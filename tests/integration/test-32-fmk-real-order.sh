@@ -68,7 +68,8 @@ case_assert launches
 stop_server --stop-bots
 for thread_mode in strict open; do
     # SR-8: a fresh server state, seeded BEFORE its first start. Alpha takes the
-    # real samples; beta's separate session supplies concurrent shared-state writes.
+    # real samples; beta's channel takes concurrent shared-state writes (bot
+    # calls in open, beta's own live leave and rejoin events in strict).
     real_thread_personas "${thread_mode}"
     real_seed_threads
     start_server --live

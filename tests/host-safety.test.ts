@@ -1766,6 +1766,7 @@ const HOME_CHECK_EXEMPT: ReadonlyMap<string, string> = new Map([
   ['slack_stub_inventory_fault', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
   ['slack_stub_inventory_page', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
   ['slack_stub_inventory_pages', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
+  ['slack_stub_inventory_stage', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
   ['slack_stub_post_fail', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
   ['slack_stub_post_lost', 'shared-mode fake Slack controls only: image first, _scenario_scratch_file fences the private regular nonsymlink snapshot before write_file, bounded loopback HTTP; audited below'],
   ['shared_queue_snapshot', 'shared-mode evidence only: image first, scratch-fenced output and temporary file outside live state, no HOME or AD access; audited below'],
@@ -4090,7 +4091,7 @@ describe(`${MCP_SESSION_END_HELPER}: both guards before its signal`, () => {
  * `require_scenario_home` (shared mode has no scenario HOME); `/ci` always
  * carries the marker, so this static pin is the only proof of their refusal.
  */
-const IMAGE_GUARDED_STUB_HELPERS: readonly string[] = ['slack_stub_push', 'stub_session_deliveries', 'stub_session_call', 'stub_session_list_tools', '_scenario_stub_request', 'queue_accepted', '_scenario_membership_complete', 'wait_membership_complete', 'configuration_request',
+const IMAGE_GUARDED_STUB_HELPERS: readonly string[] = ['slack_stub_push', 'stub_session_deliveries', 'stub_session_call', 'stub_session_list_tools', '_scenario_stub_request', 'queue_accepted', '_scenario_membership_complete', 'wait_membership_complete', '_scenario_membership_rescanned', 'wait_membership_rescan', 'configuration_request',
   'scenario_id',
   'scenario_ts',
   'scenario_text',
@@ -4115,6 +4116,8 @@ const IMAGE_GUARDED_STUB_HELPERS: readonly string[] = ['slack_stub_push', 'stub_
   'slack_membership_event',
   'slack_push_member_joined',
   'slack_push_channel_left',
+  'slack_push_membership_ids',
+  'slack_push_event_ids',
   'scenario_attachment',
   'scenario_stub_name',
   'slack_attachment_event',
@@ -4153,6 +4156,7 @@ const IMAGE_GUARDED_STUB_HELPERS: readonly string[] = ['slack_stub_push', 'stub_
   'shared_recovery_pending',
   'shared_recovery_consumed',
   'shared_persona_facts',
+  'shared_membership_event',
   '_scenario_stub_control_http',
   'slack_stub_control_seed',
   'slack_stub_controls',
@@ -4166,6 +4170,7 @@ const IMAGE_GUARDED_STUB_HELPERS: readonly string[] = ['slack_stub_push', 'stub_
   'slack_stub_inventory_page',
   'slack_stub_inventory_pages',
   'slack_stub_inventory_clear',
+  'slack_stub_inventory_stage',
   'slack_stub_fault',
   'slack_stub_inventory_fault',
   'slack_stub_post_lost',
@@ -4642,7 +4647,7 @@ describe('shared helper scratch guards and bounded observations', () => {
     slack_stub_faults_clear: ['_scenario_stub_control_patch'], slack_stub_history: ['_scenario_stub_control_patch'],
     slack_stub_history_seed: ['_scenario_stub_control_patch'], slack_stub_inventory_clear: ['_scenario_stub_control_patch'],
     slack_stub_inventory_page: ['_scenario_stub_control_patch'], slack_stub_inventory_pages: ['_scenario_stub_control_patch'],
-    slack_stub_history_fault: ['slack_stub_fault'],
+    slack_stub_inventory_stage: ['write_file'], slack_stub_history_fault: ['slack_stub_fault'],
     slack_stub_inventory_fault: ['slack_stub_fault'], slack_stub_post_fail: ['slack_stub_fault'], slack_stub_post_lost: ['slack_stub_fault'],
     shared_queue_snapshot: ['mv'],
   }

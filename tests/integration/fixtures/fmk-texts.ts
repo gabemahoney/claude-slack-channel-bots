@@ -95,6 +95,9 @@
  *   sharedDedupePreserved <before-snapshot> <current-journal> exact keys/allocation after compaction
  *   sharedPersonaFacts <config> <record> <key> [channel]
  *       Safe saved assignments/leaves/incarnation/marker; disk membership explicitly historical.
+ *   sharedMembershipEvent <config> <record> <key> <event-id>
+ *       The applied membership effect saved under that event identity ({channel, member,
+ *       order, boundary}), or null; historical, never current membership.
  *   sharedRecordedButton <stub-record> <label> <channel> <message-ts> <action-id-or-prefix>
  *       Exact unique button in last successful recorded post/update; prints interactive action.
  *   sharedPostMark <stub-record>              last complete monotonic stub record seq
@@ -5464,6 +5467,17 @@ const sharedPersonaFacts: Entry = {
       historicalMembership: select(p.membership), threadMemoryCreated: authority.threadMemoryCreated(key) })
   },
 }
+const sharedMembershipEvent: Entry = {
+  synopsis: '<config> <record> <key> <event-id>',
+  async print(args, context) {
+    expectArguments('sharedMembershipEvent', args, ['config', 'record', 'key', 'event-id'])
+    const [config, record, key, event] = args
+    const p = (await readScenarioAuthority(context, config, record)).snapshot().personas[key]
+    evidenceAssert(p, 'persona absent from shared authority')
+    const applied = Object.hasOwn(p.membershipEvents, event) ? p.membershipEvents[event] : undefined
+    return JSON.stringify(applied ? { channel: applied.channel, member: applied.member, order: applied.order, boundary: applied.boundary } : null)
+  },
+}
 const deliveryAttemptStatus: Entry = {
   synopsis: '<name> <key> <channel> <pending|unresolved|binding-conflict|invalid|inactive|not-applied> [rejection]',
   async print(args, context) {
@@ -5689,6 +5703,7 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   sharedAssertInjectedContent,
   sharedCronIdentity,
   sharedPersonaFacts,
+  sharedMembershipEvent,
   channelDeliveryAttemptStatusText: deliveryAttemptStatus,
   deliveryReasonText,
   reviewedChannelLine: reviewedChannelText,

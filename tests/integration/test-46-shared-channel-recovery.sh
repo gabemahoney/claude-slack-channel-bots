@@ -379,8 +379,12 @@ for failed in p q; do
         printf '%s\t%s\t%s\t%s\n' "${failed}" "${first}" "${ts}" "${kind}" >> "${EVIDENCE}/replays"
     done
 done
+connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
+connected_q="$(count_log "$(session_connected "$(persona_ref "${NAME[q]}")")")"
 crash
 start
+wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted worker did not reconnect'
+wait_for_count "$(session_connected "$(persona_ref "${NAME[q]}")")" "$((connected_q + 1))" "${START_WAIT_S}" 'restarted q worker did not reconnect'
 for who in p q; do
     before="$(stamp "${who}" "${B}")"
     # A live join or leave forces a fresh authenticated scan, so the page
@@ -459,8 +463,10 @@ for action in join leave; do
         wait_until 30 'repaired leave did not remove entry' choice_is p "${JOIN}" ''
     fi
     durable="$(same_channel_facts p "${JOIN}")"
+    connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
     crash
     start
+    wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted worker did not reconnect'
     ack "$(slack_stub_redeliver "${LABEL[p]}" "${first}")"
     facts_now="$(same_channel_facts p "${JOIN}")" || fail 'persona facts reader failed'
     [[ "${facts_now}" == "${durable}" ]] || fail 'durable membership replay applied twice'
@@ -517,8 +523,12 @@ for value in thread_hybrid all; do
         || fail 'lost answer did not use a fresh MCP session'
     review "newer-${value}" "${NAME[p]}/${B}/mentions"
     order="$(shared_attempt_order "${KEY[p]}" "${B}")"
+    connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
+    connected_q="$(count_log "$(session_connected "$(persona_ref "${NAME[q]}")")")"
     crash
     start
+    wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted worker did not reconnect'
+    wait_for_count "$(session_connected "$(persona_ref "${NAME[q]}")")" "$((connected_q + 1))" "${START_WAIT_S}" 'restarted q worker did not reconnect'
     expect_attempt restart-history "${WORK[p]}" "${retry}" "${KEY[p]}" mentions history
     order_now="$(shared_attempt_order "${KEY[p]}" "${B}")" || fail 'attempt reader failed'
     [[ "${order_now}" == "${order}" ]] || fail 'historical retry wrote another order position'
@@ -659,8 +669,10 @@ order_now="$(shared_attempt_order "${KEY[p]}" "${B}")" || fail 'attempt reader f
     || fail 'overlapping retries added an order position'
 [[ "$(shared_attempt_applications "${KEY[p]}" "${B}")" == "$((before + 1))" ]] || fail 'overlapping retries reapplied'
 choice_is p "${B}" mentions || fail 'overlapping retry overwrote the newer operator choice'
+connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
 crash
 start
+wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted worker did not reconnect'
 expect_attempt two-session-restart-history "${WORK[p]}" "${retry}" "${KEY[p]}" mentions history
 order_now="$(shared_attempt_order "${KEY[p]}" "${B}")" || fail 'attempt reader failed'
 [[ "${order_now}" == "$(cat "${EVIDENCE}/overlap-applied-order.jsonl")" ]] \
@@ -672,6 +684,7 @@ set_choice p "${B}" thread_hybrid after-overlap-hybrid
 
 # Phase 6: catch-up consumes short and empty cursor pages, with no is_member
 # fields. Private/invisible channels are facts of the bot's own inventory.
+connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
 stop_server
 slack_stub_inventory_clear "${LABEL[p]}"
 slack_stub_inventory_page "${LABEL[p]}" '' second "${A}/public/local/omit"
@@ -689,6 +702,7 @@ for channel in "${PRIVATE}" "${INVISIBLE}" "${EXTERNAL}"; do
 done
 choice_is p "${B}" thread_hybrid || fail 'catch-up overwrote explicit choice'
 choice_is p "${JOIN}" all || fail 'absence removed future preference'
+wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted worker did not reconnect'
 external="$(scenario_attempt_call "${WORK[p]}" "$(attempt_args "$(scenario_attempt_id external)" "${EXTERNAL}" all)")"
 jq -e '.isError==true and (has("error")|not)' <<< "${external}" > /dev/null || fail 'external membership authorized open write'
 choice_is p "${EXTERNAL}" mentions || fail 'external refusal changed choice'
@@ -930,6 +944,8 @@ for startup_fault in delay partial failed; do
     accepted p "${B}" "${thread_ts}" thread "${thread_text}" "${old_root}"
     snapshot p
     cp "${SNAP[p]}" "${EVIDENCE}/stopped-${startup_fault}-before.jsonl"
+    connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
+    connected_q="$(count_log "$(session_connected "$(persona_ref "${NAME[q]}")")")"
     stop_server
     slack_stub_inventory_clear "${LABEL[p]}"
     slack_stub_faults_clear "${LABEL[p]}"
@@ -958,10 +974,12 @@ for startup_fault in delay partial failed; do
     new_ts="$(scenario_ts)"; new_text="$(scenario_text "new-while-absent-${startup_fault}")"
     unresolved="$(push p "${A}" "${new_ts}" "${new_text}")"
     no_ack "${unresolved}"
+    wait_for_count "$(session_connected "$(persona_ref "${NAME[q]}")")" "$((connected_q + 1))" "${START_WAIT_S}" 'restarted q worker did not reconnect'
     result="$(scenario_attempt_call "${WORK[q]}" "$(attempt_args "$(scenario_attempt_id "q-progress-${startup_fault}")" "${A}" all)")"
     jq -e '.isError==false' <<< "${result}" > /dev/null || fail 'unrelated persona tool blocked by startup scan'
     shared_stub_notice resume "${WORK[p]}" "${KEY[p]}" "${EVIDENCE}/stopped-${startup_fault}.json" > /dev/null
     drain p
+    wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'resumed worker did not reconnect'
     result="$(scenario_attempt_call "${WORK[p]}" "$(attempt_args "$(scenario_attempt_id "absent-${startup_fault}")" "${A}" all)")"
     jq -e '.isError==true and (has("error")|not)' <<< "${result}" > /dev/null || fail 'delayed startup membership authorized new write'
     queued_n="$(shared_queued_count "${KEY[p]}" "${A}" "${new_ts}")" || fail 'queue reader failed'
@@ -1055,8 +1073,10 @@ post_hold() {
 for performed in true false; do
     pending_post "recovered-${performed}" "${performed}"
     post_hold "recovered-${performed}"
+    connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
     crash
     start
+    wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted worker did not reconnect'
     wait_until 30 'restart did not attempt the saved own-post lookup' has_record_after \
         "${OP_MARK}" fault "label=${LABEL[p]}" method=conversations.history outcome=hang
     # First successful queue load releases the durable Post Hold as recovered
@@ -1162,8 +1182,10 @@ jq -se --arg ts "${hold_ts}" '
     ([$rows[]|select(.kind=="sent" and .seq==$seqs[$i])|.at]|min) as $sent |
     $done!=null and $sent!=null and $done<=$sent)
 ' "${SNAP[p]}" > /dev/null || fail 'all-source FIFO receipt/send order violated'
+connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
 crash
 start
+wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted manual FIFO worker did not reconnect'
 slack_stub_faults_clear "${LABEL[p]}"
 RECORD_WAIT_S="${lookup_bound_s}" shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" joined \
     > "${EVIDENCE}/post-live-hold-outcome.json"
@@ -1212,9 +1234,11 @@ PY
     records_n="$(record_after "${stopped_mark}" fault "label=${LABEL[p]}" method=conversations.history | jq length)" \
         || fail 'stub record reader failed'
     [[ "${records_n}" == 0 ]] || fail 'dry run entered lookup fault'
+    connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
     stop_server
     slack_stub_faults_clear "${LABEL[p]}"
     start
+    wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted worker did not reconnect'
     RECORD_WAIT_S="${lookup_bound_s}" shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" joined \
         > "${EVIDENCE}/lookup-${problem}-outcome.json"
 done
@@ -1260,9 +1284,11 @@ for boundary in before after; do
     choice_is p "${old_channel}" '' || fail 'restart failed to honor leave'
     ack "$(slack_stub_redeliver "${LABEL[p]}" "${leave}")"
     drain p
+    connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
     stop_server
     slack_stub_inventory_page "${LABEL[p]}" '' '' "${A}" "${B}" "${NOTICE}" "${EXTRA_CHANNELS[@]}"
     start
+    wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted worker did not reconnect'
     choice_is p "${old_channel}" mentions || fail 'offline rejoin inherited old choice'
     set_choice p "${old_channel}" thread_hybrid "fresh-after-leave-${boundary}"
     stamp_now="$(stamp p "${old_channel}")" || fail 'stamp reader failed'
@@ -1287,6 +1313,7 @@ done
 # HTTP request is delayed beyond the real lookup deadline; the fresh stamp
 # is established before that request settles or any retry can succeed.
 pending_post stale-value true
+connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
 crash
 slack_stub_faults_clear "${LABEL[p]}"
 slack_stub_history_fault "${LABEL[p]}" history delay "channel=${OP_CHANNEL}" "delay_ms=$((lookup_deadline_ms + 20000))"
@@ -1294,6 +1321,7 @@ mark="$(slack_post_mark)"
 start
 wait_until 30 'delayed lookup not reached' has_record_after "${mark}" fault "label=${LABEL[p]}" method=conversations.history outcome=delay
 lookup_request="$(record_after "${mark}" fault "label=${LABEL[p]}" method=conversations.history outcome=delay | jq -er 'if length==1 then .[0].request_id else error("ambiguous lookup") end')"
+wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted worker did not reconnect'
 set_choice p "${OP_CHANNEL}" mentions stale-value-away
 set_choice p "${OP_CHANNEL}" thread_hybrid stale-value-back
 new_stamp="$(stamp p "${OP_CHANNEL}")"
@@ -1351,8 +1379,10 @@ for root in "${OP_ROOT}" "${second_root}"; do
     queued_n="$(shared_queued_count "${KEY[p]}" "${OP_CHANNEL}" "${ts}")" || fail 'queue reader failed'
     [[ "${queued_n}" == 0 ]] || fail 'reported lost join selected reply'
 done
+connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
 stop_server
 start
+wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted worker did not reconnect'
 expect_count "${loss_line}" "$((loss_count + 1))" 'saved lost outcome reported again on restart'
 joins_now="$(current_joins p "${OP_CHANNEL}")" || fail 'Thread Memory reader failed'
 [[ -z "${joins_now}" ]] || fail 'lost outcome became joined after restart'
@@ -1453,6 +1483,7 @@ seal_path="${SLACK_STATE_DIR}/$(printed THREAD_MEMORY_SEAL_FILE)"
 for iteration in first repeated; do
     drain p
     deleted_channels="$(shared_persona_facts "${KEY[p]}" | jq -r '.assignments|to_entries|map(select(.value.delivery=="thread_hybrid")|.key)|sort|join(",")')"
+    connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
     stop_server
     [[ "$(shared_thread_created "${KEY[p]}")" == true ]] || fail 'missing real Thread Memory created marker'
     if [[ -f "${memory_path}" ]]; then mv "${memory_path}" "${EVIDENCE}/deleted-memory-${iteration}"; fi
@@ -1460,6 +1491,7 @@ for iteration in first repeated; do
     before="$(count_log "$(matcher "${changed}" "${KEY[p]}")")"
     mark="$(slack_post_mark)"
     start
+    wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted worker did not reconnect'
     wait_for_count "$(matcher "${changed}" "${KEY[p]}")" "$((before + 1))" 30 'marker without journal/seal was silently forgotten'
     report_post p "${mark}" "memory-deleted-${iteration}-notice" buildThreadMemoryChangedWhileStoppedNotice \
         "$(persona_ref "${NAME[p]}")" "${deleted_channels}" changed
@@ -1480,8 +1512,10 @@ identity_compaction_before=''
 for reset in remove rename credentials working-directory; do
     drain p
     pending_post "identity-${reset}" true
+    connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
     crash
     start
+    wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted worker did not reconnect'
     if [[ -n "${identity_compaction_before}" ]]; then
         compacted_queue p "${identity_compaction_before}" "${EVIDENCE}/identity-before-${reset}-compacted.jsonl"
     fi
@@ -1596,9 +1630,11 @@ facts="$(shared_persona_facts "${KEY[p]}" "${OP_CHANNEL}")"
 jq -e --argjson stamp "${OP_STAMP}" --arg c "${OP_CHANNEL}" '.incarnation==$stamp.incarnation and .assignments[$c].threadHybridSince==$stamp.threadHybridSince' \
     <<< "${facts}" > /dev/null || fail 'confirmed unsaved post has stale authority'
 shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" unresolved > "${EVIDENCE}/confirmed-unsaved-before-kill.json"
+connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
 crash
 repair_modes
 start
+wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted worker did not reconnect'
 compacted_queue p "${identity_compaction_before}" "${EVIDENCE}/identity-final-compacted.jsonl"
 slack_stub_faults_clear "${LABEL[p]}"
 RECORD_WAIT_S="${lookup_bound_s}" shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" joined \
@@ -1626,10 +1662,12 @@ notice_post="$(slack_wait_messages_waiting "${LABEL[p]}" "${NOTICE}" "${mark}" "
 notice_root="$(jq -er .ts <<< "${notice_post}")"
 wait_for_count "${notice_match}" "$((before + 1))" 30 'notice-only failure did not leave its log line'
 [[ "$(record_after "${mark}" api "label=${LABEL[p]}" method=chat.postMessage "channel=${NOTICE}" answer=ok | jq length)" == 1 ]] || fail 'notice-only failure recursively posted an outage notice'
+connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
 crash
 repair_modes
 start
 shared_stub_notice resume "${WORK[p]}" "${KEY[p]}" "${EVIDENCE}/notice-loss-ended.json" > /dev/null
+wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'resumed worker did not reconnect'
 drain p
 ts="$(scenario_ts)"; text="$(scenario_text lost-notice-join-reply)"
 ack "$(push p "${NOTICE}" "${ts}" "${text}" "${notice_root}")"
@@ -1717,8 +1755,10 @@ repair_modes
 # on disk. Withdraw that physical confirmation before killing the process;
 # the separately retained operator intent is what the restart must preserve.
 mv "${CONFIG}.apply" "${EVIDENCE}/baseline-fault-withdrawn.apply"
+connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
 crash
 start
+wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted worker did not reconnect'
 configuration_application_preserved "${CONFIG}" "${EVIDENCE}/baseline-fault-before" "${LAST}" > /dev/null
 configuration_request baseline-fault-refresh refresh > /dev/null
 cp "${CONFIG}.pending" "${EVIDENCE}/baseline-fault-refreshed.pending"

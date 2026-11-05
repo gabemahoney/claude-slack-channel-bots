@@ -1113,7 +1113,10 @@ own_posts_phase() {
     # adds a mention must neither select nor create participation.
     outside="$(scenario_ts)"; stamp="$(printed sharedThreadStamp "${CONFIG}" "${LAST}" "${key}" "${DEST}")"
     before="$(shared_thread_joins "${key}" "${DEST}" "${stamp}" | jq -scS 'sort_by(.root)')"
-    ack_control "$(slack_push_reaction "${q}" "${DEST}" "${outside}" thumbsup "$(scenario_ts)")"
+    # The app subscribes to no reaction event and CSCB forwards none, so
+    # nothing acknowledges this envelope.
+    envelope="$(slack_push_reaction "${q}" "${DEST}" "${outside}" thumbsup "$(scenario_ts)")"
+    [[ -n "${envelope}" ]] || fail 'reaction push returned no envelope'
     ack_control "$(slack_push_edit "${q}" "${DEST}" "${outside}" "$(mention_text "${bot}")" "$(scenario_ts)")"
     ack_control "$(slack_push_delete "${q}" "${DEST}" "${outside}" "$(scenario_ts)")"
     push_event "${q}" "$(slack_message_event "${DEST}" "$(scenario_text outside-CSCB)" "${outside}" "${bot}")"

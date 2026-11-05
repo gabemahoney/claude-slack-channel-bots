@@ -16,7 +16,7 @@ import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVer
   windowsVerdict, resultLine, summary, evidenceExit, printResults, type Measurement, type Times, type Result,
   SR8_PENDING_POST_MS, SR8_LARGE_BYTES, SR8_SHARED_CHANNELS, pendingPostVerdicts, sharedListVerdicts,
   scanDiagnostics, membershipFaultVerdicts, membershipRepairVerdict, membershipLateVerdict, zeroAckVerdict,
-  accountingVerdicts, personaStoreVerdicts, lookupFaultVerdicts, orderedWriteVerdicts,
+  accountingVerdicts, personaStoreVerdicts, lookupFaultVerdicts, orderedWriteVerdicts, membershipWriteVerdicts,
   faultLoadVerdicts, faultWaves, postHoldOverlapVerdicts, concurrentOverlapVerdicts, envelopeTimings, type FaultPlan, type FaultPush, type FaultLoadEvidence,
   type SharedListEvidence, type PendingProbe, type AccountedEvent, type LookupProbe,
   burstAckVerdicts, pendingBurstVerdict, type BurstItem, type PendingWindow,
@@ -938,6 +938,234 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     if (defect === 'missing') f.after.pop()
     expect(f.run().some(r => r.verdict === (defect === 'missing' ? 'missing' : 'fail'))).toBe(true); output(f.run(), 1)
   })
+  function memberWrites() {
+    const [p, q] = sr8Personas(2), write = 'CWRITE', kept = 'CKEPT'
+    const facts = (who: string, assignments: any, leaves: any, membership: any) => ({ mode: 'strict', key: who, incarnation: `${who}-life`,
+      assignments, leaves, removedDestinations: {}, historicalMembership: membership, threadMemoryCreated: true })
+    const hybrid = { [kept]: { delivery: 'thread_hybrid', order: 2, threadHybridSince: 'stamp' } }
+    const joinedKept = { [kept]: { member: true, boundary: 2, identity: 'install', observedThrough: '1.000000' } }
+    const other = facts(p, structuredClone(hybrid), {}, structuredClone(joinedKept))
+    const leave = { event: 'Ev0STUBLEAVE', boundary: 7, incarnation: `${q}-life` }
+    const states = {
+      before: [facts(q, { ...structuredClone(hybrid), [write]: { delivery: 'off', order: 5 } }, {},
+        { ...structuredClone(joinedKept), [write]: { member: true, boundary: 5, identity: 'install', observedThrough: '1.000000' } }), other],
+      leave: [facts(q, structuredClone(hybrid), { [write]: leave }, { ...structuredClone(joinedKept), [write]: { member: false, boundary: 7, identity: 'install' } })],
+      join: [facts(q, { ...structuredClone(hybrid), [write]: { delivery: 'off', order: 9 } }, { [write]: leave },
+        { ...structuredClone(joinedKept), [write]: { member: true, boundary: 9, identity: 'install' } }), structuredClone(other)],
+      reopened: [] as any[],
+    }
+    // A reopen scan refreshes historical membership cutoffs; choices and leaves stay exact.
+    states.reopened = structuredClone(states.join)
+    for (const f of states.reopened) for (const m of Object.values(f.historicalMembership) as any[]) m.observedThrough = '2.000000'
+    const writes = [{ kind: 'leave', envelope_id: 'leave-env', event_id: leave.event, stage_seq: '3' },
+      { kind: 'join', envelope_id: 'join-env', event_id: 'Ev0STUBJOIN', stage_seq: '7' }]
+    const events = [{ kind: 'leave', event_id: leave.event, applied: { channel: write, member: false, order: 7, boundary: 7 } },
+      { kind: 'join', event_id: 'Ev0STUBJOIN', applied: { channel: write, member: true, order: 9, boundary: 9 } }]
+    // The case slice holds both personas: P's own push, scan and the control
+    // installed before the burst are outside Q's writes and marks.
+    const firstPage = (seq: number, label = q) => ({ event: 'api', seq, label, method: 'users.conversations', cursor: '', answer: 'ok' })
+    const stub: any[] = [{ event: 'control', seq: 0, source: 'http', labels: [p, q] }, { event: 'push', seq: 1, envelope_id: 'burst', label: q },
+      { event: 'inventory', seq: 3, label: q, fields: ['inventory_pages'] },
+      { event: 'push', seq: 4, envelope_id: 'leave-env', label: q, channel: write, event_type: 'channel_left' },
+      { event: 'ws-message', seq: 5, envelope_id: 'leave-env', label: q }, firstPage(6),
+      { event: 'inventory', seq: 7, label: q, fields: ['inventory_pages'] },
+      { event: 'push', seq: 8, envelope_id: 'join-env', label: q, channel: write, event_type: 'member_joined_channel' },
+      { event: 'ws-message', seq: 9, envelope_id: 'join-env', label: q }, firstPage(10), firstPage(10.5, p),
+      { event: 'push', seq: 10.7, envelope_id: 'p-burst', label: p }, { event: 'ws-message', seq: 11, envelope_id: 'burst', label: q }]
+    const at = (event: string, envelope?: string) => stub.find(r => r.event === event && (envelope === undefined || r.envelope_id === envelope))
+    return { p, q, write, kept, states: { ...states, events, eventsReopened: structuredClone(events) }, writes, stub, at, submit: 2, done: 9,
+      times: [timing('burst')], writeTimes: [timing('leave-env'), timing('join-env')],
+      run() { return membershipWriteVerdicts(sr8Personas(2), this.q, this.write, 'strict', this.states, this.writes, this.stub, this.submit, this.done, this.times, this.writeTimes) } }
+  }
+  test('strict ordered writes are a staged, acknowledged live leave then fresh off rejoin, each applied by its own event, overlapping the burst and exact after reopen', () => {
+    const got = memberWrites().run()
+    expect(got.map(r => [r.measure, r.verdict])).toEqual([['ordered-writes', 'pass'], ['ordered-write-ack', 'pass'], ['membership-write-ack', 'pass']])
+    expect(got[0].stats).toEqual({ overlap: 'yes', retained: 'yes', ordered: 'yes', acked: 'yes', staged: 'yes' }); output(got, 0)
+  })
+  test.each(['refused', 'no-op-join', 'reordered', 'ack-order', 'wrong-default', 'stale-order', 'unrelated-writer', 'unrelated-persona',
+    'reopen', 'overlap', 'unacked', 'other-channel', 'slow-write-ack', 'slow-burst-ack', 'scan-leave', 'other-event-leave', 'scan-rejoin',
+    'rejoin-order', 'events-reopen', 'unstaged', 'stage-after-push', 'stage-before-submit', 'no-rescan', 'rescan-before-push',
+    'rescan-after-restage', 'other-label-rescan', 'control-reset', 'missing-state', 'missing-writes', 'missing-events'] as const)('strict membership writes reject %s', defect => {
+    const f = memberWrites(), [q] = f.states.join
+    const scans = f.stub.filter(r => r.event === 'api' && r.label === f.q)
+    if (defect === 'refused') f.states.leave = structuredClone(f.states.before).slice(0, 1)
+    if (defect === 'no-op-join') { q.assignments[f.write] = f.states.before[0].assignments[f.write]; f.states.reopened = structuredClone(f.states.join) }
+    if (defect === 'reordered') f.writes.reverse()
+    if (defect === 'ack-order') f.at('ws-message', 'leave-env').seq = 8.5
+    if (defect === 'wrong-default') { q.assignments[f.write].delivery = 'mentions'; f.states.reopened = structuredClone(f.states.join) }
+    if (defect === 'stale-order') {
+      q.assignments[f.write].order = 7; q.historicalMembership[f.write].boundary = 7; f.states.reopened = structuredClone(f.states.join)
+    }
+    if (defect === 'unrelated-writer') { q.assignments[f.kept].delivery = 'off'; f.states.reopened = structuredClone(f.states.join) }
+    if (defect === 'unrelated-persona') f.states.reopened[1].assignments[f.kept].delivery = 'all'
+    if (defect === 'reopen') f.states.reopened[0].assignments[f.write].order = 10
+    if (defect === 'overlap') f.at('ws-message', 'burst').seq = 2
+    if (defect === 'unacked') f.stub.splice(f.stub.indexOf(f.at('ws-message', 'leave-env')), 1)
+    if (defect === 'other-channel') f.at('push', 'leave-env').channel = f.kept
+    if (defect === 'slow-write-ack') f.writeTimes[1].acks[0].ack_mono_ms++
+    if (defect === 'slow-burst-ack') f.times[0].acks[0].ack_mono_ms++
+    // A scan's absence leave carries every correlation except a live event's identity.
+    if (defect === 'scan-leave') {
+      const id = `scan:1:absent:${f.write}`
+      for (const phase of ['leave', 'join', 'reopened'] as const) f.states[phase][0].leaves[f.write] = { ...f.states[phase][0].leaves[f.write], event: id }
+      f.writes[0].event_id = id; f.states.events[0].event_id = id; f.states.eventsReopened[0].event_id = id
+    }
+    if (defect === 'other-event-leave') { f.writes[0].event_id = 'Ev0OTHER'; f.states.events[0].event_id = 'Ev0OTHER'; f.states.eventsReopened[0].event_id = 'Ev0OTHER' }
+    if (defect === 'scan-rejoin') { f.states.events[1].applied = null as any; f.states.eventsReopened[1].applied = null as any }
+    if (defect === 'rejoin-order') { f.states.events[1].applied.order = 8; f.states.eventsReopened[1].applied.order = 8 }
+    if (defect === 'events-reopen') f.states.eventsReopened[0] = { ...f.states.eventsReopened[0]!, applied: null as any }
+    if (defect === 'unstaged') f.stub.splice(f.stub.findIndex(r => r.event === 'inventory' && r.seq === 7), 1)
+    if (defect === 'stage-after-push') {
+      f.at('push', 'join-env').seq = 7; f.stub.find(r => r.event === 'inventory' && r.seq === 7).seq = 8; f.writes[1].stage_seq = '8'
+    }
+    if (defect === 'stage-before-submit') { f.stub.find(r => r.event === 'inventory' && r.seq === 3).seq = 2; f.writes[0].stage_seq = '2' }
+    if (defect === 'no-rescan') f.stub.splice(f.stub.indexOf(scans[0]), 1)
+    if (defect === 'rescan-before-push') scans[1].seq = 7.5
+    if (defect === 'rescan-after-restage') scans[0].seq = 7.2
+    if (defect === 'other-label-rescan') scans[1].label = f.p
+    if (defect === 'control-reset') f.stub.push({ event: 'control', seq: 6.5, source: 'file', labels: [f.p, f.q] })
+    if (defect === 'missing-state') f.states.leave = []
+    if (defect === 'missing-writes') f.writes.pop()
+    if (defect === 'missing-events') f.states.events = []
+    const want = defect.startsWith('missing') ? 'missing' : 'fail'
+    expect(f.run().some(r => r.verdict === want)).toBe(true); output(f.run(), 1)
+  })
+  // Test-32's strict write, run for real over recorded facts: the stub I/O is
+  // replaced, the staging, event build, timing and validation are the script's
+  // own. A stale event left where the old workload prebuilt it must not be sent.
+  const leftFacts = { written: null, leave: { event: 'Ev0LEAVE', boundary: 7, incarnation: 'beta-life' }, membership: { member: false, boundary: 7 }, unrelated: ['kept'] }
+  const fresh = '1800000000.000042', stale = JSON.stringify({ type: 'prebuilt', event_ts: '1700000000.000001' })
+  const freshEvent = (type: string, channel: string) => JSON.stringify({ type, channel, channel_type: 'C', user: 'U0SELF', event_ts: fresh })
+  const eventBuilder = [
+    'require_ci_image() { :; }', 'slack_stub_identity() { printf \'U0SELF\\n\'; }', declaration(scenario, 'slack_membership_event'),
+    `scenario_ts() { printf 'ts\\n' >> "$HOME/calls"; printf '%s\\n' ${fresh}; }`,
+    'real_thread_epoch_ms() { local t; t=$(( $(cat "$HOME/clock") + 10 )); printf \'%s\' "${t}" > "$HOME/clock"; printf \'clock %s\\n\' "${t}" >> "$HOME/calls"; printf \'%s\\n\' "${t}"; }',
+  ]
+  const strictWrite = (n: number, before: any, after: any, event: string, applied: any) => shell([
+    ...eventBuilder,
+    '_real_thread_write_facts() { cat "$HOME/facts-${1##*.}.json" > "$1"; }',
+    'slack_stub_inventory_stage() { printf \'stage %s\\n\' "$*" >> "$HOME/calls"; printf \'7\\n\'; }',
+    'slack_push_event_ids() { printf \'push %s %s\\n\' "$1" "$2" >> "$HOME/calls"; printf \'env-1\\t%s\\n\' "$(cat "$HOME/event-id")"; }',
+    'slack_wait_one_ack() { printf \'ack %s\\n\' "$*" >> "$HOME/calls"; }',
+    'slack_stub_record_field() { printf \'9\\n\'; }',
+    'wait_membership_rescan() { printf \'rescan %s\\n\' "$*" >> "$HOME/calls"; }',
+    'shared_membership_event() { printf \'applied %s\\n\' "$*" >> "$HOME/calls"; cat "$HOME/applied.json"; }',
+    declaration(real, 'real_thread_membership_write'),
+    'REAL_THREAD_EVIDENCE="$HOME/ev" REAL_WRITER_LABEL=beta REAL_WRITER_KEY=beta REAL_WRITE_CHANNEL=CWRITE',
+    'REAL_WRITER_CHANNELS=(CONE CWRITE CTWO)',
+    `rc=0; (real_thread_membership_write ${n}) || rc=$?`,
+    'printf \'rc=%s\\n\' "${rc}"; cat "$HOME/calls"; cat "$HOME/ev/operations.tsv" 2>/dev/null || true',
+  ].join('\n'), { clock: '1000', 'event-id': event, 'facts-before.json': JSON.stringify(before), 'facts-after.json': JSON.stringify(after),
+    'applied.json': JSON.stringify(applied), [`ev/beta-membership-${n}.json`]: stale })
+  const leaveCase = () => ({ n: 1, before: { written: { delivery: 'off', order: 5 }, leave: null, membership: { member: true, boundary: 5 }, unrelated: ['kept'] },
+    after: structuredClone(leftFacts), event: 'Ev0LEAVE', applied: { channel: 'CWRITE', member: false, order: 7, boundary: 7 } })
+  const joinCase = () => ({ n: 2, before: structuredClone(leftFacts),
+    after: { ...structuredClone(leftFacts), written: { delivery: 'off', order: 9 }, membership: { member: true, boundary: 9 } },
+    event: 'Ev0JOIN', applied: { channel: 'CWRITE', member: true, order: 9, boundary: 9 } })
+  test.each(['leave', 'join'] as const)('strict thread write: a staged live %s, built fresh after staging, timed push to ACK, then rescanned and applied by its own event', kind => {
+    const f = kind === 'leave' ? leaveCase() : joinCase(), run = strictWrite(f.n, f.before, f.after, f.event, f.applied)
+    expect(run.stderr).toBe('')
+    const staged = kind === 'leave' ? 'CONE CTWO' : 'CONE CWRITE CTWO'
+    const type = kind === 'leave' ? 'channel_left' : 'member_joined_channel'
+    expect(run.stdout).toBe([`rc=0`, `stage beta memberships ${staged}`, 'ts', 'clock 1010', `push beta ${freshEvent(type, 'CWRITE')}`, 'ack env-1',
+      'clock 1020', 'rescan beta beta 9', `applied beta ${f.event}`, `write\t${f.event}\t1010\t1020`, ''].join('\n'))
+  })
+  // Alpha's concurrent event, in both modes: built fresh in the worker just
+  // before its timed push, same type alternation, persona and channel.
+  test.each([['strict', 1], ['strict', 2], ['open', 1], ['open', 2]] as const)('thread worker (%s, sample %d) builds alpha\'s membership event fresh before its timed push', (mode, n) => {
+    const run = shell([
+      ...eventBuilder,
+      'slack_stub_push() { printf \'push %s %s\\n\' "$1" "$2" >> "$HOME/calls"; printf \'env-a\\n\'; }',
+      'slack_wait_one_ack() { printf \'ack %s\\n\' "$*" >> "$HOME/calls"; }',
+      'real_thread_membership_write() { printf \'strict-write %s\\n\' "$1" >> "$HOME/calls"; }',
+      'stub_session_call() { printf \'call %s\\n\' "$2" >> "$HOME/calls"; printf \'{"isError":false,"text":"applied"}\\n\'; }',
+      'bun() { printf \'applied\\n\'; }',
+      declaration(real, 'real_thread_concurrent_work'),
+      `REAL_THREAD_EVIDENCE="$HOME/ev" REAL_THREAD_MODE=${mode} REAL_LABEL=alpha REAL_MEMBER_CHANNEL=CMEMBER REAL_WRITER_WORK=/w`,
+      'REAL_THREAD_WRITE_TOOL=set_delivery SCENARIO_FIXTURES=/f REAL_WRITER_KEY=beta REAL_WRITE_CHANNEL=CWRITE',
+      `real_thread_concurrent_work ${n}`, 'cat "$HOME/calls" "$HOME/ev/operations.tsv"',
+    ].join('\n'), { clock: '1000', [`ev/membership-${n}.json`]: stale, [`ev/write-${n}.json`]: JSON.stringify({ attempt_id: 'att-1', delivery: 'off' }) })
+    expect(run.stderr).toBe('')
+    const pushed = ['ts', 'clock 1010', `push alpha ${freshEvent(n % 2 ? 'channel_left' : 'member_joined_channel', 'CMEMBER')}`, 'ack env-a', 'clock 1020']
+    const tail = mode === 'strict' ? [`strict-write ${n}`] : ['clock 1030', 'call set_delivery', 'clock 1040']
+    const ops = [`membership\t${fresh}\t1010\t1020`, ...(mode === 'open' ? ['write\tatt-1\t1030\t1040'] : [])]
+    expect(run.stdout).toBe([...pushed, ...tail, ...ops, ''].join('\n'))
+  })
+  test.each([
+    ['leave refused', leaveCase, (f: any) => { f.after = structuredClone(f.before) }],
+    ['leave by a scan', leaveCase, (f: any) => { f.event = f.after.leave.event = 'scan:1:absent:CWRITE' }],
+    ['leave by another event', leaveCase, (f: any) => { f.after.leave.event = 'Ev0OTHER' }],
+    ['leave not later', leaveCase, (f: any) => { f.after.leave.boundary = 5; f.after.membership.boundary = 5; f.applied.order = f.applied.boundary = 5 }],
+    ['leave not applied by its event', leaveCase, (f: any) => { f.applied = null }],
+    ['leave from a non-member', leaveCase, (f: any) => { f.before.membership.member = false }],
+    ['join no-op', joinCase, (f: any) => { f.after = structuredClone(f.before) }],
+    ['join reordered before the leave', joinCase, (f: any) => { f.after.written.order = 6; f.after.membership.boundary = 6; f.applied.order = f.applied.boundary = 6 }],
+    ['join by a scan', joinCase, (f: any) => { f.applied = null }],
+    ['join wrong default', joinCase, (f: any) => { f.after.written.delivery = 'mentions' }],
+    ['join changed the leave', joinCase, (f: any) => { f.after.leave.boundary = 8 }],
+    ['join changed unrelated state', joinCase, (f: any) => { f.after.unrelated = ['changed'] }],
+  ] as const)('strict thread write refuses %s and records no operation', (_name, base, defect) => {
+    const f: any = base(); defect(f)
+    const run = strictWrite(f.n, f.before, f.after, f.event, f.applied)
+    expect(run.stdout).toContain('rc=1'); expect(run.stdout).not.toContain('write\t'); expect(run.stderr).toContain('was not applied by its own event')
+  })
+  test('test-45 strict writes stage Q\'s inventory before each event, settle its own scan before reading, and record each event identity', () => {
+    const load = source('lib/membership-load.sh')
+    const run = shell([
+      'log() { printf \'%s\\n\' "$*" >> "$HOME/calls"; }',
+      'write_states() { log states "${1##*/}"; : > "$1"; }', 'wait_until() { log wait "$2"; }',
+      'slack_post_mark() { log mark; printf \'5\\n\'; }', 'slack_stub_inventory_stage() { log stage "$@"; printf \'3\\n\'; }',
+      'scenario_ts() { printf \'1.0\\n\'; }', 'slack_push_membership_ids() { log push "$@"; printf \'env-%s\\tEv-%s\\n\' "$1" "$1"; }',
+      'slack_wait_one_ack() { log ack "$@"; }', 'slack_stub_record_field() { log seq "$@"; printf \'8\\n\'; }',
+      'wait_membership_rescan() { log rescan "$@"; }', 'read_jsonl() { log read "${1##*/}"; }',
+      'shared_membership_event() { printf \'{"for":"%s"}\\n\' "$2"; }',
+      declaration(load, 'applied_events'), declaration(load, 'membership_writes'),
+      'WRITES="$HOME/w" Q=beta PAGE_LIMIT=2 WAIT_S=30 CASE_MARK=1 WRITE_CHANNEL=CWRITE; CHANNELS=(CONE CTWO CWRITE); mkdir -p "${WRITES}"',
+      'membership_writes', 'printf \'submit=%s result=%s\\n\' "${WRITE_SUBMIT}" "${WRITE_RESULT}"',
+      'cat "$HOME/calls" "${WRITES}/membership.tsv" "${WRITES}/events.jsonl"',
+    ].join('\n'))
+    expect(run.stderr).toBe('')
+    expect(run.stdout.split('\n')).toEqual(['submit=5 result=5', 'states before.jsonl', 'wait burst has no observed push', 'mark',
+      'stage beta 2 CONE CTWO', 'push channel_left beta CWRITE 1.0', 'ack env-channel_left 30', 'seq seq push envelope_id=env-channel_left',
+      'rescan beta beta 8', 'read leave.jsonl',
+      'stage beta 2 CONE CTWO CWRITE', 'push member_joined_channel beta CWRITE 1.0', 'ack env-member_joined_channel 30', 'mark',
+      'seq seq push envelope_id=env-member_joined_channel', 'rescan beta beta 8', 'states join.jsonl',
+      'leave\tenv-channel_left\tEv-channel_left\t3', 'join\tenv-member_joined_channel\tEv-member_joined_channel\t3',
+      '{"kind":"leave","event_id":"Ev-channel_left","applied":{"for":"Ev-channel_left"}}',
+      '{"kind":"join","event_id":"Ev-member_joined_channel","applied":{"for":"Ev-member_joined_channel"}}', ''])
+  })
+  test('burst slice removes exactly the two write envelopes and keeps every other stub line byte-for-byte', () => {
+    const lines = ['{"seq":1,"event":"push","envelope_id":"burst","sent_mono_ms":1.250000}', '{"seq":2,"event":"push","envelope_id":"leave-env"}',
+      '{"seq":3,"event":"ws-message","envelope_id":"leave-env"}', '{"seq":4,"event":"fault","request_id":"r1"}',
+      '{"seq":5,"event":"push","envelope_id":"join-env"}', '{"seq":6,"event":"ws-message","envelope_id":null}', '{"seq":7,"event":"ws-message","envelope_id":"burst"}']
+    const run = (tsv: string) => shell([declaration(source('lib/membership-load.sh'), 'burst_slice'),
+      'burst_slice "$HOME/case.jsonl" "$HOME/writes.tsv" "$HOME/out.jsonl"', 'cat "$HOME/out.jsonl"'].join('\n'),
+    { 'case.jsonl': lines.join('\n') + '\n', 'writes.tsv': tsv })
+    const kept = run('leave\tleave-env\njoin\tjoin-env\n')
+    expect(kept.status).toBe(0); expect(kept.stdout).toBe([0, 3, 5, 6].map(i => lines[i]).join('\n') + '\n')
+    expect(run('leave\tleave-env\n').status).not.toBe(0)
+  })
+  // The real record reader and predicate; only the readiness read is replaced.
+  const page = (seq: number, label = 'beta', cursor = '') => ({ seq, event: 'api', method: 'users.conversations', label, cursor, answer: 'ok' })
+  test.each([
+    ['first page after the push', [page(3), page(9)], 'complete', 0],
+    ['first page only at the push', [page(3), page(8)], 'complete', 1],
+    ['only a later page after the push', [page(3), page(9, 'beta', 'first-page-2')], 'complete', 1],
+    ['first page after the push for another label', [page(3), page(9, 'alpha')], 'complete', 1],
+    ['first page after the push, scan not yet complete', [page(9)], 'incomplete', 1],
+  ] as const)('a membership rescan counts only a scan the push itself started: %s', (_name, records, state, rc) => {
+    const run = shell([
+      'require_ci_image() { :; }', '_scenario_scratch_file() { :; }',
+      '_scenario_membership_complete() { printf \'complete %s\\n\' "$*" >> "$HOME/calls"; [[ "$(cat "$HOME/state")" == complete ]]; }',
+      declaration(scenario, '_scenario_complete_jsonl'), declaration(scenario, 'slack_stub_records'), declaration(scenario, '_scenario_membership_rescanned'),
+      'SCENARIO_SLACK_RECORD="$HOME/record.jsonl"',
+      'rc=0; _scenario_membership_rescanned beta-key beta 8 /route || rc=$?', 'printf \'rc=%s\\n\' "${rc}"', 'cat "$HOME/calls" 2>/dev/null || true',
+    ].join('\n'), { 'record.jsonl': records.map(r => JSON.stringify(r) + '\n').join(''), state })
+    expect(run.stderr).toBe('')
+    // Readiness is read only once a scan the push started has been seen.
+    const asked = records.some(r => r.seq > 8 && r.label === 'beta' && r.cursor === '')
+    expect(run.stdout).toBe([`rc=${rc}`, ...(asked ? ['complete beta-key /route'] : []), ''].join('\n'))
+  })
   function cli(command: string, args: string[], files: Record<string, string> = {}, recipients = 2) {
     const root = mkdtempSync(join(tmpdir(), 'sr8-case-cli-'))
     try {
@@ -976,6 +1204,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     ['stores', [noFile, noFile, '0'], 3],
     ['lookup-faults', [noFile, noFile, noFile], 2],
     ['ordered-writes', [noFile, noFile, '2', '4', noFile], 2],
+    ['membership-writes', [noFile, sr8Personas(2)[1], 'CWRITE', noFile, '2', '6', noFile], 3],
   ] as [string, string[], number][])('CLI %s prints every missing line before exiting', (command, args, count) => {
     const child = cli(command, args), lines = child.stdout.trim().split('\n')
     expect(child.status).toBe(1); expect(lines).toHaveLength(count + 1)
@@ -1052,6 +1281,25 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       'e/results.jsonl': jsonl(f.results), stub: jsonl(f.stub), times: jsonl(f.times) })
     expect(child.status).toBe(0); expect(child.stdout).toContain('overlap=yes retained=yes ordered=yes')
   })
+  test('CLI membership writes reads every persona state, write order and both timing files', () => {
+    const f = memberWrites(), files: Record<string, string> = { stub: jsonl(f.stub), times: jsonl(f.times),
+      'e/membership.tsv': f.writes.map(w => [w.kind, w.envelope_id, w.event_id, w.stage_seq].join('\t')).join('\n') + '\n', 'e/membership-times.jsonl': jsonl(f.writeTimes) }
+    const { events, eventsReopened, ...phases } = f.states
+    for (const [phase, rows] of Object.entries(phases)) files[`e/${phase}.jsonl`] = jsonl(rows)
+    files['e/events.jsonl'] = jsonl(events); files['e/events.reopened.jsonl'] = jsonl(eventsReopened)
+    const args = ['@/e', f.q, f.write, '@/stub', String(f.submit), String(f.done), '@/times']
+    const child = cli('membership-writes', args, files)
+    expect(child.status).toBe(0); expect(child.stdout).toContain('samples=2 overlap=yes retained=yes ordered=yes acked=yes staged=yes')
+    expect(child.stdout).toMatch(/membership-write-ack .* verdict=pass/)
+    const wrongWriter = cli('membership-writes', ['@/e', f.p, ...args.slice(2)], files)
+    expect(wrongWriter.status).toBe(1); expect(wrongWriter.stdout).toContain('ordered=no')
+    // The old two-column write list is malformed, not a pass.
+    const twoColumns = cli('membership-writes', args, { ...files, 'e/membership.tsv': f.writes.map(w => `${w.kind}\t${w.envelope_id}`).join('\n') + '\n' })
+    expect(twoColumns.status).toBe(1); expect(twoColumns.stdout).toContain('verdict=missing')
+    const { 'e/events.reopened.jsonl': _dropped, ...noReopenedEvents } = files
+    const unread = cli('membership-writes', args, noReopenedEvents)
+    expect(unread.status).toBe(1); expect(unread.stdout).toContain('verdict=missing')
+  })
   test('CLI stores emits combined plus both personas, independently failing Q', () => {
     const items = [{ key, phase: 'roots', channel, ts: '1' }, { key: 'beta', phase: 'roots', channel, ts: '2' }]
     const rows = [measure(1), measure(2, 'accepted', SR8_STORE_LIMIT_MS, 'beta')]
@@ -1117,6 +1365,75 @@ test('SR-8 inventories page at the requested MEMBERSHIP_PAGE_LIMIT: stub members
     for (const cursor of ['stubmembers-0', 'stubmembers-01', 'unknown']) expect(await request('members', { cursor, limit: '1' })).toEqual({ ok: false, error: 'invalid_cursor' })
   } finally { await stub.stop() }
   try { assertNoLeak({ captured, record: readFileSync(recordPath, 'utf8') }) } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+test('a staged inventory replaces only its label\'s inventory, in place: fault counters survive, the snapshot follows, and refusals are recorded', async () => {
+  const channels = Array.from({ length: MEMBERSHIP_PAGE_LIMIT + 2 }, (_, i) => `C0STAGE${String(i).padStart(5, '0')}`)
+  const fault = { method: 'users.conversations', outcome: 'error', error: 'internal_error', times: 1 }
+  const seeded = { tokens: [{ label: 'p', suffix: 'p', memberships: ['C0PKEPT'], faults: [fault] }, { label: 'q', suffix: 'q', memberships: [] }] }
+  // The real helper builds the request; curl is replaced to capture it.
+  const built = shell([
+    'require_ci_image() { :; }', 'fail() { printf \'%s\\n\' "$*" >&2; exit 1; }', '_scenario_scratch_file() { :; }',
+    '_scenario_check_stub_url() { :; }', 'write_file() { cat > "$1"; }',
+    'curl() { local n=1; while [[ -e "$HOME/request-${n}.json" ]]; do n=$((n + 1)); done; cat > "$HOME/request-${n}.json"; printf \'{"ok":true,"seq":%d}\' "$((40 + n))"; }',
+    `_scenario_stub_control_patch() { shift; jq -cn "$@" '$pages[0]'; }`,
+    declaration(scenario, 'slack_stub_inventory_body'), declaration(scenario, 'slack_stub_inventory_pages'), declaration(scenario, 'slack_stub_inventory_stage'),
+    'SCENARIO_SLACK_CONTROL="$HOME/control.json" SCENARIO_SLACK_STUB_URL=http://127.0.0.1:1 SCENARIO_SLACK_PUSH_S=5',
+    `slack_stub_inventory_stage q ${MEMBERSHIP_PAGE_LIMIT} ${channels.join(' ')}`,
+    'slack_stub_inventory_stage p memberships C0PSTAGED',
+    `slack_stub_inventory_pages q '' '' ${MEMBERSHIP_PAGE_LIMIT} ${channels.join(' ')}`,
+    'cat "$HOME/request-1.json" "$HOME/request-2.json" "$HOME/control.json"',
+  ].join('\n'), { 'control.json': JSON.stringify(seeded) + '\n' })
+  expect({ status: built.status, stderr: built.stderr }).toEqual({ status: 0, stderr: '' })
+  const lines = built.stdout.trim().split('\n')
+  expect(lines.slice(0, 2)).toEqual(['41', '42'])
+  const [chain, pagesRequest, membersRequest, snapshot] = lines.slice(2).map(line => JSON.parse(line))
+  // The staged chain is the one slack_stub_inventory_pages installs from the first cursor.
+  expect(pagesRequest).toEqual({ label: 'q', inventory_pages: chain }); expect(Object.keys(chain)).toEqual(['', 'first-page-2'])
+  expect(membersRequest).toEqual({ label: 'p', memberships: ['C0PSTAGED'] })
+  expect(snapshot).toEqual({ tokens: [{ ...seeded.tokens[0], memberships: ['C0PSTAGED'] }, { ...seeded.tokens[1], inventory_pages: chain }] })
+
+  mkdirSync('/tmp/c9', { recursive: true })
+  const root = mkdtempSync('/tmp/c9/sr8-inventory-stage-'), recordPath = join(root, 'record.jsonl')
+  const stub = startSlackStub({ recordPath, control: structuredClone(seeded) as any })
+  const base = stub.apiUrl.replace(/api\/$/, ''), captured: unknown[] = []
+  const ids = async (label: string) => {
+    const page = await fetch(`${stub.apiUrl}users.conversations`, { method: 'POST', body: new URLSearchParams({}),
+      headers: { Authorization: `Bearer ${fakeToken(BOT_TOKEN_PREFIX, label)}`, 'Content-Type': 'application/x-www-form-urlencoded' } }).then(r => r.json())
+    captured.push(page)
+    return page.ok ? page.channels.map((c: { id: string }) => c.id) : page.error
+  }
+  const stage = async (body: unknown) => {
+    const response = await fetch(`${base}_inventory`, { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' } })
+    const answer = { status: response.status, body: await response.json() }
+    captured.push(answer)
+    return answer
+  }
+  try { try {
+    expect(await ids('p')).toBe('internal_error')
+    const answers = [await stage(membersRequest), await stage(pagesRequest)]
+    expect(answers.map(a => [a.status, a.body.ok, typeof a.body.seq])).toEqual([[200, true, 'number'], [200, true, 'number']])
+    // The one-shot fault has fired; a staged inventory does not re-arm it.
+    expect(await ids('p')).toEqual(['C0PSTAGED'])
+    expect(await ids('q')).toEqual(channels.slice(0, MEMBERSHIP_PAGE_LIMIT))
+    for (const [body, status, error] of [[{ label: 'nobody', memberships: [] }, 409, 'unknown-label'], [{ label: 'p' }, 400, 'inventory-invalid'],
+      [{ label: 'p', memberships: [], faults: [] }, 400, 'inventory-invalid'], [{ label: 'p', memberships: 'C0PSTAGED' }, 400, 'inventory-invalid'],
+      [{ label: '', memberships: [] }, 400, 'inventory-invalid']] as const) {
+      expect(await stage(body)).toEqual({ status, body: { ok: false, error } })
+    }
+    expect(await ids('p')).toEqual(['C0PSTAGED'])
+    // A control replacement, by contrast, re-arms every fault.
+    stub.setControl(structuredClone(seeded) as any)
+    expect(await ids('p')).toBe('internal_error')
+    const records = readFileSync(recordPath, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    const staged = records.filter(r => r.event === 'inventory')
+    expect(staged.map(r => [r.seq, r.label, r.fields])).toEqual([[answers[0].body.seq, 'p', ['memberships']], [answers[1].body.seq, 'q', ['inventory_pages']]])
+    expect(records.filter(r => r.event === 'inventory-refused').map(r => r.reason))
+      .toEqual(['unknown-label', 'inventory-invalid', 'inventory-invalid', 'inventory-invalid', 'inventory-invalid'])
+    expect(records.filter(r => r.event === 'control').map(r => r.seq).filter(seq => seq > staged[0].seq)).toHaveLength(1)
+  } finally { await stub.stop() }
+  assertNoLeak({ captured, record: readFileSync(recordPath, 'utf8') })
+  } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
 describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () => {
@@ -1406,7 +1723,8 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
   }))
   // Samples are [admission, delivery) = [100, 200) and [300, 400); each kind's
   // operation is shifted by 200 ms per kind. Recorded ends are poll-bounded, so
-  // only a start inside a sample is credited.
+  // only a start inside a sample is credited, except a strict write, which
+  // must lie wholly inside (the CLI context is strict).
   const spans: Record<string, [number, number]> = { before: [10, 50], after: [500, 550], 'start-at-delivery': [200, 220],
     'start-before-admission': [60, 130], 'start-at-admission': [100, 180], 'start-inside-end-after': [150, 450] }
   test.each(['pass', 'start-at-admission', 'start-inside-end-after', 'before', 'after', 'start-before-admission', 'start-at-delivery',
@@ -1428,14 +1746,33 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
     if (passes) expect(verdicts.map(r => r.verdict)).toEqual(['pass', 'pass'])
     else if (defect in spans) expect(verdicts.map(r => r.verdict)).toEqual(['missing', 'missing'])
     else expect(verdicts.some(r => r.verdict === 'missing')).toBe(true)
+    // A slow strict write that only starts inside its sample is not a durable overlap.
+    const strictPasses = passes && defect !== 'start-inside-end-after'
+    const strict = concurrentOverlapVerdicts(operations, samples, defect === 'missing-n2' ? undefined : measured, 'strict')
+    expect(evidenceExit(strict)).toBe(strictPasses ? 0 : 1)
+    if (defect === 'start-inside-end-after') expect(strict.map(r => r.verdict)).toEqual(['pass', 'missing'])
     writeFileSync(join(root, 'operations'), operations.map(o => `${o.kind}\t${o.id}\t${o.start_epoch_ms}\t${o.end_epoch_ms}\n`).join(''))
     writeFileSync(join(root, 'samples'), samples.map(s => `${s.key}\t${s.seq}\t${s.start_epoch_ms}\t${s.end_epoch_ms}\n`).join(''))
     if (defect !== 'missing-n2') writeFileSync(join(root, 'n2'), measured.map(s => `recorded: sr8 n2-sample key=${s.key} seq=${s.seq} name=${s.name} verdict=pass\n`).join(''))
     const child = cli('concurrent-overlap', [join(root, 'operations'), join(root, 'samples'), join(root, 'n2')])
-    expect(child.status).toBe(passes ? 0 : 1)
+    expect(child.status).toBe(strictPasses ? 0 : 1)
     expect(child.stdout).toContain('thread-membership-overlap'); expect(child.stdout).toContain('thread-write-overlap')
-    expect(child.stdout).toContain(`verdict=${passes ? 'pass' : 'missing'}`)
+    expect(child.stdout).toContain(`verdict=${strictPasses ? 'pass' : 'missing'}`)
   }))
+  // Sample [100, 200); membership always starts and ends inside it.
+  test.each([
+    ['contained', 150, 180, 'pass', 'pass'], ['starts-at-admission', 100, 199, 'pass', 'pass'],
+    ['ends-at-delivery', 150, 200, 'pass', 'missing'], ['slow-ack', 190, 260, 'pass', 'missing'],
+    ['starts-before-admission', 90, 150, 'missing', 'missing'],
+  ] as const)('a strict write is credited only when its whole push-to-ACK span lies inside a measured sample: %s', (_name, start, end, open, strict) => {
+    const epoch = 1700000000000, key = sr8Personas(1)[0], measured = [{ key, seq: 1, name: 'resolved' }]
+    const samples = [{ key, seq: 1, start_epoch_ms: epoch + 100, end_epoch_ms: epoch + 200 }]
+    const operations = [{ kind: 'membership', id: 'EvALPHA', start_epoch_ms: epoch + 150, end_epoch_ms: epoch + 180 },
+      { kind: 'write', id: 'EvBETA', start_epoch_ms: epoch + start, end_epoch_ms: epoch + end }]
+    const got = (mode?: string) => concurrentOverlapVerdicts(operations, samples, measured, mode).map(r => [r.measure, r.verdict, r.limit])
+    expect(got()).toEqual([['thread-membership-overlap', 'pass', 'start-inside-measured-sample'], ['thread-write-overlap', open, 'start-inside-measured-sample']])
+    expect(got('strict')).toEqual([['thread-membership-overlap', 'pass', 'start-inside-measured-sample'], ['thread-write-overlap', strict, 'durable-inside-measured-sample']])
+  })
   test('bulk timings exactly match the scenario.sh reader for ordered zero, duplicate and replay ACK observations', () => withCLI((root, cli) => {
     const push = (id: string, at: number, connection?: string) => ({ event: 'push', envelope_id: id, sent_mono_ms: at, ...(connection ? { connection_id: connection } : {}) })
     const ack = (id: string, at: number, connection?: string) => ({ event: 'ws-message', envelope_id: id, ack_mono_ms: at, ...(connection ? { connection_id: connection } : {}) })

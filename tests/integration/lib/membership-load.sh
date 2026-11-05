@@ -188,8 +188,70 @@ pending_results() {
     done
 }
 
+write_states() {
+    read_jsonl "$1" shared_persona_facts "${Q}"
+    shared_persona_facts "${P}" >> "$1" || fail 'write-state reader failed'
+    printf '\n' >> "$1"
+}
+applied_events() {
+    local kind event
+    while IFS=$'\t' read -r kind _ event _; do
+        jq -cn --arg kind "${kind}" --arg event "${event}" --argjson applied "$(shared_membership_event "${Q}" "${event}")" \
+            '{kind:$kind,event_id:$event,applied:$applied}' || fail 'membership event reader failed'
+    done < "${WRITES}/membership.tsv" > "$1"
+}
+# Strict refuses every bot assignment (t1.tad.5i SR-2.3), so Q's two ordered
+# writes there are the production membership route strict allows (SR-3.3):
+# a live leave of the write channel, then a qualifying rejoin. Each event is
+# acknowledged only once durable, and requests a fresh scan. Q's inventory is
+# staged to agree before each event, without a control replacement that would
+# reset P's fault counters inside the burst, and that scan settles before the
+# state is read or the inventory changes again.
+membership_writes() {
+    local kind type ids envelope event mark channel
+    local -a absent=()
+    for channel in "${CHANNELS[@]}"; do [[ "${channel}" == "${WRITE_CHANNEL}" ]] || absent+=("${channel}"); done
+    write_states "${WRITES}/before.jsonl"
+    wait_until "${WAIT_S}" 'burst has no observed push' has_record_since "${CASE_MARK}" push "label=${Q}"
+    WRITE_SUBMIT="$(slack_post_mark)"
+    for kind in leave join; do
+        if [[ "${kind}" == leave ]]; then
+            type=channel_left
+            mark="$(slack_stub_inventory_stage "${Q}" "${PAGE_LIMIT}" "${absent[@]}")"
+        else
+            type=member_joined_channel
+            mark="$(slack_stub_inventory_stage "${Q}" "${PAGE_LIMIT}" "${CHANNELS[@]}")"
+        fi
+        # scenario_ts explicitly accepts zero arguments.
+        # shellcheck disable=SC2119
+        ids="$(slack_push_membership_ids "${type}" "${Q}" "${WRITE_CHANNEL}" "$(scenario_ts)")"
+        IFS=$'\t' read -r envelope event <<< "${ids}"
+        printf '%s\t%s\t%s\t%s\n' "${kind}" "${envelope}" "${event}" "${mark}" >> "${WRITES}/membership.tsv"
+        slack_wait_one_ack "${envelope}" "${WAIT_S}"
+        [[ "${kind}" == leave ]] || WRITE_RESULT="$(slack_post_mark)"
+        wait_membership_rescan "${Q}" "${Q}" "$(slack_stub_record_field seq push "envelope_id=${envelope}")"
+        [[ "${kind}" == join ]] || read_jsonl "${WRITES}/leave.jsonl" shared_persona_facts "${Q}"
+    done
+    write_states "${WRITES}/join.jsonl"
+    applied_events "${WRITES}/events.jsonl"
+}
+# fault-check accounts exactly the planned burst; membership-writes judges
+# Q's two write envelopes from the unfiltered case slice.
+burst_slice() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import json,sys
+source,writes,out=sys.argv[1:]
+skip={line.split('\t')[1] for line in open(writes).read().splitlines()}
+if len(skip) != 2: sys.exit('expected two membership write envelopes')
+with open(source) as rows, open(out,'w') as target:
+    for line in rows:
+        if json.loads(line).get('envelope_id') not in skip: target.write(line)
+PY
+}
+
 ordered_writes() {
     local delivery attempt args id result expected
+    if [[ "${MODE}" == strict ]]; then membership_writes; return; fi
     read_jsonl "${WRITES}/before.jsonl" shared_attempt_order "${Q}"
     wait_until "${WAIT_S}" 'burst has no observed push' has_record_since "${CASE_MARK}" push "label=${Q}"
     WRITE_SUBMIT="$(slack_post_mark)"
@@ -488,7 +550,13 @@ PY
             bun "${E}" fault-ids "${C[@]}" "${OUT}" > "${OUT}/all-ids.txt"
         else cp "${OUT}/during-ids.txt" "${OUT}/all-ids.txt"; fi
         capture_times "${OUT}/all-ids.txt" "${OUT}/times.jsonl"
-        stub_slice "${CASE_MARK}" "${OUT}/stub.jsonl"
+        if [[ "${MODE}" == strict && "${KIND}" != undurable ]]; then
+            stub_slice "${CASE_MARK}" "${WRITES}/case-stub.jsonl"
+            burst_slice "${WRITES}/case-stub.jsonl" "${WRITES}/membership.tsv" "${OUT}/stub.jsonl" \
+                || fail 'burst slice could not separate the membership writes'
+            while IFS=$'\t' read -r _ envelope _; do slack_envelope_times "${envelope}"; done \
+                < "${WRITES}/membership.tsv" > "${WRITES}/membership-times.jsonl"
+        else stub_slice "${CASE_MARK}" "${OUT}/stub.jsonl"; fi
         # Stop drains the measurement recorder. Queue contents remain retained
         # by the manual-receipt stub; capture before the required clean restart.
         bun "${E}" conditions "${SLACK_STATE_DIR}" "${SERVER_PID}"
@@ -501,7 +569,12 @@ PY
         start_ready
         bun "${E}" seal measured "${C[@]}" "${SLACK_STATE_DIR}/server.log" "${REOPEN_LOG}" "${CONFIG}"
         for key in "${KEYS[@]}"; do read_jsonl "${OUT}/${key}.after.jsonl" shared_thread_joins "${key}"; done
-        if [[ "${KIND}" != undurable ]]; then
+        if [[ "${KIND}" != undurable && "${MODE}" == strict ]]; then
+            write_states "${WRITES}/reopened.jsonl"
+            applied_events "${WRITES}/events.reopened.jsonl"
+            bun "${E}" membership-writes "${C[@]}" "${WRITES}" "${Q}" "${WRITE_CHANNEL}" "${WRITES}/case-stub.jsonl" \
+                "${WRITE_SUBMIT}" "${WRITE_RESULT}" "${OUT}/times.jsonl"
+        elif [[ "${KIND}" != undurable ]]; then
             read_jsonl "${WRITES}/reopened.jsonl" shared_attempt_order "${Q}"
             # Ordered-write N1 covers Q's concurrent traffic. Fault-check also
             # judges P's independent originals and all dependent replay ACKs.

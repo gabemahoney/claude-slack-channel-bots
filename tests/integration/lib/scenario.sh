@@ -6115,6 +6115,23 @@ wait_membership_complete() {
     route="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" MEMBERSHIP_READINESS_ROUTE)" || fail 'cannot print membership readiness route'
     wait_until 30 "authenticated inventory did not complete for ${persona}" _scenario_membership_complete "${persona}" "${route}"
 }
+# An applied live join or leave aborts any inventory scan and marks the
+# inventory incomplete before its ACK. A first-page request after the event's
+# push therefore begins a scan of the inventory then staged, and a complete
+# status seen after it is that scan's or a later one's, never an earlier one's.
+_scenario_membership_rescanned() {
+    require_ci_image _scenario_membership_rescanned
+    slack_stub_records api method=users.conversations "label=$2" \
+        | jq -se --argjson mark "$3" 'any(.[]; .seq > $mark and .cursor == "")' > /dev/null || return 1
+    _scenario_membership_complete "$1" "$4"
+}
+# wait_membership_rescan <persona> <label> <event-push-seq>
+wait_membership_rescan() {
+    require_ci_image wait_membership_rescan
+    local route
+    route="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" MEMBERSHIP_READINESS_ROUTE)" || fail 'cannot print membership readiness route'
+    wait_until 30 "staged inventory was not rescanned for $1" _scenario_membership_rescanned "$1" "$2" "$3" "${route}"
+}
 
 # An explicit operator request precedes its separate rename confirmation.
 # Wait for this exact request's generation in the server-written preview,
@@ -6325,6 +6342,27 @@ slack_push_member_joined() {
 slack_push_channel_left() {
     require_ci_image slack_push_channel_left
     _scenario_push_membership channel_left "$@"
+}
+# slack_push_membership_ids <member_joined_channel|channel_left> <label> <channel> <ts>
+# Prints the envelope ID and the Slack event_id it carries, tab separated:
+# a live membership effect is recorded under that event_id.
+slack_push_membership_ids() {
+    require_ci_image slack_push_membership_ids
+    local event
+    event="$(slack_membership_event "$@")" || fail 'cannot build membership event'
+    slack_push_event_ids "$2" "${event}"
+}
+# slack_push_event_ids <label> <event-json>: push one prebuilt event; print as
+# slack_push_membership_ids does.
+slack_push_event_ids() {
+    require_ci_image slack_push_event_ids
+    local request answer
+    _scenario_check_stub_url push
+    request="$(jq -cn --arg l "$1" --argjson e "$2" '{label:$l,event:$e}')" || fail 'cannot build event push'
+    answer="$(curl -fsS --max-time "${SCENARIO_SLACK_PUSH_S}" -H 'Content-Type: application/json' \
+        --data-binary @- "${SCENARIO_SLACK_STUB_URL}/_push" 2>/dev/null <<< "${request}")" || fail 'Slack stub push refused or timed out'
+    jq -er 'select(.ok == true and (.envelope_id|type)=="string" and (.event_id|type)=="string") | "\(.envelope_id)\t\(.event_id)"' \
+        <<< "${answer}" || fail 'push returned no envelope or event ID'
 }
 
 # The fixture supplies Slack metadata and independently expected queue/tag
@@ -6636,6 +6674,10 @@ shared_persona_facts() {
     require_ci_image shared_persona_facts
     bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedPersonaFacts "${SLACK_STATE_DIR}/config.json" "${SLACK_STATE_DIR}/config.json.last-applied" "$@"
 }
+shared_membership_event() {
+    require_ci_image shared_membership_event
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedMembershipEvent "${SLACK_STATE_DIR}/config.json" "${SLACK_STATE_DIR}/config.json.last-applied" "$@"
+}
 
 # Control snapshots contain fake token suffixes only. Never print a whole
 # control or server rejection body. The stub's first file load precedes our
@@ -6777,6 +6819,45 @@ slack_stub_inventory_pages() {
 slack_stub_inventory_clear() {
     require_ci_image slack_stub_inventory_clear
     _scenario_stub_control_patch 'if any(.tokens[]; .label==$l) then (.tokens[] | select(.label==$l) | .inventory_pages)={} else error("unknown label") end' --arg l "$1"
+}
+# slack_stub_inventory_stage <label> <page-size|memberships> <channel>...
+# Replaces only the label's inventory, as raw pages from the first cursor or
+# as memberships, without a control replacement: every fault counter and
+# refusal count stays armed. Prints the stub's inventory record seq. The
+# private snapshot takes the same value, so a later replacement keeps it.
+slack_stub_inventory_stage() {
+    require_ci_image slack_stub_inventory_stage
+    local label="$1" limit="$2" field=inventory_pages value='{}' key='' next part=1 page request answer body
+    shift 2
+    [[ -n "${SCENARIO_SLACK_CONTROL:-}" ]] || fail 'call slack_stub_controls first'
+    _scenario_scratch_file "${SCENARIO_SLACK_CONTROL}"
+    _scenario_check_stub_url inventory
+    if [[ "${limit}" == memberships ]]; then
+        field=memberships
+        value="$(jq -cn '$ARGS.positional' --args "$@")" || fail 'invalid memberships'
+    else
+        [[ "${limit}" =~ ^[1-9][0-9]*$ ]] || fail 'inventory page size must be a positive integer'
+        while :; do
+            next=''
+            (( $# <= limit )) || next="first-page-$((part + 1))"
+            page="$(slack_stub_inventory_body "${next}" "${@:1:limit}")" || fail 'invalid inventory page'
+            value="$(jq -c --arg k "${key}" --slurpfile page <(printf '%s\n' "${page}") '.[$k]=$page[0]' <<< "${value}")" \
+                || fail 'cannot collect inventory pages'
+            (( $# > limit )) || break
+            shift "${limit}"
+            part=$((part + 1))
+            key="${next}"
+        done
+    fi
+    request="$(jq -cn --arg l "${label}" --arg f "${field}" --slurpfile v <(printf '%s\n' "${value}") '{label:$l,($f):$v[0]}')" \
+        || fail 'cannot build inventory stage'
+    answer="$(curl -fsS --max-time "${SCENARIO_SLACK_PUSH_S}" -H 'Content-Type: application/json' \
+        --data-binary @- "${SCENARIO_SLACK_STUB_URL}/_inventory" 2>/dev/null <<< "${request}")" || fail 'Slack stub refused inventory stage'
+    body="$(jq -ce --arg l "${label}" --arg f "${field}" --slurpfile v <(printf '%s\n' "${value}") \
+        'if any(.tokens[]; .label==$l) then (.tokens[] | select(.label==$l) | .[$f])=$v[0] else error("unknown label") end' \
+        "${SCENARIO_SLACK_CONTROL}")" || fail 'cannot update Slack control snapshot'
+    write_file "${SCENARIO_SLACK_CONTROL}" <<< "${body}"
+    jq -er 'select(.ok == true) | .seq | select(type=="number")' <<< "${answer}" || fail 'inventory stage returned no record seq'
 }
 slack_stub_fault() {
     require_ci_image slack_stub_fault

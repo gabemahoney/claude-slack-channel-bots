@@ -138,6 +138,16 @@
  * with `body` and delay_ms past the replacement scan; `delay` still aborts on
  * disconnect. Read faults work on any page.
  *
+ * `POST /_inventory` with `{label, memberships?, inventory_pages?}` (at least
+ * one of the two, validated as in a control) replaces only those inventory
+ * answers on every token rule of that label, in place. Unlike a control
+ * replacement it resets no fault counter or connection refusal and fires no
+ * socket close or push, so a scenario can change one persona's inventory
+ * while another's faults are armed. It answers `{"ok":true,"seq":<n>}`, the
+ * seq of its `inventory` record ({label, fields}); a later control
+ * replacement supersedes it. Refusals: 400 `inventory-invalid`, 409
+ * `unknown-label`, each with an `inventory-refused` record.
+ *
  * Top-level `socket_closes: [{label, refuse_connections?: N}]` closes every
  * live socket for that label with code 1001. The next N apps.connections.open
  * calls for it return temporarily_unavailable, then normal control resumes.
@@ -1054,6 +1064,30 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
     return { label: 'no-token', answers: control.default ?? {} }
   }
 
+  /** Replace one label's inventory answers on its existing rule objects, which key the fault counters. */
+  function stageInventory(text: string): Response {
+    let label: unknown, fields: StubAnswers
+    try {
+      const value: unknown = JSON.parse(text)
+      if (!isObject(value) || Object.keys(value).some(key => !['label', 'memberships', 'inventory_pages'].includes(key)) ||
+          (value.memberships === undefined && value.inventory_pages === undefined)) throw new Error('inventory-invalid')
+      label = value.label
+      if (typeof label !== 'string' || label === '') throw new Error('inventory-invalid')
+      fields = checkAnswers({ memberships: value.memberships, inventory_pages: value.inventory_pages }, 'inventory')
+    } catch {
+      record('inventory-refused', { label: pushFieldText(label), reason: 'inventory-invalid' })
+      return Response.json({ ok: false, error: 'inventory-invalid' }, { status: 400 })
+    }
+    const rules = (control.tokens ?? []).filter(rule => rule.label === label)
+    if (!rules.length) {
+      record('inventory-refused', { label: pushFieldText(label), reason: 'unknown-label' })
+      return Response.json({ ok: false, error: 'unknown-label' }, { status: 409 })
+    }
+    for (const rule of rules) Object.assign(rule, structuredClone(fields))
+    record('inventory', { label: pushFieldText(label), fields: Object.keys(fields) })
+    return Response.json({ ok: true, seq })
+  }
+
   function refusePush(label: string | null, reason: PushRefusalReason): Response {
     record('push-refused', { label: pushFieldText(label), reason })
     return Response.json({ ok: false, error: reason }, { status: PUSH_REFUSAL_STATUS[reason] })
@@ -1211,6 +1245,7 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
         }
       }
       if (path === '/_push' && req.method === 'POST') return push(await req.text())
+      if (path === '/_inventory' && req.method === 'POST') return stageInventory(await req.text())
 
       if (path.startsWith('/link')) {
         const ticket = url.searchParams.get('ticket') ?? ''

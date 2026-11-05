@@ -197,7 +197,7 @@ test('thread script: both modes carry isolated population, sequential samples an
 })
 test('thread overlap collection times each operation through its own result before validation', () => {
   const lib = readFileSync(join(import.meta.dir, 'integration/lib/real-scenario.sh'), 'utf8')
-  const worker = lib.slice(lib.indexOf('real_thread_concurrent_work() {'), lib.indexOf('real_assert_thread_latency() {'))
+  const worker = lib.slice(lib.indexOf('real_thread_concurrent_work() {'), lib.indexOf('real_thread_membership_write() {'))
   expect(worker.match(/real_thread_epoch_ms/g)).toHaveLength(4)
   expect(worker).toMatch(/start="\$\(real_thread_epoch_ms\)"\n\s+envelope="\$\(slack_stub_push[^\n]+\n\s+slack_wait_one_ack[^\n]+\n\s+end="\$\(real_thread_epoch_ms\)"/)
   expect(worker).toMatch(/start="\$\(real_thread_epoch_ms\)"\n\s+line="\$\(stub_session_call[^\n]+\n\s+end="\$\(real_thread_epoch_ms\)"/)
@@ -206,6 +206,33 @@ test('thread overlap collection times each operation through its own result befo
   expect(worker).toContain('attempt_id="$(jq -r .attempt_id')
   expect(worker).toContain("printf 'membership\\t%s\\t%s\\t%s\\n'")
   expect(worker).toContain("printf 'write\\t%s\\t%s\\t%s\\n'")
+  // Strict's write is the retained helper, reached only from the worker after alpha's ACK.
+  expect(worker).toMatch(/if \[\[ "\$\{REAL_THREAD_MODE\}" == strict \]\]; then\n\s+real_thread_membership_write "\$\{n\}"\n\s+return/)
+  expect(worker.indexOf('real_thread_membership_write "${n}"')).toBeGreaterThan(worker.indexOf("printf 'membership\\t"))
+  const strict = lib.slice(lib.indexOf('real_thread_membership_write() {'), lib.indexOf('real_assert_thread_latency() {'))
+  expect(strict.match(/real_thread_epoch_ms/g)).toHaveLength(2)
+  // Only beta's own push through its own ACK is timed; staging precedes it
+  // and the scan wait, facts and validation all follow the end.
+  expect(strict).toMatch(/start="\$\(real_thread_epoch_ms\)"\n\s+ids="\$\(slack_push_event_ids "\$\{REAL_WRITER_LABEL\}" "\$\{event\}"\)"\n\s+slack_wait_one_ack[^\n]+\n\s+end="\$\(real_thread_epoch_ms\)"/)
+  expect(strict.indexOf('slack_stub_inventory_stage')).toBeLessThan(strict.indexOf('start="$(real_thread_epoch_ms)"'))
+  const end = strict.indexOf('end="$(real_thread_epoch_ms)"')
+  for (const after of ['wait_membership_rescan', '_real_thread_write_facts "${facts}.after"', 'shared_membership_event', 'jq -en'])
+    expect(strict.indexOf(after)).toBeGreaterThan(end)
+  // Production ignores a live event older than the last rescan, so each
+  // membership event is built fresh before its own start: beta's after staging.
+  const beta = strict.indexOf('slack_membership_event "${membership}" "${REAL_WRITER_LABEL}" "${REAL_WRITE_CHANNEL}" "$(scenario_ts)" > "${REAL_THREAD_EVIDENCE}/beta-membership-${n}.json"')
+  expect(beta).toBeGreaterThan(strict.indexOf('slack_stub_inventory_stage'))
+  expect(strict.indexOf('event="$(cat "${REAL_THREAD_EVIDENCE}/beta-membership-${n}.json")"')).toBeGreaterThan(beta)
+  expect(strict.indexOf('start="$(real_thread_epoch_ms)"')).toBeGreaterThan(strict.indexOf('event="$(cat'))
+  const alpha = worker.indexOf('slack_membership_event "${membership}" "${REAL_LABEL}" "${REAL_MEMBER_CHANNEL}" "$(scenario_ts)" > "${REAL_THREAD_EVIDENCE}/membership-${n}.json"')
+  expect(alpha).toBeGreaterThan(-1)
+  expect(worker.indexOf('event="$(cat "${REAL_THREAD_EVIDENCE}/membership-${n}.json")"')).toBeGreaterThan(alpha)
+  expect(worker.indexOf('start="$(real_thread_epoch_ms)"')).toBeGreaterThan(worker.indexOf('event="$(cat'))
+  expect(strict).toContain("printf 'write\\t%s\\t%s\\t%s\\n' \"${event_id}\" \"${start}\" \"${end}\"")
+  expect(lib).not.toContain('real_thread_operator_write')
+  expect(lib).not.toContain('configuration_request')
+  const workload = lib.slice(lib.indexOf('real_thread_workload() {'), lib.indexOf('real_thread_root() {'))
+  expect(workload).not.toContain('slack_membership_event')
   expect(lib).toContain('time.time_ns() / 1000000')
 })
 type SendKind = 'text' | 'enter' | 'retype'

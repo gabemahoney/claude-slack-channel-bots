@@ -114,17 +114,21 @@
  *     (Date.now/time.time_ns()/1e6), never stub/server performance.now/monotonic times.
  *     Operations: kind TAB operation-id TAB start-epoch-ms TAB end-epoch-ms.
  *     Kind is membership or write; ID is the actual membership event identity or
- *     write attempt ID, unique within that kind. Prebuild payloads before timing.
- *     Membership endpoints bracket its push invocation through its own ACK wait.
- *     Write endpoints bracket the actual tool-call invocation through its successful
- *     result, BEFORE expensive result validation. Capture inside the background
- *     worker, immediately around each operation, NOT around worker launch/join or
- *     both operations together. Require the existing ACK/write-result checks too.
- *     Recorded ends are poll-bounded supersets (ACK poll, request/poll round trip),
- *     so only the START is credited: an operation overlaps a sample only when
- *     admission <= start < delivery. Ends are still validated, never credited.
- *     This proves the operation was issued while the sample was in flight, not that
- *     the server's handling of it overlapped (the push/call latency is a known limit).
+ *     write attempt ID (strict: the write's Slack event_id), unique within that
+ *     kind. Prebuild payloads before timing. Membership endpoints bracket its push
+ *     invocation through its own ACK wait. Open write endpoints bracket the actual
+ *     tool-call invocation through its successful result; strict write endpoints
+ *     bracket beta's own leave/rejoin push through its own ACK, which Slack gets
+ *     only once the write is durable; both BEFORE expensive result validation.
+ *     Capture inside the background worker, immediately around each operation,
+ *     NOT around worker launch/join or both operations together. Require the
+ *     existing ACK/write-result checks too. Recorded ends are poll-bounded
+ *     supersets (ACK poll, request/poll round trip), so for membership and open
+ *     write only the START is credited: admission <= start < delivery. That proves
+ *     the operation was issued while the sample was in flight, not that the
+ *     server's handling of it overlapped (the push/call latency is a known limit).
+ *     A strict write is credited only when admission <= start AND end < delivery:
+ *     its durable application lies between, so it happened inside the sample.
  *     Samples: persona-key TAB queue-seq TAB admission-epoch-ms TAB delivery-epoch-ms.
  *     Select exactly n2-file's measured key/seq set from real shared_queue_snapshot
  *     observations: admission=the Slack accepted record's received_at; delivery=
@@ -132,9 +136,10 @@
  *     The existing receipt audit/thread-latency must succeed and prove all parts
  *     complete; do not substitute a delivery poll's return or infer an endpoint.
  *     n2-file is that same phase's transcript-receipts thread-latency output.
- *     Both membership AND write need at least one operation starting inside at least
+ *     Both membership AND write need at least one operation credited inside at least
  *     one declared measured sample (they may use different samples). A start before
- *     admission (even with a later recorded end) or at/after delivery, serial-only
+ *     admission (even with a later recorded end) or at/after delivery, a strict
+ *     write ending at/after delivery (a slow start alone is not overlap), serial-only
  *     work, absent kinds, incomplete/mismatched samples, malformed or reversed
  *     endpoints are missing, exit 1. No scheduler-start assertion is proof.
  *     bun "$E" concurrent-overlap "$TEST_NAME" "$mode" 100000 2 "$out/operations.tsv" "$out/sample-intervals.tsv" "$out/n2.txt"
@@ -307,6 +312,26 @@
  *     reordered/lost writes, refused results or lack of overlap fails. Script also
  *     compares each result's text to the existing printer's attempt-result text;
  *     that is exact content checking, not a second numeric/timing oracle.
+ *   membership-writes C <directory> <writer-key> <channel> <case-stub-slice> <submit-seq-mark> <result-seq-mark> <times>
+ *     Strict refuses bot assignments, so its ordered writes are the writer's live
+ *     channel_left then member_joined_channel for one channel outside the burst.
+ *     membership.tsv holds kind(leave|join),envelope_id,event_id,stage_seq in push
+ *     order: stage_seq is the stub's inventory record from slack_stub_inventory_stage
+ *     just before that push, staging the writer's inventory without or with the
+ *     channel; each waits for its own ACK, then for a scan. sharedPersonaFacts
+ *     JSONL: before/join/reopened.jsonl for every persona, leave.jsonl for the
+ *     writer. events.jsonl and events.reopened.jsonl hold {kind,event_id,applied}
+ *     per write, applied the sharedMembershipEvent record. Require prior
+ *     assignment and membership, then a new leave whose event is the live leave's
+ *     (never a scan:), then a fresh mode default at a later order, both applied
+ *     by their own events, exact after reopening; all other choices/leaves/identity
+ *     unchanged. Same overlap as ordered-writes over the writer's burst pushes;
+ *     each write's push/ACK inside the marks, its stage after the previous ACK
+ *     and before its push, a first-page inventory request after its push (and
+ *     before the next stage), and no control replacement between the marks.
+ *     Lines: ordered-writes(overlap,retained,ordered,acked,staged; durable-order),
+ *     ordered-write-ack (burst, N1), membership-write-ack (both writes, N1;
+ *     membership-times.jsonl in <directory>).
  *
  * Fault-aware load commands (Decision 27). C must use two recipients. All event
  * bodies are prebuilt by scenario.sh OUTSIDE the measured window, as for burst.
@@ -609,7 +634,7 @@ export function windowsVerdict(calls: { instance: string; ms: number }[] | undef
 export interface ConcurrentOperation { kind: string; id: string; start_epoch_ms: number; end_epoch_ms: number }
 export interface SampleInterval extends Accepted { start_epoch_ms: number; end_epoch_ms: number }
 export function concurrentOverlapVerdicts(operations: ConcurrentOperation[] | undefined, samples: SampleInterval[] | undefined,
-  measured: N2Sample[] | undefined): Result[] {
+  measured: N2Sample[] | undefined, mode = 'open'): Result[] {
   const validInterval = (r: { start_epoch_ms: number; end_epoch_ms: number }) => nonnegative(r.start_epoch_ms)
     && finite(r.end_epoch_ms) && r.end_epoch_ms > r.start_epoch_ms
   const expected = new Set(measured?.map(identity))
@@ -620,10 +645,14 @@ export function concurrentOverlapVerdicts(operations: ConcurrentOperation[] | un
     || new Set(operations.map(o => JSON.stringify([o.kind, o.id]))).size !== operations.length
   return ['membership', 'write'].map(kind => {
     const work = operations?.filter(o => o.kind === kind) ?? []
-    // Recorded ends are poll-bounded supersets; only the start is credited.
-    const overlapping = work.filter(o => samples?.some(s => o.start_epoch_ms >= s.start_epoch_ms && o.start_epoch_ms < s.end_epoch_ms)).length
-    return result(`thread-${kind}-overlap`, overlapping, { operations: work.length, measured: expected.size }, 'start-inside-measured-sample',
-      missing || !overlapping ? 'missing' : 'pass')
+    // Recorded ends are poll-bounded supersets; only the start is credited,
+    // except a strict write, whose durable point lies between its start and
+    // its observed ACK: the whole operation must lie inside the sample.
+    const durable = mode === 'strict' && kind === 'write'
+    const overlapping = work.filter(o => samples?.some(s => o.start_epoch_ms >= s.start_epoch_ms && o.start_epoch_ms < s.end_epoch_ms
+      && (!durable || o.end_epoch_ms < s.end_epoch_ms))).length
+    return result(`thread-${kind}-overlap`, overlapping, { operations: work.length, measured: expected.size },
+      durable ? 'durable-inside-measured-sample' : 'start-inside-measured-sample', missing || !overlapping ? 'missing' : 'pass')
   })
 }
 
@@ -967,6 +996,78 @@ export function orderedWriteVerdicts(before: any[] | undefined, after: any[] | u
     missing ? 'missing' : !overlap || !order || !retained || !choices || results!.some(r => r.isError !== false || r.error !== undefined) ? 'fail' : 'pass'),
     ackVerdict('ordered-write-ack', ids, times)]
 }
+export interface MembershipWrite { kind: string; envelope_id: string; event_id: string; stage_seq: string }
+export interface MembershipWriteStates { before?: any[]; leave?: any[]; join?: any[]; reopened?: any[]; events?: any[]; eventsReopened?: any[] }
+/** Strict ordered writes: the writer's live leave then qualifying rejoin of one channel. */
+export function membershipWriteVerdicts(keys: string[], writer: string, channel: string, mode: string, states: MembershipWriteStates,
+  writes: MembershipWrite[] | undefined, stub: any[] | undefined, submitMark: number, resultMark: number,
+  times: Times[] | undefined, writeTimes: Times[] | undefined): Result[] {
+  const facts = (rows: any[] | undefined, key: string) => {
+    const found = rows?.filter(r => r.key === key) ?? []
+    return found.length === 1 && object(found[0].assignments) && object(found[0].leaves) && object(found[0].historicalMembership) ? found[0] : undefined
+  }
+  const writeIds = writes?.map(w => w.envelope_id) ?? []
+  const pushes = stub?.filter(r => r.event === 'push' && r.label === writer) ?? []
+  const burst = pushes.filter(p => !writeIds.includes(p.envelope_id)), burstIds = burst.map(p => p.envelope_id)
+  const acks = stub?.filter(r => r.event === 'ws-message' && burstIds.includes(r.envelope_id)) ?? []
+  const q = (['before', 'leave', 'join', 'reopened'] as const).map(phase => facts(states[phase], writer))
+  const others = keys.filter(k => k !== writer)
+  const missing = !keys.includes(writer) || !others.length || q.some(f => !f) || !stub || !burst.length || !acks.length
+    || writes?.length !== 2 || !integer(submitMark) || !integer(resultMark) || states.events?.length !== 2 || states.eventsReopened?.length !== 2
+    || (['before', 'join', 'reopened'] as const).some(phase => others.some(k => !facts(states[phase], k)))
+  const [before, left, joined, reopened] = q
+  // Unrelated state: every persona's choices, leaves and identity, except the writer's write channel.
+  const unrelated = (f: any, key: string) => {
+    if (!f) return undefined
+    const assignments = { ...f.assignments }, leaves = { ...f.leaves }
+    if (key === writer) { delete assignments[channel]; delete leaves[channel] }
+    return { mode: f.mode, incarnation: f.incarnation, assignments, leaves, removedDestinations: f.removedDestinations, threadMemoryCreated: f.threadMemoryCreated }
+  }
+  const membership = (f: any) => f?.historicalMembership?.[channel] ? { member: f.historicalMembership[channel].member, boundary: f.historicalMembership[channel].boundary } : undefined
+  const retained = !missing && keys.every(k => {
+    const phases = (k === writer ? ['before', 'leave', 'join', 'reopened'] : ['before', 'join', 'reopened']) as (keyof MembershipWriteStates)[]
+    const base = unrelated(facts(states.before, k), k)
+    return phases.every(phase => isDeepStrictEqual(unrelated(facts(states[phase], k), k), base))
+  }) && isDeepStrictEqual(reopened.assignments[channel], joined.assignments[channel])
+    && isDeepStrictEqual(reopened.leaves[channel], joined.leaves[channel]) && isDeepStrictEqual(membership(reopened), membership(joined))
+  const prior = before?.assignments[channel], leave = left?.leaves[channel], rejoined = joined?.assignments[channel]
+  const fresh = mode === 'open' ? 'mentions' : 'off'
+  const ordered = !missing && writes!.map(w => w.kind).join(',') === 'leave,join'
+    && object(prior) && integer(prior.order) && membership(before)?.member === true
+    && left.assignments[channel] == null && object(leave) && typeof leave.event === 'string' && !leave.event.startsWith('scan:')
+    && leave.event === writes![0].event_id && integer(leave.boundary) && leave.boundary > prior.order && leave.incarnation === before.incarnation
+    && !isDeepStrictEqual(leave, before.leaves[channel]) && leave.boundary > (before.leaves[channel]?.boundary ?? 0)
+    && isDeepStrictEqual(membership(left), { member: false, boundary: leave.boundary })
+    && object(rejoined) && integer(rejoined.order) && rejoined.order > leave.boundary
+    && isDeepStrictEqual(rejoined, { delivery: fresh, order: rejoined.order })
+    && isDeepStrictEqual(joined.leaves[channel], leave) && isDeepStrictEqual(membership(joined), { member: true, boundary: rejoined.order })
+    // The live events themselves, not a scan's, applied the leave and the rejoin.
+    && writes![1].event_id !== writes![0].event_id && isDeepStrictEqual(states.events, [
+      { kind: 'leave', event_id: writes![0].event_id, applied: { channel, member: false, order: leave.boundary, boundary: leave.boundary } },
+      { kind: 'join', event_id: writes![1].event_id, applied: { channel, member: true, order: rejoined.order, boundary: rejoined.order } }])
+    && isDeepStrictEqual(states.eventsReopened, states.events)
+  // Each write is its own acknowledged envelope, in order, inside the marks,
+  // after the writer's inventory was staged to agree and before a scan of it.
+  const event = { leave: 'channel_left', join: 'member_joined_channel' } as Record<string, string>
+  const firstPages = stub?.filter(r => r.event === 'api' && r.method === 'users.conversations' && r.label === writer && r.cursor === '') ?? []
+  let acked = !missing && new Set(writeIds).size === 2, staged = !missing, previous = submitMark
+  for (const [i, w] of (missing ? [] : writes!).entries()) {
+    const push = pushes.filter(p => p.envelope_id === w.envelope_id), ack = stub!.filter(r => r.event === 'ws-message' && r.envelope_id === w.envelope_id)
+    const stage = Number(w.stage_seq), next = i + 1 < writes!.length ? Number(writes![i + 1].stage_seq) : Infinity
+    acked &&= push.length === 1 && ack.length === 1 && push[0].channel === channel && push[0].event_type === event[w.kind]
+      && push[0].seq > previous && ack[0].seq > push[0].seq && ack[0].seq <= resultMark
+    staged &&= integer(stage) && stage > previous && stage < (push[0]?.seq ?? -Infinity)
+      && stub!.some(r => r.event === 'inventory' && r.seq === stage && r.label === writer)
+      && firstPages.some(r => r.seq > push[0].seq && r.seq < next)
+    previous = ack[0]?.seq ?? Infinity
+  }
+  // Replacing the control would reset the burst's fault counters.
+  staged &&= !stub?.some(r => r.event === 'control' && r.seq > submitMark && r.seq <= resultMark)
+  const overlap = burst.some(p => p.seq <= submitMark) && acks.some(a => a.seq > resultMark) && resultMark >= submitMark
+  return [result('ordered-writes', missing ? 0 : 2, { overlap: overlap ? 'yes' : 'no', retained: retained ? 'yes' : 'no', ordered: ordered ? 'yes' : 'no', acked: acked ? 'yes' : 'no', staged: staged ? 'yes' : 'no' },
+    'durable-order', missing ? 'missing' : !overlap || !retained || !ordered || !acked || !staged ? 'fail' : 'pass'),
+    ackVerdict('ordered-write-ack', burstIds, times), ackVerdict('membership-write-ack', writeIds, writeTimes)]
+}
 
 export interface FaultItem extends BurstItem { ordinal: number; root: string; dependent: boolean }
 export interface FaultPlan { kind: string; key: string; keys: string[]; all: boolean; channels: string[]; items: FaultItem[] }
@@ -1303,6 +1404,14 @@ async function additional(command: string, c: Context, args: string[]): Promise<
     const [dir, stub, submit, done, times] = args, path = (name: string) => join(dir, name)
     return orderedWriteVerdicts(evidenceRows(path('before.jsonl')), evidenceRows(path('after.jsonl')), evidenceRows(path('reopened.jsonl')),
       tsv(path('expected.tsv'), ['channel', 'delivery']), evidenceRows(path('results.jsonl')), evidenceRows(stub), numeric(submit), numeric(done), timingRows(times))
+  }
+  if (command === 'membership-writes') {
+    countArgs(args, 7)
+    const [dir, writer, channel, stub, submit, done, times] = args, path = (name: string) => join(dir, name), p = await population()
+    return membershipWriteVerdicts(p.sr8Personas(c.recipients), writer, channel, c.mode,
+      { before: evidenceRows(path('before.jsonl')), leave: evidenceRows(path('leave.jsonl')), join: evidenceRows(path('join.jsonl')), reopened: evidenceRows(path('reopened.jsonl')),
+        events: evidenceRows(path('events.jsonl')), eventsReopened: evidenceRows(path('events.reopened.jsonl')) },
+      tsv(path('membership.tsv'), ['kind', 'envelope_id', 'event_id', 'stage_seq']), evidenceRows(stub), numeric(submit), numeric(done), timingRows(times), timingRows(path('membership-times.jsonl')))
   }
 }
 function measurements(path: string, offset: number): Measurement[] | undefined {
@@ -1820,12 +1929,12 @@ async function windows(c: Context, args: string[]): Promise<Result[]> {
   const windowsAt = (file: string) => tsv(file, ['instance', 'start', 'end'])?.map(w => ({ instance: w.instance, start: numeric(w.start) * 1000, end: numeric(w.end) * 1000 }))
   return [windowsVerdict(calls, windowsAt(args[1]), Number(printer('DELIVERY_MAX_AD_CALLS_PER_S')), windowsAt(args[2]))]
 }
-function concurrentOverlap(args: string[]): Result[] {
+function concurrentOverlap(c: Context, args: string[]): Result[] {
   countArgs(args, 3)
   const operations = tsv(args[0], ['kind', 'id', 'start', 'end'])?.map(o => ({ kind: o.kind, id: o.id, start_epoch_ms: numeric(o.start), end_epoch_ms: numeric(o.end) }))
   const samples = tsv(args[1], ['key', 'seq', 'start', 'end'])?.map(s => ({ key: s.key, seq: numeric(s.seq), start_epoch_ms: numeric(s.start), end_epoch_ms: numeric(s.end) }))
   const measured = textFile(args[2])
-  return concurrentOverlapVerdicts(operations, samples, measured === undefined ? undefined : n2Samples(measured))
+  return concurrentOverlapVerdicts(operations, samples, measured === undefined ? undefined : n2Samples(measured), c.mode)
 }
 function conditions(args: string[]) {
   countArgs(args, 2)
@@ -1870,7 +1979,7 @@ async function main(args: string[]): Promise<number> {
   if (command === 'seal') return printResults(c, await seal(c, phase, args))
   if (command === 'n4') return printResults(c, await n4(c, args))
   if (command === 'windows') return printResults(c, await windows(c, args))
-  if (command === 'concurrent-overlap') return printResults(c, concurrentOverlap(args))
+  if (command === 'concurrent-overlap') return printResults(c, concurrentOverlap(c, args))
   const extra = await additional(command!, c, args)
   if (extra) return printResults(c, extra)
   throw new Error('usage')

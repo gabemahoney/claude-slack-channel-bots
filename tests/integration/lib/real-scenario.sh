@@ -267,8 +267,9 @@ real_assert_latency() {
 }
 # SR-8 uses a fresh state directory: seed before its first server start. Keep
 # the DM phase's journals for once-only usage/duplicate accounting on EXIT.
-# Two population personas: alpha is measured; beta supplies concurrent tool
-# writes through a separate MCP session without replacing alpha's connection.
+# Two population personas: alpha is measured; beta's channel takes the
+# concurrent writes, through its own MCP session in open and its own live
+# leave and rejoin events in strict, without replacing alpha's connection.
 REAL_THREAD_LOOKUP_DELAY_MS=500
 REAL_PRIOR_STATES=()
 real_thread_personas() {
@@ -290,7 +291,9 @@ real_thread_personas() {
     bun "${REAL_SR8}" config "${REAL_THREAD_MODE}" 100000 2 "${SCENARIO_ROOT}" "${SCENARIO_PORT}" "${compact}" > "${config}"
     # Read names from the population configuration; no second population recipe.
     while IFS= read -r key; do real_persona "${key}" "${instruction}" "thread-${REAL_THREAD_MODE}-${key}"; done < <(jq -r '.personas[].name' "${config}")
+    REAL_WRITER_NAME="${REAL_NAME}"
     REAL_WRITER_KEY="${REAL_KEY}"
+    REAL_WRITER_LABEL="${REAL_LABEL}"
     REAL_WRITER_WORK="${REAL_WORK}"
     jq --slurpfile real "${REAL_PERSONAS}" '
       .personas |= map(. as $p | ($real | map(select(.name == $p.name)) | last) as $r |
@@ -303,6 +306,10 @@ real_thread_personas() {
     REAL_CHANNEL="$(jq -r '.personas[0].channels[0].id' "${config}")"
     REAL_MEMBER_CHANNEL="$(jq -r '.personas[0].channels | map(select(.delivery=="off"))[0].id' "${config}")"
     REAL_WRITE_CHANNEL="$(jq -r '.personas[0].channels | map(select(.delivery=="off"))[1].id' "${config}")"
+    # Beta's inventory is its configured channel list, in config order.
+    mapfile -t REAL_WRITER_CHANNELS < <(jq -r --arg n "${REAL_WRITER_NAME}" '.personas[] | select(.name==$n) | .channels[].id' "${SLACK_STATE_DIR}/config.json")
+    jq -e --arg n "${REAL_WRITER_NAME}" --arg c "${REAL_WRITE_CHANNEL}" 'any(.personas[] | select(.name==$n) | .channels[]; .id==$c)' \
+        "${SLACK_STATE_DIR}/config.json" > /dev/null || fail 'beta does not hold the write channel'
     jq -s --slurpfile config "${SLACK_STATE_DIR}/config.json" '
       {tokens:map(. as $t | ($config[0].personas | map(select(.name==$t.label)) | first) as $p |
         if $p then .memberships=[$p.channels[].id] else . end) | unique_by(.label),default:{auth:"invalid_auth",connections:"invalid_auth"}}' \
@@ -319,11 +326,13 @@ real_thread_now_ms() { python3 -c 'import time; print(time.monotonic_ns() / 1000
 # Operation endpoints share the durable queue's Unix epoch clock, not the
 # startup duration's monotonic clock.
 real_thread_epoch_ms() { python3 -c 'import time; print(time.time_ns() / 1000000)'; }
-# Build all Slack events and write arguments before admitting any sample.
+# Build every sample and write argument before admitting any sample.
 # IDs come from f6's shared builder, including two previously unused senders.
+# Membership events are built by their workers instead: production ignores a
+# live event older than its persona's last rescan, which each push starts.
 real_thread_workload() {
     require_scenario_home real_thread_workload
-    local n ts sender text membership args delivery
+    local n ts sender text args delivery
     REAL_THREAD_ROOT="$(scenario_ts)"
     text="$(scenario_mention_text "${REAL_BOT_USER_ID}" "$(scenario_text thread-root)")"
     slack_mention_event "${REAL_CHANNEL}" "${text}" "${REAL_THREAD_ROOT}" > "${REAL_THREAD_EVIDENCE}/root.json"
@@ -338,8 +347,7 @@ real_thread_workload() {
         REAL_THREAD_SAMPLES+=("${ts}")
         text="$(scenario_text "thread-latency-${n}")"
         slack_reply_event "${REAL_CHANNEL}" "${REAL_THREAD_ROOT}" "${text}" "${ts}" "${sender}" > "${REAL_THREAD_EVIDENCE}/sample-${n}.json"
-        if (( n % 2 )); then membership=channel_left; delivery=all; else membership=member_joined_channel; delivery=off; fi
-        slack_membership_event "${membership}" "${REAL_LABEL}" "${REAL_MEMBER_CHANNEL}" "$(scenario_ts)" > "${REAL_THREAD_EVIDENCE}/membership-${n}.json"
+        if (( n % 2 )); then delivery=all; else delivery=off; fi
         args="$(attempt_args "$(scenario_attempt_id "thread-${REAL_THREAD_MODE}-write-${n}")" "${REAL_WRITE_CHANNEL}" "${delivery}")"
         printf '%s\n' "${args}" > "${REAL_THREAD_EVIDENCE}/write-${n}.json"
     done
@@ -361,8 +369,24 @@ real_thread_writer_start() {
 _real_thread_writer_connected() {
     stub_session_sessions "${REAL_WRITER_WORK}" | jq -se 'any(.[]; .event=="connected")' > /dev/null
 }
+# Both personas' production-parsed facts, as files: the shared lists exceed
+# a safe single argument. The live membership channel is alpha's concurrent
+# event target and the write channel beta's; every other assignment and
+# leave, and both incarnations, must hold.
+_real_thread_write_facts() {
+    shared_persona_facts "${REAL_KEY}" > "$1.alpha.json" || return 1
+    shared_persona_facts "${REAL_WRITER_KEY}" > "$1.beta.json" || return 1
+    jq -cn --slurpfile a "$1.alpha.json" --slurpfile b "$1.beta.json" \
+        --arg member "${REAL_MEMBER_CHANNEL}" --arg write "${REAL_WRITE_CHANNEL}" '
+      {written:($b[0].assignments[$write] // null), leave:($b[0].leaves[$write] // null),
+       membership:($b[0].historicalMembership[$write] // null | if . then {member,boundary} else null end),
+       unrelated:[$a[0].incarnation, ($a[0].assignments|del(.[$member])), ($a[0].leaves|del(.[$member])),
+         $b[0].incarnation, ($b[0].assignments|del(.[$write])), ($b[0].leaves|del(.[$write]))]}' > "$1"
+}
 real_thread_concurrent_work() {
-    local n="$1" envelope args delivery event event_id attempt_id start end line expected
+    local n="$1" membership=channel_left envelope args delivery event event_id attempt_id start end line expected
+    (( n % 2 )) || membership=member_joined_channel
+    slack_membership_event "${membership}" "${REAL_LABEL}" "${REAL_MEMBER_CHANNEL}" "$(scenario_ts)" > "${REAL_THREAD_EVIDENCE}/membership-${n}.json"
     event="$(cat "${REAL_THREAD_EVIDENCE}/membership-${n}.json")"
     event_id="$(jq -r .event_ts <<< "${event}")"
     args="$(cat "${REAL_THREAD_EVIDENCE}/write-${n}.json")"
@@ -373,6 +397,10 @@ real_thread_concurrent_work() {
     slack_wait_one_ack "${envelope}"
     end="$(real_thread_epoch_ms)"
     printf 'membership\t%s\t%s\t%s\n' "${event_id}" "${start}" "${end}" >> "${REAL_THREAD_EVIDENCE}/operations.tsv"
+    if [[ "${REAL_THREAD_MODE}" == strict ]]; then
+        real_thread_membership_write "${n}"
+        return
+    fi
     start="$(real_thread_epoch_ms)"
     line="$(stub_session_call "${REAL_WRITER_WORK}" "${REAL_THREAD_WRITE_TOOL}" "${args}")" || exit 1
     end="$(real_thread_epoch_ms)"
@@ -384,6 +412,51 @@ real_thread_concurrent_work() {
     [[ "$(jq -r .isError <<< "${line}")" == false && "$(jq -r .text <<< "${line}")" == "${expected}" ]] \
         || fail "thread-write-${n}: tool result differs from retained outcome/current facts"
     printf 'write\t%s\t%s\t%s\n' "${attempt_id}" "${start}" "${end}" >> "${REAL_THREAD_EVIDENCE}/operations.tsv"
+}
+# Strict refuses bot assignments (t1.tad.5i SR-2.3), so beta's per-sample
+# write is its own live leave (odd samples) or rejoin (even) of the write
+# channel: one event, acknowledged only once durable. Beta's inventory is
+# staged to agree first, without a control replacement, and the event's scan
+# settles before the facts are read. The event is built after staging, so its
+# timestamp follows the previous write's settled rescan. The leave must be this
+# event's, never a scan's, and the rejoin a fresh default at a later order
+# applied by its event.
+real_thread_membership_write() {
+    local n="$1" kind=leave membership=channel_left id="thread-strict-write-$1" facts event ids envelope event_id start end applied channel
+    local -a staged=()
+    (( n % 2 )) || { kind=join; membership=member_joined_channel; }
+    facts="${REAL_THREAD_EVIDENCE}/${id}"
+    for channel in "${REAL_WRITER_CHANNELS[@]}"; do
+        if [[ "${kind}" == join || "${channel}" != "${REAL_WRITE_CHANNEL}" ]]; then staged+=("${channel}"); fi
+    done
+    _real_thread_write_facts "${facts}.before" || fail "${id}: cannot read shared facts"
+    slack_stub_inventory_stage "${REAL_WRITER_LABEL}" memberships "${staged[@]}" > "${facts}.stage"
+    slack_membership_event "${membership}" "${REAL_WRITER_LABEL}" "${REAL_WRITE_CHANNEL}" "$(scenario_ts)" > "${REAL_THREAD_EVIDENCE}/beta-membership-${n}.json"
+    event="$(cat "${REAL_THREAD_EVIDENCE}/beta-membership-${n}.json")"
+    start="$(real_thread_epoch_ms)"
+    ids="$(slack_push_event_ids "${REAL_WRITER_LABEL}" "${event}")"
+    slack_wait_one_ack "${ids%%$'\t'*}"
+    end="$(real_thread_epoch_ms)"
+    IFS=$'\t' read -r envelope event_id <<< "${ids}"
+    wait_membership_rescan "${REAL_WRITER_KEY}" "${REAL_WRITER_LABEL}" "$(slack_stub_record_field seq push "envelope_id=${envelope}")"
+    _real_thread_write_facts "${facts}.after" || fail "${id}: cannot read shared facts"
+    applied="$(shared_membership_event "${REAL_WRITER_KEY}" "${event_id}")" || fail "${id}: cannot read the applied event"
+    jq -en --slurpfile before "${facts}.before" --slurpfile after "${facts}.after" --argjson applied "${applied}" \
+        --arg kind "${kind}" --arg event "${event_id}" --arg channel "${REAL_WRITE_CHANNEL}" '
+      $before[0] as $b | $after[0] as $a | $a.unrelated == $b.unrelated and $b.membership.member == ($kind == "leave") and
+      if $kind == "leave" then
+        $a.written == null and ($event | startswith("scan:") | not) and $a.leave.event == $event
+        and ($a.leave.boundary | type) == "number" and $a.leave.boundary > ([$b.written.order // 0, $b.leave.boundary // 0] | max)
+        and $a.membership == {member:false,boundary:$a.leave.boundary}
+        and $applied == {channel:$channel,member:false,order:$a.leave.boundary,boundary:$a.leave.boundary}
+      else
+        $b.written == null and ($a.written.order | type) == "number" and $a.written == {delivery:"off",order:$a.written.order}
+        and $a.written.order > ($b.leave.boundary // 0) and $a.leave == $b.leave
+        and $a.membership == {member:true,boundary:$a.written.order}
+        and $applied == {channel:$channel,member:true,order:$a.written.order,boundary:$a.written.order}
+      end
+    ' > /dev/null || fail "${id}: ${kind} was not applied by its own event in order, or changed unrelated state"
+    printf 'write\t%s\t%s\t%s\n' "${event_id}" "${start}" "${end}" >> "${REAL_THREAD_EVIDENCE}/operations.tsv"
 }
 real_assert_thread_latency() {
     bun "${REAL_RECEIPTS}" thread-latency "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" \
