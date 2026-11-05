@@ -625,10 +625,10 @@ own start and end on the host's epoch clock. `thread-intervals` in
 `transcript-receipts.ts` takes a sample's admission from its accepted
 `received_at` and its delivery from its last durable delivered part;
 `concurrent-overlap` in `sr8-evidence.ts` credits an operation only when it
-starts at or after admission and before delivery, never by its end, and
-requires at least one credited membership event and one credited write. A
-credited start proves the operation was issued while the sample was in
-flight, not that the server handled it then.
+starts at or after admission and before delivery, and requires at least one
+credited membership event and one credited write. Membership events and open
+writes receive start-only credit: this proves the operation was issued while
+the sample was in flight, not that the server handled it then. A strict-mode write (the writer persona's own live leave or rejoin of its write channel, ACKed only once durable) also needs its end before that sample's delivery, because its durable application lies inside that push-to-ACK span.
 
 Use the one nearest-rank implementation, `percentile` exported by
 `tests/integration/fixtures/transcript-receipts.ts`: sort ascending and select
