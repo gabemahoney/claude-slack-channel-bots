@@ -3,6 +3,9 @@
  * permission-1|permission-2 <work> <key> queues each permission once/session.
  * receipt <work> <key> releases one submitted text (displayed-states delays it).
  * outcome <work> <key> <token> reads AD's decision/delivery, never decides it.
+ * complete-1|complete-2 <work> <key> <token>, once AD reads that observed
+ * request allow/delivered: ends the allowed turn through the registered Stop
+ * hook and waits for AD itself to read waiting. Once per session, no retry.
  * notice-setup <work> selects ordinary at-once receipts BEFORE launch.
  * notice-end|notice-ended|notice-resume <work> <key> <evidence-file>:
  * graceful sentinel through fresh AD waiting, then verified ended; recheck;
@@ -124,7 +127,7 @@ async function noticeControl(client: NoticeClient, command: string, id: string, 
 async function run() {
   const [binArg, command, workArg, key, token] = process.argv.slice(2)
   requireFact(binArg && workArg && ['setup', 'permission-1', 'permission-2', 'receipt', 'outcome',
-    'notice-setup', 'notice-end', 'notice-ended', 'notice-resume'].includes(command))
+    'complete-1', 'complete-2', 'notice-setup', 'notice-end', 'notice-ended', 'notice-resume'].includes(command))
   const root = realpathSync(process.env.SCENARIO_ROOT!)
   const bin = realpathSync(scratchPath(root, binArg, true))
   const work = realpathSync(scratchPath(root, workArg, true))
@@ -205,7 +208,8 @@ async function run() {
         decision: result.decision, delivery: result.delivery }))
       return
     }
-    requireFact(!token)
+    const complete = command.startsWith('complete-')
+    requireFact(complete ? token : !token)
     const control = scratchPath(root, join(bin, `stub-claude-hooks.${session}`))
     const record = scratchPath(root, control + '.jsonl')
     const observed = scratchPath(root, control + '.observed')
@@ -226,6 +230,17 @@ async function run() {
         await Bun.sleep(100)
       }
     }
+    if (complete) {
+      // Only this session's observed request, decided allow and delivered to
+      // its registered hook, may end the simulated turn.
+      requireFact(commands.includes(`permission-${command.slice(-1)}`))
+      requireFact(boundedText(observed).split('\n').includes(token!))
+      const result = await client.getPermission({ request_token: token })
+      requireFact(result.request_token === token && result.decision === 'allow' && result.delivery === 'delivered' &&
+        JSON.parse(result.tool_input).command === `printf fixture-${command.slice(-1)}`)
+    }
+    // A completion's waiting must follow its Stop, never precede it.
+    requireFact(!complete || bind(await client.get({ instance_id: id })).state !== 'waiting')
     bind(await client.get({ instance_id: id }))
     appendControl(control, command + '\n')
     do {
@@ -238,14 +253,22 @@ async function run() {
           console.log(JSON.stringify({ instance_id: id, session_id: session, command, state: row.state }))
           return
         }
-        const requests = row.permission_requests.filter((r: any) => JSON.parse(r.tool_input).command === `printf fixture-${command.slice(-1)}`)
-        if (requests.length === 1) {
-          const request = requests[0]
-          appendControl(observed, request.request_token + '\n')
-          console.log(JSON.stringify({ instance_id: id, session_id: session, command, request_token: request.request_token, delivery: request.delivery }))
-          return
+        if (complete) {
+          requireFact(events.at(-1).event === 'Stop')
+          if (row.state === 'waiting') {
+            console.log(JSON.stringify({ instance_id: id, session_id: session, command, request_token: token, state: row.state }))
+            return
+          }
+        } else {
+          const requests = row.permission_requests.filter((r: any) => JSON.parse(r.tool_input).command === `printf fixture-${command.slice(-1)}`)
+          if (requests.length === 1) {
+            const request = requests[0]
+            appendControl(observed, request.request_token + '\n')
+            console.log(JSON.stringify({ instance_id: id, session_id: session, command, request_token: request.request_token, delivery: request.delivery }))
+            return
+          }
+          requireFact(requests.length === 0)
         }
-        requireFact(requests.length === 0)
       }
       await Bun.sleep(100)
     } while (Date.now() < deadline)

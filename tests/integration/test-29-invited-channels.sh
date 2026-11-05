@@ -1166,6 +1166,9 @@ permission_post() {
     [[ -n "${button}" ]] || fail 'actual permission has no Allow button'
     ack_control "$(slack_push_button "${q}" "${DEST}" "${PROMPT_TS}" perm_allow_ "${HUMAN}")"
     wait_until "${EVENT_WAIT_S}" 'valid prompt response not delivered to registered hook' permission_outcome_allowed "${dir}" "${key}" "${token}"
+    # The allowed turn ends through the registered Stop hook; AD reads waiting
+    # before any later delivery to this worker.
+    shared_stub_permission "complete-${number}" "${dir}" "${key}" "${token}" > /dev/null
 }
 
 observe_other_post() {

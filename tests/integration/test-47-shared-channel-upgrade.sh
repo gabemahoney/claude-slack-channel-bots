@@ -468,7 +468,9 @@ permission_allowed() {
     shared_stub_permission outcome "${WORK[$1]}" "$1" "$2" | jq -e '.decision=="allow" and .delivery=="delivered"' > /dev/null
 }
 # prompt <key> <1|2> <destination>: the registered hook's prompt posts to the
-# one destination and its Allow response reaches the hook.
+# one destination and its Allow response reaches the hook. The allowed turn
+# then ends through the registered Stop hook, and AD reads waiting before any
+# later delivery to that worker.
 prompt() {
     local key="$1" mark request token post ts
     mark="$(slack_post_mark)"
@@ -481,6 +483,7 @@ prompt() {
     [[ -n "$(slack_recorded_button "${LABEL[${key}]}" "$3" "${ts}" perm_allow_)" ]] || fail 'prompt has no Allow button'
     ack "$(slack_push_button "${LABEL[${key}]}" "$3" "${ts}" perm_allow_ "${HUMAN}")"
     wait_until "${EVENT_WAIT_S}" 'prompt response not delivered to the registered hook' permission_allowed "${key}" "${token}"
+    shared_stub_permission "complete-$2" "${WORK[${key}]}" "${key}" "${token}" > /dev/null
 }
 # messages_waiting <key> <channel-with-all> <destination>: an ended worker's
 # queued work posts the production notice to the one destination.

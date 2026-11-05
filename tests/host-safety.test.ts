@@ -1295,8 +1295,8 @@ describe('static audit: every child process call’s env is a direct hostSafeChi
     const files = hostTestFiles()
     expect(auditTree(files, (sf) => childProcessAudit(sf).findings)).toEqual([])
     expect(files.reduce((sum, path) => sum + childProcessAudit(parseFile(path)).calls, 0)).toBeGreaterThan(0)
-    // The inherited-directory cases and shared declaration runner are all found and accepted.
-    expect(childProcessAudit(parseFile(join(TESTS_DIR, 'host-safety.test.ts')))).toEqual({ calls: 3, findings: [] })
+    // The inherited-directory cases, shared declaration runner and permission-turn stub runner are all found and accepted.
+    expect(childProcessAudit(parseFile(join(TESTS_DIR, 'host-safety.test.ts')))).toEqual({ calls: 4, findings: [] })
   })
 
   test('the audited files: every test file bun runs, node_modules excluded, and every test helper', () => {
@@ -4562,6 +4562,83 @@ test('shared registered-hook controls bind the actual row and fail closed withou
       await expect(run()).rejects.toThrow()
       unlinkSync(control); unlinkSync(record); unlinkSync(control + '.observed')
     })
+    await check('completion needs an observed allow/delivered request, then AD itself reads waiting after its registered Stop', async () => {
+      const control = join(bin, `stub-claude-hooks.${session}`), record = control + '.jsonl', observed = control + '.observed'
+      const token = 'observed-permission-1'
+      let permission: any, stopEvent: string, reaches: boolean, stops: number
+      const arm = (queued = 'permission-1\n') => {
+        reset()
+        writeFileSync(control, queued); writeFileSync(observed, token + '\n')
+        writeFileSync(record, JSON.stringify({ command: 'permission-1', event: 'PermissionRequest', instance_id: id, session_id: session }) + '\n')
+        row.state = 'check_permission'
+        permission = { request_token: token, decision: 'allow', delivery: 'delivered', tool_input: JSON.stringify({ command: 'printf fixture-1' }) }
+        stopEvent = 'Stop'; reaches = true; stops = 0
+        // Models the stub: only the appended control fires the registered
+        // Stop, and only that hook can move AD's row to waiting.
+        setAuditClient(Object.assign(makeStubClient(), {
+          async get() {
+            const commands = readFileSync(control, 'utf8').split('\n').filter(c => c.startsWith('complete-'))
+            for (const command of commands.slice(stops)) {
+              stops++
+              writeFileSync(record, readFileSync(record, 'utf8') + JSON.stringify({ command, event: stopEvent, instance_id: id, session_id: session }) + '\n')
+              if (reaches) row.state = 'waiting'
+            }
+            return structuredClone(row)
+          },
+          async getPermission(args: any) { assert.deepEqual(args, { request_token: token }); return structuredClone(permission) },
+        }))
+      }
+      const complete = (command = 'complete-1') => {
+        context.argv = ['bun', 'declarations', bin, command, work, key, token]
+        return run()
+      }
+      arm()
+      const logged = captured.length
+      await complete()
+      expect(readFileSync(control, 'utf8')).toBe('permission-1\ncomplete-1\n')
+      expect(row.state).toBe('waiting')
+      expect(captured.slice(logged).map(args => JSON.parse(String(args[0])))).toEqual([{
+        instance_id: id, session_id: session, command: 'complete-1', request_token: token, state: 'waiting' }])
+      // Each case leaves every other completion guard satisfied, so it fails
+      // only if the guard it names is gone.
+      const refusals: [string, () => void, string?][] = [
+        ['undecided', () => { permission.decision = null }],
+        ['denied', () => { permission.decision = 'deny' }],
+        ['fallen back', () => { permission.delivery = 'fallen_back' }],
+        ['foreign token answer', () => { permission.request_token = 'foreign' }],
+        ['foreign tool marker', () => { permission.tool_input = JSON.stringify({ command: 'printf fixture-2' }) }],
+        ['token not observed for this session', () => { writeFileSync(observed, 'observed-permission-2\n') }],
+        ['other permission number', () => { writeFileSync(control, 'permission-1\npermission-2\n') }, 'complete-2'],
+        ['no permission queued', () => { writeFileSync(control, '') }],
+        ['already waiting before its Stop', () => { row.state = 'waiting' }],
+      ]
+      for (const [, mutate, command] of refusals) {
+        arm(); mutate()
+        const before = readFileSync(control, 'utf8')
+        await expect(complete(command)).rejects.toThrow()
+        expect(readFileSync(control, 'utf8')).toBe(before)
+      }
+      arm()
+      context.argv = ['bun', 'declarations', bin, 'complete-1', work, key]
+      await expect(run()).rejects.toThrow()
+      expect(readFileSync(control, 'utf8')).toBe('permission-1\n')
+      // A recorded non-Stop event never counts as the turn's end.
+      arm(); stopEvent = 'PermissionRequest'
+      await expect(complete()).rejects.toThrow()
+      // AD never reading waiting expires at the unchanged 20 s bound, with
+      // the one control appended and never retried.
+      arm(); reaches = false
+      const started = clock.now()
+      await expect(complete()).rejects.toThrow()
+      expect(clock.now() - started).toBe(20000)
+      expect(readFileSync(control, 'utf8')).toBe('permission-1\ncomplete-1\n')
+      expect(row.state).toBe('check_permission')
+      // Once per session: a timed-out completion, row still check_permission,
+      // is never appended again.
+      await expect(complete()).rejects.toThrow()
+      expect(readFileSync(control, 'utf8')).toBe('permission-1\ncomplete-1\n')
+      unlinkSync(control); unlinkSync(record); unlinkSync(observed)
+    })
     await check('receipt release requires a submitted item and never repeats an unobserved release', async () => {
       reset()
       const control = join(bin, `stub-claude-hooks.${session}`), record = control + '.jsonl'
@@ -4600,6 +4677,110 @@ test('shared registered-hook controls bind the actual row and fail closed withou
     expect(clock.pendingCount()).toBe(0)
     rmSync(scratch, { recursive: true, force: true })
   }
+})
+
+describe('displayed-states stub ends an allowed permission turn only through its registered hooks', () => {
+  // Runs the stub's own control declarations in bash with fake registered
+  // hooks; no AD, tmux or pane is involved.
+  const stub = readFileSync(join(INTEGRATION_DIR, 'fixtures/stub-claude.sh'), 'utf8')
+  const declarations = ['fire_hooks', 'display_record', 'display_payload', 'display_controls'].map(name => {
+    const match = stub.match(new RegExp(`^${name}\\(\\) \\{\n[\\s\\S]*?^\\}`, 'm'))
+    if (!match) throw new Error(`missing stub declaration ${name}`)
+    return match[0]
+  }).join('\n')
+  function controls(body: string, hookRc = 0) {
+    mkdirSync('/tmp/c9', { recursive: true })
+    const root = mkdtempSync('/tmp/c9/stub-permission-turn-')
+    try {
+      mkdirSync(join(root, 'home'))
+      writeFileSync(join(root, 'permission-hook'), `#!/bin/bash
+cat > "$ROOT/permission-payload"
+for ((i = 0; i < 500; i++)); do [[ -e "$ROOT/decided" ]] && break; sleep 0.01; done
+[[ -e "$ROOT/decided" ]] || exit 3
+: > "$ROOT/permission-exited"
+exit "$HOOK_RC"
+`, { mode: 0o755 })
+      writeFileSync(join(root, 'stop-hook'), `#!/bin/bash
+if [[ -e "$ROOT/permission-exited" ]]; then printf 'after\\t'; else printf 'before\\t'; fi >> "$ROOT/stop-log"
+cat >> "$ROOT/stop-log"
+`, { mode: 0o755 })
+      const script = `set -u
+SESSION_ID=fixture-session REALCWD="$ROOT" TRANSCRIPT="$ROOT/transcript.jsonl" HOOK_FILE="$ROOT/hook-file"
+DISPLAY_CONTROL="$ROOT/control" DISPLAY_RECORD="$ROOT/control.jsonl" DISPLAY_NEXT=0 DISPLAY_TEXT=
+declare -A DISPLAY_HOOK_PIDS=()
+PERMISSION_HOOKS=(1 "$ROOT/permission-hook") STOP_HOOKS=(1 "$ROOT/stop-hook")
+${declarations}
+step() { printf '%s\\n' "$1" >> "$DISPLAY_CONTROL"; display_controls; }
+${body}
+printf 'outstanding=%s\\n' "\${#DISPLAY_HOOK_PIDS[@]}"
+`
+      const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-c', script], {
+        encoding: 'utf8', timeout: 10000,
+        env: hostSafeChildEnv(join(root, 'home'), { tools: ['jq', 'cat', 'sleep'], extras: {
+          ROOT: root, HOOK_RC: String(hookRc), AGENT_DIRECTOR_INSTANCE_ID: 'fixture-instance' } }),
+      })
+      const read = (name: string) => existsSync(join(root, name)) ? readFileSync(join(root, name), 'utf8') : ''
+      return { status: result.status, stdout: result.stdout, stderr: result.stderr,
+        stops: read('stop-log').split('\n').filter(Boolean).map(line => line.split('\t')),
+        records: read('control.jsonl').split('\n').filter(Boolean).map(line => JSON.parse(line)) }
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  }
+
+  const exited = `for ((i = 0; i < 500; i++)); do [[ -e "$ROOT/permission-exited" ]] && break; sleep 0.01; done
+[[ -e "$ROOT/permission-exited" ]] || exit 9`
+
+  test.each([
+    // The hook is still undecided when complete-1 is queued; the release
+    // starts only once the control holds complete-1.
+    ['returns', `step permission-1
+( for ((i = 0; i < 500; i++)); do [[ "$(< "$ROOT/control")" == *complete-1* ]] && break; sleep 0.01; done
+  sleep 0.1; : > "$ROOT/decided" ) &
+release=$!
+step complete-1
+wait "$release"`],
+    ['has already returned', `step permission-1
+: > "$ROOT/decided"
+${exited}
+step complete-1`],
+  ] as const)('complete waits until the decided hook %s, then fires the registered Stop once for the same session', (_name, body) => {
+    const r = controls(body)
+    expect(r.stderr).toBe('')
+    expect(r.status).toBe(0)
+    expect(r.stdout).toBe('outstanding=0\n')
+    expect(r.stops).toHaveLength(1)
+    expect(r.stops[0]![0]).toBe('after')
+    expect(JSON.parse(r.stops[0]![1]!)).toMatchObject({ hook_event_name: 'Stop', session_id: 'fixture-session' })
+    expect(r.records.map(({ command, event, instance_id, session_id }) => ({ command, event, instance_id, session_id }))).toEqual([
+      { command: 'permission-1', event: 'PermissionRequest', instance_id: 'fixture-instance', session_id: 'fixture-session' },
+      { command: 'complete-1', event: 'Stop', instance_id: 'fixture-instance', session_id: 'fixture-session' },
+    ])
+    expect(r.records[1].pid).toBe(r.records[0].pid)
+  })
+
+  test('a permission with no completion control fires no Stop, even after its hook returns', () => {
+    const r = controls(`step permission-1
+: > "$ROOT/decided"
+${exited}
+display_controls`)
+    expect(r.status).toBe(0)
+    expect(r.stdout).toBe('outstanding=1\n')
+    expect(r.stops).toEqual([])
+    expect(r.records.map(row => row.command)).toEqual(['permission-1'])
+  })
+
+  test.each([
+    ['without a queued permission', 'step complete-1', 0],
+    ['after the hook fell back', 'step permission-1\nstep fallback-1\nstep complete-1', 0],
+    ['when the hook returned no decision', 'step permission-1\n: > "$ROOT/decided"\nstep complete-1', 2],
+    ['a second time', 'step permission-1\n: > "$ROOT/decided"\nstep complete-1\nstep complete-1', 0],
+    ['for the other permission', `step permission-1\n: > "$ROOT/decided"\n${exited}\nstep complete-2`, 0],
+  ] as const)('complete %s fails closed with no further Stop', (_name, body, hookRc) => {
+    const r = controls(body, hookRc)
+    expect(r.status).toBe(1)
+    expect(r.stdout).toBe('')
+    expect(r.stops).toHaveLength(body.includes('complete-1\nstep complete-1') ? 1 : 0)
+    expect(r.records.filter(row => row.event === 'Stop')).toHaveLength(r.stops.length)
+  })
 })
 
 

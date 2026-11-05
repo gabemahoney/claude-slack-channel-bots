@@ -210,10 +210,13 @@
 #   slack_push_button <same button args...> <human-user> returns interactive envelope ID
 #   shared_stub_permission_setup <work> BEFORE launch: select existing displayed-states stub,
 #       fence/export scratch TMPDIR. Stub must already be copied into SCENARIO_STUB_DIR.
-#   shared_stub_permission <permission-1|permission-2|receipt|outcome> <work> <key> [token]
+#   shared_stub_permission <permission-1|permission-2|receipt|outcome|complete-1|complete-2> <work> <key> [token]
 #       uses actual AD session; each permission once/session. receipt releases ONE submitted
 #       text because displayed-states delays receipts. outcome reads a previously returned
-#       request token's decision/delivery. 30 s total / 5 s per AD call; no pane inspection.
+#       request token's decision/delivery. complete-N <token>, once AD reads that request
+#       allow/delivered, ends its turn through the registered Stop hook and waits for AD
+#       itself to read waiting; once/session, no retry. 30 s total / 5 s per AD call; no
+#       pane inspection.
 #       Setup and controls preserve HOME; all control files stay under SCENARIO_ROOT.
 #   shared_stub_notice_setup <work> BEFORE launch: select ordinary at-once receipts and
 #       scratch TMPDIR; unnecessary if shared_stub_permission_setup selected that work.

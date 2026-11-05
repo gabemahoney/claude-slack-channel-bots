@@ -267,6 +267,19 @@ display_controls() {
                 DISPLAY_HOOK_PIDS["${token}"]="${pid}"
                 display_record "${command}" PermissionRequest "${pid}"
                 ;;
+            complete-1|complete-2)
+                token="${command#complete-}"
+                pid="${DISPLAY_HOOK_PIDS[${token}]:-}"
+                [[ -n "${pid}" ]] || exit 1
+                # The allowed fixture tool's turn ends only after this
+                # registered hook has returned its decision; AD, through the
+                # registered Stop, alone decides the row's next state.
+                wait "${pid}" || exit 1
+                unset 'DISPLAY_HOOK_PIDS['"${token}"']'
+                display_payload Stop
+                fire_hooks "${STOP_HOOKS[@]}"
+                display_record "${command}" Stop "${pid}"
+                ;;
             fallback-1|fallback-2)
                 token="${command#fallback-}"
                 pid="${DISPLAY_HOOK_PIDS[${token}]:-}"
