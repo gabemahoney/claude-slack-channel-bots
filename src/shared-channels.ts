@@ -744,9 +744,12 @@ export interface SharedChannelAuthority {
    * restart. Never accepts an external snapshot or publishes staged choices. */
   stageRestoration(request: SharedRecoveryRequest, evidence: Uint8Array, prepared: Uint8Array): SharedMutationResult
   snapshot(): SharedChannelState
+  /** One persona's published state, cloned without the rest of the authority. */
+  personaSnapshot(key: string): SharedPersona | undefined
   /** One persona's published membership history, uncloned. `read` must not
-   * mutate or retain the view, and returns only a primitive answer. */
-  inspectMembershipHistory<T extends boolean>(key: string, read: (history: SharedMembershipHistory | undefined) => T): T
+   * mutate or retain the view, and returns only a primitive answer or a
+   * freshly built list of channel IDs. */
+  inspectMembershipHistory<T extends boolean | string[]>(key: string, read: (history: SharedMembershipHistory | undefined) => T): T
   config(): PersonaConfig
   sourceBytes(): Buffer
   incarnation(key: string): string | undefined
@@ -1152,6 +1155,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
       })
     },
     snapshot: () => clone(current),
+    personaSnapshot: key => { const life = own(current.personas, key); return life && clone(life) },
     inspectMembershipHistory: (key, read) => read(own(current.personas, key)),
     config: () => sharedAppliedConfig(current, path, deps),
     choice: (key, channel) => { const life = own(current.personas, key); return life ? own(life.assignments, channel)?.delivery : undefined },

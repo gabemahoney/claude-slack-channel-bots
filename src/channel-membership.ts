@@ -93,15 +93,15 @@ function object(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 function lifeOf(authority: SharedChannelAuthority, key: string): SharedPersona | undefined {
-  const personas = authority.snapshot().personas
-  return Object.hasOwn(personas, key) ? personas[key] : undefined
+  return authority.personaSnapshot(key)
 }
 function unresolvedFor(e: Readonly<MembershipEvidence>, channel: string | undefined, life: SharedMembershipHistory,
     evidence: (event: string) => Readonly<MembershipEvidence> | undefined): boolean {
   return (e.state === 'pending' || e.state === 'conflict') && (channel === undefined || e.channel === channel ||
     (e.originalEvent !== undefined && (evidence(e.originalEvent)?.channel ?? life.membershipEvents[e.originalEvent]?.channel) === channel))
 }
-function pending(life: SharedPersona | undefined, channel?: string): MembershipEvidence[] {
+function pending<E extends Readonly<MembershipEvidence>>(
+  life: (SharedMembershipHistory & { readonly membershipEvidence?: Readonly<Record<string, E>> }) | undefined, channel?: string): E[] {
   if (!life) return []
   return Object.values(life.membershipEvidence ?? {}).filter(e => unresolvedFor(e, channel, life, event => life.membershipEvidence?.[event]))
     .sort((a, b) => a.recordedOrder - b.recordedOrder)
@@ -175,23 +175,27 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
     undurable.set(key, records)
     undurableIncarnations.set(key, incarnation)
   }
+  function withUnsaved<E extends Readonly<MembershipEvidence>, A extends Readonly<SharedMembershipAbsenceConflict>>(key: string,
+      saved: { readonly membershipEvidence?: Readonly<Record<string, E>>, readonly membershipAbsenceConflicts?: Readonly<Record<string, A>> }) {
+    return {
+      membershipEvidence: { ...saved.membershipEvidence, ...Object.fromEntries(undurable.get(key) ?? []) },
+      membershipAbsenceConflicts: { ...saved.membershipAbsenceConflicts, ...Object.fromEntries(undurableAbsences.get(key) ?? []) },
+    }
+  }
   function recoveryLife(key: string): SharedPersona | undefined {
     const life = lifeOf(authority, key)
-    if (life) {
-      life.membershipEvidence = { ...life.membershipEvidence, ...Object.fromEntries(undurable.get(key) ?? []) }
-      life.membershipAbsenceConflicts = { ...life.membershipAbsenceConflicts, ...Object.fromEntries(undurableAbsences.get(key) ?? []) }
-    }
+    if (life) Object.assign(life, withUnsaved(key, life))
     return life
   }
   function retainAbsences(generation: MembershipGeneration, conflicts: Map<string, SharedMembershipAbsenceConflict>): SharedMutationResult {
     const { key, incarnation } = generation
     if (!isCurrent(generation)) return { kind: 'stale', revision: authority.revision }
     const records = undurableAbsences.get(key) ?? new Map<string, SharedMembershipAbsenceConflict>()
-    const life = lifeOf(authority, key)!
+    const saved = new Set(authority.inspectMembershipHistory(key, life => Object.keys(life?.membershipAbsenceConflicts ?? {})))
     for (const [channel, conflict] of conflicts) {
       // Preserve the first observation, including across retries and newer
       // assignments. Refreshing its scan-start revision would lose the race.
-      if (!life.membershipAbsenceConflicts?.[channel] && !records.has(channel)) records.set(channel, conflict)
+      if (!saved.has(channel) && !records.has(channel)) records.set(channel, conflict)
       markHeld(generation, channel, 'history-unresolved')
     }
     if (!records.size) return { kind: 'unresolved', revision: authority.revision }
@@ -282,8 +286,11 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
     // live observations. An ambiguous scan/assignment race still needs review.
     if (!isCurrent(generation) || !authority.readable || evidence.member ||
         evidence.originalEvent || evidence.conflict !== 'predecessor') return false
-    const saved = lifeOf(authority, generation.key)?.membershipEvidence?.[evidence.event]
-    if (saved?.state === 'applied' && membershipPayloadIdentity(saved) === membershipPayloadIdentity(evidence)) {
+    const savedApplied = authority.inspectMembershipHistory(generation.key, life => {
+      const saved = life?.membershipEvidence?.[evidence.event]
+      return saved?.state === 'applied' && membershipPayloadIdentity(saved) === membershipPayloadIdentity(evidence)
+    })
+    if (savedApplied) {
       // A directory-sync failure may have installed this exact transaction.
       // Once the owner recovers it, retire the in-memory retry without writing
       // or treating that historical result as current membership.
@@ -322,7 +329,7 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
   function retain(generation: MembershipGeneration, evidence: MembershipEvidence, fault: MembershipFault): boolean {
     if (!isCurrent(generation)) return false
     markHeld(generation, evidence.channel, fault)
-    if (!lifeOf(authority, generation.key)?.membershipEvidence?.[evidence.event]) rememberUndurable(generation, evidence)
+    if (!authority.inspectMembershipHistory(generation.key, life => life?.membershipEvidence?.[evidence.event] !== undefined)) rememberUndurable(generation, evidence)
     if (!undurable.get(generation.key)?.size && !undurableAbsences.get(generation.key)?.size) return true
     if (persistPending(generation, evidence)) return true
     markHeld(generation, evidence.channel, 'event-not-durable')
@@ -365,18 +372,23 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
         retain(generation, evidence, evidence.conflict === 'contradictory-id' || evidence.conflict === 'reset-overlap' ? 'history-unresolved' : 'event-order-conflict')
       }
     }
-    return !conflicts.size && !pending(lifeOf(authority, key)).length && !undurable.get(key)?.size
+    return !conflicts.size && !authority.inspectMembershipHistory(key, life => pending(life).length > 0) && !undurable.get(key)?.size
   }
   function unresolvedChannels(key: string): string[] {
-    const life = recoveryLife(key)
-    return [...new Set([
-      ...(generations.get(key)?.holds.keys() ?? []),
-      ...Object.keys(life?.membershipAbsenceConflicts ?? {}),
-      ...pending(life).flatMap(e => {
-        const originalChannel = e.originalEvent ? life?.membershipEvidence?.[e.originalEvent]?.channel ?? life?.membershipEvents[e.originalEvent]?.channel : undefined
-        return originalChannel ? [e.channel, originalChannel] : [e.channel]
-      }),
-    ])]
+    const holds = [...generations.get(key)?.holds.keys() ?? []]
+    // The same durable-plus-unsaved view and order as recoveryLife, merged
+    // shallowly in place: routing asks on every reconciliation request.
+    return authority.inspectMembershipHistory(key, saved => {
+      const life = saved && { membershipEvents: saved.membershipEvents, ...withUnsaved(key, saved) }
+      return [...new Set([
+        ...holds,
+        ...Object.keys(life?.membershipAbsenceConflicts ?? {}),
+        ...pending(life).flatMap(e => {
+          const originalChannel = e.originalEvent ? life?.membershipEvidence[e.originalEvent]?.channel ?? life?.membershipEvents[e.originalEvent]?.channel : undefined
+          return originalChannel ? [e.channel, originalChannel] : [e.channel]
+        }),
+      ])]
+    })
   }
   function recoveryPlan(generation: MembershipGeneration, channel: string, through: string, life: SharedPersona):
       { records: MembershipEvidence[] } | { fault: MembershipFault } {

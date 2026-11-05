@@ -2097,8 +2097,7 @@ test('page-1 positives release held redeliveries while page 2 hangs and after it
   } finally { await managed.close() }
 })
 
-// t2.yiv.sf.d2: reload review reads membership twice for every reviewed channel.
-test('membership reads of SR8_SHARED_LIST_CHANNELS reviewed channels beside saved unresolved history clone no shared state', async () => {
+async function reviewedBesideSavedConflict() {
   const channels = channelPopulation(SR8_SHARED_LIST_CHANNELS), ids = channels.map(c => c.id)
   const f = fixture({ channels: [...channels, { id: C.primary, delivery: 'all' }] })
   const pages = Math.ceil(ids.length / MEMBERSHIP_PAGE_LIMIT)
@@ -2108,6 +2107,30 @@ test('membership reads of SR8_SHARED_LIST_CHANNELS reviewed channels beside save
   const timestamp = ((f.h.clock.now() + 1) / 1000).toFixed(3)
   for (const member of [true, false]) await f.event(member, C.primary, { id: 'EvREVIEWCONFLICT', timestamp })
   expect(Object.values(life(f).membershipEvidence!).map(e => e.state)).toEqual(['applied', 'conflict'])
+  return { f, ids }
+}
+
+// t2.yiv.sf.ht: routing's reconciliation request listed unresolved channels
+// through a structured clone of the whole authority on every request.
+test('a reconciliation request beside SR8_SHARED_LIST_CHANNELS reviewed channels and saved unresolved history reads no whole authority and clones nothing', async () => {
+  const { f } = await reviewedBesideSavedConflict()
+  f.membership.invalidate('alpha')
+  const before = f.authority.snapshot()
+  const spies = [spyOn(f.authority, 'snapshot'), spyOn(f.authority, 'personaSnapshot'), spyOn(globalThis, 'structuredClone')]
+  let listed: string[]
+  try {
+    listed = f.membership.unresolvedChannels('alpha')
+    f.membership.request('alpha')
+    expect(spies.map(spy => spy.mock.calls.length)).toEqual([0, 0, 0])
+  } finally { for (const spy of spies) spy.mockRestore() }
+  expect(listed).toEqual([C.primary])
+  expect(f.scanner.status('alpha')).toMatchObject({ problem: 'event-order-conflict' })
+  expect(f.authority.snapshot()).toEqual(before)
+})
+
+// t2.yiv.sf.d2: reload review reads membership twice for every reviewed channel.
+test('membership reads of SR8_SHARED_LIST_CHANNELS reviewed channels beside saved unresolved history clone no shared state', async () => {
+  const { f, ids } = await reviewedBesideSavedConflict()
   const before = f.authority.snapshot()
   const clones = spyOn(globalThis, 'structuredClone')
   let answers: unknown[]
@@ -2191,9 +2214,16 @@ test.each<[string, (f: MembershipHarness) => Promise<MembershipHarness>, string[
   f.membership.invalidate('alpha')
   const answers = () => {
     expect(AGREEMENT_CHANNELS.map(channel => f.authority.readableFor('alpha', channel))).toEqual(AGREEMENT_CHANNELS.map(() => true))
-    const listed = f.membership.unresolvedChannels('alpha')
+    const clones = spyOn(globalThis, 'structuredClone')
+    let listed: string[]
+    try {
+      listed = f.membership.unresolvedChannels('alpha')
+      expect(clones).toHaveBeenCalledTimes(0)
+    } finally { clones.mockRestore() }
     const checked = AGREEMENT_CHANNELS.filter(channel => f.membership.hasUnresolved('alpha', channel))
     expect(checked).toEqual(AGREEMENT_CHANNELS.filter(channel => listed.includes(channel)))
+    expect([...listed].sort()).toEqual([...expected].sort())
+    listed.splice(0, listed.length, 'C0FORGED')
     return checked
   }
   const before = f.authority.snapshot()
@@ -2205,4 +2235,21 @@ test.each<[string, (f: MembershipHarness) => Promise<MembershipHarness>, string[
   expect(answers()).toEqual(expected)
   expect([f.membership.hasUnresolved('gamma', C.primary), f.membership.unresolvedChannels('gamma')]).toEqual([false, []])
   expect(f.authority.snapshot()).toEqual(before)
+})
+
+// Recovery merges unsaved history into its own copy of the target persona.
+// The control hands it the authority's live persona instead.
+test.each([false, true])('recovery over unsaved evidence leaves published history unchanged unless given the live persona (control=%p)', async control => {
+  const f = fixture(); await f.start()
+  await f.event(true, C.primary, { id: 'EvSAVEDCOPY' })
+  expect(life(f).membershipEvidence?.EvSAVEDCOPY?.state).toBe('applied')
+  const before = f.authority.snapshot()
+  const live = control ? spyOn(f.authority, 'personaSnapshot').mockImplementation(key => f.authority.inspectMembershipHistory(key, life => life as never)) : undefined
+  try {
+    f.failWrites(() => true); await f.event(true, C.secondary, { id: 'EvUNSAVEDCOPY' })
+    f.membership.recover('alpha')
+    expect(f.membership.unresolvedChannels('alpha')).toContain(C.secondary)
+  } finally { live?.mockRestore() }
+  if (control) expect(life(f).membershipEvidence?.EvUNSAVEDCOPY).toBeDefined()
+  else expect(f.authority.snapshot()).toEqual(before)
 })

@@ -1,5 +1,5 @@
 /** The file-free adapter and the durable shared-authority mutation contract. */
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -128,6 +128,26 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     expect(authority.assign('alpha', authority.incarnation('alpha')!, 'C0TEST001', 'mentions', 1)).toEqual({ kind: 'applied', revision: 2 })
     expect(authority.snapshot().pendingIntent).toEqual({})
     expect(readSharedState(root)!.revision).toBe(2)
+    check(authority.snapshot())
+  })
+
+  // t2.yiv.sf.ht: membership recovery copies its target persona, never the whole authority.
+  test('a persona snapshot clones only that persona and cannot mutate the authority', () => {
+    const authority = makeSharedAuthority(root, input())
+    const join = { event: 'join', identity: 'app', channel: 'C0TEST001', member: true, boundary: 0 }
+    expect(authority.observeMembership('alpha', authority.incarnation('alpha')!, join, authority.revision).kind).toBe('applied')
+    const before = authority.snapshot()
+    const clones = spyOn(globalThis, 'structuredClone')
+    let alpha: ReturnType<typeof authority.personaSnapshot>
+    try {
+      alpha = authority.personaSnapshot('alpha')
+      expect(clones.mock.calls).toEqual([[before.personas['alpha']]])
+    } finally { clones.mockRestore() }
+    expect(alpha).toEqual(before.personas['alpha'])
+    alpha!.assignments = {}; alpha!.membershipEvents['join']!.channel = 'C0FORGED'; alpha!.incarnation = 'forged-life'
+    expect(authority.snapshot()).toEqual(before)
+    expect(authority.personaSnapshot('alpha')).toEqual(before.personas['alpha'])
+    expect(['gone', '__proto__', 'constructor', 'hasOwnProperty'].map(key => authority.personaSnapshot(key))).toEqual([undefined, undefined, undefined, undefined])
     check(authority.snapshot())
   })
 
