@@ -2622,6 +2622,9 @@ helper's header names the function behind each):
 |---|---|
 | `persona_ref <name>` | the text `"<name>" (key=<key>)` (not a matcher) |
 | `persona_start_match <index> <name>` | the `persona-start` line for that entry |
+| `session_connected_match <name>` | the `Session connected` line for that persona's new MCP session |
+| `session_barrier_mark [--position] <name>...` | not a matcher: before a server (re)start, records each persona's `Session connected` count; with `--position` (inside one server, where a session can connect and drop again), `server.log`'s line count instead |
+| `session_barrier_wait <timeout-s> <step>` | not a matcher: under one timeout, waits until every marked persona's count has risen or, with `--position`, its last `Session connected` line follows the mark and its last `MCP session dropped` line, so no MCP request goes to a stale session; fails naming the personas still waiting |
 | `skip_match <name> [<cwd>]` | the dry-run spawn skip, optionally with its `cwd=` |
 | `completion_match <n>` | the start pass's completion line for `<n>` personas |
 | `counts [<field>=<n>]...` | the reload counts text (not a matcher); unnamed fields are 0 |
@@ -3287,7 +3290,8 @@ builder's output for the given arguments.
   marker it exits 2 (see Image marker); `tests/host-safety.test.ts`'s marker
   audit covers it.
 - It makes no agent-director call, starts no process or server, opens no
-  socket, reads no token and writes no file.
+  socket and reads no token. The one file it writes is the private copy of
+  the shared record that an authority-reading entry reads and then removes.
 - `sharedAuthorityPreserved <config-path> <before-record> <after-record>`
   production-parses both records and silently succeeds only when reviewed
   source bytes, applied configuration, retired/pending intent, persona identity,

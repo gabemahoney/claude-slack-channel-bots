@@ -455,10 +455,20 @@
 #                                      printer): the server read the test_timer_overrides block
 #   wait_for_file <path> <timeout-s> [<step>]
 #   wait_until <timeout-s> <step> <command> [<arg>...]
+#   session_barrier_mark [--position] <name>...
+#                                      before a server (re)start, record each persona's Session
+#                                      connected count; with --position (inside one server),
+#                                      record server.log's line count instead
+#   session_barrier_wait <timeout-s> <step>
+#                                      under one timeout, wait until every marked persona's count
+#                                      has risen or, with --position, its last Session connected
+#                                      line is after the mark and its last MCP session dropped
+#                                      line; fail naming the personas still waiting
 #
 #   Line builders (each prints a matcher; see "Line builders" for the fragments)
 #   persona_ref <name>                 print `"<name>" (key=<key>)` (text, not a matcher)
 #   persona_start_match <index> <name>
+#   session_connected_match <name>
 #   skip_match <name> [<cwd>]
 #   completion_match <persona-count>
 #   counts [<field>=<n>]...            print the reload counts field (text, not a matcher)
@@ -1287,6 +1297,11 @@
 #   persona_start_match   `[slack] persona-start: personas[<index>] <ref>`
 #                         (src/persona-bringup-controller.ts bringUp, format
 #                         src/persona-diagnostics.ts formatPersonaDiagnostic)
+#   session_connected_match
+#                         `[slack] Session connected: persona <ref>` (src/server.ts
+#                         handleInitialized). The barrier's position form also reads
+#                         `[slack] persona <ref>: MCP session dropped` (src/persona-bringup-controller.ts
+#                         createNotUpSessionDropper)
 #   skip_match            `[slack] dry-run: skipping spawn for <ref>`, then ` cwd=<cwd>` when given
 #                         (src/session-manager.ts spawnForPersona)
 #   completion_match      `[slack] startupSessionManager: complete — <n> persona(s):`
@@ -2030,6 +2045,67 @@ persona_start_match() {
     [[ "${1:-}" =~ ^[0-9]+$ ]] || fail "persona_start_match: index '${1:-}' is not a whole number"
     ref="$(persona_ref "$2")" || exit 1
     matcher "[slack] persona-start: personas[$1] ${ref}"
+}
+
+# session_connected_match <name>: the server's line for a persona's new MCP session.
+session_connected_match() {
+    local ref
+    ref="$(persona_ref "$1")" || exit 1
+    matcher "[slack] Session connected: persona ${ref}"
+}
+
+# The session barrier. session_barrier_mark <name>... records each persona's
+# Session connected count before a server (re)start; session_barrier_wait
+# <timeout-s> <step> then waits, under that one timeout, until every marked
+# persona's count has risen, so no MCP request goes to a session the previous
+# server held.
+# Inside one server, where a persona can connect and then drop again before it
+# recovers, a count can rise on a session that is already gone. There,
+# session_barrier_mark --position <name>... records server.log's line count
+# instead, and the wait passes for a persona only when its last Session
+# connected line is after both the mark and its last MCP session dropped line.
+session_barrier_mark() {
+    declare -gA SESSION_BARRIER=()
+    declare -g SESSION_BARRIER_MODE=count
+    local name at
+    if [[ "${1:-}" == --position ]]; then SESSION_BARRIER_MODE=position; shift; fi
+    [[ "$#" -gt 0 ]] || fail 'session_barrier_mark: no persona named'
+    if [[ "${SESSION_BARRIER_MODE}" == position ]]; then
+        at=0
+        [[ ! -f "${SLACK_STATE_DIR}/server.log" ]] || at="$(LC_ALL=C grep -c '' -- "${SLACK_STATE_DIR}/server.log" || true)"
+        for name in "$@"; do SESSION_BARRIER["${name}"]="${at}"; done
+        return 0
+    fi
+    for name in "$@"; do SESSION_BARRIER["${name}"]="$(count_log "$(session_connected_match "${name}")")"; done
+}
+
+_scenario_session_reconnected() {
+    local name="$1" connected dropped ref
+    if [[ "${SESSION_BARRIER_MODE:-count}" == count ]]; then
+        [[ "$(count_log "$(session_connected_match "${name}")")" -gt "${SESSION_BARRIER[${name}]}" ]]
+        return
+    fi
+    connected="$(last_log_line "$(session_connected_match "${name}")")"
+    ref="$(persona_ref "${name}")" || exit 1
+    dropped="$(last_log_line "$(matcher "[slack] persona ${ref}: MCP session dropped")")"
+    [[ -n "${connected}" ]] && [[ "${connected}" -gt "${SESSION_BARRIER[${name}]}" ]] && [[ "${connected}" -gt "${dropped:-0}" ]]
+}
+
+_scenario_sessions_reconnected() {
+    local name
+    for name in "${!SESSION_BARRIER[@]}"; do _scenario_session_reconnected "${name}" || return 1; done
+}
+
+session_barrier_wait() {
+    local timeout_s="$1" step="$2" name waiting=''
+    [[ -v SESSION_BARRIER[@] ]] || fail "${step}: session_barrier_mark was not run"
+    _scenario_check_timeout "${timeout_s}" "${step}"
+    _scenario_poll_until "${timeout_s}" _scenario_sessions_reconnected && return 0
+    for name in "${!SESSION_BARRIER[@]}"; do _scenario_session_reconnected "${name}" || waiting+=" ${name}"; done
+    if [[ "${SESSION_BARRIER_MODE:-count}" == position ]]; then
+        fail "${step} (not within ${timeout_s}s; no session after the mark and the last drop for:${waiting})"
+    fi
+    fail "${step} (not within ${timeout_s}s; no new session for:${waiting})"
 }
 
 skip_match() {

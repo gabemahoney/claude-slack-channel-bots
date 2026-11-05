@@ -1523,6 +1523,71 @@ cleanup_launches() {
 }
 on_exit cleanup_launches
 
+# Failure observation, before the trap stops anything, unless the script
+# reached its PASS line. Diagnostic only: each persona's last queue rows,
+# its stub hook records and control commands, and its agent-director row,
+# as whitelisted fields, never message text, hook payloads or tokens. Its
+# setup reads cannot fail the script, and its agent-director read is bounded.
+ALPHA_ID="$(printed personaInstanceId "${ALPHA_KEY}" 2> /dev/null)" || ALPHA_ID=''
+BRAVO_ID="$(printed personaInstanceId "${BRAVO_KEY}" 2> /dev/null)" || BRAVO_ID=''
+OBSERVE_SAFE='def safe: if . == null then "absent" else tostring | if test("^[A-Za-z0-9_.:+-]{1,64}$") and (test("^xox") | not) then . else "invalid" end end;
+    def word: if . == null then "absent" else tostring | if test("^[A-Za-z][A-Za-z0-9_-]{0,39}$") and (test("^xox") | not) then . else "invalid" end end;'
+OBSERVE_ON_EXIT=1
+OBSERVE_ROWS=5
+exit_observe() {
+    local name dir id file session line hooks
+    [[ "${OBSERVE_ON_EXIT}" == 1 ]] || return 0
+    for name in alpha bravo; do
+        case "${name}" in
+            alpha) dir="${ALPHA_DIR}" id="${ALPHA_ID}" ;;
+            bravo) dir="${BRAVO_DIR}" id="${BRAVO_ID}" ;;
+        esac
+        if [[ -f "${DELIVERIES_FILE[${dir}]}" ]]; then
+            jq -r -R -n --arg name "${name}" --argjson n "${OBSERVE_ROWS}" "${OBSERVE_SAFE}"'
+                [inputs | fromjson? | select(type == "object")] | .[-$n:][] |
+                "exit-observe: persona=\($name) queue kind=\(.kind|word) seq=\(.seq|safe) send_kind=\(.send_kind|word) at=\(.at|safe)"' \
+                "${DELIVERIES_FILE[${dir}]}" 2> /dev/null || printf 'exit-observe: persona=%s queue=unreadable\n' "${name}"
+        else
+            printf 'exit-observe: persona=%s queue=absent\n' "${name}"
+        fi
+        if [[ -z "${id}" ]]; then
+            printf 'exit-observe: persona=%s instance=unavailable\n' "${name}"
+            continue
+        fi
+        hooks=()
+        for file in "${STUB_BIN}"/stub-claude-hooks.*.jsonl; do
+            [[ ! -f "${file}" ]] || hooks+=("${file}")
+        done
+        if (( ${#hooks[@]} > 0 )); then
+            jq -r -R -n --arg id "${id}" --arg name "${name}" --argjson n "${OBSERVE_ROWS}" "${OBSERVE_SAFE}"'
+                [inputs | fromjson? | select(type == "object" and .instance_id == $id)] |
+                sort_by(.at | tonumber? // 0) | .[-$n:][] |
+                "exit-observe: persona=\($name) stub_hook command=\(.command|word) event=\(.event|word) session_id=\(.session_id|safe) pid=\(.pid|safe) at=\(.at|safe)"' \
+                "${hooks[@]}" 2> /dev/null || printf 'exit-observe: persona=%s stub_hook=unreadable\n' "${name}"
+        fi
+        if timeout 10 agent-director get --instance-id "${id}" > "${SCENARIO_ROOT}/exit-observe.${name}.ad" 2> /dev/null; then
+            session="$(jq -r --arg name "${name}" "${OBSERVE_SAFE}"'
+                "exit-observe: persona=\($name) ad_state=\(.state|word) session_id=\(.session_id|safe) launch_started_at=\(.launch_started_at|safe) last_seen_at=\(.last_seen_at|safe) ended_at=\(.ended_at|safe)",
+                (.session_id|safe)' "${SCENARIO_ROOT}/exit-observe.${name}.ad" 2> /dev/null)" \
+                || { printf 'exit-observe: persona=%s ad=unreadable\n' "${name}"; continue; }
+            printf '%s\n' "${session%$'\n'*}"
+            session="${session##*$'\n'}"
+            file="${STUB_BIN}/stub-claude-hooks.${session}"
+            if [[ "${session}" =~ ^[a-f0-9-]{36}$ && -f "${file}" ]]; then
+                while IFS= read -r line; do
+                    [[ "${line}" =~ ^[a-z0-9-]{1,32}$ ]] || line=invalid
+                    printf 'exit-observe: persona=%s control=%s\n' "${name}" "${line}"
+                done < "${file}"
+            else
+                printf 'exit-observe: persona=%s control=absent\n' "${name}"
+            fi
+        else
+            printf 'exit-observe: persona=%s ad=unavailable\n' "${name}"
+        fi
+    done
+}
+on_before_cleanup exit_observe
+
 # --- Credentials, stub control and MCP config ------------------------------
 # write_credentials <path> <suffix>: a fresh fake bot/app pair ending in
 # <suffix> (the stub's control maps it to a label), mode 0600. Never printed.
@@ -2388,4 +2453,5 @@ n="$(count_token_like "${leak_files[@]}")"
 
 # The tmux sessions and stub-claude's transcripts go in the exit hook
 # (cleanup_launches), which runs on a failure too.
+OBSERVE_ON_EXIT=0
 echo "PASS: ${TEST_NAME} (${SECONDS} s elapsed)"

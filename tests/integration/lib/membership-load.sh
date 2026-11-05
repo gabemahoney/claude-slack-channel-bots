@@ -4,6 +4,8 @@
 # Verdicts, workloads and limits are owned by sr8-evidence.ts.
 
 printed() { bun "${PRINTER}" "$@"; }
+# A verdict command prints all its lines first; a non-pass exit then fails here.
+verdict() { bun "${E}" "$@" || fail "sr8 $1 verdict did not pass"; }
 mono_ms() { python3 -c 'import time; print(time.monotonic_ns() / 1000000)'; }
 epoch_ms() { python3 -c 'import time; print(time.time_ns() // 1000000)'; }
 byte_mark() { stat -c %s "$1"; }
@@ -90,11 +92,14 @@ start_ready() {
     overrides="$(count_log "${OVERRIDES_STEM}")"
     recording_line="$(matcher "$(printed buildTestMeasurementsStartLine "${MEASUREMENTS}")")"
     recordings="$(count_log "${recording_line}")"
+    session_barrier_mark "${KEYS[@]}"
     if [[ "${1:-}" == measured ]]; then START_MS="$(mono_ms)"; fi
     start_server --live
     wait_for_count "$(completion_match 2)" "$((completions + 1))" 150 'two-persona startup incomplete'
     expect_one_overrides_line 'SR-8 compaction override' "${overrides}" 30
     wait_for_count "${recording_line}" "$((recordings + 1))" 30 'measurement recorder not enabled'
+    # No tools/list may reach a session the previous server held.
+    session_barrier_wait 150 'persona MCP sessions did not reconnect to the new server'
     for key in "${KEYS[@]}"; do
         wait_membership_complete "${key}"
         stub_session_list_tools "${ROOT}/${key}" > "${ROOT}/${key}.tools.json"
@@ -297,6 +302,77 @@ late_state() {
     printf '\n' >> "$1"
 }
 
+# Reopen observation, printed only when the case fails between the reopen stop
+# and its measured seal. Diagnostic only: it reads, never fails, and prints
+# whitelisted fields, never message text, hook commands, tokens or log lines.
+REOPEN_SAFE='def safe: if . == null then "absent" else tostring | if test("^[A-Za-z0-9_.:+-]{1,64}$") and (test("^xox") | not) then . else "invalid" end end;
+    def word: if . == null then "absent" else tostring | if test("^[A-Za-z][A-Za-z_-]{0,39}$") and (test("^xox") | not) then . else "invalid" end end;'
+reopen_ad_rows() {
+    local phase="$1" name key id
+    for name in "${KEYS[@]}"; do
+        key="$(persona_key "${name}")" && id="$(printed personaInstanceId "${key}")" \
+            || { printf 'reopen-observe: phase=%s persona=%s ad=unavailable\n' "${phase}" "${name}"; continue; }
+        ad_capture get --instance-id "${id}"
+        if (( AD_RC != 0 )); then
+            printf 'reopen-observe: phase=%s persona=%s ad_rc=%s\n' "${phase}" "${name}" "${AD_RC}"
+            continue
+        fi
+        jq -r --arg phase "${phase}" --arg name "${name}" "${REOPEN_SAFE}"'
+            "reopen-observe: phase=\($phase) persona=\($name) ad_state=\(.state|word) session_id=\(.session_id|safe) launch_started_at=\(.launch_started_at|safe) last_seen_at=\(.last_seen_at|safe) ended_at=\(.ended_at|safe)"' \
+            "${AD_OUT}" 2> /dev/null || printf 'reopen-observe: phase=%s persona=%s ad=unreadable\n' "${phase}" "${name}"
+    done
+}
+reopen_lifecycle() {
+    local name="$1" slice="$2" ref key label a b line stamps count
+    ref="$(persona_ref "${name}")" && key="$(persona_key "${name}")" || return 0
+    while IFS='|' read -r label a b; do
+        stamps='' count=0
+        while IFS= read -r line; do
+            [[ "${line}" == *"${b}"* ]] || continue
+            count=$((count + 1))
+            if [[ "${line}" =~ ^\[([0-9T:.Z+-]{10,40})\] ]]; then stamps+="${stamps:+,}${BASH_REMATCH[1]}"; fi
+        done < <(grep -F -- "${a}" "${slice}" 2> /dev/null)
+        printf 'reopen-observe: persona=%s lifecycle=%s count=%s at=%s\n' "${name}" "${label}" "${count}" "${stamps:-none}"
+    done <<EOF
+connected|[slack] Session connected: persona ${ref}|
+disconnected|[slack] Session disconnected|persona ${ref}
+dropped|[slack] persona ${ref}: MCP session dropped|
+persona-start|[slack] persona-start: personas[|${ref}
+restart-scheduled|[slack] Scheduling restart for persona=${key} |
+EOF
+}
+reopen_stub_records() {
+    local name="$1" key id stub file
+    key="$(persona_key "${name}")" && id="$(printed personaInstanceId "${key}")" || return 0
+    stub="$(_scenario_stub_dir reopen-observe 2> /dev/null)" || stub="${SCENARIO_BIN}"
+    for file in "${stub}"/stub-claude-hooks.*.jsonl; do
+        [[ -f "${file}" ]] || continue
+        jq -r --arg id "${id}" --arg name "${name}" "${REOPEN_SAFE}"'
+            select(.instance_id == $id) |
+            "reopen-observe: persona=\($name) stub_hook event=\(.event|word) session_id=\(.session_id|safe) pid=\(.pid|safe) at=\(.at|safe)"' \
+            "${file}" 2> /dev/null || printf 'reopen-observe: persona=%s stub_hook=unreadable\n' "${name}"
+    done
+    file="$(_scenario_session_file "${ROOT}/${name}" sessions 2> /dev/null)" \
+        || { printf 'reopen-observe: persona=%s mcp_sessions=unavailable\n' "${name}"; return 0; }
+    [[ -f "${file}" ]] || { printf 'reopen-observe: persona=%s mcp_sessions=absent\n' "${name}"; return 0; }
+    jq -r --arg name "${name}" "${REOPEN_SAFE}"'
+        "reopen-observe: persona=\($name) mcp_session event=\(.event|word) session_id=\(.session_id|safe) reason=\(.reason|word) pid=\(.pid|safe)"' \
+        "${file}" 2> /dev/null || printf 'reopen-observe: persona=%s mcp_sessions=unreadable\n' "${name}"
+}
+reopen_observe() {
+    local name slice
+    [[ -n "${REOPEN_OBSERVE:-}" ]] || return 0
+    printf 'reopen-observe: case=%s failed between the reopen stop and its measured seal\n' "${CASE}"
+    cat -- "${ROOT}/reopen-observe.rows" 2> /dev/null
+    reopen_ad_rows at-failure
+    slice="${ROOT}/reopen-observe.log"
+    log_slice "${SLACK_STATE_DIR}/server.log" "${REOPEN_OBSERVE_LOG:-0}" "${slice}" 2> /dev/null || : > "${slice}"
+    for name in "${KEYS[@]}"; do
+        reopen_lifecycle "${name}" "${slice}"
+        reopen_stub_records "${name}"
+    done
+}
+
 run_membership_load() {
     require_ci_image "membership load"
     require_scenario_home "membership load"
@@ -305,6 +381,7 @@ run_membership_load() {
     E="${SCENARIO_FIXTURES}/sr8-evidence.ts"
     PRINTER="${SCENARIO_FIXTURES}/fmk-texts.ts"
     on_exit repair_modes
+    on_before_cleanup reopen_observe
 
     REQUEST_MS="$(printed MEMBERSHIP_REQUEST_TIMEOUT_MS)"
     ATTEMPT_MS="$(printed MEMBERSHIP_ATTEMPT_TIMEOUT_MS)"
@@ -338,6 +415,7 @@ run_membership_load() {
         WRITES="${ROOT}/writes"
         PLAN="${ROOT}/plan.tsv"
         mkdir -p "${BATCH}" "${WRITES}"
+        bun "${E}" cpu-mark "${ROOT}/cpu.before" || :
         new_state_dir "${MODE}-${CASE_KIND}"
         CONFIG="${SLACK_STATE_DIR}/config.json"
         bun "${E}" config "${MODE}" 100000 2 "${ROOT}" "${SCENARIO_PORT}" "${COMPACT_MS}" | write_config
@@ -382,11 +460,11 @@ run_membership_load() {
         MEASUREMENTS="${SLACK_STATE_DIR}/${MEASUREMENT_NAME}"
         bun "${E}" seed "${CONFIG}" "${SLACK_STATE_DIR}" 100000
         start_ready
-        bun "${E}" seal first "${C[@]}" "${SLACK_STATE_DIR}/server.log" 0 "${CONFIG}"
+        verdict seal first "${C[@]}" "${SLACK_STATE_DIR}/server.log" 0 "${CONFIG}"
         stop_server --stop-bots
         START_LOG="$(byte_mark "${SLACK_STATE_DIR}/server.log")"
         start_ready measured
-        bun "${E}" seal measured "${C[@]}" "${SLACK_STATE_DIR}/server.log" "${START_LOG}" "${CONFIG}"
+        verdict seal measured "${C[@]}" "${SLACK_STATE_DIR}/server.log" "${START_LOG}" "${CONFIG}"
         pending_posts
         # Prebuild outside both measured windows, after pending posts exist.
         # A held root must not predate its new-channel post's issue time: slow
@@ -499,7 +577,7 @@ PY
             stub_slice "${CASE_MARK}" "${OUT}/membership-stub.jsonl"
             log_slice "${SLACK_STATE_DIR}/server.log" "${CASE_LOG}" "${OUT}/membership.log"
             shared_persona_facts "${P}" "${CHANNELS[99]}" > "${OUT}/membership-after.jsonl"
-            bun "${E}" membership-fault "${C[@]}" "${KIND}" "${PAGE}" "${P}" "${OUT}/membership-stub.jsonl" \
+            verdict membership-fault "${C[@]}" "${KIND}" "${PAGE}" "${P}" "${OUT}/membership-stub.jsonl" \
                 "${OUT}/membership.log" "${OUT}/membership-before.jsonl" "${OUT}/membership-after.jsonl" "${RETRY_AFTER}" 0
         fi
 
@@ -512,7 +590,7 @@ PY
             ZERO_END="$(mono_ms)"
             slack_envelope_times "${FAILED_ENV}" > "${OUT}/zero-times.jsonl"
             log_slice "${SLACK_STATE_DIR}/server.log" "${CASE_LOG}" "${OUT}/zero.log"
-            bun "${E}" zero-ack "${C[@]}" "${P}" "${FAILED_ENV}" "${OUT}/zero-times.jsonl" \
+            verdict zero-ack "${C[@]}" "${P}" "${FAILED_ENV}" "${OUT}/zero-times.jsonl" \
                 "${ZERO_START}" "${ZERO_END}" "${PROBE_RC}" "${OUT}/zero.log"
             repair_modes
             slack_wait_one_ack "$(slack_stub_redeliver "${P}" "${FAILED_ENV}")"
@@ -527,7 +605,7 @@ PY
             wait_until "${WAIT_S}" 'idle membership repair did not complete' \
                 _scenario_membership_complete "${P}" "${READINESS_ROUTE}"
             log_slice "${SLACK_STATE_DIR}/server.log" "${CASE_LOG}" "${OUT}/repair.log"
-            bun "${E}" membership-repair "${C[@]}" "${P}" "${CLEAR_EPOCH}" "${OUT}/repair.log"
+            verdict membership-repair "${C[@]}" "${P}" "${CLEAR_EPOCH}" "${OUT}/repair.log"
         fi
         if [[ "${KIND}" == late ]]; then
             COMPLETE_MARK="$(slack_post_mark)"
@@ -539,7 +617,7 @@ PY
             late_state "${OUT}/late-after.jsonl"
             stub_slice "${CASE_MARK}" "${OUT}/late-stub.jsonl"
             log_slice "${SLACK_STATE_DIR}/server.log" "${CASE_LOG}" "${OUT}/late.log"
-            bun "${E}" membership-late "${C[@]}" "${P}" "${LATE_REQUEST}" "${OUT}/late-stub.jsonl" \
+            verdict membership-late "${C[@]}" "${P}" "${LATE_REQUEST}" "${OUT}/late-stub.jsonl" \
                 "${COMPLETE_MARK}" "${OUT}/late.log" "${OUT}/late-before.jsonl" "${OUT}/late-after.jsonl"
         fi
         if [[ "${KIND}" != undurable ]]; then
@@ -559,27 +637,32 @@ PY
         else stub_slice "${CASE_MARK}" "${OUT}/stub.jsonl"; fi
         # Stop drains the measurement recorder. Queue contents remain retained
         # by the manual-receipt stub; capture before the required clean restart.
-        bun "${E}" conditions "${SLACK_STATE_DIR}" "${SERVER_PID}"
+        bun "${E}" conditions "${SLACK_STATE_DIR}" "${SERVER_PID}" "${ROOT}/cpu.before"
+        REOPEN_OBSERVE_LOG="$(byte_mark "${SLACK_STATE_DIR}/server.log")"
+        reopen_ad_rows before-stop > "${ROOT}/reopen-observe.rows"
+        REOPEN_OBSERVE=1
         stop_server --stop-bots
+        reopen_ad_rows after-stop >> "${ROOT}/reopen-observe.rows"
         for key in "${KEYS[@]}"; do snapshot "${key}" "${OUT}/${key}.queue.jsonl"; done
         # Real traffic has stored and been drained by now: absence is a failure.
         regular_measurements || fail 'test-only measurement file missing after measured traffic'
         cp "${MEASUREMENTS}" "${OUT}/measurements.jsonl"
         REOPEN_LOG="$(byte_mark "${SLACK_STATE_DIR}/server.log")"
         start_ready
-        bun "${E}" seal measured "${C[@]}" "${SLACK_STATE_DIR}/server.log" "${REOPEN_LOG}" "${CONFIG}"
+        verdict seal measured "${C[@]}" "${SLACK_STATE_DIR}/server.log" "${REOPEN_LOG}" "${CONFIG}"
+        REOPEN_OBSERVE=''
         for key in "${KEYS[@]}"; do read_jsonl "${OUT}/${key}.after.jsonl" shared_thread_joins "${key}"; done
         if [[ "${KIND}" != undurable && "${MODE}" == strict ]]; then
             write_states "${WRITES}/reopened.jsonl"
             applied_events "${WRITES}/events.reopened.jsonl"
-            bun "${E}" membership-writes "${C[@]}" "${WRITES}" "${Q}" "${WRITE_CHANNEL}" "${WRITES}/case-stub.jsonl" \
+            verdict membership-writes "${C[@]}" "${WRITES}" "${Q}" "${WRITE_CHANNEL}" "${WRITES}/case-stub.jsonl" \
                 "${WRITE_SUBMIT}" "${WRITE_RESULT}" "${OUT}/times.jsonl"
         elif [[ "${KIND}" != undurable ]]; then
             read_jsonl "${WRITES}/reopened.jsonl" shared_attempt_order "${Q}"
             # Ordered-write N1 covers Q's concurrent traffic. Fault-check also
             # judges P's independent originals and all dependent replay ACKs.
             jq -c --arg key "${Q}" 'select(.label==$key)' "${OUT}/stub.jsonl" > "${WRITES}/stub.jsonl"
-            bun "${E}" ordered-writes "${C[@]}" "${WRITES}" "${WRITES}/stub.jsonl" \
+            verdict ordered-writes "${C[@]}" "${WRITES}" "${WRITES}/stub.jsonl" \
                 "${WRITE_SUBMIT}" "${WRITE_RESULT}" "${OUT}/times.jsonl"
         fi
         if [[ "${KIND}" == lookup ]]; then
@@ -595,13 +678,13 @@ PY
                 envelope="$(jq -ser --argjson ordinal "${ordinal}" '[.[] | select(.ordinal==$ordinal and .stage=="original")] | if length==1 then .[0].envelope_id else error("missing lookup envelope") end' "${OUT}/fault-ledger.jsonl")"
                 printf '%s\t%s\t%s\t%s\t%s\n' "${P}" "${method}" "${outcome}" "${match}" "${envelope}"
             done > "${OUT}/lookups.tsv"
-            bun "${E}" lookup-faults "${C[@]}" "${OUT}/lookups.tsv" "${OUT}/stub.jsonl" "${OUT}/times.jsonl"
+            verdict lookup-faults "${C[@]}" "${OUT}/lookups.tsv" "${OUT}/stub.jsonl" "${OUT}/times.jsonl"
         fi
         if [[ "${KIND}" == undurable ]]; then
-            bun "${E}" check "${C[@]}" "${OUT}" "${OUT}/measurements.jsonl" "${MEASURE_MARK}" "${START_MS}" "${READY_MS}"
-            bun "${E}" stores "${C[@]}" "${OUT}" "${OUT}/measurements.jsonl" "${MEASURE_MARK}"
+            verdict check "${C[@]}" "${OUT}" "${OUT}/measurements.jsonl" "${MEASURE_MARK}" "${START_MS}" "${READY_MS}"
+            verdict stores "${C[@]}" "${OUT}" "${OUT}/measurements.jsonl" "${MEASURE_MARK}"
         else
-            bun "${E}" fault-check "${C[@]}" "${OUT}" "${OUT}/stub.jsonl" "${CLEAR_MARK}" "${CLEAR_EPOCH}" \
+            verdict fault-check "${C[@]}" "${OUT}" "${OUT}/stub.jsonl" "${CLEAR_MARK}" "${CLEAR_EPOCH}" \
                 "${OUT}/measurements.jsonl" "${MEASURE_MARK}" "${START_MS}" "${READY_MS}"
         fi
         stop_server --stop-bots

@@ -657,8 +657,11 @@ second, so this interval includes dispatch and preparation; delivery follows
 the full timeout and lookup-to-delivery is not the N4 measure.
 
 The 100 ms
-allowance applies only to Post Hold resolution and N4, never to N1, store
-p99, membership deadlines, retry spacing, `Retry-After` or idle repair.
+allowance applies only to Post Hold resolution, N4 and a membership hang's
+request duration (D − A) over `MEMBERSHIP_REQUEST_TIMEOUT_MS`, whose
+`membership-fault` hang lines also print signed `excess_ms` and
+`allowance_ms`. It never applies to N1, store p99, the membership attempt
+deadline, retry spacing, `Retry-After` or idle repair.
 
 Read ACK intervals from the stub's monotonic push and ACK observations.
 Store, Post Hold and name-fallback timings come from the test-only
@@ -680,13 +683,23 @@ Read results against the `recorded: sr8 conditions` line: Bun version, CPUs,
 cgroup memory limit, filesystem type, the state directory's mount and server
 peak RSS. Test 44 captures its largest two-recipient open-mode burst, Tests 45
 and 48 capture each case, and Test 32 captures each mode's thread phase while
-its measured server still exists. The fixture's output forms are:
+its measured server still exists. Tests 45 and 48 also add the cgroup's
+`cpu.max` and its throttling deltas since the case's start (`unknown` when
+unreadable). The fixture's output forms are:
 
 ```text
-recorded: sr8 conditions bun=<version> cpus=<count> memory_limit=<limit> fs_type=<type> state_dir_mount=<mount> peak_rss_kib=<KiB>
+recorded: sr8 conditions bun=<version> cpus=<count> memory_limit=<limit> fs_type=<type> state_dir_mount=<mount> peak_rss_kib=<KiB>[ cpu_max=<quota|max>/<period> nr_periods_delta=<n> nr_throttled_delta=<n> throttled_usec_delta=<usec>]
 recorded: sr8 <measure> scenario=<scenario> mode=<strict|open> population=<joins-per-persona> recipients=<1|2> samples=<count> <statistics> limit=<limit> verdict=<pass|fail|missing|recorded>
 recorded: sr8 summary scenario=<scenario> measures=<count> pass=<count> fail=<count> missing=<count>
+recorded: sr8 membership-fault-row case=<case> source=<fault|fault-settled|api|scan|stub> <fields>
 ```
+
+A `membership-fault` case that does not pass first prints its
+`membership-fault-row` lines, before its verdict lines. They are correlation
+rows, not measures, and carry no `verdict=`: each staged fault, its
+settlement and API answer (joined by fault ordinal), and each scan
+diagnostic, as numbers and code words only (`rows=unavailable` when the
+stub records or scan diagnostics are absent).
 
 Each verdict command prints every result line and its summary before
 returning failure for any `fail` or `missing`; a script can therefore stop

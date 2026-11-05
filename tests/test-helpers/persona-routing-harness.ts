@@ -52,6 +52,7 @@ import {
   type RestartDeps,
 } from '../../src/restart.ts'
 import { LIVENESS_READING_DEAD, type LivenessReading } from '../../src/liveness-reading.ts'
+import type { PersonaSerialize } from '../../src/persona-serializer.ts'
 import { KILL_OUTCOME_KILLED } from '../../src/checked-kill.ts'
 import { _resetBackoffState, isAtCap, recordFailure } from '../../src/backoff.ts'
 import { LATCH_ROW_STATE_NO_ROW, REFUSED_OPERATION_PLAIN_SPAWN } from '../../src/conflict-latch.ts'
@@ -398,6 +399,8 @@ export interface RestartFakeOptions {
   restartDelayS?: number | (() => number)
   /** Replaces the launch outcome (default: resolves true). Called after the launch is recorded. */
   launchSession?: (key: string, cwd: string, sessionId?: string) => Promise<boolean>
+  /** The restart work's per-persona serializer (`RestartDeps.serialize`); absent, the work runs at once. */
+  serialize?: PersonaSerialize
 }
 
 /** What `makeRestartDeps` adds to the restart deps: its captures and its in-flight query. */
@@ -448,6 +451,7 @@ export function makeRestartDeps(opts: RestartFakeOptions = {}): RestartDeps & Re
     getRestartDelay: () => (typeof delay === 'function' ? delay() : delay),
     isShuttingDown: () => false,
     onCapReached: () => {},
+    ...(opts.serialize === undefined ? {} : { serialize: opts.serialize }),
   }
 }
 
@@ -494,6 +498,8 @@ export interface RoutingHarnessOptions {
   restartDelayS?: number
   /** Replaces the restart deps' launch outcome, e.g. a promise held open. */
   launchSession?: RestartFakeOptions['launchSession']
+  /** The restart deps' serializer (see `RestartFakeOptions.serialize`). */
+  serialize?: RestartFakeOptions['serialize']
   /** Clock for the per-persona dedupe stores (e.g. a fake clock's `now`); default the module's (`Date.now`). */
   dedupeClock?: () => number
   /** Replaces the routing's `notify` (default: the real notifier, `h.notifier.notify`); calls are still recorded in `h.notices`. */
@@ -855,6 +861,7 @@ export function makeRoutingHarness(
   const restartDeps = makeRestartDeps({
     restartDelayS: () => h.restartDelayS,
     launchSession: opts.launchSession ?? (opts.holdLaunches === true ? holdLaunch : undefined),
+    serialize: opts.serialize,
   })
 
   // The up check, as main() builds it: a connection that serves for every

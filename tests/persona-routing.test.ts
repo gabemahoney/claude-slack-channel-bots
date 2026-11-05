@@ -453,7 +453,9 @@ describe.each(['strict', 'open'] as const)('%s serial hybrid joins', mode => {
     await h.receive(event, ['alpha', 'beta'], () => {
       atAck.push({ stores: [...stores], joins: ['alpha', 'beta'].map(k => h.threads!.memory.view(k, CA, THREAD_ROOTS.primary)), saved: ['alpha', 'beta'].map(savedJoins) })
     })
-    expect(atAck).toEqual([{ stores: ['alpha', 'beta'], joins: ['joined', 'joined'], saved: [[], []] }])
+    // Recipients store concurrently: each once, in either order, both before the ack.
+    expect(atAck).toEqual([{ stores: expect.arrayContaining(['alpha', 'beta']), joins: ['joined', 'joined'], saved: [[], []] }])
+    expect((atAck[0] as { stores: string[] }).stores).toHaveLength(2)
     await h.settleJoinSaves()
     const next = reply(); await h.receive(next)
     for (const key of ['alpha', 'beta']) {

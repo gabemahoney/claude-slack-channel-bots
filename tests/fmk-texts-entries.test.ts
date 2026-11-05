@@ -114,7 +114,7 @@ import * as sharedChannels from '../src/shared-channels.ts'
 import * as testTimerOverrides from '../src/test-timer-overrides.ts'
 import * as testMeasurements from '../src/test-measurements.ts'
 import * as unavailableRetry from '../src/unavailable-retry.ts'
-import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
+import { assertNoLeak, writtenFile, fakeToken, BOT_TOKEN_PREFIX } from './test-helpers/credentials.ts'
 import { makePersona, makePersonaConfigInput } from './test-helpers/persona-config.ts'
 import { initialSharedState } from './test-helpers/shared-channels.ts'
 
@@ -142,22 +142,37 @@ describe('test-29 Channel Stamp printer', () => {
   const state = initialSharedState(base, input)
   const key = personaIdentity.personaKey('alpha')
 
-  function reader(bytes = sharedChannels.serializeSharedChannelState(state)) {
-    const reads: string[] = []
+  // The record and its private copy live in memory: the injected fs calls
+  // copy between map entries, and the reader reads only a copied path.
+  type Faults = { copy?: unknown, read?: unknown }
+  function reader(bytes = sharedChannels.serializeSharedChannelState(state), faults: Faults = {}) {
+    const reads: string[] = [], copies: Array<[string, string]> = [], removed: string[] = [], scratches: string[] = []
+    const files = new Map<string, Uint8Array>([[recordPath, bytes]])
     const packageFunction = async (_context: unknown, file: string, name: string) => {
       if (file === 'config.ts' && name === 'readPersonaConfigBytes') return (path: string) => {
         reads.push(path)
-        if (path !== recordPath) throw new Error('unexpected read')
-        return bytes
+        if (faults.read !== undefined) throw faults.read
+        if (path === recordPath || !files.has(path)) throw new Error('unexpected read')
+        return files.get(path)!
       }
       if (file === 'shared-channels.ts') return (sharedChannels as Record<string, unknown>)[name]
       throw new Error('unexpected package export')
     }
+    const copyFileSync = (from: string, to: string) => {
+      copies.push([from, to])
+      if (faults.copy !== undefined) throw faults.copy
+      files.set(to, files.get(from)!)
+    }
+    const mkdtempSync = (prefix: string) => { const dir = `${prefix}${scratches.length}`; scratches.push(dir); return dir }
+    const rmSync = (path: string) => { removed.push(path); for (const name of [...files.keys()]) if (name.startsWith(`${path}/`)) files.delete(name) }
     const entry = new Function('packageFunction', 'PrinterFailure', 'PRINTER_FAIL_EXIT', 'usageFail',
-      `${js}\nreturn sharedThreadStamp;`)(packageFunction, Error, 1, () => { throw new Error('invalid arguments') }) as {
+      'copyFileSync', 'mkdtempSync', 'rmSync', 'tmpdir', 'join',
+      `${js}\nreturn sharedThreadStamp;`)(packageFunction, Error, 1, () => { throw new Error('invalid arguments') },
+      copyFileSync, mkdtempSync, rmSync, () => join(base, 'scratch'), join) as {
         print(args: string[], context: object): Promise<string>
       }
-    return { reads, print: (persona = key, channel = 'CHYBRID') => entry.print([configPath, recordPath, persona, channel], {}) }
+    return { reads, copies, removed, scratches, files,
+      print: (persona = key, channel = 'CHYBRID') => entry.print([configPath, recordPath, persona, channel], {}) }
   }
 
   test('prints only the selected current stamp, obtained through the production reader', async () => {
@@ -165,8 +180,39 @@ describe('test-29 Channel Stamp printer', () => {
     const r = reader(), output = await r.print()
     expect(JSON.parse(output)).toEqual({ incarnation: state.personas[key]!.incarnation,
       threadHybridSince: state.personas[key]!.assignments.CHYBRID!.threadHybridSince })
-    expect(r.reads).toEqual([recordPath])
+    expect(r.scratches).toHaveLength(1)
+    const copy = join(r.scratches[0]!, 'record')
+    expect(r.copies).toEqual([[recordPath, copy]])
+    expect(r.reads).toEqual([copy])
     assertNoLeak(output)
+  })
+
+  test('reads a private copy of the record and removes it, on success and on failure', async () => {
+    const ok = reader()
+    await ok.print()
+    expect(ok.scratches[0]!.startsWith(join(base, 'scratch', 'fmk-authority-'))).toBe(true)
+    expect(ok.removed).toEqual(ok.scratches)
+    expect([...ok.files.keys()]).toEqual([recordPath])
+    const failed = reader(Buffer.from('private-invalid-authority'))
+    await expect(failed.print()).rejects.toThrow()
+    expect(failed.removed).toEqual(failed.scratches)
+    expect([...failed.files.keys()]).toEqual([recordPath])
+  })
+
+  test('a failed authority read names its stage and errno-style code, once, with no retry', async () => {
+    const changed = Object.assign(new Error('changed while being read: /private/path'), { code: 'EAGAIN' })
+    const r = reader(undefined, { read: changed })
+    await expect(r.print()).rejects.toThrow('shared configuration authority could not be read or validated (read EAGAIN)')
+    expect(r.reads).toHaveLength(1)
+    expect(r.copies).toHaveLength(1)
+    const missing = reader(undefined, { copy: Object.assign(new Error('no such file /private/path'), { code: 'ENOENT' }) })
+    await expect(missing.print()).rejects.toThrow('shared configuration authority could not be read or validated (copy ENOENT)')
+    expect(missing.reads).toEqual([])
+    await expect(reader(Buffer.from('{')).print()).rejects.toThrow('shared configuration authority could not be read or validated (parse)')
+    for (const code of ['not a regular file', 'Esecret', fakeToken(BOT_TOKEN_PREFIX, 'authority-code'), 7]) {
+      const error = await reader(undefined, { read: Object.assign(new Error('x'), { code }) }).print().then(() => new Error('resolved'), (e: Error) => e)
+      expect(error.message).toBe('shared configuration authority could not be read or validated (read)')
+    }
   })
 
   test('refuses absent, non-hybrid and inherited-property lookups', async () => {

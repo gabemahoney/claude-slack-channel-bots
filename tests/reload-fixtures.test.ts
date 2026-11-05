@@ -1,6 +1,6 @@
 /** Execute the integration printer bodies with real package modules and scratch files. */
 import { afterEach, beforeEach, expect, test } from 'bun:test'
-import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, symlinkSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, symlinkSync, copyFileSync, mkdtempSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import { spawnSync } from 'node:child_process'
@@ -23,12 +23,14 @@ const modules: Record<string, Record<string, unknown>> = {
 }
 const names = ['operatorReviewRequest', 'operatorReviewPending', 'sharedReviewConsumed', 'sharedApplicationPreserved', 'sharedAuthorityPreserved', 'stoppedDowngradeBaseline']
 const entries = new Function('packageFunction', 'expectArguments', 'usageFail', 'PrinterFailure', 'PRINTER_FAIL_EXIT', 'isDeepStrictEqual', 'dirname', 'Buffer',
+  'copyFileSync', 'mkdtempSync', 'rmSync', 'tmpdir', 'join',
   ts.transpileModule(declarations, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText + `\nreturn {${names.join(',')}};`)(
   async (_: unknown, file: string, name: string) => {
     const fn = modules[file]?.[name]; expect(fn).toBeTypeOf('function'); return fn
   },
   (_: string, args: unknown[], wanted: string[]) => { if (args.length !== wanted.length) throw new Error('invalid arguments') },
   () => { throw new Error('invalid arguments') }, Error, 1, isDeepStrictEqual, dirname, Buffer,
+  copyFileSync, mkdtempSync, rmSync, () => h.root, join,
 ) as Record<string, { print(args: string[], context: object): Promise<string> }>
 let h: ReloadHarness, run: ReloadRun
 beforeEach(async () => {

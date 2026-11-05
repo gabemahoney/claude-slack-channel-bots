@@ -143,8 +143,12 @@
  *     work, absent kinds, incomplete/mismatched samples, malformed or reversed
  *     endpoints are missing, exit 1. No scheduler-start assertion is proof.
  *     bun "$E" concurrent-overlap "$TEST_NAME" "$mode" 100000 2 "$out/operations.tsv" "$out/sample-intervals.tsv" "$out/n2.txt"
- *   conditions <state-dir> <server-pid>
- *     Bun, CPUs, cgroup memory limit, filesystem/mount, server VmHWM (KiB).
+ *   conditions <state-dir> <server-pid> [<cpu-mark-file>]
+ *     Bun, CPUs, cgroup memory limit, filesystem/mount, server VmHWM (KiB). With a
+ *     cpu-mark file, also cgroup cpu_max and the nr_periods/nr_throttled/
+ *     throttled_usec deltas since that mark (cpuConditionFields; unknown if unread).
+ *   cpu-mark <new-file>
+ *     Saves the cgroup cpu.stat counters (empty when unreadable) at a case's start.
  *
  * Additional case commands for scripts 44/45 (check, n4 and startup-load keep
  * their outputs). TSV files contain observations/identities, never Slack/control
@@ -224,7 +228,8 @@
  *     to the staged request's arrival interval before the next faulted attempt.
  *     Request duration D-A uses A=arrival_epoch_ms (stub handler entry before control
  *     I/O/body parsing) and D=diagnostic logger ISO time, both on the same container
- *     wall clock. D-A must be <= MEMBERSHIP_REQUEST_TIMEOUT_MS, and A/D inside the
+ *     wall clock. D-A must be <= MEMBERSHIP_REQUEST_TIMEOUT_MS + SR8_DISPATCH_ALLOWANCE_MS
+ *     (hang lines print signed excess_ms and allowance_ms), and A/D inside the
  *     attempt interval [deadline_at - MEMBERSHIP_ATTEMPT_TIMEOUT_MS, deadline_at].
  *     Never use the later fault.ts as arrival. D<A or absent endpoints/settlements is
  *     missing; an observed over-bound duration is fail. Wall-clock steps are NOT
@@ -234,13 +239,16 @@
  *     historical channel. failure-index is the first fault's zero-based local
  *     backoff index; retry-after is the injected seconds (0 for non-429).
  *     Lines: membership-fault(case,page,fired,incomplete,max_request_ms,max_attempt_ms,
- *     attempt_limit_ms), membership-retry(case,
+ *     attempt_limit_ms[,excess_ms,allowance_ms]), membership-retry(case,
  *     page,min_ms,retry_after_ms,after_429_ms). Start gaps use arrival_mono_ms;
  *     after-429 uses the stub API response ISO stamp and next arrival_epoch_ms, not
  *     server clocks. Limits from membershipRetryDelay / MEMBERSHIP_REQUEST_TIMEOUT_MS;
- *     NO allowance. Missing fired/diagnostic/answer/state evidence is missing;
+ *     the allowance applies to D-A only. Missing fired/diagnostic/answer/state evidence is missing;
  *     early retry, wrong outcome, false complete or changed state fails.
  *     membership-retry is a RESULT of membership-fault, not a separate CLI command.
+ *     When either result is not pass, membership-fault-row lines (membershipFaultRows:
+ *     fault, settlement, API answer and scan rows, numbers and code words only)
+ *     print before the verdict lines.
  *   membership-repair C <key> <clear-epoch-ms> <log-slice>
  *     Slice contains the last incomplete diagnostic before clear and the first
  *     complete diagnostic afterward, with the logger's ISO timestamps intact.
@@ -446,7 +454,8 @@
  *
  * Percentiles: transcript-receipts.percentile (nearest rank), never interpolation.
  * SR8_DISPATCH_ALLOWANCE_MS is the test-method timer-dispatch allowance over the
- * Post Hold and N4 STRICT limits; both print signed excess and allowance always.
+ * Post Hold and N4 STRICT limits and the membership hang request duration D-A;
+ * each prints signed excess and allowance always.
  */
 import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, statSync, statfsSync, openSync, readSync, closeSync } from 'node:fs'
 import { join, resolve } from 'node:path'
@@ -853,7 +862,7 @@ export function membershipFaultVerdicts(kind: string, page: string, key: string,
         || !(ss[0].seq > f.seq) || !positive(attemptMs)) { faultMissing = true; continue }
       const elapsed = d.at - a, attemptStart = d.deadline - attemptMs
       requestDurations.push(elapsed); attemptDurations.push(d.at - attemptStart)
-      deadlineBad ||= elapsed > requestMs || d.at > d.deadline || a < attemptStart
+      deadlineBad ||= elapsed - requestMs > SR8_DISPATCH_ALLOWANCE_MS || d.at > d.deadline || a < attemptStart
         || ss[0].resolution !== 'abort'
     }
     if (used.size !== matches.length) faultMissing = true
@@ -861,11 +870,37 @@ export function membershipFaultVerdicts(kind: string, page: string, key: string,
   }
   const stats = { case: kind, page, fired: faults.length, incomplete: matches.length,
     max_request_ms: requestDurations.length ? maximum(requestDurations) : 'missing',
-    max_attempt_ms: attemptDurations.length ? maximum(attemptDurations) : 'missing', attempt_limit_ms: attemptMs }
+    max_attempt_ms: attemptDurations.length ? maximum(attemptDurations) : 'missing', attempt_limit_ms: attemptMs,
+    ...(kind === 'hang' ? { excess_ms: requestDurations.length ? maximum(requestDurations) - requestMs : 'missing',
+      allowance_ms: SR8_DISPATCH_ALLOWANCE_MS } : {}) }
   return [result('membership-fault', matches.length, stats, kind === 'hang' ? requestMs : 'incomplete', deadlineBad || bad ? 'fail' : faultMissing ? 'missing' : 'pass'),
     result('membership-retry', gaps.length, { case: kind, page, min_ms: gaps.length ? Math.min(...gaps) : 'missing',
       retry_after_ms: kind === 'rate' ? retryAfter * 1000 : 0, after_429_ms: after429.length ? Math.min(...after429) : 0 }, retryMs,
     deadlineBad ? 'fail' : missing ? 'missing' : early || gaps.some(n => n < retryMs) || after429.some(n => n < retryAfter * 1000) ? 'fail' : 'pass')]
+}
+/** Correlation rows for a membership-fault case that did not pass: the key's
+ * users.conversations faults, each fault's settlement and API answer, joined by
+ * the fault's ordinal (never its request ID), and every scan diagnostic. Only
+ * finite numbers and lower-case code words print; anything else prints
+ * `invalid`, so no text, ID, token or error reaches the line. */
+export function membershipFaultRows(kind: string, key: string, stub: any[] | undefined, diagnostics: ScanDiagnostic[] | undefined): string[] {
+  const num = (v: unknown) => v === undefined ? 'absent' : typeof v === 'number' && Number.isFinite(v) ? String(v) : 'invalid'
+  const word = (v: unknown) => v === undefined ? 'absent' : typeof v === 'string' && /^[a-z_]{1,40}$/.test(v) ? v : 'invalid'
+  const epoch = (v: unknown) => v === undefined ? 'absent' : num(typeof v === 'string' ? Date.parse(v) : NaN)
+  const head = `recorded: sr8 membership-fault-row case=${word(kind)}`
+  if (!stub) return [`${head} source=stub rows=unavailable`]
+  const faults = stub.filter(r => r?.event === 'fault' && r.method === 'users.conversations' && r.label === key)
+  const lines = faults.map((f, i) => `${head} source=fault fault=${i} seq=${num(f.seq)} outcome=${word(f.outcome)} arrival_epoch_ms=${num(f.arrival_epoch_ms)} arrival_mono_ms=${num(f.arrival_mono_ms)}`)
+  for (const [i, f] of faults.entries()) {
+    const own = (event: string) => typeof f.request_id === 'string' && f.request_id !== '' ? stub.filter(r => r?.event === event && r.request_id === f.request_id) : []
+    for (const s of own('fault-settled')) lines.push(`${head} source=fault-settled fault=${i} seq=${num(s.seq)} resolution=${word(s.resolution)} ts_epoch_ms=${epoch(s.ts)}`)
+    for (const a of own('api')) lines.push(`${head} source=api fault=${i} status=${num(a.status)} answer=${word(a.answer)} ts_epoch_ms=${epoch(a.ts)}`)
+  }
+  if (!diagnostics) lines.push(`${head} source=scan rows=unavailable`)
+  for (const [i, d] of (diagnostics ?? []).entries()) {
+    lines.push(`${head} source=scan scan=${i} at_epoch_ms=${num(d.at)} complete=${d.complete} pages=${num(d.pages)} reason=${word(d.reason || undefined)} slack=${word(d.slack)} deadline_at=${num(d.deadline)} next_attempt_at=${num(d.next)} retry_after_s=${num(d.retryAfter)}`)
+  }
+  return lines
 }
 export function membershipRepairVerdict(clearAt: number, diagnostics: ScanDiagnostic[] | undefined, attemptMs: number, retryMaxMs: number): Result {
   const completed = diagnostics?.filter(d => d.complete && d.at >= clearAt) ?? []
@@ -1353,8 +1388,11 @@ async function additional(command: string, c: Context, args: string[]): Promise<
     const failureCount = numeric(failures)
     const wait = integer(failureCount) ? Number(printer('membershipRetryDelay', failures,
       ...(kind === 'rate' && nonnegative(numeric(retryAfter)) ? [retryAfter] : []))) : NaN
-    return membershipFaultVerdicts(kind, page, key, evidenceRows(stub), diagnostics(log, key), textFile(before), textFile(after),
+    const rows = evidenceRows(stub), scans = diagnostics(log, key)
+    const results = membershipFaultVerdicts(kind, page, key, rows, scans, textFile(before), textFile(after),
       numeric(retryAfter), wait, Number(printer('MEMBERSHIP_REQUEST_TIMEOUT_MS')), Number(printer('MEMBERSHIP_ATTEMPT_TIMEOUT_MS')))
+    if (results.some(r => r.verdict !== 'pass')) for (const line of membershipFaultRows(kind, key, rows, scans)) console.log(line)
+    return results
   }
   if (command === 'membership-repair') {
     countArgs(args, 3)
@@ -1936,14 +1974,43 @@ function concurrentOverlap(c: Context, args: string[]): Result[] {
   const measured = textFile(args[2])
   return concurrentOverlapVerdicts(operations, samples, measured === undefined ? undefined : n2Samples(measured), c.mode)
 }
+/** The container cgroup's CPU throttling counters, v2 first, then v1
+ * (throttled_time is nanoseconds there). Undefined when no counter reads. */
+export function cpuThrottle(text: string | undefined): { periods: number, throttled: number, throttledUsec: number } | undefined {
+  const value = (name: string) => { const m = text?.match(new RegExp(`^${name} (\\d+)$`, 'm')); return m ? Number(m[1]) : undefined }
+  const periods = value('nr_periods'), throttled = value('nr_throttled'), usec = value('throttled_usec'), ns = value('throttled_time')
+  const throttledUsec = usec ?? (ns === undefined ? undefined : Math.floor(ns / 1000))
+  return periods === undefined || throttled === undefined || throttledUsec === undefined ? undefined : { periods, throttled, throttledUsec }
+}
+/** `cpu_max=<quota|max>/<period>` and the throttling deltas since a case's
+ * cpu-mark, each `unknown` when unreadable or malformed. */
+export function cpuConditionFields(cpuMax: string | undefined, before: string | undefined, now: string | undefined): string {
+  const max = cpuMax?.trim().match(/^(max|\d+) (\d+)$/)
+  const a = cpuThrottle(before), b = cpuThrottle(now)
+  const delta = (pick: (t: NonNullable<typeof a>) => number) => a && b && pick(b) >= pick(a) ? String(pick(b) - pick(a)) : 'unknown'
+  return `cpu_max=${max ? `${max[1]}/${max[2]}` : 'unknown'} nr_periods_delta=${delta(t => t.periods)} nr_throttled_delta=${delta(t => t.throttled)} throttled_usec_delta=${delta(t => t.throttledUsec)}`
+}
+function cgroupCpuMax() {
+  const v2 = textFile('/sys/fs/cgroup/cpu.max')
+  if (v2 !== undefined) return v2
+  const quota = textFile('/sys/fs/cgroup/cpu/cpu.cfs_quota_us')?.trim(), period = textFile('/sys/fs/cgroup/cpu/cpu.cfs_period_us')?.trim()
+  return quota === undefined || period === undefined ? undefined : `${quota === '-1' ? 'max' : quota} ${period}`
+}
+const cgroupCpuStat = () => textFile('/sys/fs/cgroup/cpu.stat') ?? textFile('/sys/fs/cgroup/cpu/cpu.stat')
+function cpuMark(args: string[]) {
+  countArgs(args, 1)
+  const stat = cgroupCpuStat()
+  writeFileSync(args[0], cpuThrottle(stat) ? stat! : '', { flag: 'wx' })
+}
 function conditions(args: string[]) {
-  countArgs(args, 2)
-  const [state, pid] = args
+  countArgs(args, 2, 3)
+  const [state, pid, mark] = args
   if (!/^\d+$/.test(pid)) throw new Error('usage')
   const memory = textFile('/sys/fs/cgroup/memory.max')?.trim() ?? textFile('/sys/fs/cgroup/memory/memory.limit_in_bytes')?.trim() ?? 'unknown'
   const mount = (textFile('/proc/self/mountinfo') ?? '').split('\n').map(l => l.split(' ')).filter(s => s[4] && (resolve(state) === s[4] || resolve(state).startsWith(s[4].replace(/\/$/, '') + '/'))).sort((a, b) => b[4].length - a[4].length)[0]?.[4] ?? 'unknown'
   const peak = textFile(`/proc/${pid}/status`)?.match(/^VmHWM:\s+(\d+) kB$/m)?.[1] ?? 'unknown'
-  console.log(`recorded: sr8 conditions bun=${Bun.version} cpus=${cpus().length} memory_limit=${memory} fs_type=${statfsSync(state).type} state_dir_mount=${mount} peak_rss_kib=${peak}`)
+  const cpu = mark === undefined ? '' : ` ${cpuConditionFields(cgroupCpuMax(), textFile(mark), cgroupCpuStat())}`
+  console.log(`recorded: sr8 conditions bun=${Bun.version} cpus=${cpus().length} memory_limit=${memory} fs_type=${statfsSync(state).type} state_dir_mount=${mount} peak_rss_kib=${peak}${cpu}`)
 }
 async function main(args: string[]): Promise<number> {
   if (!existsSync('/etc/cscb-ci-image')) { console.error('FAIL: sr8-evidence requires the CI image'); return 2 }
@@ -1958,6 +2025,7 @@ async function main(args: string[]): Promise<number> {
     return 0
   }
   if (command === 'conditions') { conditions(args); return 0 }
+  if (command === 'cpu-mark') { cpuMark(args); return 0 }
   if (command === 'combinations') {
     countArgs(args, 0)
     const p = await population()

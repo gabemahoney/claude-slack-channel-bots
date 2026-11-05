@@ -16,7 +16,8 @@
  * for that conversation. Do permission phases before this notice/recovery leg.
  * All control paths, including the stub's hook TMPDIR, are fenced to scratch.
  * HOME and AD's real image store stay unchanged. No pane or store writes.
- * 30 s process deadline; 5 s AD calls; metadata-only stdout, redacted failure.
+ * 30 s process deadline; 5 s AD calls; metadata-only stdout, redacted failure
+ * naming only a fixed step label and the last bound row's state.
  */
 import { existsSync, realpathSync, lstatSync, readFileSync, openSync, closeSync, fstatSync, readSync, writeSync, constants } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
@@ -25,6 +26,10 @@ if (!existsSync('/etc/cscb-ci-image')) {
   console.error('FAIL: shared-stub-permission: refused outside the CI image')
   process.exit(2)
 }
+
+// The redacted failure line's fixed step label and last bound AD row state.
+let failureStep = 'prerequisites'
+let failureState: string | undefined
 
 function requireFact(value: unknown): asserts value {
   if (!value) throw new Error('shared stub prerequisite or binding failed')
@@ -125,6 +130,8 @@ async function noticeControl(client: NoticeClient, command: string, id: string, 
   throw new Error('notice worker transition not observed')
 }
 async function run() {
+  failureStep = 'prerequisites'
+  failureState = undefined
   const [binArg, command, workArg, key, token] = process.argv.slice(2)
   requireFact(binArg && workArg && ['setup', 'permission-1', 'permission-2', 'receipt', 'outcome',
     'complete-1', 'complete-2', 'notice-setup', 'notice-end', 'notice-ended', 'notice-resume'].includes(command))
@@ -152,6 +159,7 @@ async function run() {
   const pkg = process.env.CSCB_PKG_DIR ?? '/test-repo/node_modules/claude-slack-channel-bots'
   const { personaInstanceId } = await import(join(pkg, 'src/persona-identity.ts'))
   if (notice) {
+    failureStep = 'notice prerequisites'
     const stateDir = scratchPath(root, process.env.SLACK_STATE_DIR!, true)
     const configPath = scratchPath(root, join(stateDir, 'config.json'))
     const recordPath = scratchPath(root, join(stateDir, 'config.json.last-applied'))
@@ -166,21 +174,25 @@ async function run() {
     const evidenceParent = realpathSync(join(token, '..')), realState = realpathSync(stateDir)
     requireFact(evidenceParent !== realState && !evidenceParent.startsWith(realState + sep))
   }
+  failureStep = 'agent-director client'
   const { Client } = await import(import.meta.resolve('agent-director', join(pkg, 'src/agent-director-client.ts')))
   const client = await Client.create({ createIfMissing: false, callTimeoutMs: 5000,
     logger: { debug() {}, info() {}, warn() {}, error() {} } })
   try {
     const id = personaInstanceId(key)
+    failureStep = 'session binding'
     const first = await client.get({ instance_id: id })
     const session = first.session_id
     requireFact(/^[a-f0-9-]{36}$/.test(session))
     const bind = (row: typeof first) => {
+      failureState = typeof row?.state === 'string' && /^[a-z_]{1,32}$/.test(row.state) ? row.state : 'invalid'
       requireFact(row.instance_id === id && row.session_id === session && row.agent === 'claude' &&
         row.labels.persona === key && row.labels.service === 'cscb' && realpathSync(row.cwd) === work &&
         (notice || !['pending', 'missing', 'ended'].includes(row.state)))
       return row
     }
     bind(first)
+    failureStep = 'transcript identity'
     const transcript = boundedText(first.jsonl_path)
     requireFact(transcript.split('\n').filter(Boolean).some(line => {
       const row = JSON.parse(line)
@@ -191,6 +203,7 @@ async function run() {
       // of readiness. Preserve AD's actual reference and same session on resume.
       const expected = join(process.env.HOME!, '.claude', 'projects', work.replace(/[/._]/g, '-'), session + '.jsonl')
       requireFact(realpathSync(first.jsonl_path) === realpathSync(expected))
+      failureStep = 'notice control'
       await noticeControl(client, command, id, key, work, token!, modes, stubText, row => {
         bind(row)
         requireFact(row.jsonl_path === first.jsonl_path)
@@ -198,6 +211,7 @@ async function run() {
       return
     }
     if (command === 'outcome') {
+      failureStep = 'permission outcome'
       requireFact(token)
       const result = await client.getPermission({ request_token: token })
       // A token must first have been observed for this exact scratch session.
@@ -209,6 +223,7 @@ async function run() {
       return
     }
     const complete = command.startsWith('complete-')
+    failureStep = 'hook control files'
     requireFact(complete ? token : !token)
     const control = scratchPath(root, join(bin, `stub-claude-hooks.${session}`))
     const record = scratchPath(root, control + '.jsonl')
@@ -224,6 +239,7 @@ async function run() {
       // submission, never a pane. A previously queued, unobserved release is
       // not retried: it might still execute.
       requireFact(commands.filter(c => c === 'receipt').length === prior)
+      failureStep = 'receipt: no submitted record'
       while (records().filter(r => r.command === 'submitted').length <= prior) {
         requireFact(Date.now() < deadline)
         bind(await client.get({ instance_id: id }))
@@ -233,6 +249,7 @@ async function run() {
     if (complete) {
       // Only this session's observed request, decided allow and delivered to
       // its registered hook, may end the simulated turn.
+      failureStep = 'completion permission'
       requireFact(commands.includes(`permission-${command.slice(-1)}`))
       requireFact(boundedText(observed).split('\n').includes(token!))
       const result = await client.getPermission({ request_token: token })
@@ -240,9 +257,11 @@ async function run() {
         JSON.parse(result.tool_input).command === `printf fixture-${command.slice(-1)}`)
     }
     // A completion's waiting must follow its Stop, never precede it.
+    failureStep = 'control append'
     requireFact(!complete || bind(await client.get({ instance_id: id })).state !== 'waiting')
     bind(await client.get({ instance_id: id }))
     appendControl(control, command + '\n')
+    failureStep = 'registered hook evidence'
     do {
       const events = records().filter(r => r.command === command)
       requireFact(events.length <= prior + 1)
@@ -276,7 +295,11 @@ async function run() {
   } finally { await client.close() }
 }
 
-const watchdog = setTimeout(() => { console.error('FAIL: shared-stub-permission: overall deadline'); process.exit(1) }, 30000)
+const watchdog = setTimeout(() => { console.error(`FAIL: shared-stub-permission: overall deadline (step=${failureStep} state=${failureState ?? 'unknown'})`); process.exit(1) }, 30000)
 try { await run() }
-catch { console.error('FAIL: shared-stub-permission: prerequisites, session binding or registered hook evidence failed'); process.exitCode = 1 }
+catch {
+  // Fixed labels and a validated row state only: never a raw client error.
+  console.error(`FAIL: shared-stub-permission: prerequisites, session binding or registered hook evidence failed (step=${failureStep} state=${failureState ?? 'unknown'})`)
+  process.exitCode = 1
+}
 finally { clearTimeout(watchdog) }

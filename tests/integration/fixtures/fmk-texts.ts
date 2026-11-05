@@ -1378,9 +1378,11 @@
  * which the other blocks' scenarios read as well.
  *
  * The printer makes no agent-director call, starts no process or server,
- * opens no socket, reads no token and writes no file.
+ * opens no socket, reads no token and writes no file but the private copy of
+ * the shared record that `readSharedConfiguration` reads and removes.
  */
-import { existsSync, readFileSync, openSync, closeSync, fstatSync, readSync, constants, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, openSync, closeSync, fstatSync, readSync, constants, readdirSync, copyFileSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import { realpathSync } from 'node:fs'
@@ -4303,6 +4305,11 @@ const deliveryAttemptResult: Entry = {
 /** Read and validate the entire authority with the installed production reader.
  * These entries print only a boolean/number or a production diagnostic, never
  * submitted configuration, credentials, parser errors or arbitrary fields.
+ * The reader reads a private copy: CSCB replaces the record by rename, which
+ * leaves the copied inode's bytes one committed version, while the reader
+ * refuses a live file whose metadata changes during the read. No retry. The
+ * parser and projections still take the record's own path. A failure names
+ * only its stage and the error's errno-style code.
  */
 async function readSharedConfiguration(context: EntryContext, configPath: string, recordPath: string) {
   const read = await packageFunction<(path: string) => Uint8Array>(context, 'config.ts', 'readPersonaConfigBytes')
@@ -4317,12 +4324,23 @@ async function readSharedConfiguration(context: EntryContext, configPath: string
     }>; retiredIdentities: unknown; pendingIntent?: unknown } | undefined>(context, 'shared-channels.ts', 'parseSharedChannelState')
   const applied = await packageFunction<(state: object, path: string) => { port: number; resume_enabled: boolean }>(
     context, 'shared-channels.ts', 'sharedAppliedConfig')
+  let scratch: string | undefined, stage = 'copy'
   try {
-    const state = parse(read(recordPath), recordPath, { sourcePath: configPath })
+    scratch = mkdtempSync(join(tmpdir(), 'fmk-authority-'))
+    const copy = join(scratch, 'record')
+    copyFileSync(recordPath, copy)
+    stage = 'read'
+    const bytes = read(copy)
+    stage = 'parse'
+    const state = parse(bytes, recordPath, { sourcePath: configPath })
     if (!state) throw new Error()
     return { state, applied: applied(state, configPath), read }
-  } catch {
-    throw new PrinterFailure('shared configuration authority could not be read or validated', PRINTER_FAIL_EXIT)
+  } catch (error) {
+    const code = (error as { code?: unknown } | null)?.code
+    const named = typeof code === 'string' && /^E[A-Z0-9]{1,15}$/.test(code) ? ` ${code}` : ''
+    throw new PrinterFailure(`shared configuration authority could not be read or validated (${stage}${named})`, PRINTER_FAIL_EXIT)
+  } finally {
+    try { if (scratch !== undefined) rmSync(scratch, { recursive: true, force: true }) } catch { /* ignore */ }
   }
 }
 

@@ -724,8 +724,66 @@ membership_attempt_ms="$(printed MEMBERSHIP_ATTEMPT_TIMEOUT_MS)"
 membership_retry_ms="$(printed MEMBERSHIP_RETRY_MAX_MS)"
 recovery_bound_s="$(( (membership_attempt_ms + membership_retry_ms + 999) / 1000 + 30 ))"
 incomplete="$(printed MEMBERSHIP_INVENTORY_INCOMPLETE)"
+# A credentials refusal revokes p's whole connection, so its held push is
+# either refused (no open socket, or the send failed, with its push-refused
+# record after <mark>) or sent and never acknowledged. Both are accepted, as
+# in sr8-evidence's denied case. A refused push is neither ACKed nor withheld.
+held_push() {
+    local ts="$1" text="$2" mark="$3" err="${SCENARIO_ROOT}/held-push.err" reason
+    if held="$(push p "${B}" "${ts}" "${text}" 2> "${err}")"; then
+        HELD_REFUSED=false
+        no_ack "${held}"
+        return 0
+    fi
+    reason="$(record_after "${mark}" push-refused "label=${LABEL[p]}" | jq -r 'if length==1 then .[0].reason else "records=\(length)" end')" \
+        || fail 'push-refused reader failed'
+    case "${reason}" in
+        no-open-socket|send-failed) HELD_REFUSED=true; held='' ;;
+        *) sed 's/^/  | /' "${err}" >&2; fail "authorization held push was neither sent nor refused for the revoked connection (${reason})" ;;
+    esac
+}
+# Phase 7 observation, printed only when a page case fails. Diagnostic only:
+# p's lifecycle line counts and timestamps since the case's log mark, and the
+# stub's socket and refusal records since its record mark, never message
+# text, tickets or tokens.
+PHASE7_CASE='' PHASE7_MARK=0 PHASE7_LOG_MARK=0
+phase7_observe() {
+    local ref key slice label a b line stamps count event
+    [[ -n "${PHASE7_CASE}" ]] || return 0
+    ref="$(persona_ref "${NAME[p]}")" && key="${KEY[p]}" || return 0
+    printf 'phase7-observe: case=%s failed\n' "${PHASE7_CASE}"
+    slice="${SCENARIO_ROOT}/phase7-observe.log"
+    tail -c "+$((PHASE7_LOG_MARK + 1))" "${SLACK_STATE_DIR}/server.log" > "${slice}" 2> /dev/null || : > "${slice}"
+    while IFS='|' read -r label a b; do
+        stamps='' count=0
+        while IFS= read -r line; do
+            [[ "${line}" == *"${b}"* ]] || continue
+            count=$((count + 1))
+            if [[ "${line}" =~ ^\[([0-9T:.Z+-]{10,40})\] ]]; then stamps+="${stamps:+,}${BASH_REMATCH[1]}"; fi
+        done < <(grep -F -- "${a}" "${slice}" 2> /dev/null)
+        printf 'phase7-observe: lifecycle=%s count=%s at=%s\n' "${label}" "${count}" "${stamps:-none}"
+    done <<EOF
+credentials-refused|[slack] persona-credentials-refused: personas[|${ref}
+connection-lost|[slack] persona-connection-lost: personas[|${ref}
+connection-restored|[slack] persona-connection-restored: personas[|${ref}
+connected|[slack] Session connected: persona ${ref}|
+disconnected|[slack] Session disconnected|persona ${ref}
+dropped|[slack] persona ${ref}: MCP session dropped|
+inventory-incomplete|[slack] ${incomplete} persona=${key}:|
+inventory-complete|[slack] channel-membership-inventory-complete persona=${key}:|
+EOF
+    for event in ws-open ws-close push-refused; do
+        jq -r -R --argjson mark "${PHASE7_MARK}" --arg e "${event}" --arg l "${LABEL[p]}" '
+            def safe: if . == null then "absent" else tostring | if test("^[A-Za-z0-9_.:+-]{1,64}$") and (test("^xox") | not) then . else "invalid" end end;
+            fromjson? | select(type == "object" and .seq > $mark and .event == $e and .label == $l) |
+            "phase7-observe: stub \(.event) seq=\(.seq|safe) ts=\(.ts|safe) code=\(.code|safe) reason=\(.reason|safe) hello=\(.hello|safe)"' \
+            "${SCENARIO_SLACK_RECORD}" 2> /dev/null || printf 'phase7-observe: stub %s=unreadable\n' "${event}"
+    done
+}
+on_failure phase7_observe
 for page in first later; do
     for problem in transient rate scope authorization hang; do
+        PHASE7_CASE="${page}-${problem}"
         memberships
         slack_stub_faults_clear "${LABEL[p]}"
         cursor=''; [[ "${page}" == later ]] && cursor=later
@@ -739,6 +797,8 @@ for page in first later; do
         slack_stub_inventory_fault "${LABEL[p]}" "${cursor}" "${outcome}" times=100000 "${extra[@]}"
         before="$(same_channel_facts p "${B}")"
         mark="$(slack_post_mark)"; count="$(count_log "${incomplete}")"
+        PHASE7_MARK="${mark}" PHASE7_LOG_MARK="$(wc -c < "${SLACK_STATE_DIR}/server.log")"
+        [[ "${problem}" != authorization ]] || session_barrier_mark --position "${NAME[p]}"
         slack_stub_close_socket "${LABEL[p]}"
         wait_until 30 'socket close did not fire' has_record_after "${mark}" socket-close "label=${LABEL[p]}"
         wait_until 60 'page fault did not fire' has_record_after "${mark}" fault "label=${LABEL[p]}" method=users.conversations "outcome=${outcome}"
@@ -746,8 +806,12 @@ for page in first later; do
         facts_now="$(same_channel_facts p "${B}")" || fail 'persona facts reader failed'
         [[ "${facts_now}" == "${before}" ]] || fail 'incomplete scan removed omitted channel'
         held_ts="$(scenario_ts)"; held_text="$(scenario_mention_text "$(slack_stub_identity "${LABEL[p]}" user_id)" "$(scenario_text "${page}-${problem}-held")")"
-        held="$(push p "${B}" "${held_ts}" "${held_text}")"
-        no_ack "${held}"
+        if [[ "${problem}" == authorization ]]; then
+            held_push "${held_ts}" "${held_text}" "${mark}"
+        else
+            held="$(push p "${B}" "${held_ts}" "${held_text}")"
+            no_ack "${held}"
+        fi
         # Only the hung later-page case promises that positive A remains
         # eligible. A credentials refusal can revoke the whole connection.
         if [[ "${page}" == later && "${problem}" == hang ]]; then
@@ -777,13 +841,23 @@ PY
         wait_until "${recovery_bound_s}" 'idle reconciliation exceeded published recovery bound' \
             _scenario_membership_complete "${KEY[p]}" "$(printed MEMBERSHIP_READINESS_ROUTE)"
         (( SECONDS - repaired_at <= recovery_bound_s )) || fail 'idle recovery late'
-        ack "$(slack_stub_redeliver "${LABEL[p]}" "${held}")"
+        if [[ "${problem}" == authorization && "${HELD_REFUSED}" == true ]]; then
+            # The refused push never reached CSCB: send a fresh copy.
+            held_ts="$(scenario_ts)"
+            ack "$(push p "${B}" "${held_ts}" "${held_text}")"
+        else
+            ack "$(slack_stub_redeliver "${LABEL[p]}" "${held}")"
+        fi
         accepted p "${B}" "${held_ts}" mention "${held_text}"
         receipt p
         facts_now="$(same_channel_facts p "${B}")" || fail 'persona facts reader failed'
         [[ "${facts_now}" == "${before}" ]] || fail 'repaired scan changed chosen value/stamp'
+        # The refusal dropped p's MCP session: no tool call before it returns.
+        [[ "${problem}" != authorization ]] \
+            || session_barrier_wait "${START_WAIT_S}" 'authorization recovery: p did not open a new MCP session'
     done
 done
+PHASE7_CASE=''
 
 # Phase 8: a real connection gap misses A's leave and a new channel's join.
 # A delayed first page revokes previous eligibility. Late empty response is
@@ -916,6 +990,7 @@ mv "${SLACK_STATE_DIR}/queue/${KEY[p]}.jsonl.restored" "${SLACK_STATE_DIR}/queue
 changed="$(printed THREAD_MEMORY_CHANGED_WHILE_STOPPED)"
 before="$(count_log "$(matcher "${changed}" "${KEY[p]}")")"
 copy_mark="$(slack_post_mark)"
+session_barrier_mark "${NAME[p]}" "${NAME[q]}"
 start
 wait_for_count "$(matcher "${changed}" "${KEY[p]}")" "$((before + 1))" 30 'copy-restore limit was not reported'
 report_post p "${copy_mark}" memory-copy-restored-notice buildThreadMemoryChangedWhileStoppedNotice "$(persona_ref "${NAME[p]}")" "${B}" changed
@@ -923,6 +998,7 @@ ts="$(scenario_ts)"; text="$(scenario_text restored-thread-reply)"
 ack "$(push p "${B}" "${ts}" "${text}" "${root}")"
 accepted p "${B}" "${ts}" thread "${text}" "${root}"
 receipt p
+session_barrier_wait "${START_WAIT_S}" 'copy-restore restart: no new MCP session'
 
 # Phase 11: stopped, then left. Accepted all/hybrid work survives unresolved
 # startup membership; delayed new input receives no ACK until absence is
@@ -1237,8 +1313,10 @@ PY
     connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
     stop_server
     slack_stub_faults_clear "${LABEL[p]}"
+    session_barrier_mark "${NAME[p]}"
     start
     wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted worker did not reconnect'
+    session_barrier_wait "${START_WAIT_S}" "lookup-${problem} restart: no new MCP session"
     RECORD_WAIT_S="${lookup_bound_s}" shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" joined \
         > "${EVIDENCE}/lookup-${problem}-outcome.json"
 done
@@ -1287,8 +1365,10 @@ for boundary in before after; do
     connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
     stop_server
     slack_stub_inventory_page "${LABEL[p]}" '' '' "${A}" "${B}" "${NOTICE}" "${EXTRA_CHANNELS[@]}"
+    session_barrier_mark "${NAME[p]}"
     start
     wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted worker did not reconnect'
+    session_barrier_wait "${START_WAIT_S}" "leave-${boundary} restart: no new MCP session"
     choice_is p "${old_channel}" mentions || fail 'offline rejoin inherited old choice'
     set_choice p "${old_channel}" thread_hybrid "fresh-after-leave-${boundary}"
     stamp_now="$(stamp p "${old_channel}")" || fail 'stamp reader failed'
@@ -1381,8 +1461,10 @@ for root in "${OP_ROOT}" "${second_root}"; do
 done
 connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
 stop_server
+session_barrier_mark "${NAME[p]}"
 start
 wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted worker did not reconnect'
+session_barrier_wait "${START_WAIT_S}" 'ambiguous-loss restart: no new MCP session'
 expect_count "${loss_line}" "$((loss_count + 1))" 'saved lost outcome reported again on restart'
 joins_now="$(current_joins p "${OP_CHANNEL}")" || fail 'Thread Memory reader failed'
 [[ -z "${joins_now}" ]] || fail 'lost outcome became joined after restart'
@@ -1471,7 +1553,9 @@ recovered_class="$(printed THREAD_MEMORY_RECOVERED)"
 recovered_before="$(count_log "$(matcher "${recovered_class}" "${KEY[p]}")")"
 crash
 chmod 600 "${memory_path}"
+session_barrier_mark "${NAME[p]}"
 start
+session_barrier_wait "${START_WAIT_S}" 'crash-join restart: no new MCP session'
 for root in "${crash_roots[@]}"; do root_saved p "${B}" "${root}" || fail 'queue recovery silently lost accepted join'; done
 for envelope in "${crash_inputs[@]}"; do ack "$(slack_stub_redeliver "${LABEL[p]}" "${envelope}")"; done
 expect_count "$(matcher "${recovered_class}" "${KEY[p]}")" "${recovered_before}" 'restart invented an old episode closing report'
@@ -1717,6 +1801,7 @@ for stage in hung retry-scheduled; do
         wait_for_count "${incomplete}" "$((before + 1))" 30 'retry-scheduled inventory did not become incomplete'
     fi
     stop_server
+    session_barrier_mark "${NAME[p]}"
     stopped_mark="$(slack_post_mark)"
     sleep "$(( (membership_retry_ms + membership_request_ms + 999) / 1000 + 1 ))"
     records_n="$(record_after "${stopped_mark}" fault "label=${LABEL[p]}" method=users.conversations | jq length)" \
@@ -1724,6 +1809,7 @@ for stage in hung retry-scheduled; do
     [[ "${records_n}" == 0 ]] || fail 'stopped server started an obsolete scan/retry'
     slack_stub_faults_clear "${LABEL[p]}"
     start
+    session_barrier_wait "${START_WAIT_S}" "shutdown-${stage} restart: no new MCP session"
     assert_stamps
 done
 

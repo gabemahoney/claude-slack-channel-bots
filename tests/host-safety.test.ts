@@ -4412,10 +4412,11 @@ test('shared registered-hook controls bind the actual row and fail closed withou
   declarations = declarations.replaceAll('process.env', 'auditContext.env').replaceAll('process.argv', 'auditContext.argv')
     .replaceAll('console.log', 'auditContext.log').replaceAll('Date.now()', 'auditContext.now()').replaceAll('Bun.sleep(', 'auditContext.sleep(')
   declarations += '\nlet auditClient, auditContext; export function setAuditClient(client) { auditClient = client }; export function setAuditContext(context) { auditContext = context }; export { run };\n'
+    + 'export function auditFailure() { return { step: failureStep, state: failureState } }\n'
   const path = join(scratch, 'controls.ts'); writeFileSync(path, declarations)
   copyFileSync(join(INTEGRATION_DIR, 'fixtures/stub-claude.sh'), join(scratch, 'stub-claude.sh'))
   const sentinel = /^SENTINEL="([^"\r\n]+)"$/m.exec(readFileSync(join(scratch, 'stub-claude.sh'), 'utf8'))![1]
-  const { run, setAuditClient, setAuditContext } = await import(path)
+  const { run, setAuditClient, setAuditContext, auditFailure } = await import(path)
   setAuditContext(context)
   const { makePersonaConfigInput } = await import('./test-helpers/persona-config.ts')
   const { parsePersonaConfigBytes } = await import('../src/config.ts')
@@ -4486,6 +4487,20 @@ test('shared registered-hook controls bind the actual row and fail closed withou
     })
     for (const field of ['persona','service']) await check('foreign label '+field+' fails',async()=>{
       reset();row.labels[field]='foreign';await assert.rejects(invoke('notice-end'));assert(!calls.includes('send'))
+    })
+    await check('a failure keeps only its fixed step label and the last bound row state',async()=>{
+      reset();configFor(1);await assert.rejects(invoke('notice-end'));assert.deepEqual(auditFailure(),{step:'notice prerequisites',state:undefined})
+      reset();row.state='pending';await assert.rejects(invoke('permission-1'));assert.deepEqual(auditFailure(),{step:'session binding',state:'pending'})
+      reset();row.state='Bearer x';context.argv=['bun','declarations',bin,'permission-1',work,key]
+      await assert.rejects(run(),/registered hook not observed/);assert.deepEqual(auditFailure(),{step:'registered hook evidence',state:'invalid'})
+      rmSync(join(bin,`stub-claude-hooks.${session}`))
+      reset();const good=readFileSync(transcript);writeFileSync(transcript,'{}\n')
+      await assert.rejects(invoke('permission-1'));assert.deepEqual(auditFailure(),{step:'transcript identity',state:'waiting'});writeFileSync(transcript,good)
+      reset();context.argv=['bun','declarations',bin,'notice-setup',work];await run();assert.deepEqual(auditFailure(),{step:'prerequisites',state:undefined})
+      const source=readFileSync(join(INTEGRATION_DIR,'fixtures/shared-stub-permission.ts'),'utf8')
+      const assigned=[...source.matchAll(/failureStep = ([^\n]+)/g)].map(m=>m[1])
+      assert(assigned.length>5&&assigned.every(v=>/^'[a-z :-]+'$/.test(v)),'every step label is a fixed literal')
+      assert.match(source,/^catch \{\n.*\n  console\.error\(`FAIL: shared-stub-permission: prerequisites, session binding or registered hook evidence failed \(step=\$\{failureStep\} state=\$\{failureState \?\? 'unknown'\}\)`\)$/m)
     })
     await check('applied automatic restarts must be off; pending config cannot override',async()=>{
       reset();configFor(1);writeFileSync(config,'{}');await assert.rejects(invoke('notice-end'));assert.equal(calls.length,0)

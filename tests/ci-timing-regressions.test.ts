@@ -15,7 +15,7 @@ import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVer
   n4Verdict, n2Verdict, n2Samples, sealVerdict, requireSeedPopulation, startupVerdict, compactionVerdict, joinsVerdict,
   windowsVerdict, resultLine, summary, evidenceExit, printResults, type Measurement, type Times, type Result,
   SR8_PENDING_POST_MS, SR8_LARGE_BYTES, SR8_SHARED_CHANNELS, pendingPostVerdicts, sharedListVerdicts,
-  scanDiagnostics, membershipFaultVerdicts, membershipRepairVerdict, membershipLateVerdict, zeroAckVerdict,
+  scanDiagnostics, membershipFaultVerdicts, membershipFaultRows, cpuThrottle, cpuConditionFields, membershipRepairVerdict, membershipLateVerdict, zeroAckVerdict,
   accountingVerdicts, personaStoreVerdicts, lookupFaultVerdicts, orderedWriteVerdicts, membershipWriteVerdicts,
   faultLoadVerdicts, faultWaves, postHoldOverlapVerdicts, concurrentOverlapVerdicts, envelopeTimings, type FaultPlan, type FaultPush, type FaultLoadEvidence,
   type SharedListEvidence, type PendingProbe, type AccountedEvent, type LookupProbe,
@@ -795,8 +795,9 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     if (absent === 'retry-after') f.retryAfter++
     expect(f.run()[0].verdict).toBe('missing'); output(f.run(), 1)
   })
-  test.each(['first', 'later'])('membership measured deadlines on %s pages, including the 900000 ms regression', page => {
-    for (const elapsed of [MEMBERSHIP_REQUEST_TIMEOUT_MS, MEMBERSHIP_REQUEST_TIMEOUT_MS + 1, 900_000]) {
+  test.each(['first', 'later'])('membership measured deadlines on %s pages, at the dispatch allowance and the 900000 ms regression', page => {
+    const T = MEMBERSHIP_REQUEST_TIMEOUT_MS, allowed = T + SR8_DISPATCH_ALLOWANCE_MS
+    for (const elapsed of [T - 1, T, T + 1, allowed, allowed + 1, 900_000]) {
       const f = member('hang', page), gap = elapsed + f.wait
       for (const [i, r] of f.faults.slice(0, 2).entries()) {
         r.arrival_epoch_ms = clock + i * gap; r.arrival_mono_ms = 100 + i * gap; r.ts = iso(clock + i * gap)
@@ -804,9 +805,58 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       }
       f.log = [0, 1].map(i => scanLine(clock + i * gap + elapsed, false, page === 'first' ? 0 : 1,
         'deadline', undefined, clock + i * gap + MEMBERSHIP_ATTEMPT_TIMEOUT_MS)).join('\n')
-      expect(f.run().map(r => r.verdict)).toEqual(elapsed > MEMBERSHIP_REQUEST_TIMEOUT_MS ? ['fail', 'fail'] : ['pass', 'pass'])
-      expect(f.run()[0].stats.max_request_ms).toBe(elapsed)
+      expect(f.run().map(r => r.verdict)).toEqual(elapsed > allowed ? ['fail', 'fail'] : ['pass', 'pass'])
+      expect(f.run()[0].stats).toMatchObject({ max_request_ms: elapsed, excess_ms: elapsed - T, allowance_ms: SR8_DISPATCH_ALLOWANCE_MS })
+      output(f.run(), elapsed > allowed ? 1 : 0)
     }
+  })
+  test('membership hang lines print signed excess and allowance; other cases and absent durations do not invent one', () => {
+    const lines = (results: Result[]) => { const logs: string[] = []; printResults(c, results, l => logs.push(l)); return logs }
+    const hang = lines(member('hang').run())
+    expect(hang[0]).toContain(`excess_ms=0 allowance_ms=${SR8_DISPATCH_ALLOWANCE_MS}`)
+    const early = member('hang')
+    for (const i of [0, 1]) {
+      early.faults[i + 2].ts = iso(clock + i * (MEMBERSHIP_REQUEST_TIMEOUT_MS + early.wait) + MEMBERSHIP_REQUEST_TIMEOUT_MS - 5)
+    }
+    early.log = [0, 1].map(i => scanLine(clock + i * (MEMBERSHIP_REQUEST_TIMEOUT_MS + early.wait) + MEMBERSHIP_REQUEST_TIMEOUT_MS - 5, false, 0,
+      'deadline', undefined, clock + i * (MEMBERSHIP_REQUEST_TIMEOUT_MS + early.wait) + MEMBERSHIP_ATTEMPT_TIMEOUT_MS)).join('\n')
+    expect(early.run()[0].stats.excess_ms).toBe(-5)
+    const absent = member('hang'); absent.faults.pop(); absent.faults.pop()
+    expect(absent.run()[0]).toMatchObject({ verdict: 'missing', stats: { excess_ms: 'missing', allowance_ms: SR8_DISPATCH_ALLOWANCE_MS } })
+    expect(lines(member('transient').run())[0]).not.toContain('excess_ms')
+  })
+  test('membership-fault correlation rows join by fault ordinal and print no text, request ID or token', () => {
+    const f = member('hang')
+    f.faults.push({ event: 'fault', method: 'users.conversations', label: 'other', request_id: 'foreign', seq: 99, text: token })
+    const rows = membershipFaultRows('hang', key, f.faults, diag(f.log))
+    expect(rows.filter(r => r.includes('source=fault '))).toEqual([0, 1].map(i =>
+      `recorded: sr8 membership-fault-row case=hang source=fault fault=${i} seq=${i * 2 + 1} outcome=hang arrival_epoch_ms=${f.faults[i].arrival_epoch_ms} arrival_mono_ms=${f.faults[i].arrival_mono_ms}`))
+    expect(rows.filter(r => r.includes('source=fault-settled'))).toEqual([0, 1].map(i =>
+      `recorded: sr8 membership-fault-row case=hang source=fault-settled fault=${i} seq=${i * 2 + 2} resolution=abort ts_epoch_ms=${Date.parse(f.faults[i + 2].ts)}`))
+    expect(rows.filter(r => r.includes('source=scan'))).toHaveLength(2)
+    expect(rows.find(r => r.includes('scan=0'))).toContain('complete=false pages=0 reason=deadline slack=absent')
+    for (const row of rows) { expect(row).not.toContain('request-'); expect(row).not.toContain('foreign'); assertNoLeak(row) }
+    const rate = member('rate'), answered = membershipFaultRows('rate', key, rate.faults, diag(rate.log))
+    expect(answered.filter(r => r.includes('source=api'))).toEqual([0, 1].map(i => expect.stringContaining(`source=api fault=${i} status=429 answer=ratelimited`)))
+    const hostile = member('transient')
+    hostile.faults[0].outcome = token; hostile.faults[2].answer = 'Bearer secret'; hostile.faults[0].seq = 'x'
+    const scrubbed = membershipFaultRows('transient', key, hostile.faults, undefined)
+    expect(scrubbed[0]).toContain('seq=invalid outcome=invalid')
+    expect(scrubbed.find(r => r.includes('source=api fault=0'))).toContain('answer=invalid')
+    expect(scrubbed.at(-1)).toBe('recorded: sr8 membership-fault-row case=transient source=scan rows=unavailable')
+    for (const row of scrubbed) assertNoLeak(row)
+    expect(membershipFaultRows('hang', key, undefined, [])).toEqual(['recorded: sr8 membership-fault-row case=hang source=stub rows=unavailable'])
+  })
+  test('cgroup CPU conditions print quota/period and throttling deltas, unknown when unreadable', () => {
+    const v2 = (periods: number, throttled: number, usec: number) => `usage_usec 9\nnr_periods ${periods}\nnr_throttled ${throttled}\nthrottled_usec ${usec}\n`
+    expect(cpuThrottle(v2(10, 2, 300))).toEqual({ periods: 10, throttled: 2, throttledUsec: 300 })
+    expect(cpuThrottle('nr_periods 4\nnr_throttled 1\nthrottled_time 2500000\n')).toEqual({ periods: 4, throttled: 1, throttledUsec: 2500 })
+    expect(cpuThrottle(undefined)).toBeUndefined(); expect(cpuThrottle('')).toBeUndefined()
+    expect(cpuConditionFields('200000 100000\n', v2(10, 2, 300), v2(25, 7, 1300)))
+      .toBe('cpu_max=200000/100000 nr_periods_delta=15 nr_throttled_delta=5 throttled_usec_delta=1000')
+    expect(cpuConditionFields('max 100000', v2(1, 0, 0), v2(1, 0, 0))).toBe('cpu_max=max/100000 nr_periods_delta=0 nr_throttled_delta=0 throttled_usec_delta=0')
+    expect(cpuConditionFields(undefined, '', v2(1, 0, 0))).toBe('cpu_max=unknown nr_periods_delta=unknown nr_throttled_delta=unknown throttled_usec_delta=unknown')
+    expect(cpuConditionFields('garbage', v2(5, 5, 5), v2(1, 1, 1))).toBe('cpu_max=unknown nr_periods_delta=unknown nr_throttled_delta=unknown throttled_usec_delta=unknown')
   })
   test.each(['epoch', 'settlement', 'settlement-id', 'diagnostic-endpoint', 'reversed-clock', 'attempt-bound'] as const)
   ('membership measured deadline rejects %s', absent => {
@@ -821,12 +871,14 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     output(f.run(), 1)
   })
   test.each(['first', 'later'])('membership deadline uses arrival rather than later fault recording on %s page', page => {
+    // From the later fault.ts the duration is within the allowance; from arrival it exceeds it by 1 ms.
+    const over = MEMBERSHIP_REQUEST_TIMEOUT_MS + SR8_DISPATCH_ALLOWANCE_MS + 1
     const f = member('hang', page)
     f.faults[0].ts = iso(clock + 50)
-    f.faults[2].ts = iso(clock + MEMBERSHIP_REQUEST_TIMEOUT_MS + 1)
-    f.log = scanLine(clock + MEMBERSHIP_REQUEST_TIMEOUT_MS + 1, false, page === 'first' ? 0 : 1) + '\n' + f.log.split('\n')[1]
+    f.faults[2].ts = iso(clock + over)
+    f.log = scanLine(clock + over, false, page === 'first' ? 0 : 1) + '\n' + f.log.split('\n')[1]
     expect(f.run()[0].verdict).toBe('fail')
-    expect(f.run()[0].stats.max_request_ms).toBe(MEMBERSHIP_REQUEST_TIMEOUT_MS + 1)
+    expect(f.run()[0].stats).toMatchObject({ max_request_ms: over, excess_ms: SR8_DISPATCH_ALLOWANCE_MS + 1 })
   })
   test.each([0, 1])('idle repair at published bound +%d', extra => {
     const clear = clock + MEMBERSHIP_ATTEMPT_TIMEOUT_MS, start = clear + MEMBERSHIP_RETRY_MAX_MS + extra, done = start + 20
@@ -1134,6 +1186,260 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       '{"kind":"leave","event_id":"Ev-channel_left","applied":{"for":"Ev-channel_left"}}',
       '{"kind":"join","event_id":"Ev-member_joined_channel","applied":{"for":"Ev-member_joined_channel"}}', ''])
   })
+  // The session barrier's real declarations; the log and its polling are stand-ins
+  // whose poll appends the next staged server lines between checks.
+  const barrier = [
+    'matcher() { printf "%s\\n" "$*"; }', 'persona_ref() { printf \'"%s" (key=%s)\\n\' "$1" "$1"; }',
+    'count_log() { grep -cF -- "$1" "$HOME/server.log" || true; }', '_scenario_check_timeout() { :; }',
+    'last_log_line() { local l; l="$(grep -nF -- "$1" "$HOME/server.log" | tail -n 1)" || true; [[ -z "$l" ]] || printf "%s\\n" "${l%%:*}"; }',
+    '_scenario_poll_until() { local i; shift; for i in 1 2 3; do "$@" && return 0; if [[ -f "$HOME/more.$i" ]]; then cat "$HOME/more.$i" >> "$HOME/server.log"; fi; done; return 1; }',
+    ...['session_connected_match', 'session_barrier_mark', '_scenario_session_reconnected', '_scenario_sessions_reconnected', 'session_barrier_wait']
+      .map(name => declaration(scenario, name)),
+  ].join('\n')
+  const connected = (name: string) => `[slack] Session connected: persona "${name}" (key=${name}) cwd="/w"\n`
+  test('the session barrier waits for every marked persona\'s new session, under one timeout', () => {
+    const old = connected('alpha') + connected('beta') + connected('alpha2')
+    const both = shell([barrier, 'session_barrier_mark alpha beta', 'session_barrier_wait 150 "reopen barrier"', 'echo passed'].join('\n'),
+      { 'server.log': old, 'more.1': connected('alpha2') + connected('alpha'), 'more.2': connected('beta') })
+    expect({ status: both.status, stdout: both.stdout, stderr: both.stderr }).toEqual({ status: 0, stdout: 'passed\n', stderr: '' })
+    // A look-alike persona's session or the old server's lines never satisfy it.
+    const one = shell([barrier, 'session_barrier_mark alpha beta', 'session_barrier_wait 150 "reopen barrier"', 'echo passed'].join('\n'),
+      { 'server.log': old, 'more.1': connected('alpha'), 'more.2': connected('alpha2') })
+    expect(one.status).toBe(1); expect(one.stdout).toBe('')
+    expect(one.stderr).toBe('reopen barrier (not within 150s; no new session for: beta)\n')
+    const unmarked = shell([barrier, 'session_barrier_wait 150 "reopen barrier"'].join('\n'), { 'server.log': old })
+    expect(unmarked.status).toBe(1); expect(unmarked.stderr).toBe('reopen barrier: session_barrier_mark was not run\n')
+    const none = shell([barrier, 'session_barrier_mark'].join('\n'))
+    expect(none.status).toBe(1); expect(none.stderr).toBe('session_barrier_mark: no persona named\n')
+  })
+  const dropped = (name: string) => `[slack] persona "${name}" (key=${name}): MCP session dropped — the persona is not up (x); kept\n`
+  test('the positional session barrier passes only on a session after the mark and the persona\'s last drop', () => {
+    const wait = (mode: string) => [barrier, `session_barrier_mark ${mode} alpha beta`, 'session_barrier_wait 150 "authorization barrier"', 'echo passed'].join('\n')
+    // A session admitted in an up window and then dropped raises the count,
+    // so the count form passes; the position form waits for a later session.
+    const old = dropped('alpha') + connected('alpha') + connected('beta')
+    const window = { 'server.log': old, 'more.1': connected('alpha') + connected('beta') + dropped('alpha') }
+    const counted = shell(wait(''), window)
+    expect({ status: counted.status, stdout: counted.stdout, stderr: counted.stderr }).toEqual({ status: 0, stdout: 'passed\n', stderr: '' })
+    const held = shell(wait('--position'), window)
+    expect(held.status).toBe(1); expect(held.stdout).toBe('')
+    expect(held.stderr).toBe('authorization barrier (not within 150s; no session after the mark and the last drop for: alpha)\n')
+    // The pre-mark sessions never satisfy it, nor a look-alike's session or drop.
+    const before = shell(wait('--position'), { 'server.log': old, 'more.1': connected('alpha2') + dropped('beta2') })
+    expect(before.status).toBe(1)
+    expect(before.stderr).toBe('authorization barrier (not within 150s; no session after the mark and the last drop for: alpha beta)\n')
+    const recovered = shell(wait('--position'), { ...window, 'more.2': connected('alpha') + dropped('alpha2') })
+    expect({ status: recovered.status, stdout: recovered.stdout, stderr: recovered.stderr }).toEqual({ status: 0, stdout: 'passed\n', stderr: '' })
+  })
+  test('the positional session barrier mark records server.log\'s line count, and a count-form mark resets it', () => {
+    const old = dropped('alpha') + connected('alpha') + connected('beta')
+    // An unterminated last line at the mark is pre-mark text once completed.
+    const partial = shell([barrier, 'session_barrier_mark --position alpha', 'printf "%s" "${SESSION_BARRIER[alpha]}"'].join('\n'),
+      { 'server.log': old + '[slack] Session conn' })
+    expect({ status: partial.status, stdout: partial.stdout, stderr: partial.stderr }).toEqual({ status: 0, stdout: '4', stderr: '' })
+    // A missing log marks line 0, and a later count-form mark resets the mode.
+    const missing = shell([barrier, 'session_barrier_mark --position alpha', 'printf "%s %s" "$SESSION_BARRIER_MODE" "${SESSION_BARRIER[alpha]}"'].join('\n'))
+    expect({ status: missing.status, stdout: missing.stdout, stderr: missing.stderr }).toEqual({ status: 0, stdout: 'position 0', stderr: '' })
+    const reset = shell([barrier, 'session_barrier_mark --position alpha', 'session_barrier_mark alpha',
+      'printf "%s %s" "$SESSION_BARRIER_MODE" "${SESSION_BARRIER[alpha]}"'].join('\n'), { 'server.log': old })
+    expect({ status: reset.status, stdout: reset.stdout, stderr: reset.stderr }).toEqual({ status: 0, stdout: 'count 1', stderr: '' })
+    const unnamed = shell([barrier, 'session_barrier_mark --position'].join('\n'))
+    expect(unnamed.status).toBe(1); expect(unnamed.stderr).toBe('session_barrier_mark: no persona named\n')
+  })
+  test('test-45/48 start_ready marks sessions before the start and lists tools only after the barrier', () => {
+    const load = source('lib/membership-load.sh')
+    const run = shell([
+      'log() { printf \'%s\\n\' "$*" >> "$HOME/calls"; }', 'count_log() { printf "0\\n"; }', 'completion_match() { printf "complete\\n"; }',
+      'matcher() { printf "%s\\n" "$*"; }', 'printed() { printf "recorder\\n"; }', 'mono_ms() { log mono; printf "7\\n"; }',
+      'start_server() { log start "$@"; }', 'wait_for_count() { log count "$4"; }', 'expect_one_overrides_line() { log overrides; }',
+      'session_barrier_mark() { log mark "$@"; }', 'session_barrier_wait() { log barrier "$@"; }',
+      'wait_membership_complete() { log membership "$1"; }', 'stub_session_list_tools() { log tools "${1##*/}"; }',
+      declaration(load, 'start_ready'), 'KEYS=(alpha beta) ROOT="$HOME" OVERRIDES_STEM=o MEASUREMENTS=m',
+      'start_ready measured', 'printf "start=%s ready=%s\\n" "$START_MS" "$READY_MS"', 'cat "$HOME/calls"',
+    ].join('\n'))
+    expect(run.stderr).toBe('')
+    expect(run.stdout.split('\n')).toEqual(['start=7 ready=7', 'mark alpha beta', 'mono', 'start --live', 'count two-persona startup incomplete',
+      'overrides', 'count measurement recorder not enabled', 'barrier 150 persona MCP sessions did not reconnect to the new server',
+      'membership alpha', 'tools alpha', 'membership beta', 'tools beta', 'mono', ''])
+  })
+  test('test-45/48 verdict exits print a FAIL line after the verdict\'s own lines', () => {
+    const load = source('lib/membership-load.sh'), verdict = load.match(/^verdict\(\) \{.*\}$/m)![0]
+    const fixture = (rc: number) => `console.log('recorded: sr8 ' + process.argv[2] + ' verdict=${rc ? 'fail' : 'pass'}'); process.exit(${rc})`
+    const failed = shell([verdict, 'E="$HOME/e.ts"', 'verdict membership-fault test-45 strict', 'echo after'].join('\n'), { 'e.ts': fixture(1) })
+    expect({ status: failed.status, stdout: failed.stdout, stderr: failed.stderr })
+      .toEqual({ status: 1, stdout: 'recorded: sr8 membership-fault verdict=fail\n', stderr: 'sr8 membership-fault verdict did not pass\n' })
+    const passed = shell([verdict, 'E="$HOME/e.ts"', 'verdict seal measured', 'echo after'].join('\n'), { 'e.ts': fixture(0) })
+    expect({ status: passed.status, stdout: passed.stdout, stderr: passed.stderr })
+      .toEqual({ status: 0, stdout: 'recorded: sr8 seal verdict=pass\nafter\n', stderr: '' })
+    // Every verdict command goes through it; setup and observation commands do not.
+    const direct = [...load.matchAll(/bun "\$\{E\}" ([a-z-]+)/g)].map(m => m[1]).sort()
+    expect([...new Set(direct)]).toEqual(['bodies', 'burst', 'conditions', 'config', 'cpu-mark', 'envelope-times', 'fault-burst', 'fault-ids', 'fault-plan', 'fault-recover', 'plan', 'seed'])
+  })
+  test('test-45/48 reopen observer prints AD rows, lifecycle, stub hook and MCP session fields only on a reopen failure', () => {
+    const load = source('lib/membership-load.sh'), safe = load.match(/^REOPEN_SAFE='[\s\S]*?;'$/m)![0]
+    const secret = 'private message text', tok = fakeToken(BOT_TOKEN_PREFIX, 'reopen-observer')
+    const files = {
+      'state/server.log': `[2030-01-01T00:00:00.000Z] [slack] earlier ${secret}\n`,
+      'state/more.log': [`[2030-01-01T00:00:01.000Z] [slack] Session disconnected: persona "alpha" (key=alpha) cwd="/w" ${secret}`,
+        `[slack] persona "alpha" (key=alpha): MCP session dropped — ${tok}`, `[2030-01-01T00:00:02.000Z] [slack] persona-start: personas[0] "alpha" (key=alpha): bring-up starting`,
+        '[slack] Scheduling restart for persona=alpha in 5s (backoff)', `[2030-01-01T00:00:03.000Z] [slack] Session connected: persona "alpha2" (key=alpha2) cwd="/w"`, ''].join('\n'),
+      'bin/stub-claude-hooks.s1.jsonl': jsonl([{ command: `say ${secret}`, event: 'Stop', instance_id: 'cscb_alpha', session_id: 's1', pid: 4, at: '12.5' },
+        { command: 'x', event: 'Stop', instance_id: 'cscb_other', session_id: 's9', pid: 9, at: '1' }]),
+      'bin/sessions.alpha': jsonl([{ event: 'connected', session_id: 'm1', reason: 'initial', pid: 5, text: secret }, { event: 'closed', session_id: tok, reason: secret, pid: 5 }]),
+    }
+    const program = (observe: string) => [
+      'persona_key() { printf "%s\\n" "$1"; }', 'persona_ref() { printf \'"%s" (key=%s)\\n\' "$1" "$1"; }',
+      'printed() { printf "cscb_%s\\n" "$2"; }', '_scenario_stub_dir() { printf "%s\\n" "$HOME/bin"; }',
+      '_scenario_session_file() { [[ "$2" == sessions ]] && printf "%s\\n" "$HOME/bin/sessions.${1##*/}"; }',
+      `ad_capture() { AD_OUT="$HOME/ad.out" AD_RC=0; jq -nc --arg id "$3" --arg tok "${tok}" '{state:(if $id=="cscb_alpha" then "waiting" else "dead" end),session_id:"s1",launch_started_at:"2030-01-01T00:00:00Z",last_seen_at:"2030-01-01T00:00:04Z",ended_at:(if $id=="cscb_alpha" then null else "2030-01-01T00:00:05Z" end),updated_at:"2030-01-01T00:00:09Z",labels:{t:$tok},cwd:"${secret}"}' > "$AD_OUT"; }`,
+      load.match(/^log_slice\(\) .*$/m)![0], 'byte_mark() { wc -c < "$1"; }',
+      safe, ...['reopen_ad_rows', 'reopen_lifecycle', 'reopen_stub_records', 'reopen_observe'].map(name => declaration(load, name)),
+      'KEYS=(alpha beta) ROOT="$HOME" CASE=test-45-strict-first-hang',
+      'REOPEN_OBSERVE_LOG="$(byte_mark "$SLACK_STATE_DIR/server.log")"', 'reopen_ad_rows before-stop > "$ROOT/reopen-observe.rows"',
+      'cat "$SLACK_STATE_DIR/more.log" >> "$SLACK_STATE_DIR/server.log"', `REOPEN_OBSERVE=${observe}`, 'reopen_observe',
+    ].join('\n')
+    const quiet = shell(['SLACK_STATE_DIR="$HOME/state"', program("''")].join('\n'), files)
+    expect({ status: quiet.status, stdout: quiet.stdout, stderr: quiet.stderr }).toEqual({ status: 0, stdout: '', stderr: '' })
+    const run = shell(['SLACK_STATE_DIR="$HOME/state"', program('1')].join('\n'), files)
+    expect(run.stderr).toBe('')
+    const lines = run.stdout.trim().split('\n')
+    expect(lines).toEqual([
+      'reopen-observe: case=test-45-strict-first-hang failed between the reopen stop and its measured seal',
+      'reopen-observe: phase=before-stop persona=alpha ad_state=waiting session_id=s1 launch_started_at=2030-01-01T00:00:00Z last_seen_at=2030-01-01T00:00:04Z ended_at=absent',
+      'reopen-observe: phase=before-stop persona=beta ad_state=dead session_id=s1 launch_started_at=2030-01-01T00:00:00Z last_seen_at=2030-01-01T00:00:04Z ended_at=2030-01-01T00:00:05Z',
+      'reopen-observe: phase=at-failure persona=alpha ad_state=waiting session_id=s1 launch_started_at=2030-01-01T00:00:00Z last_seen_at=2030-01-01T00:00:04Z ended_at=absent',
+      'reopen-observe: phase=at-failure persona=beta ad_state=dead session_id=s1 launch_started_at=2030-01-01T00:00:00Z last_seen_at=2030-01-01T00:00:04Z ended_at=2030-01-01T00:00:05Z',
+      'reopen-observe: persona=alpha lifecycle=connected count=0 at=none',
+      'reopen-observe: persona=alpha lifecycle=disconnected count=1 at=2030-01-01T00:00:01.000Z',
+      'reopen-observe: persona=alpha lifecycle=dropped count=1 at=none',
+      'reopen-observe: persona=alpha lifecycle=persona-start count=1 at=2030-01-01T00:00:02.000Z',
+      'reopen-observe: persona=alpha lifecycle=restart-scheduled count=1 at=none',
+      'reopen-observe: persona=alpha stub_hook event=Stop session_id=s1 pid=4 at=12.5',
+      'reopen-observe: persona=alpha mcp_session event=connected session_id=m1 reason=initial pid=5',
+      'reopen-observe: persona=alpha mcp_session event=closed session_id=invalid reason=invalid pid=5',
+      'reopen-observe: persona=beta lifecycle=connected count=0 at=none',
+      'reopen-observe: persona=beta lifecycle=disconnected count=0 at=none',
+      'reopen-observe: persona=beta lifecycle=dropped count=0 at=none',
+      'reopen-observe: persona=beta lifecycle=persona-start count=0 at=none',
+      'reopen-observe: persona=beta lifecycle=restart-scheduled count=0 at=none',
+      'reopen-observe: persona=beta mcp_sessions=absent',
+    ])
+    expect(run.stdout).not.toContain(secret); expect(run.stdout).not.toContain('cscb_other')
+  })
+  const test46 = source('test-46-shared-channel-recovery.sh'), test29Script = source('test-29-invited-channels.sh')
+  // test-46's real held_push; push, record_after and no_ack are stand-ins.
+  test.each([
+    ['sent', '[]', 'false', 'env-1', 'env-1', 0, ''],
+    ['no-open-socket', '[{"reason":"no-open-socket"}]', 'true', '', '', 0, ''],
+    ['send-failed', '[{"reason":"send-failed"}]', 'true', '', '', 0, ''],
+    ['records=0', '[]', '', '', '', 1, '  | FAIL: test-46: refused (HTTP 409: no-open-socket)\nauthorization held push was neither sent nor refused for the revoked connection (records=0)\n'],
+    ['records=2', '[{"reason":"no-open-socket"},{"reason":"send-failed"}]', '', '', '', 1, '  | FAIL: test-46: refused (HTTP 409: no-open-socket)\nauthorization held push was neither sent nor refused for the revoked connection (records=2)\n'],
+    ['other reason', '[{"reason":"invalid_auth"}]', '', '', '', 1, '  | FAIL: test-46: refused (HTTP 409: no-open-socket)\nauthorization held push was neither sent nor refused for the revoked connection (invalid_auth)\n'],
+  ] as const)('test-46 held_push classifies the authorization held push: %s', (outcome, refused, state, held, noAcks, rc, stderr) => {
+    const run = shell([
+      'declare -A LABEL=([p]=label-p)', 'B=CB', 'HELD_REFUSED=unset', 'held=unset', `OUTCOME='${outcome}'`,
+      'push() { printf "%s\\n" "$*" >> "$HOME/pushes"; [[ "$OUTCOME" == sent ]] && { echo env-1; return 0; }; echo "FAIL: test-46: refused (HTTP 409: no-open-socket)" >&2; exit 1; }',
+      'record_after() { printf "%s\\n" "$*" >> "$HOME/reads"; cat "$HOME/refused.json"; }',
+      'no_ack() { printf "%s\\n" "$1" >> "$HOME/no_acks"; }',
+      'sed() { local l; while IFS= read -r l; do printf "  | %s\\n" "$l"; done < "$2"; }',
+      declaration(test46, 'held_push'),
+      'held_push 1.5 "held text" 7', 'printf "refused=%s held=%s\\n" "$HELD_REFUSED" "$held"',
+      'cat "$HOME/pushes"', 'cat "$HOME/reads" 2>/dev/null || true', 'printf "no_acks:%s\\n" "$(cat "$HOME/no_acks" 2>/dev/null || true)"',
+    ].join('\n'), { 'refused.json': refused })
+    expect({ status: run.status, stderr: run.stderr }).toEqual({ status: rc, stderr })
+    if (rc) { expect(run.stdout).toBe(''); return }
+    const reads = outcome === 'sent' ? [] : ['7 push-refused label=label-p']
+    expect(run.stdout.split('\n')).toEqual([`refused=${state} held=${held}`, 'p CB 1.5 held text', ...reads, `no_acks:${noAcks}`, ''])
+  })
+  test('test-46 phase7_observe prints p\'s lifecycle counts and whitelisted stub records since the case marks, never content', () => {
+    const secret = 'private message text', tok = fakeToken(BOT_TOKEN_PREFIX, 'phase7-observer')
+    const old = `[2030-01-01T00:00:00.000Z] [slack] Session connected: persona "p" (key=p) cwd="/w" ${secret}\n`
+    const files = {
+      'state/server.log': old + [
+        `[2030-01-01T00:00:01.000Z] [slack] persona-credentials-refused: personas[0] "p" (key=p): users.conversations: Slack error invalid_auth ${tok}`,
+        `[slack] persona "p" (key=p): MCP session dropped — the persona is not up (broken: ${secret})`,
+        '[2030-01-01T00:00:02.000Z] [slack] Session connected: persona "p" (key=p) cwd="/w"',
+        '[2030-01-01T00:00:03.000Z] [slack] Session connected: persona "p2" (key=p2) cwd="/w"',
+        `[2030-01-01T00:00:04.000Z] [slack] channel-membership-inventory-incomplete persona=p: pages=0 positives=0 reason=authentication ${secret}`, ''].join('\n'),
+      'slack.jsonl': jsonl([{ seq: 1, event: 'ws-open', label: 'label-p', ts: 'old', hello: true },
+        { seq: 2, event: 'ws-close', label: 'label-p', ts: '2030-01-01T00:00:01.000Z', code: 1000, ticket: tok },
+        { seq: 3, event: 'push-refused', label: 'label-p', ts: '2030-01-01T00:00:02.000Z', reason: 'no-open-socket' },
+        { seq: 4, event: 'push-refused', label: 'label-q', ts: '2030-01-01T00:00:02.000Z', reason: 'send-failed' },
+        { seq: 5, event: 'ws-open', label: 'label-p', ts: secret, hello: true, ticket: tok }]) + '{"seq":6,',
+    }
+    const program = (name: string) => [
+      'persona_ref() { printf \'"%s" (key=%s)\\n\' "$1" "$1"; }', 'declare -A NAME=([p]=p) KEY=([p]=p) LABEL=([p]=label-p)',
+      'SLACK_STATE_DIR="$HOME/state" SCENARIO_SLACK_RECORD="$HOME/slack.jsonl" incomplete=channel-membership-inventory-incomplete',
+      declaration(test46, 'phase7_observe'), `PHASE7_CASE=${name} PHASE7_MARK=1 PHASE7_LOG_MARK=${Buffer.byteLength(old)}`, 'phase7_observe',
+    ].join('\n')
+    const quiet = shell(program("''"), files)
+    expect({ status: quiet.status, stdout: quiet.stdout, stderr: quiet.stderr }).toEqual({ status: 0, stdout: '', stderr: '' })
+    const run = shell(program('first-authorization'), files)
+    expect(run.stderr).toBe('')
+    expect(run.stdout.trim().split('\n')).toEqual([
+      'phase7-observe: case=first-authorization failed',
+      'phase7-observe: lifecycle=credentials-refused count=1 at=2030-01-01T00:00:01.000Z',
+      'phase7-observe: lifecycle=connection-lost count=0 at=none',
+      'phase7-observe: lifecycle=connection-restored count=0 at=none',
+      'phase7-observe: lifecycle=connected count=1 at=2030-01-01T00:00:02.000Z',
+      'phase7-observe: lifecycle=disconnected count=0 at=none',
+      'phase7-observe: lifecycle=dropped count=1 at=none',
+      'phase7-observe: lifecycle=inventory-incomplete count=1 at=2030-01-01T00:00:04.000Z',
+      'phase7-observe: lifecycle=inventory-complete count=0 at=none',
+      'phase7-observe: stub ws-open seq=5 ts=invalid code=absent reason=absent hello=true',
+      'phase7-observe: stub ws-close seq=2 ts=2030-01-01T00:00:01.000Z code=1000 reason=absent hello=absent',
+      'phase7-observe: stub push-refused seq=3 ts=2030-01-01T00:00:02.000Z code=absent reason=no-open-socket hello=absent',
+    ])
+    expect(run.stdout).not.toContain(secret); expect(run.stdout).not.toContain(tok)
+  })
+  test('test-29 exit_observe prints the last queue rows, last hook records, AD row and controls as whitelisted fields only', () => {
+    const secret = 'private message text', tok = fakeToken(BOT_TOKEN_PREFIX, 'exit-observer')
+    const session = '0123abcd-0000-4000-8000-000000000001'
+    const hook = (command: string, event: string, at: string, instance = 'cscb_alpha') => ({ command, event, instance_id: instance, session_id: 's1', pid: 4, at })
+    const files = {
+      'state/queue/alpha.jsonl': jsonl([{ kind: 'accepted', seq: 1, at: 1, text: secret }, { kind: 'sent', seq: 1, send_kind: 'text', at: 2 },
+        { kind: 'sent', seq: 1, send_kind: 'enter', at: 3 }, { kind: 'delivered', seq: 1, at: 4 }, { kind: 'accepted', seq: 2, at: 5, text: secret },
+        { kind: 'sent', seq: 2, send_kind: tok, at: 6 }, { kind: secret, seq: 2, at: 7 }]) + '{"kind":"sent",',
+      'bin/stub-claude-hooks.s1.jsonl': jsonl([hook('receipt', 'Stop', '10.5'), hook('submitted', 'UserPromptSubmit', '12.0'),
+        hook('receipt', 'Stop', '11.0', 'cscb_other'), hook(`say ${secret}`, 'Stop', '13.0')]),
+      'bin/stub-claude-hooks.s2.jsonl': jsonl([hook('permission-1', 'PermissionRequest', '9.0'), hook('complete-1', 'Stop', '14.0'), hook('receipt', 'Stop', '15.0')]),
+      [`bin/stub-claude-hooks.${session}`]: `receipt\npermission-1\n${secret}\n`,
+    }
+    const program = (observe: string) => [
+      'printed() { [[ "$2" == alpha ]] || { echo "FAIL: printer" >&2; exit 1; }; printf "cscb_%s\\n" "$2"; }',
+      'timeout() { [[ "$1" == 10 ]] || return 99; shift; "$@"; }',
+      `agent-director() { [[ "$*" == "get --instance-id cscb_alpha" ]] || return 1; jq -nc --arg tok "${tok}" '{state:"waiting",session_id:"${session}",launch_started_at:"2030-01-01T00:00:00Z",last_seen_at:"2030-01-01T00:00:04Z",ended_at:null,updated_at:"2030-01-01T00:00:09Z",labels:{t:$tok},cwd:"${secret}"}'; }`,
+      'ALPHA_KEY=alpha BRAVO_KEY=bravo ALPHA_DIR="$HOME/alpha-work" BRAVO_DIR="$HOME/bravo-work" STUB_BIN="$HOME/bin"',
+      'declare -A DELIVERIES_FILE=(["$ALPHA_DIR"]="$HOME/state/queue/alpha.jsonl" ["$BRAVO_DIR"]="$HOME/state/queue/bravo.jsonl")',
+      ...['ALPHA_ID', 'BRAVO_ID', 'OBSERVE_ROWS'].map(name => test29Script.match(new RegExp(`^${name}=.*$`, 'm'))![0]),
+      test29Script.match(/^OBSERVE_SAFE='[\s\S]*?;'$/m)![0],
+      declaration(test29Script, 'exit_observe'), `OBSERVE_ON_EXIT=${observe}`, 'exit_observe',
+    ].join('\n')
+    const quiet = shell(program('0'), files)
+    expect({ status: quiet.status, stdout: quiet.stdout, stderr: quiet.stderr }).toEqual({ status: 0, stdout: '', stderr: '' })
+    const run = shell(program('1'), files)
+    expect(run.stderr).toBe('')
+    expect(run.stdout.trim().split('\n')).toEqual([
+      'exit-observe: persona=alpha queue kind=sent seq=1 send_kind=enter at=3',
+      'exit-observe: persona=alpha queue kind=delivered seq=1 send_kind=absent at=4',
+      'exit-observe: persona=alpha queue kind=accepted seq=2 send_kind=absent at=5',
+      'exit-observe: persona=alpha queue kind=sent seq=2 send_kind=invalid at=6',
+      'exit-observe: persona=alpha queue kind=invalid seq=2 send_kind=absent at=7',
+      'exit-observe: persona=alpha stub_hook command=receipt event=Stop session_id=s1 pid=4 at=10.5',
+      'exit-observe: persona=alpha stub_hook command=submitted event=UserPromptSubmit session_id=s1 pid=4 at=12.0',
+      'exit-observe: persona=alpha stub_hook command=invalid event=Stop session_id=s1 pid=4 at=13.0',
+      'exit-observe: persona=alpha stub_hook command=complete-1 event=Stop session_id=s1 pid=4 at=14.0',
+      'exit-observe: persona=alpha stub_hook command=receipt event=Stop session_id=s1 pid=4 at=15.0',
+      `exit-observe: persona=alpha ad_state=waiting session_id=${session} launch_started_at=2030-01-01T00:00:00Z last_seen_at=2030-01-01T00:00:04Z ended_at=absent`,
+      'exit-observe: persona=alpha control=receipt',
+      'exit-observe: persona=alpha control=permission-1',
+      'exit-observe: persona=alpha control=invalid',
+      'exit-observe: persona=bravo queue=absent',
+      'exit-observe: persona=bravo instance=unavailable',
+    ])
+    expect(run.stdout).not.toContain(secret); expect(run.stdout).not.toContain('cscb_other'); expect(run.stdout).not.toContain('updated_at')
+    expect(run.stdout).not.toContain(tok)
+  })
   test('burst slice removes exactly the two write envelopes and keeps every other stub line byte-for-byte', () => {
     const lines = ['{"seq":1,"event":"push","envelope_id":"burst","sent_mono_ms":1.250000}', '{"seq":2,"event":"push","envelope_id":"leave-env"}',
       '{"seq":3,"event":"ws-message","envelope_id":"leave-env"}', '{"seq":4,"event":"fault","request_id":"r1"}',
@@ -1206,7 +1512,11 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     ['ordered-writes', [noFile, noFile, '2', '4', noFile], 2],
     ['membership-writes', [noFile, sr8Personas(2)[1], 'CWRITE', noFile, '2', '6', noFile], 3],
   ] as [string, string[], number][])('CLI %s prints every missing line before exiting', (command, args, count) => {
-    const child = cli(command, args), lines = child.stdout.trim().split('\n')
+    const child = cli(command, args), all = child.stdout.trim().split('\n')
+    // A non-passing membership-fault case first prints its correlation rows.
+    const rows = all.filter(l => l.startsWith('recorded: sr8 membership-fault-row '))
+    expect(rows).toEqual(command === 'membership-fault' ? ['recorded: sr8 membership-fault-row case=hang source=stub rows=unavailable'] : [])
+    const lines = all.slice(rows.length)
     expect(child.status).toBe(1); expect(lines).toHaveLength(count + 1)
     expect(lines.slice(0, -1).every(l => l.endsWith('verdict=missing'))).toBe(true)
     expect(lines.at(-1)).toContain(`measures=${count} pass=0 fail=0 missing=${count}`)

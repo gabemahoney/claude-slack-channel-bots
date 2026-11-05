@@ -107,7 +107,7 @@ import { pathToFileURL } from 'node:url'
 import { Client as MCPClient } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { ListRootsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import ts from 'typescript'
@@ -3281,10 +3281,11 @@ test('test29 restart authority assertion accepts fresh inventory but detects cha
     const declarations = source.slice(source.indexOf('async function readSharedConfiguration('), source.indexOf('const sharedAuthorityStartLine: Entry'))
     const compiled = ts.transpileModule(declarations, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
     const modules: Record<string, Record<string, unknown>> = { 'config.ts': config, 'shared-channels.ts': shared }
-    const printer = new Function('packageFunction', 'expectArguments', 'PrinterFailure', 'PRINTER_FAIL_EXIT', 'isDeepStrictEqual', 'dirname', 'Buffer', `${compiled}\nreturn sharedAuthorityPreserved;`)(
+    const printer = new Function('packageFunction', 'expectArguments', 'PrinterFailure', 'PRINTER_FAIL_EXIT', 'isDeepStrictEqual', 'dirname', 'Buffer',
+      'copyFileSync', 'mkdtempSync', 'rmSync', 'tmpdir', 'join', `${compiled}\nreturn sharedAuthorityPreserved;`)(
       async (_context: unknown, file: string, name: string) => { expect(modules[file]?.[name]).toBeTypeOf('function'); return modules[file]![name] },
       (_entry: string, args: string[], expected: string[]) => expect(args).toHaveLength(expected.length),
-      Error, 1, isDeepStrictEqual, dirname, Buffer,
+      Error, 1, isDeepStrictEqual, dirname, Buffer, copyFileSync, mkdtempSync, rmSync, () => root, join,
     ) as { print(args: string[], context: object): Promise<string> }
     const args = [input, before, f.authority.path]
     f.h.stub(f.h.p('alpha')).script.inventory.push(membershipPage([ids.primary]))
