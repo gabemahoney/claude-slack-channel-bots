@@ -46,6 +46,11 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   lease described below; it never goes to the scheduler. See
   [the heavy invocation](../tests/README.md#heavy-inventory-and-invocation).
 
+- **The AD release gate's job image** (`scripts/ad-gate/template/Dockerfile`,
+  `FROM ubuntu:22.04`) — a shipped CSCB release's tests and package against
+  an agent-director release candidate, built by the job scheduler from each
+  gate context. See [The AD release gate](#the-ad-release-gate).
+
 `/ci` builds the base only when the tag that `docker/Dockerfile.test`'s `FROM`
 line names is missing locally, through the base-build step
 `scripts/ci-base-build.sh`; then it builds the run's own test image. The base
@@ -274,7 +279,9 @@ rm -rf "$AD_INSTALL_CTX"
 ## Image marker
 
 Only the `cscb-ci` images carry `/etc/cscb-ci-image`, written by the base
-build (so the run's test image and `cscb-ci-live` have it too).
+build (so the run's test image and `cscb-ci-live` have it too), and the AD
+release gate's job image, which writes its own (see
+[The job image](#the-job-image)).
 `tests/runner.sh` checks for it first and, when it is absent, prints one line
 on stderr and exits 2,
 so the runner never runs outside a `cscb-ci` image. `ad-client-check.sh`
@@ -1254,6 +1261,267 @@ A base build that a stop ended can leave its build context behind: a
 `cscb-ci-ad-install-*` directory in the system temp directory (`$TMPDIR`,
 else `/tmp`), holding only the extracted `install.sh`. It is safe to remove
 once no base build is running.
+
+## The AD release gate
+
+`scripts/ad-gate/` is agent-director's release gate: a shipped CSCB
+release's no-model integration scripts and a permission filter regression,
+run against an AD release candidate on the job scheduler. AD's release runs
+it through the repo skill `.claude/skills/ad-gate/SKILL.md`, which has the
+command line, the run procedure, the exit codes and the output layout. The
+kit is development-only; none of it is in the npm package.
+
+| File | What it does |
+|---|---|
+| `scripts/ad-gate/ad-gate.ts` | The driver: prepares each AD role's context, plans the shards, submits one job per shard, waits, collects each job's evidence, judges it, and writes `verdict.json` and `report.md` |
+| `scripts/ad-gate/prepare.sh` | Fetches one context's inputs into its `inputs/` directory and writes `inputs/manifest.json` |
+| `scripts/ad-gate/template/Dockerfile` | The job image (see [The job image](#the-job-image)) |
+| `scripts/ad-gate/template/entry.sh` | The job's entry point: the filter regression, then the tag's `tests/runner.sh` on the shard's scripts, then the lines the driver reads |
+| `scripts/ad-gate/template/filter-regression.ts`, `perm-stub-claude.sh` | The permission filter regression and its stub `claude`: a real candidate row held in a fallen-back permission request past the default 30 s must still be listed by the shipped CSCB's prompt query |
+| `scripts/ad-gate/template/patch-client-check.py` | Adapts the tag's `ad-client-check.sh` to the candidate binary beside CSCB's own pinned client |
+
+- **The scripts.** Every `tests/integration/test-*.sh` at the release's tag
+  `v<X.Y.Z>`, except the `-fmk-real-` scripts, which need a model key, and
+  test-13, whose switch-over installs from the npm registry while the jobs
+  have no network: 33 scripts at v0.18.6. The tag's own `tests/runner.sh`
+  and `docker/entrypoint.sh` run them against that version's npm package and
+  the candidate binary.
+- **The roles.** The candidate always; the reference, an earlier AD release,
+  only for candidate failures. Each role has its own context; one template
+  serves both.
+- **The releases.** npm's `latest` CSCB by default; `--cscb-version` names
+  others. All releases' candidate shards are submitted together, so their
+  runs overlap as scheduler slots allow. Each release is judged when its
+  own candidate jobs end; if it needs a reference, that reference is
+  prepared and submitted then, while the other releases can keep running.
+
+### One scheduler job per shard
+
+Shards are separate scheduler jobs, one container each, never shards inside
+one job:
+
+- **Whole-container cleanup.** After each script, `tests/runner.sh`
+  (`collect_survivors`, `verified_cleanup`) scans every process in its
+  container and kills each one that is not its own recorded infrastructure
+  or its daemon. A second runner in the same container would have its
+  scripts and daemon killed.
+- **Fixed HOME and ports.** The runner and `docker/entrypoint.sh` use one
+  HOME, `/home/testuser`, with one `server.pid` path, and the scripts share
+  fixed ports (the MCP server's `127.0.0.1:3100`). Two shards in one
+  container would collide on both.
+- **No way around them.** The tests come from the release tag and cannot
+  change, and the scheduler offers no PID or mount namespace option.
+- **The 8-CPU job cap.** One job gets at most 8 CPUs, not the 12 six shards
+  use. Run serially in one container, the scripts took 2 h 50 min.
+
+So each shard is its own job from the role's one context, as each `/ci`
+shard is its own container, and the driver merges the jobs' evidence into
+one verdict.
+
+### Planning
+
+- The driver plans with `/ci`'s planner (`parsePrerequisiteLines`,
+  `checkPrerequisiteHeaders`, `schedulingUnits`, `parseDurationTable` and
+  `assignShards` from `scripts/ci-run.ts`) over the tag's own
+  `tests/integration` headers and `tests/ci-durations.tsv`. Entries in a
+  `--durations` table win, entry by entry.
+- Every shard runs test-1 first. A prerequisite unit goes whole into one
+  shard, so test-2 and test-3 stay together; test-42 and test-43 need only
+  test-1. Units go longest first into the shard with the smallest total, and
+  the same inputs give the same plan.
+- `--shards N` overrides the count, from 1 to 6. Otherwise, after preparing
+  every candidate and just before submission, the driver reads
+  `jobsched list --json --limit 1` once. Free slots are
+  `max(0, active_slots_limit − active_slots_used − queued)`: queued jobs
+  take slots first because the scheduler is FIFO.
+- `fastestShardCount` chooses N from 4 to 6 for each release to minimise
+  `ceil(releases × N / max(free, 1)) × workSeconds / N`, with fewer jobs on
+  a tie. This compares how many rounds all releases need on the shared
+  slots, rather than dividing the slots evenly: two releases on six free
+  slots finish sooner with six shards each (~57 min) than four (~85 min).
+  `workSeconds` is the longest release's planned script time, with test-1
+  counted once. It sizes the estimate; the chosen N depends only on free
+  slots and release count. Each release uses at most its number of units.
+- The choice, slot reading and estimate go in `state.json`'s `shardChoice`,
+  the log and `report.md`. `--resume` reuses a recorded choice without
+  rereading slots. A dry run reads and prints the choice without recording
+  it, so a real `--resume` after it reads slots again at submission.
+- The filter regression runs in exactly one candidate shard: the one with
+  the smallest expected total, the lowest k on a tie.
+- A subset (a reference run, or `--only`) plans the named scripts, their
+  prerequisites and test-1. Reference subsets use `--shards` when given,
+  otherwise up to six shards, and have no filter regression.
+- Each plan is checked for coverage before it is submitted and again when
+  the evidence is judged.
+
+### The job image
+
+The template's `Dockerfile` mirrors the `/ci` image at the tag
+(`docker/Dockerfile.test.base` and `docker/Dockerfile.test`), except:
+
+- The candidate's binary, admin tool and `install.sh` take
+  `/opt/agent-director`'s paths, and its `release.json` names them beside
+  CSCB's own pinned client. The build fails unless the binary reports the
+  manifest's expected version and, when the manifest records a commit, a
+  commit starting with it; the admin tool reports the same version; and the
+  installed files match the manifest's digests.
+- There is no native Claude Code or Codex and no 0.16.1 downgrade fixture.
+  The 0.10.0 fixtures and the 0.17.0 legacy fixture come from `inputs/`, the
+  latter checked against the pins of v0.18.2's base Dockerfile.
+- `/test-repo` is pre-installed from the same package tarball, so test-1's
+  install resolves offline.
+- The build uses the network only for apt, bun, node and cozempic; the job
+  runs with `--network off`. Nothing reads or receives a credential.
+- It writes the [image marker](#image-marker), so the tag's runner and
+  scripts run there.
+
+### Resources and wall time
+
+Each shard is one job:
+
+```text
+jobsched submit --context <ctx> --name adg-<cscb version>-<cand|ref>-s<k> --channel <id> --network off --cpus 2 --memory 4g --disk 20g --timeout <m>m --env GATE_FILTER=<0|1> --env GATE_DEADLINE_S=<s> [--env GATE_INJECT_FAIL=<files>] -- <the shard's scripts>
+```
+
+- m is ⌈(2 × the shard's expected seconds + 1800) ÷ 60⌉, and s is
+  m × 60 − 600, so the verdict line prints before the scheduler's timeout.
+  A plan that needs a timeout over jobsched's 12 h is refused.
+- The driver submits all releases' candidate shards longest first across
+  releases; ties go to the earlier release, then the lowest shard number.
+  It waits on all pending jobs together with `jobsched wait --timeout 20m`
+  in a loop, and records each shard's queue, build and run times.
+- **2 CPUs and 4 GiB per shard.** Six shards reserve 12 CPUs and 24 GiB,
+  where the hand-built gate reserved 28 GiB for each of its four serial
+  jobs. Measured on AD 0.17.5 against CSCB 0.18.6: shard peaks of 194.2 to
+  408.6 MiB, the filter shard highest; the serial run peaked at 440 MiB.
+  Per-script times on 2 CPUs matched the 4-CPU serial run within about 1 s
+  (test-24: 1498 s), so 2 CPUs does not slow the timing-sensitive scripts.
+- **Expected wall time.** With measured durations, one release plans about
+  170 min of scripts: about 28 min on six free slots. Two releases need at
+  least about 57 min even with all six slots free (12 shards in two rounds),
+  or about 85 min on four free slots (eight shards in two rounds). These
+  estimates exclude build, setup, queueing and any reference work; the
+  two-release gate cannot meet 45 min on six slots even with no other jobs.
+  A slot reading is a snapshot, not a reservation, and zero free slots is
+  estimated as one slot without predicting when it will become free.
+- **Measured wall time.** AD 0.17.5 against CSCB 0.18.6 took 62.6 min with
+  shard runs of 24.0–32.3 min and queue waits up to 33.6 min. A repeat using
+  its `measured-durations.tsv` balanced the shard runs to 28.5–29.8 min and
+  took 59.5 min, with two shards queued 8.6 and 29.1 min. About 30 min with
+  six free slots is inferred from that repeat's timings, not a measured
+  idle-scheduler result. A reference adds its own queue, build and run, and
+  can overlap other releases' remaining candidate jobs.
+
+### entry.sh's variables and lines
+
+The scheduler returns only a job's standard output (`run.log`), so
+`entry.sh` prints everything the driver judges there. It also prints the
+whole log of each failed or unfinished script between `BEGIN full` and
+`END full` lines.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `GATE_FILTER` | 1 | 0 skips the permission filter regression. The driver sets 1 in exactly one candidate shard |
+| `GATE_DEADLINE_S` | 13800 in the image | Stops waiting for the runner after this many seconds, so the verdict line still prints. The driver sets it for each shard |
+| `GATE_INJECT_FAIL` | empty | Space-separated script file names the runner records failed without running them (its `--fail`). Verification only, from `--inject-fail` |
+| `GATE_KEEP_GOING` | 1 in the image | Disables the fail-fast guard of a runner with no `--keep-going` (v0.17.x). A v0.18.x runner gets `--keep-going` instead |
+
+| Line | When |
+|---|---|
+| `AD-GATE-EXPECT <file>` | One per script the shard runs, before the runner starts |
+| `AD-GATE-SCRIPT <file> <pass\|fail\|notrun\|unfinished> <seconds\|-> [<reason>]` | One per expected script, after the runner. Seconds for `pass` and `fail` only, `-` otherwise; a reason exactly for `notrun`: the runner's `dependency:<file>`, `fail-fast` or `unsafe-cleanup` |
+| `AD-GATE-RUNNER <done\|deadline\|exited>` | Exactly once: the runner's `done` marker (its final cleanup verified), `GATE_DEADLINE_S` reached, or the runner ended without the marker |
+| `AD-GATE-FILTER <pass\|fail\|skipped>` | Exactly once |
+| `AD-GATE PASS: …`, `AD-GATE FAIL: …` or `AD-GATE FAIL: setup: …` | The verdict line, last; exit 0, 1 or 2 |
+
+Only a line beginning `AD-GATE-` or `AD-GATE ` is a gate line; every other
+line is noise to the parser. A gate line of no known form is malformed, a
+repeated one counts once and is a problem, and a log with no verdict line is
+truncated; each fails the gate. The job's `ad-gate: manifest: <json>` line,
+printed first, is the manifest it ran with.
+
+### The verdict
+
+The candidate's evidence fails the gate at once, with no reference run, on
+any of these (each reason's `kind` in parentheses):
+
+- an input, a job's manifest line or a job's provenance that does not match
+  (`manifest-mismatch`; see [Provenance checks](#provenance-checks));
+- a plan that does not cover its scripts (`plan-coverage`);
+- a shard ended in a scheduler state other than `succeeded` or `failed`
+  (`timed-out`, `out-of-memory`, `build-failed`, `infrastructure-error`,
+  `cancelled`, …); an OOM kill the scheduler observed, or a `result.json`
+  that cannot rule one out; an exit code or verdict line that disagrees with
+  the state (`succeeded` needs exit 0 and `AD-GATE PASS`, `failed` exit 1 and
+  `AD-GATE FAIL`); a planned shard with no result or two, or a result for no
+  planned shard (`scheduler-state`);
+- exit 2 or a setup verdict line (`setup-failed`), or no `run.log`
+  (`no-run-log`);
+- a malformed, repeated or truncated log, a FAIL verdict line when every
+  line passed and the runner finished, or a PASS verdict line beside
+  anything not passing (`log-problem`; a repeated script line is
+  `duplicate-script`);
+- a runner line other than `done`, or an `unfinished` script (`unfinished`);
+- a planned script without both its expect and outcome lines
+  (`missing-script`), or a line for a script the shard was not given
+  (`extra-script`);
+- the filter regression not passing in its shard, not `skipped` in the
+  others, or not planned in exactly one candidate shard (`filter`);
+- a `notrun` the rules below never excuse (`notrun`);
+- a test-1 failure (`candidate-failure`).
+
+Otherwise the gate passes when every candidate script and the filter
+regression pass, and candidate failures go to the reference:
+
+- **test-1 is never excused.** A candidate test-1 failure fails at once, and
+  so does every `notrun` with reason `dependency:<test-1's file>`. A test-1
+  failure on the reference makes its run excuse nothing.
+- **A failed script** runs on the reference with its prerequisites, and is
+  excused only when it fails there too. One that passes there fails the gate
+  (`candidate-failure`).
+- **A `notrun`** is excused only with reason `dependency:<X>`, where X is not
+  test-1 and failed in the same shard; X runs on the reference, and the skip
+  is excused when X fails there. `fail-fast` and `unsafe-cleanup` skips are
+  never excused.
+- **The reference run must be complete.** Any problem the rules above find
+  in it, a test-1 failure in it, and a script sent to it with no outcome
+  there, or `notrun` or `unfinished` there, fail the gate as
+  `reference-incomplete`.
+
+So an unfinished script, a missing, extra or repeated line, a setup failure,
+any other scheduler state, an OOM kill, a manifest or checksum mismatch or an
+incomplete reference run never becomes a pass.
+
+### Provenance checks
+
+- **`prepare.sh`** packs the CSCB release from npm at its exact version and
+  checks the package's version; takes `tests`, `testplans`,
+  `docker/entrypoint.sh` and `docker/ad-client-check.sh` from the CSCB
+  checkout's tag; and requires an exact AD client pin. A candidate's files
+  must match its `SHA256SUMS` when it has one. A reference release's assets
+  come from its public GitHub download and must match the release's
+  `SHA256SUMS`, with `install.sh` from the AD checkout at the tag. The
+  binary must be a linux-amd64 ELF. The manifest holds names, versions and
+  SHA-256s only.
+- **Before submitting,** the driver checks that the manifest names this CSCB
+  version, tests from the tag's commit, the role's expected AD version and
+  its `ad_role`, and that each input file matches its recorded SHA-256 (the
+  client tarball present exactly when one is recorded). The reference's
+  CSCB entry must equal the candidate's.
+- **The image build** checks the binary's version and commit, the admin
+  tool's version and the installed files' digests (see
+  [The job image](#the-job-image)).
+- **After the run,** each job's `ad-gate: manifest:` line must equal its
+  context's manifest. Each job's name (`adg-<v>-<cand|ref>-s<k>`) and
+  context directory must be its shard's and its role's, and every job of a
+  role must report the same, present `context_sha256`.
+- **`verdict.json` records** the kit's revision, whether its files differ
+  from it, the SHA-256 of each template file, `prepare.sh`, the driver and
+  `scripts/ci-run.ts`, and each job's `context_sha256`.
+- **`--resume`** needs the recorded options and recomputes each plan from
+  its context. It refuses a changed plan or template once a job was
+  submitted from it, and submits no recorded shard again: each job ID is
+  recorded as its shard is submitted.
 
 ## /ci-live: the live Slack acceptance run
 

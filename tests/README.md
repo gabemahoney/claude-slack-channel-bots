@@ -162,7 +162,9 @@ only skip.
 ### Image marker
 
 `/etc/cscb-ci-image` exists only in the `cscb-ci` images
-(`docker/Dockerfile.test.base`, see `docker/README.md`). The following check
+(`docker/Dockerfile.test.base`, see `docker/README.md`) and the AD release
+gate's job image (`scripts/ad-gate/template/Dockerfile`), where a shipped
+tag's scripts run. The following check
 for it before their first other step and, when it is absent, refuse and say
 why:
 
