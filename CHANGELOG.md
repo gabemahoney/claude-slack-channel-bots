@@ -6,6 +6,8 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+- **Bots are told to skip terminal text nobody reads.** The tag description in `bot-system-prompt.md` and the MCP instructions now tell a bot to end each turn with no terminal text, or the shortest possible, unless a terminal reader needs it. Slack answers still go through `reply`. A running bot gets the new wording when it next restarts; with `fresh_system_prompt` off, a resumed bot keeps the old tag description until it starts a new conversation.
+
 ---
 
 ## 0.18.6 (2026-11-03)

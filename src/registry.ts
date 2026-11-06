@@ -1227,7 +1227,7 @@ function buildFilesRefusedText(reason: string, fileCount: number, posted?: strin
 /** every session receives the nine retained points in order. */
 export const MCP_INSTRUCTIONS_MAX_CHARS = 2048
 export const MCP_INSTRUCTIONS = [
-  'The sender reads Slack. Answer with reply, using chat_id and thread_ts for a thread; terminal output is not seen there.',
+  'The sender reads Slack, not your terminal. Answer with reply, using chat_id and thread_ts for a thread; end a turn with no terminal text unless a terminal reader needs it.',
   'Messages arrive as the <channel> tag described in the system prompt, carrying channel_name and, for a long message, part.',
   'via: dm = a direct message; mention = you were @mentioned; broadcast = @here or @channel; receive_all_shared = a channel where you and another persona receive every message; receive_all = a channel where you, and no other persona on this server, receive every message.',
   '<@ID> mentions a Slack user or persona. Use <@ID> to address another persona.',

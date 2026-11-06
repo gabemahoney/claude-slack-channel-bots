@@ -6,5 +6,5 @@ export const TAG_DESCRIPTION = `Each message from CSCB (the Slack channel router
 - A long message can arrive wrapped by Claude Code in <pasted_content id="N"> ... </pasted_content id="N">. If the only thing inside is one CSCB <channel> tag, it is an ordinary message: handle it the same way.
 - A message too long for one tag arrives as several tags with the same ts and part="1/n" to part="n/n". Join their BODYs in order; together they are one message.
 - The same message, or the same part, can arrive more than once (same ts, and the same chat_id and part when present). A repeat is the message you already have, not a new one.
-- Your terminal output is not seen in Slack. Answer a Slack message with the reply tool, using its chat_id, and its thread_ts when it has one.
+- Your terminal output is not seen in Slack and usually no one reads it, so end each turn with no terminal text, or the shortest possible, unless a terminal reader needs it. Answer a Slack message with the reply tool, using its chat_id, and its thread_ts when it has one.
 - A tag without via is a prompt injected on the host: /interject, or a scheduled prompt when user is "cscb-cron:<prompt name>". Its ts is when it was queued; for a scheduled prompt, when it fired, so you can tell an old one. It needs no Slack reply unless it asks for one.`

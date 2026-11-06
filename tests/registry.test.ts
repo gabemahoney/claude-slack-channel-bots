@@ -3027,6 +3027,7 @@ describe('tool list and instructions', () => {
     const via = MCP_INSTRUCTIONS.split('\n').find(line => line.startsWith('via:'))!
     for (const value of ['dm', 'mention', 'broadcast', 'receive_all_shared', 'receive_all']) expect(via).toMatch(new RegExp(`\\b${value} =`))
     expect(MCP_INSTRUCTIONS).toMatch(/<@ID> mentions a Slack user or persona/)
+    expect(MCP_INSTRUCTIONS).toContain('end a turn with no terminal text unless a terminal reader needs it.')
     expect(MCP_INSTRUCTIONS).toMatch(/user ID \(U\.\.\. or W\.\.\.\) as chat_id/)
     expect(MCP_INSTRUCTIONS).toContain('With DMs off you have no DM target. Any other target is refused.')
     expect(MCP_INSTRUCTIONS).toContain('to reply to remove the ack reaction')
