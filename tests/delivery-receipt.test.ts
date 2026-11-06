@@ -600,6 +600,40 @@ describe('receipt reader', () => {
     fs.writeFileSync(h.path, '')
     expect(h.read().availability).toBe('not-yet-written')
   })
+  test.each([['prior session', 'ENOENT'], ['prior session', 'ENOTDIR'], ['earlier send', 'ENOENT'], ['earlier send', 'ENOTDIR']] as const)('b.eh9 a gone %s transcript (%s) leaves the current file\'s availability and receipt', async (location, code) => {
+    const h = await fixture(), gone = code === 'ENOENT' ? join(h.root, 'gone.jsonl') : join(h.path, 'gone.jsonl')
+    const row = location === 'prior session' ? { ...h.row, prior_sessions: [{ jsonl_path: gone }] } : h.row
+    if (location === 'prior session') await h.send(); else await h.send(0, gone)
+    const read = () => h.reader.read('claude', row, h.item(), 1, h.queue.items('alpha'))
+    expect(read()).toMatchObject({ path: h.path, size: 0, availability: 'not-yet-written', records: [], receipt: undefined })
+    h.append(promptEntry(h.text))
+    expect(read()).toMatchObject({ path: h.path, size: fs.statSync(h.path).size, availability: 'readable', receipt: { path: h.path, offset: 0, text: h.text } })
+  })
+  test('b.eh9 a prior session removed after it was read contributes no records and never credits', async () => {
+    const h = await fixture(), prior = join(h.root, 'prior.jsonl')
+    fs.writeFileSync(prior, '')
+    const row = { ...h.row, prior_sessions: [{ jsonl_path: prior }] }
+    const read = () => h.reader.read('claude', row, h.item(), 1, h.queue.items('alpha'))
+    await h.send()
+    appendTranscript(prior, [promptEntry(h.text)])
+    expect(read().receipt?.path).toBe(prior)
+    fs.unlinkSync(prior)
+    expect(read()).toMatchObject({ path: h.path, availability: 'not-yet-written', records: [], receipt: undefined })
+  })
+  test.each(['EACCES', 'not a regular file'] as const)('b.eh9 an existing prior session that cannot be read (%s) stays unreadable while the current receipt is credited', async failure => {
+    const h = await fixture(), prior = join(h.root, 'prior.jsonl')
+    if (failure === 'EACCES') writeTranscript(prior, [promptEntry('unrelated')]); else fs.mkdirSync(prior)
+    const reader = createDeliveryReceiptReader({ fs: { ...fs,
+      openSync: ((...args: any[]) => {
+        if (args[0] === prior) throw Object.assign(new Error('refused'), { code: 'EACCES' })
+        return (fs.openSync as any)(...args)
+      }) as typeof fs.openSync,
+    } })
+    await h.send()
+    h.append(promptEntry(h.text))
+    const observed = reader.read('claude', { ...h.row, prior_sessions: [{ jsonl_path: prior }] }, h.item(), 1, h.queue.items('alpha'))
+    expect(observed).toMatchObject({ path: h.path, availability: 'unreadable', receipt: { path: h.path, offset: 0, text: h.text } })
+  })
   test('stat-first incremental reads handle partial JSON, replacement and truncation', async () => {
     const h = await fixture()
     await h.send()

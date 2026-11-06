@@ -1678,6 +1678,7 @@ example retype count is 3:
 - `mcp`: It is not connected to this server over MCP. Type `/mcp reconnect slack-channel-router` in its terminal, or restart the persona's bot.
 - `refused`: agent-director keeps refusing to type into it. Check its state with `agent-director get --instance-id cscb_<key>`.
 - `transcript`: Its transcript can't be read, so CSCB can't confirm delivery and keeps offering the message. Check that the transcript exists and that the server's user can read it.
+  This means the persona's current transcript, or an earlier session's that exists but can't be read; CSCB ignores a removed earlier-session transcript, because it can hold no new receipt.
 - `queue-unwritable`: CSCB can't write its queue file, so it types nothing more for this persona until it can. Check the server's disk.
 - `not-taken-in`: It doesn't take the message in: CSCB has typed it 3 times and keeps offering it. Attach with `tmux attach -t =slack_bot_<key>` to see why, or restart the persona's bot.
 - `dialog-hold`: agent-director won't type into it until it can prove an answered permission prompt is gone; a subagent's denied prompt stays held until the bot ends. Restart the persona's bot.

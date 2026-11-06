@@ -1,5 +1,6 @@
 /** notice decisions only; engine/intake/ack suites own their transitions. */
 import { afterEach, describe, expect, test } from 'bun:test'
+import { join } from 'node:path'
 import { CONFLICT_NOTICE_HUMAN_ONLY_LINE } from '../src/conflict-latch.ts'
 import { DELIVERY_STUCK_AFTER_MS, DELIVERY_ROW_POLL_MS, ENTER_DELAY_MS } from '../src/delivery-constants.ts'
 import { NOTICE_CORRECTION_TIMEOUT_MS, type NoticeCorrectionOutcome } from '../src/notice-correction.ts'
@@ -368,6 +369,33 @@ describe('b.x4j transcript-to-notice partial receipt guard', () => {
       expect(posts[0]!.text).toBe(formatPersonaNotice(r.config.personas[0]!, buildDeliveryStuckNotice(r.ref(), r.alpha, 1, e.clock.now(), 'not-taken-in', e.queue.items('alpha')[0]!.retypeCount + 1, true)))
     } finally { await e.cleanup() }
   })
+})
+
+test.each([false, true])('b.eh9 an aged head awaiting its receipt on a waiting row posts no stuck notice (gone prior session: %p)', async gonePrior => {
+  let r: DeliveryNoticeHarness | undefined
+  const e = await makeEngineHarness({ onEvent: event => r?.reporting.engineEvent(event) })
+  try {
+    r = await makeDeliveryNoticeHarness({ queue: e.queue }); runs.push(r)
+    const p = e.p()
+    if (gonePrior) p.row.prior_sessions = [{ jsonl_path: join(e.root, 'gone-prior.jsonl'), session_id: 'gone-prior' }]
+    p.autoReceipt = false; p.row.state = 'working'
+    const item = await e.accept('hello from slack')
+    e.engine.wake('alpha')
+    await e.advance(DELIVERY_STUCK_AFTER_MS + 5_000)
+    const before = e.events.length
+    p.row.state = 'waiting'
+    await e.until(() => e.keyCalls().some(call => call.params.key === 'Enter'))
+    await e.advance(4_000); await r.flush()
+    const waits = e.events.slice(before).filter(event => event.type === 'waiting')
+    expect(waits.at(-1)?.status?.ageMs).toBeGreaterThan(DELIVERY_STUCK_AFTER_MS)
+    expect([...new Set(waits.map(event => event.reason))]).toEqual(['receipt'])
+    expect(r.h.posts(r.alpha)).toEqual([])
+    expect(r.logs.filter(line => line.includes('delivery-stuck'))).toEqual([])
+    appendTranscript(p.path, [promptEntry('hello from slack')])
+    await e.until(() => e.queue.items('alpha').find(i => i.accepted.seq === item.accepted.seq)?.delivered === true, 60_000)
+    expect({ textSends: e.textCalls().length, retyped: e.events.filter(event => event.type === 'retyped').length }).toEqual({ textSends: 1, retyped: 0 })
+    expect(e.errors).toEqual([])
+  } finally { await e.cleanup() }
 })
 
 test('emptying the queue ends the waiting episode before new accepted work arrives', async () => {

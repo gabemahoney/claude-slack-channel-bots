@@ -121,7 +121,7 @@ export function createDeliveryReceiptReader(options: { fs?: typeof nodeFs } = {}
   // independently of the parsed cache, even when a file cannot be opened.
   const observed = new Map<string, number>(), windows = new Map<string, ReadonlyMap<string, number>>()
   const sendIdentity = (seq: number, send: SentRecord): string => `${seq}:${send.part}:${send.attempt}`
-  function readFile(agent: DeliveryAgent, path: string, missingAllowed: boolean): { size: number; availability: ReceiptObservation['availability']; records: readonly ReceiptRecord[] } {
+  function readFile(agent: DeliveryAgent, path: string, missingAllowed: boolean): { size: number; availability: ReceiptObservation['availability']; gone?: boolean; records: readonly ReceiptRecord[] } {
     let fd: number | undefined, observedSize: number | undefined
     try {
       // EOF is still meaningful when opening a regular file is refused.
@@ -155,8 +155,8 @@ export function createDeliveryReceiptReader(options: { fs?: typeof nodeFs } = {}
       }
       return { size: st.size, availability: st.size ? 'readable' : 'not-yet-written', records: c.records }
     } catch (err) {
-      const c = files.get(path)
-      return { size: observedSize ?? c?.size ?? 0, availability: missingAllowed && (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'not-yet-written' : 'unreadable', records: c?.records ?? [] }
+      const c = files.get(path), code = (err as NodeJS.ErrnoException).code
+      return { size: observedSize ?? c?.size ?? 0, availability: missingAllowed && code === 'ENOENT' ? 'not-yet-written' : 'unreadable', gone: code === 'ENOENT' || code === 'ENOTDIR', records: c?.records ?? [] }
     } finally { if (fd !== undefined) try { fs.closeSync(fd) } catch {} }
   }
   return {
@@ -196,6 +196,9 @@ export function createDeliveryReceiptReader(options: { fs?: typeof nodeFs } = {}
         const current = p === path
         const f = readFile(agent, p, current && row.transcript_status !== 'present')
         observed.set(p, f.size)
+        // A removed historical file can hold no new evidence; only AD's
+        // current path and files that exist decide availability.
+        if (!current && f.gone) continue
         availability.set(p, f.availability)
         if (current) size = f.size
         if (f.availability === 'unreadable') unreadable = true
