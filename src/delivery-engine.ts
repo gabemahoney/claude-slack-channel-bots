@@ -308,7 +308,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   function queueRefusal(key: string, s: State): void {
     const [seq] = s.e.target, attempt = s.e.attempt
     queueWrite(s, { v: 1, kind: 'refused', seq, attempt, at: clock.now() }, () => {
-      const refused = deps.queue.items(key).find(item => item.accepted.seq === seq)?.records.find(r => r.kind === 'sent' && r.attempt === attempt)
+      const refused = deps.queue.item(key, seq)?.records.find(r => r.kind === 'sent' && r.attempt === attempt)
       if (refused?.kind === 'sent' && 'send_kind' in refused && refused.send_kind === 'retype') { s.e.retypes[seq] = Math.max(0, (s.e.retypes[seq] ?? 0) - 1); s.retryStep = Math.max(0, s.retryStep - 1) }
       s.e.phase = 'ready'; s.e.request = 'none'; release(s)
     })
@@ -319,7 +319,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     s.deadlines.receipt = at + ms('RECEIPT_WAIT_MS', RECEIPT_WAIT_MS)
     const backoff = constants?.RETYPE_BACKOFF_MS ?? RETYPE_BACKOFF_MS
     s.deadlines.backoff = at + backoff[Math.min(s.retryStep, backoff.length - 1)]!
-    if (sent.send_kind === 'retype' && s.lastRetypeEvent !== sent.attempt) { s.lastRetypeEvent = sent.attempt; emit({ type: 'retyped', key, seq: sent.seq, part: sent.part, count: deps.queue.items(key).find(i => i.accepted.seq === sent.seq)?.retypeCount ?? s.e.retypes[sent.seq] ?? 0 }) }
+    if (sent.send_kind === 'retype' && s.lastRetypeEvent !== sent.attempt) { s.lastRetypeEvent = sent.attempt; emit({ type: 'retyped', key, seq: sent.seq, part: sent.part, count: deps.queue.item(key, sent.seq)?.retypeCount ?? s.e.retypes[sent.seq] ?? 0 }) }
   }
   async function keyError(key: string, s: State, error: unknown, textCall: boolean): Promise<void> {
     if (error instanceof DeliveryBudgetWait) throw error
@@ -341,7 +341,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     const steps = constants?.NOT_NOW_RETRY_MS ?? NOT_NOW_RETRY_MS
     s.deadlines.notNow = clock.now() + steps[Math.min(s.notNowStep++, steps.length - 1)]!
     if (textCall && deliveryTextWasRefused(error)) s.e.phase = 'refused'
-    else { const sent = effectiveSends(deps.queue.items(key).find(i => i.accepted.seq === s.e.target[0])!, s.e.target[1]).at(-1); if (sent) afterSend(s, key, sent); s.e.phase = 'receipt'; s.e.request = 'none'; s.deadlines.receipt = clock.now() + ms('RECEIPT_WAIT_MS', RECEIPT_WAIT_MS) }
+    else { const sent = effectiveSends(deps.queue.item(key, s.e.target[0])!, s.e.target[1]).at(-1); if (sent) afterSend(s, key, sent); s.e.phase = 'receipt'; s.e.request = 'none'; s.deadlines.receipt = clock.now() + ms('RECEIPT_WAIT_MS', RECEIPT_WAIT_MS) }
     wait(key, s, 'not-now')
   }
   async function run(key: string, s: State): Promise<void> {
@@ -355,7 +355,8 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       // reading. Every new operation obtains a fresh row and gate grant.
       for (let turns = 0; turns < 40 && !stopped && !s.stopped; turns++) {
         let k = build(key, s), pair = selectDeliveryTarget(k), part = pair[1]
-        const head = deps.queue.items(key).find(i => isOpenItem(i) && i.accepted.seq === pair[0])
+        const target = deps.queue.item(key, pair[0])
+        const head = target && isOpenItem(target) ? target : undefined
         if (!head && !s.pending) {
           release(s); states.delete(key); life.engineRunning(key, false); return
         }
@@ -413,7 +414,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
             s.receiptWorking = false; s.deadlines.receipt = 0
             s.e.phase = 'ready'; s.e.target = NO_DELIVERY_PAIR; release(s)
             emit({ type: 'delivered', key, seq: pair[0], part })
-            const item = deps.queue.items(key).find(i => i.accepted.seq === pair[0])
+            const item = deps.queue.item(key, pair[0])
             if (item?.delivered) emit({ type: 'item-delivered', key, seq: pair[0], at: clock.now(), waitMs: Math.max(0, clock.now() - itemOpenedAt(item)) })
           }); continue
         }
@@ -479,7 +480,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
             if (recovery) s.e.recoveryAttempt = s.e.attempt
           }
           catch (error) { await keyError(key, s, error, false) }
-          const sentItem = deps.queue.items(key).find(i => i.accepted.seq === s.e.target[0]) ?? head!
+          const sentItem = deps.queue.item(key, s.e.target[0]) ?? head!
           const sent = effectiveSends(sentItem, s.e.target[1]).at(-1)
           if (sent) afterSend(s, key, sent)
           else { s.e.phase = 'receipt'; s.deadlines.receipt = clock.now() + ms('RECEIPT_WAIT_MS', RECEIPT_WAIT_MS) }

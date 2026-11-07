@@ -5,7 +5,7 @@ import { refreshDeliveryTranscript } from '../src/session-manager.ts'
 /** production executor over a durable queue and real adapters.
  * Receipt permutations and gate lifecycle live in their
  * own suite. Every timestamp and retry is driven by the injected fake clock. */
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { readFileSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -38,6 +38,33 @@ async function hold(h: EngineHarness, ts: string = THREAD_ROOTS.secondary, key =
   if (result.status !== 'accepted') throw new Error('hold fixture acceptance failed')
   return result.item!
 }
+
+test.each([16, 64])('wakes over a growing %i-item queue clone at most the newly accepted item', async count => {
+  const h = await harness()
+  h.p().up = false
+  const clone = globalThis.structuredClone
+  const cloning = spyOn(globalThis, 'structuredClone').mockImplementation(value => clone(value))
+  let reads = 0
+  try {
+    for (let i = 0; i < count; i++) {
+      expect((await h.queue.accept('alpha', injectedInput({ text: `queued ${i}` }))).status).toBe('accepted')
+      cloning.mockClear()
+      h.engine.wake('alpha')
+      await h.tick()
+      expect(h.engine.status('alpha')).toMatchObject({ seq: 1, count: i + 1, up: false })
+      reads += cloning.mock.calls.length
+    }
+    expect(reads).toBeLessThanOrEqual(count)
+    cloning.mockClear()
+    await h.tick()
+    expect(h.engine.status('alpha')).toMatchObject({ seq: 1, count, up: false })
+    expect(cloning).not.toHaveBeenCalled()
+  } finally { cloning.mockRestore() }
+  expect(h.calls).toEqual([])
+  expect(h.queue.openCount('alpha')).toBe(count)
+  expect(h.errors).toEqual([])
+  assertNoLeak([h.events, h.calls, h.errors, h.records()])
+})
 
 describe('Memory Hold delivery', () => {
   test('passes unresolved and withdrawn work, preserves later FIFO and isolates personas', async () => {

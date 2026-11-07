@@ -246,7 +246,7 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
       return
     }
     if (event.type === 'marker-missing' || event.type === 'delivered') return
-    const item = deps.queue.items(key).find(i => i.accepted.seq === event.seq)
+    const item = deps.queue.item(key, event.seq)
     if (!item) return
     const identity = deliveryIdentity(item.accepted), id = `${key}:${event.seq}`
     if (event.type === 'item-delivered') {

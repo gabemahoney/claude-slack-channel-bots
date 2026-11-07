@@ -874,33 +874,109 @@ test.each([16, 64])('%i concurrent accepts and preparations clone only two item 
   expect(q.items('alpha').every(item => item.fixed !== undefined)).toBe(true)
 })
 
-test('single-item snapshots are fresh, deeply detached and absent after compaction removes their item', async () => {
+test.each(['item', 'items'] as const)('%s snapshots are fresh, deeply frozen and absent after compaction removes their item', async reader => {
   const q = await open()
+  const read = (seq: number) => reader === 'item' ? q.item('alpha', seq) : q.items('alpha').find(item => item.accepted.seq === seq)
   await q.accept('alpha', slackInput({ files: [{ name: 'original.txt' }] }))
   await q.accept('alpha', injectedInput())
   await q.accept('beta', injectedInput({ text: 'other persona' }))
   expect(q.item('missing', 1)).toBeUndefined()
   expect(q.item('alpha', 99)).toBeUndefined()
-  const stale = q.item('alpha', 1)!
+  const stale = read(1)!
   await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['fixed bytes'] })
   await q.append('alpha', sentRecord())
-  const current = q.item('alpha', 1)!
+  const current = read(1)!
   expect(stale.fixed).toBeUndefined()
   expect(current).toEqual(q.items('alpha')[0])
-  const unchanged = q.item('alpha', 1)!
-  current.accepted.text = 'changed'
-  current.accepted.files![0]!.name = 'changed.txt'
-  current.fixed!.parts[0] = 'changed bytes'
-  current.records.find(record => record.kind === 'sent')!.attempt = 99
-  expect(q.item('alpha', 1)).toEqual(unchanged)
+  const unchanged = structuredClone(current)
+  expect(() => { current.accepted.text = 'changed' }).toThrow()
+  expect(() => { current.accepted.key!.ts = 'changed' }).toThrow()
+  expect(() => { current.accepted.files![0]!.name = 'changed.txt' }).toThrow()
+  expect(() => { current.fixed!.parts[0] = 'changed bytes' }).toThrow()
+  expect(() => { current.records.find(record => record.kind === 'sent')!.attempt = 99 }).toThrow()
+  expect(() => { current.records.pop() }).toThrow()
+  expect(() => { current.delivered = true }).toThrow()
+  const list = q.items('alpha')
+  list.reverse(); list.pop()
+  expect(q.items('alpha').map(item => item.accepted.seq)).toEqual([1, 2])
+  expect(read(1)).toEqual(unchanged)
   expect(q.item('beta', 1)!.accepted.text).toBe('other persona')
   await q.append('alpha', deliveredRecord())
-  expect(q.item('alpha', 1)!.delivered).toBe(true)
+  const delivered = read(1)!
+  expect(delivered.delivered).toBe(true)
+  expect(() => { delivered.records.find(record => record.kind === 'delivered')!.receipt.path = 'changed' }).toThrow()
   expect(current.delivered).toBe(false)
   await q.compact('alpha')
-  expect(q.item('alpha', 1)).toBeUndefined()
+  expect(read(1)).toBeUndefined()
   expect(q.item('alpha', 2)).toEqual(q.items('alpha')[0])
   expect(q.item('beta', 1)!.accepted.text).toBe('other persona')
+})
+
+test.each([16, 64])('%i queued items and holds reuse snapshots between changes', async count => {
+  const inputs = Array.from({ length: count }, (_, i) => {
+    const ts = `1700000000.${String(i + 1).padStart(6, '0')}`
+    return heldSlackInput(unknownRootPostHold(1000), { ts, key: { chat_id: THREAD_CHANNELS.primary, ts } })
+  })
+  seedQueue(dir, inputs.map((input, i) => acceptedRecord(i + 1, input, 1000)))
+  const q = await open()
+  const initial = q.items('alpha'), holds = q.unresolvedHolds('alpha')
+  const clone = globalThis.structuredClone
+  const cloning = spyOn(globalThis, 'structuredClone').mockImplementation(value => clone(value))
+  try {
+    for (let i = 0; i < 4; i++) {
+      expect(q.items('alpha')).toEqual(initial)
+      expect(q.unresolvedHolds('alpha')).toEqual(holds)
+      expect(q.item('alpha', count)).toEqual(initial.at(-1))
+    }
+    expect(cloning).not.toHaveBeenCalled()
+    // An append and a resolution invalidate only their item/hold versions.
+    await q.append('alpha', noticedRecord(count))
+    await q.resolveHolds('alpha', [{ seq: 1, outcome: 'parked', at: 1100 }])
+    cloning.mockClear()
+    const changed = q.items('alpha'), changedHolds = q.unresolvedHolds('alpha')
+    expect(changed[0]!.hold).toMatchObject({ kind: 'memory', state: 'unresolved' })
+    expect(changed.at(-1)!.records.at(-1)).toEqual(noticedRecord(count))
+    expect(changedHolds[0]).toMatchObject({ on: 'memory', seq: 1 })
+    expect(changed.slice(1, -1)).toEqual(initial.slice(1, -1))
+    // Two changed items and their two replaced hold entries, independent of count.
+    expect(cloning).toHaveBeenCalledTimes(4)
+    cloning.mockClear()
+    expect(q.item('alpha', 1)).toEqual(changed[0])
+    expect(q.items('alpha')).toEqual(changed)
+    expect(q.unresolvedHolds('alpha')).toEqual(changedHolds)
+    expect(cloning).not.toHaveBeenCalled()
+  } finally { cloning.mockRestore() }
+})
+
+test('frozen hold snapshots keep old versions through parking, release, compaction and replay', async () => {
+  const field = unknownRootPostHold(1000), input = heldSlackInput(field)
+  const q = await open()
+  expect((await q.accept('alpha', input)).status).toBe('accepted')
+  const initial = q.items('alpha')[0]!, holds = q.unresolvedHolds('alpha'), hold = holds[0]!
+  if (hold.on !== 'post') throw new Error('expected Post Hold')
+  const original = structuredClone(initial), originalHold = structuredClone(hold)
+  expect(() => { initial.hold!.field.stamp.incarnation = 'changed' }).toThrow()
+  expect(() => { initial.hold!.state = 'released' }).toThrow()
+  expect(() => { hold.stamp.threadHybridSince = 'changed' }).toThrow()
+  expect(() => { (hold.operations as string[]).push('changed') }).toThrow()
+  holds.pop()
+  expect(q.unresolvedHolds('alpha')).toEqual([originalHold])
+  await q.resolveHolds('alpha', [{ seq: 1, outcome: 'parked', at: 1100 }])
+  expect(q.item('alpha', 1)!.hold).toMatchObject({ kind: 'memory', state: 'unresolved' })
+  expect(q.unresolvedHolds('alpha')).toEqual([{ ...memoryHold(1000), seq: 1, channel: input.channel!, memoryDependent: true }])
+  await q.resolveHolds('alpha', [{ seq: 1, outcome: 'released', at: 1200 }])
+  expect(q.item('alpha', 1)!.hold).toMatchObject({ kind: 'memory', state: 'released', at: 1200 })
+  expect(q.unresolvedHolds('alpha')).toEqual([])
+  expect(initial).toEqual(original)
+  expect(hold).toEqual(originalHold)
+  await q.compact('alpha')
+  const compacted = q.item('alpha', 1)!
+  expect(compacted.hold).toBeUndefined()
+  expect(compacted.accepted.released_at).toBe(1200)
+  await q.stop()
+  const replay = await open()
+  expect(replay.items('alpha')).toEqual([compacted])
+  expect(replay.unresolvedHolds('alpha')).toEqual([])
 })
 test('closing drains accepted writes and rejects new intake without leaving an open descriptor', async () => {
   let opens = 0; const seam = { ...fs, openSync: (...args: Parameters<typeof fs.openSync>) => { const fd = fs.openSync(...args); opens++; return fd }, closeSync: (fd: number) => { fs.closeSync(fd); opens-- } } as typeof fs

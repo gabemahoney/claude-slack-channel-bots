@@ -144,11 +144,13 @@ export interface DeliveryQueue {
   /** Adopt pre-two-stage accepted work before its first queued Slack mutation. */
   rememberQueuedReaction(key: string, seq: number, name: string): Promise<string | undefined>
   lookupSlackKey(key: string, slackKey: SlackKey): QueueAcceptResult | undefined
-  /** A current snapshot of one item, without cloning the rest of the queue. */
+  /** A deeply frozen snapshot, shared until that item changes. */
   item(key: string, seq: number): QueueItem | undefined
+  /** A fresh ordered array of deeply frozen per-item snapshots. */
   items(key: string): QueueItem[]
   openCount(key: string): number
-  /** Includes decisions whose store is in progress, for stale-join retention. */
+  /** A fresh ordered array of deeply frozen holds. Includes decisions whose
+   * store is in progress, for stale-join retention. */
   unresolvedHolds(key: string): UnresolvedHold[]
   /** Returns only resolutions newly saved by this call, in input order.
    * onCommitted observes that batch synchronously after publication, before
@@ -293,6 +295,15 @@ interface StagedAccept { record: AcceptedRecord; turnStarted: number | undefined
 interface BatchEntry { member: AcceptMember; staged?: StagedAccept; outcome?: AcceptOutcome }
 interface StageCursor { nextSeq: number; lastInjected?: bigint }
 function emptyJournal(): Journal { return { records: [], nextSeq: 1, loaded: false, reminders: new Map(), items: new Map(), slackKeys: new Map(), holds: new Map(), openCount: 0 } }
+/** Queue snapshots contain only journal data (objects, arrays and scalars).
+ * Freeze before descending so shared nested references are visited once. */
+function freezeSnapshot<T>(value: T): T {
+  if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value)
+    for (const nested of Object.values(value)) freezeSnapshot(nested)
+  }
+  return value
+}
 /** All file access is explicit; construction allocates only memory. */
 export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminderQueue {
   const fs = options.fs ?? nodeFs
@@ -302,6 +313,9 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   const dir = join(options.stateDir, 'queue')
   const { ensureDir, durableAppend, reconcileRollback, rewrite } = createDurableJournal({ dir, parentDir: options.stateDir, directoryMode: QUEUE_DIRECTORY_MODE, fileMode: QUEUE_FILE_MODE, fs })
   const journals = new Map<string, Journal>()
+  // Items and hold entries are replaced on changes, including rebuilds. Weak
+  // keys let obsolete versions go without a second invalidation/eviction index.
+  const snapshots = new WeakMap<object, object>()
   const writers = new Map<string, Promise<unknown>>()
   const appendBlocked = new Set<string>()
   const storingHolds = new Map<string, Map<number, UnresolvedHold>>()
@@ -417,6 +431,14 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   }
   function materialize(j: Journal): QueueItem[] {
     return [...j.items.values()].sort((a, b) => a.accepted.seq - b.accepted.seq)
+  }
+  function snapshot<T extends QueueItem | UnresolvedHold>(value: T): T {
+    let cached = snapshots.get(value) as T | undefined
+    if (!cached) {
+      cached = freezeSnapshot(structuredClone(value))
+      snapshots.set(value, cached)
+    }
+    return cached
   }
   async function load(key: string): Promise<void> {
     const stored = journal(key)
@@ -894,14 +916,14 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     lookupSlackKey,
     item(key, seq) {
       const item = journal(key).items.get(seq)
-      return item ? structuredClone(item) : undefined
+      return item ? snapshot(item) : undefined
     },
-    items: key => materialize(journal(key)).map(item => structuredClone(item)),
+    items: key => materialize(journal(key)).map(snapshot),
     openCount: key => journal(key).openCount,
     unresolvedHolds(key) {
       const holds = new Map(journal(key).holds)
       for (const [seq, storing] of storingHolds.get(key) ?? []) holds.set(seq, storing)
-      return structuredClone([...holds.values()].sort((a, b) => a.seq - b.seq))
+      return [...holds.values()].sort((a, b) => a.seq - b.seq).map(snapshot)
     },
     async resolveHolds(key, resolutions, current = () => true, onCommitted) {
       try {
