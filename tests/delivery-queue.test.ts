@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createDeliveryQueue, isOpenItem, itemOpenedAt, isQueueRecord, parseQueueRecord, QUEUE_DIRECTORY_MODE, QUEUE_FILE_MODE, QUEUE_KEY_KEEP_MS, QUEUE_COMPACT_INTERVAL_MS, type AcceptedRecord, type AcceptedInput, type HoldField, type HoldOutcome, type HoldResolution, type QueueRecord, type QueueEvent, type QueueStoreKind, type DeliveryQueue } from '../src/delivery-queue.ts'
+import { createDeliveryQueue, isOpenItem, itemOpenedAt, isQueueRecord, parseQueueRecord, QUEUE_DIRECTORY_MODE, QUEUE_FILE_MODE, QUEUE_KEY_KEEP_MS, QUEUE_COMPACT_INTERVAL_MS, QUEUE_GROUP_COMMIT_MAX, type AcceptedRecord, type AcceptedInput, type HoldField, type HoldOutcome, type HoldResolution, type QueueRecord, type QueueEvent, type QueueStoreKind, type DeliveryQueue } from '../src/delivery-queue.ts'
 import { assertNoLeak, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 import { makeDeliveryNoticeHarness, type DeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
 import { MAX_RELOAD_FILE_BYTES } from '../src/config.ts'
@@ -1421,8 +1421,9 @@ describe('decided acceptance owns the persona writer turn', () => {
     const { io, gate, reached } = holdFirstSync(path => path === queuePath(dir))
     const q = await open({ fs: io.fs }), order: string[] = []
     const head = q.accept('alpha', injectedInput())
-    const backlog = Array.from({ length: 20 }, (_, i) => q.acceptDecided('alpha', undefined, () => { order.push(`alpha:${i}`); return { skip: i } }))
     await reached()
+    // Queued while the head's append holds the writer, so none joins the head's batch.
+    const backlog = Array.from({ length: 20 }, (_, i) => q.acceptDecided('alpha', undefined, () => { order.push(`alpha:${i}`); return { skip: i } }))
     const decided = q.acceptDecided('beta', slackInput().key, () => { order.push('beta'); return { store: slackInput() } })
     const plain = q.accept('gamma', injectedInput()).then(r => { order.push('gamma'); return r })
     expect((await Promise.all([decided, plain])).map(r => r.status)).toEqual(['accepted', 'accepted'])
@@ -1548,6 +1549,155 @@ describe('writer turns that wait on the disk', () => {
     expect(readQueue(dir).map(r => r.kind)).toEqual(['accepted'])
     expect(q.unresolvedHolds('alpha').map(hold => hold.seq)).toEqual([1])
     expect(await q.resolveHolds('alpha', [{ seq: 1, outcome: 'released', at: THREAD_TIME + 1 }])).toHaveLength(1)
+  })
+})
+
+describe('acceptances queued together share one durable append per batch', () => {
+  test('QUEUE_GROUP_COMMIT_MAX is 8 (SR-4.1.1)', () => {
+    expect(QUEUE_GROUP_COMMIT_MAX).toBe(8)
+  })
+
+  /** The persona journal's line count at each of its file fsyncs (appends and rollbacks); the next `fail` of them throw. */
+  function journalSyncs(key = 'alpha') {
+    const rig = { lines: [] as number[], fail: 0 }
+    return Object.assign(rig, { fs: durableIo({ before(step) {
+      if (step.op !== 'fsync' || step.path !== queuePath(dir, key)) return
+      rig.lines.push(fs.readFileSync(queuePath(dir, key), 'utf8').split('\n').filter(Boolean).length)
+      if (rig.fail > 0) { rig.fail--; throw new Error('EIO batch sync') }
+    } }).fs })
+  }
+  /** A distinct Slack message per `i`. */
+  const slackAt = (i: number) => { const ts = `1700000001.${String(i).padStart(6, '0')}`; return slackInput({ text: `m${i}`, ts, key: { chat_id: 'C0TEST001', ts } }) }
+  const seqs = (results: ReadonlyArray<{ status: string; seq?: number }>) => results.map(r => r.status === 'accepted' ? r.seq : r.status)
+
+  test('per-persona order holds across batches of at most QUEUE_GROUP_COMMIT_MAX, one append each, while another persona interleaves', async () => {
+    const syncs = journalSyncs(), q = await open({ fs: syncs.fs, now: () => THREAD_TIME })
+    const n = 2 * QUEUE_GROUP_COMMIT_MAX + 3
+    const call = (key: string, i: number) => i % 3 === 0 ? q.accept(key, injectedInput({ text: `m${i}` }))
+      : i % 3 === 1 ? q.accept(key, slackAt(i)) : q.acceptDecided(key, slackAt(i).key, () => ({ store: slackAt(i) }))
+    const results = await Promise.all(Array.from({ length: n }, (_, i) => [call('alpha', i), call('beta', i)]).flat())
+    expect(seqs(results)).toEqual(Array.from({ length: n }, (_, i) => [i + 1, i + 1]).flat())
+    expect(syncs.lines).toEqual([QUEUE_GROUP_COMMIT_MAX, 2 * QUEUE_GROUP_COMMIT_MAX, n])
+    for (const key of ['alpha', 'beta']) {
+      const records = readQueue(dir, key) as AcceptedRecord[]
+      expect(records.map(r => [r.seq, r.text])).toEqual(Array.from({ length: n }, (_, i) => [i + 1, `m${i}`]))
+      // Injected timestamps share one received_at, so only the watermark carried across batches keeps them increasing.
+      const injected = records.filter(r => r.source !== 'slack').map(r => BigInt(r.ts.replace('.', '')))
+      expect(injected.every((ts, i) => i === 0 || ts > injected[i - 1]!)).toBe(true)
+    }
+    await q.stop()
+    expect((await open()).items('alpha').map(i => i.accepted.text)).toEqual(Array.from({ length: n }, (_, i) => `m${i}`))
+  })
+
+  test.each([['file', () => queuePath(dir)], ['directory', () => join(dir, 'queue')]] as const)("no member is published or answered before the shared append's %s sync completes; its staged holds read as unresolved meanwhile", async (_, path) => {
+    const h = holdFirstSync(p => p === path(), { armed: false })
+    const q = await open({ fs: h.io.fs })
+    h.state.armed = true
+    const hold = heldSlackInput(memoryHold(THREAD_TIME)), settled: number[] = []
+    const calls = [q.accept('alpha', slackInput()), q.acceptDecided('alpha', hold.key, () => ({ store: hold })), q.accept('alpha', injectedInput())]
+      .map((pending, i) => pending.then(result => { settled.push(i); return result }))
+    await h.reached()
+    expect(readQueue(dir).map(r => r.seq)).toEqual([1, 2, 3])
+    await yieldToEventLoop()
+    expect(settled).toEqual([])
+    expect(q.items('alpha')).toEqual([])
+    expect(q.lookupSlackKey('alpha', slackInput().key!)).toBeUndefined(); expect(q.lookupSlackKey('alpha', hold.key!)).toBeUndefined()
+    expect(q.unresolvedHolds('alpha').map(entry => entry.seq)).toEqual([2])
+    h.gate.release()
+    expect(seqs(await Promise.all(calls))).toEqual([1, 2, 3])
+    expect(settled).toEqual([0, 1, 2])
+    expect(q.unresolvedHolds('alpha').map(entry => entry.seq)).toEqual([2])
+    expect(h.io.steps.filter(step => step.op === 'fsync' && step.path === queuePath(dir))).toHaveLength(1)
+  })
+
+  test('a failed append fails its whole batch once, with no retry and its bytes rolled back; the next batch reuses the unpublished seqs', async () => {
+    const syncs = journalSyncs(), events: QueueEvent[] = []
+    const q = await open({ fs: syncs.fs, onEvent: e => events.push(e) })
+    expect(await q.accept('alpha', slackAt(0))).toMatchObject({ status: 'accepted', seq: 1 })
+    const boundary = fs.readFileSync(queuePath(dir))
+    events.length = 0; syncs.lines.length = 0; syncs.fail = 1
+    const hold = heldSlackInput(memoryHold(THREAD_TIME)), n = QUEUE_GROUP_COMMIT_MAX + 2
+    const results = await Promise.all(Array.from({ length: n }, (_, i) => i === 1 ? q.acceptDecided('alpha', hold.key, () => ({ store: hold })) : q.accept('alpha', slackAt(i + 1))))
+    expect(seqs(results)).toEqual([...Array<string>(QUEUE_GROUP_COMMIT_MAX).fill('failed'), 2, 3])
+    // The failed append holds the whole batch; its rollback; then only the next batch: no member is written twice.
+    expect(syncs.lines).toEqual([1 + QUEUE_GROUP_COMMIT_MAX, 1, 3])
+    expect(events.map(e => e.type)).toEqual([...Array<QueueEvent['type']>(QUEUE_GROUP_COMMIT_MAX).fill('store-failed'), 'stored', 'stored'])
+    expect(fs.readFileSync(queuePath(dir)).subarray(0, boundary.length)).toEqual(boundary)
+    expect(readQueue(dir).map(r => [r.seq, (r as AcceptedRecord).text])).toEqual([[1, 'm0'], [2, `m${n - 1}`], [3, `m${n}`]])
+    expect(q.unresolvedHolds('alpha')).toEqual([])
+    expect(q.lookupSlackKey('alpha', hold.key!)).toBeUndefined(); expect(q.lookupSlackKey('alpha', slackAt(1).key!)).toBeUndefined()
+  })
+
+  test('stop() during a multi-batch group waits for every member: a later plain accept still stores, a later acceptDecided is refused, and nothing syncs after stop resolves', async () => {
+    const h = holdFirstSync(p => p === queuePath(dir), { armed: false }), events: QueueEvent[] = []
+    const q = await open({ fs: h.io.fs, onEvent: e => events.push(e) })
+    h.state.armed = true
+    const settled: number[] = []
+    const decided = slackAt(QUEUE_GROUP_COMMIT_MAX)
+    const calls = [
+      ...Array.from({ length: QUEUE_GROUP_COMMIT_MAX }, (_, i) => q.accept('alpha', slackAt(i))),
+      q.acceptDecided('alpha', decided.key, () => ({ store: decided })),
+      q.accept('alpha', slackAt(QUEUE_GROUP_COMMIT_MAX + 1)),
+    ].map((pending, i) => pending.then(result => { settled.push(i); return result }))
+    await h.reached()
+    let stopped = false
+    const stopping = q.stop().then(() => { stopped = true })
+    await yieldToEventLoop()
+    expect(stopped).toBe(false); expect(settled).toEqual([])
+    h.gate.release()
+    await stopping
+    expect(settled.sort((a, b) => a - b)).toEqual(Array.from({ length: calls.length }, (_, i) => i))
+    const syncs = h.io.steps.filter(step => step.op === 'fsync').length
+    const results = await Promise.all(calls)
+    expect(seqs(results)).toEqual([...Array.from({ length: QUEUE_GROUP_COMMIT_MAX }, (_, i) => i + 1), 'failed', QUEUE_GROUP_COMMIT_MAX + 1])
+    expect(events.filter(e => e.type === 'store-failed')).toEqual([expect.objectContaining({ type: 'store-failed', key: 'alpha', ts: decided.ts })])
+    expect(readQueue(dir).map(r => [r.seq, (r as AcceptedRecord).text])).toEqual(
+      [...Array.from({ length: QUEUE_GROUP_COMMIT_MAX }, (_, i) => [i + 1, `m${i}`]), [QUEUE_GROUP_COMMIT_MAX + 1, `m${QUEUE_GROUP_COMMIT_MAX + 1}`]])
+    await yieldToEventLoop()
+    expect(h.io.steps.filter(step => step.op === 'fsync')).toHaveLength(syncs)
+  })
+
+  test('a decision with afterStore closes its batch, so the next decision runs after that store is durable and sees its effect', async () => {
+    const syncs = journalSyncs(), q = await open({ fs: syncs.fs })
+    let joined = false
+    const seen: Array<[boolean, number]> = []
+    const results = await Promise.all([
+      q.accept('alpha', slackAt(0)),
+      q.acceptDecided('alpha', slackAt(1).key, () => ({ store: slackAt(1), afterStore: () => { joined = true } })),
+      q.acceptDecided('alpha', slackAt(2).key, () => { seen.push([joined, readQueue(dir).length]); return { store: slackAt(2) } }),
+      q.accept('alpha', slackAt(3)),
+    ])
+    expect(seqs(results)).toEqual([1, 2, 3, 4])
+    expect(seen).toEqual([[true, 2]])
+    expect(syncs.lines).toEqual([2, 4])
+  })
+
+  test("a member whose Slack key a staged record holds commits the batch first, so it is answered as that record's duplicate without deciding", async () => {
+    const syncs = journalSyncs(), q = await open({ fs: syncs.fs })
+    const results = await Promise.all([
+      q.accept('alpha', slackAt(0)), q.accept('alpha', injectedInput()),
+      q.acceptDecided('alpha', slackAt(0).key, () => { throw new Error('duplicate must not decide') }),
+      q.accept('alpha', slackAt(0)), q.accept('alpha', slackAt(1)),
+    ])
+    expect(results.map(r => [r.status, 'seq' in r ? r.seq : undefined])).toEqual([['accepted', 1], ['accepted', 2], ['duplicate', 1], ['duplicate', 1], ['accepted', 3]])
+    expect(syncs.lines).toEqual([2, 3])
+    expect(readQueue(dir).map(r => (r as AcceptedRecord).text)).toEqual(['m0', 'prompt', 'm1'])
+  })
+
+  test('other work queued for the persona closes the forming group, so later acceptances never pass it', async () => {
+    const syncs = journalSyncs(), q = await open({ fs: syncs.fs })
+    await Promise.all([q.accept('alpha', slackAt(0)), q.accept('alpha', slackAt(1)), q.append('alpha', fixedRecord(1)), q.accept('alpha', slackAt(2)), q.accept('alpha', slackAt(3))])
+    expect(readQueue(dir).map(r => [r.kind, r.seq])).toEqual([['accepted', 1], ['accepted', 2], ['fixed', 1], ['accepted', 3], ['accepted', 4]])
+    expect(syncs.lines).toEqual([2, 3, 5])
+  })
+
+  test("a burst of one persona's acceptances takes one durable append per QUEUE_GROUP_COMMIT_MAX members, not one per member", async () => {
+    // The size of the integration suite's thread burst.
+    const burst = 2001, io = durableIo(), q = await open({ fs: io.fs })
+    const results = await Promise.all(Array.from({ length: burst }, (_, i) => q.accept('alpha', slackAt(i))))
+    expect(seqs(results)).toEqual(Array.from({ length: burst }, (_, i) => i + 1))
+    expect(io.steps.filter(step => step.op === 'fsync' && step.path === queuePath(dir))).toHaveLength(Math.ceil(burst / QUEUE_GROUP_COMMIT_MAX))
+    expect(readQueue(dir)).toHaveLength(burst)
   })
 })
 
@@ -2007,9 +2157,10 @@ describe('Memory Hold queue records', () => {
     await storeHold(q, clock.now(), {}, 'beta')
     state.armed = true
     const head = q.accept('alpha', injectedInput({ text: 'earlier turn' }))
+    await reached()
+    // Queued while the head's append holds the writer, so none joins the head's batch.
     const backlog = Array.from({ length: 20 }, (_, i) => q.acceptDecided('alpha', undefined, () => { order.push(`alpha:${i}`); return { skip: i } }))
     const alpha = q.resolveHolds('alpha', [{ seq: 1, outcome: 'released', at: clock.now() }]).then(saved => { order.push('alpha:resolved'); return saved })
-    await reached()
     expect(await q.resolveHolds('beta', [{ seq: 1, outcome: 'withdrawn', at: clock.now() }])).toHaveLength(1)
     expect(order).toEqual([])
     expect(q.unresolvedHolds('alpha')).toHaveLength(1)
@@ -2142,6 +2293,8 @@ describe('test-only store timings', () => {
   const SECRET = `${LEAK_SENTINEL} private timed body`
   /** An earlier turn's append time, which a later turn waits behind, and a measured turn's own append time. */
   const WAIT = 1_000, APPEND = 30
+  /** An earlier batch member's own staging time, before a later member's staging starts. */
+  const STAGE = 7
   /** After every THREAD_ROOTS timestamp, so never a duplicate of their stores. */
   const LATER_TS = '1700000000.000009'
   const later = (text = 'message') => slackInput({ text, ts: LATER_TS, key: { ...slackInput().key!, ts: LATER_TS } })
@@ -2225,21 +2378,41 @@ describe('test-only store timings', () => {
     expect(JSON.stringify(measured.events)).not.toContain(SECRET)
   })
 
-  test.each([
+  const MEASURED_ACCEPTS = [
     ['accept', 'accepted', (q: DeliveryQueue) => q.accept('alpha', slackInput())],
     ['acceptDecided', 'accepted', (q: DeliveryQueue) => q.acceptDecided('alpha', slackInput().key, () => ({ store: slackInput() }))],
     ['a Post Hold', 'post-hold', (q: DeliveryQueue) => { const input = heldAt(postHold(THREAD_TIME), THREAD_ROOTS.secondary); return q.acceptDecided('alpha', input.key, () => ({ store: input })) }],
     ['a Memory Hold', 'memory-hold', (q: DeliveryQueue) => { const input = heldAt(memoryHold(THREAD_TIME), THREAD_ROOTS.secondary); return q.acceptDecided('alpha', input.key, () => ({ store: input })) }],
-  ] as const)('%s: storeMs runs from its turn start, after the wait behind an earlier turn, through its append; atMonoMs is that append return', async (_, store, accept) => {
+  ] as const
+  test.each(MEASURED_ACCEPTS)('%s: storeMs runs from its turn start, after the wait behind an earlier turn, through its append; atMonoMs is that append return', async (_, store, accept) => {
     const rig = timedRig(), events: QueueEvent[] = [], q = await timedQueue(rig, events), start = rig.mono
     // The earlier turn holds the writer for WAIT inside its append; the measured turn's own append takes APPEND.
     rig.costs(WAIT, APPEND)
-    const [earlier, measured] = await Promise.all([q.accept('alpha', injectedInput()), accept(q)])
-    expect([earlier, measured]).toMatchObject([{ status: 'accepted', seq: 1 }, { status: 'accepted', seq: 2 }])
+    // Arriving while the earlier append is in flight, the measured acceptance cannot join it and waits behind it.
+    let measured: ReturnType<typeof accept> | undefined
+    const cost = rig.during!
+    rig.during = () => { measured ??= accept(q); cost() }
+    const earlier = await q.accept('alpha', injectedInput())
+    expect([earlier, await measured]).toMatchObject([{ status: 'accepted', seq: 1 }, { status: 'accepted', seq: 2 }])
     // So atMonoMs − storeMs, the measured turn's first reading, is when the earlier append returned.
     expect(events).toEqual([
       { type: 'stored', key: 'alpha', seq: 1, store: 'accepted', storeMs: WAIT, atMonoMs: start + WAIT },
       { type: 'stored', key: 'alpha', seq: 2, store, storeMs: APPEND, atMonoMs: start + WAIT + APPEND },
+    ])
+  })
+
+  test.each(MEASURED_ACCEPTS)("%s queued with an earlier acceptance shares its one append: each storeMs runs from its own staging through that append; atMonoMs is that append's return", async (_, store, accept) => {
+    const rig = timedRig(), events: QueueEvent[] = [], q = await timedQueue(rig, events), start = rig.mono
+    let appends = 0
+    rig.during = () => { appends++; rig.mono += APPEND }
+    // The earlier member's decision takes STAGE, so a batch-wide start would give the measured member STAGE+APPEND too.
+    const earlier = q.acceptDecided('alpha', later().key, () => { rig.mono += STAGE; return { store: later() } })
+    const [first, measured] = await Promise.all([earlier, accept(q)])
+    expect([first, measured]).toMatchObject([{ status: 'accepted', seq: 1 }, { status: 'accepted', seq: 2 }])
+    expect(appends).toBe(1)
+    expect(events).toEqual([
+      { type: 'stored', key: 'alpha', seq: 1, store: 'accepted', storeMs: STAGE + APPEND, atMonoMs: start + STAGE + APPEND },
+      { type: 'stored', key: 'alpha', seq: 2, store, storeMs: APPEND, atMonoMs: start + STAGE + APPEND },
     ])
   })
 

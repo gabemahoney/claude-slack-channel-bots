@@ -12,6 +12,10 @@ export const REPLY_REMINDER_KEEP_MS = 24 * 60 * 60 * 1000
 export const QUEUE_COMPACT_INTERVAL_MS = 60 * 60 * 1000
 export const QUEUE_DIRECTORY_MODE = 0o700
 export const QUEUE_FILE_MODE = 0o600
+/** Acceptances sharing one append and fsync. A runtime pause during a batch
+ * delays every member's store, so a small batch keeps one pause from moving
+ * a burst's store percentiles. */
+export const QUEUE_GROUP_COMMIT_MAX = 8
 export type DeliverySource = 'slack' | 'interject' | 'cron'
 export interface SlackKey { chat_id: string; ts: string; edited_ts?: string }
 export interface QueueFile { name: string; mimetype?: string; size?: number }
@@ -127,7 +131,14 @@ export interface DeliveryQueue {
   start(): Promise<void>
   accept: QueueAccept
   /** Decide after the durable key check in the persona's writer turn. Both
-   * callbacks must be synchronous: no I/O, network, log or shared-state write. */
+   * callbacks must be synchronous: no I/O, network, log or shared-state write.
+   * `decide` may run while the persona's earlier stores are staged in a group
+   * commit but not yet durable or published. It never reads an unfinished
+   * store's record (`unresolvedHolds` lists staged holds) or depends on that
+   * store's outcome. Anything it needs from an earlier store reaches it only
+   * as that store's applied `afterStore` effect, which runs after its group's
+   * fsync, in the same synchronous step that publishes its record, and before
+   * any later decision. */
   acceptDecided<T>(key: string, slackKey: SlackKey | undefined, decide: (facts: { keyChecked: boolean }) => QueueAcceptDecision<T>): Promise<QueueDecidedResult<T>>
   append(key: string, record: QueueRecord): Promise<void>
   /** Adopt pre-two-stage accepted work before its first queued Slack mutation. */
@@ -268,6 +279,19 @@ interface Journal extends AppendRollback {
   reminders: Map<number, ReplyReminderRecord>; items: Map<number, QueueItem>; slackKeys: Map<string, AcceptedRecord | QueueKeyRecord>; openCount: number
   holds: Map<number, UnresolvedHold>
 }
+type AcceptOutcome = { result: QueueDecidedResult<unknown> } | { error: unknown }
+/** One acceptance waiting in its persona's group. */
+interface AcceptMember {
+  /** The key its duplicate check reads. */
+  dedupeKey?: SlackKey
+  /** Runs in the group's turn: checks, decides and returns the input to store, or its final result. */
+  stage(): Promise<{ input: AcceptedInput; afterStore?: (stored: { seq: number }) => void } | { result: QueueDecidedResult<unknown> }>
+  /** Called once, in member order; must not throw. */
+  settle(outcome: AcceptOutcome): void
+}
+interface StagedAccept { record: AcceptedRecord; turnStarted: number | undefined; afterStore?: (stored: { seq: number }) => void }
+interface BatchEntry { member: AcceptMember; staged?: StagedAccept; outcome?: AcceptOutcome }
+interface StageCursor { nextSeq: number; lastInjected?: bigint }
 function emptyJournal(): Journal { return { records: [], nextSeq: 1, loaded: false, reminders: new Map(), items: new Map(), slackKeys: new Map(), holds: new Map(), openCount: 0 } }
 /** All file access is explicit; construction allocates only memory. */
 export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminderQueue {
@@ -280,7 +304,8 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   const journals = new Map<string, Journal>()
   const writers = new Map<string, Promise<unknown>>()
   const appendBlocked = new Set<string>()
-  const storingHolds = new Map<string, UnresolvedHold>()
+  const storingHolds = new Map<string, Map<number, UnresolvedHold>>()
+  const formingAccepts = new Map<string, AcceptMember[]>()
   const maintenanceQueued = new Set<string>()
   const startId = `${new Date(now()).toISOString().replace(/[:]/g, '-')}-${randomUUID()}`
   let started = false, stopped = false
@@ -298,6 +323,8 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     return j
   }
   function serial<T>(key: string, work: () => T | Promise<T>): Promise<T> {
+    // Later acceptances must not join a group queued ahead of this work.
+    formingAccepts.delete(key)
     const next = (writers.get(key) ?? Promise.resolve()).catch(() => {}).then(work)
     writers.set(key, next)
     return next
@@ -581,27 +608,95 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   function needsThreadJoinCopy(key: string, record: AcceptedRecord): boolean {
     return record.thread_join !== undefined && options.threadJoinSaved?.(key, record.channel!, record.thread_join) !== true
   }
-  /** Caller owns the loaded journal's serial turn, begun at `turnStarted`, and has checked duplicates.
-   * `afterStore` runs in the same synchronous step that publishes the durable record. */
-  async function storeAccepted(key: string, input: AcceptedInput, turnStarted: number | undefined,
-    afterStore?: (stored: { seq: number }) => void): Promise<{ status: 'accepted'; seq: number; item: QueueItem }> {
-    const j = journal(key), received_at = input.received_at ?? now()
+  // --- Group commit of acceptances
+  /** Joins the persona's forming group, or queues a new one. A group forms
+   * only while it is the last work queued for the persona, so acceptances
+   * never pass other writes. */
+  function enqueueAccept(key: string, member: AcceptMember): void {
+    let settled = false
+    const settle = member.settle
+    member.settle = outcome => { if (settled) return; settled = true; settle(outcome) }
+    const forming = formingAccepts.get(key)
+    if (forming) { forming.push(member); return }
+    const members = [member]
+    void serial(key, async () => {
+      if (formingAccepts.get(key) === members) formingAccepts.delete(key)
+      // An unexpected throw still answers every caller that has no result.
+      try { await storeGroup(key, members) } catch (error) { for (const m of members) m.settle({ error }) }
+    })
+    formingAccepts.set(key, members)
+  }
+  /** The group's serial turn: stages members in order and commits each batch
+   * with one append. A batch ends after a member with `afterStore`, so later
+   * decisions see its effect, and before a member whose key a staged record
+   * holds, so its duplicate check reads published state. */
+  async function storeGroup(key: string, members: readonly AcceptMember[]): Promise<void> {
+    let batch: BatchEntry[] = [], cursor: StageCursor | undefined
+    const stagedKeys = new Set<string>()
+    const flush = async () => { const entries = batch; batch = []; cursor = undefined; stagedKeys.clear(); await commitBatch(key, entries) }
+    for (const member of members) {
+      if (member.dedupeKey && stagedKeys.has(slackKeyString(member.dedupeKey))) await flush()
+      const turnStarted = turnStart()
+      let entry: BatchEntry
+      try {
+        const staged = await member.stage()
+        if ('result' in staged) entry = { member, outcome: staged }
+        else {
+          const j = journal(key)
+          cursor ??= { nextSeq: j.nextSeq, lastInjected: j.lastInjected }
+          const record = stageRecord(staged.input, cursor)
+          if (record.key) stagedKeys.add(slackKeyString(record.key))
+          if (record.hold) {
+            let storing = storingHolds.get(key)
+            if (!storing) storingHolds.set(key, storing = new Map())
+            storing.set(record.seq, unresolvedEntry(record.hold, record.hold.on, record.seq, record.channel!))
+          }
+          entry = { member, staged: { record, turnStarted, afterStore: staged.afterStore } }
+        }
+      } catch (error) { entry = { member, outcome: { error } } }
+      batch.push(entry)
+      if (entry.staged?.afterStore || batch.length >= QUEUE_GROUP_COMMIT_MAX) await flush()
+    }
+    await flush()
+  }
+  /** The next record in a batch; `cursor` carries the batch's unpublished sequence and injected watermark. */
+  function stageRecord(input: AcceptedInput, cursor: StageCursor): AcceptedRecord {
+    const received_at = input.received_at ?? now()
     const candidate = BigInt(Math.trunc(received_at * 1000))
-    const injected = j.lastInjected === undefined || candidate > j.lastInjected ? candidate : j.lastInjected + 1n
-    const record: AcceptedRecord = { ...input, v: 1, kind: 'accepted', seq: j.nextSeq, received_at, ts: input.source === 'slack' ? input.ts ?? input.key?.ts ?? '' : formatMicros(injected) }
+    const injected = cursor.lastInjected === undefined || candidate > cursor.lastInjected ? candidate : cursor.lastInjected + 1n
+    const record: AcceptedRecord = { ...input, v: 1, kind: 'accepted', seq: cursor.nextSeq, received_at, ts: input.source === 'slack' ? input.ts ?? input.key?.ts ?? '' : formatMicros(injected) }
     if (!isQueueRecord(record)) throw new Error('Invalid accepted record')
-    if (record.hold) storingHolds.set(key, unresolvedEntry(record.hold, record.hold.on, record.seq, record.channel!))
-    let timed: QueueStoreTiming | undefined
-    try {
-      await durableAppend(pathFor(key), Buffer.from(JSON.stringify(record) + '\n'), j)
-      timed = timing(turnStarted)
-      update(j, record)
-    } finally { storingHolds.delete(key) }
-    const store: QueueStoreKind = record.hold?.on === 'post' ? 'post-hold' : record.hold?.on === 'memory' ? 'memory-hold' : 'accepted'
-    event(timed ? { type: 'stored', key, seq: record.seq, store, ...timed } : { type: 'stored', key })
-    const item = structuredClone(j.items.get(record.seq)!)
-    try { afterStore?.({ seq: record.seq }) } catch { /* a saved acceptance cannot be undone by its observer */ }
-    return { status: 'accepted', seq: record.seq, item }
+    cursor.nextSeq = record.seq + 1
+    if (record.source !== 'slack') cursor.lastInjected = injected
+    return record
+  }
+  /** One durable append for the batch's records; each member is published and
+   * settled in order only after it, and every staged member fails with it.
+   * `afterStore` runs in the same synchronous step that publishes its record. */
+  async function commitBatch(key: string, entries: readonly BatchEntry[]): Promise<void> {
+    const records = entries.flatMap(e => e.staged ? [e.staged.record] : [])
+    let failure: { error: unknown } | undefined, atMonoMs: number | undefined
+    if (records.length) {
+      try {
+        await durableAppend(pathFor(key), Buffer.from(records.map(r => JSON.stringify(r) + '\n').join('')), journal(key))
+        if (measureTimings) atMonoMs = monotonicNow()
+      } catch (error) { failure = { error } }
+    }
+    const j = records.length ? journal(key) : undefined
+    if (j && !failure) for (const record of records) update(j, record)
+    const storing = storingHolds.get(key)
+    for (const record of records) storing?.delete(record.seq)
+    if (storing?.size === 0) storingHolds.delete(key)
+    for (const { member, staged, outcome } of entries) {
+      if (!staged) { member.settle(outcome!); continue }
+      if (failure) { member.settle(failure); continue }
+      const { record, turnStarted, afterStore } = staged
+      const store: QueueStoreKind = record.hold?.on === 'post' ? 'post-hold' : record.hold?.on === 'memory' ? 'memory-hold' : 'accepted'
+      event(turnStarted !== undefined && atMonoMs !== undefined ? { type: 'stored', key, seq: record.seq, store, storeMs: atMonoMs - turnStarted, atMonoMs } : { type: 'stored', key })
+      const item = structuredClone(j!.items.get(record.seq)!)
+      try { afterStore?.({ seq: record.seq }) } catch { /* a saved acceptance cannot be undone by its observer */ }
+      member.settle({ result: { status: 'accepted', seq: record.seq, item } })
+    }
   }
   function storeFailed(key: string, input: AcceptedInput | undefined, error: unknown): QueueAcceptResult {
     event({ type: 'store-failed', key, path: PERSONA_KEY_RE.test(key) ? pathFor(key) : undefined, source: input?.source, sender: input?.sender, user: input?.user, bot_id: input?.bot_id, channel: input?.channel, ts: input?.ts ?? input?.key?.ts, edited_ts: input?.edited_ts ?? input?.key?.edited_ts, slackKey: input?.key, error })
@@ -706,35 +801,40 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       try {
         if (!started || stopped) throw new Error('Queue is not accepting')
         input = structuredClone(input)
-        return await serial(key, async () => {
-          const turnStarted = turnStart()
-          await load(key)
-          if (input.source === 'slack' && input.key) { const existing = lookupSlackKey(key, input.key); if (existing) return existing }
-          return storeAccepted(key, input, turnStarted)
-        })
       } catch (error) { return storeFailed(key, input, error) }
+      const dedupeKey = input.source === 'slack' ? input.key : undefined
+      return new Promise<QueueAcceptResult>(resolve => enqueueAccept(key, {
+        dedupeKey,
+        async stage() {
+          await load(key)
+          if (dedupeKey) { const existing = lookupSlackKey(key, dedupeKey); if (existing) return { result: existing } }
+          return { input }
+        },
+        settle: outcome => resolve('error' in outcome ? storeFailed(key, input, outcome.error) : outcome.result as QueueAcceptResult),
+      }))
     },
-    async acceptDecided(key, slackKey, decide) {
+    async acceptDecided<T>(key: string, slackKey: SlackKey | undefined, decide: (facts: { keyChecked: boolean }) => QueueAcceptDecision<T>): Promise<QueueDecidedResult<T>> {
       let input: AcceptedInput | undefined
-      try {
-        slackKey = structuredClone(slackKey)
-        return await serial(key, async () => {
-          const turnStarted = turnStart()
+      try { slackKey = structuredClone(slackKey) } catch (error) { return storeFailed(key, input, error) }
+      return new Promise<QueueDecidedResult<T>>(resolve => enqueueAccept(key, {
+        dedupeKey: slackKey,
+        async stage() {
           let keyChecked = false, unavailable: unknown
           try {
             if (!started || stopped) throw new Error('Queue is not accepting')
             await load(key)
             const duplicate = slackKey ? lookupSlackKey(key, slackKey) : undefined
-            if (duplicate) return duplicate
+            if (duplicate) return { result: duplicate }
             keyChecked = true
           } catch (error) { unavailable = error }
           const decision = decide({ keyChecked })
-          if ('skip' in decision) return { status: 'skipped' as const, outcome: decision.skip }
+          if ('skip' in decision) return { result: { status: 'skipped' as const, outcome: decision.skip } }
           input = structuredClone(decision.store)
           if (!keyChecked) throw unavailable
-          return await storeAccepted(key, input, turnStarted, decision.afterStore)
-        })
-      } catch (error) { return storeFailed(key, input, error) }
+          return { input, afterStore: decision.afterStore }
+        },
+        settle: outcome => resolve('error' in outcome ? storeFailed(key, input, outcome.error) : outcome.result as QueueDecidedResult<T>),
+      }))
     },
     async append(key, record) {
       try {
@@ -799,8 +899,8 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     items: key => materialize(journal(key)).map(item => structuredClone(item)),
     openCount: key => journal(key).openCount,
     unresolvedHolds(key) {
-      const holds = new Map(journal(key).holds), storing = storingHolds.get(key)
-      if (storing) holds.set(storing.seq, storing)
+      const holds = new Map(journal(key).holds)
+      for (const [seq, storing] of storingHolds.get(key) ?? []) holds.set(seq, storing)
       return structuredClone([...holds.values()].sort((a, b) => a.seq - b.seq))
     },
     async resolveHolds(key, resolutions, current = () => true, onCommitted) {
