@@ -4850,26 +4850,40 @@ const acceptedQueueItems: Entry = {
 // These are observations, never store loads. Cap each regular file and the
 // number of inputs; a live append's incomplete final line is deferred. Errors
 // name evidence classes only, never include message bodies or file contents.
+// A labelled read's failure adds its label, failed stage, errno code, file
+// type, size and bytes read: never a path. It is still not retried.
 const SHARED_EVIDENCE_BYTES = 64 * 1024 * 1024
-function sharedEvidenceBytes(path: string): string {
+function sharedFileType(stat: import('node:fs').Stats): string {
+  return stat.isFile() ? 'file' : stat.isDirectory() ? 'directory' : stat.isFIFO() ? 'fifo' : stat.isSocket() ? 'socket'
+    : stat.isCharacterDevice() ? 'char' : stat.isBlockDevice() ? 'block' : stat.isSymbolicLink() ? 'symlink' : 'other'
+}
+function sharedEvidenceBytes(path: string, label?: string): string {
   let fd: number | undefined
+  let stage = 'open', type = 'unknown', size = 'unknown', read = 0
   try {
     fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW)
+    stage = 'stat'
     const stat = fstatSync(fd)
+    type = sharedFileType(stat); size = String(stat.size)
     if (!stat.isFile() || stat.size > SHARED_EVIDENCE_BYTES) throw new Error()
+    stage = 'read'
     const bytes = Buffer.alloc(stat.size)
-    let n = 0
-    while (n < bytes.length) {
-      const count = readSync(fd, bytes, n, bytes.length - n, n)
+    while (read < bytes.length) {
+      const count = readSync(fd, bytes, read, bytes.length - read, read)
       if (!count) throw new Error()
-      n += count
+      read += count
     }
     return bytes.toString('utf8')
-  } catch { throw new PrinterFailure('missing, unreadable, oversized or non-regular shared evidence', PRINTER_FAIL_EXIT) }
+  } catch (error) {
+    const code = (error as { code?: unknown } | undefined)?.code
+    const errno = typeof code === 'string' && /^E[A-Z0-9]{1,15}$/.test(code) ? code : 'none'
+    const facts = label ? ` (${label} stage=${stage} errno=${errno} type=${type} size=${size} read=${read})` : ''
+    throw new PrinterFailure('missing, unreadable, oversized or non-regular shared evidence' + facts, PRINTER_FAIL_EXIT)
+  }
   finally { if (fd !== undefined) closeSync(fd) }
 }
-function sharedLines(path: string): string[] {
-  const bytes = sharedEvidenceBytes(path)
+function sharedLines(path: string, label?: string): string[] {
+  const bytes = sharedEvidenceBytes(path, label)
   return bytes.slice(0, bytes.lastIndexOf('\n') + 1).split('\n').filter(Boolean)
 }
 function sharedJSON(path: string): any[] {
@@ -4956,9 +4970,9 @@ async function sharedQueueRecords(context: EntryContext, paths: readonly string[
   evidenceAssert(paths.length > 0 && paths.length <= 32, 'queue evidence needs 1–32 files')
   const parse = await packageFunction<typeof import('../../../src/delivery-queue.ts').parseQueueRecord>(context, 'delivery-queue.ts', 'parseQueueRecord')
   const slackKey = await packageFunction<typeof import('../../../src/delivery-queue.ts').slackKeyString>(context, 'delivery-queue.ts', 'slackKeyString')
-  const observations = paths.map(path => {
+  const observations = paths.map((path, i) => {
     const seen = new Set<number>()
-    return sharedLines(path).map(line => {
+    return sharedLines(path, `input=${i + 1} role=${i ? 'prior' : 'current'}`).map(line => {
       const row = parse(line)
       evidenceAssert(row, 'invalid complete queue evidence record')
       // The watermark is compaction bookkeeping, never immutable acceptance.

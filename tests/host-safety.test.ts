@@ -4413,10 +4413,11 @@ test('shared registered-hook controls bind the actual row and fail closed withou
     .replaceAll('console.log', 'auditContext.log').replaceAll('Date.now()', 'auditContext.now()').replaceAll('Bun.sleep(', 'auditContext.sleep(')
   declarations += '\nlet auditClient, auditContext; export function setAuditClient(client) { auditClient = client }; export function setAuditContext(context) { auditContext = context }; export { run };\n'
     + 'export function auditFailure() { return { step: failureStep, state: failureState } }\n'
+    + 'export function auditMetadata() { return failureMetadata() }\n'
   const path = join(scratch, 'controls.ts'); writeFileSync(path, declarations)
   copyFileSync(join(INTEGRATION_DIR, 'fixtures/stub-claude.sh'), join(scratch, 'stub-claude.sh'))
   const sentinel = /^SENTINEL="([^"\r\n]+)"$/m.exec(readFileSync(join(scratch, 'stub-claude.sh'), 'utf8'))![1]
-  const { run, setAuditClient, setAuditContext, auditFailure } = await import(path)
+  const { run, setAuditClient, setAuditContext, auditFailure, auditMetadata } = await import(path)
   setAuditContext(context)
   const { makePersonaConfigInput } = await import('./test-helpers/persona-config.ts')
   const { parsePersonaConfigBytes } = await import('../src/config.ts')
@@ -4686,6 +4687,148 @@ test('shared registered-hook controls bind the actual row and fail closed withou
       unlinkSync(modes); symlinkSync(transcript, modes)
       await expect(run()).rejects.toThrow()
       unlinkSync(modes); writeFileSync(modes, bytes)
+    })
+    // Test 29's receipt evidence: hook records only, with a planted record
+    // field the failure metadata must never carry.
+    const hookRecord = (command: string, at: string) => ({ command, event: command === 'receipt' ? 'Stop' : 'UserPromptSubmit',
+      instance_id: id, session_id: session, at, text: 'PRIVATE_RECORD_TEXT' })
+    const receiptFixture = () => {
+      reset()
+      const control = join(bin, `stub-claude-hooks.${session}`), record = control + '.jsonl'
+      const write = (...rows: object[]) => writeFileSync(record, rows.map(r => JSON.stringify(r)).join('\n') + (rows.length ? '\n' : ''))
+      context.argv = ['bun', 'declarations', bin, 'receipt', work, key]
+      return { control, write, started: clock.now(), done() { unlinkSync(control); writeFileSync(record, '') } }
+    }
+    const submitted = hookRecord('submitted', '1794059070.251198'), receipt = hookRecord('receipt', '1794059070.396240')
+    await check('receipt evidence written during the final AD read is read once more before failing', async () => {
+      const r = receiptFixture()
+      r.write(submitted)
+      change = () => { if (existsSync(r.control) && clock.now() - r.started === 19900) r.write(submitted, receipt) }
+      const logged = captured.length
+      await run()
+      expect(clock.now() - r.started).toBe(20000)
+      expect(readFileSync(r.control, 'utf8')).toBe('receipt\n')
+      expect(captured.slice(logged).map(args => JSON.parse(String(args[0])))).toEqual([{
+        instance_id: id, session_id: session, command: 'receipt', state: 'waiting' }])
+      r.done()
+    })
+    await check('a late submission leaves the receipt observation its own unchanged bound, with one release', async () => {
+      const r = receiptFixture()
+      r.write()
+      let appended: number | undefined
+      change = () => {
+        const elapsed = clock.now() - r.started
+        if (!existsSync(r.control)) { if (elapsed >= 19900) r.write(submitted); return }
+        appended ??= elapsed
+        if (elapsed >= appended + 500) r.write(submitted, receipt)
+      }
+      await run()
+      expect(appended).toBe(20000)
+      expect(clock.now() - r.started).toBe(20600)
+      expect(readFileSync(r.control, 'utf8')).toBe('receipt\n')
+      r.done()
+    })
+    await check('unobserved receipt evidence fails at its bound with counts and times only', async () => {
+      const r = receiptFixture()
+      r.write(submitted)
+      await assert.rejects(run(), /registered hook not observed/)
+      const end = r.started + 20000
+      expect(clock.now()).toBe(end)
+      expect(readFileSync(r.control, 'utf8')).toBe('receipt\n')
+      expect(auditFailure()).toEqual({ step: 'registered hook evidence', state: 'waiting' })
+      expect(auditMetadata()).toBe('shared-stub-permission: failure metadata command=receipt prior=0 bound=observation ' +
+        `deadline_ms=20000 submitted=1 receipt=0 records_read_at=${end} last_record_at=1794059070.251198 ` +
+        `elapsed_ms=20000 ad_read_at=${end} ad_state=waiting`)
+      r.done()
+      const late = receiptFixture()
+      late.write({ ...submitted, at: 'PRIVATE RECORD TIME' })
+      await assert.rejects(run())
+      expect(auditMetadata()).toContain(' last_record_at=invalid ')
+      expect(auditMetadata()).not.toContain('PRIVATE')
+      late.done()
+    })
+    // Test 46's notice recovery across a server start: the server's own resume
+    // of the ended row is observed, never repeated or fabricated.
+    const modesPath = join(bin, 'stub-claude-modes')
+    const startupResumed = async (start: string, options: { mode?: string; lastSeen?: string; next?: string; requests?: boolean } = {}) => {
+      reset()
+      const evidence = await invoke('notice-end')
+      writeFileSync(modesPath, readFileSync(modesPath, 'utf8') + (options.mode ?? 'at-once') + '\t' + work + '\n')
+      row.state = start; row.last_seen_at = options.lastSeen ?? 'startup-resume-hook'
+      if (options.requests) row.permission_requests = [{ request_token: 'PRIVATE_REQUEST_TOKEN' }]
+      gets = 0; calls = []
+      change = () => { if (options.next && gets === 3) { row.state = options.next; row.last_seen_at = 'startup-resume-hook' } }
+      return evidence
+    }
+    const phases = (evidence: string) => readFileSync(evidence, 'utf8').trim().split('\n').map(l => JSON.parse(l).phase)
+    for (const [start, next] of [['waiting'], ['pending', 'waiting'], ['working', 'waiting']] as const) {
+      await check(`resume accepts the server start's same-session ${start} launch without resuming it again`, async () => {
+        const evidence = await startupResumed(start, { next, lastSeen: start === 'pending' ? 'recorded-hook' : undefined })
+        const logged = captured.length
+        await invoke('notice-resume', evidence)
+        expect(calls.filter(c => c !== 'get')).toEqual(['close'])
+        expect(phases(evidence)).toEqual(['end-requested', 'ended', 'resumed'])
+        expect(JSON.parse(readFileSync(evidence, 'utf8').trim().split('\n').at(-1)!)).toMatchObject({ state: 'waiting', session_id: session })
+        expect(captured.slice(logged).map(args => JSON.parse(String(args[0])))).toEqual([{
+          instance_id: id, session_id: session, key, work, state: 'waiting' }])
+        await assert.rejects(invoke('notice-resume', evidence))
+        expect(calls).not.toContain('resume')
+      })
+    }
+    const lifecycleErrors: [string, string, Parameters<typeof startupResumed>[1], string][] = [
+      ['displayed-state controls still selected', 'waiting', { mode: 'displayed-states' }, 'startup-resume-mode'],
+      ['waiting with the ended last-seen', 'waiting', { lastSeen: 'recorded-hook' }, 'startup-resume-state'],
+      ['check_permission', 'check_permission', {}, 'startup-resume-state'],
+      ['ask_user', 'ask_user', {}, 'startup-resume-state'],
+      ['missing', 'missing', {}, 'startup-resume-state'],
+      ['an open permission request', 'waiting', { requests: true }, 'clean-requests'],
+      ['a launch that ends again', 'pending', { next: 'ended' }, 'transition-state'],
+      ['a launch that never reaches waiting', 'pending', {}, 'transition-timeout'],
+    ]
+    for (const [label, start, options, failed] of lifecycleErrors) {
+      await check(`resume still fails after a server start on ${label}`, async () => {
+        const evidence = await startupResumed(start, options)
+        const started = clock.now()
+        await assert.rejects(invoke('notice-resume', evidence))
+        expect(clock.now() - started).toBe(failed === 'transition-timeout' ? 20000 : 0)
+        expect(calls.filter(c => c !== 'get')).toEqual(['close'])
+        expect(phases(evidence)).toEqual(['end-requested', 'ended'])
+        expect(auditFailure().step).toBe('notice control')
+        expect(auditMetadata()).toBe(`shared-stub-permission: failure metadata command=notice-resume key=${key} ` +
+          `check=${failed} ad_state=${auditFailure().state}`)
+        expect(auditMetadata()).not.toContain('PRIVATE')
+      })
+    }
+    // The fake clock moves only in sleeps: a state first visible at 20000 ms
+    // landed during the final sleep, after the last in-bound read at 19900 ms.
+    const transitions: [string, string, () => Promise<string | undefined>, string[]][] = [
+      ['end', 'ended', async () => { reset(); stays = true; return undefined }, ['send', 'close']],
+      ['own resume', 'waiting', async () => { reset(); const evidence = await invoke('notice-end'); stays = true; calls = []; return evidence }, ['resume', 'close']],
+      ['server-start resume', 'waiting', () => startupResumed('pending', { lastSeen: 'recorded-hook' }), ['close']],
+    ]
+    for (const [label, wanted, arrange, actions] of transitions) {
+      await check(`a ${label} transition during the final sleep is observed at the unchanged deadline`, async () => {
+        const evidence = await arrange()
+        const started = clock.now()
+        change = () => { if (clock.now() - started >= 20000) { row.state = wanted; row.last_seen_at = 'transition-hook' } }
+        const logged = captured.length
+        const saved = await invoke(label === 'end' ? 'notice-end' : 'notice-resume', evidence)
+        expect(clock.now() - started).toBe(20000)
+        expect(calls.filter(c => c !== 'get')).toEqual(actions)
+        expect(phases(saved).at(-1)).toBe(label === 'end' ? 'ended' : 'resumed')
+        expect(captured.slice(logged).map(args => JSON.parse(String(args[0])))).toEqual([{
+          instance_id: id, session_id: session, key, work, state: wanted }])
+      })
+    }
+    await check('notice-ended stays strict after a server start resumed the row', async () => {
+      const evidence = await startupResumed('waiting')
+      await assert.rejects(invoke('notice-ended', evidence))
+      expect(auditMetadata()).toBe(`shared-stub-permission: failure metadata command=notice-ended key=${key} check=ended-state ad_state=waiting`)
+    })
+    await check('a refused own resume names its call and the ended row', async () => {
+      reset(); const evidence = await invoke('notice-end'); resumeError = true
+      await assert.rejects(invoke('notice-resume', evidence))
+      expect(auditMetadata()).toBe(`shared-stub-permission: failure metadata command=notice-resume key=${key} check=resume-call ad_state=ended`)
     })
     assertNoLeak({ captured, checks })
   } finally {

@@ -17,7 +17,10 @@
  * All control paths, including the stub's hook TMPDIR, are fenced to scratch.
  * HOME and AD's real image store stay unchanged. No pane or store writes.
  * 30 s process deadline; 5 s AD calls; metadata-only stdout, redacted failure
- * naming only a fixed step label and the last bound row's state.
+ * naming only a fixed step label and the last bound row's state, then one
+ * metadata line of fixed labels, command, key, counts and times.
+ * notice-resume also accepts the same-session row a server start already
+ * resumed, without resuming it again.
  */
 import { existsSync, realpathSync, lstatSync, readFileSync, openSync, closeSync, fstatSync, readSync, writeSync, constants } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
@@ -30,9 +33,22 @@ if (!existsSync('/etc/cscb-ci-image')) {
 // The redacted failure line's fixed step label and last bound AD row state.
 let failureStep = 'prerequisites'
 let failureState: string | undefined
+// Observer-only failure metadata: fixed labels, validated commands and keys,
+// counts and times. Never pane text, message contents or tokens.
+let failureFacts: Record<string, string | number> = {}
 
 function requireFact(value: unknown): asserts value {
   if (!value) throw new Error('shared stub prerequisite or binding failed')
+}
+function noticeFact(check: string, value: unknown): asserts value {
+  failureFacts.check = check
+  requireFact(value)
+}
+function failureMetadata(): string | undefined {
+  if (!Object.keys(failureFacts).length) return undefined
+  const fields = Object.entries({ ...failureFacts, ad_state: failureState ?? 'unknown' })
+  return 'shared-stub-permission: failure metadata ' + fields.map(([name, value]) => `${name}=${typeof value === 'number'
+    ? (Number.isFinite(value) ? value : 'invalid') : /^[a-z0-9_.:-]{1,64}$/.test(value) ? value : 'invalid'}`).join(' ')
 }
 function scratchPath(root: string, path: string, directory = false): string {
   requireFact(resolve(path).startsWith(root + sep))
@@ -76,47 +92,74 @@ function writeNoticeEvidence(path: string, value: object, exclusive = false): vo
 type NoticeClient = Pick<import('agent-director').Client, 'get' | 'sendKeys' | 'resume'>
 async function noticeControl(client: NoticeClient, command: string, id: string, key: string, work: string,
   evidence: string, modes: string, stubText: string, bound: (row: Awaited<ReturnType<NoticeClient['get']>>) => void) {
-  const read = async () => { const row = await client.get({ instance_id: id }); bound(row); return row }
+  const read = async () => {
+    failureFacts.check = 'ad-read'
+    const row = await client.get({ instance_id: id }); bound(row); return row
+  }
   const first = await read()
-  const clean = (row: typeof first) => requireFact(row.permission_requests.length === 0 && row.unproven_requests.length === 0)
+  const clean = (row: typeof first) => noticeFact('clean-requests', row.permission_requests.length === 0 && row.unproven_requests.length === 0)
   const identity = { instance_id: id, session_id: first.session_id, key, work }
   const save = (phase: string, row: typeof first, exclusive = false) =>
     writeNoticeEvidence(evidence, { ...identity, phase, state: row.state, last_seen_at: row.last_seen_at }, exclusive)
+  let startupResumed = false
   if (command === 'notice-end') {
-    requireFact(first.state === 'waiting'); clean(first)
-    requireFact(!existsSync(evidence))
+    noticeFact('end-waiting', first.state === 'waiting'); clean(first)
+    noticeFact('evidence-absent', !existsSync(evidence))
     // Take the literal from the verified fixture, not a second sentinel spelling.
     const sentinel = /^SENTINEL="([^"\r\n]+)"$/m.exec(stubText)?.[1]
-    requireFact(sentinel)
+    noticeFact('sentinel', sentinel)
     const fresh = await read()
-    requireFact(fresh.state === 'waiting'); clean(fresh)
+    noticeFact('end-fresh-waiting', fresh.state === 'waiting'); clean(fresh)
     save('end-requested', fresh, true)
+    failureFacts.check = 'send-keys'
     await client.sendKeys({ instance_id: id, text: sentinel })
   } else {
+    failureFacts.check = 'journal-read'
     const journal = boundedText(evidence)
-    requireFact(journal.endsWith('\n'))
+    noticeFact('journal-shape', journal.endsWith('\n'))
     const events = journal.trim().split('\n').map(line => JSON.parse(line))
-    requireFact(events.length === 2 && events[0].phase === 'end-requested' && events[1].phase === 'ended')
-    requireFact(events[0].state === 'waiting' && events[1].state === 'ended' &&
-      events[1].last_seen_at === first.last_seen_at)
-    requireFact(events.every(event => event.instance_id === id && event.session_id === first.session_id &&
+    noticeFact('journal-shape', events.length === 2 && events[0].phase === 'end-requested' && events[1].phase === 'ended')
+    noticeFact('journal-states', events[0].state === 'waiting' && events[1].state === 'ended')
+    noticeFact('journal-identity', events.every(event => event.instance_id === id && event.session_id === first.session_id &&
       event.key === key && event.work === work))
-    requireFact(first.state === 'ended'); clean(first)
-    if (command === 'notice-ended') { console.log(JSON.stringify({ ...identity, state: first.state })); return }
-    requireFact(command === 'notice-resume')
-    // Displayed-state commands start reading at zero on resume. Keep their
-    // evidence intact, but select ordinary receipts so no permission replays.
-    appendControl(modes, 'at-once\t' + work + '\n')
-    const fresh = await read()
-    requireFact(fresh.state === 'ended' && fresh.last_seen_at === first.last_seen_at); clean(fresh)
-    save('resume-requested', fresh)
-    // AD owns the launch and refuses any still-held/conflicting session. Any
-    // error (including an uncertain create) fails without automatic retry.
-    await client.resume({ instance_id: id })
+    const stillEnded = first.state === 'ended' && events[1].last_seen_at === first.last_seen_at
+    if (command === 'notice-ended') {
+      noticeFact('ended-state', stillEnded); clean(first)
+      console.log(JSON.stringify({ ...identity, state: first.state })); return
+    }
+    noticeFact('notice-command', command === 'notice-resume')
+    if (first.state === 'ended') {
+      noticeFact('ended-state', stillEnded); clean(first)
+      // Displayed-state commands start reading at zero on resume. Keep their
+      // evidence intact, but select ordinary receipts so no permission replays.
+      appendControl(modes, 'at-once\t' + work + '\n')
+      const fresh = await read()
+      noticeFact('resume-fresh-ended', fresh.state === 'ended' && fresh.last_seen_at === first.last_seen_at); clean(fresh)
+      save('resume-requested', fresh)
+      // AD owns the launch and refuses any still-held/conflicting session. Any
+      // error (including an uncertain create) fails without automatic retry.
+      failureFacts.check = 'resume-call'
+      await client.resume({ instance_id: id })
+    } else {
+      // A server start resumes an ended row itself, in the same conversation
+      // (bound above). Observe that launch to waiting; never resume it again.
+      // Its stub must already run ordinary receipts, or controls would replay.
+      startupResumed = true
+      const selected = boundedText(modes).split('\n').filter(line => line.split('\t')[1] === work).at(-1)
+      noticeFact('startup-resume-mode', selected === 'at-once\t' + work)
+      noticeFact('startup-resume-state', first.state === 'pending' ||
+        (['working', 'waiting'].includes(first.state) && first.last_seen_at !== events[1].last_seen_at))
+      clean(first)
+    }
   }
   const wanted = command === 'notice-end' ? 'ended' : 'waiting'
+  const passing = command === 'notice-end' ? ['waiting'] : startupResumed ? ['pending', 'working'] : ['ended', 'pending']
+  // One last read at the deadline, so a transition during the final sleep is
+  // seen rather than reported as unobserved.
   const deadline = Date.now() + 20000
+  let last: boolean
   do {
+    last = Date.now() >= deadline
     const row = await read()
     if (row.state === wanted) {
       clean(row)
@@ -124,14 +167,16 @@ async function noticeControl(client: NoticeClient, command: string, id: string, 
       console.log(JSON.stringify({ ...identity, state: row.state }))
       return
     }
-    requireFact(command === 'notice-end' ? row.state === 'waiting' : ['ended', 'pending'].includes(row.state))
-    await Bun.sleep(100)
-  } while (Date.now() < deadline)
+    noticeFact('transition-state', passing.includes(row.state))
+    if (!last) await Bun.sleep(100)
+  } while (!last)
+  failureFacts.check = 'transition-timeout'
   throw new Error('notice worker transition not observed')
 }
 async function run() {
   failureStep = 'prerequisites'
   failureState = undefined
+  failureFacts = {}
   const [binArg, command, workArg, key, token] = process.argv.slice(2)
   requireFact(binArg && workArg && ['setup', 'permission-1', 'permission-2', 'receipt', 'outcome',
     'complete-1', 'complete-2', 'notice-setup', 'notice-end', 'notice-ended', 'notice-resume'].includes(command))
@@ -204,6 +249,7 @@ async function run() {
       const expected = join(process.env.HOME!, '.claude', 'projects', work.replace(/[/._]/g, '-'), session + '.jsonl')
       requireFact(realpathSync(first.jsonl_path) === realpathSync(expected))
       failureStep = 'notice control'
+      failureFacts = { command, key }
       await noticeControl(client, command, id, key, work, token!, modes, stubText, row => {
         bind(row)
         requireFact(row.jsonl_path === first.jsonl_path)
@@ -232,17 +278,28 @@ async function run() {
     const commands = boundedText(control, true).split('\n').filter(Boolean)
     if (command !== 'receipt') requireFact(!commands.includes(command))
     const records = () => boundedText(record, true).split('\n').filter(Boolean).map(line => JSON.parse(line))
+    // Each read keeps only record counts, its time and the last record's time.
+    const observe = () => {
+      const all = records(), at = all.at(-1)?.at
+      Object.assign(failureFacts, { submitted: all.filter(r => r.command === 'submitted').length,
+        receipt: all.filter(r => r.command === 'receipt').length, records_read_at: Date.now(),
+        last_record_at: at === undefined ? 'absent' : typeof at === 'string' && /^\d{1,12}(\.\d{1,9})?$/.test(at) ? at : 'invalid' })
+      return all
+    }
     const prior = records().filter(r => r.command === command).length
-    const deadline = Date.now() + 20000
+    failureFacts = { command, prior, bound: 'submission', deadline_ms: 20000 }
+    const waitStarted = Date.now(), deadline = waitStarted + 20000
     if (command === 'receipt') {
       // A durable queue ACK can precede typing. Wait for this stub's recorded
       // submission, never a pane. A previously queued, unobserved release is
       // not retried: it might still execute.
       requireFact(commands.filter(c => c === 'receipt').length === prior)
       failureStep = 'receipt: no submitted record'
-      while (records().filter(r => r.command === 'submitted').length <= prior) {
+      while (observe().filter(r => r.command === 'submitted').length <= prior) {
+        failureFacts.elapsed_ms = Date.now() - waitStarted
         requireFact(Date.now() < deadline)
         bind(await client.get({ instance_id: id }))
+        failureFacts.ad_read_at = Date.now()
         await Bun.sleep(100)
       }
     }
@@ -262,10 +319,18 @@ async function run() {
     bind(await client.get({ instance_id: id }))
     appendControl(control, command + '\n')
     failureStep = 'registered hook evidence'
+    // The appended control's evidence has its own bound, not what the
+    // submission wait left. One last pass after it expires reads the records
+    // again, so one written during the final AD read or sleep is not missed.
+    const started = Date.now(), observeBy = started + 20000
+    Object.assign(failureFacts, { bound: 'observation', elapsed_ms: 0 })
+    let last: boolean
     do {
-      const events = records().filter(r => r.command === command)
+      last = Date.now() >= observeBy
+      const events = observe().filter(r => r.command === command)
       requireFact(events.length <= prior + 1)
       const row = bind(await client.get({ instance_id: id }))
+      Object.assign(failureFacts, { ad_read_at: Date.now(), elapsed_ms: Date.now() - started })
       if (events.length === prior + 1) {
         requireFact(events.at(-1).instance_id === id && events.at(-1).session_id === session)
         if (command === 'receipt') {
@@ -289,17 +354,22 @@ async function run() {
           requireFact(requests.length === 0)
         }
       }
-      await Bun.sleep(100)
-    } while (Date.now() < deadline)
+      if (!last) await Bun.sleep(100)
+    } while (!last)
     throw new Error('registered hook not observed')
   } finally { await client.close() }
 }
 
-const watchdog = setTimeout(() => { console.error(`FAIL: shared-stub-permission: overall deadline (step=${failureStep} state=${failureState ?? 'unknown'})`); process.exit(1) }, 30000)
+const watchdog = setTimeout(() => {
+  console.error(`FAIL: shared-stub-permission: overall deadline (step=${failureStep} state=${failureState ?? 'unknown'})`)
+  const metadata = failureMetadata(); if (metadata) console.error(metadata)
+  process.exit(1)
+}, 30000)
 try { await run() }
 catch {
   // Fixed labels and a validated row state only: never a raw client error.
   console.error(`FAIL: shared-stub-permission: prerequisites, session binding or registered hook evidence failed (step=${failureStep} state=${failureState ?? 'unknown'})`)
+  const metadata = failureMetadata(); if (metadata) console.error(metadata)
   process.exitCode = 1
 }
 finally { clearTimeout(watchdog) }

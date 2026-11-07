@@ -1954,6 +1954,74 @@ test('shared receipt archives, saved joins, accounting and recorded buttons need
   } finally { await q.stop() }
 }))
 
+test('a failed queue evidence read names only its input, role, stage, errno, type and sizes, never an empty queue', () => sharedPrinterControl(async ({ scratch, printer: { entryValue: print } }) => {
+  const dir = mkdtempSync(join(scratch, 'PRIVATE_PATH-'))
+  const current = join(dir, 'current.jsonl'), missing = join(dir, 'missing.jsonl'), linked = join(dir, 'linked.jsonl')
+  const directory = join(dir, 'directory'), oversized = join(dir, 'oversized.jsonl'), fifo = join(dir, 'fifo')
+  writeFileSync(current, '')
+  symlinkSync(current, linked); mkdirSync(directory)
+  writeFileSync(oversized, '{"text":"PRIVATE_CONTENT"}\n'); truncateSync(oversized, 64 * 1024 * 1024 + 1)
+  const cases: [string[], string][] = [
+    [[missing], 'input=1 role=current stage=open errno=ENOENT type=unknown size=unknown read=0'],
+    [[current, current, missing], 'input=3 role=prior stage=open errno=ENOENT type=unknown size=unknown read=0'],
+    [[linked], 'input=1 role=current stage=open errno=ELOOP type=unknown size=unknown read=0'],
+    [[directory], `input=1 role=current stage=stat errno=none type=directory size=${statSync(directory).size} read=0`],
+    [[current, oversized], `input=2 role=prior stage=stat errno=none type=file size=${64 * 1024 * 1024 + 1} read=0`],
+  ]
+  if (mkfifoAvailable()) {
+    makeFifo(fifo)
+    cases.push([[current, fifo], 'input=2 role=prior stage=stat errno=none type=fifo size=0 read=0'])
+  }
+  for (const [args, facts] of cases) {
+    await assert.rejects(print('sharedQueueSnapshot', args), (error: any) => {
+      assert.equal(error.exitCode, 1)
+      assert.equal(error.message, `missing, unreadable, oversized or non-regular shared evidence (${facts})`)
+      return true
+    })
+  }
+  assert.equal(await print('sharedQueueSnapshot', [current]), '\n')
+}))
+
+test('a short or failed queue evidence read names its stage, errno and partial count, closes once and never reopens', () => sharedPrinterControl(async ({ scratch, body, evidence }) => {
+  const dir = mkdtempSync(join(scratch, 'PRIVATE_PATH-'))
+  const current = join(dir, 'current.jsonl'), target = join(dir, 'target.jsonl')
+  writeFileSync(current, ''); writeFileSync(target, '{"text":"PRIVATE_CONTENT"}\n')
+  const size = statSync(target).size
+  // Only the target's descriptor is altered: its first read returns 5 real
+  // bytes, the next one ends early or throws an error carrying private text.
+  const imports = 'openSync, closeSync, fstatSync, readSync,'
+  assert(body.includes(imports))
+  const injected = join(scratch, 'failed-read.ts')
+  writeFileSync(injected, body.replace(imports, 'openSync as realOpenSync, closeSync as realCloseSync, fstatSync, readSync as realReadSync,') + `
+    let target, mode, fd, opens = 0, reads = 0, closes = 0;
+    const openSync = (path, ...rest) => { const opened = realOpenSync(path, ...rest); if (path === target) { opens++; fd = opened } return opened };
+    const readSync = (descriptor, buffer, offset, length, position) => {
+      if (descriptor !== fd) return realReadSync(descriptor, buffer, offset, length, position);
+      if (++reads === 1) return realReadSync(descriptor, buffer, offset, Math.min(length, 5), position);
+      if (mode === 'short') return 0;
+      throw Object.assign(new Error('PRIVATE_CONTENT ' + target), { code: mode === 'thrown' ? 'EIO' : 'EIO PRIVATE_CONTENT' });
+    };
+    const closeSync = descriptor => { if (descriptor === fd) closes++; return realCloseSync(descriptor) };
+    export function inject(path, kind) { target = path; mode = kind; fd = undefined; opens = reads = closes = 0 }
+    export { entryValue }; export const counts = () => ({ opens, reads, closes });
+  `)
+  const mod = evidence.wrap(await import(injected))
+  const cases: [string, string[], string][] = [
+    ['short', [target], `input=1 role=current stage=read errno=none type=file size=${size} read=5`],
+    ['thrown', [current, target], `input=2 role=prior stage=read errno=EIO type=file size=${size} read=5`],
+    ['unsafe code', [target], `input=1 role=current stage=read errno=none type=file size=${size} read=5`],
+  ]
+  for (const [kind, args, facts] of cases) {
+    mod.inject(target, kind)
+    await assert.rejects(mod.entryValue('sharedQueueSnapshot', args), (error: any) => {
+      assert.equal(error.exitCode, 1)
+      assert.equal(error.message, `missing, unreadable, oversized or non-regular shared evidence (${facts})`)
+      return true
+    })
+    assert.deepEqual(evidence.value(mod.counts()), { opens: 1, reads: 2, closes: 1 })
+  }
+}))
+
 describe("test-47's refused starts and test-40's earlier release", () => {
   const exitCode = (code: number) => (err: unknown) => (err as { exitCode?: unknown }).exitCode === code
 
