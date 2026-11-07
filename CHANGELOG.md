@@ -6,6 +6,10 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+---
+
+## 0.18.7 (2026-11-07)
+
 - **Bots are told to skip terminal text nobody reads.** The tag description in `bot-system-prompt.md` and the MCP instructions now tell a bot to end each turn with no terminal text, or the shortest possible, unless a terminal reader needs it. Slack answers still go through `reply`. A running bot gets the new wording when it next restarts; with `fresh_system_prompt` off, a resumed bot keeps the old tag description until it starts a new conversation.
 - **No false "transcript can't be read" notice after an old session's transcript is removed.** When a transcript from a persona's earlier session had been deleted, CSCB treated the whole transcript as unreadable and posted a *Delivery stuck* notice saying it kept offering the message, though each message was delivered once. A removed earlier-session transcript is now ignored; one that exists but can't be read still raises the notice. See [Delivery stuck](skills/debug-slack-channel-bots/SKILL.md#delivery-stuck).
 
