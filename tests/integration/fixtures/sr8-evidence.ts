@@ -315,8 +315,8 @@
  *     stub_session_result. Submit AFTER a burst push, capture slack_post_mark just
  *     before submission and after result. Preserve preexisting order, require new
  *     outcomes in requested order and exact equality after reopening. The submission
- *     submission AND result marks must precede a burst ACK. Lines: ordered-writes(overlap,retained,ordered;
- *     durable-order), ordered-write-ack(max_ms; N1). Missing evidence is missing;
+ *     submission AND result marks must precede a burst ACK. Lines: ordered-writes(overlap,retained,ordered,
+ *     first/last_push_seq,first/last_ack_seq,submit_seq,result_seq; durable-order), ordered-write-ack(max_ms; N1). Missing evidence is missing;
  *     reordered/lost writes, refused results or lack of overlap fails. Script also
  *     compares each result's text to the existing printer's attempt-result text;
  *     that is exact content checking, not a second numeric/timing oracle.
@@ -352,10 +352,14 @@
  *     all (invalid_auth breaks P's connection). For name-only lookup use none.
  *     Writes fault-plan.json and copied payloads.jsonl to a fresh out. Optional held
  *     batch participates too. Prints planned/dependent counts and P's number.
- *   fault-burst C <out> <stub-url> <stub-record> <state-dir> <measurement-file> <byte-mark> <wait-ms>
+ *   fault-burst C <out> <stub-url> <stub-record> <state-dir> <measurement-file> <byte-mark> <wait-ms> [<tail-release>]
  *     Submit held probes first, admit the independent probes as above; then concurrent
  *     P/Q roots, wait ONLY expected independent ACKs, then concurrent P/Q replies and
  *     drops (including replies to withheld roots). Never await a dependent ACK.
+ *     Open mode only (strict refuses it as usage): with tail-release, Q's last
+ *     SR8_FAULT_TAIL_ITEMS independent replies wait (within wait-ms) until that
+ *     file exists; the script creates it after the ordered writes' result mark,
+ *     so Q's burst ACKs overlap both marks. Strict submits its second wave at once.
  *     Appends each original HTTP result to fault-ledger.jsonl by planned ordinal:
  *     envelope_id, or denied-case no-open-socket/send-failed refusal with NO invented
  *     envelope. Unrecognized refusals/timeouts fail and retain the attempted item.
@@ -848,12 +852,15 @@ export function membershipFaultVerdicts(kind: string, page: string, key: string,
   if (kind === 'hang') {
     if (!positive(attemptMs)) faultMissing = true
     const used = new Set<ScanDiagnostic>()
+    // A request on an idle scan republishes its status without deadline_at
+    // (src/channel-membership-scan.ts request()); only an expiry carries one.
+    const expiries = matches.filter(d => Number.isFinite(d.deadline))
     for (const [i, f] of faults.entries()) {
       // Only one staged hung page per attempt. Bind each diagnostic to that
       // request's arrival interval, and require its own abort settlement by ID.
       // D and A are container wall times, never process-relative monotonic times.
       const a = f.arrival_epoch_ms, next = faults[i + 1]?.arrival_epoch_ms ?? Infinity
-      const ds = matches.filter(d => d.at >= a && d.at < next)
+      const ds = expiries.filter(d => d.at >= a && d.at < next)
       const ss = stub?.filter(r => r.event === 'fault-settled' && r.request_id === f.request_id) ?? []
       if (!nonnegative(a) || ds.length !== 1 || used.has(ds[0]) || ss.length !== 1) { faultMissing = true; continue }
       const d = ds[0], settlement = Date.parse(ss[0].ts)
@@ -865,7 +872,7 @@ export function membershipFaultVerdicts(kind: string, page: string, key: string,
       deadlineBad ||= elapsed - requestMs > SR8_DISPATCH_ALLOWANCE_MS || d.at > d.deadline || a < attemptStart
         || ss[0].resolution !== 'abort'
     }
-    if (used.size !== matches.length) faultMissing = true
+    if (used.size !== expiries.length) faultMissing = true
     missing ||= faultMissing
   }
   const stats = { case: kind, page, fired: faults.length, incomplete: matches.length,
@@ -1027,7 +1034,14 @@ export function orderedWriteVerdicts(before: any[] | undefined, after: any[] | u
     (r.startedOrder > after[i - 1].startedOrder && r.resolvedOrder > after[i - 1].resolvedOrder))) === true
   const retained = isDeepStrictEqual(before, after?.slice(0, before?.length)) && isDeepStrictEqual(after, reopened)
   const choices = added.every((r, i) => r.channel === expected?.[i]?.channel && r.delivery === expected?.[i]?.delivery)
-  return [result('ordered-writes', added.length, { overlap: overlap ? 'yes' : 'no', retained: retained ? 'yes' : 'no', ordered: order ? 'yes' : 'no' }, 'durable-order',
+  const seq = (rows: any[], pick: (s: number[]) => number) => {
+    const s = rows.map(r => r.seq).filter(integer)
+    return s.length ? pick(s) : 'missing'
+  }
+  const observed = { first_push_seq: seq(pushes, s => Math.min(...s)), last_push_seq: seq(pushes, s => Math.max(...s)),
+    first_ack_seq: seq(acks, s => Math.min(...s)), last_ack_seq: seq(acks, s => Math.max(...s)),
+    submit_seq: integer(submitMark) ? submitMark : 'missing', result_seq: integer(resultMark) ? resultMark : 'missing' }
+  return [result('ordered-writes', added.length, { overlap: overlap ? 'yes' : 'no', retained: retained ? 'yes' : 'no', ordered: order ? 'yes' : 'no', ...observed }, 'durable-order',
     missing ? 'missing' : !overlap || !order || !retained || !choices || results!.some(r => r.isError !== false || r.error !== undefined) ? 'fail' : 'pass'),
     ackVerdict('ordered-write-ack', ids, times)]
 }
@@ -1117,8 +1131,18 @@ const faultOutcomes: Record<string, string> = { hang: 'hang', transient: 'error'
 const depends = (plan: FaultPlan, item: BurstItem) => item.key === plan.key && (plan.all || plan.channels.includes(item.channel))
 
 /** Expected withholding never prevents the second wave, including its replies. */
+/** Q's last independent replies, sent only after the ordered writes' result
+ * mark so Q's burst ACKs continue past it. The burst's total size is unchanged. */
+export const SR8_FAULT_TAIL_ITEMS = 8
+export function faultTail(plan: FaultPlan): FaultItem[] {
+  return plan.items.filter(i => i.phase === 'replies' && i.key !== plan.key && !i.dependent).slice(-SR8_FAULT_TAIL_ITEMS)
+}
+/** Open mode only: strict keeps its whole second wave concurrent. */
+export function faultTailOption(mode: Context['mode'], plan: FaultPlan, released: () => Promise<boolean>) {
+  return mode === 'open' ? { items: faultTail(plan), released } : undefined
+}
 export async function faultWaves(items: FaultItem[], send: (item: FaultItem) => Promise<void>, wait: (items: FaultItem[]) => Promise<boolean>,
-  admitHeld: (items: FaultItem[]) => Promise<boolean>): Promise<boolean> {
+  admitHeld: (items: FaultItem[]) => Promise<boolean>, tail?: { items: FaultItem[]; released: () => Promise<boolean> }): Promise<boolean> {
   const held = items.filter(i => i.phase === 'held')
   await Promise.all(held.map(send))
   if (held.length && (!await wait(held.filter(i => !i.dependent)) || !await admitHeld(held.filter(i => !i.dependent)))) return false
@@ -1126,8 +1150,11 @@ export async function faultWaves(items: FaultItem[], send: (item: FaultItem) => 
   await Promise.all(roots.map(send))
   if (!await wait(roots.filter(i => !i.dependent))) return false
   const rest = items.filter(i => !['roots', 'held'].includes(i.phase))
-  await Promise.all(rest.map(send))
-  return wait(rest.filter(i => !i.dependent))
+  const late = new Set(tail?.items.map(i => i.ordinal))
+  await Promise.all(rest.filter(i => !late.has(i.ordinal)).map(send))
+  const released = !tail || await tail.released()
+  await Promise.all(rest.filter(i => late.has(i.ordinal)).map(send))
+  return await wait(rest.filter(i => !i.dependent)) && released
 }
 
 export function postHoldOverlapVerdicts(rows: Measurement[] | undefined, holds: Accepted[], ordinary: (Accepted & { envelope_id?: string })[], times: Times[] | undefined): Result[] {
@@ -1576,8 +1603,8 @@ async function faultPlan(c: Context, args: string[]): Promise<number> {
   return 0
 }
 async function faultBurst(c: Context, args: string[]): Promise<number> {
-  countArgs(args, 7)
-  const [dir, url, stubFile, stateDir, measurement, mark, rawWait] = args, waitMs = numeric(rawWait), plan = await readFaultPlan(dir, c)
+  countArgs(args, 7, c.mode === 'open' ? 8 : 7)
+  const [dir, url, stubFile, stateDir, measurement, mark, rawWait, release] = args, waitMs = numeric(rawWait), plan = await readFaultPlan(dir, c)
   if (!/^http:\/\/(127\.0\.0\.1|\[::1\]):\d+$/.test(url) || !positive(waitMs) || !integer(numeric(mark))) throw new Error('usage')
   const payloads = jsonl(join(dir, 'payloads.jsonl'))
   if (payloads?.length !== plan.items.length || payloads.some((b, n) => {
@@ -1636,8 +1663,17 @@ async function faultBurst(c: Context, args: string[]): Promise<number> {
     }
     return false
   }
+  const released = async () => {
+    const until = performance.now() + waitMs
+    while (performance.now() < until) {
+      if (existsSync(release!)) return true
+      await new Promise(r => setTimeout(r, 20))
+    }
+    return false
+  }
   try {
-    const good = await faultWaves(plan.items, send, wait, held => holdAdmission(held, stateDir, measurement, numeric(mark), waitMs, dir))
+    const good = await faultWaves(plan.items, send, wait, held => holdAdmission(held, stateDir, measurement, numeric(mark), waitMs, dir),
+      release === undefined ? undefined : faultTailOption(c.mode, plan, released))
     return good && !failed ? 0 : 1
   } finally {
     clearInterval(timer)

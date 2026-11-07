@@ -17,7 +17,7 @@ import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVer
   SR8_PENDING_POST_MS, SR8_LARGE_BYTES, SR8_SHARED_CHANNELS, pendingPostVerdicts, sharedListVerdicts,
   scanDiagnostics, membershipFaultVerdicts, membershipFaultRows, cpuThrottle, cpuConditionFields, membershipRepairVerdict, membershipLateVerdict, zeroAckVerdict,
   accountingVerdicts, personaStoreVerdicts, lookupFaultVerdicts, orderedWriteVerdicts, membershipWriteVerdicts,
-  faultLoadVerdicts, faultWaves, postHoldOverlapVerdicts, concurrentOverlapVerdicts, envelopeTimings, type FaultPlan, type FaultPush, type FaultLoadEvidence,
+  faultLoadVerdicts, faultWaves, faultTail, faultTailOption, postHoldOverlapVerdicts, concurrentOverlapVerdicts, envelopeTimings, type FaultPlan, type FaultPush, type FaultLoadEvidence,
   type SharedListEvidence, type PendingProbe, type AccountedEvent, type LookupProbe,
   burstAckVerdicts, pendingBurstVerdict, type BurstItem, type PendingWindow,
 } from './integration/fixtures/sr8-evidence.ts'
@@ -810,6 +810,19 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       output(f.run(), elapsed > allowed ? 1 : 0)
     }
   })
+  test('membership hang correlates expiries only: idle-request republications pass, an expiry without deadline_at is missing', () => {
+    const f = member('hang')
+    const republished = (i: number) => {
+      const at = clock + i * (MEMBERSHIP_REQUEST_TIMEOUT_MS + f.wait) + MEMBERSHIP_REQUEST_TIMEOUT_MS
+      return `[${iso(at + 1)}] ${membershipScanDiagnostic(key, { state: 'incomplete', pages: 0, positives: 0, problem: 'deadline',
+        deadline: undefined, nextAttemptAt: at + f.wait })}`
+    }
+    const [first, second] = f.log.split('\n')
+    f.log = [first, republished(0), second, republished(1)].join('\n')
+    expect(f.run().map(r => r.verdict)).toEqual(['pass', 'pass']); output(f.run(), 0)
+    f.log = f.log.replace(/ deadline_at=\d+/, '')
+    expect(f.run()[0].verdict).toBe('missing'); output(f.run(), 1)
+  })
   test('membership hang lines print signed excess and allowance; other cases and absent durations do not invent one', () => {
     const lines = (results: Result[]) => { const logs: string[] = []; printResults(c, results, l => logs.push(l)); return logs }
     const hang = lines(member('hang').run())
@@ -979,6 +992,13 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       run() { return orderedWriteVerdicts(this.before, this.after, this.reopened, this.expected, this.results, this.stub, this.submit, this.done, this.times) } }
   }
   test('overlapping ordered writes preserve prior and reopened durable order', () => output(writes().run(), 0))
+  test('ordered writes print Q\'s first/last burst push and ACK seq beside both marks', () => {
+    const f = writes(); f.stub.push({ event: 'push', seq: 3, envelope_id: 'tail' }, { event: 'ws-message', seq: 6, envelope_id: 'tail' })
+    expect(f.run()[0].stats).toEqual({ overlap: 'yes', retained: 'yes', ordered: 'yes', first_push_seq: 1, last_push_seq: 3,
+      first_ack_seq: 6, last_ack_seq: 8, submit_seq: 2, result_seq: 4 })
+    f.stub = []
+    expect(f.run()[0].stats).toMatchObject({ first_push_seq: 'missing', last_ack_seq: 'missing', submit_seq: 2, result_seq: 4 })
+  })
   test.each(['order', 'choice', 'reopen', 'overlap', 'result', 'ack', 'missing'] as const)('ordered writes reject %s', defect => {
     const f = writes()
     if (defect === 'order') { f.after[2].startedOrder = 2; f.reopened = structuredClone(f.after) }
@@ -1862,6 +1882,39 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
     expect(calls.filter(s => s.startsWith('send:replies:'))).toHaveLength(4)
     expect(calls.findIndex(s => s.startsWith('wait:replies'))).toBeGreaterThan(Math.max(...calls.map((s, i) => s.startsWith('send:replies:') ? i : -1)))
   })
+  test.each([true, false])('fault waves hold Q\'s tail until released (released=%p), keeping the whole burst', async released => {
+    const plan = composed().plan, tail = faultTail(plan), calls: string[] = [], sent = new Set<number>()
+    expect(tail.length).toBeGreaterThan(0)
+    expect(tail.every(i => i.phase === 'replies' && i.key !== plan.key && !i.dependent)).toBe(true)
+    const late = new Set(tail.map(i => i.ordinal))
+    const good = await faultWaves(plan.items, async i => { sent.add(i.ordinal); calls.push(late.has(i.ordinal) ? 'tail' : 'send') },
+      async () => { calls.push('wait'); return true }, async () => true,
+      { items: tail, released: async () => { calls.push('release'); return released } })
+    expect(good).toBe(released); expect(sent.size).toBe(plan.items.length)
+    expect(calls.lastIndexOf('send')).toBeLessThan(calls.indexOf('release'))
+    expect(calls.indexOf('tail')).toBeGreaterThan(calls.indexOf('release'))
+    expect(calls.filter(s => s === 'tail')).toHaveLength(tail.length)
+  })
+  test.each(['strict', 'open'] as const)('%s fault waves with a non-tail send held: only open withholds Q\'s tail', async mode => {
+    const plan = composed().plan, tail = new Set(faultTail(plan).map(i => i.ordinal))
+    const second = plan.items.filter(i => !['roots', 'held'].includes(i.phase)), stuck = second.find(i => !tail.has(i.ordinal))!
+    const submitted = new Set<number>()
+    let resolve!: () => void, reached!: () => void
+    const pending = new Promise<void>(r => { resolve = r }), started = new Promise<void>(r => { reached = r })
+    const option = faultTailOption(mode, plan, async () => true)
+    const done = faultWaves(plan.items, i => {
+      submitted.add(i.ordinal)
+      if (i.ordinal !== stuck.ordinal) return Promise.resolve()
+      reached(); return pending
+    }, async () => true, async () => true, option)
+    await started; await new Promise(r => setTimeout(r, 0))
+    const before = second.filter(i => submitted.has(i.ordinal)).length
+    if (mode === 'strict') expect(before).toBe(second.length)
+    else expect(before).toBe(second.length - tail.size)
+    resolve()
+    expect(await done).toBe(true); expect(submitted.size).toBe(plan.items.length)
+    expect(option === undefined).toBe(mode === 'strict')
+  })
   test.each(['during', 'before', 'after', 'slow-ack', 'missing-admission', 'missing-resolution'] as const)('Post Hold overlap %s', where => {
     const hold = { key: 'alpha', seq: 1 }, ordinary = [{ key: 'alpha', seq: 2, envelope_id: 'ordinary' }]
     const rows: Measurement[] = [{ v: 1, kind: 'store', store: 'post-hold', ...hold, at_mono_ms: 100 },
@@ -2230,6 +2283,7 @@ globalThis.fetch = async (_url, init) => {
     expect(cli('fault-plan', [batch, join(root, 'plan.tsv'), 'hang', '1', '1', out]).status).toBe(0)
     const declared = JSON.parse(readFileSync(join(out, 'fault-plan.json'), 'utf8')).plan
     expect(declared.items.map((i: any) => i.dependent)).toEqual(e.plan.items.map(i => i.dependent))
+    expect(cli('fault-burst', [out, 'http://127.0.0.1:1', join(root, 'stub'), state, join(root, 'measurements'), '0', '100', join(root, 'tail-release')]).status).toBe(64)
     expect(cli('fault-burst', [out, 'http://127.0.0.1:1', join(root, 'stub'), state, join(root, 'measurements'), '0', '100']).status).toBe(0)
     const ledger = readFileSync(join(out, 'fault-ledger.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
     expect(ledger).toHaveLength(e.plan.items.length)

@@ -868,6 +868,10 @@ for channel in "${EXTERNAL}" "${ABSENT}"; do
     bot_refused "${FA}" "${channel}" "f-no-evidence-${channel}"
     choice_is "${FA}" "${channel}" all || fail 'transferred preference lost without evidence'
 done
+# A live join forces a rescan whose complete inventory is the authority, so
+# each joined channel is staged in the stub inventory before its join event.
+alpha_page+=("${ABSENT}")
+inventory "${FA}" "${alpha_page[@]}"
 ack "$(slack_push_member_joined "${LABEL[${FA}]}" "${ABSENT}" "$(scenario_ts)")"
 wait_until "${EVENT_WAIT_S}" 'live join changed the chosen value' choice_is "${FA}" "${ABSENT}" all
 selected "${FA}" "${ABSENT}" receive_all "$(scenario_text absent-now-joined)"
@@ -880,6 +884,7 @@ review f-to-strict
 for key in "${FA}" "${FB}"; do mode_is "${key}" strict || fail 'strict switch not applied'; done
 bot_refused "${FA}" C0TEST002 f-strict-bot-write
 request_assignment f-strict-operator "${FA}/C0TEST002/thread_hybrid"
+inventory "${FB}" C0TEST001
 ack "$(slack_push_member_joined "${LABEL[${FB}]}" C0TEST001 "$(scenario_ts)")"
 wait_until "${EVENT_WAIT_S}" 'strict join of the mismatched identity channel is not off' choice_is "${FB}" C0TEST001 off
 set_input_mode open
@@ -972,6 +977,7 @@ inventory "${ZA}"
 start "${ZA}"
 same_facts "${ZA}" '{}' 'empty inventory invented a choice'
 FRESH="$(scenario_id C fresh-join)"
+inventory "${ZA}" "${FRESH}"
 ack "$(slack_push_member_joined "${LABEL[${ZA}]}" "${FRESH}" "$(scenario_ts)")"
 wait_until "${EVENT_WAIT_S}" 'fresh join did not use the strict default' choice_is "${ZA}" "${FRESH}" off
 check_destinations z-empty-inventory

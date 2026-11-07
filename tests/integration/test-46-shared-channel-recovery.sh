@@ -189,10 +189,19 @@ delivered_original() {
       ($original|length)==1 and any($rows[]; .kind=="delivered" and .seq==$original[0].seq)
     ' "${SNAP[${who}]}" > /dev/null
 }
+# The controlled-error seam hands a builder the string CONTROLLED_ERROR. A
+# builder that describes its error renders that as `string message="..."`,
+# while the real fault is an Error (`Error code=... message="..."`), so the
+# whole rendering is the variable part. Verbatim failure texts keep the token.
+controlled_marker() {
+    if [[ "$1" == *'string message="CONTROLLED_ERROR"'* ]]; then printf '%s' 'string message="CONTROLLED_ERROR"'
+    else printf '%s' CONTROLLED_ERROR; fi
+}
 report_post() {
-    local who="$1" mark="$2" artifact="$3" entry="$4" expected post prefix suffix; shift 4
+    local who="$1" mark="$2" artifact="$3" entry="$4" expected post prefix suffix marker; shift 4
     expected="$(printed formatPersonaNotice "${NAME[${who}]}" "${entry}" "$@")"
-    prefix="${expected%CONTROLLED_ERROR*}"; suffix="${expected#*CONTROLLED_ERROR}"
+    marker="$(controlled_marker "${expected}")"
+    prefix="${expected%"${marker}"*}"; suffix="${expected#*"${marker}"}"
     if [[ "${expected}" == *CONTROLLED_ERROR* ]]; then
         post="$(slack_wait_successful_post "${LABEL[${who}]}" "${NOTICE}" "${mark}" "${prefix}" "${suffix}")"
     else
@@ -1734,7 +1743,8 @@ set_choice p "${NOTICE}" thread_hybrid notice-loss-hybrid
 drain p
 channels="$(shared_persona_facts "${KEY[p]}" | jq -r '[.assignments|to_entries[]|select(.value.delivery=="thread_hybrid")|.key]|sort|join(",")')"
 notice_line="$(printed buildThreadMemoryNotSavedLine "${KEY[p]}" "${channels}" "${memory_path}" journal-append CONTROLLED_ERROR true)"
-notice_match="$(matcher "${notice_line%CONTROLLED_ERROR*}" "${notice_line#*CONTROLLED_ERROR}")"
+marker="$(controlled_marker "${notice_line}")"
+notice_match="$(matcher "${notice_line%"${marker}"*}" "${notice_line#*"${marker}"}")"
 before="$(count_log "${notice_match}")"
 mark="$(slack_post_mark)"
 shared_stub_notice end "${WORK[p]}" "${KEY[p]}" "${EVIDENCE}/notice-loss-ended.json" > /dev/null

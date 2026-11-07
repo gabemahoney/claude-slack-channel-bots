@@ -254,6 +254,8 @@ with open(source) as rows, open(out,'w') as target:
 PY
 }
 
+# Open mode's fault-burst holds Q's last replies until the release file exists;
+# created after WRITE_RESULT, Q's burst ACKs continue past both write marks.
 ordered_writes() {
     local delivery attempt args id result expected
     if [[ "${MODE}" == strict ]]; then membership_writes; return; fi
@@ -273,6 +275,7 @@ ordered_writes() {
         printf '%s\t%s\n' "${WRITE_CHANNEL}" "${delivery}" >> "${WRITES}/expected.tsv"
     done
     WRITE_RESULT="$(slack_post_mark)"
+    : > "${OUT}/tail-release"
     read_jsonl "${WRITES}/after.jsonl" shared_attempt_order "${Q}"
 }
 
@@ -562,8 +565,11 @@ PY
             bun "${E}" burst "${C[@]}" "${BATCH}" "${SCENARIO_SLACK_STUB_URL}" "${SCENARIO_SLACK_RECORD}" \
                 "${SLACK_STATE_DIR}" "${OUT}" "${WAIT_MS}" "${MEASUREMENTS}" "${MEASURE_MARK}" &
         else
+            # Strict keeps its whole second wave concurrent: no tail release.
+            TAIL_RELEASE=()
+            if [[ "${MODE}" == open ]]; then TAIL_RELEASE=("${OUT}/tail-release"); fi
             bun "${E}" fault-burst "${C[@]}" "${OUT}" "${SCENARIO_SLACK_STUB_URL}" "${SCENARIO_SLACK_RECORD}" \
-                "${SLACK_STATE_DIR}" "${MEASUREMENTS}" "${MEASURE_MARK}" "${WAIT_MS}" &
+                "${SLACK_STATE_DIR}" "${MEASUREMENTS}" "${MEASURE_MARK}" "${WAIT_MS}" ${TAIL_RELEASE[@]+"${TAIL_RELEASE[@]}"} &
         fi
         BURST_PID=$!
         track_pid "${BURST_PID}"

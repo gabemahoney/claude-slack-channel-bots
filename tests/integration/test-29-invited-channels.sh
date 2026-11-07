@@ -753,6 +753,10 @@ edit_input() {
     jq "$@" "${CONFIG}" > "${CONFIG}.candidate"
     mv -- "${CONFIG}.candidate" "${CONFIG}"
 }
+# Confirming an input with no effective change logs reload-noop, never
+# reload-applied (src/reload-plan.ts noEffectiveChange), so callers review
+# a destination edit only when the input differs.
+input_has() { jq -e "$@" "${CONFIG}" > /dev/null; }
 input_choice() {
     edit_input --arg who "$1" --arg c "$2" --arg d "$3" \
         '(.personas[] | select(.name==$who) | .channels) |= (map(select(.id!=$c)) + [{id:$c,delivery:$d}])'
@@ -1147,8 +1151,10 @@ permission_post() {
     thread_persona "${q}"; dir="${THREAD_DIR}"; key="${THREAD_KEY}"
     if [[ "${q}" == alpha ]]; then name="${ALPHA}"; else name="${BRAVO}"; fi
     set_composed_choice "${mode}" "${q}" "${DEST}" "${value}" "${mode}-prompt-${number}-${value}"
-    edit_input --arg who "${name}" --arg dest "${DEST}" '(.personas[]|select(.name==$who)|.permission_prompts)=$dest'
-    review_assign "${mode}-prompt-destination-${number}"
+    if ! input_has --arg who "${name}" --arg dest "${DEST}" '.personas[]|select(.name==$who)|.permission_prompts==$dest'; then
+        edit_input --arg who "${name}" --arg dest "${DEST}" '(.personas[]|select(.name==$who)|.permission_prompts)=$dest'
+        review_assign "${mode}-prompt-destination-${number}"
+    fi
     wait_queue_drained "${dir}"
     mark="$(slack_post_mark)"
     request="$(shared_stub_permission "permission-${number}" "${dir}" "${key}")"
@@ -1235,9 +1241,12 @@ notice_phase() {
     thread_persona "${q}"; dir="${THREAD_DIR}"; key="${THREAD_KEY}"
     if [[ "${q}" == alpha ]]; then name="${ALPHA}"; input="${A2}"; else name="${BRAVO}"; input="${B1}"; fi
     set_composed_choice "${mode}" "${q}" "${DEST}" "${value}" "${phase}-own-value"
-    edit_input --arg who "${name}" --arg c "${DEST}" --arg contact "${CONTACT}" \
-        '(.personas[]|select(.name==$who)) |= (.permission_prompts=$c | .dm={enabled:true,contact:$contact})'
-    review_assign "${phase}-destination"
+    if ! input_has --arg who "${name}" --arg c "${DEST}" --arg contact "${CONTACT}" \
+        '.personas[]|select(.name==$who)|.permission_prompts==$c and .dm=={enabled:true,contact:$contact}'; then
+        edit_input --arg who "${name}" --arg c "${DEST}" --arg contact "${CONTACT}" \
+            '(.personas[]|select(.name==$who)) |= (.permission_prompts=$c | .dm={enabled:true,contact:$contact})'
+        review_assign "${phase}-destination"
+    fi
     wait_queue_drained "${ALPHA_DIR}"; wait_queue_drained "${BRAVO_DIR}"
     evidence="${SCENARIO_ROOT}/${phase}-worker.jsonl"; mark="$(slack_post_mark)"
     connected="$(count_log "$(session_connected "${THREAD_REF}")")"
