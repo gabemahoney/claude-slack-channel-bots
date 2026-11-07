@@ -2622,11 +2622,14 @@ globalThis.fetch = async (_url, init) => {
     const burst = (out: string) => cli('burst', [batch, 'http://127.0.0.1:1', join(root, 'stub'), join(root, 'state'), out, '1000'])
     expect(burst(join(root, 'plain')).status).toBe(0)
     expect(existsSync(join(root, 'phase-cpu.jsonl'))).toBe(false)
+    expect(readdirSync(join(root, 'profile'))).toEqual([])
     writeFileSync(join(root, 'cpu-on'), 'server=101,stub=202\n')
     const out = join(root, 'e')
     expect(burst(out).status).toBe(0)
     const cpu: PhaseCpuSample[] = readFileSync(join(root, 'phase-cpu.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
     expect(cpu.map(s => s.phase)).toEqual(['roots', 'replies-drops', 'end'])
+    // The CPU profile's wave marks come at the same points, only under SR8_PROFILE_DIR.
+    expect(readFileSync(join(root, 'profile/waves'), 'utf8')).toBe('roots\nreplies-drops\nend\n')
     expect(cpu.every((s, i) => i === 0 || s.mono_ms >= cpu[i - 1]!.mono_ms)).toBe(true)
     for (const s of cpu) expect({ cgroup: s.cgroup, procs: s.procs }).toEqual({
       cgroup: { usage_usec: 5000, user_usec: 3000, system_usec: 2000, nr_periods: 10, nr_throttled: 2, throttled_usec: 300 },
@@ -2663,7 +2666,8 @@ globalThis.fetch = async (_url, init) => {
   }, `
 // Synthetic transport only in this copied CLI; the opt-in is set only when the test asks.
 { const base = resolve(import.meta.dir, '../../..');
-  if (existsSync(join(base, 'cpu-on'))) { process.env.SR8_PHASE_CPU_FILE = join(base, 'phase-cpu.jsonl'); process.env.SR8_PHASE_CPU_PIDS = readFileSync(join(base, 'cpu-on'), 'utf8').trim() } }
+  mkdirSync(join(base, 'profile'), { recursive: true });
+  if (existsSync(join(base, 'cpu-on'))) { process.env.SR8_PHASE_CPU_FILE = join(base, 'phase-cpu.jsonl'); process.env.SR8_PHASE_CPU_PIDS = readFileSync(join(base, 'cpu-on'), 'utf8').trim(); process.env.SR8_PROFILE_DIR = join(base, 'profile') } }
 let seq = 0;
 globalThis.fetch = async (_url, init) => {
   const base = resolve(import.meta.dir, '../../..'), b = JSON.parse(init.body), id = b.label + '-' + b.event.ts;

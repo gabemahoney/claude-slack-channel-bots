@@ -55,6 +55,31 @@ if [[ "${CASE}" == burst ]]; then
     config_args+=(timings)
 fi
 bun "${SR8}" config "${config_args[@]}" | write_config
+# Test-only CPU profile of the measured server over the burst waves: only
+# this burst case opts in. The profile stays in scenario scratch; only its
+# content-free summary reaches this log, once: right after the profile stops,
+# or from the cleanup hook when the script ends before that. No profile step
+# changes this script's status.
+PROFILER="${SCENARIO_FIXTURES}/cpu-profile.ts"
+PROFILE_DIR=""
+PROFILE_SUMMARIZED=0
+profile_stop() {
+    [[ -n "${PROFILE_DIR}" ]] || return 0
+    bun "${PROFILER}" stop "${PROFILE_DIR}" 30 || printf 'recorded: cpu-profile stop unavailable\n'
+}
+profile_summary() {
+    [[ -n "${PROFILE_DIR}" && "${PROFILE_SUMMARIZED}" == 0 ]] || return 0
+    PROFILE_SUMMARIZED=1
+    bun "${PROFILER}" summary "${PROFILE_DIR}" "${CONTEXT[@]}" || printf 'recorded: cpu-profile summary unavailable\n'
+}
+if [[ "${CASE}" == burst ]]; then
+    if mkdir -p "${EVIDENCE}/cpu-profile" 2> /dev/null; then
+        PROFILE_DIR="${EVIDENCE}/cpu-profile"
+        on_before_cleanup profile_summary
+    else
+        printf 'recorded: cpu-profile unavailable reason=profile-directory\n'
+    fi
+fi
 OVERRIDES_LINE="$(printed buildTestTimerOverridesLine "queue_compact_interval_ms=${compact_ms}")"
 OVERRIDES_STEM="$(overrides_stem "${OVERRIDES_LINE}")" || exit 1
 MEASUREMENTS="${SLACK_STATE_DIR}/$(printed TEST_MEASUREMENTS_FILE_NAME)"
@@ -107,7 +132,11 @@ start_ready() {
     completion_before="$(count_log "${completion}")"
     measurements_before="$(count_log "${measurements_started}")"
     if [[ "${1:-}" == measured ]]; then start_ms="$(mono_ms)"; fi
-    start_server --live
+    if [[ "${1:-}" == measured && -n "${PROFILE_DIR}" ]]; then
+        BUN_OPTIONS="--preload ${SCENARIO_FIXTURES}/cpu-profile-preload.ts" CSCB_TEST_CPU_PROFILE_DIR="${PROFILE_DIR}" start_server --live
+    else
+        start_server --live
+    fi
     # Every restart must publish its own observations; old log lines do not
     # establish this start's readiness or recorder activation.
     wait_for_count "${completion}" "$((completion_before + 1))" 150 'silent persona startup incomplete'
@@ -245,9 +274,13 @@ case "${CASE}" in
         burst_status=0
         # Observer-only CPU readings at each wave boundary, for observe below.
         SR8_PHASE_CPU_FILE="${RESULTS}/phase-cpu.jsonl" SR8_PHASE_CPU_PIDS="server=${SERVER_PID},stub=${SLACK_PID}" \
-            bun "${SR8}" burst "${CONTEXT[@]}" "${BATCH}" "${SCENARIO_SLACK_STUB_URL}" \
+            SR8_PROFILE_DIR="${PROFILE_DIR}" bun "${SR8}" burst "${CONTEXT[@]}" "${BATCH}" "${SCENARIO_SLACK_STUB_URL}" \
             "${SCENARIO_SLACK_RECORD}" "${SLACK_STATE_DIR}" "${RESULTS}" 30000 \
             "${MEASUREMENTS}" "${measurement_mark}" || burst_status=$?
+        # The profile ends with the waves, before the observation wait below,
+        # and its summary prints at once, so a later failing step keeps it.
+        profile_stop
+        profile_summary
         # Observe zero as well as positive ACKs; check judges the exact set.
         jq -er '.envelope_id // error("burst push has no envelope")' "${RESULTS}/burst.jsonl" > "${RESULTS}/envelopes"
         _scenario_complete_jsonl "${SCENARIO_SLACK_RECORD}" > "${RESULTS}/final-stub.jsonl"

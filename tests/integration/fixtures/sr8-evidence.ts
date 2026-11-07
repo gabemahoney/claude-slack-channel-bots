@@ -53,6 +53,9 @@
  *     Writes burst.jsonl (key/phase/channel/ts/sender/envelope_id, no text) and
  *     compactions.jsonl. Labels MUST equal population persona keys. Bounded wait;
  *     failure still retains submitted identities. HTTP responses are not ACK evidence.
+ *     With SR8_PROFILE_DIR set (test-44's burst case only), each wave's name is
+ *     appended to <dir>/waves at its start and `end` after the last, as the
+ *     phase-cpu readings are taken, for cpu-profile.ts's per-wave profile parts.
  *     Compaction proof: two existing dev:ino identities, both observed after the first
  *     push and before the final ACK. The observer reads the stub record AFTER stat too;
  *     a replacement first seen after completion cannot pass. Creation is not compaction.
@@ -1924,7 +1927,10 @@ async function burst(c: Context, args: string[]): Promise<number> {
   }
   let failed = false
   const cpuFile = process.env.SR8_PHASE_CPU_FILE, cpuPids = phasePids(process.env.SR8_PHASE_CPU_PIDS, process.pid)
+  // test-44's opt-in CPU profile cuts one part per wave at these marks (cpu-profile.ts).
+  const profileDir = process.env.SR8_PROFILE_DIR
   const phaseCpu = (phase: string) => {
+    if (profileDir) try { appendFileSync(join(profileDir, 'waves'), `${phase}\n`, { mode: 0o600 }) } catch { /* never changes the burst */ }
     if (!cpuFile) return
     try {
       const sample = phaseCpuSample(phase, performance.now(), cgroupCpuStat(), cpuPids.map(([name, pid]) => [name, textFile(`/proc/${pid}/stat`)]))
