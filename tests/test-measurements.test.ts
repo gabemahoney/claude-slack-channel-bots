@@ -5,11 +5,14 @@ import { appendFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { QueueEvent } from '../src/delivery-queue.ts'
+import type { DurableAppendTiming } from '../src/durable-journal.ts'
+import type { AckTiming } from '../src/persona-routing.ts'
 import type { PostHoldEvent } from '../src/post-holds.ts'
 import {
   TEST_MEASUREMENTS_FILE_NAME, TEST_MEASUREMENTS_FLUSH_MS, TEST_MEASUREMENTS_STOP_WAIT_MS,
   buildTestMeasurementsStartLine, buildTestMeasurementsWriteFailedLine, buildTestMeasurementsStopIncompleteLine,
   createTestMeasurements, postHoldEventMeasurement, queueEventMeasurement, serializeTestMeasurement,
+  ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement,
   type StoreMeasurement, type TestMeasurement, type TestMeasurementRecord, type TestMeasurementsDeps,
 } from '../src/test-measurements.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
@@ -78,9 +81,9 @@ function harness(overrides: Partial<TestMeasurementsDeps> = {}) {
 }
 
 describe('test-only measurement records (Decision 25)', () => {
-  test('the schema has exactly three kinds; the filename, flush delay and loud line are exported', () => {
-    const kinds: Record<TestMeasurement['kind'], true> = { store: true, 'resolution-store': true, 'post-hold-resolved': true }
-    expect(Object.keys(kinds)).toEqual(['store', 'resolution-store', 'post-hold-resolved'])
+  test('the schema has exactly six kinds; the filename, flush delay and loud line are exported', () => {
+    const kinds: Record<TestMeasurement['kind'], true> = { store: true, 'resolution-store': true, 'post-hold-resolved': true, ack: true, append: true, 'thread-save': true }
+    expect(Object.keys(kinds)).toEqual(['store', 'resolution-store', 'post-hold-resolved', 'ack', 'append', 'thread-save'])
     expect(TEST_MEASUREMENTS_FILE_NAME).toBe('test-measurements.jsonl')
     expect(TEST_MEASUREMENTS_FLUSH_MS).toBe(250)
     expect(TEST_MEASUREMENTS_STOP_WAIT_MS).toBe(1_000)
@@ -131,6 +134,70 @@ describe('test-only measurement records (Decision 25)', () => {
     if (entry.kind === 'post-hold-resolved' && entry.cause === 'restart') expect(line).not.toContain('held_ms')
     assertNoLeak({ calls: h.calls, logs: h.logs, written: h.written })
     await h.recorder.stop()
+  })
+
+  const stateDir = join(tmpdir(), 'cscb state')
+  const appendTiming = (journalDir: string, file: string): DurableAppendTiming => ({
+    dir: join(stateDir, journalDir), path: join(stateDir, journalDir, file), records: 3, bytes: 412,
+    appendMs: 9.5, fileFsyncMs: 6.25, dirFsyncMs: 2.5, fsyncs: 2, atMonoMs: 140.5,
+  })
+  const ackTiming: AckTiming = { keys: ['reader', 'writer'], ts: '1730000000.000100', targets: [{ key: 'reader', seq: 7 }, { key: 'writer', seq: 2 }],
+    outcome: 'acked', receiveToAckMs: 812.5, ackCallMs: 0.75, atMonoMs: 130.25 }
+  const sourceRows: Array<{ name: string; entry: TestMeasurement; mapped: () => TestMeasurement | undefined }> = [
+    { name: 'ack', mapped: () => ackTimingMeasurement(ackTiming),
+      entry: { kind: 'ack', keys: ['reader', 'writer'], ts: '1730000000.000100', targets: [{ key: 'reader', seq: 7 }, { key: 'writer', seq: 2 }],
+        outcome: 'acked', receive_to_ack_ms: 812.5, ack_call_ms: 0.75, at_mono_ms: 130.25 } },
+    { name: 'suppressed ack', mapped: () => ackTimingMeasurement({ keys: ['reader'], targets: [], outcome: 'suppressed', receiveToAckMs: 4, atMonoMs: 131 }),
+      entry: { kind: 'ack', keys: ['reader'], targets: [], outcome: 'suppressed', receive_to_ack_ms: 4, at_mono_ms: 131 } },
+    { name: 'queue append', mapped: () => durableAppendMeasurement(appendTiming('queue', 'reader.jsonl'), stateDir),
+      entry: { kind: 'append', journal: 'queue', key: 'reader', records: 3, bytes: 412, append_ms: 9.5, file_fsync_ms: 6.25, dir_fsync_ms: 2.5, fsyncs: 2, at_mono_ms: 140.5 } },
+    { name: 'Thread Memory append', mapped: () => durableAppendMeasurement(appendTiming('threads', 'reader.jsonl'), stateDir),
+      entry: { kind: 'append', journal: 'thread-memory', key: 'reader', records: 3, bytes: 412, append_ms: 9.5, file_fsync_ms: 6.25, dir_fsync_ms: 2.5, fsyncs: 2, at_mono_ms: 140.5 } },
+    { name: 'thread-save', mapped: () => threadSaveMeasurement({ key: 'reader', records: 3, joins: 1, intents: 1, outcomes: 1 }),
+      entry: { kind: 'thread-save', key: 'reader', records: 3, joins: 1, intents: 1, outcomes: 1 } },
+  ]
+
+  test.each(sourceRows)('$name: one exact allowlisted line from its source fact, without content', async ({ entry, mapped }) => {
+    const h = harness()
+    const extra = { text: `message-${LEAK_SENTINEL}`, channel: `C${LEAK_SENTINEL}`, user: `U${LEAK_SENTINEL}`,
+      token: fakeToken(BOT_TOKEN_PREFIX, 'measurement'), path: `path-${LEAK_SENTINEL}`, dir: `dir-${LEAK_SENTINEL}` }
+    const entryOf = mapped()
+    expect(entryOf).toEqual(entry)
+    h.recorder.record({ ...entryOf!, ...extra })
+    await h.recorder.flush()
+    // ack and append carry their own completion time; thread-save takes the record-time clock.
+    const expected: TestMeasurementRecord = { v: 1, ...entry, at_mono_ms: 'at_mono_ms' in entry ? entry.at_mono_ms : 900.5 }
+    expect(h.records()).toEqual([expected])
+    const line = h.written[0]!
+    expect(Object.keys(JSON.parse(line)).slice(0, 3)).toEqual(['v', 'kind', 'at_mono_ms'])
+    expect(serializeTestMeasurement({ ...expected, ...extra })).toBe(line.trimEnd())
+    if (entry.kind === 'ack' && entry.outcome === 'suppressed') { expect(line).not.toContain('ack_call_ms'); expect(line).not.toContain('"ts"') }
+    assertNoLeak({ calls: h.calls, logs: h.logs, written: h.written })
+    await h.recorder.stop()
+  })
+
+  test('an ack ts not in Slack form, and ack target extras, are left out; the observer input is copied', () => {
+    for (const ts of ['', 'abc', `1.${LEAK_SENTINEL}`, '1730000000', '1730000000.0001000', ` 1730000000.000100`]) {
+      expect(ackTimingMeasurement({ ...ackTiming, ts })).not.toHaveProperty('ts')
+    }
+    const keys = ['reader'], targets = [{ key: 'reader', seq: 1, text: LEAK_SENTINEL }]
+    const entry = ackTimingMeasurement({ keys, targets, outcome: 'ack-failed', receiveToAckMs: 1, ackCallMs: 2, atMonoMs: 3 })
+    expect(entry).toEqual({ kind: 'ack', keys: ['reader'], targets: [{ key: 'reader', seq: 1 }], outcome: 'ack-failed', receive_to_ack_ms: 1, ack_call_ms: 2, at_mono_ms: 3 })
+    keys.push('other'); targets.push({ key: 'other', seq: 2, text: '' })
+    expect(entry.keys).toEqual(['reader'])
+    expect(entry.targets).toEqual([{ key: 'reader', seq: 1 }])
+    assertNoLeak(entry)
+  })
+
+  test.each([
+    ['a queue quarantine file', appendTiming('queue', 'reader.unreadable')],
+    ['a Thread Memory quarantine file', appendTiming('threads', 'reader.jsonl.unreadable')],
+    ['another journal directory', appendTiming('other', 'reader.jsonl')],
+    ['a nested path', { ...appendTiming('queue', 'reader.jsonl'), path: join(stateDir, 'queue', 'nested', 'reader.jsonl') }],
+    ['an invalid persona key', appendTiming('queue', 'Reader-1.jsonl')],
+    ['another state directory', { ...appendTiming('queue', 'reader.jsonl'), dir: join(tmpdir(), 'other', 'queue'), path: join(tmpdir(), 'other', 'queue', 'reader.jsonl') }],
+  ] as const)('%s gives no append measurement', (_, timing) => {
+    expect(durableAppendMeasurement(timing, stateDir)).toBeUndefined()
   })
 
   test.each(['storeMs', 'atMonoMs', 'seq', 'store'] as const)('an untimed/incomplete stored event lacking %s is ignored', missing => {

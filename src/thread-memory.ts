@@ -339,9 +339,13 @@ export interface ThreadMemory {
   remove(key: string): Promise<ThreadMemoryWriteResult>
   removeUnappliedAtStart(): Promise<void>
   startMaintenance(intervalMs?: number): void
+  /** Test-only: observe each later save that appended records. Unset (the default), saves count nothing. */
+  setSaveObserver(observer: ((save: ThreadMemorySave) => void) | undefined): void
   quiesce(): Promise<void>
   stop(): Promise<void>
 }
+/** One successful kept-fact append: its record count by kind. */
+export interface ThreadMemorySave { key: string; records: number; joins: number; intents: number; outcomes: number }
 const memoryObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const memoryInteger = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0
 const memoryTime = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v)
@@ -506,6 +510,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   const pendingJoins = new Map<string, ThreadJoin[]>()
   const maintenanceQueued = new WeakSet<MemoryJournal>()
   let activationStarted = false
+  let saveObserver: ((save: ThreadMemorySave) => void) | undefined
   let startId: string | undefined, readStarted = false, listingFailed = false, stopped = false, quiesced = false
   let timer: ReturnType<typeof globalThis.setInterval> | undefined
   function pathFor(key: string): string {
@@ -963,6 +968,12 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     try {
       if (records.length) {
         await io.durableAppend(pathFor(key), serializeThreadMemoryRecords(records), j)
+        if (saveObserver) {
+          try {
+            const count = (kind: ThreadMemoryRecord['kind']) => records.filter(record => record.kind === kind).length
+            saveObserver({ key, records: records.length, joins: count('join'), intents: count('post-intent'), outcomes: count('post-outcome') })
+          } catch { /* an observer cannot change a saved append */ }
+        }
         for (const record of records) {
           if (record.kind === 'join') retain(j, record, record, recoveryStamp(key, record) === 'stale' ? j.heldJoins : j.joinedByChannel)
           else if (record.kind === 'post-intent') j.savedIntents.set(record.operationId, record)
@@ -1237,6 +1248,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       timer = (options.setInterval ?? globalThis.setInterval)(() => { void compactForMaintenance().catch(() => {}) }, intervalMs ?? options.compactIntervalMs ?? QUEUE_COMPACT_INTERVAL_MS)
       timer.unref?.()
     },
+    setSaveObserver(observer) { saveObserver = observer },
     async quiesce() {
       quiesced = true
       await Promise.allSettled([...writers.values()])

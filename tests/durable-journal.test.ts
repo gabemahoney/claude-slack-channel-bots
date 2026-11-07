@@ -2,7 +2,10 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createDurableJournal, removeTornTail, splitJournalLines, yieldToEventLoop, type AppendRollback } from '../src/durable-journal.ts'
+import {
+  createDurableJournal, removeTornTail, setDurableAppendTimer, splitJournalLines, yieldToEventLoop,
+  type AppendRollback, type DurableAppendTiming,
+} from '../src/durable-journal.ts'
 import { durableIo, heldStep, type DurableStepForm } from './test-helpers/durable-io.ts'
 
 let root: string, dir: string, path: string
@@ -429,6 +432,74 @@ describe('disk waits run on the I/O pool; only read-time quarantine blocks', () 
     expect(read()).toEqual(Buffer.from('old\n'))
     expect(rollback.pendingRollback).toBeUndefined()
     expect(r.paths.size).toBe(0)
+  })
+})
+
+describe('test-only append timing', () => {
+  afterEach(() => setDurableAppendTimer(undefined))
+  /** A clock that each sync advances by its path's cost, so file and directory times are distinct. */
+  function timedRun() {
+    const r = recordingFs(), timings: DurableAppendTiming[] = []
+    let t = 1000, reads = 0
+    const cost = (p: string) => p === path ? 5 : p === dir ? 2 : p === root ? 1 : 0
+    r.control.before = op => { if (op.step === 'sync') t += cost(op.path) }
+    return { r, timings, reads: () => reads, timer: { now: () => { reads++; return t }, record: (timing: DurableAppendTiming) => { timings.push(timing) } } }
+  }
+
+  test('unset by default: an append reads no clock and runs the same steps as a timed one', async () => {
+    const plain = recordingFs()
+    await journal(plain.fs).durableAppend(path, Buffer.from('a\nb\n'))
+    fs.rmSync(dir, { recursive: true })
+    const timed = timedRun()
+    setDurableAppendTimer(timed.timer)
+    await journal(timed.r.fs).durableAppend(path, Buffer.from('a\nb\n'))
+    expect(timed.r.ops.map(op => [op.step, op.path])).toEqual(plain.ops.map(op => [op.step, op.path]))
+    expect(read()).toEqual(Buffer.from('a\nb\n'))
+    setDurableAppendTimer(undefined)
+    const before = timed.reads()
+    await journal(timed.r.fs).durableAppend(path, Buffer.from('c\n'))
+    expect(timed.reads()).toBe(before)
+    expect(timed.timings).toHaveLength(1)
+  })
+
+  test('each successful append reports its records, bytes, whole time and file/directory fsync split, first with the parent sync', async () => {
+    const h = timedRun(), j = journal(h.r.fs)
+    setDurableAppendTimer(h.timer)
+    const group = Buffer.from('{"seq":1}\n{"seq":2}\n{"seq":3}\n')
+    await j.durableAppend(path, group)
+    await j.durableAppend(path, Buffer.from('{"seq":4}\n'))
+    expect(h.timings).toEqual([
+      { dir, path, records: 3, bytes: group.length, appendMs: 8, fileFsyncMs: 5, dirFsyncMs: 3, fsyncs: 3, atMonoMs: 1008 },
+      { dir, path, records: 1, bytes: 10, appendMs: 7, fileFsyncMs: 5, dirFsyncMs: 2, fsyncs: 2, atMonoMs: 1015 },
+    ])
+    expect(JSON.stringify(h.timings)).not.toContain('seq')
+  })
+
+  test('a failed append reports nothing, its rollback sync is a file sync of the next append, and a throwing timer cannot fail an append', async () => {
+    const h = timedRun(), j = journal(h.r.fs), rollback: AppendRollback = {}
+    seed('old\n'); await j.ensureDir()
+    setDurableAppendTimer(h.timer)
+    h.r.control.fail = op => op.path === path && (op.step === 'sync' || op.step === 'truncate')
+    await expect(j.durableAppend(path, Buffer.from('unaccepted\n'), rollback)).rejects.toThrow()
+    expect(h.timings).toEqual([])
+    h.r.control.fail = () => false
+    await j.durableAppend(path, Buffer.from('retry\n'), rollback)
+    expect(h.timings).toEqual([{ dir, path, records: 1, bytes: 6, appendMs: 12, fileFsyncMs: 10, dirFsyncMs: 2, fsyncs: 3, atMonoMs: h.timings[0]!.atMonoMs }])
+    setDurableAppendTimer({ now: h.timer.now, record: () => { throw new Error('observer failed') } })
+    await j.durableAppend(path, Buffer.from('next\n'))
+    expect(read()).toEqual(Buffer.from('old\nretry\nnext\n'))
+  })
+
+  test('only promise appends are timed: rewrite, reconcile, ensure and the blocking append read no clock', async () => {
+    const h = timedRun(), j = journal(h.r.fs)
+    setDurableAppendTimer(h.timer)
+    await j.ensureDir()
+    await j.rewrite(path, Buffer.from('rewritten\n'))
+    fs.appendFileSync(path, 'unaccepted\n')
+    await j.reconcileRollback(path, { pendingRollback: 'rewritten\n'.length })
+    j.durableAppendSync(path, Buffer.from('quarantined\n'))
+    expect(h.reads()).toBe(0)
+    expect(h.timings).toEqual([])
   })
 })
 

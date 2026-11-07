@@ -186,6 +186,32 @@ describe('Thread Memory store', () => {
     }
   })
 
+  test('the test-only save observer: unset by default; set, one count per appending save, none for failed or empty saves; a throw cannot fail a save', async () => {
+    const h = fixture(); await h.start()
+    const saves: unknown[] = []
+    expect(await h.memory.saveJoins('alpha', [h.fact({ root: R.secondary })])).toEqual({ kind: 'saved' })
+    h.memory.setSaveObserver(save => { saves.push(save) })
+    expect(await h.memory.saveJoins('alpha', [h.fact()])).toEqual({ kind: 'saved' })
+    expect(h.memory.addJoin('alpha', h.fact({ root: R.secondary, at: THREAD_TIME - 5 }))).toBe(true)
+    expect(h.memory.addJoin('alpha', h.fact({ at: THREAD_TIME - 5 }))).toBe(true)
+    expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+    expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+    expect(saves).toEqual([
+      { key: 'alpha', records: 1, joins: 1, intents: 0, outcomes: 0 },
+      { key: 'alpha', records: 2, joins: 2, intents: 0, outcomes: 0 },
+    ])
+    h.io.fail('writeSync')
+    expect((await h.memory.saveJoins('alpha', [h.fact({ root: R.secondary, at: THREAD_TIME - 9 })])).kind).toBe('failed')
+    h.io.heal()
+    expect(saves).toHaveLength(2)
+    h.memory.setSaveObserver(() => { throw new Error('observer failed') })
+    expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+    h.memory.setSaveObserver(undefined)
+    expect(await h.memory.saveJoins('alpha', [h.fact({ at: THREAD_TIME - 9 })])).toEqual({ kind: 'saved' })
+    expect(saves).toHaveLength(2)
+    expect(savedJoins(h)).toHaveLength(6)
+  })
+
   test('saved joins retain earliest times, store identity and increasing record numbers across compaction and restart', async () => {
     const h = fixture(); await h.start()
     const later = h.fact({ at: THREAD_TIME + 20 }), earlier = { ...later, at: THREAD_TIME + 10, source: 'broadcast' as const }

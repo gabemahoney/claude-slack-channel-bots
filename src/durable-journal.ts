@@ -35,11 +35,35 @@ export function yieldToEventLoop(): Promise<void> {
 export interface DurableJournalOptions {
   dir: string; parentDir: string; directoryMode: number; fileMode: number; fs?: typeof nodeFs
 }
+
+// ---------------------------------------------------------------------------
+// Test-only append timing
+// ---------------------------------------------------------------------------
+
+/** One successful promise `durableAppend`, timed on the timer's clock. `records`
+ * counts the newline bytes handed in (one per journal record); the fsync
+ * times sum the file's and the directories' syncs it waited for. */
+export interface DurableAppendTiming {
+  dir: string; path: string; records: number; bytes: number
+  appendMs: number; fileFsyncMs: number; dirFsyncMs: number; fsyncs: number; atMonoMs: number
+}
+export interface DurableAppendTimer {
+  now(): number
+  /** Called after the append is durable; its throw is ignored. */
+  record(timing: DurableAppendTiming): void
+}
+let appendTimer: DurableAppendTimer | undefined
+/** Test-only seam, installed only by the server's `test_measurement_timings` record:
+ * every journal's later promise appends are timed. Unset (the default), an
+ * append reads no clock and runs exactly as before. */
+export function setDurableAppendTimer(timer: DurableAppendTimer | undefined): void { appendTimer = timer }
+
 /** The syscalls that wait for the disk. Each sequence below yields them, so
  * one ordering runs either on the I/O pool or, for read-time quarantine
  * only, blocking. Every other step is immediate and stays synchronous. */
-type DurableStep = { op: 'fsync'; fd: number } | { op: 'rename'; from: string; to: string }
+type DurableStep = { op: 'fsync'; fd: number; target: 'file' | 'dir' } | { op: 'rename'; from: string; to: string }
 type DurableSteps = Generator<DurableStep, void, void>
+interface StepTimes { now(): number; fileFsyncMs: number; dirFsyncMs: number; fsyncs: number }
 export function createDurableJournal(options: DurableJournalOptions) {
   const fs = options.fs ?? nodeFs, dir = options.dir
   let durableDirectory: { dev: number; ino: number } | undefined
@@ -60,13 +84,31 @@ export function createDurableJournal(options: DurableJournalOptions) {
       else fs.rename(step.from, step.to, done)
     })
   }
-  async function run(steps: DurableSteps): Promise<void> {
+  async function run(steps: DurableSteps, times?: StepTimes): Promise<void> {
     for (let next = steps.next(); !next.done;) {
+      const started = times?.now()
       try { await perform(next.value) } catch (error) { next = steps.throw(error); continue }
+      if (times && started !== undefined && next.value.op === 'fsync') {
+        const ms = times.now() - started
+        times.fsyncs++
+        if (next.value.target === 'dir') times.dirFsyncMs += ms; else times.fileFsyncMs += ms
+      }
       next = steps.next()
     }
   }
-  function* syncDir(path: string): DurableSteps { const fd = fs.openSync(path, 'r'); try { yield { op: 'fsync', fd } } finally { fs.closeSync(fd) } }
+  async function timedAppend(timer: DurableAppendTimer, path: string, bytes: Uint8Array, rollback?: AppendRollback): Promise<void> {
+    const times: StepTimes = { now: () => timer.now(), fileFsyncMs: 0, dirFsyncMs: 0, fsyncs: 0 }
+    const started = timer.now()
+    await run(appendSteps(path, bytes, rollback), times)
+    try {
+      const atMonoMs = timer.now()
+      let records = 0
+      for (const byte of bytes) if (byte === 10) records++
+      timer.record({ dir, path, records, bytes: bytes.length, appendMs: atMonoMs - started,
+        fileFsyncMs: times.fileFsyncMs, dirFsyncMs: times.dirFsyncMs, fsyncs: times.fsyncs, atMonoMs })
+    } catch { /* a measurement cannot change a durable append's outcome */ }
+  }
+  function* syncDir(path: string): DurableSteps { const fd = fs.openSync(path, 'r'); try { yield { op: 'fsync', fd, target: 'dir' } } finally { fs.closeSync(fd) } }
   function* ensureDirSteps(): DurableSteps {
     // A recreated directory may reuse the cached device/inode identity.
     if (fs.mkdirSync(dir, { recursive: true, mode: options.directoryMode }) !== undefined) { durableDirectory = undefined; directoryGeneration++ }
@@ -94,18 +136,18 @@ export function createDurableJournal(options: DurableJournalOptions) {
       original = rollback?.pendingRollback ?? fs.fstatSync(fd).size
       fs.fchmodSync(fd, options.fileMode)
       if (rollback?.pendingRollback !== undefined) {
-        fs.ftruncateSync(fd, rollback.pendingRollback); yield { op: 'fsync', fd }
+        fs.ftruncateSync(fd, rollback.pendingRollback); yield { op: 'fsync', fd, target: 'file' }
         original = rollback.pendingRollback; delete rollback.pendingRollback
       }
       if (original > 0) { const last = Buffer.alloc(1); fs.readSync(fd, last, 0, 1, original - 1); if (last[0] !== 10) writeAll(fd, Buffer.from('\n')) }
       writeAll(fd, bytes)
-      yield { op: 'fsync', fd }
+      yield { op: 'fsync', fd, target: 'file' }
       // Always sync: a previous failed first append may have left an unsynced directory entry.
       yield* syncDir(dir)
     } catch (error) {
       if (rollback && original !== undefined) {
         rollback.pendingRollback ??= original
-        try { fs.ftruncateSync(fd, rollback.pendingRollback); yield { op: 'fsync', fd }; delete rollback.pendingRollback } catch { /* next append must reconcile before writing */ }
+        try { fs.ftruncateSync(fd, rollback.pendingRollback); yield { op: 'fsync', fd, target: 'file' }; delete rollback.pendingRollback } catch { /* next append must reconcile before writing */ }
       }
       throw error
     } finally { try { fs.closeSync(fd) } catch { /* fsync is the durability boundary */ } }
@@ -115,7 +157,7 @@ export function createDurableJournal(options: DurableJournalOptions) {
     yield* ensureDirSteps()
     try {
       const fd = fs.openSync(temp, 'wx', options.fileMode)
-      try { writeAll(fd, bytes); yield { op: 'fsync', fd } } finally { fs.closeSync(fd) }
+      try { writeAll(fd, bytes); yield { op: 'fsync', fd, target: 'file' } } finally { fs.closeSync(fd) }
       yield { op: 'rename', from: temp, to: path }
       yield* syncDir(dir)
     } finally { try { fs.unlinkSync(temp) } catch { /* rename consumed temp */ } }
@@ -123,14 +165,17 @@ export function createDurableJournal(options: DurableJournalOptions) {
   function* reconcileSteps(path: string, j: AppendRollback): DurableSteps {
     if (j.pendingRollback !== undefined) {
       const fd = fs.openSync(path, 'r+')
-      try { fs.ftruncateSync(fd, j.pendingRollback); yield { op: 'fsync', fd }; delete j.pendingRollback } finally { fs.closeSync(fd) }
+      try { fs.ftruncateSync(fd, j.pendingRollback); yield { op: 'fsync', fd, target: 'file' }; delete j.pendingRollback } finally { fs.closeSync(fd) }
     }
   }
   return {
     ensureDir: (): Promise<void> => run(ensureDirSteps()),
     /** Resolves once the bytes and the directory entry are durable. The caller's
      * serialized writer must own `path` and `rollback` until it settles. */
-    durableAppend: (path: string, bytes: Uint8Array, rollback?: AppendRollback): Promise<void> => run(appendSteps(path, bytes, rollback)),
+    durableAppend: (path: string, bytes: Uint8Array, rollback?: AppendRollback): Promise<void> => {
+      const timer = appendTimer
+      return timer ? timedAppend(timer, path, bytes, rollback) : run(appendSteps(path, bytes, rollback))
+    },
     /** Blocking form, only for Thread Memory's read-time quarantine inside its
      * synchronous journal read (start, bring-up, read retry). */
     durableAppendSync: (path: string, bytes: Uint8Array, rollback?: AppendRollback): void => runSync(appendSteps(path, bytes, rollback)),

@@ -2,11 +2,12 @@
  * No scenario is sourced, no native process is launched, and clocks are fake. */
 import { describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import ts from 'typescript'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { TEST_MEASUREMENTS_KEY, TEST_MEASUREMENT_TIMINGS_KEY } from '../src/config.ts'
 import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX } from './test-helpers/credentials.ts'
 import { test29ClosingFixture, test29EvidencePrinter, test29PrinterFixture, test29PrinterBindings, test29SwitchBindings, test29SwitchCallOrder } from './test-helpers/test29-controls.ts'
 import { TEST29_ROOT, test29RestartFixture, test29CompactionFixture, test29DiagnosticFixture, test29WatchdogFixture, test29DiagnosticExpectedItem } from './test-helpers/test29-queue.ts'
@@ -20,7 +21,11 @@ import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVer
   faultLoadVerdicts, faultWaves, faultTail, faultTailOption, postHoldOverlapVerdicts, concurrentOverlapVerdicts, envelopeTimings, type FaultPlan, type FaultPush, type FaultLoadEvidence,
   type SharedListEvidence, type PendingProbe, type AccountedEvent, type LookupProbe,
   burstAckVerdicts, pendingBurstVerdict, type BurstItem, type PendingWindow,
+  SR8_DIAGNOSTIC_KINDS, SR8_USER_HZ, cgroupCpuCounters, procCpuTicks, phasePids, phaseCpuSample, phaseCpuResults, ackClockSamples, ackClockResults,
+  ackBinResults, ackEventResults, serverWaves, serverPhase, appendResults, saveResults, observeResults, type PhaseCpuSample, type ClockSample,
 } from './integration/fixtures/sr8-evidence.ts'
+import { serializeTestMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement,
+  type TestMeasurement, type TestMeasurementRecord } from '../src/test-measurements.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
 import { THREAD_REPLY_HOLD_MS, DELIVERY_MAX_AD_CALLS_PER_S } from '../src/delivery-constants.ts'
 import { NAME_LOOKUP_TIMEOUT_MS } from '../src/tag-wrapper.ts'
@@ -88,6 +93,14 @@ function shell(program: string, files: Record<string, string> = {}) {
   } finally { rmSync(root, { recursive: true, force: true }) }
 }
 const jsonl = (rows: unknown[]) => rows.map(row => JSON.stringify(row)).join('\n') + '\n'
+/** A measurement line exactly as the server's recorder serializes it. */
+const serverLine = (entry: TestMeasurement, at: number) => serializeTestMeasurement({ ...entry, v: 1, at_mono_ms: at } as TestMeasurementRecord)
+const serverRows = {
+  ack: serverLine(ackTimingMeasurement({ keys: ['alpha'], ts: '1700000000.000001', targets: [{ key: 'alpha', seq: 1 }], outcome: 'acked', receiveToAckMs: 4, ackCallMs: 1, atMonoMs: 9 }), 9),
+  append: serverLine(durableAppendMeasurement({ dir: '/s/queue', path: '/s/queue/alpha.jsonl', records: 2, bytes: 10, appendMs: 3,
+    fileFsyncMs: 2, dirFsyncMs: 1, fsyncs: 2, atMonoMs: 9 }, '/s')!, 9),
+  save: serverLine(threadSaveMeasurement({ key: 'alpha', records: 1, joins: 1, intents: 0, outcomes: 0 }), 9),
+}
 /** A full SR-8.2 burst ledger and stub record, in burst's order, with the
  * pending-post probes leading the second wave. Stub seqs start after mark 10. */
 function pendingBurst(keys: string[], channel: string, probes: { channel: string; ts: string; envelope_id: string }[]) {
@@ -1637,10 +1650,237 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       'e/alpha.queue.jsonl': jsonl([{ kind: 'accepted', channel, ts: '1', seq: 1 }]), 'e/beta.queue.jsonl': jsonl([{ kind: 'accepted', channel, ts: '2', seq: 2 }]) })
     expect(child.status).toBe(1); expect(child.stdout).toContain('persona=1 limit=50 verdict=pass'); expect(child.stdout).toContain('persona=2 limit=50 verdict=fail')
   })
+  test('the measurement reader skips only the server diagnostic kinds; every verdict is unchanged by them', () => {
+    const items = [{ key, phase: 'roots', channel, ts: '1' }, { key: 'beta', phase: 'roots', channel, ts: '2' }]
+    const queues = { 'e/alpha.queue.jsonl': jsonl([{ kind: 'accepted', channel, ts: '1', seq: 1 }]), 'e/beta.queue.jsonl': jsonl([{ kind: 'accepted', channel, ts: '2', seq: 2 }]) }
+    const rows = [measure(1), measure(2, 'accepted', SR8_STORE_LIMIT_MS, 'beta')]
+    const run = (extra: unknown[]) => cli('stores', ['@/e', '@/measurements', '0'], { 'e/burst.jsonl': jsonl(items), measurements: jsonl([...rows, ...extra]), ...queues })
+    const plain = run([])
+    // One row of each kind as the server's own serializer writes it.
+    const diagnostic = [serverRows.ack, serverRows.append, serverRows.save].map(l => JSON.parse(l))
+    expect(diagnostic.map(r => r.kind)).toEqual([...SR8_DIAGNOSTIC_KINDS])
+    expect({ status: run(diagnostic).status, stdout: run(diagnostic).stdout }).toEqual({ status: plain.status, stdout: plain.stdout })
+    const unknown = run([{ v: 1, kind: 'unreviewed', key, at_mono_ms: 1 }])
+    expect(unknown.status).toBe(1); expect(unknown.stdout.split('\n').filter(l => l.includes(' store ')).every(l => l.endsWith('verdict=missing'))).toBe(true)
+  })
   test('CLI seal passes the printer lost-join marker into the measured verdict', () => {
     const child = cli('seal', ['@/log', '0', '@/config'], { log: THREAD_MEMORY_JOINS_LOST + ' ' + token,
       config: JSON.stringify({ personas: [key, 'beta'].map(name => ({ name, channels: [] })) }) })
     expect(child.status).toBe(1); expect(child.stdout).toContain('reports=1 loaded=0 limit=0 verdict=fail')
+  })
+})
+
+describe('test-44 latency observation collectors (synthetic rows, no runtime claim)', () => {
+  const v2 = 'usage_usec 5000\nuser_usec 3000\nsystem_usec 2000\nnr_periods 10\nnr_throttled 2\nthrottled_usec 300\nnr_bursts 0\n'
+  const procStat = (utime: number, stime: number) => `4242 (bun (x) y) S 1 4242 4242 0 -1 4194304 10 0 0 0 ${utime} ${stime} 0 0 20 0 9 0 100 0 0\n`
+  test('cgroup cpu.stat and /proc/<pid>/stat parsers read v2, v1 and kernel-shaped text, undefined when absent or malformed', () => {
+    expect(cgroupCpuCounters(v2)).toEqual({ usage_usec: 5000, user_usec: 3000, system_usec: 2000, nr_periods: 10, nr_throttled: 2, throttled_usec: 300 })
+    expect(cgroupCpuCounters('nr_periods 4\nnr_throttled 1\nthrottled_time 2500000\n')).toEqual({ nr_periods: 4, nr_throttled: 1, throttled_usec: 2500 })
+    expect(cgroupCpuCounters(undefined)).toBeUndefined(); expect(cgroupCpuCounters('garbage\n')).toBeUndefined()
+    expect(cgroupCpuCounters('usage_usec x\nnr_periods -1\n')).toBeUndefined()
+    // A full v2 file as the kernel writes it, extra counters included.
+    expect(cgroupCpuCounters('usage_usec 81234567\nuser_usec 60000000\nsystem_usec 21234567\ncore_sched.force_idle_usec 0\nnr_periods 9000\nnr_throttled 120\nthrottled_usec 4500000\nnr_bursts 0\nburst_usec 0\n'))
+      .toEqual({ usage_usec: 81234567, user_usec: 60000000, system_usec: 21234567, nr_periods: 9000, nr_throttled: 120, throttled_usec: 4500000 })
+    // A command name holding spaces and ')' must not shift the fields.
+    expect(procCpuTicks(procStat(250, 75))).toEqual({ utime: 250, stime: 75 })
+    expect(procCpuTicks(undefined)).toBeUndefined(); expect(procCpuTicks('4242 (bun) S 1 2')).toBeUndefined(); expect(procCpuTicks('no paren')).toBeUndefined()
+    expect(procCpuTicks('4242 (bun) S 1 4242 4242 0 -1 4194304 10 0 0 0 x 5 0 0\n')).toBeUndefined()
+    // A full 52-field Linux 6.x line for a bun process.
+    const kernel = '31337 (bun) S 31300 31337 31300 34816 31337 4194560 18821 0 3 0 1234 567 0 0 20 0 14 0 8812345 1180000256 52113 18446744073709551615 '
+      + '94347000000000 94347050000000 140733000000000 0 0 0 0 16781312 134235650 0 0 0 17 3 0 0 0 0 0 94347060000000 94347061000000 94347070000000 140733000100000 140733000100100 140733000100100 140733000102000 0\n'
+    expect(kernel.trim().split(' ')).toHaveLength(52)
+    expect(procCpuTicks(kernel)).toEqual({ utime: 1234, stime: 567 })
+  })
+  test('phase PIDs keep valid name=pid entries and always add the observing process', () => {
+    expect(phasePids('server=12,stub=34', 99)).toEqual([['server', 12], ['stub', 34], ['observer', 99]])
+    expect(phasePids('server=12,observer=5,Bad=1,stub=x,=3', 99)).toEqual([['server', 12], ['observer', 99]])
+    expect(phasePids(undefined, 7)).toEqual([['observer', 7]])
+  })
+  test('phase CPU deltas per wave: elapsed, cgroup usage and throttling, per-process user/system, unknown when unread or backwards', () => {
+    const at = (phase: string, ms: number, usage: number, throttled: number, server: [number, number] | null, stub: string | undefined) =>
+      phaseCpuSample(phase, ms, `usage_usec ${usage}\nuser_usec ${usage / 2}\nsystem_usec ${usage / 2}\nnr_periods ${ms / 100}\nnr_throttled ${throttled}\nthrottled_usec ${throttled * 1000}\n`,
+        [['server', server ? procStat(...server) : undefined], ['stub', stub], ['observer', procStat(0, 0)]])
+    const samples: PhaseCpuSample[] = [at('probe', 1000, 0, 0, [100, 10], procStat(5, 5)), at('roots', 1500, 400_000, 0, [130, 20], procStat(6, 5)),
+      at('replies-drops', 3500, 4_400_000, 50, [330, 60], undefined), at('end', 4500, 4_000_000, 60, null, procStat(9, 9))]
+    const lines = phaseCpuResults(samples).map(r => resultLine({ scenario: 'test-44-fmk-thread-burst', mode: 'open', population: 100000, recipients: 2 }, r))
+    const tick = 1000 / SR8_USER_HZ
+    expect(lines).toEqual([
+      `recorded: sr8 observe-cpu scenario=test-44-fmk-thread-burst mode=open population=100000 recipients=2 samples=2 phase=probe elapsed_ms=500 cpu_usage_ms=400 cpu_user_ms=200 cpu_system_ms=200 cpus_busy=0.8 nr_periods=5 nr_throttled=0 throttled_ms=0 server_user_ms=${30 * tick} server_system_ms=${10 * tick} stub_user_ms=${tick} stub_system_ms=0 observer_user_ms=0 observer_system_ms=0 limit=none verdict=recorded`,
+      `recorded: sr8 observe-cpu scenario=test-44-fmk-thread-burst mode=open population=100000 recipients=2 samples=2 phase=roots elapsed_ms=2000 cpu_usage_ms=4000 cpu_user_ms=2000 cpu_system_ms=2000 cpus_busy=2 nr_periods=20 nr_throttled=50 throttled_ms=50 server_user_ms=${200 * tick} server_system_ms=${40 * tick} stub_user_ms=unknown stub_system_ms=unknown observer_user_ms=0 observer_system_ms=0 limit=none verdict=recorded`,
+      // A counter that went backwards (a replaced cgroup) and an exited server are unknown, never negative.
+      'recorded: sr8 observe-cpu scenario=test-44-fmk-thread-burst mode=open population=100000 recipients=2 samples=2 phase=replies-drops elapsed_ms=1000 cpu_usage_ms=unknown cpu_user_ms=unknown cpu_system_ms=unknown cpus_busy=unknown nr_periods=10 nr_throttled=10 throttled_ms=10 server_user_ms=unknown server_system_ms=unknown stub_user_ms=unknown stub_system_ms=unknown observer_user_ms=0 observer_system_ms=0 limit=none verdict=recorded',
+    ])
+    expect(phaseCpuResults([])).toEqual([]); expect(phaseCpuResults(samples.slice(0, 1))).toEqual([])
+  })
+
+  // Server clock = stub clock + 10000; only durations ever cross processes.
+  const ts = (n: number) => `1700000000.00000${n}`
+  const items: BurstItem[] = [
+    { key: 'alpha', phase: 'held', channel: 'C0HOLD', ts: ts(1), sender: 'UHUMAN', envelope_id: 'h-a' },
+    { key: 'alpha', phase: 'roots', channel: 'C0ROOT', ts: ts(2), sender: 'UHUMAN', envelope_id: 'r1-a' },
+    { key: 'alpha', phase: 'roots', channel: 'C0ROOT', ts: ts(3), sender: 'UHUMAN', envelope_id: 'r2-a' },
+    { key: 'beta', phase: 'roots', channel: 'C0ROOT', ts: ts(2), sender: 'UHUMAN', envelope_id: 'r1-b' },
+    { key: 'alpha', phase: 'dropped', channel: 'C0DROP', ts: ts(4), sender: 'UHUMAN', envelope_id: 'd1-a' },
+    { key: 'alpha', phase: 'replies', channel: 'C0ROOT', ts: ts(5), sender: 'UHUMAN' },
+  ]
+  const stub = (id: string, sent: number, ack: number, acks = 1): Times => ({ envelope_id: id, push: { sent_mono_ms: sent, connection_id: 'c' },
+    acks: Array.from({ length: acks }, () => ({ ack_mono_ms: ack, connection_id: 'c' })) })
+  const times = [stub('h-a', 100, 150), stub('r1-a', 1002, 1102), stub('r2-a', 1001, 3001), stub('r1-b', 1000, 1500), stub('d1-a', 5000, 5010)]
+  const ack = (keys: string[], n: number | string, receiveToAckMs: number, received: number, ackCallMs?: number, outcome: 'acked' | 'ack-failed' | 'suppressed' = 'acked') =>
+    serverLine(ackTimingMeasurement({ keys, ts: typeof n === 'string' ? n : ts(n), targets: [], outcome, receiveToAckMs, ...(ackCallMs !== undefined ? { ackCallMs } : {}),
+      atMonoMs: received + receiveToAckMs + (ackCallMs ?? 0) }), received + receiveToAckMs + (ackCallMs ?? 0))
+  const state = '/state'
+  const append = (key: string, journal: 'queue' | 'threads', at: number, records: number, appendMs: number, fileFsyncMs: number, dirFsyncMs: number) =>
+    serverLine(durableAppendMeasurement({ dir: join(state, journal), path: join(state, journal, `${key}.jsonl`), records, bytes: records * 40, appendMs,
+      fileFsyncMs, dirFsyncMs, fsyncs: 2, atMonoMs: at }, state)!, at)
+  function observedServerRows(): string[] {
+    return [
+      append('alpha', 'queue', 9000, 1, 5, 3, 1),
+      ack(['alpha'], 1, 40, 10100, 1),
+      append('alpha', 'queue', 10130, 1, 10, 6, 3),
+      ack(['alpha'], 2, 90, 11000, 2), ack(['alpha'], 3, 1500, 11000, 0),
+      // Two rows for one event cannot be matched to either push.
+      ack(['beta'], 2, 30, 11000, 1), ack(['beta'], 2, 31, 11000, 1),
+      append('alpha', 'queue', 11050, 3, 20, 12, 6), append('beta', 'queue', 11200, 1, 4, 2, 1), append('alpha', 'threads', 11300, 2, 8, 5, 2),
+      JSON.stringify({ v: 1, kind: 'store', key: 'alpha', seq: 2, store: 'accepted', store_ms: 1, at_mono_ms: 11010 }),
+      JSON.stringify({ v: 1, kind: 'store', key: 'alpha', seq: 1, store: 'fixed', store_ms: 1, at_mono_ms: 11400 }),
+      serverLine(threadSaveMeasurement({ key: 'alpha', records: 2, joins: 2, intents: 0, outcomes: 0 }), 11310),
+      ack(['alpha'], 4, 5, 15000),
+      append('alpha', 'queue', 20000, 1, 3, 2, 1),
+    ]
+  }
+  const rows = () => observedServerRows().map(l => JSON.parse(l))
+  const none3 = (prefix: string) => `${prefix}_p50_ms=none ${prefix}_p99_ms=none ${prefix}_max_ms=none`
+  test('both ACK clocks match per event by key and Slack ts, with the server receipt rebuilt from its own row; every ledger item is kept', () => {
+    const samples = ackClockSamples(items, times, rows())
+    expect(samples).toEqual([
+      { phase: 'held', wave: 'probe', key: 'alpha', ordinal: 1, sent: 100, stub_status: 'acked', stub: 50, server_status: 'acked', server: 40, received: 10100, acked: 10141 },
+      { phase: 'roots', wave: 'roots', key: 'alpha', ordinal: 1, sent: 1002, stub_status: 'acked', stub: 100, server_status: 'acked', server: 90, received: 11000, acked: 11092 },
+      { phase: 'roots', wave: 'roots', key: 'alpha', ordinal: 2, sent: 1001, stub_status: 'acked', stub: 2000, server_status: 'acked', server: 1500, received: 11000, acked: 12500 },
+      // Two server rows for one event: neither is a sample.
+      { phase: 'roots', wave: 'roots', key: 'beta', ordinal: 1, sent: 1000, stub_status: 'acked', stub: 500, server_status: 'ambiguous' },
+      { phase: 'dropped', wave: 'replies-drops', key: 'alpha', ordinal: 1, sent: 5000, stub_status: 'acked', stub: 10, server_status: 'acked', server: 5, received: 15000, acked: 15005 },
+      // The reply has no envelope and no server row, and is still represented.
+      { phase: 'replies', wave: 'replies-drops', key: 'alpha', ordinal: 1, stub_status: 'missing', server_status: 'missing' },
+    ])
+    // A doubled stub ACK is no stub sample; the server side still matches.
+    expect(ackClockSamples(items.slice(0, 1), [stub('h-a', 100, 150, 2)], rows())).toEqual([{ phase: 'held', wave: 'probe', key: 'alpha', ordinal: 1, sent: 100,
+      stub_status: 'ambiguous', server_status: 'acked', server: 40, received: 10100, acked: 10141 }])
+    const c = { scenario: 'test-44-fmk-thread-burst', mode: 'strict', population: 0, recipients: 2 } as const
+    const head = 'recorded: sr8 observe-ack scenario=test-44-fmk-thread-burst mode=strict population=0 recipients=2'
+    const attempts = `${none3('suppressed')} ${none3('ack_failed')} limit=none verdict=recorded`
+    expect(ackClockResults(samples, percentile).map(r => resultLine(c, r))).toEqual([
+      `${head} samples=1 phase=held stub_events=1 server_events=1 matched=1 stub_unacked=0 stub_ambiguous=0 server_ambiguous=0 suppressed=0 ack_failed=0 stub_p50_ms=50 stub_p99_ms=50 stub_max_ms=50 server_p50_ms=40 server_p99_ms=40 server_max_ms=40 gap_p50_ms=10 gap_p99_ms=10 gap_max_ms=10 ${attempts}`,
+      `${head} samples=3 phase=roots stub_events=3 server_events=2 matched=2 stub_unacked=0 stub_ambiguous=0 server_ambiguous=1 suppressed=0 ack_failed=0 stub_p50_ms=500 stub_p99_ms=2000 stub_max_ms=2000 server_p50_ms=90 server_p99_ms=1500 server_max_ms=1500 gap_p50_ms=10 gap_p99_ms=500 gap_max_ms=500 ${attempts}`,
+      `${head} samples=1 phase=dropped stub_events=1 server_events=1 matched=1 stub_unacked=0 stub_ambiguous=0 server_ambiguous=0 suppressed=0 ack_failed=0 stub_p50_ms=10 stub_p99_ms=10 stub_max_ms=10 server_p50_ms=5 server_p99_ms=5 server_max_ms=5 gap_p50_ms=5 gap_p99_ms=5 gap_max_ms=5 ${attempts}`,
+      `${head} samples=1 phase=replies stub_events=0 server_events=0 matched=0 stub_unacked=0 stub_ambiguous=0 server_ambiguous=0 suppressed=0 ack_failed=0 ${none3('stub')} ${none3('server')} ${none3('gap')} ${attempts}`,
+    ])
+    // Runs follow stub push order, not ledger order; an unpushed event is in no run.
+    expect(ackBinResults(samples.filter(s => s.phase === 'roots'), 10).map(r => [r.samples, r.stats])).toEqual([
+      [1, { phase: 'roots', bin: 1, bins: 3, stub_max_ms: 500, server_max_ms: 'none', gap_max_ms: 'none' }],
+      [1, { phase: 'roots', bin: 2, bins: 3, stub_max_ms: 2000, server_max_ms: 1500, gap_max_ms: 500 }],
+      [1, { phase: 'roots', bin: 3, bins: 3, stub_max_ms: 100, server_max_ms: 90, gap_max_ms: 10 }],
+    ])
+    expect(ackBinResults(samples.filter(s => s.phase === 'replies'), 10)).toEqual([])
+    const many: ClockSample[] = Array.from({ length: 25 }, (_, n) => ({ phase: 'roots', wave: 'roots', key: 'alpha', ordinal: n + 1, sent: n,
+      stub_status: 'acked', stub: n, server_status: 'missing' }))
+    expect(ackBinResults(many, 10).map(r => [r.samples, r.stats.stub_max_ms])).toEqual([[2, 1], [3, 4], [2, 6], [3, 9], [2, 11], [3, 14], [2, 16], [3, 19], [2, 21], [3, 24]])
+  })
+  test('per-event ACK lines keep each event\'s own pair, so a run\'s three maxima from three events stay attributable; every ledger item has one line', () => {
+    const rts = (n: number) => `1700000100.${String(n).padStart(6, '0')}`
+    const ev: BurstItem[] = [['alpha', 1], ['beta', 2], ['alpha', 3], ['beta', 4], ['alpha', 5]].map(([key, n]) =>
+      ({ key: key as string, phase: 'roots', channel: 'C0ROOT', ts: rts(n as number), sender: 'UHUMAN', envelope_id: `e${n}` }))
+    // e1 has the run's largest stub delay, e2 its largest server delay, e3 its largest gap.
+    const stubs = [stub('e1', 0, 900), stub('e2', 10, 890), stub('e3', 20, 620), stub('e4', 30, 130), stub('e5', 40, 41, 2)]
+    const server = [ack(['alpha'], rts(1), 850, 20000, 1), ack(['beta'], rts(2), 870, 20010, 1), ack(['alpha'], rts(3), 100, 20020, 1), ack(['beta'], rts(4), 90, 20030, 1)]
+      .map(l => JSON.parse(l))
+    const samples = ackClockSamples(ev, stubs, server)
+    expect(ackBinResults(samples, 1).map(r => r.stats)).toEqual([{ phase: 'roots', bin: 1, bins: 1, stub_max_ms: 900, server_max_ms: 870, gap_max_ms: 500 }])
+    const c = { scenario: 'test-44-fmk-thread-burst', mode: 'open', population: 100000, recipients: 2 } as const
+    const head = 'recorded: sr8 observe-ack-event scenario=test-44-fmk-thread-burst mode=open population=100000 recipients=2 samples=1 phase=roots'
+    expect(ackEventResults(samples).map(r => resultLine(c, r))).toEqual([
+      `${head} persona=alpha ordinal=1 offset_ms=0 stub=acked stub_ms=900 server=acked server_ms=850 gap_ms=50 attempt_ms=none limit=none verdict=recorded`,
+      `${head} persona=beta ordinal=1 offset_ms=10 stub=acked stub_ms=880 server=acked server_ms=870 gap_ms=10 attempt_ms=none limit=none verdict=recorded`,
+      `${head} persona=alpha ordinal=2 offset_ms=20 stub=acked stub_ms=600 server=acked server_ms=100 gap_ms=500 attempt_ms=none limit=none verdict=recorded`,
+      `${head} persona=beta ordinal=2 offset_ms=30 stub=acked stub_ms=100 server=acked server_ms=90 gap_ms=10 attempt_ms=none limit=none verdict=recorded`,
+      `${head} persona=alpha ordinal=3 offset_ms=40 stub=ambiguous stub_ms=none server=missing server_ms=none gap_ms=none attempt_ms=none limit=none verdict=recorded`,
+    ])
+    // Every ledger item: one line, persona ordinals 1..n with none skipped or repeated.
+    const all = ackEventResults(ackClockSamples(items, times, rows()))
+    expect(all).toHaveLength(items.length)
+    expect(all.map(r => `${r.stats.phase}/${r.stats.persona}/${r.stats.ordinal}`))
+      .toEqual(['held/alpha/1', 'roots/alpha/1', 'roots/alpha/2', 'roots/beta/1', 'dropped/alpha/1', 'replies/alpha/1'])
+    expect(all.at(-1)!.stats).toEqual({ phase: 'replies', persona: 'alpha', ordinal: 1, offset_ms: 'none', stub: 'missing', stub_ms: 'none', server: 'missing',
+      server_ms: 'none', gap_ms: 'none', attempt_ms: 'none' })
+  })
+  test('suppressed and failed server attempts are counted and timed apart, never ACK samples or wave endpoints', () => {
+    const rts = (n: number) => `1700000200.${String(n).padStart(6, '0')}`
+    const ev: BurstItem[] = [1, 2, 3, 4].map(n => ({ key: 'alpha', phase: 'roots', channel: 'C0ROOT', ts: rts(n), sender: 'UHUMAN', envelope_id: `s${n}` }))
+    // s2 is suppressed (no ACK reaches the stub), s3's ack call threw; s1 and s4 are acked.
+    const stubs: Times[] = [stub('s1', 0, 40), stub('s2', 1, 0, 0), stub('s3', 2, 0, 0), stub('s4', 3, 60)]
+    const server = [ack(['alpha'], rts(1), 30, 30000, 1), ack(['alpha'], rts(2), 4000, 30000, undefined, 'suppressed'),
+      ack(['alpha'], rts(3), 700, 30000, 2, 'ack-failed'), ack(['alpha'], rts(4), 50, 30005, 1),
+      append('alpha', 'queue', 30200, 1, 5, 3, 1)].map(l => JSON.parse(l))
+    const samples = ackClockSamples(ev, stubs, server)
+    expect(samples.map(s => [s.stub_status, s.server_status, s.server, s.attempt, s.received, s.acked])).toEqual([
+      ['acked', 'acked', 30, undefined, 30000, 30031], ['unacked', 'suppressed', undefined, 4000, undefined, undefined],
+      ['unacked', 'ack-failed', undefined, 700, undefined, undefined], ['acked', 'acked', 50, undefined, 30005, 30056]])
+    // The wave ends at the last ACK (30056), not at the suppression (34000) or the failed call.
+    const waves = serverWaves(samples)
+    expect(waves).toEqual([{ wave: 'roots', start: 30000, end: 30056 }])
+    expect(appendResults(server, waves, percentile).map(r => r.stats.phase)).toEqual(['after'])
+    const c = { scenario: 'test-44-fmk-thread-burst', mode: 'strict', population: 0, recipients: 2 } as const
+    expect(ackClockResults(samples, percentile).map(r => resultLine(c, r))).toEqual([
+      'recorded: sr8 observe-ack scenario=test-44-fmk-thread-burst mode=strict population=0 recipients=2 samples=4 phase=roots stub_events=2 server_events=2 matched=2 stub_unacked=2 stub_ambiguous=0 server_ambiguous=0 suppressed=1 ack_failed=1 stub_p50_ms=40 stub_p99_ms=57 stub_max_ms=57 server_p50_ms=30 server_p99_ms=50 server_max_ms=50 gap_p50_ms=7 gap_p99_ms=10 gap_max_ms=10 suppressed_p50_ms=4000 suppressed_p99_ms=4000 suppressed_max_ms=4000 ack_failed_p50_ms=700 ack_failed_p99_ms=700 ack_failed_max_ms=700 limit=none verdict=recorded',
+    ])
+    expect(ackBinResults(samples, 1).map(r => r.stats)).toEqual([{ phase: 'roots', bin: 1, bins: 1, stub_max_ms: 57, server_max_ms: 50, gap_max_ms: 10 }])
+    expect(ackEventResults(samples).map(r => [r.stats.stub, r.stats.server, r.stats.server_ms, r.stats.attempt_ms]))
+      .toEqual([['acked', 'acked', 30, 'none'], ['unacked', 'suppressed', 'none', 4000], ['unacked', 'ack-failed', 'none', 700], ['acked', 'acked', 50, 'none']])
+    // A pushed event whose only server row is a suppression reports no server sample and no wave.
+    const lone = ackClockSamples(ev.slice(1, 2), stubs.slice(1, 2), server)
+    expect(resultLine(c, ackClockResults(lone, percentile)[0]!)).toContain(' stub_events=0 server_events=0 matched=0 stub_unacked=1 stub_ambiguous=0 server_ambiguous=0 suppressed=1 ack_failed=0 ')
+    expect(serverWaves(lone)).toEqual([])
+    // An unknown outcome is not a row at all.
+    expect(ackClockSamples(ev.slice(0, 1), stubs.slice(0, 1), [{ ...server[0], outcome: 'other' }])[0]!.server_status).toBe('missing')
+  })
+  test('server waves and phases come from matched ACK rows on the server clock', () => {
+    const waves = serverWaves(ackClockSamples(items, times, rows()))
+    expect(waves).toEqual([{ wave: 'probe', start: 10100, end: 10141 }, { wave: 'roots', start: 11000, end: 12500 }, { wave: 'replies-drops', start: 15000, end: 15005 }])
+    expect([0, 10099, 10100, 10999, 11000, 14999, 15005, 15006].map(at => serverPhase(at, waves)))
+      .toEqual(['before', 'before', 'probe', 'probe', 'roots', 'roots', 'replies-drops', 'after'])
+    expect(serverPhase(5, [])).toBe('unphased')
+  })
+  test('appends per phase and journal give group size and append/fsync spreads; saves count stores, fixed appends and Thread Memory saves', () => {
+    const waves = serverWaves(ackClockSamples(items, times, rows()))
+    expect(appendResults(rows(), waves, percentile).map(r => [r.samples, r.stats])).toEqual([
+      [1, { phase: 'before', journal: 'queue', records: 1, group_p50: 1, group_p99: 1, group_max: 1, append_p50_ms: 5, append_p99_ms: 5, append_max_ms: 5, append_total_ms: 5,
+        file_fsync_p50_ms: 3, file_fsync_p99_ms: 3, file_fsync_max_ms: 3, file_fsync_total_ms: 3, dir_fsync_p50_ms: 1, dir_fsync_p99_ms: 1, dir_fsync_max_ms: 1, dir_fsync_total_ms: 1, fsyncs: 2 }],
+      [1, { phase: 'probe', journal: 'queue', records: 1, group_p50: 1, group_p99: 1, group_max: 1, append_p50_ms: 10, append_p99_ms: 10, append_max_ms: 10, append_total_ms: 10,
+        file_fsync_p50_ms: 6, file_fsync_p99_ms: 6, file_fsync_max_ms: 6, file_fsync_total_ms: 6, dir_fsync_p50_ms: 3, dir_fsync_p99_ms: 3, dir_fsync_max_ms: 3, dir_fsync_total_ms: 3, fsyncs: 2 }],
+      [2, { phase: 'roots', journal: 'queue', records: 4, group_p50: 1, group_p99: 3, group_max: 3, append_p50_ms: 4, append_p99_ms: 20, append_max_ms: 20, append_total_ms: 24,
+        file_fsync_p50_ms: 2, file_fsync_p99_ms: 12, file_fsync_max_ms: 12, file_fsync_total_ms: 14, dir_fsync_p50_ms: 1, dir_fsync_p99_ms: 6, dir_fsync_max_ms: 6, dir_fsync_total_ms: 7, fsyncs: 4 }],
+      [1, { phase: 'roots', journal: 'thread-memory', records: 2, group_p50: 2, group_p99: 2, group_max: 2, append_p50_ms: 8, append_p99_ms: 8, append_max_ms: 8, append_total_ms: 8,
+        file_fsync_p50_ms: 5, file_fsync_p99_ms: 5, file_fsync_max_ms: 5, file_fsync_total_ms: 5, dir_fsync_p50_ms: 2, dir_fsync_p99_ms: 2, dir_fsync_max_ms: 2, dir_fsync_total_ms: 2, fsyncs: 2 }],
+      [1, { phase: 'after', journal: 'queue', records: 1, group_p50: 1, group_p99: 1, group_max: 1, append_p50_ms: 3, append_p99_ms: 3, append_max_ms: 3, append_total_ms: 3,
+        file_fsync_p50_ms: 2, file_fsync_p99_ms: 2, file_fsync_max_ms: 2, file_fsync_total_ms: 2, dir_fsync_p50_ms: 1, dir_fsync_p99_ms: 1, dir_fsync_max_ms: 1, dir_fsync_total_ms: 1, fsyncs: 2 }],
+    ])
+    expect(saveResults(rows(), waves).map(r => [r.samples, r.stats])).toEqual([
+      [0, { phase: 'probe', span_ms: 41, stores: 0, fixed: 0, thread_saves: 0, save_records: 0, joins: 0, intents: 0, outcomes: 0 }],
+      [3, { phase: 'roots', span_ms: 1500, stores: 1, fixed: 1, thread_saves: 1, save_records: 2, joins: 2, intents: 0, outcomes: 0 }],
+      [0, { phase: 'replies-drops', span_ms: 5, stores: 0, fixed: 0, thread_saves: 0, save_records: 0, joins: 0, intents: 0, outcomes: 0 }],
+    ])
+  })
+  test('observe prints inputs, CPU, ACK clocks, runs, appends and saves; every line is recorded, numbers and fixed words only', () => {
+    const cpu = [phaseCpuSample('roots', 0, v2, []), phaseCpuSample('end', 10, v2, [])]
+    const all = observeResults({ rows: rows(), items, times, cpu }, percentile)
+    expect([...new Set(all.map(r => r.measure))]).toEqual(['observe-inputs', 'observe-cpu', 'observe-ack', 'observe-ack-bin', 'observe-append', 'observe-saves', 'observe-ack-event'])
+    expect(all.filter(r => r.measure === 'observe-ack-event')).toHaveLength(items.length)
+    expect(all.every(r => r.verdict === 'recorded' && r.limit === 'none')).toBe(true)
+    expect(all[0]!.stats).toEqual({ measurements: 'read', burst: 'read', times: 'read', cpu: 'read' })
+    const c = { scenario: 'test-44-fmk-thread-burst', mode: 'open', population: 100000, recipients: 2 } as const
+    for (const r of all) expect(resultLine(c, r)).toMatch(/^recorded: sr8 observe-[a-z-]+ scenario=test-44-fmk-thread-burst mode=open population=100000 recipients=2 samples=\d+( [a-z0-9_]+=(-?[\d.]+|[a-z-]+))+ limit=none verdict=recorded$/)
+    const none = observeResults({}, percentile)
+    expect(none.map(r => [r.measure, r.stats])).toEqual([['observe-inputs', { measurements: 'missing', burst: 'missing', times: 'missing', cpu: 'missing' }]])
   })
 })
 
@@ -2029,7 +2269,8 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
       const cli = (command: string, args: string[]) => {
         const child = spawnSync(process.execPath, [join(dir, 'sr8-evidence.ts'), command,
           ...(['envelope-times', 'combinations'].includes(command) ? [] : ['test-fault', 'strict', '0', '2']), ...args],
-          { env: hostSafeChildEnv(root, { extras: { SCENARIO_ROOT: root } }), encoding: 'utf8', timeout: 3000 })
+          // observe prints one line per burst event: a full workload exceeds the default 1 MiB.
+          { env: hostSafeChildEnv(root, { extras: { SCENARIO_ROOT: root } }), encoding: 'utf8', timeout: 3000, maxBuffer: 16 * 1024 * 1024 })
         expect(child.error).toBeUndefined(); expect(child.signal).toBeNull(); assertNoLeak({ stdout: child.stdout, stderr: child.stderr })
         return child
       }
@@ -2356,6 +2597,98 @@ globalThis.fetch = async (_url, init) => {
   return Response.json({ok:true,envelope_id:id});
 };
 `))
+  test('burst writes wave-boundary CPU readings only when SR8_PHASE_CPU_FILE opts in, and observe reads them with the server rows', () => withCLI((root, cli) => {
+    const batch = join(root, 'batches'), keys = sr8Personas(2), phases = ['roots', 'replies', 'dropped'] as const
+    mkdirSync(batch); writeFileSync(join(root, 'stub'), '')
+    const ts = (phase: string, n: number) => `${1700000000 + n}.00000${phases.indexOf(phase as typeof phases[number]) + 1}`
+    const body = (label: string, phase: string, n: number) => ({ label, event: { channel: 'C0BURST', ts: ts(phase, n), user: 'UHUMAN',
+      ...(phase === 'replies' ? { thread_ts: ts('roots', n) } : {}) } })
+    for (const [phase, count] of [['roots', SR8_BURST_JOINS], ['replies', SR8_BURST_REPLIES], ['dropped', SR8_BURST_DROPPED]] as const)
+      writeFileSync(join(batch, `${phase}.batch.jsonl`), lines(keys.flatMap(k => Array.from({ length: count }, (_, n) => body(k, phase, n)))))
+    // The copied CLI reads cpu.stat and each process's stat from controlled files
+    // under its root, never the host's: server readable, stub absent, observer malformed.
+    const copy = join(root, 'tests/integration/fixtures/sr8-evidence.ts'), host = join(root, 'host')
+    const reads: Array<[string, string]> = [
+      ["textFile('/sys/fs/cgroup/cpu.stat') ?? textFile('/sys/fs/cgroup/cpu/cpu.stat')", `textFile(${JSON.stringify(join(host, 'cpu.stat'))})`],
+      ['textFile(`/proc/${pid}/stat`)', `textFile(join(${JSON.stringify(join(host, 'proc'))}, name === 'observer' ? name : String(pid), 'stat'))`],
+    ]
+    let text = readFileSync(copy, 'utf8')
+    for (const [from, to] of reads) { expect(text.split(from)).toHaveLength(2); text = text.replace(from, to) }
+    writeFileSync(copy, text)
+    mkdirSync(join(host, 'proc/101'), { recursive: true }); mkdirSync(join(host, 'proc/observer'))
+    writeFileSync(join(host, 'cpu.stat'), 'usage_usec 5000\nuser_usec 3000\nsystem_usec 2000\nnr_periods 10\nnr_throttled 2\nthrottled_usec 300\n')
+    writeFileSync(join(host, 'proc/101/stat'), '101 (bun (x) y) S 1 101 101 0 -1 4194304 10 0 0 0 250 75 0 0 20 0 9 0 100 0 0\n')
+    writeFileSync(join(host, 'proc/observer/stat'), 'garbage\n')
+    const burst = (out: string) => cli('burst', [batch, 'http://127.0.0.1:1', join(root, 'stub'), join(root, 'state'), out, '1000'])
+    expect(burst(join(root, 'plain')).status).toBe(0)
+    expect(existsSync(join(root, 'phase-cpu.jsonl'))).toBe(false)
+    writeFileSync(join(root, 'cpu-on'), 'server=101,stub=202\n')
+    const out = join(root, 'e')
+    expect(burst(out).status).toBe(0)
+    const cpu: PhaseCpuSample[] = readFileSync(join(root, 'phase-cpu.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
+    expect(cpu.map(s => s.phase)).toEqual(['roots', 'replies-drops', 'end'])
+    expect(cpu.every((s, i) => i === 0 || s.mono_ms >= cpu[i - 1]!.mono_ms)).toBe(true)
+    for (const s of cpu) expect({ cgroup: s.cgroup, procs: s.procs }).toEqual({
+      cgroup: { usage_usec: 5000, user_usec: 3000, system_usec: 2000, nr_periods: 10, nr_throttled: 2, throttled_usec: 300 },
+      procs: { server: { utime: 250, stime: 75 }, stub: null, observer: null } })
+    const ledger: BurstItem[] = readFileSync(join(out, 'burst.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
+    writeFileSync(join(out, 'times.jsonl'), lines(ledger.map((i, n) => ({ envelope_id: i.envelope_id, push: { sent_mono_ms: n, connection_id: 'c' },
+      acks: [{ ack_mono_ms: n + 5, connection_id: 'c' }] }))))
+    // The server answers only alpha's events here, each in 3 ms of a 1 ms ack call.
+    writeFileSync(join(root, 'measurements'), ledger.filter(i => i.key === keys[0]).map((i, n) => serverLine(ackTimingMeasurement({ keys: [i.key], ts: i.ts,
+      targets: [], outcome: 'acked', receiveToAckMs: 3, ackCallMs: 1, atMonoMs: 1000 + n * 10 + 4 }), 1000 + n * 10 + 4) + '\n').join(''))
+    const observed = cli('observe', [out, join(root, 'measurements'), '0', join(root, 'phase-cpu.jsonl')])
+    expect(observed.status).toBe(0); expect(observed.stderr).toBe('')
+    const printed = String(observed.stdout).trim().split('\n')
+    expect(printed[0]).toBe(`recorded: sr8 observe-inputs scenario=test-fault mode=strict population=0 recipients=2 samples=${SR8_BURST_JOINS + SR8_BURST_REPLIES + SR8_BURST_DROPPED} measurements=read burst=read times=read cpu=read limit=none verdict=recorded`)
+    expect(printed.filter(l => l.includes(' observe-cpu ')).map(l => l.replace(/ elapsed_ms=[\d.]+ /, ' elapsed_ms=E ')
+      .replace(/ cpus_busy=(0|unknown) /, ' cpus_busy=B '))).toEqual(['roots', 'replies-drops'].map(phase =>
+      `recorded: sr8 observe-cpu scenario=test-fault mode=strict population=0 recipients=2 samples=2 phase=${phase} elapsed_ms=E cpu_usage_ms=0 cpu_user_ms=0 cpu_system_ms=0 cpus_busy=B nr_periods=0 nr_throttled=0 throttled_ms=0 server_user_ms=0 server_system_ms=0 stub_user_ms=unknown stub_system_ms=unknown observer_user_ms=unknown observer_system_ms=unknown limit=none verdict=recorded`))
+    // One line per ledger event, ordinals 1..n per persona and phase; beta's events have no server row.
+    const events = printed.filter(l => l.includes(' observe-ack-event '))
+    expect(events).toHaveLength(ledger.length)
+    for (const key of keys) for (const phase of phases) {
+      const own = events.filter(l => l.includes(` phase=${phase} persona=${key} `)), count = ledger.filter(i => i.key === key && i.phase === phase).length
+      expect(own.map(l => Number(l.match(/ ordinal=(\d+) /)![1]))).toEqual(Array.from({ length: count }, (_, n) => n + 1))
+      expect(own.every(l => l.includes(key === keys[0] ? ' stub=acked stub_ms=5 server=acked server_ms=3 gap_ms=2 ' : ' stub=acked stub_ms=5 server=missing server_ms=none gap_ms=none '))).toBe(true)
+    }
+    expect(printed.find(l => l.includes(' observe-ack ') && l.includes(' phase=roots '))).toContain(
+      `samples=${2 * SR8_BURST_JOINS} phase=roots stub_events=${2 * SR8_BURST_JOINS} server_events=${SR8_BURST_JOINS} matched=${SR8_BURST_JOINS} stub_unacked=0 stub_ambiguous=0 server_ambiguous=0 suppressed=0 ack_failed=0 stub_p50_ms=5 stub_p99_ms=5 stub_max_ms=5 server_p50_ms=3 server_p99_ms=3 server_max_ms=3 gap_p50_ms=2 gap_p99_ms=2 gap_max_ms=2`)
+    expect(printed.filter(l => l.includes(' observe-ack-bin ') && l.includes(' phase=dropped '))).toHaveLength(10)
+    expect(printed.every(l => l.endsWith('limit=none verdict=recorded'))).toBe(true)
+    const absent = cli('observe', [join(root, 'absent'), join(root, 'absent'), '0', join(root, 'absent')])
+    expect(absent.status).toBe(0)
+    expect(String(absent.stdout)).toBe('recorded: sr8 observe-inputs scenario=test-fault mode=strict population=0 recipients=2 samples=0 measurements=missing burst=missing times=missing cpu=missing limit=none verdict=recorded\n')
+    expect(cli('observe', [out, join(root, 'measurements'), '0']).status).toBe(64)
+  }, `
+// Synthetic transport only in this copied CLI; the opt-in is set only when the test asks.
+{ const base = resolve(import.meta.dir, '../../..');
+  if (existsSync(join(base, 'cpu-on'))) { process.env.SR8_PHASE_CPU_FILE = join(base, 'phase-cpu.jsonl'); process.env.SR8_PHASE_CPU_PIDS = readFileSync(join(base, 'cpu-on'), 'utf8').trim() } }
+let seq = 0;
+globalThis.fetch = async (_url, init) => {
+  const base = resolve(import.meta.dir, '../../..'), b = JSON.parse(init.body), id = b.label + '-' + b.event.ts;
+  appendFileSync(join(base,'stub'), JSON.stringify({seq:++seq,event:'push',label:b.label,channel:b.event.channel,event_ts:b.event.ts,envelope_id:id})+'\\n');
+  appendFileSync(join(base,'stub'), JSON.stringify({seq:++seq,event:'ws-message',envelope_id:id})+'\\n');
+  return Response.json({ok:true,envelope_id:id});
+};
+`))
+  test('config adds the diagnostic timing switch only for its timings opt-in, which only test-44\'s burst case passes', () => withCLI(root => {
+    const dir = join(root, 'tests/integration/fixtures')
+    writeFileSync(join(dir, 'fmk-texts.ts'), `console.log(${JSON.stringify({ TEST_MEASUREMENTS_KEY, TEST_MEASUREMENT_TIMINGS_KEY,
+      testTimerOverridesBlock: '{"queue_compact_interval_ms":250}' })}[process.argv[2]]);`)
+    const config = (...extra: string[]) => spawnSync(process.execPath, [join(dir, 'sr8-evidence.ts'), 'config', 'strict', '0', '2', join(root, 'people'), '4100', '250', ...extra],
+      { env: hostSafeChildEnv(root, { extras: { SCENARIO_ROOT: root } }), encoding: 'utf8', timeout: 3000 })
+    const plain = config(), timed = config('timings')
+    expect([plain.status, timed.status]).toEqual([0, 0])
+    const off = JSON.parse(plain.stdout), on = JSON.parse(timed.stdout)
+    expect(off[TEST_MEASUREMENTS_KEY]).toBe(true); expect(Object.hasOwn(off, TEST_MEASUREMENT_TIMINGS_KEY)).toBe(false)
+    expect(on).toEqual({ ...off, [TEST_MEASUREMENT_TIMINGS_KEY]: true })
+    expect(config('other').status).not.toBe(0); expect(config('timings', 'timings').status).not.toBe(0)
+    // Scripts 32/45/48 reach config through the shared libs with six arguments; only test-44's burst case adds the opt-in.
+    const shells = (readdirSync(integration, { recursive: true }) as string[]).filter(f => f.endsWith('.sh'))
+    expect(shells.filter(f => /\(timings\)|\bconfig\b.*\btimings\b/.test(source(f)))).toEqual(['test-44-fmk-thread-burst.sh'])
+    expect(source('test-44-fmk-thread-burst.sh')).toContain('if [[ "${CASE}" == burst ]]; then\n    # The server\'s diagnostic ack/append/save rows, read only by observe below.\n    config_args+=(timings)\nfi\nbun "${SR8}" config "${config_args[@]}" | write_config\n')
+  }))
 })
 
 describe('SR-8 evidence verdicts (synthetic evidence, no runtime performance claim)', () => {

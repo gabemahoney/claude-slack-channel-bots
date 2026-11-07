@@ -111,6 +111,14 @@ export const TEST_MCP_DROP_ENDPOINT_KEY = 'test_mcp_drop_endpoint'
  * captured at start and is never applied by a reload.
  */
 export const TEST_MEASUREMENTS_KEY = 'test_measurements'
+/**
+ * The test-only diagnostic timing switch: a boolean, off unless `true`, and
+ * in effect only beside `test_measurements: true`. It adds the per-event
+ * `ack`, per-append `append` and per-save `thread-save` measurement lines,
+ * whose extra clock reads and work the other measured scenarios must not
+ * carry. Captured at start like `test_measurements`; never applied by a reload.
+ */
+export const TEST_MEASUREMENT_TIMINGS_KEY = 'test_measurement_timings'
 
 /** The keys of the test-only timer override block, each optional; milliseconds when the name ends `_ms`, seconds when it ends `_s`. */
 export const TEST_TIMER_OVERRIDE_KEYS = [
@@ -432,6 +440,8 @@ export interface ServerSettings {
   test_mcp_drop_endpoint?: boolean
   /** test-only, captured at startup and never applied by reload. */
   test_measurements?: boolean
+  /** test-only, captured at startup and never applied by reload. */
+  test_measurement_timings?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -634,6 +644,9 @@ function applyServerDefaults(input: ServerSettingsInput, configDir: string, cron
     }),
     ...((input as { test_measurements?: boolean }).test_measurements === undefined ? {} : {
       test_measurements: (input as { test_measurements?: boolean }).test_measurements,
+    }),
+    ...((input as { test_measurement_timings?: boolean }).test_measurement_timings === undefined ? {} : {
+      test_measurement_timings: (input as { test_measurement_timings?: boolean }).test_measurement_timings,
     }),
   }
 }
@@ -1110,7 +1123,7 @@ export function describeUnknownKeys(keys: readonly string[]): string {
 // ---------------------------------------------------------------------------
 
 /** Lookup form of PERSONA_TOP_LEVEL_KEYS. */
-const PERSONA_TOP_LEVEL_KEY_SET: ReadonlySet<string> = new Set([...PERSONA_TOP_LEVEL_KEYS, TEST_TIMER_OVERRIDES_KEY, TEST_MCP_DROP_ENDPOINT_KEY, TEST_MEASUREMENTS_KEY])
+const PERSONA_TOP_LEVEL_KEY_SET: ReadonlySet<string> = new Set([...PERSONA_TOP_LEVEL_KEYS, TEST_TIMER_OVERRIDES_KEY, TEST_MCP_DROP_ENDPOINT_KEY, TEST_MEASUREMENTS_KEY, TEST_MEASUREMENT_TIMINGS_KEY])
 
 /**
  * Top-level path settings that today's resolution expands without a type
@@ -1185,6 +1198,7 @@ function validatePersonaServerSettings(settings: PersonaServerSettings): void {
   validateTestTimerOverrides(settings.test_timer_overrides, style)
   if (settings.test_mcp_drop_endpoint !== undefined) checkBoolean(settings.test_mcp_drop_endpoint, TEST_MCP_DROP_ENDPOINT_KEY, style)
   if (settings.test_measurements !== undefined) checkBoolean(settings.test_measurements, TEST_MEASUREMENTS_KEY, style)
+  if (settings.test_measurement_timings !== undefined) checkBoolean(settings.test_measurement_timings, TEST_MEASUREMENT_TIMINGS_KEY, style)
 }
 
 // ---------------------------------------------------------------------------

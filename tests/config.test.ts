@@ -38,6 +38,7 @@ import {
   SERVER_PATH_SETTINGS,
   TEST_MCP_DROP_ENDPOINT_KEY,
   TEST_MEASUREMENTS_KEY,
+  TEST_MEASUREMENT_TIMINGS_KEY,
   TEST_TIMER_OVERRIDE_KEYS,
   TEST_TIMER_OVERRIDES_KEY,
   expandTilde,
@@ -1731,6 +1732,44 @@ describe('loadPersonaConfig', () => {
       expect(inEffect.test_measurements).toBe(start.test_measurements)
       expect(inEffect.test_timer_overrides).toEqual(start.test_timer_overrides)
       expect(effectiveTestTimer('queue_compact_interval_ms', inEffect.test_timer_overrides)).toBe(startInterval ?? QUEUE_COMPACT_INTERVAL_MS)
+    })
+
+    describe('test_measurement_timings', () => {
+      const withTimings = (value: unknown) => ({ ...makePersonaConfigInput({}, dir), [TEST_MEASUREMENT_TIMINGS_KEY]: value })
+
+      test('is named, outside every public key list and reload class, and absent unless set', () => {
+        expect(TEST_MEASUREMENT_TIMINGS_KEY).toBe('test_measurement_timings')
+        expect(PUBLIC_LISTS.filter(([, list]) => list.includes(TEST_MEASUREMENT_TIMINGS_KEY)).map(([name]) => name)).toEqual([])
+        const unset = load(makePersonaConfigInput({}, dir))
+        expect(Object.hasOwn(unset, TEST_MEASUREMENT_TIMINGS_KEY)).toBe(false)
+        for (const value of [true, false]) {
+          const loaded = load(withTimings(value))
+          expect(loaded.test_measurement_timings).toBe(value)
+          expect(without(loaded, TEST_MEASUREMENT_TIMINGS_KEY)).toStrictEqual(without(unset))
+        }
+      })
+
+      test.each<[string, unknown]>([
+        ['null', null],
+        ['one', 1],
+        ['a string', 'true'],
+        ['the leak sentinel as a string', LEAK_SENTINEL],
+        ['an object holding the leak sentinel', { value: LEAK_SENTINEL }],
+      ])('%s is refused as test_measurements is, naming the key and never the value', (_label, value) => {
+        const message = loadError(withTimings(value))
+        expect(message).toBe(loadError(withSwitch(value)).replace(TEST_MEASUREMENTS_KEY, TEST_MEASUREMENT_TIMINGS_KEY))
+        expect(message).toContain(`${TEST_MEASUREMENT_TIMINGS_KEY} must be a boolean.`)
+      })
+
+      test.each([[undefined, true], [true, undefined], [false, true]] as const)('%p to %p: a reload changes no setting and keeps the start-time value', (from, to) => {
+        const input = (value: boolean | undefined) => value === undefined ? makePersonaConfigInput({}, dir) : withTimings(value)
+        const start = load(input(from)), next = load(input(to))
+        const plan = buildChangePlan(start, { kind: 'valid', config: next }, { realPath: path => path, home, dryRun: true })
+        if (!plan.valid) throw new Error('expected a valid plan')
+        expect(plan.settings).toEqual([])
+        expect(plan.noEffectiveChange).toBe(true)
+        expect(configInEffect(start, next).test_measurement_timings).toBe(start.test_measurement_timings)
+      })
     })
   })
 

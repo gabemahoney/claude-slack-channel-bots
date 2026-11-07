@@ -189,6 +189,7 @@
  *   NAME_LOOKUP_TIMEOUT_MS                      src/tag-wrapper.ts
  *   QUEUE_COMPACT_INTERVAL_MS                   src/delivery-queue.ts
  *   TEST_MEASUREMENTS_KEY                       src/config.ts
+ *   TEST_MEASUREMENT_TIMINGS_KEY                src/config.ts
  *   TEST_MEASUREMENTS_FILE_NAME                 src/test-measurements.ts
  *   buildTestMeasurementsStartLine <path>        src/test-measurements.ts builder;
  *       prints the loud test-only start line, preserving the configured path.
@@ -5756,6 +5757,7 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   NAME_LOOKUP_TIMEOUT_MS: constantEntry('tag-wrapper.ts', 'NAME_LOOKUP_TIMEOUT_MS'),
   QUEUE_COMPACT_INTERVAL_MS: constantEntry('delivery-queue.ts', 'QUEUE_COMPACT_INTERVAL_MS'),
   TEST_MEASUREMENTS_KEY: constantEntry('config.ts', 'TEST_MEASUREMENTS_KEY'),
+  TEST_MEASUREMENT_TIMINGS_KEY: constantEntry('config.ts', 'TEST_MEASUREMENT_TIMINGS_KEY'),
   TEST_MEASUREMENTS_FILE_NAME: constantEntry('test-measurements.ts', 'TEST_MEASUREMENTS_FILE_NAME'),
   buildTestMeasurementsStartLine: builderEntry('test-measurements.ts', 'buildTestMeasurementsStartLine', ['path']),
   THREAD_MEMORY_SEAL_FILE: constantEntry('thread-memory-seal.ts', 'THREAD_MEMORY_SEAL_FILE'),

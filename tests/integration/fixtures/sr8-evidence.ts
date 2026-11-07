@@ -17,9 +17,11 @@
  *     Missing/duplicate pushes, malformed input or missing monotonic fields fail
  *     nonzero with a fixed named reason and NO partial output. Never applies N1.
  *     Before-clear and final observations MUST be separate files and calls.
- *   config <mode> <population> <recipients> <root> <port> <compact-ms>
+ *   config <mode> <population> <recipients> <root> <port> <compact-ms> [timings]
  *     Whole config; credentials root/<key>.env, work root/<key>. Pipe to write_config.
  *     Compact-ms is a test override, printed/validated by fmk-texts, never a limit.
+ *     `timings` adds the server's diagnostic timing switch beside test_measurements;
+ *     only test-44's burst case passes it, because its rows add server work.
  *   seed <config-path> <state-dir> <population>
  *     STOPPED server only, BEFORE its first start. If absent, creates the matching
  *     config.json.last-applied using initialSharedChannelState/serializeSharedChannelState.
@@ -149,6 +151,23 @@
  *     throttled_usec deltas since that mark (cpuConditionFields; unknown if unread).
  *   cpu-mark <new-file>
  *     Saves the cgroup cpu.stat counters (empty when unreadable) at a case's start.
+ *   observe C <burst-dir> <measurement-file> <byte-mark> <phase-cpu-file>
+ *     Test-44's latency observation, never a verdict: exits 0 and prints no summary.
+ *     The phase-cpu file is what burst appends when SR8_PHASE_CPU_FILE names it
+ *     (SR8_PHASE_CPU_PIDS=server=<pid>,stub=<pid>; the burst process is observer):
+ *     one cgroup cpu.stat and /proc/<pid>/stat reading at each wave's start and at
+ *     its end. Lines (verdict=recorded): observe-inputs; observe-cpu per wave
+ *     (probe, roots, replies-drops); observe-ack per burst phase, both ACK clocks
+ *     matched by key and Slack ts (stub push-to-ACK, the server's `acked` row's
+ *     receive-to-ACK, and their gap), with suppressed and failed attempts counted
+ *     and timed apart; observe-ack-bin, ten push-ordered runs per phase;
+ *     observe-append per server phase and journal (group size, append and
+ *     file/directory fsync times); observe-saves per server phase (stores, fixed
+ *     appends, Thread Memory saves); then observe-ack-event, one line per burst
+ *     event (persona, ordinal, push offset, each side's status and duration).
+ *     Server phases come from the `acked` rows on the server clock; clocks of
+ *     different processes never mix. The server writes `ack`, `append` and
+ *     `thread-save` rows only under config's `timings` opt-in.
  *
  * Additional case commands for scripts 44/45 (check, n4 and startup-load keep
  * their outputs). TSV files contain observations/identities, never Slack/control
@@ -471,6 +490,10 @@ export const SR8_DISPATCH_ALLOWANCE_MS = 100
 // SRD verification bounds, not configurable production timers.
 export const SR8_ACK_LIMIT_MS = 3_000
 export const SR8_STORE_LIMIT_MS = 50
+/** The server's test-only diagnostic measurement kinds; only `observe` reads them. */
+export const SR8_DIAGNOSTIC_KINDS: readonly string[] = ['ack', 'append', 'thread-save']
+/** Linux USER_HZ: the tick rate of /proc/<pid>/stat CPU times. */
+export const SR8_USER_HZ = 100
 export type Verdict = 'pass' | 'fail' | 'missing' | 'recorded'
 export interface Context { scenario: string; mode: 'strict' | 'open'; population: number; recipients: number }
 export interface Result { measure: string; samples: number; stats: Record<string, string | number>; limit: string | number; verdict: Verdict }
@@ -1479,8 +1502,10 @@ async function additional(command: string, c: Context, args: string[]): Promise<
       tsv(path('membership.tsv'), ['kind', 'envelope_id', 'event_id', 'stage_seq']), evidenceRows(stub), numeric(submit), numeric(done), timingRows(times), timingRows(path('membership-times.jsonl')))
   }
 }
+/** The verdicts' measurement rows. The server's diagnostic kinds feed only
+ * `observe` (SR8_DIAGNOSTIC_KINDS); any other unknown kind is still invalid. */
 function measurements(path: string, offset: number): Measurement[] | undefined {
-  const rows = jsonl(path, offset, true)
+  const rows = jsonl(path, offset, true)?.filter(r => !SR8_DIAGNOSTIC_KINDS.includes(r?.kind))
   return rows?.every(r => r.v === 1 && ['store', 'resolution-store', 'post-hold-resolved'].includes(r.kind)
     && typeof r.key === 'string' && nonnegative(r.at_mono_ms)) ? rows : undefined
 }
@@ -1495,16 +1520,17 @@ async function channels() {
   return p.eligibleChannels(p.populationChannels(p.SR8_POPULATION_CHANNEL_COUNT))
 }
 async function config(args: string[]) {
-  countArgs(args, 6)
-  const [mode, n, recipients, root, port, compact] = args
+  countArgs(args, 6, 7)
+  const [mode, n, recipients, root, port, compact, timings] = args
   const c = context(['config', mode, n, recipients]), p = await population()
+  if (timings !== undefined && timings !== 'timings') throw new Error('usage')
   const listed = [...(await channels()).map(id => ({ id, delivery: 'thread_hybrid' })), ...p.populationChannels(p.SR8_SHARED_LIST_CHANNELS, p.SR8_POPULATION_CHANNEL_COUNT)]
   const timers = JSON.parse(printer('testTimerOverridesBlock', `queue_compact_interval_ms=${compact}`))
   if (!Number.isSafeInteger(Number(port)) || Number(port) <= 0) throw new Error('usage')
   console.log(JSON.stringify({ channel_mode: c.mode, personas: p.sr8Personas(c.recipients).map(name => ({ name,
     credentials_file: join(resolve(root), `${name}.env`), working_directory: join(resolve(root), name), channels: listed,
     permission_prompts: listed[0].id, dm: { enabled: false } })), bind: '127.0.0.1', port: Number(port), health_check_interval: 0,
-    [printer('TEST_MEASUREMENTS_KEY')]: true, test_timer_overrides: timers }, null, 2))
+    [printer('TEST_MEASUREMENTS_KEY')]: true, ...(timings ? { [printer('TEST_MEASUREMENT_TIMINGS_KEY')]: true } : {}), test_timer_overrides: timers }, null, 2))
 }
 async function seed(args: string[]) {
   countArgs(args, 3)
@@ -1897,6 +1923,14 @@ async function burst(c: Context, args: string[]): Promise<number> {
     }
   }
   let failed = false
+  const cpuFile = process.env.SR8_PHASE_CPU_FILE, cpuPids = phasePids(process.env.SR8_PHASE_CPU_PIDS, process.pid)
+  const phaseCpu = (phase: string) => {
+    if (!cpuFile) return
+    try {
+      const sample = phaseCpuSample(phase, performance.now(), cgroupCpuStat(), cpuPids.map(([name, pid]) => [name, textFile(`/proc/${pid}/stat`)]))
+      appendFileSync(cpuFile, JSON.stringify(sample) + '\n', { mode: 0o600 })
+    } catch { /* an observation never changes the burst */ }
+  }
   const timer = setInterval(observe, 20)
   const send = async (phase: string, body: any) => {
     const item: BurstItem = { key: body.label, phase, channel: body.event.channel, ts: body.event.ts, sender: body.event.user }
@@ -1921,16 +1955,19 @@ async function burst(c: Context, args: string[]): Promise<number> {
   try {
     const held = batches.find(b => b.phase === 'held')
     if (held) {
+      phaseCpu('probe')
       await Promise.all(held.rows.map(body => send('held', body)))
       if (failed || !await waitAcks(submitted) || !await holdAdmission(submitted, stateDir, measurement!, numeric(mark), Number(rawWait), out)) return 1
     }
+    phaseCpu('roots')
     await Promise.all(batches[0].rows.map(body => send('roots', body)))
     if (failed || !await waitAcks(submitted)) return 1
     // Pending-post probes lead the second wave, so later burst pushes surround them.
     const wave = ['probes', 'replies', 'dropped'].flatMap(phase => batches.filter(b => b.phase === phase))
+    phaseCpu('replies-drops')
     await Promise.all(wave.flatMap(b => b.rows.map(body => send(b.phase, body))))
     return failed || !await waitAcks(submitted) ? 1 : 0
-  } finally { clearInterval(timer); console.log(`recorded: sr8 burst submitted=${submitted.length} expected=${expectedCount} push_failures=${submitted.filter(i => !i.envelope_id).length}`) }
+  } finally { clearInterval(timer); phaseCpu('end'); console.log(`recorded: sr8 burst submitted=${submitted.length} expected=${expectedCount} push_failures=${submitted.filter(i => !i.envelope_id).length}`) }
 }
 
 async function check(c: Context, args: string[]): Promise<Result[]> {
@@ -2026,6 +2063,223 @@ export function cpuConditionFields(cpuMax: string | undefined, before: string | 
   const delta = (pick: (t: NonNullable<typeof a>) => number) => a && b && pick(b) >= pick(a) ? String(pick(b) - pick(a)) : 'unknown'
   return `cpu_max=${max ? `${max[1]}/${max[2]}` : 'unknown'} nr_periods_delta=${delta(t => t.periods)} nr_throttled_delta=${delta(t => t.throttled)} throttled_usec_delta=${delta(t => t.throttledUsec)}`
 }
+
+/** The cgroup's cpu.stat counters: v2 usage/user/system microseconds, and the
+ * throttling counters through cpuThrottle (v1 has no usage here). Pure. */
+export function cgroupCpuCounters(text: string | undefined): Record<string, number> | undefined {
+  if (text === undefined) return undefined
+  const counters: Record<string, number> = {}
+  for (const name of ['usage_usec', 'user_usec', 'system_usec']) {
+    const m = text.match(new RegExp(`^${name} (\\d+)$`, 'm'))
+    if (m) counters[name] = Number(m[1])
+  }
+  const t = cpuThrottle(text)
+  if (t) Object.assign(counters, { nr_periods: t.periods, nr_throttled: t.throttled, throttled_usec: t.throttledUsec })
+  return Object.keys(counters).length ? counters : undefined
+}
+/** A process's whole-process utime/stime ticks from /proc/<pid>/stat. Pure. */
+export function procCpuTicks(text: string | undefined): { utime: number; stime: number } | undefined {
+  const close = text?.lastIndexOf(')') ?? -1
+  if (!text || close < 0) return undefined
+  // After "pid (comm) ", field 3 (state) is index 0: utime (14) and stime (15) are 11 and 12.
+  const fields = text.slice(close + 1).trim().split(/\s+/)
+  return /^\d+$/.test(fields[11] ?? '') && /^\d+$/.test(fields[12] ?? '') ? { utime: Number(fields[11]), stime: Number(fields[12]) } : undefined
+}
+/** `name=pid,...` from the script; the observing process is always `observer`. Pure. */
+export function phasePids(spec: string | undefined, self: number): [string, number][] {
+  const named = (spec ?? '').split(',').map(s => s.match(/^([a-z]+)=(\d+)$/)).filter(m => m !== null && m[1] !== 'observer')
+    .map(m => [m![1], Number(m![2])] as [string, number])
+  return [...named, ['observer', self]]
+}
+export interface PhaseCpuSample { phase: string; mono_ms: number; cgroup: Record<string, number> | null; procs: Record<string, { utime: number; stime: number } | null> }
+/** One boundary reading: the phase starting here, or `end`. Pure. */
+export function phaseCpuSample(phase: string, monoMs: number, cpuStat: string | undefined, procs: [string, string | undefined][]): PhaseCpuSample {
+  return { phase, mono_ms: monoMs, cgroup: cgroupCpuCounters(cpuStat) ?? null, procs: Object.fromEntries(procs.map(([name, stat]) => [name, procCpuTicks(stat) ?? null])) }
+}
+const round3 = (n: number) => Math.round(n * 1000) / 1000
+/** Per phase, between consecutive boundary readings: elapsed observer time,
+ * cgroup CPU and throttling deltas, and each process's user/system CPU. A
+ * counter unread at either end, or going backwards, is `unknown`. Pure. */
+export function phaseCpuResults(samples: PhaseCpuSample[]): Result[] {
+  const delta = (a: number | undefined, b: number | undefined, factor: number) => a !== undefined && b !== undefined && b >= a ? round3((b - a) * factor) : 'unknown'
+  return samples.slice(0, -1).map((a, i) => {
+    const b = samples[i + 1]!, elapsed = b.mono_ms - a.mono_ms, usage = delta(a.cgroup?.usage_usec, b.cgroup?.usage_usec, 1 / 1000)
+    const stats: Result['stats'] = { phase: a.phase, elapsed_ms: round3(elapsed), cpu_usage_ms: usage,
+      cpu_user_ms: delta(a.cgroup?.user_usec, b.cgroup?.user_usec, 1 / 1000), cpu_system_ms: delta(a.cgroup?.system_usec, b.cgroup?.system_usec, 1 / 1000),
+      cpus_busy: typeof usage === 'number' && elapsed > 0 ? round3(usage / elapsed) : 'unknown',
+      nr_periods: delta(a.cgroup?.nr_periods, b.cgroup?.nr_periods, 1), nr_throttled: delta(a.cgroup?.nr_throttled, b.cgroup?.nr_throttled, 1),
+      throttled_ms: delta(a.cgroup?.throttled_usec, b.cgroup?.throttled_usec, 1 / 1000) }
+    for (const name of Object.keys(b.procs)) {
+      stats[`${name}_user_ms`] = delta(a.procs[name]?.utime, b.procs[name]?.utime, 1000 / SR8_USER_HZ)
+      stats[`${name}_system_ms`] = delta(a.procs[name]?.stime, b.procs[name]?.stime, 1000 / SR8_USER_HZ)
+    }
+    return result('observe-cpu', 2, stats, 'none', 'recorded')
+  })
+}
+
+/** A burst item's phase in the observed waves: held probes, roots, then the second wave. */
+const SR8_WAVES: Record<string, string> = { held: 'probe', roots: 'roots', probes: 'replies-drops', replies: 'replies-drops', dropped: 'replies-drops' }
+/** The server's ack outcomes: only `acked` is a receive-to-ACK sample. */
+const SR8_ACK_OUTCOMES = ['acked', 'ack-failed', 'suppressed'] as const
+export interface AckRow { kind: 'ack'; keys: string[]; ts?: string; outcome: typeof SR8_ACK_OUTCOMES[number]; receive_to_ack_ms: number; ack_call_ms?: number; at_mono_ms: number }
+/** The stub side: one ACK, none after a push, more than one, or no push timing. */
+export type StubAckStatus = 'acked' | 'unacked' | 'ambiguous' | 'missing'
+/** The server side: one row by its outcome, more than one row, or none. */
+export type ServerAckStatus = typeof SR8_ACK_OUTCOMES[number] | 'ambiguous' | 'missing'
+/** One burst event: its persona and ordinal (ledger order within persona and
+ * phase), both clocks' status, and the durations each side measured. `server`,
+ * `received` and `acked` exist only for an `acked` row; a suppressed or failed
+ * attempt carries only `attempt` (receipt to suppression or to the failed call). */
+export interface ClockSample {
+  phase: string; wave: string; key: string; ordinal: number; sent?: number
+  stub_status: StubAckStatus; stub?: number; server_status: ServerAckStatus; server?: number; attempt?: number; received?: number; acked?: number
+}
+const ackRow = (r: any): r is AckRow => r?.kind === 'ack' && Array.isArray(r.keys) && typeof r.ts === 'string' && SR8_ACK_OUTCOMES.includes(r.outcome)
+  && nonnegative(r.receive_to_ack_ms) && nonnegative(r.at_mono_ms) && (r.ack_call_ms === undefined || nonnegative(r.ack_call_ms))
+/** Both ACK clocks for every burst event, matched by persona key and Slack ts:
+ * the stub's push-to-ACK (one ACK only) and the server's receive-to-ACK (one
+ * `acked` row only), with that row's receipt and ACK times on the server clock.
+ * Every ledger item gives one sample, whatever either side saw. Pure. */
+export function ackClockSamples(items: BurstItem[], times: Times[], rows: any[]): ClockSample[] {
+  const timing = new Map(times.map(t => [t.envelope_id, t])), server = new Map<string, AckRow[]>(), ordinals = new Map<string, number>()
+  for (const r of rows) if (ackRow(r)) for (const key of r.keys) {
+    const id = `${key}\t${r.ts}`
+    server.set(id, [...server.get(id) ?? [], r])
+  }
+  return items.map(item => {
+    const t = item.envelope_id ? timing.get(item.envelope_id) : undefined, own = server.get(`${item.key}\t${item.ts}`) ?? []
+    const row = own.length === 1 ? own[0]! : undefined, ordinal = (ordinals.get(`${item.key}\t${item.phase}`) ?? 0) + 1
+    ordinals.set(`${item.key}\t${item.phase}`, ordinal)
+    const stub_status: StubAckStatus = !t ? 'missing' : t.acks.length === 1 ? 'acked' : t.acks.length ? 'ambiguous' : 'unacked'
+    return { phase: item.phase, wave: SR8_WAVES[item.phase] ?? item.phase, key: item.key, ordinal, ...(t ? { sent: t.push.sent_mono_ms } : {}),
+      stub_status, ...(stub_status === 'acked' ? { stub: t!.acks[0]!.ack_mono_ms - t!.push.sent_mono_ms } : {}),
+      server_status: row ? row.outcome : own.length ? 'ambiguous' : 'missing',
+      ...(row?.outcome === 'acked' ? { server: row.receive_to_ack_ms, received: row.at_mono_ms - (row.ack_call_ms ?? 0) - row.receive_to_ack_ms, acked: row.at_mono_ms }
+        : row ? { attempt: row.receive_to_ack_ms } : {}) }
+  })
+}
+type Percentile = (values: number[], q: number) => number
+const spread = (prefix: string, values: number[], percentile: Percentile): Result['stats'] => values.length
+  ? { [`${prefix}_p50_ms`]: round3(percentile(values, .5)), [`${prefix}_p99_ms`]: round3(percentile(values, .99)), [`${prefix}_max_ms`]: round3(maximum(values)) }
+  : { [`${prefix}_p50_ms`]: 'none', [`${prefix}_p99_ms`]: 'none', [`${prefix}_max_ms`]: 'none' }
+const phasesOf = (samples: ClockSample[]) => [...new Set(samples.map(s => s.phase))]
+/** Per burst phase: event and match counts, the stub's unACKed and doubled
+ * events, the server's doubled, suppressed and failed attempts, then p50/p99/max
+ * of the stub clock, the server's `acked` clock, their difference (stub minus
+ * server, matched events), and the suppressed and failed attempts' durations. */
+export function ackClockResults(samples: ClockSample[], percentile: Percentile): Result[] {
+  return phasesOf(samples).map(phase => {
+    const own = samples.filter(s => s.phase === phase), matched = own.filter(s => s.stub !== undefined && s.server !== undefined)
+    const count = (pick: (s: ClockSample) => boolean) => own.filter(pick).length
+    const attempts = (status: ServerAckStatus) => own.flatMap(s => s.server_status === status ? [s.attempt!] : [])
+    return result('observe-ack', own.length, { phase, stub_events: count(s => s.stub !== undefined),
+      server_events: count(s => s.server !== undefined), matched: matched.length,
+      stub_unacked: count(s => s.stub_status === 'unacked'), stub_ambiguous: count(s => s.stub_status === 'ambiguous'),
+      server_ambiguous: count(s => s.server_status === 'ambiguous'), suppressed: count(s => s.server_status === 'suppressed'),
+      ack_failed: count(s => s.server_status === 'ack-failed'),
+      ...spread('stub', own.flatMap(s => s.stub ?? []), percentile), ...spread('server', own.flatMap(s => s.server ?? []), percentile),
+      ...spread('gap', matched.map(s => s.stub! - s.server!), percentile),
+      ...spread('suppressed', attempts('suppressed'), percentile), ...spread('ack_failed', attempts('ack-failed'), percentile) }, 'none', 'recorded')
+  })
+}
+/** One line per burst event, in ledger order: persona and ordinal, its push
+ * offset from the phase's first push (stub clock), each side's status and
+ * duration, their gap, and a suppressed or failed attempt's duration. Pure. */
+export function ackEventResults(samples: ClockSample[]): Result[] {
+  const first = new Map<string, number>()
+  for (const s of samples) if (s.sent !== undefined) first.set(s.phase, Math.min(first.get(s.phase) ?? s.sent, s.sent))
+  const ms = (n: number | undefined) => n === undefined ? 'none' : round3(n)
+  return samples.map(s => result('observe-ack-event', 1, { phase: s.phase, persona: /^[a-z][a-z0-9-]*$/.test(s.key) ? s.key : 'invalid', ordinal: s.ordinal,
+    offset_ms: s.sent === undefined ? 'none' : round3(s.sent - first.get(s.phase)!), stub: s.stub_status, stub_ms: ms(s.stub),
+    server: s.server_status, server_ms: ms(s.server), gap_ms: s.stub !== undefined && s.server !== undefined ? round3(s.stub - s.server) : 'none',
+    attempt_ms: ms(s.attempt) }, 'none', 'recorded'))
+}
+/** Each phase's pushed events in stub push order, cut into `bins` equal runs,
+ * with each run's maximum of both clocks: whether latency builds through a wave. */
+export function ackBinResults(samples: ClockSample[], bins: number): Result[] {
+  const max = (values: number[]) => values.length ? round3(maximum(values)) : 'none'
+  return phasesOf(samples).flatMap(phase => {
+    const own = samples.filter(s => s.phase === phase && s.sent !== undefined).sort((a, b) => a.sent! - b.sent!), n = Math.min(bins, own.length)
+    return Array.from({ length: n }, (_, i) => {
+      const run = own.slice(Math.floor(i * own.length / n), Math.floor((i + 1) * own.length / n))
+      return result('observe-ack-bin', run.length, { phase, bin: i + 1, bins: n, stub_max_ms: max(run.flatMap(s => s.stub ?? [])),
+        server_max_ms: max(run.flatMap(s => s.server ?? [])), gap_max_ms: max(run.flatMap(s => s.stub !== undefined && s.server !== undefined ? [s.stub - s.server] : [])) }, 'none', 'recorded')
+    })
+  })
+}
+export interface ServerWave { wave: string; start: number; end: number }
+/** Each wave's span on the server clock: its first `acked` receipt to its last
+ * ACK, in time order; suppressed and failed attempts never bound a wave. Pure. */
+export function serverWaves(samples: ClockSample[]): ServerWave[] {
+  const waves = [...new Set(samples.map(s => s.wave))].flatMap(wave => {
+    const own = samples.filter(s => s.wave === wave && s.received !== undefined)
+    return own.length ? [{ wave, start: Math.min(...own.map(s => s.received!)), end: Math.max(...own.map(s => s.acked!)) }] : []
+  })
+  return waves.sort((a, b) => a.start - b.start)
+}
+/** A server time's phase: `before` the first wave, the wave whose start it
+ * follows until the next wave starts, `after` the last wave's final ACK. */
+export function serverPhase(at: number, waves: ServerWave[]): string {
+  if (!waves.length) return 'unphased'
+  if (at < waves[0]!.start) return 'before'
+  const last = waves.filter(w => w.start <= at).at(-1)!
+  return last === waves.at(-1) && at > last.end ? 'after' : last.wave
+}
+interface AppendRow { journal: string; key: string; records: number; bytes: number; append_ms: number; file_fsync_ms: number; dir_fsync_ms: number; fsyncs: number; at_mono_ms: number }
+const appendRow = (r: any): r is AppendRow => r?.kind === 'append' && typeof r.journal === 'string'
+  && [r.records, r.append_ms, r.file_fsync_ms, r.dir_fsync_ms, r.fsyncs, r.at_mono_ms].every(nonnegative)
+const phaseOrder = (waves: ServerWave[]) => ['before', ...waves.map(w => w.wave), 'after', 'unphased']
+/** Per server phase and journal: appends, group size (records per append) and
+ * the append's, file fsync's and directory fsync's p50/p99/max and total. An
+ * append's phase is its start (completion minus duration). Pure. */
+export function appendResults(rows: any[], waves: ServerWave[], percentile: Percentile): Result[] {
+  const appends = rows.filter(appendRow).map(r => ({ ...r, phase: serverPhase(r.at_mono_ms - r.append_ms, waves) }))
+  const total = (values: number[]) => round3(values.reduce((n, v) => n + v, 0))
+  return phaseOrder(waves).flatMap(phase => ['queue', 'thread-memory'].flatMap(journal => {
+    const own = appends.filter(a => a.phase === phase && a.journal === journal)
+    if (!own.length) return []
+    const groups = own.map(a => a.records)
+    return [result('observe-append', own.length, { phase, journal, records: groups.reduce((n, v) => n + v, 0),
+      group_p50: percentile(groups, .5), group_p99: percentile(groups, .99), group_max: maximum(groups),
+      ...spread('append', own.map(a => a.append_ms), percentile), append_total_ms: total(own.map(a => a.append_ms)),
+      ...spread('file_fsync', own.map(a => a.file_fsync_ms), percentile), file_fsync_total_ms: total(own.map(a => a.file_fsync_ms)),
+      ...spread('dir_fsync', own.map(a => a.dir_fsync_ms), percentile), dir_fsync_total_ms: total(own.map(a => a.dir_fsync_ms)),
+      fsyncs: own.reduce((n, a) => n + a.fsyncs, 0) }, 'none', 'recorded')]
+  }))
+}
+/** Per server phase: timed stores, `fixed` appends and Thread Memory saves
+ * (count and records by kind), each at its row's own server time. Pure. */
+export function saveResults(rows: any[], waves: ServerWave[]): Result[] {
+  const at = (r: any) => nonnegative(r?.at_mono_ms) ? serverPhase(r.at_mono_ms, waves) : undefined
+  const stores = rows.filter(r => r?.kind === 'store'), saves = rows.filter(r => r?.kind === 'thread-save' && [r.records, r.joins, r.intents, r.outcomes].every(nonnegative))
+  const sum = (list: any[], field: string) => list.reduce((n, r) => n + r[field], 0)
+  return phaseOrder(waves).flatMap(phase => {
+    const own = stores.filter(r => at(r) === phase), mine = saves.filter(r => at(r) === phase), wave = waves.find(w => w.wave === phase)
+    if (!own.length && !mine.length && !wave) return []
+    return [result('observe-saves', own.length + mine.length, { phase, span_ms: wave ? round3(wave.end - wave.start) : 'none',
+      stores: own.filter(r => r.store !== 'fixed').length, fixed: own.filter(r => r.store === 'fixed').length, thread_saves: mine.length,
+      save_records: sum(mine, 'records'), joins: sum(mine, 'joins'), intents: sum(mine, 'intents'), outcomes: sum(mine, 'outcomes') }, 'none', 'recorded')]
+  })
+}
+export interface ObserveInputs { rows?: any[]; items?: BurstItem[]; times?: Times[]; cpu?: PhaseCpuSample[] }
+/** Every observe line, in order: inputs, CPU per phase, ACK clocks, ACK runs,
+ * appends, saves, then one ACK line per burst event. Observation only: every
+ * verdict is `recorded`. Pure. */
+export function observeResults(inputs: ObserveInputs, percentile: Percentile): Result[] {
+  const state = (v: unknown[] | undefined) => v === undefined ? 'missing' : 'read'
+  const samples = ackClockSamples(inputs.items ?? [], inputs.times ?? [], inputs.rows ?? []), waves = serverWaves(samples)
+  return [result('observe-inputs', inputs.rows?.length ?? 0, { measurements: state(inputs.rows), burst: state(inputs.items), times: state(inputs.times), cpu: state(inputs.cpu) }, 'none', 'recorded'),
+    ...phaseCpuResults(inputs.cpu ?? []), ...ackClockResults(samples, percentile), ...ackBinResults(samples, 10),
+    ...appendResults(inputs.rows ?? [], waves, percentile), ...saveResults(inputs.rows ?? [], waves), ...ackEventResults(samples)]
+}
+const phaseCpuRow = (r: any): r is PhaseCpuSample => typeof r?.phase === 'string' && nonnegative(r.mono_ms) && (r.cgroup === null || object(r.cgroup)) && object(r.procs)
+async function observe(args: string[]): Promise<Result[]> {
+  countArgs(args, 4)
+  const [dir, file, mark, cpuFile] = args, { percentile } = await import('./transcript-receipts.ts')
+  const cpu = jsonl(cpuFile, 0, true), items = jsonl(join(dir, 'burst.jsonl'), 0, true)
+  return observeResults({ rows: integer(numeric(mark)) ? jsonl(file, Number(mark), true) : undefined, items: records(items) ? items : undefined,
+    times: timingRows(join(dir, 'times.jsonl')), cpu: cpu?.every(phaseCpuRow) ? cpu : undefined }, percentile)
+}
 function cgroupCpuMax() {
   const v2 = textFile('/sys/fs/cgroup/cpu.max')
   if (v2 !== undefined) return v2
@@ -2084,6 +2338,7 @@ async function main(args: string[]): Promise<number> {
   if (command === 'n4') return printResults(c, await n4(c, args))
   if (command === 'windows') return printResults(c, await windows(c, args))
   if (command === 'concurrent-overlap') return printResults(c, concurrentOverlap(c, args))
+  if (command === 'observe') { for (const r of await observe(args)) console.log(resultLine(c, r)); return 0 }
   const extra = await additional(command!, c, args)
   if (extra) return printResults(c, extra)
   throw new Error('usage')

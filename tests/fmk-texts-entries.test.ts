@@ -874,6 +874,7 @@ test('SR-8 printer entries print the current package exports', () => sharedPrint
   const rows: Array<[string, string[], string | number]> = [
     ['TEST_MEASUREMENTS_FILE_NAME', [], testMeasurements.TEST_MEASUREMENTS_FILE_NAME],
     ['TEST_MEASUREMENTS_KEY', [], config.TEST_MEASUREMENTS_KEY],
+    ['TEST_MEASUREMENT_TIMINGS_KEY', [], config.TEST_MEASUREMENT_TIMINGS_KEY],
     ['DELIVERY_MAX_AD_CALLS_PER_S', [], deliveryConstants.DELIVERY_MAX_AD_CALLS_PER_S],
     ['NAME_LOOKUP_TIMEOUT_MS', [], tagWrapper.NAME_LOOKUP_TIMEOUT_MS],
     ['QUEUE_COMPACT_INTERVAL_MS', [], deliveryQueue.QUEUE_COMPACT_INTERVAL_MS],

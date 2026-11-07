@@ -49,7 +49,12 @@ elif [[ "${CASE}" == pending ]]; then
     # pending-post checks against the measured window.
     compact_ms="$(printed effectiveTestTimer queue_compact_interval_ms)"
 fi
-bun "${SR8}" config "${mode}" "${population}" "${recipients}" "${CASE_ROOT}" "${SCENARIO_PORT}" "${compact_ms}" | write_config
+config_args=("${mode}" "${population}" "${recipients}" "${CASE_ROOT}" "${SCENARIO_PORT}" "${compact_ms}")
+if [[ "${CASE}" == burst ]]; then
+    # The server's diagnostic ack/append/save rows, read only by observe below.
+    config_args+=(timings)
+fi
+bun "${SR8}" config "${config_args[@]}" | write_config
 OVERRIDES_LINE="$(printed buildTestTimerOverridesLine "queue_compact_interval_ms=${compact_ms}")"
 OVERRIDES_STEM="$(overrides_stem "${OVERRIDES_LINE}")" || exit 1
 MEASUREMENTS="${SLACK_STATE_DIR}/$(printed TEST_MEASUREMENTS_FILE_NAME)"
@@ -238,7 +243,9 @@ case "${CASE}" in
             bun "${SR8}" bodies "${key}" "${BATCH}/${key}.held.events.jsonl" >> "${BATCH}/held.batch.jsonl"
         done
         burst_status=0
-        bun "${SR8}" burst "${CONTEXT[@]}" "${BATCH}" "${SCENARIO_SLACK_STUB_URL}" \
+        # Observer-only CPU readings at each wave boundary, for observe below.
+        SR8_PHASE_CPU_FILE="${RESULTS}/phase-cpu.jsonl" SR8_PHASE_CPU_PIDS="server=${SERVER_PID},stub=${SLACK_PID}" \
+            bun "${SR8}" burst "${CONTEXT[@]}" "${BATCH}" "${SCENARIO_SLACK_STUB_URL}" \
             "${SCENARIO_SLACK_RECORD}" "${SLACK_STATE_DIR}" "${RESULTS}" 30000 \
             "${MEASUREMENTS}" "${measurement_mark}" || burst_status=$?
         # Observe zero as well as positive ACKs; check judges the exact set.
@@ -267,6 +274,10 @@ case "${CASE}" in
         for key in "${KEYS[@]}"; do shared_thread_joins "${key}" > "${RESULTS}/${key}.after.jsonl"; done
         clean_stop
         closing_assertions
+        # Latency decomposition only: no verdict, and never this script's status.
+        # It prints before check, whose failure ends the script.
+        bun "${SR8}" observe "${CONTEXT[@]}" "${RESULTS}" "${RESULTS}/measurements.jsonl" "${measurement_mark}" \
+            "${RESULTS}/phase-cpu.jsonl" || printf 'recorded: sr8 observe unavailable\n'
         bun "${SR8}" check "${CONTEXT[@]}" "${RESULTS}" "${RESULTS}/measurements.jsonl" "${measurement_mark}" "${start_ms}" "${ready_ms}"
         [[ "${burst_status}" == 0 ]] || fail 'burst submission or ACK observation failed'
         ;;

@@ -28,7 +28,10 @@ import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import type { DeliveryQueueOptions, QueueEvent, QueueThreadJoin, DeliveryQueue } from '../src/delivery-queue.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
 import { installTestTimerOverrides } from '../src/test-timer-overrides.ts'
-import { TEST_MEASUREMENTS_FILE_NAME, buildTestMeasurementsStartLine, createTestMeasurements, queueEventMeasurement, postHoldEventMeasurement, type TestMeasurements, type TestMeasurementsDeps, type TestMeasurement } from '../src/test-measurements.ts'
+import { TEST_MEASUREMENTS_FILE_NAME, buildTestMeasurementsStartLine, createTestMeasurements, queueEventMeasurement, postHoldEventMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, type TestMeasurements, type TestMeasurementsDeps, type TestMeasurement } from '../src/test-measurements.ts'
+import type { DurableAppendTimer } from '../src/durable-journal.ts'
+import type { AckTiming } from '../src/persona-routing.ts'
+import type { ThreadMemorySave } from '../src/thread-memory.ts'
 import { createDeliveryReporting, MESSAGE_RECEIVED } from '../src/delivery-notices.ts'
 import { createPersonaBringUpController } from '../src/persona-bringup-controller.ts'
 import { composePersonaStatusListeners, createPersonaUpFlushListener } from '../src/persona-start.ts'
@@ -4439,7 +4442,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
       'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
       'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS, 'getChannelDelivery', 'membership',
       'threadMemory', 'pendingOwnPosts', 'joins', 'threadStampUndecided', 'threadStampEpisodes', 'onHoldStored', ROUTING_OWN_MESSAGE,
-      'monotonicNow', 'postHolds',
+      'monotonicNow', 'ackTiming', 'postHolds',
     ]
     expect([...onlyCallProps('createPersonaRouting').keys()].sort()).toEqual([...MEMBERS].sort())
   })
@@ -5552,6 +5555,8 @@ describe('test-only measurement wiring (Decision 25)', () => {
   const branchAt = statements.findIndex(node => ts.isIfStatement(node) && node.expression.getText(tree) === 'testMeasurementsEnabled')
   const installAt = statementAt(onlyCallOf('installTestTimerOverrides'))
   const branch = statements[branchAt]!
+  const timingsBranch = ((branch as ts.IfStatement).thenStatement as ts.Block).statements
+    .find(node => ts.isIfStatement(node) && node.expression.getText(tree) === 'personaConfig.test_measurement_timings === true')!
   const shutdown = tree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'shutdown') as ts.FunctionDeclaration
   const stopAt = onlyCallOf('testMeasurements\\.stop')
   const stopStatement = shutdown.body!.statements.find(node => node.getStart(tree) <= stopAt && stopAt < node.end)!
@@ -5567,10 +5572,11 @@ describe('test-only measurement wiring (Decision 25)', () => {
 
   /** Execute the actual start binding and reload callback over isolated ports.
    * This does not call main or model a complete server start/stop. */
-  function wired(enabled: boolean | undefined, interval?: number, throws?: 'record' | 'queue-mapper' | 'post-mapper') {
+  function wired(enabled: boolean | undefined, interval?: number, throws?: 'record' | 'queue-mapper' | 'post-mapper', timings?: boolean) {
     const root = mkdtempSync(join(tmpdir(), 'cscb-measurement-wiring-')); roots.push(root)
     const config = makeMultiPersonaConfig([], root, {
       ...(enabled === undefined ? {} : { test_measurements: enabled }),
+      ...(timings === undefined ? {} : { test_measurement_timings: timings }),
       ...(interval === undefined ? {} : { test_timer_overrides: { queue_compact_interval_ms: interval } }),
     })
     const clock = createFakeClock({ start: 555.25 }), logs: string[] = []
@@ -5578,17 +5584,28 @@ describe('test-only measurement wiring (Decision 25)', () => {
     const forwarded: QueueEvent[] = [], original = (event: QueueEvent) => { forwarded.push(event) }
     const deliveryQueueEvents = { emit: original }
     const postHoldDeps: Pick<PostHoldsModule.PostHoldResolverDeps, 'onEvent'> = {}
+    let appendTimer: DurableAppendTimer | undefined, saveObserver: ((save: ThreadMemorySave) => void) | undefined
     let created = 0, unrefs = 0
-    const result = expression<() => { stop(): Promise<void>; apply(config: PersonaConfig): void; recorder(): TestMeasurements | undefined }>(`() => {
+    const result = expression<() => {
+      stop(): Promise<void>; apply(config: PersonaConfig): void; recorder(): TestMeasurements | undefined
+      ackObserver(): ((timing: AckTiming) => void) | undefined
+    }>(`() => {
       let personaConfig = config, appliedConfig = config;
-      let testMeasurements, unsubscribeTestMeasurements;
+      let testMeasurements, unsubscribeTestMeasurements, ackTimingObserver;
       ${statements.slice(installAt, branchAt + 1).map(node => node.getText(tree)).join('\n')}
-      return { stop: async () => { ${stopCode} }, apply: ${onlyCallProps('createReloadController').get('onApplied')!}, recorder: () => testMeasurements };
+      return { stop: async () => { ${stopCode} }, apply: ${onlyCallProps('createReloadController').get('onApplied')!}, recorder: () => testMeasurements,
+        ackObserver: () => ackTimingObserver };
     }`, {
       config, installTestTimerOverrides, configInEffect,
       deliveryPreparation: undefined, sharedStateReporting: undefined,
       deliveryQueue: { setMeasureTimings: (value: boolean) => { flags.push(value) }, startMaintenance: (ms: number) => { intervals.push(['queue', ms]) } },
-      threadMemory: { startMaintenance: (ms: number) => { intervals.push(['memory', ms]) } },
+      threadMemory: {
+        startMaintenance: (ms: number) => { intervals.push(['memory', ms]) },
+        setSaveObserver: (observer: typeof saveObserver) => { saveObserver = observer },
+      },
+      performance: { now: clock.now },
+      setDurableAppendTimer: (timer: DurableAppendTimer | undefined) => { appendTimer = timer },
+      ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement,
       STATE_DIR: root, join, TEST_MEASUREMENTS_FILE_NAME, buildTestMeasurementsStartLine,
       fsPromises: fs.promises, appendFileSync: fs.appendFileSync,
       setTimeout: (callback: () => void, ms: number) => Object.assign(clock.setTimeout(callback, ms), { unref() { unrefs++ } }),
@@ -5604,6 +5621,7 @@ describe('test-only measurement wiring (Decision 25)', () => {
     })
     const run = result(); stops.push(run.stop)
     return { ...run, root, config, clock, logs, flags, intervals, recorded, forwarded, deliveryQueueEvents, original, postHoldDeps,
+      appendTimer: () => appendTimer, saveObserver: () => saveObserver,
       created: () => created, unrefs: () => unrefs, path: join(root, TEST_MEASUREMENTS_FILE_NAME) }
   }
 
@@ -5616,12 +5634,34 @@ describe('test-only measurement wiring (Decision 25)', () => {
     expect(indicesOf(/\btest_measurements\b/g, SERVER_CODE)).toHaveLength(1)
     expect(callsOf('reload\\.resolveStart')).toHaveLength(1)
     expect(statements[enabledAt]!.getStart(tree)).toBeGreaterThan(startResolution(SERVER_CODE).assignAt)
+    const within = (at: number, node: ts.Node) => { expect(at).toBeGreaterThan(node.getStart(tree)); expect(at).toBeLessThan(node.end) }
     for (const name of ['createTestMeasurements', 'buildTestMeasurementsStartLine', 'queueEventMeasurement', 'postHoldEventMeasurement']) {
       expect(importSource(SERVER_CODE, name)).toBe('./test-measurements.ts')
-      const at = onlyCallOf(name)
-      expect(at).toBeGreaterThan(branch.getStart(tree))
-      expect(at).toBeLessThan(branch.end)
+      within(onlyCallOf(name), branch)
+      expect(timingsBranch.getText(tree)).not.toContain(`${name}(`)
     }
+    // The per-event timings need their own switch, read once, strictly, inside the measurement branch.
+    expect(timingsBranch).toBeDefined()
+    expect(indicesOf(/\btest_measurement_timings\b/g, SERVER_CODE)).toHaveLength(1)
+    for (const name of ['ackTimingMeasurement', 'durableAppendMeasurement', 'threadSaveMeasurement']) {
+      expect(importSource(SERVER_CODE, name)).toBe('./test-measurements.ts')
+      within(onlyCallOf(name), timingsBranch)
+    }
+    // Each timing observer is installed only in the timings branch; the cleanup clears all three in the measurement branch.
+    expect(importSource(SERVER_CODE, 'setDurableAppendTimer')).toBe('./durable-journal.ts')
+    for (const name of ['setDurableAppendTimer', 'threadMemory\\??\\.setSaveObserver']) {
+      const calls = callsOf(name)
+      expect(calls).toHaveLength(2)
+      for (const at of calls) within(at, branch)
+      expect(calls.filter(at => at > timingsBranch.getStart(tree) && at < timingsBranch.end)).toHaveLength(1)
+    }
+    // Intake asks for the ack observer at each receipt; only the timings branch sets it, and the cleanup clears it.
+    expect(onlyCallProps('createPersonaRouting').get('ackTiming')).toBe('() => ackTimingObserver')
+    expect(SERVER_CODE).toMatch(/^let ackTimingObserver: \(\(timing: AckTiming\) => void\) \| undefined$/m)
+    const sets = indicesOf(/\backTimingObserver = /g, SERVER_CODE)
+    expect(sets).toHaveLength(2)
+    for (const at of sets) within(at, branch)
+    expect(sets.filter(at => at > timingsBranch.getStart(tree) && at < timingsBranch.end)).toHaveLength(1)
     expect(onlyCallArgs('deliveryQueue\\.setMeasureTimings')).toEqual(['true'])
     expect(onlyCallOf('deliveryQueue\\.setMeasureTimings')).toBeGreaterThan(branch.getStart(tree))
     expect(onlyCallOf('deliveryQueue\\.setMeasureTimings')).toBeLessThan(branch.end)
@@ -5683,13 +5723,21 @@ describe('test-only measurement wiring (Decision 25)', () => {
     expect(h.flags).toEqual([])
     expect(h.deliveryQueueEvents.emit).toBe(h.original)
     expect(h.postHoldDeps.onEvent).toBeUndefined()
-    h.apply({ ...h.config, test_measurements: true })
+    const noNewObservers = () => {
+      expect(h.ackObserver()).toBeUndefined()
+      expect(h.appendTimer()).toBeUndefined()
+      expect(h.saveObserver()).toBeUndefined()
+    }
+    noNewObservers()
+    h.apply({ ...h.config, test_measurements: true, test_measurement_timings: true })
     h.deliveryQueueEvents.emit({ type: 'fixed-stored', key: 'reader', seq: 7, storeMs: 4, atMonoMs: 90 })
+    noNewObservers()
     await h.stop()
     expect(h.created()).toBe(0)
     expect(h.flags).toEqual([])
     expect(h.deliveryQueueEvents.emit).toBe(h.original)
     expect(h.postHoldDeps.onEvent).toBeUndefined()
+    noNewObservers()
     expect(h.logs).toEqual([])
     expect(h.clock.pendingCount()).toBe(0)
     expect(existsSync(h.path)).toBe(false)
@@ -5698,8 +5746,30 @@ describe('test-only measurement wiring (Decision 25)', () => {
     assertNoLeak(h.logs)
   })
 
+  test.each([undefined, false])('test_measurement_timings=%s with test_measurements on: the store rows are recorded, but no timing observer is installed, even after reload turns it on', async timings => {
+    const h = wired(true, undefined, undefined, timings)
+    expect(h.created()).toBe(1)
+    expect(h.flags).toEqual([true])
+    expect(h.postHoldDeps.onEvent).toBeFunction()
+    const noTimingObservers = () => {
+      expect(h.ackObserver()).toBeUndefined()
+      expect(h.appendTimer()).toBeUndefined()
+      expect(h.saveObserver()).toBeUndefined()
+    }
+    noTimingObservers()
+    h.apply({ ...h.config, test_measurement_timings: true })
+    noTimingObservers()
+    h.deliveryQueueEvents.emit({ type: 'stored', key: 'reader', seq: 7, store: 'accepted', storeMs: 2, atMonoMs: 80 })
+    await h.stop()
+    noTimingObservers()
+    expect(readFileSync(h.path, 'utf8').trim().split('\n').map(line => JSON.parse(line))).toEqual([
+      { v: 1, kind: 'store', key: 'reader', seq: 7, store: 'accepted', store_ms: 2, at_mono_ms: 80 },
+    ])
+    assertNoLeak({ logs: h.logs, file: writtenFile(h.path) })
+  })
+
   test('enabled: timed queue facts and saved Post Holds reach the file, timer is unref\'d, reload keeps the observer, stop detaches it', async () => {
-    const h = wired(true)
+    const h = wired(true, undefined, undefined, true)
     expect(h.created()).toBe(1)
     expect(h.flags).toEqual([true])
     expect(h.logs).toEqual([buildTestMeasurementsStartLine(h.path)])
@@ -5713,12 +5783,19 @@ describe('test-only measurement wiring (Decision 25)', () => {
     ]
     events.forEach(event => h.deliveryQueueEvents.emit(event))
     const observer = h.postHoldDeps.onEvent
-    h.apply({ ...h.config, test_measurements: false })
+    h.apply({ ...h.config, test_measurements: false, test_measurement_timings: false })
     expect(h.postHoldDeps.onEvent).toBe(observer)
     h.postHoldDeps.onEvent!({ kind: 'post-hold-resolved', key: 'reader', seq: 8, outcome: 'released', cause: 'restart' })
+    // The new observers: the routing ack hook, the journal timer (on performance.now, the recorder's clock) and the Thread Memory save observer.
+    expect(h.ackObserver()).toBeFunction()
+    expect(h.appendTimer()!.now()).toBe(555.25)
+    h.ackObserver()!({ keys: ['reader'], ts: '1730000000.000100', targets: [{ key: 'reader', seq: 7 }], outcome: 'acked', receiveToAckMs: 5, ackCallMs: 1, atMonoMs: 110 })
+    h.appendTimer()!.record({ dir: join(h.root, 'queue'), path: join(h.root, 'queue', 'reader.jsonl'), records: 3, bytes: 300, appendMs: 9, fileFsyncMs: 6, dirFsyncMs: 2, fsyncs: 2, atMonoMs: 120 })
+    h.appendTimer()!.record({ dir: join(h.root, 'queue'), path: join(h.root, 'queue', 'reader.unreadable'), records: 1, bytes: 10, appendMs: 1, fileFsyncMs: 1, dirFsyncMs: 0, fsyncs: 2, atMonoMs: 121 })
+    h.saveObserver()!({ key: 'reader', records: 2, joins: 1, intents: 1, outcomes: 0 })
     expect(h.unrefs()).toBe(1)
     expect(h.forwarded).toEqual(events)
-    expect(h.recorded).toHaveLength(4)
+    expect(h.recorded).toHaveLength(7)
     await h.stop()
     const records = readFileSync(h.path, 'utf8').trim().split('\n').map(line => JSON.parse(line))
     expect(records).toEqual([
@@ -5726,10 +5803,16 @@ describe('test-only measurement wiring (Decision 25)', () => {
       { v: 1, kind: 'store', key: 'reader', seq: 7, store: 'fixed', store_ms: 4, at_mono_ms: 90 },
       { v: 1, kind: 'resolution-store', key: 'reader', seqs: [8], store_ms: 3, at_mono_ms: 100 },
       { v: 1, kind: 'post-hold-resolved', key: 'reader', seq: 8, outcome: 'released', cause: 'restart', at_mono_ms: 555.25 },
+      { v: 1, kind: 'ack', at_mono_ms: 110, keys: ['reader'], ts: '1730000000.000100', targets: [{ key: 'reader', seq: 7 }], outcome: 'acked', receive_to_ack_ms: 5, ack_call_ms: 1 },
+      { v: 1, kind: 'append', at_mono_ms: 120, journal: 'queue', key: 'reader', records: 3, bytes: 300, append_ms: 9, file_fsync_ms: 6, dir_fsync_ms: 2, fsyncs: 2 },
+      { v: 1, kind: 'thread-save', at_mono_ms: 555.25, key: 'reader', records: 2, joins: 1, intents: 1, outcomes: 0 },
     ])
     expect(h.clock.pendingCount()).toBe(0)
     expect(h.deliveryQueueEvents.emit).toBe(h.original)
     expect(h.postHoldDeps.onEvent).toBeUndefined()
+    expect(h.ackObserver()).toBeUndefined()
+    expect(h.appendTimer()).toBeUndefined()
+    expect(h.saveObserver()).toBeUndefined()
     expect(h.created()).toBe(1)
     assertNoLeak({ logs: h.logs, file: writtenFile(h.path) })
   })
@@ -5765,7 +5848,10 @@ describe('test-only measurement wiring (Decision 25)', () => {
       ts.forEachChild(node, visit)
     }
     visit(tree)
-    expect(cleanup).toEqual(['() => { deliveryQueueEvents.emit = emit; delete postHoldDeps.onEvent }'])
+    expect(cleanup).toEqual([`() => {
+      deliveryQueueEvents.emit = emit; delete postHoldDeps.onEvent; ackTimingObserver = undefined
+      setDurableAppendTimer(undefined); threadMemory?.setSaveObserver(undefined)
+    }`])
   })
 
   test.each([undefined, false, true])('shutdown switch=%s: disabled adds no yield; enabled waits before detach and exit', async enabled => {

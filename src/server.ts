@@ -213,7 +213,7 @@ import { createSlowRecoveryTracker } from './slow-recovery.ts'
 import { createDeliveryReporting } from './delivery-notices.ts'
 import { createSharedStateReporting } from './shared-state-reports.ts'
 import { buildDeliveryDiagnostic, buildQueuedMessageRetryLine, SYSTEM_PROMPT_UNWRITABLE, queueErrorCode } from './persona-diagnostics.ts'
-import { createPersonaRouting } from './persona-routing.ts'
+import { createPersonaRouting, type AckTiming } from './persona-routing.ts'
 import { createDeliveryQueue, isOpenItem, type ReplyReminderQueue, type QueueEvent, type QueueItem } from './delivery-queue.ts'
 import { createOwnPostObserver, createOwnPostJoins, ownPostChoice, ownPostEligibility, ownPostStampState, pendingOwnPostViews, type OwnPostJoins } from './own-post.ts'
 import { createOwnPostLookups, type OwnPostLookups, type OwnPostLookupEvent } from './own-post-lookup.ts'
@@ -362,7 +362,8 @@ import {
 import { buildPersonaClientOrExit, runAgentDirectorStartupGate, createDeliveryClientFactory } from './agent-director-startup.ts'
 import { disposeAdVersionRecheck, installAdVersionRecheck, onAdVersionChanged } from './ad-version-gate.ts'
 import { installTestTimerOverrides } from './test-timer-overrides.ts'
-import { createTestMeasurements, buildTestMeasurementsStartLine, TEST_MEASUREMENTS_FILE_NAME, queueEventMeasurement, postHoldEventMeasurement, type TestMeasurements } from './test-measurements.ts'
+import { createTestMeasurements, buildTestMeasurementsStartLine, TEST_MEASUREMENTS_FILE_NAME, queueEventMeasurement, postHoldEventMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, type TestMeasurements } from './test-measurements.ts'
+import { setDurableAppendTimer } from './durable-journal.ts'
 import {
   adAlertThresholdMsInEffect,
   adSettingsInEffect,
@@ -1156,6 +1157,8 @@ let postHolds: PostHoldResolver | undefined
 let unsubscribePostHolds: (() => void) | undefined
 let testMeasurements: TestMeasurements | undefined
 let unsubscribeTestMeasurements: (() => void) | undefined
+/** Set only by the measurement record; intake reads it at each receipt. */
+let ackTimingObserver: ((timing: AckTiming) => void) | undefined
 const HOLD_CLOCK: PostHoldClock = {
   now: () => performance.now(),
   setTimeout: (callback, ms) => { const timer = setTimeout(callback, ms); timer.unref(); return timer },
@@ -1299,6 +1302,7 @@ const personaRouting = createPersonaRouting({
     else if (mode === 'recovered') bufferedHeldReleases.set(`${key}:${item.accepted.seq}`, { key, item })
   },
   monotonicNow: HOLD_CLOCK.now,
+  ackTiming: () => ackTimingObserver,
   postHolds: { held: (key, hold) => postHolds?.held(key, hold) },
   onHoldStored: key => {
     try { void resolveMemoryHolds(key).catch(() => {}) } catch { /* independent hold owners */ }
@@ -3241,7 +3245,20 @@ export async function main(): Promise<void> {
     postHoldDeps.onEvent = event => {
       try { const entry = postHoldEventMeasurement(event); if (entry) recorder.record(entry) } catch { /* isolated measurement observer */ }
     }
-    unsubscribeTestMeasurements = () => { deliveryQueueEvents.emit = emit; delete postHoldDeps.onEvent }
+    // The per-event timings add work to every receipt, append and save, so
+    // only the scenario that reads them turns them on.
+    if (personaConfig.test_measurement_timings === true) {
+      ackTimingObserver = timing => { recorder.record(ackTimingMeasurement(timing)) }
+      setDurableAppendTimer({
+        now: () => performance.now(),
+        record: timing => { const entry = durableAppendMeasurement(timing, STATE_DIR); if (entry) recorder.record(entry) },
+      })
+      threadMemory.setSaveObserver(save => { recorder.record(threadSaveMeasurement(save)) })
+    }
+    unsubscribeTestMeasurements = () => {
+      deliveryQueueEvents.emit = emit; delete postHoldDeps.onEvent; ackTimingObserver = undefined
+      setDurableAppendTimer(undefined); threadMemory?.setSaveObserver(undefined)
+    }
   }
   // startup failure is local; every launch retries the write and fails closed.
   const prepareSystemPrompt = (key: string): void => {

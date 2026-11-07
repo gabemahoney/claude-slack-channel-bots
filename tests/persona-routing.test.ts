@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { WebClient } from '@slack/web-api'
-import { createPersonaRouting } from '../src/persona-routing.ts'
+import { createPersonaRouting, type AckTiming } from '../src/persona-routing.ts'
 import { durableWriteFileSync, DurableWriteUnsyncedError } from '../src/atomic-write.ts'
 import { buildTagParts, NAME_LOOKUP_TIMEOUT_MS } from '../src/tag-wrapper.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
@@ -21,7 +21,7 @@ import { makeRestartDeps, makeRoutingHarness, observedMembership, resetRoutingSt
 import { broadcastText, makeAppMention, makeChannelMessage, makeDm, makeGroupDmMessage, makeBotMessage, makeOwnFileShare, makeWebhookPost, makeStubSlack, makeDeferredWebApiCall, makeMembershipEvent, mentionText, ENVELOPE_FLAG_FORMS, type OwnFileShareOptions, type SlackEvent } from './test-helpers/slack-stub.ts'
 import type { ChannelMode } from '../src/config.ts'
 import type { PersonaEventProvenance } from '../src/persona-connections.ts'
-import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
+import { assertNoLeak, LEAK_SENTINEL, sentinelInMessage } from './test-helpers/credentials.ts'
 import { readQueue, seedQueue, slackInput, injectedInput, queuePath, memoryHold, postHold } from './test-helpers/delivery-queue.ts'
 import { OWN_ROOT_CLOCK_SKEW_MS } from '../src/delivery-constants.ts'
 import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
@@ -1576,6 +1576,45 @@ test('partial fanout suppresses ack; retry prepares retained accepted-only A and
   failing = false; order.length = 0; await routing.receive(event, () => { order.push('ack') }, ['alpha', 'beta'])
   expect(order).toEqual(['store:beta', 'ack', 'received:alpha', 'received:beta', 'prepare:alpha', 'prepare:beta'])
   for (const key of ['alpha', 'beta']) { expect(queue.items(key)).toHaveLength(1); expect(queue.items(key)[0]!.fixed!.parts).toEqual(['fixed']); expect(readQueue(dir, key).filter(r => r.kind === 'accepted' && !('compact' in r))).toHaveLength(1) }; await queue.stop()
+})
+test('test-only ack timing: off by default with no extra clock read; on, one fact per event for acked, suppressed and failed acks, without content', async () => {
+  const queue = await makeQueue(dir); const config = makeMultiPersonaConfig([{ name: 'alpha', channels: [{ id: CS, delivery: 'all' }] }, { name: 'beta', channels: [{ id: CS, delivery: 'all' }] }], dir)
+  const clock = createFakeClock({ start: 100 })
+  let failing = true, reads = 0, observer: ((timing: AckTiming) => void) | undefined
+  const timings: AckTiming[] = [], order: string[] = []
+  const routing = createPersonaRouting({ ...selectionInputs(config, [CA, CB, CS]), getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }), archive: () => {}, log: () => {},
+    monotonicNow: () => { reads++; return clock.now() }, ackTiming: () => observer,
+    queue: { lookupSlackKey: queue.lookupSlackKey, acceptDecided: queue.acceptDecided, accept: async (key, input) => { await clock.advance(10); return key === 'beta' && failing ? { status: 'failed', error: new Error('EIO') } : queue.accept(key, input) } },
+    onReceived: () => {}, prepare: async () => {} })
+  try {
+    const event = makeChannelMessage({ channel: CS, text: `private ${LEAK_SENTINEL}` })
+    // Off: receipt is the only clock read, and ordering is unchanged.
+    await routing.receive(event, () => { order.push('ack') }, ['alpha', 'beta'])
+    expect(reads).toBe(1); expect(order).toEqual([])
+    observer = timing => { timings.push(timing) }
+    await routing.receive(event, () => { order.push('ack') }, ['alpha', 'beta'])
+    expect(reads).toBe(3); expect(order).toEqual([])
+    failing = false
+    await routing.receive(event, () => { order.push('ack'); return clock.advance(3).then(() => {}) }, ['beta', 'alpha'])
+    expect(reads).toBe(6); expect(order).toEqual(['ack'])
+    const seqs = { alpha: queue.items('alpha')[0]!.accepted.seq, beta: queue.items('beta')[0]!.accepted.seq }, ts = event.ts as string
+    expect(timings).toEqual([
+      { keys: ['alpha', 'beta'], ts, targets: [{ key: 'alpha', seq: seqs.alpha }], outcome: 'suppressed', receiveToAckMs: 10, atMonoMs: 120 },
+      { keys: ['beta', 'alpha'], ts, targets: [{ key: 'alpha', seq: seqs.alpha }, { key: 'beta', seq: seqs.beta }], outcome: 'acked', receiveToAckMs: 10, ackCallMs: 3, atMonoMs: 133 },
+    ])
+    await routing.receive(event, () => { throw new Error('socket closed') }, 'alpha')
+    expect(timings.at(-1)).toMatchObject({ keys: ['alpha'], outcome: 'ack-failed', receiveToAckMs: 0, ackCallMs: 0 })
+    assertNoLeak(timings)
+    // A throwing observer changes nothing; with no receipt clock there is no fact.
+    observer = () => { throw new Error('observer failed') }
+    await routing.receive(event, () => { order.push('ack') }, 'alpha')
+    expect(order).toEqual(['ack', 'ack'])
+  } finally { await queue.stop() }
+  const unclocked = createPersonaRouting({ ...selectionInputs(config, [CA, CB, CS]), getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }), archive: () => {}, log: () => {},
+    ackTiming: () => { throw new Error('asked without a receipt clock') }, queue: { lookupSlackKey: () => undefined, acceptDecided: queue.acceptDecided, accept: async () => ({ status: 'failed', error: new Error('EIO') }) },
+    onReceived: () => {}, prepare: async () => {} })
+  await unclocked.receive({ type: 'not-a-message' }, () => { order.push('ack') }, 'alpha')
+  expect(order).toEqual(['ack', 'ack', 'ack'])
 })
 test('a fresh routing factory acknowledges a preexisting fixed undelivered Slack item without recovery or another received report', async () => {
   const queue = await makeQueue(dir)

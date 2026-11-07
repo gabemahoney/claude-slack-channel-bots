@@ -78,6 +78,18 @@ const FUNGIBLE_MODE: ChannelMode = 'open'
 export type SlackAck = () => Promise<void> | void
 
 /**
+ * One event's acknowledgement timing. `targets` are the queue items the event
+ * stored or matched, ordered by key then seq; `ts` is the event's own `ts`
+ * when it has one. `receiveToAckMs` ends when the ack is called, or when a
+ * failed store suppresses it; `ackCallMs` is the ack call itself.
+ */
+export interface AckTiming {
+  keys: string[]; ts?: string; targets: Array<{ key: string; seq: number }>
+  outcome: 'acked' | 'ack-failed' | 'suppressed'
+  receiveToAckMs: number; ackCallMs?: number; atMonoMs: number
+}
+
+/**
  * The persona config fields this module reads: the personas, the restart
  * delay, and the `channel_mode` switch, read through
  * `channelModeOf` at each event.
@@ -99,6 +111,13 @@ interface SerialSelection {
 export interface PersonaRoutingDeps {
   /** Receipt time for the Post Hold deadline, before the serial intake wait. */
   monotonicNow?: () => number
+  /**
+   * Test-only (`test_measurement_timings`): the observer told, after the ack attempt
+   * or its suppression, how long the event took from receipt on
+   * `monotonicNow`. Asked once at receipt; with none (the default), receive
+   * reads no further clock. The observer's throw is ignored.
+   */
+  ackTiming?(): ((timing: AckTiming) => void) | undefined
   /** Registers each stored Post Hold in its store's synchronous turn, with monotonicNow's receipt time; its throw is ignored. */
   postHolds?: Pick<PostHoldResolver, 'held'>
   /** Read the live Thread Memory view only when the decision needs a reply's membership. */
@@ -323,6 +342,24 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     return provenance?.key === key ? provenance.identity : deps.getBotIdentity(key)
   }
 
+  /** Hand one event's ack timing to the test-only observer; the second reading ends the ack call or the suppression. */
+  function reportAckTiming(
+    observer: (timing: AckTiming) => void, event: unknown, personaKeys: string | readonly string[], receivedAt: number,
+    targets: Array<{ key: string; seq: number }>, outcome: AckTiming['outcome'], ackCalledAt?: number,
+  ): void {
+    try {
+      const atMonoMs = deps.monotonicNow!()
+      const ts = typeof event === 'object' && event !== null ? (event as Record<string, unknown>)['ts'] : undefined
+      observer({
+        keys: typeof personaKeys === 'string' ? [personaKeys] : [...personaKeys],
+        ...(typeof ts === 'string' ? { ts } : {}),
+        targets: [...targets].sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : a.seq - b.seq),
+        outcome, receiveToAckMs: (ackCalledAt ?? atMonoMs) - receivedAt,
+        ...(ackCalledAt !== undefined ? { ackCallMs: atMonoMs - ackCalledAt } : {}), atMonoMs,
+      })
+    } catch { /* a measurement cannot change intake */ }
+  }
+
   async function receive(
     event: unknown,
     ack: SlackAck,
@@ -334,6 +371,8 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     if (provenance?.candidate) { deps.membership?.request(provenance.key); return }
     if (provenance?.applied && !provenance.isCurrent()) { await ack(); return }
     if (provenance && !provenance.applied) return
+    const ackTiming = receivedAt !== undefined ? deps.ackTiming?.() : undefined
+    const ackTargets: Array<{ key: string; seq: number }> | undefined = ackTiming ? [] : undefined
     const afterAck: Array<() => Promise<void>> = []
     const accepted: Array<() => void> = []
     const saveJoins: Array<() => void> = []
@@ -379,6 +418,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
             if (selection) reportSerialSelection(key, ev, slackKey, selection)
             if (selection?.requestMembership || result.status === 'failed') storeFailed = true
             if (result.status === 'skipped' || result.status === 'failed') return
+            if (result.item) ackTargets?.push({ key, seq: result.item.accepted.seq })
             if (result.status === 'accepted' && selection?.join) {
               const fact = selection.join
               saveJoins.push(() => {
@@ -399,6 +439,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
           // A retry after partial fanout must prepare the already retained, unfixed target too.
           const duplicate = slackKey ? deps.queue.lookupSlackKey(key, slackKey) : undefined
           if (duplicate && duplicate.status !== 'failed') {
+            if (duplicate.item) ackTargets?.push({ key, seq: duplicate.item.accepted.seq })
             if (duplicate.item?.hold?.state === 'unresolved') heldKeys.add(key)
             if (duplicate.item && !duplicate.item.fixed && isOpenItem(duplicate.item)) {
               report(duplicate.item)
@@ -442,6 +483,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
           try {
             const result = await deps.queue.accept(key, input)
             if (result.status === 'failed') { storeFailed = true; return }
+            if (result.item) ackTargets?.push({ key, seq: result.item.accepted.seq })
             if (result.item && isOpenItem(result.item)) { report(result.item); afterAck.push(post(result.item)) }
           } catch { storeFailed = true }
         } catch (err) {
@@ -453,8 +495,14 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     }
     // A failed sibling suppresses the aggregate ack, but retained targets still
     // deserve queued feedback. Preparation/recovery continue only after ack.
-    if (storeFailed) { for (const save of saveJoins) save(); for (const report of accepted) report(); return }
-    try { await ack() } catch (err) { deps.log(`[slack] persona-routing: failed to ack event${describeSlackCallFailure(err)}`) }
+    if (storeFailed) {
+      if (ackTiming) reportAckTiming(ackTiming, event, personaKeys, receivedAt!, ackTargets!, 'suppressed')
+      for (const save of saveJoins) save(); for (const report of accepted) report(); return
+    }
+    const ackCalledAt = ackTiming ? deps.monotonicNow!() : undefined
+    let ackFailed = false
+    try { await ack() } catch (err) { ackFailed = true; deps.log(`[slack] persona-routing: failed to ack event${describeSlackCallFailure(err)}`) }
+    if (ackTiming) reportAckTiming(ackTiming, event, personaKeys, receivedAt!, ackTargets!, ackFailed ? 'ack-failed' : 'acked', ackCalledAt)
     for (const save of saveJoins) save()
     for (const report of accepted) report()
     for (const key of heldKeys) {
