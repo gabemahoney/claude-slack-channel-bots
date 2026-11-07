@@ -1,6 +1,6 @@
 /** run the real scenario assertions over synthetic AD/receipt evidence.
  * No scenario is sourced, no native process is launched, and clocks are fake. */
-import { describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -35,8 +35,9 @@ import { MEMBERSHIP_REQUEST_TIMEOUT_MS, MEMBERSHIP_ATTEMPT_TIMEOUT_MS, MEMBERSHI
 import { startSlackStub, type StubAnswers } from './integration/fixtures/slack-stub-server.ts'
 import { MEMBERSHIP_INVENTORY_INCOMPLETE, MEMBERSHIP_INVENTORY_COMPLETE, membershipScanDiagnostic } from '../src/channel-membership-scan.ts'
 import { MEMBERSHIP_STORAGE_FAILED, membershipDiagnostic } from '../src/channel-membership.ts'
-import { burstSpec, sr8Personas, sr8Combinations, SR8_BURST_JOINS, SR8_BURST_REPLIES, SR8_BURST_DROPPED } from './test-helpers/thread-memory.ts'
-import { makeQueue, slackInput, heldSlackInput, postHold, queuePath } from './test-helpers/delivery-queue.ts'
+import { burstSpec, sr8Personas, sr8Combinations, SR8_BURST_JOINS, SR8_BURST_REPLIES, SR8_BURST_DROPPED, readThreads } from './test-helpers/thread-memory.ts'
+import { makeQueue, slackInput, heldSlackInput, postHold, queuePath, readQueue } from './test-helpers/delivery-queue.ts'
+import { makeRoutingHarness, observedMembership, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness } from './test-helpers/persona-routing-harness.ts'
 
 const integration = join(import.meta.dir, 'integration')
 const source = (file: string) => readFileSync(join(integration, file), 'utf8')
@@ -1667,6 +1668,74 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     const child = cli('seal', ['@/log', '0', '@/config'], { log: THREAD_MEMORY_JOINS_LOST + ' ' + token,
       config: JSON.stringify({ personas: [key, 'beta'].map(name => ({ name, channels: [] })) }) })
     expect(child.status).toBe(1); expect(child.stdout).toContain('reports=1 loaded=0 limit=0 verdict=fail')
+  })
+})
+
+describe('test-44 root payloads through durable intake (synthetic only)', () => {
+  let root: string, h: RoutingHarness | undefined
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'test44-intake-')); h = undefined; resetRoutingState() })
+  afterEach(async () => {
+    try {
+      if (h) {
+        h.hold.cancelAll(); h.releaseLaunches()
+        await h.ready(); await h.settleJoinSaves(); await h.threads!.close(); await h.queue.stop()
+        assertNoLeak(h.captured())
+      }
+    } finally { resetRoutingState(); rmSync(root, { recursive: true, force: true }) }
+  })
+  test.each(['strict', 'open'] as const)('%s roots store and join before the unmentioned reply; plain messages still drop', async mode => {
+    const keys = sr8Personas(2), channel = 'C0LARGE00003'
+    h = makeRoutingHarness(keys.map(name => ({ name, channels: [{ id: channel, delivery: 'thread_hybrid' }] })), root, {
+      mode, threadMemory: {}, membership: observedMembership(Object.fromEntries(keys.map(key => [key, [channel]]))),
+      restartDelayS: NEVER_FIRE_RESTART_DELAY_S,
+    })
+    await h.ready()
+    const spec = burstSpec({ mode, population: 0, recipients: keys.length }, [channel], 1_800_000_000)
+    // One root/reply/drop from the real plan. Execute the scenario's actual
+    // builder, shared by burst and pending, without its integration entrypoint.
+    const plan = [['roots', spec.rootMentions[0]], ['replies', spec.replies[0]], ['dropped', spec.dropped[0]]] as const
+    const built = shell([
+      'require_ci_image() { :; }',
+      ...['_scenario_channel_type', 'slack_message_event', 'slack_mention_event', 'slack_reply_event'].map(name => declaration(scenario, name)),
+      `mode=${mode}; BATCH="$HOME"; HUMAN=U0BURST; OTHER=U0PARENT`,
+      'message="test-44 burst"',
+      `mention='<@${h.p(keys[1]!).stub.identity.botUserId}> <@${h.p(keys[0]!).stub.identity.botUserId}> test-44 burst'`,
+      block(source('test-44-fmk-thread-burst.sh'), "    while IFS=$'\\t' read -r phase channel ts root _mentioned; do", '\n    for key in "${KEYS[@]}"; do'),
+      'cat "$BATCH/roots.events.jsonl" "$BATCH/replies.events.jsonl" "$BATCH/dropped.events.jsonl"',
+    ].join('\n'), { 'plan.tsv': plan.map(([phase, m]) => [phase, m!.channel, m!.ts, m!.threadTs ?? '-', m!.mentions.length].join('\t')).join('\n') + '\n' })
+    expect({ status: built.status, stderr: built.stderr }).toEqual({ status: 0, stderr: '' })
+    const events = built.stdout.trim().split('\n').map(line => JSON.parse(line))
+    expect(events).toHaveLength(plan.length)
+    expect(events.map(e => e.text)).toEqual([
+      `<@${h.p(keys[1]!).stub.identity.botUserId}> <@${h.p(keys[0]!).stub.identity.botUserId}> test-44 burst`,
+      'test-44 burst', 'test-44 burst',
+    ])
+    const atAck: unknown[] = []
+    for (const event of events) for (const key of keys) {
+      await h.receive(event, [key], () => {
+        // Read the journal at ACK, so an in-memory-only acceptance cannot pass.
+        const records = existsSync(queuePath(root, key)) ? readQueue(root, key) : []
+        atAck.push({ key, stored: records.filter(r => r.kind === 'accepted' && 'ts' in r).map(r => r.ts),
+          joined: h!.threads!.memory.view(key, channel, spec.rootMentions[0]!.ts) })
+      })
+    }
+    expect(atAck).toEqual(plan.flatMap(([phase]) => keys.map(key => ({ key, joined: 'joined',
+      stored: (phase === 'roots' ? [spec.rootMentions[0]!] : [spec.rootMentions[0]!, spec.replies[0]!]).map(m => m.ts),
+    }))))
+    expect(events.map(e => [e.type, e.channel_type, e.channel, e.ts, e.thread_ts, e.user, e.parent_user_id])).toEqual([
+      [mode === 'open' ? 'message' : 'app_mention', mode === 'open' ? 'channel' : undefined, channel, spec.rootMentions[0]!.ts, undefined, 'U0BURST', undefined],
+      ['message', 'channel', channel, spec.replies[0]!.ts, spec.rootMentions[0]!.ts, 'U0BURST', 'U0PARENT'],
+      ['message', 'channel', channel, spec.dropped[0]!.ts, undefined, 'U0BURST', undefined],
+    ])
+    await h.settleJoinSaves()
+    for (const key of keys) {
+      expect(h.queued(key).map(({ accepted: a }) => ({ channel: a.channel, ts: a.ts, text: a.text, via: a.via }))).toEqual([
+        { channel, ts: spec.rootMentions[0]!.ts, text: events[0].text, via: 'mention' },
+        { channel, ts: spec.replies[0]!.ts, text: 'test-44 burst', via: 'thread' },
+      ])
+      expect(readThreads(root, key).filter(r => r.kind === 'join').map(r => [r.channel, r.root, r.source]))
+        .toEqual([[channel, spec.rootMentions[0]!.ts, 'mention']])
+    }
   })
 })
 

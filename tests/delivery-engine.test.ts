@@ -66,6 +66,250 @@ test.each([16, 64])('wakes over a growing %i-item queue clone at most the newly 
   assertNoLeak([h.events, h.calls, h.errors, h.records()])
 })
 
+test.each([16, 64])('engine summaries visit only changed items over %i growing acceptances and unchanged wakes', async count => {
+  const h = await harness()
+  h.p().up = false
+  let visits = 0
+  const items = h.queue.items.bind(h.queue)
+  const reads = spyOn(h.queue, 'items').mockImplementation(key => new Proxy(items(key), {
+    get(target, property, receiver) {
+      if (typeof property === 'string' && /^\d+$/.test(property)) visits++
+      return Reflect.get(target, property, receiver)
+    },
+  }))
+  try {
+    for (let n = 0; n < count; n++) {
+      await h.queue.accept('alpha', injectedInput({ text: `queued ${n}` }))
+      await h.tick()
+      expect(h.engine.status('alpha')).toMatchObject({ seq: 1, count: n + 1 })
+    }
+    expect(visits).toBeLessThanOrEqual(count)
+    visits = 0
+    for (let n = 0; n < 8; n++) { await h.tick(); h.engine.status('alpha') }
+    expect(visits).toBe(0)
+    expect(h.engine.snapshot('alpha')?.p.accepted).toEqual(Array.from({ length: count }, (_, n) => n + 1))
+    expect(h.queue.openCount('alpha')).toBe(count)
+    expect(h.calls).toEqual([])
+    expect(h.errors).toEqual([])
+  } finally { reads.mockRestore() }
+  assertNoLeak([h.events, h.calls, h.errors, h.records()])
+})
+
+describe('queue summaries across executor retirement', () => {
+  function countFullReads(h: EngineHarness) {
+    let visits = 0
+    const items = h.queue.items.bind(h.queue)
+    const reads = spyOn(h.queue, 'items').mockImplementation(key => new Proxy(items(key), {
+      get(target, property, receiver) {
+        if (typeof property === 'string' && /^\d+$/.test(property)) visits++
+        return Reflect.get(target, property, receiver)
+      },
+    }))
+    return { reads, take: () => { const count = visits; visits = 0; return count } }
+  }
+
+  test.each([16, 64].flatMap(count => (['released', 'withdrawn', 'parked'] as const).map(outcome => [count, outcome] as const)))('%i later items stay incremental behind a Post Hold until %s', async (count, outcome) => {
+    const h = await harness()
+    h.p().up = outcome !== 'withdrawn'
+    const held = await hold(h, THREAD_ROOTS.secondary, 'alpha', unknownRootPostHold)
+    await h.accept('later 0')
+    await h.queue.append('alpha', { v: 1, kind: 'noticed', seq: 2, at: h.clock.now() })
+    const counter = countFullReads(h)
+    try {
+      await h.tick()
+      expect(counter.take()).toBeGreaterThan(0) // The first executor must read the existing queue.
+      for (let n = 1; n < count; n++) {
+        await h.accept(`later ${n}`)
+        h.engine.wake('alpha'); await h.tick()
+        expect(h.engine.running('alpha')).toBe(false)
+        expect(h.engine.status('alpha')).toBeUndefined()
+        expect(h.clock.pendingCount()).toBe(0)
+      }
+      const growingVisits = counter.take()
+      for (let n = 0; n < 8; n++) { h.engine.wake('alpha'); await h.tick() }
+      expect(counter.take()).toBe(0)
+      expect(growingVisits).toBe(0)
+      expect(h.calls).toEqual([])
+      expect(h.events).toEqual([])
+      expect(h.queue.openCount('alpha')).toBe(count)
+      expect(h.clock.pendingCount()).toBe(0)
+      await h.advance(RECEIPT_WAIT_MS)
+      expect(h.calls).toEqual([])
+
+      await h.queue.resolveHolds('alpha', [{ seq: held.accepted.seq, outcome, at: h.clock.now() }])
+      h.p().up = false
+      h.engine.wake('alpha'); await h.tick()
+      const snapshot = h.engine.snapshot('alpha')!
+      expect(snapshot.e.noticed).toEqual([2])
+      expect(snapshot.p.accepted).toEqual(Array.from({ length: count + 1 }, (_, n) => n + 1).filter(seq => outcome !== 'withdrawn' || seq !== 1))
+      expect(snapshot.holds).toEqual(outcome === 'parked' ? [{ item: 1, kind: 'memory' }] : [])
+      expect(h.engine.status('alpha')).toMatchObject({ seq: outcome === 'released' ? 1 : 2, count: count + (outcome === 'released' ? 1 : 0) })
+      expect(counter.take()).toBe(0)
+    } finally { counter.reads.mockRestore() }
+
+    if (outcome === 'released') await h.preparation.recover()
+    h.p().up = true
+    await h.tick(); await delivered(h)
+    const later = Array.from({ length: count }, (_, n) => n + 2)
+    const order = outcome === 'released' ? [1, ...later] : later
+    expect(h.events.flatMap(e => e.type === 'item-delivered' ? [e.seq] : [])).toEqual(order)
+    expect(h.textCalls().map(c => c.params.text)).toEqual(order.flatMap(seq => h.queue.item('alpha', seq)!.fixed!.parts))
+    if (outcome === 'parked') {
+      await h.queue.resolveHolds('alpha', [{ seq: 1, outcome: 'released', at: h.clock.now() }])
+      await h.preparation.recover(); h.engine.wake('alpha'); await delivered(h)
+      expect(h.events.flatMap(e => e.type === 'item-delivered' ? [e.seq] : [])).toEqual([...later, 1])
+    }
+    expect(h.errors).toEqual([])
+    assertNoLeak([h.events, h.calls, h.errors, h.records()])
+  })
+
+  test('new work after each drain does not resummarize retained delivered items', async () => {
+    const h = await harness(), counter = countFullReads(h)
+    try {
+      await h.accept('first'); await h.tick(); await delivered(h)
+      expect(h.engine.running('alpha')).toBe(false)
+      counter.take()
+      for (let n = 1; n <= 16; n++) {
+        h.p().up = false
+        await h.accept(`next ${n}`)
+        h.engine.wake('alpha'); await h.tick()
+        expect(h.engine.status('alpha')).toMatchObject({ seq: n + 1, count: 1, up: false })
+        expect(h.engine.snapshot('alpha')?.p.delivered).toEqual(Array.from({ length: n }, (_, i) => [i + 1, 1]))
+        expect(h.engine.snapshot('alpha')?.p.sent.every(send => send.offset === 0)).toBe(true)
+        expect(counter.take()).toBe(0)
+        h.p().up = true
+        await h.tick(); await delivered(h)
+        expect(h.engine.running('alpha')).toBe(false)
+        expect(h.engine.status('alpha')).toBeUndefined()
+        expect(h.clock.pendingCount()).toBe(0)
+        counter.take() // Receipt observation deliberately reads the full queue.
+      }
+      expect(h.queue.items('alpha')).toHaveLength(17)
+      expect(h.events.flatMap(e => e.type === 'item-delivered' ? [e.seq] : [])).toEqual(Array.from({ length: 17 }, (_, n) => n + 1))
+      expect(h.textCalls().map(c => c.params.text)).toEqual(['first', ...Array.from({ length: 16 }, (_, n) => `next ${n + 1}`)])
+    } finally { counter.reads.mockRestore() }
+    // A fresh executor must not credit an earlier, identical delivered text.
+    h.p().autoReceipt = false
+    await h.accept('first'); await h.tick(); await h.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+    expect(h.queue.openCount('alpha')).toBe(1)
+    expect(h.queue.item('alpha', 18)?.delivered).toBe(false)
+    appendTranscript(h.p().path, [promptEntry('first')])
+    await delivered(h)
+    expect(h.events.flatMap(e => e.type === 'item-delivered' ? [e.seq] : [])).toEqual(Array.from({ length: 18 }, (_, n) => n + 1))
+    expect(h.errors).toEqual([])
+    assertNoLeak([h.events, h.calls, h.errors, h.records()])
+  })
+
+  test('compaction while retired rebuilds once and refreshes notices before the next executor', async () => {
+    const h = await harness()
+    await hold(h, THREAD_ROOTS.secondary, 'alpha', postHold)
+    const withdrawn = await hold(h, THREAD_ROOTS.third)
+    await h.accept('later')
+    await h.queue.append('alpha', { v: 1, kind: 'noticed', seq: withdrawn.accepted.seq, at: h.clock.now() })
+    await h.queue.append('alpha', { v: 1, kind: 'noticed', seq: 3, at: h.clock.now() })
+    await h.tick()
+    expect(h.engine.running('alpha')).toBe(false)
+    await h.queue.resolveHolds('alpha', [{ seq: withdrawn.accepted.seq, outcome: 'withdrawn', at: h.clock.now() }])
+    await h.queue.compact('alpha')
+    const counter = countFullReads(h)
+    try {
+      await h.tick()
+      expect(counter.take()).toBeGreaterThan(0)
+      expect(h.engine.running('alpha')).toBe(false)
+      await h.tick()
+      expect(counter.take()).toBe(0)
+      await h.queue.resolveHolds('alpha', [{ seq: 1, outcome: 'withdrawn', at: h.clock.now() }])
+      h.p().up = false
+      await h.tick()
+      expect(counter.take()).toBe(0)
+      expect(h.engine.snapshot('alpha')?.p).toEqual({ accepted: [3], fixed: [3], sent: [], refused: [], delivered: [] })
+      expect(h.engine.snapshot('alpha')?.e.noticed).toEqual([3])
+      expect(h.engine.snapshot('alpha')?.holds).toEqual([])
+      expect(h.engine.status('alpha')).toMatchObject({ seq: 3, count: 1 })
+      expect(h.calls).toEqual([])
+    } finally { counter.reads.mockRestore() }
+    h.p().up = true
+    await h.tick(); await delivered(h)
+    expect(h.textCalls().map(c => c.params.text)).toEqual(['later'])
+    expect(h.errors).toEqual([])
+    assertNoLeak([h.events, h.calls, h.errors, h.records()])
+  })
+
+  test.each([false, true])('forget discards only that persona summary (executor retired=%p)', async retired => {
+    const h = await harness({ keys: ['alpha', 'beta'] })
+    h.p().up = false; h.p('beta').up = false
+    if (retired) await hold(h, THREAD_ROOTS.secondary, 'alpha', postHold)
+    await h.accept('alpha later'); await h.accept('beta later', 'beta')
+    await h.tick(); await h.tick('beta')
+    expect(h.engine.running('alpha')).toBe(!retired)
+    const counter = countFullReads(h)
+    try {
+      await h.engine.forget('alpha')
+      expect(h.engine.running('alpha')).toBe(false)
+      expect(h.engine.status('alpha')).toBeUndefined()
+      await h.tick('beta')
+      expect(counter.take()).toBe(0)
+      await h.tick()
+      expect(counter.take()).toBeGreaterThan(0)
+      await h.tick()
+      expect(counter.take()).toBe(0)
+      expect(h.calls).toEqual([])
+      expect(h.queue.openCount('alpha')).toBe(1)
+      expect(h.errors).toEqual([])
+    } finally { counter.reads.mockRestore() }
+    assertNoLeak([h.events, h.calls, h.errors, h.records(), h.records('beta')])
+  })
+})
+
+test('incremental policy inputs preserve ordered sends, refusal positions, unknown parts, holds and rebuilds', async () => {
+  const h = await harness({ keys: ['alpha', 'beta'] })
+  h.p().up = false; h.p('beta').up = false
+  await hold(h)
+  await h.accept('multipart', 'alpha', ['one', 'two'])
+  await h.accept('later')
+  await hold(h, THREAD_ROOTS.third, 'alpha', unknownRootPostHold)
+  const withdrawn = await hold(h, THREAD_ROOTS.primary)
+  await h.queue.resolveHolds('alpha', [{ seq: withdrawn.accepted.seq, outcome: 'withdrawn', at: h.clock.now() }])
+  await h.accept('other persona', 'beta')
+  await h.tick(); await h.tick('beta')
+  const before = h.engine.snapshot('alpha')!
+  const append = (record: QueueRecord) => h.queue.append('alpha', record)
+  const sent = (seq: number, attempt: number, part = 1): QueueRecord => ({ v: 1, kind: 'sent', seq, attempt, part, send_kind: 'text', at: h.clock.now(), session_id: h.p().row.session_id, transcript_path: h.p().path, transcript_size: 0 })
+  await append(sent(3, 1)); await append({ v: 1, kind: 'refused', seq: 3, attempt: 1, at: h.clock.now() })
+  await append(sent(2, 1)); await append({ v: 1, kind: 'refused', seq: 2, attempt: 1, at: h.clock.now() })
+  await append({ v: 1, kind: 'sent', seq: 2, attempt: 2, unknown_outcome: true, at: h.clock.now(), quarantine: { path: join(h.root, 'quarantine'), line: 1 } })
+  for (const seq of [3, 2]) await append({ v: 1, kind: 'noticed', seq, at: h.clock.now() })
+  const send = (item: number, part: number, attempt: number, how = 'text') => ({ item, part, attempt, how, offset: 0 })
+  await h.tick()
+  const first = h.engine.snapshot('alpha')!
+  expect(first.p).toEqual({ accepted: [1, 2, 3, 4], fixed: [2, 3], sent: [send(2, 1, 1), send(2, 1, 2, 'unknown'), send(3, 1, 1)], refused: [1, 3], delivered: [] })
+  expect(first.parts).toEqual({ 1: 1, 2: 2, 3: 1, 4: 1 })
+  expect(first.holds).toEqual([{ item: 1, kind: 'memory' }, { item: 4, kind: 'post' }])
+  expect(first.e.noticed).toEqual([2, 3])
+  expect(first.textFor?.([2, 2])).toBe('two')
+  expect(first.textFor?.([5, 1])).toEqual([5, 1])
+  expect(before.p.sent).toEqual([])
+  await append({ v: 1, kind: 'delivered', seq: 2, part: 1, at: h.clock.now(), receipt: { path: h.p().path, offset: 1 } })
+  await append(sent(2, 3, 2))
+  await h.tick()
+  expect(h.engine.snapshot('alpha')?.p).toEqual({ accepted: [1, 2, 3, 4], fixed: [2, 3], sent: [send(2, 1, 1), send(2, 2, 2, 'unknown'), send(2, 2, 3), send(3, 1, 1)], refused: [1, 4], delivered: [[2, 1]] })
+  expect(first.p.sent).toEqual([send(2, 1, 1), send(2, 1, 2, 'unknown'), send(3, 1, 1)])
+  await h.queue.resolveHolds('alpha', [{ seq: 1, outcome: 'released', at: h.clock.now() }, { seq: 4, outcome: 'parked', at: h.clock.now() }])
+  await h.queue.compact('alpha'); await h.tick()
+  const compacted = h.engine.snapshot('alpha')!
+  expect(compacted.p).toEqual({ accepted: [1, 2, 3, 4], fixed: [2, 3], sent: [send(2, 2, 2, 'unknown'), send(2, 2, 3)], refused: [], delivered: [[2, 1]] })
+  expect(compacted.holds).toEqual([{ item: 4, kind: 'memory' }])
+  expect(compacted.e.noticed).toEqual([2, 3])
+  expect(h.engine.status('alpha')).toMatchObject({ seq: 1, count: 3 })
+  expect(h.engine.snapshot('beta')?.p).toEqual({ accepted: [1], fixed: [1], sent: [], refused: [], delivered: [] })
+  await h.restartServer(); await h.tick()
+  expect(h.engine.snapshot('alpha')?.p).toEqual(compacted.p)
+  expect(h.engine.snapshot('alpha')?.holds).toEqual(compacted.holds)
+  expect(h.errors).toEqual([])
+  expect(h.calls).toEqual([])
+  assertNoLeak([h.events, h.calls, h.errors, h.records(), h.records('beta')])
+})
+
 describe('Memory Hold delivery', () => {
   test('passes unresolved and withdrawn work, preserves later FIFO and isolates personas', async () => {
     const h = await harness({ keys: ['alpha', 'beta'] })

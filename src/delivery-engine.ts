@@ -2,7 +2,7 @@
  * All environment access is injected; importing this module does no I/O. */
 import type { Client, GetResult, SendKeysParams } from 'agent-director'
 import type { DeliveryQueue, QueueItem, QueueRecord, SentRecord } from './delivery-queue.ts'
-import { isOpenItem, itemOpenedAt } from './delivery-queue.ts'
+import { createQueueItemReader, isOpenItem, itemOpenedAt } from './delivery-queue.ts'
 import { createDeliveryReceiptReader, effectiveSends, type DeliveryReceiptReader, type ReceiptObservation } from './delivery-receipt.ts'
 import { type DeliveryLifecycle, type DeliveryClock, systemDeliveryClock, NOT_NOW_RETRY_MS } from './delivery-lifecycle.ts'
 import { decideEngine, decideGate, firstSendGate, recoveryEnterGate, latestDeliveryAttempt, retypeGate, selectDeliveryTarget, NO_DELIVERY_PAIR, createDeliveryReading, createDeliveryPolicyState, type DeliveryPair, type DeliveryPolicyEngine, type DeliveryPolicyKnowledge, type DeliveryReading, type DeliveryTimer } from './delivery-policy.ts'
@@ -91,10 +91,99 @@ export function deliveryTextWasRefused(error: unknown): boolean {
   const cls = classifyAdError(error).errorClass
   return ['CONFLICT', 'UNUSABLE_NAME', 'ENVIRONMENT', 'CONFIG', 'GONE'].includes(cls) || [ErrInvalidFlags, ErrSpawnNotFound, ErrSpawnNotInteractive, ErrSendKeysWhileRelayed, ErrRelayFallenBack, ErrDialogMaybeOpen, ErrPaneChanged, ErrSystemInstallDisappeared].some(c => isAdErrorInstance(error, c))
 }
+/** First position with an item number at least `seq`. Appends to these ordered
+ * summaries are constant work; a changed item never rereads its neighbours. */
+function itemPosition<T>(values: readonly T[], seq: number, itemOf: (value: T) => number): number {
+  if (!values.length || itemOf(values[values.length - 1]!) < seq) return values.length
+  let lo = 0, hi = values.length
+  while (lo < hi) { const mid = (lo + hi) >>> 1; if (itemOf(values[mid]!) < seq) lo = mid + 1; else hi = mid }
+  return lo
+}
+function replaceItemRange<T>(values: T[], seq: number, replacements: T[], itemOf: (value: T) => number) {
+  const start = itemPosition(values, seq, itemOf), end = itemPosition(values, seq + 1, itemOf)
+  // Insert in slices: a long retype history must not overflow argument limits.
+  if (end > start) values.splice(start, end - start)
+  for (let at = 0; at < replacements.length; at += 1024) values.splice(start + at, 0, ...replacements.slice(at, at + 1024))
+  return { start, end, delta: replacements.length - (end - start) }
+}
+function setItemMember(values: number[], seq: number, present: boolean): void {
+  const at = itemPosition(values, seq, n => n)
+  if (values[at] === seq) { if (!present) values.splice(at, 1) }
+  else if (present) values.splice(at, 0, seq)
+}
+function createQueueSummary(queue: DeliveryQueue, key: string) {
+  const read = createQueueItemReader(queue, key)
+  const items = new Map<number, QueueItem>(), open: number[] = []
+  const p = { accepted: [] as number[], fixed: [] as number[], sent: [] as DeliveryPolicyKnowledge['p']['sent'][number][], refused: [] as number[], delivered: [] as DeliveryPair[] }
+  const parts: Record<number, number> = {}, holds: { item: number; kind: 'memory' | 'post' }[] = []
+  // Immutable between membership changes, so a new executor can inherit the
+  // durable notices without copying a queue-sized list on every blocked wake.
+  let notices: number[] = []
+  function update(item: QueueItem): boolean {
+    const seq = item.accepted.seq, included = item.hold?.state !== 'withdrawn'
+    items.set(seq, item)
+    setItemMember(open, seq, isOpenItem(item))
+    setItemMember(p.accepted, seq, included)
+    setItemMember(p.fixed, seq, included && !!item.fixed)
+    if (included) parts[seq] = item.fixed?.parts.length ?? 1; else delete parts[seq]
+    const sends: typeof p.sent = [], refused: number[] = [], delivered: DeliveryPair[] = []
+    let noticed = false
+    if (included) {
+      const noKeys = new Set(item.records.flatMap(r => r.kind === 'refused' ? [r.attempt] : []))
+      for (const r of item.records) {
+        if (r.kind === 'sent') {
+          const part = 'part' in r ? r.part : Array.from({ length: parts[seq]! }, (_, n) => n + 1).find(part => !item.records.some(record => record.kind === 'delivered' && record.part === part)) ?? 1
+          sends.push({ item: seq, part, offset: 0, how: 'send_kind' in r ? r.send_kind : 'unknown', attempt: r.attempt })
+          if (noKeys.has(r.attempt)) refused.push(sends.length)
+        } else if (r.kind === 'delivered') delivered.push([r.seq, r.part])
+        else if (r.kind === 'noticed') noticed = true
+      }
+    }
+    const range = replaceItemRange(p.sent, seq, sends, send => send.item)
+    const first = itemPosition(p.refused, range.start + 1, n => n), last = itemPosition(p.refused, range.end + 1, n => n)
+    p.refused.splice(first, last - first)
+    if (range.delta) for (let at = first; at < p.refused.length; at++) p.refused[at]! += range.delta
+    for (let at = 0; at < refused.length; at++) p.refused.splice(first + at, 0, range.start + refused[at]!)
+    replaceItemRange(p.delivered, seq, delivered, pair => pair[0])
+    replaceItemRange(holds, seq, item.hold?.state === 'unresolved' ? [{ item: seq, kind: item.hold.kind }] : [], hold => hold.item)
+    const noticeAt = itemPosition(notices, seq, n => n)
+    if ((notices[noticeAt] === seq) !== noticed) {
+      notices = [...notices]
+      setItemMember(notices, seq, noticed)
+    }
+    return noticed
+  }
+  function refresh(): number[] {
+    const changed = read()
+    if (changed.reset) {
+      items.clear(); open.length = 0
+      for (const values of Object.values(p)) values.length = 0
+      for (const seq of Object.keys(parts)) delete parts[Number(seq)]
+      holds.length = 0; notices = []
+    }
+    const noticed: number[] = []
+    for (const item of changed.items.sort((a, b) => a.accepted.seq - b.accepted.seq)) if (update(item)) noticed.push(item.accepted.seq)
+    return noticed
+  }
+  let previousReceiptItem: number | undefined
+  function receiptOffsets(target: DeliveryPair | undefined, attempt: number, offset: number): void {
+    // Only sends for the old/new receipt item can change their window.
+    for (const seq of new Set([previousReceiptItem, target?.[0]])) {
+      if (seq === undefined) continue
+      for (let at = itemPosition(p.sent, seq, send => send.item); p.sent[at]?.item === seq; at++) {
+        const send = p.sent[at]!
+        send.offset = target?.[0] === seq && target[1] === send.part && send.attempt! > attempt ? offset : 0
+      }
+    }
+    previousReceiptItem = target?.[0]
+  }
+  return { p, parts, holds, items, open, refresh, receiptOffsets, get notices() { return notices } }
+}
 export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines {
   const clock = deps.clock ?? systemDeliveryClock, life = deps.lifecycle, constants = deps.constants
   const ms = (name: 'ENTER_DELAY_MS' | 'RECEIPT_WAIT_MS', fallback: number): number => constants?.[name] ?? fallback
   interface State {
+    queue: ReturnType<typeof createQueueSummary>; noticesInitialized: boolean
     e: DeliveryPolicyEngine; reading: DeliveryReading; row?: GetResult; receipt?: ReceiptObservation
     reader: DeliveryReceiptReader; receiptTarget?: DeliveryPair; receiptAttempt?: number; deadlines: Partial<Record<DeliveryTimer, number>>; budget: () => void
     rowAt: number; notNowStep: number; retryStep: number; appendRetryStep: number; lastSeq?: number; lastPart?: number; transcriptReference?: string
@@ -102,21 +191,34 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     relaunch: boolean; restarted?: boolean; gone?: { row: GetResult; handedOff?: boolean }; receiptWorking: boolean; pollAfter: number; snapshot?: DeliveryPolicyKnowledge; lastRetypeEvent?: number; dialogHold: boolean; dialogMaybeOpen: boolean; recoveringReconnect?: boolean
   }
   const states = new Map<string, State>(), budgets = new Map<string, () => void>()
+  // Blocked/empty executors retire without polling. Their queue-derived facts
+  // and change cursor live until persona teardown; rebuilds invalidate the
+  // cursor inside createQueueItemReader, including while no executor is active.
+  const summaries = new Map<string, ReturnType<typeof createQueueSummary>>()
   let stopped = false
   const typed = new Set<string>()
   function emit(event: DeliveryEngineEvent): void { try { void Promise.resolve(deps.onEvent?.(event)).catch(() => {}) } catch {} }
   function budget(key: string): () => void { let b = budgets.get(key); if (!b) { b = createDeliveryCallBudget(clock.now); budgets.set(key, b) }; return b }
   function create(key: string): State {
-    const s: State = { e: createDeliveryPolicyState(), reading: createDeliveryReading(), reader: deps.receiptReader?.() ?? createDeliveryReceiptReader(), deadlines: {}, budget: budget(key), rowAt: -Infinity, notNowStep: 0, retryStep: 0, appendRetryStep: 0, stopped: false, relaunch: true, receiptWorking: false, pollAfter: 0, dialogHold: false, dialogMaybeOpen: false }
+    let queue = summaries.get(key)
+    if (!queue) { queue = createQueueSummary(deps.queue, key); summaries.set(key, queue) }
+    queue.receiptOffsets(undefined, 0, 0)
+    const s: State = { queue, noticesInitialized: false, e: createDeliveryPolicyState(), reading: createDeliveryReading(), reader: deps.receiptReader?.() ?? createDeliveryReceiptReader(), deadlines: {}, budget: budget(key), rowAt: -Infinity, notNowStep: 0, retryStep: 0, appendRetryStep: 0, stopped: false, relaunch: true, receiptWorking: false, pollAfter: 0, dialogHold: false, dialogMaybeOpen: false }
     states.set(key, s); life.engineRunning(key, true); return s
   }
   function release(s: State): void { s.lease?.(); s.lease = undefined; s.e.request = 'none' }
   function timers(s: State): void { for (const name of Object.keys(s.e.timers) as DeliveryTimer[]) s.e.timers[name] = Math.max(0, (s.deadlines[name] ?? 0) - clock.now()) }
+  function refreshQueue(s: State): void {
+    const noticed = s.queue.refresh()
+    if (!s.noticesInitialized) { s.e.noticed = s.queue.notices; s.noticesInitialized = true }
+    else if (noticed.length) s.e.noticed = [...new Set([...s.e.noticed, ...noticed])]
+  }
   function status(key: string, s: State): DeliveryStatus | undefined {
-    const items = deps.queue.items(key).filter(isOpenItem), head = items[0]
+    refreshQueue(s)
+    const head = s.queue.items.get(s.queue.open[0]!)
     if (!head) return undefined
     const deferred = life.deferred(key)
-    return { key, seq: head.accepted.seq, count: items.length, ageMs: Math.max(0, clock.now() - itemOpenedAt(head)), retypeCount: head.retypeCount,
+    return { key, seq: head.accepted.seq, count: s.queue.open.length, ageMs: Math.max(0, clock.now() - itemOpenedAt(head)), retypeCount: head.retypeCount,
       row: s.restarted === true ? (s.row?.state === 'ended' || s.row?.state === 'missing' ? s.row.state : 'absent') : s.row?.state, marker: s.row?.labels?.tag_prompt === '1', relay: s.row?.relay_mode === 'on', connected: deps.isConnected(key), up: deps.isUp(key),
       latched: deps.isLatched(key), held: deps.isHeld(key), receiptWorking: s.receiptWorking, dialogMaybeOpen: s.dialogMaybeOpen, reconnectDeferred: !!deferred }
   }
@@ -223,31 +325,12 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   function build(key: string, s: State): DeliveryPolicyKnowledge {
     timers(s)
     s.e.appendBlocked = !!s.pending && s.e.appendBlocked || deps.queue.isWritable?.(key) === false
-    const items = deps.queue.items(key).filter(i => i.hold?.state !== 'withdrawn')
-    s.e.noticed = [...new Set([...s.e.noticed, ...items.filter(i => i.records.some(r => r.kind === 'noticed')).map(i => i.accepted.seq)])]
-    const sends: DeliveryPolicyKnowledge['p']['sent'][number][] = [], refused: number[] = [], delivered: DeliveryPair[] = [], parts: Record<number, number> = {}
-    for (const item of items) {
-      parts[item.accepted.seq] = item.fixed?.parts.length ?? 1
-      const noKeys = new Set(item.records.filter(r => r.kind === 'refused').map(r => r.attempt))
-      for (const r of item.records) {
-        if (r.kind === 'sent') {
-          // The receipt adapter has already applied path/byte windows. Its
-          // returned exact receipts are the frozen records.
-          const part = 'part' in r ? r.part : Array.from({ length: parts[item.accepted.seq]! }, (_, n) => n + 1).find(p => !item.records.some(record => record.kind === 'delivered' && record.part === p)) ?? 1
-          // The frozen observation predates any newly appended send.
-          // Receipts for earlier sends of this part remain eligible.
-          const offset = s.receiptTarget?.[0] === item.accepted.seq && s.receiptTarget[1] === part && r.attempt > (s.receiptAttempt ?? 0) ? s.reading.records.length : 0
-          sends.push({ item: item.accepted.seq, part, offset, how: 'send_kind' in r ? r.send_kind : 'unknown', attempt: r.attempt })
-          if (noKeys.has(r.attempt)) refused.push(sends.length)
-        } else if (r.kind === 'delivered') delivered.push([r.seq, r.part])
-      }
-    }
+    refreshQueue(s)
+    s.queue.receiptOffsets(s.receiptTarget, s.receiptAttempt ?? 0, s.reading.records.length)
     if (deps.isConnected(key) && !life.reconnectInput(key)) life.clearDeferred(key)
     const deferred = life.deferred(key)
     s.reading = { ...s.reading, gate: life.owner(key), up: deps.isUp(key) && !!deps.persona(key), latched: deps.isLatched(key), held: deps.isHeld(key) || s.restarted === true, mcp: deps.isConnected(key), relaunch: s.relaunch }
-    const k: DeliveryPolicyKnowledge = { p: { accepted: items.map(i => i.accepted.seq), fixed: items.filter(i => i.fixed).map(i => i.accepted.seq), sent: sends, refused, delivered }, e: s.e, r: s.reading, g: { owner: life.owner(key), stage: 'none', deferred: !!deferred, due: deferred?.due ?? false }, writer: { kind: s.pending?.record.kind ?? 'none' }, compact: 'none', parts, MaxRetypes: constants?.MaxRetypes, textFor: pair => items.find(i => i.accepted.seq === pair[0])?.fixed?.parts[pair[1] - 1] ?? pair }
-    // Effective kinds: a parked Post Hold is passed as a Memory Hold.
-    k.holds = items.flatMap(i => i.hold?.state === 'unresolved' ? [{ item: i.accepted.seq, kind: i.hold.kind }] : [])
+    const k: DeliveryPolicyKnowledge = { p: s.queue.p, e: s.e, r: s.reading, g: { owner: life.owner(key), stage: 'none', deferred: !!deferred, due: deferred?.due ?? false }, writer: { kind: s.pending?.record.kind ?? 'none' }, compact: 'none', parts: s.queue.parts, holds: s.queue.holds, MaxRetypes: constants?.MaxRetypes, textFor: pair => s.queue.parts[pair[0]] === undefined ? pair : s.queue.items.get(pair[0])?.fixed?.parts[pair[1] - 1] ?? pair }
     if (s.pending) k.writer.item = s.pending.record.seq
     s.snapshot = k; return k
   }
@@ -578,10 +661,22 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       try { await api.tick(key) } finally { s.recoveringReconnect = false }
       return reconciled()
     },
-    async forget(key) { const s = states.get(key); if (!s) { life.forget(key); return }; s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); await s.busy; states.delete(key); life.engineRunning(key, false); life.forget(key) },
-    async stop() { stopped = true; const stoppingLife = life.stop(); for (const [key, s] of states) { s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); life.engineRunning(key, false) }; await Promise.allSettled([...states.values()].flatMap(s => s.busy ? [s.busy] : [])); await stoppingLife; states.clear() },
+    async forget(key) {
+      const s = states.get(key)
+      if (s) { s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); await s.busy; states.delete(key); life.engineRunning(key, false) }
+      summaries.delete(key); life.forget(key)
+    },
+    async stop() { stopped = true; const stoppingLife = life.stop(); for (const [key, s] of states) { s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); life.engineRunning(key, false) }; await Promise.allSettled([...states.values()].flatMap(s => s.busy ? [s.busy] : [])); await stoppingLife; states.clear(); summaries.clear() },
     running: key => states.has(key),
-    snapshot: key => states.get(key)?.snapshot,
+    snapshot(key) {
+      const s = states.get(key), k = s?.snapshot
+      if (!s || !k) return undefined
+      // Diagnostic callers retain independent policy inputs. Only the engine's
+      // private summaries are updated in place between synchronous decisions.
+      const items = new Map(s.queue.items), parts = { ...k.parts }
+      return { ...k, parts, p: { accepted: [...k.p.accepted], fixed: [...k.p.fixed], sent: k.p.sent.map(send => ({ ...send })), refused: [...k.p.refused], delivered: k.p.delivered.map(pair => [pair[0], pair[1]] as const) }, holds: k.holds?.map(hold => ({ ...hold })),
+        textFor: pair => parts[pair[0]] === undefined ? pair : items.get(pair[0])?.fixed?.parts[pair[1] - 1] ?? pair }
+    },
     status: key => { const s = states.get(key); return s ? status(key, s) : undefined },
   }
   life.setRelaunchObserver((key, row) => {

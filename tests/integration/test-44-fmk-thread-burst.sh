@@ -194,7 +194,14 @@ if [[ "${CASE}" == burst || "${CASE}" == pending ]]; then
     for phase in roots replies dropped; do : > "${BATCH}/${phase}.events.jsonl"; : > "${BATCH}/${phase}.batch.jsonl"; done
     while IFS=$'\t' read -r phase channel ts root _mentioned; do
         case "${phase}" in
-            roots) slack_mention_event "${channel}" "${mention}" "${ts}" "${HUMAN}" ;;
+            roots)
+                # Open intake uses the paired message; app_mention is ignored.
+                if [[ "${mode}" == open ]]; then
+                    slack_message_event "${channel}" "${mention}" "${ts}" "${HUMAN}"
+                else
+                    slack_mention_event "${channel}" "${mention}" "${ts}" "${HUMAN}"
+                fi
+                ;;
             replies) slack_reply_event "${channel}" "${root}" "${message}" "${ts}" "${HUMAN}" "${OTHER}" ;;
             dropped) slack_message_event "${channel}" "${message}" "${ts}" "${HUMAN}" ;;
             *) fail 'unknown burst phase' ;;

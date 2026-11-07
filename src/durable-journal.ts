@@ -67,6 +67,7 @@ interface StepTimes { now(): number; fileFsyncMs: number; dirFsyncMs: number; fs
 export function createDurableJournal(options: DurableJournalOptions) {
   const fs = options.fs ?? nodeFs, dir = options.dir
   let durableDirectory: { dev: number; ino: number } | undefined
+  const fileModes = new Map<string, { dev: number; ino: number; birthtimeMs: number }>()
   // Concurrent personas share this directory. Only the latest ensure may
   // publish its identity, so an older one cannot vouch for a recreation.
   let directoryGeneration = 0
@@ -111,7 +112,7 @@ export function createDurableJournal(options: DurableJournalOptions) {
   function* syncDir(path: string): DurableSteps { const fd = fs.openSync(path, 'r'); try { yield { op: 'fsync', fd, target: 'dir' } } finally { fs.closeSync(fd) } }
   function* ensureDirSteps(): DurableSteps {
     // A recreated directory may reuse the cached device/inode identity.
-    if (fs.mkdirSync(dir, { recursive: true, mode: options.directoryMode }) !== undefined) { durableDirectory = undefined; directoryGeneration++ }
+    if (fs.mkdirSync(dir, { recursive: true, mode: options.directoryMode }) !== undefined) { durableDirectory = undefined; fileModes.clear(); directoryGeneration++ }
     const stat = fs.statSync(dir)
     if (durableDirectory?.dev === stat.dev && durableDirectory.ino === stat.ino && (stat.mode & 0o7777) === options.directoryMode) return
     durableDirectory = undefined
@@ -126,6 +127,13 @@ export function createDurableJournal(options: DurableJournalOptions) {
     let offset = 0
     while (offset < bytes.length) { const n = fs.writeSync(fd, bytes, offset, bytes.length - offset); if (n <= 0) throw new Error('Short queue write'); offset += n }
   }
+  function ensureFileMode(path: string, fd: number, stat: nodeFs.Stats): void {
+    const previous = fileModes.get(path)
+    if (previous?.dev === stat.dev && previous.ino === stat.ino && previous.birthtimeMs === stat.birthtimeMs && (stat.mode & 0o7777) === options.fileMode) return
+    fileModes.delete(path)
+    fs.fchmodSync(fd, options.fileMode)
+    fileModes.set(path, { dev: stat.dev, ino: stat.ino, birthtimeMs: stat.birthtimeMs })
+  }
   function* appendSteps(path: string, bytes: Uint8Array, rollback?: AppendRollback): DurableSteps {
     yield* ensureDirSteps()
     const fd = fs.openSync(path, 'a+', options.fileMode)
@@ -133,8 +141,9 @@ export function createDurableJournal(options: DurableJournalOptions) {
     try {
       // A failed reconciliation still owes the original rollback, not the
       // current file length, which may contain an unaccepted append.
-      original = rollback?.pendingRollback ?? fs.fstatSync(fd).size
-      fs.fchmodSync(fd, options.fileMode)
+      const stat = fs.fstatSync(fd)
+      original = rollback?.pendingRollback ?? stat.size
+      ensureFileMode(path, fd, stat)
       if (rollback?.pendingRollback !== undefined) {
         fs.ftruncateSync(fd, rollback.pendingRollback); yield { op: 'fsync', fd, target: 'file' }
         original = rollback.pendingRollback; delete rollback.pendingRollback

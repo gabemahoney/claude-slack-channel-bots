@@ -280,6 +280,29 @@ interface Journal extends AppendRollback {
   pendingRecovery?: boolean
   reminders: Map<number, ReplyReminderRecord>; items: Map<number, QueueItem>; slackKeys: Map<string, AcceptedRecord | QueueKeyRecord>; openCount: number
   holds: Map<number, UnresolvedHold>
+  itemChanges: ItemChange
+}
+/** Forward-only changes: the queue retains only the tail. A reader retains
+ * changes since its last read, and dropping it requires no unsubscribe. */
+interface ItemChange { next?: ItemChange; seq?: number }
+// Key by the item reader so adapters that forward/copy the queue's methods
+// retain its index without extending the DeliveryQueue interface.
+const itemSources = new WeakMap<DeliveryQueue['item'], (key: string) => Journal>()
+/** Internal incremental reader for the engine; DeliveryQueue's public read
+ * contract stays unchanged. Injected queues without the index use full reads. */
+export function createQueueItemReader(queue: DeliveryQueue, key: string): () => { reset: boolean; items: QueueItem[] } {
+  let index: Journal['items'] | undefined, cursor: ItemChange | undefined
+  return () => {
+    const j = itemSources.get(queue.item)?.(key)
+    if (!j) return { reset: true, items: queue.items(key) }
+    if (index !== j.items) {
+      index = j.items; cursor = j.itemChanges
+      return { reset: true, items: queue.items(key) }
+    }
+    const changed = new Set<number>()
+    while (cursor?.next) { changed.add(cursor.seq!); cursor = cursor.next }
+    return { reset: false, items: [...changed].map(seq => queue.item(key, seq)!).filter(Boolean) }
+  }
 }
 type AcceptOutcome = { result: QueueDecidedResult<unknown> } | { error: unknown }
 /** One acceptance waiting in its persona's group. */
@@ -294,7 +317,7 @@ interface AcceptMember {
 interface StagedAccept { record: AcceptedRecord; turnStarted: number | undefined; afterStore?: (stored: { seq: number }) => void }
 interface BatchEntry { member: AcceptMember; staged?: StagedAccept; outcome?: AcceptOutcome }
 interface StageCursor { nextSeq: number; lastInjected?: bigint }
-function emptyJournal(): Journal { return { records: [], nextSeq: 1, loaded: false, reminders: new Map(), items: new Map(), slackKeys: new Map(), holds: new Map(), openCount: 0 } }
+function emptyJournal(): Journal { return { records: [], nextSeq: 1, loaded: false, reminders: new Map(), items: new Map(), slackKeys: new Map(), holds: new Map(), openCount: 0, itemChanges: {} } }
 /** Queue snapshots contain only journal data (objects, arrays and scalars).
  * Freeze before descending so shared nested references are visited once. */
 function freezeSnapshot<T>(value: T): T {
@@ -392,6 +415,11 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     if (item.hold?.state === 'unresolved') j.holds.set(item.accepted.seq, unresolvedEntry(item.hold.field, item.hold.kind, item.accepted.seq, item.accepted.channel!))
     else j.holds.delete(item.accepted.seq)
   }
+  function indexItem(j: Journal, item: QueueItem): void {
+    j.items.set(item.accepted.seq, item)
+    j.itemChanges.seq = item.accepted.seq
+    j.itemChanges = j.itemChanges.next = {}
+  }
   function indexRecord(j: Journal, record: QueueRecord): void {
     if (record.kind === 'reply-reminder') { j.reminders.set(record.seq, record); return }
     if (record.kind === 'accepted') {
@@ -401,20 +429,20 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       }
       if (isAccepted(record) && !j.items.has(record.seq)) {
         const item = summarize(record, [record])
-        j.items.set(record.seq, item); indexHold(j, item); j.openCount += Number(isOpenItem(item))
+        indexItem(j, item); indexHold(j, item); j.openCount += Number(isOpenItem(item))
       }
       return
     }
     const previous = j.items.get(record.seq)
     if (!previous) return
     const item = summarize(previous.accepted, [...previous.records, record])
-    j.items.set(record.seq, item)
+    indexItem(j, item)
     indexHold(j, item)
     ensureReminder(j, item)
     j.openCount += Number(isOpenItem(item)) - Number(isOpenItem(previous))
   }
   function rebuild(j: Journal): void {
-    j.items = new Map(); j.slackKeys = new Map(); j.reminders = new Map(); j.holds = new Map(); j.openCount = 0
+    j.items = new Map(); j.itemChanges = {}; j.slackKeys = new Map(); j.reminders = new Map(); j.holds = new Map(); j.openCount = 0
     // Replay groups records once, rather than repeatedly copying a long
     // history of retypes for the same item.
     for (const record of j.records) {
@@ -423,7 +451,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     }
     for (const [seq, previous] of j.items) {
       const item = summarize(previous.accepted, previous.records)
-      j.items.set(seq, item)
+      indexItem(j, item)
       indexHold(j, item)
       ensureReminder(j, item)
       j.openCount += Number(isOpenItem(item)) - Number(isOpenItem(previous))
@@ -978,5 +1006,6 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     startupFindings: () => findings.map(e => ({ ...e })),
     retained(key) { event({ type: 'retained', key, count: api.openCount(key) }) },
   }
+  itemSources.set(api.item, journal)
   return api
 }

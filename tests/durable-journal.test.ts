@@ -79,6 +79,66 @@ const read = () => fs.readFileSync(path)
 const durableSteps = (ops: Op[]) => ops.filter(op => op.step === 'sync' || op.step === 'rename')
 
 describe('directory durability and modes', () => {
+  test.each(['async', 'sync'] as const)('%s appends set mode once per journal file, reopen and replacement', async form => {
+    const r = recordingFs()
+    let j = journal(r.fs)
+    const append = () => form === 'async' ? j.durableAppend(path, Buffer.from('saved\n')) : j.durableAppendSync(path, Buffer.from('saved\n'))
+    const modes = () => r.ops.filter(op => op.step === 'fchmod').length
+    for (let n = 0; n < 8; n++) await append()
+    expect(modes()).toBe(1)
+    expect(fs.statSync(path).mode & 0o7777).toBe(0o600)
+    j = journal(r.fs)
+    await append(); await append()
+    expect(modes()).toBe(2)
+    fs.renameSync(path, join(dir, 'old.jsonl'))
+    await append(); await append()
+    expect(modes()).toBe(3)
+    fs.chmodSync(path, 0o666)
+    await append(); await append()
+    expect(modes()).toBe(4)
+    expect(fs.statSync(path).mode & 0o7777).toBe(0o600)
+    expect(read()).toEqual(Buffer.from('saved\n'.repeat(4)))
+    expect(r.paths.size).toBe(0)
+  })
+
+  test('a failed mode repair is retried before any append, then rollback and retries reuse the repaired mode', async () => {
+    const r = recordingFs(), j = journal(r.fs), rollback: AppendRollback = {}
+    seed('old\n'); fs.chmodSync(path, 0o666)
+    r.control.fail = op => op.step === 'fchmod'
+    await expect(j.durableAppend(path, Buffer.from('unaccepted\n'), rollback)).rejects.toThrow('EIO injected fchmod')
+    expect(read()).toEqual(Buffer.from('old\n'))
+    expect(r.ops.filter(op => op.step === 'write')).toEqual([])
+    r.control.fail = op => op.path === path && (op.step === 'sync' || op.step === 'truncate')
+    await expect(j.durableAppend(path, Buffer.from('unaccepted\n'), rollback)).rejects.toThrow()
+    expect(rollback.pendingRollback).toBe(4)
+    r.control.fail = () => false
+    await j.durableAppend(path, Buffer.from('retry\n'), rollback)
+    expect(read()).toEqual(Buffer.from('old\nretry\n'))
+    expect(fs.statSync(path).mode & 0o7777).toBe(0o600)
+    expect(r.ops.filter(op => op.step === 'fchmod')).toHaveLength(2)
+    expect(rollback.pendingRollback).toBeUndefined()
+    expect(r.paths.size).toBe(0)
+  })
+
+  test('rewrite and directory recreation get their own mode check before subsequent appends', async () => {
+    const r = recordingFs(), j = journal(r.fs, 0o750, 0o640)
+    await j.durableAppend(path, Buffer.from('old\n'))
+    await j.rewrite(path, Buffer.from('rewritten\n'))
+    r.ops.length = 0
+    await j.durableAppend(path, Buffer.from('next\n')); await j.durableAppend(path, Buffer.from('last\n'))
+    expect(r.ops.filter(op => op.step === 'fchmod')).toHaveLength(1)
+    expect(fs.statSync(path).mode & 0o7777).toBe(0o640)
+    expect(read()).toEqual(Buffer.from('rewritten\nnext\nlast\n'))
+    fs.renameSync(dir, join(root, 'previous'))
+    r.ops.length = 0
+    await j.durableAppend(path, Buffer.from('new\n')); await j.durableAppend(path, Buffer.from('last\n'))
+    expect(r.ops.filter(op => op.step === 'fchmod')).toHaveLength(1)
+    expect(fs.statSync(path).mode & 0o7777).toBe(0o640)
+    expect(fs.statSync(dir).mode & 0o7777).toBe(0o750)
+    expect(read()).toEqual(Buffer.from('new\nlast\n'))
+    expect(r.paths.size).toBe(0)
+  })
+
   test('construction does no filesystem work', () => {
     const r = recordingFs()
     journal(r.fs)
