@@ -5,7 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from 'bun:test'
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
@@ -2469,6 +2469,92 @@ describe('Thread Memory compaction in slices', () => {
     expect(written).toEqual({ ...header, highWater: written.highWater })
     expect(journalBytes(h).equals(serializeThreadMemoryRecords([written, ...[...records].sort(bySeq)]))).toBe(true)
   }
+
+  test('successive saves and compactions serialize only new records and do not sort the saved population again', async () => {
+    const { h, header, records } = await large('alternate')
+    await h.memory.compact('alpha')
+    let serialized = 0, sorted = 0
+    const stringify = JSON.stringify, sort = Array.prototype.sort
+    const encoding = spyOn(JSON, 'stringify').mockImplementation(((...args: Parameters<typeof stringify>) => {
+      if (args[0]?.kind === 'join') serialized++
+      return stringify(...args)
+    }) as typeof stringify)
+    const sorting = spyOn(Array.prototype, 'sort').mockImplementation(function (this: unknown[], compare) {
+      if (this.some(value => typeof value === 'object' && value !== null && 'seq' in value)) sorted += this.length
+      return sort.call(this, compare)
+    })
+    try {
+      for (let i = 0; i < 4; i++) {
+        const fact = h.fact({ root: rootOf(COUNT + i) })
+        expect(await h.memory.saveJoins('alpha', [fact])).toEqual({ kind: 'saved' })
+        await h.memory.compact('alpha')
+      }
+    } finally { encoding.mockRestore(); sorting.mockRestore() }
+    expect({ serialized, sorted }).toEqual({ serialized: 4, sorted: 0 })
+    const written = readThreads(h.stateDir)
+    expect(written.slice(1, records.length + 1)).toEqual(records)
+    expect(written).toHaveLength(records.length + 5)
+    expectSynchronousImage(h, header, written.slice(1))
+    expect(h.events.filter(e => e.type === 'compaction-failed')).toEqual([])
+  })
+
+  test('a cached image replaces earlier saved times only after append durability and drops resolved intents and unnamed held joins', async () => {
+    let held: ThreadJoin[] = []
+    const h = fixture({ heldStamps: () => held }); await h.start()
+    const later = h.fact({ at: THREAD_TIME + 20 }), earlier = { ...later, at: THREAD_TIME + 10 }
+    await h.memory.saveJoins('alpha', [later])
+    const pending = h.memory.keepIntent('alpha', postIntent(later))
+    expect(pending.kept && await pending.ready).toBe('saved')
+    await h.memory.compact('alpha')
+    const [header, ...saved] = readThreads(h.stateDir)
+
+    h.io.fail('writeSync')
+    expect((await h.memory.saveJoins('alpha', [earlier])).kind).toBe('failed')
+    h.io.heal(); await h.memory.compact('alpha')
+    expectSynchronousImage(h, header!, saved)
+    expect(h.memory.isJoinSaved('alpha', earlier)).toBe(false)
+
+    expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+    const replacement = readThreads(h.stateDir).at(-1)!
+    expect(replacement).toMatchObject({ kind: 'join', at: earlier.at })
+    await h.memory.compact('alpha')
+    expectSynchronousImage(h, header!, [saved[1]!, replacement])
+
+    expect(h.memory.resolveIntent('alpha', postIntent(later).operationId, { none: true })).toBe('none')
+    await h.memory.flush('alpha')
+    held = [earlier]
+    expect(h.choose('mentions').kind).toBe('applied')
+    await h.memory.compact('alpha')
+    expectSynchronousImage(h, header!, [replacement])
+    expect(h.memory.joinedBy('alpha', earlier.channel, earlier.root, earlier.stamp, earlier.at)).toBe(true)
+
+    held = []; h.memory.pruneHeldJoins('alpha')
+    await h.memory.compact('alpha')
+    expectSynchronousImage(h, header!, [])
+    const bytes = journalBytes(h)
+    await h.close()
+    const reopened = fixture({ reopen: true }, h.stateDir); await reopened.start()
+    expect(journalBytes(reopened)).toEqual(bytes)
+    expect(reopened.memory.unresolvedIntents('alpha')).toEqual([])
+  })
+
+  test('loaded records with equal sequence numbers retain the original stable walk order across stamp changes', async () => {
+    let held: ThreadJoin[] = []
+    const h = fixture({ heldStamps: () => held })
+    h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha'], [C.primary, C.secondary]))
+    const primary = h.fact(), secondary = h.fact({ channel: C.secondary })
+    const a = joinRecord(primary, 2), b = joinRecord(secondary, 2)
+    seedThreads(h.stateDir, [threadHeader(), a, b])
+    await h.start()
+    expectSynchronousImage(h, threadHeader(), [a, b])
+    held = [primary]
+    expect(h.choose('mentions').kind).toBe('applied')
+    await h.memory.compact('alpha')
+    expectSynchronousImage(h, threadHeader(), [b, a])
+    held = []; h.memory.pruneHeldJoins('alpha')
+    await h.memory.compact('alpha')
+    expectSynchronousImage(h, threadHeader(), [b])
+  })
 
   test(`over ${SLICE} records, the image is the synchronous serialization's bytes, and the event loop turns between slices before any disk wait`, async () => {
     const { h, header, records } = await large('alternate')

@@ -11,7 +11,7 @@ import { createPersonaEventRouter } from '../src/persona-event-router.ts'
 import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
 import { _resetRegistry } from '../src/registry.ts'
 import { _resetAckTracker } from '../src/ack-tracker.ts'
-import { parseSharedChannelState } from '../src/shared-channels.ts'
+import { parseSharedChannelState, sharedPersonaChannels } from '../src/shared-channels.ts'
 import { DurableWriteUnsyncedError } from '../src/atomic-write.ts'
 import type { MembershipEvidence } from '../src/channel-membership-evidence.ts'
 import type { AcceptedRecord } from '../src/delivery-queue.ts'
@@ -1966,7 +1966,12 @@ test.each(['positives', 'mid-page recovery'] as const)('a page of %s is durably 
       expect(reading(f).kind).toBe('unresolved')
     }
     const before = f.writes.length
-    await f.scan()
+    const snapshots = spyOn(f.authority, 'snapshot')
+    try {
+      await f.scan()
+      // Collection, page adoption and publication need no whole-state copy.
+      expect(snapshots).toHaveBeenCalledTimes(0)
+    } finally { snapshots.mockRestore() }
     expect(f.scanner.status('alpha')).toMatchObject({ state: 'complete', pages: pages.length, positives: ids.length })
     expect(ids.map(id => reading(f, id).kind)).toEqual(ids.map(() => 'eligible'))
     // Scan and connection IDs are random, and declarations name each fixture's
@@ -1985,6 +1990,30 @@ test.each(['positives', 'mid-page recovery'] as const)('a page of %s is durably 
     expect(events.map(e => e.order)).toEqual(events.map((_, i) => events[0]!.order + i))
     expect(ids.map(id => batched.life.membership[id]!.boundary)).toEqual(events.map(e => e.order))
   }
+})
+
+test('scan and report projections match the old snapshot reads and remain detached', async () => {
+  const f = fixture({ channels: [{ id: C.primary, delivery: 'all' }, { id: C.secondary, delivery: 'mentions' }] })
+  stub(f).script.inventory.push(membershipPage([C.primary, C.secondary]))
+  await f.start(); await f.scan()
+  expect(f.scanner.status('alpha').state).toBe('complete')
+  const before = f.authority.snapshot(), membership = before.personas.alpha!.membership
+  const all = f.authority.membershipSnapshot('alpha')!
+  const selected = f.authority.membershipSnapshot('alpha', [C.secondary, C.private, C.secondary])!
+  const channels = f.authority.reportingChannels('alpha')
+  expect(all).toEqual(membership)
+  expect(selected).toEqual({ [C.secondary]: membership[C.secondary] })
+  expect(channels).toEqual(sharedPersonaChannels(before, 'alpha'))
+  expect(f.authority.membershipSnapshot('alpha', [])).toEqual({})
+  expect(f.authority.membershipSnapshot('missing')).toBeUndefined()
+  expect(f.authority.reportingChannels('missing')).toEqual([])
+  selected[C.secondary]!.member = false
+  expect(all).toEqual(membership)
+  all[C.primary]!.boundary = -1
+  delete all[C.secondary]
+  channels.splice(0, channels.length)
+  expect(f.authority.snapshot()).toEqual(before)
+  expect([reading(f, C.primary).kind, reading(f, C.secondary).kind]).toEqual(['eligible', 'eligible'])
 })
 
 const PAGE_FAILURES = {

@@ -746,6 +746,14 @@ export interface SharedChannelAuthority {
   snapshot(): SharedChannelState
   /** One persona's published state, cloned without the rest of the authority. */
   personaSnapshot(key: string): SharedPersona | undefined
+  /** Detached membership records only; an omitted channel list selects all.
+   * Scan bookkeeping never needs assignments, event history or other personas. */
+  membershipSnapshot(key: string, channels?: readonly string[]): Record<string, SharedMembership> | undefined
+  /** Reporting inventory only, with the same sorted IDs as sharedPersonaChannels. */
+  reportingChannels(key: string): string[]
+  /** Detached replacement identities in publication order. No conflict payload
+   * or other persona state is needed to revoke an obsolete scan. */
+  absenceReplacements(): { key: string; incarnation: string; binding: string; channel: string }[]
   /** One persona's published membership history, uncloned. `read` must not
    * mutate or retain the view, and returns only a primitive answer or a
    * freshly built list of channel IDs. */
@@ -1156,6 +1164,20 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
     },
     snapshot: () => clone(current),
     personaSnapshot: key => { const life = own(current.personas, key); return life && clone(life) },
+    membershipSnapshot(key, channels) {
+      const life = own(current.personas, key)
+      if (!life) return undefined
+      const records: Record<string, SharedMembership> = {}
+      for (const channel of channels ?? Object.keys(life.membership)) {
+        const record = own(life.membership, channel)
+        if (record) put(records, channel, { ...record })
+      }
+      return records
+    },
+    reportingChannels: key => sharedPersonaChannels(current, key),
+    absenceReplacements: () => Object.entries(current.personas).flatMap(([key, life]) =>
+      Object.entries(life.replacedAbsences ?? {}).map(([binding, replacement]) =>
+        ({ key, incarnation: life.incarnation, binding, channel: replacement.channel }))),
     inspectMembershipHistory: (key, read) => read(own(current.personas, key)),
     config: () => sharedAppliedConfig(current, path, deps),
     choice: (key, channel) => { const life = own(current.personas, key); return life ? own(life.assignments, channel)?.delivery : undefined },

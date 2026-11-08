@@ -403,6 +403,9 @@ interface KeptWrite { records: KeptRecord[] }
 interface MemoryJournal extends AppendRollback {
   readable: boolean; exists: boolean; hasRecords: boolean; live: boolean; created: boolean; failed: boolean
   header?: ThreadMemoryHeader; highWater: number; records?: ThreadMemoryRecord[]
+  /** Once ordered at load, later saves only append higher record numbers.
+   * Entries are immutable and removed/replaced with their saved evidence. */
+  savedOrder?: Set<ThreadMemoryRecord>; savedVersion: number
   creationHeader?: ThreadMemoryHeader; sealSaved?: boolean
   missing?: boolean
   joinedByChannel: JoinIndex
@@ -418,7 +421,7 @@ interface MemoryJournal extends AppendRollback {
   error?: unknown; quarantined: ThreadMemoryQuarantineFact[]; quarantineRollback: AppendRollback
 }
 function emptyMemoryJournal(): MemoryJournal {
-  return { readable: true, exists: false, hasRecords: false, live: false, created: false, failed: false, highWater: 0,
+  return { readable: true, exists: false, hasRecords: false, live: false, created: false, failed: false, highWater: 0, savedVersion: 0,
     joinedByChannel: new Map(), judged: new Map(), heldJoins: new Map(), kept: [], intents: new Map(), savedIntents: new Map(),
     intentsByChannel: new Map(), writes: [], ownJoins: new Map(), quarantined: [], quarantineRollback: {} }
 }
@@ -441,6 +444,12 @@ function workSlices(current: () => boolean) {
   }
 }
 type WorkSlices = ReturnType<typeof workSlices>
+function replaceSaved(j: MemoryJournal, before?: ThreadMemoryRecord, after?: ThreadMemoryRecord): void {
+  if (before === after) return
+  j.savedVersion++
+  if (before) j.savedOrder?.delete(before)
+  if (after) j.savedOrder?.add(after)
+}
 /** Saved records in the order a synchronous walk visits them. Publication can
  * move a saved join to the held index between slices; walking held joins
  * last never misses it, and `serializeInSlices` drops the identical copy. */
@@ -485,11 +494,12 @@ async function sortInSlices(records: ThreadMemoryRecord[], slices: WorkSlices): 
   return runs[0] ?? []
 }
 /** The bytes of `serializeThreadMemoryRecords([header, ...records])`, in slices. */
-async function serializeInSlices(header: ThreadMemoryHeader, records: readonly ThreadMemoryRecord[], slices: WorkSlices): Promise<Buffer | undefined> {
+async function serializeInSlices(header: ThreadMemoryHeader, records: Iterable<ThreadMemoryRecord>, slices: WorkSlices,
+  lineOf: (record: ThreadMemoryRecord) => string): Promise<Buffer | undefined> {
   const chunks: Buffer[] = []
   let lines = [JSON.stringify(header) + '\n'], previous: string | undefined
   for (const record of records) {
-    const line = JSON.stringify(record) + '\n'
+    const line = lineOf(record)
     if (line !== previous) lines.push(line)
     previous = line
     if (slices.due()) {
@@ -509,6 +519,14 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   const forgotten = new Set<string>(), clocks = new Map<string, number>()
   const pendingJoins = new Map<string, ThreadJoin[]>()
   const maintenanceQueued = new WeakSet<MemoryJournal>()
+  // Records are private immutable versions. Failed writes do not install
+  // their records in the saved indexes; weak keys release abandoned versions.
+  const recordLines = new WeakMap<ThreadMemoryRecord, string>()
+  function lineOf(record: ThreadMemoryRecord): string {
+    let line = recordLines.get(record)
+    if (line === undefined) { line = JSON.stringify(record) + '\n'; recordLines.set(record, line) }
+    return line
+  }
   let activationStarted = false
   let saveObserver: ((save: ThreadMemorySave) => void) | undefined
   let startId: string | undefined, readStarted = false, listingFailed = false, stopped = false, quiesced = false
@@ -562,18 +580,21 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   function entry(j: MemoryJournal, fact: ThreadJoin): JoinedThread | undefined {
     return j.joinedByChannel.get(fact.channel)?.get(fact.root)?.get(stampKey(fact.stamp)) ?? j.heldJoins.get(fact.channel)?.get(fact.root)?.get(stampKey(fact.stamp))
   }
-  function retain(j: MemoryJournal, fact: ThreadJoin, saved?: ThreadJoinRecord, index = j.joinedByChannel): void {
+  function retain(j: MemoryJournal, fact: ThreadJoin, saved?: ThreadJoinRecord, index = j.joinedByChannel): JoinedThread {
     if (index === j.joinedByChannel && j.judged.get(fact.channel) !== stampKey(fact.stamp)) j.judged.delete(fact.channel)
     let roots = index.get(fact.channel)
     if (!roots) { roots = new Map(); index.set(fact.channel, roots) }
     let stamps = roots.get(fact.root)
     if (!stamps) { stamps = new Map(); roots.set(fact.root, stamps) }
     const id = stampKey(fact.stamp), old = stamps.get(id)
-    if (!old) stamps.set(id, { join: structuredClone(fact), ...(saved ? { saved: structuredClone(saved) } : {}) })
-    else {
-      if (fact.at < old.join.at) old.join = structuredClone(fact)
-      if (saved && (!old.saved || saved.at < old.saved.at)) old.saved = structuredClone(saved)
+    const value = old ?? { join: structuredClone(fact) }
+    if (!old) stamps.set(id, value)
+    if (fact.at < value.join.at) value.join = structuredClone(fact)
+    if (saved && (!value.saved || saved.at < value.saved.at)) {
+      replaceSaved(j, value.saved, saved)
+      value.saved = saved
     }
+    return value
   }
   function advancePast(key: string, at: number): void {
     if (!memoryTime(at)) throw new Error('Invalid Thread Memory clock time')
@@ -587,7 +608,10 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     if (!j) return
     for (const [channel, roots] of j.heldJoins) {
       for (const [root, entries] of roots) {
-        for (const [id, value] of entries) if (!named(key, channel, value.join.stamp)) entries.delete(id)
+        for (const [id, value] of entries) if (!named(key, channel, value.join.stamp)) {
+          replaceSaved(j, value.saved)
+          entries.delete(id)
+        }
         if (!entries.size) roots.delete(root)
       }
       if (!roots.size) j.heldJoins.delete(channel)
@@ -609,7 +633,8 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       if (current !== undefined && j.judged.get(channel) === current) continue
       for (const [root, entries] of roots) {
         for (const [id, value] of entries) if (!memoryStampMatches(value.join.stamp, stamp)) {
-          if (named(key, channel, value.join.stamp)) retain(j, value.join, value.saved, j.heldJoins)
+          const held = named(key, channel, value.join.stamp) ? retain(j, value.join, value.saved, j.heldJoins) : undefined
+          if (!held || held.saved !== value.saved) replaceSaved(j, value.saved)
           entries.delete(id)
         }
         if (!entries.size) roots.delete(root)
@@ -644,6 +669,8 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   }
   function replayIntents(j: MemoryJournal): void {
     if (j.records) {
+      delete j.savedOrder
+      j.savedVersion++
       j.savedIntents.clear()
       for (const record of j.records) {
         if (record.kind === 'post-intent') j.savedIntents.set(record.operationId, record)
@@ -718,6 +745,8 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
         event({ type: 'lines-quarantined', key, path: pathFor(key), quarantinePath, facts })
       }
       j.records = records; j.hasRecords = records.length > 0; j.header = header; j.highWater = highWater; j.readable = true; delete j.error
+      delete j.savedOrder
+      j.savedVersion++
       // Expose saved times before activation: the queue compacts after this
       // read and before a shared authority is available. Replay later judges
       // these stamps; no pre-activation join can select intake.
@@ -752,9 +781,20 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       // Only this writer turn saves records; between slices publication can
       // only judge, and a forget or shutdown leaves the old image in place.
       const slices = workSlices(() => current(key, j))
-      const records = await savedRecords(j, slices)
-      const sorted = records && await sortInSlices(records, slices)
-      const bytes = sorted && await serializeInSlices(header, sorted, slices)
+      let ordered: Iterable<ThreadMemoryRecord> | undefined = j.savedOrder
+      if (!ordered) {
+        const version = j.savedVersion
+        const records = await savedRecords(j, slices)
+        const sorted = records && await sortInSlices(records, slices)
+        ordered = sorted
+        // A publication can change saved evidence during the initial walk.
+        // Keep its already collected image, but rebuild the cache next time.
+        // Legacy equal sequence numbers retain the stable walk order too.
+        if (sorted && version === j.savedVersion && sorted.every((record, i) => i === 0 || record.seq > sorted[i - 1]!.seq)) {
+          j.savedOrder = new Set(sorted)
+        }
+      }
+      const bytes = ordered && await serializeInSlices(header, ordered, slices, lineOf)
       if (!bytes || !current(key, j)) return
       await io.rewrite(pathFor(key), bytes)
       j.header = header; j.hasRecords = true
@@ -967,7 +1007,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     }
     try {
       if (records.length) {
-        await io.durableAppend(pathFor(key), serializeThreadMemoryRecords(records), j)
+        await io.durableAppend(pathFor(key), Buffer.from(records.map(lineOf).join('')), j)
         if (saveObserver) {
           try {
             const count = (kind: ThreadMemoryRecord['kind']) => records.filter(record => record.kind === kind).length
@@ -976,8 +1016,13 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
         }
         for (const record of records) {
           if (record.kind === 'join') retain(j, record, record, recoveryStamp(key, record) === 'stale' ? j.heldJoins : j.joinedByChannel)
-          else if (record.kind === 'post-intent') j.savedIntents.set(record.operationId, record)
-          else if (record.kind === 'post-outcome') { j.savedIntents.delete(record.operationId); j.ownJoins.delete(record.operationId) }
+          else if (record.kind === 'post-intent') {
+            replaceSaved(j, j.savedIntents.get(record.operationId), record)
+            j.savedIntents.set(record.operationId, record)
+          } else if (record.kind === 'post-outcome') {
+            replaceSaved(j, j.savedIntents.get(record.operationId))
+            j.savedIntents.delete(record.operationId); j.ownJoins.delete(record.operationId)
+          }
         }
         j.highWater = records.at(-1)!.seq
       }

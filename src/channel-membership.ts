@@ -119,7 +119,7 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
   const undurableAbsences = new Map<string, Map<string, SharedMembershipAbsenceConflict>>()
   const undurableIncarnations = new Map<string, string>()
   const episodes = new Map<string, Map<string, MembershipFault>>()
-  const seenReplacements = new Set(Object.values(authority.snapshot().personas).flatMap(life => Object.keys(life.replacedAbsences ?? {})))
+  const seenReplacements = new Set(authority.absenceReplacements().map(replacement => replacement.binding))
   let closed = false
   const unsubscribe = authority.subscribe(() => {
     for (const [key, incarnation] of undurableIncarnations) {
@@ -133,17 +133,15 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
         episodes.delete(key)
       }
     }
-    for (const [key, life] of Object.entries(authority.snapshot().personas)) {
-      for (const [binding, replacement] of Object.entries(life.replacedAbsences ?? {})) {
-        if (seenReplacements.has(binding)) continue
-        seenReplacements.add(binding)
-        const generation = generations.get(key)
-        if (generation?.incarnation !== life.incarnation) continue
-        // Invalidate the in-flight scan before requesting a fresh observation.
-        // Other channels keep their proven positives and accepted queues.
-        generation.observations++
-        markHeld(generation, replacement.channel, 'current-membership-missing')
-      }
+    for (const { key, incarnation, binding, channel } of authority.absenceReplacements()) {
+      if (seenReplacements.has(binding)) continue
+      seenReplacements.add(binding)
+      const generation = generations.get(key)
+      if (generation?.incarnation !== incarnation) continue
+      // Invalidate the in-flight scan before requesting a fresh observation.
+      // Other channels keep their proven positives and accepted queues.
+      generation.observations++
+      markHeld(generation, channel, 'current-membership-missing')
     }
   })
   function report(key: string, channel: string, fault: MembershipFault): void {

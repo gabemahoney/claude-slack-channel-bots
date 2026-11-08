@@ -11,7 +11,7 @@ import {
 import type { ChannelMode } from './config.ts'
 import type { ChannelMembership, MembershipFault } from './channel-membership.ts'
 import type { MembershipScanStatus } from './channel-membership-scan.ts'
-import { sharedPersonaChannels, type SharedChannelAuthority, type SharedUnresolvedScope } from './shared-channels.ts'
+import type { SharedChannelAuthority, SharedUnresolvedScope } from './shared-channels.ts'
 import type { PersonaEpisodes } from './persona-episodes.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import type { ReloadApplyFailure } from './reload.ts'
@@ -104,7 +104,7 @@ export interface SharedStateReportingDeps {
   episodes: PersonaEpisodes
   log(line: string): void
   persona(key: string): { name: string; key: string } | undefined
-  authority: Pick<SharedChannelAuthority, 'readable' | 'unreadableCause' | 'unresolvedScope' | 'snapshot' | 'path' | 'failure'>
+  authority: Pick<SharedChannelAuthority, 'readable' | 'unreadableCause' | 'unresolvedScope' | 'reportingChannels' | 'inspectMembershipHistory' | 'path' | 'failure'>
   membership: Pick<ChannelMembership, 'generation' | 'read' | 'unresolvedChannels'>
   mode(): ChannelMode
   scanStatus(key: string): MembershipScanStatus
@@ -159,7 +159,7 @@ export function createSharedStateReporting(deps: SharedStateReportingDeps) {
   }
   function allChannels(key: string): string[] {
     const generation = membership.generation(key)
-    return [...new Set([...sharedPersonaChannels(authority.snapshot(), key),
+    return [...new Set([...authority.reportingChannels(key),
       ...(generation?.positives.keys() ?? []), ...(generation?.absent ?? []), ...(generation?.holds.keys() ?? [])])].sort()
   }
   function onset(key: string, kind: SharedReportKind, cause: string, scope: SharedStateReportScope,
@@ -225,10 +225,11 @@ export function createSharedStateReporting(deps: SharedStateReportingDeps) {
     // but neither onset nor escalation is justified before that scan ends.
     const scanEnded = endedIncomplete || (scan.state === 'complete' && deps.scanEnded(key))
     if (evidenceAffected && scanEnded) {
-      // The conflict snapshot is needed only for history holds. Full-scope
-      // reports separately read the inventory to name the persona's channels.
-      const conflicts = historyChannels.length ? authority.snapshot().personas[key]?.membershipAbsenceConflicts : undefined
-      const history = historyChannels.map(channel => ({ channel, evidence: Object.hasOwn(conflicts ?? {}, channel) ? 'absence-order' as const : 'event-history' as const }))
+      // Only the presence of an absence conflict affects the report. Keep
+      // its payload and the rest of the shared state inside the authority.
+      const absences = new Set(historyChannels.length ? authority.inspectMembershipHistory(key, history =>
+        historyChannels.filter(channel => Object.hasOwn(history?.membershipAbsenceConflicts ?? {}, channel))) : [])
+      const history = historyChannels.map(channel => ({ channel, evidence: absences.has(channel) ? 'absence-order' as const : 'event-history' as const }))
       const channels = new Set(historyChannels)
       let all = false
       if (scanProblem) {
