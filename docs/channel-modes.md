@@ -15,19 +15,20 @@ Both modes share one list and destination. A newly verified member without a cho
 
 Listening requires current verified membership. Listing, hearing a message, posting or inviting alone supplies no such evidence. Valid current positives can progress before the inventory completes; [membership readiness](../skills/debug-slack-channel-bots/SKILL.md#membership-setup-record-and-readback) reports inventory and live-event setup separately.
 
-Configurations using `allow_invited_channels` or `invited` are rejected; a manual edit is required.
+A configuration from an earlier release is rejected at load until it is prepared by hand; a manual edit is required (see [Configuration rejections](../skills/debug-slack-channel-bots/SKILL.md#configuration-rejections)).
 
-## Who can reach a persona in fungible mode
+## Who can reach a persona in open mode
 
 Read this before turning open mode on. Each persona's Claude worker runs with tool access on the host, and channel assignments determine who can reach that worker.
 
 - **Assignments change a persona's audience.** A channel invitation and an applied listening choice can expose a persona's worker to new people. In open mode, a verified join without a choice creates `mentions`. This includes private channels, which the operator may not be able to see.
-- **Anyone who can reach the persona can switch a channel to `all`.** In any channel it serves, or by DM, anyone can ask the persona to switch any channel it serves to `all`, including a channel they are not in. From then on, every message in that channel reaches the worker.
+- **Anyone who can reach the persona can change what it hears in a channel.** In any channel it serves, or by DM, anyone can ask the persona to set any eligible channel it is a member of to any value, including a channel they are not in. At `all`, every message in that channel then reaches the worker.
+- **Open-mode choices persist into strict mode.** A choice a persona sets in open mode stays in force when strict mode is turned on, so a non-off choice can start delivery in a channel that was `off`, until a later allowed write or a verified leave changes it.
 - **`fetch_messages` reads every channel the app is in.** The persona's `fetch_messages` can read the history of every channel its app is a member of, so content can be carried from one channel to another.
 - **Slack Connect channels are never served.** An externally shared channel is never served in open mode; serve it in strict mode, with the channel listed.
 - **Enterprise Grid: Slack's flag decides.** A channel shared between workspaces of one Enterprise Grid organization can be served when Slack marks it as not externally shared, and then members of every workspace sharing it can reach the persona.
 
-The audit lines in `server.log` are `persona-invited-channel`, logged the first time a persona hears a channel in open mode (naming the channel, `public` or `private`, and its channel delivery), and `persona-channel-delivery-set`, logged for each stored `set_channel_delivery` choice. The debugging skill explains both ([`persona-invited-channel`](../skills/debug-slack-channel-bots/SKILL.md#persona-invited-channel), [`persona-channel-delivery-set`](../skills/debug-slack-channel-bots/SKILL.md#persona-channel-delivery-set)). To list them:
+The audit lines in `server.log` are `persona-invited-channel`, logged the first time a persona hears a channel in open mode (naming the channel, `public` or `private`, and its `delivery` value), and `persona-channel-delivery-set`, logged for each choice a `set_channel_delivery` call newly applies, as `stored choice for channel <channel> set from <none|off|mentions|all|thread_hybrid> to <value>, at channel delivery <value>`. The debugging skill explains both ([`persona-invited-channel`](../skills/debug-slack-channel-bots/SKILL.md#persona-invited-channel), [`persona-channel-delivery-set`](../skills/debug-slack-channel-bots/SKILL.md#persona-channel-delivery-set)). To list them:
 
 ```sh
 grep -E 'persona-(invited-channel|channel-delivery-set)' ~/.config/claude-slack-channel-bots/server.log*
@@ -37,7 +38,7 @@ A persona logs a channel's `persona-invited-channel` line only once until the se
 
 ## Turning open mode on or off
 
-Before you turn open mode on, read [Who can reach a persona in open mode](#who-can-reach-a-persona-in-fungible-mode): assignments determine who can reach the worker.
+Before you turn open mode on, read [Who can reach a persona in open mode](#who-can-reach-a-persona-in-open-mode): assignments determine who can reach the worker.
 
 The switch selects `strict` or `open` through a confirmed edit:
 
@@ -53,17 +54,43 @@ Before you turn it on, review each persona's app's channel memberships in Slack,
 grep unclaimed-channel ~/.config/claude-slack-channel-bots/server.log*
 ```
 
-**Turning it off.** Strict mode uses the same shared channel choices and destination. The mode switch preserves them, including choices made while open mode was active.
+**Turning it off.** Strict mode uses the same shared channel choices and destination. The mode switch preserves them, including choices made while open mode was active, which stay in force in strict (see [Who can reach a persona in open mode](#who-can-reach-a-persona-in-open-mode)).
 
-## Channel delivery in open mode
+## Delivery values in both modes
 
-In both modes, the shared choices are `off`, `mentions`, `all` and `thread_hybrid`. A missing or unreadable assignment holds affected intake; it is not a saved `off` choice. A newly verified member gets the mode's join default described above, preserving any existing choice: `mentions` delivers direct mentions and broadcasts, while `all` delivers every message.
+In both modes, the shared choices are `off`, `mentions`, `all` and `thread_hybrid`. A missing or unreadable assignment holds affected intake; it is not a saved `off` choice. A newly verified member gets the mode's join default described above, preserving any existing choice: `mentions` delivers direct mentions and broadcasts, `all` delivers every message, and `thread_hybrid` is described under [Threads in `thread_hybrid` channels](#threads-in-thread_hybrid-channels).
 
+- **Saved and effective choice.** A persona's saved choice is the `delivery` value of its entry in the shared list. Its effective choice is what applies to the next message: the saved value while its app is a verified, eligible member and the shared state is readable. While membership is unverified or the state is unresolved, the channel's messages are held, and in a channel the persona can't serve, nothing is delivered; the saved value stays as it is.
 - **Choices persist.** Applied choices live in `config.json.last-applied` across server restarts and persona relaunches. A mode switch preserves them. A proven leave removes the prior choice; incomplete scans cannot prove a leave, and uncertain ordering holds the channel without erasing a newer reviewed choice. A removed, renamed or replaced persona never inherits its previous incarnation’s choices.
-- **The open-mode loop guard.** Another persona’s `permission_prompts` channel is held at `mentions` for other personas whose applied choice is non-off. Off wins before the guard, including for mentions and broadcasts; the saved value stays intact. Its own destination and a `"dm"` destination hold nothing.
+- **`receive_all_shared` requires effective eligibility.** In either mode, a non-mention/non-broadcast message uses this reason only when this persona and another currently eligible member have effective `all` in the channel. A saved-all choice alone does not count: departed or unverified personas cannot supply it, and a persona on `thread_hybrid` never counts; otherwise the reason is `receive_all`.
+- **Notice Destinations.** Each persona's `delivery` applies as written in a channel where another persona posts its permission prompts and notices. Use this on purpose: with `planner`'s `permission_prompts` set to a channel where `reviewer`'s entry is `all`, `reviewer` sees each of `planner`'s prompts and notices there and can review them.
+- **Two personas hearing each other there can answer each other in a loop.** This includes `thread_hybrid` channels, because a persona's own prompts and notices put it in their threads. To avoid it, keep one of them at `mentions`, or give the other persona a different destination.
+- **Don't keep two personas at `all` in one channel.** Each receives every message there, the other's posts included, so each answer one persona posts reaches the other, which can answer it in turn: the two can keep answering each other with no human involved. Two personas in one thread they are both in can keep answering each other the same way. If one should listen to everything, keep the other at `mentions`.
 
-- **`receive_all_shared` requires effective eligibility.** In either mode, a non-mention/non-broadcast message uses this reason only when this persona and another currently eligible member have effective `all` in the channel. A saved-all choice alone does not count: departed, unverified or loop-guarded personas cannot supply it; otherwise the reason is `receive_all`.
-- **Don't keep two personas at `all` in one channel.** Each receives every message there, the other's posts included, so each answer one persona posts reaches the other, which can answer it in turn: the two can keep answering each other with no human involved. If one should listen to everything, keep the other at `mentions`.
+## Threads in `thread_hybrid` channels
+
+At `thread_hybrid`, a persona receives its @mentions and broadcasts, plus every later message in each thread it is in, with `via` `thread`. [How a persona receives messages](bots.md#how-a-persona-receives-messages) gives the order of reasons.
+
+### Joining a thread
+
+- An accepted @mention or broadcast, in a thread's channel message or in a reply, joins the persona to that thread as soon as CSCB accepts it, before the persona answers. Each persona mentioned joins on its own.
+- A post CSCB makes as the persona and Slack confirms joins its thread: replies, uploaded files, permission prompts and server notices.
+- Nothing else joins: reactions, edits (even one adding a mention), deletions, posts the app makes outside CSCB, unconfirmed posts, DMs, and channels that are not `thread_hybrid` or that the persona isn't eligible to serve.
+
+Joining sends no earlier message. The persona can read the whole thread with `fetch_messages` (see [Tools](bots.md#tools)).
+
+### Staying in a thread
+
+Threads are kept across persona and server restarts, channel mode switches and setting `thread_hybrid` again. There is no expiry, no way to leave one thread and no limit. In a channel the persona can't currently serve, its threads are kept and deliver again once it can.
+
+### Starting over
+
+- A persona forgets its threads in a channel when its choice there stops being `thread_hybrid` for any reason, or when its app leaves the channel (a verified leave).
+- A removed, renamed or replaced persona forgets all of them (see [Destructive changes](reload.md#destructive-changes)).
+- A channel switched to `thread_hybrid` starts with none. Messages already waiting are kept, and delivering them joins nothing.
+- A leave and rejoin that CSCB never observes, such as both while it is stopped, is not a verified leave, so the threads stay.
+
+Keep each persona's Slack app internal to the workspace, not distributed: a distributed app gets lower Slack rate limits, which slow whole-thread reading and recovery lookups. The Thread Memory reports a persona's destination can receive are in [Troubleshooting](troubleshooting.md#troubleshooting).
 
 ## Permission prompts in both modes
 
@@ -72,7 +99,7 @@ In both modes, the shared choices are `off`, `mentions`, `all` and `thread_hybri
 - **A channel ID:** a listed channel for a fresh submission, including one set to `off`. Invite the app there so Slack can accept its posts. Everyone there sees the prompts and notices.
 - **`dm`:** a DM to `dm.contact`, requiring `dm.enabled: true` and a contact.
 
-A validated unchanged channel destination remains selected after same-incarnation verified removal, including with zero entries and DMs disabled; it does not recreate membership or a choice. Only a confirmed destination change moves future prompts and ordinary notices, held notices included. Posted valid prompts stay answerable under their original identity rules, without granting ordinary tools or intake authority; see [Permission Relay](bots.md#permission-relay).
+A validated unchanged channel destination stays selected after a verified leave of that channel by the same persona incarnation, even with zero entries and DMs off; it does not recreate membership or a choice. Only a confirmed destination change moves future prompts and ordinary notices, held notices included. Posted valid prompts stay answerable in their original conversation; [Permission Relay](bots.md#permission-relay) says who may answer.
 
 [Storage-warning recovery](../skills/debug-slack-channel-bots/SKILL.md#message-saved-after-retry) keeps both the edit and its one fallback correction in the warning's original channel or DM, even after the destination changes or DMs are turned off.
 
@@ -101,15 +128,3 @@ A complete `config.json` in open mode, with two personas. `triage` has a listed 
   "channel_mode": "open"
 }
 ```
-
-### Turning fungible mode on or off
-
-See [Turning open mode on or off](#turning-open-mode-on-or-off).
-
-### Channel delivery in fungible mode
-
-See [Channel delivery in open mode](#channel-delivery-in-open-mode).
-
-### Permission prompts in fungible mode
-
-See [Permission prompts in both modes](#permission-prompts-in-both-modes).

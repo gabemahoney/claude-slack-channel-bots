@@ -6,7 +6,7 @@ The persona reference for `config.json`: every persona field, credentials files 
 
 `config.json` is read from `~/.config/claude-slack-channel-bots/config.json` by default (`$XDG_CONFIG_HOME/claude-slack-channel-bots/config.json` when `XDG_CONFIG_HOME` is an absolute path). Override the directory with `SLACK_STATE_DIR`. The server needs only this file and the credentials files it names.
 
-Each bot is a **persona**: one Slack app, one Claude instance with its own working directory, and the channels it serves. In both modes, listening follows the shared applied channel choices; in strict mode, its tools target configured non-off channels; in open mode, its tools may target any channel ID: the call goes to Slack, which decides (see [Tools](bots.md#tools) and [Channel modes](channel-modes.md#channel-modes)). Create one Slack app per persona (see `slack-app-manifest.yml`); that app gives the persona its own name and avatar in Slack.
+Each bot is a **persona**: one Slack app, one Claude instance with its own working directory, and the channels it serves. In both modes, listening follows the shared applied channel choices (see [Channel modes](channel-modes.md#channel-modes), and [Tools](bots.md#tools) for what its tools may target). Create one Slack app per persona (see `slack-app-manifest.yml`); that app gives the persona its own name and avatar in Slack.
 
 The top level holds a required `personas` array and the [server-wide settings](server-settings.md#server-wide-settings). Unknown keys are rejected at every level: the top level, each persona, its `dm` object and each channel entry. See [Load-time rules](#load-time-rules).
 
@@ -70,7 +70,7 @@ Replace the channel IDs, user IDs and paths with your own. Each persona's creden
 | `name` | string | yes | — | Any non-empty string; no format rule. See [Persona name and key](#persona-name-and-key). |
 | `credentials_file` | path | yes | — | Path to the persona's [credentials file](#credentials-files). |
 | `working_directory` | path | yes | — | Working directory of the persona's Claude instance. It must exist before the persona can come up. |
-| `channels` | array | fresh submission: yes unless `dm.enabled` is `true` | empty | Shared channel choices in both modes, a list of [channel entries](#channel-entries). See [Channel delivery](#channel-delivery). |
+| `channels` | array | fresh submission: yes unless `dm.enabled` is `true` | empty | Shared channel choices in both modes, a list of [channel entries](#channel-entries). See [Delivery values](#delivery-values). |
 | `dm.enabled` | boolean | no | `false` | The persona's DMs switch. See [Direct messages](#direct-messages-dmenabled). |
 | `dm.contact` | string | when `permission_prompts` is `"dm"` | — | A Slack user ID such as `U0123456789`: the person a `"dm"` destination addresses. In Slack, open the person’s profile, then **⋮** → **Copy member ID**. |
 | `permission_prompts` | string | yes | — | Required in both modes: the persona’s **destination**, where its permission prompts and server notices are posted. For a fresh submission, one of its listed channel IDs, including `off`, or `"dm"`. See [Permission prompts](#permission-prompts). |
@@ -88,7 +88,7 @@ Channel entries supply shared choices in both modes (see [What each mode serves]
 | Field | Description |
 |---|---|
 | `id` | A Slack channel ID: `C` or `G` followed by capital letters and digits, such as `C0123456789`. Not a channel name. In Slack, click the channel name; the ID is at the bottom of the **About** tab. |
-| `delivery` | `"off"`, `"mentions"`, `"all"` or `"thread_hybrid"`, explicitly required. See [Channel delivery](#channel-delivery). |
+| `delivery` | `"off"`, `"mentions"`, `"all"` or `"thread_hybrid"`, explicitly required. See [Delivery values](#delivery-values). |
 
 ### Persona name and key
 
@@ -109,9 +109,7 @@ The key identifies the persona's agent-director instance (`cscb_<key>`), its tmu
 
 **No persona's key may start with another persona's key.** The server rejects such a pair when it checks the configuration (see [Load-time rules](#load-time-rules)), with an error that names both personas and suggests a new name. tmux matches a session target by prefix unless it is written with `=`, so a human's tmux command without `=` for one persona (for example `tmux attach -t slack_bot_dev`) could reach another persona's session. With personas `dev` and `dev_2`, that command could reach `slack_bot_dev_2`.
 
-Give the shorter name a suffix, such as `dev_main` beside `dev_2`, or `team_main` beside `team_admin`, or rename either so that neither key starts with the other. Keys that only share a start, such as `dev_a` and `dev_b`, are fine. A name that isn't its own key counts by its key: `"Dev Bot"` (key `dev_bot_…`) can't sit beside `dev` either.
-
-Renaming a persona changes its key, so the old persona is removed and a new one added (see [What a confirmation applies](reload.md#what-a-confirmation-applies)).
+Give the shorter name a suffix, such as `dev_main` beside `dev_2`, or rename either so that neither key starts with the other; renaming changes the key, so the old persona is removed and a new one added (see [What a confirmation applies](reload.md#what-a-confirmation-applies)). Keys that only share a start, such as `dev_a` and `dev_b`, are fine. A name that isn't its own key counts by its key: `"Dev Bot"` (key `dev_bot_…`) can't sit beside `dev` either.
 
 ### Credentials files
 
@@ -126,7 +124,7 @@ Each persona's Slack tokens live in its own credentials file, and `config.json` 
 
 `bot_token` is the app's bot token (`xoxb-…`), shown under OAuth & Permissions once you install the app to the workspace. `app_token` is an app-level token (`xapp-…`) with the `connections:write` scope, generated under Basic Information → App-Level Tokens.
 
-- Tokens come only from these files, never from `config.json`.
+- Tokens come only from these files: never put one in `config.json`, a ticket or a chat.
 - Two personas can't share a credentials file.
 - The server never writes or copies the file and doesn't check its mode. Keep it private: `chmod 600`.
 - The file's content is checked when the persona comes up, not when `config.json` is checked. A missing or malformed file keeps only that persona down (see [Troubleshooting](troubleshooting.md#troubleshooting)).
@@ -135,7 +133,6 @@ Each persona's Slack tokens live in its own credentials file, and `config.json` 
 Write the file with `claude-slack-channel-bots credentials <persona>` in your own terminal, once the persona is declared in `config.json`: the [credentials command](../skills/setup-slack-channel-bots/SKILL.md#credentials-command) of the setup wizard, `setup-slack-channel-bots`. It checks both tokens with Slack and writes the file, mode 0600, only when both pass; see [`claude-slack-channel-bots credentials`](cli.md#claude-slack-channel-bots-credentials).
 
 To rotate a persona's tokens, run the credentials command for it again (see the wizard's [Rotate a persona's tokens](../skills/setup-slack-channel-bots/SKILL.md#rotate-a-personas-tokens)), then confirm the pending change (see [Confirming a change](reload.md#confirming-a-change)). Only that persona reconnects, and no restart is needed.
-Never put a token in `config.json`, a ticket or a chat.
 
 The shipped `slack-app-manifest.yml` also grants the `lists:read` and `lists:write` bot scopes, so a bot can read and write, with its own bot token, a Slack List it has been given access to, such as one list shared by all bots. CSCB itself makes no Lists call. An app created from an earlier manifest must have both scopes added and be re-installed; until then, every Lists call fails with `missing_scope`.
 
@@ -143,16 +140,16 @@ The `canvases:read` and `canvases:write` bot scopes let a persona read and maint
 
 The `reactions:read` bot scope lets a persona read the owner's reaction answers with `reactions.get`. An app created from an earlier manifest must have this scope added and be re-installed; until then, `reactions.get` fails with `missing_scope`.
 
-### Channel delivery
+### Delivery values
 
-Channel delivery applies in both modes; see [Channel delivery in open mode](channel-modes.md#channel-delivery-in-open-mode). Each channel entry's `delivery` sets which messages in that channel reach the persona:
+Each channel entry's `delivery` applies in both modes and sets which messages in that channel reach the persona. Join defaults, membership and a persona's saved and effective choice are in [Delivery values in both modes](channel-modes.md#delivery-values-in-both-modes).
 
-- **`off`**: no channel messages. A newly verified member without a choice starts at `off` in strict or `mentions` in open, using the mode at application; duplicate joins preserve choices, including `off`.
-- **`thread_hybrid`**: an explicit shared channel delivery choice.
-- **`all`**: every message in the channel.
+- **`off`**: no channel messages.
 - **`mentions`**: only messages that @mention the persona directly, and `@here` / `@channel` broadcasts.
+- **`all`**: every message in the channel.
+- **`thread_hybrid`**: the persona's @mentions and broadcasts, plus every later message in each thread it is in (see [Threads in `thread_hybrid` channels](channel-modes.md#threads-in-thread_hybrid-channels)).
 
-Any number of personas may list the same channel, each with its own `delivery`; one persona can't list it twice. Invite each app, but listing, inviting, hearing or posting alone proves no current membership. Listening requires current verified membership; valid positives can progress before inventory completion. [How a persona receives messages](bots.md#how-a-persona-receives-messages) describes delivery; [membership readiness](../skills/debug-slack-channel-bots/SKILL.md#membership-setup-record-and-readback) distinguishes inventory from setup.
+Any number of personas may list the same channel, each with its own `delivery`; one persona can't list it twice. Invite each app to its channels. [How a persona receives messages](bots.md#how-a-persona-receives-messages) describes delivery.
 
 ### Direct messages (`dm.enabled`)
 
@@ -170,12 +167,12 @@ Receiving DMs and replying in an existing DM (a `D…` ID) work without the scop
 
 ### Permission prompts
 
-`permission_prompts` is required in both modes; see [Permission prompts in both modes](channel-modes.md#permission-prompts-in-both-modes). It is the persona's destination: its permission prompts and its server notices, such as *Message not saved* notices and restart-limit warnings, are posted there as the persona.
+`permission_prompts` is required in both modes. It is the persona's destination: its permission prompts and its server notices, such as *Message not saved* notices and restart-limit warnings, are posted there as the persona. [Permission prompts in both modes](channel-modes.md#permission-prompts-in-both-modes) says when a destination stays selected after the persona leaves its channel.
 
-- **A channel ID:** a fresh destination must be in the persona's own `channels`, including `off`. A validated unchanged destination remains selected after same-incarnation verified removal, even with zero entries and DMs disabled; restart or an unrelated confirmation needs no re-add. Everyone in that channel sees the prompts and notices.
+- **A channel ID:** a fresh destination must be in the persona's own `channels`, including `off`. Everyone in that channel sees the prompts and notices.
 - **`"dm"`:** a DM from the persona's app to its `dm.contact`. It needs `dm.enabled: true` and a `dm.contact`.
 
-Removal evidence grants no operator exception flag, new invalid destination, recreated entry or inherited audience after reset. Choose with [channel delivery](#channel-delivery) in mind: if two personas each receive every message in the other’s destination and storing fails, notices stop after one *Message not saved* each per episode, with further failures counted in `server.log`. [Permission Relay](bots.md#permission-relay) covers responses; [Troubleshooting](troubleshooting.md#troubleshooting) covers failed posts.
+Choose with [delivery values](#delivery-values) in mind: if two personas each receive every message in the other’s destination and storing fails, notices stop after one *Message not saved* each per episode, with further failures counted in `server.log`. [Permission Relay](bots.md#permission-relay) covers responses; [Troubleshooting](troubleshooting.md#troubleshooting) covers failed posts.
 
 ### Next-launch settings
 
@@ -198,4 +195,6 @@ Use `--console` instead of `--claudeai` for a Console account. When neither the 
 
 ### Load-time rules
 
-Before applying `config.json`, the server reports the first violation: names and keys must be unique with no key prefixes, working directories and credentials files cannot be shared, and fields must meet their type/value rules (see [Persona name and key](#persona-name-and-key)). Both modes validate `channels` and `permission_prompts`, with only the trusted unchanged-destination qualification [above](#permission-prompts); `channel_mode` accepts only `strict` or `open`. A fresh-install violation stops startup and a running edit produces an `INVALID` preview; the debug skill lists [every load-time rule](../skills/debug-slack-channel-bots/SKILL.md#the-load-time-rules) and [rejection with its fix](../skills/debug-slack-channel-bots/SKILL.md#configuration-rejections).
+Before applying `config.json`, the server reports the first violation: names and keys must be unique with no key prefixes, working directories and credentials files cannot be shared, and fields must meet their type/value rules (see [Persona name and key](#persona-name-and-key)). Both modes validate `channels` and `permission_prompts`; `channel_mode` accepts only `strict` or `open`.
+
+A configuration from an earlier release is rejected with an error naming what replaces each removed key. A fresh-install violation stops startup and a running edit produces an `INVALID` preview; the debug skill lists [every load-time rule](../skills/debug-slack-channel-bots/SKILL.md#the-load-time-rules) and [rejection with its fix](../skills/debug-slack-channel-bots/SKILL.md#configuration-rejections).

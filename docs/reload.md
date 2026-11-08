@@ -12,8 +12,9 @@ These files sit beside `config.json` (`~/.config/claude-slack-channel-bots/` by 
 | `config.json.pending` | A preview of what applying the edit would do, written by the server. It exists only while a change is pending. |
 | `config.json.request` | Your explicit assignment, revision, cancellation, refresh or [restore/replace request](../skills/debug-slack-channel-bots/SKILL.md#reload-shared-recovery). It stages intent or recovery without activation; deleting this file does not cancel recorded intent. |
 | `config.json.apply` | Your confirmation: the current pending file, renamed. Its durable outcome prevents reuse even if cleanup fails. Definite failure needs fresh review; unresolved durability needs retained-outcome recovery (see [Confirming a change](#confirming-a-change)). |
-| `retired-keys.json` | The retired-key record: the persona keys the server holds as retired. A confirmed change records the key of each removed persona (a renamed persona's old key included) and of each persona whose `name`, `credentials_file` or `working_directory` changed, before the reviewed change becomes active. A server start also records, before its clean-up of old instances ends any of them, the key of every agent-director instance labelled with a persona that is not in the applied configuration (see [Start rules](#start-rules)), so a persona added back later with that key starts fresh. If that write fails, the start logs it in `server.log`, holds those keys as retired until the server stops, and records them again at the next start. Only the server writes it, never the CLI. It is kept across restarts and is absent until a key is first recorded. A key's entry is removed on its own once the persona's new session is running. If it can't be read, the server doesn't start; moving it aside is the fix (see `retired-keys-unreadable` under [Startup errors](troubleshooting.md#startup-errors)). |
+| `retired-keys.json` | The retired-key record: persona keys held as retired. A confirmed change records, before it becomes active, the key of each removed persona (a renamed persona's old key included) and of each persona whose `name`, `credentials_file` or `working_directory` changed. A server start records, before its clean-up of old instances ends any, the key of every agent-director instance labelled with a persona not in the applied configuration (see [Start rules](#start-rules)), so a persona added back with that key starts fresh; if that write fails, `server.log` says so and the keys stay retired until the server stops and are recorded at the next start. Only the server writes it. It is absent until a key is first recorded, and a key's entry goes once its persona's new session is running. If it can't be read, the server doesn't start; move it aside (see `retired-keys-unreadable` under [Startup errors](troubleshooting.md#startup-errors)). |
 | `queue/<key>.jsonl` | The persona’s durable queue, holding message text until delivery. Removing a persona retains its queue file; delivery resumes only when the same key returns. |
+| `threads/<key>.jsonl` and `thread-memory-seal.json` | Thread Memory: each persona's journal of the threads it is in, in its `thread_hybrid` channels, and one seal for all personas that lets a start tell whether a journal changed while CSCB was stopped. Neither holds message text. Never edit them by hand; for recovery see [Thread Memory reports](../skills/debug-slack-channel-bots/SKILL.md#thread-memory-reports-and-log-lines). |
 
 ## Start rules
 
@@ -30,13 +31,11 @@ Zero personas is valid; the operator starts CSCB after reboot because it ships n
 
 While the server runs, it checks `config.json` and each credentials file the file names about every 5 seconds. It applies nothing it finds. When either differs from what is applied, the server writes `config.json.pending` and logs the same preview once in `server.log`. The change waits for your confirmation (see [Confirming a change](#confirming-a-change)). Nothing about a pending change is posted to Slack.
 
-- Restarting the server or rebooting the host doesn't apply a pending `config.json` edit. The start brings back the recorded personas, and the edit stays pending.
-- A pending credentials-file change is the exception: every start reads credentials files as they stand, so the next start applies it.
+- Restarting the server or rebooting the host doesn't apply a pending `config.json` edit: the start brings back the recorded personas, and the edit stays pending.
+- A pending credentials-file change is the exception: every start reads credentials files as they stand, so the next start applies it. In dry run (`SLACK_DRY_RUN`), credentials files are not compared.
 - Reverting the edit byte for byte clears the preview only if no explicit request remains. A whitespace difference stays pending as `no effective change`. Detected reversion never revives an earlier confirmation.
-- In dry run (`SLACK_DRY_RUN`), credentials files are not compared.
 
 To see what is pending:
-
 ```sh
 cat ~/.config/claude-slack-channel-bots/config.json.pending
 grep -E 'reload-(preview|invalid|nothing-pending)' ~/.config/claude-slack-channel-bots/server.log | tail
@@ -66,7 +65,7 @@ Use a fresh `request_id` for each deliberate operation: 1–128 ASCII letters, d
 | `refresh` | Only `format`, a fresh `request_id`, current `intent_generation` and `action:"refresh"`; omit `assignments`. Keeps the declaration set and reviews current facts. For generation 1: `{"format":"cscb-review-request-v1","request_id":"planner-refresh-2","intent_generation":1,"action":"refresh"}`. |
 | `cancel` | The same four fields with `action:"cancel"`. Clears declared intent, preserving other pending configuration edits. After that refresh at generation 2: `{"format":"cscb-review-request-v1","request_id":"planner-cancel-3","intent_generation":2,"action":"cancel"}`. |
 
-Each accepted operation advances the generation; wait for its `reload-request-recorded` line before the next operation. Replaying the same ID and payload creates no new assignment. Cancellation and successful consumption do not free an ID for reuse. Saving, requesting, revising, cancelling and refreshing apply nothing; the separate [confirming rename](#confirming-a-change) is still required. Automatic changes never rewrite your original `config.json` bytes.
+Each accepted operation advances the generation; wait for its `reload-request-recorded` line before the next operation. Recorded intent survives a server restart, and replaying the same ID and payload creates no second assignment; a new deliberate assignment needs a fresh ID, and neither cancellation nor consumption frees one for reuse. Requests apply nothing: the separate [confirming rename](#confirming-a-change) does, and automatic changes never rewrite your original `config.json` bytes.
 
 ## Reading the preview
 
@@ -93,9 +92,11 @@ persona "reviewer" (key=reviewer): channels changed: applied in place immediatel
 server-wide setting channel_mode changed: turns open mode on, applied in place at once, from the next event, tool call, prompt and notice, for "planner" (key=planner), "reviewer" (key=reviewer), "helpdesk" (key=helpdesk).
 ```
 
-These excerpts show lifecycle effects; the full preview also includes `Operator intent generation=<n>; declared assignments=<n>. Requests change intent only; rename the reviewed pending file to the apply name to confirm.` Each `Channel persona=… channel=…` line distinguishes `saved`, `reviewed`, `saved order`, `membership`, `effective now` and `reviewed effective`.
+These excerpts show lifecycle effects; the full preview also includes `Operator intent generation=<n>; declared assignments=<n>. Requests change intent only; rename the reviewed pending file to the apply name to confirm.` Each `Channel persona=… channel=…` line distinguishes `saved`, `reviewed`, `saved order`, `membership`, `effective now` and `reviewed effective`: the [saved and effective choice](channel-modes.md#delivery-values-in-both-modes) now and once confirmed.
 
-`declared` assignments and edited channel values are intentional writes; `copied` fields are not. An explicit same-value assignment takes a new position in application order. A newer saved choice overwritten by intent is labelled `Deliberately overwrites the current saved choice.` Omitted current choices and automatic additions outside intent remain: `Retained current choice; use an explicit off assignment to stop intake.` Unverified membership does not become current merely because a preference is saved.
+`declared` assignments and edited channel values are intentional writes; `copied` fields are not. Unverified membership does not become current merely because a preference is saved.
+
+An explicit same-value assignment takes a new position in application order, and its line says `Explicit same-value assignment.` A newer saved choice overwritten by intent is labelled `Deliberately overwrites the current saved choice.` Omitted current choices and automatic additions outside intent remain: `Retained current choice; use an explicit off assignment to stop intake.`
 
 Paths in the preview are absolute: a `~` in `config.json` is shown expanded. In `server.log`, each preview line (everything after the `fingerprint:` line and the blank line) is prefixed `[slack] reload-preview:`, and the first one ends with where the preview is written: ` (preview in "<path of config.json.pending>")`.
 
@@ -118,15 +119,15 @@ Paths in the preview are absolute: a `~` in `config.json` is shown expanded. In 
 
 ## Confirming a change
 
-To apply a pending change, rename `config.json.pending` to `config.json.apply` in the same directory, with the server running:
+To apply a pending change, rename `config.json.pending` to `config.json.apply` in the same directory, with the server running; you can direct an agent to do the rename:
 
 ```sh
 cd "${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}" && mv config.json.pending config.json.apply
 ```
 
-Read the full current preview first. The next check, about 5 seconds later, revalidates its state and current membership; an earlier apply can delay the outcome by minutes. The reviewed mode, channel choices and persona identities become durable and visible together. Only successful activation consumes its matching intent; unrelated pending input survives. Next-launch and most server-wide settings are recorded and take effect later; the switch `channel_mode` and reminder setting `stop_hook_bootstrap` (own or inherited) apply in place at once.
+Read the full current preview first; after a stop, wait for recovery and current startup membership validation, then read and confirm the fresh preview. The next check, about 5 seconds later, revalidates its state and current membership; an earlier apply can delay the outcome by minutes. Never compute or copy a fingerprint into a confirmation.
 
-You can direct an agent to do the rename. Never compute or copy a fingerprint into a confirmation. After a stop, wait for recovery and current startup membership validation, then read and confirm the fresh preview.
+The reviewed mode, channel choices and persona identities become durable and visible together. Only successful activation consumes its matching intent; unrelated pending input survives. Next-launch and most server-wide settings are recorded and take effect later; the switch `channel_mode` and reminder setting `stop_hook_bootstrap` (own or inherited) apply in place at once.
 
 Each confirmation logs one of these lines in `server.log`:
 
@@ -145,11 +146,9 @@ grep -E 'reload-(applied|noop|invalid|stale-confirmation|record-write-failed|rev
 
 ## What a confirmation applies
 
-Each row is one kind of change: what happens once you confirm it, and what happens to the persona's live session (its instance and its conversation).
-
 | Change | Once confirmed | Live session |
 |---|---|---|
-| `channels`, `delivery`, `permission_prompts`, `dm.enabled` or `dm.contact` changes | Applied in place, immediately: from the next event or post. Explicit assignments, including the same value, are ordered; copied fields, mode-only and unrelated edits do not reassign channels. Omission retains current choices; assign `off` to stop intake. A changed DM contact is used for the next prompt. | Kept |
+| `channels`, `delivery`, `permission_prompts`, `dm.enabled` or `dm.contact` changes | Applied in place, immediately: from the next event or post. Explicit assignments, including the same value, are ordered; copied fields, mode-only and unrelated edits do not reassign channels. Omission retains current choices; assign `off` to stop intake. Changing a channel away from `thread_hybrid` forgets the persona's threads there (see [Starting over](channel-modes.md#starting-over)). A changed DM contact is used for the next prompt. | Kept |
 | A credentials file's content changes (same path), such as a rotated token | Only that persona reconnects: the new connection opens, then the old one closes. If the new file can't be used or Slack refuses it, the old connection keeps running, `server.log` shows `persona-credentials-change-failed`, and the change stays pending. If Slack can't be reached, the old connection stays in use while the new one retries. A persona that is retrying (Slack unreachable, its working directory unusable, or held for its `claude_config_dir` by `persona-config-dir-unresolvable`) has no connection and retries with the new content. A persona down because of its credentials comes up on the confirmed change, with no restart; if its new file can't be used, it stays down with its usual line, such as `persona-credentials-invalid`, and nothing stays pending. | Kept |
 | `claude_config_dir` changes (the persona's own or inherited) | Recorded. The persona's next launch uses it and starts a new conversation on the same instance when the directory changed: the conversation is not resumed, nothing is deleted, and the old transcript stays in the old directory. | Kept until the next launch |
 | `stop_hook_bootstrap` changes (the persona's own or inherited) | Applied in place, immediately: subsequent reminder checks use the confirmed value. | Kept |
@@ -160,7 +159,6 @@ Each row is one kind of change: what happens once you confirm it, and what happe
 | A server-wide setting changes, such as `port` | Recorded. The running server keeps its current value, and the next server start uses the recorded one. `channel_mode` and inherited `stop_hook_bootstrap` apply in place at once (see the switch's row above). `stop_timeout` and `exit_timeout` differ too: only the CLI uses them, and it takes them from the record at once, so the next `stop` or `clean_restart` uses them. `agent_director_call_timeout_ms` differs as well: the CLI takes it from the record at once, and the running server uses it from its next start. | Not affected |
 | A persona is added | Brought up exactly as at start, including the storage check (`jsonl-non-persistent`, see [Startup errors](troubleshooting.md#startup-errors)). If its credentials file or working directory is bad, it logs the same lines as at start and never affects running personas. See "A persona doesn't come up or doesn't answer" in [Troubleshooting](troubleshooting.md#troubleshooting). | New session |
 
-- **Inherited defaults.** A changed top-level `claude_config_dir` takes effect at each inheriting persona's next launch. A changed top-level `stop_hook_bootstrap` applies immediately to each inheriting persona. The preview lists those personas; a persona that sets its own value isn't affected.
 - **Unchanged personas.** A persona whose declaration and credentials are unchanged is not touched.
 - **Several changes to one persona.** A `credentials_file` path or `working_directory` change wins: the persona is brought up fresh from its new entry, which carries its other changes with it. Otherwise each change applies as its row says. The order is teardowns, in-place updates, credentials reconnects, then bring-ups.
 - **Fixed on Slack's side.** A persona down because Slack refused its tokens, fixed in Slack (for example, its app re-installed) with the same tokens, has nothing pending. Re-save its credentials file with any byte change (a trailing newline is enough), wait for the pending change, then confirm it. The `debug-slack-channel-bots` skill (see [Troubleshooting](troubleshooting.md#troubleshooting)) has the details.
@@ -173,11 +171,17 @@ To make them take effect sooner, wait for the `reload-applied` line, then run `c
 
 ## Destructive changes
 
-Removal/re-add, rename/back, a changed credentials location or working directory resets inherited choices. Unchanged copied fields do not retain them. To retain a value deliberately, use the request above with the currently applied incarnation (or `null` for an absent key), the replacement's declaration and the desired value, even if unchanged. Its preview says `Deliberate assignment to the replacement; no old participation or membership is retained.` Unassigned discovered entries start `off` in strict or `mentions` in open. Equivalent paths, reconnect/relaunch, mode/value changes and same-location credential-content rotation do not independently reset preferences. A preference after verified leave is new future intent, not current membership or resurrection.
+Removal/re-add, rename/back, a changed credentials location or working directory resets inherited choices, and the reset persona forgets all its threads (see [Starting over](channel-modes.md#starting-over)). Unchanged copied fields do not retain them; unassigned discovered entries start `off` in strict or `mentions` in open.
 
-`DESTRUCTIVE:` lines in the preview name the personas the change retires when you confirm it (see the table above). A retired persona's session is stopped and never resumed. Its queue is retained: add a persona with the same key to deliver its queued messages. Read the preview before you rename it. There is no undo. A persona removed and added again with the same key, or renamed and then renamed back, always starts a new conversation, even with a server restart in between: its old conversation is never resumed. A persona brought up from its new entry after a `credentials_file` path or `working_directory` change starts fresh the same way.
+To retain a value deliberately, use the request above with the currently applied incarnation (or `null` for an absent key), the replacement's declaration and the desired value, even if unchanged. Its preview says `Deliberate assignment to the replacement; no old participation or membership is retained.`
 
-CSCB never deletes an agent-director row, and it checks the result of every kill it makes. A teardown ends the old session, checks the result, and keeps the row; a removed persona's row stays until agent-director's `expire` removes it, and is never resumed. A kill agent-director can't carry out right now is tried up to 3 times, 2 s apart. When the kill still fails (for example, the worker outlived each of its kills), `server.log` shows the teardown's line for it, which ends `— the row is kept; nothing latches and no retry timer is armed …`. The persona's new session is then not started over the old one: the bring-up after a `credentials_file` path or `working_directory` change ends the old session first and starts the new conversation only once that succeeds. A renamed persona's new name is brought up only once the old instance has ended, and so is any other persona that shares the old instance's working directory; until then a Claude Code session started from that directory is refused (see "A persona waits on an old instance in its working directory" in [Troubleshooting](troubleshooting.md#troubleshooting)). The old conversation is never resumed either way.
+Equivalent paths, reconnect/relaunch, mode/value changes and same-location credential-content rotation do not independently reset preferences. A preference after verified leave is new future intent, not current membership or resurrection.
+
+`DESTRUCTIVE:` lines in the preview name the personas the change retires when you confirm it (see the table above); read the preview before you rename it, as there is no undo. A retired persona's session is stopped and never resumed. Its queue is retained: add a persona with the same key to deliver its queued messages.
+
+A persona removed and added again with the same key, or renamed and then renamed back, always starts a new conversation, even with a server restart in between: its old conversation is never resumed. A persona brought up from its new entry after a `credentials_file` path or `working_directory` change starts fresh the same way.
+
+CSCB never deletes an agent-director row, and it checks the result of every kill it makes. A teardown ends the old session, checks the result, and keeps the row; a removed persona's row stays until agent-director's `expire` removes it, and is never resumed. A new session is never started over an old one whose kill failed; the kill's retries, the teardown's `server.log` line and which personas wait for the old instance to end are in [A persona was added or removed by a confirmed change](../skills/debug-slack-channel-bots/SKILL.md#a-persona-was-added-or-removed-by-a-confirmed-change).
 
 Nothing about the teardown is posted to Slack. Every notice raised for the persona while it runs goes to `server.log` and `startup-errors.log` as a `persona-teardown-notice` entry; see `persona-teardown-notice` under [Startup errors](troubleshooting.md#startup-errors), and "A persona posts a *Kill failed* or *Process outlived kill* notice" in [Troubleshooting](troubleshooting.md#troubleshooting).
 
@@ -194,7 +198,3 @@ To fix it, wait for the server to write `config.json.pending` again (within abou
 ## No reload command
 
 By design, no CLI subcommand, MCP tool or HTTP endpoint applies a change: the rename is the only way. Personas are Claude instances that read help output and tool lists, and a reload can remove a persona, so none of them advertises it; this isn't a security boundary, since a bot running as your user could rename the file itself, so only direct one to when you intend to.
-
-## When the server can't start
-
-Ordinary confirmation needs a running server. When damaged or unresolved authority prevents startup, [reviewed restore or explicit replacement](../skills/debug-slack-channel-bots/SKILL.md#reload-shared-recovery) uses the same request, preview and confirming rename: a staged proposal is inert, and an installed-but-unsynced outcome remains unresolved until the retained result is recovered. Preserve authority, retirement evidence, request, confirmation and prepared input; never substitute an old snapshot or promote unconfirmed edits. For valid authority with an unusable listening setting, see [A first start that fails after recording](../skills/debug-slack-channel-bots/SKILL.md#a-first-start-that-fails-after-recording).

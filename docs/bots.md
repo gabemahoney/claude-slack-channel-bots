@@ -11,19 +11,17 @@ Each MCP endpoint exposes the following tools to the connected Claude Code sessi
 | `reply` | Send a message to a channel (in strict mode one of the persona's configured non-off channels; in open mode any channel ID) or, when the persona's `dm.enabled` is `true`, to a DM conversation ID (`D…`) or a Slack user ID (`U…`/`W…`). A user ID opens a DM with that user and posts there as the persona; the result names the DM conversation ID to use for later calls. Splits long text by `reply_chunk_limit` and `reply_chunk_mode`; supports file attachments. With `message_id` (the message being answered), its first successful text post or file upload clears this persona's actual queued or delivered [acknowledgement reaction](server-settings.md#acknowledgement-reactions), without waiting for cleanup before continuing the reply. |
 | `react` | Add an emoji reaction to a Slack message in a channel (a configured non-off channel in strict mode; any channel ID in open mode) or, with `dm.enabled` `true`, a DM conversation (`D…`). |
 | `edit_message` | Edit a previously sent message (bot's own messages only) in a channel (a configured non-off channel in strict mode; any channel ID in open mode) or, with `dm.enabled` `true`, a DM conversation (`D…`). |
-| `fetch_messages` | Fetch message history from a channel (a configured non-off channel in strict mode; any channel ID in open mode), a DM conversation (`D…`, with `dm.enabled` `true`) or a thread in either. Returns oldest-first. |
+| `fetch_messages` | Fetch message history from a channel (a configured non-off channel in strict mode; any channel ID in open mode), a DM conversation (`D…`, with `dm.enabled` `true`) or a thread in either. With `thread_ts` in a channel where the persona's saved choice is `thread_hybrid`, it returns `{ messages, next_cursor }`: one page of the thread, the first starting with its channel message, and `next_cursor` while more remain; pass it back as `cursor` for the next page. Otherwise it returns an oldest-first JSON array and ignores `cursor`. `limit` defaults to 20, at most 100. |
 | `download_attachment` | Download attachments from a Slack message in a channel (a configured non-off channel in strict mode; any channel ID in open mode) or, with `dm.enabled` `true`, a DM conversation (`D…`). Saves files to `STATE_DIR/inbox/`. Returns local file paths. Only files hosted by Slack are downloaded; external files are refused. |
-| `set_channel_delivery` | Set one shared channel choice in `config.json.last-applied`. Required inputs: `channel` (public/private channel ID), `delivery` (`off`, `mentions`, `all` or `thread_hybrid`), nonempty caller-retained `attempt_id`, and `intent` (`assignment` or `retry`); no extra fields. New assignments require open mode and authenticated current eligible membership. An authorized current session of the same persona incarnation can read retained history in strict mode or dry run. It makes no Slack call. |
+| `set_channel_delivery` | Set one shared channel choice in `config.json.last-applied`. Required inputs: `channel` (public/private channel ID), `delivery` (`off`, `mentions`, `all` or `thread_hybrid`), nonempty caller-retained `attempt_id`, and `intent` (`assignment` or `retry`); no extra fields. New assignments require open mode and authenticated current eligible membership. An authorized current session of the same persona incarnation can read retained history in strict mode or dry run. It makes no Slack call. Its result names the persona's [saved and effective choice](channel-modes.md#delivery-values-in-both-modes); who may ask for one is in [Who can reach a persona in open mode](channel-modes.md#who-can-reach-a-persona-in-open-mode). |
 
-Create and retain `attempt_id` before first submission, keeping it across response loss, reconnect and restart. Each deliberate assignment, including the same value, uses a fresh identifier and `intent: assignment`. A retry preserves identifier, channel and value with `intent: retry`; same-binding duplicates under either intent read the original outcome without assigning again.
+Create and retain `attempt_id` before first submission, keeping it across response loss, reconnect and restart. Each deliberate assignment, including the same value, uses a fresh identifier and `intent: assignment`. A retry keeps the identifier, channel and value with `intent: retry`; a repeat under either intent reads the original outcome without assigning again.
 
-Fresh writes require an active current persona/session and verified public/private membership with explicit non-external-sharing evidence, rechecked at application. Current discovery before traffic can suffice; listed/heard channels, historical membership and dry-run placeholders cannot authorize a new write.
+A fresh write needs an active current persona session and verified public or private membership with explicit non-external-sharing evidence, rechecked at application. Current discovery before traffic can suffice; listed or heard channels, historical membership and dry-run placeholders cannot authorize it. Stale, foreign or replacement sessions cannot read another incarnation's history.
 
-Stale, foreign or replacement sessions cannot retrieve another incarnation's history.
+A new application gets one assignment position and one `persona-channel-delivery-set` log line, without editing `config.json` or consuming pending operator intent. Its result keeps the original saved and effective choice and restrictions apart from current facts, which may reflect a later operator choice or be unavailable; history never overwrites that later choice.
 
-A new durable application gets one assignment position and one `persona-channel-delivery-set` log line, without editing `config.json` or consuming pending operator intent. Its result keeps the original saved/effective choices and restrictions separate from current facts, which may reflect a later operator choice or be unavailable. History never overwrites that later choice.
-
-Pending, proven not-applied and unresolved outcomes differ; an unknown retry cannot write or prove unchanged state. See [tool outcomes and recovery](../skills/debug-slack-channel-bots/SKILL.md#persona-channel-delivery-set).
+Pending, proven not-applied and unresolved outcomes differ, and an unknown retry cannot write or prove the state unchanged. See [tool outcomes and recovery](../skills/debug-slack-channel-bots/SKILL.md#persona-channel-delivery-set).
 
 The following target rules apply to the five Slack tools. Only `reply` takes a user ID; the other four need a channel or DM conversation ID. When `dm.enabled` ([Persona fields](configuration.md#persona-fields)) is `false`, the persona has no DM target in either mode: no tool can post in, read or open a DM.
 
@@ -44,7 +42,7 @@ On a host whose Claude Code permission settings don't allow the server's tools a
 
 POST to `/interject` to store a message for a configured persona from localhost. The message is queued only for the named persona, including while it is down. Each request is an independent queued item, even with identical sender and text; requests are never merged or deduplicated. Only requests from `127.0.0.1` or `::1` are accepted — external callers are rejected with 403. The bot sees it as described in [How a persona receives messages](#how-a-persona-receives-messages); this input never arms a Slack reply reminder.
 
-An injected message carries no Slack conversation; say in its text where to post any Slack reply.
+An injected message carries no Slack conversation; say in its text where to post any Slack reply. For recurring prompts, prefer the built-in [Scheduled Prompts](scheduled-prompts.md#scheduled-prompts-cscb_cron) to a host `cron` job calling this endpoint.
 
 ### Request
 
@@ -62,13 +60,7 @@ curl -X POST http://localhost:<port>/interject \
 
 ### Response
 
-After durable storage, returns HTTP 200. This acknowledges storage, not delivery:
-
-```json
-{ "ok": true, "persona": "planner" }
-```
-
-`persona` is the target persona's name, even when the request named it by key.
+After durable storage it returns HTTP 200 with `{ "ok": true, "persona": "planner" }`. This acknowledges storage, not delivery; `persona` is the target persona's name, even when the request named it by key.
 
 ### Error conditions
 
@@ -80,17 +72,6 @@ After durable storage, returns HTTP 200. This acknowledges storage, not delivery
 | 405 | Must use POST method. |
 | 413 | Request body exceeds 32KB. |
 | 500 | The message could not be stored (`Message not stored`). |
-
-### Example: crontab reminder
-
-For recurring prompts, prefer the built-in scheduler (see [Scheduled Prompts](scheduled-prompts.md#scheduled-prompts-cscb_cron)) — it needs no host cron and delivers straight to a persona. The host-crontab example below is an alternative when you already run `cron`:
-
-```sh
-# crontab -e
-0 9 * * 1 curl -s -X POST http://localhost:3100/interject \
-  -H "Content-Type: application/json" \
-  -d '{"persona": "planner", "message": "Weekly reminder: update the changelog before standup.", "sender": "cron"}'
-```
 
 ---
 
@@ -108,7 +89,7 @@ The prompt names the tool and shows its input: Bash's command, Edit's or Write's
 
 While a persona is not up (broken or retrying), its instance keeps running but its permission prompts are not posted and its already-posted prompts are left as they are. They appear, or get their verdict, on the first poll after the persona comes up.
 
-A validated unchanged destination stays selected after verified leave, even with zero channel entries and DMs disabled. Posted valid prompts remain answerable in their original conversation after off, destination changes or restart under the same identity rules; stale or cross-persona responses remain refused. This grants no ordinary tool or membership authority; unavailable posts use the bounded [destination failure handling](../skills/debug-slack-channel-bots/SKILL.md#persona-destination-failed).
+When a destination stays selected after the persona leaves its channel is in [Permission prompts in both modes](channel-modes.md#permission-prompts-in-both-modes). Posted valid prompts remain answerable in their original conversation after off, destination changes or restart; stale or cross-persona responses are refused. Unavailable posts use the bounded [destination failure handling](../skills/debug-slack-channel-bots/SKILL.md#persona-destination-failed).
 
 ### Slack app prerequisites
 
@@ -132,7 +113,20 @@ If that rewrite fails, `server.log` shows a `template refresh: … failed` line.
 
 ## How a persona receives messages
 
-CSCB stores accepted messages, then types their text into the bot’s terminal in a `<channel source="slack-channel-router" …>` tag. Every Slack message carries its sender’s ID; use the shared prompt file to say whose instructions to follow. The bot answers through `reply`. A message from Slack carries a `via` attribute that says how it reached the persona. An injected message (a scheduled prompt or an `/interject` message) carries no `via`. A received item is durably stored; delivered means its complete text is confirmed in the bot’s transcript. Delivery is at-least-once: an unconfirmed item is offered again, so the bot may see it more than once. Each persona uses strict FIFO across Slack, `/interject` and scheduled prompts, with one item in flight; the next waits until the previous item is confirmed delivered. There is no age cutoff. Delivery and reconnects wait until agent-director reports the bot is `waiting`. If agent-director refuses a key operation, the message stays queued and retries later. Transcript records confirm only the exact message received; they do not decide whether the bot is idle. Messages wait while MCP is disconnected, trigger the configured reconnect, and are delivered once connected again. Which channels a persona serves, and at which delivery, depends on the channel mode (see [Channel modes](channel-modes.md#channel-modes)).
+CSCB stores accepted messages, then types their text into the bot’s terminal in a `<channel source="slack-channel-router" …>` tag. Every Slack message carries its sender’s ID; use the shared prompt file to say whose instructions to follow. The bot answers through `reply`.
+
+A message from Slack carries a `via` attribute that says how it reached the persona; an injected message (a scheduled prompt or an `/interject` message) carries no `via`. Which channels a persona serves, and at which delivery, depends on the channel mode (see [Channel modes](channel-modes.md#channel-modes)).
+
+A received item is durably stored; delivered means its complete text is confirmed in the bot’s transcript, whose records confirm only that exact message, never whether the bot is idle. Delivery is at-least-once: an unconfirmed item is offered again, so the bot may see it more than once.
+
+Each persona takes Slack, `/interject` and scheduled prompts in arrival order, with one item in flight; the next waits until the previous item is confirmed delivered. There is no age cutoff. A thread reply can be held first, and gets its queued reaction only once released:
+
+- **A reply racing the persona's own post** waits while one of its posts is pending, either in that thread or as a new channel message that may have started it. It waits up to 3 seconds for the post's answer, and everything behind it waits too. It is released when a post lands in that thread or the 3 seconds pass, and withdrawn, never delivered, when every post landed elsewhere or failed.
+- **A reply in a thread whose Thread Memory can't be read** waits while later items pass it, and is delivered only if the persona turns out to be in that thread. A racing reply waits this way instead of being withdrawn when its thread can't be read.
+
+Each decision is saved before the affected reply moves on, and a failed save is retried. An unresolved Post Hold blocks every later item, and a restart releases it, including one whose decision wasn't saved yet. A Memory Hold lets later items pass and survives a restart until Thread Memory can be read (see [Thread Memory unreadable](../skills/debug-slack-channel-bots/SKILL.md#thread-memory-unreadable)).
+
+Delivery and reconnects wait until agent-director reports the bot is `waiting`. If agent-director refuses a key operation, the message stays queued and retries later. Messages wait while MCP is disconnected, trigger the configured reconnect, and are delivered once connected again.
 
 Slack feedback has two stages: queued after durable storage (`beehive` by default), then delivered after the whole message is confirmed (`spinthinking` by default). CSCB removes queued before adding delivered; the first successful correlated reply clears the actual stage. Both names are configurable; see [Acknowledgement reactions](server-settings.md#acknowledgement-reactions) for the custom-emoji prerequisite and tracking limits.
 
@@ -151,16 +145,16 @@ A message from Slack carries these tag attributes:
 | `thread_ts` | The thread's timestamp, for a thread reply. |
 | `attachment_count`, `attachments` | The number of attached files and each file's name, type and size, when files are attached. |
 
-For new non-thread channel intake, both modes require current verified eligible membership and a trustworthy non-off choice; open also requires a public/private channel with explicit non-external-sharing evidence. Off suppresses mentions and broadcasts before the open loop guard; unresolved facts withhold affected acknowledgement while independent recipients and accepted work can progress. Reasons below prefer a direct mention, then a broadcast, then, under effective `thread_hybrid`, a followed thread reply, then effective `all`.
+For every channel message and thread reply, both modes require current verified eligible membership and a trustworthy non-off choice; open also requires a public/private channel with explicit non-external-sharing evidence. Off suppresses mentions and broadcasts; unresolved facts withhold affected acknowledgement while independent recipients and accepted work can progress. Reasons below prefer a direct mention, then a broadcast, then, under effective `thread_hybrid`, a reply in a thread the persona is in, then effective `all`.
 
 | Kind | How it reaches the persona | Tag attributes | `via` | Reminder |
 |---|---|---|---|---|
 | Direct message | A DM to the persona's own Slack app, when its `dm.enabled` is `true`, whatever the text mentions. With `dm.enabled` `false` the server drops it and logs one `persona-dm-dropped` line. A group DM is never delivered. | Slack attributes; `chat_id` is the DM conversation ID | `dm` | Yes |
 | Direct @mention | A message that @mentions the persona. In strict mode: in a channel listed in its `channels`, with any current non-off choice and verified eligible membership. In open mode: in a public or private channel its app is in that is not externally shared, with a non-off applied channel choice and current verified membership. | Slack attributes | `mention` | Yes |
 | `@here` / `@channel` broadcast | A message using `@here` or `@channel` without a direct mention of this persona. In strict mode: in a channel listed in the persona's `channels`, with any current non-off choice and verified eligible membership. In open mode: in a public or private channel its app is in that is not externally shared, with a non-off applied channel choice and current verified membership; `@everyone` and user-group mentions are not broadcasts. | Slack attributes | `broadcast` | Yes |
-| Followed thread reply | Neither a direct mention nor a broadcast: a reply, with effective `thread_hybrid` for this persona in the channel and current verified eligible membership, where this persona participates in that thread. In open mode the channel must also be a public or private channel its app is in that is not externally shared. It participates once it accepts a direct @mention in the thread's root or one of its replies under `mentions`, `all` or `thread_hybrid`; broadcasts never count, and each persona's participation is its own. Participation survives restarts and delivery changes: `mentions` or `all` pauses following and `thread_hybrid` resumes it. The open-mode loop guard holds a saved `thread_hybrid` at `mentions`. A thread root is never delivered this way. | Slack attributes | `thread` | Yes |
-| Every message, shared channel | Neither a direct mention nor a broadcast, with effective `all` for this persona and another currently eligible persona in the same channel. Departed, unverified, off or loop-guarded saved-all siblings do not count. | Slack attributes | `receive_all_shared` | Yes |
-| Every message, this persona alone | Neither a direct mention nor a broadcast. In strict mode: in a channel listed in its `channels` with `delivery: all`, when no other persona is currently eligible and effectively all there. In open mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is `all`, when no other persona in the applied configuration has a channel delivery of `all` for that channel after current membership, eligibility and loop-guard checks. | Slack attributes | `receive_all` | Yes |
+| Reply in a thread the bot is in | Neither a direct mention nor a broadcast: a reply in a thread this persona is in, with effective `thread_hybrid` for it in the channel and current verified eligible membership. In open mode the channel must also be a public or private channel its app is in that is not externally shared. How a persona joins, stays in and forgets a thread is in [Threads in `thread_hybrid` channels](channel-modes.md#threads-in-thread_hybrid-channels). A thread's channel message never arrives this way. | Slack attributes | `thread` | Yes |
+| Every message, shared channel | Neither a direct mention nor a broadcast, with effective `all` for this persona and another currently eligible persona in the same channel. Only another persona whose saved choice is `all` counts; departed, unverified or off ones do not, and a persona on `thread_hybrid` never does. | Slack attributes | `receive_all_shared` | Yes |
+| Every message, this persona alone | Neither a direct mention nor a broadcast. In strict mode: in a channel listed in its `channels` with `delivery: all`, when no other persona is currently eligible and effectively all there. In open mode: in a public or private channel its app is in that is not externally shared, where its applied choice is `all`, when no other persona in the applied configuration has a choice of `all` for that channel after current membership and eligibility checks. | Slack attributes | `receive_all` | Yes |
 | Scheduled prompt | A crontable line naming the persona fires, and the scheduler queues it for that persona only (see [Scheduled Prompts](scheduled-prompts.md#scheduled-prompts-cscb_cron)). | Only `user` = `cscb-cron:<prompt file name without its extension>` (`cscb-cron:standup` for `standup.md`) and `ts` = the fire time in seconds, with six decimals. No `chat_id`, `message_id` or `via`. | none | Never |
 | `/interject` message | A localhost POST to `/interject` addressed by `persona` (see [Interject](#interject)); it reaches only that persona. | Only `user` = the request's `sender` (default `interject`) and `ts`, as for a scheduled prompt. No `chat_id`, `message_id` or `via`. | none | Never |
 
@@ -169,7 +163,7 @@ A "Yes" in the Reminder column means [Slack reply reminders](#slack-reply-remind
 - **The first applicable `via` wins,** in the order `dm`, `mention`, `broadcast`, `thread`, `receive_all_shared`, `receive_all`. A message that @mentions the persona in a channel it receives in full arrives as `mention`.
 - **Every @mention stays in the text,** including quoted, repeated and mention-only messages. Original whitespace is kept when the message is stored. Terminal tag formatting converts CRLF/CR line endings to LF and tabs to four spaces, removes other control characters, replaces invalid Unicode surrogates and escapes tag look-alikes and characters the terminal would rewrite.
 - **Every author counts.** Posts by people, bots, integrations and other personas all arrive by these rules. Each persona posts as its own Slack app, so another persona's post reaches it like anyone else's.
-- **Anyone in the workspace can reach a persona,** in both modes: in strict mode in its listed channels, by each channel's `delivery`; in open mode in every channel its app is invited to that it serves, by its channel delivery there; and in both modes by DM when its `dm.enabled` is `true`. There is no approval step. In open mode assignments change who that is (see [Who can reach a persona in open mode](channel-modes.md#who-can-reach-a-persona-in-fungible-mode)).
+- **Anyone in the workspace can reach a persona,** in both modes: in strict mode in its listed channels, by each channel's `delivery`; in open mode in every channel its app is invited to that it serves, by its choice there; and in both modes by DM when its `dm.enabled` is `true`. There is no approval step. In open mode assignments change who that is (see [Who can reach a persona in open mode](channel-modes.md#who-can-reach-a-persona-in-open-mode)).
 - **A persona never receives its own posts.**
 - **Slack redeliveries add no second queue item, including across server restarts.** Each accepted Slack message keeps its key for at least 24 hours after intake; the paired channel @mention adds no second item.
 - **In open mode, an @mention is delivered from its `message` event.** Of the two events Slack sends for a channel @mention, the `app_mention` event decides nothing and the `message` event carrying the same mention decides, so each @mention is delivered once, whichever event arrives first. An edit that adds a mention to an earlier message sends no new `message` event, so in open mode it is not delivered.

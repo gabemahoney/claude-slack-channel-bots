@@ -333,7 +333,8 @@ import {
   UNUSABLE_NAME_NOTICE_HEAD
 } from '../src/conflict-latch.ts'
 import { CRONTABLE_TEMPLATE_HEADER } from '../src/cron-bootstrap.ts'
-import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
+import { DELIVERY_STUCK_AFTER_MS, THREAD_REPLY_HOLD_MS } from '../src/delivery-constants.ts'
+import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
 import type { Via } from '../src/delivery-decision.ts'
 import {
   buildMessageNotSavedNotice,
@@ -377,7 +378,9 @@ import { THREAD_MEMORY_LOOKUP_METHODS, type ThreadMemoryLookupMethod } from '../
 import { STUCK_LAUNCH_HELD_HEAD, STUCK_LAUNCH_RELAUNCHING_HEAD } from '../src/pending-row.ts'
 import { renderLogMessageText } from '../src/persona-connection-errors.ts'
 import {
+  channelDeliverySetCause,
   FUNGIBLE_REFUSAL_TEXTS,
+  NO_STORED_CHOICE,
   PERSONA_CHANNEL_DELIVERY_SET,
   PERSONA_INVITED_CHANNEL,
   UNCLAIMED_CHANNEL,
@@ -783,8 +786,8 @@ function codeSpans(cell: string): string[] {
 /** The persona configuration reference heading (in `CONFIGURATION_DOC`) and its complete-example heading, DOC-1's interface. */
 const PERSONAS_HEADING = '## Personas (config.json)'
 const EXAMPLE_HEADING = '### Example'
-/** The heading of the second complete example, in fungible mode, a section of `CHANNEL_MODES_DOC`. */
-const FUNGIBLE_EXAMPLE_HEADING = '## Example in open mode'
+/** The heading of the second complete example, in open mode, a section of `CHANNEL_MODES_DOC`. */
+const OPEN_MODE_EXAMPLE_HEADING = '## Example in open mode'
 
 /**
  * The persona-entry key holding the fungible section: read
@@ -806,13 +809,13 @@ function personasSection(text: string): string {
 /**
  * A complete example's text: the one fenced block, tagged `json`, directly
  * under `heading`: `### Example` inside `## Personas (config.json)` of
- * `configuration` (`CONFIGURATION_DOC`), or `## Example in fungible mode` in
+ * `configuration` (`CONFIGURATION_DOC`), or `## Example in open mode` in
  * `CHANNEL_MODES_DOC`. Throws naming what is missing, and on any other count
  * or tag, so the load case never passes vacuously or on some other JSON block.
  */
 function completeExample(configuration: string, heading: string = EXAMPLE_HEADING): string {
   const example =
-    heading === FUNGIBLE_EXAMPLE_HEADING
+    heading === OPEN_MODE_EXAMPLE_HEADING
       ? requiredSection(readRepoFile(CHANNEL_MODES_DOC), heading, CHANNEL_MODES_DOC)
       : requiredSection(personasSection(configuration), heading, IN_PERSONAS)
   const { blocks } = splitFences(example)
@@ -1158,7 +1161,7 @@ describe('README.md', () => {
         return { raw, home, config }
       }
 
-      const EXAMPLE_HEADINGS = [EXAMPLE_HEADING, FUNGIBLE_EXAMPLE_HEADING]
+      const EXAMPLE_HEADINGS = [EXAMPLE_HEADING, OPEN_MODE_EXAMPLE_HEADING]
 
       test.each(EXAMPLE_HEADINGS)('the example under "%s" loads with no error, one resolved persona per entry, in order', (heading) => {
         const { raw, config } = loadExample(heading)
@@ -1249,7 +1252,7 @@ describe('README.md', () => {
       ]
 
       test.each(FUNGIBLE_COMPLETENESS)('the fungible-mode example is complete: %s', (_label, check) => {
-        check(loadExample(FUNGIBLE_EXAMPLE_HEADING))
+        check(loadExample(OPEN_MODE_EXAMPLE_HEADING))
       })
     })
   })
@@ -1659,6 +1662,20 @@ const FORBIDDEN_TERMS: readonly TermGroup[] = [
     name: 'the retired persona-name rule',
     terms: [['a name that "looks like a Slack token"', /\bnames?\b[^.]{0,40}\blooks?\s+like\s+an?\s+(?:Slack\s+)?token\b/gi]],
   },
+  {
+    // A persona's `delivery` applies as written in another persona's
+    // destination channel: nothing holds it there. The clean-exit loop guard
+    // (session_restart_delay) is another mechanism and stays unflagged.
+    name: 'the destination loop guard',
+    terms: [
+      ['an open-mode or destination loop guard', /\b(?:open(?:-|\s+)mode|open|fungible|destination)\s+loop(?:-|\s+)guards?\b/gi],
+      ['loop-guarded', /\bloop(?:-|\s+)guarded\b/gi],
+      ['loop-guard checks', /\bloop(?:-|\s+)guard\s+checks?\b/gi],
+      ['after the loop guard', /\bafter\s+the\s+loop(?:-|\s+)guard\b/gi],
+      ['the loop guard holding a value', /\bloop(?:-|\s+)guard\s+holds?\b/gi],
+      ['a value held at `mentions`', /\bheld\s+at\s+`mentions`/gi],
+    ],
+  },
 ]
 
 /** One exemption: `terms` may appear in `file` only inside the section under `heading` (bounded at the next heading of its level or higher). */
@@ -1919,6 +1936,8 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
     [DELIVERY_WORDING_EXCEPTION.file, '#a-personas-routing-settings-were-changed-by-a-confirmed-change', "That heading's anchor"],
     [DELIVERY_WORDING_EXCEPTION.file, '`[slack] persona-routing: ', "The server's real log prefix"],
     [DELIVERY_WORDING_EXCEPTION.file, 'routinely', 'whole words: "routine" is not "routes"'],
+    [DELIVERY_WORDING_EXCEPTION.file, /^\| `\[slack\] No clean-exit check for persona=.*\(the clean-exit loop guard: .*$/m, "the clean-exit loop guard's log line row: not the destination loop guard"],
+    [DELIVERY_WORDING_EXCEPTION.file, /^A clean exit \(`\/exit`.*shows the check and its loop guard.*$/m, "the clean-exit paragraph: its loop guard is the clean-exit check's"],
     [RUNBOOK_DOC, 'remove any token environment variables you exported for the previous version', "Upgrade wording: variables are banned by name and export form"],
     [SERVER_SETTINGS_DOC, 'slack-channel-router', 'the MCP server name; no route term matches it'],
     [CREDENTIALS_SCRIPT, 'header = "Authorization: Bearer %s"', "the credentials script's curl config line, read from curl's stdin, not a command-line argument"],
@@ -1972,6 +1991,12 @@ describe('forbidden-term scanner self-checks', () => {
     'allowlist wording': 'Add the user to the allow-list.',
     'pairing wording': 'Pairing codes expire after an hour.',
     'a name that "looks like a Slack token"': 'A name that looks like a Slack\ntoken is rejected.',
+    'an open-mode or destination loop guard': 'The open-mode loop guard keeps a persona out of the other\'s destination.',
+    'loop-guarded': 'Departed or loop-guarded saved-all siblings do not count.',
+    'loop-guard checks': 'after current membership, eligibility and loop-guard checks',
+    'after the loop guard': 'at channel delivery mentions after the loop guard',
+    'the loop guard holding a value': 'The loop guard holds a saved `thread_hybrid` there.',
+    'a value held at `mentions`': 'In another persona\'s destination, a channel is held at `mentions`.',
   }
 
   /**
@@ -1989,6 +2014,9 @@ describe('forbidden-term scanner self-checks', () => {
     ['a bearer token in a curl header flag', '--header "…"', 'curl --header "Authorization: Bearer <bot token>" https://slack.com/api/auth.test'],
     ['a bearer token in a curl header flag', 'unquoted -H', 'curl -H Authorization:Bearer\\ <bot token> https://slack.com/api/auth.test'],
     ['a bearer token in a curl header flag', '--header=…', "curl --header='Authorization: Bearer <bot token>' https://slack.com/api/auth.test"],
+    ['an open-mode or destination loop guard', '"the open loop guard"', 'Off suppresses mentions before the open loop guard.'],
+    ['an open-mode or destination loop guard', '"the destination loop guard"', 'The destination loop guard applies to every other persona.'],
+    ['the loop guard holding a value', 'a wrapped "holds"', 'The loop\nguard holds the channel at mentions.'],
     ['a name that "looks like a Slack token"', 'plural names', 'Persona names that look like a token are rejected.'],
   ] as const)('%s is flagged in %s', (label, _form, text) => {
     expect(findTerms('sample', text, ALL_FORBIDDEN_TERMS).map((hit) => hit.term)).toContain(label)
@@ -2027,6 +2055,10 @@ describe('forbidden-term scanner self-checks', () => {
     ['MCP wait without loss', 'Messages sent while MCP is down are kept; they are not lost.'],
     ['unreadable-record non-delivery', buildQueueRecordUnreadableNotice('Alpha', 2, '/state/queue/quarantined.jsonl')],
     ['conversation history loss', 'The transcript is missing; conversation history was lost.'],
+    ['the clean-exit loop guard', 'the full 120s restart delay stands (the clean-exit loop guard: at most one clean-exit relaunch per session_restart_delay)'],
+    ['the clean-exit check and its loop guard', 'A clean exit is relaunched about 3 s later; server.log shows the check and its loop guard.'],
+    ['a persona held at a startup prompt', 'The persona is held at a startup prompt until the operator answers it.'],
+    ['a choice that applies as written', "Each persona's `delivery` applies as written in a channel where another persona posts its permission prompts and notices."],
   ])('%s is not flagged', (_label, text) => {
     expect(findTerms('sample', text, ALL_FORBIDDEN_TERMS).map(formatHit)).toEqual([])
   })
@@ -2200,7 +2232,7 @@ const VIA_ROWS: Record<Via, string> = {
   dm: 'Direct message',
   mention: 'Direct @mention',
   broadcast: '`@here` / `@channel` broadcast',
-  thread: 'Followed thread reply',
+  thread: 'Reply in a thread the bot is in',
   receive_all_shared: 'Every message, shared channel',
   receive_all: 'Every message, this persona alone',
 }
@@ -2340,6 +2372,23 @@ describe('exported thread reason wording', () => {
     const row = kindRowOf('thread')(referenceText())
     expect(tableCells(row).slice(2)).toEqual(['Slack attributes', '`thread`', 'Yes'])
     expect(threadAudienceProblems(row)).toEqual([])
+  })
+
+  /** Wording of following a thread by participation, paused and resumed by a delivery change. */
+  const PARTICIPATION_WORDING = /\b(?:participat|paus|resum)\w*/gi
+
+  test('the receiving row names no participation, pause or resume', () => {
+    expect(kindRowOf('thread')(referenceText()).match(PARTICIPATION_WORDING)).toBeNull()
+  })
+
+  test.each([
+    'It participates once it accepts a direct @mention.',
+    '`mentions` or `all` pauses following.',
+    '`thread_hybrid` resumes it.',
+  ])('self-check: the receiving row with "%s" added fails the participation check', (sentence) => {
+    const text = referenceText()
+    const edited = withLineEdited(text, (line) => line.startsWith(`| ${VIA_ROWS.thread} |`), (line) => line.replace(' A thread\'s channel message', ` ${sentence} A thread's channel message`))
+    expect(kindRowOf('thread')(edited).match(PARTICIPATION_WORDING)).not.toBeNull()
   })
 })
 
@@ -7662,13 +7711,18 @@ describe(`${TESTS_README_FILE} names every integration script and keeps the star
 const CHANNEL_MODES_HEADING = '# Channel modes'
 const SERVER_SETTINGS_HEADING = '# Server settings'
 const WHAT_EACH_MODE_SERVES_HEADING = '## What each mode serves'
-/** The security subsection, read before turning fungible mode on, so right after what each mode serves. */
-const WHO_CAN_REACH_HEADING = '## Who can reach a persona in fungible mode'
-const TURNING_FUNGIBLE_HEADING = '## Turning open mode on or off'
-const FUNGIBLE_DELIVERY_HEADING = '## Channel delivery in open mode'
-const FUNGIBLE_PROMPTS_HEADING = '## Permission prompts in both modes'
-/** The page's sections, in order: the four of the contract, the security section and the fungible-mode example. */
-const CHANNEL_MODES_SUBSECTIONS = [WHAT_EACH_MODE_SERVES_HEADING, WHO_CAN_REACH_HEADING, TURNING_FUNGIBLE_HEADING, FUNGIBLE_DELIVERY_HEADING, FUNGIBLE_PROMPTS_HEADING, FUNGIBLE_EXAMPLE_HEADING] as const
+/** The security subsection, read before turning open mode on, so right after what each mode serves. */
+const WHO_CAN_REACH_HEADING = '## Who can reach a persona in open mode'
+const TURNING_OPEN_MODE_HEADING = '## Turning open mode on or off'
+const DELIVERY_VALUES_HEADING = '## Delivery values in both modes'
+const THREADS_HEADING = '## Threads in `thread_hybrid` channels'
+const PROMPTS_IN_BOTH_MODES_HEADING = '## Permission prompts in both modes'
+/** The page's sections, in order: what each mode serves, the security section, the switch, the delivery values, threads, prompts and the open-mode example. */
+const CHANNEL_MODES_SUBSECTIONS = [WHAT_EACH_MODE_SERVES_HEADING, WHO_CAN_REACH_HEADING, TURNING_OPEN_MODE_HEADING, DELIVERY_VALUES_HEADING, THREADS_HEADING, PROMPTS_IN_BOTH_MODES_HEADING, OPEN_MODE_EXAMPLE_HEADING] as const
+/** The threads section's own sections, in order. */
+const THREADS_SUBSECTIONS = ['### Joining a thread', '### Staying in a thread', '### Starting over'] as const
+/** The link from a page under `docs/` to the debugging skill's configuration-rejections section, as the channel-modes page writes it. */
+const CONFIGURATION_REJECTIONS_LINK = `[Configuration rejections](${relative('docs', DEBUG_SKILL_FILE)}#configuration-rejections)`
 
 /** The downgrade section, under `## Migration` right after "Upgrading to personas". */
 const DOWNGRADE_HEADING = '### Downgrading to an earlier release'
@@ -7780,6 +7834,17 @@ function switchLineQuote(mode: ChannelMode): string {
   return `${line.slice(0, at).replace(` turns ${mode} mode on`, ' turns <mode> mode on')}, for …`
 }
 
+/**
+ * The `persona-channel-delivery-set` cause as the channel-modes page quotes
+ * it: `channelDeliverySetCause` with the channel as `<channel>`, the earlier
+ * choice as every value it can name and the new one as `<value>`.
+ */
+function deliverySetCauseQuote(): string {
+  type Value = (typeof DELIVERY_MODES)[number]
+  const before = `<${[NO_STORED_CHOICE, ...DELIVERY_MODES].join('|')}>` as Value
+  return channelDeliverySetCause('<channel>', before, '<value>' as Value, '<value>' as Value)
+}
+
 /** The ending of the switch's line when no persona is in both configurations (`modeSwitchLine` with none), from its last `;`. */
 function switchLineNoPersonaEnding(): string {
   const line = modeSwitchLine('open', [])
@@ -7805,40 +7870,58 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci('A newly verified member without a choice starts at `off` in strict or `mentions` in open, using the mode when the join is applied'),
     ci('Duplicate joins and mode switches preserve choices, including `off`'),
   ]],
-['Channel modes: changing mode preserves applied channel choices', readmeSection(TURNING_FUNGIBLE_HEADING), [
+['Channel modes: changing mode preserves applied channel choices', readmeSection(TURNING_OPEN_MODE_HEADING), [
     ci('Mode changes preserve every applied `delivery` choice and the shared destination'),
     ci('Strict mode uses the same shared channel choices and destination'),
     ci('The mode switch preserves them, including choices made while open mode was active'),
   ]],
-[`Channel modes: before turning it on, the operator reviews each app's channels and past ${UNCLAIMED_CHANNEL} lines`, readmeSection(TURNING_FUNGIBLE_HEADING), [
+[`Channel modes: before turning it on, the operator reviews each app's channels and past ${UNCLAIMED_CHANNEL} lines`, readmeSection(TURNING_OPEN_MODE_HEADING), [
     ci("Before you turn it on, review each persona's app's channel memberships in Slack, private channels included"),
     ci(`Past ${code(UNCLAIMED_CHANNEL)} lines in ${code('server.log')} show channels`),
     `grep ${UNCLAIMED_CHANNEL} ~/.config/claude-slack-channel-bots/server.log*`,
   ]],
-["Channel modes: old keys require a manual edit", readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [ci("manual"), ci("`allow_invited_channels`"), ci("`invited`"), ci("rejected")]],
-["Channel modes: switching through pending confirmation", readmeSection(TURNING_FUNGIBLE_HEADING), [ci("confirmed"), ci("preview"), ci("no restart"), ci("`strict`"), ci("`open`")]],
-['Channel modes: four persistent listening choices with missing choices unresolved', readmeSection(FUNGIBLE_DELIVERY_HEADING), [
+["Channel modes: a configuration from an earlier release requires a manual edit", readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [
+    ci('A configuration from an earlier release is rejected at load until it is prepared by hand; a manual edit is required'),
+    CONFIGURATION_REJECTIONS_LINK,
+  ]],
+["Channel modes: switching through pending confirmation", readmeSection(TURNING_OPEN_MODE_HEADING), [ci("confirmed"), ci("preview"), ci("no restart"), ci("`strict`"), ci("`open`")]],
+['Channel modes: four persistent listening choices with missing choices unresolved', readmeSection(DELIVERY_VALUES_HEADING), [
     ci('In both modes, the shared choices are `off`, `mentions`, `all` and `thread_hybrid`'),
     ci('A missing or unreadable assignment holds affected intake; it is not a saved `off` choice'),
     ci("A newly verified member gets the mode's join default described above, preserving any existing choice"),
     ci('Applied choices live in `config.json.last-applied` across server restarts and persona relaunches'),
     ci('A mode switch preserves them'),
     ci('A removed, renamed or replaced persona never inherits its previous incarnation’s choices'),
+    ci(`**Saved and effective choice.** A persona's saved choice is the ${code(DELIVERY_KEY)} value of its entry in the shared list`),
+    ci("Its effective choice is what applies to the next message: the saved value while its app is a verified, eligible member and the shared state is readable"),
+    ci('the saved value stays as it is'),
   ]],
 // decideDelivery checks current channelAvailability and the all choice for each sibling.
-[`Channel modes: ${RECEIVE_ALL_SHARED} requires current eligible effective-all siblings`, readmeSection(FUNGIBLE_DELIVERY_HEADING), [
+[`Channel modes: ${RECEIVE_ALL_SHARED} requires current eligible effective-all siblings`, readmeSection(DELIVERY_VALUES_HEADING), [
     ci(`**${code(RECEIVE_ALL_SHARED)} requires effective eligibility.**`),
     ci('In either mode, a non-mention/non-broadcast message uses this reason only when this persona and another currently eligible member have effective `all` in the channel'),
-    ci('A saved-all choice alone does not count: departed, unverified or'),
-    ci('personas cannot supply it'),
+    ci('A saved-all choice alone does not count: departed or unverified personas cannot supply it'),
+    ci('a persona on `thread_hybrid` never counts'),
     ci('otherwise the reason is `receive_all`'),
   ]],
-[`Channel modes: the warning against two personas at ${ALL} in one channel`, readmeSection(FUNGIBLE_DELIVERY_HEADING), [
+[`Channel modes: a persona's ${code(DELIVERY_KEY)} applies as written in another persona's destination`, readmeSection(DELIVERY_VALUES_HEADING), [
+    ci(`**Notice Destinations.** Each persona's ${code(DELIVERY_KEY)} applies as written in a channel where another persona posts its permission prompts and notices`),
+  ]],
+['Channel modes: the on-purpose example, a second persona hearing the first persona\'s destination to review its prompts', readmeSection(DELIVERY_VALUES_HEADING), [
+    ci(`Use this on purpose: with ${code('planner')}'s ${code(PROMPTS_KEY)} set to a channel where ${code('reviewer')}'s entry is ${code(ALL)}, ${code('reviewer')} sees each of ${code('planner')}'s prompts and notices there and can review them`),
+  ]],
+['Channel modes: the loop warning for two personas hearing each other in a destination, thread_hybrid channels included', readmeSection(DELIVERY_VALUES_HEADING), [
+    ci('**Two personas hearing each other there can answer each other in a loop.**'),
+    ci("This includes `thread_hybrid` channels, because a persona's own prompts and notices put it in their threads"),
+    ci(`To avoid it, keep one of them at ${code(MENTIONS)}, or give the other persona a different destination`),
+  ]],
+[`Channel modes: the warning against two personas at ${ALL} in one channel or in one thread`, readmeSection(DELIVERY_VALUES_HEADING), [
     ci(`**Don't keep two personas at ${code(ALL)} in one channel.**`),
     ci('the two can keep answering each other with no human involved'),
+    ci('Two personas in one thread they are both in can keep answering each other the same way'),
     ci(`If one should listen to everything, keep the other at ${code(MENTIONS)}`),
   ]],
-["Channel modes: required shared destination", readmeSection(FUNGIBLE_PROMPTS_HEADING), [ci("`permission_prompts`"), ci("required"), ci("both modes"), ci("`dm`"), ci("listed")]],
+["Channel modes: required shared destination", readmeSection(PROMPTS_IN_BOTH_MODES_HEADING), [ci("`permission_prompts`"), ci("required"), ci("both modes"), ci("`dm`"), ci("listed")]],
   // the configuration sections cases do not read ( S3).
   [`Server-wide settings: the opening paragraph names ${MODE_SWITCH_SETTING} and the reminder default as applying immediately`, unitOf(USER_DOCS_NAME, '## Server-wide settings', 'These top-level fields apply'), [
     ci('Confirmed changes take effect at the next server start, with exceptions'),
@@ -7848,7 +7931,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
 ["Persona fields: shared channel choices", tableRowOf('### Persona fields', `${code(CHANNELS_KEY)} |`), [ci("both modes")]],
 ["Persona fields: required shared destination", tableRowOf('### Persona fields', `${code(PROMPTS_KEY)} |`), [ci("both modes"), ci("required")]],
 ["Channel entries: shared in both modes", readmeSection('### Channel entries'), [ci("both modes")]],
-["Channel delivery: four shared values", readmeSection('### Channel delivery'), [ci("both modes"), ci("`off`"), ci("`mentions`"), ci("`all`"), ci("`thread_hybrid`")]],
+["Delivery values: four shared values", readmeSection('### Delivery values'), [ci("both modes"), ci("`off`"), ci("`mentions`"), ci("`all`"), ci("`thread_hybrid`")]],
 ["Permission prompts: required in both modes", readmeSection('### Permission prompts'), [ci("both modes"), ci("required")]],
 ["Load-time rules: channel_mode accepts only strict and open", sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [ci("`channel_mode`"), ci("`strict`"), ci("`open`"), ci("rejected")]],
 ["Load-time rules: explicit DM destination requires enabled and contact", sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [ci("`permission_prompts`"), ci("`dm`"), ci("`dm.enabled`"), ci("`dm.contact`")]],
@@ -7862,7 +7945,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci(`In strict mode: in a channel listed in ${via === 'mention' ? 'its' : "the persona's"} ${code(CHANNELS_KEY)}`),
     ci('In open mode: in a public or private channel its app is in that is not externally shared, with a non-off applied channel choice'),
   ]]),
-['receiving: current verified eligibility in both modes', unitOf(USER_DOCS_NAME, RECEIVING_HEADING, 'For new non-thread channel intake,'), [
+['receiving: current verified eligibility in both modes', unitOf(USER_DOCS_NAME, RECEIVING_HEADING, 'For every channel message and thread reply,'), [
     ci('both modes require current verified eligible membership and a trustworthy non-off choice'),
     ci('open also requires a public/private channel with explicit non-external-sharing evidence'),
     ci('Off suppresses mentions and broadcasts'),
@@ -7870,19 +7953,20 @@ const README_DEO_ROWS: readonly DocRow[] = [
   ]],
 [`receiving: the ${RECEIVE_ALL_SHARED} row requires current eligible effective-all siblings`, kindRowOf(RECEIVE_ALL_SHARED), [
     ci('Neither a direct mention nor a broadcast, with effective `all` for this persona and another currently eligible persona in the same channel'),
-    ci('Departed, unverified, off or'),
-    ci('saved-all siblings do not count'),
+    ci(`Only another persona whose saved choice is ${code(ALL)} counts; departed, unverified or off ones do not`),
+    ci('and a persona on `thread_hybrid` never does'),
   ]],
 ['receiving: the receive_all row, scoped per mode', kindRowOf('receive_all'), [
     ci(`In strict mode: in a channel listed in its ${code(CHANNELS_KEY)} with ${code(`${DELIVERY_KEY}: ${ALL}`)}, when no other persona is currently eligible and effectively all there`),
-    ci(`In open mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is ${code(ALL)}, when no other persona in the applied configuration has a channel delivery of ${code(ALL)} for that channel after current membership, eligibility`),
+    ci(`In open mode: in a public or private channel its app is in that is not externally shared, where its applied choice is ${code(ALL)}, when no other persona in the applied configuration has a choice of ${code(ALL)} for that channel after current membership and eligibility checks`),
   ]],
-['receiving: followed replies use this persona\'s participation under effective thread_hybrid', text => tableCells(kindRowOf('thread')(text))[1] ?? '', [
-    /Neither a direct mention nor a broadcast/i,
+['receiving: a reply in a thread this persona is in, under effective thread_hybrid', text => tableCells(kindRowOf('thread')(text))[1] ?? '', [
+    /Neither a direct mention nor a broadcast: a reply in a thread this persona is in/i,
     /effective `thread_hybrid`/i,
-    /reply/i,
-    /this persona (?:participates in|follows) (?:that|the) thread/i,
     /current verified eligible membership/i,
+    /In open mode the channel must also be a public or private channel its app is in that is not externally shared/i,
+    /A thread's channel message never arrives this way/i,
+    `[Threads in \`thread_hybrid\` channels](${relative('docs', CHANNEL_MODES_DOC)}${anchorLink(THREADS_HEADING).slice(1, -1)})`,
   ]],
 ['receiving: in open mode an @mention is delivered from its message event', unitOf(USER_DOCS_NAME, RECEIVING_HEADING, '- **In open mode, an @mention is delivered from its'), [
     ci(`**In open mode, an @mention is delivered from its ${code('message')} event.**`),
@@ -7891,7 +7975,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
 ['receiving: "Anyone in the workspace can reach a persona", in both modes', unitOf(USER_DOCS_NAME, RECEIVING_HEADING, '- **Anyone in the workspace can reach a persona,**'), [
     ci('**Anyone in the workspace can reach a persona,** in both modes'),
     ci(`in strict mode in its listed channels, by each channel's ${code(DELIVERY_KEY)}`),
-    ci('in open mode in every channel its app is invited to that it serves, by its channel delivery there'),
+    ci('in open mode in every channel its app is invited to that it serves, by its choice there'),
     ci(`in both modes by DM when its ${code(DM_ENABLED)} is ${code('true')}`),
   ]],
 ["security: an invite changes a persona's audience", readmeSection(WHO_CAN_REACH_HEADING), [
@@ -7902,9 +7986,11 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci("A channel invitation and an applied listening choice can expose a persona's worker to new people"),
     ci('This includes private channels, which the operator may not be able to see'),
   ]],
-[`security: anyone who can reach the persona can switch any channel it serves to ${ALL}, one they are not in included`, readmeSection(WHO_CAN_REACH_HEADING), [
-    ci(`**Anyone who can reach the persona can switch a channel to ${code(ALL)}.** In any channel it serves, or by DM, anyone can ask the persona to switch any channel it serves to ${code(ALL)}, including a channel they are not in`),
-    ci('From then on, every message in that channel reaches the worker'),
+['security: anyone who can reach the persona can set any eligible channel it is in to any value, one they are not in included, and open-mode choices persist into strict mode', readmeSection(WHO_CAN_REACH_HEADING), [
+    ci('**Anyone who can reach the persona can change what it hears in a channel.** In any channel it serves, or by DM, anyone can ask the persona to set any eligible channel it is a member of to any value, including a channel they are not in'),
+    ci(`At ${code(ALL)}, every message in that channel then reaches the worker`),
+    ci('**Open-mode choices persist into strict mode.** A choice a persona sets in open mode stays in force when strict mode is turned on'),
+    ci('so a non-off choice can start delivery in a channel that was `off`'),
   ]],
 ['security: fetch_messages reads every channel the app is in, so content can be carried between channels', readmeSection(WHO_CAN_REACH_HEADING), [
     ci(`**${code('fetch_messages' satisfies (typeof TARGETING_TOOLS)[number])} reads every channel the app is in.**`),
@@ -7919,7 +8005,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
   ]],
 [`security: the audit lines ${PERSONA_INVITED_CHANNEL} and ${PERSONA_CHANNEL_DELIVERY_SET}`, readmeSection(WHO_CAN_REACH_HEADING), [
     ci(`The audit lines in ${code('server.log')} are ${code(PERSONA_INVITED_CHANNEL)}, logged the first time a persona hears a channel in open mode`),
-    ci(`and ${code(PERSONA_CHANNEL_DELIVERY_SET)}, logged for each stored ${TOOL} choice`),
+    () => ci(`and ${code(PERSONA_CHANNEL_DELIVERY_SET)}, logged for each choice a ${TOOL} call newly applies, as ${code(deliverySetCauseQuote())}`),
   ]],
 ["security: log rotation can discard a channel's only audit line, and a restart logs every heard channel again", readmeSection(WHO_CAN_REACH_HEADING), [
     ci("log rotation can discard a channel's only audit line"),
@@ -7931,9 +8017,9 @@ const README_DEO_ROWS: readonly DocRow[] = [
 ["introduction: what a persona's tool calls may target, per mode", unitOf(USER_DOCS_NAME, README_TITLE_HEADING, 'A single HTTP MCP server'), [
     ci("Each persona's tool calls act as that persona: in strict mode only in its configured non-off channels, in open mode in any channel ID it names, where the call goes to Slack, which decides"),
   ]],
-['Personas (config.json): the channels a persona serves and its tools may target, per mode', unitOf(USER_DOCS_NAME, PERSONAS_HEADING, 'Each bot is a **persona**'), [
+['Personas (config.json): the channels a persona serves, in both modes, with Tools for what its tools may target', unitOf(USER_DOCS_NAME, PERSONAS_HEADING, 'Each bot is a **persona**'), [
     ci('In both modes, listening follows the shared applied channel choices'),
-    ci('in open mode, its tools may target any channel ID: the call goes to Slack, which decides'),
+    ci('and Tools for what its tools may target'),
   ]],
 ['Tools: in strict mode a refused target sends nothing to Slack', unitOf(USER_DOCS_NAME, TOOLS_HEADING, '- **In strict mode,**'), [
     ci("a tool call with any other target, a channel the persona isn't configured into included, is refused with a tool error naming the persona and the target, and nothing is sent to Slack"),
@@ -7947,6 +8033,17 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci(tool === 'reply' ? "in strict mode one of the persona's configured non-off channels; in open mode any channel ID" : 'a configured non-off channel in strict mode; any channel ID in open mode'),
   ]]),
 ["Tools: set_channel_delivery updates one shared authority", toolRowOf(SET_CHANNEL_DELIVERY_TOOL), [ci("`off`"), ci("`mentions`"), ci("`all`"), ci("`thread_hybrid`"), ci("open mode"), ci("strict mode"), ci("config.json.last-applied"), ci("no Slack call"), ci("`attempt_id`"), ci("`intent`"), ci("retry"), ci("history"), ci("membership")]],
+["Tools: set_channel_delivery links a persona's saved and effective choice and who may ask for one", toolRowOf(SET_CHANNEL_DELIVERY_TOOL), [
+    `[saved and effective choice](${relative('docs', CHANNEL_MODES_DOC)}${anchorLink(DELIVERY_VALUES_HEADING).slice(1, -1)})`,
+    `[${WHO_CAN_REACH_HEADING.replace(/^## /, '')}](${relative('docs', CHANNEL_MODES_DOC)}${anchorLink(WHO_CAN_REACH_HEADING).slice(1, -1)})`,
+  ]],
+["Tools: fetch_messages reads a whole thread in a thread_hybrid channel a page at a time, with cursor and next_cursor, and otherwise returns an oldest-first array, ignoring cursor", toolRowOf('fetch_messages' satisfies (typeof TARGETING_TOOLS)[number]), [
+    ci("With `thread_ts` in a channel where the persona's saved choice is `thread_hybrid`, it returns `{ messages, next_cursor }`"),
+    ci('one page of the thread, the first starting with its channel message, and `next_cursor` while more remain'),
+    ci('pass it back as `cursor` for the next page'),
+    ci('Otherwise it returns an oldest-first JSON array and ignores `cursor`'),
+    ci('`limit` defaults to 20, at most 100'),
+  ]],
 ['Tools: the known residual in an externally shared channel the app is in ', readmeSection(TOOLS_HEADING), [
     ci("CSCB makes no Slack call to learn whether a channel holds the persona's app, is externally shared or is a group DM"),
     ci('So in open mode it refuses no post, read, reaction or edit in an externally shared channel that the app belongs to'),
@@ -8084,7 +8181,8 @@ function placementProblems(readme: string, p: Placement): string[] {
  * place them: `# Channel modes`, its own page (`CHANNEL_MODES_DOC`), between
  * the server settings and Reload in the docs' order, with its sections in
  * order inside it (the security section right after "What each mode serves",
- * the fungible-mode example last), and the downgrade section a `###` of its
+ * the three thread sections in order under the threads section, the
+ * open-mode example last), and the downgrade section a `###` of its
  * own (the "Upgrading to personas" cases read that section alone) right after
  * "Upgrading to personas".
  */
@@ -8095,14 +8193,20 @@ const README_DEO_PLACEMENTS: readonly Placement[] = [
     parent: CHANNEL_MODES_HEADING,
     previous: i === 0 ? CHANNEL_MODES_HEADING : CHANNEL_MODES_SUBSECTIONS[i - 1],
   })),
+  ...THREADS_SUBSECTIONS.map((heading, i): Placement => ({
+    heading,
+    parent: THREADS_HEADING,
+    previous: i === 0 ? THREADS_HEADING : THREADS_SUBSECTIONS[i - 1],
+  })),
   { heading: DOWNGRADE_HEADING, parent: MIGRATION_HEADING, previous: `### ${UPGRADING_TITLE}` },
 ]
 
-/** Each declarative-scoped configuration section and the channel-modes page's section its pointer must link. */
-const DECLARATIVE_POINTERS: readonly [section: string, target: string][] = [
+/** Each configuration section on the shared list and destination, and the channel-modes page's section each of its pointers must link. */
+const CONFIGURATION_POINTERS: readonly [section: string, target: string][] = [
   ['### Channel entries', WHAT_EACH_MODE_SERVES_HEADING],
-  ['### Channel delivery', FUNGIBLE_DELIVERY_HEADING],
-  ['### Permission prompts', FUNGIBLE_PROMPTS_HEADING],
+  ['### Delivery values', DELIVERY_VALUES_HEADING],
+  ['### Delivery values', THREADS_HEADING],
+  ['### Permission prompts', PROMPTS_IN_BOTH_MODES_HEADING],
 ]
 
 /** The pointer path from the persona reference to the channel-modes page, as `CONFIGURATION_DOC` writes it (`channel-modes.md`). */
@@ -8209,9 +8313,36 @@ describe('the README describes both channel modes', () => {
         ['currently eligible member', 'historically listed member'],
         ['have effective `all`', 'have saved `all`'],
         ['A saved-all choice alone does not count', 'A saved-all choice alone counts'],
-        ['departed, ', 'departed personas can supply it; '],
-        ['unverified or ', 'unverified personas can supply it; '],
+        ['departed or unverified personas cannot supply it', 'departed or unverified personas can supply it'],
+        ['a persona on `thread_hybrid` never counts', 'a persona on `thread_hybrid` counts too'],
         ['otherwise the reason is `receive_all`', 'otherwise the reason is `receive_all_shared`'],
+      ]],
+      ['Channel modes: four persistent listening choices with missing choices unresolved', [
+        ["A persona's saved choice is the `delivery` value", "A persona's saved choice is its effective choice"],
+        ['the saved value stays as it is', 'the saved value is reset to `off`'],
+      ]],
+      ['Channel modes: a configuration from an earlier release requires a manual edit', [
+        ['is rejected at load until it is prepared by hand', 'is accepted at load and prepared automatically'],
+        [CONFIGURATION_REJECTIONS_LINK, 'Configuration rejections'],
+      ]],
+      [`Channel modes: a persona's ${code(DELIVERY_KEY)} applies as written in another persona's destination`, [
+        ['applies as written in a channel where another persona posts', 'is held at `mentions` in a channel where another persona posts'],
+      ]],
+      ['Channel modes: the on-purpose example, a second persona hearing the first persona\'s destination to review its prompts', [
+        ["`reviewer`'s entry is `all`", "`reviewer`'s entry is `off`"],
+        ["`reviewer` sees each of `planner`'s prompts and notices there", "`reviewer` never sees `planner`'s prompts and notices there"],
+      ]],
+      ['Channel modes: the loop warning for two personas hearing each other in a destination, thread_hybrid channels included', [
+        ['can answer each other in a loop', 'never answer each other'],
+        ['This includes `thread_hybrid` channels', 'This excludes `thread_hybrid` channels'],
+        ['keep one of them at `mentions`', 'keep both of them at `all`'],
+      ]],
+      [`Channel modes: the warning against two personas at ${ALL} in one channel or in one thread`, [
+        ['Two personas in one thread they are both in can keep answering each other the same way', 'Two personas in one thread never answer each other'],
+      ]],
+      ['security: anyone who can reach the persona can set any eligible channel it is in to any value, one they are not in included, and open-mode choices persist into strict mode', [
+        ['to any value, including a channel they are not in', 'to `all`, only in a channel they are in'],
+        ['stays in force when strict mode is turned on', 'is discarded when strict mode is turned on'],
       ]],
       ['receiving: current verified eligibility in both modes', [
         ['current verified eligible membership', 'listed or historical membership'],
@@ -8224,13 +8355,16 @@ describe('the README describes both channel modes', () => {
         ['Neither a direct mention nor a broadcast, with effective `all`', 'A direct mention or broadcast, with saved `all`'],
         ['this persona and another currently eligible persona in the same channel', 'this persona alone or another historical persona in a different channel'],
         ['another currently eligible persona', 'another historically listed persona'],
-        ['Departed, ', 'Departed siblings count. '],
-        ['unverified, ', 'unverified siblings count; '],
-        ['off or ', 'off siblings count; '],
+        ['departed, unverified or off ones do not', 'departed, unverified or off ones count too'],
+        ['a persona on `thread_hybrid` never does', 'a persona on `thread_hybrid` counts too'],
       ]],
       ['receiving: the receive_all row, scoped per mode', [
         ['no other persona is currently eligible and effectively all there', 'no other persona has a saved-all entry there'],
-        ['after current membership, eligibility', 'whether or not that app remains in the channel'],
+        ['after current membership and eligibility checks', 'whether or not that app remains in the channel'],
+      ]],
+      ['receiving: a reply in a thread this persona is in, under effective thread_hybrid', [
+        ['a reply in a thread this persona is in', 'any reply in the channel'],
+        ["A thread's channel message never arrives this way", "A thread's channel message also arrives this way"],
       ]],
     ] as const).flatMap(([element, mutations]) => mutations.map(([original, reversal]) => [element, original, reversal] as const)))(
       'self-check: %s rejects omission or reversal of "%s"', (element, original, reversal) => {
@@ -8260,12 +8394,12 @@ describe('the README describes both channel modes', () => {
     })
   })
 
-  describe('pointers from the declarative-scoped sections', () => {
-    test.each(DECLARATIVE_POINTERS)('"%s" links "%s", and the link resolves', (section, target) => {
+  describe('pointers from the configuration sections', () => {
+    test.each(CONFIGURATION_POINTERS)('"%s" links "%s", and the link resolves', (section, target) => {
       expect(pointerProblems(readme(), section, target)).toEqual([])
     })
 
-    test.each(DECLARATIVE_POINTERS)('self-check: "%s" with its link to "%s" dropped, or that heading renamed, fails', (section, target) => {
+    test.each(CONFIGURATION_POINTERS)('self-check: "%s" with its link to "%s" dropped, or that heading renamed, fails', (section, target) => {
       const anchor = anchorLink(target).slice(2, -1)
       const unlinked = readme().replaceAll(`](${CHANNEL_MODES_FROM_CONFIGURATION}#${anchor})`, ']')
       expect(unlinked).not.toBe(readme())
@@ -8709,6 +8843,18 @@ test('0.17.0 records fresh conversations, retained memory and the typed launch c
 
 const OBSOLETE_SLACK_REDELIVERY = /(?:deduplicat\w*|redeliver\w*|key)[^.]*(?:10|ten)[ -]minutes?|(?:deduplicat\w*|redeliver\w*|key)[^.]*(?:clear\w*|reset\w*|forgotten|forget\w*)[^.]*restart/i
 
+/** How often maintenance compacts a queue, as the privacy paragraph words `QUEUE_COMPACT_INTERVAL_MS`. */
+const COMPACTION_CADENCE = QUEUE_COMPACT_INTERVAL_MS === 60 * 60 * 1000 ? 'about hourly' : `about every ${QUEUE_COMPACT_INTERVAL_MS / 60_000} minutes`
+
+/** The longest a reply racing the persona's own post waits for that post's answer, in seconds. */
+const POST_HOLD_SECONDS = THREAD_REPLY_HOLD_MS / 1000
+
+/** The R44 receiving-order row's element, which its reversal cases look up. */
+const POST_HOLD_ROW = `arrival order and one in flight hold across sources; a reply racing the persona's own post waits up to ${POST_HOLD_SECONDS} seconds with everything behind it, then is released or withdrawn, and a reply waiting on Thread Memory lets later items pass; each decision is saved before the affected reply moves on; a restart releases an unresolved Post Hold but not a Memory Hold; a blocked head never expires`
+
+/** The R44 privacy row's element, which its reversal cases look up. */
+const PRIVACY_ROW = `privacy: undelivered and removed-persona text persists, delivered text is removed when the queue is compacted, at each start and ${COMPACTION_CADENCE}, and a message that joined a thread is kept until Thread Memory has saved that join or no longer needs it`
+
 /** Uncovered R44 facts only; marker and fixed notice rows stay above. */
 const QUEUED_DOC_ROWS: readonly (readonly [file: string, heading: HeadingMatch | undefined, element: string, required: readonly (string | RegExp)[], example: string])[] = [
   [BOTS_DOC, RECEIVING_HEADING, 'CSCB types the tag; channel names and split parts are explained', [
@@ -8728,11 +8874,26 @@ const QUEUED_DOC_ROWS: readonly (readonly [file: string, heading: HeadingMatch |
     /key[^.]*at least 24 hours after intake/i,
     /paired channel @mention adds no second item/i,
   ], 'Slack redeliveries add no second queue item across server restarts. Each accepted message keeps its key for at least 24 hours after intake; the paired channel @mention adds no second item.'],
-  [BOTS_DOC, RECEIVING_HEADING, 'FIFO and one in flight hold across sources; a blocked head never expires', [
-    /(?:strict[^.]*order|first.in.first.out|FIFO)/i, /one (?:message|item) in flight/i,
+  [BOTS_DOC, RECEIVING_HEADING, POST_HOLD_ROW, [
+    /(?:arrival order|first.in.first.out|FIFO)/i, /one (?:message|item) in flight/i,
     /(?:next|later)[^.]*(?:confirm|delivered)/i, /(?:no age cutoff|never expires|no expiry)/i,
     /(?:Slack[^.]*interject[^.]*scheduled|every source)/i,
-  ], 'Strict order covers every source. There is one message in flight; the next waits until the previous is confirmed delivered. There is no age cutoff.'],
+    /A reply racing the persona['’]s own post/i,
+    /waits while one of its posts is pending, either in that thread or as a new channel message that may have started it/i,
+    new RegExp(String.raw`waits up to ${POST_HOLD_SECONDS} seconds for the post['’]s answer, and everything behind it waits too`, 'i'),
+    new RegExp(`released when a post lands in that thread or the ${POST_HOLD_SECONDS} seconds pass`, 'i'),
+    /withdrawn, never delivered, when every post landed elsewhere or failed/i,
+    /A reply in a thread whose Thread Memory can['’]t be read/i,
+    /waits while later items pass it, and is delivered only if the persona turns out to be in that thread/i,
+    /A racing reply waits this way instead of being withdrawn when its thread can['’]t be read/i,
+    /Each decision is saved before the affected reply moves on, and a failed save is retried/i,
+    /An unresolved Post Hold blocks every later item, and a restart releases it, including one whose decision wasn['’]t saved yet/i,
+    /A Memory Hold lets later items pass and survives a restart until Thread Memory can be read/i,
+    'SKILL.md#thread-memory-unreadable',
+  ], `Slack, /interject and scheduled prompts go in arrival order. There is one message in flight; the next waits until the previous is confirmed delivered. There is no age cutoff.
+- A reply racing the persona's own post waits while one of its posts is pending, either in that thread or as a new channel message that may have started it. It waits up to ${POST_HOLD_SECONDS} seconds for the post's answer, and everything behind it waits too. It is released when a post lands in that thread or the ${POST_HOLD_SECONDS} seconds pass, and withdrawn, never delivered, when every post landed elsewhere or failed.
+- A reply in a thread whose Thread Memory can't be read waits while later items pass it, and is delivered only if the persona turns out to be in that thread. A racing reply waits this way instead of being withdrawn when its thread can't be read.
+Each decision is saved before the affected reply moves on, and a failed save is retried. An unresolved Post Hold blocks every later item, and a restart releases it, including one whose decision wasn't saved yet. A Memory Hold lets later items pass and survives a restart until Thread Memory can be read (see [Thread Memory unreadable](../skills/debug-slack-channel-bots/SKILL.md#thread-memory-unreadable)).`],
   [BOTS_DOC, RECEIVING_HEADING, 'MCP disconnection holds messages for delivery once connected', [
     /messages[^.]*wait[^.]*MCP|MCP[^.]*messages[^.]*wait/i, /deliver\w*[^.]*once[^.]*connected/i,
   ], 'Messages wait while disconnected over MCP and are delivered once connected.'],
@@ -8760,13 +8921,17 @@ const QUEUED_DOC_ROWS: readonly (readonly [file: string, heading: HeadingMatch |
     /tag description[^.]*always/i, /`system_prompt_mode`/, /`none`/,
     /(?:one|same|single|shared) file[^.]*every persona/i, /(?:whom|whose)[^.]*(?:obey|follow)/i,
   ], 'The tag description is always carried, with `system_prompt_mode` `none` included. One file serves every persona and defines whom to obey.'],
-  [SERVER_SETTINGS_DOC, '## Server-wide settings', 'acknowledgement waits for the whole transcript receipt and an early reply suppresses it', [
+  [SERVER_SETTINGS_DOC, '## Server-wide settings', 'acknowledgement waits for the whole transcript receipt, an early reply suppresses it, and a held thread reply gets its queued reaction only once released', [
     /`ack_reaction`[^\n]*transcript[^\n]*whole message/i, /reply before delivery[^.]*suppress/i,
-  ], '| `ack_reaction` | Its transcript confirms the whole message first; a reply before delivery suppresses the later reaction. |'],
-  [SERVER_SETTINGS_DOC, "# Server settings", 'privacy: undelivered and removed-persona text persists, delivered text is removed within 24 hours', [
+    /held thread reply gets its queued reaction only once released/i,
+  ], '| `ack_reaction` | Its transcript confirms the whole message first; a reply before delivery suppresses the later reaction. |\nA held thread reply gets its queued reaction only once released.'],
+  [SERVER_SETTINGS_DOC, "# Server settings", PRIVACY_ROW, [
     /undelivered[^.]*(?:kept|retain)[^.]*(?:until delivered|until delivery)/i,
-    /removed persona[^.]*queue/i, /delivered[^.]*(?:removed|deleted)[^.]*(?:within|no later than) 24 hours/i,
-  ], "Undelivered text is kept until delivered. A removed persona's queue is retained too. Delivered text is removed within 24 hours."],
+    /removed persona[^.]*queue/i, /delivered text is (?:removed|deleted) when the queue is compacted/i,
+    new RegExp(`compacted, at each start and ${COMPACTION_CADENCE}`, 'i'),
+    /delivered message that joined the persona to a thread is kept until Thread Memory has saved that join or no longer needs it/i,
+    /then removed at the next compaction/i,
+  ], `Undelivered text is kept until delivered. A removed persona's queue is retained too. Delivered text is removed when the queue is compacted, at each start and ${COMPACTION_CADENCE}. A delivered message that joined the persona to a thread is kept until Thread Memory has saved that join or no longer needs it, then removed at the next compaction.`],
   [SERVER_SETTINGS_DOC, "# Server settings", 'privacy: native transcript/history and message-bearing server log remain', [
     /transcript/i, /prompt history/i, /Claude Code[^.]*config directory/i,
     /server\.log[^.]*message text/i, /received.event/, /dispatch/, '/interject',
@@ -8774,9 +8939,12 @@ const QUEUED_DOC_ROWS: readonly (readonly [file: string, heading: HeadingMatch |
   [CONFIGURATION_DOC, '### Permission prompts', 'destinations use Message not saved and mutual storage-failure notices end after one each per episode', [
     /Message not saved/, /one[^.]*(?:each|per persona)[^.]*episode/i,
   ], 'Message not saved notices stop after one each per episode.'],
-  [CHANNEL_MODES_DOC, FUNGIBLE_PROMPTS_HEADING, 'fungible destinations receive the current storage-failure notice', [
+  [CHANNEL_MODES_DOC, PROMPTS_IN_BOTH_MODES_HEADING, "a persona's destination receives the current storage-failure notice, and a validated destination stays selected after the persona's verified leave, creating no membership or choice", [
     'Message not saved',
-  ], 'The destination receives Message not saved notices.'],
+    /validated unchanged channel destination stays selected after a verified leave of that channel by the same persona incarnation/i,
+    /even with zero entries and DMs off/i,
+    /does not recreate membership or a choice/i,
+  ], 'The destination receives Message not saved notices. A validated unchanged channel destination stays selected after a verified leave of that channel by the same persona incarnation, even with zero entries and DMs off; it does not recreate membership or a choice.'],
   [RELOAD_DOC, '## Reading the preview', 'a removed persona line includes the exact retained-queue clause', [
     /DESTRUCTIVE:[^.]*removed[^.]*\d+ open queued items? kept/, /delivered only if a persona with the same key is added again/,
   ], 'DESTRUCTIVE: persona "scribe" is removed: 2 open queued items kept, delivered only if a persona with the same key is added again.'],
@@ -8847,10 +9015,50 @@ describe('R44: queued-delivery documentation', () => {
     }
   })
 
+  test.each([
+    [BOTS_DOC, POST_HOLD_ROW, [
+      [`up to ${POST_HOLD_SECONDS} seconds for the post`, `up to ${POST_HOLD_SECONDS * 10} seconds for the post`],
+      ['and everything behind it waits too', 'and later items pass it'],
+      ['released when a post lands in that thread', 'withdrawn when a post lands in that thread'],
+      ['withdrawn, never delivered, when every post landed elsewhere or failed', 'delivered anyway when every post landed elsewhere or failed'],
+      ['waits while later items pass it', 'blocks every later item'],
+      ['waits this way instead of being withdrawn', 'is withdrawn instead of waiting'],
+      ['saved before the affected reply moves on', 'saved after the affected reply moves on'],
+      ['a failed save is retried', 'a failed save is dropped'],
+      ['An unresolved Post Hold blocks every later item', 'An unresolved Post Hold lets later items pass'],
+      ['and a restart releases it, including one', 'and survives a restart, including one'],
+      ['including one whose decision', 'except one whose decision'],
+      ['A Memory Hold lets later items pass', 'A Memory Hold blocks every later item'],
+      ['and survives a restart until Thread Memory can be read', ', and a restart releases it'],
+      ['survives a restart until Thread Memory can be read', 'is released by a restart'],
+    ]],
+    [SERVER_SETTINGS_DOC, PRIVACY_ROW, [
+      ['has saved that join or no longer needs it', 'has saved that join'],
+      ['then removed at the next compaction', 'then kept for good'],
+    ]],
+  ] as const)('self-check: %s — %s rejects omission or reversal of each held fact', (file, element, mutations) => {
+    const row = QUEUED_DOC_ROWS.find((r) => r[2] === element)
+    if (row === undefined) throw new Error(`no R44 row for ${element}`)
+    const [, heading, , required] = row
+    const passage = sectionOf(file, heading!)
+    const text = operatorText(file)
+    expect(docRowProblems(passage, required, text)).toEqual([])
+    for (const [original, reversal] of mutations) {
+      for (const replacement of ['', reversal]) {
+        const edited = text.replaceAll(original, replacement)
+        expect({ original, replacement, changed: edited !== text }).toEqual({ original, replacement, changed: true })
+        expect({ original, replacement, failing: docRowProblems(passage, required, edited).length > 0 }).toEqual({ original, replacement, failing: true })
+      }
+    }
+  })
+
   test('the interject error table has exactly the supported responses and no session-unavailable answer', () => {
     const section = requiredSection(operatorText(BOTS_DOC), '### Error conditions', BOTS_DOC)
     expect(firstTable(section).rows.map(row => Number(row[0])).sort((a, b) => a - b)).toEqual([400, 403, 404, 405, 413, 500])
-    const edited = `${section.trimEnd()}\n| 503 | No session |`
+    const lines = section.split('\n')
+    const lastRow = lines.map((line) => line.startsWith('|')).lastIndexOf(true)
+    expect(lastRow).toBeGreaterThan(0)
+    const edited = [...lines.slice(0, lastRow + 1), '| 503 | No session |', ...lines.slice(lastRow + 1)].join('\n')
     expect(firstTable(edited).rows.map(row => Number(row[0]))).toContain(503)
   })
 

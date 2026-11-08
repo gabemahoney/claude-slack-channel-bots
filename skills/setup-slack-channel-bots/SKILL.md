@@ -145,7 +145,7 @@ jq '.channel_mode // "strict"' "$STATE_DIR/config.json"
 
 On a fresh install, explain both modes, suggest `strict`, and ask which one. On an existing install, state the applied mode and ask whether to change it. An absent selector and `"strict"` mean the same mode. A differing input mode is pending until confirmed.
 
-To change modes, edit only `channel_mode`, preserving channel choices and the shared destination. Before selecting `open`, review each app’s channel memberships, private channels included, and past `unclaimed-channel` lines in `server.log`. A newly verified member without a choice starts at `off` in strict mode or `mentions` in open mode, using the mode when the join is applied. Duplicate joins and mode switches preserve existing choices, including `off`. Have the operator read `docs/channel-modes.md`’s `## Who can reach a persona in fungible mode` before selecting it. Check every persona against the debug skill’s `### The load-time rules`; Step 10 describes confirmation.
+To change modes, edit only `channel_mode`, preserving channel choices and the shared destination. Before selecting `open`, review each app’s channel memberships, private channels included, and past `unclaimed-channel` lines in `server.log`. A newly verified member without a choice starts at `off` in strict mode or `mentions` in open mode, using the mode when the join is applied. Duplicate joins and mode switches preserve existing choices, including `off`. Have the operator read `docs/channel-modes.md`’s `## Who can reach a persona in open mode` before selecting it. Check every persona against the debug skill’s `### The load-time rules`; Step 10 describes confirmation.
 
 ---
 
@@ -276,7 +276,7 @@ In both modes, collect each channel’s fields below. A fresh persona with no ch
 - **`id`**: a Slack channel ID, pattern `^[CG][A-Z0-9]+$`. In Slack, click the channel name; the ID is at the bottom of **About**.
 - **`delivery`**: explicitly choose `off`, `mentions`, `all` or `thread_hybrid`. `off` disables channel listening; `mentions` delivers direct mentions and broadcasts; `all` delivers every message. A newly verified member without a choice starts at `off` in strict or `mentions` in open; existing choices are preserved.
 
-See `docs/configuration.md`’s `### Channel entries` and `### Channel delivery`.
+See `docs/configuration.md`’s `### Channel entries` and `### Delivery values`.
 
 In either mode, tell the operator to invite the persona's app to each channel
 the persona should serve, in that channel:

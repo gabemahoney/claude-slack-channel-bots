@@ -1228,7 +1228,7 @@ credentials workflow, never these requests or chat.
 - **Two personas at `all` in one channel:** don't. Each receives every
   message there, the other's posts included, so the two can keep answering
   each other with no human involved. Keep at most one at `all` (see
-  [Channel delivery in open mode](../../docs/channel-modes.md#channel-delivery-in-open-mode)).
+  [Delivery values in both modes](../../docs/channel-modes.md#delivery-values-in-both-modes)).
 
 ### `persona-channel-delivery-set`
 
@@ -1767,7 +1767,7 @@ channel, not only @mentions and broadcasts.
 
 Two personas at `all` in one channel each receive the other's posts and can
 keep answering each other: keep at most one at `all` (see
-[Channel delivery in open mode](../../docs/channel-modes.md#channel-delivery-in-open-mode)).
+[Delivery values in both modes](../../docs/channel-modes.md#delivery-values-in-both-modes)).
 
 ---
 

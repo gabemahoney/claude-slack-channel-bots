@@ -40,7 +40,7 @@ These top-level fields apply to the whole server. Confirmed changes take effect 
 
 **Custom emoji must exist in the Slack workspace before you configure them.** `spinthinking` is custom; before starting, make sure both selected names are available in each persona's workspace. Omitting either setting selects its default; empty strings and `null` are invalid.
 
-CSCB removes the queued reaction before adding the delivered reaction. Setting both names alike keeps one reaction through both stages; dropped messages and injected messages get neither. The first successful `reply` text post or file upload carrying the original `message_id` clears that persona's actual stage without delaying the rest of the reply.
+CSCB removes the queued reaction before adding the delivered reaction. Setting both names alike keeps one reaction through both stages; dropped messages and injected messages get neither, and a held thread reply gets its queued reaction only once released. The first successful `reply` text post or file upload carrying the original `message_id` clears that persona's actual stage without delaying the rest of the reply.
 
 Both settings take effect only at server startup after a [confirmed change](reload.md#what-a-confirmation-applies). Outstanding work retains its original queued name across restarts and setting changes, including when queued feedback is restored after reconnect; its delivered stage uses the setting in effect at delivery.
 
@@ -85,6 +85,8 @@ If you change `port` or `bind` in `config.json`, the confirmed change takes effe
 
 ## Message text and privacy
 
-Undelivered message text is kept until delivery, including a removed persona’s queue. Delivered text is removed within 24 hours. Typed Slack text also remains in the agent’s native transcript and prompt history file; Claude Code keeps these in its config directory.
+Undelivered message text is kept until delivery, including a removed persona’s queue. Delivered text is removed when the queue is compacted, at each start and about hourly. A delivered message that joined the persona to a thread is kept until Thread Memory has saved that join or no longer needs it, then removed at the next compaction.
+
+Typed Slack text also remains in the agent’s native transcript and prompt history file; Claude Code keeps these in its config directory.
 
 `server.log` retains message text in received-event, dispatch and `/interject` lines. Protect the state and Claude Code config directories and any log copies accordingly.
