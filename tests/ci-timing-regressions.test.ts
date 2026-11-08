@@ -921,6 +921,68 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     const missing = membershipRepairVerdict(clear, diag(log), MEMBERSHIP_ATTEMPT_TIMEOUT_MS, MEMBERSHIP_RETRY_MAX_MS)
     expect(missing.verdict).toBe('missing'); output([missing], 1)
   })
+  // The answers25 strict-first-scope shape: a refused page carries no
+  // deadline_at, and neither do the repair attempt's republication or its
+  // complete line.
+  function scope(refusedAt = 1794157684876, next = 1794157704876, clear = 1794157685660, start = 1794157704880, done = 1794157705325) {
+    const at = (t: number, status: Parameters<typeof membershipScanDiagnostic>[1]) => `[${iso(t)}] ${membershipScanDiagnostic(key, status)}`
+    const lines = [at(refusedAt, { state: 'incomplete', pages: 0, positives: 0, problem: 'access', slackError: 'missing_scope', nextAttemptAt: next }),
+      at(start, { state: 'unverified', pages: 0, positives: 0, nextAttemptAt: start }),
+      at(done, { state: 'complete', pages: 6, positives: 1100 })]
+    const f = { clear, lines, run: (log = lines.join('\n')) => membershipRepairVerdict(f.clear, diag(log), MEMBERSHIP_ATTEMPT_TIMEOUT_MS, MEMBERSHIP_RETRY_MAX_MS) }
+    return f
+  }
+  test('idle repair after an access refusal: the recorded run passes with no remaining deadline and the attempt\'s own scan time', () => {
+    const r = scope().run()
+    expect(r.stats).toMatchObject({ elapsed_ms: 19665, remaining_ms: 0, retry_ms: MEMBERSHIP_RETRY_MAX_MS, scan_ms: 445 })
+    expect(r.limit).toBe(MEMBERSHIP_RETRY_MAX_MS + 445); expect(r.verdict).toBe('pass'); output([r], 0)
+  })
+  test.each([0, 1])('idle repair after an access refusal at its bound +%d', extra => {
+    const clear = clock, start = clear + MEMBERSHIP_RETRY_MAX_MS + extra
+    const r = scope(clear - 1, start, clear, start, start + 20).run()
+    expect(r.stats).toMatchObject({ remaining_ms: 0, scan_ms: 20 }); expect(r.verdict).toBe(extra ? 'fail' : 'pass'); output([r], extra ? 1 : 0)
+  })
+  test('idle repair after an access refusal fails a scan beyond its attempt deadline and never passes without completion', () => {
+    const f = scope(), slow = scope(undefined, undefined, undefined, undefined, 1794157704880 + MEMBERSHIP_ATTEMPT_TIMEOUT_MS + 1)
+    expect(slow.run().verdict).toBe('fail'); output([slow.run()], 1)
+    const never = f.run(f.lines.slice(0, 2).join('\n'))
+    expect(never.stats.elapsed_ms).toBe('missing'); expect(never.verdict).toBe('missing'); output([never], 1)
+  })
+  test.each(['no-attempt', 'attempt-before-next', 'attempt-before-clear', 'refusal-without-slack', 'transport-without-deadline', 'hang-complete-without-deadline'] as const)
+  ('idle repair stays missing on %s', shape => {
+    const f = scope()
+    let log = f.lines.join('\n')
+    if (shape === 'no-attempt') log = [f.lines[0], f.lines[2]].join('\n')
+    if (shape === 'attempt-before-next') log = log.replace(iso(1794157704880), iso(1794157704875))
+    if (shape === 'attempt-before-clear') { f.clear = 1794157704881; log = [f.lines[0].replace(iso(1794157684876), iso(1794157704870)), f.lines[1], f.lines[2]].join('\n') }
+    if (shape === 'refusal-without-slack') log = log.replace(' slack_error=missing_scope', '')
+    if (shape === 'transport-without-deadline') log = log.replace('reason=access slack_error=missing_scope', 'reason=transport slack_error=internal_error')
+    if (shape === 'hang-complete-without-deadline') log = [scanLine(f.clear - 1, false, 0, 'deadline', undefined, f.clear + 1000), f.lines[1], f.lines[2]].join('\n')
+    const r = f.run(log)
+    expect(r.verdict).toBe('missing'); output([r], 1)
+  })
+  // The denied case publishes the same shape, with its own reason and code.
+  const denied = (log: string) => log.replace('reason=access slack_error=missing_scope', 'reason=authentication slack_error=invalid_auth')
+  test('idle repair after an authentication refusal: pass, over-bound fail and missing', () => {
+    const f = scope(), r = f.run(denied(f.lines.join('\n')))
+    expect(r.stats).toMatchObject({ elapsed_ms: 19665, remaining_ms: 0, scan_ms: 445 }); expect(r.verdict).toBe('pass'); output([r], 0)
+    for (const extra of [0, 1]) {
+      const start = clock + MEMBERSHIP_RETRY_MAX_MS + extra, b = scope(clock - 1, start, clock, start, start + 20)
+      const over = b.run(denied(b.lines.join('\n')))
+      expect(over.stats).toMatchObject({ remaining_ms: 0, scan_ms: 20 }); expect(over.verdict).toBe(extra ? 'fail' : 'pass'); output([over], extra ? 1 : 0)
+    }
+    for (const log of [[f.lines[0], f.lines[2]], f.lines.slice(0, 2)].map(l => denied(l.join('\n')))) {
+      const missing = f.run(log)
+      expect(missing.verdict).toBe('missing'); output([missing], 1)
+    }
+    const storage = f.run(f.lines.join('\n').replace('reason=access slack_error=missing_scope', 'reason=storage slack_error=missing_scope'))
+    expect(storage.verdict).toBe('missing'); output([storage], 1)
+  })
+  test('idle repair after an access refusal keeps a complete line\'s own deadline_at as its scan start', () => {
+    const f = scope(), withDeadline = f.lines[2].replace('reason=none.', `reason=none deadline_at=${1794157704876 + MEMBERSHIP_ATTEMPT_TIMEOUT_MS}.`)
+    const r = f.run([f.lines[0], f.lines[1], withDeadline].join('\n'))
+    expect(r.stats).toMatchObject({ remaining_ms: 0, scan_ms: 449 }); expect(r.verdict).toBe('pass'); output([r], 0)
+  })
   function late() {
     const stub: any[] = [{ seq: 1, event: 'fault', control: 'faults', method: 'users.conversations', label: key, request_id: 'late', outcome: 'late', arrival_mono_ms: 1 },
       { seq: 5, event: 'fault-settled', request_id: 'late', resolution: 'late', socket_open: false },

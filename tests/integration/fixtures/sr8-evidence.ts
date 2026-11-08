@@ -281,7 +281,11 @@
  *     send NO traffic/tool/reconnect until complete. The line records elapsed_ms,
  *     remaining_ms, retry_ms, scan_ms. Published bound = remaining attempt deadline
  *     + max(MEMBERSHIP_RETRY_MAX_MS, Retry-After) + successful scan/persistence time;
- *     scan start is complete.deadline_at - MEMBERSHIP_ATTEMPT_TIMEOUT_MS. No fixed
+ *     scan start is complete.deadline_at - MEMBERSHIP_ATTEMPT_TIMEOUT_MS. After an
+ *     access or authentication refusal (no deadline_at) the remaining deadline is 0
+ *     and, when the complete line has no deadline_at, scan start is the last
+ *     reason=none incomplete line after clear and at/after the refusal's
+ *     next_attempt_at. No fixed
  *     extra 30 seconds, rounding tolerance or dispatch allowance. Missing timestamps
  *     or completion is missing, elapsed above the bound or scan above its deadline
  *     fails. This does not claim a constant bound on arbitrary persistence work.
@@ -959,13 +963,22 @@ export function membershipFaultRows(kind: string, key: string, stub: any[] | und
 export function membershipRepairVerdict(clearAt: number, diagnostics: ScanDiagnostic[] | undefined, attemptMs: number, retryMaxMs: number): Result {
   const completed = diagnostics?.filter(d => d.complete && d.at >= clearAt) ?? []
   const last = diagnostics?.filter(d => !d.complete && d.at <= clearAt).at(-1)
-  const done = completed[0], scanStart = done ? done.deadline - attemptMs : NaN
+  const done = completed[0]
+  // A refused page (access: missing_scope; authentication: invalid_auth) is
+  // published once its attempt has ended, so no deadline remains. Attempts
+  // after a refusal revalidate by reconnecting, whose status republication
+  // drops deadline_at, so a complete line without one starts at that
+  // attempt's own publication, never before the refusal's next_attempt_at.
+  const refused = !!last && ['access', 'authentication'].includes(last.reason) && !!last.slack && !finite(last.deadline) && nonnegative(last.next)
+  const attempt = refused && done && !finite(done.deadline)
+    ? diagnostics!.filter(d => !d.complete && d.reason === 'none' && d.at > clearAt && d.at >= last!.next && d.at <= done.at).at(-1) : undefined
+  const scanStart = !done ? NaN : finite(done.deadline) ? done.deadline - attemptMs : attempt ? attempt.at : NaN
   const scan = done ? done.at - scanStart : NaN, elapsed = done ? done.at - clearAt : NaN
   const remaining = last && nonnegative(last.deadline) ? Math.max(0, last.deadline - clearAt) : 0
   const retry = Math.max(retryMaxMs, last && nonnegative(last.retryAfter) ? last.retryAfter * 1000 : 0)
   const bound = remaining + retry + scan
   const missing = !last || !done || !nonnegative(clearAt) || !nonnegative(scan) || !nonnegative(elapsed)
-    || !nonnegative(last.deadline) || !positive(attemptMs) || !positive(retryMaxMs)
+    || (!refused && !nonnegative(last.deadline)) || !positive(attemptMs) || !positive(retryMaxMs)
   return result('membership-repair', done ? 1 : 0, { elapsed_ms: finite(elapsed) ? elapsed : 'missing',
     remaining_ms: remaining, retry_ms: retry, scan_ms: finite(scan) ? scan : 'missing' }, finite(bound) ? bound : 'missing',
     missing ? 'missing' : scan > attemptMs || remaining > attemptMs || elapsed > bound ? 'fail' : 'pass')
