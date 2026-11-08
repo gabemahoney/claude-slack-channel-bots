@@ -552,9 +552,12 @@ async function serializeSavedImage(j: MemoryJournal, header: ThreadMemoryHeader,
   }
   const chunks: Buffer[] = [Buffer.from(JSON.stringify(header) + '\n')]
   for (const chunk of image.chunks) {
+    // A cached chunk costs one reference, not another walk of its records.
+    // Still slice both encoding and a very large cached-chunk traversal.
+    const work = chunk.bytes ? 1 : chunk.records.size
     chunk.bytes ??= Buffer.from([...chunk.records].map(lineOf).join(''))
     chunks.push(chunk.bytes)
-    if (slices.due(chunk.records.size) && !await slices.pause()) return undefined
+    if (slices.due(work) && !await slices.pause()) return undefined
   }
   return Buffer.concat(chunks)
 }

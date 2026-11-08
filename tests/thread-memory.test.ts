@@ -2570,6 +2570,64 @@ describe('Thread Memory compaction in slices', () => {
     expect(journalBytes(h).equals(serializeThreadMemoryRecords([written, ...[...records].sort(bySeq)]))).toBe(true)
   }
 
+  test('a mostly cached compaction yields only for new work', async () => {
+    const { h, header, records } = await large('alternate')
+    await h.memory.compact('alpha')
+    expect(await h.memory.saveJoins('alpha', [h.fact({ root: rootOf(COUNT) })])).toEqual({ kind: 'saved' })
+    const expected = readThreads(h.stateDir).slice(1)
+    const temp = h.io.hold('fsync', 'alpha', { match: isTemp(h) })
+    const yielding = spyOn(globalThis, 'setImmediate')
+    const compaction = h.memory.compact('alpha')
+    let yields = 0
+    try {
+      // The held temp-file sync is the first disk wait: count preparation only.
+      await temp.reached
+      yields = yielding.mock.calls.length
+    } finally {
+      yielding.mockRestore(); temp.release(); await compaction
+    }
+    // Two cached full chunks plus a two-record dirty tail fit in one slice.
+    expect(yields).toBe(0)
+    expectSynchronousImage(h, header, expected)
+    expect(savedJoins(h)).toHaveLength(records.length + 1)
+    const bytes = journalBytes(h)
+    await h.close()
+    const reopened = fixture({ reopen: true }, h.stateDir); await reopened.start()
+    expect(journalBytes(reopened)).toEqual(bytes)
+    expect(readThreads(reopened.stateDir).slice(1)).toEqual(expected)
+  })
+
+  test.each(['temp', 'directory'] as const)('a mostly cached rewrite handles %s fsync failure and retries the full rewrite', async failure => {
+    const { h, header, records } = await large('alternate', { seal: true })
+    await h.memory.compact('alpha')
+    await h.memory.saveJoins('alpha', [h.fact({ root: rootOf(COUNT) })])
+    const before = journalBytes(h), expected = readThreads(h.stateDir).slice(1)
+    const notifications = spyOn(h.seal!, 'entryCompacted')
+    const cause = h.io.fail('fsync', 'alpha', {
+      match: failure === 'directory' ? path => path === join(h.stateDir, 'threads') : isTemp(h),
+    })
+    try {
+      await h.memory.compact('alpha')
+      expect(notifications).not.toHaveBeenCalled()
+      expect(h.events.at(-1)).toMatchObject({ type: 'compaction-failed', error: cause })
+      if (failure === 'directory') expectSynchronousImage(h, header, expected)
+      else expect(journalBytes(h)).toEqual(before)
+      expect(readdirSync(join(h.stateDir, 'threads')).filter(name => name.endsWith('.tmp'))).toEqual([])
+      h.io.heal(); h.io.reset()
+      await h.memory.compact('alpha')
+      const steps = h.io.calls.filter(c => ['writeSync', 'fsync', 'rename'].includes(c.op))
+        .map(c => [c.op, isTemp(h)(c.path) ? 'temp' : c.path === join(h.stateDir, 'threads') ? 'directory' : 'journal'])
+      expect(steps).toEqual([['writeSync', 'temp'], ['fsync', 'temp'], ['rename', 'temp'], ['fsync', 'directory']])
+      expect(notifications).toHaveBeenCalledTimes(1)
+      expectSynchronousImage(h, header, expected)
+    } finally { h.io.heal(); notifications.mockRestore() }
+    const bytes = journalBytes(h)
+    await h.crash()
+    const reopened = fixture({ reopen: true, seal: true }, h.stateDir); await reopened.start()
+    expect(savedJoins(reopened)).toHaveLength(records.length + 1)
+    expect(journalBytes(reopened)).toEqual(bytes)
+  })
+
   test('successive saves and compactions serialize only new records and do not sort the saved population again', async () => {
     const { h, header, records } = await large('alternate')
     await h.memory.compact('alpha')
@@ -2704,7 +2762,14 @@ describe('Thread Memory compaction in slices', () => {
     let held: ThreadJoin[] = [], checks = 0
     const { h, facts, header, records } = await large('one-primary', {
       heldStamps: key => key === 'alpha' ? held : [], canRun: () => { checks++; return true } })
-    if (cached) await h.memory.compact('alpha')
+    if (cached) {
+      await h.memory.compact('alpha')
+      // Cached references no longer yield as if they encoded every record.
+      // Add a full slice of new work to exercise publication during a build.
+      const added = Array.from({ length: SLICE }, (_, i) => h.fact({ channel: C.secondary, root: rootOf(COUNT + i) }))
+      await h.memory.saveJoins('alpha', added)
+      records.push(...readThreads(h.stateDir).slice(records.length + 1))
+    }
     const moved = facts[0]!
     held = [moved]; checks = 0; h.io.reset()
     let atYield: { started: boolean; rewriting: boolean } | undefined
@@ -2713,7 +2778,8 @@ describe('Thread Memory compaction in slices', () => {
       expect(h.choose('mentions').kind).toBe('applied')
     })
     await h.memory.compact('alpha')
-    // The compaction had started and walked its first slice, which visits the primary join first, and had not begun its rewrite.
+    // The compaction had collected the primary join and yielded for actual
+    // building work, before beginning its rewrite.
     expect(atYield).toEqual({ started: true, rewriting: false })
     expect(view(h, moved.root)).toBe('not-joined')
     expect(h.memory.joinedBy('alpha', moved.channel, moved.root, moved.stamp, moved.at)).toBe(true)
