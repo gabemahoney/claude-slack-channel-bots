@@ -210,30 +210,33 @@ Create one Slack app for this persona from the shipped manifest,
 Tell the operator where both tokens are. Don't ask for them: they go into the
 terminal command in 5.10.
 
-**Reusing an existing app** for this persona: an app created from an earlier
-manifest can lack the `im:write`, `channels:read` and `groups:read` scopes and
-must gain them and be re-installed. Point to the debugging skill's entries "A
-persona can't open a DM: re-install its app to gain `im:write`" and "The
-message archive shows channel IDs: re-install each app to gain
-`channels:read` and `groups:read`"
-(`skills/debug-slack-channel-bots/SKILL.md`) for the steps. It can also lack
-the `lists:read` and `lists:write` scopes, which a bot needs to use a Slack
-List: add both the same way, then re-install.
+**Reusing an existing app** for this persona: collect all missing scopes and
+subscriptions before following **Update and reinstall an existing app**,
+linked below, for one reinstall. Check for `im:write`, `channels:read` and `groups:read`;
+the debugging skill's entries "A persona can't open a DM: re-install its app
+to gain `im:write`" and "The message archive shows channel IDs: re-install
+each app to gain `channels:read` and `groups:read`"
+(`skills/debug-slack-channel-bots/SKILL.md`) explain the corresponding symptoms.
+
+Also collect missing `lists:read` and `lists:write` scopes, which a bot needs
+to use a Slack List, in the same update.
 
 Also check for `canvases:read` and `canvases:write` for persona status canvases,
-and `reactions:read` for reading the owner's reaction answers: add any missing
-bot scopes under **OAuth & Permissions**, then re-install the app to the
-workspace. See [Credentials files](../../docs/configuration.md#credentials-files)
+and `reactions:read` for reading the owner's reaction answers; include them
+in the same scope update under **OAuth & Permissions**. Collect missing
+`member_joined_channel` and `channel_left` subscriptions under **Event
+Subscriptions** too, then use the linked procedure for the single reinstall.
+See [Credentials files](../../docs/configuration.md#credentials-files)
 for the maintained scope guidance.
 An app already used by another persona can't be reused.
 
-**Membership setup, for new and existing apps:** check the currently installed
+**Membership setup for a new app:** check the currently installed
 app's **Event Subscriptions** → **Subscribe to bot events** for both
 `member_joined_channel` and `channel_left`, and its bot scopes for
 `channels:read` (public) and `groups:read` (private). A fresh manifest install
-includes them; an existing app needs any missing subscriptions/scopes added
-and its one-time reinstall completed. An ordinarily restarted, already
-verified app needs no redundant reinstall. Ordinary CSCB startup neither
+includes them and needs no extra reinstall. For an existing app, follow
+[Update and reinstall an existing app](#update-and-reinstall-an-existing-app).
+Ordinary CSCB startup neither
 checks nor changes these Slack installation settings; thread following adds
 no separate scope or reinstall requirement.
 
@@ -539,8 +542,9 @@ channels and wait for its answer: in strict mode, a channel listed in its
 `channels`; in open mode, a channel its app was invited to. In either
 mode, a persona with DMs on can be DMed instead.
 
-Read [membership readiness](../debug-slack-channel-bots/SKILL.md#membership-setup-record-and-readback)
-for each persona too: report `inventory.state` separately from `setup.state`.
+Complete [membership setup recording and readback](../debug-slack-channel-bots/SKILL.md#membership-setup-record-and-readback)
+for each persona too: report `inventory.state` separately from `setup.state`,
+with the recorded subscription evidence and reinstall status for its current app.
 A reply does not prove complete inventory or verified subscription/reinstall
 setup. Dry run verifies neither and starts no membership probes or retries.
 
@@ -563,7 +567,8 @@ Report:
 - Each persona's membership inventory state (`unverified`, `scanning`,
   `incomplete` or `complete`) and, separately, current-app setup state
   (`verified`, `missing-subscriptions`, `incomplete-reinstall` or `unknown`),
-  with any recorded missing/unknown subscriptions and reinstall status.
+  with its recorded subscription evidence and reinstall status. State explicitly
+  when no current-app record exists or a value remains unknown.
 
 - The channel mode `config.json` holds (strict or open), and whether
   Step 4 changed it. A changed switch applies in place, at once, once
@@ -659,6 +664,33 @@ persona whose tokens Slack refuses (`persona-credentials-refused`).
 Replacing an existing persona's file on a running server makes a pending
 credentials change: the server writes `config.json.pending`, and the change
 takes effect only once the operator confirms it (Step 10, `docs/reload.md`).
+
+---
+
+## Update and reinstall an existing app
+
+For each persona's current app, follow these steps once as part of
+[Upgrading from 0.18.x](../../docs/migration.md#upgrading-from-018x).
+Later ordinary restarts need no further reinstall.
+
+1. Update the app from the shipped `slack-app-manifest.yml`. Check **Event
+   Subscriptions** → **Subscribe to bot events** includes `member_joined_channel`
+   and `channel_left`, and **OAuth & Permissions** includes `channels:read`
+   for public channels and `groups:read` for private channels. Include any
+   other missing scopes identified in step 5.2 before reinstalling.
+2. Under **OAuth & Permissions**, choose **Reinstall to Workspace** once and
+   complete it. Thread following requires no separate scope or reinstall.
+3. Once the persona is applied and running, follow the debug skill's
+   [Membership setup record and readback](../debug-slack-channel-bots/SKILL.md#membership-setup-record-and-readback):
+   read the authenticated installation IDs, inspect that exact app/workspace,
+   record each subscription as `verified`, `missing` or `unknown` and reinstall
+   as `complete`, `incomplete` or `unknown`, then read back both inventory and
+   setup states with the recorded evidence. Evidence for another installation
+   does not count. Leave anything uninspectable `unknown`; a successful scan,
+   silence or one observed event never verifies setup.
+
+The local record needs no new runtime credentials. Tokens go only into
+5.10's terminal [Credentials command](#credentials-command), never the chat.
 
 ---
 

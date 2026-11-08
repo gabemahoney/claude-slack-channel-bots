@@ -41,8 +41,8 @@
 
 import { describe, expect, test } from 'bun:test'
 
-import { existsSync, readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { existsSync, readFileSync, statSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
 
 import { SET_CHANNEL_DELIVERY_TOOL } from '../src/channel-delivery.ts'
 import {
@@ -57,8 +57,12 @@ import {
 import { UNCLAIMED_CHANNEL } from '../src/persona-diagnostics.ts'
 import { FUNGIBLE_DESTINATION_SETTING } from '../src/persona-destination.ts'
 import { MODE_SWITCH_SETTING } from '../src/reload-plan.ts'
-import { MEMBERSHIP_REQUIRED_SUBSCRIPTIONS } from '../src/channel-membership-readiness.ts'
+import {
+  MEMBERSHIP_REQUIRED_SUBSCRIPTIONS, MEMBERSHIP_READINESS_ROUTE, parseMembershipSetupInput,
+  type MembershipSetupInput,
+} from '../src/channel-membership-readiness.ts'
 import { flat, headingAnchors, headings, requiredSection, sectionRange, splitFences } from './test-helpers/markdown.ts'
+import { assertNoLeak } from './test-helpers/credentials.ts'
 
 const REPO_ROOT = resolve(import.meta.dirname, '..')
 const SKILL_FILE = 'skills/setup-slack-channel-bots/SKILL.md'
@@ -106,7 +110,7 @@ describe('setup wizard: the per-persona step covers each item', () => {
     ['Slack app', "the app's name", /display_information\.name/],
     ['Slack app', 'the avatar, uploaded in the display information', /\bavatar\b[^.]*Display Information/],
     ['Slack app', 'install to the workspace', /Install to Workspace/],
-    ['Slack app', 'an existing app re-installed to gain im:write', /re-install[^.]*`im:write`|`im:write`[^.]*re-install/],
+    ['Slack app', 'existing apps gather changes before the one reinstall', /collect all missing scopes and subscriptions before following \*\*Update and reinstall an existing app\*\*, linked below, for one reinstall/],
     ['Credentials file path', 'credentials file path', /`credentials_file`/],
     ['Write its credentials file', 'hand-off to the credentials command', /\]\(#credentials-command\)/],
     ['Write its credentials file', 'the file checked for existence and mode 0600 with ls -lL', /exists and has mode 0600[\s\S]*ls -lL "/],
@@ -137,11 +141,207 @@ describe('setup wizard: the per-persona step covers each item', () => {
 // Current configuration has one shared list and one required destination.
 const modeStep = (doc: string) => requiredSection(doc, titled(3, 'Channel mode'), SKILL_FILE)
 const personaStep = (doc: string, title: string) => requiredSection(requiredSection(doc, titled(3, 'Add a persona'), SKILL_FILE), titled(4, title), SKILL_FILE)
-test('membership setup: the Slack app step checks both subscriptions for existing apps as well as new manifest installs', () => {
-  const app = flat(personaStep(skill, 'Slack app'))
-  expect(MEMBERSHIP_REQUIRED_SUBSCRIPTIONS.filter(event => !app.includes(event))).toEqual([])
-  expect(app).toMatch(/existing app/i)
-  expect(app).toMatch(/re-?install/i)
+const REINSTALL_HEADING = '## Update and reinstall an existing app'
+const REINSTALL_LINK = '(#update-and-reinstall-an-existing-app)'
+const MEMBERSHIP_RECORD_LINK = '(../debug-slack-channel-bots/SKILL.md#membership-setup-record-and-readback)'
+const UPGRADE_LINK = '(../../docs/migration.md#upgrading-from-018x)'
+const code = (value: string) => '`' + value + '`'
+const SETUP_RECORD_STATES = {
+  subscriptions: ['verified', 'missing', 'unknown'],
+  reinstall: ['complete', 'incomplete', 'unknown'],
+} as const satisfies {
+  subscriptions: readonly MembershipSetupInput['subscriptions'][typeof MEMBERSHIP_REQUIRED_SUBSCRIPTIONS[number]][]
+  reinstall: readonly MembershipSetupInput['reinstall'][]
+}
+const manifest = Bun.YAML.parse(readFileSync(resolve(REPO_ROOT, 'slack-app-manifest.yml'), 'utf-8')) as {
+  oauth_config: { scopes: { bot: string[] } }
+}
+const MEMBERSHIP_READ_SCOPES = manifest.oauth_config.scopes.bot.filter(scope => /^(channels|groups):read$/.test(scope))
+const REUSE_SCOPES = manifest.oauth_config.scopes.bot.filter(scope => /^(?:im:write|(?:channels|groups|reactions):read|(?:lists|canvases):(?:read|write))$/.test(scope))
+
+/** Existing-app preparation ends before the new-app membership instructions. */
+function reuseParagraphs(doc: string): string {
+  const app = personaStep(doc, 'Slack app')
+  const start = app.indexOf('**Reusing an existing app**')
+  const end = app.indexOf('**Membership setup for a new app:**', start)
+  if (start < 0 || end < start) throw new Error('Slack app has no bounded existing-app preparation')
+  return app.slice(start, end)
+}
+const REUSE_REQUIREMENTS = [
+  'collect all missing scopes and subscriptions before following **Update and reinstall an existing app**',
+  'linked below, for one reinstall',
+  ...REUSE_SCOPES.map(code), ...MEMBERSHIP_REQUIRED_SUBSCRIPTIONS.map(code),
+  'Also collect missing', 'in the same update',
+  'include them in the same scope update under **OAuth & Permissions**',
+  'subscriptions under **Event Subscriptions** too',
+  'then use the linked procedure for the single reinstall',
+]
+function reuseProblems(doc: string): string[] {
+  const text = flat(reuseParagraphs(doc))
+  // Quoted diagnostic headings describe symptoms, and the task title is a referral.
+  // Only the two explicit referrals may otherwise mention reinstalling here.
+  const diagnosticTitles = debugSkillHeadings.map(heading => heading.replace(/^#+ /, ''))
+  const instructions = text.replace(/"([^"\n]+)"/g, (quote, title: string) => diagnosticTitles.includes(title) ? '' : quote)
+    .replace(`**${REINSTALL_HEADING.slice(3)}**`, '')
+    .replace('linked below, for one reinstall', '')
+    .replace('then use the linked procedure for the single reinstall', '')
+  return [
+    ...REUSE_REQUIREMENTS.filter(item => !text.includes(item)).map(item => `missing: ${item}`),
+    ...(instructions.match(/\bre-?install(?:ed|ing)?\b/gi) ?? []).map(item => `separate reinstall instruction: ${item}`),
+  ]
+}
+
+const newAppRequirements = [
+  'Membership setup for a new app', ...MEMBERSHIP_REQUIRED_SUBSCRIPTIONS.map(code),
+  'A fresh manifest install includes them and needs no extra reinstall', REINSTALL_LINK,
+  'Once the persona is applied and running', MEMBERSHIP_RECORD_LINK,
+  'read the authenticated installation IDs', 'inspect that exact app',
+  'record each subscription', 'then read back both states',
+]
+function newAppProblems(doc: string): string[] {
+  const app = flat(personaStep(doc, 'Slack app'))
+  return newAppRequirements.filter(item => !app.includes(item))
+}
+
+const reinstallRequirements = [
+  "For each persona's current app", UPGRADE_LINK, code('slack-app-manifest.yml'),
+  ...MEMBERSHIP_REQUIRED_SUBSCRIPTIONS.map(code), ...MEMBERSHIP_READ_SCOPES.map(code),
+  'for public channels', 'for private channels', 'other missing scopes', 'before reinstalling',
+  '**Reinstall to Workspace** once and complete it',
+  'Thread following requires no separate scope or reinstall',
+  'Once the persona is applied and running', MEMBERSHIP_RECORD_LINK,
+  'read the authenticated installation IDs, inspect that exact app/workspace',
+  `record each subscription as ${SETUP_RECORD_STATES.subscriptions.map(code).join(', ').replace(/, ([^,]+)$/, ' or $1')}`,
+  `reinstall as ${SETUP_RECORD_STATES.reinstall.map(code).join(', ').replace(/, ([^,]+)$/, ' or $1')}`,
+  'then read back both inventory and setup states with the recorded evidence',
+  'Evidence for another installation does not count',
+  `Leave anything uninspectable ${code(SETUP_RECORD_STATES.subscriptions[2])}`,
+  'a successful scan, silence or one observed event never verifies setup',
+  'Later ordinary restarts need no further reinstall',
+]
+const REINSTALL_ORDER = [
+  'Update the app from the shipped', '**Reinstall to Workspace** once and complete it',
+  'read the authenticated installation IDs', 'record each subscription',
+  'then read back both inventory and setup states',
+]
+function reinstallProblems(doc: string): string[] {
+  let section: string
+  try { section = requiredSection(doc, REINSTALL_HEADING, SKILL_FILE) }
+  catch (error) { return [String(error)] }
+  const text = flat(section)
+  let after = 0
+  return [
+    ...reinstallRequirements.filter(item => !text.includes(item)).map(item => `missing: ${item}`),
+    ...REINSTALL_ORDER.flatMap(item => {
+      const at = text.indexOf(item, after)
+      if (at < 0) return [`missing or out of order: ${item}`]
+      after = at + item.length
+      return []
+    }),
+    ...(splitFences(section).blocks.length === 0 ? [] : ['record commands must remain in the linked debug entry']),
+  ]
+}
+
+describe('membership setup: new apps and existing installations', () => {
+  test('the manifest supplies public and private read scopes', () => {
+    expect(MEMBERSHIP_READ_SCOPES).toHaveLength(2)
+  })
+  test('new installs need no extra reinstall and existing installs point to their procedure', () => {
+    expect(newAppProblems(skill)).toEqual([])
+  })
+  test('existing-app preparation collects all missing scopes and subscriptions for one linked reinstall', () => {
+    expect(REUSE_SCOPES).toHaveLength(8)
+    expect(reuseProblems(skill)).toEqual([])
+    expect(newAppProblems(skill)).toEqual([])
+  })
+  test.each(REUSE_REQUIREMENTS)('self-check: existing-app preparation cannot lose %s', item => {
+    const preparation = reuseParagraphs(skill)
+    const edited = skill.replace(preparation, flat(preparation).replaceAll(item, '') + '\n\n')
+    expect(edited).not.toBe(skill)
+    expect(reuseProblems(edited)).toContain(`missing: ${item}`)
+  })
+  test.each([
+    'The app must gain them and be re-installed.',
+    'Add both the same way, then re-install.',
+    'Then re-install the app to the workspace.',
+    'Choose Reinstall to Workspace now.',
+  ])('self-check: existing-app preparation rejects a separate action: %s', instruction => {
+    const preparation = reuseParagraphs(skill)
+    const edited = skill.replace(preparation, `${preparation}${instruction}\n\n`)
+    expect(reuseProblems(edited).some(problem => problem.startsWith('separate reinstall instruction:'))).toBe(true)
+  })
+  test('self-check: dropping the existing-app pointer fails the new-app check', () => {
+    const app = personaStep(skill, 'Slack app')
+    const edited = skill.replace(app, app.replace(REINSTALL_LINK, ''))
+    expect(edited).not.toBe(skill)
+    expect(newAppProblems(edited)).toContain(REINSTALL_LINK)
+  })
+  test('the task section orders update, reinstall, authenticated record and readback', () => {
+    expect(reinstallProblems(skill)).toEqual([])
+  })
+  test('self-check: removing the task section fails', () => {
+    const edited = skill.replace(REINSTALL_HEADING, '## Retired setup task')
+    expect(reinstallProblems(edited).length).toBeGreaterThan(0)
+  })
+  test.each(REINSTALL_ORDER.slice(0, -1))('self-check: moving %s to the end fails the order check', item => {
+    const section = flat(requiredSection(skill, REINSTALL_HEADING, SKILL_FILE))
+    const edited = `${REINSTALL_HEADING}\n${section.replace(item, '')} ${item}`
+    expect(reinstallProblems(edited)).toContain(`missing or out of order: ${REINSTALL_ORDER[REINSTALL_ORDER.indexOf(item) + 1]}`)
+  })
+  test.each(reinstallRequirements)('self-check: the reinstall section cannot lose %s', item => {
+    const section = flat(requiredSection(skill, REINSTALL_HEADING, SKILL_FILE))
+    const edited = `${REINSTALL_HEADING}\n${section.replace(item, '')}`
+    expect(edited).not.toBe(`${REINSTALL_HEADING}\n${section}`)
+    expect(reinstallProblems(edited)).toContain(`missing: ${item}`)
+  })
+  test('self-check: duplicating record commands in the task section fails', () => {
+    const section = requiredSection(skill, REINSTALL_HEADING, SKILL_FILE)
+    expect(reinstallProblems(`${REINSTALL_HEADING}\n${section}\n\n\`\`\`sh\ncurl ${MEMBERSHIP_READINESS_ROUTE}\n\`\`\``))
+      .toContain('record commands must remain in the linked debug entry')
+  })
+
+  const setupRecord = (
+    subscription: MembershipSetupInput['subscriptions'][typeof MEMBERSHIP_REQUIRED_SUBSCRIPTIONS[number]],
+    reinstall: MembershipSetupInput['reinstall'],
+  ): MembershipSetupInput => ({
+    installation: { teamId: 'T0TEST001', appId: 'A0TEST001', botUserId: 'U0TEST001', botId: 'B0TEST001' },
+    subscriptions: Object.fromEntries(MEMBERSHIP_REQUIRED_SUBSCRIPTIONS.map(event => [event, subscription])) as MembershipSetupInput['subscriptions'],
+    reinstall,
+  })
+  test.each([...SETUP_RECORD_STATES.subscriptions])('documented subscription evidence %s is accepted by the record parser', value => {
+    const record = setupRecord(value, SETUP_RECORD_STATES.reinstall[0])
+    const parsed = parseMembershipSetupInput(record)
+    assertNoLeak({ record, parsed })
+    expect(parsed).toEqual(record)
+  })
+  test.each([...SETUP_RECORD_STATES.reinstall])('documented reinstall evidence %s is accepted by the record parser', value => {
+    const record = setupRecord(SETUP_RECORD_STATES.subscriptions[0], value)
+    const parsed = parseMembershipSetupInput(record)
+    assertNoLeak({ record, parsed })
+    expect(parsed).toEqual(record)
+  })
+  test.each([...MEMBERSHIP_REQUIRED_SUBSCRIPTIONS, 'reinstall'])('an undocumented %s evidence value is rejected', field => {
+    const record = setupRecord(SETUP_RECORD_STATES.subscriptions[0], SETUP_RECORD_STATES.reinstall[0])
+    const invalid = field === 'reinstall' ? { ...record, reinstall: 'assumed' }
+      : { ...record, subscriptions: { ...record.subscriptions, [field]: 'assumed' } }
+    const parsed = parseMembershipSetupInput(invalid)
+    assertNoLeak({ record: invalid, parsed })
+    expect(parsed).toBeUndefined()
+  })
+
+  test('verification and summary distinguish inventory from recorded current-app setup', () => {
+    const check = takesEffect()
+    expect(check).toContain(MEMBERSHIP_RECORD_LINK)
+    expect(check).toContain('report `inventory.state` separately from `setup.state`')
+    expect(check).toContain('recorded subscription evidence and reinstall status for its current app')
+    expect(check).toContain('A reply does not prove complete inventory or verified subscription/reinstall setup')
+    const summary = flat(requiredSection(skill, titled(3, 'Summary'), SKILL_FILE))
+    expect(summary).toContain('membership inventory state')
+    expect(summary).toContain('separately, current-app setup state')
+    expect(summary).toContain('recorded subscription evidence and reinstall status')
+    expect(summary).toContain('no current-app record exists or a value remains unknown')
+    expect(sentenceUnits(check + '\n\n' + summary).filter(sentence => /\b(?:a |the )?reply (?:proves|verifies|confirms)\b/i.test(sentence))).toEqual([])
+  })
 })
 const modeRequirements: Array<[string, RegExp]> = [
   ['the setting name', /`channel_mode`/],
@@ -314,6 +514,19 @@ describe("setup wizard: rotating a persona's tokens", () => {
   })
 })
 
+/** Relative Markdown links resolve from the wizard, with GitHub heading anchors. */
+function brokenRepoLinks(text: string): string[] {
+  const targets = [...splitFences(text).prose.matchAll(/\]\(([^)\s]+)\)/g)].map(match => match[1])
+  return targets.filter(target => {
+    if (/^(?:[a-z][a-z0-9+.-]*:|\/\/|\/)/i.test(target)) return false
+    const [path, anchor] = target.split('#')
+    if (!path) return false // Same-file links have their own check below.
+    const file = resolve(REPO_ROOT, dirname(SKILL_FILE), decodeURIComponent(path))
+    if (!existsSync(file) || !statSync(file).isFile()) return true
+    return anchor !== undefined && !headingAnchors(readFileSync(file, 'utf-8')).includes(decodeURIComponent(anchor))
+  })
+}
+
 describe('setup wizard: cross-references resolve', () => {
   const allTitles = [...[...userDocHeadings.values()].flat(), ...debugSkillHeadings]
 
@@ -340,6 +553,19 @@ describe('setup wizard: cross-references resolve', () => {
     const links = [...skill.matchAll(/\]\(#([^)\s]+)\)/g)].map((m) => m[1])
     expect(links.length).toBeGreaterThan(0)
     expect(links.filter((a) => !anchors.includes(a))).toEqual([])
+  })
+
+  test('every relative repository link names an existing file and heading', () => {
+    expect(brokenRepoLinks(skill)).toEqual([])
+  })
+  test.each([
+    '../../docs/migration.md#missing-upgrade-heading',
+    '../../docs/missing-upgrade-page.md',
+    '../debug-slack-channel-bots/SKILL.md#missing-membership-record',
+  ])('self-check: a broken repository target %s fails', target => {
+    const edited = skill.replace(UPGRADE_LINK, `(${target})`)
+    expect(edited).not.toBe(skill)
+    expect(brokenRepoLinks(edited)).toEqual([target])
   })
 
   test.each(['skills/debug-slack-channel-bots/SKILL.md', 'skills/install-cscb/SKILL.md', 'skills/EXAMPLE_CLAUDE.md', 'slack-app-manifest.yml'])(

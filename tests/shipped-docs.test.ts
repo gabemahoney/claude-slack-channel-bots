@@ -429,6 +429,17 @@ import {
   channelDeliveryCurrentFactsText,
 } from '../src/registry.ts'
 import { TAG_DESCRIPTION } from '../src/tag-description.ts'
+import {
+  buildThreadMemoryNotSavedNotice, buildThreadMemoryUnreadableNotice,
+  buildThreadMemoryJoinsLostNotice, buildThreadMemoryChangedWhileStoppedNotice,
+  buildThreadMemoryRecoveredNotice,
+} from '../src/thread-memory-reports.ts'
+import {
+  buildSharedStateUnresolvedNotice, buildMembershipEvidenceUnresolvedNotice,
+  buildSharedStateRecoveredNotice,
+} from '../src/shared-state-reports.ts'
+import { APPLY_FILE_SUFFIX, PENDING_FILE_SUFFIX } from '../src/reload.ts'
+import { REVIEW_REQUEST_SUFFIX } from '../src/reload-request.ts'
 import { RELOAD_NOOP } from '../src/reload-apply.ts'
 import {
   buildChangePlan,
@@ -3729,9 +3740,12 @@ describe(`the switch-over runbook, "${PHASE1_RUNBOOK_SECTION_TITLE}"`, () => {
       expect(upgrading()).toMatch(pattern)
     })
 
-    test(`"${UPGRADING_HEADING}" says step 1 writes these steps into the separate staged file, not config.json, and step 7 puts it in place as config.json`, () => {
-      expect(upgrading()).toMatch(ci('at switch-over step 1, these steps are written into the separate staged file, not `config.json`'))
-      expect(upgrading()).toMatch(ci('step 7 puts that file in place as `config.json`'))
+    test(`"${UPGRADING_HEADING}" assigns preparation to the staged file and placement to the switch-over runbook`, () => {
+      expect(linkTexts(upgrading())).toContain('do steps 1, 2, 3, 5 and 6 in the separate staged file at switch-over step 1')
+      expect(linkTexts(upgrading())).toContain('do steps 4, 7 and 8 at switch-over step 7')
+      // Placement still belongs to the linked runbook, whose steps are audited above.
+      expect(upgrading()).toContain('That runbook places the files')
+      expect(flat(readmeCarrier().steps[6])).toContain('config.json')
     })
 
     test.each([1, 7])(`"${UPGRADING_HEADING}" links switch-over step %d`, (n) => {
@@ -6493,14 +6507,14 @@ const README_NOTICE_ROWS: readonly DocRow[] = [
   ]],
 
   // Migration, beside the runbooks.
-  ["Migration: the find-missing job runs as the workers' user and resolves their tmux socket (C7, C19)", sectionOf(USER_DOCS_NAME, MIGRATION_HEADING), [
-    ci("the job must run as the workers' user and resolve their tmux socket"),
-    ci('the socket switch-over step 1 pins'),
+  ["Migration: the find-missing job runs as the workers' user on the pinned tmux socket", sectionOf(RUNBOOK_DOC, /^#### .*Schedule the daily expire$/), [
+    ci("as the workers' user in the tmux environment step 1 pinned"),
+    ci('running both `agent-director find-missing` on a schedule'),
   ]],
   ["Migration: a host that follows the switch-over runbook runs a periodic sweep, which switch-over step 11 (linked) adds where the host has none; it runs as a cron entry, a systemd timer or a loop script, the runbook's sweep schedule", sectionOf(USER_DOCS_NAME, MIGRATION_HEADING), [
-    ci('a host that follows the switch-over runbook runs one'),
-    '[switch-over step 11](#step-11-schedule-the-daily-expire) adds it where the host has none',
-    ci("run it as a cron entry, a systemd timer or a loop script (the switch-over runbook calls this the host's sweep schedule)"),
+    ci('sweep is optional for CSCB recovery'),
+    '[switch-over step 11](#step-11-schedule-the-daily-expire) schedules one where the host has none',
+    ci("The host's sweep schedule can be a cron entry, systemd timer or loop script"),
   ]],
 
   // Destructive changes: the retired persona, no delete, checked kills.
@@ -7751,6 +7765,23 @@ const DM_ENABLED = `${DM_KEY}.${'enabled' satisfies (typeof PERSONA_DM_KEYS)[num
 const INVITED_DESTINATION = `${REMOVED_SECTION_KEY}.${INVITED_DESTINATION_KEY}`
 const MENTIONS = 'mentions' satisfies (typeof DELIVERY_MODES)[number]
 const ALL = 'all' satisfies (typeof DELIVERY_MODES)[number]
+const OFF = 'off' satisfies (typeof DELIVERY_MODES)[number]
+const THREAD_HYBRID = 'thread_hybrid' satisfies (typeof DELIVERY_MODES)[number]
+const THREAD_VIA = 'thread' satisfies Via
+const RESUME_KEY = 'resume_enabled' satisfies (typeof PERSONA_TOP_LEVEL_KEYS)[number]
+const QUEUED_ACK_KEY = 'queued_ack_reaction' satisfies (typeof PERSONA_TOP_LEVEL_KEYS)[number]
+// Retired names have no public source constant; the current authority is CHANNEL_DELIVERY_FILE_NAME.
+const LEGACY_DELIVERY_FILE = 'channel-delivery.json'
+const REMOVED_MODE_KEY = 'allow_invited_channels'
+const UPGRADE_HEADING = '### Upgrading from 0.18.x'
+const UPGRADE_ANCHOR = headingSlug(UPGRADE_HEADING.replace(/^#+ /, ''))
+const REINSTALL_ANCHOR = headingSlug('Update and reinstall an existing app')
+const CONFIG_REVIEW_FILES = [CONFIG_FILE_NAME, CHANNEL_DELIVERY_FILE_NAME,
+  ...[REVIEW_REQUEST_SUFFIX, PENDING_FILE_SUFFIX, APPLY_FILE_SUFFIX].map(suffix => CONFIG_FILE_NAME + suffix)]
+const memoryNotSavedTitle = () => noticeTitle(buildThreadMemoryNotSavedNotice('persona', [], '/memory', 'write', 'unavailable'))
+const memoryUnreadableTitle = () => noticeTitle(buildThreadMemoryUnreadableNotice('persona', [], '/memory'))
+const memoryRecoveredTitle = () => noticeTitle(buildThreadMemoryRecoveredNotice('persona', []))
+const memoryChangedTitle = () => noticeTitle(buildThreadMemoryChangedWhileStoppedNotice('persona', [], 'unclean'))
 const RECEIVE_ALL_SHARED = 'receive_all_shared' satisfies Via
 /** `"dm"`, as the README writes the destination value in a code span. */
 const DM_VALUE = code(JSON.stringify(DM_DESTINATION))
@@ -7789,9 +7820,90 @@ const downgradeStep = (n: number) => (readme: string) => {
   return step
 }
 
-/** R55's four phases replace the old fungible-only downgrade recipe. */
+/** A numbered procedure step, including nested bullets and continuation lines. */
+const upgradeStep = (n: number) => (text: string): string => {
+  const steps = requiredSection(text, UPGRADE_HEADING, RUNBOOK_DOC).split(/\n(?=\d+\. )/).slice(1)
+  const step = steps[n - 1]
+  if (step === undefined || !step.startsWith(`${n}. `)) throw new Error(`upgrade has no step ${n} in place`)
+  return flat(step)
+}
+
+const UPGRADE_ROWS: readonly DocRow[] = [
+  ['Upgrade: stop old writes before installing or preparing', upgradeStep(1), [
+    ci('Disable autostart'), code(`claude-slack-channel-bots ${CLI_COMMAND_STOP_BOTS}`), ci("old package's"),
+    ci('verify it succeeds before installing'), ci('without starting it'), ci('Keep services and bots stopped'),
+  ]],
+  ['Upgrade: preserve old files and pending intent as manual references', upgradeStep(2), [
+    ci('outside the state directory'), ...[CONFIG_FILE_NAME, CHANNEL_DELIVERY_FILE_NAME, LEGACY_DELIVERY_FILE, CONFIG_FILE_NAME + PENDING_FILE_SUFFIX].map(code),
+    ci('edited, unconfirmed'), ci('keeping their bytes and dates'), ci('manual references only'),
+    ci(`this release never reads ${code(LEGACY_DELIVERY_FILE)}`), ci('refuses removed configuration keys'),
+    CONFIGURATION_REJECTIONS_LINK,
+  ]],
+  ['Upgrade: prepare both baseline files before the first start', upgradeStep(3), [
+    ci('Start from the preserved applied configuration'),
+    ci(`(${code(CHANNEL_DELIVERY_FILE_NAME)}) when present, otherwise the preserved ${code(CONFIG_FILE_NAME)}`),
+    ci('retaining its unrelated settings and defaults'),
+    ci('same complete current-format configuration'), code(CONFIG_FILE_NAME), code(CHANNEL_DELIVERY_FILE_NAME),
+    ci('before the first start'), ci('adopted as the applied baseline'), ci('Keep the reference copies untouched'),
+  ]],
+  ['Upgrade: choose the mode and transfer or retire every old choice deliberately', upgradeStep(3), [
+    code(`${MODE_SWITCH_SETTING}: "strict"`), code('"open"'), ci('whatever the starting mode'),
+    ci('For every channel in either old source'), ci('deliberately transfer its value'),
+    ci(`that configuration or the preserved reference ${code(LEGACY_DELIVERY_FILE)}`),
+    ci(`one shared ${code(CHANNELS_KEY)} list or retire it, including ${code(OFF)}`),
+    ci('never infer writer order from file dates'), ci('active in strict mode once membership is verified'),
+    ci(`explicit ${code(OFF)} stays silent`),
+  ]],
+  ['Upgrade: join defaults and another persona destination keep their meaning', upgradeStep(3), [
+    ci('unlisted, newly verified member'), ci(`${code(OFF)} in strict or ${code(MENTIONS)} in open`),
+    ci("another persona's destination channel applies as written"),
+  ]],
+  ['Upgrade: choose one explicit permission destination', upgradeStep(3), [
+    ci(`one ${code(PROMPTS_KEY)} destination per persona when old destinations differ`),
+    ci('everyone in the chosen channel sees its prompts and notices'), code(DM_CONTACT),
+    ci('formerly implicit DM now needs explicit'), code(`${PROMPTS_KEY}: "${DM_DESTINATION}"`),
+    code(`${DM_ENABLED}: true`), ci('a channel destination must be listed'),
+  ]],
+  ['Upgrade: resolve inactive identities and start with no joined threads', upgradeStep(3), [
+    ci('every reference from an inactive, removed or renamed persona, or another app identity'),
+    ci('an explicit disposition'), ci('nothing is inherited silently'), code(THREAD_HYBRID), ci('upgrade carries no Joined Threads'),
+  ]],
+  ['Upgrade: pending edits stay separate and queues retain accepted facts', upgradeStep(3), [
+    ci(`set aside the edited ${code(CONFIG_FILE_NAME)}'s unconfirmed differences as pending intent before reconciling channel choices`),
+    ci('pending channel, mode, credential-location and unrelated edits separately for later review'),
+    ci('starting confirms none of them'), ci('Leave queues in place'), ci('original text, queued emoji and reminder facts'),
+  ]],
+  ['Upgrade: refuse and correct invalid or interrupted preparation without changing state', upgradeStep(4), [
+    ci('interrupted pair'), ci('invalid value or destination'), ci('removed key can refuse the start'),
+    ci('without changing the baseline or queues'), ci('error identifies the invalid setting'),
+    ci('removed-key error names its replacement'), ci('Correct both baseline files and retry'),
+    ci('unreadable old reference requires an explicit replacement choice'),
+  ]],
+  ['Upgrade: update and reinstall each existing app once with recorded verification', upgradeStep(5), [
+    ci('every existing app and reinstall once'), code('slack-app-manifest.yml'), ...MEMBERSHIP_REQUIRED_SUBSCRIPTIONS.map(code),
+    `(${relative('docs', WIZARD_FILE)}#${REINSTALL_ANCHOR})`, ci('Inspect the current app'),
+    ci('once its persona runs, record that evidence'), ci('read back setup and inventory separately'),
+    ci('new manifest install needs no extra reinstall'),
+  ]],
+  ['Upgrade: startup catches up membership with both downtime outcomes', upgradeStep(6), [
+    code('claude-slack-channel-bots start'), ci('then re-enable autostart'),
+    ci('Startup membership catch-up'), ci('changes while stopped and memberships neither old source held'),
+    ci('A leave still absent at start is found'), ci('a leave and rejoin wholly during downtime'),
+    ci('with no evidence of absence, is not reconstructed'), ci('channel keeps its value'),
+    ci('record and readback on the running persona'),
+  ]],
+  ['Upgrade: restore pending edits through ordinary preview and confirmation', upgradeStep(7), [
+    ci('Restore wanted pending edits as ordinary edits'), ci('read the new preview and confirm it'),
+    '(reload.md#editing-the-configuration)', '(reload.md#confirming-a-change)',
+  ]],
+]
+
+/** Four ordered phases retain the current files and restore the earlier baseline. */
 const R55_DOWNGRADE_ROWS: readonly DocRow[] = [
   ['Downgrading: step 1 stops intake and drains received items, or explicitly accepts loss', downgradeStep(1), [
+    ci(`change every ${code(THREAD_HYBRID)} channel to another delivery value and confirm`),
+    () => ci(`wait until every *${memoryNotSavedTitle()}* or *${memoryUnreadableTitle()}* report has been followed by *${memoryRecoveredTitle()}*`),
+    ci(`then restart once with ${code(`claude-slack-channel-bots ${CLI_COMMAND_CLEAN_RESTART} --server`)} to tidy the queues at start`),
     /stop sending/i, /server\.log/, /every received (?:item|message)[^.]*delivered/i,
     /(?:accept|accepting)[^.]*undelivered messages[^.]*lost/i,
   ]],
@@ -7805,6 +7917,36 @@ const R55_DOWNGRADE_ROWS: readonly DocRow[] = [
   ['Downgrading: step 4 starts fresh with channels before restoring and confirming resume', downgradeStep(4), [
     /start[^.]*(?:earlier|older|previous) release/i, /(?:new|fresh) conversation/i, /channels/,
     /`resume_enabled`[^.]*(?:back|`true`)[^.]*confirm/i,
+  ]],
+]
+
+const DOWNGRADE_STATE_ROWS: readonly DocRow[] = [
+  ['Downgrading: restore the earlier format from preserved upgrade references', readmeSection(DOWNGRADE_HEADING), [
+    ci(`cannot use ${code(MODE_SWITCH_SETTING)}, the shared list or ${code(THREAD_HYBRID)}`),
+    ci('restore its configuration and applied baseline'), `(#${UPGRADE_ANCHOR})`,
+    ci('references contain no changes made since the upgrade'),
+    ci(`${code(LEGACY_DELIVERY_FILE)} is a stale preserved reference that the current release never reads`),
+  ]],
+  ['Downgrading: keep current files and restore validated old copies while stopped', downgradeStep(3), [
+    ci('While stopped, save the current'), ...CONFIG_REVIEW_FILES.map(code),
+    ci('outside the state directory for upgrading again'), ci('Prepare copies of the old references'),
+    code(`${RESUME_KEY}: false`), ci("phase 2's settings precautions"),
+    ci('validate them with the earlier release'), ci(`restore them as ${code(CONFIG_FILE_NAME)} and ${code(CHANNEL_DELIVERY_FILE_NAME)}`),
+    ci('keep the current request, pending and apply files out of the state directory'),
+  ]],
+  ['Downgrading: keep the queued reaction precaution for targets without it', readmeSection(DOWNGRADE_HEADING), [
+    ci(`If the target release does not support ${code(QUEUED_ACK_KEY)}, remove it from ${code(CONFIG_FILE_NAME)}`),
+    ci(`confirm while the current server is running, and verify it is absent from ${code(CHANNEL_DELIVERY_FILE_NAME)}`),
+  ]],
+  ['Downgrading: earlier releases leave memory files and deliver waiting replies as ordinary messages', readmeSection(DOWNGRADE_HEADING), [
+    ci('earlier release ignores Thread Memory and leaves its files alone'),
+    ci('delivers as ordinary messages replies still waiting for a thread decision'),
+    ci('or decided since the queue was last tidied'),
+    ci("sets aside those decisions' records as unreadable"), ci('logs each in `server.log`, with no alert'),
+  ]],
+  ['Downgrading: upgrading again restores current inputs and reports changed memory', readmeSection(DOWNGRADE_HEADING), [
+    ci('Before upgrading again, stop with the bots and restore the saved current configuration, applied baseline and pending inputs'),
+    () => ci(`reports *${memoryChangedTitle()}* on upgrading again`),
   ]],
 ]
 
@@ -8125,7 +8267,9 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci('Neither mode serves a malformed channel ID'),
     ci(`${code(CONFIG_FILE_NAME)} can't list such an ID either, so neither mode serves it`),
   ]],
-...R55_DOWNGRADE_ROWS
+...UPGRADE_ROWS,
+...R55_DOWNGRADE_ROWS,
+...DOWNGRADE_STATE_ROWS,
 ]
 
 /** The setup wizard's step on how a change takes effect, found by its title, whatever its number. */
@@ -8198,6 +8342,7 @@ const README_DEO_PLACEMENTS: readonly Placement[] = [
     parent: THREADS_HEADING,
     previous: i === 0 ? THREADS_HEADING : THREADS_SUBSECTIONS[i - 1],
   })),
+  { heading: UPGRADE_HEADING, parent: MIGRATION_HEADING, previous: ROLLBACK_HEADING, next: `### ${UPGRADING_TITLE}` },
   { heading: DOWNGRADE_HEADING, parent: MIGRATION_HEADING, previous: `### ${UPGRADING_TITLE}` },
 ]
 
@@ -9183,7 +9328,7 @@ describe('R55: documented downgrade matches the executed safety barriers', () =>
   })
 
   const documentedPhases = `${DOWNGRADE_HEADING}\n
-1. Stop sending; wait until server.log shows every received item delivered, or accept that undelivered messages are lost.
+1. Stop sending; change every ${code(THREAD_HYBRID)} channel to another delivery value and confirm; wait until every *${memoryNotSavedTitle()}* or *${memoryUnreadableTitle()}* report has been followed by *${memoryRecoveredTitle()}*; then restart once with ${code(`claude-slack-channel-bots ${CLI_COMMAND_CLEAN_RESTART} --server`)} to tidy the queues at start. Wait until server.log shows every received item delivered, or accept that undelivered messages are lost.
 2. On the current release set \`resume_enabled\` to \`false\`, confirm the change and check last-applied.
 3. Run \`claude-slack-channel-bots stop --stop-bots\`, install the earlier build, and restore the Claude Code pin.
 4. Start the earlier release in a fresh conversation with channels; set \`resume_enabled\` back and confirm the change.
@@ -9255,18 +9400,16 @@ describe('R55: documented downgrade matches the executed safety barriers', () =>
     expect(lacking(edited, [pattern])).toHaveLength(1)
   })
 
-  test('schema precautions are conditional on the older target, without an install-and-resume shortcut', () => {
+  test('schema restoration uses preserved references without an install-and-resume shortcut', () => {
+    for (const [element, passage, required] of DOWNGRADE_STATE_ROWS) {
+      expect({ element, problems: docRowProblems(passage, required, operatorText(RUNBOOK_DOC)) }).toEqual({ element, problems: [] })
+    }
     const text = flat(requiredSection(operatorText(RUNBOOK_DOC), DOWNGRADE_HEADING, RUNBOOK_DOC))
-    expect(text).toMatch(/(?:if|when)[^.]*(?:target|release|build)[^.]*(?:reject|support|understand)/i)
-    expect(text).toContain('`allow_invited_channels`')
-    expect(text).toContain('`invited`')
-    expect(text).toMatch(/valid declarative (?:section|configuration)/i)
-    expect(text).toMatch(/remov\w*[^.]*`allow_invited_channels`[^.]*`invited`/i)
-    expect(text).toMatch(/last-applied[^.]*(?:neither|without)|(?:neither|without)[^.]*last-applied/i)
     expect(text).not.toMatch(/An earlier release's loader rejects/)
     expect(text).not.toMatch(/never held either key[^.]*install the older build and restart/i)
     const step4 = downgradeStep(4)(operatorText(RUNBOOK_DOC))
     expect(step4).toMatch(/start[^.]*(?:fresh|new conversation)[\s\S]*resume_enabled[\s\S]*confirm/i)
+    expect(step4).not.toContain(LEGACY_DELIVERY_FILE)
   })
 
   test('the maintained downgrade copy matches word for word, with only its intro and relative links normalised', () => {
@@ -9297,4 +9440,215 @@ test.each(MEMBERSHIP_RECORD_TERMS)('membership readiness manual record check det
   const example = MEMBERSHIP_RECORD_TERMS.join('\n')
   expect(membershipRecordMissing(example)).toEqual([])
   expect(membershipRecordMissing(MEMBERSHIP_RECORD_TERMS.filter(value => value !== term).join('\n'))).toContain(term)
+})
+
+/** Find the shared-channel release by its content, so publishing can rename its heading. */
+function sharedReleaseEntry(changelog: string): string {
+  const entries = headings(changelog).filter(h => h.level === 2)
+    .map(h => requiredSection(changelog, h.text, CHANGELOG_FILE))
+    .filter(entry => headings(entry).some(h => h.text === '### Shared channels and threads'))
+  if (entries.length !== 1) throw new Error(`expected one shared-channel release entry, found ${entries.length}`)
+  return entries[0]
+}
+
+const SHARED_RELEASE_ROWS: readonly DocRow[] = [
+  ['removed keys fail at load and name their replacements', sharedReleaseEntry, [
+    code(REMOVED_MODE_KEY), code(REMOVED_SECTION_KEY), ci('cause load errors naming'),
+    code(MODE_SWITCH_SETTING), code(PROMPTS_KEY), ci('as their replacements'),
+    code(CONFIG_FILE_NAME), code(CHANNEL_DELIVERY_FILE_NAME), ci('no automatic conversion'),
+    `(${RUNBOOK_DOC}#${UPGRADE_ANCHOR})`,
+  ]],
+  ['the old delivery file is ignored and retained for rollback', sharedReleaseEntry, [
+    ci(`${code(LEGACY_DELIVERY_FILE)} is ignored`),
+    ci('Keep it until rollback is no longer wanted, because the previous CSCB reads it'),
+    ci('preserved copy only as a manual reference'),
+  ]],
+  ['existing apps need one manifest update and reinstall with current verification', sharedReleaseEntry, [
+    ci('Every existing Slack app needs one manifest update and reinstall'),
+    ...MEMBERSHIP_REQUIRED_SUBSCRIPTIONS.map(code),
+    ci('Record and read back verification for the current installation'),
+    `(${WIZARD_FILE}#${REINSTALL_ANCHOR})`,
+    ci('New manifest installs need no extra reinstall; ordinary restarts need none'),
+  ]],
+  ['the removed destination guard leaves choices effective as written', sharedReleaseEntry, [
+    ci('destination loop guard is removed'), ci("delivery value applies as written in another persona's destination channel"),
+  ]],
+  // Tool and parameter names are inline in registry.ts; it exports descriptions, not a name list.
+  ['thread delivery and whole-thread reading name their public controls', sharedReleaseEntry, [
+    code(THREAD_HYBRID), code(`via="${THREAD_VIA}"`), code('fetch_messages'), code('thread_ts'), code('cursor'), ci('read the whole thread'),
+  ]],
+  ['thread memory and shared-state reports name the source titles', sharedReleaseEntry, [
+    ...[memoryNotSavedTitle, memoryUnreadableTitle, memoryChangedTitle, memoryRecoveredTitle,
+      () => noticeTitle(buildThreadMemoryJoinsLostNotice({ name: 'persona', key: 'persona' }, { threads: [], messages: [] }).text),
+      () => noticeTitle(buildSharedStateUnresolvedNotice('persona', { channels: [] }, 'unsynced', '/authority')),
+      () => noticeTitle(buildMembershipEvidenceUnresolvedNotice('persona', { channels: [] }, { problem: 'deadline' })),
+      () => noticeTitle(buildSharedStateRecoveredNotice('persona', { channels: [] }, 'repair')),
+    ].map(title => () => code(title())),
+  ]],
+  ['tag descriptions quote the changed source lines', sharedReleaseEntry, [
+    () => {
+      const line = TAG_DESCRIPTION.split('\n').find(line => line.startsWith(`- via="${THREAD_VIA}"`))
+      if (!line) throw new Error('tag description has no thread line')
+      return code(line.slice(2))
+    },
+    () => {
+      const line = TAG_DESCRIPTION.match(/BODY carries [^:]+/)
+      if (!line) throw new Error('tag description has no BODY clause')
+      return code(line[0])
+    },
+  ]],
+  ['downgrade actions precede draining and keep both configurations', sharedReleaseEntry, [
+    ci(`change every ${code(THREAD_HYBRID)} channel to another value and confirm`),
+    ci('wait for Thread Memory recovery'), ci('then restart once to tidy queues before draining them'),
+    ci('Restore the earlier configuration from preserved references while stopped'),
+    ci('retaining the current files for upgrading again'), `(${RUNBOOK_DOC}#${headingSlug(DOWNGRADE_HEADING.slice(4))})`,
+  ]],
+]
+
+/** These passages read README.md itself; other pages cannot satisfy a pointer. */
+const README_UPGRADE_ROWS: readonly DocRow[] = [
+  ['prerequisites link the manual upgrade for existing installations', sectionOf('README.md', PREREQUISITES_HEADING), [
+    ci('For an existing installation'), `(${RUNBOOK_DOC}#${UPGRADE_ANCHOR})`,
+  ]],
+  ['the wizard pointer requires one existing-app update and reinstall', sectionOf('README.md', '## Quick Start'), [
+    ci('An existing app needs one manifest update and reinstall'), `(${WIZARD_FILE}#${REINSTALL_ANCHOR})`,
+    ci('current-app verification and readback'),
+  ]],
+  ['the Migration table row names the manual upgrade and rollback', tableRowOf('## Documentation', '[Migration]'), [
+    ci('Install this release over an earlier one'), ci('manual upgrade'), `(${RUNBOOK_DOC}#${UPGRADE_ANCHOR})`, ci('roll it back'),
+  ]],
+  ['the Channel modes table row names both modes and the shared list', tableRowOf('## Documentation', '[Channel modes]'), [
+    '(docs/channel-modes.md)', ci('strict or open mode'), ci('one shared channel list'), ci('who can reach a persona in open mode'),
+  ]],
+  ['the first configuration names every delivery value', unitOf('README.md', '## A first configuration', `- ${code(CHANNELS_KEY)}`), [
+    ci('shared list in both modes'), ...DELIVERY_MODES.map(code),
+  ]],
+]
+
+function orderedTextProblems(text: string, items: readonly RegExp[]): string[] {
+  let after = 0
+  return items.flatMap(item => {
+    const match = item.exec(text.slice(after))
+    if (!match) return [`missing or out of order: ${String(item)}`]
+    after += match.index + match[0].length
+    return []
+  })
+}
+
+const DOWNGRADE_PRE_DRAIN = [
+  ci(`change every ${code(THREAD_HYBRID)} channel to another delivery value and confirm`),
+  ci(`wait until every *${memoryNotSavedTitle()}* or *${memoryUnreadableTitle()}* report has been followed by *${memoryRecoveredTitle()}*`),
+  ci(`then restart once with ${code(`claude-slack-channel-bots ${CLI_COMMAND_CLEAN_RESTART} --server`)}`),
+  ci('every received item delivered'),
+]
+
+function legacyDeliveryReferenceProblems(text: string): string[] {
+  return textUnits(text).filter(unit => unit.includes(LEGACY_DELIVERY_FILE)
+    && !/(?:preserved|stale) reference|(?:this|current) release (?:never reads|does(?:n't| not) read)/i.test(unit))
+}
+
+describe('the manual upgrade and release guidance', () => {
+  test.each([
+    ['prepare both baseline files', 'Start from the preserved applied configuration', 'Start from the edited configuration'],
+    ['prepare both baseline files', `when present, otherwise the preserved ${code(CONFIG_FILE_NAME)}`, 'even when absent'],
+    ['prepare both baseline files', 'retaining its unrelated settings and defaults', 'resetting its unrelated settings and defaults'],
+    ['choose the mode and transfer', `that configuration or the preserved reference ${code(LEGACY_DELIVERY_FILE)}`, `the edited configuration or the preserved reference ${code(LEGACY_DELIVERY_FILE)}`],
+    ['pending edits stay separate', `set aside the edited ${code(CONFIG_FILE_NAME)}'s unconfirmed differences as pending intent before reconciling channel choices`, `apply the edited ${code(CONFIG_FILE_NAME)}'s unconfirmed differences while reconciling channel choices`],
+  ])('self-check: upgrade %s rejects reversed baseline or pending intent', (prefix, from, to) => {
+    const row = UPGRADE_ROWS.find(([element]) => element.startsWith(`Upgrade: ${prefix}`))!
+    const text = operatorText(RUNBOOK_DOC)
+    const edited = text.replace(from, to)
+    expect(edited).not.toBe(text)
+    expect(row[1](edited)).toContain(to)
+    expect(docRowProblems(row[1], row[2], edited).length).toBeGreaterThan(0)
+  })
+
+  test('the upgrade has exactly seven ordered preparation, verification and start steps', () => {
+    const text = operatorText(RUNBOOK_DOC)
+    const numbers = requiredSection(text, UPGRADE_HEADING, RUNBOOK_DOC).match(/^\d+(?=\. )/gm)
+    expect(numbers).toEqual(['1', '2', '3', '4', '5', '6', '7'])
+    for (const [, passage, required] of UPGRADE_ROWS) expect(docRowProblems(passage, required, text)).toEqual([])
+  })
+
+  test.each([1, 2, 3, 4, 5, 6])('self-check: swapping upgrade steps %s and its successor fails their rows', n => {
+    const text = operatorText(RUNBOOK_DOC)
+    const body = requiredSection(text, UPGRADE_HEADING, RUNBOOK_DOC)
+    const parts = body.split(/\n(?=\d+\. )/)
+    const next = parts[n + 1]
+    parts[n + 1] = parts[n].replace(/^\d+\./, `${n + 1}.`)
+    parts[n] = next.replace(/^\d+\./, `${n}.`)
+    const edited = text.replace(body, parts.join('\n'))
+    expect(edited).not.toBe(text)
+    expect(UPGRADE_ROWS.flatMap(([, passage, required]) => docRowProblems(passage, required, edited)).length).toBeGreaterThan(0)
+  })
+
+  test('downgrade changes delivery, waits for recovery and restarts before draining', () => {
+    expect(orderedTextProblems(downgradeStep(1)(operatorText(RUNBOOK_DOC)), DOWNGRADE_PRE_DRAIN)).toEqual([])
+  })
+  test.each([0, 1, 2])('self-check: moving pre-drain action %s after its successor fails', i => {
+    const text = downgradeStep(1)(operatorText(RUNBOOK_DOC))
+    const action = text.match(DOWNGRADE_PRE_DRAIN[i])![0]
+    const edited = text.replace(action, '') + ` ${action}`
+    expect(orderedTextProblems(edited, DOWNGRADE_PRE_DRAIN).length).toBeGreaterThan(0)
+  })
+
+  for (const [file, rows] of [['README.md', README_UPGRADE_ROWS], [CHANGELOG_FILE, SHARED_RELEASE_ROWS]] as const) {
+    describe(file, () => {
+      test.each(rows)('%s', (element, passage, required) => {
+        expect({ element, problems: docRowProblems(passage, required, operatorText(file)) }).toEqual({ element, problems: [] })
+      })
+      test.each(rows)('self-check: %s fails for every omitted item', (element, passage, required) => {
+        const text = operatorText(file)
+        for (const item of required.map(resolveItem)) {
+          const edited = withItemCut(text, passage, item)
+          expect({ element, item: String(item), problems: docRowProblems(passage, [item], edited) })
+            .toEqual({ element, item: String(item), problems: [`lacks ${String(item)}`] })
+        }
+      })
+    })
+  }
+
+  const SHARED_RELEASE_REVERTS = [
+    ['removed keys fail', 'cause load errors naming', 'are accepted alongside'],
+    ['the old delivery file', 'is ignored', 'is the active store'],
+    ['existing apps need', 'needs one manifest update and reinstall', 'needs no manifest update or reinstall'],
+    ['the removed destination guard', 'destination loop guard is removed', 'destination loop guard still suppresses delivery'],
+    ['thread delivery', code('fetch_messages'), code('reply')],
+    ['thread memory and shared-state reports', code(memoryRecoveredTitle()), code('Storage works')],
+    ['tag descriptions', 'BODY carries the Slack text with terminal normalization', 'BODY carries the text exactly as Slack sent it'],
+    ['downgrade actions', 'then restart once to tidy queues before draining them', 'drain queues without restarting'],
+  ] as const
+  test.each(SHARED_RELEASE_REVERTS)('self-check: %s rejects reverted release wording', (prefix, from, to) => {
+    const row = SHARED_RELEASE_ROWS.find(([element]) => element.startsWith(prefix))!
+    const text = operatorText(CHANGELOG_FILE)
+    const entry = sharedReleaseEntry(text)
+    const edited = text.replace(entry, entry.replace(from, to))
+    expect(edited).not.toBe(text)
+    expect(docRowProblems(row[1], row[2], edited).length).toBeGreaterThan(0)
+  })
+
+  test('publishing the shared-channel entry and inserting an empty Unreleased keeps every release check', () => {
+    const text = operatorText(CHANGELOG_FILE)
+    const published = text.replace(/^## Unreleased$/m, '## Unreleased\n\n## 1.0.0 (2026-11-08)')
+    expect(published).not.toBe(text)
+    for (const [element, passage, required] of SHARED_RELEASE_ROWS) {
+      expect({ element, problems: docRowProblems(passage, required, published) }).toEqual({ element, problems: [] })
+    }
+  })
+
+  const deleteInstructions = (text: string) => textUnits(text).filter(unit => unit.includes(LEGACY_DELIVERY_FILE) && DELETE_WORDS.test(unit))
+  test('nothing in the changelog tells the reader to delete the old delivery file', () => {
+    expect(deleteInstructions(operatorText(CHANGELOG_FILE))).toEqual([])
+  })
+  test.each(['Delete', 'Remove', 'Erase', 'Discard', 'rm'])('self-check: %s of the old delivery file is caught outside the release entry', action => {
+    expect(deleteInstructions(`${operatorText(CHANGELOG_FILE)}\n\n${action} ${code(LEGACY_DELIVERY_FILE)}.`)).toHaveLength(1)
+  })
+
+  test.each([RUNBOOK_DOC, 'README.md'])('%s treats the old delivery file only as a reference', file => {
+    expect(legacyDeliveryReferenceProblems(operatorText(file))).toEqual([])
+  })
+  test.each([RUNBOOK_DOC, 'README.md'])('self-check: %s cannot describe the old delivery file as a current store', file => {
+    const text = `${operatorText(file)}\n\n${code(LEGACY_DELIVERY_FILE)} is the current delivery store.`
+    expect(legacyDeliveryReferenceProblems(text)).toHaveLength(1)
+  })
 })
