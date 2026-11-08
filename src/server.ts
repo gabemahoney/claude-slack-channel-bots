@@ -2949,6 +2949,7 @@ export async function main(): Promise<void> {
   threadMemorySeal = createThreadMemorySeal({
     stateDir: STATE_DIR,
     queueJournalPath: key => join(STATE_DIR, 'queue', `${key}.jsonl`),
+    onQueueJournalOpened: key => deliveryQueue?.journalOpened(key),
     appliedKeys: () => personaConfig?.personas.map(persona => persona.key) ?? [],
     threadHybrid: key => (reloadController?.sharedChannels()?.threadView().threadHybridChannels(key).length ?? 0) > 0,
     created: key => reloadController?.sharedChannels()?.threadMemoryCreated(key) ?? false,

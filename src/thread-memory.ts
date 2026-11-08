@@ -33,7 +33,7 @@ import { join } from 'node:path'
 import { createHmac, randomBytes, randomUUID } from 'node:crypto'
 import { PERSONA_KEY_RE } from './persona-identity.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from './delivery-queue.ts'
-import { durableUnlinkSync, DurableUnlinkUnsyncedError } from './atomic-write.ts'
+import { DurableUnlinkUnsyncedError } from './atomic-write.ts'
 import type { ThreadMemoryJournalFact, ThreadMemoryJournalFacts, ThreadMemorySealPort, ThreadMemoryStoreIdentity } from './thread-memory-seal.ts'
 import { createDurableJournal, splitJournalLines, removeTornTail, yieldToEventLoop, type AppendRollback } from './durable-journal.ts'
 import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS } from './delivery-constants.ts'
@@ -762,7 +762,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   function readKey(key: string, retry = false, emitRead = true): ThreadMemoryReadResult {
     const j = journal(key), wasUnknown = !j.readable
     let bytes: Buffer
-    try { bytes = fs.readFileSync(pathFor(key)) } catch (error) {
+    try { bytes = io.read(pathFor(key)) } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         if (retry) { j.missing = true; j.readable = false; return 'missing' }
         if (!wasUnknown) { j.exists = false; j.readable = true; return 'read' }
@@ -1114,7 +1114,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       if (options.canRemove?.(key) === false) return { kind: 'kept' }
       let step: 'journal-unlink' | 'seal-entry' | 'marker' = 'journal-unlink'
       try {
-        try { durableUnlinkSync(pathFor(key), fs) } catch (error) { if (!(error instanceof DurableUnlinkUnsyncedError)) throw error }
+        try { io.unlinkSync(pathFor(key)) } catch (error) { if (!(error instanceof DurableUnlinkUnsyncedError)) throw error }
         if (options.seal) {
           step = 'seal-entry'
           const sealed = await options.seal.removeEntry(key)

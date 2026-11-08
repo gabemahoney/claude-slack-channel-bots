@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { createDeliveryQueue, isOpenItem, itemOpenedAt, isQueueRecord, parseQueueRecord, QUEUE_DIRECTORY_MODE, QUEUE_FILE_MODE, QUEUE_KEY_KEEP_MS, QUEUE_COMPACT_INTERVAL_MS, QUEUE_GROUP_COMMIT_MAX, type AcceptedRecord, type AcceptedInput, type HoldField, type HoldOutcome, type HoldResolution, type QueueRecord, type QueueEvent, type QueueStoreKind, type DeliveryQueue } from '../src/delivery-queue.ts'
 import { assertNoLeak, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 import { makeDeliveryNoticeHarness, type DeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
 import { MAX_RELOAD_FILE_BYTES } from '../src/config.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
-import { durableIo, failFileSyncs, holdFirstSync } from './test-helpers/durable-io.ts'
+import { durableIo, failFileSyncs, holdFirstSync, type DurableStep } from './test-helpers/durable-io.ts'
 import { yieldToEventLoop } from '../src/durable-journal.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { _resetAckTracker, createQueuedAckCallback } from '../src/ack-tracker.ts'
@@ -27,13 +27,18 @@ const accepted = (): AcceptedRecord => ({ ...slackInput(), v: 1, kind: 'accepted
 const kinds: QueueRecord[] = [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['exact bytes\n🙂'] }, sentRecord(), deliveredRecord(), { v: 1, kind: 'refused', seq: 1, attempt: 1, at: 1000 }, { v: 1, kind: 'noticed', seq: 1, at: 1000 }, { v: 1, kind: 'reply-reminder', seq: 1, at: 1000, state: 'observed', delivery_attempts: [1] }]
 function recordSyncs() {
   const synced: string[] = []
-  let failingPath: string | undefined
+  let failing: ((path: string) => boolean) | undefined
   const io = durableIo({ before(step) {
     if (step.op !== 'fsync') return
     synced.push(step.path)
-    if (step.path === failingPath) throw new Error('EIO injected sync')
+    if (failing?.(step.path)) throw new Error('EIO injected sync')
   } })
-  return { synced, io, fail(path?: string) { failingPath = path }, fs: io.fs }
+  return { synced, io, fail(path?: string | ((path: string) => boolean)) { failing = typeof path === 'string' ? p => p === path : path }, fs: io.fs }
+}
+/** Each fsync's target in `steps`: the queue or parent directory, `key`'s journal, another journal, a rewrite's temp or a quarantine file. */
+function fsyncTargets(steps: readonly DurableStep[], key = 'alpha'): string[] {
+  return steps.filter(step => step.op === 'fsync').map(({ path }) => path === join(dir, 'queue') ? 'queue' : path === dir ? 'parent'
+    : path === queuePath(dir, key) ? 'journal' : path.endsWith('.tmp') ? 'temp' : path.includes('.unreadable-') ? 'quarantine' : 'other journal')
 }
 /** Interval timers on `clock`; each requested delay is pushed to `scheduled`. */
 function fakeIntervals(clock: FakeClock, scheduled: number[] = []) {
@@ -232,14 +237,14 @@ test('real file acceptance fsyncs file and new directory, enforces permissions a
   expect(fs.statSync(queuePath(dir)).mode & 0o777).toBe(QUEUE_FILE_MODE)
   await q.stop(); const replay = await open(); expect(replay.items('alpha')[0]!.accepted.text).toBe('message')
 })
-test('reuses a durably synced parent while every acceptance and append still syncs its journal and queue directory', async () => {
+test("reuses a durably synced parent; a journal's creating acceptance syncs it and the queue directory, its later appends only the journal", async () => {
   const sync = recordSyncs(), queueDir = join(dir, 'queue')
   const q = await open({ fs: sync.fs })
   expect(sync.synced).toEqual([dir])
   expect((await q.accept('alpha', injectedInput())).status).toBe('accepted')
   await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['fixed'] })
   expect((await q.accept('beta', injectedInput())).status).toBe('accepted')
-  expect(sync.synced).toEqual([dir, queuePath(dir), queueDir, queuePath(dir), queueDir, queuePath(dir, 'beta'), queueDir])
+  expect(sync.synced).toEqual([dir, queuePath(dir), queueDir, queuePath(dir), queuePath(dir, 'beta'), queueDir])
   await q.stop()
   const replay = await open({ fs: sync.fs })
   expect(sync.synced.filter(path => path === dir)).toHaveLength(2)
@@ -291,9 +296,9 @@ test.each(['mode correction', 'directory replacement', 'same-inode directory rec
   expect(replay.openCount('alpha')).toBe(1)
   expect(replay.lookupSlackKey('alpha', slackInput().key!)).toMatchObject({ status: 'duplicate', seq: 1 })
 })
-test('queue-directory sync failures publish neither new Slack keys nor completed delivery summaries until retry succeeds', async () => {
+test("queue-directory sync failures publish neither new Slack keys nor completed delivery summaries until retry succeeds, at a journal's creation and at its first opening after a failed start rewrite", async () => {
   const sync = recordSyncs(), queueDir = join(dir, 'queue')
-  const q = await open({ fs: sync.fs })
+  let q = await open({ fs: sync.fs })
   sync.fail(queueDir)
   for (let retry = 0; retry < 2; retry++) {
     expect((await q.accept('alpha', slackInput())).status).toBe('failed')
@@ -305,6 +310,11 @@ test('queue-directory sync failures publish neither new Slack keys nor completed
   sync.fail()
   expect(await q.accept('alpha', slackInput())).toMatchObject({ status: 'accepted', seq: 1 })
   await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['fixed'] })
+  // The restart's load is the journal's first opening; its rewrite then fails
+  // before the rename, so no directory sync has followed that opening.
+  await q.stop()
+  sync.fail(path => path.endsWith('.tmp'))
+  q = await open({ fs: sync.fs })
   const before = q.item('alpha', 1)!
   sync.fail(queueDir)
   for (let retry = 0; retry < 2; retry++) {
@@ -318,8 +328,10 @@ test('queue-directory sync failures publish neither new Slack keys nor completed
   await q.append('alpha', deliveredRecord())
   expect(q.item('alpha', 1)!.delivered).toBe(true)
   expect(q.openCount('alpha')).toBe(0)
-  expect(sync.synced.filter(path => path === dir)).toHaveLength(1)
-  expect(sync.synced.filter(path => path === queueDir)).toHaveLength(7)
+  expect(sync.synced.filter(path => path === dir)).toHaveLength(2)
+  expect(sync.synced.filter(path => path.endsWith('.tmp'))).toHaveLength(1)
+  // Three creating acceptances and three appends after the restart; the fixed append syncs only its journal.
+  expect(sync.synced.filter(path => path === queueDir)).toHaveLength(6)
   // Four failed appends each sync their rollback as well as their candidate.
   expect(sync.synced.filter(path => path === queuePath(dir))).toHaveLength(11)
   await q.stop()
@@ -1633,10 +1645,12 @@ describe('acceptances queued together share one durable append per batch', () =>
     expect(QUEUE_GROUP_COMMIT_MAX).toBe(8)
   })
 
-  /** The persona journal's line count at each of its file fsyncs (appends and rollbacks); the next `fail` of them throw. */
+  /** The persona journal's line count at each of its file fsyncs (appends and rollbacks); the next `fail` of them throw.
+   * `dirs` holds, for each queue-directory fsync, how many of those file fsyncs preceded it. */
   function journalSyncs(key = 'alpha') {
-    const rig = { lines: [] as number[], fail: 0 }
+    const rig = { lines: [] as number[], dirs: [] as number[], fail: 0 }
     return Object.assign(rig, { fs: durableIo({ before(step) {
+      if (step.op === 'fsync' && step.path === join(dir, 'queue')) rig.dirs.push(rig.lines.length)
       if (step.op !== 'fsync' || step.path !== queuePath(dir, key)) return
       rig.lines.push(fs.readFileSync(queuePath(dir, key), 'utf8').split('\n').filter(Boolean).length)
       if (rig.fail > 0) { rig.fail--; throw new Error('EIO batch sync') }
@@ -1760,33 +1774,43 @@ describe('acceptances queued together share one durable append per batch', () =>
     expect(readQueue(dir).map(r => (r as AcceptedRecord).text)).toEqual(['m0', 'prompt', 'm1'])
   })
 
-  test('other work queued for the persona closes the forming group, so later acceptances never pass it', async () => {
+  test('other work queued for the persona closes the forming group, so later acceptances never pass it; only the creating group syncs the queue directory', async () => {
     const syncs = journalSyncs(), q = await open({ fs: syncs.fs })
     await Promise.all([q.accept('alpha', slackAt(0)), q.accept('alpha', slackAt(1)), q.append('alpha', fixedRecord(1)), q.accept('alpha', slackAt(2)), q.accept('alpha', slackAt(3))])
     expect(readQueue(dir).map(r => [r.kind, r.seq])).toEqual([['accepted', 1], ['accepted', 2], ['fixed', 1], ['accepted', 3], ['accepted', 4]])
     expect(syncs.lines).toEqual([2, 3, 5])
+    expect(syncs.dirs).toEqual([1])
   })
 
-  test("a burst of one persona's acceptances takes one durable append per QUEUE_GROUP_COMMIT_MAX members, not one per member", async () => {
+  test("a burst of one persona's acceptances takes one durable append per QUEUE_GROUP_COMMIT_MAX members, not one per member, and syncs the queue directory once, at creation", async () => {
     // The size of the integration suite's thread burst.
-    const burst = 2001, io = durableIo(), q = await open({ fs: io.fs })
+    const burst = 2001, writes: string[] = []
+    const io = durableIo({ base: { ...fs, writeSync(fd: number, ...rest: unknown[]) {
+      writes.push(io.paths.get(fd) ?? '<unknown-fd>')
+      return (fs.writeSync as Function)(fd, ...rest)
+    } } as typeof fs })
+    const q = await open({ fs: io.fs })
     const results = await Promise.all(Array.from({ length: burst }, (_, i) => q.accept('alpha', slackAt(i))))
     expect(seqs(results)).toEqual(Array.from({ length: burst }, (_, i) => i + 1))
-    expect(io.steps.filter(step => step.op === 'fsync' && step.path === queuePath(dir))).toHaveLength(Math.ceil(burst / QUEUE_GROUP_COMMIT_MAX))
+    const groups = Math.ceil(burst / QUEUE_GROUP_COMMIT_MAX)
+    expect(writes.filter(path => path === queuePath(dir))).toHaveLength(groups)
+    expect(io.steps.filter(step => step.op === 'fsync' && step.path === queuePath(dir))).toHaveLength(groups)
+    expect(io.steps.filter(step => step.op === 'fsync' && step.path === join(dir, 'queue'))).toHaveLength(1)
     expect(readQueue(dir)).toHaveLength(burst)
   })
 })
 
 describe('a journal loaded after start', () => {
-  /** alpha's journal is unreadable at start() until `heal`, beta's is read by start(); each hook call records the load it sees. */
-  async function lateLoad(throws = false) {
+  /** alpha's journal is unreadable at start() until `heal`, beta's is read by start(); each hook call records the load it sees.
+   * The refused read fails before opening the file, so alpha's first load after `heal` is its first opening. */
+  async function lateLoad(throws = false, base: typeof fs = fs) {
     let unreadable = true
     const calls: Array<[string, number]> = []
     seedQueue(dir, [accepted()]); seedQueue(dir, [accepted()], 'beta')
-    const q: DeliveryQueue = createDeliveryQueue({ stateDir: dir, fs: { ...fs,
+    const q: DeliveryQueue = createDeliveryQueue({ stateDir: dir, fs: { ...base,
       readFileSync(path: fs.PathOrFileDescriptor, ...args: unknown[]) {
         if (unreadable && String(path) === queuePath(dir)) throw new Error('EIO journal read')
-        return (fs.readFileSync as Function)(path, ...args)
+        return (base.readFileSync as Function)(path, ...args)
       },
     } as typeof fs, onLoadedAfterStart: key => {
       calls.push([key, q.items(key).length])
@@ -1826,6 +1850,53 @@ describe('a journal loaded after start', () => {
     await q.compact('alpha')
     expect(q.items('alpha')).toHaveLength(1)
     expect(calls).toEqual([])
+  })
+
+  test("its first load opens it: the turn's acceptance is answered, published and observed only after a queue-directory sync, and later acceptances sync only the journal", async () => {
+    const h = holdFirstSync(path => path === join(dir, 'queue'), { armed: false })
+    const { q, heal } = await lateLoad(false, h.io.fs)
+    heal(); h.state.armed = true
+    const from = h.io.steps.length, input = later(THREAD_ROOTS.secondary)
+    let observed = false, settled = false
+    const pending = q.acceptDecided('alpha', input.key, () => ({ store: input, afterStore: () => { observed = true } })).then(result => { settled = true; return result })
+    await Promise.race([h.reached(), pending])
+    expect(h.state.armed).toBe(false)
+    expect(fs.readFileSync(queuePath(dir), 'utf8')).toContain(input.ts!)
+    await yieldToEventLoop()
+    expect({ settled, observed }).toEqual({ settled: false, observed: false })
+    expect(q.items('alpha').map(item => item.accepted.seq)).toEqual([1])
+    expect(q.lookupSlackKey('alpha', input.key!)).toBeUndefined()
+    h.gate.release()
+    expect(await pending).toMatchObject({ status: 'accepted', seq: 2 })
+    expect(observed).toBe(true)
+    expect(await q.accept('alpha', later(THREAD_ROOTS.third))).toMatchObject({ status: 'accepted', seq: 3 })
+    expect(fsyncTargets(h.io.steps.slice(from))).toEqual(['journal', 'queue', 'journal'])
+  })
+})
+
+describe('the queue directory is synced only while a journal entry may not be durable', () => {
+  const damaged = '{"v":99,"kind":"accepted","seq":9,"text":"private queued body"}\n'
+  test.each([
+    { compaction: 'its own start compaction succeeds', keys: ['alpha'], failTemps: 0, start: ['temp', 'queue'], first: ['journal'] },
+    { compaction: 'its start rewrite fails before the rename', keys: ['alpha'], failTemps: 1, start: ['temp'], first: ['journal', 'queue'] },
+    { compaction: "its start rewrite fails before the rename and another journal's start compaction succeeds after its read", keys: ['alpha', 'beta'], failTemps: 1,
+      start: ['temp', 'temp', 'queue'], first: ['journal'] },
+    { compaction: 'start quarantines its damaged line into a new file, then repairs and compacts it', keys: ['alpha'], failTemps: 0, damaged: true,
+      start: ['quarantine', 'queue', 'temp', 'queue', 'temp', 'queue'], first: ['journal'] },
+  ])('a journal that existed before start, where $compaction: start syncs $start, then its first acceptance $first', async ({ keys, failTemps, damaged: damage, start, first }) => {
+    for (const key of keys) seedQueue(dir, [accepted(), ...(damage ? [damaged] : [])], key)
+    // The measured journal is the one whose rewrite failed, whichever start compacts first.
+    let left = failTemps, key = 'alpha'
+    const io = durableIo({ before(step) {
+      if (step.op !== 'fsync' || !step.path.endsWith('.tmp') || left === 0) return
+      left--; key = basename(step.path).split('.')[0]!
+      throw new Error('EIO temp sync')
+    } })
+    const q = await open({ fs: io.fs })
+    expect(fsyncTargets(io.steps, key)).toEqual(['parent', ...start])
+    const from = io.steps.length
+    expect((await q.accept(key, injectedInput())).status).toBe('accepted')
+    expect(fsyncTargets(io.steps.slice(from), key)).toEqual([...first])
   })
 })
 
@@ -2117,8 +2188,8 @@ describe('Memory Hold queue records', () => {
     events.length = 0; resolving = true
     expect(await q.resolveHolds('alpha', candidates)).toEqual(saved)
     resolving = false
-    // The file and directory syncs both ran before publication.
-    expect(checkedSyncs).toBe(2)
+    // The file sync ran before publication; the journal's entry was already durable, so no directory sync.
+    expect(checkedSyncs).toBe(1)
     expect(writes).toEqual([Buffer.from([withdrawnRecord(2, clock.now()), releasedRecord(1, clock.now())].map(r => JSON.stringify(r) + '\n').join(''))])
     expect(events).toEqual([{ type: 'holds-resolved', key: 'alpha', resolutions: saved }])
     expect(q.unresolvedHolds('alpha')).toEqual([])

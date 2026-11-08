@@ -284,6 +284,8 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
   const sealIo = sealOptions.fs ?? threadSealFsControls(stateDir), sealEvents: ThreadMemorySealEvent[] = []
   const seal = options.seal ? createThreadMemorySeal({ stateDir, fs: sealIo.fs,
     queueJournalPath: key => queuePath(stateDir, key),
+    // As main() wires it: the seal's read can be a queue journal's first opening.
+    onQueueJournalOpened: key => queue?.journalOpened(key),
     appliedKeys: options.appliedKeys ?? (() => authority.config().personas.map(p => p.key)),
     threadHybrid: key => authority.threadView().threadHybridChannels(key).length > 0,
     created: key => authority.threadMemoryCreated(key),

@@ -6,10 +6,10 @@
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from 'bun:test'
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync, type Stats } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
-import { join, relative } from 'node:path'
+import { basename, join, relative } from 'node:path'
 import { THREAD_MEMORY_LOOKUP_METHODS, MetadataCancelledError, classifyMetadataFailure, createMetadataAttempts, metadataRetryDelay,
   type MetadataFailure } from '../src/thread-memory.ts'
 import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS, THREAD_MEMORY_NOTICE_MAX_CHARS } from '../src/delivery-constants.ts'
@@ -23,21 +23,22 @@ import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
 import { recoverQueuedJoins } from '../src/thread-join-recovery.ts'
 import { createOwnPostJoins, ownPostAnswerOfPost, type OwnPostSurface } from '../src/own-post.ts'
 import { DurableWriteUnsyncedError } from '../src/atomic-write.ts'
-import { isThreadMemorySealEntry, isThreadMemorySealFile, serializeThreadMemorySeal, judgeSeal, queueIdentitiesMatch,
+import { createThreadMemorySeal, isThreadMemorySealEntry, isThreadMemorySealFile, serializeThreadMemorySeal, judgeSeal, queueIdentitiesMatch,
   type JudgeSealInput, type ThreadMemorySealCase, type ThreadMemorySealEntry } from '../src/thread-memory-seal.ts'
 import {
   makeThreadMemoryHarness, makeThreadMembershipHarness, threadConfig, threadPath, threadHeader,
   threadJoin, joinRecord, postIntent, postOutcome, seedThreads, readThreads, damagedThreadLine,
   THREAD_CHANNELS as C, THREAD_ROOTS as R, THREAD_TIME, type ThreadMemoryHarness, type ThreadHarnessOptions, slackTsOfMs,
   runningSealEntry, cleanSealEntry, cleanOwnPostSealEntry, seedThreadSeal, readThreadSeal, threadSealPath, damagedThreadSeal,
-  threadFsControls, populationConfig, populationEligible, seedUnitPopulation, populationChannels, populationJoins, oldestJoins, stampedJoins,
+  threadFsControls, threadSealFsControls, populationConfig, populationEligible, seedUnitPopulation, populationChannels, populationJoins, oldestJoins, stampedJoins,
   sr8Personas, SR8_POPULATIONS, SR8_ELIGIBLE_CHANNELS, SR8_POPULATION_CHANNEL_COUNT, SR8_SHARED_LIST_CHANNELS, SR8_BURST_JOINS, SEED_BATCH_JOINS,
 } from './test-helpers/thread-memory.ts'
 import { makeOwnPostHarness, type OwnPostHarness } from './test-helpers/own-post.ts'
 import { channelPopulation, makeSharedAuthority, membershipPage, readSharedState, FIXTURE_THREAD_HYBRID_SINCE_PREFIX } from './test-helpers/shared-channels.ts'
 import type { SharedChannelAuthority } from '../src/shared-channels.ts'
 import { makeReloadHarness, type ReloadRun } from './test-helpers/reload-harness.ts'
-import { deliveredRecord, fixedRecord, makeQueue, queuePath, slackInput, memoryHold, heldSlackInput } from './test-helpers/delivery-queue.ts'
+import { acceptedRecord, deliveredRecord, fixedRecord, injectedInput, makeQueue, queuePath, seedQueue, slackInput, memoryHold, heldSlackInput } from './test-helpers/delivery-queue.ts'
+import { durableIo } from './test-helpers/durable-io.ts'
 import { makeDeferredWebApiCall, makeStubSlack } from './test-helpers/slack-stub.ts'
 import { MEMBERSHIP_PAGE_LIMIT, MEMBERSHIP_RETRY_MIN_MS } from '../src/channel-membership-retry.ts'
 import { _resetRegistry } from '../src/registry.ts'
@@ -1112,6 +1113,105 @@ describe('Thread Memory store', () => {
     expect(h.memory.clock('alpha')).toBe(fact.at + 1)
     h.memory.advancePast('alpha', fact.at + 200); expect(h.memory.clock('alpha')).toBe(fact.at + 201)
     h.memory.advancePast('alpha', 0); expect(h.memory.clock('alpha')).toBe(fact.at + 202)
+  })
+})
+
+describe('the threads directory is synced only while a journal entry may not be durable', () => {
+  const threadsDir = (h: ThreadMemoryHarness) => join(h.stateDir, 'threads')
+  /** Each fsync's target from `h.io.calls[from]` on: the threads or parent directory, `key`'s journal, or another file. */
+  function syncTargets(h: ThreadMemoryHarness, from = 0, key = 'alpha') {
+    return h.io.calls.slice(from).filter(c => c.op === 'fsync' || c.op === 'fsyncSync').map(({ path }) => path === threadsDir(h) ? 'threads'
+      : path === h.stateDir ? 'parent' : path === threadPath(h.stateDir, key) ? 'journal' : relative(threadsDir(h), path))
+  }
+  function seedCreated(h: ThreadMemoryHarness, key = 'alpha') {
+    seedThreads(h.stateDir, [threadHeader()], key)
+    expect(h.authority.setThreadMemoryCreated(key).kind).toBe('saved')
+  }
+
+  test('a store created by its header append syncs the threads directory; later saves sync only the journal', async () => {
+    const h = fixture(); await h.start()
+    expect(syncTargets(h)).toEqual(['parent', 'journal', 'threads'])
+    const from = h.io.calls.length
+    for (const root of [R.primary, R.secondary]) expect(await h.memory.saveJoins('alpha', [h.fact({ root })])).toEqual({ kind: 'saved' })
+    expect(syncTargets(h, from)).toEqual(['journal', 'journal'])
+  })
+
+  test.each((['start', 'later bring-up'] as const).flatMap(at => (['succeeds', 'fails at its rename', 'fails at its directory sync'] as const)
+    .map(compaction => [at, compaction] as const)))('an existing journal first read at %s, whose compaction %s: only a failed compaction leaves the first save to sync the threads directory, retryably', async (at, compaction) => {
+    const h = fixture(), isThreads = (path: string) => path === threadsDir(h)
+    seedCreated(h)
+    const breakCompaction = () => {
+      if (compaction === 'fails at its rename') h.io.fail('rename')
+      else if (compaction === 'fails at its directory sync') h.io.fail('fsync', 'alpha', { match: isThreads })
+    }
+    // The fixture refuses the start read before the file opens, so the later bring-up's read is the first opening.
+    if (at === 'start') breakCompaction(); else h.io.fail('readFileSync')
+    await h.start()
+    if (at === 'later bring-up') {
+      expect(view(h)).toBe('unknown')
+      h.io.heal(); breakCompaction(); await h.memory.loadKey('alpha')
+    }
+    h.io.heal()
+    const from = h.io.calls.length, first = h.fact()
+    if (compaction === 'succeeds') expect(await h.memory.saveJoins('alpha', [first])).toEqual({ kind: 'saved' })
+    else {
+      h.io.fail('fsync', 'alpha', { match: isThreads, times: 1 })
+      expect((await h.memory.saveJoins('alpha', [first])).kind).toBe('failed')
+      expect(h.memory.keptFacts('alpha')).toEqual([first])
+      expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+    }
+    expect(await h.memory.saveJoins('alpha', [h.fact({ root: R.secondary })])).toEqual({ kind: 'saved' })
+    expect(syncTargets(h, from)).toEqual(compaction === 'succeeds' ? ['journal', 'journal']
+      // The refused directory sync and its rollback's file sync; the retry syncs the directory again.
+      : ['journal', 'threads', 'journal', 'journal', 'threads', 'journal'])
+    expect(savedJoins(h).map(r => r.root)).toEqual([R.primary, R.secondary])
+  })
+
+  test('a read retry of a journal this run already opened opens nothing new, so the start compaction still vouches for the first save', async () => {
+    const h = fixture(); seedCreated(h); await h.start()
+    h.memory.forget('alpha'); h.io.fail('readFileSync'); await h.memory.loadKey('alpha')
+    expect(view(h)).toBe('unknown')
+    h.io.heal(); expect(await h.memory.retryRead('alpha')).toBe('read')
+    const from = h.io.calls.length
+    expect(await h.memory.saveJoins('alpha', [h.fact()])).toEqual({ kind: 'saved' })
+    expect(syncTargets(h, from)).toEqual(['journal'])
+  })
+
+  test("a journal recreated after remove is a new entry even when it reuses the removed file's identity: its first append syncs the threads directory", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'thread-memory-')), controls = threadFsControls(dir)
+    let reused: Pick<Stats, 'dev' | 'ino' | 'birthtimeMs'> | undefined
+    // Model the filesystem giving the recreated journal the removed one's device, inode and birth time.
+    const io = { ...controls, fs: { ...controls.fs, fstatSync(fd: number, ...rest: unknown[]) {
+      const stat = (controls.fs.fstatSync as Function)(fd, ...rest) as Stats
+      if (reused && existsSync(threadPath(dir)) && statSync(threadPath(dir)).ino === stat.ino) Object.assign(stat, reused)
+      return stat
+    } } as typeof controls.fs }
+    const h = fixture({ fs: io }, dir); await h.start()
+    expect(await h.memory.saveJoins('alpha', [h.fact()])).toEqual({ kind: 'saved' })
+    const { dev, ino, birthtimeMs } = statSync(threadPath(dir)); reused = { dev, ino, birthtimeMs }
+    expect(await h.memory.remove('alpha')).toEqual({ kind: 'saved' })
+    const from = h.io.calls.length
+    await h.memory.loadKey('alpha')
+    expect(h.authority.threadMemoryCreated('alpha')).toBe(true)
+    expect(await h.memory.saveJoins('alpha', [h.fact({ root: R.secondary })])).toEqual({ kind: 'saved' })
+    expect(syncTargets(h, from)).toEqual(['journal', 'threads', 'journal'])
+  })
+
+  test.each(['removes the file and syncs the directory', 'finds no file', 'cannot sync the directory'] as const)("a removal that %s vouches for another journal's earlier opening only when its directory sync succeeded", async outcome => {
+    const h = fixture()
+    h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta']))
+    for (const key of ['alpha', 'beta']) seedCreated(h, key)
+    // Every start compaction fails before its rename: both journals stay opened with no directory sync since.
+    h.io.fail('fsync', 'alpha', { match: path => path.endsWith('.tmp') })
+    await h.start(); h.io.heal()
+    if (outcome === 'finds no file') h.io.removeJournal('alpha')
+    if (outcome === 'cannot sync the directory') h.io.fail('fsyncSync', 'alpha', { match: path => path === threadsDir(h) })
+    expect(await h.memory.remove('alpha')).toEqual({ kind: 'saved' })
+    expect(existsSync(threadPath(h.stateDir))).toBe(false)
+    h.io.heal()
+    const from = h.io.calls.length
+    expect(await h.memory.saveJoins('beta', [h.fact({}, 'beta')])).toEqual({ kind: 'saved' })
+    expect(syncTargets(h, from, 'beta')).toEqual(outcome === 'removes the file and syncs the directory' ? ['journal'] : ['journal', 'threads'])
   })
 })
 
@@ -3144,6 +3244,22 @@ describe('Thread Memory seal judgments and closed metadata', () => {
     h.sealIo.heal(); writeFileSync(queuePath(h.stateDir), Buffer.alloc(0))
     expect(queueIdentitiesMatch(absent, h.seal.queueIdentity('alpha'))).toBe(false)
   })
+
+  test("an observer of the seal's queue-journal openings changes nothing it reads or hashes, even when it throws; an absent journal notifies nothing", () => {
+    const dir = mkdtempSync(join(tmpdir(), 'thread-memory-')); threadDirs.push(dir)
+    seedQueue(dir, [acceptedRecord(1, slackInput(), THREAD_TIME)])
+    function identify(key: string, observer?: (key: string) => void) {
+      const io = threadSealFsControls(dir)
+      const seal = createThreadMemorySeal({ stateDir: dir, fs: io.fs, queueJournalPath: k => queuePath(dir, k), appliedKeys: () => [],
+        threadHybrid: () => false, created: () => false, ...(observer ? { onQueueJournalOpened: observer } : {}) })
+      return { identity: seal.queueIdentity(key), reads: io.queueReads() }
+    }
+    const plain = identify('alpha'), opened: string[] = []
+    expect(identify('alpha', key => { opened.push(key) })).toEqual(plain)
+    expect(identify('alpha', () => { throw new Error('fixture observer failed') })).toEqual(plain)
+    expect(identify('beta', key => { opened.push(key) }).identity).toEqual({ size: '0', sha256: createHash('sha256').digest('hex') })
+    expect(opened).toEqual(['alpha'])
+  })
 })
 
 describe('Thread Memory seal startup and restart', () => {
@@ -3414,6 +3530,30 @@ describe('Thread Memory seal startup and restart', () => {
     expect(next.seal.queueIdentity('alpha')).not.toEqual(old.queue!)
     await next.memory.activate()
     expect(next.seal.startupFindings()).toEqual([{ key: 'beta', case: 'unclean-stop', wording: 'unclean' }])
+  })
+
+  test.each([
+    ['succeeds', ['journal']],
+    ['also fails before its rename', ['journal', 'queue']],
+  ] as const)("the seal's read is a queue journal's first opening: when the earlier start compaction %s, the later journal's first append syncs %j", async (earlier, expected) => {
+    // Start compacts the queue journals one at a time; the later one's rewrite always fails before its rename.
+    let temps = 0, later = ''
+    const rewrites = durableIo({ before(step) {
+      if (step.op !== 'fsync' || !step.path.endsWith('.tmp') || (++temps === 1 && earlier === 'succeeds')) return
+      later = basename(step.path).split('.')[0]!
+      throw new Error('fixture temp sync refused')
+    } })
+    const h = sealFixture({ queueOptions: { fs: rewrites.fs } })
+    h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta']))
+    for (const key of ['alpha', 'beta']) { seedQueue(h.stateDir, [acceptedRecord(1, slackInput(), THREAD_TIME)], key); seedReadable(h, [], key) }
+    await h.start()
+    expect(h.sealIo.queueReads().filter(c => c.op === 'openSync').map(c => c.path).sort()).toEqual([queuePath(h.stateDir), queuePath(h.stateDir, 'beta')])
+    expect(temps).toBe(2)
+    expectSealFinding(h)
+    const from = h.queueIo.steps.length
+    expect((await h.queue.accept(later, injectedInput())).status).toBe('accepted')
+    expect(h.queueIo.steps.slice(from).filter(step => step.op === 'fsync').map(({ path }) =>
+      path === join(h.stateDir, 'queue') ? 'queue' : path === queuePath(h.stateDir, later) ? 'journal' : path)).toEqual([...expected])
   })
 
   test.each(['json', 'version', 'persona-key', 'missing-queue', 'read-failure'] as const)('%s seal is reported, treated as empty and replaced with valid running entries', async damage => {

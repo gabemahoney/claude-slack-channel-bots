@@ -181,6 +181,9 @@ export interface ReplyReminderQueue extends DeliveryQueue {
   recordReplyCall(key: string, targets: readonly ReplyCallTarget[]): Promise<void>
   observeReplyReminders(key: string, row: ReplyReminderRow, text: string, enabled: boolean, current: () => boolean): Promise<QueueItem[]>
   cancelReplyReminders(key: string): Promise<void>
+  /** Another module opened `key`'s existing journal, as the seal does to hash
+   * it, possibly before this queue reads it. Only this run's first opening counts. */
+  journalOpened(key: string): void
 }
 export interface DeliveryQueueOptions {
   stateDir: string
@@ -334,7 +337,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   const monotonicNow = options.monotonicNow ?? (() => performance.now())
   let measureTimings = options.measureTimings === true
   const dir = join(options.stateDir, 'queue')
-  const { ensureDir, durableAppend, reconcileRollback, rewrite } = createDurableJournal({ dir, parentDir: options.stateDir, directoryMode: QUEUE_DIRECTORY_MODE, fileMode: QUEUE_FILE_MODE, fs })
+  const { ensureDir, durableAppend, reconcileRollback, rewrite, read, opened } = createDurableJournal({ dir, parentDir: options.stateDir, directoryMode: QUEUE_DIRECTORY_MODE, fileMode: QUEUE_FILE_MODE, fs })
   const journals = new Map<string, Journal>()
   // Items and hold entries are replaced on changes, including rebuilds. Weak
   // keys let obsolete versions go without a second invalidation/eviction index.
@@ -476,7 +479,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     // items must remain visible to startup preparation and delivery recovery.
     const j = emptyJournal()
     let bytes: Buffer
-    try { bytes = fs.readFileSync(pathFor(key)) } catch (error) {
+    try { bytes = read(pathFor(key)) } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') { stored.loaded = true; return }
       event({ type: 'recovery-failed', key, error }); throw error
     }
@@ -992,6 +995,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     keys: () => [...journals.keys()],
     compact,
     setMeasureTimings(enabled) { measureTimings = enabled },
+    journalOpened: key => opened(pathFor(key)),
     startMaintenance(intervalMs) {
       if (timer !== undefined || stopped) return
       timer = (options.setInterval ?? globalThis.setInterval)(() => { void compactForMaintenance().catch(() => {}) }, intervalMs ?? options.compactIntervalMs ?? QUEUE_COMPACT_INTERVAL_MS)

@@ -25,7 +25,7 @@ import type { SharedStateReportingDeps } from '../src/shared-state-reports.ts'
 import type { MembershipScanner } from '../src/channel-membership-scan.ts'
 import { _resetAckTracker, createQueuedAckCallback, forgetPersonaAcks } from '../src/ack-tracker.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
-import type { DeliveryQueueOptions, QueueEvent, QueueThreadJoin, DeliveryQueue } from '../src/delivery-queue.ts'
+import type { DeliveryQueueOptions, QueueEvent, QueueThreadJoin, DeliveryQueue, ReplyReminderQueue } from '../src/delivery-queue.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
 import { installTestTimerOverrides } from '../src/test-timer-overrides.ts'
 import { TEST_MEASUREMENTS_FILE_NAME, buildTestMeasurementsStartLine, createTestMeasurements, queueEventMeasurement, postHoldEventMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, type TestMeasurements, type TestMeasurementsDeps, type TestMeasurement } from '../src/test-measurements.ts'
@@ -6438,7 +6438,7 @@ describe('Thread Memory server lifecycle wiring', () => {
     }
   })
 
-  test('one seal uses the queue state directory, real filesystem and live shared-state readers, and publishes its events', () => {
+  test('one seal uses the queue state directory, real filesystem and live shared-state readers, reports each queue-journal opening to the live queue, and publishes its events', () => {
     expect(importSource(SERVER_CODE, sealFactory)).toBe('./thread-memory-seal.ts')
     const seal = onlyCallOf(sealFactory)
     expect(atMainTopLevel(SERVER_CODE, seal)).toBe(true)
@@ -6449,6 +6449,7 @@ describe('Thread Memory server lifecycle wiring', () => {
     expect(Object.fromEntries(props)).toEqual({
       stateDir: onlyCallProps('createDeliveryQueue').get('stateDir')!,
       queueJournalPath: 'key => join(STATE_DIR, \'queue\', `${key}.jsonl`)',
+      onQueueJournalOpened: 'key => deliveryQueue?.journalOpened(key)',
       appliedKeys: '() => personaConfig?.personas.map(persona => persona.key) ?? []',
       threadHybrid: 'key => (reloadController?.sharedChannels()?.threadView().threadHybridChannels(key).length ?? 0) > 0',
       created: 'key => reloadController?.sharedChannels()?.threadMemoryCreated(key) ?? false',
@@ -6457,6 +6458,21 @@ describe('Thread Memory server lifecycle wiring', () => {
     expect(props.get('stateDir')).toBe('STATE_DIR')
     expect(seal).toBeGreaterThan(onlyCallOf('createDeliveryQueue'))
     expect(seal).toBeLessThan(onlyCallOf(factory))
+    // The queue holder is set once, by the factory call before the seal, so the seal's start reads find it.
+    expect(assignmentsTo('deliveryQueue').map(({ value }) => value)).toEqual(['createDeliveryQueue({'])
+    // Execute the actual observer alone, with its holder in an isolated closure.
+    const observer = expression<() => {
+      opened: NonNullable<ThreadMemorySealModule.ThreadMemorySealOptions['onQueueJournalOpened']>
+      set: (queue: Pick<ReplyReminderQueue, 'journalOpened'>) => void
+    }>(`() => {
+      let deliveryQueue;
+      return { opened: (${props.get('onQueueJournalOpened')}), set: queue => { deliveryQueue = queue } };
+    }`, {})()
+    observer.opened('alpha')
+    const opened: string[] = []
+    observer.set({ journalOpened: key => { opened.push(key) } })
+    observer.opened('alpha'); observer.opened('beta')
+    expect(opened).toEqual(['alpha', 'beta'])
   })
 
   test('one store reads, then awaits the seal before queue replay even in dry run, and maintenance starts beside the queue', () => {
