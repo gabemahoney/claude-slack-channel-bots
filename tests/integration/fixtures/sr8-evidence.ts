@@ -69,8 +69,10 @@
  *     <key>.queue.jsonl from shared_queue_snapshot (retain pre-compaction snapshots);
  *     <key>.before.jsonl and <key>.after.jsonl from shared_thread_joins, before the burst
  *     and AFTER a clean restart. Reader failures must fail the script, never become [].
- *     Joins must retain every seeded identity and every burst root; additional joins
- *     (e.g. the held-probe setup's successful own post) are counted, never subtracted.
+ *     Joins: every seeded identity before the burst, and every pre-burst join and
+ *     burst root after the restart (S ⊆ B, B ∪ N ⊆ A). Additional joins (the first
+ *     start's seal-report notice's own post, say) are counted, never subtracted,
+ *     and printed by count, source and channel (baseline_excess, excess_*).
  *     External start/ready timestamps MUST be from the same clock for the measured start.
  *     Required N2 count defaults to zero for stub-only bursts; test-32 passes >=20.
  *     With held probes, also emits post-hold-overlap and post-hold-overlap-ack:
@@ -639,14 +641,30 @@ export function compactionVerdict(rows: Compaction[] | undefined, keys: string[]
     && r.inside === true && !!r.before && !!r.after && r.before !== r.after))).filter(Boolean).length
   return result('compaction', count, { required: required ? keys.length * 2 : 0 }, 'inside-burst', !required || count === keys.length * 2 ? 'pass' : 'missing')
 }
-export function joinsVerdict(before: { channel: string; root: string }[] | undefined, after: { channel: string; root: string }[] | undefined,
-  expected: { channel: string; root: string }[], newJoins: { channel: string; root: string }[], recipients: number): Result {
-  const id = (r: { channel: string; root: string }) => `${r.channel}:${r.root}`
+interface JoinIdentity { channel: string; root: string; source?: unknown }
+/** Counts per value, e.g. `own-post:1`; a value that is not one short word counts as `other`. */
+function tally(values: unknown[]): string {
+  const counts = new Map<string, number>()
+  for (const v of values) { const w = typeof v === 'string' && /^[A-Za-z0-9._-]{1,64}$/.test(v) ? v : 'other'; counts.set(w, (counts.get(w) ?? 0) + 1) }
+  const sorted = [...counts].sort((x, y) => y[1] - x[1] || (x[0] < y[0] ? -1 : 1)).map(([w, n]) => `${w}:${n}`)
+  return sorted.length ? sorted.slice(0, 5).join(',') + (sorted.length > 5 ? `,+${sorted.length - 5}` : '') : 'none'
+}
+/** With S the seeded identities, B the pre-burst snapshot, N the burst roots
+ * and A the snapshot after the restart: S ⊆ B and B ∪ N ⊆ A. The baseline
+ * excess B \ S (the seal report's own-post join, say) is printed by count,
+ * source and channel only. */
+export function joinsVerdict(before: JoinIdentity[] | undefined, after: JoinIdentity[] | undefined,
+  expected: JoinIdentity[], newJoins: JoinIdentity[], recipients: number): Result {
+  const id = (r: JoinIdentity) => `${r.channel}:${r.root}`
   const b = new Set(before?.map(id)), a = new Set(after?.map(id)), old = new Set(expected.map(id)), added = new Set(newJoins.map(id))
   const retained = [...old].filter(k => a.has(k)).length
-  return result('joins', a.size, { before: b.size, after: a.size, oldest_retained: retained, forgotten: old.size - retained }, `>=${(old.size + added.size) * recipients}`,
-    !before || !after ? 'missing' : b.size === old.size && [...old].every(k => b.has(k) && a.has(k))
-      && a.size >= old.size + added.size && [...added].every(k => a.has(k)) ? 'pass' : 'fail')
+  const excess = [...new Map((before ?? []).filter(r => !old.has(id(r))).map(r => [id(r), r])).values()]
+  const lost = [...b].filter(k => !a.has(k)).length, missingRoots = [...added].filter(k => !a.has(k)).length
+  return result('joins', a.size, { before: b.size, after: a.size, oldest_retained: retained, forgotten: old.size - retained,
+    baseline_excess: excess.length, excess_sources: tally(excess.map(r => r.source)), excess_channels: tally(excess.map(r => r.channel)),
+    baseline_lost: lost, burst_missing: missingRoots }, `>=${(old.size + added.size) * recipients}`,
+    !before || !after ? 'missing' : [...old].every(k => b.has(k)) && lost === 0 && missingRoots === 0
+      && a.size >= old.size + added.size ? 'pass' : 'fail')
 }
 export interface ObservationWindow { instance: string; start: number; end: number }
 export function windowsVerdict(calls: { instance: string; ms: number }[] | undefined, empty: ObservationWindow[] | undefined,

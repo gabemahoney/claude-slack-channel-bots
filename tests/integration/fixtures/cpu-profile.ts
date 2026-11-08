@@ -10,13 +10,19 @@
  *     per wave; the ordered writes fall in its waves, and the script marks
  *     `end` after them.
  *   test-32's thread phases: the script, one `thread-samples` wave over all
- *     20 samples, so no cut falls inside a sample. It writes each sample's
- *     push-to-delivery interval to <dir>/samples.tsv (wave TAB start TAB end,
- *     epoch ms; wave `sample`, `delayed-lookup` or `hung-lookup`), and the
- *     summary delimits the profile's samples by those intervals.
+ *     20 samples, so no cut falls inside a sample unless the phase outlasts
+ *     its cap. Its <dir>/interval-us samples every 100 ms and its
+ *     <dir>/max-seconds caps the profile, so a long phase on a large server
+ *     stays small in memory. It writes each sample's push-to-delivery interval to
+ *     <dir>/samples.tsv (wave TAB start TAB end, epoch ms; wave `sample`, `delayed-lookup` or
+ *     `hung-lookup`), and the summary delimits the samples by those intervals.
  * The preload samples only the daemon child, from the first wave mark until
- * `end`, saving one part-<n>-<wave>.json per wave; parts of one wave name are
- * summarized together. The profile stays in scenario scratch; only the
+ * `end`, every <dir>/interval-us µs (CPU_PROFILE_INTERVAL_US without it),
+ * saving one part-<n>-<wave>.json per wave; parts of one wave name are
+ * summarized together. With <dir>/max-seconds, its first poll that many
+ * seconds after a start's request stops sampling for good, saving the wave
+ * in progress (`capped`); `end` then completes the profile, whose outcome is
+ * `capped`. The profile stays in scenario scratch; only the
  * summary reaches the script log.
  *
  * The server sees a mark only when its poll timer runs, so each cut records
@@ -29,8 +35,8 @@
  *     Marks `end` (unless burst already did) and waits for complete.json or
  *     error.txt. One line: recorded: cpu-profile-stop outcome=… parts=…
  *   summary <dir> <scenario> <mode> <population> <recipients>
- *     The outcome (`complete` only when the declared parts are the marked
- *     waves, each with samples) and split, then per wave and for all waves:
+ *     The outcome (`complete`, or `capped`, only when the declared parts are
+ *     the marked waves, each with samples) and split, then per wave and for all waves:
  *     samples, weight and duration, and the top functions and files by self
  *     and total share of samples, then of weight. A sample's weight is the
  *     profiler's time delta before it (elapsed time, not exact on-CPU time).
@@ -51,6 +57,9 @@ export const CPU_PROFILE_END = 'end'
 export const CPU_PROFILE_TOP = 10
 export const CPU_PROFILE_POLL_MS = 50
 export const CPU_PROFILE_SPLIT_LAG_MS = 250
+export const CPU_PROFILE_INTERVAL_US = 1000
+export const CPU_PROFILE_MAX_INTERVAL_US = 100_000
+export const CPU_PROFILE_LONGEST_CAP_S = 3600
 
 /** The profile directory when this process is the CI image's daemon child
  * started with the opt-in; otherwise undefined, and nothing is profiled. */
@@ -64,6 +73,24 @@ export function cpuProfileOptIn(env: Record<string, string | undefined>, argv: r
 /** The wave names written to <dir>/waves, in order; a malformed name is skipped. */
 export function waveMarks(dir: string): string[] {
   try { return readFileSync(join(dir, 'waves'), 'utf8').split('\n').filter(w => /^[a-z-]+$/.test(w)) } catch { return [] }
+}
+
+/** The sampling interval in <dir>/interval-us: a whole number of µs from
+ * CPU_PROFILE_INTERVAL_US to CPU_PROFILE_MAX_INTERVAL_US; otherwise the default. */
+export function samplingIntervalUs(dir: string): number {
+  let text = ''
+  try { text = readFileSync(join(dir, 'interval-us'), 'utf8').trim() } catch { return CPU_PROFILE_INTERVAL_US }
+  const us = /^\d{1,6}$/.test(text) ? Number(text) : NaN
+  return us >= CPU_PROFILE_INTERVAL_US && us <= CPU_PROFILE_MAX_INTERVAL_US ? us : CPU_PROFILE_INTERVAL_US
+}
+
+/** The profile's cap in <dir>/max-seconds: a whole number of seconds from 1
+ * to CPU_PROFILE_LONGEST_CAP_S; otherwise undefined, and nothing caps it. */
+export function profileCapS(dir: string): number | undefined {
+  let text = ''
+  try { text = readFileSync(join(dir, 'max-seconds'), 'utf8').trim() } catch { return undefined }
+  const s = /^\d{1,4}$/.test(text) ? Number(text) : NaN
+  return s >= 1 && s <= CPU_PROFILE_LONGEST_CAP_S ? s : undefined
 }
 
 export function savePart(dir: string, part: number, wave: string, data: object): string {
@@ -115,6 +142,16 @@ export async function startCpuProfile(dir: string, io: ProfilerIo = nodeProfiler
   const event = (phase: string, extra = {}) => quietly(() => io.append(join(dir, 'observer.jsonl'),
     JSON.stringify({ phase, pid: process.pid, ts: new Date().toISOString(), ...extra }) + '\n'))
   let wave: string | undefined, startRequestedAt = '', startedAt = '', startLagMs = 0, seen = 0, part = 0, busy = false, lastRead = 0
+  let startRequestedMs = 0, capped = false
+  const intervalUs = samplingIntervalUs(dir), capS = profileCapS(dir)
+  const save = async (stopLagMs: number, extra = {}) => {
+    const stopRequestedAt = new Date().toISOString(), { profile } = await post('Profiler.stop')
+    const name = savePart(dir, part++, wave!, { pid: process.pid, intervalUs, startRequestedAt, startedAt, stopRequestedAt,
+      stoppedAt: new Date().toISOString(), startLagMs, stopLagMs, ...extra, profile })
+    event('saved', { wave, name })
+    wave = undefined
+    return name
+  }
   const tick = async () => {
     if (busy || done) return
     busy = true
@@ -124,18 +161,19 @@ export async function startCpuProfile(dir: string, io: ProfilerIo = nodeProfiler
       const marks = waveMarks(dir)
       while (!done && seen < marks.length) {
         const next = marks[seen++]!, lagMs = Math.round(io.now() - since)
-        if (wave !== undefined) {
-          const stopRequestedAt = new Date().toISOString(), { profile } = await post('Profiler.stop')
-          const name = savePart(dir, part++, wave, { pid: process.pid, startRequestedAt, startedAt, stopRequestedAt,
-            stoppedAt: new Date().toISOString(), startLagMs, stopLagMs: lagMs, profile })
-          event('saved', { wave, name })
-          wave = undefined
-        }
-        if (next === CPU_PROFILE_END) return finish('complete.json', { parts: part })
-        startRequestedAt = new Date().toISOString()
+        if (wave !== undefined) await save(lagMs)
+        if (next === CPU_PROFILE_END) return finish('complete.json', capped ? { parts: part, capped: true } : { parts: part })
+        if (capped) continue
+        startRequestedAt = new Date().toISOString(); startRequestedMs = io.now()
         await post('Profiler.start')
         wave = next; startedAt = new Date().toISOString(); startLagMs = lagMs
         event('started', { wave, lagMs })
+      }
+      const sampledMs = io.now() - startRequestedMs
+      if (!done && wave !== undefined && capS !== undefined && sampledMs >= capS * 1000) {
+        const capWave = wave, name = await save(Math.round(sampledMs - capS * 1000), { cappedAfterMs: Math.round(sampledMs) })
+        capped = true
+        event('capped', { wave: capWave, name, afterMs: Math.round(sampledMs) })
       }
     } catch {
       finish('error.txt', { error: 'profiler checkpoint failed' })
@@ -145,8 +183,8 @@ export async function startCpuProfile(dir: string, io: ProfilerIo = nodeProfiler
     session = io.session()
     session.connect()
     await post('Profiler.enable')
-    await post('Profiler.setSamplingInterval', { interval: 1000 })
-    event('ready')
+    await post('Profiler.setSamplingInterval', { interval: intervalUs })
+    event('ready', { intervalUs })
     lastRead = io.now()
     timer = io.every(() => tick().catch(() => finish('error.txt', { error: 'profiler checkpoint failed' })), CPU_PROFILE_POLL_MS)
   } catch { finish('error.txt', { error: 'profiler initialization failed' }) }
@@ -326,20 +364,24 @@ export function checkpointOverlap(dir: string, parts: ProfilePart[], intervals: 
   return String(intervals.filter(v => checkpoints.some(([from, to]) => from! < v.endMs && v.startMs <= to!)).length)
 }
 
-/** `complete` only when complete.json declares the saved parts, the parts are
- * the marked waves in order, and every part holds samples; `inconsistent`
- * when complete.json says otherwise. */
+/** `complete` (`capped` when its cap stopped sampling) only when
+ * complete.json declares the saved parts, the parts are the marked waves in
+ * order, and every part holds samples; `inconsistent` when complete.json
+ * says otherwise. */
 export function profileOutcome(dir: string, parts: ProfilePart[] | undefined): string {
   if (!parts) return 'unreadable'
   if (existsSync(join(dir, 'error.txt'))) return 'error'
   if (!existsSync(join(dir, 'complete.json'))) return 'incomplete'
-  let declared: unknown
-  try { declared = JSON.parse(readFileSync(join(dir, 'complete.json'), 'utf8'))?.parts } catch { /* inconsistent below */ }
+  let declared: unknown, capped = false
+  try {
+    const complete = JSON.parse(readFileSync(join(dir, 'complete.json'), 'utf8'))
+    declared = complete?.parts; capped = complete?.capped === true
+  } catch { /* inconsistent below */ }
   const marks = waveMarks(dir), end = marks.indexOf(CPU_PROFILE_END)
   const expected = end < 0 ? marks : marks.slice(0, end)
   const usable = declared === parts.length && parts.length > 0 && parts.map(p => p.wave).join('\n') === expected.join('\n')
     && parts.every(p => summarizeWave(p.wave, [p]).samples > 0)
-  return usable ? 'complete' : 'inconsistent'
+  return !usable ? 'inconsistent' : capped ? 'capped' : 'complete'
 }
 
 /** Whether each part holds its own wave's work: `unreliable` when any cut's

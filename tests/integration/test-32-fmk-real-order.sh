@@ -10,7 +10,11 @@ case_assert() { bun "${CASE_ASSERT}" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${
 # Test-only CPU profile of each thread phase's measured server over its 20
 # samples (fixtures/cpu-profile.ts): one continuous `thread-samples` wave,
 # started before the active window and ended after the last sample, so no
-# profiler checkpoint falls inside a sample. Each sample's push-to-delivery
+# profiler checkpoint falls inside a sample and nothing waits between samples.
+# It samples every 100 ms, and the server stops sampling for good
+# PROFILE_MAX_S after the start (once, even inside a sample; `outcome=capped`)
+# if the phase runs that long, which caps the profile's memory (see the
+# budget row in tests/cpu-profile.test.ts). Each sample's push-to-delivery
 # interval goes to samples.tsv (`delayed-lookup` and `hung-lookup` for the N4
 # lookup samples, `sample` otherwise), and the summary delimits the samples
 # by those intervals. The profile stays in scenario scratch; only its
@@ -21,12 +25,16 @@ case_assert() { bun "${CASE_ASSERT}" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${
 PROFILER="${SCENARIO_FIXTURES}/cpu-profile.ts"
 PROFILE_DIR=""
 PROFILE_SUMMARIZED=0
+PROFILE_INTERVAL_US=100000
+PROFILE_MAX_S=300
 PROFILE_START_WAIT_S=5
 PROFILE_CLEANUP_STOP_S=10
 profile_open() {
     PROFILE_DIR=""
     PROFILE_SUMMARIZED=0
-    if mkdir -p "${REAL_THREAD_EVIDENCE}/cpu-profile" 2> /dev/null; then
+    if mkdir -p "${REAL_THREAD_EVIDENCE}/cpu-profile" 2> /dev/null \
+        && { printf '%s\n' "${PROFILE_INTERVAL_US}" > "${REAL_THREAD_EVIDENCE}/cpu-profile/interval-us" \
+            && printf '%s\n' "${PROFILE_MAX_S}" > "${REAL_THREAD_EVIDENCE}/cpu-profile/max-seconds"; } 2> /dev/null; then
         PROFILE_DIR="${REAL_THREAD_EVIDENCE}/cpu-profile"
     else
         printf 'recorded: cpu-profile unavailable reason=profile-directory\n'
@@ -35,12 +43,14 @@ profile_open() {
 profile_started() {
     [[ -f "${PROFILE_DIR}/observer.jsonl" && "$(< "${PROFILE_DIR}/observer.jsonl")" == *'"phase":"started"'* ]]
 }
+# Waits up to PROFILE_START_WAIT_S for the start, not once the profiler failed.
 profile_begin() {
     [[ -n "${PROFILE_DIR}" ]] || return 0
     local tries
     if ! { printf 'thread-samples\n' >> "${PROFILE_DIR}/waves"; } 2> /dev/null; then return 0; fi
     for ((tries = PROFILE_START_WAIT_S * 10; tries > 0; tries--)); do
         if profile_started; then return 0; fi
+        if [[ -e "${PROFILE_DIR}/error.txt" ]]; then break; fi
         sleep 0.1
     done
     printf 'recorded: cpu-profile start unacknowledged wait_s=%s\n' "${PROFILE_START_WAIT_S}"

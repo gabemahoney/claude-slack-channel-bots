@@ -2581,7 +2581,8 @@ globalThis.fetch = async (_url, init) => {
       recovered_id: replay.find(l => l.ordinal === i.ordinal)?.envelope_id ?? '-' }))
     expect(accountingVerdicts(accounts, records, during, final, queues, seq).every(r => r.verdict === 'pass')).toBe(true)
   }, recoveryTransport))
-  test('fault CLI check reads every original, replay, snapshot and unchanged ordinary predicate', () => withCLI((root, cli) => {
+  // fault-check's evidence directory for composed(); `before` gives each key's pre-burst joins, `after` its post-restart extras.
+  function faultCheckEvidence(root: string, before: (key: string) => object[] = () => [], after: (key: string) => object[] = () => []) {
     const e = composed(), dir = join(root, 'e'); mkdirSync(join(dir, 'during'), { recursive: true })
     writeFileSync(join(dir, 'fault-plan.json'), JSON.stringify({ context: { scenario: 'test-fault', mode: 'strict', population: 0, recipients: 2 }, plan: e.plan }))
     writeFileSync(join(dir, 'fault-ledger.jsonl'), lines(e.ledger!))
@@ -2591,10 +2592,13 @@ globalThis.fetch = async (_url, init) => {
     for (const key of e.plan.keys) {
       writeFileSync(join(dir, `${key}.queue.jsonl`), lines(e.queues[key]!))
       writeFileSync(join(dir, 'during', `${key}.queue.jsonl`), lines(e.duringQueues[key]!))
-      writeFileSync(join(dir, `${key}.before.jsonl`), '')
-      writeFileSync(join(dir, `${key}.after.jsonl`), lines(e.plan.items.filter(i => i.key === key && i.phase === 'roots').map(i => ({ channel: i.channel, root: i.ts }))))
+      writeFileSync(join(dir, `${key}.before.jsonl`), before(key).length ? lines(before(key)) : '')
+      writeFileSync(join(dir, `${key}.after.jsonl`), lines([...e.plan.items.filter(i => i.key === key && i.phase === 'roots').map(i => ({ channel: i.channel, root: i.ts })), ...after(key)]))
     }
-    const args = [dir, join(root, 'stub'), String(e.clearMark), String(e.clearAt), join(root, 'measurements'), '0', '0', '1']
+    return { e, dir, args: [dir, join(root, 'stub'), String(e.clearMark), String(e.clearAt), join(root, 'measurements'), '0', '0', '1'] }
+  }
+  test('fault CLI check reads every original, replay, snapshot and unchanged ordinary predicate', () => withCLI((root, cli) => {
+    const { e, dir, args } = faultCheckEvidence(root)
     const pass = cli('fault-check', args)
     expect(pass.status).toBe(0); expect(String(pass.stdout)).toContain('fault-overlap'); expect(String(pass.stdout)).toContain('post-hold-overlap')
     const q = e.plan.items.find(i => i.key !== e.plan.key)!
@@ -2602,6 +2606,21 @@ globalThis.fetch = async (_url, init) => {
     writeFileSync(join(dir, 'times.jsonl'), lines(e.times!))
     const fail = cli('fault-check', args)
     expect(fail.status).toBe(1); expect(String(fail.stdout)).toContain('verdict=fail'); expect(String(fail.stdout)).toContain('recorded: sr8 summary')
+  }))
+  test.each([
+    ['kept after the restart passes', true],
+    ['lost through the burst and restart fails', false],
+  ])('fault CLI check judges each persona\'s joins by identity, printing the baseline excess: a notice\'s extra pre-burst join %s', (_name, kept) => withCLI((root, cli) => {
+    const notice = (key: string) => [{ channel: 'C0LARGE00003', root: `5.${key}`, source: 'own-post' }]
+    const { e, args } = faultCheckEvidence(root, notice, key => kept ? notice(key) : [])
+    const child = cli('fault-check', args)
+    expect(child.status).toBe(kept ? 0 : 1)
+    expect(String(child.stdout).split('\n').filter(l => l.startsWith('recorded: sr8 joins '))).toEqual(e.plan.keys.map(key => {
+      const roots = e.plan.items.filter(i => i.key === key && i.phase === 'roots').length, after = roots + (kept ? 1 : 0)
+      return `recorded: sr8 joins scenario=test-fault mode=strict population=0 recipients=2 samples=${after} before=1 after=${after} oldest_retained=0 forgotten=0`
+        + ` baseline_excess=1 excess_sources=own-post:1 excess_channels=C0LARGE00003:1 baseline_lost=${kept ? 0 : 1} burst_missing=0 persona=${key}`
+        + ` limit=>=${roots} verdict=${kept ? 'pass' : 'fail'}`
+    }))
   }))
   test('fault CLI declares plan-derived dependencies and sends both waves without withheld ACKs', () => withCLI((root, cli) => {
     const e = composed(), batch = join(root, 'batches'), out = join(root, 'e'), state = join(root, 'state')
@@ -3003,11 +3022,33 @@ describe('SR-8 evidence verdicts (synthetic evidence, no runtime performance cla
     missing(compactionVerdict(rows.slice(1), [key], true))
     for (const change of [{ inside: false }, { after: '1:1' }, { before: '' }]) missing(compactionVerdict([{ ...rows[0], ...change }, rows[1]], [key], true))
   })
-  test('joins preserve each oldest identity, not only the count', () => {
-    const old = [{ channel: 'channel', root: '1' }], added = [{ channel: 'channel', root: '2' }]
-    expect(joinsVerdict(old, [...old, ...added], old, added, 1).verdict).toBe('pass')
-    expect(joinsVerdict(old, [...added, { channel: 'channel', root: '3' }], old, added, 1).verdict).toBe('fail')
-    missing(joinsVerdict(undefined, [...old, ...added], old, added, 1))
+  describe('joins: every seed before the burst, every pre-burst join and burst root after it', () => {
+    // S seeds, N burst roots, and the first start's seal-report notice's own-post join.
+    const joined = (channel: string, root: string, source = 'mention') => ({ channel, root, source })
+    const S = [joined('C1', '1'), joined('C1', '2')], N = [joined('C1', '9')], notice = joined('C0LARGE00003', '5', 'own-post')
+    const other = joined('C1', '7')
+    test.each([
+      ['the seal notice\'s extra pre-burst join, kept', [...S, notice], [...S, notice, ...N], 'pass', [1, 'own-post:1', 'C0LARGE00003:1', 0, 0]],
+      ['no extra join', S, [...S, ...N], 'pass', [0, 'none', 'none', 0, 0]],
+      ['a seed lost before the burst while the extra keeps the count', [S[0]!, notice], [...S, notice, ...N], 'fail', [1, 'own-post:1', 'C0LARGE00003:1', 0, 0]],
+      ['the extra pre-burst join lost through the burst and restart', [...S, notice], [...S, ...N, other], 'fail', [1, 'own-post:1', 'C0LARGE00003:1', 1, 0]],
+      ['a burst root missing while another join keeps the count', [...S, notice], [...S, notice, other], 'fail', [1, 'own-post:1', 'C0LARGE00003:1', 0, 1]],
+    ] as const)('%s', (_name, before, after, verdict, [excess, sources, channels, lost, burstMissing]) => {
+      const r = joinsVerdict([...before], [...after], S, N, 1)
+      expect(r.verdict).toBe(verdict)
+      expect(r.stats).toMatchObject({ baseline_excess: excess, excess_sources: sources, excess_channels: channels, baseline_lost: lost, burst_missing: burstMissing })
+    })
+    test('missing snapshots stay missing', () => {
+      missing(joinsVerdict(undefined, [...S, ...N], S, N, 1))
+      missing(joinsVerdict([...S, notice], undefined, S, N, 1))
+    })
+    test('the baseline excess prints content-free: counts per source and channel word, never other text', () => {
+      const odd = [joined('C2', '6', 'own post <text>'), joined('C2', '8', 'own-post'), { channel: 'C3 x', root: '4' }]
+      const output: string[] = []
+      printResults(context, [joinsVerdict([...S, ...odd], [...S, ...odd, ...N], S, N, 1)], line => output.push(line))
+      expect(output[0]).toBe('recorded: sr8 joins scenario=test-control mode=strict population=100000 recipients=1 samples=6 before=5 after=6'
+        + ' oldest_retained=2 forgotten=0 baseline_excess=3 excess_sources=other:2,own-post:1 excess_channels=C2:2,other:1 baseline_lost=0 burst_missing=0 limit=>=3 verdict=pass')
+    })
   })
   test('N2 sample counts are distinct and all required samples remain present', () => {
     const samples = Array.from({ length: 20 }, (_, i) => ({ ...item(i + 1), name: 'fallback' }))
