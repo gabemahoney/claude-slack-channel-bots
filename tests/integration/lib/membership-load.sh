@@ -94,7 +94,11 @@ start_ready() {
     recordings="$(count_log "${recording_line}")"
     session_barrier_mark "${KEYS[@]}"
     if [[ "${1:-}" == measured ]]; then START_MS="$(mono_ms)"; fi
-    start_server --live
+    if [[ "${1:-}" == measured && -n "${MEMBERSHIP_PROFILE_DIR:-}" ]]; then
+        BUN_OPTIONS="--preload ${SCENARIO_FIXTURES}/cpu-profile-preload.ts" CSCB_TEST_CPU_PROFILE_DIR="${MEMBERSHIP_PROFILE_DIR}" start_server --live
+    else
+        start_server --live
+    fi
     wait_for_count "$(completion_match 2)" "$((completions + 1))" 150 'two-persona startup incomplete'
     expect_one_overrides_line 'SR-8 compaction override' "${overrides}" 30
     wait_for_count "${recording_line}" "$((recordings + 1))" 30 'measurement recorder not enabled'
@@ -376,15 +380,51 @@ reopen_observe() {
     done
 }
 
+# Test-only CPU profile of one case's measured server over its fault burst
+# and ordered writes (tests/integration/fixtures/cpu-profile.ts): only the
+# case `--cpu-profile` names opts in, and only test-45 passes it. The profile
+# stays in the case's scratch; only its content-free summary reaches the log,
+# once: right after the burst and ordered writes, or from the cleanup hook,
+# which first stops the profile (bounded) while the server still runs, so the
+# wave in progress is saved too. No profile step changes the script's status.
+MEMBERSHIP_PROFILE_CASE=''
+MEMBERSHIP_PROFILE_DIR=''
+MEMBERSHIP_PROFILE_SUMMARIZED=0
+MEMBERSHIP_PROFILE_CLEANUP_STOP_S=10
+membership_profile_open() {
+    MEMBERSHIP_PROFILE_DIR=''
+    MEMBERSHIP_PROFILE_SUMMARIZED=0
+    [[ -n "${MEMBERSHIP_PROFILE_CASE}" && "${CASE_KIND}" == "${MEMBERSHIP_PROFILE_CASE}" ]] || return 0
+    if mkdir -p "${ROOT}/cpu-profile" 2> /dev/null; then
+        MEMBERSHIP_PROFILE_DIR="${ROOT}/cpu-profile"
+    else
+        printf 'recorded: cpu-profile unavailable reason=profile-directory\n'
+    fi
+}
+# Waits up to $1 s for the profile to finish, marking `end` if no `end` is
+# marked yet, then prints its summary; once per case.
+membership_profile_collect() {
+    [[ -n "${MEMBERSHIP_PROFILE_DIR}" && "${MEMBERSHIP_PROFILE_SUMMARIZED}" == 0 ]] || return 0
+    MEMBERSHIP_PROFILE_SUMMARIZED=1
+    if [[ -s "${MEMBERSHIP_PROFILE_DIR}/waves" ]]; then
+        bun "${SCENARIO_FIXTURES}/cpu-profile.ts" stop "${MEMBERSHIP_PROFILE_DIR}" "$1" || printf 'recorded: cpu-profile stop unavailable\n'
+    fi
+    bun "${SCENARIO_FIXTURES}/cpu-profile.ts" summary "${MEMBERSHIP_PROFILE_DIR}" "${C[@]}" || printf 'recorded: cpu-profile summary unavailable\n'
+}
+membership_profile_cleanup() { membership_profile_collect "${MEMBERSHIP_PROFILE_CLEANUP_STOP_S}"; }
+
 run_membership_load() {
     require_ci_image "membership load"
     require_scenario_home "membership load"
-    [[ "$#" == 1 && ( "$1" == strict || "$1" == open ) ]] || fail 'membership load requires one channel mode'
+    [[ ( "$#" == 1 || ( "$#" == 3 && "$2" == --cpu-profile && -n "$3" ) ) && ( "$1" == strict || "$1" == open ) ]] \
+        || fail 'membership load requires one channel mode and optionally --cpu-profile <case>'
     MODE="$1"
+    MEMBERSHIP_PROFILE_CASE="${3:-}"
     E="${SCENARIO_FIXTURES}/sr8-evidence.ts"
     PRINTER="${SCENARIO_FIXTURES}/fmk-texts.ts"
     on_exit repair_modes
     on_before_cleanup reopen_observe
+    if [[ -n "${MEMBERSHIP_PROFILE_CASE}" ]]; then on_before_cleanup membership_profile_cleanup; fi
 
     REQUEST_MS="$(printed MEMBERSHIP_REQUEST_TIMEOUT_MS)"
     ATTEMPT_MS="$(printed MEMBERSHIP_ATTEMPT_TIMEOUT_MS)"
@@ -418,6 +458,7 @@ run_membership_load() {
         WRITES="${ROOT}/writes"
         PLAN="${ROOT}/plan.tsv"
         mkdir -p "${BATCH}" "${WRITES}"
+        membership_profile_open
         bun "${E}" cpu-mark "${ROOT}/cpu.before" || :
         new_state_dir "${MODE}-${CASE_KIND}"
         CONFIG="${SLACK_STATE_DIR}/config.json"
@@ -568,7 +609,7 @@ PY
             # Strict keeps its whole second wave concurrent: no tail release.
             TAIL_RELEASE=()
             if [[ "${MODE}" == open ]]; then TAIL_RELEASE=("${OUT}/tail-release"); fi
-            bun "${E}" fault-burst "${C[@]}" "${OUT}" "${SCENARIO_SLACK_STUB_URL}" "${SCENARIO_SLACK_RECORD}" \
+            SR8_PROFILE_DIR="${MEMBERSHIP_PROFILE_DIR}" bun "${E}" fault-burst "${C[@]}" "${OUT}" "${SCENARIO_SLACK_STUB_URL}" "${SCENARIO_SLACK_RECORD}" \
                 "${SLACK_STATE_DIR}" "${MEASUREMENTS}" "${MEASURE_MARK}" "${WAIT_MS}" ${TAIL_RELEASE[@]+"${TAIL_RELEASE[@]}"} &
         fi
         BURST_PID=$!
@@ -577,6 +618,9 @@ PY
         # Every network-fault case overlaps these ordered Q writes instead.
         if [[ "${KIND}" != undurable ]]; then ordered_writes; fi
         wait "${BURST_PID}" || fail 'full original burst did not complete'
+        # The profile ends with the burst and the ordered writes, and its
+        # summary prints at once, so a later failing verdict keeps it.
+        membership_profile_collect 30
 
         if [[ "${KIND}" =~ ^(hang|transient|rate|scope|denied)$ ]]; then
             wait_until "$((WAIT_S * 2))" 'two membership failures did not settle' membership_settled_twice

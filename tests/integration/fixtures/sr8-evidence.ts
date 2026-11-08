@@ -53,7 +53,7 @@
  *     Writes burst.jsonl (key/phase/channel/ts/sender/envelope_id, no text) and
  *     compactions.jsonl. Labels MUST equal population persona keys. Bounded wait;
  *     failure still retains submitted identities. HTTP responses are not ACK evidence.
- *     With SR8_PROFILE_DIR set (test-44's burst case only), each wave's name is
+ *     With SR8_PROFILE_DIR set (only test-44's burst case runs burst with it), each wave's name is
  *     appended to <dir>/waves at its start and `end` after the last, as the
  *     phase-cpu readings are taken, for cpu-profile.ts's per-wave profile parts.
  *     Compaction proof: two existing dev:ino identities, both observed after the first
@@ -382,6 +382,9 @@
  *     SR8_FAULT_TAIL_ITEMS independent replies wait (within wait-ms) until that
  *     file exists; the script creates it after the ordered writes' result mark,
  *     so Q's burst ACKs overlap both marks. Strict submits its second wave at once.
+ *     With SR8_PROFILE_DIR set (test-45's profiled case only), `held` (when there
+ *     are held probes), `roots` and `replies-drops` are appended to <dir>/waves as
+ *     each wave's sends start; the script marks `end` after its ordered writes.
  *     Appends each original HTTP result to fault-ledger.jsonl by planned ordinal:
  *     envelope_id, or denied-case no-open-socket/send-failed refusal with NO invented
  *     envelope. Unrecognized refusals/timeouts fail and retain the attempted item.
@@ -1168,15 +1171,19 @@ export function faultTailOption(mode: Context['mode'], plan: FaultPlan, released
   return mode === 'open' ? { items: faultTail(plan), released } : undefined
 }
 export async function faultWaves(items: FaultItem[], send: (item: FaultItem) => Promise<void>, wait: (items: FaultItem[]) => Promise<boolean>,
-  admitHeld: (items: FaultItem[]) => Promise<boolean>, tail?: { items: FaultItem[]; released: () => Promise<boolean> }): Promise<boolean> {
+  admitHeld: (items: FaultItem[]) => Promise<boolean>, tail?: { items: FaultItem[]; released: () => Promise<boolean> },
+  mark: (wave: string) => void = () => {}): Promise<boolean> {
   const held = items.filter(i => i.phase === 'held')
+  if (held.length) mark('held')
   await Promise.all(held.map(send))
   if (held.length && (!await wait(held.filter(i => !i.dependent)) || !await admitHeld(held.filter(i => !i.dependent)))) return false
   const roots = items.filter(i => i.phase === 'roots')
+  mark('roots')
   await Promise.all(roots.map(send))
   if (!await wait(roots.filter(i => !i.dependent))) return false
   const rest = items.filter(i => !['roots', 'held'].includes(i.phase))
   const late = new Set(tail?.items.map(i => i.ordinal))
+  mark('replies-drops')
   await Promise.all(rest.filter(i => !late.has(i.ordinal)).map(send))
   const released = !tail || await tail.released()
   await Promise.all(rest.filter(i => late.has(i.ordinal)).map(send))
@@ -1700,9 +1707,14 @@ async function faultBurst(c: Context, args: string[]): Promise<number> {
     }
     return false
   }
+  // test-45's opt-in CPU profile cuts one part per wave at these marks (cpu-profile.ts).
+  const profileDir = process.env.SR8_PROFILE_DIR
+  const profileMark = (wave: string) => {
+    if (profileDir) try { appendFileSync(join(profileDir, 'waves'), `${wave}\n`, { mode: 0o600 }) } catch { /* never changes the burst */ }
+  }
   try {
     const good = await faultWaves(plan.items, send, wait, held => holdAdmission(held, stateDir, measurement, numeric(mark), waitMs, dir),
-      release === undefined ? undefined : faultTailOption(c.mode, plan, released))
+      release === undefined ? undefined : faultTailOption(c.mode, plan, released), profileMark)
     return good && !failed ? 0 : 1
   } finally {
     clearInterval(timer)

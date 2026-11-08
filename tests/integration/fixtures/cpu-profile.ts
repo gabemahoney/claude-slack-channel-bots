@@ -1,13 +1,23 @@
 /**
- * Test-only CPU profile of the packed server over test-44's burst waves.
+ * Test-only CPU profile of the packed server over a script's measured waves.
  * Diagnostic only: it prints `recorded:` lines and never sets a verdict.
  *
- * test-44's burst case alone opts in: its measured start runs the server with
- * BUN_OPTIONS="--preload cpu-profile-preload.ts" and CSCB_TEST_CPU_PROFILE_DIR,
- * and sr8-evidence's burst appends each wave's name to <dir>/waves
- * (SR8_PROFILE_DIR). The preload samples only the daemon child, from the
- * first wave mark until `end`, saving one part-<n>-<wave>.json per wave. The
- * profile stays in scenario scratch; only the summary reaches the script log.
+ * Only tests 44, 45 and 32 opt in, each for one measured server start, which
+ * runs with BUN_OPTIONS="--preload cpu-profile-preload.ts" and
+ * CSCB_TEST_CPU_PROFILE_DIR; each wave's name is appended to <dir>/waves:
+ *   test-44's burst case: sr8-evidence's burst (SR8_PROFILE_DIR), per wave.
+ *   test-45's first-hang case: sr8-evidence's fault-burst (SR8_PROFILE_DIR),
+ *     per wave; the ordered writes fall in its waves, and the script marks
+ *     `end` after them.
+ *   test-32's thread phases: the script, one `thread-samples` wave over all
+ *     20 samples, so no cut falls inside a sample. It writes each sample's
+ *     push-to-delivery interval to <dir>/samples.tsv (wave TAB start TAB end,
+ *     epoch ms; wave `sample`, `delayed-lookup` or `hung-lookup`), and the
+ *     summary delimits the profile's samples by those intervals.
+ * The preload samples only the daemon child, from the first wave mark until
+ * `end`, saving one part-<n>-<wave>.json per wave; parts of one wave name are
+ * summarized together. The profile stays in scenario scratch; only the
+ * summary reaches the script log.
  *
  * The server sees a mark only when its poll timer runs, so each cut records
  * its lag: the time from the last read of <dir>/waves that lacked the mark to
@@ -24,6 +34,11 @@
  *     samples, weight and duration, and the top functions and files by self
  *     and total share of samples, then of weight. A sample's weight is the
  *     profiler's time delta before it (elapsed time, not exact on-CPU time).
+ *     With samples.tsv: the slices line (interval count, the profile clock,
+ *     and how many intervals overlap a checkpoint: a part's start, from its
+ *     request to Profiler.start's answer, or its stop, from its request to
+ *     the part's save), then the same rows per slice (`parts` counts its
+ *     intervals, per profile part; `between` is every sample outside them).
  *     Function names and source locations only; no event, message or log content.
  */
 import { appendFileSync, existsSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
@@ -99,7 +114,7 @@ export async function startCpuProfile(dir: string, io: ProfilerIo = nodeProfiler
     session!.post(method, params, (error, answer) => error ? reject(error) : resolve(answer)))
   const event = (phase: string, extra = {}) => quietly(() => io.append(join(dir, 'observer.jsonl'),
     JSON.stringify({ phase, pid: process.pid, ts: new Date().toISOString(), ...extra }) + '\n'))
-  let wave: string | undefined, startedAt = '', startLagMs = 0, seen = 0, part = 0, busy = false, lastRead = 0
+  let wave: string | undefined, startRequestedAt = '', startedAt = '', startLagMs = 0, seen = 0, part = 0, busy = false, lastRead = 0
   const tick = async () => {
     if (busy || done) return
     busy = true
@@ -110,12 +125,14 @@ export async function startCpuProfile(dir: string, io: ProfilerIo = nodeProfiler
       while (!done && seen < marks.length) {
         const next = marks[seen++]!, lagMs = Math.round(io.now() - since)
         if (wave !== undefined) {
-          const { profile } = await post('Profiler.stop')
-          const name = savePart(dir, part++, wave, { pid: process.pid, startedAt, stoppedAt: new Date().toISOString(), startLagMs, stopLagMs: lagMs, profile })
+          const stopRequestedAt = new Date().toISOString(), { profile } = await post('Profiler.stop')
+          const name = savePart(dir, part++, wave, { pid: process.pid, startRequestedAt, startedAt, stopRequestedAt,
+            stoppedAt: new Date().toISOString(), startLagMs, stopLagMs: lagMs, profile })
           event('saved', { wave, name })
           wave = undefined
         }
         if (next === CPU_PROFILE_END) return finish('complete.json', { parts: part })
+        startRequestedAt = new Date().toISOString()
         await post('Profiler.start')
         wave = next; startedAt = new Date().toISOString(); startLagMs = lagMs
         event('started', { wave, lagMs })
@@ -138,7 +155,11 @@ export async function startCpuProfile(dir: string, io: ProfilerIo = nodeProfiler
 interface CallFrame { functionName?: string; url?: string; lineNumber?: number }
 interface ProfileNode { id: number; callFrame: CallFrame; children?: number[] }
 export interface CpuProfile { nodes: ProfileNode[]; samples?: number[]; timeDeltas?: number[]; startTime?: number; endTime?: number }
-export interface ProfilePart { wave: string; profile: CpuProfile; startLagMs?: number; stopLagMs?: number }
+export interface ProfilePart {
+  wave: string; profile: CpuProfile; startLagMs?: number; stopLagMs?: number
+  /** ISO times of the part's checkpoints, and its file name; absent in older parts. */
+  startRequestedAt?: string; startedAt?: string; stopRequestedAt?: string; file?: string
+}
 /** Sample counts and weights (µs) of one function or file. */
 export interface FrameShare { name: string; self: number; total: number; selfUs: number; totalUs: number }
 export interface WaveSummary {
@@ -208,9 +229,9 @@ const lagText = (lag: number | undefined) => lag === undefined ? 'unknown' : Str
 /** Content-free lines: one per wave in profile order and `all`, each followed
  * by its top functions and files by self and total share of samples, then
  * by self and total share of weight. */
-export function summaryLines(context: string, parts: ProfilePart[], top = CPU_PROFILE_TOP): string[] {
+export function summaryLines(context: string, parts: ProfilePart[], top = CPU_PROFILE_TOP, all = true): string[] {
   const waves = [...new Set(parts.map(p => p.wave))]
-  const groups = [...waves.map(w => summarizeWave(w, parts.filter(p => p.wave === w))), ...(parts.length ? [summarizeWave('all', parts)] : [])]
+  const groups = [...waves.map(w => summarizeWave(w, parts.filter(p => p.wave === w))), ...(all && parts.length ? [summarizeWave('all', parts)] : [])]
   return groups.flatMap(g => {
     const head = `recorded: cpu-profile ${context} wave=${g.wave}`
     const rows = (kind: 'function' | 'file', shares: FrameShare[], n: number) => RANKINGS.flatMap(([by, field]) =>
@@ -226,14 +247,83 @@ export function summaryLines(context: string, parts: ProfilePart[], top = CPU_PR
 
 const partFile = /^part-\d{4}-[a-z-]+\.json$/
 const lagField = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? value : undefined
+const timeField = (value: unknown) => typeof value === 'string' && Number.isFinite(Date.parse(value)) ? value : undefined
 export function readParts(dir: string): ProfilePart[] | undefined {
   try {
     return readdirSync(dir).filter(f => partFile.test(f)).sort().map(f => {
       const data = JSON.parse(readFileSync(join(dir, f), 'utf8'))
       if (typeof data?.wave !== 'string' || !Array.isArray(data?.profile?.nodes)) throw new Error('part')
-      return { wave: data.wave, profile: data.profile, startLagMs: lagField(data.startLagMs), stopLagMs: lagField(data.stopLagMs) }
+      return { wave: data.wave, profile: data.profile, startLagMs: lagField(data.startLagMs), stopLagMs: lagField(data.stopLagMs),
+        startRequestedAt: timeField(data.startRequestedAt), startedAt: timeField(data.startedAt), stopRequestedAt: timeField(data.stopRequestedAt), file: f }
     })
   } catch { return undefined }
+}
+
+/** One sample's push-to-delivery interval from <dir>/samples.tsv, epoch ms. */
+export interface SampleInterval { wave: string; startMs: number; endMs: number }
+/** undefined when there is no samples.tsv; 'unreadable' when any line is malformed. */
+export function readSampleIntervals(dir: string): SampleInterval[] | 'unreadable' | undefined {
+  if (!existsSync(join(dir, 'samples.tsv'))) return undefined
+  try {
+    const intervals = readFileSync(join(dir, 'samples.tsv'), 'utf8').split('\n').filter(Boolean).map(line => {
+      const [wave, start, end, extra] = line.split('\t')
+      const startMs = Number(start), endMs = Number(end)
+      if (extra !== undefined || !/^[a-z-]+$/.test(wave ?? '') || !/^\d+$/.test(start ?? '') || !/^\d+$/.test(end ?? '') || endMs < startMs) throw new Error('interval')
+      return { wave: wave!, startMs, endMs }
+    })
+    return intervals.length ? intervals : 'unreadable'
+  } catch { return 'unreadable' }
+}
+
+/** The epoch-µs offset of a part's profile clock: Bun's profiles are on the
+ * epoch clock already; any other clock is anchored at the part's startedAt. */
+function clockOffsetUs(part: ProfilePart): { offsetUs: number; clock: 'epoch' | 'anchored' } | undefined {
+  const start = part.profile.startTime, startedMs = part.startedAt === undefined ? NaN : Date.parse(part.startedAt)
+  if (!Number.isFinite(start) || !Number.isFinite(startedMs)) return undefined
+  return Math.abs(start! / 1000 - startedMs) <= 60_000 ? { offsetUs: 0, clock: 'epoch' } : { offsetUs: startedMs * 1000 - start!, clock: 'anchored' }
+}
+
+/** Each part's samples cut by the intervals: one synthetic part per part and
+ * interval, named by the interval's wave, then `between` for each part's
+ * samples outside them. A sample belongs to the half-open interval holding
+ * its own time; a synthetic part's duration is its overlap with the part. */
+export function sliceParts(parts: ProfilePart[], intervals: SampleInterval[]): { clock: string; slices: ProfilePart[] } {
+  const clocks = parts.map(clockOffsetUs)
+  if (!parts.length || clocks.some(c => c === undefined)) return { clock: 'unavailable', slices: [] }
+  const sliced = parts.map((part, p) => {
+    const { profile } = part, offsetUs = clocks[p]!.offsetUs
+    const from = profile.startTime! + offsetUs, to = Number.isFinite(profile.endTime) ? profile.endTime! + offsetUs : from
+    const views = [...intervals, undefined].map(v => ({ wave: v?.wave ?? 'between', samples: [] as number[], timeDeltas: [] as number[],
+      durationUs: v ? Math.max(0, Math.min(to, v.endMs * 1000) - Math.max(from, v.startMs * 1000)) : 0 }))
+    views.at(-1)!.durationUs = Math.max(0, to - from - views.slice(0, -1).reduce((n, v) => n + v.durationUs, 0))
+    let at = from
+    for (const [i, id] of (profile.samples ?? []).entries()) {
+      const delta = Math.max(0, Number(profile.timeDeltas?.[i]) || 0)
+      at += delta
+      const k = intervals.findIndex(v => at >= v.startMs * 1000 && at < v.endMs * 1000)
+      views.at(k)!.samples.push(id); views.at(k)!.timeDeltas.push(delta)
+    }
+    return views.map(v => ({ wave: v.wave, profile: { nodes: profile.nodes, samples: v.samples, timeDeltas: v.timeDeltas, startTime: 0, endTime: v.durationUs } }))
+  })
+  // Intervals in file order, then `between`, across parts.
+  return { clock: clocks.some(c => c!.clock === 'anchored') ? 'anchored' : 'epoch',
+    slices: intervals.map((_, k) => k).concat(intervals.length).flatMap(k => sliced.map(views => views[k]!)) }
+}
+
+/** How many intervals overlap a checkpoint: a part's start (startRequestedAt
+ * to startedAt) or its stop (stopRequestedAt to the observer's `saved` time);
+ * `unknown` when any checkpoint time is missing. */
+export function checkpointOverlap(dir: string, parts: ProfilePart[], intervals: SampleInterval[]): string {
+  let saved: Map<string, number>
+  try {
+    saved = new Map(readFileSync(join(dir, 'observer.jsonl'), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l))
+      .filter(e => e?.phase === 'saved' && typeof e.name === 'string').map(e => [e.name, Date.parse(e.ts)]))
+  } catch { return 'unknown' }
+  const at = (iso: string | undefined) => iso === undefined ? NaN : Date.parse(iso)
+  const checkpoints = parts.flatMap(p => [[at(p.startRequestedAt), at(p.startedAt)], [at(p.stopRequestedAt), saved.get(p.file ?? '') ?? NaN]])
+  if (!parts.length || checkpoints.some(([from, to]) => !Number.isFinite(from) || !Number.isFinite(to))) return 'unknown'
+  // A checkpoint is closed at both ends (ms resolution), an interval half-open.
+  return String(intervals.filter(v => checkpoints.some(([from, to]) => from! < v.endMs && v.startMs <= to!)).length)
 }
 
 /** `complete` only when complete.json declares the saved parts, the parts are
@@ -262,9 +352,14 @@ export function profileSplit(parts: ProfilePart[]): string {
 
 /** Lines for the script log: the profile's outcome and split first, then its summary. */
 export function summaryReport(dir: string, context: string): string[] {
-  const parts = readParts(dir)
-  return [`recorded: cpu-profile ${context} wave=none outcome=${profileOutcome(dir, parts)} parts=${parts?.length ?? 0} ${profileSplit(parts ?? [])}`,
+  const parts = readParts(dir), intervals = readSampleIntervals(dir)
+  const lines = [`recorded: cpu-profile ${context} wave=none outcome=${profileOutcome(dir, parts)} parts=${parts?.length ?? 0} ${profileSplit(parts ?? [])}`,
     ...summaryLines(context, parts ?? [])]
+  if (intervals === undefined) return lines
+  if (intervals === 'unreadable') return [...lines, `recorded: cpu-profile ${context} wave=none slices=unreadable clock=unavailable checkpoint_overlap=unknown`]
+  const { clock, slices } = sliceParts(parts ?? [], intervals)
+  return [...lines, `recorded: cpu-profile ${context} wave=none slices=${intervals.length} clock=${clock} checkpoint_overlap=${checkpointOverlap(dir, parts ?? [], intervals)}`,
+    ...summaryLines(context, slices, CPU_PROFILE_TOP, false)]
 }
 
 async function stop(dir: string, waitS: number): Promise<string> {

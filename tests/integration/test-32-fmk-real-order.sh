@@ -7,6 +7,74 @@ source "$(dirname "$0")/lib/real-scenario.sh"
 source "$(dirname "$0")/lib/real-recovery.sh"
 CASE_ASSERT="${SCENARIO_FIXTURES}/real-case-assertions.ts"
 case_assert() { bun "${CASE_ASSERT}" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${@:2}"; }
+# Test-only CPU profile of each thread phase's measured server over its 20
+# samples (fixtures/cpu-profile.ts): one continuous `thread-samples` wave,
+# started before the active window and ended after the last sample, so no
+# profiler checkpoint falls inside a sample. Each sample's push-to-delivery
+# interval goes to samples.tsv (`delayed-lookup` and `hung-lookup` for the N4
+# lookup samples, `sample` otherwise), and the summary delimits the samples
+# by those intervals. The profile stays in scenario scratch; only its
+# content-free summary reaches this log, once: after the empty window, or from
+# the cleanup hook, which first stops the profile (bounded) while the server
+# still runs. No profile step changes this script's status or moves an
+# observation boundary.
+PROFILER="${SCENARIO_FIXTURES}/cpu-profile.ts"
+PROFILE_DIR=""
+PROFILE_SUMMARIZED=0
+PROFILE_START_WAIT_S=5
+PROFILE_CLEANUP_STOP_S=10
+profile_open() {
+    PROFILE_DIR=""
+    PROFILE_SUMMARIZED=0
+    if mkdir -p "${REAL_THREAD_EVIDENCE}/cpu-profile" 2> /dev/null; then
+        PROFILE_DIR="${REAL_THREAD_EVIDENCE}/cpu-profile"
+    else
+        printf 'recorded: cpu-profile unavailable reason=profile-directory\n'
+    fi
+}
+profile_started() {
+    [[ -f "${PROFILE_DIR}/observer.jsonl" && "$(< "${PROFILE_DIR}/observer.jsonl")" == *'"phase":"started"'* ]]
+}
+profile_begin() {
+    [[ -n "${PROFILE_DIR}" ]] || return 0
+    local tries
+    if ! { printf 'thread-samples\n' >> "${PROFILE_DIR}/waves"; } 2> /dev/null; then return 0; fi
+    for ((tries = PROFILE_START_WAIT_S * 10; tries > 0; tries--)); do
+        if profile_started; then return 0; fi
+        sleep 0.1
+    done
+    printf 'recorded: cpu-profile start unacknowledged wait_s=%s\n' "${PROFILE_START_WAIT_S}"
+}
+profile_epoch_ms() {
+    local us="${EPOCHREALTIME//[!0-9]/}"
+    printf -v "$1" '%d' "$(( 10#${us} / 1000 ))"
+}
+profile_sample_begin() {
+    if [[ -n "${PROFILE_DIR}" ]]; then profile_epoch_ms PROFILE_SAMPLE_START_MS; fi
+}
+profile_sample_end() {
+    [[ -n "${PROFILE_DIR}" ]] || return 0
+    local wave=sample end_ms
+    profile_epoch_ms end_ms
+    if [[ "$1" == "${REAL_THREAD_DELAYED_TS}" ]]; then wave=delayed-lookup; elif [[ "$1" == "${REAL_THREAD_HUNG_TS}" ]]; then wave=hung-lookup; fi
+    { printf '%s\t%s\t%s\n' "${wave}" "${PROFILE_SAMPLE_START_MS}" "${end_ms}" >> "${PROFILE_DIR}/samples.tsv"; } 2> /dev/null || :
+}
+profile_end() {
+    [[ -n "${PROFILE_DIR}" ]] || return 0
+    { printf 'end\n' >> "${PROFILE_DIR}/waves"; } 2> /dev/null || :
+}
+# Waits up to $1 s for the profile to finish, marking `end` if no `end` is
+# marked yet, then prints its summary; once per phase.
+profile_collect() {
+    [[ -n "${PROFILE_DIR}" && "${PROFILE_SUMMARIZED}" == 0 ]] || return 0
+    PROFILE_SUMMARIZED=1
+    if [[ -s "${PROFILE_DIR}/waves" ]]; then
+        bun "${PROFILER}" stop "${PROFILE_DIR}" "$1" || printf 'recorded: cpu-profile stop unavailable\n'
+    fi
+    bun "${PROFILER}" summary "${PROFILE_DIR}" "${REAL_THREAD_CONTEXT[@]}" || printf 'recorded: cpu-profile summary unavailable\n'
+}
+profile_cleanup() { profile_collect "${PROFILE_CLEANUP_STOP_S}"; }
+on_before_cleanup profile_cleanup
 real_prepare
 # Real reply calls resolve candidates before the next measured DM. This
 # replaces real_persona's default no-tool acknowledgement instruction.
@@ -80,8 +148,13 @@ for thread_mode in strict open; do
     stop_server --stop-bots
     THREAD_LOG_MARK="$(wc -c < "${SLACK_STATE_DIR}/server.log")"
     REAL_CONNECTION_LINE_BASE="$(wc -l < "${SLACK_STATE_DIR}/server.log")"
+    profile_open
     THREAD_START_MS="$(real_thread_now_ms)"
-    start_server --live
+    if [[ -n "${PROFILE_DIR}" ]]; then
+        BUN_OPTIONS="--preload ${SCENARIO_FIXTURES}/cpu-profile-preload.ts" CSCB_TEST_CPU_PROFILE_DIR="${PROFILE_DIR}" start_server --live
+    else
+        start_server --live
+    fi
     THREAD_READY_MS="$(real_thread_now_ms)"
     expect_one_overrides_line thread-measured-start 1 30
     bun "${REAL_SR8}" startup-load "${REAL_THREAD_CONTEXT[@]}" "${THREAD_START_MS}" "${THREAD_READY_MS}"
@@ -104,10 +177,14 @@ for thread_mode in strict open; do
     : > "${REAL_THREAD_EVIDENCE}/operations.tsv"
     shared_queue_snapshot "${REAL_THREAD_EVIDENCE}/queue.jsonl" "${REAL_KEY}" "${SLACK_STATE_DIR}/receipt-history/${REAL_KEY}.jsonl"
     THREAD_INSTANCE="$(real_instance "${REAL_KEY}")"
+    # The profile's start is acknowledged (or given up on) before the active
+    # window and the first sample.
+    profile_begin
     THREAD_ACTIVE_START="$(date +%s.%6N)"
     THREAD_AD_MARK="$(ad_shim_mark)"
     for ((sample=1; sample<=20; sample++)); do
         real_wait_latency_admission "${REAL_KEY}" "${sample}"
+        profile_sample_begin
         THREAD_ENVELOPE="$(real_thread_reply "${sample}")"
         slack_wait_one_ack "${THREAD_ENVELOPE}"
         # The ACK follows the sample's durable admission and precedes delivery
@@ -117,10 +194,14 @@ for thread_mode in strict open; do
         track_pid "${THREAD_WORK_PID}"
         slack_envelope_times "${THREAD_ENVELOPE}" >> "${REAL_THREAD_EVIDENCE}/times.jsonl"
         real_wait_delivery "${REAL_KEY}" "$((sample+1))"
+        profile_sample_end "${REAL_THREAD_SAMPLES[sample-1]}"
         shared_queue_snapshot "${REAL_THREAD_EVIDENCE}/queue.jsonl" "${REAL_KEY}" \
             "${REAL_THREAD_EVIDENCE}/queue.jsonl" "${SLACK_STATE_DIR}/receipt-history/${REAL_KEY}.jsonl"
         wait "${THREAD_WORK_PID}" || fail 'concurrent membership/write work failed'
     done
+    # Only a mark: the server finishes the profile while the script observes,
+    # and nothing waits for it before the empty window.
+    profile_end
     # Admission proves every reply candidate and accepted item has drained. Both
     # endpoint checks are harness AD reads, excluded by ad_cscb_calls.
     real_wait_latency_admission "${REAL_KEY}" 21
@@ -135,6 +216,9 @@ for thread_mode in strict open; do
     bun "${REAL_SR8}" conditions "${SLACK_STATE_DIR}" "${SERVER_PID}"
     shared_queue_snapshot "${REAL_THREAD_EVIDENCE}/queue.jsonl" "${REAL_KEY}" \
         "${REAL_THREAD_EVIDENCE}/queue.jsonl" "${SLACK_STATE_DIR}/receipt-history/${REAL_KEY}.jsonl"
+    # After every observation window and before any verdict, so a failing
+    # gate keeps the summary.
+    profile_collect 30
     # Clean shutdown awaits and drains the measurement recorder before n4 reads it.
     stop_server --stop-bots
     THREAD_N2_STATUS=0

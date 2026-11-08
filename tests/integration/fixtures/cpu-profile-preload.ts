@@ -1,5 +1,5 @@
 /**
- * Test-only Bun preload for test-44's burst case; see cpu-profile.ts. It does
+ * Test-only Bun preload for the profiled starts of tests 44, 45 and 32; see cpu-profile.ts. It does
  * nothing unless cpuProfileOptIn finds the opt-in in the CI image's daemon
  * child. Then it removes the opt-in from this process's environment, so the
  * server's own children never load it, and runs startCpuProfile. Everything,

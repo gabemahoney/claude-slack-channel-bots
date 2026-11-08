@@ -10,7 +10,9 @@ source "$(dirname "$0")/lib/scenario.sh"
 # shellcheck source=lib/membership-load.sh
 source "$(dirname "$0")/lib/membership-load.sh"
 STARTED="$(date +%s)"
-run_membership_load strict
+# Test-only CPU profile of the first-hang case's measured server, for its
+# ordered-write ACK; diagnostic lines only, never a verdict or status.
+run_membership_load strict --cpu-profile first-hang
 assert_no_server_tmux
 assert_no_cscb_include_finished
 assert_no_cscb_delete

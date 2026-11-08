@@ -2191,6 +2191,26 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
     expect(calls.filter(s => s.startsWith('send:replies:'))).toHaveLength(4)
     expect(calls.findIndex(s => s.startsWith('wait:replies'))).toBeGreaterThan(Math.max(...calls.map((s, i) => s.startsWith('send:replies:') ? i : -1)))
   })
+  test.each([true, false])('fault waves mark each wave as its sends start, for the CPU profile (held probes=%p)', async withHeld => {
+    const items = composed().plan.items.filter(i => i.ordinal < 4 || (i.phase === 'replies' && i.ordinal < 2 * SR8_BURST_JOINS + 4) || (withHeld && i.phase === 'held'))
+    const calls: string[] = []
+    const good = await faultWaves(items, async i => { calls.push(`send:${i.phase}`) }, async batch => { calls.push(`wait:${batch[0]?.phase}`); return true },
+      async () => { calls.push('admitted'); return true }, undefined, wave => calls.push(`mark:${wave}`))
+    expect(good).toBe(true)
+    const marks = calls.filter(s => s.startsWith('mark:'))
+    expect(marks).toEqual([...(withHeld ? ['mark:held'] : []), 'mark:roots', 'mark:replies-drops'])
+    if (withHeld) expect(calls.indexOf('mark:held')).toBe(0)
+    // Each mark follows the previous wave's waits and leads its own wave's sends.
+    expect(calls.indexOf('mark:roots')).toBe(withHeld ? calls.indexOf('admitted') + 1 : 0)
+    expect(calls[calls.indexOf('mark:roots') + 1]).toBe('send:roots')
+    expect(calls.indexOf('mark:replies-drops')).toBe(calls.indexOf('wait:roots') + 1)
+    expect(calls[calls.indexOf('mark:replies-drops') + 1]).toBe('send:replies')
+    // A failed wave marks no later wave, and no caller needs to pass a mark.
+    const stopped: string[] = []
+    expect(await faultWaves(items, async () => {}, async () => false, async () => true, undefined, wave => stopped.push(wave))).toBe(false)
+    expect(stopped).toEqual(withHeld ? ['held'] : ['roots'])
+    expect(await faultWaves(items, async () => {}, async () => true, async () => true)).toBe(true)
+  })
   test.each([true, false])('fault waves hold Q\'s tail until released (released=%p), keeping the whole burst', async released => {
     const plan = composed().plan, tail = faultTail(plan), calls: string[] = [], sent = new Set<number>()
     expect(tail.length).toBeGreaterThan(0)
@@ -2619,8 +2639,22 @@ globalThis.fetch = async (_url, init) => {
     expect(ordinary.filter(i => i.phase === 'roots')).toHaveLength(2 * SR8_BURST_JOINS)
     rmSync(join(batch, 'held.batch.jsonl'))
     expect(cli('burst', [batch, 'http://127.0.0.1:1', join(root, 'stub'), state, join(root, 'healthy-no-held'), '100']).status).toBe(0)
+    // The CPU profile's wave marks, only under SR8_PROFILE_DIR (none above); the
+    // script marks `end`. A fresh plan, stub, queues and measurements.
+    expect(readdirSync(join(root, 'profile'))).toEqual([])
+    writeFileSync(join(root, 'profile-on'), '')
+    writeFileSync(join(batch, 'held.batch.jsonl'), lines(payloads.filter((_, n) => e.plan.items[n].phase === 'held')))
+    rmSync(join(state, 'queue'), { recursive: true }); mkdirSync(join(state, 'queue'))
+    writeFileSync(join(root, 'stub'), ''); writeFileSync(join(root, 'measurements'), '')
+    const profiled = join(root, 'profiled')
+    expect(cli('fault-plan', [batch, join(root, 'plan.tsv'), 'hang', '1', '1', profiled]).status).toBe(0)
+    expect(cli('fault-burst', [profiled, 'http://127.0.0.1:1', join(root, 'stub'), state, join(root, 'measurements'), '0', '100']).status).toBe(0)
+    expect(readFileSync(join(root, 'profile/waves'), 'utf8')).toBe('held\nroots\nreplies-drops\n')
   }, `
 // Synthetic transport only in this copied CLI. No server or network is used.
+// The profile opt-in is set only when the test asks.
+{ const base = resolve(import.meta.dir, '../../..'); mkdirSync(join(base, 'profile'), { recursive: true });
+  if (existsSync(join(base, 'profile-on'))) process.env.SR8_PROFILE_DIR = join(base, 'profile') }
 let transportPlan;
 globalThis.fetch = async (_url, init) => {
   const base = resolve(import.meta.dir, '../../..'), dir = join(base, 'e');

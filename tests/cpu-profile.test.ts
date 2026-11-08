@@ -1,10 +1,10 @@
-/** test-44's opt-in CPU profile (tests/integration/fixtures/cpu-profile*.ts):
+/** The opt-in CPU profile of tests 44, 45 and 32 (tests/integration/fixtures/cpu-profile*.ts):
  * the opt-in gate, the content-free summary over synthetic profiles, the
  * profiler's failure containment over a fake inspector, the real preload
- * sampling a scratch Bun child, and test-44's profile steps in a stub shell.
- * No scenario or server runs. */
+ * sampling a scratch Bun child, and each script's profile steps and opt-in
+ * wiring in a stub shell. No scenario or server runs. */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -13,10 +13,19 @@ import {
   CPU_PROFILE_DIR_ENV, cpuProfileOptIn, startCpuProfile, summaryLines, summaryReport,
   type CpuProfile, type ProfilePart, type ProfilerIo,
 } from './integration/fixtures/cpu-profile.ts'
+import { windowsVerdict } from './integration/fixtures/sr8-evidence.ts'
 
 const REPO = join(import.meta.dir, '..')
 const FIXTURES = join(import.meta.dir, 'integration/fixtures')
-const SCRIPT = readFileSync(join(import.meta.dir, 'integration/test-44-fmk-thread-burst.sh'), 'utf8')
+const integrationFile = (file: string) => readFileSync(join(import.meta.dir, 'integration', file), 'utf8')
+const SCRIPT = integrationFile('test-44-fmk-thread-burst.sh')
+const LOAD = integrationFile('lib/membership-load.sh'), T45 = integrationFile('test-45-fmk-membership-load.sh')
+const T48 = integrationFile('test-48-fmk-membership-load-open.sh'), T32 = integrationFile('test-32-fmk-real-order.sh')
+function shellFunction(text: string, name: string): string {
+  const match = text.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))
+  if (!match) throw new Error(`Missing shell function ${name}`)
+  return match[0]
+}
 const CONTEXT = 'scenario=test-44-fmk-thread-burst mode=strict population=0 recipients=1'
 let root: string
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'cscb-cpu-profile-')) })
@@ -43,6 +52,18 @@ function writeProfile(dir: string, parts: ProfilePart[], waves: string, declared
   writeFileSync(join(dir, 'waves'), waves)
   if (declared !== undefined) writeFileSync(join(dir, 'complete.json'), JSON.stringify({ parts: declared }))
 }
+// The fixtures with the CI image marker redirected to <root>/image, so a
+// scratch Bun child under the preload counts as the image's daemon child.
+function imageFixtures(): string {
+  const fixtures = join(root, 'fixtures'), marker = join(root, 'image')
+  mkdirSync(fixtures, { recursive: true }); writeFileSync(marker, '')
+  const module = readFileSync(join(FIXTURES, 'cpu-profile.ts'), 'utf8')
+  expect(module.split("'/etc/cscb-ci-image'")).toHaveLength(2)
+  writeFileSync(join(fixtures, 'cpu-profile.ts'), module.replace("'/etc/cscb-ci-image'", JSON.stringify(marker)))
+  writeFileSync(join(fixtures, 'cpu-profile-preload.ts'), readFileSync(join(FIXTURES, 'cpu-profile-preload.ts')))
+  return fixtures
+}
+const iso = (ms: number) => new Date(ms).toISOString()
 
 describe('cpu-profile summary (synthetic profiles)', () => {
   const server = '(module)@claude-slack-channel-bots/src/server.ts:1', handler = 'handleEvent@claude-slack-channel-bots/src/socket.ts:10'
@@ -121,6 +142,60 @@ describe('cpu-profile summary (synthetic profiles)', () => {
     const lines = summaryReport(dir, CONTEXT)
     expect(lines[0]).toBe(`recorded: cpu-profile ${CONTEXT} wave=none outcome=${outcome} parts=${parts.length} ${split}`)
     expect(lines.slice(1)).toEqual(summaryLines(CONTEXT, parts))
+  })
+})
+
+describe('cpu-profile sample slices (synthetic profile, samples.tsv)', () => {
+  // One continuous part from T to T+700 ms; its six samples fall at T+100 …
+  // T+600 ms. Two intervals: `sample` [T+50, T+250) holds the two clone
+  // samples, `hung-lookup` [T+250, T+450) the two handler samples, and the
+  // last two are `between`.
+  const T = Date.parse('2026-11-08T00:00:00.000Z')
+  const part = (startTime: number, checkpoints: Partial<ProfilePart> = {}): ProfilePart => ({ wave: 'thread-samples', startLagMs: 10, stopLagMs: 10,
+    startRequestedAt: iso(T - 2), startedAt: iso(T), stopRequestedAt: iso(T + 700), ...checkpoints,
+    profile: profile([5, 5, 3, 3, 4, 1], [100_000, 100_000, 100_000, 100_000, 100_000, 100_000], startTime, startTime + 700_000) })
+  const write = (p: ProfilePart, intervals = `sample\t${T + 50}\t${T + 250}\nhung-lookup\t${T + 250}\t${T + 450}\n`, savedAt: number | null = T + 705) => {
+    const dir = join(root, 'cpu-profile')
+    writeProfile(dir, [p], 'thread-samples\nend\n', 1)
+    writeFileSync(join(dir, 'samples.tsv'), intervals)
+    if (savedAt !== null) writeFileSync(join(dir, 'observer.jsonl'), JSON.stringify({ phase: 'saved', name: 'part-0000-thread-samples.json', ts: iso(savedAt) }) + '\n')
+    return summaryReport(dir, CONTEXT)
+  }
+  const head = (slice: string, samples: number, durationMs: number) =>
+    `recorded: cpu-profile ${CONTEXT} wave=${slice} parts=1 samples=${samples} weight_ms=${samples * 100} duration_ms=${durationMs} start_lag_ms=unknown stop_lag_ms=unknown`
+  const whole = (p: ProfilePart) => [`recorded: cpu-profile ${CONTEXT} wave=none outcome=complete parts=1 split=reliable max_lag_ms=10`, ...summaryLines(CONTEXT, [p])]
+
+  test.each([
+    ['on the epoch clock (as Bun records it)', T * 1000, 'epoch'],
+    ['on another clock, anchored at the part\'s start', 5_000_000, 'anchored'],
+  ])('delimits the samples by their intervals after the whole-profile summary: %s', (_name, startTime, clock) => {
+    const lines = write(part(startTime))
+    const slices = lines.indexOf(`recorded: cpu-profile ${CONTEXT} wave=none slices=2 clock=${clock} checkpoint_overlap=0`)
+    expect(lines.slice(0, slices)).toEqual(whole(part(startTime)))
+    const heads = lines.slice(slices + 1).filter(l => l.startsWith(`recorded: cpu-profile ${CONTEXT} `))
+    expect(heads).toEqual([head('sample', 2, 200), head('hung-lookup', 2, 200), head('between', 2, 300)])
+    const top = (slice: string) => lines.slice(slices).find(l => l.startsWith(`recorded: cpu-profile-function ${CONTEXT} wave=${slice} by=self rank=1 `))
+    expect(top('sample')).toEndWith(' function=structured_Clone@(native)')
+    expect(top('hung-lookup')).toEndWith(' function=handleEvent@claude-slack-channel-bots/src/socket.ts:10')
+  })
+
+  test.each([
+    ['no checkpoint inside an interval', {}, T + 705, '0'],
+    ['the start answered inside the first interval', { startRequestedAt: iso(T + 40), startedAt: iso(T + 60) }, T + 705, '1'],
+    ['the stop saved inside the second interval', { stopRequestedAt: iso(T + 440) }, T + 460, '1'],
+    ['both', { startRequestedAt: iso(T + 40), startedAt: iso(T + 60), stopRequestedAt: iso(T + 440) }, T + 460, '2'],
+    ['a part without its start request time', { startRequestedAt: undefined }, T + 705, 'unknown'],
+    ['no saved time from the observer', {}, null, 'unknown'],
+  ] as const)('counts the intervals a checkpoint overlaps: %s', (_name, checkpoints, savedAt, overlap) => {
+    expect(write(part(T * 1000, checkpoints), undefined, savedAt)).toContain(`recorded: cpu-profile ${CONTEXT} wave=none slices=2 clock=epoch checkpoint_overlap=${overlap}`)
+  })
+
+  test.each([
+    ['a missing end', `sample\t${T}\n`], ['an end before its start', `sample\t${T + 2}\t${T + 1}\n`],
+    ['a malformed wave', `Sample\t${T}\t${T + 1}\n`], ['an extra field', `sample\t${T}\t${T + 1}\tx\n`], ['no interval', ''],
+  ])('an unreadable samples.tsv (%s) adds one line and no slice', (_name, intervals) => {
+    const lines = write(part(T * 1000), intervals)
+    expect(lines).toEqual([...whole(part(T * 1000)), `recorded: cpu-profile ${CONTEXT} wave=none slices=unreadable clock=unavailable checkpoint_overlap=unknown`])
   })
 })
 
@@ -241,12 +316,8 @@ if (mode !== 'plain') await until(() => existsSync(join(dir, 'complete.json')) |
 console.log('done')
 `
   function run(env: Record<string, string>, mode: 'profiled' | 'held' | 'plain', subcommand = 'start', fault?: string) {
-    const fixtures = join(root, 'fixtures'), dir = join(root, 'cpu-profile'), marker = join(root, 'image')
-    mkdirSync(fixtures); mkdirSync(dir); writeFileSync(marker, '')
-    const module = readFileSync(join(FIXTURES, 'cpu-profile.ts'), 'utf8')
-    expect(module.split("'/etc/cscb-ci-image'")).toHaveLength(2)
-    writeFileSync(join(fixtures, 'cpu-profile.ts'), module.replace("'/etc/cscb-ci-image'", JSON.stringify(marker)))
-    writeFileSync(join(fixtures, 'cpu-profile-preload.ts'), readFileSync(join(FIXTURES, 'cpu-profile-preload.ts')))
+    const fixtures = imageFixtures(), dir = join(root, 'cpu-profile')
+    mkdirSync(dir)
     writeFileSync(join(root, 'server.ts'), SERVER)
     const preloads = [join(fixtures, 'cpu-profile-preload.ts')]
     if (fault) { writeFileSync(join(root, 'fault.ts'), `import { Session } from 'node:inspector'\n${fault}\n`); preloads.unshift(join(root, 'fault.ts')) }
@@ -273,6 +344,16 @@ console.log('done')
     expect(top('replies-drops')).toMatch(/ function=repliesWork@\S+\/server\.ts:\d+$/)
     expect(lines.find(l => l.startsWith(`recorded: cpu-profile ${CONTEXT} wave=roots parts=1 `)))
       .toMatch(/ samples=[1-9]\d* weight_ms=\d+ duration_ms=[1-9]\d* start_lag_ms=\d+ stop_lag_ms=\d+$/)
+    // Each part records its checkpoints in order, and Bun's profile clock is
+    // the epoch clock, so an interval over the roots part slices out its work.
+    const part = JSON.parse(readFileSync(join(dir, 'part-0000-roots.json'), 'utf8'))
+    const times = [part.startRequestedAt, part.startedAt, part.stopRequestedAt, part.stoppedAt].map(t => Date.parse(t))
+    expect(times.every(Number.isFinite)).toBe(true)
+    expect([...times].sort((a, b) => a - b)).toEqual(times)
+    writeFileSync(join(dir, 'samples.tsv'), `sample\t${times[1]}\t${times[2]}\n`)
+    const sliced = summaryReport(dir, CONTEXT)
+    expect(sliced).toContain(`recorded: cpu-profile ${CONTEXT} wave=none slices=1 clock=epoch checkpoint_overlap=1`)
+    expect(sliced.find(l => l.startsWith(`recorded: cpu-profile-function ${CONTEXT} wave=sample by=self rank=1 `))).toMatch(/ function=rootsWork@\S+\/server\.ts:\d+$/)
   })
 
   test('reports the per-wave split unreliable when a held event loop delays every cut', () => {
@@ -366,6 +447,383 @@ CONTEXT=(test-44-fmk-thread-burst strict 0 1)
   })
 })
 
+// scenario.sh's before-cleanup semantics, as in test-44's rows: each hook runs
+// in a subshell, its status ignored, and the exit status kept. $1 is the
+// scratch directory, $2 the fixtures directory.
+const CLEANUP_HARNESS = `set -euo pipefail
+bun() { "\${BUN}" "$@"; }
+hooks=()
+on_before_cleanup() { hooks+=("$1"); }
+fail() { echo "FAIL: $1" >&2; exit 1; }
+cleanup() { local rc=$? hook; set +e; trap - EXIT; for hook in \${hooks[@]+"\${hooks[@]}"}; do ( "\${hook}" ); done; exit "\${rc}"; }
+trap cleanup EXIT
+SCENARIO_FIXTURES="$2"
+`
+function stubShell(program: string, scratch: string, fixtures = FIXTURES) {
+  const child = spawnSync('bash', ['--noprofile', '--norc', '-c', program, 'stub', scratch, fixtures], {
+    env: hostSafeChildEnv(root, { tools: ['bash', 'mkdir', 'cat', 'sleep'], extras: { BUN: process.execPath, BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0' } }),
+    encoding: 'utf8', timeout: 10_000 })
+  expect(child.error).toBeUndefined(); expect(child.signal).toBeNull()
+  return { status: child.status, stdout: child.stdout, stderr: child.stderr }
+}
+// A profiler CLI whose stop and summary both exit 3, over a profile with a marked wave.
+const failingProfiler = (scratch: string) => {
+  mkdirSync(join(scratch, 'fixtures'), { recursive: true }); writeFileSync(join(scratch, 'fixtures/cpu-profile.ts'), 'process.exit(3)\n')
+  mkdirSync(join(scratch, 'cpu-profile')); writeFileSync(join(scratch, 'cpu-profile/waves'), 'roots\n')
+  return join(scratch, 'fixtures')
+}
+// A script's profile block, from its header comment through the line holding `last`.
+function scriptBlock(text: string, last: string): string {
+  const start = text.indexOf('# Test-only CPU profile'), end = text.indexOf('\n', text.indexOf(last, start)) + 1
+  expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start)
+  return text.slice(start, end)
+}
+const loadBlock = () => scriptBlock(LOAD, 'membership_profile_cleanup() {')
+const t32Block = () => scriptBlock(T32, 'on_before_cleanup profile_cleanup')
+// [name, prepare the scratch directory (answers a fixtures directory), steps, status, stdout lines given the profile dir, stderr]
+type StepRow = [string, (scratch: string) => string | void, string, number, (dir: string) => string[], string]
+const STOPPED_TWO = 'recorded: cpu-profile-stop outcome=complete parts=2'
+const FAILED_PROFILER = ['recorded: cpu-profile stop unavailable', 'recorded: cpu-profile summary unavailable']
+const unmakeable = (scratch: string) => { writeFileSync(scratch, ''); return undefined }
+// The cleanup hook's stop bound in these rows, where no profiler ever answers.
+const CLEANUP_STOP_S = '0.2'
+const TIMED_OUT_ONE = 'recorded: cpu-profile-stop outcome=timeout parts=1'
+
+const C45 = ['test-45-fmk-membership-load-strict-first-hang', 'strict', '100000', '2']
+const CONTEXT45 = `scenario=${C45[0]} mode=strict population=100000 recipients=2`
+// As run_membership_load registers the hook and each case opens its profile.
+const t45Program = (kind: string, steps: string) => `${CLEANUP_HARNESS}ROOT="$1"\nCASE_KIND=${kind}\nC=(${C45.join(' ')})\n${loadBlock()}
+MEMBERSHIP_PROFILE_CLEANUP_STOP_S=${CLEANUP_STOP_S}\nMEMBERSHIP_PROFILE_CASE=first-hang\non_before_cleanup membership_profile_cleanup\nmembership_profile_open\n${steps}\n`
+const CONTEXT32 = 'scenario=test-32-fmk-real-order mode=strict population=100000 recipients=2'
+const t32Program = (steps: string) => `${CLEANUP_HARNESS}REAL_THREAD_EVIDENCE="$1"\nREAL_THREAD_CONTEXT=(test-32-fmk-real-order strict 100000 2)
+${t32Block()}PROFILE_CLEANUP_STOP_S=${CLEANUP_STOP_S}\n${steps}\n`
+
+describe('test-45 profile steps (stub shell)', () => {
+  const program = t45Program
+  const complete = (scratch: string) => writeProfile(join(scratch, 'cpu-profile'), [roots, replies], 'roots\nreplies-drops\nend\n', 2)
+
+  test('the profile is collected right after the burst and ordered writes, before any verdict', () => {
+    const body = shellFunction(LOAD, 'run_membership_load')
+    const collect = body.indexOf('        membership_profile_collect 30\n')
+    expect(collect).toBeGreaterThan(body.indexOf('wait "${BURST_PID}" || fail'))
+    expect(collect).toBeLessThan(body.indexOf('two membership failures did not settle'))
+    expect(LOAD.match(/^\s*membership_profile_(open|collect)\b(?!\(\)).*$/gm)?.map(l => l.trim())).toEqual(['membership_profile_open', 'membership_profile_collect 30'])
+    // Each case opens (or clears) its profile before its first server start.
+    expect(body.indexOf('        membership_profile_open\n')).toBeGreaterThan(body.indexOf('mkdir -p "${BATCH}" "${WRITES}"'))
+    expect(body.indexOf('        membership_profile_open\n')).toBeLessThan(body.indexOf('start_ready'))
+  })
+
+  test.each<StepRow>([
+    ['a verdict after the profile is collected fails', complete, 'membership_profile_collect 30\nfail "sr8 membership-writes verdict did not pass"',
+      1, dir => [STOPPED_TWO, ...summaryReport(dir, CONTEXT45)], 'FAIL: sr8 membership-writes verdict did not pass\n'],
+    ['the burst fails with one part saved and no profiler answering the hook\'s stop', scratch => writeProfile(join(scratch, 'cpu-profile'), [roots], 'roots\n'),
+      'fail "full original burst did not complete"', 1, dir => [TIMED_OUT_ONE, ...summaryReport(dir, CONTEXT45)], 'FAIL: full original burst did not complete\n'],
+    ['the case fails before any wave is marked, so the hook only summarizes', () => undefined, 'fail "two-persona startup incomplete"',
+      1, dir => summaryReport(dir, CONTEXT45), 'FAIL: two-persona startup incomplete\n'],
+    ['the case passes', complete, 'membership_profile_collect 30', 0, dir => [STOPPED_TWO, ...summaryReport(dir, CONTEXT45)], ''],
+    ['the stop and the summarizer fail in the cleanup hook', failingProfiler, 'exit 4', 4, () => FAILED_PROFILER, ''],
+    ['the profile directory cannot be made', unmakeable,
+      'membership_profile_collect 30\necho continued', 0, () => ['recorded: cpu-profile unavailable reason=profile-directory', 'continued'], ''],
+  ])('prints the summary once and keeps the script\'s status: %s', (_name, prepare, steps, status, stdout, stderr) => {
+    const scratch = join(root, 'case')
+    const fixtures = prepare(scratch)
+    expect(stubShell(program('first-hang', steps), scratch, fixtures ?? FIXTURES))
+      .toEqual({ status, stdout: stdout(join(scratch, 'cpu-profile')).join('\n') + '\n', stderr })
+  })
+
+  test.each(['later-hang', 'first-transient', 'undurable'])('another case (%s) opens no profile, so its steps and hook do nothing', kind => {
+    const scratch = join(root, 'case')
+    mkdirSync(scratch)
+    expect(stubShell(program(kind, 'membership_profile_collect 30\nfail "later verdict"'), scratch))
+      .toEqual({ status: 1, stdout: '', stderr: 'FAIL: later verdict\n' })
+    expect(readdirSync(scratch)).toEqual([])
+  })
+
+  test('a profiled case after the first leaves no profile for the next case or its hook', () => {
+    const scratch = join(root, 'case')
+    complete(scratch)
+    const run = stubShell(program('first-hang', 'membership_profile_collect 30\nCASE_KIND=later-hang\nmembership_profile_open\nfail "later verdict"'), scratch)
+    expect(run).toEqual({ status: 1, stdout: [STOPPED_TWO, ...summaryReport(join(scratch, 'cpu-profile'), CONTEXT45)].join('\n') + '\n', stderr: 'FAIL: later verdict\n' })
+  })
+})
+
+describe('test-45/48 profile opt-in (run_membership_load in a stub shell)', () => {
+  // The real library sourced; run_membership_load runs until its first case's
+  // state directory, where the stub reports the case's profile and stops.
+  const run = (...args: string[]) => {
+    writeFileSync(join(root, 'membership-load.sh'), LOAD)
+    const program = `set -euo pipefail
+log() { printf '%s\\n' "$*" >> "$HOME/calls"; }
+require_ci_image() { :; }
+require_scenario_home() { :; }
+on_exit() { :; }
+on_before_cleanup() { log "hook $1"; }
+fail() { echo "FAIL: $1" >&2; exit 1; }
+overrides_stem() { printf 'stem\\n'; }
+new_state_dir() { log "case=\${CASE_KIND} profile=\${MEMBERSHIP_PROFILE_DIR#"$HOME/"}"; cat "$HOME/calls"; exit 0; }
+SCENARIO_ROOT="$HOME" SCENARIO_FIXTURES="$HOME/fixtures" TEST_NAME=test-45-fmk-membership-load
+source "$HOME/membership-load.sh"
+bun() { :; }
+printed() { printf '1\\n'; }
+run_membership_load "$@"
+`
+    const child = spawnSync('bash', ['--noprofile', '--norc', '-c', program, 'stub', ...args], {
+      env: hostSafeChildEnv(root, { tools: ['bash', 'mkdir', 'cat'] }), encoding: 'utf8', timeout: 10_000 })
+    expect(child.error).toBeUndefined(); expect(child.signal).toBeNull()
+    return { status: child.status, stdout: child.stdout, stderr: child.stderr }
+  }
+
+  test('test-45\'s option registers the profile\'s cleanup hook and profiles its first-hang case', () => {
+    expect(run('strict', '--cpu-profile', 'first-hang')).toEqual({ status: 0, stderr: '',
+      stdout: 'hook reopen_observe\nhook membership_profile_cleanup\ncase=first-hang profile=strict-first-hang/cpu-profile\n' })
+    expect(readdirSync(join(root, 'strict-first-hang')).sort()).toEqual(['batch', 'cpu-profile', 'writes'])
+  })
+
+  test('test-48\'s plain call registers no profile hook and profiles nothing', () => {
+    expect(run('open')).toEqual({ status: 0, stderr: '', stdout: 'hook reopen_observe\ncase=first-hang profile=\n' })
+    expect(readdirSync(join(root, 'open-first-hang')).sort()).toEqual(['batch', 'writes'])
+  })
+
+  test.each([
+    [['strict', '--cpu-profile']], [['strict', 'first-hang']], [['strict', '--cpu-profile', '']], [['strict', '--profile', 'first-hang']],
+    [['strict', '--cpu-profile', 'first-hang', 'extra']], [['both', '--cpu-profile', 'first-hang']],
+  ])('refuses %j before any hook or case', args => {
+    expect(run(...args)).toEqual({ status: 1, stdout: '', stderr: 'FAIL: membership load requires one channel mode and optionally --cpu-profile <case>\n' })
+  })
+
+  test('start_ready runs only the profiled case\'s measured start with the preload', () => {
+    const program = (dir: string, mode: string) => [
+      'set -euo pipefail', 'log() { printf \'%s\\n\' "$*"; }', 'count_log() { printf "0\\n"; }', 'completion_match() { printf "complete\\n"; }',
+      'matcher() { printf "%s\\n" "$*"; }', 'printed() { printf "recorder\\n"; }', 'mono_ms() { printf "7\\n"; }',
+      'start_server() { log "start $* BUN_OPTIONS=${BUN_OPTIONS:-none} dir=${CSCB_TEST_CPU_PROFILE_DIR:-none}"; }',
+      'wait_for_count() { :; }', 'expect_one_overrides_line() { :; }', 'session_barrier_mark() { :; }', 'session_barrier_wait() { :; }',
+      'wait_membership_complete() { :; }', 'stub_session_list_tools() { :; }',
+      shellFunction(LOAD, 'start_ready'), `KEYS=(alpha) ROOT="$HOME" OVERRIDES_STEM=o MEASUREMENTS=m SCENARIO_FIXTURES=/fx MEMBERSHIP_PROFILE_DIR=${dir}`,
+      `start_ready ${mode}`, 'printf "%s\\n" "${BUN_OPTIONS:-unset} ${CSCB_TEST_CPU_PROFILE_DIR:-unset}"',
+    ].join('\n')
+    const start = (dir: string, mode: string) => {
+      const child = spawnSync('bash', ['--noprofile', '--norc', '-c', program(dir, mode)], { env: hostSafeChildEnv(root, { tools: ['bash'] }), encoding: 'utf8', timeout: 10_000 })
+      expect(child.stderr).toBe('')
+      return child.stdout
+    }
+    expect(start('/scratch/cpu-profile', 'measured')).toBe('start --live BUN_OPTIONS=--preload /fx/cpu-profile-preload.ts dir=/scratch/cpu-profile\nunset unset\n')
+    expect(start('/scratch/cpu-profile', '')).toBe('start --live BUN_OPTIONS=none dir=none\nunset unset\n')
+    expect(start("''", 'measured')).toBe('start --live BUN_OPTIONS=none dir=none\nunset unset\n')
+  })
+})
+
+describe('test-32 profile steps (stub shell)', () => {
+  const program = t32Program
+  const complete = (scratch: string) => writeProfile(join(scratch, 'cpu-profile'), [roots, replies], 'roots\nreplies-drops\nend\n', 2)
+
+  test('one wave spans the samples: begun before the active window, ended after the last sample, collected after the empty window and before any verdict', () => {
+    const phase = T32.slice(T32.indexOf('for thread_mode in strict open; do'))
+    const at = (text: string) => { const i = phase.indexOf(text); expect(i).toBeGreaterThan(0); return i }
+    expect(at('    profile_begin\n')).toBeLessThan(at('    THREAD_ACTIVE_START='))
+    // Each sample's interval runs from just before its push to its delivery.
+    expect(phase).toContain('        real_wait_latency_admission "${REAL_KEY}" "${sample}"\n        profile_sample_begin\n        THREAD_ENVELOPE="$(real_thread_reply "${sample}")"\n')
+    expect(phase).toContain('        real_wait_delivery "${REAL_KEY}" "$((sample+1))"\n        profile_sample_end "${REAL_THREAD_SAMPLES[sample-1]}"\n')
+    expect(at('    profile_end\n')).toBeGreaterThan(at('\n    done\n'))
+    expect(at('    profile_end\n')).toBeLessThan(at('    real_wait_latency_admission "${REAL_KEY}" 21\n'))
+    expect(at('    profile_collect 30\n')).toBeGreaterThan(at('> "${REAL_THREAD_EVIDENCE}/active.tsv"'))
+    expect(at('    profile_collect 30\n')).toBeLessThan(at('    stop_server --stop-bots\n    THREAD_N2_STATUS=0'))
+    expect(T32.match(/^\s*profile_(open|begin|sample_begin|sample_end|end|collect)\b(?! ?\()/gm)?.map(l => l.trim()))
+      .toEqual(['profile_open', 'profile_begin', 'profile_sample_begin', 'profile_sample_end', 'profile_end', 'profile_collect'])
+    expect(T32.indexOf('on_before_cleanup profile_cleanup\n')).toBeLessThan(T32.indexOf('real_prepare'))
+  })
+
+  test('without a profile every step does nothing, and with an unwritable one nothing waits, fails or prints', () => {
+    const scratch = join(root, 'evidence')
+    mkdirSync(scratch)
+    const steps = 'REAL_THREAD_DELAYED_TS=7 REAL_THREAD_HUNG_TS=14\nprofile_begin\nprofile_sample_begin\nprofile_sample_end 7\nprofile_end\n'
+    expect(stubShell(program(`${steps}profile_collect 30\necho continued`), scratch)).toEqual({ status: 0, stdout: 'continued\n', stderr: '' })
+    expect(readdirSync(scratch)).toEqual([])
+    expect(stubShell(program(`PROFILE_DIR="$1/absent"\n${steps}PROFILE_DIR=""\necho continued`), scratch)).toEqual({ status: 0, stdout: 'continued\n', stderr: '' })
+    expect(readdirSync(scratch)).toEqual([])
+  })
+
+  test.each<StepRow>([
+    ['a gate after the profile is collected fails', complete, 'profile_open\nprofile_collect 30\nfail "SR-8 real-thread evidence failed"',
+      1, dir => [STOPPED_TWO, ...summaryReport(dir, CONTEXT32)], 'FAIL: SR-8 real-thread evidence failed\n'],
+    ['a sample fails with one part saved and no profiler answering the hook\'s stop', scratch => writeProfile(join(scratch, 'cpu-profile'), [roots], 'roots\n'),
+      'profile_open\nfail "concurrent membership/write work failed"', 1, dir => [TIMED_OUT_ONE, ...summaryReport(dir, CONTEXT32)], 'FAIL: concurrent membership/write work failed\n'],
+    ['the script fails before any thread phase opens a profile', () => undefined, 'fail "real launch failed"', 1, () => [], 'FAIL: real launch failed\n'],
+    ['the phase passes', complete, 'profile_open\nprofile_collect 30', 0, dir => [STOPPED_TWO, ...summaryReport(dir, CONTEXT32)], ''],
+    ['the stop and the summarizer fail in the cleanup hook', failingProfiler, 'profile_open\nexit 4', 4, () => FAILED_PROFILER, ''],
+    ['the profile directory cannot be made', unmakeable,
+      'profile_open\nprofile_collect 30\necho continued', 0, () => ['recorded: cpu-profile unavailable reason=profile-directory', 'continued'], ''],
+  ])('prints the summary once and keeps the script\'s status: %s', (_name, prepare, steps, status, stdout, stderr) => {
+    const scratch = join(root, 'evidence')
+    const fixtures = prepare(scratch)
+    const run = stubShell(program(steps), scratch, fixtures ?? FIXTURES)
+    const lines = stdout(join(scratch, 'cpu-profile'))
+    expect(run).toEqual({ status, stdout: lines.length ? lines.join('\n') + '\n' : '', stderr })
+  })
+
+  test('the second thread phase opens its own profile, and the hook collects only that one', () => {
+    const strict = join(root, 'strict'), open = join(root, 'open')
+    complete(strict); writeProfile(join(open, 'cpu-profile'), [roots], 'roots\n')
+    const steps = `profile_open\nprofile_collect 30\nREAL_THREAD_EVIDENCE="${open}"\nREAL_THREAD_CONTEXT=(test-32-fmk-real-order open 100000 2)\nprofile_open\nfail "open phase failed"`
+    expect(stubShell(program(steps), strict)).toEqual({ status: 1, stderr: 'FAIL: open phase failed\n',
+      stdout: [STOPPED_TWO, ...summaryReport(join(strict, 'cpu-profile'), CONTEXT32),
+        TIMED_OUT_ONE, ...summaryReport(join(open, 'cpu-profile'), CONTEXT32.replace('mode=strict', 'mode=open'))].join('\n') + '\n' })
+  })
+})
+
+describe('test-32 sample phase on an injected clock (stub shell)', () => {
+  // test-32 from the profile's begin through the clean shutdown before its
+  // verdicts, on a fake epoch clock: EPOCHREALTIME unset and kept as a plain
+  // variable, which `date` reads and `sleep` moves. Every admission returns
+  // at once, each delivery takes 200 ms (3 s for the hung lookup's), and each
+  // profiler command takes 2 s. The fake server acknowledges the profile's
+  // start, seen at the script's next poll, START_DELAY_MS after its mark.
+  // CSCB makes one call in the active window and a stray one 1 s after the
+  // last delivery, where the original empty window starts.
+  const phase = () => {
+    const start = T32.indexOf('    profile_begin\n'), stop = '    stop_server --stop-bots\n', end = T32.indexOf(stop, start) + stop.length
+    expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start + stop.length)
+    return T32.slice(start, end)
+  }
+  const samples = Array.from({ length: 20 }, (_, n) => `1700000000.0000${String(n + 1).padStart(2, '0')}`)
+  const program = (profiled: boolean, startDelayMs: number) => `${t32Program('')}CLOCK_LOG="$1/clock.log"
+CLOCK_US=1700000100000000
+unset EPOCHREALTIME
+tick() { CLOCK_US=$(( CLOCK_US + $1 )); printf -v EPOCHREALTIME '%d.%06d' $(( CLOCK_US / 1000000 )) $(( CLOCK_US % 1000000 )); }
+tick 0
+log() { printf '%s %d\\n' "$1" $(( CLOCK_US / 1000 )) >> "\${CLOCK_LOG}"; }
+date() { printf '%s\\n' "\${EPOCHREALTIME}"; }
+START_DELAY_MS=${startDelayMs}
+START_AT_US=''
+server_tick() {
+    [[ -n "\${PROFILE_DIR}" && -s "\${PROFILE_DIR}/waves" && ! -f "\${PROFILE_DIR}/observer.jsonl" ]] || return 0
+    if [[ -z "\${START_AT_US}" ]]; then START_AT_US=$(( CLOCK_US + START_DELAY_MS * 1000 )); fi
+    if (( CLOCK_US >= START_AT_US )); then printf '{"phase":"started"}\\n' > "\${PROFILE_DIR}/observer.jsonl"; log started; fi
+}
+sleep() { server_tick; if [[ "$1" == 0.1 ]]; then tick 100000; else tick $(( $1 * 1000000 )); fi; }
+real_wait_latency_admission() {
+    local waves=''
+    if [[ "$2" != 21 ]]; then return 0; fi
+    if [[ -n "\${PROFILE_DIR}" ]]; then waves="$(< "\${PROFILE_DIR}/waves")"; fi
+    log "admission-21:\${waves//$'\\n'/,}"
+}
+real_thread_reply() { printf 'envelope-%s\\n' "$1"; }
+slack_wait_one_ack() { tick 5000; }
+real_thread_concurrent_work() { :; }
+track_pid() { :; }
+slack_envelope_times() { printf '{}\\n'; }
+real_wait_delivery() {
+    if [[ "$2" == 15 ]]; then tick 3000000; else tick 200000; fi
+    LAST_DELIVERY_US=\${CLOCK_US}
+    if [[ "$2" == 21 ]]; then log delivered; fi
+}
+shared_queue_snapshot() { :; }
+ad_shim_mark() { printf '0\\n'; }
+ad_cscb_calls() {
+    local active=$(( 10#\${THREAD_ACTIVE_START//[!0-9]/} + 500000 )) stray=$(( LAST_DELIVERY_US + 1000000 ))
+    printf '%s\\t%d.%06d\\n' "$1" $(( active / 1000000 )) $(( active % 1000000 )) "$1" $(( stray / 1000000 )) $(( stray % 1000000 ))
+}
+bun() { if [[ "$1" == "\${PROFILER}" ]]; then tick 2000000; log "profiler-$2"; fi; }
+stop_server() { :; }
+REAL_KEY=alpha THREAD_INSTANCE=i-1 REAL_SR8=/sr8 SLACK_STATE_DIR="$1/state" SERVER_PID=1
+REAL_THREAD_SAMPLES=(${samples.join(' ')})
+REAL_THREAD_DELAYED_TS=${samples[6]} REAL_THREAD_HUNG_TS=${samples[13]}
+${profiled ? 'profile_open' : 'PROFILE_DIR=""'}
+${phase()}`
+  const run = (profiled: boolean, startDelayMs = 0) => {
+    const scratch = join(root, profiled ? 'on' : 'off')
+    mkdirSync(scratch)
+    const shell = stubShell(program(profiled, startDelayMs), scratch)
+    const log = readFileSync(join(scratch, 'clock.log'), 'utf8').trim().split('\n').map(l => ({ label: l.split(' ')[0]!, ms: Number(l.split(' ')[1]) }))
+    const tsv = (file: string) => readFileSync(join(scratch, file), 'utf8').trim().split('\n').map(l => l.split('\t'))
+    return { shell, log, tsv, dir: join(scratch, 'cpu-profile'), at: (label: string) => log.find(l => l.label === label)!.ms }
+  }
+  const n3 = (r: ReturnType<typeof run>) => {
+    const windows = (file: string) => r.tsv(file).map(([instance, start, end]) => ({ instance: instance!, start: Number(start) * 1000, end: Number(end) * 1000 }))
+    return windowsVerdict(r.tsv('ad.tsv').map(([instance, s]) => ({ instance: instance!, ms: Number(s) * 1000 })), windows('empty.tsv'), 1, windows('active.tsv'))
+  }
+  // The summary over the part the server would save with these checkpoint times.
+  const serverSummary = (r: ReturnType<typeof run>, requestedMs: number, startedMs: number, stopRequestedMs: number) => {
+    writeFileSync(join(r.dir, 'part-0000-thread-samples.json'), JSON.stringify({ wave: 'thread-samples', startLagMs: 10, stopLagMs: 10,
+      startRequestedAt: iso(requestedMs), startedAt: iso(startedMs), stopRequestedAt: iso(stopRequestedMs),
+      profile: profile([3], [1000], startedMs * 1000, stopRequestedMs * 1000) }))
+    appendFileSync(join(r.dir, 'observer.jsonl'), JSON.stringify({ phase: 'saved', name: 'part-0000-thread-samples.json', ts: iso(stopRequestedMs + 5) }) + '\n')
+    return summaryReport(r.dir, CONTEXT32)
+  }
+  const slicesLine = (overlap: string) => `recorded: cpu-profile ${CONTEXT32} wave=none slices=20 clock=epoch checkpoint_overlap=${overlap}`
+
+  test('profiling moves no observation boundary: a stray CSCB call 1 s after the last delivery fails N3 alike with profiling on and off', () => {
+    const off = run(false), on = run(true)
+    for (const r of [off, on]) {
+      expect(r.shell).toEqual({ status: 0, stdout: '', stderr: '' })
+      expect(Math.round(Number(r.tsv('empty.tsv')[0]![1]) * 1000)).toBe(r.at('delivered'))
+    }
+    expect(n3(off)).toMatchObject({ measure: 'n3', verdict: 'fail', stats: { empty_calls: 1, covered_instances: 1 } })
+    expect(n3(on)).toEqual(n3(off))
+    // The profile is collected only after both admissions bound the empty window.
+    expect(on.log.map(l => l.label)).toEqual(['started', 'delivered', 'admission-21:thread-samples,end', 'admission-21:thread-samples,end', 'profiler-stop', 'profiler-summary'])
+    expect(off.log.map(l => l.label)).toEqual(['delivered', 'admission-21:', 'admission-21:'])
+  })
+
+  test.each([
+    ['acknowledged at once', 0],
+    ['acknowledged 300 ms after its mark', 300],
+  ])('the profile starts before the active window and every sample and ends after the last, so no checkpoint overlaps one: %s', (_name, delay) => {
+    const r = run(true, delay)
+    expect(r.shell).toEqual({ status: 0, stdout: '', stderr: '' })
+    const intervals = r.tsv('cpu-profile/samples.tsv'), started = r.at('started'), ended = r.log.find(l => l.label.startsWith('admission-21'))!
+    expect(intervals.map(([wave]) => wave)).toEqual(samples.map((_, n) => n === 6 ? 'delayed-lookup' : n === 13 ? 'hung-lookup' : 'sample'))
+    expect(Number(r.tsv('active.tsv')[0]![1]) * 1000).toBeGreaterThan(started)
+    expect(Number(intervals[0]![1])).toBeGreaterThan(started)
+    expect(ended).toEqual({ label: 'admission-21:thread-samples,end', ms: Number(intervals.at(-1)![2]) })
+    expect(serverSummary(r, started - delay, started, ended.ms)).toContain(slicesLine('0'))
+  })
+
+  test('a start not acknowledged within the wait is reported and the phase goes on; the summary counts a start answered inside the first sample', () => {
+    const r = run(true, 60_000)
+    expect(r.shell).toEqual({ status: 0, stdout: 'recorded: cpu-profile start unacknowledged wait_s=5\n', stderr: '' })
+    const intervals = r.tsv('cpu-profile/samples.tsv'), first = Number(intervals[0]![1])
+    expect(intervals).toHaveLength(20)
+    expect(serverSummary(r, first - 5000, first + 100, r.log.find(l => l.label.startsWith('admission-21'))!.ms)).toContain(slicesLine('1'))
+  })
+})
+
+describe('cleanup hooks stop the profile first, saving the wave in progress (real preload, scratch Bun child)', () => {
+  // A daemon stand-in under the real preload: it runs hotLookup until the
+  // profile completes or fails, or 8 s pass.
+  const SERVER = `import { existsSync } from 'node:fs'
+import { join } from 'node:path'
+const dir = process.argv[3]!
+function hotLookup() { let x = 0; for (let i = 0; i < 300000; i++) x += Math.sqrt(x + i); return x }
+const end = performance.now() + 8000
+while (!existsSync(join(dir, 'complete.json')) && !existsSync(join(dir, 'error.txt')) && performance.now() < end) { hotLookup(); await new Promise(r => setTimeout(r, 1)) }
+`
+  const awaitStarted = (dir: string) => `for ((n = 0; n < 50; n++)); do
+    [[ -f "\${${dir}}/observer.jsonl" && "$(< "\${${dir}}/observer.jsonl")" == *'"phase":"started"'* ]] && break
+    sleep 0.1
+done`
+  test.each([
+    ['test-32: a sample fails after the profile began', 'evidence', t32Program(
+      'PROFILE_CLEANUP_STOP_S=5\nprofile_open\nprofile_begin\nsleep 0.3\nfail "concurrent membership/write work failed"'),
+    CONTEXT32, 'thread-samples', 'FAIL: concurrent membership/write work failed\n'],
+    ['test-45: the burst fails during its roots wave', 'case', t45Program('first-hang',
+      `MEMBERSHIP_PROFILE_CLEANUP_STOP_S=5\nprintf 'roots\\n' >> "\${MEMBERSHIP_PROFILE_DIR}/waves"\n${awaitStarted('MEMBERSHIP_PROFILE_DIR')}\nsleep 0.3\nfail "full original burst did not complete"`),
+    CONTEXT45, 'roots', 'FAIL: full original burst did not complete\n'],
+  ])('%s', async (_name, sub, program, context, wave, stderr) => {
+    const scratch = join(root, sub), dir = join(scratch, 'cpu-profile'), fixtures = imageFixtures()
+    mkdirSync(dir, { recursive: true }); writeFileSync(join(root, 'active-server.ts'), SERVER)
+    const server = spawn(process.execPath, [join(root, 'active-server.ts'), 'start', dir], { stdio: 'ignore',
+      env: hostSafeChildEnv(root, { tools: [], extras: { BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0',
+        BUN_OPTIONS: `--preload ${join(fixtures, 'cpu-profile-preload.ts')}`, [CPU_PROFILE_DIR_ENV]: dir, _CLI_DAEMON_CHILD: '1' } }) })
+    const exited = new Promise<number | null>(resolve => server.once('exit', resolve))
+    const shell = stubShell(program, scratch, fixtures)
+    expect(await exited).toBe(0)
+    const report = summaryReport(dir, context)
+    expect(shell).toEqual({ status: 1, stderr, stdout: ['recorded: cpu-profile-stop outcome=complete parts=1', ...report].join('\n') + '\n' })
+    expect(report[0]).toStartWith(`recorded: cpu-profile ${context} wave=none outcome=complete parts=1 `)
+    expect(report.find(l => l.startsWith(`recorded: cpu-profile-function ${context} wave=${wave} by=self rank=1 `))).toMatch(/ function=hotLookup@\S+\/active-server\.ts:\d+$/)
+  }, 20_000)
+})
+
 describe('cpu-profile opt-in', () => {
   const on = (dir: string) => ({ [CPU_PROFILE_DIR_ENV]: dir, _CLI_DAEMON_CHILD: '1' })
   const argv = ['bun', '/test-repo/node_modules/claude-slack-channel-bots/src/cli.ts', 'start']
@@ -383,15 +841,33 @@ describe('cpu-profile opt-in', () => {
     expect(optIn(dir, marker)).toBe(profiled ? dir : undefined)
   })
 
-  test('only test-44\'s burst case sets it, on its measured start, and no src module names it', () => {
+  test('only tests 44, 45 and 32 set it, each on one measured start, and no src module names it', () => {
     const integration = join(import.meta.dir, 'integration')
     const shells = (readdirSync(integration, { recursive: true }) as string[]).filter(f => f.endsWith('.sh'))
     const opted = /cpu-profile|CSCB_TEST_CPU_PROFILE_DIR|SR8_PROFILE_DIR|BUN_OPTIONS/
-    expect(shells.filter(f => opted.test(readFileSync(join(integration, f), 'utf8')))).toEqual(['test-44-fmk-thread-burst.sh'])
+    // test-48 shares membership-load.sh but never passes its --cpu-profile option.
+    expect(shells.filter(f => opted.test(readFileSync(join(integration, f), 'utf8'))).sort())
+      .toEqual(['lib/membership-load.sh', 'test-32-fmk-real-order.sh', 'test-44-fmk-thread-burst.sh', 'test-45-fmk-membership-load.sh'])
+    expect(shells.filter(f => readFileSync(join(integration, f), 'utf8').includes('--cpu-profile')).sort())
+      .toEqual(['lib/membership-load.sh', 'test-45-fmk-membership-load.sh'])
+    expect(T45.match(/^run_membership_load .*$/gm)).toEqual(['run_membership_load strict --cpu-profile first-hang'])
+    expect(T48.match(/^run_membership_load .*$/gm)).toEqual(['run_membership_load open'])
+    const preload = (dir: string) => `BUN_OPTIONS="--preload \${SCENARIO_FIXTURES}/cpu-profile-preload.ts" CSCB_TEST_CPU_PROFILE_DIR="\${${dir}}" start_server --live\n`
     expect(SCRIPT).toContain('if [[ "${CASE}" == burst ]]; then\n    if mkdir -p "${EVIDENCE}/cpu-profile" 2> /dev/null; then\n        PROFILE_DIR="${EVIDENCE}/cpu-profile"\n')
     expect(SCRIPT.match(/PROFILE_DIR="\$\{EVIDENCE\}/g)).toHaveLength(1)
-    expect(SCRIPT).toContain('    if [[ "${1:-}" == measured && -n "${PROFILE_DIR}" ]]; then\n        BUN_OPTIONS="--preload ${SCENARIO_FIXTURES}/cpu-profile-preload.ts" CSCB_TEST_CPU_PROFILE_DIR="${PROFILE_DIR}" start_server --live\n    else\n        start_server --live\n    fi\n')
-    expect(SCRIPT.match(/BUN_OPTIONS=/g)).toHaveLength(1)
+    expect(SCRIPT).toContain(`    if [[ "\${1:-}" == measured && -n "\${PROFILE_DIR}" ]]; then\n        ${preload('PROFILE_DIR')}    else\n        start_server --live\n    fi\n`)
+    expect(LOAD).toContain(`    if [[ "\${1:-}" == measured && -n "\${MEMBERSHIP_PROFILE_DIR:-}" ]]; then\n        ${preload('MEMBERSHIP_PROFILE_DIR')}    else\n        start_server --live\n    fi\n`)
+    // test-32: the thread phase's measured start, the second start of each mode.
+    expect(T32).toContain(`    profile_open\n    THREAD_START_MS="$(real_thread_now_ms)"\n    if [[ -n "\${PROFILE_DIR}" ]]; then\n        ${preload('PROFILE_DIR')}    else\n        start_server --live\n    fi\n    THREAD_READY_MS=`)
+    for (const text of [SCRIPT, LOAD, T32]) expect(text.match(/BUN_OPTIONS=/g)).toHaveLength(1)
+    expect(T45).not.toMatch(/BUN_OPTIONS|SR8_PROFILE_DIR/)
+    // Each profile directory is set in one place; test-45's only for the named case.
+    expect(LOAD.match(/MEMBERSHIP_PROFILE_DIR="\$\{ROOT\}/g)).toHaveLength(1)
+    expect(shellFunction(LOAD, 'membership_profile_open')).toContain('[[ -n "${MEMBERSHIP_PROFILE_CASE}" && "${CASE_KIND}" == "${MEMBERSHIP_PROFILE_CASE}" ]] || return 0\n')
+    expect(T32.match(/PROFILE_DIR="\$\{REAL_THREAD_EVIDENCE\}/g)).toHaveLength(1)
+    // The burst's wave marks reach only test-45's fault burst.
+    expect(LOAD.match(/SR8_PROFILE_DIR=.*$/gm)).toEqual(['SR8_PROFILE_DIR="${MEMBERSHIP_PROFILE_DIR}" bun "${E}" fault-burst "${C[@]}" "${OUT}" "${SCENARIO_SLACK_STUB_URL}" "${SCENARIO_SLACK_RECORD}" \\'])
+    expect(T32).not.toContain('SR8_PROFILE_DIR')
     const src = (readdirSync(join(REPO, 'src'), { recursive: true }) as string[]).filter(f => /\.[cm]?[jt]s$/.test(f))
     expect(src.filter(f => /cpu-profile|CSCB_TEST_CPU_PROFILE_DIR|SR8_PROFILE_DIR|Profiler\./.test(readFileSync(join(REPO, 'src', f), 'utf8')))).toEqual([])
     // The npm package ships src only, never the test fixtures.
