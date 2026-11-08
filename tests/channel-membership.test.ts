@@ -11,7 +11,7 @@ import { createPersonaEventRouter } from '../src/persona-event-router.ts'
 import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
 import { _resetRegistry } from '../src/registry.ts'
 import { _resetAckTracker } from '../src/ack-tracker.ts'
-import { parseSharedChannelState, sharedPersonaChannels } from '../src/shared-channels.ts'
+import { parseSharedChannelState, sharedPersonaChannels, SHARED_CHANNEL_FORMAT } from '../src/shared-channels.ts'
 import { DurableWriteUnsyncedError } from '../src/atomic-write.ts'
 import type { MembershipEvidence } from '../src/channel-membership-evidence.ts'
 import type { AcceptedRecord } from '../src/delivery-queue.ts'
@@ -2267,18 +2267,96 @@ test.each<[string, (f: MembershipHarness) => Promise<MembershipHarness>, string[
 })
 
 // Recovery merges unsaved history into its own copy of the target persona.
-// The control hands it the authority's live persona instead.
-test.each([false, true])('recovery over unsaved evidence leaves published history unchanged unless given the live persona (control=%p)', async control => {
+// The control hands it the authority's live persona instead, which is frozen:
+// the merge throws rather than reach published history.
+test.each([false, true])('recovery over unsaved evidence leaves published history unchanged, even given the live persona (control=%p)', async control => {
   const f = fixture(); await f.start()
   await f.event(true, C.primary, { id: 'EvSAVEDCOPY' })
   expect(life(f).membershipEvidence?.EvSAVEDCOPY?.state).toBe('applied')
   const before = f.authority.snapshot()
+  const writes = f.writes.length, acks = stub(f).socket.acks.length
+  f.failWrites(() => true); await f.event(true, C.secondary, { id: 'EvUNSAVEDCOPY' })
+  expect(f.writes.slice(writes).map(state => state.personas.alpha!.membershipEvidence?.EvUNSAVEDCOPY?.state)).toEqual(['applied', 'pending'])
+  expect(stub(f).socket.acks).toHaveLength(acks)
+  expect(f.authority.snapshot()).toEqual(before)
+  const recoveryWrites = f.writes.length
   const live = control ? spyOn(f.authority, 'personaSnapshot').mockImplementation(key => f.authority.inspectMembershipHistory(key, life => life as never)) : undefined
   try {
-    f.failWrites(() => true); await f.event(true, C.secondary, { id: 'EvUNSAVEDCOPY' })
-    f.membership.recover('alpha')
-    expect(f.membership.unresolvedChannels('alpha')).toContain(C.secondary)
+    if (control) expect(() => f.membership.recover('alpha')).toThrow(TypeError)
+    else {
+      f.membership.recover('alpha')
+      expect(f.writes.slice(recoveryWrites).map(state => state.personas.alpha!.membershipEvidence?.EvUNSAVEDCOPY?.state)).toEqual(['applied', 'pending'])
+    }
   } finally { live?.mockRestore() }
-  if (control) expect(life(f).membershipEvidence?.EvUNSAVEDCOPY).toBeDefined()
-  else expect(f.authority.snapshot()).toEqual(before)
+  expect(f.membership.unresolvedChannels('alpha')).toContain(C.secondary)
+  expect(f.authority.snapshot()).toEqual(before)
+})
+
+// t2.yiv.sf.s3: every scan page, inventory commit and live membership event
+// cloned the whole shared state for its transaction draft.
+test('a scan of SR8_SHARED_LIST_CHANNELS channels and live membership events clone no whole shared state', async () => {
+  const channels = channelPopulation(SR8_SHARED_LIST_CHANNELS), ids = channels.map(c => c.id)
+  const f = fixture({ channels })
+  const pages = Math.ceil(ids.length / MEMBERSHIP_PAGE_LIMIT)
+  stub(f).script.inventory.push(...Array.from({ length: pages }, (_, i) =>
+    membershipPage(ids.slice(i * MEMBERSHIP_PAGE_LIMIT, (i + 1) * MEMBERSHIP_PAGE_LIMIT), i + 1 < pages ? `page-${i + 1}` : undefined)))
+  await f.start()
+  const before = f.writes.length
+  const clones = spyOn(globalThis, 'structuredClone')
+  let copies: unknown[], scanned: MembershipScanStatus
+  try {
+    await f.scan()
+    scanned = f.scanner.status('alpha')
+    await f.event(false, ids[0]!); await f.event(true, C.primary)
+    copies = clones.mock.calls.filter(([value]) => typeof value === 'object' && value !== null && (value as { format?: unknown }).format === SHARED_CHANNEL_FORMAT)
+  } finally { clones.mockRestore() }
+  expect(copies).toHaveLength(0)
+  // One write per page, the inventory commit, then each live event.
+  expect(f.writes.length - before).toBe(pages + 3)
+  expect(scanned).toMatchObject({ state: 'complete', pages, positives: ids.length })
+  expect([life(f).membership[ids[0]!]!.member, life(f).membership[C.primary]!.member]).toEqual([false, true])
+  expect(readSharedState(f.stateDir)).toEqual(f.authority.snapshot())
+})
+
+/** Scan pages, live joins and leaves, a failed write, an unsynced write and a
+ * retained absence conflict, in one deterministic order. */
+async function membershipHistory(f: MembershipHarness) {
+  stub(f).script.inventory.push(membershipPage([C.primary, C.secondary], 'page-1'), membershipPage([C.private]))
+  await f.start(); await f.scan()
+  await f.event(true, 'C0TEST009'); await f.event(false, C.secondary)
+  f.failWrites(() => true); await f.event(true, C.secondary, { id: 'EvFAILED' })
+  f.failWrites(() => false); f.membership.recover('alpha')
+  f.unsyncWrites(() => true); await f.event(false, C.private, { id: 'EvUNSYNCED' })
+  f.unsyncWrites(() => false); f.authority.recoverDurability()
+  const held = makeDeferredWebApiCall()
+  f.scanner.connectionChanged('alpha'); stub(f).script.inventory.push(held.outcome)
+  await f.h.clock.advance(MEMBERSHIP_RETRY_MIN_MS)
+  f.assign(C.primary, 'off')
+  held.settle(membershipPage([])); await f.h.clock.flush()
+}
+test('a membership history commits as whole-state transactions would: writes, lines, acknowledgements and state', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'membership-'))
+  async function history(whole: boolean) {
+    rmSync(dir, { recursive: true, force: true }); mkdirSync(dir)
+    const f = fixture({}, dir)
+    if (whole) f.authority.transactMembership = (key, revision, change, span) => f.authority.transact(revision, change, span)
+    const clones = spyOn(globalThis, 'structuredClone')
+    let copies: number
+    try {
+      await membershipHistory(f)
+      copies = clones.mock.calls.filter(([value]) => typeof value === 'object' && value !== null && (value as { format?: unknown }).format === SHARED_CHANNEL_FORMAT).length
+    } finally { clones.mockRestore() }
+    // Scan and connection IDs are random; the same history mints them in the same order.
+    const ids = new Map<string, string>()
+    const text = JSON.stringify({ writes: f.writes, captured: f.captured(), acks: stub(f).socket.acks, status: f.scanner.status('alpha'), memory: f.authority.snapshot() })
+      .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, id => ids.get(id) ?? ids.set(id, `id-${ids.size + 1}`).get(id)!)
+    const conflicts = Object.keys(life(f).membershipAbsenceConflicts ?? {})
+    await f.close(); expect(f.h.clock.pendingCount()).toBe(0); assertNoLeak(f.captured())
+    runs.splice(runs.indexOf(f), 1)
+    return { history: JSON.parse(text) as unknown, conflicts, copies }
+  }
+  const narrow = await history(false), whole = await history(true)
+  // Only the operator assignment copies the whole state on the membership path.
+  expect([narrow.conflicts, narrow.copies, whole.copies > narrow.copies]).toEqual([[C.primary], 1, true])
+  expect(narrow.history).toEqual(whole.history)
 })

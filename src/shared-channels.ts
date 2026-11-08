@@ -181,6 +181,19 @@ function own<T>(record: Record<string, T>, key: string): T | undefined {
 function put<T>(record: Record<string, T>, key: string, value: T): void {
   Object.defineProperty(record, key, { value, enumerable: true, configurable: true, writable: true })
 }
+/** Committed states share their objects across revisions, so they are frozen
+ * whole: an in-place write throws instead of reaching another revision. A
+ * frozen object's descendants are already frozen. */
+function freeze<T>(value: T): T {
+  if (typeof value !== 'object' || value === null || Object.isFrozen(value)) return value
+  for (const child of Object.values(value)) freeze(child)
+  return Object.freeze(value)
+}
+/** The value as reading its serialized form back gives it. */
+function reparse(value: unknown): unknown {
+  const text = JSON.stringify(value)
+  return text === undefined ? undefined : JSON.parse(text)
+}
 /** Every value write: a `thread_hybrid` entry keeps its Thread Hybrid Since
  * only over a previous `thread_hybrid` entry of the same life, else mints. */
 function putAssignment(assignments: Record<string, SharedAssignment>, channel: string, delivery: DeliveryMode, order: number, mint: () => string = randomUUID): void {
@@ -337,6 +350,20 @@ export function sharedAppliedConfig(state: SharedChannelState, path: string, dep
     resetDestination: persona => resetDestination(state, persona, deps.realpath),
   })
 }
+/** Saved input is immutable, but its destination exception depends on the
+ * current persona's removal and leave proofs. Validate both representations. */
+function checkSourceConfigs(state: SharedChannelState, sourceBytes: Uint8Array, path: string, deps: SharedChannelDeps): void {
+  parsePersonaConfigBytes(rawBytes(state.source), path, dirname(path), {
+    home: deps.home, record: true,
+    removedDestination: persona => removedDestination(state, persona, deps.realpath),
+  })
+  // Validate both representations before comparing them, so removed settings
+  // still receive the actionable schema diagnostic even in a damaged envelope.
+  parsePersonaConfigBytes(sourceBytes, path, dirname(path), {
+    home: deps.home, record: true,
+    removedDestination: persona => removedDestination(state, persona, deps.realpath),
+  })
+}
 /** The marker field's only valid shape; absence is checked by the caller. */
 export function validThreadMemoryMarker(value: unknown): value is Record<string, true> {
   return object(value) && Object.entries(value).every(([key, created]) => PERSONA_KEY_RE.test(key) && created === true)
@@ -382,88 +409,7 @@ export function parseSharedChannelState(bytes: Uint8Array, path: string, deps: S
   const sourceBytes = Buffer.from(state.sourceBytesBase64, 'base64')
   if (sourceBytes.toString('base64') !== state.sourceBytesBase64) throw new Error('The shared channel authority has invalid reviewed input evidence.')
   const incarnations = new Set<string>()
-  for (const [key, life] of Object.entries(state.personas)) {
-    if (!object(life) || typeof life.incarnation !== 'string' || !life.incarnation || !object(life.declaration) ||
-        !['name', 'credentials_file', 'working_directory'].every(field => typeof life.declaration[field as keyof PersonaDeclaration] === 'string') ||
-        !object(life.assignments) || !object(life.membership) || !object(life.membershipEvents) || !object(life.leaves) || !object(life.removedDestinations) ||
-        incarnations.has(life.incarnation) || Object.hasOwn(state.retiredIdentities, life.incarnation) ||
-        personaKey(life.declaration.name) !== key) throw new Error('The shared channel authority has an invalid persona incarnation.')
-    incarnations.add(life.incarnation)
-    if (life.resetOrder !== undefined && (!Number.isSafeInteger(life.resetOrder) || life.resetOrder < 1 || life.resetOrder > state.revision)) throw new Error('Invalid persona reset order.')
-    if (life.createdAt !== undefined && (!Number.isSafeInteger(life.createdAt) || life.createdAt < 0)) throw new Error('Invalid persona reset time evidence.')
-    if (life.resetDestination !== undefined) {
-      const proof = life.resetDestination
-      if (!object(proof) || Object.keys(proof).length !== 3 || !CHANNEL_ID_RE.test(proof.channel) ||
-          proof.incarnation !== life.incarnation || proof.order !== life.resetOrder || !Number.isSafeInteger(proof.order) || proof.order <= 1 ||
-          life.createdAt === undefined) throw new Error('Invalid destination reset evidence.')
-    }
-    if (life.membershipInventory !== undefined) {
-      const inventory = life.membershipInventory
-      if (!object(inventory) || Object.keys(inventory).length !== 5 || inventory.incarnation !== life.incarnation ||
-          !validInventoryIdentity(inventory.identity) ||
-          typeof inventory.observedThrough !== 'string' || !MEMBERSHIP_TIMESTAMP_RE.test(inventory.observedThrough) ||
-          !Number.isSafeInteger(inventory.observedRevision) || inventory.observedRevision < 1 ||
-          !Number.isSafeInteger(inventory.recordedOrder) || inventory.recordedOrder <= inventory.observedRevision || inventory.recordedOrder > state.revision) {
-        throw new Error('Invalid complete membership inventory evidence.')
-      }
-    }
-    if (life.installationReadiness !== undefined) validateMembershipSetupRecords(life.installationReadiness, state.revision)
-    if (life.membershipEvidence !== undefined) {
-      validateMembershipEvidence(life.membershipEvidence, state.revision)
-      const leaveKey = (e: MembershipEvidence) => JSON.stringify([e.recordedOrder, e.channel, e.identity])
-      const appliedLeaves = new Map(Object.values(life.membershipEvidence)
-        .filter(e => !e.member && e.state === 'applied').map(e => [leaveKey(e), e]))
-      for (const evidence of Object.values(life.membershipEvidence)) {
-        if (evidence.originalEvent !== undefined && !own(life.membershipEvidence, evidence.originalEvent) && !own(life.membershipEvents, evidence.originalEvent)) {
-          throw new Error('Missing original membership recovery evidence.')
-        }
-        if (evidence.originalEvent !== undefined && evidence.state === 'superseded') {
-          const original = own(life.membershipEvidence, evidence.originalEvent)
-          const laterLeave = appliedLeaves.get(leaveKey(evidence))
-          if (!original || !laterLeave || own(life.membershipEvents, laterLeave.event)?.order !== evidence.recordedOrder ||
-              original.channel !== evidence.channel || original.identity !== evidence.identity ||
-              compareMembershipEventTimes(original.timestamp, laterLeave.timestamp) >= 0 ||
-              compareMembershipEventTimes(evidence.timestamp, laterLeave.timestamp) >= 0) {
-            throw new Error('Unproven membership supersession.')
-          }
-        }
-        const event = own(life.membershipEvents, evidence.event)
-        if (evidence.state === 'applied' && (!event || event.channel !== evidence.channel ||
-            event.member !== evidence.member || event.identity !== evidence.identity)) {
-          throw new Error('Inconsistent applied membership recovery evidence.')
-        }
-      }
-    }
-    for (const [id, assignment] of Object.entries(life.assignments)) {
-      if (!CHANNEL_ID_RE.test(id) || !object(assignment) || !DELIVERY_MODES.includes(assignment.delivery) ||
-          !Number.isSafeInteger(assignment.order) || assignment.order < 1 || assignment.order > state.revision ||
-          (assignment.delivery === 'thread_hybrid'
-            ? typeof assignment.threadHybridSince !== 'string' || !assignment.threadHybridSince
-            : Object.hasOwn(assignment, 'threadHybridSince'))) throw new Error('The shared channel authority has an invalid ordered assignment.')
-    }
-    for (const [id, membership] of Object.entries(life.membership)) {
-      if (!CHANNEL_ID_RE.test(id) || !object(membership) || typeof membership.member !== 'boolean' ||
-          typeof membership.identity !== 'string' || !membership.identity || !Number.isSafeInteger(membership.boundary) ||
-          membership.boundary < 1 || membership.boundary > state.revision ||
-          (membership.isExtSharedChannel !== undefined && typeof membership.isExtSharedChannel !== 'boolean') ||
-          (membership.channelType !== undefined && membership.channelType !== 'channel' && membership.channelType !== 'group')) throw new Error('The shared channel authority has invalid membership evidence.')
-      if (membership.observedThrough !== undefined && !MEMBERSHIP_TIMESTAMP_RE.test(membership.observedThrough)) throw new Error('Invalid membership observation boundary.')
-    }
-    for (const [event, observation] of Object.entries(life.membershipEvents)) {
-      if (!event || !object(observation) || !CHANNEL_ID_RE.test(observation.channel) ||
-          typeof observation.member !== 'boolean' || typeof observation.identity !== 'string' || !observation.identity ||
-          !Number.isSafeInteger(observation.order) || observation.order < 1 || observation.order > state.revision ||
-          !Number.isSafeInteger(observation.boundary) || observation.boundary < 1 || observation.boundary > observation.order) throw new Error('The shared channel authority has invalid ordered membership evidence.')
-    }
-    for (const records of [life.leaves, life.removedDestinations]) {
-      for (const [id, proof] of Object.entries(records)) {
-        if (!CHANNEL_ID_RE.test(id) || !object(proof) || typeof proof.event !== 'string' || !proof.event ||
-            proof.incarnation !== life.incarnation || !Number.isSafeInteger(proof.boundary) ||
-            proof.boundary < 1 || proof.boundary > state.revision) throw new Error('The shared channel authority has invalid removal provenance.')
-      }
-    }
-    if (!key) throw new Error('The shared channel authority has an invalid persona key.')
-  }
+  for (const [key, life] of Object.entries(state.personas)) checkPersonaRecords(state, key, life, incarnations)
   for (const [incarnation, retired] of Object.entries(state.retiredIdentities)) {
     if (!object(retired) || retired.incarnation !== incarnation || typeof retired.key !== 'string' || !retired.key ||
         !Number.isSafeInteger(retired.order) || retired.order < 1 || retired.order > state.revision ||
@@ -473,33 +419,114 @@ export function parseSharedChannelState(bytes: Uint8Array, path: string, deps: S
         new Set(retired.channels.map(channel => channel.id)).size !== retired.channels.length) throw new Error('The shared channel authority has invalid retired identity evidence.')
   }
   validateBotAttempts(state)
-  for (const life of Object.values(state.personas)) {
-    checkMembershipHistory(life)
-    checkAbsenceConflicts(life, state.revision)
-    checkReplacedAbsences(life, state.revision)
-    for (const [channel, proof] of Object.entries(life.leaves)) {
-      const event = own(life.membershipEvents, proof.event)
-      if (!event || event.member || event.channel !== channel || event.boundary !== proof.boundary) throw new Error('The shared channel authority has inconsistent leave evidence.')
-    }
-    for (const [channel, proof] of Object.entries(life.removedDestinations)) {
-      const leave = own(life.leaves, channel)
-      if (!leave || leave.event !== proof.event || leave.boundary !== proof.boundary) throw new Error('The shared channel authority has inconsistent destination-removal evidence.')
-    }
-  }
+  for (const life of Object.values(state.personas)) checkPersonaHistory(life, state.revision)
   // Both raw inputs obey the final schema, including removed-key rejection.
   const config = sharedAppliedConfig(state, path, deps)
-  parsePersonaConfigBytes(rawBytes(state.source), path, dirname(path), {
-    home: deps.home, record: true,
-    removedDestination: persona => removedDestination(state, persona, deps.realpath),
-  })
-  // Validate both representations before comparing them, so removed settings
-  // still receive the actionable schema diagnostic even in a damaged envelope.
-  parsePersonaConfigBytes(sourceBytes, path, dirname(path), {
-    home: deps.home, record: true,
-    removedDestination: persona => removedDestination(state, persona, deps.realpath),
-  })
+  checkSourceConfigs(state, sourceBytes, path, deps)
   if (!isDeepStrictEqual(parseConfigJsonBytes(sourceBytes, path), state.source)) throw new Error('The shared channel authority has inconsistent reviewed input evidence.')
   if (!isDeepStrictEqual(reviewedFields(state.source), reviewedFields(state.applied))) throw new Error('The shared channel authority has inconsistent reviewed and applied fields.')
+  checkAppliedChoices(state, config, deps)
+  return state
+}
+/** One persona's own records, its incarnation unique among `incarnations`. */
+function checkPersonaRecords(state: SharedChannelState, key: string, life: SharedPersona, incarnations: Set<string>): void {
+  if (!object(life) || typeof life.incarnation !== 'string' || !life.incarnation || !object(life.declaration) ||
+      !['name', 'credentials_file', 'working_directory'].every(field => typeof life.declaration[field as keyof PersonaDeclaration] === 'string') ||
+      !object(life.assignments) || !object(life.membership) || !object(life.membershipEvents) || !object(life.leaves) || !object(life.removedDestinations) ||
+      incarnations.has(life.incarnation) || Object.hasOwn(state.retiredIdentities, life.incarnation) ||
+      personaKey(life.declaration.name) !== key) throw new Error('The shared channel authority has an invalid persona incarnation.')
+  incarnations.add(life.incarnation)
+  if (life.resetOrder !== undefined && (!Number.isSafeInteger(life.resetOrder) || life.resetOrder < 1 || life.resetOrder > state.revision)) throw new Error('Invalid persona reset order.')
+  if (life.createdAt !== undefined && (!Number.isSafeInteger(life.createdAt) || life.createdAt < 0)) throw new Error('Invalid persona reset time evidence.')
+  if (life.resetDestination !== undefined) {
+    const proof = life.resetDestination
+    if (!object(proof) || Object.keys(proof).length !== 3 || !CHANNEL_ID_RE.test(proof.channel) ||
+        proof.incarnation !== life.incarnation || proof.order !== life.resetOrder || !Number.isSafeInteger(proof.order) || proof.order <= 1 ||
+        life.createdAt === undefined) throw new Error('Invalid destination reset evidence.')
+  }
+  if (life.membershipInventory !== undefined) {
+    const inventory = life.membershipInventory
+    if (!object(inventory) || Object.keys(inventory).length !== 5 || inventory.incarnation !== life.incarnation ||
+        !validInventoryIdentity(inventory.identity) ||
+        typeof inventory.observedThrough !== 'string' || !MEMBERSHIP_TIMESTAMP_RE.test(inventory.observedThrough) ||
+        !Number.isSafeInteger(inventory.observedRevision) || inventory.observedRevision < 1 ||
+        !Number.isSafeInteger(inventory.recordedOrder) || inventory.recordedOrder <= inventory.observedRevision || inventory.recordedOrder > state.revision) {
+      throw new Error('Invalid complete membership inventory evidence.')
+    }
+  }
+  if (life.installationReadiness !== undefined) validateMembershipSetupRecords(life.installationReadiness, state.revision)
+  if (life.membershipEvidence !== undefined) {
+    validateMembershipEvidence(life.membershipEvidence, state.revision)
+    const leaveKey = (e: MembershipEvidence) => JSON.stringify([e.recordedOrder, e.channel, e.identity])
+    const appliedLeaves = new Map(Object.values(life.membershipEvidence)
+      .filter(e => !e.member && e.state === 'applied').map(e => [leaveKey(e), e]))
+    for (const evidence of Object.values(life.membershipEvidence)) {
+      if (evidence.originalEvent !== undefined && !own(life.membershipEvidence, evidence.originalEvent) && !own(life.membershipEvents, evidence.originalEvent)) {
+        throw new Error('Missing original membership recovery evidence.')
+      }
+      if (evidence.originalEvent !== undefined && evidence.state === 'superseded') {
+        const original = own(life.membershipEvidence, evidence.originalEvent)
+        const laterLeave = appliedLeaves.get(leaveKey(evidence))
+        if (!original || !laterLeave || own(life.membershipEvents, laterLeave.event)?.order !== evidence.recordedOrder ||
+            original.channel !== evidence.channel || original.identity !== evidence.identity ||
+            compareMembershipEventTimes(original.timestamp, laterLeave.timestamp) >= 0 ||
+            compareMembershipEventTimes(evidence.timestamp, laterLeave.timestamp) >= 0) {
+          throw new Error('Unproven membership supersession.')
+        }
+      }
+      const event = own(life.membershipEvents, evidence.event)
+      if (evidence.state === 'applied' && (!event || event.channel !== evidence.channel ||
+          event.member !== evidence.member || event.identity !== evidence.identity)) {
+        throw new Error('Inconsistent applied membership recovery evidence.')
+      }
+    }
+  }
+  for (const [id, assignment] of Object.entries(life.assignments)) {
+    if (!CHANNEL_ID_RE.test(id) || !object(assignment) || !DELIVERY_MODES.includes(assignment.delivery) ||
+        !Number.isSafeInteger(assignment.order) || assignment.order < 1 || assignment.order > state.revision ||
+        (assignment.delivery === 'thread_hybrid'
+          ? typeof assignment.threadHybridSince !== 'string' || !assignment.threadHybridSince
+          : Object.hasOwn(assignment, 'threadHybridSince'))) throw new Error('The shared channel authority has an invalid ordered assignment.')
+  }
+  for (const [id, membership] of Object.entries(life.membership)) {
+    if (!CHANNEL_ID_RE.test(id) || !object(membership) || typeof membership.member !== 'boolean' ||
+        typeof membership.identity !== 'string' || !membership.identity || !Number.isSafeInteger(membership.boundary) ||
+        membership.boundary < 1 || membership.boundary > state.revision ||
+        (membership.isExtSharedChannel !== undefined && typeof membership.isExtSharedChannel !== 'boolean') ||
+        (membership.channelType !== undefined && membership.channelType !== 'channel' && membership.channelType !== 'group')) throw new Error('The shared channel authority has invalid membership evidence.')
+    if (membership.observedThrough !== undefined && !MEMBERSHIP_TIMESTAMP_RE.test(membership.observedThrough)) throw new Error('Invalid membership observation boundary.')
+  }
+  for (const [event, observation] of Object.entries(life.membershipEvents)) {
+    if (!event || !object(observation) || !CHANNEL_ID_RE.test(observation.channel) ||
+        typeof observation.member !== 'boolean' || typeof observation.identity !== 'string' || !observation.identity ||
+        !Number.isSafeInteger(observation.order) || observation.order < 1 || observation.order > state.revision ||
+        !Number.isSafeInteger(observation.boundary) || observation.boundary < 1 || observation.boundary > observation.order) throw new Error('The shared channel authority has invalid ordered membership evidence.')
+  }
+  for (const records of [life.leaves, life.removedDestinations]) {
+    for (const [id, proof] of Object.entries(records)) {
+      if (!CHANNEL_ID_RE.test(id) || !object(proof) || typeof proof.event !== 'string' || !proof.event ||
+          proof.incarnation !== life.incarnation || !Number.isSafeInteger(proof.boundary) ||
+          proof.boundary < 1 || proof.boundary > state.revision) throw new Error('The shared channel authority has invalid removal provenance.')
+    }
+  }
+  if (!key) throw new Error('The shared channel authority has an invalid persona key.')
+}
+/** One persona's membership history, absence evidence and removal provenance. */
+function checkPersonaHistory(life: SharedPersona, revision: number): void {
+  checkMembershipHistory(life)
+  checkAbsenceConflicts(life, revision)
+  checkReplacedAbsences(life, revision)
+  for (const [channel, proof] of Object.entries(life.leaves)) {
+    const event = own(life.membershipEvents, proof.event)
+    if (!event || event.member || event.channel !== channel || event.boundary !== proof.boundary) throw new Error('The shared channel authority has inconsistent leave evidence.')
+  }
+  for (const [channel, proof] of Object.entries(life.removedDestinations)) {
+    const leave = own(life.leaves, channel)
+    if (!leave || leave.event !== proof.event || leave.boundary !== proof.boundary) throw new Error('The shared channel authority has inconsistent destination-removal evidence.')
+  }
+}
+/** Each applied persona's declaration, list and destination proofs against its life. */
+function checkAppliedChoices(state: SharedChannelState, config: PersonaConfig, deps: SharedChannelDeps): void {
   if (config.personas.length !== Object.keys(state.personas).length) throw new Error('The shared channel authority has inconsistent persona identities.')
   for (const persona of config.personas) {
     const life = own(state.personas, persona.key)
@@ -511,7 +538,6 @@ export function parseSharedChannelState(bytes: Uint8Array, path: string, deps: S
     }
     if (life.resetDestination && !resetDestination(state, persona, deps.realpath)) throw new Error('The shared channel authority has inconsistent destination-reset evidence.')
   }
-  return state
 }
 export function serializeSharedChannelState(state: SharedChannelState): Uint8Array {
   return Buffer.from(JSON.stringify(state, null, 2) + '\n')
@@ -526,10 +552,14 @@ export function initialSharedChannelState(bytes: Uint8Array, config: PersonaConf
   }
   return { format: SHARED_CHANNEL_FORMAT, revision: 1, source: clone(raw), sourceBytesBase64: Buffer.from(bytes).toString('base64'), applied: clone(raw), personas, retiredIdentities: {}, pendingIntent: {}, outcomes: {} }
 }
+/** The persona's position in the applied list, -1 when absent. */
+function rawPersonaIndex(entries: unknown[], key: string): number {
+  return entries.findIndex(entry => object(entry) && typeof entry['name'] === 'string' && personaKey(entry['name']) === key)
+}
 function rawPersona(state: SharedChannelState, key: string): Record<string, unknown> {
   const entries = state.applied['personas']
   if (!Array.isArray(entries)) throw new Error('The shared channel authority has invalid applied personas.')
-  const persona = entries.find(entry => object(entry) && typeof entry['name'] === 'string' && personaKey(entry['name']) === key)
+  const persona = entries[rawPersonaIndex(entries, key)]
   if (!persona) throw new Error('Unknown applied persona incarnation.')
   return persona
 }
@@ -573,6 +603,138 @@ export function applySharedMembership(
     putAssignment(life.assignments, observation.channel, next.applied['channel_mode'] === 'open' ? 'mentions' : 'off', order, mint)
   }
   raw['channels'] = Object.entries(life.assignments).map(([id, assignment]) => ({ id, delivery: assignment.delivery }))
+}
+
+// --- Membership transactions: one persona's records, copied on write ---
+
+/** The record maps a membership transaction may change in its persona. */
+const MEMBERSHIP_RECORDS = ['assignments', 'membership', 'membershipEvents', 'leaves', 'removedDestinations', 'membershipEvidence', 'membershipAbsenceConflicts'] as const
+const MEMBERSHIP_FIELDS: ReadonlySet<string> = new Set<string>([...MEMBERSHIP_RECORDS, 'membershipInventory'])
+/** The field holding the application position of a record in each map. */
+const RECORD_POSITIONS: Readonly<Record<string, string>> = {
+  assignments: 'order', membershipEvents: 'order', membershipEvidence: 'recordedOrder', membershipAbsenceConflicts: 'recordedOrder',
+}
+const DRAFT_FIELDS: ReadonlySet<string> = new Set(['revision', 'personas', 'applied'])
+const APPLIED_LIST: ReadonlySet<string> = new Set(['personas'])
+const RAW_CHANNELS: ReadonlySet<string> = new Set(['channels'])
+interface MembershipDraft {
+  next: SharedChannelState
+  life: SharedPersona
+  raw: Record<string, unknown>
+  index: number
+  /** The persona's copied record maps, by field. */
+  records: Map<string, Record<string, unknown>>
+}
+/** `state` at `revision` with fresh copies of the persona, its record maps,
+ * the applied list and its raw entry; every other object is shared. */
+function membershipDraft(state: SharedChannelState, key: string, revision: number): MembershipDraft {
+  const list = (state.applied['personas'] as Record<string, unknown>[]).slice()
+  const index = rawPersonaIndex(list, key)
+  const raw = { ...list[index]! }
+  list[index] = raw
+  const life: SharedPersona = { ...state.personas[key]! }
+  const fields = life as unknown as Record<string, unknown>
+  const records = new Map<string, Record<string, unknown>>()
+  for (const field of MEMBERSHIP_RECORDS) {
+    if (fields[field] === undefined) continue
+    const copy = { ...fields[field] as Record<string, unknown> }
+    records.set(field, copy)
+    fields[field] = copy
+  }
+  const personas = { ...state.personas }
+  put(personas, key, life)
+  return { next: { ...state, revision, personas, applied: { ...state.applied, personas: list } }, life, raw, index, records }
+}
+/** Same keys in the same order, with identical values, outside `except`. */
+function sameExcept(after: object, before: object, except: ReadonlySet<string>): boolean {
+  const a = after as Record<string, unknown>, b = before as Record<string, unknown>
+  const keys = Object.keys(a).filter(key => !except.has(key)), kept = Object.keys(b).filter(key => !except.has(key))
+  return keys.length === kept.length && keys.every((key, i) => key === kept[i] && a[key] === b[key])
+}
+/** A membership transaction changes its persona's membership fields and its
+ * raw entry's `channels` only; everything else stays the committed objects. */
+function checkMembershipScope(before: SharedChannelState, key: string, draft: MembershipDraft): void {
+  const { next, life, raw, index } = draft
+  const list = next.applied['personas'], kept = before.applied['personas'] as unknown[]
+  if (!sameExcept(next, before, DRAFT_FIELDS) || !sameExcept(next.personas, before.personas, new Set([key])) || own(next.personas, key) !== life ||
+      !sameExcept(next.applied, before.applied, APPLIED_LIST) || !Array.isArray(list) || list.length !== kept.length ||
+      list.some((entry, i) => entry !== (i === index ? raw : kept[i])) || !sameExcept(raw, kept[index] as object, RAW_CHANNELS) ||
+      !sameExcept(life, before.personas[key]!, MEMBERSHIP_FIELDS)) throw new Error('A membership transaction changed state outside its persona.')
+}
+/** Gives each value the transaction wrote the form reading the file back would
+ * give it, frozen, and answers whether every position written follows `revision`. */
+function settleMembershipDraft(saved: SharedPersona, savedRaw: Record<string, unknown>, draft: MembershipDraft, revision: number): boolean {
+  const fields = draft.life as unknown as Record<string, unknown>, kept = saved as unknown as Record<string, unknown>
+  let fresh = true
+  const written = (field: string, record: unknown) => {
+    const position = field === 'membershipInventory' ? 'recordedOrder' : RECORD_POSITIONS[field]
+    if (position !== undefined && object(record) && !((record[position] as number) > revision)) fresh = false
+  }
+  const settle = (value: unknown) => freeze(reparse(value))
+  for (const field of MEMBERSHIP_FIELDS) {
+    const value = fields[field]
+    if (value === undefined) { delete fields[field]; continue }
+    const copy = draft.records.get(field)
+    if (value === copy) {
+      const records = kept[field] as Record<string, unknown>
+      // Visits each entry once without building entry arrays; only the
+      // current entry is replaced or deleted.
+      for (const id in copy) {
+        if (Object.hasOwn(records, id) && records[id] === copy[id]) continue
+        const settled = settle(copy[id])
+        if (settled === undefined) delete copy[id]
+        else put(copy, id, settled)
+        written(field, settled)
+      }
+    } else if (value !== kept[field]) {
+      const settled = settle(value)
+      if (settled === undefined) delete fields[field]
+      else fields[field] = settled
+      if (field === 'membershipInventory') written(field, settled)
+      else if (object(settled)) for (const record of Object.values(settled)) written(field, record)
+    }
+  }
+  if (draft.raw['channels'] !== savedRaw['channels']) {
+    const settled = settle(draft.raw['channels'])
+    if (settled === undefined) delete draft.raw['channels']
+    else draft.raw['channels'] = settled
+  }
+  return fresh
+}
+/** Freezes the draft's fresh containers, whose other contents are already
+ * frozen: shared committed objects, or values settled above. */
+function sealMembershipDraft(draft: MembershipDraft): SharedChannelState {
+  for (const records of draft.records.values()) Object.freeze(records)
+  for (const value of [draft.life, draft.raw, draft.next.applied['personas'], draft.next.applied, draft.next.personas, draft.next]) Object.freeze(value)
+  return draft.next
+}
+/** The checks of `parseSharedChannelState` a membership transaction can
+ * change. Every other check reads objects it shares unchanged, bounded only
+ * from above by the revision, which grew. The incarnation stays unique
+ * because it is unchanged. */
+function checkMembershipDraft(before: SharedChannelState, state: SharedChannelState, key: string, fresh: boolean, path: string, deps: SharedChannelDeps): void {
+  const life = state.personas[key]!
+  checkPersonaRecords(state, key, life, new Set())
+  const attempts = state.outcomes.botAttempts
+  if (!fresh) validateBotAttempts(state)
+  else if (attempts !== undefined) {
+    // Positions after every earlier one meet no other persona's attempt.
+    const personas: Record<string, SharedPersona> = {}, mine: Record<string, SharedBotAttempt> = {}
+    put(personas, key, life)
+    for (const [id, attempt] of Object.entries(attempts)) if (attempt.key === key) put(mine, id, attempt)
+    validateBotAttempts({ ...state, personas, outcomes: { ...state.outcomes, botAttempts: mine } })
+  }
+  checkPersonaHistory(life, state.revision)
+  const config = sharedAppliedConfig(state, path, deps)
+  const saved = before.personas[key]!, destination = rawPersona(state, key)['permission_prompts'] as string
+  // Scope keeps both sources, declarations and destinations unchanged. Only
+  // these two records can change the saved source's removedDestination answer,
+  // even when a rejoin has made the applied list valid without that proof.
+  if (own(life.removedDestinations, destination) !== own(saved.removedDestinations, destination) ||
+      own(life.leaves, destination) !== own(saved.leaves, destination)) {
+    checkSourceConfigs(state, Buffer.from(state.sourceBytesBase64, 'base64'), path, deps)
+  }
+  checkAppliedChoices(state, config, deps)
 }
 export interface ReviewedAssignment { key: string; channel: string; delivery: DeliveryMode; incarnation?: string; absenceReplacement?: string }
 export interface ReviewedChannelEffect {
@@ -780,10 +942,18 @@ export interface SharedChannelAuthority {
   operatorIntent(): OperatorIntent
   requestReview(request: ReviewRequest, bytes: Uint8Array): OperatorRequestResult
   declaredAssignments(bytes: Uint8Array): ReviewedAssignment[]
-  /** The sole mutation boundary. Callback errors and stale revisions write
-   * nothing. A batch may reserve multiple ordered positions in one write;
-   * the callback receives the final position and publishes only that revision. */
+  /** The mutation boundary, with `transactMembership` sharing its commit order.
+   * Callback errors and stale revisions write nothing. A batch may reserve
+   * multiple ordered positions in one write; the callback receives the final
+   * position and publishes only that revision. */
   transact(expectedRevision: number, change: (next: SharedChannelState, order: number) => void, orderSpan?: number, publish?: (config: PersonaConfig) => void): SharedMutationResult
+  /** `transact` for one persona's membership, copying only what it changes.
+   * `change` may add, replace or delete entries of that persona's record maps
+   * (assignments, membership, events, leaves, removed destinations, evidence,
+   * absence conflicts), set its inventory and its applied `channels`, never
+   * mutating a shared record in place; anything else fails and writes nothing.
+   * Committed state is shared between revisions and frozen. */
+  transactMembership(key: string, expectedRevision: number, change: (next: SharedChannelState, order: number) => void, orderSpan?: number): SharedMutationResult
   previewReviewed(bytes: Uint8Array, assignments?: readonly ReviewedAssignment[]): PersonaConfig
   planReviewed(bytes: Uint8Array, assignments?: readonly ReviewedAssignment[]): ReviewedChannelPlan
   applyReviewed(bytes: Uint8Array, expectedRevision: number, assignments?: readonly ReviewedAssignment[]): SharedMutationResult
@@ -937,11 +1107,14 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
       return { kind: 'failed' }
     } finally { mutating = false }
   }
-  function publishChange(before: SharedChannelState, publish?: (config: PersonaConfig) => void): void {
+  function publishChange(before: SharedChannelState, publish?: (config: PersonaConfig) => void, key?: string): void {
     // Runtime publication precedes observers while the mutation lock is held.
     try { publish?.(authority.config()) } catch { /* durability cannot be undone by a publisher */ }
-    const changed = !isDeepStrictEqual(before.applied, current.applied) || !isDeepStrictEqual(before.personas, current.personas) ||
-      !isDeepStrictEqual(before.retiredIdentities, current.retiredIdentities)
+    // A membership commit shares every other persona, raw entry and field.
+    const changed = key === undefined
+      ? !isDeepStrictEqual(before.applied, current.applied) || !isDeepStrictEqual(before.personas, current.personas) ||
+        !isDeepStrictEqual(before.retiredIdentities, current.retiredIdentities)
+      : !isDeepStrictEqual(own(before.personas, key), own(current.personas, key)) || !isDeepStrictEqual(rawPersona(before, key), rawPersona(current, key))
     // Thread Memory forgets before `subscribe` listeners; the runtime publisher ran above.
     deliverThreadView(publish !== undefined || changed)
     if (changed) {
@@ -949,6 +1122,46 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
         try { listener(authority.config()) } catch { /* an observer cannot undo durability */ }
       }
     }
+  }
+  /** Every transaction's one order: reserve its positions, stage the next
+   * state and its bytes, write them durably, install, then publish. */
+  function commit(expectedRevision: number, orderSpan: number, publish: ((config: PersonaConfig) => void) | undefined,
+    stage: (revision: number) => { bytes: Uint8Array; state: SharedChannelState }, key?: string): SharedMutationResult {
+    if (!readable) return { kind: 'unresolved', revision: current.revision }
+    if (mutating || expectedRevision !== current.revision) return { kind: 'stale', revision: current.revision }
+    if (!Number.isSafeInteger(orderSpan) || orderSpan < 1 || !Number.isSafeInteger(current.revision + orderSpan)) return { kind: 'failed', revision: current.revision }
+    const before = current
+    const appliedRevision = current.revision + orderSpan
+    let prepared: SharedChannelState | undefined
+    mutating = true
+    failure = ''
+    try {
+      const staged = stage(appliedRevision)
+      prepared = staged.state
+      write(path, staged.bytes)
+      current = staged.state
+    } catch (err) {
+      mutating = false
+      failure = errnoSuffix(err)
+      // Never overwrite ambiguous evidence with a rollback or allow another
+      // writer to decide that the old memory won after an unsynced rename.
+      if (err instanceof DurableWriteUnsyncedError) {
+        readable = false
+        unreadableCause = 'unsynced'
+        uncertain = prepared
+        uncertainPublish = publish
+        deliverThreadView(false)
+        return { kind: 'unresolved', revision: current.revision }
+      }
+      return { kind: 'failed', revision: current.revision }
+    }
+    try {
+      // Metadata has durable order, but no applied publication or assignment.
+      publishChange(before, publish, key)
+    } finally {
+      mutating = false
+    }
+    return { kind: 'applied', revision: appliedRevision }
   }
   function candidateInput(bytes: Uint8Array): PersonaConfig {
     // Exact recorded input keeps record-start collision recovery available
@@ -1237,49 +1450,34 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
       return answer(result.kind === 'applied' ? 'recorded' : result.kind)
     },
     transact(expectedRevision, change, orderSpan = 1, publish) {
-      return reportOutcome(() => {
-        if (!readable) return { kind: 'unresolved', revision: current.revision }
-        if (mutating || expectedRevision !== current.revision) return { kind: 'stale', revision: current.revision }
-        if (!Number.isSafeInteger(orderSpan) || orderSpan < 1 || !Number.isSafeInteger(current.revision + orderSpan)) return { kind: 'failed', revision: current.revision }
+      return reportOutcome(() => commit(expectedRevision, orderSpan, publish, revision => {
         const next = clone(current)
-        const before = current
-        next.revision += orderSpan
-        const appliedRevision = next.revision
-        let prepared: SharedChannelState | undefined
-        mutating = true
-        failure = ''
-        try {
-          change(next, next.revision)
-          if (next.revision !== appliedRevision) throw new Error('Invalid shared application order.')
-          const bytes = serializeSharedChannelState(next)
-          const published = parseSharedChannelState(bytes, path, deps)
-          if (!published) throw new Error('Invalid shared authority format.')
-          prepared = published
-          write(path, bytes)
-          current = published
-        } catch (err) {
-          mutating = false
-          failure = errnoSuffix(err)
-          // Never overwrite ambiguous evidence with a rollback or allow another
-          // writer to decide that the old memory won after an unsynced rename.
-          if (err instanceof DurableWriteUnsyncedError) {
-            readable = false
-            unreadableCause = 'unsynced'
-            uncertain = prepared
-            uncertainPublish = publish
-            deliverThreadView(false)
-            return { kind: 'unresolved', revision: current.revision }
-          }
-          return { kind: 'failed', revision: current.revision }
-        }
-        try {
-          // Metadata has durable order, but no applied publication or assignment.
-          publishChange(before, publish)
-        } finally {
-          mutating = false
-        }
-        return { kind: 'applied', revision: appliedRevision }
-      })
+        next.revision = revision
+        change(next, revision)
+        if (next.revision !== revision) throw new Error('Invalid shared application order.')
+        const bytes = serializeSharedChannelState(next)
+        const published = parseSharedChannelState(bytes, path, deps)
+        if (!published) throw new Error('Invalid shared authority format.')
+        return { bytes, state: published }
+      }))
+    },
+    transactMembership(key, expectedRevision, change, orderSpan = 1) {
+      // A staged recovery is checked against its anchor's whole state.
+      const list = current.applied['personas']
+      if (current.recovery !== undefined || !own(current.personas, key) || !Array.isArray(list) || rawPersonaIndex(list, key) < 0) {
+        return authority.transact(expectedRevision, change, orderSpan)
+      }
+      return reportOutcome(() => commit(expectedRevision, orderSpan, undefined, revision => {
+        const before = freeze(current)
+        const draft = membershipDraft(before, key, revision)
+        change(draft.next, revision)
+        if (draft.next.revision !== revision) throw new Error('Invalid shared application order.')
+        checkMembershipScope(before, key, draft)
+        const fresh = settleMembershipDraft(before.personas[key]!, rawPersona(before, key), draft, before.revision)
+        checkMembershipDraft(before, draft.next, key, fresh, path, deps)
+        // The same encoder over the same keys and values as a whole copy.
+        return { bytes: serializeSharedChannelState(draft.next), state: sealMembershipDraft(draft) }
+      }, key))
     },
     observeMembership(key, incarnation, observation, expectedRevision) {
       if (!readable) return { kind: 'unresolved', revision: current.revision }
@@ -1294,7 +1492,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
           membershipPayloadIdentity(evidence) === membershipPayloadIdentity(observation.evidence))
         return { kind: samePayload && recorded.channel === observation.channel && recorded.member === observation.member && recorded.identity === observation.identity ? 'applied' : 'failed', revision: recorded.order }
       }
-      return authority.transact(expectedRevision, (next, order) => {
+      return authority.transactMembership(key, expectedRevision, (next, order) => {
         applySharedMembership(next, order, key, incarnation, observation, mint)
       })
     },

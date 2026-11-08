@@ -222,7 +222,7 @@ export function createMembershipScanner(deps: MembershipScanDeps): MembershipSca
   function applyPositives(entry: ScanEntry, controller: AbortController, generation: MembershipGeneration, observations: number,
     deadline: number, boundaries: Map<string, number>, staged: readonly VerifiedSharedMembership[]): void {
     const { authority } = deps
-    if (staged.length > 1 && authority.transact(authority.revision, (next, order) => {
+    if (staged.length > 1 && authority.transactMembership(entry.key, authority.revision, (next, order) => {
       let position = order - staged.length
       for (const observation of staged) applySharedMembership(next, ++position, entry.key, generation.incarnation, observation)
     }, staged.length).kind === 'applied') {

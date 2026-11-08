@@ -534,6 +534,233 @@ test('the production reader refuses malformed typed evidence without dumping ide
   check(authority.snapshot())
 })
 
+import { closeSync, fsyncSync, openSync, readdirSync, renameSync, unlinkSync, writeSync } from 'node:fs'
+import type { DurableWriteFs } from '../src/atomic-write.ts'
+import { applySharedMembership, SHARED_CHANNEL_FORMAT, type SharedChannelAuthority, type SharedChannelDeps, type VerifiedSharedMembership } from '../src/shared-channels.ts'
+import { channelPopulation } from './test-helpers/shared-channels.ts'
+import { SR8_SHARED_LIST_CHANNELS } from './test-helpers/thread-memory.ts'
+describe('membership transactions copy only their persona', () => {
+  const joinOf = (channel: string, event = `Ev${channel}`): VerifiedSharedMembership => ({ event, identity: 'app', channel, member: true, boundary: 0 })
+  const boundaryOf = (authority: SharedChannelAuthority, key: string, channel: string) => authority.lifetime(key, channel)?.membershipBoundary ?? 0
+  const observe = (authority: SharedChannelAuthority, key: string, channel: string, member: boolean, event: string) =>
+    authority.observeMembership(key, authority.incarnation(key)!, { event, identity: 'app', channel, member, boundary: boundaryOf(authority, key, channel) }, authority.revision)
+  /** One scan page's positives, as the scanner batches them. */
+  const page = (authority: SharedChannelAuthority, key: string, channels: string[], scan: string) => authority.transactMembership(key, authority.revision, (next, order) => {
+    let position = order - channels.length
+    for (const channel of channels) applySharedMembership(next, ++position, key, authority.incarnation(key)!, { event: `scan:${scan}:${channel}`, channel, member: true,
+      identity: 'app', boundary: boundaryOf(authority, key, channel), observedThrough: '1700000000.000', channelType: 'channel', isExtSharedChannel: false })
+  }, channels.length)
+  const wholeState = (value: unknown) => typeof value === 'object' && value !== null && (value as { format?: unknown }).format === SHARED_CHANNEL_FORMAT
+  /** An open-mode authority in `dir` whose observers record each publication
+   * with the revision on disk; `whole` routes membership through `transact`. */
+  function historyRun(dir: string, whole: boolean, write: NonNullable<SharedChannelDeps['write']> = durableWriteFileSync) {
+    mkdirSync(dir)
+    const config = input(); config.channel_mode = 'open'
+    const state = initialSharedState(root, config)
+    writeSharedState(dir, state)
+    const writes: Buffer[] = [], seen: unknown[] = []
+    let since = 0
+    const authority = createSharedChannelAuthority(sharedChannelPath(dir), state, {
+      write(path, bytes) { writes.push(Buffer.from(bytes)); write(path, bytes) }, threadHybridSince: () => `since-${++since}`,
+    })
+    if (whole) authority.transactMembership = (key, revision, change, span) => authority.transact(revision, change, span)
+    const disk = () => parseSharedChannelState(readFileSync(authority.path), authority.path)!.revision
+    // Settings resolved beside the authority file name its directory.
+    authority.subscribe(config => seen.push(['config', authority.revision, disk(), JSON.parse(JSON.stringify(config).replaceAll(dir, '<dir>'))]))
+    authority.subscribeThreadView(view => seen.push(['view', view.revision, disk(), view.personaKeys().map(key => [key, view.threadHybridChannels(key), view.stamp(key, 'C0TEST002')])]))
+    authority.watch(() => seen.push(['watch', authority.revision, disk(), authority.readable]))
+    return { authority, writes, seen }
+  }
+  function membershipHistory(authority: SharedChannelAuthority): unknown[] {
+    const store = createChannelDeliveryStore(authority, () => true)
+    return [
+      observe(authority, 'alpha', 'C0TEST001', true, 'EvJOIN1'),
+      page(authority, 'alpha', ['C0TEST002', 'C0TEST003'], 'first'),
+      store.attempt('alpha', authority.incarnation('alpha')!, deliveryAttempt('equivalent-attempt', 'C0TEST002', 'thread_hybrid'), () => undefined),
+      observe(authority, 'beta', 'C0TEST001', true, 'EvJOIN2'),
+      observe(authority, 'alpha', 'C0TEST002', false, 'EvLEAVE1'),
+      observe(authority, 'alpha', 'C0TEST001', false, 'EvLEAVE2'),
+      observe(authority, 'alpha', 'C0TEST002', true, 'EvREJOIN1'),
+      observe(authority, 'alpha', 'C0TEST002', true, 'EvREJOIN1'),
+      page(authority, 'alpha', ['C0TEST003', 'C0TEST004'], 'second'),
+      authority.transactMembership('alpha', authority.revision, () => { throw new Error('refused') }),
+      authority.transactMembership('alpha', authority.revision - 1, () => { throw new Error('must not run') }),
+    ]
+  }
+
+  test('a membership history commits the bytes, outcomes, publications and observer order of whole-state transactions', () => {
+    const clones = spyOn(globalThis, 'structuredClone')
+    const runs = [false, true].map(whole => {
+      clones.mockClear()
+      const run = historyRun(join(root, whole ? 'whole' : 'narrow'), whole)
+      return { ...run, results: membershipHistory(run.authority), copies: clones.mock.calls.filter(([value]) => wholeState(value)).length }
+    })
+    clones.mockRestore()
+    const [narrow, whole] = runs as [typeof runs[0], typeof runs[0]]
+    // The paths differ: the bot attempt's two writes copy the whole state on
+    // both; whole-state membership adds one copy per write and one for the refusal.
+    expect([narrow.copies, whole.copies]).toEqual([2, 10])
+    expect(narrow.results).toEqual(whole.results)
+    expect(narrow.results.map(result => (result as { kind: string }).kind)).toEqual(['applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'failed', 'stale'])
+    expect(narrow.writes).toEqual(whole.writes)
+    expect(narrow.seen).toEqual(whole.seen)
+    // Every publication follows its durable write.
+    for (const entry of narrow.seen.filter(entry => (entry as unknown[])[0] !== 'watch')) expect((entry as number[])[1]).toBe((entry as number[])[2])
+    expect(narrow.authority.snapshot()).toEqual(whole.authority.snapshot())
+    expect(readFileSync(narrow.authority.path)).toEqual(readFileSync(whole.authority.path))
+    expect(parseSharedChannelState(readFileSync(narrow.authority.path), narrow.authority.path)).toEqual(narrow.authority.snapshot())
+    check([narrow.seen, narrow.authority.snapshot()])
+  })
+
+  test.each([true, false])('a saved empty source keeps its removal proof after rejoin: reject deletion without writing or publishing (whole=%p)', whole => {
+    const config = input()
+    const alpha = config.personas[0]!
+    alpha.dm = { enabled: false }
+    const channel = alpha.permission_prompts!
+    const writes: Uint8Array[] = []
+    const authority = makeSharedAuthority(root, config, { write(path, bytes) { writes.push(bytes); durableWriteFileSync(path, bytes) } })
+    if (whole) authority.transactMembership = (_key, revision, change, span) => authority.transact(revision, change, span)
+    expect(observe(authority, 'alpha', channel, false, 'EvSOURCELEAVE').kind).toBe('applied')
+    alpha.channels = []; alpha.stop_hook_bootstrap = false
+    const source = configBytes(config)
+    expect(authority.applyReviewed(source, authority.revision).kind).toBe('applied')
+    expect(authority.sourceBytes()).toEqual(source)
+    expect(observe(authority, 'alpha', channel, true, 'EvSOURCEREJOIN').kind).toBe('applied')
+    expect(authority.config().personas[0]!.channels.map(entry => entry.id)).toEqual([channel])
+    expect(authority.snapshot().personas.alpha!.removedDestinations[channel]).toBeDefined()
+    const before = { memory: authority.snapshot(), disk: readFileSync(authority.path), writes: writes.length }
+    const published: unknown[] = []
+    authority.subscribe(config => published.push(config))
+    authority.subscribeThreadView(view => published.push(view.revision))
+
+    expect(authority.transactMembership('alpha', authority.revision, next => {
+      delete next.personas.alpha!.removedDestinations[channel]
+    })).toEqual({ kind: 'failed', revision: before.memory.revision })
+    expect([authority.snapshot(), readFileSync(authority.path), writes.length, published, authority.readable])
+      .toEqual([before.memory, before.disk, before.writes, [], true])
+    const reopened = createSharedChannelAuthority(authority.path, readSharedState(root)!)
+    expect(reopened.snapshot()).toEqual(before.memory)
+    expect(reopened.config()).toEqual(authority.config())
+    check(reopened.snapshot())
+  })
+
+  const eio = () => Object.assign(new Error(sentinelInMessage('disk')), { code: 'EIO' })
+  /** Real durable writes, failing at `fault.at`: the temporary file's open,
+   * write or fsync, the rename, or the directory's open after the rename. */
+  function faultyWrite(fault: { at?: string }) {
+    const fs: DurableWriteFs = {
+      openSync: (path, flags) => { if (fault.at === (flags === 'r' ? 'directory' : 'open')) throw eio(); return openSync(path, flags) },
+      writeSync: (fd, buffer, offset, length) => { if (fault.at === 'write') throw eio(); return writeSync(fd, buffer, offset, length) },
+      fsyncSync: fd => { if (fault.at === 'fsync') throw eio(); fsyncSync(fd) },
+      closeSync: fd => closeSync(fd),
+      renameSync: (from, to) => { if (fault.at === 'rename') throw eio(); renameSync(from, to) },
+      unlinkSync: path => unlinkSync(path),
+    }
+    return (path: string, bytes: Uint8Array) => durableWriteFileSync(path, bytes, fs)
+  }
+  test.each(['open', 'write', 'fsync', 'rename', 'directory'] as const)('a membership write failing at %s leaves durable and memory state consistent and retryable, as a whole-state one does', at => {
+    const [narrow, whole] = [false, true].map(routed => {
+      const fault: { at?: string } = {}
+      const dir = join(root, routed ? 'whole' : 'narrow')
+      const { authority, seen } = historyRun(dir, routed, faultyWrite(fault))
+      expect(observe(authority, 'alpha', 'C0TEST001', true, 'EvSETUP').kind).toBe('applied')
+      const before = { disk: readFileSync(authority.path), memory: authority.snapshot(), seen: seen.length }
+      fault.at = at
+      const failed = observe(authority, 'alpha', 'C0TEST002', true, 'EvFAULT')
+      const after = { failed, readable: authority.readable, cause: authority.unreadableCause, failure: authority.failure,
+        disk: readFileSync(authority.path), memory: authority.snapshot(), temporary: readdirSync(dir).filter(name => name.endsWith('.tmp')), seen: seen.slice(before.seen) }
+      // Memory never runs ahead of a failed or uncertain write.
+      expect(after.memory).toEqual(before.memory)
+      if (at === 'directory') {
+        expect([failed.kind, after.readable, after.disk.equals(before.disk)]).toEqual(['unresolved', false, false])
+      } else {
+        expect([failed, after.readable, after.disk]).toEqual([{ kind: 'failed', revision: before.memory.revision }, true, before.disk])
+      }
+      expect(after.temporary).toEqual([])
+      fault.at = undefined
+      const retried = at === 'directory' ? authority.recoverDurability() : observe(authority, 'alpha', 'C0TEST002', true, 'EvFAULT')
+      expect(retried).toEqual({ kind: 'applied', revision: before.memory.revision + 1 })
+      expect(parseSharedChannelState(readFileSync(authority.path), authority.path)).toEqual(authority.snapshot())
+      return { after, retried, final: readFileSync(authority.path), memory: authority.snapshot(), seen: seen.slice(before.seen) }
+    })
+    expect(narrow).toEqual(whole!)
+    check(narrow)
+  })
+
+  test.each<[string, (next: SharedChannelState, order: number) => void]>([
+    ['throws after writing its own persona', (next, order) => { applySharedMembership(next, order, 'alpha', next.personas['alpha']!.incarnation, joinOf('C0TEST009')); throw new Error('refused') }],
+    ['changes a committed record in place', next => { next.personas['alpha']!.membership['C0TEST001']!.member = false }],
+    ['writes another persona', (next, order) => { next.personas['beta']!.assignments['C0TEST009'] = { delivery: 'off', order } }],
+    ['replaces a shared field', next => { next.pendingIntent = { forged: true } }],
+    ['changes its incarnation', next => { next.personas['alpha']!.incarnation = 'forged-life' }],
+    ['changes its applied entry beyond channels', next => { (next.applied['personas'] as Record<string, unknown>[])[0]!['permission_prompts'] = 'C0TEST009' }],
+    ['writes an invalid record', (next, order) => { next.personas['alpha']!.membership['C0TEST009'] = { member: true, boundary: order, identity: '' } }],
+  ])('a membership transaction that %s fails, writes and publishes nothing, and stays retryable', (_case, change) => {
+    const writes: Uint8Array[] = []
+    const authority = makeSharedAuthority(root, input(), { write(path, bytes) { writes.push(bytes); durableWriteFileSync(path, bytes) } })
+    expect(observe(authority, 'alpha', 'C0TEST001', true, 'EvSETUP').kind).toBe('applied')
+    const before = { memory: authority.snapshot(), disk: readFileSync(authority.path), writes: writes.length }
+    const published: unknown[] = []
+    authority.subscribe(config => published.push(config)); authority.subscribeThreadView(view => published.push(view.revision))
+    expect(authority.transactMembership('alpha', authority.revision, change)).toEqual({ kind: 'failed', revision: before.memory.revision })
+    expect([authority.snapshot(), readFileSync(authority.path), writes.length, published, authority.readable]).toEqual([before.memory, before.disk, before.writes, [], true])
+    expect(observe(authority, 'alpha', 'C0TEST002', true, 'EvRETRY')).toEqual({ kind: 'applied', revision: before.memory.revision + 1 })
+    expect(readSharedState(root)).toEqual(authority.snapshot())
+    check(authority.snapshot())
+  })
+
+  test('committed state is frozen: a retained draft cannot change what was published', () => {
+    const authority = makeSharedAuthority(root, input())
+    let kept: SharedChannelState | undefined
+    expect(authority.transactMembership('alpha', authority.revision, (next, order) => {
+      kept = next
+      applySharedMembership(next, order, 'alpha', authority.incarnation('alpha')!, joinOf('C0TEST002'))
+    }).kind).toBe('applied')
+    const committed = authority.snapshot()
+    expect(() => { kept!.personas['alpha']!.membership['C0TEST002']!.member = false }).toThrow(TypeError)
+    expect(() => { kept!.personas['beta']!.assignments = {} }).toThrow(TypeError)
+    expect(() => { kept!.pendingIntent['forged'] = true }).toThrow(TypeError)
+    // Readers still get detached copies they may change.
+    const copy = authority.snapshot(); copy.personas['alpha']!.membership = {}
+    expect([authority.snapshot(), readSharedState(root)]).toEqual([committed, committed])
+    check(committed)
+  })
+
+  // t2.yiv.sf.s3: each membership outcome cloned, reserialized, reparsed and
+  // revalidated the whole shared state, work that grew with the population.
+  test('live membership outcomes beside SR8_SHARED_LIST_CHANNELS channels per persona copy and reparse no whole state and share untouched records', () => {
+    const authority = makeSharedAuthority(root, input())
+    const ids = channelPopulation(SR8_SHARED_LIST_CHANNELS).map(channel => channel.id)
+    for (const key of ['alpha', 'beta']) {
+      expect(authority.transact(authority.revision, (next, order) => {
+        let position = order - ids.length
+        for (const channel of ids) applySharedMembership(next, ++position, key, authority.incarnation(key)!, { ...joinOf(channel, `scan:setup:${channel}`), channelType: 'channel', isExtSharedChannel: false })
+      }, ids.length).kind).toBe('applied')
+    }
+    const size = readFileSync(authority.path).length
+    const persona = (key: string) => authority.inspectMembershipHistory(key, life => life as never) as SharedChannelState['personas'][string]
+    const setup = `scan:setup:${ids[0]}`
+    const [alpha, beta] = [persona('alpha'), persona('beta')]
+    const clones = spyOn(globalThis, 'structuredClone'), parses = spyOn(JSON, 'parse')
+    let outcomes: string[], copies: number, reparses: number, untouched: unknown
+    try {
+      outcomes = [...ids.slice(1, 6).map(channel => observe(authority, 'alpha', channel, false, `EvLEAVE${channel}`)),
+        ...ids.slice(1, 6).map(channel => observe(authority, 'alpha', channel, true, `EvREJOIN${channel}`))].map(outcome => outcome.kind)
+      untouched = persona('beta')
+      outcomes.push(observe(authority, 'beta', 'C0TEST009', true, 'EvBETA').kind)
+      copies = clones.mock.calls.filter(([value]) => wholeState(value)).length
+      reparses = parses.mock.calls.filter(([text]) => typeof text === 'string' && text.length >= size).length
+    } finally { clones.mockRestore(); parses.mockRestore() }
+    expect({ outcomes, copies, reparses }).toEqual({ outcomes: outcomes.map(() => 'applied'), copies: 0, reparses: 0 })
+    // Another persona's outcomes share this one whole, and their own untouched records.
+    expect(untouched).toBe(beta)
+    expect(persona('alpha').membershipEvents[setup]).toBe(alpha.membershipEvents[setup]!)
+    expect(persona('beta').membershipEvents[setup]).toBe(beta.membershipEvents[setup]!)
+    expect(readSharedState(root)).toEqual(authority.snapshot())
+    check(authority.snapshot())
+  })
+})
+
 test('attempt identifiers preserve exact code units and cannot collide after Unicode replacement or trimming', () => {
   const values = ['retained', ' retained ', '\ud800', '\ufffd', '😀', '😀 ']
   const keys = values.map(id => {

@@ -199,7 +199,7 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
     if (!records.size) return { kind: 'unresolved', revision: authority.revision }
     undurableAbsences.set(key, records)
     undurableIncarnations.set(key, incarnation)
-    const result = authority.transact(authority.revision, (next, order) => {
+    const result = authority.transactMembership(key, authority.revision, (next, order) => {
       if (!isCurrent(generation)) throw new Error('Superseded membership absence.')
       const current = next.personas[key]!
       current.membershipAbsenceConflicts ??= {}
@@ -214,7 +214,7 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
     const records = new Map(undurable.get(generation.key))
     const absences = new Map(undurableAbsences.get(generation.key))
     records.set(evidence.event, evidence)
-    const result = authority.transact(authority.revision, (next, order) => {
+    const result = authority.transactMembership(generation.key, authority.revision, (next, order) => {
       const life = next.personas[generation.key]
       if (!life || life.incarnation !== generation.incarnation) throw new Error('Superseded membership observation.')
       // A live event held by an unsaved scan conflict must not acknowledge
@@ -306,7 +306,7 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
         (record.originalEvent !== undefined && (!original || original.channel !== evidence.channel ||
           original.identity !== generation.identityKey || compareMembershipEventTimes(original.timestamp, evidence.timestamp) >= 0))
     })) return false
-    const result = authority.transact(authority.revision, (next, order) => {
+    const result = authority.transactMembership(generation.key, authority.revision, (next, order) => {
       if (!isCurrent(generation)) throw new Error('Superseded membership observation.')
       const current = next.personas[generation.key]!
       current.membershipEvidence ??= {}
@@ -345,7 +345,7 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
     // The recorded leave may have happened after this join. Do not manufacture
     // another membership boundary (and then another leave) by replaying it as
     // a rejoin. Retain its identity durably; the scanner supplies current truth.
-    const result = authority.transact(authority.revision, (next, order) => {
+    const result = authority.transactMembership(generation.key, authority.revision, (next, order) => {
       const life = next.personas[generation.key]
       if (!life || life.incarnation !== generation.incarnation) throw new Error('Superseded membership observation.')
       life.membershipEvidence![evidence.event] = { ...evidence, state: 'superseded', recordedOrder: order }
@@ -471,7 +471,7 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
     }
     const observations = generation.observations
     const orderSpan = 1 + inventory.absent.size + [...plans.values()].reduce((count, records) => count + records.length, 0)
-    const result = authority.transact(authority.revision, (next, order) => {
+    const result = authority.transactMembership(generation.key, authority.revision, (next, order) => {
       if (!isCurrent(generation) || generation.observations !== observations) throw new Error('Superseded membership inventory.')
       const current = next.personas[generation.key]!
       let position = order - orderSpan
