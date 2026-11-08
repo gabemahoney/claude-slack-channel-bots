@@ -85,7 +85,11 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
   step of the "Operator actions" section of agent-director's README for it.
   Those notices are for a human only (see
   [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice)).
-- NEVER hand-edit or delete the shared authority `config.json.last-applied`.
+- NEVER hand-edit or delete the shared authority `config.json.last-applied`
+  once a start has adopted it. The one exception is a baseline written by hand
+  for an upgrade that has not yet started: correct it together with
+  `config.json`, with the operator's say-so, as
+  [Removed configuration keys](#removed-configuration-keys) says.
   Preserve authority and pending evidence during recovery (see
   [The stored-choice file: `config.json.last-applied`](#the-stored-choice-file-configjsonlast-applied)).
 - NEVER move, delete, relink or rewrite the state directory, its old
@@ -116,8 +120,8 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    **Answering every message in a channel, not only @mentions?** See
    [A persona receives every message in a channel](#a-persona-receives-every-message-in-a-channel).
    An `unclaimed-channel` line ending
-   `to serve this channel, use declarative mode with the channel listed` is
-   the fungible-mode form: see its reasons under
+   `to serve this channel, use strict mode with the channel listed` is
+   the open-mode form: see its reasons under
    [`unclaimed-channel`](#unclaimed-channel).
 2. **Pull every line for that key** from `server.log` (see
    [The server log](#the-server-log)).
@@ -268,8 +272,8 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
 11. **The cause of a hold is fixed but the persona is still held, or
     `clear-latch` printed a line and exited non-zero?** See
     [Clearing a hold by hand: `clear-latch`](#clearing-a-hold-by-hand-clear-latch).
-12. **The shared authority is unreadable or a choice write failed?** See
-    [The stored-choice file: `config.json.last-applied`](#the-stored-choice-file-configjsonlast-applied).
+12. **The shared authority is unreadable or invalid?** See
+    [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid).
     **An agent's `set_channel_delivery` call was refused or failed?** The
     refusals, in the order they are checked, and the failed write are under
     [`persona-channel-delivery-set`](#persona-channel-delivery-set).
@@ -910,13 +914,28 @@ no recovery outcome. See [Message saved after retry](#message-saved-after-retry)
 
 ### `channel-membership-unresolved`
 
-The named persona/channel lacks trustworthy current membership. `installation-unverified`
+- **Line:** `[slack] channel-membership-unresolved persona=<key> channel=<id>: <cause>. <action>`,
+  without ` channel=<id>` when no single channel applies. `<action>` is
+  `Authenticated reconciliation is required; elapsed time is not membership evidence.`,
+  or for `shared-state-unreadable`
+  `Restore readable, writable shared state; finite Slack retries cannot guarantee recovery of unsaved events.`,
+  or for `history-unresolved`
+  `Current inventory cannot establish this conflicting history; retain the hold for reviewed state recovery.`
+
+The named persona/channel lacks trustworthy current membership. The causes are
+`installation-unverified`, `current-membership-missing`, `eligibility-missing`,
+`event-order-conflict`, `shared-state-unreadable` and `history-unresolved`.
+`installation-unverified`
 requires the current authenticated app; `current-membership-missing` requires
 responsive inventory after startup, a gap or a live observation. A received
 join/leave is authenticated history, not current presence or absence by itself.
 `eligibility-missing` needs valid channel type and sharing metadata;
 `event-order-conflict` needs reconciliation beyond the conflicting observations.
-`shared-state-unreadable` requires readable shared state before recovery.
+`shared-state-unreadable` requires readable shared state before recovery. Once
+a persona's scan has ended, the same missing evidence is also posted to its
+destination as a
+[*Channel membership evidence unresolved*](#membership-evidence-unresolved)
+report.
 
 `history-unresolved` means current inventory cannot establish historical order:
 contradictory event IDs, ambiguous old history, or a missed absence crossing a
@@ -933,6 +952,8 @@ grants no fresh channel-assignment authority.
 
 ### `channel-membership-storage-failed`
 
+- **Line:** `[slack] channel-membership-storage-failed persona=<key> channel=<id>: event-not-durable. Restore readable, writable shared state; finite Slack retries cannot guarantee recovery of unsaved events.`
+
 `event-not-durable` means the named channel's event or retained history obligation
 could not be saved. Restore readable, writable shared state and free disk space;
 read readiness again after the idle retry. A live event is acknowledged only
@@ -941,6 +962,10 @@ succeeds it stays unacknowledged. An in-run hold cannot guarantee crash recovery
 of evidence that was never written. Accepted work remains queued.
 
 ### `channel-membership-inventory-incomplete`
+
+- **Line:** `[slack] channel-membership-inventory-incomplete persona=<key>: pages=<n> positives=<n> reason=<reason> slack_error=<code> deadline_at=<ms> next_attempt_at=<ms> retry_after_seconds=<s>. Restore the named access or storage evidence; background retries continue. Accepted work remains queued.`
+  `slack_error`, `deadline_at`, `next_attempt_at` and `retry_after_seconds`
+  appear only when known.
 
 The persona's current inventory is unverified, scanning or incomplete, never
 an empty complete inventory. Read `pages`, `positives`, `reason`, optional
@@ -962,10 +987,15 @@ Retry-After is seconds.
 Independent valid positive channels can progress before completion. A failed,
 partial or expired scan cannot prove absence. Complete catch-up can establish
 a still-visible leave, but a leave/rejoin wholly during downtime without
-authoritative absence cannot be reconstructed. Repeated absence cannot erase
+authoritative absence cannot be reconstructed, so that channel keeps its
+value. Both outcomes apply to the first start after an upgrade too (see
+[Upgrading from 0.18.x](../../docs/migration.md#upgrading-from-018x)).
+Repeated absence cannot erase
 a freshly reviewed future preference; a never-joined preference is not a leave.
 
 ### `channel-membership-inventory-complete`
+
+- **Line:** `[slack] channel-membership-inventory-complete persona=<key>: pages=<n> positives=<n> reason=none. Inventory evidence is current; subscription/reinstall verification is separate.`
 
 All available pages and the final shared-state write completed for the current
 authenticated persona. No repair is needed for that inventory. Read setup
@@ -975,6 +1005,10 @@ completeness; saved historical evidence alone does not restore it.
 
 ### `channel-membership-deadline`
 
+- **Line:** none of its own. It shows as `reason=deadline` on the
+  [`channel-membership-inventory-incomplete`](#channel-membership-inventory-incomplete)
+  line.
+
 A membership request, credential validation/open, or whole reconciliation
 attempt expired. Inventory reports `reason=deadline`; this typed timeout code
 is not a separate claim that a leave or repair occurred. Follow the next retry
@@ -983,16 +1017,22 @@ Expiry never authorizes discarding held history or accepted work.
 
 ### Membership recovery bounds
 
-Membership requests have a **10000 ms end-to-end deadline**, covering queued
+Membership requests have a **10000 ms end-to-end deadline**
+(`MEMBERSHIP_REQUEST_TIMEOUT_MS`), covering queued
 HTTP work; the membership client disables SDK retries, so SDK retry time cannot
-extend it. Composite credential validation/socket open is bounded at **20000 ms**,
-and a whole reconciliation attempt at **120000 ms**. Inventory requests use
-**200 channels per page** and follow every cursor, including after empty pages.
+extend it. Composite credential validation/socket open is bounded at **20000 ms**
+(`MEMBERSHIP_VALIDATION_TIMEOUT_MS`),
+and a whole reconciliation attempt at **120000 ms** (`MEMBERSHIP_ATTEMPT_TIMEOUT_MS`).
+Inventory requests use
+**200 channels per page** (`MEMBERSHIP_PAGE_LIMIT`) and follow every cursor,
+including after empty pages.
 
-Idle retries start with **5000 ms**, doubling through 10000, 20000 and 40000
-to a local ceiling of **60000 ms**. A longer Slack `Retry-After` controls the
+Idle retries start with **5000 ms** (`MEMBERSHIP_RETRY_MIN_MS`), doubling
+through 10000, 20000 and 40000
+to a local ceiling of **60000 ms** (`MEMBERSHIP_RETRY_MAX_MS`). A longer Slack
+`Retry-After` controls the
 actual next start. Long waits are rearmed in chunks no larger than
-**2147483647 ms**, never shortened into an early retry.
+**2147483647 ms** (`MEMBERSHIP_TIMER_MAX_MS`), never shortened into an early retry.
 
 With responsive Slack and persistence after repair, recovery takes at most the
 remaining in-flight deadline + next permitted retry wait (including Retry-After)
@@ -1007,10 +1047,24 @@ reconnect request or restart. The existing credential/client owner revalidates
 already applied credentials, the current authenticated installation and all
 persona admission checks. Pending credential edits are not adopted. Other
 credential/posting failures retain their recovery policy; this is not automatic
-recovery for every broken persona. Shutdown, supersession and identity changes
-invalidate obsolete results and retries. Elapsed time grants no membership.
+recovery for every broken persona.
+
+Shutdown, the persona's teardown and a new persona incarnation cancel the
+running attempt and its pending retry. A connection change cancels a running
+inventory and schedules nothing itself while the connection reconnects; once
+it is up or failed, a fresh attempt runs no sooner than
+`MEMBERSHIP_RETRY_MIN_MS` after the cancel. A newer observation during the inventory cancels it and
+schedules a fresh attempt no sooner than `MEMBERSHIP_RETRY_MIN_MS` later. A
+cancelled or superseded result changes nothing. Elapsed time grants no membership.
 
 ### `channel-membership-setup-unknown`
+
+- **Line:** `[slack] channel-membership-setup-unknown persona=<key>: missing=<subscriptions|none> unknown=<subscriptions|none> reinstall=<complete|incomplete|unknown> reason=<reason>. Check both required subscriptions and reinstall completion for the authenticated app; record the result through the local /membership-readiness operator interface.`
+  ` reason=<reason>` appears only when a reason is known.
+  `channel-membership-subscriptions-missing` and
+  `channel-membership-reinstall-incomplete` use the same form and action;
+  `channel-membership-setup-verified` ends
+  `Manual evidence covers this installation; current inventory is reported separately.`
 
 The persona has no complete manual evidence for its current installation.
 `installation-unverified`, `shared-state-unreadable`, `manual-evidence-missing`
@@ -1021,6 +1075,8 @@ Setup uncertainty does not invalidate independently trustworthy current positive
 
 ### `channel-membership-subscriptions-missing`
 
+- **Line:** `[slack] channel-membership-subscriptions-missing persona=<key>: missing=<subscriptions> unknown=<subscriptions|none> reinstall=<complete|incomplete|unknown>. Check both required subscriptions and reinstall completion for the authenticated app; record the result through the local /membership-readiness operator interface.`
+
 Manual evidence says one or both required subscriptions are missing from this
 persona's current app. Add the named `member_joined_channel` or `channel_left`
 subscription and finish the required reinstall, then record and read back the
@@ -1029,11 +1085,15 @@ subscriptions is the primary setup state. Inventory completion cannot repair it.
 
 ### `channel-membership-reinstall-incomplete`
 
+- **Line:** `[slack] channel-membership-reinstall-incomplete persona=<key>: missing=none unknown=<subscriptions|none> reinstall=incomplete. Check both required subscriptions and reinstall completion for the authenticated app; record the result through the local /membership-readiness operator interface.`
+
 The current app's manual record says reinstall is incomplete. Finish that app's
 installation in Slack, then record the observed result and read it back. Neither
 a successful scan nor a received event completes this setup evidence.
 
 ### `channel-membership-setup-verified`
+
+- **Line:** `[slack] channel-membership-setup-verified persona=<key>: missing=none unknown=none reinstall=complete. Manual evidence covers this installation; current inventory is reported separately.`
 
 The current authenticated installation has both subscriptions manually verified
 and reinstall recorded complete. No redundant reinstall is needed on ordinary
@@ -1041,6 +1101,8 @@ restart. This says nothing about inventory completeness; check its separate
 state. An old installation's record cannot verify a replacement app.
 
 ### `channel-membership-setup-recorded`
+
+- **Line:** `[slack] channel-membership-setup-recorded persona=<key>: saved manual evidence for the authenticated current installation; inventory and saved choices are unchanged.`
 
 Manual setup evidence was saved for the current authenticated installation.
 Read back `setup.state`, both subscription values and `reinstall`: a saved
@@ -1174,14 +1236,14 @@ credentials workflow, never these requests or chat.
 - **Group DMs:** a group DM (a direct message with more than one person) is
   never delivered, in either channel mode, and never logs
   `persona-dm-dropped`, whatever `dm.enabled` says. This is by design, not a
-  fault; turning `dm.enabled` on, or turning fungible mode on, does not
+  fault; turning `dm.enabled` on, or turning open mode on, does not
   change it. What it logs:
   - a group-DM message that Slack marks with `channel_type` `mpim` logs the
     plain `[slack] persona "<name>" (key=<key>) dropped message from
     channel=<id> …: group-dm` line, in both modes;
   - an @mention of the persona in a group DM arrives as an `app_mention`
-    event without `channel_type`. In declarative mode it logs
-    [`unclaimed-channel`](#unclaimed-channel). In fungible mode it logs no
+    event without `channel_type`. In strict mode it logs
+    [`unclaimed-channel`](#unclaimed-channel). In open mode it logs no
     line of its own, only the server's
     `[slack] RAW app_mention event persona=<key>: …` intake line.
 
@@ -1222,7 +1284,7 @@ credentials workflow, never these requests or chat.
   persona hearing it, remove its app from the channel in Slack. To change the
   delivery shown, ask the persona in that channel: its agent calls
   `set_channel_delivery`, which logs a
-  [`persona-channel-delivery-set`](#persona-channel-delivery-set) line. A newly verified join without a choice uses `mentions` in open mode; duplicate joins preserve explicit choices, including `off`. Without such a join or an assignment, delivery is `off`; an unreadable authority has no fallback choice (see [`channel-delivery-unreadable`](#channel-delivery-unreadable)). A persona
+  [`persona-channel-delivery-set`](#persona-channel-delivery-set) line. A newly verified join without a choice uses `mentions` in open mode; duplicate joins preserve explicit choices, including `off`. Without such a join or an assignment, delivery is `off`; an unreadable authority has no fallback choice (see [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid)). A persona
   that hears a channel but doesn't answer there is covered under
   [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to).
 - **Two personas at `all` in one channel:** don't. Each receives every
@@ -1281,15 +1343,22 @@ credentials workflow, never these requests or chat.
   current authorization. Other fixes are under
   [A persona receives every message in a channel](#a-persona-receives-every-message-in-a-channel).
 
-- **Results and history:** An applied result identifies the persona/channel,
-  says `newly applied` or `previously applied` at its original position, and
-  reports original saved/effective delivery.
-  A historical result adds `This history read made no new assignment.`
+- **Results and history:** Every result opens
+  `Channel delivery for persona "<name>" (key=<key>), channel <id>: `. An
+  applied result reads
+  `newly applied at position <n>; original saved <value>, effective <value>.`,
+  or `previously applied` in place of `newly applied` when it reports a
+  retained application. A historical result adds `This history read made no new assignment.`
 
-  Current saved/effective facts and mode are reported separately;
+  An outcome reports both the saved choice and the effective delivery, which
+  can differ (see [saved and effective delivery](../../docs/channel-modes.md#delivery-values-in-both-modes)).
+  The current facts and mode follow separately, as
+  `Current saved <value>, effective <value> in <strict|open> mode.`;
   a later operator choice is not overwritten. When current evidence is missing,
   removed, ineligible or untrustworthy, the result identifies what is unavailable
-  rather than inventing an effective choice.
+  rather than inventing an effective choice:
+  `Current saved/effective facts are unavailable: <reason>.` or
+  `Current saved <value>; effective delivery is unavailable: <reason>.`
 
   An authorized current session of the same incarnation may read this history
   in strict mode or dry run without writing. Inactive, stale, foreign or
@@ -1310,6 +1379,25 @@ credentials workflow, never these requests or chat.
 
   Restoring eligibility does not
   turn that retained rejection into an assignment.
+
+  **What to do with each:**
+  - **No result** (the response was lost, or the session reconnected or
+    restarted): call again with the same `attempt_id`, channel and value and
+    `intent: retry`. It reports the retained outcome and makes no second
+    application. A retry whose identifier has no retained history reports
+    *unresolved* and creates nothing. A new identifier would make a new
+    assignment instead.
+  - **Pending:** the attempt is retained but its application is not yet
+    settled. **Unresolved:** the shared state cannot show whether it applied.
+    For both, preserve the identifier, then have the operator repair storage
+    ([`reload-record-write-failed`](#reload-record-write-failed)) or use
+    [reviewed repair](#reload-shared-recovery), and retry with the same
+    identifier afterwards.
+  - **Assert the same value again, cancel or revise a choice:** a deliberate
+    same-value assignment uses a fresh identifier and `intent: assignment`. An
+    operator's own channel choices, and cancelling or revising them before
+    confirmation, follow [Editing the configuration](../../docs/reload.md#editing-the-configuration)
+    and [Confirming a change](../../docs/reload.md#confirming-a-change).
 - **Refusals:** No new assignment diagnostic is produced for input/access
   refusal, pending, not-applied or unresolved results. A rejected attempt may
   retain metadata; absence of a success line does not establish the outcome.
@@ -1318,6 +1406,8 @@ credentials workflow, never these requests or chat.
   1. Session/access failures include:
      - `Tool "set_channel_delivery" refused: this session is not matched to a persona.`
      - `Tool "set_channel_delivery" refused: persona key=<key> is not an applied persona.`
+     - `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): this request cannot access or change channel delivery.`
+       (an attempt lookup that found the session inactive or the request invalid).
      An absent, retiring, down, disconnected, dropped or superseded session
      is refused even when its key remains in `config.json`. A later authorized
      session can read retained history only for its own current incarnation.
@@ -1327,7 +1417,7 @@ credentials workflow, never these requests or chat.
      `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): dry run cannot create assignments or attempt records. Retained same-incarnation history can be read without writing.`
   3. Unavailable authority may give:
      `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): the shared channel authority "<path>" is not trustworthy, so the outcome is unresolved and no channel delivery can be stored. The operator must preserve the evidence and restore trustworthy shared state before retrying.`
-     See [`channel-delivery-unreadable`](#channel-delivery-unreadable).
+     See [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid).
   4. A bad value:
      `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): delivery "<value>" is not "off" or "mentions" or "all" or "thread_hybrid".`
      A value that is missing, not a string, or anything but 1 to 48
@@ -1359,7 +1449,7 @@ credentials workflow, never these requests or chat.
   that same attempt; neither elapsed time nor another call guarantees recovery.
 
   Do not replace the identifier to retry an uncertain write or replay it over a
-  newer choice. See [The store's `[slack] channel-delivery:` lines](#the-stores-slack-channel-delivery-lines).
+  newer choice.
 - **Input validation:** The MCP request has exactly the four inputs above,
   with no timestamp input. Supply valid inputs; changing the channel/value
   on a retained identifier is refused.
@@ -1388,7 +1478,10 @@ credentials workflow, never these requests or chat.
     rate-limit wait is never shorter than Slack asks for;
   - server notices wait in order, at most 20 per persona (past that the
     oldest is dropped with a line; see
-    [Other lines you may see](#other-lines-you-may-see));
+    [Other lines you may see](#other-lines-you-may-see)). Shared-state
+    reports are held the same way, including when an affected channel is the
+    destination (see
+    [Shared channel state reports](#shared-channel-state-reports));
   - a permission request stays open in agent-director. Its prompt is posted
     at the first retry that succeeds, if the request is still open then;
   - the line is logged once per episode. Failed retries log nothing, except
@@ -1427,9 +1520,10 @@ credentials workflow, never these requests or chat.
     above. A timed-out DM open may still finish at Slack, but CSCB does not
     post from that late answer.
   - To send the persona's prompts and notices somewhere else instead, change
-    its destination setting in `config.json`: `permission_prompts` in
-    declarative mode, `permission_prompts` in fungible mode (a
-    channel its app is in, or `"dm"`, its default), or its `dm.contact`. The edit becomes pending (see
+    its destination setting in `config.json`: its required
+    `permission_prompts` (in either mode, a channel listed in its `channels`
+    whose app is in it, or `"dm"` with `dm.enabled` on and a `dm.contact`;
+    there is no default), or its `dm.contact`. The edit becomes pending (see
     [Pending changes](#pending-changes)); once confirmed (see
     [Confirming a pending change](#confirming-a-pending-change)) it applies
     in place, with no restart, and the persona keeps its instance and
@@ -1656,9 +1750,8 @@ This is not a bring-up retry. A persona that was up and whose working directory
 is later removed follows the restart path: its launches fail, restarts back off
 from `session_restart_delay` and stop after 5 consecutive failures (a
 `SpawnCapReached` notice), and a *Working directory unreachable* notice is
-posted to the persona's destination: its `permission_prompts` channel or DM
-in declarative mode, its fungible destination (`permission_prompts`,
-or its DM with `dm.contact` when that is `"dm"` or absent) in fungible mode.
+posted to the persona's destination in either mode: its `permission_prompts`
+channel, or its DM with `dm.contact` when that is `"dm"`.
 Restore the directory; if
 restarts were capped, restart the server.
 
@@ -1940,6 +2033,8 @@ These reports are for the operator: the bot is told not to act on them, even whe
 
 Failed saves (creation or append), reads and seal writes retry in the background without new traffic: 5 seconds (`THREAD_MEMORY_RETRY_MIN_MS`), then 10, 20, 40 and at most 60 seconds (`THREAD_MEMORY_RETRY_MAX_MS`) between attempts. A retry does not post a bot message again; teardown or removal cancels that persona's retries, lookups and upload-thread reads and silently ends its open episodes, and a later bring-up starts fresh ones.
 
+A Slack lookup for Thread Memory (a reply's parent or a thread's history) has a 15-second end-to-end deadline per attempt (`THREAD_MEMORY_LOOKUP_DEADLINE_MS`), covering queued and in-flight HTTP work; the Web client makes no retries of its own, so nothing extends it. A failed attempt retries with the same spacing, waiting longer whenever Slack's `Retry-After` asks for more, even beyond 60 seconds; long waits are chained in timers of at most `MAX_TIMER_DELAY_MS` and never end early. There is no overall bound: a lookup retries until Slack answers it or what it serves changes (the persona's connection or the channel's state), and an answer that arrives after that changes nothing. Shutdown cancels lookups as teardown and removal do.
+
 Examples use persona `Alpha`, key `alpha`, channel `C0123` and an `EACCES` storage error. Notice blocks show the body; Slack posts normally prefix it with `Persona "Alpha" (key=alpha): `, and `&lt;state dir&gt;` displays as `<state dir>` in Slack. The overflow examples show the complete post so its prefix is included in the bound; log paths use JSON quotes without Slack escaping.
 
 ### `thread-memory-not-saved`
@@ -2191,7 +2286,7 @@ Thread: C0123 / 1700000000.000001.
 
   For an own-post lookup, `cause=several` means several of the bot's messages match; `cause=unmatched` means its messages are present but none matches. Otherwise Slack permanently refused the read, for example `channel_not_found`, `not_in_channel`, `is_archived` or `missing_scope`, refused credentials such as `invalid_auth`, or lost channel access; an unusable answer can instead give `rejected` or `malformed`. An upload-thread read is reported for every one of these answers, `rejected` and `malformed` included, and also for `thread_not_found` or `message_not_found`, because it reads no parent; it is never reported as `several` or `unmatched`.
 
-  Transient failures, rate limits and attempt timeouts post nothing and retry with the Thread Memory spacing above, honoring a longer `Retry-After`, with no overall limit. A missing parent (`thread_not_found` or `message_not_found`), a stale Channel Stamp after leaving `thread_hybrid` or changing its shared identity, and a lookup's complete history with no remaining message of the bot's own close silently; a unique match joins silently.
+  Transient failures, rate limits and attempt timeouts post nothing and retry as the lookup bounds above describe. A missing parent (`thread_not_found` or `message_not_found`), a stale Channel Stamp after leaving `thread_hybrid` or changing its shared identity, and a lookup's complete history with no remaining message of the bot's own close silently; a unique match joins silently.
 
   An upload whose own share message isn't in the history yet posts nothing and is read again from the first page with the same spacing and no limit, until the share appears in the history or as the bot's own message event, or the Channel Stamp goes stale. If CSCB stops or the persona is torn down first, the next start's or bring-up's own-post lookup settles it. Lookups and upload-thread reads wait while Thread Memory is unreadable, the connection is down or the Channel Stamp is undecided.
 - **Fix:** A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot, and use `server.log` for all identifiers when the post gives a count of the rest.
@@ -4364,7 +4459,7 @@ bug.
 
 **Stored channel choices.** Successful activation records retirement and
 replacement choices in the sole shared authority. A replacement inherits no
-old choice, membership or participation. Copied fields do not retain a choice;
+old choice or membership. Copied fields do not retain a choice;
 explicit reviewed retention assigns it to the replacement at a new order.
 Unassigned discovered entries use `off` in strict or `mentions` in open.
 While retirement is unsettled, old-life tool calls cannot assign for the
@@ -4487,7 +4582,7 @@ then on. Search `server.log` for `key is retired`.
 
 Successful activation records the choice reset and replacement assignments
 atomically in the sole shared authority. Re-add or rename-back inherits no
-old choice, membership or participation; deliberate reviewed retention is a
+old choice or membership; deliberate reviewed retention is a
 new assignment to the replacement. Current membership still governs effective
 delivery. See **Stored channel choices** under
 [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change)
@@ -4557,8 +4652,8 @@ reach subsequent AD-state reminder checks immediately with the same session.
 
 | Line | Meaning |
 |---|---|
-| `[slack] persona "<name>" (key=<key>): updated in place (<settings>); its instance, Slack connection and MCP session are kept` | The change was applied. `<settings>` lists what changed, such as `channels, dm.contact` in declarative mode or `permission_prompts, dm.enabled` in fungible mode. Normal. The same line is logged for a persona that is `retrying` or `broken`, though it has no instance, connection or session yet; it serves with the new values once it comes up. |
-| … the same line ending `; its cached DM conversation is forgotten` | The destination setting (`permission_prompts`, or `permission_prompts` in fungible mode) or `dm.*` changed, so the next post to a DM destination opens the DM again. Normal. |
+| `[slack] persona "<name>" (key=<key>): updated in place (<settings>); its instance, Slack connection and MCP session are kept` | The change was applied. `<settings>` lists what changed, such as `channels, dm.contact` or `permission_prompts, dm.enabled`, in either mode. Normal. The same line is logged for a persona that is `retrying` or `broken`, though it has no instance, connection or session yet; it serves with the new values once it comes up. |
+| … the same line ending `; its cached DM conversation is forgotten` | The destination setting (`permission_prompts`) or `dm.*` changed, so the next post to a DM destination opens the DM again. Normal. |
 | … the same line ending `; forgetting its cached DM conversation failed: <error>` | An internal error. The new values still apply. Report it as a bug. |
 | `[slack] persona "<name>" (key=<key>): in-place update failed: <error>` | An internal error. The new values still apply, because the server reads them at each use. Report it as a bug. |
 
@@ -4653,9 +4748,7 @@ registers again with its history. If the new token is refused too, a new
   `server.log` has a matching `[slack] Tool "reply" failed for persona <ref>: could not open a DM with "<user>" …`
   line. Nothing is posted.
 - **Same cause, prompts and notices:** a persona with a `"dm"` destination
-  (its `permission_prompts` is `"dm"` in declarative mode; in fungible mode
-  its `permission_prompts` is `"dm"` or absent, `"dm"` being the
-  default) opens its DM with `dm.contact` the same way, so its permission
+  (its `permission_prompts` is `"dm"`, in either mode) opens its DM with `dm.contact` the same way, so its permission
   prompts, stuck-prompt warnings and server notices can't be posted either.
   They are held, not lost: `server.log` has one
   [`persona-destination-failed`](#persona-destination-failed) line naming
@@ -5676,7 +5769,7 @@ agent-director get --instance-id <id>
 | `[slack] permission-poller: chat.postMessage failed for <instance> token=<token> (the prompt's message was rejected; a short prompt naming the tool is posted instead) (reason=<code>): …` | Slack refused the prompt's message itself (`<code>` is `invalid_blocks`, `msg_too_long` or the like), not its destination, so nothing is held. That message is not posted again: at the next poll a short prompt goes to the destination in its place, naming the tool and reading `The tool input is not shown: Slack rejected the full prompt (<code>).`, with the usual Allow and Deny buttons, which work as on any prompt. Report it as a bug, with the line. |
 | `[slack] permission-poller: chat.postMessage failed for <instance> token=<token> (the short prompt's message was rejected too; nothing more is posted for this request) (reason=<code>): …` | Slack refused the short prompt too. Nothing more is posted for the request. Once agent-director's relay window for it elapses, Claude asks at the persona's tmux pane (`tmux attach -t =slack_bot_<key>`), where it can be answered. Report it as a bug, with both lines. |
 | `[slack] permission-poller: prompt for <instance> (request_token=<token>) failed — the tick goes on; a later tick tries it again unless it was posted: <description>`, `[slack] permission-poller: spawn <instance> failed — the tick goes on, its tracked prompts and stuck-prompt state kept as if not read this tick: <description>`, `[slack] permission-poller: closing prompt for <instance> token=<token> failed — kept for the next tick, the tick goes on: <description>`, `[slack] permission-poller: tick failed — the rest of it skipped: <description>` | An internal error in the permission poller, caught: on one request's prompt, on one instance's row, on one prompt's closing update, or (`tick failed`) elsewhere in one poll, whose rest was skipped. Everything else goes on (after `tick failed`, from the next poll), and later polls try again; each line is written once while the failure repeats, not at every poll. A request whose prompt never posts can still be answered at the persona's tmux pane once its relay window elapses. Report it as a bug, with the line. |
-| `[slack] Tool "<tool>" failed for persona "<name>" (key=<key>) on channel "<channel>": <error>` (fungible mode) | In fungible mode a persona's tools may target any channel ID and Slack decides, so a call on a channel can fail at Slack. The agent gets `Tool "<tool>" failed for persona "<name>" (key=<key>) on channel "<channel>": Slack refused the call (<code>).`, or `…: the tool call failed.` when the failure has no Slack error code (a network or local failure). `not_in_channel`, or `channel_not_found` for a private channel, means the persona's app isn't in that channel: invite the app to it, or have the persona use a channel its app is in. A target that is neither a channel ID nor an allowed DM target is refused before any Slack call, with the tool error `Persona "<name>" (key=<key>) may not target "<target>": it is neither a channel ID nor an allowed DM target.` In declarative mode a channel the persona doesn't list is refused before any Slack call instead, with `… may not target "<target>": it is not one of the persona's configured channels.` |
+| `[slack] Tool "<tool>" failed for persona "<name>" (key=<key>) on channel "<channel>": <error>` (open mode) | In open mode a persona's tools may target any channel ID and Slack decides, so a call on a channel can fail at Slack. The agent gets `Tool "<tool>" failed for persona "<name>" (key=<key>) on channel "<channel>": Slack refused the call (<code>).`, or `…: the tool call failed.` when the failure has no Slack error code (a network or local failure). `not_in_channel`, or `channel_not_found` for a private channel, means the persona's app isn't in that channel: invite the app to it, or have the persona use a channel its app is in. A target that is neither a channel ID nor an allowed DM target is refused before any Slack call, with the tool error `Persona "<name>" (key=<key>) may not target "<target>": it is neither a channel ID nor an allowed DM target.` In strict mode a channel the persona doesn't list is refused before any Slack call instead, with `… may not target "<target>": it is not one of the persona's configured channels.` |
 | `[slack] persona-destination-hold: more than 20 notices held for "<name>" (key=<key>) while its destination fails — oldest held notice dropped, not posted: <first line>` | The persona's destination has been failing for a while (see [`persona-destination-failed`](#persona-destination-failed)) and more than 20 notices are waiting. The oldest is dropped; the line shows its first line. Fix the destination. |
 | `[slack] persona-destination-hold: persona=<key> is no longer applied — <n> held notice(s) dropped, not posted` | The persona was removed from the configuration while notices waited for its failing destination. They are dropped. Nothing to do. |
 | `[slack] persona-destination-hold: shutting down — <n> held notice(s) for "<name>" (key=<key>) dropped, not posted` | The server stopped while the persona's destination was failing. Its held notices are lost; its still-open prompts are posted after the next start. Fix the destination (see [`persona-destination-failed`](#persona-destination-failed)). |
@@ -6442,7 +6535,7 @@ validated before it can be confirmed. See the
 
 ### The load-time rules
 
-Before applying `config.json`, the server validates server-wide settings and all shared persona fields in both modes. `channel_mode` accepts only `strict` (the default) and `open`; other values are rejected. Removed `allow_invited_channels` and `invited` keys are rejected and require a manual edit.
+Before applying `config.json`, the server validates server-wide settings and all shared persona fields in both modes. `channel_mode` accepts only `strict` (the default) and `open`; other values are rejected. Keys from an earlier release are rejected and need a manual edit; see [Removed configuration keys](#removed-configuration-keys).
 
 In both modes:
 
@@ -6481,9 +6574,8 @@ Every row below applies to submitted configuration in both modes; shared persona
 | Message (after the persona prefix) | Mode | Cause | Fix |
 |---|---|---|---|
 | `personas[<i>] must be a JSON object, got <type>.` | both | An array element isn't an object. | Make it a persona object. |
-| `unknown field(s) in the persona entry: "<key>".`, `… in dm: …`, each possibly with `1 field whose name is not shown …` or `plus <n> fields whose names are not shown …` | both | A key the schema doesn't have, at that level. As at the top level, only plain setting names are shown; others (a digit, as in `channels2`, a dash, a pasted token) are counted. `channels` and `permission_prompts` are shared persona fields; `invited` is rejected. | Remove or correct it. For an unshown field, compare that entry's keys with the persona keys in `docs/configuration.md`. |
+| `unknown field(s) in the persona entry: "<key>".`, `… in dm: …`, each possibly with `1 field whose name is not shown …` or `plus <n> fields whose names are not shown …` | both | A key the schema doesn't have, at that level. As at the top level, only plain setting names are shown; others (a digit, as in `channels2`, a dash, a pasted token) are counted. `channels` and `permission_prompts` are shared persona fields; for a key from an earlier release, see [Removed configuration keys](#removed-configuration-keys). | Remove or correct it. For an unshown field, compare that entry's keys with the persona keys in `docs/configuration.md`. |
 | `unknown field(s) in channels[<j>]: …`, with the same forms | both | A key a channel entry doesn't have. | Remove or correct it. |
-| `invited has been removed; use permission_prompts.` | both | The persona entry contains `invited`, regardless of its contents. | Remove `invited`; the shared `permission_prompts` must meet [the destination rules above](#the-load-time-rules), including the verified-removal exception for an unchanged destination. |
 | `name is required.` / `name must be a non-empty string.` | both | Missing or blank name. Any other name is accepted: there is no format rule. | Give the persona a name. |
 | `credentials_file is required.` / `working_directory is required.` | both | Missing path. | Add it. |
 | `<setting> must be an absolute path, "~" or a path starting with "~/".` | both | `credentials_file`, `working_directory` or `claude_config_dir` is relative (or not a string). | Use an absolute path or `~/…`. |
@@ -6500,6 +6592,17 @@ Every row below applies to submitted configuration in both modes; shared persona
 | `the persona has no channels and dm.enabled is not true, so it can receive no messages. Add a channel or set dm.enabled to true.` | both | Zero channels with DMs off, without verified-removal evidence for an already validated, unchanged destination in the same incarnation. Checked before the two destination rules below. | Without that evidence, add a channel or turn DMs on. The [verified-removal exception above](#the-load-time-rules) requires neither for an unrelated edit. |
 | `permission_prompts names channel <id>, which is not in the persona's channels.` | both | The destination channel is unlisted and lacks the same-incarnation verified-removal evidence for an already validated, unchanged destination. | Unless the [verified-removal exception above](#the-load-time-rules) applies, add the channel to `channels` with an explicit delivery value (`off` is allowed), or pick one it lists. New or changed destinations and replacement identities cannot use old removal evidence. |
 | `permission_prompts is "dm" but dm.contact is not set.` / `… but dm.enabled is not true.` / `… but dm.contact is not set and dm.enabled is not true.` | both | A `dm` destination needs DMs enabled and a contact. | Set `dm.contact` and `"dm": {"enabled": true, …}`, or use a listed channel. |
+
+### Removed configuration keys
+
+These keys belong to an earlier release's configuration. A start rejects them from `config.json` when there is no record, or from a hand-written `config.json.last-applied` that has not yet started, shown as `[slack] Fatal: last-applied record error — …` with the same message; a pending review rejects them too. Edit every file that holds them by hand: before the first start of an upgrade, both baseline files, as step 4 of [Upgrading from 0.18.x](../../docs/migration.md#upgrading-from-018x) says.
+
+| Message | Cause | Replace with |
+|---|---|---|
+| `allow_invited_channels has been removed; use channel_mode.` | The top level of `config.json`, or of a hand-written `config.json.last-applied`, contains `allow_invited_channels`. | `channel_mode`: `"open"` where it was `true`, `"strict"` where it was `false` or absent. Remove `allow_invited_channels`. |
+| `invited has been removed; use permission_prompts.` (after the persona prefix) | A persona entry in either file contains `invited`, whatever it holds. | The persona's one `permission_prompts`, which must meet [the destination rules](#the-load-time-rules): move `invited.permission_prompts` there. Where it was absent (the earlier `"dm"` default), set `"dm"` with `dm.enabled: true` and a `dm.contact`. A channel destination must be listed in `channels` with an explicit delivery (`off` is allowed). Then remove `invited`. |
+
+"Declarative mode" is now strict mode and "fungible mode" is now open mode. `channel-delivery.json` is a preserved reference the current release does not read; the [upgrade procedure](../../docs/migration.md#upgrading-from-018x) keeps it for manual use when transferring channel choices.
 
 ### Across personas
 
@@ -6555,7 +6658,7 @@ start.
 
 Without an authority on a fresh install, `config.json` is checked and becomes the first durable applied revision. The CLI takes its settings and persona set from the record too, or
 from `config.json` when there is none: `stop` (its `stop_timeout`),
-`stop --stop-bots` and `clean_restart`. Never edit the record's contents.
+`stop --stop-bots` and `clean_restart`. Never edit the record's contents once a start has adopted it; the one exception is a baseline written by hand for an upgrade that has not yet started, which you correct together with `config.json`, with the operator's say-so, as [Removed configuration keys](#removed-configuration-keys) says.
 
 Each start logs which configuration it runs:
 
@@ -6646,7 +6749,7 @@ fields; an explicit same-value assignment has a new application order.
 Omitted current choices and automatic additions outside intent are retained;
 use an explicit `off` assignment to stop intake. A replacement resets copied
 preferences; deliberate retention assigns to the reviewed replacement and
-inherits no old membership or participation. The diff can
+inherits no old membership. The diff can
 show anything in `config.json` (see [Constraints](#constraints)).
 
 The first two lines are written by the server:
@@ -6931,7 +7034,7 @@ No line at all:
 
 ### Starting without the record
 
-A fresh install with no authority validates `config.json` and durably records the first applied revision. This is not a recovery path for an existing authority: preserve an unreadable, invalid or unresolved authority together with prepared input and pending evidence, and use [reviewed restore or explicit replacement](#reload-shared-recovery). See [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid).
+A fresh install with no authority validates `config.json` and durably records the first applied revision. This is not a recovery path for an existing authority: preserve an unreadable, invalid or unresolved adopted authority together with prepared input and pending evidence, and use [reviewed restore or explicit replacement](#reload-shared-recovery). A baseline written by hand for an upgrade that has not yet started is corrected instead, as [Removed configuration keys](#removed-configuration-keys) says. See [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid).
 
 ### A first start that fails after recording
 
@@ -6977,7 +7080,9 @@ Fix the cause, then review and confirm the pending change afresh; repeating the 
 This uses `config.json.request`, the existing preview and the confirming rename; there is no recovery subcommand. Preserve the authority, retirement evidence, request, confirmation, original `config.json` and accepted queues before repair. Never hand-edit the envelope or treat an older snapshot as trustworthy.
 
 - **Owned restore:** while the process still holds its latest validated state, choose `restore` below. It retains that owner's order, identities, leave boundaries, attempt history and unrelated pending intent; no snapshot field is accepted. Wait for `restoration staged`, then stop and start the server to obtain the recovery preview; staging freezes ordinary mutations while unchanged trustworthy projections and accepted queues may continue.
-- **Damaged start:** if no owner anchor remains, prepare `replacement-config.json` separately using the current configuration schema and deliberately chosen personas/channels. Keep `config.json` unchanged and choose `replace` below. Every replacement choice and lifetime is new: numeric continuity and recovery of lost preferences, leave, participation or attempt history are not claimed, and lost attempt outcomes stay unresolved.
+- **Damaged start:** if no owner anchor remains, prepare `replacement-config.json` separately using the current configuration schema and deliberately chosen personas/channels. Keep `config.json` unchanged and choose `replace` below. Every replacement choice and lifetime is new: numeric continuity and recovery of lost preferences, leave or attempt history are not claimed, and lost attempt outcomes stay unresolved.
+
+A restored or new choice that ends at `thread_hybrid` starts with its Joined Threads empty: its preview line ends `Joined Threads forgotten, not restored.`, and the persona joins each thread again as it would a new one (see [Threads in `thread_hybrid` channels](../../docs/channel-modes.md#threads-in-thread_hybrid-channels)).
 
 For an initial repair, the following writes only a request, never the authority. Set `RECOVERY_ACTION` to `restore` for the still-running owner; `replace` reads the separately prepared replacement file. It hashes the exact current damaged bytes, regardless of apparent recovery fields inside them. Use the separate revision example below only for a known retained cold stage.
 
@@ -7054,11 +7159,11 @@ Accepted cancellation advances the generation and retains its tombstone, origina
 | `stage unresolved` / `repair unresolved` | Preserve staged evidence and prepared input; correct the reported safe filesystem cause and restart to verify the retained stage. |
 | `durability unresolved` | The operation may already be installed. Preserve authority, retirement evidence, request, confirmation and prepared input; restart to recover the retained outcome **before any new review**. This is not definite nonactivation or permission to reconfirm. |
 | `confirmation not activated` | A definite failure or stale gesture; read the genuinely fresh pending preview after recovery before confirming again. |
-| `durable repair activated` / `retained repair activation` | The repair is consumed once; the latter reports its retained order on a later start, without applying it again. Current authenticated membership is still required. |
+| `durable repair activated` / `retained repair activation` | The repair is consumed once; the latter reports its retained order on a later start, without applying it again. Current authenticated membership is still required. Once it is verified, each affected persona posts a [*Channel state recovered*](#shared-state-recovered) report with `cause=repair`. |
 
-History is not current membership. Missing root, share or eligibility evidence remains unresolved; independently provable work may progress, but a wholly unprovable authority cannot expose runtime configuration. Repair preserves exact damaged/prepared bytes privately and accepted work under its original keys, content, context and FIFO; unrelated input remains for ordinary review.
+History is not current membership. Missing membership or eligibility evidence remains unresolved; independently provable work may progress, but a wholly unprovable authority cannot expose runtime configuration. Repair preserves exact damaged/prepared bytes privately and accepted work under its original keys, content, context and FIFO; unrelated input remains for ordinary review.
 
-Repair never retries an unknown or proven-not-applied assignment, and finite Slack retries cannot recover events never accepted. For a channel's unresolved absence order, the ordinary reviewed assignment may explicitly replace that conflict: its preview distinguishes retained history, the removal boundary and a new future preference, requiring fresh membership. This grants no recovered lost participation or automatic root/share-gap repair.
+Repair never retries an unknown or proven-not-applied assignment, and finite Slack retries cannot recover events never accepted. For a channel's unresolved absence order, the ordinary reviewed assignment may explicitly replace that conflict: its preview distinguishes retained history, the removal boundary and a new future preference, requiring fresh membership. It recovers no lost Joined Threads.
 
 ### `reload-request-invalid`
 
@@ -7310,8 +7415,9 @@ Repair never retries an unknown or proven-not-applied assignment, and finite Sla
 
 - **Line:** `[slack] Fatal: last-applied record error — <cause>` names `config.json.last-applied`; malformed JSON identifies only its position, never its contents.
 - **Cause:** The shared authority is unreadable, is not a regular file, is malformed or fails schema/evidence validation.
-- **Effect:** Startup refuses without falling back to `config.json`. Shared authority and configuration have no size cap; credentials and agent-director settings keep their independent 64 KiB limits.
+- **Effect:** Startup refuses without falling back to `config.json`. Shared authority and configuration have no size cap; credentials and agent-director settings keep their independent 64 KiB limits. Neither writable storage, elapsed time, a queue acceptance nor a new mention proves missing state recovered, and no default listening choice supplies it.
 - **Fix:** Preserve the authority, prepared input and pending evidence. Correct read/permission failures before requesting [reviewed recovery](#reload-shared-recovery); unreadable or nonregular evidence cannot be staged. Only the running owner can supply a restoration anchor; without one, explicitly review replacement choices and lost history. Never delete the record or import an older copy as authority.
+- **A hand-written record that has never started:** when `<cause>` is a removed-key message from a record written by hand for an upgrade, correct both baseline files as [Removed configuration keys](#removed-configuration-keys) says. Reviewed repair is for an adopted authority. That start also logs `[slack] reload-shared-recovery: unresolved. No trustworthy authority anchor; …`, and the refusal ends "restore trustworthy authority evidence before starting again". For this record, correcting both baseline files is that restoration; it needs no request.
 
 ### The retired-key record can't be read or is invalid
 
@@ -7352,23 +7458,7 @@ writes it; it is absent until a key is first recorded. Never edit it.
 
 `config.json.last-applied` is the sole shared channel authority. Its envelope holds the revision, applied configuration, reviewed source and exact source bytes (`sourceBytesBase64`), persona identities and incarnations, and ordered channel choices. An uncertain or unresolved outcome requires preserving authority, prepared input and pending evidence.
 
-Use [reviewed recovery](#reload-shared-recovery); do not replace it with an unconfirmed configuration or an unproven snapshot.
-
-### The stored-choice file: `channel-delivery.json`
-
-`channel-delivery.json` is ignored and is not read. It supplies no configuration, choices or recovery authority.
-
-### `channel-delivery-unreadable`
-
-A shared authority that cannot be read or validated prevents runtime startup. Unprovable affected intake and choice writes stay held; independently trustworthy personas, channels, DMs and accepted work can progress. If the whole state is unprovable, there is no healthy projection to assume.
-
-Preserve evidence and use [reviewed recovery](#reload-shared-recovery). Neither writable storage, elapsed time, a queue acceptance nor a new mention proves missing state recovered; no default listening choice supplies it.
-
-### The store's `[slack] channel-delivery:` lines
-
-Choice-write failures leave choices unchanged only when nonapplication is proven. The attempt response distinguishes a durably retained rejection from pending or unresolved evidence; absence of a success line proves neither application nor nonapplication. Preserve the identifier, authority and prepared/pending evidence before recovery.
-
-A retry reads the original outcome and cannot acquire a new assignment position, even after storage is repaired. Exact result and refusal wording is under [`persona-channel-delivery-set`](#persona-channel-delivery-set).
+Once a start has adopted it, use [reviewed recovery](#reload-shared-recovery); do not replace it with an unconfirmed configuration or an unproven snapshot. The one exception is a baseline written by hand for an upgrade that has not yet started: correct it together with `config.json`, with the operator's say-so, as [Removed configuration keys](#removed-configuration-keys) says.
 
 ## The state directory's location and its move at start
 
@@ -7640,11 +7730,15 @@ No `config.json` and no last-applied record. See the `missing prerequisite: conf
 
 ### Symptom: The server won't start: last-applied record error
 
-See [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid).
+For a removed-key message from a hand-written record that has never started, correct both baseline files as [Removed configuration keys](#removed-configuration-keys) says; reviewed repair is for an adopted authority. Otherwise see [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid), then [`reload-shared-recovery`](#reload-shared-recovery): a repaired choice ending at `thread_hybrid` starts with no Joined Threads, and once the repair is active and membership verified, the persona posts *Channel state recovered*.
 
 ### Symptom: The server won't start: `reload-record-write-failed`
 
-See **At a start without a record** under [`reload-record-write-failed`](#reload-record-write-failed).
+A definite failure applied nothing: fix the directory's permissions, free space or sync support and start again. An unresolved write may already be installed: preserve the authority and prepared input, restart to recover it, and use [reviewed repair](#reload-shared-recovery) only when that cannot resolve it. See [`reload-record-write-failed`](#reload-record-write-failed).
+
+### Symptom: A start or pending review rejects a removed configuration key
+
+The key belongs to an earlier release's configuration; edit `config.json` by hand to use its replacement, and before the first start after an upgrade also `config.json.last-applied`. See [Removed configuration keys](#removed-configuration-keys).
 
 ### Symptom: A fix to config.json is ignored after a failed first start
 
@@ -7693,7 +7787,7 @@ grep -E 'unavailable-retry: persona=<key> |Deferring persona=<key>: |pending-row
 
 ### Symptom: A persona doesn't receive messages in a channel or DM
 
-See [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to) (the mode in force, a pending edit, `delivery` or channel delivery) and, for DMs, [`persona-dm-dropped`](#persona-dm-dropped) and [A persona can't open a DM](#a-persona-cant-open-a-dm-re-install-its-app-to-gain-imwrite). A persona that is down: [Triage](#triage).
+See [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to) (the mode in force, a pending edit, `delivery` or channel delivery). A `thread_hybrid` channel delivers the persona's @mentions and `@here` / `@channel` Broadcasts anywhere in the channel, plus replies in threads the bot is in; other channel messages and replies don't reach it (see [Threads in `thread_hybrid` channels](../../docs/channel-modes.md#threads-in-thread_hybrid-channels)). For DMs, see [`persona-dm-dropped`](#persona-dm-dropped) and [A persona can't open a DM](#a-persona-cant-open-a-dm-re-install-its-app-to-gain-imwrite). A persona that is down: [Triage](#triage).
 
 ### Symptom: A persona is silent in a channel it was invited to
 
@@ -7701,11 +7795,15 @@ See [A persona is silent in a channel its app was invited to](#a-persona-is-sile
 
 ### Symptom: Membership inventory or app setup is unresolved
 
-Read [membership readiness](#membership-setup-record-and-readback) to separate inventory completeness from current-app subscription/reinstall evidence. Follow the named access/storage cause and [recovery bounds](#membership-recovery-bounds); retain unprovable history as [`channel-membership-unresolved`](#channel-membership-unresolved) describes.
+Read [membership readiness](#membership-setup-record-and-readback) to separate inventory completeness from current-app subscription/reinstall evidence; for app setup, follow [Update and reinstall an existing app](../setup-slack-channel-bots/SKILL.md#update-and-reinstall-an-existing-app). Follow the named access/storage cause and [recovery bounds](#membership-recovery-bounds); retain unprovable history as [`channel-membership-unresolved`](#channel-membership-unresolved) describes.
 
 ### Symptom: A persona receives every message in a channel
 
 See [A persona receives every message in a channel](#a-persona-receives-every-message-in-a-channel).
+
+### Symptom: A bot's channel delivery change has no result, or a pending or unresolved outcome
+
+Retry with the same `attempt_id`, channel and value and `intent: retry`, never a new identifier; for pending or unresolved, preserve the identifier and repair storage or use reviewed repair first. See **What to do with each** under [`persona-channel-delivery-set`](#persona-channel-delivery-set).
 
 ### Symptom: File attachment fails after a long wait
 
@@ -7731,7 +7829,7 @@ The bot is wedged in `check_permission` on a native Claude Code TUI prompt that 
 
 The persona's launches keep failing and it stays down. Auto-restart backs off exponentially on repeated launch failures — the delay doubles from `session_restart_delay` (default 60s) on each consecutive failure, up to a 15-minute ceiling. After 5 consecutive failures the persona hits a cap: a `SpawnCapReached` notice naming the persona is posted to the persona's destination (a channel or a DM with its contact, per its required `permission_prompts` in both modes) and automatic restarts stop. A launch that agent-director refuses is not counted: see [agent-director refuses a persona: it is retried on its own](#agent-director-refuses-a-persona-it-is-retried-on-its-own).
 
-A clean exit (`/exit`, which `agent-director pause` sends) is relaunched about 3 s after the disconnect instead of after `session_restart_delay`, at most once per `session_restart_delay`; `grep ~/.config/claude-slack-channel-bots/server.log` shows the check and its loop guard (the `` lines under [Other lines you may see](#other-lines-you-may-see)). There is no such check while the persona's last launch failed, so failed launches still back off and cap; nothing is logged for that.
+A clean exit (`/exit`, which `agent-director pause` sends) is relaunched about 3 s after the disconnect instead of after `session_restart_delay`, at most once per `session_restart_delay`; `grep -i 'clean-exit check' ~/.config/claude-slack-channel-bots/server.log` shows the check and its loop guard (the `Clean-exit check` and `No clean-exit check` lines under [Other lines you may see](#other-lines-you-may-see)). There is no such check while the persona's last launch failed, so failed launches still back off and cap; nothing is logged for that.
 
 A resume counts only once its session starts, and after 2 resumes in a row that end first the persona comes up fresh: see [A persona's resumed launch ends before it reports in](#a-personas-resumed-launch-ends-before-it-reports-in). A restart relaunches without a preceding kill after agent-director reports a finished or absent row; the `No kill before …` lines are under [A persona whose instance died under a prompt](#a-persona-whose-instance-died-under-a-prompt). Accepted messages remain queued while the persona recovers.
 
@@ -7760,13 +7858,41 @@ and [Persona diagnostic classes](#persona-diagnostic-classes). Storage failures 
 a disk check; stuck delivery needs the notice's remedy; waiting messages need the
 persona's hold or down state resolved. Accepted items remain queued in order.
 
-### Symptom: A persona posts a Thread Memory notice
+### Symptom: A persona posts a *Thread Memory not saved* notice
 
-Read the persona's report and follow its entry under [Thread Memory reports and log lines](#thread-memory-reports-and-log-lines).
+Check the named path's disk, mount and permissions; saving retries in the background and nothing needs resending. See [`thread-memory-not-saved`](#thread-memory-not-saved).
 
-### Symptom: A persona posts a *Channel state unresolved*, *Channel membership evidence unresolved* or *Channel state recovered* notice
+### Symptom: A persona posts a *Thread Memory unreadable* notice
 
-Read the persona's report and follow its entry under [Shared channel state reports](#shared-channel-state-reports).
+Restore the journal's permissions or storage; to start its Thread Memory empty, stop CSCB first. See [`thread-memory-unreadable`](#thread-memory-unreadable).
+
+### Symptom: A persona posts a *Joins lost* notice
+
+A new @mention in a thread puts the bot back in it; send each listed message again if it was meant for the bot. See [`thread-memory-joins-lost`](#thread-memory-joins-lost).
+
+### Symptom: A persona posts a *Thread Memory changed while stopped* notice
+
+Check the threads the bot should be in; a new @mention puts it back in a thread. Never delete Thread Memory files to clear it. See [`thread-memory-changed-while-stopped`](#thread-memory-changed-while-stopped).
+
+### Symptom: A persona posts a *Thread Memory recovered* notice
+
+No action is needed; a separate holds-not-resolved line still needs its own storage fix. See [`thread-memory-recovered`](#thread-memory-recovered).
+
+### Symptom: A Thread Memory line in server.log with no notice
+
+The `thread-memory-quarantined`, `-compaction-failed`, `-removal-failed`, `-seal-unreadable`, `-seal-not-saved` and `-holds-not-resolved` lines post nothing; check the named file's disk, mount and permissions and leave it in place. See the entries from [`thread-memory-quarantined`](#thread-memory-quarantined) on, under [Thread Memory reports and log lines](#thread-memory-reports-and-log-lines).
+
+### Symptom: A persona posts a *Channel state unresolved* notice
+
+Follow the cause's action: check the state directory's disk, or restart to review a staged restoration; use [reviewed repair](#reload-shared-recovery) when exact recovery cannot finish. See [`shared-state-unresolved`](#shared-state-unresolved).
+
+### Symptom: A persona posts a *Channel membership evidence unresolved* notice
+
+Only reviewed recovery settles a history gap; for a scan problem, make the named repair (scope, credentials or installation) and let the retries run. See [`membership-evidence-unresolved`](#membership-evidence-unresolved).
+
+### Symptom: A persona posts a *Channel state recovered* notice
+
+No further repair is needed; send again any message Slack stopped retrying meanwhile. See [`shared-state-recovered`](#shared-state-recovered).
 
 ### Symptom: A persona posts a *Waiting on a prompt* or *Not connected* notice
 

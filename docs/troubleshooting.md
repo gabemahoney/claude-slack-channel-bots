@@ -2,7 +2,7 @@
 
 The `debug-slack-channel-bots` skill has an entry for every persona log class, every `config.json` rejection and each recovery step; run `/debug-slack-channel-bots` from Claude Code for a guided diagnosis. This page lists the common symptoms, then the server log and the startup-error log.
 
-For rejected channel requests or unusable confirmations, check current intent and the fresh preview; preserve input and authority evidence for uncertain writes. [Request diagnostics](../skills/debug-slack-channel-bots/SKILL.md#reload-request-invalid), [confirmation outcomes](../skills/debug-slack-channel-bots/SKILL.md#reload-review-outcome) and [write recovery](../skills/debug-slack-channel-bots/SKILL.md#reload-record-write-failed); `reload-shared-recovery` distinguishes inert proposals, cancellation, installed uncertainty and retained activation in [reviewed recovery](../skills/debug-slack-channel-bots/SKILL.md#reload-shared-recovery).
+For rejected channel requests or unusable confirmations, check current intent and the fresh preview; preserve input and authority evidence for uncertain writes. [Request diagnostics](../skills/debug-slack-channel-bots/SKILL.md#reload-request-invalid), [confirmation outcomes](../skills/debug-slack-channel-bots/SKILL.md#reload-review-outcome) and [write recovery](../skills/debug-slack-channel-bots/SKILL.md#reload-record-write-failed); `reload-shared-recovery` distinguishes inert proposals, cancellation, installed uncertainty and retained activation in [reviewed recovery](../skills/debug-slack-channel-bots/SKILL.md#reload-shared-recovery); a repair restores no Joined Threads, and each persona reports *Channel state recovered* once it is active and that persona's membership is verified.
 
 **Installation fails or launches stay pending**
 Check Bun, the global package trust, the supported host, and the worker's Claude Code version and launcher. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-installation-fails-or-launches-stay-pending).
@@ -11,10 +11,13 @@ Check Bun, the global package trust, the supported host, and the worker's Claude
 With no last-applied record, `start` exits with `missing prerequisite: config.json not found at <path>, and no config.json.last-applied at <path>`. Run `bun src/postinstall.ts` from the installed package directory to create the skeleton, or create the file, and check that `SLACK_STATE_DIR` names the directory you populated. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-configjson-not-found).
 
 **The server won't start: last-applied record error**
-`server.log` shows `[slack] Fatal: last-applied record error —`: the record can't be read or is invalid. Preserve authority and prepared input; use [reviewed restore or explicit replacement](../skills/debug-slack-channel-bots/SKILL.md#reload-shared-recovery), including the refused-start preview. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-the-server-wont-start-last-applied-record-error).
+`server.log` shows `[slack] Fatal: last-applied record error —`: the record can't be read or is invalid. For a removed-key message from a hand-written record that has never started, correct both baseline files as the [removed-keys entry](../skills/debug-slack-channel-bots/SKILL.md#removed-configuration-keys) says; reviewed repair is for an adopted authority. Otherwise preserve authority and prepared input; use [reviewed restore or explicit replacement](../skills/debug-slack-channel-bots/SKILL.md#reload-shared-recovery), including the refused-start preview. A repaired `thread_hybrid` choice starts with no Joined Threads. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-the-server-wont-start-last-applied-record-error).
 
 **The server won't start: `reload-record-write-failed`**
-A start with no record could not write it, so nothing was applied. Make the directory holding `config.json` writable and not full, then start again. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-the-server-wont-start-reload-record-write-failed).
+A definite failure applied nothing: make the directory holding `config.json` writable, not full and syncable, then start again. An unresolved write may be installed: preserve the authority and prepared input and restart to recover it, using reviewed repair only if that fails. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-the-server-wont-start-reload-record-write-failed).
+
+**A start or pending review rejects a removed configuration key**
+A start or a pending review rejects a key from an earlier release's configuration. Edit `config.json` by hand, and before the first start after an upgrade also `config.json.last-applied`, using the replacement the [removed-keys entry](../skills/debug-slack-channel-bots/SKILL.md#removed-configuration-keys) gives and the [upgrade procedure](migration.md#upgrading-from-018x). [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-start-or-pending-review-rejects-a-removed-configuration-key).
 
 **A fix to config.json is ignored after a failed first start**
 Later starts use the recorded `port` and `bind`. Resolve an external cause such as a port conflict, then start; preserve configuration edits for normal review afterward. Damaged-state replacement cannot force an edit to a valid authority's listening setting. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-fix-to-configjson-is-ignored-after-a-failed-first-start).
@@ -35,16 +38,19 @@ agent-director pre-trusts the working directory during launch. If any startup pr
 Normal for a short time after every launch: the server waits it out and never launches a second instance over it. If it hasn't started in time, the persona posts a *Launch stuck* or *Session not starting* notice. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-personas-instance-is-still-starting).
 
 **A persona doesn't receive messages in a channel or DM**
-Check that its Slack app is invited to the channel, that the channel is listed in `channels` with the `delivery` you want (strict mode) or that its channel delivery there is the one you want (open mode), that the edit is confirmed, and for DMs that `dm.enabled` is `true`. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-doesnt-receive-messages-in-a-channel-or-dm).
+Check that its Slack app is invited to the channel, that the channel is listed in `channels` with the `delivery` you want (strict mode) or that its channel delivery there is the one you want (open mode), that the edit is confirmed, and for DMs that `dm.enabled` is `true`. A `thread_hybrid` channel delivers only the persona's @mentions and `@here` / `@channel` Broadcasts anywhere in it, plus replies in threads the bot is in ([Threads in `thread_hybrid` channels](channel-modes.md#threads-in-thread_hybrid-channels)). [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-doesnt-receive-messages-in-a-channel-or-dm).
 
 **A persona is silent in a channel it was invited to**
 A newly verified join without a choice starts `off` in strict or `mentions` in open; duplicate joins preserve choices. Check current membership, the applied choice and channel restrictions; an invitation alone proves no current evidence. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-is-silent-in-a-channel-it-was-invited-to).
 
 **Membership inventory or app setup is unresolved**
-Read inventory completeness separately from current-app subscription/reinstall evidence; restore the named access/storage cause and follow the bounded idle retry, keeping unprovable history held. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-membership-inventory-or-app-setup-is-unresolved).
+Read inventory completeness separately from current-app subscription/reinstall evidence, and fix app setup with [Update and reinstall an existing app](../skills/setup-slack-channel-bots/SKILL.md#update-and-reinstall-an-existing-app); restore the named access/storage cause and follow the bounded idle retry, keeping unprovable history held. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-membership-inventory-or-app-setup-is-unresolved).
 
 **A persona receives every message in a channel**
 In open mode its agent stored `all` there (a `persona-channel-delivery-set` line): ask it to switch back to `mentions`, remove its app from the channel. A mode switch preserves the shared choice. In strict mode, change the channel's `delivery` to `mentions` and confirm the change. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-receives-every-message-in-a-channel).
+
+**A bot's channel delivery change has no result, or a pending or unresolved outcome**
+Retry with the same `attempt_id`, channel and value and `intent: retry`, never a new identifier. A *pending* or *unresolved* outcome keeps its identifier until storage repair or reviewed repair settles it. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-bots-channel-delivery-change-has-no-result-or-a-pending-or-unresolved-outcome).
 
 **File attachment fails after a long wait**
 Each Slack request attempt, an upload included, is limited to 30 s, so an upload that needs longer fails only after about 30 minutes of retries. Send smaller files, or split a large attachment. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-file-attachment-fails-after-a-long-wait).
@@ -56,7 +62,7 @@ Each such message logs an `unclaimed-channel` line naming the channel, and in op
 Turn on the persona's app's interactivity, check the bot is in `check_permission` (on agent-director 0.16 and 0.17.0 an unanswered prompt shows as `needs_intelligence` once its timeout passes) with `agent-director list --state check_permission,needs_intelligence --label service=cscb`, and if `permission-poller:` lines warn of skipped ticks, raise `agent_director_poll_interval_ms` (it takes effect at the next server start). [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-permission-relay-not-working).
 
 **A permission prompt or notice doesn't arrive**
-Slack refused a post to the persona's destination; a `persona-destination-failed` line names its error, and the prompts and notices are held and retried. For `missing_scope` add `im:write` and re-install the app; for `not_in_channel` invite the app to its destination channel. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-permission-prompt-or-notice-doesnt-arrive).
+Slack refused a post to the persona's one `permission_prompts` destination, in either mode; a `persona-destination-failed` line names its error, and the prompts and notices are held and retried. For `missing_scope` add `im:write` and re-install the app; for `not_in_channel` invite the app to its destination channel. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-permission-prompt-or-notice-doesnt-arrive).
 
 **Bot appears dead / posts a "blocked on a native Claude Code permission prompt" warning**
 The bot is stuck on a Claude Code prompt that never reached Slack. A human reads it with `agent-director read-pane --instance-id <id>`, ends the session with `agent-director kill --instance-id <id>` and checks the result; on an error, don't delete or respawn, and never use `send-keys`. The server then brings the persona up again. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-bot-appears-dead--posts-a-blocked-on-a-native-claude-code-permission-prompt-warning).
@@ -77,13 +83,34 @@ Accepted messages remain queued; a Slack message triggers the configured reconne
 Each start logs one `[slack] startupSessionManager: complete — …` line counting its personas by outcome. `latched`, `retrying`, `waiting on a live-row sequence`, `held on invalid flags` and `fresh as retired keys` are not failures. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-reading-the-start-summary).
 
 **Delivery notices or delivery diagnostic lines**
-For *Message not saved*, check the server disk; a [`queue-unwritable`](../skills/debug-slack-channel-bots/SKILL.md#queue-unwritable) line with `participation=unresolved` posts no notice and does not mean a message was lost; fix the disk rather than asking for a resend. For *Delivery stuck* or *Message not taken in*, follow the notice's remedy; for *Messages waiting*, resolve the persona's state; for *Queue record unreadable*, preserve its file and ask the senders to resend. Accepted messages stay queued in order. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-delivery-notices-or-delivery-diagnostic-lines).
+For *Message not saved*, check the server disk; for a [`queue-unwritable`](../skills/debug-slack-channel-bots/SKILL.md#queue-unwritable) line, fix the disk and the queued work resumes without a resend. For *Delivery stuck* or *Message not taken in*, follow the notice's remedy; for *Messages waiting*, resolve the persona's state; for *Queue record unreadable*, preserve its file and ask the senders to resend. Accepted messages stay queued in order. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-delivery-notices-or-delivery-diagnostic-lines).
 
-**A persona posts a Thread Memory notice**
-Read the persona's Thread Memory report and follow its entry. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-thread-memory-notice).
+**A persona posts a *Thread Memory not saved* notice**
+Check the named path's disk, mount and permissions; saving retries on its own and nothing needs resending. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-thread-memory-not-saved-notice).
 
-**A persona posts a *Channel state unresolved*, *Channel membership evidence unresolved* or *Channel state recovered* notice**
-Read the report and follow its entry. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-channel-state-unresolved-channel-membership-evidence-unresolved-or-channel-state-recovered-notice).
+**A persona posts a *Thread Memory unreadable* notice**
+Restore the journal's permissions or storage, or, to start its Thread Memory empty, stop CSCB, move the journal aside and start again. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-thread-memory-unreadable-notice).
+
+**A persona posts a *Joins lost* notice**
+A new @mention in a thread puts the bot back in it; send each listed message again if it was meant for the bot. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-joins-lost-notice).
+
+**A persona posts a *Thread Memory changed while stopped* notice**
+Check the threads the bot should be in; a new @mention puts it back in one. Never delete Thread Memory files to clear it. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-thread-memory-changed-while-stopped-notice).
+
+**A persona posts a *Thread Memory recovered* notice**
+No action is needed. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-thread-memory-recovered-notice).
+
+**A Thread Memory line in server.log with no notice**
+These `thread-memory-` lines post nothing: check the named file's disk, mount and permissions and leave the file in place. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-thread-memory-line-in-serverlog-with-no-notice).
+
+**A persona posts a *Channel state unresolved* notice**
+Follow the named cause's storage or repair step; affected messages stay held, and any message Slack stopped retrying must be sent again. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-channel-state-unresolved-notice).
+
+**A persona posts a *Channel membership evidence unresolved* notice**
+Only reviewed recovery settles a history gap; for a scan problem, make the named repair. Send again any message Slack stopped retrying. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-channel-membership-evidence-unresolved-notice).
+
+**A persona posts a *Channel state recovered* notice**
+No further repair is needed; send again any message Slack stopped retrying meanwhile. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-channel-state-recovered-notice).
 
 **A persona posts a *Waiting on a prompt* or *Not connected* notice**
 The session runs but is disconnected; accepted messages are kept until it reconnects. A human attaches with `tmux attach -t =slack_bot_<key>`, deals with anything on screen and, if it stays disconnected, types `/mcp reconnect slack-channel-router`, or restarts the server. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-waiting-on-a-prompt-or-not-connected-notice).

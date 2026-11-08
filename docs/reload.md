@@ -4,11 +4,11 @@ Saving `config.json` doesn't change what runs. The server runs the last configur
 
 ## Files beside the config file
 
-These files sit beside `config.json` (`~/.config/claude-slack-channel-bots/` by default, or `SLACK_STATE_DIR`). You write requests; the server writes previews and records. Never hand-edit a preview, confirmation or authority.
+These files sit beside `config.json` (`~/.config/claude-slack-channel-bots/` by default, or `SLACK_STATE_DIR`). You write requests; the server writes previews and records. Never hand-edit a preview, confirmation or adopted authority.
 
 | File | What it is |
 |---|---|
-| `config.json.last-applied` | The sole shared authority: an envelope holding the revision, applied configuration, reviewed source and exact reviewed bytes. It also records persona identity, incarnation and ordered channel choices. A replacement never inherits old choices. Never edit it by hand. For an unresolved write, preserve authority, prepared input and pending evidence; use [reviewed recovery](../skills/debug-slack-channel-bots/SKILL.md#reload-shared-recovery) to restore trustworthy evidence or explicitly replace lost state. |
+| `config.json.last-applied` | The sole shared authority: an envelope holding the revision, applied configuration, reviewed source and exact reviewed bytes. It also records persona identity, incarnation and ordered channel choices. A replacement never inherits old choices. Never edit it by hand once a start has adopted it; the one exception is a baseline written by hand for an upgrade that has not yet started, corrected together with `config.json` as [Upgrading from 0.18.x](migration.md#upgrading-from-018x) says. For an unresolved write, preserve authority, prepared input and pending evidence; use [reviewed recovery](../skills/debug-slack-channel-bots/SKILL.md#reload-shared-recovery) to restore trustworthy evidence or explicitly replace lost state. |
 | `config.json.pending` | A preview of what applying the edit would do, written by the server. It exists only while a change is pending. |
 | `config.json.request` | Your explicit assignment, revision, cancellation, refresh or [restore/replace request](../skills/debug-slack-channel-bots/SKILL.md#reload-shared-recovery). It stages intent or recovery without activation; deleting this file does not cancel recorded intent. |
 | `config.json.apply` | Your confirmation: the current pending file, renamed. Its durable outcome prevents reuse even if cleanup fails. Definite failure needs fresh review; unresolved durability needs retained-outcome recovery (see [Confirming a change](#confirming-a-change)). |

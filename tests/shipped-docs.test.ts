@@ -39,12 +39,16 @@ import { REPLY_REMINDER_TEXT } from '../src/reply-reminder.ts'
  *   read): no
  * first-@mention claim, and no term of `FORBIDDEN_TERMS` (the
  *   pre-persona shape, the token environment variables and command-line
- *   tokens, the access-control file, the retired name-rule wording). The
- *   exemptions (`AUDIT_EXCEPTIONS`) are exactly three: the debugging skill's
- * entry, and one entry per README runbook section, each exempting
+ *   tokens, the access-control file, the retired name-rule wording, the
+ *   destination loop guard, the removed channel-mode configuration). The
+ *   exemptions (`AUDIT_EXCEPTIONS`) are exactly four: the debugging skill's
+ *   pre-persona entry; one entry per README runbook section, each exempting
  *   `access.json` only, and only inside "Switching over to agent-director
  *   Phase 1" (which saves the previous CSCB's file) or "Rolling back the
- * switch-over" (which restores it).
+ *   switch-over" (which restores it); and the debugging skill's
+ *   `### Removed configuration keys` entry, which may name the removed
+ *   switch, the per-persona `invited` key and the old mode names to quote
+ *   each removed-key error with what replaces it.
  *   Every other term stays banned inside those sections, the token
  *   variables' names included; a missing heading fails the audit;
  * - the README's receiving section: its table's row for each
@@ -632,7 +636,7 @@ describe('slack-app-manifest.yml', () => {
     expect(readme).toMatch(/earlier manifest must have both scopes added and be re-installed/)
   })
 
-  // b.n24: scope presence is covered by the pinned list and provisioning tests.
+  // Scope presence is covered by the pinned list and provisioning tests.
   // Keep each migration promise with its own permission, so the Lists note
   // cannot accidentally satisfy the new scopes' operator guidance.
   const housekeepingGuidance = [
@@ -1561,7 +1565,7 @@ describe(`shipped text audit (README, skills, manifest, MCP instructions, ${SET_
 /** One forbidden term: its label in case titles and failures, and its pattern (flag `g`, so every occurrence is found). */
 type Term = readonly [label: string, pattern: RegExp]
 
-/** A group of forbidden terms: what they stand for, the SRs (or decisions) that retire them, and the terms. */
+/** A group of forbidden terms: what they stand for, the behaviour the group enforces (in a comment), and the terms. */
 interface TermGroup {
   name: string
   terms: readonly Term[]
@@ -1603,6 +1607,13 @@ interface TermGroup {
  *   variables you exported for the previous version"), so banning it would
  *   need a second exemption; a name or an export is what would tell an
  *   operator to set one.
+ * - The removed per-persona key `invited` matches only as a key (a code span
+ *   holding exactly `invited`, `"invited":`, an `invited:` line, and the
+ *   removed-key error's `invited has been removed`); "an app invited to a
+ *   channel" and `persona-invited-channel` never match. "declarative" matches
+ *   only in the old mode and section phrases ("declarative mode",
+ *   "declarative-mode", "declarative and fungible mode", "declarative
+ *   section"); `fungible` matches in any use.
  */
 const FORBIDDEN_TERMS: readonly TermGroup[] = [
   {
@@ -1687,9 +1698,29 @@ const FORBIDDEN_TERMS: readonly TermGroup[] = [
       ['a value held at `mentions`', /\bheld\s+at\s+`mentions`/gi],
     ],
   },
+  {
+    // Strict and open mode take `channel_mode` and one shared list; the
+    // removed switch, the removed per-persona `invited` key and the old mode
+    // names appear only where an upgrading operator reads the removed-key
+    // errors. Plain-prose "invited", `persona-invited-channel` and bare
+    // "declarative" stay legal.
+    name: 'the removed channel-mode configuration',
+    terms: [
+      ['allow_invited_channels', /\ballow_invited_channels\b/g],
+      ['invited.permission_prompts', /\binvited\.permission_prompts\b/g],
+      ['invited as a configuration key', /`invited`|"invited"\s*:|^[ \t-]*invited:|\binvited\s+has\s+been\s+removed\b/gm],
+      ['fungible', /\bfungible\b/gi],
+      ['declarative mode or section', /\bdeclarative(?:-|\s+)(?:(?:and|or)\s+fungible(?:-|\s+))?(?:modes?|sections?)\b/gi],
+    ],
+  },
 ]
 
-/** One exemption: `terms` may appear in `file` only inside the section under `heading` (bounded at the next heading of its level or higher). */
+/**
+ * One exemption: `terms` may appear in `file` only inside the section under
+ * `heading` (bounded at the next heading of its level or higher). There are
+ * four, in `AUDIT_EXCEPTIONS`: the pre-persona entry, the two runbook entries
+ * and the removed configuration keys entry.
+ */
 interface AuditException {
   file: string
   heading: string
@@ -1746,7 +1777,32 @@ const ROLLBACK_EXCEPTION: AuditException = {
 /** The two runbook entries: one per runbook section in `RUNBOOK_DOC`, each exempting only `access.json`. */
 const RUNBOOK_EXCEPTIONS: readonly AuditException[] = [SWITCH_OVER_EXCEPTION, ROLLBACK_EXCEPTION]
 
-const AUDIT_EXCEPTIONS: readonly AuditException[] = [DELIVERY_WORDING_EXCEPTION, ...RUNBOOK_EXCEPTIONS]
+/** The removed channel-mode configuration group, by its name in `FORBIDDEN_TERMS`. */
+const REMOVED_CHANNEL_MODE_GROUP = 'the removed channel-mode configuration'
+
+/** The removed channel-mode configuration's terms. Throws if the group is gone. */
+function removedChannelModeTerms(): readonly Term[] {
+  const group = FORBIDDEN_TERMS.find((g) => g.name === REMOVED_CHANNEL_MODE_GROUP)
+  if (group === undefined) throw new Error(`FORBIDDEN_TERMS has no group "${REMOVED_CHANNEL_MODE_GROUP}"`)
+  return group.terms
+}
+
+/**
+ * The fourth exemption: the debugging skill's `### Removed configuration keys`
+ * entry, under `## Configuration rejections`, may name the removed
+ * channel-mode configuration (the switch, the per-persona `invited` key and
+ * the old mode names) to quote each removed-key error with what replaces the
+ * key. Every other term stays banned inside it, and those names stay banned
+ * everywhere else. A missing heading throws, as for the other entries.
+ */
+const REMOVED_KEYS_EXCEPTION: AuditException = {
+  file: DEBUG_SKILL_FILE,
+  heading: '### Removed configuration keys',
+  terms: removedChannelModeTerms().map(([label]) => label),
+  reason: "an upgrading operator's removed-key errors, each quoted with what replaces the key",
+}
+
+const AUDIT_EXCEPTIONS: readonly AuditException[] = [DELIVERY_WORDING_EXCEPTION, ...RUNBOOK_EXCEPTIONS, REMOVED_KEYS_EXCEPTION]
 
 /** A forbidden term found in a text: its file, 1-based line, term label, matched text and whole line. */
 interface TermHit {
@@ -1902,12 +1958,72 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
     expect([...new Set(hits.map((hit) => hit.term))].sort()).toEqual([...DELIVERY_WORDING_EXCEPTION.terms].sort())
   })
 
-  test(`the exemptions are exactly the entry and the two runbook entries, each runbook entry exempting only access.json in ${RUNBOOK_DOC}`, () => {
+  test(`the exemptions are exactly four: the pre-persona entry, the two runbook entries, each exempting only access.json in ${RUNBOOK_DOC}, and the removed configuration keys entry`, () => {
     expect(AUDIT_EXCEPTIONS.map((e) => [e.file, e.heading, [...e.terms]])).toEqual([
       [DELIVERY_WORDING_EXCEPTION.file, DELIVERY_WORDING_EXCEPTION.heading, [...DELIVERY_WORDING_EXCEPTION.terms]],
       [RUNBOOK_DOC, `### ${PHASE1_RUNBOOK_SECTION_TITLE}`, ['access.json']],
       [RUNBOOK_DOC, `### ${ROLLBACK_RUNBOOK_SECTION_TITLE}`, ['access.json']],
+      [
+        DEBUG_SKILL_FILE,
+        '### Removed configuration keys',
+        ['allow_invited_channels', 'invited.permission_prompts', 'invited as a configuration key', 'fungible', 'declarative mode or section'],
+      ],
     ])
+  })
+
+  /** The removed keys' labels in the removed channel-mode configuration group; the old mode names are the group's other labels. */
+  const REMOVED_KEY_LABELS = ['allow_invited_channels', 'invited.permission_prompts', 'invited as a configuration key']
+
+  test(`the only allowed hit: the removed channel-mode configuration in ${REMOVED_KEYS_EXCEPTION.file} under "${REMOVED_KEYS_EXCEPTION.heading}"; with the exemptions off, it appears nowhere else in shipped text, and every removed key is named there`, () => {
+    const terms = removedChannelModeTerms()
+    expect(terms.map(([label]) => label)).toEqual([...REMOVED_KEYS_EXCEPTION.terms])
+    const range = sectionRange(operatorText(REMOVED_KEYS_EXCEPTION.file), REMOVED_KEYS_EXCEPTION.heading)
+    if (range === undefined) throw new Error(`${REMOVED_KEYS_EXCEPTION.file} has no heading "${REMOVED_KEYS_EXCEPTION.heading}"`)
+    const inside = (hit: TermHit) => hit.file === REMOVED_KEYS_EXCEPTION.file && hit.line > range.start && hit.line <= range.end
+    const hits = SHIPPED_TEXTS.flatMap(([name, read]) => auditText(name, read(), terms, []).hits)
+    expect(hits.filter((hit) => !inside(hit)).map(formatHit)).toEqual([])
+    const named = new Set(hits.filter(inside).map((hit) => hit.term))
+    expect(REMOVED_KEY_LABELS.filter((label) => !named.has(label))).toEqual([])
+    expect([...named].filter((label) => !REMOVED_KEYS_EXCEPTION.terms.includes(label))).toEqual([])
+  })
+
+  /**
+   * Each removed-key error as the loader renders it (`resolvePersonaConfig`,
+   * pure, no file read), after the persona prefix for a persona entry's key:
+   * a valid configuration with the removed key added, rejected. Throws
+   * unless the loader rejects it.
+   */
+  const removedKeyErrors = lazy((): [key: string, message: string][] => {
+    const base = join(tmpdir(), 'cscb-shipped-docs-removed-keys')
+    const persona = makePersona({}, base)
+    const key = personaKey(String(persona.name))
+    const rejection = (raw: unknown, lead: string): string => {
+      let message: string | undefined
+      try {
+        resolvePersonaConfig(raw, base, base)
+      } catch (err) {
+        assertNoLeak(err, 'removed-key rejection')
+        message = err instanceof Error ? err.message : undefined
+      }
+      const at = message?.indexOf(lead) ?? -1
+      if (message === undefined || at < 0) throw new Error(`the loader did not reject the removed key with a message after "${lead}": ${message}`)
+      return message.slice(at + lead.length)
+    }
+    resolvePersonaConfig({ personas: [persona] }, base, base)
+    return [
+      ['allow_invited_channels', rejection({ allow_invited_channels: true, personas: [persona] }, ': ')],
+      ['invited', rejection({ personas: [{ ...persona, invited: { permission_prompts: DM_DESTINATION } }] }, `(key=${key}): `)],
+    ]
+  })
+
+  test(`the removed configuration keys entry quotes each removed-key error as the loader renders it, names channel_mode and permission_prompts as the replacements, and holds no ### heading`, () => {
+    const text = operatorText(REMOVED_KEYS_EXCEPTION.file)
+    const section = requiredSection(text, REMOVED_KEYS_EXCEPTION.heading, REMOVED_KEYS_EXCEPTION.file)
+    const entry = flat(section)
+    for (const [, message] of removedKeyErrors()) expect(entry).toContain(code(message))
+    expect(entry).toContain(code(MODE_SWITCH_SETTING))
+    expect(entry).toContain(code(PROMPTS_KEY))
+    expect(headings(section).map((h) => h.title)).toEqual([])
   })
 
   test(`the only allowed hits: access.json in ${RUNBOOK_DOC} under "${SWITCH_OVER_EXCEPTION.heading}" and under "${ROLLBACK_EXCEPTION.heading}"; with the exemptions off, it appears nowhere else in shipped text, and both exemptions are used`, () => {
@@ -1953,6 +2069,9 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
     [SERVER_SETTINGS_DOC, 'slack-channel-router', 'the MCP server name; no route term matches it'],
     [CREDENTIALS_SCRIPT, 'header = "Authorization: Bearer %s"', "the credentials script's curl config line, read from curl's stdin, not a command-line argument"],
     [WIZARD_FILE, /^allowed-tools:.*$/m, 'skill frontmatter: a tool list, not an allowlist'],
+    [DEBUG_SKILL_FILE, '### `persona-invited-channel`', 'a current class label: `invited` counts only as a configuration key'],
+    [DEBUG_SKILL_FILE, '## A persona is silent in a channel its app was invited to', 'plain-prose "invited": a Slack invitation, not the removed key'],
+    [RUNBOOK_DOC, /^.*this release never reads `channel-delivery\.json`.*$/m, 'the upgrade keeps channel-delivery.json as a preserved reference; the file name is not banned'],
   ]
 
   test.each(NOT_HITS_BY_DESIGN)('%s: %p is not a hit (%s)', (file, snippet, _reason) => {
@@ -1964,9 +2083,11 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
 })
 
 /**
- * Self-checks for the scanner and the exemption, on in-memory text only: each
- * term is flagged, the exemption covers only its three keys and only
- * inside its section, and persona wording is left alone.
+ * Self-checks for the scanner and the four exemptions, on in-memory text
+ * only: each term is flagged; the pre-persona entry covers only its three
+ * keys, each runbook entry only `access.json`, and the removed configuration
+ * keys entry only the removed channel-mode configuration, each only inside
+ * its section; and persona wording is left alone.
  */
 describe('forbidden-term scanner self-checks', () => {
   /** One sample per term, so a term added to the list needs a sample here. */
@@ -2008,6 +2129,11 @@ describe('forbidden-term scanner self-checks', () => {
     'after the loop guard': 'at channel delivery mentions after the loop guard',
     'the loop guard holding a value': 'The loop guard holds a saved `thread_hybrid` there.',
     'a value held at `mentions`': 'In another persona\'s destination, a channel is held at `mentions`.',
+    allow_invited_channels: 'Set allow_invited_channels to true.',
+    'invited.permission_prompts': 'Set `invited.permission_prompts` to "dm".',
+    'invited as a configuration key': 'Move the `invited` section into the persona entry.',
+    fungible: 'In fungible mode a persona serves every channel.',
+    'declarative mode or section': 'In declarative mode a persona serves its listed channels.',
   }
 
   /**
@@ -2029,6 +2155,17 @@ describe('forbidden-term scanner self-checks', () => {
     ['an open-mode or destination loop guard', '"the destination loop guard"', 'The destination loop guard applies to every other persona.'],
     ['the loop guard holding a value', 'a wrapped "holds"', 'The loop\nguard holds the channel at mentions.'],
     ['a name that "looks like a Slack token"', 'plural names', 'Persona names that look like a token are rejected.'],
+    ['invited as a configuration key', 'a quoted "invited" key', '{ "invited": { "permission_prompts": "dm" } }'],
+    ['invited as a configuration key', 'an invited: key', 'personas:\n  - invited:\n      permission_prompts: dm'],
+    ['invited as a configuration key', 'the removed-key error', 'The start fails with invited has been removed; use permission_prompts.'],
+    ['fungible', '"fungible destination"', "The persona's fungible destination is its DM."],
+    ['fungible', 'a stale "fungible-mode" anchor', 'See [who can reach it](channel-modes.md#who-can-reach-a-persona-in-fungible-mode).'],
+    ['declarative mode or section', 'a wrapped "declarative mode"', 'Switch back to declarative\nmode first.'],
+    ['declarative mode or section', '"declarative-mode"', 'The declarative-mode example lists every channel.'],
+    ['declarative mode or section', 'the plural', 'Both declarative modes are gone.'],
+    ['declarative mode or section', '"declarative section"', 'Edit the declarative section of the persona.'],
+    ['declarative mode or section', '"declarative and fungible mode"', 'It works in declarative and fungible mode.'],
+    ['declarative mode or section', '"declarative or fungible mode"', 'In declarative or fungible mode alike.'],
   ] as const)('%s is flagged in %s', (label, _form, text) => {
     expect(findTerms('sample', text, ALL_FORBIDDEN_TERMS).map((hit) => hit.term)).toContain(label)
   })
@@ -2070,12 +2207,18 @@ describe('forbidden-term scanner self-checks', () => {
     ['the clean-exit check and its loop guard', 'A clean exit is relaunched about 3 s later; server.log shows the check and its loop guard.'],
     ['a persona held at a startup prompt', 'The persona is held at a startup prompt until the operator answers it.'],
     ['a choice that applies as written', "Each persona's `delivery` applies as written in a channel where another persona posts its permission prompts and notices."],
+    ['plain-prose "invited"', 'A persona is silent in a channel its app was invited to: an app invited to a channel needs it listed.'],
+    ['the persona-invited-channel label', '### `persona-invited-channel`\n`[slack] persona-invited-channel: …`'],
+    ['channel-delivery.json as a preserved reference', '`channel-delivery.json` is a preserved reference the current release does not read.'],
+    ['channel_mode with its values', 'Set `channel_mode` to `"strict"` or `"open"`; absence defaults to strict.'],
+    ['strict and open mode', 'In strict mode a persona serves its listed channels; in open mode, every eligible channel.'],
+    ['bare "declarative"', 'The configuration is declarative: each persona lists its channels in the shared list.'],
   ])('%s is not flagged', (_label, text) => {
     expect(findTerms('sample', text, ALL_FORBIDDEN_TERMS).map(formatHit)).toEqual([])
   })
 
   const FILE = DELIVERY_WORDING_EXCEPTION.file
-  /** A synthetic debugging skill: the section (with a subsection) between two other sections. */
+  /** A synthetic debugging skill: the section (with a subsection) between two other sections, then the removed configuration keys heading, which the skill's file must hold. */
   const skill = (earlier: string, entry: string, later: string) =>
     [
       '# Debugging', //                                  l.1
@@ -2087,6 +2230,7 @@ describe('forbidden-term scanner self-checks', () => {
       'Still inside: `default_route` is rejected.', //   l.7
       '## Later', //                                     l.8
       later, //                                          l.9
+      REMOVED_KEYS_EXCEPTION.heading, //                 l.10
     ].join('\n')
   const ENTRY = '`routes`, `default_route` and `default_dm_session` are rejected.'
 
@@ -2225,6 +2369,74 @@ describe('forbidden-term scanner self-checks', () => {
       const edited = edit(readme({ inSwitchOver: SAVE, inRollback: RESTORE }))
       expect(edited).not.toBe(readme({ inSwitchOver: SAVE, inRollback: RESTORE }))
       expect(() => auditText(README, edited, ALL_FORBIDDEN_TERMS)).toThrow(`${README} has no heading "${heading}"`)
+    })
+  })
+
+  /** The removed configuration keys exemption, on a synthetic debugging skill. */
+  describe('the removed configuration keys exemption', () => {
+    const HEADING = REMOVED_KEYS_EXCEPTION.heading
+    const NAMES = 'Remove `allow_invited_channels`; "fungible mode" is now open mode.'
+    /**
+     * A synthetic debugging skill: the entry between two `###` siblings under
+     * one `##` section, with a `####` subsection, then another `##` section.
+     * Line numbers hold while each part is one line.
+     */
+    const skill = (before: string, entry: string, after: string) =>
+      [
+        '# Debugging', //                               l.1
+        '## Configuration rejections', //               l.2
+        '### Persona entries', //                       l.3
+        before, //                                      l.4
+        HEADING, //                                     l.5
+        entry, //                                       l.6
+        '#### Detail', //                               l.7
+        'Move `invited.permission_prompts` too.', //    l.8
+        '### Across personas', //                       l.9
+        after, //                                       l.10
+        '## Pre-persona configuration', //              l.11
+      ].join('\n')
+
+    test('inside the section, including its subsections, the removed names are allowed, not hits', () => {
+      const { hits, allowed } = auditText(DEBUG_SKILL_FILE, skill('-', NAMES, '-'), ALL_FORBIDDEN_TERMS)
+      expect(hits).toEqual([])
+      expect(allowed.map((hit) => `${hit.line}: ${hit.term}`)).toEqual(['6: allow_invited_channels', '8: invited.permission_prompts', '6: fungible'])
+    })
+
+    test.each([
+      ['just before the section', skill(NAMES, NAMES, '-'), 4],
+      ['just after its next ### sibling', skill('-', NAMES, NAMES), 10],
+    ])('a removed name %s is a hit, with file and line', (_where, text, line) => {
+      expect(auditText(DEBUG_SKILL_FILE, text, ALL_FORBIDDEN_TERMS).hits.map(formatHit).map((hit) => hit.slice(0, hit.indexOf(' ('))).sort()).toEqual(
+        [`${DEBUG_SKILL_FILE}:${line}: allow_invited_channels`, `${DEBUG_SKILL_FILE}:${line}: fungible`],
+      )
+    })
+
+    test('the same section in another skill exempts nothing', () => {
+      const other = 'skills/other-skill/SKILL.md'
+      const { hits, allowed } = auditText(other, skill('-', NAMES, '-'), ALL_FORBIDDEN_TERMS)
+      expect(allowed).toEqual([])
+      expect(hits.map((hit) => `${hit.file}:${hit.line}: ${hit.term}`)).toEqual(
+        [`${other}:6: allow_invited_channels`, `${other}:8: invited.permission_prompts`, `${other}:6: fungible`],
+      )
+    })
+
+    test.each([
+      ['a token variable', 'Unset SLACK_BOT_TOKEN too.', 'SLACK_BOT_TOKEN'],
+      ['the access-control file', 'Delete access.json too.', 'access.json'],
+      ['a pre-persona key', 'Remove `default_route` too.', 'default_route'],
+    ])('%s inside the section is a hit', (_label, line, term) => {
+      const { hits } = auditText(DEBUG_SKILL_FILE, skill('-', `${NAMES}\n${line}`, '-'), ALL_FORBIDDEN_TERMS)
+      expect(hits.map((hit) => `${hit.line}: ${hit.term}`)).toEqual([`7: ${term}`])
+    })
+
+    test.each([
+      ['removed', (text: string) => text.replace(`${HEADING}\n`, '')],
+      ['renamed', (text: string) => text.replace(HEADING, '### Old configuration keys')],
+      ['moved to another level', (text: string) => text.replace(HEADING, `#${HEADING}`)],
+    ])('with the heading %s, the audit fails naming it and exempts nothing', (_how, edit) => {
+      const edited = edit(skill('-', NAMES, '-'))
+      expect(edited).not.toBe(skill('-', NAMES, '-'))
+      expect(() => auditText(DEBUG_SKILL_FILE, edited, ALL_FORBIDDEN_TERMS)).toThrow(`${DEBUG_SKILL_FILE} has no heading "${HEADING}"`)
     })
   })
 })
@@ -2792,7 +3004,7 @@ const AD_VOCABULARY: Record<string, { text: string; source: string }> = {
   configMalformed: { text: code('ErrConfigMalformed'), source: "HO §1; ADSRD agent-director's answer to a malformed settings file" },
   ownerLabel: { text: code('@ad_owner'), source: "HO rev 15; the session label by which agent-director proves a session is a row's" },
   paneLabel: { text: code('@ad_pane'), source: 'HO rev 17; the per-pane label' },
-  unknownErrorName: { text: code('ErrUnknownErrorName'), source: "agent-director's client: the error a name outside its catalog arrives as; the E4 hatch note (`ad-shim-catalog-incomplete`)" },
+  unknownErrorName: { text: code('ErrUnknownErrorName'), source: "agent-director's client: the error a name outside its catalog arrives as (`ad-shim-catalog-incomplete`)" },
   expireAll: { text: code('--older-than 0d'), source: 'HO C6step 11: never used' },
   'ceiling kill': { text: 'the larger of 2Q + 2A + E + 4W and 3Q + 2A + 5W', source: 'ADSRD' },
   'ceiling read-pane': { text: '3Q + A + 4W', source: 'ADSRD' },
@@ -2928,7 +3140,7 @@ const UPGRADING_TITLE = 'Upgrading to personas'
 /**
  * A link to the `RUNBOOK_DOC` heading titled `title` as the carrier writes
  * it: a same-file anchor in `RUNBOOK_DOC`, `docs/migration.md#…` in the
- * CHANGELOG copy (the PM note).
+ * CHANGELOG copy.
  */
 const readmeLink = (title: string) => (carrier: RunbookCarrier) => `(${carrier.name.startsWith(`${CHANGELOG_FILE} `) ? RUNBOOK_DOC : ''}#${headingSlug(title)})`
 
@@ -3115,7 +3327,7 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci(`the shared orchestrator prompt is the system prompt your orchestrator bots load, for example the file ${code('append_system_prompt_file' satisfies (typeof SERVER_PATH_SETTINGS)[number])} names`),
   ]],
   ['step 1 › The orchestrator prompt', 'operator action: the §6 "ship now" wording', [OPERATOR_ACTION]],
-  ['step 1', `the conversion steps kept in "${UPGRADING_TITLE}" are linked (the E35 T1 PM note)`, [upgradingLink]],
+  ['step 1', `the conversion steps kept in "${UPGRADING_TITLE}" are linked`, [upgradingLink]],
 
   // Steps 2 to 11.
   ['step 2', "the host's autostart for CSCB disabled until step 10", [ci("disable the host's autostart for CSCB until step 10")]],
@@ -3194,7 +3406,7 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci(`passes on the still-installed ${HISTORICAL_RUNBOOK_AD}, with its note`),
   ]],
   ['step 7', 'from this step the new CSCB is deployed but not started', [ci('from this step the new CSCB is deployed but not started')]],
-  ['step 7', `the conversion steps kept in "${UPGRADING_TITLE}" are linked (the E35 T1 PM note)`, [upgradingLink]],
+  ['step 7', `the conversion steps kept in "${UPGRADING_TITLE}" are linked`, [upgradingLink]],
   ['step 8 › The go-ahead', "the go-ahead for this host confirmed as still standing, and recorded in the switch-over log (A-19)", [
     ci('confirm that the go-ahead for this host still stands, and record it in the switch-over log'),
   ]],
@@ -3832,7 +4044,7 @@ const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Ite
   ['step 2', 'operator action: removing the daily expire', [ci(`loop script that runs it ${OPERATOR_ACTION}`)]],
 
   // Step 3.
-  ['step 3', `the new CSCB stopped with ${CLI_COMMAND_STOP_BOTS}, whose failure lines the CLI Reference describes (E32, E33)`, [
+  ['step 3', `the new CSCB stopped with ${CLI_COMMAND_STOP_BOTS}, whose failure lines the CLI Reference describes`, [
     `claude-slack-channel-bots ${CLI_COMMAND_STOP_BOTS}`,
     ci("the command's failure lines are described in"),
     'Precheck before stopping bots',
@@ -4487,7 +4699,7 @@ const RELEASE_ENTRY_CHECKS: [element: string, problems: (changelog: string) => s
     textUnits(changelog).filter((unit) => /\baccess\.json\b/.test(unit) && DELETE_WORDS.test(unit)).map((unit) => `a delete instruction: ${unit}`)],
   ['the prompt-open relaunch note says the server checks the session through agent-director', (changelog) =>
     noteUnitProblems(changelog, ci('prompt or question open'), (unit) => lacking(unit, [ci('checks the session through agent-director')]))],
-  [`the note "The server's own tmux commands act only on a bot's own session" is gone (E17, E18)`, (changelog) =>
+  [`the note "The server's own tmux commands act only on a bot's own session" is gone`, (changelog) =>
     [...flat(changelog).matchAll(/the server's own tmux commands/gi)].map((m) => `the dropped note is back: ${m[0]}`)],
   [`the prefix-key note's reason is sentence and does not name agent-director ${HISTORICAL_RUNBOOK_AD}`, (changelog) =>
     noteUnitProblems(changelog, ci("may start with another persona's key"), (unit) => [
@@ -4525,14 +4737,14 @@ function releaseCheck(element: string): (changelog: string) => string[] {
  * pinned), with the component and source of each.
  */
 const HATCH_NOTE_NAMES: [name: string, source: string][] = [
-  [CLEAR_LATCH_COMMAND, 'E31: src/clear-latch.ts CLEAR_LATCH_COMMAND'],
-  [SERVER_PORT_FILE_NAME, 'E31: src/clear-latch.ts SERVER_PORT_FILE_NAME'],
-  [CLI_TEARDOWN_FAILED_LABEL, 'E33: src/cli-teardown.ts CLI_TEARDOWN_FAILED_LABEL'],
-  [PERSONA_KILL_FAILED_LABEL, 'E33: src/kill-failure-alert.ts PERSONA_KILL_FAILED_LABEL'],
-  [PERSONA_KILL_SURVIVOR_LABEL, 'E33: src/kill-failure-alert.ts PERSONA_KILL_SURVIVOR_LABEL'],
-  [CLEAN_RESTART_NOT_RESTARTED_LABEL, 'E33: src/cli-teardown.ts CLEAN_RESTART_NOT_RESTARTED_LABEL'],
-  ...startSummaryCountLabels().map((label): [string, string] => [label, 'E26: src/session-manager.ts startupSummaryEnding']),
-  [UNAVAILABLE_RETRY_CAUSE_COLLISION, "E36 T1: src/unavailable-retry.ts UNAVAILABLE_RETRY_CAUSE_COLLISION (the retry cause's rename, reconcile ruling)"],
+  [CLEAR_LATCH_COMMAND, 'src/clear-latch.ts CLEAR_LATCH_COMMAND'],
+  [SERVER_PORT_FILE_NAME, 'src/clear-latch.ts SERVER_PORT_FILE_NAME'],
+  [CLI_TEARDOWN_FAILED_LABEL, 'src/cli-teardown.ts CLI_TEARDOWN_FAILED_LABEL'],
+  [PERSONA_KILL_FAILED_LABEL, 'src/kill-failure-alert.ts PERSONA_KILL_FAILED_LABEL'],
+  [PERSONA_KILL_SURVIVOR_LABEL, 'src/kill-failure-alert.ts PERSONA_KILL_SURVIVOR_LABEL'],
+  [CLEAN_RESTART_NOT_RESTARTED_LABEL, 'src/cli-teardown.ts CLEAN_RESTART_NOT_RESTARTED_LABEL'],
+  ...startSummaryCountLabels().map((label): [string, string] => [label, 'src/session-manager.ts startupSummaryEnding']),
+  [UNAVAILABLE_RETRY_CAUSE_COLLISION, "src/unavailable-retry.ts UNAVAILABLE_RETRY_CAUSE_COLLISION (the retry cause's rename)"],
 ]
 
 /**
@@ -6240,8 +6452,9 @@ function noticeTitle(text: string): string {
 /**
  * The Slack notices README "Troubleshooting" gives an entry each (
  * the retry timer's, `tmux-unresponsive`'s, the kill-failure alert's two
- * versions and the other new notices), each title rendered by the `src/`
- * builder or head that posts it.
+ * versions, the other new notices, the five Thread Memory reports and the
+ * three shared-state reports), each title rendered by the `src/` builder or
+ * head that posts it.
  */
 const TROUBLESHOOTING_NOTICES: readonly [source: string, title: () => string][] = [
   ['tmuxUnresponsiveOnsetText', () => noticeTitle(tmuxUnresponsiveOnsetText(ALERT_KEY))],
@@ -6261,6 +6474,14 @@ const TROUBLESHOOTING_NOTICES: readonly [source: string, title: () => string][] 
     .map(({ content }): [string, () => string] => [`killFailureAlertText (${content.version})`, () => noticeTitle(killFailureAlertText(content, KILL_FAILURE_CLOSING_DESTINATION, true))]),
   ["ONSET_TEMPLATES['ad-config-malformed']", () => noticeTitle(ONSET_TEMPLATES['ad-config-malformed']())],
   ['unclassifiedErrorAlertText', () => noticeTitle(unclassifiedErrorAlertText({ reportedName: undefined, message: '' }))],
+  ['buildThreadMemoryNotSavedNotice', () => memoryNotSavedTitle()],
+  ['buildThreadMemoryUnreadableNotice', () => memoryUnreadableTitle()],
+  ['buildThreadMemoryJoinsLostNotice', () => joinsLostTitle()],
+  ['buildThreadMemoryChangedWhileStoppedNotice', () => memoryChangedTitle()],
+  ['buildThreadMemoryRecoveredNotice', () => memoryRecoveredTitle()],
+  ['buildSharedStateUnresolvedNotice', () => sharedStateUnresolvedTitle()],
+  ['buildMembershipEvidenceUnresolvedNotice', () => membershipEvidenceUnresolvedTitle()],
+  ['buildSharedStateRecoveredNotice', () => sharedStateRecoveredTitle()],
 ]
 
 /**
@@ -6967,7 +7188,7 @@ describe('over every operator text (through it)', () => {
     expect(killAdviceProblems(_name === CHANGELOG_FILE ? historicalRunbookText(read()) : read(), CHECKS_THE_RESULT)).toEqual([])
   })
 
-  test.each(OPERATOR_TEXTS)('%s: no `agent-director kill` with a positional id and no kill-and-respawn advice (the E8 note)', (name, read) => {
+  test.each(OPERATOR_TEXTS)('%s: no `agent-director kill` with a positional id and no kill-and-respawn advice', (name, read) => {
     expect(findTerms(name, name === CHANGELOG_FILE ? historicalRunbookText(read()) : migrationKillAuditText(name, read()), RAW_COMMAND_FORMS).map(formatHit)).toEqual([])
   })
 
@@ -7131,7 +7352,7 @@ describe('over every operator text (through it)', () => {
       ['run `agent-director\n  kill <id>`', '`agent-director kill` without --instance-id'],
       ['(`agent-director kill` / tmux-kill + respawn)', 'kill-and-respawn advice'],
       ['then kill and\nrespawn the session', 'kill-and-respawn advice'],
-    ] as const)('the E8 note: %p is reported as %s', (text, label) => {
+    ] as const)('the kill advice: %p is reported as %s', (text, label) => {
       expect(findTerms('sample.md', text, RAW_COMMAND_FORMS).map((hit) => hit.term)).toEqual([label])
     })
 
@@ -7306,7 +7527,7 @@ describe('the user docs describe the build', () => {
     expect(migrationCronProblems(readme())).toEqual([])
   })
 
-  test.each(REFUSAL_LABELS)(`"${SKILL_STARTUP_ERRORS_HEADING}": the \`%s\` item points to the "${REFUSAL_BLOCK_HEADING}" block and step 10, never "start the server again" (E2 gate)`, (label) => {
+  test.each(REFUSAL_LABELS)(`"${SKILL_STARTUP_ERRORS_HEADING}": the \`%s\` item points to the "${REFUSAL_BLOCK_HEADING}" block and step 10, never "start the server again"`, (label) => {
     expect(readmeRefusalItemProblems(label, readme())).toEqual([])
   })
 
@@ -7439,7 +7660,7 @@ describe('the debugging skill describes the build', () => {
     expect(debugClassSectionNames(`## Other\n\`${RETIRED_KEYS_UNREADABLE_LABEL}\`\n`, RETIRED_KEYS_UNREADABLE_LABEL)).toBe(false)
   })
 
-  test.each(REFUSAL_LABELS)(`the \`%s\` entry's fix follows the "${REFUSAL_BLOCK_HEADING}" block and the runbook's step 10, never "start the server again" (E2 gate)`, (label) => {
+  test.each(REFUSAL_LABELS)(`the \`%s\` entry's fix follows the "${REFUSAL_BLOCK_HEADING}" block and the runbook's step 10, never "start the server again"`, (label) => {
     expect(debugRefusalEntryProblems(label, skill())).toEqual([])
   })
 
@@ -7782,6 +8003,10 @@ const memoryNotSavedTitle = () => noticeTitle(buildThreadMemoryNotSavedNotice('p
 const memoryUnreadableTitle = () => noticeTitle(buildThreadMemoryUnreadableNotice('persona', [], '/memory'))
 const memoryRecoveredTitle = () => noticeTitle(buildThreadMemoryRecoveredNotice('persona', []))
 const memoryChangedTitle = () => noticeTitle(buildThreadMemoryChangedWhileStoppedNotice('persona', [], 'unclean'))
+const joinsLostTitle = () => noticeTitle(buildThreadMemoryJoinsLostNotice({ name: 'persona', key: 'persona' }, { threads: [], messages: [] }).text)
+const sharedStateUnresolvedTitle = () => noticeTitle(buildSharedStateUnresolvedNotice('persona', { channels: [] }, 'unsynced', '/authority'))
+const membershipEvidenceUnresolvedTitle = () => noticeTitle(buildMembershipEvidenceUnresolvedNotice('persona', { channels: [] }, { problem: 'deadline' }))
+const sharedStateRecoveredTitle = () => noticeTitle(buildSharedStateRecoveredNotice('persona', { channels: [] }, 'repair'))
 const RECEIVE_ALL_SHARED = 'receive_all_shared' satisfies Via
 /** `"dm"`, as the README writes the destination value in a code span. */
 const DM_VALUE = code(JSON.stringify(DM_DESTINATION))
@@ -7950,7 +8175,7 @@ const DOWNGRADE_STATE_ROWS: readonly DocRow[] = [
   ]],
 ]
 
-/** The troubleshooting entries names, by their titles (T17's closing note). */
+/** The troubleshooting entries names, by their titles. */
 const SILENT_INVITED_TITLE = 'A persona is silent in a channel it was invited to'
 const RECEIVES_EVERYTHING_TITLE = 'A persona receives every message in a channel'
 const UNCLAIMED_ENTRY_TITLE = 'Messages in a channel no persona is configured into are not delivered'
@@ -8393,7 +8618,7 @@ describe('the README describes both channel modes', () => {
   const readme = () => referenceText()
 
   describe('headings', () => {
-    test.each(README_DEO_PLACEMENTS.map((p) => [p.heading, p] as const))('"%s" appears once, where T17 placed it', (_heading, placement) => {
+    test.each(README_DEO_PLACEMENTS.map((p) => [p.heading, p] as const))('"%s" appears once, in its placed section', (_heading, placement) => {
       expect(placementProblems(readme(), placement)).toEqual([])
     })
 
@@ -8722,7 +8947,7 @@ describe('the README describes both channel modes', () => {
     })
   })
 
-  describe('same-file and cross-page links of the user docs (T17 hatch note 10)', () => {
+  describe('same-file and cross-page links of the user docs', () => {
     test.each([...USER_DOC_FILES, CONTRIBUTING_FILE])('every same-file link in %s resolves to one of its own headings', (doc) => {
       expect(brokenReadmeAnchors(operatorText(doc))).toEqual([])
     })
@@ -9263,7 +9488,7 @@ describe('MCP-loss wording sensitivity', () => {
 const DOWNGRADE_OPERATIONS: readonly (readonly [label: string, pattern: RegExp])[] = [
   [`native ${MIN_CLAUDE_CODE_VERSION} selected before either start`, new RegExp(`^real_prepare ${escapeRegExp(MIN_CLAUDE_CODE_VERSION)}$`, 'm')],
   ['current release starts', /^start_server --live$/m],
-  // SR-10.5's first phase, before the queues are emptied.
+  // The downgrade's first phase: retire thread_hybrid and let Thread Memory recover, before the queues are emptied.
   ['every thread_hybrid channel is changed to another value', /^jq -c '\.channels \|= map\(if \.delivery == "thread_hybrid" then \.delivery = "all" else \. end\)' "\$\{REAL_PERSONAS\}" > "\$\{SCENARIO_ROOT\}\/real-personas\.next"\nmv "\$\{SCENARIO_ROOT\}\/real-personas\.next" "\$\{REAL_PERSONAS\}"\nreal_write_config$/m],
   ['the thread_hybrid change is confirmed', /^mv .*config\.json\.pending" .*config\.json\.apply"$/m],
   ['no thread_hybrid channel is applied before continuing', /^wait_until \d+ '[^']*' no_thread_hybrid_applied$/m],
@@ -9284,7 +9509,7 @@ const DOWNGRADE_OPERATIONS: readonly (readonly [label: string, pattern: RegExp])
   ['previous release starts', /^start_server --live$/m],
   ['previous bot finishes launching', /^real_wait_launch "\$\{REAL_KEY\}"$/m],
   ['fresh start is asserted rather than resume', /^\[\[ .*cscb_ad_count_between .* resume\).* == 0 \]\] \|\| fail /m],
-  // 0.18.0 has no development-channels flag (b.j2a); its route is its own template.
+  // 0.18.0 has no development-channels flag; its route is its own template.
   ['shim words are decoded by the shared %q decoder', /^const \{ shimWords \} = await import\(receipts\)$/m],
   ["the previous release's own router name is loaded", /^const \{ loadPersonaConfig, MCP_SERVER_NAME \} = await import\(configTs\)$/m],
   ['the previous release builds its own template parameters', /^const params = buildTemplateParams\(loadPersonaConfig\(config, home\)\)$/m],
@@ -9426,7 +9651,7 @@ describe('R55: documented downgrade matches the executed safety barriers', () =>
   })
 })
 
-// 7p's narrow operator contract. Full operating documentation remains a later Epic.
+// The membership setup record's narrow operator contract: the terms its documentation names.
 const MEMBERSHIP_RECORD_TERMS = [MEMBERSHIP_READINESS_ROUTE, ...MEMBERSHIP_REQUIRED_SUBSCRIPTIONS,
   'installation', 'teamId', 'appId', 'botUserId', 'botId', 'subscriptions', 'reinstall', 'record', 'read']
 function membershipRecordMissing(text: string): string[] {
@@ -9478,11 +9703,8 @@ const SHARED_RELEASE_ROWS: readonly DocRow[] = [
     code(THREAD_HYBRID), code(`via="${THREAD_VIA}"`), code('fetch_messages'), code('thread_ts'), code('cursor'), ci('read the whole thread'),
   ]],
   ['thread memory and shared-state reports name the source titles', sharedReleaseEntry, [
-    ...[memoryNotSavedTitle, memoryUnreadableTitle, memoryChangedTitle, memoryRecoveredTitle,
-      () => noticeTitle(buildThreadMemoryJoinsLostNotice({ name: 'persona', key: 'persona' }, { threads: [], messages: [] }).text),
-      () => noticeTitle(buildSharedStateUnresolvedNotice('persona', { channels: [] }, 'unsynced', '/authority')),
-      () => noticeTitle(buildMembershipEvidenceUnresolvedNotice('persona', { channels: [] }, { problem: 'deadline' })),
-      () => noticeTitle(buildSharedStateRecoveredNotice('persona', { channels: [] }, 'repair')),
+    ...[memoryNotSavedTitle, memoryUnreadableTitle, memoryChangedTitle, memoryRecoveredTitle, joinsLostTitle,
+      sharedStateUnresolvedTitle, membershipEvidenceUnresolvedTitle, sharedStateRecoveredTitle,
     ].map(title => () => code(title())),
   ]],
   ['tag descriptions quote the changed source lines', sharedReleaseEntry, [
