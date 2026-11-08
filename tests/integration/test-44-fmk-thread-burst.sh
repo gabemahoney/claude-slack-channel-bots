@@ -19,6 +19,25 @@ LOG="${SLACK_STATE_DIR}/server.log"
 printed() { bun "${PRINTER}" "$@" || fail "printer entry $1 failed"; }
 mono_ms() { python3 -c 'import time; print(time.monotonic_ns() / 1000000)'; }
 byte_mark() { if [[ -e "$1" ]]; then stat -c %s "$1"; else printf '0\n'; fi; }
+# Runs one sr8-evidence verdict command and prints all its rows; a failing
+# exit then prints a FAIL line in fail's form naming each fail/missing verdict (with its
+# persona, if any), so the runner's FAIL line says which measures failed, and
+# exits with the command's own status (64 for a usage error, 137 when killed).
+sr8_verdicts() {
+    local rows="${EVIDENCE}/verdicts.txt" status=0 line name failed=()
+    local verdict_re='^recorded: sr8 ([^ ]+) .* verdict=(fail|missing)$' persona_re=' persona=([^ ]+) '
+    bun "${SR8}" "$@" > "${rows}" || status=$?
+    cat "${rows}"
+    (( status == 0 )) && return 0
+    while IFS= read -r line; do
+        [[ "${line}" =~ ${verdict_re} ]] || continue
+        name="${BASH_REMATCH[1]}=${BASH_REMATCH[2]}"
+        if [[ "${line}" =~ ${persona_re} ]]; then name="${name%=*}[${BASH_REMATCH[1]}]=${name##*=}"; fi
+        failed+=("${name}")
+    done < "${rows}"
+    echo "FAIL: ${TEST_NAME}: ${failed[*]:-sr8 $1 exited ${status} with no verdict} (${mode}/${population}/${recipients})" >&2
+    exit "${status}"
+}
 
 # These are serial child invocations of this same script, not additional CI
 # scripts. sr8Combinations owns their order and populations. Do not split or
@@ -220,13 +239,13 @@ if [[ "${population}" != 0 ]]; then
     bun "${SR8}" seed "${CONFIG}" "${SLACK_STATE_DIR}" "${population}"
     first_mark="$(byte_mark "${LOG}")"
     start_ready
-    bun "${SR8}" seal first "${CONTEXT[@]}" "${LOG}" "${first_mark}" "${CONFIG}"
+    sr8_verdicts seal first "${CONTEXT[@]}" "${LOG}" "${first_mark}" "${CONFIG}"
     clean_stop
 fi
 measured_log_mark="$(byte_mark "${LOG}")"
 measurement_mark="$(byte_mark "${MEASUREMENTS}")"
 start_ready measured
-bun "${SR8}" seal measured "${CONTEXT[@]}" "${LOG}" "${measured_log_mark}" "${CONFIG}"
+sr8_verdicts seal measured "${CONTEXT[@]}" "${LOG}" "${measured_log_mark}" "${CONFIG}"
 
 start_pending_post() {
     local key="$1" request facts
@@ -310,7 +329,7 @@ case "${CASE}" in
         for key in "${KEYS[@]}"; do snapshot "${key}" "${RESULTS}/${key}.queue.jsonl"; done
         reopen_mark="$(byte_mark "${LOG}")"
         start_ready
-        bun "${SR8}" seal measured "${CONTEXT[@]}" "${LOG}" "${reopen_mark}" "${CONFIG}"
+        sr8_verdicts seal measured "${CONTEXT[@]}" "${LOG}" "${reopen_mark}" "${CONFIG}"
         for key in "${KEYS[@]}"; do shared_thread_joins "${key}" > "${RESULTS}/${key}.after.jsonl"; done
         clean_stop
         closing_assertions
@@ -318,7 +337,7 @@ case "${CASE}" in
         # It prints before check, whose failure ends the script.
         bun "${SR8}" observe "${CONTEXT[@]}" "${RESULTS}" "${RESULTS}/measurements.jsonl" "${measurement_mark}" \
             "${RESULTS}/phase-cpu.jsonl" || printf 'recorded: sr8 observe unavailable\n'
-        bun "${SR8}" check "${CONTEXT[@]}" "${RESULTS}" "${RESULTS}/measurements.jsonl" "${measurement_mark}" "${start_ms}" "${ready_ms}"
+        sr8_verdicts check "${CONTEXT[@]}" "${RESULTS}" "${RESULTS}/measurements.jsonl" "${measurement_mark}" "${start_ms}" "${ready_ms}"
         [[ "${burst_status}" == 0 ]] || fail 'burst submission or ACK observation failed'
         ;;
     pending)
@@ -374,7 +393,7 @@ case "${CASE}" in
         for persona in "${KEYS[@]}"; do snapshot "${persona}" "${RESULTS}/${persona}.queue.jsonl"; done
         clean_stop
         closing_assertions
-        bun "${SR8}" pending-post "${CONTEXT[@]}" "${key}" "${OPERATION[${key}]}" "${pending_start}" "${pending_end}" \
+        sr8_verdicts pending-post "${CONTEXT[@]}" "${key}" "${OPERATION[${key}]}" "${pending_start}" "${pending_end}" \
             "${EVIDENCE}/before.posts.jsonl" "${EVIDENCE}/after.posts.jsonl" "${EVIDENCE}/probes.tsv" "${RESULTS}/${key}.queue.jsonl" \
             "${RESULTS}/times.jsonl" "${MEASUREMENTS}" "${pending_mark}" "${HOLD_CHANNEL}" \
             "${RESULTS}" "${pending_seq}" "${settled_seq}" "${compact_ms}" "${start_ms}" "${window_end}"
@@ -450,6 +469,6 @@ PY
         restore_permissions
         clean_stop
         closing_assertions
-        bun "${SR8}" shared-list "${CONTEXT[@]}" "${EVIDENCE}" "${probe_exit}"
+        sr8_verdicts shared-list "${CONTEXT[@]}" "${EVIDENCE}" "${probe_exit}"
         ;;
 esac

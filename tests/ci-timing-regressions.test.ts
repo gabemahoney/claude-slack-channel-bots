@@ -1671,7 +1671,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
   })
 })
 
-describe('test-44 root payloads through durable intake (synthetic only)', () => {
+describe('test-44, test-32 and test-45/48 root payloads through durable intake (synthetic only)', () => {
   let root: string, h: RoutingHarness | undefined
   beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'test44-intake-')); h = undefined; resetRoutingState() })
   afterEach(async () => {
@@ -1683,7 +1683,7 @@ describe('test-44 root payloads through durable intake (synthetic only)', () => 
       }
     } finally { resetRoutingState(); rmSync(root, { recursive: true, force: true }) }
   })
-  test.each(['strict', 'open'] as const)('%s roots store and join before the unmentioned reply; plain messages still drop', async mode => {
+  test.each(['strict', 'open'] as const)('test-44 %s roots store and join before the unmentioned reply; plain messages still drop', async mode => {
     const keys = sr8Personas(2), channel = 'C0LARGE00003'
     h = makeRoutingHarness(keys.map(name => ({ name, channels: [{ id: channel, delivery: 'thread_hybrid' }] })), root, {
       mode, threadMemory: {}, membership: observedMembership(Object.fromEntries(keys.map(key => [key, [channel]]))),
@@ -1736,6 +1736,160 @@ describe('test-44 root payloads through durable intake (synthetic only)', () => 
       expect(readThreads(root, key).filter(r => r.kind === 'join').map(r => [r.channel, r.root, r.source]))
         .toEqual([[channel, spec.rootMentions[0]!.ts, 'mention']])
     }
+  })
+  test.each(['strict', 'open'] as const)('test-32 %s thread root stores and joins before the first latency reply', async mode => {
+    const keys = sr8Personas(2), channel = 'C0LARGE00003', [alpha, beta] = keys as [string, string]
+    h = makeRoutingHarness(keys.map(name => ({ name, channels: [{ id: channel, delivery: 'thread_hybrid' }] })), root, {
+      mode, threadMemory: {}, membership: observedMembership(Object.fromEntries(keys.map(key => [key, [channel]]))),
+      restartDelayS: NEVER_FIRE_RESTART_DELAY_S,
+    })
+    await h.ready()
+    const bot = h.p(alpha).stub.identity.botUserId, rootTs = '1800000000.000001', replyTs = '1800000000.000002'
+    // Execute test-32's actual root block and sample-reply line from its
+    // workload builder (the whole builder's 20 samples cost seconds of jq).
+    const workload = declaration(real, 'real_thread_workload')
+    const built = shell([
+      'require_ci_image() { :; }',
+      ...['_scenario_channel_type', 'slack_message_event', 'slack_mention_event', 'slack_reply_event', 'scenario_text', 'scenario_mention_text']
+        .map(name => declaration(scenario, name)),
+      'scenario_ts() { printf \'1800000000.000001\\n\'; }', 'scenario_id() { printf \'U0HUMAN\\n\'; }',
+      `TEST_NAME=test-32-fmk-real-order REAL_THREAD_MODE=${mode} REAL_THREAD_EVIDENCE="$HOME" REAL_CHANNEL=${channel} REAL_BOT_USER_ID=${bot}`,
+      block(workload, '    REAL_THREAD_ROOT="$(scenario_ts)"', '    REAL_THREAD_SAMPLES=()'),
+      `n=1 ts=${replyTs} sender=U0HUMAN; text="$(scenario_text "thread-latency-\${n}")"`,
+      block(workload, '        slack_reply_event "${REAL_CHANNEL}"', '\n        if'),
+      'cat "$HOME/root.json" "$HOME/sample-1.json"',
+    ].join('\n'))
+    expect({ status: built.status, stderr: built.stderr }).toEqual({ status: 0, stderr: '' })
+    const events = built.stdout.trim().split('\n').map(line => JSON.parse(line))
+    // The scenario pushes both to alpha's connection only.
+    const atAck: unknown[] = []
+    for (const event of events) {
+      await h.receive(event, [alpha], () => {
+        const records = existsSync(queuePath(root, alpha)) ? readQueue(root, alpha) : []
+        atAck.push({ stored: records.filter(r => r.kind === 'accepted' && 'ts' in r).map(r => r.ts), joined: h!.threads!.memory.view(alpha, channel, rootTs) })
+      })
+    }
+    expect(atAck).toEqual([{ stored: [rootTs], joined: 'joined' }, { stored: [rootTs, replyTs], joined: 'joined' }])
+    expect(events.map(e => [e.type, e.channel_type, e.channel, e.ts, e.thread_ts, e.text])).toEqual([
+      [mode === 'open' ? 'message' : 'app_mention', mode === 'open' ? 'channel' : undefined, channel, rootTs, undefined, `<@${bot}> test-32-fmk-real-order thread-root`],
+      ['message', 'channel', channel, replyTs, rootTs, 'test-32-fmk-real-order thread-latency-1'],
+    ])
+    await h.settleJoinSaves()
+    expect(h.queued(alpha).map(({ accepted: a }) => ({ channel: a.channel, ts: a.ts, via: a.via })))
+      .toEqual([{ channel, ts: rootTs, via: 'mention' }, { channel, ts: replyTs, via: 'thread' }])
+    expect(h.queued(beta)).toEqual([])
+    expect(readThreads(root, alpha).filter(r => r.kind === 'join').map(r => [r.channel, r.root, r.source])).toEqual([[channel, rootTs, 'mention']])
+  })
+  test.each(['strict', 'open'] as const)('test-45/48 %s roots store and join before the unmentioned reply; plain messages still drop', async mode => {
+    const keys = sr8Personas(2), channel = 'C0LARGE00003'
+    h = makeRoutingHarness(keys.map(name => ({ name, channels: [{ id: channel, delivery: 'thread_hybrid' }] })), root, {
+      mode, threadMemory: {}, membership: observedMembership(Object.fromEntries(keys.map(key => [key, [channel]]))),
+      restartDelayS: NEVER_FIRE_RESTART_DELAY_S,
+    })
+    await h.ready()
+    const spec = burstSpec({ mode, population: 0, recipients: keys.length }, [channel], 1_800_000_000), rootTs = spec.rootMentions[0]!.ts
+    const plan = [['roots', spec.rootMentions[0]], ['replies', spec.replies[0]], ['dropped', spec.dropped[0]]] as const
+    const bots = Object.fromEntries(keys.map(key => [key, h!.p(key).stub.identity.botUserId]))
+    // Execute membership-load.sh's real build_batches; bun stands in for the
+    // CI-only sr8-evidence `bodies`, which only wraps each event per label.
+    const built = shell([
+      'require_ci_image() { :; }',
+      ...['_scenario_channel_type', 'slack_message_event', 'slack_mention_event', 'slack_reply_event', 'scenario_text', 'scenario_mention_text']
+        .map(name => declaration(scenario, name)),
+      `slack_stub_identity() { case "$1" in ${keys.map(key => `${key}) printf '%s\\n' ${bots[key]} ;;`).join(' ')} *) exit 9 ;; esac; }`,
+      'scenario_id() { local name="${2//[^A-Za-z0-9]/}"; printf \'%s0%s\\n\' "$1" "${name^^}"; }',
+      'bun() { [[ "$1" == "$E" && "$2" == bodies && "$#" == 4 ]] || exit 9; jq -c --arg key "$3" \'{"label":$key,event:.}\' "$4"; }',
+      declaration(source('lib/membership-load.sh'), 'build_batches'),
+      `MODE=${mode} TEST_NAME=test-48-fmk-membership-load-open CASE=test-48-${mode}-first-hang BATCH="$HOME" PLAN="$HOME/plan.tsv" E=e.ts`,
+      `KEYS=(${keys.join(' ')}) HOLD_KEYS=()`, 'build_batches',
+      'cat "$BATCH/roots.batch.jsonl" "$BATCH/replies.batch.jsonl" "$BATCH/dropped.batch.jsonl"',
+    ].join('\n'), { 'plan.tsv': plan.map(([phase, m]) => [phase, m!.channel, m!.ts, m!.threadTs ?? '-', m!.mentions.length].join('\t')).join('\n') + '\n' })
+    expect({ status: built.status, stderr: built.stderr }).toEqual({ status: 0, stderr: '' })
+    const bodies: { label: string; event: any }[] = built.stdout.trim().split('\n').map(line => JSON.parse(line))
+    expect(bodies.map(b => b.label)).toEqual(plan.flatMap(() => keys))
+    const sender = 'U0TEST48' + mode.toUpperCase() + 'FIRSTHANGORDINARY'
+    const text = (phase: string, ts: string) => `test-48-fmk-membership-load-open test-48-${mode}-first-hang-${phase}-${ts}`
+    const rootText = keys.map(key => `<@${bots[key]}> test-48-fmk-membership-load-open `).join('') + text('roots', rootTs)
+    expect(bodies.filter((_, n) => n % keys.length === 0).map(({ event: e }) => [e.type, e.channel_type, e.channel, e.ts, e.thread_ts, e.user, e.parent_user_id, e.text])).toEqual([
+      [mode === 'open' ? 'message' : 'app_mention', mode === 'open' ? 'channel' : undefined, channel, rootTs, undefined, sender, undefined, rootText],
+      ['message', 'channel', channel, spec.replies[0]!.ts, rootTs, sender, sender, text('replies', spec.replies[0]!.ts)],
+      ['message', 'channel', channel, spec.dropped[0]!.ts, undefined, sender, undefined, text('dropped', spec.dropped[0]!.ts)],
+    ])
+    const atAck: unknown[] = []
+    for (const { label: key, event } of bodies) {
+      await h.receive(event, [key], () => {
+        const records = existsSync(queuePath(root, key)) ? readQueue(root, key) : []
+        atAck.push({ key, stored: records.filter(r => r.kind === 'accepted' && 'ts' in r).map(r => r.ts), joined: h!.threads!.memory.view(key, channel, rootTs) })
+      })
+    }
+    expect(atAck).toEqual(plan.flatMap(([phase]) => keys.map(key => ({ key, joined: 'joined',
+      stored: phase === 'roots' ? [rootTs] : [rootTs, spec.replies[0]!.ts] }))))
+    await h.settleJoinSaves()
+    for (const key of keys) {
+      expect(h.queued(key).map(({ accepted: a }) => ({ channel: a.channel, ts: a.ts, via: a.via })))
+        .toEqual([{ channel, ts: rootTs, via: 'mention' }, { channel, ts: spec.replies[0]!.ts, via: 'thread' }])
+      expect(readThreads(root, key).filter(r => r.kind === 'join').map(r => [r.channel, r.root, r.source])).toEqual([[channel, rootTs, 'mention']])
+    }
+  })
+})
+
+describe('test-44 verdict failures print a FAIL line naming them (stub shell)', () => {
+  const t44 = source('test-44-fmk-thread-burst.sh')
+  const row = (measure: string, verdict: Result['verdict'], stats: Result['stats'] = {}): Result => ({ measure, samples: 1, stats, limit: 3000, verdict })
+  // Runs the script's sr8_verdicts and scenario.sh's fail over a stand-in
+  // verdict command that prints rows through the real printResults, then
+  // exits with printResults' status, a given status, or SIGKILLs itself.
+  const run = (rows: Result[] | null, exit: number | 'SIGKILL' | null = null) => shell([
+    declaration(scenario, 'fail'), declaration(t44, 'sr8_verdicts'),
+    'TEST_NAME=test-44-fmk-thread-burst EVIDENCE="$HOME" SR8="$HOME/e.ts" mode=open population=0 recipients=2',
+    'sr8_verdicts check test-44-fmk-thread-burst open 0 2', 'echo after',
+  ].join('\n'), {
+    'rows.json': JSON.stringify({ rows, exit }),
+    'e.ts': `import { printResults } from ${JSON.stringify(join(integration, 'fixtures/sr8-evidence.ts'))}
+const { rows, exit } = await Bun.file(import.meta.dir + '/rows.json').json()
+const status = rows === null ? 1 : printResults({ scenario: 'test-44-fmk-thread-burst', mode: 'open', population: 0, recipients: 2 }, rows)
+if (exit === 'SIGKILL') process.kill(process.pid, 'SIGKILL')
+process.exit(exit ?? status)\n`,
+  })
+  const printed = (rows: Result[]) => {
+    const lines: string[] = []
+    printResults({ scenario: 'test-44-fmk-thread-burst', mode: 'open', population: 0, recipients: 2 }, rows, line => lines.push(line))
+    return lines.map(line => `${line}\n`).join('')
+  }
+  // answers22's open/0/2 check: both ACK verdicts over the limit, the rest passing.
+  const answers22 = [row('ack-accepted', 'fail', { max_ms: 3338.7 }), row('store', 'pass'), row('joins', 'pass', { persona: 'alpha' }),
+    row('post-hold-overlap-ack', 'fail', { max_ms: 3338.7 })]
+  test.each<[string, Result[] | null, string]>([
+    ['failing ACK verdicts', answers22, 'ack-accepted=fail post-hold-overlap-ack=fail'],
+    ['a persona\'s missing joins', [row('store', 'pass'), row('joins', 'pass', { persona: 'alpha' }), row('joins', 'missing', { persona: 'beta' })], 'joins[beta]=missing'],
+    ['a failing exit with no verdict rows', null, 'sr8 check exited 1 with no verdict'],
+  ])('%s', (_name, rows, named) => {
+    const r = run(rows)
+    expect({ status: r.status, stdout: r.stdout, stderr: r.stderr })
+      .toEqual({ status: 1, stdout: rows ? printed(rows) : '', stderr: `FAIL: test-44-fmk-thread-burst: ${named} (open/0/2)\n` })
+  })
+  // The FAIL line still names the failure, and the scenario exits with the
+  // command's own status rather than fail's 1. For the kill, bash's own
+  // "Killed" report precedes the FAIL line.
+  test.each<[string, Result[] | null, number | 'SIGKILL', number, string]>([
+    ['a usage error (64) with no verdict rows', null, 64, 64, 'sr8 check exited 64 with no verdict'],
+    ['a killed command (137) after failing verdict rows', answers22, 'SIGKILL', 137, 'ack-accepted=fail post-hold-overlap-ack=fail'],
+  ])('%s keeps its exit status', (_name, rows, exit, status, named) => {
+    const r = run(rows, exit), failLine = `FAIL: test-44-fmk-thread-burst: ${named} (open/0/2)\n`
+    const killed = exit === 'SIGKILL' ? /^[^\n]* Killed +bun "\$\{SR8\}" "\$@" > "\$\{rows\}"\n/.exec(r.stderr)?.[0] ?? '' : ''
+    if (exit === 'SIGKILL') expect(killed).not.toBe('')
+    expect({ status: r.status, stdout: r.stdout, stderr: r.stderr })
+      .toEqual({ status, stdout: rows ? printed(rows) : '', stderr: killed + failLine })
+  })
+  test('passing verdicts print the same rows and continue', () => {
+    const rows = [row('store', 'pass'), row('joins', 'pass', { persona: 'alpha' })], r = run(rows)
+    expect({ status: r.status, stdout: r.stdout, stderr: r.stderr }).toEqual({ status: 0, stdout: `${printed(rows)}after\n`, stderr: '' })
+  })
+  test('every verdict command goes through sr8_verdicts; setup and observation commands do not', () => {
+    expect([...new Set([...t44.matchAll(/bun "\$\{SR8\}" ([a-z-]+)/g)].map(m => m[1]))].sort())
+      .toEqual(['bodies', 'burst', 'combinations', 'conditions', 'config', 'envelope-times', 'observe', 'plan', 'seed'])
+    expect([...t44.matchAll(/^\s*sr8_verdicts (seal [a-z]+|[a-z-]+) /gm)].map(m => m[1]))
+      .toEqual(['seal first', 'seal measured', 'seal measured', 'check', 'pending-post', 'shared-list'])
   })
 })
 

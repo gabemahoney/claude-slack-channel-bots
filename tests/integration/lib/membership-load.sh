@@ -133,7 +133,14 @@ build_batches() {
         fi
         text="$(scenario_text "${CASE}-${phase}-${ts}")"
         case "${phase}" in
-            roots) body="$(slack_mention_event "${channel}" "${mention_text}${text}" "${ts}" "${sender}")" ;;
+            # Open intake uses the paired message; app_mention is ignored.
+            roots)
+                if [[ "${MODE}" == open ]]; then
+                    body="$(slack_message_event "${channel}" "${mention_text}${text}" "${ts}" "${sender}")"
+                else
+                    body="$(slack_mention_event "${channel}" "${mention_text}${text}" "${ts}" "${sender}")"
+                fi
+                ;;
             replies) body="$(slack_reply_event "${channel}" "${root}" "${text}" "${ts}" "${sender}" "${HUMAN}")" ;;
             dropped) body="$(slack_message_event "${channel}" "${text}" "${ts}" "${sender}")" ;;
             *) fail 'unknown plan phase' ;;

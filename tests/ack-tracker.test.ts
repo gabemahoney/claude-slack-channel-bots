@@ -182,6 +182,20 @@ describe('forgetPersonaAcks — per-persona forget at teardown', () => {
 })
 
 describe('pruning expired entries', () => {
+  test('a burst does not iterate tracking maps before any entry can expire', () => {
+    const iterator = Map.prototype[Symbol.iterator]
+    let visited = 0
+    const walking = spyOn(Map.prototype, Symbol.iterator).mockImplementation(function* (this: Map<unknown, unknown>): Generator<[unknown, unknown], undefined> {
+      for (const pair of iterator.call(this)) { visited++; yield pair }
+      return undefined
+    })
+    try {
+      for (let i = 0; i < 64; i++) trackAck('A', 'C_TEST', String(i))
+      for (let i = 0; i < 64; i++) expect(consumeAck('A', 'C_TEST', String(i))).toBe(true)
+    } finally { walking.mockRestore() }
+    expect(visited).toBe(0)
+  })
+
   test('entries older than 30 days are pruned on the next trackAck call', () => {
     const thirtyOneDaysMs = 31 * 24 * 60 * 60 * 1000
 
@@ -204,6 +218,28 @@ describe('pruning expired entries', () => {
       // Restore system time so other tests aren't affected
       jest.setSystemTime()
     }
+  })
+
+  test('an expired entry busy in Slack is reconsidered after its tail settles', async () => {
+    const at = Date.now(), days = 31 * 24 * 60 * 60 * 1000
+    let release!: () => void, entered!: () => void, didRemove!: () => void, removed = 0
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const reached = new Promise<void>(resolve => { entered = resolve })
+    const removal = new Promise<void>(resolve => { didRemove = resolve })
+    try {
+      jest.setSystemTime(at)
+      const pending = addDeliveryAck('A', 'C_TEST', 'busy', async () => { entered(); await gate }, async () => { removed++; didRemove() })
+      await reached
+      jest.setSystemTime(at + days)
+      trackAck('B', 'C_TEST', 'trigger')
+      expect(removed).toBe(0)
+      release(); await pending
+      trackAck('B', 'C_TEST', 'trigger-again')
+      expect(consumeAck('A', 'C_TEST', 'busy')).toBe(false)
+      await removal
+      expect(removed).toBe(1)
+      expect(consumeAck('B', 'C_TEST', 'trigger')).toBe(true)
+    } finally { release(); jest.setSystemTime() }
   })
 })
 

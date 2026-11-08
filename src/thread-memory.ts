@@ -400,12 +400,17 @@ type KeptIntent = Omit<ThreadPostIntent, 'v' | 'seq' | 'digest'> & { digest?: st
 /** Reporting provenance stays in memory; journal records never carry it. */
 type KeptRecord = (({ kind: 'join' } & ThreadJoin) | KeptIntent | Omit<ThreadPostOutcome, 'v' | 'seq'>) & { noticeOnly?: boolean }
 interface KeptWrite { records: KeptRecord[] }
+interface SavedChunk { records: Set<ThreadMemoryRecord>; bytes?: Buffer }
+interface SavedImage {
+  chunks: Set<SavedChunk>; owners: WeakMap<ThreadMemoryRecord, SavedChunk>; tail?: SavedChunk
+}
 interface MemoryJournal extends AppendRollback {
   readable: boolean; exists: boolean; hasRecords: boolean; live: boolean; created: boolean; failed: boolean
   header?: ThreadMemoryHeader; highWater: number; records?: ThreadMemoryRecord[]
   /** Once ordered at load, later saves only append higher record numbers.
    * Entries are immutable and removed/replaced with their saved evidence. */
   savedOrder?: Set<ThreadMemoryRecord>; savedVersion: number
+  savedImage?: SavedImage
   creationHeader?: ThreadMemoryHeader; sealSaved?: boolean
   missing?: boolean
   joinedByChannel: JoinIndex
@@ -449,6 +454,25 @@ function replaceSaved(j: MemoryJournal, before?: ThreadMemoryRecord, after?: Thr
   j.savedVersion++
   if (before) j.savedOrder?.delete(before)
   if (after) j.savedOrder?.add(after)
+  const image = j.savedImage
+  if (!image) return
+  const chunk = before && image.owners.get(before)
+  if (chunk) {
+    chunk.records.delete(before!); image.owners.delete(before!); delete chunk.bytes
+    if (!chunk.records.size) {
+      image.chunks.delete(chunk)
+      if (image.tail === chunk) delete image.tail
+    }
+  }
+  // Moving a join to the held index retains the very same saved record.
+  if (after && !image.owners.has(after)) appendToImage(image, after)
+}
+function appendToImage(image: SavedImage, record: ThreadMemoryRecord): void {
+  let chunk = image.tail
+  if (!chunk || chunk.records.size >= THREAD_MEMORY_COMPACTION_SLICE) {
+    chunk = { records: new Set() }; image.chunks.add(chunk); image.tail = chunk
+  }
+  chunk.records.add(record); image.owners.set(record, chunk); delete chunk.bytes
 }
 /** Saved records in the order a synchronous walk visits them. Publication can
  * move a saved join to the held index between slices; walking held joins
@@ -508,6 +532,30 @@ async function serializeInSlices(header: ThreadMemoryHeader, records: Iterable<T
     }
   }
   chunks.push(Buffer.from(lines.join('')))
+  return Buffer.concat(chunks)
+}
+
+/** Unique, increasing saved records have stable chunk boundaries. A rewrite
+ * still writes the complete image, but only changed chunks revisit records
+ * and encode UTF-8. Publication invalidates affected chunks between slices. */
+async function serializeSavedImage(j: MemoryJournal, header: ThreadMemoryHeader, slices: WorkSlices,
+  lineOf: (record: ThreadMemoryRecord) => string): Promise<Buffer | undefined> {
+  const version = j.savedVersion
+  let image = j.savedImage
+  if (!image) {
+    image = { chunks: new Set(), owners: new WeakMap() }
+    for (const record of j.savedOrder!) {
+      appendToImage(image, record)
+      if (slices.due() && !await slices.pause()) return undefined
+    }
+    if (version === j.savedVersion) j.savedImage = image
+  }
+  const chunks: Buffer[] = [Buffer.from(JSON.stringify(header) + '\n')]
+  for (const chunk of image.chunks) {
+    chunk.bytes ??= Buffer.from([...chunk.records].map(lineOf).join(''))
+    chunks.push(chunk.bytes)
+    if (slices.due(chunk.records.size) && !await slices.pause()) return undefined
+  }
   return Buffer.concat(chunks)
 }
 
@@ -587,9 +635,12 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     let stamps = roots.get(fact.root)
     if (!stamps) { stamps = new Map(); roots.set(fact.root, stamps) }
     const id = stampKey(fact.stamp), old = stamps.get(id)
-    const value = old ?? { join: structuredClone(fact) }
+    // All callers normalized this metadata or parsed the closed record schema.
+    // Stamp is its only nested value; preserve saved-record fields on replay.
+    const copy = () => ({ ...fact, stamp: { ...fact.stamp } })
+    const value = old ?? { join: copy() }
     if (!old) stamps.set(id, value)
-    if (fact.at < value.join.at) value.join = structuredClone(fact)
+    if (fact.at < value.join.at) value.join = copy()
     if (saved && (!value.saved || saved.at < value.saved.at)) {
       replaceSaved(j, value.saved, saved)
       value.saved = saved
@@ -670,6 +721,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   function replayIntents(j: MemoryJournal): void {
     if (j.records) {
       delete j.savedOrder
+      delete j.savedImage
       j.savedVersion++
       j.savedIntents.clear()
       for (const record of j.records) {
@@ -746,6 +798,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       }
       j.records = records; j.hasRecords = records.length > 0; j.header = header; j.highWater = highWater; j.readable = true; delete j.error
       delete j.savedOrder
+      delete j.savedImage
       j.savedVersion++
       // Expose saved times before activation: the queue compacts after this
       // read and before a shared authority is available. Replay later judges
@@ -794,7 +847,9 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
           j.savedOrder = new Set(sorted)
         }
       }
-      const bytes = ordered && await serializeInSlices(header, ordered, slices, lineOf)
+      const bytes = ordered && await (j.savedOrder
+        ? serializeSavedImage(j, header, slices, lineOf)
+        : serializeInSlices(header, ordered, slices, lineOf))
       if (!bytes || !current(key, j)) return
       await io.rewrite(pathFor(key), bytes)
       j.header = header; j.hasRecords = true

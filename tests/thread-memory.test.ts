@@ -2473,7 +2473,12 @@ describe('Thread Memory compaction in slices', () => {
   test('successive saves and compactions serialize only new records and do not sort the saved population again', async () => {
     const { h, header, records } = await large('alternate')
     await h.memory.compact('alpha')
-    let serialized = 0, sorted = 0
+    let serialized = 0, sorted = 0, encoded = 0
+    const from = Buffer.from
+    const buffers = spyOn(Buffer, 'from').mockImplementation(((...args: Parameters<typeof from>) => {
+      if (typeof args[0] === 'string') encoded += args[0].split('"kind":"join"').length - 1
+      return (from as Function)(...args)
+    }) as typeof from)
     const stringify = JSON.stringify, sort = Array.prototype.sort
     const encoding = spyOn(JSON, 'stringify').mockImplementation(((...args: Parameters<typeof stringify>) => {
       if (args[0]?.kind === 'join') serialized++
@@ -2489,13 +2494,35 @@ describe('Thread Memory compaction in slices', () => {
         expect(await h.memory.saveJoins('alpha', [fact])).toEqual({ kind: 'saved' })
         await h.memory.compact('alpha')
       }
-    } finally { encoding.mockRestore(); sorting.mockRestore() }
+    } finally { encoding.mockRestore(); sorting.mockRestore(); buffers.mockRestore() }
     expect({ serialized, sorted }).toEqual({ serialized: 4, sorted: 0 })
+    // Four appends plus the changed tail chunks (2, 3, 4, 5 records).
+    // Full unchanged chunks must not be walked/joined/UTF-8 encoded again.
+    expect(encoded).toBe(18)
     const written = readThreads(h.stateDir)
     expect(written.slice(1, records.length + 1)).toEqual(records)
     expect(written).toHaveLength(records.length + 5)
     expectSynchronousImage(h, header, written.slice(1))
     expect(h.events.filter(e => e.type === 'compaction-failed')).toEqual([])
+  })
+
+  test('new and earlier joins copy normalized facts without per-join structuredClone, retaining caller isolation', async () => {
+    const h = fixture(); await h.start()
+    const fact = h.fact(), original = structuredClone(fact)
+    const copying = spyOn(globalThis, 'structuredClone')
+    let calls: number
+    try {
+      expect(h.memory.addJoin('alpha', fact)).toBe(true)
+      fact.stamp.incarnation = 'caller changed'; fact.root = rootOf(999)
+      expect(h.memory.addJoin('alpha', { ...original, at: original.at - 1 })).toBe(true)
+      expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+      calls = copying.mock.calls.length
+    } finally { copying.mockRestore() }
+    expect(calls!).toBe(0)
+    expect(h.memory.joins('alpha')).toEqual([{ join: { ...original, at: original.at - 1 }, savedAt: original.at - 1 }])
+    expect(savedJoins(h).map(({ v, kind, seq, ...join }) => join)).toEqual([
+      original, { ...original, at: original.at - 1 },
+    ])
   })
 
   test('a cached image replaces earlier saved times only after append durability and drops resolved intents and unnamed held joins', async () => {
@@ -2573,10 +2600,11 @@ describe('Thread Memory compaction in slices', () => {
     expect(h.events.filter(e => e.type === 'compaction-failed')).toEqual([])
   })
 
-  test('a saved join that publication moves to the held index during a yield is written exactly once', async () => {
+  test.each([false, true])('a saved join that publication moves to the held index during a yield is written exactly once (cached=%s)', async cached => {
     let held: ThreadJoin[] = [], checks = 0
     const { h, facts, header, records } = await large('one-primary', {
       heldStamps: key => key === 'alpha' ? held : [], canRun: () => { checks++; return true } })
+    if (cached) await h.memory.compact('alpha')
     const moved = facts[0]!
     held = [moved]; checks = 0; h.io.reset()
     let atYield: { started: boolean; rewriting: boolean } | undefined

@@ -148,7 +148,13 @@ export function createDurableJournal(options: DurableJournalOptions) {
         fs.ftruncateSync(fd, rollback.pendingRollback); yield { op: 'fsync', fd, target: 'file' }
         original = rollback.pendingRollback; delete rollback.pendingRollback
       }
-      if (original > 0) { const last = Buffer.alloc(1); fs.readSync(fd, last, 0, 1, original - 1); if (last[0] !== 10) writeAll(fd, Buffer.from('\n')) }
+      if (original > 0) {
+        // Metadata can stay unchanged across a same-size external edit. Check
+        // the actual tail on every append, using the descriptor already open.
+        const last = Buffer.alloc(1)
+        fs.readSync(fd, last, 0, 1, original - 1)
+        if (last[0] !== 10) writeAll(fd, Buffer.from('\n'))
+      }
       writeAll(fd, bytes)
       yield { op: 'fsync', fd, target: 'file' }
       // Always sync: a previous failed first append may have left an unsynced directory entry.

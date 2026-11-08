@@ -25,6 +25,7 @@ function recordingFs() {
   const control = {
     maxChunk: Infinity,
     stat: undefined as fs.Stats | undefined,
+    fileStat: undefined as fs.Stats | undefined,
     fail: (_op: Op): boolean => false,
     before: (_op: Op): void => {},
     /** A callback `sync` or `rename` waits for the returned promise. */
@@ -43,6 +44,7 @@ function recordingFs() {
   const base = { ...fs,
     mkdirSync(p: fs.PathLike, options: fs.MakeDirectoryOptions) { record({ step: 'mkdir', path: String(p), mode: options.mode }); return fs.mkdirSync(p, options) },
     statSync(p: fs.PathLike) { record({ step: 'stat', path: String(p) }); return control.stat ?? fs.statSync(p) },
+    fstatSync(fd: number) { record({ step: 'fstat', path: fdPath(fd) }); return control.fileStat ?? fs.fstatSync(fd) },
     chmodSync(p: fs.PathLike, mode: fs.Mode) { record({ step: 'chmod', path: String(p), mode }); fs.chmodSync(p, mode) },
     openSync(p: fs.PathLike, flags: fs.OpenMode, mode?: fs.Mode) {
       record({ step: 'open', path: String(p), flags, mode })
@@ -56,6 +58,9 @@ function recordingFs() {
       record({ step: 'write', path: fdPath(fd), length })
       if (control.maxChunk <= 0) return control.maxChunk
       return fs.writeSync(fd, bytes, offset, Math.min(length, control.maxChunk))
+    },
+    readSync(fd: number, bytes: Uint8Array, offset: number, length: number, position: number) {
+      record({ step: 'read', path: fdPath(fd), length }); return fs.readSync(fd, bytes, offset, length, position)
     },
     fchmodSync(fd: number, mode: fs.Mode) { record({ step: 'fchmod', path: fdPath(fd), mode }); fs.fchmodSync(fd, mode) },
     ftruncateSync(fd: number, length = 0) { record({ step: 'truncate', path: fdPath(fd), length }); fs.ftruncateSync(fd, length) },
@@ -220,6 +225,104 @@ describe('directory durability and modes', () => {
 })
 
 describe('append and rollback', () => {
+  test.each(['async', 'sync'] as const)('%s appends separate and replay records after a same-size tail edit with unchanged metadata', async form => {
+    const r = recordingFs(), j = journal(r.fs)
+    const append = (text: string) => form === 'async' ? j.durableAppend(path, Buffer.from(text)) : j.durableAppendSync(path, Buffer.from(text))
+    await append('{"a":1}\n')
+    // Model coarse inode timestamps: every field compared by the old tail
+    // cache stays unchanged, even though a real write replaces the newline.
+    const version = fs.statSync(path)
+    r.control.fileStat = version
+    const fd = fs.openSync(path, 'r+')
+    try { fs.writeSync(fd, Buffer.from(' '), 0, 1, version.size - 1) } finally { fs.closeSync(fd) }
+    expect(fs.statSync(path).size).toBe(version.size)
+    expect(read()).toEqual(Buffer.from('{"a":1} '))
+
+    await append('{"b":2}\n')
+    const bytes = read(), lines = splitJournalLines(bytes)
+    // Check replay independently of the byte assertion so a merged record is
+    // reported as a parse failure too, not just a formatting difference.
+    expect(() => lines.map(line => JSON.parse(line.text))).not.toThrow()
+    expect(bytes).toEqual(Buffer.from('{"a":1} \n{"b":2}\n'))
+    expect(lines.every(line => line.whole && !line.torn)).toBe(true)
+    expect(lines.map(line => JSON.parse(line.text))).toEqual([{ a: 1 }, { b: 2 }])
+    expect(r.paths.size).toBe(0)
+  })
+
+  test('appends read the repaired tail after failed append/rollback, explicit repair, and rewrite', async () => {
+    const r = recordingFs(), j = journal(r.fs), rollback: AppendRollback = {}
+    await j.durableAppend(path, Buffer.from('saved\n'), rollback)
+    r.control.fail = op => op.path === path && (op.step === 'sync' || op.step === 'truncate')
+    await expect(j.durableAppend(path, Buffer.from('unaccepted'), rollback)).rejects.toThrow()
+    expect(rollback.pendingRollback).toBe(6)
+    r.control.fail = () => false
+    await j.reconcileRollback(path, rollback)
+    await j.durableAppend(path, Buffer.from('retry\n'), rollback)
+    expect(read()).toEqual(Buffer.from('saved\nretry\n'))
+    expect(r.ops.filter(op => op.step === 'read')).toHaveLength(2)
+    await j.rewrite(path, Buffer.from('replacement'))
+    await j.durableAppend(path, Buffer.from('next\n'), rollback)
+    expect(read()).toEqual(Buffer.from('replacement\nnext\n'))
+    expect(r.ops.filter(op => op.step === 'read')).toHaveLength(3)
+    expect(rollback.pendingRollback).toBeUndefined()
+  })
+
+  test('appends check the on-disk tail after an edit or caller buffer mutation during file sync', async () => {
+    const r = recordingFs(), j = journal(r.fs), gate = heldStep()
+    await j.durableAppend(path, Buffer.from('saved\n'))
+    r.control.hold = op => op.path === path && op.step === 'sync' ? gate.promise : undefined
+    const bytes = Buffer.from('next\n'), pending = j.durableAppend(path, bytes)
+    await yieldToEventLoop()
+    expect(r.io.held()).toBe(1)
+    bytes[bytes.length - 1] = 88
+    gate.release(); await pending
+    r.control.hold = () => undefined
+    await j.durableAppend(path, Buffer.from('last\n'))
+    expect(read()).toEqual(Buffer.from('saved\nnext\nlast\n'))
+    expect(r.ops.filter(op => op.step === 'read')).toHaveLength(2)
+
+    const edit = heldStep()
+    r.control.hold = op => op.path === path && op.step === 'sync' ? edit.promise : undefined
+    const edited = j.durableAppend(path, Buffer.from('edit\n'))
+    await yieldToEventLoop()
+    expect(r.io.held()).toBe(1)
+    const external = read(); external[external.length - 1] = 88
+    fs.writeFileSync(path, external); fs.utimesSync(path, 1, 1)
+    edit.release(); await edited
+    r.control.hold = () => undefined
+    await j.durableAppend(path, Buffer.from('after\n'))
+    expect(read()).toEqual(Buffer.from('saved\nnext\nlast\neditX\nafter\n'))
+    expect(r.ops.filter(op => op.step === 'read')).toHaveLength(4)
+  })
+
+  test.each(['async', 'sync'] as const)('%s appends check each tail through the append descriptor and preserve external changes', async form => {
+    const r = recordingFs(), j = journal(r.fs)
+    const append = (text = 'new\n') => form === 'async' ? j.durableAppend(path, Buffer.from(text)) : j.durableAppendSync(path, Buffer.from(text))
+    const reads = () => r.ops.filter(op => op.step === 'read').length
+    seed('old')
+    for (let i = 0; i < 8; i++) await append()
+    expect(read()).toEqual(Buffer.from('old\n' + 'new\n'.repeat(8)))
+    expect(reads()).toBe(8)
+    expect(r.ops.filter(op => op.step === 'read').map(op => op.length)).toEqual(Array(8).fill(1))
+    expect(r.ops.filter(op => op.step === 'open' && op.path === path).map(op => op.flags)).toEqual(Array(8).fill('a+'))
+    expect(r.ops.filter(op => op.step === 'fstat')).toHaveLength(8)
+    fs.appendFileSync(path, 'external')
+    await append(); expect(reads()).toBe(9)
+    expect(read().subarray(-13)).toEqual(Buffer.from('external\nnew\n'))
+    // A same-size edit still needs a separating newline.
+    const bytes = read(); bytes[bytes.length - 1] = 88
+    fs.writeFileSync(path, bytes); fs.utimesSync(path, 1, 1)
+    await append(); expect(reads()).toBe(10)
+    expect(read().subarray(-9)).toEqual(Buffer.from('newX\nnew\n'))
+    fs.renameSync(path, join(dir, 'old.jsonl')); seed('replacement')
+    await append(); expect(reads()).toBe(11)
+    expect(read()).toEqual(Buffer.from('replacement\nnew\n'))
+    await append('unterminated'); await append('')
+    expect(read()).toEqual(Buffer.from('replacement\nnew\nunterminated\n'))
+    expect(reads()).toBe(13)
+    expect(r.paths.size).toBe(0)
+  })
+
   test.each(['', 'old\n', 'old'])('short writes append exact bytes after %j, with file then directory sync', async old => {
     const r = recordingFs(), j = journal(r.fs), bytes = Buffer.from('new é🙂\n')
     seed(old); r.control.maxChunk = 2

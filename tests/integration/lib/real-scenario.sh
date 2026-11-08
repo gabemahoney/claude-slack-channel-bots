@@ -335,7 +335,12 @@ real_thread_workload() {
     local n ts sender text args delivery
     REAL_THREAD_ROOT="$(scenario_ts)"
     text="$(scenario_mention_text "${REAL_BOT_USER_ID}" "$(scenario_text thread-root)")"
-    slack_mention_event "${REAL_CHANNEL}" "${text}" "${REAL_THREAD_ROOT}" > "${REAL_THREAD_EVIDENCE}/root.json"
+    # Open intake uses the paired message; app_mention is ignored.
+    if [[ "${REAL_THREAD_MODE}" == open ]]; then
+        slack_message_event "${REAL_CHANNEL}" "${text}" "${REAL_THREAD_ROOT}" > "${REAL_THREAD_EVIDENCE}/root.json"
+    else
+        slack_mention_event "${REAL_CHANNEL}" "${text}" "${REAL_THREAD_ROOT}" > "${REAL_THREAD_EVIDENCE}/root.json"
+    fi
     REAL_THREAD_SAMPLES=()
     REAL_THREAD_DELAYED_USER="$(scenario_id U "thread-${REAL_THREAD_MODE}-delayed-sender")"
     REAL_THREAD_HUNG_USER="$(scenario_id U "thread-${REAL_THREAD_MODE}-hung-sender")"
