@@ -2040,6 +2040,32 @@ process.exit(exit ?? status)\n`,
   })
 })
 
+describe('test-44 pending probe lookup over burst.jsonl (stub shell)', () => {
+  // The script's own probe loop and scenario.sh's fail, over a ledger whose
+  // probes lead the second wave, so later replies follow every probe row.
+  const loop = block(source('test-44-fmk-thread-burst.sh'), '        : > "${EVIDENCE}/probes.tsv"\n', '        for persona in "${KEYS[@]}"; do snapshot')
+  const plan = [['other', 'C1', '1.000002'], ['bot', 'C1', '1.000003']]
+  const item = (phase: string, ts: string, envelope_id: string) => ({ key: 'alpha', phase, channel: 'C1', ts, sender: 'U1', envelope_id })
+  const run = (ledger: unknown[]) => shell([
+    declaration(scenario, 'fail'), 'TEST_NAME=test-44-fmk-thread-burst EVIDENCE="$HOME" RESULTS="$HOME"', loop, 'cat "${EVIDENCE}/probes.tsv"',
+  ].join('\n'), { 'probe-plan.tsv': plan.map(row => `${row.join('\t')}\n`).join(''), 'burst.jsonl': jsonl(ledger) })
+  test('each probe resolves to its one envelope when other rows follow it', () => {
+    const r = run([item('roots', '1.000001', 'e-root'), item('probes', '1.000002', 'e-other'), item('probes', '1.000003', 'e-bot'),
+      item('replies', '1.000004', 'e-reply')])
+    expect({ status: r.status, stdout: r.stdout, stderr: r.stderr })
+      .toEqual({ status: 0, stdout: 'other\tC1\t1.000002\te-other\nbot\tC1\t1.000003\te-bot\n', stderr: '' })
+  })
+  test.each<[string, unknown[], string]>([
+    ['no probe row', [item('probes', '1.000002', 'e-other'), item('replies', '1.000003', 'e-reply')], 'bot probe 1.000003'],
+    ['a duplicate probe row', [item('probes', '1.000002', 'e-other'), item('probes', '1.000002', 'e-again'), item('probes', '1.000003', 'e-bot')], 'other probe 1.000002'],
+    ['a probe row without an envelope', [item('probes', '1.000002', ''), item('probes', '1.000003', 'e-bot')], 'other probe 1.000002'],
+  ])('%s is a FAIL line, not a bare exit', (_name, ledger, named) => {
+    const r = run(ledger)
+    expect({ status: r.status, stdout: r.stdout, failLine: r.stderr.split('\n').at(-2) })
+      .toEqual({ status: 1, stdout: '', failLine: `FAIL: test-44-fmk-thread-burst: pending ${named} has no unique burst envelope` })
+  })
+})
+
 describe('test-44 latency observation collectors (synthetic rows, no runtime claim)', () => {
   const v2 = 'usage_usec 5000\nuser_usec 3000\nsystem_usec 2000\nnr_periods 10\nnr_throttled 2\nthrottled_usec 300\nnr_bursts 0\n'
   const procStat = (utime: number, stime: number) => `4242 (bun (x) y) S 1 4242 4242 0 -1 4194304 10 0 0 0 ${utime} ${stime} 0 0 20 0 9 0 100 0 0\n`

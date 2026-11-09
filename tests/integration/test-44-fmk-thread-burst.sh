@@ -387,7 +387,10 @@ case "${CASE}" in
         bun "${SR8}" envelope-times "${RESULTS}/envelopes" "${RESULTS}/final-stub.jsonl" > "${RESULTS}/times.jsonl"
         : > "${EVIDENCE}/probes.tsv"
         while IFS=$'\t' read -r parent channel ts; do
-            envelope="$(jq -er --arg ts "${ts}" 'select(.phase=="probes" and .ts==$ts) | .envelope_id' "${RESULTS}/burst.jsonl")"
+            # Slurp: jq 1.6's -e reports only the last JSONL line, which is rarely the probe.
+            envelope="$(jq -ser --arg ts "${ts}" '[.[] | select(.phase=="probes" and .ts==$ts) | .envelope_id]
+                | if length==1 and (.[0]|type)=="string" and (.[0]|length)>0 then .[0] else error("missing or ambiguous") end' \
+                "${RESULTS}/burst.jsonl")" || fail "pending ${parent} probe ${ts} has no unique burst envelope"
             printf '%s\t%s\t%s\t%s\n' "${parent}" "${channel}" "${ts}" "${envelope}" >> "${EVIDENCE}/probes.tsv"
         done < "${EVIDENCE}/probe-plan.tsv"
         for persona in "${KEYS[@]}"; do snapshot "${persona}" "${RESULTS}/${persona}.queue.jsonl"; done
