@@ -13,7 +13,7 @@ import { test29ClosingFixture, test29EvidencePrinter, test29PrinterFixture, test
 import { TEST29_ROOT, test29RestartFixture, test29CompactionFixture, test29DiagnosticFixture, test29WatchdogFixture, test29DiagnosticExpectedItem } from './test-helpers/test29-queue.ts'
 import { percentile } from './integration/fixtures/transcript-receipts.ts'
 import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVerdict, storeVerdict, postHoldVerdict,
-  n4Verdict, n2Verdict, n2Samples, sealVerdict, requireSeedPopulation, startupVerdict, compactionVerdict, joinsVerdict,
+  n4Verdict, n2Verdict, n2Samples, sealVerdict, requireSeedPopulation, startupVerdict, compactionVerdict, storeWindow, faultWindow, faultRewriters, joinsVerdict,
   windowsVerdict, resultLine, summary, evidenceExit, printResults, type Measurement, type Times, type Result,
   SR8_PENDING_POST_MS, SR8_LARGE_BYTES, SR8_SHARED_CHANNELS, pendingPostVerdicts, sharedListVerdicts,
   scanDiagnostics, membershipFaultVerdicts, membershipFaultRows, cpuThrottle, cpuConditionFields, membershipRepairVerdict, membershipLateVerdict, zeroAckVerdict,
@@ -24,7 +24,7 @@ import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVer
   SR8_DIAGNOSTIC_KINDS, SR8_USER_HZ, cgroupCpuCounters, procCpuTicks, phasePids, phaseCpuSample, phaseCpuResults, ackClockSamples, ackClockResults,
   ackBinResults, ackEventResults, serverWaves, serverPhase, appendResults, saveResults, observeResults, type PhaseCpuSample, type ClockSample,
 } from './integration/fixtures/sr8-evidence.ts'
-import { serializeTestMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement,
+import { serializeTestMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, threadCompactionMeasurement,
   type TestMeasurement, type TestMeasurementRecord } from '../src/test-measurements.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
 import { THREAD_REPLY_HOLD_MS, DELIVERY_MAX_AD_CALLS_PER_S } from '../src/delivery-constants.ts'
@@ -96,11 +96,18 @@ function shell(program: string, files: Record<string, string> = {}) {
 const jsonl = (rows: unknown[]) => rows.map(row => JSON.stringify(row)).join('\n') + '\n'
 /** A measurement line exactly as the server's recorder serializes it. */
 const serverLine = (entry: TestMeasurement, at: number) => serializeTestMeasurement({ ...entry, v: 1, at_mono_ms: at } as TestMeasurementRecord)
+/** A completed Thread Memory compaction as the server writes it; `at_mono_ms` is its end. */
+const compactionLine = (key: string, startMonoMs: number, endMonoMs: number, outcome: 'rewritten' | 'skipped') =>
+  serverLine(threadCompactionMeasurement({ key, startMonoMs, endMonoMs, outcome }), endMonoMs)
+/** That line as the verdicts read it back. */
+const compactionRow = (key: string, startMonoMs: number, endMonoMs: number, outcome: 'rewritten' | 'skipped'): Measurement =>
+  JSON.parse(compactionLine(key, startMonoMs, endMonoMs, outcome))
 const serverRows = {
   ack: serverLine(ackTimingMeasurement({ keys: ['alpha'], ts: '1700000000.000001', targets: [{ key: 'alpha', seq: 1 }], outcome: 'acked', receiveToAckMs: 4, ackCallMs: 1, atMonoMs: 9 }), 9),
   append: serverLine(durableAppendMeasurement({ dir: '/s/queue', path: '/s/queue/alpha.jsonl', records: 2, bytes: 10, appendMs: 3,
     fileFsyncMs: 2, dirFsyncMs: 1, fsyncs: 2, atMonoMs: 9 }, '/s')!, 9),
   save: serverLine(threadSaveMeasurement({ key: 'alpha', records: 1, joins: 1, intents: 0, outcomes: 0 }), 9),
+  compaction: compactionLine('alpha', 3, 9, 'rewritten'),
 }
 /** A full SR-8.2 burst ledger and stub record, in burst's order, with the
  * pending-post probes leading the second wave. Stub seqs start after mark 10. */
@@ -1713,7 +1720,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       'e/alpha.queue.jsonl': jsonl([{ kind: 'accepted', channel, ts: '1', seq: 1 }]), 'e/beta.queue.jsonl': jsonl([{ kind: 'accepted', channel, ts: '2', seq: 2 }]) })
     expect(child.status).toBe(1); expect(child.stdout).toContain('persona=1 limit=50 verdict=pass'); expect(child.stdout).toContain('persona=2 limit=50 verdict=fail')
   })
-  test('the measurement reader skips only the server diagnostic kinds; every verdict is unchanged by them', () => {
+  test('the measurement reader skips only the server diagnostic kinds and keeps thread-compaction for the compaction proof; every other verdict is unchanged by them', () => {
     const items = [{ key, phase: 'roots', channel, ts: '1' }, { key: 'beta', phase: 'roots', channel, ts: '2' }]
     const queues = { 'e/alpha.queue.jsonl': jsonl([{ kind: 'accepted', channel, ts: '1', seq: 1 }]), 'e/beta.queue.jsonl': jsonl([{ kind: 'accepted', channel, ts: '2', seq: 2 }]) }
     const rows = [measure(1), measure(2, 'accepted', SR8_STORE_LIMIT_MS, 'beta')]
@@ -1722,9 +1729,40 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     // One row of each kind as the server's own serializer writes it.
     const diagnostic = [serverRows.ack, serverRows.append, serverRows.save].map(l => JSON.parse(l))
     expect(diagnostic.map(r => r.kind)).toEqual([...SR8_DIAGNOSTIC_KINDS])
-    expect({ status: run(diagnostic).status, stdout: run(diagnostic).stdout }).toEqual({ status: plain.status, stdout: plain.stdout })
+    const all = run([...diagnostic, JSON.parse(serverRows.compaction)])
+    expect({ status: all.status, stdout: all.stdout }).toEqual({ status: plain.status, stdout: plain.stdout })
     const unknown = run([{ v: 1, kind: 'unreviewed', key, at_mono_ms: 1 }])
     expect(unknown.status).toBe(1); expect(unknown.stdout.split('\n').filter(l => l.includes(' store ')).every(l => l.endsWith('verdict=missing'))).toBe(true)
+  })
+  test('CLI check proves each recipient\'s Thread Memory compaction from its measurement file, inside the burst\'s server-clock store span only', () => {
+    const keys = sr8Personas(2), [alpha, beta] = keys as [string, string], { ledger } = pendingBurst(keys, channel, [])
+    const accepted = ledger.filter(i => i.phase !== 'dropped')
+    // Server clock: the burst's 4,000 acceptance stores span 1000..5000. The stub's
+    // push/ACK clock starts at 9,000,000 and the harness's start/ready at 0.
+    const stores = accepted.map((i, n) => serverLine({ kind: 'store', key: i.key, seq: n + 1, store: 'accepted', store_ms: 1, at_mono_ms: 1001 + n }, 1001 + n))
+    const files: Record<string, string> = { 'e/burst.jsonl': jsonl(ledger),
+      'e/times.jsonl': jsonl(ledger.map((i, n) => ({ envelope_id: i.envelope_id, push: { sent_mono_ms: 9_000_000 + n, connection_id: 'socket' },
+        acks: [{ ack_mono_ms: 9_000_001 + n, connection_id: 'socket' }] }))),
+      'e/compactions.jsonl': jsonl(keys.map(k => ({ key: k, kind: 'queue', before: '1:1', after: '1:2', inside: true }))) }
+    for (const k of keys) files[`e/${k}.queue.jsonl`] = jsonl(accepted.flatMap((i, n) => i.key === k ? [{ kind: 'accepted', channel: i.channel, ts: i.ts, seq: n + 1 }] : []))
+    const run = (measured: string[], mark = 0) => {
+      const out = cli('check', ['@/e', '@/measurements', String(mark), '0', '1'], { ...files, measurements: measured.map(l => `${l}\n`).join('') }).stdout.trim().split('\n')
+      return { compaction: out.filter(l => l.startsWith('recorded: sr8 compaction ')),
+        others: out.filter(l => !l.startsWith('recorded: sr8 compaction ') && !l.startsWith('recorded: sr8 summary ')) }
+    }
+    const line = (stats: string, verdict: string) => [`recorded: sr8 compaction scenario=test-cli mode=strict population=100000 recipients=2 ${stats} limit=inside-burst verdict=${verdict}`]
+    const startup = keys.map(k => compactionLine(k, 10, 900, 'rewritten')), alphaRewrite = compactionLine(alpha, 1500, 1600, 'rewritten')
+    const skips = [compactionLine(alpha, 2000, 2100, 'skipped'), compactionLine(beta, 3000, 3100, 'skipped')]
+    const plain = run(stores), pass = run([...startup, ...stores, alphaRewrite, ...skips, compactionLine(beta, 4000, 4999, 'rewritten')])
+    expect(plain.compaction).toEqual(line('samples=2 required=4 queue=2 threads=0 rewritten=0 skipped=0 outside=0 window_ms=4000', 'missing'))
+    expect(pass.compaction).toEqual(line('samples=4 required=4 queue=2 threads=2 rewritten=2 skipped=2 outside=2 window_ms=4000', 'pass'))
+    expect(pass.others).toEqual(plain.others)
+    // beta's rewrite inside the stub's push-to-ACK span is outside the server's: beta only skipped.
+    expect(run([...startup, ...stores, alphaRewrite, ...skips, compactionLine(beta, 9_000_100, 9_000_200, 'rewritten')]).compaction)
+      .toEqual(line('samples=3 required=4 queue=2 threads=1 rewritten=1 skipped=2 outside=3 window_ms=4000', 'fail'))
+    // Entries before the byte mark are not read: alpha's rewrite precedes it.
+    expect(run([alphaRewrite, ...stores, ...skips, compactionLine(beta, 4000, 4999, 'rewritten')], alphaRewrite.length + 1).compaction)
+      .toEqual(line('samples=3 required=4 queue=2 threads=1 rewritten=1 skipped=2 outside=0 window_ms=4000', 'fail'))
   })
   test('CLI seal passes the printer lost-join marker into the measured verdict', () => {
     const child = cli('seal', ['@/log', '0', '@/config'], { log: THREAD_MEMORY_JOINS_LOST + ' ' + token,
@@ -2349,6 +2387,28 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
     expect(rows.filter(r => r.measure === 'store')).toHaveLength(3)
     assertNoLeak(rows)
   })
+  // answers28: only personas with stored burst items in Q's window must rewrite there.
+  test.each([['a P with independent items must rewrite in it', false], ['a P with every item withheld (all) is proved by a skip', true]] as const)
+  ('the compaction window is Q\'s original store span, never P\'s items or recovery replays; %s', (_name, all) => {
+    const e = composed(all), [p, q] = e.plan.keys as [string, string]
+    expect(e.plan.all).toBe(all); expect(faultRewriters(e.plan)).toEqual(all ? [q] : [p, q])
+    // Q's held probe's store starts the span at 99 and its others end it at 1000; P's stores, replays' included, come later.
+    for (const r of e.rows!) if (r.key === p) r.at_mono_ms = 200_000
+    expect(faultWindow(e)).toEqual({ start: 99, end: 1000 })
+    const verdict = (entries: Measurement[]) => compactionVerdict(e.plan.keys.map(key => ({ key, kind: 'queue', before: '1:1', after: '1:2', inside: true })),
+      [...e.rows!, ...entries], faultWindow(e), e.plan.keys, true, faultRewriters(e.plan)).verdict
+    const qEntries = [compactionRow(q, 99, 150, 'skipped'), compactionRow(q, 900, 1000, 'rewritten')]
+    expect(verdict([compactionRow(p, 200, 300, 'rewritten'), ...qEntries])).toBe('pass')
+    // P's rewrite after Q's last store, among P's own later stores, is outside Q's burst: P only skipped inside it.
+    expect(verdict([compactionRow(p, 1500, 199_000, 'rewritten'), compactionRow(p, 200, 300, 'skipped'), ...qEntries])).toBe(all ? 'pass' : 'fail')
+    // P still needs an in-span entry, and Q always a rewrite.
+    expect(verdict([compactionRow(p, 1500, 199_000, 'rewritten'), ...qEntries])).toBe('missing')
+    expect(verdict([compactionRow(p, 200, 300, 'rewritten'), compactionRow(q, 99, 150, 'skipped')])).toBe('fail')
+    // Without one of Q's acceptances or its store there is no window.
+    const reply = e.plan.items.find(i => i.key === q && i.phase === 'replies')!
+    expect(faultWindow({ ...e, rows: e.rows!.filter(r => !(r.key === q && r.seq === reply.ordinal + 1)) })).toBeUndefined()
+    expect(faultWindow({ ...e, queues: { ...e.queues, [q]: e.queues[q]!.filter(a => a.ts !== reply.ts) } })).toBeUndefined()
+  })
   test.each(['never-replayed', 'stored-twice', 'late-replay', 'late-q', 'nondependent-p-withheld', 'stored-while-withheld', 'no-overlap',
     'q-root-missing', 'unlisted-envelope', 'q-store-slow', 'q-drop-slow', 'dependency-changed', 'held-unresolved', 'original-ack-after-clear'] as const)
   ('fault-aware composition rejects %s', defect => {
@@ -2562,7 +2622,7 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
       }
     } finally { await q.stop(); rmSync(root, { recursive: true, force: true }) }
   })
-  async function withCLI(body: (root: string, cli: (command: string, args: string[]) => ReturnType<typeof spawnSync>) => void | Promise<void>, prefix = '') {
+  async function withCLI(body: (root: string, cli: (command: string, args: string[], population?: number) => ReturnType<typeof spawnSync>) => void | Promise<void>, prefix = '') {
     const root = mkdtempSync(join(tmpdir(), 'sr8-cli-'))
     try {
       const dir = join(root, 'tests/integration/fixtures'), marker = join(root, 'image')
@@ -2571,9 +2631,9 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
       writeFileSync(join(dir, 'transcript-receipts.ts'), source('fixtures/transcript-receipts.ts'))
       writeFileSync(join(root, 'tests/test-helpers/thread-populations.ts'), readFileSync(join(import.meta.dir, 'test-helpers/thread-populations.ts')))
       writeFileSync(join(dir, 'fmk-texts.ts'), `import {readFileSync} from 'node:fs'; if(process.argv[2]==='sharedQueueSnapshot') console.log(readFileSync(process.argv[3],'utf8')); else console.log(${JSON.stringify({ THREAD_REPLY_HOLD_MS, DELIVERY_MAX_AD_CALLS_PER_S, NAME_LOOKUP_TIMEOUT_MS })}[process.argv[2]]);`)
-      const cli = (command: string, args: string[]) => {
+      const cli = (command: string, args: string[], population = 0) => {
         const child = spawnSync(process.execPath, [join(dir, 'sr8-evidence.ts'), command,
-          ...(['envelope-times', 'combinations'].includes(command) ? [] : ['test-fault', 'strict', '0', '2']), ...args],
+          ...(['envelope-times', 'combinations'].includes(command) ? [] : ['test-fault', 'strict', String(population), '2']), ...args],
           // observe prints one line per burst event: a full workload exceeds the default 1 MiB.
           { env: hostSafeChildEnv(root, { extras: { SCENARIO_ROOT: root } }), encoding: 'utf8', timeout: 3000, maxBuffer: 16 * 1024 * 1024 })
         expect(child.error).toBeUndefined(); expect(child.signal).toBeNull(); assertNoLeak({ stdout: child.stdout, stderr: child.stderr })
@@ -2596,8 +2656,10 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
       const accepted = snapshot.trim().split('\n').map(l => JSON.parse(l)).filter(r => r.kind === 'accepted' && !r.compact)
       expect(accepted).toHaveLength(samples.length)
       expect(accepted.every(r => r.source === 'slack' && typeof r.user === 'string' && !Object.hasOwn(r, 'sender'))).toBe(true)
+      // test-32's file also holds the server's thread-compaction lines; n4 reads past them.
       writeFileSync(join(root, 'measurements'), lines([
         { v: 1, kind: 'store', store: 'accepted', key, seq: accepted[0].seq, at_mono_ms: 100, store_ms: 1 },
+        compactionRow(key, 100, 150, 'skipped'),
         { v: 1, kind: 'store', store: 'fixed', key, seq: accepted[0].seq, at_mono_ms: 101 + NAME_LOOKUP_TIMEOUT_MS, store_ms: 1 },
       ]))
       writeFileSync(join(root, 'stub'), lines(samples.flatMap((s, i) => [
@@ -2798,9 +2860,9 @@ globalThis.fetch = async (_url, init) => {
     expect(accountingVerdicts(accounts, records, during, final, queues, seq).every(r => r.verdict === 'pass')).toBe(true)
   }, recoveryTransport))
   // fault-check's evidence directory for composed(); `before` gives each key's pre-burst joins, `after` its post-restart extras.
-  function faultCheckEvidence(root: string, before: (key: string) => object[] = () => [], after: (key: string) => object[] = () => []) {
-    const e = composed(), dir = join(root, 'e'); mkdirSync(join(dir, 'during'), { recursive: true })
-    writeFileSync(join(dir, 'fault-plan.json'), JSON.stringify({ context: { scenario: 'test-fault', mode: 'strict', population: 0, recipients: 2 }, plan: e.plan }))
+  function faultCheckEvidence(root: string, before: (key: string) => object[] = () => [], after: (key: string) => object[] = () => [], population = 0, denied = false) {
+    const e = composed(denied), dir = join(root, 'e'); mkdirSync(join(dir, 'during'), { recursive: true })
+    writeFileSync(join(dir, 'fault-plan.json'), JSON.stringify({ context: { scenario: 'test-fault', mode: 'strict', population, recipients: 2 }, plan: e.plan }))
     writeFileSync(join(dir, 'fault-ledger.jsonl'), lines(e.ledger!))
     writeFileSync(join(dir, 'during-times.jsonl'), lines(e.during!)); writeFileSync(join(dir, 'times.jsonl'), lines(e.times!))
     writeFileSync(join(dir, 'compactions.jsonl'), '')
@@ -2822,6 +2884,29 @@ globalThis.fetch = async (_url, init) => {
     writeFileSync(join(dir, 'times.jsonl'), lines(e.times!))
     const fail = cli('fault-check', args)
     expect(fail.status).toBe(1); expect(String(fail.stdout)).toContain('verdict=fail'); expect(String(fail.stdout)).toContain('recorded: sr8 summary')
+  }))
+  // answers28: a P with independent items must rewrite inside Q's span; a P with every item withheld (all) is proved by a skip.
+  test.each([
+    ['a P with independent items that only skipped fails', false, 'samples=3 required=4 queue=2 threads=1 rewritten=1 skipped=2 outside=1 window_ms=901', 'fail'],
+    ['a P with every item withheld that only skipped passes', true, 'samples=4 required=4 queue=2 threads=2 rewritten=1 skipped=2 outside=1 window_ms=901', 'pass'],
+  ] as const)('fault CLI check reads Thread Memory compactions from its measurement file over Q\'s original store span: %s', (_name, all, stats, verdict) => withCLI((root, cli) => {
+    const { e, dir, args } = faultCheckEvidence(root, undefined, undefined, 100_000, all), [p, q] = e.plan.keys as [string, string]
+    writeFileSync(join(dir, 'compactions.jsonl'), lines(e.plan.keys.map(key => ({ key, kind: 'queue', before: '1:1', after: '1:2', inside: true }))))
+    // Q's own acceptance stores span 99..1000 on the server clock; P's stores, replays' included, come later.
+    for (const r of e.rows!) if (r.key === p) r.at_mono_ms = 200_000
+    const run = (entries: string[]) => {
+      writeFileSync(join(root, 'measurements'), lines(e.rows!) + entries.map(l => `${l}\n`).join(''))
+      const out = String(cli('fault-check', args, 100_000).stdout).trim().split('\n')
+      return { compaction: out.filter(l => l.startsWith('recorded: sr8 compaction ')),
+        others: out.filter(l => !l.startsWith('recorded: sr8 compaction ') && !l.startsWith('recorded: sr8 summary ')) }
+    }
+    const line = (stats: string, verdict: string) => [`recorded: sr8 compaction scenario=test-fault mode=strict population=100000 recipients=2 ${stats} limit=inside-burst verdict=${verdict}`]
+    // P's rewrite, after Q's last store and among P's own later stores, is outside Q's burst (window_ms is Q's alone): P only skipped inside it.
+    const plain = run([]), measured = run([compactionLine(p, 200, 300, 'skipped'), compactionLine(p, 1500, 199_000, 'rewritten'),
+      compactionLine(q, 99, 150, 'skipped'), compactionLine(q, 900, 1000, 'rewritten')])
+    expect(plain.compaction).toEqual(line('samples=2 required=4 queue=2 threads=0 rewritten=0 skipped=0 outside=0 window_ms=901', 'missing'))
+    expect(measured.compaction).toEqual(line(stats, verdict))
+    expect(measured.others).toEqual(plain.others)
   }))
   test.each([
     ['kept after the restart passes', true],
@@ -3231,12 +3316,67 @@ describe('SR-8 evidence verdicts (synthetic evidence, no runtime performance cla
       expect(child.stdout).toContain('start_to_ready_ms=missing limit=none verdict=missing\n')
     })
   })
-  test('both compactions need distinct existing file identities INSIDE the burst', () => {
-    const rows = ['queue', 'threads'].map(kind => ({ key, kind, before: '1:1', after: '1:2', inside: true }))
-    expect(compactionVerdict(rows, [key], true).verdict).toBe('pass')
-    missing(compactionVerdict(undefined, [key], true))
-    missing(compactionVerdict(rows.slice(1), [key], true))
-    for (const change of [{ inside: false }, { after: '1:1' }, { before: '' }]) missing(compactionVerdict([{ ...rows[0], ...change }, rows[1]], [key], true))
+  describe('compaction: the queue by file identity, Thread Memory by its entries wholly inside the burst\'s server-clock store span', () => {
+    // The burst's own acceptance stores: alpha's starts the span at 1000 (at_mono_ms - store_ms), beta's ends it at 2000.
+    const stores = [store(1, 5, 'accepted', 1005), { ...store(1, 10, 'post-hold', 2000), key: other }]
+    const burst = [item(), { key: other, seq: 1 }], keys = [key, other]
+    const queue = (k: string) => ({ key: k, kind: 'queue', before: '1:1', after: '1:2', inside: true })
+    // alpha rewrote inside the span; each case gives beta's entries.
+    const run = (entries: Measurement[], q = keys.map(queue)) => {
+      const rows = [...stores, compactionRow(key, 1100, 1200, 'rewritten'), ...entries]
+      return compactionVerdict(q, rows, storeWindow(rows, burst), keys, true)
+    }
+    test('a skipped compaction inside the span counts as complete beside a rewrite, at both inclusive edges', () => {
+      expect(storeWindow(stores, burst)).toEqual({ start: 1000, end: 2000 })
+      const r = run([compactionRow(other, 1000, 1050, 'skipped'), compactionRow(other, 1300, 1400, 'rewritten'), compactionRow(other, 1900, 2000, 'skipped')])
+      expect(resultLine(context, r)).toContain(' samples=4 required=4 queue=2 threads=2 rewritten=2 skipped=2 outside=0 window_ms=1000 limit=inside-burst verdict=pass')
+    })
+    test('a persona whose in-burst compactions all skipped fails, though the other rewrote', () => {
+      const r = run([compactionRow(other, 1100, 1200, 'skipped'), compactionRow(other, 1500, 1600, 'skipped')])
+      expect(r.verdict).toBe('fail'); expect(r.stats).toMatchObject({ threads: 1, rewritten: 1, skipped: 2 })
+    })
+    test.each([['at startup, before the first store', 10, 500], ['across the first store\'s start', 990, 1010],
+      ['across the last store', 1990, 2010], ['after the last store', 2001, 2100]] as const)
+    ('beta\'s rewrite %s never counts', (_name, start, end) => {
+      const outside = compactionRow(other, start, end, 'rewritten')
+      missing(run([outside]))
+      const r = run([outside, compactionRow(other, 1500, 1600, 'skipped')])
+      expect(r.verdict).toBe('fail'); expect(r.stats).toMatchObject({ threads: 1, skipped: 1, outside: 1 })
+    })
+    test('no entries, none for one persona, or an unreadable measurement file is missing', () => {
+      missing(compactionVerdict(keys.map(queue), stores, storeWindow(stores, burst), keys, true))
+      missing(run([]))
+      missing(compactionVerdict(keys.map(queue), undefined, storeWindow(stores, burst), keys, true))
+    })
+    test.each<[string, (rows: Measurement[]) => Measurement[]]>([
+      ['no store rows', rows => rows.filter(r => r.kind !== 'store')],
+      ['a burst item\'s store absent', rows => rows.filter(r => !(r.kind === 'store' && r.key === other))],
+      ['an item stored twice', rows => [...rows, { ...stores[1]! }]],
+      ['only a later fixed append for an item', rows => rows.map(r => r.kind === 'store' && r.key === other ? { ...r, store: 'fixed' } : r)],
+      ['a store taking longer than its own time', rows => rows.map(r => r.kind === 'store' && r.key === key ? { ...r, store_ms: 1006 } : r)],
+    ])('no window (%s) is missing, even with every entry inside', (_name, change) => {
+      const rows = change([...stores, compactionRow(key, 1100, 1200, 'rewritten'), compactionRow(other, 1300, 1400, 'rewritten')])
+      expect(storeWindow(rows, burst)).toBeUndefined()
+      missing(compactionVerdict(keys.map(queue), rows, storeWindow(rows, burst), keys, true))
+    })
+    test.each<[string, Partial<Measurement>]>([
+      ['a negative start', { start_mono_ms: -1 }], ['no end', { end_mono_ms: undefined }], ['an end before its start', { start_mono_ms: 1450 }],
+      ['an unknown outcome', { outcome: 'partial' }], ['an unknown persona key', { key: 'gamma' }], ['at_mono_ms other than its end', { at_mono_ms: 1350 }],
+    ])('beta\'s malformed rewrite (%s) never counts and cannot make the proof pass', (_name, change) => {
+      const bad = { ...compactionRow(other, 1300, 1400, 'rewritten'), ...change }
+      missing(run([bad]))
+      expect(run([bad, compactionRow(other, 1500, 1600, 'skipped')]).verdict).toBe('fail')
+    })
+    test.each([['absent', undefined], ['outside the burst', { inside: false }], ['one identity', { after: '1:1' }], ['no identity before', { before: '' }]] as const)
+    ('beta\'s queue proof %s stays missing whatever the entries show', (_name, change) => {
+      const r = run([compactionRow(other, 1300, 1400, 'rewritten')], [queue(key), ...(change ? [{ ...queue(other), ...change }] : [])])
+      missing(r); expect(r.stats).toMatchObject({ queue: 1, threads: 2 })
+    })
+    test('Thread Memory file identity rows no longer count, and below 100,000 nothing is required', () => {
+      const r = compactionVerdict(keys.flatMap(k => [queue(k), { ...queue(k), kind: 'threads' }]), stores, storeWindow(stores, burst), keys, true)
+      missing(r); expect(r.samples).toBe(2)
+      expect(compactionVerdict(undefined, undefined, undefined, keys, false)).toMatchObject({ verdict: 'pass', stats: { required: 0 } })
+    })
   })
   describe('joins: every seed before the burst, every pre-burst join and burst root after it', () => {
     // S seeds, N burst roots, and the first start's seal-report notice's own-post join.

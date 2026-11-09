@@ -555,11 +555,15 @@ ordinary traffic while their own-post outcomes remain unresolved. Require an
 ordinary acceptance strictly between hold admission and resolution on the
 server clock, with every overlapping item's ACK meeting N1 on the stub clock.
 
-At 100,000, shorten maintenance through `queue_compact_interval_ms` and prove
-both a queue compaction and a Thread Memory compaction for each recipient
-inside the measured burst. The fixture requires two different existing
-journal file identities observed between the first push and final ACK;
-creation or a replacement first seen afterward is insufficient. Retain
+At 100,000, shorten maintenance through `queue_compact_interval_ms` and prove,
+for each recipient, a queue compaction by two different existing queue journal
+file identities observed between the first push and final ACK (creation or a
+replacement first seen afterward is insufficient), and a Thread Memory
+compaction by its `thread-compaction` entries in `test-measurements.jsonl`.
+An entry counts only when it lies wholly inside the span of the burst's own
+acceptance stores on the server clock, a span inside push-to-final-ACK, so
+startup and other out-of-burst compactions never count; skips count as
+complete, but each recipient needs at least one rewrite. Retain
 pre-compaction queue observations, including the fixture's validated
 held-admission archive, for later readers.
 

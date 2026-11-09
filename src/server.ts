@@ -362,7 +362,7 @@ import {
 import { buildPersonaClientOrExit, runAgentDirectorStartupGate, createDeliveryClientFactory } from './agent-director-startup.ts'
 import { disposeAdVersionRecheck, installAdVersionRecheck, onAdVersionChanged } from './ad-version-gate.ts'
 import { installTestTimerOverrides } from './test-timer-overrides.ts'
-import { createTestMeasurements, buildTestMeasurementsStartLine, TEST_MEASUREMENTS_FILE_NAME, queueEventMeasurement, postHoldEventMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, type TestMeasurements } from './test-measurements.ts'
+import { createTestMeasurements, buildTestMeasurementsStartLine, TEST_MEASUREMENTS_FILE_NAME, queueEventMeasurement, postHoldEventMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, threadCompactionMeasurement, type TestMeasurements } from './test-measurements.ts'
 import { setDurableAppendTimer } from './durable-journal.ts'
 import {
   adAlertThresholdMsInEffect,
@@ -3246,6 +3246,7 @@ export async function main(): Promise<void> {
     postHoldDeps.onEvent = event => {
       try { const entry = postHoldEventMeasurement(event); if (entry) recorder.record(entry) } catch { /* isolated measurement observer */ }
     }
+    threadMemory.setCompactionObserver(compaction => { recorder.record(threadCompactionMeasurement(compaction)) })
     // The per-event timings add work to every receipt, append and save, so
     // only the scenario that reads them turns them on.
     if (personaConfig.test_measurement_timings === true) {
@@ -3259,6 +3260,7 @@ export async function main(): Promise<void> {
     unsubscribeTestMeasurements = () => {
       deliveryQueueEvents.emit = emit; delete postHoldDeps.onEvent; ackTimingObserver = undefined
       setDurableAppendTimer(undefined); threadMemory?.setSaveObserver(undefined)
+      threadMemory?.setCompactionObserver(undefined)
     }
   }
   // startup failure is local; every launch retries the write and fails closed.

@@ -56,9 +56,11 @@
  *     With SR8_PROFILE_DIR set (only test-44's burst case runs burst with it), each wave's name is
  *     appended to <dir>/waves at its start and `end` after the last, as the
  *     phase-cpu readings are taken, for cpu-profile.ts's per-wave profile parts.
- *     Compaction proof: two existing dev:ino identities, both observed after the first
- *     push and before the final ACK. The observer reads the stub record AFTER stat too;
- *     a replacement first seen after completion cannot pass. Creation is not compaction.
+ *     Queue compaction proof: two existing queue journal dev:ino identities, both observed
+ *     after the first push and before the final ACK. The observer reads the stub record
+ *     AFTER stat too; a replacement first seen after completion cannot pass. Creation is
+ *     not compaction. Thread Memory compactions are proved by check from the measurement
+ *     file's thread-compaction entries, not by file identity (a skip changes no file).
  *   seal <first|measured> C <server-log> <log-byte-mark> <config-path>
  *     First: exactly one printer-built entry-missing report per seeded key. Measured:
  *     no changed-while-stopped OR THREAD_MEMORY_JOINS_LOST report, including any
@@ -81,6 +83,17 @@
  *     post-hold admission and resolution on the SERVER measurement clock. N1 for
  *     every overlapping item uses its own envelope's STUB push/ACK times. No overlap
  *     or missing endpoints is missing; slow overlapping ACK is fail. Clocks never mix.
+ *     Compaction (required at 100000 only), per recipient: the queue by compactions.jsonl's
+ *     file identities as burst records them; Thread Memory by that persona's
+ *     thread-compaction entries after the byte mark lying WHOLLY inside the burst's
+ *     span on the SERVER clock: the first store's start (at_mono_ms - store_ms) to
+ *     the last store's at_mono_ms, over the acceptance stores of the burst's own
+ *     accepted items (key/seq bound through the queue snapshots). Each store follows
+ *     its push and precedes its ACK, so the span lies inside push-to-final-ACK.
+ *     Rewritten and skipped-identical entries both count as complete, and at least
+ *     one must be rewritten: all skipped fails; none, an incomplete store set or a
+ *     malformed entry alone is missing. Startup, bring-up and other entries outside
+ *     the span never count. Entry times are never compared with any other clock.
  *   startup-load C <start-ms> <ready-ms>
  *     Standalone startup evidence for test-32; no burst files are needed. Population
  *     is per recipient: samples/joined report population * recipients, as check does.
@@ -394,7 +407,7 @@
  *     Appends each original HTTP result to fault-ledger.jsonl by planned ordinal:
  *     envelope_id, or denied-case no-open-socket/send-failed refusal with NO invented
  *     envelope. Unrecognized refusals/timeouts fail and retain the attempted item.
- *     Compaction observations cover the Q burst window; keeps compactions.jsonl and
+ *     Queue compaction observations cover the Q burst window; keeps compactions.jsonl and
  *     held-admission snapshots. Prints submitted/expected/refused. No HTTP ACK oracle.
  *   fault-ids C <out>
  *     Every original/replay envelope in the ledger, one per line, excluding only
@@ -446,6 +459,13 @@
  *     window; no overlap is missing), accounting/accounting-ack/recovered-ack,
  *     ordinary ack-accepted/ack-dropped per nonempty independent persona class,
  *     combined/per-persona store, post-hold and overlap, joins, startup and compaction.
+ *     Compaction follows check's rule for both P and Q, over Q's ORIGINAL burst
+ *     (what fault-burst observes): the span of Q's own acceptance stores, never P's
+ *     items or any recovery replay. Only personas with stored burst items there
+ *     must rewrite: Q always, P only when the plan has independent accepted P
+ *     items (not all). A P with every item withheld has no Thread Memory change in
+ *     that span, so any complete in-span entry, rewritten or skipped, proves it;
+ *     no in-span entry is still missing (answers28).
  *     Q keeps ALL ordinary counts and limits, P's independent work keeps N1, all
  *     recovery ACKs start at their NEW push and all accepted recoveries store once.
  *     This replaces ordinary check ONLY for this declared fault-aware workload;
@@ -479,7 +499,9 @@
  *   accepted burst items (fixed appends are excluded from both the count and p99);
  * - a push without its unique ACK, missing push/timing/accepted/join snapshots;
  * - fewer real-agent N2 samples than required;
- * - either required compaction not proved INSIDE the burst at population 100000;
+ * - either required compaction not proved INSIDE the burst at population 100000
+ *   (a persona that must rewrite and whose in-burst Thread Memory compactions all
+ *   skipped fails; only fault-check's fully withheld P need not rewrite);
  * - a held reply without its resolution or its OWN key/seq resolution-store append;
  * - absent hung N2 sample or accepted/fixed record of its key/seq;
  * - absent fired fault for either hung or delayed sample;
@@ -509,7 +531,7 @@ export const SR8_USER_HZ = 100
 export type Verdict = 'pass' | 'fail' | 'missing' | 'recorded'
 export interface Context { scenario: string; mode: 'strict' | 'open'; population: number; recipients: number }
 export interface Result { measure: string; samples: number; stats: Record<string, string | number>; limit: string | number; verdict: Verdict }
-export interface Measurement { v: number; kind: string; key: string; seq?: number; seqs?: number[]; store?: string; at_mono_ms: number; store_ms?: number; held_ms?: number; outcome?: string; cause?: string }
+export interface Measurement { v: number; kind: string; key: string; seq?: number; seqs?: number[]; store?: string; at_mono_ms: number; store_ms?: number; held_ms?: number; outcome?: string; cause?: string; start_mono_ms?: number; end_mono_ms?: number }
 export interface Accepted { key: string; seq: number }
 export interface Times { envelope_id: string; push: { sent_mono_ms: number; connection_id: unknown }; acks: { ack_mono_ms: number; connection_id: unknown }[] }
 export interface BurstItem { key: string; phase: string; channel: string; ts: string; sender: string; envelope_id?: string }
@@ -563,8 +585,10 @@ export function burstAckVerdicts(keys: string[], items: BurstItem[] | undefined,
   if (ackDropped.verdict !== 'missing' && droppedStored > 0) ackDropped.verdict = 'fail'
   return [ackAccepted, ackDropped]
 }
+/** An accepted item's own acceptance store; a later `fixed` append is not one. */
+const ACCEPTANCE_STORES = ['accepted', 'post-hold', 'memory-hold']
 export function storeVerdict(rows: Measurement[] | undefined, accepted: Accepted[], percentile: (values: number[], q: number) => number): Result {
-  const stores = rows?.filter(r => r.kind === 'store' && ['accepted', 'post-hold', 'memory-hold'].includes(r.store!)) ?? []
+  const stores = rows?.filter(r => r.kind === 'store' && ACCEPTANCE_STORES.includes(r.store!)) ?? []
   const wanted = new Set(accepted.map(identity))
   const samples = stores.filter(r => wanted.has(identity(r as Accepted)))
   const counts = new Map<string, number>()
@@ -640,10 +664,51 @@ export function startupVerdict(start: number, ready: number, count: number): Res
     nonnegative(start) && nonnegative(ready) && ready >= start ? 'recorded' : 'missing')
 }
 export interface Compaction { key: string; kind: string; before: string; after: string; inside: boolean }
-export function compactionVerdict(rows: Compaction[] | undefined, keys: string[], required: boolean): Result {
-  const count = keys.flatMap(key => ['queue', 'threads'].map(kind => rows?.some(r => r.key === key && r.kind === kind
-    && r.inside === true && !!r.before && !!r.after && r.before !== r.after))).filter(Boolean).length
-  return result('compaction', count, { required: required ? keys.length * 2 : 0 }, 'inside-burst', !required || count === keys.length * 2 ? 'pass' : 'missing')
+/** A span on the server's measurement clock (`performance.now`), ms. */
+export interface ServerWindow { start: number; end: number }
+/** The measured burst on the server clock, from the burst items' own acceptance
+ * stores (by key and seq): the first store's start (`at_mono_ms - store_ms`) to
+ * the last store's `at_mono_ms`. Each store follows its item's push and precedes
+ * its ACK, so the span lies inside the burst's push-to-final-ACK window. Undefined
+ * unless every item has exactly one usable store. Pure. */
+export function storeWindow(rows: Measurement[] | undefined, accepted: Accepted[]): ServerWindow | undefined {
+  const wanted = new Set(accepted.map(identity))
+  const stores = rows?.filter(r => r.kind === 'store' && ACCEPTANCE_STORES.includes(r.store!) && wanted.has(identity(r as Accepted))) ?? []
+  // Distinct identities, one store each: every item's own store, none twice.
+  if (!rows || !accepted.length || wanted.size !== accepted.length || stores.length !== accepted.length
+    || new Set(stores.map(r => identity(r as Accepted))).size !== stores.length) return undefined
+  let start = Infinity, end = -Infinity
+  for (const s of stores) {
+    if (!nonnegative(s.store_ms) || !nonnegative(s.at_mono_ms - s.store_ms)) return undefined
+    start = Math.min(start, s.at_mono_ms - s.store_ms); end = Math.max(end, s.at_mono_ms)
+  }
+  return { start, end }
+}
+/** A `thread-compaction` entry as the server writes it: start and end on the
+ * server clock, end at or after start and equal to `at_mono_ms`, a known outcome. */
+const threadCompaction = (r: Measurement) => r.kind === 'thread-compaction' && nonnegative(r.start_mono_ms) && nonnegative(r.end_mono_ms)
+  && r.end_mono_ms >= r.start_mono_ms && r.at_mono_ms === r.end_mono_ms && ['rewritten', 'skipped'].includes(r.outcome!)
+/** SR-8.2's compaction proof, required only at 100,000. Per recipient: a queue
+ * compaction by file identity (`compactions.jsonl`), and that persona's
+ * `thread-compaction` entries wholly inside `window`, rewritten and
+ * skipped-identical alike complete. Each persona in `rewriters` (every recipient
+ * unless fault-check narrows it) needs at least one of them rewritten, and fails
+ * when all skipped; any other persona is proved by any such entry. None, or no
+ * window, is missing. Entries outside the window (startup and bring-up included)
+ * and Thread Memory file identity rows never count. Pure. */
+export function compactionVerdict(queue: Compaction[] | undefined, rows: Measurement[] | undefined, window: ServerWindow | undefined,
+  keys: string[], required: boolean, rewriters: string[] = keys): Result {
+  const entries = rows?.filter(r => keys.includes(r.key) && threadCompaction(r)) ?? []
+  const span = window && nonnegative(window.start) && finite(window.end) && window.end >= window.start ? window : undefined
+  const inside = span ? entries.filter(r => r.start_mono_ms! >= span.start && r.end_mono_ms! <= span.end) : []
+  const queued = keys.filter(key => queue?.some(r => r.key === key && r.kind === 'queue' && r.inside === true && !!r.before && !!r.after && r.before !== r.after))
+  const proved = keys.filter(key => inside.some(r => r.key === key && (r.outcome === 'rewritten' || !rewriters.includes(key))))
+  const skippedOnly = keys.filter(key => !proved.includes(key) && inside.some(r => r.key === key))
+  const missing = queued.length < keys.length || proved.length + skippedOnly.length < keys.length
+  return result('compaction', queued.length + proved.length, { required: required ? keys.length * 2 : 0, queue: queued.length, threads: proved.length,
+    rewritten: inside.filter(r => r.outcome === 'rewritten').length, skipped: inside.filter(r => r.outcome === 'skipped').length,
+    outside: entries.length - inside.length, window_ms: span ? round3(span.end - span.start) : 'missing' }, 'inside-burst',
+    !required ? 'pass' : missing ? 'missing' : skippedOnly.length ? 'fail' : 'pass')
 }
 interface JoinIdentity { channel: string; root: string; source?: unknown }
 /** Counts per value, e.g. `own-post:1`; a value that is not one short word counts as `other`. */
@@ -1321,6 +1386,26 @@ export function faultLoadVerdicts(e: FaultLoadEvidence, counts: { roots: number;
   if (items.some(i => i.phase === 'held')) results.push(...postHoldOverlapVerdicts(rows, holds, ordinary, e.times))
   return results
 }
+/** fault-check's compaction window: Q's original burst, the items fault-burst
+ * observes, by their own acceptance stores. P's items and recovery replays never
+ * bound it. Pure. */
+export function faultWindow(e: FaultLoadEvidence): ServerWindow | undefined {
+  const accepted: Accepted[] = []
+  for (const i of e.plan.items.filter(i => i.key !== e.plan.key && i.phase !== 'dropped')) {
+    const found = acceptedFor(e.queues[i.key], i.channel, i.ts)
+    if (found.length !== 1) return undefined
+    accepted.push({ key: i.key, seq: found[0].seq })
+  }
+  return storeWindow(e.rows, accepted)
+}
+/** fault-check's personas that must rewrite inside Q's window: those with stored
+ * burst items there, Q always and P only when the plan has an independent
+ * accepted P item (never under `all`). A P whose every item is withheld has no
+ * Thread Memory change in the window, so its passes there correctly skip
+ * (answers28). Pure. */
+export function faultRewriters(plan: FaultPlan): string[] {
+  return plan.keys.filter(key => key !== plan.key || plan.items.some(i => i.key === key && !i.dependent && i.phase !== 'dropped'))
+}
 
 // CLI adapters. Errors never echo raw evidence, event text, credentials or exceptions.
 const pkg = () => resolve(process.env.CSCB_PKG_DIR ?? '/test-repo/node_modules/claude-slack-channel-bots')
@@ -1544,10 +1629,11 @@ async function additional(command: string, c: Context, args: string[]): Promise<
   }
 }
 /** The verdicts' measurement rows. The server's diagnostic kinds feed only
- * `observe` (SR8_DIAGNOSTIC_KINDS); any other unknown kind is still invalid. */
+ * `observe` (SR8_DIAGNOSTIC_KINDS); `thread-compaction` feeds only the compaction
+ * proof, which checks its own fields; any other unknown kind is still invalid. */
 function measurements(path: string, offset: number): Measurement[] | undefined {
   const rows = jsonl(path, offset, true)?.filter(r => !SR8_DIAGNOSTIC_KINDS.includes(r?.kind))
-  return rows?.every(r => r.v === 1 && ['store', 'resolution-store', 'post-hold-resolved'].includes(r.kind)
+  return rows?.every(r => r.v === 1 && ['store', 'resolution-store', 'post-hold-resolved', 'thread-compaction'].includes(r.kind)
     && typeof r.key === 'string' && nonnegative(r.at_mono_ms)) ? rows : undefined
 }
 function context(args: string[]): Context {
@@ -1691,9 +1777,10 @@ async function faultBurst(c: Context, args: string[]): Promise<number> {
   const observe = () => {
     const first = observed()
     if (!first?.pushes.length || first.acked.size >= qIdentities.size) return
-    const stats = plan.keys.flatMap(key => ['queue', 'threads'].map(kind => {
-      try { const st = statSync(join(stateDir, kind, `${key}.jsonl`)); return { key, kind, id: `${st.dev}:${st.ino}` } } catch { return { key, kind, id: '' } }
-    }))
+    // Queue journals only: Thread Memory compactions are proved by their measurement entries.
+    const stats = plan.keys.map(key => {
+      try { const st = statSync(join(stateDir, 'queue', `${key}.jsonl`)); return { key, kind: 'queue', id: `${st.dev}:${st.ino}` } } catch { return { key, kind: 'queue', id: '' } }
+    })
     const after = observed()
     if (!after || after.acked.size >= qIdentities.size) return
     for (const s of stats) {
@@ -1901,15 +1988,16 @@ async function faultCommands(command: string, c: Context, args: string[]): Promi
   const [, stub, clearMark, clearAt, measurement, mark, start, ready] = args, p = await population(), { percentile } = await import('./transcript-receipts.ts')
   const queues = Object.fromEntries(plan.keys.map(key => [key, evidenceRows(join(dir, `${key}.queue.jsonl`))]))
   const duringQueues = Object.fromEntries(plan.keys.map(key => [key, evidenceRows(join(dir, 'during', `${key}.queue.jsonl`))]))
-  const rows = faultLoadVerdicts({ plan, ledger, stub: evidenceRows(stub), during: timingRows(join(dir, 'during-times.jsonl')), times: timingRows(join(dir, 'times.jsonl')),
-    queues, duringQueues, rows: measurements(measurement, numeric(mark)), clearMark: numeric(clearMark), clearAt: numeric(clearAt) },
-    { roots: p.SR8_BURST_JOINS, replies: p.SR8_BURST_REPLIES, dropped: p.SR8_BURST_DROPPED }, Number(printer('THREAD_REPLY_HOLD_MS')), percentile)
+  const e: FaultLoadEvidence = { plan, ledger, stub: evidenceRows(stub), during: timingRows(join(dir, 'during-times.jsonl')), times: timingRows(join(dir, 'times.jsonl')),
+    queues, duringQueues, rows: measurements(measurement, numeric(mark)), clearMark: numeric(clearMark), clearAt: numeric(clearAt) }
+  const rows = faultLoadVerdicts(e, { roots: p.SR8_BURST_JOINS, replies: p.SR8_BURST_REPLIES, dropped: p.SR8_BURST_DROPPED }, Number(printer('THREAD_REPLY_HOLD_MS')), percentile)
   for (const key of plan.keys) {
     const expected = p.populationJoins(key, c.population, await channels()), added = plan.items.filter(i => i.key === key && i.phase === 'roots').map(i => ({ channel: i.channel, root: i.ts }))
     const r = joinsVerdict(evidenceRows(join(dir, `${key}.before.jsonl`)), evidenceRows(join(dir, `${key}.after.jsonl`)), expected, added, 1)
     r.stats.persona = key; rows.push(r)
   }
-  rows.push(startupVerdict(numeric(start), numeric(ready), c.population * c.recipients), compactionVerdict(evidenceRows(join(dir, 'compactions.jsonl')), plan.keys, c.population === 100_000))
+  rows.push(startupVerdict(numeric(start), numeric(ready), c.population * c.recipients),
+    compactionVerdict(evidenceRows(join(dir, 'compactions.jsonl')), e.rows, faultWindow(e), plan.keys, c.population === 100_000, faultRewriters(plan)))
   return printResults(c, rows)
 }
 
@@ -1954,9 +2042,10 @@ async function burst(c: Context, args: string[]): Promise<number> {
   const observe = () => {
     const first = observed()
     if (!first?.pushes.length || first.acked.size >= expectedCount) return
-    const stats = keys.flatMap(key => ['queue', 'threads'].map(kind => {
-      try { const st = statSync(join(stateDir, kind, `${key}.jsonl`)); return { key, kind, id: `${st.dev}:${st.ino}` } } catch { return { key, kind, id: '' } }
-    }))
+    // Queue journals only: Thread Memory compactions are proved by their measurement entries.
+    const stats = keys.map(key => {
+      try { const st = statSync(join(stateDir, 'queue', `${key}.jsonl`)); return { key, kind: 'queue', id: `${st.dev}:${st.ino}` } } catch { return { key, kind: 'queue', id: '' } }
+    })
     const after = observed()
     if (!after || after.acked.size >= expectedCount) return
     for (const s of stats) {
@@ -2052,7 +2141,7 @@ async function check(c: Context, args: string[]): Promise<Result[]> {
   const store = storeVerdict(complete ? rows : undefined, accepted, percentile)
   const results = [ackAccepted, ackDropped, store, postHoldVerdict(rows, holds, Number(printer('THREAD_REPLY_HOLD_MS'))),
     startupVerdict(Number(start), Number(ready), c.population * c.recipients), ...joins,
-    compactionVerdict(jsonl(join(dir, 'compactions.jsonl')), keys, c.population === 100_000)]
+    compactionVerdict(jsonl(join(dir, 'compactions.jsonl')), rows, storeWindow(complete ? rows : undefined, accepted), keys, c.population === 100_000)]
   if (items?.some(i => i.phase === 'held')) results.push(...postHoldOverlapVerdicts(rows, holds, ordinary, times))
   if (Number(required) > 0) results.push(n2Verdict(n2File && textFile(n2File) !== undefined ? n2Samples(textFile(n2File)!) : undefined, Number(required)))
   return results

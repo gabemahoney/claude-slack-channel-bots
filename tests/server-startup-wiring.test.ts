@@ -28,7 +28,7 @@ import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import type { DeliveryQueueOptions, QueueEvent, QueueThreadJoin, DeliveryQueue, ReplyReminderQueue } from '../src/delivery-queue.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
 import { installTestTimerOverrides } from '../src/test-timer-overrides.ts'
-import { TEST_MEASUREMENTS_FILE_NAME, buildTestMeasurementsStartLine, createTestMeasurements, queueEventMeasurement, postHoldEventMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, type TestMeasurements, type TestMeasurementsDeps, type TestMeasurement } from '../src/test-measurements.ts'
+import { TEST_MEASUREMENTS_FILE_NAME, buildTestMeasurementsStartLine, createTestMeasurements, queueEventMeasurement, postHoldEventMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, threadCompactionMeasurement, type TestMeasurements, type TestMeasurementsDeps, type TestMeasurement } from '../src/test-measurements.ts'
 import type { DurableAppendTimer } from '../src/durable-journal.ts'
 import type { AckTiming } from '../src/persona-routing.ts'
 import type { ThreadMemorySave } from '../src/thread-memory.ts'
@@ -5585,6 +5585,8 @@ describe('test-only measurement wiring (Decision 25)', () => {
     const deliveryQueueEvents = { emit: original }
     const postHoldDeps: Pick<PostHoldsModule.PostHoldResolverDeps, 'onEvent'> = {}
     let appendTimer: DurableAppendTimer | undefined, saveObserver: ((save: ThreadMemorySave) => void) | undefined
+    let compactionObserver: ((compaction: ThreadMemoryModule.ThreadMemoryCompaction) => void) | undefined
+    const compactionObservers: Array<typeof compactionObserver> = []
     let created = 0, unrefs = 0
     const result = expression<() => {
       stop(): Promise<void>; apply(config: PersonaConfig): void; recorder(): TestMeasurements | undefined
@@ -5602,10 +5604,11 @@ describe('test-only measurement wiring (Decision 25)', () => {
       threadMemory: {
         startMaintenance: (ms: number) => { intervals.push(['memory', ms]) },
         setSaveObserver: (observer: typeof saveObserver) => { saveObserver = observer },
+        setCompactionObserver: (observer: typeof compactionObserver) => { compactionObservers.push(observer); compactionObserver = observer },
       },
       performance: { now: clock.now },
       setDurableAppendTimer: (timer: DurableAppendTimer | undefined) => { appendTimer = timer },
-      ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement,
+      ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, threadCompactionMeasurement,
       STATE_DIR: root, join, TEST_MEASUREMENTS_FILE_NAME, buildTestMeasurementsStartLine,
       fsPromises: fs.promises, appendFileSync: fs.appendFileSync,
       setTimeout: (callback: () => void, ms: number) => Object.assign(clock.setTimeout(callback, ms), { unref() { unrefs++ } }),
@@ -5621,7 +5624,7 @@ describe('test-only measurement wiring (Decision 25)', () => {
     })
     const run = result(); stops.push(run.stop)
     return { ...run, root, config, clock, logs, flags, intervals, recorded, forwarded, deliveryQueueEvents, original, postHoldDeps,
-      appendTimer: () => appendTimer, saveObserver: () => saveObserver,
+      appendTimer: () => appendTimer, saveObserver: () => saveObserver, compactionObserver: () => compactionObserver, compactionObservers,
       created: () => created, unrefs: () => unrefs, path: join(root, TEST_MEASUREMENTS_FILE_NAME) }
   }
 
@@ -5635,11 +5638,22 @@ describe('test-only measurement wiring (Decision 25)', () => {
     expect(callsOf('reload\\.resolveStart')).toHaveLength(1)
     expect(statements[enabledAt]!.getStart(tree)).toBeGreaterThan(startResolution(SERVER_CODE).assignAt)
     const within = (at: number, node: ts.Node) => { expect(at).toBeGreaterThan(node.getStart(tree)); expect(at).toBeLessThan(node.end) }
-    for (const name of ['createTestMeasurements', 'buildTestMeasurementsStartLine', 'queueEventMeasurement', 'postHoldEventMeasurement']) {
+    for (const name of ['createTestMeasurements', 'buildTestMeasurementsStartLine', 'queueEventMeasurement', 'postHoldEventMeasurement', 'threadCompactionMeasurement']) {
       expect(importSource(SERVER_CODE, name)).toBe('./test-measurements.ts')
       within(onlyCallOf(name), branch)
       expect(timingsBranch.getText(tree)).not.toContain(`${name}(`)
     }
+    // Compactions need only test_measurements, including the startup compactions.
+    const compactionCalls = callsOf('threadMemory\\??\\.setCompactionObserver')
+    expect(compactionCalls).toHaveLength(2)
+    for (const at of compactionCalls) {
+      within(at, branch)
+      expect(at > timingsBranch.getStart(tree) && at < timingsBranch.end).toBe(false)
+    }
+    const compactionAt = onlyCallOf('threadMemory\\.setCompactionObserver')
+    const binding = ((branch as ts.IfStatement).thenStatement as ts.Block).statements
+      .find(node => node.getStart(tree) === compactionAt)
+    expect(binding).toBeDefined()
     // The per-event timings need their own switch, read once, strictly, inside the measurement branch.
     expect(timingsBranch).toBeDefined()
     expect(indicesOf(/\btest_measurement_timings\b/g, SERVER_CODE)).toHaveLength(1)
@@ -5678,7 +5692,7 @@ describe('test-only measurement wiring (Decision 25)', () => {
     expect(onlyCallProps('createReloadController').get('onApplied')).not.toMatch(/[Mm]easure|startMaintenance|installTestTimer/)
   })
 
-  test('both maintenance calls immediately follow overrides outside the switch, with no executed await from the old site through binding', () => {
+  test('both maintenance calls immediately follow overrides outside the switch, with no executed await through compaction binding until activation', () => {
     expect(statements.slice(installAt + 1, installAt + 3).map(node => node.getText(tree))).toEqual([
       'deliveryQueue.startMaintenance(testTimers.queueCompactIntervalMs)',
       'threadMemory.startMaintenance(testTimers.queueCompactIntervalMs)',
@@ -5697,7 +5711,9 @@ describe('test-only measurement wiring (Decision 25)', () => {
       ts.forEachChild(node, visit)
     }
     expect(oldSite).toBeLessThan(installAt)
-    statements.slice(oldSite, branchAt + 1).forEach(visit)
+    const activationAt = statementAt(onlyCallOf('threadMemory\\.activate'))
+    expect(activationAt).toBeGreaterThan(branchAt)
+    statements.slice(oldSite, activationAt).forEach(visit)
     expect(yields).toEqual([])
     expect(branch.end).toBeLessThan(onlyCallOf('threadMemory\\.activate'))
     const loop = statements.find(node => ts.isForOfStatement(node) && node.getText(tree).includes(`${START_RECOVERY_STEP}(`))!
@@ -5727,6 +5743,8 @@ describe('test-only measurement wiring (Decision 25)', () => {
       expect(h.ackObserver()).toBeUndefined()
       expect(h.appendTimer()).toBeUndefined()
       expect(h.saveObserver()).toBeUndefined()
+      expect(h.compactionObserver()).toBeUndefined()
+      expect(h.compactionObservers).toEqual([])
     }
     noNewObservers()
     h.apply({ ...h.config, test_measurements: true, test_measurement_timings: true })
@@ -5746,7 +5764,7 @@ describe('test-only measurement wiring (Decision 25)', () => {
     assertNoLeak(h.logs)
   })
 
-  test.each([undefined, false])('test_measurement_timings=%s with test_measurements on: the store rows are recorded, but no timing observer is installed, even after reload turns it on', async timings => {
+  test.each([undefined, false])('test_measurement_timings=%s with test_measurements on: store and compaction rows are recorded without per-event timing observers, including after reload', async timings => {
     const h = wired(true, undefined, undefined, timings)
     expect(h.created()).toBe(1)
     expect(h.flags).toEqual([true])
@@ -5757,12 +5775,23 @@ describe('test-only measurement wiring (Decision 25)', () => {
       expect(h.saveObserver()).toBeUndefined()
     }
     noTimingObservers()
+    const compactionObserver = h.compactionObserver()
+    expect(compactionObserver).toBeFunction()
+    expect(h.compactionObservers).toEqual([compactionObserver])
+    compactionObserver!({ key: 'reader', startMonoMs: 70.25, endMonoMs: 75.5, outcome: 'rewritten' })
     h.apply({ ...h.config, test_measurement_timings: true })
     noTimingObservers()
+    expect(h.compactionObserver()).toBe(compactionObserver)
+    expect(h.compactionObservers).toEqual([compactionObserver])
+    compactionObserver!({ key: 'writer', startMonoMs: 76.25, endMonoMs: 77.5, outcome: 'skipped' })
     h.deliveryQueueEvents.emit({ type: 'stored', key: 'reader', seq: 7, store: 'accepted', storeMs: 2, atMonoMs: 80 })
     await h.stop()
     noTimingObservers()
+    expect(h.compactionObserver()).toBeUndefined()
+    expect(h.compactionObservers).toEqual([compactionObserver, undefined])
     expect(readFileSync(h.path, 'utf8').trim().split('\n').map(line => JSON.parse(line))).toEqual([
+      { v: 1, kind: 'thread-compaction', at_mono_ms: 75.5, key: 'reader', start_mono_ms: 70.25, end_mono_ms: 75.5, outcome: 'rewritten' },
+      { v: 1, kind: 'thread-compaction', at_mono_ms: 77.5, key: 'writer', start_mono_ms: 76.25, end_mono_ms: 77.5, outcome: 'skipped' },
       { v: 1, kind: 'store', key: 'reader', seq: 7, store: 'accepted', store_ms: 2, at_mono_ms: 80 },
     ])
     assertNoLeak({ logs: h.logs, file: writtenFile(h.path) })
@@ -5783,8 +5812,12 @@ describe('test-only measurement wiring (Decision 25)', () => {
     ]
     events.forEach(event => h.deliveryQueueEvents.emit(event))
     const observer = h.postHoldDeps.onEvent
+    const compactionObserver = h.compactionObserver()
+    expect(compactionObserver).toBeFunction()
     h.apply({ ...h.config, test_measurements: false, test_measurement_timings: false })
     expect(h.postHoldDeps.onEvent).toBe(observer)
+    expect(h.compactionObserver()).toBe(compactionObserver)
+    expect(h.compactionObservers).toEqual([compactionObserver])
     h.postHoldDeps.onEvent!({ kind: 'post-hold-resolved', key: 'reader', seq: 8, outcome: 'released', cause: 'restart' })
     // The new observers: the routing ack hook, the journal timer (on performance.now, the recorder's clock) and the Thread Memory save observer.
     expect(h.ackObserver()).toBeFunction()
@@ -5793,9 +5826,10 @@ describe('test-only measurement wiring (Decision 25)', () => {
     h.appendTimer()!.record({ dir: join(h.root, 'queue'), path: join(h.root, 'queue', 'reader.jsonl'), records: 3, bytes: 300, appendMs: 9, fileFsyncMs: 6, dirFsyncMs: 2, fsyncs: 2, atMonoMs: 120 })
     h.appendTimer()!.record({ dir: join(h.root, 'queue'), path: join(h.root, 'queue', 'reader.unreadable'), records: 1, bytes: 10, appendMs: 1, fileFsyncMs: 1, dirFsyncMs: 0, fsyncs: 2, atMonoMs: 121 })
     h.saveObserver()!({ key: 'reader', records: 2, joins: 1, intents: 1, outcomes: 0 })
+    compactionObserver!({ key: 'reader', startMonoMs: 122.25, endMonoMs: 124.5, outcome: 'rewritten' })
     expect(h.unrefs()).toBe(1)
     expect(h.forwarded).toEqual(events)
-    expect(h.recorded).toHaveLength(7)
+    expect(h.recorded).toHaveLength(8)
     await h.stop()
     const records = readFileSync(h.path, 'utf8').trim().split('\n').map(line => JSON.parse(line))
     expect(records).toEqual([
@@ -5806,6 +5840,7 @@ describe('test-only measurement wiring (Decision 25)', () => {
       { v: 1, kind: 'ack', at_mono_ms: 110, keys: ['reader'], ts: '1730000000.000100', targets: [{ key: 'reader', seq: 7 }], outcome: 'acked', receive_to_ack_ms: 5, ack_call_ms: 1 },
       { v: 1, kind: 'append', at_mono_ms: 120, journal: 'queue', key: 'reader', records: 3, bytes: 300, append_ms: 9, file_fsync_ms: 6, dir_fsync_ms: 2, fsyncs: 2 },
       { v: 1, kind: 'thread-save', at_mono_ms: 555.25, key: 'reader', records: 2, joins: 1, intents: 1, outcomes: 0 },
+      { v: 1, kind: 'thread-compaction', at_mono_ms: 124.5, key: 'reader', start_mono_ms: 122.25, end_mono_ms: 124.5, outcome: 'rewritten' },
     ])
     expect(h.clock.pendingCount()).toBe(0)
     expect(h.deliveryQueueEvents.emit).toBe(h.original)
@@ -5813,6 +5848,8 @@ describe('test-only measurement wiring (Decision 25)', () => {
     expect(h.ackObserver()).toBeUndefined()
     expect(h.appendTimer()).toBeUndefined()
     expect(h.saveObserver()).toBeUndefined()
+    expect(h.compactionObserver()).toBeUndefined()
+    expect(h.compactionObservers).toEqual([compactionObserver, undefined])
     expect(h.created()).toBe(1)
     assertNoLeak({ logs: h.logs, file: writtenFile(h.path) })
   })
@@ -5851,6 +5888,7 @@ describe('test-only measurement wiring (Decision 25)', () => {
     expect(cleanup).toEqual([`() => {
       deliveryQueueEvents.emit = emit; delete postHoldDeps.onEvent; ackTimingObserver = undefined
       setDurableAppendTimer(undefined); threadMemory?.setSaveObserver(undefined)
+      threadMemory?.setCompactionObserver(undefined)
     }`])
   })
 

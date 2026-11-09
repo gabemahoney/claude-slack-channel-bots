@@ -12,7 +12,7 @@ import {
   TEST_MEASUREMENTS_FILE_NAME, TEST_MEASUREMENTS_FLUSH_MS, TEST_MEASUREMENTS_STOP_WAIT_MS,
   buildTestMeasurementsStartLine, buildTestMeasurementsWriteFailedLine, buildTestMeasurementsStopIncompleteLine,
   createTestMeasurements, postHoldEventMeasurement, queueEventMeasurement, serializeTestMeasurement,
-  ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement,
+  ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, threadCompactionMeasurement,
   type StoreMeasurement, type TestMeasurement, type TestMeasurementRecord, type TestMeasurementsDeps,
 } from '../src/test-measurements.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
@@ -81,9 +81,9 @@ function harness(overrides: Partial<TestMeasurementsDeps> = {}) {
 }
 
 describe('test-only measurement records (Decision 25)', () => {
-  test('the schema has exactly six kinds; the filename, flush delay and loud line are exported', () => {
-    const kinds: Record<TestMeasurement['kind'], true> = { store: true, 'resolution-store': true, 'post-hold-resolved': true, ack: true, append: true, 'thread-save': true }
-    expect(Object.keys(kinds)).toEqual(['store', 'resolution-store', 'post-hold-resolved', 'ack', 'append', 'thread-save'])
+  test('the schema has exactly seven kinds; the filename, flush delay and loud line are exported', () => {
+    const kinds: Record<TestMeasurement['kind'], true> = { store: true, 'resolution-store': true, 'post-hold-resolved': true, ack: true, append: true, 'thread-save': true, 'thread-compaction': true }
+    expect(Object.keys(kinds)).toEqual(['store', 'resolution-store', 'post-hold-resolved', 'ack', 'append', 'thread-save', 'thread-compaction'])
     expect(TEST_MEASUREMENTS_FILE_NAME).toBe('test-measurements.jsonl')
     expect(TEST_MEASUREMENTS_FLUSH_MS).toBe(250)
     expect(TEST_MEASUREMENTS_STOP_WAIT_MS).toBe(1_000)
@@ -143,7 +143,7 @@ describe('test-only measurement records (Decision 25)', () => {
   })
   const ackTiming: AckTiming = { keys: ['reader', 'writer'], ts: '1730000000.000100', targets: [{ key: 'reader', seq: 7 }, { key: 'writer', seq: 2 }],
     outcome: 'acked', receiveToAckMs: 812.5, ackCallMs: 0.75, atMonoMs: 130.25 }
-  const sourceRows: Array<{ name: string; entry: TestMeasurement; mapped: () => TestMeasurement | undefined }> = [
+  const sourceRows: Array<{ name: string; entry: TestMeasurement; mapped: (extra: Record<string, unknown>) => TestMeasurement | undefined }> = [
     { name: 'ack', mapped: () => ackTimingMeasurement(ackTiming),
       entry: { kind: 'ack', keys: ['reader', 'writer'], ts: '1730000000.000100', targets: [{ key: 'reader', seq: 7 }, { key: 'writer', seq: 2 }],
         outcome: 'acked', receive_to_ack_ms: 812.5, ack_call_ms: 0.75, at_mono_ms: 130.25 } },
@@ -155,22 +155,34 @@ describe('test-only measurement records (Decision 25)', () => {
       entry: { kind: 'append', journal: 'thread-memory', key: 'reader', records: 3, bytes: 412, append_ms: 9.5, file_fsync_ms: 6.25, dir_fsync_ms: 2.5, fsyncs: 2, at_mono_ms: 140.5 } },
     { name: 'thread-save', mapped: () => threadSaveMeasurement({ key: 'reader', records: 3, joins: 1, intents: 1, outcomes: 1 }),
       entry: { kind: 'thread-save', key: 'reader', records: 3, joins: 1, intents: 1, outcomes: 1 } },
+    ...(['rewritten', 'skipped'] as const).map(outcome => ({
+      name: `thread-compaction ${outcome}`,
+      mapped: (extra: Record<string, unknown>) => threadCompactionMeasurement({ ...extra, key: 'reader', startMonoMs: 120.25, endMonoMs: 140.5, outcome }),
+      entry: { kind: 'thread-compaction' as const, key: 'reader', start_mono_ms: 120.25, end_mono_ms: 140.5, outcome, at_mono_ms: 140.5 },
+    })),
   ]
 
   test.each(sourceRows)('$name: one exact allowlisted line from its source fact, without content', async ({ entry, mapped }) => {
-    const h = harness()
+    let clockReads = 0
+    const h = harness({ monotonicNow: () => { clockReads++; return 900.5 } })
     const extra = { text: `message-${LEAK_SENTINEL}`, channel: `C${LEAK_SENTINEL}`, user: `U${LEAK_SENTINEL}`,
       token: fakeToken(BOT_TOKEN_PREFIX, 'measurement'), path: `path-${LEAK_SENTINEL}`, dir: `dir-${LEAK_SENTINEL}` }
-    const entryOf = mapped()
+    const entryOf = mapped(extra)
     expect(entryOf).toEqual(entry)
     h.recorder.record({ ...entryOf!, ...extra })
     await h.recorder.flush()
-    // ack and append carry their own completion time; thread-save takes the record-time clock.
+    // ack, append and compaction carry their own completion time; thread-save takes the record-time clock.
     const expected: TestMeasurementRecord = { v: 1, ...entry, at_mono_ms: 'at_mono_ms' in entry ? entry.at_mono_ms : 900.5 }
     expect(h.records()).toEqual([expected])
     const line = h.written[0]!
     expect(Object.keys(JSON.parse(line)).slice(0, 3)).toEqual(['v', 'kind', 'at_mono_ms'])
     expect(serializeTestMeasurement({ ...expected, ...extra })).toBe(line.trimEnd())
+    if (entry.kind === 'thread-compaction') {
+      expect(Object.keys(JSON.parse(line))).toEqual(['v', 'kind', 'at_mono_ms', 'key', 'start_mono_ms', 'end_mono_ms', 'outcome'])
+      expect(line.endsWith('\n')).toBe(true)
+      expect(line.split('\n')).toHaveLength(2)
+      expect(clockReads).toBe(0)
+    }
     if (entry.kind === 'ack' && entry.outcome === 'suppressed') { expect(line).not.toContain('ack_call_ms'); expect(line).not.toContain('"ts"') }
     assertNoLeak({ calls: h.calls, logs: h.logs, written: h.written })
     await h.recorder.stop()

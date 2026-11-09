@@ -252,6 +252,7 @@ export interface ThreadHarnessOptions {
   failureHandling?: boolean
   /** Passed through to `createThreadMemory` as given, absent by default. */
   compactIntervalMs?: ThreadMemoryOptions['compactIntervalMs']
+  monotonicNow?: ThreadMemoryOptions['monotonicNow']
 }
 export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarnessOptions = {}) {
   const clock = options.clock ?? createFakeClock({ start: THREAD_TIME }), io = options.fs ?? threadFsControls(stateDir)
@@ -304,6 +305,7 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
   const memory = createThreadMemory({
     stateDir, fs: io.fs, now: options.now ?? clock.now, ...intervalTimers(clock), dryRun: options.dryRun, seal,
     compactIntervalMs: options.compactIntervalMs,
+    monotonicNow: options.monotonicNow,
     appliedKeys: options.appliedKeys ?? (() => authority.config().personas.map(p => p.key)),
     stamp: (key, channel) => authority.channelStamp(key, channel),
     heldStamps: options.heldStamps,

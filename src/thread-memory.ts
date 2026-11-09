@@ -269,6 +269,9 @@ export type ThreadMemoryReadResult = 'read' | 'unreadable' | 'missing'
 export interface ThreadMemoryOutage { unknown: boolean; unsaved: number; missing: boolean }
 export interface ThreadMemoryOptions {
   stateDir: string; fs?: typeof nodeFs; now?: () => number; dryRun?: boolean
+  /** Test-only compaction clock; read only while a compaction observer
+   * is set. */
+  monotonicNow?: () => number
   seal?: ThreadMemorySealPort
   setInterval?: typeof globalThis.setInterval; clearInterval?: typeof globalThis.clearInterval
   appliedKeys(): readonly string[]
@@ -341,11 +344,18 @@ export interface ThreadMemory {
   startMaintenance(intervalMs?: number): void
   /** Test-only: observe each later save that appended records. Unset (the default), saves count nothing. */
   setSaveObserver(observer: ((save: ThreadMemorySave) => void) | undefined): void
+  /** Test-only: observe completed compactions, including startup
+   * and bring-up. */
+  setCompactionObserver(observer: ((compaction: ThreadMemoryCompaction) => void) | undefined): void
   quiesce(): Promise<void>
   stop(): Promise<void>
 }
 /** One successful kept-fact append: its record count by kind. */
 export interface ThreadMemorySave { key: string; records: number; joins: number; intents: number; outcomes: number }
+/** One completed rewrite or maintenance skip, timed inside its writer turn. */
+export interface ThreadMemoryCompaction {
+  key: string; startMonoMs: number; endMonoMs: number; outcome: 'rewritten' | 'skipped'
+}
 const memoryObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const memoryInteger = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0
 const memoryTime = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v)
@@ -411,6 +421,10 @@ interface MemoryJournal extends AppendRollback {
    * Entries are immutable and removed/replaced with their saved evidence. */
   savedOrder?: Set<ThreadMemoryRecord>; savedVersion: number
   savedImage?: SavedImage
+  /** Every attempted journal append invalidates the last durable rewrite,
+   * even when its failure leaves saved evidence and high-water unchanged. */
+  appendAttempts: number
+  compactionWitness?: { header: ThreadMemoryHeader; savedVersion: number; appendAttempts: number }
   creationHeader?: ThreadMemoryHeader; sealSaved?: boolean
   missing?: boolean
   joinedByChannel: JoinIndex
@@ -426,7 +440,7 @@ interface MemoryJournal extends AppendRollback {
   error?: unknown; quarantined: ThreadMemoryQuarantineFact[]; quarantineRollback: AppendRollback
 }
 function emptyMemoryJournal(): MemoryJournal {
-  return { readable: true, exists: false, hasRecords: false, live: false, created: false, failed: false, highWater: 0, savedVersion: 0,
+  return { readable: true, exists: false, hasRecords: false, live: false, created: false, failed: false, highWater: 0, savedVersion: 0, appendAttempts: 0,
     joinedByChannel: new Map(), judged: new Map(), heldJoins: new Map(), kept: [], intents: new Map(), savedIntents: new Map(),
     intentsByChannel: new Map(), writes: [], ownJoins: new Map(), quarantined: [], quarantineRollback: {} }
 }
@@ -451,6 +465,8 @@ function workSlices(current: () => boolean) {
 type WorkSlices = ReturnType<typeof workSlices>
 function replaceSaved(j: MemoryJournal, before?: ThreadMemoryRecord, after?: ThreadMemoryRecord): void {
   if (before === after) return
+  // Moving the same saved record into the held index changes no image.
+  if (!before && after && j.savedOrder?.has(after)) return
   j.savedVersion++
   if (before) j.savedOrder?.delete(before)
   if (after) j.savedOrder?.add(after)
@@ -565,6 +581,7 @@ async function serializeSavedImage(j: MemoryJournal, header: ThreadMemoryHeader,
 /** All state belongs to this instance; reading, activation and timers are explicit. */
 export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   const fs = options.fs ?? nodeFs, now = options.now ?? Date.now, dir = join(options.stateDir, 'threads')
+  const monotonicNow = options.monotonicNow ?? (() => performance.now())
   const io = createDurableJournal({ dir, parentDir: options.stateDir, directoryMode: THREAD_MEMORY_DIRECTORY_MODE, fileMode: THREAD_MEMORY_FILE_MODE, fs })
   const journals = new Map<string, MemoryJournal>(), writers = new Map<string, Promise<unknown>>()
   const forgotten = new Set<string>(), clocks = new Map<string, number>()
@@ -580,6 +597,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   }
   let activationStarted = false
   let saveObserver: ((save: ThreadMemorySave) => void) | undefined
+  let compactionObserver: ((compaction: ThreadMemoryCompaction) => void) | undefined
   let startId: string | undefined, readStarted = false, listingFailed = false, stopped = false, quiesced = false
   let timer: ReturnType<typeof globalThis.setInterval> | undefined
   function pathFor(key: string): string {
@@ -764,6 +782,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   }
   function readKey(key: string, retry = false, emitRead = true): ThreadMemoryReadResult {
     const j = journal(key), wasUnknown = !j.readable
+    delete j.compactionWitness
     let bytes: Buffer
     try { bytes = io.read(pathFor(key)) } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
@@ -825,14 +844,36 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   function newHeader(j: MemoryJournal): ThreadMemoryHeader {
     return { v: 1, kind: 'header', seq: 0, storeId: randomUUID(), digestKey: randomBytes(32).toString('hex'), highWater: j.highWater }
   }
-  async function compactOne(key: string, j: MemoryJournal, creationHeader?: ThreadMemoryHeader): Promise<void> {
+  function observeCompaction(key: string, startMonoMs: number | undefined, outcome: ThreadMemoryCompaction['outcome']): void {
+    if (!compactionObserver || startMonoMs === undefined) return
+    try { compactionObserver({ key, startMonoMs, endMonoMs: monotonicNow(), outcome }) } catch {
+      /* an observer cannot change a completed compaction */
+    }
+  }
+  async function compactOne(key: string, j: MemoryJournal, creationHeader?: ThreadMemoryHeader, maintenance = false): Promise<void> {
     if (!current(key, j) || !j.readable || !j.exists || options.dryRun || (!j.hasRecords && !options.threadHybridChannels(key).length)) return
     // Creating a missing header creates a store, so its seal step must run
     // first. Without a seal, retain the original standalone store behavior.
     if (options.seal && !j.header && !creationHeader) return
+    const startMonoMs = compactionObserver ? monotonicNow() : undefined
     try {
       judge(key, j)
       await io.reconcileRollback(pathFor(key), j)
+      if (maintenance) {
+        if (!current(key, j)) return
+        // Retention may have changed while rollback reconciliation awaited I/O.
+        judge(key, j)
+        const witness = j.compactionWitness
+        if (witness && j.savedOrder && j.header === witness.header && j.highWater === witness.header.highWater &&
+          j.savedVersion === witness.savedVersion && j.appendAttempts === witness.appendAttempts) {
+          observeCompaction(key, startMonoMs, 'skipped')
+          return
+        }
+      }
+      // A failed or cancelled build must never reuse an earlier
+      // rewrite's proof.
+      delete j.compactionWitness
+      const savedVersion = j.savedVersion, appendAttempts = j.appendAttempts
       const header = { ...(j.header ?? creationHeader ?? newHeader(j)), highWater: j.highWater }
       // Only this writer turn saves records; between slices publication can
       // only judge, and a forget or shutdown leaves the old image in place.
@@ -850,16 +891,24 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
           j.savedOrder = new Set(sorted)
         }
       }
-      const bytes = ordered && await (j.savedOrder
+      const orderedImage = j.savedOrder !== undefined
+      const bytes = ordered && await (orderedImage
         ? serializeSavedImage(j, header, slices, lineOf)
         : serializeInSlices(header, ordered, slices, lineOf))
       if (!bytes || !current(key, j)) return
       await io.rewrite(pathFor(key), bytes)
       j.header = header; j.hasRecords = true
+      // Bind proof to the pre-build version: a change during any await makes
+      // this witness ineligible, even though the rewrite itself completed.
+      if (orderedImage) j.compactionWitness = { header, savedVersion, appendAttempts }
+      observeCompaction(key, startMonoMs, 'rewritten')
       digestKept(j)
       // The shared seal writer must never hold a persona's compaction turn.
       void options.seal?.entryCompacted(key, header.storeId, j.highWater)
-    } catch (error) { event({ type: 'compaction-failed', key, path: pathFor(key), step: 'journal-rewrite', error }); throw error }
+    } catch (error) {
+      delete j.compactionWitness
+      event({ type: 'compaction-failed', key, path: pathFor(key), step: 'journal-rewrite', error }); throw error
+    }
   }
   async function createStore(key: string, j: MemoryJournal): Promise<ThreadMemoryWriteResult> {
     if (!current(key, j)) return { kind: 'cancelled' }
@@ -883,6 +932,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
         step = 'journal-header'
         if (j.exists) await compactOne(key, j, header)
         else {
+          j.appendAttempts++
           await io.durableAppend(pathFor(key), serializeThreadMemoryRecords([header]), j)
           j.header = header; j.highWater = header.highWater; j.exists = true; j.hasRecords = true
         }
@@ -896,6 +946,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       if (!current(key, j)) return { kind: 'cancelled' }
       if (result.kind !== 'saved') throw new Error('Thread Memory created marker was not saved')
       j.created = true
+      delete j.compactionWitness
       event({ type: 'created', key, path: pathFor(key) })
       return { kind: 'saved' }
     } catch (error) {
@@ -1065,6 +1116,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     }
     try {
       if (records.length) {
+        j.appendAttempts++
         await io.durableAppend(pathFor(key), Buffer.from(records.map(lineOf).join('')), j)
         if (saveObserver) {
           try {
@@ -1151,7 +1203,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   async function compactForMaintenance(): Promise<void> {
     await Promise.allSettled([...journals].filter(([, j]) => !maintenanceQueued.has(j)).map(([k, j]) => {
       maintenanceQueued.add(j)
-      return serial(k, () => { maintenanceQueued.delete(j); return compactOne(k, j) })
+      return serial(k, () => { maintenanceQueued.delete(j); return compactOne(k, j, undefined, true) })
     }))
   }
   const api: ThreadMemory = {
@@ -1352,6 +1404,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       timer.unref?.()
     },
     setSaveObserver(observer) { saveObserver = observer },
+    setCompactionObserver(observer) { compactionObserver = observer },
     async quiesce() {
       quiesced = true
       await Promise.allSettled([...writers.values()])

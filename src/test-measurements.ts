@@ -2,8 +2,9 @@
  * The test-only measurement record. Undocumented for users; OFF by default.
  * It lets the SR-8 performance scenarios read timings that never leave the
  * process (durable store time, Post Hold resolution, receipt-to-ack time,
- * each journal append's fsync times and Thread Memory saves), measured
- * through the production paths. Startup load is measured outside the process.
+ * each journal append's fsync times and Thread Memory saves and compactions),
+ * measured through the production paths. Startup load is measured outside
+ * the process.
  *
  * Only `test_measurements: true` in `config.json` (`TEST_MEASUREMENTS_KEY`,
  * validated by `src/config.ts`, read once at server start) creates a recorder,
@@ -14,6 +15,7 @@
  * The `ack`, `append` and `thread-save` kinds also need
  * `test_measurement_timings: true` (`TEST_MEASUREMENT_TIMINGS_KEY`), because
  * their observers add work to every receipt, append and save.
+ * The `thread-compaction` kind needs only `test_measurements: true`.
  *
  * Each line is `{ v: 1, kind, at_mono_ms, … }` and holds numbers, persona
  * keys, sequence numbers, Slack event timestamps (`ack`'s `ts`) and fixed
@@ -21,7 +23,8 @@
  * credentials. `at_mono_ms` is the server's monotonic time (`performance.now`'s
  * clock, the queue's default): for the store kinds and `append`, when the
  * append became durable; for `ack`, when the ack call returned or was
- * suppressed; for the others, when the recorder was handed the fact.
+ * suppressed; for `thread-compaction`, when the compaction completed;
+ * for the others, when the recorder was handed the fact.
  *
  * Importing this module performs no I/O and starts no timer.
  */
@@ -32,7 +35,7 @@ import type { HoldOutcome, QueueEvent, QueueStoreKind } from './delivery-queue.t
 import type { DurableAppendTiming } from './durable-journal.ts'
 import type { AckTiming } from './persona-routing.ts'
 import type { PostHoldCause, PostHoldEvent } from './post-holds.ts'
-import type { ThreadMemorySave } from './thread-memory.ts'
+import type { ThreadMemoryCompaction, ThreadMemorySave } from './thread-memory.ts'
 import { PERSONA_KEY_RE } from './persona-identity.ts'
 import { queueErrorCode } from './persona-diagnostics.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
@@ -72,9 +75,15 @@ export interface AppendMeasurement {
 }
 /** One Thread Memory save that appended records, counted by kind. */
 export interface ThreadSaveMeasurement { kind: 'thread-save'; key: string; records: number; joins: number; intents: number; outcomes: number }
+/** One completed Thread Memory compaction, whether rewritten or
+ * skipped-identical. */
+export interface ThreadCompactionMeasurement {
+  kind: 'thread-compaction'; key: string; start_mono_ms: number; end_mono_ms: number
+  outcome: 'rewritten' | 'skipped'; at_mono_ms: number
+}
 /** What `record` takes. */
 export type TestMeasurement = StoreMeasurement | ResolutionStoreMeasurement | PostHoldResolvedMeasurement
-  | AckMeasurement | AppendMeasurement | ThreadSaveMeasurement
+  | AckMeasurement | AppendMeasurement | ThreadSaveMeasurement | ThreadCompactionMeasurement
 /** One line of the file. */
 export type TestMeasurementRecord = TestMeasurement & { v: 1; at_mono_ms: number }
 
@@ -98,6 +107,8 @@ export function serializeTestMeasurement(record: TestMeasurementRecord): string 
         append_ms: record.append_ms, file_fsync_ms: record.file_fsync_ms, dir_fsync_ms: record.dir_fsync_ms, fsyncs: record.fsyncs })
     case 'thread-save':
       return JSON.stringify({ ...head, key: record.key, records: record.records, joins: record.joins, intents: record.intents, outcomes: record.outcomes })
+    case 'thread-compaction':
+      return JSON.stringify({ ...head, key: record.key, start_mono_ms: record.start_mono_ms, end_mono_ms: record.end_mono_ms, outcome: record.outcome })
   }
 }
 
@@ -127,6 +138,12 @@ export function durableAppendMeasurement(timing: DurableAppendTiming, stateDir: 
 /** The measurement a Thread Memory save carries. Pure. */
 export function threadSaveMeasurement(save: ThreadMemorySave): ThreadSaveMeasurement {
   return { kind: 'thread-save', key: save.key, records: save.records, joins: save.joins, intents: save.intents, outcomes: save.outcomes }
+}
+
+/** The measurement a completed Thread Memory compaction carries. Pure. */
+export function threadCompactionMeasurement(compaction: ThreadMemoryCompaction): ThreadCompactionMeasurement {
+  return { kind: 'thread-compaction', key: compaction.key, start_mono_ms: compaction.startMonoMs, end_mono_ms: compaction.endMonoMs,
+    outcome: compaction.outcome, at_mono_ms: compaction.endMonoMs }
 }
 
 /** The measurement a queue event carries: a timed store, a `fixed` append or a saved resolution. Pure. */
@@ -306,7 +323,7 @@ export function createTestMeasurements(deps: TestMeasurementsDeps): TestMeasurem
     record(entry) {
       try {
         if (stopped) return
-        const atMonoMs = entry.kind === 'store' || entry.kind === 'resolution-store' || entry.kind === 'ack' || entry.kind === 'append'
+        const atMonoMs = entry.kind === 'store' || entry.kind === 'resolution-store' || entry.kind === 'ack' || entry.kind === 'append' || entry.kind === 'thread-compaction'
           ? entry.at_mono_ms : monotonicNow()
         buffer.push({ ...entry, v: 1, at_mono_ms: atMonoMs })
         arm()
