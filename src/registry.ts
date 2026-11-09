@@ -645,7 +645,7 @@ export function resolveTransportForRequest(
  * its client are looked up through these on every tool call, never cached.
  */
 export interface SessionToolDeps {
-  /** Records an attempted reply using CSCB records, before any scope or Slack outcome. */
+  /** Records an attempted reply or react using CSCB records, before any scope or Slack outcome. */
   onReplyCall?(key: string): void | Promise<void>
   /** File exfiltration guard — throws when the file must not be sent */
   assertSendable: (filePath: string) => void
@@ -663,10 +663,11 @@ export interface SessionToolDeps {
   /** Resolve a user's display name through the persona's client */
   resolveUserName: (personaKey: string, userId: string) => Promise<string>
   /**
-   * Record a successful correlated reply and clean up its captured ack stage.
-   * The removal fallback is only for legacy entries without a captured reaction.
+   * Record a successful correlated reply or react and clean up its captured ack stage.
+   * The removal fallback is only for legacy entries without a captured reaction;
+   * `kept` is a react's emoji, never removed.
    */
-  consumeAck: (personaKey: string, channelId: string, messageTs: string, removeLegacy?: () => Promise<unknown>) => boolean | Promise<void>
+  consumeAck: (personaKey: string, channelId: string, messageTs: string, removeLegacy?: () => Promise<unknown>, kept?: string) => boolean | Promise<void>
   /** TCP port the MCP HTTP server is listening on (retained for diagnostics). */
   serverPort: number
   /**
@@ -1235,7 +1236,7 @@ export const MCP_INSTRUCTIONS = [
   'You may act in every channel you receive. With invited channels off, these are your configured channels; with it on, channels your Slack app belongs to (Slack refuses others).',
   `${SET_CHANNEL_DELIVERY_TOOL} sets listening to mentions (@mentions and @here/@channel broadcasts) or all (every message). Use it when someone in that channel asks; it requires invited channels on.`,
   'With DMs on, you may reply, react, edit_message, fetch_messages and download_attachment in a DM you belong to (D... chat_id). To start a DM, reply takes a user ID (U... or W...) as chat_id and returns the D... ID for later edits, reactions, reads and thread replies. Other tools take no user ID. With DMs off you have no DM target. Any other target is refused.',
-  'Pass message_id (the triggering message ts) to reply to remove the ack reaction.',
+  'To remove the ack reaction, reply with message_id (the triggering message ts) or react to that message.',
   'reply accepts files: ["/abs/path.png"] for attachments. react adds emoji reactions; edit_message updates a sent message; fetch_messages reads real Slack history from conversations.history.',
 ].join('\n')
 
@@ -1305,7 +1306,7 @@ export function createSessionServer(
           type: 'object' as const,
           properties: {
             chat_id: { type: 'string', description: 'A channel ID or a DM conversation ID (D...)' },
-            message_id: { type: 'string', description: 'Message timestamp (ts)' },
+            message_id: { type: 'string', description: 'Message timestamp (ts); reacting to the triggering message removes its ack reaction' },
             emoji: {
               type: 'string',
               description: 'Emoji name without colons (e.g. "thumbsup")',
@@ -1459,6 +1460,19 @@ export function createSessionServer(
   }
 
   /**
+   * Record a successful correlated reply or react and detach removal of the
+   * persona's own ack reaction, so a held reaction call never delays the
+   * remaining content or the tool result. `kept` (a react's emoji) is never removed.
+   */
+  function releaseAck(persona: Persona, web: WebClient, chatId: string, messageId: string, ackReaction: string | undefined, kept?: string): void {
+    try {
+      void Promise.resolve(consumeAck(persona.key, chatId, messageId, async () => {
+        if (ackReaction && ackReaction !== kept) await web.reactions.remove({ channel: chatId, timestamp: messageId, name: ackReaction })
+      }, kept)).catch(() => {})
+    } catch { /* reaction cleanup cannot fail a successful tool call */ }
+  }
+
+  /**
    * Run one tool on the persona's client. `kind` is the target's kind from
    * the scope check; a `user` target (reply only) is opened first, and the
    * opened conversation ID is set on `dm.opened` right away so the caller can
@@ -1502,15 +1516,8 @@ export function createSessionServer(
         const hasFiles = (files?.length ?? 0) > 0
         const filesOnly = text === '' && hasFiles
         const chunks = filesOnly ? [] : chunkText(text, settings.reply_chunk_limit, settings.reply_chunk_mode)
-        // Record the first successful reply immediately; a held reaction call
-        // may delay cleanup, but never the remaining content or tool result.
         const clearAck = () => {
-          if (!messageId) return
-          try {
-            void Promise.resolve(consumeAck(persona.key, chatId, messageId, async () => {
-              if (settings.ack_reaction) await web.reactions.remove({ channel: chatId, timestamp: messageId, name: settings.ack_reaction })
-            })).catch(() => {})
-          } catch { /* reaction cleanup cannot fail a successful reply */ }
+          if (messageId) releaseAck(persona, web, chatId, messageId, settings.ack_reaction)
         }
 
         let lastTs = ''
@@ -1567,13 +1574,16 @@ export function createSessionServer(
       // react
       // ---------------------------------------------------------------------
       case 'react': {
-        await web.reactions.add({
-          channel: args.chat_id,
-          timestamp: args.message_id,
-          name: args.emoji,
-        })
+        const chatId: string = args.chat_id, messageId: string = args.message_id, emoji: string = args.emoji
+        try {
+          await web.reactions.add({ channel: chatId, timestamp: messageId, name: emoji })
+        } catch (err) {
+          // The persona's own reaction is already there, as when it matches its ack.
+          if (slackPlatformReason(err) !== 'already_reacted') throw err
+        }
+        releaseAck(persona, web, chatId, messageId, getReplySettings().ack_reaction, emoji)
         return {
-          content: [{ type: 'text', text: `Reacted :${args.emoji}: to ${args.message_id}` }],
+          content: [{ type: 'text', text: `Reacted :${emoji}: to ${messageId}` }],
         }
       }
 
@@ -1817,7 +1827,7 @@ export function createSessionServer(
     if (!key) return toolError(sessionNotMatchedRefusal(name))
     const persona = getPersona(key)
     if (!persona) return toolError(personaNotAppliedRefusal(name, key))
-    if (name === 'reply') await deps.onReplyCall?.(key)
+    if (name === 'reply' || name === 'react') await deps.onReplyCall?.(key)
     // The channel mode, read now with the persona.
     const mode: ChannelMode = deps.getChannelMode?.() ?? 'declarative'
 

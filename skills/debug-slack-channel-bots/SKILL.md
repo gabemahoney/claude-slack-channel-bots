@@ -491,7 +491,7 @@ no recovery outcome. See [Message saved after retry](#message-saved-after-retry)
 - **Line:** `[slack] message-delivered: persona="<name>" (key=<key>) source=<source> chat_id="<chat>" ts="<ts>" sender_id="<sender>" at=<time> wait_ms=<ms>`
 - **Meaning:** All parts have transcript receipts and the final delivery record is durable. The next item can proceed.
 - **Cause:** The bot took in the typed message; a successful typing call alone does not produce this line.
-- **Fix:** No action is needed. For Slack work, this persona removes its original queued reaction before adding `ack_reaction` (default `spinthinking`), unless a tracked successful reply suppresses it. A failed queued removal can leave queued visible even after delivery; see [Acknowledgement reaction missing or stuck](#symptom-acknowledgement-reaction-missing-or-stuck).
+- **Fix:** No action is needed. For Slack work, this persona removes its original queued reaction before adding `ack_reaction` (default `spinthinking`), unless a tracked successful reply or reaction suppresses it. A failed queued removal can leave queued visible even after delivery; see [Acknowledgement reaction missing or stuck](#symptom-acknowledgement-reaction-missing-or-stuck).
 
 ### `message-retyped`
 
@@ -3929,7 +3929,7 @@ registers again with its history. If the new token is refused too, a new
 
 ## A persona isn't reminded to reply, or is reminded after opting out
 
-- **Symptom:** a persona finishes responding to a delivered Slack message without a `reply` tool call and no reminder arrives, or a persona with reminders disabled still receives one.
+- **Symptom:** a persona finishes responding to a delivered Slack message without a `reply` or `react` tool call and no reminder arrives, or a persona with reminders disabled still receives one.
 - **Rule:** CSCB must observe the persona's agent-director row go `working` → `waiting` in the same running session after delivery. It queues at most one reminder per Slack delivery, through the normal queue. Claude and Codex use the same rule, independently of `claude_config_dir` and `jq`.
 - **Confirm:** check the persona's own and top-level `stop_hook_bootstrap` booleans in `config.json`, and confirm that the change was applied (see [Confirming a pending change](#confirming-a-pending-change)). An own value overrides the top-level default, which is `true`. A confirmed change applies immediately and keeps the session.
 - **Check only authoritative state and CSCB facts:** use `agent-director get --instance-id cscb_<key>` for the row state, and inspect `server.log` for the content-free `reply-reminder persona=<key>: observation or journal update failed; retrying` line. Check state-directory permissions and free space if it repeats. Do not inspect transcripts or panes to reconstruct a turn or reply.
@@ -3938,10 +3938,10 @@ registers again with its history. If the new token is refused too, a new
 |---|---|
 | A Claude row lacks `reply_tool_preallowed=1` in its labels. | This older conversation has no recorded reply pre-approval, so CSCB sends no new reminders. Resume retains its saved permissions. Leave the label unchanged; new CSCB spawns receive the permission and label together. Ordinary message delivery continues. |
 | The row was first observed at `waiting`, so no `working` transition was observed. | No reminder is owed from that read alone. Verify with a subsequent delivered Slack message and observed AD transition. |
-| The persona invoked its own `reply` tool after the delivery, even if the post failed or targeted another conversation. | The call suppresses that delivery's reminder. Diagnose any posting failure separately. |
+| The persona invoked its own `reply` or `react` tool after the delivery, even if the post failed or targeted another conversation. | The call suppresses that delivery's reminder. Diagnose any posting failure separately. |
 | The input was a scheduled prompt, `/interject` or a reminder. | These inputs never arm reminders. |
 | The persona's session changed, its row finished or disappeared, or it was torn down. | Pending reminder checks for the previous running life are cancelled. |
-| The persona answers through another service or only with `edit_message` or `react`. | Set its `stop_hook_bootstrap` to `false` and confirm the change to avoid unnecessary reminders. |
+| The persona answers through another service or only with `edit_message`. | Set its `stop_hook_bootstrap` to `false` and confirm the change to avoid unnecessary reminders. |
 | A reminder was queued before opt-out was confirmed. | Already accepted queue items follow normal delivery; disabling reminders affects subsequent checks. |
 
 ### Reply-hook cleanup messages
@@ -7186,14 +7186,15 @@ require a server start after a confirmed change; see
 
 Slack reaction failures do not block message delivery or reply content. Failed
 queued removal keeps the delivered stage from being added beside it, so use
-`message-delivered` to confirm delivery rather than the visible emoji. A failed
-reply cleanup can also leave a reaction behind; there is no guaranteed reaction
-retry loop.
+`message-delivered` to confirm delivery rather than the visible emoji. The
+persona's own correlated `reply`, or its `react` on the message, clears its
+stage. A failed cleanup can also leave a reaction behind; there is no
+guaranteed reaction retry loop.
 
 Outstanding work retains its original queued name across restart/config changes.
 Recovery and a persona becoming up after reconnect or re-add can restore queued
 feedback with that name; they do not repeat its received log in the same server
-run. Early-reply suppression lasts 24 hours and pending/completed tracking 30 days
+run. Early reply or reaction suppression lasts 24 hours and pending/completed tracking 30 days
 in memory; restart loses reply suppression, so an already answered retained
 message can acquire a reaction again.
 

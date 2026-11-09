@@ -8684,10 +8684,10 @@ const QUEUED_DOC_ROWS: readonly (readonly [file: string, heading: HeadingMatch |
     /200/, /(?:durable storage|durably stored)/i, /(?:not delivery|not a delivery)/i,
     /\| 500 \|/, 'Message not stored', /\| 404 \|[^\n]*applied configuration/,
   ], 'After durable storage, 200 acknowledges storage, not delivery.\n| 500 | Message not stored |\n| 404 | No persona in the applied configuration |'],
-  [BOTS_DOC, '## Slack reply reminders', 'reminders use AD state and own reply calls for both agents, at most once per Slack delivery', [
-    /agent-director row/i, /working[^.]*waiting/i, /no [`]?reply[`]? tool call since that delivery/i,
+  [BOTS_DOC, '## Slack reply reminders', 'reminders use AD state and own reply or react calls for both agents, at most once per Slack delivery', [
+    /agent-director row/i, /working[^.]*waiting/i, /no [`]?reply[`]? or [`]?react[`]? tool call since that delivery/i,
     /at most one reminder per delivered Slack message/i, /Claude and Codex/i, 'stop_hook_bootstrap',
-  ], 'The agent-director row goes working to waiting, with no reply tool call since that delivery. There is at most one reminder per delivered Slack message. Claude and Codex use stop_hook_bootstrap.'],
+  ], 'The agent-director row goes working to waiting, with no reply or react tool call since that delivery. There is at most one reminder per delivered Slack message. Claude and Codex use stop_hook_bootstrap.'],
   [SERVER_SETTINGS_DOC, '## Server-wide settings', 'bind keeps clear-latch loopback and scheduled queueing independent of HTTP', [
     /`bind`[^|\n]*\|[^\n]*clear-latch/, /clear-latch[^.]*loopback/i,
     /(?:scheduled|cron)[^.]*(?:directly|in.process)[^.]*queue/i,
@@ -8701,9 +8701,9 @@ const QUEUED_DOC_ROWS: readonly (readonly [file: string, heading: HeadingMatch |
     /tag description[^.]*always/i, /`system_prompt_mode`/, /`none`/,
     /(?:one|same|single|shared) file[^.]*every persona/i, /(?:whom|whose)[^.]*(?:obey|follow)/i,
   ], 'The tag description is always carried, with `system_prompt_mode` `none` included. One file serves every persona and defines whom to obey.'],
-  [SERVER_SETTINGS_DOC, '## Server-wide settings', 'acknowledgement waits for the whole transcript receipt and an early reply suppresses it', [
-    /`ack_reaction`[^\n]*transcript[^\n]*whole message/i, /reply before delivery[^.]*suppress/i,
-  ], '| `ack_reaction` | Its transcript confirms the whole message first; a reply before delivery suppresses the later reaction. |'],
+  [SERVER_SETTINGS_DOC, '## Server-wide settings', 'acknowledgement waits for the whole transcript receipt and an early reply or reaction suppresses it', [
+    /`ack_reaction`[^\n]*transcript[^\n]*whole message/i, /reply or reaction before delivery[^.]*suppress/i,
+  ], '| `ack_reaction` | Its transcript confirms the whole message first; a reply or reaction before delivery suppresses the later reaction. |'],
   [SERVER_SETTINGS_DOC, "# Server settings", 'privacy: undelivered and removed-persona text persists, delivered text is removed within 24 hours', [
     /undelivered[^.]*(?:kept|retain)[^.]*(?:until delivered|until delivery)/i,
     /removed persona[^.]*queue/i, /delivered[^.]*(?:removed|deleted)[^.]*(?:within|no later than) 24 hours/i,

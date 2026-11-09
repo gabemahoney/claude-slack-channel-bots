@@ -1342,24 +1342,24 @@ describe('tool posting scope (through the MCP server)', () => {
 // ---------------------------------------------------------------------------
 
 describe('reply reminder tool facts', () => {
-  test.each(['success', 'Slack failure', 'target refusal', 'dry run'] as const)('%s: reply records its own persona before scope validation or Slack outcome', async outcome => {
+  test.each((['reply', 'react'] as const).flatMap(tool => (['success', 'Slack failure', 'target refusal', 'dry run'] as const).map(outcome => [outcome, tool] as const)))('%s: %s records its own persona before scope validation or Slack outcome', async (outcome, tool) => {
     const keys: string[] = []
     const deps = { ...h.deps, onReplyCall: async (key: string) => {
       expect(totalSlackCalls()).toBe(0)
       keys.push(key)
     } }
-    if (outcome === 'Slack failure') stubOf(h.alpha).script.post.push({ kind: 'platform', error: 'not_in_channel' })
+    if (outcome === 'Slack failure') stubOf(h.alpha).script[tool === 'reply' ? 'post' : 'reactionsAdd'].push({ kind: 'platform', error: 'not_in_channel' })
     if (outcome === 'dry run') process.env['SLACK_DRY_RUN'] = '1'
     const entry = registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer())
     const session = await openSession(entry, deps)
-    const result = await session.call('reply', TOOL_ARGS.reply(outcome === 'target refusal' ? B_CHANNEL : A_ALL))
+    const result = await session.call(tool, TOOL_ARGS[tool](outcome === 'target refusal' ? B_CHANNEL : A_ALL))
     expect(keys).toEqual([h.alpha.key])
     expect(result.isError === true).toBe(outcome === 'Slack failure' || outcome === 'target refusal')
     expect(slackCallCount(stubOf(h.beta))).toBe(0)
     if (outcome === 'target refusal' || outcome === 'dry run') expectNoSlackCall()
   })
 
-  test('a reply waits for its durable fact before posting, while other tools create no reply fact', async () => {
+  test('a reply waits for its durable fact before posting, while tools other than react create no reply fact', async () => {
     let release!: () => void
     let entered!: () => void
     const started = new Promise<void>(resolve => { entered = resolve })
@@ -1373,7 +1373,7 @@ describe('reply reminder tool facts', () => {
     release()
     expect((await replying).isError).toBeUndefined()
     expect(stubOf(h.alpha).calls.postMessage).toHaveLength(1)
-    await session.call('react', TOOL_ARGS.react(A_ALL))
+    await session.call('edit_message', TOOL_ARGS.edit_message(A_ALL))
     expect(keys).toEqual([h.alpha.key])
   })
 
@@ -2877,6 +2877,49 @@ describe('reply — ack reaction removal', () => {
   })
 })
 
+// A react on the triggering message answers it like a correlated reply.
+describe('react — ack reaction removal', () => {
+  test("a react removes only its own persona's tracked ack, once, through its own client", async () => {
+    shareAlphaChannelWithBeta()
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    trackAck(h.beta.key, A_ALL, MSG_TS)
+    const alpha = await openWithSettings(h.alpha)
+
+    expect((await alpha.call('react', TOOL_ARGS.react(A_ALL))).isError).toBeUndefined()
+    await alpha.call('react', { ...TOOL_ARGS.react(A_ALL), emoji: 'tada' })
+
+    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([REMOVE_EYES])
+    expect(stubOf(h.beta).callLog).toEqual([])
+    expect(consumeAck(h.beta.key, A_ALL, MSG_TS)).toBe(true)
+  })
+
+  test.each(['Slack failure', 'dry run'] as const)('a react ending in %s consumes nothing', async outcome => {
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    if (outcome === 'Slack failure') stubOf(h.alpha).script.reactionsAdd.push({ kind: 'platform', error: 'invalid_name' })
+    else process.env['SLACK_DRY_RUN'] = '1'
+    const session = await openWithSettings(h.alpha)
+
+    const result = await session.call('react', TOOL_ARGS.react(A_ALL))
+
+    expect(result.isError === true).toBe(outcome === 'Slack failure')
+    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([])
+    expect(consumeAck(h.alpha.key, A_ALL, MSG_TS)).toBe(true)
+  })
+
+  test("a react with the ack's own emoji succeeds on already_reacted and keeps that reaction", async () => {
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    stubOf(h.alpha).script.reactionsAdd.push({ kind: 'platform', error: 'already_reacted' })
+    const session = await openWithSettings(h.alpha)
+
+    const result = await session.call('react', { ...TOOL_ARGS.react(A_ALL), emoji: 'eyes' })
+
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0]!.text).toBe(`Reacted :eyes: to ${MSG_TS}`)
+    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([])
+    expect(consumeAck(h.alpha.key, A_ALL, MSG_TS)).toBe(false)
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Reply chunking by the server-wide settings
 // ---------------------------------------------------------------------------
@@ -3015,7 +3058,7 @@ describe('tool list and instructions', () => {
     expect(MCP_INSTRUCTIONS.length).toBeLessThanOrEqual(MCP_INSTRUCTIONS_MAX_CHARS)
     const points = [
       'The sender reads Slack', 'Messages arrive as the <channel> tag described in the system prompt',
-      'via:', '<@ID>', 'attachment_count', 'You may act', 'With DMs on', 'Pass message_id', 'reply accepts files',
+      'via:', '<@ID>', 'attachment_count', 'You may act', 'With DMs on', 'To remove the ack reaction', 'reply accepts files',
     ]
     let last = -1
     for (const point of points) {
@@ -3030,7 +3073,7 @@ describe('tool list and instructions', () => {
     expect(MCP_INSTRUCTIONS).toContain('end a turn with no terminal text unless a terminal reader needs it.')
     expect(MCP_INSTRUCTIONS).toMatch(/user ID \(U\.\.\. or W\.\.\.\) as chat_id/)
     expect(MCP_INSTRUCTIONS).toContain('With DMs off you have no DM target. Any other target is refused.')
-    expect(MCP_INSTRUCTIONS).toContain('to reply to remove the ack reaction')
+    expect(MCP_INSTRUCTIONS).toContain('To remove the ack reaction, reply with message_id (the triggering message ts) or react to that message.')
     expect(MCP_INSTRUCTIONS).not.toContain('source=')
     assertNoLeak(MCP_INSTRUCTIONS)
   })

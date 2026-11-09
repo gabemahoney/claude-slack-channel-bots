@@ -9,7 +9,7 @@ export const REPLY_REMINDER_POLL_MS = 1000
 export const REPLY_TOOL_PREALLOWED_LABEL = 'reply_tool_preallowed=1'
 export interface ReplyReminders {
   wake(key: string): void
-  /** Called synchronously when CSCB sees the bot invoke reply, including a failed call. */
+  /** Called synchronously when CSCB sees the bot invoke reply or react, including a failed call. */
   noteReplyCall(key: string): Promise<void>
   observe(key: string, row: GetResult): Promise<void>
   forget(key: string): Promise<void>

@@ -40,11 +40,11 @@ These top-level fields apply to the whole server. Confirmed changes take effect 
 
 **Custom emoji must exist in the Slack workspace before you configure them.** `spinthinking` is custom; before starting, make sure both selected names are available in each persona's workspace. Omitting either setting selects its default; empty strings and `null` are invalid.
 
-CSCB removes the queued reaction before adding the delivered reaction. Setting both names alike keeps one reaction through both stages; dropped messages and injected messages get neither. The first successful `reply` text post or file upload carrying the original `message_id` clears that persona's actual stage without delaying the rest of the reply.
+CSCB removes the queued reaction before adding the delivered reaction. Setting both names alike keeps one reaction through both stages; dropped messages and injected messages get neither. The first successful `reply` text post or file upload carrying the original `message_id`, or that persona's successful `react` on the message, clears that persona's actual stage without delaying the tool. A `react` with the stage's own emoji keeps that reaction.
 
 Both settings take effect only at server startup after a [confirmed change](reload.md#what-a-confirmation-applies). Outstanding work retains its original queued name across restarts and setting changes, including when queued feedback is restored after reconnect; its delivered stage uses the setting in effect at delivery.
 
-A reply before delivery suppresses later stages: early replies are remembered for 24 hours and pending/completed reaction tracking lasts 30 days in memory. Restart loses reply suppression, so already answered retained work can acquire a reaction again. For missing or lingering reactions, see [Troubleshooting](troubleshooting.md#troubleshooting).
+A reply or reaction before delivery suppresses later stages: early answers are remembered for 24 hours and pending/completed reaction tracking lasts 30 days in memory. Restart loses reply suppression, so already answered retained work can acquire a reaction again. For missing or lingering reactions, see [Troubleshooting](troubleshooting.md#troubleshooting).
 
 ---
 
