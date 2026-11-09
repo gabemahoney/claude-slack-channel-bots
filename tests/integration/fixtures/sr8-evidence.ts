@@ -259,7 +259,10 @@
  *     Stage ONLY this fault/page in the slice. Use users.conversations hang,
  *     error internal_error/missing_scope/invalid_auth, or rate_limit respectively.
  *     Need >=2 fired records and scoped incomplete diagnostics for key; pages=0
- *     for first, >0 for later. Hang requires reason=deadline with deadline/next
+ *     for first, >0 for later, except denied later also accepts pages=0 when
+ *     every fault's api row carries a non-empty cursor, proving the later page
+ *     (the credentials refusal resets scan progress before publishing
+ *     reason=authentication slack=invalid_auth). Hang requires reason=deadline with deadline/next
  *     attempt timestamps and each request's own fault-settled/abort. Capture through
  *     the LAST fault's diagnostic/settlement. Each diagnostic is uniquely correlated
  *     to the staged request's arrival interval before the next faulted attempt.
@@ -937,8 +940,13 @@ export function membershipFaultVerdicts(kind: string, page: string, key: string,
   const faults = stub?.filter(r => r.event === 'fault' && r.control === 'faults' && r.method === 'users.conversations' && r.label === key && r.outcome === expected[0]) ?? []
   const observed = diagnostics?.filter(d => d.reason !== 'none') ?? []
   const answers = faults.map(f => stub?.filter(r => r.event === 'api' && r.request_id === f.request_id) ?? [])
+  // A later-page invalid_auth is a credentials refusal: connectionChanged
+  // resets the scan status (pages=0) before publishing the authentication failure.
+  // With pages=0 the diagnostic no longer shows page 1 succeeded, so the stub's
+  // request cursor must prove each fault was a later page.
+  const laterCursor = answers.length > 0 && answers.every(a => a.length === 1 && typeof a[0].cursor === 'string' && a[0].cursor !== '')
   const matches = observed.filter(d => !d.complete && d.reason === expected[1] && (expected[2] === undefined || d.slack === expected[2])
-    && (page === 'first' ? d.pages === 0 : d.pages > 0))
+    && (page === 'first' ? d.pages === 0 : d.pages > 0 || kind === 'denied' && d.pages === 0 && laterCursor))
   let missing = !stub || !diagnostics || faults.length < 2 || !observed.length || !stateRead(before) || !stateRead(after)
     || faults.some(f => !nonnegative(f.arrival_mono_ms) || !nonnegative(f.arrival_epoch_ms) || !f.request_id) || !positive(retryMs) || !positive(requestMs)
   let bad = diagnostics?.some(d => d.complete) === true || (observed.length > 0 && matches.length === 0) || (stateRead(before) && stateRead(after) && before !== after)

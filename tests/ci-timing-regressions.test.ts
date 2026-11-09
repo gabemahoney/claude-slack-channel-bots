@@ -779,7 +779,8 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     const problem = { hang: 'deadline', transient: 'transport', scope: 'access', denied: 'authentication', rate: 'transport' }[kind]!
     const faults: any[] = [0, 1].map(i => ({ seq: i * 2 + 1, event: 'fault', control: 'faults', method: 'users.conversations', label: key,
       request_id: `request-${i}`, outcome, arrival_mono_ms: 100 + i * gap, arrival_epoch_ms: clock + i * gap, ts: iso(clock + i * gap), text: token }))
-    if (kind !== 'hang') faults.push(...[0, 1].map(i => ({ event: 'api', request_id: `request-${i}`, ts: iso(clock + i * gap), answer, status: kind === 'rate' ? 429 : 200 })))
+    if (kind !== 'hang') faults.push(...[0, 1].map(i => ({ event: 'api', request_id: `request-${i}`, ts: iso(clock + i * gap), cursor: page === 'later' ? 'later' : '',
+      answer, status: kind === 'rate' ? 429 : 200 })))
     else faults.push(...[0, 1].map(i => ({ seq: i * 2 + 2, event: 'fault-settled', request_id: `request-${i}`, resolution: 'abort', ts: iso(clock + i * gap + duration) })))
     const log = [0, 1].map(i => scanLine(clock + i * gap + duration, false, page === 'later' ? 1 : 0, problem,
       kind === 'rate' ? after : undefined, clock + i * gap + MEMBERSHIP_ATTEMPT_TIMEOUT_MS)).join('\n')
@@ -788,6 +789,52 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
   }
   test.each(['hang', 'transient', 'scope', 'denied', 'rate'])('membership %s first and later page published outcomes', kind => {
     for (const page of ['first', 'later']) { const f = member(kind, page); output(f.run(), 0) }
+  })
+  // The kept test-45/test-48 later-denied runs: each refusal resets the scan
+  // (pages=0) and republishes reason=none before the next attempt.
+  function reset(kind: string) {
+    const f = member(kind, 'later')
+    const [first, second] = f.log.replace(/ pages=1 positives=1 /g, ' pages=0 positives=0 ').split('\n')
+    const idle = `[${iso(f.faults[1].arrival_epoch_ms - 1)}] ${membershipScanDiagnostic(key, { state: 'unverified', pages: 0, positives: 0 })}`
+    f.log = [first, idle, second].join('\n')
+    return f
+  }
+  test('membership denied later page passes the credentials-refusal reset: pages=0 reason=authentication slack=invalid_auth', () => {
+    const f = reset('denied')
+    expect(f.log).toContain('pages=0 positives=0 reason=authentication slack_error=invalid_auth')
+    expect(f.run().map(r => r.verdict)).toEqual(['pass', 'pass'])
+    expect(f.run()[0].stats).toMatchObject({ case: 'denied', page: 'later', fired: 2, incomplete: 2 }); output(f.run(), 0)
+  })
+  test.each(['other-reason', 'no-slack-error', 'other-slack-error', 'first-page-cursor', 'one-first-page-cursor', 'before-its-fault', 'no-diagnostic'] as const)
+  ('membership denied later page reset does not pass with %s', defect => {
+    const f = reset('denied')
+    const api = f.faults.filter(r => r.event === 'api')
+    if (defect === 'other-reason') f.log = f.log.replaceAll('reason=authentication slack_error=invalid_auth', 'reason=storage')
+    if (defect === 'no-slack-error') f.log = f.log.replaceAll(' slack_error=invalid_auth', '')
+    if (defect === 'other-slack-error') f.log = f.log.replaceAll('slack_error=invalid_auth', 'slack_error=missing_scope')
+    // The faulted requests asked for the first page, so pages=0 proves nothing about a later one.
+    if (defect === 'first-page-cursor') for (const r of api) r.cursor = ''
+    if (defect === 'one-first-page-cursor') api[1].cursor = ''
+    // Diagnostic 0 is published before fault 0, so membership-retry's correlation rejects it.
+    if (defect === 'before-its-fault') f.log = [0, 1].map(i => scanLine(clock - 1 + i * f.wait, false, 0, 'authentication')).join('\n')
+    if (defect === 'no-diagnostic') f.log = f.log.split('\n').filter(l => l.includes('reason=none')).join('\n')
+    const rows = f.run(), verdicts = rows.map(r => r.verdict)
+    if (defect === 'before-its-fault') {
+      expect(verdicts).toEqual(['pass', 'fail'])
+      expect(rows[1].stats.min_ms).toBeDefined()
+    } else if (defect === 'no-diagnostic') expect(verdicts).toEqual(['missing', 'missing'])
+    else expect(verdicts).toEqual(['fail', 'missing'])
+    output(rows, 1)
+  })
+  test.each(['hang', 'transient', 'scope', 'rate'])('membership %s later page with pages=0 still fails', kind => {
+    const f = reset(kind)
+    expect(f.log).toContain('pages=0 positives=0')
+    expect(f.run()[0]).toMatchObject({ verdict: 'fail', stats: { page: 'later', incomplete: 0 } }); output(f.run(), 1)
+  })
+  test('membership denied first page still requires pages=0', () => {
+    const f = member('denied', 'first')
+    f.log = f.log.replace(/ pages=0 positives=0 /g, ' pages=1 positives=1 ')
+    expect(f.run()[0]).toMatchObject({ verdict: 'fail', stats: { page: 'first', incomplete: 0 } }); output(f.run(), 1)
   })
   test.each(['early-start', 'early-429', 'early-after-deadline', 'state-changed', 'false-complete', 'wrong-page', 'wrong-outcome'] as const)
   ('membership fails %s without an allowance', defect => {
