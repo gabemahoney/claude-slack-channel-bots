@@ -693,7 +693,7 @@ two actual identical DM take-ins before counting one.
 Report actual verdicts; completed native observation and synthetic controls
 are not final gate, full CI or heavy acceptance.
 
-The heavy leg's AI criteria run on the model set by CI_ANTHROPIC_AI_MODEL (azure/openai/gpt-6-astra for release runs); gate and other scripts use CI_ANTHROPIC_MODEL.
+The heavy leg's AI criteria run on the model set by CI_ANTHROPIC_AI_MODEL, which defaults to CI_ANTHROPIC_MODEL (release runs leave it unset); gate and other scripts use CI_ANTHROPIC_MODEL.
 
 Provision `CI_ANTHROPIC_API_KEY`, optional `CI_ANTHROPIC_BASE_URL` and
 `CI_ANTHROPIC_MODEL` in the runner and reader environment through the existing

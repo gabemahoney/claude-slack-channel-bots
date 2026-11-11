@@ -19,7 +19,7 @@ import { personaTranscripts, type TranscriptEntry } from './integration/fixtures
 // Unpaid native-evidence controls only; no unit result certifies a real AI trial.
 function evidence() {
   const fixture = JSON.parse(readFileSync(new URL('./fixtures/delivery-wrapper/wrapper-cases.json', import.meta.url), 'utf8'))[2]
-  const path = '/scenario/projects/aiac11/session.jsonl', model = 'azure/openai/gpt-6-astra'
+  const path = '/scenario/projects/aiac11/session.jsonl', model = 'aws/anthropic/bedrock-claude-opus-5-5'
   const entry = (offset: number, value: any): TranscriptEntry => ({ path, offset, at: offset,
     value: { sessionId: 'session', isSidechain: false, ...value }, ...parseDeliveryTranscriptRecord('claude', value) })
   const take = entry(20, { type: 'user', uuid: 'case3', message: { role: 'user', content: fixture.typed } })
@@ -331,7 +331,7 @@ test('ordinary AI readback requires exact fields from its completed receipt-back
   expect(() => completedAIReadback(e)).toThrow('AI read-back field differs')
 })
 
-test.each(['azure/openai/gpt-6-astra', 'aws/anthropic/bedrock-claude-opus-5-5'])('completed readback records the actual selected model %s and rejects substitution', model => {
+test.each(['aws/anthropic/bedrock-claude-opus-5-5', 'claude-opus-5-5'])('completed readback records the actual selected model %s and rejects substitution', model => {
   const e = ordinaryEvidence()
   e.model = model; e.reply.value.requestedModel = model; e.reply.value.message.model = model
   expect(completedAIReadback(e).actual_model).toBe(model)
@@ -370,10 +370,10 @@ test.each([false, true])('fresh hazard proof accepts only its exact native conve
 })
 
 test.each([
-  ['azure/openai/gpt-6-astra', 'azure/openai/gpt-6-astra', '1', 0],
-  ['azure/openai/gpt-6-astra', 'claude-opus-5-5', '1', 1],
+  ['aws/anthropic/bedrock-claude-opus-5-5', 'aws/anthropic/bedrock-claude-opus-5-5', '1', 0],
+  ['aws/anthropic/bedrock-claude-opus-5-5', 'claude-opus-5-5', '1', 1],
   ['model\n', 'model\n', '1', 1],
-  ['azure/openai/gpt-6-astra', 'azure/openai/gpt-6-astra', '0', 1],
+  ['aws/anthropic/bedrock-claude-opus-5-5', 'aws/anthropic/bedrock-claude-opus-5-5', '0', 1],
 ] as const)('actual AI shell validates selected/pinned model and fallback setting %j/%j/%s', (selected, pinned, fallback, status) => {
   const root = mkdtempSync(join(tmpdir(), 'ai-pin-shell-'))
   try {

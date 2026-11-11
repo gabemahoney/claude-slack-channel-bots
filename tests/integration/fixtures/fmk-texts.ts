@@ -1029,6 +1029,11 @@
  *                                 1 to LIVE_ROW_SEQUENCE_STEP3_RUNS, one line each:
  *                                 every line a step-3 run of the live-row sequence
  *                                 logs when it marked the row `missing`
+ *   liveRowSequenceStep2GetMissingLine <ref>
+ *                                 src/live-row-sequence.ts liveRowSequenceGetLine(<ref>,
+ *                                 2, a LIVE_ROW_READ_ROW read of state `missing`): the
+ *                                 line the live-row sequence's step-2 `get` logs when
+ *                                 it read the row `missing`
  *   stuckLaunchHeldPostedLines <key>
  *                                 src/pending-row.ts stuckLaunchPostLine(<key>,
  *                                 STUCK_LAUNCH_MARK_HELD, STUCK_LAUNCH_POSTED, …) for
@@ -3630,6 +3635,13 @@ async function liveRowSequenceStep3MarkedMissingLines(ref: string): Promise<stri
   return lines.join('\n')
 }
 
+/** The live-row sequence's step-2 `get` line for `ref` when it read the row `missing`. */
+async function liveRowSequenceStep2GetMissingLine(ref: string): Promise<string> {
+  const lineOf = await functionExport('live-row-sequence.ts', 'liveRowSequenceGetLine')
+  const row = await stringExport('live-row-sequence.ts', 'LIVE_ROW_READ_ROW')
+  return builtText('live-row-sequence.ts', 'liveRowSequenceGetLine', lineOf(ref, 2, { kind: row, row: { state: 'missing' } }))
+}
+
 /** Every line the held text's poster logs for persona `key` with the answer `posted`: both forms of the text, each unmuted and muted, joined by newlines. */
 async function stuckLaunchHeldPostedLines(key: string): Promise<string> {
   const lineOf = await functionExport('pending-row.ts', 'stuckLaunchPostLine')
@@ -3848,6 +3860,7 @@ const FN_ENTRIES: Readonly<Record<string, FnEntry>> = {
   }),
   stuckLaunchAbortKillSucceededHead: oneArgument('stuckLaunchAbortKillSucceededHead', 'key', stuckLaunchAbortKillSucceededHead),
   liveRowSequenceStep3MarkedMissingLines: oneArgument('liveRowSequenceStep3MarkedMissingLines', 'ref', liveRowSequenceStep3MarkedMissingLines),
+  liveRowSequenceStep2GetMissingLine: oneArgument('liveRowSequenceStep2GetMissingLine', 'ref', liveRowSequenceStep2GetMissingLine),
   stuckLaunchHeldPostedLines: oneArgument('stuckLaunchHeldPostedLines', 'key', stuckLaunchHeldPostedLines),
   pendingRowRuleRoundLineHead: exactArguments('pendingRowRuleRoundLineHead', ['ref', 'origin'], ([ref, origin]) =>
     pendingRowRuleRoundLineHead(ref!, origin!),

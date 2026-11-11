@@ -159,7 +159,7 @@ describe('heavy planning and result validation', () => {
   })
 
   test.each([
-    ['azure/openai/gpt-6-astra', true], ['claude-opus-5-5', true], ['org/model:version@pin', true],
+    ['aws/anthropic/bedrock-claude-opus-5-5', true], ['claude-opus-5-5', true], ['org/model:version@pin', true],
     ['', false], ['model with spaces', false], ['model\n', false], ['model\r', false],
     ['-model', false], ['a'.repeat(257), false], ['model$(command)', false],
   ])('safe selected model %j accepted=%s', (value, expected) => expect(safeModel(value)).toBe(expected))
@@ -896,8 +896,8 @@ describe('heavy execution with fake children', () => {
     expect(stdout.at(-1)).toMatch(/^REAL-AGENT-VERDICT PASS /)
   })
 
-  test('accepts an explicitly selected non-Opus AI model while keeping ordinary routing separate', async () => {
-    const selected = 'azure/openai/gpt-6-astra'
+  test('accepts an explicitly selected AI model other than the CI model while keeping ordinary routing separate', async () => {
+    const selected = 'aws/anthropic/bedrock-claude-opus-5-5'
     process.env.CI_ANTHROPIC_AI_MODEL = selected
     process.env.CI_ANTHROPIC_OPUS_MODEL = 'ignored-legacy-model'
     expect(await run()).toBe(true)
@@ -910,9 +910,9 @@ describe('heavy execution with fake children', () => {
   })
 
   test('defaults AI to a non-Opus CI model without imposing a family restriction', async () => {
-    process.env.CI_ANTHROPIC_MODEL = 'azure/openai/gpt-6-astra'
+    process.env.CI_ANTHROPIC_MODEL = 'org/model:version@pin'
     expect(await run()).toBe(true)
-    expect(jobsRun().map(c => [c.model, c.aiModel])).toEqual(Array(3).fill(['azure/openai/gpt-6-astra', 'azure/openai/gpt-6-astra']))
+    expect(jobsRun().map(c => [c.model, c.aiModel])).toEqual(Array(3).fill(['org/model:version@pin', 'org/model:version@pin']))
   })
 
   test.each(['', 'model with spaces', 'model\n', 'model\r', '-model', 'a'.repeat(257), 'model$(command)'])('invalid AI override %j refuses before filesystem or child effects', async value => {
@@ -923,7 +923,7 @@ describe('heavy execution with fake children', () => {
   })
 
   test.each(['AI', 'ordinary'])('a result using the other routing model fails its %s invocation', async kind => {
-    const selected = 'azure/openai/gpt-6-astra'
+    const selected = 'aws/anthropic/bedrock-claude-opus-5-5'
     process.env.CI_ANTHROPIC_AI_MODEL = selected
     response = argv => {
       if (argv[1] !== 'run' || argv.includes('id') || argv.includes('/opt/cscb-ci/real-agent-codex-job.sh')) return {}

@@ -158,7 +158,7 @@ try {
   const foreignPath = join(transcripts, 'foreign.jsonl')
   const native = (type: string, uuid: string, timestamp: number, extra: any = {}) => ({ type, uuid, timestamp, sessionId: 'control', isSidechain: false, ...extra })
   const take = native('user', 'receipt', 20000, { message: { role: 'user', content: ai[3].typed } })
-  const model = 'azure/openai/gpt-6-astra'
+  const model = 'aws/anthropic/bedrock-claude-opus-5-5'
   const reply = (uuid = 'response', timestamp = 30000, extra: any = {}) => native('assistant', uuid, timestamp, { parentUuid: 'receipt', requestedModel: model,
     message: { role: 'assistant', model, stop_reason: 'end_turn', content: [{ type: 'text', text: JSON.stringify(bang) }] }, ...extra })
   const accepted = { kind: 'accepted', seq: 1, source: 'slack', channel: ai[3].msg.chat_id, ts: ai[3].msg.ts, user: ai[3].msg.user_id, received_at: 10000 }

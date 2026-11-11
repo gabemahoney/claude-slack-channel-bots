@@ -1296,7 +1296,8 @@ note_worker "${STEP}" "${ID_A}"
 # ---------------------------------------------------------------------------
 # Leg 7: a pending row with no launch start; no keys, no kill, one post and
 # status-only re-checks; cleared with one bring-up retry once the harness's
-# loop marks it missing
+# loop marks it missing. From agent-director 0.18.0 CSCB's own first read
+# marks it missing: no launch-start latch or hold, no loop.
 # ---------------------------------------------------------------------------
 
 STEP="leg 7 (pending row with no launch start)"
@@ -1305,6 +1306,7 @@ MARK_P="$(ad_shim_mark)"
 LOG_P="$(wc -l < "${SLACK_STATE_DIR}/server.log")"
 SID_B_OLD="$(session_id_of "${SESSION_B}")"
 [[ "${SID_B_OLD}" =~ ^\$[0-9]+$ ]] || fail "${STEP}: no session ${SESSION_B} on the scenario's tmux server"
+EDIT_MS_P="$(date +%s%3N)"
 ad_store_pending_no_launch "${ID_B}"
 expect_worker_runs "${STEP}" "${ID_B}"
 # B's latch line: its printed head and the hold case. The status-only
@@ -1316,74 +1318,109 @@ stop_server
 start_server --live
 START_COUNT=$(( START_COUNT + 1 ))
 wait_for_count "${COMPLETE_2}" "${START_COUNT}" "${START_WAIT_S}" "${STEP}: start pass ${START_COUNT} never completed"
-wait_for_log "${LATCH_HOLD_B}" "${START_WAIT_S}" "${STEP}: ${PERSONA_B} never latched with '${HOLD_CASE}'"
-MARK_L="$(ad_shim_mark)"
-wait_until "${POST_WAIT_S}" "${STEP}: no post for ${PERSONA_B} after the latch" posts_at_least "${SUFFIX_B}" "${POSTS_P}" 1
-sleep "${SETTLE_S}"
-posts_of "${SUFFIX_B}" "${POSTS_P}"
-(( ${#POSTS[@]} == 1 )) || fail "${STEP}: ${#POSTS[@]} posts for ${PERSONA_B} after the latch, not 1"
-[[ "${POSTS[0]}" == "${HOLD_NOTICE_B}" ]] || fail "${STEP}: the latch post reads '${POSTS[0]}', not '${HOLD_NOTICE_B}'"
-window_calls "${STEP}" "${MARK_P}" - "${ID_B}"
-echo "${TEST_NAME}: ${STEP}: CSCB calls of ${ID_B} up to the latch: ${WIN_VERBS[*]-none}"
+if ad_release_at_least 0.18.0; then
+    # From 0.18.0 CSCB's first read of the row checks it and marks it
+    # missing (a pending row with no launch start is past its grace): CSCB
+    # sees missing at once, so B has no launch-start latch or hold and the
+    # harness's loop has nothing to mark. What the restart path then did beside the
+    # still-running old session is recorded below (S8), not asserted.
+    tick="$(ad_missing_tick "${ID_B}" "${EDIT_MS_P}")" \
+        || fail "${STEP}: no ad.find_missing.tick record marked row ${ID_B} missing after the edit"
+    caller="$(ad_mark_caller "${tick}" "${MARK_P}")" || fail "${STEP}: no agent-director call after the edit could have marked ${ID_B}: ${tick}"
+    IFS=$'\t' read -r pos time ppid verb role <<< "${caller}"
+    [[ "${role}" == cscb && "${ppid}" == "${SERVER_PID}" ]] \
+        || fail "${STEP}: the mark's call (shim line ${pos}, ${verb} at ${time}, parent ${ppid}) is not the bot server ${SERVER_PID}'s"
+    echo "${TEST_NAME}: ${STEP}: the bot server's ${verb} at shim line ${pos} marked ${ID_B} missing"
+    sleep "${SETTLE_S}"
+    n="$(count_in "$(log_slice "${LOG_P}")" "${LATCH_HOLD_B}")"
+    [[ "${n}" == 0 ]] || fail "${STEP}: server.log holds ${n} launch-start latch line(s) for ${PERSONA_B} since the leg began, not none"
+    echo "${TEST_NAME}: ${STEP}: [S8, recorded] other latch lines: $(grep -F -- "${LATCH_HEAD_B}" "$(log_slice "${LOG_P}")" || true)"
+    posts_of "${SUFFIX_B}" "${POSTS_P}"
+    for p in ${POSTS[@]+"${POSTS[@]}"}; do
+        [[ "${p}" != "${HOLD_NOTICE_B}" ]] || fail "${STEP}: a launch-start-not-recorded post for ${PERSONA_B}: '${p}'"
+    done
+    MARK_R="$(ad_shim_mark)"
+    window_calls "${STEP}" "${MARK_P}" "${MARK_R}" "${ID_B}"
+    echo "${TEST_NAME}: ${STEP}: CSCB calls of ${ID_B} since the edit: ${WIN_VERBS[*]-none}"
+    expect_one_relaunch "${STEP}" "${ID_B}"
+    for verb in send-keys kill; do
+        n="$(window_count "${verb}")"
+        [[ "${n}" == 0 ]] || fail "${STEP}: a CSCB process made ${n} ${verb} call(s) of ${ID_B}"
+    done
+    for i in ${WIN_VERBS[@]+"${!WIN_VERBS[@]}"}; do
+        [[ "${WIN_VERBS[i]}" == resume || "${WIN_VERBS[i]}" == spawn ]] \
+            && echo "${TEST_NAME}: ${STEP}: ${ID_B}: ${WIN_VERBS[i]} ${WIN_ARGS[i]:0:300}"
+    done
+else
+    wait_for_log "${LATCH_HOLD_B}" "${START_WAIT_S}" "${STEP}: ${PERSONA_B} never latched with '${HOLD_CASE}'"
+    MARK_L="$(ad_shim_mark)"
+    wait_until "${POST_WAIT_S}" "${STEP}: no post for ${PERSONA_B} after the latch" posts_at_least "${SUFFIX_B}" "${POSTS_P}" 1
+    sleep "${SETTLE_S}"
+    posts_of "${SUFFIX_B}" "${POSTS_P}"
+    (( ${#POSTS[@]} == 1 )) || fail "${STEP}: ${#POSTS[@]} posts for ${PERSONA_B} after the latch, not 1"
+    [[ "${POSTS[0]}" == "${HOLD_NOTICE_B}" ]] || fail "${STEP}: the latch post reads '${POSTS[0]}', not '${HOLD_NOTICE_B}'"
+    window_calls "${STEP}" "${MARK_P}" - "${ID_B}"
+    echo "${TEST_NAME}: ${STEP}: CSCB calls of ${ID_B} up to the latch: ${WIN_VERBS[*]-none}"
 
-STEP="leg 7 (held)"
-wait_for_count "${ROUND_HELD_B}" $(( held_before + 1 )) $(( RECHECK_S + RECHECK_ALLOWANCE_S )) "${STEP}: no status-only re-check held the latch"
-sleep "${SETTLE_S}"
-MARK_HELD="$(ad_shim_mark)"
-window_any "${STEP}" "${MARK_L}" "${MARK_HELD}" "${ID_B}"
-[[ "${WIN_VERBS[*]-}" == status ]] || fail "${STEP}: the re-check's calls were '${WIN_VERBS[*]-}', not one status"
-[[ "${WIN_PPIDS[0]}" == "${SERVER_PID}" ]] || fail "${STEP}: its status has parent ${WIN_PPIDS[0]}, not the bot server ${SERVER_PID}"
-window_calls "${STEP}" "${MARK_P}" "${MARK_HELD}" "${ID_B}"
-for verb in send-keys kill; do
-    n="$(window_count "${verb}")"
-    [[ "${n}" == 0 ]] || fail "${STEP}: a CSCB process made ${n} ${verb} call(s) of ${ID_B} while it was latched"
-done
-expect_worker_runs "${STEP}" "${ID_B}"
-row_reads "${ID_B}" pending || fail "${STEP}: row ${ID_B} no longer reads pending"
+    STEP="leg 7 (held)"
+    wait_for_count "${ROUND_HELD_B}" $(( held_before + 1 )) $(( RECHECK_S + RECHECK_ALLOWANCE_S )) "${STEP}: no status-only re-check held the latch"
+    sleep "${SETTLE_S}"
+    MARK_HELD="$(ad_shim_mark)"
+    window_any "${STEP}" "${MARK_L}" "${MARK_HELD}" "${ID_B}"
+    [[ "${WIN_VERBS[*]-}" == status ]] || fail "${STEP}: the re-check's calls were '${WIN_VERBS[*]-}', not one status"
+    [[ "${WIN_PPIDS[0]}" == "${SERVER_PID}" ]] || fail "${STEP}: its status has parent ${WIN_PPIDS[0]}, not the bot server ${SERVER_PID}"
+    window_calls "${STEP}" "${MARK_P}" "${MARK_HELD}" "${ID_B}"
+    for verb in send-keys kill; do
+        n="$(window_count "${verb}")"
+        [[ "${n}" == 0 ]] || fail "${STEP}: a CSCB process made ${n} ${verb} call(s) of ${ID_B} while it was latched"
+    done
+    expect_worker_runs "${STEP}" "${ID_B}"
+    row_reads "${ID_B}" pending || fail "${STEP}: row ${ID_B} no longer reads pending"
 
-STEP="leg 7 (the loop marks the row)"
-run_find_missing_loop "${FM_INTERVAL_S}"
-wait_until "${MARK_WAIT_S}" "${STEP}: the find-missing loop never marked row ${ID_B} missing" row_reads "${ID_B}" missing
-stop_find_missing_loop
-sed 's/^/  loop| /' "${FIND_MISSING_LOOP_LOG}"
-wait_for_log "${ROUND_CLEARED_B}" $(( RECHECK_S + RECHECK_ALLOWANCE_S )) "${STEP}: no re-check cleared the latch on missing"
-wait_for_log "${RETRY_AT_ONCE_HEAD_B}" "${START_WAIT_S}" "${STEP}: no bring-up retry followed the clear"
-MARK_R="$(ad_shim_mark)"
-window_any "${STEP}" "${MARK_HELD}" "${MARK_R}" "${ID_B}"
-echo "${TEST_NAME}: ${STEP}: CSCB calls from the held re-check to the retry's answer: ${WIN_VERBS[*]-none}"
-[[ "${WIN_VERBS[0]:-}" == status ]] || fail "${STEP}: the clearing re-check made '${WIN_VERBS[0]:-none}' first, not status"
-n="$(window_count find-missing)"
-[[ "${n}" == 0 ]] || fail "${STEP}: a CSCB process made ${n} find-missing call(s) before the bring-up retry"
-for verb in send-keys kill; do
-    n="$(window_count "${verb}")"
-    [[ "${n}" == 0 ]] || fail "${STEP}: a CSCB process made ${n} ${verb} call(s) of ${ID_B}"
-done
-for i in "${!WIN_VERBS[@]}"; do
-    [[ "${WIN_VERBS[i]}" == resume || "${WIN_VERBS[i]}" == spawn ]] \
-        && echo "${TEST_NAME}: ${STEP}: ${ID_B}: ${WIN_VERBS[i]} ${WIN_ARGS[i]:0:300}"
-done
-wait_until "${POST_WAIT_S}" "${STEP}: no recovery post" posts_at_least "${SUFFIX_B}" "${POSTS_P}" 2
-sleep "${SETTLE_S}"
-posts_of "${SUFFIX_B}" "${POSTS_P}"
-[[ "${POSTS[1]}" == "${HOLD_RECOVERY_B}" ]] || fail "${STEP}: the second post reads '${POSTS[1]}', not '${HOLD_RECOVERY_B}'"
-n=0
-for p in "${POSTS[@]}"; do
-    [[ "${p}" == "${HOLD_RECOVERY_B}" ]] && n=$(( n + 1 ))
-done
-(( n == 1 )) || fail "${STEP}: ${n} recovery posts for ${PERSONA_B}, not 1"
-n="$(count_log "${RETRY_AT_ONCE_HEAD_B}")"
-[[ "${n}" == 1 ]] || fail "${STEP}: server.log holds ${n} after-clear retry line(s) for ${PERSONA_B}, not 1"
-# The one bring-up retry is the restart path's decision: one resume, after
-# its liveness read found the row missing and with no kill.
-window_any "${STEP}" "${MARK_HELD}" "${MARK_R}" "${ID_B}"
-expect_one_relaunch "${STEP}" "${ID_B}"
-SLICE="$(log_slice "${LOG_P}")"
-without_kill="$(_scenario_printed "${STEP}" relaunchWithoutKillLine "${KEY_B}" RELAUNCH_NO_KILL_ROW_READ LIVENESS_READING_DEAD_MISSING)"
-after_kill="$(_scenario_printed "${STEP}" relaunchAfterKillLine "${KEY_B}" "${WORK_B}" RELAUNCH_KILL_NONE)"
-for m in "${without_kill}" "${after_kill}"; do
-    n="$(count_in "${SLICE}" "${m}")"
-    [[ "${n}" == 1 ]] || fail "${STEP}: server.log holds ${n} line(s) '${m}' since the leg began, not 1"
-done
+    STEP="leg 7 (the loop marks the row)"
+    run_find_missing_loop "${FM_INTERVAL_S}"
+    wait_until "${MARK_WAIT_S}" "${STEP}: the find-missing loop never marked row ${ID_B} missing" row_reads "${ID_B}" missing
+    stop_find_missing_loop
+    sed 's/^/  loop| /' "${FIND_MISSING_LOOP_LOG}"
+    wait_for_log "${ROUND_CLEARED_B}" $(( RECHECK_S + RECHECK_ALLOWANCE_S )) "${STEP}: no re-check cleared the latch on missing"
+    wait_for_log "${RETRY_AT_ONCE_HEAD_B}" "${START_WAIT_S}" "${STEP}: no bring-up retry followed the clear"
+    MARK_R="$(ad_shim_mark)"
+    window_any "${STEP}" "${MARK_HELD}" "${MARK_R}" "${ID_B}"
+    echo "${TEST_NAME}: ${STEP}: CSCB calls from the held re-check to the retry's answer: ${WIN_VERBS[*]-none}"
+    [[ "${WIN_VERBS[0]:-}" == status ]] || fail "${STEP}: the clearing re-check made '${WIN_VERBS[0]:-none}' first, not status"
+    n="$(window_count find-missing)"
+    [[ "${n}" == 0 ]] || fail "${STEP}: a CSCB process made ${n} find-missing call(s) before the bring-up retry"
+    for verb in send-keys kill; do
+        n="$(window_count "${verb}")"
+        [[ "${n}" == 0 ]] || fail "${STEP}: a CSCB process made ${n} ${verb} call(s) of ${ID_B}"
+    done
+    for i in "${!WIN_VERBS[@]}"; do
+        [[ "${WIN_VERBS[i]}" == resume || "${WIN_VERBS[i]}" == spawn ]] \
+            && echo "${TEST_NAME}: ${STEP}: ${ID_B}: ${WIN_VERBS[i]} ${WIN_ARGS[i]:0:300}"
+    done
+    wait_until "${POST_WAIT_S}" "${STEP}: no recovery post" posts_at_least "${SUFFIX_B}" "${POSTS_P}" 2
+    sleep "${SETTLE_S}"
+    posts_of "${SUFFIX_B}" "${POSTS_P}"
+    [[ "${POSTS[1]}" == "${HOLD_RECOVERY_B}" ]] || fail "${STEP}: the second post reads '${POSTS[1]}', not '${HOLD_RECOVERY_B}'"
+    n=0
+    for p in "${POSTS[@]}"; do
+        [[ "${p}" == "${HOLD_RECOVERY_B}" ]] && n=$(( n + 1 ))
+    done
+    (( n == 1 )) || fail "${STEP}: ${n} recovery posts for ${PERSONA_B}, not 1"
+    n="$(count_log "${RETRY_AT_ONCE_HEAD_B}")"
+    [[ "${n}" == 1 ]] || fail "${STEP}: server.log holds ${n} after-clear retry line(s) for ${PERSONA_B}, not 1"
+    # The one bring-up retry is the restart path's decision: one resume,
+    # after its liveness read found the row missing and with no kill.
+    window_any "${STEP}" "${MARK_HELD}" "${MARK_R}" "${ID_B}"
+    expect_one_relaunch "${STEP}" "${ID_B}"
+    SLICE="$(log_slice "${LOG_P}")"
+    without_kill="$(_scenario_printed "${STEP}" relaunchWithoutKillLine "${KEY_B}" RELAUNCH_NO_KILL_ROW_READ LIVENESS_READING_DEAD_MISSING)"
+    after_kill="$(_scenario_printed "${STEP}" relaunchAfterKillLine "${KEY_B}" "${WORK_B}" RELAUNCH_KILL_NONE)"
+    for m in "${without_kill}" "${after_kill}"; do
+        n="$(count_in "${SLICE}" "${m}")"
+        [[ "${n}" == 1 ]] || fail "${STEP}: server.log holds ${n} line(s) '${m}' since the leg began, not 1"
+    done
+fi
 
 # Ruling S8: what the retry met beside the still-running old session is
 # recorded, not asserted.

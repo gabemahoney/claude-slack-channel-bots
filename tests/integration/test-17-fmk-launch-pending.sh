@@ -249,12 +249,18 @@ line_count() {
     wc -l < "$1" | tr -d ' '
 }
 
-# read_row_of <id> <step>: a harness `get` of row <id>. Sets ROW_READ_AT (the
+# read_row_of <id> <step>: a passive store read from 0.18.0, otherwise a
+# harness `get` of row <id>. Sets ROW_READ_AT (the
 # time just before the call), ROW_STATE, ROW_SID (session_id),
 # ROW_LAUNCH (launch_started_at as printed) and ROW_SESSION
 # (tmux_session_name), each empty when absent.
 read_row_of() {
     local id="$1" fields
+    if ad_release_at_least 0.18.0; then
+        poll_row_of "$@"
+        [[ "${ROW_STATE}" != absent ]] || fail "$2: the store has no row ${id}"
+        return 0
+    fi
     ROW_READ_AT="$(now_s)"
     ad_capture get --instance-id "${id}"
     (( AD_RC == 0 )) || fail "$2: the harness get of ${id} exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
@@ -830,10 +836,22 @@ write_personas_config() {
 
 # poll_row_of <id> <step>: `read_row_of`, except that a row agent-director
 # does not know (ErrSpawnNotFound) reads ROW_STATE `absent` instead of
-# failing.
+# failing. From 0.18.0 a `get` checks the row it reads and can mark it
+# missing itself, so the poll reads the store (`ad_store_peek`) instead.
 poll_row_of() {
-    local id="$1" fields
+    local id="$1" fields row
     ROW_READ_AT="$(now_s)"
+    if ad_release_at_least 0.18.0; then
+        row="$(ad_store_peek "${id}")" || exit 1
+        if [[ -z "${row}" ]]; then
+            ROW_STATE=absent ROW_SID="" ROW_LAUNCH="" ROW_SESSION=""
+            return 0
+        fi
+        fields="$(jq -r '[.state // "", .session_id // "", (.launch_started_at // "" | tostring), .tmux_session_name // ""] | join("\u001f")' <<< "${row}")" \
+            || fail "$2: the store row of ${id} does not read: ${row}"
+        IFS=$'\x1f' read -r ROW_STATE ROW_SID ROW_LAUNCH ROW_SESSION <<< "${fields}"
+        return 0
+    fi
     ad_capture get --instance-id "${id}"
     if (( AD_RC != 0 )); then
         if grep -qF ErrSpawnNotFound "${AD_OUT}" "${AD_ERR}"; then
@@ -1276,10 +1294,17 @@ fc_failure_seen() {
     [[ -n "$(log_hits "$1" '[slack] spawnForPersona: ' "failed for ${F_REF}: " "${SESSION_CREATE_ERR}")" ]]
 }
 
-# fc_only_pending <step>: a harness `list --state pending`; fail unless F's
+# fc_only_pending <step>: a harness `list --state pending` (from 0.18.0, which
+# checks the rows a list selects, the store's pending rows); fail unless F's
 # row is the only `pending` row.
 fc_only_pending() {
     local ids
+    if ad_release_at_least 0.18.0; then
+        ids="$(_scenario_store_read "$1" "SELECT instance_id FROM spawns WHERE state = 'pending' ORDER BY instance_id" | tr '\n' ' ')" \
+            || exit 1
+        [[ "${ids}" == "${F_ID} " ]] || fail "$1: the store's pending rows are '${ids% }', not ${F_ID} alone"
+        return 0
+    fi
     ad_capture list --state pending
     (( AD_RC == 0 )) || fail "$1: the harness list exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
     ids="$(jq -r '(if type == "array" then . else .spawns end)[] | .instance_id' "${AD_OUT}" | sort | tr '\n' ' ')" \
@@ -1287,10 +1312,37 @@ fc_only_pending() {
     [[ "${ids}" == "${F_ID} " ]] || fail "$1: the pending rows are '${ids% }', not ${F_ID} alone"
 }
 
+# fc_marked_by_server <step> <l-ms> <l-s> <g-at> <next-at> <from-mark> <server-pid> <first-missing>:
+# from 0.18.0, where a read checks the rows it selects: F's row was marked
+# missing (an ad.find_missing.tick record) no earlier than G and no later
+# than F's next launch, by a call of the bot server (`ad_mark_caller`, from
+# <from-mark>); the harness, which reads the store, saw missing only after.
+fc_marked_by_server() {
+    local step="$1" l_ms="$2" l_s="$3" g_at="$4" next_at="$5" from="$6" srv="$7" first_missing="$8"
+    local tick tick_s caller pos time ppid verb role
+    tick="$(ad_missing_tick "${F_ID}" "${l_ms}")" || fail "${step}: no ad.find_missing.tick record marked ${F_ID} missing after its launch start"
+    tick_s="$(date -u -d "$(jq -r '.ts' <<< "${tick}")" +%s.%3N)" || fail "${step}: the mark's ts does not read as a time: ${tick}"
+    awk -v t="${tick_s}" -v g="${g_at}" -v n="${next_at}" 'BEGIN { exit !(t + 0 >= g + 0 && t + 0 <= n + 0.001) }' \
+        || fail "${step}: F's row was marked missing $(seconds_between "${l_s}" "${tick_s}")s after L, not from G ${G_S}s to its next launch (+$(seconds_between "${l_s}" "${next_at}")s)"
+    caller="$(ad_mark_caller "${tick}" "${from}")" || fail "${step}: no agent-director call at or before the mark could have made it: ${tick}"
+    IFS=$'\t' read -r pos time ppid verb role <<< "${caller}"
+    [[ "${role}" == cscb && "${ppid}" == "${srv}" ]] \
+        || fail "${step}: the mark's call (shim line ${pos}, ${verb} at ${time}, parent ${ppid}) is not the bot server's (${srv})"
+    echo "${TEST_NAME}: ${step}: from L: marked missing +$(seconds_between "${l_s}" "${tick_s}")s by the bot server's ${verb} (shim line ${pos}, source $(jq -r '.source' <<< "${tick}")), next launch +$(seconds_between "${l_s}" "${next_at}")s"
+    if [[ -n "${first_missing}" ]]; then
+        # ROW_READ_AT is just before the store read, which can see a mark made while it ran.
+        awk -v m="${first_missing}" -v t="${tick_s}" -v p="${FC_POLL_S}" 'BEGIN { exit !(m + p >= t + 0) }' \
+            || fail "${step}: the harness read F's row missing ($(seconds_between "${l_s}" "${first_missing}")s from L) before the mark"
+        echo "${TEST_NAME}: ${step}: the harness read the row missing at +$(seconds_between "${l_s}" "${first_missing}")s from L (recorded)"
+    else
+        echo "${TEST_NAME}: ${step}: no harness read caught the row missing (recorded)"
+    fi
+}
+
 leg_fail_create() {
     local step="scenario 11" creds="${SCENARIO_ROOT}/credentials-fc" work log0 srv leg_start reset_at creates
     local l_ms l_s g_at deadline launch out_at first_missing="" reads="${SCENARIO_ROOT}/fc-reads.tsv"
-    local table="${SCENARIO_ROOT}/fc-calls.tsv" n spawn0 next_at fm_at get_at rule_at
+    local table="${SCENARIO_ROOT}/fc-calls.tsv" n spawn0 next_at fm_at get_at rule_at mark0
     local lines=() notices=()
 
     new_state_dir failcreate
@@ -1310,6 +1362,7 @@ leg_fail_create() {
     tmux_shim_mode fail-create
     log0="$(line_count "${SLACK_STATE_DIR}/server.log")"
     leg_start="$(now_s)"
+    mark0="$(ad_shim_mark)"
     start_server --live
     srv="${SERVER_PID}"
 
@@ -1377,29 +1430,45 @@ leg_fail_create() {
     # No bot-server find-missing from L to G after it.
     n="$(count_calls "${table}" "${srv}" - find-missing "${l_s}" "$(plus_s "${g_at}" -0.001)")"
     (( n == 0 )) || fail "${step}: the bot server ran find-missing ${n} time(s) between F's launch start and G after it"
-    # F's next launch, and the run and the get before it.
+    # F's next launch: from 0.18.0 a retry's own active read may mark it
+    # missing and relaunch directly, without a pending-row rule or sweep.
     next_at="$(calls "${table}" "${srv}" "${F_ID}" - "${spawn0}" - | awk -F'\t' '$3 == "spawn" || $3 == "resume"' | head -n 1 | cut -f1)"
     [[ -n "${next_at}" ]] || fail "${step}: the bot server made no launch of ${F_ID} after the failed spawn"
-    fm_at="$(calls "${table}" "${srv}" - find-missing - "${next_at}" | tail -n 1 | cut -f1)"
-    [[ -n "${fm_at}" ]] || fail "${step}: no bot-server find-missing before F's next launch"
-    awk -v f="${fm_at}" -v g="${g_at}" 'BEGIN { exit !(f + 0 >= g + 0) }' \
-        || fail "${step}: the last bot-server find-missing before F's next launch came $(seconds_between "${l_s}" "${fm_at}")s after L, before G ${G_S}s"
-    get_at="$(first_call_at "${table}" "${srv}" "${F_ID}" get "${fm_at}" "${next_at}")"
-    [[ -n "${get_at}" ]] || fail "${step}: no bot-server get of ${F_ID} between its find-missing and its next launch"
-    # The rule's round marked the row missing and its get read missing.
-    mapfile -t lines < <(log_hits "${log0}" "${PENDING_ROW_HEAD} ${F_REF} rule (" "find-missing: ${MARKED_MISSING}" "get: missing")
-    (( ${#lines[@]} == 1 )) || fail "${step}: ${#lines[@]} pending-row rule line(s) for F name the row marked and read missing, not one"
-    rule_at="$(cut -f2 <<< "${lines[0]}")"
-    awk -v r="${rule_at}" -v n="${next_at}" 'BEGIN { exit !(r + 0 <= n + 0) }' \
-        || fail "${step}: the pending-row rule's missing line came after F's next launch"
-    echo "${TEST_NAME}: ${step}: from L: find-missing +$(seconds_between "${l_s}" "${fm_at}")s, get +$(seconds_between "${l_s}" "${get_at}")s, next launch +$(seconds_between "${l_s}" "${next_at}")s ($(calls "${table}" "${srv}" "${F_ID}" - "$(plus_s "${next_at}" -0.001)" "${next_at}" | cut -f5 | sed 's/ --label .*/ …/'))"
-    # The harness's read of missing, when it made one, came after the run.
-    if [[ -n "${first_missing}" ]]; then
-        awk -v m="${first_missing}" -v f="${fm_at}" 'BEGIN { exit !(m + 0 > f + 0) }' \
-            || fail "${step}: the harness read F's row missing ($(seconds_between "${l_s}" "${first_missing}")s from L) before the bot server's find-missing"
-        echo "${TEST_NAME}: ${step}: the harness read the row missing at +$(seconds_between "${l_s}" "${first_missing}")s from L (recorded)"
+    if ad_release_at_least 0.18.0; then
+        fc_marked_by_server "${step}" "${l_ms}" "${l_s}" "${g_at}" "${next_at}" "${mark0}" "${srv}" "${first_missing}"
+        # If a pending-row rule observed missing, retain its get and line
+        # ordering checks. An active status can bypass the rule altogether.
+        mapfile -t lines < <(log_hits "${log0}" "${PENDING_ROW_HEAD} ${F_REF} rule (" "find-missing: " "get: missing")
+        if (( ${#lines[@]} > 0 )); then
+            (( ${#lines[@]} == 1 )) || fail "${step}: ${#lines[@]} pending-row rule line(s) for F read missing, not one"
+            rule_at="$(cut -f2 <<< "${lines[0]}")"
+            awk -v r="${rule_at}" -v n="${next_at}" 'BEGIN { exit !(r + 0 <= n + 0) }' \
+                || fail "${step}: the pending-row rule's missing line came after F's next launch"
+            get_at="$(first_call_at "${table}" "${srv}" "${F_ID}" get "${g_at}" "${rule_at}")"
+            [[ -n "${get_at}" ]] || fail "${step}: no bot-server get of ${F_ID} from G to its pending-row rule's missing line"
+        fi
     else
-        echo "${TEST_NAME}: ${step}: no harness read caught the row missing (recorded)"
+        fm_at="$(calls "${table}" "${srv}" - find-missing - "${next_at}" | tail -n 1 | cut -f1)"
+        [[ -n "${fm_at}" ]] || fail "${step}: no bot-server find-missing before F's next launch"
+        awk -v f="${fm_at}" -v g="${g_at}" 'BEGIN { exit !(f + 0 >= g + 0) }' \
+            || fail "${step}: the last bot-server find-missing before F's next launch came $(seconds_between "${l_s}" "${fm_at}")s after L, before G ${G_S}s"
+        get_at="$(first_call_at "${table}" "${srv}" "${F_ID}" get "${fm_at}" "${next_at}")"
+        [[ -n "${get_at}" ]] || fail "${step}: no bot-server get of ${F_ID} between its find-missing and its next launch"
+        # The rule's round marked the row missing and its get read missing.
+        mapfile -t lines < <(log_hits "${log0}" "${PENDING_ROW_HEAD} ${F_REF} rule (" "find-missing: ${MARKED_MISSING}" "get: missing")
+        (( ${#lines[@]} == 1 )) || fail "${step}: ${#lines[@]} pending-row rule line(s) for F name the row marked and read missing, not one"
+        rule_at="$(cut -f2 <<< "${lines[0]}")"
+        awk -v r="${rule_at}" -v n="${next_at}" 'BEGIN { exit !(r + 0 <= n + 0) }' \
+            || fail "${step}: the pending-row rule's missing line came after F's next launch"
+        echo "${TEST_NAME}: ${step}: from L: find-missing +$(seconds_between "${l_s}" "${fm_at}")s, get +$(seconds_between "${l_s}" "${get_at}")s, next launch +$(seconds_between "${l_s}" "${next_at}")s ($(calls "${table}" "${srv}" "${F_ID}" - "$(plus_s "${next_at}" -0.001)" "${next_at}" | cut -f5 | sed 's/ --label .*/ …/'))"
+        # The harness's read of missing, when it made one, came after the run.
+        if [[ -n "${first_missing}" ]]; then
+            awk -v m="${first_missing}" -v f="${fm_at}" 'BEGIN { exit !(m + 0 > f + 0) }' \
+                || fail "${step}: the harness read F's row missing ($(seconds_between "${l_s}" "${first_missing}")s from L) before the bot server's find-missing"
+            echo "${TEST_NAME}: ${step}: the harness read the row missing at +$(seconds_between "${l_s}" "${first_missing}")s from L (recorded)"
+        else
+            echo "${TEST_NAME}: ${step}: no harness read caught the row missing (recorded)"
+        fi
     fi
     # No kill of F's row from any CSCB process.
     n="$(count_calls "${table}" - "${F_ID}" kill - -)"

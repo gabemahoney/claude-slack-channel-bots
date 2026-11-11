@@ -219,7 +219,7 @@ describe('scenario and original oracle wiring', () => {
     const calls: string[] = [], paths = ['owned'], all = {}, journal = {}, own = {}, adapters = {}, expected = {}; let reject = false
     const completed = completionCallback((value: unknown) => { expect(value).toBe('root'); return paths }, (p: unknown, a: unknown) => { expect(p).toBe(paths); expect(a).toBe(adapters); return all }, () => journal,
       (args: unknown, entries: unknown, a: unknown) => { calls.push('audit'); expect(args).toEqual({ stateDir: 'state', key: 'key', shimLog: 'shim', transcripts: paths }); expect(entries).toBe(all); expect(a).toBe(adapters) },
-      () => own, () => 'line\n', join, (args: unknown) => { calls.push('oracle'); expect(args).toEqual({ seq: 2, expected, journal, own, adapters, model: 'azure/openai/gpt-6-astra', key: 'key', log: ['line', ''] }); if (reject) throw new Error('ordinary oracle rejects') }, 'root', adapters, 'state', 'key', 'shim', 2, expected, { env: { REAL_AGENT_MODEL_PIN: 'azure/openai/gpt-6-astra' } })
+      () => own, () => 'line\n', join, (args: unknown) => { calls.push('oracle'); expect(args).toEqual({ seq: 2, expected, journal, own, adapters, model: 'aws/anthropic/bedrock-claude-opus-5-5', key: 'key', log: ['line', ''] }); if (reject) throw new Error('ordinary oracle rejects') }, 'root', adapters, 'state', 'key', 'shim', 2, expected, { env: { REAL_AGENT_MODEL_PIN: 'aws/anthropic/bedrock-claude-opus-5-5' } })
     return (async () => { expect(await completed()).toBe(true); expect(calls).toEqual(['audit', 'oracle']); reject = true; expect(await completed()).toBe(false) })()
   })
   test.each([
@@ -229,7 +229,7 @@ describe('scenario and original oracle wiring', () => {
     { name: 'known send path without an AD reference', knownPath: true, session: null, directory: 'owned', passes: true },
   ])('observer binds real readback: $name', async ({ knownPath, session, directory, passes }) => {
     const root = join(tmpdir(), 'ac20-readback'), path = join(root, 'owned/session.jsonl'), key = 'aiac20'
-    const model = 'azure/openai/gpt-6-astra', text = '<channel>late reference</channel>', expected = { case: 'case_01', body: 'late reference' }
+    const model = 'aws/anthropic/bedrock-claude-opus-5-5', text = '<channel>late reference</channel>', expected = { case: 'case_01', body: 'late reference' }
     const journal = [
       { kind: 'accepted', seq: 1, received_at: 10 },
       { kind: 'fixed', seq: 1, parts: [text] },

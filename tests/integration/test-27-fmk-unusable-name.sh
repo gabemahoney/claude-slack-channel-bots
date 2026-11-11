@@ -131,6 +131,21 @@ read_row() {
     fields="$(jq -r '[.state // "", .session_id // "", .tmux_session_name // "", .liveness_note // ""] | join("\u001f")' "${AD_OUT}")" \
         || fail "$1: the harness get of $2 printed no row object: $(head -c 300 "${AD_OUT}")"
     IFS=$'\x1f' read -r ROW_STATE ROW_SID ROW_SESSION ROW_NOTE <<< "${fields}"
+    ROW_FILE="${AD_OUT}"
+}
+
+# read_seeded_row <step> <instance-id>: read_row, except that from
+# agent-director 0.18.0, whose reads re-judge the row (and so would note the
+# edited name themselves), the row is read from the store. Sets ROW_FILE to
+# the row object's file too.
+read_seeded_row() {
+    local fields
+    ad_release_at_least 0.18.0 || { read_row "$1" "$2"; return; }
+    ROW_FILE="${SCENARIO_ROOT}/seeded-row.json"
+    ad_store_peek "$2" > "${ROW_FILE}" || exit 1
+    fields="$(jq -er '[.state // "", .session_id // "", .tmux_session_name // "", .liveness_note // ""] | join("\u001f")' "${ROW_FILE}")" \
+        || fail "$1: the store holds no row $2: $(head -c 300 "${ROW_FILE}")"
+    IFS=$'\x1f' read -r ROW_STATE ROW_SID ROW_SESSION ROW_NOTE <<< "${fields}"
 }
 
 # row_reads <step> <instance-id> <state>...: read the row; true when its
@@ -488,11 +503,11 @@ step_other_row() {
     [[ "${OTHER_SID}" =~ ^\$[0-9]+$ && "${OTHER_WID}" =~ ^@[0-9]+$ && "${OTHER_PANE}" =~ ^%[0-9]+$ && "${pid}" =~ ^[0-9]+$ ]] \
         || fail "${step}: tmux gave '${out}' for session ${OTHER_SESSION}"
     wait_until "${OTHER_WAIT_S}" "${step}: the other caller's pane process ${pid} never became the stub" stub_running "${pid}"
-    read_row "${step}" "${OTHER_ID}"
+    read_seeded_row "${step}" "${OTHER_ID}"
     [[ "${ROW_STATE}" == pending ]] || fail "${step}: ${OTHER_ID} reads '${ROW_STATE}', not pending"
-    [[ "$(jq '.labels // {} | length' "${AD_OUT}")" == 0 ]] || fail "${step}: ${OTHER_ID} carries labels $(jq -c '.labels' "${AD_OUT}")"
+    [[ "$(jq '.labels // {} | length' "${ROW_FILE}")" == 0 ]] || fail "${step}: ${OTHER_ID} carries labels $(jq -c '.labels' "${ROW_FILE}")"
     other_row_unusable "${step}"
-    read_row "${step}" "${OTHER_ID}"
+    read_seeded_row "${step}" "${OTHER_ID}"
     [[ "${ROW_STATE}" == waiting && "${ROW_SESSION}" == "${OTHER_UNUSABLE}" && -z "${ROW_NOTE}" ]] \
         || fail "${step}: ${OTHER_ID} reads '${ROW_STATE}' in '${ROW_SESSION}' with note '${ROW_NOTE}', not waiting in ${OTHER_UNUSABLE} with no note"
     OTHER_SEED_MARK="$(ad_shim_mark)"
@@ -739,13 +754,21 @@ step_clear_fresh() {
 }
 
 # Step 4: the other caller's row got its note from a CSCB find-missing, and
-# CSCB ignored it.
+# CSCB ignored it. From agent-director 0.18.0 every read re-judges the rows it
+# selects, so any CSCB call after the seeding may have noted it; the row is
+# read from the store so that no harness read notes it.
 step_other_ignored() {
-    local step="step 4: the other caller's row ignored" fm target n found control=""
-    fm="$(ad_cscb_verb_between find-missing "${OTHER_SEED_MARK}" -)" || exit 1
-    [[ -n "${fm}" ]] || fail "${step}: positive control: no CSCB find-missing after the seeding"
-    echo "${TEST_NAME}: ${step}: the first CSCB find-missing after the seeding is at shim line $(field_of 1 "$(sed -n 1p <<< "${fm}")") (the delete at ${DELETE_MARK}); $(rows_count "${fm}") in all"
-    read_row "${step}" "${OTHER_ID}"
+    local step="step 4: the other caller's row ignored" fm target n found control="" calls
+    if ad_release_at_least 0.18.0; then
+        calls="$(cscb_ad_count_between "${OTHER_SEED_MARK}" - "")" || exit 1
+        (( calls > 0 )) || fail "${step}: positive control: no CSCB agent-director call after the seeding"
+        echo "${TEST_NAME}: ${step}: ${calls} CSCB agent-director call(s) after the seeding (the delete at ${DELETE_MARK})"
+    else
+        fm="$(ad_cscb_verb_between find-missing "${OTHER_SEED_MARK}" -)" || exit 1
+        [[ -n "${fm}" ]] || fail "${step}: positive control: no CSCB find-missing after the seeding"
+        echo "${TEST_NAME}: ${step}: the first CSCB find-missing after the seeding is at shim line $(field_of 1 "$(sed -n 1p <<< "${fm}")") (the delete at ${DELETE_MARK}); $(rows_count "${fm}") in all"
+    fi
+    read_seeded_row "${step}" "${OTHER_ID}"
     [[ "${ROW_NOTE}" == tmux_session_name_rewritten ]] \
         || fail "${step}: ${OTHER_ID}'s liveness note reads '${ROW_NOTE}', not tmux_session_name_rewritten"
     [[ "${ROW_STATE}" == waiting && "${ROW_SESSION}" == "${OTHER_UNUSABLE}" ]] \
