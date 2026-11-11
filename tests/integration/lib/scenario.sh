@@ -1997,6 +1997,9 @@ run_start() {
     # leave a daemon behind, and the trap stops it.
     _scenario_register_state_dir "${SLACK_STATE_DIR}"
     local env_args=(-u SLACK_BOT_TOKEN -u SLACK_APP_TOKEN -u CSCB_PERSONA -u SLACK_DRY_RUN)
+    # b.c13's boundary leg injects fake env values AFTER the ordinary unsets.
+    # An unset array leaves every other scenario's start unchanged.
+    env_args+=( ${SCENARIO_START_ENV[@]+"${SCENARIO_START_ENV[@]}"} )
     if [[ "${live}" == 1 ]]; then
         _SCENARIO_LIVE=1
     else

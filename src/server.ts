@@ -54,6 +54,7 @@
 
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
 import { prepareBotSystemPrompt, botSystemPromptPath } from './bot-system-prompt.ts'
+import { scrubProcessEnv } from './child-env.ts'
 import type { Client } from 'agent-director'
 import { createDeliveryEngines, createDeliveryLifecycle, type DeliveryEngines, type DeliveryLifecycle, type DeliveryEngineEvent } from './delivery-engine.ts'
 import { createDeliveryAdScope } from './delivery-ad-scope.ts'
@@ -4132,6 +4133,7 @@ export async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
+  scrubProcessEnv()
   main().catch((err) => {
     console.error('[slack] Fatal:', err)
     process.exit(1)

@@ -575,9 +575,86 @@ t21_check_last_line() {
 # S3: the precheck legs ( design note)
 # ---------------------------------------------------------------------------
 
+# Join the same two shim logs as assert_no_server_tmux: tmux's immediate
+# parent is agent-director, whose parent is the recorded CSCB server. A
+# cscb_tmux_count call only counts direct CSCB -> tmux calls, so it cannot
+# prove this chain. Check the first create on this socket, not a later call
+# that could hide a foreign create; the AD PID must belong to the latest
+# preceding call with that PID, as in the closing assertion's reuse guard.
+t21_assert_first_tmux_create() {
+    local step="child environment boundary" socket="$1" ad_lines=() tmux_lines=() parent=()
+    local i entry best owned
+    local -A ad_calls=()
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_query_prep "${step}"
+    _scenario_read_log "${step}" "${SCENARIO_AD_SHIM_LOG}" ad_lines
+    _scenario_read_log "${step}" "${SCENARIO_TMUX_SHIM_LOG}" tmux_lines
+    for i in "${!ad_lines[@]}"; do
+        _scenario_split_line "${ad_lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        owned=0
+        _scenario_decode_words
+        _scenario_ad_verb
+        _scenario_ad_id
+        if _scenario_role_at "${_L_PPID}" "${_L_US}" && [[ "${_SCENARIO_ROLE}" == server ]] \
+            && [[ "${_L_VERB}" == spawn && ( "${_L_ID}" == "${A_ID}" || "${_L_ID}" == "${B_ID}" ) ]]; then
+            owned=1
+        fi
+        ad_calls["${_L_PID}"]+=" ${_L_US}:${owned}"
+    done
+    for i in "${!tmux_lines[@]}"; do
+        _scenario_split_line "${tmux_lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        _scenario_decode_words
+        # AD's create argv is -u -S <socket> new-session ... (the release
+        # used here), or start-server ; source-file - for private input.
+        [[ "${_L_WORDS[0]:-}" == -u && "${_L_WORDS[1]:-}" == -S \
+            && "${_L_WORDS[2]:-}" == "${socket}" ]] || continue
+        case "${_L_WORDS[3]:-}" in new-session | start-server) ;; *) continue ;; esac
+        best=""
+        for entry in ${ad_calls[${_L_PPID}]:-}; do
+            (( ${entry%:*} <= _L_US )) || continue
+            if [[ -z "${best}" ]] || (( ${entry%:*} >= ${best%:*} )); then best="${entry}"; fi
+        done
+        [[ "${best}" == *:1 ]] \
+            || fail "${step}: first tmux create has no preceding CSCB-server persona spawn"
+        _scenario_eval_words parent "${_L_PARENT}" || fail "${step}: unreadable tmux parent"
+        entry="${parent[0]:-}"
+        case "${entry##*/}" in agent-director | agent-director.real) ;; \
+            *) fail "${step}: first tmux create was not made by agent-director" ;; esac
+        return 0
+    done
+    fail "${step}: no scenario-socket tmux create in the shim log"
+}
+
 t21_precheck_legs() {
     local step="precheck" a_before b_before after pid out cmd cmd_name args head nothing n ids a_sid
+    # b.c13: this is the scenario's FIRST start. Do not seed tmux: the
+    # environment of CSCB's first launch must become the new server's env.
+    require_ci_image "child environment boundary"
+    require_scenario_home "child environment boundary"
+    local socket="${TMUX_TMPDIR}/tmux-$(id -u)/default" names
+    [[ ! -S "${socket}" ]] || fail "child environment boundary: socket already exists before CSCB's first launch"
+    if "${SCENARIO_REAL_TMUX}" -S "${socket}" list-sessions > /dev/null 2>&1; then
+        fail "child environment boundary: tmux was seeded before CSCB's first launch"
+    fi
+    [[ ! -s "${SCENARIO_TMUX_SHIM_LOG}" ]] || fail "child environment boundary: tmux shim calls preceded CSCB's first launch"
+    # run_start ordinarily unsets SLACK_BOT_TOKEN; the fixture override puts
+    # these fake values into the actual CLI parent's environment afterwards.
+    SCENARIO_START_ENV=(SLACK_BOT_TOKEN=fake-not-a-token GH_TOKEN=fake-not-a-token)
     t21_up "${step}: setup" A B
+    unset SCENARIO_START_ENV
+    [[ -S "${socket}" ]] || fail "child environment boundary: CSCB did not create the scenario socket"
+    t21_assert_first_tmux_create "${socket}"
+    # Only names leave this pipe. Never retain the raw global environment.
+    names="$("${SCENARIO_REAL_TMUX}" -S "${socket}" show-environment -g | cut -d= -f1)" \
+        || fail "child environment boundary: could not read tmux environment names"
+    if grep -qiE '^SLACK_.*(TOKEN|SECRET)$|^_CLI_DAEMON_CHILD$' <<< "${names}"; then
+        fail "child environment boundary: CSCB credentials or daemon marker reached tmux"
+    fi
+    grep -qxF GH_TOKEN <<< "${names}" \
+        || fail "child environment boundary: host GH_TOKEN did not pass through"
 
     # The harness respawns A's worker pane with another process: A's
     # `read-pane` answers CONFLICT ("the agent's pane was not found") while

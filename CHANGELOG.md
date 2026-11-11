@@ -6,6 +6,7 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+- **CSCB's Slack credentials stay out of child environments.** CSCB now strips its Slack credential variable names, including those Bun loads from `.env` files, before starting child processes or making agent-director calls, covering any tmux server those calls start. `_CLI_DAEMON_CHILD` is limited to the daemon startup handoff. Other host variables still pass through under the operator's environment policy. Existing tmux servers and sessions keep their stored environment. See [Environment Variables](docs/server-settings.md#environment-variables).
 - **A reaction now answers a message.** When a bot answered a Slack message only with the `react` tool, its acknowledgement reaction stayed on the message and CSCB sent it a "you haven't replied" reminder. Now a persona's `react` on the message clears its acknowledgement as a `reply` with `message_id` does, a reaction before delivery suppresses later stages, and any `react` call suppresses the reminder. A reaction with the acknowledgement's own emoji stays. See [Acknowledgement reactions](docs/server-settings.md#acknowledgement-reactions) and [Slack reply reminders](docs/bots.md#slack-reply-reminders).
 
 ---

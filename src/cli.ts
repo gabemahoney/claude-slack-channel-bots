@@ -151,6 +151,7 @@
 import { join, resolve } from 'path'
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, statSync, unlinkSync } from 'fs'
 import { spawn, spawnSync } from 'child_process'
+import { childEnv, scrubProcessEnv } from './child-env.ts'
 import { isProcessRunning } from './pid.ts'
 import {
   CLEAR_LATCH_COMMAND,
@@ -434,7 +435,7 @@ export type InitClientGateOptions = Omit<StartupGateOptions, 'callTimeoutMs'>
 
 export interface CliDeps {
   /** Run a command and return its exit code (or null if spawn failed). */
-  spawnSync: (cmd: string, args: string[]) => { status: number | null }
+  spawnSync: (cmd: string, args: string[], env: NodeJS.ProcessEnv) => { status: number | null }
   /** Spawn the detached server daemon (`start`'s parent path). */
   spawnDaemon: (cmd: string, args: string[], opts: DaemonSpawnOptions) => DaemonChild
   /** Open a file for appending (creating it) and return its descriptor: the daemon's `server.log`. */
@@ -499,7 +500,7 @@ export interface CliDeps {
    * Returns 1 when the script is missing or bash cannot be run, after
    * printing why.
    */
-  runCredentialsScript: (credentialsFile: string) => number
+  runCredentialsScript: (credentialsFile: string, env: NodeJS.ProcessEnv) => number
   /**
    * initialize the agent-director Client singleton before the precheck
    * and any per-persona teardown work (step 1). clean_restart /
@@ -1399,13 +1400,13 @@ export function createCli(deps: CliDeps): CliHandlers {
       const logPath = join(stateDir, 'server.log')
       const logOffset = deps.fileSize(logPath)
       const logFd = deps.openLogAppend(logPath)
-      const childEnv: NodeJS.ProcessEnv = { ...process.env, _CLI_DAEMON_CHILD: '1' }
+      const daemonEnv = childEnv(process.env, { daemonChild: true })
       let child: DaemonChild
       try {
         child = deps.spawnDaemon(process.execPath, [import.meta.filename, 'start'], {
           detached: true,
           stdio: ['ignore', logFd, logFd],
-          env: childEnv,
+          env: daemonEnv,
         })
       } finally {
         // The daemon holds its own copy of the descriptor; the parent's is not
@@ -1421,6 +1422,9 @@ export function createCli(deps: CliDeps): CliHandlers {
       await awaitDaemonStartup(child, pidFiles, logPath, logOffset)
       return
     }
+
+    // The marker has served its purpose; agent-director must never inherit it.
+    delete process.env['_CLI_DAEMON_CHILD']
 
     // Child (daemon): redirect stderr/stdout to server.log
     try { deps.initLogging(join(stateDir, 'server.log')) } catch { /* best-effort: log redirect failure is non-fatal */ }
@@ -1752,7 +1756,7 @@ export function createCli(deps: CliDeps): CliHandlers {
     // line through the fatal path. Answers the status; the caller exits.
     const spawnStart = (): number | null => {
       console.error('[slack] clean_restart: starting server')
-      const startResult = deps.spawnSync(process.execPath, [process.argv[1], 'start'])
+      const startResult = deps.spawnSync(process.execPath, [process.argv[1], 'start'], childEnv(process.env))
       if (startResult.status !== 0) {
         fatal(cleanRestartStartFailedLine(startResult.status))
       }
@@ -1804,7 +1808,7 @@ export function createCli(deps: CliDeps): CliHandlers {
 
     // Phase 4: Stop the server daemon
     console.error('[slack] clean_restart: stopping server')
-    const stopResult = deps.spawnSync(process.execPath, [process.argv[1], 'stop'])
+    const stopResult = deps.spawnSync(process.execPath, [process.argv[1], 'stop'], childEnv(process.env))
     if (stopResult.status !== 0) {
       console.error(`[slack] clean_restart: stop returned non-zero exit code: ${stopResult.status}`)
     }
@@ -1974,7 +1978,7 @@ export function createCli(deps: CliDeps): CliHandlers {
       return deps.exit(1)
     }
     console.error(`Credentials file of persona ${renderPersonaRef(persona.name, persona.key)}: ${persona.credentials_file}`)
-    return deps.exit(deps.runCredentialsScript(persona.credentials_file))
+    return deps.exit(deps.runCredentialsScript(persona.credentials_file, childEnv(process.env)))
   }
 
   /**
@@ -2056,13 +2060,13 @@ export function createCli(deps: CliDeps): CliHandlers {
 
 /**
  * The production `runCredentialsScript`: `bash <CREDENTIALS_SCRIPT_PATH>
- * <credentialsFile>` with stdio inherited and this process's environment.
+ * <credentialsFile>` with stdio inherited and an explicitly filtered environment.
  * While it runs, this process ignores SIGINT and SIGQUIT, as a shell does for
  * a foreground job: Ctrl-C reaches the script, which removes its temporary
  * file and exits, and this process then exits with its status instead of
  * returning the prompt first. A script killed by a signal counts as 1.
  */
-function runCredentialsScript(credentialsFile: string): number {
+function runCredentialsScript(credentialsFile: string, env: NodeJS.ProcessEnv): number {
   if (!existsSync(CREDENTIALS_SCRIPT_PATH)) {
     console.error(
       `credentials: the credentials script ${CREDENTIALS_SCRIPT_PATH} is missing; reinstall claude-slack-channel-bots`,
@@ -2073,7 +2077,7 @@ function runCredentialsScript(credentialsFile: string): number {
   process.on('SIGINT', ignore)
   process.on('SIGQUIT', ignore)
   try {
-    const result = spawnSync('bash', [CREDENTIALS_SCRIPT_PATH, credentialsFile], { stdio: 'inherit' })
+    const result = spawnSync('bash', [CREDENTIALS_SCRIPT_PATH, credentialsFile], { stdio: 'inherit', env })
     if (result.error !== undefined) {
       console.error(`credentials: could not run bash: ${describeThrownValue(result.error)}`)
       return 1
@@ -2203,7 +2207,10 @@ export async function initProductionClient(
 // ---------------------------------------------------------------------------
 
 if (import.meta.main) {
+  scrubProcessEnv(process.env, { keepDaemonMarker: true })
   const subcommand = process.argv[2]
+  // Only start needs to inspect the marker; other commands may call agent-director.
+  if (subcommand !== 'start') delete process.env['_CLI_DAEMON_CHILD']
 
   if (
     subcommand !== 'start' &&
@@ -2219,7 +2226,7 @@ if (import.meta.main) {
   const directorOps = createDirectorOps(getClient)
 
   const realDeps: CliDeps = {
-    spawnSync: (cmd, args) => spawnSync(cmd, args, { stdio: 'ignore' }),
+    spawnSync: (cmd, args, env) => spawnSync(cmd, args, { stdio: 'ignore', env }),
     spawnDaemon: (cmd, args, opts) => spawn(cmd, args, opts),
     openLogAppend: (path) => openSync(path, 'a'),
     closeFd: (fd) => closeSync(fd),
