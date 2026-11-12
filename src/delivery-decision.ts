@@ -1,7 +1,7 @@
 /**
  * delivery-decision.ts — The one place inbound delivery is decided, in both
- * channel modes (channel rules with to,
- * direct messages`via` with).
+ * channel modes: `decideDelivery` for messages and `decideReaction` for
+ * reactions.
  *
  * `decideDelivery` takes a raw Slack `message` / `app_mention` event, the
  * receiving persona P (key, bot user ID, bot ID, channel entries, DMs switch),
@@ -42,8 +42,7 @@
  *    without a label); otherwise `not-mentioned`. `<!everyone>` and user-group
  *    mentions (`<!subteam^…>`) are not mentions.
  *
- * Fungible mode (with to). No persona's
- * channel entries are read, P's or any other's.
+ * Fungible mode. No persona's channel entries are read, P's or any other's.
  *
  * 4. The fungible path: the event takes it only when all of these
  *    hold, checked in this order, `FUNGIBLE_REFUSALS`' order: its
@@ -70,11 +69,47 @@
  * An empty or unknown bot user ID or bot ID never matches an author or a
  * mention.
  *
+ * `decideReaction` is a separate decision, made before any network call or
+ * store, for one raw `reaction_added` / `reaction_removed` event. It takes
+ * the receiving persona P (key, confirmed bot user ID, channel entries, DMs
+ * switch) and `ReactionDecisionInputs` (the channel mode, the envelope flag,
+ * the channel-ID pattern, where the event came from, and whether an ID is one
+ * of the Run Bot Identities: the bot user IDs confirmed for any persona
+ * during this server run). It returns accept (with the reaction's facts and
+ * its reactor, a `user` or a `bot_id`) or drop (with a machine-readable
+ * reason). The first rule the event fails drops it:
+ *
+ * 1. Reaction shape: the event is `reaction_added` (change `added`) or
+ *    `reaction_removed` (change `removed`), its `item.type` is `message`,
+ *    and `item.channel`, `item.ts`, `reaction` and `event_ts` are non-empty
+ *    strings; otherwise `not-a-message-reaction`.
+ * 2. Ownership: `item_user` is P's confirmed bot user ID; otherwise, or when
+ *    P has none, `not-own-message`.
+ * 3. Reactor: the event's `user`, or its `bot_id` when it has no `user`;
+ *    with neither, `no-reactor`. A reactor that is P's bot user ID is
+ *    `own-reaction`; one of the Run Bot Identities is `bot-reaction`.
+ * 4. Conversation: one P serves now. A conversation ID starting with `D` is a
+ *    DM, accepted when P's DMs switch is on and `dm-disabled` otherwise. In
+ *    declarative mode any other conversation must be one of P's channel
+ *    entries, whatever its `delivery`, else `unserved-conversation`; the
+ *    envelope flag and the channel-ID pattern play no part. In fungible mode
+ *    no persona's channel entries are read: the conversation ID must match
+ *    the channel-ID pattern and the envelope flag must be present, a boolean
+ *    and `false`, else `fungible-refused` with the refusal of the first
+ *    that fails. Reaction events carry no `channel_type`, so the group-DM
+ *    exclusion and the fungible path's channel-type condition are left to the
+ *    reaction's preparation after acceptance.
+ *
+ * P's channel delivery (`mentions` or `all`), the stored choices and the
+ * loop guard play no part in a reaction's decision. Both decisions check the
+ * fungible path's channel-ID and envelope-flag conditions with the same
+ * helpers, in `FUNGIBLE_REFUSALS`' order.
+ *
  * Pure and stateless: imports types only,
  * creates no client, reads no file or environment variable, logs nothing, and
  * keeps no counter, rate limit, per-sender memory or cross-persona
- * arbitration. The mode, the stored choices and the destinations arrive as
- * inputs at each call.
+ * arbitration. The mode, the stored choices, the destinations and the Run
+ * Bot Identities arrive as inputs at each call.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -119,6 +154,15 @@ const DELIVERY_ALL: DeliveryMode = 'all'
 
 /** The channel delivery that hears mentions and broadcasts only, and the default. */
 const DELIVERY_MENTIONS: DeliveryMode = 'mentions'
+
+/** The event type of a reaction added to an item (change `added`). */
+const REACTION_ADDED_EVENT = 'reaction_added'
+
+/** The event type of a reaction removed from an item (change `removed`). */
+const REACTION_REMOVED_EVENT = 'reaction_removed'
+
+/** The `item.type` of a reaction on a message. */
+const MESSAGE_ITEM_TYPE = 'message'
 
 /**
  * The destination value that sends by DM (`DM_DESTINATION` in
@@ -318,6 +362,103 @@ export interface AppliedPersonaView {
   channels: readonly ChannelEntry[]
 }
 
+/**
+ * The receiving persona P as `decideReaction` sees it, from the
+ * configuration in effect and P's confirmed identity at the event. Its
+ * `botUserId` is P's confirmed bot user ID: empty or absent never matches a
+ * reacted message's author, so no reaction is accepted. Its channel entries
+ * are read in declarative mode only.
+ */
+export type ReactionDecisionPersona = Pick<DeliveryPersona, 'key' | 'botUserId' | 'channels' | 'dmEnabled'>
+
+/** Where a reaction `decideReaction` decides came from: a Slack event on P's own connection. */
+export type ReactionDecisionOrigin = 'slack-event'
+
+/**
+ * The inputs of `decideReaction` besides the event and P, each read at the
+ * call. The envelope flag and the channel-ID pattern are read in fungible
+ * mode only.
+ */
+export interface ReactionDecisionInputs extends Pick<FungibleDecisionInputs, 'mode' | 'isExtSharedChannel' | 'channelIdPattern'> {
+  /** Where the event came from; carried into the accept outcome. */
+  origin: ReactionDecisionOrigin
+  /**
+   * Whether `id` is one of the Run Bot Identities: the bot user IDs confirmed
+   * for any persona during this server run, removed personas included.
+   * Synchronous, with no side effect.
+   */
+  isRunBotIdentity(id: string): boolean
+}
+
+/** Who reacted: the event's `user` when it has one, else its `bot_id`; exactly one is present. */
+export type ReactionReactor = { user: string; bot_id?: never } | { user?: never; bot_id: string }
+
+/**
+ * The accept outcome: the reaction's facts exactly as received. `channel` is
+ * the conversation, `message_ts` the reacted message's ts (`item.ts`), `ts`
+ * the event's `event_ts`, `emoji` the `reaction` name, `change` whether it
+ * was added or removed, and `mode` and `origin` the inputs it was decided
+ * under.
+ */
+export type ReactionAcceptDecision = {
+  action: 'accept'
+  channel: string
+  message_ts: string
+  ts: string
+  change: 'added' | 'removed'
+  emoji: string
+  mode: ChannelMode
+  origin: ReactionDecisionOrigin
+} & ReactionReactor
+
+/**
+ * Why a reaction is not accepted for P:
+ * - `not-a-message-reaction`: not a reaction added to or removed from a
+ *   message, or a field the reaction needs is missing or empty.
+ * - `not-own-message`: the reacted message is not P's, or P has no confirmed
+ *   bot user ID.
+ * - `no-reactor`: neither `user` nor `bot_id`.
+ * - `own-reaction`: P's own reaction.
+ * - `bot-reaction`: a reaction by one of the Run Bot Identities.
+ * - `dm-disabled`: in a DM while P's DMs switch (`dm.enabled`) is off.
+ * - `unserved-conversation`: in a conversation P does not list (declarative
+ *   mode).
+ * - `fungible-refused`: the conversation fails a fungible-path condition
+ *   (fungible mode); the outcome carries which.
+ */
+export type ReactionDropReason =
+  | 'not-a-message-reaction'
+  | 'not-own-message'
+  | 'no-reactor'
+  | 'own-reaction'
+  | 'bot-reaction'
+  | 'dm-disabled'
+  | 'unserved-conversation'
+  | FungibleDropReason
+
+/**
+ * A fungible-path condition a reaction can fail at its decision. Reaction
+ * events carry no `channel_type`, so `not-a-channel` is never one.
+ */
+export type ReactionFungibleRefusal = Exclude<FungibleRefusal, 'not-a-channel'>
+
+/** A drop outcome of `decideReaction`; only `fungible-refused` carries a refusal. */
+export type ReactionDropDecision =
+  | {
+      action: 'drop'
+      reason: Exclude<ReactionDropReason, FungibleDropReason>
+      refusal?: never
+    }
+  | {
+      action: 'drop'
+      reason: FungibleDropReason
+      /** The first fungible-path condition the conversation failed. */
+      refusal: ReactionFungibleRefusal
+    }
+
+/** Outcome of `decideReaction` for one receiving persona. */
+export type ReactionDecision = ReactionAcceptDecision | ReactionDropDecision
+
 // ---------------------------------------------------------------------------
 // Decision
 // ---------------------------------------------------------------------------
@@ -406,10 +547,10 @@ function decideFungibleChannel(
 }
 
 /**
- * The first fungible-path condition the event fails, in
+ * The first fungible-path condition a message event fails, in
  * `FUNGIBLE_REFUSALS`' order, or undefined when it takes the path: its
- * `channel_type` is `channel` or `group`; `channel` matches the channel-ID
- * pattern; the envelope flag is present, is a boolean, and is `false`.
+ * `channel_type` is `channel` or `group`; then the channel-ID and
+ * envelope-flag conditions `decideReaction` shares.
  */
 function fungibleRefusalOf(
   channelType: unknown,
@@ -417,8 +558,21 @@ function fungibleRefusalOf(
   inputs: FungibleDecisionInputs,
 ): FungibleRefusal | undefined {
   if (channelType !== PUBLIC_CHANNEL_TYPE && channelType !== PRIVATE_CHANNEL_TYPE) return 'not-a-channel'
-  if (!inputs.channelIdPattern.test(channel)) return 'channel-id-malformed'
-  const flag = inputs.isExtSharedChannel
+  return channelIdRefusalOf(channel, inputs.channelIdPattern) ?? envelopeFlagRefusalOf(inputs.isExtSharedChannel)
+}
+
+/** The fungible path's channel-ID condition: `channel` matches the channel-ID pattern. */
+function channelIdRefusalOf(channel: string, channelIdPattern: RegExp): 'channel-id-malformed' | undefined {
+  return channelIdPattern.test(channel) ? undefined : 'channel-id-malformed'
+}
+
+/**
+ * The fungible path's envelope-flag conditions, in `FUNGIBLE_REFUSALS`'
+ * order: the flag (`is_ext_shared_channel`, exactly as received) is
+ * present, is a boolean, and is `false`. Kept apart from the channel-ID
+ * condition because an event that has no envelope still needs that one.
+ */
+function envelopeFlagRefusalOf(flag: unknown): Exclude<ReactionFungibleRefusal, 'channel-id-malformed'> | undefined {
   if (flag === undefined) return 'flag-missing'
   if (typeof flag !== 'boolean') return 'flag-not-boolean'
   if (flag) return 'externally-shared'
@@ -476,6 +630,119 @@ function conversationKind(channelType: unknown, channel: string): 'dm' | 'group-
 /** The value when it is a non-empty string; otherwise undefined. */
 function nonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value !== '' ? value : undefined
+}
+
+// ---------------------------------------------------------------------------
+// Reaction decision
+// ---------------------------------------------------------------------------
+
+/** A reaction event that passed the shape rule: its record and the fields the accept outcome carries. */
+interface MessageReaction {
+  event: Record<string, unknown>
+  change: ReactionAcceptDecision['change']
+  channel: string
+  messageTs: string
+  emoji: string
+  eventTs: string
+}
+
+/**
+ * Decide whether the receiving persona P accepts the reaction `event` (see
+ * the module comment for the rule order). `persona` and `inputs` come from
+ * the configuration in effect and P's confirmed identity at this event;
+ * nothing is kept between calls.
+ */
+export function decideReaction(
+  event: unknown,
+  persona: ReactionDecisionPersona,
+  inputs: ReactionDecisionInputs,
+): ReactionDecision {
+  const reaction = messageReactionOf(event)
+  if (reaction === undefined) return { action: 'drop', reason: 'not-a-message-reaction' }
+
+  const ownUser = nonEmptyString(persona.botUserId)
+  if (ownUser === undefined || reaction.event['item_user'] !== ownUser) return { action: 'drop', reason: 'not-own-message' }
+
+  const reactor = reactorOf(reaction.event)
+  if (reactor === undefined) return { action: 'drop', reason: 'no-reactor' }
+  if (reactor.id === ownUser) return { action: 'drop', reason: 'own-reaction' }
+  if (inputs.isRunBotIdentity(reactor.id)) return { action: 'drop', reason: 'bot-reaction' }
+
+  // Every reactor rule comes before every conversation rule, so a Bot's
+  // reaction is `bot-reaction` in any conversation, served or not.
+  const conversationDrop = reactionConversationDropOf(reaction.channel, persona, inputs)
+  if (conversationDrop !== undefined) return conversationDrop
+
+  return {
+    action: 'accept',
+    channel: reaction.channel,
+    message_ts: reaction.messageTs,
+    ts: reaction.eventTs,
+    change: reaction.change,
+    emoji: reaction.emoji,
+    mode: inputs.mode,
+    origin: inputs.origin,
+    ...reactor.fields,
+  }
+}
+
+/**
+ * The shape rule: `event` is a `reaction_added` or `reaction_removed` event
+ * on a message, with non-empty string `item.channel`, `item.ts`, `reaction`
+ * and `event_ts`, each kept exactly as received; otherwise undefined.
+ */
+function messageReactionOf(event: unknown): MessageReaction | undefined {
+  if (!isRecord(event)) return undefined
+  const change = reactionChangeOf(event['type'])
+  const item = event['item']
+  if (change === undefined || !isRecord(item) || item['type'] !== MESSAGE_ITEM_TYPE) return undefined
+  const channel = nonEmptyString(item['channel'])
+  const messageTs = nonEmptyString(item['ts'])
+  const emoji = nonEmptyString(event['reaction'])
+  const eventTs = nonEmptyString(event['event_ts'])
+  if (channel === undefined || messageTs === undefined || emoji === undefined || eventTs === undefined) return undefined
+  return { event, change, channel, messageTs, emoji, eventTs }
+}
+
+/** The change a reaction event type makes, or undefined for any other type. */
+function reactionChangeOf(type: unknown): ReactionAcceptDecision['change'] | undefined {
+  if (type === REACTION_ADDED_EVENT) return 'added'
+  if (type === REACTION_REMOVED_EVENT) return 'removed'
+  return undefined
+}
+
+/** The reactor's ID and its accept fields: a non-empty `user` first, else a non-empty `bot_id`; undefined with neither. */
+function reactorOf(ev: Record<string, unknown>): { id: string; fields: ReactionReactor } | undefined {
+  const user = nonEmptyString(ev['user'])
+  if (user !== undefined) return { id: user, fields: { user } }
+  const botId = nonEmptyString(ev['bot_id'])
+  return botId === undefined ? undefined : { id: botId, fields: { bot_id: botId } }
+}
+
+/**
+ * The conversation rule: undefined when P serves `channel` now, else its drop.
+ * A DM depends on P's DMs switch alone in both modes; declarative mode reads
+ * only P's channel entries, fungible mode only the channel-ID pattern and the
+ * envelope flag.
+ */
+function reactionConversationDropOf(
+  channel: string,
+  persona: ReactionDecisionPersona,
+  inputs: ReactionDecisionInputs,
+): ReactionDropDecision | undefined {
+  if (channel.startsWith(DM_CONVERSATION_PREFIX)) {
+    return persona.dmEnabled ? undefined : { action: 'drop', reason: 'dm-disabled' }
+  }
+  if (inputs.mode === FUNGIBLE_MODE) {
+    const refusal = channelIdRefusalOf(channel, inputs.channelIdPattern) ?? envelopeFlagRefusalOf(inputs.isExtSharedChannel)
+    return refusal === undefined ? undefined : { action: 'drop', reason: 'fungible-refused', refusal }
+  }
+  return persona.channels.some((entry) => entry.id === channel) ? undefined : { action: 'drop', reason: 'unserved-conversation' }
+}
+
+/** True when `value` is a non-null object, so its fields can be read. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
 }
 
 // ---------------------------------------------------------------------------
