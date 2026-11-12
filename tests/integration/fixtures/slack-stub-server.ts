@@ -41,8 +41,20 @@
  *         "connections": "ok", "ticket": "MARKER",
  *         "user_id": "U…", "bot_id": "B…", "ws_scheme": "ws" }
  *     ],
- *     "default": { "auth": "ok", "connections": "ok" }
+ *     "default": { "auth": "ok", "connections": "ok" },
+ *     "users": { "U…": { "name": "…", "real_name": "…",
+ *                         "profile": { "display_name": "…", "real_name": "…" } } },
+ *     "channels": { "C…": { "name": "…", "is_member": true, "is_channel": true,
+ *                            "is_private": false, "is_mpim": false, "is_im": false,
+ *                            "is_ext_shared": false, "error": "<Slack code>" } },
+ *     "replies": { "C…": { "<ts>": { "message": { "ts": "<ts>", "user": "U…", "bot_id": "B…",
+ *                                                  "thread_ts": "<ts>",
+ *                                                  "metadata": { "event_type": "…", "event_payload": {} },
+ *                                                  "blocks": [ … ] } } } }
  *   }
+ *
+ * Every top-level key is optional; `users`, `channels` and `replies` are
+ * independent of the token sections and apply to every label.
  *
  * A request's token is its `Authorization: Bearer` value (or a `token` form
  * field). The first `tokens` entry whose `suffix` the token ends with applies;
@@ -67,6 +79,54 @@
  *   `closed-port`, which mirrors Slack's real URL shape; `ws` otherwise).
  * - `user_id` / `bot_id`: `auth.test`'s identity; default `U`/`B` plus the
  *   token's hash, so two tokens get two identities.
+ *
+ * `users` (keys `U…`/`W…`) overlays `users.info`'s defaults with the given
+ * `name`, `real_name` and `profile` texts.
+ *
+ * `channels` (keys `C…`/`D…`/`G…`) answers `conversations.info` for the
+ * requested `channel`:
+ * - With no entry, the answer is `{"ok":true,"channel":{"id","name":"stub-<id
+ *   in lower case>","is_member":true}}`, exactly as before these fields existed;
+ *   no kind or sharing flag is added.
+ * - `name` (string) and the booleans `is_member`, `is_channel`, `is_private`,
+ *   `is_mpim`, `is_im` and `is_ext_shared` overlay those defaults. Only the
+ *   fields given appear; the stub derives no flag from another.
+ * - `error` (a Slack error code: lower-case letters, digits, `_`) makes the
+ *   call answer `{"ok":false,"error":"<code>"}`, HTTP 200, whatever else the
+ *   entry holds. Every `conversations.info` of that channel fails, the server's
+ *   channel-name reads included.
+ *
+ * `replies` answers `conversations.replies` by the request's `channel` and
+ * its exact `ts` (`<digits>.<1-6 digits>`). Other arguments (`oldest`,
+ * `latest`, `inclusive`, …) are recorded, not interpreted. Each entry is one of:
+ * - `{"message": {…}}`: answers `{"ok":true,"messages":[<message>],
+ *   "has_more":false,"response_metadata":{"next_cursor":""}}`, the message
+ *   exactly as given. It may hold only `ts` (required, a Slack ts; the
+ *   server keeps the returned message whose `ts` equals the reacted one, so a
+ *   scenario normally repeats the key), `user` (`U…`/`W…`) and/or `bot_id`
+ *   (`B…`), at least one of the two, `thread_ts` (a Slack ts), `metadata`
+ *   (`{"event_type": <non-empty string>, "event_payload"?: <object>}`) and
+ *   `blocks` (a list of at most 50 objects, sent unchanged). The stub never
+ *   adds an author, a thread, a marker or a button, and does not judge whether
+ *   a message is a Server Post: the scenario writes the marker metadata or the
+ *   permission buttons it wants the server to see.
+ * - `{"error": "<Slack code>"}` (`not_in_channel`, `channel_not_found`, …):
+ *   answers `{"ok":false,"error":"<code>"}`, HTTP 200.
+ * - `{}`: explicitly no message: the empty answer below.
+ * `message` and `error` together are refused. A request whose channel or ts
+ * has no entry, and every `conversations.history`, gets the empty answer
+ * `{"ok":true,"messages":[],"has_more":false,"response_metadata":{"next_cursor":""}}`.
+ *
+ * A configured error is checked after the token's `auth`, so a refused token
+ * still answers its `auth` code. No other method reads `channels` or
+ * `replies`.
+ *
+ * Validation: a control that breaks any rule above is refused whole (the file
+ * keeps the previous control and writes a `control-error` line; `POST
+ * /_control` answers 400). The reason names the field, never a supplied
+ * value. As with every control field, rewriting the file or posting a new
+ * control replaces `channels` and `replies` at once, so a scenario switches
+ * a conversation's kind, sharing, failure or message mid-run.
  *
  * Other endpoints: `GET /_control` (the labels in force), `GET /_health`,
  * `POST /_push` (below), and `POST /upload/<id>` (the upload URL
@@ -169,6 +229,14 @@
  *
  * `api` lines also carry `channel`, `user` and `text` when the request has
  * them, and `args_token_like` (whether any argument held token-like text).
+ * `conversations.replies` lines also carry, each when the request sent it,
+ * `request_ts` (the request's `ts`; the line's own `ts` is its write time),
+ * `oldest`, `latest`, `inclusive` and `include_all_metadata`, each the
+ * wire string as received (a true flag is `"true"`), with token-like text
+ * replaced and cut to at most 300 characters. A configured error's line has
+ * `answer` set to its code. No line carries a returned message, its metadata
+ * or blocks, or a `channels` entry; each `conversations.info` call is its own
+ * line, its `channel` the requested one.
  * Posts/updates with `blocks` additionally record their redacted structured
  * display/button fields (no arbitrary fields or URLs), and successful ones
  * carry `response_ts`, the returned message timestamp used for a click.
@@ -208,12 +276,39 @@ export interface StubTokenRule extends StubAnswers {
   label: string
 }
 
+/** `conversations.info` facts for one conversation; `error` fails the call instead. */
+export interface StubChannelEntry {
+  name?: string
+  is_member?: boolean
+  is_channel?: boolean
+  is_private?: boolean
+  is_mpim?: boolean
+  is_im?: boolean
+  is_ext_shared?: boolean
+  error?: string
+}
+
+/** A message `conversations.replies` returns, exactly as the control gives it. */
+export interface StubRepliesMessage {
+  ts: string
+  user?: string
+  bot_id?: string
+  thread_ts?: string
+  metadata?: { event_type: string; event_payload?: Record<string, unknown> }
+  blocks?: Record<string, unknown>[]
+}
+
+/** One exact-ts `conversations.replies` answer: a message, a Slack error, or (`{}`) no message. */
+export type StubRepliesEntry = { message: StubRepliesMessage } | { error: string } | Record<string, never>
+
 /** The whole control document. */
 export interface StubControl {
   tokens?: StubTokenRule[]
   default?: StubAnswers
   users?: Record<string, { name?: string; real_name?: string; profile?: { display_name?: string; real_name?: string } }>
-  channels?: Record<string, { name?: string; is_member?: boolean }>
+  channels?: Record<string, StubChannelEntry>
+  /** Channel ID, then the requested message `ts`. */
+  replies?: Record<string, Record<string, StubRepliesEntry>>
 }
 
 export interface SlackStubOptions {
@@ -324,8 +419,84 @@ function recordedBlocks(text: string): Record<string, unknown>[] | null {
 
 const ANSWER_KEYS = ['auth', 'connections', 'ticket', 'ws_scheme', 'user_id', 'bot_id'] as const
 
+/** The boolean `conversations.info` facts a `channels` entry may set. */
+const CHANNEL_FLAGS: readonly string[] = ['is_member', 'is_channel', 'is_private', 'is_mpim', 'is_im', 'is_ext_shared']
+
+const USER_ID_RE = /^[UW][A-Z0-9]+$/
+const BOT_ID_RE = /^B[A-Z0-9]+$/
+const CHANNEL_ID_RE = /^[CDG][A-Z0-9]+$/
+const SLACK_TS_RE = /^\d+\.\d{1,6}$/
+/** A Slack error code (`not_in_channel`, `channel_not_found`, …): answered `ok: false`. */
+const SLACK_ERROR_RE = /^[a-z][a-z0-9_]*$/
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** `map[key]` when `map` holds `key` itself, so a request argument never reaches a prototype member. */
+function ownEntry<T>(map: Record<string, T> | undefined, key: string | undefined): T | undefined {
+  return map !== undefined && key !== undefined && Object.hasOwn(map, key) ? map[key] : undefined
+}
+
+/** Validate one `replies` message; it is returned as given, so nothing is inferred. */
+function checkRepliesMessage(value: unknown): StubRepliesMessage {
+  const where = 'control.replies message'
+  if (!isObject(value)) throw new Error(`${where} must be an object`)
+  for (const [field, data] of Object.entries(value)) {
+    switch (field) {
+      case 'ts':
+      case 'thread_ts':
+        if (typeof data !== 'string' || !SLACK_TS_RE.test(data)) throw new Error(`${where}.${field} must be a Slack timestamp`)
+        break
+      case 'user':
+        if (typeof data !== 'string' || !USER_ID_RE.test(data)) throw new Error(`${where}.user must be a user ID`)
+        break
+      case 'bot_id':
+        if (typeof data !== 'string' || !BOT_ID_RE.test(data)) throw new Error(`${where}.bot_id must be a bot ID`)
+        break
+      case 'metadata':
+        if (!isObject(data) || typeof data.event_type !== 'string' || data.event_type === '' ||
+            Object.keys(data).some(key => key !== 'event_type' && key !== 'event_payload') ||
+            (data.event_payload !== undefined && !isObject(data.event_payload))) {
+          throw new Error(`${where}.metadata must be {event_type, event_payload?}`)
+        }
+        break
+      case 'blocks':
+        if (!Array.isArray(data) || data.length > 50 || !data.every(isObject)) throw new Error(`${where}.blocks must be a list of at most 50 objects`)
+        break
+      default:
+        throw new Error(`${where} has an unknown field`)
+    }
+  }
+  if (value.ts === undefined) throw new Error(`${where}.ts is required`)
+  if (value.user === undefined && value.bot_id === undefined) throw new Error(`${where} needs user or bot_id`)
+  return value as unknown as StubRepliesMessage
+}
+
+/** Validate the `replies` map: channel ID, then exact message ts, then one entry. */
+function checkReplies(value: unknown): NonNullable<StubControl['replies']> {
+  if (!isObject(value)) throw new Error('control.replies must be an object')
+  const replies: NonNullable<StubControl['replies']> = {}
+  for (const [channel, byTs] of Object.entries(value)) {
+    if (!CHANNEL_ID_RE.test(channel) || !isObject(byTs)) throw new Error('control.replies entry is invalid')
+    const entries: Record<string, StubRepliesEntry> = {}
+    for (const [ts, entry] of Object.entries(byTs)) {
+      if (!SLACK_TS_RE.test(ts)) throw new Error('control.replies key must be a Slack timestamp')
+      if (!isObject(entry)) throw new Error('control.replies entry must be an object')
+      if (Object.keys(entry).some(key => key !== 'message' && key !== 'error')) throw new Error('control.replies entry has an unknown field')
+      if (entry.message !== undefined && entry.error !== undefined) throw new Error('control.replies entry must not hold both message and error')
+      if (entry.error !== undefined) {
+        if (typeof entry.error !== 'string' || !SLACK_ERROR_RE.test(entry.error)) throw new Error('control.replies error must be a Slack error code')
+        entries[ts] = { error: entry.error }
+      } else if (entry.message !== undefined) {
+        entries[ts] = { message: checkRepliesMessage(entry.message) }
+      } else {
+        entries[ts] = {}
+      }
+    }
+    replies[channel] = entries
+  }
+  return replies
 }
 
 function checkAnswers(value: unknown, where: string): StubAnswers {
@@ -363,14 +534,17 @@ export function parseControl(value: unknown): StubControl {
     if (!isObject(entries)) throw new Error(`control.${kind} must be an object`)
     const checked: Record<string, Record<string, unknown>> = {}
     for (const [id, metadata] of Object.entries(entries)) {
-      if (!(kind === 'users' ? /^[UW][A-Z0-9]+$/ : /^[CDG][A-Z0-9]+$/).test(id) || !isObject(metadata)) throw new Error(`control.${kind} entry is invalid`)
+      if (!(kind === 'users' ? USER_ID_RE : CHANNEL_ID_RE).test(id) || !isObject(metadata)) throw new Error(`control.${kind} entry is invalid`)
       const entry: Record<string, unknown> = {}
       for (const [field, data] of Object.entries(metadata)) {
         if (field === 'name' || (kind === 'users' && field === 'real_name')) {
           if (typeof data !== 'string') throw new Error(`control.${kind} text must be a string`)
           entry[field] = data
-        } else if (kind === 'channels' && field === 'is_member') {
-          if (typeof data !== 'boolean') throw new Error('control.channels.is_member must be boolean')
+        } else if (kind === 'channels' && CHANNEL_FLAGS.includes(field)) {
+          if (typeof data !== 'boolean') throw new Error(`control.channels.${field} must be boolean`)
+          entry[field] = data
+        } else if (kind === 'channels' && field === 'error') {
+          if (typeof data !== 'string' || !SLACK_ERROR_RE.test(data)) throw new Error('control.channels.error must be a Slack error code')
           entry[field] = data
         } else if (kind === 'users' && field === 'profile') {
           if (!isObject(data) || Object.keys(data).some(key => !['display_name', 'real_name'].includes(key)) || Object.values(data).some(text => typeof text !== 'string')) throw new Error('control.users.profile is invalid')
@@ -382,6 +556,7 @@ export function parseControl(value: unknown): StubControl {
     if (kind === 'users') control.users = checked as StubControl['users']
     else control.channels = checked as StubControl['channels']
   }
+  if (value.replies !== undefined) control.replies = checkReplies(value.replies)
   return control
 }
 
@@ -410,11 +585,18 @@ function okBody(method: string, args: Record<string, string>, seq: number, uploa
     }
     case 'conversations.open':
       return { ok: true, channel: { id: `D0STUB${String(seq).padStart(4, '0')}` } }
-    case 'conversations.info':
-      return { ok: true, channel: { id: channel, name: `stub-${channel.toLowerCase()}`, is_member: true, ...control.channels?.[channel] } }
+    case 'conversations.info': {
+      // A configured `error` was answered before this; only the facts overlay the defaults.
+      const { error: _error, ...facts } = ownEntry(control.channels, channel) ?? {}
+      return { ok: true, channel: { id: channel, name: `stub-${channel.toLowerCase()}`, is_member: true, ...facts } }
+    }
     case 'conversations.history':
-    case 'conversations.replies':
       return { ok: true, messages: [], has_more: false, response_metadata: { next_cursor: '' } }
+    case 'conversations.replies': {
+      const entry = ownEntry(ownEntry(control.replies, args.channel), args.ts)
+      const messages = entry !== undefined && 'message' in entry ? [entry.message] : []
+      return { ok: true, messages, has_more: false, response_metadata: { next_cursor: '' } }
+    }
     case 'users.info': {
       const id = args.user ?? 'U0STUBUSER'
       const user = control.users?.[id]
@@ -837,6 +1019,12 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
         if (args.name !== undefined) fields.name = recordedText(method, args.name)
         if (args.timestamp !== undefined) fields.timestamp = recordedText(method, args.timestamp)
       }
+      if (method === 'conversations.replies') {
+        // `request_ts`, because a record line's own `ts` is its write time.
+        for (const [arg, field] of [['ts', 'request_ts'], ['oldest', 'oldest'], ['latest', 'latest'], ['inclusive', 'inclusive'], ['include_all_metadata', 'include_all_metadata']] as const) {
+          if (args[arg] !== undefined) fields[field] = recordedText(method, args[arg])
+        }
+      }
       if (args.user !== undefined) fields.user = args.user
       if (args.thread_ts !== undefined) fields.thread_ts = recordedText(method, args.thread_ts)
       if (args.text !== undefined) fields.text = recordedText(method, args.text)
@@ -891,6 +1079,11 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
 
       const auth = answers.auth ?? 'ok'
       if (auth !== 'ok') return failWith(auth)
+
+      const configuredError = method === 'conversations.info' ? ownEntry(control.channels, args.channel ?? 'C0STUBCHAN')?.error
+        : method === 'conversations.replies' ? (ownEntry(ownEntry(control.replies, args.channel), args.ts) as { error?: string } | undefined)?.error
+          : undefined
+      if (configuredError !== undefined) return failWith(configuredError)
 
       if (method === 'auth.test') {
         const hash = tokenHash(token!).toUpperCase().slice(0, 10)

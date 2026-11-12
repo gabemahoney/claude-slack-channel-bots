@@ -2,7 +2,7 @@
  * fmk-texts-entries.test.ts — Every `src/` export the `/ci` scenarios' value
  * printer (`tests/integration/fixtures/fmk-texts.ts`
  * read by every fmk scenario and by the shared-mode
- * test-29-invited-channels.sh) names exists in `src/` with the kind the
+ * test-29-invited-channels.sh and test-50-reaction-notices.sh) names exists in `src/` with the kind the
  * printer reads it as, so a renamed, removed or retyped export fails on the
  * host, before `/ci` runs a scenario.
  *
@@ -72,16 +72,22 @@ import * as livenessReading from '../src/liveness-reading.ts'
 import * as outageState from '../src/outage-state.ts'
 import * as paneRead from '../src/pane-read.ts'
 import * as pendingRow from '../src/pending-row.ts'
+import * as permissionActionId from '../src/permission-action-id.ts'
 import * as personaDiagnostics from '../src/persona-diagnostics.ts'
 import * as personaEpisodes from '../src/persona-episodes.ts'
 import * as personaIdentity from '../src/persona-identity.ts'
 import * as personaNotifier from '../src/persona-notifier.ts'
+import * as reactionIntakeDiagnostics from '../src/reaction-intake-diagnostics.ts'
+import * as reactionPreparationDiagnostics from '../src/reaction-preparation-diagnostics.ts'
 import * as registry from '../src/registry.ts'
 import * as reloadApply from '../src/reload-apply.ts'
 import * as reloadPlan from '../src/reload-plan.ts'
+import * as replyReminder from '../src/reply-reminder.ts'
 import * as restart from '../src/restart.ts'
 import * as rowReadRules from '../src/row-read-rules.ts'
+import * as serverPost from '../src/server-post.ts'
 import * as sessionManager from '../src/session-manager.ts'
+import * as tagWrapper from '../src/tag-wrapper.ts'
 import * as testTimerOverrides from '../src/test-timer-overrides.ts'
 import * as unavailableRetry from '../src/unavailable-retry.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
@@ -113,16 +119,22 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'outage-state.ts': outageState,
   'pane-read.ts': paneRead,
   'pending-row.ts': pendingRow,
+  'permission-action-id.ts': permissionActionId,
   'persona-diagnostics.ts': personaDiagnostics,
   'persona-episodes.ts': personaEpisodes,
   'persona-identity.ts': personaIdentity,
   'persona-notifier.ts': personaNotifier,
+  'reaction-intake-diagnostics.ts': reactionIntakeDiagnostics,
+  'reaction-preparation-diagnostics.ts': reactionPreparationDiagnostics,
   'registry.ts': registry,
   'reload-apply.ts': reloadApply,
   'reload-plan.ts': reloadPlan,
+  'reply-reminder.ts': replyReminder,
   'restart.ts': restart,
   'row-read-rules.ts': rowReadRules,
+  'server-post.ts': serverPost,
   'session-manager.ts': sessionManager,
+  'tag-wrapper.ts': tagWrapper,
   'test-timer-overrides.ts': testTimerOverrides,
   'unavailable-retry.ts': unavailableRetry,
 }
