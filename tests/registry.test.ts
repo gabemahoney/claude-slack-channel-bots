@@ -200,6 +200,16 @@ const TOOL_CAPTURE: Record<ToolName, keyof StubSlack['calls']> = {
 
 const TOOLS = Object.keys(TOOL_ARGS) as ToolName[]
 
+/**
+ * Tool Posts and tool edits carry no Slack metadata, so no reply is taken for
+ * a Server Post and an edit keeps the message's own: each captured call
+ * (at least one) has no `metadata` key at all, not even one set to undefined.
+ */
+function expectNoMetadata(calls: readonly object[]): void {
+  expect(calls.length).toBeGreaterThan(0)
+  for (const call of calls) expect(Object.hasOwn(call, 'metadata')).toBe(false)
+}
+
 /** Every Slack call recorded on a stub, across all capture arrays. */
 function slackCallCount(stub: StubSlack): number {
   return Object.values(stub.calls).reduce((n, list) => n + list.length, 0)
@@ -1300,6 +1310,7 @@ describe('tool posting scope (through the MCP server)', () => {
       expect(result.isError).toBeUndefined()
       const captured = stubOf(h.alpha).calls[TOOL_CAPTURE[tool]] as Array<{ channel?: string }>
       expect(captured.map((c) => c.channel)).toEqual([target])
+      expectNoMetadata(captured)
       expect(slackCallCount(stubOf(h.beta))).toBe(0)
     },
   )
@@ -1334,6 +1345,7 @@ describe('tool posting scope (through the MCP server)', () => {
     expect(Object.keys(stubOf(h.alpha).calls.postMessage[0]!)).toEqual(
       expect.not.arrayContaining(['username', 'icon_emoji', 'icon_url']),
     )
+    expectNoMetadata(stubOf(h.alpha).calls.postMessage)
   })
 })
 
@@ -1487,6 +1499,9 @@ describe('DM targets (through the MCP server)', () => {
     expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([
       { channel_id: OPENED, file_uploads: [{ file, filename: 'out.txt' }], thread_ts: posted[0] },
     ] as any)
+    // Every chunk and the upload are Tool Posts.
+    expectNoMetadata(stubOf(h.alpha).calls.postMessage)
+    expectNoMetadata(stubOf(h.alpha).calls.filesUploadV2)
     expect(stubOf(h.beta).callLog).toEqual([])
   })
 

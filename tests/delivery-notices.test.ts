@@ -8,10 +8,12 @@ import type { SlackKey } from '../src/delivery-queue.ts'
 import type { DeliveryReason, DeliveryStatus } from '../src/delivery-engine.ts'
 import { buildDeliveryDiagnostic, buildDeliveryStuckNotice, buildMessageNotSavedNotice, buildMessageSavedAfterRetryNotice, buildStorageNoticeRecoveryLine, buildMessageNotTakenInNotice, buildMessagesWaitingNotice, buildQueueRecordUnreadableNotice, deliveryIdentity, deliveryStuckRemedy, MESSAGE_NOT_TAKEN_IN, MESSAGE_RECEIVED, MESSAGE_RETYPED, QUEUE_KEPT, QUEUE_UNWRITABLE, type DeliveryReportState, type DeliveryStuckReason } from '../src/delivery-notices.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
+import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
 import { MESSAGE_PARTIAL_RECEIPT, PERSONA_DESTINATION_FAILED } from '../src/persona-diagnostics.ts'
 import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { makeDeliveryNoticeHarness, makeStorageNoticeHarness, type DeliveryNoticeHarness, type StorageNoticeHarness } from './test-helpers/delivery-notices.ts'
+import type { NoticePost } from './test-helpers/persona-notifier.ts'
 import { injectedInput, readQueue } from './test-helpers/delivery-queue.ts'
 import { partialReceiptText, partialReceiptSuffix } from './test-helpers/partial-receipt.ts'
 import { openedDm } from './test-helpers/slack-stub.ts'
@@ -437,6 +439,14 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
   function recovered(r: StorageNoticeHarness, args: object) {
     expect(noticeText(args)).toBe(formatPersonaNotice(r.config.personas[0]!, buildMessageSavedAfterRetryNotice(r.ref(), 'U0SENDER1')))
   }
+  /** The Server Post Marker every warning and correction post carries. */
+  const SERVER_POST_METADATA = { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} }
+  /** A captured notice post as Slack receives it: the capture type's `{channel, text}` and the marker. */
+  const noticePost = (channel: string, text: string): NoticePost => ({ channel, text, metadata: SERVER_POST_METADATA }) as NoticePost
+  /** An edit leaves Slack's stored metadata alone: no `metadata` key at all, not even one set to undefined. */
+  function expectNoMetadata(args: object) {
+    expect(Object.hasOwn(args, 'metadata')).toBe(false)
+  }
   function recoveryLines(r: StorageNoticeHarness) {
     return r.logs.filter(line => line.includes(' recovery='))
   }
@@ -502,6 +512,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     expect(updates).toHaveLength(1)
     expect(updates[0]).toMatchObject({ channel: destination === 'dm' ? noticeDm : 'C0NOTICE1', ts: warningTs })
     recovered(r, updates[0]!)
+    expectNoMetadata(updates[0]!)
     expect(r.h.posts(r.alpha)).toHaveLength(1)
     expect(r.h.stub(r.beta).callLog).toEqual([])
     expect(recoveryLines(r)).toEqual([recoveryLine(r, 'edit', { outcome: 'success' }, edited.edited.ts)])
@@ -533,11 +544,14 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     await retry(r)
     expect(r.h.stub(r.alpha).calls.update).toHaveLength(1)
     expect(r.h.stub(r.alpha).calls.update[0]).toMatchObject({ channel: destination === 'dm' ? noticeDm : 'C0NOTICE1', ts: warningTs })
+    expectNoMetadata(r.h.stub(r.alpha).calls.update[0]!)
     expect(r.h.posts(r.alpha)).toHaveLength(2)
     const correction = r.h.stub(r.alpha).calls.postMessage[1]!
     expect(correction.channel).toBe(r.h.posts(r.alpha)[0]!.channel)
     expect(correction.thread_ts).toBe(r.h.stub(r.alpha).calls.postMessage[0]!.thread_ts)
     recovered(r, correction)
+    // The fallback is a Server Post: the marker rides in its one request.
+    expect(correction).toEqual(noticePost(r.h.posts(r.alpha)[0]!.channel, noticeText(correction)!))
     expect(noticeText(correction)!.length).toBeLessThan(warning(r).length)
     expect(recoveryLines(r)).toEqual([
       expect.stringContaining(recoveryLine(r, 'edit', { outcome: 'failed', reason: '' })),
@@ -566,7 +580,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     expect(r.acks).toHaveLength(1)
     expect(r.queue.items(r.alpha)).toHaveLength(1)
     opening.settle(openedDm(noticeDm)); await r.flush()
-    expect(r.h.posts(r.alpha)).toEqual([{ channel: noticeDm, text: warning(r) }])
+    expect(r.h.posts(r.alpha)).toEqual([noticePost(noticeDm, warning(r))])
     expect(r.h.stub(r.alpha).calls.update).toEqual([])
   })
   test.each(unrelated)('posted edited warning survives %s, then the exact edit still corrects it', async (_label, other) => {
@@ -610,7 +624,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     await r.receive(); await r.receive()
     await r.h.clock.advance(90 * 24 * 60 * 60 * 1000)
     await r.receive()
-    expect(r.h.posts(r.alpha)).toEqual([{ channel: noticeDm, text: warning(r) }])
+    expect(r.h.posts(r.alpha)).toEqual([noticePost(noticeDm, warning(r))])
     expect(r.h.stub(r.alpha).calls.update).toEqual([])
     expect(r.acks).toEqual([])
     expect(r.queue.items(r.alpha)).toEqual([])
@@ -662,6 +676,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     expect(r.h.posts(r.alpha)).toHaveLength(2)
     expect(r.h.posts(r.alpha)[1]!.channel).toBe('C0NOTICE1')
     recovered(r, r.h.stub(r.alpha).calls.postMessage[1]!)
+    expect(r.h.stub(r.alpha).calls.postMessage[1]!.metadata).toEqual(SERVER_POST_METADATA)
     expect(recoveryLines(r)).toEqual([
       recoveryLine(r, 'edit', { outcome: 'failed', reason: 'missing_message_ts' }),
       recoveryLine(r, 'correction', { outcome: 'success' }),
@@ -684,7 +699,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     expect(r.h.clock.pendingCount()).toBe(keepOther ? 1 : 0)
     if (keepOther) {
       await r.h.clock.runNext()
-      expect(r.h.posts(r.alpha)[1]).toEqual({ channel: 'C0NOTICE1', text: formatPersonaNotice(r.config.personas[0]!, other) })
+      expect(r.h.posts(r.alpha)[1]).toEqual(noticePost('C0NOTICE1', formatPersonaNotice(r.config.personas[0]!, other)))
     }
     await r.h.clock.advance(NOTICE_CORRECTION_TIMEOUT_MS * 2)
     expect(r.h.posts(r.alpha)).toHaveLength(keepOther ? 2 : 1)
@@ -727,7 +742,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     // an open timeout: abort itself must release this persona's drain.
     await r.h.clock.advance(1)
     expect(opening.settled).toBe(false)
-    const expectedPosts = [{ channel: 'C0FIXED01', text: formatPersonaNotice(r.h.personas[0]!, other) }]
+    const expectedPosts = [noticePost('C0FIXED01', formatPersonaNotice(r.h.personas[0]!, other))]
     expect(r.h.posts(r.alpha)).toEqual(expectedPosts)
     expect(r.h.hold.view(r.alpha)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
     const destinationOutcomes = destinationLines(r)
@@ -792,8 +807,8 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     await r.receive(edited, r.beta)
     expect(r.acks).toEqual([])
     expect(readQueue(r.root, r.beta)).toEqual([])
-    expect(r.h.posts(r.beta)).toEqual([{ channel: betaDm,
-      text: formatPersonaNotice(r.config.personas[1]!, buildMessageNotSavedNotice(r.ref(r.beta), 'U0SENDER1')) }])
+    expect(r.h.posts(r.beta)).toEqual([noticePost(betaDm,
+      formatPersonaNotice(r.config.personas[1]!, buildMessageNotSavedNotice(r.ref(r.beta), 'U0SENDER1')))])
     expect(opening.settled).toBe(false)
     // Both warning registrations exist before only alpha is forgotten.
     r.forget()

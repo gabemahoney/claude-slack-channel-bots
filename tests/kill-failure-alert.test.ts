@@ -144,8 +144,14 @@ import { LAUNCH_START_PRE_PERSONA_KEY } from './test-helpers/conflict-cases.ts'
 import { LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
-import { makeNoticeAlertsRig, makeNotifierHarness, readStartupEntries, type NotifierHarness, type StartupEntry } from './test-helpers/persona-notifier.ts'
+import { makeNoticeAlertsRig, makeNotifierHarness, readStartupEntries, type NoticePost, type NotifierHarness, type StartupEntry } from './test-helpers/persona-notifier.ts'
 import { forbiddenServerLoads } from './test-helpers/source-audit.ts'
+import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
+
+/** The Server Post Marker every server post carries. */
+const SERVER_POST_METADATA = { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} }
+/** A captured notice post as the server posts it: channel, text and the Server Post Marker. */
+const noticePost = (channel: string, text: string): NoticePost => ({ channel, text, metadata: SERVER_POST_METADATA }) as NoticePost
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -873,7 +879,7 @@ describe('kill-failure alert: the alerts layer over every context, and a stopped
       const keptRoute = expectedRoute(version, context, true, false)
       expect(h.posts(kept.key)).toEqual(
         keptRoute.destination
-          ? [{ channel: kept.permission_prompts!, text: formatPersonaNotice(kept, killFailureAlertText(contentFor(kept.key, decision), keptRoute.closing, true)) }]
+          ? [noticePost(kept.permission_prompts!, formatPersonaNotice(kept, killFailureAlertText(contentFor(kept.key, decision), keptRoute.closing, true)))]
           : [],
       )
       expect(h.posts(removed.key)).toEqual([])

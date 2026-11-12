@@ -2,6 +2,7 @@
 import type { PostedPersonaNotice } from './persona-notifier.ts'
 import type { PersonaConnectionClock } from './persona-connections.ts'
 import { describeSlackCallFailure } from './persona-connection-errors.ts'
+import { SERVER_POST_EVENT_TYPE } from './server-post.ts'
 
 export const NOTICE_CORRECTION_TIMEOUT_MS = 10_000
 export type NoticeCorrectionOutcome =
@@ -47,6 +48,8 @@ export async function correctPostedNotice(post: PostedPersonaNotice, text: strin
   if (!active() || edited.outcome === 'cancelled') return
   deps.logOutcome('edit', edited)
   if (edited.outcome === 'success') return
-  const correction = await attempt(() => post.client.chat.postMessage({ channel: post.channelId, text: formatted }), deps)
+  const correction = await attempt(() => post.client.chat.postMessage({
+    channel: post.channelId, text: formatted, metadata: { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} },
+  }), deps)
   if (active() && correction.outcome !== 'cancelled') deps.logOutcome('correction', correction)
 }

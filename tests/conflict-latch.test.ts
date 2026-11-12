@@ -388,7 +388,7 @@ import {
 } from './test-helpers/pending-row-model.ts'
 import { posts } from './test-helpers/permission-relay-harness.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
-import { makeNotifierHarness } from './test-helpers/persona-notifier.ts'
+import { makeNotifierHarness, type NoticePost } from './test-helpers/persona-notifier.ts'
 import {
   callCounts,
   callCountsSince,
@@ -420,6 +420,12 @@ import {
   type RecoveryTimedCall
 } from './test-helpers/recovery-harness.ts'
 import { confirmValues, freshStartLinesIn, startLabelsIn, startLabelsOf, type StartValues } from './test-helpers/start-values.ts'
+import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
+
+/** The Server Post Marker every server post carries. */
+const SERVER_POST_METADATA = { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} }
+/** A captured notice post as the server posts it: channel, text and the Server Post Marker. */
+const noticePost = (channel: string, text: string): NoticePost => ({ channel, text, metadata: SERVER_POST_METADATA }) as NoticePost
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1828,7 +1834,7 @@ describe('the unusable-recorded-name hold: notice, the record and the episode', 
       latchUnusable(run.latch, persona.key, row)
       await Promise.all(sent)
       expect(notifier.posts(persona.key)).toEqual([
-        { channel: persona.permission_prompts!, text: formatPersonaNotice(persona, unusableNameNoticeText(persona.key, row.description)) },
+        noticePost(persona.permission_prompts!, formatPersonaNotice(persona, unusableNameNoticeText(persona.key, row.description))),
       ])
       expect(notifier.posts(other.key)).toEqual([])
       expect(notifier.clock.pendingCount()).toBe(0)
@@ -3490,7 +3496,7 @@ describe('notice for a launch start not recorded', () => {
       expect(run.latch.setLaunchStartNotRecorded(persona.key, PENDING)).toBe(CONFLICT_LATCH_SET_LATCHED)
       await Promise.all(sent)
       expect(notifier.posts(persona.key)).toEqual([
-        { channel: persona.permission_prompts!, text: formatPersonaNotice(persona, launchStartNotRecordedNoticeText(persona.key)) },
+        noticePost(persona.permission_prompts!, formatPersonaNotice(persona, launchStartNotRecordedNoticeText(persona.key))),
       ])
       expect(notifier.posts(other.key)).toEqual([])
       expect(notifier.clock.pendingCount()).toBe(0)

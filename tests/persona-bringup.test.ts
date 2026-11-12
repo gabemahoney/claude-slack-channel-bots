@@ -138,6 +138,12 @@ import {
   type StubSlack,
   type StubSlackOptions,
 } from './test-helpers/slack-stub.ts'
+import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
+
+/** The Server Post Marker every server post carries. */
+const SERVER_POST_METADATA = { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} }
+/** A captured notice post as the server posts it: channel, text and the Server Post Marker. */
+const noticePost = (channel: string, text: string) => ({ channel, text, metadata: SERVER_POST_METADATA })
 
 // ---------------------------------------------------------------------------
 // Fixture: personas A and B, each with its own directory and credentials file
@@ -532,7 +538,7 @@ describe('held notices flush per persona when it is up', () => {
       (key, status) => h.controller.onConnectionStatus(key, status),
     )
     const postsOf = (key: string) => h.conn.slack.persona(key).calls.postMessage
-    const noticeTo = (persona: Persona, text: string) => ({ channel: persona.permission_prompts!, text: formatPersonaNotice(persona, text) })
+    const noticeTo = (persona: Persona, text: string) => noticePost(persona.permission_prompts!, formatPersonaNotice(persona, text))
 
     // Raised before any bring-up: every notice is held.
     await notifier.notify(a.key, 'first notice for A')
@@ -903,7 +909,7 @@ describe('an unresolvable claude_config_dir holds the persona retrying with its 
     expect(h.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
     expect(h.retryLaunches).toEqual([a.key])
     expect(postsOf(a.key).slice(cp.aPosts)).toEqual([
-      { channel: a.permission_prompts!, text: formatPersonaNotice(a, 'a notice raised during the hold') },
+      noticePost(a.permission_prompts!, formatPersonaNotice(a, 'a notice raised during the hold')),
     ])
     expect(postsOf(b.key)).toHaveLength(cp.bPosts)
     // A later reconnect of A posts nothing again.

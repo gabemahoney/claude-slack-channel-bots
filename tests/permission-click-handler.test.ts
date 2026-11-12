@@ -186,6 +186,11 @@ const TOKEN_C = '33333333-3333-4333-8333-333333333333'
 /** A key naming no applied persona. */
 const UNKNOWN_KEY = 'no_such_persona'
 
+/** A `chat.update` leaves the message's Slack metadata (its Server Post Marker) alone: no `metadata` key at all, not even one set to undefined. */
+function expectNoMetadata(args: object): void {
+  expect(Object.hasOwn(args, 'metadata')).toBe(false)
+}
+
 const ALLOWED_TEXT = '*Permission* — Allowed'
 const DENIED_TEXT = '*Permission* — Denied by operator'
 const RELAY_FALLEN_BACK_TEXT =
@@ -553,6 +558,7 @@ describe('handlePermissionClick — happy path', () => {
     expect(updates[0]!.channel).toBe(CHANNEL_A)
     expect(updates[0]!.ts).toBe(messageTs)
     expect(updates[0]!.text).toBe(ALLOWED_TEXT)
+    expectNoMetadata(updates[0]!)
     // Nothing went through persona B's client.
     expect(slackCalls(h.stubB)).toBe(0)
     // The update was resolved through A's key.
@@ -581,6 +587,7 @@ describe('handlePermissionClick — happy path', () => {
     expect(updates[0]!.channel).toBe(CHANNEL_A)
     expect(updates[0]!.ts).toBe(messageTs)
     expect(updates[0]!.text).toBe(DENIED_TEXT)
+    expectNoMetadata(updates[0]!)
     expect(slackCalls(h.stubB)).toBe(0)
     expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(true)
   })

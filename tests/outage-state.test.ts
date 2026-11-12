@@ -168,6 +168,10 @@ import {
   enclosingScope,
   scanFile,
 } from './getclient-allowlist-audit.ts'
+import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
+
+/** The Server Post Marker every server post carries. */
+const SERVER_POST_METADATA = { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} }
 
 // ---------------------------------------------------------------------------
 // Harness helpers
@@ -810,9 +814,10 @@ describe('persona-keyed notices', () => {
       setOutageFlag(keyA, 'ad-unreachable', '/bin/ad')
       await Promise.resolve()
       expect(stubA.calls.postMessage).toHaveLength(1)
-      const onset = stubA.calls.postMessage[0] as { channel: string; text: string }
-      // Exactly channel + text: top-level, no thread or identity override.
-      expect(Object.keys(onset).sort()).toEqual(['channel', 'text'])
+      const onset = stubA.calls.postMessage[0] as { channel: string; text: string; metadata?: unknown }
+      // Exactly channel + text + the Server Post Marker: top-level, no thread or identity override.
+      expect(Object.keys(onset).sort()).toEqual(['channel', 'metadata', 'text'])
+      expect(onset.metadata).toEqual(SERVER_POST_METADATA)
       expect(onset.channel).toBe(destA)
       expect(onset.text).toContain(refA)
       expect(onset.text).not.toContain(refB)
@@ -823,8 +828,9 @@ describe('persona-keyed notices', () => {
       clearOutageFlag(keyA, 'ad-unreachable')
       await Promise.resolve()
       expect(stubA.calls.postMessage).toHaveLength(2)
-      const allClear = stubA.calls.postMessage[1] as { channel: string; text: string }
-      expect(Object.keys(allClear).sort()).toEqual(['channel', 'text'])
+      const allClear = stubA.calls.postMessage[1] as { channel: string; text: string; metadata?: unknown }
+      expect(Object.keys(allClear).sort()).toEqual(['channel', 'metadata', 'text'])
+      expect(allClear.metadata).toEqual(SERVER_POST_METADATA)
       expect(allClear.channel).toBe(destA)
       expect(allClear.text).toContain(refA)
       expect(allClear.text).not.toContain(refB)
@@ -875,9 +881,10 @@ describe('persona-keyed notices', () => {
       expect(stubA.web.callLog.map((c) => c.method)).toEqual(['conversations.open', 'chat.postMessage'])
       expect(stubA.calls.conversationsOpen).toEqual([{ users: contact }])
       expect(stubA.calls.postMessage).toHaveLength(1)
-      const onset = stubA.calls.postMessage[0] as { channel: string; text: string }
-      // Exactly channel + text, to the opened D… conversation (never the contact's user ID).
-      expect(Object.keys(onset).sort()).toEqual(['channel', 'text'])
+      const onset = stubA.calls.postMessage[0] as { channel: string; text: string; metadata?: unknown }
+      // Exactly channel + text + the Server Post Marker, to the opened D… conversation (never the contact's user ID).
+      expect(Object.keys(onset).sort()).toEqual(['channel', 'metadata', 'text'])
+      expect(onset.metadata).toEqual(SERVER_POST_METADATA)
       expect(onset.channel).toBe(dmId)
       // The same text a channel destination gets: the notifier's persona reference + the raised body.
       expect(onset.text).toBe(formatPersonaNotice(a, bodies[0]!))
@@ -889,8 +896,9 @@ describe('persona-keyed notices', () => {
       // The cached DM is reused: no second open.
       expect(stubA.web.callLog.map((c) => c.method)).toEqual(['conversations.open', 'chat.postMessage', 'chat.postMessage'])
       expect(stubA.calls.postMessage).toHaveLength(2)
-      const allClear = stubA.calls.postMessage[1] as { channel: string; text: string }
-      expect(Object.keys(allClear).sort()).toEqual(['channel', 'text'])
+      const allClear = stubA.calls.postMessage[1] as { channel: string; text: string; metadata?: unknown }
+      expect(Object.keys(allClear).sort()).toEqual(['channel', 'metadata', 'text'])
+      expect(allClear.metadata).toEqual(SERVER_POST_METADATA)
       expect(allClear.channel).toBe(dmId)
       expect(allClear.text).toBe(formatPersonaNotice(a, bodies[1]!))
       expect(allClear.text).toContain(refA)
