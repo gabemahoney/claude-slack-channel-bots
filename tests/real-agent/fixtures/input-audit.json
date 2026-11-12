@@ -203,7 +203,7 @@
   "inherited_prompts": [
     {
       "source": "Packed src/tag-description.ts TAG_DESCRIPTION",
-      "review": "Unchanged provenance/syntax instructions. The phrase \"prompt injected on the host\" describes the real /interject/scheduled-prompt source and is necessary meaning, not incidental fixture bait. Do not reword production instructions."
+      "review": "Provenance/syntax instructions, now also describing the Reaction Notice tag (via=\"reaction\", reaction and emoji, empty BODY, no reply needed); the added text was reviewed and holds no incidental classifier bait. The phrase \"prompt injected on the host\" describes the real /interject/scheduled-prompt source and is necessary meaning, not incidental fixture bait. Do not reword production instructions."
     },
     {
       "source": "Packed src/registry.ts MCP_INSTRUCTIONS and reply tool descriptions; stop-hooks/slack-reply-guard.sh reminder",
