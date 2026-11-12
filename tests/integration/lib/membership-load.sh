@@ -206,7 +206,7 @@ pending_results() {
 
 write_states() {
     read_jsonl "$1" shared_persona_facts "${Q}"
-    shared_persona_facts "${P}" >> "$1" || fail 'write-state reader failed'
+    shared_persona_facts "${P}" | cat >> "$1" || fail 'write-state reader failed'
     printf '\n' >> "$1"
 }
 applied_events() {
@@ -309,11 +309,12 @@ membership_settled_twice() {
 }
 
 late_state() {
-    read_jsonl "$1" shared_persona_facts "${P}"
-    shared_attempt_order "${P}" >> "$1" || fail 'late-state order reader failed'
-    printf '\n' >> "$1"
-    shared_thread_joins "${P}" >> "$1" || fail 'late-state join reader failed'
-    printf '\n' >> "$1"
+    # Bun.write(stdout) must not receive an append-open file. Keep each
+    # reader separate; read_jsonl also omits a separator for an empty reader.
+    read_jsonl "$1.facts" shared_persona_facts "${P}"
+    read_jsonl "$1.order" shared_attempt_order "${P}"
+    read_jsonl "$1.joins" shared_thread_joins "${P}"
+    cat "$1.facts" "$1.order" "$1.joins" > "$1" || fail 'late-state concatenation failed'
 }
 
 # Reopen observation, printed only when the case fails between the reopen stop

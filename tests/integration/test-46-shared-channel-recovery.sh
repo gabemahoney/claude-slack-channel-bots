@@ -159,7 +159,7 @@ queued_total() {
 accepted() {
     local who="$1" channel="$2" ts="$3" via="$4" text="$5" root="${6:--}"
     wait_until "${EVENT_WAIT_S}" 'expected one acceptance' queued "${who}" "${channel}" "${ts}" "${via}"
-    shared_delivery_expectation "${KEY[${who}]}" "${NAME[${who}]}" slack "${channel}" "${ts}" "${HUMAN}" "${via}" >> "${EXPECTED}"
+    shared_delivery_expectation "${KEY[${who}]}" "${NAME[${who}]}" slack "${channel}" "${ts}" "${HUMAN}" "${via}" | cat >> "${EXPECTED}" || fail 'expected Slack delivery reader failed'
     INPUTS["${who}|${channel}|${ts}|${via}"]="$(jq -cn --arg text "${text}" --arg root "${root}" '{text:$text,root:$root}')"
 }
 injected_ready() {
@@ -173,7 +173,7 @@ injected() {
         '[.[]|select(.source==$source and .sender==$sender and .text==$text and (has("reminder_for")|not))]|if length==1 then .[0] else error("ambiguous original") end')"
     ts="$(jq -er .ts <<< "${original}")"
     jq -e 'has("hold")|not' <<< "${original}" > /dev/null || fail 'injected work acquired a Post Hold'
-    shared_delivery_expectation "${KEY[${who}]}" "${NAME[${who}]}" "${source}" "${sender}" "${ts}" "${sender}" - >> "${EXPECTED}"
+    shared_delivery_expectation "${KEY[${who}]}" "${NAME[${who}]}" "${source}" "${sender}" "${ts}" "${sender}" - | cat >> "${EXPECTED}" || fail 'expected injected delivery reader failed'
     INJECTED["${who}|${source}|${sender}|${ts}"]="${text}"
     snapshot "${who}"
 }

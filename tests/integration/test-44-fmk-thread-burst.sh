@@ -308,7 +308,7 @@ case "${CASE}" in
         profile_stop
         profile_summary
         # Observe zero as well as positive ACKs; check judges the exact set.
-        jq -er '.envelope_id // error("burst push has no envelope")' "${RESULTS}/burst.jsonl" > "${RESULTS}/envelopes"
+        jq -ser 'if all(.[]; (.envelope_id | type)=="string") then .[].envelope_id else error("burst push has no string envelope_id") end' "${RESULTS}/burst.jsonl" > "${RESULTS}/envelopes" || fail 'burst push has no string envelope_id'
         _scenario_complete_jsonl "${SCENARIO_SLACK_RECORD}" > "${RESULTS}/final-stub.jsonl"
         bun "${SR8}" envelope-times "${RESULTS}/envelopes" "${RESULTS}/final-stub.jsonl" > "${RESULTS}/times.jsonl"
         # An observation wait, not an allowance: check uses each hold's actual
@@ -382,7 +382,7 @@ case "${CASE}" in
         shared_wait_own_post_state "${key}" "${OPERATION[${key}]}" "${HOLD_CHANNEL}" "${STAMP[${key}]}" unresolved \
             > "${EVIDENCE}/after.unresolved.json"
         window_end="$(mono_ms)"
-        jq -er '.envelope_id // error("burst push has no envelope")' "${RESULTS}/burst.jsonl" > "${RESULTS}/envelopes"
+        jq -ser 'if all(.[]; (.envelope_id | type)=="string") then .[].envelope_id else error("burst push has no string envelope_id") end' "${RESULTS}/burst.jsonl" > "${RESULTS}/envelopes" || fail 'burst push has no string envelope_id'
         _scenario_complete_jsonl "${SCENARIO_SLACK_RECORD}" > "${RESULTS}/final-stub.jsonl"
         bun "${SR8}" envelope-times "${RESULTS}/envelopes" "${RESULTS}/final-stub.jsonl" > "${RESULTS}/times.jsonl"
         : > "${EVIDENCE}/probes.tsv"
@@ -416,7 +416,7 @@ case "${CASE}" in
             cp "${CONFIG}" "${EVIDENCE}/${phase}.input"
             : > "${EVIDENCE}/${phase}.facts.jsonl"
             for key in "${KEYS[@]}"; do
-                shared_persona_facts "${key}" >> "${EVIDENCE}/${phase}.facts.jsonl" || fail 'cannot read shared-list facts'
+                shared_persona_facts "${key}" | cat >> "${EVIDENCE}/${phase}.facts.jsonl" || fail 'cannot read shared-list facts'
                 printf '\n' >> "${EVIDENCE}/${phase}.facts.jsonl"
             done
         }

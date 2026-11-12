@@ -145,6 +145,70 @@ const queueControls = [
 const restartAssertion = block(test29, 'bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedAuthorityPreserved', '\npreserved_four_values')
 
 describe('retained timing regressions', () => {
+  test.each([0, 1].flatMap(index => ['valid', 'missing-first', 'missing-middle', 'missing-last', 'non-string'].map(variant => [index, variant] as const)))
+  ('test-44 envelope lookup %i validates every row: %s', (index, variant) => {
+    const lookups = source('test-44-fmk-thread-burst.sh').split('\n').filter(line => line.includes('> "${RESULTS}/envelopes"'))
+    expect(lookups).toHaveLength(2)
+    const rows: Record<string, unknown>[] = ['first', 'middle', 'last'].map(envelope_id => ({ envelope_id }))
+    if (variant.startsWith('missing-')) delete rows[['first', 'middle', 'last'].indexOf(variant.slice('missing-'.length))].envelope_id
+    if (variant === 'non-string') rows[1].envelope_id = 123
+    const result = shell([
+      'RESULTS="$HOME"', 'fail() { printf "FAIL %s\\n" "$*"; exit 1; }', lookups[index], 'cat "$RESULTS/envelopes"',
+    ].join('\n'), { 'burst.jsonl': jsonl(rows) })
+    expect(result.status).toBe(variant === 'valid' ? 0 : 1)
+    if (variant === 'valid') expect(result.stdout).toBe('first\nmiddle\nlast\n')
+    else expect(result.stdout).toContain('FAIL burst push has no string envelope_id\n')
+  })
+  test.each([
+    ['lib/membership-load.sh', 'shared_persona_facts "${P}" >>'],
+    ['test-44-fmk-thread-burst.sh', 'shared_persona_facts "${key}" >>'],
+    ['test-46-shared-channel-recovery.sh', 'shared_delivery_expectation "${KEY[${who}]}" "${NAME[${who}]}" slack'],
+    ['test-46-shared-channel-recovery.sh', 'shared_delivery_expectation "${KEY[${who}]}" "${NAME[${who}]}" "${source}"'],
+    ['test-47-shared-channel-upgrade.sh', 'shared_assert_content "${key}" "${LOG}"'],
+  ].flatMap(([file, prefix]) => ['bytes', 'silent-failure'].map(mode => [file, prefix, mode])))
+  ('printer append in %s (%s): %s', (file, prefix, mode) => {
+    // Execute each swept command verbatim; only its reader is synthetic.
+    const text = source(file).replaceAll('\\\n', '')
+    const command = text.split('\n').find(line => line.includes(prefix.replace(' >>', '')) && line.includes('>>'))
+    expect(command).toBeDefined()
+    const result = shell([
+      declaration(scenario, 'fail'), 'TEST_NAME=reader-control',
+      'P=alpha; key=alpha; who=p; source=cron; sender=sender; ts=1; channel=C; HUMAN=U; via=-; LOG=-; text=-; parts=-',
+      'declare -A KEY=([p]=alpha) NAME=([p]=alpha) SNAP=([alpha]=snapshot)',
+      'EXPECTED="$HOME/out"; EVIDENCE="$HOME"; phase=out; set -- "$HOME/out"',
+      'shared_persona_facts() { bun "$HOME/printer.ts"; }',
+      'shared_delivery_expectation() { bun "$HOME/printer.ts"; }',
+      'shared_assert_content() { bun "$HOME/printer.ts"; }',
+      // Point every real command at the same seeded output.
+      'printf "prior\\n" > "$HOME/out"',
+      command!.replaceAll('${EVIDENCE}/${phase}.facts.jsonl', '${HOME}/out').replaceAll('${EVIDENCE}/${key}-old-content.jsonl', '${HOME}/out'),
+      'cat "$HOME/out"',
+    ].join('\n'), { 'printer.ts': mode === 'silent-failure' ? 'process.exit(1)\n' : 'await Bun.write(Bun.stdout, "next".repeat(5000) + "\\n")\n' })
+    if (mode === 'silent-failure') {
+      expect(result.status).toBe(1)
+      expect(result.stderr).toMatch(/^FAIL: reader-control: .+\n$/)
+      expect(result.stdout).toBe('')
+    } else {
+      expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: '' })
+      expect(result.stdout).toBe('prior\n' + 'next'.repeat(5000) + '\n')
+    }
+  })
+  test.each([
+    ['late_state', 'facts-p'], ['late_state', 'order'], ['late_state', 'joins'], ['write_states', 'facts-q'],
+  ])('%s emits FAIL when its %s reader exits silently', (name, reader) => {
+    const load = source('lib/membership-load.sh')
+    const result = shell([
+      declaration(scenario, 'fail'), 'TEST_NAME=reader-control',
+      declaration(load, 'read_jsonl'), declaration(load, name), 'P=p; Q=q',
+      'shared_persona_facts() { bun "$HOME/reader.ts" "facts-$1"; }',
+      'shared_attempt_order() { bun "$HOME/reader.ts" order; }',
+      'shared_thread_joins() { bun "$HOME/reader.ts" joins; }',
+      `${name} "$HOME/state"`, 'echo continued',
+    ].join('\n'), { 'reader.ts': `if (process.argv[2] === ${JSON.stringify(reader)}) process.exit(1)\nprocess.stdout.write('{"saved":true}')\n` })
+    expect(result.status).toBe(1)
+    expect(result.stderr).toBe('FAIL: reader-control: evidence reader failed\n')
+    expect(result.stdout).toBe('')
+  })
   test('test-29 compaction preserves both consumer drains and diagnostics across restart', async () => {
     const fixture = await test29CompactionFixture()
     const result = shell([
@@ -1045,6 +1109,31 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       run() { return membershipLateVerdict(key, 'late', this.stub, this.mark, diag(this.log), this.before, this.after) } }
   }
   test('abandoned late answer after replacement completion leaves state equal', () => output([late().run()], 0))
+  test.each(['empty-order', 'empty-joins', 'large-readers'] as const)('late_state preserves reader bytes: %s', variant => {
+    const facts = JSON.stringify({ persona: key, saved: 'facts' })
+    const large = Array.from({ length: 1000 }, (_, n) => JSON.stringify({ ordinal: n, saved: 'x'.repeat(200) })).join('\n')
+    const order = variant === 'empty-order' ? '' : large
+    const joins = variant === 'empty-joins' ? '' : large
+    const expected = [facts, order, joins].filter(Boolean).map(value => value + '\n').join('')
+    const result = shell([
+      declaration(source('lib/membership-load.sh'), 'read_jsonl'),
+      declaration(source('lib/membership-load.sh'), 'late_state'),
+      'P=alpha',
+      'shared_persona_facts() { bun "$HOME/printer.ts" "$HOME/facts"; }',
+      'shared_attempt_order() { bun "$HOME/printer.ts" "$HOME/order"; }',
+      'shared_thread_joins() { bun "$HOME/printer.ts" "$HOME/joins"; }',
+      'late_state "$HOME/late.state"', 'cat "$HOME/late.state"',
+    ].join('\n'), {
+      // Match the real printer's stdout call, including its empty-value path.
+      'printer.ts': 'await Bun.write(Bun.stdout, await Bun.file(process.argv[2]).text())\n',
+      facts, order, joins,
+    })
+    expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: '' })
+    expect(result.stdout).toBe(expected)
+    const f = late(); f.before = result.stdout; f.after = result.stdout
+    // This exercises stateRead through its unchanged public verdict caller.
+    expect(f.run().verdict).toBe('pass')
+  })
   test.each(['fault', 'settlement', 'api', 'complete', 'state', 'too-early', 'abort', 'changed', 'incomplete-after'] as const)
   ('late answer rejects %s', defect => {
     const f = late()

@@ -531,7 +531,7 @@ old_queue_delivered() {
         parts="$(shared_expected_parts "${text}" "${ts}" "${user}" "$(scenario_stub_name user "${user}")" \
             "${channel}" "$(scenario_stub_name channel "${channel}")" "${via}" - -)"
         shared_assert_content "${key}" "${LOG}" "${SNAP[${key}]}" "${channel}" "${ts}" "${text}" "${parts}" - \
-            >> "${EVIDENCE}/${key}-old-content.jsonl"
+            | cat >> "${EVIDENCE}/${key}-old-content.jsonl" || fail 'old queue content reader failed'
         wait_until "${RECORD_WAIT_S}" "queued emoji of item ${seq} not removed" has_record_after 0 api \
             "label=${LABEL[${key}]}" method=reactions.remove "channel=${channel}" "timestamp=${ts}" "name=${emoji}"
     done
