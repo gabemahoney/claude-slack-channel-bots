@@ -553,6 +553,20 @@ evidence may no longer qualify after restart.
 - **Cause:** The state directory or its disk cannot be written.
 - **Fix:** Check the named file, state directory permissions, mount and free space. Launch retries follow the existing backoff; other personas continue.
 
+### `reaction-withdrawn`
+
+- **Line:** `[slack] reaction-withdrawn: persona="<name>" (key=<key>) chat_id="<chat>" message_ts="<ts>" reason=<reason>[ failed_condition=<condition>]`
+- **Meaning:** A reaction to a message in `<chat>` was saved for this persona but is never typed to its bot. The queue passes it, so the messages behind it go on. `message_ts` is the reacted message's timestamp. When several reasons apply, the line names only the first of `server-post`, `conversation-unknown`, `group-dm` and `fungible-refused`. The decision is final, after a restart too, and it is logged once.
+- **Cause:** `server-post`: the reacted message is a notice or permission prompt CSCB posted as the persona. `conversation-unknown`: the channel was in fungible mode and Slack's conversation lookup failed or timed out. `group-dm`: the conversation is a group DM, in either mode. `fungible-refused`: the channel was in fungible mode and `failed_condition` names the check that failed: `not-a-channel` (not a public or private channel), `externally-shared` (shared with another organization), or Slack's `not_in_channel` or `channel_not_found` when CSCB read the message. The mode is the one in effect when the reaction was saved, not the mode now.
+- **Fix:** For `server-post` and `group-dm`, nothing: those reactions are never delivered. For `not_in_channel` or `channel_not_found`, invite the persona's app to the channel. For `conversation-unknown`, check the persona's Slack connection and that its app has the manifest's `channels:read`, `groups:read` and `mpim:read` scopes; re-install the app if it lacks one. Nothing resends a withdrawn reaction; a later reaction is decided afresh.
+
+### `reaction-message-unknown`
+
+- **Line:** `[slack] reaction-message-unknown: persona="<name>" (key=<key>) chat_id="<chat>" message_ts="<ts>"`
+- **Meaning:** CSCB could not read the reacted message, so it took it for one of the bot's own replies and prepared the reaction notice without `thread_ts`: the bot is not told which thread the message is in. The notice then waits its turn like any message, so this line does not mean the bot has it; use [`message-delivered`](#message-delivered) to confirm that. Logged once, for this reaction only.
+- **Cause:** Slack's message read failed, timed out or returned no message with that timestamp, for example after the message was deleted. In declarative mode, Slack's `not_in_channel` or `channel_not_found` answer has the same effect. When a reason in `reaction-withdrawn` applies, that line is logged instead and nothing is delivered.
+- **Fix:** No action is needed for an occasional line. If it repeats, check the persona's Slack connection and that its app has the manifest's `channels:history`, `groups:history` and `im:history` scopes, and is in the channel.
+
 ### `persona-start`
 
 - **Line:** `[slack] persona-start: personas[<i>] "<name>" (key=<key>): bring-up starting`

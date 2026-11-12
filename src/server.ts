@@ -2720,6 +2720,8 @@ export async function main(): Promise<void> {
     wake: key => deliveryQueueWake.wake(key),
     onPending: key => deliveryEngines?.wake(key),
     tagMaxBytes: tagMaxBytesFor(process.platform),
+    log: (line) => console.error(line),
+    persona: getAppliedPersona,
   })
 
   // the retired-key record (retired-keys.json in the
