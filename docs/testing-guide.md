@@ -593,9 +593,12 @@ intentional drops remain acknowledged and unstored.
 
 Require the case-specific evidence too: first/later membership deadlines and
 incomplete scans, retry spacing and `Retry-After`, idle repair within its
-published bound, unchanged state after an abandoned first- or later-page late
-answer, zero ACKs for an undurable live membership event with a failed write
-probe, fired hung and late `users.info`/`conversations.info` lookups, and
+published bound, unchanged membership state after an abandoned first- or
+later-page late answer (excluding only `source: own-post` joins for threads
+absent from the before read taken after the complete mark; facts, attempt order
+and all retained joins compare byte for byte in order), zero ACKs for an
+undurable live membership event with a failed write probe, fired hung and late
+`users.info`/`conversations.info` lookups, and
 overlapping durable ordered writes. Fresh senders and channels must reach the lookup rather than
 a lifetime cache; missing fault or overlap evidence cannot pass. Membership
 request deadlines use stub arrival and server diagnostic timestamps on the

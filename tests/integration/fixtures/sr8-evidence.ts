@@ -316,7 +316,9 @@
  *     record, both seq > complete-seq-mark. The same stub's seq is monotonic record
  *     order. Line: membership-late(fired,late_after_complete,unchanged; unchanged).
  *     Abort always fails. Missing evidence or a settlement before completion is
- *     missing; different state reads fail. Never accept an aborted delay as late.
+ *     missing; different state reads fail except own-post joins first present in
+ *     after-state. Every join already in before-state remains byte-exact and ordered.
+ *     Never accept an aborted delay as late.
  *
  *   zero-ack C <key> <envelope-id> <times> <start-ms> <end-ms> <probe-exit> <log-slice>
  *     Attempt the actual write probe while permissions deny writes. Capture start
@@ -1056,6 +1058,27 @@ export function membershipRepairVerdict(clearAt: number, diagnostics: ScanDiagno
     remaining_ms: remaining, retry_ms: retry, scan_ms: finite(scan) ? scan : 'missing' }, finite(bound) ? bound : 'missing',
     missing ? 'missing' : scan > attemptMs || remaining > attemptMs || elapsed > bound ? 'fail' : 'pass')
 }
+/** The before read follows the complete mark. Only own-post joins for threads
+ * absent from that read may be removed from after; existing joins (including
+ * changed/removed own posts), facts and attempt order retain exact reader bytes.
+ * Keep stateRead and the verdict's missing-evidence rules independent of this
+ * comparison. Non-JSONL inputs still compare exactly, as before. */
+function lateMembershipStateUnchanged(before: string | undefined, after: string | undefined): boolean {
+  if (before === undefined || after === undefined) return false
+  if (before === after) return true
+  try {
+    // Retain line endings: parsing identifies exclusions, never normalises state.
+    const lines = (text: string) => text.split(/(?<=\n)/).filter(line => line !== '')
+    const joinId = (row: any) => row.kind === 'join' && typeof row.channel === 'string'
+      && typeof row.root === 'string' && object(row.stamp)
+      ? JSON.stringify([row.channel, row.root, row.stamp.incarnation, row.stamp.threadHybridSince]) : undefined
+    const prior = new Set(lines(before).map(line => joinId(JSON.parse(line))).filter(id => id !== undefined))
+    return lines(after).filter(line => {
+      const row = JSON.parse(line), id = joinId(row)
+      return row.source !== 'own-post' || id === undefined || prior.has(id)
+    }).join('') === before
+  } catch { return false }
+}
 export function membershipLateVerdict(key: string, request: string, stub: any[] | undefined, completedMark: number,
   diagnostics: ScanDiagnostic[] | undefined, before: string | undefined, after: string | undefined): Result {
   const faults = stub?.filter(r => r.event === 'fault' && r.control === 'faults' && r.method === 'users.conversations'
@@ -1068,8 +1091,9 @@ export function membershipLateVerdict(key: string, request: string, stub: any[] 
     && settled[0].seq > completedMark && answered.length === 1 && answered[0].seq > completedMark
   const missing = !stub || !integer(completedMark) || faults.length !== 1 || !nonnegative(faults[0]?.arrival_mono_ms)
     || !(faults[0]?.seq <= completedMark) || !complete || !late || !stateRead(before) || !stateRead(after)
-  return result('membership-late', settled.length, { fired: faults.length, late_after_complete: late ? 'yes' : 'no', unchanged: before !== undefined && before === after ? 'yes' : 'no' }, 'unchanged',
-    changedCompleteness || settled.some(s => s.resolution === 'abort') ? 'fail' : missing ? 'missing' : before === after ? 'pass' : 'fail')
+  const unchanged = lateMembershipStateUnchanged(before, after)
+  return result('membership-late', settled.length, { fired: faults.length, late_after_complete: late ? 'yes' : 'no', unchanged: unchanged ? 'yes' : 'no' }, 'unchanged',
+    changedCompleteness || settled.some(s => s.resolution === 'abort') ? 'fail' : missing ? 'missing' : unchanged ? 'pass' : 'fail')
 }
 
 export function zeroAckVerdict(id: string, times: Times[] | undefined, start: number, end: number, probeExit: number,

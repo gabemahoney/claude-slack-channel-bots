@@ -35,7 +35,7 @@ import { MEMBERSHIP_REQUEST_TIMEOUT_MS, MEMBERSHIP_ATTEMPT_TIMEOUT_MS, MEMBERSHI
 import { startSlackStub, type StubAnswers } from './integration/fixtures/slack-stub-server.ts'
 import { MEMBERSHIP_INVENTORY_INCOMPLETE, MEMBERSHIP_INVENTORY_COMPLETE, membershipScanDiagnostic } from '../src/channel-membership-scan.ts'
 import { MEMBERSHIP_STORAGE_FAILED, membershipDiagnostic } from '../src/channel-membership.ts'
-import { burstSpec, sr8Personas, sr8Combinations, SR8_BURST_JOINS, SR8_BURST_REPLIES, SR8_BURST_DROPPED, readThreads } from './test-helpers/thread-memory.ts'
+import { burstSpec, sr8Personas, sr8Combinations, SR8_BURST_JOINS, SR8_BURST_REPLIES, SR8_BURST_DROPPED, readThreads, threadJoin, joinRecord } from './test-helpers/thread-memory.ts'
 import { makeQueue, slackInput, heldSlackInput, postHold, queuePath, readQueue } from './test-helpers/delivery-queue.ts'
 import { makeRoutingHarness, observedMembership, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness } from './test-helpers/persona-routing-harness.ts'
 
@@ -1109,6 +1109,46 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       run() { return membershipLateVerdict(key, 'late', this.stub, this.mark, diag(this.log), this.before, this.after) } }
   }
   test('abandoned late answer after replacement completion leaves state equal', () => output([late().run()], 0))
+  function lateMembershipState() {
+    const f = late()
+    const facts = { key, incarnation: 'life', assignments: {}, historicalMembership: {} }
+    const order = { key, channel, startedOrder: 1, resolvedOrder: 2 }
+    const joins = [joinRecord(threadJoin({ channel })),
+      joinRecord(threadJoin({ channel, root: '1700000000.000002', source: 'own-post' }), 3)]
+    f.before = f.after = jsonl([facts, order, ...joins])
+    return { f, facts, order, joins }
+  }
+  test.each(['join-added', 'join-removed', 'join-changed', 'broadcast-added', 'facts', 'attempt-order',
+    'own-post-changed', 'own-post-removed', 'own-post-duplicated', 'join-reordered', 'bytes'] as const)
+  ('late membership state still rejects %s', defect => {
+    const { f, facts, order, joins } = lateMembershipState()
+    if (defect === 'join-added' || defect === 'broadcast-added') joins.push(joinRecord(threadJoin({
+      channel, root: '1700000000.000003', source: defect === 'join-added' ? 'mention' : 'broadcast' }), 4))
+    if (defect === 'join-removed') joins.shift()
+    if (defect === 'join-changed') joins[0].source = 'own-post'
+    if (defect === 'facts') facts.historicalMembership = { [channel]: { member: false } }
+    if (defect === 'attempt-order') order.resolvedOrder++
+    if (defect === 'own-post-changed') joins[1].at++
+    if (defect === 'own-post-removed') joins.pop()
+    if (defect === 'own-post-duplicated') joins.push({ ...joins[1] })
+    if (defect === 'join-reordered') joins.reverse()
+    f.after = jsonl([facts, order, ...joins])
+    if (defect === 'bytes') f.after = f.after.replace('\n', ' \n')
+    // Reject the change alone and when new own posts accompany it.
+    const changed = f.after
+    for (const extra of ['', jsonl([joinRecord(threadJoin({ channel, root: '1700000000.000004', source: 'own-post' }), 5)])]) {
+      f.after = changed + extra
+      const r = f.run()
+      expect(r.stats.unchanged).toBe('no'); expect(r.verdict).toBe('fail'); output([r], 1)
+    }
+  })
+  test('late membership state excludes only own-post joins first observed after the complete-mark read', () => {
+    const { f } = lateMembershipState()
+    f.after += jsonl([3, 4].map((n, i) => joinRecord(threadJoin({
+      channel, root: `1700000000.00000${n}`, source: 'own-post' }), i + 4)))
+    const r = f.run()
+    expect(r.stats.unchanged).toBe('yes'); expect(r.verdict).toBe('pass'); output([r], 0)
+  })
   test.each(['empty-order', 'empty-joins', 'large-readers'] as const)('late_state preserves reader bytes: %s', variant => {
     const facts = JSON.stringify({ persona: key, saved: 'facts' })
     const large = Array.from({ length: 1000 }, (_, n) => JSON.stringify({ ordinal: n, saved: 'x'.repeat(200) })).join('\n')
