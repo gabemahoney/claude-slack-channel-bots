@@ -66,6 +66,36 @@ test.each([16, 64])('wakes over a growing %i-item queue clone at most the newly 
   assertNoLeak([h.events, h.calls, h.errors, h.records()])
 })
 
+test.each([64, 512])('receipt observations do not revisit the %i-item queue behind a pending head', async count => {
+  const h = await harness()
+  h.p().row.state = 'pending'
+  for (let n = 0; n < count; n++) await h.accept(`queued ${n}`)
+  let visits = 0
+  const items = h.queue.items.bind(h.queue)
+  const reads = spyOn(h.queue, 'items').mockImplementation(key => new Proxy(items(key), {
+    get(target, property, receiver) {
+      if (typeof property === 'string' && /^\d+$/.test(property)) visits++
+      return Reflect.get(target, property, receiver)
+    },
+  }))
+  try {
+    await h.tick() // Initial indexes may read the existing queue once.
+    visits = 0
+    reads.mockClear()
+    for (let n = 0; n < 4; n++) {
+      await h.accept(`later ${n}`)
+      await h.advance(DELIVERY_ROW_POLL_MS)
+    }
+    expect(h.calls.filter(c => c.verb === 'get').length).toBeGreaterThanOrEqual(4)
+    expect(h.engine.snapshot('alpha')?.r.row).toBe('pending')
+    expect(h.queue.openCount('alpha')).toBe(count + 4)
+    expect(h.keyCalls()).toEqual([])
+    expect(h.errors).toEqual([])
+    expect(visits).toBe(0)
+    expect(reads).not.toHaveBeenCalled()
+  } finally { reads.mockRestore() }
+})
+
 test.each([16, 64])('engine summaries visit only changed items over %i growing acceptances and unchanged wakes', async count => {
   const h = await harness()
   h.p().up = false
@@ -182,7 +212,7 @@ describe('queue summaries across executor retirement', () => {
         expect(h.engine.running('alpha')).toBe(false)
         expect(h.engine.status('alpha')).toBeUndefined()
         expect(h.clock.pendingCount()).toBe(0)
-        counter.take() // Receipt observation deliberately reads the full queue.
+        counter.take() // Each fresh executor initializes its receipt index.
       }
       expect(h.queue.items('alpha')).toHaveLength(17)
       expect(h.events.flatMap(e => e.type === 'item-delivered' ? [e.seq] : [])).toEqual(Array.from({ length: 17 }, (_, n) => n + 1))

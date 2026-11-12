@@ -3,7 +3,7 @@
 import type { Client, GetResult, SendKeysParams } from 'agent-director'
 import type { DeliveryQueue, QueueItem, QueueRecord, SentRecord } from './delivery-queue.ts'
 import { createQueueItemReader, isOpenItem, itemOpenedAt } from './delivery-queue.ts'
-import { createDeliveryReceiptReader, effectiveSends, type DeliveryReceiptReader, type ReceiptObservation } from './delivery-receipt.ts'
+import { createQueueDeliveryReceiptReader, effectiveSends, type DeliveryReceiptReader, type ReceiptObservation } from './delivery-receipt.ts'
 import { type DeliveryLifecycle, type DeliveryClock, systemDeliveryClock, NOT_NOW_RETRY_MS } from './delivery-lifecycle.ts'
 import { decideEngine, decideGate, firstSendGate, recoveryEnterGate, latestDeliveryAttempt, retypeGate, selectDeliveryTarget, NO_DELIVERY_PAIR, createDeliveryReading, createDeliveryPolicyState, type DeliveryPair, type DeliveryPolicyEngine, type DeliveryPolicyKnowledge, type DeliveryReading, type DeliveryTimer } from './delivery-policy.ts'
 import { classifyAdError, isAdErrorInstance, classifyWithInvalidFlagsRecheck, type AdCall } from './ad-error-class.ts'
@@ -203,7 +203,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     let queue = summaries.get(key)
     if (!queue) { queue = createQueueSummary(deps.queue, key); summaries.set(key, queue) }
     queue.receiptOffsets(undefined, 0, 0)
-    const s: State = { queue, noticesInitialized: false, e: createDeliveryPolicyState(), reading: createDeliveryReading(), reader: deps.receiptReader?.() ?? createDeliveryReceiptReader(), deadlines: {}, budget: budget(key), rowAt: -Infinity, notNowStep: 0, retryStep: 0, appendRetryStep: 0, stopped: false, relaunch: true, receiptWorking: false, pollAfter: 0, dialogHold: false, dialogMaybeOpen: false }
+    const s: State = { queue, noticesInitialized: false, e: createDeliveryPolicyState(), reading: createDeliveryReading(), reader: deps.receiptReader?.() ?? createQueueDeliveryReceiptReader(deps.queue, key), deadlines: {}, budget: budget(key), rowAt: -Infinity, notNowStep: 0, retryStep: 0, appendRetryStep: 0, stopped: false, relaunch: true, receiptWorking: false, pollAfter: 0, dialogHold: false, dialogMaybeOpen: false }
     states.set(key, s); life.engineRunning(key, true); return s
   }
   function release(s: State): void { s.lease?.(); s.lease = undefined; s.e.request = 'none' }
@@ -339,7 +339,8 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     const persona = deps.persona(key)
     const agentOf = (row: GetResult): DeliveryAgent => row.agent === 'codex' ? 'codex' : persona?.agent ?? 'claude'
     let row = s.row
-    let receipt = s.reader.read(agentOf(row), row, head, part, deps.queue.items(key))
+    const readReceipt = () => s.reader.read(agentOf(row), row, head, part, deps.receiptReader ? deps.queue.items(key) : undefined)
+    let receipt = readReceipt()
     // Claude's SessionStart can precede its first transcript write. AD keeps
     // that reference empty until find-missing heals it; get alone cannot.
     // Keep receipts from recorded/prior paths usable without a sweep. Only
@@ -353,7 +354,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       if (stopped || s.stopped || !life.active(key) || !deps.isUp(key) || deps.isLatched(key) || deps.isHeld(key)) return false
       if (!await readRow(key, s, true) || !s.row) return false
       row = s.row
-      receipt = s.reader.read(agentOf(row), row, head, part, deps.queue.items(key))
+      receipt = readReceipt()
     }
     // Preserve an AD binding absent from an earlier durable attempt.
     // This is reference evidence, independent of whether a receipt matched.

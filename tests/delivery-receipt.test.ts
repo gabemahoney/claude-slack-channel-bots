@@ -5,7 +5,7 @@ import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { QueueItem, SentRecord } from '../src/delivery-queue.ts'
-import { createDeliveryReceiptReader, deliveryTranscriptPath, parseDeliveryTranscriptRecord, receiptTextMatches, type DeliveryAgent } from '../src/delivery-receipt.ts'
+import { createDeliveryReceiptReader, createQueueDeliveryReceiptReader, deliveryTranscriptPath, parseDeliveryTranscriptRecord, receiptTextMatches, type DeliveryAgent, type DeliveryTranscriptRow } from '../src/delivery-receipt.ts'
 import { buildWrapper, type TagMessage } from '../src/tag-wrapper.ts'
 import { deliveryFailureEvidence, readTranscripts } from './integration/fixtures/transcript-receipts.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken } from './test-helpers/credentials.ts'
@@ -238,6 +238,89 @@ describe('exact matching and agent schema', () => {
 })
 
 describe('receipt reader', () => {
+  // The snapshot reader retains the original whole-queue algorithm. Compare
+  // every observation, including all records, availability and current size.
+  function equivalentReaders(h: Awaited<ReturnType<typeof fixture>>, agent: DeliveryAgent) {
+    const incremental = createQueueDeliveryReceiptReader(h.queue, 'alpha')
+    return {
+      read(seq: number, row: DeliveryTranscriptRow = h.row) {
+        const items = h.queue.items('alpha'), item = items.find(i => i.accepted.seq === seq)!
+        const expected = h.reader.read(agent, row, item, 1, items)
+        const actual = incremental.read(agent, row, item, 1)
+        expect(actual).toEqual(expected)
+        return actual
+      },
+      forget() { h.reader.forget(); incremental.forget() },
+    }
+  }
+
+  test.each(['claude', 'codex'] as const)('%s incremental windows and credits match full reads across other items, compaction and forget', async agent => {
+    const h = await fixture(agent), prior = join(h.root, 'prior.jsonl')
+    const entry = agent === 'claude' ? promptEntry : codexPromptEntry
+    const before = { ...entry(h.text), uuid: 'before' }, first = { ...entry(h.text), uuid: 'first' }, second = { ...entry(h.text), uuid: 'second' }
+    const row = { ...h.row, prior_sessions: [{ jsonl_path: prior }] }, readers = equivalentReaders(h, agent)
+    writeTranscript(prior, [before])
+    expect(readers.read(1, row).receipt).toBeUndefined()
+    await h.accept(); await h.accept()
+    for (const seq of [1, 2, 3]) await h.queue.append('alpha', { v: 1, kind: 'sent', seq, part: 1, attempt: 1, send_kind: 'text', at: 1000, session_id: 'current', transcript_path: h.path, transcript_size: 0 })
+    await h.queue.append('alpha', { v: 1, kind: 'refused', seq: 1, attempt: 1, at: 1001 })
+    // Observing item 1 must freeze the windows of items 2 and 3 as well,
+    // even though their receipts have not appeared yet.
+    expect(readers.read(1, row).receipt).toBeUndefined()
+    appendTranscript(prior, [first])
+    expect(readers.read(2, row).receipt?.uuid).toBe(first.uuid)
+    expect(readers.read(3, row).receipt?.uuid).toBe(first.uuid)
+    await h.queue.append('alpha', { v: 1, kind: 'sent', seq: 1, part: 1, attempt: 2, send_kind: 'retype', at: 1002, session_id: 'current', transcript_path: h.path, transcript_size: 0 })
+    expect(readers.read(1, row).receipt).toBeUndefined()
+    appendTranscript(prior, [second])
+    expect(readers.read(1, row).receipt?.uuid).toBe(second.uuid)
+    for (const [seq, uuid] of [[1, second.uuid], [1, first.uuid], [2, first.uuid]] as const) {
+      await h.queue.append('alpha', { v: 1, kind: 'delivered', seq, part: 1, at: 2000, receipt: { path: prior, uuid } })
+      readers.read(3, row)
+    }
+    expect(readers.read(3, row).receipt).toBeUndefined()
+    // Replacing an item's snapshot must keep the other item's duplicate
+    // credit, and must neither refreeze a send nor duplicate its credit.
+    await h.queue.append('alpha', { v: 1, kind: 'noticed', seq: 1, at: 2001 })
+    expect(readers.read(3, row).receipt).toBeUndefined()
+    await h.queue.compact('alpha')
+    expect(h.queue.items('alpha').map(i => i.accepted.seq)).toEqual([3])
+    expect(readers.read(3, row).receipt?.uuid).toBe(first.uuid)
+    const late = join(h.root, 'late.jsonl')
+    writeTranscript(late, [{ ...entry(h.text), timestamp: 0 }])
+    expect(readers.read(3, { ...row, jsonl_path: late }).receipt).toMatchObject({ path: late, offset: 0, at: 0 })
+    readers.forget()
+    expect(readers.read(3, row).receipt?.uuid).toBe(before.uuid)
+  })
+
+  test.each(['claude', 'codex'] as const)('%s incremental reads match unknown outcomes, offset credits, discovery order and unavailable files', async agent => {
+    const h = await fixture(agent), late = join(h.root, 'late.jsonl')
+    const entry = agent === 'claude' ? promptEntry : codexPromptEntry
+    const row: DeliveryTranscriptRow = { ...h.row, jsonl_path: late, transcript_status: 'rotated', prior_sessions: [{ jsonl_path: h.path }] }
+    const readers = equivalentReaders(h, agent)
+    const before = { ...entry(h.text), uuid: undefined, timestamp: 999 }, after = { ...entry(h.text), uuid: undefined, timestamp: 1000 }
+    writeTranscript(h.path, [before, after])
+    expect(readers.read(1, row).receipt).toBeUndefined()
+    await h.queue.append('alpha', { v: 1, kind: 'sent', seq: 1, attempt: 1, at: 1000, unknown_outcome: true, quarantine: { path: join(h.root, 'quarantine'), line: 1 } })
+    const found = readers.read(1, row)
+    expect(found).toMatchObject({ path: late, size: 0, availability: 'not-yet-written', receipt: { path: h.path, at: 1000 } })
+    await h.queue.append('alpha', { v: 1, kind: 'delivered', seq: 1, part: 1, at: 2000, receipt: { path: h.path, offset: found.receipt!.offset } })
+    expect(readers.read(1, row).receipt).toBeUndefined()
+    // A newly discovered current path wins over prior paths, regardless of
+    // timestamp order, and offset zero remains eligible for the unknown send.
+    writeTranscript(late, [{ ...entry(h.text), timestamp: 1001 }])
+    expect(readers.read(1, row).receipt).toMatchObject({ path: late, offset: 0, at: 1001 })
+    fs.unlinkSync(late); fs.mkdirSync(late)
+    expect(readers.read(1, row)).toMatchObject({ availability: 'unreadable', receipt: undefined })
+    fs.rmdirSync(late)
+    // The original reader retains its last size when a cached file vanishes.
+    expect(readers.read(1, row)).toMatchObject({ availability: 'readable', receipt: undefined })
+    readers.forget()
+    // Forget also resets the queue cursor: the existing offset credit is
+    // restored even though no new queue record has appeared.
+    expect(readers.read(1, row).receipt).toBeUndefined()
+  })
+
   test('Codex receipt matching preserves every wrapper newline', async () => {
     const own = buildWrapper({ source: 'slack', text: 'a long exact body', user: 'U0SENDER', channel: 'C0CHANNEL', ts: '1792000100.000001' } as TagMessage), h = await fixture('codex', own)
     await h.send()
