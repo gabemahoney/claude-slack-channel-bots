@@ -165,10 +165,20 @@
  *     bun "$E" concurrent-overlap "$TEST_NAME" "$mode" 100000 2 "$out/operations.tsv" "$out/sample-intervals.tsv" "$out/n2.txt"
  *   conditions <state-dir> <server-pid> [<cpu-mark-file>]
  *     Bun, CPUs, cgroup memory limit, filesystem/mount, server VmHWM (KiB). With a
- *     cpu-mark file, also cgroup cpu_max and the nr_periods/nr_throttled/
+ *     cpu-mark file, also the server's cgroup cpu_max and the nr_periods/nr_throttled/
  *     throttled_usec deltas since that mark (cpuConditionFields; unknown if unread).
  *   cpu-mark <new-file>
- *     Saves the cgroup cpu.stat counters (empty when unreadable) at a case's start.
+ *     Saves its own cgroup's cpu.stat counters (empty when unreadable) at a case's
+ *     start: the server's cgroup, since only the burst driver runs elsewhere.
+ *   driver-cpu C <server-pid> <driver-record>
+ *     The control that the burst driver ran off the server's CPU quota: placement,
+ *     configured quotas and permissions, not throttling. The record is
+ *     burst-driver.sh's, one cgroup path per driver run; run as the server's UID
+ *     from the server's group while the measured server runs. Prints both
+ *     cgroups, cpu.max, CPUs and usage, and how many guarded cgroup files on
+ *     their paths a write-only open reached, and how many it could not probe;
+ *     missing unless driverCpuVerdict passes every run and every present file
+ *     was refused.
  *   observe C <burst-dir> <measurement-file> <byte-mark> <phase-cpu-file>
  *     Test-44's latency observation, never a verdict: exits 0 and prints no summary.
  *     The phase-cpu file is what burst appends when SR8_PHASE_CPU_FILE names it
@@ -519,7 +529,7 @@
  * Post Hold and N4 STRICT limits and the membership hang request duration D-A;
  * each prints signed excess and allowance always.
  */
-import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, statSync, statfsSync, openSync, readSync, closeSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, statSync, statfsSync, openSync, readSync, closeSync, constants as fsConstants } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { cpus } from 'node:os'
@@ -1641,6 +1651,14 @@ async function additional(command: string, c: Context, args: string[]): Promise<
     const { percentile } = await import('./transcript-receipts.ts')
     return personaStoreVerdicts(complete ? measurements(file, numeric(mark)) : undefined, accepted, keys, percentile)
   }
+  if (command === 'driver-cpu') {
+    countArgs(args, 2)
+    const [pid, record] = args, text = textFile(record)
+    if (!/^\d+$/.test(pid)) throw new Error('usage')
+    const runs = text === undefined || !text.endsWith('\n') ? undefined : text.slice(0, -1).split('\n').map(line => cgroupPathOf(`0::${line}`))
+    const server = procCgroup(Number(pid))
+    return [driverCpuVerdict(server, runs, cgroupFile, cgroupWriteAccess(guardedCgroups(server, runs), probeCgroupFile))]
+  }
   if (command === 'lookup-faults') {
     countArgs(args, 3)
     return lookupFaultVerdicts(tsv(args[0], ['key', 'method', 'outcome', 'match', 'envelope_id']), evidenceRows(args[1]), timingRows(args[2]))
@@ -2091,13 +2109,14 @@ async function burst(c: Context, args: string[]): Promise<number> {
   }
   let failed = false
   const cpuFile = process.env.SR8_PHASE_CPU_FILE, cpuPids = phasePids(process.env.SR8_PHASE_CPU_PIDS, process.pid)
+  const cpuCgroup = phaseCgroup(cpuPids)
   // test-44's opt-in CPU profile cuts one part per wave at these marks (cpu-profile.ts).
   const profileDir = process.env.SR8_PROFILE_DIR
   const phaseCpu = (phase: string) => {
     if (profileDir) try { appendFileSync(join(profileDir, 'waves'), `${phase}\n`, { mode: 0o600 }) } catch { /* never changes the burst */ }
     if (!cpuFile) return
     try {
-      const sample = phaseCpuSample(phase, performance.now(), cgroupCpuStat(), cpuPids.map(([name, pid]) => [name, textFile(`/proc/${pid}/stat`)]))
+      const sample = phaseCpuSample(phase, performance.now(), cgroupCpuStat(cpuCgroup), cpuPids.map(([name, pid]) => [name, textFile(`/proc/${pid}/stat`)]))
       appendFileSync(cpuFile, JSON.stringify(sample) + '\n', { mode: 0o600 })
     } catch { /* an observation never changes the burst */ }
   }
@@ -2234,6 +2253,98 @@ export function cpuConditionFields(cpuMax: string | undefined, before: string | 
   return `cpu_max=${max ? `${max[1]}/${max[2]}` : 'unknown'} nr_periods_delta=${delta(t => t.periods)} nr_throttled_delta=${delta(t => t.throttled)} throttled_usec_delta=${delta(t => t.throttledUsec)}`
 }
 
+/** The measured server's CPU quota, in CPUs: a shard's `CPUS_PER_SHARD` (scripts/ci-run.ts), which the driver's own CPU leaves unchanged. */
+export const SR8_SERVER_CPUS = 2
+/** A cgroup v2 path from `/proc/<pid>/cgroup`'s `0::` line, below the namespace root; undefined when absent or not a plain path. Pure. */
+export function cgroupPathOf(text: string | undefined): string | undefined {
+  const path = text?.match(/^0::(.*)$/m)?.[1]
+  return path !== undefined && /^\/(?:[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*)?$/.test(path)
+    && !path.split('/').some(s => s === '.' || s === '..') ? path : undefined
+}
+/** A cgroup path and its ancestors, the namespace root first. Pure. */
+export function cgroupChain(path: string): string[] {
+  return path === '/' ? ['/'] : path.split('/').map((_, i, parts) => parts.slice(0, i + 1).join('/') || '/')
+}
+/** A cpu.max as CPUs: quota ÷ period, Infinity for `max`; undefined when unreadable or malformed. Pure. */
+export function cpuMaxCpus(text: string | undefined): number | undefined {
+  const m = text?.trim().match(/^(max|\d+) (\d+)$/)
+  return !m || Number(m[2]) === 0 ? undefined : m[1] === 'max' ? Infinity : Number(m[1]) / Number(m[2])
+}
+/** Reads one file of the cgroup at a path below the namespace root. */
+export type CgroupRead = (path: string, file: string) => string | undefined
+/** The cgroup files that move a process or change a CPU, memory or PID limit. */
+export const SR8_GUARDED_CGROUP_FILES: readonly string[] = ['cgroup.procs', 'cgroup.threads', 'cgroup.subtree_control', 'cgroup.type',
+  'cpu.max', 'cpu.max.burst', 'cpu.weight', 'cpu.idle', 'memory.max', 'memory.high', 'memory.swap.max', 'pids.max']
+/** One guarded file's write-only open: it opened (writable), the kernel refused it, the file is absent, or it failed for another reason (no evidence). */
+export type CgroupOpenOutcome = 'writable' | 'refused' | 'absent' | 'error'
+/** A failed write-only open's outcome by its error code: EACCES, EPERM and EROFS are refusals, ENOENT an absent file, anything else no evidence. Pure. */
+export function cgroupOpenFailure(code: string | undefined): CgroupOpenOutcome {
+  return code === 'EACCES' || code === 'EPERM' || code === 'EROFS' ? 'refused' : code === 'ENOENT' ? 'absent' : 'error'
+}
+/** Of the guarded files on some cgroups: how many are present, how many the checking process could open to write, and how many it could not probe. */
+export interface CgroupWriteAccess { checked: number; writable: number; unknown: number }
+/** Tallies every guarded file on these cgroups by its probe's outcome; absent files are not counted. Pure given `probe`. */
+export function cgroupWriteAccess(paths: string[], probe: (path: string, file: string) => CgroupOpenOutcome): CgroupWriteAccess {
+  const access = { checked: 0, writable: 0, unknown: 0 }
+  for (const path of paths) for (const file of SR8_GUARDED_CGROUP_FILES) {
+    const outcome = probe(path, file)
+    if (outcome === 'absent') continue
+    access.checked++
+    if (outcome === 'writable') access.writable++
+    if (outcome === 'error') access.unknown++
+  }
+  return access
+}
+/**
+ * driver-cpu, the control that the burst driver's CPU no longer counts
+ * against the measured server's quota. It checks placement, configured
+ * quotas and permissions, not throttling: a pass does not rule out the
+ * container's own quota throttling the server's group. A cgroup's CPUs are
+ * the smallest cpu.max on its path. The server's must be `SR8_SERVER_CPUS`;
+ * each recorded driver run's must be finite; and every cgroup holding both
+ * (their common ancestors, the server's own when they share it) must allow
+ * the server's CPUs plus the driver's. The server's UID, checking from the
+ * server's group, must be able to open none of the guarded files on either
+ * path for writing, so it can neither move a process nor change a limit.
+ * Any other placement, an unreadable path or cpu.max, a writable guarded
+ * file, one it could not probe, none checked, or no recorded run is missing.
+ * Usage is each cgroup's cumulative cpu.stat `usage_usec`, in ms. Pure.
+ */
+export function driverCpuVerdict(server: string | undefined, drivers: (string | undefined)[] | undefined, read: CgroupRead, access: CgroupWriteAccess | undefined): Result {
+  const limit = (path: string) => cpuMaxCpus(read(path, 'cpu.max'))
+  const cpusOf = (path: string | undefined) => {
+    const chain = path === undefined ? [] : cgroupChain(path).map(limit)
+    return chain.length && chain.every(c => c !== undefined) ? Math.min(...chain as number[]) : undefined
+  }
+  const shared = (driver: string | undefined) => server === undefined || driver === undefined ? undefined
+    : cgroupChain(server).filter(path => cgroupChain(driver).includes(path)).map(limit)
+  const fits = (driver: string | undefined) => {
+    const serverCpus = cpusOf(server), driverCpus = cpusOf(driver), common = shared(driver)
+    return serverCpus === SR8_SERVER_CPUS && driverCpus !== undefined && Number.isFinite(driverCpus)
+      && !!common?.every(c => c !== undefined && c >= serverCpus + driverCpus)
+  }
+  const shown = (path: string | undefined) => path ?? 'unknown'
+  const cpus = (n: number | undefined) => n === undefined ? 'unknown' : Number.isFinite(n) ? round3(n) : 'max'
+  const cpuMax = (path: string | undefined) => {
+    const m = path === undefined ? undefined : read(path, 'cpu.max')?.trim().match(/^(max|\d+) (\d+)$/)
+    return m ? `${m[1]}/${m[2]}` : 'unknown'
+  }
+  const usage = (path: string | undefined) => {
+    const used = path === undefined ? undefined : cgroupCpuCounters(read(path, 'cpu.stat'))?.usage_usec
+    return used === undefined ? 'unknown' : round3(used / 1000)
+  }
+  const driver = drivers?.[0], common = shared(driver)
+  return result('driver-cpu', drivers?.length ?? 0, { server_cgroup: shown(server), server_cpu_max: cpuMax(server), server_cpus: cpus(cpusOf(server)),
+    server_usage_ms: usage(server), driver_cgroup: shown(driver), driver_cpu_max: cpuMax(driver), driver_cpus: cpus(cpusOf(driver)),
+    driver_usage_ms: usage(driver), shared_cpus: common === undefined ? 'unknown' : !common.length ? 'none' : cpus(common.some(c => c === undefined) ? undefined : Math.min(...common as number[])),
+    guarded_files: access?.checked ?? 'unknown', writable_files: access?.writable ?? 'unknown', unprobed_files: access?.unknown ?? 'unknown' },
+  SR8_SERVER_CPUS, drivers?.length && drivers.every(fits) && !!access?.checked && access.writable === 0 && access.unknown === 0 ? 'pass' : 'missing')
+}
+/** The cgroups driver-cpu checks permissions on: every cgroup on the server's and the drivers' paths, once each, root first. Pure. */
+export function guardedCgroups(server: string | undefined, drivers: (string | undefined)[] | undefined): string[] {
+  return [...new Set([server, ...drivers ?? []].flatMap(path => path === undefined ? [] : cgroupChain(path)))]
+}
+
 /** The cgroup's cpu.stat counters: v2 usage/user/system microseconds, and the
  * throttling counters through cpuThrottle (v1 has no usage here). Pure. */
 export function cgroupCpuCounters(text: string | undefined): Record<string, number> | undefined {
@@ -2260,6 +2371,11 @@ export function phasePids(spec: string | undefined, self: number): [string, numb
   const named = (spec ?? '').split(',').map(s => s.match(/^([a-z]+)=(\d+)$/)).filter(m => m !== null && m[1] !== 'observer')
     .map(m => [m![1], Number(m![2])] as [string, number])
   return [...named, ['observer', self]]
+}
+/** The cgroup a phase sample reads: the named server's, whose CPU quota the burst loads; else the namespace root. */
+function phaseCgroup(pids: [string, number][]): string {
+  const server = pids.find(([name]) => name === 'server')
+  return server ? cgroupOfPid(server[1]) : '/'
 }
 export interface PhaseCpuSample { phase: string; mono_ms: number; cgroup: Record<string, number> | null; procs: Record<string, { utime: number; stime: number } | null> }
 /** One boundary reading: the phase starting here, or `end`. Pure. */
@@ -2450,16 +2566,40 @@ async function observe(args: string[]): Promise<Result[]> {
   return observeResults({ rows: integer(numeric(mark)) ? jsonl(file, Number(mark), true) : undefined, items: records(items) ? items : undefined,
     times: timingRows(join(dir, 'times.jsonl')), cpu: cpu?.every(phaseCpuRow) ? cpu : undefined }, percentile)
 }
-function cgroupCpuMax() {
-  const v2 = textFile('/sys/fs/cgroup/cpu.max')
-  if (v2 !== undefined) return v2
+/** The cgroup v2 namespace root's mount. */
+const CGROUP_ROOT = '/sys/fs/cgroup'
+/** A cgroup v2 file of the cgroup at `path` below the namespace root. */
+const cgroupFile = (path: string, file: string) => textFile(join(CGROUP_ROOT, path, file))
+/**
+ * One guarded file's probe by this process: a write-only open, the kernel's
+ * write-permission check, closed with nothing written. No create or truncate
+ * flag; O_NONBLOCK and O_NOFOLLOW turn a FIFO or a link, which no cgroup file
+ * is, into an error rather than a wait or a followed path.
+ */
+function probeCgroupFile(path: string, file: string): CgroupOpenOutcome {
+  try {
+    closeSync(openSync(join(CGROUP_ROOT, path, file), fsConstants.O_WRONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW))
+    return 'writable'
+  } catch (error) {
+    return cgroupOpenFailure((error as NodeJS.ErrnoException).code)
+  }
+}
+/** A process's cgroup v2 path; undefined when unreadable (cgroup v1, or a gone process). */
+const procCgroup = (pid: number | 'self') => cgroupPathOf(textFile(`/proc/${pid}/cgroup`))
+/** A process's cgroup v2 path, else the namespace root. */
+const cgroupOfPid = (pid: number | 'self') => procCgroup(pid) ?? '/'
+/** cpu.max of the cgroup at `path`; at the root, cgroup v1's quota and period. */
+function cgroupCpuMax(path: string) {
+  const v2 = cgroupFile(path, 'cpu.max')
+  if (v2 !== undefined || path !== '/') return v2
   const quota = textFile('/sys/fs/cgroup/cpu/cpu.cfs_quota_us')?.trim(), period = textFile('/sys/fs/cgroup/cpu/cpu.cfs_period_us')?.trim()
   return quota === undefined || period === undefined ? undefined : `${quota === '-1' ? 'max' : quota} ${period}`
 }
-const cgroupCpuStat = () => textFile('/sys/fs/cgroup/cpu.stat') ?? textFile('/sys/fs/cgroup/cpu/cpu.stat')
+const cgroupCpuStat = (path: string) => cgroupFile(path, 'cpu.stat') ?? (path === '/' ? textFile('/sys/fs/cgroup/cpu/cpu.stat') : undefined)
+/** The case's mark: this process's cgroup, the measured server's (the burst driver alone runs elsewhere). */
 function cpuMark(args: string[]) {
   countArgs(args, 1)
-  const stat = cgroupCpuStat()
+  const stat = cgroupCpuStat(cgroupOfPid('self'))
   writeFileSync(args[0], cpuThrottle(stat) ? stat! : '', { flag: 'wx' })
 }
 function conditions(args: string[]) {
@@ -2469,7 +2609,8 @@ function conditions(args: string[]) {
   const memory = textFile('/sys/fs/cgroup/memory.max')?.trim() ?? textFile('/sys/fs/cgroup/memory/memory.limit_in_bytes')?.trim() ?? 'unknown'
   const mount = (textFile('/proc/self/mountinfo') ?? '').split('\n').map(l => l.split(' ')).filter(s => s[4] && (resolve(state) === s[4] || resolve(state).startsWith(s[4].replace(/\/$/, '') + '/'))).sort((a, b) => b[4].length - a[4].length)[0]?.[4] ?? 'unknown'
   const peak = textFile(`/proc/${pid}/status`)?.match(/^VmHWM:\s+(\d+) kB$/m)?.[1] ?? 'unknown'
-  const cpu = mark === undefined ? '' : ` ${cpuConditionFields(cgroupCpuMax(), textFile(mark), cgroupCpuStat())}`
+  const server = cgroupOfPid(Number(pid))
+  const cpu = mark === undefined ? '' : ` ${cpuConditionFields(cgroupCpuMax(server), textFile(mark), cgroupCpuStat(server))}`
   console.log(`recorded: sr8 conditions bun=${Bun.version} cpus=${cpus().length} memory_limit=${memory} fs_type=${statfsSync(state).type} state_dir_mount=${mount} peak_rss_kib=${peak}${cpu}`)
 }
 async function main(args: string[]): Promise<number> {

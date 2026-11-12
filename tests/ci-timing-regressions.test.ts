@@ -23,7 +23,10 @@ import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVer
   burstAckVerdicts, pendingBurstVerdict, type BurstItem, type PendingWindow,
   SR8_DIAGNOSTIC_KINDS, SR8_USER_HZ, cgroupCpuCounters, procCpuTicks, phasePids, phaseCpuSample, phaseCpuResults, ackClockSamples, ackClockResults,
   ackBinResults, ackEventResults, serverWaves, serverPhase, appendResults, saveResults, observeResults, type PhaseCpuSample, type ClockSample,
+  SR8_SERVER_CPUS, SR8_GUARDED_CGROUP_FILES, cgroupPathOf, cgroupChain, cpuMaxCpus, driverCpuVerdict, guardedCgroups, cgroupWriteAccess, cgroupOpenFailure,
+  type CgroupWriteAccess, type CgroupOpenOutcome,
 } from './integration/fixtures/sr8-evidence.ts'
+import { CPUS_PER_SHARD } from '../scripts/ci-run.ts'
 import { serializeTestMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, threadCompactionMeasurement,
   type TestMeasurement, type TestMeasurementRecord } from '../src/test-measurements.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
@@ -1002,6 +1005,77 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     expect(cpuConditionFields('max 100000', v2(1, 0, 0), v2(1, 0, 0))).toBe('cpu_max=max/100000 nr_periods_delta=0 nr_throttled_delta=0 throttled_usec_delta=0')
     expect(cpuConditionFields(undefined, '', v2(1, 0, 0))).toBe('cpu_max=unknown nr_periods_delta=unknown nr_throttled_delta=unknown throttled_usec_delta=unknown')
     expect(cpuConditionFields('garbage', v2(5, 5, 5), v2(1, 1, 1))).toBe('cpu_max=unknown nr_periods_delta=unknown nr_throttled_delta=unknown throttled_usec_delta=unknown')
+  })
+  describe('driver-cpu: the burst driver off the server\'s CPU quota', () => {
+    const files = (entries: Record<string, string>) => (path: string, file: string) => entries[`${path === '/' ? '' : path}/${file}`]
+    const stat = (usec: number) => `usage_usec ${usec}\nuser_usec 1\nsystem_usec 1\nnr_periods 1\nnr_throttled 0\nthrottled_usec 0\n`
+    // Before: one 2-CPU container quota holds the server, the stub and the driver.
+    const shared = { '/cpu.max': '200000 100000\n', '/cpu.stat': stat(7_806_000) }
+    // Now: a 3-CPU container; the server's group keeps 2 CPUs and the driver's 0.9 sits beside it.
+    const split = { '/cpu.max': '300000 100000\n', '/cpu.stat': stat(9_000_000), '/shard/cpu.max': 'max 100000\n',
+      '/shard/server/cpu.max': '200000 100000\n', '/shard/server/cpu.stat': stat(5_000_000),
+      '/shard/driver/cpu.max': '90000 100000\n', '/shard/driver/cpu.stat': stat(1_860_000) }
+    // The server's UID could open none of the guarded files it checked for writing.
+    const contained = { checked: 34, writable: 0, unknown: 0 }
+    test('today\'s shard, one quota for the server and the driver, is missing; the split shard passes', () => {
+      expect(driverCpuVerdict('/', ['/'], files(shared), { checked: 10, writable: 0, unknown: 0 })).toEqual({ measure: 'driver-cpu', samples: 1, stats: { server_cgroup: '/', server_cpu_max: '200000/100000',
+        server_cpus: 2, server_usage_ms: 7806, driver_cgroup: '/', driver_cpu_max: '200000/100000', driver_cpus: 2, driver_usage_ms: 7806, shared_cpus: 2,
+        guarded_files: 10, writable_files: 0, unprobed_files: 0 }, limit: 2, verdict: 'missing' })
+      expect(driverCpuVerdict('/shard/server', ['/shard/driver', '/shard/driver'], files(split), contained)).toEqual({ measure: 'driver-cpu', samples: 2, stats: {
+        server_cgroup: '/shard/server', server_cpu_max: '200000/100000', server_cpus: 2, server_usage_ms: 5000, driver_cgroup: '/shard/driver',
+        driver_cpu_max: '90000/100000', driver_cpus: 0.9, driver_usage_ms: 1860, shared_cpus: 3, guarded_files: 34, writable_files: 0, unprobed_files: 0 }, limit: 2, verdict: 'pass' })
+      expect(SR8_SERVER_CPUS).toBe(CPUS_PER_SHARD)
+    })
+    // Injected probe outcomes: the tally the real write-only probe feeds, whoever runs the suite.
+    test('every present guarded file counts; an opened file is writable and an unexpected probe error is unknown', () => {
+      const paths = guardedCgroups('/shard/server', ['/shard/driver'])
+      const outcome = (bad: Record<string, CgroupOpenOutcome>) => (path: string, file: string) => bad[`${path} ${file}`] ?? (file === 'memory.max' && path !== '/' ? 'absent' : 'refused')
+      const present = paths.length * SR8_GUARDED_CGROUP_FILES.length - (paths.length - 1)
+      expect(cgroupWriteAccess(paths, outcome({}))).toEqual({ checked: present, writable: 0, unknown: 0 })
+      // A write-only migration file the server's UID may write: R2.2's escape.
+      expect(cgroupWriteAccess(paths, outcome({ '/shard cgroup.procs': 'writable' }))).toEqual({ checked: present, writable: 1, unknown: 0 })
+      expect(cgroupWriteAccess(paths, outcome({ '/shard/driver cpu.max': 'error' }))).toEqual({ checked: present, writable: 0, unknown: 1 })
+      expect(cgroupWriteAccess(paths, () => 'absent')).toEqual({ checked: 0, writable: 0, unknown: 0 })
+      expect([undefined, 'EACCES', 'EPERM', 'EROFS', 'ENOENT', 'EMFILE', 'EISDIR', 'ELOOP', 'ENXIO'].map(code => cgroupOpenFailure(code)))
+        .toEqual(['error', 'refused', 'refused', 'refused', 'absent', 'error', 'error', 'error', 'error'])
+    })
+    test.each<[string, string | undefined, (string | undefined)[] | undefined, Record<string, string>, CgroupWriteAccess | undefined]>([
+      ['one driver run in the server\'s group', '/shard/server', ['/shard/driver', '/shard/server'], split, contained],
+      ['a driver beside the server under a container quota with no room for it', '/shard/server', ['/shard/driver'], { ...split, '/cpu.max': '200000 100000\n' }, contained],
+      ['an uncapped driver', '/shard/server', ['/shard/driver'], { ...split, '/shard/driver/cpu.max': 'max 100000\n' }, contained],
+      ['a server quota other than the shard\'s', '/shard/server', ['/shard/driver'], { ...split, '/shard/server/cpu.max': '250000 100000\n' }, contained],
+      ['an unreadable cpu.max on the path', '/shard/server', ['/shard/driver'], Object.fromEntries(Object.entries(split).filter(([path]) => path !== '/shard/cpu.max')), contained],
+      ['an unreadable server cgroup', undefined, ['/shard/driver'], split, contained],
+      ['a malformed record line', '/shard/server', [undefined], split, contained],
+      ['no recorded driver run', '/shard/server', [], split, contained],
+      ['no record', '/shard/server', undefined, split, contained],
+      // The server's UID could move a process (for example into shard or shard/driver) or change a limit.
+      ['one guarded file the server\'s UID can write', '/shard/server', ['/shard/driver'], split, { checked: 34, writable: 1, unknown: 0 }],
+      ['one guarded file it could not probe', '/shard/server', ['/shard/driver'], split, { checked: 34, writable: 0, unknown: 1 }],
+      ['no guarded file checked', '/shard/server', ['/shard/driver'], split, { checked: 0, writable: 0, unknown: 0 }],
+      ['no permission check', '/shard/server', ['/shard/driver'], split, undefined],
+    ])('%s is missing', (_name, server, drivers, entries, access) => {
+      const row = driverCpuVerdict(server, drivers, files(entries), access)
+      expect(row.verdict).toBe('missing')
+      expect(resultLine({ scenario: 'test-45-fmk-membership-load-strict-lookup', mode: 'strict', population: 100_000, recipients: 2 }, row))
+        .toMatch(/^recorded: sr8 driver-cpu scenario=\S+ mode=strict population=100000 recipients=2 samples=\d+ server_cgroup=\S+ server_cpu_max=\S+ server_cpus=\S+ server_usage_ms=\S+ driver_cgroup=\S+ driver_cpu_max=\S+ driver_cpus=\S+ driver_usage_ms=\S+ shared_cpus=\S+ guarded_files=\S+ writable_files=\S+ unprobed_files=\S+ limit=2 verdict=missing$/)
+    })
+    test('permissions are checked on every cgroup of both paths, once each, root first', () => {
+      expect(guardedCgroups('/shard/server', ['/shard/driver', '/shard/driver'])).toEqual(['/', '/shard', '/shard/server', '/shard/driver'])
+      expect(guardedCgroups('/', ['/'])).toEqual(['/'])
+      expect(guardedCgroups(undefined, undefined)).toEqual([])
+      expect(SR8_GUARDED_CGROUP_FILES).toEqual(expect.arrayContaining(['cgroup.procs', 'cgroup.threads', 'cpu.max', 'cpu.max.burst', 'memory.max', 'pids.max']))
+    })
+    test('cgroup paths, chains and cpu.max values parse strictly', () => {
+      expect(cgroupPathOf('0::/shard/server\n')).toBe('/shard/server')
+      expect(cgroupPathOf('0::/\n')).toBe('/')
+      expect(cgroupPathOf('12:cpu,cpuacct:/x\n0::/a.b/c-d_e\n')).toBe('/a.b/c-d_e')
+      for (const text of ['12:cpu,cpuacct:/x\n', '0::/a/../b\n', '0::/a b\n', '0::relative\n', '0::/a//b\n', '', undefined]) expect(cgroupPathOf(text)).toBeUndefined()
+      expect(cgroupChain('/shard/server')).toEqual(['/', '/shard', '/shard/server'])
+      expect(cgroupChain('/')).toEqual(['/'])
+      expect([cpuMaxCpus('200000 100000\n'), cpuMaxCpus('90000 100000'), cpuMaxCpus('max 100000')]).toEqual([2, 0.9, Infinity])
+      for (const text of ['200000', '1 0', 'max', '-1 100000', undefined]) expect(cpuMaxCpus(text)).toBeUndefined()
+    })
   })
   test.each(['epoch', 'settlement', 'settlement-id', 'diagnostic-endpoint', 'reversed-clock', 'attempt-bound'] as const)
   ('membership measured deadline rejects %s', absent => {
@@ -2165,7 +2239,176 @@ process.exit(exit ?? status)\n`,
     expect([...new Set([...t44.matchAll(/bun "\$\{SR8\}" ([a-z-]+)/g)].map(m => m[1]))].sort())
       .toEqual(['bodies', 'burst', 'combinations', 'conditions', 'config', 'envelope-times', 'observe', 'plan', 'seed'])
     expect([...t44.matchAll(/^\s*sr8_verdicts (seal [a-z]+|[a-z-]+) /gm)].map(m => m[1]))
-      .toEqual(['seal first', 'seal measured', 'seal measured', 'check', 'pending-post', 'shared-list'])
+      .toEqual(['seal first', 'seal measured', 'driver-cpu', 'seal measured', 'check', 'driver-cpu', 'pending-post', 'shared-list'])
+  })
+})
+
+describe('the burst driver runs off the server\'s CPU quota (stub shell)', () => {
+  const entrypoint = readFileSync(join(import.meta.dir, '..', 'docker', 'entrypoint.sh'), 'utf8')
+  /** Every driver command in a script, and those burst-driver.sh runs, recording into `record`. */
+  const drivers = (text: string, bun: string, record: string) => ({
+    all: [...text.matchAll(new RegExp(`bun "\\$\\{${bun}\\}" (burst|fault-burst|fault-recover) `, 'g'))].map(m => m[1]),
+    wrapped: [...text.matchAll(new RegExp(`bash "\\$\\{BURST_DRIVER\\}" "\\$\\{${record}\\}/driver-cgroup"(?: \\\\\\n\\s*| )bun "\\$\\{${bun}\\}" (burst|fault-burst|fault-recover) `, 'g'))].map(m => m[1]),
+  })
+  test('tests 44, 45 and 48 run every burst driver through burst-driver.sh and judge it with driver-cpu while the measured server runs', () => {
+    const t44 = source('test-44-fmk-thread-burst.sh'), load = source('lib/membership-load.sh')
+    expect(drivers(t44, 'SR8', 'RESULTS')).toEqual({ all: ['burst', 'burst'], wrapped: ['burst', 'burst'] })
+    expect(drivers(load, 'E', 'OUT')).toEqual({ all: ['burst', 'fault-burst', 'fault-recover'], wrapped: ['burst', 'fault-burst', 'fault-recover'] })
+    expect(t44.match(/^\s*sr8_verdicts driver-cpu "\$\{CONTEXT\[@\]\}" "\$\{SERVER_PID\}" "\$\{RESULTS\}\/driver-cgroup"\n\s*clean_stop$/gm)).toHaveLength(2)
+    expect(load).toContain('        verdict driver-cpu "${C[@]}" "${SERVER_PID}" "${OUT}/driver-cgroup"\n'
+      + '        REOPEN_OBSERVE_LOG="$(byte_mark "${SLACK_STATE_DIR}/server.log")"\n        reopen_ad_rows before-stop > "${ROOT}/reopen-observe.rows"\n'
+      + '        REOPEN_OBSERVE=1\n        stop_server --stop-bots\n')
+  })
+  // burst-driver.sh with its image guard removed and its spool and cgroup
+  // membership read from the case's own files, never the host's /proc or /run.
+  const fixture = source('fixtures/burst-driver.sh')
+  const guard = "[[ -f /etc/cscb-ci-image ]] || { echo 'burst-driver requires the CI image' >&2; exit 70; }\n"
+  const spool = 'SPOOL=/run/cscb-burst-driver\n', membership = 'MEMBERSHIP=/proc/self/cgroup\n'
+  const bun = 'BUN=/usr/local/bin/bun\n', trustedUid = 'TRUSTED_UID=0\n', trustedGid = 'TRUSTED_GID=0\n'
+  /** The fixture with its launcher's Bun planted as `bunPath` and this test's user and group trusted in place of root. */
+  const planted = (bunPath = '$HOME/bin/bun') => {
+    for (const line of [guard, spool, membership, bun, trustedUid, trustedGid]) expect(fixture.split(line)).toHaveLength(2)
+    return fixture.replace(guard, '').replace(spool, 'SPOOL="$HOME/spool"\n').replace(membership, 'MEMBERSHIP="$HOME/membership"\n')
+      .replace(bun, `BUN="${bunPath}"\n`).replace(trustedUid, 'TRUSTED_UID="$(id -u)"\n').replace(trustedGid, 'TRUSTED_GID="$(id -g)"\n')
+  }
+  // The planted Bun (a script that runs this suite's Bun by its absolute path), closed to
+  // others like the image's root-owned one, and a stub driver closed to others too.
+  const setup = [
+    'mkdir -m 0755 "$HOME/bin"', `printf '#!/bin/bash\\nexec %s "$@"\\n' '${process.execPath}' > "$HOME/bin/bun"`,
+    'chmod 0755 "$HOME/bin/bun"', 'chmod 0644 "$HOME/sr8-evidence.ts"', 'chmod 0700 "$HOME"',
+    'mkdir -m 0700 "$HOME/spool" "$HOME/work"', 'mkfifo -m 0600 "$HOME/spool/requests"', 'printf "0::/shard/driver\\n" > "$HOME/membership"',
+  ]
+  // A stand-in for sr8-evidence.ts: prints what it ran with, and for fault-burst waits to be stopped.
+  const stubDriver = `import { readFileSync, writeFileSync } from 'node:fs'
+const [command, ...rest] = process.argv.slice(2), grand = readFileSync('/proc/' + process.ppid + '/stat', 'utf8').split(') ')[1].split(' ')[1], e = process.env
+console.log('driver ' + command + ' ' + rest.join(' ') + ' cwd=' + process.cwd() + ' root=' + e.SCENARIO_ROOT + ' cpu=' + e.SR8_PHASE_CPU_FILE + ' pids=' + e.SR8_PHASE_CPU_PIDS
+  + ' profile=' + e.SR8_PROFILE_DIR + ' path=' + e.PATH + ' home=' + e.HOME + ' options=' + e.BUN_OPTIONS + ' extra=' + e.EXTRA + ' pid=' + process.pid + ' grandparent=' + grand)
+console.error('driver stderr')
+writeFileSync(e.SCENARIO_ROOT + '/driver.pid', String(process.pid))
+if (command === 'fault-burst') setTimeout(() => {}, 20000)
+else process.exitCode = command === 'burst' ? 3 : 0
+`
+  /** A request written straight to the launcher, skipping the caller's checks: its spec entries, then its status. */
+  const craft = 'craft() { local request; request="$(mktemp -d "$HOME/spool/request.XXXXXX")"; mkfifo "$request/spec" "$request/status"; '
+    + 'echo "${request##*/}" > "$HOME/spool/requests"; printf "%s\\0" "$@" > "$request/spec"; cat "$request/status"; rm -rf "$request"; }'
+  test('burst-driver.sh without a launcher records the membership it runs in and execs the driver as the same PID', () => {
+    const r = shell([
+      'printf "0::/shard/server\\n" > "$HOME/membership"',
+      'SCENARIO_ROOT="$HOME" bash "$HOME/driver.sh" "$HOME/record" bun "$HOME/sr8-evidence.ts" burst one & pid=$!',
+      'status=0; wait "$pid" || status=$?; echo "status $status, caller pid $pid"',
+      'status=0; bash "$HOME/driver.sh" "$HOME/record" bash -c "echo not a driver" || status=$?; echo "other command $status"',
+      'status=0; bash "$HOME/driver.sh" record bun "$HOME/sr8-evidence.ts" burst || status=$?; echo "relative record $status"',
+      'cat "$HOME/record"',
+    ].join('\n'), { 'driver.sh': planted(), 'sr8-evidence.ts': stubDriver })
+    const pid = r.stdout.match(/caller pid (\d+)/)?.[1]
+    expect(r.status).toBe(0)
+    expect(r.stdout).toContain(` pid=${pid} grandparent=`)
+    expect(r.stdout.replace(/^driver .*\n/m, '')).toBe(`status 3, caller pid ${pid}\nother command 64\nrelative record 64\n/shard/server\n`)
+    const usage = 'usage: burst-driver.sh <record> bun <fixtures>/sr8-evidence.ts burst|fault-burst|fault-recover <arguments>... | --serve <spool>\n'
+    expect(r.stderr).toBe(`driver stderr\n${usage}${usage}`)
+  })
+  test('the launcher runs all three driver commands under itself, with its own Bun, directory, PATH and HOME and only the driver fields, relaying output and status', () => {
+    const r = shell([
+      ...setup, 'bash "$HOME/driver.sh" --serve "$HOME/spool" & launcher=$!', 'cd "$HOME/work"', 'echo "launcher $launcher"',
+      'export SCENARIO_ROOT="$HOME" SR8_PHASE_CPU_FILE="$HOME/cpu.jsonl" SR8_PHASE_CPU_PIDS=server=7,stub=8 SR8_PROFILE_DIR="$HOME/profile" EXTRA=dropped',
+      'for command in burst fault-recover; do',
+      '  status=0; bash "$HOME/driver.sh" "$HOME/record" bun "$HOME/sr8-evidence.ts" "$command" "a b" \'$HOME\' & caller=$!; wait "$caller" || status=$?',
+      '  echo "$command status $status caller $caller"',
+      'done',
+      // SIGTERM to the caller reaches the fault-burst driver it started.
+      'rm "$HOME/driver.pid"; bash "$HOME/driver.sh" "$HOME/record" bun "$HOME/sr8-evidence.ts" fault-burst & caller=$!',
+      'for _ in $(seq 100); do [[ -s "$HOME/driver.pid" ]] && break; sleep 0.05; done; kill -TERM "$caller"',
+      'status=0; wait "$caller" || status=$?; driver="$(cat "$HOME/driver.pid")"; for _ in $(seq 100); do kill -0 "$driver" 2> /dev/null || break; sleep 0.05; done',
+      'kill -0 "$driver" 2> /dev/null && echo "driver alive" || echo "fault-burst stopped $status"',
+      'kill "$launcher"', 'cat "$HOME/record"', 'ls "$HOME/spool"',
+    ].join('\n'), { 'driver.sh': planted(), 'sr8-evidence.ts': stubDriver })
+    expect(r.status).toBe(0)
+    const home = r.stdout.match(/ root=(\S+) /)![1]!, launcher = r.stdout.match(/^launcher (\d+)$/m)![1]
+    const literal = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const fields = literal(`cwd=/ root=${home} cpu=${home}/cpu.jsonl pids=server=7,stub=8 profile=${home}/profile path=/usr/local/bin:/usr/bin:/bin home=/ options=undefined extra=undefined`)
+    // Arguments arrive as given, unevaluated; each driver's grandparent is the launcher, not its caller.
+    for (const [command, status] of [['burst', 3], ['fault-recover', 0]] as const) {
+      const caller = r.stdout.match(new RegExp(`^${command} status ${status} caller (\\d+)$`, 'm'))![1]
+      const line = r.stdout.match(new RegExp(`^driver ${command} a b \\$HOME ${fields} pid=(\\d+) grandparent=(\\d+)$`, 'm'))!
+      expect([line[1] === caller, line[2]]).toEqual([false, launcher])
+    }
+    expect(r.stdout).toMatch(new RegExp(`^driver fault-burst  ${fields} pid=\\d+ grandparent=${launcher}$`, 'm'))
+    expect(r.stdout).toContain('fault-burst stopped 143\n/shard/driver\n/shard/driver\n/shard/driver\nrequests\n')
+    expect(r.stderr).toBe('driver stderr\ndriver stderr\ndriver stderr\n')
+  })
+  test('the launcher ignores a caller\'s PATH, Bun options, preload, bunfig and .env files, and refuses crafted environment entries, arguments and records', () => {
+    const r = shell([
+      ...setup, 'mkdir -m 0755 "$HOME/evil"',
+      // A fake bun first on the caller's PATH, and a preload every Bun override names.
+      'printf "#!/bin/bash\\ntouch %s/fake-bun\\n" "$HOME" > "$HOME/evil/bun"', 'chmod 0755 "$HOME/evil/bun"',
+      `printf '%s\\n' "import { writeFileSync } from 'node:fs'; writeFileSync('$HOME/preloaded', '')" > "$HOME/evil/preload.ts"`,
+      'printf "preload = [\\"%s/evil/preload.ts\\"]\\n" "$HOME" | tee "$HOME/work/bunfig.toml" > "$HOME/.bunfig.toml"',
+      'printf "EXTRA=from-dotenv\\n" > "$HOME/work/.env"',
+      // The preload is live: Bun itself honors BUN_OPTIONS.
+      'BUN_OPTIONS="--preload=$HOME/evil/preload.ts" SCENARIO_ROOT="$HOME" "$HOME/bin/bun" "$HOME/sr8-evidence.ts" fault-recover > /dev/null 2>&1',
+      '[[ -e "$HOME/preloaded" ]] && echo "preload live"; rm -f "$HOME/preloaded" "$HOME/driver.pid"',
+      'bash "$HOME/driver.sh" --serve "$HOME/spool" & launcher=$!', 'cd "$HOME/work"',
+      'status=0; PATH="$HOME/evil:$PATH" BUN_OPTIONS="--preload=$HOME/evil/preload.ts" NODE_OPTIONS="--require=$HOME/evil/preload.ts" SCENARIO_ROOT="$HOME" \\',
+      '  bash "$HOME/driver.sh" "$HOME/record" bun "$HOME/sr8-evidence.ts" fault-recover || status=$?',
+      'echo "overridden caller $status"; for f in fake-bun preloaded; do [[ -e "$HOME/$f" ]] && echo "$f ran"; done',
+      craft, 'rm -f "$HOME/driver.pid"',
+      'for entry in -u --unset=SCENARIO_ROOT -i -- PATH=/tmp BUN_OPTIONS=--preload=x HOME=/tmp NODE_OPTIONS=x SR8_PROFILE_DIR SCENARIO_ROOTX=1 " SR8_PROFILE_DIR=x"; do',
+      '  echo "entry [$entry]: $(craft "$HOME/record" 3 bun "$HOME/sr8-evidence.ts" burst "$entry")"',
+      'done',
+      'echo "argv: $(craft "$HOME/record" 3 bash -c "touch $HOME/ran")"',
+      'echo "other entry file: $(craft "$HOME/record" 3 bun "$HOME/work/../sr8-evidence.ts" burst)"',
+      'echo "relative record: $(craft record 3 bun "$HOME/sr8-evidence.ts" burst)"',
+      'echo "short argv: $(craft "$HOME/record" 5 bun "$HOME/sr8-evidence.ts" burst)"',
+      '[[ -e "$HOME/driver.pid" || -e "$HOME/ran" ]] && echo "a crafted request ran" || echo "no crafted request ran"',
+      'kill "$launcher"', 'cat "$HOME/record"',
+    ].join('\n'), { 'driver.sh': planted(), 'sr8-evidence.ts': stubDriver })
+    expect(r.status).toBe(0)
+    expect(r.stdout).toMatch(/^driver fault-recover  cwd=\/ root=\S+ cpu=undefined pids=undefined profile=undefined path=\/usr\/local\/bin:\/usr\/bin:\/bin home=\/ options=undefined extra=undefined pid=\d+ grandparent=\d+$/m)
+    const entries = ['-u', '--unset=SCENARIO_ROOT', '-i', '--', 'PATH=/tmp', 'BUN_OPTIONS=--preload=x', 'HOME=/tmp', 'NODE_OPTIONS=x', 'SR8_PROFILE_DIR', 'SCENARIO_ROOTX=1', ' SR8_PROFILE_DIR=x']
+    expect(r.stdout.replace(/^driver .*\n/m, '')).toBe(['preload live', 'overridden caller 0', ...entries.map(entry => `entry [${entry}]: exit 64`),
+      'argv: exit 64', 'other entry file: exit 64', 'relative record: exit 64', 'short argv: exit 64', 'no crafted request ran', '/shard/driver', ''].join('\n'))
+    expect(r.stderr).toBe('driver stderr\n')
+  })
+  test.each([['other-writable', 'chmod 0757 "$HOME/bin/bun"'], ['a link', 'ln -s "$HOME/bin/bun" "$HOME/bin/link"'],
+    ['a group-writable entry file of another group', 'chmod 0664 "$HOME/sr8-evidence.ts"']])('the launcher does not serve when what it runs is %s', (_name, change) => {
+    const planting = change.includes('link') ? '$HOME/bin/link' : '$HOME/bin/bun'
+    const r = shell([...setup, change, 'status=0; bash "$HOME/driver.sh" --serve "$HOME/spool" || status=$?; echo "launcher $status"'].join('\n'),
+      { 'driver.sh': change.includes('0664') ? planted().replace('TRUSTED_GID="$(id -g)"\n', 'TRUSTED_GID=0\n') : planted(planting), 'sr8-evidence.ts': stubDriver })
+    expect({ status: r.status, stdout: r.stdout }).toEqual({ status: 0, stdout: 'launcher 70\n' })
+    expect(r.stderr).toMatch(/^burst-driver: \S+ is not root-owned and closed to others; the launcher does not serve\n$/)
+  })
+  test('a burst-driver shard\'s entrypoint keeps the server at all but one CPU, starts the driver\'s launcher in the driver\'s group, and gives testuser no cgroup file', () => {
+    expect(entrypoint).toContain('if [[ -w /sys/fs/cgroup/cgroup.subtree_control ]] && (( $$ != 1 )); then\n'
+      + '    split_driver_cpu /sys/fs/cgroup /proc/self/cgroup /run/cscb-burst-driver\nfi\n\nexec gosu testuser bash /tests/runner.sh "$@"\n')
+    expect(fixture).toContain(spool)
+    expect(entrypoint.split('\n').filter(line => /\bchown\b/.test(line) && /cgroup|\$\{root\}/.test(line))).toEqual([])
+    const split = (cpuMax: string, member = '0::/', listed = true) => shell([
+      'chown() { printf "chown %s\\n" "$*" >> "$HOME/log"; }', 'gosu() { printf "gosu %s\\n" "$*" >> "$HOME/log"; }', declaration(entrypoint, 'split_driver_cpu'),
+      'mkdir "$HOME/cg"', `printf '%s\\n' '${cpuMax}' > "$HOME/cg/cpu.max"`, `printf '%s\\n' '${member}' > "$HOME/membership"`,
+      listed ? 'printf "1\\n%s\\n" "$$" > "$HOME/cg/cgroup.procs"' : 'printf "1\\n" > "$HOME/cg/cgroup.procs"',
+      'split_driver_cpu "$HOME/cg" "$HOME/membership" "$HOME/spool"', 'wait', 'cd "$HOME/cg"',
+      'for f in cgroup.subtree_control shard/cgroup.type shard/cgroup.subtree_control shard/server/cgroup.type shard/driver/cgroup.type shard/server/cpu.max shard/driver/cpu.max; do echo "$f=$(cat "$f")"; done',
+      '[[ "$(cat shard/driver/cgroup.procs)" == "$$" && "$(cat shard/server/cgroup.procs)" == "$$" ]] && echo "forked from the driver group, then moved to the server group"',
+      // Permission bits only: the scratch root's setgid bit may carry into the spool.
+      '[[ -p "$HOME/spool/requests" ]] && printf "spool %o requests %o\\n" "$(( 0$(stat -c %a "$HOME/spool") & 0777 ))" "$(( 0$(stat -c %a "$HOME/spool/requests") & 0777 ))"',
+      'while read -r line; do echo "${line//"$HOME"/<home>}"; done < "$HOME/log"',
+    ].join('\n'))
+    const r = split('300000 100000')
+    expect({ status: r.status, stdout: r.stdout, stderr: r.stderr }).toEqual({ status: 0, stderr: '', stdout: [
+      'cgroup.subtree_control=+cpu', 'shard/cgroup.type=threaded', 'shard/cgroup.subtree_control=+cpu', 'shard/server/cgroup.type=threaded',
+      'shard/driver/cgroup.type=threaded', 'shard/server/cpu.max=200000 100000', 'shard/driver/cpu.max=90000 100000',
+      'forked from the driver group, then moved to the server group', 'spool 700 requests 600',
+      'chown testuser:testuser <home>/spool <home>/spool/requests', 'gosu testuser bash /tests/integration/fixtures/burst-driver.sh --serve <home>/spool', ''].join('\n') })
+    for (const [cpuMax, member, listed, message] of [
+      ['300000 100000', '0::/docker/0123abcd', true, 'the cgroup mount is not this container\'s own; a burst-driver shard needs --cgroupns private'],
+      ['300000 100000', '0::/', false, 'the cgroup mount is not this container\'s own; a burst-driver shard needs --cgroupns private'],
+      ['max 100000', '0::/', true, 'the container\'s cpu.max leaves no CPU for the burst driver'],
+      ['100000 100000', '0::/', true, 'the container\'s cpu.max leaves no CPU for the burst driver'],
+      ['', '0::/', true, 'the container\'s cpu.max leaves no CPU for the burst driver'],
+    ] as const) {
+      const refused = split(cpuMax, member, listed)
+      expect({ status: refused.status, stdout: refused.stdout, stderr: refused.stderr }).toEqual({ status: 1, stdout: '', stderr: `entrypoint.sh: ${message}\n` })
+    }
   })
 })
 
@@ -3222,6 +3465,56 @@ globalThis.fetch = async (_url, init) => {
   return Response.json({ok:true,envelope_id:id});
 };
 `))
+  // Real file permissions stand in for the kernel's checks on root-owned cgroup
+  // files, so root, which opens any of them for writing, cannot run this case;
+  // the injected-outcome tally above covers the verdict for every runner.
+  test.skipIf(process.getuid?.() === 0)('driver-cpu reads the measured server\'s cgroup and burst-driver.sh\'s record: missing in one shared quota, passing when split, missing when a guarded file opens for writing or cannot be probed', () => withCLI((root, cli) => {
+    const copy = join(root, 'tests/integration/fixtures/sr8-evidence.ts'), host = join(root, 'host')
+    let text = readFileSync(copy, 'utf8')
+    for (const [from, to] of [["const CGROUP_ROOT = '/sys/fs/cgroup'", `const CGROUP_ROOT = ${JSON.stringify(join(host, 'cgroup'))}`],
+      ['textFile(`/proc/${pid}/cgroup`)', `textFile(join(${JSON.stringify(join(host, 'proc'))}, String(pid), 'cgroup'))`]]) {
+      expect(text.split(from)).toHaveLength(2); text = text.replace(from, to)
+    }
+    writeFileSync(copy, text)
+    // Read-only files stand in for root-owned guarded files.
+    const put = (path: string, contents: string, mode = 0o444) => {
+      mkdirSync(dirname(join(host, path)), { recursive: true }); rmSync(join(host, path), { force: true }); writeFileSync(join(host, path), contents, { mode })
+    }
+    const stat = (usec: number) => `usage_usec ${usec}\nuser_usec 0\nsystem_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\n`
+    put('proc/101/cgroup', '0::/\n'); put('cgroup/cpu.max', '200000 100000\n'); put('cgroup/cpu.stat', stat(7_000)); put('cgroup/cgroup.procs', '1\n')
+    writeFileSync(join(root, 'shared'), '/\n')
+    const shared = cli('driver-cpu', ['101', join(root, 'shared')])
+    expect({ status: shared.status, stdout: shared.stdout }).toEqual({ status: 1, stdout: 'recorded: sr8 driver-cpu scenario=test-fault mode=strict population=0 recipients=2 samples=1 '
+      + 'server_cgroup=/ server_cpu_max=200000/100000 server_cpus=2 server_usage_ms=7 driver_cgroup=/ driver_cpu_max=200000/100000 driver_cpus=2 driver_usage_ms=7 shared_cpus=2 '
+      + 'guarded_files=2 writable_files=0 unprobed_files=0 limit=2 verdict=missing\n'
+      + 'recorded: sr8 summary scenario=test-fault measures=1 pass=0 fail=0 missing=1\n' })
+    put('proc/102/cgroup', '0::/shard/server\n'); put('cgroup/cpu.max', '300000 100000\n'); put('cgroup/shard/cpu.max', 'max 100000\n')
+    put('cgroup/shard/cgroup.procs', ''); put('cgroup/shard/driver/cgroup.procs', ''); put('cgroup/shard/server/cgroup.procs', '7\n')
+    put('cgroup/shard/server/cpu.max', '200000 100000\n'); put('cgroup/shard/server/cpu.stat', stat(5_000))
+    put('cgroup/shard/driver/cpu.max', '90000 100000\n'); put('cgroup/shard/driver/cpu.stat', stat(2_000))
+    writeFileSync(join(root, 'split'), '/shard/driver\n/shard/driver\n')
+    const split = cli('driver-cpu', ['102', join(root, 'split')])
+    expect({ status: split.status, stdout: split.stdout }).toEqual({ status: 0, stdout: 'recorded: sr8 driver-cpu scenario=test-fault mode=strict population=0 recipients=2 samples=2 '
+      + 'server_cgroup=/shard/server server_cpu_max=200000/100000 server_cpus=2 server_usage_ms=5 driver_cgroup=/shard/driver driver_cpu_max=90000/100000 driver_cpus=0.9 driver_usage_ms=2 shared_cpus=3 '
+      + 'guarded_files=8 writable_files=0 unprobed_files=0 limit=2 verdict=pass\n'
+      + 'recorded: sr8 summary scenario=test-fault measures=1 pass=1 fail=0 missing=0\n' })
+    // R1's escape: the server's UID able to write the parent's cgroup.procs, so it could leave its group,
+    // whether the file is also readable (0644) or write-only (0200), which a read-write probe would miss.
+    for (const mode of [0o644, 0o200]) {
+      put('cgroup/shard/cgroup.procs', '', mode)
+      expect(cli('driver-cpu', ['102', join(root, 'split')]).stdout).toContain(' guarded_files=8 writable_files=1 unprobed_files=0 limit=2 verdict=missing\n')
+    }
+    put('cgroup/shard/cgroup.procs', '')
+    // A guarded file the probe cannot open for an unexpected reason (EISDIR here) is no evidence, so missing.
+    rmSync(join(host, 'cgroup/shard/driver/cgroup.procs')); mkdirSync(join(host, 'cgroup/shard/driver/cgroup.procs'))
+    expect(cli('driver-cpu', ['102', join(root, 'split')]).stdout).toContain(' guarded_files=8 writable_files=0 unprobed_files=1 limit=2 verdict=missing\n')
+    rmSync(join(host, 'cgroup/shard/driver/cgroup.procs'), { recursive: true }); put('cgroup/shard/driver/cgroup.procs', '')
+    expect(cli('driver-cpu', ['102', join(root, 'split')]).status).toBe(0)
+    // A record cut mid-line, an absent one or a gone server is missing; a bad PID is a usage error.
+    writeFileSync(join(root, 'cut'), '/shard/driver')
+    for (const args of [['102', join(root, 'cut')], ['102', join(root, 'absent')], ['103', join(root, 'split')]]) expect(cli('driver-cpu', args).status).toBe(1)
+    expect(cli('driver-cpu', ['x', join(root, 'split')]).status).toBe(64)
+  }))
   test('burst writes wave-boundary CPU readings only when SR8_PHASE_CPU_FILE opts in, and observe reads them with the server rows', () => withCLI((root, cli) => {
     const batch = join(root, 'batches'), keys = sr8Personas(2), phases = ['roots', 'replies', 'dropped'] as const
     mkdirSync(batch); writeFileSync(join(root, 'stub'), '')
@@ -3230,18 +3523,22 @@ globalThis.fetch = async (_url, init) => {
       ...(phase === 'replies' ? { thread_ts: ts('roots', n) } : {}) } })
     for (const [phase, count] of [['roots', SR8_BURST_JOINS], ['replies', SR8_BURST_REPLIES], ['dropped', SR8_BURST_DROPPED]] as const)
       writeFileSync(join(batch, `${phase}.batch.jsonl`), lines(keys.flatMap(k => Array.from({ length: count }, (_, n) => body(k, phase, n)))))
-    // The copied CLI reads cpu.stat and each process's stat from controlled files
+    // The copied CLI reads cgroups and each process's stat from controlled files
     // under its root, never the host's: server readable, stub absent, observer malformed.
+    // The cgroup read is the server's own, not the namespace root the driver shares.
     const copy = join(root, 'tests/integration/fixtures/sr8-evidence.ts'), host = join(root, 'host')
     const reads: Array<[string, string]> = [
-      ["textFile('/sys/fs/cgroup/cpu.stat') ?? textFile('/sys/fs/cgroup/cpu/cpu.stat')", `textFile(${JSON.stringify(join(host, 'cpu.stat'))})`],
+      ["const CGROUP_ROOT = '/sys/fs/cgroup'", `const CGROUP_ROOT = ${JSON.stringify(join(host, 'cgroup'))}`],
+      ['textFile(`/proc/${pid}/cgroup`)', `textFile(join(${JSON.stringify(join(host, 'proc'))}, String(pid), 'cgroup'))`],
       ['textFile(`/proc/${pid}/stat`)', `textFile(join(${JSON.stringify(join(host, 'proc'))}, name === 'observer' ? name : String(pid), 'stat'))`],
     ]
     let text = readFileSync(copy, 'utf8')
     for (const [from, to] of reads) { expect(text.split(from)).toHaveLength(2); text = text.replace(from, to) }
     writeFileSync(copy, text)
-    mkdirSync(join(host, 'proc/101'), { recursive: true }); mkdirSync(join(host, 'proc/observer'))
-    writeFileSync(join(host, 'cpu.stat'), 'usage_usec 5000\nuser_usec 3000\nsystem_usec 2000\nnr_periods 10\nnr_throttled 2\nthrottled_usec 300\n')
+    mkdirSync(join(host, 'proc/101'), { recursive: true }); mkdirSync(join(host, 'proc/observer')); mkdirSync(join(host, 'cgroup/shard/server'), { recursive: true })
+    writeFileSync(join(host, 'proc/101/cgroup'), '0::/shard/server\n')
+    writeFileSync(join(host, 'cgroup/cpu.stat'), 'usage_usec 9\nuser_usec 9\nsystem_usec 9\nnr_periods 9\nnr_throttled 9\nthrottled_usec 9\n')
+    writeFileSync(join(host, 'cgroup/shard/server/cpu.stat'), 'usage_usec 5000\nuser_usec 3000\nsystem_usec 2000\nnr_periods 10\nnr_throttled 2\nthrottled_usec 300\n')
     writeFileSync(join(host, 'proc/101/stat'), '101 (bun (x) y) S 1 101 101 0 -1 4194304 10 0 0 0 250 75 0 0 20 0 9 0 100 0 0\n')
     writeFileSync(join(host, 'proc/observer/stat'), 'garbage\n')
     const burst = (out: string) => cli('burst', [batch, 'http://127.0.0.1:1', join(root, 'stub'), join(root, 'state'), out, '1000'])

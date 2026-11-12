@@ -10,6 +10,7 @@ source "$(dirname "$0")/lib/scenario.sh"
 
 PRINTER="${SCENARIO_FIXTURES}/fmk-texts.ts"
 SR8="${SCENARIO_FIXTURES}/sr8-evidence.ts"
+BURST_DRIVER="${SCENARIO_FIXTURES}/burst-driver.sh"
 EVIDENCE="${SCENARIO_ROOT}/evidence"
 mkdir -p "${EVIDENCE}"
 RECORD_WAIT_S=30
@@ -299,8 +300,10 @@ case "${CASE}" in
         done
         burst_status=0
         # Observer-only CPU readings at each wave boundary, for observe below.
+        # The driver runs off the server's CPU quota; driver-cpu judges that.
         SR8_PHASE_CPU_FILE="${RESULTS}/phase-cpu.jsonl" SR8_PHASE_CPU_PIDS="server=${SERVER_PID},stub=${SLACK_PID}" \
-            SR8_PROFILE_DIR="${PROFILE_DIR}" bun "${SR8}" burst "${CONTEXT[@]}" "${BATCH}" "${SCENARIO_SLACK_STUB_URL}" \
+            SR8_PROFILE_DIR="${PROFILE_DIR}" bash "${BURST_DRIVER}" "${RESULTS}/driver-cgroup" \
+            bun "${SR8}" burst "${CONTEXT[@]}" "${BATCH}" "${SCENARIO_SLACK_STUB_URL}" \
             "${SCENARIO_SLACK_RECORD}" "${SLACK_STATE_DIR}" "${RESULTS}" 30000 \
             "${MEASUREMENTS}" "${measurement_mark}" || burst_status=$?
         # The profile ends with the waves, before the observation wait below,
@@ -324,6 +327,7 @@ case "${CASE}" in
         if [[ "${mode}/${population}/${recipients}" == open/100000/2 ]]; then
             bun "${SR8}" conditions "${SLACK_STATE_DIR}" "${SERVER_PID}"
         fi
+        sr8_verdicts driver-cpu "${CONTEXT[@]}" "${SERVER_PID}" "${RESULTS}/driver-cgroup"
         clean_stop
         cp "${MEASUREMENTS}" "${RESULTS}/measurements.jsonl"
         for key in "${KEYS[@]}"; do snapshot "${key}" "${RESULTS}/${key}.queue.jsonl"; done
@@ -370,7 +374,7 @@ case "${CASE}" in
         pending_seq="$(slack_post_mark)"
         # The probes lead the burst's second wave, while the post stays pending.
         burst_status=0
-        bun "${SR8}" burst "${CONTEXT[@]}" "${BATCH}" "${SCENARIO_SLACK_STUB_URL}" \
+        bash "${BURST_DRIVER}" "${RESULTS}/driver-cgroup" bun "${SR8}" burst "${CONTEXT[@]}" "${BATCH}" "${SCENARIO_SLACK_STUB_URL}" \
             "${SCENARIO_SLACK_RECORD}" "${SLACK_STATE_DIR}" "${RESULTS}" 30000 || burst_status=$?
         # The actual measured interval includes the burst and these 120 seconds.
         # Repeated lost-post and hung-history controls retain the same unresolved intent.
@@ -394,6 +398,7 @@ case "${CASE}" in
             printf '%s\t%s\t%s\t%s\n' "${parent}" "${channel}" "${ts}" "${envelope}" >> "${EVIDENCE}/probes.tsv"
         done < "${EVIDENCE}/probe-plan.tsv"
         for persona in "${KEYS[@]}"; do snapshot "${persona}" "${RESULTS}/${persona}.queue.jsonl"; done
+        sr8_verdicts driver-cpu "${CONTEXT[@]}" "${SERVER_PID}" "${RESULTS}/driver-cgroup"
         clean_stop
         closing_assertions
         sr8_verdicts pending-post "${CONTEXT[@]}" "${key}" "${OPERATION[${key}]}" "${pending_start}" "${pending_end}" \

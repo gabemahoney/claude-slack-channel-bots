@@ -987,6 +987,46 @@ describe('shard management: shard containers (to)', () => {
       }
     })
 
+    test.each(['test-44-fmk-thread-burst.sh', 'test-45-fmk-membership-load.sh', 'test-48-fmk-membership-load-open.sh'])(
+      'a shard holding %s takes the driver’s CPU beside the server’s, docker-init, a private cgroup namespace and writable cgroups, and nothing else more',
+      async (script) => {
+        const rig = shardRig()
+        const ordinary = rig.assigned(1)
+        await rig.start(1, { assignment: { shard: 1, assigned: [ordinary[0]!, script] } })
+        await rig.start(2)
+        const [driver, plain] = rig.runs() as [readonly string[], readonly string[]]
+
+        expect(valuesOf(driver, '--cpus')).toEqual([String(e9.CPUS_PER_SHARD + e9.DRIVER_CPUS)])
+        // Its writable cgroup is always its own: a private cgroup namespace, whatever the daemon's default.
+        expect(valuesOf(driver, '--cgroupns')).toEqual(['private'])
+        expect(e9.DRIVER_SHARD_CGROUPNS).toBe('private')
+        expect(valuesOf(driver, '--security-opt')).toEqual([e9.DRIVER_SHARD_SECURITY_OPT])
+        expect(driver.filter((arg) => arg === '--init')).toEqual(['--init'])
+        // Without the driver's options and its CPU, the list is an ordinary shard's.
+        const valued = ['--security-opt', '--cgroupns']
+        const withoutDriver = driver.filter((arg, index) => arg !== '--init' && !valued.includes(arg) && !valued.includes(driver[index - 1] as string))
+        expect(valuesOf(withoutDriver, '--memory')).toEqual([String(e9.SHARD_MEMORY_CAP_BYTES)])
+        expect(withoutDriver.filter((arg) => arg.startsWith('-'))).toEqual(plain.filter((arg) => arg.startsWith('-')))
+        expect(valuesOf(plain, '--cpus')).toEqual([String(e9.CPUS_PER_SHARD)])
+        expect(plain.filter((arg) => /^--(?:init|security-opt|cgroupns)(?:=|$)/.test(arg))).toEqual([])
+      },
+    )
+
+    test('the burst-driver scripts are exactly the integration scripts that run burst-driver.sh, test-44, test-45 and test-48', () => {
+      const dir = join(import.meta.dir, 'integration')
+      const membership = readFileSync(join(dir, 'lib', 'membership-load.sh'), 'utf8')
+      expect(membership).toContain('bash "${BURST_DRIVER}"')
+      const scripts = readdirSync(dir).filter((name) => /^test-\d+-.*\.sh$/.test(name))
+      const driving = scripts.filter((name) => {
+        const text = readFileSync(join(dir, name), 'utf8')
+        return text.includes('bash "${BURST_DRIVER}"') || text.includes('lib/membership-load.sh')
+      })
+      expect(driving.sort()).toEqual(['test-44-fmk-thread-burst.sh', 'test-45-fmk-membership-load.sh', 'test-48-fmk-membership-load-open.sh'])
+      expect(scripts.filter(e9.isBurstDriverScript).sort()).toEqual(driving)
+      expect(e9.shardCpus(['test-1-install-startup.sh', ...driving])).toBe(e9.CPUS_PER_SHARD + e9.DRIVER_CPUS)
+      expect(e9.shardCpus(scripts.filter((name) => !driving.includes(name)))).toBe(e9.CPUS_PER_SHARD)
+    })
+
     test.each([
       ['no image-drift: fault: every shard from the pinned ID', {}, [PINNED_IMAGE_ID, PINNED_IMAGE_ID, PINNED_IMAGE_ID]],
       ['image-drift:2 with its build done: shard 2 from the drift image’s ID', { inject: ['image-drift:2'], drift: 'built' as const }, [PINNED_IMAGE_ID, DRIFT_IMAGE_ID, PINNED_IMAGE_ID]],

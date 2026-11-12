@@ -614,13 +614,20 @@ names it. A `cscb-ci=1` container is picked by its label, whatever its name.
 The CPU fit counts the CPUs of every other live `/ci` reservation;
 `/ci-live` adds none.
 
+A shard holding a burst-driver script (tests 44, 45 and 48) takes one more
+CPU than the 2 its server keeps, for the SR-8 burst driver (see
+[Burst-driver shards](#burst-driver-shards)). Admission comes before
+scheduling places those scripts, so for N shards it counts one more CPU for
+each of the run's burst-driver scripts, at most N; the reservation records
+the same CPUs.
+
 **The three fits.** N is the number of shards being judged:
 
 | Fit | Passes when |
 |---|---|
 | Memory | U + the commitments + N × the ordinary cap + 2 GiB per Codex shard + the 1 GiB admission margin ≤ C, and no container blocks every run |
 | Disk | (used + 1 GiB) ÷ (used + available) < 85% on the volume holding the run directory. The 1 GiB is an allowance for the run's own files; the 85% is `/ci`'s own disk line |
-| CPU | The other live reservations' CPUs + 2 × N ≤ the 12 CI CPUs |
+| CPU | The other live reservations' CPUs + 2 × N + the smaller of N and the run's burst-driver scripts ≤ the 12 CI CPUs |
 
 The disk fit uses actual allocated filesystem blocks and available space;
 it does not discount temporary usage. The tarball is packed under the run
@@ -698,8 +705,13 @@ with a 64 GiB pod limit:
   41.4 GiB, and 5 up to 43.4 GiB.
 - While a `/ci-live` run is active, C is 40 GiB and that run counts 13 GiB,
   so no `/ci` run fits once U is above 24 GiB.
-- A second default full run beside a 6-shard run is refused for CPU: the
-  6-shard run holds all 12 CI CPUs.
+- A default full run holds tests 44, 45 and 48, so it takes at most 4
+  shards: 8 + 3 = 11 CPUs, where 5 shards would need 13. A second default
+  full run beside it is refused for CPU. It is judged at its isolation
+  minimum of two shards, the dedicated Codex shard and one ordinary shard:
+  4 + 2 = 6 CPUs, with 1 free.
+- A run without those scripts takes 2 CPUs a shard, so a second default run
+  beside a 6-shard one is refused for CPU: that run holds all 12 CI CPUs.
 
 **The memory watchdog** checks U every 30 s against C less 0.5 GiB
 (53.9 GiB for a 64 GiB pod, or 39.5 GiB while `/ci-live` lowers C). At or
@@ -781,7 +793,7 @@ rename), with these keys:
 | `runId`, `pid` | the run's RUN_ID and PID |
 | `shards` | N |
 | `memoryBytes` | N × the ordinary per-shard memory cap + 2 GiB per dedicated Codex shard |
-| `cpus` | 2 × N |
+| `cpus` | 2 × N + the smaller of N and the run's burst-driver scripts |
 | `kind` | `full` or `selective` |
 
 - **Its lifetime.** A reservation lives until its run ends: the run removes
@@ -1001,12 +1013,72 @@ image's build succeeded, and from the pinned ID when it did not (see
 | `--memory` | The per-shard memory cap, in bytes | Each shard is held to the cap admission counted it at (see [The per-shard memory cap and out-of-memory kills](#the-per-shard-memory-cap-and-out-of-memory-kills) for its value and rules) |
 | `--memory-swap` | The same as `--memory` | No swap above the cap: past it the kernel kills a process inside the container instead of swapping |
 | `--pids-limit` | `2048` | Stops a fork or spawn loop inside one shard long before it reaches the host |
-| `--cpus` | `2` | The CPUs admission reserves per shard (see [Admission: memory, disk and CPU](#admission-memory-disk-and-cpu) for the CPU budget) |
+| `--cpus` | `2`, or `3` for a burst-driver shard | The CPUs admission reserves per shard (see [Admission: memory, disk and CPU](#admission-memory-disk-and-cpu) for the CPU budget) |
 
 **Isolation.** A shard is on the default network only. No list sets
 `--network`, `--privileged`, or a PID, IPC or network namespace shared with
 the host or another container. No list sets `--rm` either: a shard never
 removes itself, and only the runner removes it, after its final reading.
+
+#### Burst-driver shards
+
+A shard holding test 44, 45 or 48 (`BURST_DRIVER_SCRIPTS` in
+`scripts/ci-run.ts`) keeps the SR-8 burst driver, the test's own load
+generator, off the CPU quota of the server it measures. Its `docker run` adds
+four things to an ordinary shard's:
+
+| Flag | Why |
+|---|---|
+| `--cpus 3` | The server keeps the 2 CPUs of quota every shard has; the third is the driver's |
+| `--cgroupns private` | The cgroup the shard sees, and may write, is its own, whatever the daemon's default namespace mode |
+| `--security-opt writable-cgroups=true` | The entrypoint can make CPU groups inside the container's own cgroup, with no added capability |
+| `--init` | Docker's init is PID 1, so the container's main process stays in the container's cgroup, where the runner reads its memory and PIDs |
+
+The Docker daemon must support `writable-cgroups` (Docker 29 does); one that
+does not refuses the `docker run`, and the shard fails to start. Ordinary
+shards keep the read-only cgroup.
+
+`docker/entrypoint.sh` refuses, and the shard fails, unless its cgroup view is
+the container's own: the entrypoint at its namespace's root (`0::/`), listed in
+the mount root's `cgroup.procs`. It then splits the container's cgroup with
+the threaded `cpu` controller:
+
+- Everything it starts, the in-container runner, scripts, Slack stub and
+  server alike, runs in `shard/server` at `cpu.max` 200000/100000, the same
+  2 CPUs as before.
+- The driver's launcher, `tests/integration/fixtures/burst-driver.sh --serve`,
+  is born in `shard/driver`, at 0.9 of the third CPU, and runs as testuser. A
+  test's `burst-driver.sh` passes it each driver run, which starts there, so
+  nothing migrates. A request names a record path, one of the
+  `sr8-evidence.ts` driver commands (`burst`, `fault-burst`,
+  `fault-recover`) with its arguments, and at most the fields `SCENARIO_ROOT`,
+  `SR8_PHASE_CPU_FILE`, `SR8_PHASE_CPU_PIDS` and `SR8_PROFILE_DIR`. The
+  launcher refuses anything else with status 64 and starts nothing.
+  It runs the image's root-owned `/usr/local/bin/bun` on the fixtures'
+  `sr8-evidence.ts` itself, with the arguments unevaluated, from `/`, with
+  its own `PATH`, `HOME=/` and no Bun options. No program, search path,
+  preload, `bunfig.toml`, `.env` file or other loader setting comes from the
+  caller. It serves only while that Bun, the fixtures directory and
+  `sr8-evidence.ts` are root-owned and writable by no one else.
+  Like the server, the driver imports the installed package under test,
+  which test-1 installs as testuser. The launcher limits what a request can
+  start, not what testuser's own files hold.
+- testuser, the server's UID, owns no cgroup file, so it cannot move any
+  process into another group or change any limit. Only the entrypoint runs as
+  root, and it creates the groups and places the launcher before it drops to
+  testuser.
+- The 0.1 CPU left is headroom. It makes it rare for the container's 3-CPU
+  quota to throttle the server's group, but does not prevent it: the control
+  probes recorded 5 ms and 1.1 s of container-level throttling under
+  saturated loops. When a slow ACK is diagnosed, container-level throttling
+  remains a possible cause.
+
+Memory, PID and OOM figures stay the container's, as in any shard. While the
+measured server runs, the script's `driver-cpu` verdict checks the placement,
+the configured quotas and the server's UID's permissions (a write-only open of
+each guarded cgroup file must be refused; any other probe error is missing),
+not throttling (see
+[Thread Memory performance runs](../docs/testing-guide.md#thread-memory-performance-runs)).
 
 **Mounts.** Each mount is a `--mount type=bind,...`, never `-v`, so Docker
 never creates a missing source: every source is a file or directory the
@@ -1079,7 +1151,9 @@ same order, each step after the one before:
 4. Its removal, never forced.
 
 There is no graceful stop: the in-container runner is the container's PID 1
-and ignores SIGTERM, so SIGTERM is never sent. A failed SIGKILL or log save is
+and ignores SIGTERM, so SIGTERM is never sent. (In a burst-driver shard
+Docker's init is PID 1 and would pass SIGTERM on to the runner; it is never
+sent there either.) A failed SIGKILL or log save is
 written to the runner log, and the removal still follows. A shard retired at
 its limit whose `result.txt` already holds its end marker is retired at its
 end marker instead, never as over its limit.

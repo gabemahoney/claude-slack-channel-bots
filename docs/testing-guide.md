@@ -523,6 +523,38 @@ thread phase of
 socket, and stores on the container's real scratch storage; unit or simulated
 runs do not supply this evidence.
 
+The bounds measure CSCB, so the tests' own burst driver (`sr8-evidence.ts`
+`burst`, `fault-burst` and `fault-recover`) runs off the measured server's
+CPU quota. Tests 44, 45 and 48 run in
+[burst-driver shards](../docker/README.md#burst-driver-shards): the server
+keeps 2 CPUs of `cpu.max` quota, as in every shard, shared as before with the
+Slack stub, the scripts and the runner. `tests/integration/fixtures/burst-driver.sh`
+hands each driver run to a launcher born in its own group beside the server's,
+at 0.9 of the shard's third CPU, and the cgroup each run ran in is recorded.
+
+The launcher takes only one of the three driver commands, its arguments, a
+record path, and the `SCENARIO_ROOT` and three `SR8_*` profiling fields. It
+runs the image's root-owned Bun itself, from `/`, with its own `PATH` and
+`HOME`, so a caller's `PATH`, Bun options, preload, `bunfig.toml` or `.env`
+file never reaches the driver. The server's UID owns no cgroup file, so
+nothing it runs can change group or limit.
+
+While the measured server still runs, `driver-cpu` reads that record and the
+server's cgroup. As the server's UID, from the server's group, it opens every
+guarded cgroup file on both paths write-only, and writes nothing. It passes
+only when:
+
+- the server's quota is 2 CPUs and the driver's is finite;
+- every cgroup holding both allows both;
+- every present guarded file refused the open.
+
+A driver in the server's group or quota, a guarded file that opened (even a
+write-only one), a probe error other than a refusal, or an unreadable
+placement is missing. It checks placement, configured quotas and permissions,
+not throttling. The 0.1 CPU left is headroom, so the container's quota rarely
+throttles the server's group, but it can, and a passing control does not rule
+that out.
+
 Take populations and burst counts from `tests/test-helpers/thread-populations.ts`:
 0, 10,000 and 100,000 Joined Threads per persona across 100 eligible
 `thread_hybrid` channels, in both `strict` and `open` Channel Modes, with one
@@ -690,12 +722,17 @@ Read results against the `recorded: sr8 conditions` line: Bun version, CPUs,
 cgroup memory limit, filesystem type, the state directory's mount and server
 peak RSS. Test 44 captures its largest two-recipient open-mode burst, Tests 45
 and 48 capture each case, and Test 32 captures each mode's thread phase while
-its measured server still exists. Tests 45 and 48 also add the cgroup's
-`cpu.max` and its throttling deltas since the case's start (`unknown` when
-unreadable). The fixture's output forms are:
+its measured server still exists. Tests 45 and 48 also add the server's
+cgroup's `cpu.max`, its 2 CPUs, and that cgroup's throttling deltas since the
+case's start (`unknown` when unreadable). Tests 44, 45 and 48 follow each
+driver run with `driver-cpu`, which records where the driver and the server
+ran, how many guarded cgroup files a write-only open by the server's UID
+reached and how many it could not probe. The
+fixture's output forms are:
 
 ```text
 recorded: sr8 conditions bun=<version> cpus=<count> memory_limit=<limit> fs_type=<type> state_dir_mount=<mount> peak_rss_kib=<KiB>[ cpu_max=<quota|max>/<period> nr_periods_delta=<n> nr_throttled_delta=<n> throttled_usec_delta=<usec>]
+recorded: sr8 driver-cpu scenario=<scenario> mode=<strict|open> population=<joins-per-persona> recipients=<1|2> samples=<driver runs> server_cgroup=<path> server_cpu_max=<quota|max>/<period> server_cpus=<n> server_usage_ms=<ms> driver_cgroup=<path> driver_cpu_max=<quota|max>/<period> driver_cpus=<n> driver_usage_ms=<ms> shared_cpus=<n|none> guarded_files=<n> writable_files=<n> unprobed_files=<n> limit=2 verdict=<pass|missing>
 recorded: sr8 <measure> scenario=<scenario> mode=<strict|open> population=<joins-per-persona> recipients=<1|2> samples=<count> <statistics> limit=<limit> verdict=<pass|fail|missing|recorded>
 recorded: sr8 summary scenario=<scenario> measures=<count> pass=<count> fail=<count> missing=<count>
 recorded: sr8 membership-fault-row case=<case> source=<fault|fault-settled|api|scan|stub> <fields>
@@ -730,6 +767,10 @@ list and command-specific requirements; its common missing cases are:
 - An absent hung N2 sample or accepted/fixed record for its key/sequence number.
 - An absent fired fault for either the hung or delayed lookup sample.
 - Absent external startup timestamps or N3 idle-window observations.
+- A burst driver run inside the server's CPU quota, a guarded cgroup file the
+  server's UID can open write-only, a probe error other than a refusal, or an
+  unread driver or server placement
+  (`driver-cpu`).
 
 ## Fixture Patterns
 

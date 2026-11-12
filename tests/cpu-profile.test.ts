@@ -1043,8 +1043,11 @@ describe('cpu-profile opt-in', () => {
     const shells = (readdirSync(integration, { recursive: true }) as string[]).filter(f => f.endsWith('.sh'))
     const opted = /cpu-profile|CSCB_TEST_CPU_PROFILE_DIR|SR8_PROFILE_DIR|BUN_OPTIONS/
     // test-48 shares membership-load.sh but never passes its --cpu-profile option.
+    // burst-driver.sh only forwards the caller's SR8_PROFILE_DIR to the driver it launches; it sets none.
     expect(shells.filter(f => opted.test(readFileSync(join(integration, f), 'utf8'))).sort())
-      .toEqual(['lib/membership-load.sh', 'test-32-fmk-real-order.sh', 'test-44-fmk-thread-burst.sh', 'test-45-fmk-membership-load.sh'])
+      .toEqual(['fixtures/burst-driver.sh', 'lib/membership-load.sh', 'test-32-fmk-real-order.sh', 'test-44-fmk-thread-burst.sh', 'test-45-fmk-membership-load.sh'])
+    const forwarder = readFileSync(join(integration, 'fixtures/burst-driver.sh'), 'utf8')
+    expect(forwarder.split('\n').filter(line => opted.test(line))).toEqual(['DRIVER_ENV=(SCENARIO_ROOT SR8_PHASE_CPU_FILE SR8_PHASE_CPU_PIDS SR8_PROFILE_DIR)'])
     expect(shells.filter(f => readFileSync(join(integration, f), 'utf8').includes('--cpu-profile')).sort())
       .toEqual(['lib/membership-load.sh', 'test-45-fmk-membership-load.sh'])
     expect(T45.match(/^run_membership_load .*$/gm)).toEqual(['run_membership_load strict --cpu-profile first-hang'])
@@ -1063,7 +1066,8 @@ describe('cpu-profile opt-in', () => {
     expect(shellFunction(LOAD, 'membership_profile_open')).toContain('[[ -n "${MEMBERSHIP_PROFILE_CASE}" && "${CASE_KIND}" == "${MEMBERSHIP_PROFILE_CASE}" ]] || return 0\n')
     expect(T32.match(/PROFILE_DIR="\$\{REAL_THREAD_EVIDENCE\}/g)).toHaveLength(1)
     // The burst's wave marks reach only test-45's fault burst.
-    expect(LOAD.match(/SR8_PROFILE_DIR=.*$/gm)).toEqual(['SR8_PROFILE_DIR="${MEMBERSHIP_PROFILE_DIR}" bun "${E}" fault-burst "${C[@]}" "${OUT}" "${SCENARIO_SLACK_STUB_URL}" "${SCENARIO_SLACK_RECORD}" \\'])
+    expect(LOAD.match(/SR8_PROFILE_DIR=.*$/gm)).toEqual(['SR8_PROFILE_DIR="${MEMBERSHIP_PROFILE_DIR}" bash "${BURST_DRIVER}" "${OUT}/driver-cgroup" \\'])
+    expect(LOAD).toContain('"${OUT}/driver-cgroup" \\\n                bun "${E}" fault-burst "${C[@]}" "${OUT}" ')
     expect(T32).not.toContain('SR8_PROFILE_DIR')
     const src = (readdirSync(join(REPO, 'src'), { recursive: true }) as string[]).filter(f => /\.[cm]?[jt]s$/.test(f))
     expect(src.filter(f => /cpu-profile|CSCB_TEST_CPU_PROFILE_DIR|SR8_PROFILE_DIR|Profiler\./.test(readFileSync(join(REPO, 'src', f), 'utf8')))).toEqual([])
