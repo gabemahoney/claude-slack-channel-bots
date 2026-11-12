@@ -13,6 +13,7 @@ import {
   sharedChannelPath, withThreadMemoryCreated, writeSharedState,
 } from './test-helpers/shared-channels.ts'
 import { osTempDir } from './test-helpers/host-safe-env.ts'
+import { spyOnCopies } from './test-helpers/copies.ts'
 
 let root: string
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'shared-authority-')) })
@@ -137,12 +138,14 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     const join = { event: 'join', identity: 'app', channel: 'C0TEST001', member: true, boundary: 0 }
     expect(authority.observeMembership('alpha', authority.incarnation('alpha')!, join, authority.revision).kind).toBe('applied')
     const before = authority.snapshot()
-    const clones = spyOn(globalThis, 'structuredClone')
+    const copies = spyOnCopies()
     let alpha: ReturnType<typeof authority.personaSnapshot>
     try {
       alpha = authority.personaSnapshot('alpha')
-      expect(clones.mock.calls).toEqual([[before.personas['alpha']]])
-    } finally { clones.mockRestore() }
+      expect(copies.values).toEqual([before.personas['alpha']])
+      // t3.yiv.sf.ws.ih: field by field, not through a structured clone's serialisation.
+      expect(copies.serialised).toBe(0)
+    } finally { copies.restore() }
     expect(alpha).toEqual(before.personas['alpha'])
     alpha!.assignments = {}; alpha!.membershipEvents['join']!.channel = 'C0FORGED'; alpha!.incarnation = 'forged-life'
     expect(authority.snapshot()).toEqual(before)
@@ -536,7 +539,7 @@ test('the production reader refuses malformed typed evidence without dumping ide
 
 import { closeSync, fsyncSync, openSync, readdirSync, renameSync, unlinkSync, writeSync } from 'node:fs'
 import type { DurableWriteFs } from '../src/atomic-write.ts'
-import { applySharedMembership, SHARED_CHANNEL_FORMAT, type SharedChannelAuthority, type SharedChannelDeps, type VerifiedSharedMembership } from '../src/shared-channels.ts'
+import { applySharedMembership, applySharedMemberships, SHARED_CHANNEL_FORMAT, sharedAppliedConfig, type SharedChannelAuthority, type SharedChannelDeps, type VerifiedSharedMembership } from '../src/shared-channels.ts'
 import { channelPopulation } from './test-helpers/shared-channels.ts'
 import { SR8_SHARED_LIST_CHANNELS } from './test-helpers/thread-memory.ts'
 describe('membership transactions copy only their persona', () => {
@@ -589,13 +592,13 @@ describe('membership transactions copy only their persona', () => {
   }
 
   test('a membership history commits the bytes, outcomes, publications and observer order of whole-state transactions', () => {
-    const clones = spyOn(globalThis, 'structuredClone')
+    const clones = spyOnCopies()
     const runs = [false, true].map(whole => {
-      clones.mockClear()
+      clones.clear()
       const run = historyRun(join(root, whole ? 'whole' : 'narrow'), whole)
-      return { ...run, results: membershipHistory(run.authority), copies: clones.mock.calls.filter(([value]) => wholeState(value)).length }
+      return { ...run, results: membershipHistory(run.authority), copies: clones.values.filter(wholeState).length }
     })
-    clones.mockRestore()
+    clones.restore()
     const [narrow, whole] = runs as [typeof runs[0], typeof runs[0]]
     // The paths differ: the bot attempt's two writes copy the whole state on
     // both; whole-state membership adds one copy per write and one for the refusal.
@@ -610,6 +613,52 @@ describe('membership transactions copy only their persona', () => {
     expect(readFileSync(narrow.authority.path)).toEqual(readFileSync(whole.authority.path))
     expect(parseSharedChannelState(readFileSync(narrow.authority.path), narrow.authority.path)).toEqual(narrow.authority.snapshot())
     check([narrow.seen, narrow.authority.snapshot()])
+  })
+
+  // t3.yiv.sf.ws.ih: each observation of a batch rebuilt the persona's raw
+  // channel list from all its assignments, though only the last list survives.
+  test('a batch of mixed observations commits the bytes, outcomes and publications of one application per observation, deriving the raw channel list once', () => {
+    const seen = (authority: SharedChannelAuthority, key: string, channel: string, member: boolean, event: string, observedThrough?: string): VerifiedSharedMembership => ({
+      event, identity: 'app', channel, member, boundary: boundaryOf(authority, key, channel),
+      ...(observedThrough === undefined ? {} : { observedThrough, channelType: 'channel', isExtSharedChannel: false }),
+    })
+    const batches: Array<[string, (authority: SharedChannelAuthority) => VerifiedSharedMembership[]]> = [
+      ['alpha', a => [seen(a, 'alpha', 'C0TEST002', true, 'EvB1J2'), seen(a, 'alpha', 'C0TEST001', false, 'EvB1L1'),
+        seen(a, 'alpha', 'C0TEST003', true, 'EvB1J3', '1700000000.000'), seen(a, 'alpha', 'C0TEST004', true, 'EvB1J4')]],
+      ['alpha', a => [seen(a, 'alpha', 'C0TEST001', true, 'EvB2J1'), seen(a, 'alpha', 'C0TEST002', true, 'EvB2J2', '1700000001.000'), seen(a, 'alpha', 'C0TEST003', false, 'EvB2L3')]],
+      // An obsolete boundary after an applicable observation refuses the whole batch.
+      ['alpha', a => [seen(a, 'alpha', 'C0TEST005', true, 'EvB3J5'), { ...seen(a, 'alpha', 'C0TEST004', false, 'EvB3L4'), boundary: 999 }]],
+      ['beta', a => [seen(a, 'beta', 'C0TEST001', false, 'EvB4L1'), seen(a, 'beta', 'C0TEST006', true, 'EvB4J6'), seen(a, 'beta', 'C0TEST007', true, 'EvB4J7')]],
+      ['alpha', a => [seen(a, 'alpha', 'C0TEST004', false, 'EvB5L4'), seen(a, 'alpha', 'C0TEST005', true, 'EvB5J5')]],
+    ]
+    const runs = [false, true].map(batched => {
+      const run = historyRun(join(root, batched ? 'batched' : 'single'), false)
+      const { authority } = run
+      let minted = 0
+      const mint = () => `minted-${++minted}`
+      const entries = spyOn(Object, 'entries'), derivations: number[] = []
+      try {
+        const results = batches.map(([key, of]) => {
+          const staged = of(authority), incarnation = authority.incarnation(key)!
+          return authority.transactMembership(key, authority.revision, (next, order) => {
+            const assignments = next.personas[key]!.assignments, first = order - staged.length + 1, before = entries.mock.calls.length
+            if (batched) applySharedMemberships(next, first, key, incarnation, staged, mint)
+            else staged.forEach((observation, index) => applySharedMembership(next, first + index, key, incarnation, observation, mint))
+            derivations.push(entries.mock.calls.slice(before).filter(([value]) => value === assignments).length)
+          }, staged.length)
+        })
+        return { ...run, results, derivations, minted }
+      } finally { entries.mockRestore() }
+    })
+    const [single, batched] = runs as [typeof runs[0], typeof runs[0]]
+    expect(single.results.map(result => result.kind)).toEqual(['applied', 'applied', 'failed', 'applied', 'applied'])
+    expect(batched.results).toEqual(single.results)
+    expect([batched.minted, batched.writes, batched.seen]).toEqual([single.minted, single.writes, single.seen])
+    expect(batched.authority.snapshot()).toEqual(single.authority.snapshot())
+    expect(readFileSync(batched.authority.path)).toEqual(readFileSync(single.authority.path))
+    // One raw channel list per applied observation before; one per batch now.
+    expect([single.derivations, batched.derivations]).toEqual([[4, 3, 3, 2], [1, 1, 1, 1]])
+    check([batched.seen, batched.authority.snapshot()])
   })
 
   test.each([true, false])('a saved empty source keeps its removal proof after rejoin: reject deletion without writing or publishing (whole=%p)', whole => {
@@ -741,16 +790,16 @@ describe('membership transactions copy only their persona', () => {
     const persona = (key: string) => authority.inspectMembershipHistory(key, life => life as never) as SharedChannelState['personas'][string]
     const setup = `scan:setup:${ids[0]}`
     const [alpha, beta] = [persona('alpha'), persona('beta')]
-    const clones = spyOn(globalThis, 'structuredClone'), parses = spyOn(JSON, 'parse')
+    const clones = spyOnCopies(), parses = spyOn(JSON, 'parse')
     let outcomes: string[], copies: number, reparses: number, untouched: unknown
     try {
       outcomes = [...ids.slice(1, 6).map(channel => observe(authority, 'alpha', channel, false, `EvLEAVE${channel}`)),
         ...ids.slice(1, 6).map(channel => observe(authority, 'alpha', channel, true, `EvREJOIN${channel}`))].map(outcome => outcome.kind)
       untouched = persona('beta')
       outcomes.push(observe(authority, 'beta', 'C0TEST009', true, 'EvBETA').kind)
-      copies = clones.mock.calls.filter(([value]) => wholeState(value)).length
+      copies = clones.values.filter(wholeState).length
       reparses = parses.mock.calls.filter(([text]) => typeof text === 'string' && text.length >= size).length
-    } finally { clones.mockRestore(); parses.mockRestore() }
+    } finally { clones.restore(); parses.mockRestore() }
     expect({ outcomes, copies, reparses }).toEqual({ outcomes: outcomes.map(() => 'applied'), copies: 0, reparses: 0 })
     // Another persona's outcomes share this one whole, and their own untouched records.
     expect(untouched).toBe(beta)
@@ -759,8 +808,247 @@ describe('membership transactions copy only their persona', () => {
     expect(readSharedState(root)).toEqual(authority.snapshot())
     check(authority.snapshot())
   })
-})
 
+  // t3.yiv.sf.ws.ih: every commit encoded the whole state as pretty JSON again,
+  // though a membership commit shares all but one persona's changed records.
+  test('membership commits beside SR8_SHARED_LIST_CHANNELS channels per persona write the native pretty JSON of each state, encoding only what they changed', () => {
+    function populated(dir: string, whole: boolean) {
+      mkdirSync(dir)
+      const config = input(); config.channel_mode = 'open'
+      const state = initialSharedState(root, config)
+      writeSharedState(dir, state)
+      const writes: Buffer[] = []
+      let since = 0
+      const authority = createSharedChannelAuthority(sharedChannelPath(dir), state, {
+        write(path, bytes) { writes.push(Buffer.from(bytes)); durableWriteFileSync(path, bytes) }, threadHybridSince: () => `since-${++since}`,
+      })
+      const ids = channelPopulation(SR8_SHARED_LIST_CHANNELS).map(channel => channel.id)
+      for (const key of ['alpha', 'beta']) {
+        expect(authority.transact(authority.revision, (next, order) => {
+          let position = order - ids.length
+          for (const channel of ids) applySharedMembership(next, ++position, key, authority.incarnation(key)!, { ...joinOf(channel, `scan:setup:${channel}`), channelType: 'channel', isExtSharedChannel: false })
+        }, ids.length).kind).toBe('applied')
+      }
+      if (whole) authority.transactMembership = (key, revision, change, span) => authority.transact(revision, change, span)
+      return { authority, writes, ids }
+    }
+    const steps = (authority: SharedChannelAuthority, ids: string[]): Array<[string, () => unknown]> => {
+      const store = createChannelDeliveryStore(authority, () => true)
+      return [
+        // The first membership commit over a state that \`transact\` installed encodes it whole.
+        ['first', () => observe(authority, 'alpha', ids[0]!, false, 'EvFIRST')],
+        ...ids.slice(1, 6).map((channel): [string, () => unknown] => ['membership', () => observe(authority, 'alpha', channel, false, `EvLEAVE${channel}`)]),
+        ['membership', () => page(authority, 'beta', ['C0TEST001', 'C0TEST002', ids[7]!], 'beta')],
+        ...ids.slice(1, 4).map((channel): [string, () => unknown] => ['membership', () => observe(authority, 'alpha', channel, true, `EvREJOIN${channel}`)]),
+        ['duplicate', () => observe(authority, 'alpha', ids[1]!, true, `EvREJOIN${ids[1]}`)],
+        ['refused', () => authority.transactMembership('alpha', authority.revision, () => { throw new Error('refused') })],
+        ['membership', () => page(authority, 'alpha', ['C0TEST002'], 'alpha')],
+        ['attempt', () => store.attempt('alpha', authority.incarnation('alpha')!, deliveryAttempt('encoded-attempt', 'C0TEST002', 'thread_hybrid'), () => undefined)],
+        ['first', () => observe(authority, 'beta', ids[8]!, false, 'EvAFTERATTEMPT')],
+        ['membership', () => observe(authority, 'alpha', 'C0TEST009', true, 'EvNEW')],
+        ['membership', () => observe(authority, 'beta', ids[8]!, true, 'EvREJOINBETA')],
+      ]
+    }
+    const rawInput = (value: unknown) => typeof value === 'object' && value !== null && Array.isArray((value as { personas?: unknown }).personas) && !wholeState(value)
+    const runs = [false, true].map(whole => {
+      const { authority, writes, ids } = populated(join(root, whole ? 'whole' : 'narrow'), whole)
+      const size = readFileSync(authority.path).length, start = writes.length
+      const encodes = spyOn(JSON, 'stringify')
+      const measured: Array<{ kind: string; writes: number; encoded: number }> = []
+      const results: unknown[] = []
+      try {
+        for (const [kind, step] of steps(authority, ids)) {
+          const calls = encodes.mock.results.length, before = writes.length
+          results.push(step())
+          // Pretty encodings of state objects; validation still encodes the applied configuration input whole.
+          const encoded = encodes.mock.calls.slice(calls).reduce((sum, [value, , space], i) => sum +
+            (space === 2 && !rawInput(value) && typeof encodes.mock.results[calls + i]!.value === 'string' ? (encodes.mock.results[calls + i]!.value as string).length : 0), 0)
+          measured.push({ kind, writes: writes.length - before, encoded })
+          // The bytes written last are the native pretty JSON of the installed state.
+          if (writes.length > before) expect(writes.at(-1)!.toString()).toBe(JSON.stringify(authority.snapshot(), null, 2) + '\n')
+        }
+      } finally { encodes.mockRestore() }
+      return { authority, results, writes: writes.slice(start), measured, size }
+    })
+    const [narrow, whole] = runs as [typeof runs[0], typeof runs[0]]
+    expect(narrow.results.map(result => (result as { kind: string }).kind)).toEqual([
+      'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'failed', 'applied', 'applied', 'applied', 'applied', 'applied'])
+    expect(narrow.results).toEqual(whole.results)
+    expect(narrow.writes).toEqual(whole.writes)
+    expect(readFileSync(narrow.authority.path)).toEqual(readFileSync(whole.authority.path))
+    const steady = (run: typeof narrow) => run.measured.filter(step => step.kind === 'membership')
+    console.info(`membership commit encoding size=${narrow.size} narrow=${steady(narrow).map(step => step.encoded).join(' ')} whole=${steady(whole).map(step => step.encoded).join(' ')} first=${narrow.measured.filter(step => step.kind === 'first').map(step => step.encoded).join(' ')}`)
+    for (const run of [narrow, whole]) {
+      expect(steady(run).every(step => step.writes === 1)).toBe(true)
+      expect(run.measured.filter(step => step.kind === 'duplicate' || step.kind === 'refused').map(step => step.writes)).toEqual([0, 0])
+    }
+    // A whole encoding per commit fails the bound. A commit now encodes the records it changed, and once
+    // a container's members: the first time a commit copies it after it was encoded whole (beta's page
+    // and alpha's first new assignment here).
+    expect(steady(whole).every(step => step.encoded >= narrow.size)).toBe(true)
+    const encoded = steady(narrow).map(step => step.encoded)
+    expect(encoded.every(chars => chars < narrow.size / 2)).toBe(true)
+    expect(encoded.map(chars => chars < narrow.size / 10)).toEqual(encoded.map((_, i) => i !== 5 && i !== 10))
+    check(narrow.authority.snapshot())
+  })
+
+  // t3.yiv.sf.ws.ih: each recipient of a commit parsed the applied
+  // configuration again, including the listeners that read none of it.
+  test('commits give each configuration reader its own copy of the configuration they validated, and call configuration-free listeners in subscription order with none', () => {
+    const dir = join(root, 'listeners'); mkdirSync(dir)
+    const config = input(); config.channel_mode = 'open'
+    const state = initialSharedState(root, config)
+    writeSharedState(dir, state)
+    const authority = createSharedChannelAuthority(sharedChannelPath(dir), state, { threadHybridSince: () => 'since' })
+    type Config = ReturnType<typeof authority.config>
+    const calls: Array<[string, number]> = [], received: Array<{ config: Config; state: SharedChannelState }> = []
+    const reader = (name: string) => (config: Config) => { calls.push([name, 1]); received.push({ config, state: authority.snapshot() }) }
+    authority.subscribe(reader('first'))
+    authority.subscribeChange((...args: unknown[]) => { calls.push(['plain', args.length]) })
+    authority.subscribe(reader('second'))
+    const late = authority.subscribeChange((...args: unknown[]) => { calls.push(['late', args.length]) })
+    const publish = reader('publish')
+    const beta = (next: SharedChannelState, order: number) => applySharedMembership(next, order, 'beta', authority.incarnation('beta')!, joinOf('C0TEST003', 'EvBETA'))
+    const parses = spyOn(authority, 'config'), copies = spyOnCopies()
+    // A parsed configuration, not the raw applied input that whole-state copies carry.
+    const configCopy = (value: unknown) => typeof value === 'object' && value !== null && !wholeState(value) && 'reply_chunk_limit' in value &&
+      Array.isArray((value as Config).personas) && (value as Config).personas.every(persona => typeof persona.key === 'string')
+    let results: string[], parsed: number, copied: number[]
+    try {
+      const counted = (step: () => { kind: string }) => { const before = copies.values.filter(configCopy).length; const kind = step().kind; return [kind, copies.values.filter(configCopy).length - before] as const }
+      const steps = [
+        counted(() => observe(authority, 'alpha', 'C0TEST001', true, 'EvJOIN')),
+        counted(() => authority.transact(authority.revision, beta, 1, publish)),
+        // A metadata commit publishes the configuration but notifies no listener.
+        counted(() => authority.transact(authority.revision, next => { next.threadMemoryCreated = { alpha: true } }, 1, publish)),
+        counted(() => { late(); return observe(authority, 'alpha', 'C0TEST001', false, 'EvLEAVE') }),
+      ]
+      results = steps.map(([kind]) => kind)
+      copied = steps.map(([, count]) => count)
+      parsed = parses.mock.calls.length
+    } finally { copies.restore(); parses.mockRestore() }
+    expect(results).toEqual(['applied', 'applied', 'applied', 'applied'])
+    // One parse per recipient before; now the commit's own validated configuration, copied for the publisher and for all but its last reader.
+    expect({ parsed, copied }).toEqual({ parsed: 0, copied: [1, 2, 1, 1] })
+    const first: [string, number] = ['first', 1], plain: [string, number] = ['plain', 0], second: [string, number] = ['second', 1], publisher: [string, number] = ['publish', 1]
+    expect(calls).toEqual([first, plain, second, ['late', 0], publisher, first, plain, second, ['late', 0], publisher, first, plain, second])
+    // Every recipient owns its configuration: what parsing the installed state gives.
+    const configs = received.map(({ config }) => config)
+    expect(new Set(configs).size).toBe(configs.length)
+    expect(new Set(configs.map(config => config.personas[0])).size).toBe(configs.length)
+    expect(new Set(received.map(({ state }) => state.revision)).size).toBe(4)
+    for (const { config, state } of received) expect(config).toEqual(sharedAppliedConfig(state, authority.path))
+    configs[0]!.personas.length = 0
+    expect(configs[1]!.personas).toHaveLength(2)
+    check(authority.snapshot())
+  })
+
+  function openAuthority(name: string) {
+    const dir = join(root, name); mkdirSync(dir)
+    const config = input(); config.channel_mode = 'open'
+    const state = initialSharedState(root, config)
+    writeSharedState(dir, state)
+    return createSharedChannelAuthority(sharedChannelPath(dir), state, { threadHybridSince: () => 'since' })
+  }
+  const joinBeta = (authority: SharedChannelAuthority) => (next: SharedChannelState, order: number) =>
+    applySharedMembership(next, order, 'beta', authority.incarnation('beta')!, joinOf('C0TEST003', 'EvBETA'))
+
+  // review-r1 R2: commits took their listeners before the publisher and the
+  // thread-view callbacks ran, as the old path did after them, so a listener
+  // those callbacks removed still ran and one they added did not.
+  test('a commit notifies the listeners subscribed once its publisher and thread-view callbacks have run, each reader with its own configuration', () => {
+    const authority = openAuthority('boundary')
+    type Config = ReturnType<typeof authority.config>
+    const calls: string[] = [], received: Array<{ name: string; config: Config; state: SharedChannelState }> = []
+    const reader = (name: string) => (config: Config) => { calls.push(name); received.push({ name, config, state: authority.snapshot() }) }
+    const plain = (name: string) => () => { calls.push(name) }
+    let phase = ''
+    const removedByPublisher = authority.subscribe(reader('removed by publisher'))
+    const removedByView = authority.subscribeChange(plain('removed by view'))
+    const kept = authority.subscribe(reader('kept'))
+    authority.subscribeThreadView(() => {
+      calls.push(`view: ${phase}`)
+      if (phase === 'publisher commit') { removedByView(); authority.subscribe(reader('added by view')) }
+      else { kept(); authority.subscribeChange(plain('added by view again')) }
+    })
+    const publish = (config: Config) => {
+      calls.push('publisher')
+      received.push({ name: 'publisher', config, state: authority.snapshot() })
+      removedByPublisher(); authority.subscribeChange(plain('added by publisher')); authority.subscribe(reader('reader added by publisher'))
+      config.personas.length = 0
+    }
+    phase = 'publisher commit'
+    expect(authority.transact(authority.revision, joinBeta(authority), 1, publish).kind).toBe('applied')
+    const first = calls.splice(0)
+    phase = 'membership commit'
+    expect(observe(authority, 'alpha', 'C0TEST001', true, 'EvJOIN').kind).toBe('applied')
+    // The old path's recipients: the listeners as subscribed after both callbacks.
+    expect([first, calls]).toEqual([
+      ['publisher', 'view: publisher commit', 'kept', 'added by publisher', 'reader added by publisher', 'added by view'],
+      ['view: membership commit', 'added by publisher', 'reader added by publisher', 'added by view', 'added by view again'],
+    ])
+    // Each recipient owns what parsing its installed state gives; the publisher changed only its own copy.
+    const configs = received.map(({ config }) => config)
+    expect(new Set(configs).size).toBe(configs.length)
+    expect(received.map(({ name, state }) => [name, state.revision])).toEqual([['publisher', 2], ['kept', 2], ['reader added by publisher', 2], ['added by view', 2], ['reader added by publisher', 3], ['added by view', 3]])
+    expect(configs[0]!.personas).toHaveLength(0)
+    for (const { config, state } of received.slice(1)) expect(config).toEqual(sharedAppliedConfig(state, authority.path))
+    check(authority.snapshot())
+  })
+
+  test('a publisher\'s configuration is its own when it subscribes the commit\'s only reader', () => {
+    const authority = openAuthority('lone-publisher')
+    type Config = ReturnType<typeof authority.config>
+    const published: Config[] = [], read: Config[] = []
+    expect(authority.transact(authority.revision, joinBeta(authority), 1, config => {
+      published.push(config)
+      authority.subscribe(config => read.push(config))
+      config.personas.length = 0
+    }).kind).toBe('applied')
+    expect(read).toHaveLength(1)
+    expect(read[0]).not.toBe(published[0])
+    expect(read[0]).toEqual(sharedAppliedConfig(authority.snapshot(), authority.path))
+    expect(read[0]!.personas).toHaveLength(2)
+  })
+
+  // review-r1 R1 sweep: a membership commit reused a committed object's
+  // encoding without reading it again, so a hook a draft installed ran only
+  // when first encoded, or never, where the old path's whole encoding ran it
+  // at every commit. review-r2 R2: an own `toJSON`, enumerable or not, on a
+  // copied object or array. Counts and bytes are the old path's (HEAD).
+  const hooks: Array<[string, (next: SharedChannelState, call: () => void) => void, number[]]> = [
+    ['an enumerable accessor on a copied map', (next, call) => {
+      const membership = next.personas['alpha']!.membership, record = membership['C0TEST001']
+      Object.defineProperty(membership, 'C0TEST001', { get() { call(); return record }, enumerable: true, configurable: true })
+    }, [4, 1, 1]],
+    ['a non-enumerable toJSON getter on a copied map', (next, call) => {
+      Object.defineProperty(next.personas['alpha']!.membership, 'toJSON', { get() { call(); return undefined }, enumerable: false, configurable: true })
+    }, [1, 1, 1]],
+    ['a non-enumerable toJSON method on a copied map', (next, call) => {
+      Object.defineProperty(next.personas['alpha']!.membership, 'toJSON', { value() { call(); return {} }, enumerable: false, configurable: true })
+    }, [1, 1, 1]],
+    ['a non-enumerable toJSON method on a copied array', (next, call) => {
+      Object.defineProperty(next.applied['personas'], 'toJSON', { value(this: unknown[]) { call(); return Array.from(this) }, enumerable: false, configurable: true })
+    }, [2, 0, 0]],
+  ]
+  test.each(hooks)('%s runs at each later commit\'s encoding as the native encoder of the whole state ran it, with its bytes', (_, install, expected) => {
+    const authority = makeSharedAuthority(root, input())
+    expect(observe(authority, 'alpha', 'C0TEST001', true, 'EvJOIN1').kind).toBe('applied')
+    let calls = 0
+    const call = () => { calls++ }
+    const counted = (step: () => { kind: string }) => { const before = calls; expect(step().kind).toBe('applied'); return calls - before }
+    const perCommit = [counted(() => authority.transactMembership('alpha', authority.revision, (next, order) => {
+      applySharedMembership(next, order, 'alpha', authority.incarnation('alpha')!, joinOf('C0TEST002'))
+      install(next, call)
+    }))]
+    for (const [channel, event] of [['C0TEST003', 'EvBETA3'], ['C0TEST004', 'EvBETA4']] as const) perCommit.push(counted(() => observe(authority, 'beta', channel, true, event)))
+    expect(perCommit).toEqual(expected)
+    // The bytes the native encoder gives the installed state: alpha's committed life as it encodes, hooks run.
+    const state = authority.snapshot()
+    state.personas['alpha'] = JSON.parse(JSON.stringify(authority.inspectMembershipHistory('alpha', life => life as never)))
+    expect(readFileSync(authority.path).toString()).toBe(JSON.stringify(state, null, 2) + '\n')
+  })
+})
 test('attempt identifiers preserve exact code units and cannot collide after Unicode replacement or trimming', () => {
   const values = ['retained', ' retained ', '\ud800', '\ufffd', '😀', '😀 ']
   const keys = values.map(id => {

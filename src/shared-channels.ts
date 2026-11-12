@@ -13,8 +13,9 @@ import { reloadFingerprint } from './reload-fingerprint.ts'
 import { recoveryHash, validateSharedRecovery, type SharedRecoveryRecord, type SharedRecoveryRequest } from './shared-recovery.ts'
 import { expandTilde, PERSONA_KEY_RE, personaKey } from './persona-identity.ts'
 import { dirname } from 'node:path'
-import { isDeepStrictEqual } from 'node:util'
+import { isDeepStrictEqual, types } from 'node:util'
 import { durableWriteFileSync, DurableWriteUnsyncedError } from './atomic-write.ts'
+import { cloneJournalData } from './durable-journal.ts'
 import { errnoSuffix } from './persona-credentials.ts'
 import { MEMBERSHIP_TIMESTAMP_RE, compareMembershipEventTimes, membershipPayloadIdentity, validateMembershipEvidence, type MembershipEvidence } from './channel-membership-evidence.ts'
 import { validateMembershipSetupRecords, type MembershipSetupRecord } from './channel-membership-readiness.ts'
@@ -174,20 +175,77 @@ export interface SharedChannelDeps {
 function object(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
-function clone<T>(value: T): T { return structuredClone(value) }
+/** A copy of committed or parsed state; a caller's value takes `structuredClone`. */
+function clone<T>(value: T): T { return cloneJournalData(value) }
 function own<T>(record: Record<string, T>, key: string): T | undefined {
   return Object.hasOwn(record, key) ? record[key] : undefined
 }
 function put<T>(record: Record<string, T>, key: string, value: T): void {
   Object.defineProperty(record, key, { value, enumerable: true, configurable: true, writable: true })
 }
+/** The objects this module froze: parsed or reparsed JSON data, which
+ * committed states never write in place, and the containers a membership
+ * transaction copied, the only objects it writes. So each one's pretty
+ * encoding at a given depth never changes. */
+const sealed = new WeakSet<object>()
+/** The sealed containers a membership transaction copied. Most of their
+ * members are the previous revision's objects, so they are encoded by member. */
+const copied = new WeakSet<object>()
+const encodings = new WeakMap<object, { depth: number; text: string }>()
 /** Committed states share their objects across revisions, so they are frozen
  * whole: an in-place write throws instead of reaching another revision. A
  * frozen object's descendants are already frozen. */
 function freeze<T>(value: T): T {
   if (typeof value !== 'object' || value === null || Object.isFrozen(value)) return value
   for (const child of Object.values(value)) freeze(child)
+  sealed.add(value)
   return Object.freeze(value)
+}
+const INDENTS: string[] = ['']
+function indent(depth: number): string { return INDENTS[depth] ??= '  '.repeat(depth) }
+const NOT_SEALED_DATA = 'Not sealed JSON data.'
+/** `JSON.stringify(value, null, 2)` of a sealed object nested `depth` levels
+ * deep, as its parent's encoding holds it: kept from an earlier revision,
+ * joined from a copied container's members, or the native encoder's
+ * re-indented. Throws, having run no code of the state's, on an object this
+ * module did not seal, and on what a transaction wrote that is not JSON data. */
+function encodeSealed(value: object, depth: number): string {
+  const cached = encodings.get(value)
+  if (cached !== undefined && cached.depth === depth) return cached.text
+  if (!sealed.has(value)) throw new Error(NOT_SEALED_DATA)
+  let text: string
+  if (!copied.has(value)) {
+    // JSON text has newlines only between tokens, each followed by the indent.
+    text = JSON.stringify(value, null, 2)
+    if (depth) text = text.replaceAll('\n', '\n' + indent(depth))
+  } else {
+    const inner = indent(depth + 1), members: string[] = [], list = Array.isArray(value)
+    // A transaction may have left what the native encoder treats otherwise:
+    // a proxy's traps, an own `toJSON` of any kind (it is read whether
+    // enumerable or not), one inherited from another prototype, a member's
+    // accessor, or a boxed primitive's value (a raw JSON object's prototype is null).
+    if (types.isProxy(value) || Object.getPrototypeOf(value) !== (list ? Array.prototype : Object.prototype) || Object.hasOwn(value, 'toJSON') ||
+        types.isBoxedPrimitive(value)) throw new Error(NOT_SEALED_DATA)
+    const member = (key: string | number): unknown => {
+      const property = Object.getOwnPropertyDescriptor(value, key)
+      if (!property || !('value' in property)) throw new Error(NOT_SEALED_DATA)
+      return property.value
+    }
+    if (list) {
+      for (let i = 0; i < value.length; i++) members.push(inner + (encodeMember(member(i), depth + 1) ?? 'null'))
+    } else {
+      for (const key of Object.keys(value)) {
+        const encoded = encodeMember(member(key), depth + 1)
+        if (encoded !== undefined) members.push(inner + JSON.stringify(key) + ': ' + encoded)
+      }
+    }
+    text = !members.length ? (list ? '[]' : '{}') : (list ? '[\n' : '{\n') + members.join(',\n') + '\n' + indent(depth) + (list ? ']' : '}')
+  }
+  encodings.set(value, { depth, text })
+  return text
+}
+function encodeMember(value: unknown, depth: number): string | undefined {
+  return typeof value === 'object' && value !== null ? encodeSealed(value, depth) : JSON.stringify(value)
 }
 /** The value as reading its serialized form back gives it. */
 function reparse(value: unknown): unknown {
@@ -371,6 +429,10 @@ export function validThreadMemoryMarker(value: unknown): value is Record<string,
 /** Strict envelope reader. A raw baseline still obeys the new schema; this
  * never reads or imports the removed delivery store or old configuration. */
 export function parseSharedChannelState(bytes: Uint8Array, path: string, deps: SharedChannelDeps = {}): SharedChannelState | undefined {
+  return readSharedChannelState(bytes, path, deps)?.state
+}
+/** `parseSharedChannelState` with the applied configuration it validated. */
+function readSharedChannelState(bytes: Uint8Array, path: string, deps: SharedChannelDeps): { state: SharedChannelState; config: PersonaConfig } | undefined {
   const value = parseConfigJsonBytes(bytes, path)
   if (!object(value) || value['format'] !== SHARED_CHANNEL_FORMAT) return undefined
   if (!Number.isSafeInteger(value['revision']) || (value['revision'] as number) < 1 ||
@@ -426,7 +488,7 @@ export function parseSharedChannelState(bytes: Uint8Array, path: string, deps: S
   if (!isDeepStrictEqual(parseConfigJsonBytes(sourceBytes, path), state.source)) throw new Error('The shared channel authority has inconsistent reviewed input evidence.')
   if (!isDeepStrictEqual(reviewedFields(state.source), reviewedFields(state.applied))) throw new Error('The shared channel authority has inconsistent reviewed and applied fields.')
   checkAppliedChoices(state, config, deps)
-  return state
+  return { state, config }
 }
 /** One persona's own records, its incarnation unique among `incarnations`. */
 function checkPersonaRecords(state: SharedChannelState, key: string, life: SharedPersona, incarnations: Set<string>): void {
@@ -540,7 +602,16 @@ function checkAppliedChoices(state: SharedChannelState, config: PersonaConfig, d
   }
 }
 export function serializeSharedChannelState(state: SharedChannelState): Uint8Array {
-  return Buffer.from(JSON.stringify(state, null, 2) + '\n')
+  return Buffer.from(encodeState(state) + '\n')
+}
+/** `JSON.stringify(state, null, 2)`. A sealed state reuses the encodings of
+ * the objects it shares with earlier revisions; any other value, or anything
+ * the reuse cannot encode exactly, takes the native encoder. */
+function encodeState(state: SharedChannelState): string {
+  if (sealed.has(state) && !('toJSON' in Object.prototype) && !('toJSON' in Array.prototype)) {
+    try { return encodeSealed(state, 0) } catch { /* the native encoder decides */ }
+  }
+  return JSON.stringify(state, null, 2)
 }
 export function initialSharedChannelState(bytes: Uint8Array, config: PersonaConfig, incarnation: () => string = randomUUID, threadHybridSince: () => string = randomUUID): SharedChannelState {
   const raw = parseConfigJsonBytes(bytes, 'prepared configuration') as Record<string, unknown>
@@ -568,6 +639,28 @@ function rawPersona(state: SharedChannelState, key: string): Record<string, unkn
 export function applySharedMembership(
   next: SharedChannelState, order: number, key: string, incarnation: string, observation: VerifiedSharedMembership,
   mint: () => string = randomUUID,
+): void {
+  applyMembershipRecords(next, order, key, incarnation, observation, mint)
+  deriveRawChannels(next, key)
+}
+/** Consecutive `applySharedMembership` calls at positions `first`,
+ * `first + 1`, ...: each later call rebuilds the raw channel list from the
+ * same assignments, so only the last list survives and is derived once. */
+export function applySharedMemberships(
+  next: SharedChannelState, first: number, key: string, incarnation: string, observations: readonly VerifiedSharedMembership[],
+  mint: () => string = randomUUID,
+): void {
+  if (!observations.length) return
+  observations.forEach((observation, index) => applyMembershipRecords(next, first + index, key, incarnation, observation, mint))
+  deriveRawChannels(next, key)
+}
+function deriveRawChannels(next: SharedChannelState, key: string): void {
+  const life = own(next.personas, key)!
+  rawPersona(next, key)['channels'] = Object.entries(life.assignments).map(([id, assignment]) => ({ id, delivery: assignment.delivery }))
+}
+/** Every effect of one observation except the raw channel list it implies. */
+function applyMembershipRecords(
+  next: SharedChannelState, order: number, key: string, incarnation: string, observation: VerifiedSharedMembership, mint: () => string,
 ): void {
   const life = own(next.personas, key)
   if (!life || life.incarnation !== incarnation) throw new Error('Obsolete membership incarnation.')
@@ -602,7 +695,6 @@ export function applySharedMembership(
   } else if (observation.member && !own(life.assignments, observation.channel)) {
     putAssignment(life.assignments, observation.channel, next.applied['channel_mode'] === 'open' ? 'mentions' : 'off', order, mint)
   }
-  raw['channels'] = Object.entries(life.assignments).map(([id, assignment]) => ({ id, delivery: assignment.delivery }))
 }
 
 // --- Membership transactions: one persona's records, copied on write ---
@@ -704,15 +796,18 @@ function settleMembershipDraft(saved: SharedPersona, savedRaw: Record<string, un
 /** Freezes the draft's fresh containers, whose other contents are already
  * frozen: shared committed objects, or values settled above. */
 function sealMembershipDraft(draft: MembershipDraft): SharedChannelState {
-  for (const records of draft.records.values()) Object.freeze(records)
-  for (const value of [draft.life, draft.raw, draft.next.applied['personas'], draft.next.applied, draft.next.personas, draft.next]) Object.freeze(value)
+  for (const value of [...draft.records.values(), draft.life, draft.raw, draft.next.applied['personas'] as object, draft.next.applied, draft.next.personas, draft.next]) {
+    sealed.add(value)
+    copied.add(value)
+    Object.freeze(value)
+  }
   return draft.next
 }
 /** The checks of `parseSharedChannelState` a membership transaction can
  * change. Every other check reads objects it shares unchanged, bounded only
  * from above by the revision, which grew. The incarnation stays unique
  * because it is unchanged. */
-function checkMembershipDraft(before: SharedChannelState, state: SharedChannelState, key: string, fresh: boolean, path: string, deps: SharedChannelDeps): void {
+function checkMembershipDraft(before: SharedChannelState, state: SharedChannelState, key: string, fresh: boolean, path: string, deps: SharedChannelDeps): PersonaConfig {
   const life = state.personas[key]!
   checkPersonaRecords(state, key, life, new Set())
   const attempts = state.outcomes.botAttempts
@@ -735,6 +830,7 @@ function checkMembershipDraft(before: SharedChannelState, state: SharedChannelSt
     checkSourceConfigs(state, Buffer.from(state.sourceBytesBase64, 'base64'), path, deps)
   }
   checkAppliedChoices(state, config, deps)
+  return config
 }
 export interface ReviewedAssignment { key: string; channel: string; delivery: DeliveryMode; incarnation?: string; absenceReplacement?: string }
 export interface ReviewedChannelEffect {
@@ -929,11 +1025,17 @@ export interface SharedChannelAuthority {
   channels(key: string): string[]
   validatesRemovedDestination(persona: Pick<Persona, 'key' | 'name' | 'credentials_file' | 'working_directory' | 'permission_prompts'>): boolean
   subscribe(listener: (config: PersonaConfig) => void): () => void
+  /** `subscribe` for a listener that reads no configuration: called at the
+   * same moments, in the same subscription order, with no argument. */
+  subscribeChange(listener: () => void): () => void
   /** A stamp can read `undecided` while `readableFor` is true (a staged
    * recovery), so intake may continue. Undecided means hold: a consumer never
    * forgets under it, never treats it as selecting nothing, and never
    * acknowledges then drops a reply that depends on a join. */
   channelStamp(key: string, channel: string): SharedChannelStampState | undefined
+  /** The facts every `channelStamp` answer derives from, as one token: while
+   * the same token is returned, every key and channel reads the same stamp. */
+  stampFacts(): object
   threadView(): SharedThreadView
   /** Delivered at every config publication, before `subscribe` listeners, and
    * after any other durable or readability change to the derived stamps. A
@@ -989,6 +1091,8 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
   const write = deps.write ?? durableWriteFileSync
   const mint = deps.threadHybridSince ?? randomUUID
   const listeners = new Set<(config: PersonaConfig) => void>()
+  /** Listeners in `listeners` that read no configuration. */
+  const configless = new Set<(config: PersonaConfig) => void>()
   const watchers = new Set<() => void>()
   let pendingWatchOutcomes = 0
   let watching = false
@@ -1010,6 +1114,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
   }
   const threadViewListeners = new Set<(view: SharedThreadView) => void>()
   const readability = (): SharedReadability => ({ current, uncertain, readable, recoveryStaged })
+  let stampFacts = readability()
   let deliveredThreadView = threadViewSignature(readability())
   function deliverThreadView(always: boolean): void {
     const facts = readability()
@@ -1107,9 +1212,17 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
       return { kind: 'failed' }
     } finally { mutating = false }
   }
-  function publishChange(before: SharedChannelState, publish?: (config: PersonaConfig) => void, key?: string): void {
+  /** `installed` is the configuration the commit validated for `current`, if any. */
+  function publishChange(before: SharedChannelState, publish?: (config: PersonaConfig) => void, key?: string, installed?: PersonaConfig): void {
+    // The mutation lock keeps `current` installed while recipients run. Every
+    // recipient that reads configuration owns it: one parse of `current`, or
+    // the configuration the commit validated, copied for the publisher and
+    // for each listener but the last that reads it. A configuration-free
+    // listener still runs only once `current` parses.
+    let config = installed
+    const parsed = (): PersonaConfig => config ??= authority.config()
     // Runtime publication precedes observers while the mutation lock is held.
-    try { publish?.(authority.config()) } catch { /* durability cannot be undone by a publisher */ }
+    try { publish?.(clone(parsed())) } catch { /* durability cannot be undone by a publisher */ }
     // A membership commit shares every other persona, raw entry and field.
     const changed = key === undefined
       ? !isDeepStrictEqual(before.applied, current.applied) || !isDeepStrictEqual(before.personas, current.personas) ||
@@ -1118,21 +1231,29 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
     // Thread Memory forgets before `subscribe` listeners; the runtime publisher ran above.
     deliverThreadView(publish !== undefined || changed)
     if (changed) {
-      for (const listener of [...listeners]) {
-        try { listener(authority.config()) } catch { /* an observer cannot undo durability */ }
-      }
+      // The listeners subscribed once the callbacks above have run.
+      const recipients = [...listeners].map(listener => ({ listener, reads: !configless.has(listener) }))
+      let last = -1
+      recipients.forEach((recipient, i) => { if (recipient.reads) last = i })
+      recipients.forEach(({ listener, reads }, i) => {
+        try {
+          const shared = parsed()
+          if (!reads) (listener as () => void)()
+          else listener(i < last ? clone(shared) : shared)
+        } catch { /* an observer cannot undo durability */ }
+      })
     }
   }
   /** Every transaction's one order: reserve its positions, stage the next
    * state and its bytes, write them durably, install, then publish. */
   function commit(expectedRevision: number, orderSpan: number, publish: ((config: PersonaConfig) => void) | undefined,
-    stage: (revision: number) => { bytes: Uint8Array; state: SharedChannelState }, key?: string): SharedMutationResult {
+    stage: (revision: number) => { bytes: Uint8Array; state: SharedChannelState; config: PersonaConfig }, key?: string): SharedMutationResult {
     if (!readable) return { kind: 'unresolved', revision: current.revision }
     if (mutating || expectedRevision !== current.revision) return { kind: 'stale', revision: current.revision }
     if (!Number.isSafeInteger(orderSpan) || orderSpan < 1 || !Number.isSafeInteger(current.revision + orderSpan)) return { kind: 'failed', revision: current.revision }
     const before = current
     const appliedRevision = current.revision + orderSpan
-    let prepared: SharedChannelState | undefined
+    let prepared: SharedChannelState | undefined, installed: PersonaConfig | undefined
     mutating = true
     failure = ''
     try {
@@ -1140,6 +1261,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
       prepared = staged.state
       write(path, staged.bytes)
       current = staged.state
+      installed = staged.config
     } catch (err) {
       mutating = false
       failure = errnoSuffix(err)
@@ -1157,7 +1279,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
     }
     try {
       // Metadata has durable order, but no applied publication or assignment.
-      publishChange(before, publish, key)
+      publishChange(before, publish, key, installed)
     } finally {
       mutating = false
     }
@@ -1353,7 +1475,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
           if (readable && installed) return { kind: 'stale', revision: current.revision }
           staged = clone(anchor)
           staged.revision++
-          staged.recovery = { boundary: (deps.incarnation ?? randomUUID)(), phase: 'review', request: clone(request),
+          staged.recovery = { boundary: (deps.incarnation ?? randomUUID)(), phase: 'review', request: structuredClone(request),
             evidenceBase64: Buffer.from(evidence).toString('base64'), preparedBase64: Buffer.from(prepared).toString('base64'),
             anchorBase64: Buffer.from(serializeSharedChannelState(anchor)).toString('base64') }
           if (!parseSharedChannelState(serializeSharedChannelState(staged), path, deps)) throw new Error('Invalid recovery stage.')
@@ -1420,8 +1542,15 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
     reviewHeld: key => heldByReview(current, key),
     lifetime: (key, channel) => sharedChannelLifetime(current, key, channel),
     validatesRemovedDestination: persona => removedDestination(current, persona, deps.realpath),
-    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener) },
+    subscribe(listener) { configless.delete(listener); listeners.add(listener); return () => { configless.delete(listener); return listeners.delete(listener) } },
+    subscribeChange(listener) { configless.add(listener); listeners.add(listener); return () => { configless.delete(listener); return listeners.delete(listener) } },
     channelStamp: (key, channel) => stampIn(readability(), key, channel),
+    stampFacts() {
+      // `stampIn` reads only these facts, and committed states are never mutated in place.
+      if (stampFacts.current !== current || stampFacts.uncertain !== uncertain || stampFacts.readable !== readable ||
+          stampFacts.recoveryStaged !== recoveryStaged) stampFacts = readability()
+      return stampFacts
+    },
     threadView: () => captureThreadView(readability()),
     subscribeThreadView(listener) { threadViewListeners.add(listener); return () => threadViewListeners.delete(listener) },
     operatorIntent: () => clone((own(current.pendingIntent, 'operator') as OperatorIntent | undefined) ?? emptyOperatorIntent()),
@@ -1456,9 +1585,9 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
         change(next, revision)
         if (next.revision !== revision) throw new Error('Invalid shared application order.')
         const bytes = serializeSharedChannelState(next)
-        const published = parseSharedChannelState(bytes, path, deps)
+        const published = readSharedChannelState(bytes, path, deps)
         if (!published) throw new Error('Invalid shared authority format.')
-        return { bytes, state: published }
+        return { bytes, ...published }
       }))
     },
     transactMembership(key, expectedRevision, change, orderSpan = 1) {
@@ -1474,9 +1603,10 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
         if (draft.next.revision !== revision) throw new Error('Invalid shared application order.')
         checkMembershipScope(before, key, draft)
         const fresh = settleMembershipDraft(before.personas[key]!, rawPersona(before, key), draft, before.revision)
-        checkMembershipDraft(before, draft.next, key, fresh, path, deps)
-        // The same encoder over the same keys and values as a whole copy.
-        return { bytes: serializeSharedChannelState(draft.next), state: sealMembershipDraft(draft) }
+        const config = checkMembershipDraft(before, draft.next, key, fresh, path, deps)
+        const state = sealMembershipDraft(draft)
+        // The same encoding of the same keys and values as a whole copy.
+        return { bytes: serializeSharedChannelState(state), state, config }
       }, key))
     },
     observeMembership(key, incarnation, observation, expectedRevision) {

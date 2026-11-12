@@ -4,7 +4,7 @@ import * as nodeFs from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { PERSONA_KEY_RE } from './persona-identity.ts'
-import { createDurableJournal, splitJournalLines, type AppendRollback } from './durable-journal.ts'
+import { cloneJournalData, createDurableJournal, splitJournalLines, type AppendRollback } from './durable-journal.ts'
 import type { ChannelStamp } from './shared-channels.ts'
 
 export const QUEUE_KEY_KEEP_MS = 24 * 60 * 60 * 1000
@@ -466,7 +466,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   function snapshot<T extends QueueItem | UnresolvedHold>(value: T): T {
     let cached = snapshots.get(value) as T | undefined
     if (!cached) {
-      cached = freezeSnapshot(structuredClone(value))
+      cached = freezeSnapshot(cloneJournalData(value))
       snapshots.set(value, cached)
     }
     return cached
@@ -656,7 +656,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     const j = journal(key)
     const encoded = slackKeyString(slack)
     const r = j.slackKeys.get(encoded)
-    return r ? structuredClone({ status: 'duplicate' as const, seq: r.seq, item: j.items.get(r.seq) }) : undefined
+    return r ? cloneJournalData({ status: 'duplicate' as const, seq: r.seq, item: j.items.get(r.seq) }) : undefined
   }
   function needsThreadJoinCopy(key: string, record: AcceptedRecord): boolean {
     return record.thread_join !== undefined && options.threadJoinSaved?.(key, record.channel!, record.thread_join) !== true
@@ -746,7 +746,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       const { record, turnStarted, afterStore } = staged
       const store: QueueStoreKind = record.hold?.on === 'post' ? 'post-hold' : record.hold?.on === 'memory' ? 'memory-hold' : 'accepted'
       event(turnStarted !== undefined && atMonoMs !== undefined ? { type: 'stored', key, seq: record.seq, store, storeMs: atMonoMs - turnStarted, atMonoMs } : { type: 'stored', key })
-      const item = structuredClone(j!.items.get(record.seq)!)
+      const item = cloneJournalData(j!.items.get(record.seq)!)
       try { afterStore?.({ seq: record.seq }) } catch { /* a saved acceptance cannot be undone by its observer */ }
       member.settle({ result: { status: 'accepted', seq: record.seq, item } })
     }
@@ -775,8 +775,10 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     await durableAppend(pathFor(key), Buffer.from(records.map(r => JSON.stringify(r) + '\n').join('')), j)
     for (const r of records) update(j, r)
   }
+  // Values callers hand in are copied with structuredClone itself:
+  // cloneJournalData copies only records the queue built or already copied.
   const api: ReplyReminderQueue = {
-    replyReminderItems: key => replyCandidates(journal(key)).map(record => structuredClone(record)),
+    replyReminderItems: key => replyCandidates(journal(key)).map(record => cloneJournalData(record)),
     replyCallTargets: key => replyTargets(journal(key)),
     async recordReplyCall(key, targets) {
       targets = structuredClone(targets)
@@ -836,7 +838,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
           records.push({ v: 1, kind: 'reply-reminder', seq: originalSeq, at: now(), delivered_at: previous.delivered_at ?? previous.at, state: cancelled ? 'cancelled' : alreadyQueued || nudge ? 'nudged' : 'observed', row_state: row.state, session_id: row.session_id, launch_started_at: row.launch_started_at, ...(previous.delivery_attempts === undefined ? {} : { delivery_attempts: previous.delivery_attempts }) })
         }
         await appendReminderRecords(key, records)
-        return injected.map(seq => structuredClone(j.items.get(seq)!))
+        return injected.map(seq => cloneJournalData(j.items.get(seq)!))
       })
     },
     async start() {
@@ -983,9 +985,9 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
           const wasBlocked = appendBlocked.delete(key)
           // Transfer committed evidence before a queue observer can submit
           // teardown. Never turn an observer failure into an append failure.
-          try { void Promise.resolve(onCommitted?.(structuredClone(saved))).catch(() => {}) } catch { /* saved facts remain saved */ }
+          try { void Promise.resolve(onCommitted?.(cloneJournalData(saved))).catch(() => {}) } catch { /* saved facts remain saved */ }
           if (wasBlocked) event({ type: 'writable', key })
-          event({ type: 'holds-resolved', key, resolutions: structuredClone(saved), ...timed })
+          event({ type: 'holds-resolved', key, resolutions: cloneJournalData(saved), ...timed })
           return saved
         })
       } catch (error) { appendBlocked.add(key); event({ type: 'append-failed', key, path: pathFor(key), error }); throw error }

@@ -9,6 +9,7 @@ import { MAX_RELOAD_FILE_BYTES } from '../src/config.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { durableIo, failFileSyncs, holdFirstSync, type DurableStep } from './test-helpers/durable-io.ts'
 import { yieldToEventLoop } from '../src/durable-journal.ts'
+import * as journal from '../src/durable-journal.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { _resetAckTracker, createQueuedAckCallback } from '../src/ack-tracker.ts'
 import { acceptedRecord, deliveredRecord, fixedRecord, heldSlackInput, HOLD_FIELDS, injectedInput, makeQueue, memoryHold, noticedRecord, parkedRecord, postHold, queuePath, readQueue, refusedRecord, releasedRecord, seedQueue, sentRecord, slackInput, tornRecord, unknownRootPostHold, withdrawnRecord } from './test-helpers/delivery-queue.ts'
@@ -17,6 +18,7 @@ import { makeThreadMemoryHarness, THREAD_CHANNELS, THREAD_ROOTS, THREAD_STAMP, T
 import { recoverQueuedJoins } from '../src/thread-join-recovery.ts'
 import { createMemoryHoldResolver } from '../src/memory-holds.ts'
 import { createDeliveryQueue as createMainDeliveryQueue, isQueueRecord as isMainQueueRecord } from './fixtures/main-delivery-queue/delivery-queue.ts'
+import { spyOnCopies } from './test-helpers/copies.ts'
 
 let dir: string
 let queues: DeliveryQueue[]
@@ -859,12 +861,7 @@ test('simultaneous redeliveries share one durable Slack acceptance; per-persona 
 test.each([16, 64])('%i concurrent accepts and preparations clone only two item snapshots per acceptance', async count => {
   const q = await open()
   const preparation = createDeliveryPreparation({ queue: q, resolveUserName: async () => 'human', clientFor: () => undefined, clock: createFakeClock() })
-  const clone = globalThis.structuredClone
-  let snapshots = 0
-  const cloning = spyOn(globalThis, 'structuredClone').mockImplementation(value => {
-    if (value && typeof value === 'object' && 'accepted' in value && 'records' in value) snapshots++
-    return clone(value)
-  })
+  const copies = spyOnCopies()
   try {
     await Promise.all(Array.from({ length: count }, (_, i) => {
       const ts = `1700000000.${String(i + 1).padStart(6, '0')}`
@@ -874,12 +871,18 @@ test.each([16, 64])('%i concurrent accepts and preparations clone only two item 
         await preparation.prepare('alpha', result.item)
       })
     }))
+    const snapshots = copies.values.filter(value => value && typeof value === 'object' && 'accepted' in value && 'records' in value).length
     console.info(`queue preparation accepts=${count} item_snapshots=${snapshots} expected=${2 * count}`)
     // One detached acceptance result and one fresh preparation snapshot. A
     // whole-queue refresh instead grows quadratically as this burst queues.
     expect(snapshots).toBe(2 * count)
+    // Item snapshots are copied field by field, not through a structured
+    // clone's serialisation of every string (t3.yiv.sf.ws.ih). Only what
+    // callers hand in takes structuredClone: each accepted input and each
+    // fixation record the preparation appends (review-r2 R1).
+    expect(copies.serialised).toBe(2 * count)
   } finally {
-    cloning.mockRestore()
+    copies.restore()
     await preparation.stop()
   }
   expect(q.openCount('alpha')).toBe(count)
@@ -932,32 +935,164 @@ test.each([16, 64])('%i queued items and holds reuse snapshots between changes',
   seedQueue(dir, inputs.map((input, i) => acceptedRecord(i + 1, input, 1000)))
   const q = await open()
   const initial = q.items('alpha'), holds = q.unresolvedHolds('alpha')
-  const clone = globalThis.structuredClone
-  const cloning = spyOn(globalThis, 'structuredClone').mockImplementation(value => clone(value))
+  const copies = spyOnCopies()
   try {
     for (let i = 0; i < 4; i++) {
       expect(q.items('alpha')).toEqual(initial)
       expect(q.unresolvedHolds('alpha')).toEqual(holds)
       expect(q.item('alpha', count)).toEqual(initial.at(-1))
     }
-    expect(cloning).not.toHaveBeenCalled()
+    expect(copies.values).toHaveLength(0)
     // An append and a resolution invalidate only their item/hold versions.
     await q.append('alpha', noticedRecord(count))
     await q.resolveHolds('alpha', [{ seq: 1, outcome: 'parked', at: 1100 }])
-    cloning.mockClear()
+    copies.clear()
     const changed = q.items('alpha'), changedHolds = q.unresolvedHolds('alpha')
     expect(changed[0]!.hold).toMatchObject({ kind: 'memory', state: 'unresolved' })
     expect(changed.at(-1)!.records.at(-1)).toEqual(noticedRecord(count))
     expect(changedHolds[0]).toMatchObject({ on: 'memory', seq: 1 })
     expect(changed.slice(1, -1)).toEqual(initial.slice(1, -1))
     // Two changed items and their two replaced hold entries, independent of count.
-    expect(cloning).toHaveBeenCalledTimes(4)
-    cloning.mockClear()
+    expect(copies.values).toHaveLength(4)
+    copies.clear()
     expect(q.item('alpha', 1)).toEqual(changed[0])
     expect(q.items('alpha')).toEqual(changed)
     expect(q.unresolvedHolds('alpha')).toEqual(changedHolds)
-    expect(cloning).not.toHaveBeenCalled()
-  } finally { cloning.mockRestore() }
+    expect(copies.values).toHaveLength(0)
+  } finally { copies.restore() }
+})
+
+// t3.yiv.sf.ws.ih: the queue copied its inputs, results, snapshots and
+// reports through structuredClone, which serialises every string.
+test('a queue history returns, stores, reports and replays what structuredClone copies gave', async () => {
+  async function history(label: string, structured: boolean) {
+    const stateDir = join(dir, label), clock = createFakeClock({ start: THREAD_TIME }), events: unknown[] = []
+    fs.mkdirSync(stateDir)
+    const copier = structured ? spyOn(journal, 'cloneJournalData').mockImplementation(value => structuredClone(value)) : undefined
+    const results: unknown[] = []
+    const record = async (step: () => unknown) => { try { results.push(await step()) } catch (error) { results.push(`threw ${(error as Error).message}`) } }
+    try {
+      const q = createDeliveryQueue({ stateDir, now: clock.now, onEvent: event => { events.push(event) } }); queues.push(q)
+      await q.start()
+      const input = slackInput({ files: [{ name: 'original 🙂.txt' }] }), heldTs = THREAD_ROOTS.secondary
+      const held = heldSlackInput(memoryHold(clock.now()), { ts: heldTs, key: { chat_id: THREAD_CHANNELS.primary, ts: heldTs } })
+      await record(() => q.accept('alpha', input))
+      await record(() => q.accept('alpha', input))
+      await record(() => q.accept('alpha', injectedInput({ text: 'second 🙂\nline' })))
+      await record(() => q.acceptDecided('alpha', held.key, () => ({ store: held })))
+      await record(() => q.acceptDecided('alpha', { chat_id: THREAD_CHANNELS.primary, ts: THREAD_ROOTS.third }, () => ({ skip: 'not stored' })))
+      await record(() => q.append('alpha', fixedRecord(1, ['fixed 🙂', 'bytes'])))
+      await record(() => q.append('alpha', sentRecord()))
+      await record(() => q.append('alpha', deliveredRecord()))
+      await record(() => q.resolveHolds('alpha', [{ seq: 3, outcome: 'parked', at: clock.now() }], () => true, saved => { results.push(['committed', saved]) }))
+      await record(() => q.recordReplyCall('alpha', q.replyCallTargets('alpha')))
+      results.push(q.items('alpha'), q.item('alpha', 2), q.unresolvedHolds('alpha'), q.lookupSlackKey('alpha', input.key!), q.replyReminderItems('alpha'), q.replyCallTargets('alpha'))
+      await q.stop()
+      const replay = createDeliveryQueue({ stateDir, now: clock.now }); queues.push(replay)
+      await replay.start()
+      results.push(replay.items('alpha'), replay.unresolvedHolds('alpha'))
+    } finally { copier?.mockRestore() }
+    return { text: JSON.stringify({ results, events }).replaceAll(stateDir, '<dir>'), bytes: fs.readFileSync(queuePath(stateDir)) }
+  }
+  const before = await history('structured', true), now = await history('journal', false)
+  expect(JSON.parse(now.text)).toEqual(JSON.parse(before.text))
+  expect(now.bytes).toEqual(before.bytes)
+})
+
+// review-r1 R1: the copier read an input's getter, then sent the whole input to
+// structuredClone for its class-instance key, which read the getter again and
+// stored its second answer.
+test('accept and acceptDecided store and return what one structuredClone of an input with a getter gave', async () => {
+  class SlackKey { chat_id = 'C0TEST001'; ts: string; constructor(ts: string) { this.ts = ts } }
+  async function accepted(label: string, structured: boolean) {
+    const stateDir = join(dir, label)
+    fs.mkdirSync(stateDir)
+    const copier = structured ? spyOn(journal, 'cloneJournalData').mockImplementation(value => structuredClone(value)) : undefined
+    const reads: string[] = []
+    const input = (ts: string): AcceptedInput => {
+      let n = 0
+      return { ...slackInput({ ts }), get text() { reads.push(ts); return `message-${++n}` }, key: new SlackKey(ts) }
+    }
+    try {
+      const q = createDeliveryQueue({ stateDir, now: () => THREAD_TIME }); queues.push(q)
+      await q.start()
+      const results = [await q.accept('alpha', input('1700000000.000001')),
+        await q.acceptDecided('alpha', new SlackKey('1700000000.000002'), () => ({ store: input('1700000000.000002') }))]
+      return { results: JSON.stringify(results), items: JSON.stringify(q.items('alpha')), reads, bytes: fs.readFileSync(queuePath(stateDir)) }
+    } finally { copier?.mockRestore() }
+  }
+  const before = await accepted('structured', true), now = await accepted('journal', false)
+  expect(now.results).toContain('"text":"message-1"')
+  expect(now).toEqual(before)
+})
+
+// review-r2 R1: cloneJournalData copies only records the queue built or
+// already copied; every value a caller hands in keeps structuredClone.
+test('every queue entry point copies what its caller hands in with structuredClone itself', async () => {
+  const q = await open()
+  const serialising = spyOn(globalThis, 'structuredClone'), copying = spyOn(journal, 'cloneJournalData')
+  const handed: Array<[string, unknown]> = []
+  const hand = <T>(name: string, value: T): T => { handed.push([name, value]); return value }
+  try {
+    await q.accept('alpha', hand('accept input', slackInput()))
+    const ts = '1700000000.000002'
+    await q.acceptDecided('alpha', hand('acceptDecided key', { chat_id: 'C0TEST001', ts }), () => ({ store: hand('acceptDecided store', slackInput({ ts, key: { chat_id: 'C0TEST001', ts } })) }))
+    await q.append('alpha', hand('append record', fixedRecord(1, ['fixed'])))
+    await q.recordReplyCall('alpha', hand('recordReplyCall targets', q.replyCallTargets('alpha')))
+    await q.resolveHolds('alpha', hand('resolveHolds resolutions', [{ seq: 1, outcome: 'parked' as const, at: 1000 }]))
+    for (const [name, value] of handed) {
+      expect([name, serialising.mock.calls.filter(([arg]) => arg === value).length, copying.mock.calls.filter(([arg]) => arg === value).length]).toEqual([name, 1, 0])
+    }
+  } finally { serialising.mockRestore(); copying.mockRestore() }
+})
+
+// review-r2 R1: an object with internal slots behind a plain object's
+// prototype looked like plain data to the copier, which then copied a
+// WeakRef structuredClone refuses and emptied a Blob it copies whole.
+test('accept and acceptDecided give a disguised WeakRef or Blob, nested or frozen, what structuredClone gave it', async () => {
+  const disguised = <T extends object>(value: T, fields: Record<string, unknown> = {}): T => Object.assign(Object.setPrototypeOf(value, Object.prototype), fields)
+  const weakKey = (ts: string) => disguised(new WeakRef({}), { chat_id: 'C0TEST001', ts })
+  const blob = () => disguised(new Blob(['payload'], { type: 'text/plain' }))
+  const message = (ts: string) => slackInput({ ts, key: { chat_id: 'C0TEST001', ts } })
+  const inputs: Array<[string, (ts: string) => AcceptedInput]> = [
+    ['WeakRef key', ts => ({ ...message(ts), key: weakKey(ts) as unknown as AcceptedInput['key'] })],
+    ['nested WeakRef', ts => ({ ...message(ts), files: [{ name: 'a.txt', ref: disguised(new WeakRef({}), { id: 'F0TEST001' }) }] } as unknown as AcceptedInput)],
+    ['frozen WeakRef key', ts => Object.freeze({ ...message(ts), key: Object.freeze(weakKey(ts)) as unknown as AcceptedInput['key'] })],
+    ['Blob', ts => ({ ...message(ts), files: [{ name: 'a.txt', body: blob() }] } as unknown as AcceptedInput)],
+    ['frozen Blob', ts => Object.freeze({ ...message(ts), files: Object.freeze([Object.freeze({ name: 'a.txt', body: Object.freeze(blob()) })]) } as unknown as AcceptedInput)],
+  ]
+  /** A result as comparable data: an error by its name, a Blob by its type and payload. */
+  async function described(value: unknown): Promise<unknown> {
+    if (value instanceof Error) return { error: value.name }
+    if (value instanceof Blob) return { blob: [Object.getPrototypeOf(value) === Blob.prototype, value.type, await value.text()] }
+    if (Array.isArray(value)) return Promise.all(value.map(described))
+    if (typeof value !== 'object' || value === null) return value
+    return Object.fromEntries(await Promise.all(Object.entries(value).map(async ([key, member]) => [key, await described(member)])))
+  }
+  async function run(label: string, structured: boolean) {
+    const stateDir = join(dir, label)
+    fs.mkdirSync(stateDir)
+    const copier = structured ? spyOn(journal, 'cloneJournalData').mockImplementation(value => structuredClone(value)) : undefined
+    try {
+      const q = createDeliveryQueue({ stateDir, now: () => THREAD_TIME }); queues.push(q)
+      await q.start()
+      const results: unknown[] = []
+      for (const [i, [name, input]] of inputs.entries()) {
+        const ts = (n: number) => `1700000000.${String(10 * i + n).padStart(6, '0')}`
+        results.push([name, 'accept', await q.accept('alpha', input(ts(1)))])
+        results.push([name, 'acceptDecided', await q.acceptDecided('alpha', { chat_id: 'C0TEST001', ts: ts(2) }, () => ({ store: input(ts(2)) }))])
+      }
+      // A disguised WeakRef as the decided Slack key itself.
+      results.push(['WeakRef key', 'acceptDecided key', await q.acceptDecided('alpha', weakKey('1700000000.000099') as never, () => ({ store: slackInput() }))])
+      results.push(['items', q.items('alpha')])
+      return { results: await described(results), bytes: fs.readFileSync(queuePath(stateDir)) }
+    } finally { copier?.mockRestore() }
+  }
+  const before = await run('structured', true), now = await run('journal', false)
+  expect(JSON.stringify(now.results)).toContain('"error":"DataCloneError"')
+  expect(JSON.stringify(now.results)).toContain(`"blob":[true,${JSON.stringify(new Blob([], { type: 'text/plain' }).type)},"payload"]`)
+  expect(now.results).toEqual(before.results)
+  expect(now.bytes).toEqual(before.bytes)
 })
 
 test('frozen hold snapshots keep old versions through parking, release, compaction and replay', async () => {

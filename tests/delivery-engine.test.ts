@@ -25,6 +25,7 @@ import { assertNoLeak } from './test-helpers/credentials.ts'
 import { makeRecoveryHarness, personaOf, personaRow, retryNow } from './test-helpers/recovery-harness.ts'
 import { balancedAfter, onlyCallArguments, stripComments } from './test-helpers/source-audit.ts'
 import { appendTranscript, codexPromptEntry, endedTurn, promptEntry, queueOperationEntry, replyEntry, writeTranscript } from './test-helpers/working-row-panes.ts'
+import { spyOnCopies } from './test-helpers/copies.ts'
 
 const harnesses: EngineHarness[] = []
 afterEach(async () => { for (const h of harnesses.splice(0).reverse()) await h.cleanup() })
@@ -42,24 +43,23 @@ async function hold(h: EngineHarness, ts: string = THREAD_ROOTS.secondary, key =
 test.each([16, 64])('wakes over a growing %i-item queue clone at most the newly accepted item', async count => {
   const h = await harness()
   h.p().up = false
-  const clone = globalThis.structuredClone
-  const cloning = spyOn(globalThis, 'structuredClone').mockImplementation(value => clone(value))
+  const copies = spyOnCopies()
   let reads = 0
   try {
     for (let i = 0; i < count; i++) {
       expect((await h.queue.accept('alpha', injectedInput({ text: `queued ${i}` }))).status).toBe('accepted')
-      cloning.mockClear()
+      copies.clear()
       h.engine.wake('alpha')
       await h.tick()
       expect(h.engine.status('alpha')).toMatchObject({ seq: 1, count: i + 1, up: false })
-      reads += cloning.mock.calls.length
+      reads += copies.values.length
     }
     expect(reads).toBeLessThanOrEqual(count)
-    cloning.mockClear()
+    copies.clear()
     await h.tick()
     expect(h.engine.status('alpha')).toMatchObject({ seq: 1, count, up: false })
-    expect(cloning).not.toHaveBeenCalled()
-  } finally { cloning.mockRestore() }
+    expect(copies.values).toHaveLength(0)
+  } finally { copies.restore() }
   expect(h.calls).toEqual([])
   expect(h.queue.openCount('alpha')).toBe(count)
   expect(h.errors).toEqual([])

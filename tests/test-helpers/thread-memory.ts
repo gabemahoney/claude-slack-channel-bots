@@ -253,6 +253,9 @@ export interface ThreadHarnessOptions {
   /** Passed through to `createThreadMemory` as given, absent by default. */
   compactIntervalMs?: ThreadMemoryOptions['compactIntervalMs']
   monotonicNow?: ThreadMemoryOptions['monotonicNow']
+  /** Stamp facts are wired as main() wires them; `false` leaves the judge
+   * reading every channel's stamp, its path before stamp facts existed. */
+  stampFacts?: false
 }
 export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarnessOptions = {}) {
   const clock = options.clock ?? createFakeClock({ start: THREAD_TIME }), io = options.fs ?? threadFsControls(stateDir)
@@ -308,6 +311,7 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
     monotonicNow: options.monotonicNow,
     appliedKeys: options.appliedKeys ?? (() => authority.config().personas.map(p => p.key)),
     stamp: (key, channel) => authority.channelStamp(key, channel),
+    stampFacts: options.stampFacts === false ? undefined : () => authority.stampFacts(),
     heldStamps: options.heldStamps,
     unsavedOwnPosts: key => ownPosts?.unsavedDeferredPosts(key) ?? 0,
     canRun: options.canRun,

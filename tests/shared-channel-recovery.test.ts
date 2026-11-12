@@ -153,7 +153,13 @@ test.each(['recover', 'stage'] as const)('changed uncertain bytes keep the exist
     expect(authority.failure).toBe(''); expect(authority.snapshot()).toEqual(uncertain)
     expect(h.readRecord()).toEqual(exact)
   } else {
-    expect(authority.stageRestoration(sharedRecoveryRequest('report-stage', damaged), damaged, configBytes(input)).kind).toBe('unresolved')
+    // t3.yiv.sf.ws.ih, review-r2 R1: the caller's request keeps structuredClone;
+    // the fast copier copies only committed or parsed state.
+    const request = sharedRecoveryRequest('report-stage', damaged), serialising = spyOn(globalThis, 'structuredClone')
+    try {
+      expect(authority.stageRestoration(request, damaged, configBytes(input)).kind).toBe('unresolved')
+      expect(serialising.mock.calls.filter(([value]) => value === request)).toHaveLength(1)
+    } finally { serialising.mockRestore() }
     expect(authority.unreadableCause).toBe('restoration-staged')
     expect(authority.recoverDurability().kind).toBe('unresolved')
     expect(authority.unreadableCause).toBe('restoration-staged')

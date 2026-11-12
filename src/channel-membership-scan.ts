@@ -3,7 +3,7 @@
 import { randomUUID } from 'node:crypto'
 import { CHANNEL_ID_RE } from './config.ts'
 import type { ChannelMembership, MembershipGeneration } from './channel-membership.ts'
-import { applySharedMembership, type SharedChannelAuthority, type VerifiedSharedMembership } from './shared-channels.ts'
+import { applySharedMemberships, type SharedChannelAuthority, type VerifiedSharedMembership } from './shared-channels.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock, type PersonaConnectionManager, type PersonaStatusListener } from './persona-connections.ts'
 import { classifySlackValidationError, slackRetryAfterSeconds, type SlackValidationFailure } from './persona-slack-validation.ts'
 import {
@@ -118,7 +118,7 @@ export function createMembershipScanner(deps: MembershipScanDeps): MembershipSca
   const clock = deps.clock ?? SYSTEM_PERSONA_CONNECTION_CLOCK
   const entries = new Map<string, ScanEntry>()
   let closed = false
-  const unsubscribe = deps.authority.subscribe(() => {
+  const unsubscribe = deps.authority.subscribeChange(() => {
     for (const [key, entry] of entries) {
       if (entry.incarnation !== deps.authority.incarnation(key)) stop(key)
     }
@@ -223,8 +223,7 @@ export function createMembershipScanner(deps: MembershipScanDeps): MembershipSca
     deadline: number, boundaries: Map<string, number>, staged: readonly VerifiedSharedMembership[]): void {
     const { authority } = deps
     if (staged.length > 1 && authority.transactMembership(entry.key, authority.revision, (next, order) => {
-      let position = order - staged.length
-      for (const observation of staged) applySharedMembership(next, ++position, entry.key, generation.incarnation, observation)
+      applySharedMemberships(next, order - staged.length + 1, entry.key, generation.incarnation, staged)
     }, staged.length).kind === 'applied') {
       adopt(entry, generation, boundaries, staged)
       return

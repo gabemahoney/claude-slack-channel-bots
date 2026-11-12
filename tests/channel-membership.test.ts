@@ -17,6 +17,8 @@ import type { MembershipEvidence } from '../src/channel-membership-evidence.ts'
 import type { AcceptedRecord } from '../src/delivery-queue.ts'
 import { membershipScanDiagnostic, MEMBERSHIP_INVENTORY_COMPLETE, MEMBERSHIP_INVENTORY_INCOMPLETE, type MembershipScanStatus } from '../src/channel-membership-scan.ts'
 import { SR8_SHARED_LIST_CHANNELS } from './test-helpers/thread-memory.ts'
+import { spyOnCopies } from './test-helpers/copies.ts'
+import * as sharedChannels from '../src/shared-channels.ts'
 
 const runs: MembershipHarness[] = [], dirs: string[] = []
 function fixture(opts: Parameters<typeof makeMembershipHarness>[1] = {}, dir = mkdtempSync(join(tmpdir(), 'membership-'))) {
@@ -2145,13 +2147,13 @@ test('a reconciliation request beside SR8_SHARED_LIST_CHANNELS reviewed channels
   const { f } = await reviewedBesideSavedConflict()
   f.membership.invalidate('alpha')
   const before = f.authority.snapshot()
-  const spies = [spyOn(f.authority, 'snapshot'), spyOn(f.authority, 'personaSnapshot'), spyOn(globalThis, 'structuredClone')]
+  const spies = [spyOn(f.authority, 'snapshot'), spyOn(f.authority, 'personaSnapshot')], copies = spyOnCopies()
   let listed: string[]
   try {
     listed = f.membership.unresolvedChannels('alpha')
     f.membership.request('alpha')
-    expect(spies.map(spy => spy.mock.calls.length)).toEqual([0, 0, 0])
-  } finally { for (const spy of spies) spy.mockRestore() }
+    expect([...spies.map(spy => spy.mock.calls.length), copies.values.length]).toEqual([0, 0, 0])
+  } finally { for (const spy of spies) spy.mockRestore(); copies.restore() }
   expect(listed).toEqual([C.primary])
   expect(f.scanner.status('alpha')).toMatchObject({ problem: 'event-order-conflict' })
   expect(f.authority.snapshot()).toEqual(before)
@@ -2161,12 +2163,12 @@ test('a reconciliation request beside SR8_SHARED_LIST_CHANNELS reviewed channels
 test('membership reads of SR8_SHARED_LIST_CHANNELS reviewed channels beside saved unresolved history clone no shared state', async () => {
   const { f, ids } = await reviewedBesideSavedConflict()
   const before = f.authority.snapshot()
-  const clones = spyOn(globalThis, 'structuredClone')
+  const clones = spyOnCopies()
   let answers: unknown[]
   try {
     answers = [...ids, C.primary].map(id => [reading(f, id).kind, reading(f, id).kind, f.membership.hasUnresolved('alpha', id)])
-    expect(clones).toHaveBeenCalledTimes(0)
-  } finally { clones.mockRestore() }
+    expect(clones.values).toHaveLength(0)
+  } finally { clones.restore() }
   expect(answers).toEqual([...ids.map(() => ['eligible', 'eligible', false]), ['unresolved', 'unresolved', true]])
   expect(f.authority.snapshot()).toEqual(before)
 })
@@ -2243,12 +2245,12 @@ test.each<[string, (f: MembershipHarness) => Promise<MembershipHarness>, string[
   f.membership.invalidate('alpha')
   const answers = () => {
     expect(AGREEMENT_CHANNELS.map(channel => f.authority.readableFor('alpha', channel))).toEqual(AGREEMENT_CHANNELS.map(() => true))
-    const clones = spyOn(globalThis, 'structuredClone')
+    const clones = spyOnCopies()
     let listed: string[]
     try {
       listed = f.membership.unresolvedChannels('alpha')
-      expect(clones).toHaveBeenCalledTimes(0)
-    } finally { clones.mockRestore() }
+      expect(clones.values).toHaveLength(0)
+    } finally { clones.restore() }
     const checked = AGREEMENT_CHANNELS.filter(channel => f.membership.hasUnresolved('alpha', channel))
     expect(checked).toEqual(AGREEMENT_CHANNELS.filter(channel => listed.includes(channel)))
     expect([...listed].sort()).toEqual([...expected].sort())
@@ -2302,20 +2304,93 @@ test('a scan of SR8_SHARED_LIST_CHANNELS channels and live membership events clo
     membershipPage(ids.slice(i * MEMBERSHIP_PAGE_LIMIT, (i + 1) * MEMBERSHIP_PAGE_LIMIT), i + 1 < pages ? `page-${i + 1}` : undefined)))
   await f.start()
   const before = f.writes.length
-  const clones = spyOn(globalThis, 'structuredClone')
+  const clones = spyOnCopies()
   let copies: unknown[], scanned: MembershipScanStatus
   try {
     await f.scan()
     scanned = f.scanner.status('alpha')
     await f.event(false, ids[0]!); await f.event(true, C.primary)
-    copies = clones.mock.calls.filter(([value]) => typeof value === 'object' && value !== null && (value as { format?: unknown }).format === SHARED_CHANNEL_FORMAT)
-  } finally { clones.mockRestore() }
+    copies = clones.values.filter(value => typeof value === 'object' && value !== null && (value as { format?: unknown }).format === SHARED_CHANNEL_FORMAT)
+  } finally { clones.restore() }
   expect(copies).toHaveLength(0)
   // One write per page, the inventory commit, then each live event.
   expect(f.writes.length - before).toBe(pages + 3)
   expect(scanned).toMatchObject({ state: 'complete', pages, positives: ids.length })
   expect([life(f).membership[ids[0]!]!.member, life(f).membership[C.primary]!.member]).toEqual([false, true])
   expect(readSharedState(f.stateDir)).toEqual(f.authority.snapshot())
+})
+
+// t3.yiv.sf.ws.ih: membership and the scanner read no configuration, yet every
+// commit parsed the applied configuration once for each of them.
+test('a scan of SR8_SHARED_LIST_CHANNELS channels and live membership events parse no configuration for membership or the scanner', async () => {
+  const channels = channelPopulation(SR8_SHARED_LIST_CHANNELS), ids = channels.map(c => c.id)
+  const f = fixture({ channels })
+  const pages = Math.ceil(ids.length / MEMBERSHIP_PAGE_LIMIT)
+  stub(f).script.inventory.push(...Array.from({ length: pages }, (_, i) =>
+    membershipPage(ids.slice(i * MEMBERSHIP_PAGE_LIMIT, (i + 1) * MEMBERSHIP_PAGE_LIMIT), i + 1 < pages ? `page-${i + 1}` : undefined)))
+  await f.start()
+  const before = f.writes.length
+  type Config = ReturnType<typeof f.authority.config>
+  const published: Config[] = []
+  const unsubscribe = f.authority.subscribe(config => { published.push(config) })
+  const parses = spyOn(f.authority, 'config'), clones = spyOnCopies()
+  let parsed: number, copies: number, scanned: MembershipScanStatus
+  try {
+    await f.scan()
+    scanned = f.scanner.status('alpha')
+    await f.event(false, ids[0]!); await f.event(true, C.primary)
+    parsed = parses.mock.calls.length
+    copies = clones.values.filter(value => typeof value === 'object' && value !== null && 'reply_chunk_limit' in value &&
+      (value as Config).personas.every(persona => typeof persona.key === 'string')).length
+  } finally { parses.mockRestore(); clones.restore(); unsubscribe() }
+  // One write per page, the inventory commit, then each live event.
+  const commits = f.writes.length - before
+  expect(commits).toBe(pages + 3)
+  // Each commit's configuration goes to its two readers: the harness's, copied, then this test's.
+  expect({ parsed, copies, published: published.length }).toEqual({ parsed: 0, copies: commits, published: commits })
+  expect(published.at(-1)).toEqual(f.authority.config())
+  expect(f.h.config).toEqual(f.authority.config())
+  expect(f.h.config).not.toBe(published.at(-1))
+  expect(scanned).toMatchObject({ state: 'complete', pages, positives: ids.length })
+  expect(readSharedState(f.stateDir)).toEqual(f.authority.snapshot())
+})
+// t3.yiv.sf.ws.ih: each positive of a scan page rebuilt the persona's raw
+// channel list from all its assignments; the page keeps only the last list.
+test('a scan of SR8_SHARED_LIST_CHANNELS channels derives one raw channel list per page and writes what one application per positive wrote', async () => {
+  const channels = channelPopulation(SR8_SHARED_LIST_CHANNELS), ids = channels.map(c => c.id)
+  const pages = Math.ceil(ids.length / MEMBERSHIP_PAGE_LIMIT)
+  const dir = mkdtempSync(join(tmpdir(), 'membership-'))
+  const assignmentMap = (value: unknown) => typeof value === 'object' && value !== null && !Array.isArray(value) && Object.keys(value).length > 0 &&
+    Object.values(value).every(entry => typeof entry === 'object' && entry !== null && 'delivery' in entry && 'order' in entry)
+  async function scanned(perPositive: boolean) {
+    rmSync(dir, { recursive: true, force: true }); mkdirSync(dir)
+    const f = fixture({ channels }, dir)
+    stub(f).script.inventory.push(...Array.from({ length: pages }, (_, i) =>
+      membershipPage(ids.slice(i * MEMBERSHIP_PAGE_LIMIT, (i + 1) * MEMBERSHIP_PAGE_LIMIT), i + 1 < pages ? `page-${i + 1}` : undefined)))
+    await f.start()
+    // The scanner's page batch as it ran before: one whole application per positive.
+    const batch = perPositive ? spyOn(sharedChannels, 'applySharedMemberships').mockImplementation((next, first, key, incarnation, observations, mint) => {
+      observations.forEach((observation, index) => sharedChannels.applySharedMembership(next, first + index, key, incarnation, observation, mint))
+    }) : undefined
+    const entries = spyOn(Object, 'entries')
+    let derivations: number
+    try {
+      await f.scan()
+      derivations = entries.mock.calls.filter(([value]) => assignmentMap(value)).length
+    } finally { entries.mockRestore(); batch?.mockRestore() }
+    expect(f.scanner.status('alpha')).toMatchObject({ state: 'complete', pages, positives: ids.length })
+    // Scan and connection IDs are random; the same history mints them in the same order.
+    const minted = new Map<string, string>()
+    const text = JSON.stringify({ writes: f.writes, captured: f.captured(), acks: stub(f).socket.acks, status: f.scanner.status('alpha'), memory: f.authority.snapshot() })
+      .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, id => minted.get(id) ?? minted.set(id, `id-${minted.size + 1}`).get(id)!)
+    await f.close(); expect(f.h.clock.pendingCount()).toBe(0); assertNoLeak(f.captured())
+    runs.splice(runs.indexOf(f), 1)
+    return { history: JSON.parse(text) as unknown, derivations }
+  }
+  const batched = await scanned(false), perPositive = await scanned(true)
+  console.info(`scan raw channel derivations batched=${batched.derivations} per_positive=${perPositive.derivations} pages=${pages} positives=${ids.length}`)
+  expect(batched.history).toEqual(perPositive.history)
+  expect(perPositive.derivations - batched.derivations).toBe(ids.length - pages)
 })
 
 /** Scan pages, live joins and leaves, a failed write, an unsynced write and a
@@ -2340,12 +2415,12 @@ test('a membership history commits as whole-state transactions would: writes, li
     rmSync(dir, { recursive: true, force: true }); mkdirSync(dir)
     const f = fixture({}, dir)
     if (whole) f.authority.transactMembership = (key, revision, change, span) => f.authority.transact(revision, change, span)
-    const clones = spyOn(globalThis, 'structuredClone')
+    const clones = spyOnCopies()
     let copies: number
     try {
       await membershipHistory(f)
-      copies = clones.mock.calls.filter(([value]) => typeof value === 'object' && value !== null && (value as { format?: unknown }).format === SHARED_CHANNEL_FORMAT).length
-    } finally { clones.mockRestore() }
+      copies = clones.values.filter(value => typeof value === 'object' && value !== null && (value as { format?: unknown }).format === SHARED_CHANNEL_FORMAT).length
+    } finally { clones.restore() }
     // Scan and connection IDs are random; the same history mints them in the same order.
     const ids = new Map<string, string>()
     const text = JSON.stringify({ writes: f.writes, captured: f.captured(), acks: stub(f).socket.acks, status: f.scanner.status('alpha'), memory: f.authority.snapshot() })

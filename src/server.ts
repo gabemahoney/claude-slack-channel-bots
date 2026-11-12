@@ -2960,6 +2960,7 @@ export async function main(): Promise<void> {
     canRun: threadMemoryWorkAllowed,
     appliedKeys: () => personaConfig?.personas.map(persona => persona.key) ?? [],
     stamp: (key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel),
+    stampFacts: () => reloadController?.sharedChannels()?.stampFacts(),
     authorityReady: () => reloadController?.sharedChannels() !== undefined,
     heldStamps: key => deliveryQueue?.unresolvedHolds(key).filter(hold => hold.memoryDependent).map(hold => ({ channel: hold.channel, stamp: hold.stamp })) ?? [],
     unsavedOwnPosts: key => ownPostJoins?.unsavedDeferredPosts(key) ?? 0,

@@ -1,6 +1,7 @@
 /** Shared byte-level journal operations. Construction performs no I/O. */
 import * as nodeFs from 'node:fs'
 import { randomUUID } from 'node:crypto'
+import { types } from 'node:util'
 import { durableUnlinkSync } from './atomic-write.ts'
 
 export interface AppendRollback { pendingRollback?: number }
@@ -31,6 +32,83 @@ export function removeTornTail(rollback: AppendRollback, line: JournalLine): voi
  * a resolved promise would not, because microtasks run before them. */
 export function yieldToEventLoop(): Promise<void> {
   return new Promise(resolve => setImmediate(resolve))
+}
+
+const NOT_JOURNAL_DATA = Symbol('not journal data')
+/** Objects found frozen and plain data all the way down. They can never
+ * change, so their properties are read without inspecting them again. */
+const frozenData = new WeakSet<object>()
+/** Whether `source` is an array, or else whether it is an object with a plain
+ * object's prototype; throws for anything else. Runs no code of `source`'s,
+ * as a proxy's traps would. */
+function plainShape(source: object): boolean {
+  if (types.isProxy(source)) throw NOT_JOURNAL_DATA
+  const prototype = Object.getPrototypeOf(source)
+  if (Array.isArray(source)) {
+    // A hole or a named property needs structuredClone's array form.
+    if (prototype !== Array.prototype || Object.keys(source).length !== source.length) throw NOT_JOURNAL_DATA
+    return true
+  }
+  if (prototype !== Object.prototype && prototype !== null) throw NOT_JOURNAL_DATA
+  return false
+}
+/** An own enumerable data property's value, read without calling an accessor. */
+function dataProperty(source: object, key: string | number): unknown {
+  // Assigning `__proto__` would set the prototype, not an own property.
+  if (key === '__proto__') throw NOT_JOURNAL_DATA
+  const property = Object.getOwnPropertyDescriptor(source, key)
+  if (!property?.enumerable || !('value' in property)) throw NOT_JOURNAL_DATA
+  return property.value
+}
+function frozenDataValue(value: unknown): boolean {
+  return typeof value !== 'object' || value === null || frozenData.has(value)
+}
+/** `structuredClone` of journal and state data without its serialisation
+ * round trip, which copies every string: plain objects and dense arrays of
+ * enumerable data properties, and scalars, shared and cyclic references kept
+ * as `structuredClone` keeps them. Any other value goes to `structuredClone`
+ * itself, untouched: the copy runs no code of the value's first.
+ *
+ * Contract: pass only data CSCB built itself (parsed JSON, its own records)
+ * or values `structuredClone` already copied. Their plain objects are
+ * ordinary, so the copy equals `structuredClone`'s. A caller-supplied value
+ * can be anything, such as an object with internal slots behind a plain
+ * object's prototype, which this copy would take for plain data: every entry
+ * point taking one copies it with `structuredClone` itself. */
+export function cloneJournalData<T>(value: T): T {
+  const copies = new Map<object, unknown>()
+  const copy = (source: unknown): unknown => {
+    if (typeof source === 'function' || typeof source === 'symbol') throw NOT_JOURNAL_DATA
+    if (typeof source !== 'object' || source === null) return source
+    const seen = copies.get(source)
+    if (seen !== undefined) return seen
+    // Frozen data's properties are known to be plain data.
+    const known = frozenData.has(source)
+    const array = known ? Array.isArray(source) : plainShape(source)
+    let frozen = !known && Object.isFrozen(source)
+    if (array) {
+      const list = source as unknown[], target: unknown[] = []
+      copies.set(source, target)
+      for (let i = 0; i < list.length; i++) {
+        const member = known ? list[i] : dataProperty(list, i)
+        target.push(copy(member))
+        frozen &&= frozenDataValue(member)
+      }
+      if (frozen) frozenData.add(source)
+      return target
+    }
+    const record = source as Record<string, unknown>, target: Record<string, unknown> = {}
+    copies.set(source, target)
+    for (const key of Object.keys(record)) {
+      const member = known ? record[key] : dataProperty(record, key)
+      target[key] = copy(member)
+      frozen &&= frozenDataValue(member)
+    }
+    if (frozen) frozenData.add(source)
+    return target
+  }
+  // The copy ran no code of the value's, so `structuredClone` sees it as given.
+  try { return copy(value) as T } catch { return structuredClone(value) }
 }
 
 export interface DurableJournalOptions {

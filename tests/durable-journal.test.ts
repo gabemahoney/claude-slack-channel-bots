@@ -1,9 +1,9 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  createDurableJournal, removeTornTail, setDurableAppendTimer, splitJournalLines, yieldToEventLoop,
+  cloneJournalData, createDurableJournal, removeTornTail, setDurableAppendTimer, splitJournalLines, yieldToEventLoop,
   type AppendRollback, type DurableAppendTiming,
 } from '../src/durable-journal.ts'
 import { durableIo, heldStep, type DurableStepForm } from './test-helpers/durable-io.ts'
@@ -880,4 +880,181 @@ describe('exact byte line splitting', () => {
     ])
   })
   test('an empty file has no lines', () => expect(splitJournalLines(Buffer.alloc(0))).toEqual([]))
+})
+
+/** The same values, prototypes, frozenness, property descriptors and
+ * aliasing: what `toEqual` cannot see, such as a lost shared reference. */
+function sameCopy(a: unknown, b: unknown, pairs = new Map<object, object>(), back = new Map<object, object>()): string | undefined {
+  if (typeof a !== 'object' || a === null || typeof b !== 'object' || b === null) return Object.is(a, b) ? undefined : `${String(a)} vs ${String(b)}`
+  if (pairs.has(a)) return pairs.get(a) === b ? undefined : 'aliasing'
+  if (back.has(b)) return 'aliasing'
+  pairs.set(a, b); back.set(b, a)
+  if (Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return 'prototype'
+  if (Array.isArray(a) !== Array.isArray(b)) return 'array'
+  if (Object.isFrozen(a) !== Object.isFrozen(b)) return 'frozen'
+  const keys = Reflect.ownKeys(a).map(String), otherKeys = Reflect.ownKeys(b).map(String)
+  if (keys.join('\0') !== otherKeys.join('\0')) return `keys ${keys} vs ${otherKeys}`
+  for (const key of Reflect.ownKeys(a)) {
+    const da = Object.getOwnPropertyDescriptor(a, key)!, db = Object.getOwnPropertyDescriptor(b, key)!
+    if (da.writable !== db.writable || da.enumerable !== db.enumerable || da.configurable !== db.configurable || ('get' in da) !== ('get' in db)) return `descriptor ${String(key)}`
+    const differs = sameCopy(da.value, db.value, pairs, back)
+    if (differs) return `${String(key)}: ${differs}`
+  }
+  return undefined
+}
+function copyOutcome(copy: () => unknown): { value?: unknown; error?: string } {
+  try { return { value: copy() } } catch (error) { return { error: `${(error as Error).name}: ${(error as Error).message}` } }
+}
+
+// t3.yiv.sf.ws.ih: queue and shared-state copies went through structuredClone,
+// whose serialisation round trip copies every string of every record. The
+// copier's contract: data CSCB built, or values structuredClone already
+// copied; values callers hand in keep structuredClone (delivery-queue tests).
+describe('journal data copies', () => {
+  const shared = { incarnation: 'life', threadHybridSince: 'since' }
+  const fixed = { v: 1, kind: 'fixed', seq: 1, parts: ['a', 'b'] }
+  /** Values `cloneJournalData` copies itself. */
+  function journalData(): Record<string, unknown> {
+    const cyclic: Record<string, unknown> = { a: 1 }; cyclic['self'] = cyclic; cyclic['list'] = [cyclic, { back: cyclic }]
+    const hidden = { a: 1 }; Object.defineProperty(hidden, 'hidden', { value: 2, enumerable: false })
+    return {
+      item: { accepted: { v: 1, kind: 'accepted', seq: 1, text: 'hi 🙂', thread_ts: undefined, key: { chat_id: 'C0TEST001', ts: '1700000000.000001' } },
+        fixed, records: [fixed, { kind: 'sent', attempt: 1 }], delivered: false, hold: { field: { stamp: shared, again: shared } }, shared: [shared, shared] },
+      scalars: { a: undefined, b: null, c: -0, d: NaN, e: 1n, f: 'x', g: true, h: Infinity },
+      cyclic, hidden,
+      nullPrototype: Object.assign(Object.create(null), { a: 1, b: { c: 2 } }),
+      symbolKey: { a: 1, [Symbol('key')]: 2 },
+      order: { b: 1, 2: 2, a: 3, 1: 4 },
+      frozen: Object.freeze({ a: Object.freeze([1, Object.freeze({ b: 2 })]) }),
+      number: 5, string: 'text', undefined: undefined, null: null, emptyArray: [], emptyObject: {},
+    }
+  }
+  /** Values only `structuredClone` copies (or refuses) as `structuredClone` does. */
+  function otherData(): Record<string, unknown> {
+    class Thing { x = 1; y = { z: 2 } }
+    const named: unknown[] & { name?: string } = [1, 2]; named.name = 'x'
+    const holed = [1, , 3]
+    const holedNamed: unknown[] & { name?: string } = [1, , 3]; holedNamed.name = 'x'
+    // A non-enumerable index beside a named property keeps the key count.
+    const hiddenIndex: unknown[] & { name?: string } = [1, 2]; Object.defineProperty(hiddenIndex, 0, { value: 1, enumerable: false }); hiddenIndex.name = 'x'
+    const accessorIndex = [1, 2]; Object.defineProperty(accessorIndex, 1, { get: () => 5, enumerable: true })
+    const setterOnly = { a: 1 }; Object.defineProperty(setterOnly, 'b', { set: () => {}, enumerable: true })
+    return {
+      named, holed, holedNamed, hiddenIndex,
+      builtIns: { when: new Date(0), map: new Map([[1, { a: 1 }]]), set: new Set([1]), bytes: new Uint8Array([1, 2]), list: [shared, shared] },
+      functionValue: { a: 1, f: () => 1 }, topFunction: () => 1,
+      symbolValue: { a: Symbol('value') },
+      protoKey: JSON.parse('{"__proto__": {"a": 1}, "b": 2}'),
+      instance: new Thing(), nestedInstance: { t: new Thing() },
+      error: { e: new Error('boom') },
+      boxed: { s: new String('x') },
+      getter: { get x() { return { n: 1 } } }, accessorIndex, setterOnly,
+      proxy: new Proxy({ a: 1 }, {}), arrayProxy: new Proxy([1, 2], {}), nestedProxy: { a: { b: 1 }, p: new Proxy({ c: 3 }, {}) },
+    }
+  }
+  /** Values `structuredClone` already copied, which keep their own prototypes. */
+  function nativelyCopied(): Record<string, unknown> {
+    return structuredClone({
+      record: { accepted: { text: 'hi', key: { chat_id: 'C0TEST001', ts: '1700000000.000001' } }, parts: ['a', 'b'] },
+      fromNullPrototype: Object.assign(Object.create(null), { a: { b: 1 } }),
+      builtIns: { when: new Date(0), map: new Map([[1, { a: 1 }]]), bytes: new Uint8Array([1, 2]), error: new Error('boom'), boxed: new String('x'), list: [shared, shared] },
+      blob: { file: new Blob(['payload'], { type: 'text/plain' }) },
+    })
+  }
+
+  test.each([['journal data', journalData], ['other values', otherData], ['values structuredClone copied', nativelyCopied]] as const)('copies %s exactly as structuredClone does, errors included', (_, values) => {
+    for (const [name, value] of Object.entries(values())) {
+      const expected = copyOutcome(() => structuredClone(value)), actual = copyOutcome(() => cloneJournalData(value))
+      if (expected.error || actual.error) { expect(`${name}: ${actual.error}`).toBe(`${name}: ${expected.error}`); continue }
+      expect(`${name}: ${sameCopy(expected.value, actual.value) ?? 'same'}`).toBe(`${name}: same`)
+      if (typeof value === 'object' && value !== null) expect(actual.value).not.toBe(value)
+    }
+  })
+
+  test('a Blob structuredClone copied keeps its payload and type', async () => {
+    const { blob } = nativelyCopied() as { blob: { file: Blob } }
+    const copy = cloneJournalData(blob)
+    expect(copy.file).toBeInstanceOf(Blob)
+    expect(copy.file).not.toBe(blob.file)
+    expect([copy.file.type, await copy.file.text()]).toEqual([blob.file.type, 'payload'])
+  })
+
+  test('journal data is copied without structuredClone; any other value goes through it once, unchanged', () => {
+    const copied = nativelyCopied() as Record<string, unknown>
+    const serialising = spyOn(globalThis, 'structuredClone')
+    try {
+      for (const value of [...Object.values(journalData()), copied['record'], copied['fromNullPrototype']]) cloneJournalData(value)
+      expect(serialising).not.toHaveBeenCalled()
+      for (const [name, value] of [...Object.entries(otherData()), ['builtIns', copied['builtIns']], ['blob', copied['blob']]] as Array<[string, unknown]>) {
+        serialising.mockClear()
+        copyOutcome(() => cloneJournalData(value))
+        expect(`${name}: ${serialising.mock.calls.length}`).toBe(`${name}: 1`)
+        expect(serialising.mock.calls[0]![0]).toBe(value)
+      }
+    } finally { serialising.mockRestore() }
+  })
+
+  /** A proxy handler logging every trap a copy could run. */
+  function traps(log: string[]): ProxyHandler<object> {
+    return {
+      get: (target, key, receiver) => { log.push(`get ${String(key)}`); return Reflect.get(target, key, receiver) },
+      has: (target, key) => { log.push(`has ${String(key)}`); return Reflect.has(target, key) },
+      ownKeys: target => { log.push('ownKeys'); return Reflect.ownKeys(target) },
+      getOwnPropertyDescriptor: (target, key) => { log.push(`describe ${String(key)}`); return Reflect.getOwnPropertyDescriptor(target, key) },
+      getPrototypeOf: target => { log.push('prototype'); return Reflect.getPrototypeOf(target) },
+      isExtensible: target => { log.push('extensible'); return Reflect.isExtensible(target) },
+    }
+  }
+  class SlackKey { chat_id = 'C0TEST001'; ts = '1700000000.000001' }
+  /** Inputs whose reading runs code, each logging what ran. */
+  const codeRunning: Array<[string, (log: string[]) => unknown]> = [
+    // review-r1 R1: the getter ran in the copy, then again in the fallback the class instance needs.
+    ['a getter before a fallback', log => { let n = 0; return { source: 'slack', get text() { log.push('text'); return `message-${++n}` }, key: new SlackKey() } }],
+    ['a getter deleting a later property', log => {
+      const value: Record<string, unknown> = { get a() { log.push('a'); delete value['b']; return 1 }, b: 2, c: 3 }
+      return value
+    }],
+    ['a getter whose second answer cannot be copied', log => ({ get x() { log.push('x'); return log.length > 1 ? () => 1 : 1 }, when: new Date(0) })],
+    ['a throwing getter after data', log => ({ a: { b: 1 }, get c() { log.push('c'); throw new Error('read refused') } })],
+    ['an accessor index', log => { const list = [1, { a: 2 }]; Object.defineProperty(list, 0, { get() { log.push('0'); return 5 }, enumerable: true }); return { list } }],
+    ['a frozen object with a getter', log => Object.freeze({ a: Object.freeze([1]), get b() { log.push('b'); return { c: 1 } } })],
+    ['a proxy', log => new Proxy({ a: 1, b: { c: 2 } }, traps(log))],
+    ['an array proxy', log => new Proxy([1, { a: 2 }], traps(log))],
+    ['a proxy after data', log => ({ a: { b: 1 }, p: new Proxy({ c: 3 }, traps(log)) })],
+  ]
+  test.each(codeRunning)('copies %s as structuredClone does, running the same code once', (_, input) => {
+    const expectedLog: string[] = [], actualLog: string[] = []
+    const expected = copyOutcome(() => structuredClone(input(expectedLog))), actual = copyOutcome(() => cloneJournalData(input(actualLog)))
+    expect(actual.error).toBe(expected.error)
+    if (!expected.error) expect(sameCopy(expected.value, actual.value) ?? 'same').toBe('same')
+    expect(actualLog).toEqual(expectedLog)
+  })
+
+  test('frozen plain data is inspected once; frozen data holding code or an unfrozen part is read as given each time', () => {
+    const data = Object.freeze({ a: Object.freeze([1, Object.freeze({ b: 'x' })]), c: Object.freeze({}), d: Object.freeze({ e: 1n }) })
+    const descriptors = spyOn(Object, 'getOwnPropertyDescriptor')
+    let inspected: number[]
+    let copies: unknown[]
+    try {
+      copies = [cloneJournalData(data)]; inspected = [descriptors.mock.calls.length]
+      descriptors.mockClear()
+      copies.push(cloneJournalData(data), cloneJournalData({ again: data })); inspected.push(descriptors.mock.calls.length)
+    } finally { descriptors.mockRestore() }
+    // Each own property once (a, c, d, both indexes, b, e); the record wrapping `data` again.
+    expect(inspected).toEqual([7, 1])
+    expect(copies.map(copy => sameCopy(structuredClone(data), (copy as { again?: unknown }).again ?? copy) ?? 'same')).toEqual(['same', 'same', 'same'])
+    // An unfrozen part can change between copies.
+    const inner = { b: 1 }, partly = Object.freeze({ inner })
+    expect(cloneJournalData(partly)).toEqual({ inner: { b: 1 } })
+    inner.b = 2
+    expect(cloneJournalData(partly)).toEqual({ inner: { b: 2 } })
+    // A getter runs for every copy, as structuredClone's.
+    let reads = 0
+    const accessor = Object.freeze({ get a() { return ++reads } })
+    expect([cloneJournalData(accessor), cloneJournalData(accessor)]).toEqual([{ a: 1 }, { a: 2 }])
+    // A proxy in frozen data is refused every time, as structuredClone refuses it, running none of its traps.
+    const log: string[] = [], proxied = Object.freeze({ p: new Proxy(Object.freeze({ a: 1 }), traps(log)) })
+    for (let i = 0; i < 2; i++) expect(copyOutcome(() => cloneJournalData(proxied))).toEqual(copyOutcome(() => structuredClone(proxied)))
+    expect([reads, log]).toEqual([2, []])
+  })
 })

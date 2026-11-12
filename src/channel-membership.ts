@@ -121,7 +121,7 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
   const episodes = new Map<string, Map<string, MembershipFault>>()
   const seenReplacements = new Set(authority.absenceReplacements().map(replacement => replacement.binding))
   let closed = false
-  const unsubscribe = authority.subscribe(() => {
+  const unsubscribe = authority.subscribeChange(() => {
     for (const [key, incarnation] of undurableIncarnations) {
       if (authority.incarnation(key) !== incarnation) { undurable.delete(key); undurableAbsences.delete(key); undurableIncarnations.delete(key) }
     }

@@ -2222,6 +2222,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       clearInterval: threadMaintenance.clearInterval as typeof globalThis.clearInterval,
       appliedKeys: () => serverConfig()?.personas.map(p => p.key) ?? [],
       stamp: (key, channel) => controller?.sharedChannels()?.channelStamp(key, channel),
+      stampFacts: () => controller?.sharedChannels()?.stampFacts(),
       authorityReady: () => controller?.sharedChannels() !== undefined,
       heldStamps: key => queue.unresolvedHolds(key).filter(hold => hold.memoryDependent).map(hold => ({ channel: hold.channel, stamp: hold.stamp })),
       threadHybridChannels: key => controller?.sharedChannels()?.threadView().threadHybridChannels(key) ?? [],

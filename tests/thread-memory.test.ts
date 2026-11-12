@@ -39,6 +39,7 @@ import type { SharedChannelAuthority } from '../src/shared-channels.ts'
 import { makeReloadHarness, type ReloadRun } from './test-helpers/reload-harness.ts'
 import { acceptedRecord, deliveredRecord, fixedRecord, injectedInput, makeQueue, queuePath, seedQueue, slackInput, memoryHold, heldSlackInput } from './test-helpers/delivery-queue.ts'
 import { durableIo } from './test-helpers/durable-io.ts'
+import { spyOnCopies } from './test-helpers/copies.ts'
 import { makeDeferredWebApiCall, makeStubSlack } from './test-helpers/slack-stub.ts'
 import { MEMBERSHIP_PAGE_LIMIT, MEMBERSHIP_RETRY_MIN_MS } from '../src/channel-membership-retry.ts'
 import { _resetRegistry } from '../src/registry.ts'
@@ -2708,15 +2709,15 @@ describe('Thread Memory compaction in slices', () => {
   test('new and earlier joins copy normalized facts without per-join structuredClone, retaining caller isolation', async () => {
     const h = fixture(); await h.start()
     const fact = h.fact(), original = structuredClone(fact)
-    const copying = spyOn(globalThis, 'structuredClone')
+    const copying = spyOnCopies()
     let calls: number
     try {
       expect(h.memory.addJoin('alpha', fact)).toBe(true)
       fact.stamp.incarnation = 'caller changed'; fact.root = rootOf(999)
       expect(h.memory.addJoin('alpha', { ...original, at: original.at - 1 })).toBe(true)
       expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
-      calls = copying.mock.calls.length
-    } finally { copying.mockRestore() }
+      calls = copying.values.length
+    } finally { copying.restore() }
     expect(calls!).toBe(0)
     expect(h.memory.joins('alpha')).toEqual([{ join: { ...original, at: original.at - 1 }, savedAt: original.at - 1 }])
     expect(savedJoins(h).map(({ v, kind, seq, ...join }) => join)).toEqual([
@@ -3458,6 +3459,361 @@ describe('Thread Memory rejudges only channels whose stamp changed (t2.yiv.sf.aa
     expect(h.members.scanner.status('alpha')).toMatchObject({ state: 'incomplete', problem: 'transport' })
     expect(h.memory.view('alpha', C.primary, R.primary)).toBe('joined')
     expect(h.records().filter(r => r.kind === 'post-outcome')).toMatchObject([{ operationId: operation, outcome: 'joined' }])
+  })
+})
+
+// t3.yiv.sf.ws.ih: each save judged every joined channel again, reading its
+// stamp, though no fact any stamp derives from had changed since.
+describe('Thread Memory judges no channel again under unchanged stamp facts', () => {
+  const channels = channelPopulation(24).map(channel => channel.id)
+  /** Saves across `channels` between publications that keep, change, hold and
+   * leave undecided their stamps, with each save's stamp reads. */
+  async function history(stampFacts: boolean) {
+    let held: ThreadJoin[] = []
+    const h = fixture({ heldStamps: key => key === 'alpha' ? held : [], ...(stampFacts ? {} : { stampFacts: false as const }) })
+    expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha'], channels)).kind).toBe('applied')
+    await h.start()
+    const read = h.authority.channelStamp
+    let reads = 0
+    h.authority.channelStamp = (key, channel) => { reads++; return read(key, channel) }
+    const saveReads: number[] = [], results: unknown[] = []
+    let n = 0
+    const factOn = (channel: string) => h.fact({ channel, root: `1700000002.${String(++n).padStart(6, '0')}` })
+    async function save(facts: ThreadJoin[]) {
+      const before = reads
+      results.push(await h.memory.saveJoins('alpha', facts))
+      saveReads.push(reads - before)
+      return facts
+    }
+    await save(channels.map(factOn))
+    for (const channel of channels.slice(0, 12)) await save([factOn(channel)])
+    // A changed stamp forgets that channel's joins at its publication.
+    results.push(h.choose('mentions', 'alpha', channels[0]!).kind, h.choose('thread_hybrid', 'alpha', channels[0]!).kind)
+    for (const channel of channels.slice(0, 6)) await save([factOn(channel)])
+    // A join a hold names moves to the held index when its stamp changes.
+    held = await save([factOn(channels[1]!)])
+    results.push(h.choose('mentions', 'alpha', channels[1]!).kind)
+    for (const channel of channels.slice(2, 8)) await save([factOn(channel)])
+    results.push(held.map(fact => h.memory.joinedBy('alpha', fact.channel, fact.root, fact.stamp, fact.at)))
+    held = []
+    // Undecided stamps keep every join until the authority recovers.
+    const pending = [factOn(channels[2]!), factOn(channels[3]!)]
+    h.failShared(() => 'unsynced')
+    results.push(h.choose('mentions', 'alpha', channels[2]!).kind)
+    await save(pending)
+    h.failShared(); results.push(h.authority.recoverDurability().kind)
+    for (const channel of channels.slice(3, 9)) await save([factOn(channel)])
+    h.authority.channelStamp = read
+    // Store IDs, digest keys and stamps are minted per run; each history mints them in the same order.
+    const minted = new Map<string, string>()
+    const text = JSON.stringify({ results, joins: h.memory.joins('alpha'), records: readThreads(h.stateDir), events: h.events })
+      .replaceAll(h.stateDir, '<dir>')
+      .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{64}/g, id => minted.get(id) ?? minted.set(id, `id-${minted.size + 1}`).get(id)!)
+    return { history: JSON.parse(text) as unknown, saveReads }
+  }
+
+  test('a history of saves and publications keeps the outcomes, journal and events of judging every channel, reading stamps only after a fact changed', async () => {
+    const unwired = await history(false), wired = await history(true)
+    console.info(`judge stamp reads unwired=${unwired.saveReads.join(',')} wired=${wired.saveReads.join(',')}`)
+    expect(wired.history).toEqual(unwired.history)
+    // Each save after the first judged all 24 channels again; now only what it saves and keeps.
+    expect(Math.min(...unwired.saveReads.slice(1))).toBeGreaterThanOrEqual(channels.length)
+    expect(Math.max(...wired.saveReads.slice(1))).toBeLessThan(channels.length / 2)
+  })
+})
+
+// t3.yiv.sf.ws.ih: each save filtered and searched every unsaved join and
+// queued write, reading a channel stamp per unsaved join, so a backlog made
+// every later save cost more than the last.
+describe('Thread Memory upkeep visits only the unsaved joins a change can affect', () => {
+  const channels = channelPopulation(4).map(channel => channel.id), wide = channelPopulation(16).map(channel => channel.id)
+  const brief = (fact: Pick<ThreadJoin, 'channel' | 'root' | 'at'>) =>
+    `${wide.includes(fact.channel) ? wide.indexOf(fact.channel) : fact.channel}:${fact.root.slice(-3)}@${fact.at - THREAD_TIME}`
+  /** Each step's unsaved joins in order, unsaved count, save block and kept probes, then the journal, joins and events. */
+  function tracer(h: ThreadMemoryHarness, probes: () => readonly ThreadJoin[]) {
+    const trace: unknown[] = []
+    return {
+      trace,
+      look(label: string) {
+        const outage = h.memory.outage('alpha')
+        trace.push(`${label} | kept ${h.memory.keptFacts('alpha').map(brief).join(' ')} | unsaved ${outage.unsaved}${outage.unknown ? ' unknown' : ''}` +
+          `${h.memory.saveBlocked('alpha') ? ' blocked' : ''} | has ${probes().map(p => Number(h.memory.hasKeptJoin('alpha', p.channel, p.root))).join('')}`)
+      },
+      end() {
+        trace.push(readThreads(h.stateDir).map(r => r.kind === 'join' ? `${r.seq} ${brief(r)}` : r.kind === 'post-intent' ? `${r.seq} intent ${r.operationId}`
+          : r.kind === 'post-outcome' ? `${r.seq} ${r.operationId} ${r.outcome}` : `${r.seq} ${r.kind}`).join(', '))
+        trace.push(h.memory.joins('alpha').map(({ join, savedAt }) => `${brief(join)}${savedAt === undefined ? '' : ` saved@${savedAt - THREAD_TIME}`}`).join(', '))
+        trace.push(h.events.map(e => e.type).join(' '))
+        return trace
+      },
+    }
+  }
+  const holdJournalSync = (h: ThreadMemoryHarness) => h.io.hold('fsync', 'alpha', { match: path => path === threadPath(h.stateDir) })
+  // Recorded from the linear scans at 339a4ee1: kept order, counts, kept
+  // answers, save results, journal records, joins and events, step by step.
+  const backlogTrace = [
+    'backlog | kept 0:001@0 0:002@1 1:003@2 2:004@3 3:005@4 0:006@5 1:007@6 2:008@7 3:009@8 0:010@9 1:011@10 2:012@11 3:013@12 0:014@13 1:015@14 2:016@15 3:017@16 1:018@17 2:019@18 1:007@5 3:020@19 3:020@18 | unsaved 22 | has 11111111',
+    'applied',
+    'applied',
+    'stamps changed | kept 0:001@0 0:002@1 2:004@3 3:005@4 0:006@5 2:008@7 3:009@8 0:010@9 2:012@11 3:013@12 0:014@13 2:016@15 3:017@16 2:019@18 3:020@19 3:020@18 | unsaved 16 | has 11001100',
+    'applied',
+    'new stamp | kept 0:001@0 0:002@1 2:004@3 3:005@4 0:006@5 2:008@7 3:009@8 0:010@9 2:012@11 3:013@12 0:014@13 2:016@15 3:017@16 2:019@18 3:020@19 3:020@18 1:021@20 | unsaved 17 | has 11001100',
+    '0:001@0 kept, 0:002@1 kept, 1:003@2 kept, 2:004@3 kept, 3:005@4 kept, 0:006@5 kept, 1:007@6 kept, 2:008@7 kept, 3:009@8 kept, 0:010@9 kept, 1:011@10 kept, 2:012@11 kept, 3:013@12 kept, 0:014@13 kept, 1:015@14 kept, 2:016@15 kept, 3:017@16 kept, 1:018@17+2:019@18 kept, 0:006@6 kept, 1:007@5 kept, 3:020@18 kept, 1:021@20 kept',
+    'released | kept  | unsaved 0 | has 00000000',
+    'unresolved',
+    'undecided | kept 0:022@21 3:023@22 0:024@23 3:025@24 | unsaved 4 | has 00000000',
+    '0:022@21 kept, 3:023@22 kept, 0:024@23+3:025@24 kept',
+    'deferred | kept 3:023@22 3:025@24 | unsaved 2 | has 00000000',
+    'applied',
+    'recovered | kept  | unsaved 0 | has 00000000',
+    'saved',
+    'flushed | kept  | unsaved 0 | has 00000000',
+    '0:026@25 failed',
+    'failed | kept 0:026@25 | unsaved 1 blocked | has 00000000',
+    '0:027@26 kept',
+    'saved after failure | kept 0:026@25 | unsaved 1 blocked | has 00000000',
+    'saved',
+    'flushed again | kept  | unsaved 0 | has 00000000',
+    'joined',
+    'posts held | kept 0:028@28 | unsaved 4 | has 00000000',
+    'saved',
+    'saved',
+    'none',
+    'saved',
+    'posts saved | kept  | unsaved 0 | has 00000000',
+    '1 header, 2 0:001@0, 3 0:002@1, 4 2:004@3, 5 3:005@4, 6 0:006@5, 7 2:008@7, 8 3:009@8, 9 0:010@9, 10 2:012@11, 11 3:013@12, 12 0:014@13, 13 2:016@15, 14 3:017@16, 15 2:019@18, 16 3:020@18, 17 1:021@20, 18 0:022@21, 19 0:024@23, 20 0:027@26, 21 0:026@25, 22 intent post-a, 23 intent post-b, 24 0:028@28, 25 post-a joined, 26 post-b none',
+    '0:001@0 saved@0, 0:002@1 saved@1, 0:006@5 saved@5, 0:010@9 saved@9, 0:014@13 saved@13, 0:022@21 saved@21, 0:024@23 saved@23, 0:026@25 saved@25, 0:027@26 saved@26, 0:028@28 saved@28, 1:021@20 saved@20',
+    'created outage-settled outage-settled outage-settled append-failed saved-after-failure outage-settled',
+  ]
+  const readRetryTrace = [
+    true,
+    true,
+    true,
+    'unreadable | kept C0TEST001:002@1 C0TEST001:001@0 C0TEST001:001@-1 | unsaved 3 unknown | has 11',
+    'read',
+    'read | kept C0TEST001:002@1 C0TEST001:001@-1 | unsaved 2 | has 11',
+    'saved',
+    'flushed | kept  | unsaved 0 | has 00',
+    '1 header, 2 C0TEST001:001@0, 3 C0TEST001:002@1, 4 C0TEST001:001@0, 5 C0TEST001:001@-1',
+    'C0TEST001:002@1 saved@1, C0TEST001:001@-1 saved@-1',
+    'read-failed read outage-settled',
+  ]
+
+  // Recorded from judging and counting every kept channel at each save, before
+  // per-channel judgements under unchanged stamp facts.
+  const wideTrace = [
+    'backlog | kept 0:001@0 0:002@1 1:003@2 2:004@3 3:005@4 4:006@5 5:007@6 6:008@7 7:009@8 8:010@9 9:011@10 10:012@11 11:013@12 12:014@13 13:015@14 14:016@15 15:017@16 0:018@17 1:019@18 2:020@19 3:021@20 4:022@21 5:023@22 6:024@23 7:025@24 8:026@25 9:027@26 10:028@27 11:029@28 12:030@29 13:031@30 14:032@31 15:033@32 | unsaved 33 | has 111111',
+    'applied',
+    'applied',
+    'stamps changed | kept 0:001@0 0:002@1 1:003@2 2:004@3 3:005@4 4:006@5 5:007@6 6:008@7 7:009@8 8:010@9 10:012@11 11:013@12 12:014@13 13:015@14 14:016@15 15:017@16 0:018@17 1:019@18 2:020@19 3:021@20 4:022@21 5:023@22 6:024@23 7:025@24 8:026@25 10:028@27 11:029@28 12:030@29 13:031@30 14:032@31 15:033@32 | unsaved 31 | has 110000',
+    'one judged | kept 0:002@1 1:003@2 2:004@3 3:005@4 4:006@5 5:007@6 6:008@7 7:009@8 8:010@9 10:012@11 11:013@12 12:014@13 13:015@14 14:016@15 15:017@16 0:018@17 1:019@18 2:020@19 3:021@20 4:022@21 5:023@22 6:024@23 7:025@24 8:026@25 10:028@27 11:029@28 12:030@29 13:031@30 14:032@31 15:033@32 | unsaved 30 | has 110000',
+    'hold withdrawn | kept 0:002@1 1:003@2 2:004@3 3:005@4 4:006@5 5:007@6 6:008@7 7:009@8 8:010@9 10:012@11 11:013@12 12:014@13 13:015@14 14:016@15 15:017@16 0:018@17 1:019@18 2:020@19 3:021@20 4:022@21 5:023@22 6:024@23 7:025@24 8:026@25 10:028@27 11:029@28 12:030@29 13:031@30 14:032@31 15:033@32 | unsaved 28 | has 110000',
+    'next judged | kept 1:003@2 2:004@3 3:005@4 4:006@5 6:008@7 7:009@8 8:010@9 10:012@11 11:013@12 12:014@13 13:015@14 14:016@15 15:017@16 0:018@17 1:019@18 2:020@19 3:021@20 4:022@21 6:024@23 7:025@24 8:026@25 10:028@27 11:029@28 12:030@29 13:031@30 14:032@31 15:033@32 | unsaved 27 | has 010000',
+    'unresolved',
+    'undecided | kept 1:003@2 2:004@3 3:005@4 4:006@5 6:008@7 7:009@8 8:010@9 10:012@11 11:013@12 12:014@13 13:015@14 14:016@15 15:017@16 0:018@17 1:019@18 2:020@19 3:021@20 4:022@21 6:024@23 7:025@24 8:026@25 10:028@27 11:029@28 12:030@29 13:031@30 14:032@31 15:033@32 3:035@34 | unsaved 28 | has 000000',
+    'applied',
+    'recovered | kept 1:003@2 3:005@4 4:006@5 6:008@7 7:009@8 8:010@9 10:012@11 11:013@12 12:014@13 13:015@14 14:016@15 15:017@16 0:018@17 1:019@18 3:021@20 4:022@21 6:024@23 7:025@24 8:026@25 10:028@27 11:029@28 12:030@29 13:031@30 14:032@31 15:033@32 3:035@34 | unsaved 26 | has 000000',
+    '0:001@0 kept, 0:002@1 kept, 1:003@2 kept, 2:004@3 kept, 3:005@4 kept, 4:006@5 kept, 5:007@6 kept, 6:008@7 kept, 7:009@8 kept, 8:010@9 kept, 9:011@10 kept, 10:012@11 kept, 11:013@12 kept, 12:014@13 kept, 13:015@14 kept, 14:016@15 kept, 15:017@16 kept, 0:018@17 kept, 1:019@18 kept, 2:020@19 kept, 3:021@20 kept, 4:022@21 kept, 5:023@22 kept, 6:024@23 kept, 7:025@24 kept, 8:026@25 kept, 9:027@26 kept, 10:028@27 kept, 11:029@28 kept, 12:030@29 kept, 13:031@30 kept, 14:032@31 kept, 15:033@32 kept, 2:034@33 kept, 3:035@34 saved',
+    'drained | kept  | unsaved 0 | has 000000',
+    'saved',
+    'flushed | kept  | unsaved 0 | has 000000',
+    '1 header, 2 0:001@0, 3 0:002@1, 4 1:003@2, 5 3:005@4, 6 4:006@5, 7 6:008@7, 8 7:009@8, 9 8:010@9, 10 10:012@11, 11 11:013@12, 12 12:014@13, 13 13:015@14, 14 14:016@15, 15 15:017@16, 16 0:018@17, 17 1:019@18, 18 3:021@20, 19 4:022@21, 20 6:024@23, 21 7:025@24, 22 8:026@25, 23 10:028@27, 24 11:029@28, 25 12:030@29, 26 13:031@30, 27 14:032@31, 28 15:033@32, 29 3:035@34',
+    '0:001@0 saved@0, 0:002@1 saved@1, 0:018@17 saved@17, 1:003@2 saved@2, 1:019@18 saved@18, 3:005@4 saved@4, 3:021@20 saved@20, 3:035@34 saved@34, 4:006@5 saved@5, 4:022@21 saved@21, 6:008@7 saved@7, 6:024@23 saved@23, 7:009@8 saved@8, 7:025@24 saved@24, 8:010@9 saved@9, 8:026@25 saved@25, 10:012@11 saved@11, 10:028@27 saved@27, 11:013@12 saved@12, 11:029@28 saved@28, 12:014@13 saved@13, 12:030@29 saved@29, 13:015@14 saved@14, 13:031@30 saved@30, 14:016@15 saved@15, 14:032@31 saved@31, 15:017@16 saved@16, 15:033@32 saved@32',
+    'created outage-settled',
+  ]
+
+  /** Saves queued behind held appends, through stamp changes, holds, undecided stamps, a failed append and posts. */
+  async function backlogHistory() {
+    let held: ThreadJoin[] = []
+    const h = fixture({ heldStamps: key => key === 'alpha' ? held : [] })
+    expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha'], channels)).kind).toBe('applied')
+    await h.start()
+    let n = 0
+    const on = (i: number) => h.fact({ channel: channels[i]!, root: `1700000003.${String(++n).padStart(6, '0')}` })
+    const facts: ThreadJoin[] = [], results: string[] = [], saving: Promise<void>[] = []
+    const { trace, look, end } = tracer(h, () => facts.slice(0, 8))
+    const save = (batch: ThreadJoin[]) => {
+      facts.push(...batch)
+      saving.push(h.memory.saveJoins('alpha', batch).then(result => { results.push(`${batch.map(brief).join('+')} ${result.kind}`) }))
+    }
+    const settle = async () => { await Promise.all(saving.splice(0)); trace.push(results.splice(0).join(', ')) }
+    const sync = holdJournalSync(h)
+    save([on(0)]); await sync.reached
+    for (let i = 0; i < 16; i++) save([on(i % 4)])
+    save([on(1), on(2)])
+    // A later time for a kept root keeps nothing new; an earlier one keeps another join.
+    save([{ ...facts[5]!, at: facts[5]!.at + 1 }]); save([{ ...facts[6]!, at: facts[6]!.at - 1 }])
+    // Kept with no save of its own; an earlier join's save saves its root first.
+    const alone = on(3)
+    expect(h.memory.addJoin('alpha', alone)).toBe(true); facts.push(alone)
+    save([{ ...alone, at: alone.at - 1 }])
+    look('backlog')
+    // A changed stamp forgets its channel's unsaved joins; a hold keeps another channel's.
+    trace.push(h.choose('mentions', 'alpha', channels[1]!).kind)
+    held = [facts[3]!]
+    trace.push(h.choose('mentions', 'alpha', channels[2]!).kind)
+    look('stamps changed')
+    trace.push(h.choose('thread_hybrid', 'alpha', channels[1]!).kind)
+    save([on(1)])
+    look('new stamp')
+    sync.release(); await settle(); look('released')
+    // Undecided stamps defer joins until the authority recovers.
+    const again = holdJournalSync(h)
+    save([on(0)]); await again.reached
+    save([on(3)]); save([on(0), on(3)])
+    h.failShared(() => 'unsynced'); trace.push(h.choose('mentions', 'alpha', channels[3]!).kind)
+    look('undecided')
+    again.release(); await settle(); look('deferred')
+    h.failShared(); trace.push(h.authority.recoverDurability().kind)
+    look('recovered')
+    trace.push((await h.memory.flush('alpha')).kind); look('flushed')
+    // A failed append blocks saves until one succeeds.
+    h.io.fail('writeSync', 'alpha', { times: 1 })
+    save([on(0)]); await settle(); look('failed')
+    save([on(0)]); await settle(); look('saved after failure')
+    trace.push((await h.memory.flush('alpha')).kind); look('flushed again')
+    // Posts count as unsaved until their intent and outcome are saved.
+    const post = holdJournalSync(h), target = on(0)
+    const first = h.memory.keepIntent('alpha', { operationId: 'post-a', channel: target.channel, root: target.root, at: target.at, stamp: target.stamp,
+      content: { kind: 'text', text: 'first post' } })
+    await post.reached
+    const second = h.memory.keepIntent('alpha', { operationId: 'post-b', channel: target.channel, at: target.at, stamp: target.stamp, digest: 'cd'.repeat(32) })
+    trace.push(h.memory.resolveIntent('alpha', 'post-a', { joined: { channel: target.channel, root: target.root, stamp: target.stamp } }) ?? 'unresolved')
+    look('posts held')
+    post.release()
+    trace.push(String(first.kept && await first.ready), String(second.kept && await second.ready))
+    trace.push(h.memory.resolveIntent('alpha', 'post-b', { none: true }) ?? 'unresolved')
+    trace.push((await h.memory.flush('alpha')).kind); look('posts saved')
+    return end()
+  }
+
+  /** Saves across many channels behind held appends: a hold alone keeps a
+   * changed channel's joins and is then withdrawn with no new stamp facts;
+   * then undecided stamps, recovery and a drained backlog. */
+  async function wideHistory() {
+    let held: ThreadJoin[] = []
+    const h = fixture({ heldStamps: key => key === 'alpha' ? held : [] })
+    expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha'], wide)).kind).toBe('applied')
+    await h.start()
+    let n = 0
+    const on = (i: number) => h.fact({ channel: wide[i]!, root: `1700000005.${String(++n).padStart(6, '0')}` })
+    const facts: ThreadJoin[] = [], results: string[] = [], saving: Promise<void>[] = []
+    // facts[k] is on channel (k - 1) % 16 for k >= 1.
+    const { trace, look, end } = tracer(h, () => [1, 3, 6, 10, 22, 26].map(k => facts[k]!))
+    const save = (batch: ThreadJoin[]) => {
+      facts.push(...batch)
+      saving.push(h.memory.saveJoins('alpha', batch).then(result => { results.push(`${batch.map(brief).join('+')} ${result.kind}`) }))
+    }
+    const settle = async () => { await Promise.all(saving.splice(0)); trace.push(results.splice(0).join(', ')) }
+    const first = holdJournalSync(h)
+    save([on(0)]); await first.reached
+    for (let i = 0; i < 32; i++) save([on(i % 16)])
+    look('backlog')
+    // Only a hold keeps channel 5's joins once its stamp changes; channel 9's are forgotten.
+    held = [facts[6]!]
+    trace.push(h.choose('mentions', 'alpha', wide[5]!).kind, h.choose('mentions', 'alpha', wide[9]!).kind)
+    look('stamps changed')
+    const second = holdJournalSync(h)
+    first.release(); await second.reached
+    look('one judged')
+    // Withdrawn with no publication: the next judgement forgets channel 5's joins.
+    held = []
+    look('hold withdrawn')
+    const third = holdJournalSync(h)
+    second.release(); await third.reached
+    look('next judged')
+    const late = [on(2), on(3)]
+    h.failShared(() => 'unsynced'); trace.push(h.choose('mentions', 'alpha', wide[2]!).kind)
+    for (const fact of late) save([fact])
+    look('undecided')
+    h.failShared(); trace.push(h.authority.recoverDurability().kind)
+    look('recovered')
+    third.release(); await settle(); look('drained')
+    trace.push((await h.memory.flush('alpha')).kind); look('flushed')
+    return end()
+  }
+  /** Joins kept while the journal is unreadable, then read: saved evidence on disk settles them. */
+  async function readRetryHistory() {
+    const h = fixture()
+    const saved = h.fact(), other = h.fact({ root: R.secondary })
+    seedReadable(h, [saved])
+    h.io.fail('readFileSync'); await h.start()
+    const { trace, look, end } = tracer(h, () => [saved, other])
+    for (const fact of [other, { ...saved }, { ...saved, at: saved.at - 1 }]) trace.push(h.memory.addJoin('alpha', fact))
+    look('unreadable')
+    h.io.heal(); trace.push(await h.memory.retryRead('alpha')); look('read')
+    trace.push((await h.memory.flush('alpha')).kind); look('flushed')
+    return end()
+  }
+
+  test('saves queued behind held appends keep the unsaved order, counts, kept answers, journal and events of scanning every unsaved join', async () => {
+    expect(await backlogHistory()).toEqual(backlogTrace)
+  })
+
+  test('joins kept while the journal was unreadable settle against its saved evidence as scanning every unsaved join did', async () => {
+    expect(await readRetryHistory()).toEqual(readRetryTrace)
+  })
+
+  test('saves across many channels keep the unsaved order, counts, kept answers, journal and events of judging and counting every kept channel', async () => {
+    expect(await wideHistory()).toEqual(wideTrace)
+  })
+
+  test('a save reads a bounded number of channel stamps, however many channels hold unsaved joins', async () => {
+    const many = channelPopulation(200).map(channel => channel.id)
+    const h = fixture()
+    expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha'], many)).kind).toBe('applied')
+    await h.start()
+    const sync = holdJournalSync(h)
+    const saves = [h.memory.saveJoins('alpha', [h.fact({ channel: many[0]! })])]
+    await sync.reached
+    saves.push(...Array.from({ length: 400 }, (_, i) =>
+      h.memory.saveJoins('alpha', [h.fact({ channel: many[i % many.length]!, root: `1700000006.${String(i).padStart(6, '0')}` })])))
+    const read = h.authority.channelStamp
+    let reads = 0
+    h.authority.channelStamp = (key, channel) => { reads++; return read(key, channel) }
+    let results: Awaited<(typeof saves)[number]>[]
+    try {
+      sync.release()
+      results = await Promise.all(saves)
+    } finally { h.authority.channelStamp = read }
+    console.info(`kept-channel upkeep per save: stamp reads ${(reads / saves.length).toFixed(1)}`)
+    expect(results!.at(-1)).toEqual({ kind: 'saved' })
+    expect(h.memory.keptFacts('alpha')).toEqual([])
+    expect(h.events.filter(e => e.type === 'outage-settled')).toHaveLength(1)
+    expect(savedJoins(h)).toHaveLength(saves.length)
+    // Judging and counting every kept channel read about 304 stamps per save here.
+    expect(reads / saves.length).toBeLessThan(12)
+  })
+  test('a save reads each kept channel\'s stamp and encodes stamp keys a bounded number of times, however long the backlog', async () => {
+    let held: ThreadJoin[] = []
+    const h = fixture({ heldStamps: key => key === 'alpha' ? held : [] })
+    expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha'], channels)).kind).toBe('applied')
+    await h.start()
+    const sync = holdJournalSync(h)
+    const saves = [h.memory.saveJoins('alpha', [h.fact({ channel: channels[0]! })])]
+    await sync.reached
+    const backlog = Array.from({ length: 400 }, (_, i) => h.fact({ channel: channels[i % 4]!, root: `1700000004.${String(i).padStart(6, '0')}` }))
+    saves.push(...backlog.map(fact => h.memory.saveJoins('alpha', [fact])))
+    // The last channel's unsaved joins are stale but named by a hold.
+    held = [backlog[3]!]
+    expect(h.choose('mentions', 'alpha', channels[3]!).kind).toBe('applied')
+    const read = h.authority.channelStamp
+    let reads = 0, encodings = 0
+    h.authority.channelStamp = (key, channel) => { reads++; return read(key, channel) }
+    const stringify = JSON.stringify
+    const encoding = spyOn(JSON, 'stringify').mockImplementation(((...args: Parameters<typeof JSON.stringify>) => { encodings++; return stringify(...args) }) as typeof JSON.stringify)
+    let results: Awaited<(typeof saves)[number]>[]
+    try {
+      sync.release()
+      results = await Promise.all(saves)
+    } finally { encoding.mockRestore(); h.authority.channelStamp = read }
+    console.info(`unsaved-join upkeep per save: stamp reads ${(reads / saves.length).toFixed(1)}, encodings ${(encodings / saves.length).toFixed(1)}`)
+    expect(results!.at(-1)).toEqual({ kind: 'saved' })
+    expect(h.memory.keptFacts('alpha')).toEqual([])
+    expect(savedJoins(h)).toHaveLength(saves.length)
+    // Scanning every unsaved join read about 208 stamps and encoded about 212 values per save here.
+    expect(reads / saves.length).toBeLessThan(24)
+    expect(encodings / saves.length).toBeLessThan(24)
   })
 })
 

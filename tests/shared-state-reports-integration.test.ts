@@ -23,6 +23,7 @@ import {
   initialSharedState, writeSharedState, channelPopulation,
 } from './test-helpers/shared-channels.ts'
 import { SR8_SHARED_LIST_CHANNELS } from './test-helpers/thread-memory.ts'
+import { spyOnCopies } from './test-helpers/copies.ts'
 import { makeDeferredWebApiCall, makeMembershipEvent, makeChannelMessage, mentionText, broadcastText, type WebApiOutcome } from './test-helpers/slack-stub.ts'
 
 let h: ReloadHarness
@@ -157,7 +158,7 @@ test('repeated outcomes report the same full inventory without copying whole sha
     nextAttemptAt: run.membershipScanner.status('alpha').nextAttemptAt }
   evidenceReport(run, { channels, all: true }, expected)
   const before = { posts: run.slackPosts(), lines: reportLines(run) }
-  const copies = spyOn(globalThis, 'structuredClone'), snapshots = spyOn(authority, 'snapshot')
+  const copies = spyOnCopies(), snapshots = spyOn(authority, 'snapshot')
   try {
     for (let i = 0; i < 4; i++) {
       // A readable recovery still reports its outcome through the real watch
@@ -165,8 +166,8 @@ test('repeated outcomes report the same full inventory without copying whole sha
       expect(authority.recoverDurability()).toEqual({ kind: 'applied', revision: authority.revision })
       await flush(run)
     }
-    expect({ snapshots: snapshots.mock.calls.length, copies: copies.mock.calls.length }).toEqual({ snapshots: 0, copies: 0 })
-  } finally { snapshots.mockRestore(); copies.mockRestore() }
+    expect({ snapshots: snapshots.mock.calls.length, copies: copies.values.length }).toEqual({ snapshots: 0, copies: 0 })
+  } finally { snapshots.mockRestore(); copies.restore() }
   expect({ posts: run.slackPosts(), lines: reportLines(run) }).toEqual(before)
   evidenceReport(run, { channels, all: true }, expected)
 })
