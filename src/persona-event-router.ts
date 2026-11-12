@@ -25,8 +25,9 @@
  *   action is still handled. The payload is acked exactly once, after
  *   handling, even when an action throws. The click handler refuses a click
  *   whose action names another persona's instance (`cscb_<other key>`).
- * - Any other event name (defensive: the manager forwards only the three
- *   above) is acked and ignored.
+ * - Any other event name is acked and ignored. The manager also forwards
+ *   `reaction_added` and `reaction_removed`; for now they take this branch
+ *   too, so they are acked and ignored like any unrecognised name.
  *
  * Every event is handled only for the persona whose connection received it:
  * no other persona's key, connection or client is consulted here. A throw

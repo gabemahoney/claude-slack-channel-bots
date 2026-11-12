@@ -52,7 +52,17 @@
 # be re-installed to gain it. Until then, `reactions.get` fails with
 # `missing_scope`.
 #
-# Group DMs are deliberately not subscribed: do not add a group-DM event.
+# It also subscribes the `reaction_added` and `reaction_removed` bot events,
+# so a persona's app receives the reactions people add to and remove from
+# messages, and grants the `mpim:read` bot scope, which a persona needs to
+# recognise a group DM when it looks a conversation up (`conversations.info`).
+# The scope is for that lookup only. An app created from an earlier version of
+# this manifest must have `reaction_added`, `reaction_removed` and `mpim:read`
+# added and then be re-installed to gain them. Until then, Slack sends the app
+# neither event, and looking a group DM up fails with `missing_scope`.
+#
+# Group DM messages are deliberately not subscribed: do not add a group-DM
+# message event (`message.mpim`).
 
 _metadata:
   major_version: 1
@@ -91,6 +101,7 @@ oauth_config:
       - lists:write
       - canvases:read
       - canvases:write
+      - mpim:read
 
 settings:
   event_subscriptions:
@@ -99,6 +110,8 @@ settings:
       - message.im
       - message.groups
       - app_mention
+      - reaction_added
+      - reaction_removed
   interactivity:
     is_enabled: true
   org_deploy_enabled: false
