@@ -205,7 +205,7 @@ export function createDurableJournal(options: DurableJournalOptions) {
     try {
       const atMonoMs = timer.now()
       let records = 0
-      for (const byte of bytes) if (byte === 10) records++
+      for (let at = bytes.indexOf(10); at >= 0; at = bytes.indexOf(10, at + 1)) records++
       timer.record({ dir, path, records, bytes: bytes.length, appendMs: atMonoMs - started,
         fileFsyncMs: times.fileFsyncMs, dirFsyncMs: times.dirFsyncMs, fsyncs: times.fsyncs, atMonoMs })
     } catch { /* a measurement cannot change a durable append's outcome */ }
@@ -217,6 +217,14 @@ export function createDurableJournal(options: DurableJournalOptions) {
     durableBefore = Math.max(durableBefore, started)
   }
   function* ensureDirSteps(): DurableSteps {
+    if (durableDirectory) {
+      // A directory still known durable, with its identity and mode, exists:
+      // mkdir would create nothing, and the walk below would return here.
+      let stat: nodeFs.Stats | undefined
+      try { stat = fs.statSync(dir) } catch { /* the full ensure below decides */ }
+      if (stat?.isDirectory() && stat.dev === durableDirectory.dev && stat.ino === durableDirectory.ino &&
+          (stat.mode & 0o7777) === options.directoryMode) return
+    }
     // A recreated directory may reuse the cached device/inode identity.
     if (fs.mkdirSync(dir, { recursive: true, mode: options.directoryMode }) !== undefined) { durableDirectory = undefined; fileModes.clear(); entries.clear(); directoryGeneration++ }
     const stat = fs.statSync(dir)

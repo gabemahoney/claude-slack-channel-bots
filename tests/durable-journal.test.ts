@@ -205,8 +205,9 @@ describe('directory durability and modes', () => {
     else {
       fs.renameSync(dir, join(root, 'old-journals'))
       if (change === 'replacement') fs.mkdirSync(dir, { mode: 0o700 })
-      // Model inode reuse even on filesystems that do not reuse it in this run.
-      else r.control.stat = identity
+      // Model inode reuse even on filesystems that do not reuse it in this run:
+      // the directory the ensure's mkdir recreates reports the old identity.
+      else r.control.before = op => { if (op.step === 'mkdir') r.control.stat = identity }
     }
     r.control.fail = op => op.step === 'sync' && op.path === root
     await expect(j.ensureDir()).rejects.toThrow('EIO injected sync')
@@ -214,6 +215,29 @@ describe('directory durability and modes', () => {
     await j.ensureDir()
     expect(r.ops.filter(op => op.step === 'sync').map(op => op.path)).toEqual([root])
     expect(fs.statSync(dir).mode & 0o7777).toBe(0o700)
+    expect(r.paths.size).toBe(0)
+  })
+
+  // t2.yiv.sf.ws (fix round 2): every append also ran mkdir on a directory
+  // already known durable, which could only report that it exists.
+  test('an append to a directory still known durable stats it once and runs no mkdir; any change takes the full ensure', async () => {
+    const r = recordingFs(), j = journal(r.fs)
+    await j.durableAppend(path, Buffer.from('first\n'))
+    const steps = async (bytes: string) => { r.ops.length = 0; await j.durableAppend(path, Buffer.from(bytes)); return r.ops.filter(op => op.path === dir || op.path === root).map(op => `${op.step} ${op.path === dir ? 'dir' : 'root'}`) }
+    expect(await steps('second\n')).toEqual(['stat dir'])
+    // A changed mode, a missing directory and a replaced one each take mkdir, the mode and the parent sync, as before.
+    const synced = (name: string) => [`open ${name}`, `sync ${name}`, `close ${name}`]
+    fs.chmodSync(dir, 0o755)
+    expect(await steps('third\n')).toEqual(['stat dir', 'mkdir dir', 'stat dir', 'chmod dir', ...synced('root')])
+    fs.renameSync(dir, join(root, 'moved'))
+    expect(await steps('fourth\n')).toEqual(['stat dir', 'mkdir dir', 'stat dir', 'chmod dir', ...synced('root'), ...synced('dir')])
+    expect(read()).toEqual(Buffer.from('fourth\n'))
+    fs.renameSync(dir, join(root, 'moved-again')); fs.mkdirSync(dir, { mode: 0o700 })
+    expect(await steps('fifth\n')).toEqual(['stat dir', 'mkdir dir', 'stat dir', 'chmod dir', ...synced('root'), ...synced('dir')])
+    // A failed stat falls back to the full ensure, whose own stat decides.
+    r.control.fail = op => op.step === 'stat' && r.ops.filter(o => o.step === 'stat').length === 1
+    expect(await steps('sixth\n')).toEqual(['stat dir', 'mkdir dir', 'stat dir'])
+    expect(read()).toEqual(Buffer.from('fifth\nsixth\n'))
     expect(r.paths.size).toBe(0)
   })
 
@@ -827,6 +851,24 @@ describe('test-only append timing', () => {
     ])
     expect(h.r.ops.filter(op => op.step === 'write')).toHaveLength(1)
     expect(JSON.stringify(h.timings)).not.toContain('seq')
+  })
+
+  // t2.yiv.sf.ws (fix round 2): the record count iterated every byte.
+  test('records counts each newline byte, as a walk over every byte counted them', async () => {
+    const h = timedRun(), j = journal(h.r.fs)
+    setDurableAppendTimer(h.timer)
+    const inputs: Uint8Array[] = [Buffer.from('no newline'), Buffer.from('\n'), Buffer.from('\n\nmiddle\n\n'), new TextEncoder().encode('é\n🙂\n'), Buffer.from('{"a":1}\n'.repeat(500))]
+    // No byte-by-byte walk: count typed-array iterations while appending.
+    const iterate = Uint8Array.prototype[Symbol.iterator]
+    let walks = 0
+    Object.defineProperty(Uint8Array.prototype, Symbol.iterator, { configurable: true, writable: true, value(this: Uint8Array) { walks++; return iterate.call(this) } })
+    try { for (const bytes of inputs) await j.durableAppend(path, bytes) } finally { delete (Uint8Array.prototype as { [Symbol.iterator]?: unknown })[Symbol.iterator] }
+    expect(Uint8Array.prototype[Symbol.iterator]).toBe(iterate)
+    expect(walks).toBe(0)
+    let newlines: number[] = []
+    for (const bytes of inputs) { let n = 0; for (const byte of bytes) if (byte === 10) n++; newlines = [...newlines, n] }
+    expect(h.timings.map(timing => timing.records)).toEqual(newlines)
+    expect(newlines).toEqual([0, 1, 4, 2, 500])
   })
 
   test('a failed append reports nothing, its rollback sync is a file sync of the next append, and a throwing timer cannot fail an append', async () => {

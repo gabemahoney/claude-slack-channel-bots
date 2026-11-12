@@ -1,12 +1,13 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 import {
-  buildTagParts, buildWrapper, escapeAttr, escapeBody,
+  buildTagParts, buildWrapper, escapeAttr, escapeBody, replaceLoneSurrogates, tagByteLength,
   TAG_ATTRIBUTE_ORDER, TAG_MAX_BYTES, TAG_MIN_BODY_BYTES, TAG_SOURCE,
   type TagMessage,
 } from '../src/tag-wrapper'
 import cases from './fixtures/delivery-wrapper/wrapper-cases.json'
 import edges from './fixtures/delivery-wrapper/escaping-edges.json'
 import { TAG_DESCRIPTION } from '../src/tag-description.ts'
+import * as previous from './fixtures/previous-tag-wrapper/tag-wrapper.ts'
 
 function injected(text: string, overrides: Partial<TagMessage> = {}): TagMessage {
   return { user: 'interject', ts: '1792000000.123456', text, ...overrides }
@@ -219,5 +220,49 @@ describe('native input rewrites', () => {
     expect(escapeBody(raw)).toBe(escaped)
     expect(escapeAttr(raw)).toBe(raw)
     expect(buildTagParts(injected(raw))).toEqual([injectedFrame().replace('></channel>', `>${escaped}</channel>`)])
+  })
+})
+
+// t2.yiv.sf.ws (fix round 2): sizing encoded each body character with a new
+// TextEncoder, and every body and attribute went through a per-character array.
+describe('the formatter gives the previous formatter\'s exact output', () => {
+  const ALPHABET = ['a', 'Z', '9', ' ', '_', '/', '／', '\n', '\r\n', '\r', '\t', '\x00', '\x07', '\x1f', '\x7f', '\x85', '\x9f', '&', '"', '>',
+    '<', '＜', '﹤', '‹', '〈', '⟨', '〈', '❮', 'channel', 'CHANNEL', 'Channels', 'ｃｈａｎｎｅｌ',
+    '​', '­', '⁠', '　', ' ', ' ', ' ', 'é', 'ü', '́', 'é', '中', 'ࠀ', '߿',
+    '🙂', '\ud800', '\udfff', '\ud83d', '\ude42x', '<@U0TEST001>']
+  /** The same strings each run: a fixed linear congruential sequence. */
+  function corpus(count: number, maxParts: number): string[] {
+    let seed = 0x2f6b
+    const next = () => (seed = (seed * 1103515245 + 12345) >>> 0) / 0x100000000
+    return Array.from({ length: count }, () => Array.from({ length: Math.floor(next() * maxParts) }, () => ALPHABET[Math.floor(next() * ALPHABET.length)]).join(''))
+  }
+  const texts = [...corpus(400, 40), ...corpus(40, 900), 'x'.repeat(5000), '🙂'.repeat(1200), 'é '.repeat(2500), '\ud800'.repeat(700)]
+
+  test('escaping, sizing and surrogate replacement match on every corpus string', () => {
+    for (const text of texts) {
+      expect([escapeBody(text), escapeAttr(text), replaceLoneSurrogates(text), tagByteLength(text)])
+        .toEqual([previous.escapeBody(text), previous.escapeAttr(text), previous.replaceLoneSurrogates(text), previous.tagByteLength(text)])
+    }
+  })
+
+  test('single and split tags match, attribute truncation included', () => {
+    const attributeTexts = corpus(30, 400)
+    texts.forEach((text, i) => {
+      const message: TagMessage = { chat_id: 'C0TEST001', ts: '1700000000.000001', via: 'mention', user: attributeTexts[i % attributeTexts.length]!,
+        ...(i % 3 === 0 ? { attachments: attributeTexts[(i + 7) % attributeTexts.length]!.repeat(4), attachment_count: '2' } : {}), text }
+      expect(buildTagParts(message)).toEqual(previous.buildTagParts(message))
+      expect(buildWrapper(message)).toBe(previous.buildWrapper(message))
+    })
+  })
+
+  test('a split message encodes no character on its own', () => {
+    const message: TagMessage = { chat_id: 'C0TEST001', ts: '1700000000.000001', user: 'human', text: 'línea con acentos y 🙂 emoji '.repeat(180) }
+    const encodes = spyOn(TextEncoder.prototype, 'encode')
+    try {
+      const counted = (build: () => string[]) => { encodes.mockClear(); expect(build().length).toBe(4); return encodes.mock.calls.length }
+      // The previous formatter encoded each body character of each part's cut.
+      expect(counted(() => previous.buildTagParts(message))).toBeGreaterThan(4000)
+      expect(counted(() => buildTagParts(message))).toBe(0)
+    } finally { encodes.mockRestore() }
   })
 })
