@@ -1,10 +1,6 @@
 # What a bot can do
 
-Tools, receiving messages, injecting a message, permission prompts and Slack reply reminders. See also [Scheduled Prompts](scheduled-prompts.md).
-
 ## Tools
-
-Each MCP endpoint exposes the following tools to the connected Claude Code session:
 
 | Tool | Description |
 |---|---|
@@ -32,9 +28,7 @@ On a host whose Claude Code permission settings don't allow the server's tools a
 
 ## Interject
 
-POST to `/interject` to store a message for a configured persona from localhost. The message is queued only for the named persona, including while it is down. Each request is an independent queued item, even with identical sender and text; requests are never merged or deduplicated. Only requests from `127.0.0.1` or `::1` are accepted — external callers are rejected with 403. The bot sees it as described in [How a persona receives messages](#how-a-persona-receives-messages); this input never arms a Slack reply reminder.
-
-An injected message carries no Slack conversation; say in its text where to post any Slack reply.
+POST to `/interject` to store a message for a configured persona from localhost. The message is queued only for the named persona, including while it is down. Each request is an independent queued item, even with identical sender and text; requests are never merged or deduplicated. Only requests from `127.0.0.1` or `::1` are accepted — external callers are rejected with 403. The bot sees it as described in [How a persona receives messages](#how-a-persona-receives-messages); this input never arms a Slack reply reminder. An injected message carries no Slack conversation; say in its text where to post any Slack reply.
 
 ### Request
 
@@ -52,13 +46,7 @@ curl -X POST http://localhost:<port>/interject \
 
 ### Response
 
-After durable storage, returns HTTP 200. This acknowledges storage, not delivery:
-
-```json
-{ "ok": true, "persona": "planner" }
-```
-
-`persona` is the target persona's name, even when the request named it by key.
+After durable storage, returns HTTP 200 with `{ "ok": true, "persona": "planner" }`. This acknowledges storage, not delivery; `persona` is the target persona's name, even when the request named it by key.
 
 ### Error conditions
 
@@ -71,16 +59,9 @@ After durable storage, returns HTTP 200. This acknowledges storage, not delivery
 | 413 | Request body exceeds 32KB. |
 | 500 | The message could not be stored (`Message not stored`). |
 
-### Example: crontab reminder
+### Recurring prompts
 
-For recurring prompts, prefer the built-in scheduler (see [Scheduled Prompts](scheduled-prompts.md#scheduled-prompts-cscb_cron)) — it needs no host cron and delivers straight to a persona. The host-crontab example below is an alternative when you already run `cron`:
-
-```sh
-# crontab -e
-0 9 * * 1 curl -s -X POST http://localhost:3100/interject \
-  -H "Content-Type: application/json" \
-  -d '{"persona": "planner", "message": "Weekly reminder: update the changelog before standup.", "sender": "cron"}'
-```
+For recurring prompts, use [Scheduled Prompts](scheduled-prompts.md#scheduled-prompts-cscb_cron); no host cron is needed.
 
 ---
 
@@ -122,11 +103,11 @@ If that rewrite fails, `server.log` shows a `template refresh: … failed` line.
 
 ## How a persona receives messages
 
-CSCB stores accepted messages, then types their text into the bot’s terminal in a `<channel source="slack-channel-router" …>` tag. Every Slack message carries its sender’s ID; use the shared prompt file to say whose instructions to follow. The bot answers through `reply`. A message from Slack carries a `via` attribute that says how it reached the persona. An injected message (a scheduled prompt or an `/interject` message) carries no `via`. A received item is durably stored; delivered means its complete text is confirmed in the bot’s transcript. Delivery is at-least-once: an unconfirmed item is offered again, so the bot may see it more than once. Each persona uses strict FIFO across Slack, `/interject` and scheduled prompts, with one item in flight; the next waits until the previous item is confirmed delivered. There is no age cutoff. Delivery and reconnects wait until agent-director reports the bot is `waiting`. If agent-director refuses a key operation, the message stays queued and retries later. Transcript records confirm only the exact message received; they do not decide whether the bot is idle. Messages wait while MCP is disconnected, trigger the configured reconnect, and are delivered once connected again. Which channels a persona serves, and at which delivery, depends on the channel mode (see [Channel modes](channel-modes.md#channel-modes)).
+CSCB stores accepted messages and Reaction Notices, then types them into the bot’s terminal in a `<channel source="slack-channel-router" …>` tag. Every Slack message carries its sender’s ID; use the shared prompt file to say whose instructions to follow. The bot answers messages through `reply`; [Reaction Notices](#reaction-notices) need no reply. A message from Slack carries a `via` attribute that says how it reached the persona. An injected message (a scheduled prompt or an `/interject` message) carries no `via`. A received item is durably stored; delivered means its complete text is confirmed in the bot’s transcript. Delivery is at-least-once: an unconfirmed item is offered again, so the bot may see it more than once. Each persona uses strict FIFO across Slack messages, Reaction Notices, `/interject` and scheduled prompts, with one item in flight; the next waits until the previous item is confirmed delivered or a Reaction Notice is excluded before delivery. There is no age cutoff. Delivery and reconnects wait until agent-director reports the bot is `waiting`. If agent-director refuses a key operation, the item stays queued and retries later. Transcript records confirm only the exact item received; they do not decide whether the bot is idle. Messages and Reaction Notices wait while MCP is disconnected, trigger the configured reconnect, and are delivered once connected again. Which channels a persona serves, and at which delivery, depends on the channel mode (see [Channel modes](channel-modes.md#channel-modes)).
 
-Slack feedback has two stages: queued after durable storage (`beehive` by default), then delivered after the whole message is confirmed (`spinthinking` by default). CSCB removes queued before adding delivered; the first successful correlated reply or reaction clears the actual stage. Both names are configurable; see [Acknowledgement reactions](server-settings.md#acknowledgement-reactions) for the custom-emoji prerequisite and tracking limits.
+Ordinary Slack messages get two feedback stages: queued after durable storage (`beehive` by default), then delivered after the whole message is confirmed (`spinthinking` by default). CSCB removes queued before adding delivered; the first successful correlated reply or reaction clears the actual stage. Both names are configurable; see [Acknowledgement reactions](server-settings.md#acknowledgement-reactions) for the custom-emoji prerequisite and tracking limits. Reaction Notices get neither stage.
 
-A message from Slack carries these tag attributes:
+An ordinary message from Slack carries these tag attributes:
 
 | Attribute | Value |
 |---|---|
@@ -143,8 +124,6 @@ A message from Slack carries these tag attributes:
 
 A long `attachments` or `user` value can be cut short, ending in `…`; on a macOS host this happens sooner, and a long `channel_name` can be cut too. `chat_id` and `attachment_count` are always whole.
 
-Each way a message reaches a persona:
-
 | Kind | How it reaches the persona | Tag attributes | `via` | Reminder |
 |---|---|---|---|---|
 | Direct message | A DM to the persona's own Slack app, when its `dm.enabled` is `true`, whatever the text mentions. With `dm.enabled` `false` the server drops it and logs one `persona-dm-dropped` line. A group DM is never delivered. | Slack attributes; `chat_id` is the DM conversation ID | `dm` | Yes |
@@ -154,10 +133,11 @@ Each way a message reaches a persona:
 | Every message, this persona alone | A message that neither @mentions the persona nor broadcasts. In declarative mode: in a channel listed in its `channels` with `delivery: all`, when no other persona in the applied configuration has `delivery: all` for that channel. In fungible mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is `all`, when no other persona in the applied configuration has a channel delivery of `all` for that channel. | Slack attributes | `receive_all` | Yes |
 | Scheduled prompt | A crontable line naming the persona fires, and the scheduler queues it for that persona only (see [Scheduled Prompts](scheduled-prompts.md#scheduled-prompts-cscb_cron)). | Only `user` = `cscb-cron:<prompt file name without its extension>` (`cscb-cron:standup` for `standup.md`) and `ts` = the fire time in seconds, with six decimals. No `chat_id`, `message_id` or `via`. | none | Never |
 | `/interject` message | A localhost POST to `/interject` addressed by `persona` (see [Interject](#interject)); it reaches only that persona. | Only `user` = the request's `sender` (default `interject`) and `ts`, as for a scheduled prompt. No `chat_id`, `message_id` or `via`. | none | Never |
+| Reaction Notice | An added or removed reaction on this persona's own reply-tool post; see [Reaction Notices](#reaction-notices). | Reactor and reacted-message attributes below; empty BODY | `reaction` | Never |
 
 A "Yes" in the Reminder column means [Slack reply reminders](#slack-reply-reminders) are eligible for that delivery when enabled for the persona.
 
-- **The first applicable `via` wins,** in the order `dm`, `mention`, `broadcast`, `receive_all_shared`, `receive_all`. A message that @mentions the persona in a channel it receives in full arrives as `mention`.
+- **The first applicable `via` wins,** for ordinary Slack messages, in the order `dm`, `mention`, `broadcast`, `receive_all_shared`, `receive_all`. A message that @mentions the persona in a channel it receives in full arrives as `mention`.
 - **Every @mention stays in the text,** including quoted, repeated and mention-only messages. Original whitespace is kept when the message is stored. Terminal tag formatting converts CRLF/CR line endings to LF and tabs to four spaces, removes other control characters, replaces invalid Unicode surrogates and escapes tag look-alikes and characters the terminal would rewrite.
 - **Every author counts.** Posts by people, bots, integrations and other personas all arrive by these rules. Each persona posts as its own Slack app, so another persona's post reaches it like anyone else's.
 - **Anyone in the workspace can reach a persona,** in both modes: in declarative mode in its listed channels, by each channel's `delivery`; in fungible mode in every channel its app is invited to that it serves, by its channel delivery there; and in both modes by DM when its `dm.enabled` is `true`. There is no approval step. In fungible mode an invite changes who that is (see [Who can reach a persona in fungible mode](channel-modes.md#who-can-reach-a-persona-in-fungible-mode)).
@@ -165,7 +145,22 @@ A "Yes" in the Reminder column means [Slack reply reminders](#slack-reply-remind
 - **Slack redeliveries add no second queue item, including across server restarts.** Each accepted Slack message keeps its key for at least 24 hours after intake; the paired channel @mention adds no second item.
 - **In fungible mode, an @mention is delivered from its `message` event.** Of the two events Slack sends for a channel @mention, the `app_mention` event decides nothing and the `message` event carrying the same mention decides, so each @mention is delivered once, whichever event arrives first. An edit that adds a mention to an earlier message sends no new `message` event, so in fungible mode it is not delivered.
 - **A message without `via` is an injected prompt.** Its `user` label is free-form, so an `/interject` sender label, even one starting with `cscb-cron:`, cannot make it look like a Slack message.
-- **When the reminder is off.** No new reminder is queued when the persona's effective `stop_hook_bootstrap` is `false`. See [Slack reply reminders](#slack-reply-reminders).
+
+---
+
+## Reaction Notices
+
+A person's or another app's added or removed reaction on this persona's own `reply` text or file post brings a Reaction Notice in a conversation it serves: a channel, an enabled DM, or a thread in either. Channels at `delivery: mentions` receive these too; no mention is needed.
+
+The tag has `via="reaction"`, `reaction="added"` or `reaction="removed"`, `emoji` as the emoji name without colons, and an empty BODY. `user` and `user_id` identify the reactor (`bot_id` substitutes when there is no user); `chat_id`, `channel_name`, `message_id` and optional `thread_ts` identify the persona's reacted message. `message_id` is that message's timestamp; `ts` is when the reaction happened.
+
+Use the reactor's identity to decide whose answer it is: an emoji alone is not authorisation. Notices can repeat, need no reply, get no acknowledgement reaction and create no reply reminder. They do not count as reply-call targets or change any existing message's reminder eligibility.
+
+No notice comes from the persona's own reactions, Slack reaction events by bots whose identities this CSCB run has confirmed, reactions on other authors' messages, CSCB's server notices or permission prompts, or unserved conversations. Successful conversation lookup excludes group DMs; fungible mode also excludes externally shared conversations, while declarative listed external channels qualify. For lookup failures, see **A Reaction Notice has no thread timestamp** and **A Reaction Notice arrives from a listed group DM** in [Troubleshooting](troubleshooting.md#troubleshooting).
+
+Acknowledgement reactions from sessions served by a different CSCB server can bring notices: their bot identities are outside this server's confirmed set.
+
+---
 
 ## Slack reply reminders
 
@@ -179,7 +174,7 @@ The persona can reply or end its turn. There is at most one reminder per deliver
 
 Claude reminders require the `reply_tool_preallowed=1` agent-director label; conversations without it receive no new reminders. An existing label alone does not prove that the conversation's saved launch arguments include the reply allowance. Updating the template leaves existing conversations and their saved arguments unchanged; ordinary fresh or reuse launches obtain the current rule, and existing conversations continue receiving ordinary messages.
 
-Only Slack deliveries arm reminders. Scheduled prompts, `/interject` messages and reminders themselves do not. A `reply` or `react` call by that persona suppresses the reminder even if posting fails or the call targets another conversation. Replies through another tool or service can therefore be followed by one harmless reminder.
+Only ordinary Slack message deliveries arm reminders. Reaction Notices, scheduled prompts, `/interject` messages and reminders themselves do not. A `reply` or `react` call by that persona suppresses the reminder even if posting fails or the call targets another conversation. Replies through another tool or service can therefore be followed by one harmless reminder.
 
 ### Turning it on or off
 
@@ -191,6 +186,4 @@ A persona that answers only with `edit_message` or another service can receive a
 
 ### When it stays silent
 
-A reminder requires an observed `working` → `waiting` transition after delivery in the same session. A first observation of `waiting` alone is insufficient; CSCB does not infer a missed transition. A changed session, a finished or missing row, or persona teardown cancels pending reminder checks. For diagnosis, see [A persona isn't reminded to reply, or is reminded after opting out](../skills/debug-slack-channel-bots/SKILL.md#a-persona-isnt-reminded-to-reply-or-is-reminded-after-opting-out).
-
-A pending reminder check expires 24 hours after delivery. A reminder already queued follows normal delivery.
+A reminder requires an observed `working` → `waiting` transition after delivery in the same session. A first observation of `waiting` alone is insufficient; CSCB does not infer a missed transition. A changed session, a finished or missing row, or persona teardown cancels pending reminder checks; they expire 24 hours after delivery. A reminder already queued follows normal delivery. For diagnosis, see [A persona isn't reminded to reply, or is reminded after opting out](../skills/debug-slack-channel-bots/SKILL.md#a-persona-isnt-reminded-to-reply-or-is-reminded-after-opting-out).

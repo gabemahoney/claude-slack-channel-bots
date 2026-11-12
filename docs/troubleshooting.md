@@ -29,6 +29,15 @@ Correct the name (or remove `model`) in `config.json`, confirm the change, then 
 **Acknowledgement reaction missing or stuck**
 Check that both configured emoji exist in the workspace and the confirmed settings took effect at server start; use `message-delivered` to confirm delivery when Slack reaction calls fail. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-acknowledgement-reaction-missing-or-stuck).
 
+**A Reaction Notice has no thread timestamp**
+Check for `reaction-message-unknown` and restore Slack read access; an unthreaded message also omits `thread_ts`. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-reaction-notice-has-no-thread-timestamp).
+
+**A Reaction Notice arrives from a listed group DM**
+Remove that conversation from the persona's `channels` and confirm the change; check `mpim:read` and Slack lookup availability. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-reaction-notice-arrives-from-a-listed-group-dm).
+
+**No Reaction Notices for reactions by people or other apps**
+Check both reaction event subscriptions and reinstall the receiving persona's app with the manifest's scopes. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-no-reaction-notices-for-reactions-by-people-or-other-apps).
+
 **A persona's instance waits at a startup prompt**
 agent-director pre-trusts the working directory during launch. If any startup prompt still needs an answer, attach with `tmux attach -t =slack_bot_<key>` and answer it yourself; CSCB sends no automatic startup answers. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-personas-instance-waits-at-a-startup-prompt).
 

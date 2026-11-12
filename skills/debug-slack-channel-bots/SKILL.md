@@ -7225,6 +7225,24 @@ run. Early reply or reaction suppression lasts 24 hours and pending/completed tr
 in memory; restart loses reply suppression, so an already answered retained
 message can acquire a reaction again.
 
+### Symptom: A Reaction Notice has no thread timestamp
+
+- **Symptom:** A notice has no `thread_ts`. An ordinary unthreaded message also omits it, so omission alone proves no lookup failure.
+- **Cause:** If reading the reacted message fails, times out or finds no message, and the item is not withdrawn, CSCB treats it as the persona's reply-tool post and fixes the notice without `thread_ts`. See [`reaction-message-unknown`](#reaction-message-unknown).
+- **Action:** Match that safe `server.log` line to the persona, conversation and reacted message. Check app membership, the manifest's read scopes and Slack read availability; use [`message-delivered`](#message-delivered) to confirm delivery. A later successful read affects new or not-yet-fixed work; it does not repair an already fixed notice. Do not infer a thread or server-notice origin from the emoji.
+
+### Symptom: A Reaction Notice arrives from a listed group DM
+
+- **Symptom:** A persona receives a notice from a group DM listed in its declarative `channels`.
+- **Cause:** When Slack's conversation lookup fails or times out, declarative mode keeps the item. A successful lookup excludes a group DM; ordinary group-DM messages never deliver. Acceptance can show [`reaction-received`](#reaction-received); this kept outcome requires neither `conversation-unknown` nor `reaction-message-unknown`.
+- **Action:** Remove the group-DM conversation from the persona's `channels` and [confirm the change](../../docs/reload.md#reload) to prevent new intake; already accepted items are not cancelled. Check the app has `mpim:read`, reinstall it if needed and restore Slack lookup availability. See [`reaction-withdrawn`](#reaction-withdrawn) for successful group-DM exclusion and fungible mode's refusal when the conversation cannot be looked up.
+
+### Symptom: No Reaction Notices for reactions by people or other apps
+
+- **Symptom:** Adding or removing a reaction on this persona's own reply-tool text or file post brings no notice.
+- **Cause:** Its app may lack the `reaction_added` and `reaction_removed` bot event subscriptions. The manifest also requires the `mpim:read` bot scope for recognising group DMs; its absence alone does not prove all reaction events are absent.
+- **Action:** Verify both bot events and the scopes against [the manifest](../../slack-app-manifest.yml), then reinstall the receiving persona's existing app as [Migration](../../docs/migration.md#migration) describes. Test an eligible reaction in a conversation it serves. Follow [`reaction-received`](#reaction-received), [`reaction-dropped`](#reaction-dropped) and [`reaction-withdrawn`](#reaction-withdrawn) to distinguish saved work from exclusions.
+
 ### Symptom: A persona's instance waits at a startup prompt
 
 AD pre-trust handles workspace trust before launch. CSCB never answers startup dialogs automatically. With the operator's say-so, inspect `agent-director get --instance-id cscb_<key>` and `agent-director read-pane --instance-id cscb_<key>`, then attach (`tmux attach -t =slack_bot_<key>`) to answer a prompt. Pending launches retain ordinary retries and their grace/bound; see [A persona posts a Launch stuck or Session not starting notice](#a-persona-posts-a-launch-stuck-or-session-not-starting-notice).

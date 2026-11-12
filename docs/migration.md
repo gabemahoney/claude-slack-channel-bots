@@ -18,6 +18,9 @@ This release requires agent-director 0.12.0 or later. Its 0.12.0 client and the 
    ```
    A snippet installed by an earlier release names `/home/USER/.claude/channels/slack/startup-errors.log` or `/home/USER/.config/cscb/startup-errors.log`: copy the file again, or change that path to `/home/USER/.config/claude-slack-channel-bots/startup-errors.log`.
 4. **Stop the old server before the first start after an upgrade from a release that kept its state in `~/.claude/channels/slack` or `~/.config/cscb`.** The state directory is now `~/.config/claude-slack-channel-bots` (`$XDG_CONFIG_HOME/claude-slack-channel-bots` when `XDG_CONFIG_HOME` is an absolute path). The first `start` moves `~/.config/cscb` there, then `~/.claude/channels/slack`, overwrites nothing in the new directory, and leaves each old name as a symbolic link to it. It refuses to start (exit 1, nothing moved, a `[slack] state-migrate: a server is still running on the old state directory …` line) while a server still runs on an old directory: run `claude-slack-channel-bots stop` (it finds the old directory), then `start`; `clean_restart --server` does both. A host that follows the switch-over runbook stops the old server in step 3 and moves the directory at the first start, in step 10; create nothing at `~/.config/claude-slack-channel-bots` before that start, or it merges the old directory into the new one instead of moving it whole. With `SLACK_STATE_DIR` set, nothing moves. What each starting point (0.13 and earlier, 0.14.0, 0.15.0) ends with is in the [CHANGELOG](../CHANGELOG.md) entry "The state directory is renamed to `~/.config/claude-slack-channel-bots`"; a conflict or a failed move is in the debug skill under [The state directory's location and its move at start](../skills/debug-slack-channel-bots/SKILL.md#the-state-directorys-location-and-its-move-at-start).
+5. **Enable Reaction Notices on each receiving persona's existing app.** Add the `reaction_added` and `reaction_removed` bot events and the `mpim:read` bot scope from [the manifest](../slack-app-manifest.yml), then reinstall the app. Before the reaction-event subscriptions are in place, that persona gets no notices for reactions by people or other apps. `mpim:read` enables group-DM recognition, not group-DM message delivery. For new apps see [Quick Start](../README.md#quick-start); for behavior see [Reaction Notices](bots.md#reaction-notices).
+
+Server notices and already-closed permission prompts posted before the upgrade have no server-post marker, so reactions on them can bring notices as if they were the persona's own replies. Still-open old permission prompts remain excluded, and server notices and permission prompts posted after the upgrade are recognised.
 
 ### Switching over to agent-director Phase 1
 
@@ -184,6 +187,8 @@ The shared orchestrator prompt's "hold until after" wording goes out now (operat
 
 This runbook takes the host back to the previous CSCB on its previous compatible agent-director, whether agent-director Phase 1 was installed by [Switching over to agent-director Phase 1](#switching-over-to-agent-director-phase-1) or some other way. Both binaries are rolled back together.
 
+An earlier CSCB release without Reaction Item support quarantines those queue records; undelivered Reaction Notices cannot be delivered by that release. This is separate from restoring agent-director's store below.
+
 - Stop all callers before restoring the previous agent-director using the released way-back procedure in step 6: restore the retained old directory and any external store's pre-upgrade copy. Schema 9 has no SQL downgrade. Data written since the upgrade is lost; restart only callers compatible with the restored CLI, including the previous CSCB.
 - The store is shared by every agent-director user on the host. Without stopping all callers first, a restore would drop the rows of other services' workers spawned since the switch-over, leaving them running with no row.
 - Every agent on the host, with every long-running agent-director process (`agent-director serve` included), is stopped before the previous binary is restored and started again after it.
@@ -292,6 +297,8 @@ This major version accepts only the persona configuration format. These are the 
 
 Earlier releases ignore this release’s queue and can resume a bot without their required channels launch, leaving it unable to receive messages. Follow all four phases in order, including when the configuration already fits the target release.
 
+An earlier CSCB release without Reaction Item support quarantines those queue records, so undelivered Reaction Notices cannot be delivered there.
+
 1. **Stop sending and empty the queues.** Wait until `server.log` shows every received item delivered. Otherwise explicitly accept that undelivered messages are lost when using the earlier release.
 2. **Disable resume on the current release.** Set `resume_enabled` to `false` in `config.json`, [confirm the pending change](reload.md#confirming-a-change), and verify `config.json.last-applied` holds `resume_enabled: false`. Keep the current server running until this is applied.
    If the target release does not support these settings, first give every persona a valid declarative section (`permission_prompts`, and `channels` unless `dm.enabled` is `true`; see [Load-time rules](configuration.md#load-time-rules)), remove `allow_invited_channels` and every persona’s `invited`, confirm, and ensure the last-applied record holds neither.
@@ -304,30 +311,15 @@ Earlier releases ignore this release’s queue and can resume a bot without thei
 
 ## Upgrading from pre-v0.6 (v0.5.x → v0.6.x)
 
-If you installed CSCB before v0.6.0 you may have legacy artifacts on disk that are no longer needed. Clean them up by hand; no install step removes them.
+Remove these old relay artifacts by hand; installation does not remove them. The permission relay runs through agent-director.
 
 ### 1. Remove old relay hook files
 
-The `.sh` relay hooks are no longer shipped by CSCB. Delete them if present:
-
-```sh
-rm -f ~/.claude/hooks/permission-relay.sh ~/.claude/hooks/ask-relay.sh
-```
+Delete `~/.claude/hooks/permission-relay.sh` and `~/.claude/hooks/ask-relay.sh` if present.
 
 ### 2. Remove orphan settings.json hook entries
 
-If you wired the hooks into `~/.claude/settings.json` by hand, remove the stale entries. Use this `jq` filter to check whether any are present:
-
-```sh
-jq '
-  (.hooks.PermissionRequest // [] | map(select(.hooks[]?.command | strings | test("\\.sh$")))),
-  (.hooks.PreToolUse // [] | map(select(.matcher == "AskUserQuestion" and (.hooks[]?.command | strings | test("\\.sh$")))))
-' ~/.claude/settings.json 2>/dev/null
-```
-
-Any non-empty arrays in the output are orphan entries. Remove:
+In `~/.claude/settings.json`, remove only the matching stale entries:
 
 - Any object inside `hooks.PermissionRequest` whose `hooks[].command` ends in `permission-relay.sh`.
 - Any object inside `hooks.PreToolUse` with `"matcher": "AskUserQuestion"` whose `hooks[].command` ends in `ask-relay.sh`.
-
-The modern permission relay runs automatically via agent-director — no `PermissionRequest` or `PreToolUse` hook entries for `.sh` files are needed.

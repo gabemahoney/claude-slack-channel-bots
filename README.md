@@ -36,6 +36,8 @@ Install [Bun](https://bun.sh) before installing CSCB. For installation problems,
 
    Skip this step if the wizard created them. Create one Slack app per persona from `slack-app-manifest.yml`. Write each app's tokens to its own credentials file, then list the personas in `config.json`. See [A first configuration](#a-first-configuration), and [Personas (config.json)](docs/configuration.md#personas-configjson) and [Credentials files](docs/configuration.md#credentials-files) for the full reference.
 
+   Both setup paths use a manifest with the `reaction_added` and `reaction_removed` bot events and the `mpim:read` bot scope, which allows group-DM recognition and exclusion. For an existing app, add both events and that scope, then reinstall it; before the reaction-event subscriptions are in place, its persona gets no notices for reactions by people or other apps. See [Migration](docs/migration.md#migration) for existing-app instructions and [Reaction Notices](docs/bots.md#reaction-notices) for behavior.
+
 5. **Start the server:**
 
    ```sh
