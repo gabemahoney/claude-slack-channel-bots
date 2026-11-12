@@ -1,6 +1,6 @@
 /** Post-accept immutable fixation shared by fresh and recovered work. */
 import type { WebClient } from '@slack/web-api'
-import type { DeliveryQueue, QueueAccept, QueueItem, QueueEvent } from './delivery-queue.ts'
+import { isQueueItemClosed, type DeliveryQueue, type QueueAccept, type QueueItem, type QueueEvent } from './delivery-queue.ts'
 import { buildTagParts, NAME_LOOKUP_TIMEOUT_MS, TAG_MAX_BYTES, type TagMessage } from './tag-wrapper.ts'
 import { sanitizeFilename } from './lib.ts'
 import { RETYPE_BACKOFF_MS } from './delivery-constants.ts'
@@ -74,7 +74,8 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
     // post-ack fixation must not clone every queued item
     // while a burst's remaining events still await durable acceptance.
     item = deps.queue.item(key, item.accepted.seq) ?? item
-    if (stopped || item.delivered) return
+    // A withdrawn outcome is final: no fixation, retry or wake.
+    if (stopped || isQueueItemClosed(item)) return
     if (!item.fixed) {
       const a = item.accepted, id = `${key}:${a.seq}`
       let parts = fixedParts.get(id)
@@ -131,7 +132,7 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
     owns: (key, seq) => inFlight.has(`${key}:${seq}`) || retries.has(`${key}:${seq}`),
     prepare,
     async recover(keys = deps.queue.keys()) {
-      await Promise.allSettled(keys.flatMap(key => deps.queue.items(key).filter(item => !item.delivered).map(item => prepare(key, item))))
+      await Promise.allSettled(keys.flatMap(key => deps.queue.items(key).filter(item => !isQueueItemClosed(item)).map(item => prepare(key, item))))
     },
     async accept(key, input) {
       const result = await deps.queue.accept(key, input)

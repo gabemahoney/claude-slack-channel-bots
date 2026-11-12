@@ -206,7 +206,7 @@ import { createSlowRecoveryTracker } from './slow-recovery.ts'
 import { createDeliveryReporting } from './delivery-notices.ts'
 import { buildDeliveryDiagnostic, buildQueuedMessageRetryLine, SYSTEM_PROMPT_UNWRITABLE, queueErrorCode } from './persona-diagnostics.ts'
 import { createPersonaRouting } from './persona-routing.ts'
-import { createDeliveryQueue, type ReplyReminderQueue, type QueueEvent } from './delivery-queue.ts'
+import { createDeliveryQueue, isQueueItemClosed, type ReplyReminderQueue, type QueueEvent } from './delivery-queue.ts'
 import { createReplyReminders, type ReplyReminders } from './reply-reminder.ts'
 import { createDeliveryPreparation, type DeliveryPreparation } from './delivery-intake.ts'
 import { tagMaxBytesFor } from './tag-wrapper.ts'
@@ -3512,7 +3512,7 @@ export async function main(): Promise<void> {
   deliveryQueueWake.wake = key => deliveryEngines?.wake(key)
   // Retained in-flight items need recovery before launch reconnects; an
   // accepted-only head has no keys to recover and is fixed after bring-up.
-  for (const p of personaConfig.personas) if (deliveryQueue!.items(p.key).some(i => !i.delivered && i.records.some(r => r.kind === 'sent'))) deliveryEngines.wake(p.key)
+  for (const p of personaConfig.personas) if (deliveryQueue!.items(p.key).some(i => !isQueueItemClosed(i) && i.records.some(r => r.kind === 'sent'))) deliveryEngines.wake(p.key)
   setSessionNotifier(personaNotifier.notify)
 
   // one Slack connection per persona. Each connection's

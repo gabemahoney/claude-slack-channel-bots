@@ -1,13 +1,14 @@
 /** durable final receipts trigger reactions through the owning app. */
 import { afterEach, beforeEach, expect, test } from 'bun:test'
-import { writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { _resetAckTracker, addDeliveryAck, consumeAck, createQueuedAckCallback, createDeliveryAckCallback, forgetPersonaAcks } from '../src/ack-tracker.ts'
+import type { AcceptedInput, ReactionAcceptedInput } from '../src/delivery-queue.ts'
 import { buildDeliveryDiagnostic, buildDeliveryDispatchLine, createDeliveryReporting, deliveryIdentity, MESSAGE_DELIVERED, MESSAGE_RECEIVED } from '../src/delivery-notices.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
 import { makeDeliveryNoticeHarness, type DeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
-import { slackInput } from './test-helpers/delivery-queue.ts'
+import { deliveredRecord, queuePath, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
 import { makeQueuedAckHarness, type QueuedAckHarness } from './test-helpers/queued-ack.ts'
 import { makeStubSlack } from './test-helpers/slack-stub.ts'
 const engines: EngineHarness[] = [], notices: DeliveryNoticeHarness[] = []
@@ -669,4 +670,71 @@ test.each(['reply', 'teardown'] as const)('metadata: %s during legacy adoption c
   expect(h.visible()).toEqual([])
   expect(h.stub().calls.reactionsAdd.map(call => call.name)).toEqual(race === 'reply' ? [] : [originalName])
   expectOnlyOneStage(h)
+})
+
+function reactionInput(overrides: Partial<ReactionAcceptedInput> = {}): ReactionAcceptedInput {
+  const fields = { channel: 'C0TEST001', message_ts: '1700000000.000001', ts: '1700000000.000002', change: 'added' as const, emoji: 'thumbsup', user: 'U0REACTOR', ...overrides }
+  return { source: 'reaction', text: '', origin: 'slack-event', mode: 'declarative', ...fields, reaction_key: { chat_id: fields.channel, message_ts: fields.message_ts, reactor: fields.user, emoji: fields.emoji, change: fields.change, event_ts: fields.ts } }
+}
+async function acceptOn(e: EngineHarness, input: AcceptedInput): Promise<number> {
+  const result = await e.queue.accept('alpha', input)
+  if (result.status !== 'accepted') throw new Error('fixture acceptance failed')
+  return result.seq
+}
+async function deliverDurably(e: EngineHarness, seq: number): Promise<void> {
+  await e.queue.append('alpha', { v: 1, kind: 'fixed', seq, parts: ['body'] })
+  await e.queue.append('alpha', sentRecord(seq))
+  await e.queue.append('alpha', deliveredRecord(seq))
+}
+
+test('both production callbacks skip a Reaction Item at its queued and final durable stages; a Slack control on the same client acknowledges', async () => {
+  const { e, n } = await setup()
+  const clientKeys: string[] = [], adoptions: number[] = []
+  const deps = {
+    queue: { rememberQueuedReaction: (key: string, seq: number, name: string) => { adoptions.push(seq); return e.queue.rememberQueuedReaction(key, seq, name) } },
+    clientFor: (key: string) => { clientKeys.push(key); return n.h.stub(key).web },
+  }
+  const queued = createQueuedAckCallback({ ...deps, getReaction: () => 'hourglass' })
+  const delivered = createDeliveryAckCallback({ ...deps, getReaction: () => 'white_check_mark' })
+  // Reporting may call either stage with the current durable item.
+  const bothStages = async (seq: number) => { await queued('alpha', e.queue.item('alpha', seq)!); await delivered('alpha', e.queue.item('alpha', seq)!) }
+  const untouched = (key: string) => ({ added: n.h.stub(key).calls.reactionsAdd, removed: n.h.stub(key).calls.reactionsRemove })
+  const reaction = await acceptOn(e, reactionInput())
+  await bothStages(reaction)
+  await deliverDurably(e, reaction)
+  expect(e.queue.item('alpha', reaction)!.delivered).toBe(true)
+  await bothStages(reaction)
+  expect({ clientKeys, adoptions }).toEqual({ clientKeys: [], adoptions: [] })
+  for (const key of ['alpha', 'beta']) expect(untouched(key)).toEqual({ added: [], removed: [] })
+  expect(e.queue.item('alpha', reaction)!.accepted.queued_ack_reaction).toBeUndefined()
+  expect(consumeAck('alpha', 'C0TEST001', '1700000000.000002')).toBe(false)
+
+  // The same settings and own client acknowledge the reacted-to Slack message.
+  const target = { channel: 'C0TEST001', timestamp: '1700000000.000001' }
+  const slack = await acceptOn(e, slackInput())
+  await bothStages(slack)
+  expect(untouched('alpha')).toEqual({ added: [{ ...target, name: 'hourglass' }], removed: [] })
+  await deliverDurably(e, slack)
+  await bothStages(slack)
+  expect(untouched('alpha')).toEqual({ added: [{ ...target, name: 'hourglass' }, { ...target, name: 'white_check_mark' }], removed: [{ ...target, name: 'hourglass' }] })
+  expect({ clientKeys, adoptions }).toEqual({ clientKeys: ['alpha', 'alpha'], adoptions: [slack] })
+  expect(untouched('beta')).toEqual({ added: [], removed: [] })
+  expect(consumeAck('alpha', target.channel, target.timestamp)).toBe(true)
+})
+
+test('rememberQueuedReaction gives a Reaction Item no queued-ack metadata and leaves its journal unchanged', async () => {
+  const { e } = await setup()
+  const reaction = await acceptOn(e, reactionInput())
+  const slack = await acceptOn(e, slackInput())
+  const journal = readFileSync(queuePath(e.root), 'utf8'), item = e.queue.item('alpha', reaction)
+  const record = e.records().find(r => r.kind === 'accepted' && r.seq === reaction)
+  expect(await e.queue.rememberQueuedReaction('alpha', reaction, 'hourglass')).toBeUndefined()
+  expect(readFileSync(queuePath(e.root), 'utf8')).toBe(journal)
+  expect(e.queue.item('alpha', reaction)).toEqual(item!)
+  expect(item!.accepted.queued_ack_reaction).toBeUndefined()
+  // The Slack control's rewrite still leaves the reaction record as it was.
+  expect(await e.queue.rememberQueuedReaction('alpha', slack, 'hourglass')).toBe('hourglass')
+  expect(e.queue.item('alpha', slack)!.accepted.queued_ack_reaction).toBe('hourglass')
+  expect(e.records().find(r => r.kind === 'accepted' && r.seq === reaction)).toEqual(record!)
+  expect(e.queue.item('alpha', reaction)).toEqual(item!)
 })
