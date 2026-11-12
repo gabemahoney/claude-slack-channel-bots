@@ -451,9 +451,9 @@ retain their existing text excerpts; receipt confirmation has its own line.
 ### `message-not-saved`
 
 - **Line:** `[slack] message-not-saved: persona="<name>" (key=<key>) source=slack chat_id="<chat>" ts="<ts>" sender_id="<sender>" count=<n> path="<path>" code=<errno>`
-- **Meaning:** The incoming message could not be durably stored on this attempt; it was not accepted. Every failure is counted, including Slack retries.
+- **Meaning:** The incoming message could not be durably stored on this attempt; it was not accepted. Every failure is counted, including Slack retries. A reaction that could not be saved shows `source=reaction chat_id="<chat>" ts="<event ts>" sender_id="<reactor>"`: the conversation, the reaction event's timestamp (not the reacted message's) and the reactor's ID.
 - **Cause:** The queue directory or disk cannot be written.
-- **Fix:** Check free space, mount availability and permissions on the named path. For Slack, follow **Message not saved** below; retry a failed injected message once storage works.
+- **Fix:** Check free space, mount availability and permissions on the named path. For a Slack message, follow **Message not saved** below; retry a failed injected message once storage works. A reaction gets no *Message not saved* warning and no *Message saved after retry* correction, because both concern Slack messages. CSCB did not acknowledge it, so Slack sends it again a few times; the reaction is lost only if no copy is saved before Slack stops resending. A [`reaction-received`](#reaction-received) line confirms a copy was saved, but logging is best effort, so a missing line alone does not prove the reaction was lost.
 
 The same class also records attempts to correct a warning after the exact message
 was saved:
@@ -553,6 +553,19 @@ evidence may no longer qualify after restart.
 - **Cause:** The state directory or its disk cannot be written.
 - **Fix:** Check the named file, state directory permissions, mount and free space. Launch retries follow the existing backoff; other personas continue.
 
+### `reaction-received`
+
+- **Line:** `[slack] reaction-received: persona="<name>" (key=<key>) chat_id="<chat>" message_ts="<ts>" change=<added|removed> emoji="<emoji>" <user|bot_id>="<reactor>" seq=<n>`
+- **Meaning:** Someone added (`change=added`) or removed (`change=removed`) the reaction `<emoji>` on one of this persona's messages in `<chat>`, and CSCB saved it for the persona before acknowledging the event to Slack. `message_ts` is the reacted message's timestamp, `user` the reactor's user ID (`bot_id` for a reactor with no user ID) and `seq` the reaction's place in the persona's queue. It is logged once, when the reaction is first saved: a copy Slack sends again, before or after a restart, logs nothing. Saved is not delivered. CSCB next reads the reacted message; then either the reaction waits its turn like any message, and its [`message-delivered`](#message-delivered) line shows `source=reaction chat_id="<chat>" ts="<event ts>" sender_id="<reactor>"`, or a [`reaction-withdrawn`](#reaction-withdrawn) line says why it is never delivered.
+- **Cause:** A reaction to a message the persona's bot posted, by a person or by an app that is not a persona's, in a conversation the persona serves now. [`reaction-dropped`](#reaction-dropped) lists the reactions it doesn't take.
+- **Fix:** No action is needed. A reaction gets no acknowledgement reaction and never prompts a reply reminder. A reaction that could not be saved logs no `reaction-received` line: it logs [`message-not-saved`](#message-not-saved) with `source=reaction`, the conversation as `chat_id`, the event's `ts` and the reactor as `sender_id`, and no *Message not saved* warning is posted. The event is not acknowledged, so Slack sends it again; fix the storage as that entry says.
+
+### `reaction-dropped`
+
+- **Line:** `[slack] reaction-dropped: persona="<name>" (key=<key>) chat_id="<chat>" message_ts="<ts>" reason=<reason>[ refusal=<refusal>]`
+- **Meaning:** A reaction to one of this persona's messages in `<chat>` was not saved and is never delivered to the persona's bot. `message_ts` is the reacted message's timestamp. CSCB acknowledged the event, so Slack does not send it again, and nothing is posted to Slack. The persona's settings in effect when the reaction arrived decide it; a confirmed change applies from the next reaction.
+- **Cause:** `reason` names the first check that failed. `no-reactor`: the event names neither a user ID nor a bot ID. `dm-disabled`: the reaction is in a DM and the persona's `dm.enabled` is off. `unserved-conversation`: in declarative mode, the channel is not one of the persona's `channels`. `fungible-refused`: in fungible mode, the channel failed a check, and `refusal` names it: `channel-id-malformed` (the conversation ID is not a channel ID), `flag-missing` (the event's envelope has no `is_ext_shared_channel` flag), `flag-not-boolean` (that flag is neither true nor false) or `externally-shared` (the channel is shared with another organization). Four kinds of reaction are dropped with no line: one to a message that is not this persona's, an event that is not a reaction to a message, the persona's own reaction, and a reaction by the bot of any persona this server has connected since it started, a removed persona's included.
+- **Fix:** For `dm-disabled`, if the persona should hear DMs, set `dm.enabled` to `true` and confirm the change (see [Confirming a pending change](#confirming-a-pending-change)). For `unserved-conversation`, if the persona should hear the channel, add it to the persona's `channels` and confirm the change. For `channel-id-malformed` and `externally-shared`, nothing: fungible mode never delivers those. For `no-reactor`, `flag-missing` and `flag-not-boolean`, nothing: Slack sent an incomplete event. Nothing resends a dropped reaction; a later reaction is decided afresh.
 ### `reaction-withdrawn`
 
 - **Line:** `[slack] reaction-withdrawn: persona="<name>" (key=<key>) chat_id="<chat>" message_ts="<ts>" reason=<reason>[ failed_condition=<condition>]`

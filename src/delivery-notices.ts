@@ -110,6 +110,10 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     deps.episodes.end(key, 'delivery-stuck'); deps.episodes.end(key, 'messages-waiting')
   }
   function receivedItem(key: string, item: QueueItem): void {
+    // Reaction intake logs its own reaction-received line once, at a new
+    // store; a Reaction Item gets no message-received line and no queued
+    // acknowledgement reaction, from preparation, recovery or final delivery.
+    if (item.accepted.source === 'reaction') return
     // Intake calls this after its aggregate ack decision. Recovery stays
     // detached, so a stuck Slack edit never holds acknowledgement/preparation.
     if (item.accepted.source === 'slack' && item.accepted.key) {

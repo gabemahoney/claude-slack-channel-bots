@@ -593,6 +593,7 @@ describe('end to end: A\'s connection trouble makes no agent-director call', () 
           await ack()
           received.push({ key: receiver as string, text: (event as { text?: unknown } | undefined)?.text })
         },
+        receiveReaction: async (_event, ack) => ack(),
       },
       clientFor,
       getPersona: (k) => cfg.personas.find((p) => p.key === k),
@@ -875,6 +876,7 @@ describe('an unresolvable claude_config_dir holds the persona retrying with its 
           await ack()
           received.push({ key: receiver as string, text: (event as { text?: unknown } | undefined)?.text })
         },
+        receiveReaction: async (_event, ack) => ack(),
       },
       clientFor,
       getPersona: (k) => cfg.personas.find((p) => p.key === k),

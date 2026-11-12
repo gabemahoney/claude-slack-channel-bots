@@ -1,6 +1,6 @@
-/** Durable Slack intake: decision wiring, persona isolation, ack boundary and immutable preparation. */
+/** Durable Slack intake of messages and reactions: decision wiring, persona isolation, ack boundary and immutable preparation. */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { WebClient } from '@slack/web-api'
@@ -9,17 +9,20 @@ import { buildTagParts, NAME_LOOKUP_TIMEOUT_MS, TAG_MAX_BYTES, TAG_MAX_BYTES_MAC
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { sanitizeFilename } from '../src/lib.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
-import { makeRoutingHarness, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness } from './test-helpers/persona-routing-harness.ts'
-import { makeAppMention, makeChannelMessage, makeDm, makeBotMessage, makeWebhookPost, makeStubSlack, mentionText, ENVELOPE_FLAG_FORMS, type SlackEvent } from './test-helpers/slack-stub.ts'
-import { assertNoLeak } from './test-helpers/credentials.ts'
-import { readQueue, seedQueue, slackInput } from './test-helpers/delivery-queue.ts'
+import { makeRoutingHarness, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness, type RoutingHarnessOptions } from './test-helpers/persona-routing-harness.ts'
+import { makeAppMention, makeChannelMessage, makeDm, makeBotMessage, makeWebhookPost, makeStubSlack, mentionText, ENVELOPE_FLAG_FORMS, type EnvelopeOverrides, type SlackEvent } from './test-helpers/slack-stub.ts'
+import { assertNoLeak, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
+import { deliveredRecord, queuePath, readQueue, seedQueue, slackInput } from './test-helpers/delivery-queue.ts'
+import type { ChannelMode, Persona } from '../src/config.ts'
+import type { QueueRecord, ReactionAcceptedRecord } from '../src/delivery-queue.ts'
+import { buildReactionDroppedLine, buildReactionReceivedLine, REACTION_RECEIVED, type ReactionDroppedInput } from '../src/reaction-intake-diagnostics.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { injectedInput, makeQueue } from './test-helpers/delivery-queue.ts'
 import { isRestartPendingOrActive } from '../src/restart.ts'
 const CA = 'C0TEST001', CB = 'C0TEST002', CS = 'C0SHARED1', CX = 'C0OTHER01'
 let dir: string; let harnesses: RoutingHarness[]
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'routing-queue-')); harnesses = []; resetRoutingState() })
-afterEach(async () => { for (const h of harnesses) { h.hold.cancelAll(); h.releaseLaunches(); await h.queue.stop(); assertNoLeak(h.captured()) }; resetRoutingState(); rmSync(dir, { recursive: true, force: true }) })
+afterEach(async () => { for (const h of harnesses) { h.hold.cancelAll(); h.releaseLaunches(); await h.preparation.stop(); await h.queue.stop(); assertNoLeak(h.captured()) }; resetRoutingState(); rmSync(dir, { recursive: true, force: true }) })
 function harness(opts: Parameters<typeof makeRoutingHarness>[2] = {}) {
   const h = makeRoutingHarness([{ name: 'alpha', channels: [{ id: CA, delivery: 'all' }, { id: CS, delivery: 'mentions' }], dm: { enabled: true } }, { name: 'beta', channels: [{ id: CB, delivery: 'all' }, { id: CS, delivery: 'mentions' }] }], dir, { restartDelayS: NEVER_FIRE_RESTART_DELAY_S, ...opts }); harnesses.push(h); return h
 }
@@ -130,7 +133,7 @@ describe('fungible mode', () => {
 test('partial fanout suppresses ack; retry prepares retained accepted-only A and newly stored B after aggregate ack', async () => {
   const queue = await makeQueue(dir); const config = makeMultiPersonaConfig([{ name: 'alpha', channels: [{ id: CS, delivery: 'all' }] }, { name: 'beta', channels: [{ id: CS, delivery: 'all' }] }], dir)
   let failing = true; const order: string[] = []
-  const routing = createPersonaRouting({ getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }), archive: () => {}, log: () => {}, queue: { lookupSlackKey: queue.lookupSlackKey, accept: async (key, input) => { order.push('store:' + key); return key === 'beta' && failing ? { status: 'failed', error: new Error('EIO') } : queue.accept(key, input) } }, onReceived: (key) => { order.push('received:' + key) }, prepare: async (key, item) => { order.push('prepare:' + key); await queue.append(key, { v: 1, kind: 'fixed', seq: item.accepted.seq, parts: ['fixed'] }) } })
+  const routing = createPersonaRouting({ getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }), archive: () => {}, log: () => {}, queue: { lookupSlackKey: queue.lookupSlackKey, lookupReactionKey: queue.lookupReactionKey, accept: async (key, input) => { order.push('store:' + key); return key === 'beta' && failing ? { status: 'failed', error: new Error('EIO') } : queue.accept(key, input) } }, onReceived: (key) => { order.push('received:' + key) }, prepare: async (key, item) => { order.push('prepare:' + key); await queue.append(key, { v: 1, kind: 'fixed', seq: item.accepted.seq, parts: ['fixed'] }) } })
   const event = makeChannelMessage({ channel: CS }); await routing.receive(event, () => { order.push('ack') }, ['alpha', 'beta'])
   expect(order).toEqual(['store:alpha', 'store:beta', 'received:alpha']); expect(queue.items('alpha')).toHaveLength(1); expect(queue.items('beta')).toEqual([])
   failing = false; order.length = 0; await routing.receive(event, () => { order.push('ack') }, ['alpha', 'beta'])
@@ -350,5 +353,290 @@ describe('reaction-shaped ordinary input', () => {
       const item = queue.items('alpha')[0]!
       expect(outerTag(item.fixed!.parts)).toEqual({ attrs: [['source', 'slack-channel-router'], ['user', row.user], ['ts', item.accepted.ts]], body: row.body })
     } finally { await preparation.stop(); await queue.stop() }
+  })
+})
+
+// SR-3.2, SR-3.3, SR-4.1 to SR-4.3, SR-8.1, SR-10.1: the real reaction intake over the real queue and preparation.
+describe('reaction intake', () => {
+  const MSG_TS = '1700000000.000100', EVENT_TS = '1700000050.000200', NOW = 1700000100000, DM = 'D0TEST001'
+  const ALPHA_BOT = 'U0ALPHABOT', BETA_BOT = 'U0BETABOT1', RETIRED_BOT = 'U0RETIRED1', HUMAN = 'U0REACTOR1', APP_BOT = 'B0REACTAPP'
+  const CONTENT = 'reaction-content-sentinel: no message text is stored'
+  // The run's Run Bot Identities as a fixed fake: both live personas' bot users and one retired from the configuration.
+  const RUN_BOTS: ReadonlySet<string> = new Set([ALPHA_BOT, BETA_BOT, RETIRED_BOT])
+  const USER_LOOKUPS = ['conversations.info', 'conversations.replies', 'users.info'], BOT_LOOKUPS = ['conversations.info', 'conversations.replies']
+  function rh(opts: RoutingHarnessOptions = {}) {
+    return harness({
+      dedupeClock: () => NOW, isRunBotIdentity: id => RUN_BOTS.has(id), ...opts,
+      stubOptions: { ...opts.stubOptions, alpha: { botUserId: ALPHA_BOT, ...opts.stubOptions?.alpha }, beta: { botUserId: BETA_BOT, ...opts.stubOptions?.beta } },
+    })
+  }
+  type ReactionOverrides = { [field: string]: unknown; item?: Record<string, unknown> }
+  /** A human's reaction to alpha's message in CA; `item` overrides merge into the nested item. */
+  function reaction(over: ReactionOverrides = {}): Record<string, unknown> {
+    const { item, ...rest } = over
+    return { type: 'reaction_added', user: HUMAN, reaction: 'white_check_mark', item_user: ALPHA_BOT, event_ts: EVENT_TS, ...rest, item: { type: 'message', channel: CA, ts: MSG_TS, ...item } }
+  }
+  const keyOf = (h: RoutingHarness, name = 'alpha') => h.p(name).persona.key
+  const acks = (h: RoutingHarness) => h.order.filter(s => s === 'ack').length
+  const methods = (h: RoutingHarness, name = 'alpha') => h.p(name).stub.callLog.map((c): string => c.method).sort()
+  const received = (h: RoutingHarness) => h.logs.filter(l => l.includes(REACTION_RECEIVED))
+  const dropped = (h: RoutingHarness) => h.logs.filter(l => l.includes('reaction-dropped'))
+  const records = (h: RoutingHarness, name = 'alpha') => existsSync(queuePath(dir, keyOf(h, name))) ? readQueue(dir, keyOf(h, name)) : []
+  const full = (rs: QueueRecord[]) => rs.filter(r => r.kind === 'accepted' && !('compact' in r))
+  const subject = (h: RoutingHarness, name = 'alpha') => ({ key: keyOf(h, name), name: h.p(name).persona.name })
+  function withAlpha(h: RoutingHarness, edit: (p: Persona) => Persona): void {
+    h.config = { ...h.config!, personas: h.config!.personas.map(p => p.name === 'alpha' ? edit(p) : p) }
+  }
+  function expectNoWork(h: RoutingHarness): void {
+    for (const p of h.all) { expect(records(h, p.persona.name)).toEqual([]); expect(p.stub.callLog).toEqual([]) }
+    expect(h.received).toEqual([])
+  }
+
+  test.each([
+    { type: 'reaction_added', change: 'added', reactor: { user: HUMAN }, id: HUMAN, lookups: USER_LOOKUPS },
+    { type: 'reaction_removed', change: 'removed', reactor: { user: HUMAN }, id: HUMAN, lookups: USER_LOOKUPS },
+    { type: 'reaction_added', change: 'added', reactor: { bot_id: APP_BOT }, id: APP_BOT, lookups: BOT_LOOKUPS },
+    { type: 'reaction_removed', change: 'removed', reactor: { bot_id: APP_BOT }, id: APP_BOT, lookups: BOT_LOOKUPS },
+  ] as const)('$type by $id is durable with exact fields at its one ack, then prepared on alpha\'s client only', async row => {
+    const h = rh(); const key = keyOf(h)
+    const event = reaction({ type: row.type, user: undefined, ...row.reactor, text: CONTENT, item: { text: CONTENT } })
+    let atAck: { records: unknown[]; calls: string[] } | undefined
+    await h.receiveReaction(event, 'alpha', () => { h.order.push('ack'); atAck = { records: readQueue(dir, key), calls: h.all.flatMap(p => p.stub.callLog.map(c => c.method)) } })
+    const accepted = {
+      v: 1, kind: 'accepted', seq: 1, source: 'reaction', text: '', channel: CA, message_ts: MSG_TS, ts: EVENT_TS, change: row.change, emoji: 'white_check_mark', ...row.reactor,
+      origin: 'slack-event', mode: 'declarative', reaction_key: { chat_id: CA, message_ts: MSG_TS, reactor: row.id, emoji: 'white_check_mark', change: row.change, event_ts: EVENT_TS }, received_at: NOW,
+    }
+    expect(atAck).toEqual({ records: [accepted], calls: [] })
+    expect(h.order).toEqual(['config', `identity:${key}`, 'ack'])
+    expect(readQueue(dir, key).map(r => r.kind)).toEqual(['accepted', 'fixed'])
+    expect(methods(h)).toEqual([...row.lookups])
+    expect(records(h, 'beta')).toEqual([]); expect(h.p('beta').stub.callLog).toEqual([])
+    expect(h.logs).toEqual([buildReactionReceivedLine(subject(h), accepted as ReactionAcceptedRecord)])
+    expect(h.received).toEqual([]); expect(h.all.flatMap(p => p.stub.calls.reactionsAdd)).toEqual([])
+    expect(readFileSync(queuePath(dir, key), 'utf8')).not.toContain(CONTENT); expect(h.logs.join('\n')).not.toContain(CONTENT)
+    assertNoLeak({ ...h.captured(), queue: writtenFile(queuePath(dir, key)) })
+  })
+
+  test('a held async ack holds preparation until the ack completes, not until it is called', async () => {
+    const h = rh(); let release!: () => void; let called!: () => void
+    const ackCalled = new Promise<void>(r => { called = r })
+    const handling = h.receiveReaction(reaction(), 'alpha', () => { h.order.push('ack'); called(); return new Promise<void>(r => { release = r }) })
+    await ackCalled; await new Promise(r => setImmediate(r))
+    expect(h.p('alpha').stub.callLog).toEqual([]); expect(h.queued('alpha').map(i => i.fixed)).toEqual([undefined])
+    release(); await handling
+    expect(methods(h)).toEqual(USER_LOOKUPS); expect(h.queued('alpha')[0]!.fixed).toBeDefined()
+  })
+
+  test.each(['fsync-failing', 'failed', 'rejected'] as const)('a %s store sends no ack and leaves no item; the identical redelivery is stored and prepared once', async fault => {
+    let armed = true
+    const h = rh(fault === 'fsync-failing' ? {} : { wrapAccept: accept => async (key, input) => {
+      if (!armed) return accept(key, input)
+      armed = false
+      if (fault === 'failed') return { status: 'failed', error: new Error(sentinelInMessage('store')) }
+      throw new Error(sentinelInMessage('accept'))
+    } })
+    // One regular-file fsync fails; directory syncs and every later fsync run normally.
+    if (fault === 'fsync-failing') h.queueFaults.fileSync = () => { h.queueFaults.fileSync = undefined; throw Object.assign(new Error('EIO: injected fsync failure'), { code: 'EIO' }) }
+    const event = reaction()
+    await h.receiveReaction(event, 'alpha')
+    expect(h.queueFaults.fileSync).toBeUndefined()
+    expect(acks(h)).toBe(0); expectNoWork(h); expect(h.queued('alpha')).toEqual([])
+    expect(h.logs).toEqual(fault === 'rejected' ? [expect.stringContaining('reaction store failed')] : [])
+    await h.receiveReaction(event, 'alpha')
+    expect(acks(h)).toBe(1)
+    expect(records(h).map(r => [r.kind, r.seq])).toEqual([['accepted', 1], ['fixed', 1]])
+    expect(received(h)).toHaveLength(1); expect(methods(h)).toEqual(USER_LOOKUPS)
+    expect(h.allPosts()).toEqual([]); expect(h.notices).toEqual([])
+  })
+
+  test('a throwing diagnostic log undoes neither the stored item nor its one ack and preparation', async () => {
+    const h = rh({ logHook: line => { if (line.includes(REACTION_RECEIVED)) throw new Error('log sink failed') } })
+    await h.receiveReaction(reaction(), 'alpha')
+    expect(acks(h)).toBe(1); expect(received(h)).toHaveLength(1)
+    expect(records(h).map(r => r.kind)).toEqual(['accepted', 'fixed'])
+  })
+
+  // A sink that throws on every line, error lines included: each path's own log call meets it, and its ack and work are unchanged.
+  const receivedLine = (h: RoutingHarness) => buildReactionReceivedLine(subject(h), h.queued('alpha')[0]!.accepted as ReactionAcceptedRecord)
+  const FAILING_SINK: Array<{ path: string; opts?: RoutingHarnessOptions; event?: () => Record<string, unknown>; afterAck?: (h: RoutingHarness) => void; acks: number; kinds: Array<QueueRecord['kind']>; calls: readonly string[]; lines: (h: RoutingHarness) => string[] }> = [
+    { path: 'a logged drop', event: () => reaction({ item: { channel: CX } }), acks: 1, kinds: [], calls: [], lines: h => [buildReactionDroppedLine(subject(h), { reason: 'unserved-conversation', chat_id: CX, message_ts: MSG_TS })] },
+    { path: 'a decision failure', opts: { isRunBotIdentity: () => { throw new Error('run bot query failed') } }, acks: 1, kinds: [], calls: [], lines: () => [expect.stringContaining('error handling reaction event')] },
+    { path: 'a rejected store', opts: { wrapAccept: () => async () => { throw new Error('accept rejected') } }, acks: 0, kinds: [], calls: [], lines: () => [expect.stringContaining('reaction store failed')] },
+    { path: 'a failed ack', afterAck: () => { throw new Error('ack lost') }, acks: 1, kinds: ['accepted'], calls: [], lines: h => [receivedLine(h), expect.stringContaining('failed to ack reaction event')] },
+    {
+      path: 'a failed preparation',
+      // The fixed record's fsync fails once; the queue rolls the append back.
+      afterAck: h => { h.queueFaults.fileSync = () => { h.queueFaults.fileSync = undefined; throw Object.assign(new Error('EIO: injected fsync failure'), { code: 'EIO' }) } },
+      acks: 1, kinds: ['accepted'], calls: USER_LOOKUPS, lines: h => [receivedLine(h), expect.stringContaining('post-accept reaction preparation failed')],
+    },
+  ]
+  test.each(FAILING_SINK)('with a log sink that throws on every call, $path still resolves with its own ack and work', async row => {
+    const h = rh({ ...row.opts, logHook: () => { throw new Error('log sink failed') } })
+    await expect(h.receiveReaction((row.event ?? reaction)(), 'alpha', () => { h.order.push('ack'); row.afterAck?.(h) })).resolves.toBeUndefined()
+    expect(acks(h)).toBe(row.acks)
+    expect(records(h).map(r => r.kind)).toEqual(row.kinds)
+    expect(methods(h)).toEqual([...row.calls]); expect(h.p('beta').stub.callLog).toEqual([])
+    expect(h.logs).toEqual(row.lines(h))
+    expect(h.received).toEqual([]); expect(h.allPosts()).toEqual([])
+  })
+
+  test('a throwing ack leaves one accepted-only item unprepared; its redelivery acks, then prepares it', async () => {
+    const h = rh(); const event = reaction()
+    await h.receiveReaction(event, 'alpha', () => { h.order.push('ack'); throw new Error(sentinelInMessage('ack')) })
+    expect(records(h).map(r => r.kind)).toEqual(['accepted']); expect(h.p('alpha').stub.callLog).toEqual([])
+    expect(h.logs).toEqual([received(h)[0], expect.stringContaining('failed to ack reaction event')])
+    let callsAtAck: string[] | undefined
+    await h.receiveReaction(event, 'alpha', () => { h.order.push('ack'); callsAtAck = methods(h) })
+    expect(callsAtAck).toEqual([]); expect(acks(h)).toBe(2)
+    expect(records(h).map(r => [r.kind, r.seq])).toEqual([['accepted', 1], ['fixed', 1]])
+    expect(received(h)).toHaveLength(1); expect(methods(h)).toEqual(USER_LOOKUPS)
+  })
+
+  test('same-run and simultaneous duplicates ack every envelope but store one item and one received line per key', async () => {
+    const h = rh(); const event = reaction(), other = reaction({ event_ts: '1700000050.000300' })
+    await h.receiveReaction(event, 'alpha'); const calls = methods(h)
+    await h.receiveReaction(event, 'alpha')
+    expect(acks(h)).toBe(2); expect(methods(h)).toEqual(calls)
+    await Promise.all([h.receiveReaction(other, 'alpha'), h.receiveReaction(other, 'alpha')])
+    expect(acks(h)).toBe(4)
+    const rs = records(h)
+    expect(full(rs).map(r => r.seq)).toEqual([1, 2]); expect(rs.filter(r => r.kind === 'fixed').map(r => r.seq)).toEqual([1, 2])
+    expect(received(h)).toEqual(full(rs).map(r => buildReactionReceivedLine(subject(h), r as ReactionAcceptedRecord)))
+  })
+
+  test('after stop and reopen, a fresh routing acks a redelivered key with no new item, received line, decision or preparation', async () => {
+    const first = rh(); const key = keyOf(first); const event = reaction()
+    await first.receiveReaction(event, 'alpha'); await first.preparation.stop(); await first.queue.stop()
+    const second = rh()
+    await second.receiveReaction(event, 'alpha')
+    expect(second.order).toEqual(['ack']); expect(second.runBotAsks).toEqual([])
+    expect(second.queued('alpha').map(i => [i.accepted.seq, i.fixed !== undefined])).toEqual([[1, true]])
+    expect(full(readQueue(dir, key))).toHaveLength(1)
+    expect(received(second)).toEqual([]); expect(second.p('alpha').stub.callLog).toEqual([])
+  })
+
+  const fixedRecord: QueueRecord = { v: 1, kind: 'fixed', seq: 1, parts: ['fixed reaction notice'] }
+  const withdrawnRecord: QueueRecord = { v: 1, kind: 'withdrawn', seq: 1, reason: 'server-post', at: NOW }
+  const CLOSES: Array<{ state: string; close: (h: RoutingHarness) => Promise<void>; prepares: boolean }> = [
+    { state: 'accepted-only', close: async () => {}, prepares: true },
+    { state: 'fixed', close: h => h.queue.append(keyOf(h), fixedRecord), prepares: false },
+    { state: 'delivered', close: async h => { await h.queue.append(keyOf(h), fixedRecord); await h.queue.append(keyOf(h), deliveredRecord(1, NOW)) }, prepares: false },
+    { state: 'withdrawn', close: h => h.queue.append(keyOf(h), withdrawnRecord), prepares: false },
+    { state: 'key-only', close: async h => { await h.queue.append(keyOf(h), withdrawnRecord); await h.queue.compact(keyOf(h)) }, prepares: false },
+  ]
+  test.each(CLOSES)('a redelivered $state duplicate is acked with no new item or received line; only accepted-only work is prepared, after the ack', async row => {
+    const h = rh(); const key = keyOf(h); const event = reaction()
+    await h.receiveReaction(event, 'alpha', () => { h.order.push('ack'); throw new Error('ack lost') })
+    await row.close(h)
+    const before = readQueue(dir, key); const mark = h.order.length
+    let callsAtAck: string[] | undefined
+    await h.receiveReaction(event, 'alpha', () => { h.order.push('ack'); callsAtAck = methods(h) })
+    expect(h.order.slice(mark)).toEqual(['ack']); expect(callsAtAck).toEqual([])
+    expect(received(h)).toHaveLength(1)
+    const after = readQueue(dir, key)
+    expect(after.slice(0, before.length)).toEqual(before)
+    expect(after.slice(before.length)).toEqual(row.prepares ? [expect.objectContaining({ kind: 'fixed', seq: 1 })] : [])
+    expect(methods(h)).toEqual(row.prepares ? USER_LOOKUPS : [])
+    expect(full(after)).toHaveLength(row.state === 'key-only' ? 0 : 1)
+    if (row.state === 'key-only') expect(after).toContainEqual(expect.objectContaining({ compact: 'reaction-key', seq: 1 }))
+  })
+
+  const REPLAYS: Array<{ change: string; event: () => Record<string, unknown>; apply: (h: RoutingHarness) => void }> = [
+    { change: 'mode', event: () => reaction(), apply: h => { h.setMode('fungible') } },
+    { change: 'channels', event: () => reaction(), apply: h => { withAlpha(h, p => ({ ...p, channels: [] })) } },
+    { change: 'DMs', event: () => reaction({ item: { channel: DM } }), apply: h => { withAlpha(h, p => ({ ...p, dm: { ...p.dm, enabled: false } })) } },
+    { change: 'identity', event: () => reaction(), apply: h => { h.identities.set(keyOf(h), { botUserId: 'U0NEWALPHA', botId: 'B0NEWALPHA' }) } },
+  ]
+  test.each(REPLAYS)('a retained accepted-only duplicate replays after the $change change under its stored mode, with no new decision or item', async row => {
+    // The conversation lookup fails: the stored declarative mode keeps the notice, where fungible mode would withdraw it.
+    const h = rh({ stubOptions: { alpha: { info: [{ kind: 'platform', error: 'internal_error' }] } } })
+    const event = row.event()
+    await h.receiveReaction(event, 'alpha', () => { h.order.push('ack'); throw new Error('ack lost') })
+    expect(h.queued('alpha').map(i => [i.accepted.mode, i.fixed])).toEqual([['declarative', undefined]])
+    row.apply(h)
+    const mark = h.order.length, asks = h.runBotAsks.length
+    await h.receiveReaction(event, 'alpha')
+    expect(h.order.slice(mark)).toEqual(['ack']); expect(h.runBotAsks).toHaveLength(asks)
+    expect(h.queued('alpha').map(i => [i.accepted.seq, i.accepted.mode, i.fixed !== undefined, i.withdrawn])).toEqual([[1, 'declarative', true, undefined]])
+    expect(full(records(h))).toHaveLength(1); expect(received(h)).toHaveLength(1); expect(dropped(h)).toEqual([])
+  })
+
+  test('new reaction keys follow each confirmed change of mode, channels, DMs and identity, for the receiving persona only', async () => {
+    let gate: { reached: () => void; release: Promise<void> } | undefined
+    const h = rh({ wrapAccept: accept => async (key, input) => { if (gate) { gate.reached(); await gate.release } return accept(key, input) } })
+    const key = keyOf(h); let n = 0
+    const ts = (i: number) => `1700000060.${String(i).padStart(6, '0')}`
+    const next = (over: ReactionOverrides = {}) => h.receiveReaction(reaction({ event_ts: ts(++n), ...over }), 'alpha')
+    await next()
+    h.setMode('fungible'); await next({ item: { channel: CX } })
+    h.setMode('declarative'); await next({ item: { channel: CX } })
+    withAlpha(h, p => ({ ...p, channels: [...p.channels, { id: CX, delivery: 'mentions' }] })); await next({ item: { channel: CX } })
+    await next({ item: { channel: DM } })
+    withAlpha(h, p => ({ ...p, dm: { ...p.dm, enabled: false } })); await next({ item: { channel: DM } })
+    h.identities.set(key, { botUserId: 'U0NEWALPHA', botId: 'B0NEWALPHA' }); await next(); await next({ item_user: 'U0NEWALPHA' })
+    // The decision's configuration is read before the store's await: a switch while the store is held cannot change that event's mode.
+    let reached!: () => void; let release!: () => void
+    const atStore = new Promise<void>(r => { reached = r })
+    gate = { reached, release: new Promise<void>(r => { release = r }) }
+    const held = next({ item_user: 'U0NEWALPHA' })
+    await atStore; gate = undefined; h.setMode('fungible'); release(); await held
+    expect(h.queued('alpha').map(i => [i.accepted.channel, i.accepted.mode, i.accepted.ts])).toEqual([
+      [CA, 'declarative', ts(1)], [CX, 'fungible', ts(2)], [CX, 'declarative', ts(4)], [DM, 'declarative', ts(5)], [CA, 'declarative', ts(8)], [CA, 'declarative', ts(9)],
+    ])
+    expect(dropped(h)).toEqual([
+      buildReactionDroppedLine(subject(h), { reason: 'unserved-conversation', chat_id: CX, message_ts: MSG_TS }),
+      buildReactionDroppedLine(subject(h), { reason: 'dm-disabled', chat_id: DM, message_ts: MSG_TS }),
+    ])
+    expect(acks(h)).toBe(9); expect(received(h)).toHaveLength(6)
+    expect(records(h, 'beta')).toEqual([]); expect(h.p('beta').stub.callLog).toEqual([])
+  })
+
+  const DROPS: Array<{ reason: string; name?: string; mode?: ChannelMode; envelope?: EnvelopeOverrides; event: () => Record<string, unknown>; drop?: ReactionDroppedInput }> = [
+    { reason: 'no-reactor', event: () => reaction({ user: undefined }), drop: { reason: 'no-reactor', chat_id: CA, message_ts: MSG_TS } },
+    { reason: 'dm-disabled', name: 'beta', event: () => reaction({ item_user: BETA_BOT, item: { channel: DM } }), drop: { reason: 'dm-disabled', chat_id: DM, message_ts: MSG_TS } },
+    { reason: 'unserved-conversation', event: () => reaction({ item: { channel: CX } }), drop: { reason: 'unserved-conversation', chat_id: CX, message_ts: MSG_TS } },
+    { reason: 'fungible-refused', mode: 'fungible', envelope: ENVELOPE_FLAG_FORMS.true, event: () => reaction({ item: { channel: CX } }), drop: { reason: 'fungible-refused', chat_id: CX, message_ts: MSG_TS, refusal: 'externally-shared' } },
+    { reason: 'not-a-message-reaction', event: () => reaction({ item: { type: 'file' } }) },
+    { reason: 'not-own-message', event: () => reaction({ item_user: BETA_BOT }) },
+    { reason: 'own-reaction', event: () => reaction({ user: ALPHA_BOT }) },
+    { reason: 'bot-reaction', event: () => reaction({ user: RETIRED_BOT }) },
+  ]
+  test.each(DROPS)('a $reason drop is acked once with no item, preparation or network, and logs only the builder\'s line for a logged reason', async row => {
+    const name = row.name ?? 'alpha'
+    const h = rh(row.mode === undefined ? {} : { mode: row.mode })
+    await h.receiveReaction(row.event(), name, undefined, row.envelope)
+    expect(acks(h)).toBe(1); expectNoWork(h)
+    expect(h.logs).toEqual(row.drop ? [buildReactionDroppedLine(subject(h, name), row.drop)] : [])
+    if (row.reason === 'bot-reaction') {
+      expect(h.runBotAsks).toEqual([RETIRED_BOT])
+      expect(JSON.stringify(h.config)).not.toContain(RETIRED_BOT)
+    }
+  })
+
+  test.each(['configuration', 'persona'] as const)('with no applied %s a reaction is acked with no decision or work', async missing => {
+    const h = rh()
+    h.config = missing === 'configuration' ? null : { ...h.config!, personas: h.config!.personas.filter(p => p.name !== 'alpha') }
+    await h.receiveReaction(reaction(), 'alpha')
+    expect(acks(h)).toBe(1); expectNoWork(h); expect(h.logs).toEqual([]); expect(h.runBotAsks).toEqual([])
+  })
+
+  test('a reaction in a mentions-only channel is accepted: no ordinary message gate applies', async () => {
+    const h = rh()
+    await h.receiveReaction(reaction({ item: { channel: CS } }), 'alpha')
+    expect(h.queued('alpha').map(i => [i.accepted.channel, i.accepted.source])).toEqual([[CS, 'reaction']])
+  })
+
+  test('reaction intake makes no archive write, lost-message row read or restart, queued report, heard-channel change or post', async () => {
+    const h = rh({ mode: 'fungible', sessions: [], rowRead: {}, armRetryTimer: true })
+    const key = keyOf(h)
+    await h.receiveReaction(reaction({ item: { channel: CX } }), 'alpha')
+    expect(h.queued('alpha').map(i => [i.accepted.source, i.fixed !== undefined])).toEqual([['reaction', true]])
+    expect(h.order).toEqual(['config', `identity:${key}`, 'ack'])
+    expect(h.rowReads).toEqual([]); expect(h.launches).toEqual([]); expect(isRestartPendingOrActive(key)).toBe(false); expect(h.retryTimerArms).toEqual([])
+    expect(h.received).toEqual([]); expect(h.heardChannels(key)).toEqual(new Set()); expect(h.allPosts()).toEqual([]); expect(h.notices).toEqual([])
+    expect(h.all.flatMap(p => p.stub.calls.reactionsAdd)).toEqual([])
+    // Control: an ordinary message on the same harness takes those message-only paths.
+    await h.receive(makeChannelMessage({ channel: CX, text: `${mentionText(ALPHA_BOT)} hello` }), ['alpha'])
+    expect(h.received).toHaveLength(1); expect(h.heardChannels(key)).toEqual(new Set([CX])); expect(h.rowReads).toEqual([key])
   })
 })

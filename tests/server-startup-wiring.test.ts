@@ -70,6 +70,7 @@ import type * as SlowRecoveryModule from '../src/slow-recovery.ts'
 import type { SlowRecoveryTracker, SlowRecoveryTrackerDeps } from '../src/slow-recovery.ts'
 import type * as UnavailableRetryModule from '../src/unavailable-retry.ts'
 import type { FullModeRetryDeps, RetryRunGateDeps, UnavailableRetryController, UnavailableRetryDeps } from '../src/unavailable-retry.ts'
+import type { DeliveryQueue, QueueAcceptResult, ReactionKey } from '../src/delivery-queue.ts'
 import { makeStubCallLog } from './test-helpers/agent-director-stub.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
@@ -1752,6 +1753,50 @@ describe('server.ts wires the persona connection seams', () => {
     const routing = onlyCallProps('createPersonaRouting')
     expect(routing.get('prepare')).toMatch(/^\((\w+), (\w+)\) => deliveryPreparation\?\.prepare\(\1, \2\) \?\? Promise\.resolve\(\)$/)
     expect(routing.has('notify')).toBe(false)
+  })
+
+  // SR-2.4, SR-4.2: the reaction decision asks the manager's own Run Bot
+  // Identities (never a set rebuilt from the personas), and the reaction-key
+  // check the live queue. The routing is built at module scope, before main()
+  // assigns `connections` and `deliveryQueue`, so each binding must read its
+  // holder at every call; one bound to a copy taken at import would type-check
+  // and answer as absent for the whole run.
+  test('the persona routing asks the manager\'s Run Bot Identities through `connections` and the live queue\'s reaction keys through `deliveryQueue`, each read at call time: false and no answer while absent, then the instance\'s own answer', () => {
+    const RUN_BOT: keyof PersonaRoutingDeps = 'isRunBotIdentity'
+    const MANAGER_QUERY: keyof PersonaConnectionsModule.PersonaConnectionManager = 'isRunBotIdentity'
+    const LOOKUP: keyof DeliveryQueue = 'lookupReactionKey'
+    const SLACK_LOOKUP: keyof DeliveryQueue = 'lookupSlackKey'
+    const ACCEPT: keyof DeliveryQueue = 'accept'
+    const routing = onlyCallProps('createPersonaRouting')
+    const runBot = routing.get(RUN_BOT)!
+    expect(runBot).toMatch(new RegExp(`^\\(?(\\w+)\\)? => connections\\?\\.${MANAGER_QUERY}\\(\\1\\) \\?\\? false$`))
+    const queue = objectProperties(routing.get('queue')!)
+    expect([...queue.keys()].sort()).toEqual([ACCEPT, LOOKUP, SLACK_LOOKUP].sort())
+    // The same holder as the Slack-key lookup (and preparation's queue, pinned above).
+    for (const lookup of [LOOKUP, SLACK_LOOKUP]) {
+      expect(queue.get(lookup)).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => deliveryQueue\\?\\.${lookup}\\(\\1, \\2\\)$`))
+    }
+
+    // The actual binding text, run with each holder a `let` set only after the bindings exist.
+    const js = ts.transpileModule(`const value = { runBot: ${runBot}, lookup: ${queue.get(LOOKUP)} };`, {
+      compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+    }).outputText
+    const live = new Function(`let connections, deliveryQueue;\n${js}\nreturn { value, setConnections: (v) => { connections = v }, setQueue: (v) => { deliveryQueue = v } };`)() as {
+      value: { runBot(id: string): boolean; lookup(key: string, reactionKey: ReactionKey): QueueAcceptResult | undefined }
+      setConnections(v: Pick<PersonaConnectionsModule.PersonaConnectionManager, 'isRunBotIdentity'>): void
+      setQueue(v: Pick<DeliveryQueue, 'lookupReactionKey'>): void
+    }
+    const reactionKey: ReactionKey = { chat_id: 'C0WIRE', message_ts: '1.1', reactor: 'U0PERSON', emoji: 'eyes', change: 'added', event_ts: '1.2' }
+    expect(live.value.runBot('U0BOT')).toBe(false)
+    expect(live.value.lookup('alpha', reactionKey)).toBeUndefined()
+
+    const asked: unknown[] = []
+    const held: QueueAcceptResult = { status: 'duplicate', seq: 7 }
+    live.setConnections({ isRunBotIdentity: (id) => { asked.push(id); return id === 'U0BOT' } })
+    live.setQueue({ lookupReactionKey: (key, rk) => { asked.push([key, rk]); return held } })
+    expect([live.value.runBot('U0BOT'), live.value.runBot('U0PERSON')]).toEqual([true, false])
+    expect(live.value.lookup('alpha', reactionKey)).toBe(held)
+    expect(asked).toEqual(['U0BOT', 'U0PERSON', ['alpha', reactionKey]])
   })
 
   test('archiveWrite is set only inside main(), to the persona archive writer over the name resolver source on clientFor', () => {
@@ -4272,7 +4317,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
   // fungible-mode event.
   test('the routing\'s call binds exactly these members, no more', () => {
     const MEMBERS: Array<keyof PersonaRoutingDeps> = [
-      'getPersonaConfig', 'getBotIdentity', 'queue', 'prepare', 'onReceived', 'archive', 'log',
+      'getPersonaConfig', 'getBotIdentity', 'isRunBotIdentity', 'queue', 'prepare', 'onReceived', 'archive', 'log',
       'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
       'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS, 'getChannelDelivery',
     ]

@@ -1116,9 +1116,9 @@ async function handleInitialized(
 // ---------------------------------------------------------------------------
 
 /**
- * The one persona-routing instance. The event router hands each `message`
- * and `app_mention` event to it with the receiving persona as the only
- * receiver.
+ * The one persona-routing instance. The event router hands each `message`,
+ * `app_mention`, `reaction_added` and `reaction_removed` event to it with
+ * the receiving persona as the only receiver.
  */
 // Holders are populated in main(), after the duplicate-server guard and before admission.
 let deliveryQueue: ReplyReminderQueue | undefined
@@ -1148,7 +1148,10 @@ const personaRouting = createPersonaRouting({
       return deliveryQueue.accept(key, input)
     },
     lookupSlackKey: (key, slackKey) => deliveryQueue?.lookupSlackKey(key, slackKey),
+    lookupReactionKey: (key, reactionKey) => deliveryQueue?.lookupReactionKey(key, reactionKey),
   },
+  // main() builds the connection manager after this; no event arrives before it.
+  isRunBotIdentity: (id) => connections?.isRunBotIdentity(id) ?? false,
   prepare: (key, item) => deliveryPreparation?.prepare(key, item) ?? Promise.resolve(),
   onReceived: (key, item) => deliveryReporting?.received(key, item),
   archive: (key, event) => archiveWrite?.(key, event),
