@@ -183,7 +183,8 @@
  * `POST /_push` (below), and `POST /upload/<id>` (the upload URL
  * `files.getUploadURLExternal` hands out). Every other Web API method answers
  * `ok: true` with the shape CSCB reads (`chat.postMessage` a `ts`,
- * `conversations.open` a channel ID, …).
+ * `conversations.open` a channel ID, `files.completeUploadExternal` one file
+ * per file it completed, with the request's id and title, …).
  *
  * PUSH (`POST /_push`, JSON; b.deo SRI-1402)
  * ----
@@ -670,8 +671,13 @@ function okBody(method: string, args: Record<string, string>, seq: number, uploa
       const fileId = `F0STUB${String(seq).padStart(4, '0')}`
       return { ok: true, file_id: fileId, upload_url: `${uploadBase}${fileId}` }
     }
-    case 'files.completeUploadExternal':
-      return { ok: true, files: [{ id: 'F0STUBFILE', title: 'stub' }] }
+    case 'files.completeUploadExternal': {
+      // One entry per file the call completed, with the id and title it named.
+      let files: unknown
+      try { files = JSON.parse(args.files ?? '') } catch { files = undefined }
+      return { ok: true, files: (Array.isArray(files) ? files : []).filter(f => isObject(f) && typeof f.id === 'string')
+        .map(f => ({ id: f.id, title: typeof f.title === 'string' ? f.title : '' })) }
+    }
     default:
       return { ok: true }
   }

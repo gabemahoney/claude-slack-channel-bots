@@ -1957,6 +1957,72 @@ test('shared receipt archives, saved joins, accounting and recorded buttons need
   } finally { await q.stop() }
 }))
 
+// test-47 case I: 0.18.0 items delivered, then a restart's start compaction,
+// then a newer item drained against the cumulative snapshot. Production keeps
+// a delivered key only while younger than QUEUE_KEY_KEEP_MS, so the fixture's
+// months-old keys leave only the allocation; recent keys keep their key rows.
+test.each(['expired', 'recent'] as const)('shared queue receipts follow production key retention across a post-delivery restart: %s 0.18.0 keys', mode => sharedPrinterControl(async ({ scratch, pkg, printer: { entryValue: print }, evidence }) => {
+  const f = await import(join(pkg, 'tests/test-helpers/delivery-queue.ts'))
+  const reference = readFileSync(join(pkg, 'tests/fixtures/shared-channel-upgrade/interrupted-and-invalid-preparation/reference-0.18.0/queue/alpha.jsonl'), 'utf8')
+  const old = reference.trim().split('\n').map(line => JSON.parse(line))
+  // The /ci run delivered them 171 days after intake; the control within the hour.
+  let wall = Math.max(...old.map(r => r.received_at)) + (mode === 'expired' ? 171 * 24 : 1) * 3_600_000
+  const now = () => wall, key = 't47_i_alpha'
+  const dir = mkdtempSync(join(scratch, 'upgrade-state-')), journal = f.queuePath(dir, key)
+  const log = join(dir, 'server.log'), session = 'session-upgrade', transcript = join(dir, session + '.jsonl')
+  const snapshot = join(dir, 'snapshot.jsonl'), variant = join(dir, 'variant.jsonl')
+  writeFileSync(log, ''); writeFileSync(transcript, '')
+  f.seedQueue(dir, [reference], key)
+  const takes: string[] = [], deliveredAt = new Map<number, number>()
+  const deliver = async (q: any, seq: number) => {
+    const text = `upgraded part ${seq}`
+    await q.append(key, f.fixedRecord(seq, [text]))
+    await q.append(key, { ...f.sentRecord(seq), at: wall, session_id: session, transcript_path: transcript })
+    takes.push(JSON.stringify({ type: 'user', uuid: `take-${seq}`, sessionId: session, timestamp: wall + 1, message: { role: 'user', content: text } }))
+    writeFileSync(transcript, takes.join('\n') + '\n')
+    await q.append(key, { ...f.deliveredRecord(seq, wall + 2), receipt: { path: transcript, uuid: `take-${seq}` } })
+    deliveredAt.set(seq, wall + 2)
+    wall += 10
+  }
+  // test-47's drain: snapshot (live journal plus the earlier snapshot), read, snapshot.
+  let snapped = false
+  const snap = async () => {
+    writeFileSync(snapshot, await print('sharedQueueSnapshot', snapped ? [journal, snapshot] : [journal]))
+    snapped = true; evidence.files(snapshot)
+  }
+  const drain = async () => {
+    await snap()
+    const state = JSON.parse(await print('sharedQueueReceipts', [key, log, journal, snapshot, snapshot]))
+    await snap()
+    return state
+  }
+  let q = await f.makeQueue(dir, { now })
+  try {
+    for (const seq of [1, 2]) await deliver(q, seq)
+    assert.equal((await drain()).complete, true)
+  } finally { await q.stop() }
+  q = await f.makeQueue(dir, { now })
+  try {
+    const compacted = f.readQueue(dir, key).filter((r: any) => r.kind === 'accepted').map((r: any) => [r.seq, r.compact])
+    assert.deepEqual(compacted, mode === 'expired' ? [[2, 'allocation']] : [[1, 'key'], [2, 'key'], [2, 'allocation']])
+    const ts = '1794560791.855589'
+    const accepted = await q.accept(key, f.slackInput({ channel: 'G0TEST003', channel_type: 'group', key: { chat_id: 'G0TEST003', ts }, ts, via: 'receive_all' }))
+    assert.equal(accepted.status, 'accepted')
+    await deliver(q, accepted.seq)
+    assert.deepEqual(await drain(), { accepted: 3, complete: true, progress: 3, incomplete: 0, first_incomplete: [], incomplete_items_omitted: 0 })
+    // Altered live journals stay refused on each side of the expiry.
+    const live = f.readQueue(dir, key)
+    const refused = async (label: string, records: any[]) => {
+      writeFileSync(variant, records.map(r => JSON.stringify(r) + '\n').join('')); evidence.files(variant)
+      await assert.rejects(print('sharedQueueReceipts', [key, log, variant, snapshot, snapshot]), /archived item lacks matching live compaction evidence/, label)
+    }
+    if (mode === 'expired') {
+      await refused('a key row production cannot keep', [...live, { v: 1, kind: 'accepted', seq: 1, compact: 'key', key: old[0].key, received_at: old[0].received_at, delivered_at: deliveredAt.get(1) }])
+      await refused('no allocation', live.filter((r: any) => r.compact !== 'allocation'))
+    } else await refused('an unexpired key row removed', live.filter((r: any) => !(r.compact === 'key' && r.seq === 1)))
+  } finally { await q.stop() }
+}))
+
 test('a failed queue evidence read names only its input, role, stage, errno, type and sizes, never an empty queue', () => sharedPrinterControl(async ({ scratch, printer: { entryValue: print } }) => {
   const dir = mkdtempSync(join(scratch, 'PRIVATE_PATH-'))
   const current = join(dir, 'current.jsonl'), missing = join(dir, 'missing.jsonl'), linked = join(dir, 'linked.jsonl')

@@ -3438,7 +3438,7 @@ describe('shared scenario consumer evidence boundaries', () => {
     ])) findings.push('leave boundary lacks historical exact observation')
     for (const [start, target] of [
       ['pending_post live-hold true', 'post-live-hold-after-receipts.json'],
-      ['pending_post confirmed-unsaved true 30000', 'confirmed-unsaved-before-kill.json'],
+      ['pending_post confirmed-unsaved true 25000', 'confirmed-unsaved-before-kill.json'],
     ]) {
       const begin = all.indexOf(start), end = all.indexOf('\ncrash', begin)
       const boundary = all.slice(begin, end)

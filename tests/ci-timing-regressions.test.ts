@@ -36,6 +36,10 @@ import { buildThreadMemoryChangedWhileStoppedLine } from '../src/thread-memory-r
 import { THREAD_MEMORY_CHANGED_WHILE_STOPPED, THREAD_MEMORY_JOINS_LOST } from '../src/persona-diagnostics.ts'
 import { MEMBERSHIP_REQUEST_TIMEOUT_MS, MEMBERSHIP_ATTEMPT_TIMEOUT_MS, MEMBERSHIP_RETRY_MAX_MS, MEMBERSHIP_PAGE_LIMIT, membershipRetryDelay } from '../src/channel-membership-retry.ts'
 import { startSlackStub, type StubAnswers } from './integration/fixtures/slack-stub-server.ts'
+import { WebClient } from '@slack/web-api'
+import { longLivedWebClientOptions, PERSONA_WEB_API_REQUEST_TIMEOUT_MS } from '../src/persona-slack-clients.ts'
+import { judgeOwnPostLookup } from '../src/own-post-lookup.ts'
+import { outputDuringAsync } from './test-helpers/slack-logger-probes.ts'
 import { MEMBERSHIP_INVENTORY_INCOMPLETE, MEMBERSHIP_INVENTORY_COMPLETE, membershipScanDiagnostic } from '../src/channel-membership-scan.ts'
 import { MEMBERSHIP_STORAGE_FAILED, membershipDiagnostic } from '../src/channel-membership.ts'
 import { burstSpec, sr8Personas, sr8Combinations, SR8_BURST_JOINS, SR8_BURST_REPLIES, SR8_BURST_DROPPED, readThreads, threadJoin, joinRecord } from './test-helpers/thread-memory.ts'
@@ -1843,6 +1847,107 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       const none = shell(program(name), { 'config.json': config })
       expect({ status: none.status, stdout: none.stdout, stderr: none.stderr }).toEqual({ status: 1, stdout: '', stderr: `no configured channel to retain for ${name}\n` })
     }
+  })
+  // test-46's real pending_post and lose_post build the faults through
+  // scenario.sh's real control helpers; pending_post's other steps are
+  // stand-ins. The real stub answers a real Web client with the production
+  // long-lived options, only its per-attempt timeout and retry spacing
+  // shortened (one retry): the library retries a timed-out attempt as a new
+  // chat.postMessage, as it does after PERSONA_WEB_API_REQUEST_TIMEOUT_MS.
+  test.each([[true, ''], [false, ''], [true, '100']] as const)(
+    'test-46 lose_post holds the Web client\'s retry of a lost post unperformed, so only the first attempt can settle it: performed=%p delay=%p', async (performed, delay) => {
+      const options = longLivedWebClientOptions()
+      expect([options.timeout, 'retryConfig' in options]).toEqual([PERSONA_WEB_API_REQUEST_TIMEOUT_MS, false])
+      const channel = 'C0LOSTPOST01', stamp = '{"incarnation":"i1","threadHybridSince":"t1"}'
+      const built = shell([
+        'require_ci_image() { :; }', '_scenario_scratch_file() { :; }', '_scenario_stub_control_http() { :; }', 'write_file() { cat > "$1"; }',
+        ...['_scenario_stub_control_patch', 'slack_stub_fault', 'slack_stub_post_lost', 'slack_stub_history_fault', 'slack_stub_faults_clear'].map(name => declaration(scenario, name)),
+        `scenario_id() { echo ${channel}; }`, 'slack_stub_inventory_page() { :; }', 'slack_push_member_joined() { echo env-1; }', 'ack() { :; }',
+        'scenario_ts() { echo 1.5; }', 'wait_membership_complete() { :; }', 'set_choice() { :; }', `stamp() { echo '${stamp}'; }`,
+        `shared_own_post_records() { [[ ! -e "$HOME/posted" ]] || echo '{"kind":"post-intent","operationId":"op-1","channel":"${channel}","stamp":${stamp}}'; }`,
+        'slack_post_mark() { echo 0; }', 'scenario_text() { echo "text-$1"; }', 'stub_session_submit() { : > "$HOME/posted"; echo call-1; }',
+        'wait_until() { :; }', `record_after() { echo '[{"performed":${performed},"response_ts":"9.1"}]'; }`,
+        `shared_persona_facts() { echo '{"incarnation":"i1","assignments":{"${channel}":{"threadHybridSince":"t1"}}}'; }`, 'shared_wait_own_post_state() { :; }',
+        'declare -A LABEL=([p]=p) KEY=([p]=p) WORK=([p]=/w)', 'declare -a EXTRA_CHANNELS=()', 'A=CA B=CB NOTICE=CN EVIDENCE="$HOME" SCENARIO_SLACK_CONTROL="$HOME/control.json"',
+        declaration(test46, 'lose_post'), declaration(test46, 'pending_post'), `pending_post lost ${performed} ${delay}`, 'cat "$SCENARIO_SLACK_CONTROL"',
+      ].join('\n'), { 'control.json': JSON.stringify({ tokens: [{ label: 'p', suffix: 'lostp', auth: 'ok', connections: 'ok' }] }) + '\n' })
+      expect({ status: built.status, stderr: built.stderr }).toEqual({ status: 0, stderr: '' })
+      mkdirSync('/tmp/c9', { recursive: true })
+      const root = mkdtempSync('/tmp/c9/test46-lost-post-'), recordPath = join(root, 'record.jsonl')
+      // The real client's output, its answer or error and every caught error
+      // are leak-checked, on a failing assertion too.
+      const captured: unknown[] = []
+      try { const stub = startSlackStub({ recordPath, control: JSON.parse(built.stdout) }); try {
+        const web = new WebClient(fakeToken(BOT_TOKEN_PREFIX, 'lostp'),
+          { ...longLivedWebClientOptions(stub.apiUrl), timeout: 300, retryConfig: { retries: 1, minTimeout: 10, maxTimeout: 10 } })
+        let answer: unknown
+        const output = await outputDuringAsync(async () => {
+          answer = await web.chat.postMessage({ channel, text: 'lost post' }).then(r => ({ ok: r.ok, ts: r.ts }), (e: Error) => { captured.push(e); return { error: e.message } })
+        })
+        captured.push(answer, output)
+        // One library warning per timed-out attempt, so the scan sees real output.
+        expect(output.filter(call => JSON.stringify(call.args).includes('http request failed'))).toHaveLength(delay ? 0 : 2)
+        const posts = readFileSync(recordPath, 'utf8').trim().split('\n').map(line => JSON.parse(line)).filter(r => r.method === 'chat.postMessage')
+        const history = await fetch(`${stub.apiUrl}conversations.history`, { method: 'POST', body: new URLSearchParams({ channel }),
+          headers: { Authorization: `Bearer ${fakeToken(BOT_TOKEN_PREFIX, 'reader')}`, 'Content-Type': 'application/x-www-form-urlencoded' } }).then(r => r.json())
+        captured.push(history)
+        const first = posts[0]
+        if (delay) {
+          // The delayed answer comes inside the attempt: the first attempt's own post, no retry.
+          expect(posts.map(r => [r.event, r.outcome ?? r.answer, r.performed ?? null])).toEqual([['fault', 'lost', true], ['api', 'ok', null]])
+          expect(answer).toEqual({ ok: true, ts: first.response_ts })
+        } else {
+          // Each attempt times out unanswered: the retry is held and never performed.
+          expect(posts.map(r => [r.event, r.fault_index, r.outcome, r.performed])).toEqual([['fault', 0, 'lost', performed], ['fault', 1, 'lost', false]])
+          expect(answer).toEqual({ error: expect.stringContaining('timeout of 300ms exceeded') })
+        }
+        expect(history.messages.map((m: { ts: string }) => m.ts)).toEqual(performed ? [first.response_ts] : [])
+      } catch (error) { captured.push(error); throw error } finally {
+        try { await stub.stop() } catch (error) { captured.push(error); throw error }
+      }
+      } finally {
+        try { assertNoLeak({ captured, record: existsSync(recordPath) ? readFileSync(recordPath, 'utf8') : '' }) }
+        finally { rmSync(root, { recursive: true, force: true }) }
+      }
+    })
+  test('test-46 confirmed-unsaved\'s held answer comes 5 s inside the Web client\'s per-attempt timeout', () => {
+    const delay = Number(/^pending_post confirmed-unsaved true (\d+)$/m.exec(test46)?.[1])
+    expect(delay + 5000).toBeLessThanOrEqual(PERSONA_WEB_API_REQUEST_TIMEOUT_MS)
+  })
+  // The production lookup judges the situation Phase 13 builds: its live post,
+  // with no parent, is P's only own message in range, and the behind-post
+  // mention and broadcast joined its root. `found` records joined; `none`
+  // and `lost` record none.
+  test('test-46 Phase 13 expects the production lookup\'s outcome for its mention-joined live post: none, with the thread still joined', () => {
+    const post = { ts: '1794561089.000002', digests: ['digest'], fileIds: [] }
+    const judged = (joined: boolean) => judgeOwnPostLookup({ digest: 'digest', hasParent: false, own: [post], leftOut: ts => joined && ts === post.ts })
+    expect(judged(false)).toEqual({ kind: 'found', ts: post.ts, holds: 'thread' })
+    expect(judged(true)).toEqual({ kind: 'none', holds: 'none' })
+    const fifo = block(test46, 'for route in all dm mention broadcast; do', 'inject_sender=')
+    for (const route of ['mention', 'broadcast']) expect(fifo).toContain(route + ') channel="${OP_CHANNEL}"; parent="${OP_ROOT}"; via=' + route + ';')
+    const restart = block(test46, "'restarted manual FIFO worker did not reconnect'", "'ordinary FIFO worker did not reconnect'")
+    expect(restart).toContain('shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" none')
+    expect(restart).not.toContain('"${OP_STAMP}" joined')
+    expect(restart).toContain('root_saved p "${OP_CHANNEL}" "${OP_ROOT}" || fail')
+  })
+  // test-46's real newest_first against the production lookup's lost-join
+  // threads, read from a history page ordered as the stub and Slack order it
+  // (by numeric ts, newest first), whichever of Phase 18's two roots is newer.
+  test.each([
+    ['the seeded root is newer in the same second', '1794572342.001409', '1794572342.989009'],
+    ['the post is newer in the same second', '1794572342.001409', '1794572342.000500'],
+    ['the seeded root is a second later', '1794572342.989009', '1794572343.000100'],
+  ] as const)('test-46 Phase 18 lists its lost roots in the lookup\'s history order: %s', (_name, opRoot, secondRoot) => {
+    const history = [opRoot, secondRoot].sort((a, b) => Number(b) - Number(a))
+    const judged = judgeOwnPostLookup({ digest: 'digest', hasParent: false, leftOut: () => false,
+      own: history.map(ts => ({ ts, digests: ['digest'], fileIds: [] })) })
+    expect(judged).toEqual({ kind: 'lost', reason: 'several', holds: 'none', threads: history })
+    const run = shell([declaration(test46, 'newest_first'), `newest_first ${opRoot} ${secondRoot}`].join('\n'))
+    expect({ status: run.status, stdout: run.stdout, stderr: run.stderr }).toEqual({ status: 0, stdout: history.join(',') + '\n', stderr: '' })
+    const phase = block(test46, 'pending_post ambiguous true', 'for root in "${OP_ROOT}" "${second_root}"; do')
+    expect(phase).toContain('lost_roots="$(newest_first "${OP_ROOT}" "${second_root}")"')
+    expect(phase.match(/"\$\{lost_roots\}" several/g)).toHaveLength(3)
+    expect(phase).not.toContain('"${OP_ROOT},${second_root}"')
   })
   // test-47's real refused_start, queue_items_digest and state_digest, and
   // scenario.sh's real shared_queue_items over the production reader

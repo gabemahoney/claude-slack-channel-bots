@@ -1135,6 +1135,17 @@ lookup_min_ms="$(printed THREAD_MEMORY_RETRY_MIN_MS)"
 lookup_max_ms="$(printed THREAD_MEMORY_RETRY_MAX_MS)"
 lookup_bound_s="$(( (lookup_deadline_ms + lookup_max_ms + 999) / 1000 + 30 ))"
 declare -a EXTRA_CHANNELS=()
+# The persona's Web client gives each attempt 30 s
+# (PERSONA_WEB_API_REQUEST_TIMEOUT_MS) and its library retries a timed-out
+# attempt as a new chat.postMessage. Phase 13 holds its post past that, so
+# every later attempt is lost too, never performed: only the first attempt's
+# answer (a delayed one must come inside its 30 s) can settle the post.
+lose_post() {
+    local performed="$1" delay="${2:-}"
+    if [[ -n "${delay}" ]]; then slack_stub_post_lost "${LABEL[p]}" "${OP_CHANNEL}" "${performed}" "delay_ms=${delay}"
+    else slack_stub_post_lost "${LABEL[p]}" "${OP_CHANNEL}" "${performed}"; fi
+    slack_stub_post_lost "${LABEL[p]}" "${OP_CHANNEL}" false after=1 times=100000
+}
 pending_post() {
     local case_name="$1" performed="$2" delay="${3:-}" before rows facts
     OP_CHANNEL="$(scenario_id C "post-${case_name}")"
@@ -1146,8 +1157,7 @@ pending_post() {
     OP_STAMP="$(stamp p "${OP_CHANNEL}")"
     before="$(shared_own_post_records "${KEY[p]}" | jq -sc '[.[]|select(.kind=="post-intent")|.operationId]')"
     slack_stub_faults_clear "${LABEL[p]}"
-    if [[ -n "${delay}" ]]; then slack_stub_post_lost "${LABEL[p]}" "${OP_CHANNEL}" "${performed}" "delay_ms=${delay}"
-    else slack_stub_post_lost "${LABEL[p]}" "${OP_CHANNEL}" "${performed}"; fi
+    lose_post "${performed}" "${delay}"
     slack_stub_history_fault "${LABEL[p]}" history hang "channel=${OP_CHANNEL}" times=100000
     OP_MARK="$(slack_post_mark)"
     OP_TEXT="$(scenario_text "post-${case_name}")"
@@ -1308,8 +1318,12 @@ crash
 start
 wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted manual FIFO worker did not reconnect'
 slack_stub_faults_clear "${LABEL[p]}"
-RECORD_WAIT_S="${lookup_bound_s}" shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" joined \
+# The behind-post mention and broadcast joined the post's own thread
+# (SR-3.1), so the lookup leaves that root out of its range and, with no own
+# message left in it, records none (SR-3.4.2). The thread stays joined.
+RECORD_WAIT_S="${lookup_bound_s}" shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" none \
     > "${EVIDENCE}/post-live-hold-outcome.json"
+root_saved p "${OP_CHANNEL}" "${OP_ROOT}" || fail 'live-hold thread lost its mention join'
 connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
 cp "${EVIDENCE}/fifo-original-config.json" "${CONFIG}"
 retain "${NAME[p]}"
@@ -1483,11 +1497,18 @@ set_choice p "${B}" thread_hybrid choice-storage-repaired
 # Phase 18: several actual matching candidates lose the join, with one
 # production-built report at the Notice Destination. The unrelated reply
 # remains outside the thread, including after another restart.
+# The lookup names a lost join's threads in the order Slack's history lists
+# them, newest first (src/own-post-lookup.ts), so expected loss texts list
+# the roots by ts, newest first.
+newest_first() {
+    jq -rn '$ARGS.positional | sort_by(tonumber) | reverse | join(",")' --args "$@"
+}
 pending_post ambiguous true
 second_root="$(scenario_ts)"
 slack_stub_history_seed "${OP_CHANNEL}" "$(slack_message_event "${OP_CHANNEL}" "${OP_TEXT}" "${second_root}" "$(slack_stub_identity "${LABEL[p]}" user_id)")"
-loss_line="$(printed buildThreadMemoryOwnPostLostLine "${NAME[p]}" "${KEY[p]}" "${OP_CHANNEL}" "${OP_ROOT},${second_root}" several)"
-loss_notice="$(printed buildThreadMemoryOwnPostLostNotice "${NAME[p]}" "${KEY[p]}" "${OP_CHANNEL}" "${OP_ROOT},${second_root}" several)"
+lost_roots="$(newest_first "${OP_ROOT}" "${second_root}")"
+loss_line="$(printed buildThreadMemoryOwnPostLostLine "${NAME[p]}" "${KEY[p]}" "${OP_CHANNEL}" "${lost_roots}" several)"
+loss_notice="$(printed buildThreadMemoryOwnPostLostNotice "${NAME[p]}" "${KEY[p]}" "${OP_CHANNEL}" "${lost_roots}" several)"
 loss_count="$(count_log "${loss_line}")"
 crash
 slack_stub_faults_clear "${LABEL[p]}"
@@ -1498,7 +1519,7 @@ RECORD_WAIT_S="${lookup_bound_s}" shared_wait_own_post_state "${KEY[p]}" "${OP_I
 wait_for_count "${loss_line}" "$((loss_count + 1))" 30 'ambiguous lookup did not report lost joins'
 slack_wait_successful_post "${LABEL[p]}" "${NOTICE}" "${mark}" "${loss_notice}" > "${EVIDENCE}/ambiguous-notice.json"
 report_post p "${mark}" ambiguous-exact-notice buildThreadMemoryOwnPostLostNotice \
-    "${NAME[p]}" "${KEY[p]}" "${OP_CHANNEL}" "${OP_ROOT},${second_root}" several
+    "${NAME[p]}" "${KEY[p]}" "${OP_CHANNEL}" "${lost_roots}" several
 for root in "${OP_ROOT}" "${second_root}"; do
     ts="$(scenario_ts)"; text="$(scenario_text after-ambiguous-loss)"
     ack "$(push p "${OP_CHANNEL}" "${ts}" "${text}" "${root}")"
@@ -1752,8 +1773,9 @@ done
 
 # Phase 23: confirmation after the durable intent but with the outcome/join
 # append refused. A successful Slack API record binds the actual root; the
-# exact unresolved intent plus the effective file fault gate the kill.
-pending_post confirmed-unsaved true 30000
+# exact unresolved intent plus the effective file fault gate the kill. The
+# held answer comes 5 s inside the client's 30 s attempt (lose_post).
+pending_post confirmed-unsaved true 25000
 file_fault "${memory_path}" >> "${EVIDENCE}/faults"
 post="$(RECORD_WAIT_S=45 slack_wait_successful_post "${LABEL[p]}" "${OP_CHANNEL}" "${OP_MARK}" "${OP_TEXT}")"
 [[ "$(jq -er .ts <<< "${post}")" == "${OP_ROOT}" ]] || fail 'confirmed root differs from controlled Slack post'

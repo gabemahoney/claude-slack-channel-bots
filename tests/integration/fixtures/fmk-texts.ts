@@ -5240,6 +5240,8 @@ const sharedQueueReceipts: Entry = {
     const { accepted, items } = await sharedReceiptView(context, key, log, rows)
     const current = await sharedQueueRecords(context, [journal])
     const currentSeqs = new Set(sharedAccepts(current).map(r => r.seq))
+    const keyKeepMs = await packageExport(context, 'delivery-queue.ts', 'QUEUE_KEY_KEEP_MS')
+    evidenceAssert(Number.isSafeInteger(keyKeepMs) && (keyKeepMs as number) > 0, 'invalid production key retention')
     // Archives are observed evidence, not authority to resurrect lost work.
     // Require the live journal's compacted key/allocation and the archived
     // exact receipt proof before allowing a historical item to complete.
@@ -5247,10 +5249,15 @@ const sharedQueueReceipts: Entry = {
       const proof = items.find(r => r.seq === item.seq)!
       evidenceAssert(proof.complete, 'archived item lacks complete observed receipts')
       const marker = current.find(r => r.kind === 'accepted' && 'compact' in r && r.compact === 'key' && r.seq === item.seq)
-      const retained = item.source === 'slack'
-        ? marker && 'key' in marker && 'delivered_at' in marker && isDeepStrictEqual(marker.key, item.key) &&
-          marker.received_at === item.received_at && marker.delivered_at === Math.max(...proof.receipts.map(r => r.at))
-        : current.some(r => r.kind === 'accepted' && 'compact' in r && r.compact === 'allocation' && r.seq >= item.seq)
+      const allocated = current.some(r => r.kind === 'accepted' && 'compact' in r && r.compact === 'allocation' && r.seq >= item.seq)
+      const deliveredAt = Math.max(...proof.receipts.map(r => r.at))
+      // Compaction follows the final receipt and keeps a Slack key only while
+      // it is younger than QUEUE_KEY_KEEP_MS, so a key already that old at its
+      // final receipt leaves only the allocation (an upgraded 0.18.0 item).
+      const retained = item.source !== 'slack' ? allocated
+        : deliveredAt - item.received_at >= (keyKeepMs as number) ? !marker && allocated
+        : marker && 'key' in marker && 'delivered_at' in marker && isDeepStrictEqual(marker.key, item.key) &&
+          marker.received_at === item.received_at && marker.delivered_at === deliveredAt
       evidenceAssert(retained, 'archived item lacks matching live compaction evidence')
     }
     const progress = items.filter(r => originals.some(a => a.seq === r.seq)).reduce((n, r) => n + r.receipted_parts, 0)
