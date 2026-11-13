@@ -9,6 +9,8 @@ import ts from 'typescript'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { TEST_MEASUREMENTS_KEY, TEST_MEASUREMENT_TIMINGS_KEY, CHANNEL_ID_RE, parsePersonaConfigBytes } from '../src/config.ts'
 import { decideDelivery } from '../src/delivery-decision.ts'
+import { buildDeliveryDispatchLine } from '../src/delivery-notices.ts'
+import { createPersonaEventRouter } from '../src/persona-event-router.ts'
 import { RELOAD_NOOP } from '../src/reload-apply.ts'
 import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX } from './test-helpers/credentials.ts'
 import { test29ClosingFixture, test29EvidencePrinter, test29PrinterFixture, test29PrinterBindings, test29SwitchBindings, test29SwitchCallOrder } from './test-helpers/test29-controls.ts'
@@ -31,7 +33,7 @@ import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVer
 import { CPUS_PER_SHARD } from '../scripts/ci-run.ts'
 import { serializeTestMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, threadCompactionMeasurement,
   type TestMeasurement, type TestMeasurementRecord } from '../src/test-measurements.ts'
-import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
+import { QUEUE_COMPACT_INTERVAL_MS, type AcceptedRecord } from '../src/delivery-queue.ts'
 import { THREAD_REPLY_HOLD_MS, DELIVERY_MAX_AD_CALLS_PER_S } from '../src/delivery-constants.ts'
 import { NAME_LOOKUP_TIMEOUT_MS } from '../src/tag-wrapper.ts'
 import { buildThreadMemoryChangedWhileStoppedLine } from '../src/thread-memory-reports.ts'
@@ -2283,6 +2285,93 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       steps,
     ].join('\n'), { 'cause.txt': cause + '\n', 'logged.txt': logged + '\n' })
     expect({ status: run.status, stderr: run.stderr }).toEqual({ status, stderr })
+  })
+  // test-29's unverified case waits three times for a stub control: the socket
+  // close, the reconnect's delayed inventory request and that request's settled
+  // record. The real record readers (lib/scenario.sh) and the fake-clock poll;
+  // a stand-in sleep writes the wait's record during the second sleep, so the
+  // third poll is the first to see it, as the stub writes it only once the
+  // control fires. The old step is 909132aa's wait: the same line polling
+  // slack_stub_control_fired, which fails the script on the first empty poll.
+  const controlWaits = test29Script.match(/^ {4}wait_until \S+ '[^']*' control_fired .*$/gm)!
+  const controlRecords: Record<string, string> = {
+    'socket-close': '{"seq":2,"event":"socket-close","label":"alpha"}',
+    fault: '{"seq":2,"event":"fault","label":"alpha","method":"users.conversations","outcome":"delay","request_id":"r1"}',
+    'fault-settled': '{"seq":2,"event":"fault-settled","request_id":"r1","resolution":"delay"}',
+  }
+  type ControlCase = [event: string, form: string, fires: boolean, status: number, stderr: string]
+  const controlCases: ControlCase[] = [
+    ...Object.keys(controlRecords).flatMap((event): ControlCase[] => [
+      [event, 'fixed step', true, 0, ''], [event, 'old step', true, 1, 'the requested control has no fired record\n'],
+    ]),
+    ['fault', 'fixed step, never fired', false, 1, 'inventory delay did not fire (not within 3s)\n'],
+  ]
+  test.each(controlCases)(
+    'test-29 polls a stub control until it fires: %s, %s', (event, form, fires, status, stderr) => {
+      expect(controlWaits).toHaveLength(3)
+      const fixed = controlWaits.find(line => line.includes(` control_fired ${event} `))!
+      const run = shell([
+        polling, 'RECORD_WAIT_S=3 SCENARIO_SLACK_RECORD="$HOME/record.jsonl" request_id=r1', `FIRES=${fires}`,
+        'printf \'{"seq":1,"event":"ws-open","label":"alpha"}\\n\' > "$SCENARIO_SLACK_RECORD"',
+        'sleep() { local now; read -r now < "$HOME/clock"; printf "%s\\n" "$((now+1000))" > "$HOME/clock"',
+        '    [[ "$FIRES" == true && "$now" == 1000 ]] || return 0', '    cat "$HOME/fired.jsonl" >> "$SCENARIO_SLACK_RECORD"; }',
+        'require_ci_image() { :; }',
+        ...['_scenario_scratch_file', '_scenario_complete_jsonl', 'slack_stub_records', 'slack_stub_record_count', 'slack_stub_control_fired'].map(name => declaration(scenario, name)),
+        test29Script.match(/^control_fired\(\) \{.*\}$/m)![0],
+        form === 'old step' ? fixed.replace(' control_fired ', ' slack_stub_control_fired ') : fixed,
+        'printf "after the wait at %s ms\\n" "$(cat "$HOME/clock")"',
+      ].join('\n'), { 'fired.jsonl': controlRecords[event] + '\n' })
+      expect({ status: run.status, stderr: run.stderr }).toEqual({ status, stderr })
+      if (!status) expect(run.stdout).toBe('after the wait at 2000 ms\n')
+    })
+  // test-29's closing body check, its real function and heads. The heads are
+  // pinned to the lines production builds: the event router's RAW line and the
+  // delivery dispatch line. A body on those timestamped lines alone passes; on
+  // any other log line, an unstamped line, in a captured result, or past a head
+  // that is not the line's start, it fails, as with the old check on every line.
+  const bodyCheck = declaration(test29Script, 'body_sentinels_absent')
+  const bodyHeads = test29Script.match(/^BODY_LINE_HEADS=.*$/m)![0]
+  const oldBodyCheck = [
+    '# 909132aa\'s check.', 'body_sentinels_absent() {',
+    '    python3 - "$1" "$2" "$3" <<\'PY\'', 'import json, pathlib, sys',
+    'texts = {json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()}',
+    "assert texts and all(texts), 'missing independent message-body sentinels'",
+    'paths = [pathlib.Path(sys.argv[2]), *pathlib.Path(sys.argv[3]).iterdir()]', 'for path in paths:',
+    '    if any(text in path.read_text() for text in texts):',
+    "        raise SystemExit('message body leaked into diagnostics or a captured result')", 'PY', '}',
+  ].join('\n')
+  test.each([
+    ['fixed check, body on RAW and dispatch lines', 'fixed', 'excerpts', 0],
+    ['old check, body on RAW and dispatch lines', 'old', 'excerpts', 1],
+    ['fixed check, body on another log line', 'fixed', 'other-line', 1],
+    ['fixed check, body after a head mid-line', 'fixed', 'mid-line', 1],
+    ['fixed check, body on an unstamped line that starts with a head', 'fixed', 'unstamped', 1],
+    ['fixed check, body in a captured result', 'fixed', 'captured', 1],
+  ] as const)('test-29 closing body check skips only the RAW and dispatch lines: %s', async (_name, form, where, status) => {
+    const body = 'test-29-invited-channels plain-7'
+    const logged: string[] = []
+    const router = createPersonaEventRouter({ routing: { receive: async () => {} }, clientFor: () => undefined as never, getPersona: () => undefined as never, log: line => logged.push(line) })
+    const event = { type: 'message', channel: 'CHUMAN', text: body, ts: '1700000001.000001', user: 'UHUMAN', channel_type: 'channel' }
+    await router('t29_alpha', 'message', { event, ack: async () => {} } as never)
+    await router('t29_alpha', 'app_mention', { event: { ...event, type: 'app_mention' }, ack: async () => {} } as never)
+    logged.push(buildDeliveryDispatchLine('"t29_alpha" (key=t29_alpha)',
+      { v: 1, kind: 'accepted', seq: 1, source: 'slack', channel: 'CHUMAN', ts: '1700000001.000001', user: 'UHUMAN', text: body, received_at: 1 } as AcceptedRecord))
+    // Each production line's head, through its `persona=`, in the script's order.
+    const heads = logged.map(line => line.slice(0, line.indexOf('persona=') + 'persona='.length))
+    expect(bodyHeads).toBe(`BODY_LINE_HEADS=(${heads.map(head => `'${head}'`).join(' ')})`)
+    expect(logged.every(line => line.includes(body))).toBe(true)
+    const stamp = (line: string) => `[2026-11-13T18:03:53.751Z] ${line}`
+    const lines = [...logged.map(stamp), stamp('[slack] message-received: persona="t29_alpha" (key=t29_alpha) source=slack')]
+    if (where === 'other-line') lines.push(stamp(`[slack] reload-preview: ${body}`))
+    if (where === 'mid-line') lines.push(stamp(`[slack] persona=t29_alpha: note ${logged[0]}`))
+    // A continuation line of a multi-line entry carries no timestamp.
+    if (where === 'unstamped') lines.push(stamp('[slack] persona=t29_alpha: note'), logged[2]!)
+    const run = shell([
+      bodyHeads, form === 'fixed' ? bodyCheck : oldBodyCheck, 'mkdir -p "$HOME/captured"',
+      `printf '%s\\n' ${where === 'captured' ? `"echo ${body}"` : '"no body"'} > "$HOME/captured/step.result"`,
+      'body_sentinels_absent "$HOME/inputs.jsonl" "$HOME/server.log" "$HOME/captured"',
+    ].join('\n'), { 'inputs.jsonl': JSON.stringify(body) + '\n', 'server.log': lines.join('\n') + '\n' })
+    expect({ status: run.status, stderr: run.stderr }).toEqual({ status, stderr: status ? 'message body leaked into diagnostics or a captured result\n' : '' })
   })
   test('burst slice removes exactly the two write envelopes and keeps every other stub line byte-for-byte', () => {
     const lines = ['{"seq":1,"event":"push","envelope_id":"burst","sent_mono_ms":1.250000}', '{"seq":2,"event":"push","envelope_id":"leave-env"}',

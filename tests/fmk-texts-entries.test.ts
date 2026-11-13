@@ -2179,6 +2179,58 @@ test('per-server-run accounting keeps the exact sets and allows a repeat only in
   } finally { await q.stop() }
 }))
 
+// test-46's closing content check (MI answers47 Q1): a reply the next start
+// releases from a Post Hold is fixed before p's client serves, so its tag
+// keeps the documented ID fallback; every other input expects the names.
+test('test-46 expects the ID fallback for exactly the replies a restart releases from a Post Hold', () => sharedPrinterControl(async ({ scratch, pkg, printer: { entryValue: print } }) => {
+  const script = readFileSync(join(REPO_ROOT, 'tests/integration/test-46-shared-channel-recovery.sh'), 'utf8')
+  // Phase 12's and Phase 15's held replies are marked; Phase 13's live hold is released while p serves.
+  const lines = script.split('\n')
+  const holds = lines.flatMap((line, i) => {
+    const m = /^\s*post_hold "?([^"\s]+)"?$/.exec(line)
+    return m ? [[m[1], lines[i + 1]!.trim() === 'released_at_start']] : []
+  })
+  expect(holds).toEqual([['recovered-${performed}', true], ['live-hold', false], ['leave-${boundary}', true]])
+  expect(lines.filter(line => line.trim() === 'released_at_start')).toHaveLength(2)
+  // The real marking and name selection, with only the stub's name lookup replaced.
+  const fn = (name: string) => new RegExp(`^${name}\\(\\) \\{.*\\}$|^${name}\\(\\) \\{\\n[\\s\\S]*?\\n\\}$`, 'm').exec(script)![0]
+  const home = mkdtempSync(join(scratch, 'home-'))
+  const result = spawnSync('bash', ['-c', [
+    'set -euo pipefail', 'declare -A RESTART_RELEASED', 'HUMAN=U0HUMAN01',
+    'scenario_stub_name() { printf "%s-name\\n" "$1"; }', fn('released_at_start'), fn('expected_names'),
+    'OP_CHANNEL=C0POST001; OP_REPLY_TS=1700000000.000001; released_at_start',
+    'expected_names "p|C0POST001|1700000000.000001|thread" C0POST001 thread',
+    'expected_names "p|C0POST001|1700000000.000002|thread" C0POST001 thread',
+    'expected_names "p|D0DIRECT1|1700000000.000003|dm" D0DIRECT1 dm',
+  ].join('\n')], { env: hostSafeChildEnv(home, { tools: ['bash'] }), encoding: 'utf8', timeout: 5000 })
+  assertNoLeak({ stdout: result.stdout, stderr: result.stderr })
+  expect(result.error).toBeUndefined()
+  expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: '' })
+  expect(result.stdout).toBe('U0HUMAN01\tC0POST001\nuser-name\tchannel-name\nuser-name\tdm\n')
+  // The marked expectation is what production fixes with no serving client.
+  const intake = await import(join(pkg, 'src/delivery-intake.ts'))
+  const f = await import(join(pkg, 'tests/test-helpers/delivery-queue.ts'))
+  const { createFakeClock } = await import(join(pkg, 'tests/test-helpers/fake-clock.ts'))
+  const queue = await f.makeQueue(mkdtempSync(join(scratch, 'state-'))), clock = createFakeClock()
+  // src/server.ts resolvePersonaUserName answers the user ID without a serving client.
+  const preparation = intake.createDeliveryPreparation({ queue, clock, clientFor: () => undefined, resolveUserName: async (_key: string, user: string) => user })
+  try {
+    const root = '1699999999.000001', ts = '1700000000.000001', text = 'held reply'
+    const accepted = await queue.accept('alpha', f.slackInput({ channel: 'C0POST001', ts, key: { chat_id: 'C0POST001', ts }, user: 'U0HUMAN01', via: 'thread', thread_ts: root, text }))
+    if (accepted.status === 'failed' || !accepted.item) throw new Error('fixture acceptance failed')
+    await preparation.prepare('alpha', accepted.item)
+    // Both lookups fall back at once; neither lookup deadline stays armed.
+    expect(clock.pendingCount()).toBe(0)
+    const fixed = queue.item('alpha', accepted.item.accepted.seq)!.fixed!.parts
+    const expected = async (user: string, channelName: string) =>
+      JSON.parse(await print('sharedExpectedParts', [text, ts, 'U0HUMAN01', user, 'C0POST001', channelName, 'thread', root, '-']))
+    const [user, channelName] = result.stdout.split('\n')[0]!.split('\t')
+    expect(fixed).toEqual(await expected(user!, channelName!))
+    // The names test-46 expected for these replies before answers47 differ.
+    expect(fixed).not.toEqual(await expected('user-name', 'channel-name'))
+  } finally { await preparation.stop(); await queue.stop() }
+}))
+
 describe("test-47's refused starts and test-40's earlier release", () => {
   const exitCode = (code: number) => (err: unknown) => (err as { exitCode?: unknown }).exitCode === code
 

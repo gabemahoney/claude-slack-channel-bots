@@ -1,6 +1,7 @@
 import { activationRecord, applicationState } from './test-helpers/shared-channels.ts'
 import { THREAD_ROOTS, threadPath, threadFsControls, readThreads } from './test-helpers/thread-memory.ts'
 import { THREAD_MEMORY_RETRY_MIN_MS } from '../src/delivery-constants.ts'
+import { buildThreadMemoryNotSavedNotice } from '../src/thread-memory-reports.ts'
 import * as nodeFs from 'node:fs'
 import { membershipPage, deliveryAttempt, holdsLifetime, expectCurrent, expectSuperseded } from './test-helpers/shared-channels.ts'
 import { buildOperatorAssignment } from '../src/reload-request.ts'
@@ -373,6 +374,12 @@ describe.each(['strict', 'open'] as const)('%s Thread Memory retries at confirme
 describe('Thread Memory at confirmed apply', () => {
   const channel = 'C0THREAD1', root = '1700000000.000001'
   const pathFor = (key: string) => join(h.stateDir, 'threads', `${key}.jsonl`)
+  async function expectCreatedAfterIo(run: ReloadRun, key: string): Promise<void> {
+    // Publication creates stores behind their durable disk steps. Drain only
+    // existing work, without advancing time or starting a load/flush/retry.
+    await run.clock.flush()
+    expect(run.controller.sharedChannels()!.threadMemoryCreated(key)).toBe(true)
+  }
   async function seeded(opts: ReloadRunOptions = {}) {
     const started = await running([
       ['alpha', { channels: [{ id: channel, delivery: 'thread_hybrid' }], permission_prompts: channel }],
@@ -501,7 +508,7 @@ describe('Thread Memory at confirmed apply', () => {
     expectNoPostNoLeak(run)
     h.confirm()
     await run.ticks.tick()
-    await until(() => authority.threadMemoryCreated('bravo'))
+    await expectCreatedAfterIo(run, 'bravo')
     expect(run.since(hybridCp).lifecycle).toEqual([
       // The identity reset retired the previous channel assignment.
       { op: 'update-in-place', key: 'bravo', via: 'apply', settings: [destructive ? 'channels' : 'delivery'] },
@@ -534,6 +541,37 @@ describe('Thread Memory at confirmed apply', () => {
     for (const capturedRun of h.runs) expectNoPostNoLeak(capturedRun, captures())
     await run.stop()
     for (const capturedRun of h.runs) expectNoPostNoLeak(capturedRun, captures())
+  })
+
+  test('the durable-I/O marker assertion rejects when creation is withheld', async () => {
+    const { run, personas: [bravo] } = await running([
+      ['bravo', { channels: [{ id: channel, delivery: 'off' }], permission_prompts: channel }],
+    ], { threadMemory: {} })
+    const authority = run.controller.sharedChannels()!
+    expect(authority.threadMemoryCreated('bravo')).toBe(false)
+    const marker = spyOn(authority, 'setThreadMemoryCreated').mockReturnValue({ kind: 'failed' })
+    try {
+      await previewConfig(run, [{ ...bravo!, channels: [{ id: channel, delivery: 'thread_hybrid' }] }])
+      expectNoPostNoLeak(run)
+      h.confirm()
+      await run.ticks.tick()
+      const now = run.clock.now()
+      // Only the helper's strict toBe(true) on the marker, with or without bun's colour codes.
+      const sgr = '(?:\\u001b\\[[0-9;]*m)*'
+      await expect(expectCreatedAfterIo(run, 'bravo')).rejects.toThrow(
+        new RegExp(`toBe${sgr}\\(${sgr}expected${sgr}\\)${sgr}\\n\\nExpected: ${sgr}true${sgr}\\nReceived: ${sgr}false${sgr}\\n$`))
+      expect(marker).toHaveBeenCalledWith('bravo')
+      expect(authority.threadMemoryCreated('bravo')).toBe(false)
+      expect(run.threadMemoryEvents.some(event => event.type === 'creation-failed' && event.key === 'bravo')).toBe(true)
+      // The failed marker save is reported once, to bravo's prompt channel.
+      const key = h.key('bravo')
+      const notice = buildThreadMemoryNotSavedNotice(renderPersonaRef('bravo', key), [channel], pathFor(key), 'marker',
+        new Error('Thread Memory created marker was not saved'))
+      expect(run.slackPosts().map(postOf)).toEqual([{ channel, text: formatPersonaNotice({ name: 'bravo', key }, notice) }])
+      expect(run.stub('bravo').calls.postMessage).toHaveLength(1)
+      expect(run.clock.now()).toBe(now)
+      assertNoLeak(run.captured())
+    } finally { marker.mockRestore() }
   })
 
   test.each(['remove', 'rename'] as const)('%s unlinks only the old key after teardown, clears its marker afterward and preserves accepted queues', async action => {

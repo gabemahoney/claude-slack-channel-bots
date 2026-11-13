@@ -1346,6 +1346,11 @@ future_after_leave() {
     NEVER_JOINED_FACTS="$(channel_facts "${ALPHA_KEY}" "${FUTURE}")"
 }
 
+# control_fired <event> [field=value...]: a fired control record exists, as a
+# wait predicate. slack_stub_control_fired requires one and fails the script
+# on the first poll that finds none (lib/scenario.sh).
+control_fired() { [[ "$(slack_stub_record_count "$@")" -ge 1 ]]; }
+
 ineligible_and_unverified() {
     local root outside before stamp event mark fault request_id sockets request_ms unclaimed
     # Known, authenticated channel: all writes are refused in open while
@@ -1393,16 +1398,16 @@ ineligible_and_unverified() {
     request_ms="$(printed MEMBERSHIP_REQUEST_TIMEOUT_MS)"
     slack_stub_inventory_fault alpha '' delay "delay_ms=$(( request_ms * 4 / 5 ))"
     slack_stub_close_socket alpha 0
-    wait_until "${RECORD_WAIT_S}" 'socket close control did not fire' slack_stub_control_fired socket-close label=alpha > /dev/null
+    wait_until "${RECORD_WAIT_S}" 'socket close control did not fire' control_fired socket-close label=alpha > /dev/null
     wait_until "${RECORD_WAIT_S}" 'new socket did not open' rec_at_least $(( sockets + 1 )) event=ws-open label=alpha
-    wait_until "${RECORD_WAIT_S}" 'inventory delay did not fire' slack_stub_control_fired fault label=alpha method=users.conversations outcome=delay > /dev/null
+    wait_until "${RECORD_WAIT_S}" 'inventory delay did not fire' control_fired fault label=alpha method=users.conversations outcome=delay > /dev/null
     fault="$(slack_stub_control_fired fault label=alpha method=users.conversations outcome=delay)"
     request_id="$(jq -er '.request_id' <<< "${fault}")"
     [[ "$(slack_stub_record_count fault-settled "request_id=${request_id}")" == 0 ]] || fail 'inventory resolved before unverified case'
     expect_attempt unverified-refusal "${ALPHA_DIR}" "$(attempt_args unverified-refusal "${M_MENTIONS}" all)" "${ALPHA_KEY}" current-membership-missing new true
     [[ "$(slack_stub_record_count fault-settled "request_id=${request_id}")" == 0 ]] || fail 'unverified result was observed after inventory resolved'
     [[ "$(channel_facts "${ALPHA_KEY}" "${M_MENTIONS}")" == "${before}" ]] || fail 'unverified bot write changed saved facts'
-    wait_until 30 'successful delayed inventory did not settle' slack_stub_control_fired fault-settled "request_id=${request_id}" resolution=delay > /dev/null
+    wait_until 30 'successful delayed inventory did not settle' control_fired fault-settled "request_id=${request_id}" resolution=delay > /dev/null
     # Every later control post re-arms faults still in the control file.
     slack_stub_faults_clear alpha
     wait_membership_complete "${ALPHA}"
@@ -2475,15 +2480,31 @@ done
 # The bodies belong in delivery evidence, never in server diagnostics or
 # captured reviews/tool results. Q's own notice wording is excluded from this
 # sentinel check because the server legitimately prints its own notice text.
-python3 - "${HUMAN_INPUTS}" "${SLACK_STATE_DIR}/server.log" "${CAPTURED}" <<'PY'
-import json, pathlib, sys
+# Two server.log line kinds carry a body excerpt by design, and no SR forbids
+# it: the event router's RAW line (src/persona-event-router.ts routeInbound,
+# for message and app_mention) and the dispatch line (src/delivery-notices.ts
+# buildDeliveryDispatchLine). Only a timestamped line whose text starts with
+# one of these heads is skipped; an unstamped continuation line of a
+# multi-line log entry is always checked. ci-timing-regressions.test.ts pins
+# the heads to the lines those functions build.
+BODY_LINE_HEADS=('[slack] RAW message event persona=' '[slack] RAW app_mention event persona=' '[slack] dispatch: persona=')
+# body_sentinels_absent <human-inputs> <server-log> <captured-dir>
+body_sentinels_absent() {
+    python3 - "$1" "$2" "$3" "${BODY_LINE_HEADS[@]}" <<'PY'
+import json, pathlib, re, sys
 texts = {json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()}
 assert texts and all(texts), 'missing independent message-body sentinels'
-paths = [pathlib.Path(sys.argv[2]), *pathlib.Path(sys.argv[3]).iterdir()]
-for path in paths:
-    if any(text in path.read_text() for text in texts):
+heads, stamp = tuple(sys.argv[4:]), re.compile(r'\[\d{4}-\d{2}-\d{2}T[0-9:.]+Z\] ')
+def diagnostic(line):
+    at = stamp.match(line)
+    return not (at and line[at.end():].startswith(heads))
+log = '\n'.join(filter(diagnostic, pathlib.Path(sys.argv[2]).read_text().splitlines()))
+for content in [log, *(path.read_text() for path in pathlib.Path(sys.argv[3]).iterdir())]:
+    if any(text in content for text in texts):
         raise SystemExit('message body leaked into diagnostics or a captured result')
 PY
+}
+body_sentinels_absent "${HUMAN_INPUTS}" "${SLACK_STATE_DIR}/server.log" "${CAPTURED}"
 while IFS= read -r envelope; do
     [[ "$(slack_ack_count "${envelope}")" == 1 ]] || fail 'closing: missing or repeated ACK'
 done < "${ACKS}"

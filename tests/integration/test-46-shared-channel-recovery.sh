@@ -34,7 +34,7 @@ printed() { bun "${PRINTER}" "$@" || fail "printer entry $1 failed"; }
 session_connected() {
     matcher "[slack] Session connected: persona $1"
 }
-declare -A NAME KEY WORK CREDS LABEL SNAP MANUAL INPUTS INJECTED
+declare -A NAME KEY WORK CREDS LABEL SNAP MANUAL INPUTS INJECTED RESTART_RELEASED
 for who in p q; do
     NAME[${who}]="${SCENARIO_TAG}_${who}"
     KEY[${who}]="$(persona_key "${NAME[${who}]}")"
@@ -1200,9 +1200,14 @@ post_hold() {
     shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" unresolved \
         > "${EVIDENCE}/post-${case_name}-held-unresolved.json"
 }
+# The next start releases this Post Hold's reply before p's client serves
+# (src/server.ts recoverQueueKeyAtStart), so its tag keeps the documented ID
+# fallback for user and channel names (docs/bots.md; MI answers47 Q1).
+released_at_start() { RESTART_RELEASED["p|${OP_CHANNEL}|${OP_REPLY_TS}|thread"]=1; }
 for performed in true false; do
     pending_post "recovered-${performed}" "${performed}"
     post_hold "recovered-${performed}"
+    released_at_start
     connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
     crash
     start
@@ -1390,6 +1395,7 @@ done
 for boundary in before after; do
     pending_post "leave-${boundary}" true
     post_hold "leave-${boundary}"
+    released_at_start
     old_channel="${OP_CHANNEL}"; old_stamp="${OP_STAMP}"; old_root="${OP_ROOT}"; old_envelope="${OP_ENVELOPE}"
     file_fault "${SLACK_STATE_DIR}/queue/${KEY[p]}.jsonl" >> "${EVIDENCE}/faults"
     before="$(same_channel_facts p "${old_channel}")"
@@ -2210,14 +2216,26 @@ assert_chunk_posts # No later restart or recovery reposted either chunk.
 # message-received is a per-server-run diagnostic: an item still queued at a
 # stop is logged again when the next start recovers it (MI answers46).
 shared_assert_accounting --per-server-run "${EXPECTED}" "${LOG}" "${KEY[p]}" "${SNAP[p]}" "${KEY[q]}" "${SNAP[q]}" > /dev/null
+# expected_names <identity> <channel> <via>: the user and channel names an
+# input's tag must carry, tab-separated. Only a reply released at start
+# (released_at_start) expects the IDs.
+expected_names() {
+    local identity="$1" channel="$2" via="$3" user channel_name
+    if [[ -n "${RESTART_RELEASED[${identity}]:-}" ]]; then printf '%s\t%s\n' "${HUMAN}" "${channel}"; return 0; fi
+    user="$(scenario_stub_name user "${HUMAN}")"; channel_name="$(scenario_stub_name channel "${channel}")"
+    # src/delivery-intake.ts channelName uses the fixed DM display name.
+    [[ "${via}" != dm ]] || channel_name=dm
+    printf '%s\t%s\n' "${user}" "${channel_name}"
+}
+[[ "${#RESTART_RELEASED[@]}" == 4 ]] || fail 'expected four replies released from a Post Hold at a restart'
+for identity in "${!RESTART_RELEASED[@]}"; do [[ -n "${INPUTS[${identity}]:-}" ]] || fail 'restart-released reply is not an accepted input'; done
 for identity in "${!INPUTS[@]}"; do
     IFS='|' read -r who channel ts via <<< "${identity}"
     input="${INPUTS[${identity}]}"
     text="$(jq -r .text <<< "${input}")"; root="$(jq -r .root <<< "${input}")"
-    channel_name="$(scenario_stub_name channel "${channel}")"
-    # src/delivery-intake.ts channelName uses the fixed DM display name.
-    [[ "${via}" != dm ]] || channel_name=dm
-    parts="$(shared_expected_parts "${text}" "${ts}" "${HUMAN}" "$(scenario_stub_name user "${HUMAN}")" \
+    names="$(expected_names "${identity}" "${channel}" "${via}")"
+    IFS=$'\t' read -r user_name channel_name <<< "${names}"
+    parts="$(shared_expected_parts "${text}" "${ts}" "${HUMAN}" "${user_name}" \
         "${channel}" "${channel_name}" "${via}" "${root}" -)"
     shared_assert_content "${KEY[${who}]}" "${LOG}" "${SNAP[${who}]}" "${channel}" "${ts}" "${text}" "${parts}" - > /dev/null
 done
