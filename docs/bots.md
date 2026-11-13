@@ -152,11 +152,13 @@ A "Yes" in the Reminder column means [Slack reply reminders](#slack-reply-remind
 
 A person's or another app's added or removed reaction on this persona's own `reply` text or file post brings a Reaction Notice in a conversation it serves: a channel, an enabled DM, or a thread in either. Channels at `delivery: mentions` receive these too; no mention is needed.
 
+Added Reaction Notices also come from another persona served by this CSCB server deliberately using `react` on this persona's own `reply` post in a conversation it serves. Here `user` is the reacting persona's name and `user_id` is its bot user ID. These notices come through CSCB even when the receiving persona's app is not subscribed to reaction events.
+
 The tag has `via="reaction"`, `reaction="added"` or `reaction="removed"`, `emoji` as the emoji name without colons, and an empty BODY. `user` and `user_id` identify the reactor (`bot_id` substitutes when there is no user); `chat_id`, `channel_name`, `message_id` and optional `thread_ts` identify the persona's reacted message. `message_id` is that message's timestamp; `ts` is when the reaction happened.
 
 Use the reactor's identity to decide whose answer it is: an emoji alone is not authorisation. Notices can repeat, need no reply, get no acknowledgement reaction and create no reply reminder. They do not count as reply-call targets or change any existing message's reminder eligibility.
 
-No notice comes from the persona's own reactions, Slack reaction events by bots whose identities this CSCB run has confirmed, reactions on other authors' messages, CSCB's server notices or permission prompts, or unserved conversations. Successful conversation lookup excludes group DMs; fungible mode also excludes externally shared conversations, while declarative listed external channels qualify. For lookup failures, see **A Reaction Notice has no thread timestamp** and **A Reaction Notice arrives from a listed group DM** in [Troubleshooting](troubleshooting.md#troubleshooting).
+No notice comes from the persona's own reactions, Slack reaction events by bots whose identities this CSCB run has confirmed (their deliberate `react` notices come through CSCB as above), reactions on other authors' messages, CSCB's server notices or permission prompts, or unserved conversations. Successful conversation lookup excludes group DMs; fungible mode also excludes externally shared conversations, while declarative listed external channels qualify. For lookup failures, see **A Reaction Notice has no thread timestamp** and **A Reaction Notice arrives from a listed group DM** in [Troubleshooting](troubleshooting.md#troubleshooting).
 
 Acknowledgement reactions from sessions served by a different CSCB server can bring notices: their bot identities are outside this server's confirmed set.
 
