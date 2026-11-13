@@ -131,6 +131,7 @@ import {
   ENVELOPE_FLAG_FORMS,
   makeAppMention,
   makeChannelMessage,
+  makeReaction,
   type EnvelopeFlagForm,
   type SlackEvent,
 } from './test-helpers/slack-stub.ts'
@@ -345,18 +346,16 @@ const REACTED_TS = '1700000000.888888'
 
 /**
  * A reaction event on a message in `CS`: `overrides` replace its fields and
- * `item` its item's (no shared reaction factory exists).
+ * `item` its item's.
  */
 function reactionEvent(type: ReactionEventName, overrides: Record<string, unknown> = {}, item: Record<string, unknown> = {}): SlackEvent {
-  return {
-    type,
+  return makeReaction(type, {
     user: REACTOR,
     reaction: 'thumbsup',
     item_user: 'U0WIREBOTA',
     event_ts: '1700000001.000001',
     ...overrides,
-    item: { type: 'message', channel: CS, ts: REACTED_TS, ...item },
-  }
+  }, { channel: CS, ts: REACTED_TS, ...item })
 }
 
 /** One click-handler call a spy saw. */

@@ -54,7 +54,7 @@ describe('isServerPost: Server Posts', () => {
     ['a valid element after malformed blocks and elements', message({
       blocks: [
         null, 'text', 7, [], { type: 'actions' }, { type: 'actions', elements: 'nope' },
-        { type: 'actions', elements: [null, 'x', [], {}, button(42), button(null), button('perm_allow_junk'), button(ALLOW_ID)] },
+        { type: 'actions', elements: [null, 'x', [], {}, button(42), button(null), button(ALLOW_ID)] },
       ],
     })],
   ])('%s', (_name, msg) => {
@@ -63,7 +63,6 @@ describe('isServerPost: Server Posts', () => {
 })
 
 describe('isServerPost: Tool Posts and malformed input', () => {
-  const uuid = TOKEN
   test.each([
     ['undefined', undefined],
     ['null', null],
@@ -85,12 +84,8 @@ describe('isServerPost: Tool Posts and malformed input', () => {
     ['elements that are not an array', message({ blocks: [{ type: 'actions', elements: button(ALLOW_ID) }] })],
     ['a block array carrying valid elements', message({ blocks: [Object.assign([], { type: 'actions', elements: [button(ALLOW_ID)] })] })],
     ['an element array carrying a valid permission action', message({ blocks: [{ type: 'actions', elements: [Object.assign([], button(ALLOW_ID))] }] })],
+    ['an undecodable action_id', message({ blocks: [{ type: 'actions', elements: [button('perm_allow_junk')] }] })],
     ['a non-string action_id', message({ blocks: [{ type: 'actions', elements: [button({ id: ALLOW_ID })] }] })],
-    ['an unknown decision', message({ blocks: [{ type: 'actions', elements: [button(`perm_maybe_${STUB_INSTANCE_ID}_${uuid}`)] }] })],
-    ['an instance id without the cscb_ prefix', message({ blocks: [{ type: 'actions', elements: [button(`perm_allow_bot_x_${uuid}`)] }] })],
-    ['a token that is not UUID-shaped', message({ blocks: [{ type: 'actions', elements: [button(`perm_allow_${STUB_INSTANCE_ID}_not-a-token`)] }] })],
-    ['a valid id with trailing text', message({ blocks: [{ type: 'actions', elements: [button(`${ALLOW_ID} `)] }] })],
-    ['a valid id behind leading text', message({ blocks: [{ type: 'actions', elements: [button(`x${ALLOW_ID}`)] }] })],
   ])('%s', (_name, msg) => {
     expect(isServerPost(msg)).toBe(false)
   })

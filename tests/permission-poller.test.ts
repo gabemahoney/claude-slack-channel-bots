@@ -164,6 +164,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { SERVER_POST_METADATA, expectNoMetadata } from './test-helpers/server-post.ts'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
@@ -208,7 +209,6 @@ import { createPersonaDestinationHold, type PersonaDestinationHold } from '../sr
 import type { PersonaTeardownWindowState } from '../src/persona-notifier.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { parsePermissionActionId } from '../src/permission-action-id.ts'
-import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
 import { personaKeyFromActionId } from './test-helpers/action-id-key.ts'
 import { personaInstanceId, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import { createPersonaUpPredicate } from '../src/persona-start.ts'
@@ -314,10 +314,6 @@ const D_DM = stubOpenedDmId(D_CONTACT)
 const POST_TS = 'TS1'
 const POST_TS_2 = 'TS2'
 
-/** A `chat.update` leaves the message's Slack metadata (its Server Post Marker) alone: no `metadata` key at all, not even one set to undefined. */
-function expectNoMetadata(args: object): void {
-  expect(Object.hasOwn(args, 'metadata')).toBe(false)
-}
 
 // A handful of reusable UUIDv4-shaped tokens. CSCB treats them as opaque.
 const TOKEN_A = '11111111-1111-4111-8111-111111111111'
@@ -711,7 +707,7 @@ describe('poller tick — Case 1: new entry', () => {
       channel: A_DEST,
       text: expect.any(String),
       blocks: buildPermissionBlocks(row.tool_name, JSON.parse(row.tool_input), INSTANCE_A, TOKEN_A),
-      metadata: { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} },
+      metadata: SERVER_POST_METADATA,
     })
     expect(postCalls.some((c) => c.channel === A_WORK)).toBe(false)
     // No other persona's client is used.

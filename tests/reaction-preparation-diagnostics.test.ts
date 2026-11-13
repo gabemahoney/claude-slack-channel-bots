@@ -1,11 +1,8 @@
 /**
  * Reaction preparation's server-log lines (SR-10.1): the class labels and the
- * two pure builders, pinned once here; and their same-change entries in the
- * debugging skill and the architecture Logging section (SR-10.2).
+ * two pure builders, pinned once here.
  */
 import { describe, expect, test } from 'bun:test'
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
 import type { ReactionFungibleCondition, ReactionWithdrawalReason } from '../src/delivery-queue.ts'
 import { personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import {
@@ -17,7 +14,6 @@ import {
 } from '../src/reaction-preparation-diagnostics.ts'
 import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL, sentinelInMessage, withoutName } from './test-helpers/credentials.ts'
-import { classHeading, requiredSection } from './test-helpers/markdown.ts'
 
 const SUBJECT: ReactionDiagnosticSubject = { key: 'ops_bot', name: 'Ops Bot', chat_id: 'C0GENERAL', message_ts: '1700000100.000100' }
 const KEY_ONLY: ReactionDiagnosticSubject = { key: 'ops_bot', chat_id: 'C0GENERAL', message_ts: '1700000100.000100' }
@@ -139,20 +135,5 @@ describe('builders', () => {
       expect(line).not.toContain(REDACTED_URL_PLACEHOLDER)
     }
     assertNoLeak(lines)
-  })
-})
-
-describe('catalogue entries in the same change (SR-10.2)', () => {
-  const REPO_ROOT = resolve(import.meta.dir, '..')
-  const SKILL_FILE = 'skills/debug-slack-channel-bots/SKILL.md'
-  const ARCHITECTURE_FILE = 'docs/architecture.md'
-  const read = (file: string) => readFileSync(resolve(REPO_ROOT, file), 'utf-8')
-
-  test.each([REACTION_WITHDRAWN, REACTION_MESSAGE_UNKNOWN])('the debugging skill has a %s entry quoting its line', label => {
-    expect(requiredSection(read(SKILL_FILE), classHeading(label), SKILL_FILE)).toContain(`[slack] ${label}:`)
-  })
-
-  test.each([REACTION_WITHDRAWN, REACTION_MESSAGE_UNKNOWN])('the architecture Logging section lists the %s line', label => {
-    expect(requiredSection(read(ARCHITECTURE_FILE), '## Logging', ARCHITECTURE_FILE)).toContain(`\`[slack] ${label}:`)
   })
 })

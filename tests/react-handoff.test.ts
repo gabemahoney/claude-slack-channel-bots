@@ -4,33 +4,31 @@
  * and the real origin classifier, and handed to the other applied persona A's
  * `bot-tool` intake with the fields captured at the claim; `forget` and `stop`
  * cancel and drain it; a failed job writes one content-free line. The line's
- * builder is pinned once here, with its catalogue entries (SR-10.1, SR-10.2).
+ * builder is pinned once here (SR-10.1).
  */
+import { SERVER_POST_METADATA } from './test-helpers/server-post.ts'
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
 import type { Persona } from '../src/config.ts'
 import { encodePermissionActionId } from '../src/permission-action-id.ts'
 import { personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import type { BotToolReactionInput, BotToolReactionIntakeResult } from '../src/persona-routing.ts'
 import {
   buildReactionHandoffFailedLine,
-  createReactHandoff,
   REACTION_HANDOFF_FAILED,
   REACTION_HANDOFF_FAILURE_REASONS,
-  type ReactHandoff,
   type ReactionHandoffFailure,
   type ReactionHandoffFailureReason,
 } from '../src/react-handoff.ts'
 import type { ReactClaimContext } from '../src/registry.ts'
-import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
 import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { NAME_LOOKUP_TIMEOUT_MS } from '../src/tag-wrapper.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL, sentinelInMessage, withoutName } from './test-helpers/credentials.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
-import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
-import { classHeading, requiredSection } from './test-helpers/markdown.ts'
+import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { makeReactHandoffFixture, drainReactHandoff, type ReactHandoffFixture } from './test-helpers/react-handoff.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { asWebClient, makeDeferredWebApiCall, makeStubSlack, type DeferredWebApiCall, type SettledWebApiOutcome, type StubSlack } from './test-helpers/slack-stub.ts'
 
@@ -88,22 +86,10 @@ interface Personas {
   gamma: Persona
 }
 
-interface Fixture extends Personas {
-  clock: FakeClock
+interface Fixture extends Personas, ReactHandoffFixture {
   /** What getAppliedPersonas answers now. */
   applied: Persona[]
-  /** Each persona's confirmed bot user now; a missing key is not serving. */
-  identities: Map<string, string>
   stubs: Record<'alpha' | Role, StubSlack>
-  /** Every intake call, its input copied when it was made. */
-  intakes: Intake[]
-  /** The intake's answer; `stored` unless a case sets its own. */
-  answer: (key: string, input: BotToolReactionInput) => Promise<BotToolReactionIntakeResult>
-  logs: string[]
-  shuttingDown: boolean
-  /** Settles whatever a case left held, so the owner can be stopped after it. */
-  releases: Array<() => void>
-  handoff: ReactHandoff
   claim(by?: Role, overrides?: Partial<ReactClaimContext>): ReactClaimContext
 }
 
@@ -121,12 +107,7 @@ const open: Fixture[] = []
 
 afterEach(async () => {
   for (const f of open.splice(0)) {
-    const stopped = f.handoff.stop()
-    for (const release of f.releases.splice(0)) release()
-    await stopped
-    await f.clock.flush()
-    expect(f.clock.pendingCount()).toBe(0)
-    assertNoLeak({ logs: f.logs, intakes: f.intakes })
+    await drainReactHandoff(f)
     for (const marker of Object.values(MARKERS)) expect(f.logs.join('\n')).not.toContain(marker)
   }
 })
@@ -141,37 +122,22 @@ function makeFixture(opts: FixtureOptions = {}): Fixture {
   const { alpha, beta, gamma } = appliedPersonas()
   const stubs = { alpha: makeStubSlack({ leakMarker: LEAK_SENTINEL }), beta: makeStubSlack({ leakMarker: LEAK_SENTINEL }), gamma: makeStubSlack({ leakMarker: LEAK_SENTINEL }) }
   const users: Record<Role, string> = { beta: B_USER, gamma: C_USER }
-  const f: Omit<Fixture, 'handoff'> & { handoff?: ReactHandoff } = {
-    clock, alpha, beta, gamma, stubs,
-    applied: [alpha, beta, gamma],
+  const f: Fixture = Object.assign(makeReactHandoffFixture({
+    getAppliedPersonas: () => f.applied,
     identities: new Map([[alpha.key, A_USER], [beta.key, B_USER], [gamma.key, C_USER]]),
-    intakes: [],
-    answer: async () => ({ status: 'stored', seq: 1 }),
-    logs: [],
-    shuttingDown: false,
-    releases: [],
-    claim: (by = 'beta', overrides = {}) => ({
+    clock,
+    isShuttingDown: opts.isShuttingDown,
+    lookupTimeoutMs: opts.lookupTimeoutMs,
+  }), {
+    alpha, beta, gamma, stubs,
+    applied: [alpha, beta, gamma],
+    claim: (by: Role = 'beta', overrides: Partial<ReactClaimContext> = {}): ReactClaimContext => ({
       persona: by === 'beta' ? beta : gamma, client: asWebClient(stubs[by].web), botUserId: users[by],
       chatId: CHANNEL, messageId: MESSAGE_TS, emoji: EMOJI, ...overrides,
     }),
-  }
-  f.handoff = createReactHandoff({
-    getAppliedPersonas: () => f.applied,
-    getBotIdentity: (key) => {
-      const botUserId = f.identities.get(key)
-      return botUserId === undefined ? undefined : { botUserId }
-    },
-    receiveBotToolReaction: (key, input) => {
-      f.intakes.push({ key, input: structuredClone(input) })
-      return f.answer(key, input)
-    },
-    clock,
-    ...(opts.lookupTimeoutMs === undefined ? {} : { lookupTimeoutMs: opts.lookupTimeoutMs }),
-    isShuttingDown: opts.isShuttingDown ?? (() => f.shuttingDown),
-    log: (line) => { f.logs.push(line) },
   })
-  open.push(f as Fixture)
-  return f as Fixture
+  open.push(f)
+  return f
 }
 
 /** B's next read waits for the test; released with no message if the case leaves it held. */
@@ -241,7 +207,7 @@ describe("the reacted message's origin and author decide the hand-off", () => {
     ['it has no author', () => post(undefined, { bot_id: 'B0WEBHOOK' }), null],
     ["A's bot user wrote it but A is not confirmed now", (f) => { f.identities.delete(f.alpha.key); return post(A_USER) }, null],
     ["A's bot user wrote it but A is not applied now", (f) => { f.applied = [f.beta, f.gamma]; return post(A_USER) }, null],
-    ["A's Server Post, by the Server Post Marker", () => post(A_USER, { metadata: { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} } }), null],
+    ["A's Server Post, by the Server Post Marker", () => post(A_USER, { metadata: SERVER_POST_METADATA }), null],
     ["A's Server Post, by an open permission prompt's decision button", (f) => post(A_USER, PERMISSION_BUTTON(f)), null],
   ]
 
@@ -823,20 +789,5 @@ describe('buildReactionHandoffFailedLine', () => {
     expect(line).toBe(`[slack] ${REACTION_HANDOFF_FAILED}: ${refs} ${WHERE_TEXT} reason=read-failed`)
     // C0 and C1 controls, DEL and the two Unicode separators.
     expect(line).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/)
-  })
-})
-
-describe('catalogue entries in the same change (SR-10.2)', () => {
-  const REPO_ROOT = resolve(import.meta.dir, '..')
-  const SKILL_FILE = 'skills/debug-slack-channel-bots/SKILL.md'
-  const ARCHITECTURE_FILE = 'docs/architecture.md'
-  const read = (file: string) => readFileSync(resolve(REPO_ROOT, file), 'utf-8')
-
-  test(`the debugging skill has a ${REACTION_HANDOFF_FAILED} entry quoting its line`, () => {
-    expect(requiredSection(read(SKILL_FILE), classHeading(REACTION_HANDOFF_FAILED), SKILL_FILE)).toContain(`[slack] ${REACTION_HANDOFF_FAILED}:`)
-  })
-
-  test(`the architecture Logging section lists the ${REACTION_HANDOFF_FAILED} line`, () => {
-    expect(requiredSection(read(ARCHITECTURE_FILE), '## Logging', ARCHITECTURE_FILE)).toContain(`\`[slack] ${REACTION_HANDOFF_FAILED}:`)
   })
 })

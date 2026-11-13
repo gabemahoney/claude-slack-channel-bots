@@ -1,5 +1,6 @@
 
 
+import { noticePost } from './test-helpers/server-post.ts'
 import type { MakeTemplateParams } from 'agent-director'
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync, unlinkSync } from 'node:fs'
@@ -228,7 +229,6 @@ import {
   readStartupEntries,
   teardownNoticeEntry,
   teardownNoticeLine,
-  type NoticePost,
   type NotifierHarness,
   type StartupEntry,
 } from './test-helpers/persona-notifier.ts'
@@ -248,12 +248,6 @@ import {
   makePrivateChannelMessage,
   type WebApiOutcome,
 } from './test-helpers/slack-stub.ts'
-import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
-
-/** The Server Post Marker every server post carries. */
-const SERVER_POST_METADATA = { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} }
-/** A captured notice post as the server posts it: channel, text and the Server Post Marker. */
-const noticePost = (channel: string, text: string): NoticePost => ({ channel, text, metadata: SERVER_POST_METADATA }) as NoticePost
 
 /** The kill's success the fixture's `killInstance` answers: `kill_sent: true`. */
 const KILL_SUCCEEDED: KillOutcome = { kind: KILL_OUTCOME_KILLED, killSent: true }

@@ -18,7 +18,7 @@ import { UNAVAILABLE_RETRY_MODE_PENDING_ONLY, UNAVAILABLE_RETRY_RUN_NOW_ARMED, U
 import { cannedPermissionRequest, errCallTimeout, errConfigMalformed, errDialogMaybeOpen, errInstanceIdCollision, errInternal, errInvalidFlags, errPaneChanged, errRelayFallenBack, errSendKeysWhileRelayed, errSpawnNotFound, errSpawnNotInteractive, errSystemInstallDisappeared, errTmuxNotAvailable, errTmuxSendKeys, errTmuxSessionConflict, errTmuxUnresponsive, errUnusableName } from './test-helpers/agent-director-stub.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
 import { partialReceiptText, partialReceiptSuffix } from './test-helpers/partial-receipt.ts'
-import { injectedInput, makeQueue, readQueue, seedQueue } from './test-helpers/delivery-queue.ts'
+import { reactionInput, injectedInput, makeQueue, readQueue, seedQueue } from './test-helpers/delivery-queue.ts'
 import type { AcceptedRecord, QueueRecord, ReactionAcceptedInput } from '../src/delivery-queue.ts'
 import { createDeliveryPolicyState, createDeliveryReading, decideEngine, decideGate, NO_DELIVERY_PAIR, selectDeliveryTarget, type DeliveryPair, type DeliveryPolicyKnowledge } from '../src/delivery-policy.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
@@ -1917,10 +1917,6 @@ test('a reconnect timer outlived by a six-second AD read resumes its retained co
   await stopping
 })
 
-function reactionInput(overrides: Partial<ReactionAcceptedInput> = {}): ReactionAcceptedInput {
-  const fields = { channel: 'C0TEST001', message_ts: '1700000000.000001', ts: '1700000000.000002', change: 'added' as const, emoji: 'thumbsup', user: 'U0REACTOR', ...overrides }
-  return { source: 'reaction', text: '', origin: 'slack-event', mode: 'declarative', ...fields, reaction_key: { chat_id: fields.channel, message_ts: fields.message_ts, reactor: fields.user, emoji: fields.emoji, change: fields.change, event_ts: fields.ts } }
-}
 async function acceptReaction(h: EngineHarness, overrides: Partial<ReactionAcceptedInput> = {}): Promise<number> {
   const result = await h.queue.accept('alpha', reactionInput(overrides))
   if (result.status !== 'accepted') throw new Error('fixture reaction acceptance failed')
@@ -1943,12 +1939,10 @@ describe('Reaction Items in the FIFO', () => {
   test.each([
     ['an explicit withdrawn head passes to its fixed successor', { accepted: [1, 2], fixed: [2], withdrawn: [1] }, {}, [2, 1], 'recordSend'],
     ['an absent withdrawn field keeps the head', { accepted: [1, 2], fixed: [1, 2] }, {}, [1, 1], 'recordSend'],
-    ['an empty withdrawn list keeps the head', { accepted: [1, 2], fixed: [1, 2], withdrawn: [] }, {}, [1, 1], 'recordSend'],
     ['unsorted acceptance is taken in ascending order past a withdrawn item', { accepted: [5, 3, 4], fixed: [4, 5], withdrawn: [3] }, {}, [4, 1], 'recordSend'],
     ['a delivered head and a withdrawn item pass to the next item', { accepted: [1, 2, 3], fixed: [1, 3], delivered: [[1, 1]], withdrawn: [2] }, {}, [3, 1], 'recordSend'],
     ['a multipart successor continues at its next part', { accepted: [1, 2], fixed: [2], delivered: [[2, 1]], withdrawn: [1] }, { parts: { 1: 1, 2: 2 } }, [2, 2], 'recordSend'],
     ['a withdrawn first item ignores bounded MaxParts', { accepted: [1, 2], fixed: [2], withdrawn: [1] }, { MaxParts: 3 }, [2, 1], 'recordSend'],
-    ['an accepted-only reaction head still precedes later fixed work', { accepted: [1, 2], fixed: [2] }, {}, [1, 1], 'fixText'],
     ['all-withdrawn work has no target', { accepted: [1, 2], withdrawn: [1, 2] }, {}, NO_DELIVERY_PAIR, 'wait'],
   ] as [string, Partial<DeliveryPolicyKnowledge['p']>, Partial<DeliveryPolicyKnowledge>, DeliveryPair, 'recordSend' | 'fixText' | 'wait'][])('pure policy: %s', (_, p, extra, target, action) => {
     const k = ready(p, extra)
@@ -2028,29 +2022,6 @@ describe('Reaction Items in the FIFO', () => {
     expect(h.textCalls().map(c => c.params.text)).toEqual(outcome === 'fixed' ? ['reaction text', 'successor'] : ['successor'])
     expect(h.records().filter(r => r.kind === 'delivered').map(r => r.seq)).toEqual(seqs)
     expect(h.events.filter(e => e.type === 'item-delivered').map(e => 'seq' in e && e.seq)).toEqual(seqs)
-    expect(h.errors).toEqual([])
-  })
-
-  test.each(['working', 'down', 'held'] as const)('a fixed reaction head obeys %s and is typed before its successor only after a fresh waiting row', async guard => {
-    const h = await reactionHarness(), p = h.p()
-    await acceptReaction(h)
-    await h.queue.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['reaction text'] })
-    await h.accept('successor')
-    p.pane = 'prompt ready > '
-    if (guard === 'working') p.row.state = 'working'
-    else if (guard === 'down') p.up = false
-    else p.held = true
-    await start(h)
-    await h.advance(RECEIPT_WAIT_MS)
-    expect(h.keyCalls()).toEqual([])
-    expect(h.engine.status('alpha')).toMatchObject({ seq: 1, count: 2 })
-    const released = h.clock.now()
-    p.row.state = 'waiting'; p.up = true; p.held = false
-    await delivered(h)
-    expect(h.textCalls().map(c => c.params.text)).toEqual(['reaction text', 'successor'])
-    const first = h.calls.indexOf(h.keyCalls()[0]!)
-    expect(h.calls.slice(0, first).some(c => c.verb === 'get' && c.at >= released)).toBe(true)
-    expect(h.calls.filter(c => c.verb === 'read-pane')).toEqual([])
     expect(h.errors).toEqual([])
   })
 

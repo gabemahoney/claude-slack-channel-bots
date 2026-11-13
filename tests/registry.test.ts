@@ -33,6 +33,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { expectNoMetadata } from './test-helpers/server-post.ts'
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
@@ -104,9 +105,10 @@ import {
 } from '../src/registry.ts'
 import { trackAck, consumeAck, claimReactAnswer, _resetAckTracker, addDeliveryAck } from '../src/ack-tracker.ts'
 import type { BotToolReactionInput, BotToolReactionIntakeResult } from '../src/persona-routing.ts'
-import { buildReactionHandoffFailedLine, createReactHandoff, type ReactHandoff, type ReactionHandoffFailureReason } from '../src/react-handoff.ts'
+import { buildReactionHandoffFailedLine, type ReactionHandoffFailureReason } from '../src/react-handoff.ts'
 import { NAME_LOOKUP_TIMEOUT_MS } from '../src/tag-wrapper.ts'
-import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { makeReactHandoffFixture, drainReactHandoff, type ReactHandoffFixture } from './test-helpers/react-handoff.ts'
 import {
   makeFungiblePersona,
   makeMultiPersonaConfig,
@@ -206,16 +208,6 @@ const TOOL_CAPTURE: Record<ToolName, keyof StubSlack['calls']> = {
 }
 
 const TOOLS = Object.keys(TOOL_ARGS) as ToolName[]
-
-/**
- * Tool Posts and tool edits carry no Slack metadata, so no reply is taken for
- * a Server Post and an edit keeps the message's own: each captured call
- * (at least one) has no `metadata` key at all, not even one set to undefined.
- */
-function expectNoMetadata(calls: readonly object[]): void {
-  expect(calls.length).toBeGreaterThan(0)
-  for (const call of calls) expect(Object.hasOwn(call, 'metadata')).toBe(false)
-}
 
 /** Every Slack call recorded on a stub, across all capture arrays. */
 function slackCallCount(stub: StubSlack): number {
@@ -2984,18 +2976,7 @@ describe('react — the first-answer claim and onReactClaimed', () => {
   /** The reacted message as Alpha's read returns it: Beta's Tool Post, its text beside its author. */
   const BETA_POST: SettledWebApiOutcome = { kind: 'ok', result: { messages: [{ type: 'message', ts: MSG_TS, user: BETA_BOT, text: `${MARKERS.body} ${LEAK_SENTINEL}` }] } }
 
-  interface HandoffWorker {
-    handoff: ReactHandoff
-    clock: FakeClock
-    /** Each persona's confirmed bot user now, as the worker's getBotIdentity answers. */
-    identities: Map<string, string>
-    /** Every intake call, its input copied when it was made. */
-    intakes: Array<{ key: string; input: BotToolReactionInput }>
-    /** The intake's answer; `stored` unless a case sets its own. */
-    answer: () => Promise<BotToolReactionIntakeResult>
-    /** Settles whatever a case left held, so the worker can be stopped after it. */
-    releases: Array<() => void>
-  }
+  type HandoffWorker = ReactHandoffFixture
   const workers: HandoffWorker[] = []
 
   /**
@@ -3004,41 +2985,18 @@ describe('react — the first-answer claim and onReactClaimed', () => {
    * clock, a recording intake for A and its lines on console.error.
    */
   function makeWorker(): HandoffWorker {
-    const clock = createFakeClock({ start: OBSERVED_MS })
-    const worker: Omit<HandoffWorker, 'handoff'> & { handoff?: ReactHandoff } = {
-      clock,
-      identities: new Map([[h.alpha.key, BOT_USER], [h.beta.key, BETA_BOT]]),
-      intakes: [],
-      answer: async () => ({ status: 'stored', seq: 1 }),
-      releases: [],
-    }
-    worker.handoff = createReactHandoff({
+    const worker = makeReactHandoffFixture({
       getAppliedPersonas: () => [...h.personas.values()],
-      getBotIdentity: (key) => {
-        const botUserId = worker.identities.get(key)
-        return botUserId === undefined ? undefined : { botUserId }
-      },
-      receiveBotToolReaction: (key, input) => {
-        worker.intakes.push({ key, input: structuredClone(input) })
-        return worker.answer()
-      },
-      clock,
-      isShuttingDown: () => false,
-      log: (line) => console.error(line),
+      identities: new Map([[h.alpha.key, BOT_USER], [h.beta.key, BETA_BOT]]),
+      clock: createFakeClock({ start: OBSERVED_MS }),
+      log: line => console.error(line),
     })
-    workers.push(worker as HandoffWorker)
-    return worker as HandoffWorker
+    workers.push(worker)
+    return worker
   }
 
   afterEach(async () => {
-    for (const w of workers.splice(0)) {
-      const stopped = w.handoff.stop()
-      for (const release of w.releases.splice(0)) release()
-      await stopped
-      await w.clock.flush()
-      expect(w.clock.pendingCount()).toBe(0)
-      assertNoLeak({ intakes: w.intakes }, 'react hand-off intakes')
-    }
+    for (const w of workers.splice(0)) await drainReactHandoff(w)
     for (const marker of Object.values(MARKERS)) expect(h.lines.join('\n')).not.toContain(marker)
   })
 
@@ -3144,7 +3102,6 @@ describe('react — the first-answer claim and onReactClaimed', () => {
       w.identities.set(key, botUser)
       held.settle()
       expect(await reacting).toEqual(REACTED)
-      await turnsUntil(() => true)
       await w.clock.advance(1)
       await turnsUntil(() => w.intakes.length > 0)
       expect(replacement.callLog).toEqual([])
@@ -3228,7 +3185,22 @@ describe('react — the first-answer claim and onReactClaimed', () => {
     trackAck(h.alpha.key, A_ALL, MSG_TS)
     const removal = makeDeferredWebApiCall()
     stubOf(h.alpha).script.reactionsRemove.push(removal.outcome)
-    const { call, told } = await claimSession()
+    let removalWork: Promise<unknown> | undefined
+    const claims: boolean[] = []
+    const removals: string[] = []
+    const { call, told } = await claimSession({
+      claimReactAnswer: (key, channel, ts, emoji, remove) => {
+        const held = claimReactAnswer(key, channel, ts, emoji, async () => {
+          removalWork = remove!()
+          try { await removalWork } catch (error) {
+            removals.push('failed')
+            throw error
+          }
+        })
+        claims.push(held)
+        return held
+      },
+    })
 
     try {
       const result = await call('react', TOOL_ARGS.react(A_ALL))
@@ -3237,15 +3209,16 @@ describe('react — the first-answer claim and onReactClaimed', () => {
       await turnsUntil(() => stubOf(h.alpha).calls.reactionsRemove.length > 0)
       expect(removal.settled).toBe(false)
       removal.settle({ kind: 'platform', error: 'internal_error' })
-      await turnsUntil(() => true)
-      expect(result).toEqual(REACTED)
+      await turnsUntil(() => removals.length === 1)
     } finally {
       if (!removal.settled) removal.settle()
+      await Promise.allSettled([removalWork])
     }
+    expect({ claims, removals, results: h.results }).toEqual({ claims: [false], removals: ['failed'], results: [REACTED] })
     expect(told).toHaveLength(1)
     expect(told[0]!.client).toBe(asWebClient(stubOf(h.alpha).web))
     expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([REMOVE_EYES])
-    expect(stubOf(h.beta).callLog).toEqual([])
+    expect(allCallLogs()).toEqual({ [h.alpha.key]: ['reactions.add', 'reactions.remove'], [h.beta.key]: [] })
   })
 
   test("with the real hand-off bound, the winning react's exact result returns before its read is due; the read then runs on Alpha's captured client, and Beta, not subscribed to the conversation, gets the whole bot-tool input while the result stays as returned", async () => {
@@ -3295,7 +3268,6 @@ describe('react — the first-answer claim and onReactClaimed', () => {
     await w.clock.advance(1)
     await turnsUntil(() => h.lines.length > 0)
     await w.clock.advance(NAME_LOOKUP_TIMEOUT_MS * 2)
-    await turnsUntil(() => true)
 
     expect({ result, results: h.results }).toEqual({ result: REACTED, results: [REACTED] })
     expect(h.lines).toEqual([buildReactionHandoffFailedLine({

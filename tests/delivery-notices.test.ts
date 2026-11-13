@@ -1,4 +1,5 @@
 /** notice decisions only; engine/intake/ack suites own their transitions. */
+import { SERVER_POST_METADATA, noticePost, expectNoMetadata } from './test-helpers/server-post.ts'
 import { afterEach, describe, expect, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { join } from 'node:path'
@@ -10,12 +11,10 @@ import { createDeliveryPreparation, type DeliveryPreparation } from '../src/deli
 import type { DeliveryReason, DeliveryStatus } from '../src/delivery-engine.ts'
 import { buildDeliveryDiagnostic, buildDeliveryStuckNotice, buildMessageNotSavedNotice, buildMessageSavedAfterRetryNotice, buildStorageNoticeRecoveryLine, buildMessageNotTakenInNotice, buildMessagesWaitingNotice, buildQueueRecordUnreadableNotice, deliveryIdentity, deliveryStuckRemedy, MESSAGE_DELIVERED, MESSAGE_NOT_SAVED, MESSAGE_NOT_TAKEN_IN, MESSAGE_RECEIVED, MESSAGE_RETYPED, QUEUE_KEPT, QUEUE_UNWRITABLE, type DeliveryReportState, type DeliveryStuckReason } from '../src/delivery-notices.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
-import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
 import { MESSAGE_PARTIAL_RECEIPT, PERSONA_DESTINATION_FAILED } from '../src/persona-diagnostics.ts'
 import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { makeDeliveryNoticeHarness, makeStorageNoticeHarness, type DeliveryNoticeHarness, type StorageNoticeHarness } from './test-helpers/delivery-notices.ts'
-import type { NoticePost } from './test-helpers/persona-notifier.ts'
 import { injectedInput, queuePath, readQueue, slackInput } from './test-helpers/delivery-queue.ts'
 import { partialReceiptText, partialReceiptSuffix } from './test-helpers/partial-receipt.ts'
 import { openedDm } from './test-helpers/slack-stub.ts'
@@ -577,14 +576,6 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
   }
   function recovered(r: StorageNoticeHarness, args: object) {
     expect(noticeText(args)).toBe(formatPersonaNotice(r.config.personas[0]!, buildMessageSavedAfterRetryNotice(r.ref(), 'U0SENDER1')))
-  }
-  /** The Server Post Marker every warning and correction post carries. */
-  const SERVER_POST_METADATA = { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} }
-  /** A captured notice post as Slack receives it: the capture type's `{channel, text}` and the marker. */
-  const noticePost = (channel: string, text: string): NoticePost => ({ channel, text, metadata: SERVER_POST_METADATA }) as NoticePost
-  /** An edit leaves Slack's stored metadata alone: no `metadata` key at all, not even one set to undefined. */
-  function expectNoMetadata(args: object) {
-    expect(Object.hasOwn(args, 'metadata')).toBe(false)
   }
   function recoveryLines(r: StorageNoticeHarness) {
     return r.logs.filter(line => line.includes(' recovery='))

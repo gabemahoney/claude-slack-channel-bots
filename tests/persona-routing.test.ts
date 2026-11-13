@@ -10,7 +10,7 @@ import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { sanitizeFilename } from '../src/lib.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeRoutingHarness, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness, type RoutingHarnessOptions } from './test-helpers/persona-routing-harness.ts'
-import { makeAppMention, makeChannelMessage, makeDm, makeBotMessage, makeWebhookPost, makeStubSlack, mentionText, ENVELOPE_FLAG_FORMS, type EnvelopeOverrides, type SlackEvent } from './test-helpers/slack-stub.ts'
+import { makeAppMention, makeChannelMessage, makeDm, makeBotMessage, makeReaction, makeWebhookPost, makeStubSlack, mentionText, ENVELOPE_FLAG_FORMS, type EnvelopeOverrides, type SlackEvent } from './test-helpers/slack-stub.ts'
 import { assertNoLeak, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
 import { deliveredRecord, queuePath, readQueue, seedQueue, slackInput } from './test-helpers/delivery-queue.ts'
 import type { ChannelMode, Persona } from '../src/config.ts'
@@ -377,7 +377,7 @@ describe('reaction intake', () => {
   /** A human's reaction to alpha's message in CA; `item` overrides merge into the nested item. */
   function reaction(over: ReactionOverrides = {}): Record<string, unknown> {
     const { item, ...rest } = over
-    return { type: 'reaction_added', user: HUMAN, reaction: 'white_check_mark', item_user: ALPHA_BOT, event_ts: EVENT_TS, ...rest, item: { type: 'message', channel: CA, ts: MSG_TS, ...item } }
+    return makeReaction('reaction_added', { user: HUMAN, reaction: 'white_check_mark', item_user: ALPHA_BOT, event_ts: EVENT_TS, ...rest }, { channel: CA, ts: MSG_TS, ...item })
   }
   const keyOf = (h: RoutingHarness, name = 'alpha') => h.p(name).persona.key
   const acks = (h: RoutingHarness) => h.order.filter(s => s === 'ack').length
@@ -694,6 +694,7 @@ describe('reaction intake', () => {
     { reason: 'not-own-message', event: () => reaction({ item_user: BETA_BOT }) },
     { reason: 'own-reaction', event: () => reaction({ user: ALPHA_BOT }) },
     { reason: 'bot-reaction', event: () => reaction({ user: RETIRED_BOT }) },
+    { reason: 'bot-reaction', event: () => reaction({ type: 'reaction_removed', user: RETIRED_BOT }) },
   ]
   test.each(DROPS)('a $reason drop is acked once with no item, preparation or network, and logs only the builder\'s line for a logged reason', async row => {
     const name = row.name ?? 'alpha'

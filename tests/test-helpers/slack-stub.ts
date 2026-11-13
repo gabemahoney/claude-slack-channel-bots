@@ -1667,6 +1667,27 @@ export function makeChannelMessage(overrides: EventOverrides = {}): SlackEvent {
   )
 }
 
+/**
+ * A reaction on a bot's channel message. `item` overrides the default item's
+ * fields; `overrides.item` replaces it whole, including malformed values.
+ * Explicit undefined removes a field at either level. Envelope flags belong
+ * in `deliver`'s separate envelope argument.
+ */
+export function makeReaction(
+  type: 'reaction_added' | 'reaction_removed',
+  overrides: EventOverrides = {},
+  item: EventOverrides = {},
+): SlackEvent {
+  return mergeDroppingUndefined({
+    type,
+    user: DEFAULT_USER,
+    reaction: 'eyes',
+    item_user: DEFAULT_BOT_USER,
+    event_ts: randomTs(),
+    item: mergeDroppingUndefined({ type: 'message', channel: DEFAULT_CHANNEL, ts: randomTs() }, item),
+  }, overrides)
+}
+
 /** A human's message in a private channel (`G…` channel, `channel_type` `group`). */
 export function makePrivateChannelMessage(overrides: EventOverrides = {}): SlackEvent {
   return makeEvent(

@@ -3,6 +3,7 @@
  * same path: real preparation over the real queue fixes or withdraws each one
  * once, retries the identical record, and leaves final work final. A bot-tool
  * item keeps its stored mode and reactor name through reopen and recovery. */
+import { SERVER_POST_METADATA } from './test-helpers/server-post.ts'
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createDeliveryPreparation, type DeliveryPreparation } from '../src/delivery-intake.ts'
 import type { DeliveryEngineEvent } from '../src/delivery-engine.ts'
@@ -10,10 +11,9 @@ import type { DeliveryQueue, FixedRecord, QueueItem, QueueRecord, ReactionAccept
 import { createPersonaRouting } from '../src/persona-routing.ts'
 import { RETYPE_BACKOFF_MS } from '../src/delivery-constants.ts'
 import { buildReactionMessageUnknownLine, buildReactionWithdrawnLine } from '../src/reaction-preparation-diagnostics.ts'
-import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
 import { buildTagParts, NAME_LOOKUP_TIMEOUT_MS, tagByteLength, type TagMessage } from '../src/tag-wrapper.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
-import { injectedInput, queuePath, slackInput } from './test-helpers/delivery-queue.ts'
+import { reactionInput, injectedInput, queuePath, slackInput } from './test-helpers/delivery-queue.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { asWebClient, makeChannelMessage, makeDeferredWebApiCall, makeStubSlack, type DeferredWebApiCall, type SettledWebApiOutcome, type StubSlack } from './test-helpers/slack-stub.ts'
 import { assertNoLeak, LEAK_SENTINEL, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
@@ -90,11 +90,6 @@ function heldCall(): DeferredWebApiCall {
   return call
 }
 
-function reactionInput(overrides: Partial<ReactionAcceptedInput> = {}): ReactionAcceptedInput {
-  const fields = { channel: 'C0TEST001', message_ts: '1700000000.000001', ts: '1700000000.000002', change: 'added' as const, emoji: 'thumbsup', user: 'U0REACTOR', ...overrides }
-  return { source: 'reaction', text: '', origin: 'slack-event', mode: 'declarative', ...fields, reaction_key: { chat_id: fields.channel, message_ts: fields.message_ts, reactor: fields.user || fields.bot_id || '', emoji: fields.emoji, change: fields.change, event_ts: fields.ts } }
-}
-
 /** Where each case's shared clock starts, so a withdrawal's `at` is never the clock's zero. */
 const START = 1_000
 
@@ -125,7 +120,7 @@ const BETA_SUBJECT = { ...SUBJECT, key: BETA.key, name: BETA.name }
 /** Reacted-message content that preparation reads past: the sentinel fails the leak checks if it reaches a record, line or send. */
 const BODY = `reacted body ${LEAK_SENTINEL}`
 const PUBLIC = { name: 'general', is_channel: true }
-const SERVER_POST = { metadata: { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} } }
+const SERVER_POST = { metadata: SERVER_POST_METADATA }
 const DELIVERY_EVENTS: readonly DeliveryEngineEvent['type'][] = ['delivered', 'item-delivered', 'first-typed', 'partial-receipt', 'retyped', 'first-unconfirmed-retype']
 
 /** A reaction on the reacted message of these cases, with distinct reacted, event and root timestamps. */

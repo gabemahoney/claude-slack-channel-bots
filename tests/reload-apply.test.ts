@@ -167,6 +167,7 @@ import {
   makeDeferredWebApiCall,
   makeDm,
   makePrivateChannelMessage,
+  makeReaction,
   mentionText,
   stubOpenedDmId,
   type DeferredWebApiCall,
@@ -6196,10 +6197,9 @@ describe('reaction_notices turned off and back on applies in place at confirmati
         const channel = ownChannel(name)
         const socket = run.stub(name).socket
         const from = { acks: socket.acks.length, logs: run.logs.length, calls: run.stub(name).callLog.length }
-        await run.deliver(name, {
-          type, user: CONTACT, reaction: 'white_check_mark', item_user: run.stub(name).identity.botUserId, event_ts: eventTs,
-          item: { type: 'message', channel, ts: REACTED_TS },
-        })
+        await run.deliver(name, makeReaction(type, {
+          user: CONTACT, reaction: 'white_check_mark', item_user: run.stub(name).identity.botUserId, event_ts: eventTs,
+        }, { channel, ts: REACTED_TS }))
         expect(socket.acks.length - from.acks).toBe(1)
         const drops = run.logs.slice(from.logs).filter((line) => line.startsWith(`[slack] ${REACTION_DROPPED}: `))
         if (notices) {
@@ -7078,7 +7078,7 @@ function slackEventOf(run: ReloadRun, source: 'slack' | 'reaction', user: string
   const channel = ownChannel('bravo')
   return source === 'slack'
     ? makeChannelMessage({ channel, user, text: HEAD_TEXT, ts })
-    : { type: 'reaction_added', user, reaction: 'white_check_mark', item_user: run.stub('bravo').identity.botUserId, event_ts: ts, item: { type: 'message', channel, ts: REACTED_TS } }
+    : makeReaction('reaction_added', { user, reaction: 'white_check_mark', item_user: run.stub('bravo').identity.botUserId, event_ts: ts }, { channel, ts: REACTED_TS })
 }
 
 /**

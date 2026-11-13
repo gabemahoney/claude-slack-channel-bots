@@ -8,7 +8,7 @@ import { MAX_RELOAD_FILE_BYTES } from '../src/config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { _resetAckTracker, createQueuedAckCallback } from '../src/ack-tracker.ts'
-import { deliveredRecord, injectedInput, makeQueue, queuePath, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
+import { reactionInput, deliveredRecord, injectedInput, makeQueue, queuePath, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
 import { makeStubSlack } from './test-helpers/slack-stub.ts'
 
 let dir: string
@@ -911,12 +911,6 @@ test('startup findings remain available to a notifier installed after queue star
   expect(q.items('alpha').map(item => item.accepted.seq)).toEqual([1, 3])
 })
 
-/** A Reaction Item input whose key agrees with its fields unless `reaction_key` is overridden. */
-function reactionInput(overrides: Partial<ReactionAcceptedInput> = {}): ReactionAcceptedInput {
-  const fields = { channel: 'C0TEST001', message_ts: '1700000000.000001', ts: '1700000000.000002', change: 'added' as const, emoji: 'thumbsup', user: 'U0REACTOR', ...overrides }
-  const reaction_key = overrides.reaction_key ?? { chat_id: fields.channel, message_ts: fields.message_ts, reactor: fields.user || fields.bot_id || '', emoji: fields.emoji, change: fields.change, event_ts: fields.ts }
-  return { source: 'reaction', text: '', origin: 'slack-event', mode: 'declarative', ...fields, reaction_key }
-}
 const reactionRecord = (overrides: Partial<ReactionAcceptedInput> = {}): AcceptedRecord => ({ ...reactionInput(overrides), v: 1, kind: 'accepted', seq: 1, received_at: 1000 })
 const withdrawn = (overrides: Partial<WithdrawnRecord> = {}): WithdrawnRecord => ({ v: 1, kind: 'withdrawn', seq: 1, reason: 'server-post', at: 2000, ...overrides })
 /** Compaction writes retained key facts before items; order by sequence instead. */

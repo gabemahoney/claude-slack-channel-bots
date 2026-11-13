@@ -50,6 +50,7 @@
  * every line and recorded failure.
  */
 
+import { SERVER_POST_METADATA } from './test-helpers/server-post.ts'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -96,10 +97,7 @@ import {
   fakeToken,
   sentinelInMessage,
 } from './test-helpers/credentials.ts'
-import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
 
-/** The Server Post Marker every server post carries. */
-const SERVER_POST_METADATA = { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} }
 
 // ---------------------------------------------------------------------------
 // Harness

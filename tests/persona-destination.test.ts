@@ -36,6 +36,7 @@
  * `afterEach` runs `assertNoLeak` over every log line and result.
  */
 
+import { SERVER_POST_METADATA } from './test-helpers/server-post.ts'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -61,7 +62,6 @@ import {
 } from '../src/persona-destination.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
-import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './test-helpers/persona-config.ts'
 import {
   asWebClient,
@@ -119,8 +119,6 @@ const methods = (p: Persona): string[] => stub(p).callLog.map((c) => c.method)
 const opens = (p: Persona) => stub(p).calls.conversationsOpen
 /** `chat.postMessage` arguments on `p`'s stub, as the module passes them. */
 const posts = (p: Persona) => stub(p).calls.postMessage as { channel: string; text: string; blocks?: unknown[]; metadata?: unknown }[]
-/** The Server Post Marker every destination post carries. */
-const SERVER_POST_METADATA = { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} }
 
 /** The persona with another contact (an in-place contact change, as reload makes). */
 const withContact = (p: Persona, contact: string): Persona => ({ ...p, dm: { ...p.dm, contact } })

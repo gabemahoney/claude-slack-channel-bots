@@ -1,3 +1,4 @@
+import { SERVER_POST_METADATA } from './test-helpers/server-post.ts'
 import { REPLY_TOOL_PREALLOWED_LABEL } from '../src/reply-reminder.ts'
 import { makePendingRowModel, PENDING_ROW_MODEL_NO_ROW, judgeNotJudged } from './test-helpers/pending-row-model.ts'
 import { errDialogMaybeOpen } from './test-helpers/agent-director-stub.ts'
@@ -338,7 +339,6 @@ import {
   startupSummaryLine, TEARDOWN_KILL_STATUS_SITE, thisLaunchRowOf,
   type ForcedLaunchOutcome, type JsonlCandidate, type LatchRecheckRoundDeps, type OldLifeHoldWaitStart, type OrphanReconcileResult, type OwnLaunchRecord, type PersonaKillKeepGoingQuery, type ReuseRecordedSince
 } from '../src/session-manager.ts'
-import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
 import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { escapeSlackControlCharacters, unescapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import {
@@ -914,7 +914,7 @@ function expectOneNoticeToDestination(h: NotifierHarness): string {
   expect(post.channel).toBe(NOTICE_DEST)
   // Top-level, the persona's own identity: exactly channel + text, with the Server Post Marker.
   expect(Object.keys(post).sort()).toEqual(['channel', 'metadata', 'text'])
-  expect((post as { metadata?: unknown }).metadata).toEqual({ event_type: SERVER_POST_EVENT_TYPE, event_payload: {} })
+  expect(post.metadata).toEqual(SERVER_POST_METADATA)
   expect(post.text.startsWith(`Persona ${renderPersonaRef(NOTICE_NAME, NOTICE_KEY)}: `)).toBe(true)
   expect(post.text).not.toContain(NOTICE_DEST)
   expect(post.text).not.toContain(NOTICE_MENTIONS)
@@ -9414,7 +9414,7 @@ describe('persona notices', () => {
     const [otherPost] = h.posts(OTHER_KEY)
     expect(otherPost!.channel).toBe(OTHER_DEST)
     expect(Object.keys(otherPost!).sort()).toEqual(['channel', 'metadata', 'text'])
-    expect((otherPost as { metadata?: unknown }).metadata).toEqual({ event_type: SERVER_POST_EVENT_TYPE, event_payload: {} })
+    expect(otherPost!.metadata).toEqual(SERVER_POST_METADATA)
     expect(otherPost!.text.startsWith(`Persona ${renderPersonaRef(OTHER_NAME, OTHER_KEY)}: `)).toBe(true)
     expect(otherPost!.text).toContain('Error: `SpawnCapReached`')
     expect(otherPost!.text).not.toContain(NOTICE_NAME)

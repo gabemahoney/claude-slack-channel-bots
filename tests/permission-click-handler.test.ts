@@ -1,3 +1,4 @@
+import { expectNoMetadata } from './test-helpers/server-post.ts'
 import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
 /**
  * permission-click-handler.test.ts — click → decide path under
@@ -186,10 +187,6 @@ const TOKEN_C = '33333333-3333-4333-8333-333333333333'
 /** A key naming no applied persona. */
 const UNKNOWN_KEY = 'no_such_persona'
 
-/** A `chat.update` leaves the message's Slack metadata (its Server Post Marker) alone: no `metadata` key at all, not even one set to undefined. */
-function expectNoMetadata(args: object): void {
-  expect(Object.hasOwn(args, 'metadata')).toBe(false)
-}
 
 const ALLOWED_TEXT = '*Permission* — Allowed'
 const DENIED_TEXT = '*Permission* — Denied by operator'

@@ -1,3 +1,4 @@
+import { SERVER_POST_METADATA } from './test-helpers/server-post.ts'
 import { REPLY_TOOL_PREALLOWED_LABEL } from '../src/reply-reminder.ts'
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
@@ -286,10 +287,7 @@ import {
 } from './test-helpers/recovery-harness.ts'
 import { observeLaunchCalls } from './test-helpers/launch-calls.ts'
 import { stubOpenedDmId, type StubWebMethod } from './test-helpers/slack-stub.ts'
-import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
 
-/** The Server Post Marker every server post carries. */
-const SERVER_POST_METADATA = { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} }
 
 function makeStubClient(options: Parameters<typeof makeBaseStubClient>[0] = {}) {
   return makeBaseStubClient({ readPaneResults: [cannedReadPaneResult(IDLE_PANE)], ...options })
@@ -2492,7 +2490,7 @@ describe('restart cap notice goes to the persona destination', () => {
 
       expect(deps.onCapReachedCalls).toEqual([a.key])
       const posts = h.posts(a.key)
-      expect(posts).toEqual([{ channel, text: expect.any(String), metadata: SERVER_POST_METADATA } as (typeof posts)[number]])
+      expect(posts).toEqual([{ channel, text: expect.any(String), metadata: SERVER_POST_METADATA }])
       expect(h.stub(a.key).web.callLog.map((c) => c.method)).toEqual(methods)
       if (destination.permission_prompts === 'dm') {
         expect(h.stub(a.key).calls.conversationsOpen).toEqual([{ users: DM_CONTACT }])

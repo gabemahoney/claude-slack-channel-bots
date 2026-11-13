@@ -3,12 +3,12 @@ import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { _resetAckTracker, addDeliveryAck, consumeAck, createQueuedAckCallback, createDeliveryAckCallback, forgetPersonaAcks } from '../src/ack-tracker.ts'
-import type { AcceptedInput, ReactionAcceptedInput } from '../src/delivery-queue.ts'
+import type { AcceptedInput } from '../src/delivery-queue.ts'
 import { buildDeliveryDiagnostic, buildDeliveryDispatchLine, createDeliveryReporting, deliveryIdentity, MESSAGE_DELIVERED, MESSAGE_RECEIVED } from '../src/delivery-notices.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
 import { makeDeliveryNoticeHarness, type DeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
-import { deliveredRecord, queuePath, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
+import { reactionInput, deliveredRecord, queuePath, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
 import { makeQueuedAckHarness, type QueuedAckHarness } from './test-helpers/queued-ack.ts'
 import { makeStubSlack } from './test-helpers/slack-stub.ts'
 import type { GetResult } from 'agent-director'
@@ -750,10 +750,6 @@ test.each(['reply', 'teardown'] as const)('metadata: %s during legacy adoption c
   expectOnlyOneStage(h)
 })
 
-function reactionInput(overrides: Partial<ReactionAcceptedInput> = {}): ReactionAcceptedInput {
-  const fields = { channel: 'C0TEST001', message_ts: '1700000000.000001', ts: '1700000000.000002', change: 'added' as const, emoji: 'thumbsup', user: 'U0REACTOR', ...overrides }
-  return { source: 'reaction', text: '', origin: 'slack-event', mode: 'declarative', ...fields, reaction_key: { chat_id: fields.channel, message_ts: fields.message_ts, reactor: fields.user, emoji: fields.emoji, change: fields.change, event_ts: fields.ts } }
-}
 async function acceptOn(e: EngineHarness, input: AcceptedInput): Promise<number> {
   const result = await e.queue.accept('alpha', input)
   if (result.status !== 'accepted') throw new Error('fixture acceptance failed')

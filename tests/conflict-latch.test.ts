@@ -1,3 +1,4 @@
+import { noticePost } from './test-helpers/server-post.ts'
 import type { RecoveryStubVerb } from './test-helpers/recovery-harness.ts'
 import { CLEAR_LATCH_ROUTE, handleClearLatch } from '../src/clear-latch.ts'
 import { latchClearRestartResetFailedLine, sweepDeadTmuxChannel, type LatchClearSequenceAnswer } from '../src/session-manager.ts'
@@ -388,7 +389,7 @@ import {
 } from './test-helpers/pending-row-model.ts'
 import { posts } from './test-helpers/permission-relay-harness.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
-import { makeNotifierHarness, type NoticePost } from './test-helpers/persona-notifier.ts'
+import { makeNotifierHarness } from './test-helpers/persona-notifier.ts'
 import {
   callCounts,
   callCountsSince,
@@ -420,12 +421,7 @@ import {
   type RecoveryTimedCall
 } from './test-helpers/recovery-harness.ts'
 import { confirmValues, freshStartLinesIn, startLabelsIn, startLabelsOf, type StartValues } from './test-helpers/start-values.ts'
-import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
 
-/** The Server Post Marker every server post carries. */
-const SERVER_POST_METADATA = { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} }
-/** A captured notice post as the server posts it: channel, text and the Server Post Marker. */
-const noticePost = (channel: string, text: string): NoticePost => ({ channel, text, metadata: SERVER_POST_METADATA }) as NoticePost
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -2911,7 +2907,6 @@ describe('a CONFLICT or UNUSABLE NAME at the reconnect\'s send-keys holds P, and
     ])
   })
 })
-
 
 /** How P's kill latches: [label, P's expected record, P's one post, the latching call (P's retry timer armed before it)]. */
 const KILL_LATCH_WAYS: ReadonlyArray<

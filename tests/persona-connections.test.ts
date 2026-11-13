@@ -327,6 +327,7 @@ import {
   makeChannelMessage,
   makeDeferredConnect,
   makeDeferredWebApiCall,
+  makeReaction as makeSlackReaction,
   makeStubSlack,
   makeStubSlackFactory,
   mentionText,
@@ -2316,15 +2317,12 @@ async function expectDelivers(h: Harness, p: ManagedPersona, stub: StubSlack = s
 
 /** A `reaction_added` or `reaction_removed` event on a channel message. */
 function makeReaction(type: 'reaction_added' | 'reaction_removed', overrides: Record<string, unknown> = {}): SlackEvent {
-  return {
-    type,
+  return makeSlackReaction(type, {
     user: 'U0REACTOR',
-    reaction: 'eyes',
     item_user: 'U0AUTHOR',
-    item: { type: 'message', channel: 'C0STUB0001', ts: '1700000000.000100' },
     event_ts: '1700000001.000200',
     ...overrides,
-  }
+  }, { ts: '1700000000.000100' })
 }
 
 /**

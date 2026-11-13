@@ -66,6 +66,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { noticePost } from './test-helpers/server-post.ts'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -138,12 +139,7 @@ import {
   type StubSlack,
   type StubSlackOptions,
 } from './test-helpers/slack-stub.ts'
-import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
 
-/** The Server Post Marker every server post carries. */
-const SERVER_POST_METADATA = { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} }
-/** A captured notice post as the server posts it: channel, text and the Server Post Marker. */
-const noticePost = (channel: string, text: string) => ({ channel, text, metadata: SERVER_POST_METADATA })
 
 // ---------------------------------------------------------------------------
 // Fixture: personas A and B, each with its own directory and credentials file

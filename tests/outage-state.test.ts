@@ -38,6 +38,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { SERVER_POST_METADATA } from './test-helpers/server-post.ts'
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -168,10 +169,7 @@ import {
   enclosingScope,
   scanFile,
 } from './getclient-allowlist-audit.ts'
-import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
 
-/** The Server Post Marker every server post carries. */
-const SERVER_POST_METADATA = { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} }
 
 // ---------------------------------------------------------------------------
 // Harness helpers

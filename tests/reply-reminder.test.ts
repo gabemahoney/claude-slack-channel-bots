@@ -3,13 +3,13 @@ import * as fs from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { GetResult } from 'agent-director'
-import { createDeliveryQueue, REPLY_REMINDER_KEEP_MS, type AcceptedInput, type ReactionAcceptedInput, type ReplyReminderQueue, type QueueItem } from '../src/delivery-queue.ts'
+import { createDeliveryQueue, REPLY_REMINDER_KEEP_MS, type AcceptedInput, type ReplyReminderQueue, type QueueItem } from '../src/delivery-queue.ts'
 import { createReplyReminders, REPLY_REMINDER_TEXT, REPLY_REMINDER_POLL_MS, REPLY_TOOL_PREALLOWED_LABEL, type ReplyReminders } from '../src/reply-reminder.ts'
 import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
-import { deliveredRecord, injectedInput, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
+import { reactionInput, deliveredRecord, injectedInput, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 
 let dir: string
@@ -526,10 +526,6 @@ describe('AD row reply reminders', () => {
   })
 })
 
-function reactionInput(overrides: Partial<ReactionAcceptedInput> = {}): ReactionAcceptedInput {
-  const fields = { channel: 'C0TEST001', message_ts: '1700000000.000001', ts: '1700000000.000002', change: 'added' as const, emoji: 'thumbsup', user: 'U0REACTOR', ...overrides }
-  return { source: 'reaction', text: '', origin: 'slack-event', mode: 'declarative', ...fields, reaction_key: { chat_id: fields.channel, message_ts: fields.message_ts, reactor: fields.user, emoji: fields.emoji, change: fields.change, event_ts: fields.ts } }
-}
 const reminderFacts = () => readQueue(dir).filter(record => record.kind === 'reply-reminder')
 const reminderView = (q: ReplyReminderQueue) => ({ candidates: q.replyReminderItems('alpha'), targets: q.replyCallTargets('alpha'), facts: reminderFacts() })
 

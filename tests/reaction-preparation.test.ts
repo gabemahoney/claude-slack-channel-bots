@@ -4,6 +4,7 @@
  * on the receiving persona's own client that supply those facts; a bot-tool
  * item's reactor name is the one stored with it.
  */
+import { SERVER_POST_METADATA } from './test-helpers/server-post.ts'
 import { describe, expect, spyOn, test } from 'bun:test'
 import type { WebClient } from '@slack/web-api'
 import type { ChannelMode } from '../src/config.ts'
@@ -18,7 +19,6 @@ import {
   type ReactionMessageRead,
   type ReactionPreparationDecision,
 } from '../src/reaction-preparation.ts'
-import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
 import { NAME_LOOKUP_TIMEOUT_MS } from '../src/tag-wrapper.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL, sentinelInMessage } from './test-helpers/credentials.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
@@ -272,7 +272,7 @@ describe('lookup 2: the reacted message, read with its metadata', () => {  test(
     ])
   })
 
-  const MARKER = { metadata: { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} } }
+  const MARKER = { metadata: SERVER_POST_METADATA }
   test.each([
     ['the exact message\'s thread, not a Server Post neighbour\'s', [{ ts: NEIGHBOR_TS, thread_ts: NEIGHBOR_TS, ...MARKER }, { ts: REACTED_TS, thread_ts: ROOT_TS, text: BODY }], fixed('Name of U0ADA', 'general', { thread_ts: ROOT_TS })],
     ['an unthreaded Tool Post beside a threaded neighbour is found, not unknown', [{ ts: NEIGHBOR_TS, thread_ts: ROOT_TS }, { ts: REACTED_TS, text: BODY, files: [{ name: BODY }] }], fixed('Name of U0ADA', 'general')],
@@ -456,7 +456,7 @@ describe('lookup 3: the conversation, read fresh for every item', () => {
     r.stubs.alpha.script.info.push(channelInfo(PUBLIC))
     // Scripted results merge into record responses; return the malformed outer array directly.
     const intercepted = leg === 'message'
-      ? spyOn(r.stubs.alpha.web.conversations, 'replies').mockResolvedValue(Object.assign([], { ok: true, messages: [{ ts: REACTED_TS, user: 'U0AUTHOR', thread_ts: ROOT_TS, text: BODY, metadata: { event_type: SERVER_POST_EVENT_TYPE } }] }))
+      ? spyOn(r.stubs.alpha.web.conversations, 'replies').mockResolvedValue(Object.assign([], { ok: true, messages: [{ ts: REACTED_TS, user: 'U0AUTHOR', thread_ts: ROOT_TS, text: BODY, metadata: { event_type: SERVER_POST_METADATA.event_type } }] }))
       : spyOn(r.stubs.alpha.web.conversations, 'info').mockResolvedValue(Object.assign([], { ok: true, channel: { id: CHANNEL, ...PUBLIC } }))
     try {
       const decision = await r.run(accepted({ mode: 'fungible' })).promise
@@ -504,7 +504,7 @@ describe('lookup 3: the conversation, read fresh for every item', () => {
     await r.clock.advance(NAME_LOOKUP_TIMEOUT_MS)
     const decided = structuredClone(first.value)
     expect(decided).toStrictEqual(fixed('Name of U0ADA', CHANNEL, { messageUnknown: true }))
-    lateReplies.settle(exactMessage({ thread_ts: ROOT_TS, metadata: { event_type: SERVER_POST_EVENT_TYPE } }))
+    lateReplies.settle(exactMessage({ thread_ts: ROOT_TS, metadata: { event_type: SERVER_POST_METADATA.event_type } }))
     lateInfo.settle(channelInfo({ name: 'late', is_channel: true, is_ext_shared: true }))
     await r.clock.flush()
     expect(first.value).toStrictEqual(decided)

@@ -62,6 +62,7 @@
  * startup-errors entry, and the written `startup-errors.log`.
  */
 
+import { SERVER_POST_METADATA, noticePost } from './test-helpers/server-post.ts'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -91,11 +92,10 @@ import {
 import { createPersonaDestinations, type DestinationFailure } from '../src/persona-destination.ts'
 import { createPersonaDestinationHold } from '../src/persona-destination-hold.ts'
 import { personaKey, renderPersonaRef } from '../src/persona-identity.ts'
-import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
 import { escapeSlackControlCharacters, unescapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
-import { makeNotifierHarness, teardownNoticeEntry, teardownNoticeLine, type NoticePost, type NotifierHarness } from './test-helpers/persona-notifier.ts'
+import { makeNotifierHarness, teardownNoticeEntry, teardownNoticeLine, type NotifierHarness } from './test-helpers/persona-notifier.ts'
 import { stubOpenedDmId, type WebApiOutcome } from './test-helpers/slack-stub.ts'
 import { LEAK_SENTINEL, assertNoLeak, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
 
@@ -103,10 +103,6 @@ import { LEAK_SENTINEL, assertNoLeak, sentinelInMessage, writtenFile } from './t
 // Harness
 // ---------------------------------------------------------------------------
 
-/** The Server Post Marker the destination adds to every notice post. */
-const SERVER_POST_METADATA = { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} }
-/** A captured notice post as Slack receives it: the capture type's `{channel, text}` and the marker. */
-const noticePost = (channel: string, text: string): NoticePost => ({ channel, text, metadata: SERVER_POST_METADATA }) as NoticePost
 
 interface Fixture {
   h: NotifierHarness

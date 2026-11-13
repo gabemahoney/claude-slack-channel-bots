@@ -1345,6 +1345,7 @@ AC5_MARK="$(rec_lines)"
 # Silent drops: each ACKed, with no line, acceptance or preparation.
 push_reaction "AC5: alpha's own reaction" added "${LA}" "${PS}" "${ALPHA_BOT_USER}" tada
 push_reaction "AC5: bravo's bot user reacts" added "${LA}" "${PS}" "${BRAVO_BOT_USER}" tada
+push_reaction "AC5: bravo's bot user removes a reaction" removed "${LA}" "${PS}" "${BRAVO_BOT_USER}" tada
 push_reaction "AC5: another user's message" added "${LA}" "${PO}" "${HUMAN}" tada "${HUMAN2}"
 # A logged drop.
 push_reaction "AC5: unlisted channel" added "${UN}" "${PN}" "${HUMAN}" tada
