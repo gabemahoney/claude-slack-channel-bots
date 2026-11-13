@@ -1717,6 +1717,64 @@ test('hung independent lookups acknowledge within 3s, use bounded fallbacks and 
   } finally { await preparation.stop(); await queue.stop() }
 })
 
+test.each(['failed', 'timed-out', 'missing-client', 'nameless'] as const)('channel lookup recovers after %s fallback and caches the resolved name', async outcome => {
+  const clock = createFakeClock(), io = durableIo()
+  clock.settleOn(io)
+  const queue = await makeQueue(dir, { now: clock.now, fs: io.fs })
+  const late = makeDeferredWebApiCall()
+  const slack = makeStubSlack({ info: [
+    ...(outcome === 'failed' ? [{ kind: 'platform' as const, error: 'channel_not_found' }]
+      : outcome === 'timed-out' ? [late.outcome]
+      : outcome === 'nameless' ? [{ kind: 'ok' as const, result: { channel: {} } }] : []),
+    { kind: 'ok', result: { channel: { name: '#real-room' } } },
+  ] })
+  let clientAvailable = outcome !== 'missing-client'
+  const preparation = createDeliveryPreparation({ queue, clock,
+    clientFor: () => clientAvailable ? slack.web as unknown as WebClient : undefined,
+    resolveUserName: async () => 'sender',
+  })
+  async function accept(ts: string) {
+    const result = await queue.accept('alpha', slackInput({ channel: CA, ts, key: { chat_id: CA, ts } }))
+    if (result.status === 'failed' || !result.item) throw new Error('fixture acceptance failed')
+    return result.item
+  }
+  try {
+    const first = await accept('1700000000.000001')
+    const preparing = preparation.prepare('alpha', first)
+    await clock.flush()
+    if (outcome === 'timed-out') {
+      await clock.advance(NAME_LOOKUP_TIMEOUT_MS - 1)
+      expect(queue.item('alpha', first.accepted.seq)?.fixed).toBeUndefined()
+      await clock.advance(1)
+    }
+    await preparing
+    const fallback = queue.item('alpha', first.accepted.seq)!.fixed!
+    expect(fallback.parts.join('')).toContain(`channel_name="${CA}"`)
+    expect(slack.calls.conversationsInfo).toHaveLength(outcome === 'missing-client' ? 0 : 1)
+
+    clientAvailable = true
+    const second = await accept('1700000000.000002')
+    await preparation.prepare('alpha', second)
+    expect(queue.item('alpha', second.accepted.seq)!.fixed!.parts.join('')).toContain('channel_name="real-room"')
+    const lookupCount = outcome === 'missing-client' ? 1 : 2
+    expect(slack.calls.conversationsInfo).toEqual(Array.from({ length: lookupCount }, () => ({ channel: CA })))
+    if (outcome === 'timed-out') {
+      late.settle({ kind: 'ok', result: { channel: { name: 'obsolete-room' } } })
+      await clock.flush()
+    }
+    const third = await accept('1700000000.000003')
+    await preparation.prepare('alpha', third)
+    expect(queue.item('alpha', third.accepted.seq)!.fixed!.parts.join('')).toContain('channel_name="real-room"')
+    expect(slack.calls.conversationsInfo).toHaveLength(lookupCount)
+    expect(queue.item('alpha', first.accepted.seq)!.fixed).toEqual(fallback)
+    expect(clock.pendingCount()).toBe(0)
+  } finally {
+    await clock.advance(NAME_LOOKUP_TIMEOUT_MS)
+    await preparation.stop()
+    await queue.stop()
+  }
+})
+
 test('channel caches are persona scoped, slow preparation leaves unrelated work free and fixed parts stay immutable', async () => {
   const fake = createFakeClock({ start: 1700000000000 })
   const h = makeRoutingHarness([{ name: 'alpha', channels: [{ id: CS, delivery: 'all' }] }, { name: 'beta', channels: [{ id: CS, delivery: 'all' }] }], dir, { membership: observedMembership({ alpha: [CS], beta: [CS] }), preparationClock: fake, stubOptions: { alpha: { info: [{ kind: 'never' }] }, beta: { info: [{ kind: 'ok', result: { channel: { name: 'beta-room' } } }] } } })
@@ -1730,7 +1788,7 @@ test('channel caches are persona scoped, slow preparation leaves unrelated work 
     const fixed = structuredClone(h.queued('alpha')[0]!.fixed)
     expect(fixed!.parts.join('')).toContain(CS)
     await h.receive(makeChannelMessage({ channel: CS, ts: '1700000000.000002' }))
-    expect(h.p('alpha').stub.calls.conversationsInfo).toEqual([{ channel: CS }]); expect(h.p('beta').stub.calls.conversationsInfo).toEqual([{ channel: CS }]); expect(h.queued('alpha')[0]!.fixed).toEqual(fixed); expect(h.queued('beta')).toHaveLength(2)
+    expect(h.p('alpha').stub.calls.conversationsInfo).toEqual([{ channel: CS }, { channel: CS }]); expect(h.p('beta').stub.calls.conversationsInfo).toEqual([{ channel: CS }]); expect(h.queued('alpha')[0]!.fixed).toEqual(fixed); expect(h.queued('beta')).toHaveLength(2)
     expect(fake.pendingCount()).toBe(0)
   } finally { expect(fake.pendingCount()).toBe(0) }
 })

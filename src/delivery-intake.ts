@@ -66,7 +66,11 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
       result = bounded(async () => {
         const info = await deps.clientFor(key)?.conversations.info({ channel })
         return info?.channel?.name?.replace(/^#/, '') || channel
-      }, channel)
+      }, channel).then(name => {
+        // Share in-flight lookups, but let the next message retry a fallback.
+        if (name === channel) cache!.delete(channel)
+        return name
+      })
       cache.set(channel, result)
     }
     return result
