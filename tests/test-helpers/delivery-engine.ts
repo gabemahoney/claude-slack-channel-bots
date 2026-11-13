@@ -9,6 +9,7 @@ import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
 import type { AcceptedInput, DeliveryQueue, DeliveryQueueOptions, QueueRecord } from '../../src/delivery-queue.ts'
 import { createFakeClock } from './fake-clock.ts'
 import { makeQueue, injectedInput, readQueue } from './delivery-queue.ts'
+import { durableIo } from './durable-io.ts'
 import { cannedGetResult, makeStubClient, type CannedGetResult } from './agent-director-stub.ts'
 import { appendTranscript, codexPromptEntry, endedTurn, promptEntry, replyEntry, writeTranscript } from './working-row-panes.ts'
 
@@ -20,7 +21,11 @@ export async function makeEngineHarness(options: { keys?: string[]; constants?: 
   const restarts: { key: string; cwd: string }[] = [], order: string[] = [], failures = new Map<string, number>()
   const received: { key: string; seq: number }[] = []
   let queue!: DeliveryQueue, engines!: DeliveryEngines, start = 0
-  let realQueue = options.queue ?? await makeQueue(root, { now: clock.now, fs: options.queueFs })
+  // Virtual time waits for the owned queue's real fsync and rename, so a
+  // timer-driven loop's turns never run out while the disk is slow.
+  const queueIo = durableIo({ base: options.queueFs })
+  if (!options.queue) clock.settleOn(queueIo)
+  let realQueue = options.queue ?? await makeQueue(root, { now: clock.now, fs: queueIo.fs })
   queue = { ...realQueue, async append(key, record) {
     const count = failures.get(record.kind) ?? 0
     if (count > 0) { failures.set(record.kind, count - 1); throw Object.assign(new Error('injected append failure'), { code: 'ENOSPC' }) }
@@ -110,7 +115,7 @@ export async function makeEngineHarness(options: { keys?: string[]; constants?: 
     async restartServer() {
       if (options.queue) throw new Error('the caller owns external queue reopen')
       await engines.stop(); await realQueue.stop()
-      realQueue = await makeQueue(root, { now: clock.now, fs: options.queueFs })
+      realQueue = await makeQueue(root, { now: clock.now, fs: queueIo.fs })
       const append = queue.append
       Object.assign(queue, realQueue, { append })
       lifecycle = createDeliveryLifecycle({ clock }); build()

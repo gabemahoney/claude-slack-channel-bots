@@ -81,16 +81,24 @@ export interface DeliveryEngines {
   status(key: string): DeliveryStatus | undefined
 }
 export class DeliveryBudgetWait extends Error { constructor(readonly delayMs: number) { super('Delivery call budget') } }
+/** Calling it records one call. `cover` records nothing: it throws until a
+ * step's `calls` all fit the window together. */
+export interface DeliveryCallBudget { (): void; cover(calls: number): void }
 /** The sliding ten-second window counts every engine and deferred call. */
-export function createDeliveryCallBudget(now: () => number, callsPerSecond = DELIVERY_MAX_AD_CALLS_PER_S): () => void {
-  const calls: number[] = []
-  return () => {
-    const at = now()
+export function createDeliveryCallBudget(now: () => number, callsPerSecond = DELIVERY_MAX_AD_CALLS_PER_S): DeliveryCallBudget {
+  const calls: number[] = [], limit = callsPerSecond * 10
+  function check(at: number, count: number): void {
     while (calls.length && calls[0]! <= at - 10000) calls.shift()
-    if (calls.length >= callsPerSecond * 10) throw new DeliveryBudgetWait(calls[0]! + 10000 - at)
-    calls.push(at)
+    // Calls leave in age order: wait for the one whose expiry makes room for all.
+    const over = calls.length + Math.min(count, limit) - limit
+    if (over > 0) throw new DeliveryBudgetWait(calls[over - 1]! + 10000 - at)
   }
+  return Object.assign(() => { const at = now(); check(at, 1); calls.push(at) }, { cover: (count: number) => check(now(), count) })
 }
+// A key's fresh reads are spent only when the budget also covers the key:
+// a read whose key is then refused fills the window that the key waits on.
+const KEY_STEP_CALLS = 2 // revalidation get, key
+const GATE_STEP_CALLS = 3 // gate observation get, then a key step
 /** A definite refusal of the *text* call; Enter never removes an earlier text. */
 export function deliveryTextWasRefused(error: unknown): boolean {
   const cls = classifyAdError(error).errorClass
@@ -190,13 +198,13 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   interface State {
     queue: ReturnType<typeof createQueueSummary>; noticesInitialized: boolean
     e: DeliveryPolicyEngine; reading: DeliveryReading; row?: GetResult; receipt?: ReceiptObservation
-    reader: DeliveryReceiptReader; receiptTarget?: DeliveryPair; receiptAttempt?: number; deadlines: Partial<Record<DeliveryTimer, number>>; budget: () => void
+    reader: DeliveryReceiptReader; receiptTarget?: DeliveryPair; receiptAttempt?: number; deadlines: Partial<Record<DeliveryTimer, number>>; budget: DeliveryCallBudget
     rowAt: number; notNowStep: number; retryStep: number; appendRetryStep: number; lastSeq?: number; lastPart?: number; transcriptReference?: string
     partialReceipt?: PartialReceiptEvidence & { seq: number }; partialLaunch?: string; partialAfterAttempts: Map<number, number>
     pending?: { record: QueueRecord; complete(): void }; lease?: () => void; timer?: unknown; busy?: Promise<void>; stopped: boolean
     relaunch: boolean; restarted?: boolean; gone?: { row: GetResult; handedOff?: boolean }; receiptWorking: boolean; pollAfter: number; snapshot?: DeliveryPolicyKnowledge; lastRetypeEvent?: number; dialogHold: boolean; dialogMaybeOpen: boolean; recoveringReconnect?: boolean
   }
-  const states = new Map<string, State>(), budgets = new Map<string, () => void>()
+  const states = new Map<string, State>(), budgets = new Map<string, DeliveryCallBudget>()
   // Blocked/empty executors retire without polling. Their queue-derived facts
   // and change cursor live until persona teardown; rebuilds invalidate the
   // cursor inside createQueueItemReader, including while no executor is active.
@@ -205,7 +213,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   const typed = new Set<string>()
   const reportedPartials = new Set<string>()
   function emit(event: DeliveryEngineEvent): void { try { void Promise.resolve(deps.onEvent?.(event)).catch(() => {}) } catch {} }
-  function budget(key: string): () => void { let b = budgets.get(key); if (!b) { b = createDeliveryCallBudget(clock.now); budgets.set(key, b) }; return b }
+  function budget(key: string): DeliveryCallBudget { let b = budgets.get(key); if (!b) { b = createDeliveryCallBudget(clock.now); budgets.set(key, b) }; return b }
   function create(key: string): State {
     let queue = summaries.get(key)
     if (!queue) { queue = createQueueSummary(deps.queue, key); summaries.set(key, queue) }
@@ -406,6 +414,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   // A durable append or the text-to-Enter pause may outlive its gate read.
   // Revalidate AD's row and CSCB's lifecycle guards before each unused key.
   async function revalidateKeys(key: string, s: State): Promise<boolean> {
+    s.budget.cover(KEY_STEP_CALLS)
     const fresh = await readRow(key, s, true), row = s.row
     const allowed = fresh && row && life.owner(key) === 'delivery' &&
       !s.relaunch && row.session_id === s.e.sessionSeen &&
@@ -538,6 +547,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           break
         }
         if (action === 'requestGate') {
+          s.budget.cover(GATE_STEP_CALLS)
           s.e.request = 'delivery'
           // Revalidate every unused request against a fresh independent gate
           // observation. The engine's prior external reading stays frozen.
@@ -641,7 +651,8 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         break
       }
     } catch (error) {
-      if (error instanceof DeliveryBudgetWait) { release(s); nextDelay = error.delayMs }
+      // Typed text keeps its lease through a budget wait until its Enter.
+      if (error instanceof DeliveryBudgetWait) { if (s.e.phase === 'enter' && life.owner(key) === 'delivery') s.e.request = 'none'; else release(s); nextDelay = error.delayMs }
       else { release(s); deps.onError?.(key, error) }
     } finally { if (states.get(key) === s && !stopped && !s.stopped) schedule(key, s, nextDelay) }
   }
