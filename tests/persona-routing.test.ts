@@ -1,6 +1,6 @@
 /** Durable Slack intake: decision wiring, persona isolation, ack boundary and immutable preparation. */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { WebClient } from '@slack/web-api'
@@ -25,6 +25,65 @@ function harness(opts: Parameters<typeof makeRoutingHarness>[2] = {}) {
 }
 const facts = (h: RoutingHarness, name: string) => h.queued(name).map(i => ({ channel: i.accepted.channel, ts: i.accepted.ts, via: i.accepted.via, text: i.accepted.text }))
 async function each(h: RoutingHarness, event: unknown) { await h.receive(event, ['alpha']); await h.receive(event, ['beta']) }
+
+describe('message intake with a throwing logger', () => {
+  const scenarios = [
+    { name: '1: archive failure still stores, acks, reports and prepares', failure: 'archive' },
+    { name: '2: disabled DM still acks without storing', failure: 'dm' },
+    { name: '3: ack failure still reports and prepares', failure: 'ack' },
+    { name: '4: preparation failure still resolves', failure: 'prepare' },
+    { name: 'routing failure still acks', failure: 'routing' },
+  ] as const
+
+  async function check(failure: string, fungible: boolean, throwingLog = true) {
+    const queue = await makeQueue(dir)
+    const config = makeMultiPersonaConfig([{ name: 'alpha', channels: [{ id: CA, delivery: 'all' }], dm: { enabled: false } }], dir, { allow_invited_channels: fungible })
+    const key = config.personas[0]!.key
+    const order: string[] = [], logs: string[] = []
+    const event = failure === 'dm' ? makeDm() : makeChannelMessage({ channel: CA, text: '<@U0BOT001> hello' })
+    const routing = createPersonaRouting({
+      getPersonaConfig: () => config,
+      getBotIdentity: () => {
+        if (failure === 'routing') throw new Error('identity unavailable')
+        return { botUserId: 'U0BOT001', botId: 'B0BOT001' }
+      },
+      queue: { lookupSlackKey: queue.lookupSlackKey, accept: async (key, input) => {
+        const result = await queue.accept(key, input)
+        order.push('store')
+        return result
+      } },
+      archive: () => { if (failure === 'archive') throw new Error('archive unavailable') },
+      log: line => { logs.push(line); if (throwingLog) throw new Error('log sink closed') },
+      onReceived: () => { order.push('report') },
+      prepare: async () => { order.push('prepare'); if (failure === 'prepare') throw new Error('preparation unavailable') },
+      isPersonaUp: () => false,
+    })
+    try {
+      await expect(routing.receive(event, () => {
+        order.push('ack')
+        if (failure === 'ack') throw new Error('ack unavailable')
+      }, key, false)).resolves.toBeUndefined()
+      const dropped = failure === 'dm' || failure === 'routing'
+      expect(order).toEqual(dropped ? ['ack'] : ['store', 'ack', 'report', 'prepare'])
+      expect(queue.items(key)).toHaveLength(dropped ? 0 : 1)
+      if (dropped) expect(existsSync(join(dir, 'queue', `${key}.jsonl`))).toBe(false)
+      else expect(readQueue(dir, key).filter(record => record.kind === 'accepted')).toHaveLength(1)
+      expect(logs.length).toBeGreaterThan(0)
+      if (failure === 'first-heard') expect(routing.heardChannels(key)).toEqual(new Set([CA]))
+      assertNoLeak(logs)
+    } finally { await queue.stop() }
+  }
+
+  for (const fungible of [false, true]) {
+    describe(fungible ? 'fungible' : 'declarative', () => {
+      test.each([...scenarios])('$name', async ({ failure }) => { await check(failure, fungible) })
+    })
+  }
+  test('2b: fungible first-heard logging failure still stores, acks, reports and prepares', async () => { await check('first-heard', true) })
+  test('control: archive failure with a working logger', async () => { await check('archive', false, false) })
+  test('control: fungible first-heard with a working logger', async () => { await check('first-heard', true, false) })
+})
+
 describe('persona routing and durable dedupe', () => {
   test('home, shared mention and DM retain exact target, source and via with empty bystander queues', async () => {
     const h = harness(); const mention = mentionText(h.p('alpha').stub.identity.botUserId)
