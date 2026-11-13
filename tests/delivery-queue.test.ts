@@ -531,6 +531,30 @@ describe('append validation refusals', () => {
     expect(q.item('alpha', 1)!.records.filter(record => record.kind === 'sent')).toEqual([sentRecord()])
   })
 
+  test('identical fixed retry writes nothing and preserves an existing storage failure', async () => {
+    let fail = false
+    const events: QueueEvent[] = []
+    const seam = { ...fs, fsyncSync(fd: number) {
+      if (fail && fs.fstatSync(fd).isFile()) throw new Error('EIO append sync')
+      fs.fsyncSync(fd)
+    } } as typeof fs
+    const q = await open({ fs: seam, onEvent: event => events.push(event) })
+    await q.accept('alpha', injectedInput())
+    const fixed: QueueRecord = { v: 1, kind: 'fixed', seq: 1, parts: ['fixed bytes'] }
+    await q.append('alpha', fixed)
+    fail = true
+    await expect(q.append('alpha', sentRecord())).rejects.toThrow('EIO append sync')
+    fail = false
+    const bytes = fs.readFileSync(queuePath(dir))
+    await q.append('alpha', fixed)
+    expect(fs.readFileSync(queuePath(dir))).toEqual(bytes)
+    expect(q.isWritable!('alpha')).toBe(false)
+    expect(events.filter(event => event.type === 'writable')).toEqual([])
+    await q.append('alpha', sentRecord())
+    expect(q.isWritable!('alpha')).toBe(true)
+    expect(events.filter(event => event.type === 'writable')).toEqual([{ type: 'writable', key: 'alpha' }])
+  })
+
   test('journal load failure still blocks append until storage recovers', async () => {
     seedQueue(dir, [accepted()])
     let fail = true

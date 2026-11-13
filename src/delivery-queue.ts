@@ -98,7 +98,7 @@ export interface DeliveryQueue {
   item(key: string, seq: number): QueueItem | undefined
   items(key: string): QueueItem[]
   openCount(key: string): number
-  /** Pending journal repair or a failed post-accept append suspends keys. */
+  /** Pending journal repair or an append storage failure suspends keys. Validation refusals preserve this state. */
   isWritable?(key: string): boolean
   keys(): string[]
   compact(key?: string): Promise<void>
@@ -619,8 +619,9 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         const bytes = Buffer.from(records.map(r => JSON.stringify(r) + '\n').join(''))
         try { durableAppend(path, bytes, j) } catch (error) { storageFailed(error) }
         for (const next of records) update(j, next)
+        // Only a durable write clears a block; an identical fixed retry writes nothing.
+        if (appendBlocked.delete(key)) event({ type: 'writable', key })
       })
-      if (appendBlocked.delete(key)) event({ type: 'writable', key })
     },
     async rememberQueuedReaction(key, seq, name) {
       return serial(key, () => {
