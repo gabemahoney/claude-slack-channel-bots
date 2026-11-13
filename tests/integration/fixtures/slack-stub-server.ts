@@ -50,11 +50,15 @@
  *     "replies": { "C…": { "<ts>": { "message": { "ts": "<ts>", "user": "U…", "bot_id": "B…",
  *                                                  "thread_ts": "<ts>",
  *                                                  "metadata": { "event_type": "…", "event_payload": {} },
- *                                                  "blocks": [ … ] } } } }
+ *                                                  "blocks": [ … ] } } } },
+ *     "reaction_pairs": [ { "id": "pair1", "label": "bravo", "channel": "C…",
+ *                           "timestamp": "<ts>", "name": "white_check_mark",
+ *                           "answers": ["ok", "already_reacted"] } ]
  *   }
  *
  * Every top-level key is optional; `users`, `channels` and `replies` are
- * independent of the token sections and apply to every label.
+ * independent of the token sections and apply to every label;
+ * `reaction_pairs` applies only to the label each entry names.
  *
  * A request's token is its `Authorization: Bearer` value (or a `token` form
  * field). The first `tokens` entry whose `suffix` the token ends with applies;
@@ -120,6 +124,43 @@
  * A configured error is checked after the token's `auth`, so a refused token
  * still answers its `auth` code. No other method reads `channels` or
  * `replies`.
+ *
+ * `reaction_pairs` (opt-in; absent, every `reactions.add` answers `ok` as
+ * before) scripts two overlapping `reactions.add` calls. Each entry is
+ * `{id, label, channel, timestamp, name, answers}`, every field required:
+ * `id` 1 to 64 letters, digits, `_` or `-`; `label` a token label (1 to
+ * 100 printable characters); `channel` a channel ID; `timestamp` a Slack
+ * ts; `name` an emoji name; `answers` exactly `["ok","already_reacted"]`
+ * or `["already_reacted","ok"]`. At most 32 entries, ids unique, and no two
+ * entries with one label/channel/timestamp/name. An entry applies only to a
+ * `reactions.add` whose label, `channel`, `timestamp` and `name` all equal
+ * its own; every other request and method is answered as without it.
+ * - One id is ONE pair of two requests. The first matching request (slot 1)
+ *   is held, unanswered, until the second (slot 2) arrives; then slot 1 gets
+ *   `answers[0]` and, REACTION_PAIR_ANSWER_GAP_MS (200 ms) later, slot 2 gets
+ *   `answers[1]`, so the server sees them in that order. `ok` is
+ *   `{"ok":true}`; `already_reacted` is `{"ok":false,"error":"already_reacted"}`,
+ *   HTTP 200, the shapes every other answer uses.
+ * - Failures never give a configured answer. Each is
+ *   `{"ok":false,"error":"stub_pair_<outcome>"}`, HTTP 200 (a Slack error,
+ *   which the Web API client does not retry), and a `fail` record line:
+ *   `timeout` (no slot 2 within REACTION_PAIR_TIMEOUT_MS, 10 s: slot 1
+ *   fails; a later match is `exhausted`), `refused` (a matching request's
+ *   token `auth` is not `ok`: that request answers its `auth` code, and a
+ *   held slot 1 fails `refused`), `exhausted` (a match after its pair
+ *   completed or failed), `reused` (a later control defines a known id with
+ *   another label/channel/timestamp/name/answers: a held slot 1 of that id
+ *   fails as soon as the control loads, and every later match of the new
+ *   entry fails too) and `stopped` (the stub stopped while a pair request
+ *   was held or waiting its gap).
+ * - Pair state is kept by id for the stub's life: loading another control,
+ *   by file or `POST /_control`, neither resets a spent id nor drops a held
+ *   request (a held slot 1 still pairs with its tuple's slot 2 when the new
+ *   control lacks its entry or repeats it unchanged; only a changed entry
+ *   for its id ends it, `reused`). Use a fresh id for a fresh pair. A malformed
+ *   entry refuses the whole control, as for every other field.
+ * - The stub only scripts HTTP answers: it judges no claim, notice or
+ *   reaction, and keeps no reaction state of its own.
  *
  * Validation: a control that breaks any rule above is refused whole (the file
  * keeps the previous control and writes a `control-error` line; `POST
@@ -210,6 +251,8 @@
  *   {"event":"push","label","envelope_id","connection_id","sent_mono_ms","event_ts","event_type","channel","channel_type",
  *    "flag":"false"|"true"|"non-boolean"|"absent","flag_value"}
  *   {"event":"push-refused","label","reason"}
+ *   {"event":"reaction-pair","pair_id","label","channel","timestamp","name","phase",
+ *    "slot", …}   (below)
  *
  * A `push` line is written once per sent push, right after the send and so
  * before the client's ack, which is the `ws-message` line carrying the
@@ -226,6 +269,25 @@
  * `ws-message` carries `ack_mono_ms` captured on arrival, before parsing/I/O.
  * Both use this process's monotonic clock. `connection_id` is a generated
  * UUID independent of the ticket or credentials, shared by push and ACK.
+ *
+ * A `reaction-pair` line is written at each step of a pair. Every one carries
+ * the entry's `pair_id`, `label`, `channel`, `timestamp` and `name` (each
+ * validated; token-like text replaced, cut to at most 100 characters), and:
+ *   - `"phase":"arrive"`: `slot` (1 or 2, by arrival), `held` (the pair's
+ *     requests then held unanswered: 0 for slot 1, 1 for slot 2) and
+ *     `arrival_mono_ms`;
+ *   - `"phase":"answer"`: `slot`, `answer` (`ok` or `already_reacted`) and
+ *     `answer_mono_ms`, written just before that request's `api` line;
+ *   - `"phase":"fail"`: `slot` (null for `exhausted`, and for `reused`
+ *     except the held slot 1 a redefinition ends), `outcome` and
+ *     `answer_mono_ms`.
+ * Both clocks are this process's monotonic clock. Two requests entered
+ * before either answered when, for one `pair_id`, the slot 2 `arrive` line
+ * (`held: 1`) precedes the slot 1 `answer` line in `seq` order. The
+ * request's `api` line stays the authority for what was answered (`answer`,
+ * `status`); for a pair request it also carries `pair_id` and, when it
+ * took a slot, `pair_slot`. No pair line carries a token, a suffix or a
+ * raw request or response.
  *
  * `api` lines also carry `channel`, `user` and `text` when the request has
  * them, and `args_token_like` (whether any argument held token-like text).
@@ -301,6 +363,20 @@ export interface StubRepliesMessage {
 /** One exact-ts `conversations.replies` answer: a message, a Slack error, or (`{}`) no message. */
 export type StubRepliesEntry = { message: StubRepliesMessage } | { error: string } | Record<string, never>
 
+/** A `reaction_pairs` answer: one of the two `reactions.add` outcomes a pair gives. */
+export type StubPairAnswer = 'ok' | 'already_reacted'
+
+/** One controlled pair of `reactions.add` answers for an exact label, channel, timestamp and emoji. */
+export interface StubReactionPair {
+  id: string
+  label: string
+  channel: string
+  timestamp: string
+  name: string
+  /** The answer for the first arrival, then the second's: one `ok` and one `already_reacted`. */
+  answers: [StubPairAnswer, StubPairAnswer]
+}
+
 /** The whole control document. */
 export interface StubControl {
   tokens?: StubTokenRule[]
@@ -309,6 +385,7 @@ export interface StubControl {
   channels?: Record<string, StubChannelEntry>
   /** Channel ID, then the requested message `ts`. */
   replies?: Record<string, Record<string, StubRepliesEntry>>
+  reaction_pairs?: StubReactionPair[]
 }
 
 export interface SlackStubOptions {
@@ -499,6 +576,43 @@ function checkReplies(value: unknown): NonNullable<StubControl['replies']> {
   return replies
 }
 
+/** The most `reaction_pairs` entries one control may hold. */
+const REACTION_PAIRS_MAX = 32
+const REACTION_PAIR_KEYS: readonly string[] = ['id', 'label', 'channel', 'timestamp', 'name', 'answers']
+const PAIR_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
+/** A label as a pair names it: printable, at most 100 characters (the record's cut). */
+const PAIR_LABEL_RE = /^[\x21-\x7e]{1,100}$/
+/** An emoji name as `reactions.add` sends it (skin tones included). */
+const EMOJI_NAME_RE = /^[a-z0-9_+'-]+(?:::[a-z0-9_+'-]+)?$/
+
+/** Validate `reaction_pairs`: unique ids and unique label/channel/timestamp/name tuples. */
+function checkReactionPairs(value: unknown): StubReactionPair[] {
+  if (!Array.isArray(value)) throw new Error('control.reaction_pairs must be an array')
+  if (value.length > REACTION_PAIRS_MAX) throw new Error(`control.reaction_pairs must hold at most ${REACTION_PAIRS_MAX} entries`)
+  const ids = new Set<string>()
+  const tuples = new Set<string>()
+  return value.map((entry, i) => {
+    const where = `control.reaction_pairs[${i}]`
+    if (!isObject(entry)) throw new Error(`${where} must be an object`)
+    if (Object.keys(entry).some(key => !REACTION_PAIR_KEYS.includes(key))) throw new Error(`${where} has an unknown field`)
+    const { id, label, channel, timestamp, name, answers } = entry
+    if (typeof id !== 'string' || !PAIR_ID_RE.test(id)) throw new Error(`${where}.id must be 1 to 64 letters, digits, _ or -`)
+    if (typeof label !== 'string' || !PAIR_LABEL_RE.test(label)) throw new Error(`${where}.label must be 1 to 100 printable characters`)
+    if (typeof channel !== 'string' || !CHANNEL_ID_RE.test(channel)) throw new Error(`${where}.channel must be a channel ID`)
+    if (typeof timestamp !== 'string' || !SLACK_TS_RE.test(timestamp)) throw new Error(`${where}.timestamp must be a Slack timestamp`)
+    if (typeof name !== 'string' || name.length > 100 || !EMOJI_NAME_RE.test(name)) throw new Error(`${where}.name must be an emoji name`)
+    if (!Array.isArray(answers) || answers.length !== 2 || !answers.includes('ok') || !answers.includes('already_reacted')) {
+      throw new Error(`${where}.answers must be ["ok","already_reacted"] or ["already_reacted","ok"]`)
+    }
+    if (ids.has(id)) throw new Error(`${where}.id must be unique in control.reaction_pairs`)
+    const tuple = JSON.stringify([label, channel, timestamp, name])
+    if (tuples.has(tuple)) throw new Error(`${where} must not share label, channel, timestamp and name with another entry`)
+    ids.add(id)
+    tuples.add(tuple)
+    return { id, label, channel, timestamp, name, answers: [answers[0], answers[1]] as [StubPairAnswer, StubPairAnswer] }
+  })
+}
+
 function checkAnswers(value: unknown, where: string): StubAnswers {
   if (!isObject(value)) throw new Error(`${where} must be an object`)
   const answers: StubAnswers = {}
@@ -557,6 +671,7 @@ export function parseControl(value: unknown): StubControl {
     else control.channels = checked as StubControl['channels']
   }
   if (value.replies !== undefined) control.replies = checkReplies(value.replies)
+  if (value.reaction_pairs !== undefined) control.reaction_pairs = checkReactionPairs(value.reaction_pairs)
   return control
 }
 
@@ -619,6 +734,46 @@ function okBody(method: string, args: Record<string, string>, seq: number, uploa
 function httpStatusOf(answer: string): number | undefined {
   const match = /^http-(\d{3})$/.exec(answer)
   return match === null ? undefined : Number(match[1])
+}
+
+// ---------------------------------------------------------------------------
+// Reaction pairs (`reaction_pairs`)
+// ---------------------------------------------------------------------------
+
+/**
+ * How long a pair's first `reactions.add` is held for its second, in
+ * milliseconds. Shorter than the harness's stub_session_call bound
+ * (SCENARIO_STUB_CALL_S, 30 s) and the server's Web API request timeout
+ * (30 s), so the held call ends with this stub's failure answer, not theirs.
+ */
+export const REACTION_PAIR_TIMEOUT_MS = 10_000
+
+/** The pause between a pair's first answer and its second, in milliseconds, so they arrive in the configured order. */
+export const REACTION_PAIR_ANSWER_GAP_MS = 200
+
+/**
+ * Why a pair request gets no configured answer: each answered
+ * `{"ok":false,"error":"stub_pair_<outcome>"}` (the refused request itself
+ * answers its token's `auth` code instead).
+ */
+type PairFailure = 'timeout' | 'refused' | 'reused' | 'exhausted' | 'stopped'
+
+/** One pair id's state, kept for the stub's life whatever control is loaded. */
+interface PairState {
+  entry: StubReactionPair
+  /** The entry's definition; the same id defined otherwise later is `reused`. */
+  definition: string
+  phase: 'idle' | 'pending' | 'complete' | 'failed'
+  arrivals: number
+  /** Releases the held first request: `paired` once the second arrives. */
+  release?: (outcome: 'paired' | PairFailure) => void
+  timer?: ReturnType<typeof setTimeout>
+}
+
+type PairMatch = { state: PairState } | { failure: 'reused' | 'exhausted'; entry: StubReactionPair }
+
+function pairDefinition(entry: StubReactionPair): string {
+  return JSON.stringify([entry.label, entry.channel, entry.timestamp, entry.name, entry.answers])
 }
 
 // ---------------------------------------------------------------------------
@@ -796,6 +951,10 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
   // Only this stub instance's successful posts/updates authorize a click.
   const messageActions = new Map<string, PushAction[]>()
   const messageKey = (label: string, channel: string, ts: string): string => JSON.stringify([label, channel, ts])
+  // Pair state by id: retained across control reloads, so a spent id stays spent.
+  const pairStates = new Map<string, PairState>()
+  const pairWaits = new Set<() => void>()
+  let pairsStopped = false
   const closedPort = reserveClosedPort()
 
   appendFileSync(recordPath, '')
@@ -823,6 +982,13 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
   function applyControl(next: StubControl, source: 'file' | 'http'): void {
     control = next
     record('control', { source, labels: labelsOf(next) })
+    // Checked here, not at slot 2: a pending pair matches by tuple before the
+    // control is read, so a held slot 1 would otherwise complete with the
+    // answers its id no longer has.
+    for (const entry of next.reaction_pairs ?? []) {
+      const known = pairStates.get(entry.id)
+      if (known?.phase === 'pending' && known.definition !== pairDefinition(entry)) settlePair(known, 'reused')
+    }
   }
 
   /** Re-read the control file when its mtime or size changed; keep the old control on a bad file. */
@@ -851,6 +1017,63 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
       return { label: `unlabelled-${tokenHash(token)}`, answers: control.default ?? {} }
     }
     return { label: 'no-token', answers: control.default ?? {} }
+  }
+
+  /** A `reaction-pair` record line: the pair's bounded, validated identity and `fields`. */
+  function recordPair(entry: StubReactionPair, fields: Record<string, unknown>): void {
+    record('reaction-pair', {
+      pair_id: pushFieldText(entry.id), label: pushFieldText(entry.label), channel: entry.channel,
+      timestamp: entry.timestamp, name: pushFieldText(entry.name), ...fields,
+    })
+  }
+
+  /**
+   * The pair a `reactions.add` belongs to: a pending pair with its exact
+   * label, channel, timestamp and emoji first, then the control's entry.
+   * Undefined when none matches, so the request is answered as ever.
+   */
+  function matchPair(label: string, channel: string | undefined, timestamp: string | undefined, name: string | undefined): PairMatch | undefined {
+    if (channel === undefined || timestamp === undefined || name === undefined) return undefined
+    const same = (entry: StubReactionPair): boolean =>
+      entry.label === label && entry.channel === channel && entry.timestamp === timestamp && entry.name === name
+    for (const state of pairStates.values()) {
+      if (state.phase === 'pending' && same(state.entry)) return { state }
+    }
+    const entry = (control.reaction_pairs ?? []).find(same)
+    if (entry === undefined) return undefined
+    const definition = pairDefinition(entry)
+    const known = pairStates.get(entry.id)
+    if (known === undefined) {
+      const state: PairState = { entry, definition, phase: 'idle', arrivals: 0 }
+      pairStates.set(entry.id, state)
+      return { state }
+    }
+    if (known.definition !== definition) return { failure: 'reused', entry }
+    return known.phase === 'idle' ? { state: known } : { failure: 'exhausted', entry }
+  }
+
+  /** End a held first request with `outcome`; nothing when none is held. */
+  function settlePair(state: PairState, outcome: 'paired' | PairFailure): void {
+    const release = state.release
+    if (release === undefined) return
+    state.release = undefined
+    if (state.timer !== undefined) clearTimeout(state.timer)
+    state.timer = undefined
+    state.phase = outcome === 'paired' ? 'complete' : 'failed'
+    release(outcome)
+  }
+
+  /** Wait `ms`, or less when the stub stops; true when it stopped. */
+  function pairWait(ms: number): Promise<boolean> {
+    return new Promise(resolve => {
+      const done = (): void => {
+        clearTimeout(timer)
+        pairWaits.delete(done)
+        resolve(pairsStopped)
+      }
+      const timer = setTimeout(done, ms)
+      pairWaits.add(done)
+    })
   }
 
   function refusePush(label: string | null, reason: PushRefusalReason): Response {
@@ -953,6 +1176,65 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
       ...pushFlagFields(flag),
     })
     return Response.json({ ok: true, envelope_id: envelopeId, event_id: eventId })
+  }
+
+  /**
+   * Answer one `reactions.add` of a pair: the first is held until the
+   * second arrives, then both get their configured answers in arrival order,
+   * REACTION_PAIR_ANSWER_GAP_MS apart. Every other outcome is a failure
+   * answer and a `fail` line, never a configured answer.
+   */
+  async function answerPair(
+    match: PairMatch,
+    auth: string,
+    fields: Record<string, unknown>,
+    answer: (name: string, body: Record<string, unknown> | undefined, status?: number) => Response,
+    failWith: (code: string) => Response,
+  ): Promise<Response> {
+    if ('failure' in match) {
+      fields.pair_id = pushFieldText(match.entry.id)
+      recordPair(match.entry, { phase: 'fail', slot: null, outcome: match.failure, answer_mono_ms: performance.now() })
+      return failWith(`stub_pair_${match.failure}`)
+    }
+    const { state } = match
+    const { entry } = state
+    const arrivalMonoMs = performance.now()
+    state.arrivals += 1
+    const slot = state.arrivals
+    fields.pair_id = pushFieldText(entry.id)
+    fields.pair_slot = slot
+    recordPair(entry, { phase: 'arrive', slot, held: slot - 1, arrival_mono_ms: arrivalMonoMs })
+    const fail = (outcome: PairFailure, slotOf: number | null, code = `stub_pair_${outcome}`): Response => {
+      recordPair(entry, { phase: 'fail', slot: slotOf, outcome, answer_mono_ms: performance.now() })
+      return failWith(code)
+    }
+    const configured = (of: number): Response => {
+      const name = entry.answers[of - 1]
+      recordPair(entry, { phase: 'answer', slot: of, answer: name, answer_mono_ms: performance.now() })
+      return name === 'ok' ? answer('ok', { ok: true }) : failWith(name)
+    }
+    if (pairsStopped) {
+      state.phase = 'failed'
+      settlePair(state, 'stopped')
+      return fail('stopped', slot)
+    }
+    if (auth !== 'ok') {
+      // The token's own refusal; the pair cannot complete, so a held first request fails with it.
+      state.phase = 'failed'
+      settlePair(state, 'refused')
+      return fail('refused', slot, auth)
+    }
+    if (slot === 1) {
+      state.phase = 'pending'
+      const outcome = await new Promise<'paired' | PairFailure>(resolve => {
+        state.release = resolve
+        state.timer = setTimeout(() => settlePair(state, 'timeout'), REACTION_PAIR_TIMEOUT_MS)
+      })
+      return outcome === 'paired' ? configured(1) : fail(outcome, 1)
+    }
+    settlePair(state, 'paired')
+    if (await pairWait(REACTION_PAIR_ANSWER_GAP_MS)) return fail('stopped', 2)
+    return configured(2)
   }
 
   refreshControl()
@@ -1078,6 +1360,10 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
       }
 
       const auth = answers.auth ?? 'ok'
+      if (method === 'reactions.add') {
+        const pair = matchPair(label, args.channel, args.timestamp, args.name)
+        if (pair !== undefined) return await answerPair(pair, auth, fields, answer, failWith)
+      }
       if (auth !== 'ok') return failWith(auth)
 
       const configuredError = method === 'conversations.info' ? ownEntry(control.channels, args.channel ?? 'C0STUBCHAN')?.error
@@ -1157,6 +1443,9 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
     async stop() {
       if (stopped) return
       stopped = true
+      pairsStopped = true
+      for (const state of pairStates.values()) settlePair(state, 'stopped')
+      for (const done of [...pairWaits]) done()
       for (const ws of sockets) ws.close(1001, 'stub stopping')
       await server.stop(true)
       record('stop')

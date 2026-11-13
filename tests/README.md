@@ -439,7 +439,11 @@ tests/
     test-50-reaction-notices.sh    # shared mode, live against the Slack stub, two personas from the first start: Reaction Notices typed and receipted exactly
                                    # (Tool Posts in a listed, threaded, DM and mentions-only conversation), FIFO with ordinary items while alpha is held
                                    # (displayed-states hooks), dedupe across a restart, no acknowledgement or Reply Reminder, react on a delivered
-                                   # message in its open turn, a forged opener escaped, silent/logged drops and withdrawals in both channel modes, L1/L7 keeps
+                                   # message in its open turn, a forged opener escaped, silent/logged drops and withdrawals in both channel modes, L1/L7 keeps;
+                                   # rerun against Epic t1.1b3.99's react claim, that react leg is its AC6 evidence. Bot-to-Bot: bravo's react on alpha's
+                                   # real Tool Post brings alpha one empty-body notice naming bravo (persona name, bot user ID) and Slack's own event for it
+                                   # none; two overlapping react calls (ok then already_reacted, and the reverse) bring one notice each with unchanged
+                                   # results; bravo's react on its own post brings neither persona anything
     lib/
       displayed-states.sh          # contained setup, runtime provenance and success/failure leak checks before closing diagnostics and driver evidence release
       real-scenario.sh             # native agent setup, minimal permissions, exact evidence, faults, bounds and once-only EXIT accounting
@@ -484,13 +488,16 @@ tests/
       stub-mcp-session.ts          # the stub's MCP session client, copied beside the stub in every fmk script and Tests 29 and 50: connects to the bot server named by the stub's
                                    # `--mcp-config` with the package's own MCP SDK and holds the session until the stub ends; records every channel notification
                                    # in a per-directory delivery record and calls the tools the harness writes to a per-directory request file, one result line
-                                   # each (see The stub worker); refuses to run without the image marker /etc/cscb-ci-image and imports the
+                                   # each (see The stub worker), in order one at a time unless the per-directory stub-mcp-concurrency.<key>.json
+                                   # (`{"max_in_flight":2}`) lets two run at once; refuses to run without the image marker /etc/cscb-ci-image and imports the
                                    # package only after that check
       slack-stub-server.ts         # the loopback Slack stub of Test 0, Tests 10, 12, 29 and 50 and the fmk scenarios: Web API, apps.connections.open, Socket Mode WebSocket, JSONL record
                                    # (each `chat.postMessage` text whole, token-redacted); the push control `POST /_push`, which sends one Socket Mode
                                    # `events_api` envelope over a label's newest open WebSocket (see Slack stub); the control's `users`, `channels`
                                    # (conversation kind, sharing or a Slack error) and `replies` (an exact-ts message, error or none) answer the
-                                   # lookups Test 50's Reaction Notices read, recorded with their reads' arguments
+                                   # lookups Test 50's Reaction Notices read, recorded with their reads' arguments; `reaction_pairs` holds a label's first
+                                   # matching `reactions.add` until its second arrives, then answers them ok/already_reacted in the configured order, with
+                                   # `reaction-pair` arrival and answer records
       phase1-client-check.ts       # run by Test 1 on the installed package, after the client-under-test check
                                    # against the agent-director client the installed package resolves: the client exports seven classes and the package's re-exports of them are the client's own,
                                    # client-built errors classify by class, the description and predicate helpers hold; refuses to run without the image marker /etc/cscb-ci-image

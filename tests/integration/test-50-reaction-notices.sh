@@ -23,8 +23,8 @@
 # AC8 instead appends `receipt-only` (the record, no Stop) and later `stop`.
 # CSCB types only into a `waiting` row, so a later typed item shows the turn
 # ended. bravo's stub runs `at-once` (immediate receipts) and is the Run Bot
-# Identity reactor; Epic t1.1b3.99 adds its Bot-to-Bot leg (insertion point
-# below).
+# Identity reactor; in the Bot-to-Bot leg its react tool reacts on alpha's
+# Tool Posts and on its own post.
 #
 # Legs (each numbered as the Epic acceptance criterion it protects):
 # - AC1: alpha's real reply-tool Tool Posts in a listed `all` channel, in a
@@ -43,7 +43,9 @@
 #   `receipt-only`, the turn still open) and its delivered-stage
 #   acknowledgement seen; alpha's react tool on it, then Stop: the tracked
 #   stage removed, the chosen emoji kept and, once the row is `waiting`
-#   again, no Reply Reminder.
+#   again, no Reply Reminder. Rerun against Epic t1.1b3.99's react claim,
+#   this leg is that Epic's AC6 (the claim's hand-off read of the user's
+#   message on alpha's client, and no Reaction Item from it).
 # - AC2: while alpha is held on an ordinary message, two users' thumbsup on
 #   one message, an ordinary message, a second emoji from one user and that
 #   user's thumbsup removed: each accepted in push order, nothing typed early;
@@ -59,19 +61,33 @@
 # - AC3: one reaction event pushed twice, a plain restart, then again: three
 #   ACKed envelopes, one accepted item, received line and typed notice, one
 #   preparation.
+# - Epic t1.1b3.99 (declarative, in BB, listed by both personas): AC1:
+#   bravo's react on alpha's real Tool Post: one bot-tool Reaction Item
+#   (origin, bravo's bot user and persona name, an observed-time ts), bravo's
+#   hand-off read then alpha's preparation read, one received line and one
+#   empty-body notice typed and receipted; after the receipt, Slack's own
+#   reaction_added for it (its own event ts) ACKed and no second item, line
+#   or notice. AC3 (self-author part): bravo's react on its own post: the
+#   hand-off reads it, nothing reaches either persona. AC2: with only bravo's
+#   MCP client running two calls at once, two overlapping react calls per
+#   fresh Tool Post, Slack answering ok then already_reacted and the reverse
+#   (the second request arrives before the first is answered): two unchanged
+#   results and one notice each. The overlap notices are the later positive
+#   progress for the AC1 and AC3 negatives.
 # - Fungible (AC5): an externally shared envelope is a logged fungible-refused
 #   drop; sharing learned from conversations.info and a failed lookup are
 #   withdrawn (fungible-refused externally-shared, conversation-unknown); a
 #   successor passes.
 # - Closing: no RAW line and no message-received line for any reaction, no
-#   acknowledgement on any notice's message or event ts, no reminder for any
-#   notice; bravo accepted, received and was typed no reaction (its journal
+#   acknowledgement on any notice's message or event ts (bravo's react calls
+#   aside), no reminder for any notice; bravo accepted, received and was typed no reaction (its journal
 #   saved before the restart included); `stop --stop-bots`; the port closed;
 #   no token-like text.
 #
 # Own client. Every preparation read and API call the script counts is
 # counted on alpha's label and in all, and the two must agree, so a read
-# through bravo's Slack client fails.
+# through bravo's Slack client fails. The Bot-to-Bot leg counts bravo's
+# hand-off reads, posts and react calls on bravo's label, by name.
 #
 # Runtime rules. Every wait polls (wait_until / wait_for_*) and returns once
 # its condition holds. Every negative verdict is read after the event's own
@@ -155,6 +171,7 @@ GD="G0${CH_TAG}GD"          # alpha: a listed group DM (is_mpim)
 UN="C0${CH_TAG}UN"          # listed by no persona
 DMA="D0${CH_TAG}AD"         # alpha's DM (dm.enabled)
 B1="C0${CH_TAG}B1"          # bravo: listed `mentions`
+BB="C0${CH_TAG}BB"          # Bot-to-Bot: listed by alpha (`all`) and bravo (`mentions`)
 FX="C0${CH_TAG}FX"          # fungible: the envelope flag true
 FS="C0${CH_TAG}FS"          # fungible: externally shared by conversations.info
 FU="C0${CH_TAG}FU"          # fungible: conversations.info fails
@@ -166,7 +183,7 @@ BRAVO_BOT_ID="B0${CH_TAG}BRAVO"
 HUMAN="U0${CH_TAG}HUMAN"     # the usual reactor and every message's author; alpha's dm.contact
 HUMAN2="U0${CH_TAG}SECOND"   # a second user
 CONTACT="U0${CH_TAG}CONTACT" # bravo's dm.contact
-for id in "${LA}" "${LM}" "${LX}" "${LF}" "${GD}" "${UN}" "${DMA}" "${B1}" "${FX}" "${FS}" "${FU}" "${FP}" \
+for id in "${LA}" "${LM}" "${LX}" "${LF}" "${GD}" "${UN}" "${DMA}" "${B1}" "${BB}" "${FX}" "${FS}" "${FU}" "${FP}" \
     "${ALPHA_BOT_USER}" "${ALPHA_BOT_ID}" "${BRAVO_BOT_USER}" "${BRAVO_BOT_ID}" "${HUMAN}" "${HUMAN2}" "${CONTACT}"; do
     [[ "${id}" =~ ^[A-Z0-9]{1,24}$ ]] || fail "ID ${id} is not 1 to 24 characters from A-Z0-9"
 done
@@ -388,14 +405,30 @@ elif cmd == "key-count":         # <journal> <chat> <message-ts> <reactor> <emoj
 elif cmd == "reaction-seqs":     # <journal>…: every Reaction Item's seq, one per line
     for seq in sorted({f[0] for f in reaction_facts(a)}):
         print(seq)
-elif cmd == "notice-acks":       # <record> <journal>…: reactions.add/remove on a notice's message or event ts
-    facts = reaction_facts(a[1:])
+elif cmd == "reaction-count":    # <chat> <message-ts> <journal>…: Reaction Items on that message, compacted ones included
+    n = 0
+    for path in a[2:]:
+        n += sum(1 for _, c, m, _e in reaction_facts([path]) if c == a[0] and m == a[1])
+    print(n)
+elif cmd == "bot-tool-seqs":     # <journal> <chat> <message-ts>: live bot-tool Reaction Items on that message
+    for r in records(a[0]):
+        if r.get("kind") == "accepted" and r.get("compact") is None and r.get("source") == "reaction" \
+                and r.get("origin") == "bot-tool" and r.get("channel") == a[1] and r.get("message_ts") == a[2]:
+            print(r["seq"])
+elif cmd == "notice-acks":       # <record> <except> <journal>…: reactions.add/remove on a notice's message or event ts
+    # <except>: "-", or comma-separated field=value specs of the calls a Bot's own react tool made, not acknowledgements.
+    facts = reaction_facts(a[2:])
     targets = {(c, t) for _, c, m, e in facts for t in (m, e)}
+    skip = [] if a[1] == "-" else a[1].split(",")
     hits = [r for r in records(a[0]) if r.get("event") == "api" and r.get("method") in ("reactions.add", "reactions.remove")
-            and (r.get("channel"), r.get("timestamp")) in targets]
+            and (r.get("channel"), r.get("timestamp")) in targets and not (skip and matches(r, skip))]
     for r in hits:
         print(json.dumps({k: r.get(k) for k in ("method", "channel", "timestamp", "name")}), file=sys.stderr)
     print(len(hits))
+elif cmd == "content-count":     # <fragment> <transcript>…: user records whose text holds <fragment>
+    print(sum(1 for path in a[1:] for t in records(path)
+              if t.get("type") == "user" and isinstance((t.get("message") or {}).get("content"), str)
+              and a[0] in t["message"]["content"]))
 elif cmd == "notice-records":    # <transcript>…: user records typed as a Reaction Notice (the tag's head says so)
     n = 0
     for path in a:
@@ -427,9 +460,24 @@ elif cmd == "rec-after":         # <record> <mark> <field>=<value>…: matching 
     except FileNotFoundError:
         pass
     print(n)
+elif cmd == "rec-seqs":          # <record> <mark> <field>=<value>…: the seq of each matching line after line <mark>
+    try:
+        with open(a[0], errors="replace") as f:
+            for i, line in enumerate(f):
+                if i < int(a[1]):
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and matches(rec, a[2:]):
+                    print(rec.get("seq"))
+    except FileNotFoundError:
+        pass
 elif cmd == "rec-show":          # <record> <field>=<value>…: the safe fields of matching lines
     keep = ("seq", "event", "label", "method", "envelope_id", "event_type", "channel", "timestamp", "name",
-            "request_ts", "oldest", "latest", "inclusive", "include_all_metadata", "thread_ts", "answer", "status", "flag")
+            "request_ts", "oldest", "latest", "inclusive", "include_all_metadata", "thread_ts", "answer", "status", "flag",
+            "pair_id", "pair_slot", "phase", "slot", "held", "outcome")
     for rec in records(a[0]):
         if matches(rec, a[1:]):
             print(json.dumps({k: rec[k] for k in keep if k in rec}))
@@ -547,6 +595,7 @@ new_ts() {
 # --- The stub's control (users, channels, replies), rewritten whole --------
 CTL_CHANNELS='{}'
 CTL_REPLIES='{}'
+CTL_PAIRS='[]'
 ALPHA_SUFFIX="${SCENARIO_TAG}alpha"
 BRAVO_SUFFIX="${SCENARIO_TAG}bravo"
 # set_channel <id> <entry-json>; set_reply <channel> <ts> <entry-json>
@@ -574,13 +623,14 @@ control_write() {
     jq -n --arg asuf "${ALPHA_SUFFIX}" --arg al "${ALPHA_LABEL}" --arg au "${ALPHA_BOT_USER}" --arg ab "${ALPHA_BOT_ID}" \
         --arg bsuf "${BRAVO_SUFFIX}" --arg bl "${BRAVO_LABEL}" --arg bu "${BRAVO_BOT_USER}" --arg bb "${BRAVO_BOT_ID}" \
         --arg h "${HUMAN}" --arg hn "${HUMAN_NAME}" --arg h2 "${HUMAN2}" --arg h2n "${HUMAN2_NAME}" \
-        --argjson channels "${CTL_CHANNELS}" --argjson replies "${CTL_REPLIES}" \
+        --argjson channels "${CTL_CHANNELS}" --argjson replies "${CTL_REPLIES}" --argjson pairs "${CTL_PAIRS}" \
         '{tokens: [
             {suffix: $asuf, label: $al, auth: "ok", connections: "ok", user_id: $au, bot_id: $ab},
             {suffix: $bsuf, label: $bl, auth: "ok", connections: "ok", user_id: $bu, bot_id: $bb}],
           default: {auth: "invalid_auth", connections: "invalid_auth"},
           users: {($h): {name: "human", profile: {display_name: $hn}}, ($h2): {name: "second", profile: {display_name: $h2n}}},
-          channels: $channels, replies: $replies}' | write_file "${STUB_CONTROL}" \
+          channels: $channels, replies: $replies}
+         + (if ($pairs | length) > 0 then {reaction_pairs: $pairs} else {} end)' | write_file "${STUB_CONTROL}" \
         || fail "$1: could not write the stub's control file"
     if [[ -n "${SCENARIO_SLACK_STUB_URL:-}" ]]; then
         wait_until "${RECORD_WAIT_S}" "$1: the stub never loaded the new control" control_loaded $(( before + 1 ))
@@ -868,7 +918,7 @@ leak_files() {
         "${STUB_BIN}/stub-mcp-session.log" "${STUB_BIN}/${SCENARIO_STUB_DELIVERIES_PREFIX}"* \
         "${STUB_BIN}/${SCENARIO_STUB_REQUESTS_PREFIX}"* "${STUB_BIN}/${SCENARIO_STUB_RESULTS_PREFIX}"* \
         "${STUB_BIN}"/stub-claude-launches.jsonl "${STUB_BIN}"/stub-claude-hooks.* \
-        "${ALPHA_TRANSCRIPTS}"/*.jsonl "${BRAVO_TRANSCRIPTS}"/*.jsonl)
+        "${ALPHA_TRANSCRIPTS}"/*.jsonl "${BRAVO_TRANSCRIPTS}"/*.jsonl "${SCENARIO_ROOT}"/b2b-result-*)
     shopt -u nullglob
 }
 # Exit hook 2, on pass and on failure: the same scan once every writer is
@@ -944,7 +994,8 @@ write_persona_config() {
         { "id": "${LM}", "delivery": "mentions" },
         { "id": "${LX}", "delivery": "all" },
         { "id": "${LF}", "delivery": "all" },
-        { "id": "${GD}", "delivery": "all" }
+        { "id": "${GD}", "delivery": "all" },
+        { "id": "${BB}", "delivery": "all" }
       ],
       "dm": { "enabled": true, "contact": "${HUMAN}" },
       "permission_prompts": "${LA}"${invited}
@@ -953,7 +1004,7 @@ write_persona_config() {
       "name": "${BRAVO}",
       "credentials_file": "${BRAVO_CREDS}",
       "working_directory": "${BRAVO_DIR}",
-      "channels": [{ "id": "${B1}", "delivery": "mentions" }],
+      "channels": [{ "id": "${B1}", "delivery": "mentions" }, { "id": "${BB}", "delivery": "mentions" }],
       "dm": { "enabled": true, "contact": "${CONTACT}" },
       "permission_prompts": "dm"
     }
@@ -1139,12 +1190,21 @@ expect_api "AC8: the queued acknowledgement replaced by the delivered one" 0 1 \
 # The delivery made the message a Reply Reminder candidate.
 [[ "$(ev reminder-states "${ALPHA_JOURNAL}" "${AC8_SEQ}")" =~ ^observed( observed)*$ ]] \
     || fail "AC8: before the react, the message's reminder records read '$(ev reminder-states "${ALPHA_JOURNAL}" "${AC8_SEQ}")', expected observed only"
+# Epic t1.1b3.99 AC6: this react now goes through the claim (the kept-answer
+# memory consumeAck keeps) and, as a first answer, the hand-off's read of the
+# message on alpha's own client; the message reads back as the user's, so the
+# hand-off skips it.
+set_reply "${LA}" "${AC8_TS}" "$(jq -c -n --arg t "${AC8_TS}" --arg u "${HUMAN}" '{message: {ts: $t, user: $u}}')"
+control_write "AC8: the message as conversations.replies returns it"
 AC8_EMOJI=eyes
 call_tool "${ALPHA_DIR}" react "$(jq -c -n --arg c "${LA}" --arg m "${AC8_TS}" --arg e "${AC8_EMOJI}" '{chat_id: $c, message_id: $m, emoji: $e}')"
 [[ "${CALL_IS_ERROR}" == false && "${CALL_TEXT}" == "Reacted :${AC8_EMOJI}: to ${AC8_TS}" ]] \
     || fail "AC8: alpha's react answered '${CALL_TEXT}'"
+AC8_REACT_TEXT="${CALL_TEXT}"
 wait_until "${EVENT_WAIT_S}" "AC8: the delivered-stage acknowledgement was never removed" \
     ac8_api reactions.remove "${DELIVERED_ACK}"
+wait_until "${EVENT_WAIT_S}" "AC8 (Epic t1.1b3.99 AC6): the react's claim never reached the hand-off (no read of the message on alpha's client)" \
+    rec_at_least 1 event=api label="${ALPHA_LABEL}" method=conversations.replies channel="${LA}" request_ts="${AC8_TS}"
 [[ "$(ev reminder-states "${ALPHA_JOURNAL}" "${AC8_SEQ}")" =~ ^observed( observed)*( replied)+$ ]] \
     || fail "AC8: after the react, the message's reminder records read '$(ev reminder-states "${ALPHA_JOURNAL}" "${AC8_SEQ}")', expected replied last"
 printf '%s\n' "${STOP_COMMAND}" >> "${ALPHA_HOOK_CONTROL}"
@@ -1172,7 +1232,11 @@ done
 [[ "$(ev nudges "${ALPHA_JOURNAL}" "${AC8_SEQ}")" == 0 ]] || fail "AC8: a Reply Reminder was injected for the message"
 [[ "$(ev reminder-states "${ALPHA_JOURNAL}" "${AC8_SEQ}")" =~ ^observed( observed)*( replied)+$ ]] \
     || fail "AC8: after the Stop, the message's reminder records read '$(ev reminder-states "${ALPHA_JOURNAL}" "${AC8_SEQ}")', expected nothing after replied"
+expect_api "AC8 (Epic t1.1b3.99 AC6): the claim's one hand-off read of the message" 0 1 method=conversations.replies request_ts="${AC8_TS}"
+[[ "$(ev reaction-count "${LA}" "${AC8_TS}" "${ALPHA_JOURNAL}" "${BRAVO_JOURNAL}")" == 0 ]] \
+    || fail "AC8 (Epic t1.1b3.99 AC6): alpha's react on the user's message brought a Reaction Item"
 evidence "AC8: $(ev rec-show "${STUB_RECORD}" event=api channel="${LA}" timestamp="${AC8_TS}" | tr '\n' ' ')"
+evidence "Epic t1.1b3.99 AC6 (this AC8 leg, rerun against the react claim): seq ${AC8_SEQ} receipted; ${QUEUED_ACK} and ${DELIVERED_ACK} each added and removed once on alpha's client, ${AC8_EMOJI} added and kept; react answered '${AC8_REACT_TEXT}'; the claim's hand-off read $(ev rec-show "${STUB_RECORD}" event=api method=conversations.replies request_ts="${AC8_TS}" | tr '\n' ' '); reminder states '$(ev reminder-states "${ALPHA_JOURNAL}" "${AC8_SEQ}")', 0 nudges; completion: Stop, then seq ${H0_SEQ} typed into the waiting row"
 
 AC2_MARK="$(rec_lines)"
 declare -a AC2_SEQS=() AC2_TAGS=() AC2_TSS=() AC2_WHO=()
@@ -1418,6 +1482,237 @@ for kind in fixed sent delivered; do
 done
 evidence "AC3: envelopes ${DUP_ENVELOPES[*]} each ACKed once; one item seq ${DUP_SEQ}; ${DUP_RECEIVED}"
 
+# --- Epic t1.1b3.99: Bot-to-Bot (bravo's react tool on alpha's Tool Posts) ----
+# Declarative, after AC3's restart (both personas' sockets, auth.test and MCP
+# sessions confirmed there), in BB: listed by alpha (`all`) and bravo
+# (`mentions`), so bravo's react is in its scope and alpha serves the
+# conversation. Each target is a fresh message and tuple, within the
+# kept-answer lifetime; the Slack event and the overlap pairs come after the
+# first notice's receipt. Every read and call here is counted by label.
+E99="Epic t1.1b3.99"
+BB_NAME="$(stub_name "${BB}")"
+react_args() {
+    jq -c -n --arg c "$1" --arg m "$2" --arg e "$3" '{chat_id: $c, message_id: $m, emoji: $e}'
+}
+# b2b_result_ok <step> <message-ts>: CALL_IS_ERROR/CALL_TEXT are bravo's react result, unchanged.
+b2b_result_ok() {
+    [[ "${CALL_IS_ERROR}" == false && "${CALL_TEXT}" == "Reacted :${EMOJI_CHECK}: to $2" ]] \
+        || fail "$1: bravo's react answered '${CALL_TEXT}' (isError ${CALL_IS_ERROR}), expected 'Reacted :${EMOJI_CHECK}: to $2'"
+}
+# bravo_react <step> <message-ts>: bravo's react tool on a BB message (B2B_T0 the second before).
+bravo_react() {
+    B2B_T0="$(date +%s)"
+    call_tool "${BRAVO_DIR}" react "$(react_args "${BB}" "$2" "${EMOJI_CHECK}")"
+    b2b_result_ok "$1" "$2"
+}
+# b2b_post <step> <dir> <label> <text>: a reply-tool post in BB through that persona's
+# session, its chat.postMessage on that persona's client only; POST_TS its ts.
+b2b_post() {
+    local step="$1" mark re
+    mark="$(rec_lines)"
+    call_tool "$2" reply "$(jq -c -n --arg c "${BB}" --arg t "$4" '{chat_id: $c, text: $t}')"
+    re="^Sent 1 message\\(s\\) to ${BB} \\[ts: ([0-9]+\\.[0-9]{6})\\]$"
+    [[ "${CALL_IS_ERROR}" == false && "${CALL_TEXT}" =~ ${re} ]] \
+        || fail "${step}: the reply to ${BB} answered '${CALL_TEXT}' (isError ${CALL_IS_ERROR})"
+    POST_TS="${BASH_REMATCH[1]}"
+    [[ "$(rec_after "${mark}" event=api label="$3" method=chat.postMessage channel="${BB}")" == 1 \
+        && "$(rec_after "${mark}" event=api method=chat.postMessage channel="${BB}")" == 1 ]] \
+        || fail "${step}: the post was not one chat.postMessage in ${BB} on $3's client"
+}
+one_bot_tool_item() {
+    [[ "$(ev bot-tool-seqs "${ALPHA_JOURNAL}" "${BB}" "$1" | wc -l)" == 1 ]]
+}
+# replies_reads <mark> <label> <message-ts>: that label's conversations.replies for the
+# message since <mark>, with the reacted-ts bounds (wire strings).
+replies_reads() {
+    rec_after "$1" event=api label="$2" method=conversations.replies channel="${BB}" \
+        request_ts="$3" oldest="$3" latest="$3" inclusive=true include_all_metadata=true
+}
+# b2b_notice <step> <message-ts> <mark>: bravo's react on alpha's message (made since
+# <mark>) brings alpha one bot-tool Reaction Item, one received line and one notice,
+# typed and receipted; B2B_SEQ, B2B_EVENT_TS, B2B_TAG.
+b2b_notice() {
+    local step="$1" msg="$2" mark="$3" fv f v got last_b first_a
+    wait_until "${EVENT_WAIT_S}" "${step}: no bot-tool Reaction Item accepted at alpha for ${BB} ts ${msg}" one_bot_tool_item "${msg}"
+    B2B_SEQ="$(ev bot-tool-seqs "${ALPHA_JOURNAL}" "${BB}" "${msg}")"
+    B2B_EVENT_TS="$(ev field "${ALPHA_JOURNAL}" "${B2B_SEQ}" ts)"
+    [[ "${B2B_EVENT_TS}" =~ ^[0-9]+\.[0-9]{6}$ && "${B2B_EVENT_TS}" != "${msg}" ]] \
+        || fail "${step}: seq ${B2B_SEQ}'s event ts '${B2B_EVENT_TS}' is not an observed time with six fractional digits, distinct from the message ts ${msg}"
+    (( ${B2B_EVENT_TS%.*} >= B2B_T0 && ${B2B_EVENT_TS%.*} <= $(date +%s) )) \
+        || fail "${step}: seq ${B2B_SEQ}'s event ts ${B2B_EVENT_TS} is not between the react call (${B2B_T0}) and now"
+    # The durable acceptance: SR-6.2's fields and origin.
+    for fv in "source reaction" "origin bot-tool" "change added" "emoji ${EMOJI_CHECK}" "channel ${BB}" "message_ts ${msg}" \
+        "user ${BRAVO_BOT_USER}" "reactor_persona_name ${BRAVO}"; do
+        read -r f v <<< "${fv}"
+        got="$(ev field "${ALPHA_JOURNAL}" "${B2B_SEQ}" "${f}")"
+        [[ "${got}" == "${v}" ]] || fail "${step}: seq ${B2B_SEQ}'s accepted record has ${f} '${got}', expected '${v}'"
+    done
+    [[ "$(ev reaction-count "${BB}" "${msg}" "${ALPHA_JOURNAL}")" == 1 && "$(ev reaction-count "${BB}" "${msg}" "${BRAVO_JOURNAL}")" == 0 ]] \
+        || fail "${step}: the message has other than one Reaction Item at alpha and none at bravo"
+    expect_received "${step}" "${BB}" "${msg}" added "${EMOJI_CHECK}" "${BRAVO_BOT_USER}" "${B2B_SEQ}"
+    B2B_TAG="$(expected_notice "${BB}" "${BB_NAME}" "${msg}" "${BRAVO}" "${BRAVO_BOT_USER}" "${B2B_EVENT_TS}" - added "${EMOJI_CHECK}")"
+    expect_fixed "${step}" "${B2B_SEQ}" "${B2B_TAG}"
+    # The hand-off's read on bravo's client, then the preparation's on alpha's; nothing else
+    # read the message, and the stored name took no users.info.
+    [[ "$(replies_reads "${mark}" "${BRAVO_LABEL}" "${msg}")" == 1 ]] \
+        || fail "${step}: $(replies_reads "${mark}" "${BRAVO_LABEL}" "${msg}") hand-off read(s) of the message on bravo's client, expected 1"
+    [[ "$(replies_reads "${mark}" "${ALPHA_LABEL}" "${msg}")" == 1 ]] \
+        || fail "${step}: $(replies_reads "${mark}" "${ALPHA_LABEL}" "${msg}") preparation read(s) of the message on alpha's client, expected 1"
+    [[ "$(rec_after "${mark}" event=api method=conversations.replies request_ts="${msg}")" == 2 ]] \
+        || fail "${step}: the message was read other than twice (the hand-off's and the preparation's)"
+    last_b="$(ev rec-seqs "${STUB_RECORD}" "${mark}" event=api label="${BRAVO_LABEL}" method=conversations.replies request_ts="${msg}")"
+    first_a="$(ev rec-seqs "${STUB_RECORD}" "${mark}" event=api label="${ALPHA_LABEL}" method=conversations.replies request_ts="${msg}")"
+    (( last_b < first_a )) || fail "${step}: alpha's preparation read (seq ${first_a}) is not after bravo's hand-off read (seq ${last_b})"
+    expect_api "${step}: conversations.info for ${BB}" "${mark}" 1 method=conversations.info channel="${BB}"
+    [[ "$(rec_after "${mark}" event=api method=users.info user="${BRAVO_BOT_USER}")" == 0 ]] \
+        || fail "${step}: the stored reactor name took a users.info lookup"
+    notice_turn "${step}" "${B2B_SEQ}" "${B2B_TAG}" "${BB}" "${B2B_EVENT_TS}" "${BRAVO_BOT_USER}"
+    evidence "${step}: reads $(ev rec-show "${STUB_RECORD}" event=api method=conversations.replies request_ts="${msg}" | tr '\n' ' ')"
+}
+
+# AC1: bravo's react on alpha's real Tool Post.
+b2b_post "${E99} AC1: alpha's Tool Post in ${BB}" "${ALPHA_DIR}" "${ALPHA_LABEL}" "${TEST_NAME} bot-to-bot tool post"
+B2B_TS="${POST_TS}"
+set_reply "${BB}" "${B2B_TS}" "$(bot_message "${B2B_TS}")"
+control_write "${E99} AC1: alpha's Tool Post as conversations.replies returns it"
+B2B_MARK="$(rec_lines)"
+bravo_react "${E99} AC1: bravo's react on alpha's Tool Post" "${B2B_TS}"
+B2B_RESULT="${CALL_TEXT}"
+b2b_notice "${E99} AC1: bravo's react on alpha's Tool Post" "${B2B_TS}" "${B2B_MARK}"
+B2B_AC1_SEQ="${B2B_SEQ}"
+B2B_AC1_EVENT_TS="${B2B_EVENT_TS}"
+evidence "${E99} AC1: bravo's react answered '${B2B_RESULT}'; alpha seq ${B2B_AC1_SEQ} accepted $(jq -c -n --arg o "$(ev field "${ALPHA_JOURNAL}" "${B2B_AC1_SEQ}" origin)" --arg u "$(ev field "${ALPHA_JOURNAL}" "${B2B_AC1_SEQ}" user)" --arg n "$(ev field "${ALPHA_JOURNAL}" "${B2B_AC1_SEQ}" reactor_persona_name)" --arg t "${B2B_AC1_EVENT_TS}" '{origin: $o, user: $u, reactor_persona_name: $n, ts: $t}'); tag ${B2B_TAG}"
+
+# AC1: Slack's own reaction_added for that reaction, after the receipt: its own
+# event ts, so only the bot-reactor rule (not the queue key) can stop it.
+push_reaction "${E99} AC1: Slack's reaction_added for bravo's reaction" added "${BB}" "${B2B_TS}" "${BRAVO_BOT_USER}" "${EMOJI_CHECK}" "${ALPHA_BOT_USER}"
+B2B_SLACK_TS="${PUSH_TS}"
+B2B_SLACK_ENVELOPE="${PUSH_ENVELOPE}"
+[[ "${B2B_SLACK_TS}" != "${B2B_AC1_EVENT_TS}" ]] || fail "${E99} AC1: the Slack event shares the hand-off's event ts"
+evidence "${E99} AC1: Slack event push+ACK $(ev rec-show "${STUB_RECORD}" envelope_id="${B2B_SLACK_ENVELOPE}" | tr '\n' ' ')"
+
+# AC3 (self-author part): bravo's react on its own post; the hand-off reads it and stops.
+b2b_post "${E99} AC3: bravo's own post in ${BB}" "${BRAVO_DIR}" "${BRAVO_LABEL}" "${TEST_NAME} bravo's own post"
+B2B_SELF_TS="${POST_TS}"
+set_reply "${BB}" "${B2B_SELF_TS}" "$(jq -c -n --arg t "${B2B_SELF_TS}" --arg u "${BRAVO_BOT_USER}" --arg b "${BRAVO_BOT_ID}" \
+    '{message: {ts: $t, user: $u, bot_id: $b}}')"
+control_write "${E99} AC3: bravo's own post as conversations.replies returns it"
+B2B_SELF_MARK="$(rec_lines)"
+bravo_react "${E99} AC3: bravo's react on its own post" "${B2B_SELF_TS}"
+B2B_SELF_RESULT="${CALL_TEXT}"
+b2b_self_read() {
+    (( $(replies_reads "${B2B_SELF_MARK}" "${BRAVO_LABEL}" "${B2B_SELF_TS}") >= 1 ))
+}
+wait_until "${EVENT_WAIT_S}" "${E99} AC3: the hand-off never read bravo's own post on bravo's client" b2b_self_read
+
+# AC2: two overlapping react calls per pair, ok then already_reacted and the
+# reverse, on fresh Tool Posts. Only bravo's MCP client runs two calls at once.
+B2B_BRAVO_KEY="$(printf '%s' "$(realpath -e -- "${BRAVO_DIR}")" | sha256sum | cut -d ' ' -f 1)"
+B2B_ALPHA_KEY="$(printf '%s' "$(realpath -e -- "${ALPHA_DIR}")" | sha256sum | cut -d ' ' -f 1)"
+[[ -f "${STUB_BIN}/${SCENARIO_STUB_RESULTS_PREFIX}${B2B_BRAVO_KEY}${SCENARIO_STUB_RECORD_SUFFIX}" ]] \
+    || fail "${E99} AC2: bravo's MCP results record is not under the key ${B2B_BRAVO_KEY}"
+B2B_CONCURRENCY="${STUB_BIN}/stub-mcp-concurrency.${B2B_BRAVO_KEY}.json"
+[[ ! -e "${STUB_BIN}/stub-mcp-concurrency.${B2B_ALPHA_KEY}.json" ]] || fail "${E99} AC2: alpha's MCP client has a concurrency control"
+declare -a B2B_PAIR_IDS=(b2b_ok_first b2b_already_first) B2B_PAIR_TS=()
+declare -a B2B_PAIR_ANSWERS=("ok already_reacted" "already_reacted ok")
+for i in 0 1; do
+    b2b_post "${E99} AC2: alpha's Tool Post for pair ${B2B_PAIR_IDS[i]}" "${ALPHA_DIR}" "${ALPHA_LABEL}" "${TEST_NAME} overlap tool post $(( i + 1 ))"
+    B2B_PAIR_TS+=("${POST_TS}")
+    set_reply "${BB}" "${POST_TS}" "$(bot_message "${POST_TS}")"
+    read -r a1 a2 <<< "${B2B_PAIR_ANSWERS[i]}"
+    CTL_PAIRS="$(jq -c --arg id "${B2B_PAIR_IDS[i]}" --arg l "${BRAVO_LABEL}" --arg c "${BB}" --arg t "${POST_TS}" --arg n "${EMOJI_CHECK}" \
+        --arg a1 "${a1}" --arg a2 "${a2}" '. + [{id: $id, label: $l, channel: $c, timestamp: $t, name: $n, answers: [$a1, $a2]}]' <<< "${CTL_PAIRS}")"
+done
+[[ "${B2B_PAIR_TS[0]}" != "${B2B_PAIR_TS[1]}" ]] || fail "${E99} AC2: the two Tool Posts share a ts"
+control_write "${E99} AC2: the Tool Posts and their reaction pairs"
+printf '{"max_in_flight":2}\n' | write_file "${B2B_CONCURRENCY}"
+# A barrier: the poll after this call's result reads the concurrency control.
+call_tool "${BRAVO_DIR}" fetch_messages "$(jq -c -n --arg c "${BB}" '{channel: $c, limit: 1}')"
+
+declare -a B2B_PIDS=()
+b2b_calls_done() {
+    local pid
+    for pid in "${B2B_PIDS[@]}"; do
+        pid_alive "${pid}" && return 1
+    done
+    return 0
+}
+# b2b_pair <step> <pair-index>: the pair's two react calls at once, each to its own
+# result file under the scratch root; both settled, overlapped and answered as scripted.
+b2b_pair() {
+    local step="$1" id="${B2B_PAIR_IDS[$2]}" msg="${B2B_PAIR_TS[$2]}" mark args i pid line arrive2 answer1 api1 api2 a1 a2
+    read -r a1 a2 <<< "${B2B_PAIR_ANSWERS[$2]}"
+    mark="$(rec_lines)"
+    args="$(react_args "${BB}" "${msg}" "${EMOJI_CHECK}")"
+    B2B_T0="$(date +%s)"
+    B2B_PIDS=()
+    for i in 1 2; do
+        stub_session_call "${BRAVO_DIR}" react "${args}" \
+            > "${SCENARIO_ROOT}/b2b-result-${id}-${i}.json" 2> "${SCENARIO_ROOT}/b2b-result-${id}-${i}.err" &
+        B2B_PIDS+=("$!")
+        track_pid "$!"
+    done
+    wait_until $(( SCENARIO_STUB_CALL_S + 10 )) "${step}: bravo's two react calls did not both end" b2b_calls_done
+    for i in 1 2; do
+        pid="${B2B_PIDS[i - 1]}"
+        wait "${pid}" || fail "${step}: bravo's react call ${i} exited $?: $(tr '\n' ' ' < "${SCENARIO_ROOT}/b2b-result-${id}-${i}.err")"
+        stop_tracked_pid "${pid}" 5 "${step}: bravo's react call ${i} is still running"
+        line="$(cat -- "${SCENARIO_ROOT}/b2b-result-${id}-${i}.json")"
+        jq -e 'has("error") | not' <<< "${line}" > /dev/null \
+            || fail "${step}: bravo's react call ${i} ended without a tool result: $(jq -r '.error' <<< "${line}")"
+        CALL_IS_ERROR="$(jq -r '.isError' <<< "${line}")"
+        CALL_TEXT="$(jq -r '.text' <<< "${line}")"
+        b2b_result_ok "${step}: call ${i}" "${msg}"
+    done
+    # Overlap: the second request arrived (one held) before the first was answered.
+    arrive2="$(ev rec-seqs "${STUB_RECORD}" "${mark}" event=reaction-pair pair_id="${id}" phase=arrive slot=2 held=1)"
+    answer1="$(ev rec-seqs "${STUB_RECORD}" "${mark}" event=reaction-pair pair_id="${id}" phase=answer slot=1 answer="${a1}")"
+    [[ "${arrive2}" =~ ^[0-9]+$ && "${answer1}" =~ ^[0-9]+$ ]] \
+        || fail "${step}: pair ${id} has no single slot-2 arrival and slot-1 '${a1}' answer"
+    (( arrive2 < answer1 )) || fail "${step}: pair ${id}'s second request (seq ${arrive2}) arrived after the first was answered (seq ${answer1})"
+    [[ "$(rec_after "${mark}" event=reaction-pair pair_id="${id}" phase=fail)" == 0 ]] || fail "${step}: pair ${id} failed"
+    api1="$(ev rec-seqs "${STUB_RECORD}" "${mark}" event=api label="${BRAVO_LABEL}" method=reactions.add pair_id="${id}" pair_slot=1 answer="${a1}")"
+    api2="$(ev rec-seqs "${STUB_RECORD}" "${mark}" event=api label="${BRAVO_LABEL}" method=reactions.add pair_id="${id}" pair_slot=2 answer="${a2}")"
+    if ! [[ "${api1}" =~ ^[0-9]+$ && "${api2}" =~ ^[0-9]+$ ]] || (( api1 >= api2 )); then
+        fail "${step}: pair ${id}'s Slack answers were not '${a1}' then '${a2}' on bravo's client"
+    fi
+    [[ "$(rec_after "${mark}" event=api method=reactions.add channel="${BB}" timestamp="${msg}")" == 2 ]] \
+        || fail "${step}: other than two reactions.add for the message"
+    evidence "${step}: pair $(ev rec-show "${STUB_RECORD}" pair_id="${id}" | tr '\n' ' ')"
+    evidence "${step}: MCP results $(cat -- "${SCENARIO_ROOT}/b2b-result-${id}-1.json") $(cat -- "${SCENARIO_ROOT}/b2b-result-${id}-2.json")"
+    b2b_notice "${step}" "${msg}" "${mark}"
+}
+b2b_pair "${E99} AC2: ok then already_reacted" 0
+b2b_pair "${E99} AC2: already_reacted then ok" 1
+rm -f -- "${B2B_CONCURRENCY}"
+CTL_PAIRS='[]'
+
+# Read after the overlap notices, the later positive progress on alpha's
+# connection and through bravo's hand-off.
+# AC1: the Slack event brought no second item, line or notice.
+[[ "$(rec_count event=ws-message envelope_id="${B2B_SLACK_ENVELOPE}")" == 1 ]] || fail "${E99} AC1: the Slack event was not ACKed once"
+[[ "$(ev reaction-count "${BB}" "${B2B_TS}" "${ALPHA_JOURNAL}" "${BRAVO_JOURNAL}")" == 1 ]] \
+    || fail "${E99} AC1: alpha's Tool Post has other than one Reaction Item after the Slack event"
+[[ "$(ev key-count "${ALPHA_JOURNAL}" "${BB}" "${B2B_TS}" "${BRAVO_BOT_USER}" "${EMOJI_CHECK}" added "${B2B_SLACK_TS}")" == 0 ]] \
+    || fail "${E99} AC1: the Slack event was accepted"
+n="$(log_has_count "message_ts=\"${B2B_TS}\"")"
+[[ "${n}" == 1 ]] || fail "${E99} AC1: ${n} server.log lines name the Tool Post, expected only its one received line (no drop, withdrawal or hand-off failure)"
+n="$(ev content-count "message_id=\"${B2B_TS}\"" "${ALPHA_TRANSCRIPTS}"/*.jsonl)"
+[[ "${n}" == 1 ]] || fail "${E99} AC1: ${n} records typed into alpha name the Tool Post, expected 1"
+n="$(log_has_count "[slack] ${DELIVERED_LABEL}: persona=" "source=reaction chat_id=\"${BB}\" ts=\"${B2B_AC1_EVENT_TS}\"")"
+[[ "${n}" == 1 ]] || fail "${E99} AC1: ${n} ${DELIVERED_LABEL} lines for seq ${B2B_AC1_SEQ}, expected 1"
+evidence "${E99} AC1: after the Slack event (envelope ${B2B_SLACK_ENVELOPE}, event ts ${B2B_SLACK_TS}) and two later notices: 1 Reaction Item (seq ${B2B_AC1_SEQ}), 1 server.log line naming the message, 1 typed notice"
+# AC3: bravo's own post brought nothing to either persona.
+[[ "$(ev reaction-count "${BB}" "${B2B_SELF_TS}" "${ALPHA_JOURNAL}" "${BRAVO_JOURNAL}")" == 0 ]] \
+    || fail "${E99} AC3: bravo's react on its own post brought a Reaction Item"
+n="$(log_has_count "message_ts=\"${B2B_SELF_TS}\"")"
+[[ "${n}" == 0 ]] || fail "${E99} AC3: ${n} server.log line(s) name bravo's own post"
+n="$(ev content-count "message_id=\"${B2B_SELF_TS}\"" "${ALPHA_TRANSCRIPTS}"/*.jsonl "${BRAVO_TRANSCRIPTS}"/*.jsonl)"
+[[ "${n}" == 0 ]] || fail "${E99} AC3: ${n} typed record(s) name bravo's own post"
+[[ "$(replies_reads "${B2B_SELF_MARK}" "${BRAVO_LABEL}" "${B2B_SELF_TS}")" == 1 \
+    && "$(rec_count event=api method=conversations.replies request_ts="${B2B_SELF_TS}")" == 1 ]] \
+    || fail "${E99} AC3: bravo's own post was read other than once, by the hand-off on bravo's client"
+evidence "${E99} AC3: bravo's react on its own post ${B2B_SELF_TS} answered '${B2B_SELF_RESULT}'; hand-off read $(ev rec-show "${STUB_RECORD}" event=api method=conversations.replies request_ts="${B2B_SELF_TS}" | tr '\n' ' '); then 0 Reaction Items, 0 server.log lines, 0 typed records at either persona after two later notices"
 # --- Fungible mode (AC5) ---------------------------------------------------------
 check_switch_applied() {
     local applied_before
@@ -1464,10 +1759,6 @@ done
 [[ "$(log_has_count "[slack] ${REACTION_RECEIVED}: " "message_ts=\"${PFX}\"")" == 0 ]] || fail "fungible: the shared envelope's reaction was received"
 [[ "$(rec_count event=api method=conversations.replies request_ts="${PFX}")" == 0 ]] || fail "fungible: the shared envelope's reaction was prepared"
 
-# --- Insertion point: Epic t1.1b3.99's Bot-to-Bot leg ---------------------------
-# Both personas run from the first start; the later Epic adds bravo's
-# react-tool hand-off to alpha here, before the closing reads.
-
 # --- Closing reads (every writer still running; later legs are positive) --------
 expect_drained "closing"
 n="$(count_server_log "${RAW_REACTION}")"
@@ -1475,7 +1766,8 @@ n="$(count_server_log "${RAW_REACTION}")"
 (( $(count_server_log "${RAW_MESSAGE}") >= 1 )) || fail "closing: no RAW message line, the RAW control"
 n="$(log_has_count "[slack] ${RECEIVED_LABEL}: " "source=reaction")"
 [[ "${n}" == 0 ]] || fail "closing: ${n} ${RECEIVED_LABEL} line(s) for Reaction Items"
-n="$(ev notice-acks "${STUB_RECORD}" "${JOURNAL_BEFORE}" "${ALPHA_JOURNAL}")"
+# bravo's react tool calls are its deliberate reactions, not acknowledgements.
+n="$(ev notice-acks "${STUB_RECORD}" "label=${BRAVO_LABEL},method=reactions.add,name=${EMOJI_CHECK}" "${JOURNAL_BEFORE}" "${ALPHA_JOURNAL}")"
 [[ "${n}" == 0 ]] || fail "closing: ${n} reactions.add/remove call(s) on a notice's message or event ts"
 mapfile -t REACTION_SEQS < <(ev reaction-seqs "${JOURNAL_BEFORE}" "${ALPHA_JOURNAL}")
 (( ${#REACTION_SEQS[@]} >= 20 )) || fail "closing: only ${#REACTION_SEQS[@]} Reaction Items found"
