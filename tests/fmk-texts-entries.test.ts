@@ -2114,6 +2114,71 @@ test('test-46 builds its recovery requests with review IDs: the printer accepts 
   }
 }))
 
+// test-46's closing accounting (MI answers46): message-received is logged once
+// per server run, so an item still queued at a stop is logged again when the
+// next start recovers it. Runs split on the production start line.
+test('per-server-run accounting keeps the exact sets and allows a repeat only in a later server run', () => sharedPrinterControl(async ({ scratch, pkg, printer: { entryValue: print }, evidence }) => {
+  const f = await import(join(pkg, 'tests/test-helpers/delivery-queue.ts'))
+  const diag = await import(join(pkg, 'src/persona-diagnostics.ts'))
+  const identity = await import(join(pkg, 'src/persona-identity.ts'))
+  // The boundary precedes the delivery reporting that writes every
+  // message-received line, start-time releases of recovered holds included.
+  const server = readFileSync(join(pkg, 'src/server.ts'), 'utf8')
+  const startCall = 'console.error(`[slack] Loaded persona config: ${personaConfig.personas.length} persona(s)`)'
+  expect(server.split(startCall).length).toBe(2)
+  expect(server.indexOf(startCall)).toBeLessThan(server.indexOf('deliveryReporting = createDeliveryReporting('))
+  // The line that call logs: its template between the backticks with a
+  // persona count of 2, behind src/logging.ts's `[<ISO time>] ` prefix.
+  const start = '[2026-11-13T16:04:35.359Z] ' +
+    startCall.slice(startCall.indexOf('`') + 1, startCall.lastIndexOf('`')).replace('${personaConfig.personas.length}', '2')
+  const dir = mkdtempSync(join(scratch, 'runs-')), key = 'alpha', name = 'Alpha', channel = 'C0TEST001'
+  const journal = f.queuePath(dir, key), log = join(dir, 'server.log'), snapshot = join(dir, 'snapshot.jsonl'), expectations = join(dir, 'expected.jsonl')
+  const q = await f.makeQueue(dir, { now: () => 100 })
+  try {
+    let expected = ''
+    for (const ts of ['1794584146.055887', '1794584146.066438']) {
+      assert.equal((await q.accept(key, f.slackInput({ ts, key: { chat_id: channel, ts }, via: 'mention', received_at: 100 }))).status, 'accepted')
+      expected += await print('sharedDeliveryExpectation', [key, name, 'slack', channel, ts, 'U0TEST001', 'mention'])
+    }
+    writeFileSync(expectations, expected)
+    writeFileSync(snapshot, await print('sharedQueueSnapshot', [journal]))
+    evidence.files(expectations, snapshot)
+    const received = (item: any) => '[2026-11-13T16:04:36.000Z] ' + evidence.call(() =>
+      diag.buildDeliveryDiagnostic(diag.MESSAGE_RECEIVED, identity.renderPersonaRef(name, key), diag.deliveryIdentity(item)))
+    const [first, second] = q.items(key).map((item: any) => item.accepted)
+    const a = received(first), b = received(second), other = received({ ...first, ts: '1794584146.077777' })
+    const logs = (files: Record<string, string[]>) => {
+      for (const n of readdirSync(dir).filter(n => n.startsWith('server.log'))) rmSync(join(dir, n))
+      for (const [n, lines] of Object.entries(files)) writeFileSync(join(dir, n), lines.map(l => l + '\n').join(''))
+      evidence.files(...Object.keys(files).map(n => join(dir, n)))
+    }
+    const perRun = () => print('sharedAssertAccounting', ['--per-server-run', expectations, log, key, snapshot])
+    const refused = (pattern: RegExp, run = perRun) =>
+      assert.rejects(run(), (e: any) => { assert.equal(e.exitCode, 1); assert.match(e.message, pattern); return true })
+    // Recovered: B, still queued at the first run's stop, is logged again in
+    // the next run. Run 1 spans a rotation; files are read oldest first.
+    logs({ 'server.log.2': [start, a], 'server.log.1': [b, '[2026-11-13T16:04:37.000Z] [slack] Shutdown complete'], 'server.log': [start, b] })
+    assert.deepEqual(JSON.parse(await perRun()), { accepted: 2, received: 3, runs: 2, repeated: 1 })
+    // test-29's form keeps one line per identity over all runs.
+    await refused(/^exact received diagnostic set mismatch$/, () => print('sharedAssertAccounting', [expectations, log, key, snapshot]))
+    // A duplicate in one run, in one file or across a rotation with no start between.
+    logs({ 'server.log': [start, a, b, b] })
+    await refused(/^received diagnostic repeated within one server run \(identities=1\)$/)
+    logs({ 'server.log.1': [start, a, b], 'server.log': [b] })
+    await refused(/^received diagnostic repeated within one server run \(identities=1\)$/)
+    // Missing and extra identities.
+    logs({ 'server.log': [start, a] })
+    await refused(/^exact received diagnostic set mismatch \(missing=1 extra=0\)$/)
+    logs({ 'server.log': [start, a, b, other] })
+    await refused(/^exact received diagnostic set mismatch \(missing=0 extra=1\)$/)
+    // A line no start precedes, and a lost rotation, leave runs unknown.
+    logs({ 'server.log': [a, start, b] })
+    await refused(/^received diagnostic before any server start$/)
+    logs({ 'server.log.2': [start, a], 'server.log': [b] })
+    await refused(/^server log rotations are not contiguous$/)
+  } finally { await q.stop() }
+}))
+
 describe("test-47's refused starts and test-40's earlier release", () => {
   const exitCode = (code: number) => (err: unknown) => (err as { exitCode?: unknown }).exitCode === code
 

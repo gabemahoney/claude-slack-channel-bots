@@ -113,9 +113,11 @@
  *       Prints the installed delivery-notices.ts builder's production notice body.
  *   sharedDeliveryExpectation <key> <name> <slack|cron|interject> <channel-or-sender>
  *       <ts> <sender-id> <via-or-dash>   independently specified expected acceptance, JSONL
- *   sharedAssertAccounting <expectations-jsonl> <server-log> (<key> <queue-snapshot>)...
+ *   sharedAssertAccounting [--per-server-run] <expectations-jsonl> <server-log> (<key> <queue-snapshot>)...
  *       Exact full acceptance and received-diagnostic multisets using production text builders;
  *       compares source, sender and reason, including actual bot posts and injected work.
+ *       --per-server-run: the received set stays exact, but an identity may repeat in later
+ *       server runs (split on the start's `Loaded persona config` line), at most once per run.
  *   sharedExpectedParts <text> <ts> <user-id> <user-name> <channel> <channel-name> <via>
  *       <root-or-dash> <attachment-json-or-dash> independent production-built tag parts, JSON
  *   sharedAssertContent <key> <server-log> <queue-snapshot> <channel> <ts> <text>
@@ -5391,9 +5393,26 @@ const sharedDeliveryExpectation: Entry = {
       ...(via === '-' ? {} : { via }) }) + '\n'
   },
 }
+// src/server.ts main() logs this once per start, before it creates the
+// delivery reporting that writes every message-received line, the
+// start-time releases of recovered holds included.
+const SHARED_SERVER_START_RE = /^(?:\[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z\] )?\[slack\] Loaded persona config: (?:0|[1-9][0-9]*) persona\(s\)$/
+// Oldest first: the rotations `.K` … `.1` (src/logging.ts shifts each one
+// up), then the active file. Within a file, lines are in write order.
+function sharedLogsInOrder(path: string): string[] {
+  const rotated = sharedLogPaths(path).filter(p => p !== path)
+    .map(p => ({ p, n: Number(/\.([0-9]+)$/.exec(p)?.[1]) })).sort((a, b) => b.n - a.n)
+  evidenceAssert(rotated.every((r, i) => r.n === rotated.length - i), 'server log rotations are not contiguous')
+  return [...rotated.map(r => r.p), path]
+}
 const sharedAssertAccounting: Entry = {
-  synopsis: '<expectations-jsonl> <server-log> (<key> <queue-snapshot>)...',
-  async print(args, context) {
+  synopsis: '[--per-server-run] <expectations-jsonl> <server-log> (<key> <queue-snapshot>)...',
+  async print(input, context) {
+    // message-received is deduplicated for one server run
+    // (src/delivery-notices.ts), so an item still queued at a stop is logged
+    // again when the next start recovers it. --per-server-run keeps the exact
+    // accepted and received sets, allowing each identity at most once per run.
+    const perRun = input[0] === '--per-server-run', args = perRun ? input.slice(1) : input
     evidenceAssert(args.length >= 4 && args.length % 2 === 0, 'accounting needs expectations, log and key/snapshot pairs')
     const expected: SharedExpected[] = sharedJSON(args[0])
     evidenceAssert(expected.length > 0, 'empty expected acceptance set')
@@ -5412,13 +5431,32 @@ const sharedAssertAccounting: Entry = {
         accepts.push(diagnostic(label, ref(e.name, key), identity(row)))
       }
     }
-    for (const path of sharedLogPaths(args[1])) for (const line of sharedLines(path)) {
+    let run = 0
+    const runs = new Map<string, number[]>()
+    for (const path of perRun ? sharedLogsInOrder(args[1]) : sharedLogPaths(args[1])) for (const line of sharedLines(path)) {
+      if (perRun && SHARED_SERVER_START_RE.test(line)) { run++; continue }
       const marker = `[slack] ${label}: `, i = line.indexOf(marker)
-      if (i >= 0) actual.push(line.slice(i))
+      if (i < 0) continue
+      const received = line.slice(i)
+      actual.push(received)
+      if (!perRun) continue
+      evidenceAssert(run > 0, 'received diagnostic before any server start')
+      runs.set(received, [...runs.get(received) ?? [], run])
     }
     evidenceAssert(isDeepStrictEqual(accepts.sort(), [...wanted].sort()), 'exact accepted set mismatch')
-    evidenceAssert(isDeepStrictEqual(actual.sort(), [...wanted].sort()), 'exact received diagnostic set mismatch')
-    return JSON.stringify({ accepted: accepts.length, received: actual.length })
+    if (!perRun) {
+      evidenceAssert(isDeepStrictEqual(actual.sort(), [...wanted].sort()), 'exact received diagnostic set mismatch')
+      return JSON.stringify({ accepted: accepts.length, received: actual.length })
+    }
+    const wantedSet = new Set(wanted)
+    const missing = wanted.filter(w => !runs.has(w)).length, extra = [...runs.keys()].filter(r => !wantedSet.has(r)).length
+    evidenceAssert(!missing && !extra, `exact received diagnostic set mismatch (missing=${missing} extra=${extra})`)
+    // Lines are read in write order, so a repeat in a run after the first
+    // line's run is a strictly later run; equal runs are a same-run repeat.
+    const repeated = [...runs.values()].filter(r => r.length > 1)
+    const sameRun = repeated.filter(r => r.some((n, j) => j > 0 && n <= r[j - 1]!)).length
+    evidenceAssert(!sameRun, `received diagnostic repeated within one server run (identities=${sameRun})`)
+    return JSON.stringify({ accepted: accepts.length, received: actual.length, runs: run, repeated: repeated.length })
   },
 }
 const sharedExpectedParts: Entry = {

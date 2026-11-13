@@ -2207,7 +2207,9 @@ for who in p q; do drain "${who}"; done
 stop_server --stop-bots
 for who in p q; do snapshot "${who}"; done
 assert_chunk_posts # No later restart or recovery reposted either chunk.
-shared_assert_accounting "${EXPECTED}" "${LOG}" "${KEY[p]}" "${SNAP[p]}" "${KEY[q]}" "${SNAP[q]}" > /dev/null
+# message-received is a per-server-run diagnostic: an item still queued at a
+# stop is logged again when the next start recovers it (MI answers46).
+shared_assert_accounting --per-server-run "${EXPECTED}" "${LOG}" "${KEY[p]}" "${SNAP[p]}" "${KEY[q]}" "${SNAP[q]}" > /dev/null
 for identity in "${!INPUTS[@]}"; do
     IFS='|' read -r who channel ts via <<< "${identity}"
     input="${INPUTS[${identity}]}"

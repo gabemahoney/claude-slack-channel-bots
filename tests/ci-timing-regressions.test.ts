@@ -7,7 +7,9 @@ import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import ts from 'typescript'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
-import { TEST_MEASUREMENTS_KEY, TEST_MEASUREMENT_TIMINGS_KEY } from '../src/config.ts'
+import { TEST_MEASUREMENTS_KEY, TEST_MEASUREMENT_TIMINGS_KEY, CHANNEL_ID_RE, parsePersonaConfigBytes } from '../src/config.ts'
+import { decideDelivery } from '../src/delivery-decision.ts'
+import { RELOAD_NOOP } from '../src/reload-apply.ts'
 import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX } from './test-helpers/credentials.ts'
 import { test29ClosingFixture, test29EvidencePrinter, test29PrinterFixture, test29PrinterBindings, test29SwitchBindings, test29SwitchCallOrder } from './test-helpers/test29-controls.ts'
 import { TEST29_ROOT, test29RestartFixture, test29CompactionFixture, test29DiagnosticFixture, test29WatchdogFixture, test29DiagnosticExpectedItem } from './test-helpers/test29-queue.ts'
@@ -33,7 +35,7 @@ import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
 import { THREAD_REPLY_HOLD_MS, DELIVERY_MAX_AD_CALLS_PER_S } from '../src/delivery-constants.ts'
 import { NAME_LOOKUP_TIMEOUT_MS } from '../src/tag-wrapper.ts'
 import { buildThreadMemoryChangedWhileStoppedLine } from '../src/thread-memory-reports.ts'
-import { THREAD_MEMORY_CHANGED_WHILE_STOPPED, THREAD_MEMORY_JOINS_LOST } from '../src/persona-diagnostics.ts'
+import { THREAD_MEMORY_CHANGED_WHILE_STOPPED, THREAD_MEMORY_JOINS_LOST, UNCLAIMED_CHANNEL, fungibleUnclaimedChannelCause, formatPersonaDiagnostic } from '../src/persona-diagnostics.ts'
 import { MEMBERSHIP_REQUEST_TIMEOUT_MS, MEMBERSHIP_ATTEMPT_TIMEOUT_MS, MEMBERSHIP_RETRY_MAX_MS, MEMBERSHIP_PAGE_LIMIT, membershipRetryDelay } from '../src/channel-membership-retry.ts'
 import { startSlackStub, type StubAnswers } from './integration/fixtures/slack-stub-server.ts'
 import { WebClient } from '@slack/web-api'
@@ -2041,6 +2043,20 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     expect(run.stdout).not.toContain(secret); expect(run.stdout).not.toContain('cscb_other'); expect(run.stdout).not.toContain('updated_at')
     expect(run.stdout).not.toContain(tok)
   })
+  // In a script file, a failure inside a call whose stdout is discarded runs
+  // the exit hooks with that stdout (as the scenario's cleanup runs them, in a
+  // subshell each); test-29 registers its dump through the stderr wrapper.
+  test.each([['exit_observe_stderr', 'printer refused\nexit-observe: dump\n'], ['exit_observe', 'printer refused\n']] as const)(
+    'test-29 exit dump survives a failure under a discarded stdout: %s', (hook, stderr) => {
+      expect(test29Script).toMatch(/^on_before_cleanup exit_observe_stderr$/m)
+      const run = shell('bash "$HOME/case.sh"', { 'case.sh': [
+        'set -euo pipefail', 'fail() { printf "%s\\n" "$*" >&2; exit 1; }',
+        'exit_observe() { printf "exit-observe: dump\\n"; }', test29Script.match(/^exit_observe_stderr\(\) \{.*\}$/m)![0],
+        `cleanup() { trap - EXIT; ( ${hook} ); }`, 'trap cleanup EXIT',
+        'discarded() { fail "printer refused"; }', 'discarded > /dev/null', '',
+      ].join('\n') })
+      expect({ status: run.status, stdout: run.stdout, stderr: run.stderr }).toEqual({ status: 1, stdout: '', stderr })
+    })
   // test-29's real leave steps and expect_stale_review. The stand-in server
   // applies the leave on its ACK and, when pending, lands the staged rescan at
   // its next chance: the rescan wait, or the stale confirmation's reload tick.
@@ -2101,6 +2117,172 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     expect({ status: run.status, stderr: run.stderr }).toEqual({ status, stderr })
     if (status) return
     expect(run.stdout.trim().split('\n')).toEqual([...reviews, JSON.stringify(dm)])
+  })
+  // test-29's real write_persona_config, read by the production parser. A
+  // persona without the opt-out inherits reminders on, and each nudge takes a
+  // manual receipt release meant for a real item.
+  // Its heredoc's closing brace sits in column 0, so it ends at the next section.
+  const personaConfig = block(test29Script, 'write_persona_config() {', '\n\n# --- Start')
+  const optOut = /^ {6}"stop_hook_bootstrap": false,\n/gm
+  const personaConfigSetup = [
+    'CONFIG="$HOME/config.json" ALPHA=t29_alpha BRAVO=t29_bravo ALPHA_CREDS="$HOME/alpha.json" BRAVO_CREDS="$HOME/bravo.json"',
+    'ALPHA_DIR="$HOME/alpha" BRAVO_DIR="$HOME/bravo" CONTACT=UCONTACT SWITCH_KEY=channel_mode SCENARIO_PORT=3999 MCP_CONFIG="$HOME/mcp.json"',
+    'A1=CA1 A2=CA2 B1=CB1 T1=CT1 N1=CN1 N2=CN2 N3=CN3 F1=CF1 F2=GF2 U1=CU1 M_OFF=CMOFF M_MENTIONS=CMMENTIONS M_ALL=CMALL M_HYBRID=CMHYBRID WRITE_CHANNEL=CWRITE FUTURE=CFUTURE',
+    'write_config() { cat > "$CONFIG"; }',
+    declaration(test29Script, 'edit_input'), test29Script.match(/^input_has\(\) \{.*\}$/m)![0], declaration(test29Script, 'input_choice'),
+  ]
+  test.each((['declarative', 'fungible', 'switch-off'] as const).flatMap(shape => (['with', 'without'] as const).map(form => [shape, form] as const)))(
+    'test-29 written config turns reply reminders off for both personas: %s, %s the opt-out', (shape, form) => {
+      expect(personaConfig.match(optOut)).toHaveLength(2)
+      const ready = shape === 'declarative' ? 'false' : 'true'
+      const run = shell([
+        ...personaConfigSetup, `ALPHA_THREADS=${ready} MATRIX_READY=${ready}`,
+        form === 'with' ? personaConfig : personaConfig.replace(optOut, ''),
+        `write_persona_config ${shape}`, 'cat "$CONFIG"',
+      ].join('\n'))
+      assertNoLeak([run.stdout, run.stderr])
+      expect({ status: run.status, stderr: run.stderr }).toEqual({ status: 0, stderr: '' })
+      const config = parsePersonaConfigBytes(run.stdout, '/scratch/config.json', '/scratch')
+      expect(config.personas.map(p => [p.name, p.stop_hook_bootstrap])).toEqual([['t29_alpha', form === 'without'], ['t29_bravo', form === 'without']])
+    })
+  // test-29's real permission_post destination step, notice_phase destination
+  // step and destination_post_matrix back-edit (set_composed_choice,
+  // edit_destination, input_has, input_choice, edit_input) over bravo's real
+  // open-shape input. The stand-in review reads the input with the production
+  // parser, as configuration_request's printer does, then saves its gestures;
+  // the stand-in tool saves its value. The old step (909132aa's permission_post
+  // edit) points permission_prompts at an unlisted channel, which the parser
+  // refuses.
+  const destinationStep = block(test29Script, '    set_composed_choice "${mode}" "${q}" "${DEST}" "${value}" "${mode}-prompt-${number}-${value}"', '    wait_queue_drained "${dir}"')
+  const noticeStep = block(test29Script, '    set_composed_choice "${mode}" "${q}" "${DEST}" "${value}" "${phase}-own-value"', '    wait_queue_drained "${ALPHA_DIR}"')
+  const backEdit = test29Script.match(/^ {12}edit_destination "\$\{qname\}" "\$\{qkey\}" .*$/m)![0]
+  const oldDestination = [
+    '    if ! input_has --arg who "${name}" --arg dest "${DEST}" \'.personas[]|select(.name==$who)|.permission_prompts==$dest\'; then',
+    '        edit_input --arg who "${name}" --arg dest "${DEST}" \'(.personas[]|select(.name==$who)|.permission_prompts)=$dest\'',
+    '        review_assign "${mode}-prompt-destination-${number}"', '    fi', '',
+  ].join('\n')
+  const parser = [`import { parsePersonaConfigBytes } from ${JSON.stringify(join(import.meta.dir, '..', 'src', 'config.ts'))}`,
+    "import { readFileSync } from 'node:fs'",
+    'try { parsePersonaConfigBytes(readFileSync(process.argv[2]!), process.argv[2]!, process.argv[3]!) }',
+    'catch (error) { process.stderr.write(`${(error as Error).message}\\n`); process.exit(1) }', ''].join('\n')
+  test.each([
+    ['permission', 'old step', 1, []],
+    ['permission', 'fixed step', 0, ['bot open-prompt-1-off off', 'review open-prompt-destination-1 t29_bravo/CDEST/off',
+      'review open-prompt-2-thread_hybrid t29_bravo/CDEST/thread_hybrid', 'review open-prompt-destination-dm', 'review open-prompt-destination-back']],
+    ['notice', 'fixed step', 0, ['review open-notice-off-own-value t29_bravo/CDEST/off', 'review open-notice-off-destination',
+      'review open-notice-thread_hybrid-own-value t29_bravo/CDEST/thread_hybrid']],
+  ] as const)('test-29 open destination steps list DEST in bravo\'s input: %s, %s', (steps, form, status, calls) => {
+    expect(destinationStep.split('\n')).toHaveLength(3)
+    const program = steps === 'notice' ? [
+      // As the strict phases leave it: DEST listed at its saved value.
+      'input_choice "$BRAVO" CDEST all; printf "all\\n" > "$HOME/saved.k_bravo.CDEST"',
+      'notice() { local q=bravo value="$1" phase="open-notice-$1" dir key name="$BRAVO"', 'thread_persona "$q"; dir="$THREAD_DIR"; key="$THREAD_KEY"', noticeStep, '}',
+      'notice off', 'notice thread_hybrid',
+    ] : [
+      // own_posts_phase's tool-stored choice, with DEST still unlisted.
+      'printf "thread_hybrid\\n" > "$HOME/saved.k_bravo.CDEST"',
+      'post() { local q=bravo number="$1" value="$2" dir key name="$BRAVO"', 'thread_persona "$q"; dir="$THREAD_DIR"; key="$THREAD_KEY"',
+      form === 'old step' ? destinationStep.replace(/^ {4}edit_destination .*\n/m, oldDestination) : destinationStep, '}',
+      'post 1 off', 'post 2 thread_hybrid', 'qname="$BRAVO" qkey="$BRAVO_KEY" kind=prompt',
+      'edit_input --arg who "$qname" \'(.personas[]|select(.name==$who)|.permission_prompts)="dm"\'', 'review_assign "${mode}-${kind}-destination-dm"', backEdit,
+    ]
+    const run = shell([
+      ...personaConfigSetup, 'ALPHA_THREADS=false MATRIX_READY=false', personaConfig, 'write_persona_config fungible',
+      'ALPHA_KEY=k_alpha BRAVO_KEY=k_bravo ALPHA_BOT_USER=UALPHA BRAVO_BOT_USER=UBRAVO ALPHA_REF=alpha BRAVO_REF=bravo DEST=CDEST mode=open',
+      declaration(test29Script, 'thread_persona'),
+      'attempt_args() { printf "%s\\n" "$2"; }',
+      'expect_attempt() { printf "bot %s %s\\n" "$1" "$5" >> "$HOME/calls"; printf "%s\\n" "$5" > "$HOME/saved.$4.$3"; }',
+      'shared_channel_saved() { cat "$HOME/saved.$1.$2" 2> /dev/null || true; }',
+      'review_assign() {', '    local step="$1" gesture name channel value; shift', '    printf "review %s%s\\n" "$step" "${*:+ $*}" >> "$HOME/calls"',
+      '    bun "$HOME/parser.ts" "$CONFIG" "$HOME" || fail "$step: cannot build the operator request"',
+      '    for gesture in "$@"; do IFS=/ read -r name channel value <<< "$gesture"; printf "%s\\n" "$value" > "$HOME/saved.k_${name#t29_}.$channel"; done', '}',
+      ...['set_composed_choice', 'edit_destination'].map(name => declaration(test29Script, name)),
+      ...program,
+      'cat "$HOME/calls"', 'jq -c \'.personas[1]|{permission_prompts,dm,listed:[.channels[]|select(.id=="CDEST")]}\' "$CONFIG"', 'cat "$HOME/saved.k_bravo.CDEST"',
+    ].join('\n'), { 'parser.ts': parser })
+    assertNoLeak([run.stdout, run.stderr])
+    expect(run.status).toBe(status)
+    if (status) {
+      expect(run.stderr).toContain("permission_prompts names channel CDEST, which is not in the persona's channels.")
+      expect(run.stderr).toEndWith('open-prompt-destination-1: cannot build the operator request\n')
+      return
+    }
+    expect(run.stderr).toBe('')
+    expect(run.stdout.trim().split('\n')).toEqual([...calls,
+      JSON.stringify({ permission_prompts: 'CDEST', dm: { enabled: true, contact: 'UCONTACT' }, listed: [{ id: 'CDEST', delivery: 'thread_hybrid' }] }), 'thread_hybrid'])
+  })
+  // test-29's real confirm_review, its omit-member call and its NOOP_CLASS. The
+  // stand-in server consumes the confirmed review and logs reload-noop for no
+  // effective change and reload-applied otherwise, as src/reload.ts does; an
+  // omission is no effective change. `both` logs the two, which production never
+  // does, to reach the applied-count check.
+  const omitConfirm = test29Script.match(/^ {4}confirm_review omit-member .*$/m)![0]
+  const noopClass = test29Script.match(/^NOOP_CLASS=.*$/m)![0]
+  test.each([
+    ['omit-member', omitConfirm, 'noop', 0, ''],
+    ['omit-member', '    confirm_review omit-member', 'noop', 1, 'omit-member: confirmation did not apply\n'],
+    ['omit-member', omitConfirm, 'applied', 1, 'omit-member: confirmation was not a no-op\n'],
+    ['omit-member', omitConfirm, 'both', 1, 'omit-member: a no-op confirmation applied a change\n'],
+    ['applying review', '    confirm_review same-operator', 'applied', 0, ''],
+  ] as const)('test-29 confirms a review with no effective change by its reload-noop line: %s, %s', (_name, call, effect, status, stderr) => {
+    expect(noopClass).toBe(`NOOP_CLASS='[slack] ${RELOAD_NOOP}:'`)
+    const run = shell([
+      'CONFIG="$HOME/config.json" LAST="$HOME/last" PENDING="$HOME/pending" APPLY="$HOME/apply" CAPTURED="$HOME/captured" PRINTER=printer.ts',
+      `APPLY_WAIT_S=20 APPLIED_CLASS=applied EFFECT=${effect}`, noopClass,
+      'mkdir -p "$CAPTURED"; printf "review\\n" > "$PENDING"; printf "0\\n" > "$HOME/applied"; printf "0\\n" > "$HOME/noop"',
+      'count_log() { case "$1" in "$APPLIED_CLASS") cat "$HOME/applied" ;; "$NOOP_CLASS") cat "$HOME/noop" ;; *) return 1 ;; esac; }',
+      'check_pending_layout() { :; }', 'configuration_record_matches() { :; }',
+      'serve() { [[ -e "$APPLY" ]] || return 0; rm -- "$APPLY"; touch "$HOME/consumed"',
+      '    [[ "$EFFECT" == applied ]] || printf "1\\n" > "$HOME/noop"; [[ "$EFFECT" == noop ]] || printf "1\\n" > "$HOME/applied"; }',
+      'wait_for_count() { serve; (( $(count_log "$1") >= $2 )) || fail "$4"; }', 'wait_until() { serve; shift 2; "$@"; }',
+      'bun() { [[ "$2" == sharedReviewConsumed && -e "$HOME/consumed" && "$5" == "$CAPTURED/"*.pending ]]; }',
+      declaration(test29Script, 'capture_review'), declaration(test29Script, 'confirm_review'), call,
+      'printf "applied=%s noop=%s\\n" "$(cat "$HOME/applied")" "$(cat "$HOME/noop")"',
+    ].join('\n'))
+    expect({ status: run.status, stderr: run.stderr }).toEqual({ status, stderr })
+    if (!status) expect(run.stdout).toBe(effect === 'noop' ? 'applied=0 noop=1\n' : 'applied=1 noop=0\n')
+  })
+  // test-29's ineligible step pushes its joined-thread reply with Slack's
+  // external-sharing flag set, as the channel now is. Open mode refuses that
+  // flag before membership (decideDelivery), and routing logs the refusal as
+  // an unclaimed-channel line (logDrop), never a channel-ineligible drop. The
+  // stand-in log holds the production line; the step's real wait reads it.
+  const externalWait = test29Script.match(/^ {4}wait_since "\$\{mark\}" "\$\{unclaimed\}" .*$/m)![0]
+  const externalReply = block(test29Script, '    unclaimed="$(persona_line "${UNCLAIMED_CHANNEL}"', '    expect_queued external-joined-reply')
+  const reply = (flag: boolean) => decideDelivery(
+    { type: 'message', channel: 'CEXTERNAL', channel_type: 'channel', user: 'UHUMAN', text: 'plain', ts: '1700000001.000002', thread_ts: '1700000001.000001' },
+    { key: 'k_alpha', botUserId: 'UALPHA', botId: 'BALPHA', channels: [], dmEnabled: false }, [{ key: 'k_alpha', channels: [] }],
+    { mode: 'open', channelIdPattern: CHANNEL_ID_RE, isExtSharedChannel: flag, storedChoices: { readable: true, storedChoice: () => 'thread_hybrid' },
+      memberships: new Map([['k_alpha', { kind: 'ineligible', reason: 'external-sharing' } as const]]) })
+  test.each([
+    ['fixed step', externalReply, 0, ''],
+    // 909132aa's wait.
+    ['old step', externalReply.replace(externalWait,
+      '    wait_since "${mark}" "$(plain_drop "${ALPHA_REF}" "${EXTERNAL}" channel-ineligible)" "${EVENT_WAIT_S}" \'external joined reply was not excluded\''),
+    1, 'external joined reply was not excluded\n'],
+  ] as const)('test-29 waits for the external joined reply\'s refusal line: %s', (_form, steps, status, stderr) => {
+    expect(reply(true)).toEqual({ action: 'drop', reason: 'fungible-refused', refusal: 'externally-shared' })
+    expect(reply(false)).toEqual({ action: 'drop', reason: 'channel-ineligible' })
+    const cause = fungibleUnclaimedChannelCause('CEXTERNAL', 'externally-shared')
+    const logged = formatPersonaDiagnostic({ class: UNCLAIMED_CHANNEL, name: 't29_alpha', key: 'k_alpha', index: 0, cause })
+    const run = shell([
+      'SLACK_STATE_DIR="$HOME/state" EXTERNAL=CEXTERNAL ALPHA_REF=\'"t29_alpha" (key=k_alpha)\' UNCLAIMED_CHANNEL=unclaimed-channel REFUSAL_EXTERNALLY_SHARED=externally-shared',
+      'EVENT_WAIT_S=15 HUMAN=UHUMAN root=1700000001.000001 SCENARIO_SEP=$\'\\x1f\'', 'mkdir -p "$SLACK_STATE_DIR"; printf "earlier\\n" > "$SLACK_STATE_DIR/server.log"',
+      'printed() { [[ "$*" == "fungibleUnclaimedChannelCause CEXTERNAL externally-shared" ]] || return 1; cat "$HOME/cause.txt"; }',
+      'persona_line() { [[ "$1|$2|$3" == "unclaimed-channel|alpha|$(cat "$HOME/cause.txt")" ]] || return 1; cat "$HOME/logged.txt"; }',
+      'new_ts() { PUSH_TS=1700000001.000002; }', 'plain_text() { echo plain; }', 'slack_reply_event() { printf "%s\\n" "$*"; }',
+      // The stand-in server logs the production line for a flagged reply.
+      'push_event() { [[ "$1 $3" == "alpha true" ]] || return 1; cat "$HOME/logged.txt" >> "$SLACK_STATE_DIR/server.log"; }',
+      'wait_until() { local step="$2"; shift 2; "$@" || fail "$step"; }',
+      // _scenario_scan's count: every fragment, in order, on one line after the mark.
+      'count_since_at_least() { local line rest frag n=0 ok; local -a frags; IFS=$\'\\x1f\' read -r -a frags <<< "$2"',
+      '    while IFS= read -r line; do rest="$line"; ok=1',
+      '        for frag in "${frags[@]}"; do [[ "$rest" == *"$frag"* ]] || { ok=0; break; }; rest="${rest#*"$frag"}"; done',
+      '        (( ok == 0 )) || n=$(( n + 1 ))', '    done < <(tail -n "+$(( $1 + 1 ))" "$SLACK_STATE_DIR/server.log"); (( n >= $3 )); }',
+      declaration(scenario, 'matcher'), declaration(test29Script, 'plain_drop'), declaration(test29Script, 'log_mark'), declaration(test29Script, 'wait_since'),
+      steps,
+    ].join('\n'), { 'cause.txt': cause + '\n', 'logged.txt': logged + '\n' })
+    expect({ status: run.status, stderr: run.stderr }).toEqual({ status, stderr })
   })
   test('burst slice removes exactly the two write envelopes and keeps every other stub line byte-for-byte', () => {
     const lines = ['{"seq":1,"event":"push","envelope_id":"burst","sent_mono_ms":1.250000}', '{"seq":2,"event":"push","envelope_id":"leave-env"}',

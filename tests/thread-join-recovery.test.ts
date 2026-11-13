@@ -473,6 +473,9 @@ describe.each(['strict', 'open'] as const)('%s join recovery', mode => {
     expectReports(reopened, { alpha: [{ kind: 'unclean', channels: [] }], bravo: ['unclean'] })
   })
 
+  // Heavy, not clock-dependent: two restarts, two relaunches and 744 virtual
+  // hourly compactions over real durable I/O take about 2.7 s alone and over
+  // 5 s in the full suite, the same at any wall-clock date.
   test('AC-V02/AC-C01: intake joins survive modes, same-value writes, relaunch, restarts and time; leave forgets only one channel', async () => {
     for (const delivery of ['off', 'mentions', 'all'] as const) {
       const persona = h.persona(delivery, { channels: [{ id: channel, delivery }],
@@ -552,5 +555,5 @@ describe.each(['strict', 'open'] as const)('%s join recovery', mode => {
     expect(view(run, 'alpha', THREAD_ROOTS.secondary)).toBe('not-joined')
     expectReports(runs[0]!, {})
     for (const restarted of runs.slice(1)) expectReports(restarted, afterCrash)
-  })
+  }, 20_000)
 })
