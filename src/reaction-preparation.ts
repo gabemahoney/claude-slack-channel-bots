@@ -17,6 +17,7 @@ import type { WebClient } from '@slack/web-api'
 import type { ChannelMode } from './config.ts'
 import type { ReactionAcceptedRecord, ReactionFungibleCondition, ReactionWithdrawalReason } from './delivery-queue.ts'
 import { slackPlatformReason } from './persona-connection-errors.ts'
+import { isRecord } from './record.ts'
 import { isServerPost } from './server-post.ts'
 
 export type ReactionPreparationDecision =
@@ -141,10 +142,6 @@ function bounded<T>(
     timer = bound.clock.setTimeout(() => finish(timedOut), bound.lookupTimeoutMs)
     Promise.resolve().then<T | typeof NOT_STARTED>(() => (done ? NOT_STARTED : work())).then(value => { if (value !== NOT_STARTED) finish(() => value) }, () => finish(fallback))
   })
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
 /**

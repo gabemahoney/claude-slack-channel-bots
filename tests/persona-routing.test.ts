@@ -15,7 +15,7 @@ import { assertNoLeak, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage,
 import { deliveredRecord, queuePath, readQueue, seedQueue, slackInput } from './test-helpers/delivery-queue.ts'
 import type { ChannelMode, Persona } from '../src/config.ts'
 import type { QueueRecord, ReactionAcceptedInput, ReactionAcceptedRecord } from '../src/delivery-queue.ts'
-import { buildBotToolReactionErrorLine, buildBotToolReactionStoreFailedLine, buildReactionDroppedLine, buildReactionReceivedLine, REACTION_RECEIVED, type ReactionDroppedInput } from '../src/reaction-intake-diagnostics.ts'
+import { buildBotToolReactionErrorLine, buildBotToolReactionStoreFailedLine, buildReactionAckFailedLine, buildReactionDroppedLine, buildReactionEventErrorLine, buildReactionPreparationFailedLine, buildReactionReceivedLine, buildReactionStoreFailedLine, REACTION_RECEIVED, type ReactionDroppedInput } from '../src/reaction-intake-diagnostics.ts'
 import { describeSlackCallFailure } from '../src/persona-connection-errors.ts'
 import { personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
@@ -433,24 +433,27 @@ describe('reaction intake', () => {
 
   test.each(['fsync-failing', 'failed', 'rejected'] as const)('a %s store sends no ack and leaves no item; the identical redelivery is stored and prepared once', async fault => {
     let armed = true
+    const err = Object.assign(new Error(`store refused (${sentinelInMessage('store')})`), { code: 'EIO', data: { error: 'internal_error', detail: LEAK_SENTINEL }, detail: LEAK_SENTINEL })
     const h = rh(fault === 'fsync-failing' ? {} : { wrapAccept: accept => async (key, input) => {
       if (!armed) return accept(key, input)
       armed = false
-      if (fault === 'failed') return { status: 'failed', error: new Error(sentinelInMessage('store')) }
-      throw new Error(sentinelInMessage('accept'))
+      if (fault === 'failed') return { status: 'failed', error: err }
+      throw err
     } })
     // One regular-file fsync fails; directory syncs and every later fsync run normally.
     if (fault === 'fsync-failing') h.queueFaults.fileSync = () => { h.queueFaults.fileSync = undefined; throw Object.assign(new Error('EIO: injected fsync failure'), { code: 'EIO' }) }
     const event = reaction()
-    await h.receiveReaction(event, 'alpha')
+    const failed = await h.receiveReaction(event, 'alpha')
     expect(h.queueFaults.fileSync).toBeUndefined()
     expect(acks(h)).toBe(0); expectNoWork(h); expect(h.queued('alpha')).toEqual([])
-    expect(h.logs).toEqual(fault === 'rejected' ? [expect.stringContaining('reaction store failed')] : [])
-    await h.receiveReaction(event, 'alpha')
+    expect(h.logs).toEqual(fault === 'rejected' ? [buildReactionStoreFailedLine(subject(h), describeSlackCallFailure(err))] : [])
+    if (fault === 'rejected') expect(h.logs[0]).toContain(` (reason=internal_error): Error code=EIO message="store refused (${REDACTED_SENTINEL_TAIL})"`)
+    const retried = await h.receiveReaction(event, 'alpha')
     expect(acks(h)).toBe(1)
     expect(records(h).map(r => [r.kind, r.seq])).toEqual([['accepted', 1], ['fixed', 1]])
     expect(received(h)).toHaveLength(1); expect(methods(h)).toEqual(USER_LOOKUPS)
     expect(h.allPosts()).toEqual([]); expect(h.notices).toEqual([])
+    assertNoLeak({ ...h.captured(), failed, retried, queue: writtenFile(queuePath(dir, keyOf(h))) })
   })
 
   test('a throwing diagnostic log undoes neither the stored item nor its one ack and preparation', async () => {
@@ -462,17 +465,20 @@ describe('reaction intake', () => {
 
   // A sink that throws on every line, error lines included: each path's own log call meets it, and its ack and work are unchanged.
   const receivedLine = (h: RoutingHarness) => buildReactionReceivedLine(subject(h), h.queued('alpha')[0]!.accepted as ReactionAcceptedRecord)
+  const EIO = () => Object.assign(new Error('EIO: injected fsync failure'), { code: 'EIO' })
+  // Reuse each injected error so exact descriptions include its actual stack.
+  const sinkErrors = { decision: new Error('run bot query failed'), store: new Error('accept rejected'), ack: new Error('ack lost'), preparation: EIO() }
   const FAILING_SINK: Array<{ path: string; opts?: RoutingHarnessOptions; arrange?: (h: RoutingHarness) => void; event?: () => Record<string, unknown>; afterAck?: (h: RoutingHarness) => void; acks: number; kinds: Array<QueueRecord['kind']>; calls: readonly string[]; lines: (h: RoutingHarness) => string[] }> = [
     { path: 'a logged drop', event: () => reaction({ item: { channel: CX } }), acks: 1, kinds: [], calls: [], lines: h => [buildReactionDroppedLine(subject(h), { reason: 'unserved-conversation', chat_id: CX, message_ts: MSG_TS })] },
     { path: 'a notices-off drop', arrange: noticesOff, acks: 1, kinds: [], calls: [], lines: h => [buildReactionDroppedLine(subject(h), { reason: 'notices-off', chat_id: CA, message_ts: MSG_TS })] },
-    { path: 'a decision failure', opts: { isRunBotIdentity: () => { throw new Error('run bot query failed') } }, acks: 1, kinds: [], calls: [], lines: () => [expect.stringContaining('error handling reaction event')] },
-    { path: 'a rejected store', opts: { wrapAccept: () => async () => { throw new Error('accept rejected') } }, acks: 0, kinds: [], calls: [], lines: () => [expect.stringContaining('reaction store failed')] },
-    { path: 'a failed ack', afterAck: () => { throw new Error('ack lost') }, acks: 1, kinds: ['accepted'], calls: [], lines: h => [receivedLine(h), expect.stringContaining('failed to ack reaction event')] },
+    { path: 'a decision failure', opts: { isRunBotIdentity: () => { throw sinkErrors.decision } }, acks: 1, kinds: [], calls: [], lines: h => [buildReactionEventErrorLine(subject(h), describeSlackCallFailure(sinkErrors.decision))] },
+    { path: 'a rejected store', opts: { wrapAccept: () => async () => { throw sinkErrors.store } }, acks: 0, kinds: [], calls: [], lines: h => [buildReactionStoreFailedLine(subject(h), describeSlackCallFailure(sinkErrors.store))] },
+    { path: 'a failed ack', afterAck: () => { throw sinkErrors.ack }, acks: 1, kinds: ['accepted'], calls: [], lines: h => [receivedLine(h), buildReactionAckFailedLine(subject(h), describeSlackCallFailure(sinkErrors.ack))] },
     {
       path: 'a failed preparation',
       // The fixed record's fsync fails once; the queue rolls the append back.
-      afterAck: h => { h.queueFaults.fileSync = () => { h.queueFaults.fileSync = undefined; throw Object.assign(new Error('EIO: injected fsync failure'), { code: 'EIO' }) } },
-      acks: 1, kinds: ['accepted'], calls: USER_LOOKUPS, lines: h => [receivedLine(h), expect.stringContaining('post-accept reaction preparation failed')],
+      afterAck: h => { h.queueFaults.fileSync = () => { h.queueFaults.fileSync = undefined; throw sinkErrors.preparation } },
+      acks: 1, kinds: ['accepted'], calls: USER_LOOKUPS, lines: h => [receivedLine(h), buildReactionPreparationFailedLine(subject(h), describeSlackCallFailure(sinkErrors.preparation))],
     },
   ]
   test.each(FAILING_SINK)('with a log sink that throws on every call, $path still resolves with its own ack and work', async row => {
@@ -488,9 +494,12 @@ describe('reaction intake', () => {
 
   test('a throwing ack leaves one accepted-only item unprepared; its redelivery acks, then prepares it', async () => {
     const h = rh(); const event = reaction()
-    await h.receiveReaction(event, 'alpha', () => { h.order.push('ack'); throw new Error(sentinelInMessage('ack')) })
+    const err = Object.assign(new Error(`ack lost (${sentinelInMessage('ack')})`), { code: 'ECONNRESET', data: { detail: LEAK_SENTINEL }, detail: LEAK_SENTINEL })
+    const result = await h.receiveReaction(event, 'alpha', () => { h.order.push('ack'); throw err })
     expect(records(h).map(r => r.kind)).toEqual(['accepted']); expect(h.p('alpha').stub.callLog).toEqual([])
-    expect(h.logs).toEqual([received(h)[0], expect.stringContaining('failed to ack reaction event')])
+    expect(h.logs).toEqual([receivedLine(h), buildReactionAckFailedLine(subject(h), describeSlackCallFailure(err))])
+    expect(h.logs[1]).toContain(`: Error code=ECONNRESET message="ack lost (${REDACTED_SENTINEL_TAIL})"`)
+    assertNoLeak({ ...h.captured(), result, queue: writtenFile(queuePath(dir, keyOf(h))) })
     let callsAtAck: string[] | undefined
     await h.receiveReaction(event, 'alpha', () => { h.order.push('ack'); callsAtAck = methods(h) })
     expect(callsAtAck).toEqual([]); expect(acks(h)).toBe(2)
@@ -739,8 +748,7 @@ describe('reaction intake', () => {
       reaction_key: { chat_id: CA, message_ts: MSG_TS, reactor: BETA_BOT, emoji: 'white_check_mark', change: 'added', event_ts: EVENT_TS }, reactor_persona_name: B_NAME, received_at: NOW,
     })
     const botToolRecord = (): ReactionAcceptedRecord => ({ v: 1, kind: 'accepted', seq: 1, ...botToolStored() })
-    const EIO = () => Object.assign(new Error('EIO: injected fsync failure'), { code: 'EIO' })
-    const failNextFileSync = (h: RoutingHarness) => { h.queueFaults.fileSync = () => { h.queueFaults.fileSync = undefined; throw EIO() } }
+    const failNextFileSync = (h: RoutingHarness, error = EIO()) => { h.queueFaults.fileSync = () => { h.queueFaults.fileSync = undefined; throw error } }
     const removePersona = (h: RoutingHarness, name: string) => { h.config = { ...h.config!, personas: h.config!.personas.filter(p => p.name !== name) } }
     const disableDms = (h: RoutingHarness) => { withAlpha(h, p => ({ ...p, dm: { ...p.dm, enabled: false } })) }
 
@@ -805,18 +813,19 @@ describe('reaction intake', () => {
 
     test('a preparation rejecting after the durable store leaves a fresh copy stored and a retained accepted-only copy duplicate, never store-failed', async () => {
       // The fixed record's fsync fails once and the queue rolls that append back; the fake clock holds the retry.
-      const first: RoutingHarness = rh({ preparationClock: createFakeClock(), wrapAccept: accept => async (key, input) => { const r = await accept(key, input); failNextFileSync(first); return r } })
+      const firstError = EIO(), secondError = EIO()
+      const first: RoutingHarness = rh({ logHook: () => { throw new Error('log sink failed') }, preparationClock: createFakeClock(), wrapAccept: accept => async (key, input) => { const r = await accept(key, input); failNextFileSync(first, firstError); return r } })
       expect(await first.receiveBotToolReaction('alpha', botTool())).toStrictEqual({ status: 'stored', seq: 1 })
       expect(first.queueFaults.fileSync).toBeUndefined()
       expect(records(first).map(r => r.kind)).toEqual(['accepted']); expect(methods(first)).toEqual(BOT_LOOKUPS)
       // The received line follows storage, not preparation's success.
-      expect(first.logs).toEqual([buildReactionReceivedLine(subject(first), botToolRecord()), expect.stringContaining('post-accept reaction preparation failed')])
+      expect(first.logs).toEqual([buildReactionReceivedLine(subject(first), botToolRecord()), buildReactionPreparationFailedLine(subject(first), describeSlackCallFailure(firstError))])
       await first.preparation.stop(); await first.queue.stop()
-      const second: RoutingHarness = rh({ preparationClock: createFakeClock(), wrapLookupReactionKey: lookup => (key, rk) => { failNextFileSync(second); return lookup(key, rk) } })
+      const second: RoutingHarness = rh({ logHook: () => { throw new Error('log sink failed') }, preparationClock: createFakeClock(), wrapLookupReactionKey: lookup => (key, rk) => { failNextFileSync(second, secondError); return lookup(key, rk) } })
       expect(await second.receiveBotToolReaction('alpha', botTool())).toStrictEqual({ status: 'duplicate', seq: 1 })
       expect(second.queueFaults.fileSync).toBeUndefined()
       expect(second.queued('alpha').map(i => [i.accepted.seq, i.fixed, i.withdrawn])).toEqual([[1, undefined, undefined]]); expect(methods(second)).toEqual(BOT_LOOKUPS)
-      expect(second.logs).toEqual([expect.stringContaining('post-accept reaction preparation failed')])
+      expect(second.logs).toEqual([buildReactionPreparationFailedLine(subject(second), describeSlackCallFailure(secondError))])
     })
 
     test('a log sink that throws on every call changes no result, store or preparation', async () => {

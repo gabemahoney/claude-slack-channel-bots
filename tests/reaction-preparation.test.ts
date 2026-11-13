@@ -4,7 +4,7 @@
  * on the receiving persona's own client that supply those facts; a bot-tool
  * item's reactor name is the one stored with it.
  */
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 import type { WebClient } from '@slack/web-api'
 import type { ChannelMode } from '../src/config.ts'
 import { isQueueRecord, type ReactionAcceptedRecord } from '../src/delivery-queue.ts'
@@ -320,6 +320,7 @@ describe('lookup 2: the reacted message, read with its metadata', () => {  test(
     ['no messages field', { kind: 'ok', result: { messages: undefined } }, 'failed'],
     ['a messages field that is not a list', { kind: 'ok', result: { messages: REACTED_TS } }, 'failed'],
     ['malformed entries', { kind: 'ok', result: { messages: [null, 7, REACTED_TS, [REACTED_TS]] } }, 'missing'],
+    ['an array entry carrying the exact ts and trusted message facts', { kind: 'ok', result: { messages: [Object.assign([], { ts: REACTED_TS, user: 'U0AUTHOR', thread_ts: ROOT_TS, text: BODY, ...MARKER })] } }, 'missing'],
     ['no message with the reacted ts', { kind: 'ok', result: { messages: [{ ts: NEIGHBOR_TS, thread_ts: ROOT_TS, text: BODY }] } }, 'missing'],
     ['a network failure', { kind: 'network' }, 'failed'],
     ['another Slack refusal', { kind: 'platform', error: 'missing_scope' }, 'failed'],
@@ -434,6 +435,7 @@ describe('lookup 3: the conversation, read fresh for every item', () => {
     ['an externally shared channel', channelInfo({ ...PUBLIC, is_ext_shared: true }), { declarative: kept('general'), fungible: withdrawn('fungible-refused', 'externally-shared') }],
     ['an answer with no channel', { kind: 'ok', result: { channel: undefined } }, unknownConversation],
     ['a channel that is not an object', { kind: 'ok', result: { channel: 'general' } }, unknownConversation],
+    ['a channel array carrying a valid channel name and flags', { kind: 'ok', result: { channel: Object.assign([], { id: CHANNEL, ...PUBLIC }) } }, unknownConversation],
     ['a Slack refusal', { kind: 'platform', error: 'missing_scope' }, unknownConversation],
     ['a network failure', { kind: 'network' }, unknownConversation],
   ] as Array<[string, WebApiOutcome, Record<ChannelMode, Expected>]>)('%s', async (_label, info, expected) => {
@@ -445,6 +447,25 @@ describe('lookup 3: the conversation, read fresh for every item', () => {
       expect(decision).toStrictEqual(expected[mode])
       expect(methods(r.stubs.alpha)).toEqual(['conversations.info', 'conversations.replies'])
       assertNoLeak(decision)
+    }
+  })
+
+  test.each(['message', 'conversation'] as const)('an array-shaped %s response cannot supply trusted lookup facts', async leg => {
+    const r = rig()
+    r.stubs.alpha.script.replies.push(exactMessage())
+    r.stubs.alpha.script.info.push(channelInfo(PUBLIC))
+    // Scripted results merge into record responses; return the malformed outer array directly.
+    const intercepted = leg === 'message'
+      ? spyOn(r.stubs.alpha.web.conversations, 'replies').mockResolvedValue(Object.assign([], { ok: true, messages: [{ ts: REACTED_TS, user: 'U0AUTHOR', thread_ts: ROOT_TS, text: BODY, metadata: { event_type: SERVER_POST_EVENT_TYPE } }] }))
+      : spyOn(r.stubs.alpha.web.conversations, 'info').mockResolvedValue(Object.assign([], { ok: true, channel: { id: CHANNEL, ...PUBLIC } }))
+    try {
+      const decision = await r.run(accepted({ mode: 'fungible' })).promise
+      expect(decision).toStrictEqual(leg === 'message' ? fixed('Name of U0ADA', 'general', { messageUnknown: true }) : withdrawn('conversation-unknown'))
+      expect(r.stubs.beta.callLog).toEqual([])
+      expect(r.clock.pendingCount()).toBe(0)
+      assertNoLeak(decision)
+    } finally {
+      intercepted.mockRestore()
     }
   })
 

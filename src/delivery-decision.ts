@@ -123,6 +123,7 @@
  */
 
 import type { ChannelEntry, ChannelMode, DeliveryMode, DM_DESTINATION } from './config.ts'
+import type { ReactionKey } from './delivery-queue.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -164,10 +165,10 @@ const DELIVERY_ALL: DeliveryMode = 'all'
 const DELIVERY_MENTIONS: DeliveryMode = 'mentions'
 
 /** The event type of a reaction added to an item (change `added`). */
-const REACTION_ADDED_EVENT = 'reaction_added'
+export const REACTION_ADDED_EVENT = 'reaction_added'
 
 /** The event type of a reaction removed from an item (change `removed`). */
-const REACTION_REMOVED_EVENT = 'reaction_removed'
+export const REACTION_REMOVED_EVENT = 'reaction_removed'
 
 /** The `item.type` of a reaction on a message. */
 const MESSAGE_ITEM_TYPE = 'message'
@@ -499,8 +500,8 @@ export function decideDelivery(
   applied: readonly AppliedPersonaView[],
   fungible?: FungibleDecisionInputs,
 ): DeliveryDecision {
-  if (typeof event !== 'object' || event === null) return { action: 'drop', reason: 'non-message' }
-  const ev = event as Record<string, unknown>
+  if (!isRecord(event)) return { action: 'drop', reason: 'non-message' }
+  const ev = event
   const subtype = ev['subtype']
   if (subtype && !(typeof subtype === 'string' && DELIVERABLE_SUBTYPES.has(subtype))) {
     return { action: 'drop', reason: 'non-message' }
@@ -659,14 +660,19 @@ function nonEmptyString(value: unknown): string | undefined {
 // Reaction decision
 // ---------------------------------------------------------------------------
 
-/** A reaction event that passed the shape rule: its record and the fields the accept outcome carries. */
-interface MessageReaction {
-  event: Record<string, unknown>
+/**
+ * Shape facts shared by decisions, retained-key lookup and storage. A missing
+ * reactor leaves the shape valid: ownership must be checked before no-reactor.
+ */
+export interface ParsedReactionShape {
   change: ReactionAcceptDecision['change']
   channel: string
   messageTs: string
   emoji: string
   eventTs: string
+  itemUser?: string
+  reactor?: { id: string; fields: ReactionReactor }
+  reactionKey?: ReactionKey
 }
 
 /**
@@ -680,13 +686,13 @@ export function decideReaction(
   persona: ReactionDecisionPersona,
   inputs: ReactionDecisionInputs,
 ): ReactionDecision {
-  const reaction = messageReactionOf(event)
+  const reaction = parseReactionShape(event)
   if (reaction === undefined) return { action: 'drop', reason: 'not-a-message-reaction' }
 
   const ownUser = nonEmptyString(persona.botUserId)
-  if (ownUser === undefined || reaction.event['item_user'] !== ownUser) return { action: 'drop', reason: 'not-own-message' }
+  if (ownUser === undefined || reaction.itemUser !== ownUser) return { action: 'drop', reason: 'not-own-message' }
 
-  const reactor = reactorOf(reaction.event)
+  const reactor = reaction.reactor
   if (reactor === undefined) return { action: 'drop', reason: 'no-reactor' }
   if (reactor.id === ownUser) return { action: 'drop', reason: 'own-reaction' }
   if (inputs.origin !== BOT_TOOL_ORIGIN && inputs.isRunBotIdentity(reactor.id)) return { action: 'drop', reason: 'bot-reaction' }
@@ -718,7 +724,7 @@ export function decideReaction(
  * on a message, with non-empty string `item.channel`, `item.ts`, `reaction`
  * and `event_ts`, each kept exactly as received; otherwise undefined.
  */
-function messageReactionOf(event: unknown): MessageReaction | undefined {
+export function parseReactionShape(event: unknown): ParsedReactionShape | undefined {
   if (!isRecord(event)) return undefined
   const change = reactionChangeOf(event['type'])
   const item = event['item']
@@ -728,7 +734,13 @@ function messageReactionOf(event: unknown): MessageReaction | undefined {
   const emoji = nonEmptyString(event['reaction'])
   const eventTs = nonEmptyString(event['event_ts'])
   if (channel === undefined || messageTs === undefined || emoji === undefined || eventTs === undefined) return undefined
-  return { event, change, channel, messageTs, emoji, eventTs }
+  const reactor = reactorOf(event)
+  return {
+    change, channel, messageTs, emoji, eventTs,
+    itemUser: nonEmptyString(event['item_user']),
+    reactor,
+    reactionKey: reactor === undefined ? undefined : { chat_id: channel, message_ts: messageTs, reactor: reactor.id, emoji, change, event_ts: eventTs },
+  }
 }
 
 /** The change a reaction event type makes, or undefined for any other type. */
@@ -768,9 +780,13 @@ function reactionConversationDropOf(
   return persona.channels.some((entry) => entry.id === channel) ? undefined : { action: 'drop', reason: 'unserved-conversation' }
 }
 
-/** True when `value` is a non-null object, so its fields can be read. */
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null
+// ---------------------------------------------------------------------------
+// Shared record guard
+// ---------------------------------------------------------------------------
+
+/** Defined here to keep decisions runtime-import-free; record.ts re-exports it for other consumers. */
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 // ---------------------------------------------------------------------------

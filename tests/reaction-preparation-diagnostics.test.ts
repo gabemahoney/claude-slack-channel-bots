@@ -80,15 +80,13 @@ describe('builders', () => {
   test('external fields stay on one line, with tokens and URLs redacted', () => {
     const hostile: ReactionDiagnosticSubject = {
       ...SUBJECT,
-      chat_id: `C0GENERAL\r\n[slack] forged line ${fakeToken(BOT_TOKEN_PREFIX, 'chat')}`,
-      message_ts: `1700000100.000100\nhttps://files.slack.com/files-pri/T0/F0/x?pub_secret=${LEAK_SENTINEL}`,
+      chat_id: `C0GENERAL\r\n[slack] forged line\u007f\u0085 ${fakeToken(BOT_TOKEN_PREFIX, 'chat')}`,
+      message_ts: `1700000100.000100\u2028\u2029\u001bhttps://files.slack.com/files-pri/T0/F0/x?pub_secret=${LEAK_SENTINEL}`,
     }
     const lines = [buildReactionWithdrawnLine(hostile, 'group-dm'), buildReactionMessageUnknownLine(hostile)]
     for (const line of lines) {
-      expect(line.split(/[\r\n]/)).toHaveLength(1)
-      expect(line).toContain(` persona=${NAMED_REF} chat_id="C0GENERAL`)
-      expect(line).toContain(REDACTED_TOKEN_PLACEHOLDER)
-      expect(line).toContain(REDACTED_URL_PLACEHOLDER)
+      expect(line).not.toMatch(/[\p{Cc}\u2028\u2029]/u)
+      expect(line).toContain(` persona=${NAMED_REF} chat_id="C0GENERAL\\r\\n[slack] forged line\\u007f\\u0085 ${REDACTED_TOKEN_PLACEHOLDER}" message_ts="1700000100.000100\\u2028\\u2029\\u001b${REDACTED_URL_PLACEHOLDER}"`)
     }
     expect(lines.map(line => line.slice(0, line.indexOf(':')))).toEqual([`[slack] ${REACTION_WITHDRAWN}`, `[slack] ${REACTION_MESSAGE_UNKNOWN}`])
     expect(lines[0]!.endsWith(' reason=group-dm')).toBe(true)
@@ -127,16 +125,17 @@ describe('builders', () => {
   })
 
   test('a receiving persona name with quotes, control characters and a URL keeps its JSON-quoted configured form on one line', () => {
-    const name = 'Ops "Night"\r\nDesk\t\\ https://ops.example.test/desk'
+    const name = 'Ops "Night"\r\nDesk\t\\\u2028 https://ops.example.test/desk'
     const key = personaKey(name)
+    const escaped = `"Ops \\"Night\\"\\r\\nDesk\\t\\\\\\u2028 https://ops.example.test/desk" (key=${key})`
     const subject: ReactionDiagnosticSubject = { key, name, chat_id: 'C0GENERAL', message_ts: '1700000100.000100' }
     const lines = [buildReactionWithdrawnLine(subject, 'group-dm'), buildReactionMessageUnknownLine(subject)]
     expect(lines).toEqual([
-      `[slack] ${REACTION_WITHDRAWN}: persona=${renderPersonaRef(name, key)} ${WHERE} reason=group-dm`,
-      `[slack] ${REACTION_MESSAGE_UNKNOWN}: persona=${renderPersonaRef(name, key)} ${WHERE}`,
+      `[slack] ${REACTION_WITHDRAWN}: persona=${escaped} ${WHERE} reason=group-dm`,
+      `[slack] ${REACTION_MESSAGE_UNKNOWN}: persona=${escaped} ${WHERE}`,
     ])
     for (const line of lines) {
-      expect(line.split(/[\r\n]/)).toHaveLength(1)
+      expect(line).not.toMatch(/[\p{Cc}\u2028\u2029]/u)
       expect(line).not.toContain(REDACTED_URL_PLACEHOLDER)
     }
     assertNoLeak(lines)

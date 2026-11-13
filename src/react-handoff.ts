@@ -27,13 +27,11 @@
 
 import type { WebClient } from '@slack/web-api'
 import type { Persona } from './config.ts'
-import { escapeCause } from './persona-diagnostics.ts'
-import { renderPersonaRef } from './persona-identity.ts'
 import type { BotToolReactionInput, BotToolReactionIntakeResult } from './persona-routing.ts'
 import type { SlackBotIdentity } from './persona-slack-validation.ts'
 import { lookupReactionMessage, type ReactionMessageRead } from './reaction-preparation.ts'
+import { quoteReactionLogField as quote, reactionLogWord as word, renderReactionPersonaRef as ref } from './reaction-log-fields.ts'
 import type { ReactClaimContext } from './registry.ts'
-import { redactSlackLogText } from './slack-log-redaction.ts'
 import { NAME_LOOKUP_TIMEOUT_MS } from './tag-wrapper.ts'
 
 // ---------------------------------------------------------------------------
@@ -66,19 +64,13 @@ export interface ReactionHandoffFailure {
   reason: ReactionHandoffFailureReason
 }
 
-// JSON quoting escapes C0 controls and quotes; escapeCause also escapes DEL, C1 and U+2028/U+2029, which JSON.stringify leaves raw.
-const quote = (text: string): string => escapeCause(JSON.stringify(redactSlackLogText(text)))
-
-// The configured name is never redacted; escapeCause catches what renderPersonaRef's JSON quoting leaves raw, as in quote. A validated key passes through it unchanged.
-const ref = (p: ReactionHandoffPersona): string => escapeCause(p.name !== undefined ? renderPersonaRef(p.name, p.key) : p.key)
-
 /**
  * `[slack] reaction-handoff-failed: persona=<B ref>[ receiver=<A ref>] chat_id="…" message_ts="…" reason=<reason>`.
  * No message text, emoji, Slack response, error or token.
  */
 export function buildReactionHandoffFailedLine(f: ReactionHandoffFailure): string {
   const receiver = f.receiver !== undefined ? ` receiver=${ref(f.receiver)}` : ''
-  return `[slack] ${REACTION_HANDOFF_FAILED}: persona=${ref(f.reactor)}${receiver} chat_id=${quote(f.chat_id)} message_ts=${quote(f.message_ts)} reason=${f.reason}`
+  return `[slack] ${REACTION_HANDOFF_FAILED}: persona=${ref(f.reactor)}${receiver} chat_id=${quote(f.chat_id)} message_ts=${quote(f.message_ts)} reason=${word(f.reason)}`
 }
 
 // ---------------------------------------------------------------------------

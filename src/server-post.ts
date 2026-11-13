@@ -20,13 +20,10 @@
  */
 
 import { parsePermissionActionId } from './permission-action-id.ts'
+import { isRecord } from './record.ts'
 
 /** The `metadata.event_type` every Server Post carries. */
 export const SERVER_POST_EVENT_TYPE = 'cscb_server_post'
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-}
 
 /** The read-back payload is not checked: only writes promise it is empty. */
 function hasServerPostMarker(message: Record<string, unknown>): boolean {

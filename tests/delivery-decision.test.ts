@@ -33,6 +33,7 @@ import {
   type Via,
   decideDelivery,
   decideReaction,
+  parseReactionShape,
 } from '../src/delivery-decision.ts'
 import {
   broadcastText,
@@ -577,6 +578,31 @@ function expectRow(_label: string, event: unknown, expected: ReactionDecision, r
 }
 
 // ---------------------------------------------------------------------------
+// Reactions: parsed lookup and storage facts
+// ---------------------------------------------------------------------------
+
+describe('parseReactionShape: facts before policy', () => {
+  test.each([
+    ['reaction_added', 'added', ` ${PERSON} `, Q_USER, { id: ` ${PERSON} `, fields: { user: ` ${PERSON} ` } }],
+    ['reaction_removed', 'removed', '', ` ${INTEGRATION_BOT} `, { id: ` ${INTEGRATION_BOT} `, fields: { bot_id: ` ${INTEGRATION_BOT} ` } }],
+  ] as const)('%s keeps untrimmed lookup facts and the selected reactor in its durable key', (type, change, user, bot_id, reactor) => {
+    const event = frozen(reaction({ type, user, bot_id, reaction: ' :+1::skin-tone-2: ', event_ts: ` ${EVENT_TS} `, item_user: ` ${P_USER} ` }, { channel: ` ${ALL} `, ts: ` ${MESSAGE_TS} ` }))
+    expect(parseReactionShape(event)).toStrictEqual({
+      change, channel: ` ${ALL} `, messageTs: ` ${MESSAGE_TS} `,
+      emoji: ' :+1::skin-tone-2: ', eventTs: ` ${EVENT_TS} `, itemUser: ` ${P_USER} `, reactor,
+      reactionKey: { chat_id: ` ${ALL} `, message_ts: ` ${MESSAGE_TS} `, reactor: reactor.id, emoji: ' :+1::skin-tone-2: ', change, event_ts: ` ${EVENT_TS} ` },
+    })
+  })
+
+  test('a missing reactor preserves the message location and ownership facts without inventing a durable key', () => {
+    expect(parseReactionShape(frozen(reaction({ user: undefined, item_user: Q_USER })))).toStrictEqual({
+      change: 'added', channel: ALL, messageTs: MESSAGE_TS, emoji: EMOJI, eventTs: EVENT_TS,
+      itemUser: Q_USER, reactor: undefined, reactionKey: undefined,
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Reactions: accepted
 // ---------------------------------------------------------------------------
 
@@ -616,7 +642,7 @@ describe('reactions, rule 1: not-a-message-reaction', () => {
     ['null', null],
     ['undefined', undefined],
     ['a string', 'reaction_added'],
-    ['an array', []],
+    ['an array carrying valid reaction fields', Object.assign([], reaction())],
     ['a message event', makeChannelMessage({ channel: ALL })],
     ['an event with no type', reaction({ type: undefined })],
     ['a pin_added event on a message', reaction({ type: 'pin_added' })],
@@ -625,12 +651,14 @@ describe('reactions, rule 1: not-a-message-reaction', () => {
     ['no item', reaction({ item: undefined })],
     ['a null item', reaction({ item: null })],
     ['a string item', reaction({ item: 'message' })],
+    ['an array item carrying valid message fields', reaction({ item: Object.assign([], reaction().item) })],
     ['an item of type file', reaction({}, { type: 'file' })],
     ['a reaction_removed on an item of type file_comment', reaction({ type: 'reaction_removed' }, { type: 'file_comment' })],
     ['an item with no type', reaction({}, { type: undefined })],
     ...REQUIRED.flatMap(([field, build]) => NOT_NON_EMPTY.map(([form, value]): [string, unknown] => [`${field} ${form}`, build(value)])),
   ])('%s is not-a-message-reaction', (_label, event) => {
     expect(react(event)).toStrictEqual(dropped('not-a-message-reaction'))
+    expect(parseReactionShape(frozen(event))).toBeUndefined()
   })
 })
 

@@ -1,7 +1,7 @@
 /**
  * Reaction intake's server-log lines (SR-10.1): the class labels and the pure
  * builders, pinned once here; the received and dropped lines' content-free,
- * redacted, single-line rendering of whatever reaches them. The two bot-tool
+ * redacted, single-line rendering of whatever reaches them. The intake and bot-tool
  * failure lines take an already safe description, so routing's tests own
  * their redaction.
  */
@@ -12,8 +12,12 @@ import { personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import {
   buildBotToolReactionErrorLine,
   buildBotToolReactionStoreFailedLine,
+  buildReactionAckFailedLine,
   buildReactionDroppedLine,
+  buildReactionEventErrorLine,
+  buildReactionPreparationFailedLine,
   buildReactionReceivedLine,
+  buildReactionStoreFailedLine,
   REACTION_DROPPED,
   REACTION_LOGGED_DROP_REASONS,
   REACTION_RECEIVED,
@@ -71,6 +75,22 @@ describe('pins: the one place the class labels and line spelling are written out
       '[slack] reaction-dropped: persona="Ops Bot" (key=ops_bot) chat_id="C0GENERAL" message_ts="1700000100.000100" reason=fungible-refused refusal=externally-shared',
       '[slack] persona-routing: bot-tool reaction store failed for persona "Ops Bot" (key=ops_bot) (reason=internal_error): Error code=EIO message="store refused"',
       '[slack] persona-routing: error handling bot-tool reaction for persona key=ops_bot: TypeError message="lookup broke"',
+    ])
+    assertNoLeak(lines)
+  })
+
+  test.each([
+    [buildReactionEventErrorLine, '[slack] persona-routing: error handling reaction event for persona='],
+    [buildReactionAckFailedLine, '[slack] persona-routing: failed to ack reaction event for persona='],
+    [buildReactionPreparationFailedLine, '[slack] persona-routing: post-accept reaction preparation failed for persona='],
+    [buildReactionStoreFailedLine, '[slack] persona-routing: reaction store failed for persona='],
+  ] as const)('%p names the receiving persona, with its safe failure description', (build, prefix) => {
+    const described = ' (reason=internal_error): Error code=EIO message="store refused"'
+    const suffix = build === buildReactionStoreFailedLine ? ' — not acked, so Slack sends it again' : ''
+    const lines = [build(NAMED, described), build(KEY_ONLY, described)]
+    expect(lines).toEqual([
+      `${prefix}"Ops Bot" (key=ops_bot)${suffix}${described}`,
+      `${prefix}ops_bot${suffix}${described}`,
     ])
     assertNoLeak(lines)
   })
@@ -256,12 +276,13 @@ describe('the receiving persona name, as configured', () => {
   })
 
   test('a name with quotes, control characters and a URL keeps its JSON-quoted form on one line', () => {
-    const name = 'Ops "Night"\r\nDesk\t\\ https://ops.example.test/desk'
+    const name = 'Ops "Night"\r\nDesk\t\\\u2028 https://ops.example.test/desk'
     const persona: ReactionIntakePersona = { key: personaKey(name), name }
+    const escaped = `"Ops \\"Night\\"\\r\\nDesk\\t\\\\\\u2028 https://ops.example.test/desk" (key=${persona.key})`
     const lines = [buildReactionReceivedLine(persona, reaction({}, { bot_id: 'B0REACTOR' })), buildReactionDroppedLine(persona, { reason: 'no-reactor', chat_id: CHAT, message_ts: MSG_TS })]
     for (const line of lines) {
-      expect(line).toContain(` persona=${renderPersonaRef(name, persona.key)} chat_id=${quoted(CHAT)} `)
-      expect(line.split(/[\r\n]/)).toHaveLength(1)
+      expect(line).toContain(` persona=${escaped} chat_id=${quoted(CHAT)} `)
+      expect(line).not.toMatch(/[\p{Cc}\u2028\u2029]/u)
       expect(line).not.toContain(REDACTED_URL_PLACEHOLDER)
     }
     assertNoLeak(lines)

@@ -5,7 +5,7 @@
  * persona, the conversation, the reacted message's ts, the change, the emoji,
  * the reactor's ID and the item's sequence. `reaction-dropped` reports a drop
  * for one of the logged reasons only; the other drop reasons log nothing, and
- * the input types cannot name them. The two `bot-tool` intake failure lines
+ * the input types cannot name them. The intake failure lines
  * name the receiving persona and carry the caller's safe description of the
  * thrown value (`describeSlackCallFailure`), never the value itself. No line
  * carries message text, a display name other than the receiving persona's
@@ -15,8 +15,7 @@
 import type { ReactionFungibleRefusal } from './delivery-decision.ts'
 import type { ReactionAcceptedRecord } from './delivery-queue.ts'
 import { escapeCause } from './persona-diagnostics.ts'
-import { renderPersonaRef } from './persona-identity.ts'
-import { redactSlackLogText } from './slack-log-redaction.ts'
+import { quoteReactionLogField as quote, reactionLogWord as word, renderReactionPersonaRef } from './reaction-log-fields.ts'
 
 export const REACTION_RECEIVED = 'reaction-received'
 export const REACTION_DROPPED = 'reaction-dropped'
@@ -36,19 +35,10 @@ export type ReactionDroppedInput =
   | { reason: Exclude<ReactionLoggedDropReason, 'fungible-refused'>; chat_id?: string; message_ts?: string; refusal?: never }
   | { reason: 'fungible-refused'; chat_id?: string; message_ts?: string; refusal: ReactionFungibleRefusal }
 
-// JSON quoting escapes C0 controls and quotes; escapeCause also escapes DEL, C1 and U+2028/U+2029, which JSON.stringify leaves raw.
-const quote = (text: string): string => escapeCause(JSON.stringify(redactSlackLogText(text)))
-const word = (text: string): string => escapeCause(redactSlackLogText(text)).replace(/\s/g, '_')
-
-// The configured name is never redacted (renderPersonaRef's JSON quoting keeps it one line), and the key is a validated persona key.
-function persona(p: ReactionIntakePersona): string {
-  return `persona=${p.name !== undefined ? renderPersonaRef(p.name, p.key) : p.key}`
-}
-
 /** `[slack] reaction-received: persona=<ref> chat_id="…" message_ts="…" change=<added|removed> emoji="…" <user|bot_id>="…" seq=<n>` */
 export function buildReactionReceivedLine(p: ReactionIntakePersona, record: ReactionAcceptedRecord): string {
   const reactor = record.user !== undefined && record.user !== '' ? `user=${quote(record.user)}` : `bot_id=${quote(record.bot_id ?? '')}`
-  return `[slack] ${REACTION_RECEIVED}: ${persona(p)} chat_id=${quote(record.channel)} message_ts=${quote(record.message_ts)} change=${word(record.change)} emoji=${quote(record.emoji)} ${reactor} seq=${word(String(record.seq))}`
+  return `[slack] ${REACTION_RECEIVED}: persona=${renderReactionPersonaRef(p)} chat_id=${quote(record.channel)} message_ts=${quote(record.message_ts)} change=${word(record.change)} emoji=${quote(record.emoji)} ${reactor} seq=${word(String(record.seq))}`
 }
 
 /** `[slack] reaction-dropped: persona=<ref>[ chat_id="…"][ message_ts="…"] reason=<reason>[ refusal=<refusal>]` */
@@ -56,7 +46,27 @@ export function buildReactionDroppedLine(p: ReactionIntakePersona, drop: Reactio
   const chat = drop.chat_id !== undefined ? ` chat_id=${quote(drop.chat_id)}` : ''
   const message = drop.message_ts !== undefined ? ` message_ts=${quote(drop.message_ts)}` : ''
   const refusal = drop.reason === 'fungible-refused' ? ` refusal=${word(drop.refusal)}` : ''
-  return `[slack] ${REACTION_DROPPED}: ${persona(p)}${chat}${message} reason=${word(drop.reason)}${refusal}`
+  return `[slack] ${REACTION_DROPPED}: persona=${renderReactionPersonaRef(p)}${chat}${message} reason=${word(drop.reason)}${refusal}`
+}
+
+/** A routing/decision throw is acked. `described` is describeSlackCallFailure's safe tail. */
+export function buildReactionEventErrorLine(p: ReactionIntakePersona, described: string): string {
+  return `[slack] persona-routing: error handling reaction event for persona=${renderReactionPersonaRef(p)}${escapeCause(described)}`
+}
+
+/** The stored item waits for redelivery/recovery after a failed ack. */
+export function buildReactionAckFailedLine(p: ReactionIntakePersona, described: string): string {
+  return `[slack] persona-routing: failed to ack reaction event for persona=${renderReactionPersonaRef(p)}${escapeCause(described)}`
+}
+
+/** Shared by Slack-event and bot-tool post-accept preparation failures. */
+export function buildReactionPreparationFailedLine(p: ReactionIntakePersona, described: string): string {
+  return `[slack] persona-routing: post-accept reaction preparation failed for persona=${renderReactionPersonaRef(p)}${escapeCause(described)}`
+}
+
+/** A thrown store leaves the Slack event unacked. */
+export function buildReactionStoreFailedLine(p: ReactionIntakePersona, described: string): string {
+  return `[slack] persona-routing: reaction store failed for persona=${renderReactionPersonaRef(p)} — not acked, so Slack sends it again${escapeCause(described)}`
 }
 
 /**
@@ -66,7 +76,7 @@ export function buildReactionDroppedLine(p: ReactionIntakePersona, drop: Reactio
  * `[slack] persona-routing: bot-tool reaction store failed for persona <ref>[ (reason=<code>)]: <description>`
  */
 export function buildBotToolReactionStoreFailedLine(ref: string, described: string): string {
-  return `[slack] persona-routing: bot-tool reaction store failed for persona ${ref}${described}`
+  return `[slack] persona-routing: bot-tool reaction store failed for persona ${escapeCause(ref)}${escapeCause(described)}`
 }
 
 /**
@@ -76,5 +86,5 @@ export function buildBotToolReactionStoreFailedLine(ref: string, described: stri
  * `[slack] persona-routing: error handling bot-tool reaction for persona <ref>[ (reason=<code>)]: <description>`
  */
 export function buildBotToolReactionErrorLine(ref: string, described: string): string {
-  return `[slack] persona-routing: error handling bot-tool reaction for persona ${ref}${described}`
+  return `[slack] persona-routing: error handling bot-tool reaction for persona ${escapeCause(ref)}${escapeCause(described)}`
 }
