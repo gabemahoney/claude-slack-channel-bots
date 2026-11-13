@@ -191,6 +191,9 @@ const sealed = new WeakSet<object>()
 /** The sealed containers a membership transaction copied. Most of their
  * members are the previous revision's objects, so they are encoded by member. */
 const copied = new WeakSet<object>()
+/** The encodings kept for later revisions: only sealed objects that are not
+ * copied containers. A copied container's text would repeat its members'
+ * texts at each level above them, about five copies of the state in all. */
 const encodings = new WeakMap<object, { depth: number; text: string }>()
 /** Committed states share their objects across revisions, so they are frozen
  * whole: an in-place write throws instead of reaching another revision. A
@@ -204,48 +207,60 @@ function freeze<T>(value: T): T {
 const INDENTS: string[] = ['']
 function indent(depth: number): string { return INDENTS[depth] ??= '  '.repeat(depth) }
 const NOT_SEALED_DATA = 'Not sealed JSON data.'
-/** `JSON.stringify(value, null, 2)` of a sealed object nested `depth` levels
- * deep, as its parent's encoding holds it: kept from an earlier revision,
- * joined from a copied container's members, or the native encoder's
- * re-indented. Throws, having run no code of the state's, on an object this
- * module did not seal, and on what a transaction wrote that is not JSON data. */
-function encodeSealed(value: object, depth: number): string {
-  const cached = encodings.get(value)
-  if (cached !== undefined && cached.depth === depth) return cached.text
+/** Appends to `out` the parts of `JSON.stringify(value, null, 2)` of a sealed
+ * object nested `depth` levels deep, as its parent's encoding holds it: a
+ * copied container's member by member, any other's kept from an earlier
+ * revision or the native encoder's re-indented. Throws, having run no code of
+ * the state's, on an object this module did not seal, and on what a
+ * transaction wrote that is not JSON data. */
+function encodeSealed(value: object, depth: number, out: string[]): void {
   if (!sealed.has(value)) throw new Error(NOT_SEALED_DATA)
-  let text: string
   if (!copied.has(value)) {
-    // JSON text has newlines only between tokens, each followed by the indent.
-    text = JSON.stringify(value, null, 2)
-    if (depth) text = text.replaceAll('\n', '\n' + indent(depth))
-  } else {
-    const inner = indent(depth + 1), members: string[] = [], list = Array.isArray(value)
-    // A transaction may have left what the native encoder treats otherwise:
-    // a proxy's traps, an own `toJSON` of any kind (it is read whether
-    // enumerable or not), one inherited from another prototype, a member's
-    // accessor, or a boxed primitive's value (a raw JSON object's prototype is null).
-    if (types.isProxy(value) || Object.getPrototypeOf(value) !== (list ? Array.prototype : Object.prototype) || Object.hasOwn(value, 'toJSON') ||
-        types.isBoxedPrimitive(value)) throw new Error(NOT_SEALED_DATA)
-    const member = (key: string | number): unknown => {
-      const property = Object.getOwnPropertyDescriptor(value, key)
-      if (!property || !('value' in property)) throw new Error(NOT_SEALED_DATA)
-      return property.value
+    let cached = encodings.get(value)
+    if (cached === undefined || cached.depth !== depth) {
+      // JSON text has newlines only between tokens, each followed by the indent.
+      let text = JSON.stringify(value, null, 2)
+      if (depth) text = text.replaceAll('\n', '\n' + indent(depth))
+      encodings.set(value, cached = { depth, text })
     }
-    if (list) {
-      for (let i = 0; i < value.length; i++) members.push(inner + (encodeMember(member(i), depth + 1) ?? 'null'))
-    } else {
-      for (const key of Object.keys(value)) {
-        const encoded = encodeMember(member(key), depth + 1)
-        if (encoded !== undefined) members.push(inner + JSON.stringify(key) + ': ' + encoded)
+    out.push(cached.text)
+    return
+  }
+  const list = Array.isArray(value)
+  // A transaction may have left what the native encoder treats otherwise:
+  // a proxy's traps, an own `toJSON` of any kind (it is read whether
+  // enumerable or not), one inherited from another prototype, a member's
+  // accessor, or a boxed primitive's value (a raw JSON object's prototype is null).
+  if (types.isProxy(value) || Object.getPrototypeOf(value) !== (list ? Array.prototype : Object.prototype) || Object.hasOwn(value, 'toJSON') ||
+      types.isBoxedPrimitive(value)) throw new Error(NOT_SEALED_DATA)
+  const member = (key: string | number): unknown => {
+    const property = Object.getOwnPropertyDescriptor(value, key)
+    if (!property || !('value' in property)) throw new Error(NOT_SEALED_DATA)
+    return property.value
+  }
+  // Each member's parts follow its opening bracket or the separator.
+  const open = (list ? '[\n' : '{\n') + indent(depth + 1), separator = ',\n' + indent(depth + 1)
+  let members = 0
+  if (list) {
+    for (let i = 0; i < value.length; i++) {
+      const item = member(i)
+      out.push(members++ ? separator : open)
+      if (typeof item === 'object' && item !== null) encodeSealed(item, depth + 1, out)
+      else out.push(JSON.stringify(item) ?? 'null')
+    }
+  } else {
+    for (const key of Object.keys(value)) {
+      const item = member(key)
+      if (typeof item === 'object' && item !== null) {
+        out.push(members++ ? separator : open, JSON.stringify(key), ': ')
+        encodeSealed(item, depth + 1, out)
+      } else {
+        const encoded = JSON.stringify(item)
+        if (encoded !== undefined) out.push(members++ ? separator : open, JSON.stringify(key), ': ', encoded)
       }
     }
-    text = !members.length ? (list ? '[]' : '{}') : (list ? '[\n' : '{\n') + members.join(',\n') + '\n' + indent(depth) + (list ? ']' : '}')
   }
-  encodings.set(value, { depth, text })
-  return text
-}
-function encodeMember(value: unknown, depth: number): string | undefined {
-  return typeof value === 'object' && value !== null ? encodeSealed(value, depth) : JSON.stringify(value)
+  out.push(!members ? (list ? '[]' : '{}') : '\n' + indent(depth) + (list ? ']' : '}'))
 }
 /** The value as reading its serialized form back gives it. */
 function reparse(value: unknown): unknown {
@@ -602,16 +617,18 @@ function checkAppliedChoices(state: SharedChannelState, config: PersonaConfig, d
   }
 }
 export function serializeSharedChannelState(state: SharedChannelState): Uint8Array {
-  return Buffer.from(encodeState(state) + '\n')
+  return Buffer.from(encodeState(state, '\n'))
 }
-/** `JSON.stringify(state, null, 2)`. A sealed state reuses the encodings of
- * the objects it shares with earlier revisions; any other value, or anything
- * the reuse cannot encode exactly, takes the native encoder. */
-function encodeState(state: SharedChannelState): string {
+/** `JSON.stringify(state, null, 2)` followed by `end`. A sealed state reuses
+ * the encodings of the objects it shares with earlier revisions, joined once
+ * into the whole text; any other value, or anything the reuse cannot encode
+ * exactly, takes the native encoder. */
+function encodeState(state: SharedChannelState, end: string): string {
   if (sealed.has(state) && !('toJSON' in Object.prototype) && !('toJSON' in Array.prototype)) {
-    try { return encodeSealed(state, 0) } catch { /* the native encoder decides */ }
+    const out: string[] = []
+    try { encodeSealed(state, 0, out); out.push(end); return out.join('') } catch { /* the native encoder decides */ }
   }
-  return JSON.stringify(state, null, 2)
+  return JSON.stringify(state, null, 2) + end
 }
 export function initialSharedChannelState(bytes: Uint8Array, config: PersonaConfig, incarnation: () => string = randomUUID, threadHybridSince: () => string = randomUUID): SharedChannelState {
   const raw = parseConfigJsonBytes(bytes, 'prepared configuration') as Record<string, unknown>

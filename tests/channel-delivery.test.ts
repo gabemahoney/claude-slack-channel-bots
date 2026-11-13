@@ -537,11 +537,13 @@ test('the production reader refuses malformed typed evidence without dumping ide
   check(authority.snapshot())
 })
 
-import { closeSync, fsyncSync, openSync, readdirSync, renameSync, unlinkSync, writeSync } from 'node:fs'
+import { closeSync, fsyncSync, openSync, readdirSync, renameSync, statSync, unlinkSync, writeSync } from 'node:fs'
 import type { DurableWriteFs } from '../src/atomic-write.ts'
 import { applySharedMembership, applySharedMemberships, SHARED_CHANNEL_FORMAT, sharedAppliedConfig, type SharedChannelAuthority, type SharedChannelDeps, type VerifiedSharedMembership } from '../src/shared-channels.ts'
 import { channelPopulation } from './test-helpers/shared-channels.ts'
 import { SR8_SHARED_LIST_CHANNELS } from './test-helpers/thread-memory.ts'
+import { MEMBERSHIP_PAGE_LIMIT } from '../src/channel-membership-retry.ts'
+import { heapStats } from 'bun:jsc'
 describe('membership transactions copy only their persona', () => {
   const joinOf = (channel: string, event = `Ev${channel}`): VerifiedSharedMembership => ({ event, identity: 'app', channel, member: true, boundary: 0 })
   const boundaryOf = (authority: SharedChannelAuthority, key: string, channel: string) => authority.lifetime(key, channel)?.membershipBoundary ?? 0
@@ -890,6 +892,38 @@ describe('membership transactions copy only their persona', () => {
     expect(encoded.every(chars => chars < narrow.size / 2)).toBe(true)
     expect(encoded.map(chars => chars < narrow.size / 10)).toEqual(encoded.map((_, i) => i !== 5 && i !== 10))
     check(narrow.authority.snapshot())
+  })
+
+  // t3.yiv.sf.pk.tj: the encodings kept for later commits held each copied
+  // container's text, which repeats its members' at every level above them:
+  // about five copies of the state, growing with the membership events each
+  // scan adds, until test-32's measured server outgrew its shard.
+  test('repeated scans beside SR8_SHARED_LIST_CHANNELS channels per persona retain under three bytes of text per state byte they add', () => {
+    const config = input(); config.channel_mode = 'open'
+    const state = initialSharedState(root, config)
+    writeSharedState(root, state)
+    const authority = createSharedChannelAuthority(sharedChannelPath(root), state, { threadHybridSince: () => 'since' })
+    const ids = channelPopulation(SR8_SHARED_LIST_CHANNELS).map(channel => channel.id)
+    // One full scan of both personas: a write per page of positives.
+    const scan = (round: number) => {
+      for (const key of ['alpha', 'beta']) for (let at = 0; at < ids.length; at += MEMBERSHIP_PAGE_LIMIT) {
+        expect(page(authority, key, ids.slice(at, at + MEMBERSHIP_PAGE_LIMIT), `round-${round}`).kind).toBe('applied')
+      }
+    }
+    // String text lives outside the collected heap; a full collection leaves
+    // only what is retained. Read before anything else is allocated.
+    const reading = () => { Bun.gc(true); Bun.gc(true); const retained = heapStats().extraMemorySize; return { retained, bytes: statSync(authority.path).size } }
+    scan(0)
+    const first = reading()
+    for (let round = 1; round <= 10; round++) scan(round)
+    const last = reading()
+    const grown = (last.retained - first.retained) / (last.bytes - first.bytes)
+    console.info(`retained text per state byte added: ${grown.toFixed(2)} (state ${first.bytes} -> ${last.bytes} bytes)`)
+    // Measured: 5.6 with container encodings kept, 1.3 to 1.9 with the
+    // records' alone, about 0.3 with none kept (before Task ws).
+    expect(grown).toBeLessThan(3)
+    expect(readFileSync(authority.path).toString()).toBe(JSON.stringify(authority.snapshot(), null, 2) + '\n')
+    check(authority.snapshot())
   })
 
   // t3.yiv.sf.ws.ih: each recipient of a commit parsed the applied
