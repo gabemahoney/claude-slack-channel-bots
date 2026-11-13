@@ -75,9 +75,11 @@
  * switch) and `ReactionDecisionInputs` (the channel mode, the envelope flag,
  * the channel-ID pattern, where the event came from, and whether an ID is one
  * of the Run Bot Identities: the bot user IDs confirmed for any persona
- * during this server run). It returns accept (with the reaction's facts and
- * its reactor, a `user` or a `bot_id`) or drop (with a machine-readable
- * reason). The first rule the event fails drops it:
+ * during this server run). The event comes from `slack-event`, a Slack event
+ * on P's own connection, or `bot-tool`, a reaction another persona's Bot made
+ * with its `react` tool, which has no envelope. It returns accept (with the
+ * reaction's facts and its reactor, a `user` or a `bot_id`) or drop (with a
+ * machine-readable reason). The first rule the event fails drops it:
  *
  * 1. Reaction shape: the event is `reaction_added` (change `added`) or
  *    `reaction_removed` (change `removed`), its `item.type` is `message`,
@@ -87,18 +89,20 @@
  *    P has none, `not-own-message`.
  * 3. Reactor: the event's `user`, or its `bot_id` when it has no `user`;
  *    with neither, `no-reactor`. A reactor that is P's bot user ID is
- *    `own-reaction`; one of the Run Bot Identities is `bot-reaction`.
+ *    `own-reaction`; one of the Run Bot Identities is `bot-reaction`, for a
+ *    `slack-event` only, since a `bot-tool` reactor is one by design.
  * 4. Conversation: one P serves now. A conversation ID starting with `D` is a
  *    DM, accepted when P's DMs switch is on and `dm-disabled` otherwise. In
  *    declarative mode any other conversation must be one of P's channel
  *    entries, whatever its `delivery`, else `unserved-conversation`; the
  *    envelope flag and the channel-ID pattern play no part. In fungible mode
  *    no persona's channel entries are read: the conversation ID must match
- *    the channel-ID pattern and the envelope flag must be present, a boolean
- *    and `false`, else `fungible-refused` with the refusal of the first
- *    that fails. Reaction events carry no `channel_type`, so the group-DM
- *    exclusion and the fungible path's channel-type condition are left to the
- *    reaction's preparation after acceptance.
+ *    the channel-ID pattern and, for a `slack-event`, the envelope flag must
+ *    be present, a boolean and `false`, else `fungible-refused` with the
+ *    refusal of the first that fails. Reaction events carry no
+ *    `channel_type`, so the group-DM exclusion and the fungible path's
+ *    channel-type condition are left to the reaction's preparation after
+ *    acceptance, and so is a `bot-tool` event's external sharing.
  *
  * P's channel delivery (`mentions` or `all`), the stored choices and the
  * loop guard play no part in a reaction's decision. Both decisions check the
@@ -163,6 +167,9 @@ const REACTION_REMOVED_EVENT = 'reaction_removed'
 
 /** The `item.type` of a reaction on a message. */
 const MESSAGE_ITEM_TYPE = 'message'
+
+/** The origin of a reaction another persona's Bot made with its `react` tool. */
+const BOT_TOOL_ORIGIN: ReactionDecisionOrigin = 'bot-tool'
 
 /**
  * The destination value that sends by DM (`DM_DESTINATION` in
@@ -371,13 +378,18 @@ export interface AppliedPersonaView {
  */
 export type ReactionDecisionPersona = Pick<DeliveryPersona, 'key' | 'botUserId' | 'channels' | 'dmEnabled'>
 
-/** Where a reaction `decideReaction` decides came from: a Slack event on P's own connection. */
-export type ReactionDecisionOrigin = 'slack-event'
+/**
+ * Where a reaction `decideReaction` decides came from: `slack-event`, a
+ * Slack event on P's own connection, or `bot-tool`, a reaction another
+ * persona's Bot made with its `react` tool, handed to P's intake with no
+ * envelope.
+ */
+export type ReactionDecisionOrigin = 'slack-event' | 'bot-tool'
 
 /**
  * The inputs of `decideReaction` besides the event and P, each read at the
- * call. The envelope flag and the channel-ID pattern are read in fungible
- * mode only.
+ * call. The channel-ID pattern is read in fungible mode only, and the
+ * envelope flag only there for a `slack-event`.
  */
 export interface ReactionDecisionInputs extends Pick<FungibleDecisionInputs, 'mode' | 'isExtSharedChannel' | 'channelIdPattern'> {
   /** Where the event came from; carried into the accept outcome. */
@@ -385,7 +397,7 @@ export interface ReactionDecisionInputs extends Pick<FungibleDecisionInputs, 'mo
   /**
    * Whether `id` is one of the Run Bot Identities: the bot user IDs confirmed
    * for any persona during this server run, removed personas included.
-   * Synchronous, with no side effect.
+   * Synchronous, with no side effect. Not asked for a `bot-tool` event.
    */
   isRunBotIdentity(id: string): boolean
 }
@@ -666,7 +678,7 @@ export function decideReaction(
   const reactor = reactorOf(reaction.event)
   if (reactor === undefined) return { action: 'drop', reason: 'no-reactor' }
   if (reactor.id === ownUser) return { action: 'drop', reason: 'own-reaction' }
-  if (inputs.isRunBotIdentity(reactor.id)) return { action: 'drop', reason: 'bot-reaction' }
+  if (inputs.origin !== BOT_TOOL_ORIGIN && inputs.isRunBotIdentity(reactor.id)) return { action: 'drop', reason: 'bot-reaction' }
 
   // Every reactor rule comes before every conversation rule, so a Bot's
   // reaction is `bot-reaction` in any conversation, served or not.
@@ -722,8 +734,8 @@ function reactorOf(ev: Record<string, unknown>): { id: string; fields: ReactionR
 /**
  * The conversation rule: undefined when P serves `channel` now, else its drop.
  * A DM depends on P's DMs switch alone in both modes; declarative mode reads
- * only P's channel entries, fungible mode only the channel-ID pattern and the
- * envelope flag.
+ * only P's channel entries, fungible mode only the channel-ID pattern and,
+ * for a `slack-event`, the envelope flag.
  */
 function reactionConversationDropOf(
   channel: string,
@@ -734,7 +746,8 @@ function reactionConversationDropOf(
     return persona.dmEnabled ? undefined : { action: 'drop', reason: 'dm-disabled' }
   }
   if (inputs.mode === FUNGIBLE_MODE) {
-    const refusal = channelIdRefusalOf(channel, inputs.channelIdPattern) ?? envelopeFlagRefusalOf(inputs.isExtSharedChannel)
+    const refusal = channelIdRefusalOf(channel, inputs.channelIdPattern)
+      ?? (inputs.origin === BOT_TOOL_ORIGIN ? undefined : envelopeFlagRefusalOf(inputs.isExtSharedChannel))
     return refusal === undefined ? undefined : { action: 'drop', reason: 'fungible-refused', refusal }
   }
   return persona.channels.some((entry) => entry.id === channel) ? undefined : { action: 'drop', reason: 'unserved-conversation' }

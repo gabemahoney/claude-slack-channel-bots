@@ -15,6 +15,9 @@ import {
   type DropDecision,
   type FungibleDecisionInputs,
   type FungiblePath,
+  type ReactionAcceptDecision,
+  type ReactionDecision,
+  type ReactionDecisionOrigin,
   type ReactionDropDecision,
   type StoredChoices,
 } from './delivery-decision.ts'
@@ -31,7 +34,13 @@ import {
 } from './persona-diagnostics.ts'
 import { describeSlackCallFailure } from './persona-connection-errors.ts'
 import { isQueueItemClosed, isReactionKey, type DeliveryQueue, type QueueAcceptResult, type QueueItem, type AcceptedInput, type ReactionAcceptedInput, type ReactionAcceptedRecord, type ReactionKey } from './delivery-queue.ts'
-import { buildReactionDroppedLine, buildReactionReceivedLine, type ReactionDroppedInput } from './reaction-intake-diagnostics.ts'
+import {
+  buildBotToolReactionErrorLine,
+  buildBotToolReactionStoreFailedLine,
+  buildReactionDroppedLine,
+  buildReactionReceivedLine,
+  type ReactionDroppedInput,
+} from './reaction-intake-diagnostics.ts'
 import { getSessionByPersona } from './registry.ts'
 import { isRestartPendingOrActive, RESTART_FAILURE_CAP, scheduleRestart } from './restart.ts'
 import { isAtCap } from './backoff.ts'
@@ -58,12 +67,46 @@ const APP_MENTION_EVENT_TYPE = 'app_mention'
 /** The channel mode in which a persona serves the channels its app is in. */
 const FUNGIBLE_MODE: ChannelMode = 'fungible'
 
+/** The reaction event type a `bot-tool` reaction's change stands for. */
+const BOT_TOOL_EVENT_TYPES: Readonly<Record<BotToolReactionInput['change'], string>> = { added: 'reaction_added' }
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 /** The Slack `ack` handed over with a Socket Mode event. */
 export type SlackAck = () => Promise<void> | void
+
+/**
+ * A reaction persona B made with its own `react` tool on a message of the
+ * receiving persona A, as A's reaction intake takes it. `reactorUserId` and
+ * `reactorPersonaName` are B's confirmed bot user ID and persona name at
+ * hand-off; `messageAuthorUserId` is the reacted message's author as read,
+ * which the decision checks against A's confirmed bot user ID; `eventTs` is
+ * when CSCB observed B's answer, already formatted.
+ */
+export interface BotToolReactionInput {
+  change: 'added'
+  reactorUserId: string
+  reactorPersonaName: string
+  emoji: string
+  channel: string
+  messageTs: string
+  eventTs: string
+  messageAuthorUserId: string
+}
+
+/**
+ * What A's intake did with a `bot-tool` reaction: `stored` (durably accepted
+ * as a new Reaction Item, not yet fixed or delivered), `duplicate` (the queue
+ * already holds its reaction key), `dropped` (not accepted for A) or
+ * `store-failed` (not stored). It carries no queue item, error or message.
+ */
+export type BotToolReactionIntakeResult =
+  | { status: 'stored'; seq: number }
+  | { status: 'duplicate'; seq: number }
+  | { status: 'dropped' }
+  | { status: 'store-failed' }
 
 /**
  * The persona config fields this module reads: the personas, the restart
@@ -245,6 +288,18 @@ export interface PersonaRouting {
    */
   receiveReaction(event: unknown, ack: SlackAck, personaKey: string, isExtSharedChannel?: unknown): Promise<void>
   /**
+   * Take one reaction another persona's Bot made with its `react` tool on a
+   * message of the persona `personaKey`, with origin `bot-tool` and no Slack
+   * envelope or ack. As for `receiveReaction`, a reaction key the queue holds
+   * is a duplicate; otherwise the reaction is decided under the configuration
+   * in effect now, without the Run Bot and envelope-flag conditions, and an
+   * accepted one is stored as a Reaction Item with the decision's mode and the
+   * reacting persona's name. A retained item not yet fixed or closed then goes
+   * to preparation, whose outcome does not change the result. Nothing before
+   * the store makes a network call. Never rejects.
+   */
+  receiveBotToolReaction(personaKey: string, input: BotToolReactionInput): Promise<BotToolReactionIntakeResult>
+  /**
    * Forget ephemeral heard-channel state on teardown. Durable queue records
    * and Slack keys remain under their original persona key.
    */
@@ -407,44 +462,102 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     const config = deps.getPersonaConfig()
     const persona = config?.personas.find(p => p.key === key)
     if (!config || !persona) return undefined
-    const identity = deps.getBotIdentity(key)
-    // Extension points. A `notices-off` drop (the persona's reaction notices
-    // switch) belongs in decideReaction after its reactor rules and before its
-    // conversation rules; this intake then passes the switch in effect and
-    // logs it with its own reaction-dropped variant. A reaction made by a
-    // Bot's own tool call is a separate intake, not this one: no Slack ack, a
-    // deliberately widened decision origin, and only the Run Bot and envelope
-    // flag checks skipped (ownership, own-reactor, the switch, conversation,
-    // DM and channel-ID checks still apply). It shares this reaction key,
-    // queue.accept and prepare; preparation reads the stored mode and name.
-    const decision = decideReaction(event, { key, botUserId: identity?.botUserId, channels: persona.channels, dmEnabled: persona.dm.enabled }, {
-      mode: channelModeOf(config),
-      origin: 'slack-event',
-      channelIdPattern: CHANNEL_ID_RE,
-      isExtSharedChannel,
-      isRunBotIdentity: (id) => deps.isRunBotIdentity?.(id) ?? true,
-    })
+    const decision = decideReactionFor(event, key, config, persona, 'slack-event', isExtSharedChannel)
     if (decision.action === 'drop') { logReactionDrop(persona, event, decision); return undefined }
-    const reactorId = decision.user ?? decision.bot_id
-    const input: ReactionAcceptedInput = {
-      source: 'reaction', text: '', channel: decision.channel, message_ts: decision.message_ts, ts: decision.ts,
-      change: decision.change, emoji: decision.emoji, ...(decision.user !== undefined ? { user: decision.user } : { bot_id: reactorId }),
-      origin: decision.origin, mode: decision.mode,
-      reaction_key: { chat_id: decision.channel, message_ts: decision.message_ts, reactor: reactorId, emoji: decision.emoji, change: decision.change, event_ts: decision.ts },
-      received_at: (deps.now ?? Date.now)(),
-    }
     let result: QueueAcceptResult
-    try { result = await deps.queue.accept(key, input) } catch (err) {
+    try { result = await deps.queue.accept(key, reactionAcceptedInputOf(decision, (deps.now ?? Date.now)())) } catch (err) {
       safeLog(() => `[slack] persona-routing: reaction store failed for persona ${refForKey(key)} — not acked, so Slack sends it again${describeSlackCallFailure(err)}`)
       return 'store-failed'
     }
     if (result.status === 'failed') return 'store-failed'
     // A duplicate here lost a race to a concurrent copy, which logged its line.
-    const stored = result.item
-    if (result.status === 'accepted' && stored?.accepted.source === 'reaction') {
-      safeLog(() => buildReactionReceivedLine({ key, name: persona.name }, stored.accepted as ReactionAcceptedRecord))
+    logReactionReceived(persona, result)
+    return result.item
+  }
+
+  async function receiveBotToolReaction(key: string, input: BotToolReactionInput): Promise<BotToolReactionIntakeResult> {
+    let taken: { result: BotToolReactionIntakeResult; retained?: QueueItem }
+    try {
+      taken = await takeBotToolReaction(key, input)
+    } catch (err) {
+      safeLog(() => buildBotToolReactionErrorLine(refForKey(key), describeSlackCallFailure(err)))
+      return { status: 'store-failed' }
     }
-    return stored
+    const { result, retained } = taken
+    if (retained === undefined || retained.fixed || isQueueItemClosed(retained)) return result
+    try { await deps.prepare(key, retained) } catch (err) {
+      safeLog(() => `[slack] persona-routing: post-accept reaction preparation failed${describeSlackCallFailure(err)}`)
+    }
+    return result
+  }
+
+  /**
+   * Everything before a `bot-tool` reaction's preparation: its result, and
+   * the retained item to prepare (absent for a drop, a failure, or a
+   * duplicate kept only as its key). The queue logs a failed store itself.
+   */
+  async function takeBotToolReaction(key: string, input: BotToolReactionInput): Promise<{ result: BotToolReactionIntakeResult; retained?: QueueItem }> {
+    // Copied now, so a later change to the caller's object cannot relabel accepted work.
+    const reactorPersonaName = input.reactorPersonaName
+    const event = botToolReactionEventOf(input)
+    // The durable key check comes before the decision, as for Slack events.
+    const reactionKey = reactionKeyOf(event)
+    const duplicate = reactionKey ? deps.queue.lookupReactionKey(key, reactionKey) : undefined
+    if (duplicate?.status === 'failed') return { result: { status: 'store-failed' } }
+    if (duplicate) return { result: { status: 'duplicate', seq: duplicate.seq }, retained: duplicate.item }
+    const config = deps.getPersonaConfig()
+    const persona = config?.personas.find(p => p.key === key)
+    if (!config || !persona) return { result: { status: 'dropped' } }
+    const decision = decideReactionFor(event, key, config, persona, 'bot-tool')
+    if (decision.action === 'drop') { logReactionDrop(persona, event, decision); return { result: { status: 'dropped' } } }
+    let result: QueueAcceptResult
+    try {
+      result = await deps.queue.accept(key, { ...reactionAcceptedInputOf(decision, (deps.now ?? Date.now)()), reactor_persona_name: reactorPersonaName })
+    } catch (err) {
+      safeLog(() => buildBotToolReactionStoreFailedLine(refForKey(key), describeSlackCallFailure(err)))
+      return { result: { status: 'store-failed' } }
+    }
+    if (result.status === 'failed') return { result: { status: 'store-failed' } }
+    if (result.status === 'duplicate') return { result: { status: 'duplicate', seq: result.seq }, retained: result.item }
+    logReactionReceived(persona, result)
+    return { result: { status: 'stored', seq: result.seq }, retained: result.item }
+  }
+
+  /**
+   * `decideReaction` for persona `key` under the configuration in effect now:
+   * its channels, DMs switch and confirmed bot user ID, the mode,
+   * `CHANNEL_ID_RE` and the Run Bot Identities. A `bot-tool` reaction has no
+   * envelope flag.
+   */
+  function decideReactionFor(
+    event: unknown,
+    key: string,
+    config: PersonaRoutingConfig,
+    persona: Persona,
+    origin: ReactionDecisionOrigin,
+    isExtSharedChannel?: unknown,
+  ): ReactionDecision {
+    const identity = deps.getBotIdentity(key)
+    // Extension point. A `notices-off` drop (the persona's reaction notices
+    // switch) belongs in decideReaction after its reactor rules and before its
+    // conversation rules, for both origins; this then passes the switch in
+    // effect, and logReactionDrop logs it with its own reaction-dropped variant.
+    return decideReaction(event, { key, botUserId: identity?.botUserId, channels: persona.channels, dmEnabled: persona.dm.enabled }, {
+      mode: channelModeOf(config),
+      origin,
+      channelIdPattern: CHANNEL_ID_RE,
+      isExtSharedChannel,
+      isRunBotIdentity: (id) => deps.isRunBotIdentity?.(id) ?? true,
+    })
+  }
+
+  /** One `reaction-received` line for a newly stored Reaction Item; a duplicate logs none. */
+  function logReactionReceived(persona: Persona, result: QueueAcceptResult): void {
+    if (result.status !== 'accepted') return
+    const stored = result.item
+    if (stored?.accepted.source === 'reaction') {
+      safeLog(() => buildReactionReceivedLine({ key: persona.key, name: persona.name }, stored.accepted as ReactionAcceptedRecord))
+    }
   }
 
   /** One `reaction-dropped` line for a logged reason; the other reasons log nothing. */
@@ -696,6 +809,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   return {
     receive,
     receiveReaction,
+    receiveBotToolReaction,
     forget: (key) => {
       heardSets.delete(key)
     },
@@ -737,6 +851,37 @@ function reactionKeyOf(event: unknown): ReactionKey | undefined {
   const reactor = typeof user === 'string' && user !== '' ? user : ev['bot_id']
   const key = { chat_id, message_ts, reactor, emoji: ev['reaction'], change, event_ts: ev['event_ts'] }
   return isReactionKey(key) ? key : undefined
+}
+
+/**
+ * A `bot-tool` reaction as the Slack-shaped event the decision and the
+ * reaction key read, with no envelope: each field copied from `input` now.
+ */
+function botToolReactionEventOf(input: BotToolReactionInput): Record<string, unknown> {
+  return {
+    type: BOT_TOOL_EVENT_TYPES[input.change],
+    item: { type: 'message', channel: input.channel, ts: input.messageTs },
+    item_user: input.messageAuthorUserId,
+    user: input.reactorUserId,
+    reaction: input.emoji,
+    event_ts: input.eventTs,
+  }
+}
+
+/**
+ * The Reaction Item an accepted reaction is stored as: the decision's facts,
+ * one reactor field, its origin and mode, the reaction key made of the same
+ * facts, empty text and `receivedAt`.
+ */
+function reactionAcceptedInputOf(decision: ReactionAcceptDecision, receivedAt: number): ReactionAcceptedInput {
+  const reactorId = decision.user ?? decision.bot_id
+  return {
+    source: 'reaction', text: '', channel: decision.channel, message_ts: decision.message_ts, ts: decision.ts,
+    change: decision.change, emoji: decision.emoji, ...(decision.user !== undefined ? { user: decision.user } : { bot_id: reactorId }),
+    origin: decision.origin, mode: decision.mode,
+    reaction_key: { chat_id: decision.channel, message_ts: decision.message_ts, reactor: reactorId, emoji: decision.emoji, change: decision.change, event_ts: decision.ts },
+    received_at: receivedAt,
+  }
 }
 
 /** A reaction event's `item.channel` and `item.ts`, each when it is a string. */

@@ -2,8 +2,8 @@
  * delivery-decision.test.ts — The pure inbound decisions: `decideDelivery`'s
  * steps in order, direct messages and group DMs, and `via` precedence; and
  * `decideReaction`'s rules in order, its accepted fields, its conversation
- * rule in both channel modes and its reading of the configuration passed at
- * each call.
+ * rule in both channel modes, its reading of the configuration passed at
+ * each call, and the two rules a `bot-tool` reaction skips.
  *
  * Imports the module directly: no server, no `mock.module`, no I/O. Message
  * events come from the Slack stub's event factories and reaction events from
@@ -12,7 +12,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, expect, test } from 'bun:test'
+import { beforeEach, describe, expect, test } from 'bun:test'
 
 import { CHANNEL_ID_RE, type ChannelEntry, type DeliveryMode } from '../src/config.ts'
 import {
@@ -535,7 +535,7 @@ const ACCEPTED = {
   origin: 'slack-event',
 } as const
 
-type AcceptedFacts = Partial<Pick<ReactionAcceptDecision, 'channel' | 'message_ts' | 'ts' | 'change' | 'emoji' | 'mode'>>
+type AcceptedFacts = Partial<Pick<ReactionAcceptDecision, 'channel' | 'message_ts' | 'ts' | 'change' | 'emoji' | 'mode' | 'origin'>>
 
 /** An accept outcome: `ACCEPTED` with `facts` over it, and the reactor (the person unless given). */
 function accepted(facts: AcceptedFacts = {}, reactor: ReactionReactor = { user: PERSON }): ReactionDecision {
@@ -799,5 +799,122 @@ describe('reactions: each call reads the configuration it is given', () => {
       dropped('dm-disabled'),
       accepted({ channel: DM, mode: 'fungible' }),
     ])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Reactions from a Bot's react tool (origin bot-tool, SR-6.3)
+// ---------------------------------------------------------------------------
+
+describe("reactions from another persona's react tool (origin bot-tool): only the Run Bot and envelope-flag rules are skipped", () => {
+  /** Every ID a `bot-tool` decision asked the Run Bot predicate about; it must ask about none. */
+  const queried: string[] = []
+  beforeEach(() => {
+    queried.length = 0
+  })
+
+  /** `bot-tool` inputs whose Run Bot predicate records the ID and throws, so a decision that asks fails either way. */
+  function botToolInputs(overrides: Partial<ReactionDecisionInputs> = {}): ReactionDecisionInputs {
+    return reactionInputs({
+      origin: 'bot-tool',
+      isRunBotIdentity: (id) => {
+        queried.push(id)
+        throw new Error(`decideReaction asked whether ${id} is a Run Bot Identity for a bot-tool reaction`)
+      },
+      ...overrides,
+    })
+  }
+
+  /** Fungible-mode `bot-tool` inputs carrying the Slack stub's envelope flag form `form`. */
+  function botToolFungibleInputs(form: EnvelopeFlagForm): ReactionDecisionInputs {
+    return botToolInputs({ mode: 'fungible', isExtSharedChannel: envelopeFlagOf(ENVELOPE_FLAG_FORMS[form]) })
+  }
+
+  /** A `bot-tool` accept outcome: `facts` over the defaults, origin `bot-tool`, Q's bot user the reactor unless given. */
+  function botToolAccepted(facts: AcceptedFacts = {}, reactor: ReactionReactor = { user: Q_USER }): ReactionDecision {
+    return accepted({ ...facts, origin: 'bot-tool' }, reactor)
+  }
+
+  /** The bot-tool row's outcome and the Run Bot queries it made. */
+  function expectBotToolRow(_label: string, event: unknown, expected: ReactionDecision, receiver: ReactionDecisionPersona, inputs: ReactionDecisionInputs): void {
+    expect({ outcome: react(event, receiver, inputs), queried }).toStrictEqual({ outcome: expected, queried: [] })
+  }
+
+  test.each<[label: string, event: unknown, receiver: ReactionDecisionPersona, slackEvent: ReactionDecisionInputs, botTool: ReactionDecisionInputs, expected: ReactionDecision]>([
+    ["Q's reaction on P's message in P's all channel", reaction({ user: Q_USER }), P, reactionInputs(), botToolInputs(), botToolAccepted()],
+    [
+      "a removed persona's reaction, a Run Bot Identity no persona has now",
+      reaction({ user: RETIRED_USER }),
+      P,
+      reactionInputs(),
+      botToolInputs(),
+      botToolAccepted({}, { user: RETIRED_USER }),
+    ],
+    ["Q's bot user as the bot ID of a reaction with no user", reaction({ user: undefined, bot_id: Q_USER }), P, reactionInputs(), botToolInputs(), botToolAccepted({}, { bot_id: Q_USER })],
+    ["Q's reaction in a DM, DMs on", reactionIn(DM, { user: Q_USER }), P, reactionInputs(), botToolInputs(), botToolAccepted({ channel: DM })],
+    [
+      "fungible: Q's reaction in a channel nobody lists, flag false",
+      reactionIn(NOBODY, { user: Q_USER }),
+      FP,
+      fungibleInputs(),
+      botToolFungibleInputs('false'),
+      botToolAccepted({ channel: NOBODY, mode: 'fungible' }),
+    ],
+    [
+      "Q's reaction with colons, a skin tone and padding in the emoji and both timestamps, kept exactly",
+      reaction({ user: Q_USER, reaction: ' :+1::skin-tone-2: ', event_ts: ` ${EVENT_TS}` }, { ts: `${MESSAGE_TS} ` }),
+      P,
+      reactionInputs(),
+      botToolInputs(),
+      botToolAccepted({ emoji: ' :+1::skin-tone-2: ', ts: ` ${EVENT_TS}`, message_ts: `${MESSAGE_TS} ` }),
+    ],
+  ])('%s: bot-reaction from a Slack event, accepted with origin bot-tool and no Run Bot query', (_label, event, receiver, slackEvent, botTool, expected) => {
+    const fromSlack = react(event, receiver, slackEvent)
+    const fromTool = react(event, receiver, botTool)
+    expect({ fromSlack, fromTool, queried }).toStrictEqual({ fromSlack: dropped('bot-reaction'), fromTool: expected, queried: [] })
+  })
+
+  test.each<ReactionRow>([
+    row('no item', reaction({ user: Q_USER, item: undefined }), dropped('not-a-message-reaction'), P, botToolInputs()),
+    row('a pin_added event on a message', reaction({ user: Q_USER, type: 'pin_added' }), dropped('not-a-message-reaction'), P, botToolInputs()),
+    row('an item of type file', reaction({ user: Q_USER }, { type: 'file' }), dropped('not-a-message-reaction'), P, botToolInputs()),
+    row('an empty event_ts', reaction({ user: Q_USER, event_ts: '' }), dropped('not-a-message-reaction'), P, botToolInputs()),
+    row("Q's reaction on Q's message", reaction({ user: Q_USER, item_user: Q_USER }), dropped('not-own-message'), P, botToolInputs()),
+    row("Q's reaction with no item_user", reaction({ user: Q_USER, item_user: undefined }), dropped('not-own-message'), P, botToolInputs()),
+    row("Q's reaction, P with no confirmed bot user ID", reaction({ user: Q_USER }), dropped('not-own-message'), P_NO_ID, botToolInputs()),
+    row("Q's reaction, P's confirmed bot user ID and item_user both empty", reaction({ user: Q_USER, item_user: '' }), dropped('not-own-message'), P_EMPTY_ID, botToolInputs()),
+    row('no user and no bot ID', reaction({ user: undefined }), dropped('no-reactor'), P, botToolInputs()),
+    row("P's own reaction, P's bot user being a Run Bot Identity too", reaction({ user: P_USER }), dropped('own-reaction'), P, botToolInputs()),
+    row("P's bot user ID as the bot ID of a reaction with no user", reaction({ user: undefined, bot_id: P_USER }), dropped('own-reaction'), P, botToolInputs()),
+    row("declarative: Q's reaction in a channel nobody lists", reactionIn(NOBODY, { user: Q_USER }), dropped('unserved-conversation'), P, botToolInputs()),
+    row("declarative: Q's reaction in a channel only Q lists", reactionIn(Q_ONLY, { user: Q_USER }), dropped('unserved-conversation'), P, botToolInputs()),
+    row("declarative: Q's reaction in a DM, DMs off", reactionIn(DM, { user: Q_USER }), dropped('dm-disabled'), P_DM_OFF, botToolInputs()),
+    row("fungible: Q's reaction in a DM, DMs off, flag absent", reactionIn(DM, { user: Q_USER }), dropped('dm-disabled'), FP_DM_OFF, botToolFungibleInputs('absent')),
+    row(
+      "every rule failing: a file reaction with no reactor on Q's message in a DM, DMs off",
+      reaction({ user: undefined, item_user: Q_USER }, { type: 'file', channel: DM }),
+      dropped('not-a-message-reaction'),
+      P_DM_OFF,
+      botToolInputs(),
+    ),
+    row("ownership before the reactor: no reactor on Q's message", reaction({ user: undefined, item_user: Q_USER }), dropped('not-own-message'), P, botToolInputs()),
+    row("ownership before the reactor: P's own reaction on Q's message", reaction({ user: P_USER, item_user: Q_USER }), dropped('not-own-message'), P, botToolInputs()),
+    row("the reactor before the conversation: P's own reaction in a channel nobody lists", reactionIn(NOBODY, { user: P_USER }), dropped('own-reaction'), P, botToolInputs()),
+    row("the reactor before the conversation: P's own reaction in a DM, DMs off", reactionIn(DM, { user: P_USER }), dropped('own-reaction'), P_DM_OFF, botToolInputs()),
+    row(
+      "the reactor before the conversation, fungible: no reactor on a malformed ID, flag true",
+      reactionIn(MALFORMED, { user: undefined }),
+      dropped('no-reactor'),
+      FP,
+      botToolFungibleInputs('true'),
+    ),
+  ])('every other rule still applies, in order: %s', expectBotToolRow)
+
+  test.each(FLAG_FORMS)("fungible: Q's reaction in a channel nobody lists is accepted whatever the envelope flag (form %s)", (form) => {
+    expectBotToolRow('', reactionIn(NOBODY, { user: Q_USER }), botToolAccepted({ channel: NOBODY, mode: 'fungible' }), FP, botToolFungibleInputs(form))
+  })
+
+  test.each(FLAG_FORMS)("fungible: a malformed ID is still channel-id-malformed, the channel ID checked before the flag (form %s)", (form) => {
+    expectBotToolRow('', reactionIn(MALFORMED, { user: Q_USER }), refused('channel-id-malformed'), FP, botToolFungibleInputs(form))
   })
 })

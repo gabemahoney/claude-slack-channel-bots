@@ -1,21 +1,23 @@
-/** Durable Slack intake of messages and reactions: decision wiring, persona isolation, ack boundary and immutable preparation. */
+/** Durable intake of Slack messages and reactions, and of other personas' react-tool reactions: decision wiring, persona isolation, ack boundary and immutable preparation. */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { WebClient } from '@slack/web-api'
-import { createPersonaRouting } from '../src/persona-routing.ts'
+import { createPersonaRouting, type BotToolReactionInput } from '../src/persona-routing.ts'
 import { buildTagParts, NAME_LOOKUP_TIMEOUT_MS, TAG_MAX_BYTES, TAG_MAX_BYTES_MACOS } from '../src/tag-wrapper.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { sanitizeFilename } from '../src/lib.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeRoutingHarness, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness, type RoutingHarnessOptions } from './test-helpers/persona-routing-harness.ts'
 import { makeAppMention, makeChannelMessage, makeDm, makeBotMessage, makeWebhookPost, makeStubSlack, mentionText, ENVELOPE_FLAG_FORMS, type EnvelopeOverrides, type SlackEvent } from './test-helpers/slack-stub.ts'
-import { assertNoLeak, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
+import { assertNoLeak, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
 import { deliveredRecord, queuePath, readQueue, seedQueue, slackInput } from './test-helpers/delivery-queue.ts'
 import type { ChannelMode, Persona } from '../src/config.ts'
-import type { QueueRecord, ReactionAcceptedRecord } from '../src/delivery-queue.ts'
-import { buildReactionDroppedLine, buildReactionReceivedLine, REACTION_RECEIVED, type ReactionDroppedInput } from '../src/reaction-intake-diagnostics.ts'
+import type { QueueRecord, ReactionAcceptedInput, ReactionAcceptedRecord } from '../src/delivery-queue.ts'
+import { buildBotToolReactionErrorLine, buildBotToolReactionStoreFailedLine, buildReactionDroppedLine, buildReactionReceivedLine, REACTION_RECEIVED, type ReactionDroppedInput } from '../src/reaction-intake-diagnostics.ts'
+import { describeSlackCallFailure } from '../src/persona-connection-errors.ts'
+import { renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { injectedInput, makeQueue } from './test-helpers/delivery-queue.ts'
 import { isRestartPendingOrActive } from '../src/restart.ts'
@@ -638,5 +640,221 @@ describe('reaction intake', () => {
     // Control: an ordinary message on the same harness takes those message-only paths.
     await h.receive(makeChannelMessage({ channel: CX, text: `${mentionText(ALPHA_BOT)} hello` }), ['alpha'])
     expect(h.received).toHaveLength(1); expect(h.heardChannels(key)).toEqual(new Set([CX])); expect(h.rowReads).toEqual([key])
+  })
+
+  // SR-6.2, SR-6.3, SR-3.3, SR-4.1, SR-4.2, SR-4.4, SR-10.1: beta's react-tool reaction handed straight to alpha's intake, with no envelope or ack.
+  describe('from another persona\'s react tool (origin bot-tool)', () => {
+    const B_NAME = 'beta', RENAMED = 'beta-renamed', OTHER_TS = '1700000050.000300'
+    const NEW_ALPHA = { botUserId: 'U0NEWALPHA', botId: 'B0NEWALPHA' }
+    /** Beta's reaction to alpha's message in CA, as the hand-off gives it. */
+    const botTool = (over: Partial<BotToolReactionInput> = {}): BotToolReactionInput => ({
+      change: 'added', reactorUserId: BETA_BOT, reactorPersonaName: B_NAME, emoji: 'white_check_mark', channel: CA, messageTs: MSG_TS, eventTs: EVENT_TS, messageAuthorUserId: ALPHA_BOT, ...over,
+    })
+    /** What alpha's queue accepts for `botTool()` in declarative mode: a valid fixture for the public queue API. */
+    const botToolStored = (): ReactionAcceptedInput & { received_at: number } => ({
+      source: 'reaction', text: '', channel: CA, message_ts: MSG_TS, ts: EVENT_TS, change: 'added', emoji: 'white_check_mark', user: BETA_BOT, origin: 'bot-tool', mode: 'declarative',
+      reaction_key: { chat_id: CA, message_ts: MSG_TS, reactor: BETA_BOT, emoji: 'white_check_mark', change: 'added', event_ts: EVENT_TS }, reactor_persona_name: B_NAME, received_at: NOW,
+    })
+    const botToolRecord = (): ReactionAcceptedRecord => ({ v: 1, kind: 'accepted', seq: 1, ...botToolStored() })
+    const EIO = () => Object.assign(new Error('EIO: injected fsync failure'), { code: 'EIO' })
+    const failNextFileSync = (h: RoutingHarness) => { h.queueFaults.fileSync = () => { h.queueFaults.fileSync = undefined; throw EIO() } }
+    const removePersona = (h: RoutingHarness, name: string) => { h.config = { ...h.config!, personas: h.config!.personas.filter(p => p.name !== name) } }
+    const disableDms = (h: RoutingHarness) => { withAlpha(h, p => ({ ...p, dm: { ...p.dm, enabled: false } })) }
+
+    test('is durable with its exact snapshot before any Slack call, then prepared on alpha\'s client only, with no message-only path', async () => {
+      const calls = (h: RoutingHarness) => h.all.flatMap(p => p.stub.callLog.map((c): string => c.method))
+      const at: Record<string, unknown> = {}
+      const h: RoutingHarness = rh({
+        rowRead: {}, upCheck: true, armRetryTimer: true,
+        wrapAccept: accept => async (key, input) => {
+          at.store = { records: records(h), calls: calls(h) }
+          const result = await accept(key, input)
+          at.stored = { records: records(h), calls: calls(h), logs: [...h.logs] }
+          return result
+        },
+        wrapPrepare: prepare => (key, item) => { at.prepare = { key, seq: item.accepted.seq, kinds: records(h).map(r => r.kind), calls: calls(h) }; return prepare(key, item) },
+      })
+      const key = keyOf(h)
+      const result = await h.receiveBotToolReaction('alpha', botTool())
+      expect(result).toStrictEqual({ status: 'stored', seq: 1 })
+      const accepted = botToolRecord()
+      expect(at).toEqual({ store: { records: [], calls: [] }, stored: { records: [accepted], calls: [], logs: [] }, prepare: { key, seq: 1, kinds: ['accepted'], calls: [] } })
+      expect(records(h).map(r => r.kind)).toEqual(['accepted', 'fixed'])
+      expect(methods(h)).toEqual(BOT_LOOKUPS); expect(records(h, 'beta')).toEqual([]); expect(h.p('beta').stub.callLog).toEqual([])
+      expect(h.order).toEqual(['config', `identity:${key}`]); expect(h.runBotAsks).toEqual([])
+      expect(h.logs).toEqual([buildReactionReceivedLine(subject(h), accepted)]); expect(h.logs.join('\n')).not.toContain(B_NAME)
+      expect(h.received).toEqual([]); expect(h.rowReads).toEqual([]); expect(h.upAsks).toEqual([]); expect(h.launches).toEqual([]); expect(h.retryTimerArms).toEqual([])
+      expect(isRestartPendingOrActive(key)).toBe(false); expect(h.heardChannels(key)).toEqual(new Set())
+      expect(h.allPosts()).toEqual([]); expect(h.notices).toEqual([]); expect(h.all.flatMap(p => p.stub.calls.reactionsAdd)).toEqual([])
+      assertNoLeak({ ...h.captured(), result, queue: writtenFile(queuePath(dir, key)) })
+    })
+
+    /** A thrown store step: safe type, code and platform reason; the sentinel only inside its message, and bare where no line may read. */
+    const thrown = () => Object.assign(new Error(`store step refused (${sentinelInMessage('thrown')})`), { code: 'EIO', data: { error: 'internal_error', detail: LEAK_SENTINEL }, detail: LEAK_SENTINEL })
+    const THROWN_DESCRIPTION = ` (reason=internal_error): Error code=EIO message="store step refused (${REDACTED_SENTINEL_TAIL})"`
+    const STORE_FAULTS: Array<{ fault: string; opts?: (once: () => boolean, err: Error) => RoutingHarnessOptions; fileSync?: true; line?: (ref: string, described: string) => string }> = [
+      { fault: 'fsync-failing store', fileSync: true },
+      { fault: 'failed store', opts: once => ({ wrapAccept: accept => async (key, input) => once() ? { status: 'failed', error: new Error(sentinelInMessage('store')) } : accept(key, input) }) },
+      { fault: 'rejected store', opts: (once, err) => ({ wrapAccept: accept => async (key, input) => { if (once()) throw err; return accept(key, input) } }), line: buildBotToolReactionStoreFailedLine },
+      { fault: 'failed key lookup', opts: once => ({ wrapLookupReactionKey: lookup => (key, rk) => once() ? { status: 'failed', error: new Error(sentinelInMessage('lookup')) } : lookup(key, rk) }) },
+      // Thrown outside queue.accept: the intake's outer catch.
+      { fault: 'throwing key lookup', opts: (once, err) => ({ wrapLookupReactionKey: lookup => (key, rk) => { if (once()) throw err; return lookup(key, rk) } }), line: buildBotToolReactionErrorLine },
+    ]
+    test.each(STORE_FAULTS)('a $fault returns only store-failed, with no record, preparation or network, and a thrown fault logs only its safe description; the identical retry is stored and prepared once', async row => {
+      let armed = true
+      const err = thrown()
+      const h = rh(row.opts?.(() => { const was = armed; armed = false; return was }, err))
+      // One regular-file fsync fails; directory syncs and every later fsync run normally.
+      if (row.fileSync) failNextFileSync(h)
+      const input = botTool()
+      const failed = await h.receiveBotToolReaction('alpha', input)
+      expect(failed).toStrictEqual({ status: 'store-failed' })
+      expect(h.queueFaults.fileSync).toBeUndefined(); expectNoWork(h); expect(h.queued('alpha')).toEqual([])
+      expect(h.logs).toEqual(row.line ? [row.line(renderPersonaRef(subject(h).name, keyOf(h)), describeSlackCallFailure(err))] : [])
+      if (row.line) expect(h.logs[0]).toContain(THROWN_DESCRIPTION)
+      const stored = await h.receiveBotToolReaction('alpha', input)
+      expect(stored).toStrictEqual({ status: 'stored', seq: 1 })
+      expect(records(h).map(r => [r.kind, r.seq])).toEqual([['accepted', 1], ['fixed', 1]])
+      expect(received(h)).toHaveLength(1); expect(methods(h)).toEqual(BOT_LOOKUPS)
+      expect(h.allPosts()).toEqual([]); expect(h.notices).toEqual([])
+      assertNoLeak({ failed, stored, logs: h.logs, queue: writtenFile(queuePath(dir, keyOf(h))) })
+    })
+
+    test('a preparation rejecting after the durable store leaves a fresh copy stored and a retained accepted-only copy duplicate, never store-failed', async () => {
+      // The fixed record's fsync fails once and the queue rolls that append back; the fake clock holds the retry.
+      const first: RoutingHarness = rh({ preparationClock: createFakeClock(), wrapAccept: accept => async (key, input) => { const r = await accept(key, input); failNextFileSync(first); return r } })
+      expect(await first.receiveBotToolReaction('alpha', botTool())).toStrictEqual({ status: 'stored', seq: 1 })
+      expect(first.queueFaults.fileSync).toBeUndefined()
+      expect(records(first).map(r => r.kind)).toEqual(['accepted']); expect(methods(first)).toEqual(BOT_LOOKUPS)
+      // The received line follows storage, not preparation's success.
+      expect(first.logs).toEqual([buildReactionReceivedLine(subject(first), botToolRecord()), expect.stringContaining('post-accept reaction preparation failed')])
+      await first.preparation.stop(); await first.queue.stop()
+      const second: RoutingHarness = rh({ preparationClock: createFakeClock(), wrapLookupReactionKey: lookup => (key, rk) => { failNextFileSync(second); return lookup(key, rk) } })
+      expect(await second.receiveBotToolReaction('alpha', botTool())).toStrictEqual({ status: 'duplicate', seq: 1 })
+      expect(second.queueFaults.fileSync).toBeUndefined()
+      expect(second.queued('alpha').map(i => [i.accepted.seq, i.fixed, i.withdrawn])).toEqual([[1, undefined, undefined]]); expect(methods(second)).toEqual(BOT_LOOKUPS)
+      expect(second.logs).toEqual([expect.stringContaining('post-accept reaction preparation failed')])
+    })
+
+    test('a log sink that throws on every call changes no result, store or preparation', async () => {
+      const h = rh({ logHook: () => { throw new Error('log sink failed') } })
+      expect(await h.receiveBotToolReaction('alpha', botTool())).toStrictEqual({ status: 'stored', seq: 1 })
+      expect(await h.receiveBotToolReaction('alpha', botTool({ channel: CX, eventTs: OTHER_TS }))).toStrictEqual({ status: 'dropped' })
+      expect(records(h).map(r => r.kind)).toEqual(['accepted', 'fixed']); expect(methods(h)).toEqual(BOT_LOOKUPS)
+      expect(received(h)).toHaveLength(1); expect(dropped(h)).toHaveLength(1)
+    })
+
+    test('same-run and simultaneous copies store one item and one received line per key; the copy losing at accept is a duplicate of its seq', async () => {
+      let race = false, arrivals = 0; let bothArrived!: () => void
+      const both = new Promise<void>(r => { bothArrived = r })
+      const h = rh({ wrapAccept: accept => async (key, input) => { if (race) { if (++arrivals === 2) bothArrived(); await both } return accept(key, input) } })
+      expect(await h.receiveBotToolReaction('alpha', botTool())).toStrictEqual({ status: 'stored', seq: 1 })
+      const calls = methods(h), mark = h.order.length
+      expect(await h.receiveBotToolReaction('alpha', botTool())).toStrictEqual({ status: 'duplicate', seq: 1 })
+      expect(h.order.slice(mark)).toEqual([]); expect(methods(h)).toEqual(calls)
+      // Only the event ts differs: a distinct key. Both copies pass the lookup, so the queue's accept decides.
+      race = true
+      const results = await Promise.all([h.receiveBotToolReaction('alpha', botTool({ eventTs: OTHER_TS })), h.receiveBotToolReaction('alpha', botTool({ eventTs: OTHER_TS }))])
+      expect(arrivals).toBe(2)
+      expect(results).toStrictEqual([{ status: 'stored', seq: 2 }, { status: 'duplicate', seq: 2 }])
+      const rs = records(h)
+      expect(full(rs).map(r => r.seq)).toEqual([1, 2]); expect(rs.filter(r => r.kind === 'fixed').map(r => r.seq)).toEqual([1, 2])
+      expect(received(h)).toEqual(full(rs).map(r => buildReactionReceivedLine(subject(h), r as ReactionAcceptedRecord)))
+    })
+
+    test('after stop and reopen, a renamed copy under another mode and the same key as a Slack event add no item, decision, received line or preparation', async () => {
+      const first = rh(); const key = keyOf(first)
+      expect(await first.receiveBotToolReaction('alpha', botTool())).toStrictEqual({ status: 'stored', seq: 1 })
+      await first.preparation.stop(); await first.queue.stop()
+      const second = rh({ mode: 'fungible' })
+      expect(await second.receiveBotToolReaction('alpha', botTool({ reactorPersonaName: RENAMED }))).toStrictEqual({ status: 'duplicate', seq: 1 })
+      // Origin is not a key field: beta's own Slack event for the same reaction is the same key.
+      await second.receiveReaction(reaction({ user: BETA_BOT }), 'alpha')
+      expect(second.order).toEqual(['ack']); expect(second.runBotAsks).toEqual([])
+      expect(second.queued('alpha').map(i => [i.accepted.seq, i.accepted.origin, i.accepted.mode, i.accepted.reactor_persona_name, i.fixed !== undefined])).toEqual([[1, 'bot-tool', 'declarative', B_NAME, true]])
+      // The reopened queue's own bookkeeping fields aside, the stored record is unchanged.
+      expect(full(readQueue(dir, key))).toEqual([expect.objectContaining(botToolRecord())])
+      expect(second.logs).toEqual([]); expect(second.p('alpha').stub.callLog).toEqual([])
+    })
+
+    test.each(CLOSES)('a retained $state copy is a duplicate keeping its seq, mode and name; only accepted-only work is prepared', async row => {
+      const prepared: number[] = []
+      const recording: RoutingHarnessOptions = { wrapPrepare: prepare => (key, item) => { prepared.push(item.accepted.seq); return prepare(key, item) } }
+      const first = rh(recording); const key = keyOf(first)
+      if ((await first.queue.accept(key, botToolStored())).status !== 'accepted') throw new Error('fixture acceptance failed')
+      await row.close(first)
+      let h = first
+      // A real compaction, read back by a fresh routing and queue.
+      if (row.state === 'key-only') { await first.preparation.stop(); await first.queue.stop(); h = rh(recording) }
+      h.setMode('fungible')
+      const before = readQueue(dir, key)
+      expect(await h.receiveBotToolReaction('alpha', botTool({ reactorPersonaName: RENAMED }))).toStrictEqual({ status: 'duplicate', seq: 1 })
+      expect(h.order).toEqual([]); expect(h.logs).toEqual([])
+      const after = readQueue(dir, key)
+      expect(after.slice(0, before.length)).toEqual(before)
+      expect(after.slice(before.length)).toEqual(row.prepares ? [expect.objectContaining({ kind: 'fixed', seq: 1 })] : [])
+      expect(prepared).toEqual(row.prepares ? [1] : []); expect(methods(h)).toEqual(row.prepares ? BOT_LOOKUPS : [])
+      expect(full(after)).toEqual(row.state === 'key-only' ? [] : [botToolRecord()])
+      if (row.state === 'key-only') expect(after).toContainEqual(expect.objectContaining({ compact: 'reaction-key', seq: 1 }))
+    })
+
+    const RETAINED: Array<{ change: string; input?: Partial<BotToolReactionInput>; apply: (h: RoutingHarness) => void }> = [
+      { change: 'a mode switch', apply: h => { h.setMode('fungible') } },
+      { change: 'a channels change', apply: h => { withAlpha(h, p => ({ ...p, channels: [] })) } },
+      { change: 'DMs disabled', input: { channel: DM }, apply: disableDms },
+      { change: 'an identity change', apply: h => { h.identities.set(keyOf(h), NEW_ALPHA) } },
+      { change: 'no other change', apply: () => {} },
+      { change: 'the receiving persona removed', apply: h => { removePersona(h, 'alpha') } },
+      { change: 'the reacting persona removed', apply: h => { removePersona(h, 'beta') } },
+      { change: 'the configuration removed', apply: h => { h.config = null } },
+    ]
+    test.each(RETAINED)('after $change, a renamed copy of a retained key is a duplicate with its stored mode and name, and no decision', async row => {
+      const h = rh()
+      expect(await h.receiveBotToolReaction('alpha', botTool(row.input))).toStrictEqual({ status: 'stored', seq: 1 })
+      row.apply(h)
+      const mark = h.order.length
+      expect(await h.receiveBotToolReaction('alpha', botTool({ ...row.input, reactorPersonaName: RENAMED }))).toStrictEqual({ status: 'duplicate', seq: 1 })
+      expect(h.order.slice(mark)).toEqual([])
+      expect(h.queued('alpha').map(i => [i.accepted.seq, i.accepted.mode, i.accepted.reactor_persona_name, i.fixed !== undefined])).toEqual([[1, 'declarative', B_NAME, true]])
+      expect(full(records(h))).toHaveLength(1); expect(received(h)).toHaveLength(1); expect(dropped(h)).toEqual([])
+    })
+
+    const NEW_KEYS: Array<{ change: string; input?: Partial<BotToolReactionInput>; apply: (h: RoutingHarness) => void; drop?: ReactionDroppedInput; control?: Partial<BotToolReactionInput> }> = [
+      // The observed author is compared with alpha's current identity, never made from it.
+      { change: 'an identity change, against the stale observed author', apply: h => { h.identities.set(keyOf(h), NEW_ALPHA) }, control: { messageAuthorUserId: NEW_ALPHA.botUserId } },
+      { change: 'the identity becoming unknown', apply: h => { h.identities.set(keyOf(h), undefined) } },
+      { change: 'the configuration removed', apply: h => { h.config = null } },
+      { change: 'the receiving persona removed', apply: h => { removePersona(h, 'alpha') } },
+      { change: 'DMs disabled', input: { channel: DM }, apply: disableDms, drop: { reason: 'dm-disabled', chat_id: DM, message_ts: MSG_TS } },
+      { change: 'the channel unserved', apply: h => { withAlpha(h, p => ({ ...p, channels: p.channels.filter(c => c.id !== CA) })) }, drop: { reason: 'unserved-conversation', chat_id: CA, message_ts: MSG_TS } },
+    ]
+    test.each(NEW_KEYS)('after $change, a new key is dropped under the configuration in effect, logging only a logged reason\'s builder line', async row => {
+      const h = rh()
+      expect(await h.receiveBotToolReaction('alpha', botTool(row.input))).toStrictEqual({ status: 'stored', seq: 1 })
+      row.apply(h)
+      const mark = h.logs.length
+      expect(await h.receiveBotToolReaction('alpha', botTool({ ...row.input, eventTs: OTHER_TS }))).toStrictEqual({ status: 'dropped' })
+      expect(h.logs.slice(mark)).toEqual(row.drop ? [buildReactionDroppedLine(subject(h), row.drop)] : [])
+      expect(full(records(h)).map(r => r.seq)).toEqual([1]); expect(h.runBotAsks).toEqual([]); expect(records(h, 'beta')).toEqual([])
+      if (row.control) expect(await h.receiveBotToolReaction('alpha', botTool({ ...row.control, eventTs: '1700000050.000400' }))).toStrictEqual({ status: 'stored', seq: 2 })
+    })
+
+    test('a held store keeps the input, name and settings of its invocation; the changed input is a new key under the new settings', async () => {
+      let gate: { reached: () => void; release: Promise<void> } | undefined
+      const h = rh({ wrapAccept: accept => async (key, input) => { if (gate) { gate.reached(); await gate.release } return accept(key, input) } })
+      let reached!: () => void; let release!: () => void
+      const atStore = new Promise<void>(r => { reached = r })
+      gate = { reached, release: new Promise<void>(r => { release = r }) }
+      const input = botTool()
+      const held = h.receiveBotToolReaction('alpha', input)
+      await atStore; gate = undefined
+      Object.assign(input, { reactorUserId: 'U0OTHERBOT', reactorPersonaName: RENAMED, emoji: 'tada', channel: CX, messageTs: '1700000000.000999', eventTs: '1700000099.000999', messageAuthorUserId: NEW_ALPHA.botUserId })
+      h.setMode('fungible'); h.identities.set(keyOf(h), NEW_ALPHA)
+      release()
+      expect(await held).toStrictEqual({ status: 'stored', seq: 1 })
+      expect(full(records(h))).toEqual([botToolRecord()])
+      expect(await h.receiveBotToolReaction('alpha', input)).toStrictEqual({ status: 'stored', seq: 2 })
+      expect(h.queued('alpha')[1]!.accepted).toMatchObject({ channel: CX, message_ts: '1700000000.000999', ts: '1700000099.000999', emoji: 'tada', user: 'U0OTHERBOT', mode: 'fungible', reactor_persona_name: RENAMED })
+    })
   })
 })

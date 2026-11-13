@@ -1,13 +1,17 @@
 /**
- * Reaction intake's server-log lines (SR-10.1): the class labels and the two
- * pure builders, pinned once here, and their content-free, redacted,
- * single-line rendering of whatever reaches them.
+ * Reaction intake's server-log lines (SR-10.1): the class labels and the pure
+ * builders, pinned once here; the received and dropped lines' content-free,
+ * redacted, single-line rendering of whatever reaches them. The two bot-tool
+ * failure lines take an already safe description, so routing's tests own
+ * their redaction.
  */
 import { describe, expect, test } from 'bun:test'
 import { FUNGIBLE_REFUSALS, type ReactionDropReason, type ReactionFungibleRefusal } from '../src/delivery-decision.ts'
 import type { ReactionAcceptedRecord, ReactionChange } from '../src/delivery-queue.ts'
 import { personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import {
+  buildBotToolReactionErrorLine,
+  buildBotToolReactionStoreFailedLine,
   buildReactionDroppedLine,
   buildReactionReceivedLine,
   REACTION_DROPPED,
@@ -59,10 +63,14 @@ describe('pins: the one place the class labels and line spelling are written out
     const lines = [
       buildReactionReceivedLine(NAMED, reaction()),
       buildReactionDroppedLine(NAMED, { reason: 'fungible-refused', chat_id: CHAT, message_ts: MSG_TS, refusal: 'externally-shared' }),
+      buildBotToolReactionStoreFailedLine(ref(NAMED), ' (reason=internal_error): Error code=EIO message="store refused"'),
+      buildBotToolReactionErrorLine(`key=${KEY_ONLY.key}`, ': TypeError message="lookup broke"'),
     ]
     expect(lines).toEqual([
       '[slack] reaction-received: persona="Ops Bot" (key=ops_bot) chat_id="C0GENERAL" message_ts="1700000100.000100" change=added emoji="thumbsup" user="U0REACTOR" seq=7',
       '[slack] reaction-dropped: persona="Ops Bot" (key=ops_bot) chat_id="C0GENERAL" message_ts="1700000100.000100" reason=fungible-refused refusal=externally-shared',
+      '[slack] persona-routing: bot-tool reaction store failed for persona "Ops Bot" (key=ops_bot) (reason=internal_error): Error code=EIO message="store refused"',
+      '[slack] persona-routing: error handling bot-tool reaction for persona key=ops_bot: TypeError message="lookup broke"',
     ])
     assertNoLeak(lines)
   })

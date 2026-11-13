@@ -1,7 +1,8 @@
 /** Accepted work survives a failed first fixed append without another event
  * or restart; the unfixed head still owns the FIFO. Reaction Items take the
  * same path: real preparation over the real queue fixes or withdraws each one
- * once, retries the identical record, and leaves final work final. */
+ * once, retries the identical record, and leaves final work final. A bot-tool
+ * item keeps its stored mode and reactor name through reopen and recovery. */
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createDeliveryPreparation, type DeliveryPreparation } from '../src/delivery-intake.ts'
 import type { DeliveryEngineEvent } from '../src/delivery-engine.ts'
@@ -130,6 +131,12 @@ const DELIVERY_EVENTS: readonly DeliveryEngineEvent['type'][] = ['delivered', 'i
 /** A reaction on the reacted message of these cases, with distinct reacted, event and root timestamps. */
 const reaction = (overrides: Partial<ReactionAcceptedInput> = {}): ReactionAcceptedInput =>
   reactionInput({ channel: CHANNEL, message_ts: REACTED_TS, ts: EVENT_TS, ...overrides })
+/** BETA's bot user, and the persona name stored with a bot-tool item at hand-off, unlike any name a lookup gives. */
+const B_USER = 'U0BETABOT'
+const STORED_B_NAME = 'Beta Bot as handed off'
+/** reaction() made by BETA's react tool: origin bot-tool, BETA's bot user the reactor and its stored name. */
+const botToolReaction = (overrides: Partial<ReactionAcceptedInput> = {}): ReactionAcceptedInput =>
+  reaction({ origin: 'bot-tool', user: B_USER, reactor_persona_name: STORED_B_NAME, ...overrides })
 /** Slack's answer holding the reacted message, with a body and files that never reach the tag. */
 const exact = (extra: Record<string, unknown> = {}): SettledWebApiOutcome =>
   ({ kind: 'ok', result: { messages: [{ ts: REACTED_TS, text: BODY, files: [{ name: `${BODY}.txt`, mimetype: 'text/plain', size: 3 }], ...extra }] } })
@@ -156,7 +163,9 @@ interface Preparer {
 /** A real preparation over the harness queue and shared clock, with one Slack stub per persona. Its lines and wakes go into `h.order`, after the queue's durable appends. */
 function preparer(h: EngineHarness, opts: { resolve?: (user: string) => Promise<string>; log?: (line: string) => unknown; tagMaxBytes?: number
   /** Each outcome append waits for this before it reaches the harness queue. */
-  holdAppend?: (record: QueueRecord) => Promise<void> } = {}): Preparer {
+  holdAppend?: (record: QueueRecord) => Promise<void>
+  /** The receiving persona's display identity; PERSONAS by default. */
+  persona?: (key: string) => { name: string; key: string } | undefined } = {}): Preparer {
   const stubs: Record<string, StubSlack> = {}, resolvedBy: Record<string, string[]> = {}
   for (const key of Object.keys(PERSONAS)) { stubs[key] = makeStubSlack({ leakMarker: LEAK_SENTINEL }); resolvedBy[key] = [] }
   const logs: string[] = [], wakes: string[] = []
@@ -169,7 +178,7 @@ function preparer(h: EngineHarness, opts: { resolve?: (user: string) => Promise<
     resolveUserName: async (key, user) => { resolvedBy[key]?.push(user); return opts.resolve ? opts.resolve(user) : `Name of ${user}` },
     now: h.clock.now,
     log: line => { logs.push(line); h.order.push('log'); return opts.log?.(line) },
-    persona: key => PERSONAS[key],
+    persona: opts.persona ?? (key => PERSONAS[key]),
     wake: key => { wakes.push(key); h.order.push(`wake:${key}`) },
     tagMaxBytes: opts.tagMaxBytes,
   })
@@ -178,6 +187,8 @@ function preparer(h: EngineHarness, opts: { resolve?: (user: string) => Promise<
 }
 /** Lookups made so far for one persona: Slack calls and reactor-name resolutions. */
 const lookups = (p: Preparer, key = PERSONA.key): number => p.stubs[key]!.callLog.length + p.resolvedBy[key]!.length
+/** The Slack methods called on one stub, sorted. */
+const methods = (stub: StubSlack): string[] => stub.callLog.map(c => c.method).sort()
 
 describe('reaction preparation fixes or withdraws through the real queue', () => {
   const ASSEMBLY: Array<[string, Partial<ReactionAcceptedInput>, SettledWebApiOutcome, SettledWebApiOutcome, TagMessage, string[]]> = [
@@ -672,7 +683,8 @@ describe('closed and fixed reaction preparation recovery', () => {
     expect(h.queue.item('alpha', 1)?.fixed).toBeUndefined()
   })
 
-  test.each((['appended', 'decided by a stopped preparation'] as const).flatMap(made => (['recover', 'prepare a stale snapshot'] as const).map(via => [via, made] as const)))('a durably fixed reaction keeps its exact parts through reopen and %s, without lookups or a line, and its wake delivers them (%s)', async (via, made) => {
+  const FIXED_MADE = ['appended', 'decided by a stopped preparation', 'decided for a bot-tool item by a stopped preparation'] as const
+  test.each(FIXED_MADE.flatMap(made => (['recover', 'prepare a stale snapshot'] as const).map(via => [via, made] as const)))('a durably fixed reaction keeps its exact parts through reopen and %s, without lookups or a line, and its wake delivers them (%s)', async (via, made) => {
     const h = await harness()
     let stale: QueueItem, parts: string[]
     if (made === 'appended') {
@@ -680,14 +692,16 @@ describe('closed and fixed reaction preparation recovery', () => {
       stale = await acceptReaction(h, reactionInput({ origin: 'bot-tool', reactor_persona_name: 'Reactor Bot', user: undefined, bot_id: 'B0BOT001' }))
       await h.queue.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: [...parts] })
     } else {
+      const botTool = made === 'decided for a bot-tool item by a stopped preparation'
       const first = preparer(h)
       first.stub.script.replies.push({ kind: 'ok', result: { messages: [] } })
       first.stub.script.info.push(conversation(PUBLIC))
-      stale = await acceptReaction(h, reaction())
+      stale = await acceptReaction(h, botTool ? botToolReaction() : reaction())
       await first.preparation.prepare('alpha', stale)
       await first.preparation.stop()
-      parts = buildTagParts(notice())
+      parts = buildTagParts(botTool ? notice({ user: STORED_B_NAME, user_id: B_USER }) : notice())
       expect(first.logs).toEqual([buildReactionMessageUnknownLine(SUBJECT)])
+      expect(first.resolvedBy).toEqual({ [PERSONA.key]: botTool ? [] : ['U0REACTOR'], [BETA.key]: [] })
     }
     const fixed: FixedRecord = { v: 1, kind: 'fixed', seq: 1, parts }
     await h.restartServer()
@@ -706,34 +720,50 @@ describe('closed and fixed reaction preparation recovery', () => {
     expect(h.errors).toEqual([])
   })
 
-  test.each(['fungible', 'declarative'] as const)('an accepted-only %s reaction whose append failed before a stop is decided afresh, under its stored mode, by a new preparation after reopen', async mode => {
+  const ACCEPTED_ONLY = (['fungible', 'declarative'] as const).flatMap(mode => (['slack-event', 'bot-tool'] as const).map(origin => [mode, origin] as const))
+  test.each(ACCEPTED_ONLY)('an accepted-only %s %s reaction whose append failed before a stop is decided afresh, under its stored mode and with its stored name, by a new preparation after reopen', async (mode, origin) => {
+    const botTool = origin === 'bot-tool'
     const h = await harness()
     const first = preparer(h)
     first.stub.script.replies.push(exact({ thread_ts: ROOT_TS }))
     first.stub.script.info.push(conversation(PUBLIC))
     h.failAppend('fixed')
-    const item = await acceptReaction(h, reaction({ mode }))
+    const item = await acceptReaction(h, botTool ? botToolReaction({ mode }) : reaction({ mode }))
     await expect(first.preparation.prepare('alpha', item)).rejects.toThrow('injected append failure')
     await first.preparation.stop()
     expect(h.records().map(r => r.kind)).toEqual(['accepted'])
     await h.restartServer()
-    expect(h.queue.item('alpha', 1)!.accepted.mode).toBe(mode)
-    // The new start sees different facts: the conversation lookup now fails.
-    const second = preparer(h)
+    const reopened = h.queue.item('alpha', 1)!.accepted
+    expect([reopened.mode, reopened.origin, reopened.reactor_persona_name]).toEqual([mode, origin, botTool ? STORED_B_NAME : undefined])
+    // The new start sees different facts: the conversation lookup now fails. Every reactor
+    // now resolves to a new name and BETA is no longer a persona, so only a stored name survives.
+    const asked: string[] = []
+    const second = preparer(h, {
+      resolve: async user => `Renamed ${user}`,
+      persona: key => { asked.push(key); return key === PERSONA.key ? PERSONA : undefined },
+    })
     second.stub.script.replies.push(exact({ thread_ts: ROOT_TS }))
     second.stub.script.info.push({ kind: 'platform', error: 'internal_error' })
     const at = h.clock.now()
     await second.preparation.recover()
-    expect(lookups(second)).toBe(3)
+    expect(methods(second.stub)).toEqual(['conversations.info', 'conversations.replies'])
+    expect([first.resolvedBy, second.resolvedBy, second.stubs[BETA.key]!.callLog]).toEqual([
+      { [PERSONA.key]: botTool ? [] : ['U0REACTOR'], [BETA.key]: [] },
+      { [PERSONA.key]: botTool ? [] : ['U0REACTOR'], [BETA.key]: [] },
+      [],
+    ])
+    expect(asked).not.toContain(BETA.key)
     if (mode === 'fungible') {
       expect(outcomes(h)).toEqual([withdrawal(1, 'conversation-unknown', at)])
       expect(second.logs).toEqual([buildReactionWithdrawnLine(SUBJECT, 'conversation-unknown')])
     } else {
-      expect(outcomes(h)).toEqual([{ v: 1, kind: 'fixed', seq: 1, parts: buildTagParts(notice({ channel_name: CHANNEL, thread_ts: ROOT_TS })) }])
+      const reactor = botTool ? { user: STORED_B_NAME, user_id: B_USER } : { user: 'Renamed U0REACTOR' }
+      expect(outcomes(h)).toEqual([{ v: 1, kind: 'fixed', seq: 1, parts: buildTagParts(notice({ channel_name: CHANNEL, thread_ts: ROOT_TS, ...reactor })) }])
       expect(second.logs).toEqual([])
     }
     expect(first.logs).toEqual([])
     expect(second.preparation.owns('alpha', 1)).toBe(false)
+    assertNoLeak({ journal: writtenFile(queuePath(h.root)) })
   })
 })
 

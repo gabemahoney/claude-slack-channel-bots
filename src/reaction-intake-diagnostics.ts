@@ -5,9 +5,12 @@
  * persona, the conversation, the reacted message's ts, the change, the emoji,
  * the reactor's ID and the item's sequence. `reaction-dropped` reports a drop
  * for one of the logged reasons only; the other drop reasons log nothing, and
- * the input types cannot name them. No line carries message text, a display
- * name other than the receiving persona's configured name, the raw event, a
- * Slack response or an error. Pure builders: no I/O.
+ * the input types cannot name them. The two `bot-tool` intake failure lines
+ * name the receiving persona and carry the caller's safe description of the
+ * thrown value (`describeSlackCallFailure`), never the value itself. No line
+ * carries message text, a display name other than the receiving persona's
+ * configured name, the raw event, a Slack response or an error. Pure builders:
+ * no I/O.
  */
 import type { ReactionFungibleRefusal } from './delivery-decision.ts'
 import type { ReactionAcceptedRecord } from './delivery-queue.ts'
@@ -54,4 +57,24 @@ export function buildReactionDroppedLine(p: ReactionIntakePersona, drop: Reactio
   const message = drop.message_ts !== undefined ? ` message_ts=${quote(drop.message_ts)}` : ''
   const refusal = drop.reason === 'fungible-refused' ? ` refusal=${word(drop.refusal)}` : ''
   return `[slack] ${REACTION_DROPPED}: ${persona(p)}${chat}${message} reason=${word(drop.reason)}${refusal}`
+}
+
+/**
+ * A `bot-tool` reaction's `queue.accept` threw. `ref` is the routing's
+ * persona reference and `described` is `describeSlackCallFailure`'s output
+ * for the thrown value, never the error:
+ * `[slack] persona-routing: bot-tool reaction store failed for persona <ref>[ (reason=<code>)]: <description>`
+ */
+export function buildBotToolReactionStoreFailedLine(ref: string, described: string): string {
+  return `[slack] persona-routing: bot-tool reaction store failed for persona ${ref}${described}`
+}
+
+/**
+ * Any other throw while taking a `bot-tool` reaction, before its
+ * preparation; `ref` and `described` as for
+ * {@link buildBotToolReactionStoreFailedLine}:
+ * `[slack] persona-routing: error handling bot-tool reaction for persona <ref>[ (reason=<code>)]: <description>`
+ */
+export function buildBotToolReactionErrorLine(ref: string, described: string): string {
+  return `[slack] persona-routing: error handling bot-tool reaction for persona ${ref}${described}`
 }

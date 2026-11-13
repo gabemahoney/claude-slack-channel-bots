@@ -1,12 +1,13 @@
 /**
  * Reaction Item preparation (SR-5.2 to SR-5.5): the decision under the mode
  * stored with the item, over normalized facts, and the three bounded lookups
- * on the receiving persona's own client that supply those facts.
+ * on the receiving persona's own client that supply those facts; a bot-tool
+ * item's reactor name is the one stored with it.
  */
 import { describe, expect, test } from 'bun:test'
 import type { WebClient } from '@slack/web-api'
 import type { ChannelMode } from '../src/config.ts'
-import type { ReactionAcceptedRecord } from '../src/delivery-queue.ts'
+import { isQueueRecord, type ReactionAcceptedRecord } from '../src/delivery-queue.ts'
 import {
   decideReactionPreparation,
   lookupReactionPreparation,
@@ -411,6 +412,54 @@ describe('lookup 3: the conversation, read fresh for every item', () => {
     r.stubs.alpha.script.info.push({ kind: 'reject', value: new Error(sentinelInMessage('info')) })
     const decision = await r.run(accepted({ mode: 'fungible' })).promise
     expect(decision).toStrictEqual(withdrawn('conversation-unknown'))
+    assertNoLeak(decision)
+  })
+})
+
+/** B, the persona whose react tool made a bot-tool reaction: its bot user, and the persona name stored with the item at hand-off. */
+const B_USER = 'U0BETABOT'
+const STORED_B_NAME = 'Beta Bot as handed off'
+
+/** A bot-tool item as the queue admits it: B's bot user the reactor and B's name stored with it, `overrides` over it. */
+function botToolAccepted(overrides: Partial<ReactionAcceptedRecord> = {}): ReactionAcceptedRecord {
+  const record = accepted({ origin: 'bot-tool', user: B_USER, reactor_persona_name: STORED_B_NAME, ...overrides })
+  if (!isQueueRecord(record)) throw new Error('the bot-tool fixture is not a record the queue admits')
+  return record
+}
+
+describe('lookup 1 for a bot-tool item: the persona name stored with it, with no lookup', () => {
+  test('the stored name is the reactor name, with no name lookup or bound, while lookups 2 and 3 run on the receiving persona\'s client', async () => {
+    // A resolver that would answer B's current name, so a lookup would also show in the decision.
+    const r = rig({ resolve: async () => 'Beta Bot renamed' })
+    const replies = makeDeferredWebApiCall(), info = makeDeferredWebApiCall()
+    r.stubs.alpha.script.replies.push(replies.outcome)
+    r.stubs.alpha.script.info.push(info.outcome)
+    const run = r.run(botToolAccepted())
+    await r.clock.flush()
+    expect(methods(r.stubs.alpha)).toEqual(['conversations.info', 'conversations.replies'])
+    expect(r.clock.pending().map(t => t.delayMs)).toEqual([NAME_LOOKUP_TIMEOUT_MS, NAME_LOOKUP_TIMEOUT_MS])
+    expect(run.done).toBe(false)
+    replies.settle(exactMessage({ thread_ts: ROOT_TS }))
+    info.settle(channelInfo(PUBLIC))
+    await r.clock.flush()
+    expect({ decision: run.value, resolved: r.resolved, beta: r.stubs.beta.callLog, timers: r.clock.pendingCount() })
+      .toStrictEqual({ decision: fixed(STORED_B_NAME, 'general', { thread_ts: ROOT_TS }), resolved: [], beta: [], timers: 0 })
+    assertNoLeak(run.value)
+  })
+
+  const GROUP_DM_INFO = channelInfo({ name: 'mpdm-ada--bob-1', is_mpim: true, is_group: true, is_private: true })
+  test.each([
+    ['an externally shared channel', 'fungible', exactMessage(), channelInfo({ ...PUBLIC, is_ext_shared: true }), withdrawn('fungible-refused', 'externally-shared')],
+    ['a reacted-message read refused with not_in_channel', 'fungible', { kind: 'platform', error: 'not_in_channel' }, channelInfo(PUBLIC), withdrawn('fungible-refused', 'not_in_channel')],
+    ['a group DM', 'fungible', exactMessage(), GROUP_DM_INFO, withdrawn('group-dm')],
+    ['a group DM', 'declarative', exactMessage(), GROUP_DM_INFO, withdrawn('group-dm')],
+  ] as Array<[string, ChannelMode, WebApiOutcome, WebApiOutcome, Expected]>)('%s still withdraws a %s bot-tool item, read with no membership call', async (_label, mode, replies, info, expected) => {
+    const r = rig()
+    r.stubs.alpha.script.replies.push(replies)
+    r.stubs.alpha.script.info.push(info)
+    const decision = await r.run(botToolAccepted({ mode })).promise
+    expect({ decision, calls: methods(r.stubs.alpha), beta: r.stubs.beta.callLog, resolved: r.resolved })
+      .toStrictEqual({ decision: expected, calls: ['conversations.info', 'conversations.replies'], beta: [], resolved: [] })
     assertNoLeak(decision)
   })
 })

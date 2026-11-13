@@ -23,7 +23,7 @@ import {
 } from '../../src/config.ts'
 import { durableWriteFileSync } from '../../src/atomic-write.ts'
 import { loadChannelDeliveryStore, type ChannelDeliveryStore } from '../../src/channel-delivery.ts'
-import { createPersonaRouting, type PersonaRoutingDeps, type SlackAck } from '../../src/persona-routing.ts'
+import { createPersonaRouting, type BotToolReactionInput, type BotToolReactionIntakeResult, type PersonaRoutingDeps, type SlackAck } from '../../src/persona-routing.ts'
 import { formatPersonaNotice, type PersonaNotifier } from '../../src/persona-notifier.ts'
 import type { PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
 import { LOST_MESSAGE_STATES, type LostMessageState } from '../../src/lost-message.ts'
@@ -562,6 +562,10 @@ export interface RoutingHarnessOptions {
   isRunBotIdentity?: (id: string) => boolean
   /** Wraps the queue's `accept` as the routing calls it (a scripted failed or rejected store); the queue itself is unchanged. */
   wrapAccept?: (accept: QueueAccept) => QueueAccept
+  /** Wraps the queue's `lookupReactionKey` as the routing calls it (a scripted failed lookup); the queue itself is unchanged. */
+  wrapLookupReactionKey?: (lookup: PersonaRoutingDeps['queue']['lookupReactionKey']) => PersonaRoutingDeps['queue']['lookupReactionKey']
+  /** Wraps the real preparation's `prepare` as the routing calls it (to record or hold it); the preparation itself is unchanged. */
+  wrapPrepare?: (prepare: DeliveryPreparation['prepare']) => DeliveryPreparation['prepare']
   /** Runs for each log line once it is in `h.logs`; a throw makes the log seam throw. */
   logHook?: (line: string) => void
 }
@@ -740,6 +744,12 @@ export interface RoutingHarness {
    * envelope flag as `receive` gives it.
    */
   receiveReaction(event: unknown, name: string, ack?: SlackAck, envelope?: EnvelopeOverrides): Promise<void>
+  /**
+   * Hand the named persona's reaction intake one reaction another persona
+   * made with its `react` tool, once the queue is ready: no envelope and no
+   * ack. Resolves with the intake's result.
+   */
+  receiveBotToolReaction(name: string, input: BotToolReactionInput): Promise<BotToolReactionIntakeResult>
   /** The real preparation the routing prepares through; stop it in cleanup. */
   readonly preparation: DeliveryPreparation
   /** Every ask of the `isRunBotIdentity` option's query, in order. */
@@ -978,6 +988,10 @@ export function makeRoutingHarness(
       await queueReady
       return routing.receiveReaction(event, ack ?? (() => { h.order.push('ack') }), byName(name).persona.key, envelopeFlagOf(envelope))
     },
+    receiveBotToolReaction: async (name, input) => {
+      await queueReady
+      return routing.receiveBotToolReaction(byName(name).persona.key, input)
+    },
     get preparation() { return preparation },
     runBotAsks: [],
     received: [],
@@ -1051,8 +1065,12 @@ export function makeRoutingHarness(
   }
   const preparation = createDeliveryPreparation({ queue, clock: opts.preparationClock, clientFor: webClientFor, resolveUserName: opts.resolveUserName ?? resolveUserName })
   const routing = createPersonaRouting({
-    queue: opts.wrapAccept === undefined ? queue : { lookupSlackKey: queue.lookupSlackKey, lookupReactionKey: queue.lookupReactionKey, accept: opts.wrapAccept(queue.accept) },
-    prepare: preparation.prepare,
+    queue: opts.wrapAccept === undefined && opts.wrapLookupReactionKey === undefined ? queue : {
+      lookupSlackKey: queue.lookupSlackKey,
+      lookupReactionKey: opts.wrapLookupReactionKey?.(queue.lookupReactionKey) ?? queue.lookupReactionKey,
+      accept: opts.wrapAccept?.(queue.accept) ?? queue.accept,
+    },
+    prepare: opts.wrapPrepare?.(preparation.prepare) ?? preparation.prepare,
     onReceived: (key, item) => { h.received.push({ key, seq: item.accepted.seq }) },
     ...(opts.isRunBotIdentity === undefined ? {} : {
       isRunBotIdentity: (id: string) => {

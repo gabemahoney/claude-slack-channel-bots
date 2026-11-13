@@ -107,12 +107,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
-/** Lookup 1 (SR-5.2): the reactor's name. */
+/**
+ * Lookup 1 (SR-5.2): the reactor's name. A `bot-tool` item's is the persona
+ * name stored with it at hand-off, with no lookup: neither the persona
+ * configuration in effect nor Slack is read, so a later rename or removal
+ * does not relabel it.
+ */
 export function resolveReactionReactorName(key: string, accepted: ReactionAcceptedRecord, deps: ReactionLookupDeps): Promise<string> {
-  // Insertion point for the bot-tool origin (Epic t1.1b3.99): an
-  // `accepted.origin === 'bot-tool'` branch goes here, before any user lookup,
-  // and returns `accepted.reactor_persona_name`, the name stored at hand-off,
-  // reading neither the current persona configuration nor Slack.
+  // The queue admits a `bot-tool` record only with a non-empty persona name.
+  if (accepted.origin === 'bot-tool') return Promise.resolve(accepted.reactor_persona_name!)
   const user = accepted.user
   if (user) return bounded(deps, () => deps.resolveUserName(key, user).then(name => name || user), () => user)
   return Promise.resolve(accepted.bot_id || 'unknown')
