@@ -154,6 +154,12 @@ A person's or another app's added or removed reaction on this persona's own `rep
 
 Added Reaction Notices also come from another persona served by this CSCB server deliberately using `react` on this persona's own `reply` post in a conversation it serves. Here `user` is the reacting persona's name and `user_id` is its bot user ID. These notices come through CSCB even when the receiving persona's app is not subscribed to reaction events.
 
+`reaction_notices` defaults to `true` for each persona in both channel modes (see [Persona fields](configuration.md#persona-fields)). A [confirmed change](reload.md#what-a-confirmation-applies) to `false` stops every new Reaction Notice to that persona, for added and removed reactions from anyone, other bots included. Notices already queued before the change still arrive.
+
+Turning it back on allows later reactions; reactions ignored while off are not automatically replayed.
+
+The persona's own `react` still counts as its reply with notices off: successful reactions clear its acknowledgement under the [tool rules](#tools), and any call suppresses its [reply reminder](#slack-reply-reminders).
+
 The tag has `via="reaction"`, `reaction="added"` or `reaction="removed"`, `emoji` as the emoji name without colons, and an empty BODY. `user` and `user_id` identify the reactor (`bot_id` substitutes when there is no user); `chat_id`, `channel_name`, `message_id` and optional `thread_ts` identify the persona's reacted message. `message_id` is that message's timestamp; `ts` is when the reaction happened.
 
 Use the reactor's identity to decide whose answer it is: an emoji alone is not authorisation. Notices can repeat, need no reply, get no acknowledgement reaction and create no reply reminder. They do not count as reply-call targets or change any existing message's reminder eligibility.
