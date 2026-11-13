@@ -509,6 +509,77 @@ describe('each connection\'s inbound events reach the intake with its own person
   })
 })
 
+describe('a throwing logger never skips an intake, an action or an ack (b.aos)', () => {
+  /** Plug the router with a logger that records each line, then throws. */
+  function plugThrowing(h: ConnectionHarness, routing: Pick<PersonaRouting, 'receive'>, extra: Partial<PersonaEventRouterDeps> = {}) {
+    const logs: string[] = []
+    const plugged = plugRouter(h, routing, { log: (line) => { logs.push(line); throw new Error('log sink closed') }, ...extra })
+    return { ...plugged, logs }
+  }
+
+  test.each<[PersonaSocketEventName, (overrides: Record<string, unknown>) => SlackEvent]>([
+    ['message', (o) => makeChannelMessage(o)],
+    ['app_mention', (o) => makeAppMention(o)],
+  ])('a `%s` event still reaches the intake and is acked once after the RAW line throws', async (eventName, build) => {
+    const h = harness()
+    const intake = recordingIntake()
+    const { router, logs } = plugThrowing(h, intake)
+    const event = build({ channel: CS })
+    const ack = recordingAck()
+
+    await expect(router(h.A.key, eventName, { ack: ack.ack, event })).resolves.toBeUndefined()
+
+    expect(intake.calls).toEqual([{ event, key: h.A.key }])
+    expect(ack.count()).toBe(1)
+    expect(logs.filter((l) => l.startsWith(`[slack] RAW ${eventName} event`))).toHaveLength(1)
+    assertNoLeak({ logs })
+  })
+
+  test('an unknown event name is still acked once', async () => {
+    const h = harness()
+    const intake = recordingIntake()
+    const { router, logs } = plugThrowing(h, intake)
+    const ack = recordingAck()
+
+    await expect(router(h.A.key, 'reaction_added' as PersonaSocketEventName, { ack: ack.ack })).resolves.toBeUndefined()
+
+    expect(ack.count()).toBe(1)
+    expect(intake.calls).toEqual([])
+    expect(logs).toEqual([`[slack] persona=${h.A.key}: ignoring unexpected reaction_added event`])
+  })
+
+  test('an intake throw still resolves the handler, so the manager logs no handler failure', async () => {
+    const h = harness()
+    await bringUpBoth(h)
+    const { logs } = plugThrowing(h, { receive: async () => { throw new Error('intake failed') } })
+
+    await h.stub(h.A).socket.deliver(makeChannelMessage({ channel: CS }))
+
+    expect(logs.filter((l) => l.includes('message event handling failed'))).toHaveLength(1)
+    expect(h.lines.filter((l) => l.includes('event handler failed'))).toEqual([])
+    assertNoLeak({ logs, lines: h.lines })
+  })
+
+  test('a throw on action 1 still lets action 2 run, and the payload is acked once after both', async () => {
+    const h = harness()
+    const order: string[] = []
+    const click = clickSpy((actionId) => {
+      order.push(actionId)
+      if (actionId === 'first_action') throw new Error('click failed')
+      return true
+    })
+    const { router, logs } = plugThrowing(h, recordingIntake(), { handleClick: click.handleClick })
+
+    await expect(router(h.A.key, 'interactive', {
+      ack: async () => void order.push('ack'),
+      body: blockActions(['first_action', 'second_action']),
+    })).resolves.toBeUndefined()
+
+    expect(order).toEqual(['first_action', 'second_action', 'ack'])
+    expect(logs.filter((l) => l.includes('interactive action 1 of 2 handling failed'))).toHaveLength(1)
+  })
+})
+
 // ---------------------------------------------------------------------------
 // the envelope flag at the intake
 // ---------------------------------------------------------------------------
