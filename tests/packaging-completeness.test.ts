@@ -157,6 +157,7 @@ import {
 import { RELOAD_DIAGNOSTIC_CLASSES, RELOAD_RECORD_WRITE_FAILED, reloadChannelDeliveryWriteFailedLine } from '../src/reload.ts'
 import { REACTION_DROPPED, REACTION_LOGGED_DROP_REASONS, REACTION_RECEIVED } from '../src/reaction-intake-diagnostics.ts'
 import { REACTION_MESSAGE_UNKNOWN, REACTION_WITHDRAWN } from '../src/reaction-preparation-diagnostics.ts'
+import { REACTION_HANDOFF_FAILED } from '../src/react-handoff.ts'
 import { modeSwitchLine, recordedLine, type RecordedSectionKey } from '../src/reload-plan.ts'
 import {
   CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES,
@@ -627,8 +628,8 @@ function architecture(): string {
   return architectureCache
 }
 
-/** The reaction classes, intake's and preparation's, kept apart from the persona, reload and stored-choice classes. */
-const REACTION_DIAGNOSTIC_CLASSES = [REACTION_RECEIVED, REACTION_DROPPED, REACTION_WITHDRAWN, REACTION_MESSAGE_UNKNOWN] as const
+/** The reaction classes, intake's, preparation's and the react hand-off's, kept apart from the persona, reload and stored-choice classes. */
+const REACTION_DIAGNOSTIC_CLASSES = [REACTION_RECEIVED, REACTION_DROPPED, REACTION_WITHDRAWN, REACTION_MESSAGE_UNKNOWN, REACTION_HANDOFF_FAILED] as const
 
 /** Whether `line` is a table row whose first cell opens with the `[slack] <label>:` line. */
 const isLineRow = (line: string, label: string): boolean => line.startsWith(`| \`[slack] ${label}:`)

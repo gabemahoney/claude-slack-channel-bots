@@ -10,10 +10,12 @@ import type { ChannelMode } from '../src/config.ts'
 import { isQueueRecord, type ReactionAcceptedRecord } from '../src/delivery-queue.ts'
 import {
   decideReactionPreparation,
+  lookupReactionMessage,
   lookupReactionPreparation,
   type ReactionConversationFacts,
   type ReactionConversationKind,
   type ReactionMessageFacts,
+  type ReactionMessageRead,
   type ReactionPreparationDecision,
 } from '../src/reaction-preparation.ts'
 import { SERVER_POST_EVENT_TYPE } from '../src/server-post.ts'
@@ -235,8 +237,34 @@ describe('lookupReactionPreparation: three concurrent, bounded lookups on the pe
   })
 })
 
-describe('lookup 2: the reacted message, read with its metadata', () => {
-  test('one conversations.replies with the reacted ts as ts, oldest and latest, inclusive, with all metadata', async () => {
+/** The shared lookup 2 read on alpha's client, bounded by NAME_LOOKUP_TIMEOUT_MS on the rig's clock. */
+function readMessage(r: Rig, signal?: AbortSignal): Promise<ReactionMessageRead> {
+  return lookupReactionMessage(asWebClient(r.stubs.alpha.web), CHANNEL, REACTED_TS, { clock: r.clock, lookupTimeoutMs: NAME_LOOKUP_TIMEOUT_MS, ...(signal ? { signal } : {}) })
+}
+
+/** `promise`'s value once it settles, read without awaiting it. */
+function watch<T>(promise: Promise<T>): { done: boolean; value?: T } {
+  const w: { done: boolean; value?: T } = { done: false }
+  void promise.then(value => { w.done = true; w.value = value })
+  return w
+}
+
+/** A test-owned abort signal whose `abort` listeners are recorded as they are added and removed. */
+function watchedSignal() {
+  const controller = new AbortController()
+  const signal = controller.signal
+  const added: unknown[] = []
+  const removed: unknown[] = []
+  const add = signal.addEventListener.bind(signal)
+  const remove = signal.removeEventListener.bind(signal)
+  Object.assign(signal, {
+    addEventListener: (...args: Parameters<AbortSignal['addEventListener']>) => { if (args[0] === 'abort') added.push(args[1]); add(...args) },
+    removeEventListener: (...args: Parameters<AbortSignal['removeEventListener']>) => { if (args[0] === 'abort') removed.push(args[1]); remove(...args) },
+  })
+  return { controller, signal, added, attached: () => added.filter(l => !removed.includes(l)).length }
+}
+
+describe('lookup 2: the reacted message, read with its metadata', () => {  test('one conversations.replies with the reacted ts as ts, oldest and latest, inclusive, with all metadata', async () => {
     const r = rig()
     await r.run().promise
     expect(r.stubs.alpha.calls.conversationsReplies).toStrictEqual([
@@ -260,23 +288,64 @@ describe('lookup 2: the reacted message, read with its metadata', () => {
   })
 
   test.each([
-    ['no messages field', { kind: 'ok', result: { messages: undefined } }],
-    ['a messages field that is not a list', { kind: 'ok', result: { messages: REACTED_TS } }],
-    ['malformed entries', { kind: 'ok', result: { messages: [null, 7, REACTED_TS, [REACTED_TS]] } }],
-    ['no message with the reacted ts', { kind: 'ok', result: { messages: [{ ts: NEIGHBOR_TS, thread_ts: ROOT_TS, text: BODY }] } }],
-    ['a network failure', { kind: 'network' }],
-    ['another Slack refusal', { kind: 'platform', error: 'missing_scope' }],
-    ['a thrown error whose text names not_in_channel', { kind: 'reject', value: new Error(`not_in_channel ${sentinelInMessage('replies')}`) }],
-    ['a thrown string channel_not_found', { kind: 'reject', value: 'channel_not_found' }],
-  ] as Array<[string, WebApiOutcome]>)('L1 in both modes: %s fixes the notice without thread_ts', async (_label, outcome) => {
+    ['a Tool Post', { user: 'U0AUTHOR', thread_ts: ROOT_TS }, { state: 'found', author: 'U0AUTHOR', serverPost: false, thread_ts: ROOT_TS }],
+    ['a Server Post', { user: 'U0AUTHOR', ...MARKER }, { state: 'found', author: 'U0AUTHOR', serverPost: true }],
+    ['a message with no user', { bot_id: 'B0WEBHOOK', thread_ts: ROOT_TS }, { state: 'found', serverPost: false, thread_ts: ROOT_TS }],
+    ['a message with an empty user and thread_ts', { user: '', thread_ts: '' }, { state: 'found', serverPost: false }],
+  ] as Array<[string, Record<string, unknown>, ReactionMessageRead]>)('the shared read keeps only the exact message\'s normalized facts: %s', async (_label, exact, expected) => {
+    const r = rig()
+    const content = { text: BODY, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: BODY } }], files: [{ name: BODY }], user_profile: { real_name: BODY } }
+    r.stubs.alpha.script.replies.push({ kind: 'ok', result: { messages: [{ ts: NEIGHBOR_TS, user: 'U0NEIGHBOR', thread_ts: NEIGHBOR_TS, ...content, ...MARKER }, { ts: REACTED_TS, ...content, ...exact }] } })
+    const signal = watchedSignal()
+    const read = await readMessage(r, signal.signal)
+    expect(read).toStrictEqual(expected)
+    expect(r.stubs.alpha.calls.conversationsReplies).toStrictEqual([{ channel: CHANNEL, ts: REACTED_TS, oldest: REACTED_TS, latest: REACTED_TS, inclusive: true, include_all_metadata: true }])
+    expect({ timers: r.clock.pendingCount(), listeners: signal.attached() }).toStrictEqual({ timers: 0, listeners: 0 })
+    assertNoLeak(read)
+  })
+
+  test('the message\'s author alone never changes the decision', async () => {
+    const decisions: ReactionPreparationDecision[] = []
+    for (const user of ['U0ADA', 'U0ALPHABOT', undefined]) {
+      const r = rig()
+      r.stubs.alpha.script.replies.push(exactMessage({ thread_ts: ROOT_TS, ...(user === undefined ? {} : { user }) }))
+      r.stubs.alpha.script.info.push(channelInfo(PUBLIC))
+      decisions.push(await r.run(accepted({ mode: 'fungible' })).promise)
+    }
+    const kept = fixed('Name of U0ADA', 'general', { thread_ts: ROOT_TS })
+    expect(decisions).toStrictEqual([kept, kept, kept])
+  })
+
+  test.each([
+    ['no messages field', { kind: 'ok', result: { messages: undefined } }, 'failed'],
+    ['a messages field that is not a list', { kind: 'ok', result: { messages: REACTED_TS } }, 'failed'],
+    ['malformed entries', { kind: 'ok', result: { messages: [null, 7, REACTED_TS, [REACTED_TS]] } }, 'missing'],
+    ['no message with the reacted ts', { kind: 'ok', result: { messages: [{ ts: NEIGHBOR_TS, thread_ts: ROOT_TS, text: BODY }] } }, 'missing'],
+    ['a network failure', { kind: 'network' }, 'failed'],
+    ['another Slack refusal', { kind: 'platform', error: 'missing_scope' }, 'failed'],
+    ['a thrown error whose text names not_in_channel', { kind: 'reject', value: new Error(`not_in_channel ${sentinelInMessage('replies')}`) }, 'failed'],
+    ['a thrown string channel_not_found', { kind: 'reject', value: 'channel_not_found' }, 'failed'],
+    ['a read that never answers', { kind: 'never' }, 'timeout'],
+  ] as Array<[string, WebApiOutcome, ReactionMessageRead['state']]>)('L1 in both modes: %s fixes the notice without thread_ts', async (_label, outcome, state) => {
     for (const mode of ['declarative', 'fungible'] as const) {
       const r = rig()
       r.stubs.alpha.script.replies.push(outcome)
       r.stubs.alpha.script.info.push(channelInfo(PUBLIC))
-      const decision = await r.run(accepted({ mode })).promise
-      expect(decision).toStrictEqual(fixed('Name of U0ADA', 'general', { messageUnknown: true }))
-      assertNoLeak(decision)
+      const run = r.run(accepted({ mode }))
+      await r.clock.advance(NAME_LOOKUP_TIMEOUT_MS)
+      expect(run.value).toStrictEqual(fixed('Name of U0ADA', 'general', { messageUnknown: true }))
+      expect(r.clock.pendingCount()).toBe(0)
+      assertNoLeak(run.value)
     }
+    // The shared read tells the cases apart, keeps nothing of the answer or error, and leaves no bound or listener.
+    const r = rig()
+    r.stubs.alpha.script.replies.push(outcome)
+    const signal = watchedSignal()
+    const read = watch(readMessage(r, signal.signal))
+    await r.clock.advance(NAME_LOOKUP_TIMEOUT_MS)
+    expect(read.value).toStrictEqual({ state } as ReactionMessageRead)
+    expect({ timers: r.clock.pendingCount(), listeners: signal.attached() }).toStrictEqual({ timers: 0, listeners: 0 })
+    assertNoLeak(read.value)
   })
 
   test.each(['not_in_channel', 'channel_not_found'] as const)('Slack refusing the read with %s refuses a fungible item and is L1 for a declarative one', async code => {
@@ -289,9 +358,50 @@ describe('lookup 2: the reacted message, read with its metadata', () => {
     }
     expect(decisions).toStrictEqual([withdrawn('fungible-refused', code), fixed('Name of U0ADA', 'general', { messageUnknown: true })])
     assertNoLeak(decisions)
+    const r = rig()
+    r.stubs.alpha.script.replies.push({ kind: 'platform', error: code })
+    const signal = watchedSignal()
+    const read = await readMessage(r, signal.signal)
+    expect(read).toStrictEqual({ state: 'refused', code })
+    expect({ timers: r.clock.pendingCount(), listeners: signal.attached() }).toStrictEqual({ timers: 0, listeners: 0 })
+    assertNoLeak(read)
+  })
+
+  test('an already-aborted signal settles the shared read as cancelled, with no read, bound or listener', async () => {
+    const r = rig()
+    r.stubs.alpha.script.replies.push(exactMessage())
+    const signal = watchedSignal()
+    signal.controller.abort()
+    expect(await readMessage(r, signal.signal)).toStrictEqual({ state: 'cancelled' })
+    expect({ calls: r.stubs.alpha.callLog, timers: r.clock.pendingCount(), added: signal.added.length }).toStrictEqual({ calls: [], timers: 0, added: 0 })
+  })
+
+  test.each([
+    ['success', exactMessage({ thread_ts: ROOT_TS, ...MARKER })],
+    ['refusal', { kind: 'platform', error: 'not_in_channel' }],
+  ] as Array<[string, SettledWebApiOutcome]>)('aborting a held read settles it as cancelled at once and removes its bound and listener; a late %s changes nothing, and the next read is independent', async (_label, late) => {
+    const r = rig()
+    const replies = makeDeferredWebApiCall()
+    r.stubs.alpha.script.replies.push(replies.outcome, exactMessage({ thread_ts: ROOT_TS }))
+    const signal = watchedSignal()
+    try {
+      const read = watch(readMessage(r, signal.signal))
+      await r.clock.flush()
+      expect({ calls: methods(r.stubs.alpha), bounds: r.clock.pending().map(t => t.delayMs), listeners: signal.attached(), done: read.done })
+        .toStrictEqual({ calls: ['conversations.replies'], bounds: [NAME_LOOKUP_TIMEOUT_MS], listeners: 1, done: false })
+      signal.controller.abort()
+      await r.clock.flush()
+      expect({ value: read.value, timers: r.clock.pendingCount(), listeners: signal.attached() }).toStrictEqual({ value: { state: 'cancelled' }, timers: 0, listeners: 0 })
+      replies.settle(late)
+      await r.clock.flush()
+      expect(read.value).toStrictEqual({ state: 'cancelled' })
+      expect(await readMessage(r)).toStrictEqual({ state: 'found', serverPost: false, thread_ts: ROOT_TS })
+      expect(r.clock.pendingCount()).toBe(0)
+    } finally {
+      if (!replies.settled) replies.settle()
+    }
   })
 })
-
 describe('lookup 3: the conversation, read fresh for every item', () => {
   test('a non-DM item makes one conversations.info and no other conversation or membership call', async () => {
     const r = rig()

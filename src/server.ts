@@ -209,6 +209,7 @@ import { createPersonaRouting } from './persona-routing.ts'
 import { createDeliveryQueue, isQueueItemClosed, type ReplyReminderQueue, type QueueEvent } from './delivery-queue.ts'
 import { createReplyReminders, type ReplyReminders } from './reply-reminder.ts'
 import { createDeliveryPreparation, type DeliveryPreparation } from './delivery-intake.ts'
+import { createReactHandoff } from './react-handoff.ts'
 import { tagMaxBytesFor } from './tag-wrapper.ts'
 import {
   createPersonaConnectionManager,
@@ -708,6 +709,8 @@ const sessionToolDeps: SessionToolDeps = {
   claimReactAnswer,
   // Read at each react, beside its client, never copied at session creation.
   getBotUserId: (key) => identityFor(key)?.botUserId,
+  // The one hand-off owner main() builds before admission; synchronous, so the react result never waits on it.
+  onReactClaimed: (claim) => reactHandoff?.onReactClaimed(claim),
   onReplyCall: key => replyReminders?.noteReplyCall(key),
   serverPort: 0, // updated to actual port in main() before Bun.serve
   // The channel mode of the configuration in effect, read at each tool call
@@ -1135,6 +1138,8 @@ export function _setDeliveryLifecycle(value: DeliveryLifecycle | undefined): voi
   setDeliveryLifecycle(value)
 }
 let deliveryReporting: ReturnType<typeof createDeliveryReporting> | undefined
+/** The one `react` hand-off owner (Bot-to-Bot Reaction Notices); persona teardown forgets its key's work, shutdown stops it. */
+let reactHandoff: ReturnType<typeof createReactHandoff> | undefined
 const bufferedQueueEvents: QueueEvent[] = []
 let deliveryClients: ReturnType<typeof createDeliveryClientFactory> | undefined
 export const deliveryEngineEvents = { emit: (event: DeliveryEngineEvent): void => { deliveryReporting?.engineEvent(event); if (event.type === 'item-delivered') replyReminders?.wake(event.key) } }
@@ -1363,6 +1368,9 @@ let cronScheduler: CronScheduler | null = null
 async function shutdown(reason: string, exitCode = 0): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
+  // No new message read or intake from here; an intake already started is
+  // awaited below, before preparation and the queue stop.
+  const reactHandoffDrained = reactHandoff?.stop()
   stopPermissionPoller()
   stopHealthCheck()
   // The runtime version re-check: its timers are cleared and
@@ -1420,6 +1428,7 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // synchronous stop above, before closing the transports and clients.
   const remindersStopping = replyReminders?.stop()
   const deliveryStopping = deliveryEngines?.stop()
+  await reactHandoffDrained
   await deliveryPreparation?.stop()
   await deliveryStopping
   await remindersStopping
@@ -2729,6 +2738,20 @@ export async function main(): Promise<void> {
     log: (line) => console.error(line),
     persona: getAppliedPersona,
   })
+  // Before MCP admission, so every winning react reaches it. A's intake is the
+  // one routing's, named only inside the closure.
+  reactHandoff = createReactHandoff({
+    getAppliedPersonas: () => personaConfig?.personas ?? [],
+    getBotIdentity: identityFor,
+    receiveBotToolReaction: (key, input) => personaRouting.receiveBotToolReaction(key, input),
+    clock: {
+      now: () => Date.now(),
+      setTimeout: (callback, delayMs) => globalThis.setTimeout(callback, delayMs),
+      clearTimeout: (handle) => globalThis.clearTimeout(handle as ReturnType<typeof globalThis.setTimeout>),
+    },
+    isShuttingDown: () => shuttingDown,
+    log: (line) => console.error(line),
+  })
 
   // the retired-key record (retired-keys.json in the
   // state directory) is read once here, after the PID check (so a duplicate
@@ -2804,7 +2827,8 @@ export async function main(): Promise<void> {
     // apply step 1 begins its old-life holds in the one hold
     // set, once the last-applied rewrite has succeeded.
     oldLifeHolds,
-    stopDelivery: async (key) => { const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); const remindersStopping = replyReminders?.forget(key); await Promise.all([stopping, remindersStopping]) },
+    // A retired key's react hand-off is cancelled first, as at persona teardown.
+    stopDelivery: async (key) => { reactHandoff?.forget(key); const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); const remindersStopping = replyReminders?.forget(key); await Promise.all([stopping, remindersStopping]) },
     // beside,
     // a confirmed apply's step 1 writes the unwritten
     // drops of a key it brings up, drops the retired keys' stored choices and
@@ -3607,7 +3631,8 @@ export async function main(): Promise<void> {
     isShuttingDown: () => shuttingDown,
     log: (line) => console.error(line),
     whenLaunchSettled,
-    stopDelivery: async (key) => { const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); const remindersStopping = replyReminders?.forget(key); await Promise.all([stopping, remindersStopping]) },
+    // The react hand-off's cancel comes first: called at submission and again in the teardown's turn.
+    stopDelivery: async (key) => { reactHandoff?.forget(key); const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); const remindersStopping = replyReminders?.forget(key); await Promise.all([stopping, remindersStopping]) },
     stopLiveRowSequence: (key) => stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN),
     // a teardown cancels a launch's wait for a `working` row rather
     // than wait it out (up to 10 min).

@@ -1,6 +1,8 @@
 /**
  * Reaction Item preparation: the three bounded lookups on the receiving
  * persona's own client and the fix-or-withdraw decision (SR-5.2 to SR-5.5).
+ * Lookup 2's bounded message read is exported (`lookupReactionMessage`) so
+ * the `react` hand-off reads a reacted message exactly as preparation does.
  *
  * The decision reads the channel mode stored with the item, never the mode in
  * effect now (guide exception E1). Only normalized facts leave the lookups:
@@ -50,6 +52,27 @@ export interface ReactionLookupClock {
   clearTimeout(handle: unknown): void
 }
 
+/**
+ * One bounded lookup 2 read: the exact-ts message's normalized facts (its
+ * author's user ID when it has one), a membership refusal, no exact-ts
+ * message (`missing`), a rejected or malformed read (`failed`), the bound
+ * reached (`timeout`) or the caller's signal (`cancelled`).
+ */
+export type ReactionMessageRead =
+  | { state: 'found'; author?: string; serverPost: boolean; thread_ts?: string }
+  | { state: 'refused'; code: ReactionMessageRefusal }
+  | { state: 'missing' }
+  | { state: 'failed' }
+  | { state: 'timeout' }
+  | { state: 'cancelled' }
+
+export interface ReactionMessageReadOptions {
+  clock: ReactionLookupClock
+  lookupTimeoutMs: number
+  /** Aborting it settles the read as `cancelled` at once; a read not yet started is never made. */
+  signal?: AbortSignal
+}
+
 export interface ReactionLookupDeps {
   /** The receiving persona's own client; undefined makes lookups 2 and 3 fail at once. */
   clientFor(key: string): WebClient | undefined
@@ -87,19 +110,36 @@ export function decideReactionPreparation(mode: ChannelMode, facts: ReactionPrep
   return { kind: 'fixed', user: facts.user, channel_name: conversation.channel_name, messageUnknown: true }
 }
 
-/** The fallback when `work` rejects or outlasts the bound; a late result is ignored. */
-function bounded<T>(deps: ReactionLookupDeps, work: () => Promise<T>, fallback: () => T): Promise<T> {
+const NOT_STARTED: unique symbol = Symbol('not started')
+
+/**
+ * `work`'s result, or `fallback` when it rejects, `timedOut` when it outlasts
+ * the bound and `cancelled` when `signal` aborts first. The timer and the
+ * abort listener are removed once it settles, and a late result is ignored.
+ */
+function bounded<T>(
+  bound: Pick<ReactionLookupDeps, 'clock' | 'lookupTimeoutMs'>,
+  work: () => Promise<T>,
+  fallback: () => T,
+  timedOut: () => T = fallback,
+  signal?: AbortSignal,
+  cancelled: () => T = fallback,
+): Promise<T> {
   return new Promise<T>(resolve => {
     let done = false
     let timer: unknown
+    const onAbort = (): void => finish(cancelled)
     const finish = (value: () => T) => {
       if (done) return
       done = true
-      if (timer !== undefined) deps.clock.clearTimeout(timer)
+      if (timer !== undefined) bound.clock.clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
       resolve(value())
     }
-    timer = deps.clock.setTimeout(() => finish(fallback), deps.lookupTimeoutMs)
-    Promise.resolve().then(work).then(value => finish(() => value), () => finish(fallback))
+    if (signal?.aborted) return finish(cancelled)
+    signal?.addEventListener('abort', onAbort)
+    timer = bound.clock.setTimeout(() => finish(timedOut), bound.lookupTimeoutMs)
+    Promise.resolve().then<T | typeof NOT_STARTED>(() => (done ? NOT_STARTED : work())).then(value => { if (value !== NOT_STARTED) finish(() => value) }, () => finish(fallback))
   })
 }
 
@@ -121,22 +161,50 @@ export function resolveReactionReactorName(key: string, accepted: ReactionAccept
   return Promise.resolve(accepted.bot_id || 'unknown')
 }
 
-/** Lookup 2 (SR-5.2): only the exact-ts message counts; `thread_ts` comes only from it. */
-async function readReactedMessage(client: WebClient, accepted: ReactionAcceptedRecord): Promise<ReactionMessageFacts> {
-  const ts = accepted.message_ts
+/** Lookup 2 (SR-5.2): only the exact-ts message counts; its author and `thread_ts` come only from it. */
+async function readReactedMessage(client: WebClient, channel: string, ts: string): Promise<ReactionMessageRead> {
   try {
-    const response: unknown = await client.conversations.replies({ channel: accepted.channel, ts, oldest: ts, latest: ts, inclusive: true, include_all_metadata: true })
+    const response: unknown = await client.conversations.replies({ channel, ts, oldest: ts, latest: ts, inclusive: true, include_all_metadata: true })
     const messages = isRecord(response) ? response.messages : undefined
-    const message = Array.isArray(messages) ? messages.find(m => isRecord(m) && m.ts === ts) as Record<string, unknown> | undefined : undefined
-    if (!message) return { state: 'unknown' }
-    const thread = message.thread_ts
-    return typeof thread === 'string' && thread !== ''
-      ? { state: 'found', serverPost: isServerPost(message), thread_ts: thread }
-      : { state: 'found', serverPost: isServerPost(message) }
+    if (!Array.isArray(messages)) return { state: 'failed' }
+    const message = messages.find(m => isRecord(m) && m.ts === ts) as Record<string, unknown> | undefined
+    if (!message) return { state: 'missing' }
+    const author = typeof message.user === 'string' && message.user !== '' ? message.user : undefined
+    const thread = typeof message.thread_ts === 'string' && message.thread_ts !== '' ? message.thread_ts : undefined
+    return {
+      state: 'found', serverPost: isServerPost(message),
+      ...(author !== undefined ? { author } : {}), ...(thread !== undefined ? { thread_ts: thread } : {}),
+    }
   } catch (error) {
     const code = slackPlatformReason(error)
-    return code === 'not_in_channel' || code === 'channel_not_found' ? { state: 'refused', code } : { state: 'unknown' }
+    return code === 'not_in_channel' || code === 'channel_not_found' ? { state: 'refused', code } : { state: 'failed' }
   }
+}
+
+/**
+ * Lookup 2 (SR-5.2) on `client`: one `conversations.replies` with the reacted
+ * ts as `ts`, `oldest` and `latest`, inclusive, with all metadata, bounded
+ * by `lookupTimeoutMs`. Nothing of the message but its normalized facts is
+ * kept. Never rejects.
+ */
+export function lookupReactionMessage(client: WebClient, channel: string, messageTs: string, options: ReactionMessageReadOptions): Promise<ReactionMessageRead> {
+  return bounded<ReactionMessageRead>(
+    options,
+    () => readReactedMessage(client, channel, messageTs),
+    () => ({ state: 'failed' }),
+    () => ({ state: 'timeout' }),
+    options.signal,
+    () => ({ state: 'cancelled' }),
+  )
+}
+
+/** Preparation's view of a read: anything but a found or refused message is unknown (L1). */
+function messageFactsOf(read: ReactionMessageRead): ReactionMessageFacts {
+  if (read.state === 'refused') return { state: 'refused', code: read.code }
+  if (read.state !== 'found') return { state: 'unknown' }
+  return read.thread_ts === undefined
+    ? { state: 'found', serverPost: read.serverPost }
+    : { state: 'found', serverPost: read.serverPost, thread_ts: read.thread_ts }
 }
 
 /** Lookup 3 (SR-5.2): one `conversations.info`; never `is_member` or any membership read. */
@@ -168,7 +236,7 @@ export async function lookupReactionPreparation(key: string, accepted: ReactionA
   const unknownConversation = (): ReactionConversationFacts => ({ state: 'unknown', channel_name: channel })
   const [user, message, conversation] = await Promise.all([
     resolveReactionReactorName(key, accepted, deps),
-    client ? bounded(deps, () => readReactedMessage(client, accepted), unknownMessage) : Promise.resolve(unknownMessage()),
+    client ? lookupReactionMessage(client, channel, accepted.message_ts, deps).then(messageFactsOf) : Promise.resolve(unknownMessage()),
     channel.startsWith('D') ? Promise.resolve<ReactionConversationFacts>({ state: 'dm', channel_name: 'dm' })
       : client ? bounded(deps, () => readConversation(client, channel), unknownConversation)
       : Promise.resolve(unknownConversation()),

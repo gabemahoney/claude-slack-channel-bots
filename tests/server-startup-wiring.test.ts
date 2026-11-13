@@ -54,6 +54,8 @@ import type { PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
 import type * as PersonaNotifierModule from '../src/persona-notifier.ts'
 import type { PersonaNotifier } from '../src/persona-notifier.ts'
 import type { PersonaRouting, PersonaRoutingDeps } from '../src/persona-routing.ts'
+import type * as ReactHandoffModule from '../src/react-handoff.ts'
+import type { ReactHandoff, ReactHandoffClock, ReactHandoffDeps } from '../src/react-handoff.ts'
 import type { SessionAdmissionOptions, SessionToolDeps } from '../src/registry.ts'
 import type { ReloadControllerDeps } from '../src/reload.ts'
 import type * as RestartModule from '../src/restart.ts'
@@ -1825,6 +1827,151 @@ describe('server.ts wires the persona connection seams', () => {
     const args = splitTopLevel(callArguments(SERVER_CODE, call))
     expect(args).toHaveLength(3)
     expect(args[1]).toBe('createPersonaNameResolverSource(clientFor)')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: the react hand-off (SR-6.2, SR-6.5)
+// ---------------------------------------------------------------------------
+
+/** The hand-off's factory and members; renaming one fails the typecheck. */
+const REACT_HANDOFF_FACTORY: keyof typeof ReactHandoffModule = 'createReactHandoff'
+const HANDOFF_ON_CLAIM: keyof ReactHandoff = 'onReactClaimed'
+const HANDOFF_FORGET: keyof ReactHandoff = 'forget'
+const HANDOFF_STOP: keyof ReactHandoff = 'stop'
+const SESSION_TOOLS_REACT_CLAIMED: keyof SessionToolDeps = 'onReactClaimed'
+const ROUTING_BOT_TOOL_INTAKE: keyof PersonaRouting = 'receiveBotToolReaction'
+const LIFECYCLE_STOP_DELIVERY: keyof PersonaLifecycleDeps = 'stopDelivery'
+const RELOAD_STOP_DELIVERY: keyof ReloadControllerDeps = 'stopDelivery'
+
+/** The module-scope holder the session tools' onReactClaimed delegates to, read from that delegate. */
+function reactHandoffHolder(): string {
+  const delegate = objectProperties(spreadConstObject('sessionToolDeps')).get(SESSION_TOOLS_REACT_CLAIMED)
+  const form = new RegExp(`^\\(?(\\w+)\\)? => (\\w+)\\?\\.${HANDOFF_ON_CLAIM}\\(\\1\\)$`)
+  expect(delegate).toMatch(form)
+  return delegate!.match(form)![2]!
+}
+
+/** shutdown()'s own statements in order: each one's code (whitespace collapsed) and whether it awaits outside a nested function. */
+function shutdownStatements(): Array<{ code: string; awaits: boolean }> {
+  const tree = ts.createSourceFile('server.ts', SERVER_CODE, ts.ScriptTarget.Latest, true)
+  const shutdown = tree.statements.find((node): node is ts.FunctionDeclaration => ts.isFunctionDeclaration(node) && node.name?.text === 'shutdown')
+  expect(shutdown?.body).toBeDefined()
+  return shutdown!.body!.statements.map((statement) => {
+    let awaits = false
+    const visit = (node: ts.Node): void => {
+      if (ts.isFunctionLike(node)) return
+      if (ts.isAwaitExpression(node)) awaits = true
+      ts.forEachChild(node, visit)
+    }
+    visit(statement)
+    return { code: statement.getText(tree).replace(/\s+/g, ' '), awaits }
+  })
+}
+
+// Every member is optional or a closure the type cannot tell from a stub or a
+// copy taken at import, so only this audit makes sure production builds the
+// one owner before any session can react, hands it each winning claim as it
+// is, cancels a key's work as its teardown starts and drains it at shutdown.
+// The owner's behaviour is tests/react-handoff.test.ts's; its composition with
+// the real tools is tests/registry.test.ts's.
+describe('main() builds the one react hand-off before MCP admission, the session tools hand it each winning claim, a persona stop cancels its key\'s work first and shutdown stops and drains it', () => {
+  test('one owner, built at main()\'s own top level before Bun.serve and the start bring-up, into a module-scope holder declared with no initializer; the holder is named only where it is built, delegated to, forgotten and stopped', () => {
+    expect(importSource(SERVER_CODE, REACT_HANDOFF_FACTORY)).toBe('./react-handoff.ts')
+    expect(indicesOf(new RegExp(`\\b(?:function|let|const|var)\\s+${REACT_HANDOFF_FACTORY}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    const built = onlyCallOf(REACT_HANDOFF_FACTORY)
+    const holder = reactHandoffHolder()
+    declaredOnce(holder)
+    const decls = [...SERVER_CODE.matchAll(new RegExp(`^let\\s+${holder}\\s*:[^=\\n]+$`, 'gm'))]
+    expect(decls).toHaveLength(1)
+    expect(insideMain(decls[0]!.index!)).toBe(false)
+    const assigned = assignmentsTo(holder)
+    expect(assigned.map((a) => a.value)).toEqual([`${REACT_HANDOFF_FACTORY}({`])
+    expect(atMainTopLevel(SERVER_CODE, assigned[0]!.at)).toBe(true)
+    expect(SERVER_CODE.indexOf(REACT_HANDOFF_FACTORY, assigned[0]!.at)).toBe(built)
+    const serve = callsOf('Bun\\.serve')
+    expect(serve).toHaveLength(1)
+    for (const later of [serve[0]!, startResolution(SERVER_CODE).bringUpAt]) expect(built).toBeLessThan(later)
+    // Its declaration, its assignment, the delegate, the two stopDelivery forgets and shutdown's stop.
+    expect(indicesOf(new RegExp(`\\b${holder}\\b`, 'g'), SERVER_CODE)).toHaveLength(6)
+    expect(indicesOf(new RegExp(`\\b${holder}\\?\\.${HANDOFF_FORGET}\\(`, 'g'), SERVER_CODE)).toHaveLength(2)
+    expect(indicesOf(new RegExp(`\\b${holder}\\?\\.${HANDOFF_STOP}\\(`, 'g'), SERVER_CODE)).toHaveLength(1)
+  })
+
+  test('the session tools\' onReactClaimed hands each claim, unchanged and synchronously, to the holder read at each call: with no owner yet it does nothing, then the owner gets the very claim before the call returns', () => {
+    const delegate = objectProperties(spreadConstObject('sessionToolDeps')).get(SESSION_TOOLS_REACT_CLAIMED)!
+    const holder = reactHandoffHolder()
+    expect(insideMain(SERVER_CODE.search(/\bconst\s+sessionToolDeps\b/))).toBe(false)
+    expect(indicesOf(new RegExp(`\\bsessionToolDeps\\s*(?:\\.\\s*${SESSION_TOOLS_REACT_CLAIMED}\\b|\\[)`, 'g'), SERVER_CODE)).toEqual([])
+
+    // The actual binding text, run with the holder a `let` set only after the binding exists.
+    const js = ts.transpileModule(`const value = ${delegate};`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
+    const live = new Function(`let ${holder};\n${js}\nreturn { value, install: (v) => { ${holder} = v } };`)() as {
+      value(claim: unknown): unknown
+      install(owner: { onReactClaimed(claim: unknown): void }): void
+    }
+    const claim = { chatId: 'C0WIRE', messageId: '1.1' }
+    expect(live.value(claim)).toBeUndefined()
+    const got: unknown[] = []
+    live.install({ onReactClaimed: (c) => { got.push(c) } })
+    expect(live.value(claim)).toBeUndefined()
+    expect(got).toHaveLength(1)
+    expect(got[0]).toBe(claim)
+  })
+
+  test("the owner reads the applied personas of the configuration in effect and A's confirmed identity through identityFor, gives A's reaction to the one routing's bot-tool intake read at each call, and runs on the real clock, the live shutdown flag and the server log", () => {
+    const props = onlyCallProps(REACT_HANDOFF_FACTORY)
+    const members: Array<keyof ReactHandoffDeps> = ['getAppliedPersonas', 'getBotIdentity', 'receiveBotToolReaction', 'clock', 'isShuttingDown', 'log']
+    expect([...props.keys()].sort()).toEqual([...members].sort())
+    expect(props.get('getAppliedPersonas')).toBe(`() => ${loadedConfigName(SERVER_CODE)}?.personas ?? []`)
+    expect(props.get('getBotIdentity')).toBe(constOf('createPersonaIdentityLookup'))
+    // The routing is built at module scope; the closure names it, so no copy of its method is taken.
+    const routing = constOf('createPersonaRouting')
+    expect(insideMain(onlyCallOf('createPersonaRouting'))).toBe(false)
+    expect(props.get('receiveBotToolReaction')).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => ${routing}\\.${ROUTING_BOT_TOOL_INTAKE}\\(\\1, \\2\\)$`))
+    // The one intake path: its member name and that call.
+    expect(indicesOf(new RegExp(`\\b${ROUTING_BOT_TOOL_INTAKE}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
+    const clock = objectProperties(props.get('clock')!)
+    const clockMembers: Array<keyof ReactHandoffClock> = ['now', 'setTimeout', 'clearTimeout']
+    expect([...clock.keys()].sort()).toEqual([...clockMembers].sort())
+    expect(clock.get('now')).toBe('() => Date.now()')
+    expect(clock.get('setTimeout')).toMatch(/^\((\w+), (\w+)\) => globalThis\.setTimeout\(\1, \2\)$/)
+    expect(clock.get('clearTimeout')).toMatch(/^\(?(\w+)\)? => globalThis\.clearTimeout\(\1(?: as [^()]+)?\)$/)
+    expect(props.get('isShuttingDown')).toBe('() => shuttingDown')
+    expect(props.get('log')).toMatch(/^\(\s*(\w+)\s*\)\s*=>\s*console\.error\(\s*\1\s*\)$/)
+  })
+
+  // The lifecycle calls stopDelivery when a teardown is submitted, without
+  // awaiting it, so only its synchronous first part runs then; the forget must
+  // be in it, not behind an await or the later routing forget.
+  test.each<[string, string, string]>([
+    ["the persona lifecycle's", 'createPersonaLifecycle', LIFECYCLE_STOP_DELIVERY],
+    ["the reload controller's", 'createReloadController', RELOAD_STOP_DELIVERY],
+  ])("%s stopDelivery forgets the key's react hand-off work as its first statement, before the delivery engines' forget and any await", (_label, factory, member) => {
+    const holder = reactHandoffHolder()
+    const body = onlyCallProps(factory).get(member)
+    expect(body).toMatch(new RegExp(`^async \\(?(\\w+)\\)? => \\{ ${holder}\\?\\.${HANDOFF_FORGET}\\(\\1\\); const \\w+ = deliveryEngines\\?\\.forget\\(\\1\\);`))
+    expect(body!.indexOf('await')).toBeGreaterThan(body!.indexOf(`${holder}?.${HANDOFF_FORGET}(`))
+  })
+
+  test('shutdown stops the owner after raising shuttingDown and before its first await, and awaits the drain stop returns before preparation and the queue stop', () => {
+    const holder = reactHandoffHolder()
+    const statements = shutdownStatements()
+    const only = (re: RegExp): number => {
+      const at = statements.flatMap((s, i) => (re.test(s.code) ? [i] : []))
+      expect([String(re), at.length]).toEqual([String(re), 1])
+      return at[0]!
+    }
+    const raised = only(/^shuttingDown = true;?$/)
+    const stopped = only(new RegExp(`^const (\\w+) = ${holder}\\?\\.${HANDOFF_STOP}\\(\\);?$`))
+    const drain = statements[stopped]!.code.match(/^const (\w+) =/)![1]!
+    const drained = only(new RegExp(`^await ${drain};?$`))
+    expect(raised).toBeLessThan(stopped)
+    expect(statements.findIndex((s) => s.awaits)).toBeGreaterThan(stopped)
+    expect(drained).toBeLessThan(only(/^await deliveryPreparation\?\.stop\(\);?$/))
+    expect(drained).toBeLessThan(only(/^await deliveryQueue\?\.stop\(\);?$/))
+    // The drain is named only where it is taken and awaited.
+    expect(statements.filter((s) => new RegExp(`\\b${drain}\\b`).test(s.code))).toHaveLength(2)
   })
 })
 

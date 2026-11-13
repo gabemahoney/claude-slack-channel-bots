@@ -499,12 +499,13 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
 
     expect(props.get('forgetReplyReminders')).toMatch(/^\(?key\)? => replyReminders\?\.forget\(key\) \?\? Promise\.resolve\(\)$/)
 
-    // Teardown stops delivery and forgets its lifecycle for this key.
+    // Teardown cancels the key's react hand-off work first, then stops
+    // delivery and forgets its lifecycle for this key.
     const stopBody = props.get('stopDelivery') ?? ''
-    const stopDelivery = stopBody.match(/^async \(?(\w+)\)? => \{ const (\w+) = /)
+    const stopDelivery = stopBody.match(/^async \(?(\w+)\)? => \{ reactHandoff\?\.forget\(\1\); const (\w+) = /)
     expect(stopDelivery).not.toBeNull()
     const [, stopKey, stoppingDelivery] = stopDelivery!
-    expect(stopBody).toBe(`async (${stopKey}) => { const ${stoppingDelivery} = deliveryEngines?.forget(${stopKey}); deliveryLifecycle?.forget(${stopKey}); const remindersStopping = replyReminders?.forget(${stopKey}); await Promise.all([${stoppingDelivery}, remindersStopping]) }`)
+    expect(stopBody).toBe(`async (${stopKey}) => { reactHandoff?.forget(${stopKey}); const ${stoppingDelivery} = deliveryEngines?.forget(${stopKey}); deliveryLifecycle?.forget(${stopKey}); const remindersStopping = replyReminders?.forget(${stopKey}); await Promise.all([${stoppingDelivery}, remindersStopping]) }`)
 
     // optional in the deps, so only this pin makes
     // sure a production teardown stops the key's live-row sequence (right
