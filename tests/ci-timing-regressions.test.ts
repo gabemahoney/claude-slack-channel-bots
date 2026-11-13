@@ -2041,6 +2041,67 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     expect(run.stdout).not.toContain(secret); expect(run.stdout).not.toContain('cscb_other'); expect(run.stdout).not.toContain('updated_at')
     expect(run.stdout).not.toContain(tok)
   })
+  // test-29's real leave steps and expect_stale_review. The stand-in server
+  // applies the leave on its ACK and, when pending, lands the staged rescan at
+  // its next chance: the rescan wait, or the stale confirmation's reload tick.
+  // The rescan rewrites what sharedApplicationPreserved compares (the left
+  // channel's isExtSharedChannel), here the stand-in record's bytes.
+  const leaveSteps = block(test29Script, '        member_unlist alpha "${channel}"', '        configuration_request "leave-cancel-')
+  const rescanWait = '        wait_membership_rescan "${ALPHA}" "${ALPHA_LABEL}" "$(slack_stub_record_field seq push "envelope_id=${first}")"\n'
+  test.each([
+    ['pending', 'with the wait', 0, ''],
+    ['pending', 'without the wait', 1, 'leave-stale-open-off: stale confirmation changed applied facts\n'],
+    ['landed', 'with the wait', 0, ''],
+    ['landed', 'without the wait', 0, ''],
+  ] as const)('test-29 leave lets its staged rescan land before the stale check: rescan %s, %s', (rescan, variant, status, stderr) => {
+    expect(leaveSteps.split(rescanWait)).toHaveLength(2)
+    const steps = variant === 'with the wait' ? leaveSteps : leaveSteps.replace(rescanWait, '')
+    const run = shell([
+      'CONFIG="$HOME/config.json" LAST="$HOME/config.json.last-applied" APPLY="$HOME/config.json.apply" CAPTURED="$HOME/captured"',
+      'ALPHA=t29_alpha ALPHA_LABEL=alpha ALPHA_KEY=k_alpha BRAVO_KEY=k_bravo M_HYBRID=CHYBRID EVENT_WAIT_S=15 APPLY_WAIT_S=20',
+      `SUPERSEDED_OUTCOME=superseded RESCAN=${rescan} mode=open value=off channel=CLEFT`, 'declare -A LEAVE_ENVELOPES=()',
+      'mkdir -p "$CAPTURED"; printf "stale\\n" > "$CAPTURED/leave-preview-open-off.pending"; printf "member ext=false\\n" > "$LAST"',
+      'land_rescan() { [[ -e "$HOME/rescan-due" ]] || return 0; printf "left ext=absent\\n" > "$LAST"; rm "$HOME/rescan-due"; }',
+      'member_unlist() { :; }', 'scenario_ts() { echo 1.1; }', 'slack_push_channel_left() { echo env-left; }',
+      'ack_control() { [[ "$1" == env-left ]] || return 1; printf "left ext=false\\n" > "$LAST"; touch "$HOME/rescan-due"; [[ "$RESCAN" == pending ]] || land_rescan; }',
+      'wait_until() { shift 2; "$@"; }', 'choice_is() { [[ "$3" == "" ]]; }', 'shared_thread_since() { :; }', 'channel_facts() { echo "facts $1 $2"; }',
+      'slack_stub_record_field() { [[ "$*" == "seq push envelope_id=env-left" ]] || return 1; echo 41; }',
+      'wait_membership_rescan() { printf "%s\\n" "$*" >> "$HOME/waits"; land_rescan; }',
+      'wait_since() { land_rescan; mv -- "$APPLY" "$HOME/spent"; }',
+      'configuration_application_preserved() { cmp -s "$2" "$3"; }',
+      declaration(test29Script, 'log_mark'), declaration(test29Script, 'expect_stale_review'),
+      'sibling="$(channel_facts "${BRAVO_KEY}" "${channel}")"; before="$(channel_facts "${ALPHA_KEY}" "${M_HYBRID}")"',
+      steps, 'cat "$HOME/waits" 2> /dev/null || true', 'cat "$LAST"',
+    ].join('\n'))
+    expect({ status: run.status, stderr: run.stderr }).toEqual({ status, stderr })
+    if (status) return
+    expect(run.stdout).toBe((variant === 'with the wait' ? 't29_alpha alpha 41\n' : '') + 'left ext=absent\n')
+  })
+  // test-29's real DM enable in own_posts_phase, with the real input_has and
+  // edit_input. The stand-in review fails as the server's reload-noop does when
+  // the confirmed input equals the applied one.
+  const dmEnable = block(test29Script, '    name="$(if [[ "${q}" == alpha ]]', '    successful_tool "${mode}-own-dm"')
+  const unguarded = dmEnable.replace(/^ {4}if ! input_has .*; then\n/m, '').replace(/^ {4}fi\n/m, '')
+  test.each([
+    ['bravo', 'UCONTACT', 'guarded', 0, '', [], { enabled: true, contact: 'UCONTACT' }],
+    ['bravo', 'UCONTACT', 'unguarded', 1, 'open-enable-dm: confirmation did not apply (reload-noop)\n', [], { enabled: true, contact: 'UCONTACT' }],
+    ['bravo', 'UOTHER', 'guarded', 0, '', ['open-enable-dm'], { enabled: true, contact: 'UCONTACT' }],
+    ['alpha', '', 'guarded', 0, '', ['open-enable-dm'], { enabled: true, contact: 'UCONTACT' }],
+  ] as const)('test-29 reviews a DM enable only when the input changes: %s contact=%s %s', (q, contact, form, status, stderr, reviews, dm) => {
+    expect(unguarded.length).toBeLessThan(dmEnable.length)
+    const config = { personas: [{ name: 't29_alpha', dm: { enabled: false } },
+      { name: 't29_bravo', dm: contact ? { enabled: true, contact } : { enabled: false } }] }
+    const run = shell([
+      'CONFIG="$HOME/config.json" ALPHA=t29_alpha BRAVO=t29_bravo CONTACT=UCONTACT mode=open', `q=${q}`, 'cp -- "$CONFIG" "$HOME/applied.json"',
+      'review_assign() { printf "%s\\n" "$*" >> "$HOME/reviews"; [[ "$(jq -cS . "$CONFIG")" != "$(jq -cS . "$HOME/applied.json")" ]] || fail "$1: confirmation did not apply (reload-noop)"; cp -- "$CONFIG" "$HOME/applied.json"; }',
+      declaration(test29Script, 'edit_input'), test29Script.match(/^input_has\(\) \{.*\}$/m)![0],
+      form === 'guarded' ? dmEnable : unguarded,
+      'cat "$HOME/reviews" 2> /dev/null || true', `jq -c --arg who "t29_${q}" '.personas[]|select(.name==$who)|.dm' "$CONFIG"`,
+    ].join('\n'), { 'config.json': JSON.stringify(config) })
+    expect({ status: run.status, stderr: run.stderr }).toEqual({ status, stderr })
+    if (status) return
+    expect(run.stdout.trim().split('\n')).toEqual([...reviews, JSON.stringify(dm)])
+  })
   test('burst slice removes exactly the two write envelopes and keeps every other stub line byte-for-byte', () => {
     const lines = ['{"seq":1,"event":"push","envelope_id":"burst","sent_mono_ms":1.250000}', '{"seq":2,"event":"push","envelope_id":"leave-env"}',
       '{"seq":3,"event":"ws-message","envelope_id":"leave-env"}', '{"seq":4,"event":"fault","request_id":"r1"}',

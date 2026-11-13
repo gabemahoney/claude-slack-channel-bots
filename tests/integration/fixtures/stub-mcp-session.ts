@@ -82,6 +82,12 @@
  *   - Tool request: `{"id":"<id>","method":"tools/call","tool":"<tool name>","arguments":{…}}`.
  *     `id` is non-empty; `tool` is 1–128 letters, digits, `_`, `-` or `.`;
  *     `arguments` is a JSON object (not an array or null).
+ *   - A tool request too long for one write names its arguments instead:
+ *     `"arguments_file":"stub-mcp-arguments.<key>.<id>.json"`, never with
+ *     `arguments`. Only that exact name in this client's directory is read: a
+ *     regular file (not a symlink) of at most ARGUMENTS_FILE_MAX_BYTES holding
+ *     one JSON object, which the harness writes whole before it appends the
+ *     line. Anything else makes the line invalid; no reason quotes the file.
  *   - Listing request: `{"id":"<id>","method":"tools/list"}`. No tool or
  *     arguments are accepted. Calls the negotiated client's listTools and
  *     returns its tools array as JSON in the result's text field.
@@ -199,7 +205,7 @@
  * client never opened a session: the client writes nothing before it
  * connects. Polling ends with the session.
  */
-import { closeSync, existsSync, openSync, readFileSync, realpathSync, writeSync } from 'node:fs'
+import { closeSync, existsSync, lstatSync, openSync, readFileSync, realpathSync, writeSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -254,6 +260,13 @@ const REQUESTS_PREFIX = 'stub-mcp-requests.'
 const RESULTS_PREFIX = 'stub-mcp-results.'
 const SESSIONS_PREFIX = 'stub-mcp-sessions.'
 const RECORD_SUFFIX = '.jsonl'
+
+/** A request's arguments file: `<prefix><key>.<id><suffix>` (see the header). */
+const ARGUMENTS_PREFIX = 'stub-mcp-arguments.'
+const ARGUMENTS_SUFFIX = '.json'
+
+/** The largest arguments file read, in bytes (scenario.sh SCENARIO_STUB_ARGUMENTS_MAX_BYTES). */
+const ARGUMENTS_FILE_MAX_BYTES = 65_536
 
 /** The notification the server delivers a channel message by (src/persona-routing.ts). */
 const CHANNEL_NOTIFICATION_METHOD = 'notifications/claude/channel'
@@ -380,8 +393,40 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+/** The arguments a request's `arguments_file` names, or why it names none. */
+type ArgumentsFileReader = (id: string, name: string) => { arguments: unknown } | { invalid: string }
+
+/**
+ * Read only `<ARGUMENTS_PREFIX><key>.<id><ARGUMENTS_SUFFIX>` in `dir`: a
+ * regular file, never followed through a symlink, of at most
+ * ARGUMENTS_FILE_MAX_BYTES, parsed as JSON. Reasons never quote the file.
+ */
+function argumentsFileReader(dir: string, key: string): ArgumentsFileReader {
+  return (id, name) => {
+    if (!/^[A-Za-z0-9_.-]{1,200}$/.test(id) || name !== `${ARGUMENTS_PREFIX}${key}.${id}${ARGUMENTS_SUFFIX}`) {
+      return { invalid: '"arguments_file" is not this request\'s arguments file' }
+    }
+    const path = join(dir, name)
+    let bytes: Buffer
+    try {
+      const stat = lstatSync(path)
+      if (!stat.isFile()) return { invalid: 'the arguments file is not a regular file' }
+      if (stat.size > ARGUMENTS_FILE_MAX_BYTES) return { invalid: 'the arguments file is too large' }
+      bytes = readFileSync(path)
+    } catch {
+      return { invalid: 'the arguments file could not be read' }
+    }
+    if (bytes.length > ARGUMENTS_FILE_MAX_BYTES) return { invalid: 'the arguments file is too large' }
+    try {
+      return { arguments: JSON.parse(bytes.toString('utf8')) }
+    } catch {
+      return { invalid: 'the arguments file is not JSON' }
+    }
+  }
+}
+
 /** The request a complete line holds, or why it holds none. */
-function parseRequest(line: string): StubRequest | { invalid: string } {
+function parseRequest(line: string, readArguments?: ArgumentsFileReader): StubRequest | { invalid: string } {
   let value: unknown
   try {
     value = JSON.parse(line)
@@ -389,18 +434,27 @@ function parseRequest(line: string): StubRequest | { invalid: string } {
     return { invalid: 'not JSON' }
   }
   if (!isPlainObject(value)) return { invalid: 'not a JSON object' }
-  const { id, method, tool, arguments: args, group, lose_response } = value
+  const { id, method, tool, group, lose_response } = value
+  let args = value['arguments']
   if (typeof id !== 'string' || id === '') return { invalid: '"id" is not a non-empty string' }
   if ('group' in value && (typeof group !== 'string' || group === '')) return { invalid: '"group" is not a non-empty string' }
   if ('lose_response' in value && typeof lose_response !== 'boolean') return { invalid: '"lose_response" is not a boolean' }
   const grouping = typeof group === 'string' ? { group } : {}
   if (method === 'tools/list') {
-    if ('tool' in value || 'arguments' in value) return { invalid: 'tools/list takes no tool or arguments' }
+    if ('tool' in value || 'arguments' in value || 'arguments_file' in value) return { invalid: 'tools/list takes no tool or arguments' }
     if ('lose_response' in value) return { invalid: 'tools/list takes no lose_response' }
     return { id, method, ...grouping }
   }
   if (method !== 'tools/call') return { invalid: 'unsupported method' }
   if (typeof tool !== 'string' || !/^[A-Za-z0-9_.-]{1,128}$/.test(tool)) return { invalid: '"tool" is not a tool name' }
+  if ('arguments_file' in value) {
+    if ('arguments' in value) return { invalid: 'a request takes "arguments" or "arguments_file", not both' }
+    const file = value['arguments_file']
+    if (typeof file !== 'string' || readArguments === undefined) return { invalid: '"arguments_file" is not an arguments file' }
+    const read = readArguments(id, file)
+    if ('invalid' in read) return read
+    args = read.arguments
+  }
   if (!isPlainObject(args)) return { invalid: '"arguments" is not a JSON object' }
   const { _stub_session: sessionRole, ...toolArgs } = args
   if ('_stub_session' in args && sessionRole !== 'stale' && sessionRole !== 'replacement') {
@@ -444,6 +498,7 @@ async function main(argv: readonly string[]): Promise<number> {
   const requestsPath = recordPath(REQUESTS_PREFIX, key)
   const resultsPath = recordPath(RESULTS_PREFIX, key)
   const sessionsPath = recordPath(SESSIONS_PREFIX, key)
+  const readArguments = argumentsFileReader(CLIENT_DIR, key)
 
   const { Client } = await importSdk('client/index.js')
   const { StreamableHTTPClientTransport } = await importSdk('client/streamableHttp.js')
@@ -713,7 +768,7 @@ async function main(argv: readonly string[]): Promise<number> {
       const text = bytes.subarray(readOffset, lineEnd).toString('utf8')
       readOffset = lineEnd + 1
       lineNumber += 1
-      const request = parseRequest(text)
+      const request = parseRequest(text, readArguments)
       if ('invalid' in request) {
         say(`line ${lineNumber} of the request file ${requestsPath} is not a valid request (${request.invalid}); skipped`)
         continue

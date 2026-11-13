@@ -2091,6 +2091,29 @@ test('a short or failed queue evidence read names its stage, errno and partial c
   }
 }))
 
+// test-46's two recovery requests, read from the script with its TEST_NAME
+// expanded, through the real printer and the installed parser. The colon
+// form scenario_attempt_id prints is not a review ID.
+test('test-46 builds its recovery requests with review IDs: the printer accepts them and refuses the attempt-ID colon form', () => sharedPrinterControl(async ({ scratch, printer }) => {
+  const script = readFileSync(join(REPO_ROOT, 'tests/integration/test-46-shared-channel-recovery.sh'), 'utf8')
+  const testName = /^TEST_NAME="([^"]+)"$/m.exec(script)![1]!
+  const ids = [...script.matchAll(/^configuration_recovery_request "([^"]+)"/gm)].map(m => m[1]!.replace('${TEST_NAME}', testName))
+  expect(ids).toEqual([`${testName}-owned-restoration`, `${testName}-cold-replacement`])
+  const damaged = join(scratch, 'damaged')
+  writeFileSync(damaged, 'controlled damaged authority\n')
+  const requestModule = await import(join(REPO_ROOT, 'src/reload-request.ts'))
+  for (const id of ids) {
+    expect(requestModule.REVIEW_ID_RE.test(id)).toBe(true)
+    expect(JSON.parse(await printer.entryValue('sharedRecoveryRequest', [id, damaged]))).toMatchObject({ request_id: id, action: 'restore' })
+  }
+  for (const name of ['owned-restoration', 'cold-replacement']) {
+    await assert.rejects(printer.entryValue('sharedRecoveryRequest', [`${testName}:${name}`, damaged]), (e: any) => {
+      assert.equal(e.exitCode, 1); assert.match(e.message, /invalid recovery request arguments/)
+      return true
+    })
+  }
+}))
+
 describe("test-47's refused starts and test-40's earlier release", () => {
   const exitCode = (code: number) => (err: unknown) => (err as { exitCode?: unknown }).exitCode === code
 

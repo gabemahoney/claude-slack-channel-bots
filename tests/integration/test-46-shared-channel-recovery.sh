@@ -1559,7 +1559,8 @@ second_chunk="$(python3 -c 'print("ijklmnop" * 375, end="")')"
 chunk_text="${first_chunk}${second_chunk}"
 slack_stub_post_fail "${LABEL[p]}" "${chunk_channel}" error error=channel_not_found after=1
 chunk_mark="$(slack_post_mark)"
-result="$(stub_session_call "${WORK[p]}" reply "$(jq -cn --arg c "${chunk_channel}" --arg t "${chunk_text}" '{chat_id:$c,text:$t}')")"
+# The two parts exceed one request line, so the reply's arguments go in a file.
+result="$(stub_session_call "${WORK[p]}" reply "$(jq -cn --arg c "${chunk_channel}" --arg t "${chunk_text}" '{chat_id:$c,text:$t}')" arguments-file)"
 printf '%s\n' "${result}" > "${EVIDENCE}/chunk-result.json"
 jq -e '.isError==true and (has("error")|not)' <<< "${result}" > /dev/null || fail 'later failed chunk falsely succeeded'
 wait_until 30 'later chunk fault not reached' has_record_after "${chunk_mark}" fault "label=${LABEL[p]}" method=chat.postMessage outcome=error
@@ -1971,7 +1972,8 @@ staged_count="$(count_log "${staged_diagnostic}")"
 mark="$(slack_post_mark)"
 printf '%s\n' 'controlled damaged authority while the live owner retains its anchor' > "${LAST}"
 cp "${LAST}" "${EVIDENCE}/restoration-damaged"
-configuration_recovery_request "$(scenario_attempt_id owned-restoration)" "${EVIDENCE}/restoration-damaged" "${EVIDENCE}/restoration-request.json"
+# Recovery request IDs are review IDs (REVIEW_ID_RE): no colon, unlike an attempt ID.
+configuration_recovery_request "${TEST_NAME}-owned-restoration" "${EVIDENCE}/restoration-damaged" "${EVIDENCE}/restoration-request.json"
 wait_for_count "${stage_line}" "$((stage_count + 1))" 30 'owner did not stage restoration'
 configuration_application_preserved "${CONFIG}" "${EVIDENCE}/restoration-anchor" "${LAST}" > /dev/null
 wait_for_count "${staged_diagnostic}" "$((staged_count + 1))" 30 'staged repair diagnostic missing'
@@ -2136,7 +2138,7 @@ cp "${SNAP[p]}" "${EVIDENCE}/replacement-queue-before.jsonl"
 crash
 printf '%s\n' 'controlled irrecoverable authority without a running owner' > "${LAST}"
 cp "${LAST}" "${EVIDENCE}/replacement-damaged"
-configuration_recovery_request "$(scenario_attempt_id cold-replacement)" "${EVIDENCE}/replacement-damaged" \
+configuration_recovery_request "${TEST_NAME}-cold-replacement" "${EVIDENCE}/replacement-damaged" \
     "${EVIDENCE}/replacement-request.json" "${EVIDENCE}/replacement-source.json"
 refused_recovery_start
 shared_recovery_pending "${EVIDENCE}/replacement-request.json" "${CONFIG}.pending" > "${EVIDENCE}/replacement-review.json"

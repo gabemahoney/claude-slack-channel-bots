@@ -1306,7 +1306,7 @@
 #                                      JSON object per line, as recorded, in record order; only
 #                                      complete lines. Prints nothing when there is no record yet.
 #                                      Read-only
-#   stub_session_call <dir> <tool> <json-args>
+#   stub_session_call <dir> <tool> <json-args> [arguments-file]
 #                                      (harness addition, both modes) call the MCP tool <tool>
 #                                      (1 to 128 letters, digits, `_`, `-` or `.`) with
 #                                      <json-args> (a JSON object) over the session of the stub
@@ -1324,7 +1324,12 @@
 #                                      naming <tool>, the request ID and <dir>, when no result
 #                                      line comes in time; an `isError: true` result is the
 #                                      scenario's to judge, not a failure. Writes only the request
-#                                      file, in SCENARIO_STUB_DIR
+#                                      file, in SCENARIO_STUB_DIR. With `arguments-file`, for
+#                                      arguments too long for one line: first writes them whole
+#                                      to a new `stub-mcp-arguments.<key>.<id>.json` there (at
+#                                      most SCENARIO_STUB_ARGUMENTS_MAX_BYTES), and the request
+#                                      line names that file instead of carrying them; their
+#                                      content is never printed
 #   stub_session_list_tools <dir>      list the negotiated tools over the same MCP session.
 #                                      Uses a tools/list method request, never a tool name.
 #                                      The same bounded record exchange returns the tools
@@ -5976,6 +5981,15 @@ SCENARIO_STUB_CALL_S=30
 # the request file in one write.
 SCENARIO_STUB_REQUEST_MAX_BYTES=4000
 
+# A tool call's arguments file, for arguments too long for one request line:
+# `<prefix><key>.<request id><suffix>` in SCENARIO_STUB_DIR, at most this many
+# bytes, newline included (fixtures/stub-mcp-session.ts ARGUMENTS_PREFIX,
+# ARGUMENTS_SUFFIX and ARGUMENTS_FILE_MAX_BYTES). Well below the kernel's
+# 128 KiB bound on one argument, which every jq call here passes them in.
+SCENARIO_STUB_ARGUMENTS_PREFIX=stub-mcp-arguments.
+SCENARIO_STUB_ARGUMENTS_SUFFIX=.json
+SCENARIO_STUB_ARGUMENTS_MAX_BYTES=65536
+
 # _scenario_check_stub_url <step>: fail, with the reason, unless
 # SCENARIO_SLACK_STUB_URL is exactly `http://127.0.0.1:<port>` (a port from 1
 # to 65535, never 3100).
@@ -6120,8 +6134,8 @@ stub_session_call() {
     local dir="${1:-}" tool="${2:-}" step
     step="stub_session_call ${dir} ${tool}"
     require_ci_image "${step}"
-    (( $# == 3 )) || fail "${step}: takes <dir> <tool> <json-args>"
-    _scenario_stub_request "${dir}" tools/call "${tool}" "$3"
+    (( $# == 3 )) || [[ $# == 4 && "$4" == arguments-file ]] || fail "${step}: takes <dir> <tool> <json-args> [arguments-file]"
+    _scenario_stub_request "${dir}" tools/call "${tool}" "$3" "${@:4}"
 }
 
 stub_session_list_tools() {
@@ -6134,12 +6148,13 @@ stub_session_list_tools() {
 # Shared bounded exchange. A method and a tool name are distinct fields;
 # listing has no tool or arguments, and every tools/call validates both.
 _scenario_stub_request() {
-    local dir="${1:-}" method="${2:-}" tool="${3:-}" args="${4:-}" payload stub key requests results id line found deadline step
+    local dir="${1:-}" method="${2:-}" tool="${3:-}" args="${4:-}" via="${5:-}" payload stub key requests results id line found deadline step argfile content
     step="stub session ${method} ${dir}${tool:+ ${tool}}"
     require_ci_image "${step}"
     case "${method}" in
         tools/call)
-            (( $# == 4 )) || fail "${step}: takes <dir> tools/call <tool> <json-args>"
+            (( $# == 4 )) || [[ $# == 5 && "${via}" == arguments-file ]] \
+                || fail "${step}: takes <dir> tools/call <tool> <json-args> [arguments-file]"
             [[ "${tool}" =~ ^[A-Za-z0-9_.-]{1,128}$ ]] \
                 || fail "${step}: '${tool}' is not a tool name (1 to 128 letters, digits, '_', '-' or '.')"
             jq -n -e --argjson a "${args}" '$a | type == "object"' > /dev/null 2>&1 \
@@ -6169,6 +6184,20 @@ _scenario_stub_request() {
     id="${SCENARIO_TAG}-${BASHPID}-${EPOCHREALTIME//[.,]/}-${RANDOM}"
     if [[ -f "${requests}" ]] && grep -qF -- "\"id\":\"${id}\"" "${requests}"; then
         fail "${step}: the request ID ${id} is already in ${requests}"
+    fi
+    if [[ "${via}" == arguments-file ]]; then
+        # The arguments go whole into their own new file before the request
+        # line names it, so the client never reads part of them. Neither the
+        # file's content nor the arguments are ever printed.
+        [[ "${id}" =~ ^[A-Za-z0-9_.-]{1,200}$ ]] || fail "${step}: the request ID ${id} cannot name an arguments file"
+        argfile="${stub}/${SCENARIO_STUB_ARGUMENTS_PREFIX}${key}.${id}${SCENARIO_STUB_ARGUMENTS_SUFFIX}"
+        [[ ! -e "${argfile}" && ! -L "${argfile}" ]] || fail "${step}: the arguments file ${argfile} already exists"
+        content="$(jq -c -a -n --argjson a "${args}" '$a')" || fail "${step}: could not build the arguments file"
+        (( ${#content} < SCENARIO_STUB_ARGUMENTS_MAX_BYTES )) \
+            || fail "${step}: the arguments take ${#content} bytes; at most $(( SCENARIO_STUB_ARGUMENTS_MAX_BYTES - 1 )) fit an arguments file"
+        ( set -C; printf '%s\n' "${content}" > "${argfile}" ) 2> /dev/null || fail "${step}: could not write the arguments file ${argfile}"
+        payload="$(jq -c -a -n --arg tool "${tool}" --arg file "${argfile##*/}" \
+            '{method: "tools/call", tool: $tool, arguments_file: $file}')" || fail "${step}: could not build the tool request"
     fi
     # ASCII only (-a), so the line's length is its size in bytes.
     line="$(jq -c -a -n --arg id "${id}" --argjson payload "${payload}" \

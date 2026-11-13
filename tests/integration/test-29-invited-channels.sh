@@ -983,6 +983,10 @@ live_membership_phase() {
         LEAVE_ENVELOPES["${mode}|${value}"]="${first}"
         ack_control "${first}"
         wait_until "${EVENT_WAIT_S}" 'leave did not remove saved entry' choice_is "${ALPHA_KEY}" "${channel}" ''
+        # The applied leave staged an inventory rescan. Let it land before the
+        # stale check's snapshot, so that check's window holds only the refused
+        # confirmation.
+        wait_membership_rescan "${ALPHA}" "${ALPHA_LABEL}" "$(slack_stub_record_field seq push "envelope_id=${first}")"
         [[ -z "$(shared_thread_since "${ALPHA_KEY}" "${channel}")" ]] || fail 'leave retained Thread Hybrid Since'
         [[ "$(channel_facts "${BRAVO_KEY}" "${channel}")" == "${sibling}" ]] || fail 'leave changed sibling choice'
         [[ "$(channel_facts "${ALPHA_KEY}" "${M_HYBRID}")" == "${before}" ]] || fail 'leave changed another channel'
@@ -1093,7 +1097,7 @@ successful_tool() {
 }
 
 own_posts_phase() {
-    local mode="$1" q="$2" dir key bot root text mark result post_ts stamp before file method envelope outside
+    local mode="$1" q="$2" dir key bot root text mark result post_ts stamp before file method envelope outside name
     thread_persona "${q}"; dir="${THREAD_DIR}"; key="${THREAD_KEY}"; bot="${THREAD_BOT}"
     set_composed_choice "${mode}" "${q}" "${DEST}" thread_hybrid "${mode}-own-hybrid"
     # No inbound mention supplied either own-post join. The root's original
@@ -1129,10 +1133,13 @@ own_posts_phase() {
     successful_tool "${mode}-react-only" "${dir}" react "$(jq -cn --arg c "${DEST}" --arg id "${outside}" '{chat_id:$c,message_id:$id,emoji:"thumbsup"}')"
     [[ "$(shared_thread_joins "${key}" "${DEST}" "${stamp}" | jq -scS 'sort_by(.root)')" == "${before}" ]] || fail 'reaction/edit/delete/outside post joined a thread'
     # DM tools may post, but do not create channel participation. Group DM
-    # ingress remains excluded, even with a direct mention.
-    edit_input --arg who "$(if [[ "${q}" == alpha ]]; then echo "${ALPHA}"; else echo "${BRAVO}"; fi)" --arg contact "${CONTACT}" \
-        '(.personas[]|select(.name==$who)|.dm)={enabled:true,contact:$contact}'
-    review_assign "${mode}-enable-dm"
+    # ingress remains excluded, even with a direct mention. Bravo's input
+    # already enables DMs, and an unchanged input confirms as reload-noop.
+    name="$(if [[ "${q}" == alpha ]]; then echo "${ALPHA}"; else echo "${BRAVO}"; fi)"
+    if ! input_has --arg who "${name}" --arg contact "${CONTACT}" '.personas[]|select(.name==$who)|.dm=={enabled:true,contact:$contact}'; then
+        edit_input --arg who "${name}" --arg contact "${CONTACT}" '(.personas[]|select(.name==$who)|.dm)={enabled:true,contact:$contact}'
+        review_assign "${mode}-enable-dm"
+    fi
     successful_tool "${mode}-own-dm" "${dir}" reply "$(jq -cn --arg c "${DM}" --arg t "$(scenario_text own-dm)" '{chat_id:$c,text:$t}')"
     mark="$(log_mark)"
     push_message "${q}" "${GDM}" mpim "$(mention_text "${bot}")"

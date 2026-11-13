@@ -2651,6 +2651,12 @@ A setting that is unset or bad fails the step at once, with its reason.
   (`SCENARIO_STUB_CALL_S`) and prints the result line as recorded. It fails,
   naming `<tool>`, the request ID and `<dir>`, when no result line arrives in
   time; an `isError: true` result is the scenario's to judge, not a failure.
+  A longer line is refused. For arguments too long for one line, add
+  `arguments-file`: the arguments go whole into a new
+  `stub-mcp-arguments.<key>.<id>.json` beside the request file (at most
+  64 KiB, `SCENARIO_STUB_ARGUMENTS_MAX_BYTES`), and the request line carries
+  `arguments_file` naming it instead of `arguments`. The client reads only
+  that request's own regular file there, and neither side prints its content.
 
 - `stub_session_list_tools <dir>` negotiates `tools/list` through the same
   `_scenario_stub_request` exchange; its request holds only `id` and `method`,

@@ -107,13 +107,13 @@ import { pathToFileURL } from 'node:url'
 import { Client as MCPClient } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { ListRootsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
-import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import ts from 'typescript'
 import type { PersonaConfigInput } from '../src/config.ts'
 import { createSharedChannelAuthority } from '../src/shared-channels.ts'
-import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
+import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, writtenFile } from './test-helpers/credentials.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { configBytes, makeSharedAuthority, readSharedState } from './test-helpers/shared-channels.ts'
@@ -3125,7 +3125,22 @@ describe('test29 negotiated schema protocol', () => {
       ${js}
       return async line => { const request = parseRequest(line);
         if ('invalid' in request) throw new Error(request.invalid);
-        result = undefined; await call(request); return result; };`)(client) as (line: string) => Promise<Record<string, unknown>>
+        result = undefined; await call(request); return result; };`)(client) as (line: string, root?: string) => Promise<Record<string, unknown>>
+  }
+  // The same parser and dispatch with the client's own arguments-file reader
+  // and limits, over the exchange's stub directory and working-directory key.
+  function fileDispatcher(client: object, source = stub) {
+    const declarations = source.slice(source.indexOf('/** One request from the request file'), source.indexOf('\nasync function main('))
+    const call = source.slice(source.indexOf('  const call = async (request:'), source.indexOf('\n  /** One poll:'))
+    const limits = ['ARGUMENTS_PREFIX', 'ARGUMENTS_SUFFIX', 'ARGUMENTS_FILE_MAX_BYTES'].map(name => source.match(new RegExp(`^const ${name} = .+$`, 'm'))![0])
+    const js = ts.transpileModule(`${limits.join('\n')}\n${declarations}\n${call}`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
+    const workKey = (root: string) => createHash('sha256').update(realpathSync(join(root, 'work')), 'utf8').digest('hex')
+    return new Function('client', 'lstatSync', 'readFileSync', 'join', 'workKey', `let inFlight, result; const describe = String;
+      const answer = (id, line) => { result = { id, ...line }; };
+      ${js}
+      return async (line, root) => { const request = parseRequest(line, argumentsFileReader(join(root, 'stub'), workKey(root)));
+        if ('invalid' in request) throw new Error(request.invalid);
+        result = undefined; await call(request); return result; };`)(client, lstatSync, readFileSync, join, workKey) as (line: string, root?: string) => Promise<Record<string, unknown>>
   }
   async function exchange(command: string, dispatch: ReturnType<typeof dispatcher>, extras: Record<string, string> = {}) {
     const root = mkdtempSync(join(tmpdir(), 'schema-protocol-'))
@@ -3150,12 +3165,17 @@ ${command}`], {
       stdin: 'pipe', stdout: 'pipe', stderr: 'pipe', timeout: 5000,
       env: hostSafeChildEnv(root, { tools: ['cat', 'jq', 'realpath', 'sha256sum', 'cut', 'grep'], extras: { FIXTURE_ROOT: root, ...extras } }),
     })
-    const requests: unknown[] = [], responses: unknown[] = [], errors: string[] = []
+    // Every file the exchange wrote, arguments files included, by name and content.
+    const written = () => Object.fromEntries(readdirSync(join(root, 'stub')).filter(p => p !== 'stub-mcp-session.ts')
+      .map(p => [p, readFileSync(join(root, 'stub', p), 'utf8')]))
+    // Captures, partial output and any caught error are leak-checked with the
+    // written files on every path, failures included, before the root goes.
+    const requests: unknown[] = [], responses: unknown[] = [], errors: string[] = [], caught: unknown[] = []
     const output = new Response(child.stdout).text()
+    let pending = '', stdout = ''
     try {
       // The injected wait hands the already persisted request to this process;
       // the real stub parser/dispatch returns its correlated result via stdin.
-      let pending = ''
       for await (const chunk of child.stderr.pipeThrough(new TextDecoderStream())) {
         pending += chunk
         let end: number
@@ -3163,17 +3183,27 @@ ${command}`], {
           const line = pending.slice(0, end); pending = pending.slice(end + 1)
           if (!line.startsWith('{')) { errors.push(line); continue }
           requests.push(JSON.parse(line))
-          const result = await dispatch(line)
+          const result = await dispatch(line, root)
           responses.push(result)
           child.stdin.write(JSON.stringify(result) + '\n'); await child.stdin.flush()
         }
       }
       expect(pending).toBe('')
-      const status = await child.exited, stdout = await output
-      const records = readdirSync(join(root, 'stub')).filter(p => p.endsWith('.jsonl')).map(p => writtenFile(join(root, 'stub', p)))
-      assertNoLeak({ requests, responses, errors, stdout, records })
-      return { status, stdout, errors, requests, responses, recordCount: records.length }
-    } finally { child.stdin.end(); child.kill(); await child.exited; rmSync(root, { recursive: true, force: true }) }
+      const status = await child.exited
+      stdout = await output
+      const files = written()
+      return { status, stdout, errors, requests, responses, recordCount: Object.keys(files).filter(p => p.endsWith('.jsonl')).length, files }
+    } catch (error) {
+      caught.push(error)
+      throw error
+    } finally {
+      try {
+        try { child.stdin.end() } catch (error) { caught.push(error) }
+        child.kill(); await child.exited
+        stdout = await output.catch(error => { caught.push(error); return stdout })
+        assertNoLeak({ requests, responses, errors, pending, stdout, caught, files: written() })
+      } finally { rmSync(root, { recursive: true, force: true }) }
+    }
   }
 
   test.each(['strict', 'open'] as const)('%s runs test29 schema assertion through the shell request, stub parser and negotiated SDK listing', async channel_mode => {
@@ -3253,6 +3283,85 @@ ${command}`], {
     const result = await exchange(schemaCheck, dispatcher({ listTools: async () => { throw new Error('fixture listing failure') } }))
     expect(result.status).toBe(1); expect(result.errors).toEqual(['missing negotiated tool'])
     expect(result.responses).toEqual([{ id: expect.any(String), isError: true, text: '', error: 'Error: fixture listing failure' }])
+  })
+
+  // test-46 Phase 19's reply: two parts that exceed the default reply chunk
+  // limit together, too long for one request line.
+  const longReply = { chat_id: 'C0CHUNK0001', text: `${'abcdefgh'.repeat(375)}\n${'ijklmnop'.repeat(375)}` }
+  test('an oversized inline tool request is still refused before anything is written, and the refusal never quotes its arguments', async () => {
+    const args = { ...longReply, text: `${longReply.text} ${fakeToken(BOT_TOKEN_PREFIX, 'inline-refusal')}` }
+    const result = await exchange('stub_session_call "$ALPHA_DIR" reply "$CALL_ARGS"', dispatcher({}), { CALL_ARGS: JSON.stringify(args) })
+    expect(result.status).toBe(1)
+    expect(result.errors).toEqual([expect.stringMatching(/ reply: the request line takes \d+ bytes; at most 3999 reach the file in one write$/)])
+    expect(result.requests).toEqual([]); expect(result.files).toEqual({})
+  })
+
+  test('test-46 Phase 19\'s 6,001-character reply reaches the tool whole through its arguments file, on a request line within the bound', async () => {
+    expect(longReply.text).toHaveLength(6001)
+    const calls: unknown[] = []
+    const dispatch = fileDispatcher({ callTool: async (request: unknown) => {
+      calls.push(request); return { isError: false, content: [{ type: 'text', text: 'fixture result' }] }
+    } })
+    const result = await exchange('stub_session_call "$ALPHA_DIR" reply "$CALL_ARGS" arguments-file', dispatch, { CALL_ARGS: JSON.stringify(longReply) })
+    expect(result.status).toBe(0); expect(result.errors).toEqual([])
+    expect(result.requests).toEqual([{ id: expect.any(String), method: 'tools/call', tool: 'reply', arguments_file: expect.any(String) }])
+    const request = result.requests[0] as { id: string; arguments_file: string }
+    expect(request.arguments_file).toMatch(new RegExp(`^stub-mcp-arguments\\.[0-9a-f]{64}\\.${request.id.replace(/[.]/g, '\\.')}\\.json$`))
+    expect(JSON.stringify(request).length + 1).toBeLessThan(4000)
+    expect(result.files[request.arguments_file]).toBe(`${JSON.stringify(longReply)}\n`)
+    expect(calls).toEqual([{ name: 'reply', arguments: longReply }])
+    expect(JSON.parse(result.stdout)).toEqual({ id: request.id, isError: false, text: 'fixture result' })
+  })
+
+  test.each([
+    ['not a JSON object', '"$CALL_ARGS"', ': the arguments are not a JSON object'],
+    ['over the arguments-file bound', '"$(jq -cn --arg t "$CALL_ARGS" \'{text: ($t + ("x" * 70000))}\')"', ': the arguments take 70'],
+  ])('a request is refused before anything is written when its arguments for a file are %s, and the refusal never quotes them', async (_name, args, reason) => {
+    const plant = fakeToken(BOT_TOKEN_PREFIX, 'file-refusal')
+    const result = await exchange(`stub_session_call "$ALPHA_DIR" reply ${args} arguments-file`, fileDispatcher({}),
+      { CALL_ARGS: args === '"$CALL_ARGS"' ? JSON.stringify([plant]) : plant })
+    expect(result.status).toBe(1); expect(result.errors).toEqual([expect.stringContaining(reason)])
+    expect(result.requests).toEqual([]); expect(result.files).toEqual({})
+  })
+
+  test('the client reads only the request\'s own arguments file, as a regular file within the bound, and its refusals never quote the file', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'arguments-file-'))
+    const refusals: string[] = []
+    try {
+      mkdirSync(join(root, 'stub')); mkdirSync(join(root, 'work'))
+      const key = createHash('sha256').update(realpathSync(join(root, 'work')), 'utf8').digest('hex')
+      const secret = fakeToken(BOT_TOKEN_PREFIX, 'arguments-file')
+      const name = (id: string) => `stub-mcp-arguments.${key}.${id}.json`
+      const line = (id: string, fields: Record<string, unknown> = { arguments_file: name(id) }) => JSON.stringify({ id, method: 'tools/call', tool: 'reply', ...fields })
+      writeFileSync(join(root, 'stub', name('other')), JSON.stringify({ text: secret }))
+      writeFileSync(join(root, 'stub', name('notjson')), `{"text":"${secret}"`)
+      writeFileSync(join(root, 'stub', name('array')), JSON.stringify([secret]))
+      writeFileSync(join(root, 'stub', name('large')), JSON.stringify({ text: `${secret}${'x'.repeat(65_536)}` }))
+      symlinkSync(join(root, 'stub', name('other')), join(root, 'stub', name('link')))
+      writeFileSync(join(root, 'outside.json'), JSON.stringify({ text: secret }))
+      const dispatch = fileDispatcher({ callTool: async () => { throw new Error('a refused request must not call a tool') } })
+      const notOwn = '"arguments_file" is not this request\'s arguments file'
+      for (const [text, reason] of [
+        [line('mine', { arguments_file: name('other') }), notOwn],
+        [line('mine', { arguments_file: '../outside.json' }), notOwn],
+        [line('missing'), 'the arguments file could not be read'],
+        [line('link'), 'the arguments file is not a regular file'],
+        [line('notjson'), 'the arguments file is not JSON'],
+        [line('array'), '"arguments" is not a JSON object'],
+        [line('large'), 'the arguments file is too large'],
+        [line('other', { arguments: {}, arguments_file: name('other') }), 'a request takes "arguments" or "arguments_file", not both'],
+        [JSON.stringify({ id: 'other', method: 'tools/list', arguments_file: name('other') }), 'tools/list takes no tool or arguments'],
+      ] as const) {
+        const error = await dispatch(text, root).then(() => undefined, (e: Error) => e)
+        refusals.push(error?.message ?? 'accepted')
+        expect(error?.message).toBe(reason)
+      }
+      // The same reader accepts the request's own regular file.
+      const own = await fileDispatcher({ callTool: async (request: unknown) => ({ isError: false, content: [{ type: 'text', text: JSON.stringify(request).length.toString() }] }) })(line('other'), root)
+      expect(own).toEqual({ id: 'other', isError: false, text: String(JSON.stringify({ name: 'reply', arguments: { text: secret } }).length) })
+    } finally {
+      try { assertNoLeak({ refusals }) } finally { rmSync(root, { recursive: true, force: true }) }
+    }
   })
 
   test.each([
@@ -3527,6 +3636,7 @@ describe('shared MCP client transport, grouping and session evidence', () => {
     AsyncLocalStorage, pathToFileURL, fetch, readFileSync, appendLine, say, setTimeout, clearTimeout } = deps;
   const url = 'http://127.0.0.1/mcp', cwd = '/scratch/persona';
   const requestsPath = 'requests', resultsPath = 'results', sessionsPath = 'sessions', deliveriesPath = 'deliveries';
+  const readArguments = argumentsFileReader('/scratch/stub', 'scratchkey');
   const CLIENT_INFO = {name:'scratch-probe',version:'1'}, CHANNEL_NOTIFICATION_METHOD = 'notifications/claude/channel';
   const NEWLINE = 10;
   ${source.match(/^const ROOTS_READY_TIMEOUT_MS = .+$/m)![0]}
