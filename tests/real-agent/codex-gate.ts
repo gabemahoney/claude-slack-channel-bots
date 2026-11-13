@@ -19,6 +19,21 @@ export function auditCodexDelivery(options: {
   journal: any[]; completedPrefix?: any[]; rollout: CodexRollout; path: string; instance: string; shim: string; events: any[]; key: string; log: string
 }) {
   const { rollout, path, instance, events } = options
+  // A send can precede AD's rollout path publication. Only the engine's
+  // independent reference binds that later full path to this exact session.
+  const lateReference = events.some(e => e.type === 'transcript-reference' && e.key === options.key
+    && e.instance === instance && e.instanceId === instance && e.sessionId === rollout.session && e.path === path)
+  const ownSend = (send: any) => typeof rollout.session === 'string' && rollout.session.length > 0
+    && typeof path === 'string' && path.length > 0 && send.session_id === rollout.session
+    && typeof send.transcript_path === 'string' && (send.transcript_path === path || lateReference)
+    && Number.isFinite(send.at) && Number.isSafeInteger(send.transcript_size) && send.transcript_size >= 0
+    && (send.transcript_path !== path || send.transcript_size <= rollout.size)
+  const inWindow = (send: any, record: CodexRollout['records'][number], acceptedAt: number) => ownSend(send)
+    && record.at !== undefined && Number.isFinite(record.at) && send.at >= acceptedAt && send.at <= record.at
+    && Number.isSafeInteger(record.offset) && record.offset >= 0
+    // Known paths retain their EOF. A late path uses its own zero floor and
+    // send timestamp; another file's pre-send EOF is not transferable.
+    && (send.transcript_path !== path || send.transcript_size <= record.offset)
   // queue startup compacts delivered items during the real
   // harness crash. Audit their actual earlier journal alongside the surviving
   // suffix; never restore these historical records to the production queue.
@@ -45,16 +60,13 @@ export function auditCodexDelivery(options: {
       const receipt = rollout.records.find(r => r.offset === d.receipt.offset)
       requireEvidence(receipt?.type === 'response_item' && receipt.role === 'user' && receipt.text === text
         && receipt.at !== undefined && receipt.at >= a.received_at && receipt.at <= d.at, 'receipt is not exact own user take-in')
-      requireEvidence(sends.some(s => s.session_id === rollout.session && s.transcript_path === path
-        && s.transcript_size <= receipt.offset && s.at <= receipt.at! && s.at >= a.received_at), 'receipt has no own send window')
+      requireEvidence(sends.some(s => inWindow(s, receipt, a.received_at)), 'receipt has no own send window')
       const copies = rollout.records.filter(r => r.type === 'response_item' && r.role === 'user' && r.text === text
-        && sends.some(s => s.session_id === rollout.session && r.offset >= s.transcript_size && r.at !== undefined && r.at >= s.at))
+        && sends.some(s => inWindow(s, r, a.received_at)))
       requireEvidence(copies.length > 0 && copies[0]!.offset > previousReceipt, 'first receipts are out of acceptance order')
       firstReceipts.push(copies[0]!.offset); previousReceipt = copies[0]!.offset; duplicates += copies.length - 1
       for (const send of sends) {
-        requireEvidence(send.session_id === rollout.session && send.transcript_path === path
-          && Number.isSafeInteger(send.transcript_size) && send.transcript_size >= 0 && send.transcript_size <= rollout.size
-          && Number.isFinite(send.at) && send.at >= a.received_at && send.at <= d.at, 'foreign or invalid send window')
+        requireEvidence(ownSend(send) && send.at >= a.received_at && send.at <= d.at, 'foreign or invalid send window')
         requireEvidence(journal.indexOf(send) > previousJournalIndex && send.at >= previousEventAt, 'next send preceded predecessor message-delivered')
         if (send.send_kind !== 'enter') requireEvidence(calls.some(c => c.text === text && c.noEnter && c.at >= send.at
           && c.at >= previousEventAt && c.at <= d.at), 'durable text has no actual shim send')

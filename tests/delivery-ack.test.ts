@@ -25,12 +25,13 @@ async function setup() {
   })
   return { e, n, reporting }
 }
-test.each([false, true])('multipart receipt adds only after the final durable part; early successful reply=%p', async early => {
+test.each([false, 'reply', 'react with the ack emoji'] as const)('multipart receipt adds only after the final durable part; early successful answer=%p', async early => {
   const { e, n, reporting } = await setup()
   const result = await e.queue.accept('alpha', slackInput({ text: 'ordinary private body' }))
   if (result.status === 'failed') throw new Error('store failed')
   await e.queue.append('alpha', { v: 1, kind: 'fixed', seq: result.seq, parts: ['one', 'two'] })
-  if (early) expect(consumeAck('alpha', 'C0TEST001', result.item!.accepted.ts)).toBe(false)
+  if (early === 'reply') expect(consumeAck('alpha', 'C0TEST001', result.item!.accepted.ts)).toBe(false)
+  if (early === 'react with the ack emoji') await consumeAck('alpha', 'C0TEST001', result.item!.accepted.ts, async () => { throw new Error('legacy removal') }, 'white_check_mark')
   expect(n.h.stub('alpha').calls.reactionsAdd).toEqual([])
   await e.tick(); await e.until(() => e.events.some(event => event.type === 'delivered'))
   expect(n.h.stub('alpha').calls.reactionsAdd).toEqual([])
@@ -121,8 +122,9 @@ async function queuedSetup() {
   const h = await makeQueuedAckHarness(); queuedHarnesses.push(h)
   return h
 }
-function expectOnlyOneStage(h: QueuedAckHarness) {
-  expect(h.snapshots.filter(snapshot => snapshot.names.length > 1)).toEqual([])
+/** `answer`: a bot's own reaction, which may sit beside one ack stage. */
+function expectOnlyOneStage(h: QueuedAckHarness, answer?: string) {
+  expect(h.snapshots.filter(snapshot => snapshot.names.filter(name => name !== answer).length > 1)).toEqual([])
 }
 async function flushUntil(h: QueuedAckHarness, condition: () => boolean) {
   // Bound the fixture's promise turns, without advancing time or releasing held work.
@@ -261,9 +263,55 @@ test('a failed reply preserves queued, and wrong message/persona correlation can
   expect(h.visible()).toEqual([])
 })
 
-test.each(['queued-add', 'queued-remove', 'delivered-add'].flatMap(point => ['reply', 'teardown'].map(race => ({ point, race }))))(
-  '$race during $point leaves no reaction when held Slack work settles', async ({ point, race }) => {
+test.each(['queued', 'delivered'] as const)('a correlated react clears %s and later delivery/redelivery cannot resurrect it', async stage => {
+  const h = await queuedSetup()
+  await h.receive()
+  if (stage === 'delivered') await h.deliver()
+  const name = stage === 'queued' ? h.settings.queued_ack_reaction : h.settings.ack_reaction
+  expect((await h.react()).isError).toBeUndefined()
+  expect(h.visible()).toEqual(['thumbsup'])
+  expect(h.stub().calls.reactionsRemove.at(-1)).toEqual({ channel: h.event.channel, timestamp: h.event.ts, name })
+  await h.deliver(); await h.receive()
+  h.reporting.received('alpha', h.item())
+  h.reporting.engineEvent(h.e.events.find(event => event.type === 'item-delivered')!)
+  await h.e.clock.flush()
+  expect(h.visible()).toEqual(['thumbsup'])
+  expect(h.stub().calls.reactionsAdd.map(call => call.name)).toEqual(stage === 'queued'
+    ? [h.settings.queued_ack_reaction, 'thumbsup'] : [h.settings.queued_ack_reaction, h.settings.ack_reaction, 'thumbsup'])
+})
+
+test("a failed react or another persona's react leaves the acknowledgement", async () => {
+  const h = await queuedSetup()
+  await h.receive(); await h.receive('beta')
+  h.stub().script.reactionsAdd.push({ kind: 'platform', error: 'invalid_name' })
+  expect((await h.react()).isError).toBe(true)
+  await h.react({}, 'beta')
+  expect(h.visible()).toEqual([h.settings.queued_ack_reaction])
+  expect(h.visible('beta')).toEqual(['thumbsup'])
+  await h.deliver()
+  expect(h.visible()).toEqual([h.settings.ack_reaction])
+})
+
+test.each(['queued', 'delivered'] as const)("a react with the %s ack's own emoji keeps the bot's reaction and suppresses later stages", async stage => {
+  const h = await queuedSetup()
+  await h.receive()
+  if (stage === 'delivered') await h.deliver()
+  const name = stage === 'queued' ? h.settings.queued_ack_reaction : h.settings.ack_reaction
+  const removed = h.stub().calls.reactionsRemove.length
+  h.stub().script.reactionsAdd.push({ kind: 'platform', error: 'already_reacted' })
+  expect((await h.react({ emoji: name })).isError).toBeUndefined()
+  await h.deliver()
+  expect(h.visible()).toEqual([name])
+  expect(h.stub().calls.reactionsRemove).toHaveLength(removed)
+  expect(h.stub().calls.reactionsAdd.map(call => call.name)).toEqual(stage === 'queued'
+    ? [name, name] : [h.settings.queued_ack_reaction, name, name])
+})
+
+test.each(['queued-add', 'queued-remove', 'delivered-add'].flatMap(point => ['reply', 'teardown', 'react', 'react-own'].map(race => ({ point, race }))))(
+  '$race during $point leaves no ack reaction when held Slack work settles', async ({ point, race }) => {
     const h = await queuedSetup()
+    // The stage being established when the held call settles.
+    const own = point === 'queued-add' ? h.settings.queued_ack_reaction : h.settings.ack_reaction
     const held = point === 'queued-add' ? h.hold('reactionsAdd') : undefined
     await h.receive()
     expect(h.stub().calls.reactionsAdd.map(call => call.name)).toEqual([h.settings.queued_ack_reaction])
@@ -273,17 +321,38 @@ test.each(['queued-add', 'queued-remove', 'delivered-add'].flatMap(point => ['re
     else expect(h.stub().calls.reactionsAdd.map(call => call.name)).toEqual([h.settings.queued_ack_reaction, h.settings.ack_reaction])
     // A reply may await serialized cleanup. Start it, let the successful post
     // run, then release the held reaction; do not force reply completion early.
-    const reply = race === 'reply' ? h.reply() : undefined
+    const reply = race === 'reply' ? h.reply() : race === 'react' ? h.react() : race === 'react-own' ? h.react({ emoji: own }) : undefined
     if (race === 'teardown') forgetPersonaAcks('alpha')
     await h.e.clock.flush()
     if (race === 'reply') expect(h.stub().calls.postMessage).toHaveLength(1)
     transition.settle()
-    await reply
+    expect((await reply)?.isError).toBeUndefined()
     await h.e.clock.flush()
-    expect(h.visible()).toEqual([])
-    expectOnlyOneStage(h)
+    expect(h.visible()).toEqual(race === 'react' ? ['thumbsup'] : race === 'react-own' ? [own] : [])
+    expectOnlyOneStage(h, race === 'react-own' ? own : 'thumbsup')
   },
 )
+
+test("an early react with the queued ack's emoji, then a reply, keeps the bot's reaction when the queued callback runs late", async () => {
+  const h = await queuedSetup()
+  const name = h.settings.queued_ack_reaction
+  expect((await h.react({ emoji: name })).isError).toBeUndefined()
+  expect((await h.reply()).isError).toBeUndefined()
+  await h.receive()
+  expect(h.visible()).toEqual([name])
+  expect(h.stub().calls.reactionsRemove).toEqual([])
+})
+
+test("a react with the held queued ack's emoji after a reply keeps the bot's reaction when the add settles", async () => {
+  const h = await queuedSetup(), held = h.hold('reactionsAdd')
+  const name = h.settings.queued_ack_reaction
+  await h.receive()
+  expect((await h.reply()).isError).toBeUndefined()
+  expect((await h.react({ emoji: name })).isError).toBeUndefined()
+  held.settle(); await h.e.clock.flush()
+  expect(h.visible()).toEqual([name])
+  expect(h.stub().calls.reactionsRemove).toEqual([])
+})
 
 test('failed queued removal never adds a second visible stage, blocks no delivery, and reply can still clear queued', async () => {
   const h = await queuedSetup()

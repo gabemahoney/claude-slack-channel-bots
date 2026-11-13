@@ -70,12 +70,19 @@ export function assertSameConversationReplyPermission(
 }
 
 /** Bind first-waiting evidence to this persona and its durable AD session. */
-export function assertFirstLaunchWaiting(waiting: LaunchObservation[], sent: { session_id?: string }[], key: string, start: number, textAt: number): LaunchObservation {
-  const observed = waiting.find(r => r.key === key && r.at >= start && r.at <= textAt)
-  check(observed, 'actual first-waiting launch observation missing')
-  check(sent.length > 0 && !!observed.session_id && sent.every(r => r.session_id === observed.session_id),
-    'fresh launch sends do not match AD waiting session')
-  return observed
+export function assertFirstLaunchWaiting(waiting: LaunchObservation[], sent: { session_id?: string; at: number }[], key: string, start: number, textAt: number): LaunchObservation {
+  check(waiting.some(r => r.key === key && r.at >= start && r.at <= textAt), 'actual first-waiting launch observation missing')
+  check(sent.length > 0, 'fresh launch sends do not match AD waiting session')
+  const observations = sent.map((send, index) => {
+    // AD can publish waiting before its session ID. Bind every attempt to
+    // its own prior observation, including reoffers after a session change.
+    const observed = waiting.find(r => r.key === key && typeof r.session_id === 'string' && r.session_id.length > 0
+      && r.session_id === send.session_id && Number.isFinite(r.at) && r.at >= start
+      && Number.isFinite(send.at) && r.at <= send.at && (index > 0 || r.at <= textAt))
+    check(observed, 'fresh launch sends do not match AD waiting session')
+    return observed
+  })
+  return observations[0]!
 }
 
 /** Restart resets the first receipt/retry wait to 10s. The next retype has

@@ -61,6 +61,7 @@ import { recoverQueuedJoins } from './thread-join-recovery.ts'
 import { createThreadMemorySeal, type ThreadMemorySeal, type ThreadMemorySealEvent } from './thread-memory-seal.ts'
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
 import { prepareBotSystemPrompt, botSystemPromptPath } from './bot-system-prompt.ts'
+import { scrubProcessEnv } from './child-env.ts'
 import type { Client } from 'agent-director'
 import { createDeliveryEngines, createDeliveryLifecycle, type DeliveryEngines, type DeliveryLifecycle, type DeliveryEngineEvent } from './delivery-engine.ts'
 import { createDeliveryAdScope } from './delivery-ad-scope.ts'
@@ -219,6 +220,7 @@ import { createOwnPostObserver, createOwnPostJoins, ownPostChoice, ownPostEligib
 import { createOwnPostLookups, type OwnPostLookups, type OwnPostLookupEvent } from './own-post-lookup.ts'
 import { createReplyReminders, type ReplyReminders } from './reply-reminder.ts'
 import { createDeliveryPreparation, type DeliveryPreparation } from './delivery-intake.ts'
+import { tagMaxBytesFor } from './tag-wrapper.ts'
 import {
   createPersonaConnectionManager,
   SYSTEM_PERSONA_CONNECTION_CLOCK,
@@ -3054,6 +3056,7 @@ export async function main(): Promise<void> {
     clientFor,
     wake: key => deliveryQueueWake.wake(key),
     onPending: key => deliveryEngines?.wake(key),
+    tagMaxBytes: tagMaxBytesFor(process.platform),
   })
 
   // the retired-key record (retired-keys.json in the
@@ -4605,6 +4608,7 @@ export async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
+  scrubProcessEnv()
   main().catch((err) => {
     console.error('[slack] Fatal:', err)
     process.exit(1)

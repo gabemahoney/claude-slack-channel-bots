@@ -177,13 +177,25 @@ write_credentials() {
     printf '%s\n' "${file}"
 }
 
-# poll_row_of <id> <step>: a harness `get` of row <id>. Sets ROW_READ_AT (the
+# poll_row_of <id> <step>: a passive store read from 0.18.0, else a harness
+# `get` of row <id>. Sets ROW_READ_AT (the
 # time just before the call), ROW_STATE (`absent` for ErrSpawnNotFound),
 # ROW_SID (session_id), ROW_LAUNCH (launch_started_at as printed) and
 # ROW_SESSION (tmux_session_name), each empty when absent.
 poll_row_of() {
-    local id="$1" fields
+    local id="$1" fields row
     ROW_READ_AT="$(now_s)"
+    if ad_release_at_least 0.18.0; then
+        row="$(ad_store_peek "${id}")" || exit 1
+        if [[ -z "${row}" ]]; then
+            ROW_STATE=absent ROW_SID="" ROW_LAUNCH="" ROW_SESSION=""
+            return 0
+        fi
+        fields="$(jq -r '[.state // "", .session_id // "", (.launch_started_at // "" | tostring), .tmux_session_name // ""] | join("\u001f")' <<< "${row}")" \
+            || fail "$2: the store row of ${id} does not read: ${row}"
+        IFS=$'\x1f' read -r ROW_STATE ROW_SID ROW_LAUNCH ROW_SESSION <<< "${fields}"
+        return 0
+    fi
     ad_capture get --instance-id "${id}"
     if (( AD_RC != 0 )); then
         if grep -qF ErrSpawnNotFound "${AD_OUT}" "${AD_ERR}"; then
@@ -573,13 +585,15 @@ ABORT_KILL_HEAD="$(fmk_text stuckLaunchAbortKillSucceededHead "${P_KEY}")" \
     || fail "setup: fmk-texts.ts could not print stuckLaunchAbortKillSucceededHead"
 MARKED_MISSING_LINES="$(fmk_text liveRowSequenceStep3MarkedMissingLines "${P_REF}")" \
     || fail "setup: fmk-texts.ts could not print liveRowSequenceStep3MarkedMissingLines"
+STEP2_GET_MISSING_LINE="$(fmk_text liveRowSequenceStep2GetMissingLine "${P_REF}")" \
+    || fail "setup: fmk-texts.ts could not print liveRowSequenceStep2GetMissingLine"
 Q_HELD_POSTED="$(fmk_text stuckLaunchPostLine "${Q_KEY}" held posted)" || fail "setup: fmk-texts.ts could not print stuckLaunchPostLine for Q"
 Q_HELD_AGAIN="$(fmk_text stuckLaunchPostLine "${Q_KEY}" held already-posted)" \
     || fail "setup: fmk-texts.ts could not print stuckLaunchPostLine for Q"
 Q_RELAUNCHING_POSTED="$(fmk_text stuckLaunchPostLine "${Q_KEY}" relaunching posted)" \
     || fail "setup: fmk-texts.ts could not print stuckLaunchPostLine for Q"
 for v in RELAUNCHING_POST P_RELAUNCHING_POSTED P_HELD_POSTED_LINES P_RETRY_ROUND_HEAD \
-    ABORT_KILL_HEAD MARKED_MISSING_LINES Q_HELD_POSTED Q_HELD_AGAIN Q_RELAUNCHING_POSTED; do
+    ABORT_KILL_HEAD MARKED_MISSING_LINES STEP2_GET_MISSING_LINE Q_HELD_POSTED Q_HELD_AGAIN Q_RELAUNCHING_POSTED; do
     [[ -n "${!v}" ]] || fail "setup: fmk-texts.ts printed an empty ${v}"
 done
 # Every held poster line is one non-empty line.
@@ -631,7 +645,7 @@ leg_own_stuck_launch() {
     local step="own stuck launch" creds="${SCENARIO_ROOT}/credentials-own" creds_file work sid session srv log0 posts0 leg_start
     local l_ms l_s g_at b_at worker deadline kill_at live_at="" reads="${SCENARIO_ROOT}/own-reads.tsv"
     local table="${SCENARIO_ROOT}/own-calls.tsv" lines=() fms=() hits=() n i bound_at stop_run_at gap
-    local post_at resume_at fm_after get_at relaunch_at marked_at relaunched="" retry_rounds stop_rounds
+    local post_at resume_at fm_after get_at relaunch_at marked_at relaunched="" retry_rounds stop_rounds marked_lines
 
     new_state_dir own
     mkdir -m 700 "${creds}"
@@ -789,8 +803,14 @@ leg_own_stuck_launch() {
     [[ -n "${fm_after}" ]] || fail "${step}: no bot-server find-missing between the kill and the resume"
     get_at="$(first_call_at "${table}" "${srv}" "${P_ID}" get "${fm_after}" "${resume_at}")"
     [[ -n "${get_at}" ]] || fail "${step}: no bot-server get of ${P_ID} between its last find-missing and the resume"
-    mapfile -t hits < <(grep -nxF -f <(printf '%s\n' "${MARKED_MISSING_LINES}") <(sed -n "$(( log0 + 1 )),\$p" "${SLACK_STATE_DIR}/server.log" | sed 's/^\[[^]]*\] //') || true)
-    (( ${#hits[@]} == 1 )) || fail "${step}: ${#hits[@]} live-row sequence run line(s) marking P's row missing, not one"
+    # From 0.18.0 the sequence's step-2 get checks the row it reads, so it
+    # can read the row missing itself, with no step-3 run.
+    marked_lines="${MARKED_MISSING_LINES}"
+    if ad_release_at_least 0.18.0; then
+        marked_lines+=$'\n'"${STEP2_GET_MISSING_LINE}"
+    fi
+    mapfile -t hits < <(grep -nxF -f <(printf '%s\n' "${marked_lines}") <(sed -n "$(( log0 + 1 )),\$p" "${SLACK_STATE_DIR}/server.log" | sed 's/^\[[^]]*\] //') || true)
+    (( ${#hits[@]} == 1 )) || fail "${step}: ${#hits[@]} live-row sequence line(s) marking or reading P's row missing, not one"
     marked_at="$(log_hits "$(( log0 + ${hits[0]%%:*} - 1 ))" "" | sed -n 1p | cut -f2)"
     awk -v m="${marked_at}" -v k="${kill_at}" -v r="${resume_at}" 'BEGIN { exit !(m + 0 >= k + 0 && m + 0 <= r + 0) }' \
         || fail "${step}: the sequence's marked-missing run line is not between the kill and the resume"

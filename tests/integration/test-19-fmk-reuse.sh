@@ -273,9 +273,13 @@ export CSCB_SLACK_API_URL
 # Reading the rows, the logs and CSCB's calls
 # ---------------------------------------------------------------------------
 
-# t19_row_state <id>: print the row's state (a harness `status`), or nothing
-# when the read fails.
+# t19_row_state <id>: print the passive store state from 0.18.0, otherwise
+# a harness `status`; nothing when absent or the legacy read fails.
 t19_row_state() {
+    if ad_release_at_least 0.18.0; then
+        ad_store_peek "$1" | jq -r '.state // empty'
+        return 0
+    fi
     ad_capture status --instance-id "$1"
     [[ "${AD_RC}" == 0 ]] || return 0
     jq -r '.state // empty' "${AD_OUT}" 2> /dev/null || true
@@ -343,6 +347,7 @@ t19_line_time() {
 # t19_mark: the leg's mark: the time, and the lines server.log and
 # startup-errors.log hold.
 t19_mark() {
+    MARK_AD="$(ad_shim_mark)"
     MARK_TIME="${EPOCHREALTIME/,/.}"
     MARK_LOG="$(t19_lines "${SLACK_STATE_DIR}/server.log")"
     MARK_ERRORS="$(t19_lines "${SLACK_STATE_DIR}/startup-errors.log")"
@@ -707,9 +712,13 @@ t19_poll() {
 # WATCH_PERIOD_S and appends one JSON line per read to <file>: {t, rc, state,
 # session_id} for an answered read, {t, rc, err} (its output and
 # error, on one line) for a failed one. It ends at the top of its loop once
-# <file>.stop exists (`t19_bg_stop`).
+# <file>.stop exists (`t19_bg_stop`). From 0.18.0 a `get` checks the row it
+# reads and can mark it missing itself, so the loop reads the store
+# (`ad_store_peek`) instead; no store row is a failed read naming
+# ErrSpawnNotFound.
 t19_watch_start() {
-    local id="$1" file="$2"
+    local id="$1" file="$2" peek=0
+    ad_release_at_least 0.18.0 && peek=1
     : > "${file}"
     rm -f -- "${file}.stop"
     (
@@ -718,6 +727,19 @@ t19_watch_start() {
         while :; do
             [[ -e "${file}.stop" ]] && exit 0
             t="${EPOCHREALTIME/,/.}"
+            if (( peek )); then
+                if ! (ad_store_peek "${id}") > "${tmp}" 2> "${tmp}.err"; then
+                    jq -cn --arg t "${t}" --rawfile e "${tmp}.err" \
+                        '{t: $t, rc: 2, err: ($e | gsub("\n"; " ") | .[0:400])}' >> "${file}" 2> /dev/null
+                elif [[ -s "${tmp}" ]]; then
+                    jq -c --arg t "${t}" '{t: $t, rc: 0, state: .state, session_id: (.session_id // "")}' \
+                        "${tmp}" >> "${file}" 2> /dev/null
+                else
+                    jq -cn --arg t "${t}" --arg nf "${NOT_FOUND}" '{t: $t, rc: 1, err: ("no store row: " + $nf)}' >> "${file}" 2> /dev/null
+                fi
+                sleep "${WATCH_PERIOD_S}"
+                continue
+            fi
             ad get --instance-id "${id}" > "${tmp}" 2> "${tmp}.err"
             rc=$?
             if (( rc == 0 )); then
@@ -915,6 +937,12 @@ t19_all_find_missing_since() {
 }
 
 t19_row_pending_launched() {
+    if ad_release_at_least 0.18.0; then
+        AD_OUT="${SCENARIO_ROOT}/t19-pending-row.json"
+        ad_store_peek "$1" > "${AD_OUT}" || exit 1
+        jq -e '.state == "pending" and ((.launch_started_at // "") != "")' "${AD_OUT}" > /dev/null
+        return
+    fi
     ad_capture status --instance-id "$1"
     [[ "${AD_RC}" == 0 ]] || return 1
     jq -e '.state == "pending" and ((.launch_started_at // "") != "")' "${AD_OUT}" > /dev/null 2>&1
@@ -932,6 +960,7 @@ t19_pane_dead() {
 t19_leg_missing_row() {
     local step="missing row, no session id" id="${G_ID}" name="${G_NAME}" session="${G_SESSION}" work="${G_WORK}"
     local ref launch_start launch_s watch leftover_sid elapsed t_begin missing_t fm_t first_reuse_t diag diag_t n all_fm sid mark_record
+    local tick caller verb role
 
     ref="$(persona_ref "${name}")" || exit 1
 
@@ -942,7 +971,13 @@ t19_leg_missing_row() {
     mark_record="$(t19_lines "${STUB_RECORD}")"
     t19_start_and_wait 1
     wait_until "${ROW_WAIT_S}" "${step}: ${id} never read pending with a launch start" t19_row_pending_launched "${id}"
-    t19_row_get "${id}" "${step}: the launch"
+    if ad_release_at_least 0.18.0; then
+        AD_OUT="${SCENARIO_ROOT}/G-launch.json"
+        ad_store_peek "${id}" > "${AD_OUT}" || exit 1
+        [[ -s "${AD_OUT}" ]] || fail "${step}: the store has no row ${id} after its launch"
+    else
+        t19_row_get "${id}" "${step}: the launch"
+    fi
     launch_start="$(jq -r '.launch_started_at // empty' "${AD_OUT}")"
     [[ -z "$(jq -r '.session_id // empty' "${AD_OUT}")" ]] \
         || fail "${step}: ${id}'s silent launch has a session_id: $(jq -c . "${AD_OUT}")"
@@ -983,14 +1018,28 @@ t19_leg_missing_row() {
     # from any other process.
     missing_t="$(t19_watch_first "${watch}" missing)"
     [[ -n "${missing_t}" ]] || { jq -c . "${watch}" | sed 's/^/  | /' >&2; fail "${step}: the background get never read ${id} missing"; }
-    fm_t="$(t19_cscb_calls_since "${MARK_TIME}" find-missing | awk -F'\t' 'NR == 1 { print $2 }')" || exit 1
-    [[ -n "${fm_t}" ]] || fail "${step}: no CSCB find-missing after the mark"
-    t19_at_or_before "${fm_t}" "${missing_t}" \
-        || fail "${step}: ${id} read missing at ${missing_t}, before CSCB's first find-missing after the mark (${fm_t})"
+    if ad_release_at_least 0.18.0; then
+        # From 0.18.0 a read checks the rows it selects too: the mark's call
+        # (`ad_mark_caller`, by the tick's source) is CSCB's.
+        tick="$(ad_missing_tick "${id}" "$(awk -v t="${MARK_TIME}" 'BEGIN { printf "%.0f", int(t * 1000) }')")" \
+            || fail "${step}: no ad.find_missing.tick record marked ${id} missing after the mark"
+        caller="$(ad_mark_caller "${tick}" "${MARK_AD}")" || fail "${step}: no agent-director call after the mark could have made it: ${tick}"
+        IFS=$'\t' read -r _ fm_t _ verb role <<< "${caller}"
+        [[ "${role}" == cscb ]] || fail "${step}: the mark's call (${verb} at ${fm_t}) is not CSCB's: ${tick}"
+        # The watch's time is just before its store read, which can see a mark made while it ran.
+        t19_at_or_before "${fm_t}" "$(awk -v m="${missing_t}" -v p="${WATCH_PERIOD_S}" 'BEGIN { printf "%.6f", m + p }')" \
+            || fail "${step}: ${id} read missing at ${missing_t}, before the call that marked it (${verb} at ${fm_t})"
+    else
+        fm_t="$(t19_cscb_calls_since "${MARK_TIME}" find-missing | awk -F'\t' 'NR == 1 { print $2 }')" || exit 1
+        [[ -n "${fm_t}" ]] || fail "${step}: no CSCB find-missing after the mark"
+        t19_at_or_before "${fm_t}" "${missing_t}" \
+            || fail "${step}: ${id} read missing at ${missing_t}, before CSCB's first find-missing after the mark (${fm_t})"
+        verb=find-missing
+    fi
     all_fm="$(t19_all_find_missing_since "${MARK_TIME}")"
     n="$(t19_cscb_count_since "${MARK_TIME}" find-missing)"
     [[ "${all_fm}" == "${n}" ]] || fail "${step}: ${all_fm} find-missing call(s) after the mark, of which ${n} CSCB's: another process ran find-missing"
-    echo "${TEST_NAME}: ${step}: CSCB's own find-missing (first at ${fm_t}; ${n} after the mark, no other) marked ${id} missing (first read ${missing_t})"
+    echo "${TEST_NAME}: ${step}: CSCB's own ${verb} at ${fm_t} (${n} CSCB find-missing after the mark, no other) marked ${id} missing (first read ${missing_t})"
 
     # The resume answered ErrNoSessionId, before the first reuse spawn.
     n="$(t19_cscb_count_since "${MARK_TIME}" resume "${id}")"
@@ -1281,7 +1330,13 @@ t19_leg_removed_readded() {
     cause="$(t19_retired_cause "${J_KEY}")"
     [[ "${cause}" == "${CAUSE_REMOVED}" ]] || fail "${step}: the retired-key record gives ${J_KEY} the cause '${cause}' after the removal, not ${CAUSE_REMOVED}"
     state="$(t19_row_state "${id}")"
-    [[ -n "${state}" ]] || fail "${step}: ${id}'s row is gone after the removal: $(tr '\n' ' ' < "${AD_ERR}")"
+    if [[ -z "${state}" ]]; then
+        if ad_release_at_least 0.18.0; then
+            fail "${step}: the store has no row ${id} after the removal"
+        else
+            fail "${step}: ${id}'s row is gone after the removal: $(tr '\n' ' ' < "${AD_ERR}")"
+        fi
+    fi
     echo "${TEST_NAME}: ${step}: the removal's teardown ended ${session}; ${J_KEY} is recorded ${CAUSE_REMOVED}; ${id}'s row is kept, reading ${state}"
 
     # 3. A plain stop and a start, with no persona configured.

@@ -2370,8 +2370,37 @@ leg_stop_status_failure() {
     pid_alive "${pid}" || fail "${step}: the stub ended: it did not stop re-firing on its own"
 }
 
+# True when the store (no agent-director call) holds row <instance-id> in <state>.
+store_state_is() {
+    [[ "$(ad_store_peek "$1" | jq -r '.state // empty')" == "$2" ]]
+}
+
+# stop_no_launch_start_marked <step> <stub-pid> <edit-ms>: from 0.18.0 the
+# stub's own status read checks the edited row; pending with no launch start
+# is past its grace, so that read marks it missing (an ad_recovery tick) and
+# the stub stops silently, with no stop line and no SessionStart after the mark.
+stop_no_launch_start_marked() {
+    local step="$1" pid="$2" edit_ms="$3" tick mark_t times=() n
+    wait_until 10 "${step}: the store never held ${NOLS_ID} missing after the edit" store_state_is "${NOLS_ID}" missing
+    tick="$(ad_missing_tick "${NOLS_ID}" "${edit_ms}")" \
+        || fail "${step}: no ad.find_missing.tick record marked ${NOLS_ID} missing after the edit"
+    [[ "$(jq -r '.source // empty' <<< "${tick}")" == ad_recovery ]] \
+        || fail "${step}: the mark is not a read's check (source ad_recovery): ${tick}"
+    mark_t="$(date -u -d "$(jq -r '.ts' <<< "${tick}")" +%s.%3N)" || fail "${step}: the mark's ts does not read as a time: ${tick}"
+    sleep "${REFIRE_QUIET_S}"
+    ! has_stop_line "${NOLS_ID}" || fail "${step}: a stop line names ${NOLS_ID}; the stub read the row as pending, not missing"
+    trail_read times "${TRAIL_IGNORED_FROM}" --argjson p "${pid}"
+    n="${#times[@]}"
+    (( n >= 2 )) || fail "${step}: ${n} SessionStart record(s) from the stub, not its report-in and a re-fire"
+    expect_none_after "${step}" "a SessionStart record from the stub ${pid}" "${mark_t}" "${times[@]}"
+    trail_read times "${TRAIL_FIRED_FOR}" --arg id "${NOLS_ID}"
+    (( ${#times[@]} == n )) || fail "${step}: ${#times[@]} SessionStart record(s) for ${NOLS_ID}, not the stub's ${n}"
+    pid_alive "${pid}" || fail "${step}: the stub ended: it did not stop re-firing on its own"
+    echo "${TEST_NAME}: ${step}: marked missing at ${mark_t} by a read's check; the stub stopped silently"
+}
+
 leg_stop_no_launch_start() {
-    local step="stop: no launch start" dir pid times=() n
+    local step="stop: no launch start" dir pid times=() n edit_ms
     hold_row "${step}" "${NOLS_ID}" refire-nols-held
     dir="$(make_workdir refire-nols)"
     stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
@@ -2380,7 +2409,12 @@ leg_stop_no_launch_start() {
     # It re-fires while the row reads pending with its launch start.
     wait_until 15 "${step}: the stub never re-fired for ${NOLS_ID}" records_from_at_least "${pid}" 2
     ! has_stop_line "${NOLS_ID}" || fail "${step}: a stop line names ${NOLS_ID} before the edit"
+    edit_ms="$(date +%s%3N)"
     ad_store_pending_no_launch "${NOLS_ID}"
+    if ad_release_at_least 0.18.0; then
+        stop_no_launch_start_marked "${step}" "${pid}" "${edit_ms}"
+        return 0
+    fi
     wait_until 10 "${step}: no stop line names ${NOLS_ID} after the edit" has_stop_line "${NOLS_ID}"
     sleep "${REFIRE_QUIET_S}"
     expect_one_stop_line "${step}" "${NOLS_ID}" "${pid}"
@@ -2453,11 +2487,14 @@ leg_refire_grace() {
 }
 
 leg_stub_lines_not_cscb() {
-    local step="stub lines not CSCB's" dir="${SCENARIO_ROOT}/window-stubs" ad_after line n stops=0 mine=() got
+    local step="stub lines not CSCB's" dir="${SCENARIO_ROOT}/window-stubs" ad_after line n stops=0 mine=() got expected_stops=2
     ad_after="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
     window_copy "${dir}" 1 0 "$(( REFIRE_AD_BEFORE + 1 ))" "${ad_after}"
-    # The window holds the two stop legs' stop lines and the harness's own
-    # calls, all in the shim log's format.
+    # Before 0.18.0 both stop legs write a stop line. From 0.18.0 the
+    # no-launch-start leg stops silently after its status marks the row
+    # missing; only the status-failure leg writes one. Harness calls stay
+    # in the same shim log format.
+    if ad_release_at_least 0.18.0; then expected_stops=1; fi
     mapfile -d '' -t mine < "/proc/$$/cmdline"
     while IFS= read -r line; do
         _scenario_split_line "${line}" || fail "${step}: a shim log line is not in its format: ${line}"
@@ -2470,7 +2507,7 @@ leg_stub_lines_not_cscb() {
             *) fail "${step}: a shim log line of kind '${_L_KIND}': ${line}" ;;
         esac
     done < "${dir}/agent-director-shim.log"
-    (( stops == 2 )) || fail "${step}: ${stops} stop line(s) since the hold, not the two stop legs'"
+    (( stops == expected_stops )) || fail "${step}: ${stops} stop line(s) since the hold, not ${expected_stops} for the installed AD's stop legs"
     # No count helper counts a stub's line.
     n="$(on_files "${dir}" cscb_ad_count "")" || fail "${step}: cscb_ad_count failed on the window"
     [[ "${n}" == 0 ]] || fail "${step}: cscb_ad_count counts ${n} line(s) of the window"

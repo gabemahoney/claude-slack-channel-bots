@@ -25,6 +25,9 @@ Later starts use the recorded `port` and `bind`. Resolve an external cause such 
 **A persona doesn't come up or doesn't answer**
 The persona is silent. Accepted messages remain queued while its instance is unavailable. Find its key on its `persona-start` line in `server.log` and read its lines: each names a class (such as `persona-credentials-invalid` or `persona-directory-missing`) and the file or directory to fix. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-doesnt-come-up-or-doesnt-answer).
 
+**A persona seems silent after its `model` was set or changed**
+Correct the name (or remove `model`) in `config.json`, confirm the change, then run `claude-slack-channel-bots clean_restart <bot>` to start the persona fresh. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-seems-silent-after-its-model-was-set-or-changed).
+
 **Acknowledgement reaction missing or stuck**
 Check that both configured emoji exist in the workspace and the confirmed settings took effect at server start; use `message-delivered` to confirm delivery when Slack reaction calls fail. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-acknowledgement-reaction-missing-or-stuck).
 
@@ -77,7 +80,10 @@ Accepted messages remain queued; a Slack message triggers the configured reconne
 Each start logs one `[slack] startupSessionManager: complete — …` line counting its personas by outcome. `latched`, `retrying`, `waiting on a live-row sequence`, `held on invalid flags` and `fresh as retired keys` are not failures. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-reading-the-start-summary).
 
 **Delivery notices or delivery diagnostic lines**
-For *Message not saved*, check the server disk; a [`queue-unwritable`](../skills/debug-slack-channel-bots/SKILL.md#queue-unwritable) line with `participation=unresolved` posts no notice and does not mean a message was lost; fix the disk rather than asking for a resend. For *Delivery stuck* or *Message not taken in*, follow the notice's remedy; for *Messages waiting*, resolve the persona's state; for *Queue record unreadable*, preserve its file and ask the senders to resend. Accepted messages stay queued in order. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-delivery-notices-or-delivery-diagnostic-lines).
+For *Message not saved*, check the server disk; a [`queue-unwritable`](../skills/debug-slack-channel-bots/SKILL.md#queue-unwritable) line with `participation=unresolved` posts no notice and does not mean a message was lost; fix the disk rather than asking for a resend. For *Delivery stuck* or *Message not taken in*, follow the notice's remedy; for *Messages waiting*, resolve the persona's state; for *Queue record unreadable*, preserve its file and ask the senders to resend. Accepted messages stay queued in order, including when [`message-partial-receipt`](../skills/debug-slack-channel-bots/SKILL.md#message-partial-receipt) reports cut-off text. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-delivery-notices-or-delivery-diagnostic-lines).
+
+**A persona on a Mac keeps retyping a long message**
+On a macOS host CSCB types a long message in parts of at most about 880 bytes each. A message queued before an upgrade can keep larger parts, and a restart does not split it again: CSCB keeps offering it until the bot takes it in, while later messages wait. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-on-a-mac-keeps-retyping-a-long-message).
 
 **A persona posts a Thread Memory notice**
 Read the persona's Thread Memory report and follow its entry. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-thread-memory-notice).
@@ -143,7 +149,7 @@ The installed agent-director is below the client's own minimum, so only the serv
 Each `could not stop persona` line names a persona, its session and the class of the failure. Fix the cause and run the command again; rows are never deleted. If `clean_restart --server` says the server was not started, start it with `claude-slack-channel-bots start` once `agent-director version` answers. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-clean_restart-or-stop---stop-bots-exits-non-zero-with-could-not-stop).
 
 **Bots come back with no memory of the prior conversation after a reboot**
-A bot starts a new conversation when its session no longer matches the applied configuration, when it was retired by a confirmed change, once after an upgrade, or after 2 resumes in a row that failed. Search `server.log` for `sweeping row`, `pre-persona row`, `replacing the row`, `not resuming; replacing its row`, `key is retired` or `not resuming its transcript again` to see which. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-bots-come-back-with-no-memory-of-the-prior-conversation-after-a-reboot).
+A bot starts a new conversation when its session no longer matches the applied configuration, when it was retired by a confirmed change, once after an upgrade, or after 2 resumes in a row that failed. A persona whose `model` or `effort` differs from what its conversation started with starts a new conversation on the same instance at its next launch; this includes setting either key over a conversation from an earlier release. Nothing is deleted. Search `server.log` for `sweeping row`, `pre-persona row`, `replacing the row`, `not resuming; replacing its row`, `key is retired`, `from what its conversation started with` or `not resuming its transcript again` to see which. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-bots-come-back-with-no-memory-of-the-prior-conversation-after-a-reboot).
 
 **Session crashes on resume with "sandbox required but unavailable"**
 A regression in some Claude Code releases (for example v2.1.120). Set `resume_enabled: false` in `config.json`, confirm the change and restart the server; bots then always start a new conversation. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-session-crashes-on-resume-with-sandbox-required-but-unavailable).

@@ -15,6 +15,12 @@
  * - `--system-prompt-snapshot off` is the last two arguments
  *     unless fresh_system_prompt is false, whatever the append-file decision;
  *     the refresh keeps the boot install's arguments in both directions.
+ * - buildStartAgentArgs, shared with every spawn: the model and effort
+ *     prefixes pinned as literals; with no start values it equals the
+ *     template's agent_args for every fresh_system_prompt setting; a persona's
+ *     model then effort elements sit after the --allowedTools pair and before
+ *     the snapshot pair (last without it), each only when set; the template
+ *     carries neither, whatever its personas set.
  *   - installSlackChannelBotTemplate() calls client.makeTemplate(...) with
  *     exactly the buildTemplateParams shape, and propagates the result.
  *   - Rejections from client.makeTemplate(...) — typed AgentDirectorError
@@ -40,7 +46,10 @@ import { join } from 'node:path'
 import { AgentDirectorError, ErrTemplateMalformed, type MakeTemplateParams } from 'agent-director'
 
 import {
+  buildStartAgentArgs,
   buildTemplateParams,
+  EFFORT_ARG_PREFIX,
+  MODEL_ARG_PREFIX,
   REPLY_TOOL_ALLOW_RULE,
   deriveMemoryReadAllowRules,
   installSlackChannelBotTemplate,
@@ -200,9 +209,17 @@ describe('deriveMemoryReadAllowRules over personas', () => {
 // buildTemplateParams — the snapshot pair
 // ---------------------------------------------------------------------------
 
+const PAIR = ['--system-prompt-snapshot', 'off']
+
+// 'absent' is a configuration without the field, as an older caller builds one.
+const freshSystemPromptSettings = [
+  ['absent', undefined, true],
+  ['true', true, true],
+  ['false', false, false],
+] as const
+
 describe('buildTemplateParams: --system-prompt-snapshot off', () => {
   // operator readability affects composition, never argv.
-  const PAIR = ['--system-prompt-snapshot', 'off']
   const FILE = '/etc/cscb/extra.md'
   const rows: [string, Partial<PersonaConfig>][] = [
     ['none', { system_prompt_mode: 'none', append_system_prompt_file: FILE }],
@@ -210,14 +227,7 @@ describe('buildTemplateParams: --system-prompt-snapshot off', () => {
     ['append unset', { system_prompt_mode: 'append' }],
   ]
 
-  // 'absent' is a configuration without the field, as an older caller builds one.
-  const settings = [
-    ['absent', undefined, true],
-    ['true', true, true],
-    ['false', false, false],
-  ] as const
-
-  test.each(rows.flatMap(([label, overrides]) => settings.map(([setting, value, pair]) => [label, setting, value, pair, overrides] as const)))(
+  test.each(rows.flatMap(([label, overrides]) => freshSystemPromptSettings.map(([setting, value, pair]) => [label, setting, value, pair, overrides] as const)))(
     '%s, fresh_system_prompt %s: exact reply preallow, one generated append flag and optional snapshot pair last',
     (_label, _setting, value, pair, overrides) => {
       const cfg = makePersonaConfig({ mcp_config_path: '/abs/mcp.json', ...overrides }, baseDir)
@@ -232,6 +242,46 @@ describe('buildTemplateParams: --system-prompt-snapshot off', () => {
       expect(params.agent_args!.filter(a => a === '--append-system-prompt-file')).toHaveLength(1)
       expect(params.agent_args).not.toContain('--dangerously-load-development-channels')
       expect(params.agent_args).not.toContain('server:slack-channel-router')
+    },
+  )
+})
+
+// ---------------------------------------------------------------------------
+// buildStartAgentArgs — the template's and every spawn's start arguments
+// ---------------------------------------------------------------------------
+
+describe('buildStartAgentArgs', () => {
+  // The one literal pin: the expected elements below and the spawn tests are
+  // built from these prefixes. A prefix ending in a space instead of `=` would
+  // split the option and its value into two elements.
+  test('the model and effort prefixes end in =', () => {
+    expect(MODEL_ARG_PREFIX).toBe('--model=')
+    expect(EFFORT_ARG_PREFIX).toBe('--effort=')
+  })
+
+  // The configuration's one persona sets each row's keys, so the template is
+  // built from personas that carry them, and the builder is handed that
+  // persona as buildSpawnParams hands it.
+  type StartRow = [label: string, keys: Pick<PersonaSpec, 'model' | 'effort'>, elements: string[]]
+  const startRows: StartRow[] = [
+    ['neither key', {}, []],
+    ['model only', { model: 'opus[1m]' }, [`${MODEL_ARG_PREFIX}opus[1m]`]],
+    ['effort only', { effort: 'xhigh' }, [`${EFFORT_ARG_PREFIX}xhigh`]],
+    ['model and effort', { model: 'opus[1m]', effort: 'xhigh' }, [`${MODEL_ARG_PREFIX}opus[1m]`, `${EFFORT_ARG_PREFIX}xhigh`]],
+  ]
+
+  test.each(startRows.flatMap(([label, keys, elements]) => freshSystemPromptSettings.map(([setting, value, pair]) => [label, setting, value, pair, keys, elements] as const)))(
+    'persona sets %s, fresh_system_prompt %s: the template and the builder without start values give the base arguments; the set keys sit between --allowedTools and the pair',
+    (_label, _setting, value, pair, keys, elements) => {
+      const cfg = makeMultiPersonaConfig([{ name: 'A Bot', ...keys }], baseDir, { mcp_config_path: '/abs/mcp.json' })
+      if (value === undefined) delete (cfg as Partial<PersonaConfig>).fresh_system_prompt
+      else cfg.fresh_system_prompt = value
+      const base = ['--mcp-config', '/abs/mcp.json', '--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir()), '--allowedTools', REPLY_TOOL_ALLOW_RULE]
+      const tail = pair ? PAIR : []
+      const templateArgs = buildTemplateParams(cfg).agent_args
+      expect(templateArgs).toEqual([...base, ...tail])
+      expect(buildStartAgentArgs(cfg)).toEqual(templateArgs!)
+      expect(buildStartAgentArgs(cfg, cfg.personas[0]!)).toEqual([...base, ...elements, ...tail])
     },
   )
 })

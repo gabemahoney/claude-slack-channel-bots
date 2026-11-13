@@ -527,7 +527,16 @@
 #                                      agent-director-admin> --no-symlink --no-hooks`, stdin from
 #                                      /dev/null, cwd HOME; output in AD_INSTALL_OUT), then `reshim_ad`
 #                                      and `check_ad_admin_shim`; a failed run fails the step with
-#                                      install.sh's output
+#                                      install.sh's output. A release of 0.18.0 or later also gets
+#                                      `--journal-maintenance-window --journal-roots-complete
+#                                      --journal-backup <new dir under SCENARIO_ROOT>` (needed to
+#                                      cross a store below schema v16, ignored otherwise; 0.17.x
+#                                      refuses them). The caller keeps every agent-director process
+#                                      stopped across a crossing install, which refuses otherwise
+#   ad_release_at_least <X.Y.Z> [<record>]
+#                                      true when the release record's version (default: the last
+#                                      installed, SCENARIO_INSTALLED_AD_RECORD) is X.Y.Z or later;
+#                                      false when no release is installed yet
 #   install_ad_legacy_displayed [<step>] install the real 0.17.0 fixture into a fresh AD directory;
 #                                      selects verified binary/admin/installer without changing the default
 #   check_ad_runtime <binary> <record> [<step>] verify version, commit and digest; returns 1 only for
@@ -592,6 +601,13 @@
 #   ad_store_row <instance-id>         open the store read-only and print the row of <instance-id> as a
 #                                      one-element JSON array (sqlite3 -json); fail when the id holds a
 #                                      character other than letters, digits and `._:@-`, or no row has it
+#   ad_store_peek <instance-id>        open the store read-only and print the row as one object in
+#                                      `get`'s shape (labels an object, launch_started_at ISO, NULL
+#                                      columns left out); nothing when no row has it. From 0.18.0 a
+#                                      harness get, status or list checks the rows it reads and may
+#                                      mark or note them, so a passive observation reads this instead
+#   ad_store_no_agent_pane <step> <id> repoint pane_id at a nonexistent pane, advancing row_version
+#                                      and keeping the worker alive (0.18.0 pane-not-found fixture)
 #   ad_store_backup <dest>             the switch-over runbook's online-consistent copy of the store
 #                                      (step 8): sqlite3's `.backup`, the store opened read-only, into
 #                                      <dest>, a new file under SCENARIO_ROOT (as written and by the real
@@ -610,8 +626,10 @@
 #                                      fails when it changed no row (agent-director wrote the row in
 #                                      between), and when the row read after it differs from the
 #                                      one before in any column but those named here, or not as
-#                                      named. Then a harness `status` read (`ad_capture`) must read
-#                                      `pending` with no launch_started_at, or it fails
+#                                      named. Then, before 0.18.0, a harness `status` read
+#                                      (`ad_capture`) must read `pending` with no launch_started_at, or
+#                                      it fails. From 0.18.0 there is no such read: that row is past
+#                                      its grace, so the next read of it marks it missing
 #
 #   agent-director's settings file (fmk mode; harness addition, scenarios 10, 20 and 24
 #   (test-22, test-23, test-26); the image guard, then the HOME check, before any write)
@@ -1173,6 +1191,21 @@
 #                                      print the rows of the CSCB-parented calls of <verb> between the
 #                                      two marks, for a verb that carries no instance id (find-missing,
 #                                      list, version)
+#   ad_mark_caller <tick> [<from-mark>]
+#                                      from 0.18.0, the call that made an `ad.find_missing.tick`
+#                                      record <tick> (one JSON object; the record names no caller):
+#                                      the latest shim `call` line after <from-mark> and by the
+#                                      tick's ts whose verb could make a tick of its `source`
+#                                      (ad_find_missing: find-missing or sweep; ad_recovery: list,
+#                                      or status, get or pause naming the row). Prints
+#                                        <position> TAB <time> TAB <ppid> TAB <verb> TAB <cscb|other>
+#                                      and returns 1 when no line could have made it. List filters
+#                                      must admit the tick's prior state and the row's current labels.
+#                                      This is approximate: no call-end times or historical labels are
+#                                      logged. Treat every eligible call in the window as possibly
+#                                      overlapping; fail ambiguous when different parents include a
+#                                      non-CSCB caller. Same-CSCB calls still use the latest start,
+#                                      and list limits/display filters cannot be reconstructed.
 #   tmux_shim_targets <session-name|session-id|window-id|pane-id> [<from-mark> [<to-mark>]]
 #                                      print, for each tmux shim `call` line between the marks (every
 #                                      line of that log is a CSCB process's or agent-director's for
@@ -1210,6 +1243,10 @@
 #                                      JSON object per line, in trail order (none when there is no
 #                                      trail; a line that is not JSON, a record still being written, is
 #                                      skipped). Read-only: it never writes
+#   ad_missing_tick <instance-id> [<after-ms>]
+#                                      print the first `ad.find_missing.tick` record that marked
+#                                      <instance-id> missing at or after <after-ms> (epoch ms);
+#                                      return 1 when there is none
 #
 #   The Slack stub's pushes and the stub MCP session's records (both modes; harness additions,
 #). Each helper here is a harness addition that works in both
@@ -2282,6 +2319,9 @@ run_start() {
     # leave a daemon behind, and the trap stops it.
     _scenario_register_state_dir "${SLACK_STATE_DIR}"
     local env_args=(-u SLACK_BOT_TOKEN -u SLACK_APP_TOKEN -u CSCB_PERSONA -u SLACK_DRY_RUN)
+    # b.c13's boundary leg injects fake env values AFTER the ordinary unsets.
+    # An unset array leaves every other scenario's start unchanged.
+    env_args+=( ${SCENARIO_START_ENV[@]+"${SCENARIO_START_ENV[@]}"} )
     if [[ "${live}" == 1 ]]; then
         _SCENARIO_LIVE=1
     else
@@ -2863,11 +2903,28 @@ install_ad_legacy_displayed() {
     install_ad_release "${step}"
 }
 
+ad_release_at_least() {
+    local want="${1:-}" record="${2:-${SCENARIO_INSTALLED_AD_RECORD:-}}" have w h i
+    [[ "${want}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "ad_release_at_least: '${want}' is not a version X.Y.Z"
+    [[ -n "${record}" ]] || return 1
+    [[ -f "${record}" ]] || fail "ad_release_at_least ${want}: no release record at ${record}"
+    have="$(jq -r '.version // empty' "${record}")" || fail "ad_release_at_least ${want}: jq could not read ${record}"
+    [[ "${have}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)([-+].*)?$ ]] \
+        || fail "ad_release_at_least ${want}: ${record}'s version '${have}' is not X.Y.Z"
+    IFS=. read -r -a w <<< "${want}"
+    IFS=. read -r -a h <<< "${BASH_REMATCH[1]}"
+    for i in 0 1 2; do
+        (( 10#${h[i]} > 10#${w[i]} )) && return 0
+        (( 10#${h[i]} < 10#${w[i]} )) && return 1
+    done
+    return 0
+}
+
 install_ad_release() {
     local step="${1:-install the release with its install.sh}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    local rc=0 last
+    local rc=0 last journal=() backup n
     [[ -f "${SCENARIO_RELEASE_INSTALL_SH}" && -x "${SCENARIO_RELEASE_INSTALL_SH}" ]] \
         || fail "${step}: the release's install.sh is missing from the image (${SCENARIO_RELEASE_INSTALL_SH})"
     [[ -f "${SCENARIO_RELEASE_BIN}" && -x "${SCENARIO_RELEASE_BIN}" ]] \
@@ -2885,8 +2942,20 @@ install_ad_release() {
         | sha256sum --check --status || fail "${step}: admin/installer digest mismatch"
     _SCENARIO_INSTALL_COUNT=$(( _SCENARIO_INSTALL_COUNT + 1 ))
     AD_INSTALL_OUT="${SCENARIO_ROOT}/install-sh.${_SCENARIO_INSTALL_COUNT}.out"
+    # 0.17.x's install.sh exits 2 on the journal flags; 0.18.0 and later need
+    # them to cross a store below schema v16, and ignore them otherwise. The
+    # backup directory must not exist yet; its parent must.
+    if ad_release_at_least 0.18.0 "${SCENARIO_RELEASE_RECORD}"; then
+        n="${_SCENARIO_INSTALL_COUNT}"
+        backup="${SCENARIO_ROOT}/ad-journal-backup.${n}"
+        while [[ -e "${backup}" || -L "${backup}" ]]; do
+            n=$(( n + 1 ))
+            backup="${SCENARIO_ROOT}/ad-journal-backup.${n}"
+        done
+        journal=(--journal-maintenance-window --journal-roots-complete --journal-backup "${backup}")
+    fi
     (cd "${HOME}" && "${SCENARIO_RELEASE_INSTALL_SH}" --binary "${SCENARIO_RELEASE_BIN}" \
-        --admin-binary "${SCENARIO_RELEASE_ADMIN}" --no-symlink --no-hooks) \
+        --admin-binary "${SCENARIO_RELEASE_ADMIN}" --no-symlink --no-hooks "${journal[@]}") \
         < /dev/null > "${AD_INSTALL_OUT}" 2>&1 || rc=$?
     if [[ "${rc}" -ne 0 ]]; then
         # Indented, so no line of it can pass for the runner's FAIL line.
@@ -3176,6 +3245,38 @@ ad_store_row() {
     _scenario_row_json "${step}" "${id}"
 }
 
+ad_store_peek() {
+    local id="${1:-}" step out
+    step="ad_store_peek ${id}"
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    (( $# == 1 )) || fail "${step}: takes one instance id, not $# arguments"
+    _scenario_check_instance_id "${step}" "${id}"
+    out="$(_scenario_store_read "${step}" "SELECT * FROM spawns WHERE ${SCENARIO_AD_ID_COLUMN} = '${id}'" json)" || exit 1
+    [[ -n "${out}" ]] || return 0
+    jq -c '.[0]
+        | if (.labels | type) == "string" then .labels = (.labels | fromjson? // .labels) else . end
+        | if (.launch_started_at | type) == "number" then
+              .launch_started_at = ((.launch_started_at / 1000 | floor | todate | rtrimstr("Z"))
+                  + "." + ((.launch_started_at % 1000) + 1000 | tostring | .[1:]) + "Z")
+          else . end
+        | with_entries(select(.value != null))' <<< "${out}" \
+        || fail "${step}: jq could not read the row: ${out//$'\n'/ }"
+}
+
+ad_store_no_agent_pane() {
+    local step="$1" id="$2" pane="%999999" panes out
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_check_instance_id "${step}" "${id}"
+    panes="$("${SCENARIO_REAL_TMUX}" list-panes -a -F '#{pane_id}')" || fail "${step}: tmux could not list the panes"
+    ! grep -qxF -- "${pane}" <<< "${panes}" || fail "${step}: a pane ${pane} exists"
+    out="$(ad_store_edit "UPDATE spawns SET pane_id = '${pane}', row_version = row_version + 1 WHERE instance_id = '${id}' AND pane_id IS NOT NULL AND pid IS NOT NULL RETURNING instance_id")" \
+        || exit 1
+    [[ "${out}" == "${id}" ]] || fail "${step}: the pane-id edit of ${id} changed no row (no recorded pane or pid)"
+    echo "${TEST_NAME}: ${step}: ${id}'s row records pane ${pane}, which no pane has; its worker runs on"
+}
+
 # Deliberate pre-0.12 contract: backup reads the pre-upgrade store before migration.
 ad_store_backup() {
     local dest="${1:-}" step db real_root real_dir out
@@ -3220,6 +3321,9 @@ ad_store_pending_no_launch() {
     after="$(_scenario_row_json "${step}" "${id}")" || exit 1
     _scenario_row_diff_check "${step}" "${before}" "${after}" \
         "{\"state\": \"pending\", \"launch_started_at\": null, \"launch_token\": null, \"pid\": null, \"proc_starttime\": null, \"pane_id\": null, \"pane_pid\": null, \"pane_starttime\": null, \"row_version\": $(( rv + 1 ))}"
+    # From 0.18.0 every read checks the rows it selects, and a pending row with
+    # no launch start is past its grace: a harness read would mark it missing.
+    ad_release_at_least 0.18.0 && return 0
     ad_capture status --instance-id "${id}"
     [[ "${AD_RC}" == 0 ]] \
         || fail "${step}: the harness status read exited ${AD_RC}: $(tr '\n' ' ' < "${AD_ERR}")"
@@ -5446,6 +5550,77 @@ ad_cscb_calls() {
     _scenario_cscb_ad_rows ad_cscb_calls "${id}" "" "${from}" "${to}" "${pid}"
 }
 
+# Reject a list that could not have selected this tick's row. Labels come
+# from a passive store read, never an active CLI read during attribution.
+_scenario_mark_list_selects() {
+    local id="$1" prior="$2" i arg value key row=""
+    require_ci_image ad_mark_caller
+    require_scenario_home ad_mark_caller
+    for (( i = 0; i < ${#_L_ARGS[@]}; i++ )); do
+        arg="${_L_ARGS[i]}"
+        case "${arg}" in
+            --state | --label) i=$(( i + 1 )); value="${_L_ARGS[i]:-}" ;;
+            --state=* | --label=*) value="${arg#*=}"; arg="${arg%%=*}" ;;
+            *) continue ;;
+        esac
+        if [[ "${arg}" == --state ]]; then
+            [[ -n "${prior}" && ",${value}," == *",${prior},"* ]] || return 1
+        else
+            [[ "${value}" == *=* ]] || return 1
+            key="${value%%=*}"
+            [[ -n "${row}" ]] || row="$(ad_store_peek "${id}")" || return 1
+            jq -e --arg key "${key}" --arg value "${value#*=}" '.labels[$key] == $value' <<< "${row}" > /dev/null || return 1
+        fi
+    done
+}
+
+ad_mark_caller() {
+    local tick="${1:-}" from="${2:--}" step="ad_mark_caller" id source ts prior tick_ms lines=() i found="" role
+    local parents=() roles=() chosen_parent="" chosen_role=""
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_check_mark "${step}" "<from-mark>" "${from}"
+    id="$(jq -er '.instance_id // ""' <<< "${tick}" 2> /dev/null)" \
+        && source="$(jq -er '.source // ""' <<< "${tick}")" && ts="$(jq -er '.ts // ""' <<< "${tick}")" \
+        || fail "${step}: the tick is not one trail record: ${tick}"
+    [[ -n "${id}" && -n "${ts}" ]] || fail "${step}: the tick names no instance id or ts: ${tick}"
+    prior="$(jq -r '.prior_state // ""' <<< "${tick}")"
+    [[ "${source}" == ad_recovery || "${source}" == ad_find_missing ]] \
+        || fail "${step}: the tick's source is '${source}', not ad_recovery or ad_find_missing: ${tick}"
+    tick_ms="$(date -u -d "${ts}" +%s%3N 2> /dev/null)" && [[ "${tick_ms}" =~ ^[0-9]+$ ]] \
+        || fail "${step}: the tick's ts '${ts}' does not read as a time"
+    _scenario_query_prep "${step}"
+    _scenario_read_log "${step}" "${SCENARIO_AD_SHIM_LOG}" lines
+    for i in "${!lines[@]}"; do
+        _scenario_in_window "$(( i + 1 ))" "${from}" - || continue
+        _scenario_split_line "${lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        (( _L_US < (tick_ms + 1) * 1000 )) || continue
+        _scenario_decode_words
+        _scenario_ad_verb
+        _scenario_ad_id
+        case "${source}:${_L_VERB}" in
+            ad_find_missing:find-missing | ad_find_missing:sweep) ;;
+            ad_recovery:list) _scenario_mark_list_selects "${id}" "${prior}" || continue ;;
+            ad_recovery:status | ad_recovery:get | ad_recovery:pause) [[ "${_L_ID}" == "${id}" ]] || continue ;;
+            *) continue ;;
+        esac
+        role=other
+        _scenario_role_at "${_L_PPID}" "${_L_US}" && role=cscb
+        parents+=("${_L_PPID}")
+        roles+=("${role}")
+        chosen_parent="${_L_PPID}" chosen_role="${role}"
+        printf -v found '%s\t%s\t%s\t%s\t%s' "$(( i + 1 ))" "$(_scenario_us_text "${_L_US}")" "${_L_PPID}" "${_L_VERB}" "${role}"
+    done
+    [[ -n "${found}" ]] || return 1
+    for i in "${!parents[@]}"; do
+        if [[ "${parents[i]}" != "${chosen_parent}" && ( "${roles[i]}" == other || "${chosen_role}" == other ) ]]; then
+            fail "${step}: ambiguous mark of ${id}: eligible calls from parents ${parents[i]} and ${chosen_parent} may overlap (no call-end timestamps)"
+        fi
+    done
+    printf '%s\n' "${found}"
+}
+
 # Match each key to the exact shim invocation, through the first success.
 # AD caller_pid is os.Getpid() inside its CLI, not the CSCB server PID.
 # Rows must carry with-pid field 7; its parent still has to be the server.
@@ -5759,6 +5934,22 @@ ad_trail_events() {
     jq -c -R --arg e "${event}" --arg id "${id}" \
         'fromjson? | select(type == "object" and .event == $e and ($id == "" or (.instance_id // .claude_instance_id) == $id))' \
         "${trail}" || fail "${step}: jq could not read ${trail}"
+}
+
+ad_missing_tick() {
+    local id="${1:-}" after="${2:-0}" out
+    [[ -n "${id}" ]] || fail "ad_missing_tick: no instance id given"
+    [[ "${after}" =~ ^[0-9]+$ ]] || fail "ad_missing_tick ${id}: '${after}' is not milliseconds since the epoch"
+    out="$(ad_trail_events ad.find_missing.tick "${id}")" || exit 1
+    [[ -n "${out}" ]] || return 1
+    out="$(jq -c -s --argjson after "${after}" '
+        map(select(.new_state == "missing")
+            | select((.ts | capture("^(?<s>[^.]+?)(\\.(?<f>[0-9]+))?Z$")) as $t
+                | (($t.s + "Z") | fromdateiso8601) * 1000 + ((($t.f // "0") + "000")[0:3] | tonumber) >= $after))
+        | first // empty' <<< "${out}")" \
+        || fail "ad_missing_tick ${id}: jq could not read the ticks"
+    [[ -n "${out}" ]] || return 1
+    printf '%s\n' "${out}"
 }
 
 # ---------------------------------------------------------------------------

@@ -8,8 +8,8 @@ Each MCP endpoint exposes the following tools to the connected Claude Code sessi
 
 | Tool | Description |
 |---|---|
-| `reply` | Send a message to a channel (in strict mode one of the persona's configured non-off channels; in open mode any channel ID) or, when the persona's `dm.enabled` is `true`, to a DM conversation ID (`D…`) or a Slack user ID (`U…`/`W…`). A user ID opens a DM with that user and posts there as the persona; the result names the DM conversation ID to use for later calls. Splits long text by `reply_chunk_limit` and `reply_chunk_mode`; supports file attachments. With `message_id` (the message being answered), its first successful text post or file upload clears this persona's actual queued or delivered [acknowledgement reaction](server-settings.md#acknowledgement-reactions), without waiting for cleanup before continuing the reply. |
-| `react` | Add an emoji reaction to a Slack message in a channel (a configured non-off channel in strict mode; any channel ID in open mode) or, with `dm.enabled` `true`, a DM conversation (`D…`). |
+| `reply` | Send a message to a channel (in strict mode one of the persona's configured non-off channels; in open mode any channel ID) or, when the persona's `dm.enabled` is `true`, to a DM conversation ID (`D…`) or a Slack user ID (`U…`/`W…`). A user ID opens a DM with that user and posts there as the persona; the result names the DM conversation ID to use for later calls. Splits long text by `reply_chunk_limit` and `reply_chunk_mode`. Attached `files` are posted together in one message, each under its own filename. With text, that message goes in `thread_ts` if given, otherwise in a thread under the first text message, and repeats the text's `<@…>` mentions so a persona that receives only mentions gets the files. Only direct `<@…>` mentions are repeated, not `@here`, `@channel` or user-group mentions. With empty text, only the files are posted, in the conversation or `thread_ts`. With `message_id` (the message being answered), its first successful text post or file upload clears this persona's actual queued or delivered [acknowledgement reaction](server-settings.md#acknowledgement-reactions), without waiting for cleanup before continuing the reply. |
+| `react` | Add an emoji reaction to a Slack message in a channel (a configured non-off channel in strict mode; any channel ID in open mode) or, with `dm.enabled` `true`, a DM conversation (`D…`). A reaction on the message being answered clears this persona's [acknowledgement reaction](server-settings.md#acknowledgement-reactions), as a correlated `reply` does. |
 | `edit_message` | Edit a previously sent message (bot's own messages only) in a channel (a configured non-off channel in strict mode; any channel ID in open mode) or, with `dm.enabled` `true`, a DM conversation (`D…`). |
 | `fetch_messages` | Fetch message history from a channel (a configured non-off channel in strict mode; any channel ID in open mode), a DM conversation (`D…`, with `dm.enabled` `true`) or a thread in either. Returns oldest-first. |
 | `download_attachment` | Download attachments from a Slack message in a channel (a configured non-off channel in strict mode; any channel ID in open mode) or, with `dm.enabled` `true`, a DM conversation (`D…`). Saves files to `STATE_DIR/inbox/`. Returns local file paths. Only files hosted by Slack are downloaded; external files are refused. |
@@ -134,7 +134,7 @@ If that rewrite fails, `server.log` shows a `template refresh: … failed` line.
 
 CSCB stores accepted messages, then types their text into the bot’s terminal in a `<channel source="slack-channel-router" …>` tag. Every Slack message carries its sender’s ID; use the shared prompt file to say whose instructions to follow. The bot answers through `reply`. A message from Slack carries a `via` attribute that says how it reached the persona. An injected message (a scheduled prompt or an `/interject` message) carries no `via`. A received item is durably stored; delivered means its complete text is confirmed in the bot’s transcript. Delivery is at-least-once: an unconfirmed item is offered again, so the bot may see it more than once. Each persona uses strict FIFO across Slack, `/interject` and scheduled prompts, with one item in flight; the next waits until the previous item is confirmed delivered. There is no age cutoff. Delivery and reconnects wait until agent-director reports the bot is `waiting`. If agent-director refuses a key operation, the message stays queued and retries later. Transcript records confirm only the exact message received; they do not decide whether the bot is idle. Messages wait while MCP is disconnected, trigger the configured reconnect, and are delivered once connected again. Which channels a persona serves, and at which delivery, depends on the channel mode (see [Channel modes](channel-modes.md#channel-modes)).
 
-Slack feedback has two stages: queued after durable storage (`beehive` by default), then delivered after the whole message is confirmed (`spinthinking` by default). CSCB removes queued before adding delivered; the first successful correlated reply clears the actual stage. Both names are configurable; see [Acknowledgement reactions](server-settings.md#acknowledgement-reactions) for the custom-emoji prerequisite and tracking limits.
+Slack feedback has two stages: queued after durable storage (`beehive` by default), then delivered after the whole message is confirmed (`spinthinking` by default). CSCB removes queued before adding delivered; the first successful correlated reply or reaction clears the actual stage. Both names are configurable; see [Acknowledgement reactions](server-settings.md#acknowledgement-reactions) for the custom-emoji prerequisite and tracking limits.
 
 A message from Slack carries these tag attributes:
 
@@ -150,6 +150,8 @@ A message from Slack carries these tag attributes:
 | `via` | How the message reached the persona (see the next table). |
 | `thread_ts` | The thread's timestamp, for a thread reply. |
 | `attachment_count`, `attachments` | The number of attached files and each file's name, type and size, when files are attached. |
+
+A long `attachments` or `user` value can be cut short, ending in `…`; on a macOS host this happens sooner, and a long `channel_name` can be cut too. `chat_id` and `attachment_count` are always whole.
 
 For new non-thread channel intake, both modes require current verified eligible membership and a trustworthy non-off choice; open also requires a public/private channel with explicit non-external-sharing evidence. Off suppresses mentions and broadcasts before the open loop guard; unresolved facts withhold affected acknowledgement while independent recipients and accepted work can progress. Reasons below prefer a direct mention, then a broadcast, then, under effective `thread_hybrid`, a followed thread reply, then effective `all`.
 
@@ -178,7 +180,7 @@ A "Yes" in the Reminder column means [Slack reply reminders](#slack-reply-remind
 
 ## Slack reply reminders
 
-After CSCB delivers a Slack message, it watches the persona's agent-director row. When it observes `working` followed by `waiting` in the same running session, and the persona has made no `reply` tool call since that delivery, CSCB queues one reminder through normal message delivery:
+After CSCB delivers a Slack message, it watches the persona's agent-director row. When it observes `working` followed by `waiting` in the same running session, and the persona has made no `reply` or `react` tool call since that delivery, CSCB queues one reminder through normal message delivery:
 
 ```text
 You received a Slack message and you haven't replied. If you meant to answer in Slack, do it now with the reply tool. If no reply is needed, just end your turn.
@@ -188,7 +190,7 @@ The persona can reply or end its turn. There is at most one reminder per deliver
 
 Claude reminders require the `reply_tool_preallowed=1` agent-director label; conversations without it receive no new reminders. An existing label alone does not prove that the conversation's saved launch arguments include the reply allowance. Updating the template leaves existing conversations and their saved arguments unchanged; ordinary fresh or reuse launches obtain the current rule, and existing conversations continue receiving ordinary messages.
 
-Only Slack deliveries arm reminders. Scheduled prompts, `/interject` messages and reminders themselves do not. A `reply` call by that persona suppresses the reminder even if posting fails or the call targets another conversation. Replies through another tool or service can therefore be followed by one harmless reminder.
+Only Slack deliveries arm reminders. Scheduled prompts, `/interject` messages and reminders themselves do not. A `reply` or `react` call by that persona suppresses the reminder even if posting fails or the call targets another conversation. Replies through another tool or service can therefore be followed by one harmless reminder.
 
 ### Turning it on or off
 
@@ -196,7 +198,7 @@ Set `stop_hook_bootstrap` in `config.json`: at the top level for every persona, 
 
 ### Personas that answer without `reply` — opt them out
 
-A persona that answers only with `edit_message`, `react` or another service can receive a reminder after each Slack delivery. Set `stop_hook_bootstrap: false` on that persona and confirm the change.
+A persona that answers only with `edit_message` or another service can receive a reminder after each Slack delivery. Set `stop_hook_bootstrap: false` on that persona and confirm the change.
 
 ### When it stays silent
 

@@ -756,8 +756,10 @@ export interface StubSlack {
   readonly responders: { history?: StubSlackOptions['historyResponder']; replies?: StubSlackOptions['repliesResponder'] }
   /**
    * How many completion groups each unscripted `filesUploadV2` call
-   * completes, consumed front to back (default 1, one file per call); each
-   * group takes the next `script.completeUpload` outcome.
+   * completes, consumed front to back (default 1, holding every file of the
+   * call); the call's files split across its groups in order, at least one
+   * file per group, and each group takes the next `script.completeUpload`
+   * outcome.
    */
   readonly uploadGroups: number[]
   /** Captured Web API call arguments, shared by every Web API client of this stub. */
@@ -1105,10 +1107,13 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
             return mergeDroppingUndefined({ ok: true, files: [{ ok: true, files: [{ id }] }] }, overrides)
           }) as ReturnType<WebClient['filesUploadV2']>
         }
-        const { channel_id, thread_ts } = args as { channel_id?: string; thread_ts?: string }
+        const { channel_id, thread_ts, file_uploads } = args as { channel_id?: string; thread_ts?: string; file_uploads?: unknown[] }
         const files = (self as { files: StubWebClient['files'] }).files
-        const groups = Array.from({ length: uploadGroups.shift() ?? 1 }, () => files.completeUploadExternal({
-          files: [{ id: `F0STUB${String(++fileSeq).padStart(4, '0')}` }],
+        // The call's files split across its groups in order, at least one per group.
+        const count = file_uploads?.length ?? 1, groupCount = uploadGroups.shift() ?? 1
+        const groups = Array.from({ length: groupCount }, (_, i) => files.completeUploadExternal({
+          files: Array.from({ length: Math.max(1, Math.floor((i + 1) * count / groupCount) - Math.floor(i * count / groupCount)) },
+            () => ({ id: `F0STUB${String(++fileSeq).padStart(4, '0')}` })),
           ...(channel_id === undefined ? {} : { channel_id }), ...(thread_ts === undefined ? {} : { thread_ts }),
         } as Parameters<StubWebClient['files']['completeUploadExternal']>[0]))
         return Promise.all(groups).then(completed => ({ ok: true, files: completed })) as ReturnType<WebClient['filesUploadV2']>

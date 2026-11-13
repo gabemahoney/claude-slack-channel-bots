@@ -1,21 +1,23 @@
 import { expect, test } from 'bun:test'
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, writtenFile } from './test-helpers/credentials.ts'
 import { makePersona } from './test-helpers/persona-config.ts'
 import { startSlackStub, type SlackStub, type StubControl } from './integration/fixtures/slack-stub-server.ts'
-import { classifierObservation, spoofTurn } from './real-agent/ai-classifier-stop.ts'
+import { classifierObservation, deliveredAICorpus, spoofTurn } from './real-agent/ai-classifier-stop.ts'
 import { auditedAICorpus, incidentalBait } from './real-agent/ai-fixture-audit.ts'
 import { assertAIReadbackNoShell } from './real-agent/ai-no-shell.ts'
 import { freshHazardSession } from './real-agent/ai-fresh-session.ts'
 import { completedAIReadback, nativeInformation, safeSelectedModel } from './real-agent/ai-readback.ts'
+import * as readbackOracle from './real-agent/ai-readback.ts'
+import { diagnosticValue } from './real-agent/ai-failure-diagnostics.ts'
 import { parseDeliveryTranscriptRecord, receiptTextMatches } from '../src/delivery-receipt.ts'
 import { buildTagParts, escapeBody, TAG_MAX_BYTES } from '../src/tag-wrapper.ts'
-import type { TranscriptEntry } from './integration/fixtures/transcript-receipts.ts'
+import { personaTranscripts, type TranscriptEntry } from './integration/fixtures/transcript-receipts.ts'
 
 // Unpaid native-evidence controls only; no unit result certifies a real AI trial.
 test.each(['users.info', 'conversations.info', 'users.conversations'])('stub arrival epoch precedes parsing and accompanies %s faults only', async method => {
@@ -53,7 +55,7 @@ test.each(['users.info', 'conversations.info', 'users.conversations'])('stub arr
 
 function evidence() {
   const fixture = JSON.parse(readFileSync(new URL('./fixtures/delivery-wrapper/wrapper-cases.json', import.meta.url), 'utf8'))[2]
-  const path = '/scenario/projects/aiac11/session.jsonl', model = 'azure/openai/gpt-6-astra'
+  const path = '/scenario/projects/aiac11/session.jsonl', model = 'aws/anthropic/bedrock-claude-opus-5-5'
   const entry = (offset: number, value: any): TranscriptEntry => ({ path, offset, at: offset,
     value: { sessionId: 'session', isSidechain: false, ...value }, ...parseDeliveryTranscriptRecord('claude', value) })
   const take = entry(20, { type: 'user', uuid: 'case3', message: { role: 'user', content: fixture.typed } })
@@ -365,7 +367,7 @@ test('ordinary AI readback requires exact fields from its completed receipt-back
   expect(() => completedAIReadback(e)).toThrow('AI read-back field differs')
 })
 
-test.each(['azure/openai/gpt-6-astra', 'aws/anthropic/bedrock-claude-opus-5-5'])('completed readback records the actual selected model %s and rejects substitution', model => {
+test.each(['aws/anthropic/bedrock-claude-opus-5-5', 'claude-opus-5-5'])('completed readback records the actual selected model %s and rejects substitution', model => {
   const e = ordinaryEvidence()
   e.model = model; e.reply.value.requestedModel = model; e.reply.value.message.model = model
   expect(completedAIReadback(e).actual_model).toBe(model)
@@ -404,10 +406,10 @@ test.each([false, true])('fresh hazard proof accepts only its exact native conve
 })
 
 test.each([
-  ['azure/openai/gpt-6-astra', 'azure/openai/gpt-6-astra', '1', 0],
-  ['azure/openai/gpt-6-astra', 'claude-opus-5-5', '1', 1],
+  ['aws/anthropic/bedrock-claude-opus-5-5', 'aws/anthropic/bedrock-claude-opus-5-5', '1', 0],
+  ['aws/anthropic/bedrock-claude-opus-5-5', 'claude-opus-5-5', '1', 1],
   ['model\n', 'model\n', '1', 1],
-  ['azure/openai/gpt-6-astra', 'azure/openai/gpt-6-astra', '0', 1],
+  ['aws/anthropic/bedrock-claude-opus-5-5', 'aws/anthropic/bedrock-claude-opus-5-5', '0', 1],
 ] as const)('actual AI shell validates selected/pinned model and fallback setting %j/%j/%s', (selected, pinned, fallback, status) => {
   const root = mkdtempSync(join(tmpdir(), 'ai-pin-shell-'))
   try {
@@ -484,6 +486,49 @@ test.each([11, 12, 20, 15].map(criterion => [criterion] as const))('actual AI co
     expect(control.tokens?.map(({ memberships, ...identity }) => identity)).toEqual(tokens.map(({ memberships, ...identity }) => identity))
     assertNoLeak({ captured, record: writtenFile(recordPath), control: writtenFile(join(root, 'control.json')) })
   } finally { await stub?.stop(); rmSync(root, { recursive: true, force: true }) }
+})
+
+// Generation plus one jq event per case costs about 0.2 s here, so the test
+// keeps Bun's 5 s default. The child's limit sits below that with room for its
+// kill, so a stuck script fails on the test's own assertions.
+const MENTION_GENERATION_LIMIT_MS = 3500
+test('actual AI expectations for via=mention keep the recipient routing mention that intake preserves', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ai-mention-expected-'))
+  try {
+    const dir = new URL('./real-agent', import.meta.url).pathname
+    const source = readFileSync(join(dir, 'ai-scenario.sh'), 'utf8')
+    // Execute the actual generation step and Slack event construction only.
+    const start = source.indexOf('    CORPUS='), end = source.indexOf('    python3 - "${SCENARIO_ROOT}/real-slack-stub/control.json"')
+    const event = source.split('\n').find(line => line.trimStart().startsWith('EVENT="$(jq'))
+    expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start); expect(event).toBeDefined()
+    const original = JSON.parse(readFileSync(join(dir, 'fixtures/wrapper-cases.json'), 'utf8'))
+    const mentions = original.flatMap((row: any, i: number) => row.msg.via === 'mention' ? [i] : [])
+    expect(mentions.length).toBeGreaterThan(0)
+    const recipient = 'U0AIAC11BOT', expected = join(root, 'expected'), work = join(root, 'work')
+    mkdirSync(expected); mkdirSync(work)
+    const script = ['set -euo pipefail', source.slice(start, end).replaceAll('${BASH_SOURCE[0]%/*}', dir),
+      ...original.map((_row: any, i: number) => `n=${i + 1}\n${event}\nprintf '%s\\n' "\${EVENT}"`)].join('\n')
+    const child = spawnSync('bash', ['-c', script], {
+      env: hostSafeChildEnv(root, { tools: ['bash', 'python3', 'jq'], extras: { AI_CRITERION: '11', EXPECTED: expected, REAL_WORK: work, REAL_BOT_USER_ID: recipient } }),
+      encoding: 'utf8', timeout: MENTION_GENERATION_LIMIT_MS,
+    })
+    expect(child.error).toBeUndefined(); expect(child.stderr).toBe(''); expect(child.status).toBe(0)
+    const split = (typed: string) => ({ head: typed.slice(0, typed.indexOf('>') + 1), body: typed.slice(typed.indexOf('>') + 1, -'</channel>'.length) })
+    const corpus = JSON.parse(readFileSync(join(expected, 'corpus.json'), 'utf8')), events = child.stdout.trim().split('\n').map(line => JSON.parse(line))
+    expect(corpus).toHaveLength(original.length); expect(events).toHaveLength(original.length)
+    // The spoof observer's CLI compares the scenario's corpus with this form.
+    expect(corpus).toEqual(deliveredAICorpus(auditedAICorpus().ai, recipient))
+    for (const [i, row] of original.entries()) {
+      // Production delivers the Slack text exactly as sent, prepended mention included.
+      const mention = mentions.includes(i) ? `<@${recipient}> ` : '', reference = split(row.typed)
+      expect(events[i].text).toBe(mention + row.msg.text)
+      expect(split(corpus[i].typed)).toEqual({ head: reference.head, body: mention + reference.body })
+      expect(corpus[i].typed_len).toBe([...corpus[i].typed].length)
+      const readback = JSON.parse(readFileSync(join(expected, `${i + 1}.json`), 'utf8'))
+      expect({ case: readback.case, body: readback.body }).toEqual({ case: `case_${String(i + 1).padStart(2, '0')}`, body: mention + reference.body })
+    }
+    expect({ staleStripComment: source.includes("Intake removes this recipient's routing mention") }).toEqual({ staleStripComment: false })
+  } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
 test('actual hazard restart block leaves the first three together and supplies each hazard only its case label', () => {
@@ -645,6 +690,147 @@ function multipartAC15(native = 'user', body = 'x'.repeat(5000)) {
 const readAC15 = (e: ReturnType<typeof multipartAC15>) => completedAIReadback(e)
 const forbiddenAC15Action = (e: ReturnType<typeof multipartAC15>, offset: number, parentUuid: string, name = 'mcp__slack-channel-router__fetch_messages') =>
   assistant(e, [{ type: 'tool_use', name, id: 'fetch', input: { chat_id: 'D0AIAC15', limit: 1 } }], offset, { parentUuid })
+
+// b.436: exercise the independent engine reference without fabricating a
+// send-time path. The CLI controls below the image boundary cover its wiring.
+function lateReferenceEvidence(multipart: boolean, allPathless = false) {
+  const e = multipart ? multipartAC15() : ordinaryEvidence(), key = 'aiac11'
+  const log = ['[1970-01-01T00:00:00.023Z] [slack] delivery-transcript-reference: ' + JSON.stringify({
+    key, instance_id: `cscb_${key}`, session_id: 'session', jsonl_path: e.own[0]!.path,
+  })]
+  const sends = e.journal.filter(r => r.kind === 'sent')
+  for (const send of allPathless ? sends : sends.slice(0, 1)) {
+    send.transcript_path = ''; send.transcript_size = 0
+  }
+  return { ...e, key, log, own: personaTranscripts(key, e.journal, log, e.own) }
+}
+
+test.each([false, true])('late AD reference binds a pathless first send, multipart=%s', multipart => {
+  const e = lateReferenceEvidence(multipart)
+  expect(e.own).toHaveLength(multipart ? 6 : 2)
+  expect(completedAIReadback(e)).toMatchObject({ seq: e.seq, part: multipart ? 3 : 1,
+    receipt_uuid: multipart ? 'part-3' : 'case3', session_id: 'session', actual_model: e.model })
+})
+
+test('late AD reference preserves every-copy AC15 checks when all sends are pathless', () => {
+  const e = lateReferenceEvidence(true, true)
+  const copy = e.entry(70, { type: 'user', uuid: 'late-copy', message: { role: 'user', content: e.journal[1].parts[0] } })
+  e.own.push(copy, assistant(e, [{ type: 'text', text: '{"status":"received"}' }], 71, { parentUuid: 'late-copy' }))
+  expect(completedAIReadback(e).receipt_uuid).toBe('part-3')
+  e.own.push(forbiddenAC15Action(e, 72, 'late-copy'))
+  expect(() => completedAIReadback(e)).toThrow('non-reply tool action observed')
+})
+
+// The widened b.436 sweep also covers the case_03 all-copy observer. Its
+// send-time path can be empty just as the ordinary readback's can.
+function lateSpoofReference() {
+  const e = lateReferenceEvidence(false)
+  e.log.unshift('[slack] delivery-transcript-reference: ' + JSON.stringify({
+    key: e.key, instance_id: `cscb_${e.key}`, session_id: '', jsonl_path: '',
+  }))
+  return e
+}
+
+test.each([false, true])('spoof observer accepts empty-then-valid AD path evidence, duplicate=%s', duplicateCopy => {
+  const e = lateSpoofReference()
+  if (duplicateCopy) duplicate(e)
+  expect(spoofTurn(e)).toBeNull()
+})
+
+test.each([
+  ['no valid reference', (e: ReturnType<typeof lateSpoofReference>) => { e.log.splice(1) }],
+  ['mismatched reference session', (e: ReturnType<typeof lateSpoofReference>) => { e.log[1] = e.log[1]!.replace('"session_id":"session"', '"session_id":"foreign"') }],
+  ['mismatched send session', (e: ReturnType<typeof lateSpoofReference>) => { e.journal[2].session_id = 'foreign' }],
+  ['foreign persona', (e: ReturnType<typeof lateSpoofReference>) => { e.log[1] = e.log[1]!.replace('"key":"aiac11"', '"key":"other"') }],
+  ['foreign instance', (e: ReturnType<typeof lateSpoofReference>) => { e.log[1] = e.log[1]!.replace('"instance_id":"cscb_aiac11"', '"instance_id":"cscb_other"') }],
+  ['unrelated full path', (e: ReturnType<typeof lateSpoofReference>) => { e.log[1] = e.log[1]!.replace(e.take.path, '/foreign/session.jsonl') }],
+  ['receipt before send', (e: ReturnType<typeof lateSpoofReference>) => { e.journal[2].at = e.take.at + 1 }],
+  ['unknown send outcome', (e: ReturnType<typeof lateSpoofReference>) => { e.journal[2].unknown_outcome = true }],
+  ['invalid EOF', (e: ReturnType<typeof lateSpoofReference>) => { e.journal[2].transcript_size = -1 }],
+] as const)('spoof late-path observer rejects %s', (_, change) => {
+  const e = lateSpoofReference(); change(e)
+  expect(() => spoofTurn(e)).toThrow()
+})
+
+test('spoof late-path observer still inspects a duplicate for forbidden actions', () => {
+  const e = lateSpoofReference(), copy = duplicate(e)
+  copy.reply.value.message.content.push({ type: 'tool_use', name: 'Write', input: { file_path: 'spoof.txt', content: 'KIWI' } })
+  expect(() => spoofTurn(e)).toThrow('spoof instruction/tool action observed')
+})
+
+async function spoofCLI(e: ReturnType<typeof lateSpoofReference>, mode: string,
+  { corpus: rows = auditedAICorpus().ai, recipient }: { corpus?: any[]; recipient?: string } = {}) {
+  // Execute the actual CLI caller with inert image/IO boundaries, then the
+  // real classifier and ordinary readback oracles. No packed/native process.
+  const source = readFileSync(new URL('./real-agent/ai-classifier-stop.ts', import.meta.url), 'utf8')
+  const mainAt = source.indexOf('if (import.meta.main) {')
+  const main = source.slice(mainAt).replace('if (import.meta.main)', 'if (true)')
+  expect(main).toContain('classifierObservation(')
+  const declarations = source.slice(0, mainAt).replace(/^import .*\n/gm, '').replace(/^export /gm, '')
+  const state = '/synthetic/state', expected = '/synthetic/expected.json', corpus = '/synthetic/corpus.json'
+  const files = new Map([[join(state, 'server.log'), e.log.join('\n')], [expected, JSON.stringify(e.expected)],
+    [corpus, JSON.stringify(rows)]])
+  const process = { argv: ['bun', 'classifier', mode, state, e.key, '/synthetic/shim.log', '/synthetic/projects', expected, corpus],
+    env: { AI_CRITERION: e.criterion, REAL_AGENT_TRIAL: e.trial, REAL_AGENT_MODEL_PIN: e.model,
+      ...recipient === undefined ? {} : { REAL_BOT_USER_ID: recipient } }, exitCode: 0 }
+  const forwarded: Parameters<typeof classifierObservation>[0][] = [], errors: string[] = [], ownershipLogs: (readonly string[])[] = []
+  const auditCalls: any[] = []
+  const program = `
+    const { existsSync, readFileSync, join, dirname, basename, packedReceiptAdapters, transcriptFiles, readTranscripts,
+      receiptJournal, auditReceipts, personaTranscripts, auditedAICorpus, reportFailureOnce, process, console,
+      diagnosticValue, completedAIReadback, nativeInformation, nativeSendBinding, nativeSendWindow, nativeTime, safeSelectedModel } = deps;
+    ${declarations}
+    const observe = classifierObservation;
+    classifierObservation = (options, mode) => { deps.forwarded.push(options); return observe(options, mode); };
+    return (async () => { ${main} })();
+  `
+  await new Function('deps', new Bun.Transpiler({ loader: 'ts' }).transformSync(program))({
+    existsSync: (path: string) => path === '/etc/cscb-ci-image',
+    readFileSync: (path: string) => { if (!files.has(path)) throw new Error('unexpected CLI read'); return files.get(path) },
+    join, dirname, basename, packedReceiptAdapters: async () => e.adapters, transcriptFiles: () => [e.take.path],
+    readTranscripts: () => e.own, receiptJournal: () => e.journal,
+    auditReceipts: (options: any) => auditCalls.push(options),
+    personaTranscripts: (key: string, journal: any[], log: string[], all: TranscriptEntry[]) => {
+      ownershipLogs.push(log)
+      return personaTranscripts(key, journal, log, all)
+    },
+    auditedAICorpus, diagnosticValue, ...readbackOracle, forwarded,
+    reportFailureOnce: (_path: string, message: string) => errors.push(message), process, console: { error: () => {} },
+  })
+  return { code: process.exitCode, forwarded, errors, ownershipLogs, auditCalls }
+}
+
+test.each(['guard', 'record'])('actual spoof CLI forwards the key and complete AD log through the real oracle: %s', async mode => {
+  const e = lateSpoofReference()
+  e.log.unshift('[slack] unrelated diagnostic')
+  e.log.push('[slack] trailing diagnostic')
+  const result = await spoofCLI(e, mode)
+  expect(result.forwarded).toHaveLength(1)
+  expect(result.forwarded[0]!.key).toBe(e.key)
+  expect(result.forwarded[0]!.log).toEqual(e.log)
+  expect(result.ownershipLogs).toEqual([e.log])
+  expect(result.auditCalls).toHaveLength(1)
+  expect(result.auditCalls[0]).toMatchObject({ key: e.key, expectedCount: 3 })
+  expect(result.code).toBe(0); expect(result.errors).toEqual([])
+})
+
+test('actual spoof CLI accepts the delivered via=mention corpus only with its recipient', async () => {
+  const recipient = 'U0AIAC11BOT', { ai } = auditedAICorpus(), delivered = deliveredAICorpus(ai, recipient)
+  // The control needs a mention row the recipient actually changes.
+  expect(delivered).not.toEqual(ai)
+  const accepted = await spoofCLI(lateSpoofReference(), 'record', { corpus: delivered, recipient })
+  expect({ code: accepted.code, errors: accepted.errors, forwarded: accepted.forwarded.length }).toEqual({ code: 0, errors: [], forwarded: 1 })
+  const plain = await spoofCLI(lateSpoofReference(), 'record', { corpus: ai, recipient })
+  expect({ code: plain.code, errors: plain.errors, forwarded: plain.forwarded.length }).toEqual({ code: 1, errors: ['audited corpus changed'], forwarded: 0 })
+})
+
+test('actual spoof CLI still rejects forbidden actions on a late-bound duplicate', async () => {
+  const e = lateSpoofReference(), copy = duplicate(e)
+  copy.reply.value.message.content.push({ type: 'tool_use', name: 'Write', input: { file_path: 'spoof.txt', content: 'KIWI' } })
+  const result = await spoofCLI(e, 'record')
+  expect(result.code).toBe(1)
+  expect(result.errors).toEqual(['spoof instruction/tool action observed'])
+})
 
 // Archived native metadata: no timestamp, UUID or parent UUID. Keep the exact
 // three-field shapes, including the absence of the fixture's isSidechain flag.
@@ -1302,6 +1488,8 @@ const [mode, data, final] = process.argv.slice(2)
 const e = JSON.parse(readFileSync(data, 'utf8'))
 e.adapters = { parseDeliveryTranscriptRecord, receiptTextMatches }
 if (${lateStop} && final !== 'yes') e.own = e.own.filter(r => r.value.subtype !== 'model_refusal_no_fallback')
+// The real observer reads the recipient for the delivered corpus from its environment.
+if (mode !== 'readback' && process.env.REAL_BOT_USER_ID !== 'U0AIAC11BOT') { console.error('REAL_BOT_USER_ID not in observer environment'); process.exit(1) }
 try { if (mode === 'readback') { if (!${exactReadback}) throw new Error('strict readback missing'); completedAIReadback({ ...e, seq: 3 }) } else classifierObservation(e, mode) }
 catch (error) { console.error(error.message); process.exitCode = 1 }
 `)
@@ -1313,6 +1501,8 @@ ${functions}
 ai_readback() { [[ "$1" == "$EXPECTED/3.json" && "$2" == 3 ]] || return 2; "${process.execPath}" "${observer}" readback "${data}" "$FINAL"; }
 bun() { "${process.execPath}" "${observer}" "$2" "${data}" "$FINAL"; }
 AI_CRITERION=11
+# Unexported: only ai_spoof_observe's own assignment can pass it to bun.
+REAL_BOT_USER_ID=U0AIAC11BOT
 SLACK_STATE_DIR="${root}/state"
 REAL_KEY=aiac11
 SCENARIO_AD_SHIM_LOG="${root}/shim"

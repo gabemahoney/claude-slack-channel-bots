@@ -40,17 +40,19 @@ These top-level fields apply to the whole server. Confirmed changes take effect 
 
 **Custom emoji must exist in the Slack workspace before you configure them.** `spinthinking` is custom; before starting, make sure both selected names are available in each persona's workspace. Omitting either setting selects its default; empty strings and `null` are invalid.
 
-CSCB removes the queued reaction before adding the delivered reaction. Setting both names alike keeps one reaction through both stages; dropped messages and injected messages get neither. The first successful `reply` text post or file upload carrying the original `message_id` clears that persona's actual stage without delaying the rest of the reply.
+CSCB removes the queued reaction before adding the delivered reaction. Setting both names alike keeps one reaction through both stages; dropped messages and injected messages get neither. The first successful `reply` text post or file upload carrying the original `message_id`, or that persona's successful `react` on the message, clears that persona's actual stage without delaying the tool. A `react` with the stage's own emoji keeps that reaction.
 
 Both settings take effect only at server startup after a [confirmed change](reload.md#what-a-confirmation-applies). Outstanding work retains its original queued name across restarts and setting changes, including when queued feedback is restored after reconnect; its delivered stage uses the setting in effect at delivery.
 
-A reply before delivery suppresses later stages: early replies are remembered for 24 hours and pending/completed reaction tracking lasts 30 days in memory. Restart loses reply suppression, so already answered retained work can acquire a reaction again. For missing or lingering reactions, see [Troubleshooting](troubleshooting.md#troubleshooting).
+A reply or reaction before delivery suppresses later stages: early answers are remembered for 24 hours and pending/completed reaction tracking lasts 30 days in memory. Restart loses reply suppression, so already answered retained work can acquire a reaction again. For missing or lingering reactions, see [Troubleshooting](troubleshooting.md#troubleshooting).
 
 ---
 
 ## Environment Variables
 
-Runtime options are read from environment variables. None of them is required. Slack tokens come only from each persona's credentials file (see [Credentials files](configuration.md#credentials-files)). There is no `.env` file — export any of these in your shell profile.
+Runtime options are read from environment variables. None of them is required. Slack tokens come only from each persona's credentials file (see [Credentials files](configuration.md#credentials-files)). Set runtime options in your shell profile; Bun can also load `.env` files from the working directory.
+
+CSCB removes its own Slack credential variables (names matching `SLACK_*TOKEN` or `SLACK_*SECRET`, case-insensitively) from child environments, including agent-director calls and any tmux server they start. The same rule covers variables Bun loads from `.env` files. Its internal daemon marker goes only to the daemon child and is removed after its startup check. All other host environment variables pass through; the operator controls which host secrets their shells and bots receive.
 
 | Variable | Description |
 |---|---|

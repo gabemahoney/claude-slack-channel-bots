@@ -6,8 +6,8 @@
  * and errors, the name-or-key target resolver used
  * by `/interject` and the crontable, and the pure derivations of every
  * agent-director and tmux identifier a persona gets: instance
- * ID, tmux session name, labels (including the `config_dir` label) and the
- * spawn-environment values.
+ * ID, tmux session name, labels (including the `config_dir` label and the
+ * `model` and `effort` Start Labels) and the spawn-environment values.
  *
  * Pure module: no module-scope side effects, no file-system
  * or environment access, and nothing reads the home directory at import.
@@ -75,6 +75,21 @@ export const CONFIG_DIR_HASH_LENGTH = 12
 
 /** Directory, relative to the home directory, that an unconfigured claude_config_dir resolves to. */
 export const DEFAULT_CLAUDE_CONFIG_SUBDIR = '.claude'
+
+/** Label-map key of the Start Label carrying the hashed `model` a conversation started with (`model`). */
+export const MODEL_LABEL_KEY = 'model'
+
+/** Prefix of the Start Label carrying the hashed `model`. */
+export const MODEL_LABEL_PREFIX = `${MODEL_LABEL_KEY}=`
+
+/** Label-map key of the Start Label carrying the `effort` a conversation started with (`effort`). */
+export const EFFORT_LABEL_KEY = 'effort'
+
+/** Prefix of the Start Label carrying the `effort`. */
+export const EFFORT_LABEL_PREFIX = `${EFFORT_LABEL_KEY}=`
+
+/** A Start Label's key: `model` or `effort`, which are also the persona keys whose values they record. */
+export type StartLabelKey = typeof MODEL_LABEL_KEY | typeof EFFORT_LABEL_KEY
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -264,6 +279,38 @@ export function personaLabels(key: string, configDir?: string, home: string = ho
     `${PERSONA_LABEL_PREFIX}${key}`,
     `${CONFIG_DIR_LABEL_PREFIX}${configDirLabelValue(configDir, home)}`,
   ]
+}
+
+/**
+ * Value of the `model` Start Label: the full 64-digit lowercase hex SHA-256
+ * of the model's UTF-8 bytes, exactly as written (no trimming, case folding
+ * or truncation). Hashed so no model value reaches a label, `agent-director
+ * list` output or the agent's environment, where agent-director exports
+ * labels; kept whole because values compare exactly as written.
+ */
+export function modelLabelValue(model: string): string {
+  return sha256Hex(model)
+}
+
+/**
+ * Value of the `effort` Start Label: the level unchanged. One function, so
+ * the spawn and the row comparison derive the value in the same place.
+ */
+export function effortLabelValue(effort: string): string {
+  return effort
+}
+
+/**
+ * The Start Labels for a persona's start values: `model=<modelLabelValue>`
+ * when `model` is set, then `effort=<effortLabelValue>` when `effort` is set.
+ * Empty when neither is set. Generic over the persona shape so this module
+ * needs no import of the config loader.
+ */
+export function startValueLabels(values: { model?: string; effort?: string }): string[] {
+  const labels: string[] = []
+  if (values.model !== undefined) labels.push(`${MODEL_LABEL_PREFIX}${modelLabelValue(values.model)}`)
+  if (values.effort !== undefined) labels.push(`${EFFORT_LABEL_PREFIX}${effortLabelValue(values.effort)}`)
+  return labels
 }
 
 /**

@@ -7,6 +7,14 @@
  * post-state" semantics — the slack-channel-bot template exists with
  * the right contents after every boot, regardless of prior state.
  *
+ * The start arguments come from one builder, `buildStartAgentArgs`, shared
+ * with session-manager.ts `buildSpawnParams`. agent-director replaces a
+ * template's `agent_args` wholesale with a call's own, and every plain and
+ * reuse spawn passes its own: the same builder over the configuration in
+ * effect since start, plus the persona's `model` and `effort` start
+ * options. So the template's `agent_args` are not what launches use; they
+ * keep their contents, and a spawn's base arguments cannot differ from them.
+ *
  * Atomic replacement is the library's responsibility (sibling-tempfile +
  * rename(2), shipped in agent-director v0.4.3).
  *
@@ -129,24 +137,51 @@ export function deriveMemoryReadAllowRules(personaConfig: PersonaConfig, home: s
 export const REPLY_TOOL_ALLOW_RULE = `mcp__${MCP_SERVER_NAME}__reply`
 
 /**
- * Build the `MakeTemplateParams` for the slack-channel-bot template per
- * Exported for direct testing.
+ * Prefix of the one start-argument element carrying a persona's `model`
+ * (`--model=<value>`). The option and its value are one element, never
+ * `--model` followed by a value element: agent-director's argument policy
+ * splits each element at its first `=` and refuses (`ErrSpawnDeniedFlag`,
+ * which CSCB classifies UNCLASSIFIED, so the persona would never launch) an
+ * element named like a denied option even as another option's value. One
+ * element always reads as `--model`, so a value that starts with `-` or
+ * holds spaces or `=` is used only as the model; agent-director hands tmux
+ * each element as one argument.
+ */
+export const MODEL_ARG_PREFIX = '--model='
+
+/**
+ * Prefix of the one start-argument element carrying a persona's `effort`
+ * (`--effort=<level>`): one element, as for `MODEL_ARG_PREFIX`.
+ */
+export const EFFORT_ARG_PREFIX = '--effort='
+
+/**
+ * The start arguments every persona launch passes: the template's
+ * `agent_args` (`buildTemplateParams`, with no start values) and every plain
+ * and reuse spawn's own (`buildSpawnParams` in session-manager.ts, from the
+ * configuration in effect since start and the persona's start values), so
+ * the two cannot differ in their base arguments. Exported for direct testing.
  *
  * MCP tools without channel arguments, and one
  * mandatory appended prompt file shared by every persona.
+ *
+ * Then `--model=<value>` when `startValues.model` is set and
+ * `--effort=<level>` when `startValues.effort` is set, each one element
+ * (`MODEL_ARG_PREFIX`, `EFFORT_ARG_PREFIX`) with the value exactly as given
+ * (no trimming, quoting or escaping).
  *
  * Then appends `--system-prompt-snapshot off` unless
  * `fresh_system_prompt` is exactly `false`; a configuration without the field
  * gets the pair. It does not depend on `system_prompt_mode`, on the append
  * file probe or on dry run, and is always the last two elements.
  */
-export function buildTemplateParams(
-  personaConfig: PersonaConfig,
-  deps?: Partial<TemplateInstallDeps>,
-): MakeTemplateParams {
+export function buildStartAgentArgs(
+  config: Pick<PersonaConfig, 'mcp_config_path' | 'fresh_system_prompt'>,
+  startValues: { model?: string; effort?: string } = {},
+): string[] {
   const agent_args: string[] = [
     '--mcp-config',
-    personaConfig.mcp_config_path,
+    config.mcp_config_path,
   ]
 
   // the shared composed file is mandatory in every mode.
@@ -155,12 +190,34 @@ export function buildTemplateParams(
   // AD preserves agent_args on resume, but not the template's allow overlay.
   agent_args.push('--allowedTools', REPLY_TOOL_ALLOW_RULE)
 
+  // the persona's start options, before the optional trailing pair.
+  if (startValues.model !== undefined) agent_args.push(`${MODEL_ARG_PREFIX}${startValues.model}`)
+  if (startValues.effort !== undefined) agent_args.push(`${EFFORT_ARG_PREFIX}${startValues.effort}`)
+
   // last, after the mandatory composed prompt, so a
   // resumed or restarted bot reloads the current system prompt file and
   // CLAUDE.md. Only a `fresh_system_prompt` of exactly `false` leaves it out.
-  if (personaConfig.fresh_system_prompt !== false) {
+  if (config.fresh_system_prompt !== false) {
     agent_args.push('--system-prompt-snapshot', 'off')
   }
+
+  return agent_args
+}
+
+/**
+ * Build the `MakeTemplateParams` for the slack-channel-bot template.
+ * Exported for direct testing.
+ *
+ * `agent_args` are `buildStartAgentArgs(personaConfig)`, with no start
+ * values. No CSCB spawn inherits them: every plain and reuse spawn passes
+ * its own from the same builder (`buildSpawnParams` in session-manager.ts),
+ * which agent-director stores on the row in place of the template's.
+ */
+export function buildTemplateParams(
+  personaConfig: PersonaConfig,
+  deps?: Partial<TemplateInstallDeps>,
+): MakeTemplateParams {
+  const agent_args = buildStartAgentArgs(personaConfig)
 
   return {
     name: DEFAULT_TEMPLATE_NAME,

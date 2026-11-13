@@ -39,6 +39,7 @@ import {
   LIVE_ROW_STOP_NOT_UP,
   LIVE_ROW_STOP_SHUTDOWN,
   LIVE_ROW_STOP_TEARDOWN,
+  freshStartLine,
   liveRowSequenceStartLine,
   liveRowStopCauseText,
   runLiveRowSequence,
@@ -83,6 +84,7 @@ import {
   resetAdVersionRecheckForTests,
 } from '../src/ad-version-gate.ts'
 import { getClient, resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
+import { buildStartAgentArgs, buildTemplateParams, EFFORT_ARG_PREFIX, MODEL_ARG_PREFIX } from '../src/agent-director-template.ts'
 import {
   AgentDirectorError,
   ERR_STORE_OPEN_NAME,
@@ -249,6 +251,8 @@ import {
 } from '../src/persona-episodes.ts'
 import {
   configDirLabelValue,
+  EFFORT_LABEL_KEY,
+  MODEL_LABEL_KEY,
   PERSONA_INSTANCE_ID_PREFIX,
   personaInstanceId,
   personaKey,
@@ -257,6 +261,8 @@ import {
   PROMPT_SUGGESTION_OFF_ENV,
   renderPersonaRef,
   SERVICE_LABEL,
+  startValueLabels,
+  type StartLabelKey,
 } from '../src/persona-identity.ts'
 import type { PersonaNoticeOptions } from '../src/persona-notifier.ts'
 import { createPersonaRelaunchGate, type PersonaBringUpStep } from '../src/persona-start.ts'
@@ -319,7 +325,7 @@ import {
   REUSE_RECORDED_SINCE_NOT_RECORDED_AT_START,
   REUSE_RECORDED_SINCE_RECORDED_AGAIN, reuseInvalidFlagsHeldLine, reuseRecordedInFlightLine, reuseSpawnForPersona,
   runLatchRecheckRound, setInvalidFlagsHold, setLiveRowSequenceRegistry, setPersonaKillKeepGoingQuery, setRetiredKeyStore, setStuckLaunchEpisodes, SPAWN_ACTION_FRESH_RETIRED,
-  SPAWN_ACTION_RETRYING, START_SWEEP_KILL_STATUS_SITE,
+  SPAWN_ACTION_RETRYING, START_SWEEP_KILL_STATUS_SITE, START_VALUES_DIFFER_WHY, TAG_UPGRADE_WHY, UNREPORTED_RESUME_FALLBACK_AFTER, unreportedResumeFallbackLine,
   START_SWEEP_KILL_STOP_RECHECK,
   START_SWEEP_KILL_STOP_SHUTDOWN, START_SWEEP_LIST_SITE, START_SWEEP_SHUTDOWN_STOP_LINE, startLaunchNotStartedForShutdownLine, startStuckLaunchAbortSequence, startSweepKillFailedEntry,
   startSweepKillSucceededLine,
@@ -560,6 +566,7 @@ import {
   type WebApiOutcome,
 } from './test-helpers/slack-stub.ts'
 import { balancedAfter, srcModules, stripComments } from './test-helpers/source-audit.ts'
+import { confirmValues, freshStartLinesIn, onFirstCall, startLabelsIn, startLabelsOf, type StartValues } from './test-helpers/start-values.ts'
 import {
   IDLE_PANE,
   SPINNER_PANE,
@@ -1029,7 +1036,8 @@ describe('spawnForPersona: fresh spawn parameters', () => {
       DISABLE_AUTOUPDATER: '1',
       CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: '1',
     })
-    expect(params.agent_args).toBeUndefined()
+    // A plain spawn passes its own start arguments: the template's, for a persona with no start values.
+    expect(params.agent_args).toEqual(buildTemplateParams(cfg).agent_args)
   })
 
   test('no claude_config_dir configured → CLAUDE_CONFIG_DIR absent (not empty), label is that of <home>/.claude', async () => {
@@ -1745,6 +1753,23 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
 // row-vs-persona comparison (compareRowToPersona)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Start Values (SR-3): a persona's `model` and `effort` against the Start
+// Labels its row was written with. Expected labels come from the
+// `src/persona-identity.ts` derivations and expected lines from the
+// Fresh-Start Line's builder (`tests/test-helpers/start-values.ts`); model
+// values are plain words, one per case, so a case can show the value never
+// reaches a line.
+// ---------------------------------------------------------------------------
+
+/** The labels a spawn wrote, as the label map its row then carries. */
+function labelsWrittenBy(params: SpawnParams): Record<string, string> {
+  return Object.fromEntries((params.label ?? []).map((label) => [label.slice(0, label.indexOf('=')), label.slice(label.indexOf('=') + 1)]))
+}
+
+/** The session id of a row that holds a conversation. */
+const ROW_SESSION_ID = 'a-session-id'
+
 describe('compareRowToPersona', () => {
   /** Paths for one case, all under this test's fixture dir; `home` is real-pathed. */
   interface CompareFixture {
@@ -1833,6 +1858,57 @@ describe('compareRowToPersona', () => {
     // The expected label is the one a spawn of the persona writes.
     expect(result.expectedConfigDirLabel).toBe(personaConfigDirLabelValue(configDir, f.home))
     expect(result.cwdMatches).toBe(true)
+  })
+
+  // SR-3.1: for `model` and `effort`, from the row's labels only, `model`
+  // before `effort`. A row with neither Start Label (an earlier release's)
+  // differs on exactly the keys the persona sets.
+  test.each<[string, StartValues, StartValues, readonly StartLabelKey[]]>([
+    // [label, the persona's values, the values the row's Start Labels were written from, the keys that differ]
+    ['a match: model alone', { model: 'Aardvark' }, { model: 'Aardvark' }, []],
+    ['a match: effort alone', { effort: 'low' }, { effort: 'low' }, []],
+    ['a match: both', { model: 'Badger', effort: 'max' }, { model: 'Badger', effort: 'max' }, []],
+    ['a match: neither on both sides (an earlier release\'s row)', {}, {}, []],
+    ['model added (the persona sets it, the row has no label)', { model: 'Caracal', effort: 'high' }, { effort: 'high' }, [MODEL_LABEL_KEY]],
+    ['effort added', { model: 'Dingo', effort: 'high' }, { model: 'Dingo' }, [EFFORT_LABEL_KEY]],
+    ['model removed (the row has a label, the persona sets none)', { effort: 'high' }, { model: 'Ferret', effort: 'high' }, [MODEL_LABEL_KEY]],
+    ['effort removed', { model: 'Gecko' }, { model: 'Gecko', effort: 'xhigh' }, [EFFORT_LABEL_KEY]],
+    ['both removed', {}, { model: 'Hyena', effort: 'low' }, [MODEL_LABEL_KEY, EFFORT_LABEL_KEY]],
+    ['model changed', { model: 'Ibex' }, { model: 'Jackal' }, [MODEL_LABEL_KEY]],
+    ['effort changed', { effort: 'max' }, { effort: 'low' }, [EFFORT_LABEL_KEY]],
+    ['both changed', { model: 'Kudu', effort: 'high' }, { model: 'Lemur', effort: 'medium' }, [MODEL_LABEL_KEY, EFFORT_LABEL_KEY]],
+    ['a different spelling of the same model', { model: 'Marmot' }, { model: 'marmot' }, [MODEL_LABEL_KEY]],
+    ['an earlier release\'s row against a persona with model only', { model: 'Narwhal' }, {}, [MODEL_LABEL_KEY]],
+    ['an earlier release\'s row against a persona with effort only', { effort: 'low' }, {}, [EFFORT_LABEL_KEY]],
+    ['an earlier release\'s row against a persona with both', { model: 'Echidna', effort: 'medium' }, {}, [MODEL_LABEL_KEY, EFFORT_LABEL_KEY]],
+  ])('Start Values: %s; the other fields as for the same row and persona with no Start Values', (_label, personaValues, rowValues, expected) => {
+    const f = compareFixture()
+    const persona = { working_directory: f.work, claude_config_dir: f.config }
+    const labels = { service: 'cscb', persona: 'C', tag_prompt: '1', config_dir: personaConfigDirLabelValue(f.config, f.home) }
+
+    const result = compareRowToPersona({ cwd: f.work, labels: { ...labels, ...startLabelsOf(rowValues) } }, { ...persona, ...personaValues }, f.home)
+
+    expect(result.startValuesDiffering).toEqual(expected)
+    const { startValuesDiffering: _differing, ...rest } = result
+    const { startValuesDiffering: none, ...baseline } = compareRowToPersona({ cwd: f.work, labels }, persona, f.home)
+    expect([rest, none]).toEqual([baseline, []])
+  })
+
+  // Negative control: only the labels decide. The stored start arguments a
+  // `get` row carries never change the answer, either way round.
+  test.each<[string, StartValues, StartValues, readonly StartLabelKey[]]>([
+    // [label, the values the row's Start Labels were written from, the values its stored arguments name, the keys that differ]
+    ['labels matching the persona, stored arguments naming other values', { model: 'Okapi', effort: 'high' }, { model: 'Pangolin', effort: 'low' }, []],
+    ['labels written with other values, stored arguments matching the persona', { model: 'Pangolin', effort: 'low' }, { model: 'Okapi', effort: 'high' }, [MODEL_LABEL_KEY, EFFORT_LABEL_KEY]],
+  ])('Start Values come from the row\'s labels alone: %s', (_label, labelValues, argValues, expected) => {
+    const f = compareFixture()
+    const row: Pick<GetResult, 'cwd' | 'labels' | 'agent_args'> = {
+      cwd: f.work,
+      labels: { service: 'cscb', persona: 'C', tag_prompt: '1', config_dir: personaConfigDirLabelValue(f.config, f.home), ...startLabelsOf(labelValues) },
+      agent_args: [`${MODEL_ARG_PREFIX}${argValues.model}`, `${EFFORT_ARG_PREFIX}${argValues.effort}`],
+    }
+    const persona = { working_directory: f.work, claude_config_dir: f.config, model: 'Okapi', effort: 'high' as const }
+    expect(compareRowToPersona(row, persona, f.home).startValuesDiffering).toEqual(expected)
   })
 })
 
@@ -2250,6 +2326,173 @@ describe('collision ladder: config_dir guard before resume', () => {
     expect(spawnCalls[1].extra_env?.['CLAUDE_CONFIG_DIR']).toBe(later)
     expect(spawnCalls[1].label).toEqual(['service=cscb', 'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL, 'persona=C', configDirLabelFor(later)])
     expect(spawnCalls[1].label).not.toContain(configDirLabelFor(earlier))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SR-3.2: the Start Values guard, the last check before the `resume`. A row
+// with a session id whose Start Labels differ from the persona's `model` or
+// `effort` is never resumed: one Fresh-Start Line, then the row is replaced
+// exactly as for a `config_dir` mismatch (a finished row by one reuse spawn
+// of the same id carrying the persona's current Start Labels and arguments;
+// the dead-session `waiting` row, last read live with dead evidence, through
+// the live-row sequence first, none installed here, so the launch answers
+// sequence-waiting). Nothing is killed, deleted, posted, diagnosed or
+// written to startup-errors.log (SR-3.7). The same rows with matching values
+// resume as before.
+// ---------------------------------------------------------------------------
+
+describe('collision ladder: Start Values guard before resume', () => {
+  /** Persona `C` with `values`, a real working directory and a real per-persona claude_config_dir; `overrides` go to the server-wide settings. */
+  function valuesConfig(values: StartValues, overrides: Partial<Omit<PersonaConfig, 'personas'>> = {}): PersonaConfig {
+    useSpawnHome()
+    return makeStandInPersonaConfig(
+      { C: { working_directory: fixtureSubdir('work'), claude_config_dir: fixtureSubdir('claude-config'), ...values } },
+      fixtureDir,
+      { agent_director_poll_interval_ms: 1, ...overrides },
+    )
+  }
+
+  /** `C`'s row holding a conversation, its Start Labels written from `rowValues`; `overrides` win. */
+  function conversationRow(cfg: PersonaConfig, rowValues: StartValues, overrides: PersonaGetResultOverrides = {}): CannedGetResult {
+    return personaRow(cfg, 'C', { session_id: ROW_SESSION_ID, labels: { ...personaRow(cfg, 'C').labels, ...startLabelsOf(rowValues) }, ...overrides })
+  }
+
+  /** One launch of `C` at the start pass, over `entry` meeting `row`: its result, its calls, its lines and startup-errors.log. */
+  async function launchOver(entry: ResumeEntry, cfg: PersonaConfig, row: CannedGetResult) {
+    const readLog = captureStartupErrors()
+    const calls = newLadderCalls()
+    installResumeEntry(entry, row, calls)
+    let result!: SpawnPersonaResult
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+    return { result, calls, lines: errLog.split('\n'), log: readLog() }
+  }
+
+  /**
+   * `C`'s row was replaced for Start Values differing by `differing`, as a
+   * `config_dir` mismatch replaces it: never resumed; on the dead-session
+   * `waiting` entry the sequence first, on every other one reuse spawn of the
+   * same id whose labels and arguments are the colliding plain spawn's (both
+   * from the one persona), its Start Labels the persona's; one Fresh-Start
+   * Line, before the replacement's own lines; no kill, delete, notice,
+   * startup-errors entry or lost-transcript diagnosis; no line holds a
+   * model value of `models`.
+   */
+  function expectFreshStart(
+    entry: ResumeEntry,
+    cfg: PersonaConfig,
+    launched: Awaited<ReturnType<typeof launchOver>>,
+    differing: readonly StartLabelKey[],
+    models: ReadonlyArray<string | undefined>,
+  ): void {
+    const { result, calls, lines, log } = launched
+    const persona = personaOf(cfg, 'C')
+    const ref = renderPersonaRef('C', 'C')
+    expect([calls.resumeCalls, calls.killCalls, calls.deleteCalls]).toEqual([[], [], []])
+    if (entry === 'waiting (dead session)') {
+      expect(result).toEqual({ key: 'C', action: 'sequence-waiting' })
+      expect(calls.spawnCalls).toHaveLength(1)
+    } else {
+      expect(result).toEqual({ key: 'C', action: 'spawned' })
+      expect(calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
+      const [plain, reuse] = calls.spawnCalls as [SpawnParams, SpawnParams]
+      expect(startLabelsIn(reuse.label)).toEqual(startValueLabels(persona))
+      expect([reuse.label, reuse.agent_args]).toEqual([plain.label, buildStartAgentArgs(cfg, persona)])
+    }
+    const fresh = freshStartLinesIn(lines, ref)
+    expect(fresh).toEqual([freshStartLine(ref, differing)])
+    expect(lines.findIndex((line) => line.includes(START_VALUES_DIFFER_WHY))).toBeGreaterThan(lines.indexOf(fresh[0]!))
+    expect([notices, log]).toEqual([[], ''])
+    expect(lines.filter((line) => line.startsWith('[slack] ErrJsonlMissing diagnostic: '))).toEqual([])
+    for (const model of models) if (model !== undefined) expect(lines.join('\n')).not.toContain(model)
+    assertNoLeak({ lines, log })
+  }
+
+  /** `C`'s row was resumed as before the guard existed, with no Fresh-Start Line. */
+  function expectResumed(launched: Awaited<ReturnType<typeof launchOver>>): void {
+    expect(launched.result).toEqual({ key: 'C', action: 'resumed' })
+    expect(launched.calls.resumeCalls.map((r) => r.instance_id)).toEqual(['cscb_C'])
+    expect([launched.calls.spawnCalls.length, launched.calls.killCalls, launched.calls.deleteCalls]).toEqual([1, [], []])
+    expect(freshStartLinesIn(launched.lines, renderPersonaRef('C', 'C'))).toEqual([])
+    assertNoLeak({ lines: launched.lines, log: launched.log })
+  }
+
+  const ROUTE_PERSONA: StartValues = { model: 'Wombat', effort: 'high' }
+
+  test.each(RESUME_ENTRIES.flatMap((entry) => [[entry, 'matching', 'resumed, with no Fresh-Start Line'], [entry, 'differing', 'never resumed; one Fresh-Start Line, then the replacement']] as const))(
+    '%s row with a session id, its Start Labels %s the persona\'s: %s',
+    async (entry, variant) => {
+      const cfg = valuesConfig(ROUTE_PERSONA)
+      const rowValues: StartValues = variant === 'matching' ? ROUTE_PERSONA : { ...ROUTE_PERSONA, model: 'Numbat' }
+
+      const launched = await launchOver(entry, cfg, conversationRow(cfg, rowValues))
+
+      if (variant === 'matching') expectResumed(launched)
+      else expectFreshStart(entry, cfg, launched, [MODEL_LABEL_KEY], [ROUTE_PERSONA.model, rowValues.model])
+    },
+  )
+
+  // The variants on the `ended` entry (the matrix above covers the routes).
+  // An earlier release's row resumes only for a persona with neither key;
+  // for one with keys, its line names exactly the keys the persona sets (SR-4.3).
+  test.each<[string, StartValues, StartValues, readonly StartLabelKey[]]>([
+    // [label, the persona's values, the values the row's Start Labels were written from, the keys that differ]
+    ['model added', { model: 'Axolotl', effort: 'low' }, { effort: 'low' }, [MODEL_LABEL_KEY]],
+    ['model removed', { effort: 'medium' }, { model: 'Bilby', effort: 'medium' }, [MODEL_LABEL_KEY]],
+    ['effort changed', { model: 'Capybara', effort: 'max' }, { model: 'Capybara', effort: 'low' }, [EFFORT_LABEL_KEY]],
+    ['both changed', { model: 'Dugong', effort: 'high' }, { model: 'Eland', effort: 'medium' }, [MODEL_LABEL_KEY, EFFORT_LABEL_KEY]],
+    ['a different spelling of the same model', { model: 'Fossa' }, { model: 'fossa' }, [MODEL_LABEL_KEY]],
+    ['an earlier release\'s row, the persona setting effort only', { effort: 'xhigh' }, {}, [EFFORT_LABEL_KEY]],
+    ['an earlier release\'s row, the persona setting both', { model: 'Gerenuk', effort: 'low' }, {}, [MODEL_LABEL_KEY, EFFORT_LABEL_KEY]],
+  ])('ended row with a session id, %s: never resumed; one Fresh-Start Line naming the keys that differ, then one reuse spawn', async (_label, personaValues, rowValues, differing) => {
+    const cfg = valuesConfig(personaValues)
+
+    const launched = await launchOver('ended', cfg, conversationRow(cfg, rowValues))
+
+    expectFreshStart('ended', cfg, launched, differing, [personaValues.model, rowValues.model])
+  })
+
+  test('ended row with a session id, an earlier release\'s row, the persona setting neither key: resumed, with no Fresh-Start Line', async () => {
+    const cfg = valuesConfig({})
+
+    expectResumed(await launchOver('ended', cfg, conversationRow(cfg, {})))
+  })
+
+  // SR-3.3: a row with no session id holds no conversation: today's path and
+  // calls, with no Fresh-Start Line.
+  test.each(['empty', 'absent'] as const)('an ended row whose session_id is %s, its Start Labels differing: resumed as today, with no Fresh-Start Line', async (variant) => {
+    const cfg = valuesConfig({ model: 'Hartebeest' })
+    const row = conversationRow(cfg, { model: 'Impala' }, { session_id: '' })
+    if (variant === 'absent') delete (row as Partial<CannedGetResult>).session_id
+
+    expectResumed(await launchOver('ended', cfg, row))
+  })
+
+  // Each earlier fresh-start reason keeps its precedence over differing
+  // values: its own replacement, its own line, and no Fresh-Start Line. The
+  // retired key and the repeated-unreported-resume fallback are the recovery
+  // harness describe's below.
+  test.each<[string, Partial<Omit<PersonaConfig, 'personas'>>, (labels: Record<string, string>) => Record<string, string>, (ref: string) => string]>([
+    // [label, server-wide settings, the row's labels, a fragment of the earlier reason's own line]
+    ['resume_enabled false', { resume_enabled: false }, (labels) => labels, (ref) => `resume_enabled=false for ${ref} — not resuming`],
+    ['a missing tag_prompt label', {}, ({ tag_prompt: _tag, ...labels }) => labels, (ref) => `replacing the row of ${ref} (${TAG_UPGRADE_WHY}; `],
+    ['a config_dir label that differs', {}, (labels) => ({ ...labels, config_dir: personaConfigDirLabelValue(fixtureSubdir('earlier-config'), seamHome) }), (ref) => `${ref} config_dir label changed`],
+  ])('%s, with Start Labels that differ: the earlier reason decides; no Fresh-Start Line', async (_label, overrides, relabel, reasonLine) => {
+    const cfg = valuesConfig({ model: 'Jerboa' }, overrides)
+    const row = conversationRow(cfg, { model: 'Kinkajou' })
+    const ref = renderPersonaRef('C', 'C')
+
+    const { result, calls, lines, log } = await launchOver('ended', cfg, { ...row, labels: relabel(row.labels) })
+
+    expect(result).toEqual({ key: 'C', action: 'spawned' })
+    expect(calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
+    expect([calls.resumeCalls, calls.killCalls, calls.deleteCalls]).toEqual([[], [], []])
+    expect(lines.filter((line) => line.includes(reasonLine(ref)))).toHaveLength(1)
+    expect(freshStartLinesIn(lines, ref)).toEqual([])
+    expect(lines.filter((line) => line.includes(START_VALUES_DIFFER_WHY))).toEqual([])
+    assertNoLeak({ lines, log })
   })
 })
 
@@ -2717,6 +2960,52 @@ describe('next launch: the applied values at launch time (next-launch rows)', ()
     ])
     // Not held for the directory that does not exist yet.
     expect(errLog).not.toContain(PERSONA_CONFIG_DIR_UNRESOLVABLE)
+  })
+
+  test('model and effort both changed between two launches: the first writes the old Start Labels; the second gives that row one reuse spawn of the same id with the new labels and arguments, one Fresh-Start Line naming both keys, and deletes nothing', async () => {
+    useSpawnHome()
+    const work = fixtureSubdir('work')
+    const configFor = (values: StartValues) =>
+      makeMultiPersonaConfig([{ name: GUARD_NAME, working_directory: work, ...values }], fixtureDir, { agent_director_poll_interval_ms: 1 })
+    const before = configFor({ model: 'Mongoose', effort: 'low' })
+    const after = configFor({ model: 'Nilgai', effort: 'max' })
+
+    const first = makeStubCallLog()
+    installStub(first)
+    expect(await launchSession(GUARD_KEY, before)).toBe(true)
+    expect(startLabelsIn(first.spawnCalls[0]!.label)).toEqual(startValueLabels(personaOf(before, GUARD_KEY)))
+    // The row the first launch left behind holds its conversation and the labels that launch wrote.
+    const row = personaRow(before, GUARD_KEY, { state: 'ended', session_id: ROW_SESSION_ID, labels: labelsWrittenBy(first.spawnCalls[0]!) })
+
+    resetClientForTests()
+    const second = makeStubCallLog()
+    installStub({
+      ...second,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<StubSpawnResult>({ instance_id: GUARD_INSTANCE }),
+      ],
+      getResult: row,
+    })
+    let result: LaunchSessionResult | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await launchSession(GUARD_KEY, after)
+    })
+
+    expect(result).toBe(true)
+    expect([second.resumeCalls, second.deleteCalls, second.killCalls]).toEqual([[], [], []])
+    expect(second.spawnCalls.map((call) => [call.instance_id, call.reuse_finished])).toEqual([
+      [GUARD_INSTANCE, undefined],
+      [GUARD_INSTANCE, true],
+    ])
+    const persona = personaOf(after, GUARD_KEY)
+    expect([startLabelsIn(second.spawnCalls[1]!.label), second.spawnCalls[1]!.agent_args]).toEqual([startValueLabels(persona), buildStartAgentArgs(after, persona)])
+    const ref = renderPersonaRef(GUARD_NAME, GUARD_KEY)
+    const lines = errLog.split('\n')
+    expect(freshStartLinesIn(lines, ref)).toEqual([freshStartLine(ref, [MODEL_LABEL_KEY, EFFORT_LABEL_KEY])])
+    expect(errLog).not.toContain('Mongoose')
+    expect(errLog).not.toContain('Nilgai')
+    assertNoLeak(lines)
   })
 })
 
@@ -5767,6 +6056,7 @@ describe('compareRowToPersona and personaConfigDirLabelValue with an unresolvabl
       configDirLabel: configDirLabelValue(configDir),
       expectedConfigDirLabel: undefined,
       tagPrompt: true,
+      startValuesDiffering: [],
     })
     let thrown: unknown
     try {
@@ -17727,6 +18017,22 @@ describe('step 6, the sequence-launch entry, its reuse spawn and the sequence\'s
     h.remove(p)
     expect(h.sequenceDeps.personaFacts(p, own)).toBeUndefined()
   })
+
+  test('the launch-kind facts carry the Start Values whose row labels differ from P\'s, model before effort; none for a matching row or no row', () => {
+    const { h, p } = buildRecoveryCase({ personas: [{ model: 'Yapok', effort: 'medium' }, {}] })
+    const persona = harnessPersona(h, p)
+    const own = cannedGetResult({}, persona, h.home)
+    const relabelled = (values: StartValues) => ({ ...own, labels: { ...own.labels, ...startLabelsOf(values) } })
+    const facts = { resumeEnabled: true, cwdMatches: true, configDirMatches: true, retired: false }
+
+    // An earlier release's row (no Start Labels), one key matching, and another spelling of the model.
+    expect(h.sequenceDeps.personaFacts(p, own)).toStrictEqual({ ...facts, startValuesDiffering: [MODEL_LABEL_KEY, EFFORT_LABEL_KEY] })
+    expect(h.sequenceDeps.personaFacts(p, relabelled({ model: 'Yapok' }))).toStrictEqual({ ...facts, startValuesDiffering: [EFFORT_LABEL_KEY] })
+    expect(h.sequenceDeps.personaFacts(p, relabelled({ model: 'yapok', effort: 'medium' }))).toStrictEqual({ ...facts, startValuesDiffering: [MODEL_LABEL_KEY] })
+    // Absent when nothing differs, as with no row.
+    expect(h.sequenceDeps.personaFacts(p, relabelled(persona))).toStrictEqual(facts)
+    expect(h.sequenceDeps.personaFacts(p, undefined)).toStrictEqual(facts)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -18186,6 +18492,10 @@ describe('each replacement site replaces P\'s row with no delete: a finished row
     readonly row: (h: RecoveryHarness, p: string) => PersonaGetResultOverrides
     readonly script?: RecoveryStubScript
     readonly before: readonly string[]
+    /** The keys the site's Fresh-Start Line names, for a Start Values replacement; none logged when unset. */
+    readonly freshStart?: readonly StartLabelKey[]
+    /** The finished row the sequence's `get`s read; `endedWithSession` when unset. */
+    readonly finished?: (h: RecoveryHarness, p: string) => PersonaGetResultOverrides
   }
 
   /**
@@ -18220,6 +18530,8 @@ describe('each replacement site replaces P\'s row with no delete: a finished row
     readonly before: readonly string[]
     /** Whether the route's row read `pending` is covered: a `config_dir` label missing or different never is. */
     readonly pendingCovered: boolean
+    /** The keys the route's Fresh-Start Line names (the Start Values guard); none logged when unset. */
+    readonly freshStart?: readonly StartLabelKey[]
   }
 
   const DEAD_SESSION_REPLACEMENT_ROUTES: readonly DeadSessionReplacementRoute[] = [
@@ -18244,6 +18556,20 @@ describe('each replacement site replaces P\'s row with no delete: a finished row
       swept: false,
       before: ['spawn', 'get', 'get', 'get', 'sendKeys'],
       pendingCovered: true,
+    },
+    {
+      // SR-3.2: P sets no `model`, the row holding a conversation has a
+      // `model` label (the key removed). Its `pending` row stays covered (SR-3.4).
+      name: 'a waiting row with a session id whose Start Labels differ (the Start Values guard before resume)',
+      row: (h, p, state) => ({
+        state,
+        session_id: ROW_SESSION_ID,
+        labels: { ...harnessRow(h, harnessPersona(h, p), { state }).labels, ...startLabelsOf({ model: 'Zorilla' }) },
+      }),
+      swept: true,
+      before: ['spawn', 'get', 'get', 'get', 'sendKeys', 'findMissing'],
+      pendingCovered: true,
+      freshStart: [MODEL_LABEL_KEY],
     },
   ]
 
@@ -18273,16 +18599,18 @@ describe('each replacement site replaces P\'s row with no delete: a finished row
       row: (h, p) => route.row(h, p, LIVE),
       script: GONE_WAITING,
       before: route.before,
+      // the Start Values route's sequence reads its finished row with the same differing labels.
+      ...(route.freshStart === undefined ? {} : { freshStart: route.freshStart, finished: (h: RecoveryHarness, p: string) => route.row(h, p, LIVENESS_DEAD_ROW_ENDED) }),
     })),
   ]
 
-  /** Script P's launch to meet `site`'s row: the colliding first spawn, the ladder's `get`, then `endedWithSession` at every later `get`. */
+  /** Script P's launch to meet `site`'s row: the colliding first spawn, the ladder's `get`, then the site's finished row (`endedWithSession` by default) at every later `get`. */
   function scriptLiveSite(h: RecoveryHarness, p: string, site: LiveSite, extra: RecoveryStubScript = {}): void {
     site.setup?.(h)
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getQueue: [cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), site.row(h, p))), ...(site.script?.sendKeysError ? [cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), site.row(h, p))), cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), site.row(h, p)))] : [])],
-      getResult: endedWithSession(h, p),
+      getResult: site.finished === undefined ? endedWithSession(h, p) : harnessRow(h, harnessPersona(h, p), site.finished(h, p)),
       ...site.script,
       ...extra,
     })
@@ -18313,6 +18641,9 @@ describe('each replacement site replaces P\'s row with no delete: a finished row
     // Nothing armed but the step-6 reuse's pending-only watch.
     expect([getFailureCount(p), h.triggers, h.notices]).toEqual([0, [pendingRowTrigger(p)], []])
     expect(personaCallCounts(h, b)).toEqual({})
+    // One Fresh-Start Line in all for a Start Values site, the ladder's: step 6's not-kept reason logs none.
+    const ref = renderPersonaRef(p, p)
+    expect(freshStartLinesIn([...h.errors, ...h.lines], ref)).toEqual(site.freshStart === undefined ? [] : [freshStartLine(ref, site.freshStart)])
 
   })
 
@@ -18367,6 +18698,13 @@ describe('each replacement site replaces P\'s row with no delete: a finished row
     expect(rereadLines).toHaveLength(1)
     expect(rereadLines[0]).toContain(describeDeadEvidence(carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE)))
     expect(getFailureCount(p)).toBe(0)
+    // A Start Values route logs its one Fresh-Start Line at the decision, before the re-read's line, which names its reason.
+    const fresh = freshStartLinesIn([...h.errors, ...h.lines], ref)
+    expect(fresh).toEqual(route.freshStart === undefined ? [] : [freshStartLine(ref, route.freshStart)])
+    if (route.freshStart !== undefined) {
+      expect(rereadLines[0]).toContain(START_VALUES_DIFFER_WHY)
+      expect(h.errors.slice(0, h.errors.indexOf(rereadLines[0]!))).toContain(fresh[0]!)
+    }
 
     if (reread === LIVENESS_DEAD_ROW_ENDED) {
       expect(result).toStrictEqual({ key: p, action: 'spawned' })
@@ -18739,6 +19077,185 @@ describe('each replacement site replaces P\'s row with no delete: a finished row
     expect([countStartupEntries(log, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS), countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)]).toEqual([0, 0])
     expect(getFailureCount(p)).toBe(0)
 
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The Start Values guard at the collision ladder's resume site, on the
+// recovery harness: the retired key and the repeated-unreported-resume
+// fallback keep precedence; one Fresh-Start Line per Resume Decision; one
+// reading of the applied persona per Launch on the finished-row path
+// (SR-3.5); the start pass counts such a Launch as a `config_dir`
+// replacement (SR-3.7); a `pending` row stays covered at the ladder's
+// pending step (SR-3.4). Every captured line passes `assertNoLeak`
+// (`recoveryAfterEach`).
+// ---------------------------------------------------------------------------
+
+describe('the Start Values guard at the resume site, on the recovery harness', () => {
+  afterEach(() => {
+    expectNoDeleteOrIncludeFinished(recoveryHarness)
+    recoveryAfterEach()
+  })
+
+  /** P's own row read `state`, holding a conversation, its Start Labels written from `rowValues`. */
+  const conversationRowOf = (h: RecoveryHarness, p: string, state: RecoveryRowState, rowValues: StartValues): PersonaGetResultOverrides => ({
+    state,
+    session_id: ROW_SESSION_ID,
+    labels: { ...harnessRow(h, harnessPersona(h, p), { state }).labels, ...startLabelsOf(rowValues) },
+  })
+
+  /** P's Fresh-Start Lines among everything the harness logged. */
+  const freshLinesOf = (h: RecoveryHarness, p: string): string[] => freshStartLinesIn([...h.errors, ...h.lines], renderPersonaRef(p, p))
+
+  /**
+   * P's launch over a `waiting` row whose reconnect answers GONE: the
+   * find-missing run before resume lists P in `unverified_ids` and the `get`
+   * after it reads the row ended, so the resume site acts on a finished row.
+   * `row` gives each read's row.
+   */
+  function sweptToEnded(h: RecoveryHarness, p: string, row: (state: RecoveryRowState) => PersonaGetResultOverrides): RecoveryStubScript {
+    return {
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getQueue: [...Array<RecoveryRowState>(3).fill('waiting'), LIVENESS_DEAD_ROW_ENDED].map((state) => cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), row(state)))),
+      sendKeysError: errTmuxSendKeys(),
+      findMissingResult: cannedFindMissing({ rows: { [personaInstanceId(p)]: 'unverified_ids' } }),
+    }
+  }
+
+  test('a key recorded as retired during the find-missing run before resume, its row\'s Start Labels differing: the retired-key rule decides (one reuse spawn, never a resume); no Fresh-Start Line', async () => {
+    const { h, p } = buildRecoveryCase({ personas: [{ model: 'Lynx' }, {}] })
+    h.script(sweptToEnded(h, p, (state) => conversationRowOf(h, p, state, {})))
+    onFirstCall(h, 'findMissing', () => h.retireKey(p))
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
+
+    expect([h.stub.calls.resumeCalls, h.reuseSpawns()]).toEqual([[], [reuseSpawnOf(h, p)]])
+    expect(h.retiredEntry(p).recorded).toBe(true)
+    expect(freshLinesOf(h, p)).toEqual([])
+    expect(h.errors.filter((line) => line.includes(START_VALUES_DIFFER_WHY))).toEqual([])
+  })
+
+  test('after UNREPORTED_RESUME_FALLBACK_AFTER resumes in a row that ended before reporting in, a row whose Start Labels now differ: the fallback decides (its one line, one reuse spawn); no Fresh-Start Line', async () => {
+    const { h, p } = buildRecoveryCase({ alertThresholdMs: false })
+    const id = personaInstanceId(p)
+    const ref = renderPersonaRef(p, p)
+    // P's row reads missing with a session id; it gains a `model` label (P sets none) once the run of resumes is complete.
+    const rowNow = (): GetResult =>
+      harnessRow(h, harnessPersona(h, p), conversationRowOf(h, p, LIVENESS_DEAD_ROW_MISSING, h.stub.calls.resumeCalls.length < UNREPORTED_RESUME_FALLBACK_AFTER ? {} : { model: 'Margay' }))
+    h.script({
+      spawnFn: (params) => (params.instance_id !== id ? undefined : params.reuse_finished === true ? cannedSpawnResult(id, 'ok') : errInstanceIdCollision()),
+      getFn: (params) => (params.instance_id === id ? rowNow() : undefined),
+      statusFn: (params) => (params.instance_id === id ? cannedStatusResult({ state: LIVENESS_DEAD_ROW_MISSING }) : undefined),
+    })
+    for (let n = 0; n < UNREPORTED_RESUME_FALLBACK_AFTER; n++) {
+      expect(await h.launch(p)).toStrictEqual({ key: p, action: 'resumed' })
+      await h.settle()
+      await readPersonaOwnRow(p, { site: 'session-manager.test', what: 'observe resumed row', ref })
+    }
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
+
+    expect(h.stub.calls.resumeCalls).toHaveLength(UNREPORTED_RESUME_FALLBACK_AFTER)
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    expect(h.errors.filter((line) => line === unreportedResumeFallbackLine(ref, UNREPORTED_RESUME_FALLBACK_AFTER))).toHaveLength(1)
+    expect(freshLinesOf(h, p)).toEqual([])
+    expect(h.errors.filter((line) => line.includes(START_VALUES_DIFFER_WHY))).toEqual([])
+  })
+
+  test('one Fresh-Start Line per Resume Decision: a reuse that collides re-runs get-then-act once, whose Resume Decision logs one more, each before its own reuse spawn', async () => {
+    const { h, p } = buildRecoveryCase({ personas: [{ model: 'Nyala' }, {}] })
+    h.script(collided(h, harnessPersona(h, p), conversationRowOf(h, p, LIVENESS_DEAD_ROW_ENDED, { model: 'Ocelot' }), errInstanceIdCollision()))
+    const ref = renderPersonaRef(p, p)
+    // The Fresh-Start Lines logged by the time each reuse spawn is made.
+    const linesAtReuse: number[] = []
+    const spawn = h.stub.client.spawn.bind(h.stub.client)
+    h.stub.client.spawn = (params) => {
+      if (params.reuse_finished === true) linesAtReuse.push(freshLinesOf(h, p).length)
+      return spawn(params)
+    }
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
+
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p), reuseSpawnOf(h, p)])
+    expect(freshLinesOf(h, p)).toEqual([freshStartLine(ref, [MODEL_LABEL_KEY]), freshStartLine(ref, [MODEL_LABEL_KEY])])
+    expect(linesAtReuse).toEqual([1, 2])
+    expect(h.stub.calls.resumeCalls).toEqual([])
+  })
+
+  test('one Fresh-Start Line per Resume Decision: a Launch whose reuse answered retrying logs one; the retry\'s Launch over the same row is a new Resume Decision and logs one more', async () => {
+    const { h, p } = buildRecoveryCase({ personas: [{ model: 'Pudu' }, {}] })
+    const row = conversationRowOf(h, p, LIVENESS_DEAD_ROW_ENDED, { model: 'Quokka' })
+    h.script(collided(h, harnessPersona(h, p), row, errTmuxUnresponsive('spawn')))
+    const ref = renderPersonaRef(p, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
+    expect(freshLinesOf(h, p)).toEqual([freshStartLine(ref, [MODEL_LABEL_KEY])])
+
+    h.script(collided(h, harnessPersona(h, p), row))
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
+
+    expect(freshLinesOf(h, p)).toEqual([freshStartLine(ref, [MODEL_LABEL_KEY]), freshStartLine(ref, [MODEL_LABEL_KEY])])
+    expect([h.stub.calls.resumeCalls, h.reuseSpawns().length]).toEqual([[], 2])
+  })
+
+  // SR-3.5 on the finished-row path: a change confirmed while the Launch
+  // awaits an earlier call changes nothing in that Launch. Its comparison,
+  // its Fresh-Start Line and its reuse spawn's Start Labels and arguments
+  // all come from the one reading it started with; the next Launch compares
+  // the new values against the labels that spawn wrote.
+  test.each<[string, 'get' | 'findMissing', (h: RecoveryHarness, p: string, row: (state: RecoveryRowState) => PersonaGetResultOverrides) => RecoveryStubScript]>([
+    ['the collision get', 'get', (h, p, row) => collided(h, harnessPersona(h, p), row(LIVENESS_DEAD_ROW_ENDED))],
+    ['the find-missing run before resume (a waiting row whose reconnect answered GONE, the run listing P in unverified_ids, the get after it reading ended)', 'findMissing', sweptToEnded],
+  ])('SR-3.5: a change to model and effort confirmed while the Launch awaits %s: the Launch compares and spawns from the reading it started with; the next Launch compares the new values with the labels that spawn wrote', async (_label, verb, arrange) => {
+    const { h, p } = buildRecoveryCase({ personas: [{ model: 'Tapir' }, {}] })
+    const launchedWith = harnessPersona(h, p)
+    const script = arrange(h, p, (state) => conversationRowOf(h, p, state, { model: 'Urial' }))
+    h.script(script)
+    onFirstCall(h, verb, () => confirmValues(h, p, { model: 'Vicuna', effort: 'high' }))
+    const ref = renderPersonaRef(p, p)
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
+
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    expect(h.reuseSpawns()).toHaveLength(1)
+    const first = h.reuseSpawns()[0]!
+    expect([startLabelsIn(first.label), first.agent_args]).toEqual([startValueLabels(launchedWith), buildStartAgentArgs(h.config, launchedWith)])
+    expect(freshLinesOf(h, p)).toEqual([freshStartLine(ref, [MODEL_LABEL_KEY])])
+
+    h.script({ ...clearedScript(script), ...collided(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED, session_id: ROW_SESSION_ID, labels: labelsWrittenBy(first) }) })
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
+
+    const changed = harnessPersona(h, p)
+    const next = h.reuseSpawns()[1]!
+    expect([startLabelsIn(next.label), next.agent_args]).toEqual([startValueLabels(changed), buildStartAgentArgs(h.config, changed)])
+    expect(freshLinesOf(h, p)).toEqual([freshStartLine(ref, [MODEL_LABEL_KEY]), freshStartLine(ref, [MODEL_LABEL_KEY, EFFORT_LABEL_KEY])])
+    expect([...h.errors, ...h.lines].filter((line) => /Tapir|Urial|Vicuna/.test(line))).toEqual([])
+  })
+
+  test.each<[string, (h: RecoveryHarness, p: string) => PersonaGetResultOverrides]>([
+    ['a config_dir label that differs (the control)', (h, p) => ({ ...relabelledRow(h, harnessPersona(h, p), LIVENESS_DEAD_ROW_ENDED), session_id: ROW_SESSION_ID })],
+    ['Start Labels that differ', (h, p) => conversationRowOf(h, p, LIVENESS_DEAD_ROW_ENDED, { model: 'Wapiti' })],
+  ])('SR-3.7: the start pass counts a Launch replaced for %s as one success and one fresh spawn, and nothing else', async (_label, row) => {
+    const { h, p } = buildRecoveryCase({ personas: [{}] })
+    h.script(collided(h, harnessPersona(h, p), row(h, p)))
+
+    const result = await startupSessionManager(h.config, { concurrency: 1 })
+
+    expect(result.perPersona).toEqual([{ key: p, action: 'spawned' }])
+    expect(startCountsOf(result)).toEqual({ ...NO_START_COUNTS, succeeded: 1, freshSpawned: 1 })
+    expect([h.stub.calls.resumeCalls, h.reuseSpawns()]).toEqual([[], [reuseSpawnOf(h, p)]])
+    expect([getFailureCount(p), h.notices, h.startupErrors()]).toEqual([0, [], []])
+  })
+
+  test('SR-3.4: the collision get reads P\'s row pending, with a session id and Start Labels that differ: covered, a launch in progress (no-op, P armed pending-only); no sequence, kill or launch, and no Fresh-Start Line', async () => {
+    const { h, p } = buildRecoveryCase({ personas: [{ model: 'Xerus' }, {}] })
+    h.script(collided(h, harnessPersona(h, p), conversationRowOf(h, p, AGENT_DIRECTOR_PENDING_STATE, {})))
+
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'no-op' })
+
+    expect([h.sequenceRunning(p), h.stub.calls.killCalls, h.stub.calls.resumeCalls, h.stub.calls.spawnCalls.length]).toEqual([false, [], [], 1])
+    expectOnlyPendingRowWatch(h, p)
+    expect(freshLinesOf(h, p)).toEqual([])
   })
 })
 
@@ -20273,20 +20790,6 @@ describe('a recorded key is launched by a reuse spawn at every launch path, neve
     const call = client[verb]!.bind(client)
     client[verb] = (...args: unknown[]) => {
       if (!h.retiredEntry(key).recorded) h.retireKey(key)
-      return call(...args)
-    }
-  }
-
-  /** Run `act` once, as the stub's `verb` is first called, before the call goes on. */
-  function onFirstCall(h: RecoveryHarness, verb: 'get' | 'kill' | 'findMissing', act: () => void): void {
-    const client = h.stub.client as unknown as Record<string, (...args: unknown[]) => unknown>
-    const call = client[verb]!.bind(client)
-    let done = false
-    client[verb] = (...args: unknown[]) => {
-      if (!done) {
-        done = true
-        act()
-      }
       return call(...args)
     }
   }

@@ -10,7 +10,9 @@
 # SessionStart re-fires every two seconds while AD says pending, until its grace
 # bound, to make lost-create-reply cases deterministic. Exact user messages go
 # to the transcript for receipt assertions. No native dialog bytes are fixtures.
-# Launch argv are recorded under flock; --version only prints its pinned line.
+# Launch argv are recorded under flock, shell-quoted in stub-claude-launch-args
+# and as one JSON object per launch (cwd, instance_id, argv elements whole) in
+# stub-claude-launches.jsonl; --version only prints its pinned line.
 
 set -uo pipefail
 
@@ -100,6 +102,24 @@ launch_args_line=""
 printf -v launch_args_line '%q ' "$@"
 { /usr/bin/flock -x 9 && printf '%s\n' "${launch_args_line% }" >&9; } 9>> "${STUB_LAUNCH_ARGS_FILE}" 2> /dev/null \
     || printf 'stub-claude[%s]: could not record the launch arguments in %s\n' "$$" "${STUB_LAUNCH_ARGS_FILE}" >&2
+
+# A second record of every launch, for reading one launch's argument elements
+# exactly: one JSON object per line appended to `stub-claude-launches.jsonl`
+# beside the stub, `{"cwd": <the resolved working directory>, "instance_id":
+# <AGENT_DIRECTOR_INSTANCE_ID, or "" when unset>, "argv": [<each argument
+# element, whole, as the stub received it>]}`. Built by jq and written under
+# flock in one append, as the record above is; a failed build or write is
+# reported on standard error and changes nothing else.
+STUB_LAUNCHES_FILE="${STUB_DIR}/stub-claude-launches.jsonl"
+launch_record=""
+if launch_record="$(jq -nc --arg cwd "${REALCWD}" --arg instance_id "${AGENT_DIRECTOR_INSTANCE_ID:-}" \
+        '{cwd: $cwd, instance_id: $instance_id, argv: $ARGS.positional}' --args -- "$@" 2> /dev/null)" \
+        && [[ -n "${launch_record}" ]]; then
+    { /usr/bin/flock -x 9 && printf '%s\n' "${launch_record}" >&9; } 9>> "${STUB_LAUNCHES_FILE}" 2> /dev/null \
+        || printf 'stub-claude[%s]: could not record the launch in %s\n' "$$" "${STUB_LAUNCHES_FILE}" >&2
+else
+    printf 'stub-claude[%s]: could not build the launch record for %s\n' "$$" "${STUB_LAUNCHES_FILE}" >&2
+fi
 
 MODE="${MODE_AT_ONCE}"
 if [[ -f "${STUB_MODES_FILE}" ]]; then

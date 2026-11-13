@@ -5,11 +5,11 @@ import { systemDeliveryClock, type DeliveryClock } from './delivery-lifecycle.ts
 
 export const REPLY_REMINDER_TEXT = "You received a Slack message and you haven't replied. If you meant to answer in Slack, do it now with the reply tool. If no reply is needed, just end your turn."
 export const REPLY_REMINDER_POLL_MS = 1000
-/** Set only on launches using CSCB's reply-preallowing template; AD keeps it on resume. */
+/** Set only on launches whose start arguments pre-allow reply (CSCB's shared start-argument builder); AD keeps it on resume. */
 export const REPLY_TOOL_PREALLOWED_LABEL = 'reply_tool_preallowed=1'
 export interface ReplyReminders {
   wake(key: string): void
-  /** Called synchronously when CSCB sees the bot invoke reply, including a failed call. */
+  /** Called synchronously when CSCB sees the bot invoke reply or react, including a failed call. */
   noteReplyCall(key: string): Promise<void>
   observe(key: string, row: GetResult): Promise<void>
   forget(key: string): Promise<void>

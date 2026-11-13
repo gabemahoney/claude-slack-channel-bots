@@ -880,11 +880,12 @@ s19_scan_trail() {
 # launch start and no later than B plus SETTLE_S after it, one
 # ad.launch.name_held record from `ad_find_missing` (row_result
 # `marked_missing`) naming the leftover's session name and tmux id, a CSCB
-# `find-missing` call at or before that mark, no `find-missing` from any
-# other process (the harness runs none), and no CSCB `kill` of the id.
+# call that made that mark (to 0.17: a `find-missing` at or before it; from
+# 0.18.0: `ad_mark_caller`), no `find-missing` from any other process (the
+# harness runs none), and no CSCB `kill` of the id.
 s19_pending_marked() {
     local step="phase 4: ${PEND_KEY}'s row marked missing" id="${PERSONA_ID[${PEND_KEY}]}" session="${PERSONA_NAMED[${PEND_KEY}]}"
-    local deadline_ms timeout_s marks ts tick_ms recs named fm pos time us found="" other calls n
+    local deadline_ms timeout_s marks ts tick_ms recs named fm pos time us found="" other calls n verb role
     deadline_ms=$(( PEND_LAUNCH_MS + BOUND_MS + SETTLE_S * 1000 ))
     timeout_s=$(( (deadline_ms - $(now_ms)) / 1000 + 1 ))
     (( timeout_s > 0 )) || timeout_s=1
@@ -911,17 +912,27 @@ s19_pending_marked() {
     [[ "${named}" == "${session} ${S19_SID[${PEND_KEY}]}" ]] \
         || fail "${step}: the find-missing record names '${named}', not the leftover ${session} ${S19_SID[${PEND_KEY}]}"
     S19_SESSION[${PEND_KEY}]="$(jq -r '.tmux_session_name' <<< "${recs}")"
-    # The mark is a CSCB run's: a CSCB find-missing call started at or before
-    # it, and no other process ran one.
-    fm="$(ad_cscb_verb_between find-missing "${LIFE2_MARK}" -)"
-    while IFS=$'\t' read -r pos time _; do
-        [[ -n "${pos}" ]] || continue
-        us="$(us_of "${time}")"
-        if (( us / 1000 <= tick_ms )); then
-            found="${pos}"
-        fi
-    done <<< "${fm}"
-    [[ -n "${found}" ]] || fail "${step}: no CSCB find-missing call at or before the mark"
+    # The mark is a CSCB call's, and no other process ran a find-missing. Up
+    # to 0.17 only find-missing marks rows: a CSCB find-missing call started
+    # at or before the mark. From 0.18.0 a read checks the rows it selects
+    # too: the latest call at or before the mark that could have made it
+    # (by the tick's source) is CSCB's.
+    if ad_release_at_least 0.18.0; then
+        fm="$(ad_mark_caller "${marks}" "${LIFE2_MARK}")" || fail "${step}: no agent-director call at or before the mark could have made it: ${marks}"
+        IFS=$'\t' read -r pos time _ verb role <<< "${fm}"
+        [[ "${role}" == cscb ]] || fail "${step}: the mark's call (shim line ${pos}, ${verb} at ${time}) is not CSCB's"
+        found="${pos} (${verb})"
+    else
+        fm="$(ad_cscb_verb_between find-missing "${LIFE2_MARK}" -)"
+        while IFS=$'\t' read -r pos time _; do
+            [[ -n "${pos}" ]] || continue
+            us="$(us_of "${time}")"
+            if (( us / 1000 <= tick_ms )); then
+                found="${pos}"
+            fi
+        done <<< "${fm}"
+        [[ -n "${found}" ]] || fail "${step}: no CSCB find-missing call at or before the mark"
+    fi
     other="$(non_cscb_find_missing)"
     [[ -z "${other}" ]] || { sed 's/^/  | /' <<< "${other}" >&2; fail "${step}: a find-missing call whose parent is not a CSCB process"; }
     calls="$(ad_cscb_calls "${id}" "${LIFE2_MARK}")"

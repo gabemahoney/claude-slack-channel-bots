@@ -8,6 +8,43 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 The shared channel foundation uses `channel_mode` (`strict` by default, or `open`), four delivery values and one required `permission_prompts` destination. `config.json.last-applied` is the sole shared authority; reviewed source bytes and pending edits remain distinct from applied choices. Configuration and previews have no size cap; credentials retain their independent limit.
 
+- **CSCB's Slack credentials stay out of child environments.** CSCB now strips its Slack credential variable names, including those Bun loads from `.env` files, before starting child processes or making agent-director calls, covering any tmux server those calls start. `_CLI_DAEMON_CHILD` is limited to the daemon startup handoff. Other host variables still pass through under the operator's environment policy. Existing tmux servers and sessions keep their stored environment. See [Environment Variables](docs/server-settings.md#environment-variables).
+- **A reaction now answers a message.** When a bot answered a Slack message only with the `react` tool, its acknowledgement reaction stayed on the message and CSCB sent it a "you haven't replied" reminder. Now a persona's `react` on the message clears its acknowledgement as a `reply` with `message_id` does, a reaction before delivery suppresses later stages, and any `react` call suppresses the reminder. A reaction with the acknowledgement's own emoji stays. See [Acknowledgement reactions](docs/server-settings.md#acknowledgement-reactions) and [Slack reply reminders](docs/bots.md#slack-reply-reminders).
+
+---
+
+## 0.18.7 (2026-11-07)
+
+- **Bots are told to skip terminal text nobody reads.** The tag description in `bot-system-prompt.md` and the MCP instructions now tell a bot to end each turn with no terminal text, or the shortest possible, unless a terminal reader needs it. Slack answers still go through `reply`. A running bot gets the new wording when it next restarts; with `fresh_system_prompt` off, a resumed bot keeps the old tag description until it starts a new conversation.
+- **No false "transcript can't be read" notice after an old session's transcript is removed.** When a transcript from a persona's earlier session had been deleted, CSCB treated the whole transcript as unreadable and posted a *Delivery stuck* notice saying it kept offering the message, though each message was delivered once. A removed earlier-session transcript is now ignored; one that exists but can't be read still raises the notice. See [Delivery stuck](skills/debug-slack-channel-bots/SKILL.md#delivery-stuck).
+
+---
+
+## 0.18.6 (2026-11-03)
+
+- **`reply` files arrive together, named, and reach mention-only personas.** A reply's files were each posted as a separate message with no text or mention, and all named `file.txt`. They now share one message, each under its own filename. With text, that message is threaded under the first text message (or goes in the given `thread_ts`) and repeats the text's `<@…>` mentions; a files-only reply posts just the files. See [Tools](docs/bots.md#tools).
+
+---
+
+## 0.18.5 (2026-11-03)
+
+- **Per-persona `model` and `effort`.** A persona can set `model` (such as `opus`, `opus[1m]` or a full model ID) and `effort` (`low`, `medium`, `high`, `xhigh` or `max`) for its Claude instance, including over an organisation seat's defaults. An unset key is not passed; both keys are per persona only, and either at the top level is rejected. See [Next-launch settings](docs/configuration.md#next-launch-settings).
+  - A confirmed change takes effect at the persona's next launch. Setting either key, or later changing or removing it (another spelling included), starts a fresh conversation unless the values then match those the conversation started with. The old conversation is kept, never deleted. Each decision to start fresh for this reason logs one `server.log` line containing `from what its conversation started with`; a retry logs again.
+  - Before [downgrading to an earlier release](docs/migration.md#downgrading-to-an-earlier-release), remove both keys, confirm and check `config.json.last-applied` holds neither.
+
+---
+
+## 0.18.4 (2026-11-02)
+
+- **Long messages no longer block a persona on a Mac.** Claude Code on macOS loses typed input sent as one large burst, so a message of about 1 KB or more could be retyped indefinitely while every later message waited. On a macOS host CSCB now types a long message as several parts of at most about 880 bytes each, tag included; long attachment lists, sender names and channel names in the tag are shortened sooner there, each ending in `…`. On other hosts typing is unchanged. A message queued before you upgrade can keep its larger parts and still be retyped; restarting does not split it again, and CSCB keeps offering it until the bot takes it in. See [A persona on a Mac keeps retyping a long message](skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-on-a-mac-keeps-retyping-a-long-message).
+
+---
+
+## 0.18.3 (2026-11-02)
+
+- **`receive_all` no longer claims a persona is the only one reading a channel in full.** The MCP instructions and `skills/EXAMPLE_CLAUDE.md` now say no other persona on this server receives every message there. Delivery is unchanged. A `CLAUDE.md` made from the template keeps the old wording until you edit it.
+- Cut-off message evidence now logs `message-partial-receipt` and qualifies the *Message not taken in* and *Delivery stuck* notices. The full message stays queued until a complete transcript receipt arrives; existing agent-director-guarded retries continue. This reports observed loss without repairing the transport or establishing its cause. See [partial receipt diagnostics](skills/debug-slack-channel-bots/SKILL.md#message-partial-receipt).
+
 ---
 
 ## 0.18.2 (2026-11-01)
@@ -331,7 +368,8 @@ Earlier releases ignore this release’s queue and can resume a bot without thei
 1. **Stop sending and empty the queues.** Wait until `server.log` shows every received item delivered. Otherwise explicitly accept that undelivered messages are lost when using the earlier release.
 2. **Disable resume on the current release.** Set `resume_enabled` to `false` in `config.json`, [confirm the pending change](docs/reload.md#confirming-a-change), and verify `config.json.last-applied` holds `resume_enabled: false`. Keep the current server running until this is applied.
    If the target release does not support these settings, first give every persona a valid declarative section (`permission_prompts`, and `channels` unless `dm.enabled` is `true`; see [Load-time rules](docs/configuration.md#load-time-rules)), remove `allow_invited_channels` and every persona’s `invited`, confirm, and ensure the last-applied record holds neither.
-   If the target release does not support `queued_ack_reaction`, remove it from `config.json`, confirm while the current server is running, and verify it is absent from `config.json.last-applied`. These precautions do not replace any phase.
+   If the target release does not support `queued_ack_reaction`, remove it from `config.json`, confirm while the current server is running, and verify it is absent from `config.json.last-applied`.
+   If the target release does not support the persona keys `model` and `effort`, remove them from every persona that sets them, confirm while the current server is running, and verify `config.json.last-applied` holds neither. These precautions do not replace any phase.
 3. **Stop with the bots, then install and pin the earlier build.** Run `claude-slack-channel-bots stop --stop-bots` and verify it succeeds, install the earlier build (for example `bun install -g claude-slack-channel-bots@<version>`), then restore its required Claude Code version pin before starting it.
 4. **Start the earlier release fresh with channels, then restore resume.** Run `claude-slack-channel-bots start`; verify every bot starts a new conversation with that release’s channels launch and no configuration load error. Only then set `resume_enabled` back to its previous value and confirm the change. The earlier build ignores `channel-delivery.json`; leave it in place.
 

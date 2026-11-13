@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import type { WebClient } from '@slack/web-api'
 import { createPersonaRouting, type AckTiming } from '../src/persona-routing.ts'
 import { durableWriteFileSync, DurableWriteUnsyncedError } from '../src/atomic-write.ts'
-import { buildTagParts, NAME_LOOKUP_TIMEOUT_MS } from '../src/tag-wrapper.ts'
+import { buildTagParts, NAME_LOOKUP_TIMEOUT_MS, TAG_MAX_BYTES, TAG_MAX_BYTES_MACOS } from '../src/tag-wrapper.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import type { AcceptedRecord, PostHoldField, QueueEvent } from '../src/delivery-queue.ts'
 import { createDeliveryReporting, MESSAGE_NOT_SAVED, buildMessageNotSavedNotice } from '../src/delivery-notices.ts'
@@ -1674,6 +1674,28 @@ test.each(['accepted-only', 'damaged-fixed'] as const)('restart prepares %s work
     await preparation.recover()
     expect(lookups).toEqual([['alpha', 'U0SENDER1']]); expect(slack.calls.conversationsInfo).toEqual([{ channel: CA }]); expect(readQueue(dir).filter(r => r.kind === 'fixed')).toHaveLength(1)
   } finally { await clock.advance(NAME_LOOKUP_TIMEOUT_MS); await preparation.stop(); await queue.stop() }
+})
+
+test.each([
+  { name: 'the injected macOS cap', tagMaxBytes: TAG_MAX_BYTES_MACOS, limit: TAG_MAX_BYTES_MACOS, count: 2 },
+  { name: 'no injection', tagMaxBytes: undefined, limit: TAG_MAX_BYTES, count: 1 },
+])('fixes durable parts within $name', async ({ tagMaxBytes, limit, count }) => {
+  const text = 'about a thousand bytes, '.repeat(42)
+  const accepted = { ...slackInput({ channel: CA, user: 'U0SENDER1', text, via: 'receive_all' }), v: 1, kind: 'accepted', seq: 1, received_at: 1700000000000, ts: '1700000000.000001' } as const
+  seedQueue(dir, [accepted])
+  const queue = await makeQueue(dir)
+  const preparation = createDeliveryPreparation({ queue, clientFor: () => undefined, resolveUserName: async () => 'sender-name', ...(tagMaxBytes === undefined ? {} : { tagMaxBytes }) })
+  try {
+    await preparation.recover()
+    const message = { chat_id: CA, channel_name: CA, message_id: accepted.ts, user: 'sender-name', user_id: 'U0SENDER1', ts: accepted.ts, via: 'receive_all', text }
+    const parts = queue.items('alpha')[0]!.fixed!.parts
+    expect(readQueue(dir).filter(r => r.kind === 'fixed')).toEqual([{ v: 1, kind: 'fixed', seq: 1, parts }])
+    expect(parts).toEqual(buildTagParts(message, limit))
+    if (tagMaxBytes === undefined) expect(parts).toEqual(buildTagParts(message))
+    expect(parts).toHaveLength(count)
+    for (const part of parts) expect(Buffer.byteLength(part)).toBeLessThanOrEqual(limit)
+    expect(parts.map(part => /^<channel [^>]*>([\s\S]*)<\/channel>$/.exec(part)![1]!).join('')).toBe(text)
+  } finally { await preparation.stop(); await queue.stop() }
 })
 
 test('hung independent lookups acknowledge within 3s, use bounded fallbacks and persist fixed bytes before waking', async () => {

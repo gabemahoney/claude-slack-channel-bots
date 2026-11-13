@@ -1,4 +1,4 @@
-/** Test32 pre-sample admission. Replay only a private copy of the real journal;
+/** Test32 and test103 pre-sample admission. Replay only a private copy of the real journal;
  * production owns candidate eligibility, while AD alone supplies agent state.
  * Importing this module performs no I/O and starts no process or timer. */
 import { execFile } from 'node:child_process'

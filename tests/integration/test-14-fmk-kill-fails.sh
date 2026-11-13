@@ -357,9 +357,13 @@ t14_row_get() {
     [[ "${AD_RC}" == 0 ]] || fail "harness get of $1 exited ${AD_RC}: $(tr '\n' ' ' < "${AD_ERR}")"
 }
 
-# t14_row_state <id>: print the row's state (`status`), or nothing when the
-# read fails.
+# t14_row_state <id>: print the passive store state from 0.18.0, otherwise
+# a harness `status`; nothing when absent or the legacy read fails.
 t14_row_state() {
+    if ad_release_at_least 0.18.0; then
+        ad_store_peek "$1" | jq -r '.state // empty'
+        return 0
+    fi
     ad_capture status --instance-id "$1"
     [[ "${AD_RC}" == 0 ]] || return 0
     jq -r '.state // empty' "${AD_OUT}" 2> /dev/null || true
@@ -371,6 +375,12 @@ t14_row_is() {
 
 # True when the row reads `pending` with a launch start.
 t14_row_pending_launched() {
+    if ad_release_at_least 0.18.0; then
+        AD_OUT="${SCENARIO_ROOT}/t14-pending-row.json"
+        ad_store_peek "$1" > "${AD_OUT}" || exit 1
+        jq -e '.state == "pending" and (.launch_started_at // "" | length > 0)' "${AD_OUT}" > /dev/null
+        return
+    fi
     ad_capture status --instance-id "$1"
     [[ "${AD_RC}" == 0 ]] || return 1
     jq -e '.state == "pending" and (.launch_started_at // "" | length > 0)' "${AD_OUT}" > /dev/null 2>&1
@@ -405,6 +415,7 @@ t14_count_after_at_least() {
 # t14_mark: the leg's start mark: the time, and the lines server.log,
 # startup-errors.log and the Slack stub's record hold.
 t14_mark() {
+    MARK_AD="$(ad_shim_mark)"
     MARK_TIME="${EPOCHREALTIME/,/.}"
     MARK_LOG="$(t14_lines "${SLACK_STATE_DIR}/server.log")"
     MARK_ERRORS="$(t14_lines "${SLACK_STATE_DIR}/startup-errors.log")"
@@ -528,6 +539,13 @@ t14_count_posts_holding() {
 
 t14_post_arrived() {
     (( $(t14_count_posts "$1" "$2" "$3") >= 1 ))
+}
+
+# Like t14_post_arrived, for the first line of a notice whose AD description
+# is variable. Keep the destination check as well as the text check.
+t14_post_holding_arrived() {
+    t14_posts_after "$1" | jq -e -s --arg c "$2" --arg t "$3" \
+        'any(.[]; .channel == $c and ((.text // "") | contains($t)))' > /dev/null
 }
 
 # t14_no_new_post_hold <line> <count> <channel> <hold-s> <step>: for <hold-s>
@@ -810,19 +828,24 @@ t14_no_records_about() {
 # t14_check_summary <step>: exactly one start-sweep summary line after the
 # leg's mark, one the printer renders for four rows listed, <k> killed, the
 # other 3 - <k> live strays kept with their kills failed (A's at least), one
-# key recorded as retired and one row left for a latch; <k> is logged.
+# key recorded as retired and one row left for a latch; from 0.18.0 P
+# is missing and kept too, with no row left for a latch. <k> is logged.
 t14_check_summary() {
     local step="$1" k line n found=""
     n="$(t14_count_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "${SUMMARY_HEAD}")"
     for (( k = 0; k <= 2; k++ )); do
-        t14_value line startSweepSummaryLine 4 "${k}" "$(( 3 - k ))" "$(( 3 - k ))" 1 1
+        if ad_release_at_least 0.18.0; then
+            t14_value line startSweepSummaryLine 4 "${k}" "$(( 4 - k ))" "$(( 3 - k ))" 1 0
+        else
+            t14_value line startSweepSummaryLine 4 "${k}" "$(( 3 - k ))" "$(( 3 - k ))" 1 1
+        fi
         if [[ "$(t14_count_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "${line}")" == 1 ]]; then
             found="${line}"
         fi
     done
     if [[ "${n}" != 1 || -z "${found}" ]]; then
         t14_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" | grep -F -- "${SUMMARY_HEAD}" | sed 's/^/  | /' >&2 || true
-        fail "${step}: ${n} start-sweep summary line(s), not one for 4 listed, the live strays not killed kept with their kills failed, 1 recorded as retired and 1 left for a latch"
+        fail "${step}: ${n} start-sweep summary line(s), not one for 4 listed, the live strays not killed kept with their kills failed, 1 recorded as retired and the version-appropriate kept/latch counts"
     fi
     echo "${TEST_NAME}: NOTE: ${step}: the start sweep's summary: ${found}"
 }
@@ -999,16 +1022,24 @@ t14_upgrade_fixture_reported() {
 
 leg_upgrade_sweep() {
     local step="upgrade start sweep" ua_state id m n before kills entry_head alert expected prefix body
-    local ids sid pane head tail
+    local ids sid pane head tail p_row tick caller pos time verb role latch_case latch_op reuse_calls
 
     for id in "${UA_ID}" "${UB_ID}" "${Q_ID}"; do
         wait_until "${ROW_WAIT_S}" "${step}: rebuilt ${id} did not report in" t14_upgrade_fixture_reported "${id}"
     done
     # After migration and fixture reconstruction: P is injected as `pending`
     # with no launch start; the other released workers report in and run.
-    ad_capture status --instance-id "${P_ID}"
-    [[ "${AD_RC}" == 0 ]] && jq -e '.state == "pending" and ((.launch_started_at // "") == "")' "${AD_OUT}" > /dev/null \
-        || fail "${step}: after the migration ${P_ID} does not read pending with no launch start: $(tr '\n' ' ' < "${AD_OUT}" "${AD_ERR}")"
+    # From 0.18.0 a status read would check the row and mark it missing (a
+    # pending row with no launch start is past its grace): the store is read.
+    if ad_release_at_least 0.18.0; then
+        p_row="$(ad_store_peek "${P_ID}")" || exit 1
+        jq -e '.state == "pending" and ((.launch_started_at // "") == "")' <<< "${p_row}" > /dev/null 2>&1 \
+            || fail "${step}: after the migration the store does not hold ${P_ID} pending with no launch start: ${p_row}"
+    else
+        ad_capture status --instance-id "${P_ID}"
+        [[ "${AD_RC}" == 0 ]] && jq -e '.state == "pending" and ((.launch_started_at // "") == "")' "${AD_OUT}" > /dev/null \
+            || fail "${step}: after the migration ${P_ID} does not read pending with no launch start: $(tr '\n' ' ' < "${AD_OUT}" "${AD_ERR}")"
+    fi
     for id in "${UA_ID}" "${UB_ID}" "${Q_ID}"; do
         echo "${TEST_NAME}: ${step}: ${id} reads '$(t14_row_state "${id}")' after the migration"
     done
@@ -1035,7 +1066,8 @@ leg_upgrade_sweep() {
     wait_for_count "${m}" "$(( before + 1 ))" "${START_WAIT_S}" "${step}: the start pass never completed"
 
     # The sweep's counts: four rows listed; every live stray it did not kill
-    # kept with its kill failed; Q's key recorded; P's row left for its latch.
+    # kept with its kill failed; Q's key recorded; P left for its latch
+    # before 0.18.0, else marked missing by the list and kept without a kill.
     # B and Q are rebuilt owned launches; their observed kill outcomes are
     # still logged and checked individually, preserving the sweep's budget
     # checks while A is the deliberately targeted failure.
@@ -1077,18 +1109,46 @@ leg_upgrade_sweep() {
     echo "${TEST_NAME}: NOTE: ${step}: ${n} ${ORPHAN_LABEL} entries after the start"
 
     # P latched from its own listed row; no CSCB kill of P's row; its one
-    # launch-start-not-recorded post at its destination.
+    # launch-start-not-recorded post at its destination. From 0.18.0 the
+    # start sweep's read checks P's row and marks it missing (a CSCB call,
+    # `ad_mark_caller`): no launch-start latch/notice, but P's reuse spawn
+    # meets its old session and latches as leftover with a CONFLICT notice.
     t14_value expected startSweepLatchedFromOwnRowLine.launch-start-not-recorded "${P_NAME}" "${P_ID}"
     n="$(t14_count_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "${expected}")"
-    [[ "${n}" == 1 ]] || fail "${step}: ${n} line(s) of ${P_NAME} latched from its own listed row, not 1"
-    n="$(t14_cscb_count_since "${MARK_TIME}" kill "${P_ID}")"
-    [[ "${n}" == 0 ]] || fail "${step}: ${n} CSCB kill(s) of ${P_ID}, whose persona latched"
     t14_value prefix personaNoticePrefix "${P_NAME}"
     t14_value body launchStartNotRecordedNoticeText "${P_KEY}"
-    wait_until "${POST_WAIT_S}" "${step}: no launch-start-not-recorded post for ${P_NAME} reached ${P_CHANNEL}" \
-        t14_post_arrived "${MARK_RECORD}" "${P_CHANNEL}" "${prefix}${body}"
-    n="$(t14_count_posts "${MARK_RECORD}" "" "${prefix}${body}")"
-    [[ "${n}" == 1 ]] || fail "${step}: ${n} launch-start-not-recorded post(s) for ${P_NAME}, not 1"
+    if ad_release_at_least 0.18.0; then
+        [[ "${n}" == 0 ]] || fail "${step}: ${n} line(s) of ${P_NAME} latched from its own listed row, not none"
+        tick="$(ad_missing_tick "${P_ID}" "$(awk -v t="${MARK_TIME}" 'BEGIN { printf "%.0f", int(t * 1000) }')")" \
+            || fail "${step}: no ad.find_missing.tick record marked ${P_ID} missing after the mark"
+        caller="$(ad_mark_caller "${tick}" "${MARK_AD}")" || fail "${step}: no agent-director call after the mark could have made it: ${tick}"
+        IFS=$'\t' read -r pos time _ verb role <<< "${caller}"
+        [[ "${role}" == cscb ]] || fail "${step}: the mark's call (shim line ${pos}, ${verb} at ${time}) is not CSCB's"
+        n="$(t14_count_posts "${MARK_RECORD}" "" "${prefix}${body}")"
+        [[ "${n}" == 0 ]] || fail "${step}: ${n} launch-start-not-recorded post(s) for ${P_NAME}, not none"
+        t14_value latch_case LATCH_CASE_LEFTOVER
+        t14_value latch_op REFUSED_OPERATION_REUSE_SPAWN
+        t14_value expected conflictLatchSetLine "${P_KEY}" "${latch_case}" "${P_SESSION}" "${latch_op}" missing
+        n="$(t14_count_after "${SLACK_STATE_DIR}/server.log" "${MARK_LOG}" "${expected}")"
+        [[ "${n}" == 1 ]] || fail "${step}: ${n} leftover latch line(s) for ${P_NAME}'s reuse spawn, not 1"
+        reuse_calls="$(t14_cscb_calls_since "${MARK_TIME}" spawn "${P_ID}" | grep -F -- --reuse-finished || true)"
+        [[ "$(grep -c . <<< "${reuse_calls}" || true)" == 1 ]] \
+            || fail "${step}: P's bring-up did not make exactly one reuse spawn"
+        t14_value body conflictNoticeFirstLine "${latch_case}" "${P_SESSION}"
+        wait_until "${POST_WAIT_S}" "${step}: no leftover CONFLICT notice for ${P_NAME} reached ${P_CHANNEL}" \
+            t14_post_holding_arrived "${MARK_RECORD}" "${P_CHANNEL}" "${prefix}${body}"
+        n="$(t14_count_channel_posts "${MARK_RECORD}" "${P_CHANNEL}")"
+        [[ "${n}" == 1 ]] || fail "${step}: ${n} post(s) for ${P_NAME}, not its one leftover CONFLICT notice"
+        echo "${TEST_NAME}: ${step}: CSCB's ${verb} at shim line ${pos} marked ${P_ID} missing; ${P_NAME}'s reuse spawn latched as ${latch_case}"
+    else
+        [[ "${n}" == 1 ]] || fail "${step}: ${n} line(s) of ${P_NAME} latched from its own listed row, not 1"
+        wait_until "${POST_WAIT_S}" "${step}: no launch-start-not-recorded post for ${P_NAME} reached ${P_CHANNEL}" \
+            t14_post_arrived "${MARK_RECORD}" "${P_CHANNEL}" "${prefix}${body}"
+        n="$(t14_count_posts "${MARK_RECORD}" "" "${prefix}${body}")"
+        [[ "${n}" == 1 ]] || fail "${step}: ${n} launch-start-not-recorded post(s) for ${P_NAME}, not 1"
+    fi
+    n="$(t14_cscb_count_since "${MARK_TIME}" kill "${P_ID}")"
+    [[ "${n}" == 0 ]] || fail "${step}: ${n} CSCB kill(s) of ${P_ID}"
     t14_note_posts "${MARK_RECORD}" "${P_CHANNEL}" "${step}"
 
     # Q's key is recorded as retired, absent at the start.
@@ -1103,7 +1163,7 @@ leg_upgrade_sweep() {
         t14_row_get "${id}"
         echo "${TEST_NAME}: ${step}: ${id}'s row is kept, reading $(jq -r '.state' "${AD_OUT}")"
     done
-    # A's worker (its kill failed) and P's (latched, never killed) run.
+    # A's worker (its kill failed) and P's (never killed) run.
     t14_check_workers_have_rows "${step}" 2
     t14_no_records_about "${step}" "${UA_ID}" "${UA_SESSION}" "${UA_CHANNEL}"
 
@@ -1248,7 +1308,13 @@ t14_check_destination_alert() {
     # No delete and no launch after the first failed kill; the row kept.
     t14_no_launch_since "${first_kill}" "${id}" "${step}"
     state="$(t14_row_state "${id}")"
-    [[ -n "${state}" ]] || fail "${step}: ${id}'s row is gone: $(tr '\n' ' ' < "${AD_ERR}")"
+    if [[ -z "${state}" ]]; then
+        if ad_release_at_least 0.18.0; then
+            fail "${step}: the store has no row ${id}"
+        else
+            fail "${step}: ${id}'s row is gone: $(tr '\n' ' ' < "${AD_ERR}")"
+        fi
+    fi
     echo "${TEST_NAME}: ${step}: ${id}'s row is kept, reading ${state}"
 }
 
@@ -1395,7 +1461,13 @@ leg_persona_removal() {
     n="$(t14_cscb_count_since "${MARK_TIME}" delete "")"
     [[ "${n}" == 0 ]] || fail "${step}: ${n} CSCB delete call(s) after the edit"
     state="$(t14_row_state "${R_ID}")"
-    [[ -n "${state}" ]] || fail "${step}: ${R_ID}'s row is gone: $(tr '\n' ' ' < "${AD_ERR}")"
+    if [[ -z "${state}" ]]; then
+        if ad_release_at_least 0.18.0; then
+            fail "${step}: the store has no row ${R_ID}"
+        else
+            fail "${step}: ${R_ID}'s row is gone: $(tr '\n' ' ' < "${AD_ERR}")"
+        fi
+    fi
     echo "${TEST_NAME}: ${step}: ${R_ID}'s row is kept, reading ${state}"
     n="$(t14_retired_cause "${R_KEY}")"
     [[ "${n}" == "${CAUSE_REMOVED}" ]] || fail "${step}: the retired-key record gives ${R_KEY} the cause '${n}', not ${CAUSE_REMOVED}"

@@ -100,15 +100,277 @@
  */
 
 import { describe, expect, test } from 'bun:test'
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join, relative, resolve, sep } from 'node:path'
+import ts from 'typescript'
 
 import { BOT_TOKEN_PREFIX, LEAK_SENTINEL, TOKEN_LIKE, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
-import ts from 'typescript'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { serializeTestMeasurement, queueEventMeasurement, postHoldEventMeasurement, type TestMeasurementRecord } from '../src/test-measurements.ts'
 import { ackVerdict, storeVerdict, postHoldVerdict, n2Verdict, lookupFaultVerdicts, printResults, envelopeTimings } from './integration/fixtures/sr8-evidence.ts'
 import { percentile } from './integration/fixtures/transcript-receipts.ts'
 import { balancedAfter, callArguments, callsOf, splitTopLevel, stripComments } from './test-helpers/source-audit.ts'
+
+/** b.c13: process starts use the shared filter; entries scrub before dispatch.
+ * Follow the two CLI adapters as well as direct starts. Adapter parameters are
+ * accepted only at their named boundary; every deps call is audited separately.
+ * This scans AST calls, so comments and literals cannot satisfy the rule.
+ */
+function childEnvironmentViolations(file: string, source: string): string[] {
+  const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  // Bind this file only: symbols distinguish imports, nested locals and
+  // parameters without loading any project module or running startup code.
+  const compilerOptions: ts.CompilerOptions = { noResolve: true, noLib: true, types: [] }
+  const host = ts.createCompilerHost(compilerOptions)
+  host.getSourceFile = path => path === file ? sf : undefined
+  const checker = ts.createProgram([file], compilerOptions, host).getTypeChecker()
+  const symbol = (node: ts.Node) => ts.isIdentifier(node) && ts.isShorthandPropertyAssignment(node.parent)
+    ? checker.getShorthandAssignmentValueSymbol(node.parent) : checker.getSymbolAtLocation(node)
+  const failures: string[] = []
+  const processFunctions = new Set<string>()
+  const namespaces = new Set<string>()
+  const envBuilders = new Set<ts.Symbol>()
+  const scrubbers = new Set<ts.Symbol>()
+  const processVerbs = /^(?:spawn(?:Sync)?|exec(?:Sync|File|FileSync)?|fork)$/
+  for (const statement of sf.statements) {
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) continue
+    const specifier = statement.moduleSpecifier.text
+    const bindings = statement.importClause?.namedBindings
+    if (/^(?:node:)?child_process$/.test(specifier)) {
+      if (bindings && ts.isNamespaceImport(bindings)) namespaces.add(bindings.name.text)
+      if (bindings && ts.isNamedImports(bindings)) for (const item of bindings.elements) {
+        if (processVerbs.test((item.propertyName ?? item.name).text)) processFunctions.add(item.name.text)
+      }
+      if (statement.importClause?.name) namespaces.add(statement.importClause.name.text)
+    }
+    if (/^\.\.?\/child-env(?:\.ts)?$/.test(specifier) && bindings && ts.isNamedImports(bindings)) {
+      for (const item of bindings.elements) {
+        const name = (item.propertyName ?? item.name).text
+        const binding = symbol(item.name)
+        if (binding && name === 'childEnv') envBuilders.add(binding)
+        if (binding && name === 'scrubProcessEnv') scrubbers.add(binding)
+      }
+    }
+  }
+  const importedCall = (node: ts.Node | undefined, imports: Set<ts.Symbol>): node is ts.CallExpression =>
+    !!node && ts.isCallExpression(node) && ts.isIdentifier(node.expression)
+    && !!symbol(node.expression) && imports.has(symbol(node.expression)!)
+  const directBuilder = (node: ts.Node | undefined): boolean => importedCall(node, envBuilders)
+  const isProcessEnv = (node: ts.Node | undefined): boolean => !!node && ts.isPropertyAccessExpression(node)
+    && node.name.text === 'env' && ts.isIdentifier(node.expression) && node.expression.text === 'process'
+    && !symbol(node.expression) // a local `process` would scrub a different object
+  function processCall(node: ts.CallExpression): boolean {
+    const callee = node.expression
+    return ts.isIdentifier(callee) && processFunctions.has(callee.text)
+      || ts.isPropertyAccessExpression(callee) && processVerbs.test(callee.name.text)
+        && (namespaces.has(callee.expression.getText(sf)) || callee.expression.getText(sf) === 'Bun')
+  }
+  function depsCall(node: ts.CallExpression, name: string): boolean {
+    return ts.isPropertyAccessExpression(node.expression) && node.expression.expression.getText(sf) === 'deps'
+      && node.expression.name.text === name
+  }
+  // An environment may only flow straight to an audited process boundary.
+  // Any other reference could mutate it or hand an alias to unknown code.
+  function envUse(node: ts.Identifier): boolean {
+    let property: ts.Node = node.parent
+    if (ts.isShorthandPropertyAssignment(property) && property.name.text === 'env') property = property.parent
+    else if (ts.isPropertyAssignment(property) && property.initializer === node && property.name.getText(sf) === 'env') property = property.parent
+    if (ts.isObjectLiteralExpression(property) && ts.isCallExpression(property.parent)
+      && property.parent.arguments.includes(property)) {
+      return processCall(property.parent) || depsCall(property.parent, 'spawnDaemon')
+    }
+    return ts.isCallExpression(node.parent)
+      && (depsCall(node.parent, 'spawnSync') && node.parent.arguments[2] === node
+        || depsCall(node.parent, 'runCredentialsScript') && node.parent.arguments[1] === node)
+  }
+  function onlyEnvUses(binding: ts.Symbol, declaration: ts.Identifier): boolean {
+    let safe = true
+    function visit(node: ts.Node) {
+      if (ts.isIdentifier(node) && node !== declaration && symbol(node) === binding && !envUse(node)) safe = false
+      ts.forEachChild(node, visit)
+    }
+    visit(sf)
+    return safe
+  }
+  function builtEnv(node: ts.Node | undefined): boolean {
+    if (directBuilder(node)) return true
+    if (!node || !ts.isIdentifier(node)) return false
+    const binding = symbol(node)
+    if (!binding || binding.declarations?.length !== 1) return false
+    const declaration = binding.declarations[0]!
+    return ts.isVariableDeclaration(declaration) && ts.isIdentifier(declaration.name)
+      && ts.isVariableDeclarationList(declaration.parent) && !!(declaration.parent.flags & ts.NodeFlags.Const)
+      && declaration.end < node.pos && directBuilder(declaration.initializer)
+      && onlyEnvUses(binding, declaration.name)
+  }
+  function realDepsProperty(node: ts.Node, name: string): boolean {
+    if (!(ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node)) || node.name.getText(sf) !== name) return false
+    const object = node.parent
+    const declaration = object.parent
+    if (!ts.isObjectLiteralExpression(object) || !ts.isVariableDeclaration(declaration)
+      || declaration.initializer !== object || declaration.name.getText(sf) !== 'realDeps') return false
+    // These are precisely the production adapters inside the main entry,
+    // never another object or a nested function with a familiar name.
+    const statement = declaration.parent.parent
+    return ts.isVariableStatement(statement) && ts.isBlock(statement.parent)
+      && ts.isIfStatement(statement.parent.parent) && statement.parent.parent.parent === sf
+      && statement.parent.parent.expression.getText(sf) === 'import.meta.main'
+  }
+  function credentialsAdapter(declaration: ts.FunctionDeclaration): boolean {
+    if (declaration.parent !== sf || declaration.name?.text !== 'runCredentialsScript') return false
+    const binding = symbol(declaration.name)
+    let safe = true
+    function references(node: ts.Node) {
+      if (ts.isIdentifier(node) && node !== declaration.name && symbol(node) === binding
+        && !realDepsProperty(node.parent, 'runCredentialsScript')) safe = false
+      ts.forEachChild(node, references)
+    }
+    references(sf)
+    return safe
+  }
+  function adapterParameter(node: ts.Node, value: ts.Node): boolean {
+    if (!ts.isIdentifier(value) || file !== 'src/cli.ts') return false
+    const binding = symbol(value)
+    if (!binding) return false
+    const matches = (parameter: ts.ParameterDeclaration | undefined): boolean => !!parameter
+      && ts.isIdentifier(parameter.name) && symbol(parameter.name) === binding && onlyEnvUses(binding, parameter.name)
+    for (let parent: ts.Node | undefined = node.parent; parent; parent = parent.parent) {
+      if (ts.isArrowFunction(parent) && realDepsProperty(parent.parent, 'spawnSync') && matches(parent.parameters[2])) return true
+      if (ts.isFunctionDeclaration(parent) && credentialsAdapter(parent)
+        && matches(parent.parameters[1])) return true
+    }
+    return false
+  }
+  function optionsClean(node: ts.Node | undefined): boolean {
+    if (!node || !ts.isObjectLiteralExpression(node)) return false
+    const envs = node.properties.filter(prop => !ts.isSpreadAssignment(prop) && prop.name?.getText(sf) === 'env')
+    if (envs.length !== 1 || node.properties.some(ts.isSpreadAssignment)) return false
+    const prop = envs[0]!
+    const value = ts.isPropertyAssignment(prop) ? prop.initializer : ts.isShorthandPropertyAssignment(prop) ? prop.name : undefined
+    return builtEnv(value) || !!value && adapterParameter(node, value)
+  }
+  function daemonForwarder(call: ts.CallExpression): boolean {
+    const arrow = call.parent
+    return file === 'src/cli.ts' && ts.isArrowFunction(arrow)
+      && realDepsProperty(arrow.parent, 'spawnDaemon')
+      && call.arguments.length === 3 && arrow.parameters.length === 3
+      && call.arguments.every((arg, i) => ts.isIdentifier(arg) && arg.text === arrow.parameters[i]?.name.getText(sf))
+  }
+  const report = (rule: string) => failures.push(`${file}: ${rule}`)
+  function visit(node: ts.Node) {
+    if (ts.isCallExpression(node)) {
+      const callee = node.expression
+      const direct = ts.isIdentifier(callee) && processFunctions.has(callee.text)
+      const method = ts.isPropertyAccessExpression(callee) && processVerbs.test(callee.name.text)
+        && (namespaces.has(callee.expression.getText(sf)) || callee.expression.getText(sf) === 'Bun')
+      if (direct || method) {
+        const options = node.arguments.find(ts.isObjectLiteralExpression)
+        if (!optionsClean(options) && !daemonForwarder(node)) report('child process without childEnv')
+      }
+      if (ts.isPropertyAccessExpression(callee) && callee.expression.getText(sf) === 'deps') {
+        if (callee.name.text === 'spawnDaemon' && !optionsClean(node.arguments[2])) report('daemon env without childEnv')
+        if (callee.name.text === 'spawnSync' && !builtEnv(node.arguments[2])) report('CLI rerun env without childEnv')
+        if (callee.name.text === 'runCredentialsScript' && !builtEnv(node.arguments[1])) report('credentials env without childEnv')
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sf)
+  if (file === 'src/cli.ts' || file === 'src/server.ts') {
+    const entries = sf.statements.filter((s): s is ts.IfStatement => ts.isIfStatement(s) && s.expression.getText(sf) === 'import.meta.main')
+    if (entries.length !== 1) report('missing main entry scrub')
+    for (const entry of entries) {
+      const first = ts.isBlock(entry.thenStatement) ? entry.thenStatement.statements[0] : undefined
+      const call = first && ts.isExpressionStatement(first) && ts.isCallExpression(first.expression) ? first.expression : undefined
+      if (!importedCall(call, scrubbers) || call.arguments.length > 2
+        || call.arguments.length > 0 && !isProcessEnv(call.arguments[0])) report('entry must scrub process.env before dispatch')
+    }
+  }
+  return failures
+}
+
+describe('b.c13 source environment audit', () => {
+  test('every src process boundary and both main entries use the shared filter', () => {
+    const failures: string[] = []
+    for (const path of walk(join(ROOT, 'src')).filter(path => path.endsWith('.ts'))) {
+      failures.push(...childEnvironmentViolations(relative(ROOT, path).split(sep).join('/'), readFileSync(path, 'utf8')))
+    }
+    assertNoLeak(failures)
+    expect(failures).toEqual([])
+  })
+
+  const imports = "import { childEnv, scrubProcessEnv } from './child-env.ts';"
+  test.each([
+    "import { spawn } from 'child_process'; spawn('tool', []);",
+    "import { spawnSync as launch } from 'node:child_process'; launch('tool', [], {env:process.env});",
+    "import * as cp from 'node:child_process'; cp.execFile('tool', [], {env:{...process.env}});",
+    "import cp from 'node:child_process'; cp.execSync('tool', {env:process.env});",
+    "Bun.spawn(['tool']);", "Bun.spawnSync({cmd:['tool'], env:process.env});",
+    "import { spawn } from 'child_process'; spawn('tool', [], {env:childEnv(process.env), ...unsafe});",
+    "import { spawn } from 'child_process'; spawn('tool', [], {env:{...childEnv(process.env), SLACK_BOT_TOKEN:'fake-not-a-token'}});",
+    "deps.spawnSync('tool', [], process.env);",
+    "deps.spawnDaemon('tool', [], {env:process.env});",
+    "deps.runCredentialsScript(path, process.env);",
+  ])('rejects planted unfiltered process boundary %#', source => {
+    expect(childEnvironmentViolations('src/planted.ts', `${imports}\n${source}`)).not.toEqual([])
+  })
+  test.each(['src/cli.ts', 'src/server.ts'])('%s rejects absent, late, comment-only and literal-only entry scrubs', file => {
+    for (const body of ['', 'dispatch(); scrubProcessEnv();', '/* scrubProcessEnv(); */ dispatch();', '"scrubProcessEnv()"; dispatch();']) {
+      expect(childEnvironmentViolations(file, `${imports}\nif (import.meta.main) {${body}}`)).not.toEqual([])
+    }
+    expect(childEnvironmentViolations(file, `${imports}\nif (import.meta.main) { scrubProcessEnv(); dispatch(); }`)).toEqual([])
+  })
+  test.each([
+    'let clean = childEnv(process.env); clean = process.env; Bun.spawn({cmd:[], env:clean});',
+    'const clean = childEnv(process.env); function launch(clean) { Bun.spawn({cmd:[], env:clean}); }',
+    'const clean = childEnv(process.env); { const clean = process.env; Bun.spawn({cmd:[], env:clean}); }',
+    'function seed() { const clean = childEnv(process.env); } const clean = process.env; Bun.spawn({cmd:[], env:clean});',
+    'const clean = childEnv(process.env); clean.SLACK_BOT_TOKEN = "fake-not-a-token"; Bun.spawn({cmd:[], env:clean});',
+    'const clean = childEnv(process.env); Object.assign(clean, process.env); Bun.spawn({cmd:[], env:clean});',
+    'const clean = childEnv(process.env); const alias = clean; alias.X = "fake-not-a-token"; Bun.spawn({cmd:[], env:clean});',
+    'const clean = childEnv(process.env); const holder = {env: clean}; holder.env.X = "fake-not-a-token"; Bun.spawn({cmd:[], env:clean});',
+    'function launch(childEnv) { Bun.spawn({cmd:[], env:childEnv(process.env)}); }',
+    'Bun.spawn({cmd:[], env:clean}); const clean = childEnv(process.env);',
+  ])('rejects a binding that cannot prove a filtered environment %#', source => {
+    expect(childEnvironmentViolations('src/planted.ts', `${imports}\n${source}`)).toContain('src/planted.ts: child process without childEnv')
+  })
+  test.each(['src/cli.ts', 'src/server.ts'])('%s rejects a scrub of any other object or a shadowed process', file => {
+    for (const argument of ['{}', 'otherEnv', 'undefined']) {
+      expect(childEnvironmentViolations(file, `${imports}\nif (import.meta.main) { scrubProcessEnv(${argument}); dispatch(); }`))
+        .toContain(`${file}: entry must scrub process.env before dispatch`)
+    }
+    expect(childEnvironmentViolations(file, `${imports}\nconst process = {env:{}}; if (import.meta.main) { scrubProcessEnv(process.env); }`))
+      .toContain(`${file}: entry must scrub process.env before dispatch`)
+    expect(childEnvironmentViolations(file, `${imports}\nif (import.meta.main) { scrubProcessEnv(process.env); dispatch(); }`)).toEqual([])
+  })
+  test.each([
+    'const realDeps = { spawnSync: (cmd, args, env) => { env = process.env; return spawnSync(cmd, args, {env}); } };',
+    'function runCredentialsScript(path, env) { function nested(env) { return spawnSync("bash", [path], {env}); } }',
+    'function runCredentialsScript(path, env) { env.SLACK_BOT_TOKEN = "fake-not-a-token"; return spawnSync("bash", [path], {env}); }',
+    'function outside() { function runCredentialsScript(path, env) { return spawnSync("bash", [path], {env}); } }',
+    'const other = { spawnSync: (cmd, args, env) => spawnSync(cmd, args, {env}) };',
+    'function runCredentialsScript(path, env) { return spawnSync("bash", [path], {env}); } runCredentialsScript(path, process.env);',
+  ])('rejects reassigned, shadowed or mutated CLI adapter parameters %#', source => {
+    expect(childEnvironmentViolations('src/cli.ts', `${imports}\nimport {spawnSync} from 'child_process';\n${source}\nif (import.meta.main) {scrubProcessEnv(process.env);}`))
+      .toContain('src/cli.ts: child process without childEnv')
+  })
+  test('accepts direct and prebuilt filtered envs, import aliases and Bun command objects', () => {
+    expect(childEnvironmentViolations('src/filtered.ts', `${imports}
+      import { spawn as launch, execFileSync } from 'node:child_process';
+      const clean = childEnv(process.env);
+      launch('tool', [], {env: clean}); execFileSync('tool', [], {env:childEnv(process.env)});
+      Bun.spawn({cmd:['tool'], env:childEnv(process.env)});
+    `)).toEqual([])
+  })
+  test('resolves helper import aliases and separate lexical bindings', () => {
+    expect(childEnvironmentViolations('src/filtered.ts', `import { childEnv as copyEnv } from './child-env.ts';
+      const clean = copyEnv(process.env); Bun.spawn({cmd:[], env:clean});
+      function nested() { const clean = copyEnv(process.env); Bun.spawn({cmd:[], env:clean}); }
+    `)).toEqual([])
+  })
+})
 
 /** The repository root (the parent of tests/). */
 const ROOT = resolve(import.meta.dir, '..')
@@ -1499,5 +1761,105 @@ describe("a caught error's text reaches a log line under src/ only redacted (sec
     const declared = (name: string): boolean =>
       SOURCE_FILES.some((file) => new RegExp(`\\bfunction\\s+${name}\\s*\\(`).test(codeOf(file)))
     expect(SAFE_DESCRIBERS.filter((name) => !declared(name))).toEqual([])
+  })
+})
+
+describe('b.c13 first tmux create provenance', () => {
+  const scenario = readFileSync(join(ROOT, 'tests/integration/lib/scenario.sh'), 'utf8')
+  const test21 = readFileSync(join(ROOT, 'tests/integration/test-21-fmk-teardown.sh'), 'utf8')
+  const socket = '/scratch/scenario/tmux/default'
+  const declaration = (name: string, source = scenario) => {
+    const match = source.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))
+    if (!match) throw new Error(`Missing fixture declaration ${name}`)
+    return match[0]
+  }
+  const helpers = [
+    '_scenario_to_us', '_scenario_record_load', '_scenario_role_at', '_scenario_split_line',
+    '_scenario_eval_words', '_scenario_decode_words', '_scenario_ad_verb', '_scenario_ad_id',
+    '_scenario_shim_diagnostic', '_scenario_read_log', '_scenario_query_prep',
+    '_scenario_cscb_tmux_scan', 'cscb_tmux_count',
+  ].map(name => declaration(name)).join('\n')
+  const line = (time: string, pid: number, ppid: number, parent: string, words: string) =>
+    `call\t${time}\t${pid}\t${ppid}\t${parent}\t${words}\n`
+  const ad = ({ time = '100.100000', pid = 100, ppid = 42, verb = 'spawn', id = 'cscb_alpha' } = {}) =>
+    line(time, pid, ppid, '/scratch/bun /scratch/src/server.ts', `${verb} --instance-id ${id}`)
+  const tmux = ({ time = '100.200000', ppid = 100, parent = '/scratch/agent-director.real spawn --instance-id cscb_alpha',
+    target = socket, command = 'new-session -d -s cscb_alpha' } = {}) =>
+    line(time, 101, ppid, parent, `-u -S ${target} ${command}`)
+  interface Evidence { ad?: string; tmux?: string; record?: string }
+  // Only extracted declarations run, against synthetic shim logs and a fake
+  // process record. No integration harness, AD, tmux or real process probe runs.
+  function run(evidence: Evidence = {}, directCounter = false) {
+    const root = mkdtempSync(join(tmpdir(), 'cscb-first-create-'))
+    try {
+      writeFileSync(join(root, 'ad'), evidence.ad ?? ad())
+      writeFileSync(join(root, 'tmux'), evidence.tmux ?? tmux())
+      writeFileSync(join(root, 'record'), evidence.record ?? 'proc\tserver\t42\t99\t99.000000\n')
+      const script = `set -euo pipefail
+SCENARIO_FMK=1
+SCENARIO_CSCB_RECORD="$HOME/record"
+_SCENARIO_REAL_CSCB_RECORD="$HOME/unused-original"
+SCENARIO_AD_SHIM_LOG="$HOME/ad"
+SCENARIO_TMUX_SHIM_LOG="$HOME/tmux"
+A_ID=cscb_alpha B_ID=cscb_bravo
+fail() { printf '%s\\n' "$*" >&2; exit 1; }
+require_ci_image() { :; }
+require_scenario_home() { :; }
+_scenario_cscb_after() { fail 'unexpected real process probe'; }
+${helpers}
+${declaration('t21_assert_first_tmux_create', test21)}
+${directCounter ? 'cscb_tmux_count new-session' : ''}
+t21_assert_first_tmux_create '${socket}'
+`
+      const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-c', script], {
+        env: hostSafeChildEnv(root, { tools: [] }), encoding: 'utf8', timeout: 5_000,
+      })
+      expect(result.error).toBeUndefined()
+      expect(result.signal).toBeNull()
+      assertNoLeak({ stdout: result.stdout, stderr: result.stderr })
+      return { status: result.status, stdout: result.stdout, stderr: result.stderr }
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  }
+
+  test('accepts the CSCB server -> AD -> tmux create that the direct-parent counter counts as zero', () => {
+    expect(run({}, true)).toEqual({ status: 0, stdout: '0\n', stderr: '' })
+  })
+  test('accepts a start-server create through the same AD-owned chain', () => {
+    expect(run({ tmux: tmux({ command: 'start-server \\; source-file -' }) })).toEqual({ status: 0, stdout: '', stderr: '' })
+  })
+  test('accepts either of the first two persona spawns', () => {
+    expect(run({ ad: ad({ id: 'cscb_bravo' }) })).toEqual({ status: 0, stdout: '', stderr: '' })
+  })
+  test.each<[string, Evidence, string]>([
+    ['empty tmux log', { tmux: '' }, 'no scenario-socket tmux create'],
+    ['empty AD log', { ad: '' }, 'no preceding CSCB-server persona spawn'],
+    ['harness-owned AD', { ad: ad({ ppid: 84 }) }, 'no preceding CSCB-server persona spawn'],
+    ['unrelated persona', { ad: ad({ id: 'cscb_foreign' }) }, 'no preceding CSCB-server persona spawn'],
+    ['non-launch AD verb', { ad: ad({ verb: 'get' }) }, 'no preceding CSCB-server persona spawn'],
+    ['AD call after create', { ad: ad({ time: '100.300000' }) }, 'no preceding CSCB-server persona spawn'],
+    ['different AD PID', { ad: ad({ pid: 102 }) }, 'no preceding CSCB-server persona spawn'],
+    ['expired CSCB PID', { record: 'proc\tserver\t42\t99\t99.000000\ngone\t42\t99\t100.000000\n' }, 'no preceding CSCB-server persona spawn'],
+    ['direct CSCB tmux', { tmux: tmux({ ppid: 42, parent: '/scratch/bun /scratch/src/server.ts' }) }, 'no preceding CSCB-server persona spawn'],
+    ['spoofed parent executable', { tmux: tmux({ parent: '/scratch/other' }) }, 'not made by agent-director'],
+    ['other socket', { tmux: tmux({ target: '/foreign/socket' }) }, 'no scenario-socket tmux create'],
+    ['only a read call', { tmux: tmux({ command: 'list-sessions' }) }, 'no scenario-socket tmux create'],
+    ['reused AD PID now owned by harness', { ad: ad() + ad({ time: '100.150000', ppid: 84 }) }, 'no preceding CSCB-server persona spawn'],
+    ['foreign first create followed by valid create', {
+      ad: ad({ ppid: 84 }) + ad({ time: '100.250000', pid: 200 }),
+      tmux: tmux() + tmux({ time: '100.300000', ppid: 200 }),
+    }, 'no preceding CSCB-server persona spawn'],
+  ])('rejects %s', (_label, evidence, message) => {
+    const result = run(evidence)
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain(message)
+  })
+  test('the boundary retains the unseeded-socket and complete names-only environment assertions', () => {
+    const boundary = declaration('t21_precheck_legs', test21).split('# The harness respawns')[0]!
+    expect(boundary).toContain('[[ ! -S "${socket}" ]]')
+    expect(boundary).toContain('[[ ! -s "${SCENARIO_TMUX_SHIM_LOG}" ]]')
+    expect(boundary).toContain('t21_assert_first_tmux_create "${socket}"')
+    expect(boundary).toContain('show-environment -g | cut -d= -f1')
+    expect(boundary).toContain("'^SLACK_.*(TOKEN|SECRET)$|^_CLI_DAEMON_CHILD$'")
+    expect(boundary).toContain('grep -qxF GH_TOKEN')
   })
 })

@@ -1,4 +1,4 @@
-/** real intake/queue/engine/reporting/reply, in-process Slack and AD. */
+/** real intake/queue/engine/reporting/reply/react, in-process Slack and AD. */
 import { Client as McpClient } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { _resetAckTracker, createQueuedAckCallback, createDeliveryAckCallback, consumeAck } from '../../src/ack-tracker.ts'
@@ -150,28 +150,11 @@ export async function makeQueuedAckHarness() {
       try { await preparation.recover() } finally { await preparation.stop() }
       await e.clock.flush()
     },
-    async reply(args: Record<string, unknown> = {}, key = 'alpha') {
-      let client = clients.get(key)
-      if (!client) {
-        const server = createSessionServer(entries.get(key)!, {
-          getChannelDelivery: () => choices,
-          assertSendable: () => {}, getReplySettings: () => settings,
-          getPersona: personaKey => n.config.personas.find(p => p.key === personaKey),
-          clientFor: personaKey => asWebClient(clientFor(personaKey)),
-          resolveUserName: async (_key, user) => user, inboxDir: e.root,
-          consumeAck, serverPort: 0, log: line => n.logs.push(line),
-        })
-        servers.push(server)
-        const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair()
-        await server.connect(serverTransport)
-        client = new McpClient({ name: 'queued-ack-test', version: '1.0.0' }, { capabilities: {} })
-        clients.set(key, client)
-        await client.connect(clientTransport)
-      }
-      const result = await client.callTool({ name: 'reply', arguments: { chat_id: event.channel, message_id: event.ts, text: 'answer', ...args } })
-      await e.clock.flush()
-      assertNoLeak(result)
-      return result
+    reply(args: Record<string, unknown> = {}, key = 'alpha') {
+      return callTool('reply', { chat_id: event.channel, message_id: event.ts, text: 'answer', ...args }, key)
+    },
+    react(args: Record<string, unknown> = {}, key = 'alpha') {
+      return callTool('react', { chat_id: event.channel, message_id: event.ts, emoji: 'thumbsup', ...args }, key)
     },
     async cleanup() {
       for (const call of held) if (!call.settled) call.settle()
@@ -184,6 +167,29 @@ export async function makeQueuedAckHarness() {
       assertNoLeak({ logs: n.logs, posts: n.h.allPosts() })
       await n.cleanup()
     },
+  }
+  async function callTool(name: string, args: Record<string, unknown>, key: string) {
+    let client = clients.get(key)
+    if (!client) {
+      const server = createSessionServer(entries.get(key)!, {
+        getChannelDelivery: () => choices,
+        assertSendable: () => {}, getReplySettings: () => settings,
+        getPersona: personaKey => n.config.personas.find(p => p.key === personaKey),
+        clientFor: personaKey => asWebClient(clientFor(personaKey)),
+        resolveUserName: async (_key, user) => user, inboxDir: e.root,
+        consumeAck, serverPort: 0, log: line => n.logs.push(line),
+      })
+      servers.push(server)
+      const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair()
+      await server.connect(serverTransport)
+      client = new McpClient({ name: 'queued-ack-test', version: '1.0.0' }, { capabilities: {} })
+      clients.set(key, client)
+      await client.connect(clientTransport)
+    }
+    const result = await client.callTool({ name, arguments: args })
+    await e.clock.flush()
+    assertNoLeak(result)
+    return result
   }
   return h
 }

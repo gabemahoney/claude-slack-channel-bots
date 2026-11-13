@@ -114,7 +114,8 @@
  * - the collision ladder's replacement sites (the session
  *     manager's replace step, `replacePersonaRow`): a row the ladder cannot
  *     keep (`resume_enabled` false, a `cwd` mismatch, a `config_dir` label
- *     missing or different, the last at a resume and at a `pending` row,
+ *     missing or different, at a resume and at a `pending` row, a `model`
+ *     or `effort` that differs from the row's Start Labels, at a resume only,
  *     or a retired key's old life: a live row, `pending` included, of a key
  * recorded as retired with no "new life has begun" mark)
  *     that it last read live, `pending` included: the collision `get`'s or a
@@ -178,6 +179,7 @@ import {
 } from './kill-retry.ts'
 import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE } from './liveness-reading.ts'
 import { describeLogMessage, describeThrownValue, isSafeIdentifier, renderLogMessageText } from './persona-connection-errors.ts'
+import type { StartLabelKey } from './persona-identity.ts'
 import { PENDING_ROW_WAIT_NOT_ARMED, armPendingRowWait, parseLaunchStart, type PendingRowWaitArm } from './pending-row.ts'
 
 // ---------------------------------------------------------------------------
@@ -392,6 +394,8 @@ export const LIVE_ROW_LAUNCH_REASON_RESUME_DISABLED = 'resume_enabled is false'
 export const LIVE_ROW_LAUNCH_REASON_CWD_MISMATCH = "the row's cwd differs from the persona's working directory"
 /** Reuse: the row's `config_dir` label is missing or differs. */
 export const LIVE_ROW_LAUNCH_REASON_CONFIG_DIR_MISMATCH = "the row's config_dir label is missing or differs"
+/** Reuse: the row's Start Labels differ from the persona's `model` or `effort`. */
+export const LIVE_ROW_LAUNCH_REASON_START_VALUES_DIFFER = "the row's model or effort differs from the persona's"
 
 /** Why step 6 launches as it does. */
 export type LiveRowSequenceLaunchReason =
@@ -404,6 +408,7 @@ export type LiveRowSequenceLaunchReason =
   | typeof LIVE_ROW_LAUNCH_REASON_RESUME_DISABLED
   | typeof LIVE_ROW_LAUNCH_REASON_CWD_MISMATCH
   | typeof LIVE_ROW_LAUNCH_REASON_CONFIG_DIR_MISMATCH
+  | typeof LIVE_ROW_LAUNCH_REASON_START_VALUES_DIFFER
 
 /**
  * P's facts for step 6, from the applied configuration and the existing row
@@ -413,12 +418,16 @@ export type LiveRowSequenceLaunchReason =
  * retired-key store's reading at step 6: true while P's key is
  * recorded, marked or not, so a key recorded after the sequence started
  * still ends in a reuse, never a `resume`; absent reads as not recorded.
+ * `startValuesDiffering` lists the Start Values (`model` before `effort`)
+ * whose row labels differ from P's values; absent or empty when none do,
+ * and so with no row.
  */
 export interface LiveRowSequencePersonaFacts {
   readonly resumeEnabled: boolean
   readonly cwdMatches: boolean
   readonly configDirMatches: boolean
   readonly retired?: boolean
+  readonly startValuesDiffering?: readonly StartLabelKey[]
 }
 
 /** What step 6's decision is given. */
@@ -440,9 +449,10 @@ export interface LiveRowLaunchKindDecision {
 /**
  * Step 6's launch kind: `resume` only when the request keeps P's
  * conversation, the key is not retired, a row was read and carries a
- * non-empty session id, P is applied with `resume_enabled` true, and the
- * row's `cwd` and `config_dir` label match P; `reuse` in every other case,
- * with the first reason that holds. Pure; never throws.
+ * non-empty session id, P is applied with `resume_enabled` true, the
+ * row's `cwd` and `config_dir` label match P, and no Start Value differs
+ * (the last check before the `resume`); `reuse` in every other case, with
+ * the first reason that holds. Pure; never throws.
  */
 export function decideLiveRowLaunchKind(input: LiveRowLaunchKindInput): LiveRowLaunchKindDecision {
   const reuse = (reason: LiveRowSequenceLaunchReason): LiveRowLaunchKindDecision => ({ kind: LIVE_ROW_LAUNCH_REUSE, reason })
@@ -457,6 +467,7 @@ export function decideLiveRowLaunchKind(input: LiveRowLaunchKindInput): LiveRowL
     if (facts.resumeEnabled !== true) return reuse(LIVE_ROW_LAUNCH_REASON_RESUME_DISABLED)
     if (facts.cwdMatches !== true) return reuse(LIVE_ROW_LAUNCH_REASON_CWD_MISMATCH)
     if (facts.configDirMatches !== true) return reuse(LIVE_ROW_LAUNCH_REASON_CONFIG_DIR_MISMATCH)
+    if ((facts.startValuesDiffering?.length ?? 0) > 0) return reuse(LIVE_ROW_LAUNCH_REASON_START_VALUES_DIFFER)
     return { kind: LIVE_ROW_LAUNCH_RESUME, reason: LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION }
   } catch {
     return reuse(LIVE_ROW_LAUNCH_REASON_NOT_KEPT)
@@ -1088,6 +1099,19 @@ export function liveRowSequenceLaunchLine(ref: string, decision: LiveRowLaunchKi
   return `${head(ref)}: step 6: ${decision.kind} — ${decision.reason}`
 }
 
+/**
+ * The Fresh-Start Line, logged once by a Resume Decision that the Start
+ * Values alone turned from a `resume` into a reuse spawn (the collision
+ * ladder's resume site, step 6, the latch re-check's resume retry), before
+ * the replacement's own lines; `differing` is the keys that differ, `model`
+ * before `effort`. It names keys only, never a value:
+ * `[slack] spawnForPersona: <ref> <model|effort|model and effort> <differs|differ> from what its conversation started with — not resuming; a fresh conversation starts and the old one is kept`
+ */
+export function freshStartLine(ref: string, differing: readonly StartLabelKey[]): string {
+  const verb = differing.length === 1 ? 'differs' : 'differ'
+  return `[slack] spawnForPersona: ${ref} ${differing.join(' and ')} ${verb} from what its conversation started with — not resuming; a fresh conversation starts and the old one is kept`
+}
+
 /** Why a sequence stopped, in words. */
 function describeStopReason(reason: LiveRowSequenceStopReason): string {
   switch (reason) {
@@ -1606,6 +1630,10 @@ export async function runLiveRowSequence(
       if (!fresh.finished) return { kind: LIVE_ROW_OUTCOME_UPGRADE_DEFERRED, current: false }
     }
     const row = lastRead.kind === 'state' ? lastRead.row : undefined
+    // P's facts and the launch's reading of the applied persona (made before
+    // the launch's first `await`) are taken in one synchronous turn, so the
+    // Resume Decision compares and spawns from one reading: add no `await`
+    // between them.
     let facts: LiveRowSequencePersonaFacts | undefined
     try {
       facts = deps.personaFacts(key, row)
@@ -1620,6 +1648,9 @@ export async function runLiveRowSequence(
       row,
       persona: facts,
     })
+    // Only step 6's own Start Values reason logs the Fresh-Start Line: a
+    // starter that did not keep the conversation for it logged it already.
+    if (decision.reason === LIVE_ROW_LAUNCH_REASON_START_VALUES_DIFFER) log(freshStartLine(ref, facts?.startValuesDiffering ?? []))
     log(liveRowSequenceLaunchLine(ref, decision))
     const answer = await deps.launch(key, decision.kind, lastRead, ref, stop, request.retiredAtStart, request.belowCapAtStart)
     const droppedBy = dropStop()

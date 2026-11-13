@@ -4,7 +4,8 @@
  * Covers (key rule and fit constraints)(instance ID,
  * tmux name, labels, spawn env, with Claude Code's prompt suggestions off in
  * every persona env; a notice's quoted session and the exact attach
- * target), the effective config-dir set (
+ * target), the `model` and `effort` Start Labels (keys, the model's full
+ * SHA-256 digest and the label order), the effective config-dir set (
  * step 5)(persona target resolution),
  * (persona-reference rendering) and (no import side effects),
  * plus the test helper's token matcher (`TOKEN_LIKE` / `isTokenLike`), which
@@ -29,12 +30,18 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync } from 'node:f
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import {
+  EFFORT_LABEL_KEY,
+  EFFORT_LABEL_PREFIX,
+  MODEL_LABEL_KEY,
+  MODEL_LABEL_PREFIX,
   PERSONA_KEY_MAX_LENGTH,
   PROMPT_SUGGESTION_OFF_ENV,
   AUTOUPDATER_OFF_ENV,
   FEEDBACK_SURVEY_OFF_ENV,
   configDirLabelValue,
   effectiveClaudeConfigDirs,
+  effortLabelValue,
+  modelLabelValue,
   personaInstanceId,
   personaKey,
   personaLabels,
@@ -44,6 +51,7 @@ import {
   renderPersonaRef,
   resolveClaudeConfigDir,
   resolvePersonaTarget,
+  startValueLabels,
   tmuxExactSessionTarget,
 } from '../src/persona-identity.ts'
 import { encodePermissionActionId, parsePermissionActionId } from '../src/permission-action-id.ts'
@@ -66,9 +74,14 @@ afterEach(() => {
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
+/** Independent full SHA-256 of the text's UTF-8 bytes, in lowercase hex. */
+function expectedDigest(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex')
+}
+
 /** Independent expectation for a config_dir label value. */
 function expectedDirHash(absPath: string): string {
-  return createHash('sha256').update(absPath, 'utf8').digest('hex').slice(0, 12)
+  return expectedDigest(absPath).slice(0, 12)
 }
 
 /** Exactly 40 in-form characters: the longest name that is its own key. */
@@ -203,6 +216,66 @@ describe('derived identifiers', () => {
   test('different dirs give different labels', () => {
     const home = makeTempDir()
     expect(configDirLabelValue(join(home, 'a'), home)).not.toBe(configDirLabelValue(join(home, 'b'), home))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Start Labels (model and effort)
+// ---------------------------------------------------------------------------
+
+describe('Start Labels', () => {
+  // Each value holds a letter outside a-f and is no part of `model=`,
+  // `effort=` or a level, so a label that contains it can only be a leak.
+  const MODEL_VALUES: [string, string][] = [
+    ['an ordinary value', 'opus'],
+    ['a non-ASCII value', 'modèle-日本'],
+    ['a leading space', ' opus'],
+    ['a trailing space', 'opus '],
+    ['a different case', 'Opus'],
+    ['a leading -', '-opus'],
+    ['spaces', 'opus fast mode'],
+    ['an =', 'opus=fast'],
+  ]
+
+  test('pin: the label keys and prefixes', () => {
+    expect([MODEL_LABEL_KEY, MODEL_LABEL_PREFIX, EFFORT_LABEL_KEY, EFFORT_LABEL_PREFIX]).toEqual([
+      'model',
+      'model=',
+      'effort',
+      'effort=',
+    ])
+  })
+
+  test.each(MODEL_VALUES)(
+    'the model label value is the 64-hex SHA-256 of the UTF-8 value as written (%s)',
+    (_label, model) => {
+      expect(modelLabelValue(model)).toMatch(/^[0-9a-f]{64}$/)
+      expect(modelLabelValue(model)).toBe(expectedDigest(model))
+    },
+  )
+
+  test('the effort label value is the level unchanged', () => {
+    const levels = ['low', 'medium', 'high', 'xhigh', 'max']
+    expect(levels.map(effortLabelValue)).toEqual(levels)
+  })
+
+  test.each([
+    ['neither key gives no labels', {}, []],
+    ['model alone gives its label', { model: 'opus' }, [`${MODEL_LABEL_PREFIX}${expectedDigest('opus')}`]],
+    ['effort alone gives its label', { effort: 'high' }, [`${EFFORT_LABEL_PREFIX}high`]],
+    [
+      'both give the model label, then the effort label',
+      { model: 'opus', effort: 'high' },
+      [`${MODEL_LABEL_PREFIX}${expectedDigest('opus')}`, `${EFFORT_LABEL_PREFIX}high`],
+    ],
+  ])('startValueLabels: %s', (_label, values, expected) => {
+    expect(startValueLabels(values)).toEqual(expected)
+  })
+
+  test.each(MODEL_VALUES)('no Start Label holds the model value (%s)', (_label, model) => {
+    const labels = startValueLabels({ model, effort: 'high' })
+    expect(labels).toHaveLength(2)
+    for (const label of labels) expect(label.includes(model)).toBe(false)
   })
 })
 
