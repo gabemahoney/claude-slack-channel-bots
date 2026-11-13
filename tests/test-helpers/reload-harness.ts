@@ -1,5 +1,6 @@
-import { createDeliveryQueue, type QueueItem, type QueueEvent } from '../../src/delivery-queue.ts'
+import { createDeliveryQueue, type AcceptedInput, type QueueAcceptResult, type QueueItem, type QueueEvent } from '../../src/delivery-queue.ts'
 import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
+import { createDeliveryEngines, createDeliveryLifecycle, DELIVERY_ROW_POLL_MS, type DeliveryEngineEvent, type DeliveryEngines, type DeliveryLifecycle } from '../../src/delivery-engine.ts'
 
 import {
   accessSync,
@@ -75,7 +76,7 @@ import {
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import type { MakeTemplateParams } from 'agent-director'
-import type { SpawnParams } from 'agent-director'
+import type { SendKeysParams, SpawnParams } from 'agent-director'
 
 import { _resetAckTracker, consumeAck, forgetPersonaAcks } from '../../src/ack-tracker.ts'
 import { resetClientForTests, setClientForTests } from '../../src/agent-director-client.ts'
@@ -114,7 +115,7 @@ import {
 import { personaInstanceId, personaKey, renderPersonaRef } from '../../src/persona-identity.ts'
 import { createPersonaEventRouter } from '../../src/persona-event-router.ts'
 import { createPersonaLifecycle, type PersonaLifecycle } from '../../src/persona-lifecycle.ts'
-import { createPersonaRouting } from '../../src/persona-routing.ts'
+import { createPersonaRouting, type SlackAck } from '../../src/persona-routing.ts'
 import { createPersonaSerializer } from '../../src/persona-serializer.ts'
 import {
   composePersonaStatusListeners,
@@ -136,7 +137,7 @@ import {
   type SessionEntry,
   type SessionToolDeps,
 } from '../../src/registry.ts'
-import { _resetConfiguredPersonaQuery, _resetFindMissingMemo, _resetInFlightLaunches, _resetInvalidFlagsHold, _resetLiveRowSequenceRegistry, _resetOldLifeHolds, _resetOldLifeWaitBindings, _resetRetiredKeyStore, _resetSpawnHomeDir, _setSpawnHomeDir, buildLiveRowSequenceDeps, checkLaunchConfigDir, createOldLifeHoldEndRetry, forgetOldLifeWaits, isLiveRowSequenceRunning, oldLifeHeldDirectory, personaRetryBlockCause, killPersonaInstanceForTeardown, launchSession, oldLifeHoldStep, personaConfigDirLabelValue, setConfigDirUnresolvableHook, setConfiguredPersonaQuery, setConflictLatch, setInvalidFlagsHold, setLiveRowSequenceRegistry, setOldLifeHolds, setOldLifeWaitBindings, setRetiredKeyStore, setSessionNotifier, SPAWN_ACTION_FRESH_RETIRED, spawnForPersona, startLiveRowSequence, stopLiveRowSequence, whenLaunchSettled, type SpawnPersonaResult } from '../../src/session-manager.ts'
+import { _resetConfiguredPersonaQuery, _resetFindMissingMemo, _resetInFlightLaunches, _resetInvalidFlagsHold, _resetLiveRowSequenceRegistry, _resetOldLifeHolds, _resetOldLifeWaitBindings, _resetRetiredKeyStore, _resetSpawnHomeDir, _setSpawnHomeDir, buildLiveRowSequenceDeps, checkLaunchConfigDir, createOldLifeHoldEndRetry, forgetOldLifeWaits, isLiveRowSequenceRunning, isOwnRowOldLifeHeld, oldLifeHeldDirectory, personaRetryBlockCause, killPersonaInstanceForTeardown, launchSession, oldLifeHoldStep, personaConfigDirLabelValue, setConfigDirUnresolvableHook, setConfiguredPersonaQuery, setConflictLatch, setInvalidFlagsHold, setLiveRowSequenceRegistry, setOldLifeHolds, setOldLifeWaitBindings, setRetiredKeyStore, setSessionNotifier, SPAWN_ACTION_FRESH_RETIRED, spawnForPersona, startLiveRowSequence, stopLiveRowSequence, waitsOnKillFailedHold, whenLaunchSettled, type SpawnPersonaResult } from '../../src/session-manager.ts'
 import type { ApplyBringUpOptions, ApplyStepSlots, InPlaceApplyInput } from '../../src/reload-apply.ts'
 import { composePendingFile, parsePendingFingerprint } from '../../src/reload-fingerprint.ts'
 import { DESTRUCTIVE_PREFIX, PENDING_PREVIEW_TITLE, type InPlaceSetting } from '../../src/reload-plan.ts'
@@ -203,6 +204,7 @@ import {
   type StubWebCall,
   type WebApiOutcome,
 } from './slack-stub.ts'
+import { appendTranscript, endedTurn, promptEntry, replyEntry, writeTranscript } from './working-row-panes.ts'
 
 // ---------------------------------------------------------------------------
 // Scripted Slack outcomes for a start
@@ -978,6 +980,30 @@ export interface ReloadRunOptions {
   /** Also called with every configuration the controller's `onApplied` is told (after `run.appliedConfigs` records it). */
   onApplied?: (config: PersonaConfig) => void
   /**
+   * Also called with every configuration the controller's `onApplySettled`
+   * is told (after `run.settledConfigs` records it and the run's reclaim has
+   * started); e.g. to see how far the apply had got at that moment. What it
+   * returns other than `undefined` is what the controller gets back in place
+   * of the reclaim's promise, and a throw reaches the controller as the
+   * binding's own, so a case can make the server's post-apply work fail
+   * (a rejected promise) or never settle.
+   */
+  onApplySettled?: (config: PersonaConfig) => unknown
+  /**
+   * The bound of the preparation's name and reaction lookups, on `run.clock`
+   * (production's `NAME_LOOKUP_TIMEOUT_MS` by default). A case that holds a
+   * lookup while it moves `run.clock` for other work sets it past that
+   * drive, so the held lookup answers only when the case says.
+   */
+  lookupTimeoutMs?: number
+  /**
+   * With `realLaunch`: the run's delivery (`run.delivery`), the production
+   * engines over the run's queue and its one preparation, as `main()` builds
+   * them (see `ReloadDeliveryDriver`). Off by default: the run then has no
+   * engine, and its preparation wakes nothing.
+   */
+  delivery?: boolean
+  /**
    * Bind the real lifecycle composition (`run.composition`, see
    * `RealLifecycleComposition`) behind the recorder's `teardown`,
    * `updateInPlace`, `reconnectCredentials` and `bringUp` (a recovery
@@ -1049,11 +1075,65 @@ export type ReloadOldLifeHoldsView = Pick<OldLifeHoldSet, 'holdOf' | 'holdsOnDir
 /** A realLaunch run's UNAVAILABLE retry timers, read-only: their queries. */
 export type ReloadRetryTimersView = Pick<UnavailableRetryController, 'view' | 'isArmed' | 'armedKeys' | 'whenRunSettled'>
 
+/**
+ * A run's delivery (`opts.delivery`): the production engines
+ * (`createDeliveryEngines`) over `run.queue` and the run's one preparation,
+ * bound as `main()` binds them: on `run.clock`, an applied persona's working
+ * directory as its `cwd`, the run's up check, latch and held conditions, its
+ * MCP session's `connected`, and `prepare` only for an item the preparation
+ * owns. The preparation's `wake` and `onPending` wake them, and a teardown,
+ * a retired key's apply step 1 and the routing's forget stop the key's engine
+ * and delivery lifecycle, as server.ts binds them. Their agent-director
+ * client is an isolated stub over the harness's row table, as production's
+ * delivery client is its own: `get` answers the row with its life's session
+ * and transcript (each spawn starts a new life, a resume keeps it), and a
+ * `send-keys` Enter writes the typed text to that transcript as the agent's
+ * prompt, followed by its reply: the exact receipt the engine waits for.
+ */
+export interface ReloadDeliveryDriver {
+  /** The text of every send of the persona's instance's input box (`send-keys` with `no_enter`), in order. */
+  texts(name: string): string[]
+  /** Every engine event (`delivered`, `item-delivered`, `waiting`, …), in order. */
+  readonly events: readonly DeliveryEngineEvent[]
+  /** Every key the run's preparation woke after a durable outcome, in order. */
+  readonly wakes: readonly string[]
+  /** Every error the engines or their lifecycle reported, and any restart or reconnect they asked for. */
+  readonly errors: readonly unknown[]
+  /** Whether the run's preparation owns the persona's item `seq` now (what the engine's `prepare` guard reads). */
+  owns(name: string, seq: number): boolean
+  /** The transcript of each of the persona's instance lives, oldest first. */
+  transcripts(name: string): string[]
+  /**
+   * Move `run.clock` in half-poll steps, ticking each running engine, until
+   * `predicate` holds; throws once `limitMs` of virtual time has passed
+   * without it. Every timer on `run.clock` fires on the way (a lookup's
+   * bound included).
+   */
+  until(predicate: () => boolean, limitMs?: number): Promise<void>
+}
+
 /** One server start over the harness's files; see the file comment. */
 export interface ReloadRun {
   queue: ReturnType<typeof createDeliveryQueue>
   queueEvents: QueueEvent[]
   queued(name: string): QueueItem[]
+  /**
+   * Injected intake (`/interject`, cron) for the persona: the run's
+   * preparation's `accept`, as server.ts binds both. Once the item is
+   * durable its preparation is scheduled on `run.clock` with a zero delay,
+   * so nothing prepares it until the case moves `run.clock`.
+   */
+  accept(name: string, input: AcceptedInput): Promise<QueueAcceptResult>
+  /** With `opts.delivery`, the run's delivery engines and their captures; undefined otherwise. */
+  readonly delivery: ReloadDeliveryDriver | undefined
+  /**
+   * Hold the acknowledgement of the next event the persona's connection hands
+   * the routing (a message or a reaction): the routing stores it and then
+   * waits in its `ack` (`entered`) until the case calls `release`, after
+   * which the Slack ack goes out as usual. Release every hold before
+   * `h.cleanup()`, which otherwise waits on it.
+   */
+  holdAck(name: string): { readonly entered: Promise<void>; release(): void }
   /** The real reload controller. */
   readonly controller: ReloadController
   /** The real bring-up controller the start pass drives. */
@@ -1176,6 +1256,12 @@ export interface ReloadRun {
   callTool(name: string, tool: string, args: Record<string, unknown>, session?: SessionEntry): Promise<ReloadToolResult>
   /** Every configuration the controller's `onApplied` was told, in order (one per confirmed apply's step 1). */
   readonly appliedConfigs: readonly PersonaConfig[]
+  /**
+   * Every configuration the controller's `onApplySettled` was told, in order
+   * (one per confirmed apply, once its steps 2–6 settled). As server.ts binds
+   * it, each starts the preparation's `reclaim` of its persona keys, detached.
+   */
+  readonly settledConfigs: readonly PersonaConfig[]
   /** The persona keys of the controller's applied configuration now, in order; undefined before the start applied. */
   appliedKeys(): string[] | undefined
   /** `controller.resolveStart()`, keeping the outcome as `outcome`. */
@@ -1865,6 +1951,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     let stopImage: DiskImage | undefined
     let stopImagePutBack = false
     const appliedConfigs: PersonaConfig[] = []
+    const settledConfigs: PersonaConfig[] = []
     let startHold: Promise<void> | undefined
     let outcome: ReloadStartOutcome | undefined
     /** The configuration the start applied (`run.resolveStart()`): its server-wide settings stay in effect. */
@@ -2002,7 +2089,33 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     const queueEvents: QueueEvent[] = []
     const queue = createDeliveryQueue({stateDir, now: connections.clock.now, onEvent: event => queueEvents.push(event)})
     const queueReady = queue.start()
-    const preparation = createDeliveryPreparation({queue, clientFor, resolveUserName})
+    /** With `opts.delivery`, the run's engines and their lifecycle (built with the composition below). */
+    let engines: DeliveryEngines | undefined
+    let deliveryLifecycle: DeliveryLifecycle | undefined
+    /** Per key, the ack holds `run.holdAck` asked for, oldest first. */
+    const ackHolds = new Map<string, Array<{ enter: () => void; released: Promise<void> }>>()
+    /** With `opts.delivery`: its captures for `run.captured()`. */
+    let deliveryCaptured: (() => Record<string, unknown>) | undefined
+    const deliveryWakes: string[] = []
+    // As main builds it: its lookup bounds, retries and an injected item's
+    // zero-delay preparation on the run's fake clock, its reaction lines in
+    // `run.logs`, the applied persona for their names, and its wakes to the
+    // run's engines (with `opts.delivery`).
+    const preparation = createDeliveryPreparation({
+      queue,
+      clientFor,
+      resolveUserName,
+      clock: connections.clock,
+      now: connections.clock.now,
+      log,
+      persona: getAppliedPersona,
+      wake: (key) => {
+        deliveryWakes.push(key)
+        engines?.wake(key)
+      },
+      onPending: (key) => engines?.wake(key),
+      lookupTimeoutMs: runOpts.lookupTimeoutMs,
+    })
     const coreRouting = createPersonaRouting({
       getPersonaConfig: appliedConfig,
       getBotIdentity: identityFor,
@@ -2023,7 +2136,25 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       // As server.ts wires it: the Run Bot Identities are the manager's (absent, every reactor counts as one).
       isRunBotIdentity: (id) => connections.manager.isRunBotIdentity(id),
     })
-    const routing = {...coreRouting, receive: async (...args: Parameters<typeof coreRouting.receive>) => {await queueReady; return coreRouting.receive(...args)}}
+    /** The routing's ack for the next event of `key`, held until the case releases it when `run.holdAck` asked. */
+    const ackFor = (key: string, ack: SlackAck): SlackAck => {
+      const hold = ackHolds.get(key)?.shift()
+      if (hold === undefined) return ack
+      return async () => {
+        hold.enter()
+        await hold.released
+        await ack()
+      }
+    }
+    const routing = {
+      ...coreRouting,
+      receive: async (event: unknown, ack: SlackAck, keys: string | readonly string[], flag?: unknown) => {
+        await queueReady
+        return coreRouting.receive(event, typeof keys === 'string' ? ackFor(keys, ack) : ack, keys, flag)
+      },
+      receiveReaction: (event: unknown, ack: SlackAck, key: string, flag?: unknown) =>
+        coreRouting.receiveReaction(event, ackFor(key, ack), key, flag),
+    }
     connections.onEvent = createPersonaEventRouter({ routing, clientFor, getPersona: getAppliedPersona, log })
     connections.onStatus = composePersonaStatusListeners(
       createPersonaUpFlushListener(noticeStack.notifier),
@@ -2090,6 +2221,137 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     const composition = realLifecycle ? buildComposition() : undefined
     /** The run's live-row sequence registry (`opts.realLaunch`), built and installed with the launch seams. */
     let sequences: LiveRowSequenceRegistry | undefined
+    const delivery = runOpts.delivery === true ? buildDelivery() : undefined
+
+    /** As main's `stopDelivery`: the key's engine and delivery lifecycle stop (nothing without `opts.delivery`). */
+    async function stopDeliveryOf(key: string): Promise<void> {
+      const stopping = engines?.forget(key)
+      deliveryLifecycle?.forget(key)
+      await stopping
+    }
+
+    /** The run's delivery (`opts.delivery`); see `ReloadDeliveryDriver`. */
+    function buildDelivery(): ReloadDeliveryDriver {
+      if (!realLaunch) throw new Error("reload-harness: opts.delivery needs opts.realLaunch (the engines read the launch path's rows)")
+      const events: DeliveryEngineEvent[] = []
+      const errors: unknown[] = []
+      const keyCalls: Array<{ id: string; params: SendKeysParams }> = []
+      const transcripts = new Map<string, string[]>()
+      /** Each instance life's session and transcript, by the row a spawn made, and what its input box holds. */
+      const lives = new WeakMap<TableRow, { session: string; path: string; box: string }>()
+      function lifeOf(id: string, row: TableRow): { session: string; path: string; box: string } {
+        let life = lives.get(row)
+        if (life === undefined) {
+          const paths = transcripts.get(id) ?? []
+          transcripts.set(id, paths)
+          const path = join(root, 'transcripts', `${id}-life-${paths.length + 1}.jsonl`)
+          mkdirSync(dirname(path), { recursive: true })
+          writeTranscript(path, endedTurn())
+          paths.push(path)
+          life = { session: `${id}-session-${paths.length}`, path, box: '' }
+          lives.set(row, life)
+        }
+        return life
+      }
+      const client = makeStubClient({
+        getFn: (params) => {
+          const row = rows.get(params.instance_id)
+          if (row === undefined) return errSpawnNotFound()
+          const life = lifeOf(params.instance_id, row)
+          const result = cannedGetResult({
+            instance_id: params.instance_id,
+            state: row.state,
+            cwd: row.cwd,
+            labels: { ...row.labels },
+            ...launchStartOf(row),
+            session_id: life.session,
+            jsonl_path: life.path,
+          })
+          result.transcript_status = 'present'
+          return result
+        },
+        sendKeysFn: (params) => {
+          keyCalls.push({ id: params.instance_id, params: { ...params } })
+          const row = rows.get(params.instance_id)
+          if (row === undefined) return errSpawnNotFound()
+          const life = lifeOf(params.instance_id, row)
+          if (params.no_enter) life.box = params.text ?? ''
+          else if (params.key === 'Enter') {
+            if (life.box) appendTranscript(life.path, [promptEntry(life.box), replyEntry()])
+            life.box = ''
+          }
+          return {}
+        },
+      })
+      deliveryLifecycle = createDeliveryLifecycle({ clock: connections.clock, onError: (error) => void errors.push(error) })
+      const built = createDeliveryEngines({
+        queue,
+        lifecycle: deliveryLifecycle,
+        clock: connections.clock,
+        clientFor: async () => client,
+        instanceId: personaInstanceId,
+        persona: (key) => {
+          const persona = getAppliedPersona(key)
+          return persona === undefined ? undefined : { cwd: persona.working_directory }
+        },
+        isUp: (key) => !stopped && isPersonaUp(key),
+        isLatched: (key) => latch.isLatched(key),
+        isHeld: (key) =>
+          invalidFlagsHold.isHeld(key) ||
+          composition!.killFailureAlerts.isOpen(key) ||
+          waitsOnKillFailedHold(key) ||
+          isOwnRowOldLifeHeld(key) ||
+          isLiveRowSequenceRunning(key),
+        isConnected: (key) => getSessionByPersona(key)?.connected === true,
+        // As main binds it: only post-ack intake or recovery may start an
+        // item's lookups; an unfixed head waits for its owner's wake.
+        prepare: (key, item) => (preparation.owns(key, item.accepted.seq) ? preparation.prepare(key, item) : Promise.resolve()),
+        isRestartPendingOrActive: () => false,
+        scheduleRestart: (key) => void errors.push(new Error(`reload-harness: delivery asked to restart ${key}`)),
+        reconnect: async (key) => void errors.push(new Error(`reload-harness: delivery asked to reconnect ${key}`)),
+        onEvent: (event) => void events.push(event),
+        onError: (_key, error) => void errors.push(error),
+      })
+      engines = built
+      deliveryCaptured = () => {
+        const journals = join(stateDir, 'queue')
+        return {
+          events,
+          errors,
+          keyCalls,
+          // What the engines read and the queue wrote: every life's transcript and every key's journal.
+          transcripts: [...transcripts.values()].flat().map((path) => writtenFile(path)),
+          journals: existsSync(journals) ? readdirSync(journals).map((name) => writtenFile(join(journals, name))) : [],
+        }
+      }
+      return {
+        texts: (name) => {
+          const id = personaInstanceId(personaKey(name))
+          return keyCalls.filter((c) => c.id === id && c.params.no_enter === true).map((c) => c.params.text ?? '')
+        },
+        events,
+        wakes: deliveryWakes,
+        errors,
+        owns: (name, seq) => preparation.owns(personaKey(name), seq),
+        transcripts: (name) => [...(transcripts.get(personaInstanceId(personaKey(name))) ?? [])],
+        async until(predicate, limitMs = 300_000) {
+          const clock = connections.clock
+          const end = clock.now() + limitMs
+          /** A few event-loop turns: long enough for a tick that is not blocked, never a real delay. */
+          const turns = async (): Promise<void> => {
+            for (let i = 0; i < 20; i++) await new Promise<void>((done) => setImmediate(done))
+          }
+          while (!predicate() && clock.now() < end) {
+            await clock.advanceTo(Math.min(end, clock.now() + DELIVERY_ROW_POLL_MS / 2))
+            // An engine whose tick waits on a held preparation stays busy; the others go on.
+            for (const persona of serverConfig()?.personas ?? []) {
+              if (built.running(persona.key)) await Promise.race([built.tick(persona.key), turns()])
+            }
+          }
+          if (!predicate()) throw new Error(`reload-harness: the delivery condition was not reached by ${clock.now()} ms`)
+        },
+      }
+    }
 
     /** The real composition over this run (`opts.realLifecycle`); see `RealLifecycleComposition`. */
     function buildComposition(): RealLifecycleComposition & {
@@ -2276,8 +2538,18 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           },
         },
         // The run's routing's per-key forget, as server.ts binds it, so a
-        // torn-down key's dedupe store and heard set are dropped.
-        routing: { forget: rec('routing.forget', (key) => routing.forget(key)) },
+        // torn-down key's dedupe store and heard set are dropped, its
+        // preparation life ends (no lookup it started appends, logs, wakes or
+        // retries) and, with `opts.delivery`, its engine and delivery
+        // lifecycle stop.
+        routing: {
+          forget: rec('routing.forget', (key) => {
+            routing.forget(key)
+            preparation.forget(key)
+            void engines?.forget(key)
+            deliveryLifecycle?.forget(key)
+          }),
+        },
         // The real tracker's per-key forget, as server.ts binds it, so a key
         // added again starts with no ack-reaction entry.
         forgetAcks: rec('forgetAcks', (key) => forgetPersonaAcks(key)),
@@ -2339,6 +2611,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           return killFailureAlerts.raise({ key, decision, latched: false, context: KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN })
         },
         forgetReplyReminders: rec('forgetReplyReminders', async () => undefined),
+        // With `opts.delivery`, as main binds it: the key's engine and
+        // delivery lifecycle stop (not recorded, so the calls match a run without).
+        ...(runOpts.delivery === true ? { stopDelivery: (key: string) => stopDeliveryOf(key) } : {}),
         storageCheck: (persona) => void calls.push(['storageCheck', persona.key]),
         launch: async (persona) => {
           calls.push(['launch', persona.key])
@@ -2693,7 +2968,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       )
     }
     controller = createReloadController({
-      stopDelivery: async () => {},
+      // As main binds it (step 1, for each key it records): with
+      // `opts.delivery` the key's engine and delivery lifecycle stop.
+      stopDelivery: stopDeliveryOf,
       queueOpenCount: queue.openCount,
       onQueueRetained: key => queue.retained(key),
       paths,
@@ -2736,10 +3013,18 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       onApplied: (config) => {
         appliedConfigs.push(config)
         runOpts.onApplied?.(config)
-        void preparation.recover(config.personas.map(p => p.key))
         const hook = applyHook
         applyHook = undefined
         hook?.(config)
+      },
+      // As main binds it: once the apply's steps have settled, the
+      // preparation reclaims the applied keys' claimed work under their lives
+      // now, detached (its promise is the controller's, which awaits nothing).
+      onApplySettled: (config) => {
+        settledConfigs.push(config)
+        const reclaiming = preparation.reclaim(config.personas.map((p) => p.key))
+        const observed = runOpts.onApplySettled?.(config)
+        return observed === undefined ? reclaiming : observed
       },
     })
 
@@ -2874,6 +3159,17 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       queue,
       queueEvents,
       queued: name => queue.items(personaKey(name)),
+      accept: (name, input) => preparation.accept(personaKey(name), input),
+      delivery,
+      holdAck(name) {
+        let enter!: () => void
+        let release!: () => void
+        const entered = new Promise<void>((done) => (enter = done))
+        const released = new Promise<void>((done) => (release = done))
+        const key = personaKey(name)
+        ackHolds.set(key, [...(ackHolds.get(key) ?? []), { enter, released }])
+        return { entered, release }
+      },
       controller,
       bringUps,
       connections,
@@ -2934,6 +3230,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         return { isError: result.isError === true, text: result.content.map((c) => c.text ?? '').join('\n') }
       },
       appliedConfigs,
+      settledConfigs,
       appliedKeys: () => controller.applied()?.config.personas.map((p) => p.key),
       resolveStart() {
         outcome = controller.resolveStart()
@@ -2978,6 +3275,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         written: [...new Set(writes.filter((w) => w.ok).map((w) => w.path))]
           .filter((path) => existsSync(path))
           .map((path) => writtenFile(path)),
+        ...(deliveryCaptured === undefined ? {} : { delivery: deliveryCaptured() }),
         ...extra,
       }),
       async confirmPending() {
@@ -3097,6 +3395,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       async stop() {
         if (stopped) return
         stopped = true
+        // As main's shutdown: the engines stop before the preparation drains.
+        await engines?.stop()
         await preparation.stop()
         await queue.stop()
         // The server stopped at `opts.stopBeforeWrite`: nothing it wrote after that point survives.

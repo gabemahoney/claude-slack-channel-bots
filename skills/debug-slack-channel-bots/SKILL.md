@@ -6172,7 +6172,7 @@ Look in `server.log` for the lines logged after the rename (the `grep` in
 | [`reload-stale-confirmation`](#reload-stale-confirmation) | The confirmation didn't match the files as they stand, or couldn't be read. Nothing is applied. |
 | [`reload-record-write-failed`](#reload-record-write-failed), `the confirmed change is not applied and stays pending` | The record, the retired-key record written before it, or the stored-choice file (`channel-delivery.json`) written before both, couldn't be written. Nothing is applied; fix the state directory, then confirm again. |
 | `[slack] reload: cannot remove the confirmation "<apply path>" (<errno>); it was acted on once and is ignored until its content changes` | The confirmation was acted on once (one of the lines above), but the server couldn't delete it. It is ignored while its content stays the same. Fix the directory's permissions (or the read-only filesystem), then remove `config.json.apply` by hand. |
-| `[slack] reload: apply step <n> (<step>) failed …` or `[slack] reload: updating the server's applied configuration failed: <error>` | An internal error during the apply. Report it as a bug, with the lines around it. |
+| `[slack] reload: apply step <n> (<step>) failed …`, `[slack] reload: updating the server's applied configuration failed: <error>` or `[slack] reload: the server's post-apply work failed: <error>` | An internal error during the apply, or just after its steps. Report it as a bug, with the lines around it. |
 
 No line at all:
 

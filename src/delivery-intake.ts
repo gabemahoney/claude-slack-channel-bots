@@ -37,7 +37,16 @@ export interface DeliveryPreparation {
   /** True only after post-ack preparation or explicit startup recovery owns it. */
   owns(key: string, seq: number): boolean
   prepare(key: string, item: QueueItem): Promise<void>
+  /** Startup recovery: prepares every open item of `keys` (default every journal's). */
   recover(keys?: readonly string[]): Promise<void>
+  /**
+   * Recovery while intake runs: starts each key's current life and prepares
+   * under it only the open items already fixed or claimed (handed to
+   * `prepare`, or an injected accept past its zero-delay boundary), so work a
+   * forget cancelled is fixed again while a Slack item still awaiting its ack
+   * stays with its intake.
+   */
+  reclaim(keys: readonly string[]): Promise<void>
   /** Injected intake only; Slack uses queue.accept then calls prepare after its ack. */
   accept: QueueAccept
   forget(key: string): void
@@ -47,7 +56,8 @@ interface ReactionOutcome { record: FixedRecord | WithdrawnRecord; messageUnknow
 /**
  * One persona life's preparation state. `forget(key)` ends the life: work it
  * started appends, logs, wakes and retries nothing further, and none of its
- * state reaches the key's next life.
+ * state reaches the key's next life. Only the key's claims outlive it, for
+ * `reclaim`.
  */
 interface PreparationLife {
   ended: boolean
@@ -60,6 +70,9 @@ interface PreparationLife {
 export function createDeliveryPreparation(deps: DeliveryPreparationDeps): DeliveryPreparation {
   const channels = new Map<string, Map<string, Promise<string>>>()
   const lives = new Map<string, PreparationLife>()
+  // Per key, the unfixed items preparation was handed; kept across a forget
+  // so the key's next life can reclaim them, dropped once fixed or closed.
+  const claimed = new Map<string, Set<number>>()
   // Every life's outstanding work, an ended life's included, so stop drains writes already issued.
   const running = new Set<Promise<void>>()
   let stopped = false
@@ -78,6 +91,17 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
     return life
   }
   const current = (life: PreparationLife): boolean => !stopped && !life.ended
+  function claim(key: string, seq: number): void {
+    let seqs = claimed.get(key)
+    if (!seqs) { seqs = new Set(); claimed.set(key, seqs) }
+    seqs.add(seq)
+  }
+  /** Drops the claim of an item that no longer needs fixing. */
+  function release(key: string, seq: number): void {
+    const seqs = claimed.get(key)
+    if (!seqs?.delete(seq)) return
+    if (seqs.size === 0) claimed.delete(key)
+  }
   async function bounded(work: () => Promise<string>, fallback: string): Promise<string> {
     let timer: unknown
     try {
@@ -114,14 +138,19 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
       void Promise.resolve(deps.log(line)).catch(() => {})
     } catch { /* a diagnostic never undoes, retries or delays a durable outcome */ }
   }
-  /** Decides and durably appends a reaction's outcome; true when the caller should wake. */
-  async function fixReaction(key: string, a: ReactionAcceptedRecord, life: PreparationLife): Promise<boolean> {
+  /**
+   * Decides and durably appends a reaction's outcome: true when the caller
+   * should wake, false when an outcome stands without a wake, undefined when
+   * the life ended with none decided.
+   */
+  async function fixReaction(key: string, a: ReactionAcceptedRecord, life: PreparationLife): Promise<boolean | undefined> {
     let outcome = life.reactionOutcomes.get(a.seq)
     if (!outcome) {
       // Fresh lookups for every decision; the ordinary channel-name cache is not used.
       const decision = await lookupReactionPreparation(key, a, { clientFor: deps.clientFor, resolveUserName: deps.resolveUserName, clock, lookupTimeoutMs: timeout })
       const fresh = deps.queue.item(key, a.seq)
-      if (!current(life) || !fresh || isQueueItemClosed(fresh)) return false
+      if (!fresh || isQueueItemClosed(fresh)) return false
+      if (!current(life)) return fresh.fixed ? false : undefined
       if (fresh.fixed) return true
       if (decision.kind === 'fixed') {
         outcome = { record: { v: 1, kind: 'fixed', seq: a.seq, parts: buildTagParts(buildReactionNoticeMessage(reactionNotice(a, decision)), tagMaxBytes) }, messageUnknown: decision.messageUnknown }
@@ -147,16 +176,20 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
     report(key, a, outcome)
     return true
   }
-  async function fix(key: string, item: QueueItem, life: PreparationLife): Promise<void> {
+  /** Fixes the item unless its life ends first; resolves true once it needs no fixing. */
+  async function fix(key: string, item: QueueItem, life: PreparationLife): Promise<boolean> {
     // post-ack fixation must not clone every queued item
     // while a burst's remaining events still await durable acceptance.
-    item = deps.queue.item(key, item.accepted.seq) ?? item
+    const fresh = deps.queue.item(key, item.accepted.seq)
+    item = fresh ?? item
+    const settled = !fresh || item.fixed !== undefined || isQueueItemClosed(item)
     if (item.fixed || isQueueItemClosed(item)) life.reactionOutcomes.delete(item.accepted.seq)
     // A withdrawn outcome is final: no fixation, retry or wake.
-    if (!current(life) || isQueueItemClosed(item)) return
+    if (!current(life) || isQueueItemClosed(item)) return settled
     if (!item.fixed && item.accepted.source === 'reaction') {
       // The queue admits a reaction record only in its validated reaction shape.
-      if (!await fixReaction(key, item.accepted as ReactionAcceptedRecord, life)) return
+      const wake = await fixReaction(key, item.accepted as ReactionAcceptedRecord, life)
+      if (wake !== true) return wake === false
     } else if (!item.fixed) {
       const a = item.accepted
       let parts = life.fixedParts.get(a.seq)
@@ -169,7 +202,7 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
             channelName(key, a.channel!, a.channel_type),
           ])
           // A forgotten persona's lookup appends nothing; a stop, unlike a forget, still lets it append.
-          if (life.ended) return
+          if (life.ended) return false
           message = { chat_id: a.channel, channel_name, message_id: a.ts, user, ts: a.ts, thread_ts: a.thread_ts, via: a.via, text: a.text }
           if (a.user) message.user_id = a.user
           else if (a.bot_id) message.bot_id = a.bot_id
@@ -185,16 +218,20 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
       life.fixedParts.delete(a.seq)
     }
     if (current(life)) await deps.wake?.(key)
+    return true
   }
   function prepare(key: string, item: QueueItem): Promise<void> {
     try { void Promise.resolve(deps.onReceived?.(key, item)).catch(() => {}) } catch { /* reporting never owns acceptance */ }
     const life = lifeOf(key), seq = item.accepted.seq
+    claim(key, seq)
     const existing = life.inFlight.get(seq)
     if (existing) return existing
     const old = life.retries.get(seq)
     if (old?.timer !== undefined) return Promise.resolve()
-    const work: Promise<void> = fix(key, item, life).then(() => {
+    const work: Promise<void> = fix(key, item, life).then(settled => {
       life.retries.delete(seq)
+      // An ended life's lookup appended nothing: the claim stays for the next life.
+      if (settled) release(key, seq)
     }).catch(error => {
       // Fixation is entered only after Slack's ack. Retain ownership even
       // when startup recover uses allSettled and this was the only message
@@ -218,13 +255,29 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
     async recover(keys = deps.queue.keys()) {
       await Promise.allSettled(keys.flatMap(key => deps.queue.items(key).filter(item => !isQueueItemClosed(item)).map(item => prepare(key, item))))
     },
+    async reclaim(keys) {
+      await Promise.allSettled(keys.flatMap(key => {
+        lifeOf(key)
+        const seqs = claimed.get(key)
+        return deps.queue.items(key)
+          .filter(item => !isQueueItemClosed(item) && (item.fixed !== undefined || seqs?.has(item.accepted.seq) === true))
+          .map(item => prepare(key, item))
+      }))
+    },
     async accept(key, input) {
-      const life = lifeOf(key)
+      lifeOf(key)
       const result = await deps.queue.accept(key, input)
       if (result.status !== 'failed' && result.item) {
         const item = result.item
-        // Yield through the caller's HTTP answer/cron outcome before reporting or preparing.
-        clock.setTimeout(() => { if (current(life)) void prepare(key, item).catch(() => {}) }, 0)
+        // Yield through the caller's HTTP answer/cron outcome before reporting
+        // or preparing. Past it the item is claimed even when a forget ended
+        // the accepting life; the key's current life, if any, prepares it.
+        clock.setTimeout(() => {
+          if (stopped) return
+          claim(key, item.accepted.seq)
+          const life = lives.get(key)
+          if (life && current(life)) void prepare(key, item).catch(() => {})
+        }, 0)
       }
       return result
     },
@@ -244,6 +297,7 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
       }
       await Promise.allSettled([...running])
       lives.clear()
+      claimed.clear()
     },
   }
   return api

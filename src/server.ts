@@ -2888,8 +2888,15 @@ export async function main(): Promise<void> {
     onApplied: (config) => {
       if (appliedConfig === undefined) throw new Error('a confirmed apply ran before the start resolved its configuration')
       personaConfig = configInEffect(appliedConfig, config)
-      void deliveryPreparation?.recover(config.personas.map(p => p.key))
     },
+    // once the apply's teardowns and bring-ups have settled, every applied
+    // key's claimed work is prepared again, detached from the apply and the
+    // tick. A destructive modify's teardown forgot the preparation life that
+    // held its accepted-only items, whose lookups then append nothing; the
+    // key's next life starts here and fixes them. An item a new connection
+    // stored whose ack is still pending is not claimed and stays with its
+    // intake. A removed key's queue stays retained, unprepared.
+    onApplySettled: (config) => deliveryPreparation?.reclaim(config.personas.map(p => p.key)),
   })
   reloadController = reload
   const start = reload.resolveStart()
@@ -3578,8 +3585,9 @@ export async function main(): Promise<void> {
     onStatus: composePersonaStatusListeners(
       createPersonaUpFlushListener(personaNotifier),
       (key, status) => bringUps?.onConnectionStatus(key, status),
-      // Apply recovery precedes teardown/bring-up. Restore retained feedback
-      // with the usable client, on initial success and background retry alike.
+      // Apply recovery runs once the apply's steps settle, which can be before
+      // a retried bring-up reaches up. Restore retained feedback with the
+      // usable client, on initial success and background retry alike.
       (key, status) => { if (status.state === 'up') deliveryReporting?.reconcileQueued(key) },
     ),
   })

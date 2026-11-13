@@ -113,7 +113,9 @@ function endOfBringUpStatement(bringUpAt: number): number {
  * that config is still unset, then the swap
  * `<loaded> = configInEffect(<start-time>, <applied>)` (start-time first:
  * `configInEffect` keeps its first argument's server-wide values and takes
- * only the second's personas); fails the test otherwise.
+ * only the second's personas), and nothing else: preparation work started
+ * here would run under lives the apply's teardowns then end (it belongs in
+ * `onApplySettled`); fails the test otherwise.
  */
 function startTimeConfig(): string {
   const { loaded } = startResolution(SERVER_CODE)
@@ -122,7 +124,7 @@ function startTimeConfig(): string {
     new RegExp(
       `^\\(?\\s*(\\w+)\\s*\\)?\\s*=>\\s*\\{\\s*` +
         `if\\s*\\(\\s*(\\w+)\\s*===\\s*undefined\\s*\\)\\s*throw\\s+new\\s+Error\\s*\\(\\s*'[^']*'\\s*\\)\\s*;?\\s*` +
-        `${loaded}\\s*=\\s*configInEffect\\s*\\(\\s*\\2\\s*,\\s*\\1\\s*\\)\\s*;?\\s*void\\s+deliveryPreparation\\?\\.recover\\(\\1\\.personas\\.map\\(p\\s*=>\\s*p\\.key\\)\\)\\s*;?\\s*\\}$`,
+        `${loaded}\\s*=\\s*configInEffect\\s*\\(\\s*\\2\\s*,\\s*\\1\\s*\\)\\s*;?\\s*\\}$`,
     ),
   )
   expect(swap).not.toBeNull()
@@ -218,6 +220,43 @@ describe('server.ts wires the reload detection tick', () => {
     // below), not a local stand-in of the same name.
     expect(importSource(SERVER_CODE, 'configInEffect')).toBe('./reload.ts')
     expect(indicesOf(/\b(?:let|const|var|function)\s+configInEffect\b/g, SERVER_CODE)).toEqual([])
+  })
+
+  // Once a confirmed apply's steps have settled, the applied keys' claimed
+  // work is prepared again under their lives now: a destructive modify's
+  // teardown ended the life that held it (tests/reload-apply.test.ts drives
+  // that through the harness). `onApplySettled` is optional in the
+  // controller's deps and the harness binds its own, so only this audit makes
+  // sure production binds it, on the one preparation whose life the teardown's
+  // routing forget ends and whose ownership gates the engines' `prepare`, and
+  // that nothing prepares at step 1 instead (`onApplied` is pinned to the swap
+  // alone by startTimeConfig).
+  test('the controller\'s onApplySettled reclaims every applied key\'s claimed work through the one preparation the teardown forgets and the engines\' prepare is gated on, and only the start recovers every journal', () => {
+    const settled = (controllerProps().get('onApplySettled') ?? '').replace(/\s+/g, ' ')
+    const reclaim = settled.match(/^\(?(\w+)\)? => deliveryPreparation\?\.reclaim\(\1\.personas\.map\(\(?(\w+)\)? => \2\.key\)\)$/)
+    expect(reclaim).not.toBeNull()
+    expect(startTimeConfig()).toMatch(/^\w+$/)
+    // The one preparation: declared once at module scope and built once, in main().
+    expect([...SERVER_CODE.matchAll(/\b(?:let|const|var)\s+deliveryPreparation\b[^\n]*/g)].map((d) => d[0].trim())).toEqual([
+      'let deliveryPreparation: DeliveryPreparation | undefined',
+    ])
+    const builds = assignmentsOf('deliveryPreparation', 'createDeliveryPreparation')
+    expect(builds).toHaveLength(1)
+    expect(insideMain(SERVER_CODE, builds[0]!)).toBe(true)
+    expect(builds[0]!).toBeLessThan(onlyMethodCall('startDetection').at)
+    // Its life ends at a teardown's routing forget (the whole binding is pinned below), and the
+    // engines prepare only what it owns, so nothing else can fix an item a forget left unfixed.
+    expect(onlyCallProps('createPersonaLifecycle').get('routing')).toContain('deliveryPreparation?.forget(key)')
+    expect(onlyCallProps('createDeliveryEngines').get('prepare')).toBe(
+      '(key, item) => deliveryPreparation!.owns(key, item.accepted.seq) ? deliveryPreparation!.prepare(key, item) : Promise.resolve()',
+    )
+    // reclaim is called only there; the unrestricted recover only once, for every journal, after detection is armed.
+    expect(anyCallOf('reclaim')).toHaveLength(1)
+    const recover = [...SERVER_CODE.matchAll(/^\s*await deliveryPreparation\?\.recover\(\)\s*$/gm)]
+    expect(recover).toHaveLength(1)
+    expect(anyCallOf('recover')).toHaveLength(1)
+    expect(atMainTopLevel(SERVER_CODE, recover[0]!.index! + recover[0]![0].indexOf('await'))).toBe(true)
+    expect(recover[0]!.index!).toBeGreaterThan(onlyMethodCall('startDetection').at)
   })
 
   // no file watcher. Only the controller's own options are audited, so
