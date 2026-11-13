@@ -6147,6 +6147,58 @@ describe('in-place and recorded section changes at confirmation (the in-place ro
   })
 })
 
+describe('reaction_notices turned off and back on applies in place at confirmation, keeping the instance (the in-place row)', () => {
+  test.each<ChannelMode>(['declarative', 'fungible'])(
+    "%s mode: bravo's setting is published only once confirmed, as one in-place update each way, with its session, connection and row kept and alpha untouched",
+    async (mode) => {
+      const { run, personas } = await runningIn(mode)
+      const [alpha, bravo] = personas
+      const bravoKey = h.key('bravo')
+      const session = run.session('bravo')!
+      const bravoSide = slackSideOf(run, 'bravo')
+      const alphaUntouched = watchUntouched(run, 'alpha')
+      const effective = () => run.serverConfig()!.personas.map((p) => [p.name, p.reaction_notices])
+      expect(effective()).toEqual([['alpha', true], ['bravo', true]])
+
+      // Off by writing false, then back on by removing the key again.
+      for (const [next, value] of [[{ ...bravo!, reaction_notices: false }, false], [bravo!, true]] as const) {
+        const cp = run.checkpoint()
+        const timeline = run.lifecycle.timeline.length
+        const calls = run.composition!.calls.length
+        const applied = run.logsOf(RELOAD_APPLIED).length
+
+        await previewConfig(run, [alpha!, next], switchTop(mode))
+        expect(effective()).toEqual([['alpha', true], ['bravo', !value]])
+
+        h.confirm()
+        await run.ticks.tick()
+
+        expect(effective()).toEqual([['alpha', true], ['bravo', value]])
+        expect(run.since(cp).lifecycle).toEqual([{ op: 'update-in-place', key: bravoKey, via: 'apply', settings: ['reaction_notices'] }])
+        expect(run.lifecycle.timeline.slice(timeline)).toEqual([
+          { op: 'update-in-place', key: bravoKey, phase: 'start' },
+          { op: 'update-in-place', key: bravoKey, phase: 'settled' },
+        ])
+        // Not a destination setting: no destinations.forget, nor any other composition call.
+        expect(run.composition!.calls.slice(calls)).toEqual([])
+        expect(run.since(cp).slackBuilds).toBe(0)
+        expect(run.since(cp).slackCalls).toEqual([])
+        expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(applied + 1)
+      }
+
+      expect(stubCallCount(run.composition!.agentDirector)).toBe(0)
+      expect(run.session('bravo')).toBe(session)
+      expect(session.connected).toBe(true)
+      expect(slackSideOf(run, 'bravo')).toEqual(bravoSide)
+      expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
+      alphaUntouched()
+      await expectNothingPendingAfter(run)
+      expect(run.slackPosts()).toEqual([])
+      expectModeNoLeak()
+    },
+  )
+})
+
 /** bravo's destination in `mode`: its own listed channel (`permission_prompts`) or its fungible destination. */
 function destinationIn(mode: ChannelMode): string {
   return mode === 'fungible' ? fungibleDestinationOf('bravo') : ownChannel('bravo')

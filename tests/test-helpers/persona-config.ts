@@ -203,6 +203,7 @@ export function makePersonaConfig(overrides: Partial<PersonaConfig> = {}, baseDi
     ...resolvedSections(input, mode),
     dm: { enabled: false },
     stop_hook_bootstrap: true,
+    reaction_notices: true,
   }
   return {
     personas: [persona],
@@ -266,6 +267,7 @@ export type PersonaSpec = Partial<Omit<Persona, 'index'>> & { invited?: PersonaI
  *   loader does; absent when neither is set. A spec that sets the key to
  *   `undefined` opts out of inheritance.
  * - `stop_hook_bootstrap`: inherited from the resolved top-level value.
+ * - `reaction_notices`: `true`, the loader's default for an absent key.
  * A spec's own `fungible_destination` or `sections` replaces the filled one.
  *
  * Throws when two personas share a name or a key, which the loader would reject.
@@ -301,6 +303,7 @@ export function makeMultiPersonaConfig(
       ...resolvedSections(written, mode),
       dm: { enabled: false },
       stop_hook_bootstrap: base.stop_hook_bootstrap,
+      reaction_notices: true,
       ...spec,
     }
     if (claudeConfigDir !== undefined) persona.claude_config_dir = claudeConfigDir

@@ -14,11 +14,7 @@ The first start of an install applies the file as it stands. After that, the ser
 
 ### Example
 
-A complete `config.json` in declarative mode (`allow_invited_channels` absent), with three personas:
-
-- `planner` receives every message in its home channel `C0123456789` and in the shared channel `C0555555555`. Its permission prompts and notices go to its home channel. It takes no DMs.
-- `reviewer` receives only its @mentions and `@here` / `@channel` broadcasts in the shared channel. It takes DMs, and its prompts and notices go by DM to its contact `U0123456789`. It has its own Claude config directory, model and effort level, and turns [Slack reply reminders](bots.md#slack-reply-reminders) off for itself.
-- `helpdesk` is DM-only: it is in no channel and is reached only by DM. Its prompts and notices go by DM to its contact `U0987654321`.
+A complete declarative `config.json` (`allow_invited_channels` absent), with channel personas `planner` and `reviewer` and DM-only `helpdesk`. Replace the channel IDs, user IDs and paths with your own.
 
 `planner` and `helpdesk` inherit the top-level `claude_config_dir`. The server-wide settings select queued/delivered reactions and reply splitting. **Custom emoji must exist in the Slack workspace before configuration**; `spinthinking` is custom. Ensure both names below are available, or choose available names; see [Acknowledgement reactions](server-settings.md#acknowledgement-reactions).
 
@@ -41,6 +37,7 @@ A complete `config.json` in declarative mode (`allow_invited_channels` absent), 
       "permission_prompts": "dm",
       "claude_config_dir": "~/.claude-reviewer",
       "model": "opus", "effort": "high",
+      "reaction_notices": false,
       "stop_hook_bootstrap": false
     },
     {
@@ -60,8 +57,6 @@ A complete `config.json` in declarative mode (`allow_invited_channels` absent), 
 }
 ```
 
-Replace the channel IDs, user IDs and paths with your own. Each persona's credentials file must exist with its tokens before that persona can come up (see [Credentials files](#credentials-files)).
-
 ### Persona fields
 
 | Field | Type | Required | Default | Description |
@@ -78,8 +73,13 @@ Replace the channel IDs, user IDs and paths with your own. Each persona's creden
 | `stop_hook_bootstrap` | boolean | no | top-level `stop_hook_bootstrap` | Slack reply reminder switch for this persona. Confirmed changes apply immediately; see [Slack reply reminders](bots.md#slack-reply-reminders). |
 | `model` | string | no | none (Claude Code chooses) | The Claude model the persona's instance starts with, such as `opus`, `opus[1m]` or a full model ID, used exactly as written. Per persona only. See [Next-launch settings](#next-launch-settings). |
 | `effort` | string | no | none (Claude Code chooses) | The effort level the persona's instance starts with: `low`, `medium`, `high`, `xhigh` or `max`. Per persona only. See [Next-launch settings](#next-launch-settings). |
+| `reaction_notices` | boolean | no | `true` | Reaction Notice switch for this persona in both modes. Persona-only, with no top-level inheritance. See [Reaction notices](#reaction-notices). |
 
 `dm` is an object holding `enabled` and `contact`: `"dm": { "enabled": true, "contact": "U0123456789" }`. It applies in both modes. `invited` is an object holding `permission_prompts`: `"invited": { "permission_prompts": "C0123456789" }`. A path is absolute, `~` or starts with `~/`. Paths are never redacted: a log line, preview or error that names a path shows it in full, with `~` expanded.
+
+### Reaction notices
+
+`reaction_notices` turns Reaction Notices on (`true`) or off (`false`) for this persona in either mode. Omitting it means `true`. A [confirmed change](reload.md#what-a-confirmation-applies) applies immediately in place and keeps the instance.
 
 ### Channel entries
 
@@ -113,7 +113,7 @@ Give the shorter name a suffix, such as `dev_main` beside `dev_2`, or `team_main
 
 ### Credentials files
 
-Each persona's Slack tokens live in its own credentials file, and `config.json` names that file only by path. The file is a JSON object with exactly two keys:
+Each persona's Slack tokens live in its own credentials file, and `config.json` names that file only by path. The file must exist with its tokens before that persona can come up. It is a JSON object with exactly two keys:
 
 ```json
 {

@@ -384,6 +384,10 @@ describe('a persona change is classified by the section in force when both confi
     ],
     ['fungible: a working_directory change', FUNGIBLE_TOP, {}, { working_directory: '~/moved-work' }, 'destructive', 'working_directory'],
     ['fungible: a stop_hook_bootstrap change', FUNGIBLE_TOP, {}, { stop_hook_bootstrap: false }, 'inPlace', 'stop_hook_bootstrap'],
+    ['declarative: reaction_notices turned off', DECLARATIVE_TOP, {}, { reaction_notices: false }, 'inPlace', 'reaction_notices'],
+    ['fungible: reaction_notices turned off', FUNGIBLE_TOP, {}, { reaction_notices: false }, 'inPlace', 'reaction_notices'],
+    ['declarative: reaction_notices restored by removing false', DECLARATIVE_TOP, { reaction_notices: false }, {}, 'inPlace', 'reaction_notices'],
+    ['fungible: reaction_notices restored by writing true', FUNGIBLE_TOP, { reaction_notices: false }, { reaction_notices: true }, 'inPlace', 'reaction_notices'],
   ])('%s lands in its class', (_label, top, before, after, cls, setting) => {
     expect(PLAN_CLASSES[cls] as readonly string[]).toContain(setting)
     expect(channelModeOf(parse(input(top, after)))).toBe(channelModeOf(parse(input(top, before))))
@@ -432,5 +436,14 @@ describe('writing a key\'s default where it was absent (or removing it) is no ef
     ['fresh_system_prompt, true to absent', { fresh_system_prompt: true }, {}],
   ])('%s changes no setting and no persona', (_label, from, to) => {
     expect(classesOf(planBetween(input(from), input(to)))).toEqual(classes({ unchanged: ['alpha'], noEffectiveChange: true }))
+  })
+
+  test.each<[string, Record<string, unknown>, Partial<PersonaInput>, Partial<PersonaInput>]>([
+    ['declarative: reaction_notices, absent to true', DECLARATIVE_TOP, {}, { reaction_notices: true }],
+    ['declarative: reaction_notices, true to absent', DECLARATIVE_TOP, { reaction_notices: true }, {}],
+    ['fungible: reaction_notices, absent to true', FUNGIBLE_TOP, {}, { reaction_notices: true }],
+    ['fungible: reaction_notices, true to absent', FUNGIBLE_TOP, { reaction_notices: true }, {}],
+  ])('%s changes no setting and no persona', (_label, top, before, after) => {
+    expect(classesOf(planBetween(input(top, before), input(top, after)))).toEqual(classes({ unchanged: ['alpha'], noEffectiveChange: true }))
   })
 })
