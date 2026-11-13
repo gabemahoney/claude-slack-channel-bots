@@ -17,9 +17,10 @@ import type { ChannelMode, Persona } from '../src/config.ts'
 import type { QueueRecord, ReactionAcceptedInput, ReactionAcceptedRecord } from '../src/delivery-queue.ts'
 import { buildBotToolReactionErrorLine, buildBotToolReactionStoreFailedLine, buildReactionDroppedLine, buildReactionReceivedLine, REACTION_RECEIVED, type ReactionDroppedInput } from '../src/reaction-intake-diagnostics.ts'
 import { describeSlackCallFailure } from '../src/persona-connection-errors.ts'
-import { renderPersonaRef } from '../src/persona-identity.ts'
+import { personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { injectedInput, makeQueue } from './test-helpers/delivery-queue.ts'
+import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { isRestartPendingOrActive } from '../src/restart.ts'
 const CA = 'C0TEST001', CB = 'C0TEST002', CS = 'C0SHARED1', CX = 'C0OTHER01'
 let dir: string; let harnesses: RoutingHarness[]
@@ -358,7 +359,7 @@ describe('reaction-shaped ordinary input', () => {
   })
 })
 
-// SR-3.2, SR-3.3, SR-4.1 to SR-4.3, SR-8.1, SR-10.1: the real reaction intake over the real queue and preparation.
+// SR-3.2, SR-3.3, SR-4.1 to SR-4.3, SR-8.1, SR-9.3, SR-10.1: the real reaction intake over the real queue and preparation.
 describe('reaction intake', () => {
   const MSG_TS = '1700000000.000100', EVENT_TS = '1700000050.000200', NOW = 1700000100000, DM = 'D0TEST001'
   const ALPHA_BOT = 'U0ALPHABOT', BETA_BOT = 'U0BETABOT1', RETIRED_BOT = 'U0RETIRED1', HUMAN = 'U0REACTOR1', APP_BOT = 'B0REACTAPP'
@@ -389,6 +390,7 @@ describe('reaction intake', () => {
   function withAlpha(h: RoutingHarness, edit: (p: Persona) => Persona): void {
     h.config = { ...h.config!, personas: h.config!.personas.map(p => p.name === 'alpha' ? edit(p) : p) }
   }
+  const noticesOff = (h: RoutingHarness) => { withAlpha(h, p => ({ ...p, reaction_notices: false })) }
   function expectNoWork(h: RoutingHarness): void {
     for (const p of h.all) { expect(records(h, p.persona.name)).toEqual([]); expect(p.stub.callLog).toEqual([]) }
     expect(h.received).toEqual([])
@@ -460,8 +462,9 @@ describe('reaction intake', () => {
 
   // A sink that throws on every line, error lines included: each path's own log call meets it, and its ack and work are unchanged.
   const receivedLine = (h: RoutingHarness) => buildReactionReceivedLine(subject(h), h.queued('alpha')[0]!.accepted as ReactionAcceptedRecord)
-  const FAILING_SINK: Array<{ path: string; opts?: RoutingHarnessOptions; event?: () => Record<string, unknown>; afterAck?: (h: RoutingHarness) => void; acks: number; kinds: Array<QueueRecord['kind']>; calls: readonly string[]; lines: (h: RoutingHarness) => string[] }> = [
+  const FAILING_SINK: Array<{ path: string; opts?: RoutingHarnessOptions; arrange?: (h: RoutingHarness) => void; event?: () => Record<string, unknown>; afterAck?: (h: RoutingHarness) => void; acks: number; kinds: Array<QueueRecord['kind']>; calls: readonly string[]; lines: (h: RoutingHarness) => string[] }> = [
     { path: 'a logged drop', event: () => reaction({ item: { channel: CX } }), acks: 1, kinds: [], calls: [], lines: h => [buildReactionDroppedLine(subject(h), { reason: 'unserved-conversation', chat_id: CX, message_ts: MSG_TS })] },
+    { path: 'a notices-off drop', arrange: noticesOff, acks: 1, kinds: [], calls: [], lines: h => [buildReactionDroppedLine(subject(h), { reason: 'notices-off', chat_id: CA, message_ts: MSG_TS })] },
     { path: 'a decision failure', opts: { isRunBotIdentity: () => { throw new Error('run bot query failed') } }, acks: 1, kinds: [], calls: [], lines: () => [expect.stringContaining('error handling reaction event')] },
     { path: 'a rejected store', opts: { wrapAccept: () => async () => { throw new Error('accept rejected') } }, acks: 0, kinds: [], calls: [], lines: () => [expect.stringContaining('reaction store failed')] },
     { path: 'a failed ack', afterAck: () => { throw new Error('ack lost') }, acks: 1, kinds: ['accepted'], calls: [], lines: h => [receivedLine(h), expect.stringContaining('failed to ack reaction event')] },
@@ -474,6 +477,7 @@ describe('reaction intake', () => {
   ]
   test.each(FAILING_SINK)('with a log sink that throws on every call, $path still resolves with its own ack and work', async row => {
     const h = rh({ ...row.opts, logHook: () => { throw new Error('log sink failed') } })
+    row.arrange?.(h)
     await expect(h.receiveReaction((row.event ?? reaction)(), 'alpha', () => { h.order.push('ack'); row.afterAck?.(h) })).resolves.toBeUndefined()
     expect(acks(h)).toBe(row.acks)
     expect(records(h).map(r => r.kind)).toEqual(row.kinds)
@@ -526,10 +530,12 @@ describe('reaction intake', () => {
     { state: 'withdrawn', close: h => h.queue.append(keyOf(h), withdrawnRecord), prepares: false },
     { state: 'key-only', close: async h => { await h.queue.append(keyOf(h), withdrawnRecord); await h.queue.compact(keyOf(h)) }, prepares: false },
   ]
-  test.each(CLOSES)('a redelivered $state duplicate is acked with no new item or received line; only accepted-only work is prepared, after the ack', async row => {
+  // A retained key bypasses the current decision, reaction notices included (SR-9.3).
+  test.each(CLOSES.flatMap(row => [true, false].map(notices => ({ ...row, notices }))))('a redelivered $state duplicate, reaction notices $notices, is acked with no new item, received or drop line; only accepted-only work is prepared, after the ack', async row => {
     const h = rh(); const key = keyOf(h); const event = reaction()
     await h.receiveReaction(event, 'alpha', () => { h.order.push('ack'); throw new Error('ack lost') })
     await row.close(h)
+    if (!row.notices) noticesOff(h)
     const before = readQueue(dir, key); const mark = h.order.length
     let callsAtAck: string[] | undefined
     await h.receiveReaction(event, 'alpha', () => { h.order.push('ack'); callsAtAck = methods(h) })
@@ -541,6 +547,7 @@ describe('reaction intake', () => {
     expect(methods(h)).toEqual(row.prepares ? USER_LOOKUPS : [])
     expect(full(after)).toHaveLength(row.state === 'key-only' ? 0 : 1)
     if (row.state === 'key-only') expect(after).toContainEqual(expect.objectContaining({ compact: 'reaction-key', seq: 1 }))
+    expect(dropped(h)).toEqual([])
   })
 
   const REPLAYS: Array<{ change: string; event: () => Record<string, unknown>; apply: (h: RoutingHarness) => void }> = [
@@ -548,6 +555,7 @@ describe('reaction intake', () => {
     { change: 'channels', event: () => reaction(), apply: h => { withAlpha(h, p => ({ ...p, channels: [] })) } },
     { change: 'DMs', event: () => reaction({ item: { channel: DM } }), apply: h => { withAlpha(h, p => ({ ...p, dm: { ...p.dm, enabled: false } })) } },
     { change: 'identity', event: () => reaction(), apply: h => { h.identities.set(keyOf(h), { botUserId: 'U0NEWALPHA', botId: 'B0NEWALPHA' }) } },
+    { change: 'reaction notices', event: () => reaction(), apply: noticesOff },
   ]
   test.each(REPLAYS)('a retained accepted-only duplicate replays after the $change change under its stored mode, with no new decision or item', async row => {
     // The conversation lookup fails: the stored declarative mode keeps the notice, where fungible mode would withdraw it.
@@ -591,6 +599,81 @@ describe('reaction intake', () => {
     ])
     expect(acks(h)).toBe(9); expect(received(h)).toHaveLength(6)
     expect(records(h, 'beta')).toEqual([]); expect(h.p('beta').stub.callLog).toEqual([])
+  })
+
+  // SR-9.3: only the intake decision reads the setting. Work alpha accepted while its notices were on (one item held accepted-only at its
+  // ack, one prepared but not sent) is prepared and delivered by transcript receipt after they are turned off, over one engine harness's
+  // queue and clock. A confirmed reload's effect on the next event is reload-apply.test.ts's in-place row.
+  test('reaction work accepted while notices were on is prepared and delivered by receipt after they are turned off', async () => {
+    const cleanups: Array<() => unknown> = []
+    let releaseAck: () => void = () => {}
+    const ackGate = new Promise<void>(r => { releaseAck = r })
+    let held: Promise<void> | undefined
+    let failed = false
+    try {
+      const e = await makeEngineHarness({ keys: ['alpha', 'beta'].map(name => personaKey(name)) })
+      cleanups.unshift(() => e.cleanup())
+      const h = makeRoutingHarness([{ name: 'alpha' }, { name: 'beta' }], dir, {
+        restartDelayS: NEVER_FIRE_RESTART_DELAY_S, isRunBotIdentity: id => RUN_BOTS.has(id), preparationClock: e.clock,
+        stubOptions: { alpha: { botUserId: ALPHA_BOT }, beta: { botUserId: BETA_BOT } }, queue: e.realQueue,
+      })
+      // Routing-owned preparation stops before the engine harness stops the queue it owns.
+      cleanups.unshift(() => h.preparation.stop())
+      const key = keyOf(h)
+      let n = 0
+      const next = (over: ReactionOverrides = {}) => reaction({ event_ts: `1700000070.${String(++n).padStart(6, '0')}`, ...over })
+      const alphaNotices = () => h.config!.personas.find(p => p.name === 'alpha')!.reaction_notices
+      expect(alphaNotices()).toBe(true)
+      let ackCalled!: () => void
+      const atAck = new Promise<void>(r => { ackCalled = r })
+      held = h.receiveReaction(next({ text: CONTENT, item: { text: CONTENT } }), 'alpha', () => { ackCalled(); return ackGate })
+      await atAck
+      await h.receiveReaction(next(), 'alpha')
+      expect(h.queued('alpha').map(i => [i.accepted.seq, i.fixed !== undefined, i.delivered])).toEqual([[1, false, false], [2, true, false]])
+      noticesOff(h)
+      // Off in this composition: a new reaction is dropped with no item.
+      const mark = h.logs.length
+      await h.receiveReaction(next(), 'alpha')
+      expect(h.logs.slice(mark)).toEqual([buildReactionDroppedLine(subject(h), { reason: 'notices-off', chat_id: CA, message_ts: MSG_TS })])
+      expect(h.queued('alpha').map(i => i.accepted.seq)).toEqual([1, 2])
+      // Still off: the held item is prepared once its ack completes, and the engine delivers both by receipt.
+      releaseAck(); await held
+      expect(h.queued('alpha').map(i => i.fixed !== undefined)).toEqual([true, true])
+      e.engine.wake(key)
+      await e.until(() => h.queued('alpha').every(i => i.delivered))
+      expect(alphaNotices()).toBe(false)
+      expect(e.events.filter(ev => ev.type === 'item-delivered' && ev.key === key).map(ev => ev.type === 'item-delivered' && ev.seq)).toEqual([1, 2])
+      expect(e.records(key).filter(r => r.kind === 'delivered').map(r => r.seq)).toEqual([1, 2])
+      expect(e.textCalls(key).map(c => c.params.text)).toEqual(h.queued('alpha').flatMap(i => i.fixed!.parts))
+      expect(h.queued('alpha').flatMap(i => i.fixed!.parts).join('\n')).not.toContain(CONTENT)
+      assertNoLeak({ ...h.captured(), queue: writtenFile(queuePath(e.root, key)) })
+    } catch (err) {
+      failed = true
+      throw err
+    } finally {
+      // The held intake is released and awaited before its preparation and queue stop; each cleanup runs even if an earlier one rejects.
+      const errors: unknown[] = []
+      const settle = async (step: () => unknown) => { try { await step() } catch (err) { errors.push(err) } }
+      await settle(async () => { releaseAck(); await held })
+      for (const step of cleanups) await settle(step)
+      if (!failed && errors.length > 0) throw errors[0]
+    }
+  })
+
+  // SR-3.1 rule 4, SR-10.1: alpha's applied reaction_notices false; the silent drops before rule 4 stay silent.
+  const NOTICES_OFF: Array<{ case: string; mode?: ChannelMode; event: () => Record<string, unknown>; drop?: ReactionDroppedInput }> = [
+    { case: 'declarative: a reaction_added', event: () => reaction({ text: CONTENT, item: { text: CONTENT } }), drop: { reason: 'notices-off', chat_id: CA, message_ts: MSG_TS } },
+    { case: 'fungible: a reaction_removed in a channel alpha does not list', mode: 'fungible', event: () => reaction({ type: 'reaction_removed', item: { channel: CX } }), drop: { reason: 'notices-off', chat_id: CX, message_ts: MSG_TS } },
+    { case: "silent: a reaction on beta's message", event: () => reaction({ item_user: BETA_BOT }) },
+    { case: "silent: alpha's own reaction", event: () => reaction({ user: ALPHA_BOT }) },
+  ]
+  test.each(NOTICES_OFF)('with reaction notices off, $case is acked once with no item, preparation or network, logging only a notices-off drop\'s builder line', async row => {
+    const h = rh(row.mode === undefined ? {} : { mode: row.mode })
+    noticesOff(h)
+    await h.receiveReaction(row.event(), 'alpha')
+    expect(acks(h)).toBe(1); expectNoWork(h)
+    expect(h.logs).toEqual(row.drop ? [buildReactionDroppedLine(subject(h), row.drop)] : [])
+    expect(h.logs.join('\n')).not.toContain(CONTENT)
   })
 
   const DROPS: Array<{ reason: string; name?: string; mode?: ChannelMode; envelope?: EnvelopeOverrides; event: () => Record<string, unknown>; drop?: ReactionDroppedInput }> = [
@@ -807,6 +890,7 @@ describe('reaction intake', () => {
       { change: 'the receiving persona removed', apply: h => { removePersona(h, 'alpha') } },
       { change: 'the reacting persona removed', apply: h => { removePersona(h, 'beta') } },
       { change: 'the configuration removed', apply: h => { h.config = null } },
+      { change: 'reaction notices turned off', apply: noticesOff },
     ]
     test.each(RETAINED)('after $change, a renamed copy of a retained key is a duplicate with its stored mode and name, and no decision', async row => {
       const h = rh()
@@ -827,6 +911,8 @@ describe('reaction intake', () => {
       { change: 'the receiving persona removed', apply: h => { removePersona(h, 'alpha') } },
       { change: 'DMs disabled', input: { channel: DM }, apply: disableDms, drop: { reason: 'dm-disabled', chat_id: DM, message_ts: MSG_TS } },
       { change: 'the channel unserved', apply: h => { withAlpha(h, p => ({ ...p, channels: p.channels.filter(c => c.id !== CA) })) }, drop: { reason: 'unserved-conversation', chat_id: CA, message_ts: MSG_TS } },
+      // Beta's bot user is a Run Bot Identity and the hand-off has no envelope: neither skipped rule skips rule 4.
+      { change: 'reaction notices turned off', apply: noticesOff, drop: { reason: 'notices-off', chat_id: CA, message_ts: MSG_TS } },
     ]
     test.each(NEW_KEYS)('after $change, a new key is dropped under the configuration in effect, logging only a logged reason\'s builder line', async row => {
       const h = rh()

@@ -28,7 +28,7 @@ export interface ReactionIntakePersona {
 }
 
 /** The drop reasons that log a `reaction-dropped` line, in decision order. */
-export const REACTION_LOGGED_DROP_REASONS = ['no-reactor', 'dm-disabled', 'unserved-conversation', 'fungible-refused'] as const
+export const REACTION_LOGGED_DROP_REASONS = ['no-reactor', 'notices-off', 'dm-disabled', 'unserved-conversation', 'fungible-refused'] as const
 export type ReactionLoggedDropReason = typeof REACTION_LOGGED_DROP_REASONS[number]
 
 /** A logged drop: the conversation and reacted message when known, and the refusal only for `fungible-refused`. */

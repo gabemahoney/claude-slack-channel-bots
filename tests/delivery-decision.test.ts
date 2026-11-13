@@ -1,13 +1,15 @@
 /**
  * delivery-decision.test.ts — The pure inbound decisions: `decideDelivery`'s
  * steps in order, direct messages and group DMs, and `via` precedence; and
- * `decideReaction`'s rules in order, its accepted fields, its conversation
- * rule in both channel modes, its reading of the configuration passed at
- * each call, and the two rules a `bot-tool` reaction skips.
+ * `decideReaction`'s rules in order, its accepted fields, its
+ * `reaction_notices` rule (rule 4) and where it sits among the others, its
+ * conversation rule in both channel modes, its reading of the configuration
+ * passed at each call, and the two rules a `bot-tool` reaction skips.
  *
  * Imports the module directly: no server, no `mock.module`, no I/O. Message
  * events come from the Slack stub's event factories and reaction events from
- * `reaction` below; P and the applied view are built by `persona` / `view`.
+ * `reaction` below; P and the applied view are built by `persona` / `view`,
+ * and a reaction's receiver by `receiving`.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -489,12 +491,22 @@ function fungibleInputs(form: EnvelopeFlagForm = 'false'): ReactionDecisionInput
   return reactionInputs({ mode: 'fungible', isExtSharedChannel: envelopeFlagOf(ENVELOPE_FLAG_FORMS[form]) })
 }
 
+/** `base` as a reaction's receiver, its `reaction_notices` switch on unless `notices` is false. */
+function receiving(base: DeliveryPersona, notices = true): ReactionDecisionPersona {
+  return { ...base, reaction_notices: notices }
+}
+
+/** P as a reaction's receiver, its reaction notices on. */
+const RP = receiving(P)
 /** P with DMs off; with no confirmed bot user ID, absent or empty; listing only a `G…` ID; listing nothing. */
-const P_DM_OFF = persona('p', P_USER, P_BOT, P.channels, false)
-const P_NO_ID = persona('p', undefined, P_BOT, P.channels)
-const P_EMPTY_ID = persona('p', '', P_BOT, P.channels)
-const P_LISTS_G = persona('p', P_USER, P_BOT, [{ id: GROUP_DM, delivery: 'mentions' }])
-const P_NO_CHANNELS = persona('p', P_USER, P_BOT, [])
+const P_DM_OFF = receiving(persona('p', P_USER, P_BOT, P.channels, false))
+const P_NO_ID = receiving(persona('p', undefined, P_BOT, P.channels))
+const P_EMPTY_ID = receiving(persona('p', '', P_BOT, P.channels))
+const P_LISTS_G = receiving(persona('p', P_USER, P_BOT, [{ id: GROUP_DM, delivery: 'mentions' }]))
+const P_NO_CHANNELS = receiving(persona('p', P_USER, P_BOT, []))
+/** P with its reaction notices off; with DMs off too. */
+const P_NOTICES_OFF = receiving(P, false)
+const P_NOTICES_DM_OFF = receiving(persona('p', P_USER, P_BOT, P.channels, false), false)
 
 /** `base` whose channel entries throw when read, for fungible-mode rows: that mode never reads them. */
 function unreadChannels(base: ReactionDecisionPersona): ReactionDecisionPersona {
@@ -505,8 +517,9 @@ function unreadChannels(base: ReactionDecisionPersona): ReactionDecisionPersona 
     },
   })
 }
-const FP = unreadChannels(P)
+const FP = unreadChannels(RP)
 const FP_DM_OFF = unreadChannels(P_DM_OFF)
+const FP_NOTICES_OFF = unreadChannels(P_NOTICES_OFF)
 
 /** A deep copy of `value` with every object and array frozen; accessors are copied unread, functions and regexes kept. */
 function frozen<T>(value: T): T {
@@ -519,7 +532,7 @@ function frozen<T>(value: T): T {
 }
 
 /** `receiver`'s decision on `event`, each argument passed as a deep-frozen copy, so a write to one throws. */
-function react(event: unknown, receiver: ReactionDecisionPersona = P, inputs: ReactionDecisionInputs = reactionInputs()): ReactionDecision {
+function react(event: unknown, receiver: ReactionDecisionPersona = RP, inputs: ReactionDecisionInputs = reactionInputs()): ReactionDecision {
   return decideReaction(frozen(event), frozen(receiver), frozen(inputs))
 }
 
@@ -552,7 +565,7 @@ function row(
   label: string,
   event: unknown,
   expected: ReactionDecision,
-  receiver: ReactionDecisionPersona = P,
+  receiver: ReactionDecisionPersona = RP,
   inputs: ReactionDecisionInputs = reactionInputs(),
 ): ReactionRow {
   return [label, event, expected, receiver, inputs]
@@ -627,12 +640,12 @@ describe('reactions, rule 1: not-a-message-reaction', () => {
 
 describe("reactions, rule 2: not-own-message", () => {
   test.each<[string, unknown, ReactionDecisionPersona]>([
-    ["Q's message", reaction({ item_user: Q_USER }), P],
-    ['no item_user', reaction({ item_user: undefined }), P],
-    ['an empty item_user', reaction({ item_user: '' }), P],
-    ['a non-string item_user', reaction({ item_user: 7 }), P],
-    ["P's bot user ID after a space", reaction({ item_user: ` ${P_USER}` }), P],
-    ["P's bot user ID in lower case", reaction({ item_user: P_USER.toLowerCase() }), P],
+    ["Q's message", reaction({ item_user: Q_USER }), RP],
+    ['no item_user', reaction({ item_user: undefined }), RP],
+    ['an empty item_user', reaction({ item_user: '' }), RP],
+    ['a non-string item_user', reaction({ item_user: 7 }), RP],
+    ["P's bot user ID after a space", reaction({ item_user: ` ${P_USER}` }), RP],
+    ["P's bot user ID in lower case", reaction({ item_user: P_USER.toLowerCase() }), RP],
     ['P with no confirmed bot user ID', reaction(), P_NO_ID],
     ['P with no confirmed bot user ID, no item_user', reaction({ item_user: undefined }), P_NO_ID],
     ["P's confirmed bot user ID empty, item_user empty", reaction({ item_user: '' }), P_EMPTY_ID],
@@ -660,16 +673,31 @@ describe('reactions, rule 3: the reactor', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Reactions, rule 4: P's reaction notices
+// ---------------------------------------------------------------------------
+
+describe('reactions, rule 4: notices-off', () => {
+  test.each<ReactionRow>([
+    row('declarative: reaction_added', reaction(), dropped('notices-off'), P_NOTICES_OFF),
+    row('declarative: reaction_removed', reaction({ type: 'reaction_removed' }), dropped('notices-off'), P_NOTICES_OFF),
+    row("declarative: an integration's bot ID with no user", reaction({ user: undefined, bot_id: INTEGRATION_BOT }), dropped('notices-off'), P_NOTICES_OFF),
+    row('declarative: a DM, DMs on', reactionIn(DM), dropped('notices-off'), P_NOTICES_OFF),
+    row('fungible: reaction_added', reaction(), dropped('notices-off'), FP_NOTICES_OFF, fungibleInputs()),
+    row('fungible: reaction_removed', reaction({ type: 'reaction_removed' }), dropped('notices-off'), FP_NOTICES_OFF, fungibleInputs()),
+  ])("%s, otherwise accepted, with P's reaction notices off", expectRow)
+})
+
+// ---------------------------------------------------------------------------
 // Reactions: rule order
 // ---------------------------------------------------------------------------
 
 describe('reactions: the first rule an event fails decides', () => {
   test.each<ReactionRow>([
     row(
-      "every rule failing: a file reaction with no reactor on Q's message in a DM, DMs off",
+      "every rule failing: a file reaction with no reactor on Q's message in a DM, DMs and reaction notices off",
       reaction({ user: undefined, item_user: Q_USER }, { type: 'file', channel: DM }),
       dropped('not-a-message-reaction'),
-      P_DM_OFF,
+      P_NOTICES_DM_OFF,
     ),
     row("P's own reaction on Q's message", reaction({ user: P_USER, item_user: Q_USER }), dropped('not-own-message')),
     row("no reactor on Q's message", reaction({ user: undefined, item_user: Q_USER }), dropped('not-own-message')),
@@ -682,6 +710,17 @@ describe('reactions: the first rule an event fails decides', () => {
     row("P's own reaction in a DM, DMs on", reactionIn(DM, { user: P_USER }), dropped('own-reaction')),
     row("P's own reaction in a DM, DMs off", reactionIn(DM, { user: P_USER }), dropped('own-reaction'), P_DM_OFF),
     row('fungible: a DM reaction with no reactor, DMs off', reactionIn(DM, { user: undefined }), dropped('no-reactor'), FP_DM_OFF, fungibleInputs()),
+    // Rule 4 comes after every reactor rule and before every conversation rule.
+    row('reaction notices off: an item of type file', reaction({}, { type: 'file' }), dropped('not-a-message-reaction'), P_NOTICES_OFF),
+    row("reaction notices off: Q's message", reaction({ item_user: Q_USER }), dropped('not-own-message'), P_NOTICES_OFF),
+    row('reaction notices off: no reactor', reaction({ user: undefined }), dropped('no-reactor'), P_NOTICES_OFF),
+    row("reaction notices off: P's own reaction", reaction({ user: P_USER }), dropped('own-reaction'), P_NOTICES_OFF),
+    row("reaction notices off: Q's reaction in a channel nobody lists", reactionIn(NOBODY, { user: Q_USER }), dropped('bot-reaction'), P_NOTICES_OFF),
+    row('reaction notices off: a DM, DMs off', reactionIn(DM), dropped('notices-off'), P_NOTICES_DM_OFF),
+    row('reaction notices off: declarative, a channel nobody lists', reactionIn(NOBODY), dropped('notices-off'), P_NOTICES_OFF),
+    row('reaction notices off: fungible, a malformed ID, flag absent', reactionIn(MALFORMED), dropped('notices-off'), FP_NOTICES_OFF, fungibleInputs('absent')),
+    row('reaction notices off: fungible, a channel nobody lists, flag true', reactionIn(NOBODY), dropped('notices-off'), FP_NOTICES_OFF, fungibleInputs('true')),
+    row('reaction notices off: fungible, a DM, DMs off', reactionIn(DM), dropped('notices-off'), unreadChannels(P_NOTICES_DM_OFF), fungibleInputs()),
   ])('%s', expectRow)
 })
 
@@ -701,10 +740,10 @@ describe('reactions, rule 5: a conversation P serves now', () => {
       'declarative: a listed channel, flag true and a pattern nothing matches',
       reaction(),
       accepted(),
-      P,
+      RP,
       reactionInputs({ isExtSharedChannel: true, channelIdPattern: /(?!)/ }),
     ),
-    row('declarative: a channel nobody lists, flag false', reactionIn(NOBODY), dropped('unserved-conversation'), P, reactionInputs({ isExtSharedChannel: false })),
+    row('declarative: a channel nobody lists, flag false', reactionIn(NOBODY), dropped('unserved-conversation'), RP, reactionInputs({ isExtSharedChannel: false })),
     row('declarative: a DM, DMs on', reactionIn(DM), accepted({ channel: DM })),
     row('declarative: a DM, DMs on, P listing no channel', reactionIn(DM), accepted({ channel: DM }), P_NO_CHANNELS),
     row('declarative: a DM, DMs off', reactionIn(DM), dropped('dm-disabled'), P_DM_OFF),
@@ -762,7 +801,7 @@ describe('reactions: channel delivery, stored choices and the loop guard play no
     ],
   ])('%s: a plain message is not delivered, a reaction is accepted', (_label, channel, messageWith, messageOutcome, reactionWith, reactionOutcome) => {
     const message = decideDelivery(makeChannelMessage({ channel, text: 'plain words' }), P, [view(P), view(Q)], messageWith)
-    expect([message, react(reactionIn(channel), P, reactionWith)]).toStrictEqual([messageOutcome, reactionOutcome])
+    expect([message, react(reactionIn(channel), RP, reactionWith)]).toStrictEqual([messageOutcome, reactionOutcome])
   })
 })
 
@@ -771,12 +810,13 @@ describe('reactions: channel delivery, stored choices and the loop guard play no
 // ---------------------------------------------------------------------------
 
 describe('reactions: each call reads the configuration it is given', () => {
-  test('the same frozen events, decided after each change to the channels, the mode and the DMs switch', () => {
+  test('the same frozen events, decided after each change to the channels, the mode, the DMs switch and the reaction notices switch', () => {
     const inAll = frozen(reaction())
     const inDm = frozen(reactionIn(DM))
-    const listing = frozen(P)
+    const listing = frozen(RP)
     const notListing = frozen(P_NO_CHANNELS)
     const dmOff = frozen(P_DM_OFF)
+    const noticesOff = frozen(P_NOTICES_OFF)
     const declarative = frozen(reactionInputs())
     const fungible = frozen(fungibleInputs())
     const calls: [unknown, ReactionDecisionPersona, ReactionDecisionInputs][] = [
@@ -788,6 +828,9 @@ describe('reactions: each call reads the configuration it is given', () => {
       [inDm, dmOff, declarative],
       [inDm, dmOff, fungible],
       [inDm, listing, fungible],
+      [inDm, noticesOff, fungible],
+      [inAll, noticesOff, declarative],
+      [inAll, listing, declarative],
     ]
     expect(calls.map(([event, receiver, inputs]) => decideReaction(event, receiver, inputs))).toStrictEqual([
       accepted(),
@@ -798,6 +841,9 @@ describe('reactions: each call reads the configuration it is given', () => {
       dropped('dm-disabled'),
       dropped('dm-disabled'),
       accepted({ channel: DM, mode: 'fungible' }),
+      dropped('notices-off'),
+      dropped('notices-off'),
+      accepted(),
     ])
   })
 })
@@ -841,17 +887,17 @@ describe("reactions from another persona's react tool (origin bot-tool): only th
   }
 
   test.each<[label: string, event: unknown, receiver: ReactionDecisionPersona, slackEvent: ReactionDecisionInputs, botTool: ReactionDecisionInputs, expected: ReactionDecision]>([
-    ["Q's reaction on P's message in P's all channel", reaction({ user: Q_USER }), P, reactionInputs(), botToolInputs(), botToolAccepted()],
+    ["Q's reaction on P's message in P's all channel", reaction({ user: Q_USER }), RP, reactionInputs(), botToolInputs(), botToolAccepted()],
     [
       "a removed persona's reaction, a Run Bot Identity no persona has now",
       reaction({ user: RETIRED_USER }),
-      P,
+      RP,
       reactionInputs(),
       botToolInputs(),
       botToolAccepted({}, { user: RETIRED_USER }),
     ],
-    ["Q's bot user as the bot ID of a reaction with no user", reaction({ user: undefined, bot_id: Q_USER }), P, reactionInputs(), botToolInputs(), botToolAccepted({}, { bot_id: Q_USER })],
-    ["Q's reaction in a DM, DMs on", reactionIn(DM, { user: Q_USER }), P, reactionInputs(), botToolInputs(), botToolAccepted({ channel: DM })],
+    ["Q's bot user as the bot ID of a reaction with no user", reaction({ user: undefined, bot_id: Q_USER }), RP, reactionInputs(), botToolInputs(), botToolAccepted({}, { bot_id: Q_USER })],
+    ["Q's reaction in a DM, DMs on", reactionIn(DM, { user: Q_USER }), RP, reactionInputs(), botToolInputs(), botToolAccepted({ channel: DM })],
     [
       "fungible: Q's reaction in a channel nobody lists, flag false",
       reactionIn(NOBODY, { user: Q_USER }),
@@ -863,7 +909,7 @@ describe("reactions from another persona's react tool (origin bot-tool): only th
     [
       "Q's reaction with colons, a skin tone and padding in the emoji and both timestamps, kept exactly",
       reaction({ user: Q_USER, reaction: ' :+1::skin-tone-2: ', event_ts: ` ${EVENT_TS}` }, { ts: `${MESSAGE_TS} ` }),
-      P,
+      RP,
       reactionInputs(),
       botToolInputs(),
       botToolAccepted({ emoji: ' :+1::skin-tone-2: ', ts: ` ${EVENT_TS}`, message_ts: `${MESSAGE_TS} ` }),
@@ -875,31 +921,39 @@ describe("reactions from another persona's react tool (origin bot-tool): only th
   })
 
   test.each<ReactionRow>([
-    row('no item', reaction({ user: Q_USER, item: undefined }), dropped('not-a-message-reaction'), P, botToolInputs()),
-    row('a pin_added event on a message', reaction({ user: Q_USER, type: 'pin_added' }), dropped('not-a-message-reaction'), P, botToolInputs()),
-    row('an item of type file', reaction({ user: Q_USER }, { type: 'file' }), dropped('not-a-message-reaction'), P, botToolInputs()),
-    row('an empty event_ts', reaction({ user: Q_USER, event_ts: '' }), dropped('not-a-message-reaction'), P, botToolInputs()),
-    row("Q's reaction on Q's message", reaction({ user: Q_USER, item_user: Q_USER }), dropped('not-own-message'), P, botToolInputs()),
-    row("Q's reaction with no item_user", reaction({ user: Q_USER, item_user: undefined }), dropped('not-own-message'), P, botToolInputs()),
+    row('no item', reaction({ user: Q_USER, item: undefined }), dropped('not-a-message-reaction'), RP, botToolInputs()),
+    row('a pin_added event on a message', reaction({ user: Q_USER, type: 'pin_added' }), dropped('not-a-message-reaction'), RP, botToolInputs()),
+    row('an item of type file', reaction({ user: Q_USER }, { type: 'file' }), dropped('not-a-message-reaction'), RP, botToolInputs()),
+    row('an empty event_ts', reaction({ user: Q_USER, event_ts: '' }), dropped('not-a-message-reaction'), RP, botToolInputs()),
+    row("Q's reaction on Q's message", reaction({ user: Q_USER, item_user: Q_USER }), dropped('not-own-message'), RP, botToolInputs()),
+    row("Q's reaction with no item_user", reaction({ user: Q_USER, item_user: undefined }), dropped('not-own-message'), RP, botToolInputs()),
     row("Q's reaction, P with no confirmed bot user ID", reaction({ user: Q_USER }), dropped('not-own-message'), P_NO_ID, botToolInputs()),
     row("Q's reaction, P's confirmed bot user ID and item_user both empty", reaction({ user: Q_USER, item_user: '' }), dropped('not-own-message'), P_EMPTY_ID, botToolInputs()),
-    row('no user and no bot ID', reaction({ user: undefined }), dropped('no-reactor'), P, botToolInputs()),
-    row("P's own reaction, P's bot user being a Run Bot Identity too", reaction({ user: P_USER }), dropped('own-reaction'), P, botToolInputs()),
-    row("P's bot user ID as the bot ID of a reaction with no user", reaction({ user: undefined, bot_id: P_USER }), dropped('own-reaction'), P, botToolInputs()),
-    row("declarative: Q's reaction in a channel nobody lists", reactionIn(NOBODY, { user: Q_USER }), dropped('unserved-conversation'), P, botToolInputs()),
-    row("declarative: Q's reaction in a channel only Q lists", reactionIn(Q_ONLY, { user: Q_USER }), dropped('unserved-conversation'), P, botToolInputs()),
+    row('no user and no bot ID', reaction({ user: undefined }), dropped('no-reactor'), RP, botToolInputs()),
+    row("P's own reaction, P's bot user being a Run Bot Identity too", reaction({ user: P_USER }), dropped('own-reaction'), RP, botToolInputs()),
+    row("P's bot user ID as the bot ID of a reaction with no user", reaction({ user: undefined, bot_id: P_USER }), dropped('own-reaction'), RP, botToolInputs()),
+    row("declarative: Q's reaction in a channel nobody lists", reactionIn(NOBODY, { user: Q_USER }), dropped('unserved-conversation'), RP, botToolInputs()),
+    row("declarative: Q's reaction in a channel only Q lists", reactionIn(Q_ONLY, { user: Q_USER }), dropped('unserved-conversation'), RP, botToolInputs()),
     row("declarative: Q's reaction in a DM, DMs off", reactionIn(DM, { user: Q_USER }), dropped('dm-disabled'), P_DM_OFF, botToolInputs()),
     row("fungible: Q's reaction in a DM, DMs off, flag absent", reactionIn(DM, { user: Q_USER }), dropped('dm-disabled'), FP_DM_OFF, botToolFungibleInputs('absent')),
     row(
-      "every rule failing: a file reaction with no reactor on Q's message in a DM, DMs off",
+      "every rule failing: a file reaction with no reactor on Q's message in a DM, DMs and reaction notices off",
       reaction({ user: undefined, item_user: Q_USER }, { type: 'file', channel: DM }),
       dropped('not-a-message-reaction'),
-      P_DM_OFF,
+      P_NOTICES_DM_OFF,
       botToolInputs(),
     ),
-    row("ownership before the reactor: no reactor on Q's message", reaction({ user: undefined, item_user: Q_USER }), dropped('not-own-message'), P, botToolInputs()),
-    row("ownership before the reactor: P's own reaction on Q's message", reaction({ user: P_USER, item_user: Q_USER }), dropped('not-own-message'), P, botToolInputs()),
-    row("the reactor before the conversation: P's own reaction in a channel nobody lists", reactionIn(NOBODY, { user: P_USER }), dropped('own-reaction'), P, botToolInputs()),
+    // Neither skipped rule skips rule 4: Q is a Run Bot Identity and the event has no envelope flag.
+    row(
+      "reaction notices off, fungible: Q's reaction in a channel nobody lists, flag absent",
+      reactionIn(NOBODY, { user: Q_USER }),
+      dropped('notices-off'),
+      FP_NOTICES_OFF,
+      botToolFungibleInputs('absent'),
+    ),
+    row("ownership before the reactor: no reactor on Q's message", reaction({ user: undefined, item_user: Q_USER }), dropped('not-own-message'), RP, botToolInputs()),
+    row("ownership before the reactor: P's own reaction on Q's message", reaction({ user: P_USER, item_user: Q_USER }), dropped('not-own-message'), RP, botToolInputs()),
+    row("the reactor before the conversation: P's own reaction in a channel nobody lists", reactionIn(NOBODY, { user: P_USER }), dropped('own-reaction'), RP, botToolInputs()),
     row("the reactor before the conversation: P's own reaction in a DM, DMs off", reactionIn(DM, { user: P_USER }), dropped('own-reaction'), P_DM_OFF, botToolInputs()),
     row(
       "the reactor before the conversation, fungible: no reactor on a malformed ID, flag true",

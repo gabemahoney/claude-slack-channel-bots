@@ -2020,6 +2020,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       getChannelDelivery: () => channelDeliveryStore,
       // As server.ts wires it: a lost message for a persona that is not up restarts nothing.
       isPersonaUp,
+      // As server.ts wires it: the Run Bot Identities are the manager's (absent, every reactor counts as one).
+      isRunBotIdentity: (id) => connections.manager.isRunBotIdentity(id),
     })
     const routing = {...coreRouting, receive: async (...args: Parameters<typeof coreRouting.receive>) => {await queueReady; return coreRouting.receive(...args)}}
     connections.onEvent = createPersonaEventRouter({ routing, clientFor, getPersona: getAppliedPersona, log })

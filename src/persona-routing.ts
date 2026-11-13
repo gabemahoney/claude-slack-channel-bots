@@ -525,7 +525,8 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
 
   /**
    * `decideReaction` for persona `key` under the configuration in effect now:
-   * its channels, DMs switch and confirmed bot user ID, the mode,
+   * its channels, DMs switch, `reaction_notices` switch and confirmed bot
+   * user ID, the mode,
    * `CHANNEL_ID_RE` and the Run Bot Identities. A `bot-tool` reaction has no
    * envelope flag.
    */
@@ -538,11 +539,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     isExtSharedChannel?: unknown,
   ): ReactionDecision {
     const identity = deps.getBotIdentity(key)
-    // Extension point. A `notices-off` drop (the persona's reaction notices
-    // switch) belongs in decideReaction after its reactor rules and before its
-    // conversation rules, for both origins; this then passes the switch in
-    // effect, and logReactionDrop logs it with its own reaction-dropped variant.
-    return decideReaction(event, { key, botUserId: identity?.botUserId, channels: persona.channels, dmEnabled: persona.dm.enabled }, {
+    return decideReaction(event, { key, botUserId: identity?.botUserId, channels: persona.channels, dmEnabled: persona.dm.enabled, reaction_notices: persona.reaction_notices }, {
       mode: channelModeOf(config),
       origin,
       channelIdPattern: CHANNEL_ID_RE,

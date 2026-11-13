@@ -77,6 +77,7 @@ import {
   personaNotAppliedRefusal,
   type SessionEntry,
 } from '../src/registry.ts'
+import { buildReactionDroppedLine, REACTION_DROPPED } from '../src/reaction-intake-diagnostics.ts'
 import { renderNoopLogLine } from '../src/reload-apply.ts'
 import { DESTRUCTIVE_SETTINGS, MODE_SWITCH_SETTING, type DestructiveSetting, type InPlaceSetting } from '../src/reload-plan.ts'
 import {
@@ -6148,17 +6149,53 @@ describe('in-place and recorded section changes at confirmation (the in-place ro
 })
 
 describe('reaction_notices turned off and back on applies in place at confirmation, keeping the instance (the in-place row)', () => {
+  /** The reacted message's ts: the persona's own message in its own channel. */
+  const REACTED_TS = '1700000300.000100'
+
   test.each<ChannelMode>(['declarative', 'fungible'])(
-    "%s mode: bravo's setting is published only once confirmed, as one in-place update each way, with its session, connection and row kept and alpha untouched",
+    "%s mode: bravo's setting is published only once confirmed, as one in-place update each way, with its session, connection and row kept and alpha untouched; bravo's next new reaction follows it, alpha's never",
     async (mode) => {
       const { run, personas } = await runningIn(mode)
       const [alpha, bravo] = personas
       const bravoKey = h.key('bravo')
       const session = run.session('bravo')!
-      const bravoSide = slackSideOf(run, 'bravo')
-      const alphaUntouched = watchUntouched(run, 'alpha')
       const effective = () => run.serverConfig()!.personas.map((p) => [p.name, p.reaction_notices])
       expect(effective()).toEqual([['alpha', true], ['bravo', true]])
+      const accepted: Record<string, string[]> = { alpha: [], bravo: [] }
+      let n = 0
+      /**
+       * A new human reaction (a fresh `event_ts`) to the persona's message in
+       * its own channel, through the run's socket and event router. It is
+       * acked once, and either accepted (one more queued item, no drop line)
+       * or, with `notices` false, dropped with only the builder's
+       * `notices-off` line, no item and no Slack call. Every item the
+       * persona holds is one this helper saw accepted, so nothing dropped is
+       * ever backfilled.
+       */
+      async function react(name: string, notices: boolean, type: 'reaction_added' | 'reaction_removed' = 'reaction_added'): Promise<void> {
+        const eventTs = `1700000300.${String(++n).padStart(6, '0')}`
+        const channel = ownChannel(name)
+        const socket = run.stub(name).socket
+        const from = { acks: socket.acks.length, logs: run.logs.length, calls: run.stub(name).callLog.length }
+        await run.deliver(name, {
+          type, user: CONTACT, reaction: 'white_check_mark', item_user: run.stub(name).identity.botUserId, event_ts: eventTs,
+          item: { type: 'message', channel, ts: REACTED_TS },
+        })
+        expect(socket.acks.length - from.acks).toBe(1)
+        const drops = run.logs.slice(from.logs).filter((line) => line.startsWith(`[slack] ${REACTION_DROPPED}: `))
+        if (notices) {
+          accepted[name]!.push(eventTs)
+          expect(drops).toEqual([])
+        } else {
+          expect(drops).toEqual([buildReactionDroppedLine({ key: h.key(name), name }, { reason: 'notices-off', chat_id: channel, message_ts: REACTED_TS })])
+          expect(run.stub(name).callLog.length).toBe(from.calls)
+        }
+        expect(run.queued(name).map((i) => i.accepted.ts)).toEqual(accepted[name])
+      }
+
+      // On at the start, for both.
+      await react('bravo', true)
+      await react('alpha', true)
 
       // Off by writing false, then back on by removing the key again.
       for (const [next, value] of [[{ ...bravo!, reaction_notices: false }, false], [bravo!, true]] as const) {
@@ -6169,7 +6206,19 @@ describe('reaction_notices turned off and back on applies in place at confirmati
 
         await previewConfig(run, [alpha!, next], switchTop(mode))
         expect(effective()).toEqual([['alpha', true], ['bravo', !value]])
+        expect(run.since(cp).slackBuilds).toBe(0)
+        expect(run.since(cp).slackCalls).toEqual([])
 
+        // Previewed, not confirmed: bravo's next new reaction still follows the applied value, with no lifecycle work.
+        await react('bravo', !value)
+        await react('alpha', true)
+        expect(run.since(cp).lifecycle).toEqual([])
+        expect(h.pendingExists()).toBe(true)
+        assertNoLeak(run.captured())
+
+        const bravoSide = slackSideOf(run, 'bravo')
+        const alphaUntouched = watchUntouched(run, 'alpha')
+        const applyCp = run.checkpoint()
         h.confirm()
         await run.ticks.tick()
 
@@ -6181,17 +6230,23 @@ describe('reaction_notices turned off and back on applies in place at confirmati
         ])
         // Not a destination setting: no destinations.forget, nor any other composition call.
         expect(run.composition!.calls.slice(calls)).toEqual([])
-        expect(run.since(cp).slackBuilds).toBe(0)
-        expect(run.since(cp).slackCalls).toEqual([])
+        expect(run.since(applyCp).slackBuilds).toBe(0)
+        expect(run.since(applyCp).slackCalls).toEqual([])
         expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(applied + 1)
+        expect(slackSideOf(run, 'bravo')).toEqual(bravoSide)
+        alphaUntouched()
+        expect(run.session('bravo')).toBe(session)
+
+        // Confirmed: bravo's next new reactions, added and removed, follow the new value; alpha's are still accepted.
+        await react('bravo', value)
+        await react('bravo', value, 'reaction_removed')
+        await react('alpha', true)
       }
 
       expect(stubCallCount(run.composition!.agentDirector)).toBe(0)
       expect(run.session('bravo')).toBe(session)
       expect(session.connected).toBe(true)
-      expect(slackSideOf(run, 'bravo')).toEqual(bravoSide)
       expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
-      alphaUntouched()
       await expectNothingPendingAfter(run)
       expect(run.slackPosts()).toEqual([])
       expectModeNoLeak()

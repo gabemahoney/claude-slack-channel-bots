@@ -72,7 +72,7 @@
  * `decideReaction` is a separate decision, made before any network call or
  * store, for one raw `reaction_added` / `reaction_removed` event. It takes
  * the receiving persona P (key, confirmed bot user ID, channel entries, DMs
- * switch) and `ReactionDecisionInputs` (the channel mode, the envelope flag,
+ * switch, `reaction_notices` switch) and `ReactionDecisionInputs` (the channel mode, the envelope flag,
  * the channel-ID pattern, where the event came from, and whether an ID is one
  * of the Run Bot Identities: the bot user IDs confirmed for any persona
  * during this server run). The event comes from `slack-event`, a Slack event
@@ -91,7 +91,11 @@
  *    with neither, `no-reactor`. A reactor that is P's bot user ID is
  *    `own-reaction`; one of the Run Bot Identities is `bot-reaction`, for a
  *    `slack-event` only, since a `bot-tool` reactor is one by design.
- * 4. Conversation: one P serves now. A conversation ID starting with `D` is a
+ * 4. Reaction notices: P's `reaction_notices` switch is on; otherwise
+ *    `notices-off`, for either origin. Only this rule reads the switch, so an
+ *    item accepted while it was on is prepared and delivered whatever it
+ *    becomes later.
+ * 5. Conversation: one P serves now. A conversation ID starting with `D` is a
  *    DM, accepted when P's DMs switch is on and `dm-disabled` otherwise. In
  *    declarative mode any other conversation must be one of P's channel
  *    entries, whatever its `delivery`, else `unserved-conversation`; the
@@ -374,9 +378,14 @@ export interface AppliedPersonaView {
  * configuration in effect and P's confirmed identity at the event. Its
  * `botUserId` is P's confirmed bot user ID: empty or absent never matches a
  * reacted message's author, so no reaction is accepted. Its channel entries
- * are read in declarative mode only.
+ * are read in declarative mode only. `reaction_notices` is P's resolved
+ * `Persona.reaction_notices` in effect at the event; required, so no caller
+ * can leave it to a default.
  */
-export type ReactionDecisionPersona = Pick<DeliveryPersona, 'key' | 'botUserId' | 'channels' | 'dmEnabled'>
+export type ReactionDecisionPersona = Pick<DeliveryPersona, 'key' | 'botUserId' | 'channels' | 'dmEnabled'> & {
+  /** P's `reaction_notices` switch; off drops every reaction with `notices-off` (rule 4). */
+  reaction_notices: boolean
+}
 
 /**
  * Where a reaction `decideReaction` decides came from: `slack-event`, a
@@ -432,6 +441,7 @@ export type ReactionAcceptDecision = {
  * - `no-reactor`: neither `user` nor `bot_id`.
  * - `own-reaction`: P's own reaction.
  * - `bot-reaction`: a reaction by one of the Run Bot Identities.
+ * - `notices-off`: P's `reaction_notices` switch is off.
  * - `dm-disabled`: in a DM while P's DMs switch (`dm.enabled`) is off.
  * - `unserved-conversation`: in a conversation P does not list (declarative
  *   mode).
@@ -444,6 +454,7 @@ export type ReactionDropReason =
   | 'no-reactor'
   | 'own-reaction'
   | 'bot-reaction'
+  | 'notices-off'
   | 'dm-disabled'
   | 'unserved-conversation'
   | FungibleDropReason
@@ -680,8 +691,12 @@ export function decideReaction(
   if (reactor.id === ownUser) return { action: 'drop', reason: 'own-reaction' }
   if (inputs.origin !== BOT_TOOL_ORIGIN && inputs.isRunBotIdentity(reactor.id)) return { action: 'drop', reason: 'bot-reaction' }
 
-  // Every reactor rule comes before every conversation rule, so a Bot's
-  // reaction is `bot-reaction` in any conversation, served or not.
+  // Every reactor rule comes before the notices rule, and the notices rule
+  // before every conversation rule, so a Bot's reaction is `bot-reaction`
+  // whatever the switch, and with the switch off every other reaction is
+  // `notices-off` in any conversation, served or not.
+  if (!persona.reaction_notices) return { action: 'drop', reason: 'notices-off' }
+
   const conversationDrop = reactionConversationDropOf(reaction.channel, persona, inputs)
   if (conversationDrop !== undefined) return conversationDrop
 

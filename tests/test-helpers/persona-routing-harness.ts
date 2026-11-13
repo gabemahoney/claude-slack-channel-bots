@@ -568,6 +568,13 @@ export interface RoutingHarnessOptions {
   wrapPrepare?: (prepare: DeliveryPreparation['prepare']) => DeliveryPreparation['prepare']
   /** Runs for each log line once it is in `h.logs`; a throw makes the log seam throw. */
   logHook?: (line: string) => void
+  /**
+   * A queue its owner has started and stops (an engine harness's), used by
+   * the routing and its preparation instead of a queue of their own;
+   * `h.queueFaults` then injects nothing. Stop `h.preparation` before the
+   * owner stops it.
+   */
+  queue?: ReturnType<typeof createDeliveryQueue>
 }
 
 /** The stored-choice store a routing harness loads. */
@@ -938,8 +945,8 @@ export function makeRoutingHarness(
 
   const queueFaults: RoutingHarness['queueFaults'] = {}
   const queueFs = { ...fs, fsyncSync(fd: number) { if (queueFaults.fileSync && fs.fstatSync(fd).isFile()) queueFaults.fileSync(); fs.fsyncSync(fd) } }
-  const queue = createDeliveryQueue({ stateDir: baseDir, now: opts.dedupeClock, fs: queueFs })
-  const queueReady = queue.start()
+  const queue = opts.queue ?? createDeliveryQueue({ stateDir: baseDir, now: opts.dedupeClock, fs: queueFs })
+  const queueReady = opts.queue === undefined ? queue.start() : Promise.resolve()
   const h: RoutingHarness = {
     queue,
     queued: name => queue.items(byName(name).persona.key),
