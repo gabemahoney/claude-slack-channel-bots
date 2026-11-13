@@ -16,6 +16,8 @@ The first start of an install applies the file as it stands. After that, the ser
 
 A complete declarative `config.json` (`allow_invited_channels` absent), with channel personas `planner` and `reviewer` and DM-only `helpdesk`. Replace the channel IDs, user IDs and paths with your own.
 
+`reviewer` sets `"reaction_notices": false` to receive no new [Reaction Notices](bots.md#reaction-notices).
+
 `planner` and `helpdesk` inherit the top-level `claude_config_dir`. The server-wide settings select queued/delivered reactions and reply splitting. **Custom emoji must exist in the Slack workspace before configuration**; `spinthinking` is custom. Ensure both names below are available, or choose available names; see [Acknowledgement reactions](server-settings.md#acknowledgement-reactions).
 
 ```json
@@ -73,13 +75,9 @@ A complete declarative `config.json` (`allow_invited_channels` absent), with cha
 | `stop_hook_bootstrap` | boolean | no | top-level `stop_hook_bootstrap` | Slack reply reminder switch for this persona. Confirmed changes apply immediately; see [Slack reply reminders](bots.md#slack-reply-reminders). |
 | `model` | string | no | none (Claude Code chooses) | The Claude model the persona's instance starts with, such as `opus`, `opus[1m]` or a full model ID, used exactly as written. Per persona only. See [Next-launch settings](#next-launch-settings). |
 | `effort` | string | no | none (Claude Code chooses) | The effort level the persona's instance starts with: `low`, `medium`, `high`, `xhigh` or `max`. Per persona only. See [Next-launch settings](#next-launch-settings). |
-| `reaction_notices` | boolean | no | `true` | Reaction Notice switch for this persona in both modes. Persona-only, with no top-level inheritance. See [Reaction notices](#reaction-notices). |
+| `reaction_notices` | boolean | no | `true` | Reaction Notice switch for this persona in both modes. Persona-only, with no top-level inheritance. See [Reaction Notices](bots.md#reaction-notices). |
 
 `dm` is an object holding `enabled` and `contact`: `"dm": { "enabled": true, "contact": "U0123456789" }`. It applies in both modes. `invited` is an object holding `permission_prompts`: `"invited": { "permission_prompts": "C0123456789" }`. A path is absolute, `~` or starts with `~/`. Paths are never redacted: a log line, preview or error that names a path shows it in full, with `~` expanded.
-
-### Reaction notices
-
-`reaction_notices` turns Reaction Notices on (`true`) or off (`false`) for this persona in either mode. Omitting it means `true`. A [confirmed change](reload.md#what-a-confirmation-applies) applies immediately in place and keeps the instance.
 
 ### Channel entries
 
@@ -140,6 +138,8 @@ The shipped `slack-app-manifest.yml` also grants the `lists:read` and `lists:wri
 The `canvases:read` and `canvases:write` bot scopes let a persona read and maintain status canvases. CSCB itself makes no canvas call. An app created from an earlier manifest must have both scopes added and be re-installed; until then, calls requiring the missing scopes fail with `missing_scope`.
 
 The `reactions:read` bot scope lets a persona read the owner's reaction answers with `reactions.get`. An app created from an earlier manifest must have this scope added and be re-installed; until then, `reactions.get` fails with `missing_scope`.
+
+For the reaction events, `mpim:read` and reinstall required by an existing app, follow [Migration step 5](migration.md#migration).
 
 ### Channel delivery
 

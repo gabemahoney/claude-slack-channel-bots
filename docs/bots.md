@@ -18,7 +18,7 @@ Only `reply` takes a user ID; the other tools need a channel or DM conversation 
 
 Known limits of the fungible-mode targets:
 
-- CSCB makes no Slack call to learn whether a channel holds the persona's app, is externally shared or is a group DM. So in fungible mode it refuses no post, read, reaction or edit in an externally shared channel that the app belongs to, although fungible mode never delivers a message from such a channel.
+- For a tool call, CSCB makes no Slack call to learn whether a channel holds the persona's app, is externally shared or is a group DM. So in fungible mode it refuses no post, read, reaction or edit in an externally shared channel that the app belongs to, although fungible mode never delivers a message from such a channel.
 - The same holds in a group DM the app belongs to, except that Slack refuses reads there: the app has no `mpim:history` scope.
 - In fungible mode, `edit_message` on the persona's own earlier post in a channel its Slack app is not in, for example after the app was removed from the channel, is sent to Slack, and Slack accepts it.
 
@@ -162,11 +162,11 @@ The persona's own `react` still counts as its reply with notices off: successful
 
 The tag has `via="reaction"`, `reaction="added"` or `reaction="removed"`, `emoji` as the emoji name without colons, and an empty BODY. `user` and `user_id` identify the reactor (`bot_id` substitutes when there is no user); `chat_id`, `channel_name`, `message_id` and optional `thread_ts` identify the persona's reacted message. `message_id` is that message's timestamp; `ts` is when the reaction happened.
 
-Use the reactor's identity to decide whose answer it is: an emoji alone is not authorisation. Notices can repeat, need no reply, get no acknowledgement reaction and create no reply reminder. They do not count as reply-call targets or change any existing message's reminder eligibility.
+Use the reactor's identity to decide whose answer it is: an emoji alone is not authorisation. Notices can repeat, need no reply, get no acknowledgement reaction and create no reply reminder.
 
-No notice comes from the persona's own reactions, Slack reaction events by bots whose identities this CSCB run has confirmed (their deliberate `react` notices come through CSCB as above), reactions on other authors' messages, CSCB's server notices or permission prompts, or unserved conversations. Successful conversation lookup excludes group DMs; fungible mode also excludes externally shared conversations, while declarative listed external channels qualify. For lookup failures, see **A Reaction Notice has no thread timestamp** and **A Reaction Notice arrives from a listed group DM** in [Troubleshooting](troubleshooting.md#troubleshooting).
+No notice comes from the persona's own reactions, reactions Slack reports from the bots of personas this server runs (their deliberate `react` notices come through CSCB as above), reactions on other authors' messages, CSCB's server notices or permission prompts, or unserved conversations. Group DMs bring no notice; fungible mode also excludes externally shared conversations, while declarative listed external channels qualify. For lookup-failure exceptions, see **A Reaction Notice has no thread timestamp** and **A Reaction Notice arrives from a listed group DM** in [Troubleshooting](troubleshooting.md#troubleshooting).
 
-Acknowledgement reactions from sessions served by a different CSCB server can bring notices: their bot identities are outside this server's confirmed set.
+Acknowledgement reactions from sessions served by a different CSCB server can bring notices: those bots belong to another server.
 
 ---
 

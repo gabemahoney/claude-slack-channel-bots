@@ -448,6 +448,13 @@ timestamp, sender ID and the diagnostic's counts, paths or reason. They never ca
 message text. RAW event, injected-message and first actual Slack dispatch lines
 retain their existing text excerpts; receipt confirmation has its own line.
 
+The shared `message-delivered`, `message-retyped`, `message-not-taken-in`,
+`message-partial-receipt` and `delivery-stuck` classes use `source=slack`,
+`interject`, `cron` or `reaction`. For `reaction`, `chat_id` is the conversation,
+`ts` is the reaction event's timestamp (not the reacted message's), and
+`sender_id` is the reactor's user ID or bot ID. Reaction Notices get no
+acknowledgement stage.
+
 ### `message-not-saved`
 
 - **Line:** `[slack] message-not-saved: persona="<name>" (key=<key>) source=slack chat_id="<chat>" ts="<ts>" sender_id="<sender>" count=<n> path="<path>" code=<errno>`
@@ -571,7 +578,7 @@ evidence may no longer qualify after restart.
 - **Line:** `[slack] reaction-withdrawn: persona="<name>" (key=<key>) chat_id="<chat>" message_ts="<ts>" reason=<reason>[ failed_condition=<condition>]`
 - **Meaning:** A reaction to a message in `<chat>` was saved for this persona but is never typed to its bot. The queue passes it, so the messages behind it go on. `message_ts` is the reacted message's timestamp. When several reasons apply, the line names only the first of `server-post`, `conversation-unknown`, `group-dm` and `fungible-refused`. The decision is final, after a restart too, and it is logged once.
 - **Cause:** `server-post`: the reacted message is a notice or permission prompt CSCB posted as the persona. `conversation-unknown`: the channel was in fungible mode and Slack's conversation lookup failed or timed out. `group-dm`: the conversation is a group DM, in either mode. `fungible-refused`: the channel was in fungible mode and `failed_condition` names the check that failed: `not-a-channel` (not a public or private channel), `externally-shared` (shared with another organization), or Slack's `not_in_channel` or `channel_not_found` when CSCB read the message. The mode is the one in effect when the reaction was saved, not the mode now.
-- **Fix:** For `server-post` and `group-dm`, nothing: those reactions are never delivered. For `not_in_channel` or `channel_not_found`, invite the persona's app to the channel. For `conversation-unknown`, check the persona's Slack connection and that its app has the manifest's `channels:read`, `groups:read` and `mpim:read` scopes; re-install the app if it lacks one. Nothing resends a withdrawn reaction; a later reaction is decided afresh.
+- **Fix:** For `server-post` and `group-dm`, nothing: those reactions are never delivered. For `failed_condition=not-a-channel` or `externally-shared`, no action is needed: fungible mode never delivers those conversations. For `not_in_channel` or `channel_not_found`, invite the persona's app to the channel. For `conversation-unknown`, check the persona's Slack connection and that its app has the manifest's `channels:read`, `groups:read` and `mpim:read` scopes; re-install the app if it lacks one. Nothing resends a withdrawn reaction; a later reaction is decided afresh.
 
 ### `reaction-message-unknown`
 
@@ -1728,7 +1735,7 @@ notice causes come from AD state/refusals and queue age.
 :warning: *Message not taken in* — the message from U0SENDER1 for Alpha is still queued. CSCB keeps offering it (again at least every 15 minutes while it can type it) until the bot's transcript shows it. Later messages for this persona wait behind it. The bot may see it more than once.
 ```
 
-- **Meaning:** The first unconfirmed retype of this item has occurred.
+- **Meaning:** The first unconfirmed retype of this item has occurred. For a Reaction Notice, the sender shown in the notice is the reactor's user ID or bot ID.
 - **Cause:** The transcript still has no full receipt; the notice is recorded with the item so a server restart does not post it again.
 - **Fix:** Check the bot terminal and transcript. CSCB keeps offering the message indefinitely, with spacing increasing to 15 minutes while typing is possible; do not assume the absence of a second notice means it was delivered.
 
@@ -3954,10 +3961,12 @@ registers again with its history. If the new token is refused too, a new
   channel not looked up yet gets its name at once. Rows already written keep
   the ID: nothing rewrites them.
 - **DM rows keep their ID, whatever the scopes:** a row from a DM keeps the
-  DM's `D…` ID in `channel_name`, because a DM has no name. A row from a group
-  DM keeps its ID too: looking up a group DM's name needs `mpim:read`, which
-  the shipped manifest does not ask for. Neither is a sign of this problem,
-  and a re-install does not change them.
+  DM's `D…` ID in `channel_name`, because a DM has no name.
+- **Group-DM names need `mpim:read`:** the shipped manifest grants this bot
+  scope. An older app keeps group-DM IDs until you add the scope under
+  OAuth & Permissions → Bot Token Scopes and reinstall the app. With that
+  scope, group DMs can have names; the cache timing above still applies,
+  and rows already written are not rewritten.
 
 ---
 
@@ -7247,7 +7256,7 @@ message can acquire a reaction again.
 ### Symptom: A Reaction Notice arrives from a listed group DM
 
 - **Symptom:** A persona receives a notice from a group DM listed in its declarative `channels`.
-- **Cause:** When Slack's conversation lookup fails or times out, declarative mode keeps the item. A successful lookup excludes a group DM; ordinary group-DM messages never deliver. Acceptance can show [`reaction-received`](#reaction-received); this kept outcome requires neither `conversation-unknown` nor `reaction-message-unknown`.
+- **Cause:** When Slack's conversation lookup fails or times out, declarative mode keeps the item; a successful lookup excludes a group DM, and ordinary group-DM messages never deliver. No line marks this case: `conversation-unknown` is logged only in fungible mode. A separate failure to read the reacted message can still log [`reaction-message-unknown`](#reaction-message-unknown).
 - **Action:** Remove the group-DM conversation from the persona's `channels` and [confirm the change](../../docs/reload.md#reload) to prevent new intake; already accepted items are not cancelled. Check the app has `mpim:read`, reinstall it if needed and restore Slack lookup availability. See [`reaction-withdrawn`](#reaction-withdrawn) for successful group-DM exclusion and fungible mode's refusal when the conversation cannot be looked up.
 
 ### Symptom: No Reaction Notices for reactions by people or other apps

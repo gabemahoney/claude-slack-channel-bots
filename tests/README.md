@@ -439,8 +439,9 @@ tests/
     test-50-reaction-notices.sh    # shared mode, live against the Slack stub, two personas from the first start: Reaction Notices typed and receipted exactly
                                    # (Tool Posts in a listed, threaded, DM and mentions-only conversation), FIFO with ordinary items while alpha is held
                                    # (displayed-states hooks), dedupe across a restart, no acknowledgement or Reply Reminder, react on a delivered
-                                   # message in its open turn, a forged opener escaped, silent/logged drops and withdrawals in both channel modes, L1/L7 keeps;
-                                   # rerun against Epic t1.1b3.99's react claim, that react leg is its AC6 evidence. Bot-to-Bot: bravo's react on alpha's
+                                   # message in its open turn, a forged opener escaped, silent/logged drops and withdrawals in both channel modes;
+                                   # message-read failures kept without thread_ts, declarative conversation-lookup failures kept;
+                                   # Bot-to-Bot: bravo's react on alpha's
                                    # real Tool Post brings alpha one empty-body notice naming bravo (persona name, bot user ID) and Slack's own event for it
                                    # none; two overlapping react calls (ok then already_reacted, and the reverse) bring one notice each with unchanged
                                    # results; bravo's react on its own post brings neither persona anything
