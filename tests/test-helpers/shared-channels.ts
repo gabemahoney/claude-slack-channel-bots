@@ -175,6 +175,8 @@ export function makeMembershipHarness(stateDir: string, options: {
   realBringUp?: boolean; queuedAckReaction?: string; mode?: ChannelMode; dryRun?: boolean; reopen?: boolean; names?: string[];
   startTime?: number;
   channels?: Array<{ id: string; delivery: DeliveryMode }>;
+  /** Every persona's Notice Destination; defaults to its DM. */
+  permissionPrompts?: string;
   /** Defaults to the fixture counter, continuing past a reopened state's values. */
   threadHybridSince?: () => string;
   /** Observe the production scanner, separately from connection status. */
@@ -182,7 +184,7 @@ export function makeMembershipHarness(stateDir: string, options: {
 } = {}) {
   const names = options.names ?? ['alpha']
   const input = makePersonaConfigInput({ ...(options.queuedAckReaction ? { queued_ack_reaction: options.queuedAckReaction } : {}), channel_mode: options.mode ?? 'open', personas: names.map(name =>
-    makePersona({ name, channels: options.channels ?? [], permission_prompts: 'dm', dm: { enabled: true, contact: 'U0OPERATOR' } }, stateDir)) }, stateDir)
+    makePersona({ name, channels: options.channels ?? [], permission_prompts: options.permissionPrompts ?? 'dm', dm: { enabled: true, contact: 'U0OPERATOR' } }, stateDir)) }, stateDir)
   let refuseWrite: (state: SharedChannelState) => boolean = () => false
   let unsyncedWrite: (state: SharedChannelState) => boolean = () => false
   const writes: SharedChannelState[] = []
@@ -241,6 +243,36 @@ export function makeMembershipHarness(stateDir: string, options: {
   }
 }
 export type MembershipHarness = ReturnType<typeof makeMembershipHarness>
+
+import { applySharedMemberships, type SharedMembership, type VerifiedSharedMembership } from '../../src/shared-channels.ts'
+/** `key`'s history as reconciliations saved it before SR-3.5 dropped
+ * superseded repeats: `rounds` more complete reconciliations of an unchanged
+ * inventory, applied by the production membership application, which keeps
+ * every record. Each lists the persona's current members again and finds its
+ * left channels absent again, one repeat apiece in the scanner's order, then
+ * commits its inventory. Validated by the production parser. */
+export function withPreRuleScanRepeats(state: SharedChannelState, key: string, rounds: number, path = 'fixture-authority'): SharedChannelState {
+  const next = structuredClone(state)
+  const life = next.personas[key]
+  const inventory = life?.membershipInventory
+  if (!life || !inventory) throw new Error('withPreRuleScanRepeats needs a reconciled persona')
+  for (let round = 1; round <= rounds; round++) {
+    const scanId = `00000000-0000-4000-8000-${String(round).padStart(12, '0')}`
+    const facts = Object.entries(life.membership).filter(([, fact]) => fact.identity === inventory.identity)
+    const observation = ([channel, fact]: [string, SharedMembership]): VerifiedSharedMembership => fact.member
+      ? { event: `scan:${scanId}:${channel}`, channel, member: true, identity: fact.identity, boundary: fact.boundary,
+        observedThrough: fact.observedThrough, channelType: fact.channelType, isExtSharedChannel: fact.isExtSharedChannel }
+      : { event: `scan:${scanId}:absent:${channel}`, channel, member: false, identity: fact.identity, boundary: fact.boundary, observedThrough: fact.observedThrough }
+    const observations = [...facts.filter(([, fact]) => fact.member), ...facts.filter(([, fact]) => !fact.member)].map(observation)
+    const first = next.revision + 1
+    next.revision += observations.length + 1
+    applySharedMemberships(next, first, key, life.incarnation, observations)
+    life.membershipInventory = { ...life.membershipInventory!, recordedOrder: next.revision }
+  }
+  const parsed = parseSharedChannelState(serializeSharedChannelState(next), path)
+  if (!parsed) throw new Error('withPreRuleScanRepeats: expected a shared authority')
+  return parsed
+}
 
 /** Applied facts and exact input, excluding only the review ledger/revision.
  * A review metadata write is not an activation. Operator tests assert those

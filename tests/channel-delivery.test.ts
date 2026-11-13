@@ -262,6 +262,38 @@ test.each<{ label: string; alter: (state: SharedChannelState) => void }>([
   check(authority.snapshot())
 })
 
+// t2.yiv.sf.in (SR-8.9): the same checks over a history whose superseded scan
+// repeats were dropped. They cannot tell a dropped newest repeat (SR-3.5).
+test.each<{ label: string; event: string }>([
+  { label: 'the record that began a channel\'s current membership', event: 'scan:round-1:C0TEST001' },
+  { label: 'the named leave that began a channel\'s current membership', event: 'scan:round-4:absent:C0TEST002' },
+])('a retained scan history missing $label is refused by parser and constructor without publishing', ({ event }) => {
+  const authority = makeSharedAuthority(root, input())
+  const life = authority.incarnation('alpha')!
+  // Five reconciliations of two channels; C0TEST002 is absent from the last two.
+  for (let round = 1; round <= 5; round++) {
+    expect(authority.transactMembership('alpha', authority.revision, (next, order) => {
+      let position = order - 2
+      for (const channel of ['C0TEST001', 'C0TEST002']) {
+        const member = round < 4 || channel === 'C0TEST001'
+        applySharedMembership(next, ++position, 'alpha', life, { event: `scan:round-${round}:${member ? '' : 'absent:'}${channel}`, channel, member,
+          identity: 'app', boundary: next.personas['alpha']!.membership[channel]?.boundary ?? 0, observedThrough: '1700000000.000' })
+      }
+    }, 2).kind).toBe('applied')
+  }
+  const seed = readSharedState(root)!
+  expect(Object.keys(seed.personas['alpha']!.membershipEvents).sort()).toEqual([
+    'scan:round-1:C0TEST001', 'scan:round-1:C0TEST002', 'scan:round-4:absent:C0TEST002', 'scan:round-5:C0TEST001', 'scan:round-5:absent:C0TEST002'])
+  expect(seed.personas['alpha']!.leaves['C0TEST002']!.event).toBe('scan:round-4:absent:C0TEST002')
+  expect(parseSharedChannelState(serializeSharedChannelState(seed), authority.path)).toEqual(seed)
+  const before = readFileSync(authority.path)
+  delete seed.personas['alpha']!.membershipEvents[event]
+  expect(() => parseSharedChannelState(serializeSharedChannelState(seed), authority.path)).toThrow()
+  expect(() => createSharedChannelAuthority(authority.path, seed)).toThrow()
+  expect(readFileSync(authority.path)).toEqual(before)
+  check(authority.snapshot())
+})
+
 describe('thread fields in the production format', () => {
   const ORDERED = 'The shared channel authority has an invalid ordered assignment.'
   const MARKER = 'The shared channel authority has an invalid Thread Memory marker.'
@@ -550,10 +582,10 @@ describe('membership transactions copy only their persona', () => {
   const observe = (authority: SharedChannelAuthority, key: string, channel: string, member: boolean, event: string) =>
     authority.observeMembership(key, authority.incarnation(key)!, { event, identity: 'app', channel, member, boundary: boundaryOf(authority, key, channel) }, authority.revision)
   /** One scan page's positives, as the scanner batches them. */
-  const page = (authority: SharedChannelAuthority, key: string, channels: string[], scan: string) => authority.transactMembership(key, authority.revision, (next, order) => {
+  const page = (authority: SharedChannelAuthority, key: string, channels: string[], scan: string, identity = 'app') => authority.transactMembership(key, authority.revision, (next, order) => {
     let position = order - channels.length
     for (const channel of channels) applySharedMembership(next, ++position, key, authority.incarnation(key)!, { event: `scan:${scan}:${channel}`, channel, member: true,
-      identity: 'app', boundary: boundaryOf(authority, key, channel), observedThrough: '1700000000.000', channelType: 'channel', isExtSharedChannel: false })
+      identity, boundary: boundaryOf(authority, key, channel), observedThrough: '1700000000.000', channelType: 'channel', isExtSharedChannel: false })
   }, channels.length)
   const wholeState = (value: unknown) => typeof value === 'object' && value !== null && (value as { format?: unknown }).format === SHARED_CHANNEL_FORMAT
   /** An open-mode authority in `dir` whose observers record each publication
@@ -904,10 +936,14 @@ describe('membership transactions copy only their persona', () => {
     writeSharedState(root, state)
     const authority = createSharedChannelAuthority(sharedChannelPath(root), state, { threadHybridSince: () => 'since' })
     const ids = channelPopulation(SR8_SHARED_LIST_CHANNELS).map(channel => channel.id)
-    // One full scan of both personas: a write per page of positives.
+    // One full scan of both personas: a write per page of positives. Each
+    // round alternates the issuing identity, so its records are change records
+    // SR-3.5 keeps and the state grows by a round of records per scan, as it
+    // did when every repeat was kept. Unchanged scans now add only the width of
+    // their numbers, too little to measure retained text against.
     const scan = (round: number) => {
       for (const key of ['alpha', 'beta']) for (let at = 0; at < ids.length; at += MEMBERSHIP_PAGE_LIMIT) {
-        expect(page(authority, key, ids.slice(at, at + MEMBERSHIP_PAGE_LIMIT), `round-${round}`).kind).toBe('applied')
+        expect(page(authority, key, ids.slice(at, at + MEMBERSHIP_PAGE_LIMIT), `round-${round}`, `app-${round % 2}`).kind).toBe('applied')
       }
     }
     // String text lives outside the collected heap; a full collection leaves
@@ -919,8 +955,8 @@ describe('membership transactions copy only their persona', () => {
     const last = reading()
     const grown = (last.retained - first.retained) / (last.bytes - first.bytes)
     console.info(`retained text per state byte added: ${grown.toFixed(2)} (state ${first.bytes} -> ${last.bytes} bytes)`)
-    // Measured: 5.6 with container encodings kept, 1.3 to 1.9 with the
-    // records' alone, about 0.3 with none kept (before Task ws).
+    // Measured in this file and run alone: 5.6 and 9.8 with container
+    // encodings kept (029eb0f7), 1.5 and 1.9 with the records' alone.
     expect(grown).toBeLessThan(3)
     expect(readFileSync(authority.path).toString()).toBe(JSON.stringify(authority.snapshot(), null, 2) + '\n')
     check(authority.snapshot())

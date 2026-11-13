@@ -2,7 +2,8 @@ import { afterEach, expect, spyOn, test } from 'bun:test'
 import { mkdtempSync, rmSync, mkdirSync, symlinkSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { makeMembershipHarness, membershipPage, readSharedState, writeSharedState, SHARED_CHANNEL_IDS as C, type MembershipHarness, configBytes, channelPopulation } from './test-helpers/shared-channels.ts'
+import { isDeepStrictEqual } from 'node:util'
+import { makeMembershipHarness, membershipPage, readSharedState, writeSharedState, SHARED_CHANNEL_IDS as C, type MembershipHarness, configBytes, channelPopulation, withPreRuleScanRepeats } from './test-helpers/shared-channels.ts'
 import { makeDeferredWebApiCall, makeDeferredConnect, makeChannelMessage, makeDm } from './test-helpers/slack-stub.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { MEMBERSHIP_REQUEST_TIMEOUT_MS, MEMBERSHIP_ATTEMPT_TIMEOUT_MS, MEMBERSHIP_RETRY_MIN_MS, MEMBERSHIP_RETRY_MAX_MS, MEMBERSHIP_PAGE_LIMIT } from '../src/channel-membership-retry.ts'
@@ -11,7 +12,7 @@ import { createPersonaEventRouter } from '../src/persona-event-router.ts'
 import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
 import { _resetRegistry } from '../src/registry.ts'
 import { _resetAckTracker } from '../src/ack-tracker.ts'
-import { parseSharedChannelState, sharedPersonaChannels, SHARED_CHANNEL_FORMAT } from '../src/shared-channels.ts'
+import { absenceReplacementBinding, parseSharedChannelState, sharedPersonaChannels, SHARED_CHANNEL_FORMAT, type SharedPersona } from '../src/shared-channels.ts'
 import { DurableWriteUnsyncedError } from '../src/atomic-write.ts'
 import type { MembershipEvidence } from '../src/channel-membership-evidence.ts'
 import type { AcceptedRecord } from '../src/delivery-queue.ts'
@@ -2434,4 +2435,328 @@ test('a membership history commits as whole-state transactions would: writes, li
   // Only the operator assignment copies the whole state on the membership path.
   expect([narrow.conflicts, narrow.copies, whole.copies > narrow.copies]).toEqual([[C.primary], 1, true])
   expect(narrow.history).toEqual(whole.history)
+})
+
+// t2.yiv.sf.in (SR-3.5): every reconciliation kept a scan record for each
+// channel, so an unchanged inventory grew the shared state with each rescan.
+/** Each channel's scan record identifiers, oldest first. */
+function scanRecords(life: Pick<SharedPersona, 'membershipEvents'>): Map<string, string[]> {
+  const channels = new Map<string, string[]>()
+  for (const [id, event] of Object.entries(life.membershipEvents).sort(([, a], [, b]) => a.order - b.order)) {
+    if (id.startsWith('scan:')) channels.set(event.channel, [...channels.get(event.channel) ?? [], id])
+  }
+  return channels
+}
+/** The characters a state's numbers take in its encoding. */
+const numberWidth = (value: unknown): number => typeof value === 'number' ? JSON.stringify(value).length
+  : typeof value === 'object' && value !== null ? Object.values(value).reduce<number>((sum, item) => sum + numberWidth(item), 0) : 0
+/** Each record's scan, so `scan:<scan>:<channel>` reads `<scan>`. */
+const scanOf = (id: string) => id.split(':')[1]!
+
+test('unchanged reconciliations of SR8_SHARED_LIST_CHANNELS channels keep each channel its beginning and newest scan records, a flat record count and a size flat apart from number width', async () => {
+  const channels = channelPopulation(SR8_SHARED_LIST_CHANNELS), ids = channels.map(c => c.id)
+  const pages = Math.ceil(ids.length / MEMBERSHIP_PAGE_LIMIT)
+  const f = fixture({ channels })
+  async function reconcile() {
+    stub(f).script.inventory.push(...Array.from({ length: pages }, (_, i) =>
+      membershipPage(ids.slice(i * MEMBERSHIP_PAGE_LIMIT, (i + 1) * MEMBERSHIP_PAGE_LIMIT), i + 1 < pages ? `page-${i + 1}` : undefined)))
+    const writes = f.writes.length
+    if (writes) { f.scanner.request('alpha'); await f.h.clock.advanceTo(f.scanner.status('alpha').nextAttemptAt!) } else { await f.start(); await f.scan() }
+    expect(f.scanner.status('alpha')).toMatchObject({ state: 'complete', pages, positives: ids.length })
+    // Nothing else writes: one write per page of positives, then the inventory commit.
+    expect(f.writes.length - writes).toBe(pages + 1)
+    const state = readSharedState(f.stateDir)!
+    expect(state).toEqual(f.authority.snapshot())
+    return { life: state.personas.alpha!, size: readFileSync(f.authority.path).length, width: numberWidth(state) }
+  }
+  const first = await reconcile()
+  const beginnings = scanRecords(first.life)
+  expect([...beginnings.keys()]).toEqual(ids)
+  expect(ids.every(id => beginnings.get(id)!.length === 1 && first.life.membership[id]!.boundary === first.life.membershipEvents[beginnings.get(id)![0]!]!.order)).toBe(true)
+  const scans = [scanOf(beginnings.get(ids[0]!)![0]!)]
+  let second: Awaited<ReturnType<typeof reconcile>> | undefined
+  for (let round = 2; round <= 4; round++) {
+    const now = await reconcile(), records = scanRecords(now.life)
+    const newest = records.get(ids[0]!)!.at(-1)!
+    scans.push(scanOf(newest))
+    // Each channel keeps the change record that began its membership and this
+    // reconciliation's repeat; the earlier repeats are gone.
+    expect({ channels: records.size, records: [...new Set([...records.values()].map(kept => kept.length))] }).toEqual({ channels: ids.length, records: [2] })
+    expect(ids.every(id => {
+      const [beginning, repeat] = records.get(id)!
+      const event = now.life.membershipEvents[repeat!]!
+      return beginning === beginnings.get(id)![0] && scanOf(repeat!) === scans.at(-1) &&
+        event.boundary === now.life.membershipEvents[beginning!]!.order && now.life.membership[id]!.boundary === event.boundary
+    })).toBe(true)
+    expect(Object.keys(now.life.membershipEvents)).toHaveLength(2 * ids.length)
+    console.info(`reconciliation ${round}: scan records ${Object.keys(now.life.membershipEvents).length}, state ${now.size} bytes, number width ${now.width}`)
+    if (!second) { second = now; continue }
+    // Later application positions only widen numbers; nothing else grows.
+    expect(Math.abs(now.size - second.size)).toBeLessThanOrEqual(now.width - second.width)
+  }
+  expect(new Set(scans).size).toBe(4)
+})
+
+/** SR-3.5's bound: a channel keeps at most one scan repeat, its newest record. */
+function expectRepeatsBounded(life: Pick<SharedPersona, 'membershipEvents'>) {
+  const newest = new Map<string, number>()
+  for (const event of Object.values(life.membershipEvents)) newest.set(event.channel, Math.max(newest.get(event.channel) ?? 0, event.order))
+  expect(Object.entries(life.membershipEvents).filter(([id, event]) => id.startsWith('scan:') && event.boundary < event.order &&
+    event.order !== newest.get(event.channel)).map(([id]) => id)).toEqual([])
+}
+
+test.each(['scan positives', 'scan absences', 'live event', 'reviewed absence replacement'] as const)('a history saved before SR-3.5 reads as saved; the persona\'s first %s application drops every superseded repeat on every channel and keeps every other record', async route => {
+  const [quiet, joined] = channelPopulation(2).map(c => c.id) as [string, string]
+  const seed = fixture()
+  stub(seed).script.inventory.push(membershipPage([C.primary, C.secondary, quiet, joined]))
+  await seed.start(); await seed.scan()
+  await seed.event(false, C.secondary, { id: 'EvSEEDLEAVE' })
+  await seed.close()
+  const saved = readSharedState(seed.stateDir)!.personas.alpha!.membershipEvents
+  // Three more unchanged reconciliations, each keeping a repeat per channel:
+  // C.secondary's are absences after its leave.
+  const state = withPreRuleScanRepeats(readSharedState(seed.stateDir)!, 'alpha', 3)
+  writeSharedState(seed.stateDir, state)
+  const before = state.personas.alpha!, bytes = readFileSync(seed.authority.path)
+  const seeded = new Map<string, string[]>()
+  for (const [id, event] of Object.entries(before.membershipEvents).sort(([, a], [, b]) => a.order - b.order)) {
+    if (!Object.hasOwn(saved, id)) seeded.set(event.channel, [...seeded.get(event.channel) ?? [], id])
+  }
+  expect([...seeded.values()].map(ids => ids.length)).toEqual([3, 3, 3, 3])
+  const f = fixture({ reopen: true, startTime: seed.h.clock.now() + 1 }, seed.stateDir)
+  await f.start()
+  // Reading it repairs nothing.
+  expect([f.writes, f.authority.readable, readFileSync(f.authority.path)]).toEqual([[], true, bytes])
+  expect(f.authority.snapshot()).toEqual(state)
+  if (route === 'scan positives') {
+    // The first page lists one channel; its write still drops every channel's superseded repeats.
+    stub(f).script.inventory.push(membershipPage([quiet], 'next'), membershipPage([C.primary, joined])); await f.scan()
+  } else if (route === 'scan absences') {
+    stub(f).script.inventory.push(membershipPage([])); await f.scan()
+  } else if (route === 'live event') {
+    await f.event(true, joined, { id: 'EvROUTEJOIN' })
+    expect(stub(f).socket.acks).toHaveLength(1)
+  } else {
+    // A choice confirmed while collecting holds C.primary's absence for review;
+    // neither write changes the history.
+    const held = makeDeferredWebApiCall()
+    stub(f).script.inventory.push(held.outcome); await f.scan()
+    expect(f.assign(C.primary, 'off').kind).toBe('applied')
+    held.settle(membershipPage([])); await f.h.clock.flush()
+    const binding = absenceReplacementBinding(f.authority.snapshot(), 'alpha', C.primary)!
+    expect(f.authority.applyReviewed(f.authority.sourceBytes(), f.authority.revision, [{ key: 'alpha', channel: C.primary, delivery: 'all',
+      incarnation: f.authority.incarnation('alpha'), absenceReplacement: binding }]).kind).toBe('applied')
+    expect(Object.keys(life(f).replacedAbsences!)).toEqual([binding])
+  }
+  if (route.startsWith('scan')) expect(f.scanner.status('alpha').state).toBe('complete')
+  const first = f.writes.findIndex(written => !isDeepStrictEqual(written.personas.alpha!.membershipEvents, before.membershipEvents))
+  expect(first).toBe(route === 'reviewed absence replacement' ? 2 : 0)
+  const applied = f.writes[first]!.personas.alpha!.membershipEvents
+  const wrote = new Set(Object.entries(applied).filter(([id]) => !Object.hasOwn(before.membershipEvents, id)).map(([, event]) => event.channel))
+  expect([...wrote].sort()).toEqual({ 'scan positives': [quiet], 'scan absences': [C.primary, C.secondary, quiet, joined].sort(),
+    'live event': [joined], 'reviewed absence replacement': [C.primary] }[route])
+  // Only a channel this application did not write keeps a seeded repeat, its newest.
+  const kept = Object.keys(before.membershipEvents).filter(id => {
+    const channel = before.membershipEvents[id]!.channel
+    return !seeded.get(channel)!.includes(id) || (!wrote.has(channel) && seeded.get(channel)!.at(-1) === id)
+  })
+  expect(Object.keys(applied).filter(id => Object.hasOwn(before.membershipEvents, id)).sort()).toEqual(kept.sort())
+  for (const id of kept) expect(applied[id]).toEqual(before.membershipEvents[id])
+  expect(Object.keys(saved).every(id => Object.hasOwn(applied, id))).toBe(true)
+  expectRepeatsBounded(f.authority.snapshot().personas.alpha!)
+  expect(readSharedState(f.stateDir)).toEqual(f.authority.snapshot())
+})
+
+/** A complete reconciliation listing `channels`, through the production scanner. */
+async function reconcile(f: MembershipHarness, channels: string[]) {
+  stub(f).script.inventory.push(membershipPage(channels))
+  f.scanner.request('alpha'); await f.h.clock.advanceTo(f.scanner.status('alpha').nextAttemptAt!)
+  expect(f.scanner.status('alpha').state).toBe('complete')
+  expectRepeatsBounded(life(f))
+}
+
+test('with superseded repeats dropped, live and scan leaves, a removed destination, exact replay, repeated complete absence, restart and rejoin keep AC-J07 and AC-J16 results and order', async () => {
+  const historical = channelPopulation(1)[0]!.id, listed = [C.primary, C.secondary, historical]
+  // C.primary is the Notice Destination; C.private is preconfigured and never joined.
+  let f = fixture({ channels: [{ id: C.primary, delivery: 'all' }, { id: C.private, delivery: 'all' }], permissionPrompts: C.primary })
+  stub(f).script.inventory.push(membershipPage(listed)); await f.start(); await f.scan()
+  await reconcile(f, listed)
+  const began = scanRecords(life(f))
+  expect(listed.map(channel => began.get(channel)!.length)).toEqual([2, 2, 2])
+  // AC-J07: a live leave of the destination removes its entry and its own record proves the removal.
+  const leaveEvent = { id: 'EvLEAVEDEST', timestamp: ((f.h.clock.now() + 1) / 1000).toFixed(3) }
+  await f.event(false, C.primary, leaveEvent)
+  const leave = { event: 'EvLEAVEDEST', boundary: life(f).membershipEvents.EvLEAVEDEST!.order, incarnation: life(f).incarnation }
+  expect<unknown[]>([life(f).leaves[C.primary], life(f).removedDestinations[C.primary], life(f).assignments[C.primary]]).toEqual([leave, leave, undefined])
+  // That application dropped the repeat it superseded; the record that began the membership stays.
+  expect(scanRecords(life(f)).get(C.primary)).toEqual([began.get(C.primary)![0]])
+  // Replaying the exact event acknowledges with no write or order.
+  const replay = async () => {
+    const before = { state: f.authority.snapshot(), writes: f.writes.length, acks: stub(f).socket.acks.length }
+    await f.event(false, C.primary, leaveEvent)
+    expect([f.authority.snapshot(), f.writes.length, stub(f).socket.acks.length]).toEqual([before.state, before.writes, before.acks + 1])
+  }
+  await replay()
+  // A future destination choice stays inactive and retained through replay,
+  // repeated complete absence and restart, with no second removal or order.
+  expect(f.assign(C.primary, 'mentions').kind).toBe('applied')
+  const future = life(f).assignments[C.primary]
+  await replay()
+  const afterLeave = (current: MembershipHarness) => {
+    const state = life(current)
+    expect([state.assignments[C.primary], state.leaves[C.primary], state.removedDestinations[C.primary], state.membershipEvents.EvLEAVEDEST?.order])
+      .toEqual([future, leave, leave, leave.boundary])
+    expect(state.membership[C.primary]).toMatchObject({ member: false, boundary: leave.boundary })
+    expect(reading(current)).toEqual({ kind: 'ineligible', reason: 'absent' })
+    // AC-J16: the never-joined preference stays inactive with no membership.
+    expect<unknown[]>([state.assignments[C.private]?.delivery, state.membership[C.private], state.leaves[C.private]]).toEqual(['all', undefined, undefined])
+    expect(reading(current, C.private)).toEqual({ kind: 'ineligible', reason: 'absent' })
+    // Each repeated absence supersedes the previous one.
+    const records = scanRecords(state).get(C.primary)!
+    expect(records).toHaveLength(2)
+    expect(records[0]).toBe(began.get(C.primary)![0])
+    expect(records[1]).toMatch(/^scan:[^:]+:absent:C0TEST001$/)
+  }
+  const absences: string[] = []
+  for (let i = 0; i < 2; i++) {
+    await reconcile(f, [C.secondary, historical]); afterLeave(f)
+    absences.push(scanRecords(life(f)).get(C.primary)![1]!)
+  }
+  await f.close()
+  f = fixture({ reopen: true, startTime: f.h.clock.now() + 1 }, f.stateDir)
+  stub(f).script.inventory.push(membershipPage([C.secondary, historical])); await f.start(); await f.scan()
+  afterLeave(f)
+  absences.push(scanRecords(life(f)).get(C.primary)![1]!)
+  expect(new Set(absences).size).toBe(3)
+  // AC-J16: a historically joined channel's absence removes it once, by a scan record its leave names.
+  await reconcile(f, [C.secondary])
+  const scanLeave = life(f).leaves[historical]!
+  expect(scanLeave.event).toMatch(/^scan:[^:]+:absent:C0LARGE00000$/)
+  expect(life(f).membershipEvents[scanLeave.event]).toMatchObject({ member: false, order: scanLeave.boundary, boundary: scanLeave.boundary })
+  expect(life(f).assignments[historical]).toBeUndefined()
+  expect(f.assign(historical, 'thread_hybrid').kind).toBe('applied')
+  const later = life(f).assignments[historical]
+  for (let i = 0; i < 2; i++) {
+    await reconcile(f, [C.secondary])
+    expect([life(f).leaves[historical], life(f).assignments[historical]]).toEqual([scanLeave, later])
+    expect(scanRecords(life(f)).get(historical)!.slice(0, 2)).toEqual([began.get(historical)![0], scanLeave.event])
+    expect(scanRecords(life(f)).get(historical)).toHaveLength(3)
+  }
+  // A live rejoin keeps the later preference; its record and the old leave stay through later reconciliations.
+  await f.event(true, historical, { id: 'EvREJOIN' })
+  const rejoin = life(f).membershipEvents.EvREJOIN!
+  expect(rejoin).toMatchObject({ member: true, boundary: rejoin.order })
+  for (let i = 0; i < 2; i++) {
+    await reconcile(f, [C.secondary, historical])
+    expect([life(f).membershipEvents.EvREJOIN, life(f).leaves[historical], life(f).assignments[historical]]).toEqual([rejoin, scanLeave, later])
+    expect(reading(f, historical).kind).toBe('eligible')
+    expect(scanRecords(life(f)).get(historical)).toEqual([began.get(historical)![0], scanLeave.event, expect.stringMatching(/^scan:[^:]+:C0LARGE00000$/)])
+  }
+  // Unchanged throughout: C.secondary keeps its beginning and newest repeat.
+  expect(scanRecords(life(f)).get(C.secondary)![0]).toBe(began.get(C.secondary)![0])
+  expect(scanRecords(life(f)).get(C.secondary)).toHaveLength(2)
+  expect(readSharedState(f.stateDir)).toEqual(f.authority.snapshot())
+})
+
+test('with superseded repeats dropped, unresolved and superseded live evidence, collection races, a reviewed absence replacement and an identity replacement keep AC-J09 results and order', async () => {
+  const [joined, verified] = channelPopulation(2).map(c => c.id) as [string, string]
+  const listed = [C.primary, C.secondary, joined]
+  const f = fixture({ channels: [{ id: C.primary, delivery: 'all' }] })
+  stub(f).script.inventory.push(membershipPage(listed)); await f.start(); await f.scan()
+  // Every change record and every live, absence-leave or reviewed record a
+  // step saved stays, exactly, through every later step of this life.
+  const saved: SharedPersona[] = []
+  const step = () => {
+    const current = life(f)
+    for (const earlier of saved) for (const [id, event] of Object.entries(earlier.membershipEvents)) {
+      if (!id.startsWith('scan:') || event.boundary === event.order) expect([id, current.membershipEvents[id]]).toEqual([id, event])
+    }
+    expectRepeatsBounded(current)
+    saved.push(current)
+  }
+  await reconcile(f, listed); step()
+  // AC-J09: a join and a leave that cannot be ordered hold the channel on
+  // durable conflict evidence until a reconciliation settles them.
+  const timestamp = ((f.h.clock.now() + 1) / 1000).toFixed(3)
+  await f.event(true, C.secondary, { id: 'EvOVERLAPJOIN', timestamp })
+  expect(f.assign(C.secondary, 'off').kind).toBe('applied')
+  await f.event(false, C.secondary, { id: 'EvOVERLAPLEAVE', timestamp })
+  expect(life(f).membershipEvidence!.EvOVERLAPLEAVE!.state).toBe('conflict')
+  expect(reading(f, C.secondary).kind).toBe('unresolved')
+  step()
+  for (let i = 0; i < 2; i++) { await reconcile(f, listed); step() }
+  expect(reading(f, C.secondary).kind).toBe('eligible')
+  expect(life(f).leaves[C.secondary]?.event).toBe('EvOVERLAPLEAVE')
+  expect(life(f).assignments[C.secondary]?.delivery).toBe('mentions')
+  // An unsaved join superseded by a later leave keeps both as evidence.
+  f.failWrites(() => true); await f.event(true, C.private, { id: 'EvUNSAVEDJOIN' }); f.failWrites(() => false)
+  await f.event(false, C.private, { id: 'EvLATERLEAVE', timestamp: ((f.h.clock.now() + 2) / 1000).toFixed(3) })
+  expect([life(f).membershipEvidence!.EvUNSAVEDJOIN?.state, life(f).membershipEvidence!.EvLATERLEAVE?.state]).toEqual(['superseded', 'applied'])
+  expect(life(f).leaves[C.private]?.event).toBe('EvLATERLEAVE')
+  step()
+  for (let i = 0; i < 2; i++) { await reconcile(f, listed); step() }
+  expect(reading(f, C.private)).toEqual({ kind: 'ineligible', reason: 'absent' })
+  // A member newly verified after a collection began holds its default at its
+  // verification record, which stays, so that collection's absence removes it
+  // instead of protecting the default as a newer explicit assignment.
+  const collected = f.authority.revision
+  for (let i = 0; i < 2; i++) { await reconcile(f, [...listed, verified]); step() }
+  const verification = scanRecords(life(f)).get(verified)![0]!
+  expect(life(f).assignments[verified]).toMatchObject({ delivery: 'mentions', order: life(f).membershipEvents[verification]!.order })
+  expect(f.membership.commitInventory(f.membership.generation('alpha')!, { scanId: 'collected-before-verification',
+    observedThrough: ((f.h.clock.now() + 1) / 1000).toFixed(3), observedRevision: collected,
+    absent: new Map([[verified, life(f).membership[verified]!.boundary]]) }).kind).toBe('applied')
+  expect([life(f).membershipAbsenceConflicts, life(f).assignments[verified], life(f).leaves[verified]?.event])
+    .toEqual([undefined, undefined, `scan:collected-before-verification:absent:${verified}`])
+  step()
+  // A choice confirmed while collecting still makes its absence a conflict.
+  const held = makeDeferredWebApiCall()
+  stub(f).script.inventory.push(held.outcome); f.scanner.request('alpha'); await f.h.clock.advanceTo(f.scanner.status('alpha').nextAttemptAt!)
+  expect(f.scanner.status('alpha').state).toBe('scanning')
+  const started = f.authority.revision, boundary = life(f).membership[joined]!.boundary
+  expect(f.assign(joined, 'off').kind).toBe('applied')
+  const choice = life(f).assignments[joined]!
+  held.settle(membershipPage([C.primary, C.secondary])); await f.h.clock.flush()
+  expect(f.scanner.status('alpha')).toMatchObject({ state: 'incomplete', problem: 'history-unresolved' })
+  expect(life(f).membershipAbsenceConflicts![joined]).toMatchObject({ boundary, observedRevision: started, assignmentOrder: choice.order })
+  expect([reading(f, joined), life(f).assignments[joined]]).toEqual([{ kind: 'unresolved', reason: 'history-unresolved' }, choice])
+  step()
+  // Its reviewed replacement writes the removal it names and a new choice.
+  const binding = absenceReplacementBinding(f.authority.snapshot(), 'alpha', joined)!
+  expect(f.authority.applyReviewed(f.authority.sourceBytes(), f.authority.revision, [{ key: 'alpha', channel: joined, delivery: 'all',
+    incarnation: life(f).incarnation, absenceReplacement: binding }]).kind).toBe('applied')
+  const replaced = life(f).replacedAbsences![binding]!
+  const removal = { event: `reviewed-absence:${binding}`, boundary: replaced.removedOrder, incarnation: life(f).incarnation }
+  expect([life(f).leaves[joined], life(f).assignments[joined]?.order]).toEqual([removal, replaced.assignmentOrder])
+  step()
+  for (let i = 0; i < 2; i++) {
+    await reconcile(f, [C.primary, C.secondary]); step()
+    expect([life(f).leaves[joined], life(f).assignments[joined]?.delivery, reading(f, joined)]).toEqual([removal, 'all', { kind: 'ineligible', reason: 'absent' }])
+  }
+  // AC-J09: a scan response held past a newer leave cannot reverse it.
+  const late = makeDeferredWebApiCall()
+  stub(f).script.inventory.push(late.outcome); f.scanner.request('alpha'); await f.h.clock.advanceTo(f.scanner.status('alpha').nextAttemptAt!)
+  await f.event(false, C.secondary, { id: 'EvNEWERLEAVE' })
+  const left = f.authority.snapshot()
+  late.settle(membershipPage([C.primary, C.secondary])); await f.h.clock.flush()
+  expect(f.authority.snapshot()).toEqual(left)
+  expect<unknown[]>([life(f).leaves[C.secondary]?.event, life(f).assignments[C.secondary]]).toEqual(['EvNEWERLEAVE', undefined])
+  step()
+  for (let i = 0; i < 2; i++) { await reconcile(f, [C.primary]); step() }
+  expect(reading(f, C.secondary)).toEqual({ kind: 'ineligible', reason: 'absent' })
+  expect(saved.at(-1)!.membershipEvidence).toMatchObject({ EvOVERLAPJOIN: { state: 'applied' }, EvOVERLAPLEAVE: { state: 'applied' },
+    EvUNSAVEDJOIN: { state: 'superseded' }, EvLATERLEAVE: { state: 'applied' }, EvNEWERLEAVE: { state: 'applied' } })
+  // AC-J09: across an identity replacement a held response changes nothing,
+  // and the new life starts without the old life's history.
+  const reset = makeDeferredWebApiCall()
+  stub(f).script.inventory.push(reset.outcome); f.scanner.request('alpha'); await f.h.clock.advanceTo(f.scanner.status('alpha').nextAttemptAt!)
+  const source = structuredClone(f.authority.snapshot().source)
+  ;(source.personas as Array<Record<string, unknown>>)[0]!.working_directory = join(f.stateDir, 'replacement')
+  expect(f.authority.applyReviewed(configBytes(source), f.authority.revision).kind).toBe('applied')
+  const replacement = f.authority.snapshot()
+  expect(replacement.personas.alpha!.incarnation).not.toBe(saved.at(-1)!.incarnation)
+  expect([replacement.personas.alpha!.membershipEvents, replacement.personas.alpha!.leaves]).toEqual([{}, {}])
+  reset.settle(membershipPage(listed)); await f.h.clock.flush()
+  expect(f.authority.snapshot()).toEqual(replacement)
+  expect(readSharedState(f.stateDir)).toEqual(replacement)
 })

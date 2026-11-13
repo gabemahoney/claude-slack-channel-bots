@@ -714,6 +714,62 @@ function applyMembershipRecords(
   }
 }
 
+// --- Scan record retention (SR-3.5) ---
+
+/** Reconciliations name their records `scan:<scan>:<channel>` and
+ * `scan:<scan>:absent:<channel>`; live events and reviewed absences never do. */
+const SCAN_RECORD_PREFIX = 'scan:'
+/** The membership-history records another record names by identifier. */
+function namedMembershipEvents(life: SharedPersona): Set<string> {
+  const named = new Set<string>()
+  for (const proof of Object.values(life.leaves)) named.add(proof.event)
+  for (const proof of Object.values(life.removedDestinations)) named.add(proof.event)
+  for (const [event, evidence] of Object.entries(life.membershipEvidence ?? {})) {
+    named.add(event)
+    if (evidence.originalEvent !== undefined) named.add(evidence.originalEvent)
+  }
+  for (const binding of Object.keys(life.replacedAbsences ?? {})) named.add(`reviewed-absence:${binding}`)
+  return named
+}
+/** Once an application has written `life`'s membership history, drops every
+ * superseded scan repeat of that history in place, in one pass. A repeat left
+ * its channel's member value, identity and boundary unchanged, so in a
+ * consistent history its boundary precedes its own position; any newer record
+ * of its channel supersedes it. A named repeat stays, and so does one whose
+ * position a newly verified member's default assignment still holds, which
+ * tells that default from an explicit assignment. Boundaries name the records
+ * that began membership states, never repeats. `saved` is the committed life;
+ * an application that wrote this life no record drops nothing, so a metadata
+ * write never changes a review dependency through retention alone. */
+function dropSupersededScanRepeats(life: SharedPersona, saved: SharedPersona | undefined): void {
+  const events = life.membershipEvents
+  const kept = saved?.incarnation === life.incarnation ? saved.membershipEvents : undefined
+  const newest = new Map<string, number>()
+  const repeats: string[] = []
+  let wrote = false
+  for (const id in events) {
+    const event = events[id]
+    // Validation rejects a malformed record; this drops nothing beside it.
+    if (typeof event !== 'object' || event === null) return
+    if (!wrote && (!kept || !Object.hasOwn(kept, id) || kept[id]!.order !== event.order)) wrote = true
+    if ((newest.get(event.channel) ?? 0) < event.order) newest.set(event.channel, event.order)
+    if (id.startsWith(SCAN_RECORD_PREFIX) && event.boundary < event.order) repeats.push(id)
+  }
+  if (!wrote) return
+  let named: Set<string> | undefined
+  for (const id of repeats) {
+    const event = events[id]!
+    if (event.order >= newest.get(event.channel)! ||
+        (event.member && own(life.assignments, event.channel)?.order === event.order)) continue
+    named ??= namedMembershipEvents(life)
+    if (!named.has(id)) delete events[id]
+  }
+}
+/** `dropSupersededScanRepeats` for each life of a whole-state draft. */
+function dropAllSupersededScanRepeats(next: SharedChannelState, before: SharedChannelState): void {
+  for (const key in next.personas) dropSupersededScanRepeats(next.personas[key]!, own(before.personas, key))
+}
+
 // --- Membership transactions: one persona's records, copied on write ---
 
 /** The record maps a membership transaction may change in its persona. */
@@ -1601,6 +1657,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
         next.revision = revision
         change(next, revision)
         if (next.revision !== revision) throw new Error('Invalid shared application order.')
+        dropAllSupersededScanRepeats(next, current)
         const bytes = serializeSharedChannelState(next)
         const published = readSharedChannelState(bytes, path, deps)
         if (!published) throw new Error('Invalid shared authority format.')
@@ -1619,6 +1676,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
         change(draft.next, revision)
         if (draft.next.revision !== revision) throw new Error('Invalid shared application order.')
         checkMembershipScope(before, key, draft)
+        dropSupersededScanRepeats(draft.life, before.personas[key])
         const fresh = settleMembershipDraft(before.personas[key]!, rawPersona(before, key), draft, before.revision)
         const config = checkMembershipDraft(before, draft.next, key, fresh, path, deps)
         const state = sealMembershipDraft(draft)
