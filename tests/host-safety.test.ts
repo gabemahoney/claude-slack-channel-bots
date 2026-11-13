@@ -4581,21 +4581,24 @@ test('shared registered-hook controls bind the actual row and fail closed withou
     await check('completion needs an observed allow/delivered request, then AD itself reads waiting after its registered Stop', async () => {
       const control = join(bin, `stub-claude-hooks.${session}`), record = control + '.jsonl', observed = control + '.observed'
       const token = 'observed-permission-1'
-      let permission: any, stopEvent: string, reaches: boolean, stops: number
+      let permission: any, stopEvent: string, reaches: boolean, stops: number, stoppedAt: number | undefined
+      // AD's requested_at: RFC3339 in whole seconds, `offset` seconds from the clock's current one.
+      const second = (offset: number) => new Date(Math.floor(clock.now() / 1000) * 1000 + offset * 1000).toISOString().replace('.000Z', 'Z')
       const arm = (queued = 'permission-1\n') => {
         reset()
         writeFileSync(control, queued); writeFileSync(observed, token + '\n')
         writeFileSync(record, JSON.stringify({ command: 'permission-1', event: 'PermissionRequest', instance_id: id, session_id: session }) + '\n')
         row.state = 'check_permission'
-        permission = { request_token: token, decision: 'allow', delivery: 'delivered', tool_input: JSON.stringify({ command: 'printf fixture-1' }) }
-        stopEvent = 'Stop'; reaches = true; stops = 0
+        permission = { request_token: token, decision: 'allow', delivery: 'delivered', tool_input: JSON.stringify({ command: 'printf fixture-1' }),
+          requested_at: second(-1) }
+        stopEvent = 'Stop'; reaches = true; stops = 0; stoppedAt = undefined
         // Models the stub: only the appended control fires the registered
         // Stop, and only that hook can move AD's row to waiting.
         setAuditClient(Object.assign(makeStubClient(), {
           async get() {
             const commands = readFileSync(control, 'utf8').split('\n').filter(c => c.startsWith('complete-'))
             for (const command of commands.slice(stops)) {
-              stops++
+              stops++; stoppedAt ??= clock.now()
               writeFileSync(record, readFileSync(record, 'utf8') + JSON.stringify({ command, event: stopEvent, instance_id: id, session_id: session }) + '\n')
               if (reaches) row.state = 'waiting'
             }
@@ -4615,6 +4618,19 @@ test('shared registered-hook controls bind the actual row and fail closed withou
       expect(row.state).toBe('waiting')
       expect(captured.slice(logged).map(args => JSON.parse(String(args[0])))).toEqual([{
         instance_id: id, session_id: session, command: 'complete-1', request_token: token, state: 'waiting' }])
+      // AD's Stop proves the request gone only from a later whole second than
+      // AD recorded it (test 29: a same-second Stop left it unproven and every
+      // later send-keys refused). A request from this second holds the Stop's
+      // control until the next second begins, and no longer.
+      arm(); await clock.advanceTo(Math.floor(clock.now() / 1000) * 1000 + 1400); permission.requested_at = second(0)
+      await complete()
+      expect(stoppedAt).toBe(Date.parse(permission.requested_at) + 1000)
+      expect(row.state).toBe('waiting')
+      for (const requestedAt of ['not a time', undefined]) {
+        arm(); permission.requested_at = requestedAt
+        await expect(complete()).rejects.toThrow()
+        expect(readFileSync(control, 'utf8')).toBe('permission-1\n')
+      }
       // Each case leaves every other completion guard satisfied, so it fails
       // only if the guard it names is gone.
       const refusals: [string, () => void, string?][] = [

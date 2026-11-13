@@ -156,9 +156,35 @@ queued_total() {
     jq -s --arg c "${channel}" --arg ts "${ts}" --arg via "${via}" \
         '[.[]|select(.kind=="accepted" and (has("compact")|not) and .channel==$c and .ts==$ts and ($via=="" or .via==$via))]|length' "${SNAP[${who}]}"
 }
+# accept_observe <who> <channel> <ts> <via>: at a timed-out acceptance wait,
+# the queue journal's counts and whitelisted record fields, never text,
+# files or tokens. Output only; it decides nothing.
+accept_observe() {
+    local who="$1" channel="$2" ts="$3" via="$4" journal
+    journal="${SLACK_STATE_DIR}/queue/${KEY[${who}]}.jsonl"
+    printf 'accept-observe: persona=%s channel=%s ts=%s via=%s failed\n' "${KEY[${who}]}" "${channel}" "${ts}" "${via:-any}"
+    if [[ ! -f "${journal}" || -L "${journal}" ]]; then printf 'accept-observe: journal=absent\n'; return 0; fi
+    jq -n -r -R --arg c "${channel}" --arg ts "${ts}" --arg via "${via}" '
+        def safe: if . == null then "absent" else tostring | if test("^[A-Za-z0-9_.:+-]{1,64}$") and (test("^xox") | not) then . else "invalid" end end;
+        [inputs] as $lines | [$lines[] | fromjson? | select(type == "object")] as $all |
+        [$all[] | select(.kind == "accepted" and (has("compact") | not) and .channel == $c and .ts == $ts)] as $match |
+        "accept-observe: journal lines=\($lines | length) records=\($all | length) compact=\([$all[] | select(.kind == "accepted" and has("compact"))] | length) max_seq=\([$all[].seq] | max | safe)",
+        "accept-observe: matching accepted=\($match | length) with_via=\([$match[] | select($via == "" or .via == $via)] | length)",
+        ($match[] | "accept-observe: accepted seq=\(.seq | safe) source=\(.source | safe) via=\(.via | safe) thread_ts=\(.thread_ts | safe) received_at=\(.received_at | safe) released_at=\(.released_at | safe) hold=\(.hold.on | safe) hold_root_unknown=\(.hold.root_unknown | safe) hold_operations=\(.hold.operations | if . == null then null else length end | safe) hold_arrived_at=\(.hold.arrived_at | safe)"),
+        ($all[] | select(.kind != "accepted" and (.seq as $s | any($match[]; .seq == $s))) |
+            "accept-observe: record kind=\(.kind | safe) seq=\(.seq | safe) attempt=\(.attempt | safe) part=\(.part | safe) send_kind=\(.send_kind | safe) at=\(.at | safe) unknown_outcome=\(.unknown_outcome | safe)"),
+        ($all[-20:][] | "accept-observe: tail kind=\(.kind | safe) seq=\(.seq | safe) compact=\(.compact | safe) channel=\(.channel | safe) ts=\(.ts | safe) via=\(.via | safe) hold=\(.hold.on | safe)")
+    ' "${journal}" 2> /dev/null || printf 'accept-observe: journal=unreadable\n'
+}
 accepted() {
     local who="$1" channel="$2" ts="$3" via="$4" text="$5" root="${6:--}"
-    wait_until "${EVENT_WAIT_S}" 'expected one acceptance' queued "${who}" "${channel}" "${ts}" "${via}"
+    # wait_until's own check, poll and failure text, with the journal
+    # printed at the timeout.
+    _scenario_check_timeout "${EVENT_WAIT_S}" 'expected one acceptance'
+    if ! _scenario_poll_until "${EVENT_WAIT_S}" queued "${who}" "${channel}" "${ts}" "${via}"; then
+        accept_observe "${who}" "${channel}" "${ts}" "${via}" || true
+        fail "expected one acceptance (not within ${EVENT_WAIT_S}s)"
+    fi
     shared_delivery_expectation "${KEY[${who}]}" "${NAME[${who}]}" slack "${channel}" "${ts}" "${HUMAN}" "${via}" | cat >> "${EXPECTED}" || fail 'expected Slack delivery reader failed'
     INPUTS["${who}|${channel}|${ts}|${via}"]="$(jq -cn --arg text "${text}" --arg root "${root}" '{text:$text,root:$root}')"
 }
@@ -247,6 +273,15 @@ review() {
     mv "${CONFIG}.pending" "${CONFIG}.apply"
     wait_until "${START_WAIT_S}" 'review not durably consumed' bun "${PRINTER}" sharedReviewConsumed \
         "${CONFIG}" "${LAST}" "${EVIDENCE}/${id}.pending" > /dev/null
+}
+# A reviewed change of a persona's name, credentials location or working
+# directory, or its re-add, replaces its life: copied channel entries reset
+# and discovered channels take the mode default (t1.tad.5i AC-W13, SR-4.2).
+# retain <name> sets RETAIN to every channel the current input lists for that
+# persona, as written, declared for replacement retention in its review.
+retain() {
+    mapfile -t RETAIN < <(jq -r --arg who "$1" '.personas[]|select(.name==$who)|.channels[]|"\($who)/\(.id)/\(.delivery)"' "${CONFIG}")
+    (( ${#RETAIN[@]} > 0 )) || fail "no configured channel to retain for $1"
 }
 set_choice() {
     local who="$1" channel="$2" value="$3" id="$4"
@@ -1203,7 +1238,8 @@ shared_stub_permission_setup "${WORK[p]}" > /dev/null
 jq --arg work "${WORK[p]}" '.personas[0].working_directory=$work' "${CONFIG}" > "${CONFIG}.tmp"
 mv "${CONFIG}.tmp" "${CONFIG}"
 connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
-review fifo-manual-worker
+retain "${NAME[p]}"
+review fifo-manual-worker "${RETAIN[@]}"
 wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'manual FIFO worker did not connect'
 wait_membership_complete "${KEY[p]}"
 MANUAL[p]=true
@@ -1276,7 +1312,8 @@ RECORD_WAIT_S="${lookup_bound_s}" shared_wait_own_post_state "${KEY[p]}" "${OP_I
     > "${EVIDENCE}/post-live-hold-outcome.json"
 connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
 cp "${EVIDENCE}/fifo-original-config.json" "${CONFIG}"
-review fifo-original-worker
+retain "${NAME[p]}"
+review fifo-original-worker "${RETAIN[@]}"
 WORK[p]="${fifo_work}"
 MANUAL[p]=false
 wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'ordinary FIFO worker did not reconnect'
@@ -1598,8 +1635,9 @@ done
 
 # Phase 22: each destructive identity boundary with accepted old-key work,
 # delayed membership evidence and a hung own-post lookup. Configuration uses
-# the real reviewed input path. Only its baseline choices survive; every
-# current Thread Hybrid Since belongs to the new incarnation.
+# the real reviewed input path. Only the input's choices, declared for
+# replacement retention, survive; every current Thread Hybrid Since belongs
+# to the new incarnation.
 cp "${CONFIG}" "${EVIDENCE}/identity-original-config.json"
 identity_compaction_before=''
 for reset in remove rename credentials working-directory; do
@@ -1651,14 +1689,17 @@ for reset in remove rename credentials working-directory; do
             ;;
     esac
     connected="$(count_log "$(session_connected "$(persona_ref "${new_name}")")")"
-    review "identity-${reset}"
+    # Removal leaves no persona to declare; its re-add below declares them.
+    RETAIN=(); [[ "${reset}" == remove ]] || retain "${new_name}"
+    review "identity-${reset}" ${RETAIN[@]+"${RETAIN[@]}"}
     reset_mark="$(slack_post_mark)"
     if [[ "${reset}" == remove ]]; then
         # Applied removal is observable in the reviewed durable projection;
         # the old queue remains, before re-add reactivates its original key.
         [[ -f "${SLACK_STATE_DIR}/queue/${KEY[p]}.jsonl" ]] || fail 'removal deleted accepted queue'
         cp "${EVIDENCE}/identity-original-config.json" "${CONFIG}"
-        review identity-readd
+        retain "${NAME[p]}"
+        review identity-readd "${RETAIN[@]}"
     fi
     wait_for_count "$(session_connected "$(persona_ref "${new_name}")")" "$((connected + 1))" "${START_WAIT_S}" 'new identity worker did not connect'
     wait_membership_complete "${new_key}"
@@ -1691,7 +1732,8 @@ for reset in remove rename credentials working-directory; do
     if [[ "${reset}" != remove ]]; then
         connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
         cp "${EVIDENCE}/identity-original-config.json" "${CONFIG}"
-        review "identity-${reset}-restore"
+        retain "${NAME[p]}"
+        review "identity-${reset}-restore" "${RETAIN[@]}"
         wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restored original worker did not connect'
     fi
     wait_membership_complete "${KEY[p]}"
@@ -1877,7 +1919,8 @@ shared_stub_notice_setup "${WORK[p]}" > /dev/null
 slack_stub_inventory_page "${LABEL[p]}" '' '' "${A}" "${B}" "${NOTICE}"
 edit_input --arg work "${WORK[p]}" '.personas[0].working_directory=$work'
 connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
-review reviewed-repair-worker
+retain "${NAME[p]}"
+review reviewed-repair-worker "${RETAIN[@]}"
 wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'reviewed repair worker did not connect'
 wait_membership_complete "${KEY[p]}"
 restore_root="$(scenario_ts)"

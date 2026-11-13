@@ -1762,6 +1762,132 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     ])
     expect(run.stdout).not.toContain(secret); expect(run.stdout).not.toContain(tok)
   })
+  test('test-46 accept_observe prints the acceptance journal\'s counts and whitelisted fields, never content', () => {
+    const secret = 'private message text', tok = fakeToken(BOT_TOKEN_PREFIX, 'accept-observer')
+    const hold = { on: 'post', operations: ['op-a'], thread_ts: '1.0', stamp: { incarnation: 1, threadHybridSince: 2 }, root_unknown: false, arrived_at: 10 }
+    const files = {
+      'state/queue/p.jsonl': jsonl([
+        { v: 1, kind: 'accepted', seq: 1, compact: 'key', key: { channel: 'CX', ts: '0.5' }, received_at: 5, delivered_at: 6 },
+        { v: 1, kind: 'accepted', seq: 2, source: 'slack', channel: 'CX', ts: '1.5', via: 'thread', thread_ts: '1.0', user: 'U1', text: secret, received_at: 10, hold },
+        { v: 1, kind: 'released', seq: 2, at: 13 },
+        { v: 1, kind: 'sent', seq: 2, attempt: 1, part: 1, send_kind: 'text', at: 14, session_id: 's1', transcript_path: `/w/${secret}`, transcript_size: 3 },
+        { v: 1, kind: 'accepted', seq: 3, source: 'slack', channel: 'CY', ts: '1.5', via: tok, text: secret, received_at: 11 },
+      ]) + '{"v":1,"kind":"acc',
+    }
+    const program = (who: string, via: string) => [
+      'SLACK_STATE_DIR="$HOME/state"', 'declare -A KEY=([p]=p [q]=q)', declaration(test46, 'accept_observe'), `accept_observe ${who} CX 1.5 '${via}'`,
+    ].join('\n')
+    const run = shell(program('p', 'thread'), files)
+    expect({ status: run.status, stderr: run.stderr }).toEqual({ status: 0, stderr: '' })
+    const tail = [
+      'accept-observe: tail kind=accepted seq=1 compact=key channel=absent ts=absent via=absent hold=absent',
+      'accept-observe: tail kind=accepted seq=2 compact=absent channel=CX ts=1.5 via=thread hold=post',
+      'accept-observe: tail kind=released seq=2 compact=absent channel=absent ts=absent via=absent hold=absent',
+      'accept-observe: tail kind=sent seq=2 compact=absent channel=absent ts=absent via=absent hold=absent',
+      'accept-observe: tail kind=accepted seq=3 compact=absent channel=CY ts=1.5 via=invalid hold=absent',
+    ]
+    const lines = (via: string, withVia: number) => [
+      `accept-observe: persona=p channel=CX ts=1.5 via=${via || 'any'} failed`,
+      'accept-observe: journal lines=6 records=5 compact=1 max_seq=3',
+      `accept-observe: matching accepted=1 with_via=${withVia}`,
+      'accept-observe: accepted seq=2 source=slack via=thread thread_ts=1.0 received_at=10 released_at=absent hold=post hold_root_unknown=false hold_operations=1 hold_arrived_at=10',
+      'accept-observe: record kind=released seq=2 attempt=absent part=absent send_kind=absent at=13 unknown_outcome=absent',
+      'accept-observe: record kind=sent seq=2 attempt=1 part=1 send_kind=text at=14 unknown_outcome=absent',
+      ...tail,
+    ]
+    expect(run.stdout.trim().split('\n')).toEqual(lines('thread', 1))
+    expect(run.stdout).not.toContain(secret); expect(run.stdout).not.toContain(tok); expect(run.stdout).not.toContain('op-a')
+    expect(shell(program('p', 'mention'), files).stdout.trim().split('\n')).toEqual(lines('mention', 0))
+    expect(shell(program('p', ''), files).stdout.trim().split('\n')).toEqual(lines('', 1))
+    const absent = shell(program('q', 'thread'), files)
+    expect({ status: absent.status, stdout: absent.stdout, stderr: absent.stderr }).toEqual({ status: 0, stderr: '',
+      stdout: 'accept-observe: persona=q channel=CX ts=1.5 via=thread failed\naccept-observe: journal=absent\n' })
+  })
+  test.each([['ok', 0], ['timeout', 1], ['timeout, observer error', 1]] as const)(
+    'test-46 accepted keeps wait_until\'s check, poll and failure text, and prints the journal only at the timeout: %s', (outcome, status) => {
+      const stubs = (poll: string) => [
+        '_scenario_check_timeout() { printf "check %s|%s\\n" "$1" "$2"; }',
+        `_scenario_poll_until() { printf "poll %s\\n" "$*"; [[ ${poll} == ok ]]; }`,
+      ]
+      const program = [
+        ...stubs(`'${outcome}'`),
+        `accept_observe() { printf "observe %s\\n" "$*"; [[ '${outcome}' != *error ]]; }`,
+        'shared_delivery_expectation() { printf "expectation %s\\n" "$*"; }',
+        'declare -A KEY=([p]=kp) NAME=([p]=np) INPUTS', 'EXPECTED="$HOME/expected" HUMAN=UH EVENT_WAIT_S=30',
+        declaration(test46, 'accepted'), 'accepted p CX 1.5 thread "the text" 1.0', 'printf "expected: %s\\n" "$(cat "$EXPECTED")"',
+      ].join('\n')
+      const run = shell(program)
+      // wait_until itself, given the same step, timeout and predicate.
+      const reference = shell([...stubs("'timeout'"), declaration(scenario, 'wait_until'),
+        "wait_until 30 'expected one acceptance' queued p CX 1.5 thread"].join('\n'))
+      expect(reference.stdout).toBe('check 30|expected one acceptance\npoll 30 queued p CX 1.5 thread\n')
+      expect(run.status).toBe(status)
+      if (outcome === 'ok') {
+        expect(run.stderr).toBe('')
+        expect(run.stdout).toBe(reference.stdout + 'expected: expectation kp np slack CX 1.5 UH thread\n')
+      } else {
+        expect(run.stderr).toBe(reference.stderr)
+        expect(run.stdout).toBe(reference.stdout + 'observe p CX 1.5 thread\n')
+      }
+    })
+  test('test-46 retain declares every channel the input lists for the persona, as written, and fails on none', () => {
+    const config = JSON.stringify({ personas: [
+      { name: 'p', channels: [{ id: 'CA', delivery: 'all' }, { id: 'CB', delivery: 'thread_hybrid' }, { id: 'CN', delivery: 'mentions' }] },
+      { name: 'q', channels: [{ id: 'CA', delivery: 'off' }] },
+      { name: 'r', channels: [] },
+    ] })
+    const program = (name: string) => ['CONFIG="$HOME/config.json"', declaration(test46, 'retain'), `retain ${name}`, 'printf "%s\\n" "${RETAIN[@]}"'].join('\n')
+    const run = shell(program('p'), { 'config.json': config })
+    expect({ status: run.status, stdout: run.stdout, stderr: run.stderr }).toEqual({ status: 0, stderr: '', stdout: 'p/CA/all\np/CB/thread_hybrid\np/CN/mentions\n' })
+    for (const name of ['r', 'absent']) {
+      const none = shell(program(name), { 'config.json': config })
+      expect({ status: none.status, stdout: none.stdout, stderr: none.stderr }).toEqual({ status: 1, stdout: '', stderr: `no configured channel to retain for ${name}\n` })
+    }
+  })
+  // test-47's real refused_start, queue_items_digest and state_digest, and
+  // scenario.sh's real shared_queue_items over the production reader
+  // (fmk-texts acceptedQueueItems: parseQueueRecord). Stand-ins replace only
+  // the image guards, the printer's refusal texts, Slack, AD and the start
+  // itself, whose effect on the case I 0.18.0 journal each case supplies.
+  test.each([
+    ['start compaction (watermark, allocation row, mode 0600)', 'if .kind == "accepted" then . + {attempt_high_watermark: 0} else . end', 0, ''],
+    ['one accepted item dropped', 'select(.seq != 2) | if .kind == "accepted" then . + {attempt_high_watermark: 0} else . end', 1, 'interrupted: refused start changed accepted queue items\n'],
+    ['one accepted item altered', 'if .seq == 2 then .text = "altered" else . end | if .kind == "accepted" then . + {attempt_high_watermark: 0} else . end', 1, 'interrupted: refused start changed accepted queue items\n'],
+    ['another state file changed', '.', 1, 'interrupted: refused start changed state\n'],
+  ] as const)('test-47 refused_start leaves queue journal bytes to start compaction and fails on any accepted item change: %s', (label, filter, status, stderr) => {
+    mkdirSync('/tmp/c9', { recursive: true })
+    const fixtures = mkdtempSync('/tmp/c9/refused-start-printer-')
+    try {
+      sharedPrinterControl(fixtures, join(fixtures, 'fmk-texts.ts'))
+      const test47 = source('test-47-shared-channel-upgrade.sh')
+      const journal = readFileSync(join(import.meta.dir, 'fixtures/shared-channel-upgrade/interrupted-and-invalid-preparation/reference-0.18.0/queue/alpha.jsonl'), 'utf8')
+      const program = [
+        'SLACK_STATE_DIR="$HOME/state" EVIDENCE="$HOME/evidence" CONFIG="$HOME/state/config.json" PRINTER=printer KEYS_ONLY=false REMOVED_SEEN=0',
+        `SCENARIO_FIXTURES=${JSON.stringify(fixtures)} J="$HOME/state/queue/k_alpha.jsonl" FILTER='${filter}' OTHER=${label.startsWith('another') ? 1 : 0}`,
+        'mkdir -p "$EVIDENCE"; declare -A P=([alpha]=k_alpha)',
+        'require_ci_image() { :; }; require_scenario_state() { :; }; _scenario_scratch_file() { :; }',
+        'bun() { if [[ "$2" == removedKeyRefusal ]]; then return 64; fi; command bun "$@"; }',
+        'case_json() { echo config.json.last-applied; }; printed() { echo "refused: alpha"; }; rows_of() { ROWS=(alpha); }',
+        'slack_post_mark() { echo 0; }; count_log() { echo 0; }; count_in() { echo 1; }; expect_count() { :; }; none_after() { :; }; no_session() { :; }',
+        '_scenario_pid_file_live() { return 1; }; references_unchanged() { echo "references checked"; }',
+        'cmp() { [[ "$1" == -s ]] && shift; [[ "$(cat "$1")" == "$(cat "$2")" ]]; }',
+        // The refused start: its effect on the journal, an allocation row,
+        // mode 0600 and a server.log line; OTHER also edits config.json.
+        'run_start() {',
+        '    START_RC=1 START_OUT="$HOME/start.out"; echo "refused: alpha" > "$START_OUT"',
+        '    jq -c "$FILTER" "$J" > "$J.tmp"; echo \'{"v":1,"kind":"accepted","seq":2,"compact":"allocation"}\' >> "$J.tmp"; mv "$J.tmp" "$J"',
+        '    python3 -c "import os,sys; os.chmod(sys.argv[1], 0o600)" "$J"; printf x >> "$SLACK_STATE_DIR/server.log"',
+        '    if [[ "$OTHER" == 1 ]]; then printf " " >> "$CONFIG"; fi',
+        '}',
+        declaration(scenario, 'shared_queue_items'),
+        ...['state_digest', 'queue_items_digest', 'refused_start'].map(name => declaration(test47, name)),
+        'refused_start interrupted',
+      ].join('\n')
+      const run = shell(program, { 'state/config.json': '{}', 'state/server.log': '', 'state/queue/k_alpha.jsonl': journal })
+      expect({ status: run.status, stderr: run.stderr }).toEqual({ status, stderr })
+      expect(run.stdout).toBe(status ? '' : 'references checked\n')
+    } finally { rmSync(fixtures, { recursive: true, force: true }) }
+  })
   test('test-29 exit_observe prints the last queue rows, last hook records, AD row and controls as whitelisted fields only', () => {
     const secret = 'private message text', tok = fakeToken(BOT_TOKEN_PREFIX, 'exit-observer')
     const session = '0123abcd-0000-4000-8000-000000000001'

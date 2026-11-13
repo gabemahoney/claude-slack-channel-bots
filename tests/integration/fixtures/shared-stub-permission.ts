@@ -5,7 +5,8 @@
  * outcome <work> <key> <token> reads AD's decision/delivery, never decides it.
  * complete-1|complete-2 <work> <key> <token>, once AD reads that observed
  * request allow/delivered: ends the allowed turn through the registered Stop
- * hook and waits for AD itself to read waiting. Once per session, no retry.
+ * hook, from a later whole second than AD recorded the request, and waits for
+ * AD itself to read waiting. Once per session, no retry.
  * notice-setup <work> selects ordinary at-once receipts BEFORE launch.
  * notice-end|notice-ended|notice-resume <work> <key> <evidence-file>:
  * graceful sentinel through fresh AD waiting, then verified ended; recheck;
@@ -312,6 +313,14 @@ async function run() {
       const result = await client.getPermission({ request_token: token })
       requireFact(result.request_token === token && result.decision === 'allow' && result.delivery === 'delivered' &&
         JSON.parse(result.tool_input).command === `printf fixture-${command.slice(-1)}`)
+      // AD's Stop proves a request's dialog gone only when the request was
+      // recorded in an earlier whole second than the hook started (its turn-end
+      // cut). A Stop in that same second leaves it unproven, and AD refuses
+      // every later send-keys to this worker (ErrDialogMaybeOpen).
+      const recorded = Date.parse(result.requested_at)
+      requireFact(Number.isFinite(recorded))
+      const later = Math.floor(recorded / 1000) * 1000 + 1000
+      while (Date.now() < later) await Bun.sleep(later - Date.now())
     }
     // A completion's waiting must follow its Stop, never precede it.
     failureStep = 'control append'
