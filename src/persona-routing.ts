@@ -243,6 +243,10 @@ export interface PersonaRouting {
 export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   const heardSets = new Map<string, Set<string>>()
   const postAcked = new Map<string, Set<number>>()
+  /** Diagnostics must never interrupt intake, ack, reporting or preparation. */
+  function log(line: string): void {
+    try { deps.log(line) } catch { /* non-critical */ }
+  }
   /** The persona reference for a key: its rendered name when applied, else the bare key. */
   function refForKey(key: string): string {
     const persona = deps.getPersonaConfig()?.personas.find((p) => p.key === key)
@@ -262,7 +266,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       const keys = typeof personaKeys === 'string' ? [personaKeys] : personaKeys
       await Promise.all(keys.map(async key => {
         try { deps.archive(key, event) } catch (err) {
-          deps.log(`[slack] persona-routing: archive write failed for persona ${refForKey(key)}${describeSlackCallFailure(err)}`)
+          log(`[slack] persona-routing: archive write failed for persona ${refForKey(key)}${describeSlackCallFailure(err)}`)
         }
         try {
           const ev = event as Record<string, unknown>
@@ -324,17 +328,17 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
           } catch { storeFailed = true }
         } catch (err) {
           // Decision/routing failures keep the historical ack behavior.
-          deps.log(`[slack] persona-routing: error handling event for persona ${refForKey(key)}${describeSlackCallFailure(err)}`)
+          log(`[slack] persona-routing: error handling event for persona ${refForKey(key)}${describeSlackCallFailure(err)}`)
         }
       }))
     }
     // A failed sibling suppresses the aggregate ack, but retained targets still
     // deserve queued feedback. Preparation/recovery continue only after ack.
     if (storeFailed) { for (const report of accepted) report(); return }
-    try { await ack() } catch (err) { deps.log(`[slack] persona-routing: failed to ack event${describeSlackCallFailure(err)}`) }
+    try { await ack() } catch (err) { log(`[slack] persona-routing: failed to ack event${describeSlackCallFailure(err)}`) }
     for (const report of accepted) report()
     await Promise.all(afterAck.map(async work => {
-      try { await work() } catch (err) { deps.log(`[slack] persona-routing: post-accept preparation failed${describeSlackCallFailure(err)}`) }
+      try { await work() } catch (err) { log(`[slack] persona-routing: post-accept preparation failed${describeSlackCallFailure(err)}`) }
     }))
   }
 
@@ -376,7 +380,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     }
     if (heard.has(channel)) return
     heard.add(channel)
-    deps.log(formatPersonaDiagnostic({
+    log(formatPersonaDiagnostic({
       class: PERSONA_INVITED_CHANNEL,
       name: persona.name,
       key: persona.key,
@@ -391,7 +395,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       case 'channel-not-configured':
         // A channel another applied persona lists is that persona's: no line.
         if (!decision.unclaimed) return
-        deps.log(formatPersonaDiagnostic({
+        log(formatPersonaDiagnostic({
           class: UNCLAIMED_CHANNEL,
           name: persona.name,
           key: persona.key,
@@ -401,7 +405,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
         return
       case 'fungible-refused':
         // one line naming the refusal's reason.
-        deps.log(formatPersonaDiagnostic({
+        log(formatPersonaDiagnostic({
           class: UNCLAIMED_CHANNEL,
           name: persona.name,
           key: persona.key,
@@ -410,7 +414,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
         }))
         return
       case 'dm-disabled':
-        deps.log(formatPersonaDiagnostic({
+        log(formatPersonaDiagnostic({
           class: PERSONA_DM_DROPPED,
           name: persona.name,
           key: persona.key,
@@ -419,7 +423,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
         }))
         return
       default:
-        deps.log(
+        log(
           `[slack] persona ${renderPersonaRef(persona.name, persona.key)} dropped message from ` +
           `channel=${channel} ${describeAuthor(ev)}: ${decision.reason}`,
         )
@@ -528,7 +532,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       const reading = await read(persona.key)
       return livenessKindOf(reading) === LIVENESS_PENDING
     } catch (err) {
-      deps.log(
+      log(
         `[slack] persona-routing: lost-message row read for persona ${renderPersonaRef(persona.name, persona.key)} ` +
         `failed — session-starting left out: ${describeAgentDirectorFailure(err)}`,
       )
