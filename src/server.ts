@@ -322,7 +322,7 @@ import {
 import { forgetFailures, isAtCap as backoffIsAtCap } from './backoff.ts'
 import { isDryRun } from './tokens.ts'
 import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
-import { createQueuedAckCallback, createDeliveryAckCallback, consumeAck, forgetPersonaAcks } from './ack-tracker.ts'
+import { createQueuedAckCallback, createDeliveryAckCallback, consumeAck, claimReactAnswer, forgetPersonaAcks } from './ack-tracker.ts'
 import {
   openArchiveDatabase,
   createPersonaArchiveWriter,
@@ -705,6 +705,9 @@ const sessionToolDeps: SessionToolDeps = {
   inboxDir: INBOX_DIR,
   resolveUserName: resolvePersonaUserName,
   consumeAck,
+  claimReactAnswer,
+  // Read at each react, beside its client, never copied at session creation.
+  getBotUserId: (key) => identityFor(key)?.botUserId,
   onReplyCall: key => replyReminders?.noteReplyCall(key),
   serverPort: 0, // updated to actual port in main() before Bun.serve
   // The channel mode of the configuration in effect, read at each tool call

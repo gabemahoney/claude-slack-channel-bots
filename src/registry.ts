@@ -59,6 +59,7 @@ import {
 import type { WebClient } from '@slack/web-api'
 import { writeFileSync } from 'fs'
 import { basename, join, resolve } from 'path'
+import { claimReactAnswer } from './ack-tracker.ts'
 import {
   CHANNEL_DELIVERY_FILE_NAME,
   CHANNEL_DELIVERY_SET_STORED,
@@ -663,11 +664,29 @@ export interface SessionToolDeps {
   /** Resolve a user's display name through the persona's client */
   resolveUserName: (personaKey: string, userId: string) => Promise<string>
   /**
-   * Record a successful correlated reply or react and clean up its captured ack stage.
+   * Record a successful correlated reply and clean up its captured ack stage.
    * The removal fallback is only for legacy entries without a captured reaction;
    * `kept` is a react's emoji, never removed.
    */
   consumeAck: (personaKey: string, channelId: string, messageTs: string, removeLegacy?: () => Promise<unknown>, kept?: string) => boolean | Promise<void>
+  /**
+   * Record a successful react as consumeAck does, with its emoji kept, and
+   * answer in the same step whether the persona already held that answer
+   * (true) or this one is the first (false). Absent: the ack tracker's own
+   * `claimReactAnswer`.
+   */
+  claimReactAnswer?: typeof claimReactAnswer
+  /**
+   * The persona's confirmed bot user ID from its serving connection, or
+   * undefined when unavailable; read with `clientFor` before a react's add.
+   * Absent: unavailable.
+   */
+  getBotUserId?: (key: string) => string | undefined
+  /**
+   * Told synchronously of each react whose claim was the first, when the
+   * persona's bot user ID was available before the add. Absent: nothing.
+   */
+  onReactClaimed?: (claim: ReactClaimContext) => void
   /** TCP port the MCP HTTP server is listening on (retained for diagnostics). */
   serverPort: number
   /**
@@ -702,6 +721,20 @@ export interface SessionToolDeps {
    * `console.error`.
    */
   log?: (line: string) => void
+}
+
+/**
+ * A react whose claim was the first: the persona, the client that made the
+ * add and the bot user ID read with it before the add, never re-resolved
+ * after it, with the add's validated target and emoji.
+ */
+export interface ReactClaimContext {
+  persona: Persona
+  client: WebClient
+  botUserId: string
+  chatId: string
+  messageId: string
+  emoji: string
 }
 
 /**
@@ -1459,17 +1492,41 @@ export function createSessionServer(
     }
   }
 
+  /** A legacy tracked ack's removal through the caller's client; `kept` (a react's emoji) is never removed. */
+  function legacyAckRemoval(web: WebClient, chatId: string, messageId: string, ackReaction: string | undefined, kept?: string): () => Promise<unknown> {
+    return async () => {
+      if (ackReaction && ackReaction !== kept) await web.reactions.remove({ channel: chatId, timestamp: messageId, name: ackReaction })
+    }
+  }
+
   /**
-   * Record a successful correlated reply or react and detach removal of the
-   * persona's own ack reaction, so a held reaction call never delays the
-   * remaining content or the tool result. `kept` (a react's emoji) is never removed.
+   * Record a successful correlated reply and detach removal of the persona's
+   * own ack reaction, so a held reaction call never delays the remaining
+   * content or the tool result.
    */
-  function releaseAck(persona: Persona, web: WebClient, chatId: string, messageId: string, ackReaction: string | undefined, kept?: string): void {
+  function releaseAck(persona: Persona, web: WebClient, chatId: string, messageId: string, ackReaction: string | undefined): void {
     try {
-      void Promise.resolve(consumeAck(persona.key, chatId, messageId, async () => {
-        if (ackReaction && ackReaction !== kept) await web.reactions.remove({ channel: chatId, timestamp: messageId, name: ackReaction })
-      }, kept)).catch(() => {})
+      void Promise.resolve(consumeAck(persona.key, chatId, messageId, legacyAckRemoval(web, chatId, messageId, ackReaction))).catch(() => {})
     } catch { /* reaction cleanup cannot fail a successful tool call */ }
+  }
+
+  /**
+   * Claim a successful react's answer, which also releases the persona's ack
+   * as releaseAck does, keeping the emoji. Only a first answer with the bot
+   * user ID read before the add reaches `onReactClaimed`. Cleanup is
+   * detached, and neither a claim failure nor the callback can delay or
+   * change the tool result.
+   */
+  function claimReact(persona: Persona, web: WebClient, botUserId: string | undefined, chatId: string, messageId: string, emoji: string): void {
+    const removeLegacy = legacyAckRemoval(web, chatId, messageId, getReplySettings().ack_reaction, emoji)
+    let alreadyHeld = true
+    try {
+      alreadyHeld = (deps.claimReactAnswer ?? claimReactAnswer)(persona.key, chatId, messageId, emoji, removeLegacy)
+    } catch { /* a failed claim is never a first answer */ }
+    if (alreadyHeld !== false || !botUserId || !deps.onReactClaimed) return
+    try {
+      deps.onReactClaimed({ persona, client: web, botUserId, chatId, messageId, emoji })
+    } catch { /* the hand-off cannot fail a successful react */ }
   }
 
   /**
@@ -1486,6 +1543,7 @@ export function createSessionServer(
     web: WebClient,
     kind: PersonaTargetKind,
     dm: { opened?: string },
+    botUserId: string | undefined,
   ) {
     switch (name) {
       // ---------------------------------------------------------------------
@@ -1581,7 +1639,7 @@ export function createSessionServer(
           // The persona's own reaction is already there, as when it matches its ack.
           if (slackPlatformReason(err) !== 'already_reacted') throw err
         }
-        releaseAck(persona, web, chatId, messageId, getReplySettings().ack_reaction, emoji)
+        claimReact(persona, web, botUserId, chatId, messageId, emoji)
         return {
           content: [{ type: 'text', text: `Reacted :${emoji}: to ${messageId}` }],
         }
@@ -1841,11 +1899,14 @@ export function createSessionServer(
 
     const ref = renderPersonaRef(persona.name, persona.key)
     const web = clientFor(key)
+    // Read with the client, before the add: an identity swap while the add is
+    // pending cannot pair this client with another bot user ID.
+    const botUserId = name === 'react' ? deps.getBotUserId?.(key) : undefined
     if (!web) return toolError(`Tool "${name}" refused: the Slack client for persona ${ref} is not available.`)
 
     const dm: { opened?: string } = {}
     try {
-      return await runTool(name, args, persona, web, scope.kind, dm)
+      return await runTool(name, args, persona, web, scope.kind, dm, botUserId)
     } catch (err) {
       // Fungible mode, channel target: Slack enforces
       // membership, so its refusal names the persona, the channel and

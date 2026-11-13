@@ -98,10 +98,12 @@ import {
   type PersonaTargetAction,
   type PersonaTargetCheck,
   _resetRegistry,
+  type ReactClaimContext,
   type SessionEntry,
   type SessionToolDeps,
 } from '../src/registry.ts'
-import { trackAck, consumeAck, _resetAckTracker, addDeliveryAck } from '../src/ack-tracker.ts'
+import { trackAck, consumeAck, claimReactAnswer, _resetAckTracker, addDeliveryAck } from '../src/ack-tracker.ts'
+import { createFakeClock } from './test-helpers/fake-clock.ts'
 import {
   makeFungiblePersona,
   makeMultiPersonaConfig,
@@ -111,9 +113,11 @@ import {
 } from './test-helpers/persona-config.ts'
 import {
   asWebClient,
+  makeDeferredWebApiCall,
   makeStubSlack,
   openedDm,
   stubOpenedDmId,
+  type SettledWebApiOutcome,
   type StubSlack,
   type StubSlackOptions,
   type StubSlackScript,
@@ -2932,6 +2936,208 @@ describe('react — ack reaction removal', () => {
     expect(result.content[0]!.text).toBe(`Reacted :eyes: to ${MSG_TS}`)
     expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([])
     expect(consumeAck(h.alpha.key, A_ALL, MSG_TS)).toBe(false)
+  })
+})
+
+// SR-6.1/SR-6.4: a successful react claims its answer through the ack
+// tracker. Only the first answer for the message and emoji, with the bot user
+// ID read with the client before the add, reaches onReactClaimed.
+describe('react — the first-answer claim and onReactClaimed', () => {
+  const BOT_USER = 'U0ALPHABOT'
+  const REACTED = { content: [{ type: 'text', text: `Reacted :thumbsup: to ${MSG_TS}` }] }
+  const ANSWER: Record<'ok' | 'already_reacted', SettledWebApiOutcome> = {
+    ok: { kind: 'ok' },
+    already_reacted: { kind: 'platform', error: 'already_reacted' },
+  }
+
+  /** Yield promise turns, never time, until `condition` holds; fails after a bound. */
+  async function turnsUntil(condition: () => boolean): Promise<void> {
+    const clock = createFakeClock()
+    for (let round = 0; round < 20 && !condition(); round++) await clock.flush()
+    expect(condition()).toBe(true)
+  }
+
+  /** Alpha's session with its confirmed bot user ID and a recording onReactClaimed (`told`), then `over`. */
+  async function claimSession(over: Partial<SessionToolDeps> = {}) {
+    const told: ReactClaimContext[] = []
+    const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), {
+      ...h.deps, getBotUserId: () => BOT_USER, onReactClaimed: (claim) => { told.push(claim) }, ...over,
+    })
+    return { ...session, told }
+  }
+
+  test.each(
+    ([['already_reacted', 'already_reacted'], ['ok', 'already_reacted'], ['already_reacted', 'ok']] as const)
+      .flatMap(([first, second]) => (['first', 'second'] as const).map((add) => [first, second, add] as const)),
+  )('overlapping reacts answered %s, then %s (the %s add answering first): only the first answer to arrive reaches onReactClaimed', async (first, second, add) => {
+    const stub = stubOf(h.alpha)
+    const adds = [makeDeferredWebApiCall(), makeDeferredWebApiCall()]
+    for (const held of adds) stub.script.reactionsAdd.push(held.outcome)
+    const { call, told } = await claimSession()
+    // What onReactClaimed had seen when each call returned, in completion order.
+    const done: { told: number; result: ToolResult }[] = []
+    const calls = [0, 1].map(() => call('react', TOOL_ARGS.react(A_ALL)).then((result) => { done.push({ told: told.length, result }) }))
+    try {
+      await turnsUntil(() => stub.calls.reactionsAdd.length === 2)
+      expect({ told: told.length, done: done.length }).toEqual({ told: 0, done: 0 })
+      const [answersFirst, answersSecond] = add === 'first' ? [adds[0]!, adds[1]!] : [adds[1]!, adds[0]!]
+      answersFirst.settle(ANSWER[first])
+      await turnsUntil(() => done.length === 1)
+      answersSecond.settle(ANSWER[second])
+      await Promise.all(calls)
+    } finally {
+      for (const held of adds) if (!held.settled) held.settle()
+      await Promise.allSettled(calls)
+    }
+    expect(done).toEqual([{ told: 1, result: REACTED }, { told: 1, result: REACTED }])
+    expect(told.map(({ persona, client, ...rest }) => rest)).toEqual([{ botUserId: BOT_USER, chatId: A_ALL, messageId: MSG_TS, emoji: 'thumbsup' }])
+    expect(told[0]!.persona).toBe(h.alpha)
+    expect(told[0]!.client).toBe(asWebClient(stub.web))
+    expect(stubOf(h.beta).callLog).toEqual([])
+  })
+
+  test("an injected claim is asked once per successful react with the persona's key, target and emoji; its false answer reaches onReactClaimed before any promise turn, its true answer never does", async () => {
+    const events: string[] = [], asked: Parameters<typeof claimReactAnswer>[] = [], told: ReactClaimContext[] = []
+    const { call } = await claimSession({
+      consumeAck: (key, channel, ts, remove, kept) => {
+        events.push('consumeAck')
+        return remove ? consumeAck(key, channel, ts, remove, kept) : consumeAck(key, channel, ts)
+      },
+      claimReactAnswer: (...args) => {
+        asked.push(args)
+        const held = claimReactAnswer(...args)
+        events.push(`claim:${held}`)
+        queueMicrotask(() => events.push('turn'))
+        return held
+      },
+      onReactClaimed: (claim) => { events.push('claimed'); told.push(claim) },
+    })
+
+    expect(await call('react', TOOL_ARGS.react(A_ALL))).toEqual(REACTED)
+    expect(await call('react', TOOL_ARGS.react(A_ALL))).toEqual(REACTED)
+
+    expect(events).toEqual(['claim:false', 'claimed', 'turn', 'claim:true', 'turn'])
+    expect(asked.map((args) => args.slice(0, 4))).toEqual([0, 1].map(() => [h.alpha.key, A_ALL, MSG_TS, 'thumbsup']))
+    expect(asked.map((args) => typeof args[4])).toEqual(['function', 'function'])
+    expect(told).toHaveLength(1)
+    expect(stubOf(h.beta).callLog).toEqual([])
+  })
+
+  test('clientFor and getBotUserId are read together after onReplyCall, before the add; a client and bot user ID swapped while the add is held never reach the winning context', async () => {
+    const events: string[] = [], told: ReactClaimContext[] = []
+    const key = h.alpha.key, original = stubOf(h.alpha), add = original.web.reactions.add
+    original.web.reactions.add = (args) => { events.push('reactions.add'); return add(args) }
+    const held = makeDeferredWebApiCall()
+    original.script.reactionsAdd.push(held.outcome)
+    let botUser = BOT_USER
+    const { call } = await claimSession({
+      onReplyCall: async () => { events.push('onReplyCall') },
+      clientFor: (k) => { events.push(`clientFor:${k}`); queueMicrotask(() => events.push('turn')); return h.deps.clientFor(k) },
+      getBotUserId: (k) => { events.push(`getBotUserId:${k}`); return botUser },
+      onReactClaimed: (claim) => { told.push(claim) },
+    })
+
+    const reacting = call('react', TOOL_ARGS.react(A_ALL))
+    try {
+      await turnsUntil(() => original.calls.reactionsAdd.length === 1)
+      expect(events.slice(0, 3)).toEqual(['onReplyCall', `clientFor:${key}`, `getBotUserId:${key}`])
+      expect(events.indexOf('reactions.add')).toBeGreaterThan(2)
+      const replacement = makeStubSlack({ token: fakeToken(BOT_TOKEN_PREFIX, 'alpha-2'), leakMarker: LEAK_SENTINEL })
+      h.clients.set(key, replacement)
+      botUser = 'U0SWAPPED'
+      held.settle()
+      expect(await reacting).toEqual(REACTED)
+      await turnsUntil(() => true)
+      expect(replacement.callLog).toEqual([])
+    } finally {
+      if (!held.settled) held.settle()
+      await Promise.allSettled([reacting])
+    }
+    expect(told).toHaveLength(1)
+    expect(told[0]!.client).toBe(asWebClient(original.web))
+    expect(told[0]!.botUserId).toBe(BOT_USER)
+    expect(events.filter((e) => /^(clientFor|getBotUserId):/.test(e))).toEqual([`clientFor:${key}`, `getBotUserId:${key}`])
+  })
+
+  test.each<[string, Pick<SessionToolDeps, 'getBotUserId'>]>([
+    ['no getBotUserId', {}],
+    ['getBotUserId answering undefined', { getBotUserId: () => undefined }],
+    ['getBotUserId answering an empty ID', { getBotUserId: () => '' }],
+  ])('%s: a successful react still makes its one real claim, returns its result, records its reply call and removes its ack, and tells onReactClaimed nothing', async (_label, identity) => {
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    const asked: boolean[] = [], replyCalls: string[] = [], told: ReactClaimContext[] = []
+    const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), {
+      ...h.deps, ...identity,
+      onReplyCall: (key) => { replyCalls.push(key) },
+      claimReactAnswer: (...args) => { const held = claimReactAnswer(...args); asked.push(held); return held },
+      onReactClaimed: (claim) => { told.push(claim) },
+    })
+
+    expect(await session.call('react', TOOL_ARGS.react(A_ALL))).toEqual(REACTED)
+    await turnsUntil(() => stubOf(h.alpha).calls.reactionsRemove.length > 0)
+
+    expect({ asked, replyCalls, told, removed: stubOf(h.alpha).calls.reactionsRemove })
+      .toEqual({ asked: [false], replyCalls: [h.alpha.key], told: [], removed: [REMOVE_EYES] })
+    expect(claimReactAnswer(h.alpha.key, A_ALL, MSG_TS, 'thumbsup')).toBe(true)
+  })
+
+  test.each(['Slack failure', 'scope refusal', 'dry run'] as const)('a react ending in %s makes no claim and tells onReactClaimed nothing', async (outcome) => {
+    const asked: Parameters<typeof claimReactAnswer>[] = []
+    if (outcome === 'Slack failure') stubOf(h.alpha).script.reactionsAdd.push({ kind: 'platform', error: 'invalid_name' })
+    if (outcome === 'dry run') process.env['SLACK_DRY_RUN'] = '1'
+    const target = outcome === 'scope refusal' ? B_CHANNEL : A_ALL
+    const { call, told } = await claimSession({ claimReactAnswer: (...args) => { asked.push(args); return claimReactAnswer(...args) } })
+
+    const result = await call('react', TOOL_ARGS.react(target))
+
+    expect(result.isError === true).toBe(outcome !== 'dry run')
+    expect({ asked, told }).toEqual({ asked: [], told: [] })
+    expect(claimReactAnswer(h.alpha.key, target, MSG_TS, 'thumbsup')).toBe(false)
+  })
+
+  test('a react with no onReactClaimed still records its answer: the same react afterwards with the callback is not first, another emoji is', async () => {
+    const plain = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), { ...h.deps, getBotUserId: () => BOT_USER })
+    expect(await plain.call('react', TOOL_ARGS.react(A_ALL))).toEqual(REACTED)
+    const { call, told } = await claimSession()
+
+    expect(await call('react', TOOL_ARGS.react(A_ALL))).toEqual(REACTED)
+    expect(told).toEqual([])
+    expect((await call('react', { ...TOOL_ARGS.react(A_ALL), emoji: 'tada' })).isError).toBeUndefined()
+    expect(told.map((claim) => claim.emoji)).toEqual(['tada'])
+  })
+
+  test.each<[string, Partial<SessionToolDeps>]>([
+    ['onReactClaimed throws', { onReactClaimed: () => { throw new Error('hand-off failed') } }],
+    ['the claim throws', { claimReactAnswer: () => { throw new Error('claim failed') } }],
+  ])('%s: the react returns its exact success result and no first answer is invented', async (_label, over) => {
+    const { call, told } = await claimSession(over)
+
+    expect(await call('react', TOOL_ARGS.react(A_ALL))).toEqual(REACTED)
+    expect(told).toEqual([])
+  })
+
+  test('a held legacy ack removal delays neither onReactClaimed nor the result, and its later failure changes neither', async () => {
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    const removal = makeDeferredWebApiCall()
+    stubOf(h.alpha).script.reactionsRemove.push(removal.outcome)
+    const { call, told } = await claimSession()
+
+    try {
+      const result = await call('react', TOOL_ARGS.react(A_ALL))
+      expect(result).toEqual(REACTED)
+      expect(told).toHaveLength(1)
+      await turnsUntil(() => stubOf(h.alpha).calls.reactionsRemove.length > 0)
+      expect(removal.settled).toBe(false)
+      removal.settle({ kind: 'platform', error: 'internal_error' })
+      await turnsUntil(() => true)
+      expect(result).toEqual(REACTED)
+    } finally {
+      if (!removal.settled) removal.settle()
+    }
+    expect(told).toHaveLength(1)
+    expect(told[0]!.client).toBe(asWebClient(stubOf(h.alpha).web))
+    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([REMOVE_EYES])
+    expect(stubOf(h.beta).callLog).toEqual([])
   })
 })
 

@@ -1738,6 +1738,21 @@ describe('server.ts wires the persona connection seams', () => {
     expect(props.get('archive')).toMatch(/^\((\w+), (\w+)\) => archiveWrite\?\.\(\1, \2\)$/)
   })
 
+  // Both members are optional in SessionToolDeps (no claim falls back to the
+  // ack tracker's own, no getter means no hand-off), so only this audit makes
+  // sure production binds the real claim and reads each react's identity anew.
+  const SESSION_TOOLS_CLAIM: keyof SessionToolDeps = 'claimReactAnswer'
+  const SESSION_TOOLS_BOT_USER_ID: keyof SessionToolDeps = 'getBotUserId'
+  test("the session tools claim through ack-tracker.ts's claimReactAnswer and read each react's bot user ID through identityFor at call time, the key passed through", () => {
+    const props = objectProperties(spreadConstObject('sessionToolDeps'))
+    expect(props.get(SESSION_TOOLS_CLAIM)).toBe('claimReactAnswer')
+    expect(importSource(SERVER_CODE, 'claimReactAnswer')).toBe('./ack-tracker.ts')
+    expect(indicesOf(/\b(?:function|let|const|var)\s+claimReactAnswer\b/g, SERVER_CODE)).toEqual([])
+    const identity = constOf('createPersonaIdentityLookup')
+    expect(props.get(SESSION_TOOLS_BOT_USER_ID)).toMatch(new RegExp(`^\\(?(\\w+)\\)? => ${identity}\\(\\1\\)\\?\\.botUserId$`))
+    expect(indicesOf(new RegExp(`\\bsessionToolDeps\\s*\\.\\s*(?:${SESSION_TOOLS_CLAIM}|${SESSION_TOOLS_BOT_USER_ID})\\b`, 'g'), SERVER_CODE)).toEqual([])
+  })
+
   test('durable intake binds preparation to the shared queue, persona name resolver, wake hook and host part limit on the production clock', () => {
     const props = onlyCallProps('createDeliveryPreparation')
     expect([...props.keys()].sort()).toEqual(['queue', 'resolveUserName', 'clientFor', 'wake', 'onPending', 'onReceived', 'tagMaxBytes', 'log', 'persona'].sort())
