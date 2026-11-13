@@ -44,6 +44,17 @@ describe('durable record schemas', () => {
   })
   test.each(['{', 'null', '[]', '{"v":1,"seq":1,"kind":"future"}'])('invalid line %s is unreadable', line => expect(parseQueueRecord(line)).toBeUndefined())
 
+  test.each([
+    ['source', 'interject', { ...accepted(), ...injectedInput(), key: undefined }],
+    ['send_kind', 'text', sentRecord()],
+    ['state', 'observed', { v: 1, kind: 'reply-reminder', seq: 1, at: 1000, state: 'observed' }],
+  ] as const)('rejects array-valued enum %s without string coercion', (field, value, record) => {
+    expect(isQueueRecord(record)).toBe(true)
+    const malformed = { ...record, [field]: [value] }
+    expect(isQueueRecord(malformed)).toBe(false)
+    expect(parseQueueRecord(JSON.stringify(malformed))).toBeUndefined()
+  })
+
   test.each(['observed', 'replied', 'nudged', 'cancelled'] as const)('reply reminder state %s roundtrips with its row facts', state => {
     const record: QueueRecord = { v: 1, kind: 'reply-reminder', seq: 1, at: 1000, delivered_at: 900, state, row_state: 'working', session_id: 'session', launch_started_at: null, delivery_attempts: [1, 3], ...(state === 'replied' ? { reply_attempts: [3] } : {}) }
     expect(parseQueueRecord(JSON.stringify(record))).toEqual(record)
@@ -444,6 +455,123 @@ test('quarantines exact torn/middle/orphan bytes; damaged sent is unknown and su
   expect(unreadable.map(e => [e.line, e.alert])).toEqual([[2, false], [3, false], [4, false]])
   expect(fs.readFileSync(unreadable[0]!.quarantinePath, 'utf8')).toBe(bad + orphan + torn)
   await q.stop(); const replay = await open(); expect(replay.items('alpha')[0]!.unknownSend).toBe(true); expect(replay.items('alpha')[0]!.nextAttempt).toBe(2); expect(replay.items('alpha')[0]!.records.filter(r => r.kind === 'sent')).toMatchObject([{ attempt: 1, unknown_outcome: true }])
+})
+
+test('quarantines an array-valued source as record-unreadable instead of replaying live work', async () => {
+  const events: QueueEvent[] = []
+  const malformed = JSON.stringify({ ...accepted(), ...injectedInput(), source: ['interject'], key: undefined }) + '\n'
+  seedQueue(dir, [malformed])
+  const q = await open({ onEvent: event => events.push(event) })
+  expect(q.items('alpha')).toEqual([])
+  expect(q.openCount('alpha')).toBe(0)
+  const unreadable = events.filter((event): event is Extract<QueueEvent, { type: 'record-unreadable' }> => event.type === 'record-unreadable')
+  expect(unreadable).toMatchObject([{ key: 'alpha', line: 1 }])
+  expect(fs.readFileSync(unreadable[0]!.quarantinePath, 'utf8')).toBe(malformed)
+  expect(readQueue(dir).some(record => record.kind === 'accepted' && !('compact' in record))).toBe(false)
+  await q.stop()
+  expect((await open()).items('alpha')).toEqual([])
+})
+
+describe('append validation refusals', () => {
+  test.each(['not started', 'stopped'] as const)('%s queue rejects append without reporting a storage failure', async state => {
+    const events: QueueEvent[] = []
+    const q = createDeliveryQueue({ stateDir: dir, onEvent: event => events.push(event) })
+    queues.push(q)
+    if (state === 'stopped') { await q.start(); await q.stop() }
+    await expect(q.append('alpha', sentRecord())).rejects.toThrow('Queue is not writable')
+    expect(q.isWritable!('alpha')).toBe(true)
+    expect(events.filter(event => event.type === 'append-failed')).toEqual([])
+    expect(fs.existsSync(queuePath(dir))).toBe(false)
+  })
+
+  test.each([
+    ['unknown sequence', sentRecord(99), 'Append has no accepted item'],
+    ['refusal without a send', { v: 1, kind: 'refused', seq: 1, attempt: 1, at: 1000 }, 'Refusal has no sent attempt'],
+    ['invalid send kind', { ...sentRecord(), send_kind: 'bogus' }, 'Invalid append record'],
+  ] as const)('%s leaves the queue writable without append-failed', async (_, record, message) => {
+    const events: QueueEvent[] = []
+    const q = await open({ onEvent: event => events.push(event) })
+    expect(await q.accept('alpha', injectedInput())).toMatchObject({ status: 'accepted', seq: 1 })
+    const bytes = fs.readFileSync(queuePath(dir)), item = q.item('alpha', 1)
+    // Exercise validation at the untyped public boundary, as with journal input.
+    await expect(q.append('alpha', record as QueueRecord)).rejects.toThrow(message)
+    expect(fs.readFileSync(queuePath(dir))).toEqual(bytes)
+    expect(q.item('alpha', 1)).toEqual(item)
+    expect(q.isWritable!('alpha')).toBe(true)
+    expect(events.filter(event => event.type === 'append-failed')).toEqual([])
+    await q.compact('alpha')
+    expect(q.isWritable!('alpha')).toBe(true)
+    await q.append('alpha', sentRecord())
+    expect(q.isWritable!('alpha')).toBe(true)
+    expect(events.map(event => event.type)).toEqual(['stored'])
+    await q.stop()
+    expect((await open()).item('alpha', 1)!.records.filter(record => record.kind === 'sent')).toEqual([sentRecord()])
+  })
+
+  test('validation refusal preserves an existing storage failure until a valid append succeeds', async () => {
+    let fail = false
+    const events: QueueEvent[] = []
+    const seam = { ...fs, fsyncSync(fd: number) {
+      if (fail && fs.fstatSync(fd).isFile()) throw new Error('EIO append sync')
+      fs.fsyncSync(fd)
+    } } as typeof fs
+    const q = await open({ fs: seam, onEvent: event => events.push(event) })
+    await q.accept('alpha', injectedInput())
+    fail = true
+    await expect(q.append('alpha', sentRecord())).rejects.toThrow('EIO append sync')
+    expect(q.isWritable!('alpha')).toBe(false)
+    fail = false
+    await expect(q.append('alpha', sentRecord(99))).rejects.toThrow('Append has no accepted item')
+    expect(q.isWritable!('alpha')).toBe(false)
+    expect(events.filter(event => event.type === 'append-failed')).toHaveLength(1)
+    expect(events.filter(event => event.type === 'writable')).toEqual([])
+    await q.append('alpha', sentRecord())
+    expect(q.isWritable!('alpha')).toBe(true)
+    expect(events.filter(event => event.type === 'writable')).toEqual([{ type: 'writable', key: 'alpha' }])
+    expect(q.item('alpha', 1)!.records.filter(record => record.kind === 'sent')).toEqual([sentRecord()])
+  })
+
+  test('identical fixed retry writes nothing and preserves an existing storage failure', async () => {
+    let fail = false
+    const events: QueueEvent[] = []
+    const seam = { ...fs, fsyncSync(fd: number) {
+      if (fail && fs.fstatSync(fd).isFile()) throw new Error('EIO append sync')
+      fs.fsyncSync(fd)
+    } } as typeof fs
+    const q = await open({ fs: seam, onEvent: event => events.push(event) })
+    await q.accept('alpha', injectedInput())
+    const fixed: QueueRecord = { v: 1, kind: 'fixed', seq: 1, parts: ['fixed bytes'] }
+    await q.append('alpha', fixed)
+    fail = true
+    await expect(q.append('alpha', sentRecord())).rejects.toThrow('EIO append sync')
+    fail = false
+    const bytes = fs.readFileSync(queuePath(dir))
+    await q.append('alpha', fixed)
+    expect(fs.readFileSync(queuePath(dir))).toEqual(bytes)
+    expect(q.isWritable!('alpha')).toBe(false)
+    expect(events.filter(event => event.type === 'writable')).toEqual([])
+    await q.append('alpha', sentRecord())
+    expect(q.isWritable!('alpha')).toBe(true)
+    expect(events.filter(event => event.type === 'writable')).toEqual([{ type: 'writable', key: 'alpha' }])
+  })
+
+  test('journal load failure still blocks append until storage recovers', async () => {
+    seedQueue(dir, [accepted()])
+    let fail = true
+    const events: QueueEvent[] = []
+    const seam = { ...fs, readFileSync(path: fs.PathOrFileDescriptor, ...args: unknown[]) {
+      if (fail && String(path) === queuePath(dir)) throw new Error('EIO journal read')
+      return (fs.readFileSync as Function)(path, ...args)
+    } } as typeof fs
+    const q = await open({ fs: seam, onEvent: event => events.push(event) })
+    await expect(q.append('alpha', sentRecord())).rejects.toThrow('EIO journal read')
+    expect(q.isWritable!('alpha')).toBe(false)
+    expect(events.filter(event => event.type === 'append-failed')).toMatchObject([{ key: 'alpha', seq: 1, path: queuePath(dir) }])
+    fail = false
+    await q.append('alpha', sentRecord())
+    expect(q.isWritable!('alpha')).toBe(true)
+    expect(events.filter(event => event.type === 'writable')).toEqual([{ type: 'writable', key: 'alpha' }])
+  })
 })
 
 describe('b.2is torn-tail recovery', () => {
