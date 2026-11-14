@@ -339,6 +339,7 @@ import {
   unclaimedChannelCause as runnerUnclaimedChannelCause,
 } from '../ci-live/checks/invited-checks.ts'
 import { FINAL_CHECKS, hostCheck, PLAN_CHECKS, teardownCheck } from '../ci-live/checks/list.ts'
+import { RN4_PROMPT } from '../ci-live/checks/reaction-checks.ts'
 import { AD_CLIENT_CHECK_FAILED, installCheck, s2Check, s3Check } from '../ci-live/checks/setup-checks.ts'
 import { AD_CLIENT_CHECK, AD_CLIENT_CHECK_PASSED } from '../ci-live/lib/ad-client-check.ts'
 import { FlowError, type BrowserDriver, type HumanApi } from '../ci-live/lib/browser-types.ts'
@@ -841,7 +842,7 @@ describe('the check list', () => {
     const lastOf28 = Math.max(...ids.map((id, i) => (id.startsWith('28') ? i : -1)))
     expect(lastOf28).toBeGreaterThan(-1)
     expect(at('30')).toBeGreaterThan(lastOf28)
-    expect(ids.slice(at('34') + 1)).toEqual(['29a', '29b'])
+    expect(ids.slice(at('34') + 1)).toEqual(['RN1', 'RN2', 'RN3', 'RN4', 'RN5', 'RN6', '29a', '29b'])
     expect(INVITED_CHECKS.map((c) => [c.row, c.needs, c.blocking ?? false, c.prerequisite ?? false, c.always ?? false, c.skip ?? null, c.undoes ?? []])).toEqual(
       ['30', '31', '32', '33', '34'].map((row) => [row, ['workspace', 'claude'], false, false, false, null, row === '34' ? ['30', '31', '32', '33'] : []]),
     )
@@ -3218,7 +3219,8 @@ describe('the switch is absent before Check 30', () => {
     for (const p of [...buildLiveConfig(DRY_RUN_IDS).personas, personaEntryFor('d', DRY_RUN_IDS)]) expect(Object.keys(p)).not.toContain(INVITED_KEY)
   })
 
-  test("source audit: the switch's key is spelled only in live-config.ts's constant, and only invited-checks.ts uses the switch's names", () => {
+  // reaction-checks.ts's RN6 runs after Check 34 and restores config.json itself.
+  test("source audit: the switch's key is spelled only in live-config.ts's constant, and only invited-checks.ts and reaction-checks.ts use the switch's names", () => {
     const root = join(import.meta.dir, '..', 'ci-live')
     const files = (readdirSync(root, { recursive: true }) as string[]).filter((f) => f.endsWith('.ts') && !f.split('/').includes('node_modules'))
     expect(files.length).toBeGreaterThan(20)
@@ -3227,7 +3229,7 @@ describe('the switch is absent before Check 30', () => {
     expect(spelled.map(([f]) => f)).toEqual(['lib/live-config.ts'])
     expect(spelled[0]![1].split(SWITCH_KEY).length - 1).toBe(1)
     const names = /\b(SWITCH_KEY|SWITCH_VALUE_JQ|switchOnFilter|switchFilter)\b/
-    expect([...code].filter(([, c]) => names.test(c)).map(([f]) => f).sort()).toEqual(['checks/invited-checks.ts', 'lib/live-config.ts'])
+    expect([...code].filter(([, c]) => names.test(c)).map(([f]) => f).sort()).toEqual(['checks/invited-checks.ts', 'checks/reaction-checks.ts', 'lib/live-config.ts'])
   })
 })
 
@@ -4197,6 +4199,7 @@ describe('the prompts each check declares to the prompt guard, before it raises 
       { persona: 'b', command: CHECK23_B_EXTRA },
     ],
     '27': [{ persona: 'd', command: CHECK27_PROMPT, leaveOpen: true }],
+    RN4: [{ persona: 'a', command: RN4_PROMPT }],
   }
   const live = PLAN_CHECKS.filter((c) => c.needs.includes('workspace') && !c.skip)
 
@@ -4244,7 +4247,7 @@ describe('the prompts each check declares to the prompt guard, before it raises 
   }
 
   test('the checks that raise prompts are the ones run 6 named', () => {
-    expect(Object.keys(DECLARED).sort()).toEqual(['18', '22', '23', '27', '5'])
+    expect(Object.keys(DECLARED).sort()).toEqual(['18', '22', '23', '27', '5', 'RN4'])
     expect(CHECK23_B_EXTRA.test('anything B runs')).toBe(true)
   })
 
