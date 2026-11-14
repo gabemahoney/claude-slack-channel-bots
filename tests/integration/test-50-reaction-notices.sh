@@ -1791,8 +1791,8 @@ ALPHA_MEMBERS+=("${FS}" "${FU}" "${FP}")
 control_write "fungible: the conversations"
 choice_is() { [[ "$(shared_channel_saved "$1" "$2")" == "$3" ]]; }
 for chat in "${FS}" "${FU}" "${FP}"; do
-    new_ts
-    push_raw "fungible: alpha joins ${chat}" "$(slack_membership_event member_joined_channel "${ALPHA_LABEL}" "${chat}" "${PUSH_TS}" "${ALPHA_BOT_USER}")"
+    # shellcheck disable=SC2119 # scenario_ts requires zero arguments.
+    push_raw "fungible: alpha joins ${chat}" "$(slack_membership_event member_joined_channel "${ALPHA_LABEL}" "${chat}" "$(scenario_ts)" "${ALPHA_BOT_USER}")"
     wait_until "${EVENT_WAIT_S}" "fungible: alpha's join of ${chat} has no open-mode default" choice_is "${ALPHA_KEY}" "${chat}" mentions
     wait_membership_complete "${ALPHA}"
 done
