@@ -1,13 +1,19 @@
 /** Shared durable queue fixtures; all paths belong to the caller's scratch directory. */
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { createDeliveryQueue, parseQueueRecord, type AcceptedInput, type DeliveredRecord, type DeliveryQueueOptions, type QueueRecord } from '../../src/delivery-queue.ts'
+import { createDeliveryQueue, parseQueueRecord, type AcceptedInput, type DeliveredRecord, type DeliveryQueueOptions, type QueueRecord, type ReactionAcceptedInput } from '../../src/delivery-queue.ts'
 
 export const slackInput = (overrides: Partial<AcceptedInput> = {}): AcceptedInput => ({
   source: 'slack', text: 'message', channel: 'C0TEST001', channel_type: 'channel', user: 'U0TEST001',
   key: { chat_id: 'C0TEST001', ts: '1700000000.000001' }, ts: '1700000000.000001', via: 'all', ...overrides,
 })
 export const injectedInput = (overrides: Partial<AcceptedInput> = {}): AcceptedInput => ({ source: 'interject', sender: 'interject', text: 'prompt', ...overrides })
+/** A Reaction Item whose key agrees with its final fields unless explicitly overridden. */
+export function reactionInput(overrides: Partial<ReactionAcceptedInput> = {}): ReactionAcceptedInput {
+  const fields = { channel: 'C0TEST001', message_ts: '1700000000.000001', ts: '1700000000.000002', change: 'added' as const, emoji: 'thumbsup', user: 'U0REACTOR', ...overrides }
+  const reaction_key = overrides.reaction_key ?? { chat_id: fields.channel, message_ts: fields.message_ts, reactor: fields.user || fields.bot_id || '', emoji: fields.emoji, change: fields.change, event_ts: fields.ts }
+  return { source: 'reaction', text: '', origin: 'slack-event', mode: 'declarative', ...fields, reaction_key }
+}
 export const queuePath = (stateDir: string, key = 'alpha'): string => join(stateDir, 'queue', `${key}.jsonl`)
 export function seedQueue(stateDir: string, records: readonly (QueueRecord | string)[], key = 'alpha'): void {
   mkdirSync(join(stateDir, 'queue'), { recursive: true })

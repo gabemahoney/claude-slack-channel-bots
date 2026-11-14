@@ -1,7 +1,8 @@
 
 
-import { createDeliveryQueue, type QueueItem } from '../../src/delivery-queue.ts'
-import { createDeliveryPreparation, type DeliveryPreparationDeps } from '../../src/delivery-intake.ts'
+import { createDeliveryQueue, type QueueAccept, type QueueItem } from '../../src/delivery-queue.ts'
+import { createDeliveryPreparation, type DeliveryPreparation, type DeliveryPreparationDeps } from '../../src/delivery-intake.ts'
+import * as fs from 'node:fs'
 import { join, resolve } from 'node:path'
 import type { Database } from 'bun:sqlite'
 import type { WebClient } from '@slack/web-api'
@@ -22,7 +23,7 @@ import {
 } from '../../src/config.ts'
 import { durableWriteFileSync } from '../../src/atomic-write.ts'
 import { loadChannelDeliveryStore, type ChannelDeliveryStore } from '../../src/channel-delivery.ts'
-import { createPersonaRouting, type PersonaRoutingDeps } from '../../src/persona-routing.ts'
+import { createPersonaRouting, type BotToolReactionInput, type BotToolReactionIntakeResult, type PersonaRoutingDeps, type SlackAck } from '../../src/persona-routing.ts'
 import { formatPersonaNotice, type PersonaNotifier } from '../../src/persona-notifier.ts'
 import type { PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
 import { LOST_MESSAGE_STATES, type LostMessageState } from '../../src/lost-message.ts'
@@ -553,6 +554,27 @@ export interface RoutingHarnessOptions {
    * applies.
    */
   channelDelivery?: RoutingChannelDeliveryOptions
+  /**
+   * The routing's Run Bot Identities query, each ask recorded in
+   * `h.runBotAsks`. Absent, as by default: the member is absent, so the
+   * routing counts every reactor as a Run Bot and accepts no reaction.
+   */
+  isRunBotIdentity?: (id: string) => boolean
+  /** Wraps the queue's `accept` as the routing calls it (a scripted failed or rejected store); the queue itself is unchanged. */
+  wrapAccept?: (accept: QueueAccept) => QueueAccept
+  /** Wraps the queue's `lookupReactionKey` as the routing calls it (a scripted failed lookup); the queue itself is unchanged. */
+  wrapLookupReactionKey?: (lookup: PersonaRoutingDeps['queue']['lookupReactionKey']) => PersonaRoutingDeps['queue']['lookupReactionKey']
+  /** Wraps the real preparation's `prepare` as the routing calls it (to record or hold it); the preparation itself is unchanged. */
+  wrapPrepare?: (prepare: DeliveryPreparation['prepare']) => DeliveryPreparation['prepare']
+  /** Runs for each log line once it is in `h.logs`; a throw makes the log seam throw. */
+  logHook?: (line: string) => void
+  /**
+   * A queue its owner has started and stops (an engine harness's), used by
+   * the routing and its preparation instead of a queue of their own;
+   * `h.queueFaults` then injects nothing. Stop `h.preparation` before the
+   * owner stops it.
+   */
+  queue?: ReturnType<typeof createDeliveryQueue>
 }
 
 /** The stored-choice store a routing harness loads. */
@@ -723,6 +745,31 @@ export interface RoutingHarness {
    * returned; rejects when the tool reports an error.
    */
   reply(name: string, args: Record<string, unknown>): Promise<void>
+  /**
+   * Feed one reaction event to the named persona's reaction intake once the
+   * queue is ready, with a recording ack unless `ack` is given and the
+   * envelope flag as `receive` gives it.
+   */
+  receiveReaction(event: unknown, name: string, ack?: SlackAck, envelope?: EnvelopeOverrides): Promise<void>
+  /**
+   * Hand the named persona's reaction intake one reaction another persona
+   * made with its `react` tool, once the queue is ready: no envelope and no
+   * ack. Resolves with the intake's result.
+   */
+  receiveBotToolReaction(name: string, input: BotToolReactionInput): Promise<BotToolReactionIntakeResult>
+  /** The real preparation the routing prepares through; stop it in cleanup. */
+  readonly preparation: DeliveryPreparation
+  /** Every ask of the `isRunBotIdentity` option's query, in order. */
+  runBotAsks: string[]
+  /** Every `onReceived` report the routing made (queued feedback for accepted work), in order. */
+  received: Array<{ key: string; seq: number }>
+  /** Confirmed identities by persona key, replacing the stub's (`undefined`: not known), read at call time. */
+  identities: Map<string, ReturnType<PersonaRoutingDeps['getBotIdentity']>>
+  /**
+   * Queue disk control: `fileSync`, when set, runs before each fsync of a
+   * regular queue file, never the directory's; a throw fails that fsync.
+   */
+  queueFaults: { fileSync?: () => void }
   /** Everything the harness captured, for `assertNoLeak`. */
   captured(): Record<string, unknown>
 }
@@ -848,7 +895,7 @@ export function makeRoutingHarness(
   // The notifier and its hold, as server.ts builds them: the applied persona
   // read at call time, the same client lookup as the routing, one log. (`h`
   // is read only when they are called.)
-  const log = (line: string): void => { h.logs.push(line) }
+  const log = (line: string): void => { h.logs.push(line); opts.logHook?.(line) }
   const getPersona = (key: string): Persona | undefined => h.config?.personas.find((p) => p.key === key)
   const webClientFor = (key: string) => clients.clientFor(key) as unknown as WebClient | undefined
   const { notifier, hold, clock: holdClock } = makeNotifierStack({
@@ -896,8 +943,10 @@ export function makeRoutingHarness(
     }
   }
 
-  const queue = createDeliveryQueue({ stateDir: baseDir, now: opts.dedupeClock })
-  const queueReady = queue.start()
+  const queueFaults: RoutingHarness['queueFaults'] = {}
+  const queueFs = { ...fs, fsyncSync(fd: number) { if (queueFaults.fileSync && fs.fstatSync(fd).isFile()) queueFaults.fileSync(); fs.fsyncSync(fd) } }
+  const queue = opts.queue ?? createDeliveryQueue({ stateDir: baseDir, now: opts.dedupeClock, fs: queueFs })
+  const queueReady = opts.queue === undefined ? queue.start() : Promise.resolve()
   const h: RoutingHarness = {
     queue,
     queued: name => queue.items(byName(name).persona.key),
@@ -942,6 +991,19 @@ export function makeRoutingHarness(
       envelopeFlagOf(envelope),
     ) },
     receiveKeys: async (event, keys, envelope) => { await queueReady; return routing.receive(event, () => { h.order.push('ack') }, keys, envelopeFlagOf(envelope)) },
+    receiveReaction: async (event, name, ack, envelope) => {
+      await queueReady
+      return routing.receiveReaction(event, ack ?? (() => { h.order.push('ack') }), byName(name).persona.key, envelopeFlagOf(envelope))
+    },
+    receiveBotToolReaction: async (name, input) => {
+      await queueReady
+      return routing.receiveBotToolReaction(byName(name).persona.key, input)
+    },
+    get preparation() { return preparation },
+    runBotAsks: [],
+    received: [],
+    identities: new Map(),
+    queueFaults,
     setMode: (mode) => {
       h.config = configIn(mode)
     },
@@ -1010,8 +1072,19 @@ export function makeRoutingHarness(
   }
   const preparation = createDeliveryPreparation({ queue, clock: opts.preparationClock, clientFor: webClientFor, resolveUserName: opts.resolveUserName ?? resolveUserName })
   const routing = createPersonaRouting({
-    queue,
-    prepare: preparation.prepare,
+    queue: opts.wrapAccept === undefined && opts.wrapLookupReactionKey === undefined ? queue : {
+      lookupSlackKey: queue.lookupSlackKey,
+      lookupReactionKey: opts.wrapLookupReactionKey?.(queue.lookupReactionKey) ?? queue.lookupReactionKey,
+      accept: opts.wrapAccept?.(queue.accept) ?? queue.accept,
+    },
+    prepare: opts.wrapPrepare?.(preparation.prepare) ?? preparation.prepare,
+    onReceived: (key, item) => { h.received.push({ key, seq: item.accepted.seq }) },
+    ...(opts.isRunBotIdentity === undefined ? {} : {
+      isRunBotIdentity: (id: string) => {
+        h.runBotAsks.push(id)
+        return opts.isRunBotIdentity!(id)
+      },
+    }),
     getPersonaConfig: () => {
       h.order.push('config')
       return h.config
@@ -1020,7 +1093,7 @@ export function makeRoutingHarness(
     getChannelDelivery: () => h.channelDelivery,
     getBotIdentity: (key) => {
       h.order.push(`identity:${key}`)
-      return byKey(key)?.stub.identity
+      return h.identities.has(key) ? h.identities.get(key) : byKey(key)?.stub.identity
     },
     archive: (key, event) => {
       h.order.push(`archive:${key}`)

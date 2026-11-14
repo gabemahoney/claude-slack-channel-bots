@@ -1,18 +1,21 @@
 /** notice decisions only; engine/intake/ack suites own their transitions. */
+import { SERVER_POST_METADATA, noticePost, expectNoMetadata } from './test-helpers/server-post.ts'
 import { afterEach, describe, expect, test } from 'bun:test'
+import * as fs from 'node:fs'
 import { join } from 'node:path'
 import { CONFLICT_NOTICE_HUMAN_ONLY_LINE } from '../src/conflict-latch.ts'
 import { DELIVERY_STUCK_AFTER_MS, DELIVERY_ROW_POLL_MS, ENTER_DELAY_MS } from '../src/delivery-constants.ts'
 import { NOTICE_CORRECTION_TIMEOUT_MS, type NoticeCorrectionOutcome } from '../src/notice-correction.ts'
-import type { SlackKey } from '../src/delivery-queue.ts'
+import type { AcceptedInput, QueueItem, ReactionAcceptedInput, SlackKey } from '../src/delivery-queue.ts'
+import { createDeliveryPreparation, type DeliveryPreparation } from '../src/delivery-intake.ts'
 import type { DeliveryReason, DeliveryStatus } from '../src/delivery-engine.ts'
-import { buildDeliveryDiagnostic, buildDeliveryStuckNotice, buildMessageNotSavedNotice, buildMessageSavedAfterRetryNotice, buildStorageNoticeRecoveryLine, buildMessageNotTakenInNotice, buildMessagesWaitingNotice, buildQueueRecordUnreadableNotice, deliveryIdentity, deliveryStuckRemedy, MESSAGE_NOT_TAKEN_IN, MESSAGE_RECEIVED, MESSAGE_RETYPED, QUEUE_KEPT, QUEUE_UNWRITABLE, type DeliveryReportState, type DeliveryStuckReason } from '../src/delivery-notices.ts'
+import { buildDeliveryDiagnostic, buildDeliveryStuckNotice, buildMessageNotSavedNotice, buildMessageSavedAfterRetryNotice, buildStorageNoticeRecoveryLine, buildMessageNotTakenInNotice, buildMessagesWaitingNotice, buildQueueRecordUnreadableNotice, deliveryIdentity, deliveryStuckRemedy, MESSAGE_DELIVERED, MESSAGE_NOT_SAVED, MESSAGE_NOT_TAKEN_IN, MESSAGE_RECEIVED, MESSAGE_RETYPED, QUEUE_KEPT, QUEUE_UNWRITABLE, type DeliveryReportState, type DeliveryStuckReason } from '../src/delivery-notices.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import { MESSAGE_PARTIAL_RECEIPT, PERSONA_DESTINATION_FAILED } from '../src/persona-diagnostics.ts'
 import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { makeDeliveryNoticeHarness, makeStorageNoticeHarness, type DeliveryNoticeHarness, type StorageNoticeHarness } from './test-helpers/delivery-notices.ts'
-import { injectedInput, readQueue } from './test-helpers/delivery-queue.ts'
+import { injectedInput, queuePath, readQueue, slackInput } from './test-helpers/delivery-queue.ts'
 import { partialReceiptText, partialReceiptSuffix } from './test-helpers/partial-receipt.ts'
 import { openedDm } from './test-helpers/slack-stub.ts'
 import { appendTranscript, pastedText, promptEntry, replyEntry } from './test-helpers/working-row-panes.ts'
@@ -207,6 +210,143 @@ test('received is once per accepted identity, including replay preparation and f
   r.reporting.received(r.alpha, item); r.reporting.received(r.alpha, item)
   expect(r.logs).toEqual([buildDeliveryDiagnostic(MESSAGE_RECEIVED, r.ref(), deliveryIdentity(item.accepted))])
   expect(JSON.stringify(r.logs)).not.toContain('private accepted body')
+})
+
+describe('Reaction Items: the queue store-failure path and delivered diagnostics only (SR-4.4, SR-8.1, SR-10.1)', () => {
+  const preparations: DeliveryPreparation[] = []
+  afterEach(async () => { for (const p of preparations.splice(0)) await p.stop() })
+  async function runWith(options: Parameters<typeof makeDeliveryNoticeHarness>[0]) {
+    const h = await makeDeliveryNoticeHarness(options); runs.push(h); return h
+  }
+  /** The b.vki fsync seam: while failing, every journal fsync fails as a full disk. */
+  function diskFault() {
+    let failing = false
+    const faulty: typeof fs = { ...fs, fsyncSync(fd: number) {
+      if (failing && fs.fstatSync(fd).isFile()) throw Object.assign(new Error(sentinelInMessage('store')), { code: 'ENOSPC' })
+      fs.fsyncSync(fd)
+    } }
+    return { fs: faulty, fail(value = true) { failing = value } }
+  }
+  type Reactor = { user: string } | { bot_id: string }
+  const REACTORS: Array<[string, Reactor]> = [['user', { user: 'U0REACTOR' }], ['bot_id', { bot_id: 'B0REACTOR' }]]
+  const reactorId = (reactor: Reactor) => ('user' in reactor ? reactor.user : reactor.bot_id)
+  /** One reaction on alpha's channel as intake stores it. */
+  function reaction(reactor: Reactor, overrides: { ts?: string; mode?: ReactionAcceptedInput['mode'] } = {}): ReactionAcceptedInput {
+    const channel = 'C0ALPHA01', message_ts = '1700000100.000100', ts = overrides.ts ?? '1700000200.000200'
+    return { source: 'reaction', text: '', channel, message_ts, ts, change: 'added', emoji: 'eyes', ...reactor, origin: 'slack-event',
+      mode: overrides.mode ?? 'declarative', reaction_key: { chat_id: channel, message_ts, reactor: reactorId(reactor), emoji: 'eyes', change: 'added', event_ts: ts } }
+  }
+  async function store(r: DeliveryNoticeHarness, input: AcceptedInput): Promise<QueueItem> {
+    const result = await r.queue.accept(r.alpha, input)
+    if (result.status !== 'accepted') throw new Error('reaction fixture store failed')
+    return result.item!
+  }
+  function notSaved(r: DeliveryNoticeHarness, input: AcceptedInput, count: number) {
+    const identity = deliveryIdentity({ source: input.source, channel: input.channel, ts: input.ts ?? '', user: input.user, bot_id: input.bot_id })
+    return buildDeliveryDiagnostic(MESSAGE_NOT_SAVED, r.ref(), identity, `count=${count} path=${JSON.stringify(queuePath(r.root, r.alpha))} code=ENOSPC`)
+  }
+  const slackCalls = (r: DeliveryNoticeHarness) => [...r.h.stubs.values()].flatMap(stub => stub.callLog)
+  const receivedLine = (r: DeliveryNoticeHarness, item: QueueItem) => buildDeliveryDiagnostic(MESSAGE_RECEIVED, r.ref(), deliveryIdentity(item.accepted))
+  /** Real preparation with no Slack client: a declarative reaction is fixed, a fungible one withdrawn. */
+  function preparation(r: DeliveryNoticeHarness) {
+    const p = createDeliveryPreparation({ queue: r.queue, clock: r.h.clock, resolveUserName: async (_key, user) => user, clientFor: () => undefined, onReceived: r.reporting.received })
+    preparations.push(p); return p
+  }
+
+  test.each(REACTORS)('reactor %s: a failed reaction store is logged and counted with the reaction identity, reset by a successful store, and reaches no Slack API', async (_label, reactor) => {
+    const disk = diskFault(), r = await runWith({ fs: disk.fs })
+    const first = reaction(reactor), other = reaction(reactor, { ts: '1700000200.000201' })
+    disk.fail()
+    for (const input of [first, first, other]) expect((await r.queue.accept(r.alpha, input)).status).toBe('failed')
+    await r.flush()
+    expect(r.logs).toEqual([notSaved(r, first, 1), notSaved(r, first, 2), notSaved(r, other, 3)])
+    expect(r.logs[0]).toContain(` source=reaction chat_id="C0ALPHA01" ts="${first.ts}" sender_id="${reactorId(reactor)}" count=1 `)
+    // Slack's redelivery is stored; preparation then reports it received.
+    disk.fail(false)
+    r.reporting.received(r.alpha, await store(r, first))
+    disk.fail()
+    expect((await r.queue.accept(r.alpha, other)).status).toBe('failed')
+    await r.flush(); await r.h.clock.advance(NOTICE_CORRECTION_TIMEOUT_MS * 2)
+    expect(r.logs.slice(3)).toEqual([notSaved(r, other, 1)])
+    expect(slackCalls(r)).toEqual([])
+    expect(r.h.hold.view(r.alpha).heldNotices).toBe(0)
+    expect(r.h.clock.pendingCount()).toBe(0)
+    expect(readQueue(r.root, r.alpha).filter(record => record.kind === 'accepted')).toEqual([expect.objectContaining({ source: 'reaction', ts: first.ts })])
+  })
+
+  test('reaction storage neither takes, recovers nor forgets a Slack message warning, which still posts and recovers on its exact retry', async () => {
+    const disk = diskFault(), r = await runWith({ fs: disk.fs }), warningTs = '1800000000.000001'
+    const react = reaction({ user: 'U0REACTOR' })
+    const slack = slackInput({ channel: 'C0SOURCE1', user: 'U0SENDER1', key: { chat_id: 'C0SOURCE1', ts: '1700000000.000001' }, ts: '1700000000.000001' })
+    r.h.stub(r.alpha).script.post.push({ kind: 'ok', result: { ts: warningTs } })
+    disk.fail()
+    expect((await r.queue.accept(r.alpha, react)).status).toBe('failed')
+    await r.flush()
+    expect(r.h.totalPosts()).toBe(0)
+    expect((await r.queue.accept(r.alpha, slack)).status).toBe('failed')
+    await r.flush()
+    expect(r.h.posts(r.alpha)).toMatchObject([{ channel: 'C0ALPHA01', text: formatPersonaNotice(r.config.personas[0]!, buildMessageNotSavedNotice(r.ref(), 'U0SENDER1')) }])
+    disk.fail(false)
+    r.reporting.received(r.alpha, await store(r, react))
+    await r.flush()
+    expect(r.h.stub(r.alpha).calls.update).toEqual([])
+    const saved = await store(r, slack)
+    r.reporting.received(r.alpha, saved)
+    await r.flush()
+    expect(r.h.stub(r.alpha).calls.update).toMatchObject([{ channel: 'C0ALPHA01', ts: warningTs,
+      text: formatPersonaNotice(r.config.personas[0]!, buildMessageSavedAfterRetryNotice(r.ref(), 'U0SENDER1')) }])
+    expect(r.h.posts(r.alpha)).toHaveLength(1)
+    expect(r.h.posts(r.beta)).toEqual([])
+    expect(r.logs).toEqual([
+      notSaved(r, react, 1), notSaved(r, slack, 2), receivedLine(r, saved),
+      buildStorageNoticeRecoveryLine(r.ref(), slack.key!, 'edit', { outcome: 'success' }),
+    ])
+  })
+
+  test('preparation, startup recovery and queued reconciliation report no Reaction Item as received or queued; the Slack control is', async () => {
+    const r = await runWith({ recordQueued: true })
+    const slack = await r.accept()
+    const kept = await store(r, reaction({ user: 'U0REACTOR' }))
+    const withdrawn = await store(r, reaction({ bot_id: 'B0REACTOR' }, { ts: '1700000200.000201', mode: 'fungible' }))
+    const prep = preparation(r)
+    r.reporting.received(r.alpha, kept)
+    for (const item of [slack, kept, withdrawn]) await prep.prepare(r.alpha, item)
+    r.reporting.reconcileQueued(r.alpha)
+    await r.flush()
+    expect(r.queue.item(r.alpha, kept.accepted.seq)).toMatchObject({ fixed: { seq: kept.accepted.seq }, delivered: false })
+    expect(r.queue.item(r.alpha, withdrawn.accepted.seq)).toMatchObject({ withdrawn: { reason: 'conversation-unknown' }, delivered: false })
+    expect(r.logs).toEqual([receivedLine(r, slack)])
+    expect(r.queued.map(({ key, item }) => [key, item.accepted.seq])).toEqual([[r.alpha, slack.accepted.seq], [r.alpha, slack.accepted.seq]])
+
+    // A restarted server's reporting has seen nothing; recovery prepares every retained open item again.
+    const restarted = await runWith({ queue: r.queue, recordQueued: true })
+    const recovering = createDeliveryPreparation({ queue: r.queue, clock: restarted.h.clock, resolveUserName: async (_key, user) => user,
+      clientFor: () => undefined, onReceived: restarted.reporting.received })
+    preparations.push(recovering)
+    await recovering.recover([r.alpha])
+    await restarted.flush()
+    expect(restarted.logs).toEqual([receivedLine(restarted, slack)])
+    expect(restarted.queued.map(({ item }) => item.accepted.seq)).toEqual([slack.accepted.seq])
+  })
+
+  test('the final delivery fallback logs a Reaction Item delivered without a received line or queued callback; a withdrawn one is never delivered', async () => {
+    const r = await runWith({ recordQueued: true })
+    const slack = await r.accept()
+    const kept = await store(r, reaction({ user: 'U0REACTOR' }))
+    const withdrawn = await store(r, reaction({ bot_id: 'B0REACTOR' }, { ts: '1700000200.000201', mode: 'fungible' }))
+    await preparation(r).prepare(r.alpha, withdrawn)
+    // Nothing above reported slack or kept received, so final delivery is their first report.
+    r.logs.length = 0; r.queued.length = 0
+    await r.complete(slack); await r.complete(kept)
+    r.reporting.engineEvent({ type: 'item-delivered', key: r.alpha, seq: withdrawn.accepted.seq, at: r.h.clock.now(), waitMs: 0 })
+    await r.flush()
+    const deliveredLine = (item: QueueItem) => buildDeliveryDiagnostic(MESSAGE_DELIVERED, r.ref(), deliveryIdentity(item.accepted), `at=${r.h.clock.now()} wait_ms=0`)
+    expect(r.logs).toEqual([receivedLine(r, slack), deliveredLine(slack), deliveredLine(kept)])
+    expect(r.logs[2]).toContain(` source=reaction chat_id="C0ALPHA01" ts="${kept.accepted.ts}" sender_id="U0REACTOR" `)
+    expect(r.delivered.map(({ item }) => item.accepted.seq)).toEqual([slack.accepted.seq, kept.accepted.seq])
+    expect(r.queued).toEqual([])
+    expect(r.queue.item(r.alpha, withdrawn.accepted.seq)).toMatchObject({ withdrawn: { reason: 'conversation-unknown' }, delivered: false })
+  })
 })
 test('the durable per-item not-taken-in notice survives server restart while retyping continues', async () => {
   let r: DeliveryNoticeHarness | undefined
@@ -502,6 +642,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     expect(updates).toHaveLength(1)
     expect(updates[0]).toMatchObject({ channel: destination === 'dm' ? noticeDm : 'C0NOTICE1', ts: warningTs })
     recovered(r, updates[0]!)
+    expectNoMetadata(updates[0]!)
     expect(r.h.posts(r.alpha)).toHaveLength(1)
     expect(r.h.stub(r.beta).callLog).toEqual([])
     expect(recoveryLines(r)).toEqual([recoveryLine(r, 'edit', { outcome: 'success' }, edited.edited.ts)])
@@ -533,11 +674,14 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     await retry(r)
     expect(r.h.stub(r.alpha).calls.update).toHaveLength(1)
     expect(r.h.stub(r.alpha).calls.update[0]).toMatchObject({ channel: destination === 'dm' ? noticeDm : 'C0NOTICE1', ts: warningTs })
+    expectNoMetadata(r.h.stub(r.alpha).calls.update[0]!)
     expect(r.h.posts(r.alpha)).toHaveLength(2)
     const correction = r.h.stub(r.alpha).calls.postMessage[1]!
     expect(correction.channel).toBe(r.h.posts(r.alpha)[0]!.channel)
     expect(correction.thread_ts).toBe(r.h.stub(r.alpha).calls.postMessage[0]!.thread_ts)
     recovered(r, correction)
+    // The fallback is a Server Post: the marker rides in its one request.
+    expect(correction).toEqual(noticePost(r.h.posts(r.alpha)[0]!.channel, noticeText(correction)!))
     expect(noticeText(correction)!.length).toBeLessThan(warning(r).length)
     expect(recoveryLines(r)).toEqual([
       expect.stringContaining(recoveryLine(r, 'edit', { outcome: 'failed', reason: '' })),
@@ -566,7 +710,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     expect(r.acks).toHaveLength(1)
     expect(r.queue.items(r.alpha)).toHaveLength(1)
     opening.settle(openedDm(noticeDm)); await r.flush()
-    expect(r.h.posts(r.alpha)).toEqual([{ channel: noticeDm, text: warning(r) }])
+    expect(r.h.posts(r.alpha)).toEqual([noticePost(noticeDm, warning(r))])
     expect(r.h.stub(r.alpha).calls.update).toEqual([])
   })
   test.each(unrelated)('posted edited warning survives %s, then the exact edit still corrects it', async (_label, other) => {
@@ -610,7 +754,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     await r.receive(); await r.receive()
     await r.h.clock.advance(90 * 24 * 60 * 60 * 1000)
     await r.receive()
-    expect(r.h.posts(r.alpha)).toEqual([{ channel: noticeDm, text: warning(r) }])
+    expect(r.h.posts(r.alpha)).toEqual([noticePost(noticeDm, warning(r))])
     expect(r.h.stub(r.alpha).calls.update).toEqual([])
     expect(r.acks).toEqual([])
     expect(r.queue.items(r.alpha)).toEqual([])
@@ -662,6 +806,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     expect(r.h.posts(r.alpha)).toHaveLength(2)
     expect(r.h.posts(r.alpha)[1]!.channel).toBe('C0NOTICE1')
     recovered(r, r.h.stub(r.alpha).calls.postMessage[1]!)
+    expect(r.h.stub(r.alpha).calls.postMessage[1]!.metadata).toEqual(SERVER_POST_METADATA)
     expect(recoveryLines(r)).toEqual([
       recoveryLine(r, 'edit', { outcome: 'failed', reason: 'missing_message_ts' }),
       recoveryLine(r, 'correction', { outcome: 'success' }),
@@ -684,7 +829,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     expect(r.h.clock.pendingCount()).toBe(keepOther ? 1 : 0)
     if (keepOther) {
       await r.h.clock.runNext()
-      expect(r.h.posts(r.alpha)[1]).toEqual({ channel: 'C0NOTICE1', text: formatPersonaNotice(r.config.personas[0]!, other) })
+      expect(r.h.posts(r.alpha)[1]).toEqual(noticePost('C0NOTICE1', formatPersonaNotice(r.config.personas[0]!, other)))
     }
     await r.h.clock.advance(NOTICE_CORRECTION_TIMEOUT_MS * 2)
     expect(r.h.posts(r.alpha)).toHaveLength(keepOther ? 2 : 1)
@@ -727,7 +872,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     // an open timeout: abort itself must release this persona's drain.
     await r.h.clock.advance(1)
     expect(opening.settled).toBe(false)
-    const expectedPosts = [{ channel: 'C0FIXED01', text: formatPersonaNotice(r.h.personas[0]!, other) }]
+    const expectedPosts = [noticePost('C0FIXED01', formatPersonaNotice(r.h.personas[0]!, other))]
     expect(r.h.posts(r.alpha)).toEqual(expectedPosts)
     expect(r.h.hold.view(r.alpha)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
     const destinationOutcomes = destinationLines(r)
@@ -792,8 +937,8 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     await r.receive(edited, r.beta)
     expect(r.acks).toEqual([])
     expect(readQueue(r.root, r.beta)).toEqual([])
-    expect(r.h.posts(r.beta)).toEqual([{ channel: betaDm,
-      text: formatPersonaNotice(r.config.personas[1]!, buildMessageNotSavedNotice(r.ref(r.beta), 'U0SENDER1')) }])
+    expect(r.h.posts(r.beta)).toEqual([noticePost(betaDm,
+      formatPersonaNotice(r.config.personas[1]!, buildMessageNotSavedNotice(r.ref(r.beta), 'U0SENDER1')))])
     expect(opening.settled).toBe(false)
     // Both warning registrations exist before only alpha is forgotten.
     r.forget()

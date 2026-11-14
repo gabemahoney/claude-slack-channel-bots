@@ -15,7 +15,8 @@ import { makeDeliveryNoticeHarness } from './delivery-notices.ts'
 import { asWebClient, makeChannelMessage, makeDeferredWebApiCall, type DeferredWebApiCall, type StubWebClient } from './slack-stub.ts'
 
 type AckCallback = (key: string, item: QueueItem) => Promise<void>
-export async function makeQueuedAckHarness() {
+/** `onReplyCall`: bound into the session servers' tool deps, as the server binds the reply-reminder monitor's. */
+export async function makeQueuedAckHarness(options: { onReplyCall?: (key: string) => void | Promise<void> } = {}) {
   let reporting: ReturnType<typeof createDeliveryReporting> | undefined
   const e = await makeEngineHarness({ keys: ['alpha', 'beta'], onEvent: event => reporting?.engineEvent(event) })
   const n = await makeDeliveryNoticeHarness({ queue: e.queue, leakMarker: LEAK_SENTINEL })
@@ -163,7 +164,7 @@ export async function makeQueuedAckHarness() {
         getPersona: personaKey => n.config.personas.find(p => p.key === personaKey),
         clientFor: personaKey => asWebClient(clientFor(personaKey)),
         resolveUserName: async (_key, user) => user, inboxDir: e.root,
-        consumeAck, serverPort: 0, log: line => n.logs.push(line),
+        consumeAck, serverPort: 0, log: line => n.logs.push(line), onReplyCall: options.onReplyCall,
       })
       servers.push(server)
       const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair()

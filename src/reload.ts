@@ -65,7 +65,8 @@
  * reconnect, step 5 refreshes the agent-director template when the config
  * directories changed, and step 6 brings up each added persona and the new
  * half of each destructive modify; the retiring keys are cleared once step 2
- * has settled, before step 3 starts), and logs
+ * has settled, before step 3 starts), then tells `onApplySettled`, not
+ * awaiting what it starts, and logs
  * `reload-applied`, or `reload-noop` when nothing effective changed. A
  * mismatched, unreadable or malformed confirmation applies nothing and logs
  * `reload-stale-confirmation`. The pending state is then refreshed against
@@ -281,6 +282,18 @@ export function reloadChannelDeliveryWriteFailedLine(channelDeliveryPath: string
     `last-applied record ${JSON.stringify(lastAppliedPath)} is not rewritten, and the confirmed change is not ` +
     'applied and stays pending'
   )
+}
+
+/**
+ * The line logged when `onApplySettled`, told that a confirmed apply's steps
+ * 2–6 have settled, throws or its returned promise rejects; the apply goes
+ * on. `description` is the thrown value as `describeThrownValue` renders it.
+ * Pure.
+ *
+ * [slack] reload: the server's post-apply work failed: <thrown value>
+ */
+export function reloadPostApplyFailedLine(description: string): string {
+  return `[slack] reload: the server's post-apply work failed: ${description}`
 }
 
 /**
@@ -588,9 +601,24 @@ export interface ReloadControllerDeps {
    * persona set and its `allow_invited_channels` switch, with every other
    * server-wide value kept from start time; the bring-up controller's applied
    * set, the reply reminder and every consumer of the channel mode read it
-   * from there. A throw is logged; the apply goes on.
+   * from there. A throw is logged; the apply goes on. Work that must follow
+   * the lifecycle steps belongs in `onApplySettled`.
    */
   onApplied?: (config: PersonaConfig) => void
+  /**
+   * Told the configuration a confirmed apply made the applied one once its
+   * steps 2–6 have settled (each fulfilled, rejected, unbound or not run),
+   * right before `reload-applied` or `reload-noop` is logged: on every path
+   * that applied, a no-op or recorded-only change included, never after a
+   * refused candidate or a step-1 write that applied nothing. Its returned
+   * value is not awaited, so nothing it starts holds the apply or the next
+   * tick; a throw or rejection is logged (`reloadPostApplyFailedLine`), and
+   * the apply goes on. Production reclaims the applied persona keys' claimed
+   * preparation work here (`DeliveryPreparation.reclaim`): a destructive modify's
+   * teardown ended the preparation life that held the key's open work, and
+   * only the key's next life, started after that teardown, can fix it.
+   */
+  onApplySettled?: (config: PersonaConfig) => unknown
   /**
    * Test override: the bodies of apply steps 2–6 (`reload-apply.ts`), used
    * instead of the default ones; an unbound step then does nothing. Without
@@ -1706,6 +1734,20 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
   }
 
   /**
+   * Tell the server the applied configuration's steps 2–6 have settled
+   * (`deps.onApplySettled`), not awaited; a throw or a rejection is logged,
+   * never raised.
+   */
+  function notifyApplySettled(config: PersonaConfig): void {
+    const failed = (err: unknown): void => deps.log(reloadPostApplyFailedLine(describeThrownValue(err)))
+    try {
+      void Promise.resolve(deps.onApplySettled?.(config)).catch(failed)
+    } catch (err) {
+      failed(err)
+    }
+  }
+
+  /**
    * Apply a confirmed candidate: the exact bytes and the plan
    * the tick derived from them, never a second read or diff. An invalid
    * candidate logs one `reload-invalid` line and changes nothing. A valid one
@@ -1759,10 +1801,13 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
    * changed): step 2 on its own first, and once it has settled (fulfilled,
    * rejected, unbound or not run) the retiring keys are cleared, before step
    * 3 starts, on every path out of the apply; then steps 3–6.
-   * Then `reload-applied` or `reload-noop` is logged. A candidate
+   * Then, with every step settled, `onApplySettled` is told the applied
+   * configuration, not awaited, and `reload-applied` or `reload-noop` is
+   * logged. A candidate
    * whose only changes are recorded ones (the section the switch does not
    * select) has no effective change: it rewrites the record, swaps the
-   * applied state and logs `reload-noop`, with no lifecycle operation
+   * applied state, tells `onApplySettled` and logs `reload-noop`, with no
+   * lifecycle operation
    * A change of the switch is a
    * server-wide setting the swap applies in place (`configInEffect`); it puts
    * no persona in any step, so on its own it runs no teardown, bring-up,
@@ -1845,6 +1890,9 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
       setRetiring(channelDelivery, retiring, false)
     }
     await runApplySteps(applySlots, inputs, steps.filter((step) => step !== TEARDOWNS_STEP), onStepFailure)
+    // Only now: work started from here runs under lives no teardown of this
+    // apply can end.
+    notifyApplySettled(candidate.config)
     deps.log(plan.noEffectiveChange ? renderNoopLogLine(paths.lastApplied) : renderAppliedLogLine(plan, paths.lastApplied))
     return true
   }

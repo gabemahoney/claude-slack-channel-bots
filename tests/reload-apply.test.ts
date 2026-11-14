@@ -1,5 +1,7 @@
 import { REPLY_TOOL_ALLOW_RULE } from '../src/agent-director-template.ts'
-import { queuePath, readQueue } from './test-helpers/delivery-queue.ts'
+import { injectedInput, queuePath, readQueue } from './test-helpers/delivery-queue.ts'
+import { RETYPE_BACKOFF_MS } from '../src/delivery-constants.ts'
+import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
 import { botSystemPromptPath } from '../src/bot-system-prompt.ts'
@@ -77,6 +79,7 @@ import {
   personaNotAppliedRefusal,
   type SessionEntry,
 } from '../src/registry.ts'
+import { buildReactionDroppedLine, REACTION_DROPPED } from '../src/reaction-intake-diagnostics.ts'
 import { renderNoopLogLine } from '../src/reload-apply.ts'
 import { DESTRUCTIVE_SETTINGS, MODE_SWITCH_SETTING, type DestructiveSetting, type InPlaceSetting } from '../src/reload-plan.ts'
 import {
@@ -86,6 +89,7 @@ import {
   RELOAD_RETIRED_KEYS_RESTORE_FAILED,
   RELOAD_RETIRED_KEYS_RESTORED,
   reloadChannelDeliveryWriteFailedLine,
+  reloadPostApplyFailedLine,
   reloadRetiredKeysPutBackClause,
   reloadRetiredKeysPutBackFailedClause,
 } from '../src/reload.ts'
@@ -131,6 +135,7 @@ import {
   assertNoLeak,
   BOT_TOKEN_PREFIX,
   fakeToken,
+  LEAK_SENTINEL,
   REDACTED_SENTINEL_TAIL,
   sentinelInMessage,
   withoutName,
@@ -159,10 +164,14 @@ import { readRetiredKeysRecord, retiredKeysRecordOf, RFC3339_UTC, writeRetiredKe
 import {
   makeChannelMessage,
   makeDeferredConnect,
+  makeDeferredWebApiCall,
   makeDm,
   makePrivateChannelMessage,
+  makeReaction,
   mentionText,
   stubOpenedDmId,
+  type DeferredWebApiCall,
+  type SettledWebApiOutcome,
   type SlackEvent,
   type StubSlackOptions,
   type StubWebCall,
@@ -1037,6 +1046,8 @@ describe('a failed apply undoes its recording', () => {
     expect(h.readRecord()).toEqual(recordBytes)
     expect(run.controller.applied()).toBe(applied)
     expect(run.appliedConfigs).toEqual([])
+    // Nothing was applied, so nothing is told the apply settled and nothing is reclaimed.
+    expect(run.settledConfigs).toEqual([])
     expect(run.since(cp).lifecycle).toEqual([])
     expect(h.pendingFingerprint()).toBe(fingerprint)
     expectNoPostNoLeak(run)
@@ -1122,6 +1133,7 @@ describe('a failed apply undoes its recording', () => {
     expect(h.readRecord()).toEqual(recordBytes)
     expect(run.controller.applied()).toBe(applied)
     expect(run.appliedConfigs).toEqual([])
+    expect(run.settledConfigs).toEqual([])
     expect(run.since(cp).lifecycle).toEqual([])
     const lines = recordWriteFailedLines(run)
     expect(lines).toHaveLength(1)
@@ -2100,8 +2112,8 @@ describe('step order with teardowns, in-place updates and bring-ups (steps 2, 3 
    * 3), rotates golf's and hotel's tokens (step 4), and adds echo and foxtrot
    * (step 6): two personas in each step.
    */
-  async function twoOfEach() {
-    const { run, personas } = await running(['alpha', 'bravo', 'charlie', 'delta', 'golf', 'hotel'])
+  async function twoOfEach(opts: RunningOptions = {}) {
+    const { run, personas } = await running(['alpha', 'bravo', 'charlie', 'delta', 'golf', 'hotel'], opts)
     const withExtra = (name: string, extra: string) =>
       h.persona(name, { channels: [{ id: ownChannel(name), delivery: 'all' }, { id: extra, delivery: 'all' }] })
     const [, , , , golf, hotel] = personas
@@ -2125,8 +2137,12 @@ describe('step order with teardowns, in-place updates and bring-ups (steps 2, 3 
     { label: 'step 3', op: 'update-in-place', failing: 'charlie', step: '3 (in-place-updates)' },
     { label: 'step 4', op: 'reconnect', failing: 'hotel', step: '4 (credentials-reconnects)' },
     { label: 'step 6', op: 'bring-up', failing: 'foxtrot', step: '6 (bring-ups)' },
-  ])("$label: when one $op rejects, it is logged once by the controller with its message redacted, the step's other persona still settles, the later steps still run, and the apply finishes", async ({ op, failing, step }) => {
-    const { run, next } = await twoOfEach()
+  ])("$label: when one $op rejects, it is logged once by the controller with its message redacted, the step's other persona still settles, the later steps still run, and the apply finishes, telling its settlement once every step has settled and before reload-applied", async ({ op, failing, step }) => {
+    // How far the apply had got each time its settlement was told.
+    const settledAt: Array<{ timeline: number; applied: number }> = []
+    const { run, next } = await twoOfEach({
+      onApplySettled: () => void settledAt.push({ timeline: run.lifecycle.timeline.length, applied: run.logsOf(RELOAD_APPLIED).length }),
+    })
     const [alphaKey, bravoKey, charlieKey, deltaKey, echoKey, foxtrotKey, golfKey, hotelKey] = keysOf(
       'alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel',
     )
@@ -2168,6 +2184,9 @@ describe('step order with teardowns, in-place updates and bring-ups (steps 2, 3 
     expect(failed[0]).toContain(`lifecycle op exploded ${REDACTED_SENTINEL_TAIL}`)
     expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
     expect(run.appliedKeys()).toEqual(keysOf('alpha', 'charlie', 'golf', 'hotel', 'echo', 'foxtrot'))
+    // Told once, with every step's calls already ended (the rejected one included), before reload-applied.
+    expect(settledAt).toEqual([{ timeline: timeline.length, applied: 0 }])
+    expect(run.settledConfigs.map((c) => c.personas.map((p) => p.key))).toEqual([run.appliedKeys()!])
     expect(run.lifecycle.of('reconnect').find((r) => r.key === golfKey)!.change).toEqual({ kind: 'swapped' })
     if (op === 'reconnect') {
       // The rejected reconnect never ran, so hotel's change is pending again.
@@ -6123,6 +6142,8 @@ describe('in-place and recorded section changes at confirmation (the in-place ro
     expect(h.readRecord()).not.toEqual(recordBefore)
     expect(run.logsOf(RELOAD_NOOP)).toEqual([renderNoopLogLine(h.paths.lastApplied)])
     expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
+    // A recorded-only change still applied: its settlement is told once, with every persona, so their claimed work is reclaimed.
+    expect(run.settledConfigs.map((c) => c.personas.map((p) => p.key))).toEqual([keysOf('alpha', 'bravo')])
     expect(await probes()).toEqual(before)
     await expectNothingPendingAfter(run)
     expectModeNoLeak()
@@ -6145,6 +6166,111 @@ describe('in-place and recorded section changes at confirmation (the in-place ro
     expect(run.deliveries('alpha')).toEqual([])
     expectModeNoLeak()
   })
+})
+
+describe('reaction_notices turned off and back on applies in place at confirmation, keeping the instance (the in-place row)', () => {
+  /** The reacted message's ts: the persona's own message in its own channel. */
+  const REACTED_TS = '1700000300.000100'
+
+  test.each<ChannelMode>(['declarative', 'fungible'])(
+    "%s mode: bravo's setting is published only once confirmed, as one in-place update each way, with its session, connection and row kept and alpha untouched; bravo's next new reaction follows it, alpha's never",
+    async (mode) => {
+      const { run, personas } = await runningIn(mode)
+      const [alpha, bravo] = personas
+      const bravoKey = h.key('bravo')
+      const session = run.session('bravo')!
+      const effective = () => run.serverConfig()!.personas.map((p) => [p.name, p.reaction_notices])
+      expect(effective()).toEqual([['alpha', true], ['bravo', true]])
+      const accepted: Record<string, string[]> = { alpha: [], bravo: [] }
+      let n = 0
+      /**
+       * A new human reaction (a fresh `event_ts`) to the persona's message in
+       * its own channel, through the run's socket and event router. It is
+       * acked once, and either accepted (one more queued item, no drop line)
+       * or, with `notices` false, dropped with only the builder's
+       * `notices-off` line, no item and no Slack call. Every item the
+       * persona holds is one this helper saw accepted, so nothing dropped is
+       * ever backfilled.
+       */
+      async function react(name: string, notices: boolean, type: 'reaction_added' | 'reaction_removed' = 'reaction_added'): Promise<void> {
+        const eventTs = `1700000300.${String(++n).padStart(6, '0')}`
+        const channel = ownChannel(name)
+        const socket = run.stub(name).socket
+        const from = { acks: socket.acks.length, logs: run.logs.length, calls: run.stub(name).callLog.length }
+        await run.deliver(name, makeReaction(type, {
+          user: CONTACT, reaction: 'white_check_mark', item_user: run.stub(name).identity.botUserId, event_ts: eventTs,
+        }, { channel, ts: REACTED_TS }))
+        expect(socket.acks.length - from.acks).toBe(1)
+        const drops = run.logs.slice(from.logs).filter((line) => line.startsWith(`[slack] ${REACTION_DROPPED}: `))
+        if (notices) {
+          accepted[name]!.push(eventTs)
+          expect(drops).toEqual([])
+        } else {
+          expect(drops).toEqual([buildReactionDroppedLine({ key: h.key(name), name }, { reason: 'notices-off', chat_id: channel, message_ts: REACTED_TS })])
+          expect(run.stub(name).callLog.length).toBe(from.calls)
+        }
+        expect(run.queued(name).map((i) => i.accepted.ts)).toEqual(accepted[name])
+      }
+
+      // On at the start, for both.
+      await react('bravo', true)
+      await react('alpha', true)
+
+      // Off by writing false, then back on by removing the key again.
+      for (const [next, value] of [[{ ...bravo!, reaction_notices: false }, false], [bravo!, true]] as const) {
+        const cp = run.checkpoint()
+        const timeline = run.lifecycle.timeline.length
+        const calls = run.composition!.calls.length
+        const applied = run.logsOf(RELOAD_APPLIED).length
+
+        await previewConfig(run, [alpha!, next], switchTop(mode))
+        expect(effective()).toEqual([['alpha', true], ['bravo', !value]])
+        expect(run.since(cp).slackBuilds).toBe(0)
+        expect(run.since(cp).slackCalls).toEqual([])
+
+        // Previewed, not confirmed: bravo's next new reaction still follows the applied value, with no lifecycle work.
+        await react('bravo', !value)
+        await react('alpha', true)
+        expect(run.since(cp).lifecycle).toEqual([])
+        expect(h.pendingExists()).toBe(true)
+        assertNoLeak(run.captured())
+
+        const bravoSide = slackSideOf(run, 'bravo')
+        const alphaUntouched = watchUntouched(run, 'alpha')
+        const applyCp = run.checkpoint()
+        h.confirm()
+        await run.ticks.tick()
+
+        expect(effective()).toEqual([['alpha', true], ['bravo', value]])
+        expect(run.since(cp).lifecycle).toEqual([{ op: 'update-in-place', key: bravoKey, via: 'apply', settings: ['reaction_notices'] }])
+        expect(run.lifecycle.timeline.slice(timeline)).toEqual([
+          { op: 'update-in-place', key: bravoKey, phase: 'start' },
+          { op: 'update-in-place', key: bravoKey, phase: 'settled' },
+        ])
+        // Not a destination setting: no destinations.forget, nor any other composition call.
+        expect(run.composition!.calls.slice(calls)).toEqual([])
+        expect(run.since(applyCp).slackBuilds).toBe(0)
+        expect(run.since(applyCp).slackCalls).toEqual([])
+        expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(applied + 1)
+        expect(slackSideOf(run, 'bravo')).toEqual(bravoSide)
+        alphaUntouched()
+        expect(run.session('bravo')).toBe(session)
+
+        // Confirmed: bravo's next new reactions, added and removed, follow the new value; alpha's are still accepted.
+        await react('bravo', value)
+        await react('bravo', value, 'reaction_removed')
+        await react('alpha', true)
+      }
+
+      expect(stubCallCount(run.composition!.agentDirector)).toBe(0)
+      expect(run.session('bravo')).toBe(session)
+      expect(session.connected).toBe(true)
+      expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
+      await expectNothingPendingAfter(run)
+      expect(run.slackPosts()).toEqual([])
+      expectModeNoLeak()
+    },
+  )
 })
 
 /** bravo's destination in `mode`: its own listed channel (`permission_prompts`) or its fungible destination. */
@@ -6903,4 +7029,416 @@ test.each(['credentials_file', 'working_directory'] as const)('a destructive %s 
   expect(run.queued('alpha')).toHaveLength(1); expect(run.queued('alpha')[0]!.fixed!.parts).toEqual(['immutable fixed input']); expect(run.queue.openCount(key)).toBe(1)
   expect(readQueue(h.stateDir, key).filter(r => r.kind === 'accepted' && !('compact' in r))).toHaveLength(1)
   expect(run.queued('bravo')).toEqual([]); assertNoLeak(run.captured())
+})
+
+// ---------------------------------------------------------------------------
+// bravo's preparation in flight across a confirmed change of bravo
+// ---------------------------------------------------------------------------
+
+/** The real launch with the run's delivery engines, and an MCP session for every persona. */
+const REAL_DELIVERY: RunningOptions = { ...REAL_LAUNCH, delivery: true, sessions: true }
+
+/** The most virtual time one wait for receipt-backed delivery may drive `run.clock` (`run.delivery.until`). */
+const DRIVE_LIMIT_MS = 60_000
+/**
+ * The lookup bound of a case that holds a lookup while it drives delivery
+ * for other work: past every drive of the case together, so the held lookup
+ * answers only when the case answers it, never by the production bound.
+ */
+const HELD_LOOKUP_BOUND_MS = 10 * DRIVE_LIMIT_MS
+
+/** Where bravo's head item comes from: post-ack Slack intake (a message or a reaction) or injected intake (`/interject`). */
+type HeadSource = 'slack' | 'reaction' | 'interject'
+
+/** bravo's Slack sender, its head message's ts, and the ts of the message of bravo's own that a reaction reacts to. */
+const HEAD_SENDER = 'U0RLDSENDER1'
+/** The sender of an item bravo's new connection stores while the apply runs. */
+const FRESH_SENDER = 'U0RLDSENDER2'
+const HEAD_TS = '1700000500.000100'
+const REACTED_TS = '1700000500.000050'
+const HEAD_TEXT = 'the head item'
+const NEXT_TEXT = 'the item after the head'
+
+/** Slack's answer to a conversation lookup in bravo's channel, named so one life's facts tell from the other's. */
+function conversationNamed(name: string): SettledWebApiOutcome {
+  return { kind: 'ok', result: { channel: { id: ownChannel('bravo'), name, is_channel: true } } }
+}
+
+/** Script bravo's next conversation lookup to answer `lookup`; for a reaction, its reacted-message lookup first finds the message. */
+function scriptLookup(run: ReloadRun, source: 'slack' | 'reaction', lookup: WebApiOutcome): void {
+  const stub = run.stub('bravo')
+  if (source === 'reaction') {
+    stub.script.replies.push({ kind: 'ok', result: { messages: [{ ts: REACTED_TS, user: stub.identity.botUserId, text: 'the reacted message' }] } })
+  }
+  stub.script.info.push(lookup)
+}
+
+/** `user`'s message in bravo's own channel, or `user`'s reaction there to bravo's message, as `ts`. */
+function slackEventOf(run: ReloadRun, source: 'slack' | 'reaction', user: string, ts: string): SlackEvent {
+  const channel = ownChannel('bravo')
+  return source === 'slack'
+    ? makeChannelMessage({ channel, user, text: HEAD_TEXT, ts })
+    : makeReaction('reaction_added', { user, reaction: 'white_check_mark', item_user: run.stub('bravo').identity.botUserId, event_ts: ts }, { channel, ts: REACTED_TS })
+}
+
+/**
+ * bravo's head item from Slack, stored and acked by its current life, whose
+ * preparation then waits on `lookup` (its conversation lookup). Resolves once
+ * that lookup was asked; `delivered` settles once it is answered.
+ */
+async function heldSlackHead(run: ReloadRun, source: 'slack' | 'reaction', lookup: DeferredWebApiCall): Promise<{ delivered: Promise<void> }> {
+  scriptLookup(run, source, lookup.outcome)
+  const asked = run.stub('bravo').calls.conversationsInfo.length
+  const delivered = run.deliver('bravo', slackEventOf(run, source, HEAD_SENDER, HEAD_TS))
+  await until(() => run.stub('bravo').calls.conversationsInfo.length === asked + 1)
+  return { delivered }
+}
+
+/** The kinds of the persona's durable records of item `seq`, in journal order. */
+function journalOf(name: string, seq: number): string[] {
+  return readQueue(h.stateDir, h.key(name)).filter((r) => r.seq === seq).map((r) => r.kind)
+}
+
+/** The parts of every fixed record the journal holds for the persona's item `seq` (a second one would show). */
+function fixedParts(name: string, seq: number): string[][] {
+  return readQueue(h.stateDir, h.key(name)).flatMap((r) => (r.kind === 'fixed' && r.seq === seq ? [r.parts] : []))
+}
+
+/** The seqs the persona's engine reported delivered, in order. */
+function itemsDelivered(run: ReloadRun, name: string): number[] {
+  return run.delivery!.events.flatMap((e) => (e.type === 'item-delivered' && e.key === h.key(name) ? [e.seq] : []))
+}
+
+/** `confirmConfig`, with the pending file leak-checked while it exists (`previewConfig`) before the confirmation. */
+async function confirmPreviewed(run: ReloadRun, personas: PersonaInput[]): Promise<{ applying: Promise<void> }> {
+  await previewConfig(run, personas)
+  h.confirm()
+  return { applying: run.ticks.tick() }
+}
+
+describe("a confirmed change of bravo while its preparation is in flight: the ended life adds nothing, and once the apply's steps settle the next life reclaims bravo's claimed work (real launch, delivery)", () => {
+  beforeEach(useConfigDirs)
+
+  // CR-1: each row fails at ffd0b92b, whose post-apply recovery ran at step 1, before the teardown ended the life that held the head.
+  test.each<{ source: HeadSource; label: string }>([
+    { source: 'slack', label: 'an ordinary Slack message whose name lookup is held' },
+    { source: 'reaction', label: 'a Reaction Item whose conversation lookup is held' },
+    { source: 'interject', label: 'an /interject accepted while the teardown is held, its zero-delay preparation not yet run' },
+  ])("$label across a destructive modify: the ended life appends, logs, wakes and retries nothing; the next life fixes it from its own facts with no manual recovery, and with bravo up it and the item after it are delivered once each, in order, on transcript receipts, while alpha is untouched and delivers meanwhile", async ({ source }) => {
+    const settledAt: Array<{ timeline: LifecycleTimelineEntry[]; applied: number }> = []
+    const { run, personas } = await running(['alpha', 'bravo'], {
+      ...REAL_DELIVERY,
+      lookupTimeoutMs: HELD_LOOKUP_BOUND_MS,
+      onApplySettled: () => void settledAt.push({ timeline: [...run.lifecycle.timeline], applied: run.logsOf(RELOAD_APPLIED).length }),
+    })
+    const [alpha, bravo] = personas
+    const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
+    const delivery = run.delivery!
+    // The old life's lookup and the next life's, each held until the case answers it.
+    const lookups = source === 'interject' ? [] : [makeDeferredWebApiCall(), makeDeferredWebApiCall()]
+    const [oldLookup, newLookup] = lookups
+    // bravo's teardown and bring-up, held in turn; released, with the apply joined, even when an assertion fails.
+    const teardown = run.lifecycle.hold('teardown', bravoKey)
+    const bringUp = run.lifecycle.hold('bring-up', bravoKey)
+    let applying: Promise<void> = Promise.resolve()
+    let head: { delivered: Promise<void> } = { delivered: Promise.resolve() }
+    try {
+      if (source !== 'interject') {
+        head = await heldSlackHead(run, source, oldLookup!)
+        expect(delivery.owns('bravo', 1)).toBe(true)
+      }
+      const moved = movedDirectory(bravo!)
+      const label = h.credentialsLabel('bravo')
+      const alphaUntouched = watchUntouched(run, 'alpha')
+      const bravoInstanceCalls = run.composition!.instanceCallsOf('bravo').length
+      const activityFrom = run.socketActivity('bravo').length
+      const cp = run.checkpoint()
+
+      applying = (await confirmPreviewed(run, [alpha!, moved])).applying
+      await teardown.entered
+      // Step 1 published the change before any lifecycle step, and nothing is told the apply settled yet.
+      expect(run.serverConfig()!.personas.find((p) => p.key === bravoKey)!.working_directory).toBe(moved.working_directory)
+      expect(run.settledConfigs).toEqual([])
+      if (source === 'interject') {
+        expect(await run.accept('bravo', injectedInput({ sender: 'ops', text: HEAD_TEXT }))).toMatchObject({ status: 'accepted', seq: 1 })
+        expect(run.clock.pending().map((t) => t.delayMs)).toContain(0)
+      }
+      teardown.release()
+      await bringUp.entered
+
+      // The teardown ended the life that held the head: answering its lookup (or passing the accept's
+      // boundary, with no life for bravo) appends, logs, wakes and retries nothing.
+      const ended = { logs: run.logs.length, wakes: delivery.wakes.length }
+      if (oldLookup !== undefined) {
+        oldLookup.settle(conversationNamed('old-life-name'))
+        await head.delivered
+      } else {
+        await run.clock.advance(1)
+      }
+      expect(journalOf('bravo', 1)).toEqual(['accepted'])
+      expect(delivery.owns('bravo', 1)).toBe(false)
+      expect(run.logs.slice(ended.logs)).toEqual([])
+      expect(delivery.wakes.slice(ended.wakes)).toEqual([])
+      expect(run.clock.pending().filter((t) => (RETYPE_BACKOFF_MS as readonly number[]).includes(t.delayMs))).toEqual([])
+
+      // The item after the head is accepted before bravo is back, and its own boundary has not passed.
+      expect(await run.accept('bravo', injectedInput({ sender: 'ops', text: NEXT_TEXT }))).toMatchObject({ status: 'accepted', seq: 2 })
+      if (newLookup !== undefined) scriptLookup(run, source as 'slack' | 'reaction', newLookup.outcome)
+      bringUp.release()
+      await applying
+      expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+
+      // With no manual recovery, bravo's next life has claimed the head: its own lookup is asked
+      // and held (the apply finished regardless), or, with no lookup to make, the head is fixed.
+      if (newLookup !== undefined) {
+        expect(run.stub('bravo').calls.conversationsInfo).toHaveLength(2)
+        expect(delivery.owns('bravo', 1)).toBe(true)
+        expect(journalOf('bravo', 1)).toEqual(['accepted'])
+      } else {
+        await until(() => fixedParts('bravo', 1).length === 1)
+      }
+      // The next tick does nothing meanwhile.
+      const tick = run.checkpoint()
+      await run.ticks.tick()
+      expect(run.since(tick)).toEqual(NO_RUN_ACTIVITY)
+      // The reclaim took only claimed work: not the item whose boundary has not passed.
+      expect(delivery.owns('bravo', 2)).toBe(false)
+      expect(journalOf('bravo', 2)).toEqual(['accepted'])
+
+      // bravo's new life connects its MCP session. alpha's own work is delivered meanwhile; its
+      // clock passes the next item's boundary, so that item is fixed, but nothing passes the head.
+      run.registerSession('bravo')
+      expect(await run.accept('alpha', injectedInput({ sender: 'ops', text: 'alpha work' }))).toMatchObject({ status: 'accepted', seq: 1 })
+      await delivery.until(() => itemsDelivered(run, 'alpha').length === 1, DRIVE_LIMIT_MS)
+      expect(fixedParts('alpha', 1)).toEqual([delivery.texts('alpha')])
+      expect(fixedParts('bravo', 2)).toHaveLength(1)
+      if (newLookup !== undefined) {
+        // Still held: alpha's drive left bravo's lookup unanswered and its head unfixed.
+        expect(newLookup.settled).toBe(false)
+        expect(delivery.owns('bravo', 1)).toBe(true)
+        expect(journalOf('bravo', 1)).toEqual(['accepted'])
+        expect(delivery.texts('bravo')).toEqual([])
+        newLookup.settle(conversationNamed('new-life-name'))
+      }
+      await delivery.until(() => run.queue.openCount(bravoKey) === 0, DRIVE_LIMIT_MS)
+
+      // One fixed record each: the head's from the next life's own facts, never the ended life's.
+      const [headParts, nextParts] = [fixedParts('bravo', 1), fixedParts('bravo', 2)]
+      expect([headParts.length, nextParts.length]).toEqual([1, 1])
+      if (source === 'interject') expect(headParts[0]!.join('')).toContain(HEAD_TEXT)
+      else {
+        expect(headParts[0]!.join('')).toContain('channel_name="new-life-name"')
+        expect(headParts[0]!.join('')).not.toContain('old-life-name')
+      }
+      expect(nextParts[0]!.join('')).toContain(NEXT_TEXT)
+      // Each part typed once, the head's first, and each confirmed by its own receipt in the new life's transcript.
+      expect(delivery.texts('bravo')).toEqual([...headParts[0]!, ...nextParts[0]!])
+      expect(readQueue(h.stateDir, bravoKey).flatMap((r) => (r.kind === 'delivered' ? [r.seq] : []))).toEqual([
+        ...headParts[0]!.map(() => 1),
+        ...nextParts[0]!.map(() => 2),
+      ])
+      expect(itemsDelivered(run, 'bravo')).toEqual([1, 2])
+      expect(delivery.errors).toEqual([])
+
+      // The destructive modify itself: one teardown and one bring-up, the row killed and kept, then a reuse spawn,
+      // the old connection closed before the new one opened, and nothing for alpha.
+      expect(run.since(cp).lifecycle).toEqual([
+        { op: 'teardown', key: bravoKey, via: 'apply' },
+        { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+        { op: 'launch', key: bravoKey, via: 'apply', action: SPAWN_ACTION_FRESH_RETIRED },
+      ])
+      expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok', 'reuse-spawn ok'])
+      expect(run.socketActivity('bravo').slice(activityFrom)).toEqual([
+        `discarded ${label}`,
+        `disconnected ${label}`,
+        `built ${label}`,
+        `started ${label}`,
+        `connected ${label}`,
+      ])
+      alphaUntouched()
+      expect(run.composition!.calls.filter(([, key]) => key === alphaKey)).toEqual([])
+
+      // What claimed the head: the apply's settlement, told once with every applied key, after every
+      // step had settled and before reload-applied, its reclaim detached from the apply.
+      expect(settledAt).toEqual([
+        {
+          timeline: [
+            { op: 'teardown', key: bravoKey, phase: 'start' },
+            { op: 'teardown', key: bravoKey, phase: 'settled' },
+            { op: 'bring-up', key: bravoKey, phase: 'start' },
+            { op: 'bring-up', key: bravoKey, phase: 'settled' },
+          ],
+          applied: 0,
+        },
+      ])
+      expect(run.settledConfigs.map((c) => c.personas.map((p) => p.key))).toEqual([[alphaKey, bravoKey]])
+      expect(run.clock.pendingCount()).toBe(0)
+      expectNoPostNoLeak(run)
+    } finally {
+      teardown.release()
+      bringUp.release()
+      for (const lookup of lookups) if (!lookup.settled) lookup.settle()
+      await applying
+      await head.delivered
+    }
+  })
+
+  // CR1-R1: the reclaim takes only claimed work, never an item whose Slack ack is still pending.
+  test.each<{ source: 'slack' | 'reaction'; label: string; lookups: string[] }>([
+    { source: 'slack', label: 'an ordinary Slack message', lookups: ['users.info'] },
+    { source: 'reaction', label: 'a Reaction Item', lookups: ['conversations.info', 'conversations.replies', 'users.info'] },
+  ])("$label stored on bravo's new connection while the apply's launch is held, its ack still held when the reclaim runs: before the ack nothing looks it up, fixes it, wakes for it or owns it; once acked it is looked up, fixed and woken for once, and the head the ended life held is fixed by the next life in the same apply", async ({ source, lookups }) => {
+    const { run, personas } = await running(['alpha', 'bravo'], REAL_DELIVERY)
+    const [alpha, bravo] = personas
+    const bravoKey = h.key('bravo')
+    const bravoId = personaInstanceId(bravoKey)
+    const delivery = run.delivery!
+    const oldLookup = makeDeferredWebApiCall()
+    const spawns = run.composition!.holdSpawns((id) => id === bravoId)
+    let ack: ReturnType<ReloadRun['holdAck']> | undefined
+    let applying: Promise<void> = Promise.resolve()
+    let head: { delivered: Promise<void> } = { delivered: Promise.resolve() }
+    let fresh: Promise<void> = Promise.resolve()
+    try {
+      head = await heldSlackHead(run, source, oldLookup)
+      applying = (await confirmPreviewed(run, [alpha!, movedDirectory(bravo!)])).applying
+      // Step 6 has connected bravo's new half and holds its launch: the teardown has settled.
+      await spawns.entered(bravoId)
+      oldLookup.settle(conversationNamed('old-life-name'))
+      await head.delivered
+      expect(journalOf('bravo', 1)).toEqual(['accepted'])
+
+      // A new item on the new connection: stored, its ack held. Every lookup from here answers with the next life's facts.
+      scriptLookup(run, source, conversationNamed('new-life-name'))
+      scriptLookup(run, source, conversationNamed('new-life-name'))
+      ack = run.holdAck('bravo')
+      const acks = run.stub('bravo').socket.acks.length
+      fresh = run.deliver('bravo', slackEventOf(run, source, FRESH_SENDER, '1700000500.000200'))
+      await ack.entered
+      expect(journalOf('bravo', 2)).toEqual(['accepted'])
+      /** The new item's sender-name lookups, the one lookup only it makes, from before the reclaim on. */
+      const freshNameLookups = () => run.stub('bravo').calls.usersInfo.filter((args) => args.user === FRESH_SENDER).length
+      spawns.release(bravoId)
+      await applying
+      expect(run.settledConfigs).toHaveLength(1)
+
+      // The reclaim fixed the claimed head from the next life's lookups, and took nothing else.
+      await until(() => fixedParts('bravo', 1).length === 1 && !delivery.owns('bravo', 1))
+      expect(fixedParts('bravo', 1)[0]!.join('')).toContain('channel_name="new-life-name"')
+      const reclaimed = { calls: run.stub('bravo').callLog.length, wakes: delivery.wakes.length }
+      await turns()
+      expect(freshNameLookups()).toBe(0)
+      expect(run.stub('bravo').callLog.slice(reclaimed.calls)).toEqual([])
+      expect(journalOf('bravo', 2)).toEqual(['accepted'])
+      expect(delivery.owns('bravo', 2)).toBe(false)
+      expect(delivery.wakes.slice(reclaimed.wakes)).toEqual([])
+      expect(run.stub('bravo').socket.acks).toHaveLength(acks)
+
+      // The ack goes out, then its intake prepares it: its own lookups, one fixed record, one wake.
+      ack.release()
+      await fresh
+      expect(run.stub('bravo').socket.acks).toHaveLength(acks + 1)
+      expect(freshNameLookups()).toBe(1)
+      expect(run.stub('bravo').callLog.slice(reclaimed.calls).map((c): string => c.method).sort()).toEqual(lookups)
+      expect(journalOf('bravo', 2)).toEqual(['accepted', 'fixed'])
+      expect(fixedParts('bravo', 2)[0]!.join('')).toContain('channel_name="new-life-name"')
+      expect(delivery.wakes.slice(reclaimed.wakes)).toEqual([bravoKey])
+      expect(delivery.owns('bravo', 2)).toBe(false)
+      expectNoPostNoLeak(run)
+    } finally {
+      ack?.release()
+      if (!oldLookup.settled) oldLookup.settle()
+      spawns.releaseAll()
+      await applying
+      await head.delivered
+      await fresh
+    }
+  })
+
+  test("an ordinary Slack message whose name lookup is held when bravo is removed stays retained: the removal's reclaim leaves its key alone and the ended life adds nothing, and once bravo is added again under the same key its next life fixes the message from its own facts (real composition)", async () => {
+    const { run, personas } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
+    const [alpha, bravo] = personas
+    const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
+    const oldLookup = makeDeferredWebApiCall()
+    let head: { delivered: Promise<void> } = { delivered: Promise.resolve() }
+    try {
+      head = await heldSlackHead(run, 'slack', oldLookup)
+      await (await confirmPreviewed(run, [alpha!])).applying
+      expect(run.settledConfigs.map((c) => c.personas.map((p) => p.key))).toEqual([[alphaKey]])
+      expect(run.queueEvents).toContainEqual({ type: 'retained', key: bravoKey, count: 1 })
+      oldLookup.settle(conversationNamed('old-life-name'))
+      await head.delivered
+      await turns()
+      expect(journalOf('bravo', 1)).toEqual(['accepted'])
+
+      scriptLookup(run, 'slack', conversationNamed('new-life-name'))
+      await (await confirmPreviewed(run, [alpha!, bravo!])).applying
+      expect(run.settledConfigs.map((c) => c.personas.map((p) => p.key))).toEqual([[alphaKey], [alphaKey, bravoKey]])
+      await until(() => fixedParts('bravo', 1).length === 1)
+      expect(fixedParts('bravo', 1)[0]!.join('')).toContain('channel_name="new-life-name"')
+      expect(fixedParts('bravo', 1)[0]!.join('')).not.toContain('old-life-name')
+      expectNoPostNoLeak(run)
+    } finally {
+      if (!oldLookup.settled) oldLookup.settle()
+      await head.delivered
+    }
+  })
+
+  // The controller does not await the server's post-apply work and isolates its failure.
+  test.each<{ label: string; fails: boolean; work: (error: Error) => unknown }>([
+    { label: 'throws', fails: true, work: (error) => { throw error } },
+    { label: 'returns a promise that rejects', fails: true, work: (error) => Promise.reject(error) },
+    { label: 'returns a promise that never settles', fails: false, work: () => new Promise(() => undefined) },
+  ])("when the server's post-apply work $label, each apply still completes with exactly its own lifecycle effects, stays applied, leaves alpha untouched, and the next ticks find nothing: a failure is one line per apply, describing the error with its message redacted", async ({ fails, work }) => {
+    // The sentinel sits in the message only inside a fake token and a URL (`sentinelInMessage`), and bare in another property.
+    const error = Object.assign(new Error(`post-apply work failed for ${sentinelInMessage('SETTLED')}`), { detail: LEAK_SENTINEL })
+    const { run, personas } = await running(['alpha', 'bravo'], { onApplySettled: () => work(error) })
+    const [alpha, bravo] = personas
+    const bravoKey = h.key('bravo')
+    const failure = reloadPostApplyFailedLine(describeThrownValue(error))
+    expect(failure).toContain(`message="post-apply work failed for ${REDACTED_SENTINEL_TAIL}"`)
+
+    // bravo removed, then added again; each apply's lifecycle records are its own and nothing else's. bravo's own
+    // config directory (`useConfigDirs`) leaves and comes back with it, so each apply also refreshes the template (step 5).
+    const applies: Array<{ next: PersonaInput[]; keys: string[]; lifecycle: ReloadLifecycleRecord[] }> = [
+      { next: [alpha!], keys: keysOf('alpha'), lifecycle: [{ op: 'teardown', key: bravoKey, via: 'apply' }, refreshRecord()] },
+      {
+        next: [alpha!, bravo!],
+        keys: keysOf('alpha', 'bravo'),
+        lifecycle: [
+          refreshRecord(),
+          { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+          { op: 'launch', key: bravoKey, via: 'apply' },
+        ],
+      },
+    ]
+    for (const { next, keys, lifecycle } of applies) {
+      const alphaUntouched = watchUntouched(run, 'alpha')
+      const cp = run.checkpoint()
+      await (await confirmPreviewed(run, next)).applying
+      await turns()
+      expect(run.since(cp).lifecycle).toEqual(lifecycle)
+      alphaUntouched()
+      expect(run.appliedKeys()).toEqual(keys)
+      expect(run.settledConfigs.at(-1)!.personas.map((p) => p.key)).toEqual(keys)
+      await expectNothingPendingAfter(run)
+    }
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(2)
+    expect(run.logsOf('reload')).toEqual(fails ? [failure, failure] : [])
+    expectNoPostNoLeak(run)
+  })
+
+  test('a confirmed candidate the tick refuses as INVALID is not applied, so no settlement is told', async () => {
+    const { run, personas } = await running(['alpha', 'bravo'])
+    h.writeConfig(configOf(personas[0]!, personas[0]!))
+    await run.ticks.tick()
+    expect(run.invalidLines()).toHaveLength(1)
+    assertNoLeak(run.captured())
+    h.confirm()
+    await run.ticks.tick()
+    expect(run.appliedConfigs).toEqual([])
+    expect(run.settledConfigs).toEqual([])
+    expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
+    expectNoPostNoLeak(run)
+  })
 })

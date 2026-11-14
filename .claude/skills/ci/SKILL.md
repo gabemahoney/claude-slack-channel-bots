@@ -501,7 +501,7 @@ the host and fits the run. Every figure below is a runner constant.
 | CPUs | 2 per shard; all live `/ci` runs together hold at most 12 CI CPUs |
 | Memory per shard | Ordinary cap: 2 GiB. Each dedicated Codex shard adds 2 GiB (currently 4 GiB), for both memory and memory-swap |
 | Admission margin | 1 GiB |
-| Ceiling C | 85% of the pod memory limit (54.4 GiB on the 64 GiB pod); while a `/ci-live` run is active, the lower of that and 40 GiB, `/ci-live`'s working-set stop line |
+| Ceiling C | 85% of the pod memory limit (54.4 GiB on the 64 GiB pod); while a `/ci-live` run is active, the lower of that and 40 GiB, `/ci-live`'s non-reclaimable memory stop line |
 | Memory fit | pod non-reclaimable memory U + other runs' commitments + N × the ordinary cap + 2 GiB per Codex shard + 1 GiB margin ≤ C |
 | Stop line | C less 0.5 GiB (53.9 GiB, or 39.5 GiB while `/ci-live` runs). The memory watchdog checks U every 30 s and stops the run there |
 | Disk line | 85%: (used + 1 GiB) ÷ (used + available) must stay under it on the volume holding the run directory |

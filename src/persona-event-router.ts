@@ -25,8 +25,11 @@
  *   action is still handled. The payload is acked exactly once, after
  *   handling, even when an action throws. The click handler refuses a click
  *   whose action names another persona's instance (`cscb_<other key>`).
- * - Any other event name (defensive: the manager forwards only the three
- *   above) is acked and ignored.
+ * - `reaction_added` and `reaction_removed`: no RAW line; the event, its
+ *   `ack`, the receiving persona's key and the envelope flag (read as for
+ *   messages) go to the reaction intake (`persona-routing.ts`
+ *   `receiveReaction`), which acks and writes the only lines.
+ * - Any other event name is acked and ignored.
  *
  * Every event is handled only for the persona whose connection received it:
  * no other persona's key, connection or client is consulted here. A throw
@@ -68,8 +71,8 @@ const ENVELOPE_FLAG_FIELD = 'is_ext_shared_channel'
 
 /** Dependencies injected into `createPersonaEventRouter`. */
 export interface PersonaEventRouterDeps {
-  /** The persona-routing intake `message` and `app_mention` events go to. */
-  routing: Pick<PersonaRouting, 'receive'>
+  /** The persona-routing intakes: `receive` for `message` and `app_mention`, `receiveReaction` for reactions. */
+  routing: Pick<PersonaRouting, 'receive' | 'receiveReaction'>
   /** The persona's Slack client for the click handler (`clientFor`). */
   clientFor: ClickDeps['clientFor']
   /** The applied persona with this key, for the click handler. */
@@ -163,6 +166,10 @@ export function createPersonaEventRouter(deps: PersonaEventRouterDeps): PersonaE
         case 'message':
         case 'app_mention':
           await routeInbound(key, eventName, payload)
+          return
+        case 'reaction_added':
+        case 'reaction_removed':
+          await deps.routing.receiveReaction(payload.event, payload.ack, key, envelopeFlagOf(payload))
           return
         case 'interactive':
           await routeInteractive(key, payload)

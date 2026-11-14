@@ -2,13 +2,13 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createDeliveryQueue, isQueueRecord, parseQueueRecord, QUEUE_DIRECTORY_MODE, QUEUE_FILE_MODE, QUEUE_KEY_KEEP_MS, QUEUE_COMPACT_INTERVAL_MS, type AcceptedRecord, type QueueRecord, type QueueEvent, type DeliveryQueue } from '../src/delivery-queue.ts'
+import { createDeliveryQueue, isQueueItemClosed, isQueueRecord, isReactionKey, parseQueueRecord, QueueNotWithdrawable, QueueOutcomeFinal, QUEUE_DIRECTORY_MODE, QUEUE_FILE_MODE, QUEUE_KEY_KEEP_MS, QUEUE_COMPACT_INTERVAL_MS, reactionKeyString, type AcceptedRecord, type QueueRecord, type QueueEvent, type DeliveryQueue, type ReactionAcceptedInput, type ReactionKey, type WithdrawnRecord } from '../src/delivery-queue.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { MAX_RELOAD_FILE_BYTES } from '../src/config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import { _resetAckTracker, createQueuedAckCallback } from '../src/ack-tracker.ts'
-import { deliveredRecord, injectedInput, makeQueue, queuePath, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
+import { reactionInput, deliveredRecord, injectedInput, makeQueue, queuePath, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
 import { makeStubSlack } from './test-helpers/slack-stub.ts'
 
 let dir: string
@@ -1037,4 +1037,450 @@ test('startup findings remain available to a notifier installed after queue star
   expect(q.startupFindings()).toMatchObject([{ alert: true }])
   expect(fs.readFileSync(path, 'utf8')).toBe(damaged)
   expect(q.items('alpha').map(item => item.accepted.seq)).toEqual([1, 3])
+})
+
+const reactionRecord = (overrides: Partial<ReactionAcceptedInput> = {}): AcceptedRecord => ({ ...reactionInput(overrides), v: 1, kind: 'accepted', seq: 1, received_at: 1000 })
+const withdrawn = (overrides: Partial<WithdrawnRecord> = {}): WithdrawnRecord => ({ v: 1, kind: 'withdrawn', seq: 1, reason: 'server-post', at: 2000, ...overrides })
+/** Compaction writes retained key facts before items; order by sequence instead. */
+const nonAllocation = () => readQueue(dir).filter(r => !('compact' in r && r.compact === 'allocation')).sort((a, b) => a.seq - b.seq)
+type StoreFailed = Extract<QueueEvent, { type: 'store-failed' }>
+
+describe('Reaction Item journal', () => {
+  const key = reactionInput().reaction_key
+  test.each([
+    ['a declarative slack-event from a user', {}, 'U0REACTOR'],
+    ['a fungible slack-event from a bot', { mode: 'fungible', user: undefined, bot_id: 'B0BOT001' }, 'B0BOT001'],
+    ['a removed reaction naming both user and bot', { change: 'removed', bot_id: 'B0BOT001' }, 'U0REACTOR'],
+    ['a declarative bot-tool with an arbitrary stored persona name', { origin: 'bot-tool', reactor_persona_name: 'Persona name ✨ / #ops "quoted"', user: undefined, bot_id: 'B0BOT001' }, 'B0BOT001'],
+    ['a fungible bot-tool from a user', { origin: 'bot-tool', mode: 'fungible', reactor_persona_name: 'x' }, 'U0REACTOR'],
+  ] as [string, Partial<ReactionAcceptedInput>, string][])('%s roundtrips with its ordered six-part key', (_, overrides, reactor) => {
+    const record = reactionRecord(overrides), k = record.reaction_key!
+    expect(isQueueRecord(record)).toBe(true)
+    expect(parseQueueRecord(JSON.stringify(record))).toEqual(record)
+    expect(isReactionKey(k)).toBe(true)
+    expect(k.reactor).toBe(reactor)
+    expect(reactionKeyString(k)).toBe(JSON.stringify([record.channel, record.message_ts, reactor, record.emoji, record.change, record.ts]))
+    expect(reactionKeyString(Object.fromEntries(Object.entries(k).reverse()) as unknown as ReactionKey)).toBe(reactionKeyString(k))
+  })
+
+  test.each([
+    ['absent mode', { mode: undefined }, true],
+    ['an unknown mode', { mode: 'loud' }, true],
+    ['a bot-tool origin without its persona name', { origin: 'bot-tool' }, true],
+    ['a bot-tool origin with an empty persona name', { origin: 'bot-tool', reactor_persona_name: '' }, true],
+    ['a slack-event origin with a persona name', { reactor_persona_name: 'alpha' }, true],
+    ['absent origin', { origin: undefined }, true],
+    ['an unknown origin', { origin: 'webhook' }, true],
+    ['an unknown change', { change: 'changed', reaction_key: { ...key, change: 'changed' } }, false],
+    ['message text', { text: 'reaction body' }, true],
+    ['no reactor', { user: undefined }, true],
+    ['a non-string reactor', { user: 7, reaction_key: { ...key, reactor: 7 } }, false],
+    ['an empty event ts', { ts: '', reaction_key: { ...key, event_ts: '' } }, false],
+    ['an empty emoji', { emoji: '', reaction_key: { ...key, emoji: '' } }, false],
+    ['absent intake time', { received_at: undefined }, true],
+    ['absent reaction key', { reaction_key: undefined }, false],
+    ['a key with an extra field', { reaction_key: { ...key, thread_ts: '1700000000.000003' } }, false],
+    ...(['chat_id', 'message_ts', 'reactor', 'emoji', 'event_ts'] as const).map(field => [`a key ${field} that disagrees with its field`, { reaction_key: { ...key, [field]: 'other' } }, true] as const),
+    ['a key change that disagrees with its field', { reaction_key: { ...key, change: 'removed' } }, true],
+    ['a file payload', { files: [{ name: 'a.txt' }] }, true],
+    ['a Slack key', { key: { chat_id: 'C0TEST001', ts: '1700000000.000001' } }, true],
+    ['queued ack metadata', { queued_ack_reaction: 'eyes' }, true],
+    ['a reminder link', { reminder_for: 1 }, true],
+    // A permitted value inside an array, which a String() membership test would admit.
+    ['an array mode', { mode: ['declarative'] }, true],
+    ['an array origin', { origin: ['slack-event'] }, true],
+    ['an array bot-tool origin without its persona name', { origin: ['bot-tool'] }, true],
+    ['an array change in the record and its key', { change: ['added'], reaction_key: { ...key, change: ['added'] } }, false],
+  ] as [string, Record<string, unknown>, boolean][])('rejects a reaction with %s (key valid: %p)', (_, fields, keyValid) => {
+    const record = { ...reactionRecord(), ...fields }
+    expect(isReactionKey(record.reaction_key)).toBe(keyValid)
+    expect(isQueueRecord(record)).toBe(false)
+    expect(parseQueueRecord(JSON.stringify(record))).toBeUndefined()
+  })
+
+  test.each(['message_ts', 'change', 'emoji', 'origin', 'mode', 'reaction_key', 'reactor_persona_name'] as const)('a Slack record carrying reaction field %s is rejected', field => {
+    const record = { ...accepted(), [field]: reactionRecord({ origin: 'bot-tool', reactor_persona_name: 'x' })[field] }
+    expect(isQueueRecord(record)).toBe(false)
+    expect(parseQueueRecord(JSON.stringify(record))).toBeUndefined()
+  })
+
+  test.each([
+    ...(['server-post', 'conversation-unknown', 'group-dm'] as const).map(reason => [`withdrawn ${reason}`, withdrawn({ reason }), true] as const),
+    ...(['not-a-channel', 'externally-shared', 'not_in_channel', 'channel_not_found'] as const).map(failed_condition => [`withdrawn fungible-refused ${failed_condition}`, withdrawn({ reason: 'fungible-refused', failed_condition }), true] as const),
+    ['withdrawn fungible-refused without its condition', withdrawn({ reason: 'fungible-refused' }), false],
+    ['withdrawn fungible-refused with an unknown condition', { ...withdrawn({ reason: 'fungible-refused' }), failed_condition: 'archived' }, false],
+    ['withdrawn group-dm with a condition', withdrawn({ reason: 'group-dm', failed_condition: 'not-a-channel' }), false],
+    ['withdrawn with an unknown reason', { ...withdrawn(), reason: 'spam' }, false],
+    ['withdrawn without a reason', { ...withdrawn(), reason: undefined }, false],
+    ['withdrawn seq 0', withdrawn({ seq: 0 }), false],
+    ['withdrawn fractional seq', withdrawn({ seq: 1.5 }), false],
+    ['withdrawn without a time', { ...withdrawn(), at: undefined }, false],
+    ['withdrawn string time', { ...withdrawn(), at: '2000' }, false],
+    ['withdrawn with an extra field', { ...withdrawn(), detail: 'reaction body' }, false],
+    ['withdrawn version 2', { ...withdrawn(), v: 2 }, false],
+    // Permitted values inside arrays, which a String() membership test would admit.
+    ['withdrawn with an array reason', { ...withdrawn(), reason: ['server-post'] }, false],
+    ['withdrawn with an array fungible-refused reason and no condition', { ...withdrawn(), reason: ['fungible-refused'] }, false],
+    ['withdrawn fungible-refused with an array condition', { ...withdrawn({ reason: 'fungible-refused' }), failed_condition: ['not-a-channel'] }, false],
+    ['reaction-key compact', { v: 1, kind: 'accepted', seq: 1, compact: 'reaction-key', reaction_key: key, received_at: 1000, closed_at: 2000 }, true],
+    ['reaction-key compact without closed_at', { v: 1, kind: 'accepted', seq: 1, compact: 'reaction-key', reaction_key: key, received_at: 1000 }, false],
+    ['reaction-key compact with string closed_at', { v: 1, kind: 'accepted', seq: 1, compact: 'reaction-key', reaction_key: key, received_at: 1000, closed_at: '2000' }, false],
+    ['reaction-key compact without received_at', { v: 1, kind: 'accepted', seq: 1, compact: 'reaction-key', reaction_key: key, closed_at: 2000 }, false],
+    ['reaction-key compact with an invalid key', { v: 1, kind: 'accepted', seq: 1, compact: 'reaction-key', reaction_key: { ...key, change: 'changed' }, received_at: 1000, closed_at: 2000 }, false],
+    ['reaction-key compact with an array key change', { v: 1, kind: 'accepted', seq: 1, compact: 'reaction-key', reaction_key: { ...key, change: ['added'] }, received_at: 1000, closed_at: 2000 }, false],
+    ['reaction-key compact with content', { v: 1, kind: 'accepted', seq: 1, compact: 'reaction-key', reaction_key: key, received_at: 1000, closed_at: 2000, text: 'reaction body' }, false],
+    ['reaction-key compact with a Slack key', { v: 1, kind: 'accepted', seq: 1, compact: 'reaction-key', reaction_key: key, received_at: 1000, closed_at: 2000, key: { chat_id: 'C0TEST001', ts: '1700000000.000001' } }, false],
+  ] as [string, Record<string, unknown>, boolean][])('%s is valid: %p', (_, record, valid) => {
+    expect(isQueueRecord(record)).toBe(valid)
+    expect(parseQueueRecord(JSON.stringify(record)) as unknown).toEqual(valid ? record : undefined)
+  })
+
+  test('accepted bytes stay content-free and keep the exact event ts, stored mode and persona name through compaction and reopen', async () => {
+    const input = reactionInput({ origin: 'bot-tool', mode: 'fungible', reactor_persona_name: 'Stored Persona ✨', user: undefined, bot_id: 'B0BOT001', ts: '1700000000.000100' })
+    let q = await open({ now: () => 1000 })
+    const stored: AcceptedRecord = { ...input, v: 1, kind: 'accepted', seq: 1, received_at: 1000 }
+    expect(await q.accept('alpha', input)).toEqual({ status: 'accepted', seq: 1, item: { accepted: stored, records: [stored], delivered: false, unknownSend: false, retypeCount: 0, nextAttempt: 1 } })
+    expect(readQueue(dir)).toEqual([stored])
+    expect(Object.keys(JSON.parse(fs.readFileSync(queuePath(dir), 'utf8'))).sort()).toEqual(['bot_id', 'change', 'channel', 'emoji', 'kind', 'message_ts', 'mode', 'origin', 'reaction_key', 'reactor_persona_name', 'received_at', 'seq', 'source', 'text', 'ts', 'v'])
+    for (let cycle = 0; cycle < 2; cycle++) {
+      await q.compact('alpha')
+      await q.stop()
+      q = await open({ now: () => 1000 })
+      expect(q.item('alpha', 1)!.accepted).toEqual({ ...stored, attempt_high_watermark: 0 })
+      expect(nonAllocation()).toEqual([{ ...stored, attempt_high_watermark: 0 }])
+    }
+  })
+
+  test('simultaneous same-key accepts store one item; reopen and key-only compaction keep it a duplicate without using a sequence', async () => {
+    let q = await open({ now: () => 1000 })
+    const results = await Promise.all(Array.from({ length: 12 }, () => q.accept('alpha', reactionInput())))
+    const item = q.item('alpha', 1)!
+    expect(results.filter(r => r.status === 'accepted')).toEqual([{ status: 'accepted', seq: 1, item }])
+    expect(results.filter(r => r.status === 'duplicate')).toEqual(Array.from({ length: 11 }, () => ({ status: 'duplicate', seq: 1, item })))
+    expect(readQueue(dir)).toHaveLength(1)
+    const lookup = q.lookupReactionKey('alpha', key)
+    expect(lookup).toEqual({ status: 'duplicate', seq: 1, item })
+    if (lookup?.status !== 'duplicate') throw new Error('expected a duplicate lookup')
+    lookup.item!.accepted.emoji = 'changed'
+    lookup.item!.accepted.reaction_key!.emoji = 'changed'
+    for (const result of results) if (result.status !== 'failed') result.item!.accepted.mode = 'fungible'
+    expect(q.lookupReactionKey('alpha', key)).toEqual({ status: 'duplicate', seq: 1, item })
+    expect(q.item('alpha', 1)).toEqual(item)
+    await q.stop()
+    q = await open({ now: () => 1000 })
+    expect(await q.accept('alpha', reactionInput())).toEqual({ status: 'duplicate', seq: 1, item: q.item('alpha', 1) })
+    await q.append('alpha', withdrawn())
+    await q.compact('alpha')
+    for (let reopen = 0; reopen < 2; reopen++) {
+      expect(q.lookupReactionKey('alpha', key)).toEqual({ status: 'duplicate', seq: 1 })
+      expect(await q.accept('alpha', reactionInput())).toEqual({ status: 'duplicate', seq: 1 })
+      expect(q.items('alpha')).toEqual([])
+      await q.stop()
+      q = await open({ now: () => 1000 })
+    }
+    expect(await q.accept('alpha', injectedInput())).toMatchObject({ status: 'accepted', seq: 2 })
+  })
+
+  test.each([
+    ['conversation', {}, { channel: 'C0OTHER01' }, 'accepted'],
+    ['reacted message ts', {}, { message_ts: '1700000000.000009' }, 'accepted'],
+    ['reactor', {}, { user: 'U0OTHER01' }, 'accepted'],
+    ['emoji', {}, { emoji: 'eyes' }, 'accepted'],
+    ['change', {}, { change: 'removed' }, 'accepted'],
+    ['event ts', {}, { ts: '1700000000.000009' }, 'accepted'],
+    // Joined with a separator, both keys read "…:U0A:x:y:…".
+    ['component boundary', { user: 'U0A:x', emoji: 'y' }, { user: 'U0A', emoji: 'x:y' }, 'accepted'],
+    ['mode only', {}, { mode: 'fungible' }, 'duplicate'],
+    ['origin and persona name only', {}, { origin: 'bot-tool', reactor_persona_name: 'beta' }, 'duplicate'],
+    ['persona name only', { origin: 'bot-tool', reactor_persona_name: 'first' }, { origin: 'bot-tool', reactor_persona_name: 'second' }, 'duplicate'],
+  ] as [string, Partial<ReactionAcceptedInput>, Partial<ReactionAcceptedInput>, 'accepted' | 'duplicate'][])('a later reaction differing in %s is %s', async (_, base, variant, expected) => {
+    const q = await open()
+    const first = reactionInput(base), later = reactionInput(variant)
+    expect(reactionKeyString(first.reaction_key) === reactionKeyString(later.reaction_key)).toBe(expected === 'duplicate')
+    expect(await q.accept('alpha', first)).toMatchObject({ status: 'accepted', seq: 1 })
+    expect(await q.accept('alpha', later)).toMatchObject(expected === 'accepted' ? { status: 'accepted', seq: 2 } : { status: 'duplicate', seq: 1 })
+    // A duplicate keeps the first acceptance's stored routing facts.
+    expect(q.items('alpha').map(i => i.accepted)).toMatchObject(expected === 'accepted' ? [first, later] : [first])
+    expect(q.lookupReactionKey('alpha', later.reaction_key)).toMatchObject({ status: 'duplicate', seq: expected === 'accepted' ? 2 : 1 })
+    expect(readQueue(dir)).toHaveLength(expected === 'accepted' ? 2 : 1)
+  })
+
+  test('reaction, Slack and injected acceptance share one sequence order per persona while Slack and reaction keys stay separate', async () => {
+    // A reaction to the very Slack message that the Slack key names.
+    const on = { message_ts: slackInput().ts! }, reaction = reactionInput(on)
+    let q = await open()
+    expect(await q.accept('alpha', reaction)).toMatchObject({ status: 'accepted', seq: 1 })
+    expect(q.lookupSlackKey('alpha', slackInput().key!)).toBeUndefined()
+    expect(await q.accept('alpha', slackInput())).toMatchObject({ status: 'accepted', seq: 2 })
+    expect(await q.accept('alpha', injectedInput())).toMatchObject({ status: 'accepted', seq: 3 })
+    expect(await q.accept('alpha', reactionInput({ ...on, emoji: 'eyes' }))).toMatchObject({ status: 'accepted', seq: 4 })
+    expect(await q.accept('alpha', injectedInput({ source: 'cron' }))).toMatchObject({ status: 'accepted', seq: 5 })
+    expect(await q.accept('alpha', slackInput())).toMatchObject({ status: 'duplicate', seq: 2 })
+    expect(await q.accept('alpha', reaction)).toMatchObject({ status: 'duplicate', seq: 1 })
+    expect(await q.accept('beta', injectedInput())).toMatchObject({ status: 'accepted', seq: 1 })
+    expect(await q.accept('beta', reaction)).toMatchObject({ status: 'accepted', seq: 2 })
+    expect(q.lookupReactionKey('gamma', reaction.reaction_key)).toBeUndefined()
+    for (let reopen = 0; reopen < 2; reopen++) {
+      expect(q.items('alpha').map(i => [i.accepted.seq, i.accepted.source])).toEqual([[1, 'reaction'], [2, 'slack'], [3, 'interject'], [4, 'reaction'], [5, 'cron']])
+      expect(q.lookupReactionKey('alpha', reaction.reaction_key)).toMatchObject({ status: 'duplicate', seq: 1 })
+      expect(q.lookupReactionKey('beta', reaction.reaction_key)).toMatchObject({ status: 'duplicate', seq: 2 })
+      expect(q.lookupSlackKey('alpha', slackInput().key!)).toMatchObject({ status: 'duplicate', seq: 2 })
+      expect(q.lookupSlackKey('beta', slackInput().key!)).toBeUndefined()
+      await q.stop()
+      q = await open()
+    }
+    expect(await q.accept('alpha', reactionInput({ ...on, change: 'removed' }))).toMatchObject({ status: 'accepted', seq: 6 })
+  })
+
+  test('an extreme reaction event ts is stored exactly and never moves the injected timestamp watermark, also after replay', async () => {
+    const extreme = '9999999999.999999'
+    let q = await open({ now: () => 1000 })
+    await q.accept('alpha', injectedInput())
+    await q.accept('alpha', reactionInput({ ts: extreme }))
+    await q.accept('alpha', injectedInput({ source: 'cron' }))
+    expect(q.items('alpha').map(i => [i.accepted.source, i.accepted.ts])).toEqual([['interject', '1.000000'], ['reaction', extreme], ['cron', '1.000001']])
+    await q.stop()
+    q = await open({ now: () => 1000 })
+    expect(await q.accept('alpha', injectedInput())).toMatchObject({ status: 'accepted', seq: 4, item: { accepted: { ts: '1.000002' } } })
+    for (const seq of [1, 3, 4]) {
+      await q.append('alpha', { v: 1, kind: 'fixed', seq, parts: ['delivered'] })
+      await q.append('alpha', deliveredRecord(seq))
+    }
+    await q.append('alpha', withdrawn({ seq: 2 }))
+    await q.compact('alpha')
+    expect(readQueue(dir)).toEqual([
+      { v: 1, kind: 'accepted', seq: 2, compact: 'reaction-key', reaction_key: reactionInput({ ts: extreme }).reaction_key, received_at: 1000, closed_at: 2000 },
+      { v: 1, kind: 'accepted', seq: 4, compact: 'allocation', injected_ts: '1.000002' },
+    ])
+    await q.stop()
+    q = await open({ now: () => 1000 })
+    expect(await q.accept('alpha', injectedInput({ source: 'cron' }))).toMatchObject({ status: 'accepted', seq: 5, item: { accepted: { ts: '1.000003' } } })
+    expect(await q.accept('alpha', reactionInput({ ts: '0.000001' }))).toMatchObject({ status: 'accepted', seq: 6, item: { accepted: { ts: '0.000001' } } })
+    expect(await q.accept('alpha', injectedInput())).toMatchObject({ status: 'accepted', seq: 7, item: { accepted: { ts: '1.000004' } } })
+  })
+
+  test.each(['journal file', 'queue directory'] as const)('a failed %s fsync publishes no reaction acceptance and a retry stores exactly one record', async boundary => {
+    const sync = recordSyncs(), events: QueueEvent[] = []
+    let q = await open({ fs: sync.fs, onEvent: e => { events.push(e) } })
+    expect(await q.accept('alpha', injectedInput())).toMatchObject({ status: 'accepted', seq: 1 })
+    const input = reactionInput()
+    sync.fail(boundary === 'journal file' ? queuePath(dir) : join(dir, 'queue'))
+    for (let retry = 0; retry < 2; retry++) {
+      expect((await q.accept('alpha', input)).status).toBe('failed')
+      expect(q.items('alpha').map(i => i.accepted.seq)).toEqual([1])
+      expect(q.item('alpha', 2)).toBeUndefined()
+      expect(q.openCount('alpha')).toBe(1)
+      expect(q.lookupReactionKey('alpha', input.reaction_key)).toBeUndefined()
+      expect(readQueue(dir).map(r => r.seq)).toEqual([1])
+    }
+    const failures = events.filter((e): e is StoreFailed => e.type === 'store-failed')
+    expect(failures).toMatchObject(Array.from({ length: 2 }, () => ({ key: 'alpha', path: queuePath(dir), source: 'reaction', user: input.user, channel: input.channel, ts: input.ts, reactionKey: input.reaction_key })))
+    expect(failures.map(e => e.slackKey)).toEqual([undefined, undefined])
+    assertNoLeak(events)
+    sync.fail()
+    expect(await q.accept('alpha', input)).toMatchObject({ status: 'accepted', seq: 2 })
+    expect(readQueue(dir).map(r => [r.seq, r.kind, 'source' in r ? r.source : undefined])).toEqual([[1, 'accepted', 'interject'], [2, 'accepted', 'reaction']])
+    await q.stop()
+    q = await open()
+    expect(q.items('alpha').map(i => i.accepted.seq)).toEqual([1, 2])
+    expect(await q.accept('alpha', input)).toMatchObject({ status: 'duplicate', seq: 2 })
+  })
+
+  test.each(['journal file', 'queue directory'] as const)('a failed %s fsync leaves a withdrawal unpublished and retryable until it is durable', async boundary => {
+    const sync = recordSyncs(), events: QueueEvent[] = []
+    let q = await open({ fs: sync.fs, now: () => 1000, onEvent: e => { events.push(e) } })
+    await q.accept('alpha', reactionInput())
+    const before = q.item('alpha', 1)!
+    sync.fail(boundary === 'journal file' ? queuePath(dir) : join(dir, 'queue'))
+    for (let retry = 0; retry < 2; retry++) {
+      await expect(q.append('alpha', withdrawn())).rejects.toThrow('EIO injected sync')
+      expect(q.item('alpha', 1)).toEqual(before)
+      expect(isQueueItemClosed(q.item('alpha', 1)!)).toBe(false)
+      expect(q.openCount('alpha')).toBe(1)
+      expect(q.isWritable!('alpha')).toBe(false)
+      expect(readQueue(dir).map(r => r.kind)).toEqual(['accepted'])
+    }
+    expect(events.filter(e => e.type === 'append-failed')).toMatchObject([{ key: 'alpha', seq: 1 }, { key: 'alpha', seq: 1 }])
+    assertNoLeak(events)
+    sync.fail()
+    await q.append('alpha', withdrawn())
+    expect(q.item('alpha', 1)).toMatchObject({ withdrawn: withdrawn(), delivered: false })
+    expect(q.openCount('alpha')).toBe(0)
+    expect(q.isWritable!('alpha')).toBe(true)
+    expect(readQueue(dir)).toEqual([before.accepted, withdrawn()])
+    await q.stop()
+    q = await open({ now: () => 1000 })
+    expect(q.openCount('alpha')).toBe(0)
+    expect(q.lookupReactionKey('alpha', key)).toEqual({ status: 'duplicate', seq: 1 })
+  })
+
+  test.each([
+    ['open', { delivered: false }, false],
+    ['delivered', { delivered: true }, true],
+    ['withdrawn', { delivered: false, withdrawn: withdrawn() }, true],
+  ] as const)('isQueueItemClosed: %s is %p', (_, item, closed) => expect(isQueueItemClosed(item)).toBe(closed))
+
+  test('withdrawal closes a reaction once without delivery fiction; an identical retry is a no-op and no later outcome or attempt replaces it', async () => {
+    const events: QueueEvent[] = []
+    const q = await open({ onEvent: e => { events.push(e) } })
+    await q.accept('alpha', reactionInput())
+    await q.accept('alpha', injectedInput())
+    expect(q.openCount('alpha')).toBe(2)
+    const record = withdrawn({ reason: 'fungible-refused', failed_condition: 'externally-shared' })
+    await q.append('alpha', record)
+    const closed = q.item('alpha', 1)!
+    expect(closed).toMatchObject({ withdrawn: record, delivered: false, unknownSend: false, retypeCount: 0, nextAttempt: 1 })
+    expect(closed.fixed).toBeUndefined()
+    expect(closed.records.map(r => r.kind)).toEqual(['accepted', 'withdrawn'])
+    expect(isQueueItemClosed(closed)).toBe(true)
+    expect(q.openCount('alpha')).toBe(1)
+    const bytes = fs.readFileSync(queuePath(dir))
+    await q.append('alpha', { ...record })
+    const later: QueueRecord[] = [
+      { ...record, reason: 'server-post', failed_condition: undefined }, { ...record, failed_condition: 'not_in_channel' }, { ...record, at: record.at + 1 },
+      { v: 1, kind: 'fixed', seq: 1, parts: ['late text'] }, sentRecord(), deliveredRecord(), { v: 1, kind: 'refused', seq: 1, attempt: 1, at: 3000 }, { v: 1, kind: 'noticed', seq: 1, at: 3000 },
+    ]
+    for (const r of later) await expect(q.append('alpha', r)).rejects.toBeInstanceOf(QueueOutcomeFinal)
+    expect(fs.readFileSync(queuePath(dir))).toEqual(bytes)
+    expect(q.item('alpha', 1)).toEqual(closed)
+    expect(q.openCount('alpha')).toBe(1)
+    expect(q.isWritable!('alpha')).toBe(true)
+    expect(events.filter(e => e.type === 'append-failed')).toEqual([])
+    await q.append('alpha', { v: 1, kind: 'fixed', seq: 2, parts: ['next item'] })
+    expect(q.item('alpha', 2)!.fixed!.parts).toEqual(['next item'])
+  })
+
+  test.each([['slack', slackInput()], ['interject', injectedInput()], ['cron', injectedInput({ source: 'cron' })]] as const)('a %s item cannot be withdrawn, and the refusal leaves the journal as writable as it was', async (_, input) => {
+    const sync = recordSyncs(), events: QueueEvent[] = []
+    const q = await open({ fs: sync.fs, onEvent: e => { events.push(e) } })
+    await q.accept('alpha', input)
+    const refuse = async (writable: boolean) => {
+      const before = q.item('alpha', 1)!, bytes = fs.readFileSync(queuePath(dir))
+      await expect(q.append('alpha', withdrawn())).rejects.toBeInstanceOf(QueueNotWithdrawable)
+      expect(q.item('alpha', 1)).toEqual(before)
+      expect(q.openCount('alpha')).toBe(1)
+      expect(fs.readFileSync(queuePath(dir))).toEqual(bytes)
+      expect(q.isWritable!('alpha')).toBe(writable)
+    }
+    await refuse(true)
+    await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['next'] })
+    expect(q.item('alpha', 1)!.fixed!.parts).toEqual(['next'])
+    // After a genuine storage failure, the refusal neither clears nor repeats its block.
+    sync.fail(queuePath(dir))
+    await expect(q.append('alpha', sentRecord())).rejects.toThrow('EIO injected sync')
+    await refuse(false)
+    sync.fail()
+    await q.append('alpha', sentRecord())
+    expect(q.isWritable!('alpha')).toBe(true)
+    expect(q.item('alpha', 1)!.records.map(r => r.kind)).toEqual(['accepted', 'fixed', 'sent'])
+    expect(events.map(e => e.type)).toEqual(['stored', 'append-failed', 'writable'])
+    assertNoLeak(events)
+  })
+
+  const outcome = (append: Promise<void>) => append.then(() => 'stored', (error: unknown) => error instanceof QueueOutcomeFinal ? 'final' : 'refused')
+  test.each([['fixed', 1], ['withdrawn', 0]] as const)('concurrent fixed and withdrawn appends durably keep only the first, %s, through reopen', async (first, open1) => {
+    const events: QueueEvent[] = [], onEvent = (e: QueueEvent) => { events.push(e) }
+    let q = await open({ now: () => 1000, onEvent })
+    await q.accept('alpha', reactionInput())
+    const fixed: QueueRecord = { v: 1, kind: 'fixed', seq: 1, parts: ['reaction text'] }
+    const [winner, loser] = first === 'fixed' ? [fixed, withdrawn()] : [withdrawn(), fixed]
+    expect(await Promise.all([outcome(q.append('alpha', winner)), outcome(q.append('alpha', loser))])).toEqual(['stored', 'final'])
+    expect(readQueue(dir).map(r => r.kind)).toEqual(['accepted', first])
+    const item = q.item('alpha', 1)!
+    expect([item.fixed, item.withdrawn]).toEqual(first === 'fixed' ? [fixed, undefined] : [undefined, withdrawn()])
+    expect(item.delivered).toBe(false)
+    expect(q.openCount('alpha')).toBe(open1)
+    await q.stop()
+    q = await open({ now: () => 1000, onEvent })
+    expect(q.openCount('alpha')).toBe(open1)
+    // Startup compaction removes a withdrawn item; either way the late loser is final.
+    expect(await outcome(q.append('alpha', loser))).toBe('final')
+    expect(q.isWritable!('alpha')).toBe(true)
+    expect(events.filter(e => e.type === 'append-failed')).toEqual([])
+    expect(readQueue(dir).some(r => r.kind === loser.kind)).toBe(false)
+    expect(q.lookupReactionKey('alpha', key)).toMatchObject({ status: 'duplicate', seq: 1 })
+    // A sequence never allocated is not closed work.
+    expect(await outcome(q.append('alpha', { ...loser, seq: 2 }))).toBe('refused')
+    assertNoLeak(events)
+  })
+
+  test.each([
+    ['a Slack item ignores a withdrawn record', [accepted(), withdrawn()], 1, undefined],
+    ['fixed before withdrawn stays fixed', [reactionRecord(), { v: 1, kind: 'fixed', seq: 1, parts: ['text'] }, withdrawn()], 1, undefined],
+    ['withdrawn before fixed stays withdrawn and undelivered', [reactionRecord(), withdrawn(), { v: 1, kind: 'fixed', seq: 1, parts: ['text'] }, deliveredRecord()], 0, 2000],
+  ] as [string, QueueRecord[], number, number | undefined][])('replay: %s', async (_, records, openCount, closedAt) => {
+    seedQueue(dir, records)
+    const q = await open({ now: () => 5000 })
+    expect(q.openCount('alpha')).toBe(openCount)
+    expect(q.item('alpha', 1)?.withdrawn).toBeUndefined()
+    expect(readQueue(dir).filter(r => 'compact' in r && r.compact === 'reaction-key').map(r => 'closed_at' in r ? r.closed_at : undefined)).toEqual(closedAt === undefined ? [] : [closedAt])
+  })
+
+  test.each([
+    ['delivered', [{ v: 1, kind: 'fixed', seq: 2, parts: ['CLOSED-PART-MARKER'] }, deliveredRecord(2, 1000 + QUEUE_KEY_KEEP_MS - 10)]],
+    ['withdrawn', [withdrawn({ seq: 2, at: 1000 + QUEUE_KEY_KEEP_MS - 10 })]],
+  ] as [string, QueueRecord[]][])('a %s reaction compacts to its content-free key until QUEUE_KEY_KEEP_MS after intake while open reaction facts survive', async (_, closing) => {
+    const clock = createFakeClock({ start: 1000 })
+    let q = await open({ now: clock.now })
+    const survivor = reactionInput({ origin: 'bot-tool', mode: 'fungible', reactor_persona_name: 'Open Persona', user: undefined, bot_id: 'B0BOT001', emoji: 'eyes' })
+    const closed = reactionInput({ origin: 'bot-tool', reactor_persona_name: 'CLOSED-NAME-MARKER' })
+    expect(await q.accept('alpha', survivor)).toMatchObject({ status: 'accepted', seq: 1 })
+    expect(await q.accept('alpha', closed)).toMatchObject({ status: 'accepted', seq: 2 })
+    await clock.advance(QUEUE_KEY_KEEP_MS - 10)
+    for (const record of closing) await q.append('alpha', record)
+    const openRecord = { ...survivor, v: 1, kind: 'accepted', seq: 1, received_at: 1000, attempt_high_watermark: 0 } as AcceptedRecord
+    const keyRecord: QueueRecord = { v: 1, kind: 'accepted', seq: 2, compact: 'reaction-key', reaction_key: closed.reaction_key, received_at: 1000, closed_at: 1000 + QUEUE_KEY_KEEP_MS - 10 }
+    await q.compact('alpha')
+    expect(nonAllocation()).toEqual([openRecord, keyRecord])
+    for (const marker of ['CLOSED-NAME-MARKER', 'CLOSED-PART-MARKER']) expect(fs.readFileSync(queuePath(dir), 'utf8')).not.toContain(marker)
+    await clock.advance(9)
+    await q.compact('alpha')
+    await q.stop()
+    q = await open({ now: clock.now })
+    expect(nonAllocation()).toEqual([openRecord, keyRecord])
+    expect(q.lookupReactionKey('alpha', closed.reaction_key)).toEqual({ status: 'duplicate', seq: 2 })
+    expect(await q.accept('alpha', closed)).toEqual({ status: 'duplicate', seq: 2 })
+    expect(q.items('alpha').map(i => i.accepted)).toEqual([openRecord])
+    await clock.advance(1)
+    await q.compact('alpha')
+    expect(nonAllocation()).toEqual([openRecord])
+    expect(q.lookupReactionKey('alpha', closed.reaction_key)).toBeUndefined()
+    await clock.advance(3 * QUEUE_KEY_KEEP_MS)
+    await q.compact('alpha')
+    await q.stop()
+    q = await open({ now: clock.now })
+    expect(nonAllocation()).toEqual([openRecord])
+    expect(q.item('alpha', 1)!.accepted).toEqual(openRecord)
+    expect(q.lookupReactionKey('alpha', survivor.reaction_key)).toEqual({ status: 'duplicate', seq: 1, item: q.item('alpha', 1) })
+    expect(q.lookupReactionKey('alpha', closed.reaction_key)).toBeUndefined()
+    // No record names seq 2 now, yet a late outcome for it is still final and blocks nothing.
+    for (const late of [{ v: 1, kind: 'fixed', seq: 2, parts: ['late'] }, withdrawn({ seq: 2 })] as QueueRecord[]) await expect(q.append('alpha', late)).rejects.toBeInstanceOf(QueueOutcomeFinal)
+    expect(q.isWritable!('alpha')).toBe(true)
+    expect(nonAllocation()).toEqual([openRecord])
+    expect(await q.accept('alpha', closed)).toMatchObject({ status: 'accepted', seq: 3 })
+  })
+
+  test.each([
+    ['accepted reaction without its mode', { ...reactionRecord({ emoji: 'eyes' }), seq: 2, mode: undefined }, true],
+    // Read as a durable outcome, it would close seq 1 on replay.
+    ['withdrawal of seq 1 with an array fungible-refused reason', { ...withdrawn(), reason: ['fungible-refused'] }, false],
+    // A known kind inside an array is still an unknown kind, so it alerts.
+    ['record whose kind is an array', { v: 1, kind: ['withdrawn'], seq: 9 }, true],
+  ] as [string, Record<string, unknown>, boolean][])('a malformed %s in the middle of a journal is quarantined while valid work replays in order and stays open', async (_, record, alert) => {
+    const events: QueueEvent[] = []
+    const damaged = JSON.stringify(record) + '\n'
+    seedQueue(dir, [reactionRecord(), damaged, { ...accepted(), seq: 3 }])
+    const q = await open({ now: () => 5000, onEvent: e => { events.push(e) } })
+    expect(q.items('alpha').map(i => [i.accepted.seq, i.accepted.source])).toEqual([[1, 'reaction'], [3, 'slack']])
+    expect(q.item('alpha', 1)!.withdrawn).toBeUndefined()
+    expect(q.openCount('alpha')).toBe(2)
+    const unreadable = events.filter((e): e is Extract<QueueEvent, { type: 'record-unreadable' }> => e.type === 'record-unreadable')
+    expect(unreadable).toMatchObject([{ key: 'alpha', line: 2, alert }])
+    expect(fs.readFileSync(unreadable[0]!.quarantinePath, 'utf8')).toBe(damaged)
+    expect(q.lookupReactionKey('alpha', reactionInput({ emoji: 'eyes' }).reaction_key)).toBeUndefined()
+    await q.append('alpha', withdrawn())
+    expect(q.item('alpha', 1)!.withdrawn).toEqual(withdrawn())
+    expect(q.openCount('alpha')).toBe(1)
+    assertNoLeak(events)
+  })
 })

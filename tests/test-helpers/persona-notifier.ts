@@ -116,6 +116,7 @@ import { makeStubSlack, type StubSlack, type WebApiOutcome } from './slack-stub.
 export interface NoticePost {
   channel: string
   text: string
+  metadata?: { event_type: string; event_payload: Record<string, never> }
 }
 
 /** The lookups, clock and log `makeNotifierStack` builds the notifier over. */

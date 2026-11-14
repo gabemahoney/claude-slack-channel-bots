@@ -50,6 +50,7 @@
  * every line and recorded failure.
  */
 
+import { SERVER_POST_METADATA } from './test-helpers/server-post.ts'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -96,6 +97,7 @@ import {
   fakeToken,
   sentinelInMessage,
 } from './test-helpers/credentials.ts'
+
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -193,8 +195,8 @@ afterEach(() => {
 
 const stub = (p: Persona): StubSlack => stubs.get(p.key)!
 const client = (p: Persona): DestinationSlackClient => clients.get(p.key)!
-/** `chat.postMessage` calls on `p`'s stub (failed ones included), as `{channel, text}`. */
-const posts = (p: Persona) => stub(p).calls.postMessage as { channel: string; text: string }[]
+/** `chat.postMessage` calls on `p`'s stub (failed ones included), as `{channel, text, metadata}`. */
+const posts = (p: Persona) => stub(p).calls.postMessage as { channel: string; text: string; metadata?: unknown }[]
 const postedTexts = (p: Persona): string[] => posts(p).map((c) => c.text)
 
 /** A notice whose failure callback records into `failures`. */
@@ -313,7 +315,7 @@ describe('an episode: held, retried on backoff, one start line, one cleared line
     const failedPosts = posts(p).length
     await clock.runNext()
 
-    expect(posts(p).slice(failedPosts)).toEqual([{ channel: row.postedTo(), text: 'the notice' }])
+    expect(posts(p).slice(failedPosts)).toEqual([{ channel: row.postedTo(), text: 'the notice', metadata: SERVER_POST_METADATA }])
     expect(clearedLines()).toHaveLength(1)
     expect(clearedLines()[0]).toContain(`persona-destination-failed: ${refOf(p)}: cleared: destination=${row.destination}`)
     expect(startLines()).toHaveLength(1)
@@ -648,7 +650,7 @@ describe('the gate (begin)', () => {
     expect(logs).toEqual(outcomes)
     expect(failures).toEqual(failedAttempts)
     expect(callbacks).toEqual([])
-    expect(posts(D)).toEqual([{ channel: 'C0FIXED01', text: 'permission' }])
+    expect(posts(D)).toEqual([{ channel: 'C0FIXED01', text: 'permission', metadata: SERVER_POST_METADATA }])
     expect(stub(D).calls.conversationsOpen).toHaveLength(2)
     expect(hold.view(D.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
     expect(clock.pendingCount()).toBe(0)
@@ -1131,10 +1133,10 @@ describe('isolation and secrecy', () => {
 
     expect(clock.now()).toBe(0)
     expect(posts(E)).toEqual([
-      { channel: stubOpenedDmId('U0EFF0001'), text: 'e1' },
-      { channel: stubOpenedDmId('U0EFF0001'), text: 'e prompt' },
+      { channel: stubOpenedDmId('U0EFF0001'), text: 'e1', metadata: SERVER_POST_METADATA },
+      { channel: stubOpenedDmId('U0EFF0001'), text: 'e prompt', metadata: SERVER_POST_METADATA },
     ])
-    expect(posts(C)).toEqual([{ channel: 'C0CEE0001', text: 'c1' }])
+    expect(posts(C)).toEqual([{ channel: 'C0CEE0001', text: 'c1', metadata: SERVER_POST_METADATA }])
     expect(posts(D)).toEqual([])
     expect(logs.filter((l) => l.includes(E.key) || l.includes(C.key))).toEqual([])
     expect(hold.view(E.key).held).toBe(false)

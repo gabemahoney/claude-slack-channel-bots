@@ -1,5 +1,6 @@
 
 
+import { noticePost } from './test-helpers/server-post.ts'
 import type { MakeTemplateParams } from 'agent-director'
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync, unlinkSync } from 'node:fs'
@@ -2031,7 +2032,7 @@ describe('persona teardown over the real latch: the key\'s latch and CONFLICT ep
     const aRecord = r.latch.record(a)!
     const aText = conflictNoticeText({ sessionName: aRecord.sessionName, latchCase: LATCH_CASE_OWN_ID, description: aRecord.description })
     await flush()
-    expect(h.posts(a)).toEqual([{ channel: r.f.a.permission_prompts!, text: formatPersonaNotice(r.f.a, aText) }])
+    expect(h.posts(a)).toEqual([noticePost(r.f.a.permission_prompts!, formatPersonaNotice(r.f.a, aText))])
     // The real notifier records no trail entry.
     const full = fullTeardownTrail(r.f.b).filter((c) => !c.startsWith('notifier.'))
 
@@ -2065,7 +2066,7 @@ describe('persona teardown over the real latch: the key\'s latch and CONFLICT ep
     h.personas.push(r.f.b)
     expect(r.latch.set(b, LEFTOVER)).toBe(CONFLICT_LATCH_SET_LATCHED)
     await flush()
-    expect(h.posts(b)).toEqual([{ channel: r.f.b.permission_prompts!, text: formatPersonaNotice(r.f.b, leftoverNotice(r).text) }])
+    expect(h.posts(b)).toEqual([noticePost(r.f.b.permission_prompts!, formatPersonaNotice(r.f.b, leftoverNotice(r).text))])
     expect(h.startupEntries()).toHaveLength(1)
   })
 
@@ -2463,7 +2464,7 @@ describe('persona teardown over the real ErrInvalidFlags hold: the key\'s hold a
     // The new half, up, meets ErrInvalidFlags itself: a new episode, its alert at its own destination.
     expect(r.hold.set(b.key, PHASE1_RC_VERSION)).toBe(true)
     await flush()
-    expect(h.posts(b.key)).toEqual([{ channel: newHalf.permission_prompts!, text: formatPersonaNotice(newHalf, INVALID_FLAGS_HOLD_ALERT_TEXT) }])
+    expect(h.posts(b.key)).toEqual([noticePost(newHalf.permission_prompts!, formatPersonaNotice(newHalf, INVALID_FLAGS_HOLD_ALERT_TEXT))])
     expect(h.startupEntries()).toHaveLength(1)
   })
 })
@@ -3012,7 +3013,7 @@ describe('persona teardown over the real bounded-retry kill, outage state, notif
 
     // The new half's own notice reaches its destination.
     await r.h.notifier.notify(b.key, 'the new half is up')
-    expect(r.h.posts(b.key)).toEqual([{ channel: newHalf.permission_prompts!, text: formatPersonaNotice(newHalf, 'the new half is up') }])
+    expect(r.h.posts(b.key)).toEqual([noticePost(newHalf.permission_prompts!, formatPersonaNotice(newHalf, 'the new half is up'))])
     assertNoLeak({ lines: r.f.lines, logs: r.h.logs, entries: r.startupEntries() })
   })
 

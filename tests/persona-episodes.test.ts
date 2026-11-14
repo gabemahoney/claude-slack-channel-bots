@@ -150,6 +150,7 @@
  * runs `assertNoLeak` over every captured post and line.
  */
 
+import { noticePost } from './test-helpers/server-post.ts'
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -294,6 +295,7 @@ import {
   fakeToken,
   sentinelInMessage,
 } from './test-helpers/credentials.ts'
+
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -3372,7 +3374,7 @@ describe('the kill-failure alerts', () => {
 
       expect(alerts.raise(raiseInput(key, ordinary(), KILL_FAILURE_CONTEXT_RECOVERY, {}))).toBe('posted')
       await clock.flush()
-      expect(h.posts(key)).toEqual([{ channel: kept.permission_prompts!, text: formatPersonaNotice(kept, killFailureAlertText(contentOf(key, ordinary()), KILL_FAILURE_CLOSING_DESTINATION, true)) }])
+      expect(h.posts(key)).toEqual([noticePost(kept.permission_prompts!, formatPersonaNotice(kept, killFailureAlertText(contentOf(key, ordinary()), KILL_FAILURE_CLOSING_DESTINATION, true)))])
 
       await h.duringTeardown(kept, async () => {
         expect(alerts.raise(raiseInput(key, ordinary(), KILL_FAILURE_CONTEXT_RECOVERY, STOP))).toBe('stopped')

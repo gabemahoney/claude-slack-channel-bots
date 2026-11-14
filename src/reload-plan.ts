@@ -212,8 +212,8 @@ export type DestructiveSetting = (typeof DESTRUCTIVE_SETTINGS)[number]
  * The settings applied in place, immediately,
  * in the order they are reported. `channels`, `delivery` and
  * `permission_prompts` are in place when the candidate is in declarative
- * mode, `invited.permission_prompts` when it is in fungible mode; `dm.*` in
- * both modes.
+ * mode, `invited.permission_prompts` when it is in fungible mode; `dm.*`,
+ * `stop_hook_bootstrap` and `reaction_notices` in both modes.
  */
 export const IN_PLACE_SETTINGS = [
   'channels',
@@ -223,6 +223,7 @@ export const IN_PLACE_SETTINGS = [
   'dm.enabled',
   'dm.contact',
   'stop_hook_bootstrap',
+  'reaction_notices',
 ] as const
 
 /** A setting applied in place. `channels`: the set of channel IDs; `delivery`: a kept channel's mode. */
@@ -521,8 +522,8 @@ function sectionKeyChanged(before: Persona, after: Persona, key: RecordedSection
  *   `invited.permission_prompts`;
  * - the keys of the other section are always compared as written, and a
  *   changed one is recorded, never applied;
- * - `dm.enabled` and `dm.contact` are compared by resolved value in both
- *   modes.
+ * - `dm.enabled`, `dm.contact`, `stop_hook_bootstrap` and
+ *   `reaction_notices` are compared by resolved value in both modes.
  * So a change of the switch alone modifies no persona.
  */
 function personaSectionChanges(
@@ -539,6 +540,7 @@ function personaSectionChanges(
     'dm.enabled': before.dm.enabled !== after.dm.enabled,
     'dm.contact': before.dm.contact !== after.dm.contact,
     stop_hook_bootstrap: before.stop_hook_bootstrap !== after.stop_hook_bootstrap,
+    reaction_notices: before.reaction_notices !== after.reaction_notices,
   }
   let recorded: RecordedSectionKey[]
   if (mode === 'declarative') {

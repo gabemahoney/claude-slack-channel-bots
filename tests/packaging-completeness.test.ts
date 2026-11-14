@@ -39,7 +39,14 @@
  * own closed list, CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES (src/channel-delivery.ts,
  * imported), gets the same heading check in its own
  * `test.each`, behind a non-empty guard; the list's exact content is pinned
- * in tests/channel-delivery.test.ts, not here. The forbidden-term audit and
+ * in tests/channel-delivery.test.ts, not here. The reaction classes, intake's
+ * (src/reaction-intake-diagnostics.ts) and preparation's
+ * (src/reaction-preparation-diagnostics.ts), imported, are a set of their own:
+ * each needs a skill entry quoting its `[slack] <label>:` line with Line,
+ * Meaning, Cause and Fix bullets, and a row in docs/architecture.md's
+ * `## Logging` section opening with that line; `reaction-dropped`'s Cause and
+ * row name each REACTION_LOGGED_DROP_REASONS reason. In-memory self-checks
+ * cut each of those and see it alone reported. The forbidden-term audit and
  * the exception over all shipped text live in
  * tests/shipped-docs.test.ts.
  *
@@ -148,6 +155,9 @@ import {
   type PersonaDiagnosticClass,
 } from '../src/persona-diagnostics.ts'
 import { RELOAD_DIAGNOSTIC_CLASSES, RELOAD_RECORD_WRITE_FAILED, reloadChannelDeliveryWriteFailedLine } from '../src/reload.ts'
+import { REACTION_DROPPED, REACTION_LOGGED_DROP_REASONS, REACTION_RECEIVED } from '../src/reaction-intake-diagnostics.ts'
+import { REACTION_MESSAGE_UNKNOWN, REACTION_WITHDRAWN } from '../src/reaction-preparation-diagnostics.ts'
+import { REACTION_HANDOFF_FAILED } from '../src/react-handoff.ts'
 import { modeSwitchLine, recordedLine, type RecordedSectionKey } from '../src/reload-plan.ts'
 import {
   CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES,
@@ -606,6 +616,70 @@ describe("the debugging skill covers every class in the stored-choice store's cl
       expect(skillHasClassHeading(label)).toBe(true)
     },
   )
+})
+
+const ARCHITECTURE_REL = 'docs/architecture.md'
+
+let architectureCache: string | undefined
+
+/** The architecture guide's text, read once, on first use inside a case. */
+function architecture(): string {
+  architectureCache ??= readFileSync(resolve(REPO_ROOT, ARCHITECTURE_REL), 'utf-8')
+  return architectureCache
+}
+
+/** The reaction classes, intake's, preparation's and the react hand-off's, kept apart from the persona, reload and stored-choice classes. */
+const REACTION_DIAGNOSTIC_CLASSES = [REACTION_RECEIVED, REACTION_DROPPED, REACTION_WITHDRAWN, REACTION_MESSAGE_UNKNOWN, REACTION_HANDOFF_FAILED] as const
+
+/** Whether `line` is a table row whose first cell opens with the `[slack] <label>:` line. */
+const isLineRow = (line: string, label: string): boolean => line.startsWith(`| \`[slack] ${label}:`)
+
+/**
+ * What reaction class `label` lacks (SR-10.2): in `skill`, its entry's line
+ * and parts (`entryProblems`); in `arch`, a Logging section row for its line;
+ * and for `reaction-dropped`, each logged drop reason (imported) as a code
+ * span in the entry's Cause and in that row.
+ */
+function reactionCatalogueProblems(skill: string, arch: string, label: string): string[] {
+  const row = requiredSection(arch, '## Logging', ARCHITECTURE_REL).split('\n').find((line) => isLineRow(line, label))
+  const problems = [...entryProblems(skill, label), ...(row === undefined ? ['no Logging row'] : [])]
+  if (label === REACTION_DROPPED) {
+    const entry = requiredSection(skill, classHeading(label), SKILL_REL)
+    const cause = partLead('Cause').test(entry) ? bulletLed(entry, '- **Cause:**', `${SKILL_REL}, under the \`${label}\` entry,`) : ''
+    for (const reason of REACTION_LOGGED_DROP_REASONS) {
+      if (!cause.includes(`\`${reason}\``)) problems.push(`Cause: no ${reason}`)
+      if (row !== undefined && !row.includes(`\`${reason}\``)) problems.push(`Logging row: no ${reason}`)
+    }
+  }
+  return problems
+}
+
+describe('the debugging skill and the architecture Logging section cover every reaction diagnostic class', () => {
+  test('the reaction classes are duplicate-free and the logged drop reasons non-empty, so no case passes on nothing', () => {
+    expect(new Set(REACTION_DIAGNOSTIC_CLASSES).size).toBe(REACTION_DIAGNOSTIC_CLASSES.length)
+    expect(REACTION_LOGGED_DROP_REASONS.length).toBeGreaterThan(0)
+  })
+
+  test.each([...REACTION_DIAGNOSTIC_CLASSES])('%s has a skill entry quoting its line, with Line, Meaning, Cause and Fix, and a Logging row', (label) => {
+    expect(reactionCatalogueProblems(debugSkill(), architecture(), label)).toEqual([])
+  })
+
+  test.each([...REACTION_DIAGNOSTIC_CLASSES])('self-check: %s with its skill line, or its Logging row, cut fails on that alone', (label) => {
+    const skillCut = editSection(debugSkill(), classHeading(label), (body) => body.replaceAll(`[slack] ${label}:`, ''))
+    const archCut = architecture().split('\n').filter((line) => !isLineRow(line, label)).join('\n')
+    expect(archCut).not.toBe(architecture())
+    expect(reactionCatalogueProblems(skillCut, architecture(), label)).toEqual(['the line'])
+    expect(reactionCatalogueProblems(debugSkill(), archCut, label)).toEqual(['no Logging row'])
+  })
+
+  test.each([...REACTION_LOGGED_DROP_REASONS])(`self-check: ${REACTION_DROPPED} with %s cut from its Cause, or from its Logging row, fails on that alone`, (reason) => {
+    const span = `\`${reason}\``
+    const skillCut = editSection(debugSkill(), classHeading(REACTION_DROPPED), (body) =>
+      body.split('\n').map((line) => (partLead('Cause').test(line) ? line.replaceAll(span, '') : line)).join('\n'))
+    const archCut = architecture().split('\n').map((line) => (isLineRow(line, REACTION_DROPPED) ? line.replaceAll(span, '') : line)).join('\n')
+    expect(reactionCatalogueProblems(skillCut, architecture(), REACTION_DROPPED)).toEqual([`Cause: no ${reason}`])
+    expect(reactionCatalogueProblems(debugSkill(), archCut, REACTION_DROPPED)).toEqual([`Logging row: no ${reason}`])
+  })
 })
 
 // ---------------------------------------------------------------------------

@@ -107,17 +107,30 @@
  * reconnect's socket forwards nothing for a persona marked meanwhile until
  * its swap.
  *
- * Events: `message`, `app_mention` and `interactive` from a persona's socket
- * reach `onEvent(key, eventName, payload)` with the library's listener
- * argument unchanged (`{ event, body, ack, … }`). The handler is awaited in
- * try/catch; a throw is logged with `describeThrownValue` and affects no other
- * event or persona. The manager never acks.
+ * Events: `message`, `app_mention`, `interactive`, `reaction_added` and
+ * `reaction_removed` from a persona's socket reach
+ * `onEvent(key, eventName, payload)` with the library's listener argument
+ * unchanged (`{ event, body, ack, … }`). The handler is awaited in try/catch;
+ * a throw is logged with `describeThrownValue` and affects no other event or
+ * persona. The manager never acks.
  *
- * Isolation: every piece of state lives in one entry per persona. No lock,
- * queue, promise chain or timer is shared between personas; at most one
- * attempt of the persona's own connection is in flight and at most one live
- * Socket Mode client exists per persona, plus, during a credentials
- * reconnect, the reconnect's one attempt and socket.
+ * Run Bot Identities: every bot user ID a valid `auth.test` confirmed for any
+ * persona (bring-up, its retries, a credentials reconnect and its retries)
+ * joins one manager-wide set at that confirmation, before the socket opens,
+ * and stays for the manager's life: through socket failures, refusals,
+ * cancelled reconnects, swaps, `stop`, removal and `stopAll`. Only a new
+ * manager (a new server run) starts empty. `isRunBotIdentity(id)` reads it.
+ * A result already abandoned or cancelled, a failed validation, a reopen (no
+ * `auth.test`) and the dry-run placeholder add nothing. It holds bot user IDs
+ * only.
+ *
+ * Isolation: every piece of connection and lifecycle state lives in one entry
+ * per persona; the manager-wide Run Bot Identities set above is the only
+ * state shared between personas. No lock, queue, promise chain or timer is
+ * shared between personas; at most one attempt of the persona's own
+ * connection is in flight and at most one live Socket Mode client exists per
+ * persona, plus, during a credentials reconnect, the reconnect's one attempt
+ * and socket.
  *
  * Dry run: bring-up calls no factory method, needs no credentials
  * value and reports up at once with a placeholder identity derived from the
@@ -199,7 +212,7 @@ export const SYSTEM_PERSONA_CONNECTION_CLOCK: PersonaConnectionClock = {
 // ---------------------------------------------------------------------------
 
 /** The Socket Mode events forwarded to the handler, tagged with the persona. */
-export const PERSONA_FORWARDED_SOCKET_EVENTS = ['message', 'app_mention', 'interactive'] as const
+export const PERSONA_FORWARDED_SOCKET_EVENTS = ['message', 'app_mention', 'interactive', 'reaction_added', 'reaction_removed'] as const
 
 /** A forwarded Socket Mode event name. */
 export type PersonaSocketEventName = (typeof PERSONA_FORWARDED_SOCKET_EVENTS)[number]
@@ -417,6 +430,13 @@ export interface PersonaConnectionManager {
   stop(key: string, endReason?: string): Promise<void>
   /** Stop every persona. */
   stopAll(): Promise<void>
+  /**
+   * Whether `id` is a bot user ID a valid `auth.test` confirmed for any
+   * persona during this manager's life (the Run Bot Identities), including
+   * personas since stopped or removed and identities since replaced by a
+   * credentials reconnect. Synchronous, read-only, no I/O.
+   */
+  isRunBotIdentity(id: string): boolean
 }
 
 /**
@@ -497,7 +517,11 @@ interface PendingReconnect extends AttemptSlot {
   cancelled: boolean
 }
 
-/** Everything the manager holds for one persona. Nothing here is shared with another persona. */
+/**
+ * Everything the manager holds for one persona's connection and lifecycle.
+ * Nothing here is shared with another persona; its confirmed bot user IDs are
+ * also kept in the manager-wide Run Bot Identities, outside the entry.
+ */
 interface PersonaEntry extends AttemptSlot {
   readonly persona: ConnectionPersona
   /**
@@ -536,6 +560,8 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
   const clock = deps.clock ?? SYSTEM_PERSONA_CONNECTION_CLOCK
   const serialize: PersonaSerialize = deps.serialize ?? (async (_key, operation) => operation())
   const entries = new Map<string, PersonaEntry>()
+  /** The Run Bot Identities: bot user IDs only, shared by every persona, never removed. */
+  const runBotIdentities = new Set<string>()
 
   // -------------------------------------------------------------------------
   // Logging and callbacks (a throwing logger or listener never breaks supervision)
@@ -696,6 +722,9 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
         attempt.finish({ kind: 'failed', outcome: validated })
         return
       }
+      // Confirmation is the valid auth.test itself: recorded even if the
+      // socket then fails, and never removed for the rest of the run.
+      runBotIdentities.add(validated.identity.botUserId)
       identity = validated.identity
       try {
         // A reconnect's client is the persona's only from the swap on; a
@@ -1222,6 +1251,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     replaceRetryTokens,
     stop,
     stopAll,
+    isRunBotIdentity: id => runBotIdentities.has(id),
   }
 }
 

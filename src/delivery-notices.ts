@@ -1,5 +1,5 @@
 /** Delivery reporting consumes durable facts and never authorizes keys. */
-import { slackKeyString, type SlackKey, type QueueEvent, type QueueItem, type DeliveryQueue, type AcceptedRecord } from './delivery-queue.ts'
+import { isQueueItemClosed, slackKeyString, type SlackKey, type QueueEvent, type QueueItem, type DeliveryQueue, type AcceptedRecord } from './delivery-queue.ts'
 import type { PostedPersonaNotice } from './persona-notifier.ts'
 import { correctPostedNotice, type NoticeCorrectionOutcome } from './notice-correction.ts'
 import type { DeliveryEngineEvent, DeliveryReason, DeliveryStatus } from './delivery-engine.ts'
@@ -110,6 +110,10 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     deps.episodes.end(key, 'delivery-stuck'); deps.episodes.end(key, 'messages-waiting')
   }
   function receivedItem(key: string, item: QueueItem): void {
+    // Reaction intake logs its own reaction-received line once, at a new
+    // store; a Reaction Item gets no message-received line and no queued
+    // acknowledgement reaction, from preparation, recovery or final delivery.
+    if (item.accepted.source === 'reaction') return
     // Intake calls this after its aggregate ack decision. Recovery stays
     // detached, so a stuck Slack edit never holds acknowledgement/preparation.
     if (item.accepted.source === 'slack' && item.accepted.key) {
@@ -238,7 +242,7 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
       completed.add(id)
       receivedItem(key, item)
       log(MESSAGE_DELIVERED, key, identity, `at=${event.at} wait_ms=${event.waitMs}`)
-      move(key, deps.queue.items(key).find(i => !i.delivered)?.accepted.seq)
+      move(key, deps.queue.items(key).find(i => !isQueueItemClosed(i))?.accepted.seq)
       protect(() => deps.delivered?.(key, item)); return
     }
     if (event.type === 'first-typed') {

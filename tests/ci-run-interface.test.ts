@@ -206,6 +206,9 @@ import { runtimeSpecifiers, stripComments } from './test-helpers/source-audit.ts
 /** The repository root: this file sits in `tests/`. */
 const REPO_ROOT = join(import.meta.dir, '..')
 
+/** The import-free memory measure the runner shares with /ci-live's watchdog. */
+const SHARED_MEMORY_MEASURE = './non-reclaimable-memory.ts'
+
 /** The runner's source text, read when a case runs. */
 function runnerSource(): string {
   return readFileSync(join(REPO_ROOT, RUNNER_PATH_SUFFIX), 'utf-8')
@@ -364,11 +367,17 @@ describe('module properties', () => {
 
   test('runtime loads use built-ins and the import-safe Codex policy, with no production modules', () => {
     const specifiers = runtimeSpecifiers(stripComments(runnerSource()))
-    const allowed = (specifier: string): boolean => specifier.startsWith('node:') || specifier === 'bun' || specifier === 'bun:ffi' || specifier === './codex-login.ts' || specifier === './safe-docker-inspect.ts'
+    const allowed = (specifier: string): boolean => specifier.startsWith('node:') || specifier === 'bun' || specifier === 'bun:ffi' || specifier === './codex-login.ts' || specifier === './safe-docker-inspect.ts' || specifier === SHARED_MEMORY_MEASURE
 
     expect(specifiers.length).toBeGreaterThan(0)
     expect(specifiers.filter((specifier) => !allowed(specifier))).toEqual([])
     expect(specifiers.filter((specifier) => /(^|\/)(src|ci-live)\//.test(specifier))).toEqual([])
+  })
+
+  test("the memory measure shared with /ci-live is loaded and loads nothing itself", () => {
+    expect(runtimeSpecifiers(stripComments(runnerSource()))).toContain(SHARED_MEMORY_MEASURE)
+    const shared = readFileSync(join(REPO_ROOT, 'scripts', SHARED_MEMORY_MEASURE), 'utf-8')
+    expect(runtimeSpecifiers(stripComments(shared))).toEqual([])
   })
 })
 

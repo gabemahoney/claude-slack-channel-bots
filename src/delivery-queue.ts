@@ -4,14 +4,19 @@ import * as nodeFs from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { PERSONA_KEY_RE } from './persona-identity.ts'
+import type { ChannelMode } from './config.ts'
 
 export const QUEUE_KEY_KEEP_MS = 24 * 60 * 60 * 1000
 export const REPLY_REMINDER_KEEP_MS = 24 * 60 * 60 * 1000
 export const QUEUE_COMPACT_INTERVAL_MS = 60 * 60 * 1000
 export const QUEUE_DIRECTORY_MODE = 0o700
 export const QUEUE_FILE_MODE = 0o600
-export type DeliverySource = 'slack' | 'interject' | 'cron'
+export type DeliverySource = 'slack' | 'interject' | 'cron' | 'reaction'
 export interface SlackKey { chat_id: string; ts: string; edited_ts?: string }
+export type ReactionChange = 'added' | 'removed'
+export type ReactionOrigin = 'slack-event' | 'bot-tool'
+/** A Reaction Item's identity. Origin, stored mode and persona name are outside it. */
+export interface ReactionKey { chat_id: string; message_ts: string; reactor: string; emoji: string; change: ReactionChange; event_ts: string }
 export interface QueueFile { name: string; mimetype?: string; size?: number }
 export interface AcceptedInput {
   source: DeliverySource
@@ -34,9 +39,33 @@ export interface AcceptedInput {
   reminder_for?: number
   /** Original queued emoji, retained with open work across configuration changes. */
   queued_ack_reaction?: string
+  /** Reaction Items only; see ReactionAcceptedInput. */
+  message_ts?: string
+  change?: ReactionChange
+  emoji?: string
+  origin?: ReactionOrigin
+  mode?: ChannelMode
+  reaction_key?: ReactionKey
+  reactor_persona_name?: string
+}
+/** One reaction for one Bot: `channel` is the conversation, `message_ts` the
+ * reacted message, `ts` the event ts exactly as received and `user`
+ * (preferred) or `bot_id` the reactor. It holds no message text, so `text`
+ * is always empty. `mode` is the channel mode its intake decision used;
+ * preparation reads it, and `reactor_persona_name`, from the item, never
+ * from the configuration in effect (guide exception E1, Reaction Items only). */
+export interface ReactionAcceptedInput extends AcceptedInput {
+  source: 'reaction'; text: ''; channel: string; message_ts: string; ts: string
+  change: ReactionChange; emoji: string; origin: ReactionOrigin; mode: ChannelMode; reaction_key: ReactionKey
+  /** Required for origin `bot-tool`: the reacting Bot's persona name at hand-off. */
+  reactor_persona_name?: string
+  key?: undefined; queued_ack_reaction?: undefined; reminder_for?: undefined; files?: undefined
 }
 interface BaseRecord { v: 1; seq: number }
 export interface AcceptedRecord extends BaseRecord, AcceptedInput {
+  kind: 'accepted'; received_at: number; ts: string; attempt_high_watermark?: number
+}
+export interface ReactionAcceptedRecord extends BaseRecord, ReactionAcceptedInput {
   kind: 'accepted'; received_at: number; ts: string; attempt_high_watermark?: number
 }
 /** Compaction keeps dedupe facts without message content. */
@@ -47,7 +76,22 @@ export interface QueueKeyRecord extends BaseRecord {
 export interface QueueAllocationRecord extends BaseRecord {
   kind: 'accepted'; compact: 'allocation'; injected_ts?: string
 }
+/** A closed Reaction Item's dedupe fact without its content. */
+export interface QueueReactionKeyRecord extends BaseRecord {
+  kind: 'accepted'; compact: 'reaction-key'; reaction_key: ReactionKey; received_at: number
+  /** The withdrawal time, or the final delivered time. */
+  closed_at: number
+}
 export interface FixedRecord extends BaseRecord { kind: 'fixed'; parts: string[] }
+export type ReactionWithdrawalReason = 'server-post' | 'conversation-unknown' | 'group-dm' | 'fungible-refused'
+/** `not_in_channel` and `channel_not_found` are Slack refusal codes. */
+export type ReactionFungibleCondition = 'not-a-channel' | 'externally-shared' | 'not_in_channel' | 'channel_not_found'
+/** Terminal: a withdrawn Reaction Item is closed, never typed or delivered. */
+export interface WithdrawnRecord extends BaseRecord {
+  kind: 'withdrawn'; reason: ReactionWithdrawalReason; at: number
+  /** Present exactly when `reason` is `fungible-refused`. */
+  failed_condition?: ReactionFungibleCondition
+}
 export interface SentRecord extends BaseRecord {
   kind: 'sent'; attempt: number; part: number; send_kind: 'text' | 'enter' | 'retype'
   at: number; session_id: string; transcript_path: string; transcript_size: number
@@ -73,14 +117,22 @@ export interface ReplyReminderRecord extends BaseRecord {
 }
 export interface ReplyCallTarget { seq: number; attempts?: number[] }
 export interface NoticedRecord extends BaseRecord { kind: 'noticed'; at: number }
-export type QueueRecord = AcceptedRecord | QueueKeyRecord | QueueAllocationRecord | FixedRecord | SentRecord | UnknownSentRecord | DeliveredRecord | RefusedRecord | NoticedRecord | ReplyReminderRecord
-export type ItemRecord = AcceptedRecord | FixedRecord | SentRecord | UnknownSentRecord | DeliveredRecord | RefusedRecord | NoticedRecord
+export type QueueRecord = AcceptedRecord | QueueKeyRecord | QueueAllocationRecord | QueueReactionKeyRecord | FixedRecord | WithdrawnRecord | SentRecord | UnknownSentRecord | DeliveredRecord | RefusedRecord | NoticedRecord | ReplyReminderRecord
+export type ItemRecord = AcceptedRecord | FixedRecord | WithdrawnRecord | SentRecord | UnknownSentRecord | DeliveredRecord | RefusedRecord | NoticedRecord
 export interface QueueItem {
   accepted: AcceptedRecord; fixed?: FixedRecord; records: ItemRecord[]; delivered: boolean
+  /** A withdrawn item stays `delivered: false`; see isQueueItemClosed. */
+  withdrawn?: WithdrawnRecord
   unknownSend: boolean; retypeCount: number; nextAttempt: number
 }
+/** Delivered or withdrawn: no longer FIFO work. */
+export function isQueueItemClosed(item: Pick<QueueItem, 'delivered' | 'withdrawn'>): boolean { return item.delivered || item.withdrawn !== undefined }
+/** The item's fixed or withdrawn outcome is already durable. The journal stays writable. */
+export class QueueOutcomeFinal extends Error {}
+/** Only Reaction Items have a withdrawn outcome. Not a storage failure: the journal stays writable. */
+export class QueueNotWithdrawable extends Error {}
 export type QueueEvent =
-  | { type: 'store-failed'; key: string; path?: string; source?: DeliverySource; sender?: string; user?: string; bot_id?: string; channel?: string; ts?: string; slackKey?: SlackKey; error: unknown }
+  | { type: 'store-failed'; key: string; path?: string; source?: DeliverySource; sender?: string; user?: string; bot_id?: string; channel?: string; ts?: string; slackKey?: SlackKey; reactionKey?: ReactionKey; error: unknown }
   | { type: 'stored' | 'writable'; key: string }
   | { type: 'append-failed' | 'recovery-failed' | 'compaction-failed'; key: string; path?: string; seq?: number; error: unknown }
   | { type: 'record-unreadable'; key: string; line: number; quarantinePath: string; alert: boolean }
@@ -94,6 +146,7 @@ export interface DeliveryQueue {
   /** Adopt pre-two-stage accepted work before its first queued Slack mutation. */
   rememberQueuedReaction(key: string, seq: number, name: string): Promise<string | undefined>
   lookupSlackKey(key: string, slackKey: SlackKey): QueueAcceptResult | undefined
+  lookupReactionKey(key: string, reactionKey: ReactionKey): QueueAcceptResult | undefined
   /** A current snapshot of one item, without cloning the rest of the queue. */
   item(key: string, seq: number): QueueItem | undefined
   items(key: string): QueueItem[]
@@ -130,8 +183,38 @@ const number = (v: unknown): v is number => typeof v === 'number' && Number.isFi
 const integer = (v: unknown): v is number => number(v) && Number.isSafeInteger(v) && v >= 0
 const positive = (v: unknown): v is number => integer(v) && v > 0
 const timestamp = (v: unknown): v is string => str(v) && /^\d+\.\d{6}$/.test(v)
+const nonEmpty = (v: unknown): v is string => str(v) && v !== ''
+/** In-memory members holding undefined are absent on disk. */
+const onlyKeys = (r: Record<string, unknown>, allowed: readonly string[]): boolean => Object.keys(r).every(k => r[k] === undefined || allowed.includes(k))
+/** Exact members only: String() coercion would admit a non-string such as ['added']. */
+const oneOf = (members: readonly string[], v: unknown): v is string => str(v) && members.includes(v)
 export function isSlackKey(v: unknown): v is SlackKey {
   return object(v) && str(v.chat_id) && v.chat_id !== '' && str(v.ts) && v.ts !== '' && (v.edited_ts === undefined || str(v.edited_ts))
+}
+const REACTION_CHANGES: readonly string[] = ['added', 'removed'] satisfies ReactionChange[]
+const REACTION_ORIGINS: readonly string[] = ['slack-event', 'bot-tool'] satisfies ReactionOrigin[]
+const REACTION_MODES: readonly string[] = ['declarative', 'fungible'] satisfies ChannelMode[]
+const WITHDRAWAL_REASONS: readonly string[] = ['server-post', 'conversation-unknown', 'group-dm', 'fungible-refused'] satisfies ReactionWithdrawalReason[]
+const FUNGIBLE_CONDITIONS: readonly string[] = ['not-a-channel', 'externally-shared', 'not_in_channel', 'channel_not_found'] satisfies ReactionFungibleCondition[]
+const REACTION_KEY_FIELDS = ['chat_id', 'message_ts', 'reactor', 'emoji', 'change', 'event_ts']
+const REACTION_ACCEPTED_FIELDS = ['v', 'kind', 'seq', 'source', 'text', 'received_at', 'ts', 'channel', 'message_ts', 'change', 'emoji', 'user', 'bot_id', 'origin', 'mode', 'reaction_key', 'reactor_persona_name', 'attempt_high_watermark']
+/** No other source stores these, so no other queued item keeps a routing copy. */
+const REACTION_ONLY_FIELDS = ['message_ts', 'change', 'emoji', 'origin', 'mode', 'reaction_key', 'reactor_persona_name']
+export function isReactionKey(v: unknown): v is ReactionKey {
+  return object(v) && nonEmpty(v.chat_id) && nonEmpty(v.message_ts) && nonEmpty(v.reactor) && nonEmpty(v.emoji) && oneOf(REACTION_CHANGES, v.change) && nonEmpty(v.event_ts) && onlyKeys(v, REACTION_KEY_FIELDS)
+}
+/** The ordered six-tuple; Slack keys have their own index and encoding. */
+export function reactionKeyString(key: ReactionKey): string { return JSON.stringify([key.chat_id, key.message_ts, key.reactor, key.emoji, key.change, key.event_ts]) }
+/** Content-free by allowlist; every key component must agree with its stored field. */
+function isReactionAccepted(r: Record<string, unknown>): boolean {
+  if (r.text !== '' || !nonEmpty(r.channel) || !nonEmpty(r.message_ts) || !nonEmpty(r.ts) || !number(r.received_at) || !nonEmpty(r.emoji)) return false
+  if (!oneOf(REACTION_CHANGES, r.change) || !oneOf(REACTION_ORIGINS, r.origin) || !oneOf(REACTION_MODES, r.mode)) return false
+  if ((r.user !== undefined && !str(r.user)) || (r.bot_id !== undefined && !str(r.bot_id))) return false
+  if (r.attempt_high_watermark !== undefined && !integer(r.attempt_high_watermark)) return false
+  if (r.origin === 'bot-tool' ? !nonEmpty(r.reactor_persona_name) : r.reactor_persona_name !== undefined) return false
+  if (!onlyKeys(r, REACTION_ACCEPTED_FIELDS)) return false
+  const reactor = nonEmpty(r.user) ? r.user : r.bot_id, k = r.reaction_key
+  return nonEmpty(reactor) && isReactionKey(k) && k.chat_id === r.channel && k.message_ts === r.message_ts && k.reactor === reactor && k.emoji === r.emoji && k.change === r.change && k.event_ts === r.ts
 }
 /** Structural on-disk schema. Invalid versions/kinds and partial records are never replayed. */
 export function isQueueRecord(value: unknown): value is QueueRecord {
@@ -141,7 +224,11 @@ export function isQueueRecord(value: unknown): value is QueueRecord {
     case 'accepted':
       if (r.compact === 'allocation') return (r.injected_ts === undefined || timestamp(r.injected_ts)) && Object.keys(r).every(k => ['v', 'kind', 'seq', 'compact', 'injected_ts'].includes(k))
       if (r.compact === 'key') return isSlackKey(r.key) && number(r.received_at) && number(r.delivered_at) && Object.keys(r).every(k => ['v', 'kind', 'seq', 'compact', 'key', 'received_at', 'delivered_at'].includes(k))
-      if (r.compact !== undefined || !str(r.source) || !['slack', 'interject', 'cron'].includes(r.source) || !str(r.text) || !str(r.ts) || !number(r.received_at)) return false
+      if (r.compact === 'reaction-key') return isReactionKey(r.reaction_key) && number(r.received_at) && number(r.closed_at) && onlyKeys(r, ['v', 'kind', 'seq', 'compact', 'reaction_key', 'received_at', 'closed_at'])
+      if (r.compact !== undefined) return false
+      if (r.source === 'reaction') return isReactionAccepted(r)
+      if (!str(r.source) || !['slack', 'interject', 'cron'].includes(r.source) || !str(r.text) || !str(r.ts) || !number(r.received_at)) return false
+      if (REACTION_ONLY_FIELDS.some(k => r[k] !== undefined)) return false
       if (r.reminder_for !== undefined && (!positive(r.reminder_for) || r.source !== 'interject')) return false
       if (r.attempt_high_watermark !== undefined && !integer(r.attempt_high_watermark)) return false
       if (r.queued_ack_reaction !== undefined && (!str(r.queued_ack_reaction) || !r.queued_ack_reaction.trim())) return false
@@ -149,6 +236,7 @@ export function isQueueRecord(value: unknown): value is QueueRecord {
       if (r.files !== undefined && (!Array.isArray(r.files) || !r.files.every(f => object(f) && str(f.name) && (f.mimetype === undefined || str(f.mimetype)) && (f.size === undefined || number(f.size))))) return false
       return r.source === 'slack' ? isSlackKey(r.key) && str(r.channel) && str(r.via) : timestamp(r.ts) && str(r.sender) && r.key === undefined
     case 'fixed': return Array.isArray(r.parts) && r.parts.length > 0 && r.parts.every(p => str(p) && p !== '')
+    case 'withdrawn': return positive(r.seq) && number(r.at) && oneOf(WITHDRAWAL_REASONS, r.reason) && (r.reason === 'fungible-refused' ? oneOf(FUNGIBLE_CONDITIONS, r.failed_condition) : r.failed_condition === undefined) && onlyKeys(r, ['v', 'kind', 'seq', 'reason', 'at', 'failed_condition'])
     case 'sent':
       if (!positive(r.attempt) || !number(r.at)) return false
       if (r.unknown_outcome === true) return object(r.quarantine) && str(r.quarantine.path) && positive(r.quarantine.line)
@@ -165,6 +253,9 @@ export function parseQueueRecord(line: string): QueueRecord | undefined {
 }
 export function slackKeyString(key: SlackKey): string { return JSON.stringify([key.chat_id, key.ts, key.edited_ts ?? null]) }
 function isAccepted(r: QueueRecord): r is AcceptedRecord { return r.kind === 'accepted' && !('compact' in r) }
+/** Only these feed the injected microsecond watermark; Slack and reaction ts are kept exactly. */
+const injectedSource = (source: DeliverySource): boolean => source === 'interject' || source === 'cron'
+const sameWithdrawal = (a: WithdrawnRecord, b: WithdrawnRecord): boolean => a.seq === b.seq && a.reason === b.reason && a.at === b.at && a.failed_condition === b.failed_condition
 function microseconds(ts: string): bigint { const [s, f = ''] = ts.split('.'); return BigInt(s!) * 1000000n + BigInt(f.padEnd(6, '0').slice(0, 6)) }
 function formatMicros(us: bigint): string { return `${us / 1000000n}.${String(us % 1000000n).padStart(6, '0')}` }
 interface AppendRollback { pendingRollback?: number }
@@ -172,9 +263,14 @@ interface Journal extends AppendRollback {
   records: QueueRecord[]; nextSeq: number; lastInjected?: bigint; loaded: boolean; quarantineRollback?: AppendRollback
   /** Quarantine is durable; this replay must replace the source before writes. */
   pendingRecovery?: boolean
-  reminders: Map<number, ReplyReminderRecord>; items: Map<number, QueueItem>; slackKeys: Map<string, AcceptedRecord | QueueKeyRecord>; openCount: number
+  reminders: Map<number, ReplyReminderRecord>; items: Map<number, QueueItem>; slackKeys: Map<string, AcceptedRecord | QueueKeyRecord>
+  reactionKeys: Map<string, AcceptedRecord | QueueReactionKeyRecord>; openCount: number
 }
-function emptyJournal(): Journal { return { records: [], nextSeq: 1, loaded: false, reminders: new Map(), items: new Map(), slackKeys: new Map(), openCount: 0 } }
+function emptyJournal(): Journal { return { records: [], nextSeq: 1, loaded: false, reminders: new Map(), items: new Map(), slackKeys: new Map(), reactionKeys: new Map(), openCount: 0 } }
+/** Compaction keeps the allocation mark and removes only closed items, so below
+ * that mark a seq with no item was closed and compacted away (or its accepted
+ * record was quarantined on replay). A seq at or above it was never allocated. */
+const compactedClosed = (j: Journal, seq: number): boolean => positive(seq) && seq < j.nextSeq && !j.items.has(seq)
 /** All file access is explicit; construction allocates only memory. */
 export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminderQueue {
   const fs = options.fs ?? nodeFs
@@ -251,14 +347,18 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     j.records.push(record); j.nextSeq = Math.max(j.nextSeq, record.seq + 1)
     if (!replay) indexRecord(j, record)
     if (record.kind === 'accepted') {
-      const ts = 'compact' in record ? record.compact === 'allocation' ? record.injected_ts : undefined : record.source !== 'slack' ? record.ts : undefined
+      const ts = 'compact' in record ? record.compact === 'allocation' ? record.injected_ts : undefined : injectedSource(record.source) ? record.ts : undefined
       if (ts) j.lastInjected = j.lastInjected !== undefined && j.lastInjected > microseconds(ts) ? j.lastInjected : microseconds(ts)
     }
   }
   /** Derive only the changed item; public snapshots never expose these records. */
   function summarize(accepted: AcceptedRecord, records: ItemRecord[]): QueueItem {
     const item: QueueItem = { accepted, records, delivered: false, unknownSend: false, retypeCount: 0, nextAttempt: (accepted.attempt_high_watermark ?? 0) + 1 }
-    for (const r of records) if (r.kind === 'fixed') item.fixed ??= r
+    // The first durable outcome is final; a later conflicting one never replaces it.
+    for (const r of records) {
+      if (r.kind === 'fixed' && !item.withdrawn) item.fixed ??= r
+      else if (r.kind === 'withdrawn' && !item.fixed && !item.withdrawn && accepted.source === 'reaction') item.withdrawn = r
+    }
     const refused = new Set(records.flatMap(r => r.kind === 'refused' ? [r.attempt] : []))
     for (const r of records) if (r.kind === 'refused') item.nextAttempt = Math.max(item.nextAttempt, r.attempt + 1)
     for (const r of records) if (r.kind === 'sent') {
@@ -276,6 +376,10 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         const encoded = slackKeyString(record.key)
         if (!j.slackKeys.has(encoded)) j.slackKeys.set(encoded, record)
       }
+      if ('reaction_key' in record && record.reaction_key) {
+        const encoded = reactionKeyString(record.reaction_key)
+        if (!j.reactionKeys.has(encoded)) j.reactionKeys.set(encoded, record)
+      }
       if (isAccepted(record) && !j.items.has(record.seq)) { j.items.set(record.seq, summarize(record, [record])); j.openCount++ }
       return
     }
@@ -284,10 +388,10 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     const item = summarize(previous.accepted, [...previous.records, record])
     j.items.set(record.seq, item)
     ensureReminder(j, item)
-    j.openCount += Number(previous.delivered) - Number(item.delivered)
+    j.openCount += Number(isQueueItemClosed(previous)) - Number(isQueueItemClosed(item))
   }
   function rebuild(j: Journal): void {
-    j.items = new Map(); j.slackKeys = new Map(); j.reminders = new Map(); j.openCount = 0
+    j.items = new Map(); j.slackKeys = new Map(); j.reactionKeys = new Map(); j.reminders = new Map(); j.openCount = 0
     // Replay groups records once, rather than repeatedly copying a long
     // history of retypes for the same item.
     for (const record of j.records) {
@@ -298,7 +402,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       const item = summarize(previous.accepted, previous.records)
       j.items.set(seq, item)
       ensureReminder(j, item)
-      if (item.delivered) j.openCount--
+      if (isQueueItemClosed(item)) j.openCount--
     }
   }
   function materialize(j: Journal): QueueItem[] {
@@ -361,7 +465,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
           const attempt = positive(raw.attempt) && !item.records.some(r => r.kind === 'sent' && r.attempt === raw.attempt) ? raw.attempt : item.nextAttempt
           update(j, { v: 1, kind: 'sent', seq, attempt, unknown_outcome: true, at: item.accepted.received_at, quarantine: { path: quarantinePath, line: l.line } })
         }
-        event({ type: 'record-unreadable', key, line: l.line, quarantinePath, alert: l.line !== lines.length && !(integer(seq) && accepted.has(seq)) && (raw?.kind === 'accepted' || !['fixed', 'sent', 'delivered', 'refused', 'noticed'].includes(String(raw?.kind))) })
+        event({ type: 'record-unreadable', key, line: l.line, quarantinePath, alert: l.line !== lines.length && !(integer(seq) && accepted.has(seq)) && (raw?.kind === 'accepted' || !oneOf(['fixed', 'withdrawn', 'sent', 'delivered', 'refused', 'noticed'], raw?.kind)) })
       }
       // Retry this exact replay, without appending the quarantined bytes again.
       // Rewriting also persists unknown-send markers atomically with removal of
@@ -452,10 +556,15 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     reconcileRollback(key, j)
     const at = now(), retained: QueueRecord[] = []
     const queuedReminders = new Set(materialize(j).flatMap(item => item.accepted.reminder_for === undefined ? [] : [item.accepted.reminder_for]))
-    for (const r of j.records) if (r.kind === 'accepted' && 'compact' in r && r.compact === 'key' && at - r.received_at < QUEUE_KEY_KEEP_MS) retained.push(r)
+    for (const r of j.records) if (r.kind === 'accepted' && 'compact' in r && (r.compact === 'key' || r.compact === 'reaction-key') && at - r.received_at < QUEUE_KEY_KEEP_MS) retained.push(r)
     for (const item of materialize(j)) {
-      if (item.delivered) {
-        if (item.accepted.key && at - item.accepted.received_at < QUEUE_KEY_KEEP_MS) retained.push({ v: 1, kind: 'accepted', seq: item.accepted.seq, compact: 'key', key: item.accepted.key, received_at: item.accepted.received_at, delivered_at: Math.max(...item.records.flatMap(r => r.kind === 'delivered' ? [r.at] : [])) })
+      if (isQueueItemClosed(item)) {
+        // Closed content goes; only a fresh key fact stays. Open items keep their full record, key included.
+        const a = item.accepted
+        if (at - a.received_at >= QUEUE_KEY_KEEP_MS) continue
+        const closedAt = item.withdrawn?.at ?? Math.max(...item.records.flatMap(r => r.kind === 'delivered' ? [r.at] : []))
+        if (a.key) retained.push({ v: 1, kind: 'accepted', seq: a.seq, compact: 'key', key: a.key, received_at: a.received_at, delivered_at: closedAt })
+        else if (a.reaction_key) retained.push({ v: 1, kind: 'accepted', seq: a.seq, compact: 'reaction-key', reaction_key: a.reaction_key, received_at: a.received_at, closed_at: closedAt })
       } else {
         const refused = new Set(item.records.flatMap(r => r.kind === 'refused' ? [r.attempt] : []))
         const removable = new Set(item.records.flatMap(r => r.kind === 'sent' && !('unknown_outcome' in r) && refused.has(r.attempt) ? [r.attempt] : []))
@@ -481,6 +590,11 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     const j = journal(key)
     const encoded = slackKeyString(slack)
     const r = j.slackKeys.get(encoded)
+    return r ? structuredClone({ status: 'duplicate' as const, seq: r.seq, item: j.items.get(r.seq) }) : undefined
+  }
+  function lookupReactionKey(key: string, reaction: ReactionKey): QueueAcceptResult | undefined {
+    const j = journal(key)
+    const r = j.reactionKeys.get(reactionKeyString(reaction))
     return r ? structuredClone({ status: 'duplicate' as const, seq: r.seq, item: j.items.get(r.seq) }) : undefined
   }
   async function compact(key?: string): Promise<void> {
@@ -572,17 +686,20 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         return await serial(key, () => {
           load(key); const j = journal(key)
           if (input.source === 'slack' && input.key) { const existing = lookupSlackKey(key, input.key); if (existing) return existing }
+          if (input.source === 'reaction' && isReactionKey(input.reaction_key)) { const existing = lookupReactionKey(key, input.reaction_key); if (existing) return existing }
           const received_at = input.received_at ?? now()
-          const candidate = BigInt(Math.trunc(received_at * 1000))
-          const injected = j.lastInjected === undefined || candidate > j.lastInjected ? candidate : j.lastInjected + 1n
-          const record: AcceptedRecord = { ...input, v: 1, kind: 'accepted', seq: j.nextSeq, received_at, ts: input.source === 'slack' ? input.ts ?? input.key?.ts ?? '' : formatMicros(injected) }
+          const injected = (): string => {
+            const candidate = BigInt(Math.trunc(received_at * 1000))
+            return formatMicros(j.lastInjected === undefined || candidate > j.lastInjected ? candidate : j.lastInjected + 1n)
+          }
+          const record: AcceptedRecord = { ...input, v: 1, kind: 'accepted', seq: j.nextSeq, received_at, ts: input.source === 'slack' ? input.ts ?? input.key?.ts ?? '' : input.source === 'reaction' ? input.ts ?? '' : injected() }
           if (!isQueueRecord(record)) throw new Error('Invalid accepted record')
           durableAppend(pathFor(key), Buffer.from(JSON.stringify(record) + '\n'), j)
           update(j, record)
           event({ type: 'stored', key })
           return { status: 'accepted' as const, seq: record.seq, item: structuredClone(j.items.get(record.seq)!) }
         })
-      } catch (error) { event({ type: 'store-failed', key, path: PERSONA_KEY_RE.test(key) ? pathFor(key) : undefined, source: input.source, sender: input.sender, user: input.user, bot_id: input.bot_id, channel: input.channel, ts: input.ts ?? input.key?.ts, slackKey: input.key, error }); return { status: 'failed', error } }
+      } catch (error) { event({ type: 'store-failed', key, path: PERSONA_KEY_RE.test(key) ? pathFor(key) : undefined, source: input.source, sender: input.sender, user: input.user, bot_id: input.bot_id, channel: input.channel, ts: input.ts ?? input.key?.ts, slackKey: input.key, reactionKey: input.source === 'reaction' && isReactionKey(input.reaction_key) ? { ...input.reaction_key } : undefined, error }); return { status: 'failed', error } }
     },
     async append(key, record) {
       if (!started || stopped) throw new Error('Queue is not writable')
@@ -598,7 +715,21 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         const j = journal(key)
         if (!isQueueRecord(record) || record.kind === 'accepted' || record.kind === 'reply-reminder') throw new Error('Invalid append record')
         const item = j.items.get(record.seq)
-        if (!item) throw new Error('Append has no accepted item')
+        if (!item) {
+          if ((record.kind === 'fixed' || record.kind === 'withdrawn') && compactedClosed(j, record.seq)) throw new QueueOutcomeFinal('Closed item was compacted')
+          throw new Error('Append has no accepted item')
+        }
+        // A durable fixed or withdrawn outcome is never decided again, and a
+        // withdrawn item takes no attempt, receipt or notice.
+        if (record.kind === 'withdrawn') {
+          if (item.accepted.source !== 'reaction') throw new QueueNotWithdrawable('Only reaction items may be withdrawn')
+          if (item.withdrawn) {
+            if (sameWithdrawal(item.withdrawn, record)) return
+            throw new QueueOutcomeFinal('Withdrawal is immutable')
+          }
+          if (item.fixed) throw new QueueOutcomeFinal('Fixed item cannot be withdrawn')
+          if (item.records.some(r => r.kind !== 'accepted')) throw new QueueOutcomeFinal('Attempted item cannot be withdrawn')
+        } else if (item.withdrawn) throw new QueueOutcomeFinal('Withdrawn item is closed')
         // Immutable fixation and stable attempt identifiers allow safe retry after failures.
         if (record.kind === 'fixed' && item.fixed) {
           if (JSON.stringify(item.fixed) !== JSON.stringify(record)) throw new Error('Fixed text is immutable')
@@ -619,7 +750,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         const bytes = Buffer.from(records.map(r => JSON.stringify(r) + '\n').join(''))
         try { durableAppend(path, bytes, j) } catch (error) { storageFailed(error) }
         for (const next of records) update(j, next)
-        // Only a durable write clears a block; an identical fixed retry writes nothing.
+        // Only a durable write clears a block; an identical fixed or withdrawn retry writes nothing.
         if (appendBlocked.delete(key)) event({ type: 'writable', key })
       })
     },
@@ -643,6 +774,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       })
     },
     lookupSlackKey,
+    lookupReactionKey,
     item(key, seq) {
       const item = journal(key).items.get(seq)
       return item ? structuredClone(item) : undefined

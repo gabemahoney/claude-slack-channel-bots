@@ -133,13 +133,14 @@
  *   declaration and an unpinned install are each refused, never skipped.
  *   `buildImageArgs` passes no Claude Code build-arg, so the pin is what is
  *   built. No Claude Code version is written in this file.
- * - the runner loads from outside `ci-live/` only `src/`'s two import-free
- *   text modules (`src/reload-preview-clauses.ts` and
- * `src/startup-summary-ending.ts`), each imported by a
+ * - the runner loads from outside `ci-live/` only three import-free modules:
+ *   `src/`'s two text modules (`src/reload-preview-clauses.ts` and
+ *   `src/startup-summary-ending.ts`) and the memory measure it shares with
+ *   /ci (`scripts/non-reclaimable-memory.ts`), each imported by a
  *   runner file, and packages only node builtins and playwright-core; every
  *   form of load counts (type-only, re-export, dynamic, `require`, a
  *   `/// <reference path>` or `types` directive), and one
- *   the audit cannot follow is refused. Neither module imports anything, so
+ *   the audit cannot follow is refused. None of the three imports anything, so
  *   the host runner never loads the Slack SDKs, the agent-director client or
  *   `bun:sqlite`.
  *
@@ -1979,13 +1980,18 @@ describe('runner wiring (source audit of ci-live/)', () => {
 const SRC = join(import.meta.dir, '..', 'src')
 
 /**
- * The only `src/` modules a runner file may import: the import-free text
+ * The only external modules a runner file may import: the import-free text
  * modules the checks build their expected texts from (the reload preview's
  * retired clauses and the start summary's ending). Any other `src/` module
  * would load the Slack SDKs, the agent-director client or `bun:sqlite` into
- * the host runner, and `ci-live/tsconfig.json` would typecheck it.
+ * the host runner, and `ci-live/tsconfig.json` would typecheck it. The shared
+ * non-reclaimable memory calculation is also allowed and must stay import-free.
  */
-const CI_LIVE_SRC_MODULES: readonly string[] = ['reload-preview-clauses.ts', 'startup-summary-ending.ts']
+const CI_LIVE_EXTERNAL_MODULES: readonly string[] = [
+  'src/reload-preview-clauses.ts',
+  'src/startup-summary-ending.ts',
+  'scripts/non-reclaimable-memory.ts',
+]
 
 /** The packages a runner file may import: node builtins and ci-live's own dependency, playwright-core. */
 const CI_LIVE_PACKAGES = /^(?:node:.+|playwright-core)$/
@@ -2021,10 +2027,10 @@ function moduleLoads(source: string): (string | null)[] {
  * What is wrong with the runner's loads, `files` being each runner file's
  * source by its path under `ci-live/`: a load the audit cannot follow; a
  * package other than `CI_LIVE_PACKAGES`; a relative or absolute path that
- * leaves `ci-live/` and is not exactly one of `CI_LIVE_SRC_MODULES` (another
- * `src/` module, the same one named without its `.ts`, or a route through
+ * leaves `ci-live/` and is not exactly one of `CI_LIVE_EXTERNAL_MODULES` (another
+ * external module, the same one named without its `.ts`, or a route through
  * `tests/` or elsewhere); and, so the rule is not vacuous, a module of
- * `CI_LIVE_SRC_MODULES` no runner file imports. Empty when the loads are as
+ * `CI_LIVE_EXTERNAL_MODULES` no runner file imports. Empty when the loads are as
  * the rule says.
  */
 function ciLiveLoadProblems(files: ReadonlyMap<string, string>): string[] {
@@ -2043,12 +2049,12 @@ function ciLiveLoadProblems(files: ReadonlyMap<string, string>): string[] {
       const target = resolve(CI_LIVE, dirname(rel), specifier)
       const inside = relative(CI_LIVE, target)
       if (inside !== '..' && !inside.startsWith(`..${sep}`) && !isAbsolute(inside)) continue
-      const module = CI_LIVE_SRC_MODULES.find((m) => target === join(SRC, m))
-      if (module === undefined) problems.push(`${rel}: imports ${specifier}, outside ci-live/ and none of src/'s import-free text modules`)
+      const module = CI_LIVE_EXTERNAL_MODULES.find((m) => target === resolve(CI_LIVE, '..', m))
+      if (module === undefined) problems.push(`${rel}: imports ${specifier}, outside ci-live/ and none of the allowed import-free modules`)
       else imported.add(module)
     }
   }
-  for (const m of CI_LIVE_SRC_MODULES) if (!imported.has(m)) problems.push(`no runner file imports src/${m}`)
+  for (const m of CI_LIVE_EXTERNAL_MODULES) if (!imported.has(m)) problems.push(`no runner file imports ${m}`)
   return problems
 }
 
@@ -2092,12 +2098,12 @@ describe("the runner's loads from outside ci-live/ (source audit)", () => {
     expect(moduleLoads(source)).toEqual(['./m.ts', 'n', './a.ts', './b.ts', './c.ts', './d.ts', './e.ts', './f.ts', './g.ts', './h.ts', './i.ts', null])
   })
 
-  test("the runner imports from outside ci-live/ only src/'s two import-free text modules (each imported by a runner file) and packages only node builtins and playwright-core", () => {
+  test("the runner imports from outside ci-live/ only the two src/ text modules and the shared memory calculation (each import-free and imported by a runner file), and packages only node builtins and playwright-core", () => {
     expect(ciLiveLoadProblems(runnerFiles())).toEqual([])
   })
 
   /** The problem for a load of `specifier` that leaves ci-live/ and is none of the import-free modules. */
-  const outside = (specifier: string): string => `imports ${specifier}, outside ci-live/ and none of src/'s import-free text modules`
+  const outside = (specifier: string): string => `imports ${specifier}, outside ci-live/ and none of the allowed import-free modules`
 
   const flagged: [label: string, rel: string, line: string, problem: string][] = [
     ['a named import of another src/ module', HELPERS_TS, "import { startupSummaryLine } from '../../src/session-manager.ts'", outside('../../src/session-manager.ts')],
@@ -2108,6 +2114,8 @@ describe("the runner's loads from outside ci-live/ (source audit)", () => {
     ['a require of another src/ module', join('lib', 'proc.ts'), "const rp = require('../../src/reload-plan.ts')", outside('../../src/reload-plan.ts')],
     ['an import(…) type of another src/ module', HELPERS_TS, "type Counts = import('../../src/session-manager.ts').StartupSummaryCounts", outside('../../src/session-manager.ts')],
     ['an allowed module named without its .ts', HELPERS_TS, "import { DESTRUCTIVE_PREFIX as P } from '../../src/reload-preview-clauses'", outside('../../src/reload-preview-clauses')],
+    ['another scripts/ module', HELPERS_TS, "import { nonReclaimableMemoryBytes } from '../../scripts/ci-run.ts'", outside('../../scripts/ci-run.ts')],
+    ['the shared memory module named without its .ts', HELPERS_TS, "import { nonReclaimableMemoryBytes } from '../../scripts/non-reclaimable-memory'", outside('../../scripts/non-reclaimable-memory')],
     ['a route to src/ through tests/', HELPERS_TS, "import { stripComments } from '../../tests/test-helpers/source-audit.ts'", outside('../../tests/test-helpers/source-audit.ts')],
     ['an absolute path into src/', HELPERS_TS, `import { x } from '${join(SRC, 'reload-plan.ts')}'`, outside(join(SRC, 'reload-plan.ts'))],
     ['a dynamic import the audit cannot follow', 'main.ts', 'const m = await import(modulePath)', 'a module load the audit cannot follow'],
@@ -2128,22 +2136,23 @@ describe("the runner's loads from outside ci-live/ (source audit)", () => {
     expect(ciLiveLoadProblems(withLine(HELPERS_TS, line, true))).toEqual([`${HELPERS_TS}: ${problem}`])
   })
 
-  test.each(CI_LIVE_SRC_MODULES.map((m) => [m]))('refuses a runner that no longer imports src/%s (the positive control)', (m) => {
+  test.each(CI_LIVE_EXTERNAL_MODULES.map((m) => [m]))('refuses a runner that no longer imports %s (the positive control)', (m) => {
     const files = runnerFiles()
-    const importers = [...files].filter(([, source]) => moduleLoads(source).some((s) => s !== null && s.endsWith(`/src/${m}`)))
+    const importers = [...files].filter(([, source]) => moduleLoads(source).some((s) => s !== null && s.endsWith(`/${m}`)))
     expect(importers.length).toBeGreaterThan(0)
-    for (const [rel, source] of importers) files.set(rel, planted(source, new RegExp(`^import [^\\n]*/src/${escapeRegExp(m)}'\\n`, 'gm'), ''))
-    expect(ciLiveLoadProblems(files)).toEqual([`no runner file imports src/${m}`])
+    for (const [rel, source] of importers) files.set(rel, planted(source, new RegExp(`^import [^\\n]*/${escapeRegExp(m)}'\\n`, 'gm'), ''))
+    expect(ciLiveLoadProblems(files)).toEqual([`no runner file imports ${m}`])
   })
 
   test('allows a second runner file importing an import-free module, and text naming another src/ module in a string or comment', () => {
     const lifecycle = join('checks', 'lifecycle-checks.ts')
     expect(ciLiveLoadProblems(withLine(lifecycle, "import { REMOVED_RETIRED_CLAUSE as R } from '../../src/reload-preview-clauses.ts'"))).toEqual([])
+    expect(ciLiveLoadProblems(withLine(lifecycle, "import { nonReclaimableMemoryBytes as memory } from '../../scripts/non-reclaimable-memory.ts'"))).toEqual([])
     expect(ciLiveLoadProblems(withLine(lifecycle, "// import { removedLine } from '../../src/reload-plan.ts'\nconst why = \"await import('../../src/session-manager.ts')\""))).toEqual([])
   })
 
-  test.each(CI_LIVE_SRC_MODULES.map((m) => [m]))('src/%s imports nothing', (m) => {
-    expect(moduleLoads(readFileSync(join(SRC, m), 'utf-8'))).toEqual([])
+  test.each(CI_LIVE_EXTERNAL_MODULES.map((m) => [m]))('%s imports nothing', (m) => {
+    expect(moduleLoads(readFileSync(resolve(CI_LIVE, '..', m), 'utf-8'))).toEqual([])
   })
 
   test.each([
@@ -2151,8 +2160,10 @@ describe("the runner's loads from outside ci-live/ (source audit)", () => {
     ['a type-only import', "import type { ReloadPlan } from './reload-plan.ts'", ['./reload-plan.ts']],
     ['a re-export', "export * from './session-manager.ts'", ['./session-manager.ts']],
     ['a dynamic import', "const c = await import('./config.ts')", ['./config.ts']],
+    ['a require', "const c = require('../src/config.ts')", ['../src/config.ts']],
+    ['an import type', "type C = import('../src/config.ts').Config", ['../src/config.ts']],
   ] as const)('refuses %s added to an import-free module', (_label, line, loads) => {
-    for (const m of CI_LIVE_SRC_MODULES) expect(moduleLoads(`${readFileSync(join(SRC, m), 'utf-8')}\n${line}\n`)).toEqual([...loads])
+    for (const m of CI_LIVE_EXTERNAL_MODULES) expect(moduleLoads(`${readFileSync(resolve(CI_LIVE, '..', m), 'utf-8')}\n${line}\n`)).toEqual([...loads])
   })
 })
 

@@ -1,3 +1,4 @@
+import { noticePost } from './test-helpers/server-post.ts'
 import type { RecoveryStubVerb } from './test-helpers/recovery-harness.ts'
 import { CLEAR_LATCH_ROUTE, handleClearLatch } from '../src/clear-latch.ts'
 import { latchClearRestartResetFailedLine, sweepDeadTmuxChannel, type LatchClearSequenceAnswer } from '../src/session-manager.ts'
@@ -420,6 +421,7 @@ import {
   type RecoveryTimedCall
 } from './test-helpers/recovery-harness.ts'
 import { confirmValues, freshStartLinesIn, startLabelsIn, startLabelsOf, type StartValues } from './test-helpers/start-values.ts'
+
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1828,7 +1830,7 @@ describe('the unusable-recorded-name hold: notice, the record and the episode', 
       latchUnusable(run.latch, persona.key, row)
       await Promise.all(sent)
       expect(notifier.posts(persona.key)).toEqual([
-        { channel: persona.permission_prompts!, text: formatPersonaNotice(persona, unusableNameNoticeText(persona.key, row.description)) },
+        noticePost(persona.permission_prompts!, formatPersonaNotice(persona, unusableNameNoticeText(persona.key, row.description))),
       ])
       expect(notifier.posts(other.key)).toEqual([])
       expect(notifier.clock.pendingCount()).toBe(0)
@@ -2906,7 +2908,6 @@ describe('a CONFLICT or UNUSABLE NAME at the reconnect\'s send-keys holds P, and
   })
 })
 
-
 /** How P's kill latches: [label, P's expected record, P's one post, the latching call (P's retry timer armed before it)]. */
 const KILL_LATCH_WAYS: ReadonlyArray<
   readonly [string, (key: string) => ConflictLatchRecord, (key: string) => string, (run: AutomatedPathsRun, key: string) => Promise<void>]
@@ -3490,7 +3491,7 @@ describe('notice for a launch start not recorded', () => {
       expect(run.latch.setLaunchStartNotRecorded(persona.key, PENDING)).toBe(CONFLICT_LATCH_SET_LATCHED)
       await Promise.all(sent)
       expect(notifier.posts(persona.key)).toEqual([
-        { channel: persona.permission_prompts!, text: formatPersonaNotice(persona, launchStartNotRecordedNoticeText(persona.key)) },
+        noticePost(persona.permission_prompts!, formatPersonaNotice(persona, launchStartNotRecordedNoticeText(persona.key))),
       ])
       expect(notifier.posts(other.key)).toEqual([])
       expect(notifier.clock.pendingCount()).toBe(0)

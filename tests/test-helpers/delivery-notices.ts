@@ -19,6 +19,8 @@ import { assertNoLeak, LEAK_SENTINEL, sentinelInMessage } from './credentials.ts
 export async function makeDeliveryNoticeHarness(options: {
   queue?: DeliveryQueue; leakMarker?: string; fs?: typeof fs
   personas?: PersonaSpec[]; fungible?: boolean
+  /** Bind a recording `queued` callback; by default reporting gets none. */
+  recordQueued?: boolean
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'delivery-notices-'))
   const config = makeMultiPersonaConfig(options.personas ?? [
@@ -28,11 +30,13 @@ export async function makeDeliveryNoticeHarness(options: {
   const h = makeNotifierHarness(config, { leakMarker: options.leakMarker })
   const rig = makeNoticeAlertsRig(h, { logDir: root, omitStderr: true })
   const logs: string[] = [], blocked: { key: string; rule: 'menu' | 'input' }[] = [], delivered: { key: string; item: QueueItem }[] = []
+  const queued: { key: string; item: QueueItem }[] = []
   const states = new Map(config.personas.map(p => [p.key, { up: true } as DeliveryReportState]))
   const queue = options.queue ?? await makeQueue(root, { fs: options.fs, now: h.clock.now, onEvent: event => reporting?.queueEvent(event) })
   const reporting = createDeliveryReporting({ queue, episodes: rig.episodes, persona: key => config.personas.find(p => p.key === key), state: key => states.get(key)!,
     log: line => logs.push(line), notify: (key, text) => h.notifier.notify(key, text),
     delivered: (key, item) => { delivered.push({ key, item }) }, now: h.clock.now,
+    ...(options.recordQueued ? { queued: (key: string, item: QueueItem) => { queued.push({ key, item }) } } : {}),
   })
   const [alpha, beta] = config.personas.map(p => p.key) as [string, string]
   const ref = (key = alpha) => { const p = config.personas.find(p => p.key === key)!; return renderPersonaRef(p.name, key) }
@@ -50,7 +54,7 @@ export async function makeDeliveryNoticeHarness(options: {
     const facts = status(item, patch, key)
     reporting.engineEvent({ type: 'waiting', key, seq: item.accepted.seq, reason, ageMs: facts.ageMs, status: facts })
   }
-  return { root, config, h, rig, queue, reporting, logs, blocked, delivered, states, alpha, beta, ref, accept, status, waiting,
+  return { root, config, h, rig, queue, reporting, logs, blocked, delivered, queued, states, alpha, beta, ref, accept, status, waiting,
     async complete(item: QueueItem, key = alpha) {
       if (!item.fixed) await queue.append(key, { v: 1, kind: 'fixed', seq: item.accepted.seq, parts: ['fixed'] })
       await queue.append(key, { ...deliveredRecord(item.accepted.seq, h.clock.now()), seq: item.accepted.seq })

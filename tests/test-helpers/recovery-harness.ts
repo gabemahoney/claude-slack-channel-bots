@@ -2042,7 +2042,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     const core = createPersonaRouting({
       getPersonaConfig: appliedConfig,
       getBotIdentity: key => slackStubs.get(key)?.identity,
-      queue: { lookupSlackKey: queue.lookupSlackKey, accept: async (key, input) => { await ready; return queue.accept(key, input) } },
+      queue: { lookupSlackKey: queue.lookupSlackKey, lookupReactionKey: queue.lookupReactionKey, accept: async (key, input) => { await ready; return queue.accept(key, input) } },
       prepare: preparation.prepare,
       archive: () => {},
       log,

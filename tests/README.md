@@ -436,6 +436,15 @@ tests/
                                    # unnormalized real-client negative controls and production normalized positive behavior
     test-49-fmk-model-effort.sh    # per-persona model and effort: each launch's `--model=`/`--effort=` elements whole; resume kept across a death,
                                    # clean_restart and stop/start; a changed value starts a fresh conversation with one Fresh-Start Line, the old kept
+    test-50-reaction-notices.sh    # shared mode, live against the Slack stub, two personas from the first start: Reaction Notices typed and receipted exactly
+                                   # (Tool Posts in a listed, threaded, DM and mentions-only conversation), FIFO with ordinary items while alpha is held
+                                   # (displayed-states hooks), dedupe across a restart, no acknowledgement or Reply Reminder, react on a delivered
+                                   # message in its open turn, a forged opener escaped, silent/logged drops and withdrawals in both channel modes;
+                                   # message-read failures kept without thread_ts, declarative conversation-lookup failures kept;
+                                   # Bot-to-Bot: bravo's react on alpha's
+                                   # real Tool Post brings alpha one empty-body notice naming bravo (persona name, bot user ID) and Slack's own event for it
+                                   # none; two overlapping react calls (ok then already_reacted, and the reverse) bring one notice each with unchanged
+                                   # results; bravo's react on its own post brings neither persona anything
     lib/
       displayed-states.sh          # contained setup, runtime provenance and success/failure leak checks before closing diagnostics and driver evidence release
       real-scenario.sh             # native agent setup, minimal permissions, exact evidence, faults, bounds and once-only EXIT accounting
@@ -458,14 +467,14 @@ tests/
       tmux-shim.sh                 # the logging tmux shim of fmk mode, first on the PATH of every CSCB process: logs each call's argv and parent, then acts on its
                                    # mode (log, fail-kill, fail-create, slow-create, wedge); fail-kill may be limited to a target list
       fmk-driver.ts                # AD row/refusal and lifecycle recovery scenario; startup dialogs receive no CSCB answer
-      fmk-texts.ts                 # the one value printer of the fmk scenarios and Tests 29 and 31: prints the installed package's own export (a constant, or a builder's output for
+      fmk-texts.ts                 # the one value printer of the fmk scenarios and Tests 29, 31 and 50: prints the installed package's own export (a constant, or a builder's output for
                                    # the given arguments) by entry name, so no script retypes a value src/ exports; refuses to run without the image marker
                                    # /etc/cscb-ci-image and imports the package only after that check (see The value printer)
       ad-version-stand-in.sh       # scenarios 8 and 23's agent-director version stand-in, behind the shim: reports a chosen version (or none a client parses), can turn the
                                    # reuse flag into one the release does not define, and hands every other call to the image's release binary; refuses without
                                    # the image marker or its settings file (see Scenario helper)
       driver.ts                    # AD row/refusal and lifecycle recovery scenario; startup dialogs receive no CSCB answer
-      stub-claude.sh               # fake `claude` (Tests 4, 10, 12 and 29, and ordinary fmk scripts): runs the mode its working directory selects (the
+      stub-claude.sh               # fake `claude` (Tests 4, 10, 12, 29 and 50, and ordinary fmk scripts): runs the mode its working directory selects (the
                                    # at-once default, explicitly selected startup-trust or dev-channels dialog, silent, an unrecognised dialog, the trust-aware folder-trust prompt, startup-trust with the
                                    # transcript written only at the first message, at once and lingering after `pause`'s `/exit`, at once and exiting on it), reports in by firing every SessionStart
                                    # hook its `--settings` registers, and SessionEnd on its exit sentinel, as direct children of its own process (exec form:
@@ -473,16 +482,23 @@ tests/
                                    # holds an MCP session to the bot server (see The stub worker); clears its screen and scrollback when a dialog is answered,
                                    # before it reports in (see Stub worker modes); in `startup-trust`, an optional per-directory delay before the dialog
                                    # (`stub_dialog_delay`); in `linger-on-exit`, SessionEnd on the `/exit` line `pause` types, then a linger until `stub_release`;
-                                   # in `exit-on-pause`, SessionEnd on that line, then its MCP session closed and exit 0; records every launch's
-                                   # arguments beside itself, shell-quoted and as JSON elements (see The stub worker)
-      stub-mcp-session.ts          # the stub's MCP session client, copied beside the stub in every fmk script and Test 29: connects to the bot server named by the stub's
+                                   # in `exit-on-pause`, SessionEnd on that line, then its MCP session closed and exit 0; in `displayed-states`, each typed
+                                   # line held until its per-session control file's `receipt` (the transcript record, then Stop), or `receipt-only` (the
+                                   # record, the turn left open) and a later `stop` (Stop); records every launch's arguments beside itself, shell-quoted and
+                                   # as JSON elements (see The stub worker)
+      stub-mcp-session.ts          # the stub's MCP session client, copied beside the stub in every fmk script and Tests 29 and 50: connects to the bot server named by the stub's
                                    # `--mcp-config` with the package's own MCP SDK and holds the session until the stub ends; records every channel notification
                                    # in a per-directory delivery record and calls the tools the harness writes to a per-directory request file, one result line
-                                   # each (see The stub worker); refuses to run without the image marker /etc/cscb-ci-image and imports the
+                                   # each (see The stub worker), in order one at a time unless the per-directory stub-mcp-concurrency.<key>.json
+                                   # (`{"max_in_flight":2}`) lets two run at once; refuses to run without the image marker /etc/cscb-ci-image and imports the
                                    # package only after that check
-      slack-stub-server.ts         # the loopback Slack stub of Test 0, Tests 10, 12 and 29 and the fmk scenarios: Web API, apps.connections.open, Socket Mode WebSocket, JSONL record
+      slack-stub-server.ts         # the loopback Slack stub of Test 0, Tests 10, 12, 29 and 50 and the fmk scenarios: Web API, apps.connections.open, Socket Mode WebSocket, JSONL record
                                    # (each `chat.postMessage` text whole, token-redacted); the push control `POST /_push`, which sends one Socket Mode
-                                   # `events_api` envelope over a label's newest open WebSocket (see Slack stub)
+                                   # `events_api` envelope over a label's newest open WebSocket (see Slack stub); the control's `users`, `channels`
+                                   # (conversation kind, sharing or a Slack error) and `replies` (an exact-ts message, error or none) answer the
+                                   # lookups Test 50's Reaction Notices read, recorded with their reads' arguments; `reaction_pairs` holds a label's first
+                                   # matching `reactions.add` until its second arrives, then answers them ok/already_reacted in the configured order, with
+                                   # `reaction-pair` arrival and answer records
       phase1-client-check.ts       # run by Test 1 on the installed package, after the client-under-test check
                                    # against the agent-director client the installed package resolves: the client exports seven classes and the package's re-exports of them are the client's own,
                                    # client-built errors classify by class, the description and predicate helpers hold; refuses to run without the image marker /etc/cscb-ci-image
@@ -1590,9 +1606,9 @@ a config or credentials file from the host:
   a one-persona config in memory and spawns under a stub `claude`.
 - Test 0 and Tests 5 onwards each write their own config into their own
   scratch state dir (see Scenario helper), never the shared one. Tests 5 to
-  12 and Test 29 run in their shard container's shared HOME; Test 0 and
-  every fmk scenario run in their own HOME. Test 0, Tests 10, 12 and 29 and
-  the fmk scenarios are the scenarios outside dry run (see Slack stub).
+  12 and Tests 29 and 50 run in their shard container's shared HOME; Test 0 and
+  every fmk scenario run in their own HOME. Test 0, Tests 10, 12, 29 and 50
+  and the fmk scenarios are the scenarios outside dry run (see Slack stub).
 
 ### Execution model
 
@@ -1620,7 +1636,7 @@ defines; every failure remains part of the combined result.
 Test 0 and Tests 5 onwards depend only on Test 1's install. Each runs any
 server it starts in its own state dir on its own port, and stops it before it
 exits, so neither their order nor their shard matters. Tests 5 to 12 and
-Test 29 run in the helper's shared mode: they share their shard container's
+Tests 29 and 50 run in the helper's shared mode: they share their shard container's
 one HOME, one agent-director store and one tmux server, with no shim, and
 only with the other shared-mode scripts of that shard; their persona names
 are unique per script all the same. Every fmk script (Test 0 and each script
@@ -1641,7 +1657,9 @@ live start does the same to the rows of every earlier shared-mode script in
 its shard, Tests 10 and 12 among them when they are there, so those rows stay
 too; its second live start, after a plain `stop` with both workers running,
 keeps Test 29's own two rows, whose persona, instance ID and working
-directory match its config, and the start pass reconnects both personas. The
+directory match its config, and the start pass reconnects both personas.
+Test 50's two live starts, before and after its own plain `stop`, act
+the same way. The
 sweep reaches only its shard's shared store: an fmk script's rows are in its
 own store, which no other script's start sees, and no shard sees another
 shard's store.
@@ -2104,7 +2122,7 @@ script's name:
   the fmk scenarios): the script gets its own HOME, agent-director install and
   store, and tmux server, all under `SCENARIO_ROOT`, with the agent-director
   shim in front of the binary (see fmk mode below);
-- shared mode, for every other script (Tests 5 to 12 and Test 29): HOME, PATH, the
+- shared mode, for every other script (Tests 5 to 12 and Tests 29 and 50): HOME, PATH, the
   agent-director store and the tmux server stay the container's, as the
   scripts found them, and no shim is installed.
 
@@ -3320,7 +3338,7 @@ too.
 ### The value printer
 
 `tests/integration/fixtures/fmk-texts.ts` is the one value printer of the
-fmk scenarios and of Test 29, which runs it in shared mode; its header
+fmk scenarios and of Tests 29 and 50, which run it in shared mode; its header
 comment is its full statement. A scenario script
 cannot import TypeScript and never retypes a notice text, class label,
 version or settings value that `src/` exports, so it asks the printer, which
@@ -3801,7 +3819,7 @@ variable for the integration suite only (see Environment Variables in
   value (only the token's kind and the first 12 hex digits of its SHA-256) or
   a control `suffix`.
 - It has no `bun test` suite of its own; Test 10 exercises it end to end,
-  Test 29 exercises its push control end to end (see below), Test 0's `slack_stub_record` leg checks the record's text cut and token
+  Tests 29 and 50 exercise its push control end to end (see below), Test 50 its `users`, `channels` and `replies` lookups, Test 0's `slack_stub_record` leg checks the record's text cut and token
   replacement, and Test 20's whole-text checks exercise its
   `chat.postMessage` record.
 
@@ -3869,19 +3887,35 @@ characters.
 A live start also launches each persona through the real agent-director
 under the stub `claude` (see The stub worker), and stops with `--stop-bots`.
 Tests 10 and 12 put `fixtures/stub-claude.sh` first on `PATH` as `claude`
-themselves, as Test 4 does, with no session client beside it. Test 29 does
+themselves, as Test 4 does, with no session client beside it. Tests 29 and 50 do
 the same with a regular-file copy of `fixtures/stub-mcp-session.ts` beside
 the stub (`SCENARIO_STUB_DIR`, under `SCENARIO_ROOT`), so each persona's stub
 opens an MCP session. An fmk script's start finds the copy `scenario.sh` put
 first on its PATH, with the stub's MCP session client beside it.
 
-Test 29 starts the stub with `--record` and `--control`, as Tests 10 and 12
-do. `slack_stub_push` sends each event; `queue_accepted` reads durable
+Tests 29 and 50 start the stub with `--record` and `--control`, as Tests 10 and 12
+do. In Test 29, `slack_stub_push` sends each event; `queue_accepted` reads durable
 acceptance from the persona's queue, and `stub_session_call` calls
 `set_channel_delivery`. Acceptance alone does not prove transcript delivery.
 The scenario waits for all fixed parts' receipts before its restart, saves
 the pre-restart acceptances, and checks the retained dedupe facts after
 startup compaction.
+
+Test 50 posts alpha's Tool Posts through `stub_session_call`'s `reply`,
+then rewrites the whole control file (users, channels and replies) and waits
+for the stub's `control` record before each push. Each `slack_stub_push`
+waits for the push's own `ws-message` ACK. alpha's stub runs the opt-in
+`displayed-states` mode, selected in the scratch modes file: each typed item
+fires the real UserPromptSubmit hook and is held until the script appends
+`receipt` to the stub's per-session control file, which writes the
+transcript record and fires the real Stop hook. AC8 instead appends
+`receipt-only`, which writes the record and leaves the turn open, reacts
+through `stub_session_call`, then appends `stop`, which fires Stop. A typed tag is proven from
+the queue's `delivered` receipt and the transcript record it names, compared
+with a tag the script writes out attribute by attribute. Every negative count
+is read after the event's ACK or durable outcome and a later item's
+delivery on alpha's connection. The pre-restart journal is saved for the
+closing reads.
 
 For, Test 29 reads every `server.log*` after the writers stop
 and compares the exact `message-received` Counter against its complete

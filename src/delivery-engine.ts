@@ -1,7 +1,7 @@
 /** Durable one-part-at-a-time delivery executor.
  * All environment access is injected; importing this module does no I/O. */
 import type { Client, GetResult, SendKeysParams } from 'agent-director'
-import type { DeliveryQueue, QueueItem, QueueRecord, SentRecord } from './delivery-queue.ts'
+import { isQueueItemClosed, type DeliveryQueue, type QueueItem, type QueueRecord, type SentRecord } from './delivery-queue.ts'
 import { createDeliveryReceiptReader, effectiveSends, type DeliveryReceiptReader, type ReceiptObservation } from './delivery-receipt.ts'
 import { type DeliveryLifecycle, type DeliveryClock, systemDeliveryClock, NOT_NOW_RETRY_MS } from './delivery-lifecycle.ts'
 import { decideEngine, decideGate, firstSendGate, recoveryEnterGate, latestDeliveryAttempt, retypeGate, selectDeliveryTarget, NO_DELIVERY_PAIR, createDeliveryReading, createDeliveryPolicyState, type DeliveryPair, type DeliveryPolicyEngine, type DeliveryPolicyKnowledge, type DeliveryReading, type DeliveryTimer } from './delivery-policy.ts'
@@ -119,7 +119,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   function release(s: State): void { s.lease?.(); s.lease = undefined; s.e.request = 'none' }
   function timers(s: State): void { for (const name of Object.keys(s.e.timers) as DeliveryTimer[]) s.e.timers[name] = Math.max(0, (s.deadlines[name] ?? 0) - clock.now()) }
   function status(key: string, s: State): DeliveryStatus | undefined {
-    const items = deps.queue.items(key).filter(i => !i.delivered), head = items[0]
+    const items = deps.queue.items(key).filter(i => !isQueueItemClosed(i)), head = items[0]
     if (!head) return undefined
     const deferred = life.deferred(key)
     const partial = s.partialReceipt
@@ -134,7 +134,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     // AD's observed transition excludes earlier sends even when a resumed
     // conversation keeps its session ID and has no launch timestamp.
     s.partialReceipt = undefined
-    s.partialAfterAttempts = new Map(deps.queue.items(key).filter(i => !i.delivered).map(i => [i.accepted.seq, i.nextAttempt - 1]))
+    s.partialAfterAttempts = new Map(deps.queue.items(key).filter(i => !isQueueItemClosed(i)).map(i => [i.accepted.seq, i.nextAttempt - 1]))
   }
   function observePartialReceipt(key: string, s: State, head: QueueItem, part: number, receipt: ReceiptObservation): void {
     const partial = receipt.receipt ? undefined : receipt.partialReceipt
@@ -273,7 +273,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     if (deps.isConnected(key) && !life.reconnectInput(key)) life.clearDeferred(key)
     const deferred = life.deferred(key)
     s.reading = { ...s.reading, gate: life.owner(key), up: deps.isUp(key) && !!deps.persona(key), latched: deps.isLatched(key), held: deps.isHeld(key) || s.restarted === true, mcp: deps.isConnected(key), relaunch: s.relaunch }
-    const k: DeliveryPolicyKnowledge = { p: { accepted: items.map(i => i.accepted.seq), fixed: items.filter(i => i.fixed).map(i => i.accepted.seq), sent: sends, refused, delivered }, e: s.e, r: s.reading, g: { owner: life.owner(key), stage: 'none', deferred: !!deferred, due: deferred?.due ?? false }, writer: { kind: s.pending?.record.kind ?? 'none' }, compact: 'none', parts, MaxRetypes: constants?.MaxRetypes, textFor: pair => items.find(i => i.accepted.seq === pair[0])?.fixed?.parts[pair[1] - 1] ?? pair }
+    const k: DeliveryPolicyKnowledge = { p: { accepted: items.map(i => i.accepted.seq), fixed: items.filter(i => i.fixed).map(i => i.accepted.seq), sent: sends, refused, delivered, withdrawn: items.filter(i => i.withdrawn).map(i => i.accepted.seq) }, e: s.e, r: s.reading, g: { owner: life.owner(key), stage: 'none', deferred: !!deferred, due: deferred?.due ?? false }, writer: { kind: s.pending?.record.kind ?? 'none' }, compact: 'none', parts, MaxRetypes: constants?.MaxRetypes, textFor: pair => items.find(i => i.accepted.seq === pair[0])?.fixed?.parts[pair[1] - 1] ?? pair }
     s.snapshot = k; return k
   }
   async function observe(key: string, s: State, head: QueueItem, part: number, force = false): Promise<boolean> {
@@ -380,7 +380,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       // Finish our own append/call continuations without replacing the key
       // reading. Every new operation obtains a fresh row and gate grant.
       for (let turns = 0; turns < 40 && !stopped && !s.stopped; turns++) {
-        const items = deps.queue.items(key), head = items.find(i => !i.delivered)
+        const items = deps.queue.items(key), head = items.find(i => !isQueueItemClosed(i))
         if (!head && !s.pending) {
           release(s); states.delete(key); life.engineRunning(key, false); return
         }
@@ -577,7 +577,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         try { await deps.queue.compact(key) } catch { return false }
         if (deps.queue.isWritable?.(key) === false) return false
       }
-      const head = deps.queue.items(key).find(i => !i.delivered)
+      const head = deps.queue.items(key).find(i => !isQueueItemClosed(i))
       if (!head || (!head.unknownSend && !head.records.some(r => r.kind === 'sent'))) return true
       api.wake(key)
       const s = states.get(key)!

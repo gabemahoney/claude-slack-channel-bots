@@ -245,6 +245,7 @@ export const PERSONA_ENTRY_KEYS: readonly (keyof PersonaInput)[] = [
   'stop_hook_bootstrap',
   'model',
   'effort',
+  'reaction_notices',
 ]
 
 /** Keys allowed in a persona's `dm` object. */
@@ -519,6 +520,8 @@ export interface PersonaInput {
   model?: string
   /** The persona's effort level (`EFFORT_LEVELS`): per persona only, with no top-level value and no default. */
   effort?: EffortLevel
+  /** Whether the persona receives Reaction Notices, in both modes: per persona only, with no top-level value. Defaults to `true`. */
+  reaction_notices?: boolean
 }
 
 /** The persona configuration file as parsed from disk. */
@@ -598,6 +601,8 @@ export interface Persona {
   model?: string
   /** The persona's own `effort`; absent when unset. Never inherited. */
   effort?: EffortLevel
+  /** The persona's own `reaction_notices`, `true` when unset. Never inherited. */
+  reaction_notices: boolean
 }
 
 /** Validated, fully-resolved persona configuration. */
@@ -1479,7 +1484,7 @@ type ResolvedSection = Pick<Persona, 'channels' | 'permission_prompts' | 'fungib
  *   2. types and formats, in this order: `name` (required, a non-empty
  *      string), `credentials_file`,
  *      `working_directory`, `claude_config_dir`, `stop_hook_bootstrap`,
- *      `model`, `effort`,
+ *      `model`, `effort`, `reaction_notices`,
  *      `channels` (in array order: `id`, `delivery`, duplicate ID), `dm.enabled`,
  *      `dm.contact`, `permission_prompts` (required);
  *   3. cross-setting rules (see `checkPersonaCrossSettings`): zero channels
@@ -1493,7 +1498,7 @@ type ResolvedSection = Pick<Persona, 'channels' | 'permission_prompts' | 'fungib
  *   1. shape and unknown keys: persona entry, `dm` and `invited` (stage 1);
  *   2. types and formats, in this order: `name`, `credentials_file`,
  *      `working_directory`, `claude_config_dir`, `stop_hook_bootstrap`,
- *      `model`, `effort`, `dm.enabled`, `dm.contact`,
+ *      `model`, `effort`, `reaction_notices`, `dm.enabled`, `dm.contact`,
  *      `invited.permission_prompts`;
  *   3. the fungible destination rule (see `checkFungibleDestination`).
  * `channels` and the top-level `permission_prompts` are neither checked nor
@@ -1538,6 +1543,8 @@ function parsePersonaEntry(
   }
   const effort = raw['effort']
   if (effort !== undefined) checkAllowedValue(effort, 'effort', EFFORT_LEVELS, style)
+  const ownReactionNotices = raw['reaction_notices']
+  if (ownReactionNotices !== undefined) checkBoolean(ownReactionNotices, 'reaction_notices', style)
   let section: ResolvedSection
   let dm: PersonaDm
   if (mode === 'fungible') {
@@ -1573,6 +1580,7 @@ function parsePersonaEntry(
     stop_hook_bootstrap: (ownStopHook as boolean | undefined) ?? inherited.stop_hook_bootstrap,
     ...(model !== undefined ? { model } : {}),
     ...(effort !== undefined ? { effort: effort as EffortLevel } : {}),
+    reaction_notices: (ownReactionNotices as boolean | undefined) ?? true,
   }
 }
 
