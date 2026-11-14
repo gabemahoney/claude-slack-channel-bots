@@ -159,8 +159,10 @@ installed Google Chrome, headless; no browser download):
    `--pids-limit 2048` (the `docker run` guard refuses a run without them),
    Chrome is one browser with one context and one page per account, idle on
    `about:blank` between flows, and a watchdog writes a `watchdog:` line to
-   `run.log` every 30 s. It stops the run when the host's working set passes
-   40 GiB or Chrome's process tree PSS passes 4 GiB. A prompt guard runs
+   `run.log` every 30 s. It stops the run when the host's non-reclaimable
+   memory passes 40 GiB or Chrome's process tree PSS passes 4 GiB. The host
+   measure is `max(anon + shmem, active_anon + inactive_anon + unevictable)`,
+   shared with `/ci`; reclaimable page cache is excluded. A prompt guard runs
    through the checks: it denies (Deny clicked, else `agent-director decide`
    in the container) any permission prompt no check declared once it is 15 s
    old, and any prompt a check left open when it ends (Check 27's excepted),

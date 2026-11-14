@@ -573,7 +573,7 @@ it does not decide admission or a watchdog stop.
 monitor uses the working set, so its reading can differ from U.
 
 While a `/ci-live` run is active, C is the lower of that and 40 GiB,
-`/ci-live`'s working-set stop line (see [Memory bounds](#memory-bounds)).
+`/ci-live`'s non-reclaimable memory stop line (see [Memory bounds](#memory-bounds)).
 Shard containers run under the root, so their anonymous, shared and locked
 memory is in U. Reclaimable page cache left by removed containers can remain
 charged to the pod and visible in W without consuming the gate's headroom.
@@ -1862,12 +1862,12 @@ and writes one `watchdog:` line to `run.log` per sample:
 
 | Part of the line | What it reads |
 |---|---|
-| `host` | The host (pod) cgroup: the working set (`ws`), which is `memory.current` minus `inactive_file` from `memory.stat` (page cache the kernel can drop is not use, as the kubelet counts it), then `memory.current` and `memory.max` |
+| `host` | The host (pod) cgroup: non-reclaimable memory (`non-reclaimable`), using `/ci`'s shared `max(anon + shmem, active_anon + inactive_anon + unevictable)` calculation from `memory.stat`, excluding reclaimable page cache; then `memory.current` and `memory.max` |
 | `container` | The test container's `docker stats`: memory use and limit, and its PIDs. `container not running` before it starts and after it is removed; `container not read (the watchdog stopped)` in a sample that ends after the watchdog stopped, which skips `docker stats` |
 | `chrome` | Chrome's process tree (the runner's descendants that are Chrome): its summed PSS (`pss=`, which counts pages shared between Chrome's processes once), its process count, and the browser's open pages (how many idle on `about:blank`) and contexts. A process whose `smaps_rollup` can't be read counts its RSS instead, and the line says how many did (`rss fallback for <n>`) |
 | `runner` | The runner's own RSS |
 
-It stops the run when the host working set passes 40 GiB (well below the
+It stops the run when the host non-reclaimable memory passes 40 GiB (well below the
 pod's 64 GiB, leaving room for the production bots) or Chrome's tree PSS
 passes 4 GiB (a healthy run stays well under it). Each limit is checked as
 soon as its reading arrives, the host's first, then Chrome's, before the
@@ -1892,7 +1892,7 @@ It stops the run the way a signal does (see
 The results so far are written with a `memory watchdog` FAIL row, and the
 run exits 1. The verdict names what crossed its limit, its value and the
 limit, such as
-`FAIL: memory watchdog: host working set 41.2 GiB is over the 40.0 GiB limit (…)`.
+`FAIL: memory watchdog: host non-reclaimable memory 41.2 GiB is over the 40.0 GiB limit (…)`.
 The run's note says what the cleanup actually did (see
 [One run at a time](#one-run-at-a-time)).
 

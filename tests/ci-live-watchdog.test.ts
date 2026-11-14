@@ -4,13 +4,13 @@
  * process tree it takes from `ci-live/lib/proc-tree.ts`.
  *
  * The rules under test:
- * - every sample is one `watchdog:` line: the host cgroup's working set
- *   (`memory.current` minus `inactive_file`), the test container's docker
+ * - every sample is one `watchdog:` line: the host cgroup's non-reclaimable
+ *   memory (anon + shmem vs anon/unevictable LRU), the test container's docker
  *   stats, Chrome's tree PSS with the browser's contexts and pages, and the
  *   runner's RSS;
  * - the run is stopped once, through `onAbort` (main.ts turns it into the
  *   verdict `FAIL: memory watchdog: <reason>`, pinned by the source audit in
- *   tests/ci-live-docker.test.ts), when the host working set or Chrome's PSS
+ *   tests/ci-live-docker.test.ts), when the host non-reclaimable memory or Chrome's PSS
  *   passes its limit, the reason naming the value and the limit; a reading
  *   that fails is logged in its sample's line and never stops the run;
  * - the limits are checked as their readings arrive (the host, then Chrome),
@@ -56,16 +56,23 @@ const MIB = 1024 ** 2
 const T0 = Date.parse('2026-09-26T12:00:00.000Z')
 const at = (seconds: number) => new Date(T0 + seconds * 1000).toISOString()
 
-/** The host at `wsGiB` of working set: 2 GiB of inactive file cache on top, under a 64 GiB memory.max. */
-function host(wsGiB: number, max: string = String(64 * GIB)): HostMemory {
-  return parseHostCgroup(String((wsGiB + 2) * GIB), max, `anon 1\ninactive_file ${2 * GIB}\n`)
+/** A complete cgroup v2 memory.stat; callers override individual counters. */
+function memoryStat(overrides: Record<string, number> = {}): string {
+  return Object.entries({ anon: 0, shmem: 0, active_anon: 0, inactive_anon: 0, unevictable: 0, ...overrides })
+    .map(([key, value]) => `${key} ${value}`)
+    .join('\n')
+}
+
+/** The host at `anonGiB` of anon, with 2 GiB of file cache under a 64 GiB memory.max. */
+function host(anonGiB: number, max: string = String(64 * GIB)): HostMemory {
+  return parseHostCgroup(String((anonGiB + 2) * GIB), max, memoryStat({ anon: anonGiB * GIB, active_anon: anonGiB * GIB, inactive_file: 2 * GIB }))
 }
 
 function chrome(pssGiB: number, overrides: Partial<ChromeMemory> = {}): ChromeMemory {
   return { pssBytes: pssGiB * GIB, rssFallbacks: 0, processes: 6, browser: { contexts: 1, pages: 1, idlePages: 1 }, ...overrides }
 }
 
-/** Healthy readings: 10 GiB host working set, a 1.5 GiB container, 1 GiB of Chrome, a 200 MiB runner. */
+/** Healthy readings: 10 GiB host anon, a 1.5 GiB container, 1 GiB of Chrome, a 200 MiB runner. */
 function sources(overrides: Partial<WatchdogSources> = {}): WatchdogSources {
   return {
     host: () => host(10),
@@ -123,24 +130,39 @@ function sequence<T>(...values: T[]): () => T {
 
 describe('the host cgroup', () => {
   test.each([
-    ['a limit', '4294967296\n', '68719476736\n', { currentBytes: 4 * GIB, maxBytes: 64 * GIB, inactiveFileBytes: GIB, workingSetBytes: 3 * GIB }],
-    ['no limit (max)', '4294967296\n', 'max\n', { currentBytes: 4 * GIB, maxBytes: null, inactiveFileBytes: GIB, workingSetBytes: 3 * GIB }],
-    ['more inactive file cache than use (never below 0)', '536870912\n', 'max\n', { currentBytes: GIB / 2, maxBytes: null, inactiveFileBytes: GIB, workingSetBytes: 0 }],
-  ])('parseHostCgroup: the working set is memory.current minus inactive_file, with %s', (_what, current, max, expected) => {
-    expect(parseHostCgroup(current, max, `anon 7\nfile 9\ninactive_file ${GIB}\nactive_file 3\n`)).toEqual(expected)
+    ['a limit', '68719476736\n', 64 * GIB],
+    ['no limit (max)', 'max\n', null],
+  ])('parseHostCgroup reads non-reclaimable counters with %s', (_what, max, maxBytes) => {
+    expect(parseHostCgroup(String(4 * GIB), String(max), memoryStat({ anon: GIB, shmem: GIB / 2, active_anon: GIB, inactive_anon: GIB / 2 }))).toEqual({
+      currentBytes: 4 * GIB, maxBytes, anonBytes: GIB, shmemBytes: GIB / 2,
+      activeAnonBytes: GIB, inactiveAnonBytes: GIB / 2, unevictableBytes: 0, workingSetBytes: 1.5 * GIB,
+    })
+  })
+
+  test.each([
+    ['anon and shmem exceed the LRU counters', { anon: 8, shmem: 3, active_anon: 4, inactive_anon: 2, unevictable: 1 }, 11],
+    ['anon LRU and unevictable exceed type counters', { anon: 4, shmem: 1, active_anon: 6, inactive_anon: 2, unevictable: 3 }, 11],
+    ['locked anon/shmem are not counted twice', { anon: 8, shmem: 2, active_anon: 5, inactive_anon: 2, unevictable: 3 }, 10],
+    ['all counters are zero', {}, 0],
+  ])('parseHostCgroup takes the larger counter sum: %s', (_what, counters, expected) => {
+    expect(parseHostCgroup('100', 'max', memoryStat(counters)).workingSetBytes).toBe(expected)
   })
 
   test.each([
     ['memory.current that is no number', 'abc', 'max', `inactive_file 1\n`, 'memory.current is not a number'],
     ['a negative memory.max', '1', '-1', `inactive_file 1\n`, 'memory.max is not a number'],
-    ['memory.stat with no inactive_file', '1', 'max', 'anon 1\nfile 2\n', 'memory.stat has no inactive_file'],
-    ["cgroup v1's total_inactive_file only", '1', 'max', 'total_inactive_file 1\n', 'memory.stat has no inactive_file'],
+    ['memory.stat with no anon', '1', 'max', 'file 2\n', 'memory.stat has no anon'],
+    ["cgroup v1's total_anon only", '1', 'max', 'total_anon 1\n', 'memory.stat has no anon'],
   ])('parseHostCgroup throws on %s', (_what, current, max, stat, message) => {
     expect(() => parseHostCgroup(current, max, stat)).toThrow(message)
   })
 
+  test.each(['anon', 'shmem', 'active_anon', 'inactive_anon', 'unevictable'])('parseHostCgroup rejects a malformed %s counter', (key) => {
+    expect(() => parseHostCgroup('100', 'max', memoryStat().replace(`${key} 0`, `${key} bad`))).toThrow(`memory.stat has no ${key}`)
+  })
+
   test('readHostCgroup reads memory.current, memory.max and memory.stat under the given cgroup dir', () => {
-    const files: Record<string, string> = { '/cg/memory.current': '3221225472\n', '/cg/memory.max': 'max\n', '/cg/memory.stat': `inactive_file ${GIB}\n` }
+    const files: Record<string, string> = { '/cg/memory.current': '3221225472\n', '/cg/memory.max': 'max\n', '/cg/memory.stat': memoryStat({ anon: 2 * GIB }) }
     const reads: string[] = []
     expect(readHostCgroup('/cg', (p) => (reads.push(p), files[p]!)).workingSetBytes).toBe(2 * GIB)
     expect(reads).toEqual(['/cg/memory.current', '/cg/memory.max', '/cg/memory.stat'])
@@ -163,15 +185,45 @@ describe('the host cgroup', () => {
 // ---------------------------------------------------------------------------
 
 describe('MemoryWatchdog', () => {
+  test.each([
+    ['large active and inactive page cache', 18, 80, 24, false],
+    ['large anonymous memory', 41, 0, 0, true],
+  ])('non-reclaimable control: %s', async (_what, anonGiB, activeFileGiB, inactiveFileGiB, aborts) => {
+    const stat = `anon ${anonGiB * GIB}\nshmem 0\nactive_anon ${anonGiB * GIB}\ninactive_anon 0\nunevictable 0\nactive_file ${activeFileGiB * GIB}\ninactive_file ${inactiveFileGiB * GIB}\n`
+    const h = watchdogHarness(sources({
+      host: () => parseHostCgroup(String((anonGiB + activeFileGiB + inactiveFileGiB) * GIB), String(128 * GIB), stat),
+    }))
+    await h.watchdog.sample()
+    expect(h.aborts.length).toBe(aborts ? 1 : 0)
+    expect(h.watchdog.report().peaks.hostWorkingSet?.value).toBe(anonGiB * GIB)
+    expect(h.watchdog.report().failedSamples).toBe(0)
+  })
+
+  test.each(['anon', 'shmem', 'active_anon', 'inactive_anon', 'unevictable'])(
+    'a missing %s counter fails the host reading without aborting, even with high memory.current',
+    async (missing) => {
+      const stat = ['anon', 'shmem', 'active_anon', 'inactive_anon', 'unevictable', 'inactive_file']
+        .filter((key) => key !== missing)
+        .map((key) => `${key} 0`)
+        .join('\n')
+      const h = watchdogHarness(sources({ host: () => parseHostCgroup(String(100 * GIB), 'max', stat) }))
+      await h.watchdog.sample()
+      expect(h.aborts).toEqual([])
+      expect(h.watchdog.report().failedSamples).toBe(1)
+      expect(h.watchdog.report().peaks.hostWorkingSet).toBeUndefined()
+      expect(h.log.detail[0]).toContain(`host error: Error: memory.stat has no ${missing}`)
+    },
+  )
+
   test('start says what it watches and its limits, samples at once and then every 30 s, one watchdog: line each; stop ends the sampling', async () => {
     const h = watchdogHarness(sources())
     h.watchdog.start()
     await h.fake.flush()
     expect(h.log.info).toEqual([
-      "watchdog: sampling memory every 30 s into run.log; the run stops when the host working set passes 40.0 GiB or Chrome's PSS passes 4.0 GiB",
+      "watchdog: sampling memory every 30 s into run.log; the run stops when the host non-reclaimable memory passes 40.0 GiB or Chrome's PSS passes 4.0 GiB",
     ])
     expect(h.log.detail).toEqual([
-      'watchdog: host ws=10.0 GiB cur=12.0 GiB max=64.0 GiB | container mem=1.5GiB / 8GiB pids=120 | chrome pss=1.0 GiB procs=6 pages=1 idle=1 contexts=1 | runner rss=200.0 MiB',
+      'watchdog: host non-reclaimable=10.0 GiB cur=12.0 GiB max=64.0 GiB | container mem=1.5GiB / 8GiB pids=120 | chrome pss=1.0 GiB procs=6 pages=1 idle=1 contexts=1 | runner rss=200.0 MiB',
     ])
     await h.fake.advance(90_000)
     expect(h.log.detail.length).toBe(4)
@@ -183,13 +235,13 @@ describe('MemoryWatchdog', () => {
   })
 
   const HOST_OVER =
-    'host working set 41.0 GiB is over the 40.0 GiB limit (memory.current 43.0 GiB minus inactive_file 2.0 GiB; memory.max 64.0 GiB)'
+    'host non-reclaimable memory 41.0 GiB is over the 40.0 GiB limit (anon 41.0 GiB + shmem 0 B vs anon/unevictable LRU 41.0 GiB; reclaimable page cache excluded; memory.current 43.0 GiB; memory.max 64.0 GiB)'
   test.each([
-    ['the host working set passes 40 GiB', { host: () => host(41) }, HOST_OVER],
+    ['the host non-reclaimable memory passes 40 GiB', { host: () => host(41) }, HOST_OVER],
     [
-      'the host working set passes 40 GiB, with no memory.max',
+      'the host non-reclaimable memory passes 40 GiB, with no memory.max',
       { host: () => host(41, 'max') },
-      'host working set 41.0 GiB is over the 40.0 GiB limit (memory.current 43.0 GiB minus inactive_file 2.0 GiB; no memory.max)',
+      'host non-reclaimable memory 41.0 GiB is over the 40.0 GiB limit (anon 41.0 GiB + shmem 0 B vs anon/unevictable LRU 41.0 GiB; reclaimable page cache excluded; memory.current 43.0 GiB; no memory.max)',
     ],
     [
       "Chrome's PSS passes 4 GiB (two processes counted by RSS)",
@@ -280,7 +332,7 @@ describe('MemoryWatchdog', () => {
     reading.resolve(host(41))
     expect(await stopped).toBe(1)
     expect(h.log.detail).toEqual([
-      'watchdog: host ws=41.0 GiB cur=43.0 GiB max=64.0 GiB | container not read (the watchdog stopped) | chrome pss=1.0 GiB procs=6 pages=1 idle=1 contexts=1 | runner rss=200.0 MiB',
+      'watchdog: host non-reclaimable=41.0 GiB cur=43.0 GiB max=64.0 GiB | container not read (the watchdog stopped) | chrome pss=1.0 GiB procs=6 pages=1 idle=1 contexts=1 | runner rss=200.0 MiB',
     ])
     const report = h.watchdog.report()
     expect([h.aborts, h.log.error, report.abort, report.failedSamples, containerReads]).toEqual([[], [], null, 0, 0])
@@ -299,12 +351,12 @@ describe('MemoryWatchdog', () => {
     first.resolve(host(10))
     await explicit
     expect(hostReads).toBe(2)
-    expect(h.log.detail.map((line) => line.split(' | ')[0])).toEqual(['watchdog: host ws=10.0 GiB cur=12.0 GiB max=64.0 GiB', 'watchdog: host ws=12.0 GiB cur=14.0 GiB max=64.0 GiB'])
+    expect(h.log.detail.map((line) => line.split(' | ')[0])).toEqual(['watchdog: host non-reclaimable=10.0 GiB cur=12.0 GiB max=64.0 GiB', 'watchdog: host non-reclaimable=12.0 GiB cur=14.0 GiB max=64.0 GiB'])
     await h.watchdog.stop()
   })
 
   test.each([
-    ['the host working set', { host: () => host(41) }, HOST_OVER],
+    ['the host non-reclaimable memory', { host: () => host(41) }, HOST_OVER],
     ["Chrome's PSS", { chrome: () => chrome(4.5) }, "Chrome's process tree PSS 4.5 GiB (6 processes) is over the 4.0 GiB limit"],
   ] as Array<[string, Partial<WatchdogSources>, string]>)('%s over its limit stops the run at once, never waiting on a docker stats that hangs (not read once stopped)', async (_what, overrides, reason) => {
     let containerReads = 0
@@ -359,7 +411,7 @@ describe('MemoryWatchdog', () => {
     expect(report.peaks.containerMem).toBeUndefined()
     expect(report.lines).toEqual([
       '3 samples every 30 s, 1 with a failed reading',
-      `host working set peak 20.0 GiB at ${at(30)} (limit 40.0 GiB; memory.max 64.0 GiB)`,
+      `host non-reclaimable memory peak 20.0 GiB at ${at(30)} (limit 40.0 GiB; memory.max 64.0 GiB)`,
       `host memory.current peak 22.0 GiB at ${at(30)}`,
       'container memory peak not read, PIDs peak not read',
       `Chrome tree PSS peak 2.0 GiB at ${at(60)} (limit 4.0 GiB), processes peak 9 at ${at(60)}, rss fallback peak 0 at ${at(0)}`,

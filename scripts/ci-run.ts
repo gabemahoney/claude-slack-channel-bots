@@ -49,6 +49,8 @@
 import { acquireCodexLogin, realCodexLoginDeps, isCodexScript, assertNoCodexLoginContainers, codexLoginContainerListArgs, CODEX_LOGIN_CONTAINER_LABEL, CODEX_LOGIN_LOCK_WAIT_MS, CODEX_LOGIN_TARGET, CODEX_EXTRA_MEMORY_BYTES, CODEX_HOST_CONFIG_KEYS_ENV, decodeCodexHostConfigKeys, type CodexLoginDeps, type CodexLoginLease } from './codex-login.ts'
 export { CODEX_LOGIN_SCRIPTS, CODEX_LOGIN_LOCK_WAIT_MS } from './codex-login.ts'
 import { isDockerInspectCommand, safeDockerInspect } from './safe-docker-inspect.ts'
+import { nonReclaimableMemoryBytes, type NonReclaimableMemoryReading } from './non-reclaimable-memory.ts'
+export { nonReclaimableMemoryBytes } from './non-reclaimable-memory.ts'
 import { randomBytes as cryptoRandomBytes } from 'node:crypto'
 import { readFileSync, readlinkSync, realpathSync, statfsSync, writeSync } from 'node:fs'
 import { constants as osConstants } from 'node:os'
@@ -1291,15 +1293,9 @@ export type Unreadable = typeof UNREADABLE_READING
 export type Reading<T> = T | Unreadable
 
 /** W with its parts (`workingSet`). */
-export interface WorkingSetReading {
+export interface WorkingSetReading extends NonReclaimableMemoryReading {
   readonly bytes: number
-  readonly anonBytes: number
   readonly activeFileBytes: number
-  /** Gate-only counters; omitted from the version 1 results diagnostics. */
-  readonly shmemBytes?: number
-  readonly activeAnonBytes?: number
-  readonly inactiveAnonBytes?: number
-  readonly unevictableBytes?: number
 }
 
 /** One active `/ci-live` run as admission or a sample saw it. */
@@ -7399,21 +7395,6 @@ export function readPodMemory(deps: Pick<RunnerDeps, 'readCgroupFile'>): Reading
 /** W's rest: W minus anon and active page cache, never below 0. */
 export function workingSetRestBytes(reading: WorkingSetReading): number {
   return Math.max(0, reading.bytes - reading.anonBytes - reading.activeFileBytes)
-}
-
-/**
- * Memory counted by admission and the watchdog, excluding reclaimable file
- * cache. anon and shmem are separate type counters. shmem is on the anon LRU
- * lists; locked anon/shmem move to the unevictable list, so adding unevictable
- * to the type counters would count those pages twice. The disjoint anon and
- * unevictable lists account for locked file pages too. Take the larger of
- * that sum and anon + shmem because type and LRU counters can differ.
- * Legacy diagnostics have only anon; production reads all four extra keys.
- */
-export function nonReclaimableMemoryBytes(reading: WorkingSetReading): number {
-  const anonAndShmem = reading.anonBytes + (reading.shmemBytes ?? 0)
-  const anonAndUnevictableLists = (reading.activeAnonBytes ?? 0) + (reading.inactiveAnonBytes ?? 0) + (reading.unevictableBytes ?? 0)
-  return Math.max(anonAndShmem, anonAndUnevictableLists)
 }
 
 /** Throws unless `bytes` is a whole number of bytes, 0 or more. */
