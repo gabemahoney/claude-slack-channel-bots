@@ -107,6 +107,10 @@
  */
 
 import { AgentDirectorError } from 'agent-director'
+// The pinned client has no native ErrCantSend class. Its real
+// ErrUnknownErrorName envelope is handled only in ad-error-class.ts;
+// adopt a named native re-export when the matching client is installed.
+export type { CantSendDetails, NotPausableCause } from './ad-busy-send-types.ts'
 
 /**
  * `errName` of CSCB's own `ErrSpawnCapReached`. The spawn-failure notice's

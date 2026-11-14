@@ -9,6 +9,7 @@ import { classifyAdError, isAdErrorInstance, classifyWithInvalidFlagsRecheck, ty
 import { ErrInvalidFlags, ErrSpawnNotFound, ErrSpawnNotInteractive, ErrSendKeysWhileRelayed, ErrRelayFallenBack, ErrDialogMaybeOpen, ErrPaneChanged, ErrSystemInstallDisappeared } from './agent-director-errors.ts'
 import { ENTER_DELAY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS, DELIVERY_MAX_AD_CALLS_PER_S, DELIVERY_ROW_POLL_MS } from './delivery-constants.ts'
 import type { DeliveryAgent } from './delivery-receipt.ts'
+import { createCoveredDelivery, isCoveredRow, hasUnresolvedCoveredCustody, type CoveredClient } from './covered-delivery.ts'
 
 export * from './delivery-policy.ts'
 export { createDeliveryLifecycle, NOT_NOW_RETRY_MS } from './delivery-lifecycle.ts'
@@ -38,7 +39,7 @@ export type DeliveryEngineEvent =
   | { type: 'first-unconfirmed-retype'; key: string; seq: number; part: number; count: number; partialReceipt?: PartialReceiptEvidence }
   | { type: 'waiting'; key: string; seq: number; reason: DeliveryReason; ageMs: number; status?: DeliveryStatus }
   | { type: 'marker-missing'; key: string }
-export type DeliveryClient = Pick<Client, 'get' | 'sendKeys'>
+export type DeliveryClient = Pick<Client, 'get' | 'sendKeys'> & CoveredClient
 export interface DeliveryEngineDeps {
   queue: DeliveryQueue; lifecycle: DeliveryLifecycle
   clientFor(key: string): Promise<DeliveryClient>
@@ -55,6 +56,7 @@ export interface DeliveryEngineDeps {
   refreshTranscript?(key: string, client: DeliveryClient, beforeCall: () => void): Promise<boolean>
   onReadError?(key: string, error: unknown, verb: 'get'): Promise<void>
   onError?(key: string, error: unknown): void
+  onCoveredBlocked?(key: string, reason: string): void
   onEvent?(event: DeliveryEngineEvent): void
   onKeyError?(key: string, error: unknown, row: GetResult): Promise<void>
   isRestartPendingOrActive(key: string): boolean
@@ -107,6 +109,10 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     relaunch: boolean; restarted?: boolean; gone?: { row: GetResult; handedOff?: boolean }; receiptWorking: boolean; pollAfter: number; snapshot?: DeliveryPolicyKnowledge; lastRetypeEvent?: number; dialogHold: boolean; dialogMaybeOpen: boolean; recoveringReconnect?: boolean
   }
   const states = new Map<string, State>(), budgets = new Map<string, () => void>()
+  const covered = createCoveredDelivery({ queue: deps.queue, now: clock.now,
+    log: (key, reason) => deps.onError?.(key, new Error(reason)),
+    notify: deps.onCoveredBlocked,
+  })
   let stopped = false
   const typed = new Set<string>()
   const reportedPartials = new Set<string>()
@@ -278,6 +284,9 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   }
   async function observe(key: string, s: State, head: QueueItem, part: number, force = false): Promise<boolean> {
     if (!await readRow(key, s, force) || !s.row) return false
+    // A fresh capability observation dispatches before any legacy transcript
+    // receipt or retype can settle a covered submission.
+    if (isCoveredRow(s.row) || hasUnresolvedCoveredCustody(head)) return false
     const persona = deps.persona(key)
     const agentOf = (row: GetResult): DeliveryAgent => row.agent === 'codex' ? 'codex' : persona?.agent ?? 'claude'
     let row = s.row
@@ -377,6 +386,35 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       // A concurrent local hold may have delayed the GONE handoff. This
       // engine retains it only for the launch whose key call failed.
       await refreshGone(key, s, s.recoveringReconnect)
+      const coveredHead = deps.queue.items(key).find(item => !item.delivered)
+      if (coveredHead && !s.pending) {
+        if (!deps.isUp(key) || deps.isLatched(key) || deps.isHeld(key) || deps.queue.isWritable?.(key) === false) return
+        if (!await readRow(key, s) || !s.row) { release(s); return }
+        if (isCoveredRow(s.row) || hasUnresolvedCoveredCustody(coveredHead)) {
+          if (!coveredHead.fixed) { await deps.prepare(key, coveredHead); return }
+          const part = coveredHead.fixed.parts.findIndex((_, i) => !coveredHead.records.some(r => r.kind === 'delivered' && r.part === i + 1)) + 1
+          s.e.target = [coveredHead.accepted.seq, part]
+          if (life.owner(key) === 'free') s.lease = life.acquire(key, 'delivery')
+          let coveredAction: Awaited<ReturnType<typeof covered.step>>
+          try {
+            coveredAction = await covered.step({ key, item: coveredHead, row: s.row, part,
+              client: () => deps.clientFor(key),
+              readRow: async () => await readRow(key, s, true) ? s.row : undefined,
+              ready: () => !stopped && !s.stopped && life.active(key) && life.owner(key) === 'delivery' && deps.isUp(key) && !deps.isLatched(key) && !deps.isHeld(key) && deps.isConnected(key) && s.row?.labels?.tag_prompt === '1' && s.row.relay_mode === 'on' && !['ended', 'missing', 'pending'].includes(s.row.state),
+              call: (verb, run) => ad(key, s, verb, run),
+              delivered: () => {
+                emit({ type: 'delivered', key, seq: coveredHead.accepted.seq, part })
+                const item = deps.queue.item(key, coveredHead.accepted.seq)
+                if (item?.delivered) emit({ type: 'item-delivered', key, seq: item.accepted.seq, at: clock.now(), waitMs: Math.max(0, clock.now() - item.accepted.received_at) })
+              },
+            })
+          } finally { release(s); s.e.phase = 'ready' }
+          if (coveredAction !== 'legacy') {
+            if (!deps.isConnected(key) && life.deferred(key)?.due && !s.recoveringReconnect) await life.retryReconnect(key)
+            wait(key, s, coveredAction === 'blocked' ? 'held' : 'receipt'); return
+          }
+        }
+      }
       // Finish our own append/call continuations without replacing the key
       // reading. Every new operation obtains a fresh row and gate grant.
       for (let turns = 0; turns < 40 && !stopped && !s.stopped; turns++) {
@@ -483,6 +521,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         }
         if (action === 'typeText') {
           if (!await revalidateKeys(key, s)) break
+          if (isCoveredRow(s.row!)) { release(s); s.e.phase = 'ready'; break }
           try {
             const params: SendKeysParams = { instance_id: deps.instanceId(key), text: head!.fixed!.parts[part - 1], no_enter: true }
             await ad(key, s, 'send-keys', client => client.sendKeys(params))
@@ -495,6 +534,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         }
         if (action === 'pressEnter') {
           if (!await revalidateKeys(key, s)) break
+          if (isCoveredRow(s.row!)) { release(s); s.e.phase = 'ready'; break }
           const recovery = s.e.phase === 'recovery-enter'
           try {
             await ad(key, s, 'send-keys', client => client.sendKeys({ instance_id: deps.instanceId(key), key: 'Enter' }))
@@ -600,7 +640,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       try { await api.tick(key) } finally { s.recoveringReconnect = false }
       return reconciled()
     },
-    async forget(key) { const s = states.get(key); if (!s) { life.forget(key); return }; s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); await s.busy; states.delete(key); life.engineRunning(key, false); life.forget(key) },
+    async forget(key) { covered.forget(key); const s = states.get(key); if (!s) { life.forget(key); return }; s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); await s.busy; states.delete(key); life.engineRunning(key, false); life.forget(key) },
     async stop() { stopped = true; const stoppingLife = life.stop(); for (const [key, s] of states) { s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); life.engineRunning(key, false) }; await Promise.allSettled([...states.values()].flatMap(s => s.busy ? [s.busy] : [])); await stoppingLife; states.clear() },
     running: key => states.has(key),
     snapshot: key => states.get(key)?.snapshot,

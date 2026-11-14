@@ -524,3 +524,71 @@ describe('AD row reply reminders', () => {
     expect(resumed.prepared).toEqual([])
   })
 })
+
+describe('b.r6d regression: covered turn-start reminders', () => {
+  test.each([undefined, 1, 2])('awaiting_turn_start=%s never treats waiting as a completed turn', async pending => {
+    const q = await open(), h = harness(q)
+    await send(q)
+    await h.monitor.observe('alpha', h.row('working', { busy_send: 'covered', delivery: { awaiting_turn_start: 0 } }))
+    await h.monitor.observe('alpha', h.row('waiting', { busy_send: 'covered', delivery: pending === undefined ? undefined : { awaiting_turn_start: pending } }))
+    expect(nudges(q)).toEqual([])
+    expect(h.prepared).toEqual([])
+    // Consuming the pending input exposes the retained working → waiting edge.
+    await h.monitor.observe('alpha', h.row('waiting', { busy_send: 'covered', delivery: { awaiting_turn_start: 0 } }))
+    expect(nudges(q)).toHaveLength(1)
+    expect(h.prepared).toHaveLength(1)
+    expect(nudges(q)[0]!.accepted.item_id).toMatch(/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/)
+  })
+
+  test('unknown turn-start facts do not invent a working observation', async () => {
+    const q = await open(), h = harness(q)
+    await send(q)
+    await h.monitor.observe('alpha', h.row('working', { busy_send: 'covered' }))
+    await h.monitor.observe('alpha', h.row('waiting', { busy_send: 'covered', delivery: { awaiting_turn_start: 0 } }))
+    expect(nudges(q)).toEqual([])
+    await h.monitor.observe('alpha', h.row('working', { busy_send: 'covered', delivery: { awaiting_turn_start: 0 } }))
+    await h.monitor.observe('alpha', h.row('waiting', { busy_send: 'covered', delivery: { awaiting_turn_start: 0 } }))
+    expect(nudges(q)).toHaveLength(1)
+  })
+
+  test.each([undefined, 'not_covered'] as const)('legacy coverage=%s still needs no turn-start field', async busy_send => {
+    const q = await open(), h = harness(q)
+    await send(q)
+    await h.monitor.observe('alpha', h.row('working', { busy_send }))
+    await h.monitor.observe('alpha', h.row('waiting', { busy_send }))
+    expect(nudges(q)).toHaveLength(1)
+  })
+})
+
+describe('b.r6d regression: covered handover reminder candidates', () => {
+  async function submit(q: ReplyReminderQueue) {
+    const accepted = await q.accept('alpha', slackInput())
+    if (accepted.status !== 'accepted') throw new Error('fixture acceptance failed')
+    const seq = accepted.seq
+    await q.append('alpha', { v: 1, kind: 'fixed', seq, parts: ['original'] })
+    await q.append('alpha', { v: 1, kind: 'submitted', seq, part: 1, attempt: 1, at: 1000,
+      caller_uuid: q.callerUuid!(), delivery_request_id: 'cscb/alpha/reminder/1', instance_id: 'cscb_alpha', launch_token: 'launch-a', session_id: 'session-before-resume' })
+    return seq
+  }
+  test('Final handover uses AD session binding and wakes one reminder after Turn Start consumption', async () => {
+    const q = await open(), h = harness(q), seq = await submit(q)
+    await q.append('alpha', { ...deliveredRecord(seq), ad: { launch_token: 'launch-b', session_id: 'session', evidence_kind: null } })
+    expect(q.replyReminderItems('alpha')).toContainEqual(expect.objectContaining({ seq, session_id: 'session', delivery_attempts: [1] }))
+    await q.compact('alpha')
+    await h.monitor.observe('alpha', h.row('working', { busy_send: 'covered', delivery: { awaiting_turn_start: 0 } }))
+    await h.monitor.observe('alpha', h.row('waiting', { busy_send: 'covered', delivery: { awaiting_turn_start: 1 } }))
+    expect(nudges(q)).toEqual([])
+    await h.monitor.observe('alpha', h.row('waiting', { busy_send: 'covered', delivery: { awaiting_turn_start: 0 } }))
+    expect(nudges(q)).toHaveLength(1); expect(h.prepared).toHaveLength(1)
+  })
+  test('a reply before covered Final settles only its submitted attempt', async () => {
+    const q = await open(), h = harness(q), seq = await submit(q)
+    expect(q.replyCallTargets('alpha')).toEqual([{ seq, attempts: [1] }])
+    await h.monitor.noteReplyCall('alpha')
+    await q.append('alpha', { ...deliveredRecord(seq), ad: { launch_token: 'launch-a', session_id: 'session', evidence_kind: null } })
+    await h.monitor.observe('alpha', h.row('working', { busy_send: 'covered', delivery: { awaiting_turn_start: 0 } }))
+    await h.monitor.observe('alpha', h.row('waiting', { busy_send: 'covered', delivery: { awaiting_turn_start: 0 } }))
+    expect(nudges(q)).toEqual([])
+    expect(q.replyReminderItems('alpha')).toEqual([])
+  })
+})

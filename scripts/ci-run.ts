@@ -858,6 +858,8 @@ export const RAW_KEY_PREFIX = 'sk-ant-'
 
 /** A `/ci` invocation, parsed. */
 export interface Invocation {
+  /** Local AD binary/client overlay; absent on ordinary release runs. */
+  readonly adCandidateDist?: string
   /** Continue independent scripts only after verified cleanup. Absent on legacy callers means false. */
   readonly keepGoing?: boolean
   /** The `/ci` arguments as given. */
@@ -1766,7 +1768,7 @@ export interface ArgumentFailure {
 const SHARDS_OPTION = '--shards'
 const SHARD_TIMEOUT_OPTION = '--shard-timeout'
 const INJECT_OPTION = '--inject'
-const OPTION_NAMES: readonly string[] = [SHARDS_OPTION, SHARD_TIMEOUT_OPTION, INJECT_OPTION]
+const OPTION_NAMES: readonly string[] = [SHARDS_OPTION, SHARD_TIMEOUT_OPTION, INJECT_OPTION, '--ad-candidate-dist']
 
 /** A control character, which an argument shown in a one-line reason must not carry raw. */
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/
@@ -2026,6 +2028,7 @@ export function parseCiArguments(args: readonly string[]): ArgumentParse {
   let shardsSeen = false
   let shardTimeoutSeen = false
   let keepGoing = false
+  let adCandidateDist: string | undefined
   for (let position = 0; position < args.length; position++) {
     const arg = args[position] as string
     if (arg === '--keep-going') {
@@ -2054,6 +2057,12 @@ export function parseCiArguments(args: readonly string[]): ArgumentParse {
     const optionPosition = position
     position++
     const value = args[position] as string
+    if (arg === '--ad-candidate-dist') {
+      if (adCandidateDist !== undefined) failures.push({ position: optionPosition, reason: '--ad-candidate-dist is repeated' })
+      else if (!isAbsolute(value) || /[\x00-\x1f\x7f]/.test(value)) failures.push({ position: optionPosition, reason: '--ad-candidate-dist needs an absolute directory path' })
+      else adCandidateDist = value
+      continue
+    }
     if (arg === INJECT_OPTION) {
       const parsed = parseFault(value)
       if (parsed.ok) given.push({ position: optionPosition, value, fault: parsed.fault })
@@ -2083,6 +2092,7 @@ export function parseCiArguments(args: readonly string[]): ArgumentParse {
     ok: true,
     invocation: {
       keepGoing,
+      ...(adCandidateDist === undefined ? {} : { adCandidateDist }),
       args: [...args],
       scripts,
       shards,
@@ -2093,14 +2103,14 @@ export function parseCiArguments(args: readonly string[]): ArgumentParse {
   }
 }
 
-/** A full run: no SCRIPT argument (Terms). */
+/** An ordinary full run: no SCRIPT argument and no candidate overlay. */
 export function isFullRun(invocation: Invocation): boolean {
-  return invocation.scripts.length === 0
+  return invocation.scripts.length === 0 && !invocation.adCandidateDist
 }
 
-/** A selective run: at least one SCRIPT argument (Terms). */
+/** A non-gate selection: SCRIPT arguments or an explicit candidate overlay. */
 export function isSelectiveRun(invocation: Invocation): boolean {
-  return invocation.scripts.length > 0
+  return invocation.scripts.length > 0 || !!invocation.adCandidateDist
 }
 
 /** An injected run: at least one `--inject` (Terms). */
@@ -3675,6 +3685,7 @@ export type ContainerRunOutcome =
 
 /** The test-image build: a Dockerfile path, the worktree as context, labels and a run-private tag. */
 export interface TestImageBuildSpec {
+  readonly adCandidateDist?: string
   readonly dockerfilePath: string
   readonly contextDir: string
   readonly labels: DockerLabels
@@ -4349,6 +4360,7 @@ export function testImageBuildArgs(spec: TestImageBuildSpec): string[] {
     BUILD_PROGRESS_OPTION,
     '--file',
     dockerOperand(spec.dockerfilePath, 'Dockerfile path'),
+    ...(spec.adCandidateDist ? ['--build-context', `ad-candidate=${dockerOperand(spec.adCandidateDist, 'AD candidate dist')}`] : []),
     ...dockerLabelArguments(spec.labels),
     '--tag',
     runPrivateTagOperand(spec.tag),
@@ -5424,6 +5436,15 @@ export function validateRun(args: readonly string[], worktreeRoot: string, env: 
   const argumentsChecked = argumentStage(args)
   if (!argumentsChecked.ok) return refused(argumentsChecked.refusal)
   const invocation = argumentsChecked.invocation
+  if (invocation.adCandidateDist) {
+    for (const name of ['agent-director', 'client.tgz']) {
+      try {
+        if (!lstatSync(join(invocation.adCandidateDist, name)).isFile()) throw new Error('not a regular file')
+      } catch {
+        return refused(buildRefusal(null, `AD candidate dist requires a readable regular ${name}`))
+      }
+    }
+  }
 
   const entries = readDiscoveryEntries(worktreeRoot)
   if (!entries.ok) return refused(buildRefusal(null, entries.error))
@@ -10461,6 +10482,7 @@ const FAULT_IMAGE_FAULT_KINDS: Readonly<Record<FaultLabelValue, FaultKind>> = { 
 
 /** What image preparation's image steps act through. */
 export interface RunImagesContext {
+  readonly adCandidateDist?: string
   /** The docker context; its `cwd` is the worktree root, the test build's context, against which `TEST_DOCKERFILE_PATH` is read. */
   readonly docker: DockerContext
   /** `RunnerDeps.sendSignal`: each build's `end()` signals its group through it. */
@@ -10568,7 +10590,9 @@ export async function buildTestImage(context: RunImagesContext, state: RunState)
   const build = startTestImageBuild(
     docker,
     sendSignal,
-    { dockerfilePath: TEST_DOCKERFILE_PATH, contextDir: docker.cwd, labels: { [OWNER_LABEL]: formatOwner(owner) }, tag: formatRunTag(owner, 'test') },
+    { dockerfilePath: context.adCandidateDist ? 'docker/Dockerfile.test.candidate' : TEST_DOCKERFILE_PATH,
+      adCandidateDist: context.adCandidateDist, contextDir: docker.cwd,
+      labels: { [OWNER_LABEL]: formatOwner(owner) }, tag: formatRunTag(owner, 'test') },
     log,
   )
   const end = await awaitRoleBuild(state, 'test', build)
@@ -16187,7 +16211,8 @@ async function runCodexTrack(seq: RunSequence, pinnedId: string, tarballPath: st
 
 /** image preparation's image steps' context. */
 function runImagesContextOf(seq: RunSequence): RunImagesContext {
-  return { docker: seq.docker, sendSignal: seq.deps.sendSignal, owner: seq.owner, clock: seq.deps.clock, log: seq.say }
+  return { docker: seq.docker, sendSignal: seq.deps.sendSignal, owner: seq.owner, clock: seq.deps.clock, log: seq.say,
+    adCandidateDist: seq.validated.invocation.adCandidateDist }
 }
 
 /**

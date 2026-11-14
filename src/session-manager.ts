@@ -412,6 +412,7 @@ import { ENTER_DELAY_MS } from './delivery-constants.ts'
 import { REPLY_TOOL_PREALLOWED_LABEL } from './reply-reminder.ts'
 import type { DeliveryLifecycle, ReconnectInput } from './delivery-lifecycle.ts'
 import { deliveryTextWasRefused } from './delivery-engine.ts'
+import { createCoveredReconnect, isCoveredRow, buildCoveredRestartNotice } from './covered-delivery.ts'
 import { decideGate, createDeliveryPolicyState, type DeliveryReading } from './delivery-policy.ts'
 import type {
   Client,
@@ -2855,6 +2856,7 @@ export async function handleDeliveryReadError(key: string, error: unknown, verb:
 
 /** Apply own-row rules and record upgrade provenance from a fresh delivery-client reading. */
 export function applyDeliveryOwnRowRead(key: string, row: GetResult): boolean {
+  busySendNoticeCoverage.set(key, isCoveredRow(row))
   const at = { site: 'delivery engine', what: 'get' }
   endKillFailureEpisodeOnRead(key, { state: row.state })
   endStuckLaunchEpisodeOnRead(key, row.state)
@@ -2925,6 +2927,7 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
   }
   // a row that settles after the caller stopped is not acted on.
   if (!ownRowActGoes(key, at)) return { kind: OWN_ROW_READ_ROW, row, latched: false }
+  busySendNoticeCoverage.set(key, isCoveredRow(row))
   // a row read `ended` or `missing` ends the kill-failure episode.
   endKillFailureEpisodeOnRead(key, { state: row.state })
   // a row read live out of `pending` ends the stuck-launch episode.
@@ -3381,9 +3384,13 @@ function latchOnConflict(key: string, err: unknown, operation: RefusedOperation,
 }
 
 
-export type NotConnectedNotice =
+export type NotConnectedNotice = (
   | { reason: 'blocked-on-prompt'; autoRestartDisabled: boolean }
-  | { reason: 'auto-restart-disabled'; cause: string }
+  | { reason: 'auto-restart-disabled'; cause: string }) & { covered?: boolean }
+
+// Notice wording only. Sending/reconnect always reads capability fresh.
+const busySendNoticeCoverage = new Map<string, boolean>()
+const reconnectCovered = createCoveredReconnect()
 
 /**
  * Personas whose not-connected notice was raised in the current episode
@@ -3404,7 +3411,7 @@ export function notifyPersonaNotConnected(key: string, notice: NotConnectedNotic
   if (notConnectedNoticeRaised.has(key)) return false
   notConnectedNoticeRaised.add(key)
   console.error(`[slack] session-manager: ${keyRef(key)} is not connected (${notice.reason}) — raising a not-connected notice`)
-  sendPersonaNotice(key, buildNotConnectedNotice(key, notice))
+  sendPersonaNotice(key, buildNotConnectedNotice(key, { ...notice, covered: notice.covered ?? busySendNoticeCoverage.get(key) ?? false }, configuredPersonaForDelivery(key)?.name))
   return true
 }
 
@@ -3423,6 +3430,8 @@ export function notifyDisconnectedWithAutoRestartDisabled(key: string): void {
 export function hasNotConnectedEpisode(key: string): boolean { return notConnectedNoticeRaised.has(key) }
 
 export function forgetNotConnectedEpisode(key: string): void {
+  busySendNoticeCoverage.delete(key)
+  reconnectCovered.forget(key)
   notConnectedNoticeRaised.delete(key)
   promptRowDeferredSince.delete(key)
   nonLatchingNoteLogged.delete(key)
@@ -3430,7 +3439,14 @@ export function forgetNotConnectedEpisode(key: string): void {
 
 /** Test-only seam: end every persona's not-connected episode (notice latches, deferral runs and logged liveness notes). */
 export function _resetNotConnectedEpisodes(): void {
+  clearNotConnectedEpisodes()
+}
+
+/** Shutdown and test reset: retire every notice/reconnect episode. */
+export function clearNotConnectedEpisodes(): void {
   notConnectedNoticeRaised.clear()
+  busySendNoticeCoverage.clear()
+  reconnectCovered.clear()
   promptRowDeferredSince.clear()
   nonLatchingNoteLogged.clear()
 }
@@ -3446,7 +3462,8 @@ export function _resetNotConnectedEpisodes(): void {
  * `slack_bot_dev`) once the persona's own is gone. Pure; exported for the
  * notice catalogue.
  */
-export function buildNotConnectedNotice(key: string, notice: NotConnectedNotice): string {
+export function buildNotConnectedNotice(key: string, notice: NotConnectedNotice, name?: string): string {
+  if (notice.covered) return buildCoveredRestartNotice({ key, name })
   const attach = `\`tmux attach -t ${tmuxExactSessionTarget(personaTmuxSessionName(key))}\``
   const reconnect = `\`/mcp reconnect ${MCP_SERVER_NAME}\``
   if (notice.reason === 'blocked-on-prompt') {
@@ -3730,6 +3747,7 @@ export async function reconnectMcpWithCause(
   if (read.kind === OWN_ROW_READ_ABSENT) { clearInput(); life?.clearDeferred(key); return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_ABSENT } }
   if (read.kind !== OWN_ROW_READ_ROW || read.latched) return defer()
   const row = read.row
+  busySendNoticeCoverage.set(key, isCoveredRow(row))
   const priorInput = getInput()
   if (priorInput && (priorInput.session !== row.session_id || priorInput.launchStartedAt !== row.launch_started_at)) clearInput()
   if (noteTagPromptReading(key, row) && !AGENT_DIRECTOR_DEAD_STATES.has(row.state)) {
@@ -3738,6 +3756,41 @@ export async function reconnectMcpWithCause(
   }
   if (life && !await life.recoverBeforeReconnect(key)) return defer()
   if (AGENT_DIRECTOR_DEAD_STATES.has(row.state)) { clearInput(); life?.clearDeferred(key); return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE } }
+  if (isCoveredRow(row)) {
+    clearInput()
+    let release = life?.acquire(key, 'reconnect'), coveredState = row.state
+    if (life && !release) return defer()
+    try {
+      const answer = await reconnectCovered({ key, row,
+        ready: () => !personaLatchedNow(key) && !isOwnRowOldLifeHeld(key) && heldGateReadingOf(key) === undefined && !waitsOnKillFailedHold(key) && (!life || (life.active(key) && (life.owner(key) === 'reconnect' || (life.owner(key) === 'free' && AGENT_DIRECTOR_DEAD_STATES.has(coveredState))))),
+        readRow: async () => {
+          const fresh = await readPersonaOwnRow(key, { site: 'reconnect', what: 'covered reconnect' })
+          if (fresh.kind !== OWN_ROW_READ_ROW || fresh.latched) return undefined
+          coveredState = fresh.row.state
+          return fresh.row
+        },
+        pause: () => withOutageDetection(key, undefined, 'pause', client => client.pause({ instance_id: personaInstanceId(key), only_if_waiting: true })),
+        resume: () => {
+          // AD's observed end releases the old lease. Reacquire it before
+          // resume and use the existing tracked launch/outage boundary.
+          if (life?.owner(key) === 'free') release = life.acquire(key, 'reconnect')
+          if (life && !release) throw new Error('Covered reconnect lost lifecycle ownership')
+          return launchCallWithWindow(key, row.cwd, 'resume', client => client.resume({ instance_id: personaInstanceId(key) }))
+        },
+        log: reason => console.error(`[slack] reconnect persona=${key}: ${reason}`),
+        notify: () => { notifyPersonaNotConnected(key, { reason: 'auto-restart-disabled', cause: 'covered reconnect unavailable', covered: true }) },
+      })
+      if (answer === 'ok') { life?.clearDeferred(key); return { outcome: 'ok' } }
+      // Fail safe before E6: no deferred retry timer or malformed pause loop.
+      if (answer === 'restart-required') { life?.clearDeferred(key); return { outcome: 'transient' } }
+      return defer()
+    } catch (error) {
+      // Covered errors never count as death evidence. A subsequent row read
+      // alone permits the caller's existing recovery policy to run.
+      console.error(`[slack] covered reconnect persona=${key}: ${describeAdFailureForLog(error)}`)
+      return defer()
+    } finally { release?.() }
+  }
   if (row.state !== 'waiting' || row.relay_mode !== 'on') return defer()
   const reading: DeliveryReading = { row: row.state, relay: true, marker: row.labels?.tag_prompt === '1', mcp: false, up: true, latched: personaLatchedNow(key), held: isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key), readable: true, receipts: [], relaunch: false, session: row.session_id, gate: life?.owner(key) ?? 'free', offset: 0, records: [] }
   const gateChoice = decideGate({ p: { accepted: [], fixed: [], sent: [], refused: [], delivered: [] }, e: createDeliveryPolicyState(), r: reading, g: { owner: life?.owner(key) ?? 'free', stage: 'none', deferred: true, due: true }, writer: { kind: 'none' }, compact: 'none' })
@@ -3748,6 +3801,7 @@ export async function reconnectMcpWithCause(
   try {
     const textRow = await readPersonaOwnRow(key, { site: 'reconnect', what: 'before text' })
     if (textRow.kind !== OWN_ROW_READ_ROW || textRow.latched || textRow.row.labels?.tag_prompt !== '1' || textRow.row.relay_mode !== 'on' ||
+        isCoveredRow(textRow.row) ||
         textRow.row.session_id !== row.session_id || textRow.row.launch_started_at !== row.launch_started_at ||
         textRow.row.state !== 'waiting' || personaLatchedNow(key) ||
         isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key) ||
@@ -3771,6 +3825,7 @@ export async function reconnectMcpWithCause(
     // the final read is awaited; a teardown, shutdown or
     // concurrent latch/hold during it must still prevent the control key.
     if (enterRow.kind !== OWN_ROW_READ_ROW || enterRow.latched || enterRow.row.labels?.tag_prompt !== '1' || enterRow.row.relay_mode !== 'on' ||
+        isCoveredRow(enterRow.row) ||
         enterRow.row.session_id !== row.session_id || enterRow.row.launch_started_at !== row.launch_started_at ||
         enterRow.row.state !== 'waiting' || personaLatchedNow(key) ||
         isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key) ||

@@ -1,8 +1,18 @@
 # agent-director
 
-CSCB requires agent-director CLI 0.12.0 or later and pins its TypeScript client to `agent-director@0.12.0`. Workers require Claude Code 2.1.280 or later. Upgrade the CLI with its released installer before upgrading CSCB; see [Migration](migration.md#migration).
+CSCB requires agent-director CLI 0.12.0 or later and pins its TypeScript client to `agent-director@0.12.0`. Covered busy-send instances have additional compatibility limits below. Workers require Claude Code 2.1.280 or later. Upgrade the CLI with its released installer before upgrading CSCB; see [Migration](migration.md#migration).
 
 CSCB runs every bot through [agent-director](https://github.com/gabemahoney/agent-director), installed system-wide. This page covers checking that install, the `install-cscb` skill that walks you through a failed check, and the agent-director settings CSCB reads.
+
+## Delivery and reconnect compatibility
+
+CSCB chooses delivery per persona from agent-director's `get` result. Instances with `busy_send` absent or `not_covered` support delivery and automatic reconnect with the pinned client. Covered instances require a matching busy-send client; the bundled `agent-director@0.12.0` cannot deliver to them, so CSCB keeps their messages queued. A successful install check does not establish covered-delivery support.
+
+Automatic reconnect is unavailable for covered instances in this build. Follow the persona-restart notice; an unknown delivery outcome does not authorize resending. See [A persona's instance runs but isn't connected](../skills/debug-slack-channel-bots/SKILL.md#a-personas-instance-runs-but-isnt-connected) and [Covered delivery is held or unconfirmed](../skills/debug-slack-channel-bots/SKILL.md#covered-delivery-is-held-or-unconfirmed).
+
+Once a release with the new queue record kinds (`submitted` and `submission-blocked`) has run, going back to an older CSCB is unsupported. There is no queue migration or replay command.
+
+---
 
 ## Checking your agent-director install
 

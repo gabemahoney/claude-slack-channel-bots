@@ -1038,3 +1038,172 @@ test('startup findings remain available to a notifier installed after queue star
   expect(fs.readFileSync(path, 'utf8')).toBe(damaged)
   expect(q.items('alpha').map(item => item.accepted.seq)).toEqual([1, 3])
 })
+
+// b.r6d: persisted AD custody and caller identity, never inferred replay safety.
+import type { SubmittedRecord } from '../src/delivery-queue.ts'
+const submittedRecord = (overrides: Partial<SubmittedRecord> = {}): SubmittedRecord => ({
+  v: 1, kind: 'submitted', seq: 1, attempt: 1, part: 1, at: 1000,
+  caller_uuid: '4a3f1860-d64c-4e91-bd42-e64cd2be3faf', delivery_request_id: 'cscb/alpha/item/1',
+  instance_id: 'cscb_alpha', launch_token: 'launch-a', session_id: 'session', ...overrides,
+})
+
+describe('b.r6d regression: durable covered queue', () => {
+  test.each(['partial-write', 'temp-sync', 'orphan-temp'] as const)('b.r6d C4 %s cannot poison the published caller identity', async boundary => {
+    const path = join(dir, 'queue', 'caller-uuid'), paths = new Map<number, string>()
+    let failing = true, writes = 0
+    const seam = { ...fs,
+      openSync(...args: Parameters<typeof fs.openSync>) { const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd },
+      writeSync(fd: number, bytes: Uint8Array, offset: number, length: number) {
+        if (failing && boundary !== 'temp-sync' && paths.get(fd)?.includes('caller-uuid')) {
+          if (writes++ === 0) return fs.writeSync(fd, bytes, offset, 4)
+          throw new Error('partial caller write')
+        }
+        return fs.writeSync(fd, bytes, offset, length)
+      },
+      fsyncSync(fd: number) {
+        if (failing && boundary === 'temp-sync' && paths.get(fd)?.includes('caller-uuid')) throw new Error('caller temp sync')
+        fs.fsyncSync(fd)
+      },
+      unlinkSync(name: fs.PathLike) { if (failing && boundary === 'orphan-temp') throw new Error('simulated crash cleanup'); fs.unlinkSync(name) },
+    } as typeof fs
+    let q = await open({ fs: seam })
+    expect(() => q.callerUuid!()).toThrow()
+    expect(fs.existsSync(path)).toBe(false)
+    await q.stop(); failing = false
+    q = await open()
+    const id = q.callerUuid!()
+    expect(fs.readFileSync(path, 'utf8')).toBe(id + '\n')
+    expect(id).toMatch(/^[0-9a-f-]{36}$/)
+  })
+  test.each(['directory-sync', 'cleanup', 'competing-publisher'] as const)('b.r6d C4 %s preserves a complete published caller identity', async boundary => {
+    const path = join(dir, 'queue', 'caller-uuid'), paths = new Map<number, string>(), order: string[] = []
+    const winner = '11111111-2222-4333-8444-555555555555'
+    let failing = true
+    const seam = { ...fs,
+      openSync(...args: Parameters<typeof fs.openSync>) { const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd },
+      fsyncSync(fd: number) {
+        const name = paths.get(fd)!
+        order.push('sync:' + name)
+        if (failing && boundary === 'directory-sync' && name === join(dir, 'queue')) throw new Error('publication directory sync')
+        fs.fsyncSync(fd)
+      },
+      linkSync(from: fs.PathLike, target: fs.PathLike) {
+        order.push('publish')
+        expect(fs.statSync(from).mode & 0o777).toBe(QUEUE_FILE_MODE)
+        expect(order).toContain('sync:' + String(from))
+        if (boundary === 'competing-publisher') fs.writeFileSync(target, winner + '\n', { mode: QUEUE_FILE_MODE })
+        fs.linkSync(from, target)
+      },
+      unlinkSync(name: fs.PathLike) { if (failing && boundary === 'cleanup' && fs.existsSync(path)) throw new Error('publication cleanup'); fs.unlinkSync(name) },
+    } as typeof fs
+    const q = await open({ fs: seam })
+    if (boundary === 'competing-publisher') expect(q.callerUuid!()).toBe(winner)
+    else expect(() => q.callerUuid!()).toThrow()
+    const published = fs.readFileSync(path, 'utf8')
+    expect(published.trim()).toMatch(/^[0-9a-f-]{36}$/)
+    failing = false
+    expect(q.callerUuid!() + '\n').toBe(published)
+    expect(order).toContain('publish')
+    await q.stop()
+    const next = await open(); expect(next.callerUuid!() + '\n').toBe(published)
+  })
+  test.each(['submitted', 'submission-blocked'] as const)('%s replays and compacts without losing pair, FIFO or attempt allocation', async kind => {
+    const submitted = submittedRecord(), blocked = { v: 1 as const, kind: 'submission-blocked' as const, seq: 1, attempt: 1, at: 1001, reason: 'uncertain outcome' }
+    seedQueue(dir, [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['one', 'two'] }, submitted, ...(kind === 'submission-blocked' ? [blocked] : [])])
+    let q = await open()
+    for (const compact of [false, true]) {
+      if (compact) await q.compact('alpha')
+      const item = q.item('alpha', 1)!
+      expect(item.records).toContainEqual(submitted)
+      if (kind === 'submission-blocked') expect(item.records).toContainEqual(blocked)
+      expect(item.nextAttempt).toBe(2)
+      expect(item.delivered).toBe(false)
+      expect(q.openCount('alpha')).toBe(1)
+      await q.stop(); q = await open()
+    }
+  })
+
+  test.each(['caller_uuid', 'delivery_request_id', 'instance_id', 'launch_token', 'session_id', 'part', 'attempt'] as const)('damaged submitted %s becomes a durable block across two recoveries', async field => {
+    const damaged = { ...submittedRecord(), [field]: null }
+    const raw = JSON.stringify(damaged) + '\n'
+    seedQueue(dir, [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['message'] }, raw])
+    let q = await open()
+    expect(q.item('alpha', 1)!.records).toContainEqual(expect.objectContaining({ kind: 'submission-blocked', reason: expect.stringContaining('automatic resend forbidden') }))
+    const findings = q.startupFindings().filter(e => e.type === 'record-unreadable')
+    expect(findings).toHaveLength(1)
+    if (findings[0]!.type === 'record-unreadable') expect(fs.readFileSync(findings[0]!.quarantinePath, 'utf8')).toBe(raw)
+    await q.compact('alpha'); await q.stop(); q = await open()
+    expect(q.item('alpha', 1)!.records.some(r => r.kind === 'submission-blocked')).toBe(true)
+    expect(q.openCount('alpha')).toBe(1)
+    expect(q.startupFindings().filter(e => e.type === 'record-unreadable')).toEqual([])
+  })
+
+  test('accepted item UUID is unique and survives replay and compaction', async () => {
+    let q = await open()
+    const a = await q.accept('alpha', injectedInput()), b = await q.accept('alpha', injectedInput())
+    if (a.status !== 'accepted' || b.status !== 'accepted') throw new Error('fixture not accepted')
+    const id = a.item!.accepted.item_id
+    expect(id).toMatch(/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/)
+    expect(b.item!.accepted.item_id).not.toBe(id)
+    await q.compact('alpha'); await q.stop(); q = await open()
+    expect(q.item('alpha', a.seq)!.accepted.item_id).toBe(id)
+  })
+
+  test('one caller UUID is synced before use, private and shared across personas and queue restarts', async () => {
+    const sync = recordSyncs()
+    let q = await open({ fs: sync.fs }), id = q.callerUuid!()
+    const path = join(dir, 'queue', 'caller-uuid')
+    expect(id).toMatch(/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/)
+    expect(fs.readFileSync(path, 'utf8')).toBe(id + '\n')
+    expect(fs.statSync(path).mode & 0o777).toBe(QUEUE_FILE_MODE)
+    expect(sync.synced).toContain(path)
+    expect(sync.synced).toContain(join(dir, 'queue'))
+    await q.accept('alpha', injectedInput()); await q.accept('beta', injectedInput())
+    await q.compact(); await q.stop(); q = await open()
+    expect(q.callerUuid!()).toBe(id)
+  })
+
+  test.each(['open', 'file-sync', 'directory-sync', 'read', 'invalid'] as const)('caller UUID %s failure never substitutes a new volatile identity', async fault => {
+    const path = join(dir, 'queue', 'caller-uuid')
+    if (fault === 'invalid') { fs.mkdirSync(join(dir, 'queue')); fs.writeFileSync(path, 'broken identity\n') }
+    const touched = new Map<number, string>()
+    let fail = true
+    const seam = { ...fs,
+      openSync(...args: Parameters<typeof fs.openSync>) {
+        if (fail && fault === 'open' && String(args[0]) === path) throw new Error('EACCES caller')
+        const fd = fs.openSync(...args); touched.set(fd, String(args[0])); return fd
+      },
+      fsyncSync(fd: number) {
+        const selected = fault === 'file-sync' ? path : join(dir, 'queue')
+        if (fail && ['file-sync', 'directory-sync'].includes(fault) && touched.get(fd) === selected) throw new Error('EIO caller sync')
+        fs.fsyncSync(fd)
+      },
+      readFileSync(...args: Parameters<typeof fs.readFileSync>) {
+        if (fail && fault === 'read' && String(args[0]) === path) throw new Error('EIO caller read')
+        return fs.readFileSync(...args)
+      },
+    } as typeof fs
+    const q = await open({ fs: seam })
+    expect(() => q.callerUuid!()).toThrow()
+    const prior = fs.existsSync(path) ? fs.readFileSync(path, 'utf8') : undefined
+    fail = false
+    if (fault === 'invalid') {
+      expect(() => q.callerUuid!()).toThrow('Invalid durable AD caller UUID')
+      expect(fs.readFileSync(path, 'utf8')).toBe(prior!)
+    } else {
+      const id = q.callerUuid!()
+      expect(fs.readFileSync(path, 'utf8')).toBe(prior ?? id + '\n')
+      expect(q.callerUuid!()).toBe(id)
+    }
+  })
+
+  test('Final AD receipt metadata survives replay without retaining submitted custody after completed compaction', async () => {
+    seedQueue(dir, [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['message'] }, submittedRecord(),
+      { v: 1, kind: 'delivered', seq: 1, part: 1, at: 1002, receipt: { path: 'agent-director:get-delivery', uuid: 'cscb/alpha/item/1' }, ad: { launch_token: 'launch-a', session_id: 'session', evidence_kind: null } }])
+    const q = await open({ now: () => 1000 })
+    expect(q.openCount('alpha')).toBe(0)
+    expect(q.lookupSlackKey('alpha', slackInput().key!)).toMatchObject({ status: 'duplicate', seq: 1 })
+    await q.compact('alpha')
+    expect(readQueue(dir).some(r => r.kind === 'submitted')).toBe(false)
+  })
+})

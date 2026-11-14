@@ -2310,3 +2310,38 @@ describe('classifyAdError: pure', () => {
     expect(rig.resolveCalls).toHaveLength(0)
   })
 })
+
+import { errCantSend } from './test-helpers/agent-director-stub.ts'
+describe('b.r6d regression: structured busy-send errors', () => {
+  test.each(['fixture-envelope', 'direct-envelope'] as const)('%s pinned-client CantSend preserves machine facts and limit/result without description parsing', async form => {
+    const { cantSendDetailsOf } = await import('../src/ad-error-class.ts')
+    const facts = { class: 'cant_send' as const, reason: 'held_bytes', resend_safe: true, retry_with: 'new_send', limit: { actual: 101, allowed: 100 } }
+    const error = form === 'fixture-envelope' ? errCantSend(facts) : new ErrUnknownErrorName('ErrCantSend', { err_name: 'ErrCantSend', err_details: facts })
+    expect(error).toBeInstanceOf(ErrUnknownErrorName)
+    expect(cantSendDetailsOf(error)).toEqual(facts)
+  })
+  test.each([
+    { class: 'wrong', reason: 'held_count', resend_safe: true, retry_with: 'new_send' },
+    { class: 'cant_send', reason: null, resend_safe: true, retry_with: 'new_send' },
+    { class: 'cant_send', reason: 'held_count', resend_safe: 'true', retry_with: 'new_send' },
+    { class: 'cant_send', reason: 'held_count', resend_safe: true, retry_with: null },
+    null,
+  ])('malformed refusal facts %j remain uncertain', async err_details => {
+    const { cantSendDetailsOf } = await import('../src/ad-error-class.ts')
+    expect(cantSendDetailsOf(new ErrUnknownErrorName('ErrCantSend', { err_details }))).toBeUndefined()
+  })
+  test('a named object or English description grants no structured refusal authority', async () => {
+    const { cantSendDetailsOf, notPausableCauseOf } = await import('../src/ad-error-class.ts')
+    const details = { class: 'cant_send', reason: 'held_count', resend_safe: true, retry_with: 'new_send' }
+    expect(cantSendDetailsOf({ name: 'ErrCantSend', errDetails: details })).toBeUndefined()
+    expect(cantSendDetailsOf(new AgentDirectorError('send-keys', 'ErrCantSend', 'refused', details))).toBeUndefined()
+    expect(cantSendDetailsOf(new ErrUnknownErrorName('SomethingElse', { err_details: details }))).toBeUndefined()
+    expect(notPausableCauseOf(new Error('not_waiting'))).toBeUndefined()
+    expect(notPausableCauseOf({ name: 'ErrSpawnNotPausable', errDetails: { cause: 'turn_pending' } })).toBeUndefined()
+  })
+  test.each(['not_waiting', 'turn_pending', 'pause_in_progress', 'pause_uncertain', 'agent_not_covered'] as const)('conditional pause cause %s is class-checked', async cause => {
+    const { notPausableCauseOf } = await import('../src/ad-error-class.ts')
+    expect(notPausableCauseOf(errSpawnNotPausable('pause', cause))).toBe(cause)
+    expect(notPausableCauseOf(errSpawnNotPausable())).toBeUndefined()
+  })
+})

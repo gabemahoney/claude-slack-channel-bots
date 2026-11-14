@@ -2502,6 +2502,46 @@ describe('persona-set teardown', () => {
 // ---------------------------------------------------------------------------
 
 describe('clean_restart', () => {
+  test.each(['ended', 'missing', 'absent'] as const)('b.r6d C1 underway keeps polling the old live launch until %s', async terminal => {
+    const old = { state: 'waiting', launch_started_at: SAMPLE_LAUNCH_START_DEFAULT }
+    let reads = 0
+    const b = makeDeps({ serverPid: 4242, isProcessRunning: () => true, config: opsConfig({ exit_timeout: 2 }),
+      directorGet: async () => old,
+      directorPause: async () => { throw errSpawnNotPausable('pause', 'pause_in_progress') },
+      directorStatus: async () => { reads++; return reads <= 2 ? old : reads === 3 ? (terminal === 'absent' ? null : { state: terminal }) : { state: 'waiting', launch_started_at: '2026-11-14T00:00:00Z' } },
+    })
+    await settled(createCli(b.deps).clean_restart([OPS_NAME]))
+    expect(reads).toBeGreaterThanOrEqual(4)
+    expect(b.killCalls).toEqual([])
+    expect(stderr).not.toContain(teardownNextLifeAfterPauseLine(OPS_PERSONA, TEARDOWN_POLL_FIRST_WAIT_MS))
+    expect(b.exitCodes).toEqual([])
+    expect(b.directorCallTimes.filter(([call]) => call.startsWith('status:'))[2]![1]).toBeGreaterThan(0)
+  })
+  test.each([0, 1] as const)('b.r6d C1 underway unchanged live launch at exit_timeout=%s uses checked kill', async exit_timeout => {
+    const old = { state: 'waiting', launch_started_at: SAMPLE_LAUNCH_START_DEFAULT }
+    const b = makeDeps({ serverPid: 4242, isProcessRunning: () => true, config: opsConfig({ exit_timeout }),
+      directorGet: async () => old, directorStatus: async () => old,
+      directorPause: async () => { throw errSpawnNotPausable('pause', 'pause_in_progress') },
+    })
+    await settled(createCli(b.deps).clean_restart([OPS_NAME]))
+    expect(b.killCalls).toEqual([opsId()])
+    expect(callTimesOf(b, 'kill')[0]).toBe(callTimesOf(b, 'pause')[0]! + exit_timeout * 1000)
+  })
+  test.each([true, false])('b.r6d C1 underway replacement requires known initial launch identity=%s', async known => {
+    const old = { state: 'waiting', ...(known ? { launch_started_at: SAMPLE_LAUNCH_START_DEFAULT } : {}) }
+    let reads = 0
+    const b = makeDeps({ serverPid: 4242, isProcessRunning: () => true, config: opsConfig({ exit_timeout: 1 }),
+      directorGet: async () => old, directorStatus: async () => ++reads === 1 ? old : { state: 'waiting', launch_started_at: '2026-11-14T00:00:00Z' },
+      directorPause: async () => { throw errSpawnNotPausable('pause', 'pause_in_progress') },
+    })
+    await settled(createCli(b.deps).clean_restart([OPS_NAME]))
+    expect(b.killCalls).toEqual(known ? [] : [opsId()])
+  })
+  test('b.r6d C1 successful pause retains zero-timeout next-life shortcut', async () => {
+    const b = makeDeps({ serverPid: 4242, isProcessRunning: () => true, config: opsConfig({ exit_timeout: 0 }), directorStatus: async () => ({ state: 'waiting' }) })
+    await settled(createCli(b.deps).clean_restart([OPS_NAME]))
+    expect(b.pauseCalls).toEqual([opsId()]); expect(b.killCalls).toEqual([])
+  })
   test('genuinely-absent row (null) skips quietly and clean_restart still starts', async () => {
     const b = makeDeps({ directorStatus: async () => null })
     await createCli(b.deps).clean_restart(['--server'])

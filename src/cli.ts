@@ -204,6 +204,7 @@ import {
   PRECHECK_VERDICT_RETRY,
   PRECHECK_VERDICT_SKIP,
   PAUSE_VERDICT_DONE,
+  PAUSE_VERDICT_UNDERWAY,
   PAUSE_VERDICT_FAIL,
   PAUSE_VERDICT_RETRY,
   STATE_READ_VERDICT_ABSENT,
@@ -984,13 +985,14 @@ export function createCli(deps: CliDeps): CliHandlers {
    *      to PRECHECK_TRIES calls PRECHECK_TRY_SPACING_MS apart, then
    *      escalates; an escalation goes to the kill; a fail-at-once verdict
    *      fails the persona with no kill;
-   *   3. after a successful pause, `status` reads with a doubling wait until
+   *   3. after a successful or underway pause, `status` reads with a doubling wait until
    *      the row is `ended`, `missing` or absent, or `exit_timeout` passes;
    *      the last wait is cut short at `exit_timeout`; a read error fails the
    *      persona (`stateReadVerdictOf`). A read that shows the persona's next
-   *      life stops it, with no kill: with `serverRelaunches`, any live read
+   *      life stops it, with no kill: with `serverRelaunches`, any live read after a completed pause
    *      (`pause` answers only once the row reads `ended`); otherwise a
-   *      launch start other than the one step 1 read;
+   *      launch start other than the one step 1 read. An underway pause
+   *      requires both launch starts to be known before claiming replacement;
    *   4. at `exit_timeout`, or after an escalated pause, the kill's bounded
    *      retry by class (`teardownKill`); with `serverRelaunches`, a
    *      successful pause is never followed by the kill: with `exit_timeout`
@@ -1051,7 +1053,7 @@ export function createCli(deps: CliDeps): CliHandlers {
     // ErrSpawnNotPausable, then the kill.
     const pause = await pauseTries(id)
     if (pause.kind === PAUSE_VERDICT_FAIL) return teardownFailed(TEARDOWN_STEP_PAUSE, pause)
-    if (pause.kind !== PAUSE_VERDICT_DONE) {
+    if (pause.kind !== PAUSE_VERDICT_DONE && pause.kind !== PAUSE_VERDICT_UNDERWAY) {
       console.error(`[slack] teardownBots: pause failed for persona ${ref} — escalating to kill: ${pause.description}`)
       return teardownKill(persona, initial.state, launchStartBefore)
     }
@@ -1076,21 +1078,23 @@ export function createCli(deps: CliDeps): CliHandlers {
         console.error(`[slack] teardownBots: persona ${ref} exited cleanly in ${deps.now() - startTime}ms`)
         return teardownStopped(TEARDOWN_STOPPED_EXITED)
       }
-      if (serverRelaunches) {
+      if (serverRelaunches && pause.kind === PAUSE_VERDICT_DONE) {
         console.error(teardownNextLifeAfterPauseLine(persona, deps.now() - startTime))
         return teardownStopped(TEARDOWN_STOPPED_NEXT_LIFE)
       }
-      if (isNextLifeLaunchStart(launchStartBefore, launchStartOfAnswer(polledAnswer))) {
+      // An underway pause has not established exit. Without an initial
+      // launch identity, a later live reading cannot establish replacement.
+      if ((pause.kind === PAUSE_VERDICT_DONE || launchStartBefore !== undefined) && isNextLifeLaunchStart(launchStartBefore, launchStartOfAnswer(polledAnswer))) {
         console.error(teardownNextLifeLaunchStartLine(persona, deps.now() - startTime))
         return teardownStopped(TEARDOWN_STOPPED_NEXT_LIFE)
       }
       lastState = polled.state
     }
 
-    // With `serverRelaunches` the loop returns at its first read, so it ends
-    // here only having made none (`exit_timeout` 0): the successful pause
-    // already ended the row, and a kill could reach the next life.
-    if (serverRelaunches) {
+    // Only a completed pause established exit. For an underway claim,
+    // reaching the bound (zero included) retains explicit teardown's kill
+    // policy instead of inventing a stopped/relaunched result.
+    if (serverRelaunches && pause.kind === PAUSE_VERDICT_DONE) {
       console.error(`[slack] teardownBots: persona ${ref} exited cleanly in ${deps.now() - startTime}ms`)
       return teardownStopped(TEARDOWN_STOPPED_EXITED)
     }

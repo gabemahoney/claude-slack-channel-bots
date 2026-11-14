@@ -71,6 +71,8 @@
  * (every answer through `classifyAdError`):
  *
  *   - success: done, and the poll follows;
+ *   - pause_in_progress: underway, and the same launch is polled without
+ *     treating a live row as proof that a replacement started;
  *   - UNAVAILABLE (`ErrCallTimeout` and a non-agent-director throw
  *     included): retry, only the `pause` being repeated, at most
  *     {@link PRECHECK_TRIES} calls {@link PRECHECK_TRY_SPACING_MS} apart on
@@ -176,6 +178,7 @@ import {
   classifyAdError,
   describeReportedAdFailure,
   isAdErrorInstance,
+  notPausableCauseOf,
   type AdErrorClass,
 } from './ad-error-class.ts'
 import { AD_CONFIG_FILE_DISPLAY_NAME } from './ad-config-file.ts'
@@ -668,6 +671,8 @@ export type PauseAnswer = PauseDoneAnswer | PauseErrorAnswer
 
 /** The pause succeeded: the poll follows. */
 export const PAUSE_VERDICT_DONE = 'done'
+/** A shutdown was claimed, but its completion is not proved. */
+export const PAUSE_VERDICT_UNDERWAY = 'underway'
 /** UNAVAILABLE: the `pause` alone is made again, up to {@link PRECHECK_TRIES} calls in all. */
 export const PAUSE_VERDICT_RETRY = 'retry'
 /** The teardown goes on to the kill. */
@@ -678,6 +683,11 @@ export const PAUSE_VERDICT_FAIL = 'fail'
 /** The verdict over a `pause` that succeeded. */
 export interface PauseDoneVerdict {
   readonly kind: typeof PAUSE_VERDICT_DONE
+}
+export interface PauseUnderwayVerdict {
+  readonly kind: typeof PAUSE_VERDICT_UNDERWAY
+  readonly errorClass: AdErrorClass
+  readonly description: string
 }
 
 /** A verdict that retries or escalates, with the answer's class and description for the log. */
@@ -694,7 +704,7 @@ export interface PauseFailVerdict extends TeardownErrorReport {
 }
 
 /** The verdict over one `pause` answer. */
-export type PauseVerdict = PauseDoneVerdict | PauseEscalationVerdict | PauseFailVerdict
+export type PauseVerdict = PauseDoneVerdict | PauseUnderwayVerdict | PauseEscalationVerdict | PauseFailVerdict
 
 const PAUSE_DONE: PauseDoneVerdict = Object.freeze({ kind: PAUSE_VERDICT_DONE })
 
@@ -713,6 +723,13 @@ const PAUSE_FAIL_CLASSES: ReadonlySet<AdErrorClass> = new Set<AdErrorClass>([
  */
 export function pauseVerdictOf(answer: PauseAnswer): PauseVerdict {
   if (!('error' in answer)) return PAUSE_DONE
+  const cause = notPausableCauseOf(answer.error)
+  // A claimed shutdown is already underway: poll row evidence instead of
+  // issuing another pause. The existing finite poll still owns escalation.
+  if (cause === 'pause_in_progress') return { kind: PAUSE_VERDICT_UNDERWAY, errorClass: classifyAdError(answer.error).errorClass, description: describeReportedAdFailure(answer.error) }
+  // not_waiting/turn_pending/agent_not_covered and pause_uncertain retain
+  // explicit teardown's checked-kill policy below. Reconnect, unlike an
+  // operator's teardown, never escalates these causes into a kill.
   const { errorClass, reportedName } = classifyAdError(answer.error)
   if (PAUSE_FAIL_CLASSES.has(errorClass) || (errorClass === AD_ERROR_CLASS_UNCLASSIFIED && reportedName === ERR_INTERNAL_NAME)) {
     return { kind: PAUSE_VERDICT_FAIL, ...teardownErrorReportOf(answer.error) }

@@ -504,6 +504,12 @@ const PAUSE_ERROR_ROWS: readonly PauseRow[] = [
 ]
 
 describe('pauseVerdictOf: each pause answer by class (hatch note )', () => {
+  test('b.r6d C1 pause_in_progress is underway, not proof of completion', async () => {
+    const { PAUSE_VERDICT_UNDERWAY } = await import('../src/cli-teardown.ts')
+    const verdict = pauseVerdictOf({ error: errSpawnNotPausable('pause', 'pause_in_progress') })
+    expect(verdict.kind).toBe(PAUSE_VERDICT_UNDERWAY)
+    expect(verdict.kind).not.toBe(PAUSE_VERDICT_DONE)
+  })
   test('a pause that succeeded is done: the poll follows', () => {
     expect(pauseVerdictOf({ paused: true })).toEqual({ kind: PAUSE_VERDICT_DONE })
   })

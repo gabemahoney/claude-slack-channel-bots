@@ -107,6 +107,7 @@ AD_SHA256=$(record_field binary_sha256)
 AD_CLIENT_VERSION=$(record_field client_version)
 AD_TGZ=$(record_field client_tarball)
 AD_TGZ_SHA256=$(record_field client_tarball_sha256)
+CANDIDATE=$(jq -r '.candidate_overlay // false' "${RELEASE_RECORD}")
 
 # --- Which client --------------------------------------------------------
 if [ "${MODE}" = --package ]; then
@@ -150,15 +151,20 @@ TGZ_SHA256=$(sha256sum "${AD_TGZ}" | cut -d' ' -f1)
     || fail '1 (tarball)' "${AD_TGZ} has SHA-256 ${TGZ_SHA256}, not the pinned ${AD_TGZ_SHA256}"
 
 # --- 2 version -----------------------------------------------------------
-[[ "${AD_VERSION}" =~ ${PLAIN_RELEASE_RE} ]] \
+CANDIDATE=${CANDIDATE:-false}
+VERSION_RE="${PLAIN_RELEASE_RE}"
+if [[ "${CANDIDATE}" == true ]]; then
+    VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+fi
+[[ "${AD_VERSION}" =~ ${VERSION_RE} ]] \
     || fail '2 (version)' "the release record's version ${AD_VERSION} is not a plain major.minor.patch release"
-[[ "${AD_CLIENT_VERSION}" =~ ${PLAIN_RELEASE_RE} ]] \
+[[ "${AD_CLIENT_VERSION}" =~ ${VERSION_RE} ]] \
     || fail '2 (version)' "the release record's client_version ${AD_CLIENT_VERSION} is not a plain major.minor.patch release"
 CLIENT_VERSION=$(jq -er '.version | strings' "${CLIENT_DIR}/package.json" 2>/dev/null) \
     || fail '2 (version)' "${CLIENT_DIR}/package.json has no string version"
 [ "${CLIENT_VERSION}" = "${AD_CLIENT_VERSION}" ] \
     || fail '2 (version)' "the client at ${CLIENT_DIR} is agent-director ${CLIENT_VERSION}, not the pinned client ${AD_CLIENT_VERSION}"
-if [ "${MODE}" = --package ]; then
+if [[ "${MODE}" == --package && "${CANDIDATE}" != true ]]; then
     PIN=$(jq -r '.dependencies["agent-director"] // "(none)"' "${TARGET}/package.json")
     [ "${PIN}" = "${CLIENT_VERSION}" ] \
         || fail '2 (version)' "${TARGET}/package.json pins agent-director ${PIN}, not exactly the client's ${CLIENT_VERSION}"
@@ -253,4 +259,6 @@ CREATE_VERSION=$(cat "${SCRATCH}/create.out")
 [ "${CREATE_VERSION}" = "${BIN_VERSION}" ] \
     || fail '7 (client-create)' "Client.create() from ${ENTRY} reports agent-director version ${CREATE_VERSION}, not ${BIN_VERSION} (the first agent-director binary on PATH, ${BIN})"
 
-echo "ad-client check passed: ${CLIENT_DIR} is agent-director ${CLIENT_VERSION} from npm (tarball sha256 ${TGZ_SHA256}); agent-director ${BIN_VERSION} (${BIN_COMMIT}) at ${BIN} (binary sha256 ${BIN_SHA256}); client floor ${FLOOR}"
+SOURCE='from npm'
+[[ "${CANDIDATE}" != true ]] || SOURCE='from local candidate dist (shipped pin unchanged)'
+echo "ad-client check passed: ${CLIENT_DIR} is agent-director ${CLIENT_VERSION} ${SOURCE} (tarball sha256 ${TGZ_SHA256}); agent-director ${BIN_VERSION} (${BIN_COMMIT}) at ${BIN} (binary sha256 ${BIN_SHA256}); client floor ${FLOOR}"

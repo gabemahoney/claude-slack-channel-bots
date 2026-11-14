@@ -2970,7 +2970,8 @@ function liveClientCheckProblems(text: string): string[] {
 /**
  * What is wrong with a test-1 text's client check: empty when, directly after
  * `bun install /tmp/package.tgz` in /test-repo, it runs `AD_CLIENT_CHECK
- * --package` on the installed package (only plain assignments between) and
+ * --package` on the installed package (plain assignments and the exact
+ * candidate-only installer between) and
  * fails the test when the check fails; its one package install is the
  * package's; and nothing writes into node_modules (no swap).
  */
@@ -2984,6 +2985,15 @@ function test1ClientCheckProblems(text: string): string[] {
   const vars = new Map<string, string>()
   let at = install + 1
   for (let m; (m = /^([A-Z_][A-Z0-9_]*)=([^\s$"'`;()]+)$/.exec(lines[at] ?? '')); at++) vars.set(m[1]!, m[2]!)
+  // b.r6d route-a decision: a supplied candidate tarball replaces only the
+  // private integration dependency. Ordinary release installs remain as-is.
+  // Permit exactly this checked helper at this boundary, not arbitrary swaps.
+  const candidateCall = /^bash "\$\{FIXTURES\}\/install-candidate-client\.sh" "\$\{INSTALLED_PKG\}"\s+\|\| fail "candidate client overlay failed"$/
+  const candidateCalls = lines.filter(line => line.includes('install-candidate-client.sh'))
+  if (candidateCall.test(lines[at] ?? '')) at++
+  if (candidateCalls.length > 0 && (candidateCalls.length !== 1 || !candidateCall.test(lines[at - 1] ?? ''))) {
+    problems.push('candidate client install is not the one guarded pre-check step')
+  }
   const call = /^if ! (?:\w+=\$\()?"?([^\s"]+)"? --package "?([^\s")]+)"?[\s)].*; then$/.exec(lines[at] ?? '')
   const pkgName = JSON.parse(repoFile('package.json')).name as string
   if (call === null || expand(call[1]!, vars) !== AD_CLIENT_CHECK || expand(call[2]!, vars) !== join(repoDir ?? '', 'node_modules', pkgName)) {
@@ -2996,6 +3006,24 @@ function test1ClientCheckProblems(text: string): string[] {
   if (JSON.stringify(installs) !== JSON.stringify(['bun install /tmp/package.tgz'])) problems.push(`the package installs are ${JSON.stringify(installs)}, not only the package's`)
   const swaps = swapStatements(statements, /node_modules|agent-director/)
   if (swaps.length > 0) problems.push(`files are written into the installed package: ${JSON.stringify(swaps)}`)
+  return problems
+}
+
+/** Explicit candidate exception retains the provenance check for ordinary runs. */
+function candidateClientInstallProblems(text: string): string[] {
+  const required = [
+    '[[ -f /etc/cscb-ci-image && $# == 1 ]] || exit 70',
+    'record=/opt/agent-director/client/release.json',
+    '[[ "$(jq -r \'.candidate_overlay // false\' "${record}")" == true ]] || exit 0',
+    '[[ "$1" == /test-repo/node_modules/claude-slack-channel-bots ]] || exit 70',
+    'target=$1/node_modules/agent-director',
+    'tar -xzf /opt/agent-director/client/candidate.tgz -C "${target}" --strip-components=1 --no-same-owner',
+  ]
+  const lines = text.split('\n').map(line => line.trim())
+  const problems = required.filter(line => !lines.includes(line)).map(line => `missing candidate boundary: ${line}`)
+  const guard = lines.indexOf(required[2])
+  const firstWrite = lines.findIndex(line => /\b(?:rm|mkdir|tar)\b/.test(line) && !line.startsWith('#'))
+  if (guard < 0 || firstWrite <= guard) problems.push('candidate no-op guard must precede every write')
   return problems
 }
 
@@ -3058,8 +3086,20 @@ describe('the client under test (source audit)', () => {
     expect(routedToOption(planted(text, /check 5 '/, "check [56] '")).length).toBe(2)
   })
 
-  test("test-1 runs AD_CLIENT_CHECK --package on the package it installed into /test-repo, directly after the install, and fails the test when the check fails; it installs only the package and writes nothing into node_modules", () => {
+  test("test-1 checks the installed package directly after install and the exact guarded candidate exception; ordinary runs preserve npm client provenance", () => {
     expect(test1ClientCheckProblems(repoFile(TEST_1))).toEqual([])
+    expect(candidateClientInstallProblems(repoFile('tests/integration/fixtures/install-candidate-client.sh'))).toEqual([])
+  })
+
+  test('candidate exception refuses a missing no-op guard, an ordinary client target and a replacement source', () => {
+    const source = repoFile('tests/integration/fixtures/install-candidate-client.sh')
+    for (const mutated of [
+      source.replace('== true ]] || exit 0', '== true ]] || true'),
+      source.replace('target=$1/node_modules/agent-director', 'target=/test-repo/node_modules/agent-director'),
+      source.replace('/opt/agent-director/client/candidate.tgz', '/tmp/unrecorded.tgz'),
+    ]) expect(candidateClientInstallProblems(mutated).length).toBeGreaterThan(0)
+    const call = 'bash "${FIXTURES}/install-candidate-client.sh" "${INSTALLED_PKG}"'
+    expect(test1ClientCheckProblems(repoFile(TEST_1).replace(call, call + '\n' + call)).length).toBeGreaterThan(0)
   })
 
   test.each<[string, (text: string) => string, string]>([

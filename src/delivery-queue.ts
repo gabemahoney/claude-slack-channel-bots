@@ -3,6 +3,7 @@ import type { GetResult } from 'agent-director'
 import * as nodeFs from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { durableWriteFileSync, DurableWriteUnsyncedError } from './atomic-write.ts'
 import { PERSONA_KEY_RE } from './persona-identity.ts'
 
 export const QUEUE_KEY_KEEP_MS = 24 * 60 * 60 * 1000
@@ -37,7 +38,17 @@ export interface AcceptedInput {
 }
 interface BaseRecord { v: 1; seq: number }
 export interface AcceptedRecord extends BaseRecord, AcceptedInput {
-  kind: 'accepted'; received_at: number; ts: string; attempt_high_watermark?: number
+  kind: 'accepted'; received_at: number; ts: string; attempt_high_watermark?: number; item_id?: string
+}
+/** Durable AD pair, written before sending. Recovered intents are lookup-only. */
+export interface SubmittedRecord extends BaseRecord {
+  kind: 'submitted'; attempt: number; part: number; at: number
+  caller_uuid: string; delivery_request_id: string; instance_id: string
+  launch_token: string; session_id: string
+}
+/** Terminal local handling. Unknown delivery never authorizes a new send. */
+export interface SubmissionBlockedRecord extends BaseRecord {
+  kind: 'submission-blocked'; attempt: number; at: number; reason: string
 }
 /** Compaction keeps dedupe facts without message content. */
 export interface QueueKeyRecord extends BaseRecord {
@@ -58,6 +69,7 @@ export interface UnknownSentRecord extends BaseRecord {
 }
 export interface DeliveredRecord extends BaseRecord {
   kind: 'delivered'; part: number; at: number; receipt: { path: string; uuid?: string; offset?: number }
+  ad?: { launch_token: string | null; session_id: string; evidence_kind: string | null }
 }
 export interface RefusedRecord extends BaseRecord { kind: 'refused'; attempt: number; at: number }
 export interface ReplyReminderRecord extends BaseRecord {
@@ -73,8 +85,8 @@ export interface ReplyReminderRecord extends BaseRecord {
 }
 export interface ReplyCallTarget { seq: number; attempts?: number[] }
 export interface NoticedRecord extends BaseRecord { kind: 'noticed'; at: number }
-export type QueueRecord = AcceptedRecord | QueueKeyRecord | QueueAllocationRecord | FixedRecord | SentRecord | UnknownSentRecord | DeliveredRecord | RefusedRecord | NoticedRecord | ReplyReminderRecord
-export type ItemRecord = AcceptedRecord | FixedRecord | SentRecord | UnknownSentRecord | DeliveredRecord | RefusedRecord | NoticedRecord
+export type QueueRecord = AcceptedRecord | QueueKeyRecord | QueueAllocationRecord | FixedRecord | SentRecord | UnknownSentRecord | SubmittedRecord | SubmissionBlockedRecord | DeliveredRecord | RefusedRecord | NoticedRecord | ReplyReminderRecord
+export type ItemRecord = AcceptedRecord | FixedRecord | SentRecord | UnknownSentRecord | SubmittedRecord | SubmissionBlockedRecord | DeliveredRecord | RefusedRecord | NoticedRecord
 export interface QueueItem {
   accepted: AcceptedRecord; fixed?: FixedRecord; records: ItemRecord[]; delivered: boolean
   unknownSend: boolean; retypeCount: number; nextAttempt: number
@@ -91,6 +103,8 @@ export interface DeliveryQueue {
   start(): Promise<void>
   accept: QueueAccept
   append(key: string, record: QueueRecord): Promise<void>
+  /** One durable caller identity per state directory; lazy, before covered sends. */
+  callerUuid?(): string
   /** Adopt pre-two-stage accepted work before its first queued Slack mutation. */
   rememberQueuedReaction(key: string, seq: number, name: string): Promise<string | undefined>
   lookupSlackKey(key: string, slackKey: SlackKey): QueueAcceptResult | undefined
@@ -107,7 +121,7 @@ export interface DeliveryQueue {
   retained(key: string): void
   startupFindings(): QueueEvent[]
 }
-export type ReplyReminderRow = Pick<GetResult, 'state' | 'session_id' | 'launch_started_at'>
+export type ReplyReminderRow = Pick<GetResult, 'state' | 'session_id' | 'launch_started_at' | 'busy_send' | 'delivery'>
 /** Server-owned journal operations; ordinary delivery adapters need only DeliveryQueue. */
 export interface ReplyReminderQueue extends DeliveryQueue {
   replyReminderItems(key: string): ReplyReminderRecord[]
@@ -144,16 +158,19 @@ export function isQueueRecord(value: unknown): value is QueueRecord {
       if (r.compact !== undefined || !str(r.source) || !['slack', 'interject', 'cron'].includes(r.source) || !str(r.text) || !str(r.ts) || !number(r.received_at)) return false
       if (r.reminder_for !== undefined && (!positive(r.reminder_for) || r.source !== 'interject')) return false
       if (r.attempt_high_watermark !== undefined && !integer(r.attempt_high_watermark)) return false
+      if (r.item_id !== undefined && (!str(r.item_id) || !r.item_id)) return false
       if (r.queued_ack_reaction !== undefined && (!str(r.queued_ack_reaction) || !r.queued_ack_reaction.trim())) return false
       for (const k of ['sender', 'channel', 'channel_type', 'thread_ts', 'edited_ts', 'user', 'bot_id', 'username', 'bot_profile_name', 'via']) if (r[k] !== undefined && !str(r[k])) return false
       if (r.files !== undefined && (!Array.isArray(r.files) || !r.files.every(f => object(f) && str(f.name) && (f.mimetype === undefined || str(f.mimetype)) && (f.size === undefined || number(f.size))))) return false
       return r.source === 'slack' ? isSlackKey(r.key) && str(r.channel) && str(r.via) : timestamp(r.ts) && str(r.sender) && r.key === undefined
     case 'fixed': return Array.isArray(r.parts) && r.parts.length > 0 && r.parts.every(p => str(p) && p !== '')
+    case 'submitted': return positive(r.attempt) && positive(r.part) && number(r.at) && ['caller_uuid', 'delivery_request_id', 'instance_id', 'launch_token', 'session_id'].every(k => str(r[k]) && r[k] !== '')
+    case 'submission-blocked': return positive(r.attempt) && number(r.at) && str(r.reason)
     case 'sent':
       if (!positive(r.attempt) || !number(r.at)) return false
       if (r.unknown_outcome === true) return object(r.quarantine) && str(r.quarantine.path) && positive(r.quarantine.line)
       return positive(r.part) && str(r.send_kind) && ['text', 'enter', 'retype'].includes(r.send_kind) && str(r.session_id) && str(r.transcript_path) && integer(r.transcript_size)
-    case 'delivered': return positive(r.part) && number(r.at) && object(r.receipt) && str(r.receipt.path) && (str(r.receipt.uuid) || integer(r.receipt.offset))
+    case 'delivered': return positive(r.part) && number(r.at) && object(r.receipt) && str(r.receipt.path) && (str(r.receipt.uuid) || integer(r.receipt.offset)) && (r.ad === undefined || (object(r.ad) && (r.ad.launch_token === null || str(r.ad.launch_token)) && str(r.ad.session_id) && (r.ad.evidence_kind === null || str(r.ad.evidence_kind))))
     case 'refused': return positive(r.attempt) && number(r.at)
     case 'reply-reminder': return number(r.at) && (r.delivered_at === undefined || number(r.delivered_at)) && str(r.state) && ['observed', 'replied', 'nudged', 'cancelled'].includes(r.state) && (r.row_state === undefined || str(r.row_state)) && (r.session_id === undefined || str(r.session_id)) && (r.launch_started_at === undefined || r.launch_started_at === null || str(r.launch_started_at)) && (r.reply_attempts === undefined || (r.state === 'replied' && Array.isArray(r.reply_attempts) && r.reply_attempts.length > 0 && r.reply_attempts.every(positive))) && (r.delivery_attempts === undefined || (Array.isArray(r.delivery_attempts) && r.delivery_attempts.length > 0 && r.delivery_attempts.every(positive)))
     case 'noticed': return number(r.at)
@@ -187,6 +204,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   let started = false, stopped = false
   let durableDirectory: { dev: number; ino: number } | undefined
   let timer: ReturnType<typeof globalThis.setInterval> | undefined
+  let callerUuid: string | undefined
   const findings: QueueEvent[] = []
   function event(e: QueueEvent): void { if (e.type === 'record-unreadable') findings.push({ ...e }); try { void Promise.resolve(options.onEvent?.(e)).catch(() => {}) } catch { /* observers cannot change durable outcomes */ } }
   function pathFor(key: string): string {
@@ -260,7 +278,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     const item: QueueItem = { accepted, records, delivered: false, unknownSend: false, retypeCount: 0, nextAttempt: (accepted.attempt_high_watermark ?? 0) + 1 }
     for (const r of records) if (r.kind === 'fixed') item.fixed ??= r
     const refused = new Set(records.flatMap(r => r.kind === 'refused' ? [r.attempt] : []))
-    for (const r of records) if (r.kind === 'refused') item.nextAttempt = Math.max(item.nextAttempt, r.attempt + 1)
+    for (const r of records) if (r.kind === 'refused' || r.kind === 'submitted' || r.kind === 'submission-blocked') item.nextAttempt = Math.max(item.nextAttempt, r.attempt + 1)
     for (const r of records) if (r.kind === 'sent') {
       item.nextAttempt = Math.max(item.nextAttempt, r.attempt + 1)
       if ('unknown_outcome' in r) item.unknownSend = true
@@ -356,10 +374,11 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       for (const l of damaged) {
         const raw = l.raw
         const seq = raw?.seq
-        if (raw?.kind === 'sent' && integer(seq) && accepted.has(seq)) {
+        if ((raw?.kind === 'sent' || raw?.kind === 'submitted') && integer(seq) && accepted.has(seq)) {
           const item = j.items.get(seq)!
-          const attempt = positive(raw.attempt) && !item.records.some(r => r.kind === 'sent' && r.attempt === raw.attempt) ? raw.attempt : item.nextAttempt
-          update(j, { v: 1, kind: 'sent', seq, attempt, unknown_outcome: true, at: item.accepted.received_at, quarantine: { path: quarantinePath, line: l.line } })
+          const attempt = positive(raw.attempt) && !item.records.some(r => (r.kind === 'sent' || r.kind === 'submitted') && r.attempt === raw.attempt) ? raw.attempt : item.nextAttempt
+          if (raw.kind === 'submitted') update(j, { v: 1, kind: 'submission-blocked', seq, attempt, at: item.accepted.received_at, reason: 'damaged-submission: pair unknown; automatic resend forbidden' })
+          else update(j, { v: 1, kind: 'sent', seq, attempt, unknown_outcome: true, at: item.accepted.received_at, quarantine: { path: quarantinePath, line: l.line } })
         }
         event({ type: 'record-unreadable', key, line: l.line, quarantinePath, alert: l.line !== lines.length && !(integer(seq) && accepted.has(seq)) && (raw?.kind === 'accepted' || !['fixed', 'sent', 'delivered', 'refused', 'noticed'].includes(String(raw?.kind))) })
       }
@@ -390,17 +409,21 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       fs.renameSync(temp, path); syncDir(dir)
     } finally { try { fs.unlinkSync(temp) } catch { /* rename consumed temp */ } }
   }
-  function lastSend(item: QueueItem): SentRecord | undefined {
+  function lastSend(item: QueueItem): SentRecord | SubmittedRecord | undefined {
     const refused = new Set(item.records.flatMap(r => r.kind === 'refused' ? [r.attempt] : []))
     for (let i = item.records.length - 1; i >= 0; i--) {
       const record = item.records[i]!
-      if (record.kind === 'sent' && !('unknown_outcome' in record) && !refused.has(record.attempt)) return record
+      if ((record.kind === 'submitted' || (record.kind === 'sent' && !('unknown_outcome' in record))) && !refused.has(record.attempt)) return record
     }
     return undefined
   }
   function unrefusedAttempts(item: QueueItem): number[] {
     const refused = new Set(item.records.flatMap(r => r.kind === 'refused' ? [r.attempt] : []))
-    return item.records.flatMap(r => r.kind === 'sent' && !refused.has(r.attempt) ? [r.attempt] : [])
+    return item.records.flatMap(r => (r.kind === 'sent' || r.kind === 'submitted') && !refused.has(r.attempt) ? [r.attempt] : [])
+  }
+  function deliveredSession(item: QueueItem, fallback: string): string {
+    const handover = item.records.filter((r): r is DeliveredRecord => r.kind === 'delivered' && r.ad !== undefined).at(-1)
+    return handover?.ad?.session_id ?? fallback
   }
   function reminderResolved(j: Journal, item: QueueItem): boolean {
     const record = j.reminders.get(item.accepted.seq)
@@ -415,7 +438,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     const sent = lastSend(item)
     if (!sent) return
     const delivered_at = Math.max(...item.records.flatMap(r => r.kind === 'delivered' ? [r.at] : []))
-    j.reminders.set(item.accepted.seq, { v: 1, kind: 'reply-reminder', seq: item.accepted.seq, at: delivered_at, delivered_at, state: 'observed', session_id: sent.session_id, delivery_attempts: unrefusedAttempts(item) })
+    j.reminders.set(item.accepted.seq, { v: 1, kind: 'reply-reminder', seq: item.accepted.seq, at: delivered_at, delivered_at, state: 'observed', session_id: deliveredSession(item, sent.session_id), delivery_attempts: unrefusedAttempts(item) })
   }
   function reminderExpired(record: ReplyReminderRecord, at = now()): boolean {
     // Older journals have only their last observation timestamp. Freeze that
@@ -495,6 +518,33 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     for (const r of records) update(j, r)
   }
   const api: ReplyReminderQueue = {
+    callerUuid() {
+      if (callerUuid) return callerUuid
+      if (!started || stopped) throw new Error('Queue is not writable')
+      ensureDir()
+      const path = join(dir, 'caller-uuid')
+      try {
+        if (!fs.existsSync(path)) durableWriteFileSync(path, Buffer.from(randomUUID() + '\n'), {
+          openSync: (name, flags) => fs.openSync(name, flags, QUEUE_FILE_MODE),
+          writeSync: (fd, bytes, offset, length) => fs.writeSync(fd, bytes, offset, length),
+          fsyncSync: fd => fs.fsyncSync(fd), closeSync: fd => fs.closeSync(fd),
+          // Publish the fully synced private temp inode without replacing
+          // an identity another queue/process published in the meantime.
+          renameSync: (temp, target) => { fs.linkSync(temp, target); fs.unlinkSync(temp) },
+          unlinkSync: name => fs.unlinkSync(name),
+        })
+      } catch (error) {
+        if (error instanceof DurableWriteUnsyncedError || (error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      }
+      syncDir(dir)
+      const value = fs.readFileSync(path, 'utf8').trim()
+      if (!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value)) throw new Error('Invalid durable AD caller UUID; covered delivery held')
+      // A prior failed creation may have left complete but unsynced bytes.
+      const existing = fs.openSync(path, 'r')
+      try { fs.fsyncSync(existing) } finally { fs.closeSync(existing) }
+      callerUuid = value
+      return value
+    },
     replyReminderItems: key => replyCandidates(journal(key)).map(record => structuredClone(record)),
     replyCallTargets: key => replyTargets(journal(key)),
     async recordReplyCall(key, targets) {
@@ -542,14 +592,17 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
           const alreadyQueued = items.some(other => other.accepted.reminder_for === originalSeq)
           const sameLife = previous.session_id === row.session_id && (previous.row_state === undefined || previous.launch_started_at === row.launch_started_at)
           const cancelled = !enabled || !sameLife || ['pending', 'ended', 'missing', 'error'].includes(row.state)
-          const nudge = !cancelled && previous.row_state === 'working' && row.state === 'waiting'
+          // SR-5.6: a waiting row may still have input awaiting Turn Start.
+          const turnTaken = row.busy_send !== 'covered' || row.delivery?.awaiting_turn_start === 0
+          const nudge = !cancelled && turnTaken && previous.row_state === 'working' && row.state === 'waiting'
+          if (!cancelled && !turnTaken) continue
           if (!alreadyQueued && !cancelled && !nudge && previous.row_state === row.state && sameLife) continue
           if (nudge && !alreadyQueued) {
             const at = now(), candidate = BigInt(Math.trunc(at * 1000))
             injectedAt = injectedAt === undefined || candidate > injectedAt ? candidate : injectedAt + 1n
             // Acceptance precedes resolution: a torn append can replay it and
             // recover the missing resolution without accepting a duplicate.
-            const accepted: AcceptedRecord = { v: 1, kind: 'accepted', seq: seq++, source: 'interject', sender: 'reply-reminder', text, received_at: at, ts: formatMicros(injectedAt), reminder_for: originalSeq }
+            const accepted: AcceptedRecord = { v: 1, kind: 'accepted', item_id: randomUUID(), seq: seq++, source: 'interject', sender: 'reply-reminder', text, received_at: at, ts: formatMicros(injectedAt), reminder_for: originalSeq }
             records.push(accepted); injected.push(accepted.seq)
           }
           records.push({ v: 1, kind: 'reply-reminder', seq: originalSeq, at: now(), delivered_at: previous.delivered_at ?? previous.at, state: cancelled ? 'cancelled' : alreadyQueued || nudge ? 'nudged' : 'observed', row_state: row.state, session_id: row.session_id, launch_started_at: row.launch_started_at, ...(previous.delivery_attempts === undefined ? {} : { delivery_attempts: previous.delivery_attempts }) })
@@ -575,7 +628,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
           const received_at = input.received_at ?? now()
           const candidate = BigInt(Math.trunc(received_at * 1000))
           const injected = j.lastInjected === undefined || candidate > j.lastInjected ? candidate : j.lastInjected + 1n
-          const record: AcceptedRecord = { ...input, v: 1, kind: 'accepted', seq: j.nextSeq, received_at, ts: input.source === 'slack' ? input.ts ?? input.key?.ts ?? '' : formatMicros(injected) }
+          const record: AcceptedRecord = { ...input, v: 1, kind: 'accepted', item_id: randomUUID(), seq: j.nextSeq, received_at, ts: input.source === 'slack' ? input.ts ?? input.key?.ts ?? '' : formatMicros(injected) }
           if (!isQueueRecord(record)) throw new Error('Invalid accepted record')
           durableAppend(pathFor(key), Buffer.from(JSON.stringify(record) + '\n'), j)
           update(j, record)
@@ -604,17 +657,18 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
           if (JSON.stringify(item.fixed) !== JSON.stringify(record)) throw new Error('Fixed text is immutable')
           return
         }
-        if (record.kind === 'sent' && record.attempt < item.nextAttempt) throw new Error('Attempt number must increase')
+        if ((record.kind === 'sent' || record.kind === 'submitted') && record.attempt < item.nextAttempt) throw new Error('Attempt number must increase')
+        if (record.kind === 'submitted' && (!item.fixed || record.part > item.fixed.parts.length)) throw new Error('Submission has no fixed part')
         if (record.kind === 'refused') {
           const attempt = record.attempt
-          if (!item.records.some(r => r.kind === 'sent' && !('unknown_outcome' in r) && r.attempt === attempt)) throw new Error('Refusal has no sent attempt')
+          if (!item.records.some(r => (r.kind === 'submitted' || (r.kind === 'sent' && !('unknown_outcome' in r))) && r.attempt === attempt)) throw new Error('Refusal has no sent attempt')
         }
         if (record.kind === 'delivered' && (!item.fixed || record.part > item.fixed.parts.length)) throw new Error('Receipt has no fixed part')
         const records: QueueRecord[] = [record]
         if (record.kind === 'delivered') {
           const deliveredItem = summarize(item.accepted, [...item.records, record])
           const sent = lastSend(deliveredItem)
-          if (deliveredItem.delivered && item.accepted.source === 'slack' && sent && !reminderResolved(j, deliveredItem)) records.push({ v: 1, kind: 'reply-reminder', seq: record.seq, at: record.at, state: 'observed', session_id: sent.session_id, delivery_attempts: unrefusedAttempts(deliveredItem) })
+          if (deliveredItem.delivered && item.accepted.source === 'slack' && sent && !reminderResolved(j, deliveredItem)) records.push({ v: 1, kind: 'reply-reminder', seq: record.seq, at: record.at, state: 'observed', session_id: deliveredSession(deliveredItem, sent.session_id), delivery_attempts: unrefusedAttempts(deliveredItem) })
         }
         const bytes = Buffer.from(records.map(r => JSON.stringify(r) + '\n').join(''))
         try { durableAppend(path, bytes, j) } catch (error) { storageFailed(error) }

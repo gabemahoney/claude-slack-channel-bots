@@ -23,7 +23,7 @@ Run every command below from the worktree root, the directory that holds
 ## Interface
 
 ```text
-/ci [--keep-going] [--shards N] [--shard-timeout MINUTES] [--inject FAULT]... [SCRIPT]...
+/ci [--keep-going] [--shards N] [--shard-timeout MINUTES] [--ad-candidate-dist PATH] [--inject FAULT]... [SCRIPT]...
 ```
 
 | Argument | Meaning |
@@ -32,6 +32,7 @@ Run every command below from the worktree root, the directory that holds
 | `--shards N` | Run exactly the effective N shards (see [How N is chosen](#how-n-is-chosen)), or be refused. N is a whole number from 1 to 6 |
 | `--shard-timeout MINUTES` | Every shard's wall-time limit, in place of the computed one. A whole number from 1 to 720 |
 | `--inject FAULT` | Turn on one fault (see [Fault injection](#fault-injection)). May be repeated; an identical fault given twice counts once |
+| `--ad-candidate-dist PATH` | Overlay a local AD binary/client dist in the disposable test image. Absolute directory path; off by default; may appear once. Always a non-gate result, even without SCRIPT selections. See below |
 | `SCRIPT` | Select a script: its number form `test-<n>` or its whole file name, such as `test-3` or `test-3-cozempic-restart.sh`. Any SCRIPT makes the run selective |
 
 Argument rules:
@@ -51,17 +52,65 @@ Argument rules:
 - Run options come only from these arguments. No environment variable or
   file sets one.
 
+### Testing a candidate agent-director dist
+
+Use `/ci --ad-candidate-dist '/absolute/path/to/dist' test-50` for the
+synthetic dual-path scenario, or omit SCRIPT to exercise all scripts against
+the overlay. The ordinary `/ci` image and package dependency pins are unchanged.
+Candidate runs use the existing SELECTIVE verdict/exit-code rules (PASS exits
+3), even when every script runs; they never replace the default full gate.
+
+Supply a trusted Linux amd64 dist directory containing regular files:
+
+- `agent-director`: the candidate binary with a real release or prerelease
+  version stamp and nonempty commit (`0.0.0-dev` is refused);
+- `client.tgz`: its matching npm-format client tarball, with `package/` at
+  the archive root, package name `agent-director`, and its real version;
+- optional `agent-director-admin` and `install.sh`: matching operator and
+  installer artifacts. If absent, the base image's versions are retained;
+  supply them when the candidate needs changed install/migration behavior.
+
+The runner passes the directory as BuildKit's read-only `ad-candidate` named
+context to `docker/Dockerfile.test.candidate`. It runs no candidate on the
+host. The image records runtime version, commit, binary/admin/installer and
+client-tarball SHA-256 values in `/opt/agent-director/client/release.json`.
+Test 1 unpacks the client privately under CSCB's own `node_modules`, so its
+imports resolve the exact local tarball. Candidate checks retain content,
+native error exports, binary identity, client minimum-binary floor and
+Client.create checks; only the shipped dependency-pin/Phase-1-floor equality
+check is inapplicable to this explicit overlay. CSCB's own runtime floor still
+runs. No npm prerelease publication, host install or package/lockfile edit is
+needed. Ordinary image prerequisites still apply if the base is missing.
+
+Test 50 proves actual legacy transport when the runtime omits `busy_send`,
+and shim-driven `not_covered` / safe `agent_not_covered` fallback on an
+uncovered launch. With a truly covered candidate launch those legacy legs
+are omitted explicitly: changing `get` cannot turn its real native transport
+into a legacy one. Held/lookup/final/unknown cases inject synthetic custody
+facts into the packed executor with an explicit fixture transport, because
+the pinned 0.12.0 client cannot serialize E2 options. The stub has no native
+FileChanged/asyncRewake route; this is not proof of E2's client serializer,
+native Claude delivery, actual turn start, or E6 conditional pause. Run the
+real Claude scenarios against the supplied E2 pair for that evidence;
+covered reconnect stays default-off until AD announces E6 support.
+
+Cheap standalone controls, requiring no Docker or native agent:
+`bun tests/integration/fixtures/busy-send-controls.ts` and
+`bun tests/integration/fixtures/ci-candidate-controls.ts`.
+
 Run kinds:
 
 - `/ci` with no arguments is the default full run: every script, as many
   shards as admission allows up to 6, default limits, no faults. It is what
   `/publish` and `/publish-prepare` run.
-- A full run (no SCRIPT) without `--inject` is gate-eligible, with or without
+- A full run (no SCRIPT or candidate overlay) without `--inject` is gate-eligible, with or without
   `--keep-going`, `--shards` or `--shard-timeout`, whatever N admission picks.
   Keep-going passes only with zero failures, complete coverage from both
   tracks, and all integrity and cleanup checks passing.
 - A selective run (any SCRIPT) or an injected run (any `--inject`) is never a
   gate result.
+- A candidate-dist run is always reported as selective and is never a gate
+  result, including with no SCRIPT arguments.
 
 ## Outcomes and exit codes
 

@@ -134,6 +134,8 @@ import {
 } from './ad-version-gate.ts'
 import {
   AgentDirectorError,
+  type CantSendDetails,
+  type NotPausableCause,
   ERR_INTERNAL_NAME,
   ERR_TMUX_UNRESPONSIVE_NAME,
   ErrInternal,
@@ -180,6 +182,7 @@ export const AD_VERBS = [
   'resume',
   'read-pane',
   'send-keys',
+  'get-delivery',
   'pause',
   'kill',
   'status',
@@ -427,6 +430,7 @@ export interface AdErrorClassification {
 export function classifyAdError(value: unknown): AdErrorClassification {
   try {
     if (!isAgentDirectorError(value)) return { errorClass: AD_ERROR_CLASS_UNAVAILABLE }
+    if (cantSendDetailsOf(value)) return { errorClass: AD_ERROR_CLASS_STATE }
     if (isAdErrorInstance(value, ErrUnknownErrorName)) {
       return classifyUnknownName(readProp(value, 'unknownName'), readProp(readProp(value, 'envelope'), 'err_description'))
     }
@@ -453,6 +457,27 @@ export function classifyAdError(value: unknown): AdErrorClassification {
   } catch {
     return { errorClass: AD_ERROR_CLASS_UNAVAILABLE }
   }
+}
+
+/** One forward compatibility name check, confined to the classifier until E2.
+ * Unknown names without valid structured refusal facts retain their old class.
+ */
+export function cantSendDetailsOf(value: unknown): CantSendDetails | undefined {
+  try {
+    const legacy = isAdErrorInstance(value, ErrUnknownErrorName) && readProp(value, 'unknownName') === 'ErrCantSend'
+    if (!legacy) return undefined
+    const details = readProp(readProp(value, 'envelope'), 'err_details')
+    if (readProp(details, 'class') !== 'cant_send' || typeof readProp(details, 'reason') !== 'string' ||
+      typeof readProp(details, 'resend_safe') !== 'boolean' || typeof readProp(details, 'retry_with') !== 'string') return undefined
+    return details as CantSendDetails
+  } catch { return undefined }
+}
+
+/** SR-6.5 causes are structured facts, never parsed from descriptions. */
+export function notPausableCauseOf(value: unknown): NotPausableCause | undefined {
+  if (!isAdErrorInstance(value, ErrSpawnNotPausable)) return undefined
+  const cause = readProp(readProp(value, 'errDetails'), 'cause')
+  return typeof cause === 'string' && ['not_waiting', 'turn_pending', 'pause_in_progress', 'pause_uncertain', 'agent_not_covered'].includes(cause) ? cause as NotPausableCause : undefined
 }
 
 /**

@@ -56,6 +56,8 @@ bun install /tmp/package.tgz >/tmp/bun-install.log 2>&1 \
 # floor, Client.create()).
 AD_CLIENT_CHECK=/opt/agent-director/check/ad-client-check.sh
 INSTALLED_PKG=/test-repo/node_modules/claude-slack-channel-bots
+bash "${FIXTURES}/install-candidate-client.sh" "${INSTALLED_PKG}" \
+    || fail "candidate client overlay failed"
 if ! AD_CHECK_OUT=$("${AD_CLIENT_CHECK}" --package "${INSTALLED_PKG}" 2>/tmp/test-1-ad-client-check.err); then
     AD_CHECK_ERR=$(grep -m 1 '^ERROR:' /tmp/test-1-ad-client-check.err || true)
     fail "the agent-director client check on ${INSTALLED_PKG} failed: ${AD_CHECK_ERR:-no ERROR line (see /tmp/test-1-ad-client-check.err)}"

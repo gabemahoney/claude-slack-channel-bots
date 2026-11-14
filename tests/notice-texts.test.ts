@@ -277,6 +277,8 @@ interface NoticeEntry {
 }
 
 /** The persona the notices concern. */
+import { buildCoveredRestartNotice, buildCoveredDeliveryBlockedNotice } from '../src/covered-delivery.ts'
+import { renderPersonaRef } from '../src/persona-identity.ts'
 const KEY = 'alpha'
 const PERSONA = { name: 'Alpha', key: KEY } as const
 /** An old key's persona (a renamed persona's earlier key), for the kill-failure alert's instance id. */
@@ -708,13 +710,25 @@ function notConnectedVariants(): readonly (readonly [label: string, notice: NotC
     ['blocked-on-prompt', { reason: 'blocked-on-prompt', autoRestartDisabled: false }],
     ['blocked-on-prompt, auto-restart disabled', { reason: 'blocked-on-prompt', autoRestartDisabled: true }],
     ['auto-restart-disabled, disconnected', { reason: 'auto-restart-disabled', cause }],
+    ['covered restart', { reason: 'blocked-on-prompt', autoRestartDisabled: false, covered: true }],
   ]
 }
+
+describe('b.r6d C5/T3 covered notice identity', () => {
+  test.each([buildCoveredRestartNotice, buildCoveredDeliveryBlockedNotice])('%s uses configured rendered identity and key-only fallback', builder => {
+    const name = 'Support "primary"\nteam'
+    const text = builder({ key: KEY, name })
+    expect(text).toContain(renderPersonaRef(name, KEY))
+    expect(builder({ key: KEY })).toContain(`persona=${KEY}`)
+    expect(builder(PERSONA)).toContain(renderPersonaRef(PERSONA.name, KEY))
+    assertNoLeak(text)
+  })
+})
 
 /** not-connected notices, which name `tmux attach` and so carry the human-only sentence. */
 function notConnectedEntries(): NoticeEntry[] {
   return notConnectedVariants().map(([label, notice]) =>
-    entry("common", 'buildNotConnectedNotice', label, () => buildNotConnectedNotice(KEY, notice)),
+    entry("common", 'buildNotConnectedNotice', label, () => buildNotConnectedNotice(KEY, notice, PERSONA.name)),
   )
 }
 
@@ -928,6 +942,11 @@ const NOTICE_CATALOGUE: readonly NoticeEntry[] = Object.freeze([
   ...commonEntries(),
   ...spawnFailureEntries(),
   ...notConnectedEntries(),
+  ...[buildCoveredRestartNotice, buildCoveredDeliveryBlockedNotice].flatMap(builder => [
+    entry('common', builder.name, 'configured persona', () => builder(PERSONA)),
+    entry('common', builder.name, 'key-only persona', () => builder({ key: KEY })),
+    entry('common', builder.name, 'quoted control-character name', () => builder({ key: KEY, name: 'Alpha "quoted"\nname' })),
+  ]),
   ...deliveryEntries(),
   ...jsonlSafeguardEntries(),
   ...jsonlDiagnosisEntries(),
@@ -977,6 +996,8 @@ const NAMED_SLACK_NOTICES: readonly string[] = Object.freeze([
   spawnFailureNoticeText.name,
   restartCapReachedNoticeText.name,
   buildNotConnectedNotice.name,
+  buildCoveredRestartNotice.name,
+  buildCoveredDeliveryBlockedNotice.name,
   buildMessageNotSavedNotice.name,
   buildMessageSavedAfterRetryNotice.name,
   buildDeliveryStuckNotice.name,
@@ -1329,7 +1350,7 @@ describe('a Slack notice that names a command or "Operator actions" carries the 
         (builder) => !builders.has(builder),
       ),
     ).toEqual([])
-    expect(naming.filter(([, e]) => e.builder === buildNotConnectedNotice.name)).toHaveLength(notConnectedVariants().length)
+    expect(naming.filter(([, e]) => e.builder === buildNotConnectedNotice.name)).toHaveLength(notConnectedVariants().filter(([, notice]) => !notice.covered).length)
     const commandFree = [runPersonaStorageCheck.name, runJsonlPersistenceSafeguard.name, ...JSONL_DIAGNOSIS_BUILDERS]
     expect([...builders].filter((builder) => commandFree.includes(builder))).toEqual([])
   })

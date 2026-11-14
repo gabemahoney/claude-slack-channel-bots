@@ -130,6 +130,17 @@ while (( verb_index < ${#argv[@]} )); do
     esac
 done
 call_verb="${argv[verb_index]:-}"
+# Explicit synthetic custody boundary, selected only by an adjacent control
+# file in a scenario HOME. No native Claude transport or TUI is simulated.
+if [[ -f "${dir}/agent-director-busy-send.json" ]]; then
+    exec 7> "${dir}/agent-director-busy-send.json.lock" || exit 70
+    /usr/bin/flock -x 7 || exit 70
+    "${dir}/agent-director-busy-bun" "${dir}/agent-director-busy-send.ts" "${dir}" "${real}" "${verb_index}" "$@"
+    busy_rc=$?
+    /usr/bin/flock -u 7
+    exec 7>&-
+    (( busy_rc == 75 )) || exit "${busy_rc}"
+fi
 # Launch-response loss consumes a rule only after a successful real launch.
 # Keep its lock through that call so a collision cannot steal the fault
 # intended for the following reuse/resume, or race a concurrent invocation.

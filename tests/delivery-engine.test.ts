@@ -1915,3 +1915,436 @@ test('a reconnect timer outlived by a six-second AD read resumes its retained co
   expect(stopped).toBe(true)
   await stopping
 })
+
+// b.r6d: covered custody is independent of transcript receipts and raw keys.
+import { makeBusyHarness, type BusyHarness } from './test-helpers/busy-send.ts'
+import { cannedBusyResult, cannedDeliveryLookup, cannedGetResult, errCantSend, makeStubCallLog, makeStubClient } from './test-helpers/agent-director-stub.ts'
+const busyHarnesses: BusyHarness[] = []
+afterEach(async () => { for (const h of busyHarnesses.splice(0)) await h.cleanup() })
+async function busy(options: Parameters<typeof makeBusyHarness>[0] = {}) { const h = await makeBusyHarness(options); busyHarnesses.push(h); return h }
+
+describe('b.r6d covered factory custody', () => {
+  test.each([undefined, 'not_covered'] as const)('coverage %s preserves the legacy dispatch without a submission', async coverage => {
+    const h = await busy(); h.row = { ...h.row, busy_send: coverage }
+    expect(await h.step()).toBe('legacy')
+    expect(h.calls.sendKeysCalls).toEqual([])
+    expect(h.records().map(r => r.kind)).toEqual(['accepted', 'fixed'])
+  })
+
+  test('covered construction sends exact fixed text and durable pair, with no raw-key options', async () => {
+    const h = await busy()
+    h.script.sendKeysFn = params => {
+      expect(h.records().at(-1)).toMatchObject({ kind: 'submitted', caller_uuid: params.caller_uuid, delivery_request_id: params.delivery_request_id })
+      return cannedBusyResult()
+    }
+    expect(await h.step()).toBe('waiting')
+    const intent = h.intent()
+    expect(h.calls.sendKeysCalls).toEqual([{ instance_id: h.row.instance_id, text: h.queue.item('alpha', h.seq)!.fixed!.parts[0],
+      send_mode: 'wait_turn', confirmed_delivery: true, caller_uuid: h.queue.callerUuid!(), delivery_request_id: intent.delivery_request_id }])
+    expect(intent.delivery_request_id).toBe('cscb/alpha/' + h.queue.item('alpha', h.seq)!.accepted.item_id + '/1')
+    expect(h.calls.readPaneCalls).toEqual([])
+    expect(h.completions).toBe(0)
+  })
+
+  test.each(['fresh-read', 'post-journal', 'no-identity'] as const)('launch change at %s prevents dispatch', async boundary => {
+    const h = await busy(); let reads = 0
+    if (boundary === 'no-identity') h.row = { ...h.row, launch_token: null, launch_started_at: null }
+    h.read(async () => {
+      reads++
+      return boundary !== 'no-identity' && reads >= (boundary === 'fresh-read' ? 1 : 2) ? { ...h.row, launch_token: 'launch-b' } : h.row
+    })
+    expect(await h.step()).toBe('waiting')
+    expect(h.calls.sendKeysCalls).toEqual([])
+    const records = h.records()
+    expect(records.filter(r => r.kind === 'submitted').length).toBe(boundary === 'post-journal' ? 1 : 0)
+    expect(records.filter(r => r.kind === 'refused').length).toBe(boundary === 'post-journal' ? 1 : 0)
+  })
+
+  test('missing matching client fails closed and notifies once without recording or typing', async () => {
+    const h = await busy()
+    const client = { ...h.client, getDelivery: undefined }
+    expect(await h.step({ client: async () => client })).toBe('blocked')
+    await h.advance()
+    expect(await h.step({ client: async () => client })).toBe('blocked')
+    expect(h.calls.sendKeysCalls).toEqual([])
+    expect(h.records().map(r => r.kind)).toEqual(['accepted', 'fixed'])
+    expect(h.notices).toEqual(['matching AD client required'])
+  })
+
+  const waits = ['turn_running', 'dialog', 'compaction', 'earlier_message', 'handover_in_progress', 'agent_starting', 'launch_ended', 'route_unavailable', 'readiness_unknown', 'input_unresolved', 'awaiting_proof']
+  test.each(waits)('Held %s retains FIFO head and polls the same pair without typing or completion', async reason => {
+    const h = await busy()
+    h.script.sendKeysResult = cannedBusyResult({ reason, wait: { reason, since: '2026-11-13T00:00:00Z' } })
+    await h.step()
+    const intent = h.intent()
+    h.script.getDeliveryResult = cannedDeliveryLookup(cannedBusyResult({ reason, wait: { reason, since: '2026-11-13T00:00:00Z' } }))
+    await h.advance(); expect(await h.step()).toBe('waiting')
+    await h.advance(); expect(await h.step()).toBe('waiting')
+    expect(h.calls.sendKeysCalls).toHaveLength(1)
+    expect(h.calls.getDeliveryCalls).toEqual(Array(2).fill({ caller_uuid: intent.caller_uuid, delivery_request_id: intent.delivery_request_id }))
+    expect(h.queue.openCount('alpha')).toBe(1)
+    expect(h.completions).toBe(0)
+    expect(h.notices).toEqual([])
+    if (reason === 'route_unavailable') expect(h.logs).toHaveLength(1)
+  })
+  test.each(['queued', 'sent_unconfirmed'] as const)('non-Final %s is custody, never a receipt', async klass => {
+    const h = await busy(); h.script.sendKeysResult = cannedBusyResult({ class: klass })
+    expect(await h.step()).toBe('waiting')
+    expect(h.queue.openCount('alpha')).toBe(1); expect(h.completions).toBe(0)
+  })
+
+  // SR-3.3a/3.5/5.1/6.2/6.3 final reasons, plus unknown future reasons.
+  test.each([
+    ['delivered_confirmed', 'exact_intake', 'delivered'],
+    ['delivered_confirmed', 'wait_turn_raced', 'delivered'],
+    ['sent_unconfirmed', 'handed_over_not_proven', 'delivered'],
+    ['sent_unconfirmed', 'wait_turn_raced', 'delivered'],
+    ['sent_unconfirmed', 'confirmation_off', 'blocked'],
+    ['sent_unconfirmed', 'launch_ended', 'blocked'],
+    ['sent_unconfirmed', 'transport_uncertain', 'blocked'],
+    ['sent_unconfirmed', 'admission_unknown', 'blocked'],
+    ['sent_unconfirmed', 'future_reason', 'blocked'],
+    ['not_started', 'record_deleted', 'blocked'],
+    ['not_started', 'conversation_replaced', 'blocked'],
+  ] as const)('Final %s/%s becomes %s without resend', async (klass, reason, action) => {
+    const h = await busy()
+    h.script.sendKeysResult = cannedBusyResult({ class: klass, final: true, reason, wait: null })
+    expect(await h.step()).toBe(action)
+    expect(h.queue.openCount('alpha')).toBe(action === 'delivered' ? 0 : 1)
+    expect(h.completions).toBe(action === 'delivered' ? 1 : 0)
+    expect(h.notices.length).toBe(action === 'blocked' ? 1 : 0)
+    if (action === 'blocked') {
+      await h.advance(600000); expect(await h.step()).toBe('blocked')
+      expect(h.notices).toHaveLength(1)
+    } else expect(h.records().at(-1)).toMatchObject({ kind: 'delivered', ad: { launch_token: 'launch-a', session_id: 'session' } })
+    expect(h.calls.sendKeysCalls).toHaveLength(1)
+  })
+
+  test.each(['record_deleted', 'conversation_replaced'])('Final safe not_started/%s retries only after 60 seconds with a new ID', async reason => {
+    const h = await busy()
+    h.script.sendKeysResult = cannedBusyResult({ class: 'not_started', final: true, reason, resend_safe: true, retry_with: 'new_id', wait: null })
+    expect(await h.step()).toBe('waiting'); const first = h.intent()
+    await h.advance(h.module.COVERED_DELIVERY_RETRY_MS - 1); await h.step()
+    expect(h.calls.sendKeysCalls).toHaveLength(1)
+    await h.advance(1); await h.step()
+    expect(h.calls.sendKeysCalls).toHaveLength(2)
+    expect(h.calls.sendKeysCalls[1]!.delivery_request_id).not.toBe(first.delivery_request_id)
+    expect(h.calls.sendKeysCalls[1]!.caller_uuid).toBe(first.caller_uuid)
+  })
+  test.each([
+    { resend_safe: false, retry_with: 'new_id' },
+    { resend_safe: true, retry_with: 'none' },
+  ] as const)('not_started needs both safety facts %j', async facts => {
+    const h = await busy()
+    h.script.sendKeysResult = cannedBusyResult({ class: 'not_started', final: true, reason: 'record_deleted', wait: null, ...facts })
+    expect(await h.step()).toBe('blocked')
+    expect(h.records().filter(r => r.kind === 'refused')).toEqual([])
+  })
+
+  test.each(['agent_command', 'steer_unsupported', 'text_bytes', 'prompt_size', 'text_kind', 'id_conflict', 'retention_expired', 'future_reason'])('CantSend %s blocks and notifies once even with retry facts', async reason => {
+    const h = await busy(); h.script.sendKeysError = errCantSend({ reason, resend_safe: true, retry_with: 'new_send', limit: { actual: 2, allowed: 1 } })
+    expect(await h.step()).toBe('blocked')
+    expect(h.records().at(-1)).toMatchObject({ kind: 'submission-blocked', reason: 'cant_send:' + reason })
+    await h.advance(600000); expect(await h.step()).toBe('blocked')
+    expect(h.calls.sendKeysCalls).toHaveLength(1); expect(h.notices).toHaveLength(1)
+  })
+  test.each(['held_count', 'held_bytes'])('capacity %s backs off 5/10/20/40/60/60 seconds with distinct IDs', async reason => {
+    const h = await busy(); h.script.sendKeysError = errCantSend({ reason, resend_safe: true, retry_with: 'new_send' })
+    await h.step()
+    for (const [index, delay] of NOT_NOW_RETRY_MS.concat([60000]).entries()) {
+      const count = h.calls.sendKeysCalls.length
+      await h.advance(delay - 1); await h.step(); expect(h.calls.sendKeysCalls).toHaveLength(count)
+      await h.advance(1); await h.step(); expect(h.calls.sendKeysCalls).toHaveLength(count + 1)
+    }
+    expect(new Set(h.calls.sendKeysCalls.map(p => p.delivery_request_id)).size).toBe(h.calls.sendKeysCalls.length)
+    expect(h.calls.getDeliveryCalls).toEqual([]); expect(h.notices).toEqual([])
+  })
+  test.each(['held_count', 'held_bytes', 'agent_not_covered'])('CantSend %s without safe/new_send facts blocks', async reason => {
+    const h = await busy(); h.script.sendKeysError = errCantSend({ reason })
+    expect(await h.step()).toBe('blocked')
+  })
+  test.each([undefined, 'covered', 'not_covered'] as const)('agent_not_covered fallback requires a fresh uncovered row (%s)', async coverage => {
+    const h = await busy(); let reads = 0
+    h.read(async () => ++reads <= 2 ? h.row : coverage === undefined ? undefined : { ...h.row, busy_send: coverage })
+    h.script.sendKeysError = errCantSend({ reason: 'agent_not_covered', resend_safe: true, retry_with: 'new_send' })
+    expect(await h.step()).toBe(coverage === 'not_covered' ? 'legacy' : 'waiting')
+    expect(h.records().at(-1)!.kind).toBe('refused')
+    expect(h.calls.sendKeysCalls).toHaveLength(1)
+  })
+
+  test.each(['local-budget', 'uncertain-dispatch'] as const)('%s retires only a proven unsent intent', async mode => {
+    const h = await busy()
+    if (mode === 'local-budget') h.call(async () => { throw new DeliveryBudgetWait(1) })
+    else h.script.sendKeysError = errCallTimeout('send-keys')
+    await expect(h.step()).rejects.toThrow()
+    expect(h.records().filter(r => r.kind === 'refused')).toHaveLength(mode === 'local-budget' ? 1 : 0)
+    h.call(async (_verb, run) => run(h.client)); h.script.sendKeysError = undefined
+    await h.advance(); await h.step()
+    expect(h.calls.getDeliveryCalls).toHaveLength(mode === 'local-budget' ? 0 : 1)
+    expect(h.calls.sendKeysCalls).toHaveLength(1)
+  })
+  test.each(['send-keys', 'get-delivery'] as const)('malformed %s blocks durably instead of NOT_NOW retries', async verb => {
+    const h = await busy()
+    if (verb === 'send-keys') h.script.sendKeysError = errInvalidFlags(verb)
+    else { await h.step(); await h.advance(); h.script.getDeliveryError = errInvalidFlags(verb) }
+    expect(await h.step()).toBe('blocked')
+    h.resetAdapter(); await h.advance(600000); expect(await h.step()).toBe('blocked')
+    expect(h.calls.sendKeysCalls).toHaveLength(1)
+    expect(h.notices).toHaveLength(1)
+    expect(h.logs.join()).toContain('CSCB bug: malformed covered')
+  })
+  test.each(['unknown', 'retention_expired'] as const)('%s lookup remains lookup-only through restart and capability loss', async lookup => {
+    const h = await busy(); await h.step(); const intent = h.intent()
+    h.resetAdapter(); h.row = { ...h.row, busy_send: 'not_covered', launch_token: 'launch-b' }
+    h.script.getDeliveryResult = cannedDeliveryLookup(null, lookup)
+    expect(await h.step()).toBe('waiting')
+    await h.advance(h.module.COVERED_DELIVERY_RETRY_MS); await h.step()
+    expect(h.calls.sendKeysCalls).toHaveLength(1)
+    expect(h.calls.getDeliveryCalls).toEqual(Array(2).fill({ caller_uuid: intent.caller_uuid, delivery_request_id: intent.delivery_request_id }))
+    expect(h.notices).toHaveLength(1); expect(h.queue.openCount('alpha')).toBe(1)
+  })
+
+  test('pre-send read failure is proven local refusal and can use a new ID', async () => {
+    const h = await busy(); let reads = 0
+    h.read(async () => { if (++reads === 2) throw new Error('fresh row unavailable'); return h.row })
+    await expect(h.step()).rejects.toThrow('fresh row unavailable')
+    expect(h.calls.sendKeysCalls).toEqual([])
+    expect(h.records().at(-1)!.kind).toBe('refused')
+    await h.advance(); await h.step()
+    expect(h.calls.sendKeysCalls).toHaveLength(1); expect(h.calls.getDeliveryCalls).toEqual([])
+    expect(h.calls.sendKeysCalls[0]!.delivery_request_id).toContain('/retry-')
+  })
+})
+
+describe('b.r6d regression: production engine path selection', () => {
+  test('b.r6d C4 a private caller temp fsync failure retains accepted work without covered submission', async () => {
+    const paths = new Map<number, string>()
+    const seam = { ...fs,
+      openSync(...args: Parameters<typeof fs.openSync>) { const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd },
+      fsyncSync(fd: number) { if (paths.get(fd)?.includes('caller-uuid.') && paths.get(fd)?.endsWith('.tmp')) throw new Error('caller temp fsync'); fs.fsyncSync(fd) },
+    } as typeof fs
+    const h = await harness({ queueFs: seam })
+    h.p().row.busy_send = 'covered'; h.p().row.launch_token = 'launch-a'
+    await h.accept()
+    await h.tick()
+    expect(h.keyCalls()).toEqual([])
+    expect(h.queue.openCount('alpha')).toBe(1)
+    expect(h.records().some(record => record.kind === 'submitted')).toBe(false)
+    expect(h.errors.some(error => error instanceof Error && error.message.includes('caller temp fsync'))).toBe(true)
+  })
+  test.each(['outstanding', 'delivered', 'refused', 'blocked'] as const)('b.r6d C2 shared custody predicate distinguishes %s history', async state => {
+    const { hasUnresolvedCoveredCustody } = await import('../src/covered-delivery.ts')
+    const h = await harness(), item = await h.accept('firstsecond', 'alpha', ['first', 'second'])
+    const seq = item.accepted.seq
+    await h.queue.append('alpha', { v: 1, kind: 'submitted', seq, attempt: 1, part: 1, at: 1000,
+      caller_uuid: h.queue.callerUuid!(), delivery_request_id: 'predicate-request', instance_id: 'cscb_alpha', launch_token: 'launch-a', session_id: 'session' })
+    if (state === 'delivered') await h.queue.append('alpha', { v: 1, kind: 'delivered', seq, part: 1, at: 1001, receipt: { path: 'AD', uuid: 'request' } })
+    if (state === 'refused') await h.queue.append('alpha', { v: 1, kind: 'refused', seq, attempt: 1, at: 1001 })
+    if (state === 'blocked') await h.queue.append('alpha', { v: 1, kind: 'submission-blocked', seq, attempt: 1, at: 1001, reason: 'uncertain' })
+    expect(hasUnresolvedCoveredCustody(h.queue.item('alpha', seq)!)).toBe(state === 'outstanding' || state === 'blocked')
+  })
+  test.each(['coverage-change', 'safe-refusal'] as const)('b.r6d C2 completed covered part permits multipart legacy %s without resending part 1', async mode => {
+    const h = await harness(), client = h.client(), row = h.p().row
+    row.busy_send = 'covered'; row.launch_token = 'launch-a'
+    const legacySend = client.sendKeys.bind(client), coveredTexts: string[] = []
+    client.sendKeys = async params => {
+      if (!params.send_mode) return legacySend(params)
+      coveredTexts.push(params.text!)
+      if (params.text === 'second') {
+        row.busy_send = 'not_covered'
+        throw errCantSend({ reason: 'agent_not_covered', resend_safe: true, retry_with: 'new_send' })
+      }
+      return cannedBusyResult({ class: 'delivered_confirmed', final: true, reason: 'confirmed', wait: null })
+    }
+    const item = await h.accept('firstsecond', 'alpha', ['first', 'second'])
+    await h.tick()
+    expect(h.queue.item('alpha', item.accepted.seq)!.records.some(r => r.kind === 'delivered' && r.part === 1)).toBe(true)
+    if (mode === 'coverage-change') row.busy_send = 'not_covered'
+    await h.until(() => h.queue.item('alpha', item.accepted.seq)!.delivered)
+    expect(coveredTexts).toEqual(mode === 'safe-refusal' ? ['first', 'second'] : ['first'])
+    expect(h.textCalls().map(call => call.params.text)).toEqual(['second'])
+    expect(h.keyCalls().filter(call => call.params.key === 'Enter')).toHaveLength(1)
+    expect(h.events.filter(event => event.type === 'item-delivered')).toHaveLength(1)
+    if (mode === 'safe-refusal') expect(h.records().some(r => r.kind === 'refused')).toBe(true)
+  })
+  test('b.r6d C2 unresolved covered custody still prevents raw replay and FIFO overtaking', async () => {
+    const h = await harness(), client = h.client(), covered: string[] = []
+    h.p().row.busy_send = 'covered'; h.p().row.launch_token = 'launch-a'
+    client.sendKeys = async params => { covered.push(params.text!); return cannedBusyResult() }
+    client.getDelivery = async () => cannedDeliveryLookup(null, 'unknown')
+    await h.accept('first'); await h.accept('second')
+    await h.tick(); h.p().row.busy_send = 'not_covered'
+    await h.advance(120000)
+    expect(covered).toEqual(['first']); expect(h.queue.openCount('alpha')).toBe(2)
+    expect(h.records().some(r => r.kind === 'delivered')).toBe(false)
+  })
+  test.each([undefined, 'not_covered', 'covered'] as const)('fresh get busy_send=%s selects the appropriate transport', async coverage => {
+    const calls = makeStubCallLog()
+    const script = { ...calls, sendKeysResult: cannedBusyResult() }
+    const client = makeStubClient(script)
+    const h = await harness({ clientFor: async () => client })
+    const row = { ...h.p().row, busy_send: coverage, launch_token: 'launch-a' }
+    client.get = async params => { calls.getCalls.push(params); return row }
+    await h.accept('original bytes')
+    await h.tick()
+    if (coverage === 'covered') {
+      expect(calls.sendKeysCalls[0]).toMatchObject({ send_mode: 'wait_turn', confirmed_delivery: true })
+      expect(calls.sendKeysCalls).toEqual([{ instance_id: row.instance_id, text: 'original bytes', send_mode: 'wait_turn', confirmed_delivery: true,
+        caller_uuid: h.queue.callerUuid!(), delivery_request_id: 'cscb/alpha/' + h.queue.item('alpha', 1)!.accepted.item_id + '/1' }])
+      expect(h.records().some(r => r.kind === 'submitted')).toBe(true)
+      expect(h.queue.openCount('alpha')).toBe(1)
+    } else expect(calls.sendKeysCalls[0]).toEqual({ instance_id: row.instance_id, text: 'original bytes', no_enter: true })
+  })
+
+  test.each(['before-text', 'before-enter'] as const)('capability change %s prevents stale raw-key dispatch', async boundary => {
+    const h = await harness(); const client = h.client(); let keys = 0
+    client.sendKeys = async params => { keys++; h.calls.push({ key: 'alpha', verb: 'send-keys', at: h.clock.now(), params }); return {} }
+    let reads = 0
+    client.get = async () => ({ ...h.p().row, busy_send: ++reads >= (boundary === 'before-text' ? 2 : 4) ? 'covered' : 'not_covered', launch_token: 'launch-a' })
+    await h.accept(); await h.tick(); await h.advance(ENTER_DELAY_MS + 1)
+    expect(h.keyCalls().filter(c => c.params.key)).toEqual([])
+    if (boundary === 'before-text') expect(h.keyCalls().filter(c => c.params.no_enter)).toEqual([])
+    expect(h.queue.openCount('alpha')).toBe(1)
+  })
+})
+
+describe('b.r6d covered journal failure boundaries', () => {
+  test.each(['before-send', 'after-send'] as const)('process loss %s leaves only lookup authority after durable queue reopen', async boundary => {
+    const h = await busy()
+    if (boundary === 'before-send') {
+      await h.queue.append('alpha', { v: 1, kind: 'submitted', seq: h.seq, part: 1, attempt: 1, at: 1000,
+        caller_uuid: h.queue.callerUuid!(), delivery_request_id: 'cscb/alpha/crash/1', instance_id: h.row.instance_id, launch_token: 'launch-a', session_id: h.row.session_id })
+    } else { h.script.sendKeysError = errCallTimeout('send-keys'); await expect(h.step()).rejects.toThrow() }
+    const pair = h.intent()
+    await h.restart()
+    h.script.getDeliveryResult = cannedDeliveryLookup(null, 'unknown')
+    expect(await h.step()).toBe('waiting')
+    expect(h.calls.sendKeysCalls).toHaveLength(boundary === 'after-send' ? 1 : 0)
+    expect(h.calls.getDeliveryCalls).toEqual([{ caller_uuid: pair.caller_uuid, delivery_request_id: pair.delivery_request_id }])
+    expect(h.queue.openCount('alpha')).toBe(1)
+  })
+
+  test('a completed handover recovered after a lost send reply completes once without sending again', async () => {
+    const h = await busy(); h.script.sendKeysError = errCallTimeout('send-keys')
+    await expect(h.step()).rejects.toThrow()
+    await h.restart()
+    h.script.getDeliveryResult = cannedDeliveryLookup(cannedBusyResult({ class: 'sent_unconfirmed', final: true, reason: 'handed_over_not_proven', wait: null }))
+    expect(await h.step()).toBe('delivered')
+    expect(h.calls.sendKeysCalls).toHaveLength(1); expect(h.completions).toBe(1)
+    expect(h.queue.openCount('alpha')).toBe(0)
+  })
+
+  test('launch changes during the submitted fsync retire the unsent intent before any AD dispatch', async () => {
+    const paths = new Map<number, string>()
+    let h: BusyHarness | undefined, changed = false
+    const seam = { ...fs,
+      openSync(...args: Parameters<typeof fs.openSync>) { const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd },
+      fsyncSync(fd: number) {
+        fs.fsyncSync(fd)
+        const path = paths.get(fd)
+        if (h && !changed && path?.endsWith('.jsonl') && fs.readFileSync(path, 'utf8').includes('"kind":"submitted"')) {
+          changed = true; h.row = { ...h.row, launch_token: 'launch-b' }
+        }
+      },
+    } as typeof fs
+    h = await busy({ fs: seam })
+    expect(await h.step()).toBe('waiting')
+    expect(changed).toBe(true)
+    expect(h.calls.sendKeysCalls).toEqual([])
+    expect(h.records().at(-1)!.kind).toBe('refused')
+  })
+
+  test.each(['submitted', 'delivered'] as const)('%s sync failure cannot report completion or authorize replay', async kind => {
+    const h = await busy()
+    const original = h.queue.append.bind(h.queue)
+    let fail = true
+    h.queue.append = async (key, record) => { if (record.kind === kind && fail) throw new Error('EIO journal'); await original(key, record) }
+    h.script.sendKeysResult = cannedBusyResult({ class: 'delivered_confirmed', final: true, reason: 'exact_intake', wait: null })
+    await expect(h.step()).rejects.toThrow('EIO journal')
+    expect(h.completions).toBe(0)
+    expect(h.calls.sendKeysCalls).toHaveLength(kind === 'submitted' ? 0 : 1)
+    fail = false; await h.restart()
+    h.script.getDeliveryResult = cannedDeliveryLookup(null, 'unknown')
+    await h.step()
+    expect(h.calls.getDeliveryCalls).toHaveLength(kind === 'delivered' ? 1 : 0)
+    expect(h.calls.sendKeysCalls).toHaveLength(1)
+  })
+
+  test('caller UUID persistence failure holds before submitted and send', async () => {
+    const h = await busy()
+    h.queue.callerUuid = () => { throw new Error('EIO caller identity') }
+    await expect(h.step()).rejects.toThrow('EIO caller identity')
+    expect(h.calls.sendKeysCalls).toEqual([])
+    expect(h.records().map(r => r.kind)).toEqual(['accepted', 'fixed'])
+    expect(h.completions).toBe(0)
+  })
+
+  test('an old accepted record gets a stable delivery ID across compaction/reopen', async () => {
+    const h = await busy()
+    const { item_id: _ignored, ...oldAccepted } = h.queue.item('alpha', h.seq)!.accepted
+    const oldItem = { ...h.queue.item('alpha', h.seq)!, accepted: oldAccepted }
+    const oldId = h.module.queueItemId(oldItem)
+    expect(oldId).toMatch(/^[a-f0-9]{64}$/)
+    await h.queue.compact('alpha'); await h.restart()
+    expect(h.module.queueItemId({ ...h.queue.item('alpha', h.seq)!, accepted: oldAccepted })).toBe(oldId)
+    await h.step({ item: oldItem })
+    expect(h.calls.sendKeysCalls[0]!.delivery_request_id).toBe('cscb/alpha/' + oldId + '/1')
+  })
+
+  test('legacy ambiguous input is blocked with no new busy-send custody', async () => {
+    const h = await busy()
+    await h.queue.append('alpha', { v: 1, kind: 'sent', seq: h.seq, attempt: 1, part: 1, send_kind: 'text', at: 1000, session_id: h.row.session_id, transcript_path: '', transcript_size: 0 })
+    expect(await h.step()).toBe('blocked')
+    expect(h.calls.sendKeysCalls).toEqual([])
+    expect(h.records().some(r => r.kind === 'submitted')).toBe(false)
+  })
+})
+
+describe('b.r6d regression: covered production engine outcomes', () => {
+  test.each([
+    ['held', false, 'route_unavailable', false],
+    ['queued', false, 'awaiting_proof', false],
+    ['sent_unconfirmed', false, 'awaiting_proof', false],
+    ['delivered_confirmed', true, 'exact_intake', true],
+    ['delivered_confirmed', true, 'wait_turn_raced', true],
+    ['sent_unconfirmed', true, 'handed_over_not_proven', true],
+    ['sent_unconfirmed', true, 'wait_turn_raced', true],
+    ['sent_unconfirmed', true, 'launch_ended', false],
+    ['sent_unconfirmed', true, 'admission_unknown', false],
+    ['sent_unconfirmed', true, 'confirmation_off', false],
+    ['not_started', true, 'record_deleted', false],
+    ['not_started', true, 'conversation_replaced', false],
+  ] as const)('%s Final=%s reason=%s completes=%s via covered transport only', async (klass, final, reason, complete) => {
+    const calls = makeStubCallLog(), notices: string[] = []
+    const client = makeStubClient({ ...calls, sendKeysResult: cannedBusyResult({ class: klass, final, reason, wait: final ? null : { reason, since: '2026-11-13T00:00:00Z' } }) })
+    const h = await harness({ clientFor: async () => client, onCoveredBlocked: (_key, reason) => notices.push(reason) })
+    client.get = async () => ({ ...h.p().row, busy_send: 'covered', launch_token: 'launch-a' })
+    await h.accept(); await h.tick()
+    expect(calls.sendKeysCalls).toHaveLength(1)
+    expect(calls.sendKeysCalls[0]).toMatchObject({ send_mode: 'wait_turn', confirmed_delivery: true })
+    expect(calls.sendKeysCalls[0]).not.toHaveProperty('no_enter')
+    expect(calls.sendKeysCalls[0]).not.toHaveProperty('key')
+    expect(h.queue.openCount('alpha')).toBe(complete ? 0 : 1)
+    expect(h.events.filter(e => e.type === 'item-delivered')).toHaveLength(complete ? 1 : 0)
+    expect(notices).toHaveLength(final && !complete ? 1 : 0)
+    expect(h.restarts).toEqual([])
+  })
+
+  test('whole-item notification follows both durable part receipts and fires once', async () => {
+    const calls = makeStubCallLog()
+    const client = makeStubClient({ ...calls, sendKeysResult: cannedBusyResult({ class: 'sent_unconfirmed', final: true, reason: 'handed_over_not_proven', wait: null }) })
+    const h = await harness({ clientFor: async () => client })
+    client.get = async () => ({ ...h.p().row, busy_send: 'covered', launch_token: 'launch-a' })
+    await h.accept('two parts', 'alpha', ['first', 'second']); await h.tick()
+    expect(calls.sendKeysCalls[0]).toMatchObject({ text: 'first', send_mode: 'wait_turn' })
+    expect(h.events.filter(e => e.type === 'delivered')).toHaveLength(1)
+    expect(h.events.filter(e => e.type === 'item-delivered')).toEqual([])
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    expect(calls.sendKeysCalls.map(p => p.text)).toEqual(['first', 'second'])
+    expect(h.records().filter(r => r.kind === 'delivered')).toHaveLength(2)
+    expect(h.events.filter(e => e.type === 'item-delivered')).toHaveLength(1)
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    expect(calls.sendKeysCalls).toHaveLength(2)
+    expect(h.events.filter(e => e.type === 'item-delivered')).toHaveLength(1)
+  })
+})

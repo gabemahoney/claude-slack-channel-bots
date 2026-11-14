@@ -98,7 +98,9 @@ Behavior by case:
 
 ### What the command prints when a bot can't be stopped
 
-`stop --stop-bots` and `clean_restart` share one bot teardown. A refused pause leads on to the force-kill unless the cause is one a force-kill can't fix (a tmux session conflict, an unusable tmux session name, tmux unavailable, an agent-director internal error or a refused config file); a force-kill that can't act right now is tried up to 3 times, 2 s apart. The other personas are still torn down. Once every persona's teardown has finished, the command prints one line per persona it could not stop, in configuration order:
+`stop --stop-bots` and `clean_restart` share one bot teardown. If a pause reports shutdown underway, the command waits for the old instance to finish, disappear or be provably replaced; those outcomes need no force-kill. If no such outcome is established by `exit_timeout`, it attempts a checked force-kill; at `0` it makes that attempt without a polling wait. For `clean_restart <bot>…`, a completed pause retains its no-kill behavior.
+
+Other refused pauses lead on to the force-kill unless the cause is one a force-kill can't fix (a tmux session conflict, an unusable tmux session name, tmux unavailable, an agent-director internal error or a refused config file). A force-kill that can't act right now is tried up to 3 times, 2 s apart. The other personas are still torn down. Once every persona's teardown has finished, the command prints one line per persona it could not stop, in configuration order:
 
 ```text
 <command>: could not stop persona "<name>" (key=<key>), session "slack_bot_<key>": <CLASS>: <description>

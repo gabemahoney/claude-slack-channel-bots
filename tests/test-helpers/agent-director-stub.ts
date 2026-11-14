@@ -1,3 +1,4 @@
+import type { BusyDeliveryLookup, BusyDeliveryResult, CantSendDetails, NotPausableCause } from '../../src/ad-busy-send-types.ts'
 import { cannedReadPaneResult } from './ad-results.ts'
 
 import { mkdirSync } from 'node:fs'
@@ -1116,9 +1117,23 @@ export function errTmuxCaptureFailed(
 }
 
 /** Build an ErrSpawnNotPausable (the client's class; `pause` of a row that cannot be paused, e.g. `pending`). */
-export function errSpawnNotPausable(verb: string = 'pause'): ErrSpawnNotPausable {
-  return new ErrSpawnNotPausable(verb, 'ErrSpawnNotPausable', 'spawn not pausable in its current state')
+export function errSpawnNotPausable(verb: string = 'pause', cause?: NotPausableCause): ErrSpawnNotPausable {
+  return new ErrSpawnNotPausable(verb, 'ErrSpawnNotPausable', 'spawn not pausable in its current state', cause ? { cause } : undefined)
 }
+
+/** Structured E2 refusal; descriptions deliberately carry no policy facts. */
+export function errCantSend(overrides: Partial<CantSendDetails> = {}): ErrUnknownErrorName {
+  return new ErrUnknownErrorName('ErrCantSend', { status: 'error', err_name: 'ErrCantSend', err_description: 'busy send refused',
+    err_details: { class: 'cant_send', reason: 'agent_command', resend_safe: false, retry_with: 'none', ...overrides } })
+}
+/** SR-5 Result fixtures. Synthetic custody evidence, not live transport. */
+export function cannedBusyResult(overrides: Partial<BusyDeliveryResult> = {}): BusyDeliveryResult {
+  return { class: 'held', final: false, reason: 'turn_running', resend_safe: false, retry_with: 'none', wait: { reason: 'turn_running', since: '2026-11-13T00:00:00Z' }, instance_id: 'cscb_alpha', launch_token: 'launch-a', session_id: 'session', ...overrides }
+}
+export function cannedDeliveryLookup(result: BusyDeliveryResult | null = cannedBusyResult(), lookup: BusyDeliveryLookup['lookup'] = 'found'): BusyDeliveryLookup {
+  return { lookup, result }
+}
+export type StubGetDeliveryParams = { caller_uuid: string; delivery_request_id: string }
 
 /** Build an ErrSystemInstallDisappeared (the client's class; the binary is gone since construction). */
 export function errSystemInstallDisappeared(
@@ -1706,9 +1721,9 @@ export interface StubClientOptions {
   getFn?: (params: GetParams) => GetResult | Error | undefined
 
   // sendKeys()
-  sendKeysResult?: SendKeysResult
+  sendKeysResult?: SendKeysResult | BusyDeliveryResult
   sendKeysError?: Error
-  sendKeysQueue?: CannedResponse<SendKeysResult>[]
+  sendKeysQueue?: CannedResponse<SendKeysResult | BusyDeliveryResult>[]
   sendKeysCalls?: SendKeysParams[]
   /**
    * Per-call `send-keys` answer, as `spawnFn` is for
@@ -1719,7 +1734,14 @@ export interface StubClientOptions {
    * leaves the call to the other `send-keys` knobs on `undefined`. Lets an
    * Enter on a dialog pane clear the dialog and move the row to `waiting`.
    */
-  sendKeysFn?: (params: SendKeysParams) => StubCallAnswer<SendKeysResult>
+  sendKeysFn?: (params: SendKeysParams) => StubCallAnswer<SendKeysResult | BusyDeliveryResult>
+
+  // E2 read-only pair lookup; default unknown never grants replay authority.
+  getDeliveryResult?: BusyDeliveryLookup
+  getDeliveryError?: Error
+  getDeliveryQueue?: CannedResponse<BusyDeliveryLookup>[]
+  getDeliveryCalls?: StubGetDeliveryParams[]
+  getDeliveryFn?: (params: StubGetDeliveryParams) => StubCallAnswer<BusyDeliveryLookup>
 
   // readPane() — `readPaneResults` is a FIFO sequence of canned panes whose
   // last entry sticks once consumed; `readPaneError` rejects every call and
@@ -1819,6 +1841,8 @@ export interface StubClientOptions {
   pauseResult?: PauseResult
   pauseError?: Error
   pauseCalls?: PauseParams[]
+  pauseQueue?: CannedResponse<PauseResult>[]
+  pauseFn?: (params: PauseParams) => StubCallAnswer<PauseResult>
 
   // getPermission() — paired-AD-release verb wrapping `get-permission
   // --request-token <uuid>`. The published `agent-director` Client
@@ -1859,6 +1883,7 @@ export type StubClient = {
   status(params: StatusParams): Promise<StatusResult>
   get(params: GetParams): Promise<GetResult>
   sendKeys(params: SendKeysParams): Promise<SendKeysResult>
+  getDelivery(params: StubGetDeliveryParams): Promise<BusyDeliveryLookup>
   readPane(params: ReadPaneParams): Promise<ReadPaneResult>
   kill(params: KillParams): Promise<StubKillResult>
   decide(params: DecideParams): Promise<DecideResult>
@@ -1958,6 +1983,15 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
       }
       return nextResponse('send-keys', opts.sendKeysQueue, opts.sendKeysResult, opts.sendKeysError, {})
     },
+    async getDelivery(params: StubGetDeliveryParams): Promise<BusyDeliveryLookup> {
+      opts.getDeliveryCalls?.push(params)
+      if (opts.getDeliveryFn) {
+        const r = await opts.getDeliveryFn(params)
+        if (r instanceof Error) throw r
+        if (r !== undefined) return r
+      }
+      return nextResponse('get-delivery', opts.getDeliveryQueue, opts.getDeliveryResult, opts.getDeliveryError, cannedDeliveryLookup(null, 'unknown'))
+    },
     async readPane(params: ReadPaneParams): Promise<ReadPaneResult> {
       opts.readPaneCalls?.push(params)
       if (opts.readPaneFn) {
@@ -2030,8 +2064,12 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
     },
     async pause(params: PauseParams): Promise<PauseResult> {
       opts.pauseCalls?.push(params)
-      if (opts.pauseError) throw opts.pauseError
-      return opts.pauseResult ?? {}
+      if (opts.pauseFn) {
+        const r = await opts.pauseFn(params)
+        if (r instanceof Error) throw r
+        if (r !== undefined) return r
+      }
+      return nextResponse('pause', opts.pauseQueue, opts.pauseResult, opts.pauseError, {})
     },
     async getPermission(params: GetPermissionParams): Promise<GetPermissionResult> {
       opts.getPermissionCalls?.push(params)
@@ -2180,6 +2218,7 @@ export type StubCallLog = Required<
     | 'statusCalls'
     | 'getCalls'
     | 'sendKeysCalls'
+    | 'getDeliveryCalls'
     | 'readPaneCalls'
     | 'killCalls'
     | 'decideCalls'
@@ -2195,7 +2234,7 @@ export type StubCallLog = Required<
 /** An empty capture list for every verb; pass it to `makeStubClient`. */
 export function makeStubCallLog(): StubCallLog {
   return {
-    versionCalls: [], makeTemplateCalls: [], spawnCalls: [], statusCalls: [], getCalls: [], sendKeysCalls: [],
+    versionCalls: [], makeTemplateCalls: [], spawnCalls: [], statusCalls: [], getCalls: [], sendKeysCalls: [], getDeliveryCalls: [],
     readPaneCalls: [], killCalls: [], decideCalls: [], resumeCalls: [], findMissingCalls: [], deleteCalls: [],
     listCalls: [], pauseCalls: [], getPermissionCalls: [],
   }

@@ -290,7 +290,9 @@ This major version accepts only the persona configuration format. These are the 
 
 ### Downgrading to an earlier release
 
-Earlier releases ignore this release’s queue and can resume a bot without their required channels launch, leaving it unable to receive messages. Follow all four phases in order, including when the configuration already fits the target release.
+Once a release with the queue record kinds `submitted` and `submission-blocked` has run, going back to an older CSCB that cannot read that format is unsupported. Do not follow the phases below for such a target, even after draining the queues. There is no migration or replay workaround; see [Delivery and reconnect compatibility](agent-director.md#delivery-and-reconnect-compatibility).
+
+The four phases below apply only to a target that supports the current queue format. A supported downgrade must also start bots fresh with the target's required channels launch, or they can be unable to receive messages. Follow all four phases in order, including when the configuration already fits the target release.
 
 1. **Stop sending and empty the queues.** Wait until `server.log` shows every received item delivered. Otherwise explicitly accept that undelivered messages are lost when using the earlier release.
 2. **Disable resume on the current release.** Set `resume_enabled` to `false` in `config.json`, [confirm the pending change](reload.md#confirming-a-change), and verify `config.json.last-applied` holds `resume_enabled: false`. Keep the current server running until this is applied.

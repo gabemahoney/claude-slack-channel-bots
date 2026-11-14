@@ -2539,7 +2539,11 @@ check_ad_runtime() {
         | if (all(.[]; type == "string" and length > 0)) then @tsv else error("identity fields missing") end' "${record}") \
         || fail "${step}: runtime record is missing or invalid"
     IFS=$'\t' read -r version commit digest <<< "${expected}"
-    [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "${commit}" =~ ^[0-9a-f]{40}$ && "${digest}" =~ ^[0-9a-f]{64}$ ]] \
+    local version_re='^[0-9]+\.[0-9]+\.[0-9]+$'
+    if jq -e '.candidate_overlay == true' "${record}" > /dev/null; then
+        version_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+    fi
+    [[ "${version}" =~ ${version_re} && "${commit}" =~ ^[0-9a-f]{40}$ && "${digest}" =~ ^[0-9a-f]{64}$ ]] \
         || fail "${step}: runtime record has malformed identity fields"
     [[ -f "${binary}" && -x "${binary}" ]] || fail "${step}: runtime binary is missing or not executable"
     actual=$(sha256sum "${binary}") || fail "${step}: could not hash runtime binary"
@@ -2582,11 +2586,11 @@ install_ad_legacy_displayed() {
 }
 
 ad_release_at_least() {
-    local want="${1:-}" record="${2:-${SCENARIO_INSTALLED_AD_RECORD:-}}" have w h i
+    local want="${1:-}" record="${2:-${SCENARIO_INSTALLED_AD_RECORD:-}}" field="${3:-version}" have w h i
     [[ "${want}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "ad_release_at_least: '${want}' is not a version X.Y.Z"
     [[ -n "${record}" ]] || return 1
     [[ -f "${record}" ]] || fail "ad_release_at_least ${want}: no release record at ${record}"
-    have="$(jq -r '.version // empty' "${record}")" || fail "ad_release_at_least ${want}: jq could not read ${record}"
+    have="$(jq -r --arg field "${field}" '.[$field] // .version // empty' "${record}")" || fail "ad_release_at_least ${want}: jq could not read ${record}"
     [[ "${have}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)([-+].*)?$ ]] \
         || fail "ad_release_at_least ${want}: ${record}'s version '${have}' is not X.Y.Z"
     IFS=. read -r -a w <<< "${want}"
@@ -2623,7 +2627,9 @@ install_ad_release() {
     # 0.17.x's install.sh exits 2 on the journal flags; 0.18.0 and later need
     # them to cross a store below schema v16, and ignore them otherwise. The
     # backup directory must not exist yet; its parent must.
-    if ad_release_at_least 0.18.0 "${SCENARIO_RELEASE_RECORD}"; then
+    # Candidate overlays may retain the base's older installer. Select its
+    # accepted flags independently of the candidate binary's version.
+    if ad_release_at_least 0.18.0 "${SCENARIO_RELEASE_RECORD}" installer_version; then
         n="${_SCENARIO_INSTALL_COUNT}"
         backup="${SCENARIO_ROOT}/ad-journal-backup.${n}"
         while [[ -e "${backup}" || -L "${backup}" ]]; do

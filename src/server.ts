@@ -58,6 +58,7 @@ import { scrubProcessEnv } from './child-env.ts'
 import type { Client } from 'agent-director'
 import { createDeliveryEngines, createDeliveryLifecycle, type DeliveryEngines, type DeliveryLifecycle, type DeliveryEngineEvent } from './delivery-engine.ts'
 import { createDeliveryAdScope } from './delivery-ad-scope.ts'
+import { buildCoveredDeliveryBlockedNotice } from './covered-delivery.ts'
 import { setDeliveryLifecycle, setDeliveryPersonaLookup, inspectPersonaUpgrade, isTagUpgradePending, hasNotConnectedEpisode, applyDeliveryOwnRowRead, handleDeliveryKeyError, handleDeliveryReadError, recoverDeliveryGone, refreshDeliveryTranscript } from './session-manager.ts'
 import type { WebClient } from '@slack/web-api'
 import { join, resolve } from 'path'
@@ -97,6 +98,7 @@ import {
   type EscalateDeadVerdict,
   endPromptRowDeferral,
   forgetNotConnectedEpisode,
+  clearNotConnectedEpisodes,
   holdLaunchIfConfigDirUnresolvable,
   isLaunchInFlight,
   isLiveRowSequenceRunning,
@@ -1416,6 +1418,7 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   const deliveryStopping = deliveryEngines?.stop()
   await deliveryPreparation?.stop()
   await deliveryStopping
+  clearNotConnectedEpisodes()
   await remindersStopping
   await deliveryClients?.close()
   await deliveryQueue?.stop()
@@ -3464,6 +3467,7 @@ export async function main(): Promise<void> {
     inspectUpgrade: (key, _row, client, beforeCall) => deliveryScope.run(key, client as Client, beforeCall, async () => { await inspectPersonaUpgrade(key, getAppliedPersona(key)) }),
     refreshTranscript: (key, client, beforeCall) => deliveryScope.run(key, client as Client, beforeCall, () => refreshDeliveryTranscript(key)),
     onKeyError: handleDeliveryKeyError,
+    onCoveredBlocked: key => { void personaNotifier.notify(key, buildCoveredDeliveryBlockedNotice(getAppliedPersona(key) ?? { key })) },
     onReadError: handleDeliveryReadError,
     isRestartPendingOrActive, scheduleRestart,
     recoverGone: recoverDeliveryGone,

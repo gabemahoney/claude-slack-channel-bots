@@ -1149,6 +1149,33 @@ describe('every class the client declares is decided by class in src/ and the st
 
 /** The three Phase-1-only class names, as the audits below take them. */
 const PHASE1_NAMES: readonly string[] = PHASE1_ONLY_ERR_NAMES
+// Busy-send has no native class in the pinned client. It gets the same
+// namespace/stand-in protection without requiring a nonexistent re-export.
+const AUDITED_ERROR_NAMES = [...PHASE1_NAMES, 'ErrCantSend']
+
+describe('b.r6d C5 C6 production notice and shutdown wiring', () => {
+  test('blocked delivery renders the applied configured persona, with key fallback only if absent', async () => {
+    const source = readFileSync(join(import.meta.dir, '../src/server.ts'), 'utf8')
+    const body = /onCoveredBlocked: key => \{([\s\S]*?)\},/.exec(source)?.[1]
+    expect(body).toBeDefined()
+    const { buildCoveredDeliveryBlockedNotice } = await import('../src/covered-delivery.ts')
+    const run = new Function('key', 'personaNotifier', 'buildCoveredDeliveryBlockedNotice', 'getAppliedPersona', body!)
+    const configured = { key: 'support_key', name: 'Support "primary"' }
+    for (const persona of [configured, undefined]) {
+      const posted: string[] = []
+      run(configured.key, { notify: (_key: string, text: string) => posted.push(text) }, buildCoveredDeliveryBlockedNotice, () => persona)
+      expect(posted).toEqual([buildCoveredDeliveryBlockedNotice(persona ?? { key: configured.key })])
+    }
+  })
+  test('shutdown clears episode state after joining stopped delivery and before closing clients', () => {
+    const source = stripComments(readFileSync(join(import.meta.dir, '../src/server.ts'), 'utf8'))
+    const start = source.indexOf('await deliveryStopping')
+    const clear = source.indexOf('clearNotConnectedEpisodes()', start)
+    expect(start).toBeGreaterThan(-1)
+    expect(clear).toBeGreaterThan(start)
+    expect(clear).toBeLessThan(source.indexOf('await deliveryClients?.close()', start))
+  })
+})
 
 /**
  * The Phase-1-only names `sf` does not re-export as plain static named
@@ -1179,7 +1206,7 @@ function phase1ReExportFindings(sf: ts.SourceFile): string[] {
  */
 function phase1ReadFindings(sf: ts.SourceFile): string[] {
   return [
-    ...agentDirectorValueReads(sf, PHASE1_NAMES)
+    ...agentDirectorValueReads(sf, AUDITED_ERROR_NAMES)
       .filter((read) => !ts.isImportSpecifier(read.node) && !ts.isExportSpecifier(read.node))
       .map((read) => finding(sf, read.node, read.what)),
     ...agentDirectorNamespaceArguments(sf).map((arg) => finding(sf, arg, 'the agent-director namespace passed to a call')),
@@ -1215,10 +1242,10 @@ function isParameterAt(site: ts.Node, id: string): boolean {
 function givenNames(value: ts.Expression, site: ts.Node, b: ClassNameBindings): string[] | 'unreadable' {
   const inner = unwrap(value)
   const literal = literalOf(inner)
-  if (literal !== undefined) return PHASE1_NAMES.includes(literal) ? [literal] : []
+  if (literal !== undefined) return AUDITED_ERROR_NAMES.includes(literal) ? [literal] : []
   if (ts.isIdentifier(inner) && isParameterAt(site, inner.text)) return 'unreadable'
   const held = memberName(inner) === undefined ? undefined : b.constants.get(memberName(inner)!)
-  if (held !== undefined) return [...held].filter((name) => PHASE1_NAMES.includes(name))
+  if (held !== undefined) return [...held].filter((name) => AUDITED_ERROR_NAMES.includes(name))
   return 'unreadable'
 }
 
@@ -1253,7 +1280,7 @@ function phase1StandInFindings(sf: ts.SourceFile, b: ClassNameBindings): string[
     classes.push({ node, bound })
   })
   for (const { node, bound } of classes) {
-    const named = new Set(bound.filter((name) => PHASE1_NAMES.includes(name)))
+    const named = new Set(bound.filter((name) => AUDITED_ERROR_NAMES.includes(name)))
     let unreadable = false
     const give = (value: ts.Expression | undefined, site: ts.Node): void => {
       if (value === undefined) return
@@ -1342,6 +1369,7 @@ describe('src/agent-director-errors.ts re-exports the three Phase-1-only classes
 
 describe('no file in src/ or tests/test-helpers/ reads a Phase-1-only class from agent-director but by a named import or re-export', () => {
   const flagged: ReadonlyArray<readonly [string, string]> = [
+    ['the rejected namespace/fallback busy-send export', "import * as ad from 'agent-director'\nexport const ErrCantSend = ad.ErrCantSend ?? class ErrCantSend extends ad.AgentDirectorError {}"],
     ['a namespace property read', `${AD_NS}\nconst killFailed = ad.ErrTmuxKillFailed`],
     ['a guarded read through a typed optional cast', `${AD_NS}\nconst killFailed = (ad as unknown as { readonly ErrTmuxKillFailed?: unknown }).ErrTmuxKillFailed ?? StandIn`],
     ['a namespace element read', `${AD_NS}\nconst unresponsive = ad['ErrTmuxUnresponsive']`],
@@ -1390,6 +1418,8 @@ describe('no file in src/ or tests/test-helpers/ declares a stand-in for a Phase
   const standInFindings = (source: string): string[] => phase1StandInFindings(parseSource('planted/stand-in.ts', source), TREE_BINDINGS)
 
   const flagged: ReadonlyArray<readonly [string, string]> = [
+    ['a busy-send stand-in absent from the pinned native client', 'export class ErrCantSend extends AgentDirectorError {}'],
+    ['the rejected fallback busy-send constructor', "import * as ad from 'agent-director'\nexport const ErrCantSend = ad.ErrCantSend ?? class ErrCantSend extends ad.AgentDirectorError {}"],
     ['a class declared under the name', 'export class ErrTmuxKillFailed extends AgentDirectorError {}'],
     ['a class extending the base through a namespace', "import * as ad from 'agent-director'\nexport class ErrTmuxUnresponsive extends ad.AgentDirectorError {}"],
     ['a subclass of another client class under the name', 'class ErrTmuxSessionConflict extends ErrTmuxSendKeys {}'],

@@ -10,6 +10,9 @@
 # SessionStart re-fires every two seconds while AD says pending, until its grace
 # bound, to make lost-create-reply cases deterministic. Exact user messages go
 # to the transcript for receipt assertions. No native dialog bytes are fixtures.
+# This worker implements only the legacy terminal transport. Synthetic covered
+# custody lives in agent-director-busy-send.ts and never sends text here. It
+# cannot prove FileChanged/asyncRewake or Claude's native busy-send route.
 # Launch argv are recorded under flock, shell-quoted in stub-claude-launch-args
 # and as one JSON object per launch (cwd, instance_id, argv elements whole) in
 # stub-claude-launches.jsonl; --version only prints its pinned line.
@@ -663,6 +666,12 @@ handle_line() {
             display_record submitted UserPromptSubmit
         else
             append_user_receipt "${line}"
+            # Metadata-only receipt counter for the dual-path scenario: one
+            # record per complete legacy prompt, never per text/Enter call.
+            if [[ -n "${STUB_DIR:-}" && -f "${STUB_DIR}/stub-claude-count-prompts" ]]; then
+                { /usr/bin/flock -x 9 && printf '%s\t%s\n' "${AGENT_DIRECTOR_INSTANCE_ID:-}" "${SESSION_ID}" >&9; } \
+                    9>> "${STUB_DIR}/stub-claude-prompt-receipts" || exit 1
+            fi
         fi
     fi
     if (( AWAITING_ENTER )); then

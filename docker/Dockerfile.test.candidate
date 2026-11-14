@@ -1,0 +1,17 @@
+# syntax=docker/dockerfile:1
+# Explicit /ci --ad-candidate-dist only. Mirror the ordinary test setup below.
+# The runner supplies the local dist as a named context, never an npm release.
+FROM cscb-ci-base:v9
+COPY --chmod=0755 docker/ad-client-check.sh /opt/agent-director/check/ad-client-check.sh
+COPY --chmod=0755 docker/ad-candidate-overlay.sh /opt/agent-director/check/ad-candidate-overlay.sh
+RUN --mount=type=bind,from=ad-candidate,target=/candidate \
+    /opt/agent-director/check/ad-candidate-overlay.sh /candidate
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY tests /tests
+COPY testplans /test-repo/testplans
+RUN chmod +x /usr/local/bin/entrypoint.sh /tests/runner.sh /tests/integration/*.sh && \
+    touch /run/cscb-ci-performance.lock && \
+    useradd -m -s /bin/bash testuser && \
+    chown -R testuser:testuser /test-repo
+WORKDIR /test-repo
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

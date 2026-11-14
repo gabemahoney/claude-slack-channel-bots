@@ -24709,3 +24709,260 @@ describe('CI round 3: create-timeout recovery uses the first retry past B', () =
     }
   })
 })
+
+// b.r6d: production gate stays off until AD E6 is announced.
+import { errSpawnNotPausable as errConditionalPause } from './test-helpers/agent-director-stub.ts'
+
+describe('b.r6d regression: covered production reconnect default off', () => {
+  let life: DeliveryLifecycle | undefined
+  afterEach(async () => { await life?.stop(); life = undefined; setDeliveryLifecycle(undefined); recoveryAfterEach() })
+  test('b.r6d C5 C6 configured notice identity survives only for active keys; retire/re-add and global clear drop coverage', async () => {
+    const { h, p, b } = buildRecoveryCase()
+    const { buildCoveredRestartNotice } = await import('../src/covered-delivery.ts')
+    const { clearNotConnectedEpisodes, setDeliveryPersonaLookup } = await import('../src/session-manager.ts')
+    setDeliveryPersonaLookup(key => harnessPersona(h, key))
+    for (const key of [p, b]) {
+      h.script({ getResult: harnessRow(h, harnessPersona(h, key), { state: 'waiting', busy_send: 'covered', launch_token: key + '-launch' }) })
+      await readPersonaOwnRow(key, STATUS_READ_SITE)
+    }
+    forgetNotConnectedEpisode(p)
+    const notice = { reason: 'blocked-on-prompt' as const, autoRestartDisabled: false }
+    notifyPersonaNotConnected(p, notice); notifyPersonaNotConnected(b, notice)
+    expect(h.notices.find(n => n.key === p)!.text).toContain('Waiting on a prompt')
+    expect(h.notices.find(n => n.key === b)!.text).toBe(buildCoveredRestartNotice({ key: b, name: harnessPersona(h, b).name }))
+    clearNotConnectedEpisodes(); h.notices.length = 0
+    notifyPersonaNotConnected(b, notice)
+    expect(h.notices[0]!.text).toContain('Waiting on a prompt')
+    setDeliveryPersonaLookup(() => undefined)
+  })
+
+  test('covered reconnect never types or pauses, announces once and clears deferred retry', async () => {
+    const { h, p } = buildRecoveryCase()
+    life = createDeliveryLifecycle({ clock: h.clock })
+    setDeliveryLifecycle(life)
+    let retries = 0
+    life.setReconnect(async () => { retries++ })
+    life.defer(p)
+    expect(h.clock.pendingCount()).toBeGreaterThan(0)
+    const row = harnessRow(h, harnessPersona(h, p), { state: 'waiting', busy_send: 'covered', launch_token: 'r6d-default-off-launch' })
+    h.script({ getResult: row })
+    const first = reconnectMcpWithCause(p, WAITING_READ)
+    await h.clock.flush()
+    try { expect(h.stub.calls.sendKeysCalls).toEqual([]) }
+    finally {
+      // The old raw-key implementation waits for Enter on this clock. End
+      // that continuation even when the regression assertion fails.
+      if (h.stub.calls.sendKeysCalls.length) await life.stop()
+      await first
+    }
+    expect(await first).toEqual({ outcome: 'transient' })
+    expect(await reconnectMcpWithCause(p, WAITING_READ)).toEqual({ outcome: 'transient' })
+    expect(h.stub.calls.sendKeysCalls).toEqual([])
+    expect(h.stub.calls.pauseCalls).toEqual([])
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    expect(h.stub.calls.killCalls).toEqual([])
+    expect(life.owner(p)).toBe('free')
+    expect(life.deferred(p)).toBeUndefined()
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.clock.advance(NOT_NOW_RETRY_MS.at(-1)!)
+    expect(retries).toBe(0)
+    expect(h.notices).toHaveLength(1)
+    expect(h.notices[0]!.text).toContain('Restart the persona')
+    expect(h.errors.filter(line => line.includes('covered reconnect unavailable:'))).toHaveLength(1)
+  })
+})
+
+describe('b.r6d covered reconnect factory E6 seam', () => {
+  async function fixture(enabled?: boolean) {
+    const { createCoveredReconnect, buildCoveredRestartNotice } = await import('../src/covered-delivery.ts')
+    const row = cannedGetResult({ instance_id: 'cscb_test', busy_send: 'covered', launch_token: 'launch-a' })
+    const calls: string[] = [], logs: string[] = [], notices: string[] = []
+    let current: GetResult | undefined = row, ready = true, pauseError: Error | undefined
+    const run = createCoveredReconnect(enabled === undefined ? {} : { onlyIfWaiting: enabled })
+    const input = { key: 'test', row, ready: () => ready,
+      readRow: async () => { calls.push('get'); return current },
+      pause: async () => { calls.push('pause'); if (pauseError) throw pauseError; current = { ...row, state: 'ended' } },
+      resume: async () => { calls.push('resume') },
+      log: (line: string) => logs.push(line), notify: (text: string) => notices.push(text),
+    }
+    return { input, calls, logs, notices, factory: run, notice: buildCoveredRestartNotice({ key: input.key }), run: () => run(input),
+      row(value: GetResult | undefined) { current = value }, ready(value: boolean) { ready = value }, error(value: Error) { pauseError = value } }
+  }
+
+  test('default off announces once per persona and launch with no reads, pause or resume', async () => {
+    const h = await fixture()
+    expect(await h.run()).toBe('restart-required')
+    expect(await h.run()).toBe('restart-required')
+    expect(h.calls).toEqual([])
+    expect(h.notices).toEqual([h.notice]); expect(h.logs).toHaveLength(1)
+    h.input.row = { ...h.input.row, launch_token: 'launch-b' }
+    expect(await h.run()).toBe('restart-required')
+    expect(h.notices).toEqual([h.notice, h.notice]); expect(h.logs).toHaveLength(2)
+  })
+  test('b.r6d C6 forget/re-add only resets one disabled persona; clear resets both', async () => {
+    const h = await fixture(true); h.error(errInvalidFlags('pause'))
+    const beta = { ...h.input, key: 'beta' }
+    await h.run(); await h.factory(beta)
+    expect(h.calls).toEqual(['get', 'pause', 'get', 'pause'])
+    h.factory.forget('test')
+    await h.run(); await h.factory(beta)
+    expect(h.calls).toEqual(['get', 'pause', 'get', 'pause', 'get', 'pause'])
+    expect(h.notices).toHaveLength(3)
+    h.factory.clear(); await h.run(); await h.factory(beta)
+    expect(h.calls.filter(call => call === 'pause')).toHaveLength(5)
+    expect(h.notices).toHaveLength(5)
+  })
+  test('b.r6d C6 a replaced launch discards old disabled state even if a token is seen again', async () => {
+    const h = await fixture(true); h.error(errInvalidFlags('pause'))
+    for (const launch_token of ['launch-a', 'launch-b', 'launch-a']) {
+      h.input.row = { ...h.input.row, launch_token }; h.row(h.input.row)
+      await h.run()
+    }
+    expect(h.calls.filter(call => call === 'pause')).toHaveLength(3)
+    expect(h.notices).toHaveLength(3)
+  })
+  test.each((['get', 'pause'] as const).flatMap(boundary => (['forget', 'clear', 'replace'] as const).map(action => [boundary, action] as const)))('b.r6d C6 %s continuation is invalidated by %s', async (boundary, action) => {
+    const h = await fixture(true)
+    let release!: () => void
+    const barrier = new Promise<void>(resolve => { release = resolve })
+    let entered!: () => void
+    const entry = new Promise<void>(resolve => { entered = resolve })
+    if (boundary === 'get') h.input.readRow = async () => { entered(); await barrier; return h.input.row }
+    else h.input.pause = async () => { h.calls.push('pause'); entered(); await barrier; h.row({ ...h.input.row, state: 'ended' }) }
+    const pending = h.run(); await entry
+    if (action === 'forget') h.factory.forget('test')
+    else if (action === 'clear') h.factory.clear()
+    else await h.factory({ ...h.input, row: { ...h.input.row, launch_token: 'launch-new' }, ready: () => false })
+    release()
+    expect(await pending).toBe('deferred')
+    expect(h.calls.includes('resume')).toBe(false)
+    if (boundary === 'get') expect(h.calls.includes('pause')).toBe(false)
+    expect(h.notices).toEqual([])
+  })
+  test.each([undefined, 'not_covered'] as const)('enabled E6 preserves uncovered %s legacy path', async busy_send => {
+    const h = await fixture(true); h.input.row = { ...h.input.row, busy_send }
+    expect(await h.run()).toBe('legacy'); expect(h.calls).toEqual([])
+  })
+  test.each(['not_waiting', 'turn_pending'] as const)('E6 %s defers with no resume, kill or extra read', async cause => {
+    const h = await fixture(true); h.error(errConditionalPause('pause', cause))
+    expect(await h.run()).toBe('deferred')
+    expect(h.calls).toEqual(['get', 'pause']); expect(h.notices).toEqual([])
+  })
+  test.each((['pause_in_progress', 'pause_uncertain'] as const).flatMap(cause => (['waiting', 'ended', 'missing', 'changed-launch', 'unreadable'] as const).map(state => [cause, state] as const)))('E6 %s/%s resumes only with same-launch finished evidence', async (cause, state) => {
+    const h = await fixture(true); h.error(errConditionalPause('pause', cause))
+    let reads = 0
+    h.input.readRow = async () => {
+      h.calls.push('get')
+      if (++reads === 1) return h.input.row
+      return state === 'unreadable' ? undefined : { ...h.input.row, state: state === 'changed-launch' ? 'ended' : state, launch_token: state === 'changed-launch' ? 'launch-b' : 'launch-a' }
+    }
+    const completed = state === 'ended' || state === 'missing'
+    expect(await h.run()).toBe(completed ? 'ok' : 'deferred')
+    expect(h.calls).toEqual(completed ? ['get', 'pause', 'get', 'get', 'resume'] : ['get', 'pause', 'get'])
+    expect(h.notices).toEqual([])
+  })
+  test.each([undefined, 'covered', 'not_covered'] as const)('E6 agent_not_covered rechecks coverage %s without guessing death', async busy_send => {
+    const h = await fixture(true); h.error(errConditionalPause('pause', 'agent_not_covered'))
+    let reads = 0
+    h.input.readRow = async () => { h.calls.push('get'); return ++reads === 1 ? h.input.row : busy_send === undefined ? undefined : { ...h.input.row, busy_send } }
+    expect(await h.run()).toBe(busy_send === undefined ? 'deferred' : busy_send === 'covered' ? 'restart-required' : 'legacy')
+    expect(h.calls).toEqual(['get', 'pause', 'get'])
+    expect(h.notices).toEqual(busy_send === 'covered' ? [h.notice] : [])
+  })
+  test('E6 malformed pause disables that launch; a later launch may try again', async () => {
+    const h = await fixture(true); h.error(errInvalidFlags('pause'))
+    expect(await h.run()).toBe('restart-required')
+    expect(await h.run()).toBe('restart-required')
+    expect(h.calls).toEqual(['get', 'pause'])
+    expect(h.logs.filter(l => l.includes('malformed covered pause'))).toHaveLength(1)
+    expect(h.notices).toEqual([h.notice])
+    h.input.row = { ...h.input.row, launch_token: 'launch-b' }; h.row(h.input.row)
+    expect(await h.run()).toBe('restart-required')
+    expect(h.calls).toEqual(['get', 'pause', 'get', 'pause'])
+  })
+  test.each(['before-read', 'changed-launch', 'after-read', 'after-pause'] as const)('E6 %s revocation prevents lifecycle action', async boundary => {
+    const h = await fixture(true)
+    if (boundary === 'before-read') h.ready(false)
+    if (boundary === 'changed-launch') h.row({ ...h.input.row, launch_token: 'launch-b' })
+    if (boundary === 'after-read') h.input.readRow = async () => { h.calls.push('get'); h.ready(false); return h.input.row }
+    if (boundary === 'after-pause') h.input.pause = async () => { h.calls.push('pause'); h.ready(false) }
+    expect(await h.run()).toBe('deferred')
+    expect(h.calls.includes('resume')).toBe(false)
+    if (boundary !== 'after-pause') expect(h.calls.includes('pause')).toBe(false)
+  })
+  test('E6 ordinary success reads ended row before resume', async () => {
+    const h = await fixture(true)
+    expect(await h.run()).toBe('ok')
+    expect(h.calls).toEqual(['get', 'pause', 'get', 'resume'])
+    expect(h.notices).toEqual([])
+  })
+  test('E6 successful pause with a still-live row defers rather than resuming', async () => {
+    const h = await fixture(true); h.input.pause = async () => { h.calls.push('pause') }
+    expect(await h.run()).toBe('deferred'); expect(h.calls).toEqual(['get', 'pause', 'get'])
+  })
+  test('E6 GONE-like pause refusal propagates without resume or fallback kill', async () => {
+    const h = await fixture(true); h.error(errSpawnNotFound())
+    await expect(h.run()).rejects.toThrow()
+    expect(h.calls).toEqual(['get', 'pause']); expect(h.notices).toEqual([])
+  })
+})
+
+import { runEnabledReconnectBranch } from './test-helpers/covered-reconnect.ts'
+describe('b.r6d enabled production reconnect callbacks: lifecycle leases', () => {
+  let life: DeliveryLifecycle | undefined
+  afterEach(async () => { await life?.stop() })
+  test.each(['success', 'not_waiting', 'turn_pending', 'pause_in_progress', 'pause_uncertain', 'agent_not_covered'] as const)('%s preserves conditional pause and checked resume ownership', async cause => {
+    const clock = createFakeClock()
+    const key = 'r6d-enabled', calls = makeStubCallLog()
+    life = createDeliveryLifecycle({ clock })
+    const row = cannedGetResult({ instance_id: personaInstanceId(key), busy_send: 'covered', launch_token: 'launch-a', state: 'waiting' })
+    life.observeRow(key, row)
+    const log: string[] = [], notices: unknown[] = [], owners: string[] = []
+    let paused = false
+    const client = makeStubClient({ ...calls,
+      pauseFn: params => {
+        owners.push(life!.owner(key))
+        expect(params).toEqual({ instance_id: row.instance_id, only_if_waiting: true })
+        paused = true
+        return cause === 'success' ? {} : errConditionalPause('pause', cause)
+      },
+      resumeFn: params => { owners.push(life!.owner(key)); expect(params.instance_id).toBe(row.instance_id); return { instance_id: row.instance_id } },
+    })
+    const result = await runEnabledReconnectBranch({ key, row, life, client, log, notices,
+      readRow: async () => {
+        if (!paused) return row
+        if (cause === 'agent_not_covered') return { ...row, busy_send: 'not_covered' }
+        if (cause === 'not_waiting' || cause === 'turn_pending') return row
+        // The end read invalidates the first lease. Resume must reacquire it.
+        return { ...row, state: 'ended' }
+      } })
+    const resumes = ['success', 'pause_in_progress', 'pause_uncertain'].includes(cause)
+    expect(result).toEqual({ outcome: resumes ? 'ok' : 'transient' })
+    expect(calls.pauseCalls).toHaveLength(1)
+    expect(calls.resumeCalls).toHaveLength(resumes ? 1 : 0)
+    expect(owners).toEqual(resumes ? ['reconnect', 'reconnect'] : ['reconnect'])
+    expect(life.owner(key)).toBe('free')
+    expect(calls.killCalls).toEqual([]); expect(calls.sendKeysCalls).toEqual([])
+    expect(life.deferred(key)).toEqual(resumes ? undefined : { due: false })
+  })
+
+  test('ownership revoked during paused-row read prevents resume and does not release a newer lease', async () => {
+    const key = 'r6d-revoked', clock = createFakeClock(), calls = makeStubCallLog()
+    life = createDeliveryLifecycle({ clock })
+    const row = cannedGetResult({ instance_id: personaInstanceId(key), busy_send: 'covered', launch_token: 'launch-a', state: 'waiting' })
+    life.observeRow(key, row)
+    let reads = 0, releaseOther: (() => void) | undefined
+    const client = makeStubClient(calls)
+    await runEnabledReconnectBranch({ key, row, life, client, log: [], notices: [],
+      readRow: async () => {
+        if (++reads === 2) {
+          life!.forget(key); life!.activate(key)
+          releaseOther = life!.acquire(key, 'delivery')
+        }
+        return row
+      } })
+    expect(calls.resumeCalls).toEqual([])
+    expect(life.owner(key)).toBe('delivery')
+    releaseOther?.()
+  })
+})

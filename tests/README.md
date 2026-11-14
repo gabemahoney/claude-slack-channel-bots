@@ -436,6 +436,9 @@ tests/
                                    # unnormalized real-client negative controls and production normalized positive behavior
     test-49-fmk-model-effort.sh    # per-persona model and effort: each launch's `--model=`/`--effort=` elements whole; resume kept across a death,
                                    # clean_restart and stop/start; a changed value starts a fresh conversation with one Fresh-Start Line, the old kept
+    test-50-fmk-busy-send.sh       # packed queue/engine: actual legacy text/Enter and receipts on uncovered launches; synthetic covered custody,
+                                   # safe fallback after a fresh get, held-to-Final and unknown lookup recovery without resend, default-off reconnect;
+                                   # native stub receipt counts reject accidental covered input; no native E2 transport or E6 reconnect proof
     lib/
       displayed-states.sh          # contained setup, runtime provenance and success/failure leak checks before closing diagnostics and driver evidence release
       real-scenario.sh             # native agent setup, minimal permissions, exact evidence, faults, bounds and once-only EXIT accounting

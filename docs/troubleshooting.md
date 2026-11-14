@@ -69,7 +69,10 @@ The server retries the persona on its own (after 30, 60, 120 and 240 s, then eve
 After a removal, rename or path change, or a start whose clean-up could not end an old instance, no persona comes up in that directory until the old instance has ended; the server keeps ending it. If its kill keeps failing, a human follows the "Operator actions" section of agent-director's README. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-waits-on-an-old-instance-in-its-working-directory).
 
 **Bot alive but silently unresponsive (MCP disconnected)**
-Accepted messages remain queued; a Slack message triggers the configured reconnect too. The health check reconnects or relaunches such a bot on its own, within about 3–5 minutes at the default settings. With `session_restart_delay` set to `0`, a *Not connected* notice reports it instead. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-bot-alive-but-silently-unresponsive-mcp-disconnected).
+Accepted messages remain queued. For an uncovered instance the health check normally reconnects it within 3–5 minutes; covered automatic reconnect is unavailable in this build and its notice asks a human to restart the persona. With `session_restart_delay` set to `0`, a *Not connected* notice reports the disconnection. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-bot-alive-but-silently-unresponsive-mcp-disconnected).
+
+**Delivery is blocked or its hand-over is unconfirmed**
+Keep the queue and read `server.log`; covered delivery holds unknown outcomes without resending, and the pinned client needs a matching busy-send client for covered instances. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-delivery-is-blocked-or-its-hand-over-is-unconfirmed).
 
 **Reading the start summary**
 Each start logs one `[slack] startupSessionManager: complete — …` line counting its personas by outcome. `latched`, `retrying`, `waiting on a live-row sequence`, `held on invalid flags` and `fresh as retired keys` are not failures. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-reading-the-start-summary).
@@ -81,7 +84,7 @@ For *Message not saved*, check the server disk; for *Delivery stuck* or *Message
 On a macOS host CSCB types a long message in parts of at most about 880 bytes each. A message queued before an upgrade can keep larger parts, and a restart does not split it again: CSCB keeps offering it until the bot takes it in, while later messages wait. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-on-a-mac-keeps-retyping-a-long-message).
 
 **A persona posts a *Waiting on a prompt* or *Not connected* notice**
-The session runs but is disconnected; accepted messages are kept until it reconnects. A human attaches with `tmux attach -t =slack_bot_<key>`, deals with anything on screen and, if it stays disconnected, types `/mcp reconnect slack-channel-router`, or restarts the server. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-waiting-on-a-prompt-or-not-connected-notice).
+The instance is disconnected; accepted messages are kept. Follow the notice: a covered instance asks for a persona restart; an uncovered instance can be reconnected manually by a human after answering any prompt. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-waiting-on-a-prompt-or-not-connected-notice).
 
 **A persona posts a *Not answering*, *Still not answering* or *Answering again* notice**
 agent-director or tmux is not answering for this persona's session; the server keeps retrying and posts *Answering again* when it recovers. After *Still not answering*, a human checks tmux and agent-director with read-only commands only. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-not-answering-still-not-answering-or-answering-again-notice).
@@ -117,7 +120,7 @@ A human fixes `~/.config/agent-director/config.toml` following agent-director's 
 agent-director returned an error the server can't classify; the server keeps retrying. A human checks the host's agent-director and the persona's lines in `server.log`; the next retry recovers the persona once agent-director answers normally. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-an-unclassified-agent-director-error-notice).
 
 **Session stuck during clean_restart**
-A bot that doesn't exit within `exit_timeout` is force-killed (under `clean_restart <bot>…`, a bot whose pause succeeds is never force-killed, and only a refused pause leads to the force-kill); one that still can't be stopped fails the command (see "`clean_restart` or `stop --stop-bots` exits non-zero with `could not stop`" below). Rows are never deleted, so running `clean_restart` again is safe. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-session-stuck-during-clean_restart).
+A bot that doesn't exit within `exit_timeout` can reach checked force-kill. Under `clean_restart <bot>…`, a completed pause never leads to force-kill; an underway shutdown can settle through exit or proven replacement, or reach checked kill at the timeout (without a polling wait at zero). One that still can't be stopped fails the command (see "`clean_restart` or `stop --stop-bots` exits non-zero with `could not stop`" below). Rows are never deleted, so running `clean_restart` again is safe. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-session-stuck-during-clean_restart).
 
 **`clean_restart` exits 2 with `Usage:`**
 It needs `--server` (the server and every bot) or the names of the bots to restart; a bare `clean_restart` stops nothing. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-clean_restart-exits-2-with-usage).
