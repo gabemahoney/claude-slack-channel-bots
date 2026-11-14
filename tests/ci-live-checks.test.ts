@@ -2752,7 +2752,7 @@ const ROWS = (['a', 'b', 'c'] as const).map((l) => rowLine(l)).join('\n')
 function rebootedRun(
   cAt: number | null,
   lines: readonly (readonly [number, string])[] = startLog(cAt),
-  opts: { rows?: (n: number) => string; broughtUp?: PersonaLetter[]; dRowKept?: boolean } = {},
+  opts: { rows?: (n: number) => string; broughtUp?: PersonaLetter[]; dRowKept?: boolean; pending?: string } = {},
 ) {
   const clock = virtualClock()
   const log = timedLog(clock, lines)
@@ -2761,6 +2761,7 @@ function rebootedRun(
   const { container } = fakeContainer([
     ['echo BOOT', 'BOOT'],
     ['kill -0', 'running'],
+    ['showpending', () => opts.pending ?? ''],
     ['', (script) => (script === 'mark' || script === 'cat ~/cscb-live/reboot-log-mark' ? '1:0' : script === 'rows' ? rowsAt(reads++) : (log.since(script) ?? ''))],
   ])
   const shared = {
@@ -2769,6 +2770,24 @@ function rebootedRun(
   }
   return makeCtx({ mode: 'real', clock, human: scriptedHuman(clock).human, browser: idleBrowser(), container, shared, restartContainer: async () => log.begin() })
 }
+
+describe("Check 28 step 6: B's credentials change is no longer pending", () => {
+  test.each([
+    ['a channel line for B', [], 0, []],
+    ['a credentials line for B despite zero in the counts', ['persona "persona_b" (key=persona_b): credentials file "/test/b.json" changed: a new connection opens, then the old one closes, instance kept.'], 0, ["step 6: B's credentials change is still pending"]],
+    ['a nonzero credentials count without a credentials line', [], 1, ["step 6: the counts are not 1 removed (B's change still pending?)", 'step 6: the counts are not 0 with changed credentials']],
+  ] as const)('%s', async (_what, credentialsLines, credentials, expected) => {
+    const pending = [
+      PENDING_FILE_HEADER, `fingerprint: sha256:${'0'.repeat(64)}`, '',
+      previewHeader({ removed: 1, credentials }), removedPreviewLine('c'),
+      'Channel persona=persona_b channel=C_TEST: copied; unchanged.', ...credentialsLines,
+    ].join('\n')
+    const result = await check28.run(rebootedRun(155, undefined, { pending }))
+    const failures = (result.reason ?? '').split('; ').filter((line) =>
+      line.startsWith('step 6: the counts') || line.startsWith("step 6: B's credentials") || line.includes('pending file names persona_b'))
+    expect(failures).toEqual([...expected])
+  })
+})
 
 describe('Check 28 step 5: the start after the reboot waits for every persona to connect, not only for B', () => {
   /** The findings that step 5's start lines give. */
