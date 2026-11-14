@@ -22,8 +22,8 @@
  *   or created; a refused create clears it;
  *   a real run with no apps.json creates no app unless `--create-apps`;
  * - the configuration token is rotated once when expired, the new pair saved
- *   (refresh token first) before the retry; a missing or refused token is a
- *   `ConfigTokenUnavailableError`, which the apps stage survives with a
+ *   (refresh token first) before the retry; a missing, refused or
+ *   no_permission token is a `ConfigTokenUnavailableError`, which the apps stage survives with a
  *   warning only when apps.json records all four apps;
  * - `apps --delete-strays` runs only on an apps.json that is there, parses
  *   and records an app ID (read again before each delete), and deletes only
@@ -309,6 +309,16 @@ describe('ConfigTokenSource', () => {
     const s = source(REFRESH, json({ ok: false, error: 'invalid_manifest' }))
     expect(await s.tokens.call('apps.manifest.create', { manifest: '{}' })).toEqual({ ok: false, error: 'invalid_manifest' })
     expect(s.written).toEqual([])
+  })
+
+  test('no_permission after an expiry rotation is unavailable without another rotation', async () => {
+    const s = source(REFRESH, json({ ok: false, error: 'token_expired' }), json({ ok: true, token: ROTATED, refresh_token: NEXT_REFRESH }), json({ ok: false, error: 'no_permission' }))
+    const err = await rejection(s.tokens.call('apps.manifest.export', { app_id: 'A0APP00001' }))
+    expect(err).toBeInstanceOf(ConfigTokenUnavailableError)
+    expect(err.message).toBe('the Slack app configuration token cannot manage the test apps (no_permission)')
+    expect(s.calls.map((c) => c.method)).toEqual(['apps.manifest.export', 'tooling.tokens.rotate', 'apps.manifest.export'])
+    expect(s.written.length).toBe(1)
+    assertNoLeak(err)
   })
 
   describe('over the secret store (both token files, mode 600)', () => {
@@ -837,6 +847,7 @@ describe('the apps stage without a usable configuration token', () => {
   const REFUSED = 'the Slack app configuration token was refused (token_expired): write a fresh one to /cfg/slack_config_token (mode 600)'
   const CONDITIONS = [
     ['missing', {}, [], [], 'the Slack app configuration token is missing: write it to /cfg/slack_config_token (mode 600)'],
+    ['without permission (no_permission), even with a refresh token', { token: CONFIG_TOKEN, refresh: REFRESH }, [json({ ok: false, error: 'no_permission' })], ['apps.manifest.export'], 'the Slack app configuration token cannot manage the test apps (no_permission)'],
     ['expired, with no refresh token', { token: CONFIG_TOKEN }, [EXPIRED], ['apps.manifest.export'], REFUSED],
     ['expired, its rotation refused', { token: CONFIG_TOKEN, refresh: REFRESH }, [EXPIRED, json({ ok: false, error: 'invalid_refresh_token' })], ['apps.manifest.export', 'tooling.tokens.rotate'], REFUSED],
   ] as const
@@ -856,12 +867,42 @@ describe('the apps stage without a usable configuration token', () => {
     assertNoLeak({ lines: h.lines, outcomes })
   })
 
-  test.each(CONDITIONS)('a configuration token %s, with an app missing from apps.json: not runnable (exit 2), naming the token file, and nothing created', async (_what, seed, script, methods, why) => {
+  test.each(CONDITIONS)('a configuration token %s, with an app missing from apps.json: not runnable (exit 2), naming the cause, and nothing created', async (_what, seed, script, methods, why) => {
     const h = tokenHarness(seed, [...script], ['a', 'b', 'c'])
     const err = await rejection(runAppsStage(h.deps))
     expect([err instanceof ConfigTokenUnavailableError, err instanceof NotRunnableError, err.message]).toEqual([true, true, why])
     expect(h.calls.map((c) => c.method)).toEqual([...methods])
     expect(h.appsJson()).toBe(h.before)
+    assertNoLeak({ err, lines: h.lines })
+  })
+
+  test('an internal_error on export still stops with AppsStageError, even with all four apps recorded', async () => {
+    const h = tokenHarness({ token: CONFIG_TOKEN, refresh: REFRESH }, [json({ ok: false, error: 'internal_error' })], PERSONA_LETTERS)
+    const err = await rejection(runAppsStage(h.deps))
+    expect(err).toBeInstanceOf(AppsStageError)
+    expect(err.message).toBe('apps.manifest.export for CSCB Test A (A0APPOLD01) failed: internal_error')
+    expect(h.calls.map((c) => c.method)).toEqual(['apps.manifest.export'])
+    expect(h.lines).toEqual([])
+    expect(h.appsJson()).toBe(h.before)
+    assertNoLeak({ err, lines: h.lines })
+  })
+
+  test.each(['create', 'resolve an unfinished create'] as const)('no_permission cannot %s, rotates nothing and keeps no new app ID', async (operation) => {
+    const h = tokenHarness({ token: CONFIG_TOKEN, refresh: REFRESH }, [json({ ok: false, error: 'no_permission' })], [])
+    h.deps.letters = ['a']
+    if (operation === 'resolve an unfinished create') {
+      h.deps.appsFile.update((state) => {
+        state.personas.a = { pending_create: { started_at: '2026-01-01T00:00:00.000Z' } }
+      })
+      h.deps.listApps = async () => [{ id: 'A0PENDING1', name: 'CSCB Test A', rowText: 'CSCB Test A CSCB CI Test' }]
+    }
+    const before = h.appsJson()
+    const err = await rejection(runAppsStage(h.deps))
+    expect(err).toBeInstanceOf(ConfigTokenUnavailableError)
+    expect(err).toBeInstanceOf(NotRunnableError)
+    expect(h.calls.map((c) => c.method)).toEqual([operation === 'create' ? 'apps.manifest.create' : 'apps.manifest.export'])
+    expect(h.appsJson()).toBe(before)
+    expect(h.lines.filter((l) => l.startsWith('WARNING:'))).toEqual([])
     assertNoLeak({ err, lines: h.lines })
   })
 })
@@ -1416,6 +1457,7 @@ describe("buildAppSetupSource: the setup-readiness checks' view of this run's pr
   // Each row: [what, token files, Slack's answers, why, fail the next rename].
   const UNAVAILABLE: [string, { token?: string; refresh?: string }, Scripted[], string, boolean][] = [
     ['no configuration token', {}, [json({ ok: true })], 'no usable configuration token', false],
+    ['no_permission to manage the app', { token: CONFIG_TOKEN, refresh: REFRESH }, [json({ ok: false, error: 'no_permission', detail: LEAK_SENTINEL })], 'no usable configuration token', false],
     ['an expired token whose rotation is refused', { token: CONFIG_TOKEN, refresh: REFRESH }, [EXPIRED, json({ ok: false, error: 'invalid_refresh_token' })], 'no usable configuration token', false],
     ['ok: false', { token: CONFIG_TOKEN }, [json({ ok: false, error: 'invalid_app_id', detail: LEAK_SENTINEL })], 'invalid_app_id', false],
     ['ok: false with an unsafe error code', { token: CONFIG_TOKEN }, [json({ ok: false, error: `x ${CONFIG_TOKEN}` })], 'unknown_error', false],

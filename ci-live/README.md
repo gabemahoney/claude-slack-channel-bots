@@ -83,9 +83,12 @@ already existed keeps its old mode.
 The configuration token and its refresh token. A run uses the configuration
 token to check the apps against `slack-app-manifest.yml` through the manifest
 API, and to update a drifted app or create a missing one. Once `apps.json`
-records all four apps, the token is optional: without a usable one, a run
-logs a `WARNING` and reuses the recorded apps unchecked. A configuration
-token lasts 12 hours. With the refresh token, the runner rotates the pair
+records all four apps, the token is optional: a missing or refused token, or
+`no_permission` (the token cannot manage the test apps), gives one `WARNING`
+and reuses the recorded apps unchecked, with no further export, drift check
+or update. `no_permission` never triggers rotation; creating an app or
+resolving an unfinished create still needs a usable token (exit 2 without it).
+A configuration token lasts 12 hours. With the refresh token, the runner rotates the pair
 when the token has expired and saves both files (mode 600). Write the
 refresh token issued with the token in `slack_config_token` (the same
 **Generate Token** click shows both). If you no longer have it, generate a

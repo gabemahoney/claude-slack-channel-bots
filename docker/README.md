@@ -1672,9 +1672,11 @@ runner lives in `ci-live/` and is not part of the npm package.
      the reason says to rerun.
    - **The configuration token is optional once the apps exist.** When
      `apps.json` records all four app IDs and the token is missing, empty or
-     refused (expired with no refresh token, or a refused rotation), the
-     stage logs a `WARNING` (never the value) and reuses the recorded apps
-     without their export, drift check or update. Each is logged as
+     refused (expired with no refresh token, or a refused rotation), or
+     cannot manage the test apps (`no_permission`), the stage logs one
+     `WARNING` (never the value) and reuses the recorded apps without further
+     export, drift check or update. `no_permission` never triggers rotation.
+     Each is logged as
      `reused … (unchecked: no usable configuration token)`. Creating an app
      or resolving an unfinished create still needs the token (exit 2
      without it).
