@@ -361,8 +361,10 @@ While a run is going:
 - **Memory.** The container is capped at 8 GiB with no swap and 2048
   processes, and the run keeps one Chrome with a page per account, idle on
   `about:blank` between flows. Every 30 s a `watchdog:` line in `run.log`
-  gives the host's working set, the container's memory, Chrome's (PSS) and
-  the runner's (RSS). When the host's working set passes 40 GiB or Chrome
+  gives the host's non-reclaimable memory, the container's memory, Chrome's
+  (PSS) and the runner's (RSS). The host measure, shared with `/ci`, is
+  `max(anon + shmem, active_anon + inactive_anon + unevictable)`; reclaimable
+  page cache is excluded. When the host's non-reclaimable memory passes 40 GiB or Chrome
   passes 4 GiB, the watchdog stops the run the way Ctrl-C does, closing
   Chrome at once, with the verdict
   `FAIL: memory watchdog: <what, its value and the limit>`. The peaks are at
