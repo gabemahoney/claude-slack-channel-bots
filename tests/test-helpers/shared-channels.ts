@@ -220,7 +220,7 @@ export function makeMembershipHarness(stateDir: string, options: {
   const scanner = createMembershipScanner({ authority, membership, connections: h.manager, clock: h.clock, dryRun: options.dryRun ?? false, log, onStatus: options.onScanStatus })
   const membershipStatus = membershipConnectionListener(membership, scanner, h.manager, options.dryRun ?? false)
   h.onStatus = (key, status) => { membershipStatus(key, status); if (options.realBringUp) bringUps.onConnectionStatus(key, status) }
-  const router = createPersonaEventRouter({ membership, routing: { receive: async () => {} }, clientFor: h.clientFor, getPersona: h.getPersona, log })
+  const router = createPersonaEventRouter({ membership, routing: { receive: async () => {}, receiveReaction: async () => {} }, clientFor: h.clientFor, getPersona: h.getPersona, log })
   h.onEvent = router
   let eventId = 0
   return {

@@ -2350,7 +2350,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
   ] as const)('test-29 closing body check skips only the RAW and dispatch lines: %s', async (_name, form, where, status) => {
     const body = 'test-29-invited-channels plain-7'
     const logged: string[] = []
-    const router = createPersonaEventRouter({ routing: { receive: async () => {} }, clientFor: () => undefined as never, getPersona: () => undefined as never, log: line => logged.push(line) })
+    const router = createPersonaEventRouter({ routing: { receive: async () => {}, receiveReaction: async () => {} }, clientFor: () => undefined as never, getPersona: () => undefined as never, log: line => logged.push(line) })
     const event = { type: 'message', channel: 'CHUMAN', text: body, ts: '1700000001.000001', user: 'UHUMAN', channel_type: 'channel' }
     await router('t29_alpha', 'message', { event, ack: async () => {} } as never)
     await router('t29_alpha', 'app_mention', { event: { ...event, type: 'app_mention' }, ack: async () => {} } as never)

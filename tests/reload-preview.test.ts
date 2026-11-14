@@ -540,6 +540,7 @@ describe('in-place changes', () => {
     ['permission_prompts', (b) => (b.permission_prompts = 'C0B0002')],
     ['dm.enabled', (b) => (b.dm = { enabled: true, contact: 'U0B0001' })],
     ['dm.contact', (b) => (b.dm = { enabled: false, contact: 'U0B0002' })],
+    ['reaction_notices', (b) => (b.reaction_notices = false)],
   ])('a %s change is applied in place immediately and keeps the instance', (setting, mutate) => {
     const { plan, lines } = preview(edited((c) => mutate(entry(c, 'bravo'))))
 

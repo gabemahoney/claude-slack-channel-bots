@@ -9,7 +9,8 @@ import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
  * `makeManagedRouting(h, baseDir, opts?)` takes a connection harness
  * (`makeConnectionHarness`) and builds `createPersonaRouting` with the same
  * seams the server passes: `getBotIdentity` from the harness's identity getter
- * (`createPersonaIdentityLookup`), `clientFor` from its client lookup
+ * (`createPersonaIdentityLookup`), `isRunBotIdentity` from the manager's own
+ * query (`h.manager.isRunBotIdentity`), `clientFor` from its client lookup
  * (`createPersonaClientLookup`), the user-name lookup on the receiving
  * persona's own client (`users.info`, the ID when it has no client), the
  * archive seam the caller passes (default: none), the server-wide
@@ -88,11 +89,16 @@ export function makeManagedRouting(h: ConnectionHarness, baseDir: string, opts: 
     onReceived: opts.onReceived,
     getPersonaConfig: () => h.config,
     getBotIdentity: key => h.identityFor(key),
+    isRunBotIdentity: id => h.manager.isRunBotIdentity(id),
     queue,
     prepare: preparation.prepare,
     archive: opts.archive ?? (() => {}),
     log,
   })
-  const routing = { ...core, receive: async (...args: Parameters<typeof core.receive>) => { await ready; return core.receive(...args) } }
+  const routing = {
+    ...core,
+    receive: async (...args: Parameters<typeof core.receive>) => { await ready; return core.receive(...args) },
+    receiveReaction: async (...args: Parameters<typeof core.receiveReaction>) => { await ready; return core.receiveReaction(...args) },
+  }
   return { routing, logs, queue, ready, close: async () => { hold.cancelAll(); await preparation.stop(); await queue.stop() }, queued: key => queue.items(key), notifications }
 }

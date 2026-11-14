@@ -4,6 +4,7 @@ import type { PersonaConnectionClock } from './persona-connections.ts'
 import { describeSlackCallFailure } from './persona-connection-errors.ts'
 import { OWN_POST_CANCELLED } from './persona-destination.ts'
 import { ownPostAnswerOfError, ownPostAnswerOfPost, type OwnPostAnswer, type OwnPostStart } from './own-post.ts'
+import { SERVER_POST_EVENT_TYPE } from './server-post.ts'
 
 export const NOTICE_CORRECTION_TIMEOUT_MS = 10_000
 export type NoticeCorrectionOutcome =
@@ -58,7 +59,9 @@ async function postCorrection(post: PostedPersonaNotice, text: string, deps: Not
   if (deps.signal.aborted || !deps.isActive()) { end({ kind: 'failed', code: OWN_POST_CANCELLED }); return { outcome: 'cancelled' } }
   return attempt(() => {
     let call: Promise<unknown>
-    try { call = post.client.chat.postMessage({ channel: post.channelId, text }) } catch (error) { end(ownPostAnswerOfError(error)); throw error }
+    try {
+      call = post.client.chat.postMessage({ channel: post.channelId, text, metadata: { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} } })
+    } catch (error) { end(ownPostAnswerOfError(error)); throw error }
     void call.then(response => end(ownPostAnswerOfPost(post.channelId, response)), error => end(ownPostAnswerOfError(error)))
     return call
   }, deps)

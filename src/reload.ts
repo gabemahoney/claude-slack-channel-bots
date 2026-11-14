@@ -24,7 +24,8 @@
  * an uncertain post-rename outcome retains its evidence and blocks more writes.
  * Successful application consumes the confirmation. Steps 2–6 tear down,
  * update in place, reconnect, refresh templates and bring up, using the existing
- * per-persona lifecycle. Shutdown prevents further operations from starting.
+ * per-persona lifecycle; once they settle, `onApplySettled` is told the applied
+ * configuration, not awaited. Shutdown prevents further operations from starting.
  * No path deletes or reselects accepted queue items.
  *
  * The controller (`createReloadController`) is built with every dependency
@@ -255,6 +256,18 @@ export function reloadSharedAuthorityApplyFailedLine(
     `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write the shared channel authority ${JSON.stringify(path)}${failure}; ` +
     `application ${outcome}; preserve the prepared input and authority evidence; the change remains pending${restored}`
   )
+}
+
+/**
+ * The line logged when `onApplySettled`, told that a confirmed apply's steps
+ * 2–6 have settled, throws or its returned promise rejects; the apply goes
+ * on. `description` is the thrown value as `describeThrownValue` renders it.
+ * Pure.
+ *
+ * [slack] reload: the server's post-apply work failed: <thrown value>
+ */
+export function reloadPostApplyFailedLine(description: string): string {
+  return `[slack] reload: the server's post-apply work failed: ${description}`
 }
 
 /**
@@ -558,9 +571,24 @@ export interface ReloadControllerDeps {
    * persona set and its `channel_mode` switch, with every other
    * server-wide value kept from start time; the bring-up controller's applied
    * set, the reply reminder and every consumer of the channel mode read it
-   * from there. A throw is logged; the apply goes on.
+   * from there. A throw is logged; the apply goes on. Work that must follow
+   * the lifecycle steps belongs in `onApplySettled`.
    */
   onApplied?: (config: PersonaConfig) => void
+  /**
+   * Told the configuration a confirmed apply made the applied one once its
+   * steps 2–6 have settled (each fulfilled, rejected, unbound or not run),
+   * right before `reload-applied` or `reload-noop` is logged: on every path
+   * that applied, a no-op or recorded-only change included, never after a
+   * refused candidate or a step-1 write that applied nothing. Its returned
+   * value is not awaited, so nothing it starts holds the apply or the next
+   * tick; a throw or rejection is logged (`reloadPostApplyFailedLine`), and
+   * the apply goes on. Production reclaims the applied persona keys' claimed
+   * preparation work here (`DeliveryPreparation.reclaim`): a destructive modify's
+   * teardown ended the preparation life that held the key's open work, and
+   * only the key's next life, started after that teardown, can fix it.
+   */
+  onApplySettled?: (config: PersonaConfig) => unknown
   /**
    * Test override: the bodies of apply steps 2–6 (`reload-apply.ts`), used
    * instead of the default ones; an unbound step then does nothing. Without
@@ -1773,12 +1801,28 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     }
   }
 
+  /**
+   * Tell the server the applied configuration's steps 2–6 have settled
+   * (`deps.onApplySettled`), not awaited; a throw or a rejection is logged,
+   * never raised.
+   */
+  function notifyApplySettled(config: PersonaConfig): void {
+    const failed = (err: unknown): void => deps.log(reloadPostApplyFailedLine(describeThrownValue(err)))
+    try {
+      void Promise.resolve(deps.onApplySettled?.(config)).catch(failed)
+    } catch (err) {
+      failed(err)
+    }
+  }
+
   /** Apply exact reviewed bytes at their authority revision. Step 1 prepares
    * retirement, durably applies the shared authority, then stops retired
    * workers and publishes the whole combination. Definite failure restores
    * retirement without stopping accepted work; an unresolved durability
    * outcome retains both records for recovery. Steps 2–6 use the reviewed
-   * plan and stop scheduling work when the controller stops. */
+   * plan and stop scheduling work when the controller stops; once they have
+   * settled, `onApplySettled` is told the applied configuration before
+   * `reload-applied` or `reload-noop` is logged. */
   async function applyConfirmed(state: PendingState): Promise<boolean> {
     const current = appliedState
     const { plan, candidate, bytes } = state
@@ -1840,6 +1884,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     let result
     let retiring = plan.destructive.map(({ key }) => key)
     let activationReturned = false
+    let appliedConfig: PersonaConfig | undefined
     const onStepFailure = (step: ApplyStepName, err: unknown): void =>
       deps.log(`[slack] reload: apply step ${applyStepNumber(step)} (${step}) failed: ${describeThrownValue(err)}`)
     const finishLifecycle = async (): Promise<void> => {
@@ -1849,13 +1894,18 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
         setRetiring(channelDelivery, retiring, false)
       }
       await runApplySteps(applySlots, mergedInputs, steps.filter(step => step !== TEARDOWNS_STEP), onStepFailure, () => !detectionStopped)
-      if (!detectionStopped) deps.log(plan.noEffectiveChange ? renderNoopLogLine(paths.lastApplied) : renderAppliedLogLine(plan, paths.lastApplied))
+      if (detectionStopped) return
+      // Only now: work started from here runs under lives no teardown of this
+      // apply can end.
+      if (appliedConfig !== undefined) notifyApplySettled(appliedConfig)
+      deps.log(plan.noEffectiveChange ? renderNoopLogLine(paths.lastApplied) : renderAppliedLogLine(plan, paths.lastApplied))
     }
     applyingReviewed = true
     try {
       result = sharedChannels.commitReview(bytes, attempt.revision, review, state.assignments, merged => {
         reviewedPublicationRevision = sharedChannels!.revision
         appliedState = { config: merged, bytes: sharedChannels!.sourceBytes(), source: 'config' }
+        appliedConfig = merged
         if (detectionStopped) return
         beginStepOneHolds(plan, current.config)
         setRetiring(channelDelivery, retiring, true)

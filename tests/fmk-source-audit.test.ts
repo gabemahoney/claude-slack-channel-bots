@@ -3633,9 +3633,10 @@ describe('shared MCP client transport, grouping and session evidence', () => {
   const control = source.slice(source.indexOf('  const parent = parentPid()'), source.indexOf('\n  const schedulePoll'))
   const js = ts.transpileModule(`
   const { Client, StreamableHTTPClientTransport, ListRootsRequestSchema,
-    AsyncLocalStorage, pathToFileURL, fetch, readFileSync, appendLine, say, setTimeout, clearTimeout } = deps;
+    AsyncLocalStorage, pathToFileURL, fetch, readFileSync, lstatSync, appendLine, say, setTimeout, clearTimeout } = deps;
   const url = 'http://127.0.0.1/mcp', cwd = '/scratch/persona';
   const requestsPath = 'requests', resultsPath = 'results', sessionsPath = 'sessions', deliveriesPath = 'deliveries';
+  const concurrencyPath = 'concurrency';
   const readArguments = argumentsFileReader('/scratch/stub', 'scratchkey');
   const CLIENT_INFO = {name:'scratch-probe',version:'1'}, CHANNEL_NOTIFICATION_METHOD = 'notifications/claude/channel';
   const NEWLINE = 10;
@@ -3736,6 +3737,12 @@ describe('shared MCP client transport, grouping and session evidence', () => {
         const text = files.get(path)
         if (text === undefined) throw Object.assign(new Error('missing'), { code: 'ENOENT' })
         return encoding ? text : Buffer.from(text)
+      },
+      // The concurrency control (absent unless a case writes it) reads through the same files.
+      lstatSync: (path: string) => {
+        const text = files.get(path)
+        if (text === undefined) throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+        return { isFile: () => true, size: Buffer.byteLength(text) }
       } })
     cleanups.push(async () => {
       await api.close(); await clock.flush()

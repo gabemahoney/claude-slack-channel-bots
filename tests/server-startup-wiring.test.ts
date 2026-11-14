@@ -89,6 +89,8 @@ import type { PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
 import type * as PersonaNotifierModule from '../src/persona-notifier.ts'
 import type { PersonaNotifier } from '../src/persona-notifier.ts'
 import type { PersonaRouting, PersonaRoutingDeps } from '../src/persona-routing.ts'
+import type * as ReactHandoffModule from '../src/react-handoff.ts'
+import type { ReactHandoff, ReactHandoffClock, ReactHandoffDeps } from '../src/react-handoff.ts'
 import type { SessionAdmissionOptions, SessionToolDeps } from '../src/registry.ts'
 import type { ReloadControllerDeps } from '../src/reload.ts'
 import type * as RestartModule from '../src/restart.ts'
@@ -105,6 +107,7 @@ import type * as SlowRecoveryModule from '../src/slow-recovery.ts'
 import type { SlowRecoveryTracker, SlowRecoveryTrackerDeps } from '../src/slow-recovery.ts'
 import type * as UnavailableRetryModule from '../src/unavailable-retry.ts'
 import type { FullModeRetryDeps, RetryRunGateDeps, UnavailableRetryController, UnavailableRetryDeps } from '../src/unavailable-retry.ts'
+import type { QueueAcceptResult, ReactionKey } from '../src/delivery-queue.ts'
 import { makeStubCallLog } from './test-helpers/agent-director-stub.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
@@ -260,7 +263,7 @@ function threadMemoryShutdown(bindings: Record<string, unknown>): () => Promise<
   expect(last).toBeGreaterThan(first)
   return expression(`async () => { ${statements.slice(first, last + 1).join('\n')} }`, {
     deliveryPreparation: undefined, deliveryStopping: undefined, remindersStopping: undefined, deliveryClients: undefined,
-    buildThreadMemorySealNotSavedLine, ...bindings,
+    reactHandoffDrained: undefined, buildThreadMemorySealNotSavedLine, ...bindings,
   })
 }
 
@@ -1906,10 +1909,28 @@ describe('server.ts wires the persona connection seams', () => {
     expect(props.get('archive')).toMatch(/^\((\w+), (\w+)\) => archiveWrite\?\.\(\1, \2\)$/)
   })
 
+  // Both members are optional in SessionToolDeps (no claim falls back to the
+  // ack tracker's own, no getter means no hand-off), so only this audit makes
+  // sure production binds the real claim and reads each react's identity anew.
+  const SESSION_TOOLS_CLAIM: keyof SessionToolDeps = 'claimReactAnswer'
+  const SESSION_TOOLS_BOT_USER_ID: keyof SessionToolDeps = 'getBotUserId'
+  test("the session tools claim through ack-tracker.ts's claimReactAnswer and read each react's bot user ID through identityFor at call time, the key passed through", () => {
+    const props = objectProperties(spreadConstObject('sessionToolDeps'))
+    expect(props.get(SESSION_TOOLS_CLAIM)).toBe('claimReactAnswer')
+    expect(importSource(SERVER_CODE, 'claimReactAnswer')).toBe('./ack-tracker.ts')
+    expect(indicesOf(/\b(?:function|let|const|var)\s+claimReactAnswer\b/g, SERVER_CODE)).toEqual([])
+    const identity = constOf('createPersonaIdentityLookup')
+    expect(props.get(SESSION_TOOLS_BOT_USER_ID)).toMatch(new RegExp(`^\\(?(\\w+)\\)? => ${identity}\\(\\1\\)\\?\\.botUserId$`))
+    expect(indicesOf(new RegExp(`\\bsessionToolDeps\\s*\\.\\s*(?:${SESSION_TOOLS_CLAIM}|${SESSION_TOOLS_BOT_USER_ID})\\b`, 'g'), SERVER_CODE)).toEqual([])
+  })
+
   test('durable intake binds preparation to the shared queue, persona name resolver, wake hook and host part limit on the production clock', () => {
     const props = onlyCallProps('createDeliveryPreparation')
-    expect([...props.keys()].sort()).toEqual(['queue', 'resolveUserName', 'clientFor', 'wake', 'onPending', 'onReceived', 'tagMaxBytes'].sort())
+    expect([...props.keys()].sort()).toEqual(['queue', 'resolveUserName', 'clientFor', 'wake', 'onPending', 'onReceived', 'tagMaxBytes', 'log', 'persona'].sort())
     expect(props.get('tagMaxBytes')).toBe('tagMaxBytesFor(process.platform)')
+    expect(props.get('log')).toBe('(line) => console.error(line)')
+    expect(props.get('log')).toBe(onlyCallProps('createPersonaConnectionManager').get('log')!)
+    expect(props.get('persona')).toBe('getAppliedPersona')
     expect(props.get('queue')).toBe('deliveryQueue')
     expect(props.get('resolveUserName')).toBe('resolvePersonaUserName')
     expect(props.get('clientFor')).toBe('clientFor')
@@ -1918,6 +1939,51 @@ describe('server.ts wires the persona connection seams', () => {
     const routing = onlyCallProps('createPersonaRouting')
     expect(routing.get('prepare')).toMatch(/^\((\w+), (\w+)\) => deliveryPreparation\?\.prepare\(\1, \2\) \?\? Promise\.resolve\(\)$/)
     expect(routing.has('notify')).toBe(false)
+  })
+
+  // SR-2.4, SR-4.2: the reaction decision asks the manager's own Run Bot
+  // Identities (never a set rebuilt from the personas), and the reaction-key
+  // check the live queue. The routing is built at module scope, before main()
+  // assigns `connections` and `deliveryQueue`, so each binding must read its
+  // holder at every call; one bound to a copy taken at import would type-check
+  // and answer as absent for the whole run.
+  test('the persona routing asks the manager\'s Run Bot Identities through `connections` and the live queue\'s reaction keys through `deliveryQueue`, each read at call time: false and no answer while absent, then the instance\'s own answer', () => {
+    const RUN_BOT: keyof PersonaRoutingDeps = 'isRunBotIdentity'
+    const MANAGER_QUERY: keyof PersonaConnectionsModule.PersonaConnectionManager = 'isRunBotIdentity'
+    const LOOKUP: keyof DeliveryQueue = 'lookupReactionKey'
+    const SLACK_LOOKUP: keyof DeliveryQueue = 'lookupSlackKey'
+    const ACCEPT: keyof DeliveryQueue = 'accept'
+    const routing = onlyCallProps('createPersonaRouting')
+    const runBot = routing.get(RUN_BOT)!
+    expect(runBot).toMatch(new RegExp(`^\\(?(\\w+)\\)? => connections\\?\\.${MANAGER_QUERY}\\(\\1\\) \\?\\? false$`))
+    const queue = objectProperties(routing.get('queue')!)
+    // The branch's thread_hybrid intake also stores through acceptDecided.
+    expect([...queue.keys()].sort()).toEqual([ACCEPT, 'acceptDecided', LOOKUP, SLACK_LOOKUP].sort())
+    // The same holder as the Slack-key lookup (and preparation's queue, pinned above).
+    for (const lookup of [LOOKUP, SLACK_LOOKUP]) {
+      expect(queue.get(lookup)).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => deliveryQueue\\?\\.${lookup}\\(\\1, \\2\\)$`))
+    }
+
+    // The actual binding text, run with each holder a `let` set only after the bindings exist.
+    const js = ts.transpileModule(`const value = { runBot: ${runBot}, lookup: ${queue.get(LOOKUP)} };`, {
+      compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+    }).outputText
+    const live = new Function(`let connections, deliveryQueue;\n${js}\nreturn { value, setConnections: (v) => { connections = v }, setQueue: (v) => { deliveryQueue = v } };`)() as {
+      value: { runBot(id: string): boolean; lookup(key: string, reactionKey: ReactionKey): QueueAcceptResult | undefined }
+      setConnections(v: Pick<PersonaConnectionsModule.PersonaConnectionManager, 'isRunBotIdentity'>): void
+      setQueue(v: Pick<DeliveryQueue, 'lookupReactionKey'>): void
+    }
+    const reactionKey: ReactionKey = { chat_id: 'C0WIRE', message_ts: '1.1', reactor: 'U0PERSON', emoji: 'eyes', change: 'added', event_ts: '1.2' }
+    expect(live.value.runBot('U0BOT')).toBe(false)
+    expect(live.value.lookup('alpha', reactionKey)).toBeUndefined()
+
+    const asked: unknown[] = []
+    const held: QueueAcceptResult = { status: 'duplicate', seq: 7 }
+    live.setConnections({ isRunBotIdentity: (id) => { asked.push(id); return id === 'U0BOT' } })
+    live.setQueue({ lookupReactionKey: (key, rk) => { asked.push([key, rk]); return held } })
+    expect([live.value.runBot('U0BOT'), live.value.runBot('U0PERSON')]).toEqual([true, false])
+    expect(live.value.lookup('alpha', reactionKey)).toBe(held)
+    expect(asked).toEqual(['U0BOT', 'U0PERSON', ['alpha', reactionKey]])
   })
 
   test('archiveWrite is set only inside main(), to the persona archive writer over the name resolver source on clientFor', () => {
@@ -1931,6 +1997,152 @@ describe('server.ts wires the persona connection seams', () => {
     const args = splitTopLevel(callArguments(SERVER_CODE, call))
     expect(args).toHaveLength(3)
     expect(args[1]).toBe('createPersonaNameResolverSource(clientFor)')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: the react hand-off (SR-6.2, SR-6.5)
+// ---------------------------------------------------------------------------
+
+/** The hand-off's factory and members; renaming one fails the typecheck. */
+const REACT_HANDOFF_FACTORY: keyof typeof ReactHandoffModule = 'createReactHandoff'
+const HANDOFF_ON_CLAIM: keyof ReactHandoff = 'onReactClaimed'
+const HANDOFF_FORGET: keyof ReactHandoff = 'forget'
+const HANDOFF_STOP: keyof ReactHandoff = 'stop'
+const SESSION_TOOLS_REACT_CLAIMED: keyof SessionToolDeps = 'onReactClaimed'
+const ROUTING_BOT_TOOL_INTAKE: keyof PersonaRouting = 'receiveBotToolReaction'
+const LIFECYCLE_STOP_DELIVERY: keyof PersonaLifecycleDeps = 'stopDelivery'
+const RELOAD_STOP_DELIVERY: keyof ReloadControllerDeps = 'stopDelivery'
+
+/** The module-scope holder the session tools' onReactClaimed delegates to, read from that delegate. */
+function reactHandoffHolder(): string {
+  const delegate = objectProperties(spreadConstObject('sessionToolDeps')).get(SESSION_TOOLS_REACT_CLAIMED)
+  const form = new RegExp(`^\\(?(\\w+)\\)? => (\\w+)\\?\\.${HANDOFF_ON_CLAIM}\\(\\1\\)$`)
+  expect(delegate).toMatch(form)
+  return delegate!.match(form)![2]!
+}
+
+/** shutdown()'s own statements in order: each one's code (whitespace collapsed) and whether it awaits outside a nested function. */
+function shutdownStatements(): Array<{ code: string; awaits: boolean }> {
+  const tree = ts.createSourceFile('server.ts', SERVER_CODE, ts.ScriptTarget.Latest, true)
+  const shutdown = tree.statements.find((node): node is ts.FunctionDeclaration => ts.isFunctionDeclaration(node) && node.name?.text === 'shutdown')
+  expect(shutdown?.body).toBeDefined()
+  return shutdown!.body!.statements.map((statement) => {
+    let awaits = false
+    const visit = (node: ts.Node): void => {
+      if (ts.isFunctionLike(node)) return
+      if (ts.isAwaitExpression(node)) awaits = true
+      ts.forEachChild(node, visit)
+    }
+    visit(statement)
+    return { code: statement.getText(tree).replace(/\s+/g, ' '), awaits }
+  })
+}
+
+// Every member is optional or a closure the type cannot tell from a stub or a
+// copy taken at import, so only this audit makes sure production builds the
+// one owner before any session can react, hands it each winning claim as it
+// is, cancels a key's work as its teardown starts and drains it at shutdown.
+// The owner's behaviour is tests/react-handoff.test.ts's; its composition with
+// the real tools is tests/registry.test.ts's.
+describe('main() builds the one react hand-off before MCP admission, the session tools hand it each winning claim, a persona stop cancels its key\'s work first and shutdown stops and drains it', () => {
+  test('one owner, built at main()\'s own top level before Bun.serve and the start bring-up, into a module-scope holder declared with no initializer; the holder is named only where it is built, delegated to, forgotten and stopped', () => {
+    expect(importSource(SERVER_CODE, REACT_HANDOFF_FACTORY)).toBe('./react-handoff.ts')
+    expect(indicesOf(new RegExp(`\\b(?:function|let|const|var)\\s+${REACT_HANDOFF_FACTORY}\\b`, 'g'), SERVER_CODE)).toEqual([])
+    const built = onlyCallOf(REACT_HANDOFF_FACTORY)
+    const holder = reactHandoffHolder()
+    declaredOnce(holder)
+    const decls = [...SERVER_CODE.matchAll(new RegExp(`^let\\s+${holder}\\s*:[^=\\n]+$`, 'gm'))]
+    expect(decls).toHaveLength(1)
+    expect(insideMain(decls[0]!.index!)).toBe(false)
+    const assigned = assignmentsTo(holder)
+    expect(assigned.map((a) => a.value)).toEqual([`${REACT_HANDOFF_FACTORY}({`])
+    expect(atMainTopLevel(SERVER_CODE, assigned[0]!.at)).toBe(true)
+    expect(SERVER_CODE.indexOf(REACT_HANDOFF_FACTORY, assigned[0]!.at)).toBe(built)
+    const serve = callsOf('Bun\\.serve')
+    expect(serve).toHaveLength(1)
+    for (const later of [serve[0]!, startResolution(SERVER_CODE).bringUpAt]) expect(built).toBeLessThan(later)
+    // Its declaration, its assignment, the delegate, the two stopDelivery forgets and shutdown's stop.
+    expect(indicesOf(new RegExp(`\\b${holder}\\b`, 'g'), SERVER_CODE)).toHaveLength(6)
+    expect(indicesOf(new RegExp(`\\b${holder}\\?\\.${HANDOFF_FORGET}\\(`, 'g'), SERVER_CODE)).toHaveLength(2)
+    expect(indicesOf(new RegExp(`\\b${holder}\\?\\.${HANDOFF_STOP}\\(`, 'g'), SERVER_CODE)).toHaveLength(1)
+  })
+
+  test('the session tools\' onReactClaimed hands each claim, unchanged and synchronously, to the holder read at each call: with no owner yet it does nothing, then the owner gets the very claim before the call returns', () => {
+    const delegate = objectProperties(spreadConstObject('sessionToolDeps')).get(SESSION_TOOLS_REACT_CLAIMED)!
+    const holder = reactHandoffHolder()
+    expect(insideMain(SERVER_CODE.search(/\bconst\s+sessionToolDeps\b/))).toBe(false)
+    expect(indicesOf(new RegExp(`\\bsessionToolDeps\\s*(?:\\.\\s*${SESSION_TOOLS_REACT_CLAIMED}\\b|\\[)`, 'g'), SERVER_CODE)).toEqual([])
+
+    // The actual binding text, run with the holder a `let` set only after the binding exists.
+    const js = ts.transpileModule(`const value = ${delegate};`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
+    const live = new Function(`let ${holder};\n${js}\nreturn { value, install: (v) => { ${holder} = v } };`)() as {
+      value(claim: unknown): unknown
+      install(owner: { onReactClaimed(claim: unknown): void }): void
+    }
+    const claim = { chatId: 'C0WIRE', messageId: '1.1' }
+    expect(live.value(claim)).toBeUndefined()
+    const got: unknown[] = []
+    live.install({ onReactClaimed: (c) => { got.push(c) } })
+    expect(live.value(claim)).toBeUndefined()
+    expect(got).toHaveLength(1)
+    expect(got[0]).toBe(claim)
+  })
+
+  test("the owner reads the applied personas of the configuration in effect and A's confirmed identity through identityFor, gives A's reaction to the one routing's bot-tool intake read at each call, and runs on the real clock, the live shutdown flag and the server log", () => {
+    const props = onlyCallProps(REACT_HANDOFF_FACTORY)
+    const members: Array<keyof ReactHandoffDeps> = ['getAppliedPersonas', 'getBotIdentity', 'receiveBotToolReaction', 'clock', 'isShuttingDown', 'log']
+    expect([...props.keys()].sort()).toEqual([...members].sort())
+    expect(props.get('getAppliedPersonas')).toBe(`() => ${loadedConfigName(SERVER_CODE)}?.personas ?? []`)
+    expect(props.get('getBotIdentity')).toBe(constOf('createPersonaIdentityLookup'))
+    // The routing is built at module scope; the closure names it, so no copy of its method is taken.
+    const routing = constOf('createPersonaRouting')
+    expect(insideMain(onlyCallOf('createPersonaRouting'))).toBe(false)
+    expect(props.get('receiveBotToolReaction')).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => ${routing}\\.${ROUTING_BOT_TOOL_INTAKE}\\(\\1, \\2\\)$`))
+    // The one intake path: its member name and that call.
+    expect(indicesOf(new RegExp(`\\b${ROUTING_BOT_TOOL_INTAKE}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
+    const clock = objectProperties(props.get('clock')!)
+    const clockMembers: Array<keyof ReactHandoffClock> = ['now', 'setTimeout', 'clearTimeout']
+    expect([...clock.keys()].sort()).toEqual([...clockMembers].sort())
+    expect(clock.get('now')).toBe('() => Date.now()')
+    expect(clock.get('setTimeout')).toMatch(/^\((\w+), (\w+)\) => globalThis\.setTimeout\(\1, \2\)$/)
+    expect(clock.get('clearTimeout')).toMatch(/^\(?(\w+)\)? => globalThis\.clearTimeout\(\1(?: as [^()]+)?\)$/)
+    expect(props.get('isShuttingDown')).toBe('() => shuttingDown')
+    expect(props.get('log')).toMatch(/^\(\s*(\w+)\s*\)\s*=>\s*console\.error\(\s*\1\s*\)$/)
+  })
+
+  // The lifecycle calls stopDelivery when a teardown is submitted, without
+  // awaiting it, so only its synchronous first part runs then; the forget must
+  // be in it, not behind an await or the later routing forget.
+  test.each<[string, string, string]>([
+    ["the persona lifecycle's", 'createPersonaLifecycle', LIFECYCLE_STOP_DELIVERY],
+    ["the reload controller's", 'createReloadController', RELOAD_STOP_DELIVERY],
+  ])("%s stopDelivery forgets the key's react hand-off work as its first statement, before the delivery engines' forget and any await", (_label, factory, member) => {
+    const holder = reactHandoffHolder()
+    const body = onlyCallProps(factory).get(member)
+    // The persona lifecycle's also stops the branch's membership discovery for the key before the engines' forget.
+    expect(body).toMatch(new RegExp(`^async \\(?(\\w+)\\)? => \\{ ${holder}\\?\\.${HANDOFF_FORGET}\\(\\1\\); (?:membershipScanner\\?\\.stop\\(\\1\\); membershipReadiness\\?\\.forget\\(\\1\\); )?const \\w+ = deliveryEngines\\?\\.forget\\(\\1\\);`))
+    expect(body!.indexOf('await')).toBeGreaterThan(body!.indexOf(`${holder}?.${HANDOFF_FORGET}(`))
+  })
+
+  test('shutdown stops the owner after raising shuttingDown and before its first await, and awaits the drain stop returns before preparation and the queue stop', () => {
+    const holder = reactHandoffHolder()
+    const statements = shutdownStatements()
+    const only = (re: RegExp): number => {
+      const at = statements.flatMap((s, i) => (re.test(s.code) ? [i] : []))
+      expect([String(re), at.length]).toEqual([String(re), 1])
+      return at[0]!
+    }
+    const raised = only(/^shuttingDown = true;?$/)
+    const stopped = only(new RegExp(`^const (\\w+) = ${holder}\\?\\.${HANDOFF_STOP}\\(\\);?$`))
+    const drain = statements[stopped]!.code.match(/^const (\w+) =/)![1]!
+    const drained = only(new RegExp(`^await ${drain};?$`))
+    expect(raised).toBeLessThan(stopped)
+    expect(statements.findIndex((s) => s.awaits)).toBeGreaterThan(stopped)
+    expect(drained).toBeLessThan(only(/^await deliveryPreparation\?\.stop\(\);?$/))
+    expect(drained).toBeLessThan(only(/^await deliveryQueue\?\.stop\(\);?$/))
+    // The drain is named only where it is taken and awaited.
+    expect(statements.filter((s) => new RegExp(`\\b${drain}\\b`).test(s.code))).toHaveLength(2)
   })
 })
 
@@ -4439,7 +4651,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
   // fungible-mode event.
   test('the routing\'s call binds exactly these members, no more', () => {
     const MEMBERS: Array<keyof PersonaRoutingDeps> = [
-      'getPersonaConfig', 'getBotIdentity', 'queue', 'prepare', 'onReceived', 'archive', 'log',
+      'getPersonaConfig', 'getBotIdentity', 'isRunBotIdentity', 'queue', 'prepare', 'onReceived', 'archive', 'log',
       'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
       'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS, 'getChannelDelivery', 'membership',
       'threadMemory', 'pendingOwnPosts', 'joins', 'threadStampUndecided', 'threadStampEpisodes', 'onHoldStored', ROUTING_OWN_MESSAGE,

@@ -2,7 +2,7 @@
  * All environment access is injected; importing this module does no I/O. */
 import type { Client, GetResult, SendKeysParams } from 'agent-director'
 import type { DeliveryQueue, QueueItem, QueueRecord, SentRecord } from './delivery-queue.ts'
-import { createQueueItemReader, isOpenItem, itemOpenedAt } from './delivery-queue.ts'
+import { createQueueItemReader, isOpenItem, isQueueItemClosed, itemOpenedAt } from './delivery-queue.ts'
 import { createQueueDeliveryReceiptReader, effectiveSends, type DeliveryReceiptReader, type ReceiptObservation } from './delivery-receipt.ts'
 import { type DeliveryLifecycle, type DeliveryClock, systemDeliveryClock, NOT_NOW_RETRY_MS } from './delivery-lifecycle.ts'
 import { decideEngine, decideGate, firstSendGate, recoveryEnterGate, latestDeliveryAttempt, retypeGate, selectDeliveryTarget, NO_DELIVERY_PAIR, createDeliveryReading, createDeliveryPolicyState, type DeliveryPair, type DeliveryPolicyEngine, type DeliveryPolicyKnowledge, type DeliveryReading, type DeliveryTimer } from './delivery-policy.ts'
@@ -127,7 +127,7 @@ function setItemMember(values: number[], seq: number, present: boolean): void {
 function createQueueSummary(queue: DeliveryQueue, key: string) {
   const read = createQueueItemReader(queue, key)
   const items = new Map<number, QueueItem>(), open: number[] = []
-  const p = { accepted: [] as number[], fixed: [] as number[], sent: [] as DeliveryPolicyKnowledge['p']['sent'][number][], refused: [] as number[], delivered: [] as DeliveryPair[] }
+  const p = { accepted: [] as number[], fixed: [] as number[], sent: [] as DeliveryPolicyKnowledge['p']['sent'][number][], refused: [] as number[], delivered: [] as DeliveryPair[], withdrawn: [] as number[] }
   const parts: Record<number, number> = {}, holds: { item: number; kind: 'memory' | 'post' }[] = []
   // Immutable between membership changes, so a new executor can inherit the
   // durable notices without copying a queue-sized list on every blocked wake.
@@ -138,6 +138,7 @@ function createQueueSummary(queue: DeliveryQueue, key: string) {
     setItemMember(open, seq, isOpenItem(item))
     setItemMember(p.accepted, seq, included)
     setItemMember(p.fixed, seq, included && !!item.fixed)
+    setItemMember(p.withdrawn, seq, included && !!item.withdrawn)
     if (included) parts[seq] = item.fixed?.parts.length ?? 1; else delete parts[seq]
     const sends: typeof p.sent = [], refused: number[] = [], delivered: DeliveryPair[] = []
     let noticed = false
@@ -245,7 +246,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     // AD's observed transition excludes earlier sends even when a resumed
     // conversation keeps its session ID and has no launch timestamp.
     s.partialReceipt = undefined
-    s.partialAfterAttempts = new Map(deps.queue.items(key).filter(i => !i.delivered).map(i => [i.accepted.seq, i.nextAttempt - 1]))
+    s.partialAfterAttempts = new Map(deps.queue.items(key).filter(i => !isQueueItemClosed(i)).map(i => [i.accepted.seq, i.nextAttempt - 1]))
   }
   function observePartialReceipt(key: string, s: State, head: QueueItem, part: number, receipt: ReceiptObservation): void {
     const partial = receipt.receipt ? undefined : receipt.partialReceipt
@@ -716,7 +717,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       // Diagnostic callers retain independent policy inputs. Only the engine's
       // private summaries are updated in place between synchronous decisions.
       const items = new Map(s.queue.items), parts = { ...k.parts }
-      return { ...k, parts, p: { accepted: [...k.p.accepted], fixed: [...k.p.fixed], sent: k.p.sent.map(send => ({ ...send })), refused: [...k.p.refused], delivered: k.p.delivered.map(pair => [pair[0], pair[1]] as const) }, holds: k.holds?.map(hold => ({ ...hold })),
+      return { ...k, parts, p: { accepted: [...k.p.accepted], fixed: [...k.p.fixed], sent: k.p.sent.map(send => ({ ...send })), refused: [...k.p.refused], delivered: k.p.delivered.map(pair => [pair[0], pair[1]] as const), ...(k.p.withdrawn ? { withdrawn: [...k.p.withdrawn] } : {}) }, holds: k.holds?.map(hold => ({ ...hold })),
         textFor: pair => parts[pair[0]] === undefined ? pair : items.get(pair[0])?.fixed?.parts[pair[1] - 1] ?? pair }
     },
     status: key => { const s = states.get(key); return s ? status(key, s) : undefined },

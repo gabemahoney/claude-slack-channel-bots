@@ -403,6 +403,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/persona-start\.ts$/, "the start bring-up, which checks a persona's credentials and hands its tokens to the connection manager"],
   [/^src\/persona-lifecycle\.ts$/, 'the persona lifecycle, which tears down, brings up and reconnects personas on a confirmed change'],
   [/^src\/slack-log-redaction\.ts$/, 'the Slack log redactor, whose input can hold tokens and URLs'],
+  [/^src\/reaction-log-fields\.ts$/, 'the shared reaction log renderer, whose fields can hold Slack tokens and URLs and whose persona references carry configured names'],
   [/^src\/reload[\w-]*\.ts$/, 'the reload controller, preview or apply'],
   // The modules the raw-error sweep touched whose output carries an agent-director or Slack failure's text (now
   // kept, redacted) to a log, a startup error, a Slack post or an MCP tool result ( carry, section 0).
@@ -953,6 +954,11 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(touchReasonsOf(suite, "import { RELOAD_SHARED_RECOVERY } from '../src/reload-recovery.ts'")).toEqual([])
     expect(touchReasonsOf(suite, "import { sharedRecoveryRequest as request } from './test-helpers/shared-channels.ts'")).toHaveLength(1)
     expect(callsAssertNoLeak(suite)).toBe(true); expect(suite in EXEMPT).toBe(false)
+  })
+
+  test.each(['quoteReactionLogField', 'reactionLogWord', 'renderReactionPersonaRef'])('reaction-log-fields.ts is a source surface through %s', name => {
+    const suite = 'tests/reaction-intake-diagnostics.test.ts'
+    expect(touchReasonsOf(suite, `import { ${name} as render } from '../src/reaction-log-fields.ts'`)).toHaveLength(1)
   })
 
   test('the test-only MCP route is a source surface: handlers and key rendering touch; constants and types alone do not; every consumer leak-checks', () => {

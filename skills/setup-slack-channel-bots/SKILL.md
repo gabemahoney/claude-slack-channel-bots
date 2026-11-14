@@ -225,6 +225,10 @@ and `reactions:read` for reading the owner's reaction answers: add any missing
 bot scopes under **OAuth & Permissions**, then re-install the app to the
 workspace. See [Credentials files](../../docs/configuration.md#credentials-files)
 for the maintained scope guidance.
+
+Add any missing `reaction_added` and `reaction_removed` bot events and the
+`mpim:read` bot scope, then reinstall the app; see
+[Migration step 5](../../docs/migration.md#migration) for the procedure.
 An app already used by another persona can't be reused.
 
 **Membership setup, for new and existing apps:** check the currently installed

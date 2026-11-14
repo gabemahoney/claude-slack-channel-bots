@@ -1,3 +1,4 @@
+import { expectNoMetadata } from './test-helpers/server-post.ts'
 import { cannedDecideResult, stubCallCount } from './test-helpers/agent-director-stub.ts'
 import { makeReloadHarness, type ReloadRun } from './test-helpers/reload-harness.ts'
 /**
@@ -186,6 +187,7 @@ const TOKEN_B = '22222222-2222-4222-8222-222222222222'
 const TOKEN_C = '33333333-3333-4333-8333-333333333333'
 /** A key naming no applied persona. */
 const UNKNOWN_KEY = 'no_such_persona'
+
 
 const ALLOWED_TEXT = '*Permission* — Allowed'
 const DENIED_TEXT = '*Permission* — Denied by operator'
@@ -554,6 +556,7 @@ describe('handlePermissionClick — happy path', () => {
     expect(updates[0]!.channel).toBe(CHANNEL_A)
     expect(updates[0]!.ts).toBe(messageTs)
     expect(updates[0]!.text).toBe(ALLOWED_TEXT)
+    expectNoMetadata(updates[0]!)
     // Nothing went through persona B's client.
     expect(slackCalls(h.stubB)).toBe(0)
     // The update was resolved through A's key.
@@ -582,6 +585,7 @@ describe('handlePermissionClick — happy path', () => {
     expect(updates[0]!.channel).toBe(CHANNEL_A)
     expect(updates[0]!.ts).toBe(messageTs)
     expect(updates[0]!.text).toBe(DENIED_TEXT)
+    expectNoMetadata(updates[0]!)
     expect(slackCalls(h.stubB)).toBe(0)
     expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(true)
   })

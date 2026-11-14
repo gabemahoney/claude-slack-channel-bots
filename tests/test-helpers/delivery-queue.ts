@@ -1,7 +1,7 @@
 /** Shared durable queue fixtures; all paths belong to the caller's scratch directory. */
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { createDeliveryQueue, parseQueueRecord, type AcceptedInput, type AcceptedRecord, type DeliveredRecord, type DeliveryQueueOptions, type FixedRecord, type HoldField, type HoldResolutionRecord, type NoticedRecord, type PostHoldField, type QueueRecord, type RefusedRecord } from '../../src/delivery-queue.ts'
+import { createDeliveryQueue, parseQueueRecord, type AcceptedInput, type AcceptedRecord, type DeliveredRecord, type DeliveryQueueOptions, type FixedRecord, type HoldField, type HoldResolutionRecord, type NoticedRecord, type PostHoldField, type QueueRecord, type ReactionAcceptedInput, type RefusedRecord } from '../../src/delivery-queue.ts'
 import { postIntent, threadJoin, THREAD_CHANNELS, THREAD_ROOTS, THREAD_STAMP } from './thread-memory.ts'
 
 export const slackInput = (overrides: Partial<AcceptedInput> = {}): AcceptedInput => ({
@@ -28,6 +28,12 @@ export function heldSlackInput(hold: HoldField, overrides: Partial<Omit<Accepted
   return input
 }
 export const injectedInput = (overrides: Partial<AcceptedInput> = {}): AcceptedInput => ({ source: 'interject', sender: 'interject', text: 'prompt', ...overrides })
+/** A Reaction Item whose key agrees with its final fields unless explicitly overridden. */
+export function reactionInput(overrides: Partial<ReactionAcceptedInput> = {}): ReactionAcceptedInput {
+  const fields = { channel: 'C0TEST001', message_ts: '1700000000.000001', ts: '1700000000.000002', change: 'added' as const, emoji: 'thumbsup', user: 'U0REACTOR', ...overrides }
+  const reaction_key = overrides.reaction_key ?? { chat_id: fields.channel, message_ts: fields.message_ts, reactor: fields.user || fields.bot_id || '', emoji: fields.emoji, change: fields.change, event_ts: fields.ts }
+  return { source: 'reaction', text: '', origin: 'slack-event', mode: 'strict', ...fields, reaction_key }
+}
 export const queuePath = (stateDir: string, key = 'alpha'): string => join(stateDir, 'queue', `${key}.jsonl`)
 export function seedQueue(stateDir: string, records: readonly (QueueRecord | string)[], key = 'alpha'): void {
   mkdirSync(join(stateDir, 'queue'), { recursive: true })
@@ -50,7 +56,7 @@ export const sentRecord = (seq = 1, attempt = 1, send_kind: 'text' | 'enter' | '
 export const deliveredRecord = (seq = 1, at = 1000): DeliveredRecord => ({ v: 1, kind: 'delivered', seq, part: 1, at, receipt: { path: '/scratch/transcript.jsonl', uuid: 'receipt' } })
 /** Seed resolutions only for replay/validation; behavioral tests use queue.resolveHolds. */
 export const releasedRecord = (seq = 1, at = 1000): HoldResolutionRecord => ({ v: 1, kind: 'released', seq, at })
-export const withdrawnRecord = (seq = 1, at = 1000): HoldResolutionRecord => ({ v: 1, kind: 'withdrawn', seq, at })
+export const withdrawnRecord = (seq = 1, at = 1000): HoldResolutionRecord => ({ v: 1, kind: 'hold-withdrawn', seq, at })
 export const parkedRecord = (seq = 1, at = 1000): HoldResolutionRecord => ({ v: 1, kind: 'parked', seq, at })
 export const refusedRecord = (seq = 1, attempt = 1, at = 1000): RefusedRecord => ({ v: 1, kind: 'refused', seq, attempt, at })
 export const noticedRecord = (seq = 1, at = 1000): NoticedRecord => ({ v: 1, kind: 'noticed', seq, at })

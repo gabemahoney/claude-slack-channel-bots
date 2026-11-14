@@ -18,8 +18,9 @@ import { UNAVAILABLE_RETRY_MODE_PENDING_ONLY, UNAVAILABLE_RETRY_RUN_NOW_ARMED, U
 import { cannedPermissionRequest, errCallTimeout, errConfigMalformed, errDialogMaybeOpen, errInstanceIdCollision, errInternal, errInvalidFlags, errPaneChanged, errRelayFallenBack, errSendKeysWhileRelayed, errSpawnNotFound, errSpawnNotInteractive, errSystemInstallDisappeared, errTmuxNotAvailable, errTmuxSendKeys, errTmuxSessionConflict, errTmuxUnresponsive, errUnusableName } from './test-helpers/agent-director-stub.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
 import { partialReceiptText, partialReceiptSuffix } from './test-helpers/partial-receipt.ts'
-import { heldSlackInput, HOLD_FIELDS, memoryHold, injectedInput, makeQueue, postHold, readQueue, seedQueue, slackInput, unknownRootPostHold } from './test-helpers/delivery-queue.ts'
-import type { AcceptedRecord, HoldField, HoldOutcome, QueueRecord } from '../src/delivery-queue.ts'
+import { heldSlackInput, HOLD_FIELDS, memoryHold, injectedInput, makeQueue, postHold, reactionInput, readQueue, seedQueue, slackInput, unknownRootPostHold } from './test-helpers/delivery-queue.ts'
+import type { AcceptedRecord, HoldField, HoldOutcome, QueueRecord, ReactionAcceptedInput } from '../src/delivery-queue.ts'
+import { createDeliveryPolicyState, createDeliveryReading, decideEngine, decideGate, NO_DELIVERY_PAIR, selectDeliveryTarget, type DeliveryPair, type DeliveryPolicyKnowledge } from '../src/delivery-policy.ts'
 import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
 import { THREAD_CHANNELS, THREAD_ROOTS } from './test-helpers/thread-memory.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
@@ -253,7 +254,7 @@ describe('queue summaries across executor retirement', () => {
       h.p().up = false
       await h.tick()
       expect(counter.take()).toBe(0)
-      expect(h.engine.snapshot('alpha')?.p).toEqual({ accepted: [3], fixed: [3], sent: [], refused: [], delivered: [] })
+      expect(h.engine.snapshot('alpha')?.p).toEqual({ accepted: [3], fixed: [3], sent: [], refused: [], delivered: [] , withdrawn: [] })
       expect(h.engine.snapshot('alpha')?.e.noticed).toEqual([3])
       expect(h.engine.snapshot('alpha')?.holds).toEqual([])
       expect(h.engine.status('alpha')).toMatchObject({ seq: 3, count: 1 })
@@ -313,7 +314,7 @@ test('incremental policy inputs preserve ordered sends, refusal positions, unkno
   const send = (item: number, part: number, attempt: number, how = 'text') => ({ item, part, attempt, how, offset: 0 })
   await h.tick()
   const first = h.engine.snapshot('alpha')!
-  expect(first.p).toEqual({ accepted: [1, 2, 3, 4], fixed: [2, 3], sent: [send(2, 1, 1), send(2, 1, 2, 'unknown'), send(3, 1, 1)], refused: [1, 3], delivered: [] })
+  expect(first.p).toEqual({ accepted: [1, 2, 3, 4], fixed: [2, 3], sent: [send(2, 1, 1), send(2, 1, 2, 'unknown'), send(3, 1, 1)], refused: [1, 3], delivered: [] , withdrawn: [] })
   expect(first.parts).toEqual({ 1: 1, 2: 2, 3: 1, 4: 1 })
   expect(first.holds).toEqual([{ item: 1, kind: 'memory' }, { item: 4, kind: 'post' }])
   expect(first.e.noticed).toEqual([2, 3])
@@ -323,16 +324,16 @@ test('incremental policy inputs preserve ordered sends, refusal positions, unkno
   await append({ v: 1, kind: 'delivered', seq: 2, part: 1, at: h.clock.now(), receipt: { path: h.p().path, offset: 1 } })
   await append(sent(2, 3, 2))
   await h.tick()
-  expect(h.engine.snapshot('alpha')?.p).toEqual({ accepted: [1, 2, 3, 4], fixed: [2, 3], sent: [send(2, 1, 1), send(2, 2, 2, 'unknown'), send(2, 2, 3), send(3, 1, 1)], refused: [1, 4], delivered: [[2, 1]] })
+  expect(h.engine.snapshot('alpha')?.p).toEqual({ accepted: [1, 2, 3, 4], fixed: [2, 3], sent: [send(2, 1, 1), send(2, 2, 2, 'unknown'), send(2, 2, 3), send(3, 1, 1)], refused: [1, 4], delivered: [[2, 1]] , withdrawn: [] })
   expect(first.p.sent).toEqual([send(2, 1, 1), send(2, 1, 2, 'unknown'), send(3, 1, 1)])
   await h.queue.resolveHolds('alpha', [{ seq: 1, outcome: 'released', at: h.clock.now() }, { seq: 4, outcome: 'parked', at: h.clock.now() }])
   await h.queue.compact('alpha'); await h.tick()
   const compacted = h.engine.snapshot('alpha')!
-  expect(compacted.p).toEqual({ accepted: [1, 2, 3, 4], fixed: [2, 3], sent: [send(2, 2, 2, 'unknown'), send(2, 2, 3)], refused: [], delivered: [[2, 1]] })
+  expect(compacted.p).toEqual({ accepted: [1, 2, 3, 4], fixed: [2, 3], sent: [send(2, 2, 2, 'unknown'), send(2, 2, 3)], refused: [], delivered: [[2, 1]] , withdrawn: [] })
   expect(compacted.holds).toEqual([{ item: 4, kind: 'memory' }])
   expect(compacted.e.noticed).toEqual([2, 3])
   expect(h.engine.status('alpha')).toMatchObject({ seq: 1, count: 3 })
-  expect(h.engine.snapshot('beta')?.p).toEqual({ accepted: [1], fixed: [1], sent: [], refused: [], delivered: [] })
+  expect(h.engine.snapshot('beta')?.p).toEqual({ accepted: [1], fixed: [1], sent: [], refused: [], delivered: [] , withdrawn: [] })
   await h.restartServer(); await h.tick()
   expect(h.engine.snapshot('alpha')?.p).toEqual(compacted.p)
   expect(h.engine.snapshot('alpha')?.holds).toEqual(compacted.holds)
@@ -2418,4 +2419,132 @@ test('a reconnect timer outlived by a six-second AD read resumes its retained co
   await h.clock.flush()
   expect(stopped).toBe(true)
   await stopping
+})
+
+async function acceptReaction(h: EngineHarness, overrides: Partial<ReactionAcceptedInput> = {}): Promise<number> {
+  const result = await h.queue.accept('alpha', reactionInput(overrides))
+  if (result.status !== 'accepted') throw new Error('fixture reaction acceptance failed')
+  return result.seq
+}
+const withdraw = (h: EngineHarness, seq: number) => h.queue.append('alpha', { v: 1, kind: 'withdrawn', seq, reason: 'server-post', at: h.clock.now() })
+const journalShape = (h: EngineHarness) => h.records().map(r => ['compact' in r ? r.compact : r.kind, r.seq])
+
+describe('Reaction Items in the FIFO', () => {
+  // The file-level hook still owns cleanup; these captures are in memory.
+  const checked: EngineHarness[] = []
+  afterEach(() => { for (const h of checked.splice(0)) assertNoLeak([h.errors, h.events, h.calls, h.order], 'reaction FIFO captures') })
+  async function reactionHarness() { const h = await harness(); checked.push(h); return h }
+  const ready = (p: Partial<DeliveryPolicyKnowledge['p']>, extra: Partial<DeliveryPolicyKnowledge>): DeliveryPolicyKnowledge => ({
+    p: { accepted: [], fixed: [], sent: [], refused: [], delivered: [], ...p },
+    e: { ...createDeliveryPolicyState(), sessionSeen: 'session' },
+    r: { ...createDeliveryReading(), row: 'waiting', relay: true, marker: true, mcp: true, up: true, session: 'session', gate: 'delivery' },
+    g: { owner: 'free', stage: 'none', deferred: false, due: false }, writer: { kind: 'none' }, compact: 'none', ...extra,
+  })
+  test.each([
+    ['an explicit withdrawn head passes to its fixed successor', { accepted: [1, 2], fixed: [2], withdrawn: [1] }, {}, [2, 1], 'recordSend'],
+    ['an absent withdrawn field keeps the head', { accepted: [1, 2], fixed: [1, 2] }, {}, [1, 1], 'recordSend'],
+    ['unsorted acceptance is taken in ascending order past a withdrawn item', { accepted: [5, 3, 4], fixed: [4, 5], withdrawn: [3] }, {}, [4, 1], 'recordSend'],
+    ['a delivered head and a withdrawn item pass to the next item', { accepted: [1, 2, 3], fixed: [1, 3], delivered: [[1, 1]], withdrawn: [2] }, {}, [3, 1], 'recordSend'],
+    ['a multipart successor continues at its next part', { accepted: [1, 2], fixed: [2], delivered: [[2, 1]], withdrawn: [1] }, { parts: { 1: 1, 2: 2 } }, [2, 2], 'recordSend'],
+    ['a withdrawn first item ignores bounded MaxParts', { accepted: [1, 2], fixed: [2], withdrawn: [1] }, { MaxParts: 3 }, [2, 1], 'recordSend'],
+    ['all-withdrawn work has no target', { accepted: [1, 2], withdrawn: [1, 2] }, {}, NO_DELIVERY_PAIR, 'wait'],
+  ] as [string, Partial<DeliveryPolicyKnowledge['p']>, Partial<DeliveryPolicyKnowledge>, DeliveryPair, 'recordSend' | 'fixText' | 'wait'][])('pure policy: %s', (_, p, extra, target, action) => {
+    const k = ready(p, extra)
+    expect(selectDeliveryTarget(k)).toEqual(target)
+    expect(decideEngine(k)).toBe(action)
+    const free = { ...k, r: { ...k.r, gate: 'free' } }
+    expect(decideEngine(free)).toBe(action === 'recordSend' ? 'requestGate' : action)
+    // The gate grants a pending delivery request only for a send this same target permits.
+    expect(decideGate({ ...free, e: { ...k.e, request: 'delivery' } })).toBe(action === 'recordSend' ? 'grantDelivery' : 'cancelRequest')
+  })
+
+  test.each(['live', 'restarted'] as const)('a withdrawn reaction head is passed for its fixed successor (%s)', async via => {
+    const h = await reactionHarness()
+    expect(await acceptReaction(h)).toBe(1)
+    await withdraw(h, 1)
+    await h.clock.advance(5000)
+    await h.accept('successor')
+    if (via === 'restarted') await h.restartServer()
+    await start(h)
+    expect(h.engine.snapshot('alpha')!.p).toMatchObject(via === 'live' ? { accepted: [1, 2], fixed: [2], withdrawn: [1] } : { accepted: [2], fixed: [2], withdrawn: [] })
+    expect(h.engine.snapshot('alpha')!.e.target).toEqual([2, 1])
+    // Status facts come from the successor only: its seq, age and a count of one.
+    expect(h.engine.status('alpha')).toMatchObject({ key: 'alpha', seq: 2, count: 1, ageMs: 0 })
+    await delivered(h)
+    expect(h.keyCalls().map(c => c.params.key ?? c.params.text)).toEqual(['successor', 'Enter'])
+    expect(journalShape(h).filter(([, seq]) => seq === 1)).toEqual(via === 'live' ? [['accepted', 1], ['withdrawn', 1]] : [['reaction-key', 1]])
+    expect(h.records().filter(r => r.kind === 'sent' || r.kind === 'delivered' || r.kind === 'fixed').map(r => r.seq)).toEqual([2, 2, 2])
+    expect(h.events.filter(e => 'seq' in e && e.seq === 1)).toEqual([])
+    expect(h.events.filter(e => e.type === 'item-delivered').map(e => 'seq' in e && e.seq)).toEqual([2])
+    expect(h.queue.item('alpha', 1)?.delivered).toBe(via === 'live' ? false : undefined)
+    expect(h.errors).toEqual([])
+  })
+
+  test.each(['live', 'restarted'] as const)('an all-withdrawn queue (%s) starts no engine, takes no lease or keys, and passes reconnect recovery', async via => {
+    const h = await reactionHarness()
+    await acceptReaction(h); await acceptReaction(h, { emoji: 'eyes' })
+    await withdraw(h, 1); await withdraw(h, 2)
+    if (via === 'restarted') await h.restartServer()
+    expect(h.queue.openCount('alpha')).toBe(0)
+    h.engine.wake('alpha')
+    await start(h)
+    await h.clock.advance(RECEIPT_WAIT_MS)
+    expect(h.engine.running('alpha')).toBe(false)
+    expect(h.engine.status('alpha')).toBeUndefined()
+    expect(h.engine.snapshot('alpha')).toBeUndefined()
+    expect(h.lifecycle.owner('alpha')).toBe('free')
+    expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(true)
+    expect(await h.lifecycle.recoverBeforeReconnect('alpha')).toBe(true)
+    expect(h.engine.running('alpha')).toBe(false)
+    expect(h.calls).toEqual([])
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(journalShape(h)).toEqual(via === 'live'
+      ? [['accepted', 1], ['accepted', 2], ['withdrawn', 1], ['withdrawn', 2]]
+      : [['reaction-key', 1], ['reaction-key', 2], ['allocation', 2]])
+    expect(h.events).toEqual([])
+    expect(h.errors).toEqual([])
+  })
+
+  test.each(['fixed', 'withdrawn'] as const)('an unowned accepted-only reaction head holds a later fixed item until it is durably %s', async outcome => {
+    const h = await reactionHarness()
+    await acceptReaction(h)
+    await h.accept('successor')
+    await start(h)
+    await h.advance(RECEIPT_WAIT_MS)
+    expect(h.preparation.owns('alpha', 1)).toBe(false)
+    expect(h.engine.running('alpha')).toBe(true)
+    expect(h.engine.snapshot('alpha')!.e.target).toEqual([1, 1])
+    expect(h.engine.status('alpha')).toMatchObject({ seq: 1, count: 2 })
+    expect(h.keyCalls()).toEqual([])
+    expect(h.lifecycle.owner('alpha')).toBe('free')
+    expect(h.records().filter(r => r.kind !== 'accepted').map(r => [r.kind, r.seq])).toEqual([['fixed', 2]])
+    expect(h.order).not.toContain('lookup')
+    await h.queue.append('alpha', outcome === 'fixed' ? { v: 1, kind: 'fixed', seq: 1, parts: ['reaction text'] } : { v: 1, kind: 'withdrawn', seq: 1, reason: 'server-post', at: h.clock.now() })
+    h.engine.wake('alpha')
+    await delivered(h)
+    const seqs = outcome === 'fixed' ? [1, 2] : [2]
+    expect(h.textCalls().map(c => c.params.text)).toEqual(outcome === 'fixed' ? ['reaction text', 'successor'] : ['successor'])
+    expect(h.records().filter(r => r.kind === 'delivered').map(r => r.seq)).toEqual(seqs)
+    expect(h.events.filter(e => e.type === 'item-delivered').map(e => 'seq' in e && e.seq)).toEqual(seqs)
+    expect(h.errors).toEqual([])
+  })
+
+  test('reconnect recovery passes a withdrawn head and reconciles its successor\'s retained draft first', async () => {
+    const h = await reactionHarness(), p = h.p()
+    await acceptReaction(h)
+    await withdraw(h, 1)
+    await h.accept('retained draft')
+    p.connected = false
+    p.box = 'retained draft'
+    await h.queue.append('alpha', { v: 1, kind: 'sent', seq: 2, part: 1, attempt: 1, send_kind: 'text', at: 0,
+      session_id: p.row.session_id, transcript_path: p.path, transcript_size: 0 })
+    expect(await h.lifecycle.recoverBeforeReconnect('alpha')).toBe(false)
+    expect(h.keyCalls().map(c => c.params)).toEqual([{ instance_id: 'cscb_alpha', key: 'Enter' }])
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    expect(await h.lifecycle.recoverBeforeReconnect('alpha')).toBe(true)
+    expect(h.queue.item('alpha', 2)?.delivered).toBe(true)
+    expect(h.textCalls()).toEqual([])
+    expect(journalShape(h).filter(([, seq]) => seq === 1)).toEqual([['accepted', 1], ['withdrawn', 1]])
+    expect(h.errors).toEqual([])
+  })
 })

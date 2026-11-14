@@ -2,13 +2,13 @@
  * fmk-texts.ts — the one value printer of the `/ci` scenarios that match
  * texts `src/` exports: every fmk scenario, and the shared-mode
  * test-29-invited-channels.sh (b.jg5 SRJ-1401, SRJ-1306; b.deo SRI-1401,
- * SRI-1404). A scenario script cannot import TypeScript, and a test never
+ * SRI-1404) and test-50-reaction-notices.sh (b.n3k). A scenario script cannot import TypeScript, and a test never
  * retypes a notice text, class label, version or settings value that `src/`
  * exports. So a script asks this printer for the value, and the printer
  * prints the installed package's own export (the tarball under test): a
  * constant as it is, or a builder's output for the script's arguments.
  *
- * Every fmk scenario uses this one printer, and so does test-29. A scenario
+ * Every fmk scenario uses this one printer, and so do test-29 and test-50. A scenario
  * that needs another value adds a named entry to `ENTRIES` here, and never a
  * second printer.
  *
@@ -230,8 +230,9 @@
  *   sharedConfigurationMatches <config-path> <record-path> <reviewed|applied>
  *       Validate the whole shared authority and exact reviewed input; applied
  *       also compares resolved applied configuration with that input.
- *   sharedConfigurationValue <config-path> <record-path> <port|resume_enabled>
- *       Print only the named safe applied setting, never pending input.
+ *   sharedConfigurationValue <config-path> <record-path> <port|resume_enabled|channel_mode>
+ *       Print only the named safe applied setting, never pending input;
+ *       channel_mode through src/config.ts's channelModeOf.
  *   sharedAuthorityPreserved <config-path> <before-record> <after-record>
  *       Validate preserved choices, identity and reviewed input across fresh discovery.
  *   sharedThreadStamp <config-path> <record-path> <persona-key> <channel>
@@ -1391,6 +1392,40 @@
  *                                 EFFORT_LABEL_KEY by its value (any other
  *                                 fails), in that order (any other order
  *                                 fails)
+ *
+ * test-50's entries (test-50-reaction-notices.sh, a shared-mode scenario;
+ * b.n3k). <name> is a persona name, <key> its key, <chat> a conversation ID
+ * and <message-ts> the reacted message's ts:
+ *   REACTION_RECEIVED, REACTION_DROPPED
+ *                                 src/reaction-intake-diagnostics.ts, the class
+ *                                 labels
+ *   REACTION_WITHDRAWN, REACTION_MESSAGE_UNKNOWN
+ *                                 src/reaction-preparation-diagnostics.ts, the
+ *                                 class labels
+ *   buildReactionReceivedLine <name> <key> <chat> <message-ts> <added|removed> <emoji> <user> <seq>
+ *                                 src/reaction-intake-diagnostics.ts: the line of
+ *                                 a newly stored Reaction Item from user <user>,
+ *                                 <seq> its sequence in decimal
+ *   buildReactionDroppedLine <name> <key> <reason> <chat> <message-ts> [<refusal>]
+ *                                 src/reaction-intake-diagnostics.ts: a logged
+ *                                 drop, <reason> one of its
+ *                                 REACTION_LOGGED_DROP_REASONS, <refusal> given
+ *                                 for `fungible-refused` and only for it
+ *   buildReactionWithdrawnLine <name> <key> <chat> <message-ts> <reason> [<condition>]
+ *                                 src/reaction-preparation-diagnostics.ts: a
+ *                                 withdrawal's line, <reason> and <condition> as
+ *                                 src/delivery-queue.ts's withdrawn record names
+ *                                 them
+ *   buildReactionMessageUnknownLine <name> <key> <chat> <message-ts>
+ *                                 src/reaction-preparation-diagnostics.ts: a
+ *                                 notice fixed without `thread_ts`
+ *   TAG_SOURCE                    src/tag-wrapper.ts, a typed tag's `source`
+ *   SERVER_POST_EVENT_TYPE        src/server-post.ts, a Server Post's metadata
+ *                                 event type
+ *   encodePermissionActionId <allow|deny> <instance-id> <token>
+ *                                 src/permission-action-id.ts: a permission
+ *                                 prompt button's action_id
+ *   REPLY_REMINDER_TEXT           src/reply-reminder.ts, the reply reminder's text
  *
  * An entry is one `Entry` in `ENTRIES`: its argument synopsis, the export it
  * prints and a `print` function from its arguments to the value. Constants
@@ -4452,15 +4487,21 @@ const sharedThreadStamp: Entry = {
   },
 }
 
-// sharedConfigurationValue <config-path> <record-path> <port|resume_enabled>:
+// sharedConfigurationValue <config-path> <record-path> <port|resume_enabled|channel_mode>:
 // the applied view only, never the pending input or an arbitrary JSON path.
 const sharedConfigurationValue: Entry = {
-  synopsis: '<config-path> <record-path> <port|resume_enabled>',
+  synopsis: '<config-path> <record-path> <port|resume_enabled|channel_mode>',
   async print(args, context) {
     expectArguments('sharedConfigurationValue', args, ['config-path', 'record-path', 'setting'])
     const [configPath, recordPath, setting] = args
-    if (setting !== 'port' && setting !== 'resume_enabled') usageFail('setting must be port or resume_enabled')
+    if (setting !== 'port' && setting !== 'resume_enabled' && setting !== 'channel_mode') usageFail('setting must be port, resume_enabled or channel_mode')
     const { applied } = await readSharedConfiguration(context, configPath, recordPath)
+    if (setting === 'channel_mode') {
+      const modeOf = await packageFunction<(config: object) => unknown>(context, 'config.ts', 'channelModeOf')
+      const mode = modeOf(applied)
+      if (mode !== 'strict' && mode !== 'open') throw new PrinterFailure('shared configuration setting has an unexpected type', PRINTER_FAIL_EXIT)
+      return mode
+    }
     const value = applied[setting]
     if (setting === 'port' ? !Number.isSafeInteger(value) : typeof value !== 'boolean') {
       throw new PrinterFailure('shared configuration setting has an unexpected type', PRINTER_FAIL_EXIT)
@@ -4958,10 +4999,10 @@ function sharedHoldTransition(before: SharedAccepted, after: SharedAccepted,
     rows.some(r => r.kind === 'accepted' && 'compact' in r && r.compact === 'allocation' && r.seq >= after.seq)),
   'hold transition lacks same-observation compaction evidence')
   const resolutions = observations.flat().filter((r): r is import('../../../src/delivery-queue.ts').HoldResolutionRecord =>
-    r.seq === before.seq && ['released', 'withdrawn', 'parked'].includes(r.kind))
+    r.seq === before.seq && ['released', 'hold-withdrawn', 'parked'].includes(r.kind))
   const released = new Set(resolutions.filter(r => r.kind === 'released').map(r => r.at))
   const parked = new Set(resolutions.filter(r => r.kind === 'parked').map(r => r.at))
-  evidenceAssert(!resolutions.some(r => r.kind === 'withdrawn') && released.size <= 1 && parked.size <= 1,
+  evidenceAssert(!resolutions.some(r => r.kind === 'hold-withdrawn') && released.size <= 1 && parked.size <= 1,
     'conflicting hold resolution evidence')
   if (after.hold) {
     evidenceAssert(hold.on === 'post' && hold.root_unknown && after.released_at === undefined &&
@@ -5817,6 +5858,105 @@ const freshStartLine: Entry = {
   },
 }
 
+// ---------------------------------------------------------------------------
+// test-50's Reaction Notice texts (test-50-reaction-notices.sh, a shared-mode
+// scenario), every one from reaction-intake-diagnostics.ts,
+// reaction-preparation-diagnostics.ts, tag-wrapper.ts, server-post.ts,
+// permission-action-id.ts or reply-reminder.ts.
+// ---------------------------------------------------------------------------
+
+/** The changes a reaction event names, as a Reaction Notice's `reaction` attribute carries them. */
+const REACTION_CHANGES: readonly string[] = ['added', 'removed']
+
+/** The withdrawal reasons and fungible conditions a queue's withdrawn record names (src/delivery-queue.ts's types; the package exports no list). */
+const REACTION_WITHDRAWAL_REASONS: readonly string[] = ['server-post', 'conversation-unknown', 'group-dm', 'fungible-refused']
+const REACTION_FUNGIBLE_CONDITIONS: readonly string[] = ['not-a-channel', 'externally-shared', 'not_in_channel', 'channel_not_found']
+
+/** Fails with a usage failure unless `value` is one of `allowed`. */
+function checkOneOf(entry: string, name: string, value: string, allowed: readonly string[]): void {
+  if (!allowed.includes(value)) usageFail(`${entry}: <${name}> must be one of ${allowed.join(', ')} (got '${value}')`)
+}
+
+/**
+ * `buildReactionReceivedLine({ key, name }, record)` (reaction-intake-diagnostics.ts)
+ * for a user reactor: the line of a newly stored Reaction Item, <seq> its
+ * sequence in decimal.
+ */
+const reactionReceivedLine: Entry = {
+  synopsis: '<name> <key> <chat> <message-ts> <added|removed> <emoji> <user> <seq>',
+  async print(args, context) {
+    const entry = 'buildReactionReceivedLine'
+    expectArguments(entry, args, ['name', 'key', 'chat', 'message-ts', 'added|removed', 'emoji', 'user', 'seq'])
+    const [name, key, channel, messageTs, change, emoji, user, seq] = args
+    checkOneOf(entry, 'added|removed', change!, REACTION_CHANGES)
+    if (!/^[1-9][0-9]{0,8}$/.test(seq!)) usageFail(`${entry}: <seq> '${seq}' is not a positive whole number in decimal`)
+    const build = await packageFunction<(p: { key: string; name: string }, record: Record<string, unknown>) => unknown>(
+      context,
+      'reaction-intake-diagnostics.ts',
+      entry,
+    )
+    return builtString(entry, build({ key: key!, name: name! }, { channel, message_ts: messageTs, change, emoji, user, seq: Number(seq) }))
+  },
+}
+
+/**
+ * `buildReactionDroppedLine({ key, name }, { reason, chat_id, message_ts, refusal })`
+ * (reaction-intake-diagnostics.ts): <reason> one of the package's
+ * REACTION_LOGGED_DROP_REASONS, <refusal> given for `fungible-refused` only.
+ */
+const reactionDroppedLine: Entry = {
+  synopsis: '<name> <key> <reason> <chat> <message-ts> [<refusal>]',
+  async print(args, context) {
+    const entry = 'buildReactionDroppedLine'
+    expectSomeArguments(entry, args, ['name', 'key', 'reason', 'chat', 'message-ts', 'refusal'], 5)
+    const [name, key, reason, channel, messageTs, refusal] = args
+    const reasons = await packageExport(context, 'reaction-intake-diagnostics.ts', 'REACTION_LOGGED_DROP_REASONS')
+    if (!Array.isArray(reasons) || !reasons.includes(reason)) usageFail(`${entry}: <reason> '${reason}' is not one of the package's REACTION_LOGGED_DROP_REASONS`)
+    if ((reason === 'fungible-refused') !== (refusal !== undefined)) usageFail(`${entry}: <refusal> is given for fungible-refused and only for it`)
+    const build = await packageFunction<(p: { key: string; name: string }, drop: Record<string, unknown>) => unknown>(
+      context,
+      'reaction-intake-diagnostics.ts',
+      entry,
+    )
+    const drop: Record<string, unknown> = { reason, chat_id: channel, message_ts: messageTs }
+    if (refusal !== undefined) drop.refusal = refusal
+    return builtString(entry, build({ key: key!, name: name! }, drop))
+  },
+}
+
+/**
+ * `buildReactionWithdrawnLine({ key, name, chat_id, message_ts }, <reason>, <condition>)`
+ * (reaction-preparation-diagnostics.ts), <condition> given or not.
+ */
+const reactionWithdrawnLine: Entry = {
+  synopsis: '<name> <key> <chat> <message-ts> <reason> [<condition>]',
+  async print(args, context) {
+    const entry = 'buildReactionWithdrawnLine'
+    expectSomeArguments(entry, args, ['name', 'key', 'chat', 'message-ts', 'reason', 'condition'], 5)
+    const [name, key, channel, messageTs, reason, condition] = args
+    checkOneOf(entry, 'reason', reason!, REACTION_WITHDRAWAL_REASONS)
+    if (condition !== undefined) checkOneOf(entry, 'condition', condition, REACTION_FUNGIBLE_CONDITIONS)
+    const build = await packageFunction<(s: Record<string, string>, reason: string, condition?: string) => unknown>(
+      context,
+      'reaction-preparation-diagnostics.ts',
+      entry,
+    )
+    return builtString(entry, build({ key: key!, name: name!, chat_id: channel!, message_ts: messageTs! }, reason!, condition))
+  },
+}
+
+/** `buildReactionMessageUnknownLine({ key, name, chat_id, message_ts })` (reaction-preparation-diagnostics.ts). */
+const reactionMessageUnknownLine: Entry = {
+  synopsis: '<name> <key> <chat> <message-ts>',
+  async print(args, context) {
+    const entry = 'buildReactionMessageUnknownLine'
+    expectArguments(entry, args, ['name', 'key', 'chat', 'message-ts'])
+    const [name, key, channel, messageTs] = args
+    const build = await packageFunction<(s: Record<string, string>) => unknown>(context, 'reaction-preparation-diagnostics.ts', entry)
+    return builtString(entry, build({ key: key!, name: name!, chat_id: channel!, message_ts: messageTs! }))
+  },
+}
+
 /** The printer's entries, by the name a script passes. Later scenarios add entries here. */
 const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   buildSharedStateUnresolvedNotice,
@@ -6078,6 +6218,19 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   EFFORT_ARG_PREFIX: constantEntry('agent-director-template.ts', 'EFFORT_ARG_PREFIX'),
   EFFORT_LEVELS: effortLevels,
   freshStartLine,
+  // test-50 (test-50-reaction-notices.sh), a shared-mode scenario.
+  REACTION_RECEIVED: constantEntry('reaction-intake-diagnostics.ts', 'REACTION_RECEIVED'),
+  REACTION_DROPPED: constantEntry('reaction-intake-diagnostics.ts', 'REACTION_DROPPED'),
+  REACTION_WITHDRAWN: constantEntry('reaction-preparation-diagnostics.ts', 'REACTION_WITHDRAWN'),
+  REACTION_MESSAGE_UNKNOWN: constantEntry('reaction-preparation-diagnostics.ts', 'REACTION_MESSAGE_UNKNOWN'),
+  buildReactionReceivedLine: reactionReceivedLine,
+  buildReactionDroppedLine: reactionDroppedLine,
+  buildReactionWithdrawnLine: reactionWithdrawnLine,
+  buildReactionMessageUnknownLine: reactionMessageUnknownLine,
+  TAG_SOURCE: constantEntry('tag-wrapper.ts', 'TAG_SOURCE'),
+  SERVER_POST_EVENT_TYPE: constantEntry('server-post.ts', 'SERVER_POST_EVENT_TYPE'),
+  encodePermissionActionId: builderEntry('permission-action-id.ts', 'encodePermissionActionId', ['allow|deny', 'instance-id', 'token']),
+  REPLY_REMINDER_TEXT: constantEntry('reply-reminder.ts', 'REPLY_REMINDER_TEXT'),
 }, argsEntries(ARGS_ENTRIES), fnEntries(FN_ENTRIES))
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */

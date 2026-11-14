@@ -50,7 +50,8 @@
  *
  * RECORDS AND TOOL CALLS
  * ----------------------
- * Four files per working directory, all in the directory holding the client
+ * Four record files per working directory (and one optional control, see
+ * CONCURRENCY), all in the directory holding the client
  * file (Bun's `import.meta.dir`, which Bun resolves through a symlink to its
  * target's directory). The stub runs the client beside itself, so for a copy
  * of the client this is the stub's directory: SCENARIO_STUB_DIR in a scenario
@@ -60,6 +61,8 @@
  *   stub-mcp-requests.<key>.jsonl     the request file (the harness writes)
  *   stub-mcp-results.<key>.jsonl      the results record (the client writes)
  *   stub-mcp-sessions.<key>.jsonl     session observations (the client writes)
+ *   stub-mcp-concurrency.<key>.json   the concurrency control (optional; the
+ *                                     harness writes, the client only reads)
  *
  * The key. <key> is the lowercase hexadecimal SHA-256 digest, all 64
  * characters (no truncation), of the working directory's real path: the
@@ -179,6 +182,36 @@
  * `intent: "retry"` in `arguments`, passed unchanged to callTool on the current
  * session. Request IDs and logical attempt identifiers are independent.
  *
+ * CONCURRENCY. A scenario may let two calls run at once for one working
+ * directory by placing `{"max_in_flight":2}` in stub-mcp-concurrency.<key>.json
+ * beside the client (same <key>; write a temp file, then `mv`). The client
+ * reads that control at the start of every poll, so a scenario turns it on
+ * or off between settled legs; no argument, environment variable or harness
+ * helper changes. The control:
+ *   - missing: as above (without a group, in order, one at a time);
+ *   - `{"max_in_flight":1}`: the same;
+ *   - `{"max_in_flight":2}`: up to two calls in flight. A poll admits, in
+ *     file order, each request line while fewer than two calls are in
+ *     flight, starting each call without waiting for it, and leaves the first
+ *     line beyond the cap unread for a later poll. So a second request is
+ *     admitted, at the same or the next poll, while the first still waits for
+ *     its tool result. A request with a `group` or `lose_response` is not
+ *     run in this mode: it gets a NO TOOL RESULT line at once. Each call's ID
+ *     is reserved before the call starts; an
+ *     ID already answered or in flight is never started again (one stderr
+ *     line, and the line is skipped). Result lines are written as calls end,
+ *     so they may be out of file order;
+ *   - anything else (not a regular file, over 256 bytes, unreadable, not
+ *     JSON, not an object, a key other than `max_in_flight`, a value other
+ *     than the integer 1 or 2): no new request is admitted until the control
+ *     is valid or removed; calls already in flight go on. One stderr line
+ *     names the fault (never the file's text), once per fault, and one more
+ *     when the control is valid again.
+ * Going back to one at a time (the file removed, or 1), the client admits
+ * nothing until every call in flight has its result line. Every other rule
+ * here (complete lines, offsets, the skip rule, result formats, appends)
+ * holds in both modes.
+ *
  * The skip rule. On start, before it runs any request, the client reads the
  * results record and takes every ID with a result line there as answered. A
  * request whose ID is answered (there, or by a result line this client wrote)
@@ -194,8 +227,10 @@
  * an error answer, the SDK's request timeout, a transport failure; or the
  * session ends while the call is in flight) gets one result line all the
  * same, so its ID is answered and no client runs it again:
- * `{"id":"<id>","isError":true,"text":"","error":"<why>"}`. It adds no exit
- * code, and the client never retries a request.
+ * `{"id":"<id>","isError":true,"text":"","error":"<why>"}`. When the session
+ * ends, every call then in flight gets that line, once each; a call that
+ * completes later writes nothing. It adds no exit code, and the client never
+ * retries a request.
  *
  * Writing. The delivery, results and session records are only appended to, by
  * every client of the working directory, never truncated or rewritten. Each
@@ -260,6 +295,16 @@ const REQUESTS_PREFIX = 'stub-mcp-requests.'
 const RESULTS_PREFIX = 'stub-mcp-results.'
 const SESSIONS_PREFIX = 'stub-mcp-sessions.'
 const RECORD_SUFFIX = '.jsonl'
+
+/** The concurrency control: `stub-mcp-concurrency.<key>.json` (see CONCURRENCY in the header). */
+const CONCURRENCY_PREFIX = 'stub-mcp-concurrency.'
+const CONCURRENCY_SUFFIX = '.json'
+
+/** The most calls the concurrency control may let run at once. */
+const MAX_IN_FLIGHT_LIMIT = 2
+
+/** The largest concurrency control read, in bytes. */
+const CONCURRENCY_CONTROL_MAX_BYTES = 256
 
 /** A request's arguments file: `<prefix><key>.<id><suffix>` (see the header). */
 const ARGUMENTS_PREFIX = 'stub-mcp-arguments.'
@@ -384,6 +429,39 @@ function readAnsweredIds(path: string): Set<string> | undefined {
   return ids
 }
 
+/**
+ * How many calls the concurrency control at `path` lets run at once: 1 (in
+ * order, one at a time) when the file is missing; otherwise its
+ * `max_in_flight`, or why the control is not valid. A reason names a field
+ * or a fault, never the file's text.
+ */
+function readConcurrency(path: string): { max: number } | { invalid: string } {
+  let text: string
+  try {
+    const st = lstatSync(path)
+    if (!st.isFile()) return { invalid: 'not a regular file' }
+    if (st.size > CONCURRENCY_CONTROL_MAX_BYTES) return { invalid: `larger than ${CONCURRENCY_CONTROL_MAX_BYTES} bytes` }
+    text = readFileSync(path, 'utf-8')
+  } catch (err) {
+    if (errorCode(err) === 'ENOENT') return { max: 1 }
+    return { invalid: 'unreadable' }
+  }
+  if (Buffer.byteLength(text, 'utf8') > CONCURRENCY_CONTROL_MAX_BYTES) return { invalid: `larger than ${CONCURRENCY_CONTROL_MAX_BYTES} bytes` }
+  let value: unknown
+  try {
+    value = JSON.parse(text)
+  } catch {
+    return { invalid: 'not JSON' }
+  }
+  if (!isPlainObject(value)) return { invalid: 'not a JSON object' }
+  if (Object.keys(value).some((field) => field !== 'max_in_flight')) return { invalid: 'a key other than "max_in_flight"' }
+  const max = value['max_in_flight']
+  if (typeof max !== 'number' || !Number.isInteger(max) || max < 1 || max > MAX_IN_FLIGHT_LIMIT) {
+    return { invalid: `"max_in_flight" is not an integer from 1 to ${MAX_IN_FLIGHT_LIMIT}` }
+  }
+  return { max }
+}
+
 /** One request from the request file (see the header). */
 type StubRequest =
   | { id: string; method: 'tools/list'; group?: string }
@@ -498,6 +576,7 @@ async function main(argv: readonly string[]): Promise<number> {
   const requestsPath = recordPath(REQUESTS_PREFIX, key)
   const resultsPath = recordPath(RESULTS_PREFIX, key)
   const sessionsPath = recordPath(SESSIONS_PREFIX, key)
+  const concurrencyPath = join(CLIENT_DIR, `${CONCURRENCY_PREFIX}${key}${CONCURRENCY_SUFFIX}`)
   const readArguments = argumentsFileReader(CLIENT_DIR, key)
 
   const { Client } = await importSdk('client/index.js')
@@ -522,6 +601,7 @@ async function main(argv: readonly string[]): Promise<number> {
   let answered: Set<string> | undefined
   let resultsReadReported = false
   const inFlight = new Set<string>()
+  let concurrencyReported: string | undefined
   let polling = true
   let pollTimer: ReturnType<typeof setTimeout> | undefined
   let readOffset = 0
@@ -733,7 +813,7 @@ async function main(argv: readonly string[]): Promise<number> {
     }
   }
 
-  /** One poll: the results record until read, then every complete request line not yet read. */
+  /** One poll: the results record until read, then the concurrency control, then every complete request line not yet read that it admits. */
   const poll = async (): Promise<void> => {
     if (answered === undefined) {
       answered = readAnsweredIds(resultsPath)
@@ -743,6 +823,19 @@ async function main(argv: readonly string[]): Promise<number> {
         return
       }
     }
+    const admission = readConcurrency(concurrencyPath)
+    if ('invalid' in admission) {
+      if (concurrencyReported !== admission.invalid) {
+        say(`the concurrency control ${concurrencyPath} is not valid (${admission.invalid}); no new request runs until it is valid or removed`)
+      }
+      concurrencyReported = admission.invalid
+      return
+    }
+    if (concurrencyReported !== undefined) say(`the concurrency control ${concurrencyPath} is valid again`)
+    concurrencyReported = undefined
+    const max = admission.max
+    // In order, one at a time, starts only once every call an earlier poll left in flight is done.
+    if (max === 1 && inFlight.size > 0) return
     let bytes: Buffer
     try {
       bytes = readFileSync(requestsPath)
@@ -759,6 +852,7 @@ async function main(argv: readonly string[]): Promise<number> {
       readOffset = 0
       lineNumber = 0
     }
+    if (max > 1) { admitConcurrently(bytes, max, answered); return }
     const batches: StubRequest[][] = []
     const groups = new Map<string, StubRequest[]>()
     const scheduled = new Set<string>()
@@ -805,6 +899,42 @@ async function main(argv: readonly string[]): Promise<number> {
           end(1, `could not reconnect to ${url}: ${describe(err)}`)
         }
       }
+    }
+  }
+
+  /**
+   * The concurrency control's mode (`max_in_flight` above 1): admit, in file
+   * order, each request line while fewer than `max` calls are in flight,
+   * starting each without waiting for it; the first line beyond the cap
+   * stays unread for a later poll.
+   */
+  const admitConcurrently = (bytes: Buffer, max: number, done: Set<string>): void => {
+    while (polling) {
+      const lineEnd = bytes.indexOf(NEWLINE, readOffset)
+      if (lineEnd === -1) return
+      const text = bytes.subarray(readOffset, lineEnd).toString('utf8')
+      const request = parseRequest(text, readArguments)
+      // A request that would run beyond the cap stays unread, for a later poll.
+      if (!('invalid' in request) && !done.has(request.id) && !inFlight.has(request.id) && inFlight.size >= max) return
+      readOffset = lineEnd + 1
+      lineNumber += 1
+      if ('invalid' in request) {
+        say(`line ${lineNumber} of the request file ${requestsPath} is not a valid request (${request.invalid}); skipped`)
+        continue
+      }
+      if (done.has(request.id)) {
+        say(`request ${request.id} has a result line; not run`)
+        continue
+      }
+      if (inFlight.has(request.id)) {
+        say(`request ${request.id} is in flight; not run again`)
+        continue
+      }
+      if (request.group !== undefined || (request.method === 'tools/call' && request.lose_response === true)) {
+        answer(request.id, { isError: true, text: '', error: 'a group or lose_response request runs only one at a time (concurrency control missing or 1)' })
+        continue
+      }
+      void runRequest(request).catch((err: unknown) => say(`request ${request.id} failed: ${describe(err)}`))
     }
   }
 

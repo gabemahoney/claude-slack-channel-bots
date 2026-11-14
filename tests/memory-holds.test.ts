@@ -186,10 +186,10 @@ describe('Memory Hold resolver', () => {
       await f.queue.resolveHolds('alpha', competing)
       expect(f.releases).toEqual([]); expect(f.events).toEqual([])
       gate.resolve(); await f.clock.flush()
-      expect(readQueue(f.dir).filter(r => r.kind === 'released' || r.kind === 'withdrawn')).toEqual([
-        ...competing.map(({ outcome, ...resolution }) => ({ v: 1 as const, kind: outcome, ...resolution })),
+      expect(readQueue(f.dir).filter(r => r.kind === 'released' || r.kind === 'hold-withdrawn')).toEqual([
+        ...competing.map(({ outcome, ...resolution }) => ({ v: 1 as const, kind: outcome === 'withdrawn' ? 'hold-withdrawn' as const : outcome, ...resolution })),
         ...(outcome === 'mixed' ? [
-          { v: 1, kind: 'released', seq: 3, at }, { v: 1, kind: 'withdrawn', seq: 4, at },
+          { v: 1, kind: 'released', seq: 3, at }, { v: 1, kind: 'hold-withdrawn', seq: 4, at },
           { v: 1, kind: 'released', seq: 5, at },
         ] as const : []),
       ])
@@ -775,7 +775,7 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold outage', mode => {
         expect(await pending).toBe('cancelled')
         const committed = boundary !== 'before-append'
         expect(run.queue.unresolvedHolds('alpha')).toHaveLength(committed ? 0 : 2)
-        expect(readQueue(f.h.stateDir).filter(r => r.kind === 'withdrawn')).toHaveLength(committed ? 1 : 0)
+        expect(readQueue(f.h.stateDir).filter(r => r.kind === 'hold-withdrawn')).toHaveLength(committed ? 1 : 0)
         expect(run.memoryHoldEvents.filter(e => e.type === 'withdrawn')).toHaveLength(committed ? 1 : 0)
         expect(run.heldReleases).toHaveLength(boundary === 'release-feedback' ? 1 : 0)
         expect(run.threadMemoryRetryEvents.filter(e => e.type === 'read-after-retries')).toEqual([])
@@ -881,7 +881,7 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold outage', mode => {
     expectMemoryReportsSafe(third)
     expect(f.reactions(third).filter(a => a.timestamp === held.ts)).toEqual([expect.objectContaining({ name: 'hourglass', channel, timestamp: held.ts })])
     expect(f.reactions(third).some(a => a.timestamp === absent.ts)).toBe(false)
-    expect(readQueue(f.h.stateDir).filter(r => r.kind === 'released' || r.kind === 'withdrawn')).toHaveLength(0)
+    expect(readQueue(f.h.stateDir).filter(r => r.kind === 'released' || r.kind === 'hold-withdrawn')).toHaveLength(0)
     const count = third.queued('alpha').length
     await third.deliver('alpha', held); await third.deliver('alpha', absent)
     expect(third.queued('alpha')).toHaveLength(count)

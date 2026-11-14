@@ -5,9 +5,24 @@ export const TAG_MAX_BYTES_MACOS = 880
 export const TAG_MIN_BODY_BYTES = 400
 export const NAME_LOOKUP_TIMEOUT_MS = 2000
 export const TAG_SOURCE = 'slack-channel-router'
-export const TAG_ATTRIBUTE_ORDER = ['chat_id', 'channel_name', 'message_id', 'user', 'user_id', 'bot_id', 'ts', 'thread_ts', 'via', 'attachment_count', 'attachments', 'part'] as const
+export const TAG_ATTRIBUTE_ORDER = ['chat_id', 'channel_name', 'message_id', 'user', 'user_id', 'bot_id', 'ts', 'thread_ts', 'via', 'reaction', 'emoji', 'attachment_count', 'attachments', 'part'] as const
 export type TagAttributes = Partial<Record<typeof TAG_ATTRIBUTE_ORDER[number], string>>
 export type TagMessage = TagAttributes & { text?: string }
+/** A Reaction Notice's fields: message_id is the reacted message's ts, ts the reaction event's ts, emoji the name without colons. */
+export type ReactionNoticeInput = {
+  chat_id: string; channel_name: string; message_id: string; user: string; ts: string; thread_ts?: string
+  reaction: 'added' | 'removed'; emoji: string
+} & ({ user_id: string; bot_id?: never } | { bot_id: string; user_id?: never })
+/** The only builder that sets via="reaction", reaction or emoji. Fields are copied by name, never spread, so nothing else reaches the tag. */
+export function buildReactionNoticeMessage(input: ReactionNoticeInput): TagMessage {
+  const message: TagMessage = {
+    chat_id: input.chat_id, channel_name: input.channel_name, message_id: input.message_id, user: input.user,
+    ts: input.ts, thread_ts: input.thread_ts, via: 'reaction', reaction: input.reaction, emoji: input.emoji, text: '',
+  }
+  if (input.user_id !== undefined) message.user_id = input.user_id
+  else message.bot_id = input.bot_id
+  return message
+}
 const PY_SPACE = /^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]$/u
 const IGNORABLE = /^\p{Default_Ignorable_Code_Point}$/u
 const WORD = /^[\p{L}\p{N}_]$/u

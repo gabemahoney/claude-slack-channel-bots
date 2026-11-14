@@ -415,6 +415,7 @@ describe('loadPersonaConfig', () => {
       // Per persona only: no top-level value.
       ['top-level model', { ...makePersonaConfigInput(), model: `${LEAK_SENTINEL}-model` }, 'model', WHERE.top, false],
       ['top-level effort', { ...makePersonaConfigInput(), effort: LEAK_SENTINEL }, 'effort', WHERE.top, false],
+      ['top-level reaction_notices', { ...makePersonaConfigInput(), reaction_notices: false }, 'reaction_notices', WHERE.top, false],
       ['persona entry', persona({ nickname: 'ops' }), 'nickname', WHERE.entry, true],
       ['persona entry bot_token', persona({ bot_token: fakeToken(BOT_TOKEN_PREFIX, 'entry') }), 'bot_token', WHERE.entry, true],
       ['persona entry app_token', persona({ app_token: fakeToken(APP_TOKEN_PREFIX, 'entry') }), 'app_token', WHERE.entry, true],
@@ -2172,6 +2173,52 @@ describe('loadPersonaConfig', () => {
       expect(message.split('Persona config validation error: ')).toHaveLength(2)
       expect(recordError(input)).toBe(`loadPersonaConfig: invalid persona config in "${recordPath()}": ${causeOf(message)}`)
     })
+  })
+
+  // Per-persona reaction_notices, in both channel modes: true when absent,
+  // never inherited from a sibling, and a supplied non-boolean (null included)
+  // rejected rather than defaulted, without echoing the value. Top-level
+  // placement is in the unknown-keys table above.
+  describe('reaction_notices', () => {
+    const REACTION_NOTICES = 'reaction_notices' satisfies keyof PersonaInput
+    const MODE_NAME = 'Ops Bot'
+    const MODE_REF = `personas[0] ${renderPersonaRef(MODE_NAME)}`
+    /** `overrides` on the persona `MODE_NAME`, beside a sibling that never sets the key; open mode writes `channel_mode`. */
+    const configIn = (mode: ChannelMode, overrides: Record<string, unknown>) => {
+      const personas = [makePersona({ name: MODE_NAME, ...overrides } as Partial<PersonaInput>, dir), makePersona({ name: 'review_bot' }, dir)]
+      return mode === 'open' ? { channel_mode: mode, personas } : { personas }
+    }
+
+    test.each(
+      CHANNEL_MODES.flatMap((mode) =>
+        ([['omitted', {}, true], ['true', { [REACTION_NOTICES]: true }, true], ['false', { [REACTION_NOTICES]: false }, false]] as const)
+          .map(([label, written, expected]) => ({ mode, label, written, expected }))),
+    )('$mode mode, $label: resolves to $expected, and the sibling resolves to true', ({ mode, written, expected }) => {
+      const [persona, sibling] = load(configIn(mode, written)).personas
+      expect(persona!.reaction_notices).toBe(expected)
+      expect(sibling!.reaction_notices).toBe(true)
+    })
+
+    const REJECTED: [string, unknown][] = [
+      ['null', null],
+      ['the string "false"', 'false'],
+      ['the number 0', 0],
+      ['the number 1', 1],
+      ['an empty array', []],
+      ['an object', { enabled: true }],
+      ['a fake token as a string', fakeToken(BOT_TOKEN_PREFIX, 'reaction')],
+      ['an object holding a fake token', { value: fakeToken(APP_TOKEN_PREFIX, 'reaction') }],
+    ]
+
+    test.each(CHANNEL_MODES.flatMap((mode) => REJECTED.map(([label, value]) => ({ mode, label, value }))))(
+      '$mode mode: $label is rejected naming the persona and the setting, never the value',
+      ({ mode, value }) => {
+        expect(loadError(configIn(mode, { [REACTION_NOTICES]: value }))).toBe(
+          `loadPersonaConfig: invalid persona config in "${join(dir, 'config.json')}": Persona config validation error: ` +
+            `${MODE_REF}: ${REACTION_NOTICES} must be a boolean.`,
+        )
+      },
+    )
   })
 })
 

@@ -332,11 +332,13 @@ import {
   makeChannelMessage,
   makeDeferredConnect,
   makeDeferredWebApiCall,
+  makeReaction as makeSlackReaction,
   makeStubSlack,
   makeStubSlackFactory,
   mentionText,
   type ConnectOutcome,
   type SettledConnectOutcome,
+  type SlackEvent,
   type StubClientBuild,
   type StubClientKind,
   type StubSlack,
@@ -2322,6 +2324,16 @@ async function expectDelivers(h: Harness, p: ManagedPersona, stub: StubSlack = s
   expect(h.events.filter(e => e.payload.event?.text === text).map(e => e.key)).toEqual([p.key])
 }
 
+/** A `reaction_added` or `reaction_removed` event on a channel message. */
+function makeReaction(type: 'reaction_added' | 'reaction_removed', overrides: Record<string, unknown> = {}): SlackEvent {
+  return makeSlackReaction(type, {
+    user: 'U0REACTOR',
+    item_user: 'U0AUTHOR',
+    event_ts: '1700000001.000200',
+    ...overrides,
+  }, { ts: '1700000000.000100' })
+}
+
 /**
  * A `@slack/web-api`-shaped error with `code`, carrying the sentinel in its
  * message (inside a token and a URL, `sentinelInMessage`), and bare in its
@@ -2374,8 +2386,9 @@ describe('connection manager: bring-up and identity', () => {
   test.each([
     ['the bot user ID', { user_id: undefined }],
     ['the bot ID', { bot_id: undefined }],
-  ])('an auth.test answer without %s leaves the persona retrying with no socket; the retry re-runs auth.test', async (_label, result) => {
+  ])('an auth.test answer without %s leaves the persona retrying with no socket; the retry re-runs auth.test; B keeps delivering', async (_label, result) => {
     const h = makeHarness()
+    expect(await h.manager.bringUp(h.b, h.b.tokens)).toMatchObject({ state: 'up' })
     stubOf(h, h.a).script.authTest.push({ kind: 'ok', result })
 
     const status = await h.manager.bringUp(h.a, h.a.tokens)
@@ -2389,13 +2402,19 @@ describe('connection manager: bring-up and identity', () => {
     expect(h.slack.buildsOf(h.a.key, 'socket')).toEqual([])
     expect(h.manager.identity(h.a.key)).toBeUndefined()
     expect(h.manager.webClient(h.a.key)).toBeUndefined()
+    // An incomplete answer confirms nothing, even the bot user ID it did carry.
+    expect(h.manager.isRunBotIdentity(stubOf(h, h.a).identity.botUserId)).toBe(false)
+    await expectDelivers(h, h.b)
     await h.clock.advance(5_000)
     expect(stubOf(h, h.a).calls.authTest).toHaveLength(2)
     expect(h.manager.status(h.a.key)).toMatchObject({ state: 'up' })
+    expect(h.manager.isRunBotIdentity(stubOf(h, h.a).identity.botUserId)).toBe(true)
+    await expectDelivers(h, h.b)
   })
 
-  test('a refused auth.test leaves the persona credentials-broken: no socket built or started, never retried', async () => {
+  test('a refused auth.test leaves the persona credentials-broken: no socket built or started, never retried; B keeps delivering', async () => {
     const h = makeHarness()
+    expect(await h.manager.bringUp(h.b, h.b.tokens)).toMatchObject({ state: 'up' })
     stubOf(h, h.a).script.authTest.push({ kind: 'platform', error: 'invalid_auth' })
 
     const status = await h.manager.bringUp(h.a, h.a.tokens)
@@ -2410,6 +2429,8 @@ describe('connection manager: bring-up and identity', () => {
     expect(stubOf(h, h.a).calls.authTest).toHaveLength(1)
     expect(h.clock.pendingCount()).toBe(0)
     expect(h.lines.map(classOf)).toEqual([PERSONA_CREDENTIALS_REFUSED])
+    expect(h.manager.isRunBotIdentity(stubOf(h, h.a).identity.botUserId)).toBe(false)
+    await expectDelivers(h, h.b)
   })
 
   test('bring-up outside dry run without credentials rejects with a TypeError and builds nothing', async () => {
@@ -3239,26 +3260,48 @@ describe('connection manager: no module-scope effects', () => {
 // ---------------------------------------------------------------------------
 
 describe('connection manager: event tagging and isolation', () => {
-  test('message, app_mention and interactive events reach the handler tagged with their own persona, payload unchanged, never acked by the manager', async () => {
+  test('message, app_mention, interactive, reaction_added and reaction_removed events reach the handler tagged with their own persona, the listener argument itself, never acked by the manager', async () => {
     const h = makeHarness()
     await bringUpBoth(h)
     const sent: [string, PersonaSocketEventName, Record<string, unknown>][] = []
+    // What a listener subscribed after the manager's receives: the argument the manager must pass on as is.
+    const received: unknown[] = []
 
     for (const p of [h.a, h.b]) {
       const stub = stubOf(h, p)
+      for (const name of ['message', 'app_mention', 'interactive', 'reaction_added', 'reaction_removed']) {
+        stub.socket.on(name, (arg: unknown) => void received.push(arg))
+      }
       const message = makeChannelMessage({ text: `message for ${p.key}` })
       const mention = makeAppMention({ text: `${mentionText(stub.identity.botUserId)} hello` })
       const click = { type: 'block_actions', actions: [{ action_id: `click-${p.key}` }] }
+      const added = makeReaction('reaction_added', { reaction: `added-${p.key}` })
+      const removed = makeReaction('reaction_removed', { reaction: `removed-${p.key}` })
       await stub.socket.deliver(message)
       await stub.socket.deliver(mention)
       await stub.socket.deliverInteractive(click)
-      sent.push([p.key, 'message', message], [p.key, 'app_mention', mention], [p.key, 'interactive', click])
+      // An externally shared channel's envelope: the flag lives on the envelope only and must survive.
+      await stub.socket.deliver(added, { is_ext_shared_channel: true })
+      await stub.socket.deliver(removed)
+      sent.push(
+        [p.key, 'message', message],
+        [p.key, 'app_mention', mention],
+        [p.key, 'interactive', click],
+        [p.key, 'reaction_added', added],
+        [p.key, 'reaction_removed', removed],
+      )
     }
 
     expect(h.events.map(e => [e.key, e.eventName])).toEqual(sent.map(([key, name]) => [key, name]))
+    expect(received).toHaveLength(h.events.length)
     h.events.forEach((e, i) => {
+      expect(e.payload).toBe(received[i] as PersonaSocketEventPayload)
       expect(e.eventName === 'interactive' ? e.payload.body : e.payload.event).toBe(sent[i]![2])
       expect(typeof e.payload.ack).toBe('function')
+      if (e.eventName.startsWith('reaction_')) {
+        expect(e.payload.body?.event).toBe(sent[i]![2])
+        expect(e.payload.body?.is_ext_shared_channel).toBe(e.eventName === 'reaction_added')
+      }
     })
     for (const p of [h.a, h.b]) expect(stubOf(h, p).socket.acks).toEqual([])
   })
@@ -3787,15 +3830,18 @@ describe('connection manager: late settlement of a stopped or abandoned start()'
     const starts = startsOf(h, h.a)
     // Should the late socket open, deliver on it while it is connected: nothing may reach the handler.
     const lateText = 'from A\'s late socket'
+    const lateReaction = makeReaction('reaction_added', { reaction: 'late' })
     const lateDeliveries: Promise<void>[] = []
-    inFlight.on('connected', () => void lateDeliveries.push(inFlight.deliver(makeChannelMessage({ text: lateText }))))
+    inFlight.on('connected', () => {
+      lateDeliveries.push(inFlight.deliver(makeChannelMessage({ text: lateText })), inFlight.deliver(lateReaction))
+    })
 
     deferred.settle(late)
     await h.clock.flush()
     await Promise.all(lateDeliveries)
 
-    expect(lateDeliveries).toHaveLength(late.kind === 'ok' ? 1 : 0)
-    expect(h.events.filter(e => e.payload.event?.text === lateText)).toEqual([])
+    expect(lateDeliveries).toHaveLength(late.kind === 'ok' ? 2 : 0)
+    expect(h.events.filter(e => e.payload.event?.text === lateText || e.payload.event === lateReaction)).toEqual([])
     expect(inFlight.disconnectCalls).toBe(late.kind === 'ok' ? disconnects + 1 : disconnects)
     expect(liveSocketsOf(h, h.a)).toBe(0)
     expect(h.statuses).toHaveLength(reported)
@@ -3882,6 +3928,9 @@ describe('connection manager: bring-up connection legs of the contract', () => {
     expect(stubOf(h, h.a).socket.disconnectCalls).toBe(abandonAtMs > 0 ? 1 : 0)
     expect(statesOf(h, h.a)).not.toContain('broken')
     expect(h.manager.webClient(h.a.key)).toBeUndefined()
+    // auth.test confirmed A's bot user before its socket failed: a Run Bot Identity all the same.
+    expect(h.manager.identity(h.a.key)).toBeUndefined()
+    expect(h.manager.isRunBotIdentity(stubOf(h, h.a).identity.botUserId)).toBe(true)
     await expectDelivers(h, h.b)
   })
 })
@@ -3929,9 +3978,10 @@ describe('connection manager: the 10 s bound on auth.test (carry)', () => {
     late.settle({ kind: 'ok' })
     await h.clock.flush()
 
-    // The late answer is ignored: no long-lived Web API client, no socket, no status change.
+    // The late answer is ignored: no long-lived Web API client, no socket, no status change, no Run Bot Identity.
     expect(h.slack.buildsOf(h.a.key).map(build => build.kind)).toEqual(['validation'])
     expect(h.statuses).toHaveLength(reported)
+    expect(h.manager.isRunBotIdentity(stubOf(h, h.a).identity.botUserId)).toBe(false)
     expect(pendingDelays(h)).toEqual([5_000])
     await expectDelivers(h, h.b)
     await h.clock.advanceTo(14_999)
@@ -3942,7 +3992,27 @@ describe('connection manager: the 10 s bound on auth.test (carry)', () => {
     expect(h.manager.status(h.a.key)).toMatchObject({ state: 'up' })
     expect(h.slack.buildsOf(h.a.key).map(build => build.kind)).toEqual(['validation', 'validation', 'web', 'socket'])
     expect(liveSocketsOf(h, h.a)).toBe(1)
+    expect(h.manager.isRunBotIdentity(stubOf(h, h.a).identity.botUserId)).toBe(true)
     await expectDelivers(h, h.a)
+    await expectDelivers(h, h.b)
+  })
+
+  test('an auth.test still pending when A is stopped that answers ok afterwards confirms no Run Bot Identity and builds nothing; B keeps delivering', async () => {
+    const h = makeHarness()
+    const late = makeDeferredWebApiCall()
+    stubOf(h, h.a).script.authTest.push(late.outcome)
+    const bringUpA = h.manager.bringUp(h.a, h.a.tokens)
+    expect(await h.manager.bringUp(h.b, h.b.tokens)).toMatchObject({ state: 'up' })
+
+    await h.manager.stop(h.a.key)
+    expect(await bringUpA).toEqual({ state: 'stopped' })
+    late.settle({ kind: 'ok' })
+    await h.clock.flush()
+
+    expect(h.manager.isRunBotIdentity(stubOf(h, h.a).identity.botUserId)).toBe(false)
+    expect(h.manager.isRunBotIdentity(stubOf(h, h.b).identity.botUserId)).toBe(true)
+    expect(h.slack.buildsOf(h.a.key).map(build => build.kind)).toEqual(['validation'])
+    expect(h.clock.pendingCount()).toBe(0)
     await expectDelivers(h, h.b)
   })
 })
@@ -4055,6 +4125,8 @@ describe('connection manager: dry run', () => {
       expect(existsSync(p.credentials_file)).toBe(false)
       expect(await h.manager.bringUp(p)).toEqual({ state: 'up', identity: dryRunPersonaIdentity(p.key) })
       expect(h.manager.identity(p.key)).toEqual(dryRunPersonaIdentity(p.key))
+      // A placeholder is no Slack confirmation.
+      expect(h.manager.isRunBotIdentity(dryRunPersonaIdentity(p.key).botUserId)).toBe(false)
       expect(h.manager.webClient(p.key)).toBeUndefined()
       expect(existsSync(p.credentials_file)).toBe(false)
     }
@@ -4069,6 +4141,51 @@ describe('connection manager: dry run', () => {
     const identities = [h.a.key, h.b.key, 'alpha', 'alpha_1', 'alpha1', 'alph'].map(dryRunPersonaIdentity)
     expect(new Set(identities.map(identity => identity.botUserId)).size).toBe(identities.length)
     expect(new Set(identities.map(identity => identity.botId)).size).toBe(identities.length)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Run Bot Identities
+// ---------------------------------------------------------------------------
+
+describe('connection manager: Run Bot Identities (isRunBotIdentity)', () => {
+  test('starts empty; holds each persona’s confirmed bot user ID (never its bot ID or key) through stop, re-add and stopAll, apart from the live identity; a fresh manager holds none', async () => {
+    const h = makeHarness()
+    const [a, b] = [initialIdentityOf(h, h.a), initialIdentityOf(h, h.b)]
+    const query = (): boolean[] => [a.botUserId, b.botUserId].map(id => h.manager.isRunBotIdentity(id))
+    expect(query()).toEqual([false, false])
+
+    await bringUpBoth(h)
+    expect(query()).toEqual([true, true])
+    for (const notConfirmed of [a.botId, b.botId, h.a.key, h.b.key, '']) expect(h.manager.isRunBotIdentity(notConfirmed)).toBe(false)
+
+    await h.manager.stop(h.a.key)
+    expect(h.manager.identity(h.a.key)).toBeUndefined()
+    expect(query()).toEqual([true, true])
+    await expectDelivers(h, h.b)
+
+    expect(await h.manager.bringUp(h.a, h.a.tokens)).toMatchObject({ state: 'up' })
+    expect(query()).toEqual([true, true])
+    await h.manager.stopAll()
+    expect(query()).toEqual([true, true])
+
+    const fresh = makeHarness()
+    expect([a.botUserId, b.botUserId].map(id => fresh.manager.isRunBotIdentity(id))).toEqual([false, false])
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  test('the query is read-only: it builds no client, makes no Slack call, starts no timer, and the manager exposes no collection to change', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const builds = h.slack.builds.length
+    const calls = [h.a, h.b].map(p => stubOf(h, p).callLog.length)
+
+    for (const id of [initialIdentityOf(h, h.a).botUserId, 'U0UNKNOWN']) h.manager.isRunBotIdentity(id)
+
+    expect(h.slack.builds).toHaveLength(builds)
+    expect([h.a, h.b].map(p => stubOf(h, p).callLog.length)).toEqual(calls)
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(Object.values(h.manager).filter(value => value instanceof Set || value instanceof Map || Array.isArray(value))).toEqual([])
   })
 })
 
@@ -4751,11 +4868,15 @@ describe('connection manager: credentials reconnect (credentials row)', () => {
     const rotated = rotateCredentials(h, h.a)
     const since = h.slack.activityOf(h.a.key).length
     const { later, listener } = laterOutcomes()
+    expect(h.manager.isRunBotIdentity(rotated.identity.botUserId)).toBe(false)
 
     const outcome = await h.manager.reconnectCredentials(h.a.key, rotated.tokens, listener)
 
     assertNoLeak({ outcome, later })
     expect(outcome).toEqual({ kind: 'swapped', identity: rotated.identity })
+    // Both bot user IDs stay Run Bot Identities after the swap.
+    expect(h.manager.isRunBotIdentity(initialIdentityOf(h, h.a).botUserId)).toBe(true)
+    expect(h.manager.isRunBotIdentity(rotated.identity.botUserId)).toBe(true)
     // Open before close: the new socket is connected before the old one is discarded and disconnected.
     expect(h.slack.activityOf(h.a.key).slice(since).map(e => [e.event, e.kind, e.credentials])).toEqual([
       ['built', 'validation', ROTATED],
@@ -4782,8 +4903,13 @@ describe('connection manager: credentials reconnect (credentials row)', () => {
     expect(h.lines).toEqual([])
     expect(h.clock.pendingCount()).toBe(0)
 
-    // Events on the new connection are tagged with A; A's Web API calls go through the new client.
+    // Events on the new connection are tagged with A; the old socket keeps no forwarding listener.
     await expectDelivers(h, h.a, rotated.stub)
+    const reaction = makeReaction('reaction_removed')
+    await rotated.stub.socket.deliver(reaction)
+    expect(h.events.filter(e => e.payload.event === reaction).map(e => [e.key, e.eventName])).toEqual([[h.a.key, 'reaction_removed']])
+    for (const name of ['message', 'reaction_added', 'reaction_removed']) expect(old.socket.listenerCount(name)).toBe(0)
+    // A's Web API calls go through the new client.
     const web = h.manager.webClient(h.a.key)
     expect(web).toBeDefined()
     expect(web).not.toBe(oldWeb!)
@@ -4852,6 +4978,9 @@ describe('connection manager: credentials reconnect (credentials row)', () => {
       },
     })
     expect(builtFrom(h, h.a, ROTATED)).toEqual(built)
+    // A socket-mode refusal follows a valid auth.test, whose confirmation stands.
+    expect(h.manager.isRunBotIdentity(rotated.identity.botUserId)).toBe(check === 'socket-mode')
+    expect(h.manager.isRunBotIdentity(initialIdentityOf(h, h.a).botUserId)).toBe(true)
     // The refused socket, if one was built, was let go without ever connecting.
     expect(h.slack.activityOf(h.a.key).filter(a => a.credentials === ROTATED && a.kind === 'socket').map(a => a.event))
       .toEqual(built.includes('socket') ? ['built', 'started', 'discarded'] : [])
@@ -4928,6 +5057,9 @@ describe('connection manager: credentials reconnect (credentials row)', () => {
     expect(hung.startCalls).toBe(1)
     expect(resolved).toBeUndefined()
     expect(hung.disconnectCalls).toBe(0)
+    // Confirmed before its socket opened, while the live identity is still the old one.
+    expect(h.manager.isRunBotIdentity(rotated.identity.botUserId)).toBe(true)
+    expect(h.manager.isRunBotIdentity(initialIdentityOf(h, h.a).botUserId)).toBe(true)
     await expectOldConnectionKept(h, h.a, oldWeb)
     await h.clock.advance(1)
 
@@ -4939,6 +5071,7 @@ describe('connection manager: credentials reconnect (credentials row)', () => {
     })
     expect(h.clock.now()).toBe(10_000)
     expect(hung.disconnectCalls).toBe(1)
+    expect(h.manager.isRunBotIdentity(rotated.identity.botUserId)).toBe(true)
     expect(pendingDelays(h)).toEqual([5_000])
     await expectOldConnectionKept(h, h.a, oldWeb)
     await expectBUndisturbed(h)
@@ -5080,6 +5213,8 @@ describe('connection manager: credentials reconnect (credentials row)', () => {
     expect(secondOutcome).toEqual({ kind: 'swapped', identity: second.identity })
     expect(firstSocket.disconnectCalls).toBe(1)
     expect(h.manager.identity(h.a.key)).toEqual(second.identity)
+    // The cancelled reconnect's auth.test had confirmed its bot user: all three stay.
+    for (const id of [initialIdentityOf(h, h.a), first.identity, second.identity]) expect(h.manager.isRunBotIdentity(id.botUserId)).toBe(true)
     expect(h.clock.pendingCount()).toBe(0)
     await h.clock.advance(HOUR_MS)
     expect(stubStarts(first.stub)).toBe(1)
@@ -5133,6 +5268,9 @@ describe('connection manager: credentials reconnect (credentials row)', () => {
     expect(rotated.stub.calls.authTest).toHaveLength(authTests)
     expect(stubStarts(rotated.stub)).toBe(starts)
     expect(later).toEqual([])
+    // Only the row whose auth.test answered confirmed the new bot user; shutdown removes nothing.
+    expect(h.manager.isRunBotIdentity(rotated.identity.botUserId)).toBe(script.connect !== undefined)
+    expect(h.manager.isRunBotIdentity(initialIdentityOf(h, h.a).botUserId)).toBe(true)
   })
 
   test('overlap: events emitted on the old and the new socket before the swap are both tagged with A; a duplicate (channel, ts) on both reaches the handler once per socket, for the routing dedupe to collapse', async () => {
@@ -5156,6 +5294,11 @@ describe('connection manager: credentials reconnect (credentials row)', () => {
       expect(oldSocket.connected).toBe(true)
       deliveries.push(newSocket.deliver(duplicate), oldSocket.deliver(duplicate))
     })
+
+    // Before hello: the new bot user is confirmed beside the old, and the live identity is still the old one.
+    expect(h.manager.isRunBotIdentity(rotated.identity.botUserId)).toBe(true)
+    expect(h.manager.isRunBotIdentity(initialIdentityOf(h, h.a).botUserId)).toBe(true)
+    expect(h.manager.identity(h.a.key)).toEqual(initialIdentityOf(h, h.a))
 
     hello.settle()
     expect(await reconnect).toMatchObject({ kind: 'swapped' })
@@ -6055,8 +6198,10 @@ describe('connection manager: a revoked bot token while running (the Web API aut
     expect(a.socket.connected).toBe(true)
     expect(a.socket.disconnectCalls).toBe(0)
     const text = 'after the refusal'
+    const reaction = makeReaction('reaction_removed')
     await a.socket.deliver(makeChannelMessage({ text }))
-    expect(h.events.filter(e => e.payload.event?.text === text)).toEqual([])
+    await a.socket.deliver(reaction)
+    expect(h.events.filter(e => e.payload.event?.text === text || e.payload.event === reaction)).toEqual([])
     expect(await serializer.run(h.b.key, () => 'B ran')).toBe('B ran')
     await expectBUndisturbed(h)
 
@@ -6183,18 +6328,22 @@ describe('connection manager: a revoked bot token while running (the Web API aut
     expect(h.manager.status(h.a.key)).toMatchObject({ state: 'broken', phase: 'running' })
     const newSocket = rotated.stub.socket
     const early = makeChannelMessage({ text: 'on the new socket before its swap' })
+    const earlyReaction = makeReaction('reaction_added', { reaction: 'early' })
     const deliveries: Promise<void>[] = []
     // The new socket is open during its `connected` emit, before the swap; A is still broken then.
-    newSocket.once('connected', () => void deliveries.push(newSocket.deliver(early)))
+    newSocket.once('connected', () => void deliveries.push(newSocket.deliver(early), newSocket.deliver(earlyReaction)))
 
     hello.settle()
     expect(await reconnect).toEqual({ kind: 'swapped', identity: rotated.identity })
     await Promise.all(deliveries)
 
-    expect(deliveries).toHaveLength(1)
-    expect(h.events.filter(e => e.payload.event === early)).toEqual([])
+    expect(deliveries).toHaveLength(2)
+    expect(h.events.filter(e => e.payload.event === early || e.payload.event === earlyReaction)).toEqual([])
     expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: rotated.identity })
     await expectDelivers(h, h.a, rotated.stub)
+    const after = makeReaction('reaction_added', { reaction: 'after-swap' })
+    await newSocket.deliver(after)
+    expect(h.events.filter(e => e.payload.event === after).map(e => [e.key, e.eventName])).toEqual([[h.a.key, 'reaction_added']])
     await expectBUndisturbed(h)
   })
 

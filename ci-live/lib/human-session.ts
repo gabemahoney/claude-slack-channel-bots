@@ -36,6 +36,8 @@ export interface SlackMessage {
   reactions?: { name: string; users?: string[] }[]
   blocks?: unknown[]
   edited?: unknown
+  /** The files a file post carries (only whether there are any is read). */
+  files?: unknown[]
 }
 
 export class HumanCallError extends Error {
@@ -96,6 +98,7 @@ function asMessage(v: unknown): SlackMessage | null {
     reactions: Array.isArray(m.reactions) ? (m.reactions as SlackMessage['reactions']) : undefined,
     blocks: Array.isArray(m.blocks) ? m.blocks : undefined,
     edited: m.edited,
+    files: Array.isArray(m.files) ? m.files : undefined,
   }
 }
 
@@ -152,6 +155,29 @@ export class HumanSession {
   /** Edit one of the human's messages. */
   async update(channel: string, ts: string, text: string): Promise<void> {
     await this.need('chat.update', { channel, ts, text })
+  }
+
+  /** Add the human's `name` reaction (no colons) to the message `ts`. */
+  async react(channel: string, ts: string, name: string): Promise<void> {
+    await this.need('reactions.add', { channel, timestamp: ts, name })
+  }
+
+  /** Remove the human's `name` reaction from the message `ts`. */
+  async unreact(channel: string, ts: string, name: string): Promise<void> {
+    await this.need('reactions.remove', { channel, timestamp: ts, name })
+  }
+
+  /**
+   * The `metadata.event_type` of the message `ts` (top-level or a thread
+   * reply), read with `include_all_metadata` as the server reads it; null
+   * when it has none or is not found.
+   */
+  async metadataEventType(channel: string, ts: string): Promise<string | null> {
+    const answer = await this.need('conversations.replies', { channel, ts, oldest: ts, latest: ts, inclusive: true, include_all_metadata: true, limit: 1 })
+    const list = Array.isArray(answer.messages) ? (answer.messages as unknown[]) : []
+    const m = list.find((v) => v && typeof v === 'object' && (v as Record<string, unknown>).ts === ts) as Record<string, unknown> | undefined
+    const metadata = m?.metadata && typeof m.metadata === 'object' ? (m.metadata as Record<string, unknown>) : null
+    return typeof metadata?.event_type === 'string' ? metadata.event_type : null
   }
 
   /** Invite `user` to `channel`; a user already there is fine. */

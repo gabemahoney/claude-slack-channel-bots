@@ -28,6 +28,8 @@ import { durableIo } from './durable-io.ts'
 export async function makeDeliveryNoticeHarness(options: {
   queue?: DeliveryQueue; leakMarker?: string; holds?: boolean; fs?: typeof fs
   personas?: PersonaSpec[]; channel_mode?: ChannelMode; ownPosts?: OwnPostObserver
+  /** Bind a recording `queued` callback; by default reporting gets none (`holds` binds it too). */
+  recordQueued?: boolean
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'delivery-notices-'))
   const config = makeMultiPersonaConfig(options.personas ?? [
@@ -45,7 +47,7 @@ export async function makeDeliveryNoticeHarness(options: {
   const reporting = createDeliveryReporting({ queue, episodes: rig.episodes, persona: key => config.personas.find(p => p.key === key), state: key => states.get(key)!,
     log: line => logs.push(line), notify: (key, text) => h.notifier.notify(key, text),
     delivered: (key, item) => { delivered.push({ key, item }) }, now: h.clock.now,
-    ...(options.holds ? { queued: (key: string, item: QueueItem) => { queued.push({ key, item }) } } : {}),
+    ...(options.holds || options.recordQueued ? { queued: (key: string, item: QueueItem) => { queued.push({ key, item }) } } : {}),
   })
   const [alpha, beta] = config.personas.map(p => p.key) as [string, string]
   const ref = (key = alpha) => { const p = config.personas.find(p => p.key === key)!; return renderPersonaRef(p.name, key) }

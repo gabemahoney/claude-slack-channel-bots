@@ -12,7 +12,8 @@ import { cannedDelivery } from './test-helpers/agent-director-stub.ts'
  *     `channels`, `permission_prompts`, `invited`, `fungible_destination` or
  *     `sections` is allowed; inside it, `src/registry.ts` reads them only in the
  *     posting-scope check and its classifier, `src/persona-routing.ts` only
- *     in the decision's input, `src/persona-destination.ts` only in the one
+ *     in the decisions' inputs (the arguments of `decideDelivery` and
+ *     `decideReaction`), `src/persona-destination.ts` only in the one
  *     destination rule.
  *   - The retired split forms `sections`, `invited` and
  *     `fungible_destination` have no source readers.
@@ -197,7 +198,12 @@ const PLACEMENT: readonly PlacementRow[] = [
     regions: [{ fn: 'checkPersonaTarget' }, { fn: 'classifyPersonaTarget' }],
     fields: AUDITED_FIELDS,
   },
-  { file: 'persona-routing.ts', part: "the decision's input", regions: [{ argsOf: 'decideDelivery' }], fields: AUDITED_FIELDS },
+  {
+    file: 'persona-routing.ts',
+    part: "the decisions' inputs (decideDelivery's and decideReaction's arguments)",
+    regions: [{ argsOf: 'decideDelivery' }, { argsOf: 'decideReaction' }],
+    fields: AUDITED_FIELDS,
+  },
   { file: 'persona-destination.ts', part: 'the one destination rule', regions: [{ fn: ONE_DESTINATION_RULE }], fields: AUDITED_FIELDS },
 ]
 
@@ -830,6 +836,25 @@ describe('negative controls for the reader audit', () => {
     expect(placementFindings(new Map([['planted.ts', outside]]), row)).toEqual(["src/planted.ts: string key read of invited p['invited'] (in other)"])
     const none = 'function scope(p: P) { return p.dm }'
     expect(placementFindings(new Map([['planted.ts', none]]), row)).toEqual([`src/planted.ts: no read lies in ${JSON.stringify(row.regions)}`])
+  })
+
+  test("persona-routing.ts's row admits a channels read inside either decision's arguments and still finds one moved out of them", () => {
+    const row = PLACEMENT.find((r) => r.file === 'persona-routing.ts')!
+    const inside = [
+      'export function message(p: P) { return decideDelivery(e, { channels: p.channels }) }',
+      'export function reaction(p: P) { return decideReaction(e, { channels: p.channels }, inputs) }',
+    ].join('\n')
+    expect(placementFindings(new Map([['persona-routing.ts', inside]]), row)).toEqual([])
+    const moved = [
+      'export function message(p: P) { return decideDelivery(e, { channels: p.channels }) }',
+      'export function reaction(p: P) { const channels = p.channels; return decideReaction(e, { channels }, inputs) }',
+    ].join('\n')
+    expect(placementFindings(new Map([['persona-routing.ts', moved]]), row)).toEqual(['src/persona-routing.ts: property read of channels p.channels (in reaction)'])
+    const otherCall = 'export function reaction(p: P) { return decideOther(e, { channels: p.channels }) }'
+    expect(placementFindings(new Map([['persona-routing.ts', otherCall]]), row)).toEqual([
+      'src/persona-routing.ts: property read of channels p.channels (in reaction)',
+      `src/persona-routing.ts: no read lies in ${JSON.stringify(row.regions)}`,
+    ])
   })
 })
 

@@ -276,7 +276,7 @@
  * `<settings>` lists the changed setting groups, comma-separated, in the
  * change plan's order (`IN_PLACE_SETTINGS`: `channels`, `delivery`,
  * `permission_prompts`, `invited.permission_prompts`, `dm.enabled`,
- * `dm.contact`).
+ * `dm.contact`, `stop_hook_bootstrap`, `reaction_notices`).
  *
  * Pure module: nothing is created, read or scheduled at
  * import or at `createPersonaLifecycle`; every dependency is injected, so

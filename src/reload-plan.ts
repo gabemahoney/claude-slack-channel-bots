@@ -215,7 +215,7 @@ export type DestructiveSetting = (typeof DESTRUCTIVE_SETTINGS)[number]
 /**
  * The settings applied in place, immediately,
  * in the order they are reported. Both modes use the same channel list,
- * destination, DM and reply reminder settings.
+ * destination, DM, reply reminder and Reaction Notice settings.
  */
 export const IN_PLACE_SETTINGS = [
   'channels',
@@ -224,6 +224,7 @@ export const IN_PLACE_SETTINGS = [
   'dm.enabled',
   'dm.contact',
   'stop_hook_bootstrap',
+  'reaction_notices',
 ] as const
 
 /** A setting applied in place. `channels`: the set of channel IDs; `delivery`: a kept channel's mode. */
@@ -501,7 +502,7 @@ function samePathWith(facts: ChangePlanFacts): (a: string | undefined, b: string
   return (a, b) => a === b || (a !== undefined && b !== undefined && facts.realPath(a) === facts.realPath(b))
 }
 
-/** Shared channel, destination, DM and reminder settings apply in place in either mode. */
+/** Shared channel, destination, DM, reminder and Reaction Notice settings apply in place in either mode. */
 function personaSectionChanges(before: Persona, after: Persona): InPlaceSetting[] {
   const was = new Map(before.channels.map((c) => [c.id, c.delivery]))
   const now = new Map(after.channels.map((c) => [c.id, c.delivery]))
@@ -512,6 +513,7 @@ function personaSectionChanges(before: Persona, after: Persona): InPlaceSetting[
     'dm.enabled': before.dm.enabled !== after.dm.enabled,
     'dm.contact': before.dm.contact !== after.dm.contact,
     stop_hook_bootstrap: before.stop_hook_bootstrap !== after.stop_hook_bootstrap,
+    reaction_notices: before.reaction_notices !== after.reaction_notices,
   }
   return IN_PLACE_SETTINGS.filter((setting) => changed[setting])
 }

@@ -255,6 +255,7 @@ export const PERSONA_ENTRY_KEYS: readonly (keyof PersonaInput)[] = [
   'stop_hook_bootstrap',
   'model',
   'effort',
+  'reaction_notices',
 ]
 
 /** Keys allowed in a persona's `dm` object. */
@@ -504,6 +505,8 @@ export interface PersonaInput {
   model?: string
   /** The persona's effort level (`EFFORT_LEVELS`): per persona only, with no top-level value and no default. */
   effort?: EffortLevel
+  /** Whether the persona receives Reaction Notices, in both modes: per persona only, with no top-level value. Defaults to `true`. */
+  reaction_notices?: boolean
 }
 
 /** The persona configuration file as parsed from disk. */
@@ -567,6 +570,8 @@ export interface Persona {
   model?: string
   /** The persona's own `effort`; absent when unset. Never inherited. */
   effort?: EffortLevel
+  /** The persona's own `reaction_notices`, `true` when unset. Never inherited. */
+  reaction_notices: boolean
 }
 
 /** Validated, fully-resolved persona configuration. */
@@ -1403,6 +1408,8 @@ function parsePersonaEntry(
   }
   const effort = raw['effort']
   if (effort !== undefined) checkAllowedValue(effort, 'effort', EFFORT_LEVELS, style)
+  const ownReactionNotices = raw['reaction_notices']
+  if (ownReactionNotices !== undefined) checkBoolean(ownReactionNotices, 'reaction_notices', style)
   const channels = parseChannels((raw['channels'] as Record<string, unknown>[] | undefined) ?? [], style)
   const dm = parseDm(raw['dm'] as Record<string, unknown> | undefined, style)
   const permission_prompts = parsePermissionPrompts(raw['permission_prompts'], style)
@@ -1427,6 +1434,7 @@ function parsePersonaEntry(
     stop_hook_bootstrap: (ownStopHook as boolean | undefined) ?? inherited.stop_hook_bootstrap,
     ...(model !== undefined ? { model } : {}),
     ...(effort !== undefined ? { effort: effort as EffortLevel } : {}),
+    reaction_notices: (ownReactionNotices as boolean | undefined) ?? true,
   }
 }
 

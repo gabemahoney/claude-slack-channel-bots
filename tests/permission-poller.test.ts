@@ -173,6 +173,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { SERVER_POST_METADATA, expectNoMetadata } from './test-helpers/server-post.ts'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
@@ -330,6 +331,7 @@ const D_DM = stubOpenedDmId(D_CONTACT)
 
 const POST_TS = 'TS1'
 const POST_TS_2 = 'TS2'
+
 
 // A handful of reusable UUIDv4-shaped tokens. CSCB treats them as opaque.
 const TOKEN_A = '11111111-1111-4111-8111-111111111111'
@@ -717,6 +719,14 @@ describe('poller tick — Case 1: new entry', () => {
     const postCalls = posts(stubA)
     expect(postCalls).toHaveLength(1)
     expect(postCalls[0].channel).toBe(A_DEST)
+    // The whole request: the prompt is a Server Post, its marker in the one post with an empty payload.
+    expect(Object.keys(stubA.calls.postMessage[0]!).sort()).toEqual(['blocks', 'channel', 'metadata', 'text'])
+    expect(stubA.calls.postMessage[0] as unknown).toEqual({
+      channel: A_DEST,
+      text: expect.any(String),
+      blocks: buildPermissionBlocks(row.tool_name, JSON.parse(row.tool_input), INSTANCE_A, TOKEN_A),
+      metadata: SERVER_POST_METADATA,
+    })
     expect(postCalls.some((c) => c.channel === A_WORK)).toBe(false)
     // No other persona's client is used.
     expect(slackCalls(stubB, stubD)).toBe(0)
@@ -2582,6 +2592,7 @@ describe('poller tick — row disappears from plural projection (closure reconci
     expect(updateCalls).toHaveLength(1)
     expect(updateCalls[0].ts).toBe(POST_TS)
     expect(updateCalls[0].text).toBe('⏱ *Permission* — Timed out')
+    expectNoMetadata(updateCalls[0])
     expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
   })
 
@@ -2621,6 +2632,7 @@ describe('poller tick — row disappears from plural projection (closure reconci
     expect(updateCalls).toHaveLength(1)
     expect(updateCalls[0].ts).toBe(POST_TS)
     expect(updateCalls[0].text).toBe('*Permission* — Allowed')
+    expectNoMetadata(updateCalls[0])
     expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
   })
 })
@@ -2739,6 +2751,7 @@ describe('newly-closed reconciliation + verdict rendering', () => {
     expect(updateCalls[0].channel).toBe(A_DEST)
     expect(updateCalls[0].ts).toBe(POST_TS)
     expect(updateCalls[0].text).toBe('*Permission* — Allowed')
+    expectNoMetadata(updateCalls[0])
     expect(slackCalls(stubB, stubD)).toBe(0)
     expect(getLivePermission(INSTANCE_A, token)).toBeUndefined()
   })

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { SERVER_POST_METADATA } from './test-helpers/server-post.ts'
 import { appendFileSync, existsSync, readFileSync } from 'node:fs'
 import type { ChannelMode, DeliveryMode, PersonaInput } from '../src/config.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
@@ -66,7 +67,7 @@ function expectReports(run: ReloadRun, expected: Record<string, ExpectedReport[]
       expect(failure.step).toBe('journal-append')
       return buildThreadMemoryNotSavedNotice(ref, channels, threadPath(h.stateDir, persona.key), failure.step, failure.error)
     })
-    const posts = texts.map(text => ({ channel: stubOpenedDmId('U0OPERATOR'), text: formatPersonaNotice(persona, text) }))
+    const posts = texts.map(text => ({ channel: stubOpenedDmId('U0OPERATOR'), text: formatPersonaNotice(persona, text), metadata: SERVER_POST_METADATA }))
     expect(run.stub(persona.name).calls.postMessage).toEqual(posts)
     total += posts.length
   }

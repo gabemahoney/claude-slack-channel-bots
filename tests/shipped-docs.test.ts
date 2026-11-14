@@ -671,6 +671,34 @@ describe('slack-app-manifest.yml', () => {
     }
   })
 
+  // b.n3k: the reaction paragraph carries its own migration, so an earlier
+  // paragraph's re-install note cannot stand in for it.
+  const reactionGuidance = [
+    '`reaction_added`', '`reaction_removed`', '`mpim:read`',
+    /`mpim:read`[^.]*(?:recogni[sz]e|identify|look)[^.]*group DM/i,
+    migrationGuidance[0],
+    /(?=[^.]*`reaction_added`)(?=[^.]*`reaction_removed`)(?=[^.]*`mpim:read`)[^.]*\badded\b[^.]*re-?install/i,
+  ] as const
+
+  test('manifest header explains the reaction events, mpim:read and existing-app re-install', () => {
+    expect(lacking(scopeParagraph(header, 'mpim:read'), reactionGuidance)).toEqual([])
+  })
+
+  test('sensitivity: reaction guidance rejects each omitted obligation, despite other paragraphs\' re-install notes', () => {
+    const paragraphs = header.split(/\n\s*\n/)
+    const index = paragraphs.findIndex(paragraph => paragraph.includes('`mpim:read`'))
+    const paragraph = flat(paragraphs[index] ?? '')
+    expect(lacking(paragraph, reactionGuidance)).toEqual([])
+    for (const item of reactionGuidance) {
+      const pattern = typeof item === 'string' ? new RegExp(escapeRegExp(item), 'g') : new RegExp(item.source, `${item.flags}g`)
+      const edited = paragraph.replace(pattern, '')
+      expect(edited).not.toBe(paragraph)
+      const editedHeader = paragraphs.map((p, i) => (i === index ? edited : p)).join('\n\n')
+      expect(editedHeader.replace(edited, '')).toMatch(/added[^.]*re-?install/i)
+      expect(lacking(scopeParagraph(editedHeader, 'mpim:read'), reactionGuidance).length).toBeGreaterThan(0)
+    }
+  })
+
   test('message.im stays subscribed and message.mpim is not (group DMs unsubscribed)', () => {
     const events = manifest.settings.event_subscriptions.bot_events
     expect(events).toContain('message.im')
@@ -694,6 +722,7 @@ describe('slack-app-manifest.yml', () => {
         'im:write',
         'lists:read',
         'lists:write',
+        'mpim:read',
         'reactions:read',
         'reactions:write',
         'users:read',
@@ -714,7 +743,7 @@ describe('slack-app-manifest.yml', () => {
 
   test('the bot events are exactly the pinned list (none dropped, none added)', () => {
     expect([...manifest.settings.event_subscriptions.bot_events].sort()).toEqual(
-      ['app_mention', 'message.channels', 'message.groups', 'message.im', 'member_joined_channel', 'channel_left'].sort(),
+      ['app_mention', 'message.channels', 'message.groups', 'message.im', 'member_joined_channel', 'channel_left', 'reaction_added', 'reaction_removed'].sort(),
     )
   })
 
@@ -2269,8 +2298,9 @@ describe(`${BOTS_DOC} "${RECEIVING_HEADING}"`, () => {
 
   test('the table contains each delivery reason and injected kind exactly once', () => {
     const { viaColumn, rows } = kindsTable()
-    expect(rows.map(row => row[0]).sort()).toEqual([...Object.values(VIA_ROWS), ...INJECTED_ROWS].sort())
-    expect(rows.flatMap(row => codeSpans(row[viaColumn] ?? '')).sort()).toEqual([...VIA_VALUES].sort())
+    // The Reaction Notice row's `reaction` is a tag value outside the message `Via` union.
+    expect(rows.map(row => row[0]).sort()).toEqual([...Object.values(VIA_ROWS), ...INJECTED_ROWS, 'Reaction Notice'].sort())
+    expect(rows.flatMap(row => codeSpans(row[viaColumn] ?? '')).sort()).toEqual([...VIA_VALUES, 'reaction'].sort())
   })
 
   test('the receiving explanation includes thread precedence and no obsolete denial of thread following', () => {

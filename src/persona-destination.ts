@@ -67,6 +67,7 @@ import { renderPersonaRef } from './persona-identity.ts'
 import { describeSlackCallFailure, describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
 import { ownPostAnswerOfError, ownPostAnswerOfPost, type OwnPostObserver, type OwnPostStart, type OwnPostSurface } from './own-post.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
+import { SERVER_POST_EVENT_TYPE } from './server-post.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -509,7 +510,12 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
       if (opened.outcome !== 'opened') return opened
       channelId = opened.channelId
     }
-    const args: { channel: string; text: string; blocks?: never } = { channel: channelId, text: message.text }
+    const args: {
+      channel: string
+      text: string
+      blocks?: never
+      metadata: { event_type: typeof SERVER_POST_EVENT_TYPE; event_payload: Record<string, never> }
+    } = { channel: channelId, text: message.text, metadata: { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} } }
     if (message.blocks !== undefined) args.blocks = message.blocks as never
     let op: OwnPostStart | undefined
     if (options?.surface !== undefined) {

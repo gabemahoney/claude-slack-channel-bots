@@ -2057,6 +2057,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       getBotIdentity: key => slackStubs.get(key)?.identity,
       queue: {
         lookupSlackKey: queue.lookupSlackKey,
+        lookupReactionKey: queue.lookupReactionKey,
         accept: async (key, input) => { await ready; return queue.accept(key, input) },
         acceptDecided: async (key, slackKey, decide) => { await ready; return queue.acceptDecided(key, slackKey, decide) },
       },

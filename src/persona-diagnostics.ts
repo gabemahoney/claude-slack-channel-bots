@@ -257,9 +257,13 @@ export function buildSharedStateRecoveredLine(key: string, scope: SharedStateRep
     `${failure ? `${failure}; ` : ''}state and current membership trustworthy; held messages are decided now. Slack retries are finite; messages Slack stopped retrying are not recovered.`, path)
 }
 const safe = (text: string): string => redactSlackLogText(text).replace(/[\r\n]/g, ' ')
-/** Explicit metadata allowlist: redaction alone is not message-body exclusion. */
+/**
+ * Explicit metadata allowlist: redaction alone is not message-body exclusion.
+ * A Reaction Item names its conversation, its event ts and its reactor, like a
+ * Slack message; it has no injected sender.
+ */
 export function deliveryIdentity(a: Pick<AcceptedRecord, 'source' | 'channel' | 'sender' | 'ts' | 'user' | 'bot_id' | 'via'>): string {
-  return `source=${a.source} ${a.source === 'slack' ? `chat_id=${JSON.stringify(safe(a.channel ?? ''))}` : `sender=${JSON.stringify(safe(a.sender ?? ''))}`} ts=${JSON.stringify(safe(a.ts))} sender_id=${JSON.stringify(safe(a.user ?? a.bot_id ?? a.sender ?? 'unknown'))}` +
+  return `source=${a.source} ${a.source === 'slack' || a.source === 'reaction' ? `chat_id=${JSON.stringify(safe(a.channel ?? ''))}` : `sender=${JSON.stringify(safe(a.sender ?? ''))}`} ts=${JSON.stringify(safe(a.ts))} sender_id=${JSON.stringify(safe(a.user ?? a.bot_id ?? a.sender ?? 'unknown'))}` +
     (a.source === 'slack' && a.via === 'thread' ? ' via=thread' : '')
 }
 export function buildDeliveryDiagnostic(kind: DeliveryDiagnosticClass, persona: string, identity: string, detail = ''): string {

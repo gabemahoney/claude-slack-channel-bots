@@ -109,7 +109,7 @@ accepted_as() {
         '[.[] | select(.channel == $c and .ts == $ts)] | length == 1 and .[0].via == $via and ((.[0].hold.on // "-") == $hold)' > /dev/null
 }
 resolution_recorded() {
-    # <ts> <released|withdrawn>
+    # <ts> <released|hold-withdrawn>
     local seq
     seq="$(shared_queue_items "${REAL_KEY}" | jq -se --arg c "${REAL_CHANNEL}" --arg ts "$1" \
         '[.[] | select(.channel == $c and .ts == $ts)] | if length == 1 then .[0].seq else error("no single acceptance") end')" || return 1
@@ -160,9 +160,9 @@ all_delivered_in() {
     python3 - "$@" <<'PY'
 import json, sys
 rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
-decided = {r['seq']: r['kind'] for r in rows if r['kind'] in ('released', 'withdrawn', 'parked')}
+decided = {r['seq']: r['kind'] for r in rows if r['kind'] in ('released', 'hold-withdrawn', 'parked')}
 for item in rows:
-    if item['kind'] != 'accepted' or 'compact' in item or decided.get(item['seq']) == 'withdrawn':
+    if item['kind'] != 'accepted' or 'compact' in item or decided.get(item['seq']) == 'hold-withdrawn':
         continue
     if len(sys.argv) > 2 and 'hold' in item and item['seq'] not in decided:
         continue
@@ -188,10 +188,10 @@ import json, sys
 before = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
 after = [json.loads(line) for line in open(sys.argv[2]) if line.strip()]
 accepted = {r['seq']: r for r in before if r['kind'] == 'accepted' and 'compact' not in r}
-withdrawn = {r['seq']: r['at'] for r in before if r['kind'] == 'withdrawn'}
+withdrawn = {r['seq']: r['at'] for r in before if r['kind'] == 'hold-withdrawn'}
 released = {r['seq'] for r in before if r['kind'] == 'released'}
 keys = {r['seq']: r for r in after if r['kind'] == 'accepted' and r.get('compact') == 'key'}
-if any(r['kind'] in ('released', 'withdrawn', 'parked') for r in after): sys.exit(1)
+if any(r['kind'] in ('released', 'hold-withdrawn', 'parked') for r in after): sys.exit(1)
 if any('hold' in r or 'thread_join' in r for r in after): sys.exit(1)
 for seq, at in withdrawn.items():
     marker, item = keys.get(seq), accepted[seq]
@@ -312,7 +312,7 @@ wait_until 180 'queue never held still for its pre-tidy copy' copy_pre_tidy
 python3 - "${PRE_TIDY}" <<'PY' || fail 'pre-tidy journal lacks a waiting reply or a hold decision'
 import json, sys
 rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
-decided = {r['seq'] for r in rows if r['kind'] in ('released', 'withdrawn', 'parked')}
+decided = {r['seq'] for r in rows if r['kind'] in ('released', 'hold-withdrawn', 'parked')}
 waiting = [r for r in rows if r['kind'] == 'accepted' and 'hold' in r and r['seq'] not in decided]
 sys.exit(0 if decided and waiting else 1)
 PY
@@ -336,8 +336,8 @@ Y2_ENVELOPE="$(slack_push_reply "${REAL_LABEL}" "${REAL_CHANNEL}" "${R3}" "${Y2_
 ! post_fault_settled "${RECOVERY_REQUEST}" || fail 'own post answered before its reply could be held'
 slack_wait_one_ack "${Y2_ENVELOPE}"
 wait_until 30 'reply under a pending own channel message has no Post Hold' accepted_as "${Y2}" thread post
-wait_until 30 'Post Hold was not withdrawn' resolution_recorded "${Y2}" withdrawn
-wait_until 30 'Memory Hold in an unjoined thread was not withdrawn' resolution_recorded "${X2}" withdrawn
+wait_until 30 'Post Hold was not withdrawn' resolution_recorded "${Y2}" hold-withdrawn
+wait_until 30 'Memory Hold in an unjoined thread was not withdrawn' resolution_recorded "${X2}" hold-withdrawn
 wait_until 30 'Memory Hold in the Joined Thread was not released' resolution_recorded "${X1}" released
 wait_until 300 'released Memory Hold was not delivered' delivered_content "${X1}" "${X1_TEXT}" thread "${R1}"
 RECOVERED_LINE="$(printed buildThreadMemoryRecoveredLine "${REAL_KEY}" "${REAL_CHANNEL}")"
@@ -362,7 +362,7 @@ wait_until 120 'a Thread Memory outage report was not followed by recovered' thr
 echo 'recorded: R55 step 1 every Thread Memory outage report followed by recovered'
 real_wait_idle "${REAL_KEY}"
 shared_queue_snapshot "${EVIDENCE}/queue-before-tidy.jsonl" "${REAL_KEY}"
-jq -se 'any(.[]; .kind == "released") and any(.[]; .kind == "withdrawn")' "${EVIDENCE}/queue-before-tidy.jsonl" > /dev/null \
+jq -se 'any(.[]; .kind == "released") and any(.[]; .kind == "hold-withdrawn")' "${EVIDENCE}/queue-before-tidy.jsonl" > /dev/null \
     || fail 'no resolved holds for the restart to tidy'
 stop_server
 start_server --live
@@ -398,7 +398,7 @@ earlier_rejected_lines "${PRE_TIDY}" > "${EVIDENCE}/set-aside-lines" || fail 'ea
 python3 - "${PRE_TIDY}" > "${EVIDENCE}/decision-lines" <<'PY'
 import json, sys
 for number, line in enumerate(open(sys.argv[1], 'rb').read().split(b'\n')[:-1], 1):
-    if json.loads(line)['kind'] in ('released', 'withdrawn', 'parked'): print(number)
+    if json.loads(line)['kind'] in ('released', 'hold-withdrawn', 'parked'): print(number)
 PY
 [[ -s "${EVIDENCE}/set-aside-lines" ]] || fail 'earlier release would set no record aside'
 cmp -s "${EVIDENCE}/set-aside-lines" "${EVIDENCE}/decision-lines" || fail 'earlier release would set aside other than the hold decisions'

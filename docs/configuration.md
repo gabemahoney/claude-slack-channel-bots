@@ -14,10 +14,10 @@ The first start of an install applies the file as it stands. After that, the ser
 
 ### Example
 
-A complete `config.json` in strict mode (`channel_mode` absent, the default), with three personas:
+A complete `config.json` in strict mode (`channel_mode` absent, the default), with three personas. Replace the channel IDs, user IDs and paths with your own.
 
 - `planner` receives every message in its home channel `C0123456789` and in the shared channel `C0555555555`. Its permission prompts and notices go to its home channel. It takes no DMs.
-- `reviewer` receives only its @mentions and `@here` / `@channel` broadcasts in the shared channel. Its other channels show the `off` and `thread_hybrid` choices. It takes DMs, and its prompts and notices go by DM to its contact `U0123456789`. It has its own Claude config directory, model and effort level, and turns the [Slack reply reminders](bots.md#slack-reply-reminders) off for itself.
+- `reviewer` receives only its @mentions and `@here` / `@channel` broadcasts in the shared channel. Its other channels show the `off` and `thread_hybrid` choices. It takes DMs, and its prompts and notices go by DM to its contact `U0123456789`. It has its own Claude config directory, model and effort level, and turns the [Slack reply reminders](bots.md#slack-reply-reminders) off for itself, and sets `"reaction_notices": false` to receive no new [Reaction Notices](bots.md#reaction-notices).
 - `helpdesk` is DM-only: it is in no channel and is reached only by DM. Its prompts and notices go by DM to its contact `U0987654321`.
 
 `planner` and `helpdesk` inherit the top-level `claude_config_dir`. The server-wide settings select queued/delivered reactions and reply splitting. **Custom emoji must exist in the Slack workspace before configuration**; `spinthinking` is custom. Ensure both names below are available, or choose available names; see [Acknowledgement reactions](server-settings.md#acknowledgement-reactions).
@@ -41,6 +41,7 @@ A complete `config.json` in strict mode (`channel_mode` absent, the default), wi
       "permission_prompts": "dm",
       "claude_config_dir": "~/.claude-reviewer",
       "model": "opus", "effort": "high",
+      "reaction_notices": false,
       "stop_hook_bootstrap": false
     },
     {
@@ -60,8 +61,6 @@ A complete `config.json` in strict mode (`channel_mode` absent, the default), wi
 }
 ```
 
-Replace the channel IDs, user IDs and paths with your own. Each persona's credentials file must exist with its tokens before that persona can come up (see [Credentials files](#credentials-files)).
-
 ### Persona fields
 
 | Field | Type | Required | Default | Description |
@@ -77,6 +76,7 @@ Replace the channel IDs, user IDs and paths with your own. Each persona's creden
 | `stop_hook_bootstrap` | boolean | no | top-level `stop_hook_bootstrap` | Slack reply reminder switch for this persona. Confirmed changes apply immediately; see [Slack reply reminders](bots.md#slack-reply-reminders). |
 | `model` | string | no | none (Claude Code chooses) | The Claude model the persona's instance starts with, such as `opus`, `opus[1m]` or a full model ID, used exactly as written. Per persona only. See [Next-launch settings](#next-launch-settings). |
 | `effort` | string | no | none (Claude Code chooses) | The effort level the persona's instance starts with: `low`, `medium`, `high`, `xhigh` or `max`. Per persona only. See [Next-launch settings](#next-launch-settings). |
+| `reaction_notices` | boolean | no | `true` | Reaction Notice switch for this persona in both modes. Persona-only, with no top-level inheritance. See [Reaction Notices](bots.md#reaction-notices). |
 
 `dm` is an object holding `enabled` and `contact`: `"dm": { "enabled": true, "contact": "U0123456789" }`. It applies in both modes.
 
@@ -114,7 +114,7 @@ Give the shorter name a suffix, such as `dev_main` beside `dev_2`, or `team_main
 
 ### Credentials files
 
-Each persona's Slack tokens live in its own credentials file, and `config.json` names that file only by path. The file is a JSON object with exactly two keys:
+Each persona's Slack tokens live in its own credentials file, and `config.json` names that file only by path. The file must exist with its tokens before that persona can come up. It is a JSON object with exactly two keys:
 
 ```json
 {
@@ -141,6 +141,8 @@ The shipped `slack-app-manifest.yml` also grants the `lists:read` and `lists:wri
 The `canvases:read` and `canvases:write` bot scopes let a persona read and maintain status canvases. CSCB itself makes no canvas call. An app created from an earlier manifest must have both scopes added and be re-installed; until then, calls requiring the missing scopes fail with `missing_scope`.
 
 The `reactions:read` bot scope lets a persona read the owner's reaction answers with `reactions.get`. An app created from an earlier manifest must have this scope added and be re-installed; until then, `reactions.get` fails with `missing_scope`.
+
+For the reaction events, `mpim:read` and reinstall required by an existing app, follow [Migration step 5](migration.md#migration).
 
 ### Channel delivery
 

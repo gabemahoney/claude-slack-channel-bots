@@ -220,6 +220,7 @@ import { createOwnPostObserver, createOwnPostJoins, ownPostChoice, ownPostEligib
 import { createOwnPostLookups, type OwnPostLookups, type OwnPostLookupEvent } from './own-post-lookup.ts'
 import { createReplyReminders, type ReplyReminders } from './reply-reminder.ts'
 import { createDeliveryPreparation, type DeliveryPreparation } from './delivery-intake.ts'
+import { createReactHandoff } from './react-handoff.ts'
 import { tagMaxBytesFor } from './tag-wrapper.ts'
 import {
   createPersonaConnectionManager,
@@ -336,7 +337,7 @@ import {
 import { forgetFailures, isAtCap as backoffIsAtCap } from './backoff.ts'
 import { isDryRun } from './tokens.ts'
 import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
-import { createQueuedAckCallback, createDeliveryAckCallback, consumeAck, forgetPersonaAcks } from './ack-tracker.ts'
+import { createQueuedAckCallback, createDeliveryAckCallback, consumeAck, claimReactAnswer, forgetPersonaAcks } from './ack-tracker.ts'
 import {
   openArchiveDatabase,
   createPersonaArchiveWriter,
@@ -731,6 +732,11 @@ const sessionToolDeps: SessionToolDeps = {
   inboxDir: INBOX_DIR,
   resolveUserName: resolvePersonaUserName,
   consumeAck,
+  claimReactAnswer,
+  // Read at each react, beside its client, never copied at session creation.
+  getBotUserId: (key) => identityFor(key)?.botUserId,
+  // The one hand-off owner main() builds before admission; synchronous, so the react result never waits on it.
+  onReactClaimed: (claim) => reactHandoff?.onReactClaimed(claim),
   onReplyCall: key => replyReminders?.noteReplyCall(key),
   serverPort: 0, // updated to actual port in main() before Bun.serve
   // The channel mode of the configuration in effect, read at each tool call
@@ -1147,9 +1153,9 @@ async function handleInitialized(
 // ---------------------------------------------------------------------------
 
 /**
- * The one persona-routing instance. The event router hands each `message`
- * and `app_mention` event to it with the receiving persona as the only
- * receiver.
+ * The one persona-routing instance. The event router hands each `message`,
+ * `app_mention`, `reaction_added` and `reaction_removed` event to it with
+ * the receiving persona as the only receiver.
  */
 // Holders are populated in main(), after the duplicate-server guard and before admission.
 let deliveryQueue: ReplyReminderQueue | undefined
@@ -1216,6 +1222,8 @@ export function _setDeliveryLifecycle(value: DeliveryLifecycle | undefined): voi
 let deliveryReporting: ReturnType<typeof createDeliveryReporting> | undefined
 let sharedStateReporting: ReturnType<typeof createSharedStateReporting> | undefined
 let unsubscribeSharedStateReporting: (() => void) | undefined
+/** The one `react` hand-off owner (Bot-to-Bot Reaction Notices); persona teardown forgets its key's work, shutdown stops it. */
+let reactHandoff: ReturnType<typeof createReactHandoff> | undefined
 const bufferedQueueEvents: QueueEvent[] = []
 const bufferedHeldReleases = new Map<string, { key: string; item: QueueItem }>()
 /** Independent observer ports; none can interrupt durability. */
@@ -1297,7 +1305,10 @@ const personaRouting = createPersonaRouting({
       return deliveryQueue.acceptDecided(key, slackKey, decide)
     },
     lookupSlackKey: (key, slackKey) => deliveryQueue?.lookupSlackKey(key, slackKey),
+    lookupReactionKey: (key, reactionKey) => deliveryQueue?.lookupReactionKey(key, reactionKey),
   },
+  // main() builds the connection manager after this; no event arrives before it.
+  isRunBotIdentity: (id) => connections?.isRunBotIdentity(id) ?? false,
   prepare: (key, item) => deliveryPreparation?.prepare(key, item) ?? Promise.resolve(),
   onReceived: (key, item, mode) => {
     if (deliveryReporting) deliveryReporting.received(key, item, mode)
@@ -1543,6 +1554,9 @@ let cronScheduler: CronScheduler | null = null
 async function shutdown(reason: string, exitCode = 0): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
+  // No new message read or intake from here; an intake already started is
+  // awaited below, before preparation and the queue stop.
+  const reactHandoffDrained = reactHandoff?.stop()
   sharedStateReporting?.stop()
   unsubscribeSharedStateReporting?.()
   unsubscribeSharedStateReporting = undefined
@@ -1609,6 +1623,7 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   memoryHolds?.stop()
   postHolds?.stop()
   unsubscribePostHolds?.()
+  await reactHandoffDrained
   await deliveryPreparation?.stop()
   await deliveryStopping
   await remindersStopping
@@ -3057,6 +3072,22 @@ export async function main(): Promise<void> {
     wake: key => deliveryQueueWake.wake(key),
     onPending: key => deliveryEngines?.wake(key),
     tagMaxBytes: tagMaxBytesFor(process.platform),
+    log: (line) => console.error(line),
+    persona: getAppliedPersona,
+  })
+  // Before MCP admission, so every winning react reaches it. A's intake is the
+  // one routing's, named only inside the closure.
+  reactHandoff = createReactHandoff({
+    getAppliedPersonas: () => personaConfig?.personas ?? [],
+    getBotIdentity: identityFor,
+    receiveBotToolReaction: (key, input) => personaRouting.receiveBotToolReaction(key, input),
+    clock: {
+      now: () => Date.now(),
+      setTimeout: (callback, delayMs) => globalThis.setTimeout(callback, delayMs),
+      clearTimeout: (handle) => globalThis.clearTimeout(handle as ReturnType<typeof globalThis.setTimeout>),
+    },
+    isShuttingDown: () => shuttingDown,
+    log: (line) => console.error(line),
   })
 
   // the retired-key record (retired-keys.json in the
@@ -3134,7 +3165,8 @@ export async function main(): Promise<void> {
     // apply step 1 begins its old-life holds in the one hold
     // set, once the last-applied rewrite has succeeded.
     oldLifeHolds,
-    stopDelivery: async (key) => { const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); const remindersStopping = replyReminders?.forget(key); await Promise.all([stopping, remindersStopping]) },
+    // A retired key's react hand-off is cancelled first, as at persona teardown.
+    stopDelivery: async (key) => { reactHandoff?.forget(key); const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); const remindersStopping = replyReminders?.forget(key); await Promise.all([stopping, remindersStopping]) },
     // beside,
     // a confirmed apply's step 1 writes the unwritten
     // drops of a key it brings up, drops the retired keys' stored choices and
@@ -3206,10 +3238,17 @@ export async function main(): Promise<void> {
     onApplied: (config) => {
       if (appliedConfig === undefined) throw new Error('a confirmed apply ran before the start resolved its configuration')
       personaConfig = configInEffect(appliedConfig, config)
-      void deliveryPreparation?.recover(config.personas.map(p => p.key))
       sharedStateReporting?.reloadApplied()
     },
     onApplyFailed: failure => sharedStateReporting?.reloadApplyFailed(failure),
+    // once the apply's teardowns and bring-ups have settled, every applied
+    // key's claimed work is prepared again, detached from the apply and the
+    // tick. A destructive modify's teardown forgot the preparation life that
+    // held its accepted-only items, whose lookups then append nothing; the
+    // key's next life starts here and fixes them. An item a new connection
+    // stored whose ack is still pending is not claimed and stays with its
+    // intake. A removed key's queue stays retained, unprepared.
+    onApplySettled: (config) => deliveryPreparation?.reclaim(config.personas.map(p => p.key)),
   })
   reloadController = reload
   const start = reload.resolveStart()
@@ -3981,8 +4020,9 @@ export async function main(): Promise<void> {
       (key, status) => { membershipStatus?.(key, status); membershipReadiness?.report(key) },
       createPersonaUpFlushListener(personaNotifier),
       (key, status) => bringUps?.onConnectionStatus(key, status),
-      // Apply recovery precedes teardown/bring-up. Restore retained feedback
-      // with the usable client, on initial success and background retry alike.
+      // Apply recovery runs once the apply's steps settle, which can be before
+      // a retried bring-up reaches up. Restore retained feedback with the
+      // usable client, on initial success and background retry alike.
       (key, status) => { if (status.state === 'up') deliveryReporting?.reconcileQueued(key) },
       (key, status) => { if (status.state === 'up' && threadMemoryWorkAllowed(key)) ownPostLookups?.kick(key) },
     ),
@@ -4063,7 +4103,8 @@ export async function main(): Promise<void> {
     isShuttingDown: () => shuttingDown,
     log: (line) => console.error(line),
     whenLaunchSettled,
-    stopDelivery: async (key) => { membershipScanner?.stop(key); membershipReadiness?.forget(key); const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); const remindersStopping = replyReminders?.forget(key); await Promise.all([stopping, remindersStopping]) },
+    // The react hand-off's cancel comes first: called at submission and again in the teardown's turn.
+    stopDelivery: async (key) => { reactHandoff?.forget(key); membershipScanner?.stop(key); membershipReadiness?.forget(key); const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); const remindersStopping = replyReminders?.forget(key); await Promise.all([stopping, remindersStopping]) },
     stopLiveRowSequence: (key) => stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN),
     // a teardown cancels a launch's wait for a `working` row rather
     // than wait it out (up to 10 min).

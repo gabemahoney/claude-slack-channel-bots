@@ -89,7 +89,7 @@ function compactionMarkers(rows: QueueRecord[], mode: string): QueueRecord[] {
     if (row.compact === 'allocation') {
       if (mode === 'missing-allocation') return []
       if (mode === 'wrong-allocation') return [{ ...row, seq: 1 }]
-    } else {
+    } else if (row.compact === 'key') {
       if (mode === 'missing-key') return []
       if (mode === 'wrong-key') return [{ ...row, key: { ...row.key, ts: '9.000000' } }]
       if (mode === 'wrong-received-at') return [{ ...row, received_at: row.received_at - 1 }]

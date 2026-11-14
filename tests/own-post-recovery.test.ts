@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { SERVER_POST_METADATA } from './test-helpers/server-post.ts'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ChannelMode, DeliveryMode, PersonaInput } from '../src/config.ts'
@@ -164,7 +165,7 @@ function expectLoss(run: ReloadRun, cause?: string, threads: string[] = [], key 
   const loss = { threads: [], messages: [], ownPosts: [{ channel, threads, cause }] }
   const notice = buildThreadMemoryJoinsLostNotice(persona, loss)
   expect(run.stub(key).calls.postMessage.filter(p => 'text' in p && p.text === formatPersonaNotice(persona, notice.text, notice.options)))
-    .toEqual([{ channel: stubOpenedDmId('U0OPERATOR'), text: formatPersonaNotice(persona, notice.text, notice.options) }])
+    .toEqual([{ channel: stubOpenedDmId('U0OPERATOR'), text: formatPersonaNotice(persona, notice.text, notice.options), metadata: SERVER_POST_METADATA }])
   expect(lines).toEqual([buildThreadMemoryJoinsLostLine(persona, loss)])
 }
 
@@ -812,7 +813,7 @@ async function heldReply(run: ReloadRun, thread: string, key = 'alpha', parentUs
   return { event, receivedAt, seq: item.accepted.seq }
 }
 function resolutions(key = 'alpha') {
-  return readQueue(h.stateDir, key).filter(r => r.kind === 'released' || r.kind === 'withdrawn' || r.kind === 'parked')
+  return readQueue(h.stateDir, key).filter(r => r.kind === 'released' || r.kind === 'hold-withdrawn' || r.kind === 'parked')
 }
 function expectHoldOutputsQuiet(run: ReloadRun) {
   expect(JSON.stringify({ events: run.postHoldEvents, releases: run.postHoldReleases, saved: resolutions() })).not.toContain(heldBody)
@@ -869,7 +870,7 @@ describe.each(['strict', 'open'] as const)('%s Post Holds end to end', mode => {
     }
     await run.clock.flush()
     const resolved = outcome === 'failed' ? 'withdrawn' : 'released'
-    expect(resolutions()).toEqual([{ v: 1, kind: resolved, seq: held.seq, at: expect.any(Number) }])
+    expect(resolutions()).toEqual([{ v: 1, kind: resolved === 'withdrawn' ? 'hold-withdrawn' : resolved, seq: held.seq, at: expect.any(Number) }])
     expect(run.postHoldEvents).toEqual([{ kind: 'post-hold-resolved', key: 'alpha', seq: held.seq, outcome: resolved,
       cause: outcome === 'confirmed' ? 'thread' : outcome === 'failed' ? 'outcomes' : 'timer',
       heldMs: outcome === 'confirmed' ? 1000 : outcome === 'failed' ? 0 : THREAD_REPLY_HOLD_MS }])
