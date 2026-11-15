@@ -74,8 +74,7 @@
  *   one `persona-destination-failed` line (`formatPersonaDiagnostic`, its
  *   cause `destinationFailedCause`) naming the persona (JSON-quoted name, key
  *   beside it, `personas[i]`), the destination (`destination=` the channel
- *   ID, or `dm`; in fungible mode followed by the setting in force,
- * `invited.permission_prompts`), the failed step and the
+ *   ID, or `dm`), the failed step and the
  *   Slack error code; for `missing_scope` on the open it names the `im:write`
  *   scope and says the app must be re-installed to gain it.
  * - A failed retry advances the schedule and logs nothing, unless it failed at
@@ -145,7 +144,6 @@ import type { Persona } from './config.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
 import {
-  DECLARATIVE_DESTINATION_SETTING,
   DM_OPEN_SCOPE,
   MISSING_SCOPE_ERROR,
   destinationSettingFrom,
@@ -398,21 +396,16 @@ function settledAs(result: DestinationPostResult): SettledAs {
 }
 
 /**
- * The `destination=` field of a `persona-destination-failed` line: `destination=<value>`, followed in fungible mode
- * by the setting in force in parentheses,
- * `destination=<value> (invited.permission_prompts)`. A declarative-mode
- * field names no setting, as every such line does in declarative mode. Pure.
+ * The `destination=` field of a `persona-destination-failed` line:
+ * `destination=<value>`. Pure.
  */
 function destinationField(at: NamedDestination): string {
-  return at.setting === DECLARATIVE_DESTINATION_SETTING
-    ? `destination=${at.destination}`
-    : `destination=${at.destination} (${at.setting})`
+  return `destination=${at.destination}`
 }
 
 /**
- * The cause of a `persona-destination-failed` opening line: the failed step, the destination with the
- * setting in force (`destination=<value>`, plus ` (invited.permission_prompts)`
- * in fungible mode) and the Slack error code, then that the persona's
+ * The cause of a `persona-destination-failed` opening line: the failed step,
+ * `destination=<value>` and the Slack error code, then that the persona's
  * prompts and notices are held. For `missing_scope` on the open it names the
  * `im:write` scope and says the app must be re-installed to gain it. A code
  * that is not a short identifier is written `unknown_error`

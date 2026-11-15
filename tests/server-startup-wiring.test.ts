@@ -5561,8 +5561,6 @@ describe('the session tools read the channel mode of the configuration in effect
 /** The store's start load and its factory; typed against the module, so a rename fails the typecheck. */
 const CHANNEL_DELIVERY_START_LOAD: keyof typeof ChannelDeliveryModule = 'createChannelDeliveryStore'
 const CHANNEL_DELIVERY_FACTORY: keyof typeof ChannelDeliveryModule = 'createChannelDeliveryStore'
-/** The declaration a stored choice is kept under; typed against the module. */
-const CHANNEL_DELIVERY_DECLARATION_OF: keyof typeof ChannelDeliveryModule = 'channelDeliveryDeclarationOf'
 /** server.ts's one stored-choice holder: private to server.ts, so named by string. */
 const CHANNEL_DELIVERY_HOLDER = 'channelDeliveryStore'
 /** The reload controller's store accessor; renaming it fails the typecheck. */

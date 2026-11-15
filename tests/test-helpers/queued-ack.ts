@@ -26,7 +26,7 @@ export async function makeQueuedAckHarness(options: { onReplyCall?: (key: string
   const settings = { queued_ack_reaction: DEFAULT_QUEUED_ACK_REACTION, ack_reaction: DEFAULT_ACK_REACTION, reply_chunk_limit: DEFAULT_REPLY_CHUNK_LIMIT, reply_chunk_mode: DEFAULT_REPLY_CHUNK_MODE }
   Object.assign(n.config, settings)
   const authority = makeSharedAuthority(e.root, { ...n.config,
-    personas: n.config.personas.map(({ key, index, sections, ...persona }) => persona),
+    personas: n.config.personas.map(({ key, index, ...persona }) => persona),
   })
   const choices = createChannelDeliveryStore(authority)
   // Independent positive observations for the acknowledgement fixture. The

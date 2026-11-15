@@ -47,9 +47,9 @@ import { sameChannelStamp, type ChannelStamp } from './shared-channels.ts'
 export const THREAD_MEMORY_LOOKUP_METHODS = ['conversations.replies', 'conversations.history'] as const
 export type ThreadMemoryLookupMethod = typeof THREAD_MEMORY_LOOKUP_METHODS[number]
 
-export const METADATA_DEADLINE_CODE = 'thread-memory-lookup-deadline'
+const METADATA_DEADLINE_CODE = 'thread-memory-lookup-deadline'
 
-export class MetadataDeadlineError extends Error {
+class MetadataDeadlineError extends Error {
   readonly code = METADATA_DEADLINE_CODE
   constructor() { super('Thread Memory lookup request deadline expired.') }
 }
@@ -58,14 +58,14 @@ export class MetadataCancelledError extends Error {
 }
 
 /** Slack errors that mean the token lacks the method, scope or permission. */
-export const METADATA_CAPABILITY_ERRORS: ReadonlySet<string> = new Set([
+const METADATA_CAPABILITY_ERRORS: ReadonlySet<string> = new Set([
   'missing_scope', 'not_allowed_token_type', 'no_permission', 'access_denied', 'method_deprecated',
   'ekm_access_denied', 'team_access_not_granted', 'not_authorized', 'restricted_action',
 ])
 /** Slack errors that mean the persona cannot see the conversation any more. */
-export const METADATA_ACCESS_ERRORS: ReadonlySet<string> = new Set(['channel_not_found', 'not_in_channel', 'is_archived'])
+const METADATA_ACCESS_ERRORS: ReadonlySet<string> = new Set(['channel_not_found', 'not_in_channel', 'is_archived'])
 /** Slack errors that mean the named message or thread does not exist (or no longer does). */
-export const METADATA_NOT_FOUND_ERRORS: ReadonlySet<string> = new Set(['thread_not_found', 'message_not_found'])
+const METADATA_NOT_FOUND_ERRORS: ReadonlySet<string> = new Set(['thread_not_found', 'message_not_found'])
 /** Slack errors that mean Slack itself is failing or limiting: the dependency is down, not this item. */
 const TRANSIENT_ERRORS: ReadonlySet<string> = new Set(['internal_error', 'fatal_error', 'service_unavailable', 'request_timeout', 'ratelimited'])
 

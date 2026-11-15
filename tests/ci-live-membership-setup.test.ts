@@ -75,6 +75,7 @@ import { createSharedChannelAuthority, initialSharedChannelState, parseSharedCha
 import { virtualClock } from './test-helpers/ci-live.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { _assignFixture, fixtureThreadHybridSince } from './test-helpers/shared-channels.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -139,6 +140,7 @@ interface World {
   home: string
   state: string
   authority: SharedChannelAuthority
+  threadHybridSince: () => string
   readiness: MembershipReadiness
   /** C's authenticated installation (the provenance's identity), or null for none. */
   cIdentity: (InstallationIds & { enterpriseId?: string }) | null
@@ -190,6 +192,7 @@ function makeWorld(): World {
     home,
     state,
     authority: createSharedChannelAuthority(recordPath, initial, deps),
+    threadHybridSince: fixtureThreadHybridSince(initial),
     readiness: undefined as unknown as MembershipReadiness,
     cIdentity: { ...C_IDS, enterpriseId: BODY_SENTINEL },
     inventory: { state: 'complete', pages: 1, positives: 2, slackError: BODY_SENTINEL },
@@ -206,6 +209,7 @@ function makeWorld(): World {
     restart: () => {
       w.readiness.close()
       w.authority = createSharedChannelAuthority(recordPath, parseSharedChannelState(readFileSync(recordPath), recordPath, deps)!, deps)
+      w.threadHybridSince = fixtureThreadHybridSince(w.authority.snapshot())
       w.readiness = newReadiness()
       // Another server process: a live stand-in PID now owns server.pid and server.port (the listener stays the same).
       const process2 = Bun.spawn([Bun.which('sleep')!, '600'], { env: hostSafeChildEnv(home, { tools: ['sleep'] }), stdout: 'ignore', stderr: 'ignore' })
@@ -337,12 +341,12 @@ function recordDirect(w: World, subscriptions: Record<'member_joined_channel' | 
 /** A channel C holds a saved choice for (giveCChoice). */
 const SAVED_CHANNEL = 'C0SAVED001'
 
-/** Give C a saved choice for `channel` through the production authority: a verified join, then `delivery` stored. */
+/** Script the check's durable setup: a verified join, then a fixture choice through the production transaction. */
 function giveCChoice(w: World, channel: string, delivery: 'mentions' | 'all') {
   const incarnation = w.authority.incarnation(C_KEY)!
   const boundary = w.authority.snapshot().personas[C_KEY]!.membership[channel]?.boundary ?? 0
   if (w.authority.observeMembership(C_KEY, incarnation, { event: `scripted-join-${channel}`, identity: 'authenticated-app', channel, member: true, boundary }, w.authority.revision).kind !== 'applied') throw new Error('scripted join failed')
-  if (w.authority.assign(C_KEY, incarnation, channel, delivery, w.authority.revision).kind !== 'applied') throw new Error('scripted choice failed')
+  if (_assignFixture(w.authority, C_KEY, incarnation, channel, delivery, w.authority.revision, w.threadHybridSince).kind !== 'applied') throw new Error('scripted choice failed')
 }
 
 // ---------------------------------------------------------------------------

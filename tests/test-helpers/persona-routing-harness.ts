@@ -1199,7 +1199,7 @@ export function makeRoutingHarness(
   // its lines in `h.logs` and each write recorded before it is made.
   {
     const stateDir = opts.channelDelivery?.stateDir ?? mkdtempSync(join(baseDir, 'routing-authority-'))
-    const raw = { ...config, personas: config.personas.map(({ index, key, sections, ...persona }) => persona) }
+    const raw = { ...config, personas: config.personas.map(({ index, key, ...persona }) => persona) }
     const state = readSharedState(stateDir) ?? initialSharedState(stateDir, raw)
     h.channelDelivery = createChannelDeliveryStore(opts.channelDelivery?.authority ?? createSharedChannelAuthority(sharedChannelPath(stateDir), state, {
       write(path, bytes) { h.channelDeliveryWrites.push(path); durableWriteFileSync(path, bytes) },

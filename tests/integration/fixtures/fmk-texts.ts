@@ -546,9 +546,6 @@
  *                                                src/registry.ts: the tool's refusals in
  *                                                declarative mode, for a channel not known, and
  *                                                for a delivery value it does not take
- *   channelDeliverySetResultText <channel> <stored> <delivery>
- *                                                src/registry.ts: an accepted call's result, the
- *                                                stored choice and effective channel delivery
  *   modeSwitchLine <mode> [<persona-name>…]      src/reload-plan.ts: the switch's preview line
  *                                                turning <mode> (one of src/config.ts
  *                                                CHANNEL_MODES) on, for the personas named, in
@@ -4324,27 +4321,6 @@ const deliverySetCause: Entry = {
   },
 }
 
-/**
- * `channelDeliverySetResultText(<channel>, <stored>, { delivery })`
- * (registry.ts): the result of an accepted `set_channel_delivery` call.
- */
-const deliverySetResult: Entry = {
-  synopsis: '<channel> <stored> <delivery>',
-  async print(args, context) {
-    const entry = 'channelDeliverySetResultText'
-    expectArguments(entry, args, ['channel', 'stored', 'delivery'])
-    const [channel, stored, delivery] = args
-    await checkDeliveryArgument(context, entry, 'stored', stored!)
-    await checkDeliveryArgument(context, entry, 'delivery', delivery!)
-    const build = await packageFunction<(channel: string, stored: string, result: { delivery: string }) => unknown>(
-      context,
-      'registry.ts',
-      entry,
-    )
-    return builtString(entry, build(channel!, stored!, { delivery: delivery! }))
-  },
-}
-
 /** Expected result derived from the installed validated attempt evidence after
  * a scenario call. The scenario supplies its independently expected effective
  * choice, or an unavailable reason; this never creates authority or writes. */
@@ -6204,7 +6180,6 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   channelDeliveryDeclarativeRefusal: builderEntry('registry.ts', 'channelDeliveryDeclarativeRefusal', ['name', 'key']),
   channelDeliveryChannelRefusal: builderEntry('registry.ts', 'channelDeliveryChannelRefusal', ['name', 'key', 'channel']),
   channelDeliveryValueRefusal: builderEntry('registry.ts', 'channelDeliveryValueRefusal', ['name', 'key', 'value']),
-  channelDeliverySetResultText: deliverySetResult,
   channelDeliveryAttemptResultText: deliveryAttemptResult,
   channelDeliveryAttemptInputRefusal: builderEntry('registry.ts', 'channelDeliveryAttemptInputRefusal', ['name', 'key']),
   channelDeliveryDryRunRefusal: builderEntry('registry.ts', 'channelDeliveryDryRunRefusal', ['name', 'key']),

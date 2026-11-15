@@ -1,3 +1,4 @@
+import { _assignFixture, fixtureThreadHybridSince } from './test-helpers/shared-channels.ts'
 import { activationRecord, applicationState } from './test-helpers/shared-channels.ts'
 import { THREAD_ROOTS, threadPath, threadFsControls, readThreads } from './test-helpers/thread-memory.ts'
 import { THREAD_MEMORY_RETRY_MIN_MS } from '../src/delivery-constants.ts'
@@ -54,7 +55,6 @@ import { handlePermissionClick } from '../src/permission-click-handler.ts'
 import { _resetPollerState, getLivePermission, stopPermissionPoller } from '../src/permission-poller.ts'
 import { isCredentialsBroken, type PersonaBringUpOutcome } from '../src/persona-bringup-controller.ts'
 import { destinationClearedCause, destinationFailedCause, type DestinationFailedAt } from '../src/persona-destination-hold.ts'
-import { destinationSettingOf, FUNGIBLE_DESTINATION_SETTING } from '../src/persona-destination.ts'
 import {
   formatPersonaDiagnostic,
   PERSONA_CONFIG_DIR_UNRESOLVABLE,
@@ -75,7 +75,6 @@ import { DM_DESTINATION_SETTINGS as LIFECYCLE_DM_DESTINATION_SETTINGS } from '..
 import { formatPersonaNotice, PERSONA_TEARDOWN_NOTICE_DURING_WAIT } from '../src/persona-notifier.ts'
 import {
   channelDeliveryDeclarativeRefusal,
-  channelDeliverySetResultText,
   channelDeliveryUnreadableRefusal,
   personaNotAppliedRefusal,
   type SessionEntry,
@@ -7459,7 +7458,7 @@ describe("a confirmed change of bravo while its preparation is in flight: the en
       // The destructive modify reset bravo's channel choices and membership with its old identity. Reassign its
       // channel to the new life and verify the new connection's membership, so that life serves the channel.
       const authority = run.controller.sharedChannels()!
-      expect(authority.assign(bravoKey, authority.incarnation(bravoKey)!, ownChannel('bravo'), 'all', authority.revision).kind).toBe('applied')
+      expect(_assignFixture(authority, bravoKey, authority.incarnation(bravoKey)!, ownChannel('bravo'), 'all', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('applied')
       run.stub('bravo').script.inventory.push(membershipPage([ownChannel('bravo')]))
       run.membershipScanner.request(bravoKey); await run.membershipClock.runNext()
 

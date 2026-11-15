@@ -717,7 +717,6 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
     'registry.ts:channelDeliveryDeclarativeRefusal:function',
     'registry.ts:channelDeliveryChannelRefusal:function',
     'registry.ts:channelDeliveryValueRefusal:function',
-    'registry.ts:channelDeliverySetResultText:function',
     'registry.ts:channelDeliveryAttemptResultText:function',
     'registry.ts:channelDeliveryAttemptInputRefusal:function',
     'registry.ts:channelDeliveryDryRunRefusal:function',

@@ -446,7 +446,7 @@ describe('the manager wired with the per-persona serializer, as server.ts wires 
     for (const p of [A, B]) expect(await c.bringUp(p)).toMatchObject({ state: 'up' })
     const config = c.config!
     const store = createChannelDeliveryStore(makeSharedAuthority(dir, {
-      ...config, personas: config.personas.map(({ key, index, sections, ...p }) => p),
+      ...config, personas: config.personas.map(({ key, index, ...p }) => p),
     }))
     managed = makeManagedRouting(c, dir, {
       getChannelDelivery: () => store,

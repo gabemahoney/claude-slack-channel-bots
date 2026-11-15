@@ -411,7 +411,7 @@ export const check30: CheckDef<CheckContext> = {
     const names = await configNames(ctx)
     const expected = switchOnPreview(names)
     const m = await mark(ctx)
-    const out = await confirmedEdit(ctx, f, m, switchOnFilter(ids), expected.preview)
+    const out = await confirmedEdit(ctx, f, m, switchOnFilter(), expected.preview)
     expectApplied(f, out.appliedLines, expected.counts)
     if (f.failures.length > 0) return f.result()
 

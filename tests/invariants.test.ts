@@ -226,7 +226,6 @@ interface AdmittedRead {
 const STORED_CHOICES_ENTRY = "a persona key's entry of the stored-choice file: its own `channels` map of stored choices, never a persona's"
 
 const ADMITTED_READS: readonly AdmittedRead[] = [
-  { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > storedChannels', read: 'authority.channels', count: 1, reason: 'the shared authority method, not a persona field or independent store' },
   { file: 'channel-membership-scan.ts', within: 'parsePage', read: "value['channels']", count: 2, reason: 'validate and iterate the Slack users.conversations response array, not a persona configuration' },
   { file: 'channel-membership-scan.ts', within: 'createMembershipScanner > collect', read: 'page.channels', count: 1, reason: 'iterate the parsed users.conversations page returned by the connection manager membershipPage call, not a persona configuration' },
   { file: 'reload.ts', within: 'createPendingDetection > candidateOf', read: 'reviewed.channels', count: 1, reason: 'channel effects returned by shared authority planReviewed for the preview, not a persona channels list or a delivery decision' },
@@ -861,10 +860,10 @@ describe('negative controls for the reader audit', () => {
 describe('negative controls for the one-rule checks', () => {
   const resolver = plantedSource(
     [
-      'function personaDestinationOf(c: C, p: P) { return p.dm }',
-      'function direct(p: P) { return personaDestinationOf(undefined, p) }',
+      'function personaDestinationOf(p: P) { return p.dm }',
+      'function direct(p: P) { return personaDestinationOf(p) }',
       'function viaHelper(p: P) { return helper(p) }',
-      'function helper(p: P) { return personaDestinationOf(undefined, p) }',
+      'function helper(p: P) { return personaDestinationOf(p) }',
       'function apart(p: P) { return other(p) }',
       'function other(p: P) { return p.key }',
       'function loopA(p: P): unknown { return loopB(p) }',

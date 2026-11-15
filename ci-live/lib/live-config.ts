@@ -55,24 +55,11 @@ export interface LiveConfig {
 
 /** The shared channel mode key, pinned against the production schema. */
 export const SWITCH_KEY = 'channel_mode'
-/** Shared destination key; retained export names identify the live check's controls. */
-export const INVITED_KEY = 'permission_prompts'
-export const INVITED_PERMISSION_PROMPTS_KEY = 'permission_prompts'
 /** The destination value that sends a persona's prompts and notices to its DM with its contact. */
 export const DM_DESTINATION = 'dm'
 
-/** Each persona's shared destination remains the same across mode changes. */
-export function invitedDestinationFor(letter: PersonaLetter, ids: WorkspaceIds): string {
-  switch (letter) {
-    case 'a': return ids.aHome
-    case 'b':
-    case 'c': return DM_DESTINATION
-    case 'd': return ids.dHome
-  }
-}
-
 /** Check 30 changes only the mode; it never invents assignments or destinations. */
-export function switchOnFilter(_ids: WorkspaceIds): string {
+export function switchOnFilter(): string {
   return switchFilter(true)
 }
 

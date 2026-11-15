@@ -1,3 +1,4 @@
+import { _assignFixture, fixtureThreadHybridSince } from './test-helpers/shared-channels.ts'
 import { makeDeferredWebApiCall, stubOpenedDmId } from './test-helpers/slack-stub.ts'
 import { consumeAck } from '../src/ack-tracker.ts'
 /** wc: the public request / review / rename gesture over the real authority. */
@@ -48,15 +49,15 @@ function assignment(run: ReloadRun, target: PersonaInput, delivery: DeliveryMode
 }
 function choice(run: ReloadRun, channel: string = A, name = 'alpha') { return authority(run).choice(h.key(name), channel) }
 function order(run: ReloadRun, channel: string = A, name = 'alpha') { return authority(run).snapshot().personas[h.key(name)]!.assignments[channel]?.order }
-function automatic(run: ReloadRun, delivery: DeliveryMode, channel: string = A, name = 'alpha') {
+function _fixtureChoice(run: ReloadRun, delivery: DeliveryMode, channel: string = A, name = 'alpha') {
   const store = authority(run), key = h.key(name)
-  expect(store.assign(key, store.incarnation(key)!, channel, delivery, store.revision).kind).toBe('applied')
+  expect(_assignFixture(store, key, store.incarnation(key)!, channel, delivery, store.revision, fixtureThreadHybridSince(store.snapshot())).kind).toBe('applied')
 }
 async function confirm(run: ReloadRun) { assertNoLeak(run.captured()); h.confirm(); await tick(run) }
 async function reopen(run: ReloadRun, opts: ReloadRunOptions = {}) { await run.stop(); return start(opts) }
 
-// Changed values as well as unchanged values are declarations. Automatic writes
-// here use nb's authority seam; these are not ei's logical MCP retry acceptance.
+// Changed and unchanged values are declarations. Fixture choices use hk's
+// one-position transaction; logical MCP retries are tested separately.
 test.each(DELIVERY_MODES.flatMap(from => DELIVERY_MODES.map(to => [from, to] as const)))('declared %s → %s applies once at its durable position with byte-identical input', async (from, to) => {
   const alpha = persona('alpha', from), beta = persona('beta', 'mentions'); h.materialize(alpha, beta)
   const bytes = h.writeConfig({ personas: [alpha, beta] }), run = await start()
@@ -135,12 +136,12 @@ test.each(['stale-generation', 'duplicate-target', 'unknown-field', 'wrong-life'
 test('pending overwrite, automatic additions and unrelated source edits remain distinct through refresh and exact activation', async () => {
   const alpha = persona(), beta = persona('beta'); h.materialize(alpha, beta)
   h.writeConfig({ personas: [alpha, beta] }); const run = await start()
-  automatic(run, 'off')
+  _fixtureChoice(run, 'off')
   const replacement = { ...beta, working_directory: h.persona('new-beta').working_directory }; h.materialize(replacement)
   const bytes = h.writeConfig({ channel_mode: 'open', stop_hook_bootstrap: false, personas: [alpha, replacement] })
   run.request('request', [assignment(run, alpha, 'all')]); await tick(run)
   const oldReview = h.readPending()!
-  automatic(run, 'thread_hybrid', B)
+  _fixtureChoice(run, 'thread_hybrid', B)
   expect(h.readConfig()).toEqual(bytes)
   run.request('refresh'); await tick(run)
   expect(h.pendingBody()).toContain('saved=off; reviewed=all')
@@ -156,7 +157,7 @@ test('pending overwrite, automatic additions and unrelated source edits remain d
 
 test.each(['whitespace', 'default', 'mode', 'setting', 'omitted'] as const)('%s-only confirmation takes no assignment position and preserves automatic choices', async edit => {
   const alpha = persona(); h.materialize(alpha); const original = h.writeConfig({ personas: [alpha] }); const run = await start()
-  automatic(run, 'off'); automatic(run, 'thread_hybrid', B)
+  _fixtureChoice(run, 'off'); _fixtureChoice(run, 'thread_hybrid', B)
   const beforeOrders = authority(run).snapshot().personas.alpha!.assignments
   if (edit === 'whitespace') h.writeConfigBytes(Buffer.concat([original, Buffer.from('\n')]))
   else h.writeConfig({ ...(edit === 'default' ? { channel_mode: 'strict' } : edit === 'mode' ? { channel_mode: 'open' } : {}),
@@ -192,7 +193,7 @@ test('consumed-file replay after cleanup failure, automatic write and reopen nev
   const old = h.readPending()!, fingerprint = h.pendingFingerprint()!
   h.failRemoves(); await confirm(run)
   expect(choice(run)).toBe('off'); expect(h.applyExists()).toBe(true)
-  automatic(run, 'mentions'); const writtenOrder = order(run)
+  _fixtureChoice(run, 'mentions'); const writtenOrder = order(run)
   h.clearRemoveFailure(); run = await reopen(run)
   h.writeApplyBytes(old); await tick(run)
   expect(choice(run)).toBe('mentions'); expect(order(run)).toBe(writtenOrder)
@@ -205,7 +206,7 @@ test('same-value automatic write invalidates a dependent review without retiring
   const replacement = { ...alpha, working_directory: h.persona('replacement').working_directory }; h.materialize(replacement)
   h.writeConfig({ personas: [replacement] }); run.request('request', [assignment(run, replacement, 'all')]); await tick(run)
   const old = h.readPending()!, before = authority(run).incarnation('alpha')
-  automatic(run, 'all'); const cp = run.checkpoint()
+  _fixtureChoice(run, 'all'); const cp = run.checkpoint()
   h.writeApplyBytes(old); await tick(run)
   expect(authority(run).incarnation('alpha')).toBe(before)
   expect(run.retiredKeys.keys()).toEqual([]); expect(run.since(cp).lifecycle).toEqual([])
@@ -251,7 +252,7 @@ test.each(['working_directory', 'credentials_file', 'same-key-name', 'rename-bac
 
 test.each(['real-path', 'credential-content'] as const)('%s preserves life and automatic choice through confirmation', async kind => {
   const alpha = persona(); h.materialize(alpha); h.writeConfig({ personas: [alpha] }); const run = await start({ dryRun: false })
-  automatic(run, 'off'); const life = authority(run).lifetime('alpha', A), beforeOrder = order(run)
+  _fixtureChoice(run, 'off'); const life = authority(run).lifetime('alpha', A), beforeOrder = order(run)
   if (kind === 'credential-content') h.rotateCredentials(alpha)
   else {
     const alias = join(h.root, 'work-alias'); symlinkSync(alpha.working_directory, alias)
@@ -346,7 +347,7 @@ test.each(['unchanged', 'changed'] as const)('post-rename uncertainty recovers o
   expect(authority(run).readableFor('alpha', A)).toBe(false)
   expect(authority(run).readableFor('beta', A)).toBe(true)
   expect(authority(run).snapshot().personas.beta).toEqual(oldBeta)
-  expect(authority(run).assign('beta', authority(run).incarnation('beta')!, A, 'off', authority(run).revision).kind).toBe('unresolved')
+  expect(_assignFixture(authority(run), 'beta', authority(run).incarnation('beta')!, A, 'off', authority(run).revision, fixtureThreadHybridSince(authority(run).snapshot())).kind).toBe('unresolved')
   if (evidence === 'changed') writeFileSync(h.paths.lastApplied, Buffer.concat([preparedBytes, Buffer.from('\n')]))
   h.clearWriteFailure()
   await tick(run)
@@ -405,7 +406,7 @@ test('publication observers see complete mode, settings, choices and lifetime, a
   const unsubscribe = store.subscribe(config => {
     observed.push({ mode: config.channel_mode, delivery: choice(run), life: store.incarnation('alpha'), stop: config.personas[0]!.stop_hook_bootstrap,
       consumer: run.serverConfig()!.personas[0]!.channels, source: store.sourceBytes().equals(bytes),
-      interleave: store.assign('beta', store.incarnation('beta')!, A, 'off', store.revision).kind })
+      interleave: _assignFixture(store, 'beta', store.incarnation('beta')!, A, 'off', store.revision, fixtureThreadHybridSince(store.snapshot())).kind })
   })
   await confirm(run); unsubscribe()
   expect(observed).toEqual([{ mode: 'open', delivery: 'thread_hybrid', life: store.incarnation('alpha'), stop: false,
@@ -647,7 +648,7 @@ test('reviewed absence replacement preserves the exact conflict and unrelated ch
   run.stub('alpha').script.inventory.push(membershipPage([A, B])); await run.membershipClock.runNext()
   const owner = authority(run), generation = run.membership.generation('alpha')!, baseline = owner.snapshot()
   expect(run.membership.read('alpha', A, 'open').kind).toBe('eligible')
-  automatic(run, 'mentions')
+  _fixtureChoice(run, 'mentions')
   expect(run.membership.commitInventory(generation, { scanId: 'absence-assignment-race',
     observedThrough: ((run.membershipClock.now() + 1) / 1000).toFixed(3), observedRevision: baseline.revision,
     absent: new Map([[A, baseline.personas.alpha!.membership[A]!.boundary]]),

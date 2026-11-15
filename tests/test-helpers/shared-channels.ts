@@ -4,10 +4,11 @@ import { existsSync, readFileSync, mkdirSync } from 'node:fs'
 import { resolve, join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import { durableWriteFileSync, DurableWriteUnsyncedError } from '../../src/atomic-write.ts'
-import { parsePersonaConfigBytes, type PersonaConfigInput } from '../../src/config.ts'
+import { CHANNEL_ID_RE, DELIVERY_MODES, parsePersonaConfigBytes, type PersonaConfigInput } from '../../src/config.ts'
+import { personaKey } from '../../src/persona-identity.ts'
 import {
   createSharedChannelAuthority, initialSharedChannelState, parseSharedChannelState,
-  serializeSharedChannelState, type SharedChannelAuthority, type SharedChannelDeps, type SharedChannelLifetime, type SharedChannelState,
+  serializeSharedChannelState, type SharedChannelAuthority, type SharedChannelDeps, type SharedChannelLifetime, type SharedChannelState, type SharedMutationResult,
 } from '../../src/shared-channels.ts'
 import { isRealHome, isUnder, osTempDir } from './host-safe-env.ts'
 import { makePersonaConfigInput } from './persona-config.ts'
@@ -105,6 +106,33 @@ export function makeSharedAuthority(stateDir: string, input = makePersonaConfigI
   const state = initialSharedState(stateDir, input, threadHybridSince)
   writeSharedState(stateDir, state)
   return createSharedChannelAuthority(sharedChannelPath(stateDir), state, { ...deps, threadHybridSince })
+}
+
+/** Fixture construction only: one ordered assignment through the live durable
+ * transaction and publication path. Real bot/operator behavior must use
+ * attempt/botAttempt or reviewed apply instead. Pass the fixture's shared mint
+ * (fixtureThreadHybridSince(reopenedState) on reopen); retain it across writes.
+ * Same-value writes still take one position and preserve a hybrid marker. */
+export function _assignFixture(
+  authority: SharedChannelAuthority, key: string, incarnation: string, channel: string,
+  delivery: DeliveryMode, expectedRevision: number, threadHybridSince: () => string,
+): SharedMutationResult {
+  if (!authority.readable || authority.reviewHeld(key)) return { kind: 'unresolved', revision: authority.revision }
+  if (authority.incarnation(key) !== incarnation) return { kind: 'stale', revision: authority.revision }
+  return authority.transact(expectedRevision, (next, order) => {
+    const life = next.personas[key]
+    if (!life || life.incarnation !== incarnation || !CHANNEL_ID_RE.test(channel) || !DELIVERY_MODES.includes(delivery)) {
+      throw new Error('Obsolete or invalid fixture assignment.')
+    }
+    const previous = life.assignments[channel]
+    const since = delivery !== 'thread_hybrid' ? undefined
+      : previous?.delivery === 'thread_hybrid' && previous.threadHybridSince ? previous.threadHybridSince : threadHybridSince()
+    life.assignments[channel] = { delivery, order, ...(since === undefined ? {} : { threadHybridSince: since }) }
+    const entries = next.applied['personas'] as Array<Record<string, unknown>>
+    const raw = entries.find(entry => typeof entry['name'] === 'string' && personaKey(entry['name']) === key)
+    if (!raw) throw new Error('Unknown applied fixture persona.')
+    raw['channels'] = Object.entries(life.assignments).map(([id, choice]) => ({ id, delivery: choice.delivery }))
+  })
 }
 
 /** What the lifetime checks read of an authority. */
@@ -224,7 +252,7 @@ export function makeMembershipHarness(stateDir: string, options: {
   h.onEvent = router
   let eventId = 0
   return {
-    h, authority, membership, scanner, bringUps, lines, writes, stateDir,
+    h, authority, membership, scanner, bringUps, lines, writes, stateDir, threadHybridSince: deps.threadHybridSince!,
     failWrites(predicate: typeof refuseWrite) { refuseWrite = predicate },
     /** Install the exact production bytes, then report an uncertain directory sync. */
     unsyncWrites(predicate: typeof unsyncedWrite) { unsyncedWrite = predicate },
@@ -237,7 +265,6 @@ export function makeMembershipHarness(stateDir: string, options: {
         channel_type: 'C', event_ts: extra.timestamp ?? ((h.clock.now() + 1) / 1000).toFixed(3), ...extra.event },
       { event_id: extra.id ?? `EvMEMBER${++eventId}`, ...extra.envelope })
     },
-    assign(channel: string, delivery: DeliveryMode, key = 'alpha') { return authority.assign(key, authority.incarnation(key)!, channel, delivery, authority.revision) },
     captured() { return { lines, manager: h.lines, statuses: h.statuses, state: readSharedState(stateDir), authorityFile: writtenFile(authority.path) } },
     async close() { bringUps.cancelAll(); scanner.close(); membership.close(); unsubscribe(); await h.manager.stopAll() },
   }

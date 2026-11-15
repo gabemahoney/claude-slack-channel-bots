@@ -62,7 +62,6 @@ import {
   SET_CHANNEL_DELIVERY_TOOL,
   type ChannelDeliveryCurrentFacts,
   type ChannelDeliveryUnavailableReason,
-  type ChannelDeliverySetInvalidField,
   type ChannelDeliveryStore,
 } from './channel-delivery.ts'
 import { CHANNEL_DELIVERY_INTENTS, validChannelDeliveryAttempt, validChannelDeliveryAttemptId, type BotAttemptResult, type ChannelDeliveryAttemptRequest } from './channel-delivery-attempt.ts'
@@ -79,7 +78,7 @@ import {
   type Persona,
   type ReplySettings,
 } from './config.ts'
-import { channelDeliveryFor, type ChannelDeliveryResult } from './delivery-decision.ts'
+import { channelDeliveryFor } from './delivery-decision.ts'
 import { chunkText, sanitizeFilename } from './lib.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { describeSlackCallFailure, describeThrownValue, renderLogMessageText, slackPlatformReason } from './persona-connection-errors.ts'
@@ -992,19 +991,6 @@ function isChannelDeliveryValue(value: unknown): value is DeliveryMode {
  */
 export const ECHOABLE_CHANNEL_RE = /^[A-Z0-9]{1,24}$/
 
-/** Refusal categories; attempt outcomes have their own typed result union. */
-export const SET_CHANNEL_DELIVERY_REFUSALS = [
-  'session-inactive',
-  'input-invalid',
-  'binding-conflict',
-  'strict-mode',
-  'dry-run',
-  'outcome-unresolved',
-] as const
-
-/** One of `SET_CHANNEL_DELIVERY_REFUSALS`. */
-export type SetChannelDeliveryRefusal = (typeof SET_CHANNEL_DELIVERY_REFUSALS)[number]
-
 /** The lead every `set_channel_delivery` refusal shares: the tool and the persona (`renderPersonaRef`). */
 function channelDeliveryRefusalLead(name: string, key: string): string {
   return `Tool "${SET_CHANNEL_DELIVERY_TOOL}" refused for persona ${renderPersonaRef(name, key)}`
@@ -1090,28 +1076,6 @@ export function channelDeliveryChannelRefusal(name: string, key: string, channel
   const what = typeof channel === 'string' && ECHOABLE_CHANNEL_RE.test(channel)
     ? `channel ${JSON.stringify(channel)}` : 'the channel (the value given is not shown)'
   return `${channelDeliveryRefusalLead(name, key)}: ${what} needs a valid public or private channel ID and authenticated current eligible membership for a new assignment.`
-}
-
-/** Render a new application only, using its original effective facts. */
-export function channelDeliverySetResultText(channel: string, stored: DeliveryMode, result: ChannelDeliveryResult): string {
-  return `Stored ${stored} as your channel delivery for channel ${channel}. ` +
-    `From the next message in that channel, your channel delivery there is ${result.delivery}.`
-}
-
-/** Only for a proven pre-rename failure; ambiguous outcomes use attempt results. */
-export function channelDeliveryWriteFailedText(name: string, key: string, path: string): string {
-  return (
-    `Tool "${SET_CHANNEL_DELIVERY_TOOL}" failed for persona ${renderPersonaRef(name, key)}: the shared channel authority ` +
-    `${JSON.stringify(path)} could not be written, so the choice was not stored and channel delivery is unchanged.`
-  )
-}
-
-/** Only for a proven input refusal; not an ambiguous durability outcome. */
-export function channelDeliveryNotStoredText(name: string, key: string, field: ChannelDeliverySetInvalidField): string {
-  return (
-    `Tool "${SET_CHANNEL_DELIVERY_TOOL}" failed for persona ${renderPersonaRef(name, key)}: the choice was not stored ` +
-    `(the store refused its ${field}), so channel delivery is unchanged.`
-  )
 }
 
 // ---------------------------------------------------------------------------

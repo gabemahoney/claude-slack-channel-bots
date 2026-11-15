@@ -412,11 +412,8 @@ import * as registryExports from '../src/registry.ts'
 import {
   channelDeliveryChannelRefusal,
   channelDeliveryDeclarativeRefusal,
-  channelDeliveryNotStoredText,
-  channelDeliverySetResultText,
   channelDeliveryUnreadableRefusal,
   channelDeliveryValueRefusal,
-  channelDeliveryWriteFailedText,
   FUNGIBLE_TARGET_REFUSAL,
   MCP_INSTRUCTIONS,
   MCP_INSTRUCTIONS_MAX_CHARS,
@@ -1435,9 +1432,6 @@ const SET_CHANNEL_DELIVERY_TEXTS: readonly [exportName: string, form: string, te
     [channelDeliveryValueRefusal.name, 'not shown', () => channelDeliveryValueRefusal(s().name, s().key, s().hiddenValue)],
     [channelDeliveryChannelRefusal.name, 'echoed', () => channelDeliveryChannelRefusal(s().name, s().key, s().channel)],
     [channelDeliveryChannelRefusal.name, 'not shown', () => channelDeliveryChannelRefusal(s().name, s().key, s().hiddenChannel)],
-    [channelDeliverySetResultText.name, '', () => channelDeliverySetResultText(s().channel, 'all', { delivery: 'all' })],
-    [channelDeliveryWriteFailedText.name, '', () => channelDeliveryWriteFailedText(s().name, s().key, s().path)],
-    [channelDeliveryNotStoredText.name, '', () => channelDeliveryNotStoredText(s().name, s().key, 'set_at')],
     [sessionNotMatchedRefusal.name, '', () => sessionNotMatchedRefusal(SET_CHANNEL_DELIVERY_TOOL)],
     [personaNotAppliedRefusal.name, '', () => personaNotAppliedRefusal(SET_CHANNEL_DELIVERY_TOOL, s().key)],
   ]
@@ -1958,14 +1952,6 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
     expect(text(channelDeliveryValueRefusal.name, 'not shown')).not.toContain(String(sample.hiddenValue))
     expect(text(channelDeliveryChannelRefusal.name, 'echoed')).toContain(JSON.stringify(sample.channel))
     expect(text(channelDeliveryChannelRefusal.name, 'not shown')).not.toContain(sample.hiddenChannel)
-  })
-
-  test.each([...DELIVERY_MODES])('the %s result reports the saved choice in its one plain form', delivery => {
-    const { channel } = toolTextSample()
-    expect(channelDeliverySetResultText(channel, delivery, { delivery })).toBe(
-      `Stored ${delivery} as your channel delivery for channel ${channel}. ` +
-      `From the next message in that channel, your channel delivery there is ${delivery}.`,
-    )
   })
 
   test(`the audit reads ${CREDENTIALS_SCRIPT}, whose prompts and messages the operator sees`, () => {

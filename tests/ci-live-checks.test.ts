@@ -392,8 +392,6 @@ import { HumanCallError, HumanSession, type SlackMessage } from '../ci-live/lib/
 import {
   buildLiveConfig,
   DM_DESTINATION as RUNNER_DM_DESTINATION,
-  INVITED_KEY,
-  INVITED_PERMISSION_PROMPTS_KEY,
   personaEntryFor,
   renderConfig,
   SWITCH_KEY,
@@ -414,6 +412,7 @@ import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { flat, type HeadingMatch, requiredSection } from './test-helpers/markdown.ts'
 import { stripComments } from './test-helpers/source-audit.ts'
 import { makeReloadHarness } from './test-helpers/reload-harness.ts'
+import { _assignFixture, fixtureThreadHybridSince } from './test-helpers/shared-channels.ts'
 import { BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION, OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
 
 // ---------------------------------------------------------------------------
@@ -3304,14 +3303,14 @@ describe("Check 30's switch-on edit (switchOnFilter), from each starting state",
 
   test.each(STARTING_STATES)('from %s: loads in fungible mode, every persona has invited.permission_prompts, each destination is unchanged, and nothing else changed', (_what, state) => {
     const input = state()
-    const edited = jqEdit(home, input, switchOnFilter(DRY_RUN_IDS))
+    const edited = jqEdit(home, input, switchOnFilter())
     const before = loadLive(renderConfig(input))
     const after = loadLive(edited)
     expect([channelModeOf(before), channelModeOf(after)]).toEqual(['strict', 'open'])
     const json = JSON.parse(edited) as Record<string, unknown> & { personas: Record<string, unknown>[] }
     expect(json.personas.map((p) => p.permission_prompts)).toEqual(input.personas.map(p => p.permission_prompts))
     // T1's one destination rule, from the configuration in effect before and after.
-    expect(after.personas.map((p) => [p.key, personaDestinationOf(after, p)])).toEqual(before.personas.map((p) => [p.key, personaDestinationOf(before, p)]))
+    expect(after.personas.map((p) => [p.key, personaDestinationOf(p)])).toEqual(before.personas.map((p) => [p.key, personaDestinationOf(p)]))
     // The mode-only edit preserves every shared choice and destination.
     const { [SWITCH_KEY]: switchValue, ...rest } = json
     expect(switchValue).toBe('open')
@@ -3319,8 +3318,8 @@ describe("Check 30's switch-on edit (switchOnFilter), from each starting state",
   })
 
   test("the positive control: in Part 9's state, A with \"dm\" (DMs on, no dm.contact) is refused by the same load", () => {
-    const filter = `${switchOnFilter(DRY_RUN_IDS)} | (.personas[] | select(.name == ${JSON.stringify(personaName('a'))})).${INVITED_PERMISSION_PROMPTS_KEY} = ${JSON.stringify(DM_DESTINATION)}`
-    const refused = new RegExp(INVITED_PERMISSION_PROMPTS_KEY)
+    const filter = `${switchOnFilter()} | (.personas[] | select(.name == ${JSON.stringify(personaName('a'))})).permission_prompts = ${JSON.stringify(DM_DESTINATION)}`
+    const refused = /permission_prompts/
     const edited = jqEdit(home, part9State(false), filter)
     expect(() => loadLive(edited)).toThrow(refused)
     // The same edit from the setup state (A's DMs off) is refused too: "dm" is valid for neither.
@@ -3328,7 +3327,7 @@ describe("Check 30's switch-on edit (switchOnFilter), from each starting state",
   })
 
   test('the switch-only edits of Checks 32 and 33 change the switch alone', () => {
-    const on = jqEdit(home, part9State(false), switchOnFilter(DRY_RUN_IDS))
+    const on = jqEdit(home, part9State(false), switchOnFilter())
     const off = jqEdit(home, JSON.parse(on), switchFilter(false))
     expect(JSON.parse(off)).toEqual({ ...JSON.parse(on), [SWITCH_KEY]: 'strict' })
     expect(channelModeOf(loadLive(off))).toBe('strict')
@@ -3598,7 +3597,7 @@ describe('Check 34: restores the config and the channel, and leaves C in no chan
   /** The copy (config.json as Check 30 found it) and the configurations Checks 30–33 leave, as jq writes them. */
   function states() {
     const copy = renderConfig(part9State(false))
-    const on = jqEdit(home, JSON.parse(copy), switchOnFilter(DRY_RUN_IDS))
+    const on = jqEdit(home, JSON.parse(copy), switchOnFilter())
     const off = jqEdit(home, JSON.parse(on), switchFilter(false))
     return { copy, on, off }
   }
@@ -3850,6 +3849,7 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
     const config = renderConfig(SETUP_STATE())
     const world: ReloadWorld = { config, record: liveAuthority(config), copy: null, pending: false, log: [] }
     const switchOn = () => channelModeOf(worldAuthority(world).config()) === 'open'
+    const threadHybridSince = fixtureThreadHybridSince(worldAuthority(world).snapshot())
     const messages: ScriptedMessage[] = []
     let seq = 0
     const nextTs = () => `1700000100.${String(++seq).padStart(6, '0')}`
@@ -3889,7 +3889,7 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
             if (!refused) {
               logTimes(opts.setLines ?? 1, cLog(PERSONA_CHANNEL_DELIVERY_SET, srcChannelDeliverySetCause(channel, delivery, asked, asked)))
               const authority = worldAuthority(world)
-              if (authority.assign(C_PERSONA.key, authority.incarnation(C_PERSONA.key)!, channel, asked, authority.revision).kind !== 'applied') throw new Error('scripted shared assignment failed')
+              if (_assignFixture(authority, C_PERSONA.key, authority.incarnation(C_PERSONA.key)!, channel, asked, authority.revision, threadHybridSince).kind !== 'applied') throw new Error('scripted shared assignment failed')
               delivery = asked
             }
           }
@@ -3908,7 +3908,7 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
           if (!opts.noJoin && authority.observeMembership(C_PERSONA.key, authority.incarnation(C_PERSONA.key)!, { event: 'scripted-invite', identity: 'authenticated-app', channel: RUN_CHANNEL.id, member: true, boundary: 0 }, authority.revision).kind !== 'applied') throw new Error('scripted invite failed')
           if (opts.joinChoice) {
             const after = worldAuthority(world)
-            if (after.assign(C_PERSONA.key, after.incarnation(C_PERSONA.key)!, RUN_CHANNEL.id, opts.joinChoice, after.revision).kind !== 'applied') throw new Error('scripted choice failed')
+            if (_assignFixture(after, C_PERSONA.key, after.incarnation(C_PERSONA.key)!, RUN_CHANNEL.id, opts.joinChoice, after.revision, threadHybridSince).kind !== 'applied') throw new Error('scripted choice failed')
           }
         }
         return inner.call(method, params)
@@ -3930,7 +3930,7 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
     ])
     const guard = recordingGuard()
     const ctx = makeCtx({ mode: 'real', clock, human: new HumanSession(api, clock), container, promptGuard: guard })
-    return { ctx, world, scripts, messages, slackCalls, guard }
+    return { ctx, world, scripts, messages, slackCalls, guard, threadHybridSince }
   }
 
   /** `invitedRun(opts)` through Checks 30 and 31, each a PASS: the state Check 32 starts from. */
@@ -4035,7 +4035,7 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
     const boundary = authority.snapshot().personas[C_PERSONA.key]!.membership[RUN_CHANNEL.id]!.boundary
     expect(authority.observeMembership(C_PERSONA.key, authority.incarnation(C_PERSONA.key)!, { event: 'scripted-leave', identity: 'authenticated-app', channel: RUN_CHANNEL.id, member: false, boundary }, authority.revision).kind).toBe('applied')
     const again = worldAuthority(run.world)
-    expect(again.assign(C_PERSONA.key, again.incarnation(C_PERSONA.key)!, RUN_CHANNEL.id, 'all', again.revision).kind).toBe('applied')
+    expect(_assignFixture(again, C_PERSONA.key, again.incarnation(C_PERSONA.key)!, RUN_CHANNEL.id, 'all', again.revision, run.threadHybridSince).kind).toBe('applied')
     const r = await check32.run(run.ctx)
     expect([r.status, r.reason]).toEqual(['FAIL', 'C is no longer a verified member of the run channel after the mode change'])
     expect(r.evidence).toContain('membership in strict mode: member false')
@@ -4218,7 +4218,7 @@ describe("Check 33: after the kick, reply and fetch_messages are refused with Sl
     const clock = virtualClock()
     const s = (() => {
       const copy = renderConfig(part9State(false))
-      const on = jqEdit(home, JSON.parse(copy), switchOnFilter(DRY_RUN_IDS))
+      const on = jqEdit(home, JSON.parse(copy), switchOnFilter())
       return { on, off: jqEdit(home, JSON.parse(on), switchFilter(false)) }
     })()
     const config = opts.switchOn ? s.on : s.off
@@ -4752,7 +4752,7 @@ describe('expected texts match the package', () => {
 
     test.each(STARTING_STATES)("Check 30 from %s: only the server mode changes", (_what, state) => {
       const before = renderConfig(state())
-      const after = jqEdit(home, state(), switchOnFilter(DRY_RUN_IDS))
+      const after = jqEdit(home, state(), switchOnFilter())
       const names = (state().personas as { name: string }[]).map((p) => p.name)
       const rendered = renderPreviewLines(srcPlan(before, after))
       expectLifecyclePreview(rendered, switchOnPreview(names).preview)
@@ -4761,7 +4761,7 @@ describe('expected texts match the package', () => {
     })
 
     test.each([false, true])('the switch-only edit to %p (Check 32 off, Check 33 on)', (on) => {
-      const fungible = jqEdit(home, part9State(false), switchOnFilter(DRY_RUN_IDS))
+      const fungible = jqEdit(home, part9State(false), switchOnFilter())
       const before = on ? jqEdit(home, JSON.parse(fungible), switchFilter(false)) : fungible
       const after = jqEdit(home, JSON.parse(before), switchFilter(on))
       expectLifecyclePreview(renderPreviewLines(srcPlan(before, after)), switchOnlyPreview(on, namesOf(['a', 'b', 'c'])))
@@ -4830,8 +4830,7 @@ describe('expected texts match the package', () => {
   test("the setting names live-config.ts writes: the switch's key, invited and its permission_prompts, and \"dm\"", () => {
     expect(SWITCH_KEY).toBe(MODE_SWITCH_SETTING)
     expect(PERSONA_TOP_LEVEL_KEYS).toContain(SWITCH_KEY)
-    expect(PERSONA_ENTRY_KEYS).toContain(INVITED_KEY)
-    expect(PERSONA_ENTRY_KEYS).toContain(INVITED_PERMISSION_PROMPTS_KEY)
+    expect(PERSONA_ENTRY_KEYS).toContain('permission_prompts')
     expect(RUNNER_DM_DESTINATION).toBe(DM_DESTINATION)
   })
 
@@ -5067,7 +5066,7 @@ describe('expected texts match the package', () => {
 
       test("the commands Part 11 gives: Check 30's copy and switch-on filter, Checks 32 and 34's switch read, Check 32's switch-off edit and the run channel's name", () => {
         expect(check('30')).toContain(`cp "$S/config.json" ${CONFIG_COPY}`)
-        expect(check('30')).toContain(`jq '${switchOnFilter(PLAN_IDS)}'`)
+        expect(check('30')).toContain(`jq '${switchOnFilter()}'`)
         expect(check('32')).toContain(`jq '${switchFilter(false)}'`)
         for (const id of ['32', '34']) expect(check(id)).toContain(`jq -c '.applied | ${SWITCH_VALUE_JQ}' "$S/config.json.last-applied"`)
         expect(check('34')).toContain(`if guard; then cp ${CONFIG_COPY} "$S/config.json"; fi`)

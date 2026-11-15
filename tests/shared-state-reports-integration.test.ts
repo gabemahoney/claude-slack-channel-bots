@@ -1,3 +1,4 @@
+import { _assignFixture, fixtureThreadHybridSince } from './test-helpers/shared-channels.ts'
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import { dirname } from 'node:path'
 import type { ChannelMode } from '../src/config.ts'
@@ -299,7 +300,7 @@ test.each(MODES)('%s: first request and scanning history holds stay log-only unt
   const [joined, envelope] = makeMembershipEvent(run.stub('alpha').identity, 'join', C.primary, run.membershipClock.now() + 1)
   await run.deliver('alpha', joined, envelope)
   const authority = run.controller.sharedChannels()!
-  expect(authority.assign('alpha', authority.incarnation('alpha')!, C.primary, 'off', authority.revision).kind).toBe('applied')
+  expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, C.primary, 'off', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('applied')
   const [left] = makeMembershipEvent(run.stub('alpha').identity, 'leave', C.primary, run.membershipClock.now() + 1)
   await run.deliver('alpha', left, envelope); await flush(run)
   expect(run.membership.generation('alpha')?.holds.get(C.primary)).toBe('history-unresolved')
@@ -345,7 +346,7 @@ test.each(MODES)('%s: a history conflict during retry cannot escalate an existin
   const [joined, envelope] = makeMembershipEvent(run.stub('alpha').identity, 'join', C.primary, at)
   await run.deliver('alpha', joined, envelope)
   const authority = run.controller.sharedChannels()!
-  expect(authority.assign('alpha', authority.incarnation('alpha')!, C.primary, 'off', authority.revision).kind).toBe('applied')
+  expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, C.primary, 'off', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('applied')
   const [left] = makeMembershipEvent(run.stub('alpha').identity, 'leave', C.primary, at)
   await run.deliver('alpha', left, envelope); await flush(run)
   expect(run.membership.generation('alpha')?.holds.get(C.primary)).toBe('history-unresolved')
@@ -424,7 +425,7 @@ test.each(MODES)('%s: enabling reporting leaves uncertain bytes, write calls, ho
     const authority = run.controller.sharedChannels()!
     const cp = run.checkpoint()
     h.failWrites({ step: 'fsyncSync', call: 2, code: 'EIO' })
-    expect(authority.assign('alpha', authority.incarnation('alpha')!, C.primary, 'off', authority.revision).kind).toBe('unresolved')
+    expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, C.primary, 'off', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('unresolved')
     const installed = h.readRecord()
     await run.deliver('alpha', message); await flush(run)
     const reads = [C.primary, C.secondary].map(channel => ({ channel,
@@ -444,7 +445,7 @@ test.each(MODES)('%s: persona teardown forgets old evidence scope before a fresh
   const authority = run.controller.sharedChannels()!
   const [joined, envelope] = makeMembershipEvent(run.stub('alpha').identity, 'join', C.secondary, 1)
   await run.deliver('alpha', joined, envelope)
-  expect(authority.assign('alpha', authority.incarnation('alpha')!, C.secondary, 'off', authority.revision).kind).toBe('applied')
+  expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, C.secondary, 'off', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('applied')
   const [left] = makeMembershipEvent(run.stub('alpha').identity, 'leave', C.secondary, 1)
   await run.deliver('alpha', left, envelope); await scan(run)
   expect(reportLines(run, MEMBERSHIP_EVIDENCE_UNRESOLVED)).toHaveLength(1)
@@ -456,7 +457,7 @@ test.each(MODES)('%s: persona teardown forgets old evidence scope before a fresh
   await scan(run, [C.primary])
   const before = posts(run).length
   h.failWrites({ step: 'fsyncSync', call: 2, code: 'EIO' })
-  expect(authority.assign('alpha', authority.incarnation('alpha')!, C.primary, 'off', authority.revision).kind).toBe('unresolved')
+  expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, C.primary, 'off', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('unresolved')
   await flush(run)
   expect(posts(run)).toHaveLength(before + 1)
   h.clearWriteFailure(); await run.ticks.tick(); await flush(run)
@@ -498,7 +499,7 @@ test.each(MODES.flatMap(mode => (['restore', 'replace'] as const).map(action => 
   let run = await start(); await scan(run)
   const authority = run.controller.sharedChannels()!
   h.failWrites({ step: 'fsyncSync', call: 2, code: 'EIO' })
-  expect(authority.assign('alpha', authority.incarnation('alpha')!, C.primary, 'off', authority.revision).kind).toBe('unresolved')
+  expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, C.primary, 'off', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('unresolved')
   await flush(run)
   const scope = { channels: [C.primary], all: false, dm: false }
   stateReport(run, 'unsynced', scope)

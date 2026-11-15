@@ -1311,10 +1311,6 @@ describe('isolation and secrecy', () => {
 // A fungible destination channel the app is not in
 // ---------------------------------------------------------------------------
 
-/** The configuration in effect in each mode, as `destinationSettingOf` reads it. */
-const FUNGIBLE_MODE: DestinationConfig = { channel_mode: 'open' }
-const DECLARATIVE_MODE: DestinationConfig = { channel_mode: 'strict' }
-
 /** One `persona-destination-failed` line for `p`, with `cause`, as the hold formats it. */
 function destinationLine(p: Persona, cause: string): string {
   return formatPersonaDiagnostic({ class: PERSONA_DESTINATION_FAILED, name: p.name, key: p.key, index: p.index, cause })
@@ -1349,7 +1345,7 @@ describe('fungible mode: a destination channel the app is not in is held and ret
    * F, the step, the code, `destination=<value>` and the fungible setting.
    */
   function expectFungibleEpisodeLines(code: string): void {
-    const setting = destinationSettingOf(FUNGIBLE_MODE)
+    const setting = destinationSettingOf()
     const at: NamedDestination = { setting, destination: F_CHANNEL }
     const was: DestinationFailedAt = { step: 'chat.postMessage', code }
     const opening = destinationLine(F, destinationFailedCause(at, was))
@@ -1363,7 +1359,7 @@ describe('fungible mode: a destination channel the app is not in is held and ret
       expect(line).toContain('chat.postMessage')
       expect(line).toContain(code)
       expect(line).toContain(`destination=${F_CHANNEL}`)
-      expect(destinationSettingOf(FUNGIBLE_MODE)).toBe('permission_prompts')
+      expect(destinationSettingOf()).toBe('permission_prompts')
     }
   }
 
@@ -1465,7 +1461,7 @@ describe('fungible mode: a destination channel the app is not in is held and ret
 
 describe('the causes given the declarative setting are the declarative lines', () => {
   test('each cause reproduces the declarative line byte for byte, and C\'s logged episode lines are those', async () => {
-    const at: NamedDestination = { setting: destinationSettingOf(DECLARATIVE_MODE), destination: 'C0CEE0001' }
+    const at: NamedDestination = { setting: destinationSettingOf(), destination: 'C0CEE0001' }
     const was: DestinationFailedAt = { step: 'chat.postMessage', code: 'not_in_channel' }
     const opening =
       'chat.postMessage failed for destination=C0CEE0001 with error not_in_channel; ' +

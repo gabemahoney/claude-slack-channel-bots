@@ -124,9 +124,8 @@ import {
 } from '../src/reload-apply.ts'
 import { composePendingFile, PENDING_FILE_HEADER, reloadFingerprint } from '../src/reload-fingerprint.ts'
 import { createReloadTickDriver } from '../src/reload-timer.ts'
-import { channelDeliveryDeclarativeRefusal, channelDeliverySetResultText } from '../src/registry.ts'
+import { channelDeliveryDeclarativeRefusal } from '../src/registry.ts'
 import { DESTRUCTIVE_PREFIX, DESTRUCTIVE_RETIRED_CLAUSE, MODE_SWITCH_SETTING, REMOVED_RETIRED_CLAUSE } from '../src/reload-plan.ts'
-import { FUNGIBLE_DESTINATION_SETTING } from '../src/persona-destination.ts'
 import { OLD_LIFE_HOLD_LOG_PREFIX, RETIRED_KEYS_LOG_PREFIX } from '../src/retired-keys.ts'
 import {
   APP_TOKEN_PREFIX,

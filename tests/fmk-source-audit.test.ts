@@ -116,7 +116,7 @@ import { createSharedChannelAuthority } from '../src/shared-channels.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, writtenFile } from './test-helpers/credentials.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
-import { configBytes, makeSharedAuthority, readSharedState } from './test-helpers/shared-channels.ts'
+import { _assignFixture, configBytes, fixtureThreadHybridSince, makeSharedAuthority, readSharedState } from './test-helpers/shared-channels.ts'
 
 import { AD_ERROR_CLASS_CONFIG, AD_ERROR_CLASS_CONFLICT, AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_UNUSABLE_NAME, classifyAdError, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE, launchTimeoutFormOf } from '../src/ad-error-class.ts'
 import { LAUNCH_TIMEOUT_PHRASE } from '../src/ad-description-phrases.ts'
@@ -3080,14 +3080,15 @@ write_persona_config '${mode}'`], { encoding: 'utf8', timeout: 5000, env: hostSa
       }
       expect(build('declarative', checkBody, home).status).toBe(0)
       const strict = f.authority.snapshot()
-      expect(f.assign(ids.U1!, 'mentions').kind).toBe('applied')
+      expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, ids.U1!, 'mentions', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
       expect(build('declarative', checkBody, home).status).not.toBe(0)
-      expect(f.assign(ids.U1!, 'off').kind).toBe('applied')
+      expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, ids.U1!, 'off', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
       expect(build('declarative', checkBody, home).status).toBe(0)
-      expect(f.assign(ids.U0!, 'off').kind).toBe('applied')
+      expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, ids.U0!, 'off', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
       expect(build('declarative', checkBody, home).status).not.toBe(0)
       // Resume the untouched strict authority, then use the actual builders.
       const authority = createSharedChannelAuthority(f.authority.path, strict)
+      const threadHybridSince = fixtureThreadHybridSince(strict)
       for (const mode of ['fungible', 'switch-off']) {
         const next = build(mode, builder, home)
         expect(next.status).toBe(0)
@@ -3100,7 +3101,7 @@ write_persona_config '${mode}'`], { encoding: 'utf8', timeout: 5000, env: hostSa
         expect(authority.snapshot().personas.alpha!.assignments[ids.F2!]?.delivery).toBe('off')
         expect(authority.snapshot().personas.bravo!.assignments[ids.F2!]?.delivery).toBe('mentions')
         if (mode === 'fungible') for (const key of ['alpha', 'bravo']) {
-          expect(authority.assign(key, authority.incarnation(key)!, ids.F1!, 'all', authority.revision).kind).toBe('applied')
+          expect(_assignFixture(authority, key, authority.incarnation(key)!, ids.F1!, 'all', authority.revision, threadHybridSince).kind).toBe('applied')
         }
       }
       assertNoLeak(f.captured())
@@ -3383,7 +3384,8 @@ test('test29 restart authority assertion accepts fresh inventory but detects cha
   const f = makeMembershipHarness(root)
   try {
     f.h.stub(f.h.p('alpha')).script.inventory.push(membershipPage([ids.primary]))
-    await f.start(); await f.scan(); f.assign(ids.primary, 'off')
+    await f.start(); await f.scan()
+    _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, ids.primary, 'off', f.authority.revision, f.threadHybridSince)
     const input = join(root, 'config.json'), before = join(root, 'before.json')
     writeFileSync(input, f.authority.sourceBytes()); writeFileSync(before, readFileSync(f.authority.path))
     const source = readFileSync(join(import.meta.dir, 'integration/fixtures/fmk-texts.ts'), 'utf8')
@@ -3405,7 +3407,8 @@ test('test29 restart authority assertion accepts fresh inventory but detects cha
     for (const mutation of ['choice', 'identity', 'installation', 'reviewed-bytes', 'invalid'] as const) {
       const original = shared.parseSharedChannelState(readFileSync(before), f.authority.path)!
       const authority = createSharedChannelAuthority(f.authority.path, original)
-      if (mutation === 'choice') authority.assign('alpha', authority.incarnation('alpha')!, ids.primary, 'all', authority.revision)
+      const threadHybridSince = fixtureThreadHybridSince(original)
+      if (mutation === 'choice') _assignFixture(authority, 'alpha', authority.incarnation('alpha')!, ids.primary, 'all', authority.revision, threadHybridSince)
       if (mutation === 'identity') {
         const source = structuredClone(original.source)
         ;(source.personas as Array<Record<string, unknown>>)[0]!.working_directory = join(root, 'replacement')

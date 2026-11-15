@@ -55,7 +55,6 @@ import {
   PERSONA_TOP_LEVEL_KEYS,
 } from '../src/config.ts'
 import { UNCLAIMED_CHANNEL } from '../src/persona-diagnostics.ts'
-import { FUNGIBLE_DESTINATION_SETTING } from '../src/persona-destination.ts'
 import { MODE_SWITCH_SETTING } from '../src/reload-plan.ts'
 import {
   MEMBERSHIP_REQUIRED_SUBSCRIPTIONS, MEMBERSHIP_READINESS_ROUTE, parseMembershipSetupInput,

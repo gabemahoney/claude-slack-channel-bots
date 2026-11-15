@@ -1134,7 +1134,6 @@ export interface SharedChannelAuthority {
   applyReviewed(bytes: Uint8Array, expectedRevision: number, assignments?: readonly ReviewedAssignment[]): SharedMutationResult
   commitReview(bytes: Uint8Array, expectedRevision: number, review: DurableReview, assignments: readonly ReviewedAssignment[], publish?: (config: PersonaConfig) => void): SharedMutationResult
   observeMembership(key: string, incarnation: string, observation: VerifiedSharedMembership, expectedRevision: number): SharedMutationResult
-  assign(key: string, incarnation: string, channel: string, delivery: DeliveryMode, expectedRevision: number): SharedMutationResult
   /** undefined means no retained binding, not proof of nonapplication. */
   lookupBotAttempt(key: string, incarnation: string, request: ChannelDeliveryAttemptRequest): BotAttemptResult | undefined
   botAttempt(key: string, incarnation: string, request: ChannelDeliveryAttemptRequest,
@@ -1699,18 +1698,6 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
       }
       return authority.transactMembership(key, expectedRevision, (next, order) => {
         applySharedMembership(next, order, key, incarnation, observation, mint)
-      })
-    },
-    assign(key, incarnation, channel, delivery, expectedRevision) {
-      if (!readable || authority.reviewHeld(key)) return { kind: 'unresolved', revision: current.revision }
-      const original = own(current.personas, key)
-      if (!original || original.incarnation !== incarnation) return { kind: 'stale', revision: current.revision }
-      return authority.transact(expectedRevision, (next, order) => {
-        const life = own(next.personas, key)
-        if (!life || life.incarnation !== incarnation || !CHANNEL_ID_RE.test(channel) || !DELIVERY_MODES.includes(delivery)) throw new Error('Obsolete or invalid assignment.')
-        putAssignment(life.assignments, channel, delivery, order, mint)
-        const raw = rawPersona(next, key)
-        raw['channels'] = Object.entries(life.assignments).map(([id, assignment]) => ({ id, delivery: assignment.delivery }))
       })
     },
     previewReviewed(bytes, explicit = []) {

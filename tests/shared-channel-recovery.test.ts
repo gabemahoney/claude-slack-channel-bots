@@ -1,3 +1,4 @@
+import { _assignFixture, fixtureThreadHybridSince } from './test-helpers/shared-channels.ts'
 import { reviewLedger } from '../src/reload-review.ts'
 /** Startup, confirmed application and reopen use the same durable shared authority. */
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
@@ -134,7 +135,7 @@ test.each(['recover', 'stage'] as const)('changed uncertain bytes keep the exist
     writes++; durableWriteFileSync(path, bytes)
     if (unsynced) throw new DurableWriteUnsyncedError(path, { code: 'EIO' })
   } })
-  expect(authority.assign('alpha', authority.incarnation('alpha')!, C.primary, 'off', authority.revision).kind).toBe('unresolved')
+  expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, C.primary, 'off', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('unresolved')
   const exact = h.readRecord()!, before = authority.snapshot(), uncertain = disk()
   const damaged = h.writeRecordBytes('changed uncertain authority evidence')
   unsynced = false
@@ -205,14 +206,14 @@ test('watch reports every mutation outcome after publication, isolates exception
     expect(action().kind).toBe(kind)
     expect(order).toEqual([...(publishes ? ['subscribe'] : []), 'throw', 'watch'])
   }
-  const assign = () => authority.assign('alpha', authority.incarnation('alpha')!, C.primary, 'off', authority.revision)
-  check('applied', assign, true)
+  const _fixtureChoice = () => _assignFixture(authority, 'alpha', authority.incarnation('alpha')!, C.primary, 'off', authority.revision, fixtureThreadHybridSince(authority.snapshot()))
+  check('applied', _fixtureChoice, true)
   const appliedWrites = writes
   check('stale', () => authority.transact(authority.revision - 1, () => { throw new Error('stale callback must not run') }))
   check('failed', () => authority.transact(authority.revision, () => { throw new Error('change refused') }))
   expect(writes).toBe(appliedWrites)
-  failure = 'definite'; check('failed', assign)
-  failure = 'unsynced'; check('unresolved', assign)
+  failure = 'definite'; check('failed', _fixtureChoice)
+  failure = 'unsynced'; check('unresolved', _fixtureChoice)
   const exact = h.readRecord()!
   check('unresolved', () => authority.transact(authority.revision, () => {}))
   failure = 'definite'; check('unresolved', () => authority.recoverDurability())
@@ -240,17 +241,17 @@ test.each(['transact', 'recover'] as const)('watch can start a new mutation afte
     durableWriteFileSync(path, bytes)
     if (unsynced) throw new DurableWriteUnsyncedError(path, { code: 'EIO' })
   } })
-  const assign = (channel: string) => authority.assign('alpha', authority.incarnation('alpha')!, channel, 'off', authority.revision)
-  if (operation === 'recover') expect(assign(C.primary).kind).toBe('unresolved')
+  const _fixtureChoice = (channel: string) => _assignFixture(authority, 'alpha', authority.incarnation('alpha')!, channel, 'off', authority.revision, fixtureThreadHybridSince(authority.snapshot()))
+  if (operation === 'recover') expect(_fixtureChoice(C.primary).kind).toBe('unresolved')
   unsynced = false
   const order: string[] = [], nested: string[] = []
   authority.subscribe(() => order.push('subscribe'))
   let enter = true
   const stop = authority.watch(() => {
     order.push('watch')
-    if (enter) { enter = false; nested.push(assign(C.secondary).kind) }
+    if (enter) { enter = false; nested.push(_fixtureChoice(C.secondary).kind) }
   })
-  expect((operation === 'recover' ? authority.recoverDurability() : assign(C.primary)).kind).toBe('applied')
+  expect((operation === 'recover' ? authority.recoverDurability() : _fixtureChoice(C.primary)).kind).toBe('applied')
   expect(nested).toEqual(['applied'])
   expect(order).toEqual(['subscribe', 'watch', 'subscribe', 'watch'])
   expect(authority.choice('alpha', C.secondary)).toBe('off')
@@ -651,7 +652,7 @@ test('post-read stat failure safely refuses startup and a later reload without l
   }
  })
 
-test.each(['before-rename', 'installed-unsynced'] as const)('operator thread_hybrid assignment interrupted %s keeps value and Thread Hybrid Since together; only its channel reads undecided until recovered', async fault => {
+test.each(['before-rename', 'installed-unsynced'] as const)('fixture thread_hybrid assignment interrupted %s keeps value and Thread Hybrid Since together; only its channel reads undecided until recovered', async fault => {
   const alpha = threaded('alpha'); h.materialize(alpha); h.writeConfig({ personas: [alpha] })
   const run = await start(); const authority = run.controller.sharedChannels()!
   const channel = alpha.permission_prompts, life = authority.incarnation('alpha')!
@@ -663,7 +664,7 @@ test.each(['before-rename', 'installed-unsynced'] as const)('operator thread_hyb
   authority.subscribeThreadView(view => views.push(view))
   const before = disk()
   h.failWrites(fault === 'before-rename' ? { step: 'writeSync', code: 'ENOSPC' } : { step: 'fsyncSync', call: 2, code: 'EIO' })
-  const result = authority.assign('alpha', life, channel, 'thread_hybrid', authority.revision)
+  const result = _assignFixture(authority, 'alpha', life, channel, 'thread_hybrid', authority.revision, fixtureThreadHybridSince(authority.snapshot()))
   h.clearWriteFailure()
   let installed = before.personas.alpha!.assignments[channel]
   if (fault === 'before-rename') {
@@ -702,7 +703,7 @@ test.each(['before-rename', 'installed-unsynced'] as const)('operator thread_hyb
   expect(reopened.channelStamp('alpha', THREAD)).toEqual(kept)
   // A same-value write takes a new order but keeps its Thread Hybrid Since.
   const revision = reopened.revision
-  expect(reopened.assign('alpha', life, THREAD, 'thread_hybrid', revision).kind).toBe('applied')
+  expect(_assignFixture(reopened, 'alpha', life, THREAD, 'thread_hybrid', revision, fixtureThreadHybridSince(reopened.snapshot())).kind).toBe('applied')
   expect(disk().personas.alpha!.assignments[THREAD]).toEqual({ delivery: 'thread_hybrid', order: revision + 1, threadHybridSince: keptSince })
   expect(reopened.channelStamp('alpha', THREAD)).toEqual(kept)
 })
@@ -766,7 +767,7 @@ test.each([
   expect(views).toEqual([])
   // A revision captured before the marker writes is still current.
   expect(authority.revision).toBe(revision)
-  expect(authority.assign('alpha', life, alpha.permission_prompts, 'mentions', revision).kind).toBe('applied')
+  expect(_assignFixture(authority, 'alpha', life, alpha.permission_prompts, 'mentions', revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('applied')
 })
 
 test('marker writes refuse with no write for a key that is not a current persona, inside a publication, while unreadable and while a restoration is staged', async () => {
@@ -779,13 +780,13 @@ test('marker writes refuse with no write for a key that is not a current persona
   const inside: ThreadMemoryMarkerResult[] = []
   const stopView = authority.subscribeThreadView(() => { inside.push(authority.setThreadMemoryCreated('alpha')) })
   const stopConfig = authority.subscribe(() => { inside.push(authority.setThreadMemoryCreated('alpha')) })
-  expect(authority.assign('alpha', life, channel, 'mentions', authority.revision).kind).toBe('applied')
+  expect(_assignFixture(authority, 'alpha', life, channel, 'mentions', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('applied')
   stopView(); stopConfig()
   expect(inside).toEqual([{ kind: 'failed' }, { kind: 'failed' }])
   expect(lastAppliedWrites(run)).toBe(writes + 1)
   expect(authority.threadMemoryCreated('alpha')).toBe(false)
   h.failWrites({ step: 'fsyncSync', call: 2, code: 'EIO' })
-  expect(authority.assign('alpha', life, channel, 'all', authority.revision).kind).toBe('unresolved')
+  expect(_assignFixture(authority, 'alpha', life, channel, 'all', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('unresolved')
   h.clearWriteFailure(); writes = lastAppliedWrites(run)
   expect(authority.setThreadMemoryCreated('alpha')).toEqual({ kind: 'failed' })
   expect(lastAppliedWrites(run)).toBe(writes)
@@ -816,7 +817,7 @@ test('marker writes refuse with no write for a key that is not a current persona
   h.writeConfig({ channel_mode: 'open', personas: [alpha] })
   await run.ticks.tick(); h.confirm()
   const life = authority.incarnation(h.key('alpha'))!
-  expect(authority.assign(h.key('alpha'), life, alpha.channels![0]!.id, 'all', authority.revision).kind).toBe('applied')
+  expect(_assignFixture(authority, h.key('alpha'), life, alpha.channels![0]!.id, 'all', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('applied')
   await run.ticks.tick()
   expect(authority.config().channel_mode).toBe('strict')
   expect(h.readPending()).toBeDefined()
@@ -881,7 +882,7 @@ test('marker writes refuse with no write for a key that is not a current persona
   const authority = run.controller.sharedChannels()!
   const key = h.key(alpha.name)
   const channel = alpha.channels![0]!.id
-  expect(authority.assign(key, authority.incarnation(key)!, channel, 'mentions', authority.revision).kind).toBe('applied')
+  expect(_assignFixture(authority, key, authority.incarnation(key)!, channel, 'mentions', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('applied')
   const assignment = authority.snapshot().personas[key]!.assignments[channel]!
   const revision = authority.revision
   const bytes = edit === 'whitespace' ? Buffer.concat([source, Buffer.from(' \n')]) : Buffer.from(JSON.stringify({ channel_mode: 'strict', personas: [alpha] }, null, 2) + '\n')
@@ -1040,7 +1041,7 @@ test('recording/refusing filesystem sees zero legacy access through startup, rel
   const first = await refusingIo(monitoredStart)
   const authority = first.controller.sharedChannels()!
   const key = h.key(alpha.name), channel = alpha.channels![0]!.id
-  expect(authority.assign(key, authority.incarnation(key)!, channel, 'mentions', authority.revision).kind).toBe('applied')
+  expect(_assignFixture(authority, key, authority.incarnation(key)!, channel, 'mentions', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('applied')
   const assigned = authority.snapshot().personas[key]!.assignments[channel]
   h.writeConfig({ ...source, channel_mode: 'open' })
   await refusingIo(async () => {

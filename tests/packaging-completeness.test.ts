@@ -180,14 +180,12 @@ import {
   channelDeliveryAttemptResultText,
   channelDeliveryChannelRefusal,
   channelDeliveryDeclarativeRefusal,
-  channelDeliveryNotStoredText,
   channelDeliveryUnreadableRefusal,
   channelDeliveryValueRefusal,
-  channelDeliveryWriteFailedText,
   personaNotAppliedRefusal,
   sessionNotMatchedRefusal,
 } from '../src/registry.ts'
-import { DECLARATIVE_DESTINATION_SETTING, FUNGIBLE_DESTINATION_SETTING } from '../src/persona-destination.ts'
+import { DECLARATIVE_DESTINATION_SETTING } from '../src/persona-destination.ts'
 import {
   stateDirFailedLine,
   stateDirLegacyServerRunningLine,
@@ -952,7 +950,7 @@ const DM_SPAN = `\`"?${escapeRegExp(DM_DESTINATION)}"?\``
 
 /** What a passage lacks of the fungible destination setting's name. */
 function settingProblems(passage: string): string[] {
-  return flat(passage).includes(FUNGIBLE_DESTINATION_SETTING) ? [] : [`names no ${FUNGIBLE_DESTINATION_SETTING}`]
+  return flat(passage).includes(DECLARATIVE_DESTINATION_SETTING) ? [] : [`names no ${DECLARATIVE_DESTINATION_SETTING}`]
 }
 
 /** What a destination passage lacks: the fungible destination setting, and its `"dm"` default. */
@@ -1135,28 +1133,28 @@ describe(' : the debugging skill describes open mode ', () => {
     })
   })
 
-  describe(`each destination passage names the shared ${FUNGIBLE_DESTINATION_SETTING}`, () => {
+  describe(`each destination passage names the shared ${DECLARATIVE_DESTINATION_SETTING}`, () => {
     test.each(DESTINATION_PASSAGES)('%s', (_label, passageOf) => {
       expect(destinationProblems(passageOf(debugSkill()))).toEqual([])
     })
 
-    test.each(DESTINATION_PASSAGES)(`self-check: %s with ${FUNGIBLE_DESTINATION_SETTING} cut fails on it alone`, (_label, passageOf) => {
-      expect(destinationProblems(passageAfterCut(passageOf, (p) => p.replaceAll(FUNGIBLE_DESTINATION_SETTING, '')))).toEqual([
-        `names no ${FUNGIBLE_DESTINATION_SETTING}`,
+    test.each(DESTINATION_PASSAGES)(`self-check: %s with ${DECLARATIVE_DESTINATION_SETTING} cut fails on it alone`, (_label, passageOf) => {
+      expect(destinationProblems(passageAfterCut(passageOf, (p) => p.replaceAll(DECLARATIVE_DESTINATION_SETTING, '')))).toEqual([
+        `names no ${DECLARATIVE_DESTINATION_SETTING}`,
       ])
     })
 
 
   })
 
-  describe(`each passage naming the setting a confirmed change moves the destination by names ${FUNGIBLE_DESTINATION_SETTING}`, () => {
+  describe(`each passage naming the setting a confirmed change moves the destination by names ${DECLARATIVE_DESTINATION_SETTING}`, () => {
     test.each(SETTING_PASSAGES)('%s', (_label, passageOf) => {
       expect(settingProblems(passageOf(debugSkill()))).toEqual([])
     })
 
-    test.each(SETTING_PASSAGES)(`self-check: %s with ${FUNGIBLE_DESTINATION_SETTING} cut fails`, (_label, passageOf) => {
-      expect(settingProblems(passageAfterCut(passageOf, (p) => p.replaceAll(FUNGIBLE_DESTINATION_SETTING, '')))).toEqual([
-        `names no ${FUNGIBLE_DESTINATION_SETTING}`,
+    test.each(SETTING_PASSAGES)(`self-check: %s with ${DECLARATIVE_DESTINATION_SETTING} cut fails`, (_label, passageOf) => {
+      expect(settingProblems(passageAfterCut(passageOf, (p) => p.replaceAll(DECLARATIVE_DESTINATION_SETTING, '')))).toEqual([
+        `names no ${DECLARATIVE_DESTINATION_SETTING}`,
       ])
     })
   })
@@ -1434,14 +1432,6 @@ const QUOTED_TEXTS: [label: string, where: HeadingMatch, render: () => string][]
 function quotes(section: string, text: string): boolean {
   return flat(section).includes(flat(text))
 }
-
-// These retained exports need leak coverage independently of the skill's quotations.
-test.each<[string, () => string]>([
-  ['channelDeliveryWriteFailedText', () => channelDeliveryWriteFailedText(NAME, KEY, PATH)],
-  ['channelDeliveryNotStoredText', () => channelDeliveryNotStoredText(NAME, KEY, 'set_at')],
-])('retained legacy renderer %s has no leaks', (label, render) => {
-  assertNoLeak(render(), label)
-})
 
 describe("the debugging skill's quoted texts are their builders' renderings", () => {
   test.each(QUOTED_TEXTS)('%s', (label, where, render) => {

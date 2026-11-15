@@ -336,7 +336,7 @@ export const rn6: CheckDef<CheckContext> = {
     const copied = await guarded(ctx, `cp "$S/config.json" ${RN6_COPY}`)
     if (!f.expect(copied.ok && copied.code === 0, 'could not copy config.json')) return f.result()
     try {
-      const on = `jq ${q(switchOnFilter(ctx.ids))} "$S/config.json" > "$S/config.json.tmp" && mv "$S/config.json.tmp" "$S/config.json"`
+      const on = `jq ${q(switchOnFilter())} "$S/config.json" > "$S/config.json.tmp" && mv "$S/config.json.tmp" "$S/config.json"`
       if (!(await confirmLoose(ctx, f, 'fungible on', on))) return f.result()
       const m = await mark(ctx)
       const post = await aPost(ctx, f, ctx.ids.aHome, `${mention(ctx, 'a')} reply here with the word fungible.`, 'fungible')

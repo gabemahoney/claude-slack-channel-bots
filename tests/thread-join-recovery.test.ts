@@ -1,3 +1,4 @@
+import { _assignFixture, fixtureThreadHybridSince } from './test-helpers/shared-channels.ts'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { SERVER_POST_METADATA } from './test-helpers/server-post.ts'
 import { appendFileSync, existsSync, readFileSync } from 'node:fs'
@@ -28,7 +29,9 @@ type ExpectedReport = ReportKind | { kind: ReportKind; channels: string[] }
 let expectedReports: Map<ReloadRun, Record<string, ExpectedReport[]>>
 const afterCrash: Record<string, ExpectedReport[]> = { alpha: ['unclean'], bravo: ['unclean'] }
 
+let fixtureMint: () => string
 beforeEach(() => {
+  fixtureMint = fixtureThreadHybridSince()
   h = makeReloadHarness({ personaConfigDirs: true }); runs = []; engines = []; sequence = 0
   expectedReports = new Map()
   personas = ['alpha', 'bravo'].map(name => h.persona(name, {
@@ -128,9 +131,9 @@ async function crash(run: ReloadRun) {
   await run.crash()
   for (const entry of bytes) expect(readFileSync(entry.path)).toEqual(entry.bytes)
 }
-function assign(run: ReloadRun, delivery: DeliveryMode, target = channel, key = 'alpha') {
+function _fixtureChoice(run: ReloadRun, delivery: DeliveryMode, target = channel, key = 'alpha') {
   const authority = run.controller.sharedChannels()!
-  expect(authority.assign(key, authority.incarnation(key)!, target, delivery, authority.revision).kind).toBe('applied')
+  expect(_assignFixture(authority, key, authority.incarnation(key)!, target, delivery, authority.revision, fixtureMint).kind).toBe('applied')
 }
 
 describe.each(['strict', 'open'] as const)('%s join recovery', mode => {
@@ -268,7 +271,7 @@ describe.each(['strict', 'open'] as const)('%s join recovery', mode => {
     // Change the durable authority before the recovered run's first admission.
     const reopened = h.build(options()); runs.push(reopened)
     expect(reopened.resolveStart().kind).toBe('applied')
-    assign(reopened, choice); assign(reopened, 'thread_hybrid')
+    _fixtureChoice(reopened, choice); _fixtureChoice(reopened, 'thread_hybrid')
     await reopened.controller.runStartBringUp()
     await reopened.membershipClock.runNext()
     expect(view(reopened)).toBe('not-joined')
@@ -305,7 +308,7 @@ describe.each(['strict', 'open'] as const)('%s join recovery', mode => {
     expect(reopened.resolveStart().kind).toBe('applied')
     const authority = reopened.controller.sharedChannels()!
     h.failChannelDeliveryWrites({ step: 'fsyncSync', call: 2 })
-    expect(authority.assign('alpha', authority.incarnation('alpha')!, channel, 'thread_hybrid', authority.revision).kind).toBe('unresolved')
+    expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, channel, 'thread_hybrid', authority.revision, fixtureMint).kind).toBe('unresolved')
     expect(authority.channelStamp('alpha', channel)).toEqual({ kind: 'undecided' })
     await reopened.controller.runStartBringUp()
     await reopened.membershipClock.runNext()
@@ -546,7 +549,7 @@ describe.each(['strict', 'open'] as const)('%s join recovery', mode => {
     expect(run.controller.sharedChannels()!.choice('alpha', channel)).toBe(mode === 'strict' ? 'off' : 'mentions')
     run.stub('alpha').script.inventory.push(membershipPage([channel, neighbor]))
     run.membershipScanner.request('alpha'); await run.membershipClock.runNext()
-    assign(run, 'thread_hybrid')
+    _fixtureChoice(run, 'thread_hybrid')
     const count = run.queued('alpha').length
     await intake(run, 'reply')
     expect(run.queued('alpha')).toHaveLength(count)

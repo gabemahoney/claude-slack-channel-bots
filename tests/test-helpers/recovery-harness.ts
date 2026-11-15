@@ -2046,7 +2046,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     const source = appliedConfig()
     mkdirSync(join(stateDir, 'routing-authority'), { recursive: true })
     const choices = createChannelDeliveryStore(makeSharedAuthority(join(stateDir, 'routing-authority'), {
-      ...source, personas: source.personas.map(({ key, index, sections, ...p }) => p),
+      ...source, personas: source.personas.map(({ key, index, ...p }) => p),
     }))
     const core = createPersonaRouting({
       getChannelDelivery: () => choices,

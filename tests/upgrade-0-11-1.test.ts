@@ -68,7 +68,6 @@ import {
   type PersonaDmInput,
 } from '../src/config.ts'
 import type { DropDecision, Via } from '../src/delivery-decision.ts'
-import { FUNGIBLE_DESTINATION_SETTING } from '../src/persona-destination.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import {
   FUNGIBLE_REFUSAL_TEXTS,
@@ -347,6 +346,18 @@ describe('upgrade fixtures and the term list', () => {
 })
 
 describe('a 0.11.1 configuration loaded directly stays declarative', () => {
+  test.each(['invited', 'fungible_destination'] as const)('the loader rejects a removed %s input instead of silently dropping it', field => {
+    const { home, stateDir } = makeRig()
+    const fixture = FIXTURES[0]!
+    const configPath = join(stateDir, 'config.json')
+    const input = {
+      ...fixture.input,
+      personas: fixture.input.personas.map((entry, index) => index === 0 ? { ...entry, [field]: {} } : entry),
+    }
+    writeFileSync(configPath, JSON.stringify(input))
+    expect(() => loadPersonaConfig(configPath, home)).toThrow(field)
+  })
+
   test.each(FIXTURES.map((f) => [f.file, f] as const))(
     '%s loads through loadPersonaConfig in declarative mode with its bytes unchanged, no load-time message and no stored-choice file',
     (_file, fixture) => {
@@ -366,7 +377,7 @@ describe('a 0.11.1 configuration loaded directly stays declarative', () => {
 
       expect(readFileSync(configPath).equals(fixture.bytes)).toBe(true)
       expect(channelModeOf(config)).toBe('strict')
-      expect(config.personas.every(p => !('fungible_destination' in p) && !('invited' in p.sections))).toBe(true)
+      expect(config.personas.every(p => !('fungible_destination' in p) && !('invited' in p))).toBe(true)
       expect(
         config.personas.map((p) => ({ name: p.name, channels: p.channels, dm: p.dm, permission_prompts: p.permission_prompts })),
       ).toEqual(
@@ -438,7 +449,7 @@ function expectDeclarativeAndUnchanged(h: ReloadHarness, run: ReloadRun, bytes: 
     config: h.readConfig()?.equals(bytes),
     record: h.readRecord() !== undefined && JSON.stringify(JSON.parse(h.readRecord()!.toString()).source) === JSON.stringify(JSON.parse(bytes.toString())),
     mode: channelModeOf(run.serverConfig()),
-    removedFields: run.serverConfig()?.personas.filter(p => 'fungible_destination' in p || 'invited' in p.sections).map(p => p.name),
+    removedFields: run.serverConfig()?.personas.filter(p => 'fungible_destination' in p || 'invited' in p).map(p => p.name),
     storedChoiceFile: existsSync(join(h.stateDir, 'channel-delivery.json')),
     namedAnywhere: filesNamed(h.root, 'channel-delivery.json'),
   }).toEqual({

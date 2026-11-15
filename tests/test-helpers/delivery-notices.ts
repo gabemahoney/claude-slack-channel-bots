@@ -134,7 +134,7 @@ export async function makeStorageNoticeHarness(options: {
   // Intake selects only from the shared authority's applied choices and the
   // persona's current membership, in both Channel Modes.
   const authority = makeSharedAuthority(n.root, { ...n.config,
-    personas: n.config.personas.map(({ key, index, sections, ...persona }) => persona),
+    personas: n.config.personas.map(({ key, index, ...persona }) => persona),
   })
   const choices = createChannelDeliveryStore(authority)
   const membership = observedMembership(Object.fromEntries(n.config.personas.map(p => [p.key, p.channels.map(c => c.id)])))

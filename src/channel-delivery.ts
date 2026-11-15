@@ -1,8 +1,8 @@
 /** Read/write adapter over the single recovered shared-channel authority.
  * It owns no file, fallback choices, timestamps or independent persistence.
  */
-import { sameSharedDeclaration, type SharedChannelAuthority, type PersonaDeclaration } from './shared-channels.ts'
-import type { ChannelMode, DeliveryMode, Persona } from './config.ts'
+import type { SharedChannelAuthority } from './shared-channels.ts'
+import type { ChannelMode, DeliveryMode } from './config.ts'
 import type { BotAttemptRejection, BotAttemptResult, ChannelDeliveryAttemptRequest, ChannelDeliveryFacts, SharedBotAttempt } from './channel-delivery-attempt.ts'
 import type { MembershipFault, MembershipReading } from './channel-membership.ts'
 
@@ -28,18 +28,6 @@ export function currentChannelDeliveryFacts(
 
 export const SET_CHANNEL_DELIVERY_TOOL = 'set_channel_delivery'
 export const CHANNEL_DELIVERY_FILE_NAME = 'config.json.last-applied'
-export const CHANNEL_DELIVERY_SET_STORED = 'stored'
-export const CHANNEL_DELIVERY_SET_UNREADABLE = 'unreadable'
-export const CHANNEL_DELIVERY_SET_INVALID = 'invalid'
-export const CHANNEL_DELIVERY_SET_WRITE_FAILED = 'write-failed'
-export type ChannelDeliveryDeclaration = PersonaDeclaration
-export const CHANNEL_DELIVERY_DECLARATION_FIELDS = ['name', 'credentials_file', 'working_directory'] as const
-export type ChannelDeliverySetInvalidField = 'key' | 'channel' | 'delivery' | 'declaration' | 'set_at' | 'membership'
-export type ChannelDeliverySetResult =
-  | { kind: typeof CHANNEL_DELIVERY_SET_STORED; previous: DeliveryMode | undefined }
-  | { kind: typeof CHANNEL_DELIVERY_SET_UNREADABLE; path: string }
-  | { kind: typeof CHANNEL_DELIVERY_SET_INVALID; field: ChannelDeliverySetInvalidField }
-  | { kind: typeof CHANNEL_DELIVERY_SET_WRITE_FAILED; path: string }
 export interface ChannelDeliveryStore {
   readonly path: string
   readonly readable: boolean
@@ -47,8 +35,6 @@ export interface ChannelDeliveryStore {
   readonly authority: SharedChannelAuthority
   incarnation(key: string): string | undefined
   storedChoice(key: string, channel: string): DeliveryMode | undefined
-  storedChannels(key: string): string[]
-  set(key: string, channel: string, delivery: DeliveryMode, declaration: ChannelDeliveryDeclaration): ChannelDeliverySetResult
   lookupAttempt(key: string, incarnation: string, request: ChannelDeliveryAttemptRequest): BotAttemptResult | undefined
   attempt(key: string, incarnation: string, request: ChannelDeliveryAttemptRequest,
     authorize: () => BotAttemptRejection | undefined,
@@ -56,9 +42,6 @@ export interface ChannelDeliveryStore {
   beginRetiring(keys: Iterable<string>): void
   endRetiring(keys: Iterable<string>): void
   isRetiring(key: string): boolean
-}
-export function channelDeliveryDeclarationOf(persona: Pick<Persona, 'name' | 'credentials_file' | 'working_directory'>): ChannelDeliveryDeclaration {
-  return { name: persona.name, credentials_file: persona.credentials_file, working_directory: persona.working_directory }
 }
 export function createChannelDeliveryStore(authority: SharedChannelAuthority, currentMembership?: (key: string, channel: string) => boolean): ChannelDeliveryStore {
   const retiring = new Set<string>()
@@ -69,7 +52,6 @@ export function createChannelDeliveryStore(authority: SharedChannelAuthority, cu
     get readable() { return authority.readable },
     readableFor: (key, channel) => authority.readableFor(key, channel),
     storedChoice: (key, channel) => authority.choice(key, channel),
-    storedChannels: key => authority.channels(key),
     lookupAttempt: (key, incarnation, request) => retiring.has(key) ? { kind: 'inactive' } : authority.lookupBotAttempt(key, incarnation, request),
     attempt(key, incarnation, request, authorize, applied) {
       if (retiring.has(key) || authority.incarnation(key) !== incarnation || authority.reviewHeld(key)) return { kind: 'inactive' }
@@ -81,18 +63,6 @@ export function createChannelDeliveryStore(authority: SharedChannelAuthority, cu
         const facts: ChannelDeliveryFacts = { saved: request.delivery, effective: request.delivery }
         return { kind: 'authorized', facts }
       }, applied)
-    },
-    set(key, channel, delivery, declaration) {
-      if (!authority.readable) return { kind: CHANNEL_DELIVERY_SET_UNREADABLE, path: authority.path }
-      const snapshot = authority.snapshot()
-      const life = Object.hasOwn(snapshot.personas, key) ? snapshot.personas[key] : undefined
-      if (!life || retiring.has(key) || authority.reviewHeld(key) || !sameSharedDeclaration(life.declaration, declaration)) return { kind: CHANNEL_DELIVERY_SET_INVALID, field: 'declaration' }
-      if (currentMembership && !currentMembership(key, channel)) return { kind: CHANNEL_DELIVERY_SET_INVALID, field: 'membership' }
-      const previous = this.storedChoice(key, channel)
-      const result = authority.assign(key, life.incarnation, channel, delivery, authority.revision)
-      if (result.kind === 'applied') return { kind: CHANNEL_DELIVERY_SET_STORED, previous }
-      if (result.kind === 'unresolved') return { kind: CHANNEL_DELIVERY_SET_UNREADABLE, path: authority.path }
-      return { kind: CHANNEL_DELIVERY_SET_WRITE_FAILED, path: authority.path }
     },
     beginRetiring: keys => { for (const key of keys) retiring.add(key) },
     endRetiring: keys => { for (const key of keys) retiring.delete(key) },

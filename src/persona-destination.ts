@@ -91,11 +91,8 @@ export const DM_OPEN_TIMEOUT_MS = 10_000
 /** The own-post answer of a post its caller cancelled after its intent, before any Slack call. */
 export const OWN_POST_CANCELLED = 'post_cancelled'
 
-/** The setting that names a persona's destination in declarative mode. */
+/** The common setting that names a persona's destination in both modes. */
 export const DECLARATIVE_DESTINATION_SETTING = 'permission_prompts'
-
-/** The setting that names a persona's destination in fungible mode. */
-export const FUNGIBLE_DESTINATION_SETTING = 'permission_prompts'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -116,10 +113,10 @@ type PersonaDestination =
 export type DmDestinationRefusal = 'dm_disabled' | 'no_dm_contact'
 
 /**
- * The setting that names a persona's destination in the mode in force
+ * The common setting that names a persona's destination
  * (`destinationSettingOf`).
  */
-export type DestinationSetting = typeof DECLARATIVE_DESTINATION_SETTING | typeof FUNGIBLE_DESTINATION_SETTING
+export type DestinationSetting = typeof DECLARATIVE_DESTINATION_SETTING
 
 /** The Slack call that failed. */
 export type DestinationStep = 'conversations.open' | 'chat.postMessage'
@@ -257,8 +254,7 @@ export interface PersonaDestinations {
    */
   post(persona: Persona, client: DestinationSlackClient, message: DestinationMessage, options?: DestinationPostOptions): Promise<DestinationPostResult>
   /**
-   * The persona's destination now (`personaDestinationOf` over the
-   * configuration in effect at this call): what a `post` called at the same
+   * The persona's destination now (`personaDestinationOf`): what a `post` called at the same
    * moment posts to.
    */
   destinationOf(persona: PersonaDestinationFields): string
@@ -270,8 +266,7 @@ export interface PersonaDestinations {
   refusalOf(persona: PersonaDestinationFields & Pick<Persona, 'dm'>): DmDestinationRefusal | undefined
   /**
    * The setting that names the persona's destination now
-   * (`destinationSettingOf` over the configuration in effect at this call,
-   *): the one a line naming the destination `destinationOf`
+   * (`destinationSettingOf`): the one a line naming the destination `destinationOf`
    * gives at the same moment names. Read through `destinationSettingFrom`.
    */
   settingOf(persona: PersonaDestinationFields): DestinationSetting
@@ -296,12 +291,12 @@ interface DmCacheEntry {
 export type PersonaDestinationFields = Pick<Persona, 'permission_prompts'>
 
 /** The required common permission destination in strict and open modes. */
-export function personaDestinationOf(config: DestinationConfig, persona: PersonaDestinationFields): string {
+export function personaDestinationOf(persona: PersonaDestinationFields): string {
   return persona.permission_prompts
 }
 
 /** The single permission-destination setting in both modes. */
-export function destinationSettingOf(config: DestinationConfig): DestinationSetting {
+export function destinationSettingOf(): DestinationSetting {
   return DECLARATIVE_DESTINATION_SETTING
 }
 
@@ -319,11 +314,11 @@ export function destinationSettingFrom(
 
 /**
  * Resolve a persona's destination through the one destination rule
- * (`personaDestinationOf`) over `config`: `dm` for the DM destination, else
+ * (`personaDestinationOf`): `dm` for the DM destination, else
  * the channel it names. Pure.
  */
-function resolvePersonaDestination(config: DestinationConfig, persona: PersonaDestinationFields): PersonaDestination {
-  const destination = personaDestinationOf(config, persona)
+function resolvePersonaDestination(persona: PersonaDestinationFields): PersonaDestination {
+  const destination = personaDestinationOf(persona)
   if (destination === DM_DESTINATION) return { kind: 'dm' }
   return { kind: 'channel', channelId: destination }
 }
@@ -331,14 +326,14 @@ function resolvePersonaDestination(config: DestinationConfig, persona: PersonaDe
 /**
  * Why the persona's `dm` destination must not be opened (DMs off, or no
  * contact), or undefined when it may be, or when the destination is a
- * channel. The destination comes from the one destination rule over `config`,
- * the configuration in effect (`personaDestinationOf`). Pure.
+ * channel. The destination comes from the one destination rule
+ * (`personaDestinationOf`). Pure.
  */
 export function dmDestinationRefusal(
   config: DestinationConfig,
   persona: PersonaDestinationFields & Pick<Persona, 'dm'>,
 ): DmDestinationRefusal | undefined {
-  if (personaDestinationOf(config, persona) !== DM_DESTINATION) return undefined
+  if (personaDestinationOf(persona) !== DM_DESTINATION) return undefined
   if (!persona.dm.enabled) return 'dm_disabled'
   if (!persona.dm.contact) return 'no_dm_contact'
   return undefined
@@ -409,7 +404,7 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
   const dmCache = new Map<string, DmCacheEntry>()
 
   function destinationOf(persona: PersonaDestinationFields): string {
-    return personaDestinationOf(deps.getPersonaConfig(), persona)
+    return personaDestinationOf(persona)
   }
 
   function refusalOf(persona: PersonaDestinationFields & Pick<Persona, 'dm'>): DmDestinationRefusal | undefined {
@@ -417,7 +412,7 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
   }
 
   function settingOf(persona: PersonaDestinationFields): DestinationSetting {
-    return destinationSettingOf(deps.getPersonaConfig())
+    return destinationSettingOf()
   }
 
   /**
@@ -434,7 +429,7 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
     if (refusal) {
       deps.log(
         `[slack] persona-destination: ${renderPersonaRef(persona.name, persona.key)} has ` +
-          `${destinationSettingOf(config)} set to "${DM_DESTINATION}" but ${describeDmDestinationRefusal(refusal)} — ` +
+          `${destinationSettingOf()} set to "${DM_DESTINATION}" but ${describeDmDestinationRefusal(refusal)} — ` +
           'no DM opened and nothing posted',
       )
       return { outcome: 'refused', reason: refusal }
@@ -494,7 +489,7 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
     if (message.tracking?.signal.aborted) return { outcome: 'cancelled' }
     // One read of the configuration in effect for the whole attempt.
     const config = deps.getPersonaConfig()
-    const destination = resolvePersonaDestination(config, persona)
+    const destination = resolvePersonaDestination(persona)
     let channelId: string
     // The cache entry the post used, so a stale-conversation failure drops
     // that entry only, never a newer one.

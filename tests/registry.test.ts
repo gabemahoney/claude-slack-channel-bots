@@ -1,4 +1,4 @@
-import { makeSharedAuthority } from './test-helpers/shared-channels.ts'
+import { _assignFixture, fixtureThreadHybridSince, makeSharedAuthority } from './test-helpers/shared-channels.ts'
 import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
 import { longLivedWebClientOptions } from '../src/persona-slack-clients.ts'
 import { durableWriteFileSync, DurableWriteUnsyncedError } from '../src/atomic-write.ts'
@@ -2044,7 +2044,7 @@ describe('call-time resolution', () => {
       const session = await openSession(entry, deps)
       expect((await session.call(tool, TOOL_ARGS[tool](A_ALL))).isError).toBeUndefined()
       const callsBefore = totalSlackCalls(), fetchesBefore = h.fetches.length
-      expect(authority.assign(h.alpha.key, authority.incarnation(h.alpha.key)!, A_ALL, 'off', authority.revision).kind).toBe('unresolved')
+      expect(_assignFixture(authority, h.alpha.key, authority.incarnation(h.alpha.key)!, A_ALL, 'off', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('unresolved')
       expect(choices.readableFor(h.alpha.key, A_ALL)).toBe(false)
       expect(choices.readableFor(h.alpha.key, A_MENTIONS)).toBe(true)
       expect(choices.readableFor(h.beta.key, B_CHANNEL)).toBe(true)
@@ -2553,7 +2553,7 @@ describe('download_attachment', () => {
 // ---------------------------------------------------------------------------
 
 describe('fetch_messages', () => {
-  /** Real shared authority; every choice change uses its durable assignment API. */
+  /** Real shared authority; fixture choices use the durable transaction helper. */
   async function reader(mode: ChannelMode = 'strict', options: StubSlackOptions = {}) {
     const input = { channel_mode: mode, personas: [h.alpha, h.beta].map(p => ({
       name: p.name, credentials_file: p.credentials_file, working_directory: p.working_directory,
@@ -2567,10 +2567,11 @@ describe('fetch_messages', () => {
     fetchAuthorityFiles.push(authority.path)
     const choices = createChannelDeliveryStore(authority)
     let storeAvailable = true
-    const assign = (delivery: ChannelEntry['delivery']) => authority.assign(
-      h.alpha.key, authority.incarnation(h.alpha.key)!, A_ALL, delivery, authority.revision,
+    const mint = fixtureThreadHybridSince(authority.snapshot())
+    const _fixtureChoice = (delivery: ChannelEntry['delivery']) => _assignFixture(authority,
+      h.alpha.key, authority.incarnation(h.alpha.key)!, A_ALL, delivery, authority.revision, mint,
     )
-    expect(assign('thread_hybrid').kind).toBe('applied')
+    expect(_fixtureChoice('thread_hybrid').kind).toBe('applied')
     const stub = makeStubSlack({ token: h.alphaToken, leakMarker: LEAK_SENTINEL, ...options })
     h.clients.set(h.alpha.key, stub)
     const web = stub.createWebClient(h.alphaToken, longLivedWebClientOptions())
@@ -2583,9 +2584,9 @@ describe('fetch_messages', () => {
     const entry = registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer())
     entry.personaIncarnation = authority.incarnation(h.alpha.key)
     const session = await openSession(entry, deps)
-    return { session, stub, resolved, choices, assign, withoutStore: () => { storeAvailable = false }, makeUnreadable: () => {
+    return { session, stub, resolved, choices, _fixtureChoice, withoutStore: () => { storeAvailable = false }, makeUnreadable: () => {
       failWrite = true
-      expect(assign('off').kind).toBe('unresolved')
+      expect(_fixtureChoice('off').kind).toBe('unresolved')
       expect(choices.readableFor(h.alpha.key, A_ALL)).toBe(false)
     } }
   }
@@ -2676,7 +2677,7 @@ describe('fetch_messages', () => {
     (['off', 'mentions', 'all', 'DM', 'history', 'missing', 'no store', 'unreadable', 'changed'] as const)
       .map(scope => ({ mode, scope }))))('$mode / $scope ignores cursor and preserves legacy calls/results', async ({ mode, scope }) => {
     const thread = makePagedThread(3)
-    const { session, stub, resolved, assign, withoutStore, makeUnreadable } = await reader(mode, { repliesResponder: thread.respond })
+    const { session, stub, resolved, _fixtureChoice, withoutStore, makeUnreadable } = await reader(mode, { repliesResponder: thread.respond })
     let channel = A_ALL
     let queue: 'history' | 'replies' = 'replies'
     let cursor: unknown = { ignored: 'non-string-legacy-cursor' }
@@ -2684,8 +2685,8 @@ describe('fetch_messages', () => {
       const first = await session.call('fetch_messages', { channel, thread_ts: thread.rootTs, limit: 1 })
       cursor = JSON.parse(first.content[0]!.text).next_cursor
       expect(typeof cursor).toBe('string')
-      expect(assign('mentions').kind).toBe('applied')
-    } else if (scope === 'off' || scope === 'mentions' || scope === 'all') expect(assign(scope).kind).toBe('applied')
+      expect(_fixtureChoice('mentions').kind).toBe('applied')
+    } else if (scope === 'off' || scope === 'mentions' || scope === 'all') expect(_fixtureChoice(scope).kind).toBe('applied')
     else if (scope === 'DM') { applyPersona(h.alpha, true); channel = 'D0DIRECT1' }
     else if (scope === 'history') queue = 'history'
     else if (scope === 'missing') channel = UNCONFIGURED
@@ -2714,8 +2715,8 @@ describe('fetch_messages', () => {
     (['off', 'mentions', 'all'] as const).map(delivery => ({ mode, delivery }))))(
     '$mode / $delivery long legacy thread stops at the first page despite Slack continuation', async ({ mode, delivery }) => {
       const thread = makePagedThread(107)
-      const { session, stub, assign, resolved } = await reader(mode, { repliesResponder: thread.respond })
-      expect(assign(delivery).kind).toBe('applied')
+      const { session, stub, _fixtureChoice, resolved } = await reader(mode, { repliesResponder: thread.respond })
+      expect(_fixtureChoice(delivery).kind).toBe('applied')
       const args = { channel: A_ALL, thread_ts: thread.rootTs }
       const original = await session.call('fetch_messages', args)
       expect(original.isError).toBeUndefined()

@@ -51,7 +51,6 @@ import {
   type DurableWriteFs,
 } from '../../src/atomic-write.ts'
 import {
-  channelDeliveryDeclarationOf,
   createChannelDeliveryStore,
   type ChannelDeliveryStore,
 } from '../../src/channel-delivery.ts'
@@ -1277,6 +1276,14 @@ export interface ReloadRun {
    * its retiring keys and unwritten drops start empty.
    */
   readonly channelDelivery: ChannelDeliveryStore
+  /** Membership and scanner share controller.sharedChannels() with channelDelivery.
+   * Hold a collection by pushing makeDeferredWebApiCall().outcome to
+   * currentStub(name).script.inventory, then runNext()/flush() on
+   * membershipClock. Settle that call with membershipPage(...) and flush to
+   * finish it. advanceTo(membershipScanner.status(key).nextAttemptAt!) drives retries.
+   * For a mid-scan operator write use request('request', assignments), tick,
+   * h.confirm(), tick (or confirmPending()); this runs the real reviewed apply.
+   * Bot writes use channelDelivery.attempt or callTool in open, non-dry mode. */
   readonly membership: ChannelMembership
   readonly membershipScanner: MembershipScanner
   /** Discovery has its own injectable clock; connection retry assertions use clock. */

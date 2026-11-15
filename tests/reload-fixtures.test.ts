@@ -14,6 +14,7 @@ import * as fingerprints from '../src/reload-fingerprint.ts'
 import { makeReloadHarness, type ReloadHarness, type ReloadRun } from './test-helpers/reload-harness.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { MIN_CLAUDE_CODE_VERSION } from './test-helpers/agent-director-versions.ts'
+import { _assignFixture, fixtureThreadHybridSince } from './test-helpers/shared-channels.ts'
 
 const source = readFileSync(join(import.meta.dir, 'integration/fixtures/fmk-texts.ts'), 'utf8')
 const declarations = source.slice(source.indexOf('async function readSharedConfiguration('), source.indexOf('const sharedAuthorityStartLine: Entry'))
@@ -59,7 +60,8 @@ test.each([...config.DELIVERY_MODES])('integration request printer builds valid 
   await expect(print('operatorReviewPending', h.paths.config, h.paths.lastApplied, h.paths.pending, 'fixture')).rejects.toThrow()
   expect(await print('sharedApplicationPreserved', h.paths.config, before, h.paths.lastApplied)).toBe('')
   await expect(print('sharedAuthorityPreserved', h.paths.config, before, h.paths.lastApplied)).rejects.toThrow()
-  state.assign('alpha', state.incarnation('alpha')!, channel, 'mentions', state.revision)
+  expect(_assignFixture(state, 'alpha', state.incarnation('alpha')!, channel, delivery, state.revision,
+    fixtureThreadHybridSince(state.snapshot()))).toMatchObject({ kind: 'applied' })
   await expect(print('sharedApplicationPreserved', h.paths.config, before, h.paths.lastApplied)).rejects.toThrow()
 })
 

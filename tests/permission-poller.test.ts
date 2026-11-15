@@ -1283,11 +1283,6 @@ describe('poller tick — `dm` destination', () => {
 // ---------------------------------------------------------------------------
 
 describe('poller tick — fungible mode: prompts at the fungible destination (beside)', () => {
-  /** The configuration in effect in declarative mode, as the one destination rule reads it. */
-  const DECLARATIVE_MODE: DestinationConfig = { channel_mode: 'strict' }
-  /** The configuration in effect in fungible mode, as the one destination rule reads it. */
-  const FUNGIBLE_MODE: DestinationConfig = { channel_mode: 'open' }
-
   // F's fungible destination is a channel; X names `dm` explicitly; Y has no
   // `invited` section, so its fungible destination is `dm` by default.
   const NAME_F = 'Foxtrot Invited'
@@ -1416,8 +1411,8 @@ describe('poller tick — fungible mode: prompts at the fungible destination (be
     expect(declarative.logCalls).toHaveLength(1)
     const fungibleLine = String(fungible.logCalls[0]![0])
     const declarativeLine = String(declarative.logCalls[0]![0])
-    const fungibleSetting = destinationSettingOf(FUNGIBLE_MODE)
-    const declarativeSetting = destinationSettingOf(DECLARATIVE_MODE)
+    const fungibleSetting = destinationSettingOf()
+    const declarativeSetting = destinationSettingOf()
     expect(declarativeLine).toContain(`${renderPersonaRef(persona.name, persona.key)} has ${declarativeSetting} set to "${DM_DESTINATION}" but ${describeDmDestinationRefusal(reason)}`)
     expect(declarativeLine).toContain(instance)
     expect(declarativeLine).toContain(TOKEN_A)

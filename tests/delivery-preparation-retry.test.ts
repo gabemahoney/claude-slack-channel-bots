@@ -82,7 +82,7 @@ test.each(['slack-post-ack', 'injected', 'startup-accepted-only'] as const)('%s 
   if (source === 'slack-post-ack') {
     const config = makeMultiPersonaConfig([{ name: 'alpha', key: 'alpha' }], h.root)
     const choices = createChannelDeliveryStore(makeSharedAuthority(h.root, { ...config,
-      personas: config.personas.map(({ key, index, sections, ...persona }) => persona),
+      personas: config.personas.map(({ key, index, ...persona }) => persona),
     }))
     const routing = createPersonaRouting({
       getChannelDelivery: () => choices, membership: observedMembership({ alpha: ['C0TEST001'] }),

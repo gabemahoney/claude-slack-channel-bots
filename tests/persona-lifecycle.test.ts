@@ -1,6 +1,7 @@
 
 
 import { noticePost } from './test-helpers/server-post.ts'
+import { _assignFixture, fixtureThreadHybridSince } from './test-helpers/shared-channels.ts'
 import type { MakeTemplateParams } from 'agent-director'
 import { eligibleMembership } from './test-helpers/fungible-decision.ts'
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
@@ -1634,9 +1635,10 @@ describe('persona teardown: every step for the removed key only, in order', () =
     expect(h.keys([NAME_A, NAME_B])).toEqual([a, b])
     // Channel X is heard by both; Y by A alone; Z, a private channel, by B alone.
     const [x, y, z] = ['C0HEARDX01', 'C0HEARDY01', 'G0HEARDZ01']
+    const authority = h.channelDelivery!.authority, mint = fixtureThreadHybridSince(authority.snapshot())
     for (const key of [a, b]) for (const channel of [x, y, z]) {
-      const persona = h.config!.personas.find(p => p.key === key)!
-      expect(h.channelDelivery!.set(key, channel, 'mentions', persona)).toMatchObject({ kind: 'stored' })
+      expect(_assignFixture(authority, key, authority.incarnation(key)!, channel, 'mentions', authority.revision, mint))
+        .toMatchObject({ kind: 'applied' })
     }
     await h.receive(makeChannelMessage({ channel: x }), [NAME_A, NAME_B])
     await h.receive(makeChannelMessage({ channel: y }), [NAME_A])

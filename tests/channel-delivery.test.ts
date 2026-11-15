@@ -4,19 +4,19 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync }
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DurableWriteUnsyncedError, durableWriteFileSync } from '../src/atomic-write.ts'
-import { createChannelDeliveryStore, channelDeliveryDeclarationOf } from '../src/channel-delivery.ts'
+import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
 import { createSharedChannelAuthority, parseSharedChannelState, serializeSharedChannelState, type SharedChannelState } from '../src/shared-channels.ts'
 import { assertNoLeak, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
 import { makePersona, makePersonaConfigInput } from './test-helpers/persona-config.ts'
 import {
-  configBytes, FIXTURE_THREAD_HYBRID_SINCE_PREFIX, initialSharedState, makeSharedAuthority, malformedThreadMemoryMarkers, readSharedState,
+  _assignFixture, fixtureThreadHybridSince, configBytes, FIXTURE_THREAD_HYBRID_SINCE_PREFIX, initialSharedState, makeSharedAuthority, malformedThreadMemoryMarkers, readSharedState,
   sharedChannelPath, withThreadMemoryCreated, writeSharedState,
 } from './test-helpers/shared-channels.ts'
 import { osTempDir } from './test-helpers/host-safe-env.ts'
 import { spyOnCopies } from './test-helpers/copies.ts'
 
-let root: string
-beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'shared-authority-')) })
+let root: string, mint: () => string
+beforeEach(() => { mint = fixtureThreadHybridSince(); root = mkdtempSync(join(tmpdir(), 'shared-authority-')) })
 afterEach(() => { rmSync(root, { recursive: true, force: true }) })
 function input() {
   return makePersonaConfigInput({ personas: [makePersona({ name: 'alpha' }, root), makePersona({ name: 'beta' }, root)] }, root)
@@ -25,12 +25,18 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
 
  describe('one durable authority', () => {
   test('adapter reads only applied choices and each of the four values survives reopen', () => {
-    const authority = makeSharedAuthority(root, input())
-    const store = createChannelDeliveryStore(authority)
+    const source = input(); source.channel_mode = 'open'
+    const authority = makeSharedAuthority(root, source)
     const persona = authority.config().personas[0]!
+    expect(authority.observeMembership(persona.key, authority.incarnation(persona.key)!, {
+      event: 'adapter-join', identity: 'authenticated-app', channel: 'C0TEST001', member: true, boundary: 0,
+    }, authority.revision).kind).toBe('applied')
+    const store = createChannelDeliveryStore(authority, (key, channel) => authority.personaSnapshot(key)?.membership[channel]?.member === true)
     for (const delivery of ['off', 'mentions', 'all', 'thread_hybrid'] as const) {
       const previous = authority.choice(persona.key, 'C0TEST001')
-      expect(store.set(persona.key, 'C0TEST001', delivery, channelDeliveryDeclarationOf(persona))).toEqual({ kind: 'stored', previous })
+      expect(store.attempt(persona.key, authority.incarnation(persona.key)!,
+        deliveryAttempt(`adapter-${delivery}`, 'C0TEST001', delivery), () => undefined))
+        .toMatchObject({ kind: 'applied', historical: false, outcome: { previous, delivery } })
       const reopened = createSharedChannelAuthority(authority.path, readSharedState(root)!)
       expect(reopened.choice(persona.key, 'C0TEST001')).toBe(delivery)
       expect(reopened.config().personas[0]!.channels).toEqual([{ id: 'C0TEST001', delivery }])
@@ -45,7 +51,7 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     expect(authority.transact(authority.revision, next => { next.pendingIntent = { review: 'prepared' }; next.outcomes = { attempt: 'settled' } }).kind).toBe('applied')
     const before = authority.snapshot()
     const alpha = authority.config().personas[0]!
-    for (let i = 0; i < 2; i++) expect(authority.assign(alpha.key, authority.incarnation(alpha.key)!, 'C0TEST001', 'all', authority.revision).kind).toBe('applied')
+    for (let i = 0; i < 2; i++) expect(_assignFixture(authority, alpha.key, authority.incarnation(alpha.key)!, 'C0TEST001', 'all', authority.revision, mint).kind).toBe('applied')
     const after = readSharedState(root)!
     expect(after.revision).toBe(before.revision + 2)
     expect(after.personas[alpha.key]!.assignments['C0TEST001']!.order).toBe(after.revision)
@@ -89,7 +95,7 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     expect(readSharedState(root)!.pendingIntent).toEqual({ prepared: 'review' })
     expect(readSharedState(root)!.outcomes).toEqual({ prior: 'retained' })
     unsubscribe()
-    authority.assign('alpha', authority.incarnation('alpha')!, 'C0TEST002', 'off', authority.revision)
+    _assignFixture(authority, 'alpha', authority.incarnation('alpha')!, 'C0TEST002', 'off', authority.revision, mint)
     expect(received).toHaveLength(1)
     check(received)
   })
@@ -113,7 +119,7 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     expect(disk.revision).toBe(fault === 'before-rename' ? 1 : 2)
     if (fault === 'before-rename') expect(readFileSync(authority.path)).toEqual(before)
     else {
-      expect(authority.assign('alpha', initial.personas['alpha']!.incarnation, 'C0TEST001', 'off', 1).kind).toBe('unresolved')
+      expect(_assignFixture(authority, 'alpha', initial.personas['alpha']!.incarnation, 'C0TEST001', 'off', 1, mint).kind).toBe('unresolved')
       expect(authority.observeMembership('alpha', initial.personas['alpha']!.incarnation, { event: 'join', identity: 'app', channel: 'C0TEST001', member: true, boundary: 0 }, 1).kind).toBe('unresolved')
       expect(() => authority.previewReviewed(configBytes(edited))).toThrow('unresolved')
       expect(writes).toBe(1)
@@ -126,7 +132,7 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     const authority = makeSharedAuthority(root, input())
     const detached = authority.snapshot(); detached.pendingIntent['outside'] = true; detached.personas['alpha']!.assignments = {}
     authority.subscribe(() => { throw new Error('observer failed') })
-    expect(authority.assign('alpha', authority.incarnation('alpha')!, 'C0TEST001', 'mentions', 1)).toEqual({ kind: 'applied', revision: 2 })
+    expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, 'C0TEST001', 'mentions', 1, mint)).toEqual({ kind: 'applied', revision: 2 })
     expect(authority.snapshot().pendingIntent).toEqual({})
     expect(readSharedState(root)!.revision).toBe(2)
     check(authority.snapshot())
@@ -158,11 +164,11 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     const authority = makeSharedAuthority(root, input())
     const results: unknown[] = []
     authority.subscribe(() => {
-      results.push(authority.assign('alpha', authority.incarnation('alpha')!, 'C0TEST001', 'off', authority.revision))
+      results.push(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, 'C0TEST001', 'off', authority.revision, mint))
     })
     expect(authority.transact(1, next => { next.pendingIntent['omitted'] = undefined })).toEqual({ kind: 'applied', revision: 2 })
     expect(results).toEqual([]) // metadata alone publishes no runtime change
-    expect(authority.assign('alpha', authority.incarnation('alpha')!, 'C0TEST001', 'mentions', 2)).toEqual({ kind: 'applied', revision: 3 })
+    expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, 'C0TEST001', 'mentions', 2, mint)).toEqual({ kind: 'applied', revision: 3 })
     expect(results).toEqual([{ kind: 'stale', revision: 3 }])
     expect(authority.choice('alpha', 'C0TEST001')).toBe('mentions')
     expect(Object.hasOwn(authority.snapshot().pendingIntent, 'omitted')).toBe(false)
@@ -171,15 +177,24 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
   })
 
   test('retiring is adapter-local, rejects the held key and leaves its healthy neighbor writable', () => {
-    const authority = makeSharedAuthority(root, input())
-    const store = createChannelDeliveryStore(authority)
+    const source = input(); source.channel_mode = 'open'
+    const authority = makeSharedAuthority(root, source)
+    for (const key of ['alpha', 'beta']) expect(authority.observeMembership(key, authority.incarnation(key)!, {
+      event: `adapter-${key}-join`, identity: 'authenticated-app', channel: 'C0TEST001', member: true, boundary: 0,
+    }, authority.revision).kind).toBe('applied')
+    const membership = (key: string, channel: string) => authority.personaSnapshot(key)?.membership[channel]?.member === true
+    const store = createChannelDeliveryStore(authority, membership)
     store.beginRetiring(['alpha'])
-    const [alpha, beta] = authority.config().personas
-    expect(store.set('alpha', 'C0TEST001', 'off', channelDeliveryDeclarationOf(alpha!))).toEqual({ kind: 'invalid', field: 'declaration' })
-    expect(store.set('beta', 'C0TEST001', 'mentions', channelDeliveryDeclarationOf(beta!)).kind).toBe('stored')
-    expect(createChannelDeliveryStore(authority).isRetiring('alpha')).toBe(false)
+    const request = deliveryAttempt('retiring-alpha', 'C0TEST001', 'off')
+    const before = authority.snapshot()
+    expect(store.attempt('alpha', authority.incarnation('alpha')!, request, () => undefined)).toEqual({ kind: 'inactive' })
+    expect(authority.snapshot()).toEqual(before)
+    expect(store.attempt('beta', authority.incarnation('beta')!, deliveryAttempt('healthy-beta', request.channel, 'mentions'), () => undefined).kind).toBe('applied')
+    const fresh = createChannelDeliveryStore(authority, membership)
+    expect(fresh.isRetiring('alpha')).toBe(false)
+    expect(fresh.attempt('alpha', authority.incarnation('alpha')!, deliveryAttempt('fresh-alpha', request.channel, request.delivery), () => undefined).kind).toBe('applied')
     store.endRetiring(['alpha'])
-    expect(store.set('alpha', 'C0TEST001', 'off', channelDeliveryDeclarationOf(alpha!)).kind).toBe('stored')
+    expect(store.attempt('alpha', authority.incarnation('alpha')!, request, () => undefined).kind).toBe('applied')
     check(authority.snapshot())
   })
  })
@@ -190,8 +205,8 @@ test('replaying a verified leave preserves a later future preference, while a ne
   const leave = { event: 'verified-leave', identity: 'app', channel: 'C0TEST001', member: false, boundary: 0 }
   expect(authority.observeMembership('alpha', life, leave, authority.revision).kind).toBe('applied')
   const leaveRevision = authority.revision
-  expect(authority.assign('alpha', life, 'C0TEST001', 'thread_hybrid', authority.revision).kind).toBe('applied')
-  expect(authority.assign('alpha', life, 'C0FUTURE1', 'mentions', authority.revision).kind).toBe('applied')
+  expect(_assignFixture(authority, 'alpha', life, 'C0TEST001', 'thread_hybrid', authority.revision, mint).kind).toBe('applied')
+  expect(_assignFixture(authority, 'alpha', life, 'C0FUTURE1', 'mentions', authority.revision, mint).kind).toBe('applied')
   const reopened = createSharedChannelAuthority(authority.path, readSharedState(root)!)
   const before = readFileSync(authority.path)
   expect(reopened.observeMembership('alpha', life, leave, reopened.revision)).toEqual({ kind: 'applied', revision: leaveRevision })
@@ -209,7 +224,7 @@ test('replaying a verified leave preserves a later future preference, while a ne
     durableWriteFileSync(path, bytes)
     throw new DurableWriteUnsyncedError(path, Object.assign(new Error(sentinelInMessage('sync')), { code: 'EIO' }))
   } })
-  expect(unresolved.assign('alpha', life, 'C0FUTURE1', 'off', unresolved.revision).kind).toBe('unresolved')
+  expect(_assignFixture(unresolved, 'alpha', life, 'C0FUTURE1', 'off', unresolved.revision, mint).kind).toBe('unresolved')
   expect(unresolved.observeMembership('alpha', life, leave, unresolved.revision).kind).toBe('unresolved')
   expect(writes).toBe(1)
   check(reopened.snapshot())
@@ -249,7 +264,7 @@ test.each<{ label: string; alter: (state: SharedChannelState) => void }>([
   const life = authority.incarnation('alpha')!
   expect(authority.observeMembership('alpha', life, { event: 'joined', identity: 'app', channel: 'C0TEST001', member: true, boundary: 0 }, authority.revision).kind).toBe('applied')
   expect(authority.observeMembership('alpha', life, { event: 'left', identity: 'app', channel: 'C0TEST001', member: false, boundary: authority.revision }, authority.revision).kind).toBe('applied')
-  expect(authority.assign('alpha', life, 'C0TEST001', 'mentions', authority.revision).kind).toBe('applied')
+  expect(_assignFixture(authority, 'alpha', life, 'C0TEST001', 'mentions', authority.revision, mint).kind).toBe('applied')
   const seed = readSharedState(root)!
   // Object property order is not a source mismatch; exact reviewed bytes stay separate.
   seed.source = Object.fromEntries(Object.entries(seed.source).reverse())
@@ -301,10 +316,10 @@ describe('thread fields in the production format', () => {
     expect(() => parseSharedChannelState(serializeSharedChannelState(state), path)).toThrow(message)
     expect(() => createSharedChannelAuthority(path, state)).toThrow(message)
   }
-  /** alpha's C0TEST001 is `thread_hybrid` by an operator write; beta's stays `all`. */
+  /** Fixture alpha starts hybrid; beta stays all. */
   function hybridSeed() {
     const authority = makeSharedAuthority(root, input())
-    expect(authority.assign('alpha', authority.incarnation('alpha')!, 'C0TEST001', 'thread_hybrid', authority.revision).kind).toBe('applied')
+    expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, 'C0TEST001', 'thread_hybrid', authority.revision, mint).kind).toBe('applied')
     return { authority, seed: readSharedState(root)! }
   }
 
@@ -358,7 +373,7 @@ describe('thread fields in the production format', () => {
     const alias = join(root, 'work-alias'); symlinkSync(persona.working_directory, alias)
     const authority = makeSharedAuthority(root, edited)
     const life = authority.incarnation('alpha')!
-    authority.assign('alpha', life, 'C0TEST001', 'off', authority.revision)
+    _assignFixture(authority, 'alpha', life, 'C0TEST001', 'off', authority.revision, mint)
     persona.working_directory = alias
     expect(authority.applyReviewed(configBytes(edited), authority.revision).kind).toBe('applied')
     expect(authority.incarnation('alpha')).toBe(life)
@@ -368,7 +383,7 @@ describe('thread fields in the production format', () => {
     expect(authority.incarnation('alpha')).not.toBe(life)
     expect(authority.snapshot().retiredIdentities[life]!.key).toBe('alpha')
     const beforeStale = readFileSync(authority.path)
-    expect(authority.assign('alpha', life, 'C0TEST001', 'all', authority.revision).kind).toBe('stale')
+    expect(_assignFixture(authority, 'alpha', life, 'C0TEST001', 'all', authority.revision, mint).kind).toBe('stale')
     expect(readFileSync(authority.path)).toEqual(beforeStale)
     check(authority.snapshot())
   })

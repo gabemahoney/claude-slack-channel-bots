@@ -248,13 +248,17 @@ calls.
 
 ### Layout
 
-```
+See the testing guide's [fixture assignment contract](../docs/testing-guide.md#fixture-assignments) and [membership instructions](../docs/testing-guide.md#membership-fixtures-and-evidence) for shared-authority helpers and production assignment drivers.
+
+```text
 tests/
   fixtures/
     shared-channel-upgrade/       # generated reference-0.18.0, new-baseline, pending-edits and manifest
   test-helpers/
     thread-populations.ts         # deterministic Thread Memory populations and expected bursts
     shared-channel-upgrade.ts     # fixture generator, materializer and command assertions
+    shared-channels.ts            # shared-authority seeds, fixture transactions and membership harness
+    channel-delivery.ts           # declaration/choice projections and shared-envelope seeds
   integration/
     test-1-install-startup.sh # install the package, then check its pinned npm client against the independently pinned runtime, changing nothing (ad-client-check.sh --package),
                                    # then run fixtures/phase1-client-check.ts on the installed package; a pre-persona config fails start; the persona config starts in dry run

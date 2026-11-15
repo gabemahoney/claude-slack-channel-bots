@@ -1,3 +1,4 @@
+import { _assignFixture, fixtureThreadHybridSince } from './test-helpers/shared-channels.ts'
 import { afterEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -680,7 +681,7 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold outage', mode => {
     const authority = run.controller.sharedChannels()!
     const suppressed: SlackEvent[] = []
     for (const delivery of ['off', 'mentions'] as const) {
-      expect(authority.assign('alpha', authority.incarnation('alpha')!, neighbor, delivery, authority.revision).kind).toBe('applied')
+      expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, neighbor, delivery, authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('applied')
       const plain = makeChannelMessage({ channel: neighbor, ts: delivery === 'off' ? '1700000400.000002' : '1700000400.000003' })
       suppressed.push(plain)
       await run.deliver('alpha', plain)
@@ -845,7 +846,7 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold outage', mode => {
     const fact = run.queued('alpha')[0]!.accepted.thread_join!, authority = run.controller.sharedChannels()!
     const before = readFileSync(threadPath(f.h.stateDir))
     f.h.failChannelDeliveryWrites({ step: 'fsyncSync', call: 2 })
-    expect(authority.assign('alpha', authority.incarnation('alpha')!, channel, 'thread_hybrid', authority.revision).kind).toBe('unresolved')
+    expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, channel, 'thread_hybrid', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('unresolved')
     expect(authority.channelStamp('alpha', channel)).toEqual({ kind: 'undecided' })
     io.heal(); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
     expect(run.threadMemory!.outage('alpha')).toEqual({ unknown: false, missing: false, unsaved: 1 })
@@ -879,7 +880,7 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold outage', mode => {
     const reply = await f.intake(run), held = run.queue.unresolvedHolds('alpha')[0]!
     const authority = run.controller.sharedChannels()!
     f.h.failChannelDeliveryWrites({ step: 'fsyncSync', call: 2 })
-    expect(authority.assign('alpha', authority.incarnation('alpha')!, channel, 'thread_hybrid', authority.revision).kind).toBe('unresolved')
+    expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, channel, 'thread_hybrid', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('unresolved')
     io.heal(); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
     expect(run.threadMemory!.outage('alpha')).toEqual({ unknown: false, missing: false, unsaved: 1 })
     expect(run.queue.unresolvedHolds('alpha')).toHaveLength(1)
@@ -998,8 +999,8 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold outage', mode => {
     const third = await f.start({}, undefined, run => {
       const authority = run.controller.sharedChannels()!
       f.h.failChannelDeliveryWrites({ step: 'fsyncSync', call: 2 })
-      expect(authority.assign('alpha', authority.incarnation('alpha')!, channel,
-        stale ? 'mentions' : 'thread_hybrid', authority.revision).kind).toBe('unresolved')
+      expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, channel,
+        stale ? 'mentions' : 'thread_hybrid', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('unresolved')
     })
     expect(third.queue.unresolvedHolds('alpha').map(h => h.seq)).toEqual([held.seq])
     expect(third.heldReleases).toHaveLength(0); expect(third.memoryHoldEvents).toHaveLength(0)
@@ -1081,7 +1082,8 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold outage', mode => {
     await f.drain(first); await first.stop()
     const io = threadFsControls(f.h.stateDir); io.fail('readFileSync', 'alpha')
     const second = await f.start({ threadMemory: { fs: io.fs } }), authority = second.controller.sharedChannels()!
-    const choose = (delivery: 'mentions' | 'thread_hybrid') => expect(authority.assign('alpha', authority.incarnation('alpha')!, channel, delivery, authority.revision).kind).toBe('applied')
+    const fixtureMint = fixtureThreadHybridSince(authority.snapshot())
+    const choose = (delivery: 'mentions' | 'thread_hybrid') => expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, channel, delivery, authority.revision, fixtureMint).kind).toBe('applied')
     if (scenario === 'other stamp') { choose('mentions'); choose('thread_hybrid') }
     const event = await f.intake(second), hold = second.queue.unresolvedHolds('alpha')[0]!
     if (scenario === 'later join') await f.intake(second, 'mention')

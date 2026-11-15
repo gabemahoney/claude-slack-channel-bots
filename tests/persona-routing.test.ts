@@ -1,3 +1,4 @@
+import { _assignFixture, fixtureThreadHybridSince } from './test-helpers/shared-channels.ts'
 /** Durable intake of Slack messages and reactions, and of other personas' react-tool reactions: decision wiring, persona isolation, ack boundary and immutable preparation. */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { SERVER_POST_METADATA } from './test-helpers/server-post.ts'
@@ -61,7 +62,7 @@ function harness(opts: Parameters<typeof makeRoutingHarness>[2] = {}) {
 // Actual shared projection plus explicit current positives for the low-level
 // queue tests. Neither the selector nor the intake algorithm is replaced.
 function selectionInputs(config: ReturnType<typeof makeMultiPersonaConfig>, channels: string[]) {
-  const input = { ...config, personas: config.personas.map(({ key, index, sections, ...p }) => p) }
+  const input = { ...config, personas: config.personas.map(({ key, index, ...p }) => p) }
   const store = createChannelDeliveryStore(makeSharedAuthority(dir, input))
   return { getChannelDelivery: () => store, membership: observedMembership(Object.fromEntries(config.personas.map(p => [p.key, channels]))) }
 }
@@ -1383,12 +1384,12 @@ describe('persona routing and durable dedupe', () => {
 describe('fungible mode', () => {
   test.each([false, true])('paired app mention is ignored in either order and message enters queue once (%p)', async mentionFirst => {
     const h = harness({ mode: 'open', channelDelivery: undefined });
-    const alpha = h.p('alpha').persona; h.channelDelivery!.set(alpha.key, CX, 'mentions', alpha); const message = makeChannelMessage({ channel: CX, text: mentionText(h.p('alpha').stub.identity.botUserId) + ' hello' }); const app = { ...message, type: 'app_mention' }
+    const alpha = h.p('alpha').persona; _assignFixture(h.channelDelivery!.authority, alpha.key, h.channelDelivery!.incarnation(alpha.key)!, CX, 'mentions', h.channelDelivery!.authority.revision, fixtureThreadHybridSince(h.channelDelivery!.authority.snapshot())); const message = makeChannelMessage({ channel: CX, text: mentionText(h.p('alpha').stub.identity.botUserId) + ' hello' }); const app = { ...message, type: 'app_mention' }
     await h.receive(mentionFirst ? app : message, ['alpha']); await h.receive(mentionFirst ? message : app, ['alpha']); expect(facts(h, 'alpha')).toEqual([{ channel: CX, ts: message.ts as string, via: 'mention', text: message.text as string }]); expect(facts(h, 'beta')).toEqual([]); expect(h.heardChannels('alpha')).toEqual(new Set([CX])); expect(h.logs.filter(s => s.includes('persona-invited-channel'))).toHaveLength(1)
   })
   test.each(Object.entries(ENVELOPE_FLAG_FORMS))('envelope flag %s retains decision behavior', async (form, envelope) => {
     const h = harness({ mode: 'open', channelDelivery: undefined });
-    const alpha = h.p('alpha').persona; h.channelDelivery!.set(alpha.key, CX, 'mentions', alpha); const event = makeChannelMessage({ channel: CX, text: mentionText(h.p('alpha').stub.identity.botUserId) + ' hello' }); await h.receive(event, ['alpha'], undefined, envelope)
+    const alpha = h.p('alpha').persona; _assignFixture(h.channelDelivery!.authority, alpha.key, h.channelDelivery!.incarnation(alpha.key)!, CX, 'mentions', h.channelDelivery!.authority.revision, fixtureThreadHybridSince(h.channelDelivery!.authority.snapshot())); const event = makeChannelMessage({ channel: CX, text: mentionText(h.p('alpha').stub.identity.botUserId) + ' hello' }); await h.receive(event, ['alpha'], undefined, envelope)
     expect(h.queued('alpha')).toHaveLength(form === 'false' ? 1 : 0); expect(facts(h, 'beta')).toEqual([])
   })
 })
@@ -1398,7 +1399,7 @@ describe('thread_hybrid without Thread Memory still selects @mentions and Broadc
     const h = makeRoutingHarness([{ name: 'alpha', channels: [{ id: CT, delivery: 'thread_hybrid' }] }], dir, { mode, membership: observedMembership({ alpha: [CT] }), restartDelayS: NEVER_FIRE_RESTART_DELAY_S })
     harnesses.push(h)
     const alpha = h.p('alpha').persona
-    if (mode === 'open') h.channelDelivery!.set(alpha.key, CT, 'thread_hybrid', alpha)
+    if (mode === 'open') _assignFixture(h.channelDelivery!.authority, alpha.key, h.channelDelivery!.incarnation(alpha.key)!, CT, 'thread_hybrid', h.channelDelivery!.authority.revision, fixtureThreadHybridSince(h.channelDelivery!.authority.snapshot()))
     return h
   }
   /** The persona's root @mention is delivered; returns the stub's Web API call count once its preparation settled. */
@@ -2990,7 +2991,7 @@ describe('reaction intake', () => {
     const next = (over: ReactionOverrides = {}) => h.receiveReaction(reaction({ event_ts: ts(++n), ...over }), 'alpha')
     // Alpha serves CX only with a stored choice and verified membership; strict mode also needs it listed (the channels change below).
     const authority = h.channelDelivery!.authority
-    expect(authority.assign(key, authority.incarnation(key)!, CX, 'mentions', authority.revision).kind).toBe('applied')
+    expect(_assignFixture(authority, key, authority.incarnation(key)!, CX, 'mentions', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('applied')
     h.setMode('strict')
     await next()
     h.setMode('open'); await next({ item: { channel: CX } })
@@ -3135,7 +3136,7 @@ describe('reaction intake', () => {
     let csReading: MembershipReading = { kind: 'unresolved', reason: 'current-membership-missing' }
     const h = rh({ mode, membership: { ...verified, read: (key, channel, m) => channel === CS && key === personaKey('alpha') ? csReading : verified.read(key, channel, m) } })
     const key = keyOf(h), authority = h.channelDelivery!.authority
-    expect(authority.assign(key, authority.incarnation(key)!, CA, 'off', authority.revision).kind).toBe('applied')
+    expect(_assignFixture(authority, key, authority.incarnation(key)!, CA, 'off', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('applied')
     await h.receiveReaction(reaction(), 'alpha')
     await h.receiveReaction(reaction({ event_ts: '1700000050.000300', item: { channel: CS } }), 'alpha')
     csReading = { kind: 'ineligible', reason: 'absent' }

@@ -280,7 +280,7 @@ function harness(opts: Parameters<typeof makeConnectionHarness>[2] = {}): Connec
 function managedRouting(h: ConnectionHarness, opts: Parameters<typeof makeManagedRouting>[2] = {}) {
   const config = h.config!
   const store = createChannelDeliveryStore(makeSharedAuthority(dir, {
-    ...config, personas: config.personas.map(({ key, index, sections, ...p }) => p),
+    ...config, personas: config.personas.map(({ key, index, ...p }) => p),
   }))
   const managed = makeManagedRouting(h, dir, {
     getChannelDelivery: () => store,

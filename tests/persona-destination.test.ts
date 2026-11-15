@@ -1033,9 +1033,9 @@ describe('describeDestinationFailureCause (token-safe)', () => {
 describe('one shared destination in strict and open modes', () => {
   test.each(['strict', 'open'] as const)('%s names permission_prompts for channel and DM destinations', async channel_mode => {
     const config = { channel_mode }
-    expect(destinationSettingOf(config)).toBe('permission_prompts')
+    expect(destinationSettingOf()).toBe('permission_prompts')
     const resolver = createPersonaDestinations({ log: line => logs.push(line), clock, getPersonaConfig: () => config })
-    expect(personaDestinationOf(config, C)).toBe(C.permission_prompts)
+    expect(personaDestinationOf(C)).toBe(C.permission_prompts)
     expect(resolver.destinationOf(C)).toBe(C.permission_prompts)
     expect(resolver.destinationOf(A)).toBe('dm')
     expect(dmDestinationRefusal(config, A)).toBeUndefined()

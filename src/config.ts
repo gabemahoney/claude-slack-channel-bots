@@ -535,12 +535,6 @@ export interface PersonaDm {
   contact?: string
 }
 
-/** Original shared channel and permission-destination fields. */
-export interface PersonaSections {
-  channels: unknown
-  permission_prompts: unknown
-}
-
 /** A resolved persona with defaults applied and settings inherited. */
 export interface Persona {
   /** Position of the entry in the file's `personas` array, for `personas[i]` in diagnostics. */
@@ -557,8 +551,6 @@ export interface Persona {
   dm: PersonaDm
   /** Required prompt/notice destination, shared by both modes. */
   permission_prompts: string
-  /** Original shared fields. */
-  sections: PersonaSections
   /**
    * Effective Claude config dir: the per-persona value, else the top-level
    * value, else absent (Claude's own default applies). Absolute.
@@ -1426,10 +1418,6 @@ function parsePersonaEntry(
     channels,
     dm,
     permission_prompts,
-    sections: {
-      channels: raw['channels'],
-      permission_prompts: raw['permission_prompts'],
-    },
     ...(claude_config_dir !== undefined ? { claude_config_dir } : {}),
     stop_hook_bootstrap: (ownStopHook as boolean | undefined) ?? inherited.stop_hook_bootstrap,
     ...(model !== undefined ? { model } : {}),

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, mkdirSync, symlinkSync, readFileSync } from 'node:
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
-import { makeMembershipHarness, membershipPage, readSharedState, writeSharedState, SHARED_CHANNEL_IDS as C, type MembershipHarness, configBytes, channelPopulation, withPreRuleScanRepeats } from './test-helpers/shared-channels.ts'
+import { _assignFixture, deliveryAttempt, makeMembershipHarness, membershipPage, readSharedState, writeSharedState, SHARED_CHANNEL_IDS as C, type MembershipHarness, configBytes, channelPopulation, withPreRuleScanRepeats } from './test-helpers/shared-channels.ts'
 import { makeDeferredWebApiCall, makeDeferredConnect, makeChannelMessage, makeDm } from './test-helpers/slack-stub.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { MEMBERSHIP_REQUEST_TIMEOUT_MS, MEMBERSHIP_ATTEMPT_TIMEOUT_MS, MEMBERSHIP_RETRY_MIN_MS, MEMBERSHIP_RETRY_MAX_MS, MEMBERSHIP_PAGE_LIMIT } from '../src/channel-membership-retry.ts'
@@ -20,6 +20,8 @@ import { membershipScanDiagnostic, MEMBERSHIP_INVENTORY_COMPLETE, MEMBERSHIP_INV
 import { SR8_SHARED_LIST_CHANNELS } from './test-helpers/thread-memory.ts'
 import { spyOnCopies } from './test-helpers/copies.ts'
 import * as sharedChannels from '../src/shared-channels.ts'
+import { makeReloadHarness } from './test-helpers/reload-harness.ts'
+import { buildOperatorAssignment } from '../src/reload-request.ts'
 
 const runs: MembershipHarness[] = [], dirs: string[] = []
 function fixture(opts: Parameters<typeof makeMembershipHarness>[1] = {}, dir = mkdtempSync(join(tmpdir(), 'membership-'))) {
@@ -127,7 +129,7 @@ test.each(['open', 'strict'] as const)('authenticated %s join/leave is durable b
   expect(reading(f).kind).toBe('eligible')
   expect(f.scanner.status('alpha').state).toBe('complete')
   expect(life(f).membershipEvents.EvJOIN).toEqual(joined)
-  expect(f.assign(C.primary, 'off').kind).toBe('applied')
+  expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
   await f.event(true, C.primary, joinEvent)
   expect(life(f).membershipEvents.EvJOIN).toEqual(joined)
   expect(life(f).assignments[C.primary]?.delivery).toBe('off')
@@ -142,7 +144,7 @@ test.each(['open', 'strict'] as const)('authenticated %s join/leave is durable b
   expect(life(f).assignments[C.secondary]?.delivery).toBe('off')
   const boundary = f.membership.lifetime('alpha', C.primary)!
   expect(boundary.leaveBoundary).toBeGreaterThan(0)
-  expect(f.assign(C.primary, 'thread_hybrid').kind).toBe('applied')
+  expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'thread_hybrid', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
   await f.event(false, C.primary, { id: 'EvLEAVE', timestamp: ((f.h.clock.now() + 2) / 1000).toFixed(3) })
   expect(life(f).assignments[C.primary]?.delivery).toBe('thread_hybrid')
   expect(f.membership.lifetime('alpha', C.primary)).toEqual(boundary)
@@ -224,7 +226,7 @@ test('a later recovery write durably protects its unsaved predecessor; idle scan
 
 test('crash after durable handling before socket ack replays one order and honors a precrash leave before startup rejoin', async () => {
   const f = fixture(); await f.start(); await f.event(true)
-  f.assign(C.primary, 'off')
+  _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince)
   f.failWrites(state => state.personas.alpha?.membershipEvidence?.EvCRASH?.state === 'applied')
   const router = f.h.onEvent
   f.h.onEvent = (key, name, payload, provenance) => router(key, name, { ...payload, ack: async () => { throw new Error('disconnected before ack') } }, provenance)
@@ -251,7 +253,7 @@ test.each(['unique-overlap', 'contradictory-id'] as const)('%s history: responsi
   const f = fixture(); await f.start()
   const timestamp = (f.h.clock.now() / 1000).toFixed(3)
   await f.event(true, C.primary, { id: 'EvORIGINAL', timestamp })
-  f.assign(C.primary, 'off')
+  _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince)
   await f.event(false, C.primary, { id: kind === 'contradictory-id' ? 'EvORIGINAL' : 'EvCONFLICT', timestamp })
   expect(reading(f).kind).toBe('unresolved')
   stub(f).script.inventory.push(membershipPage([C.primary]))
@@ -288,7 +290,7 @@ test('pagination includes empty nonterminal pages and public/private membership 
 test.each(['malformed', 'access', 'deadline', 'repeated-cursor'] as const)('%s partial inventory cannot establish absence of historical membership', async kind => {
   const f = fixture(); stub(f).script.inventory.push(membershipPage([C.primary])); await f.start(); await f.scan()
   const inventory = life(f).membershipInventory
-  f.assign(C.primary, 'all')
+  _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'all', f.authority.revision, f.threadHybridSince)
   f.scanner.connectionChanged('alpha')
   stub(f).script.inventory.push(kind === 'malformed' ? { kind: 'ok', result: { channels: undefined } } :
     kind === 'access' ? { kind: 'platform', error: 'missing_scope' } : kind === 'deadline' ? { kind: 'never' } : membershipPage([], 'again'))
@@ -305,11 +307,11 @@ test.each(['malformed', 'access', 'deadline', 'repeated-cursor'] as const)('%s p
 
 test.each(['off', 'mentions', 'all', 'thread_hybrid'] as const)('complete absence removes historical %s once; fresh future assignment survives repeated absence and restart', async delivery => {
   const f = fixture(); stub(f).script.inventory.push(membershipPage([C.primary])); await f.start(); await f.scan()
-  f.assign(C.primary, delivery)
+  _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, delivery, f.authority.revision, f.threadHybridSince)
   f.scanner.connectionChanged('alpha'); await f.h.clock.advance(MEMBERSHIP_RETRY_MIN_MS)
   expect(life(f).assignments[C.primary]).toBeUndefined()
   const leave = life(f).leaves[C.primary]
-  f.assign(C.primary, delivery)
+  _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, delivery, f.authority.revision, f.threadHybridSince)
   f.scanner.request('alpha'); await f.h.clock.advance(MEMBERSHIP_RETRY_MIN_MS)
   expect(life(f).assignments[C.primary]?.delivery).toBe(delivery)
   expect(life(f).leaves[C.primary]).toEqual(leave)
@@ -593,7 +595,7 @@ test('message routed from real socket cannot supply missing membership or wait f
 })
 
 test('same-installation replacement preserves preference but requires new discovery and rejects stale issuing provenance', async () => {
-  const f = fixture(); stub(f).script.inventory.push(membershipPage([C.primary])); await f.start(); await f.scan(); f.assign(C.primary, 'off')
+  const f = fixture(); stub(f).script.inventory.push(membershipPage([C.primary])); await f.start(); await f.scan(); _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince)
   const { PersonaSlackTokens } = await import('../src/persona-credentials.ts')
   const { fakeToken, BOT_TOKEN_PREFIX, APP_TOKEN_PREFIX, LEAK_SENTINEL } = await import('./test-helpers/credentials.ts')
   const tokens = new PersonaSlackTokens(fakeToken(BOT_TOKEN_PREFIX, 'replacement'), fakeToken(APP_TOKEN_PREFIX, 'replacement'))
@@ -640,7 +642,7 @@ test('metadata validation hang stays inside the manager deadline; late completio
 })
 
 test.each(['same', 'foreign'] as const)('%s installation candidate socket cannot mutate assignments before credential swap', async installation => {
-  const f = fixture(); stub(f).script.inventory.push(membershipPage([C.primary])); await f.start(); await f.scan(); f.assign(C.primary, 'off')
+  const f = fixture(); stub(f).script.inventory.push(membershipPage([C.primary])); await f.start(); await f.scan(); _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince)
   const { PersonaSlackTokens } = await import('../src/persona-credentials.ts')
   const { fakeToken, BOT_TOKEN_PREFIX, APP_TOKEN_PREFIX, LEAK_SENTINEL } = await import('./test-helpers/credentials.ts')
   const tokens = new PersonaSlackTokens(fakeToken(BOT_TOKEN_PREFIX, 'candidate'), fakeToken(APP_TOKEN_PREFIX, 'candidate'))
@@ -659,7 +661,7 @@ test.each(['same', 'foreign'] as const)('%s installation candidate socket cannot
 })
 
 test('unevidenced downtime leave/rejoin does not invent a reset; current inventory revalidates the retained preference', async () => {
-  const f = fixture(); stub(f).script.inventory.push(membershipPage([C.primary])); await f.start(); await f.scan(); f.assign(C.primary, 'thread_hybrid')
+  const f = fixture(); stub(f).script.inventory.push(membershipPage([C.primary])); await f.start(); await f.scan(); _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'thread_hybrid', f.authority.revision, f.threadHybridSince)
   const boundary = f.membership.lifetime('alpha', C.primary)
   await f.close()
   const reopened = fixture({ reopen: true }, f.stateDir)
@@ -697,7 +699,7 @@ test.each([
     await payload.ack(...args)
   } }, provenance)
   await first()
-  f.assign(C.primary, 'off')
+  _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince)
   const initialLeave = life(f).leaves[C.primary]
   await second()
   expect(stub(f).socket.acks).toHaveLength(2)
@@ -782,7 +784,7 @@ test.each(['join-leave', 'leave-join'] as const)('source regression: %s overlap 
   const leaveEvent = { id: 'EvCRASHLEAVE', event: { event_ts: undefined }, envelope: { event_time: seconds } }
   const firstMember = direction === 'join-leave'
   await f.event(firstMember, C.primary, firstMember ? joinEvent : leaveEvent)
-  f.assign(C.primary, 'off')
+  _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince)
   const secondId = firstMember ? leaveEvent.id : joinEvent.id
   const secondEvent = firstMember ? leaveEvent : joinEvent
   f.failWrites(() => true)
@@ -826,7 +828,7 @@ test.each(['join-leave', 'leave-join'] as const)('source regression: %s overlap 
   expect(life(reopened).leaves[C.primary]).toEqual(leave)
   expect(life(reopened).assignments[C.primary]?.delivery).toBe(firstMember ? 'mentions' : 'off')
   expect(life(reopened).membershipEvents[secondId]).toEqual(event)
-  reopened.assign(C.primary, 'thread_hybrid')
+  _assignFixture(reopened.authority, 'alpha', reopened.authority.incarnation('alpha')!, C.primary, 'thread_hybrid', reopened.authority.revision, reopened.threadHybridSince)
   const beforeReplay = reopened.authority.snapshot()
   await reopened.event(!firstMember, C.primary, secondEvent)
   expect(stub(reopened).socket.acks).toHaveLength(1)
@@ -837,7 +839,7 @@ test('source regression: repeated absence persists its watermark across restart 
   const f = fixture(); await f.start()
   await f.event(false, C.primary, { id: 'EvABSENT' })
   const leave = life(f).leaves[C.primary]
-  f.assign(C.primary, 'thread_hybrid')
+  _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'thread_hybrid', f.authority.revision, f.threadHybridSince)
   await f.scan()
   expect(f.scanner.status('alpha').state).toBe('complete')
   const oldThrough = life(f).membership[C.primary]!.observedThrough!
@@ -878,7 +880,7 @@ test.each([['running', true], ['restarted', true], ['running', false], ['restart
   expect(life(f).membership[C.primary]).toBeUndefined()
   expect(reading(f)).toEqual({ kind: 'ineligible', reason: 'absent' })
   const historical = { id: 'EvBEFOREFUTURE', timestamp: ((f.h.clock.now() - 1000) / 1000).toFixed(3) }
-  expect(f.assign(C.primary, 'off').kind).toBe('applied')
+  expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
   const future = life(f).assignments[C.primary]
   const cutoff = life(f).membershipInventory!
   expect(cutoff).toBeDefined()
@@ -969,7 +971,7 @@ test.each([['open', false], ['strict', false], ['open', true], ['strict', true]]
   const nextMode = mode === 'open' ? 'strict' : 'open'
   const source = { ...f.authority.snapshot().source, channel_mode: nextMode }
   expect(f.authority.applyReviewed(configBytes(source), f.authority.revision).kind).toBe('applied')
-  if (explicit) expect(f.assign(C.primary, 'off').kind).toBe('applied')
+  if (explicit) expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
   const choice = life(f).assignments[C.primary]
   f.failWrites(() => false)
   stub(f).script.inventory.push(membershipPage([C.primary])); await f.h.clock.advanceTo(f.scanner.status('alpha').nextAttemptAt!)
@@ -995,7 +997,7 @@ test('inventory commit failure cannot publish completeness or a cutoff; reopen r
   await reopened.scan()
   expect(reopened.scanner.status('alpha').state).toBe('complete')
   expect(readSharedState(reopened.stateDir)!.personas.alpha!.membershipInventory).toEqual(life(reopened).membershipInventory)
-  reopened.assign(C.primary, 'off')
+  _assignFixture(reopened.authority, 'alpha', reopened.authority.incarnation('alpha')!, C.primary, 'off', reopened.authority.revision, reopened.threadHybridSince)
   const future = life(reopened).assignments[C.primary]
   await reopened.event(true, C.primary, { id: 'EvAFTERCUTOFF' })
   expect(life(reopened).membershipEvents.EvAFTERCUTOFF?.member).toBe(true)
@@ -1006,7 +1008,7 @@ test('inventory commit failure cannot publish completeness or a cutoff; reopen r
   const leave = { id: 'EvAFTERCUTOFFLEAVE', timestamp: ((reopened.h.clock.now() + 1) / 1000).toFixed(3) }
   await reopened.event(false, C.primary, leave)
   expect(life(reopened).assignments[C.primary]).toBeUndefined()
-  reopened.assign(C.primary, 'off')
+  _assignFixture(reopened.authority, 'alpha', reopened.authority.incarnation('alpha')!, C.primary, 'off', reopened.authority.revision, reopened.threadHybridSince)
   const afterLeave = reopened.authority.snapshot()
   await reopened.event(false, C.primary, leave)
   expect(reopened.authority.snapshot()).toEqual(afterLeave)
@@ -1079,7 +1081,7 @@ test('a replacement installation and a reviewed incarnation reset cannot borrow 
 })
 
 test('coarse leave overlapping complete inventory cannot erase a later future preference, including reopen and replay', async () => {
-  const f = fixture({ startTime: 1_700_000_000_500 }); await f.start(); await f.scan(); f.assign(C.primary, 'off')
+  const f = fixture({ startTime: 1_700_000_000_500 }); await f.start(); await f.scan(); _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince)
   const choice = life(f).assignments[C.primary]
   const event = { id: 'EvCUTOFFOVERLAP', event: { event_ts: undefined }, envelope: { event_time: Math.floor(f.h.clock.now() / 1000) } }
   const router = f.h.onEvent
@@ -1221,7 +1223,7 @@ test.each(['running', 'restarted'] as const)('source review 3: %s future choice 
   stub(f).script.inventory.push(held.outcome); await f.start(); await f.scan()
   const start = f.h.clock.now(), scanRevision = f.authority.revision
   await f.h.clock.advance(1000)
-  expect(f.assign(C.primary, 'off').kind).toBe('applied')
+  expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
   const choice = life(f).assignments[C.primary]
   held.settle(membershipPage([])); await f.h.clock.flush()
   expect(f.scanner.status('alpha').state).toBe('complete')
@@ -1241,7 +1243,7 @@ test.each(['running', 'restarted'] as const)('source review 3: %s future choice 
 })
 
 test('source review 3: eligibility-incomplete inventory preserves absent historical choices and only releases independently verified positives', async () => {
-  const f = fixture(); stub(f).script.inventory.push(membershipPage([C.primary])); await f.start(); await f.scan(); f.assign(C.primary, 'off')
+  const f = fixture(); stub(f).script.inventory.push(membershipPage([C.primary])); await f.start(); await f.scan(); _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince)
   const before = life(f)
   f.scanner.connectionChanged('alpha')
   stub(f).script.inventory.push(membershipPage([C.secondary, { id: C.private }]))
@@ -1263,7 +1265,7 @@ test('source review 3: eligibility-incomplete inventory preserves absent histori
 
 test('held pages and failed final commit never partially publish absence; reopen retains both prior choices until a successful complete scan', async () => {
   const f = fixture(); stub(f).script.inventory.push(membershipPage([C.primary, C.private])); await f.start(); await f.scan()
-  f.assign(C.primary, 'off'); f.assign(C.private, 'thread_hybrid')
+  _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince); _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.private, 'thread_hybrid', f.authority.revision, f.threadHybridSince)
   const prior = life(f), final = makeDeferredWebApiCall()
   f.scanner.connectionChanged('alpha')
   stub(f).script.inventory.push(membershipPage([C.secondary], 'final'), final.outcome)
@@ -1305,7 +1307,7 @@ test('held pages and failed final commit never partially publish absence; reopen
 
 test.each(['held-history', 'malformed-page'] as const)('%s prevents unrelated historical absences while a valid independent positive progresses', async problem => {
   const f = fixture(); stub(f).script.inventory.push(membershipPage([C.primary, C.private])); await f.start(); await f.scan()
-  f.assign(C.primary, 'off'); f.assign(C.private, 'thread_hybrid')
+  _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince); _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.private, 'thread_hybrid', f.authority.revision, f.threadHybridSince)
   if (problem === 'held-history') {
     await f.event(true, 'C0HELD', { id: 'EvCOLLISION' })
     await f.event(false, 'C0HELD', { id: 'EvCOLLISION', timestamp: ((f.h.clock.now() + 2) / 1000).toFixed(3) })
@@ -1329,7 +1331,7 @@ test.each(['held-history', 'malformed-page'] as const)('%s prevents unrelated hi
 })
 
 test.each(['present', 'absent'] as const)('missing eligibility creates no historical effect and a valid %s inventory clears its local hold', async result => {
-  const f = fixture(); f.assign(C.primary, 'off')
+  const f = fixture(); _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince)
   const before = life(f)
   stub(f).script.inventory.push(membershipPage([{ id: C.primary }]))
   await f.start(); await f.scan()
@@ -1349,7 +1351,7 @@ test.each(['present', 'absent'] as const)('missing eligibility creates no histor
 
 test.each(['before-rename', 'after-rename'] as const)('%s final failure keeps negative conflict recovery, both absences and cutoff in one batch across reopen', async failure => {
   const f = fixture(); stub(f).script.inventory.push(membershipPage([C.primary, C.private])); await f.start(); await f.scan()
-  f.assign(C.primary, 'off'); f.assign(C.private, 'thread_hybrid')
+  _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince); _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.private, 'thread_hybrid', f.authority.revision, f.threadHybridSince)
   const timestamp = ((f.h.clock.now() + 1) / 1000).toFixed(3)
   await f.event(true, C.primary, { id: 'EvBATCHJOIN', timestamp })
   await f.event(false, C.primary, { id: 'EvBATCHLEAVE', timestamp })
@@ -1400,7 +1402,7 @@ test.each(['before-rename', 'after-rename'] as const)('%s final failure keeps ne
     expect(reading(reopened, channel)).toEqual({ kind: 'ineligible', reason: 'absent' })
   }
   const boundary = life(reopened).leaves[C.primary]
-  reopened.assign(C.primary, 'off')
+  _assignFixture(reopened.authority, 'alpha', reopened.authority.incarnation('alpha')!, C.primary, 'off', reopened.authority.revision, reopened.threadHybridSince)
   await reopened.event(false, C.primary, { id: 'EvBATCHLEAVE', timestamp })
   expect(life(reopened).assignments[C.primary]?.delivery).toBe('off')
   expect(life(reopened).leaves[C.primary]).toEqual(boundary)
@@ -1408,7 +1410,7 @@ test.each(['before-rename', 'after-rename'] as const)('%s final failure keeps ne
 
 test('a stale later completion boundary rolls back the already staged first absence and a valid scan can still complete', async () => {
   const f = fixture(); stub(f).script.inventory.push(membershipPage([C.primary, C.private])); await f.start(); await f.scan()
-  f.assign(C.primary, 'off'); f.assign(C.private, 'thread_hybrid')
+  _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince); _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.private, 'thread_hybrid', f.authority.revision, f.threadHybridSince)
   const before = f.authority.snapshot(), writes = f.writes.length
   const result = f.membership.commitInventory(f.membership.generation('alpha')!, {
     scanId: 'stale-later-boundary', observedThrough: ((f.h.clock.now() + 1) / 1000).toFixed(3), observedRevision: f.authority.revision,
@@ -1432,7 +1434,7 @@ test.each([
 ] as const)('source review 5: held %s page cannot erase a newer explicit %s choice at completion, retry or restart', async (page, delivery) => {
   const f = fixture(), held = makeDeferredWebApiCall()
   stub(f).script.inventory.push(membershipPage([C.primary, C.private])); await f.start(); await f.scan()
-  expect(f.assign(C.primary, 'all').kind).toBe('applied')
+  expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'all', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
   const prior = life(f)
   const startRevision = f.authority.revision
   f.scanner.connectionChanged('alpha')
@@ -1440,7 +1442,7 @@ test.each([
   await f.h.clock.advance(MEMBERSHIP_RETRY_MIN_MS)
   expect(stub(f).calls.inventory).toHaveLength(page === 'first' ? 2 : 3)
   expect(f.scanner.status('alpha').state).not.toBe('complete')
-  expect(f.assign(C.primary, delivery).kind).toBe('applied')
+  expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, delivery, f.authority.revision, f.threadHybridSince).kind).toBe('applied')
   const choice = life(f).assignments[C.primary]!
   expect(choice.order).toBeGreaterThan(startRevision)
   held.settle(membershipPage(page === 'first' ? [C.secondary] : [])); await f.h.clock.flush()
@@ -1496,7 +1498,7 @@ test.each([true, false])('unsaved absence conflict and live member=%p persist to
   stub(f).script.inventory.push(membershipPage([C.primary])); await f.start(); await f.scan()
   f.scanner.connectionChanged('alpha'); stub(f).script.inventory.push(held.outcome)
   await f.h.clock.advance(MEMBERSHIP_RETRY_MIN_MS)
-  expect(f.assign(C.primary, 'off').kind).toBe('applied')
+  expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
   const before = readSharedState(f.stateDir)!, prior = before.personas.alpha!
   f.failWrites(() => true)
   held.settle(membershipPage([])); await f.h.clock.flush()
@@ -1558,8 +1560,8 @@ test.each(['before-rename', 'after-rename'] as const)('%s two-conflict batch pre
   f.scanner.connectionChanged('alpha'); stub(f).script.inventory.push(held.outcome)
   await f.h.clock.advance(MEMBERSHIP_RETRY_MIN_MS)
   const observedThrough = (f.h.clock.now() / 1000).toFixed(3)
-  expect(f.assign(C.primary, 'off').kind).toBe('applied')
-  expect(f.assign(C.private, 'thread_hybrid').kind).toBe('applied')
+  expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
+  expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.private, 'thread_hybrid', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
   const before = f.authority.snapshot(), prior = before.personas.alpha!, writes = f.writes.length
   f.failWrites(state => {
     if (!state.personas.alpha!.membershipAbsenceConflicts) return false
@@ -1609,7 +1611,7 @@ test('absence-conflict write failure protects the choice until idle persistence;
   const prior = life(f)
   f.scanner.connectionChanged('alpha'); stub(f).script.inventory.push(held.outcome)
   await f.h.clock.advance(MEMBERSHIP_RETRY_MIN_MS)
-  expect(f.assign(C.primary, 'off').kind).toBe('applied')
+  expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
   const choice = life(f).assignments[C.primary]!, before = readSharedState(f.stateDir)!
   f.failWrites(state => !!state.personas.alpha!.membershipAbsenceConflicts?.[C.primary])
   held.settle(membershipPage([])); await f.h.clock.flush()
@@ -1670,7 +1672,7 @@ test('source review 4: immediate undurable leave retry preserves newer off befor
   expect(readSharedState(f.stateDir)).toEqual(before)
   expect(readSharedState(f.stateDir)!.personas.alpha!.membershipEvidence?.[event.id]).toBeUndefined()
   f.failWrites(() => false)
-  expect(f.assign(C.primary, 'off').kind).toBe('applied')
+  expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
   const choice = life(f).assignments[C.primary]!
   expect(choice.delivery).toBe('off'); expect(choice.order).toBeGreaterThan(observedRevision)
   expect(readSharedState(f.stateDir)!.personas.alpha!.membershipEvidence?.[event.id]).toBeUndefined()
@@ -1714,7 +1716,7 @@ test.each(['both-writes', 'effect-only'] as const)('source review 4: leave retry
   expect(stub(f).socket.acks).toHaveLength(failure === 'both-writes' ? 0 : 1)
   expect(reading(f).kind).toBe('unresolved')
   f.failWrites(() => false)
-  expect(f.assign(C.primary, 'off').kind).toBe('applied')
+  expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
   const choice = life(f).assignments[C.primary]
   // Idle recovery must retain the original anchors even before Slack retries.
   // No later inventory may reinterpret receipt time as application time.
@@ -1886,7 +1888,7 @@ test.each(['cross-channel', 'same-time', 'newer-choice'] as const)('later leave 
   if (guard === 'newer-choice') f.failWrites(s => !!s.personas.alpha!.membershipEvents.EvLATERLEAVE)
   await f.event(false, channel, { id: 'EvLATERLEAVE', timestamp: time(guard === 'same-time' ? 10 : 20) })
   if (guard === 'newer-choice') {
-    f.failWrites(() => false); expect(f.assign(channel, 'mentions').kind).toBe('applied')
+    f.failWrites(() => false); expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, channel, 'mentions', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
     expect(f.membership.recover('alpha')).toBe(false)
   }
   expect(f.authority.choice('alpha', channel)).toBe(guard === 'newer-choice' ? 'mentions' : 'all')
@@ -1912,7 +1914,7 @@ test.each(['strict', 'open'] as const)('%s affected uncertain choice holds socke
       writeSharedState(f.stateDir, state)
       throw new DurableWriteUnsyncedError(f.authority.path, { code: 'EIO' })
     })
-    expect(f.assign(C.primary, 'off').kind).toBe('unresolved')
+    expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince).kind).toBe('unresolved')
     expect(choices.readableFor('alpha', C.primary)).toBe(false)
     const held = makeChannelMessage({ channel: C.primary, text: 'held before durable recovery', ts: '1700000003.000001' })
     for (let retry = 0; retry < 2; retry++) await stub(f).socket.deliver(held)
@@ -1964,7 +1966,7 @@ test.each(['positives', 'mid-page recovery'] as const)('a page of %s is durably 
     if (kind === 'mid-page recovery') {
       const timestamp = (f.h.clock.now() / 1000).toFixed(3)
       await f.event(true, C.primary, { id: 'EvOVERLAPJOIN', timestamp })
-      f.assign(C.primary, 'off')
+      _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince)
       await f.event(false, C.primary, { id: 'EvOVERLAPLEAVE', timestamp })
       expect(reading(f).kind).toBe('unresolved')
     }
@@ -2224,7 +2226,7 @@ test.each<[string, (f: MembershipHarness) => Promise<MembershipHarness>, string[
     stub(f).script.inventory.push(membershipPage([C.primary])); await f.scan()
     f.scanner.connectionChanged('alpha'); stub(f).script.inventory.push(held.outcome)
     await f.h.clock.advance(MEMBERSHIP_RETRY_MIN_MS)
-    expect(f.assign(C.primary, 'off').kind).toBe('applied')
+    expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
     f.failWrites(() => true)
     held.settle(membershipPage([])); await f.h.clock.flush()
     expect(life(f).membershipAbsenceConflicts).toBeUndefined()
@@ -2235,7 +2237,7 @@ test.each<[string, (f: MembershipHarness) => Promise<MembershipHarness>, string[
     stub(f).script.inventory.push(membershipPage([C.primary])); await f.scan()
     f.scanner.connectionChanged('alpha'); stub(f).script.inventory.push(held.outcome)
     await f.h.clock.advance(MEMBERSHIP_RETRY_MIN_MS)
-    expect(f.assign(C.primary, 'off').kind).toBe('applied')
+    expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
     held.settle(membershipPage([])); await f.h.clock.flush()
     expect(life(f).membershipAbsenceConflicts?.[C.primary]).toBeDefined()
     return f
@@ -2407,7 +2409,7 @@ async function membershipHistory(f: MembershipHarness) {
   const held = makeDeferredWebApiCall()
   f.scanner.connectionChanged('alpha'); stub(f).script.inventory.push(held.outcome)
   await f.h.clock.advance(MEMBERSHIP_RETRY_MIN_MS)
-  f.assign(C.primary, 'off')
+  _assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince)
   held.settle(membershipPage([])); await f.h.clock.flush()
 }
 test('a membership history commits as whole-state transactions would: writes, lines, acknowledgements and state', async () => {
@@ -2541,7 +2543,7 @@ test.each(['scan positives', 'scan absences', 'live event', 'reviewed absence re
     // neither write changes the history.
     const held = makeDeferredWebApiCall()
     stub(f).script.inventory.push(held.outcome); await f.scan()
-    expect(f.assign(C.primary, 'off').kind).toBe('applied')
+    expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'off', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
     held.settle(membershipPage([])); await f.h.clock.flush()
     const binding = absenceReplacementBinding(f.authority.snapshot(), 'alpha', C.primary)!
     expect(f.authority.applyReviewed(f.authority.sourceBytes(), f.authority.revision, [{ key: 'alpha', channel: C.primary, delivery: 'all',
@@ -2599,7 +2601,7 @@ test('with superseded repeats dropped, live and scan leaves, a removed destinati
   await replay()
   // A future destination choice stays inactive and retained through replay,
   // repeated complete absence and restart, with no second removal or order.
-  expect(f.assign(C.primary, 'mentions').kind).toBe('applied')
+  expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.primary, 'mentions', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
   const future = life(f).assignments[C.primary]
   await replay()
   const afterLeave = (current: MembershipHarness) => {
@@ -2634,7 +2636,7 @@ test('with superseded repeats dropped, live and scan leaves, a removed destinati
   expect(scanLeave.event).toMatch(/^scan:[^:]+:absent:C0LARGE00000$/)
   expect(life(f).membershipEvents[scanLeave.event]).toMatchObject({ member: false, order: scanLeave.boundary, boundary: scanLeave.boundary })
   expect(life(f).assignments[historical]).toBeUndefined()
-  expect(f.assign(historical, 'thread_hybrid').kind).toBe('applied')
+  expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, historical, 'thread_hybrid', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
   const later = life(f).assignments[historical]
   for (let i = 0; i < 2; i++) {
     await reconcile(f, [C.secondary])
@@ -2658,6 +2660,101 @@ test('with superseded repeats dropped, live and scan leaves, a removed destinati
   expect(readSharedState(f.stateDir)).toEqual(f.authority.snapshot())
 })
 
+test.each(['bot', 'operator'] as const)('held production collection binds a newer %s assignment and retains conflict/replacement history while dropping superseded repeats', async origin => {
+  const h = makeReloadHarness(), held = makeDeferredWebApiCall()
+  const alpha = h.persona('alpha', { channels: [{ id: C.primary, delivery: 'all' }, { id: C.secondary, delivery: 'mentions' }], permission_prompts: C.primary })
+  h.materialize(alpha); h.writeConfig({ channel_mode: 'open', personas: [alpha] })
+  const run = await h.startDetecting({ dryRun: false, slack: { alpha: { inventory: [membershipPage([C.primary, C.secondary])] } } })
+  try {
+    const authority = run.controller.sharedChannels()!, key = 'alpha', channel = C.secondary
+    const current = () => authority.snapshot().personas[key]!
+    const scan = async (channels: string[]) => {
+      run.currentStub(key).script.inventory.push(membershipPage(channels))
+      run.membershipScanner.request(key)
+      await run.membershipClock.advanceTo(run.membershipScanner.status(key).nextAttemptAt!)
+      await run.membershipClock.flush()
+      expectRepeatsBounded(current())
+    }
+    await run.membershipClock.runNext(); await run.membershipClock.flush()
+    expect(authority.config().channel_mode).toBe('open')
+    expect(run.channelDelivery.authority).toBe(authority)
+    expect(run.membership.read(key, channel, 'open').kind).toBe('eligible')
+    await scan([C.primary, channel]); const before = current()
+    const beginning = scanRecords(before).get(channel)![0]!, oldRepeat = scanRecords(before).get(C.primary)![1]!
+    expect(scanRecords(before).get(channel)).toHaveLength(2)
+    run.currentStub(key).script.inventory.push(held.outcome)
+    run.membershipScanner.request(key)
+    await run.membershipClock.advanceTo(run.membershipScanner.status(key).nextAttemptAt!)
+    expect(run.membershipScanner.status(key).state).toBe('scanning')
+    const observedRevision = authority.revision, boundary = current().membership[channel]!.boundary
+    const incarnation = authority.incarnation(key)!
+    const apply = async (delivery: 'off' | 'all', absenceReplacement?: string) => {
+      const before = current(), cp = run.checkpoint(), timeline = run.lifecycle.timeline.length
+      run.request('request', [buildOperatorAssignment(authority.config().personas[0]!, incarnation, channel, delivery, absenceReplacement)])
+      await run.ticks.tick(); expect(h.readPending()).toBeDefined(); assertNoLeak(run.captured())
+      const preview = current()
+      expect(preview.assignments).toEqual(before.assignments)
+      expect(preview.membershipAbsenceConflicts).toEqual(before.membershipAbsenceConflicts)
+      expect(preview.replacedAbsences).toEqual(before.replacedAbsences)
+      expect(preview.leaves).toEqual(before.leaves)
+      expect(run.since(cp).lifecycle).toEqual([])
+      expect(run.lifecycle.timeline.slice(timeline)).toEqual([])
+      h.confirm(); await run.ticks.tick()
+      expect(current().assignments[channel]?.delivery).toBe(delivery)
+      expect(current().assignments[channel]!.order).toBeGreaterThan(before.assignments[channel]!.order)
+      expect(run.since(cp).lifecycle).toEqual([{ op: 'update-in-place', key, via: 'apply', settings: ['delivery'] }])
+      expect(run.lifecycle.timeline.slice(timeline)).toEqual([
+        { op: 'update-in-place', key, phase: 'start' },
+        { op: 'update-in-place', key, phase: 'settled' },
+      ])
+    }
+    if (origin === 'bot') {
+      const request = deliveryAttempt('held-bot', channel, 'off')
+      const result = run.channelDelivery.attempt(key, incarnation, request, () => undefined)
+      expect(result).toMatchObject({ kind: 'applied', historical: false, outcome: { key, incarnation, channel, delivery: 'off' } })
+      expect(run.channelDelivery.lookupAttempt(key, incarnation, request)).toMatchObject({ kind: 'applied', historical: true })
+      expect(authority.revision).toBe(observedRevision + 2)
+    } else await apply('off')
+    const choice = current().assignments[channel]!
+    expect(choice.order).toBeGreaterThan(observedRevision)
+    expect(held.settled).toBe(false)
+    expect(run.membershipScanner.status(key).state).toBe('scanning')
+    held.settle(membershipPage([C.primary])); await run.membershipClock.flush()
+    const conflict = current().membershipAbsenceConflicts![channel]!
+    expect(conflict).toEqual({ identity: before.membership[channel]!.identity, boundary,
+      observedThrough: conflict.observedThrough, observedRevision, assignmentOrder: choice.order, recordedOrder: authority.revision })
+    expect(conflict.recordedOrder).toBeGreaterThan(choice.order)
+    expect([run.membership.read(key, channel, 'open'), current().assignments[channel]])
+      .toEqual([{ kind: 'unresolved', reason: 'history-unresolved' }, choice])
+    expect(current().membershipEvents[beginning]).toEqual(before.membershipEvents[beginning])
+    expect(current().membershipEvents[oldRepeat]).toBeUndefined()
+    for (let i = 0; i < 2; i++) {
+      await scan([C.primary])
+      expect(current().membershipAbsenceConflicts![channel]).toEqual(conflict)
+      expect(current().assignments[channel]).toEqual(choice)
+    }
+    const binding = absenceReplacementBinding(authority.snapshot(), key, channel)!
+    await apply('all', binding)
+    const replaced = current(), replacement = replaced.replacedAbsences![binding]!, leave = replaced.leaves[channel]!
+    expect([replacement.conflict, replacement.assignmentOrder, leave.event])
+      .toEqual([conflict, replaced.assignments[channel]!.order, `reviewed-absence:${binding}`])
+    for (let i = 0; i < 2; i++) {
+      await scan([C.primary])
+      expect(current().replacedAbsences![binding]).toEqual(replacement)
+      expect(current().leaves[channel]).toEqual(leave)
+      expect(current().membershipEvents[beginning]).toEqual(before.membershipEvents[beginning])
+      expect(current().assignments[channel]).toEqual(replaced.assignments[channel])
+      expect(run.membership.read(key, channel, 'open')).toEqual({ kind: 'ineligible', reason: 'absent' })
+    }
+    expect(run.controller.sharedChannels()).toBe(authority)
+    expect(parseSharedChannelState(h.readRecord()!, authority.path)).toEqual(authority.snapshot())
+    expect(run.slackPosts()).toEqual([]); assertNoLeak(run.captured())
+  } finally {
+    if (!held.settled) held.settle(membershipPage([]))
+    await run.stop(); await h.cleanup()
+  }
+})
+
 test('with superseded repeats dropped, unresolved and superseded live evidence, collection races, a reviewed absence replacement and an identity replacement keep AC-J09 results and order', async () => {
   const [joined, verified] = channelPopulation(2).map(c => c.id) as [string, string]
   const listed = [C.primary, C.secondary, joined]
@@ -2679,7 +2776,7 @@ test('with superseded repeats dropped, unresolved and superseded live evidence, 
   // durable conflict evidence until a reconciliation settles them.
   const timestamp = ((f.h.clock.now() + 1) / 1000).toFixed(3)
   await f.event(true, C.secondary, { id: 'EvOVERLAPJOIN', timestamp })
-  expect(f.assign(C.secondary, 'off').kind).toBe('applied')
+  expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, C.secondary, 'off', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
   await f.event(false, C.secondary, { id: 'EvOVERLAPLEAVE', timestamp })
   expect(life(f).membershipEvidence!.EvOVERLAPLEAVE!.state).toBe('conflict')
   expect(reading(f, C.secondary).kind).toBe('unresolved')
@@ -2714,7 +2811,12 @@ test('with superseded repeats dropped, unresolved and superseded live evidence, 
   stub(f).script.inventory.push(held.outcome); f.scanner.request('alpha'); await f.h.clock.advanceTo(f.scanner.status('alpha').nextAttemptAt!)
   expect(f.scanner.status('alpha').state).toBe('scanning')
   const started = f.authority.revision, boundary = life(f).membership[joined]!.boundary
-  expect(f.assign(joined, 'off').kind).toBe('applied')
+  expect(f.authority.config().channel_mode).toBe('open')
+  expect(reading(f, joined).kind).toBe('eligible')
+  const store = createChannelDeliveryStore(f.authority, (key, channel) => f.membership.read(key, channel, 'open').kind === 'eligible')
+  const assigned = store.attempt('alpha', f.authority.incarnation('alpha')!,
+    deliveryAttempt('held-collection-bot-choice', joined, 'off'), () => undefined)
+  expect(assigned).toMatchObject({ kind: 'applied', historical: false })
   const choice = life(f).assignments[joined]!
   held.settle(membershipPage([C.primary, C.secondary])); await f.h.clock.flush()
   expect(f.scanner.status('alpha')).toMatchObject({ state: 'incomplete', problem: 'history-unresolved' })

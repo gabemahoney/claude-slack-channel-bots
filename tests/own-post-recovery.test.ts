@@ -1,3 +1,4 @@
+import { _assignFixture, fixtureThreadHybridSince } from './test-helpers/shared-channels.ts'
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { SERVER_POST_METADATA } from './test-helpers/server-post.ts'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -29,7 +30,9 @@ let runs: ReloadRun[]
 let releases: Array<() => void>
 let errors: unknown[][], errorSpy: ReturnType<typeof spyOn<typeof console, 'error'>>
 
+let fixtureMint: () => string
 beforeEach(() => {
+  fixtureMint = fixtureThreadHybridSince()
   h = makeReloadHarness({ personaConfigDirs: true }); runs = []; releases = []; sequence = 0
   errors = []; errorSpy = spyOn(console, 'error').mockImplementation((...args) => { errors.push(args) })
   personas = ['alpha', 'bravo'].map(name => h.persona(name, {
@@ -151,9 +154,9 @@ async function crash(run: ReloadRun) {
   expect(run.clock.pendingCount()).toBe(0)
 }
 async function flush(run: ReloadRun) { await run.clock.flush(); await run.threadMemory!.flush('alpha'); await run.clock.flush() }
-function assign(run: ReloadRun, delivery: DeliveryMode, key = 'alpha') {
+function _fixtureChoice(run: ReloadRun, delivery: DeliveryMode, key = 'alpha') {
   const authority = run.controller.sharedChannels()!
-  expect(authority.assign(key, authority.incarnation(key)!, channel, delivery, authority.revision).kind).toBe('applied')
+  expect(_assignFixture(authority, key, authority.incarnation(key)!, channel, delivery, authority.revision, fixtureMint).kind).toBe('applied')
 }
 function expectLoss(run: ReloadRun, cause?: string, threads: string[] = [], key = 'alpha') {
   const events = run.ownPostLookupEvents.filter(e => e.key === key)
@@ -347,7 +350,7 @@ describe.each(['strict', 'open'] as const)('%s own-post crash recovery', mode =>
     setup(mode)
     const first = await start()
     await hungPost(first)
-    assign(first, 'mentions'); assign(first, 'thread_hybrid')
+    _fixtureChoice(first, 'mentions'); _fixtureChoice(first, 'thread_hybrid')
     await crash(first)
     const run = await start()
     await flush(run)
@@ -364,7 +367,7 @@ describe.each(['strict', 'open'] as const)('%s own-post crash recovery', mode =>
     withPages(run, pages(1, undefined, { outcomes: { 0: [late.outcome] } }))
     await unknown(run)
     expect(lookups(run)).toHaveLength(1)
-    assign(run, 'mentions'); assign(run, 'thread_hybrid')
+    _fixtureChoice(run, 'mentions'); _fixtureChoice(run, 'thread_hybrid')
     await flush(run)
     expect(outcomes().map(o => o.outcome)).toEqual(['none'])
     late.settle(); await flush(run)
