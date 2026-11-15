@@ -251,8 +251,9 @@ export interface DeliveryQueueOptions {
   fs?: typeof nodeFs
   setInterval?: typeof globalThis.setInterval
   clearInterval?: typeof globalThis.clearInterval
-  /** Synchronous confirmation that compaction may discard the queue's join copy. */
-  threadJoinSaved?(key: string, channel: string, threadJoin: QueueThreadJoin): boolean
+  /** One synchronous compaction pass's confirmation that its join copies may
+   * be discarded. Construct fresh after preparatory I/O; retention stays lazy. */
+  threadJoinSaved?(key: string): (channel: string, threadJoin: QueueThreadJoin) => boolean
   /** A journal start() didn't load (one unreadable then, or whose repair
    * rewrite failed) has loaded. Called once, inside the turn that loaded or
    * repaired it and before that turn's own work, so it must be synchronous
@@ -718,6 +719,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     await reconcileRollback(pathFor(key), j)
     // The caller's lifetime can end while the repair awaits the disk.
     if (!current()) return
+    const threadJoinSaved = options.threadJoinSaved?.(key)
     const at = now(), retained: QueueRecord[] = []
     const retainedJoinItems = new Set<number>()
     const queuedReminders = new Set(materialize(j).flatMap(item => item.accepted.reminder_for === undefined ? [] : [item.accepted.reminder_for]))
@@ -729,7 +731,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         // Closed content goes; only a fresh key fact stays, unless Thread Memory
         // still needs the join copy. Open items keep their full record, key included.
         const a = item.accepted
-        if (needsThreadJoinCopy(key, a)) {
+        if (a.thread_join !== undefined && threadJoinSaved?.(a.channel!, a.thread_join) !== true) {
           retained.push(...item.records)
           retainedJoinItems.add(a.seq)
         } else if (at - a.received_at < QUEUE_KEY_KEEP_MS) {
@@ -775,9 +777,6 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     const encoded = slackKeyString(slack)
     const r = j.slackKeys.get(encoded)
     return r ? cloneJournalData({ status: 'duplicate' as const, seq: r.seq, item: j.items.get(r.seq) }) : undefined
-  }
-  function needsThreadJoinCopy(key: string, record: AcceptedRecord): boolean {
-    return record.thread_join !== undefined && options.threadJoinSaved?.(key, record.channel!, record.thread_join) !== true
   }
   // --- Group commit of acceptances
   /** Joins the persona's forming group, or queues a new one. A group forms

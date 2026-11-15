@@ -11,6 +11,8 @@ export type MemoryHoldResult = 'resolved' | 'unknown' | 'retrying' | 'cancelled'
 export interface WithdrawnMemoryHold { seq: number; channel: string; thread_ts: string; ts: string }
 export type MemoryHoldEvent =
   | { type: 'resolution-failed'; key: string; error: unknown }
+  /** A nonempty requested batch is durable; detached release feedback can still be pending. */
+  | { type: 'resolution-saved'; key: string }
   | { type: 'withdrawn'; key: string; holds: WithdrawnMemoryHold[] }
   | { type: 'release-failed'; key: string; seq: number; error: unknown }
 
@@ -124,6 +126,13 @@ export function createMemoryHoldResolver(deps: MemoryHoldResolverDeps): MemoryHo
       return 'retrying'
     }
     if (!current(key, life)) return 'cancelled'
+    // An empty/unknown pass proves nothing about an earlier failed append.
+    // Another writer may already have resolved some requested holds: verify
+    // the entire batch, not just this call's newly saved subset.
+    if (decisions.length && !deps.queue.durabilityPending?.(key)) {
+      const remaining = new Set(deps.queue.unresolvedHolds(key).map(hold => hold.seq))
+      if (decisions.every(decision => !remaining.has(decision.seq))) event({ type: 'resolution-saved', key })
+    }
     life.step = 0
     for (const decision of saved) {
       if (!current(key, life)) return 'cancelled'

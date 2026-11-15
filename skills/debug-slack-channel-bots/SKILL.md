@@ -2097,13 +2097,19 @@ at the restart limit alone does not qualify.
 
 A persona with a `thread_hybrid` channel keeps its Joined Threads in its own Thread Memory, `<state dir>/threads/<key>.jsonl`. One seal file, `<state dir>/thread-memory-seal.json`, covers all personas.
 
-Each report goes to the persona's notice destination and to `server.log` as one `[slack]` line, once per episode; the six log-only labels below post nothing and can log again on later failures. Reports carry channel IDs, Thread Roots, message timestamps and paths, never message text or credential values; configured names and paths remain complete except for the *Joins lost* name excerpt described below, safely quoted and Slack-escaped in notices, while untrusted error descriptions are redacted, including paths quoted inside an error.
+The five notice reports below go to the persona's notice destination and to `server.log`; the log-only entries post nothing and add no startup-errors entry. Each entry describes its frequency. Reports carry channel IDs, Thread Roots, message timestamps and paths, never message text or credential values; configured names and paths remain complete except for the *Joins lost* name excerpt described below, safely quoted and Slack-escaped in notices, while untrusted error descriptions are redacted, including paths quoted inside an error.
+
+Compaction, seal-write and hold-resolution failures each log one onset per episode, suppress repeated retry lines, then log one corresponding recovery. Later healthy operations stay silent; recurrence opens a new episode. Changed error text, retry counts or `written_but_not_synced` do not open another episode.
+
+Compaction and hold-resolution episodes are independent per persona; the shared seal's single series uses `persona=all` and survives any persona's teardown, including a persona whose key is `all`. Per-persona teardown silently ends its own episodes; shutdown closes ordinary reporting and late ordinary events remain silent, with the final seal-failure exception described below.
 
 These reports are for the operator: the bot is told not to act on them, even when its notice destination is a channel it reads. During an outage, `off`, `mentions` and `all` channels keep their usual delivery behavior; DMs, other personas, already known Joined Threads, @mentions and Broadcasts keep flowing. The exception is an unparked [Post Hold](#thread-memory-unreadable): everything this persona saves after it waits behind it until Slack answers the bot's post or 3 seconds pass.
 
 Failed saves (creation or append), reads and seal writes retry in the background without new traffic: 5 seconds (`THREAD_MEMORY_RETRY_MIN_MS`), then 10, 20, 40 and at most 60 seconds (`THREAD_MEMORY_RETRY_MAX_MS`) between attempts. A retry does not post a bot message again; teardown or removal cancels that persona's retries, lookups and upload-thread reads and silently ends its open episodes, and a later bring-up starts fresh ones.
 
-A Slack lookup for Thread Memory (a reply's parent or a thread's history) has a 15-second end-to-end deadline per attempt (`THREAD_MEMORY_LOOKUP_DEADLINE_MS`), covering queued and in-flight HTTP work; the Web client makes no retries of its own, so nothing extends it. A failed attempt retries with the same spacing, waiting longer whenever Slack's `Retry-After` asks for more, even beyond 60 seconds; long waits are chained in timers of at most `MAX_TIMER_DELAY_MS` and never end early. There is no overall bound: a lookup retries until Slack answers it or what it serves changes (the persona's connection or the channel's state), and an answer that arrives after that changes nothing. Shutdown cancels lookups as teardown and removal do.
+A Slack lookup for Thread Memory (a reply's parent or a thread's history) has a 15-second end-to-end deadline per attempt (`THREAD_MEMORY_LOOKUP_DEADLINE_MS`), covering queued and in-flight HTTP work; the Web client makes no retries of its own, so nothing extends it. A failed attempt retries with the same spacing, waiting longer whenever Slack's `Retry-After` asks for more, even beyond 60 seconds; long waits are chained in timers of at most `MAX_TIMER_DELAY_MS` and never end early.
+
+There is no overall bound: a lookup retries until Slack answers it or what it serves changes (the persona's connection or the channel's state), and an answer that arrives after that changes nothing. Shutdown cancels lookups as teardown and removal do.
 
 Examples use persona `Alpha`, key `alpha`, channel `C0123` and an `EACCES` storage error. Notice blocks show the body; Slack posts normally prefix it with `Persona "Alpha" (key=alpha): `, and `&lt;state dir&gt;` displays as `<state dir>` in Slack. The overflow examples show the complete post so its prefix is included in the bound; log paths use JSON quotes without Slack escaping.
 
@@ -2153,7 +2159,11 @@ Examples use persona `Alpha`, key `alpha`, channel `C0123` and an `EACCES` stora
   [slack] thread-memory-unreadable: persona=alpha channels=["C0123"] path="" journal missing on retry; Thread Memory stays unknown until the next start; waiting replies remain saved
   ```
 
-- **Meaning:** Thread Memory is unknown. Replies whose selection needs it are saved as Memory Holds and acknowledged, waiting for the read. A reply in a thread that one of the bot's still-pending own posts could put the bot in is saved and acknowledged as a Post Hold instead, and everything this persona saves later waits behind that Post Hold, while other personas keep flowing. The Post Hold is delivered once Slack confirms the post in that thread, after 3 seconds (`THREAD_REPLY_HOLD_MS`) without that answer, or when CSCB starts again or the persona is brought up again; if the post failed or went to another thread first, it is parked as a Memory Hold, waiting for the read while later messages pass it. Apart from that, known joins and the independent traffic listed above keep working. The first successful read judges pending joins, attempts to release or withdraw each Memory Hold, then saves joins kept meanwhile; a failed hold-resolution write retries separately, and the outage stays open until retained Thread Memory work is settled.
+- **Meaning:** Thread Memory is unknown. Replies whose selection needs it are saved as Memory Holds and acknowledged, waiting for the read.
+
+  A reply in a thread that one of the bot's still-pending own posts could put the bot in is saved and acknowledged as a Post Hold instead, and everything this persona saves later waits behind that Post Hold, while other personas keep flowing. The Post Hold is delivered once Slack confirms the post in that thread, after 3 seconds (`THREAD_REPLY_HOLD_MS`) without that answer, or when CSCB starts again or the persona is brought up again; if the post failed or went to another thread first, it is parked as a Memory Hold, waiting for the read while later messages pass it.
+
+  Apart from that, known joins and the independent traffic listed above keep working. The first successful read judges pending joins, attempts to release or withdraw each Memory Hold, then saves joins kept meanwhile; a failed hold-resolution write retries separately, and the outage stays open until retained Thread Memory work is settled.
 
   The bot's own posts made while the journal is unreadable keep their joins only in memory; `THREAD_MEMORY_OWN_POST_LOSS_WARNING` warns that stopping before saving loses them. The first successful read does not end the episode or post *Thread Memory recovered* until those joins and their retained intents and outcomes are saved or otherwise settled.
 - **Cause:** A journal read fails at start or bring-up. Reads retry in the background; if a retry finds the journal gone, the second line above is logged once, with `path=""`, and no second notice: read retries stop, Thread Memory stays unknown, nothing creates or appends that journal, and unresolved Memory Holds stay held until the next start.
@@ -2447,7 +2457,19 @@ Restoring the entire state directory can go undetected when its Thread Memory jo
 
 - **Meaning:** Nothing is posted. `step=journal-rewrite` identifies a compaction that could not be confirmed; the journal is retained and compaction is retried at maintenance.
 - **Cause:** Rewriting or durably saving the compacted journal failed. The failure does not clear known joins or wait on another persona; maintenance runs hourly (`QUEUE_COMPACT_INTERVAL_MS`).
-- **Fix:** Check the named journal's disk, mount and permissions. Leave it in place for the next maintenance attempt.
+- **Fix:** Check the named journal's disk, mount and permissions. Leave it in place for the next maintenance attempt; [`thread-memory-compaction-recovered`](#thread-memory-compaction-recovered) confirms recovery.
+
+### `thread-memory-compaction-recovered`
+
+- **Line:** One recovery line follows an open compaction-failure episode:
+
+  ```text
+  [slack] thread-memory-compaction-recovered: persona=alpha path="<state dir>/threads/alpha.jsonl" journal compaction confirmed
+  ```
+
+- **Meaning:** Journal compaction for this persona is confirmed. This metadata-only server-log line posts no Slack notice and adds no startup-errors entry.
+- **Cause:** After [`thread-memory-compaction-failed`](#thread-memory-compaction-failed), a durable rewrite or a maintenance completion proved to leave the journal unchanged succeeded. A guard return, unreadable memory, dry run, cancellation or a seal-write result does not confirm compaction.
+- **Fix:** No operator repair is needed for this recovery. Separate memory, seal or hold-resolution failures retain their own remedies; this is distinct from the [`Thread Memory recovered`](#thread-memory-recovered) notice.
 
 ### `thread-memory-removal-failed`
 
@@ -2491,7 +2513,19 @@ Restoring the entire state directory can go undetected when its Thread Memory jo
 
 - **Meaning:** Nothing is posted for this label. `persona=all` identifies the shared seal; `written_but_not_synced=true` means the write happened but durability was not confirmed, which still counts as a failure.
 - **Cause:** Writing or syncing the seal failed. One shared retry series uses the 5-to-60-second spacing above without stopping any persona's intake, delivery or independent Thread Memory retries; a new journal waiting for its seal entry keeps its joins in memory meanwhile.
-- **Fix:** Check the named seal's disk, mount and permissions. A failed final shutdown write also logs this line after notice episodes close; shutdown then cancels retries, so that final line promises no retry after the process stops, and the next start may report an unclean stop.
+- **Fix:** Check the named seal's disk, mount and permissions; [`thread-memory-seal-saved`](#thread-memory-seal-saved) confirms recovery. One final failed or unsynced shutdown write logs this line after ordinary episodes close, even if an earlier onset already logged. That final line promises no retry after exit, and the next start may report an unclean stop.
+
+### `thread-memory-seal-saved`
+
+- **Line:** One recovery line follows the shared seal's open failure episode:
+
+  ```text
+  [slack] thread-memory-seal-saved: persona=all path="<state dir>/thread-memory-seal.json" seal write confirmed
+  ```
+
+- **Meaning:** The shared seal is durably saved. This metadata-only server-log line posts no Slack notice and adds no startup-errors entry; it covers the one seal shared by all personas.
+- **Cause:** An actual durable seal write succeeded after [`thread-memory-seal-not-saved`](#thread-memory-seal-not-saved). A skipped request, cancellation or a write whose sync failed does not recover the episode; another persona's teardown cannot clear it.
+- **Fix:** No operator repair is needed for this recovery. It does not certify journal compaction, hold resolution or the separate [`Thread Memory recovered`](#thread-memory-recovered) notice's readable-memory/every-kept-join-saved condition.
 
 ### `thread-memory-holds-not-resolved`
 
@@ -2503,7 +2537,31 @@ Restoring the entire state directory can go undetected when its Thread Memory jo
 
 - **Meaning:** Nothing is posted. `step=resolution-append` means the decision to release or withdraw Memory Holds could not be saved in that persona's queue journal; those replies remain unresolved meanwhile.
 - **Cause:** The resolution write failed. CSCB retries that persona's resolution without new traffic, with waits of 10, 30, 60, 120, 300 and then 900 seconds (`RETYPE_BACKOFF_MS`); this is separate from Thread Memory's read/save retry spacing.
-- **Fix:** Check `<state dir>/queue/<key>.jsonl` and its disk, mount and permissions. Let the saved decisions release eligible replies; resend only messages a subsequent *Joins lost* report lists as withdrawn.
+- **Fix:** Check `<state dir>/queue/<key>.jsonl` and its disk, mount and permissions. [`thread-memory-holds-resolved`](#thread-memory-holds-resolved) confirms saved decisions; let them release eligible replies, and resend only messages a subsequent *Joins lost* report lists as withdrawn.
+
+### `thread-memory-holds-resolved`
+
+- **Line:** One recovery line follows this persona's open hold-resolution failure episode:
+
+  ```text
+  [slack] thread-memory-holds-resolved: persona=alpha step=resolution-append Memory Hold resolution saved
+  ```
+
+- **Meaning:** The requested Memory Hold decisions, including withdrawals, are durable. This metadata-only server-log line posts no Slack notice and adds no startup-errors entry; it does not certify preparation or delivery, or that every other hold is resolved.
+- **Cause:** A nonempty requested batch completed durably after [`thread-memory-holds-not-resolved`](#thread-memory-holds-not-resolved), before released replies' preparation finishes. An empty or unknown pass, pending durability, cancellation or another operation's success cannot recover that episode.
+- **Fix:** No operator repair is needed for this recovery. Follow any separate [release preparation failure](#memory-hold-release-preparation-failed); the [`Thread Memory recovered`](#thread-memory-recovered) notice has its own readable-memory/every-kept-join-saved meaning.
+
+### Memory Hold release preparation failed
+
+- **Line:** The same preparation-failure form used for live intake is logged once per failed callback, with safely described detail:
+
+  ```text
+  [slack] persona-routing: post-accept preparation failed<safe detail>
+  ```
+
+- **Meaning:** Preparation of a released reply threw or rejected after its hold decision was durable. This server-log-only error neither undoes resolution nor certifies delivery; other released replies and later resolutions continue independently.
+- **Cause:** A release's preparation callback failed. The safe detail uses the live preparation error's classification and redaction; this error opens no hold-resolution retry or recovery episode and posts no notice or startup-errors entry of its own.
+- **Fix:** Investigate the safely described preparation failure and check the reply's queue/delivery state before taking action. A separate [`thread-memory-holds-not-resolved`](#thread-memory-holds-not-resolved) needs its storage remedy; this line alone gives no automatic resend or preparation-retry instruction.
 
 ---
 
@@ -8011,7 +8069,9 @@ No action is needed; a separate holds-not-resolved line still needs its own stor
 
 ### Symptom: A Thread Memory line in server.log with no notice
 
-The `thread-memory-quarantined`, `-compaction-failed`, `-removal-failed`, `-seal-unreadable`, `-seal-not-saved` and `-holds-not-resolved` lines post nothing; check the named file's disk, mount and permissions and leave it in place. See the entries from [`thread-memory-quarantined`](#thread-memory-quarantined) on, under [Thread Memory reports and log lines](#thread-memory-reports-and-log-lines).
+For `thread-memory-quarantined`, `-compaction-failed`, `-removal-failed`, `-seal-unreadable`, `-seal-not-saved` or `-holds-not-resolved`, follow the named entry's storage remedy and preserve its files. See the entries from [`thread-memory-quarantined`](#thread-memory-quarantined) on, under [Thread Memory reports and log lines](#thread-memory-reports-and-log-lines).
+
+The healthy [`thread-memory-compaction-recovered`](#thread-memory-compaction-recovered), [`thread-memory-seal-saved`](#thread-memory-seal-saved) and [`thread-memory-holds-resolved`](#thread-memory-holds-resolved) lines need no operator repair. A [Memory Hold release preparation failure](#memory-hold-release-preparation-failed) has its own preparation remedy; its hold decision is already durable.
 
 ### Symptom: A persona posts a *Channel state unresolved* notice
 

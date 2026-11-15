@@ -119,7 +119,7 @@ test.each([['Memory', memoryHold], ['Post', postHold]] as const)('%s Holds never
 describe('join retention preserves reply reminders', () => {
   test('a joined mention, its thread reply and a plain mention each retain one eligible reminder when the join becomes saved', async () => {
     let saved = false
-    const options = { threadJoinSaved: () => saved }
+    const options = { threadJoinSaved: () => () => saved }
     const q = await open(options)
     const joined = await send(q, 'alpha', joinedMention())
     const reply = await send(q, 'alpha', slackInput({ via: 'thread', thread_ts: THREAD_ROOT,
@@ -147,7 +147,7 @@ describe('join retention preserves reply reminders', () => {
 
   test.each(['replied', 'cancelled', 'nudged'] as const)('an unsaved join cannot re-arm a %s reminder after compaction and reopen', async state => {
     let saved = false
-    const options = { threadJoinSaved: () => saved }
+    const options = { threadJoinSaved: () => () => saved }
     const q = await open(options), h = harness(q)
     const seq = await send(q, 'alpha', joinedMention())
     if (state === 'replied') await h.monitor.noteReplyCall('alpha')
@@ -184,7 +184,7 @@ describe('join retention preserves reply reminders', () => {
 
   test.each([false, true])('a torn terminal append stays suppressed after the reminder compacts away (delivered before reopen: %s)', async deliveredBeforeReopen => {
     let saved = false
-    const options = { threadJoinSaved: () => saved }
+    const options = { threadJoinSaved: () => () => saved }
     const q = await open(options), h = harness(q)
     const seq = await send(q, 'alpha', joinedMention())
     await h.monitor.observe('alpha', h.row('working'))
@@ -230,7 +230,7 @@ describe('join retention preserves reply reminders', () => {
   test('retaining a delivered join neither extends reminder eligibility nor offers the item for delivery again', async () => {
     const clock = createFakeClock({ start: 1000 })
     let saved = false
-    const options = { now: clock.now, threadJoinSaved: () => saved }
+    const options = { now: clock.now, threadJoinSaved: () => () => saved }
     const q = await open(options)
     // A different join time proves that eligibility is measured from delivery.
     const seq = await send(q, 'alpha', joinedMention({ thread_join: { thread_ts: THREAD_ROOT, stamp: { ...THREAD_STAMP }, at: 0 } }))

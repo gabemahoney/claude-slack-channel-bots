@@ -240,9 +240,11 @@ import {
   buildThreadMemoryCompactionFailedLine, buildThreadMemoryRemovalFailedLine,
   buildThreadMemorySealUnreadableLine, buildThreadMemorySealNotSavedLine,
   buildThreadMemoryHoldsNotResolvedLine,
+  buildThreadMemoryCompactionRecoveredLine, buildThreadMemorySealSavedLine, buildThreadMemoryHoldsResolvedLine,
   type ThreadMemoryLoss,
 } from '../src/thread-memory-reports.ts'
-import { THREAD_MEMORY_DIAGNOSTIC_CLASSES } from '../src/persona-diagnostics.ts'
+import { THREAD_MEMORY_DIAGNOSTIC_CLASSES, buildPostAcceptPreparationFailedLine } from '../src/persona-diagnostics.ts'
+import { describeSlackCallFailure } from '../src/persona-connection-errors.ts'
 import { PERSONA_DIAGNOSTIC_CLASSES, SHARED_STATE_STAGED_SLACK_RETRY_WARNING } from '../src/persona-diagnostics.ts'
 import {
   SHARED_STATE_NOTICE_MAX_CHANNELS, SHARED_STATE_DIAGNOSTIC_CLASSES, SHARED_STATE_SLACK_RETRY_WARNING,
@@ -1981,10 +1983,13 @@ describe('Thread Memory diagnostic builders', () => {
       ['thread-memory-seal-unreadable', 'all', buildThreadMemorySealUnreadableLine(path, error), path],
       ...[false, true].map(unsynced => ['thread-memory-seal-not-saved', 'all', buildThreadMemorySealNotSavedLine(path, error, unsynced), path]),
       ['thread-memory-holds-not-resolved', KEY, buildThreadMemoryHoldsNotResolvedLine(KEY, error)],
+      ['thread-memory-compaction-recovered', KEY, buildThreadMemoryCompactionRecoveredLine(KEY, path), path],
+      ['thread-memory-seal-saved', 'all', buildThreadMemorySealSavedLine(path), path],
+      ['thread-memory-holds-resolved', KEY, buildThreadMemoryHoldsResolvedLine(KEY)],
     ]
   }
 
-  test.each(MEMORY_CONFIGURED_PATHS)('$label: all eleven classes retain configured fields, redact errors and render one log line', ({ path }) => {
+  test.each(MEMORY_CONFIGURED_PATHS)('$label: every exported class retains configured fields, redacts errors and renders one log line', ({ path }) => {
     const rendered = rows(path, memoryError(path))
     expect([...new Set(rendered.map(([kind]) => kind))].sort()).toEqual([...THREAD_MEMORY_DIAGNOSTIC_CLASSES].sort())
     for (const [kind, key, line, configuredPath] of rendered) {
@@ -2003,7 +2008,7 @@ describe('Thread Memory diagnostic builders', () => {
         expect(line!).not.toContain('&lt;journal&gt;')
       }
     }
-    expect(rendered.filter(([, , , configuredPath]) => configuredPath !== undefined)).toHaveLength(10)
+    expect(rendered.filter(([, , , configuredPath]) => configuredPath !== undefined)).toHaveLength(12)
     for (const [, , line] of rendered.filter(([, , line]) => line!.includes('code='))) {
       expect(line!).toContain('code=EACCES')
       expect(line!).toContain(`cannot write <journal> & ${REDACTED_TOKEN_PLACEHOLDER}`)
@@ -2029,10 +2034,23 @@ describe('Thread Memory diagnostic builders', () => {
       `written_but_not_synced=false ${p} ${cause}; seal write retried`,
       `written_but_not_synced=true ${p} ${cause}; seal write retried`,
       `step=resolution-append ${cause}; Memory Hold resolution not saved, retried`,
+      `${p} journal compaction confirmed`,
+      `${p} seal write confirmed`,
+      `step=resolution-append Memory Hold resolution saved`,
     ]
     const rendered = rows(MEMORY_PATH, error)
     expect(rendered.map(([kind, key, line]) => line)).toEqual(rendered.map(([kind, key], i) => `[slack] ${kind}: persona=${key} ${expected[i]}`))
+    expect(buildPostAcceptPreparationFailedLine(': safe\r\nfailure\u2028tail\u2029end')).toBe('[slack] persona-routing: post-accept preparation failed: safe  failure tail end')
     assertNoLeak(rendered)
+  })
+
+  test('the shared preparation failure builder retains safe Slack classification and redacts the described error', () => {
+    const line = buildPostAcceptPreparationFailedLine(describeSlackCallFailure(memoryError(MEMORY_PATH)))
+    expect(line).not.toMatch(/[\r\n\u2028\u2029]/)
+    expect(line).toContain(REDACTED_TOKEN_PLACEHOLDER)
+    expect(line).not.toContain(MEMORY_BODY)
+    expect(line).not.toContain(MEMORY_USER)
+    assertNoLeak(line)
   })
 })
 

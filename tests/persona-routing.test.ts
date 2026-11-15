@@ -354,7 +354,8 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold routing', mode => {
     expect(h.holdStored).toEqual(['alpha'])
     expect(item.hold?.state).toBe(outcome)
     expect(readQueue(dir).filter(r => r.kind === 'released' || r.kind === 'hold-withdrawn')).toEqual([{ v: 1, kind: released ? 'released' : 'hold-withdrawn', seq, at: t.clock.now() }])
-    expect(holds.memoryEvents).toEqual(released ? [] : [{ type: 'withdrawn', key: 'alpha', holds: [{ seq, channel: A, thread_ts: R, ts: event.ts as string }] }])
+    expect(holds.memoryEvents).toEqual([...(released ? [] : [{ type: 'withdrawn' as const, key: 'alpha', holds: [{ seq, channel: A, thread_ts: R, ts: event.ts as string }] }]),
+      { type: 'resolution-saved' as const, key: 'alpha' }])
     expect([holds.clock.now(), holds.clock.firedCount(), holds.clock.pendingCount()]).toEqual([0, 0, 0])
     /** P's feedback: none once withdrawn; once released, the stored reaction and one live preparation. `later` is Q's preparation. */
     const feedback = (later: RoutingHarness['preparationCalls'] = []) => {

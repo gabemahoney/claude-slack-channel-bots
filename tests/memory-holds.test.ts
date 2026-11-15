@@ -8,10 +8,14 @@ import { buildTagParts } from '../src/tag-wrapper.ts'
 import { RETYPE_BACKOFF_MS, THREAD_MEMORY_RETRY_MIN_MS } from '../src/delivery-constants.ts'
 import { isOpenItem, itemOpenedAt, QUEUE_COMPACT_INTERVAL_MS, type HoldResolution } from '../src/delivery-queue.ts'
 import { createMemoryHoldResolver, judgeMemoryHolds, type MemoryHoldEvent, type MemoryHoldMode } from '../src/memory-holds.ts'
+import { createPersonaEpisodes } from '../src/persona-episodes.ts'
+import { createThreadMemoryReporting, buildThreadMemoryHoldsNotResolvedLine, buildThreadMemoryHoldsResolvedLine, buildThreadMemoryJoinsLostLine } from '../src/thread-memory-reports.ts'
+import { buildPostAcceptPreparationFailedLine } from '../src/persona-diagnostics.ts'
+import { describeSlackCallFailure } from '../src/persona-connection-errors.ts'
 import { recoverQueuedJoins } from '../src/thread-join-recovery.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
-import { heldSlackInput, makeQueue, memoryHold, queuePath, readQueue, slackInput } from './test-helpers/delivery-queue.ts'
+import { acceptedRecord, heldSlackInput, makeQueue, memoryHold, queuePath, readQueue, seedQueue, slackInput, tornRecord } from './test-helpers/delivery-queue.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeReloadHarness, type ReloadRun, type ReloadRunOptions } from './test-helpers/reload-harness.ts'
 import { membershipPage, SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
@@ -44,14 +48,21 @@ function settled(pending: Promise<unknown>): { result?: unknown } {
 
 /** The real resolver over a real durable queue on a fake clock. `releaseFeedback` is routing's
  * release callback for one saved release: it may return a gate, throw or reject. */
-async function resolverFixture(releaseFeedback?: (key: string, seq: number) => void | Promise<void>) {
+async function resolverFixture(releaseFeedback?: (key: string, seq: number) => void | Promise<void>, prepare?: (dir: string, io: ReturnType<typeof threadFsControls>) => void) {
   const dir = mkdtempSync(join(tmpdir(), 'memory-resolver-')), clock = createFakeClock({ start: THREAD_TIME })
-  const io = threadFsControls(dir), queue = await makeQueue(dir, { now: clock.now, fs: io.fs })
+  const io = threadFsControls(dir)
+  prepare?.(dir, io)
+  const queue = await makeQueue(dir, { now: clock.now, fs: io.fs })
   clock.settleOn(io.durable)
   const answers = new Map<string, boolean | 'unknown'>(), events: MemoryHoldEvent[] = []
   const releases: Array<{ key: string; seq: number; mode: MemoryHoldMode }> = [], order: string[] = []
   const saves: Array<{ key: string; decisions: readonly HoldResolution[] }> = []
   let beforeSave: (key: string) => Promise<void> = async () => {}, nowReads = 0
+  const logs: string[] = [], posts: string[] = []
+  const episodes = createPersonaEpisodes({ clock, sink: (_key, text) => { posts.push(text) }, log: line => { logs.push(line) } })
+  const reporting = createThreadMemoryReporting({ episodes, log: line => { logs.push(line) },
+    persona: key => ({ key, name: key }), threadHybridChannels: () => [channel],
+    outage: () => ({ unknown: false, unsaved: 0, missing: false }) })
   const resolver = createMemoryHoldResolver({
     queue: { ...queue, async resolveHolds(key, decisions, current, onCommitted) {
       saves.push({ key, decisions }); await beforeSave(key)
@@ -66,7 +77,7 @@ async function resolverFixture(releaseFeedback?: (key: string, seq: number) => v
       releases.push({ key, seq: item.accepted.seq, mode }); order.push(`released:${key}:${item.accepted.seq}`)
       return releaseFeedback?.(key, item.accepted.seq)
     },
-    onEvent(event) { events.push(event); order.push(event.type) },
+    onEvent(event) { events.push(event); order.push(event.type); reporting.holdsEvent(event) },
   })
   let sequence = 0
   async function hold(thread: string = root, key = 'alpha') {
@@ -79,10 +90,10 @@ async function resolverFixture(releaseFeedback?: (key: string, seq: number) => v
     return accepted.seq!
   }
   cleanups.push(async () => {
-    resolver.stop(); await queue.stop(); expect(clock.pendingCount()).toBe(0)
-    assertNoLeak({ events, releases, saves }); rmSync(dir, { recursive: true, force: true })
+    resolver.stop(); episodes.close(); reporting.close(); await queue.stop(); expect(clock.pendingCount()).toBe(0)
+    assertNoLeak({ events, releases, saves, logs, posts, records: writtenFile(queuePath(dir)) }); rmSync(dir, { recursive: true, force: true })
   })
-  return { dir, clock, io, queue, resolver, answers, releases, events, saves, order, hold,
+  return { dir, clock, io, queue, resolver, answers, releases, events, saves, order, hold, logs, posts,
     beforeSave: (fn: typeof beforeSave) => { beforeSave = fn }, nowReads: () => nowReads }
 }
 
@@ -120,11 +131,11 @@ describe('Memory Hold resolver', () => {
     expect(f.order).toHaveLength(0)
     gate.resolve(); expect(await pending).toBe('resolved')
     expect(f.releases).toEqual([1, 3].map(seq => ({ key: 'alpha', seq, mode })))
-    expect(f.events).toEqual([{ type: 'withdrawn', key: 'alpha', holds: [{ seq: 2, channel,
-      thread_ts: THREAD_ROOTS.secondary, ts: f.queue.item('alpha', 2)!.accepted.ts }] }])
-    expect(f.order).toEqual(['withdrawn', 'saved:alpha', 'released:alpha:1', 'released:alpha:3', 'pruned:alpha'])
+    expect(f.events).toEqual([{ type: 'withdrawn' as const, key: 'alpha', holds: [{ seq: 2, channel,
+      thread_ts: THREAD_ROOTS.secondary, ts: f.queue.item('alpha', 2)!.accepted.ts }] }, { type: 'resolution-saved' as const, key: 'alpha' }])
+    expect(f.order).toEqual(['withdrawn', 'saved:alpha', 'resolution-saved', 'released:alpha:1', 'released:alpha:3', 'pruned:alpha'])
     await f.resolver.resolve('alpha', mode); await f.resolver.retryPending('alpha')
-    expect(f.releases).toHaveLength(2); expect(f.events).toHaveLength(1); expect(f.saves).toHaveLength(1)
+    expect(f.releases).toHaveLength(2); expect(f.events).toHaveLength(2); expect(f.saves).toHaveLength(1)
   })
 
   test('failed durable append keeps holds unresolved, retries at backoff, and re-reads remaining work', async () => {
@@ -144,6 +155,76 @@ describe('Memory Hold resolver', () => {
     expect(f.releases).toEqual([{ key: 'alpha', seq: 2, mode: 'live' }])
     expect(f.queue.unresolvedHolds('alpha')).toHaveLength(0)
     expect(f.clock.pendingCount()).toBe(0)
+  })
+
+  test.each(['released', 'withdrawn'] as const)('%s batch recovers only after its durable append; repeated failures and recurrence each keep their producer facts', async outcome => {
+    const feedback = Promise.withResolvers<void>()
+    const f = await resolverFixture(() => feedback.promise)
+    f.answers.set(root, outcome === 'released')
+    const seq = await f.hold(), ts = f.queue.item('alpha', seq)!.accepted.ts
+    const error = f.io.fail('writeSync', 'alpha', { times: 2, match: path => path === queuePath(f.dir) })
+    const onset = buildThreadMemoryHoldsNotResolvedLine('alpha', error), recovered = buildThreadMemoryHoldsResolvedLine('alpha')
+    try {
+      expect(await f.resolver.resolve('alpha', 'live')).toBe('retrying')
+      expect(await f.resolver.resolve('alpha', 'live')).toBe('retrying')
+      expect(f.events).toEqual([1, 2].map(() => ({ type: 'resolution-failed', key: 'alpha', error })))
+      expect(f.logs).toEqual([onset]); expect(f.queue.unresolvedHolds('alpha')).toHaveLength(1)
+      expect(readQueue(f.dir).filter(r => r.kind === 'released' || r.kind === 'hold-withdrawn')).toEqual([])
+      // Empty work for another key and an unknown answer do not certify this batch.
+      expect(await f.resolver.resolve('beta', 'live')).toBe('resolved')
+      f.answers.set(root, 'unknown'); expect(await f.resolver.resolve('alpha', 'live')).toBe('unknown')
+      expect(f.logs).toEqual([onset]); expect(f.releases).toEqual([])
+      f.answers.set(root, outcome === 'released')
+      const held = f.io.hold('fsync', 'alpha', { match: path => path === queuePath(f.dir) })
+      const pending = f.resolver.resolve('alpha', 'live')
+      try {
+        await held.reached
+        expect(f.events.map(e => e.type)).toEqual(['resolution-failed', 'resolution-failed'])
+        expect(f.logs).toEqual([onset]); expect(f.releases).toEqual([])
+        expect(f.queue.unresolvedHolds('alpha')).toHaveLength(1)
+      } finally { held.release(); await pending }
+      expect(f.queue.unresolvedHolds('alpha')).toEqual([])
+      expect(readQueue(f.dir).filter(r => r.kind === 'released' || r.kind === 'hold-withdrawn')).toEqual([
+        { v: 1, kind: outcome === 'released' ? 'released' : 'hold-withdrawn', seq: 1, at: f.clock.now() },
+      ])
+      expect(f.events.map(e => e.type)).toEqual(['resolution-failed', 'resolution-failed',
+        ...(outcome === 'withdrawn' ? ['withdrawn' as const] : []), 'resolution-saved'])
+      const lossLines = outcome === 'withdrawn' ? [buildThreadMemoryJoinsLostLine({ key: 'alpha', name: 'alpha' }, {
+        threads: [{ channel, root }], messages: [{ channel, ts }],
+      })] : []
+      expect(f.logs).toEqual([onset, ...lossLines, recovered])
+      if (outcome === 'released') expect(f.order.indexOf('resolution-saved')).toBeLessThan(f.order.indexOf('released:alpha:1'))
+      // Repeating an empty resolve and settling feedback cannot manufacture a second recovery.
+      await f.resolver.resolve('alpha', 'recovered'); feedback.resolve(); await f.clock.flush()
+      expect(f.logs).toEqual([onset, ...lossLines, recovered])
+      await f.hold()
+      const again = f.io.fail('writeSync', 'alpha', { times: 1, match: path => path === queuePath(f.dir) })
+      expect(await f.resolver.resolve('alpha', 'live')).toBe('retrying')
+      expect(f.logs.at(-1)).toBe(buildThreadMemoryHoldsNotResolvedLine('alpha', again))
+      expect(await f.resolver.resolve('alpha', 'live')).toBe('resolved')
+      expect(f.logs.at(-1)).toBe(recovered)
+      expect(f.events.filter(e => e.type === 'resolution-saved')).toEqual([1, 2].map(() => ({ type: 'resolution-saved' as const, key: 'alpha' })))
+    } finally { feedback.resolve(); await f.clock.flush() }
+  })
+
+  test('a visible replay awaiting its repair rewrite emits no completion until the queue is durable and the hold is saved', async () => {
+    const f = await resolverFixture(undefined, (dir, io) => {
+      seedQueue(dir, [acceptedRecord(1, heldSlackInput(memoryHold(THREAD_TIME)), THREAD_TIME),
+        tornRecord(acceptedRecord(2, slackInput(), THREAD_TIME + 1), 'seq')])
+      io.fail('rename', 'alpha', { match: path => path.startsWith(queuePath(dir) + '.') })
+    })
+    f.answers.set(root, true)
+    expect(f.queue.durabilityPending!('alpha')).toBe(true)
+    expect(f.queue.unresolvedHolds('alpha').map(h => h.seq)).toEqual([1])
+    expect(await f.resolver.resolve('alpha', 'recovered')).toBe('unknown')
+    expect(f.events).toEqual([]); expect(f.logs).toEqual([]); expect(f.releases).toEqual([])
+    f.io.heal()
+    expect((await f.queue.accept('alpha', slackInput())).status).toBe('accepted')
+    expect(f.queue.durabilityPending!('alpha')).toBe(false)
+    expect(await f.resolver.retryPending('alpha')).toBe('resolved')
+    expect(f.events).toEqual([{ type: 'resolution-saved' as const, key: 'alpha' }])
+    expect(f.releases).toEqual([{ key: 'alpha', seq: 1, mode: 'recovered' }])
+    expect(readQueue(f.dir).filter(r => r.kind === 'released')).toEqual([{ v: 1, kind: 'released', seq: 1, at: f.clock.now() }])
   })
 
   test('one key serializes pending saves while another key resolves independently', async () => {
@@ -177,9 +258,9 @@ describe('Memory Hold resolver', () => {
       competing.push({ seq: 2, outcome: 'released', at: f.clock.now() })
     }
     const expectedReleases = outcome === 'mixed' ? [3, 5].map(seq => ({ key: 'alpha', seq, mode })) : []
-    const expectedEvents: MemoryHoldEvent[] = outcome === 'mixed' ? [{ type: 'withdrawn', key: 'alpha', holds: [{
+    const expectedEvents: MemoryHoldEvent[] = [...(outcome === 'mixed' ? [{ type: 'withdrawn' as const, key: 'alpha', holds: [{
       seq: 4, channel, thread_ts: THREAD_ROOTS.secondary, ts: f.queue.item('alpha', 4)!.accepted.ts,
-    }] }] : []
+    }] }] : []), { type: 'resolution-saved' as const, key: 'alpha' }]
     await f.clock.advance(1)
     const at = f.clock.now()
     f.beforeSave(() => gate.promise)
@@ -215,7 +296,7 @@ describe('Memory Hold resolver', () => {
       }
       expect(await pending).toBe('resolved')
       expect(f.releases).toEqual(expectedReleases); expect(f.events).toEqual(expectedEvents)
-      expect(f.order).toEqual([...(outcome === 'mixed' ? ['withdrawn'] : []), 'saved:alpha',
+      expect(f.order).toEqual([...(outcome === 'mixed' ? ['withdrawn'] : []), 'saved:alpha', 'resolution-saved',
         ...(outcome === 'mixed' ? ['released:alpha:3', 'released:alpha:5'] : []), 'pruned:alpha'])
       expect(f.queue.unresolvedHolds('alpha')).toEqual([])
       const records = readQueue(f.dir)
@@ -241,7 +322,7 @@ describe('Memory Hold resolver', () => {
       await f.clock.flush()
       expect(live.result).toBe('resolved')
       expect(f.releases).toEqual([{ key: 'alpha', seq: 1, mode: 'recovered' }, { key: 'alpha', seq: 2, mode: 'live' }, { key: 'alpha', seq: 3, mode: 'live' }])
-      expect(f.order).toEqual(['saved:alpha', 'released:alpha:1', 'released:alpha:2', 'released:alpha:3', 'pruned:alpha'])
+      expect(f.order).toEqual(['saved:alpha', 'resolution-saved', 'released:alpha:1', 'released:alpha:2', 'released:alpha:3', 'pruned:alpha'])
       // The requested compaction ran: the saved releases now live in their accepted records.
       expect(readQueue(f.dir).filter(r => r.kind === 'released')).toEqual([])
       expect([1, 2, 3].map(seq => f.queue.item('alpha', seq)!.accepted.released_at)).toEqual([f.clock.now(), f.clock.now(), f.clock.now()])
@@ -253,16 +334,16 @@ describe('Memory Hold resolver', () => {
       expect(next.result).toBe('resolved')
       expect(f.saves.map(s => s.decisions.map(d => [d.seq, d.outcome]))).toEqual([[[1, 'released'], [2, 'released'], [3, 'released']], [[fresh, 'released']]])
       expect(f.releases.slice(3)).toEqual([{ key: 'alpha', seq: fresh, mode: 'live' }])
-      expect(f.events).toEqual([])
+      expect(f.events).toEqual([1, 2].map(() => ({ type: 'resolution-saved' as const, key: 'alpha' })))
       first.resolve(); await f.clock.flush()
-      expect(f.releases).toHaveLength(4); expect(f.events).toEqual([])
+      expect(f.releases).toHaveLength(4); expect(f.events).toEqual([1, 2].map(() => ({ type: 'resolution-saved' as const, key: 'alpha' })))
     } finally { first.resolve(); await f.clock.flush() }
   })
 
   test.each(['throws', 'rejects'] as const)('a release callback that %s reports release-failed for its key and seq; later releases, resolves and the neighbor continue', async fault => {
+    const error = new Error('fixture release feedback failed')
     const f = await resolverFixture((key, seq) => {
       if (key !== 'alpha' || seq !== 1) return
-      const error = new Error('fixture release feedback failed')
       if (fault === 'throws') throw error
       return Promise.reject(error)
     })
@@ -271,13 +352,14 @@ describe('Memory Hold resolver', () => {
     expect(await f.resolver.resolve('alpha', 'live')).toBe('resolved')
     await f.clock.flush()
     expect(f.releases).toEqual([1, 2].map(seq => ({ key: 'alpha', seq, mode: 'live' })))
-    expect(f.events).toEqual([{ type: 'release-failed', key: 'alpha', seq: 1, error: expect.objectContaining({ message: 'fixture release feedback failed' }) }])
+    expect(f.events).toEqual([{ type: 'resolution-saved' as const, key: 'alpha' }, { type: 'release-failed', key: 'alpha', seq: 1, error: expect.objectContaining({ message: 'fixture release feedback failed' }) }])
     const later = await f.hold()
     expect(await f.resolver.resolve('alpha', 'live')).toBe('resolved')
     expect(await f.resolver.resolve('beta', 'live')).toBe('resolved')
     expect(f.releases.slice(2)).toEqual([{ key: 'alpha', seq: later, mode: 'live' }, { key: 'beta', seq: 1, mode: 'live' }])
     expect(f.queue.unresolvedHolds('alpha')).toEqual([]); expect(f.queue.unresolvedHolds('beta')).toEqual([])
-    expect(f.events).toHaveLength(1)
+    expect(f.events).toHaveLength(4)
+    expect(f.logs).toEqual([buildPostAcceptPreparationFailedLine(describeSlackCallFailure(error))])
   })
 
   test.each(['forget', 'stop', 'a replacement life'] as const)('a release rejection settling after %s reports nothing', async retire => {
@@ -299,7 +381,8 @@ describe('Memory Hold resolver', () => {
         expect(f.releases.at(-1)).toEqual({ key: 'alpha', seq: next, mode: 'live' })
       }
       late.reject(failure); await f.clock.flush()
-      expect(f.events).toEqual([])
+      expect(f.events).toEqual(Array.from({ length: retire === 'a replacement life' ? 2 : 1 }, () => ({ type: 'resolution-saved' as const, key: 'alpha' })))
+      expect(f.logs).toEqual([])
       // The neighbor still resolves unless the whole resolver stopped.
       expect(await f.resolver.resolve('beta', 'live')).toBe(retire === 'stop' ? 'cancelled' : 'resolved')
       expect(f.releases.filter(r => r.key === 'beta')).toEqual(retire === 'stop' ? [] : [{ key: 'beta', seq: 1, mode: 'live' }])
@@ -390,7 +473,7 @@ describe('B1 shared publication', () => {
     expect(f.releases).toEqual([{ seq: f.first, mode, joined: true }])
     expect(f.queue.item('alpha', f.first)!.hold!.state).toBe('released')
     expect(f.h.memory.view('alpha', channel, root)).toBe(stale ? 'not-joined' : 'joined')
-    expect(f.events).toHaveLength(0)
+    expect(f.events).toEqual([{ type: 'resolution-saved' as const, key: 'alpha' }])
     await f.resolver.retryPending('alpha'); expect(f.releases).toHaveLength(1)
   })
 
@@ -540,7 +623,7 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold outage', mode => {
     const run = await f.start({ threadMemory: { fs: io.fs } }), reply = await f.intake(run)
     expect(run.queue.unresolvedHolds('alpha')).toHaveLength(1)
     io.heal(); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
-    expect(run.memoryHoldEvents).toEqual([expect.objectContaining({ type: 'withdrawn', holds: [expect.objectContaining({ thread_ts: root, ts: reply.ts })] })])
+    expect(run.memoryHoldEvents).toEqual([expect.objectContaining({ type: 'withdrawn', holds: [expect.objectContaining({ thread_ts: root, ts: reply.ts })] }), { type: 'resolution-saved' as const, key: 'alpha' }])
     const losses = notices(run, 'Joins lost')
     expect(losses).toHaveLength(2)
     expect(losses.every(p => String(p.text).includes(root))).toBe(true)
@@ -886,7 +969,7 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold outage', mode => {
         run.registerSession('alpha'); await run.clock.flush()
         expect(run.queue.unresolvedHolds('alpha')).toEqual([])
         expect(run.memoryHoldEvents.filter(e => e.type === 'withdrawn')).toEqual([{
-          type: 'withdrawn', key: 'alpha', holds: [{ seq: holds[1]!.seq, channel, thread_ts: THREAD_ROOTS.secondary, ts: withdrawn.ts }],
+          type: 'withdrawn' as const, key: 'alpha', holds: [{ seq: holds[1]!.seq, channel, thread_ts: THREAD_ROOTS.secondary, ts: withdrawn.ts }],
         }])
         expect(notices(run, 'Joins lost')).toHaveLength(1)
         expect(String(notices(run, 'Joins lost')[0]!.text)).toContain(withdrawn.ts)
@@ -927,7 +1010,7 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold outage', mode => {
     expect(third.queue.unresolvedHolds('alpha')).toHaveLength(0)
     expect(third.threadMemory!.view('alpha', channel, root)).toBe(stale ? 'not-joined' : 'joined')
     expect(f.reactions(third).filter(a => a.timestamp === event.ts)).toHaveLength(1)
-    expect(third.memoryHoldEvents).toHaveLength(0)
+    expect(third.memoryHoldEvents).toEqual([{ type: 'resolution-saved' as const, key: 'alpha' }])
     await third.memoryHolds!.retryPending('alpha'); expect(third.heldReleases).toHaveLength(1)
     await f.drain(third)
   })
@@ -967,8 +1050,8 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold outage', mode => {
     expect(itemOpenedAt(released)).toBe(released.accepted.released_at!)
     expect(itemOpenedAt(released)).not.toBe(released.accepted.received_at)
     expect(released.hold).toBeUndefined(); expect(third.queue.openCount('alpha')).toBe(2)
-    expect(third.memoryHoldEvents).toEqual([{ type: 'withdrawn', key: 'alpha', holds: [{ seq: holds[1]!.seq, channel,
-      thread_ts: THREAD_ROOTS.secondary, ts: absent.ts }] }])
+    expect(third.memoryHoldEvents).toEqual([{ type: 'withdrawn' as const, key: 'alpha', holds: [{ seq: holds[1]!.seq, channel,
+      thread_ts: THREAD_ROOTS.secondary, ts: absent.ts }] }, { type: 'resolution-saved' as const, key: 'alpha' }])
     expect(notices(third, 'Joins lost')).toHaveLength(1)
     expect(String(notices(third, 'Joins lost')[0]!.text)).toContain(absent.ts)
     expect(memoryLines(third, 'joins-lost')).toHaveLength(1)
@@ -1013,7 +1096,7 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold outage', mode => {
       expect(readQueue(f.h.stateDir).filter(r => r.kind === 'accepted' && 'thread_join' in r)).toHaveLength(0)
     } else {
       expect(third.heldReleases).toHaveLength(0)
-      expect(third.memoryHoldEvents).toEqual([{ type: 'withdrawn', key: 'alpha', holds: [{ seq: hold.seq, channel, thread_ts: root, ts: event.ts }] }])
+      expect(third.memoryHoldEvents).toEqual([{ type: 'withdrawn' as const, key: 'alpha', holds: [{ seq: hold.seq, channel, thread_ts: root, ts: event.ts }] }, { type: 'resolution-saved' as const, key: 'alpha' }])
       expect(f.reactions(third).some(a => a.timestamp === event.ts)).toBe(false)
     }
   })

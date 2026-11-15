@@ -368,7 +368,10 @@ describe.each(['strict', 'open'] as const)('%s Thread Memory retries at confirme
     expect(adCallsSince(run, adFrom).filter(call => call.id !== id)).toEqual([])
     expect(run.threadMemoryWindow('alpha')).toBe('none')
     expect(run.queue.unresolvedHolds('alpha')).toEqual([])
-    expect(run.memoryHoldEvents).toEqual([{ type: 'withdrawn', key: 'alpha', holds: [expect.objectContaining({ thread_ts: THREAD_ROOTS.primary, ts: reply.ts })] }])
+    expect(run.memoryHoldEvents).toEqual([
+      { type: 'withdrawn', key: 'alpha', holds: [expect.objectContaining({ thread_ts: THREAD_ROOTS.primary, ts: reply.ts })] },
+      { type: 'resolution-saved', key: 'alpha' },
+    ])
     expect(reportPosts(run, 'alpha', 'Joins lost')).toHaveLength(1)
     expect(run.logs.filter(l => l.includes('thread-memory-joins-lost'))).toHaveLength(1)
     await run.memoryHolds!.resolve('alpha', 'live'); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)

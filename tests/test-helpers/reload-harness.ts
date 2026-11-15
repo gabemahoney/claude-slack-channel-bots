@@ -2246,9 +2246,12 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           for (const hold of queue.unresolvedHolds(key)) threadMemory?.advancePast(key, hold.arrived_at)
           recoverQueueKeyAtStart(key, true)
         },
-        threadJoinSaved: (key: string, channel: string, fact: NonNullable<QueueItem['accepted']['thread_join']>) => {
-          threadMemory?.advancePast(key, fact.at)
-          return threadMemory?.threadJoinSaved(key, channel, fact.thread_ts, fact.stamp, fact.at) ?? false
+        threadJoinSaved: (key: string) => {
+          const memory = threadMemory, isSaved = memory?.threadJoinSavedForPass(key)
+          return (channel: string, fact: NonNullable<QueueItem['accepted']['thread_join']>) => {
+            memory?.advancePast(key, fact.at)
+            return isSaved?.(channel, fact.thread_ts, fact.stamp, fact.at) ?? false
+          }
         },
         setInterval: ((callback: () => void, ms: number) => {
           queueIntervalLive = true

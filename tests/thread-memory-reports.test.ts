@@ -17,7 +17,9 @@ import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import {
   THREAD_MEMORY_NOT_SAVED, THREAD_MEMORY_UNREADABLE, THREAD_MEMORY_CHANGED_WHILE_STOPPED,
   THREAD_MEMORY_JOINS_LOST,
+  buildPostAcceptPreparationFailedLine,
 } from '../src/persona-diagnostics.ts'
+import { describeSlackCallFailure } from '../src/persona-connection-errors.ts'
 import {
   createThreadMemoryReporting, buildThreadMemoryNotSavedNotice, buildThreadMemoryNotSavedLine,
   buildThreadMemoryUnreadableNotice, buildThreadMemoryUnreadableLine,
@@ -27,6 +29,7 @@ import {
   buildThreadMemoryQuarantinedLine, buildThreadMemoryCompactionFailedLine,
   buildThreadMemoryRemovalFailedLine, buildThreadMemorySealUnreadableLine,
   buildThreadMemorySealNotSavedLine, buildThreadMemoryHoldsNotResolvedLine,
+  buildThreadMemoryCompactionRecoveredLine, buildThreadMemorySealSavedLine, buildThreadMemoryHoldsResolvedLine,
   type ThreadMemoryLoss, type ThreadMemoryReportingDeps,
 } from '../src/thread-memory-reports.ts'
 import { createThreadMemory, type ThreadMemoryEvent, type ThreadMemoryOutage, type ThreadMemoryQuarantineFact } from '../src/thread-memory.ts'
@@ -38,6 +41,7 @@ import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { assertNoLeak, LEAK_SENTINEL, sentinelInMessage, fakeToken, BOT_TOKEN_PREFIX, withoutName } from './test-helpers/credentials.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness } from './test-helpers/persona-notifier.ts'
+import { slackPlatformError } from './test-helpers/slack-stub.ts'
 import {
   THREAD_CHANNELS as C, THREAD_ROOTS as R, THREAD_STAMP, THREAD_TIME,
   threadJoin, threadHeader, joinRecord, seedThreads, threadFsControls, threadPath, threadSealPath,
@@ -126,13 +130,33 @@ function fixture(name = 'alpha', validated = true) {
       expect(JSON.stringify(captured)).not.toContain(UPLOAD_NAME)
       expect(clock.pendingCount()).toBe(0)
     } finally {
-      episodes.close(); notifier.cleanup(); rmSync(dir, { recursive: true, force: true })
+      episodes.close(); reporter.close(); notifier.cleanup(); rmSync(dir, { recursive: true, force: true })
     }
   })
   return { dir, config, a: a!, b: b!, clock, notifier, requests, logs, episodeLogs, outages, channels, throws,
     episodes, deps, reporter, path, sealPath, ref, append, unreadable, saved, settled, quarantined, configuredPaths }
 }
 type Fixture = ReturnType<typeof fixture>
+/** Event inputs and expected public builders; episode decisions stay in production. */
+function operation(f: Fixture, kind: 'compaction' | 'seal' | 'resolution', key = f.a.key) {
+  const path = threadPath(f.dir, key)
+  return {
+    fail(error: unknown, unsynced = false) {
+      if (kind === 'compaction') f.reporter.threadMemoryEvent(privateFields({ type: 'compaction-failed', key, path, step: 'journal-rewrite', error }))
+      else if (kind === 'seal') f.reporter.sealEvent(privateFields({ type: 'seal-write-failed', path: f.sealPath, error, unsynced }))
+      else f.reporter.holdsEvent(privateFields({ type: 'resolution-failed', key, error }))
+    },
+    complete() {
+      if (kind === 'compaction') f.reporter.threadMemoryEvent(privateFields({ type: 'compacted', key, path, outcome: 'rewritten' }))
+      else if (kind === 'seal') f.reporter.sealEvent(privateFields({ type: 'seal-written', path: f.sealPath }))
+      else f.reporter.holdsEvent(privateFields({ type: 'resolution-saved', key }))
+    },
+    onset: (error: unknown) => kind === 'compaction' ? buildThreadMemoryCompactionFailedLine(key, path, 'journal-rewrite', error)
+      : kind === 'seal' ? buildThreadMemorySealNotSavedLine(f.sealPath, error, false) : buildThreadMemoryHoldsNotResolvedLine(key, error),
+    recovery: kind === 'compaction' ? buildThreadMemoryCompactionRecoveredLine(key, path)
+      : kind === 'seal' ? buildThreadMemorySealSavedLine(f.sealPath) : buildThreadMemoryHoldsResolvedLine(key),
+  }
+}
 function holds(count = 1): WithdrawnMemoryHold[] {
   return Array.from({ length: count }, (_, i) => {
     const fact = threadJoin({ channel: i % 2 ? C.secondary : C.primary,
@@ -446,11 +470,79 @@ describe('Thread Memory reporter event mappings and episodes', () => {
     }
     for (const unsynced of [false, true]) {
       f.reporter.sealEvent({ type: 'seal-write-failed', path: f.sealPath, error, unsynced })
-      expected.push(buildThreadMemorySealNotSavedLine(f.sealPath, error, unsynced))
     }
+    expected.push(buildThreadMemorySealNotSavedLine(f.sealPath, error, false))
     f.reporter.holdsEvent({ type: 'resolution-failed', key: f.a.key, error })
     expected.push(buildThreadMemoryHoldsNotResolvedLine(f.a.key, error))
     expect(f.logs).toEqual(expected)
+    expect(f.requests).toEqual([])
+  })
+
+  test.each(['compaction', 'seal', 'resolution'] as const)('%s logs one onset and matching recovery, stays quiet while healthy, then reports recurrence', async kind => {
+    const f = fixture(), op = operation(f, kind), error = failure()
+    op.complete(); op.complete(); expect(f.logs).toEqual([])
+    op.fail(error)
+    op.fail(Object.assign(failure(), { message: sentinelInMessage('changed-error') }), true)
+    f.reporter.retryEvent({ type: 'seal-written-after-retries', attempts: 19 })
+    expect(f.logs).toEqual([op.onset(error)])
+    op.complete(); op.complete()
+    expect(f.logs).toEqual([op.onset(error), op.recovery])
+    op.fail(error); op.complete()
+    expect(f.logs).toEqual([op.onset(error), op.recovery, op.onset(error), op.recovery])
+    await f.clock.flush()
+    expect(f.requests).toEqual([]); expect(f.notifier.allPosts()).toEqual({ [f.a.key]: [], [f.b.key]: [] }); expect(f.notifier.startupEntries()).toEqual([])
+  })
+
+  test('operation and persona recoveries remain independent from each other and the readable/every-kept-join-saved outage', async () => {
+    const f = fixture(), error = failure()
+    const ops = [operation(f, 'compaction'), operation(f, 'resolution'), operation(f, 'compaction', f.b.key), operation(f, 'seal')]
+    f.outages.set(f.a.key, { ...healthy(), unknown: true, unsaved: 1 })
+    f.reporter.threadMemoryEvent(f.unreadable()); f.reporter.threadMemoryEvent(f.append())
+    const outageLogs = [...f.logs], notices = [...f.requests]
+    for (const op of ops) op.fail(error)
+    ops[1]!.complete(); ops[0]!.complete()
+    ops[2]!.fail(error); ops[3]!.fail(error, true)
+    f.reporter.threadMemoryEvent(f.settled())
+    expect(f.logs).toEqual([...outageLogs, ...ops.map(op => op.onset(error)), ops[1]!.recovery, ops[0]!.recovery])
+    expect(f.requests).toEqual(notices)
+    f.outages.set(f.a.key, healthy()); f.reporter.threadMemoryEvent(f.settled())
+    expect(f.requests.map(p => p.text)).toEqual([...notices.map(p => p.text), buildThreadMemoryRecoveredNotice(f.ref(), [C.primary])])
+    // Readable-memory recovery did not close either of the remaining operations.
+    ops[2]!.fail(error); ops[3]!.fail(error); ops[2]!.complete(); ops[3]!.complete()
+    expect(f.logs.slice(-3)).toEqual([buildThreadMemoryRecoveredLine(f.a.key, [C.primary]), ops[2]!.recovery, ops[3]!.recovery])
+    await f.clock.flush(); expect(f.notifier.startupEntries()).toEqual([])
+  })
+
+  test.each(['compaction', 'resolution'] as const)('forget silently drops %s for one persona; teardown and a real persona named all cannot reset the shared seal episode', kind => {
+    const f = fixture('all'), error = failure(), a = operation(f, kind), b = operation(f, kind, f.b.key), seal = operation(f, 'seal')
+    expect(f.a.key).toBe('all')
+    a.fail(error); b.fail(error); seal.fail(error)
+    f.episodes.forget(f.a.key); f.notifier.notifier.submitTeardown(f.a.key)
+    a.fail(error); a.complete(); seal.fail(error, true)
+    expect(f.logs).toEqual([a.onset(error), b.onset(error), seal.onset(error)])
+    b.complete(); seal.complete()
+    expect(f.logs.slice(-2)).toEqual([b.recovery, seal.recovery])
+    f.notifier.notifier.settleTeardown(f.a.key)
+    a.complete(); expect(f.logs).toHaveLength(5)
+    a.fail(error); a.complete()
+    expect(f.logs.slice(-2)).toEqual([a.onset(error), a.recovery]); expect(f.requests).toEqual([])
+  })
+
+  test.each(['episodes', 'reporter'] as const)('closing %s suppresses late failures, completions and release callbacks for open episodes', close => {
+    const f = fixture(), error = failure(), ops = (['compaction', 'seal', 'resolution'] as const).map(kind => operation(f, kind))
+    for (const op of ops) op.fail(error)
+    if (close === 'episodes') f.episodes.close(); else f.reporter.close()
+    for (const op of ops) { op.complete(); op.fail(error, true); op.complete() }
+    f.reporter.holdsEvent(privateFields({ type: 'release-failed', key: f.a.key, seq: 1, error }))
+    expect(f.logs).toEqual(ops.map(op => op.onset(error))); expect(f.requests).toEqual([])
+  })
+
+  test('each release failure uses the shared safe preparation builder without opening a persistence or recovery episode', () => {
+    const f = fixture(), errors = [failure(), slackPlatformError('missing_scope', undefined, sentinelInMessage('release-feedback'))]
+    for (const [index, error] of errors.entries()) f.reporter.holdsEvent(privateFields({ type: 'release-failed', key: f.a.key, seq: index + 1, error }))
+    operation(f, 'resolution').complete()
+    expect(f.logs).toEqual(errors.map(error => buildPostAcceptPreparationFailedLine(describeSlackCallFailure(error))))
+    expect(f.logs[1]).toContain('missing_scope')
     expect(f.requests).toEqual([])
   })
 
@@ -545,6 +637,11 @@ describe('Thread Memory reporter event mappings and episodes', () => {
     f.throws.add(dependency)
     expect(() => f.reporter.threadMemoryEvent(dependency === 'outage' ? f.saved() : f.append())).not.toThrow()
     expect(() => f.reporter.threadMemoryEvent(f.settled())).not.toThrow()
+    for (const kind of ['compaction', 'seal', 'resolution'] as const) {
+      const op = operation(f, kind)
+      expect(() => { op.fail(failure()); op.complete() }).not.toThrow()
+    }
+    expect(() => f.reporter.holdsEvent(privateFields({ type: 'release-failed', key: f.a.key, seq: 1, error: failure() }))).not.toThrow()
     expect(() => f.reporter.holdsEvent(withdraw(f))).not.toThrow()
     expect(() => f.reporter.lookupEvent(lostLookup(f))).not.toThrow()
     expect(() => f.reporter.startupFindings([{ key: f.a.key, case: 'unclean-stop', wording: 'unclean' }])).not.toThrow()
@@ -629,6 +726,14 @@ describe('CR5/CR6 configured fields through the reporter and notifier', () => {
       expect(line).not.toMatch(/[\r\n\u2028\u2029]/)
       assertNoLeak(withoutName(line.replace(field, '<configured-path>'), name, f.a.key))
     }
+    f.reporter.threadMemoryEvent({ type: 'compacted', key: f.a.key, path, outcome: 'skipped' })
+    f.reporter.sealEvent({ type: 'seal-written', path: sealPath })
+    f.reporter.holdsEvent({ type: 'resolution-failed', key: f.a.key, error })
+    f.reporter.holdsEvent({ type: 'resolution-saved', key: f.a.key })
+    expect(f.logs.slice(-4)).toEqual([
+      buildThreadMemoryCompactionRecoveredLine(f.a.key, path), buildThreadMemorySealSavedLine(sealPath),
+      buildThreadMemoryHoldsNotResolvedLine(f.a.key, error), buildThreadMemoryHoldsResolvedLine(f.a.key),
+    ])
     if (!validated) {
       expect(f.notifier.posts(f.a.key)).toEqual([])
       f.notifier.validate(f.a.key); await f.notifier.notifier.flush(f.a.key)

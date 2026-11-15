@@ -1880,7 +1880,7 @@ test('shared receipt archives, saved joins, accounting and recorded buttons need
   const dir=mkdtempSync(join(scratch,'state-')), key='alpha', name='Alpha'
   const journal=f.queuePath(dir,key), log=join(dir,'server.log'), original=join(dir,'original.jsonl'), snapshot=join(dir,'all.jsonl')
   writeFileSync(log,'')
-  const q=audit.methods(await f.makeQueue(dir,{now:()=>100,threadJoinSaved:()=>true}), () => [journal].filter(existsSync))
+  const q=audit.methods(await f.makeQueue(dir,{now:()=>100,threadJoinSaved:()=>()=>true}), () => [journal].filter(existsSync))
   try {
   const fixture={slack:{id:'FFILE',name:'scenario-note.txt',mimetype:'text/plain',size:23},queue:{name:'scenario-note.txt',mimetype:'text/plain',size:23},attributes:{attachment_count:'1',attachments:'scenario-note.txt (text/plain, 23 bytes)'}}
   const input=f.slackInput({text:'preserved <channel> 🐝',via:'mention',files:[fixture.queue],received_at:100,thread_join:{thread_ts:t.THREAD_ROOTS.primary,stamp:t.THREAD_STAMP,at:100}})

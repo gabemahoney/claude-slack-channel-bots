@@ -492,6 +492,10 @@ export const PERSONA_EPISODE_KIND_THREAD_MEMORY_UNREADABLE = 'thread-memory-unre
 export const PERSONA_EPISODE_KIND_THREAD_MEMORY_JOINS_LOST = 'thread-memory-joins-lost'
 /** A startup/first-read finding until the key is forgotten; Thread Memory reporting posts once per run. */
 export const PERSONA_EPISODE_KIND_THREAD_MEMORY_CHANGED_WHILE_STOPPED = 'thread-memory-changed-while-stopped'
+/** Log-only: first failed journal compaction through a durable rewrite or proved-identical maintenance skip. */
+export const PERSONA_EPISODE_KIND_THREAD_MEMORY_COMPACTION_FAILED = 'thread-memory-compaction-failed'
+/** Log-only: first failed Memory Hold resolution append through a durable requested batch. */
+export const PERSONA_EPISODE_KIND_THREAD_MEMORY_HOLDS_NOT_RESOLVED = 'thread-memory-holds-not-resolved'
 /** Shared-state reporter: first unreadable projection/unsaved evidence through
  * decided state and membership for all named channels; repair starts silently. */
 export const PERSONA_EPISODE_KIND_SHARED_STATE_UNRESOLVED = 'shared-state-unresolved'
@@ -522,6 +526,8 @@ export const PERSONA_EPISODE_KINDS = [
   PERSONA_EPISODE_KIND_THREAD_MEMORY_UNREADABLE,
   PERSONA_EPISODE_KIND_THREAD_MEMORY_JOINS_LOST,
   PERSONA_EPISODE_KIND_THREAD_MEMORY_CHANGED_WHILE_STOPPED,
+  PERSONA_EPISODE_KIND_THREAD_MEMORY_COMPACTION_FAILED,
+  PERSONA_EPISODE_KIND_THREAD_MEMORY_HOLDS_NOT_RESOLVED,
   PERSONA_EPISODE_KIND_SHARED_STATE_UNRESOLVED,
   PERSONA_EPISODE_KIND_MEMBERSHIP_EVIDENCE_UNRESOLVED,
   PERSONA_EPISODE_KIND_RELOAD_APPLY_FAILED,

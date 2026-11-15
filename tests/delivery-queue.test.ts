@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
-import { createDeliveryQueue, isOpenItem, isQueueItemClosed, itemOpenedAt, isQueueRecord, isReactionKey, parseQueueRecord, QueueNotWithdrawable, QueueOutcomeFinal, QUEUE_DIRECTORY_MODE, QUEUE_FILE_MODE, QUEUE_KEY_KEEP_MS, QUEUE_COMPACT_INTERVAL_MS, QUEUE_GROUP_COMMIT_MAX, reactionKeyString, type AcceptedRecord, type AcceptedInput, type HoldField, type HoldOutcome, type HoldResolution, type QueueRecord, type QueueEvent, type QueueStoreKind, type DeliveryQueue, type ReactionAcceptedInput, type ReactionKey, type WithdrawnRecord } from '../src/delivery-queue.ts'
+import { createDeliveryQueue, isOpenItem, isQueueItemClosed, itemOpenedAt, isQueueRecord, isReactionKey, parseQueueRecord, QueueNotWithdrawable, QueueOutcomeFinal, QUEUE_DIRECTORY_MODE, QUEUE_FILE_MODE, QUEUE_KEY_KEEP_MS, QUEUE_COMPACT_INTERVAL_MS, QUEUE_GROUP_COMMIT_MAX, reactionKeyString, type AcceptedRecord, type AcceptedInput, type HoldField, type HoldOutcome, type HoldResolution, type QueueRecord, type QueueThreadJoin, type QueueEvent, type QueueStoreKind, type DeliveryQueue, type ReactionAcceptedInput, type ReactionKey, type WithdrawnRecord } from '../src/delivery-queue.ts'
 import { assertNoLeak, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 import { makeDeliveryNoticeHarness, type DeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
 import { MAX_RELOAD_FILE_BYTES } from '../src/config.ts'
@@ -1599,7 +1599,7 @@ describe('thread_join acceptance and main-reader compatibility', () => {
   test.each(['absent', 'false'] as const)('delivered unsaved joins retain every item byte with predicate %s, then main reads delivered', async option => {
     let saved = false
     const calls: unknown[] = [], clock = createFakeClock({ start: 1000 })
-    const predicate = (key: string, channel: string, fact: ReturnType<typeof joinFact>) => { calls.push({ key, channel, fact }); return saved }
+    const predicate = (key: string) => (channel: string, fact: QueueThreadJoin) => { calls.push({ key, channel, fact }); return saved }
     const q = await open({ now: clock.now, ...(option === 'false' ? { threadJoinSaved: predicate } : {}) })
     await q.accept('alpha', joiningInput())
     const itemRecords: QueueRecord[] = [

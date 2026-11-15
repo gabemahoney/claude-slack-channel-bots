@@ -53,6 +53,7 @@ import {
   buildThreadMemoryJoinsLostNotice, buildThreadMemoryJoinsLostLine, buildThreadMemoryQuarantinedLine,
   buildThreadMemoryChangedWhileStoppedNotice, buildThreadMemoryChangedWhileStoppedLine,
   buildThreadMemorySealNotSavedLine, buildThreadMemoryCompactionFailedLine, buildThreadMemoryRemovalFailedLine,
+  buildThreadMemoryCompactionRecoveredLine, buildThreadMemorySealSavedLine,
   type ThreadMemoryLoss,
 } from '../src/thread-memory-reports.ts'
 import { THREAD_MEMORY_NOT_SAVED, THREAD_MEMORY_UNREADABLE } from '../src/persona-diagnostics.ts'
@@ -844,7 +845,7 @@ describe('Thread Memory store', () => {
         expect(h.memory.unresolvedIntents('alpha')).toEqual([saved])
         expect(h.memory.outage('alpha')).toEqual({ unknown: false, unsaved: 0, missing: false })
         expect(h.memory.saveBlocked('alpha')).toBe(false)
-        expect(h.events.every(event => ['created', 'outage-settled'].includes(event.type))).toBe(true)
+        expect(h.events.every(event => ['created', 'outage-settled', 'compacted'].includes(event.type))).toBe(true)
         expect(h.retryEvents).toEqual([]); expect(h.posts).toEqual([]); expect(h.logs).toEqual([])
         expect(h.clock.pendingCount()).toBe(0)
         const settled = journalBytes(h)
@@ -1983,6 +1984,55 @@ describe('Thread Memory failure handling through the store', () => {
     expect(existsSync(threadPath(h.stateDir))).toBe(true)
   })
 
+  test.each(['rename', 'directory fsync'] as const)('compaction %s failures retain every event; only durable recovery closes the log episode, and recurrence reports anew', async step => {
+    const h = reportingFixture({ seal: false }); await h.start()
+    const fact = h.fact(); await h.memory.saveJoins('alpha', [fact])
+    const path = threadPath(h.stateDir), before = h.events.length
+    const fail = () => h.io.fail(step === 'rename' ? 'rename' : 'fsync', 'alpha', {
+      match: p => step === 'rename' ? p.startsWith(path + '.') : p === join(h.stateDir, 'threads'),
+    })
+    const error = fail()
+    await h.memory.compact(); await h.memory.compact()
+    expect(h.events.slice(before)).toEqual([1, 2].map(() => ({ type: 'compaction-failed', key: 'alpha', path, step: 'journal-rewrite', error })))
+    const onset = buildThreadMemoryCompactionFailedLine('alpha', path, 'journal-rewrite', error)
+    expect(h.logs).toEqual([onset])
+    // A healthy read/append is unrelated to a failed rewrite.
+    await h.memory.retryRead('alpha'); await h.memory.flush('alpha')
+    expect(h.logs).toEqual([onset])
+    h.io.heal()
+    const held = h.io.hold('fsync', 'alpha', { match: p => p === join(h.stateDir, 'threads') })
+    const pending = h.memory.compact()
+    try {
+      await held.reached
+      expect(h.events.slice(before).map(e => e.type)).toEqual(['compaction-failed', 'compaction-failed'])
+      expect(h.logs).toEqual([onset])
+    } finally { held.release(); await pending }
+    const recovered = buildThreadMemoryCompactionRecoveredLine('alpha', path)
+    expect(h.events.at(-1)).toEqual({ type: 'compacted', key: 'alpha', path, outcome: 'rewritten' })
+    expect(h.logs).toEqual([onset, recovered]); expectOnlySavedJoin(h, fact)
+    await h.memory.compact(); expect(h.logs).toEqual([onset, recovered])
+    const again = fail(); await h.memory.compact()
+    h.io.heal(); await h.memory.compact()
+    expect(h.logs).toEqual([onset, recovered, buildThreadMemoryCompactionFailedLine('alpha', path, 'journal-rewrite', again), recovered])
+    expect(h.posts).toEqual([])
+  })
+
+  test('a durable compaction recovers while the independent seal write still fails', async () => {
+    const h = reportingFixture(); await h.start(); await h.memory.saveJoins('alpha', [h.fact()])
+    const error = h.io.fail('rename'); await h.memory.compact()
+    h.io.heal(); h.sealIo.failWrite()
+    await h.memory.compact(); await h.clock.flush()
+    expect(h.logs.slice(0, 2)).toEqual([
+      buildThreadMemoryCompactionFailedLine('alpha', threadPath(h.stateDir), 'journal-rewrite', error),
+      buildThreadMemoryCompactionRecoveredLine('alpha', threadPath(h.stateDir)),
+    ])
+    expect(h.sealEvents.at(-1)?.type).toBe('seal-write-failed')
+    expect(h.logs).toHaveLength(3)
+    h.sealIo.heal(); await h.seal.flush()
+    expect(h.logs.at(-1)).toBe(buildThreadMemorySealSavedLine(threadSealPath(h.stateDir)))
+    expect(h.posts).toEqual([])
+  })
+
   test.each(['forget', 'remove', 'stopKeys'] as const)('%s cancels both real read and append series before their next timer can run', async action => {
     const h = reportingFixture({ seal: false }); expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])).kind).toBe('applied')
     seedReadable(h); h.io.fail('readFileSync'); await h.start(); h.io.fail('writeSync', 'beta')
@@ -2584,6 +2634,7 @@ describe('Thread Memory compaction in slices', () => {
   const fullRewrite = ['writeSync:temp', 'fsync:temp', 'rename:temp', 'fsync:directory']
   function observe(h: ThreadMemoryHarness) {
     const completed: ThreadMemoryCompaction[] = [], sealed: Array<{ key: string; steps: string[] }> = []
+    let eventStart = h.events.length
     h.memory.setCompactionObserver(c => completed.push(c))
     if (h.seal) {
       const original = h.seal.entryCompacted.bind(h.seal)
@@ -2594,18 +2645,24 @@ describe('Thread Memory compaction in slices', () => {
     }
     return {
       completed, sealed,
-      reset() { h.io.reset(); h.sealIo.reset(); completed.length = 0; sealed.length = 0 },
+      reset() { h.io.reset(); h.sealIo.reset(); completed.length = 0; sealed.length = 0; eventStart = h.events.length },
       rewritten(prefix: string[] = []) {
         const steps = [...prefix, ...fullRewrite]
         expect(operations(h)).toEqual(steps)
         expect(sealed).toEqual([{ key: 'alpha', steps }])
         expect(h.sealIo.writes().length).toBeGreaterThan(0)
         expect(completed.map(c => [c.key, c.outcome])).toEqual([['alpha', 'rewritten']])
+        expect(h.events.slice(eventStart).filter(e => e.type === 'compacted')).toEqual([
+          { type: 'compacted', key: 'alpha', path: threadPath(h.stateDir), outcome: 'rewritten' },
+        ])
       },
       skipped(before: ReturnType<typeof identity>) {
         expect(h.io.calls).toEqual([]); expect(h.sealIo.calls).toEqual([])
         expect(sealed).toEqual([]); expect(identity(h)).toEqual(before)
         expect(completed.map(c => [c.key, c.outcome])).toEqual([['alpha', 'skipped']])
+        expect(h.events.slice(eventStart).filter(e => e.type === 'compacted')).toEqual([
+          { type: 'compacted', key: 'alpha', path: threadPath(h.stateDir), outcome: 'skipped' },
+        ])
         expect(completed[0]!.startMonoMs).toBeLessThanOrEqual(completed[0]!.endMonoMs)
         expect(h.events.filter(e => e.type === 'compaction-failed')).toEqual([])
       },
@@ -3103,6 +3160,7 @@ describe('Thread Memory compaction in slices', () => {
       setImmediate(() => { stopping = next.memory.stop() })
       await next.memory.activate(); await stopping
       expect(stopping).toBeDefined(); expect(probe.completed).toEqual([]); expect(probe.sealed).toEqual([])
+      expect(next.events.filter(e => e.type === 'compacted')).toEqual([])
       expect(journalBytes(next)).toEqual(before)
     })
 
@@ -3117,6 +3175,7 @@ describe('Thread Memory compaction in slices', () => {
       if (reason === 'not live') h.memory.readAtStart(); else await h.start()
       await h.memory.compact('alpha')
       expect(probe.completed).toEqual([]); expect(reads).toBe(0)
+      expect(h.events.filter(e => e.type === 'compacted')).toEqual([])
     })
 
     test('throwing observers cannot fail completed rewrites or skips; unset observers never read the clock', async () => {
@@ -3132,6 +3191,7 @@ describe('Thread Memory compaction in slices', () => {
       h.memory.setCompactionObserver(undefined)
       await h.memory.compact('alpha'); await maintenance(h)
       expect(reads).toBe(4)
+      expect(h.events.filter(e => e.type === 'compacted').slice(-4).map(e => e.outcome)).toEqual(['rewritten', 'skipped', 'rewritten', 'skipped'])
     })
   })
 })
@@ -5174,7 +5234,10 @@ describe('SR-8 Joined Thread populations (t1.k49.39 SR-8.1, SR-8.3, SR-2.4.4)', 
     const h = makeThreadMemoryHarness(dir, { reopen: true, ...options }); runs.push(h); return h
   }
   const byKey = <E extends { key: string }>(events: readonly E[]) => [...events].sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
-  const readEvents = (dir: string) => keys.map(key => ({ type: 'read' as const, key, path: threadPath(dir, key), firstSuccessfulRead: false }))
+  const readEvents = (dir: string) => keys.flatMap(key => [
+    { type: 'read' as const, key, path: threadPath(dir, key), firstSuccessfulRead: false },
+    { type: 'compacted' as const, key, path: threadPath(dir, key), outcome: 'rewritten' as const },
+  ])
   /** Every join `populationJoins` gives `key` is held, and the oldest are joined. */
   function expectPopulation(memory: Pick<ThreadMemory, 'joins' | 'view'>, key: string, count: number) {
     const joins = populationJoins(key, count, eligible), line = (j: { channel: string; root: string; at: number }) => `${j.channel} ${j.root} ${j.at}`
@@ -5226,7 +5289,8 @@ describe('SR-8 Joined Thread populations (t1.k49.39 SR-8.1, SR-8.3, SR-2.4.4)', 
       { type: 'read-failed', key: 'alpha', path: threadPath(dir), error: fault }, { type: 'created', key: 'beta', path: threadPath(dir, 'beta') },
     ])
     await h.memory.loadKey('alpha')
-    expect(h.events).toEqual([{ type: 'read', key: 'alpha', path: threadPath(dir), firstSuccessfulRead: true }])
+    expect(h.events).toEqual([{ type: 'read', key: 'alpha', path: threadPath(dir), firstSuccessfulRead: true },
+      { type: 'compacted', key: 'alpha', path: threadPath(dir), outcome: 'rewritten' }])
   })
 
   test('1,000 joins added to 100,000, and the compaction at compactIntervalMs, forget nothing', async () => {

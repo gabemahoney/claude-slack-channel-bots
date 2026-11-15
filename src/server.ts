@@ -1271,7 +1271,9 @@ function recoverQueueKeyAtStart(key: string, loadingTurn = false): void {
 /** Observer port for Thread Memory reporting; the seal retains startup findings. */
 export const threadMemorySealEvents = { emit: (event: ThreadMemorySealEvent): void => {
   dispatchThreadMemoryReport({ source: 'seal', event })
-  try { if (event.type === 'seal-write-failed') threadMemoryRetries?.sealWriteFailed() } catch { /* isolated retry consumer */ }
+  try {
+    if (event.type === 'seal-write-failed' && !shuttingDown && !personaEpisodes?.isClosed()) threadMemoryRetries?.sealWriteFailed()
+  } catch { /* isolated retry consumer */ }
 } }
 let deliveryClients: ReturnType<typeof createDeliveryClientFactory> | undefined
 export const deliveryEngineEvents = { emit: (event: DeliveryEngineEvent): void => { deliveryReporting?.engineEvent(event); if (event.type === 'item-delivered') replyReminders?.wake(event.key) } }
@@ -1596,6 +1598,7 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // flight that meets UNAVAILABLE or UNCLASSIFIED starts no condition and no
   // episode), so nothing is posted and no alert check is pending after this.
   personaEpisodes?.close()
+  threadMemoryReporting?.close()
   // the old-life waits' unclassified-error episodes
   // end silently with them, and none begins again.
   oldLifeWaitUnclassifiedErrors?.close()
@@ -2959,11 +2962,14 @@ export async function main(): Promise<void> {
       for (const hold of deliveryQueue?.unresolvedHolds(key) ?? []) threadMemory?.advancePast(key, hold.arrived_at)
       recoverQueueKeyAtStart(key, true)
     },
-    threadJoinSaved: (key, channel, fact) => {
-      // A covered delivered join can disappear in start compaction before
-      // recovery reads items(). Its decision time still advances this clock.
-      threadMemory?.advancePast(key, fact.at)
-      return threadMemory?.threadJoinSaved(key, channel, fact.thread_ts, fact.stamp, fact.at) ?? false
+    threadJoinSaved: key => {
+      const memory = threadMemory, isSaved = memory?.threadJoinSavedForPass(key)
+      return (channel, fact) => {
+        // A covered delivered join can disappear in start compaction before
+        // recovery reads items(). Its decision time still advances this clock.
+        memory?.advancePast(key, fact.at)
+        return isSaved?.(channel, fact.thread_ts, fact.stamp, fact.at) ?? false
+      }
     },
   })
   threadMemorySeal = createThreadMemorySeal({

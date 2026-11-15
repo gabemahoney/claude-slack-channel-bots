@@ -36,6 +36,7 @@ import {
 import { renderPersonaRef } from './persona-identity.ts'
 import {
   formatPersonaDiagnostic,
+  buildPostAcceptPreparationFailedLine,
   PERSONA_THREAD_STAMP_UNDECIDED,
   threadStampUndecidedCause,
   fungibleUnclaimedChannelCause,
@@ -521,7 +522,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     if (ackTiming) reportAckTiming(ackTiming, event, personaKeys, receivedAt!, run.ackTargets!, ackFailed ? 'ack-failed' : 'acked', ackCalledAt)
     completeRetained(run)
     await Promise.all(run.afterAck.map(async work => {
-      try { await work() } catch (err) { log(`[slack] persona-routing: post-accept preparation failed${describeSlackCallFailure(err)}`) }
+      try { await work() } catch (err) { log(buildPostAcceptPreparationFailedLine(describeSlackCallFailure(err))) }
     }))
   }
 

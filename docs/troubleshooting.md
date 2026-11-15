@@ -107,7 +107,7 @@ Check the threads the bot should be in; a new @mention puts it back in one. Neve
 No action is needed. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-thread-memory-recovered-notice).
 
 **A Thread Memory line in server.log with no notice**
-These `thread-memory-` lines post nothing: check the named file's disk, mount and permissions and leave the file in place. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-thread-memory-line-in-serverlog-with-no-notice).
+For storage-failure lines, check the named file's disk, mount and permissions and leave the file in place. The healthy `thread-memory-compaction-recovered`, `thread-memory-seal-saved` and `thread-memory-holds-resolved` lines need no repair. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-thread-memory-line-in-serverlog-with-no-notice).
 
 **A persona posts a *Channel state unresolved* notice**
 Follow the named cause's storage or repair step; affected messages stay held, and any message Slack stopped retrying must be sent again. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-channel-state-unresolved-notice).

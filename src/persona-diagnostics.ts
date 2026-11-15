@@ -183,15 +183,19 @@ export const THREAD_MEMORY_CHANGED_WHILE_STOPPED = 'thread-memory-changed-while-
 export const THREAD_MEMORY_RECOVERED = 'thread-memory-recovered'
 export const THREAD_MEMORY_QUARANTINED = 'thread-memory-quarantined'
 export const THREAD_MEMORY_COMPACTION_FAILED = 'thread-memory-compaction-failed'
+export const THREAD_MEMORY_COMPACTION_RECOVERED = 'thread-memory-compaction-recovered'
 export const THREAD_MEMORY_REMOVAL_FAILED = 'thread-memory-removal-failed'
 export const THREAD_MEMORY_SEAL_UNREADABLE = 'thread-memory-seal-unreadable'
 export const THREAD_MEMORY_SEAL_NOT_SAVED = 'thread-memory-seal-not-saved'
+export const THREAD_MEMORY_SEAL_SAVED = 'thread-memory-seal-saved'
 export const THREAD_MEMORY_HOLDS_NOT_RESOLVED = 'thread-memory-holds-not-resolved'
+export const THREAD_MEMORY_HOLDS_RESOLVED = 'thread-memory-holds-resolved'
 export const THREAD_MEMORY_DIAGNOSTIC_CLASSES = [
   THREAD_MEMORY_NOT_SAVED, THREAD_MEMORY_UNREADABLE, THREAD_MEMORY_JOINS_LOST,
   THREAD_MEMORY_CHANGED_WHILE_STOPPED, THREAD_MEMORY_RECOVERED, THREAD_MEMORY_QUARANTINED,
   THREAD_MEMORY_COMPACTION_FAILED, THREAD_MEMORY_REMOVAL_FAILED, THREAD_MEMORY_SEAL_UNREADABLE,
   THREAD_MEMORY_SEAL_NOT_SAVED, THREAD_MEMORY_HOLDS_NOT_RESOLVED,
+  THREAD_MEMORY_COMPACTION_RECOVERED, THREAD_MEMORY_SEAL_SAVED, THREAD_MEMORY_HOLDS_RESOLVED,
 ] as const
 export type ThreadMemoryDiagnosticClass = typeof THREAD_MEMORY_DIAGNOSTIC_CLASSES[number]
 export const SHARED_STATE_UNRESOLVED = 'shared-state-unresolved'
@@ -274,6 +278,11 @@ export function buildDeliveryDiagnostic(kind: DeliveryDiagnosticClass, persona: 
 export function buildThreadMemoryDiagnostic(kind: ThreadMemoryDiagnosticClass, persona: string, identity: string, detail = '', configuredPath?: string): string {
   const path = configuredPath === undefined ? '' : ` path=${JSON.stringify(configuredPath).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')}`
   return `[slack] ${kind}: persona=${safe(persona)}${identity ? ` ${safe(identity)}` : ''}${path}${detail ? ` ${safe(detail)}` : ''}`.trimEnd()
+}
+/** Shared by live intake and released Memory Holds. The caller supplies
+ * describeSlackCallFailure's safe tail, never the thrown value itself. */
+export function buildPostAcceptPreparationFailedLine(failure: string): string {
+  return `[slack] persona-routing: post-accept preparation failed${safe(failure).replace(/[\u2028\u2029]/g, ' ')}`
 }
 export function buildQueuedMessageRetryLine(key: string): string {
   return `[slack] Queued message: persona=${safe(key)} has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one`

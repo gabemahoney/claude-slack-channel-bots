@@ -2,12 +2,14 @@
 import { THREAD_MEMORY_NOTICE_MAX_CHARS } from './delivery-constants.ts'
 import { escapeSlackControlCharacters } from './slack-text-escape.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
-import { describeThrownValueWithoutStack } from './persona-connection-errors.ts'
+import { describeSlackCallFailure, describeThrownValueWithoutStack } from './persona-connection-errors.ts'
 import {
   buildThreadMemoryDiagnostic, THREAD_MEMORY_NOT_SAVED, THREAD_MEMORY_UNREADABLE,
   THREAD_MEMORY_JOINS_LOST, THREAD_MEMORY_CHANGED_WHILE_STOPPED, THREAD_MEMORY_RECOVERED,
   THREAD_MEMORY_QUARANTINED, THREAD_MEMORY_COMPACTION_FAILED, THREAD_MEMORY_REMOVAL_FAILED,
   THREAD_MEMORY_SEAL_UNREADABLE, THREAD_MEMORY_SEAL_NOT_SAVED, THREAD_MEMORY_HOLDS_NOT_RESOLVED,
+  THREAD_MEMORY_COMPACTION_RECOVERED, THREAD_MEMORY_SEAL_SAVED, THREAD_MEMORY_HOLDS_RESOLVED,
+  buildPostAcceptPreparationFailedLine,
 } from './persona-diagnostics.ts'
 import type { ThreadMemorySealCase, ThreadMemorySealFinding, ThreadMemoryChangedFinding, ThreadMemorySealEvent } from './thread-memory-seal.ts'
 import type { ThreadMemoryEvent, ThreadMemoryOutage } from './thread-memory.ts'
@@ -129,6 +131,9 @@ export function buildThreadMemoryQuarantinedLine(key: string, path: string, coun
 export function buildThreadMemoryCompactionFailedLine(key: string, path: string, step: string, error: unknown): string {
   return buildThreadMemoryDiagnostic(THREAD_MEMORY_COMPACTION_FAILED, key, `step=${safe(step)}`, `${cause(error)}; compaction not confirmed; journal retained, retried at maintenance`, path)
 }
+export function buildThreadMemoryCompactionRecoveredLine(key: string, path: string): string {
+  return buildThreadMemoryDiagnostic(THREAD_MEMORY_COMPACTION_RECOVERED, key, '', 'journal compaction confirmed', path)
+}
 export function buildThreadMemoryRemovalFailedLine(key: string, path: string, step: string, error: unknown): string {
   return buildThreadMemoryDiagnostic(THREAD_MEMORY_REMOVAL_FAILED, key, `step=${safe(step)}`, `${cause(error)}; removal retried at next start`, path)
 }
@@ -138,8 +143,14 @@ export function buildThreadMemorySealUnreadableLine(path: string, error: unknown
 export function buildThreadMemorySealNotSavedLine(path: string, error: unknown, unsynced: boolean): string {
   return buildThreadMemoryDiagnostic(THREAD_MEMORY_SEAL_NOT_SAVED, 'all', `written_but_not_synced=${unsynced}`, `${cause(error)}; seal write retried`, path)
 }
+export function buildThreadMemorySealSavedLine(path: string): string {
+  return buildThreadMemoryDiagnostic(THREAD_MEMORY_SEAL_SAVED, 'all', '', 'seal write confirmed', path)
+}
 export function buildThreadMemoryHoldsNotResolvedLine(key: string, error: unknown): string {
   return buildThreadMemoryDiagnostic(THREAD_MEMORY_HOLDS_NOT_RESOLVED, key, 'step=resolution-append', `${cause(error)}; Memory Hold resolution not saved, retried`)
+}
+export function buildThreadMemoryHoldsResolvedLine(key: string): string {
+  return buildThreadMemoryDiagnostic(THREAD_MEMORY_HOLDS_RESOLVED, key, 'step=resolution-append', 'Memory Hold resolution saved')
 }
 
 export interface ThreadMemoryReportingDeps {
@@ -152,10 +163,13 @@ export interface ThreadMemoryReportingDeps {
 /** Synchronous observers: neither a sink nor a logger can interrupt a store. */
 export function createThreadMemoryReporting(deps: ThreadMemoryReportingDeps) {
   let lossNumber = 0
+  // One shared file has one log series, independent of every persona life
+  // (including a real persona named "all"). No fake persona episode owns it.
+  let sealFailed = false, closed = false
   const protect = (work: () => unknown): void => {
     try { void Promise.resolve(work()).catch(() => {}) } catch { /* reporting cannot affect durable outcomes */ }
   }
-  const active = (key: string) => !deps.episodes.isClosed() && deps.episodes.teardownWindowState(key) === 'none'
+  const active = (key: string) => !closed && !deps.episodes.isClosed() && deps.episodes.teardownWindowState(key) === 'none'
   const ref = (key: string): string => {
     const persona = deps.persona(key)
     return persona ? renderPersonaRef(persona.name, key) : `persona=${key}`
@@ -232,7 +246,16 @@ export function createThreadMemoryReporting(deps: ThreadMemoryReportingDeps) {
         })
         return
       }
-      case 'compaction-failed': log(buildThreadMemoryCompactionFailedLine(key, event.path, event.step, event.error)); return
+      case 'compaction-failed': {
+        if (deps.episodes.begin(key, THREAD_MEMORY_COMPACTION_FAILED) === 'begun') {
+          log(buildThreadMemoryCompactionFailedLine(key, event.path, event.step, event.error))
+        }
+        return
+      }
+      case 'compacted': {
+        if (deps.episodes.end(key, THREAD_MEMORY_COMPACTION_FAILED)) log(buildThreadMemoryCompactionRecoveredLine(key, event.path))
+        return
+      }
       case 'removal-failed': log(buildThreadMemoryRemovalFailedLine(key, event.path, event.step, event.error)); return
       case 'created': case 'removed': return
     }
@@ -251,24 +274,44 @@ export function createThreadMemoryReporting(deps: ThreadMemoryReportingDeps) {
     }
   }
   function sealEvent(event: ThreadMemorySealEvent): void {
-    if (deps.episodes.isClosed()) return
+    if (closed || deps.episodes.isClosed()) return
     switch (event.type) {
       case 'changed-while-stopped': changed(event); return
       case 'own-post-joins-lost': return // Replayed only through startupFindings.
       case 'seal-read-failed': case 'seal-invalid': log(buildThreadMemorySealUnreadableLine(event.path, event.error)); return
-      case 'seal-write-failed': log(buildThreadMemorySealNotSavedLine(event.path, event.error, event.unsynced)); return
+      case 'seal-write-failed': {
+        if (sealFailed) return
+        sealFailed = true
+        log(buildThreadMemorySealNotSavedLine(event.path, event.error, event.unsynced))
+        return
+      }
+      case 'seal-written': {
+        if (!sealFailed) return
+        sealFailed = false
+        log(buildThreadMemorySealSavedLine(event.path))
+        return
+      }
       default: return
     }
   }
   function holdsEvent(event: MemoryHoldEvent): void {
     if (!active(event.key)) return
-    if (event.type === 'resolution-failed') { log(buildThreadMemoryHoldsNotResolvedLine(event.key, event.error)); return }
+    if (event.type === 'resolution-failed') {
+      if (deps.episodes.begin(event.key, THREAD_MEMORY_HOLDS_NOT_RESOLVED) === 'begun') log(buildThreadMemoryHoldsNotResolvedLine(event.key, event.error))
+      return
+    }
+    if (event.type === 'resolution-saved') {
+      if (deps.episodes.end(event.key, THREAD_MEMORY_HOLDS_NOT_RESOLVED)) log(buildThreadMemoryHoldsResolvedLine(event.key))
+      return
+    }
+    if (event.type === 'release-failed') { log(buildPostAcceptPreparationFailedLine(describeSlackCallFailure(event.error))); return }
     if (event.type === 'withdrawn' && event.holds.length) loss(event.key, {
       threads: event.holds.map(h => ({ channel: h.channel, root: h.thread_ts })),
       messages: event.holds.map(h => ({ channel: h.channel, ts: h.ts })),
     })
   }
   return {
+    close(): void { closed = true; sealFailed = false },
     // Buffered startup callers supply the readiness observed with the event;
     // live callers may omit it and read the current state synchronously.
     threadMemoryEvent: (event: ThreadMemoryEvent, outage?: ThreadMemoryOutage): void => protect(() => threadMemoryEvent(event, outage)),
