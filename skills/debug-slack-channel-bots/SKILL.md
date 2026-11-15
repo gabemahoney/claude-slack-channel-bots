@@ -1629,7 +1629,9 @@ agent-director get --instance-id cscb_<key>
 Exactly `busy_send: covered` selects AD busy send; absent or `not_covered`
 selects text/Enter with transcript receipts. Use `get`, not `status` or
 `list`, for this distinction. An unresolved covered submission keeps its
-original lookup identity even if a later instance is uncovered.
+original lookup identity even if a later instance is uncovered. Held messages
+stay with the conversation across pause/resume; AD delivers them on the next
+launch. CSCB keeps polling the same caller/request pair.
 
 For configured persona name `Alpha` and key `alpha`, the warning is:
 

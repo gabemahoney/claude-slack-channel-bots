@@ -41,6 +41,7 @@ import {
   ErrUnknownErrorName,
 } from 'agent-director'
 import type { UnreachableReason } from 'agent-director'
+import { ErrCantSend } from '../../src/agent-director-errors.ts'
 import type {
   ClientOptions,
   DecideParams,
@@ -1122,13 +1123,14 @@ export function errSpawnNotPausable(verb: string = 'pause', cause?: NotPausableC
 }
 
 /** Structured E2 refusal; descriptions deliberately carry no policy facts. */
-export function errCantSend(overrides: Partial<CantSendDetails> = {}): ErrUnknownErrorName {
-  return new ErrUnknownErrorName('ErrCantSend', { status: 'error', err_name: 'ErrCantSend', err_description: 'busy send refused',
-    err_details: { class: 'cant_send', reason: 'agent_command', resend_safe: false, retry_with: 'none', ...overrides } })
+export function errCantSend(overrides: Partial<CantSendDetails> = {}): AgentDirectorError {
+  const details = { class: 'cant_send', reason: 'agent_command', resend_safe: false, retry_with: 'none', ...overrides }
+  return ErrCantSend ? new ErrCantSend('send-keys', 'ErrCantSend', 'busy send refused', details)
+    : new ErrUnknownErrorName('ErrCantSend', { status: 'error', err_name: 'ErrCantSend', err_description: 'busy send refused', err_details: details })
 }
 /** SR-5 Result fixtures. Synthetic custody evidence, not live transport. */
 export function cannedBusyResult(overrides: Partial<BusyDeliveryResult> = {}): BusyDeliveryResult {
-  return { class: 'held', final: false, reason: 'turn_running', resend_safe: false, retry_with: 'none', wait: { reason: 'turn_running', since: '2026-11-13T00:00:00Z' }, instance_id: 'cscb_alpha', launch_token: 'launch-a', session_id: 'session', ...overrides }
+  return { class: 'held', final: false, reason: 'turn_running', resend_safe: false, retry_with: 'none', wait: { reason: 'turn_running', since: '2026-11-13T00:00:00Z' }, instance_id: 'cscb_alpha', launch_token: overrides.class === 'delivered_confirmed' || overrides.class === 'sent_unconfirmed' ? 'launch-a' : null, session_id: 'session', ...overrides }
 }
 export function cannedDeliveryLookup(result: BusyDeliveryResult | null = cannedBusyResult(), lookup: BusyDeliveryLookup['lookup'] = 'found'): BusyDeliveryLookup {
   return { lookup, result }

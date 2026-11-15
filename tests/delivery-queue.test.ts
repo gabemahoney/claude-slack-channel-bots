@@ -1107,8 +1107,9 @@ describe('b.r6d regression: durable covered queue', () => {
     await q.stop()
     const next = await open(); expect(next.callerUuid!() + '\n').toBe(published)
   })
-  test.each(['submitted', 'submission-blocked'] as const)('%s replays and compacts without losing pair, FIFO or attempt allocation', async kind => {
-    const submitted = submittedRecord(), blocked = { v: 1 as const, kind: 'submission-blocked' as const, seq: 1, attempt: 1, at: 1001, reason: 'uncertain outcome' }
+  test.each((['submitted', 'submission-blocked'] as const).flatMap(kind => [undefined, 'legacy-launch'].map(launch_token => [kind, launch_token] as const)))('%s with legacy launch token %s replays and compacts without losing pair, FIFO or attempt allocation', async (kind, launch_token) => {
+    const submitted = submittedRecord({ launch_token }), blocked = { v: 1 as const, kind: 'submission-blocked' as const, seq: 1, attempt: 1, at: 1001, reason: 'uncertain outcome' }
+    if (launch_token === undefined) delete submitted.launch_token
     seedQueue(dir, [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['one', 'two'] }, submitted, ...(kind === 'submission-blocked' ? [blocked] : [])])
     let q = await open()
     for (const compact of [false, true]) {

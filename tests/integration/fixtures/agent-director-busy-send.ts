@@ -42,9 +42,6 @@ if (verb === 'get') {
   const coverage = config.busy_send ?? 'absent'
   delete row.busy_send
   if (coverage !== 'absent') row.busy_send = coverage
-  // Legacy waiting rows have no public launch identity. A covered simulation
-  // must supply its own stable identity explicitly; never replace a real one.
-  if (!row.launch_token && config.synthetic_launch_token) row.launch_token = config.synthetic_launch_token
   row.delivery = { awaiting_turn_start: 0 }
   if (config.fallback_needs_get) { delete config.fallback_needs_get; save() }
   answer(row)

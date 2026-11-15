@@ -21,7 +21,8 @@
  *   STATE           ErrSpawnNotFound, ErrInstanceIdCollision,
  *                   ErrSpawnNotResumable, ErrSpawnNotInteractive,
  *                   ErrSpawnNotPausable, ErrNoSessionId, ErrJsonlMissing,
- *                   ErrJsonlNeverWritten, ErrInvalidFlags (its meaning is set
+ *                   ErrJsonlNeverWritten, validated ErrCantSend refusals,
+ *                   ErrInvalidFlags (its meaning is set
  *                   per call site)
  *   DIRECTORY       ErrCwdNotFound, ErrCwdNotADirectory
  *   UNCLASSIFIED    every other ErrInternal; ErrSchemaMismatch,
@@ -39,7 +40,8 @@
  * `src/agent-director-errors.ts`, including the native 0.12 internal,
  * configuration and store errors. An explicit `ErrUnknownErrorName` keeps
  * forward-compatible handling of the five legacy names through its
- * `unknownName` and envelope description; any other unknown name is
+ * `unknownName` and envelope description. A validated ErrCantSend envelope
+ * also retains refusal handling with the pinned client; any other unknown name is
  * UNAVAILABLE. Base errors merely named like those classes are UNCLASSIFIED.
  * CSCB's own `UnknownError` wrapper is recognised by its `errName`.
  *
@@ -144,6 +146,7 @@ import {
   ErrSchemaMigrationRequired,
   ErrStoreOpen,
   ErrCallTimeout,
+  ErrCantSend,
   ErrCwdNotADirectory,
   ErrCwdNotFound,
   ErrInstanceIdCollision,
@@ -459,16 +462,19 @@ export function classifyAdError(value: unknown): AdErrorClassification {
   }
 }
 
-/** One forward compatibility name check, confined to the classifier until E2.
- * Unknown names without valid structured refusal facts retain their old class.
+/** Accept the installed client's native class or the pinned client's unknown
+ * envelope. Neither named base errors nor malformed policy facts grant retry.
  */
 export function cantSendDetailsOf(value: unknown): CantSendDetails | undefined {
   try {
     const legacy = isAdErrorInstance(value, ErrUnknownErrorName) && readProp(value, 'unknownName') === 'ErrCantSend'
-    if (!legacy) return undefined
-    const details = readProp(readProp(value, 'envelope'), 'err_details')
-    if (readProp(details, 'class') !== 'cant_send' || typeof readProp(details, 'reason') !== 'string' ||
-      typeof readProp(details, 'resend_safe') !== 'boolean' || typeof readProp(details, 'retry_with') !== 'string') return undefined
+    const native = ErrCantSend !== undefined && isAdErrorInstance(value, ErrCantSend)
+    if (!legacy && !native) return undefined
+    const details = legacy ? readProp(readProp(value, 'envelope'), 'err_details') : readProp(value, 'errDetails')
+    const reason = readProp(details, 'reason'), retry = readProp(details, 'retry_with')
+    if (!details || typeof details !== 'object' || Array.isArray(details) || readProp(details, 'class') !== 'cant_send' ||
+      typeof reason !== 'string' || reason.length === 0 || typeof readProp(details, 'resend_safe') !== 'boolean' ||
+      typeof retry !== 'string' || retry.length === 0) return undefined
     return details as CantSendDetails
   } catch { return undefined }
 }

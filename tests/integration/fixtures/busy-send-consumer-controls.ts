@@ -12,7 +12,7 @@ export async function checkBusyPackedConsumer(root: string, held: any, final: an
   const queue = createDeliveryQueue({ stateDir: join(root, 'packed-consumer'), now: clock.now })
   await queue.start()
   const row = { instance_id: held.instance_id, state: 'waiting', agent: 'claude', busy_send: 'covered',
-    launch_token: 'fixture-launch', session_id: 'fixture-session', relay_mode: 'on', labels: { tag_prompt: '1' } }
+    session_id: 'fixture-session', relay_mode: 'on', labels: { tag_prompt: '1' } }
   const client = { get: async () => row, sendKeys: async () => { sends++; return held }, getDelivery: async () => ({ lookup: 'found', result: final }) }
   const engine = createDeliveryEngines({ queue, clock, lifecycle: createDeliveryLifecycle({ clock }),
     clientFor: async () => client, instanceId: () => row.instance_id, persona: () => ({ cwd: root, agent: 'claude' }),
@@ -34,14 +34,14 @@ export async function checkBusyPackedConsumer(root: string, held: any, final: an
   } finally { await engine.stop(); await queue.stop() }
 }
 
-/** Consume the actual shim's get as well as its custody responses. A legacy
+/** Consume the actual shim's get as well as its custody responses. A covered
  * waiting row has neither public launch_token nor pending-only launch start.
  * Only the raw transport's transcript write is simulated here; CI uses AD. */
 export async function checkBusyShimConsumer(root: string, mode: string, invoke: (verb: string, params: any) => any) {
   const pkg = process.env.CSCB_PKG_DIR ?? resolve(import.meta.dir, '../../..')
   const { createDeliveryQueue } = await import(join(pkg, 'src/delivery-queue.ts'))
   const { createDeliveryEngines, createDeliveryLifecycle } = await import(join(pkg, 'src/delivery-engine.ts'))
-  const { ErrUnknownErrorName } = await import(join(pkg, 'src/agent-director-errors.ts'))
+  const { ErrCantSend, ErrUnknownErrorName } = await import(join(pkg, 'src/agent-director-errors.ts'))
   let now = 1000, coveredSends = 0, lookups = 0, completions = 0, composer = ''
   const rawCalls: any[] = []
   const clock = { now: () => now, setTimeout: () => 0, clearTimeout: () => {} }
@@ -53,7 +53,11 @@ export async function checkBusyShimConsumer(root: string, mode: string, invoke: 
       const reply = invoke('send-keys', params)
       if (params.send_mode) coveredSends++
       else rawCalls.push(params)
-      if (reply.err_name) throw new ErrUnknownErrorName(reply.err_name, { status: 'error', ...reply })
+      if (reply.err_name) {
+        assert.equal(reply.err_name, 'ErrCantSend')
+        throw ErrCantSend ? new ErrCantSend('send-keys', reply.err_name, reply.err_description, reply.err_details)
+          : new ErrUnknownErrorName(reply.err_name, { status: 'error', ...reply })
+      }
       if (params.no_enter) composer = params.text
       else if (params.key === 'Enter') {
         appendFileSync(join(root, 'legacy-transcript.jsonl'), JSON.stringify({ type: 'user', uuid: `receipt-${mode}`,

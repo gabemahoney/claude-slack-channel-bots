@@ -17,7 +17,7 @@ export async function makeBusyHarness(options: { fs?: DeliveryQueueOptions['fs']
   const logs: string[] = [], notices: string[] = [], calls = makeStubCallLog()
   const script: StubClientOptions = { ...calls }
   const client = makeStubClient(script)
-  let row = cannedGetResult({ instance_id: 'cscb_alpha', busy_send: 'covered', launch_token: 'launch-a', session_id: 'session' })
+  let row = cannedGetResult({ instance_id: 'cscb_alpha', busy_send: 'covered', session_id: 'session' })
   let read: () => Promise<GetResult | undefined> = async () => row
   let call: CoveredDeliveryStep['call'] = async (_verb, run) => run(client)
   const module = await import('../../src/covered-delivery.ts')

@@ -1924,6 +1924,19 @@ afterEach(async () => { for (const h of busyHarnesses.splice(0)) await h.cleanup
 async function busy(options: Parameters<typeof makeBusyHarness>[0] = {}) { const h = await makeBusyHarness(options); busyHarnesses.push(h); return h }
 
 describe('b.r6d covered factory custody', () => {
+  test('covered waiting row without launch identity still sends', async () => {
+    const h = await busy()
+    delete h.row.launch_started_at
+    expect(h.row.state).toBe('waiting')
+    expect('launch_token' in h.row).toBe(false)
+    expect('launch_started_at' in h.row).toBe(false)
+    expect(await h.step()).toBe('waiting')
+    expect(h.calls.sendKeysCalls).toHaveLength(1)
+    expect(h.calls.sendKeysCalls[0]).toMatchObject({ instance_id: h.row.instance_id, send_mode: 'wait_turn' })
+    expect(h.intent()).toBeDefined()
+    expect('launch_token' in h.intent()).toBe(false)
+  })
+
   test.each([undefined, 'not_covered'] as const)('coverage %s preserves the legacy dispatch without a submission', async coverage => {
     const h = await busy(); h.row = { ...h.row, busy_send: coverage }
     expect(await h.step()).toBe('legacy')
@@ -1946,18 +1959,13 @@ describe('b.r6d covered factory custody', () => {
     expect(h.completions).toBe(0)
   })
 
-  test.each(['fresh-read', 'post-journal', 'no-identity'] as const)('launch change at %s prevents dispatch', async boundary => {
+  test.each(['fresh-read', 'post-journal'] as const)('conversation change at %s still submits to AD custody', async boundary => {
     const h = await busy(); let reads = 0
-    if (boundary === 'no-identity') h.row = { ...h.row, launch_token: null, launch_started_at: null }
-    h.read(async () => {
-      reads++
-      return boundary !== 'no-identity' && reads >= (boundary === 'fresh-read' ? 1 : 2) ? { ...h.row, launch_token: 'launch-b' } : h.row
-    })
+    h.read(async () => ++reads >= (boundary === 'fresh-read' ? 1 : 2) ? { ...h.row, session_id: 'session-b' } : h.row)
     expect(await h.step()).toBe('waiting')
-    expect(h.calls.sendKeysCalls).toEqual([])
-    const records = h.records()
-    expect(records.filter(r => r.kind === 'submitted').length).toBe(boundary === 'post-journal' ? 1 : 0)
-    expect(records.filter(r => r.kind === 'refused').length).toBe(boundary === 'post-journal' ? 1 : 0)
+    expect(h.calls.sendKeysCalls).toHaveLength(1)
+    expect(h.records().filter(r => r.kind === 'submitted')).toHaveLength(1)
+    expect(h.records().filter(r => r.kind === 'refused')).toEqual([])
   })
 
   test('missing matching client fails closed and notifies once without recording or typing', async () => {
@@ -1991,6 +1999,26 @@ describe('b.r6d covered factory custody', () => {
     const h = await busy(); h.script.sendKeysResult = cannedBusyResult({ class: klass })
     expect(await h.step()).toBe('waiting')
     expect(h.queue.openCount('alpha')).toBe(1); expect(h.completions).toBe(0)
+  })
+
+  test('Held custody survives pause/resume and records only the hand-over Result launch', async () => {
+    const h = await busy()
+    h.script.sendKeysResult = cannedBusyResult({ launch_token: null })
+    h.script.getDeliveryResult = cannedDeliveryLookup(cannedBusyResult({ launch_token: null }))
+    await h.step()
+    const intent = h.intent()
+    for (const state of ['ended', 'pending', 'waiting'] as const) {
+      h.row = { ...h.row, state }
+      await h.advance()
+      expect(await h.step()).toBe('waiting')
+    }
+    h.script.getDeliveryResult = cannedDeliveryLookup(cannedBusyResult({ class: 'delivered_confirmed', final: true,
+      reason: 'exact_intake', wait: null, launch_token: 'resumed-launch', session_id: 'result-session' }))
+    await h.advance()
+    expect(await h.step()).toBe('delivered')
+    expect(h.calls.sendKeysCalls).toHaveLength(1)
+    expect(h.calls.getDeliveryCalls).toEqual(Array(4).fill({ caller_uuid: intent.caller_uuid, delivery_request_id: intent.delivery_request_id }))
+    expect(h.records().at(-1)).toMatchObject({ kind: 'delivered', ad: { launch_token: 'resumed-launch', session_id: 'result-session' } })
   })
 
   // SR-3.3a/3.5/5.1/6.2/6.3 final reasons, plus unknown future reasons.
@@ -2095,7 +2123,7 @@ describe('b.r6d covered factory custody', () => {
   })
   test.each(['unknown', 'retention_expired'] as const)('%s lookup remains lookup-only through restart and capability loss', async lookup => {
     const h = await busy(); await h.step(); const intent = h.intent()
-    h.resetAdapter(); h.row = { ...h.row, busy_send: 'not_covered', launch_token: 'launch-b' }
+    h.resetAdapter(); h.row = { ...h.row, busy_send: 'not_covered' }
     h.script.getDeliveryResult = cannedDeliveryLookup(null, lookup)
     expect(await h.step()).toBe('waiting')
     await h.advance(h.module.COVERED_DELIVERY_RETRY_MS); await h.step()
@@ -2124,7 +2152,7 @@ describe('b.r6d regression: production engine path selection', () => {
       fsyncSync(fd: number) { if (paths.get(fd)?.includes('caller-uuid.') && paths.get(fd)?.endsWith('.tmp')) throw new Error('caller temp fsync'); fs.fsyncSync(fd) },
     } as typeof fs
     const h = await harness({ queueFs: seam })
-    h.p().row.busy_send = 'covered'; h.p().row.launch_token = 'launch-a'
+    h.p().row.busy_send = 'covered'
     await h.accept()
     await h.tick()
     expect(h.keyCalls()).toEqual([])
@@ -2145,7 +2173,7 @@ describe('b.r6d regression: production engine path selection', () => {
   })
   test.each(['coverage-change', 'safe-refusal'] as const)('b.r6d C2 completed covered part permits multipart legacy %s without resending part 1', async mode => {
     const h = await harness(), client = h.client(), row = h.p().row
-    row.busy_send = 'covered'; row.launch_token = 'launch-a'
+    row.busy_send = 'covered'
     const legacySend = client.sendKeys.bind(client), coveredTexts: string[] = []
     client.sendKeys = async params => {
       if (!params.send_mode) return legacySend(params)
@@ -2169,7 +2197,7 @@ describe('b.r6d regression: production engine path selection', () => {
   })
   test('b.r6d C2 unresolved covered custody still prevents raw replay and FIFO overtaking', async () => {
     const h = await harness(), client = h.client(), covered: string[] = []
-    h.p().row.busy_send = 'covered'; h.p().row.launch_token = 'launch-a'
+    h.p().row.busy_send = 'covered'
     client.sendKeys = async params => { covered.push(params.text!); return cannedBusyResult() }
     client.getDelivery = async () => cannedDeliveryLookup(null, 'unknown')
     await h.accept('first'); await h.accept('second')
@@ -2183,7 +2211,7 @@ describe('b.r6d regression: production engine path selection', () => {
     const script = { ...calls, sendKeysResult: cannedBusyResult() }
     const client = makeStubClient(script)
     const h = await harness({ clientFor: async () => client })
-    const row = { ...h.p().row, busy_send: coverage, launch_token: 'launch-a' }
+    const row = { ...h.p().row, busy_send: coverage }
     client.get = async params => { calls.getCalls.push(params); return row }
     await h.accept('original bytes')
     await h.tick()
@@ -2200,7 +2228,7 @@ describe('b.r6d regression: production engine path selection', () => {
     const h = await harness(); const client = h.client(); let keys = 0
     client.sendKeys = async params => { keys++; h.calls.push({ key: 'alpha', verb: 'send-keys', at: h.clock.now(), params }); return {} }
     let reads = 0
-    client.get = async () => ({ ...h.p().row, busy_send: ++reads >= (boundary === 'before-text' ? 2 : 4) ? 'covered' : 'not_covered', launch_token: 'launch-a' })
+    client.get = async () => ({ ...h.p().row, busy_send: ++reads >= (boundary === 'before-text' ? 2 : 4) ? 'covered' : 'not_covered' })
     await h.accept(); await h.tick(); await h.advance(ENTER_DELAY_MS + 1)
     expect(h.keyCalls().filter(c => c.params.key)).toEqual([])
     if (boundary === 'before-text') expect(h.keyCalls().filter(c => c.params.no_enter)).toEqual([])
@@ -2234,7 +2262,7 @@ describe('b.r6d covered journal failure boundaries', () => {
     expect(h.queue.openCount('alpha')).toBe(0)
   })
 
-  test('launch changes during the submitted fsync retire the unsent intent before any AD dispatch', async () => {
+  test('coverage loss during the submitted fsync retires the unsent intent before any AD dispatch', async () => {
     const paths = new Map<number, string>()
     let h: BusyHarness | undefined, changed = false
     const seam = { ...fs,
@@ -2243,7 +2271,7 @@ describe('b.r6d covered journal failure boundaries', () => {
         fs.fsyncSync(fd)
         const path = paths.get(fd)
         if (h && !changed && path?.endsWith('.jsonl') && fs.readFileSync(path, 'utf8').includes('"kind":"submitted"')) {
-          changed = true; h.row = { ...h.row, launch_token: 'launch-b' }
+          changed = true; h.row = { ...h.row, busy_send: 'not_covered' }
         }
       },
     } as typeof fs
@@ -2318,7 +2346,7 @@ describe('b.r6d regression: covered production engine outcomes', () => {
     const calls = makeStubCallLog(), notices: string[] = []
     const client = makeStubClient({ ...calls, sendKeysResult: cannedBusyResult({ class: klass, final, reason, wait: final ? null : { reason, since: '2026-11-13T00:00:00Z' } }) })
     const h = await harness({ clientFor: async () => client, onCoveredBlocked: (_key, reason) => notices.push(reason) })
-    client.get = async () => ({ ...h.p().row, busy_send: 'covered', launch_token: 'launch-a' })
+    client.get = async () => ({ ...h.p().row, busy_send: 'covered' })
     await h.accept(); await h.tick()
     expect(calls.sendKeysCalls).toHaveLength(1)
     expect(calls.sendKeysCalls[0]).toMatchObject({ send_mode: 'wait_turn', confirmed_delivery: true })
@@ -2334,7 +2362,7 @@ describe('b.r6d regression: covered production engine outcomes', () => {
     const calls = makeStubCallLog()
     const client = makeStubClient({ ...calls, sendKeysResult: cannedBusyResult({ class: 'sent_unconfirmed', final: true, reason: 'handed_over_not_proven', wait: null }) })
     const h = await harness({ clientFor: async () => client })
-    client.get = async () => ({ ...h.p().row, busy_send: 'covered', launch_token: 'launch-a' })
+    client.get = async () => ({ ...h.p().row, busy_send: 'covered' })
     await h.accept('two parts', 'alpha', ['first', 'second']); await h.tick()
     expect(calls.sendKeysCalls[0]).toMatchObject({ text: 'first', send_mode: 'wait_turn' })
     expect(h.events.filter(e => e.type === 'delivered')).toHaveLength(1)

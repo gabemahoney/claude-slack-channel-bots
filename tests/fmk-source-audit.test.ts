@@ -1208,10 +1208,16 @@ function phase1ReadFindings(sf: ts.SourceFile): string[] {
   return [
     ...agentDirectorValueReads(sf, AUDITED_ERROR_NAMES)
       .filter((read) => !ts.isImportSpecifier(read.node) && !ts.isExportSpecifier(read.node))
+      .filter((read) => !(sf.fileName === ERRORS_FILE && read.node.getText(sf) === OPTIONAL_CANT_SEND_READ &&
+        ts.isVariableDeclaration(read.node.parent) && read.node.parent.name.getText(sf) === 'ErrCantSend'))
       .map((read) => finding(sf, read.node, read.what)),
     ...agentDirectorNamespaceArguments(sf).map((arg) => finding(sf, arg, 'the agent-director namespace passed to a call')),
   ]
 }
+
+// The pin omits ErrCantSend. Permit only its direct optional native export at
+// the import boundary: no fallback expression, other class or other file.
+const OPTIONAL_CANT_SEND_READ = '(clientErrors as unknown as { readonly ErrCantSend?: typeof AgentDirectorError }).ErrCantSend'
 
 /** Whether `node` is `this.name` or `this['name']`. */
 function isThisName(node: ts.Expression): boolean {
@@ -1368,6 +1374,13 @@ describe('src/agent-director-errors.ts re-exports the three Phase-1-only classes
 })
 
 describe('no file in src/ or tests/test-helpers/ reads a Phase-1-only class from agent-director but by a named import or re-export', () => {
+  test('C1 optional ErrCantSend export is confined to its exact boundary and has no fallback', () => {
+    const source = "import * as clientErrors from 'agent-director'\nexport const ErrCantSend = " + OPTIONAL_CANT_SEND_READ
+    expect(phase1ReadFindings(parseSource(ERRORS_FILE, source))).toEqual([])
+    expect(phase1ReadFindings(parseSource('src/elsewhere.ts', source)).length).toBeGreaterThan(0)
+    expect(phase1ReadFindings(parseSource(ERRORS_FILE, source + ' ?? class ErrCantSend extends AgentDirectorError {}')).length).toBeGreaterThan(0)
+    expect(phase1ReadFindings(parseSource(ERRORS_FILE, source.replaceAll('ErrCantSend', 'ErrTmuxKillFailed'))).length).toBeGreaterThan(0)
+  })
   const flagged: ReadonlyArray<readonly [string, string]> = [
     ['the rejected namespace/fallback busy-send export', "import * as ad from 'agent-director'\nexport const ErrCantSend = ad.ErrCantSend ?? class ErrCantSend extends ad.AgentDirectorError {}"],
     ['a namespace property read', `${AD_NS}\nconst killFailed = ad.ErrTmuxKillFailed`],

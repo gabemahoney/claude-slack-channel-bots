@@ -4,7 +4,6 @@
  * Candidate runs must separately prove that client's actual option forwarding.
  */
 import assert from 'node:assert/strict'
-import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -17,7 +16,7 @@ const { Client } = await import(Bun.resolveSync('agent-director', pkg))
 const { createDeliveryQueue } = await moduleAt('delivery-queue')
 const { createDeliveryEngines, createDeliveryLifecycle } = await moduleAt('delivery-engine')
 const { createCoveredReconnect } = await moduleAt('covered-delivery')
-const { ErrUnknownErrorName } = await moduleAt('agent-director-errors')
+const { ErrCantSend, ErrUnknownErrorName } = await moduleAt('agent-director-errors')
 const ad = await Client.create()
 const bin = join(process.env.HOME!, '.config/agent-director/bin')
 const control = join(bin, 'agent-director-busy-send.json')
@@ -26,7 +25,6 @@ const covered = ['fallback', 'covered', 'unknown'].includes(mode)
 // contract, and fails visibly if an E2 candidate covers this launch.
 if (mode !== 'absent') writeFileSync(control, JSON.stringify({ instance_id: instance,
   busy_send: covered ? 'covered' : 'not_covered',
-  synthetic_launch_token: covered ? `cscb-test-50:${randomUUID()}` : undefined,
   send: mode === 'fallback' ? 'agent_not_covered' : 'held', lookup: mode === 'unknown' ? 'unknown' : 'final' }))
 
 const wireCalls: { verb: string; params: any }[] = []
@@ -50,7 +48,8 @@ async function custody(verb: string, params: Record<string, unknown>) {
   if (code) {
     const error = JSON.parse(stderr)
     assert.equal(error.err_name, 'ErrCantSend')
-    throw new ErrUnknownErrorName(error.err_name, { status: 'error', ...error })
+    throw ErrCantSend ? new ErrCantSend(verb, error.err_name, error.err_description, error.err_details)
+      : new ErrUnknownErrorName(error.err_name, { status: 'error', ...error })
   }
   return JSON.parse(stdout)
 }
@@ -87,7 +86,6 @@ try {
   const row = await ad.get({ instance_id: instance })
   if (mode === 'absent') assert.equal(row.busy_send, undefined, 'legacy runtime must really omit busy_send')
   else assert.equal(row.busy_send, covered ? 'covered' : 'not_covered')
-  if (covered) assert(row.launch_token || row.launch_started_at, 'synthetic covered row lacks launch identity')
   assert.equal(row.state, 'waiting')
   assert.equal(row.labels?.tag_prompt, '1')
   const text = `dual-path ${mode}\nexact 🙂 bytes`

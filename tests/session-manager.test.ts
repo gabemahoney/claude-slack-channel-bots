@@ -24722,7 +24722,7 @@ describe('b.r6d regression: covered production reconnect default off', () => {
     const { clearNotConnectedEpisodes, setDeliveryPersonaLookup } = await import('../src/session-manager.ts')
     setDeliveryPersonaLookup(key => harnessPersona(h, key))
     for (const key of [p, b]) {
-      h.script({ getResult: harnessRow(h, harnessPersona(h, key), { state: 'waiting', busy_send: 'covered', launch_token: key + '-launch' }) })
+      h.script({ getResult: harnessRow(h, harnessPersona(h, key), { state: 'waiting', busy_send: 'covered' }) })
       await readPersonaOwnRow(key, STATUS_READ_SITE)
     }
     forgetNotConnectedEpisode(p)
@@ -24744,7 +24744,7 @@ describe('b.r6d regression: covered production reconnect default off', () => {
     life.setReconnect(async () => { retries++ })
     life.defer(p)
     expect(h.clock.pendingCount()).toBeGreaterThan(0)
-    const row = harnessRow(h, harnessPersona(h, p), { state: 'waiting', busy_send: 'covered', launch_token: 'r6d-default-off-launch' })
+    const row = harnessRow(h, harnessPersona(h, p), { state: 'waiting', busy_send: 'covered' })
     h.script({ getResult: row })
     const first = reconnectMcpWithCause(p, WAITING_READ)
     await h.clock.flush()
@@ -24775,7 +24775,7 @@ describe('b.r6d regression: covered production reconnect default off', () => {
 describe('b.r6d covered reconnect factory E6 seam', () => {
   async function fixture(enabled?: boolean) {
     const { createCoveredReconnect, buildCoveredRestartNotice } = await import('../src/covered-delivery.ts')
-    const row = cannedGetResult({ instance_id: 'cscb_test', busy_send: 'covered', launch_token: 'launch-a' })
+    const row = cannedGetResult({ instance_id: 'cscb_test', busy_send: 'covered' })
     const calls: string[] = [], logs: string[] = [], notices: string[] = []
     let current: GetResult | undefined = row, ready = true, pauseError: Error | undefined
     const run = createCoveredReconnect(enabled === undefined ? {} : { onlyIfWaiting: enabled })
@@ -24789,13 +24789,13 @@ describe('b.r6d covered reconnect factory E6 seam', () => {
       row(value: GetResult | undefined) { current = value }, ready(value: boolean) { ready = value }, error(value: Error) { pauseError = value } }
   }
 
-  test('default off announces once per persona and launch with no reads, pause or resume', async () => {
+  test('default off announces once per persona and conversation with no reads, pause or resume', async () => {
     const h = await fixture()
     expect(await h.run()).toBe('restart-required')
     expect(await h.run()).toBe('restart-required')
     expect(h.calls).toEqual([])
     expect(h.notices).toEqual([h.notice]); expect(h.logs).toHaveLength(1)
-    h.input.row = { ...h.input.row, launch_token: 'launch-b' }
+    h.input.row = { ...h.input.row, session_id: 'session-b' }
     expect(await h.run()).toBe('restart-required')
     expect(h.notices).toEqual([h.notice, h.notice]); expect(h.logs).toHaveLength(2)
   })
@@ -24812,10 +24812,10 @@ describe('b.r6d covered reconnect factory E6 seam', () => {
     expect(h.calls.filter(call => call === 'pause')).toHaveLength(5)
     expect(h.notices).toHaveLength(5)
   })
-  test('b.r6d C6 a replaced launch discards old disabled state even if a token is seen again', async () => {
+  test('b.r6d C6 a replaced conversation discards old disabled state even if a session is seen again', async () => {
     const h = await fixture(true); h.error(errInvalidFlags('pause'))
-    for (const launch_token of ['launch-a', 'launch-b', 'launch-a']) {
-      h.input.row = { ...h.input.row, launch_token }; h.row(h.input.row)
+    for (const session_id of ['session-a', 'session-b', 'session-a']) {
+      h.input.row = { ...h.input.row, session_id }; h.row(h.input.row)
       await h.run()
     }
     expect(h.calls.filter(call => call === 'pause')).toHaveLength(3)
@@ -24832,7 +24832,7 @@ describe('b.r6d covered reconnect factory E6 seam', () => {
     const pending = h.run(); await entry
     if (action === 'forget') h.factory.forget('test')
     else if (action === 'clear') h.factory.clear()
-    else await h.factory({ ...h.input, row: { ...h.input.row, launch_token: 'launch-new' }, ready: () => false })
+    else await h.factory({ ...h.input, row: { ...h.input.row, session_id: 'session-new' }, ready: () => false })
     release()
     expect(await pending).toBe('deferred')
     expect(h.calls.includes('resume')).toBe(false)
@@ -24848,13 +24848,13 @@ describe('b.r6d covered reconnect factory E6 seam', () => {
     expect(await h.run()).toBe('deferred')
     expect(h.calls).toEqual(['get', 'pause']); expect(h.notices).toEqual([])
   })
-  test.each((['pause_in_progress', 'pause_uncertain'] as const).flatMap(cause => (['waiting', 'ended', 'missing', 'changed-launch', 'unreadable'] as const).map(state => [cause, state] as const)))('E6 %s/%s resumes only with same-launch finished evidence', async (cause, state) => {
+  test.each((['pause_in_progress', 'pause_uncertain'] as const).flatMap(cause => (['waiting', 'ended', 'missing', 'changed-session', 'unreadable'] as const).map(state => [cause, state] as const)))('E6 %s/%s resumes only with same-conversation finished evidence', async (cause, state) => {
     const h = await fixture(true); h.error(errConditionalPause('pause', cause))
     let reads = 0
     h.input.readRow = async () => {
       h.calls.push('get')
       if (++reads === 1) return h.input.row
-      return state === 'unreadable' ? undefined : { ...h.input.row, state: state === 'changed-launch' ? 'ended' : state, launch_token: state === 'changed-launch' ? 'launch-b' : 'launch-a' }
+      return state === 'unreadable' ? undefined : { ...h.input.row, state: state === 'changed-session' ? 'ended' : state, session_id: state === 'changed-session' ? 'session-b' : h.input.row.session_id }
     }
     const completed = state === 'ended' || state === 'missing'
     expect(await h.run()).toBe(completed ? 'ok' : 'deferred')
@@ -24869,21 +24869,21 @@ describe('b.r6d covered reconnect factory E6 seam', () => {
     expect(h.calls).toEqual(['get', 'pause', 'get'])
     expect(h.notices).toEqual(busy_send === 'covered' ? [h.notice] : [])
   })
-  test('E6 malformed pause disables that launch; a later launch may try again', async () => {
+  test('E6 malformed pause disables that conversation; a later conversation may try again', async () => {
     const h = await fixture(true); h.error(errInvalidFlags('pause'))
     expect(await h.run()).toBe('restart-required')
     expect(await h.run()).toBe('restart-required')
     expect(h.calls).toEqual(['get', 'pause'])
     expect(h.logs.filter(l => l.includes('malformed covered pause'))).toHaveLength(1)
     expect(h.notices).toEqual([h.notice])
-    h.input.row = { ...h.input.row, launch_token: 'launch-b' }; h.row(h.input.row)
+    h.input.row = { ...h.input.row, session_id: 'session-b' }; h.row(h.input.row)
     expect(await h.run()).toBe('restart-required')
     expect(h.calls).toEqual(['get', 'pause', 'get', 'pause'])
   })
-  test.each(['before-read', 'changed-launch', 'after-read', 'after-pause'] as const)('E6 %s revocation prevents lifecycle action', async boundary => {
+  test.each(['before-read', 'changed-session', 'after-read', 'after-pause'] as const)('E6 %s revocation prevents lifecycle action', async boundary => {
     const h = await fixture(true)
     if (boundary === 'before-read') h.ready(false)
-    if (boundary === 'changed-launch') h.row({ ...h.input.row, launch_token: 'launch-b' })
+    if (boundary === 'changed-session') h.row({ ...h.input.row, session_id: 'session-b' })
     if (boundary === 'after-read') h.input.readRow = async () => { h.calls.push('get'); h.ready(false); return h.input.row }
     if (boundary === 'after-pause') h.input.pause = async () => { h.calls.push('pause'); h.ready(false) }
     expect(await h.run()).toBe('deferred')
@@ -24915,7 +24915,7 @@ describe('b.r6d enabled production reconnect callbacks: lifecycle leases', () =>
     const clock = createFakeClock()
     const key = 'r6d-enabled', calls = makeStubCallLog()
     life = createDeliveryLifecycle({ clock })
-    const row = cannedGetResult({ instance_id: personaInstanceId(key), busy_send: 'covered', launch_token: 'launch-a', state: 'waiting' })
+    const row = cannedGetResult({ instance_id: personaInstanceId(key), busy_send: 'covered', state: 'waiting' })
     life.observeRow(key, row)
     const log: string[] = [], notices: unknown[] = [], owners: string[] = []
     let paused = false
@@ -24949,7 +24949,7 @@ describe('b.r6d enabled production reconnect callbacks: lifecycle leases', () =>
   test('ownership revoked during paused-row read prevents resume and does not release a newer lease', async () => {
     const key = 'r6d-revoked', clock = createFakeClock(), calls = makeStubCallLog()
     life = createDeliveryLifecycle({ clock })
-    const row = cannedGetResult({ instance_id: personaInstanceId(key), busy_send: 'covered', launch_token: 'launch-a', state: 'waiting' })
+    const row = cannedGetResult({ instance_id: personaInstanceId(key), busy_send: 'covered', state: 'waiting' })
     life.observeRow(key, row)
     let reads = 0, releaseOther: (() => void) | undefined
     const client = makeStubClient(calls)

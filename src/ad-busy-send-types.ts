@@ -26,7 +26,6 @@ export type NotPausableCause = 'not_waiting' | 'turn_pending' | 'pause_in_progre
 declare module 'agent-director' {
   interface GetResult {
     busy_send?: 'covered' | 'not_covered'
-    launch_token?: string | null
     delivery?: { awaiting_turn_start: number }
   }
   interface SendKeysParams {

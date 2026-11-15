@@ -12,7 +12,7 @@ export function assertBusyFixtureResult(value: any): void {
   assert(value.wait === null || (typeof value.wait?.reason === 'string' && typeof value.wait?.since === 'string'), 'wait must be explicit')
 }
 export function fixtureBusyResult(identity: { instance_id: string; caller_uuid: string; request_id: string }, final: boolean) {
-  const value = { ...identity, session_id: 'fixture-session', launch_token: null, evidence_kind: null,
+  const value = { ...identity, session_id: 'fixture-session', launch_token: final ? 'fixture-handover' : null, evidence_kind: null,
     class: final ? 'delivered_confirmed' : 'held', final, resend_safe: false, retry_with: 'none',
     reason: final ? 'fixture_confirmation' : 'route_unavailable',
     wait: final ? null : { reason: 'route_unavailable', since: '2026-11-13T00:00:00Z' } }

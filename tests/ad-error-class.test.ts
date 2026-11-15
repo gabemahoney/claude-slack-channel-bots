@@ -2312,19 +2312,23 @@ describe('classifyAdError: pure', () => {
 })
 
 import { errCantSend } from './test-helpers/agent-director-stub.ts'
+import { ErrCantSend } from '../src/agent-director-errors.ts'
 describe('b.r6d regression: structured busy-send errors', () => {
   test.each(['fixture-envelope', 'direct-envelope'] as const)('%s pinned-client CantSend preserves machine facts and limit/result without description parsing', async form => {
     const { cantSendDetailsOf } = await import('../src/ad-error-class.ts')
     const facts = { class: 'cant_send' as const, reason: 'held_bytes', resend_safe: true, retry_with: 'new_send', limit: { actual: 101, allowed: 100 } }
     const error = form === 'fixture-envelope' ? errCantSend(facts) : new ErrUnknownErrorName('ErrCantSend', { err_name: 'ErrCantSend', err_details: facts })
-    expect(error).toBeInstanceOf(ErrUnknownErrorName)
+    expect(error).toBeInstanceOf(form === 'fixture-envelope' && ErrCantSend ? ErrCantSend : ErrUnknownErrorName)
     expect(cantSendDetailsOf(error)).toEqual(facts)
   })
   test.each([
     { class: 'wrong', reason: 'held_count', resend_safe: true, retry_with: 'new_send' },
     { class: 'cant_send', reason: null, resend_safe: true, retry_with: 'new_send' },
+    { class: 'cant_send', reason: '', resend_safe: true, retry_with: 'new_send' },
     { class: 'cant_send', reason: 'held_count', resend_safe: 'true', retry_with: 'new_send' },
     { class: 'cant_send', reason: 'held_count', resend_safe: true, retry_with: null },
+    { class: 'cant_send', reason: 'held_count', resend_safe: true, retry_with: '' },
+    [],
     null,
   ])('malformed refusal facts %j remain uncertain', async err_details => {
     const { cantSendDetailsOf } = await import('../src/ad-error-class.ts')

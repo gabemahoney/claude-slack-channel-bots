@@ -33,10 +33,6 @@ export function hasUnresolvedCoveredCustody(item: QueueItem): boolean {
 }
 
 export function isCoveredRow(row: GetResult): boolean { return row.busy_send === 'covered' }
-/** Session IDs survive resume; bind every decision to AD's launch identity. */
-export function busyLaunchIdentity(row: GetResult): string | undefined {
-  return row.launch_token || row.launch_started_at || undefined
-}
 export function queueItemId(item: QueueItem): string {
   // Adopt old accepted records without rewriting immutable intake. The digest
   // is stable through compaction/restart and exposes no Slack text or IDs.
@@ -135,7 +131,7 @@ export function createCoveredDelivery(deps: {
       after.set(key, deps.now() + COVERED_DELIVERY_POLL_MS)
       const client = await input.client()
       if (typeof client.getDelivery !== 'function') {
-        if (log(key, busyLaunchIdentity(row) ?? 'unknown', 'CSCB compatibility bug: covered delivery requires AD E2 client getDelivery; install the matching client')) deps.notify?.(key, 'matching AD client required')
+        if (log(key, headId, 'CSCB compatibility bug: covered delivery requires AD E2 client getDelivery; install the matching client')) deps.notify?.(key, 'matching AD client required')
         return 'blocked'
       }
       if (submitted) {
@@ -163,14 +159,14 @@ export function createCoveredDelivery(deps: {
       const fresh = await input.readRow()
       if (!fresh || !input.ready()) return 'waiting'
       if (!isCoveredRow(fresh)) return 'legacy'
-      const launch = busyLaunchIdentity(fresh)
-      if (!launch || launch !== busyLaunchIdentity(row)) return 'waiting'
+      // AD owns conversation custody across pause/resume. A waiting/working row has
+      // no launch identity; only a handed-over Result supplies launch_token.
       const caller = deps.queue.callerUuid?.()
-      if (!caller) { log(key, launch, 'covered delivery held: durable caller UUID unavailable'); return 'blocked' }
+      if (!caller) { log(key, headId, 'covered delivery held: durable caller UUID unavailable'); return 'blocked' }
       const attempt = item.nextAttempt
       const earlier = item.records.some(r => r.kind === 'submitted' && r.part === part)
       const id = `cscb/${key}/${queueItemId(item)}/${part}${earlier ? `/retry-${attempt}` : ''}`
-      const intent: SubmittedRecord = { v: 1, kind: 'submitted', seq: item.accepted.seq, attempt, part, at: deps.now(), caller_uuid: caller, delivery_request_id: id, instance_id: fresh.instance_id, launch_token: launch, session_id: fresh.session_id }
+      const intent: SubmittedRecord = { v: 1, kind: 'submitted', seq: item.accepted.seq, attempt, part, at: deps.now(), caller_uuid: caller, delivery_request_id: id, instance_id: fresh.instance_id, session_id: fresh.session_id }
       await deps.queue.append(key, intent)
       // This live caller can prove it has not invoked send-keys yet. Retire
       // that intent if a guard/read/budget refuses before dispatch. A crash
@@ -179,7 +175,7 @@ export function createCoveredDelivery(deps: {
       let beforeSend: GetResult | undefined
       try { beforeSend = await input.readRow() }
       catch (error) { await refused(input, intent); throw error }
-      if (!beforeSend || !input.ready() || !isCoveredRow(beforeSend) || busyLaunchIdentity(beforeSend) !== launch) {
+      if (!beforeSend || !input.ready() || !isCoveredRow(beforeSend)) {
         await refused(input, intent); return 'waiting'
       }
       let dispatched = false
@@ -202,7 +198,7 @@ export function createCoveredDelivery(deps: {
           await refused(input, intent)
           const current = await input.readRow()
           if (!current || isCoveredRow(current)) {
-            log(key, launch, 'agent_not_covered: waiting for a fresh uncovered row before fallback')
+            log(key, id, 'agent_not_covered: waiting for a fresh uncovered row before fallback')
             after.set(key, deps.now() + COVERED_DELIVERY_RETRY_MS)
             return 'waiting'
           }
@@ -220,18 +216,22 @@ export function createCoveredDelivery(deps: {
 }
 
 export type CoveredReconnectAction = 'legacy' | 'ok' | 'deferred' | 'restart-required'
-/** E6 path has an explicit test seam. Production uses the default-off flag. */
+/** E6 path has an explicit test seam. Production uses the default-off flag.
+ * Session IDs guard conversation changes, not launches. After conditional pause,
+ * only a fresh ended/missing row of that conversation permits resume. Revisit
+ * this path against E6's final contract before enabling it.
+ */
 export function createCoveredReconnect(options: { onlyIfWaiting?: boolean } = {}) {
-  const states = new Map<string, { launch?: string; disabled: boolean; announced: boolean }>()
+  const states = new Map<string, { session: string; disabled: boolean; announced: boolean }>()
   const run = async (input: {
     key: string; row: GetResult; readRow(): Promise<GetResult | undefined>
     pause(): Promise<unknown>; resume(): Promise<unknown>; ready(): boolean
     log(reason: string): void; notify(text: string): void
   }): Promise<CoveredReconnectAction> => {
     if (!isCoveredRow(input.row)) { states.delete(input.key); return 'legacy' }
-    const launch = busyLaunchIdentity(input.row)
+    const session = input.row.session_id
     let state = states.get(input.key)
-    if (!state || state.launch !== launch) { state = { launch, disabled: false, announced: false }; states.set(input.key, state) }
+    if (!state || state.session !== session) { state = { session, disabled: false, announced: false }; states.set(input.key, state) }
     const current = state
     const ready = () => states.get(input.key) === current && input.ready()
     const announce = () => {
@@ -239,10 +239,10 @@ export function createCoveredReconnect(options: { onlyIfWaiting?: boolean } = {}
       if (!current.announced) { current.announced = true; input.log('covered reconnect unavailable: restart the persona'); input.notify(buildCoveredRestartNotice({ key: input.key })) }
       return 'restart-required' as const
     }
-    if (!(options.onlyIfWaiting ?? COVERED_RECONNECT_ONLY_IF_WAITING) || current.disabled || !launch) return announce()
+    if (!(options.onlyIfWaiting ?? COVERED_RECONNECT_ONLY_IF_WAITING) || current.disabled) return announce()
     if (!ready()) return 'deferred'
     let row = await input.readRow()
-    if (!row || busyLaunchIdentity(row) !== launch || !ready()) return 'deferred'
+    if (!row || row.session_id !== session || !ready()) return 'deferred'
     if (!isCoveredRow(row)) return 'legacy'
     try { await input.pause() }
     catch (error) {
@@ -255,10 +255,10 @@ export function createCoveredReconnect(options: { onlyIfWaiting?: boolean } = {}
       if (!row || !ready()) return 'deferred'
       if (cause === 'agent_not_covered') return !isCoveredRow(row) ? 'legacy' : announce()
       // pause_in_progress/pause_uncertain: only the row can prove completion.
-      if (busyLaunchIdentity(row) !== launch || !['ended', 'missing'].includes(row.state)) return 'deferred'
+      if (row.session_id !== session || !['ended', 'missing'].includes(row.state)) return 'deferred'
     }
     row = await input.readRow()
-    if (!row || !ready() || busyLaunchIdentity(row) !== launch || !['ended', 'missing'].includes(row.state)) return 'deferred'
+    if (!row || !ready() || row.session_id !== session || !['ended', 'missing'].includes(row.state)) return 'deferred'
     await input.resume()
     return 'ok'
   }

@@ -107,9 +107,12 @@
  */
 
 import { AgentDirectorError } from 'agent-director'
-// The pinned client has no native ErrCantSend class. Its real
-// ErrUnknownErrorName envelope is handled only in ad-error-class.ts;
-// adopt a named native re-export when the matching client is installed.
+import * as clientErrors from 'agent-director'
+/** The sole optional native-class read: 0.12.0 has no ErrCantSend export.
+ * Keep the actual installed constructor, or undefined; never create a fallback
+ * class. Replace with a named re-export when the package pin includes it.
+ */
+export const ErrCantSend = (clientErrors as unknown as { readonly ErrCantSend?: typeof AgentDirectorError }).ErrCantSend
 export type { CantSendDetails, NotPausableCause } from './ad-busy-send-types.ts'
 
 /**

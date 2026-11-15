@@ -336,10 +336,17 @@ and `fixtures/busy-send-controls.ts`; no Python fixture is used.
 including caller/request/instance/session identity, explicit `launch_token`
 and `evidence_kind` (nullable), and `wait`; unknown lookup returns `result: null`.
 `fixtures/busy-send-consumer-controls.ts` feeds these responses through the
-production queue/engine. The controls require a complete Final to finish
-durably and the old missing-launch-token Final to fail the actual journal
+production queue/engine with covered waiting rows that omit both launch fields.
+No shim adds a synthetic row launch token; only the hand-over Result sets it.
+The controls require a complete Final to finish durably and the old missing-launch-token Final to fail the actual journal
 consumer, rather than weakening its validator. They can also use the packed
 package via `CSCB_PKG_DIR`; this remains synthetic evidence.
+
+`bun tests/integration/fixtures/busy-send-client-controls.ts [client-package]`
+drives the installed pin or an explicit extracted candidate's real subprocess
+decoder against an inert executable, then tests refusal fallback/capacity retry
+and conditional-pause details through CSCB. It reads the candidate only and
+does not prove native-agent transport or enable conditional pause.
 
 Scenario runtime provenance accepts prerelease/build suffixes only when
 the release record has boolean `candidate_overlay: true`. Ordinary records

@@ -44,7 +44,8 @@ export interface AcceptedRecord extends BaseRecord, AcceptedInput {
 export interface SubmittedRecord extends BaseRecord {
   kind: 'submitted'; attempt: number; part: number; at: number
   caller_uuid: string; delivery_request_id: string; instance_id: string
-  launch_token: string; session_id: string
+  /** Retained for old journals only; AD binds launch_token after hand-over. */
+  launch_token?: string; session_id: string
 }
 /** Terminal local handling. Unknown delivery never authorizes a new send. */
 export interface SubmissionBlockedRecord extends BaseRecord {
@@ -164,7 +165,7 @@ export function isQueueRecord(value: unknown): value is QueueRecord {
       if (r.files !== undefined && (!Array.isArray(r.files) || !r.files.every(f => object(f) && str(f.name) && (f.mimetype === undefined || str(f.mimetype)) && (f.size === undefined || number(f.size))))) return false
       return r.source === 'slack' ? isSlackKey(r.key) && str(r.channel) && str(r.via) : timestamp(r.ts) && str(r.sender) && r.key === undefined
     case 'fixed': return Array.isArray(r.parts) && r.parts.length > 0 && r.parts.every(p => str(p) && p !== '')
-    case 'submitted': return positive(r.attempt) && positive(r.part) && number(r.at) && ['caller_uuid', 'delivery_request_id', 'instance_id', 'launch_token', 'session_id'].every(k => str(r[k]) && r[k] !== '')
+    case 'submitted': return positive(r.attempt) && positive(r.part) && number(r.at) && ['caller_uuid', 'delivery_request_id', 'instance_id', 'session_id'].every(k => str(r[k]) && r[k] !== '') && (r.launch_token === undefined || (str(r.launch_token) && r.launch_token !== ''))
     case 'submission-blocked': return positive(r.attempt) && number(r.at) && str(r.reason)
     case 'sent':
       if (!positive(r.attempt) || !number(r.at)) return false

@@ -44,10 +44,12 @@ try {
   const held = run(request)
   assertBusyFixtureResult(held)
   assert.equal(held.class, 'held')
+  assert.equal(held.launch_token, null)
   const lookup = ['get-delivery', '--caller-uuid', 'caller', '--delivery-request-id', 'request']
   const final = run(lookup).result
   assertBusyFixtureResult(final)
   assert.equal(final.class, 'delivered_confirmed')
+  assert.equal(final.launch_token, 'fixture-handover')
   for (const field of ['instance_id', 'launch_token', 'wait', 'session_id', 'caller_uuid', 'request_id', 'evidence_kind']) {
     const incomplete = { ...final }; delete incomplete[field]
     assert.throws(() => assertBusyFixtureResult(incomplete), `accepted incomplete ${field}`)
@@ -66,22 +68,18 @@ try {
   assert.equal(calls.length, 13)
   assert(calls.every(line => line.startsWith('call\t')))
   console.log('recorded: busy-send shim controls passed (scope, absent/not_covered, fresh-get barrier, no raw keys, held/final/unknown, wrong ID and duplicate negatives)')
-  // AD 0.17.1's waiting get omits both launch fields. The old control above
-  // supplied its own token directly to the engine and missed this boundary.
+  // Covered waiting get rows, like legacy waiting rows, omit launch identity.
   const legacyRow = { instance_id: 'own', state: 'waiting', session_id: 'legacy-session', agent: 'claude',
     cwd: root, relay_mode: 'on', labels: { tag_prompt: '1' }, jsonl_path: join(root, 'legacy-transcript.jsonl') }
   writeFileSync(`${real}.json`, JSON.stringify(legacyRow))
   writeFileSync(real, '#!/bin/bash\ncat -- "${0}.json"\n', { mode: 0o755 })
-  configure({ instance_id: 'own', busy_send: 'covered', synthetic_launch_token: 'fixture-launch' })
+  configure({ instance_id: 'own', busy_send: 'covered' })
   const projected = run(['get', '--instance-id', 'own'])
-  assert.equal(projected.launch_token, 'fixture-launch')
-  assert.equal(run(['get', '--instance-id', 'own']).launch_token, projected.launch_token)
+  assert(!('launch_token' in projected))
+  assert(!('launch_started_at' in projected))
   assert.equal(projected.session_id, legacyRow.session_id)
   assert.equal(projected.jsonl_path, legacyRow.jsonl_path)
-  assert.equal(run(['get', '--instance-id', 'other']).launch_token, undefined, 'synthetic identity escaped instance scope')
-  writeFileSync(`${real}.json`, JSON.stringify({ ...legacyRow, launch_token: 'native-launch' }))
-  assert.equal(run(['get', '--instance-id', 'own']).launch_token, 'native-launch', 'synthetic identity replaced AD identity')
-  writeFileSync(`${real}.json`, JSON.stringify(legacyRow))
+  assert(!('busy_send' in run(['get', '--instance-id', 'other'])), 'coverage escaped instance scope')
   const invoke = (verb: string, params: Record<string, unknown>) => {
     const argv = [verb]
     for (const [key, value] of Object.entries(params)) {
@@ -94,7 +92,7 @@ try {
     return JSON.parse(result.status === 0 ? result.stdout : result.stderr)
   }
   for (const mode of ['fallback', 'covered', 'unknown']) {
-    configure({ instance_id: 'own', busy_send: 'covered', synthetic_launch_token: 'fixture-launch',
+    configure({ instance_id: 'own', busy_send: 'covered',
       send: mode === 'fallback' ? 'agent_not_covered' : 'held', lookup: mode === 'unknown' ? 'unknown' : 'final' })
     writeFileSync(legacyRow.jsonl_path, '')
     await checkBusyShimConsumer(root, mode, invoke)
