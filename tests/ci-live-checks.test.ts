@@ -156,6 +156,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { makeMembershipHarness, membershipPage, SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
+
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -166,7 +168,7 @@ import ts from 'typescript'
 import { buildMessagesWaitingNotice, deliveryAge } from '../src/delivery-notices.ts'
 import { queueEvidence, queueEvidenceScript, type QueueEvidence } from '../ci-live/checks/delivery-evidence.ts'
 import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
-import { channelModeOf, DM_DESTINATION, MCP_SERVER_NAME, parsePersonaConfigBytes, PERSONA_ENTRY_KEYS, PERSONA_TOP_LEVEL_KEYS } from '../src/config.ts'
+import { type PersonaInput, channelModeOf, DM_DESTINATION, MCP_SERVER_NAME, parsePersonaConfigBytes, PERSONA_ENTRY_KEYS, PERSONA_TOP_LEVEL_KEYS } from '../src/config.ts'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { SET_CHANNEL_DELIVERY_TOOL } from '../src/channel-delivery.ts'
@@ -407,7 +409,7 @@ import { emptyAppsState } from '../ci-live/lib/apps-state.ts'
 import { cannedErr, errTmuxKillFailed, type StubClientOptions } from './test-helpers/agent-director-stub.ts'
 import { deliveredRecord, makeQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
 import { virtualClock } from './test-helpers/ci-live.ts'
-import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
+import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL, writtenFile } from './test-helpers/credentials.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { flat, type HeadingMatch, requiredSection } from './test-helpers/markdown.ts'
 import { stripComments } from './test-helpers/source-audit.ts'
@@ -4955,12 +4957,12 @@ describe('expected texts match the package', () => {
         "JSON.stringify(personaName('c'))": JSON.stringify(personaName('c')),
         'JSON.stringify(channel)': JSON.stringify(RUN),
       }
-      const renderTemplate = (node: ts.Expression): string => {
+      const renderTemplate = (node: ts.Expression, values = substitutions): string => {
         if (!ts.isTemplateExpression(node)) throw new Error('expected a runner template')
         return node.head.text + node.templateSpans.map((span) => {
           const expression = span.expression.getText(source)
-          if (!Object.hasOwn(substitutions, expression)) throw new Error(`unhandled runner interpolation: ${expression}`)
-          return substitutions[expression]! + span.literal.text
+          if (!Object.hasOwn(values, expression)) throw new Error(`unhandled runner interpolation: ${expression}`)
+          return values[expression]! + span.literal.text
         }).join('')
       }
       substitutions.life = renderTemplate(binding(reader, 'life'))
@@ -4980,6 +4982,69 @@ describe('expected texts match the package', () => {
       // Check 32 retains the choice that Check 31's actual call assertion asks for.
       const retained = only(nodes(checkSource('check31')).filter(ts.isBinaryExpression).filter((n) => n.left.getText(source) === 'call.delivery' && n.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken)).right
       if (!ts.isStringLiteral(retained)) throw new Error('expected the requested delivery literal')
+
+      test('actual runner jq projections read applied mode, discovered/saved choice and verified join/leave from durable authority', async () => {
+        const home = mkdtempSync(join(tmpdir(), 'ci-live-projections-'))
+        const target = SHARED_CHANNEL_IDS.primary, other = SHARED_CHANNEL_IDS.secondary
+        const c = personaName('c'), a = personaName('a')
+        const harness = makeMembershipHarness(home, { names: [c, a] })
+        const authority = harness.authority
+        const fn = (name: string) => only(source.statements.filter(ts.isFunctionDeclaration).filter(node => node.name?.text === name))
+        const switchFilterNode = only(nodes(fn('switchOnInRecord')).filter(ts.isTemplateExpression).filter(node => node.head.text === '.applied | '))
+        const switchProjection = renderTemplate(switchFilterNode, { SWITCH_VALUE_JQ })
+        const projections = (channel: string) => {
+          const values = { ...substitutions, 'JSON.stringify(channel)': JSON.stringify(channel) }
+          return [switchProjection, renderTemplate(binding(fn('sharedChoice'), 'filter'), values), renderTemplate(binding(reader, 'filter'), values)]
+        }
+        const jqOutputs: Array<{ stdout: string, stderr: string }> = []
+        const project = (channel: string) => projections(channel).map(filter => {
+          const child = Bun.spawnSync([Bun.which('jq')!, '-c', filter, authority.path], {
+            env: hostSafeChildEnv(home, { tools: ['jq'] }), timeout: 1000,
+          })
+          jqOutputs.push({ stdout: child.stdout.toString(), stderr: child.stderr.toString() })
+          assertNoLeak(jqOutputs.at(-1), 'jq output')
+          expect(child.exitCode).toBe(0)
+          expect(child.signalCode).toBeUndefined()
+          expect(child.stderr.toString()).toBe('')
+          const out = child.stdout.toString().trim()
+          return out === '' ? undefined : JSON.parse(out)
+        })
+        let closed = false
+        try {
+          await harness.start()
+          for (const key of [c, a]) harness.h.stub(harness.h.p(key)).script.inventory.push(membershipPage([]))
+          await harness.scan()
+          await harness.event(true, target, { key: c })
+          expect(project(target)).toEqual([true, 'mentions', { member: true, left: false }])
+          // The discovery is absent from the reviewed source. An unconfirmed
+          // strict edit on disk must not change the runner's applied-mode read.
+          expect((authority.snapshot().source.personas as PersonaInput[]).find(p => p.name === c)!.channels).toEqual([])
+          const pending = { ...authority.snapshot().source, channel_mode: 'strict' }
+          writeFileSync(join(home, 'config.json'), JSON.stringify(pending))
+          expect(_assignFixture(authority, c, authority.incarnation(c)!, target, 'all', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('applied')
+          await harness.event(true, other, { key: c })
+          await harness.event(true, target, { key: a })
+          // Another channel and persona retain mentions: dropping either
+          // selector cannot accidentally return the target's saved all.
+          expect(project(target)).toEqual([true, 'all', { member: true, left: false }])
+          expect(project(other)).toEqual([true, 'mentions', { member: true, left: false }])
+          expect(project(SHARED_CHANNEL_IDS.future)).toEqual([true, undefined, { member: null, left: false }])
+          await harness.h.clock.advance(1)
+          await harness.event(false, target, { key: c })
+          expect(project(target)).toEqual([true, undefined, { member: false, left: true }])
+          expect(project(other)).toEqual([true, 'mentions', { member: true, left: false }])
+          expect(authority.choice(a, target)).toBe('mentions')
+          expect(authority.applyReviewed(Buffer.from(JSON.stringify(pending)), authority.revision).kind).toBe('applied')
+          writeFileSync(join(home, 'config.json'), JSON.stringify({ ...pending, channel_mode: 'open' }))
+          expect(project(target)).toEqual([false, undefined, { member: false, left: true }])
+          await harness.close()
+          closed = true
+          assertNoLeak({ harness: harness.captured(), config: writtenFile(join(home, 'config.json')), jq: jqOutputs })
+        } finally {
+          if (!closed) await harness.close()
+          rmSync(home, { recursive: true, force: true })
+        }
+      })
 
       const readiness: HeadingMatch = '## Runner-only membership readiness'
       const checkHeading = (id: string): HeadingMatch => new RegExp(`^### Check ${id}:`)

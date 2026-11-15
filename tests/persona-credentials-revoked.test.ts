@@ -1,3 +1,4 @@
+import { parseSharedChannelState } from '../src/shared-channels.ts'
 /**
  * persona-credentials-revoked.test.ts — A bot token revoked while a persona
  * runs, end to end, and its recovery (step 6).
@@ -298,6 +299,7 @@ describe('a Web API call refused with token_revoked marks the persona broken at 
 describe('recovery through the confirmed credentials change', () => {
   test('a working file at A’s path is previewed, not applied; once confirmed, step 6’s recovery bring-up brings A up with the new tokens and records its launch, with no reconnect, kill or delete, and admits its MCP registration again; the notice held while broken posts through the new identity only; B is untouched', async () => {
     const { run, alpha, bravo } = await running()
+    const originalConfigBytes = h.readConfig()!
     const a = applied(run, 'alpha')
     const oldStub = run.stub('alpha')
     await revokeThroughReact(run, alpha)
@@ -365,7 +367,8 @@ describe('recovery through the confirmed credentials change', () => {
     expect(run.stub('bravo').callLog).toHaveLength(bravoCalls)
     await expectBravoServes(run, bravo, 'after alpha’s recovery')
     expect(h.pendingExists()).toBe(false)
-    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(h.readConfig()!.toString()))
+    expect(Buffer.from(parseSharedChannelState(h.readRecord()!, h.paths.lastApplied, { home: h.home })!.sourceBytesBase64, 'base64').equals(originalConfigBytes)).toBe(true)
+    expect(h.readConfig()).toEqual(originalConfigBytes)
     expectNoLeak(run, { reply, newStub: newStub.callLog })
   })
 })

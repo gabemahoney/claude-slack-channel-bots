@@ -26,7 +26,7 @@ beforeEach(() => { dir = fs.mkdtempSync(join(tmpdir(), 'delivery-queue-')); queu
 afterEach(async () => { await Promise.all(queues.map(q => q.stop())); _resetAckTracker(); fs.rmSync(dir, { recursive: true, force: true }) })
 async function open(options: Parameters<typeof makeQueue>[1] = {}) { const q = await makeQueue(dir, options); queues.push(q); return q }
 const accepted = (): AcceptedRecord => ({ ...slackInput(), v: 1, kind: 'accepted', seq: 1, received_at: 1000, ts: '1700000000.000001' })
-const kinds: QueueRecord[] = [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['exact bytes\n🙂'] }, sentRecord(), deliveredRecord(), { v: 1, kind: 'refused', seq: 1, attempt: 1, at: 1000 }, { v: 1, kind: 'noticed', seq: 1, at: 1000 }, { v: 1, kind: 'reply-reminder', seq: 1, at: 1000, state: 'observed', delivery_attempts: [1] }]
+const kinds: QueueRecord[] = [accepted(), fixedRecord(1, ['exact bytes\n🙂']), sentRecord(), deliveredRecord(), refusedRecord(1, 1, 1000), noticedRecord(1, 1000), { v: 1, kind: 'reply-reminder', seq: 1, at: 1000, state: 'observed', delivery_attempts: [1] }]
 function recordSyncs() {
   const synced: string[] = []
   let failing: ((path: string) => boolean) | undefined
@@ -109,7 +109,7 @@ describe('durable record schemas', () => {
 test.each([false, true])('sent journal with legacy launch_id=%s replays as an unconfirmed send and survives compaction', async legacy => {
   const sent = legacy ? { ...sentRecord(), launch_id: 'old-server:42' } : sentRecord()
   expect(parseQueueRecord(JSON.stringify(sent))).toEqual(sent)
-  seedQueue(dir, [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['message'] }, sent])
+  seedQueue(dir, [accepted(), fixedRecord(1, ['message']), sent])
   const q = await open()
   expect(q.openCount('alpha')).toBe(1)
   expect(q.item('alpha', 1)!.records.filter(r => r.kind === 'sent')).toEqual([sent])
@@ -121,7 +121,7 @@ test.each([false, true])('sent journal with legacy launch_id=%s replays as an un
 })
 describe('durable queued reaction metadata', () => {
   test('legacy adoption keeps the first name and open delivery facts through replay and compaction', async () => {
-    seedQueue(dir, [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['first', 'second'] }, sentRecord(), deliveredRecord()])
+    seedQueue(dir, [accepted(), fixedRecord(1, ['first', 'second']), sentRecord(), deliveredRecord()])
     let q = await open({ now: createFakeClock({ start: 1000 }).now })
     const before = q.item('alpha', 1)!
     expect(before.accepted.queued_ack_reaction).toBeUndefined()
@@ -160,7 +160,7 @@ describe('durable queued reaction metadata', () => {
   })
 
   test('missing, injected and already delivered legacy work cannot acquire queued metadata', async () => {
-    seedQueue(dir, [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['complete'] }, deliveredRecord()])
+    seedQueue(dir, [accepted(), fixedRecord(1, ['complete']), deliveredRecord()])
     const q = await open()
     expect((await q.accept('alpha', injectedInput())).status).toBe('accepted')
     const bytes = fs.readFileSync(queuePath(dir))
@@ -181,11 +181,11 @@ describe('durable queued reaction metadata', () => {
     } as typeof fs, before(step) {
       if (failing && step.op === 'fsync' && fs.fstatSync(step.fd!).isFile()) throw new Error('EIO append sync')
     } }).fs
-    seedQueue(dir, [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['first', 'second'] }, sentRecord(), deliveredRecord()])
+    seedQueue(dir, [accepted(), fixedRecord(1, ['first', 'second']), sentRecord(), deliveredRecord()])
     const q = await open({ fs: seam, now: clock.now }), before = q.item('alpha', 1)!
     const boundary = fs.statSync(queuePath(dir)).size
     failing = true
-    await expect(q.append('alpha', { v: 1, kind: 'noticed', seq: 1, at: 1000 })).rejects.toThrow('EIO append sync')
+    await expect(q.append('alpha', noticedRecord(1, 1000))).rejects.toThrow('EIO append sync')
     expect(fs.statSync(queuePath(dir)).size).toBeGreaterThan(boundary)
     failing = false
     expect(await q.rememberQueuedReaction('alpha', 1, 'original_queue')).toBe('original_queue')
@@ -235,7 +235,7 @@ describe('durable queued reaction metadata', () => {
     await queued('alpha', item)
     expect(slack.calls.reactionsAdd).toEqual([{ channel: item.accepted.channel!, timestamp: item.accepted.ts, name: 'custom_queue' }])
     expect(slack.calls.reactionsRemove).toEqual([])
-    await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['still deliverable'] })
+    await q.append('alpha', fixedRecord(1, ['still deliverable']))
     await q.stop()
     expect((await open()).item('alpha', 1)!.accepted.queued_ack_reaction).toBe('custom_queue')
     assertNoLeak(slack.callLog)
@@ -255,7 +255,7 @@ test("reuses a durably synced parent; a journal's creating acceptance syncs it a
   const q = await open({ fs: sync.fs })
   expect(sync.synced).toEqual([dir])
   expect((await q.accept('alpha', injectedInput())).status).toBe('accepted')
-  await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['fixed'] })
+  await q.append('alpha', fixedRecord(1, ['fixed']))
   expect((await q.accept('beta', injectedInput())).status).toBe('accepted')
   expect(sync.synced).toEqual([dir, queuePath(dir), queueDir, queuePath(dir), queuePath(dir, 'beta'), queueDir])
   await q.stop()
@@ -322,7 +322,7 @@ test("queue-directory sync failures publish neither new Slack keys nor completed
   }
   sync.fail()
   expect(await q.accept('alpha', slackInput())).toMatchObject({ status: 'accepted', seq: 1 })
-  await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['fixed'] })
+  await q.append('alpha', fixedRecord(1, ['fixed']))
   // The restart's load is the journal's first opening; its rewrite then fails
   // before the rename, so no directory sync has followed that opening.
   await q.stop()
@@ -380,7 +380,7 @@ test('Slack key includes edits and survives compaction/restart; injected repeats
 test.each([999, 1000])('injected timestamp and sequence allocation survive delivered-text removal and restart clock %i', async restartAt => {
   const q = await open({ now: () => 1000 }); await q.accept('alpha', injectedInput())
   const ts = q.items('alpha')[0]!.accepted.ts
-  await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['secret-delivered'] }); await q.append('alpha', deliveredRecord()); await q.compact(); await q.stop()
+  await q.append('alpha', fixedRecord(1, ['secret-delivered'])); await q.append('alpha', deliveredRecord()); await q.compact(); await q.stop()
   expect(fs.readFileSync(queuePath(dir), 'utf8')).not.toContain('secret-delivered')
   const replay = await open({ now: () => restartAt }); expect(await replay.accept('alpha', injectedInput())).toMatchObject({ status: 'accepted', seq: 2 })
   expect(replay.items('alpha')[0]!.accepted.ts > ts).toBe(true)
@@ -388,13 +388,13 @@ test.each([999, 1000])('injected timestamp and sequence allocation survive deliv
 })
 test('open fixed bytes never expire; sent is not delivered; only refused send pairs compact and attempts remain stable', async () => {
   const clock = createFakeClock({ start: 1000 }); const q = await open({ now: clock.now }); await q.accept('alpha', injectedInput())
-  await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['exact\nbytes🙂'] })
-  await q.append('alpha', sentRecord(1, 1, 'retype')); await q.append('alpha', { v: 1, kind: 'refused', seq: 1, attempt: 1, at: 1000 })
+  await q.append('alpha', fixedRecord(1, ['exact\nbytes🙂']))
+  await q.append('alpha', sentRecord(1, 1, 'retype')); await q.append('alpha', refusedRecord(1, 1, 1000))
   await q.append('alpha', sentRecord(1, 2, 'retype')); await clock.advance(3 * QUEUE_KEY_KEEP_MS); await q.compact(); await q.stop()
   const replay = await open({ now: clock.now }); const item = replay.items('alpha')[0]!
   expect(item.fixed!.parts).toEqual(['exact\nbytes🙂']); expect(item.delivered).toBe(false); expect(item.retypeCount).toBe(1); expect(item.nextAttempt).toBe(3)
   expect(item.records.filter(r => r.kind === 'sent')).toHaveLength(1)
-  await expect(replay.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['changed'] })).rejects.toThrow('immutable')
+  await expect(replay.append('alpha', fixedRecord(1, ['changed']))).rejects.toThrow('immutable')
 })
 test('live summaries preserve multipart delivery counts, refused retypes and unknown attempts through repeated compaction and reload', async () => {
   const edited = slackInput({ key: { ...slackInput().key!, edited_ts: 'edit' } })
@@ -403,10 +403,10 @@ test('live summaries preserve multipart delivery counts, refused retypes and unk
   await q.accept('alpha', injectedInput())
   await q.accept('alpha', edited)
   await q.accept('beta', injectedInput())
-  await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['one', 'two'] })
+  await q.append('alpha', fixedRecord(1, ['one', 'two']))
   await q.append('alpha', sentRecord(1, 1, 'retype'))
   expect(q.item('alpha', 1)!.retypeCount).toBe(1)
-  await q.append('alpha', { v: 1, kind: 'refused', seq: 1, attempt: 1, at: 1000 })
+  await q.append('alpha', refusedRecord(1, 1, 1000))
   expect(q.item('alpha', 1)).toMatchObject({ retypeCount: 0, nextAttempt: 2 })
   await q.append('alpha', sentRecord(1, 2, 'retype'))
   await q.append('alpha', deliveredRecord())
@@ -415,12 +415,12 @@ test('live summaries preserve multipart delivery counts, refused retypes and unk
   await q.append('alpha', { ...deliveredRecord(), part: 2 })
   expect(q.openCount('alpha')).toBe(2)
   await q.append('alpha', { ...deliveredRecord(), part: 2 })
-  await q.append('alpha', { v: 1, kind: 'noticed', seq: 1, at: 1000 })
+  await q.append('alpha', noticedRecord(1, 1000))
   expect(q.openCount('alpha')).toBe(2)
   expect(q.item('alpha', 1)).toMatchObject({ delivered: true, retypeCount: 1, nextAttempt: 3 })
   await q.append('alpha', sentRecord(2, 7, 'retype'))
-  await q.append('alpha', { v: 1, kind: 'refused', seq: 2, attempt: 7, at: 1000 })
-  await q.append('alpha', { v: 1, kind: 'sent', seq: 3, attempt: 3, unknown_outcome: true, at: 1000, quarantine: { path: join(dir, 'unknown'), line: 1 } })
+  await q.append('alpha', refusedRecord(2, 7, 1000))
+  await q.append('alpha', sentRecord(3, 3, { unknown_outcome: true, at: 1000, quarantine: { path: join(dir, 'unknown'), line: 1 } }))
   expect(q.items('alpha').map(item => [item.accepted.seq, item.delivered, item.unknownSend, item.retypeCount, item.nextAttempt])).toEqual([
     [1, true, false, 1, 3], [2, false, false, 0, 8], [3, false, true, 0, 4],
   ])
@@ -449,7 +449,7 @@ test('live summaries preserve multipart delivery counts, refused retypes and unk
 })
 test('delivered Slack tombstone survives compaction and restart until received_at retention expires without restoring content', async () => {
   const clock = createFakeClock({ start: 1000 }); const q = await open({ now: clock.now }); await q.accept('alpha', slackInput({ text: 'private delivered content' }))
-  await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['private fixed content'] }); await q.append('alpha', deliveredRecord()); await q.compact()
+  await q.append('alpha', fixedRecord(1, ['private fixed content'])); await q.append('alpha', deliveredRecord()); await q.compact()
   expect(fs.readFileSync(queuePath(dir), 'utf8')).not.toContain('private'); await q.stop()
   const replay = await open({ now: clock.now })
   expect(replay.items('alpha')).toEqual([]); expect(replay.lookupSlackKey('alpha', slackInput().key!)).toMatchObject({ status: 'duplicate', seq: 1 })
@@ -471,7 +471,7 @@ test('startup reads beyond reload size cap and retains every complete accepted r
 })
 test('quarantines exact torn/middle/orphan bytes; damaged sent is unknown and survives another restart', async () => {
   const events: QueueEvent[] = []; const bad = '{"kind":"sent","seq":1,"attempt":1,"broken":true}\n'; const torn = '{"kind":"accepted","seq":3'
-  const orphan = JSON.stringify({ v: 1, kind: 'fixed', seq: 99, parts: ['orphan'] }) + '\n'
+  const orphan = JSON.stringify(fixedRecord(99, ['orphan'])) + '\n'
   seedQueue(dir, [accepted(), bad, orphan, torn]); const q = await open({ onEvent: e => events.push(e) })
   expect(q.items('alpha')).toHaveLength(1); expect(q.items('alpha')[0]!.unknownSend).toBe(true)
   const unreadable = events.filter((e): e is Extract<QueueEvent, { type: 'record-unreadable' }> => e.type === 'record-unreadable')
@@ -509,7 +509,7 @@ describe('append validation refusals', () => {
 
   test.each([
     ['unknown sequence', sentRecord(99), 'Append has no accepted item'],
-    ['refusal without a send', { v: 1, kind: 'refused', seq: 1, attempt: 1, at: 1000 }, 'Refusal has no sent attempt'],
+    ['refusal without a send', refusedRecord(1, 1, 1000), 'Refusal has no sent attempt'],
     ['invalid send kind', { ...sentRecord(), send_kind: 'bogus' }, 'Invalid append record'],
   ] as const)('%s leaves the queue writable without append-failed', async (_, record, message) => {
     const events: QueueEvent[] = []
@@ -559,7 +559,7 @@ describe('append validation refusals', () => {
     const seam = durableIo({ before(step) { if (step.op === 'fsync' && fail && fs.fstatSync(step.fd!).isFile()) throw new Error('EIO append sync') } }).fs
     const q = await open({ fs: seam, onEvent: event => events.push(event) })
     await q.accept('alpha', injectedInput())
-    const fixed: QueueRecord = { v: 1, kind: 'fixed', seq: 1, parts: ['fixed bytes'] }
+    const fixed: QueueRecord = fixedRecord(1, ['fixed bytes'])
     await q.append('alpha', fixed)
     fail = true
     await expect(q.append('alpha', sentRecord())).rejects.toThrow('EIO append sync')
@@ -605,7 +605,7 @@ describe('b.2is torn-tail recovery', () => {
     ['directory-fsync', 'accept'], ['directory-fsync', 'reopen'],
   ] as const)('failed recovery rewrite %s preserves send evidence until durable recovery by %s', async (failure, retryBy) => {
     const originalAccepted = { ...accepted(), text: first.text }
-    const fixed: QueueRecord = { v: 1, kind: 'fixed', seq: 1, parts: ['fixed 🙂'] }
+    const fixed: QueueRecord = fixedRecord(1, ['fixed 🙂'])
     const torn = '{"v":1,"kind":"sent","seq":1,"attempt":7,"text":"torn 🙂'
     seedQueue(dir, [originalAccepted, fixed, torn])
     seedQueue(dir, [first], 'beta')
@@ -650,7 +650,7 @@ describe('b.2is torn-tail recovery', () => {
     const quarantinePath = initial[0]!.quarantinePath
     const quarantines = copies()
     expect(quarantines).toHaveLength(1)
-    const unknown: Extract<QueueRecord, { kind: 'sent' }> = { v: 1, kind: 'sent', seq: 1, attempt: 7, unknown_outcome: true, at: originalAccepted.received_at, quarantine: { path: quarantinePath, line: 3 } }
+    const unknown: Extract<QueueRecord, { kind: 'sent' }> = sentRecord(1, 7, { unknown_outcome: true, at: originalAccepted.received_at, quarantine: { path: quarantinePath, line: 3 } })
     // Pending repair of alpha must not block a healthy persona's writes.
     expect(await q.accept('beta', injectedInput({ text: 'healthy' }))).toMatchObject({ status: 'accepted', seq: 2 })
     for (let retry = 0; retry < 2; retry++) {
@@ -774,7 +774,7 @@ describe('b.2is torn-tail recovery', () => {
 
   test('a torn sent tail keeps its unknown-outcome evidence when the startup rewrite fails', async () => {
     const torn = '{"v":1,"kind":"sent","seq":1,"attempt":7,'
-    seedQueue(dir, [first, { v: 1, kind: 'fixed', seq: 1, parts: ['fixed 🙂'] }, torn])
+    seedQueue(dir, [first, fixedRecord(1, ['fixed 🙂']), torn])
     let fail = true, rewriteFailures = 0
     const seam = { ...fs, openSync(...args: Parameters<typeof fs.openSync>) {
       if (fail && String(args[0]).endsWith('.tmp') && args[1] === 'wx') { rewriteFailures++; throw new Error('ENOSPC rewrite unavailable') }
@@ -972,7 +972,7 @@ test('fixed append fsync failure leaves accepted-only work retryable and no fixe
   let failed = false
   const seam = failFileSyncs(() => failed, 'EIO')
   const q = await open({ fs: seam }); await q.accept('alpha', injectedInput()); failed = true
-  const fixed = { v: 1, kind: 'fixed', seq: 1, parts: ['exact fixed bytes'] } as const
+  const fixed = fixedRecord(1, ['exact fixed bytes'])
   await expect(q.append('alpha', { ...fixed, parts: [...fixed.parts] })).rejects.toThrow('EIO'); expect(q.items('alpha')[0]!.fixed).toBeUndefined()
   failed = false; await q.append('alpha', { ...fixed, parts: [...fixed.parts] }); await q.stop(); expect((await open()).items('alpha')[0]!.fixed!.parts).toEqual([...fixed.parts])
 })
@@ -1022,7 +1022,7 @@ test.each(['item', 'items'] as const)('%s snapshots are fresh, deeply frozen and
   expect(q.item('missing', 1)).toBeUndefined()
   expect(q.item('alpha', 99)).toBeUndefined()
   const stale = read(1)!
-  await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['fixed bytes'] })
+  await q.append('alpha', fixedRecord(1, ['fixed bytes']))
   await q.append('alpha', sentRecord())
   const current = read(1)!
   expect(stale.fixed).toBeUndefined()
@@ -1365,7 +1365,7 @@ test('maintenance compacts at the exported interval once and stop cancels its ti
   const scheduled: number[] = []
   const q = await open({ now: clock.now, fs: io.fs, ...fakeIntervals(clock, scheduled) })
   await q.accept('alpha', injectedInput({ text: 'delivered content' }))
-  await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['delivered bytes'] })
+  await q.append('alpha', fixedRecord(1, ['delivered bytes']))
   await q.append('alpha', deliveredRecord())
   q.startMaintenance(); q.startMaintenance()
   expect(scheduled).toEqual([QUEUE_COMPACT_INTERVAL_MS])
@@ -1422,7 +1422,7 @@ describe('the journal holds only the record kinds and fields main reads', () => 
     const q = await open({ now: clock.now })
     const threaded = slackInput({ via: 'thread', thread_ts: '1700000000.000000' })
     await q.accept('alpha', threaded)
-    await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['delivered'] })
+    await q.append('alpha', fixedRecord(1, ['delivered']))
     await q.append('alpha', sentRecord())
     await q.append('alpha', deliveredRecord())
     const openThreaded = slackInput({ ts: '1700000000.000002', key: { chat_id: 'C0TEST001', ts: '1700000000.000002' }, via: 'thread', thread_ts: '1700000000.000000' })
@@ -3171,7 +3171,7 @@ describe('Reaction Item journal', () => {
     q = await open({ now: () => 1000 })
     expect(await q.accept('alpha', injectedInput())).toMatchObject({ status: 'accepted', seq: 4, item: { accepted: { ts: '1.000002' } } })
     for (const seq of [1, 3, 4]) {
-      await q.append('alpha', { v: 1, kind: 'fixed', seq, parts: ['delivered'] })
+      await q.append('alpha', fixedRecord(seq, ['delivered']))
       await q.append('alpha', deliveredRecord(seq))
     }
     await q.append('alpha', withdrawn({ seq: 2 }))
@@ -3269,7 +3269,7 @@ describe('Reaction Item journal', () => {
     await q.append('alpha', { ...record })
     const later: QueueRecord[] = [
       { ...record, reason: 'server-post', failed_condition: undefined }, { ...record, failed_condition: 'not_in_channel' }, { ...record, at: record.at + 1 },
-      { v: 1, kind: 'fixed', seq: 1, parts: ['late text'] }, sentRecord(), deliveredRecord(), { v: 1, kind: 'refused', seq: 1, attempt: 1, at: 3000 }, { v: 1, kind: 'noticed', seq: 1, at: 3000 },
+      fixedRecord(1, ['late text']), sentRecord(), deliveredRecord(), refusedRecord(1, 1, 3000), noticedRecord(1, 3000),
     ]
     for (const r of later) await expect(q.append('alpha', r)).rejects.toBeInstanceOf(QueueOutcomeFinal)
     expect(fs.readFileSync(queuePath(dir))).toEqual(bytes)
@@ -3277,7 +3277,7 @@ describe('Reaction Item journal', () => {
     expect(q.openCount('alpha')).toBe(1)
     expect(q.isWritable!('alpha')).toBe(true)
     expect(events.filter(e => e.type === 'append-failed')).toEqual([])
-    await q.append('alpha', { v: 1, kind: 'fixed', seq: 2, parts: ['next item'] })
+    await q.append('alpha', fixedRecord(2, ['next item']))
     expect(q.item('alpha', 2)!.fixed!.parts).toEqual(['next item'])
   })
 
@@ -3294,7 +3294,7 @@ describe('Reaction Item journal', () => {
       expect(q.isWritable!('alpha')).toBe(writable)
     }
     await refuse(true)
-    await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['next'] })
+    await q.append('alpha', fixedRecord(1, ['next']))
     expect(q.item('alpha', 1)!.fixed!.parts).toEqual(['next'])
     // After a genuine storage failure, the refusal neither clears nor repeats its block.
     sync.fail(queuePath(dir))
@@ -3313,7 +3313,7 @@ describe('Reaction Item journal', () => {
     const events: QueueEvent[] = [], onEvent = (e: QueueEvent) => { events.push(e) }
     let q = await open({ now: () => 1000, onEvent })
     await q.accept('alpha', reactionInput())
-    const fixed: QueueRecord = { v: 1, kind: 'fixed', seq: 1, parts: ['reaction text'] }
+    const fixed: QueueRecord = fixedRecord(1, ['reaction text'])
     const [winner, loser] = first === 'fixed' ? [fixed, withdrawn()] : [withdrawn(), fixed]
     expect(await Promise.all([outcome(q.append('alpha', winner)), outcome(q.append('alpha', loser))])).toEqual(['stored', 'final'])
     expect(readQueue(dir).map(r => r.kind)).toEqual(['accepted', first])
@@ -3337,8 +3337,8 @@ describe('Reaction Item journal', () => {
 
   test.each([
     ['a Slack item ignores a withdrawn record', [accepted(), withdrawn()], 1, undefined],
-    ['fixed before withdrawn stays fixed', [reactionRecord(), { v: 1, kind: 'fixed', seq: 1, parts: ['text'] }, withdrawn()], 1, undefined],
-    ['withdrawn before fixed stays withdrawn and undelivered', [reactionRecord(), withdrawn(), { v: 1, kind: 'fixed', seq: 1, parts: ['text'] }, deliveredRecord()], 0, 2000],
+    ['fixed before withdrawn stays fixed', [reactionRecord(), fixedRecord(1, ['text']), withdrawn()], 1, undefined],
+    ['withdrawn before fixed stays withdrawn and undelivered', [reactionRecord(), withdrawn(), fixedRecord(1, ['text']), deliveredRecord()], 0, 2000],
   ] as [string, QueueRecord[], number, number | undefined][])('replay: %s', async (_, records, openCount, closedAt) => {
     seedQueue(dir, records)
     const q = await open({ now: () => 5000 })
@@ -3348,7 +3348,7 @@ describe('Reaction Item journal', () => {
   })
 
   test.each([
-    ['delivered', [{ v: 1, kind: 'fixed', seq: 2, parts: ['CLOSED-PART-MARKER'] }, deliveredRecord(2, 1000 + QUEUE_KEY_KEEP_MS - 10)]],
+    ['delivered', [fixedRecord(2, ['CLOSED-PART-MARKER']), deliveredRecord(2, 1000 + QUEUE_KEY_KEEP_MS - 10)]],
     ['withdrawn', [withdrawn({ seq: 2, reason: 'open-refused', failed_condition: 'externally-shared', at: 1000 + QUEUE_KEY_KEEP_MS - 10 })]],
   ] as [string, QueueRecord[]][])('a %s reaction compacts to its content-free key until QUEUE_KEY_KEEP_MS after intake while open reaction facts survive', async (_, closing) => {
     const clock = createFakeClock({ start: 1000 })
@@ -3385,7 +3385,7 @@ describe('Reaction Item journal', () => {
     expect(q.lookupReactionKey('alpha', survivor.reaction_key)).toEqual({ status: 'duplicate', seq: 1, item: q.item('alpha', 1) })
     expect(q.lookupReactionKey('alpha', closed.reaction_key)).toBeUndefined()
     // No record names seq 2 now, yet a late outcome for it is still final and blocks nothing.
-    for (const late of [{ v: 1, kind: 'fixed', seq: 2, parts: ['late'] }, withdrawn({ seq: 2 })] as QueueRecord[]) await expect(q.append('alpha', late)).rejects.toBeInstanceOf(QueueOutcomeFinal)
+    for (const late of [fixedRecord(2, ['late']), withdrawn({ seq: 2 })] as QueueRecord[]) await expect(q.append('alpha', late)).rejects.toBeInstanceOf(QueueOutcomeFinal)
     expect(q.isWritable!('alpha')).toBe(true)
     expect(nonAllocation()).toEqual([openRecord])
     expect(await q.accept('alpha', closed)).toMatchObject({ status: 'accepted', seq: 3 })

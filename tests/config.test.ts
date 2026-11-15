@@ -96,6 +96,10 @@ import {
 } from './test-helpers/credentials.ts'
 import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { SHARED_CHANNEL_IDS, channelPopulation } from './test-helpers/shared-channels.ts'
+import { SR8_SHARED_LIST_CHANNELS, SR8_DELIVERY_CYCLE } from './test-helpers/thread-memory.ts'
+
+const MALFORMED_CHANNEL_ID = 'D0TEST001'
 
 // ---------------------------------------------------------------------------
 // expandTilde()
@@ -266,7 +270,7 @@ describe('loadPersonaConfig', () => {
       const config = load(withPersonas(
         makePersona({
           name: 'Ops Bot',
-          channels: [{ id: 'C0TEST001', delivery: 'all' }, { id: 'G0TEST002', delivery: 'all' }],
+          channels: [{ id: SHARED_CHANNEL_IDS.primary, delivery: 'all' }, { id: SHARED_CHANNEL_IDS.private, delivery: 'all' }],
           dm: undefined,
         }),
         makePersona({ name: 'review_bot' }),
@@ -276,10 +280,10 @@ describe('loadPersonaConfig', () => {
         [1, 'review_bot', personaKey('review_bot')],
       ])
       expect(config.personas[0].channels).toEqual([
-        { id: 'C0TEST001', delivery: 'all' },
-        { id: 'G0TEST002', delivery: 'all' },
+        { id: SHARED_CHANNEL_IDS.primary, delivery: 'all' },
+        { id: SHARED_CHANNEL_IDS.private, delivery: 'all' },
       ])
-      expect(config.personas[1].channels).toEqual([{ id: 'C0TEST001', delivery: 'all' }])
+      expect(config.personas[1].channels).toEqual([{ id: SHARED_CHANNEL_IDS.primary, delivery: 'all' }])
       // the persona in two channels is one persona, not one per channel.
       expect(config.personas.filter((p) => p.name === 'Ops Bot')).toHaveLength(1)
       for (const persona of config.personas) {
@@ -299,8 +303,8 @@ describe('loadPersonaConfig', () => {
     })
 
     test('a mentions channel loads', () => {
-      const config = load(withPersonas(makePersona({ channels: [{ id: 'C0TEST001', delivery: 'mentions' }] })))
-      expect(config.personas[0].channels).toEqual([{ id: 'C0TEST001', delivery: 'mentions' }])
+      const config = load(withPersonas(makePersona({ channels: [{ id: SHARED_CHANNEL_IDS.primary, delivery: 'mentions' }] })))
+      expect(config.personas[0].channels).toEqual([{ id: SHARED_CHANNEL_IDS.primary, delivery: 'mentions' }])
     })
 
     test('a ~ config path is expanded under the injected home', () => {
@@ -403,7 +407,7 @@ describe('loadPersonaConfig', () => {
     }
     const inDm = (extra: Record<string, unknown>) => persona({ dm: { enabled: false, ...extra } })
     const inChannel = (extra: Record<string, unknown>) =>
-      persona({ channels: [{ id: 'C0TEST001', delivery: 'all', ...extra }] })
+      persona({ channels: [{ id: SHARED_CHANNEL_IDS.primary, delivery: 'all', ...extra }] })
 
     // The credentials keys hold sentinel-bearing fake tokens at every level:
     // loadError's assertNoLeak proves the error names the level and the key
@@ -475,15 +479,15 @@ describe('loadPersonaConfig', () => {
       ['a non-object dm', { dm: true }, 'dm'],
       ['a non-array channels', { channels: PLACEHOLDER }, 'channels'],
       ['a non-object channel entry', { channels: [null] }, 'channels[0]'],
-      ['a channel ID not matching ^[CG][A-Z0-9]+$', { channels: [{ id: 'D0TEST001', delivery: 'all' }] }, 'channels[0].id'],
+      ['a channel ID not matching ^[CG][A-Z0-9]+$', { channels: [{ id: MALFORMED_CHANNEL_ID, delivery: 'all' }] }, 'channels[0].id'],
       ['a missing channel id', { channels: [{ delivery: 'all' }] }, 'channels[0].id'],
-      ['a missing delivery', { channels: [{ id: 'C0TEST001' }] }, 'channels[0].delivery'],
-      ['an unsupported delivery', { channels: [{ id: 'C0TEST001', delivery: PLACEHOLDER }] }, 'channels[0].delivery'],
+      ['a missing delivery', { channels: [{ id: SHARED_CHANNEL_IDS.primary }] }, 'channels[0].delivery'],
+      ['an unsupported delivery', { channels: [{ id: SHARED_CHANNEL_IDS.primary, delivery: PLACEHOLDER }] }, 'channels[0].delivery'],
       ['a dm.contact not matching ^[UW][A-Z0-9]+$', { dm: { enabled: true, contact: 'B0TEST001' } }, 'dm.contact'],
       [
         'the same channel listed twice',
-        { channels: [{ id: 'C0TEST001', delivery: 'all' }, { id: 'C0TEST001', delivery: 'mentions' }] },
-        'C0TEST001',
+        { channels: [{ id: SHARED_CHANNEL_IDS.primary, delivery: 'all' }, { id: SHARED_CHANNEL_IDS.primary, delivery: 'mentions' }] },
+        SHARED_CHANNEL_IDS.primary,
       ],
     ])('%s is rejected, naming the persona and the key or channel', (_label, overrides, named) => {
       const message = loadError(withPersonas(makePersona({ name: 'Ops Bot', ...overrides } as Partial<PersonaInput>, dir)))
@@ -586,8 +590,8 @@ describe('loadPersonaConfig', () => {
         ac: '32',
         label: 'destination channel not in the persona channels',
         offenders: [[0, 'Ops Bot']],
-        settings: ['permission_prompts', 'C0TEST999'],
-        build: () => ({ personas: [makePersona({ name: 'Ops Bot', permission_prompts: 'C0TEST999' }, dir)] }),
+        settings: ['permission_prompts', SHARED_CHANNEL_IDS.foreign],
+        build: () => ({ personas: [makePersona({ name: 'Ops Bot', permission_prompts: SHARED_CHANNEL_IDS.foreign }, dir)] }),
       },
       {
         ac: '42',
@@ -1252,7 +1256,7 @@ describe('loadPersonaConfig', () => {
       ['a non-object dm', { dm: true }, 'dm must be a JSON object'],
       ['a bot_token value in dm', { dm: { enabled: false, bot_token: fakeToken(BOT_TOKEN_PREFIX, 'dm') } }, 'unknown field(s) in dm: "bot_token".'],
       ['a non-object channel entry', { channels: [null] }, 'channels[0] must be a JSON object'],
-      ['a bad channel ID', { channels: [{ id: 'D0TEST001', delivery: 'all' }] }, 'channels[0].id must be a Slack channel ID'],
+      ['a bad channel ID', { channels: [{ id: MALFORMED_CHANNEL_ID, delivery: 'all' }] }, 'channels[0].id must be a Slack channel ID'],
       ['a missing permission_prompts', { permission_prompts: undefined }, 'permission_prompts'],
     ])('with %s, the error names personas[i] with the token-shaped name and key as written', (_label, overrides, reported) => {
       const name = tokenName(BOT_TOKEN_PREFIX)
@@ -1844,7 +1848,7 @@ describe('loadPersonaConfig', () => {
     }
 
     test.each([
-      ['routes as a populated object', 'routes', { C0TEST001: { cwd: '/tmp/ops' } }],
+      ['routes as a populated object', 'routes', { [SHARED_CHANNEL_IDS.primary]: { cwd: '/tmp/ops' } }],
       ['routes as an empty object', 'routes', {}],
       ['routes as an array', 'routes', []],
       ['routes as a non-object', 'routes', 'none'],
@@ -1892,11 +1896,13 @@ describe('loadPersonaConfig', () => {
 
   describe('shared strict/open channel configuration', () => {
     test.each([undefined, 'strict', 'open'] as const)('mode %p reads the same four explicit preferences and destination', mode => {
-      const channels = (['off', 'mentions', 'all', 'thread_hybrid'] as const).map((delivery, i) => ({ id: `C0SHARED${i}`, delivery }))
+      const channels = [SHARED_CHANNEL_IDS.primary, SHARED_CHANNEL_IDS.secondary, SHARED_CHANNEL_IDS.private, SHARED_CHANNEL_IDS.third]
+        .map((id, i) => ({ id, delivery: SR8_DELIVERY_CYCLE[i]! }))
       const config = load({ channel_mode: mode, personas: [makePersona({ channels, permission_prompts: channels[0]!.id } as Partial<PersonaInput>, dir)] })
       expect(config.channel_mode).toBe(mode ?? 'strict')
       expect(channelModeOf(config)).toBe(mode ?? 'strict')
       expect(config.personas[0]!.channels).toEqual(channels)
+      expect(config.personas[0]!.channels.map(channel => channel.delivery)).toEqual(['off', 'mentions', 'all', 'thread_hybrid'])
       expect(config.personas[0]!.permission_prompts).toBe(channels[0]!.id)
       assertNoLeak(config)
     })
@@ -1909,7 +1915,7 @@ describe('loadPersonaConfig', () => {
     })
 
     test.each([undefined, 'strict', 'open'] as const)('mode %p rejects every removed-key location', mode => {
-      for (const value of [null, false, true, {}, { permission_prompts: 'C0TEST001' }, LEAK_SENTINEL]) {
+      for (const value of [null, false, true, {}, { permission_prompts: SHARED_CHANNEL_IDS.primary }, LEAK_SENTINEL]) {
         expect(loadError({ channel_mode: mode, allow_invited_channels: value, personas: [makePersona({}, dir)] })).toContain('allow_invited_channels has been removed; use channel_mode')
         expect(loadError({ channel_mode: mode, personas: [{ ...makePersona({}, dir), invited: value }] })).toContain('invited has been removed; use permission_prompts')
         expect(loadError({ channel_mode: mode, personas: [{ ...makePersona({}, dir), fungible_destination: value }] })).toContain('fungible_destination')
@@ -1918,10 +1924,10 @@ describe('loadPersonaConfig', () => {
 
     test.each(['strict', 'open'] as const)('%s validates all shared fields; no dormant section bypasses validation', channel_mode => {
       const invalid = [
-        { permission_prompts: undefined }, { permission_prompts: 'C0MISSING' },
-        { permission_prompts: DM_DESTINATION }, { channels: [{ id: 'C0TEST001' }] },
-        { channels: [{ id: 'C0TEST001', delivery: 'automatic' }] },
-        { channels: [{ id: 'D0TEST001', delivery: 'all' }] },
+        { permission_prompts: undefined }, { permission_prompts: SHARED_CHANNEL_IDS.foreign },
+        { permission_prompts: DM_DESTINATION }, { channels: [{ id: SHARED_CHANNEL_IDS.primary }] },
+        { channels: [{ id: SHARED_CHANNEL_IDS.primary, delivery: 'automatic' }] },
+        { channels: [{ id: MALFORMED_CHANNEL_ID, delivery: 'all' }] },
         { channels: null }, { dm: { enabled: 'yes' } },
       ]
       for (const change of invalid) expect(loadError({ channel_mode, personas: [{ ...makePersona({}, dir), ...change }] })).toContain('personas[0]')
@@ -1929,7 +1935,7 @@ describe('loadPersonaConfig', () => {
 
     test.each(['strict', 'open'] as const)('%s builders match the production loader and emit only current fields', channel_mode => {
       const specs = [
-        { name: 'alpha', channels: [{ id: 'C0TEST001', delivery: 'off' as const }], permission_prompts: 'C0TEST001' },
+        { name: 'alpha', channels: [{ id: SHARED_CHANNEL_IDS.primary, delivery: 'off' as const }], permission_prompts: SHARED_CHANNEL_IDS.primary },
         { name: 'beta', channels: [], permission_prompts: DM_DESTINATION, dm: { enabled: true, contact: 'U0TEST001' } },
       ]
       const input = makePersonaConfigInput({ channel_mode, personas: specs.map(spec => makePersona(spec, dir)) }, dir)
@@ -1942,13 +1948,13 @@ describe('loadPersonaConfig', () => {
     })
 
     test('a valid configuration above 64 KiB retains all 1000 channel preferences', () => {
-      const channels = Array.from({ length: 1000 }, (_, i) => ({ id: `C0LARGE${String(i).padStart(4, '0')}`, delivery: (['off', 'mentions', 'all', 'thread_hybrid'] as const)[i % 4]! }))
-      const input = makePersonaConfigInput({ personas: [makePersona({ channels, permission_prompts: channels[999]!.id }, dir)] }, dir)
+      const channels = channelPopulation(SR8_SHARED_LIST_CHANNELS)
+      const input = makePersonaConfigInput({ personas: [makePersona({ channels, permission_prompts: channels.at(-1)!.id }, dir)] }, dir)
       const path = writeConfigFile(dir, input)
       expect(statSync(path).size).toBeGreaterThan(MAX_RELOAD_FILE_BYTES)
       const actual = loadPersonaConfig(path, home)
       expect(actual.personas[0]!.channels).toEqual(channels)
-      expect(actual.personas[0]!.permission_prompts).toBe(channels[999]!.id)
+      expect(actual.personas[0]!.permission_prompts).toBe(channels.at(-1)!.id)
       assertNoLeak({ actual, file: writtenFile(path) })
     })
   })
@@ -1964,7 +1970,7 @@ describe('loadPersonaConfig', () => {
     type LoadMode = (typeof MODES)[number]
     const MODE_NAME = 'Ops Bot'
     const MODE_REF = `personas[0] ${renderPersonaRef(MODE_NAME)}`
-    const CHANNEL = 'C0TEST001'
+    const CHANNEL = SHARED_CHANNEL_IDS.primary
     const DM_ENABLED = 'dm.enabled'
     const DM_CONTACT = 'dm.contact'
 
@@ -2137,7 +2143,7 @@ describe('loadPersonaConfig', () => {
         {
           mode,
           label: 'an invalid effort before a bad channel id',
-          overrides: { effort: BAD_EFFORT, channels: [{ id: 'D0TEST001', delivery: 'all' }] },
+          overrides: { effort: BAD_EFFORT, channels: [{ id: MALFORMED_CHANNEL_ID, delivery: 'all' }] },
           reported: EFFORT_REASON,
           absent: ['channels'],
         },
@@ -2513,7 +2519,7 @@ describe('credentialsFilesToProtect', () => {
       writeFileSync(path, `{ "personas": [ { "credentials_file": "${fakeToken(BOT_TOKEN_PREFIX)}" `, 'utf-8')
       return path
     }],
-    ['a route-shaped file', () => writeConfigFile(dir, { routes: { C0TEST001: { cwd: join(dir, 'work') } } })],
+    ['a route-shaped file', () => writeConfigFile(dir, { routes: { [SHARED_CHANNEL_IDS.primary]: { cwd: join(dir, 'work') } } })],
     ['a non-array personas', () => writeConfigFile(dir, { personas: { credentials_file: join(dir, 'x.json') } })],
     ['a non-string credentials_file', () => writeConfigFile(dir, { personas: [{ name: 'x', credentials_file: 42 }] })],
     ['a JSON null', () => writeConfigFile(dir, null)],

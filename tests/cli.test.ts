@@ -1,4 +1,3 @@
-import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 /**
  * cli.test.ts — Coverage for the CLI surface (`start`, `stop`,
  * `clean_restart`, `credentials`) at the createCli factory level, with all
@@ -103,6 +102,10 @@ import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
  *
  * SPDX-License-Identifier: MIT
  */
+
+import { SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
+import { UPGRADE_FIXTURE_DIR, UPGRADE_GROUP_DIRS } from './test-helpers/shared-channel-upgrade.ts'
+import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 
@@ -500,7 +503,7 @@ function snapshotTree(): Record<string, string | null> {
 
 /** A persona whose name differs from its key, so name- or channel-addressing fails. */
 const OPS_NAME = 'Ops Bot'
-const OPS_CHANNEL = 'C0TEST001'
+const OPS_CHANNEL = SHARED_CHANNEL_IDS.primary
 const opsId = (): string => personaInstanceId(personaKey(OPS_NAME))
 /** The Ops persona as the teardown's lines name it. */
 const OPS_PERSONA: CliTeardownPersona = Object.freeze({ name: OPS_NAME, key: personaKey(OPS_NAME) })
@@ -518,8 +521,8 @@ function opsConfig(overrides: Partial<Omit<PersonaConfig, 'personas'>> = {}): Pe
 /** Two personas: Alpha is in two channels, Beta is in none with DMs on. */
 const ALPHA = {
   name: 'Alpha Bot',
-  channels: [{ id: 'C0ALPHA01', delivery: 'all' as const }, { id: 'C0SHARED1', delivery: 'mentions' as const }],
-  permission_prompts: 'C0ALPHA01',
+  channels: [{ id: SHARED_CHANNEL_IDS.secondary, delivery: 'all' as const }, { id: SHARED_CHANNEL_IDS.private, delivery: 'mentions' as const }],
+  permission_prompts: SHARED_CHANNEL_IDS.secondary,
 }
 const BETA = { name: 'Beta', channels: [], dm: { enabled: true, contact: 'U0TEST001' }, permission_prompts: 'dm' }
 /** The configuration of {@link ALPHA} and {@link BETA}, in that order. */
@@ -1435,7 +1438,7 @@ describe('stop — server.port is removed with the PID file', () => {
 
 describe('last-applied record', () => {
   /** Only in the edited config.json: a record-sourced teardown never addresses it. */
-  const GAMMA = { name: 'Gamma Bot', channels: [{ id: 'C0GAMMA01', delivery: 'all' as const }], permission_prompts: 'C0GAMMA01' }
+  const GAMMA = { name: 'Gamma Bot', channels: [{ id: SHARED_CHANNEL_IDS.third, delivery: 'all' as const }], permission_prompts: SHARED_CHANNEL_IDS.third }
   const alphaId = (): string => personaInstanceId(personaKey(ALPHA.name))
   const betaId = (): string => personaInstanceId(personaKey(BETA.name))
   const gammaId = (): string => personaInstanceId(personaKey(GAMMA.name))
@@ -4748,7 +4751,7 @@ const WRITE_FAILURES: ReadonlyArray<readonly [string, WriteFailure]> = [
 ]
 
 describe('the teardown\'s report and where each line goes', () => {
-  const GAMMA = { name: 'Gamma', channels: [{ id: 'C0GAMMA01', delivery: 'all' as const }] }
+  const GAMMA = { name: 'Gamma', channels: [{ id: SHARED_CHANNEL_IDS.third, delivery: 'all' as const }] }
   const [alphaP, betaP, gammaP] = [ALPHA.name, BETA.name, GAMMA.name].map(personaOf) as [CliTeardownPersona, CliTeardownPersona, CliTeardownPersona]
   const idOf = (p: CliTeardownPersona): string => personaInstanceId(p.key)
   const sessionOf = (p: CliTeardownPersona): string => personaTmuxSessionName(p.key)
@@ -6022,7 +6025,7 @@ describe('credentials <persona>', () => {
   test('the persona comes from config.json as it stands, never the last-applied record: one declared but not yet confirmed is found', async () => {
     // The record holds only Ops Bot; config.json adds "newbie", not yet confirmed.
     writeFileSync(recordPath(), readFileSync(configPath))
-    const newbie = makePersona({ name: 'newbie', channels: [{ id: 'C0NEW0001', delivery: 'all' }], permission_prompts: 'C0NEW0001' }, root)
+    const newbie = makePersona({ name: 'newbie', channels: [{ id: SHARED_CHANNEL_IDS.future, delivery: 'all' }], permission_prompts: SHARED_CHANNEL_IDS.future }, root)
     writeConfigFile(stateDir, makePersonaConfigInput({ personas: [makePersona({ name: OPS_NAME }, root), newbie] }, root))
     const b = makeDeps()
 
@@ -6330,17 +6333,11 @@ describe('no CLI command reads, writes, creates or removes the stored-choice fil
   /** The state directory's entries named after the file: the file itself, or a write's temporary file beside it. */
   const fileEntries = (): string[] => readdirSync(stateDir).filter((name) => name.startsWith(LEGACY_FILE_NAME))
 
-  /**
-   * The file: the Ops persona's two channels under its declaration as the
-   * applied configuration resolves it, and a key that configuration lacks,
-   * which the server's start would drop. `refused` appends a
-   * byte to what the serialiser wrote, so the module's parser refuses the
-   * file and a load through the module would log its unreadable line. Answers the file's bytes.
-   */
+  /** Preserved obsolete reference bytes, with one extra byte for the malformed control. */
   function seedStoredChoices(refused: boolean): Uint8Array {
     // Deliberately obsolete reference bytes: no application reader may touch them.
     const path = legacyPath()
-    writeFileSync(path, JSON.stringify({ version: 1, personas: { ignored: { channels: { C0OLD001: { delivery: 'all' } } } } }))
+    writeFileSync(path, readFileSync(join(UPGRADE_FIXTURE_DIR, 'declarative-choices-and-queues', UPGRADE_GROUP_DIRS.reference, LEGACY_FILE_NAME)))
     if (refused) appendFileSync(path, '}')
     return new Uint8Array(readFileSync(path))
   }

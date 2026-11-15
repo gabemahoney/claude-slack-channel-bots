@@ -15,6 +15,7 @@
  */
 
 import { beforeEach, describe, expect, test } from 'bun:test'
+import { OWN_ROOT_CLOCK_SKEW_MS } from '../src/delivery-constants.ts'
 import { eligibleMembership, THREAD_DECISION_GROUPS, decisionArgsOf, channelDeliveryArgsOf, type OwnPostRead, type ThreadRead } from './test-helpers/fungible-decision.ts'
 
 import { CHANNEL_ID_RE, type ChannelEntry, type DeliveryMode } from '../src/config.ts'
@@ -54,6 +55,11 @@ import {
   type EnvelopeFlagForm,
   type EventOverrides,
 } from './test-helpers/slack-stub.ts'
+
+
+test('own-root clock skew bound is pinned', () => {
+  expect(OWN_ROOT_CLOCK_SKEW_MS).toBe(120_000)
+})
 
 // ---------------------------------------------------------------------------
 // Fixtures

@@ -6883,32 +6883,74 @@ describe('Thread Memory server lifecycle wiring', () => {
     }
   })
 
-  test('shutdown awaits queue drain and quiescence, seals all known stores only after load, then stops memory and seal even in dry run', () => {
-    const [start, end] = shutdownBody(SERVER_CODE)
-    const code = SERVER_CODE.slice(start, end)
+  const assertShutdownOrder = (source: string): void => {
+    const code = source.slice(...shutdownBody(source))
     const tree = ts.createSourceFile('shutdown-body.ts', code, ts.ScriptTarget.Latest, true)
-    // These must be shutdown's own statements: wrapping the whole sequence in
-    // a dry-run branch must fail just as wrapping either seal write does.
-    const statements = tree.statements.map(node => node.getText(tree).replace(/\s+/g, ' ').trim())
-    const drain = statements.indexOf('await deliveryQueue?.stop()')
-    expect(drain).toBeGreaterThanOrEqual(0)
-    expect(statements.slice(drain, drain + 10)).toEqual([
-      'await deliveryQueue?.stop()',
-      'threadMemoryRetries?.stopKeys()',
-      'ownPostLookups?.stop()',
-      'ownPostJoins?.stop()',
-      'unsubscribeThreadMemory?.()',
-      'await threadMemory?.quiesce()',
-      "if (threadMemorySeal?.loadedAtStart() && threadMemory) { const completed = threadMemory.completedStores() const shutdownEntries = new Map([...threadMemory.journalFacts().keys()].map(key => { const identity = completed.get(key) ?? {} let memoryOnlyJoins: { channel: string; root: string }[] = [] try { memoryOnlyJoins = ownPostJoins?.memoryOnlyJoins(key) ?? [] } catch { } return [key, { ...identity, ...(memoryOnlyJoins.length ? { memoryOnlyJoins } : {}) }] as const })) const result = await threadMemorySeal.writeShutdown(shutdownEntries) try { if (result.kind === 'failed') console.error(buildThreadMemorySealNotSavedLine(threadMemorySeal.path, result.error, result.unsynced)) } catch { } }",
-      'await threadMemory?.stop()',
-      'await threadMemorySeal?.stop()',
-      'threadMemoryRetries?.stopSeal()',
-    ])
-    for (const call of ['threadMemorySeal\\.writeShutdown', 'threadMemorySeal\\?\\.stop']) {
-      const at = onlyCallOf(call)
-      expect(at).toBeGreaterThan(start)
-      expect(at).toBeLessThan(end)
+    const calls: ts.CallExpression[] = []
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node)) calls.push(node)
+      ts.forEachChild(node, visit)
     }
+    visit(tree)
+    const call = (name: string) => {
+      const matches = calls.filter(node => node.expression.getText(tree).replaceAll('?.', '.') === name)
+      expect(matches).toHaveLength(1)
+      return matches[0]!
+    }
+    const sequence = [
+      'deliveryQueue.stop', 'threadMemoryRetries.stopKeys', 'ownPostLookups.stop',
+      'ownPostJoins.stop', 'unsubscribeThreadMemory', 'threadMemory.quiesce',
+      'threadMemorySeal.writeShutdown', 'threadMemory.stop', 'threadMemorySeal.stop',
+      'threadMemoryRetries.stopSeal',
+    ].map(call)
+    const owners = sequence.map(node => {
+      let statement: ts.Node = node
+      while (statement.parent !== tree) statement = statement.parent
+      return statement
+    })
+    const positions = owners.map(node => tree.statements.indexOf(node as ts.Statement))
+    expect(positions.every((position, i) => i === 0 || position > positions[i - 1]!)).toBe(true)
+    for (let i = 0; i < owners.length; i++) {
+      const owner = owners[i]!
+      if (i === 6) {
+        expect(ts.isIfStatement(owner)).toBe(true)
+        const guard = owner as ts.IfStatement
+        expect(guard.expression.getText(tree).replace(/\s+/g, ' ')).toBe('threadMemorySeal?.loadedAtStart() && threadMemory')
+        expect(guard.elseStatement).toBeUndefined()
+        // The write is directly awaited in the guarded block, never gated by dry run.
+        expect(ts.isBlock(guard.thenStatement)).toBe(true)
+        expect(sequence[i]!.parent.kind).toBe(ts.SyntaxKind.AwaitExpression)
+        let writeStatement: ts.Node = sequence[i]!
+        while (!ts.isVariableStatement(writeStatement) && !ts.isExpressionStatement(writeStatement)) writeStatement = writeStatement.parent
+        expect(writeStatement.parent).toBe(guard.thenStatement)
+      } else {
+        expect(ts.isExpressionStatement(owner)).toBe(true)
+        const expression = (owner as ts.ExpressionStatement).expression
+        const awaited = [0, 5, 7, 8].includes(i)
+        expect(ts.isAwaitExpression(expression)).toBe(awaited)
+        expect(awaited ? (expression as ts.AwaitExpression).expression : expression).toBe(sequence[i]!)
+      }
+    }
+  }
+
+  test('shutdown awaits queue drain and quiescence, seals all known stores only after load, then stops memory and seal even in dry run', () => {
+    assertShutdownOrder(SERVER_CODE)
+    // Local names and diagnostic text inside the seal block are irrelevant.
+    assertShutdownOrder(SERVER_CODE.replaceAll('shutdownEntries', 'entriesForShutdown').replaceAll('const completed =', '/* harmless comment */ const completed ='))
+  })
+
+  test.each([
+    ['missing drain', (code: string) => code.replace('await deliveryQueue?.stop()', 'void 0')],
+    ['duplicate memory stop', (code: string) => code.replace('await threadMemory?.stop()', 'await threadMemory?.stop(); await threadMemory?.stop()')],
+    ['quiescence moved after sealing', (code: string) => code.replace('await threadMemory?.quiesce()', '').replace('await threadMemory?.stop()', 'await threadMemory?.quiesce(); await threadMemory?.stop()')],
+    ['missing loaded-at-start guard', (code: string) => code.replace('threadMemorySeal?.loadedAtStart() && threadMemory', 'threadMemory')],
+    ['missing memory guard', (code: string) => code.replace('threadMemorySeal?.loadedAtStart() && threadMemory', 'threadMemorySeal?.loadedAtStart()')],
+    ['dry-run-gated shutdown', (code: string) => {
+      const [start, end] = shutdownBody(code)
+      return code.slice(0, start) + 'if (!DRY_RUN) {' + code.slice(start, end) + '}' + code.slice(end)
+    }],
+  ] as const)('shutdown audit rejects %s', (_label, mutate) => {
+    expect(() => assertShutdownOrder(mutate(SERVER_CODE))).toThrow()
   })
 })
 

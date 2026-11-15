@@ -26,7 +26,6 @@ afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }) })
 
 test('the shipped tag description equals the exact contract', () => {
   expect(TAG_DESCRIPTION).toBe(FIXED_TAG)
-  expect(TAG_DESCRIPTION).not.toMatch(/participat|followed[ -]thread/i)
 })
 
 describe('shared composed system prompt', () => {

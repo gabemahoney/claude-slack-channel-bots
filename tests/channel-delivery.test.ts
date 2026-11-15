@@ -9,6 +9,7 @@ import { createSharedChannelAuthority, parseSharedChannelState, serializeSharedC
 import { assertNoLeak, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
 import { makePersona, makePersonaConfigInput } from './test-helpers/persona-config.ts'
 import {
+  SHARED_CHANNEL_IDS as C, retainedScanHistory, RETAINED_SCAN_EVENTS, membershipJoin, membershipObservation, applyMembershipPage, membershipTimestamp,
   _assignFixture, fixtureThreadHybridSince, configBytes, FIXTURE_THREAD_HYBRID_SINCE_PREFIX, initialSharedState, makeSharedAuthority, malformedThreadMemoryMarkers, readSharedState,
   sharedChannelPath, withThreadMemoryCreated, writeSharedState,
 } from './test-helpers/shared-channels.ts'
@@ -28,18 +29,16 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     const source = input(); source.channel_mode = 'open'
     const authority = makeSharedAuthority(root, source)
     const persona = authority.config().personas[0]!
-    expect(authority.observeMembership(persona.key, authority.incarnation(persona.key)!, {
-      event: 'adapter-join', identity: 'authenticated-app', channel: 'C0TEST001', member: true, boundary: 0,
-    }, authority.revision).kind).toBe('applied')
+    expect(authority.observeMembership(persona.key, authority.incarnation(persona.key)!, membershipJoin(C.primary, 'adapter-join', { identity: 'authenticated-app' }), authority.revision).kind).toBe('applied')
     const store = createChannelDeliveryStore(authority, (key, channel) => authority.personaSnapshot(key)?.membership[channel]?.member === true)
     for (const delivery of ['off', 'mentions', 'all', 'thread_hybrid'] as const) {
-      const previous = authority.choice(persona.key, 'C0TEST001')
+      const previous = authority.choice(persona.key, C.primary)
       expect(store.attempt(persona.key, authority.incarnation(persona.key)!,
-        deliveryAttempt(`adapter-${delivery}`, 'C0TEST001', delivery), () => undefined))
+        deliveryAttempt(`adapter-${delivery}`, C.primary, delivery), () => undefined))
         .toMatchObject({ kind: 'applied', historical: false, outcome: { previous, delivery } })
       const reopened = createSharedChannelAuthority(authority.path, readSharedState(root)!)
-      expect(reopened.choice(persona.key, 'C0TEST001')).toBe(delivery)
-      expect(reopened.config().personas[0]!.channels).toEqual([{ id: 'C0TEST001', delivery }])
+      expect(reopened.choice(persona.key, C.primary)).toBe(delivery)
+      expect(reopened.config().personas[0]!.channels).toEqual([{ id: C.primary, delivery }])
     }
     expect(store.path).toBe(sharedChannelPath(root))
     expect(existsSync(join(root, 'channel-delivery.json'))).toBe(false)
@@ -51,10 +50,10 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     expect(authority.transact(authority.revision, next => { next.pendingIntent = { review: 'prepared' }; next.outcomes = { attempt: 'settled' } }).kind).toBe('applied')
     const before = authority.snapshot()
     const alpha = authority.config().personas[0]!
-    for (let i = 0; i < 2; i++) expect(_assignFixture(authority, alpha.key, authority.incarnation(alpha.key)!, 'C0TEST001', 'all', authority.revision, mint).kind).toBe('applied')
+    for (let i = 0; i < 2; i++) expect(_assignFixture(authority, alpha.key, authority.incarnation(alpha.key)!, C.primary, 'all', authority.revision, mint).kind).toBe('applied')
     const after = readSharedState(root)!
     expect(after.revision).toBe(before.revision + 2)
-    expect(after.personas[alpha.key]!.assignments['C0TEST001']!.order).toBe(after.revision)
+    expect(after.personas[alpha.key]!.assignments[C.primary]!.order).toBe(after.revision)
     expect(after.personas['beta']).toEqual(before.personas['beta'])
     expect(after.source).toEqual(before.source)
     expect(after.pendingIntent).toEqual(before.pendingIntent)
@@ -85,7 +84,7 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     const authority = makeSharedAuthority(root, input(), { write(path, bytes) { durableWriteFileSync(path, bytes); durable = true } })
     const received: unknown[] = []
     const unsubscribe = authority.subscribe(config => { expect(durable).toBe(true); received.push(config) })
-    const edited = input(); edited.channel_mode = 'open'; edited.personas[0]!.channels = [{ id: 'C0TEST002', delivery: 'thread_hybrid' }]; edited.personas[0]!.permission_prompts = 'C0TEST002'
+    const edited = input(); edited.channel_mode = 'open'; edited.personas[0]!.channels = [{ id: C.secondary, delivery: 'thread_hybrid' }]; edited.personas[0]!.permission_prompts = C.secondary
     expect(authority.transact(authority.revision, next => { next.pendingIntent = { prepared: 'review' }; next.outcomes = { prior: 'retained' } }).kind).toBe('applied')
     received.length = 0
     durable = false
@@ -95,7 +94,7 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     expect(readSharedState(root)!.pendingIntent).toEqual({ prepared: 'review' })
     expect(readSharedState(root)!.outcomes).toEqual({ prior: 'retained' })
     unsubscribe()
-    _assignFixture(authority, 'alpha', authority.incarnation('alpha')!, 'C0TEST002', 'off', authority.revision, mint)
+    _assignFixture(authority, 'alpha', authority.incarnation('alpha')!, C.secondary, 'off', authority.revision, mint)
     expect(received).toHaveLength(1)
     check(received)
   })
@@ -119,8 +118,8 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     expect(disk.revision).toBe(fault === 'before-rename' ? 1 : 2)
     if (fault === 'before-rename') expect(readFileSync(authority.path)).toEqual(before)
     else {
-      expect(_assignFixture(authority, 'alpha', initial.personas['alpha']!.incarnation, 'C0TEST001', 'off', 1, mint).kind).toBe('unresolved')
-      expect(authority.observeMembership('alpha', initial.personas['alpha']!.incarnation, { event: 'join', identity: 'app', channel: 'C0TEST001', member: true, boundary: 0 }, 1).kind).toBe('unresolved')
+      expect(_assignFixture(authority, 'alpha', initial.personas['alpha']!.incarnation, C.primary, 'off', 1, mint).kind).toBe('unresolved')
+      expect(authority.observeMembership('alpha', initial.personas['alpha']!.incarnation, membershipJoin(C.primary, 'join'), 1).kind).toBe('unresolved')
       expect(() => authority.previewReviewed(configBytes(edited))).toThrow('unresolved')
       expect(writes).toBe(1)
       expect(createSharedChannelAuthority(authority.path, disk).config().channel_mode).toBe('open')
@@ -132,7 +131,7 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     const authority = makeSharedAuthority(root, input())
     const detached = authority.snapshot(); detached.pendingIntent['outside'] = true; detached.personas['alpha']!.assignments = {}
     authority.subscribe(() => { throw new Error('observer failed') })
-    expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, 'C0TEST001', 'mentions', 1, mint)).toEqual({ kind: 'applied', revision: 2 })
+    expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, C.primary, 'mentions', 1, mint)).toEqual({ kind: 'applied', revision: 2 })
     expect(authority.snapshot().pendingIntent).toEqual({})
     expect(readSharedState(root)!.revision).toBe(2)
     check(authority.snapshot())
@@ -141,7 +140,7 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
   // t2.yiv.sf.ht: membership recovery copies its target persona, never the whole authority.
   test('a persona snapshot clones only that persona and cannot mutate the authority', () => {
     const authority = makeSharedAuthority(root, input())
-    const join = { event: 'join', identity: 'app', channel: 'C0TEST001', member: true, boundary: 0 }
+    const join = membershipJoin(C.primary, 'join')
     expect(authority.observeMembership('alpha', authority.incarnation('alpha')!, join, authority.revision).kind).toBe('applied')
     const before = authority.snapshot()
     const copies = spyOnCopies()
@@ -153,7 +152,7 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
       expect(copies.serialised).toBe(0)
     } finally { copies.restore() }
     expect(alpha).toEqual(before.personas['alpha'])
-    alpha!.assignments = {}; alpha!.membershipEvents['join']!.channel = 'C0FORGED'; alpha!.incarnation = 'forged-life'
+    alpha!.assignments = {}; alpha!.membershipEvents['join']!.channel = C.forged; alpha!.incarnation = 'forged-life'
     expect(authority.snapshot()).toEqual(before)
     expect(authority.personaSnapshot('alpha')).toEqual(before.personas['alpha'])
     expect(['gone', '__proto__', 'constructor', 'hasOwnProperty'].map(key => authority.personaSnapshot(key))).toEqual([undefined, undefined, undefined, undefined])
@@ -164,13 +163,13 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     const authority = makeSharedAuthority(root, input())
     const results: unknown[] = []
     authority.subscribe(() => {
-      results.push(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, 'C0TEST001', 'off', authority.revision, mint))
+      results.push(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, C.primary, 'off', authority.revision, mint))
     })
     expect(authority.transact(1, next => { next.pendingIntent['omitted'] = undefined })).toEqual({ kind: 'applied', revision: 2 })
     expect(results).toEqual([]) // metadata alone publishes no runtime change
-    expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, 'C0TEST001', 'mentions', 2, mint)).toEqual({ kind: 'applied', revision: 3 })
+    expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, C.primary, 'mentions', 2, mint)).toEqual({ kind: 'applied', revision: 3 })
     expect(results).toEqual([{ kind: 'stale', revision: 3 }])
-    expect(authority.choice('alpha', 'C0TEST001')).toBe('mentions')
+    expect(authority.choice('alpha', C.primary)).toBe('mentions')
     expect(Object.hasOwn(authority.snapshot().pendingIntent, 'omitted')).toBe(false)
     expect(authority.snapshot()).toEqual(readSharedState(root)!)
     check(results)
@@ -179,13 +178,11 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
   test('retiring is adapter-local, rejects the held key and leaves its healthy neighbor writable', () => {
     const source = input(); source.channel_mode = 'open'
     const authority = makeSharedAuthority(root, source)
-    for (const key of ['alpha', 'beta']) expect(authority.observeMembership(key, authority.incarnation(key)!, {
-      event: `adapter-${key}-join`, identity: 'authenticated-app', channel: 'C0TEST001', member: true, boundary: 0,
-    }, authority.revision).kind).toBe('applied')
+    for (const key of ['alpha', 'beta']) expect(authority.observeMembership(key, authority.incarnation(key)!, membershipJoin(C.primary, `adapter-${key}-join`, { identity: 'authenticated-app' }), authority.revision).kind).toBe('applied')
     const membership = (key: string, channel: string) => authority.personaSnapshot(key)?.membership[channel]?.member === true
     const store = createChannelDeliveryStore(authority, membership)
     store.beginRetiring(['alpha'])
-    const request = deliveryAttempt('retiring-alpha', 'C0TEST001', 'off')
+    const request = deliveryAttempt('retiring-alpha', C.primary, 'off')
     const before = authority.snapshot()
     expect(store.attempt('alpha', authority.incarnation('alpha')!, request, () => undefined)).toEqual({ kind: 'inactive' })
     expect(authority.snapshot()).toEqual(before)
@@ -202,29 +199,29 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
 test('replaying a verified leave preserves a later future preference, while a never-joined preference has no leave evidence', () => {
   const authority = makeSharedAuthority(root, input())
   const life = authority.incarnation('alpha')!
-  const leave = { event: 'verified-leave', identity: 'app', channel: 'C0TEST001', member: false, boundary: 0 }
+  const leave = membershipJoin(C.primary, 'verified-leave', { member: false })
   expect(authority.observeMembership('alpha', life, leave, authority.revision).kind).toBe('applied')
   const leaveRevision = authority.revision
-  expect(_assignFixture(authority, 'alpha', life, 'C0TEST001', 'thread_hybrid', authority.revision, mint).kind).toBe('applied')
-  expect(_assignFixture(authority, 'alpha', life, 'C0FUTURE1', 'mentions', authority.revision, mint).kind).toBe('applied')
+  expect(_assignFixture(authority, 'alpha', life, C.primary, 'thread_hybrid', authority.revision, mint).kind).toBe('applied')
+  expect(_assignFixture(authority, 'alpha', life, C.future, 'mentions', authority.revision, mint).kind).toBe('applied')
   const reopened = createSharedChannelAuthority(authority.path, readSharedState(root)!)
   const before = readFileSync(authority.path)
   expect(reopened.observeMembership('alpha', life, leave, reopened.revision)).toEqual({ kind: 'applied', revision: leaveRevision })
   expect(readFileSync(authority.path)).toEqual(before)
-  expect(reopened.choice('alpha', 'C0TEST001')).toBe('thread_hybrid')
-  expect(reopened.choice('alpha', 'C0FUTURE1')).toBe('mentions')
+  expect(reopened.choice('alpha', C.primary)).toBe('thread_hybrid')
+  expect(reopened.choice('alpha', C.future)).toBe('mentions')
   const state = reopened.snapshot().personas['alpha']!
-  expect(state.membership['C0TEST001']!.member).toBe(false)
-  expect(state.assignments['C0TEST001']!.order).toBeGreaterThan(state.leaves['C0TEST001']!.boundary)
-  expect(state.membership['C0FUTURE1']).toBeUndefined()
-  expect(state.leaves['C0FUTURE1']).toBeUndefined()
+  expect(state.membership[C.primary]!.member).toBe(false)
+  expect(state.assignments[C.primary]!.order).toBeGreaterThan(state.leaves[C.primary]!.boundary)
+  expect(state.membership[C.future]).toBeUndefined()
+  expect(state.leaves[C.future]).toBeUndefined()
   let writes = 0
   const unresolved = createSharedChannelAuthority(authority.path, reopened.snapshot(), { write(path, bytes) {
     writes++
     durableWriteFileSync(path, bytes)
     throw new DurableWriteUnsyncedError(path, Object.assign(new Error(sentinelInMessage('sync')), { code: 'EIO' }))
   } })
-  expect(_assignFixture(unresolved, 'alpha', life, 'C0FUTURE1', 'off', unresolved.revision, mint).kind).toBe('unresolved')
+  expect(_assignFixture(unresolved, 'alpha', life, C.future, 'off', unresolved.revision, mint).kind).toBe('unresolved')
   expect(unresolved.observeMembership('alpha', life, leave, unresolved.revision).kind).toBe('unresolved')
   expect(writes).toBe(1)
   check(reopened.snapshot())
@@ -240,31 +237,31 @@ test.each<{ label: string; alter: (state: SharedChannelState) => void }>([
   { label: 'two current personas share an incarnation', alter: s => { s.personas['beta']!.incarnation = s.personas['alpha']!.incarnation } },
   { label: 'current incarnation is retired', alter: s => { s.personas['beta']!.incarnation = Object.keys(s.retiredIdentities)[0]! } },
   { label: 'retired channels repeat', alter: s => { const r = Object.values(s.retiredIdentities)[0]!; r.channels.push({ ...r.channels[0]! }) } },
-  { label: 'applied choice disagrees with assignment', alter: s => { appliedPersona(s)['channels'] = [{ id: 'C0TEST001', delivery: 'off' }] } },
-  { label: 'membership metadata has invalid type', alter: s => { Object.assign(s.personas['alpha']!.membership['C0TEST001']!, { isExtSharedChannel: 'false' }) } },
-  { label: 'current membership contradicts latest event', alter: s => { s.personas['alpha']!.membership['C0TEST001']!.member = true } },
+  { label: 'applied choice disagrees with assignment', alter: s => { appliedPersona(s)['channels'] = [{ id: C.primary, delivery: 'off' }] } },
+  { label: 'membership metadata has invalid type', alter: s => { Object.assign(s.personas['alpha']!.membership[C.primary]!, { isExtSharedChannel: 'false' }) } },
+  { label: 'current membership contradicts latest event', alter: s => { s.personas['alpha']!.membership[C.primary]!.member = true } },
   { label: 'membership history is incomplete', alter: s => { delete s.personas['alpha']!.membershipEvents['left'] } },
   { label: 'membership boundary disagrees with event order', alter: s => { s.personas['alpha']!.membershipEvents['joined']!.boundary++ } },
-  { label: 'leave points to a join', alter: s => { s.personas['alpha']!.leaves['C0TEST001']!.event = 'joined' } },
-  { label: 'assignment predates leave', alter: s => { s.personas['alpha']!.assignments['C0TEST001']!.order = s.personas['alpha']!.leaves['C0TEST001']!.boundary } },
-  { label: 'destination proof belongs to a foreign life', alter: s => { s.personas['alpha']!.removedDestinations['C0TEST001']!.incarnation = s.personas['beta']!.incarnation } },
+  { label: 'leave points to a join', alter: s => { s.personas['alpha']!.leaves[C.primary]!.event = 'joined' } },
+  { label: 'assignment predates leave', alter: s => { s.personas['alpha']!.assignments[C.primary]!.order = s.personas['alpha']!.leaves[C.primary]!.boundary } },
+  { label: 'destination proof belongs to a foreign life', alter: s => { s.personas['alpha']!.removedDestinations[C.primary]!.incarnation = s.personas['beta']!.incarnation } },
   { label: 'destination proof no longer names the configured destination', alter: s => {
     const applied = appliedPersona(s)
     const source = (s.source['personas'] as Record<string, unknown>[])[0]!
-    applied['permission_prompts'] = source['permission_prompts'] = 'C0OTHER01'
-    for (const persona of [applied, source]) (persona['channels'] as unknown[]).push({ id: 'C0OTHER01', delivery: 'all' })
-    s.personas['alpha']!.assignments['C0OTHER01'] = { delivery: 'all', order: s.revision }
+    applied['permission_prompts'] = source['permission_prompts'] = C.foreign
+    for (const persona of [applied, source]) (persona['channels'] as unknown[]).push({ id: C.foreign, delivery: 'all' })
+    s.personas['alpha']!.assignments[C.foreign] = { delivery: 'all', order: s.revision }
     s.sourceBytesBase64 = configBytes(s.source).toString('base64')
   } },
 ])('$label is refused by parser and constructor without publishing', ({ alter }) => {
   const source = input()
   const authority = makeSharedAuthority(root, source)
   source.personas[1]!.working_directory = join(root, 'replacement')
-  expect(authority.applyReviewed(configBytes(source), authority.revision, [{ key: 'beta', channel: 'C0TEST001', delivery: 'all' }]).kind).toBe('applied')
+  expect(authority.applyReviewed(configBytes(source), authority.revision, [{ key: 'beta', channel: C.primary, delivery: 'all' }]).kind).toBe('applied')
   const life = authority.incarnation('alpha')!
-  expect(authority.observeMembership('alpha', life, { event: 'joined', identity: 'app', channel: 'C0TEST001', member: true, boundary: 0 }, authority.revision).kind).toBe('applied')
-  expect(authority.observeMembership('alpha', life, { event: 'left', identity: 'app', channel: 'C0TEST001', member: false, boundary: authority.revision }, authority.revision).kind).toBe('applied')
-  expect(_assignFixture(authority, 'alpha', life, 'C0TEST001', 'mentions', authority.revision, mint).kind).toBe('applied')
+  expect(authority.observeMembership('alpha', life, membershipJoin(C.primary, 'joined'), authority.revision).kind).toBe('applied')
+  expect(authority.observeMembership('alpha', life, membershipJoin(C.primary, 'left', { member: false, boundary: authority.revision }), authority.revision).kind).toBe('applied')
+  expect(_assignFixture(authority, 'alpha', life, C.primary, 'mentions', authority.revision, mint).kind).toBe('applied')
   const seed = readSharedState(root)!
   // Object property order is not a source mismatch; exact reviewed bytes stay separate.
   seed.source = Object.fromEntries(Object.entries(seed.source).reverse())
@@ -280,26 +277,15 @@ test.each<{ label: string; alter: (state: SharedChannelState) => void }>([
 // t2.yiv.sf.in (SR-8.9): the same checks over a history whose superseded scan
 // repeats were dropped. They cannot tell a dropped newest repeat (SR-3.5).
 test.each<{ label: string; event: string }>([
-  { label: 'the record that began a channel\'s current membership', event: 'scan:round-1:C0TEST001' },
-  { label: 'the named leave that began a channel\'s current membership', event: 'scan:round-4:absent:C0TEST002' },
+  { label: 'the record that began a channel\'s current membership', event: RETAINED_SCAN_EVENTS.beginning },
+  { label: 'the named leave that began a channel\'s current membership', event: RETAINED_SCAN_EVENTS.leave },
 ])('a retained scan history missing $label is refused by parser and constructor without publishing', ({ event }) => {
   const authority = makeSharedAuthority(root, input())
-  const life = authority.incarnation('alpha')!
-  // Five reconciliations of two channels; C0TEST002 is absent from the last two.
-  for (let round = 1; round <= 5; round++) {
-    expect(authority.transactMembership('alpha', authority.revision, (next, order) => {
-      let position = order - 2
-      for (const channel of ['C0TEST001', 'C0TEST002']) {
-        const member = round < 4 || channel === 'C0TEST001'
-        applySharedMembership(next, ++position, 'alpha', life, { event: `scan:round-${round}:${member ? '' : 'absent:'}${channel}`, channel, member,
-          identity: 'app', boundary: next.personas['alpha']!.membership[channel]?.boundary ?? 0, observedThrough: '1700000000.000' })
-      }
-    }, 2).kind).toBe('applied')
-  }
-  const seed = readSharedState(root)!
+  const seed = retainedScanHistory(authority)
   expect(Object.keys(seed.personas['alpha']!.membershipEvents).sort()).toEqual([
-    'scan:round-1:C0TEST001', 'scan:round-1:C0TEST002', 'scan:round-4:absent:C0TEST002', 'scan:round-5:C0TEST001', 'scan:round-5:absent:C0TEST002'])
-  expect(seed.personas['alpha']!.leaves['C0TEST002']!.event).toBe('scan:round-4:absent:C0TEST002')
+    RETAINED_SCAN_EVENTS.beginning, RETAINED_SCAN_EVENTS.secondaryBeginning, RETAINED_SCAN_EVENTS.leave,
+    RETAINED_SCAN_EVENTS.latest, RETAINED_SCAN_EVENTS.latestAbsence])
+  expect(seed.personas['alpha']!.leaves[C.secondary]!.event).toBe(RETAINED_SCAN_EVENTS.leave)
   expect(parseSharedChannelState(serializeSharedChannelState(seed), authority.path)).toEqual(seed)
   const before = readFileSync(authority.path)
   delete seed.personas['alpha']!.membershipEvents[event]
@@ -319,18 +305,18 @@ describe('thread fields in the production format', () => {
   /** Fixture alpha starts hybrid; beta stays all. */
   function hybridSeed() {
     const authority = makeSharedAuthority(root, input())
-    expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, 'C0TEST001', 'thread_hybrid', authority.revision, mint).kind).toBe('applied')
+    expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, C.primary, 'thread_hybrid', authority.revision, mint).kind).toBe('applied')
     return { authority, seed: readSharedState(root)! }
   }
 
   test.each<{ label: string; alter: (state: SharedChannelState) => void }>([
-    { label: 'thread_hybrid entry without Thread Hybrid Since', alter: s => { delete s.personas['alpha']!.assignments['C0TEST001']!.threadHybridSince } },
-    { label: 'thread_hybrid entry with an empty one', alter: s => { s.personas['alpha']!.assignments['C0TEST001']!.threadHybridSince = '' } },
-    { label: 'thread_hybrid entry with a non-string one', alter: s => { Object.assign(s.personas['alpha']!.assignments['C0TEST001']!, { threadHybridSince: 7 }) } },
-    { label: 'all entry with one', alter: s => { s.personas['beta']!.assignments['C0TEST001']!.threadHybridSince = s.personas['alpha']!.assignments['C0TEST001']!.threadHybridSince } },
+    { label: 'thread_hybrid entry without Thread Hybrid Since', alter: s => { delete s.personas['alpha']!.assignments[C.primary]!.threadHybridSince } },
+    { label: 'thread_hybrid entry with an empty one', alter: s => { s.personas['alpha']!.assignments[C.primary]!.threadHybridSince = '' } },
+    { label: 'thread_hybrid entry with a non-string one', alter: s => { Object.assign(s.personas['alpha']!.assignments[C.primary]!, { threadHybridSince: 7 }) } },
+    { label: 'all entry with one', alter: s => { s.personas['beta']!.assignments[C.primary]!.threadHybridSince = s.personas['alpha']!.assignments[C.primary]!.threadHybridSince } },
   ])('$label is refused as an invalid ordered assignment', ({ alter }) => {
     const { authority, seed } = hybridSeed()
-    expect(seed.personas['alpha']!.assignments['C0TEST001']!.threadHybridSince).toStartWith(FIXTURE_THREAD_HYBRID_SINCE_PREFIX)
+    expect(seed.personas['alpha']!.assignments[C.primary]!.threadHybridSince).toStartWith(FIXTURE_THREAD_HYBRID_SINCE_PREFIX)
     const before = readFileSync(authority.path)
     alter(seed)
     refused(seed, authority.path, ORDERED)
@@ -373,17 +359,17 @@ describe('thread fields in the production format', () => {
     const alias = join(root, 'work-alias'); symlinkSync(persona.working_directory, alias)
     const authority = makeSharedAuthority(root, edited)
     const life = authority.incarnation('alpha')!
-    _assignFixture(authority, 'alpha', life, 'C0TEST001', 'off', authority.revision, mint)
+    _assignFixture(authority, 'alpha', life, C.primary, 'off', authority.revision, mint)
     persona.working_directory = alias
     expect(authority.applyReviewed(configBytes(edited), authority.revision).kind).toBe('applied')
     expect(authority.incarnation('alpha')).toBe(life)
-    expect(authority.choice('alpha', 'C0TEST001')).toBe('off')
+    expect(authority.choice('alpha', C.primary)).toBe('off')
     persona.working_directory = join(root, 'replacement')
-    expect(authority.applyReviewed(configBytes(edited), authority.revision, [{ key: 'alpha', channel: 'C0TEST001', delivery: 'mentions' }]).kind).toBe('applied')
+    expect(authority.applyReviewed(configBytes(edited), authority.revision, [{ key: 'alpha', channel: C.primary, delivery: 'mentions' }]).kind).toBe('applied')
     expect(authority.incarnation('alpha')).not.toBe(life)
     expect(authority.snapshot().retiredIdentities[life]!.key).toBe('alpha')
     const beforeStale = readFileSync(authority.path)
-    expect(_assignFixture(authority, 'alpha', life, 'C0TEST001', 'all', authority.revision, mint).kind).toBe('stale')
+    expect(_assignFixture(authority, 'alpha', life, C.primary, 'all', authority.revision, mint).kind).toBe('stale')
     expect(readFileSync(authority.path)).toEqual(beforeStale)
     check(authority.snapshot())
   })
@@ -392,7 +378,7 @@ describe('thread fields in the production format', () => {
     const authority = makeSharedAuthority(root, input())
     const persona = authority.config().personas[0]!
     const incarnation = authority.incarnation(persona.key)!
-    expect(authority.observeMembership(persona.key, incarnation, { event: 'leave-event', identity: 'authenticated-app', channel: 'C0TEST001', member: false, boundary: 0 }, 1).kind).toBe('applied')
+    expect(authority.observeMembership(persona.key, incarnation, membershipJoin(C.primary, 'leave-event', { member: false, identity: 'authenticated-app' }), 1).kind).toBe('applied')
     const state = readSharedState(root)!
     const reopened = createSharedChannelAuthority(authority.path, state)
     expect(reopened.config().personas[0]!.channels).toEqual([])
@@ -405,8 +391,8 @@ describe('thread fields in the production format', () => {
 
   test.each([
     (state: SharedChannelState) => { state.revision = 0 },
-    (state: SharedChannelState) => { state.personas['alpha']!.assignments['C0TEST001']!.order = 100 },
-    (state: SharedChannelState) => { state.personas['alpha']!.removedDestinations['C0TEST001'] = { event: 'forged', boundary: 1, incarnation: state.personas['alpha']!.incarnation } },
+    (state: SharedChannelState) => { state.personas['alpha']!.assignments[C.primary]!.order = 100 },
+    (state: SharedChannelState) => { state.personas['alpha']!.removedDestinations[C.primary] = { event: 'forged', boundary: 1, incarnation: state.personas['alpha']!.incarnation } },
   ])('malformed authority is refused without changing its durable bytes', alter => {
     const authority = makeSharedAuthority(root, input())
     const before = readFileSync(authority.path)
@@ -431,7 +417,7 @@ test.each((['strict', 'open'] as const).flatMap(mode =>
   const alpha = source.personas[0]!
   alpha.dm = { enabled: true, contact: 'U0TEST001' }
   alpha.permission_prompts = 'dm'
-  alpha.channels = [{ id: 'C0TEST001', delivery: original }]
+  alpha.channels = [{ id: C.primary, delivery: original }]
   let authority = makeSharedAuthority(root, source)
   const sibling = authority.snapshot().personas['beta']
   const originalLife = authority.incarnation('alpha')!
@@ -453,7 +439,7 @@ test.each((['strict', 'open'] as const).flatMap(mode =>
   apply(false)
   alpha.channels[0]!.delivery = changed
   apply(true)
-  expect(authority.choice('alpha', 'C0TEST001')).toBe(changed)
+  expect(authority.choice('alpha', C.primary)).toBe(changed)
   expect(authority.incarnation('alpha')).not.toBe(originalLife)
   for (let reset = 0; reset < 3; reset++) {
     const previousLife = authority.incarnation('alpha')!
@@ -462,7 +448,7 @@ test.each((['strict', 'open'] as const).flatMap(mode =>
     expect(preview.personas[0]!.channels).toEqual([])
     apply(true)
     expect(authority.incarnation('alpha')).not.toBe(previousLife)
-    expect(authority.choice('alpha', 'C0TEST001')).toBeUndefined()
+    expect(authority.choice('alpha', C.primary)).toBeUndefined()
     expect(authority.snapshot().source).toEqual(JSON.parse(configBytes(source).toString()))
   }
   const retirements = Object.values(authority.snapshot().retiredIdentities)
@@ -471,12 +457,12 @@ test.each((['strict', 'open'] as const).flatMap(mode =>
   expect(latest.channels).toEqual(alpha.channels)
   // A fresh explicit assignment still works, but copying it through another reset does not.
   expect(authority.applyReviewed(configBytes(source), authority.revision, [
-    { key: 'alpha', channel: 'C0TEST001', delivery: changed, incarnation: authority.incarnation('alpha') },
+    { key: 'alpha', channel: C.primary, delivery: changed, incarnation: authority.incarnation('alpha') },
   ]).kind).toBe('applied')
   reopen()
-  expect(authority.choice('alpha', 'C0TEST001')).toBe(changed)
+  expect(authority.choice('alpha', C.primary)).toBe(changed)
   apply(false); apply(true)
-  expect(authority.choice('alpha', 'C0TEST001')).toBeUndefined()
+  expect(authority.choice('alpha', C.primary)).toBeUndefined()
   check(authority.snapshot())
 })
 
@@ -485,7 +471,7 @@ test.each(['name', 'credentials_file', 'working_directory'] as const)('replaceme
   const alpha = source.personas[0]!
   alpha.dm = { enabled: true, contact: 'U0TEST001' }
   alpha.permission_prompts = 'dm'
-  alpha.channels = [{ id: 'C0TEST001', delivery: 'all' }]
+  alpha.channels = [{ id: C.primary, delivery: 'all' }]
   let authority = makeSharedAuthority(root, source)
   const sibling = authority.snapshot().personas['beta']
   const apply = () => {
@@ -498,13 +484,13 @@ test.each(['name', 'credentials_file', 'working_directory'] as const)('replaceme
   apply()
   alpha.channels[0]!.delivery = 'mentions'
   apply()
-  expect(authority.choice(field === 'name' ? 'gamma' : 'alpha', 'C0TEST001')).toBe('mentions')
+  expect(authority.choice(field === 'name' ? 'gamma' : 'alpha', C.primary)).toBe('mentions')
   alpha[field] = original
   apply()
-  expect(authority.choice('alpha', 'C0TEST001')).toBeUndefined()
+  expect(authority.choice('alpha', C.primary)).toBeUndefined()
   alpha[field] = field === 'name' ? 'gamma' : join(root, `replacement-${field}`)
   apply()
-  expect(authority.choice(field === 'name' ? 'gamma' : 'alpha', 'C0TEST001')).toBeUndefined()
+  expect(authority.choice(field === 'name' ? 'gamma' : 'alpha', C.primary)).toBeUndefined()
   check(authority.snapshot())
 })
 
@@ -526,7 +512,7 @@ test.each(['rejection-at-assignment', 'colliding-attempts'] as const)('F1: produ
   const config = input(); config.channel_mode = 'open'
   const authority = makeSharedAuthority(root, config)
   const store = createChannelDeliveryStore(authority, () => true)
-  expect(store.attempt('alpha', authority.incarnation('alpha')!, deliveryAttempt('parser-regression', 'C0TEST001', 'all'), () => undefined).kind).toBe('applied')
+  expect(store.attempt('alpha', authority.incarnation('alpha')!, deliveryAttempt('parser-regression', C.primary, 'all'), () => undefined).kind).toBe('applied')
   const bytes = serializeSharedChannelState(contradictoryBotHistory(authority.snapshot(), shape))
   expect(() => parseSharedChannelState(bytes, authority.path)).toThrow()
   durableWriteFileSync(authority.path, bytes)
@@ -541,7 +527,7 @@ test.each(['pending-at-terminal', 'pending-at-inventory'] as const)('attempt pos
   const h = makeMembershipHarness(root)
   try {
     await h.start()
-    const persona = h.h.p('alpha'), channel = 'C0TEST001'
+    const persona = h.h.p('alpha'), channel = C.primary
     h.h.stub(persona).script.inventory.push(membershipPage([channel])); await h.scan()
     const store = createChannelDeliveryStore(h.authority, () => true)
     const request = deliveryAttempt('before-authenticated-inventory', channel, 'all')
@@ -564,7 +550,7 @@ test.each(['pending-at-terminal', 'pending-at-inventory'] as const)('attempt pos
 test('the production reader refuses malformed typed evidence without dumping identifiers or injected data', () => {
   const config = input(); config.channel_mode = 'open'
   const authority = makeSharedAuthority(root, config), store = createChannelDeliveryStore(authority, () => true)
-  const request = deliveryAttempt('valid-source-record', 'C0TEST001', 'all')
+  const request = deliveryAttempt('valid-source-record', C.primary, 'all')
   const applied = store.attempt('alpha', authority.incarnation('alpha')!, request, () => undefined)
   expect(applied.kind).toBe('applied')
   if (applied.kind !== 'applied') throw new Error('expected a durable application')
@@ -592,16 +578,8 @@ import { SR8_SHARED_LIST_CHANNELS } from './test-helpers/thread-memory.ts'
 import { MEMBERSHIP_PAGE_LIMIT } from '../src/channel-membership-retry.ts'
 import { heapStats } from 'bun:jsc'
 describe('membership transactions copy only their persona', () => {
-  const joinOf = (channel: string, event = `Ev${channel}`): VerifiedSharedMembership => ({ event, identity: 'app', channel, member: true, boundary: 0 })
-  const boundaryOf = (authority: SharedChannelAuthority, key: string, channel: string) => authority.lifetime(key, channel)?.membershipBoundary ?? 0
   const observe = (authority: SharedChannelAuthority, key: string, channel: string, member: boolean, event: string) =>
-    authority.observeMembership(key, authority.incarnation(key)!, { event, identity: 'app', channel, member, boundary: boundaryOf(authority, key, channel) }, authority.revision)
-  /** One scan page's positives, as the scanner batches them. */
-  const page = (authority: SharedChannelAuthority, key: string, channels: string[], scan: string, identity = 'app') => authority.transactMembership(key, authority.revision, (next, order) => {
-    let position = order - channels.length
-    for (const channel of channels) applySharedMembership(next, ++position, key, authority.incarnation(key)!, { event: `scan:${scan}:${channel}`, channel, member: true,
-      identity, boundary: boundaryOf(authority, key, channel), observedThrough: '1700000000.000', channelType: 'channel', isExtSharedChannel: false })
-  }, channels.length)
+    authority.observeMembership(key, authority.incarnation(key)!, membershipObservation(authority, key, channel, member, event), authority.revision)
   const wholeState = (value: unknown) => typeof value === 'object' && value !== null && (value as { format?: unknown }).format === SHARED_CHANNEL_FORMAT
   /** An open-mode authority in `dir` whose observers record each publication
    * with the revision on disk; `whole` routes membership through `transact`. */
@@ -619,22 +597,22 @@ describe('membership transactions copy only their persona', () => {
     const disk = () => parseSharedChannelState(readFileSync(authority.path), authority.path)!.revision
     // Settings resolved beside the authority file name its directory.
     authority.subscribe(config => seen.push(['config', authority.revision, disk(), JSON.parse(JSON.stringify(config).replaceAll(dir, '<dir>'))]))
-    authority.subscribeThreadView(view => seen.push(['view', view.revision, disk(), view.personaKeys().map(key => [key, view.threadHybridChannels(key), view.stamp(key, 'C0TEST002')])]))
+    authority.subscribeThreadView(view => seen.push(['view', view.revision, disk(), view.personaKeys().map(key => [key, view.threadHybridChannels(key), view.stamp(key, C.secondary)])]))
     authority.watch(() => seen.push(['watch', authority.revision, disk(), authority.readable]))
     return { authority, writes, seen }
   }
   function membershipHistory(authority: SharedChannelAuthority): unknown[] {
     const store = createChannelDeliveryStore(authority, () => true)
     return [
-      observe(authority, 'alpha', 'C0TEST001', true, 'EvJOIN1'),
-      page(authority, 'alpha', ['C0TEST002', 'C0TEST003'], 'first'),
-      store.attempt('alpha', authority.incarnation('alpha')!, deliveryAttempt('equivalent-attempt', 'C0TEST002', 'thread_hybrid'), () => undefined),
-      observe(authority, 'beta', 'C0TEST001', true, 'EvJOIN2'),
-      observe(authority, 'alpha', 'C0TEST002', false, 'EvLEAVE1'),
-      observe(authority, 'alpha', 'C0TEST001', false, 'EvLEAVE2'),
-      observe(authority, 'alpha', 'C0TEST002', true, 'EvREJOIN1'),
-      observe(authority, 'alpha', 'C0TEST002', true, 'EvREJOIN1'),
-      page(authority, 'alpha', ['C0TEST003', 'C0TEST004'], 'second'),
+      observe(authority, 'alpha', C.primary, true, 'EvJOIN1'),
+      applyMembershipPage(authority, 'alpha', [C.secondary, C.third], 'first'),
+      store.attempt('alpha', authority.incarnation('alpha')!, deliveryAttempt('equivalent-attempt', C.secondary, 'thread_hybrid'), () => undefined),
+      observe(authority, 'beta', C.primary, true, 'EvJOIN2'),
+      observe(authority, 'alpha', C.secondary, false, 'EvLEAVE1'),
+      observe(authority, 'alpha', C.primary, false, 'EvLEAVE2'),
+      observe(authority, 'alpha', C.secondary, true, 'EvREJOIN1'),
+      observe(authority, 'alpha', C.secondary, true, 'EvREJOIN1'),
+      applyMembershipPage(authority, 'alpha', [C.third, C.fourth], 'second'),
       authority.transactMembership('alpha', authority.revision, () => { throw new Error('refused') }),
       authority.transactMembership('alpha', authority.revision - 1, () => { throw new Error('must not run') }),
     ]
@@ -667,18 +645,14 @@ describe('membership transactions copy only their persona', () => {
   // t3.yiv.sf.ws.ih: each observation of a batch rebuilt the persona's raw
   // channel list from all its assignments, though only the last list survives.
   test('a batch of mixed observations commits the bytes, outcomes and publications of one application per observation, deriving the raw channel list once', () => {
-    const seen = (authority: SharedChannelAuthority, key: string, channel: string, member: boolean, event: string, observedThrough?: string): VerifiedSharedMembership => ({
-      event, identity: 'app', channel, member, boundary: boundaryOf(authority, key, channel),
-      ...(observedThrough === undefined ? {} : { observedThrough, channelType: 'channel', isExtSharedChannel: false }),
-    })
     const batches: Array<[string, (authority: SharedChannelAuthority) => VerifiedSharedMembership[]]> = [
-      ['alpha', a => [seen(a, 'alpha', 'C0TEST002', true, 'EvB1J2'), seen(a, 'alpha', 'C0TEST001', false, 'EvB1L1'),
-        seen(a, 'alpha', 'C0TEST003', true, 'EvB1J3', '1700000000.000'), seen(a, 'alpha', 'C0TEST004', true, 'EvB1J4')]],
-      ['alpha', a => [seen(a, 'alpha', 'C0TEST001', true, 'EvB2J1'), seen(a, 'alpha', 'C0TEST002', true, 'EvB2J2', '1700000001.000'), seen(a, 'alpha', 'C0TEST003', false, 'EvB2L3')]],
+      ['alpha', a => [membershipObservation(a, 'alpha', C.secondary, true, 'EvB1J2'), membershipObservation(a, 'alpha', C.primary, false, 'EvB1L1'),
+        membershipObservation(a, 'alpha', C.third, true, 'EvB1J3', membershipTimestamp()), membershipObservation(a, 'alpha', C.fourth, true, 'EvB1J4')]],
+      ['alpha', a => [membershipObservation(a, 'alpha', C.primary, true, 'EvB2J1'), membershipObservation(a, 'alpha', C.secondary, true, 'EvB2J2', membershipTimestamp(1000)), membershipObservation(a, 'alpha', C.third, false, 'EvB2L3')]],
       // An obsolete boundary after an applicable observation refuses the whole batch.
-      ['alpha', a => [seen(a, 'alpha', 'C0TEST005', true, 'EvB3J5'), { ...seen(a, 'alpha', 'C0TEST004', false, 'EvB3L4'), boundary: 999 }]],
-      ['beta', a => [seen(a, 'beta', 'C0TEST001', false, 'EvB4L1'), seen(a, 'beta', 'C0TEST006', true, 'EvB4J6'), seen(a, 'beta', 'C0TEST007', true, 'EvB4J7')]],
-      ['alpha', a => [seen(a, 'alpha', 'C0TEST004', false, 'EvB5L4'), seen(a, 'alpha', 'C0TEST005', true, 'EvB5J5')]],
+      ['alpha', a => [membershipObservation(a, 'alpha', C.fifth, true, 'EvB3J5'), { ...membershipObservation(a, 'alpha', C.fourth, false, 'EvB3L4'), boundary: 999 }]],
+      ['beta', a => [membershipObservation(a, 'beta', C.primary, false, 'EvB4L1'), membershipObservation(a, 'beta', C.sixth, true, 'EvB4J6'), membershipObservation(a, 'beta', C.seventh, true, 'EvB4J7')]],
+      ['alpha', a => [membershipObservation(a, 'alpha', C.fourth, false, 'EvB5L4'), membershipObservation(a, 'alpha', C.fifth, true, 'EvB5J5')]],
     ]
     const runs = [false, true].map(batched => {
       const run = historyRun(join(root, batched ? 'batched' : 'single'), false)
@@ -761,10 +735,10 @@ describe('membership transactions copy only their persona', () => {
       const fault: { at?: string } = {}
       const dir = join(root, routed ? 'whole' : 'narrow')
       const { authority, seen } = historyRun(dir, routed, faultyWrite(fault))
-      expect(observe(authority, 'alpha', 'C0TEST001', true, 'EvSETUP').kind).toBe('applied')
+      expect(observe(authority, 'alpha', C.primary, true, 'EvSETUP').kind).toBe('applied')
       const before = { disk: readFileSync(authority.path), memory: authority.snapshot(), seen: seen.length }
       fault.at = at
-      const failed = observe(authority, 'alpha', 'C0TEST002', true, 'EvFAULT')
+      const failed = observe(authority, 'alpha', C.secondary, true, 'EvFAULT')
       const after = { failed, readable: authority.readable, cause: authority.unreadableCause, failure: authority.failure,
         disk: readFileSync(authority.path), memory: authority.snapshot(), temporary: readdirSync(dir).filter(name => name.endsWith('.tmp')), seen: seen.slice(before.seen) }
       // Memory never runs ahead of a failed or uncertain write.
@@ -776,7 +750,7 @@ describe('membership transactions copy only their persona', () => {
       }
       expect(after.temporary).toEqual([])
       fault.at = undefined
-      const retried = at === 'directory' ? authority.recoverDurability() : observe(authority, 'alpha', 'C0TEST002', true, 'EvFAULT')
+      const retried = at === 'directory' ? authority.recoverDurability() : observe(authority, 'alpha', C.secondary, true, 'EvFAULT')
       expect(retried).toEqual({ kind: 'applied', revision: before.memory.revision + 1 })
       expect(parseSharedChannelState(readFileSync(authority.path), authority.path)).toEqual(authority.snapshot())
       return { after, retried, final: readFileSync(authority.path), memory: authority.snapshot(), seen: seen.slice(before.seen) }
@@ -786,23 +760,23 @@ describe('membership transactions copy only their persona', () => {
   })
 
   test.each<[string, (next: SharedChannelState, order: number) => void]>([
-    ['throws after writing its own persona', (next, order) => { applySharedMembership(next, order, 'alpha', next.personas['alpha']!.incarnation, joinOf('C0TEST009')); throw new Error('refused') }],
-    ['changes a committed record in place', next => { next.personas['alpha']!.membership['C0TEST001']!.member = false }],
-    ['writes another persona', (next, order) => { next.personas['beta']!.assignments['C0TEST009'] = { delivery: 'off', order } }],
+    ['throws after writing its own persona', (next, order) => { applySharedMembership(next, order, 'alpha', next.personas['alpha']!.incarnation, membershipJoin(C.additional)); throw new Error('refused') }],
+    ['changes a committed record in place', next => { next.personas['alpha']!.membership[C.primary]!.member = false }],
+    ['writes another persona', (next, order) => { next.personas['beta']!.assignments[C.additional] = { delivery: 'off', order } }],
     ['replaces a shared field', next => { next.pendingIntent = { forged: true } }],
     ['changes its incarnation', next => { next.personas['alpha']!.incarnation = 'forged-life' }],
-    ['changes its applied entry beyond channels', next => { (next.applied['personas'] as Record<string, unknown>[])[0]!['permission_prompts'] = 'C0TEST009' }],
-    ['writes an invalid record', (next, order) => { next.personas['alpha']!.membership['C0TEST009'] = { member: true, boundary: order, identity: '' } }],
+    ['changes its applied entry beyond channels', next => { (next.applied['personas'] as Record<string, unknown>[])[0]!['permission_prompts'] = C.additional }],
+    ['writes an invalid record', (next, order) => { next.personas['alpha']!.membership[C.additional] = { member: true, boundary: order, identity: '' } }],
   ])('a membership transaction that %s fails, writes and publishes nothing, and stays retryable', (_case, change) => {
     const writes: Uint8Array[] = []
     const authority = makeSharedAuthority(root, input(), { write(path, bytes) { writes.push(bytes); durableWriteFileSync(path, bytes) } })
-    expect(observe(authority, 'alpha', 'C0TEST001', true, 'EvSETUP').kind).toBe('applied')
+    expect(observe(authority, 'alpha', C.primary, true, 'EvSETUP').kind).toBe('applied')
     const before = { memory: authority.snapshot(), disk: readFileSync(authority.path), writes: writes.length }
     const published: unknown[] = []
     authority.subscribe(config => published.push(config)); authority.subscribeThreadView(view => published.push(view.revision))
     expect(authority.transactMembership('alpha', authority.revision, change)).toEqual({ kind: 'failed', revision: before.memory.revision })
     expect([authority.snapshot(), readFileSync(authority.path), writes.length, published, authority.readable]).toEqual([before.memory, before.disk, before.writes, [], true])
-    expect(observe(authority, 'alpha', 'C0TEST002', true, 'EvRETRY')).toEqual({ kind: 'applied', revision: before.memory.revision + 1 })
+    expect(observe(authority, 'alpha', C.secondary, true, 'EvRETRY')).toEqual({ kind: 'applied', revision: before.memory.revision + 1 })
     expect(readSharedState(root)).toEqual(authority.snapshot())
     check(authority.snapshot())
   })
@@ -812,10 +786,10 @@ describe('membership transactions copy only their persona', () => {
     let kept: SharedChannelState | undefined
     expect(authority.transactMembership('alpha', authority.revision, (next, order) => {
       kept = next
-      applySharedMembership(next, order, 'alpha', authority.incarnation('alpha')!, joinOf('C0TEST002'))
+      applySharedMembership(next, order, 'alpha', authority.incarnation('alpha')!, membershipJoin(C.secondary))
     }).kind).toBe('applied')
     const committed = authority.snapshot()
-    expect(() => { kept!.personas['alpha']!.membership['C0TEST002']!.member = false }).toThrow(TypeError)
+    expect(() => { kept!.personas['alpha']!.membership[C.secondary]!.member = false }).toThrow(TypeError)
     expect(() => { kept!.personas['beta']!.assignments = {} }).toThrow(TypeError)
     expect(() => { kept!.pendingIntent['forged'] = true }).toThrow(TypeError)
     // Readers still get detached copies they may change.
@@ -832,7 +806,7 @@ describe('membership transactions copy only their persona', () => {
     for (const key of ['alpha', 'beta']) {
       expect(authority.transact(authority.revision, (next, order) => {
         let position = order - ids.length
-        for (const channel of ids) applySharedMembership(next, ++position, key, authority.incarnation(key)!, { ...joinOf(channel, `scan:setup:${channel}`), channelType: 'channel', isExtSharedChannel: false })
+        for (const channel of ids) applySharedMembership(next, ++position, key, authority.incarnation(key)!, { ...membershipJoin(channel, `scan:setup:${channel}`), channelType: 'channel', isExtSharedChannel: false })
       }, ids.length).kind).toBe('applied')
     }
     const size = readFileSync(authority.path).length
@@ -845,7 +819,7 @@ describe('membership transactions copy only their persona', () => {
       outcomes = [...ids.slice(1, 6).map(channel => observe(authority, 'alpha', channel, false, `EvLEAVE${channel}`)),
         ...ids.slice(1, 6).map(channel => observe(authority, 'alpha', channel, true, `EvREJOIN${channel}`))].map(outcome => outcome.kind)
       untouched = persona('beta')
-      outcomes.push(observe(authority, 'beta', 'C0TEST009', true, 'EvBETA').kind)
+      outcomes.push(observe(authority, 'beta', C.additional, true, 'EvBETA').kind)
       copies = clones.values.filter(wholeState).length
       reparses = parses.mock.calls.filter(([text]) => typeof text === 'string' && text.length >= size).length
     } finally { clones.restore(); parses.mockRestore() }
@@ -875,7 +849,7 @@ describe('membership transactions copy only their persona', () => {
       for (const key of ['alpha', 'beta']) {
         expect(authority.transact(authority.revision, (next, order) => {
           let position = order - ids.length
-          for (const channel of ids) applySharedMembership(next, ++position, key, authority.incarnation(key)!, { ...joinOf(channel, `scan:setup:${channel}`), channelType: 'channel', isExtSharedChannel: false })
+          for (const channel of ids) applySharedMembership(next, ++position, key, authority.incarnation(key)!, { ...membershipJoin(channel, `scan:setup:${channel}`), channelType: 'channel', isExtSharedChannel: false })
         }, ids.length).kind).toBe('applied')
       }
       if (whole) authority.transactMembership = (key, revision, change, span) => authority.transact(revision, change, span)
@@ -887,14 +861,14 @@ describe('membership transactions copy only their persona', () => {
         // The first membership commit over a state that \`transact\` installed encodes it whole.
         ['first', () => observe(authority, 'alpha', ids[0]!, false, 'EvFIRST')],
         ...ids.slice(1, 6).map((channel): [string, () => unknown] => ['membership', () => observe(authority, 'alpha', channel, false, `EvLEAVE${channel}`)]),
-        ['membership', () => page(authority, 'beta', ['C0TEST001', 'C0TEST002', ids[7]!], 'beta')],
+        ['membership', () => applyMembershipPage(authority, 'beta', [C.primary, C.secondary, ids[7]!], 'beta')],
         ...ids.slice(1, 4).map((channel): [string, () => unknown] => ['membership', () => observe(authority, 'alpha', channel, true, `EvREJOIN${channel}`)]),
         ['duplicate', () => observe(authority, 'alpha', ids[1]!, true, `EvREJOIN${ids[1]}`)],
         ['refused', () => authority.transactMembership('alpha', authority.revision, () => { throw new Error('refused') })],
-        ['membership', () => page(authority, 'alpha', ['C0TEST002'], 'alpha')],
-        ['attempt', () => store.attempt('alpha', authority.incarnation('alpha')!, deliveryAttempt('encoded-attempt', 'C0TEST002', 'thread_hybrid'), () => undefined)],
+        ['membership', () => applyMembershipPage(authority, 'alpha', [C.secondary], 'alpha')],
+        ['attempt', () => store.attempt('alpha', authority.incarnation('alpha')!, deliveryAttempt('encoded-attempt', C.secondary, 'thread_hybrid'), () => undefined)],
         ['first', () => observe(authority, 'beta', ids[8]!, false, 'EvAFTERATTEMPT')],
-        ['membership', () => observe(authority, 'alpha', 'C0TEST009', true, 'EvNEW')],
+        ['membership', () => observe(authority, 'alpha', C.additional, true, 'EvNEW')],
         ['membership', () => observe(authority, 'beta', ids[8]!, true, 'EvREJOINBETA')],
       ]
     }
@@ -958,7 +932,7 @@ describe('membership transactions copy only their persona', () => {
     // their numbers, too little to measure retained text against.
     const scan = (round: number) => {
       for (const key of ['alpha', 'beta']) for (let at = 0; at < ids.length; at += MEMBERSHIP_PAGE_LIMIT) {
-        expect(page(authority, key, ids.slice(at, at + MEMBERSHIP_PAGE_LIMIT), `round-${round}`, `app-${round % 2}`).kind).toBe('applied')
+        expect(applyMembershipPage(authority, key, ids.slice(at, at + MEMBERSHIP_PAGE_LIMIT), `round-${round}`, `app-${round % 2}`).kind).toBe('applied')
       }
     }
     // String text lives outside the collected heap; a full collection leaves
@@ -993,7 +967,7 @@ describe('membership transactions copy only their persona', () => {
     authority.subscribe(reader('second'))
     const late = authority.subscribeChange((...args: unknown[]) => { calls.push(['late', args.length]) })
     const publish = reader('publish')
-    const beta = (next: SharedChannelState, order: number) => applySharedMembership(next, order, 'beta', authority.incarnation('beta')!, joinOf('C0TEST003', 'EvBETA'))
+    const beta = (next: SharedChannelState, order: number) => applySharedMembership(next, order, 'beta', authority.incarnation('beta')!, membershipJoin(C.third, 'EvBETA'))
     const parses = spyOn(authority, 'config'), copies = spyOnCopies()
     // A parsed configuration, not the raw applied input that whole-state copies carry.
     const configCopy = (value: unknown) => typeof value === 'object' && value !== null && !wholeState(value) && 'reply_chunk_limit' in value &&
@@ -1002,11 +976,11 @@ describe('membership transactions copy only their persona', () => {
     try {
       const counted = (step: () => { kind: string }) => { const before = copies.values.filter(configCopy).length; const kind = step().kind; return [kind, copies.values.filter(configCopy).length - before] as const }
       const steps = [
-        counted(() => observe(authority, 'alpha', 'C0TEST001', true, 'EvJOIN')),
+        counted(() => observe(authority, 'alpha', C.primary, true, 'EvJOIN')),
         counted(() => authority.transact(authority.revision, beta, 1, publish)),
         // A metadata commit publishes the configuration but notifies no listener.
         counted(() => authority.transact(authority.revision, next => { next.threadMemoryCreated = { alpha: true } }, 1, publish)),
-        counted(() => { late(); return observe(authority, 'alpha', 'C0TEST001', false, 'EvLEAVE') }),
+        counted(() => { late(); return observe(authority, 'alpha', C.primary, false, 'EvLEAVE') }),
       ]
       results = steps.map(([kind]) => kind)
       copied = steps.map(([, count]) => count)
@@ -1036,7 +1010,7 @@ describe('membership transactions copy only their persona', () => {
     return createSharedChannelAuthority(sharedChannelPath(dir), state, { threadHybridSince: () => 'since' })
   }
   const joinBeta = (authority: SharedChannelAuthority) => (next: SharedChannelState, order: number) =>
-    applySharedMembership(next, order, 'beta', authority.incarnation('beta')!, joinOf('C0TEST003', 'EvBETA'))
+    applySharedMembership(next, order, 'beta', authority.incarnation('beta')!, membershipJoin(C.third, 'EvBETA'))
 
   // review-r1 R2: commits took their listeners before the publisher and the
   // thread-view callbacks ran, as the old path did after them, so a listener
@@ -1066,7 +1040,7 @@ describe('membership transactions copy only their persona', () => {
     expect(authority.transact(authority.revision, joinBeta(authority), 1, publish).kind).toBe('applied')
     const first = calls.splice(0)
     phase = 'membership commit'
-    expect(observe(authority, 'alpha', 'C0TEST001', true, 'EvJOIN').kind).toBe('applied')
+    expect(observe(authority, 'alpha', C.primary, true, 'EvJOIN').kind).toBe('applied')
     // The old path's recipients: the listeners as subscribed after both callbacks.
     expect([first, calls]).toEqual([
       ['publisher', 'view: publisher commit', 'kept', 'added by publisher', 'reader added by publisher', 'added by view'],
@@ -1103,8 +1077,8 @@ describe('membership transactions copy only their persona', () => {
   // copied object or array. Counts and bytes are the old path's (HEAD).
   const hooks: Array<[string, (next: SharedChannelState, call: () => void) => void, number[]]> = [
     ['an enumerable accessor on a copied map', (next, call) => {
-      const membership = next.personas['alpha']!.membership, record = membership['C0TEST001']
-      Object.defineProperty(membership, 'C0TEST001', { get() { call(); return record }, enumerable: true, configurable: true })
+      const membership = next.personas['alpha']!.membership, record = membership[C.primary]
+      Object.defineProperty(membership, C.primary, { get() { call(); return record }, enumerable: true, configurable: true })
     }, [4, 1, 1]],
     ['a non-enumerable toJSON getter on a copied map', (next, call) => {
       Object.defineProperty(next.personas['alpha']!.membership, 'toJSON', { get() { call(); return undefined }, enumerable: false, configurable: true })
@@ -1118,15 +1092,15 @@ describe('membership transactions copy only their persona', () => {
   ]
   test.each(hooks)('%s runs at each later commit\'s encoding as the native encoder of the whole state ran it, with its bytes', (_, install, expected) => {
     const authority = makeSharedAuthority(root, input())
-    expect(observe(authority, 'alpha', 'C0TEST001', true, 'EvJOIN1').kind).toBe('applied')
+    expect(observe(authority, 'alpha', C.primary, true, 'EvJOIN1').kind).toBe('applied')
     let calls = 0
     const call = () => { calls++ }
     const counted = (step: () => { kind: string }) => { const before = calls; expect(step().kind).toBe('applied'); return calls - before }
     const perCommit = [counted(() => authority.transactMembership('alpha', authority.revision, (next, order) => {
-      applySharedMembership(next, order, 'alpha', authority.incarnation('alpha')!, joinOf('C0TEST002'))
+      applySharedMembership(next, order, 'alpha', authority.incarnation('alpha')!, membershipJoin(C.secondary))
       install(next, call)
     }))]
-    for (const [channel, event] of [['C0TEST003', 'EvBETA3'], ['C0TEST004', 'EvBETA4']] as const) perCommit.push(counted(() => observe(authority, 'beta', channel, true, event)))
+    for (const [channel, event] of [[C.third, 'EvBETA3'], [C.fourth, 'EvBETA4']] as const) perCommit.push(counted(() => observe(authority, 'beta', channel, true, event)))
     expect(perCommit).toEqual(expected)
     // The bytes the native encoder gives the installed state: alpha's committed life as it encodes, hooks run.
     const state = authority.snapshot()
@@ -1138,7 +1112,7 @@ test('attempt identifiers preserve exact code units and cannot collide after Uni
   const values = ['retained', ' retained ', '\ud800', '\ufffd', '😀', '😀 ']
   const keys = values.map(id => {
     expect(validChannelDeliveryAttemptId(id)).toBe(true)
-    return botAttemptKey(botAttemptBinding('alpha', 'same-life', deliveryAttempt(id, 'C0TEST001', 'all')))
+    return botAttemptKey(botAttemptBinding('alpha', 'same-life', deliveryAttempt(id, C.primary, 'all')))
   })
   expect(new Set(keys).size).toBe(values.length)
   expect(validChannelDeliveryAttemptId(' \r\n\t')).toBe(false)

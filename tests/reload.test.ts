@@ -1,6 +1,5 @@
 import { reviewLedger, reviewOutcomeLine, RELOAD_REVIEW_OUTCOME } from '../src/reload-review.ts'
-import { applicationState } from './test-helpers/shared-channels.ts'
-import { createHash } from 'node:crypto'
+import { applicationState, withIndependentDestination } from './test-helpers/shared-channels.ts'
 import { queueRetentionClause, RECOVERY_PRESERVATION } from '../src/reload-preview-clauses.ts'
 import { sharedRecoveryLine } from '../src/reload-recovery.ts'
 import { recoveryHash } from '../src/shared-recovery.ts'
@@ -176,12 +175,6 @@ afterEach(async () => {
 })
 
 /** `{ personas }` in file form. */
-/** Identity replacements declare a destination independently of the previous source. */
-function withIndependentDestination(persona: PersonaInput): PersonaInput {
-  const id = 'C0REVIEW' + createHash('sha256').update(JSON.stringify([persona.name, persona.credentials_file, persona.working_directory])).digest('hex').slice(0, 8).toUpperCase()
-  return { ...persona, channels: [{ id, delivery: 'all' }], permission_prompts: id }
-}
-
 function configOf(...personas: PersonaInput[]): { personas: PersonaInput[] } {
   return { personas }
 }

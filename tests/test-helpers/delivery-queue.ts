@@ -1,7 +1,7 @@
 /** Shared durable queue fixtures; all paths belong to the caller's scratch directory. */
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { createDeliveryQueue, parseQueueRecord, type AcceptedInput, type AcceptedRecord, type DeliveredRecord, type DeliveryQueueOptions, type FixedRecord, type HoldField, type HoldResolutionRecord, type NoticedRecord, type PostHoldField, type QueueRecord, type ReactionAcceptedInput, type RefusedRecord } from '../../src/delivery-queue.ts'
+import { createDeliveryQueue, parseQueueRecord, type AcceptedInput, type AcceptedRecord, type DeliveredRecord, type DeliveryQueueOptions, type FixedRecord, type HoldField, type HoldResolutionRecord, type NoticedRecord, type PostHoldField, type QueueRecord, type ReactionAcceptedInput, type RefusedRecord, type SentRecord, type UnknownSentRecord } from '../../src/delivery-queue.ts'
 import { postIntent, threadJoin, THREAD_CHANNELS, THREAD_ROOTS, THREAD_STAMP } from './thread-memory.ts'
 
 export const slackInput = (overrides: Partial<AcceptedInput> = {}): AcceptedInput => ({
@@ -52,8 +52,19 @@ export async function makeQueue(stateDir: string, options: Omit<DeliveryQueueOpt
   return queue
 }
 export const fixedRecord = (seq = 1, parts = ['message']): FixedRecord => ({ v: 1, kind: 'fixed', seq, parts })
-export const sentRecord = (seq = 1, attempt = 1, send_kind: 'text' | 'enter' | 'retype' = 'text'): Extract<QueueRecord, { kind: 'sent' }> => ({ v: 1, kind: 'sent', seq, attempt, part: 1, send_kind, at: 1000, session_id: 'session', transcript_path: '/scratch/transcript.jsonl', transcript_size: 0 })
-export const deliveredRecord = (seq = 1, at = 1000): DeliveredRecord => ({ v: 1, kind: 'delivered', seq, part: 1, at, receipt: { path: '/scratch/transcript.jsonl', uuid: 'receipt' } })
+export type SentRecordOverrides = Partial<Omit<SentRecord, 'v' | 'kind' | 'seq' | 'attempt' | 'send_kind'>>
+export type UnknownSendVariant = Pick<UnknownSentRecord, 'unknown_outcome' | 'quarantine'> & Partial<Pick<UnknownSentRecord, 'at'>>
+/** Known sends retain all window facts. Unknown outcomes carry only quarantine
+ * evidence, never fabricated part/session/path/size facts. Old defaults stay put. */
+export function sentRecord(seq?: number, attempt?: number, send_kind?: SentRecord['send_kind'], overrides?: SentRecordOverrides): SentRecord
+export function sentRecord(seq: number, attempt: number, variant: UnknownSendVariant): UnknownSentRecord
+export function sentRecord(seq = 1, attempt = 1, variant: SentRecord['send_kind'] | UnknownSendVariant = 'text', overrides: SentRecordOverrides = {}): SentRecord | UnknownSentRecord {
+  if (typeof variant !== 'string') return { v: 1, kind: 'sent', seq, attempt, at: variant.at ?? 1000, unknown_outcome: true, quarantine: { ...variant.quarantine } }
+  return { v: 1, kind: 'sent', seq, attempt, part: 1, send_kind: variant, at: 1000, session_id: 'session', transcript_path: '/scratch/transcript.jsonl', transcript_size: 0, ...overrides }
+}
+/** A supplied receipt replaces the default whole: UUID, offset (including 0),
+ * or both, without an accidental default UUID credit on an offset-only record. */
+export const deliveredRecord = (seq = 1, at = 1000, overrides: Partial<Pick<DeliveredRecord, 'part' | 'receipt'>> = {}): DeliveredRecord => ({ v: 1, kind: 'delivered', seq, part: 1, at, receipt: { path: '/scratch/transcript.jsonl', uuid: 'receipt' }, ...overrides })
 /** Seed resolutions only for replay/validation; behavioral tests use queue.resolveHolds. */
 export const releasedRecord = (seq = 1, at = 1000): HoldResolutionRecord => ({ v: 1, kind: 'released', seq, at })
 export const withdrawnRecord = (seq = 1, at = 1000): HoldResolutionRecord => ({ v: 1, kind: 'hold-withdrawn', seq, at })

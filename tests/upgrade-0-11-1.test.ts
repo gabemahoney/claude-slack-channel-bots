@@ -47,6 +47,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { parseSharedChannelState } from '../src/shared-channels.ts'
+
 import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -447,7 +449,7 @@ async function startFixture(h: ReloadHarness, fixture: UpgradeFixture): Promise<
 function expectDeclarativeAndUnchanged(h: ReloadHarness, run: ReloadRun, bytes: Buffer): void {
   expect({
     config: h.readConfig()?.equals(bytes),
-    record: h.readRecord() !== undefined && JSON.stringify(JSON.parse(h.readRecord()!.toString()).source) === JSON.stringify(JSON.parse(bytes.toString())),
+    record: Buffer.from(parseSharedChannelState(h.readRecord()!, h.paths.lastApplied, { home: h.home })!.sourceBytesBase64, 'base64').equals(bytes),
     mode: channelModeOf(run.serverConfig()),
     removedFields: run.serverConfig()?.personas.filter(p => 'fungible_destination' in p || 'invited' in p).map(p => p.name),
     storedChoiceFile: existsSync(join(h.stateDir, 'channel-delivery.json')),

@@ -9,7 +9,7 @@ import { createDeliveryReceiptReader, createQueueDeliveryReceiptReader, delivery
 import { buildWrapper, type TagMessage } from '../src/tag-wrapper.ts'
 import { deliveryFailureEvidence, readTranscripts } from './integration/fixtures/transcript-receipts.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken } from './test-helpers/credentials.ts'
-import { injectedInput, makeQueue } from './test-helpers/delivery-queue.ts'
+import { injectedInput, makeQueue, fixedRecord, sentRecord, refusedRecord, deliveredRecord, noticedRecord } from './test-helpers/delivery-queue.ts'
 import { partialReceiptText, partialReceiptSuffix } from './test-helpers/partial-receipt.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { appendTranscript, codexPromptEntry, pastedText, promptEntry, queuedCommandEntry, queueOperationEntry, toolResultEntry, transcriptJsonl, writeTranscript, type TranscriptEntry } from './test-helpers/working-row-panes.ts'
@@ -27,14 +27,14 @@ async function fixture(agent: DeliveryAgent = 'claude', text = 'one\ntwo') {
     const result = await queue.accept('alpha', injectedInput({ text }))
     if (result.status === 'failed') throw new Error('fixture acceptance failed')
     seq = result.seq
-    await queue.append('alpha', { v: 1, kind: 'fixed', seq, parts: [text] })
+    await queue.append('alpha', fixedRecord(seq, [text]))
     return seq
   }
   await accept()
   const item = (): QueueItem => queue.items('alpha').find(i => i.accepted.seq === seq)!
   const row = { jsonl_path: path, transcript_status: 'present', session_id: 'current', cwd: root }
   async function send(offset = fs.statSync(path).size, sendPath = path) {
-    const record: SentRecord = { v: 1, kind: 'sent', seq, part: 1, attempt: item().nextAttempt, send_kind: 'text', at: 1000, session_id: row.session_id, transcript_path: sendPath, transcript_size: offset }
+    const record: SentRecord = sentRecord(seq, item().nextAttempt, 'text', { session_id: row.session_id, transcript_path: sendPath, transcript_size: offset })
     await queue.append('alpha', record)
     return record
   }
@@ -80,7 +80,7 @@ describe('real delivery timeout evidence (synthetic, no native launch)', () => {
       await h.send(0, '')
       h.append({ ...promptEntry(h.text), sessionId: 'current', timestamp: new Date(h.item().accepted.received_at + 1).toISOString() })
       // A delivered record alone must never establish ownership of its path.
-      await h.queue.append('alpha', { v: 1, kind: 'delivered', seq: 1, part: 1, at: h.item().accepted.received_at + 2, receipt: { path: h.path, uuid: 'receipt' } })
+      await h.queue.append('alpha', deliveredRecord(1, h.item().accepted.received_at + 2, { receipt: { path: h.path, uuid: 'receipt' } }))
       const reference = { key: 'alpha', instance_id: 'cscb_alpha', session_id: 'current', jsonl_path: h.path, at: 1500 }
       if (binding === 'foreign-persona') reference.key = 'beta'
       if (binding === 'foreign-instance') reference.instance_id = 'cscb_beta'
@@ -255,7 +255,7 @@ describe('receipt reader', () => {
     }
   }
 
-  test.each(['claude', 'codex'] as const)('%s incremental windows and credits match full reads across other items, compaction and forget', async agent => {
+  test.each([['claude', 'text'], ['codex', 'text'], ['claude', 'enter'], ['codex', 'enter']] as const)('%s %s incremental windows and credits match full reads across other items, compaction and forget', async (agent, sendKind) => {
     const h = await fixture(agent), prior = join(h.root, 'prior.jsonl')
     const entry = agent === 'claude' ? promptEntry : codexPromptEntry
     const before = { ...entry(h.text), uuid: 'before' }, first = { ...entry(h.text), uuid: 'first' }, second = { ...entry(h.text), uuid: 'second' }
@@ -263,26 +263,26 @@ describe('receipt reader', () => {
     writeTranscript(prior, [before])
     expect(readers.read(1, row).receipt).toBeUndefined()
     await h.accept(); await h.accept()
-    for (const seq of [1, 2, 3]) await h.queue.append('alpha', { v: 1, kind: 'sent', seq, part: 1, attempt: 1, send_kind: 'text', at: 1000, session_id: 'current', transcript_path: h.path, transcript_size: 0 })
-    await h.queue.append('alpha', { v: 1, kind: 'refused', seq: 1, attempt: 1, at: 1001 })
+    for (const seq of [1, 2, 3]) await h.queue.append('alpha', sentRecord(seq, 1, sendKind, { session_id: 'current', transcript_path: h.path }))
+    await h.queue.append('alpha', refusedRecord(1, 1, 1001))
     // Observing item 1 must freeze the windows of items 2 and 3 as well,
     // even though their receipts have not appeared yet.
     expect(readers.read(1, row).receipt).toBeUndefined()
     appendTranscript(prior, [first])
     expect(readers.read(2, row).receipt?.uuid).toBe(first.uuid)
     expect(readers.read(3, row).receipt?.uuid).toBe(first.uuid)
-    await h.queue.append('alpha', { v: 1, kind: 'sent', seq: 1, part: 1, attempt: 2, send_kind: 'retype', at: 1002, session_id: 'current', transcript_path: h.path, transcript_size: 0 })
+    await h.queue.append('alpha', sentRecord(1, 2, 'retype', { at: 1002, session_id: 'current', transcript_path: h.path }))
     expect(readers.read(1, row).receipt).toBeUndefined()
     appendTranscript(prior, [second])
     expect(readers.read(1, row).receipt?.uuid).toBe(second.uuid)
     for (const [seq, uuid] of [[1, second.uuid], [1, first.uuid], [2, first.uuid]] as const) {
-      await h.queue.append('alpha', { v: 1, kind: 'delivered', seq, part: 1, at: 2000, receipt: { path: prior, uuid } })
+      await h.queue.append('alpha', deliveredRecord(seq, 2000, { receipt: { path: prior, uuid } }))
       readers.read(3, row)
     }
     expect(readers.read(3, row).receipt).toBeUndefined()
     // Replacing an item's snapshot must keep the other item's duplicate
     // credit, and must neither refreeze a send nor duplicate its credit.
-    await h.queue.append('alpha', { v: 1, kind: 'noticed', seq: 1, at: 2001 })
+    await h.queue.append('alpha', noticedRecord(1, 2001))
     expect(readers.read(3, row).receipt).toBeUndefined()
     await h.queue.compact('alpha')
     expect(h.queue.items('alpha').map(i => i.accepted.seq)).toEqual([3])
@@ -294,18 +294,19 @@ describe('receipt reader', () => {
     expect(readers.read(3, row).receipt?.uuid).toBe(before.uuid)
   })
 
-  test.each(['claude', 'codex'] as const)('%s incremental reads match unknown outcomes, offset credits, discovery order and unavailable files', async agent => {
+  test.each([['claude', 'nonzero'], ['codex', 'nonzero'], ['claude', 'zero'], ['codex', 'zero']] as const)('%s incremental reads match unknown outcomes, %s offset credits, discovery order and unavailable files', async (agent, offsetKind) => {
     const h = await fixture(agent), late = join(h.root, 'late.jsonl')
     const entry = agent === 'claude' ? promptEntry : codexPromptEntry
     const row: DeliveryTranscriptRow = { ...h.row, jsonl_path: late, transcript_status: 'rotated', prior_sessions: [{ jsonl_path: h.path }] }
     const readers = equivalentReaders(h, agent)
     const before = { ...entry(h.text), uuid: undefined, timestamp: 999 }, after = { ...entry(h.text), uuid: undefined, timestamp: 1000 }
-    writeTranscript(h.path, [before, after])
+    writeTranscript(h.path, offsetKind === 'zero' ? [after] : [before, after])
     expect(readers.read(1, row).receipt).toBeUndefined()
-    await h.queue.append('alpha', { v: 1, kind: 'sent', seq: 1, attempt: 1, at: 1000, unknown_outcome: true, quarantine: { path: join(h.root, 'quarantine'), line: 1 } })
+    await h.queue.append('alpha', sentRecord(1, 1, { unknown_outcome: true, quarantine: { path: join(h.root, 'quarantine'), line: 1 } }))
     const found = readers.read(1, row)
     expect(found).toMatchObject({ path: late, size: 0, availability: 'not-yet-written', receipt: { path: h.path, at: 1000 } })
-    await h.queue.append('alpha', { v: 1, kind: 'delivered', seq: 1, part: 1, at: 2000, receipt: { path: h.path, offset: found.receipt!.offset } })
+    if (offsetKind === 'zero') expect(found.receipt!.offset).toBe(0)
+    await h.queue.append('alpha', deliveredRecord(1, 2000, { receipt: { path: h.path, offset: found.receipt!.offset } }))
     expect(readers.read(1, row).receipt).toBeUndefined()
     // A newly discovered current path wins over prior paths, regardless of
     // timestamp order, and offset zero remains eligible for the unknown send.
@@ -468,8 +469,7 @@ describe('receipt reader', () => {
 
   test('b.x4j an unknown-outcome marker alone permits full recovery, never partial classification', async () => {
     const h = await fixture('claude', partialReceiptText)
-    await h.queue.append('alpha', { v: 1, kind: 'sent', seq: 1, attempt: 1, unknown_outcome: true, at: 1000,
-      quarantine: { path: join(h.root, 'quarantine'), line: 1 } })
+    await h.queue.append('alpha', sentRecord(1, 1, { unknown_outcome: true, quarantine: { path: join(h.root, 'quarantine'), line: 1 } }))
     h.append({ ...promptEntry(partialReceiptSuffix), timestamp: new Date(2000).toISOString() })
     expect(h.read().receipt).toBeUndefined()
     expect(h.read()).not.toHaveProperty('partialReceipt', expect.anything())
@@ -512,7 +512,7 @@ describe('receipt reader', () => {
       if (kind === 'pre-send') h.append(entry)
       if (kind !== 'unsent') {
         const sent = await h.send()
-        if (kind === 'refused') await h.queue.append('alpha', { v: 1, kind: 'refused', seq: 1, attempt: sent.attempt, at: 1500 })
+        if (kind === 'refused') await h.queue.append('alpha', refusedRecord(1, sent.attempt, 1500))
       }
       if (kind !== 'pre-send') h.append(kind === 'queue-operation' ? queueOperationEntry('enqueue', partialReceiptSuffix)
         : kind === 'queued-agent' ? queuedCommandEntry(partialReceiptSuffix, { attachment: { type: 'queued_command', prompt: partialReceiptSuffix, origin: { kind: 'agent' } } })
@@ -536,8 +536,7 @@ describe('receipt reader', () => {
     const observed = h.read()
     expect(observed.receipt).toMatchObject({ path: h.path, offset: fullOffset, uuid: full.uuid })
     expect(observed).not.toHaveProperty('partialReceipt', expect.anything())
-    await h.queue.append('alpha', { v: 1, kind: 'delivered', seq: 1, part: 1, at: 2000,
-      receipt: { path: h.path, uuid: observed.receipt!.uuid, offset: fullOffset } })
+    await h.queue.append('alpha', deliveredRecord(1, 2000, { receipt: { path: h.path, uuid: observed.receipt!.uuid, offset: fullOffset } }))
     await h.accept()
     await h.send()
     h.append(full) // Same UUID is not another delivery, even at a new byte offset.
@@ -568,9 +567,8 @@ describe('receipt reader', () => {
     h.append(fragment)
     const earlier = await h.queue.accept('alpha', injectedInput({ text: partialReceiptSuffix }))
     if (earlier.status === 'failed') throw new Error('fixture acceptance failed')
-    await h.queue.append('alpha', { v: 1, kind: 'fixed', seq: earlier.seq, parts: [partialReceiptSuffix] })
-    await h.queue.append('alpha', { v: 1, kind: 'delivered', seq: earlier.seq, part: 1, at: 2000,
-      receipt: { path: h.path, offset: 0, uuid: fragment.uuid as string } })
+    await h.queue.append('alpha', fixedRecord(earlier.seq, [partialReceiptSuffix]))
+    await h.queue.append('alpha', deliveredRecord(earlier.seq, 2000, { receipt: { path: h.path, offset: 0, uuid: fragment.uuid as string } }))
     h.append(fragment)
     expect(h.read().receipt).toBeUndefined()
     expect(h.read()).not.toHaveProperty('partialReceipt', expect.anything())
@@ -617,12 +615,12 @@ describe('receipt reader', () => {
     h.append(receipt)
     const first = h.read().receipt!
     expect(first).toBeDefined()
-    await h.queue.append('alpha', { v: 1, kind: 'delivered', seq: h.item().accepted.seq, part: 1, at: 2000, receipt: { path: first.path, uuid: first.uuid, offset: first.offset } })
+    await h.queue.append('alpha', deliveredRecord(h.item().accepted.seq, 2000, { receipt: { path: first.path, uuid: first.uuid, offset: first.offset } }))
     await h.accept()
     await h.send(0)
     // Credit both earlier records to isolate the identity check from the window.
     const old = h.read().records[0]!
-    await h.queue.append('alpha', { v: 1, kind: 'delivered', seq: 1, part: 1, at: 2000, receipt: { path: old.path, uuid: old.uuid, offset: old.offset } })
+    await h.queue.append('alpha', deliveredRecord(1, 2000, { receipt: { path: old.path, uuid: old.uuid, offset: old.offset } }))
     expect(h.read().receipt).toBeUndefined()
     h.append(entry(h.text))
     expect(h.read().receipt?.offset).toBeGreaterThan(first.offset)
@@ -630,7 +628,7 @@ describe('receipt reader', () => {
   test('refused attempts cannot open the matching window', async () => {
     const h = await fixture()
     const refused = await h.send(0)
-    await h.queue.append('alpha', { v: 1, kind: 'refused', seq: 1, attempt: refused.attempt, at: 1500 })
+    await h.queue.append('alpha', refusedRecord(1, refused.attempt, 1500))
     h.append(promptEntry(h.text))
     expect(h.read().receipt).toBeUndefined()
     await h.send()

@@ -30,7 +30,7 @@ import { buildBotToolReactionErrorLine, buildBotToolReactionStoreFailedLine, bui
 import { describeSlackCallFailure } from '../src/persona-connection-errors.ts'
 import { personaKey } from '../src/persona-identity.ts'
 import { assertNoLeak, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
-import { deliveredRecord, readQueue, seedQueue, slackInput, injectedInput, queuePath, memoryHold, postHold } from './test-helpers/delivery-queue.ts'
+import { fixedRecord as queueFixedRecord, deliveredRecord, readQueue, seedQueue, slackInput, injectedInput, queuePath, memoryHold, postHold } from './test-helpers/delivery-queue.ts'
 import { OWN_ROOT_CLOCK_SKEW_MS, THREAD_REPLY_HOLD_MS } from '../src/delivery-constants.ts'
 import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
 import { configBytes, makeSharedAuthority, makeMembershipHarness, membershipPage, sharedRecoveryRequest } from './test-helpers/shared-channels.ts'
@@ -575,7 +575,7 @@ describe.each(['strict', 'open'] as const)('%s serial hybrid joins', mode => {
     const joins = t.memory.joins('alpha'), before = readFileSync(threadPath(dir))
     for (const root of [THREAD_ROOTS.primary, THREAD_ROOTS.secondary]) {
       await h.receive(makeChannelMessage({ channel: CA, ts: root, subtype: 'message_deleted', deleted_ts: root, text: undefined }), ['alpha'])
-      await h.receive(makeChannelMessage({ type: 'reaction_added', channel: undefined, ts: undefined, text: undefined, item: { type: 'message', channel: CA, ts: root }, reaction: 'eyes' }), ['alpha'])
+      await h.receive(makeReaction('reaction_added', { reaction: 'eyes' }, { channel: CA, ts: root }), ['alpha'])
     }
     expect(t.memory.joins('alpha')).toEqual(joins)
     expect(readFileSync(threadPath(dir))).toEqual(before)
@@ -1706,7 +1706,7 @@ describe.each(['strict', 'open'] as const)('%s routing through Thread Memory', m
 test('partial fanout suppresses ack; retry prepares retained accepted-only A and newly stored B after aggregate ack', async () => {
   const queue = await makeQueue(dir); const config = makeMultiPersonaConfig([{ name: 'alpha', channels: [{ id: CS, delivery: 'all' }] }, { name: 'beta', channels: [{ id: CS, delivery: 'all' }] }], dir)
   let failing = true; const order: string[] = []
-  const routing = createPersonaRouting({ ...selectionInputs(config, [CA, CB, CS]), getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }), archive: () => {}, log: () => {}, queue: { lookupSlackKey: queue.lookupSlackKey, lookupReactionKey: queue.lookupReactionKey, acceptDecided: queue.acceptDecided, accept: async (key, input) => { order.push('store:' + key); return key === 'beta' && failing ? { status: 'failed', error: new Error('EIO') } : queue.accept(key, input) } }, onReceived: (key) => { order.push('received:' + key) }, prepare: async (key, item) => { order.push('prepare:' + key); await queue.append(key, { v: 1, kind: 'fixed', seq: item.accepted.seq, parts: ['fixed'] }) } })
+  const routing = createPersonaRouting({ ...selectionInputs(config, [CA, CB, CS]), getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }), archive: () => {}, log: () => {}, queue: { lookupSlackKey: queue.lookupSlackKey, lookupReactionKey: queue.lookupReactionKey, acceptDecided: queue.acceptDecided, accept: async (key, input) => { order.push('store:' + key); return key === 'beta' && failing ? { status: 'failed', error: new Error('EIO') } : queue.accept(key, input) } }, onReceived: (key) => { order.push('received:' + key) }, prepare: async (key, item) => { order.push('prepare:' + key); await queue.append(key, queueFixedRecord(item.accepted.seq, ['fixed'])) } })
   const event = makeChannelMessage({ channel: CS }); await routing.receive(event, () => { order.push('ack') }, ['alpha', 'beta'])
   expect(order).toEqual(['store:alpha', 'store:beta', 'received:alpha']); expect(queue.items('alpha')).toHaveLength(1); expect(queue.items('beta')).toEqual([])
   failing = false; order.length = 0; await routing.receive(event, () => { order.push('ack') }, ['alpha', 'beta'])
@@ -1758,7 +1758,7 @@ test('a fresh routing factory acknowledges a preexisting fixed undelivered Slack
   const event = makeChannelMessage({ channel: CA })
   const stored = await queue.accept('alpha', slackInput({ channel: CA, ts: event.ts as string, key: { chat_id: CA, ts: event.ts as string } }))
   if (stored.status === 'failed') throw new Error('store failed')
-  await queue.append('alpha', { v: 1, kind: 'fixed', seq: stored.seq, parts: ['preexisting fixed bytes'] })
+  await queue.append('alpha', queueFixedRecord(stored.seq, ['preexisting fixed bytes']))
   const before = readQueue(dir)
   const calls: string[] = []
   // No earlier call has populated this factory's in-memory dedupe map.
@@ -2936,7 +2936,7 @@ describe('reaction intake', () => {
     expect(received(second)).toEqual([]); expect(second.p('alpha').stub.callLog).toEqual([])
   })
 
-  const fixedRecord: QueueRecord = { v: 1, kind: 'fixed', seq: 1, parts: ['fixed reaction notice'] }
+  const fixedRecord: QueueRecord = queueFixedRecord(1, ['fixed reaction notice'])
   const withdrawnRecord: QueueRecord = { v: 1, kind: 'withdrawn', seq: 1, reason: 'server-post', at: NOW }
   const CLOSES: Array<{ state: string; close: (h: RoutingHarness) => Promise<void>; prepares: boolean }> = [
     { state: 'accepted-only', close: async () => {}, prepares: true },

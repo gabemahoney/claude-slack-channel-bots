@@ -399,9 +399,11 @@ describe('the manifest describes every case and file', () => {
     expect(manifest.cases.map(c => c.new_mode)).toEqual(expect.arrayContaining(['strict', 'open']))
   })
 
-  test('the generator takes the shared channel IDs from shared-channels.ts', () => {
+  test('the upgrade population includes the three shared baseline channel IDs', () => {
     const ids = new Set(manifest.cases.flatMap(c => c.channels.map(r => r.channel)))
-    for (const id of Object.values(SHARED_CHANNEL_IDS)) expect(ids.has(id)).toBe(true)
+    // Upgrade-specific IDs coexist with these baseline channels; other shared
+    // fixtures (future, foreign, forged, and delivery-only channels) are not an upgrade population.
+    for (const id of [SHARED_CHANNEL_IDS.primary, SHARED_CHANNEL_IDS.secondary, SHARED_CHANNEL_IDS.private]) expect(ids.has(id)).toBe(true)
   })
 })
 

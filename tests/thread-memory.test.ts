@@ -1231,7 +1231,7 @@ async function queueTraffic(h: ReturnType<typeof sealFixture>, key = 'alpha') {
   const accepted = await h.queue.accept(key, slackInput())
   expect(accepted.status).toBe('accepted')
   if (accepted.status === 'failed') throw accepted.error
-  await h.queue.append(key, { v: 1, kind: 'fixed', seq: accepted.seq, parts: ['fixture delivery'] })
+  await h.queue.append(key, fixedRecord(accepted.seq, ['fixture delivery']))
   await h.queue.append(key, deliveredRecord(accepted.seq))
   expect(h.queue.item(key, accepted.seq)?.delivered).toBe(true)
   expect(h.queue.openCount(key)).toBe(0)

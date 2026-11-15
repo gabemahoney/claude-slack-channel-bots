@@ -1,10 +1,11 @@
 /** Shared-authority fixtures: production schema, serializer and durable writer only. */
 import { expect } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, mkdirSync } from 'node:fs'
 import { resolve, join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import { durableWriteFileSync, DurableWriteUnsyncedError } from '../../src/atomic-write.ts'
-import { CHANNEL_ID_RE, DELIVERY_MODES, parsePersonaConfigBytes, type PersonaConfigInput } from '../../src/config.ts'
+import { CHANNEL_ID_RE, DELIVERY_MODES, parsePersonaConfigBytes, type PersonaConfigInput, type PersonaInput } from '../../src/config.ts'
 import { personaKey } from '../../src/persona-identity.ts'
 import {
   createSharedChannelAuthority, initialSharedChannelState, parseSharedChannelState,
@@ -40,7 +41,17 @@ export function addRawResponseEvidence(message: JSONRPCResponse | JSONRPCError, 
   } else Object.assign(message.result, fields)
 }
 
-export const SHARED_CHANNEL_IDS = { primary: 'C0TEST001', secondary: 'C0TEST002', private: 'G0TEST003' } as const
+export const SHARED_CHANNEL_IDS = {
+  primary: 'C0TEST001', secondary: 'C0TEST002', private: 'G0TEST003',
+  third: 'C0TEST003', fourth: 'C0TEST004', fifth: 'C0TEST005', sixth: 'C0TEST006', seventh: 'C0TEST007',
+  additional: 'C0TEST009', future: 'C0FUTURE1', foreign: 'C0OTHER01', forged: 'C0FORGED',
+} as const
+/** Identity replacements declare a repeatable, distinct destination from the
+ * same three identity inputs as reload's original fixture. */
+export function withIndependentDestination(persona: PersonaInput): PersonaInput {
+  const id = 'C0REVIEW' + createHash('sha256').update(JSON.stringify([persona.name, persona.credentials_file, persona.working_directory])).digest('hex').slice(0, 8).toUpperCase()
+  return { ...persona, channels: [{ id, delivery: 'all' }], permission_prompts: id }
+}
 export function sharedChannelPath(stateDir: string): string { return join(resolve(stateDir), 'config.json.last-applied') }
 export function configBytes(input: unknown): Buffer { return Buffer.from(JSON.stringify(input, null, 2) + '\n') }
 
@@ -312,6 +323,81 @@ import type { ChannelMode, DeliveryMode } from '../../src/config.ts'
 import type { SettledWebApiOutcome, SlackEvent, EnvelopeOverrides } from './slack-stub.ts'
 
 export const MEMBERSHIP_FIXTURE_TIME = 1_700_000_000_000
+/** Slack observation time relative to the shared fake-clock origin. */
+export function membershipTimestamp(offsetMs = 0): string { return ((MEMBERSHIP_FIXTURE_TIME + offsetMs) / 1000).toFixed(3) }
+/** Distinct roots and events for delivery-choice/FIFO/leave histories. */
+export const CHANNEL_DELIVERY_TIMES = {
+  root: `${MEMBERSHIP_FIXTURE_TIME / 1000}.000001`, otherRoot: `${MEMBERSHIP_FIXTURE_TIME / 1000}.000002`,
+  ordinary: `${(MEMBERSHIP_FIXTURE_TIME + 1000) / 1000}.000001`,
+  mention: `${(MEMBERSHIP_FIXTURE_TIME + 1000) / 1000}.000002`,
+} as const
+export function channelDeliveryEventTimestamp(sequence: number): string {
+  return `${(MEMBERSHIP_FIXTURE_TIME + 1000) / 1000}.${String(sequence).padStart(6, '0')}`
+}
+/** A verified event just after the current fake-clock observation. */
+export function membershipEventTimestamp(now = MEMBERSHIP_FIXTURE_TIME, offsetMs = 1): string {
+  return ((now + offsetMs) / 1000).toFixed(3)
+}
+export const CHANNEL_DELIVERY_EVENT_IDS = {
+  heldLeave: 'EvHELDATTEMPTLEAVE', botLeave: 'EvBOTLEAVE', failedLeave: 'EvFAILEDATTEMPTLEAVE',
+} as const
+/** Byte-distinct FIFO originals, independently keyed before a leave. Pass each
+ * override to slackInput so the accepted envelope remains production-shaped. */
+export function channelDeliveryOriginals(channel: string = SHARED_CHANNEL_IDS.primary): Array<Partial<AcceptedInput>> {
+  return ['  first\r\n\r\n😀  ', 'second'].map((text, index) => {
+    const ts = `${MEMBERSHIP_FIXTURE_TIME / 1000 + index}.000001`
+    return { channel, text, queued_ack_reaction: 'hourglass', ts, key: { chat_id: channel, ts } }
+  })
+}
+/** Foundation observations only; live evidence uses the router/scanner harness. */
+export function membershipJoin(channel: string, event = `Ev${channel}`, overrides: Partial<VerifiedSharedMembership> = {}): VerifiedSharedMembership {
+  return { event, identity: 'app', channel, member: true, boundary: 0, ...overrides }
+}
+export function membershipObservation(authority: SharedChannelAuthority, key: string, channel: string, member: boolean, event: string, observedThrough?: string): VerifiedSharedMembership {
+  return membershipJoin(channel, event, { member, boundary: authority.lifetime(key, channel)?.membershipBoundary ?? 0,
+    ...(observedThrough === undefined ? {} : { observedThrough, channelType: 'channel', isExtSharedChannel: false }) })
+}
+export function scanMembershipEventId(scan: string, channel: string, member = true): string {
+  return `scan:${scan}:${member ? '' : 'absent:'}${channel}`
+}
+/** One page through the production transaction/application and durable writer. */
+export function applyMembershipPage(authority: SharedChannelAuthority, key: string, channels: string[], scan: string, identity = 'app') {
+  return authority.transactMembership(key, authority.revision, (next, order) => {
+    let position = order - channels.length
+    for (const channel of channels) applySharedMemberships(next, ++position, key, authority.incarnation(key)!, [
+      { ...membershipObservation(authority, key, channel, true, scanMembershipEventId(scan, channel), membershipTimestamp()), identity },
+    ])
+  }, channels.length)
+}
+/** Independently named expectations: beginning positives, first leave and last
+ * repeats survive; intermediate scan repeats must be pruned by production. */
+export const RETAINED_SCAN_EVENTS = {
+  beginning: scanMembershipEventId('round-1', SHARED_CHANNEL_IDS.primary),
+  secondaryBeginning: scanMembershipEventId('round-1', SHARED_CHANNEL_IDS.secondary),
+  leave: scanMembershipEventId('round-4', SHARED_CHANNEL_IDS.secondary, false),
+  latest: scanMembershipEventId('round-5', SHARED_CHANNEL_IDS.primary),
+  latestAbsence: scanMembershipEventId('round-5', SHARED_CHANNEL_IDS.secondary, false),
+} as const
+/** Five two-channel reconciliations, the second channel absent in the last two.
+ * Read back through the production parser before consumers deliberately damage it. */
+export function retainedScanHistory(authority: SharedChannelAuthority, key = 'alpha'): SharedChannelState {
+  for (let round = 1; round <= 5; round++) {
+    const channels = [SHARED_CHANNEL_IDS.primary, SHARED_CHANNEL_IDS.secondary]
+    const result = authority.transactMembership(key, authority.revision, (next, order) => {
+      let position = order - channels.length
+      for (const channel of channels) {
+        const member = round < 4 || channel === SHARED_CHANNEL_IDS.primary
+        applySharedMemberships(next, ++position, key, authority.incarnation(key)!, [membershipJoin(channel,
+          scanMembershipEventId(`round-${round}`, channel, member), { member,
+            boundary: next.personas[key]!.membership[channel]?.boundary ?? 0, observedThrough: membershipTimestamp() })])
+      }
+    }, channels.length)
+    if (result.kind !== 'applied') throw new Error(`retainedScanHistory: round ${round} was ${result.kind}`)
+  }
+  const parsed = parseSharedChannelState(readFileSync(authority.path), authority.path)
+  if (!parsed) throw new Error('retainedScanHistory: expected a shared authority')
+  return parsed
+}
 export function membershipPage(channels: Array<string | Record<string, unknown>>, cursor?: string | null): SettledWebApiOutcome {
   return { kind: 'ok', result: { channels: channels.map(c => typeof c === 'string' ? {
     id: c, is_channel: c.startsWith('C'), is_group: c.startsWith('G'), is_im: false, is_mpim: false, is_ext_shared: false,

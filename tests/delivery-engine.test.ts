@@ -18,7 +18,7 @@ import { UNAVAILABLE_RETRY_MODE_PENDING_ONLY, UNAVAILABLE_RETRY_RUN_NOW_ARMED, U
 import { cannedPermissionRequest, errCallTimeout, errConfigMalformed, errDialogMaybeOpen, errInstanceIdCollision, errInternal, errInvalidFlags, errPaneChanged, errRelayFallenBack, errSendKeysWhileRelayed, errSpawnNotFound, errSpawnNotInteractive, errSystemInstallDisappeared, errTmuxNotAvailable, errTmuxSendKeys, errTmuxSessionConflict, errTmuxUnresponsive, errUnusableName } from './test-helpers/agent-director-stub.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
 import { partialReceiptText, partialReceiptSuffix } from './test-helpers/partial-receipt.ts'
-import { heldSlackInput, HOLD_FIELDS, memoryHold, injectedInput, makeQueue, postHold, reactionInput, readQueue, seedQueue, slackInput, unknownRootPostHold } from './test-helpers/delivery-queue.ts'
+import { noticedRecord, sentRecord, refusedRecord, deliveredRecord, fixedRecord, heldSlackInput, HOLD_FIELDS, memoryHold, injectedInput, makeQueue, postHold, reactionInput, readQueue, seedQueue, slackInput, unknownRootPostHold } from './test-helpers/delivery-queue.ts'
 import type { AcceptedRecord, HoldField, HoldOutcome, QueueRecord, ReactionAcceptedInput } from '../src/delivery-queue.ts'
 import { createDeliveryPolicyState, createDeliveryReading, decideEngine, decideGate, NO_DELIVERY_PAIR, selectDeliveryTarget, type DeliveryPair, type DeliveryPolicyKnowledge } from '../src/delivery-policy.ts'
 import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
@@ -145,7 +145,7 @@ describe('queue summaries across executor retirement', () => {
     h.p().up = outcome !== 'withdrawn'
     const held = await hold(h, THREAD_ROOTS.secondary, 'alpha', unknownRootPostHold)
     await h.accept('later 0')
-    await h.queue.append('alpha', { v: 1, kind: 'noticed', seq: 2, at: h.clock.now() })
+    await h.queue.append('alpha', noticedRecord(2, h.clock.now()))
     const counter = countFullReads(h)
     try {
       await h.tick()
@@ -237,8 +237,8 @@ describe('queue summaries across executor retirement', () => {
     await hold(h, THREAD_ROOTS.secondary, 'alpha', postHold)
     const withdrawn = await hold(h, THREAD_ROOTS.third)
     await h.accept('later')
-    await h.queue.append('alpha', { v: 1, kind: 'noticed', seq: withdrawn.accepted.seq, at: h.clock.now() })
-    await h.queue.append('alpha', { v: 1, kind: 'noticed', seq: 3, at: h.clock.now() })
+    await h.queue.append('alpha', noticedRecord(withdrawn.accepted.seq, h.clock.now()))
+    await h.queue.append('alpha', noticedRecord(3, h.clock.now()))
     await h.tick()
     expect(h.engine.running('alpha')).toBe(false)
     await h.queue.resolveHolds('alpha', [{ seq: withdrawn.accepted.seq, outcome: 'withdrawn', at: h.clock.now() }])
@@ -306,11 +306,11 @@ test('incremental policy inputs preserve ordered sends, refusal positions, unkno
   await h.tick(); await h.tick('beta')
   const before = h.engine.snapshot('alpha')!
   const append = (record: QueueRecord) => h.queue.append('alpha', record)
-  const sent = (seq: number, attempt: number, part = 1): QueueRecord => ({ v: 1, kind: 'sent', seq, attempt, part, send_kind: 'text', at: h.clock.now(), session_id: h.p().row.session_id, transcript_path: h.p().path, transcript_size: 0 })
-  await append(sent(3, 1)); await append({ v: 1, kind: 'refused', seq: 3, attempt: 1, at: h.clock.now() })
-  await append(sent(2, 1)); await append({ v: 1, kind: 'refused', seq: 2, attempt: 1, at: h.clock.now() })
-  await append({ v: 1, kind: 'sent', seq: 2, attempt: 2, unknown_outcome: true, at: h.clock.now(), quarantine: { path: join(h.root, 'quarantine'), line: 1 } })
-  for (const seq of [3, 2]) await append({ v: 1, kind: 'noticed', seq, at: h.clock.now() })
+  const sent = (seq: number, attempt: number, part = 1): QueueRecord => sentRecord(seq, attempt, 'text', { part, at: h.clock.now(), session_id: h.p().row.session_id, transcript_path: h.p().path, transcript_size: 0 })
+  await append(sent(3, 1)); await append(refusedRecord(3, 1, h.clock.now()))
+  await append(sent(2, 1)); await append(refusedRecord(2, 1, h.clock.now()))
+  await append(sentRecord(2, 2, { unknown_outcome: true, at: h.clock.now(), quarantine: { path: join(h.root, 'quarantine'), line: 1 } }))
+  for (const seq of [3, 2]) await append(noticedRecord(seq, h.clock.now()))
   const send = (item: number, part: number, attempt: number, how = 'text') => ({ item, part, attempt, how, offset: 0 })
   await h.tick()
   const first = h.engine.snapshot('alpha')!
@@ -321,7 +321,7 @@ test('incremental policy inputs preserve ordered sends, refusal positions, unkno
   expect(first.textFor?.([2, 2])).toBe('two')
   expect(first.textFor?.([5, 1])).toEqual([5, 1])
   expect(before.p.sent).toEqual([])
-  await append({ v: 1, kind: 'delivered', seq: 2, part: 1, at: h.clock.now(), receipt: { path: h.p().path, offset: 1 } })
+  await append(deliveredRecord(2, h.clock.now(), { part: 1, receipt: { path: h.p().path, offset: 1 } }))
   await append(sent(2, 3, 2))
   await h.tick()
   expect(h.engine.snapshot('alpha')?.p).toEqual({ accepted: [1, 2, 3, 4], fixed: [2, 3], sent: [send(2, 1, 1), send(2, 2, 2, 'unknown'), send(2, 2, 3), send(3, 1, 1)], refused: [1, 4], delivered: [[2, 1]] , withdrawn: [] })
@@ -635,11 +635,8 @@ async function goneRecovery(options: {
   for (let n = 0; n < 3; n++) {
     const accepted = await queue.accept(key, injectedInput({ text: `message ${n}` }))
     if (accepted.status === 'failed') throw new Error('fixture acceptance failed')
-    await queue.append(key, { v: 1, kind: 'fixed', seq: accepted.seq, parts: [`message ${n}`] })
-    if (n === 0) await queue.append(key, {
-      v: 1, kind: 'sent', seq: accepted.seq, part: 1, attempt: 1, send_kind: 'text', at: 0,
-      session_id: row.session_id, transcript_path: path, transcript_size: 0,
-    })
+    await queue.append(key, fixedRecord(accepted.seq, [`message ${n}`]))
+    if (n === 0) await queue.append(key, sentRecord(accepted.seq, 1, 'text', { part: 1, at: 0, session_id: row.session_id, transcript_path: path, transcript_size: 0 }))
   }
   // Reopen the actual on-disk journal as a new server process would.
   await queue.stop()
@@ -1694,7 +1691,7 @@ describe('Enter and at-least-once recovery', () => {
   })
   test('a server crash after durable sent but before the first key recovers the unknown attempt and retypes its head', async () => {
     const h = await harness(); await h.accept('first'); await h.accept('second')
-    await h.queue.append('alpha', { v: 1, kind: 'sent', seq: 1, part: 1, attempt: 1, send_kind: 'text', at: h.clock.now(), session_id: h.p().row.session_id, transcript_path: h.p().path, transcript_size: statSync(h.p().path).size })
+    await h.queue.append('alpha', sentRecord(1, 1, 'text', { part: 1, at: h.clock.now(), session_id: h.p().row.session_id, transcript_path: h.p().path, transcript_size: statSync(h.p().path).size }))
     expect(h.keyCalls()).toEqual([])
     await h.restartServer()
     await delivered(h)
@@ -2107,9 +2104,8 @@ describe('b.2is pending journal recovery consumers', () => {
     const first: AcceptedRecord = { ...injectedInput({ text: 'retained delivery' }), v: 1, kind: 'accepted', seq: 1, received_at: 0, ts: '1.000000' }
     const records: QueueRecord[] = retained === 'empty' ? [] : [first]
     if (retained === 'sent') records.push(
-      { v: 1, kind: 'fixed', seq: 1, parts: [first.text] },
-      { v: 1, kind: 'sent', seq: 1, part: 1, attempt: 1, send_kind: 'text', at: 0,
-        session_id: 'alpha-session', transcript_path: join(root, 'alpha-session.jsonl'), transcript_size: 0 },
+      fixedRecord(1, [first.text]),
+      sentRecord(1, 1, 'text', { part: 1, at: 0, session_id: 'alpha-session', transcript_path: join(root, 'alpha-session.jsonl'), transcript_size: 0 }),
     )
     seedQueue(root, [...records, '{"v":1,"kind":"accepted","seq":3,'])
     const journalPath = join(root, 'queue', 'alpha.jsonl'), original = fs.readFileSync(journalPath)
@@ -2215,10 +2211,7 @@ describe('disconnected delivery draft is recovered before reconnect control text
     await h.accept('retained delivery'); await h.accept('successor')
     const p = h.p()
     p.connected = false; p.autoReceipt = false; p.box = 'retained delivery'
-    await h.queue.append('alpha', {
-      v: 1, kind: 'sent', seq: 1, part: 1, attempt: 1, send_kind: 'text', at: 0,
-      session_id: p.row.session_id, transcript_path: p.path, transcript_size: 0,
-    })
+    await h.queue.append('alpha', sentRecord(1, 1, 'text', { part: 1, at: 0, session_id: p.row.session_id, transcript_path: p.path, transcript_size: 0 }))
     if (failRecoveryAppend) h.failAppend('sent')
     expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
     return h
@@ -2335,10 +2328,7 @@ describe('disconnected delivery draft is recovered before reconnect control text
       p.connected = false
       p.autoReceipt = false
       p.box = 'retained delivery'
-      await h.queue.append('alpha', {
-        v: 1, kind: 'sent', seq: 1, part: 1, attempt: 1, send_kind: 'text', at: 0,
-        session_id: p.row.session_id, transcript_path: p.path, transcript_size: 0,
-      })
+      await h.queue.append('alpha', sentRecord(1, 1, 'text', { part: 1, at: 0, session_id: p.row.session_id, transcript_path: p.path, transcript_size: 0 }))
       let enters = 0
       p.keyHook = params => {
         if (params.key === 'Enter' && ++enters === 1) {
@@ -2372,8 +2362,7 @@ test('a reconnect timer outlived by a six-second AD read resumes its retained co
   p.connected = false
   p.autoReceipt = false
   p.box = 'delivery before reconnect'
-  await h.queue.append('alpha', { v: 1, kind: 'sent', seq: 1, part: 1, attempt: 1, send_kind: 'text', at: 0,
-    session_id: p.row.session_id, transcript_path: p.path, transcript_size: 0 })
+  await h.queue.append('alpha', sentRecord(1, 1, 'text', { part: 1, at: 0, session_id: p.row.session_id, transcript_path: p.path, transcript_size: 0 }))
   expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
   await h.advance(RECEIPT_WAIT_MS + 1000)
   expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(true)
@@ -2520,7 +2509,7 @@ describe('Reaction Items in the FIFO', () => {
     expect(h.lifecycle.owner('alpha')).toBe('free')
     expect(h.records().filter(r => r.kind !== 'accepted').map(r => [r.kind, r.seq])).toEqual([['fixed', 2]])
     expect(h.order).not.toContain('lookup')
-    await h.queue.append('alpha', outcome === 'fixed' ? { v: 1, kind: 'fixed', seq: 1, parts: ['reaction text'] } : { v: 1, kind: 'withdrawn', seq: 1, reason: 'server-post', at: h.clock.now() })
+    await h.queue.append('alpha', outcome === 'fixed' ? fixedRecord(1, ['reaction text']) : { v: 1, kind: 'withdrawn', seq: 1, reason: 'server-post', at: h.clock.now() })
     h.engine.wake('alpha')
     await delivered(h)
     const seqs = outcome === 'fixed' ? [1, 2] : [2]
@@ -2537,8 +2526,7 @@ describe('Reaction Items in the FIFO', () => {
     await h.accept('retained draft')
     p.connected = false
     p.box = 'retained draft'
-    await h.queue.append('alpha', { v: 1, kind: 'sent', seq: 2, part: 1, attempt: 1, send_kind: 'text', at: 0,
-      session_id: p.row.session_id, transcript_path: p.path, transcript_size: 0 })
+    await h.queue.append('alpha', sentRecord(2, 1, 'text', { part: 1, at: 0, session_id: p.row.session_id, transcript_path: p.path, transcript_size: 0 }))
     expect(await h.lifecycle.recoverBeforeReconnect('alpha')).toBe(false)
     expect(h.keyCalls().map(c => c.params)).toEqual([{ instance_id: 'cscb_alpha', key: 'Enter' }])
     await h.advance(DELIVERY_ROW_POLL_MS)

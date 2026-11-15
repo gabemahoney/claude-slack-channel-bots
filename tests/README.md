@@ -26,7 +26,11 @@ S=$(mktemp -d) && env -u SLACK_BOT_TOKEN -u SLACK_APP_TOKEN -u CSCB_PERSONA \
 Omit `<files>` to run the whole suite. `bun test` does not run the bash
 scripts under `tests/integration/`. Which suite covers which module is in
 the testing guide's Test File Organization table, and the shared fixtures
-under Fixture Patterns.
+under [Factory Functions](../docs/testing-guide.md#factory-functions) and
+[Membership fixtures and evidence](../docs/testing-guide.md#membership-fixtures-and-evidence).
+Those are the canonical queue/shared-authority input contracts; the inventory
+also describes exact byte/shutdown assertions and isolated jq projections.
+See [Bounded costs](../docs/testing-guide.md#bounded-costs) for the own-root skew pin.
 
 The `env … HOME=$S` prefix covers one command only. Give every `bun test`
 its own prefix and scratch directory; a second `bun test` chained after the
@@ -2204,7 +2208,13 @@ The stub controls below are used by these scenarios and by the real-thread and p
 
 `lib/real-scenario.sh` supplies Test 32’s `real_thread_personas strict-or-open` (two personas, 100,000 joined threads), `real_seed_threads` (before start), `real_thread_workload` (root plus 20 prepared samples), `real_thread_root`, `real_thread_reply n`, `real_thread_writer_start`, `real_thread_concurrent_work n` and `real_thread_membership_write n`. Open-mode writes run through beta’s MCP session; strict-mode writes are beta’s live leave/rejoin events and wait for their own durable event application and settled rescan. `real_thread_now_ms` is monotonic; `real_thread_epoch_ms` shares queue wall time. `real_assert_thread_latency` judges the thread samples, including delayed and hung names, through sr8-evidence.ts. `real_report [arguments…]` captures native usage/receipt evidence, `real_finish` runs the closing safety assertions, and `real_drop_mcp` calls the enabled test endpoint. These helpers make no host agent or Slack calls.
 
-`tests/test-helpers/thread-populations.ts` defines deterministic populations, channel cycles and independently expected burst identities; `tests/integration/fixtures/sr8-evidence.ts` exposes their image commands and verdicts. `tests/test-helpers/shared-channel-upgrade.ts` provides `writeUpgradeFixtures`, `materializeUpgradeCase` and `runUpgradeCaseCommand`; `bun tests/test-helpers/shared-channel-upgrade.ts write` regenerates the committed fixture tree and manifest. Each case has `reference-0.18.0/`, `new-baseline/` and `pending-edits/`; manifest.json records variants, expected load/refusal, target paths, modes, times, identity/channel dispositions and pending edits. Materialization confines paths to scratch, expands home-relative paths and supplies scenario settings/names. Test 47 drives the manual upgrade cases; Test 40 uses the preserved 0.18.0 reference for downgrade and checks that Thread Memory remains untouched.
+`tests/test-helpers/thread-populations.ts` defines deterministic populations, channel cycles and independently expected burst identities; `tests/integration/fixtures/sr8-evidence.ts` exposes their image commands and verdicts. Unit fixtures select named `SHARED_CHANNEL_IDS` or explicit `channelPopulation(count, offset?)` inputs, and use production membership writers with shared event/time inputs; their canonical contracts are in [Operator review fixtures and diagnostics](../docs/testing-guide.md#operator-review-fixtures-and-diagnostics) and [Membership fixtures and evidence](../docs/testing-guide.md#membership-fixtures-and-evidence). These unit helpers do not make scenario/image commands host entry points.
+
+`tests/test-helpers/shared-channel-upgrade.ts` provides `writeUpgradeFixtures`, `materializeUpgradeCase` and `runUpgradeCaseCommand`; `bun tests/test-helpers/shared-channel-upgrade.ts write` regenerates the committed fixture tree and manifest. Each case has `reference-0.18.0/`, `new-baseline/` and `pending-edits/`; manifest.json records variants, expected load/refusal, target paths, modes, times, identity/channel dispositions and pending edits.
+
+Materialization confines paths to scratch, expands home-relative paths and supplies scenario settings/names.
+
+CLI stored-choice checks copy the unchanged `declarative-choices-and-queues/reference-0.18.0/channel-delivery.json` bytes through the shared fixture directory constants; malformed cases alter those copied bytes. Test 47 drives the manual upgrade cases; Test 40 uses the preserved 0.18.0 reference for downgrade and checks that Thread Memory remains untouched.
 
 
 `tests/integration/lib/scenario.sh` is sourced by Test 0 and Tests 5

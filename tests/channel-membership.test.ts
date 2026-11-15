@@ -2743,7 +2743,7 @@ test('with superseded repeats dropped, live and scan leaves, a removed destinati
     const records = scanRecords(state).get(C.primary)!
     expect(records).toHaveLength(2)
     expect(records[0]).toBe(began.get(C.primary)![0])
-    expect(records[1]).toMatch(/^scan:[^:]+:absent:C0TEST001$/)
+    expect(records[1]).toMatch(new RegExp(`^scan:[^:]+:absent:${C.primary}$`))
   }
   const absences: string[] = []
   for (let i = 0; i < 2; i++) {
@@ -2759,7 +2759,7 @@ test('with superseded repeats dropped, live and scan leaves, a removed destinati
   // AC-J16: a historically joined channel's absence removes it once, by a scan record its leave names.
   await reconcile(f, [C.secondary])
   const scanLeave = life(f).leaves[historical]!
-  expect(scanLeave.event).toMatch(/^scan:[^:]+:absent:C0LARGE00000$/)
+  expect(scanLeave.event).toMatch(new RegExp(`^scan:[^:]+:absent:${historical}$`))
   expect(life(f).membershipEvents[scanLeave.event]).toMatchObject({ member: false, order: scanLeave.boundary, boundary: scanLeave.boundary })
   expect(life(f).assignments[historical]).toBeUndefined()
   expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, historical, 'thread_hybrid', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
@@ -2778,7 +2778,7 @@ test('with superseded repeats dropped, live and scan leaves, a removed destinati
     await reconcile(f, [C.secondary, historical])
     expect([life(f).membershipEvents.EvREJOIN, life(f).leaves[historical], life(f).assignments[historical]]).toEqual([rejoin, scanLeave, later])
     expect(reading(f, historical).kind).toBe('eligible')
-    expect(scanRecords(life(f)).get(historical)).toEqual([began.get(historical)![0], scanLeave.event, expect.stringMatching(/^scan:[^:]+:C0LARGE00000$/)])
+    expect(scanRecords(life(f)).get(historical)).toEqual([began.get(historical)![0], scanLeave.event, expect.stringMatching(new RegExp(`^scan:[^:]+:${historical}$`))])
   }
   // Unchanged throughout: C.secondary keeps its beginning and newest repeat.
   expect(scanRecords(life(f)).get(C.secondary)![0]).toBe(began.get(C.secondary)![0])

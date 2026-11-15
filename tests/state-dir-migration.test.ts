@@ -2282,10 +2282,16 @@ function warnings(): string[] {
 
 /**
  * What `N` holds once every file moved: the server's files, the crontab and `prompts/` (each unless `has` says the
- * release never had it; `'linked'` is a crontab that stays a link to the operator's own file), each real.
+ * release never had it; marked separately is the legacy delivery file carried by a whole-directory move
+ * or retained at L1 by a merge; `'linked'` is a crontab that stays a link to the operator's own file), each real.
  */
-function expectEverythingAtN(l: Layout, has: { crontab: boolean | 'linked'; prompts: boolean } = { crontab: true, prompts: true }): void {
-  const expectedFiles = Object.keys(SERVER_FILES).filter(name => name !== 'channel-delivery.json' || !existsSync(l.l1) || (isLink(l.l1) && (readlinkSync(l.l1) === l.n || (existsSync(l.l2) && isLink(l.l2) && readlinkSync(l.l2) === l.n))))
+function expectEverythingAtN(l: Layout, has: { crontab: boolean | 'linked'; prompts: boolean; legacyDelivery: 'carried' | 'retained-at-l1' }): void {
+  const expectedFiles = Object.keys(SERVER_FILES).filter(name => name !== 'channel-delivery.json' || has.legacyDelivery === 'carried')
+  if (has.legacyDelivery === 'retained-at-l1') {
+    expect(() => lstatSync(join(l.n, 'channel-delivery.json'))).toThrow()
+    expect(isLink(join(l.l1, 'channel-delivery.json'))).toBe(false)
+    expect(readFileSync(join(l.l1, 'channel-delivery.json'))).toEqual(Buffer.from(SERVER_FILES['channel-delivery.json']!))
+  }
   for (const name of expectedFiles) {
     const content = SERVER_FILES[name]!
     expect(isLink(join(l.n, name))).toBe(false)
@@ -2448,7 +2454,7 @@ describe.each([
       startupErrorDir: l.l1,
     })
     expect(lines).toEqual([stateDirRenamedLine(l.l1, l.n)])
-    expectEverythingAtN(l, { crontab: false, prompts: false })
+    expectEverythingAtN(l, { crontab: false, prompts: false, legacyDelivery: 'carried' })
     expect(readlinkSync(l.l1)).toBe(l.n)
     expect(existsSync(l.l2)).toBe(false)
     expect(lstatSync(l.n).isDirectory()).toBe(true)
@@ -2466,7 +2472,7 @@ describe.each([
       startupErrorDir: l.l1,
     })
     expect(lines).toEqual([stateDirRenamedLine(l.l2, l.n, true), stateDirMergedLine(l.l1, l.n, MERGED_FROM_L1)])
-    expectEverythingAtN(l)
+    expectEverythingAtN(l, { crontab: true, prompts: true, legacyDelivery: 'retained-at-l1' })
     expect(readlinkSync(l.l2)).toBe(l.n)
     expect(lstatSync(l.l1).isDirectory()).toBe(true)
     expect(isLink(l.l1)).toBe(false)
@@ -2489,7 +2495,7 @@ describe.each([
 
     expect(result.outcome).toEqual({ kind: 'moved', via: 'merge', entries: MERGED_FROM_L1 })
     expect(lines).toEqual([stateDirRenamedLine(l.l2, l.n, true), stateDirMergedLine(l.l1, l.n, MERGED_FROM_L1)])
-    expectEverythingAtN(l, { crontab: false, prompts: true })
+    expectEverythingAtN(l, { crontab: false, prompts: true, legacyDelivery: 'retained-at-l1' })
     expect(() => lstatSync(join(l.n, 'crontab'))).toThrow()
     expect(readlinkSync(l.l2)).toBe(l.n)
     expect(lstatSync(l.l1).isDirectory()).toBe(true)
@@ -2515,7 +2521,7 @@ describe.each([
     expect(stateDirMigrationStopsStart(result.outcome)).toBe(false)
     expect(warnings()).toEqual([])
     expect(lines.length).toBeGreaterThanOrEqual(1)
-    expectEverythingAtN(l, has)
+    expectEverythingAtN(l, { ...has, legacyDelivery: 'retained-at-l1' })
     expect(readlinkSync(l.l2)).toBe(l.n)
     expect(lstatSync(l.l1).isDirectory()).toBe(true)
     expect(isLink(l.l1)).toBe(false)
@@ -2548,7 +2554,7 @@ describe.each([
       startupErrorDir: l.l2,
     })
     expect(lines).toEqual([stateDirRenamedLine(l.l2, l.n, true), stateDirRepointedLine(l.l1, l.l2, l.n)])
-    expectEverythingAtN(l)
+    expectEverythingAtN(l, { crontab: true, prompts: true, legacyDelivery: 'carried' })
     expect(readlinkSync(l.l2)).toBe(l.n)
     // L1 no longer goes through L2, so removing ~/.config/cscb leaves it intact.
     expect(readlinkSync(l.l1)).toBe(l.n)
@@ -2723,7 +2729,7 @@ describe.each([
     })
     expect(lines).toEqual([stateDirRenamedLine(l.l2, l.n, true)])
     expect(warnings()).toEqual([])
-    expectEverythingAtN(l)
+    expectEverythingAtN(l, { crontab: true, prompts: true, legacyDelivery: 'carried' })
     expect(readlinkSync(l.l2)).toBe(l.n)
     expect(() => lstatSync(l.l1)).toThrow()
     expect(existsSync(dirname(l.l1))).toBe(false)
@@ -2774,7 +2780,7 @@ describe.each([
       expect(readlinkSync(l.l2)).toBe(l.n)
       expect(readlinkSync(l.l1)).toBe(l.l2)
       expect(realpathSync(l.l1)).toBe(realpathSync(l.n))
-      expectEverythingAtN(l)
+      expectEverythingAtN(l, { crontab: true, prompts: true, legacyDelivery: 'carried' })
       expectNoTemporaries(dirname(l.l1))
 
       lines.length = 0

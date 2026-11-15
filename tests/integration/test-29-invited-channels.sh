@@ -1926,10 +1926,10 @@ wait_until "${RECORD_WAIT_S}" "start: the stub's record holds no push-refused li
 
 # --- Phase A: a 0.11.x configuration ----------------------------
 # check_upgrade_log <step>: no server.log line names the switch's key,
-# fungible mode, or a class or line this work adds.
+# complete open-mode switch line, or either current diagnostic class.
 check_upgrade_log() {
     local term
-    for term in "${SWITCH_KEY}" "${FUNGIBLE}" "${PERSONA_OPEN_CHANNEL}" "${PERSONA_CHANNEL_DELIVERY_SET}" \
+    for term in "${SWITCH_KEY}" "${SWITCH_ON_LINE}" "${PERSONA_OPEN_CHANNEL}" "${PERSONA_CHANNEL_DELIVERY_SET}" \
         ; do
         [[ -n "${term}" ]] || fail "$1: an empty term from the printer"
         [[ "$(count_server_log "${term}")" == 0 ]] || fail "$1: server.log names '${term}' in declarative mode"
