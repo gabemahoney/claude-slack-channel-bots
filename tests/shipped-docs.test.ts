@@ -1644,7 +1644,8 @@ interface TermGroup {
  *   channel" and `persona-invited-channel` never match. "declarative" matches
  *   only in the old mode and section phrases ("declarative mode",
  *   "declarative-mode", "declarative and fungible mode", "declarative
- *   section"); `fungible` matches in any use.
+ *   section"); `fungible` matches in any use except the complete lowercase token
+ *   `fungible-refused`, which is a log value the server writes.
  */
 const FORBIDDEN_TERMS: readonly TermGroup[] = [
   {
@@ -1740,7 +1741,8 @@ const FORBIDDEN_TERMS: readonly TermGroup[] = [
       ['allow_invited_channels', /\ballow_invited_channels\b/g],
       ['invited.permission_prompts', /\binvited\.permission_prompts\b/g],
       ['invited as a configuration key', /`invited`|"invited"\s*:|^[ \t-]*invited:|\binvited\s+has\s+been\s+removed\b/gm],
-      ['fungible', /\bfungible\b/gi],
+      // Explicit case pairs keep rejection case-insensitive while the log-token exception is case-sensitive.
+      ['fungible', /\b(?!(?<![\w-])fungible-refused(?![\w-]))[fF][uU][nN][gG][iI][bB][lL][eE]\b/g],
       ['declarative mode or section', /\bdeclarative(?:-|\s+)(?:(?:and|or)\s+fungible(?:-|\s+))?(?:modes?|sections?)\b/gi],
     ],
   },
@@ -2101,6 +2103,7 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
     [CREDENTIALS_SCRIPT, 'header = "Authorization: Bearer %s"', "the credentials script's curl config line, read from curl's stdin, not a command-line argument"],
     [WIZARD_FILE, /^allowed-tools:.*$/m, 'skill frontmatter: a tool list, not an allowlist'],
     [DEBUG_SKILL_FILE, '### `persona-invited-channel`', 'a current class label: `invited` counts only as a configuration key'],
+    [DEBUG_SKILL_FILE, '`fungible-refused`', 'a current server log value; the mode is still called open mode'],
     [DEBUG_SKILL_FILE, '## A persona is silent in a channel its app was invited to', 'plain-prose "invited": a Slack invitation, not the removed key'],
     [RUNBOOK_DOC, /^.*this release never reads `channel-delivery\.json`.*$/m, 'the upgrade keeps channel-delivery.json as a preserved reference; the file name is not banned'],
   ]
@@ -2189,7 +2192,17 @@ describe('forbidden-term scanner self-checks', () => {
     ['invited as a configuration key', 'a quoted "invited" key', '{ "invited": { "permission_prompts": "dm" } }'],
     ['invited as a configuration key', 'an invited: key', 'personas:\n  - invited:\n      permission_prompts: dm'],
     ['invited as a configuration key', 'the removed-key error', 'The start fails with invited has been removed; use permission_prompts.'],
+    ['fungible', 'bare "fungible"', 'fungible'],
+    ['fungible', '"Fungible"', 'Fungible'],
+    ['fungible', '"fungible mode"', 'Use fungible mode.'],
+    ['fungible', '"fungible-mode"', 'Use fungible-mode.'],
+    ['fungible', '"a fungible destination"', 'Use a fungible destination.'],
     ['fungible', '"fungible destination"', "The persona's fungible destination is its DM."],
+    ['fungible', 'a longer token starting with the log value', 'reason=fungible-refused-mode'],
+    ['fungible', 'a longer word starting with the log value', 'reason=fungible-refusedly'],
+    ['fungible', 'a token with a prefix before the log value', 'reason=legacy-fungible-refused'],
+    ['fungible', 'a case-changed log value', 'reason=Fungible-Refused'],
+    ['fungible', 'a log value with a case-changed suffix', 'reason=fungible-Refused'],
     ['fungible', 'a stale "fungible-mode" anchor', 'See [who can reach it](channel-modes.md#who-can-reach-a-persona-in-fungible-mode).'],
     ['declarative mode or section', 'a wrapped "declarative mode"', 'Switch back to declarative\nmode first.'],
     ['declarative mode or section', '"declarative-mode"', 'The declarative-mode example lists every channel.'],
@@ -2244,6 +2257,7 @@ describe('forbidden-term scanner self-checks', () => {
     ['channel_mode with its values', 'Set `channel_mode` to `"strict"` or `"open"`; absence defaults to strict.'],
     ['strict and open mode', 'In strict mode a persona serves its listed channels; in open mode, every eligible channel.'],
     ['bare "declarative"', 'The configuration is declarative: each persona lists its channels in the shared list.'],
+    ['the server log value', 'reason=fungible-refused and `fungible-refused`'],
   ])('%s is not flagged', (_label, text) => {
     expect(findTerms('sample', text, ALL_FORBIDDEN_TERMS).map(formatHit)).toEqual([])
   })
