@@ -56,6 +56,7 @@ export interface DeliveryEngineDeps {
   refreshTranscript?(key: string, client: DeliveryClient, beforeCall: () => void): Promise<boolean>
   onReadError?(key: string, error: unknown, verb: 'get'): Promise<void>
   onError?(key: string, error: unknown): void
+  onInfo?(key: string, message: string): void
   onCoveredBlocked?(key: string, reason: string): void
   onEvent?(event: DeliveryEngineEvent): void
   onKeyError?(key: string, error: unknown, row: GetResult): Promise<void>
@@ -111,6 +112,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   const states = new Map<string, State>(), budgets = new Map<string, () => void>()
   const covered = createCoveredDelivery({ queue: deps.queue, now: clock.now,
     log: (key, reason) => deps.onError?.(key, new Error(reason)),
+    info: deps.onInfo,
     notify: deps.onCoveredBlocked,
   })
   let stopped = false

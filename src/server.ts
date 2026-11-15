@@ -3480,6 +3480,7 @@ export async function main(): Promise<void> {
     },
     onEvent: event => deliveryEngineEvents.emit(event),
     onError: (key, error) => console.error(`[slack] delivery persona=${key}: ${describeThrownValue(error)}`),
+    onInfo: (key, message) => console.log(`[slack] delivery persona=${key}: ${message}`),
     reconnect: (key, client, beforeCall) => deliveryScope.run(key, client as Client, beforeCall, async () => {
       const result = await deferredReconnect(key)
       if (typeof result === 'object' && !isRestartPendingOrActive(key)) {

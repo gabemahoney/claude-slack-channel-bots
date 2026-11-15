@@ -38,6 +38,26 @@ test('pinning: test-32 still accepts ended', async () => {
   expect((await fixture('ended').run()).code).toBe(0)
 })
 
+test.each(['same', 'different', 'empty', 'foreign-instance'])('test-32 verifies native conversation after resume: %s', async fault => {
+  const h = fixture(), resumed = join(h.root, 'resumed.json')
+  h.save(resumed, { ...h.live, session_id: fault === 'different' ? 'replacement' : fault === 'empty' ? '' : h.live.session_id,
+    instance_id: fault === 'foreign-instance' ? 'cscb_foreign' : h.live.instance_id })
+  const answer = await runFixture('fixtures/real-case-assertions.ts', ['same-conversation-resume', h.root, 'order',
+    join(h.root, 'shim.log'), h.root, h.down + '.before-pause', resumed])
+  expect(answer.code).toBe(fault === 'same' ? 0 : 1)
+  if (fault === 'same') expect(answer.out.join('\n')).toContain('recorded: same native conversation resumed')
+})
+
+test('test-32 runs the same-conversation assertion before waiting for resumed receipts', async () => {
+  const text = await Bun.file(join(import.meta.dir, 'integration/test-32-fmk-real-order.sh')).text()
+  const resume = text.indexOf('start_server --live', text.indexOf('case_assert down'))
+  const proof = text.indexOf('case_assert same-conversation-resume', resume)
+  expect(proof).toBeGreaterThan(resume)
+  expect(proof).toBeLessThan(text.indexOf('real_wait_delivery "${REAL_KEY}" 13', resume))
+  expect(text.slice(resume, proof)).toContain('real_ad get --instance-id')
+  expect(text.slice(proof, text.indexOf('\n', proof))).toContain('"${DOWN_ROW}.before-pause"')
+})
+
 test.each(['no-success', 'wrong-success', 'missing-before', 'wrong-before', 'lost-session', 'changed-session', 'changed-start', 'changed-launch', 'changed-token', 'live-end', 'wrong-end', 'changed-end-session', 'changed-end-launch'])(
   'pinning: test-32 rejects missing with %s evidence', async fault => {
     const h = fixture('missing', fault !== 'no-success')

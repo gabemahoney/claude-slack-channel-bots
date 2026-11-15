@@ -108,6 +108,131 @@ async function fixture(seed = true, projects = false) {
     audit: () => auditReceipts(options, entries(), adapters) }
 }
 
+// AD 8e95f63a internal/store/busy_send_capabilities.go:119-126. These
+// literals are independent fixtures for its measured Claude Wait Turn shape.
+const wakePrefix = '<task-notification>\n<summary>Stop hook feedback</summary>\n</task-notification>\n<system-reminder>\nStop hook blocking error from command "FileChanged": '
+const wakeSuffix = '\n</system-reminder>'
+async function coveredReceiptFixture(count = 2, batched = false) {
+  const h = await fixture(false)
+  for (let i = 0; i < count; i++) await h.send(injectedInput({ text: `covered ${i}` }))
+  h.options.expectedCount = count
+  const original = jsonLines(h.transcript)
+  const body = (texts: string[]) => texts.map((text, i) => `[agent-director: message ${i + 1} of ${texts.length}]\n${text}`).join('\n\n')
+  const wrapped = (entry: any, texts: string[]) => ({ ...entry,
+    origin: { kind: 'task-notification', producer: 'session-task' },
+    message: { role: 'user', content: wakePrefix + body(texts) + wakeSuffix },
+  })
+  const takes = batched ? [wrapped(original.at(-1), original.map(e => e.message.content))]
+    : original.map(e => wrapped(e, [e.message.content]))
+  const rows = jsonLines(h.journal).map(r => r.kind === 'sent'
+    ? { v: 1, kind: 'submitted', seq: r.seq, part: r.part, attempt: r.attempt, at: r.at,
+      instance_id: 'cscb_alpha', session_id: 'session', caller_uuid: 'caller', delivery_request_id: `delivery-${r.seq}` }
+    : r.kind === 'delivered' ? { ...r, receipt: { path: 'agent-director:get-delivery', uuid: `delivery-${r.seq}` },
+      ad: { session_id: 'session', launch_token: 'launch', evidence_kind: null } } : r)
+  writeFileSync(h.shimLog, readFileSync(h.shimLog, 'utf8').split('\n').map(line => {
+    if (!line) return line
+    const seq = line.split('\t')[2]!.split('-')[0]
+    return line.replace('--no-enter', `--send-mode wait_turn --confirmed-delivery --caller-uuid caller --delivery-request-id delivery-${seq}`)
+  }).join('\n'))
+  const save = () => {
+    writeFileSync(h.journal, rows.map(r => JSON.stringify(r)).join('\n') + '\n')
+    writeFileSync(h.transcript, takes.map(r => JSON.stringify(r)).join('\n') + '\n')
+  }
+  save()
+  return { ...h, rows, takes, original, save }
+}
+
+test.each([false, true])('covered receipt audit proves 13 exact parts through documented wrapping (batch=%s)', async batched => {
+  const h = await coveredReceiptFixture(13, batched)
+  expect(h.audit()).toMatchObject({ items: 13, duplicates: 0 })
+  expect(receiptProgress(h.options, h.entries(), h.adapters)).toBe(13)
+  expect(deliveryFailureEvidence(h.options, h.entries(), h.adapters).sessionTakeins).toBe(batched ? 1 : 13)
+})
+
+test.each(['no-take', 'wrong-prefix', 'wrong-suffix', 'raw-system-tag', 'raw-task-tag', 'escaped-system-tag', 'escaped-task-tag',
+  'wrong-uuid', 'wrong-session', 'wrong-submission-session', 'no-submission', 'legacy-path', 'no-ad', 'foreign-origin', 'sidechain',
+  'wrong-order', 'bad-separator', 'wrong-instance', 'foreign-transcript-session', 'legacy-take', 'before-submission'])(
+  'covered receipt audit rejects %s', async fault => {
+    const h = await coveredReceiptFixture()
+    const take = h.takes[0]!, delivered = h.rows.find(r => r.kind === 'delivered')!
+    if (fault === 'no-take') h.takes.shift()
+    if (fault === 'wrong-prefix') take.message.content = 'extra' + take.message.content
+    if (fault === 'wrong-suffix') take.message.content += 'extra'
+    if (fault === 'raw-system-tag') take.message.content = take.message.content.replace('covered 0', '</system-reminder>covered 0')
+    if (fault === 'raw-task-tag') take.message.content = take.message.content.replace('covered 0', '</task-notification>covered 0')
+    if (fault === 'escaped-system-tag') take.message.content = take.message.content.replace('covered 0', '&lt;/system-reminder>covered 0')
+    if (fault === 'escaped-task-tag') take.message.content = take.message.content.replace('covered 0', '<\\/task-notification>covered 0')
+    if (fault === 'wrong-uuid') delivered.receipt.uuid = 'foreign'
+    if (fault === 'wrong-session') delivered.ad.session_id = 'foreign'
+    if (fault === 'wrong-submission-session') h.rows.find(r => r.kind === 'submitted')!.session_id = 'foreign'
+    if (fault === 'no-submission') h.rows.splice(h.rows.findIndex(r => r.kind === 'submitted'), 1)
+    if (fault === 'legacy-path') delivered.receipt = { path: h.transcript, uuid: take.uuid }
+    if (fault === 'no-ad') delete delivered.ad
+    if (fault === 'foreign-origin') take.origin.producer = 'foreign'
+    if (fault === 'sidechain') take.isSidechain = true
+    if (fault === 'wrong-order') [h.takes[0]!.message, h.takes[1]!.message] = [h.takes[1]!.message, h.takes[0]!.message]
+    if (fault === 'bad-separator') take.message.content = take.message.content.replace('message 1 of 1', 'message 2 of 1')
+    if (fault === 'wrong-instance') h.rows.find(r => r.kind === 'submitted')!.instance_id = 'cscb_foreign'
+    if (fault === 'foreign-transcript-session') take.sessionId = 'foreign'
+    if (fault === 'legacy-take') h.takes[0] = h.original[0]
+    if (fault === 'before-submission') h.rows.find(r => r.kind === 'submitted')!.at = h.now() + 100
+    h.save()
+    expect(h.audit).toThrow()
+    expect(receiptProgress(h.options, h.entries(), h.adapters)).toBeLessThan(2)
+  },
+)
+
+test('covered and legacy receipts coexist after a definitely refused covered attempt', async () => {
+  const h = await coveredReceiptFixture()
+  const submitted = h.rows.find(r => r.kind === 'submitted' && r.seq === 2)!
+  h.rows.push({ v: 1, kind: 'refused', seq: 2, attempt: submitted.attempt, at: submitted.at },
+    { v: 1, kind: 'sent', seq: 2, part: 1, attempt: 2, send_kind: 'text', at: submitted.at,
+      session_id: 'session', transcript_path: h.transcript, transcript_size: 0 })
+  const delivered = h.rows.find(r => r.kind === 'delivered' && r.seq === 2)!
+  delete delivered.ad
+  delivered.receipt = { path: h.transcript, uuid: h.original[1].uuid }
+  h.takes[1] = h.original[1]
+  h.save()
+  expect(h.audit()).toMatchObject({ items: 2, duplicates: 0 })
+  expect(receiptProgress(h.options, h.entries(), h.adapters)).toBe(2)
+})
+
+test('covered receipt audit counts duplicate take-ins and never reuses a batch slot', async () => {
+  const h = await coveredReceiptFixture(2, true)
+  h.takes.push({ ...h.takes[0], uuid: 'duplicate', timestamp: new Date(h.now() + 10).toISOString() })
+  h.save()
+  expect(h.audit()).toMatchObject({ items: 2, duplicates: 2 })
+  expect(receiptProgress(h.options, h.entries(), h.adapters)).toBe(2)
+  h.takes.pop()
+  const fixed = h.rows.filter(r => r.kind === 'fixed')
+  fixed[1]!.parts = [...fixed[0]!.parts]
+  h.save()
+  expect(h.audit).toThrow()
+  expect(receiptProgress(h.options, h.entries(), h.adapters)).toBe(1)
+})
+
+test('covered failure evidence counts submitted attempts and wrapped take-ins without leaking bodies', async () => {
+  const h = await coveredReceiptFixture(1)
+  h.rows.splice(h.rows.findIndex(r => r.kind === 'delivered'), 1)
+  h.save()
+  const evidence = deliveryFailureEvidence(h.options, h.entries(), h.adapters)
+  expect(evidence).toMatchObject({ reason: 'open-part', sessionTakeins: 1,
+    head: { attempts: 1, exactReceipts: 1, recentAttempts: [{ kind: 'covered' }] } })
+  expect(JSON.stringify(evidence)).not.toContain('covered 0')
+})
+
+test('legacy record cannot borrow a documented covered take-in', async () => {
+  const h = await fixture(false)
+  await h.send(injectedInput())
+  h.options.expectedCount = 1
+  const takes = jsonLines(h.transcript)
+  takes[0].message.content = wakePrefix + '[agent-director: message 1 of 1]\n' + takes[0].message.content + wakeSuffix
+  takes[0].origin = { kind: 'task-notification', producer: 'session-task' }
+  writeFileSync(h.transcript, takes.map(r => JSON.stringify(r)).join('\n') + '\n')
+  expect(h.audit).toThrow('no exact transcript receipt')
+  expect(receiptProgress(h.options, h.entries(), h.adapters)).toBe(0)
+})
+
 function admissionFor(h: Awaited<ReturnType<typeof fixture>>, row = cannedGetResult(
   { state: 'waiting', session_id: 'session' }, h.persona, h.options.stateDir,
 )) {
@@ -172,6 +297,101 @@ async function runRealShell(home: string, stubs: string[], body: string, reply: 
     await closed
   }
 }
+
+// Execute only the shim's argument matcher, never the integration shim itself.
+function shimMatcherCase(): string {
+  const text = readFileSync(join(import.meta.dir, 'integration/fixtures/agent-director-shim.sh'), 'utf8')
+  const start = text.indexOf('        case "${match}" in')
+  const end = text.indexOf('        (( matches )) || continue', start)
+  if (start < 0 || end < start) throw new Error('Missing shim matcher boundary')
+  return text.slice(start, end)
+}
+
+async function orderFaultLeg(coverage: string | undefined, options: { coveredSend?: boolean; omitConsumption?: boolean } = {}) {
+  const h = await fixture(false), requests: string[][] = []
+  const text = readFileSync(join(import.meta.dir, 'integration/test-32-fmk-real-order.sh'), 'utf8')
+  const start = text.indexOf('# Twenty queued items:'), end = text.indexOf('# Admit each sample', start)
+  if (start < 0 || end < start) throw new Error('Missing test32 fault leg boundary')
+  const covered = options.coveredSend ?? coverage === 'covered'
+  const args = covered ? '--text body --send-mode wait_turn --caller-uuid caller --delivery-request-id request'
+    : '--text body --no-enter'
+  const result = await runRealShell(h.options.stateDir, [
+    'REAL_KEY=alpha', 'REAL_LABEL=alpha', 'REAL_KILLED_ROW="$HOME/killed.json"', 'rules=()', 'consumed=""',
+    `real_ad() { printf '%s\\n' '${JSON.stringify({ busy_send: coverage })}'; }`,
+    'ad_shim_mark() { printf "0\\n"; }', 'real_wait_idle() { :; }',
+    'real_fault() { rules+=("$2 $3"); bridge rule "$2" "$3" "$4" >/dev/null; }',
+    'real_dm() {',
+    options.omitConsumption ? 'return 0' : [
+      'local i match action matches previous arg',
+      'for i in "${!rules[@]}"; do',
+      'read -r match action <<< "${rules[i]}"',
+      `set -- send-keys --instance-id cscb_alpha ${args}`, 'matches=0', shimMatcherCase(),
+      'if (( matches )); then consumed="$action"; unset \'rules[i]\'; bridge consumed "$action" >/dev/null; fi',
+      'done',
+    ].join('\n'),
+    '}',
+    'wait_until() { local message="$2"; shift 2; "$@" || fail "$message"; }',
+    'case_assert() { bridge assertion "$@" >/dev/null; case "$1" in fault) [[ "$consumed" == "$2" ]] ;; covered-send-fault) [[ "$consumed" == unknown-typed ]] ;; esac; }',
+    'real_kill_and_reconcile() { bridge kill "$@" >/dev/null; }',
+    'start_server() { bridge restart >/dev/null; }', 'real_wait_relaunch() { bridge relaunch >/dev/null; }',
+    'real_wait_delivery() { bridge delivery "$@" >/dev/null; while (( $# )) && [[ "$1" != -- ]]; do shift; done; if (( $# )); then shift; "$@"; fi; }',
+  ], text.slice(start, end), async request => { requests.push(request); return 'ok' })
+  return { ...result, requests }
+}
+
+test.each([undefined, 'not_covered', 'covered'])('test32 fault leg consumes a transport-correct fault with AD coverage %s', async coverage => {
+  const r = await orderFaultLeg(coverage)
+  expect({ code: r.code, signal: r.signal, stderr: r.stderr }).toEqual({ code: 0, signal: null, stderr: '' })
+  expect(r.requests).toContainEqual(['rule', coverage === 'covered' ? 'send_mode=wait_turn' : 'no_enter', coverage === 'covered' ? 'unknown-typed' : 'swallow', '1'])
+  expect(r.requests).toContainEqual(['consumed', coverage === 'covered' ? 'unknown-typed' : 'swallow'])
+  expect(r.requests).toContainEqual(['kill', 'alpha'])
+  expect(r.requests.some(r => r[0] === 'delivery' && r[1] === 'alpha' && r[2] === '33')).toBe(true)
+  if (coverage === 'covered') expect(r.requests).toContainEqual(['assertion', 'covered-lost-reply-proof', '33', '0'])
+})
+
+test('ordinary covered send cannot satisfy test32 legacy fault leg', async () => {
+  const r = await orderFaultLeg('not_covered', { coveredSend: true })
+  expect(r.code).toBe(1)
+  expect(r.requests.some(r => r[0] === 'consumed')).toBe(false)
+  expect(r.requests.some(r => r[0] === 'kill')).toBe(false)
+})
+
+test('test32 covered leg refuses to continue unless its fault was consumed', async () => {
+  const r = await orderFaultLeg('covered', { omitConsumption: true })
+  expect(r.code).toBe(1)
+  expect(r.requests.some(r => r[0] === 'kill')).toBe(false)
+})
+
+test.each([
+  [['--send-mode', 'wait_turn'], 1], [['--send-mode=wait_turn'], 1],
+  [['--send-mode', 'steer_turn'], 0], [['--text', 'wait_turn', '--no-enter'], 0],
+] as const)('covered shim matcher uses actual send-mode arguments %j', async (args, expected) => {
+  const h = await fixture(false)
+  const result = Bun.spawnSync(['bash', '-c', [
+    'set -euo pipefail', 'match=send_mode=wait_turn', 'matches=0', shimMatcherCase(), 'printf "%s" "$matches"',
+  ].join('\n'), 'inert-argument-matcher', ...args], { env: hostSafeChildEnv(h.options.stateDir, { tools: ['bash'] }) })
+  expect(result.exitCode).toBe(0)
+  expect(result.stdout.toString()).toBe(String(expected))
+})
+
+test.each(['complete', 'no-fault', 'no-lookup', 'wrong-lookup-pair', 'duplicate-send', 'duplicate-take', 'legacy-recovery', 'wrong-fault-pid'])(
+  'test32 covered lost-reply proof: %s', async mode => {
+    const h = await coveredReceiptFixture(1)
+    let log = readFileSync(h.shimLog, 'utf8')
+    const pid = log.split('\t')[2]
+    const fault = `fault\t1.011\t${mode === 'wrong-fault-pid' ? 'foreign' : pid}\t1\tbun\tsend-keys send_mode=wait_turn unknown-typed 1\n`
+    if (mode !== 'no-fault') log += fault
+    if (mode !== 'no-lookup') log += `call\t1.012\tlookup\t1\tbun\tget-delivery --caller-uuid caller --delivery-request-id ${mode === 'wrong-lookup-pair' ? 'foreign' : 'delivery-1'}\n`
+    if (mode === 'duplicate-send') log += log.split('\n')[0] + '\n'
+    if (mode === 'legacy-recovery') log += 'call\t1.013\traw\t1\tbun\tsend-keys --instance-id cscb_alpha --key Enter\n'
+    if (mode === 'duplicate-take') { h.takes.push({ ...h.takes[0], uuid: 'extra' }); h.save() }
+    writeFileSync(h.shimLog, log)
+    const r = await runFixture('fixtures/real-case-assertions.ts', ['covered-lost-reply-proof', h.options.stateDir, 'alpha', h.shimLog,
+      h.options.stateDir, '1', '0'])
+    expect(r.code).toBe(mode === 'complete' ? 0 : 1)
+    if (mode === 'complete') expect(r.out.join('\n')).toContain('recorded: covered lost reply recovered by lookup')
+  },
+)
 
 /** Execute test32's real latency loop and shell helpers, stopping at its first
  * DM boundary. Only AD, the receipt CLI transport, and the clock are injected. */

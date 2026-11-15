@@ -12,6 +12,42 @@ function check(value: unknown, reason: string): asserts value { if (!value) thro
 const RECEIPTS_PENDING_EXIT = 75
 class ReceiptsPending extends Error {}
 type KeyCall = { at: number; words: string[]; pid?: string }
+function callArgument(call: KeyCall, flag: string): string | undefined {
+  const at = call.words.indexOf(flag)
+  return at >= 0 ? call.words[at + 1] : call.words.find(word => word.startsWith(flag + '='))?.slice(flag.length + 1)
+}
+/** Bind a consumed reply-loss fault to the actual covered send and its
+ * pre-existing durable intent. No native screen or inferred state. */
+export function assertCoveredSendFault(journal: any[], calls: KeyCall[], faults: KeyCall[], instance: string) {
+  const fault = faults.find(f => f.words[0] === 'send-keys' && f.words[1] === 'send_mode=wait_turn'
+    && f.words[2] === 'unknown-typed' && Number(f.words[3]) > 0 && f.pid)
+  check(fault, 'covered send reply fault not consumed')
+  const send = calls.find(c => c.pid === fault.pid && c.at <= fault.at && c.words.includes('send-keys')
+    && callArgument(c, '--instance-id') === instance && callArgument(c, '--send-mode') === 'wait_turn')
+  check(send, 'covered reply fault has no matching send call')
+  const intent = journal.find(r => r.kind === 'submitted' && r.instance_id === instance
+    && r.caller_uuid === callArgument(send, '--caller-uuid') && r.delivery_request_id === callArgument(send, '--delivery-request-id')
+    && r.at <= send.at)
+  check(intent, 'covered reply fault has no durable intent')
+  const text = journal.find(r => r.kind === 'fixed' && r.seq === intent.seq)?.parts?.[intent.part - 1]
+  check(typeof text === 'string' && callArgument(send, '--text') === text, 'covered reply fault sent different fixed text')
+  return { fault, send, intent, text }
+}
+export function assertCoveredLostReply(journal: any[], calls: KeyCall[], faults: KeyCall[], instance: string) {
+  const { fault, send, intent, text } = assertCoveredSendFault(journal, calls, faults, instance)
+  check(calls.some(c => c.at >= fault.at && c.words.includes('get-delivery')
+    && callArgument(c, '--caller-uuid') === intent.caller_uuid && callArgument(c, '--delivery-request-id') === intent.delivery_request_id),
+    'covered lost reply was not recovered by pair lookup')
+  const sends = calls.filter(c => c.words.includes('send-keys') && callArgument(c, '--instance-id') === instance)
+  check(sends.filter(c => callArgument(c, '--text') === text ||
+    (callArgument(c, '--caller-uuid') === intent.caller_uuid && callArgument(c, '--delivery-request-id') === intent.delivery_request_id)).length === 1,
+    'covered lost reply was resent')
+  check(!sends.some(c => c.at >= send.at && (c.words.includes('--key') || c.words.includes('--no-enter'))),
+    'covered lost reply used legacy key recovery')
+  check(journal.some(r => r.kind === 'delivered' && r.seq === intent.seq && r.part === intent.part
+    && r.receipt?.path === 'agent-director:get-delivery' && r.receipt.uuid === intent.delivery_request_id
+    && r.ad?.session_id === intent.session_id), 'covered lost reply lacks its durable AD receipt')
+}
 function recoveryKey(call: KeyCall, instance: string) {
   return call.words.includes('send-keys') && call.words.includes(instance)
     && (call.words.includes('--no-enter') || (call.words.includes('--key') && call.words.includes('Enter')))
@@ -138,6 +174,11 @@ const [command, state, key, shim, root, arg = '', arg2 = '', arg3 = ''] = proces
 function journal() { return jsonLines(join(state!, 'queue', `${key}.jsonl`)) }
 function cumulativeJournal() { return receiptJournal(state!, key!) }
 function calls() { return readFileSync(shim!, 'utf8').split('\n').filter(l => l.startsWith('call\t')).map(l => { const f=l.split('\t'); return { at:Number(f[1])*1000, pid:f[2], words:shimWords(f[5]!) } }) }
+function faultsSince(mark: string): KeyCall[] {
+  const lines=readFileSync(shim!,'utf8').split('\n').filter(Boolean), start=Number(mark)
+  check(Number.isSafeInteger(start)&&start>=0&&start<=lines.length,'invalid covered fault mark')
+  return lines.slice(start).filter(l=>l.startsWith('fault\t')).map(l=>{const f=l.split('\t');return {at:Number(f[1])*1000,pid:f[2],words:shimWords(f[5]!)}})
+}
 function firstWaiting(): LaunchObservation[] {
   return readFileSync(join(state!, 'server.log'), 'utf8').split('\n').flatMap(line => {
     const marker = 'delivery-launch-first-waiting: ', index = line.indexOf(marker)
@@ -212,6 +253,14 @@ try {
     check(readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')&&shimWords(l.split('\t')[5]!)[1]==='no_enter').length>=Number(arg),'text fault not yet applied')
   } else if(command==='enter-fault') {
     check(readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')&&shimWords(l.split('\t')[5]!)[1]==='key=Enter').length>=Number(arg),'Enter fault not yet applied')
+  } else if(command==='covered-send-fault') {
+    assertCoveredSendFault(cumulativeJournal(),calls(),faultsSince(arg),'cscb_'+key)
+  } else if(command==='covered-lost-reply-proof') {
+    const count=Number(arg);check(Number.isSafeInteger(count)&&count>0,'covered proof needs a positive original count')
+    const result=await confirmReceipts(count)
+    assertCoveredLostReply(cumulativeJournal(),calls(),faultsSince(arg2),'cscb_'+key)
+    check(result.duplicates===0,'covered lost reply produced duplicate take-ins')
+    console.log('recorded: covered lost reply recovered by lookup, no resend or duplicates, exact receipt FIFO complete')
   } else if(command==='fault') {
     check(readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')&&shimWords(l.split('\t')[5]!)[2]===arg).length>=Number(arg2||1), 'fault not yet consumed')
   } else if(command==='fidelity-shapes') {
@@ -337,6 +386,12 @@ try {
     const j=cumulativeJournal(), a=j.filter(r=>r.kind==='accepted'&&!r.compact), m=a.find(r=>r.text.includes('<!here>'))
     check(m,'mention not stored');const f=j.find(r=>r.kind==='fixed'&&r.seq===m.seq)
     check(f?.parts.join('').includes(`<@${arg}> <!here> &lt;b&gt; <https://example.com|link>`),'mention body lost another mention, here or markup')
+  } else if(command==='same-conversation-resume') {
+    const [before,after] = [arg,arg2].map(path => JSON.parse(readFileSync(path,'utf8')))
+    check(before?.instance_id==='cscb_'+key && after?.instance_id===before.instance_id, 'resume has the wrong AD instance')
+    check(typeof before.session_id==='string' && before.session_id.trim().length>0 && after.session_id===before.session_id,
+      'resume did not preserve the native conversation')
+    console.log('recorded: same native conversation resumed')
   } else if(command==='reply-permission-resume') {
     const { REPLY_TOOL_ALLOW_RULE } = await import(join(resolve(process.env.CSCB_PKG_DIR??'/test-repo/node_modules/claude-slack-channel-bots'),'src/agent-director-template.ts'))
     const [before,after] = [arg,arg2].map(path => {

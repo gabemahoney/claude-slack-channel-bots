@@ -2329,6 +2329,51 @@ describe('b.r6d covered journal failure boundaries', () => {
 })
 
 describe('b.r6d regression: covered production engine outcomes', () => {
+  test('covered reply loss after acceptance recovers by lookup across restart with FIFO and one send per item', async () => {
+    let loseReply = true
+    const acceptedInAd: string[] = [], calls = makeStubCallLog()
+    const terminal = cannedBusyResult({ class: 'sent_unconfirmed', final: true, reason: 'wait_turn_raced', wait: null })
+    const client = makeStubClient({ ...calls,
+      sendKeysFn(params) {
+        acceptedInAd.push(params.text!)
+        if (loseReply) { loseReply = false; return errTmuxUnresponsive('send-keys') }
+        return terminal
+      },
+      getDeliveryFn: () => cannedDeliveryLookup(terminal),
+    })
+    const h = await harness({ clientFor: async () => client })
+    client.get = async () => ({ ...h.p().row, busy_send: 'covered' })
+    await h.accept('faulted head'); await h.accept('FIFO successor'); await h.tick()
+    expect(acceptedInAd).toEqual(['faulted head'])
+    expect(h.queue.openCount('alpha')).toBe(2)
+    const intent = h.records().find(r => r.kind === 'submitted')!
+    await h.restartServer()
+    await h.until(() => h.queue.openCount('alpha') === 0)
+    expect(calls.getDeliveryCalls).toEqual([{ caller_uuid: intent.caller_uuid, delivery_request_id: intent.delivery_request_id }])
+    expect(acceptedInAd).toEqual(['faulted head', 'FIFO successor'])
+    expect(calls.sendKeysCalls.every(p => p.send_mode === 'wait_turn' && !p.key && !p.no_enter)).toBe(true)
+    expect(h.records().filter(r => r.kind === 'delivered').map(r => r.seq)).toEqual([1, 2])
+    expect(h.records().filter(r => r.kind === 'sent')).toEqual([])
+  })
+
+  test.each(['wait_turn_raced', 'admission_unknown'])('covered %s selects info for normal hand-over and errors for failure', async reason => {
+    const infos: string[] = []
+    const client = makeStubClient({ sendKeysResult: cannedBusyResult({ class: 'sent_unconfirmed', final: true, reason, wait: null }) })
+    const h = await harness({ clientFor: async () => client, onInfo: (_key, message) => infos.push(message) })
+    client.get = async () => ({ ...h.p().row, busy_send: 'covered' })
+    await h.accept(); await h.tick()
+    if (reason === 'wait_turn_raced') {
+      expect(infos).toEqual(['wait_turn_raced: AD completed the hand-over with its documented turn-boundary race'])
+      expect(infos.join()).not.toMatch(/Error| at /)
+      expect(h.errors).toEqual([])
+    } else {
+      expect(infos).toEqual([])
+      expect(h.errors).toHaveLength(1)
+      expect(h.errors[0]).toBeInstanceOf(Error)
+      expect(String(h.errors[0])).toContain('final-sent_unconfirmed')
+    }
+  })
+
   test.each([
     ['held', false, 'route_unavailable', false],
     ['queued', false, 'awaiting_proof', false],

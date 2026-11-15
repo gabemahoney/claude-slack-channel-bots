@@ -1,5 +1,6 @@
 /** Executable evidence adapter for real scenarios (b.omv SR-14.1).
- * Only the installed tarball's parser and exact matcher decide take-in.
+ * Legacy take-ins use the installed tarball's parser and exact matcher.
+ * Covered take-ins use AD's documented Claude wrapper, only in this audit.
  * Importing this helper performs no I/O; CLI entry points require the CI image.
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs'
@@ -210,6 +211,11 @@ export function shimSends(log: string): ShimSend[] {
  * Session IDs survive resume, and each new launch adds its own identity. */
 export function personaTranscripts(key: string, journal: readonly any[], log: readonly string[], entries: readonly TranscriptEntry[]): TranscriptEntry[] {
   const sessions = new Set<string>(), directories = new Set<string>()
+  // Covered attempts have no transcript_path. Their independently recorded
+  // conversation ID binds the native file and its embedded session identity;
+  // a delivered record alone never establishes transcript ownership.
+  const coveredSessions = new Set(journal.filter(r => r.kind === 'submitted' && r.instance_id === `cscb_${key}`
+    && typeof r.session_id === 'string' && r.session_id).map(r => r.session_id))
   for (const record of journal) if (record.kind === 'sent' && !record.unknown_outcome) {
     if (record.session_id) sessions.add(record.session_id)
     if (typeof record.transcript_path === 'string' && record.transcript_path && basename(record.transcript_path, '.jsonl') === record.session_id) directories.add(dirname(resolve(record.transcript_path)))
@@ -233,6 +239,8 @@ export function personaTranscripts(key: string, journal: readonly any[], log: re
   return entries.filter(entry => {
     if (entry.path.includes('/subagents/')) return false
     const session = basename(entry.path, '.jsonl')
+    if (coveredSessions.has(session) && entry.value?.sessionId === session &&
+      (entry.value?.session_id === undefined || entry.value.session_id === session)) return true
     return sessions.has(session) && directories.has(dirname(resolve(entry.path)))
       && (entry.value?.sessionId === undefined || entry.value.sessionId === session)
   })
@@ -252,21 +260,79 @@ function diagnosticTime(log: readonly string[], kind: string, key: string, item:
   return Math.min(...matches)
 }
 export interface AuditOptions { stateDir: string; key: string; shimLog: string; transcripts: string[]; expectedCount?: number; noRetype?: boolean }
+// AD 8e95f63a: internal/store/busy_send_capabilities.go:119-126,190-194;
+// internal/hook/busy_send_claude.go:35-54. No trimming, guessed envelopes or
+// decoding ambiguous escapes. This is test evidence, never agent state.
+const claudeWakePrefix = '<task-notification>\n<summary>Stop hook feedback</summary>\n</task-notification>\n<system-reminder>\nStop hook blocking error from command "FileChanged": '
+const claudeWakeSuffix = '\n</system-reminder>'
+function coveredTexts(entry: TranscriptEntry): string[] {
+  const v = entry.value
+  if (v?.type !== 'user' || v.isSidechain === true || v.isMeta || v.message?.role !== 'user' ||
+    v.origin?.kind !== 'task-notification' || v.origin?.producer !== 'session-task' || typeof v.message.content !== 'string') return []
+  const text = v.message.content
+  if (!text.startsWith(claudeWakePrefix) || !text.endsWith(claudeWakeSuffix)) return []
+  const body = text.slice(claudeWakePrefix.length, -claudeWakeSuffix.length)
+  if (['</system-reminder>', '&lt;/system-reminder>', '</task-notification>', '<\\/task-notification>'].some(tag => body.includes(tag))) return []
+  const first = body.match(/^\[agent-director: message 1 of ([1-9]\d*)\]\n/)
+  if (!first) return []
+  const count = Number(first[1])
+  // Every separator consumes bytes, bounding malicious counts by the body.
+  if (!Number.isSafeInteger(count) || count > body.length) return []
+  const texts: string[] = []
+  let rest = body.slice(first[0].length)
+  for (let n = 2; n <= count; n++) {
+    const separator = `\n\n[agent-director: message ${n} of ${count}]\n`
+    const at = rest.indexOf(separator)
+    if (at < 0 || rest.indexOf(separator, at + 1) >= 0) return []
+    texts.push(rest.slice(0, at)); rest = rest.slice(at + separator.length)
+  }
+  texts.push(rest)
+  // An unexpected separator is an ambiguous batch, never a substring match.
+  return texts.some(t => !t || /(?:^|\n\n)\[agent-director: message \d+ of \d+\]\n/.test(t)) ? [] : texts
+}
+function receiptTakes(entries: readonly TranscriptEntry[]): TranscriptEntry[] {
+  return entries.flatMap(e => {
+    const covered = coveredTexts(e)
+    if (covered.length) return covered.map(text => ({ ...e, kind: 'covered-take-in', text }))
+    return e.kind === 'take-in' && e.text !== undefined ? [e] : []
+  })
+}
+function coveredPart(journal: readonly any[], seq: number, part: number, delivered: any): boolean {
+  return delivered?.ad !== undefined || delivered?.receipt?.path === 'agent-director:get-delivery'
+    || journal.some(r => r.kind === 'submitted' && r.seq === seq && r.part === part
+      && !journal.some(other => other.kind === 'refused' && other.seq === seq && other.attempt === r.attempt))
+}
+function textMatches(e: TranscriptEntry, text: string, covered: boolean, adapters: ReceiptAdapters): boolean {
+  return covered ? e.kind === 'covered-take-in' && e.text === text
+    : e.kind === 'take-in' && adapters.receiptTextMatches(e.text!, text)
+}
+function durableCoveredReceipt(journal: readonly any[], key: string, delivered: any, take: TranscriptEntry): boolean {
+  if (delivered?.receipt?.path !== 'agent-director:get-delivery' || typeof delivered.receipt.uuid !== 'string' || !delivered.receipt.uuid
+    || typeof delivered.ad?.session_id !== 'string' || !delivered.ad.session_id
+    || delivered.ad?.session_id !== take.value?.sessionId || basename(take.path, '.jsonl') !== delivered.ad.session_id) return false
+  return journal.some(r => r.kind === 'submitted' && r.seq === delivered.seq && r.part === delivered.part
+    && r.instance_id === `cscb_${key}` && r.session_id === delivered.ad.session_id && r.delivery_request_id === delivered.receipt.uuid
+    && Number.isFinite(r.at) && take.at >= r.at
+    && !journal.some(other => other.kind === 'refused' && other.seq === r.seq && other.attempt === r.attempt))
+}
 /** Only distinct original-workload parts with a durable, exact, own-session
  * take-in advance the functional watchdog. Retries, reminders and duplicates
  * cannot keep a stuck batch alive. Success still requires auditReceipts. */
 export function receiptProgress(options: AuditOptions, entries: readonly TranscriptEntry[], adapters: ReceiptAdapters): number {
   const journal = receiptJournal(options.stateDir, options.key)
   const log = readFileSync(join(options.stateDir, 'server.log'), 'utf8').split('\n')
-  const takes = personaTranscripts(options.key, journal, log, entries).filter(e => e.kind === 'take-in' && e.text !== undefined)
+  const takes = receiptTakes(personaTranscripts(options.key, journal, log, entries))
+  const used = new Set<number>()
   let completed = 0
   for (const item of workloadItems(journal)) {
     const fixed = journal.find(r => r.kind === 'fixed' && r.seq === item.seq)
     for (const [index, text] of (fixed?.parts ?? []).entries()) {
-      if (journal.some(r => r.kind === 'delivered' && r.seq === item.seq && r.part === index + 1 &&
-        takes.some(e => e.path === r.receipt?.path && e.at >= item.received_at &&
-          (r.receipt.uuid ? e.uuid === r.receipt.uuid : e.offset === r.receipt?.offset) &&
-          adapters.receiptTextMatches(e.text!, text)))) completed++
+      const delivered = journal.find(r => r.kind === 'delivered' && r.seq === item.seq && r.part === index + 1)
+      const covered = coveredPart(journal, item.seq, index + 1, delivered)
+      const match = takes.findIndex((e, i) => !used.has(i) && e.at >= item.received_at && textMatches(e, text, covered, adapters)
+        && (covered ? durableCoveredReceipt(journal, options.key, delivered, e) : e.path === delivered?.receipt?.path &&
+          (delivered.receipt.uuid ? e.uuid === delivered.receipt.uuid : e.offset === delivered.receipt?.offset)))
+      if (match >= 0 && (!covered || [...used].every(i => i < match))) { used.add(match); completed++ }
     }
   }
   return completed
@@ -287,7 +353,7 @@ export function auditReceipts(options: AuditOptions, entries: readonly Transcrip
   }
   const log = readFileSync(join(options.stateDir, 'server.log'), 'utf8').split('\n')
   const ownEntries = personaTranscripts(options.key, journal, log, entries)
-  const takes = ownEntries.filter(e => e.kind === 'take-in' && e.text !== undefined)
+  const takes = receiptTakes(ownEntries)
   const sends = shimSends(readFileSync(options.shimLog, 'utf8')).filter(s => s.instanceId === `cscb_${options.key}`)
   let previousAppearance = -1, previousDelivered = -Infinity, duplicates = 0
   const timings: { seq: number; typing_ms: number; delivery_ms: number }[] = []
@@ -301,16 +367,20 @@ export function auditReceipts(options: AuditOptions, entries: readonly Transcrip
     let firstTyped = Infinity, partDelivered = previousDelivered
     for (let part = 1; part <= fixed.parts.length; part++) {
       const text = fixed.parts[part - 1]
-      const matches = takes.flatMap((r, i) => adapters.receiptTextMatches(r.text!, text) && r.at >= item.received_at ? [i] : [])
+      const delivered = journal.find(r => r.seq === item.seq && r.kind === 'delivered' && r.part === part)
+      const covered = coveredPart(journal, item.seq, part, delivered)
+      const matches = takes.flatMap((r, i) => textMatches(r, text, covered, adapters) && r.at >= item.received_at ? [i] : [])
       if (!matches.length) throw new Error(`Item ${item.seq} part ${part} has no exact transcript receipt`)
       const first = matches[0]!
       if (first <= previousAppearance) throw new Error(`Item ${item.seq} first appearance is out of accept order`)
       previousAppearance = first
       duplicates += matches.length - 1
-      const delivered = journal.find(r => r.seq === item.seq && r.kind === 'delivered' && r.part === part)
       if (!delivered) throw new Error(`Item ${item.seq} part ${part} is still open`)
-      const receipt = takes.find(r => r.path === delivered.receipt?.path && (delivered.receipt.uuid ? r.uuid === delivered.receipt.uuid : r.offset === delivered.receipt?.offset))
-      if (!receipt || !adapters.receiptTextMatches(receipt.text!, text)) throw new Error('Durable receipt does not identify matching take-in')
+      const receipt = covered ? undefined : takes.find(r => r.kind === 'take-in' && r.path === delivered.receipt?.path &&
+        (delivered.receipt.uuid ? r.uuid === delivered.receipt.uuid : r.offset === delivered.receipt?.offset))
+      const validReceipt = covered ? durableCoveredReceipt(journal, options.key, delivered, takes[first]!)
+        : receipt && adapters.receiptTextMatches(receipt.text!, text)
+      if (!validReceipt) throw new Error('Durable receipt does not identify matching take-in')
       const typed = sends.filter(s => s.text === text)
       if (!typed.length) throw new Error(`Item ${item.seq} part ${part} has no shim send`)
       if (typed.some(s => !Number.isFinite(s.at) || s.at < receivedAt)) throw new Error('Missing, invalid or negative typing measurement')
@@ -365,15 +435,17 @@ export function deliveryFailureEvidence(options: AuditOptions, entries: readonly
   const own = part > 0 ? fixed[part - 1] : undefined
   let ownEntries: TranscriptEntry[] = [], sessionEvidenceReadable = true
   try { ownEntries = personaTranscripts(options.key, journal, readFileSync(join(options.stateDir, 'server.log'), 'utf8').split('\n'), entries) } catch { sessionEvidenceReadable = false }
-  const attempts = head ? journal.filter(r => r.kind === 'sent' && r.seq === head.seq) : []
+  const attempts = head ? journal.filter(r => (r.kind === 'sent' || r.kind === 'submitted') && r.seq === head.seq) : []
   return { reason, journalReadable, accepted: accepted.filter(r => r.reminder_for === undefined).length,
     reminders: accepted.filter(r => r.reminder_for !== undefined).length, expected: numeric(options.expectedCount), open: open.length,
     head: head ? { seq: numeric(head.seq), parts: fixed.length, part, attempts: attempts.length,
       recentAttempts: attempts.slice(-8).map(r => ({ attempt: numeric(r.attempt), part: numeric(r.part), at: numeric(r.at),
-        kind: ['text', 'enter', 'retype'].includes(r.send_kind) ? r.send_kind : 'unknown', unknownOutcome: r.unknown_outcome === true,
+        kind: r.kind === 'submitted' ? 'covered' : ['text', 'enter', 'retype'].includes(r.send_kind) ? r.send_kind : 'unknown', unknownOutcome: r.unknown_outcome === true,
         refused: journal.some(other => other.kind === 'refused' && other.seq === head.seq && other.attempt === r.attempt) })),
-      exactReceipts: own === undefined ? 0 : ownEntries.filter(e => e.kind === 'take-in' && typeof e.text === 'string' && e.at >= head.received_at && adapters.receiptTextMatches(e.text, own)).length } : null,
-    sessionEvidenceReadable, sessionEntries: ownEntries.length, sessionTakeins: ownEntries.filter(e => e.kind === 'take-in').length,
+      exactReceipts: own === undefined ? 0 : receiptTakes(ownEntries).filter(e => e.at >= head.received_at &&
+        textMatches(e, own, coveredPart(journal, head.seq, part, undefined), adapters)).length } : null,
+    sessionEvidenceReadable, sessionEntries: ownEntries.length,
+    sessionTakeins: ownEntries.filter(e => e.kind === 'take-in' || coveredTexts(e).length > 0).length,
     rowState: ['pending', 'waiting', 'working', 'ended', 'paused'].includes(row?.state) ? row.state : 'unreadable' }
 }
 /** Failure-safe accounting does not require a completed receipt audit. */
@@ -386,11 +458,12 @@ export function reportUsage(stateDir: string, entries: readonly TranscriptEntry[
   for (const key of new Set(personaKeys)) {
     const path = join(queue, `${key}.jsonl`)
     if (!existsSync(path)) continue
-    const journal = receiptJournal(stateDir, key), own = personaTranscripts(key, journal, log, entries)
+    const journal = receiptJournal(stateDir, key), own = receiptTakes(personaTranscripts(key, journal, log, entries))
     for (const item of journal.filter(r => r.kind === 'accepted' && !r.compact)) {
       const fixed = journal.find(r => r.seq === item.seq && r.kind === 'fixed')
-      for (const text of fixed?.parts ?? []) {
-        const matches = own.filter(r => r.kind === 'take-in' && r.text !== undefined && r.at >= item.received_at && adapters.receiptTextMatches(r.text, text))
+      for (const [i, text] of (fixed?.parts ?? []).entries()) {
+        const delivered = journal.find(r => r.kind === 'delivered' && r.seq === item.seq && r.part === i + 1)
+        const matches = own.filter(r => r.at >= item.received_at && textMatches(r, text, coveredPart(journal, item.seq, i + 1, delivered), adapters))
         duplicates += Math.max(0, matches.length - 1)
       }
     }

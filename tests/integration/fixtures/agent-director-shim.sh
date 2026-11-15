@@ -201,6 +201,11 @@ if [[ -f "${faults}" ]]; then
                 [[ "${previous}" == --key && "${arg}" == "${match#key=}" ]] && matches=1
                 previous="${arg}"
             done ;;
+            send_mode=*) previous=''; for arg in "$@"; do
+                if [[ "${previous}" == --send-mode && "${arg}" == "${match#send_mode=}" \
+                    || "${arg}" == "--send-mode=${match#send_mode=}" ]]; then matches=1; fi
+                previous="${arg}"
+            done ;;
             instance=*) previous=''; for arg in "$@"; do
                 if [[ "${previous}" == --instance-id && "${arg}" == "${match#instance=}" \
                     || "${arg}" == "--instance-id=${match#instance=}" ]]; then matches=1; fi

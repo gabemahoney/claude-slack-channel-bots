@@ -289,6 +289,60 @@ and from historical captures; see
 
 ### Busy-send integration and candidate AD
 
+Test-32 captures AD's row before its own pause and again after resume, and
+requires the same non-empty native `session_id` and instance before waiting
+for receipts. `tests/real-down-pause.test.ts` rejects a replacement session.
+
+The real-scenario receipt audit keeps two distinct evidence paths. Legacy
+records retain the packed production parser, exact-text matcher and durable
+transcript receipt.
+
+Covered records require an unrefused `submitted` intent
+for that part and instance, a durable `agent-director:get-delivery` receipt
+whose UUID equals its `delivery_request_id`, and matching intent, receipt and
+native transcript session IDs. The intent independently binds the native
+file's basename and embedded session ID; the delivered record alone cannot
+establish ownership.
+
+A main Claude `user` record with
+`origin: {kind: 'task-notification', producer: 'session-task'}` qualifies only
+after removing the exact documented AD Claude Wait Turn prefix and suffix.
+The audit follows AD commit `8e95f63a`'s capability table and
+`unwrapClaudeWake`: raw or escaped reserved closing tags, changed wrappers
+and ambiguous batches give no evidence. It splits only AD's numbered
+`[agent-director: message N of M]` separators with their documented LF gaps,
+then compares each whole part byte for byte after its submission.
+
+Batch slots preserve order and cannot be reused; extra exact take-ins still count
+as duplicates. Watchdog progress, failure diagnostics and final usage use
+the same classification. Production transcript matching stays unchanged.
+
+Host-safe controls in `tests/transcript-receipts.test.ts` cover the retained
+13-message shape, a 13-part batch, missing/wrong receipt or take-in evidence,
+wrapping changes, session/instance mismatch, duplicates and path separation.
+These synthetic controls do not establish that a retained projection with
+withheld text matches the documented wrapper; the candidate rerun must prove
+that against its native transcript.
+
+Test-32 chooses its fault leg from a fresh AD `get` row's `busy_send` field.
+Uncovered launches keep the swallowed text/Enter faults; covered launches
+lose one confirmed Wait Turn reply only after the real call runs.
+
+Require a consumed `send_mode=wait_turn` / `unknown-typed` fault bound by PID
+to its actual send and pre-existing durable intent. After kill/reconcile and
+resume, audit all 33 original inputs and reminders, then require the same
+pair's `get-delivery` lookup, one send, no raw-key recovery and no duplicate
+take-ins. Keep the 20 latency samples after that proof.
+
+Host controls execute the real fault-leg slice and extracted argument matcher
+with inert stand-ins only. Full shim execution and native AD custody/recovery
+belong to the container candidate rerun.
+
+Normal covered `wait_turn_raced` hand-over logs through the engine's info
+callback as a plain line, without constructing an Error or printing a stack.
+Blocked and failed deliveries keep the error callback. The engine unit
+controls pin both paths.
+
 `tests/integration/test-50-fmk-busy-send.sh` depends on test-1 and runs in
 Docker CI. It drives the packed production queue, engine and covered adapter.
 On an uncovered runtime it checks real text/Enter transport and transcript

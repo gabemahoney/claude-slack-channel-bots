@@ -79,14 +79,17 @@ function deliveryResult(value: unknown): BusyDeliveryResult | undefined {
 export function createCoveredDelivery(deps: {
   queue: DeliveryQueue; now(): number
   log(key: string, reason: string): void
+  info?(key: string, message: string): void
   notify?(key: string, reason: string): void
 }): CoveredDelivery {
   const after = new Map<string, number>(), logged = new Set<string>(), retrySteps = new Map<string, number>(), heads = new Map<string, string>()
   function clearLogs(key: string): void { for (const id of logged) if (id.startsWith(`${key}/`)) logged.delete(id) }
-  function log(key: string, identity: string, reason: string): boolean {
+  function log(key: string, identity: string, reason: string, level: 'error' | 'info' = 'error'): boolean {
     const id = `${key}/${identity}/${reason}`
     if (logged.has(id)) return false
-    logged.add(id); deps.log(key, reason)
+    logged.add(id)
+    if (level === 'info') deps.info?.(key, reason)
+    else deps.log(key, reason)
     return true
   }
   async function blocked(input: CoveredDeliveryStep, submitted: SubmittedRecord, reason: string): Promise<CoveredDeliveryAction> {
@@ -101,7 +104,7 @@ export function createCoveredDelivery(deps: {
   async function result(input: CoveredDeliveryStep, submitted: SubmittedRecord, r: BusyDeliveryResult): Promise<CoveredDeliveryAction> {
     const handover = r.class === 'sent_unconfirmed' && ['handed_over_not_proven', 'wait_turn_raced'].includes(r.reason)
     if (r.final && (r.class === 'delivered_confirmed' || handover)) {
-      if (r.reason === 'wait_turn_raced') log(input.key, submitted.delivery_request_id, 'wait_turn_raced: AD completed the hand-over with its documented turn-boundary race')
+      if (r.reason === 'wait_turn_raced') log(input.key, submitted.delivery_request_id, 'wait_turn_raced: AD completed the hand-over with its documented turn-boundary race', 'info')
       await deps.queue.append(input.key, { v: 1, kind: 'delivered', seq: submitted.seq, part: submitted.part, at: deps.now(), receipt: { path: 'agent-director:get-delivery', uuid: submitted.delivery_request_id }, ad: { launch_token: r.launch_token, session_id: r.session_id ?? submitted.session_id, evidence_kind: r.evidence_kind ?? null } })
       input.delivered()
       return 'delivered'
