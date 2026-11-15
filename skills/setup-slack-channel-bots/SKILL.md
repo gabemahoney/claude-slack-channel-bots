@@ -688,11 +688,14 @@ For each persona's current app, follow these steps once as part of
 [Upgrading from 0.18.x](../../docs/migration.md#upgrading-from-018x).
 Later ordinary restarts need no further reinstall.
 
-1. Update the app from the shipped `slack-app-manifest.yml`. Check **Event
-   Subscriptions** → **Subscribe to bot events** includes `member_joined_channel`
-   and `channel_left`, and **OAuth & Permissions** includes `channels:read`
-   for public channels and `groups:read` for private channels. Include any
-   other missing scopes identified in step 5.2 before reinstalling.
+1. Add what the app lacks, as the shipped `slack-app-manifest.yml` names it:
+   `member_joined_channel` and `channel_left` under **Event Subscriptions** →
+   **Subscribe to bot events**, and `channels:read` for public channels and
+   `groups:read` for private channels under **OAuth & Permissions** → **Bot
+   Token Scopes** (or add them to the app's own manifest). Don't paste the
+   shipped manifest over the app's own; see the
+   [do-not-paste warning](../debug-slack-channel-bots/SKILL.md#the-message-archive-shows-channel-ids-re-install-each-app-to-gain-channelsread-and-groupsread).
+   Include any other missing scopes identified in step 5.2 before reinstalling.
 2. Under **OAuth & Permissions**, choose **Reinstall to Workspace** once and
    complete it. Thread following requires no separate scope or reinstall.
 3. Once the persona is applied and running, follow the debug skill's

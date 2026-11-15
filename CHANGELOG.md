@@ -31,6 +31,11 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 - **CSCB's Slack credentials stay out of child environments.** CSCB now strips its Slack credential variable names, including those Bun loads from `.env` files, before starting child processes or making agent-director calls, covering any tmux server those calls start. `_CLI_DAEMON_CHILD` is limited to the daemon startup handoff. Other host variables still pass through under the operator's environment policy. Existing tmux servers and sessions keep their stored environment. See [Environment Variables](docs/server-settings.md#environment-variables).
 - **A reaction now answers a message.** When a bot answered a Slack message only with the `react` tool, its acknowledgement reaction stayed on the message and CSCB sent it a "you haven't replied" reminder. Now a persona's `react` on the message clears its acknowledgement as a `reply` with `message_id` does, a reaction before delivery suppresses later stages, and any `react` call suppresses the reminder. A reaction with the acknowledgement's own emoji stays. See [Acknowledgement reactions](docs/server-settings.md#acknowledgement-reactions) and [Slack reply reminders](docs/bots.md#slack-reply-reminders).
 
+### Fixes
+
+- **Channel names recover after a lookup failure.** A failed or timed-out channel-name lookup left later messages from that channel tagged with the channel ID in `channel_name` until the server restarted. Later messages now retry the lookup and use the name once it resolves. Successful names stay cached, messages already tagged with the ID keep it, and the two-second fallback is unchanged.
+- **Deliveries no longer stall when the agent-director call budget fills.** Repeated readiness reads used up the per-persona agent-director calls needed to type a message and press Enter, so delivery could stall. CSCB now waits until the budget has room for the whole read-and-key step, and keeps the persona typing lease from the text to its Enter. The call limit is unchanged.
+
 ---
 
 ## 0.18.7 (2026-11-07)

@@ -220,7 +220,7 @@ const reinstallRequirements = [
   'Later ordinary restarts need no further reinstall',
 ]
 const REINSTALL_ORDER = [
-  'Update the app from the shipped', '**Reinstall to Workspace** once and complete it',
+  'Add what the app lacks, as the shipped', '**Reinstall to Workspace** once and complete it',
   'read the authenticated installation IDs', 'record each subscription',
   'then read back both inventory and setup states',
 ]
