@@ -70,13 +70,14 @@ elif [[ "${CASE}" == pending ]]; then
     compact_ms="$(printed effectiveTestTimer queue_compact_interval_ms)"
 fi
 config_args=("${mode}" "${population}" "${recipients}" "${CASE_ROOT}" "${SCENARIO_PORT}" "${compact_ms}")
-if [[ "${CASE}" == burst ]]; then
+if [[ "${CSCB_TEST_DIAGNOSTICS:-}" == 1 && "${CASE}" == burst ]]; then
     # The server's diagnostic ack/append/save rows, read only by observe below.
     config_args+=(timings)
 fi
 bun "${SR8}" config "${config_args[@]}" | write_config
-# Test-only CPU profile of the measured server over the burst waves: only
-# this burst case opts in. The profile stays in scenario scratch; only its
+# Test-only CPU profile of the measured server over the burst waves:
+# CSCB_TEST_DIAGNOSTICS=1 opts only this burst case in. The profile stays in
+# scenario scratch; only its
 # content-free summary reaches this log, once: right after the profile stops,
 # or from the cleanup hook when the script ends before that. No profile step
 # changes this script's status.
@@ -92,7 +93,7 @@ profile_summary() {
     PROFILE_SUMMARIZED=1
     bun "${PROFILER}" summary "${PROFILE_DIR}" "${CONTEXT[@]}" || printf 'recorded: cpu-profile summary unavailable\n'
 }
-if [[ "${CASE}" == burst ]]; then
+if [[ "${CSCB_TEST_DIAGNOSTICS:-}" == 1 && "${CASE}" == burst ]]; then
     if mkdir -p "${EVIDENCE}/cpu-profile" 2> /dev/null; then
         PROFILE_DIR="${EVIDENCE}/cpu-profile"
         on_before_cleanup profile_summary
@@ -301,7 +302,12 @@ case "${CASE}" in
         burst_status=0
         # Observer-only CPU readings at each wave boundary, for observe below.
         # The driver runs off the server's CPU quota; driver-cpu judges that.
-        SR8_PHASE_CPU_FILE="${RESULTS}/phase-cpu.jsonl" SR8_PHASE_CPU_PIDS="server=${SERVER_PID},stub=${SLACK_PID}" \
+        phase_cpu_file='' phase_cpu_pids=''
+        if [[ "${CSCB_TEST_DIAGNOSTICS:-}" == 1 ]]; then
+            phase_cpu_file="${RESULTS}/phase-cpu.jsonl"
+            phase_cpu_pids="server=${SERVER_PID},stub=${SLACK_PID}"
+        fi
+        SR8_PHASE_CPU_FILE="${phase_cpu_file}" SR8_PHASE_CPU_PIDS="${phase_cpu_pids}" \
             SR8_PROFILE_DIR="${PROFILE_DIR}" bash "${BURST_DRIVER}" "${RESULTS}/driver-cgroup" \
             bun "${SR8}" burst "${CONTEXT[@]}" "${BATCH}" "${SCENARIO_SLACK_STUB_URL}" \
             "${SCENARIO_SLACK_RECORD}" "${SLACK_STATE_DIR}" "${RESULTS}" 30000 \
@@ -339,8 +345,10 @@ case "${CASE}" in
         closing_assertions
         # Latency decomposition only: no verdict, and never this script's status.
         # It prints before check, whose failure ends the script.
-        bun "${SR8}" observe "${CONTEXT[@]}" "${RESULTS}" "${RESULTS}/measurements.jsonl" "${measurement_mark}" \
-            "${RESULTS}/phase-cpu.jsonl" || printf 'recorded: sr8 observe unavailable\n'
+        if [[ "${CSCB_TEST_DIAGNOSTICS:-}" == 1 ]]; then
+            bun "${SR8}" observe "${CONTEXT[@]}" "${RESULTS}" "${RESULTS}/measurements.jsonl" "${measurement_mark}" \
+                "${RESULTS}/phase-cpu.jsonl" || printf 'recorded: sr8 observe unavailable\n'
+        fi
         sr8_verdicts check "${CONTEXT[@]}" "${RESULTS}" "${RESULTS}/measurements.jsonl" "${measurement_mark}" "${start_ms}" "${ready_ms}"
         [[ "${burst_status}" == 0 ]] || fail 'burst submission or ACK observation failed'
         ;;

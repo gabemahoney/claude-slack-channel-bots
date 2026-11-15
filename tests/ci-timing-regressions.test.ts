@@ -173,8 +173,8 @@ describe('retained timing regressions', () => {
   test.each([
     ['lib/membership-load.sh', 'shared_persona_facts "${P}" >>'],
     ['test-44-fmk-thread-burst.sh', 'shared_persona_facts "${key}" >>'],
-    ['test-46-shared-channel-recovery.sh', 'shared_delivery_expectation "${KEY[${who}]}" "${NAME[${who}]}" slack'],
-    ['test-46-shared-channel-recovery.sh', 'shared_delivery_expectation "${KEY[${who}]}" "${NAME[${who}]}" "${source}"'],
+    ['lib/shared-channel-recovery.sh', 'shared_delivery_expectation "${KEY[${who}]}" "${NAME[${who}]}" slack'],
+    ['lib/shared-channel-recovery.sh', 'shared_delivery_expectation "${KEY[${who}]}" "${NAME[${who}]}" "${source}"'],
     ['test-47-shared-channel-upgrade.sh', 'shared_assert_content "${key}" "${LOG}"'],
   ].flatMap(([file, prefix]) => ['bytes', 'silent-failure'].map(mode => [file, prefix, mode])))
   ('printer append in %s (%s): %s', (file, prefix, mode) => {
@@ -882,7 +882,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
   test.each(['hang', 'transient', 'scope', 'denied', 'rate'])('membership %s first and later page published outcomes', kind => {
     for (const page of ['first', 'later']) { const f = member(kind, page); output(f.run(), 0) }
   })
-  // The kept test-45/test-48 later-denied runs: each refusal resets the scan
+  // The split strict/open later-denied runs: each refusal resets the scan
   // (pages=0) and republishes reason=none before the next attempt.
   function reset(kind: string) {
     const f = member(kind, 'later')
@@ -1082,7 +1082,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     ])('%s is missing', (_name, server, drivers, entries, access) => {
       const row = driverCpuVerdict(server, drivers, files(entries), access)
       expect(row.verdict).toBe('missing')
-      expect(resultLine({ scenario: 'test-45-fmk-membership-load-strict-lookup', mode: 'strict', population: 100_000, recipients: 2 }, row))
+      expect(resultLine({ scenario: 'test-56-fmk-membership-load-lookup-strict-lookup', mode: 'strict', population: 100_000, recipients: 2 }, row))
         .toMatch(/^recorded: sr8 driver-cpu scenario=\S+ mode=strict population=100000 recipients=2 samples=\d+ server_cgroup=\S+ server_cpu_max=\S+ server_cpus=\S+ server_usage_ms=\S+ driver_cgroup=\S+ driver_cpu_max=\S+ driver_cpus=\S+ driver_usage_ms=\S+ shared_cpus=\S+ guarded_files=\S+ writable_files=\S+ unprobed_files=\S+ limit=2 verdict=missing$/)
     })
     test('permissions are checked on every cgroup of both paths, once each, root first', () => {
@@ -1704,8 +1704,12 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     ])
     expect(run.stdout).not.toContain(secret); expect(run.stdout).not.toContain('cscb_other')
   })
-  const test46 = source('test-46-shared-channel-recovery.sh'), test29Script = source('test-29-invited-channels.sh')
-  // test-46's real held_push; push, record_after and no_ack are stand-ins.
+  const recovery = source('lib/shared-channel-recovery.sh')
+  const membershipRecovery = source('test-65-shared-channel-recovery-membership-memory.sh')
+  const ownPostRecovery = source('test-66-shared-channel-recovery-own-post.sh')
+  const identityRecovery = source('test-67-shared-channel-recovery-identity-repair.sh')
+  const test29Script = source('test-29-invited-channels.sh')
+  // test-65's real held_push; push, record_after and no_ack are stand-ins.
   test.each([
     ['sent', '[]', 'false', 'env-1', 'env-1', 0, ''],
     ['no-open-socket', '[{"reason":"no-open-socket"}]', 'true', '', '', 0, ''],
@@ -1713,14 +1717,14 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     ['records=0', '[]', '', '', '', 1, '  | FAIL: test-46: refused (HTTP 409: no-open-socket)\nauthorization held push was neither sent nor refused for the revoked connection (records=0)\n'],
     ['records=2', '[{"reason":"no-open-socket"},{"reason":"send-failed"}]', '', '', '', 1, '  | FAIL: test-46: refused (HTTP 409: no-open-socket)\nauthorization held push was neither sent nor refused for the revoked connection (records=2)\n'],
     ['other reason', '[{"reason":"invalid_auth"}]', '', '', '', 1, '  | FAIL: test-46: refused (HTTP 409: no-open-socket)\nauthorization held push was neither sent nor refused for the revoked connection (invalid_auth)\n'],
-  ] as const)('test-46 held_push classifies the authorization held push: %s', (outcome, refused, state, held, noAcks, rc, stderr) => {
+  ] as const)('test-65 held_push classifies the authorization held push: %s', (outcome, refused, state, held, noAcks, rc, stderr) => {
     const run = shell([
       'declare -A LABEL=([p]=label-p)', 'B=CB', 'HELD_REFUSED=unset', 'held=unset', `OUTCOME='${outcome}'`,
       'push() { printf "%s\\n" "$*" >> "$HOME/pushes"; [[ "$OUTCOME" == sent ]] && { echo env-1; return 0; }; echo "FAIL: test-46: refused (HTTP 409: no-open-socket)" >&2; exit 1; }',
       'record_after() { printf "%s\\n" "$*" >> "$HOME/reads"; cat "$HOME/refused.json"; }',
       'no_ack() { printf "%s\\n" "$1" >> "$HOME/no_acks"; }',
       'sed() { local l; while IFS= read -r l; do printf "  | %s\\n" "$l"; done < "$2"; }',
-      declaration(test46, 'held_push'),
+      declaration(membershipRecovery, 'held_push'),
       'held_push 1.5 "held text" 7', 'printf "refused=%s held=%s\\n" "$HELD_REFUSED" "$held"',
       'cat "$HOME/pushes"', 'cat "$HOME/reads" 2>/dev/null || true', 'printf "no_acks:%s\\n" "$(cat "$HOME/no_acks" 2>/dev/null || true)"',
     ].join('\n'), { 'refused.json': refused })
@@ -1729,7 +1733,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     const reads = outcome === 'sent' ? [] : ['7 push-refused label=label-p']
     expect(run.stdout.split('\n')).toEqual([`refused=${state} held=${held}`, 'p CB 1.5 held text', ...reads, `no_acks:${noAcks}`, ''])
   })
-  test('test-46 phase7_observe prints p\'s lifecycle counts and whitelisted stub records since the case marks, never content', () => {
+  test('test-65 phase7_observe prints p\'s lifecycle counts and whitelisted stub records since the case marks, never content', () => {
     const secret = 'private message text', tok = fakeToken(BOT_TOKEN_PREFIX, 'phase7-observer')
     const old = `[2030-01-01T00:00:00.000Z] [slack] Session connected: persona "p" (key=p) cwd="/w" ${secret}\n`
     const files = {
@@ -1748,7 +1752,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     const program = (name: string) => [
       'persona_ref() { printf \'"%s" (key=%s)\\n\' "$1" "$1"; }', 'declare -A NAME=([p]=p) KEY=([p]=p) LABEL=([p]=label-p)',
       'SLACK_STATE_DIR="$HOME/state" SCENARIO_SLACK_RECORD="$HOME/slack.jsonl" incomplete=channel-membership-inventory-incomplete',
-      declaration(test46, 'phase7_observe'), `PHASE7_CASE=${name} PHASE7_MARK=1 PHASE7_LOG_MARK=${Buffer.byteLength(old)}`, 'phase7_observe',
+      declaration(membershipRecovery, 'phase7_observe'), `PHASE7_CASE=${name} PHASE7_MARK=1 PHASE7_LOG_MARK=${Buffer.byteLength(old)}`, 'phase7_observe',
     ].join('\n')
     const quiet = shell(program("''"), files)
     expect({ status: quiet.status, stdout: quiet.stdout, stderr: quiet.stderr }).toEqual({ status: 0, stdout: '', stderr: '' })
@@ -1770,7 +1774,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     ])
     expect(run.stdout).not.toContain(secret); expect(run.stdout).not.toContain(tok)
   })
-  test('test-46 accept_observe prints the acceptance journal\'s counts and whitelisted fields, never content', () => {
+  test('recovery accept_observe prints the acceptance journal\'s counts and whitelisted fields, never content', () => {
     const secret = 'private message text', tok = fakeToken(BOT_TOKEN_PREFIX, 'accept-observer')
     const hold = { on: 'post', operations: ['op-a'], thread_ts: '1.0', stamp: { incarnation: 1, threadHybridSince: 2 }, root_unknown: false, arrived_at: 10 }
     const files = {
@@ -1783,7 +1787,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       ]) + '{"v":1,"kind":"acc',
     }
     const program = (who: string, via: string) => [
-      'SLACK_STATE_DIR="$HOME/state"', 'declare -A KEY=([p]=p [q]=q)', declaration(test46, 'accept_observe'), `accept_observe ${who} CX 1.5 '${via}'`,
+      'SLACK_STATE_DIR="$HOME/state"', 'declare -A KEY=([p]=p [q]=q)', declaration(recovery, 'accept_observe'), `accept_observe ${who} CX 1.5 '${via}'`,
     ].join('\n')
     const run = shell(program('p', 'thread'), files)
     expect({ status: run.status, stderr: run.stderr }).toEqual({ status: 0, stderr: '' })
@@ -1812,7 +1816,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       stdout: 'accept-observe: persona=q channel=CX ts=1.5 via=thread failed\naccept-observe: journal=absent\n' })
   })
   test.each([['ok', 0], ['timeout', 1], ['timeout, observer error', 1]] as const)(
-    'test-46 accepted keeps wait_until\'s check, poll and failure text, and prints the journal only at the timeout: %s', (outcome, status) => {
+    'recovery accepted keeps wait_until\'s check, poll and failure text, and prints the journal only at the timeout: %s', (outcome, status) => {
       const stubs = (poll: string) => [
         '_scenario_check_timeout() { printf "check %s|%s\\n" "$1" "$2"; }',
         `_scenario_poll_until() { printf "poll %s\\n" "$*"; [[ ${poll} == ok ]]; }`,
@@ -1822,7 +1826,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
         `accept_observe() { printf "observe %s\\n" "$*"; [[ '${outcome}' != *error ]]; }`,
         'shared_delivery_expectation() { printf "expectation %s\\n" "$*"; }',
         'declare -A KEY=([p]=kp) NAME=([p]=np) INPUTS', 'EXPECTED="$HOME/expected" HUMAN=UH EVENT_WAIT_S=30',
-        declaration(test46, 'accepted'), 'accepted p CX 1.5 thread "the text" 1.0', 'printf "expected: %s\\n" "$(cat "$EXPECTED")"',
+        declaration(recovery, 'accepted'), 'accepted p CX 1.5 thread "the text" 1.0', 'printf "expected: %s\\n" "$(cat "$EXPECTED")"',
       ].join('\n')
       const run = shell(program)
       // wait_until itself, given the same step, timeout and predicate.
@@ -1838,13 +1842,13 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
         expect(run.stdout).toBe(reference.stdout + 'observe p CX 1.5 thread\n')
       }
     })
-  test('test-46 retain declares every channel the input lists for the persona, as written, and fails on none', () => {
+  test('recovery retain declares every channel the input lists for the persona, as written, and fails on none', () => {
     const config = JSON.stringify({ personas: [
       { name: 'p', channels: [{ id: 'CA', delivery: 'all' }, { id: 'CB', delivery: 'thread_hybrid' }, { id: 'CN', delivery: 'mentions' }] },
       { name: 'q', channels: [{ id: 'CA', delivery: 'off' }] },
       { name: 'r', channels: [] },
     ] })
-    const program = (name: string) => ['CONFIG="$HOME/config.json"', declaration(test46, 'retain'), `retain ${name}`, 'printf "%s\\n" "${RETAIN[@]}"'].join('\n')
+    const program = (name: string) => ['CONFIG="$HOME/config.json"', declaration(recovery, 'retain'), `retain ${name}`, 'printf "%s\\n" "${RETAIN[@]}"'].join('\n')
     const run = shell(program('p'), { 'config.json': config })
     expect({ status: run.status, stdout: run.stdout, stderr: run.stderr }).toEqual({ status: 0, stderr: '', stdout: 'p/CA/all\np/CB/thread_hybrid\np/CN/mentions\n' })
     for (const name of ['r', 'absent']) {
@@ -1852,14 +1856,14 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       expect({ status: none.status, stdout: none.stdout, stderr: none.stderr }).toEqual({ status: 1, stdout: '', stderr: `no configured channel to retain for ${name}\n` })
     }
   })
-  // test-46's real pending_post and lose_post build the faults through
+  // The recovery helper's real pending_post and lose_post build the faults through
   // scenario.sh's real control helpers; pending_post's other steps are
   // stand-ins. The real stub answers a real Web client with the production
   // long-lived options, only its per-attempt timeout and retry spacing
   // shortened (one retry): the library retries a timed-out attempt as a new
   // chat.postMessage, as it does after PERSONA_WEB_API_REQUEST_TIMEOUT_MS.
   test.each([[true, ''], [false, ''], [true, '100']] as const)(
-    'test-46 lose_post holds the Web client\'s retry of a lost post unperformed, so only the first attempt can settle it: performed=%p delay=%p', async (performed, delay) => {
+    'recovery lose_post holds the Web client\'s retry of a lost post unperformed, so only the first attempt can settle it: performed=%p delay=%p', async (performed, delay) => {
       const options = longLivedWebClientOptions()
       expect([options.timeout, 'retryConfig' in options]).toEqual([PERSONA_WEB_API_REQUEST_TIMEOUT_MS, false])
       const channel = 'C0LOSTPOST01', stamp = '{"incarnation":"i1","threadHybridSince":"t1"}'
@@ -1873,7 +1877,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
         'wait_until() { :; }', `record_after() { echo '[{"performed":${performed},"response_ts":"9.1"}]'; }`,
         `shared_persona_facts() { echo '{"incarnation":"i1","assignments":{"${channel}":{"threadHybridSince":"t1"}}}'; }`, 'shared_wait_own_post_state() { :; }',
         'declare -A LABEL=([p]=p) KEY=([p]=p) WORK=([p]=/w)', 'declare -a EXTRA_CHANNELS=()', 'A=CA B=CB NOTICE=CN EVIDENCE="$HOME" SCENARIO_SLACK_CONTROL="$HOME/control.json"',
-        declaration(test46, 'lose_post'), declaration(test46, 'pending_post'), `pending_post lost ${performed} ${delay}`, 'cat "$SCENARIO_SLACK_CONTROL"',
+        declaration(recovery, 'lose_post'), declaration(recovery, 'pending_post'), `pending_post lost ${performed} ${delay}`, 'cat "$SCENARIO_SLACK_CONTROL"',
       ].join('\n'), { 'control.json': JSON.stringify({ tokens: [{ label: 'p', suffix: 'lostp', auth: 'ok', connections: 'ok' }] }) + '\n' })
       expect({ status: built.status, stderr: built.stderr }).toEqual({ status: 0, stderr: '' })
       mkdirSync('/tmp/c9', { recursive: true })
@@ -1914,41 +1918,41 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
         finally { rmSync(root, { recursive: true, force: true }) }
       }
     })
-  test('test-46 confirmed-unsaved\'s held answer comes 5 s inside the Web client\'s per-attempt timeout', () => {
-    const delay = Number(/^pending_post confirmed-unsaved true (\d+)$/m.exec(test46)?.[1])
+  test('test-67 confirmed-unsaved\'s held answer comes 5 s inside the Web client\'s per-attempt timeout', () => {
+    const delay = Number(/^pending_post confirmed-unsaved true (\d+)$/m.exec(identityRecovery)?.[1])
     expect(delay + 5000).toBeLessThanOrEqual(PERSONA_WEB_API_REQUEST_TIMEOUT_MS)
   })
   // The production lookup judges the situation Phase 13 builds: its live post,
   // with no parent, is P's only own message in range, and the behind-post
   // mention and broadcast joined its root. `found` records joined; `none`
   // and `lost` record none.
-  test('test-46 Phase 13 expects the production lookup\'s outcome for its mention-joined live post: none, with the thread still joined', () => {
+  test('test-66 Phase 13 expects the production lookup\'s outcome for its mention-joined live post: none, with the thread still joined', () => {
     const post = { ts: '1794561089.000002', digests: ['digest'], fileIds: [] }
     const judged = (joined: boolean) => judgeOwnPostLookup({ digest: 'digest', hasParent: false, own: [post], leftOut: ts => joined && ts === post.ts })
     expect(judged(false)).toEqual({ kind: 'found', ts: post.ts, holds: 'thread' })
     expect(judged(true)).toEqual({ kind: 'none', holds: 'none' })
-    const fifo = block(test46, 'for route in all dm mention broadcast; do', 'inject_sender=')
+    const fifo = block(ownPostRecovery, 'for route in all dm mention broadcast; do', 'inject_sender=')
     for (const route of ['mention', 'broadcast']) expect(fifo).toContain(route + ') channel="${OP_CHANNEL}"; parent="${OP_ROOT}"; via=' + route + ';')
-    const restart = block(test46, "'restarted manual FIFO worker did not reconnect'", "'ordinary FIFO worker did not reconnect'")
+    const restart = block(ownPostRecovery, "'restarted manual FIFO worker did not reconnect'", "'ordinary FIFO worker did not reconnect'")
     expect(restart).toContain('shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" none')
     expect(restart).not.toContain('"${OP_STAMP}" joined')
     expect(restart).toContain('root_saved p "${OP_CHANNEL}" "${OP_ROOT}" || fail')
   })
-  // test-46's real newest_first against the production lookup's lost-join
+  // test-66's real newest_first against the production lookup's lost-join
   // threads, read from a history page ordered as the stub and Slack order it
   // (by numeric ts, newest first), whichever of Phase 18's two roots is newer.
   test.each([
     ['the seeded root is newer in the same second', '1794572342.001409', '1794572342.989009'],
     ['the post is newer in the same second', '1794572342.001409', '1794572342.000500'],
     ['the seeded root is a second later', '1794572342.989009', '1794572343.000100'],
-  ] as const)('test-46 Phase 18 lists its lost roots in the lookup\'s history order: %s', (_name, opRoot, secondRoot) => {
+  ] as const)('test-66 Phase 18 lists its lost roots in the lookup\'s history order: %s', (_name, opRoot, secondRoot) => {
     const history = [opRoot, secondRoot].sort((a, b) => Number(b) - Number(a))
     const judged = judgeOwnPostLookup({ digest: 'digest', hasParent: false, leftOut: () => false,
       own: history.map(ts => ({ ts, digests: ['digest'], fileIds: [] })) })
     expect(judged).toEqual({ kind: 'lost', reason: 'several', holds: 'none', threads: history })
-    const run = shell([declaration(test46, 'newest_first'), `newest_first ${opRoot} ${secondRoot}`].join('\n'))
+    const run = shell([declaration(ownPostRecovery, 'newest_first'), `newest_first ${opRoot} ${secondRoot}`].join('\n'))
     expect({ status: run.status, stdout: run.stdout, stderr: run.stderr }).toEqual({ status: 0, stdout: history.join(',') + '\n', stderr: '' })
-    const phase = block(test46, 'pending_post ambiguous true', 'for root in "${OP_ROOT}" "${second_root}"; do')
+    const phase = block(ownPostRecovery, 'pending_post ambiguous true', 'for root in "${OP_ROOT}" "${second_root}"; do')
     expect(phase).toContain('lost_roots="$(newest_first "${OP_ROOT}" "${second_root}")"')
     expect(phase.match(/"\$\{lost_roots\}" several/g)).toHaveLength(3)
     expect(phase).not.toContain('"${OP_ROOT},${second_root}"')
@@ -4198,7 +4202,7 @@ globalThis.fetch = async (_url, init) => {
   return Response.json({ok:true,envelope_id:id});
 };
 `))
-  test('config adds the diagnostic timing switch only for its timings opt-in, which only test-44\'s burst case passes', () => withCLI(root => {
+  test('config adds the diagnostic timing switch only for its timings opt-in, which only test-44\'s diagnostic burst case passes', () => withCLI(root => {
     const dir = join(root, 'tests/integration/fixtures')
     writeFileSync(join(dir, 'fmk-texts.ts'), `console.log(${JSON.stringify({ TEST_MEASUREMENTS_KEY, TEST_MEASUREMENT_TIMINGS_KEY,
       testTimerOverridesBlock: '{"queue_compact_interval_ms":250}' })}[process.argv[2]]);`)
@@ -4210,10 +4214,12 @@ globalThis.fetch = async (_url, init) => {
     expect(off[TEST_MEASUREMENTS_KEY]).toBe(true); expect(Object.hasOwn(off, TEST_MEASUREMENT_TIMINGS_KEY)).toBe(false)
     expect(on).toEqual({ ...off, [TEST_MEASUREMENT_TIMINGS_KEY]: true })
     expect(config('other').status).not.toBe(0); expect(config('timings', 'timings').status).not.toBe(0)
-    // Scripts 32/45/48 reach config through the shared libs with six arguments; only test-44's burst case adds the opt-in.
+    // The other scripts reach config through shared libs with six arguments;
+    // only test-44's diagnostic burst case adds the opt-in. Executable switch
+    // controls live with the profile lifecycle controls in cpu-profile.test.ts.
     const shells = (readdirSync(integration, { recursive: true }) as string[]).filter(f => f.endsWith('.sh'))
     expect(shells.filter(f => /\(timings\)|\bconfig\b.*\btimings\b/.test(source(f)))).toEqual(['test-44-fmk-thread-burst.sh'])
-    expect(source('test-44-fmk-thread-burst.sh')).toContain('if [[ "${CASE}" == burst ]]; then\n    # The server\'s diagnostic ack/append/save rows, read only by observe below.\n    config_args+=(timings)\nfi\nbun "${SR8}" config "${config_args[@]}" | write_config\n')
+    expect(source('test-44-fmk-thread-burst.sh')).toContain('if [[ "${CSCB_TEST_DIAGNOSTICS:-}" == 1 && "${CASE}" == burst ]]; then\n    # The server\'s diagnostic ack/append/save rows, read only by observe below.\n    config_args+=(timings)\nfi\nbun "${SR8}" config "${config_args[@]}" | write_config\n')
   }))
 })
 

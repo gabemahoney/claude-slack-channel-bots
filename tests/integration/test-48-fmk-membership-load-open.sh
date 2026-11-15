@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ci-requires: test-1
-# AC-C06: open mode, two reopened 100,000-join personas, real socket ACKs.
-# All membership/lookup cases and verdicts share lib/membership-load.sh.
+# AC-C06: open first/later hang, two reopened 100,000-join personas, real socket ACKs.
+# Selected cases and verdicts share lib/membership-load.sh.
 # Native-agent N2/N3/N4 evidence remains the separate test-32 thread phase.
 set -euo pipefail
 TEST_NAME="test-48-fmk-membership-load-open"
@@ -10,7 +10,7 @@ source "$(dirname "$0")/lib/scenario.sh"
 # shellcheck source=lib/membership-load.sh
 source "$(dirname "$0")/lib/membership-load.sh"
 STARTED="$(date +%s)"
-run_membership_load open
+run_membership_load open hang
 assert_no_server_tmux
 assert_no_cscb_include_finished
 assert_no_cscb_delete

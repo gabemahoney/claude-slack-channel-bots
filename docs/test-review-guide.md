@@ -53,7 +53,28 @@ For every script whose `TEST_NAME` carries `-fmk-` (see `tests/README.md`'s "Rul
 - [ ] No fixture, driver or script calls agent-director's `delete`; the one `delete` under `tests/integration` is scenario 25's `ad_delete_unusable_row`, run from the scenario's own shell, and `tests/host-safety.test.ts` audits that statically. At run time `assert_no_cscb_delete` fails any `delete` whose parent is not the scenario's own shell or a subshell of it, a CSCB process the record does not hold included
 - [ ] A wait for a dialog CSCB's approver answers reads the stub's record of the dialogs it printed (`stub_shown_dialogs`), not the pane alone: the stub clears an answered dialog, so a pane-only poll can miss one shown and answered between two reads. A pane-only wait for such a dialog is a defect; `tests/fmk-launch-pending-dialog-wait.test.ts` checks test-17's waits for the dev-channels dialog
 - [ ] A check that no row was deleted reads the row afterwards (present, in any state); a scenario runs at agent-director's default settings unless it is scenario 10, 20 or 24 (or Test 0's documented `[tmux]` table), and CSCB's timings change only through its configuration and the package's exported seams
-- [ ] Only scenarios 20 (`test-23-fmk-latch-recheck.sh`) and 24 (`test-26-fmk-timing-settings.sh`) write the test-only `test_timer_overrides` block; every other scenario runs CSCB's production timers. Such a scenario prints each timer value through `fixtures/fmk-texts.ts` (never retyped), requires the one `TEST TIMER OVERRIDES ACTIVE` line after every start, and leaves at its default a timer an assertion depends on
+- [ ] Audit every direct and helper-backed `test_timer_overrides` writer. The current entrypoints are:
+  `test-23-fmk-latch-recheck.sh`, `test-26-fmk-timing-settings.sh`,
+  `test-32-fmk-real-order.sh` (through `lib/real-scenario.sh` and `fixtures/sr8-evidence.ts`),
+  `test-44-fmk-thread-burst.sh` (through `fixtures/sr8-evidence.ts`),
+  `tests/real-agent/test-101-fmk-real-busy.sh`, and these membership entrypoints through
+  `lib/membership-load.sh` and `fixtures/sr8-evidence.ts`:
+  `test-45-fmk-membership-load.sh`, `test-48-fmk-membership-load-open.sh`,
+  `test-51-fmk-membership-load-transient.sh`, `test-52-fmk-membership-load-rate.sh`,
+  `test-53-fmk-membership-load-scope.sh`, `test-54-fmk-membership-load-denied.sh`,
+  `test-55-fmk-membership-load-late.sh`, `test-56-fmk-membership-load-lookup.sh`,
+  `test-57-fmk-membership-load-undurable.sh`, `test-58-fmk-membership-load-open-transient.sh`,
+  `test-59-fmk-membership-load-open-rate.sh`, `test-60-fmk-membership-load-open-scope.sh`,
+  `test-61-fmk-membership-load-open-denied.sh`, `test-62-fmk-membership-load-open-late.sh`,
+  `test-63-fmk-membership-load-open-lookup.sh`, `test-64-fmk-membership-load-open-undurable.sh`.
+  Recovery 46/65/66/67 writes none. Recheck the tree for additional writers;
+  all others use production timers. Print values through `fixtures/fmk-texts.ts`,
+  require exactly one matching `TEST TIMER OVERRIDES ACTIVE` line after every
+  start with a nonempty block, and read overrides only at startup (restart
+  after changing them). Set `unavailable_retry_base_s` and
+  `unavailable_retry_ceiling_s` together, ceiling at least base. Leave any
+  timer whose actual duration is asserted at its production value; Test 32
+  explicitly writes the production `queue_compact_interval_ms` value.
 
 ### Patterns
 - [ ] Factory functions used for fixtures (not inline object literals)

@@ -2198,11 +2198,11 @@ test('a short or failed queue evidence read names its stage, errno and partial c
   }
 }))
 
-// test-46's two recovery requests, read from the script with its TEST_NAME
+// test-67's two recovery requests, read from the script with its TEST_NAME
 // expanded, through the real printer and the installed parser. The colon
 // form scenario_attempt_id prints is not a review ID.
-test('test-46 builds its recovery requests with review IDs: the printer accepts them and refuses the attempt-ID colon form', () => sharedPrinterControl(async ({ scratch, printer }) => {
-  const script = readFileSync(join(REPO_ROOT, 'tests/integration/test-46-shared-channel-recovery.sh'), 'utf8')
+test('test-67 builds its recovery requests with review IDs: the printer accepts them and refuses the attempt-ID colon form', () => sharedPrinterControl(async ({ scratch, printer }) => {
+  const script = readFileSync(join(REPO_ROOT, 'tests/integration/test-67-shared-channel-recovery-identity-repair.sh'), 'utf8')
   const testName = /^TEST_NAME="([^"]+)"$/m.exec(script)![1]!
   const ids = [...script.matchAll(/^configuration_recovery_request "([^"]+)"/gm)].map(m => m[1]!.replace('${TEST_NAME}', testName))
   expect(ids).toEqual([`${testName}-owned-restoration`, `${testName}-cold-replacement`])
@@ -2221,7 +2221,7 @@ test('test-46 builds its recovery requests with review IDs: the printer accepts 
   }
 }))
 
-// test-46's closing accounting (MI answers46): message-received is logged once
+// The recovery helper's closing accounting (MI answers46): message-received is logged once
 // per server run, so an item still queued at a stop is logged again when the
 // next start recovers it. Runs split on the production start line.
 test('per-server-run accounting keeps the exact sets and allows a repeat only in a later server run', () => sharedPrinterControl(async ({ scratch, pkg, printer: { entryValue: print }, evidence }) => {
@@ -2286,11 +2286,12 @@ test('per-server-run accounting keeps the exact sets and allows a repeat only in
   } finally { await q.stop() }
 }))
 
-// test-46's closing content check (MI answers47 Q1): a reply the next start
+// test-66's closing content check (MI answers47 Q1): a reply the next start
 // releases from a Post Hold is fixed before p's client serves, so its tag
 // keeps the documented ID fallback; every other input expects the names.
-test('test-46 expects the ID fallback for exactly the replies a restart releases from a Post Hold', () => sharedPrinterControl(async ({ scratch, pkg, printer: { entryValue: print } }) => {
-  const script = readFileSync(join(REPO_ROOT, 'tests/integration/test-46-shared-channel-recovery.sh'), 'utf8')
+test('test-66 expects the ID fallback for exactly the replies a restart releases from a Post Hold', () => sharedPrinterControl(async ({ scratch, pkg, printer: { entryValue: print } }) => {
+  const script = readFileSync(join(REPO_ROOT, 'tests/integration/test-66-shared-channel-recovery-own-post.sh'), 'utf8')
+  const helper = readFileSync(join(REPO_ROOT, 'tests/integration/lib/shared-channel-recovery.sh'), 'utf8')
   // Phase 12's and Phase 15's held replies are marked; Phase 13's live hold is released while p serves.
   const lines = script.split('\n')
   const holds = lines.flatMap((line, i) => {
@@ -2300,7 +2301,7 @@ test('test-46 expects the ID fallback for exactly the replies a restart releases
   expect(holds).toEqual([['recovered-${performed}', true], ['live-hold', false], ['leave-${boundary}', true]])
   expect(lines.filter(line => line.trim() === 'released_at_start')).toHaveLength(2)
   // The real marking and name selection, with only the stub's name lookup replaced.
-  const fn = (name: string) => new RegExp(`^${name}\\(\\) \\{.*\\}$|^${name}\\(\\) \\{\\n[\\s\\S]*?\\n\\}$`, 'm').exec(script)![0]
+  const fn = (name: string) => new RegExp(`^${name}\\(\\) \\{.*\\}$|^${name}\\(\\) \\{\\n[\\s\\S]*?\\n\\}$`, 'm').exec(helper)![0]
   const home = mkdtempSync(join(scratch, 'home-'))
   const result = spawnSync('bash', ['-c', [
     'set -euo pipefail', 'declare -A RESTART_RELEASED', 'HUMAN=U0HUMAN01',
@@ -2333,7 +2334,7 @@ test('test-46 expects the ID fallback for exactly the replies a restart releases
       JSON.parse(await print('sharedExpectedParts', [text, ts, 'U0HUMAN01', user, 'C0POST001', channelName, 'thread', root, '-']))
     const [user, channelName] = result.stdout.split('\n')[0]!.split('\t')
     expect(fixed).toEqual(await expected(user!, channelName!))
-    // The names test-46 expected for these replies before answers47 differ.
+    // The names test-66 expected for these replies before answers47 differ.
     expect(fixed).not.toEqual(await expected('user-name', 'channel-name'))
   } finally { await preparation.stop(); await queue.stop() }
 }))

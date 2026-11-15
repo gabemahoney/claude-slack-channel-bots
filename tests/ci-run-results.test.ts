@@ -32,6 +32,8 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { CODEX_LOGIN_TARGET } from '../scripts/codex-login.ts'
+import { decideReport, judgeVerdict, REPORT_EXIT_SELECTIVE_PASS, secretMask } from '../scripts/ci-verdict.ts'
 
 import {
   atomicTempFileName,
@@ -124,6 +126,16 @@ function newRunDir(): string {
 /** The repository's first three real script file names, test-1 first, looked up when a case runs. */
 function scripts(): [string, string, string] {
   return [realScriptFileName(1), realScriptFileName(2), realScriptFileName(3)]
+}
+
+/** Independent of the classifier: the entrypoints that invoke the driver directly or through its membership helper. */
+function actualDriverScripts(): string[] {
+  const dir = join(import.meta.dir, 'integration')
+  return readdirSync(dir).filter((name) => {
+    if (!/^test-\d+-.*\.sh$/.test(name)) return false
+    const text = readFileSync(join(dir, name), 'utf8')
+    return text.includes('bash "${BURST_DRIVER}"') || text.includes('lib/membership-load.sh')
+  }).sort()
 }
 
 function startEvent(fileName: string): ResultEvent {
@@ -987,7 +999,7 @@ describe('shard management: shard containers (to)', () => {
       }
     })
 
-    test.each(['test-44-fmk-thread-burst.sh', 'test-45-fmk-membership-load.sh', 'test-48-fmk-membership-load-open.sh'])(
+    test.each(actualDriverScripts())(
       'a shard holding %s takes the driver’s CPU beside the server’s, docker-init, a private cgroup namespace and writable cgroups, and nothing else more',
       async (script) => {
         const rig = shardRig()
@@ -1012,19 +1024,36 @@ describe('shard management: shard containers (to)', () => {
       },
     )
 
-    test('the burst-driver scripts are exactly the integration scripts that run burst-driver.sh, test-44, test-45 and test-48', () => {
+    test('the burst-driver classifier agrees with every actual direct or helper-backed driver entrypoint', () => {
       const dir = join(import.meta.dir, 'integration')
       const membership = readFileSync(join(dir, 'lib', 'membership-load.sh'), 'utf8')
       expect(membership).toContain('bash "${BURST_DRIVER}"')
       const scripts = readdirSync(dir).filter((name) => /^test-\d+-.*\.sh$/.test(name))
-      const driving = scripts.filter((name) => {
-        const text = readFileSync(join(dir, name), 'utf8')
-        return text.includes('bash "${BURST_DRIVER}"') || text.includes('lib/membership-load.sh')
-      })
-      expect(driving.sort()).toEqual(['test-44-fmk-thread-burst.sh', 'test-45-fmk-membership-load.sh', 'test-48-fmk-membership-load-open.sh'])
+      const driving = actualDriverScripts()
+      expect(driving).toEqual(expect.arrayContaining([realScriptFileName(44), realScriptFileName(45), realScriptFileName(48)]))
       expect(scripts.filter(e9.isBurstDriverScript).sort()).toEqual(driving)
       expect(e9.shardCpus(['test-1-install-startup.sh', ...driving])).toBe(e9.CPUS_PER_SHARD + e9.DRIVER_CPUS)
       expect(e9.shardCpus(scripts.filter((name) => !driving.includes(name)))).toBe(e9.CPUS_PER_SHARD)
+    })
+
+    test('several driver workloads sharing a shard add their CPU and cgroup options only once', async () => {
+      const rig = shardRig()
+      expect((await rig.start(1, { assignment: { shard: 1, assigned: [realScriptFileName(1), ...actualDriverScripts()] } })).start.kind).toBe('started')
+      const [argv] = rig.runs()
+      expect(valuesOf(argv!, '--cpus')).toEqual([String(e9.CPUS_PER_SHARD + e9.DRIVER_CPUS)])
+      expect(valuesOf(argv!, '--cgroupns')).toEqual(['private'])
+      expect(valuesOf(argv!, '--security-opt')).toEqual([e9.DRIVER_SHARD_SECURITY_OPT])
+      expect(argv!.filter(arg => arg === '--init')).toEqual(['--init'])
+    })
+
+    test.each([2, 13, 31, 32, 46, 65, 66, 67])('ordinary/ACK/model/recovery test-%s keeps ordinary shard resources', async number => {
+      const rig = shardRig()
+      const fileName = realScriptFileName(number)
+      expect(e9.isBurstDriverScript(fileName)).toBe(false)
+      expect((await rig.start(1, { assignment: { shard: 1, assigned: [realScriptFileName(1), fileName] } })).start.kind).toBe('started')
+      const [argv] = rig.runs()
+      expect(valuesOf(argv!, '--cpus')).toEqual([String(e9.CPUS_PER_SHARD)])
+      expect(argv!.filter(arg => /^--(?:init|cgroupns|security-opt)(?:=|$)/.test(arg))).toEqual([])
     })
 
     test.each([
@@ -1142,6 +1171,52 @@ describe('shard management: shard containers (to)', () => {
   // --- .S2: credentials by bare name and the argument-list check ---
 
   describe('credentials by bare name and the argument-list check', () => {
+    test.each([
+      ['absent', undefined], ['empty', ''], ['zero', '0'], ['other', 'true'], ['padded one', '01'], ['enabled', '1'],
+    ] as const)('diagnostics %s survives actual shard-child forwarding without a default or a value in argv', async (_label, value) => {
+      for (const credentials of [RAW_KEY_ENV, { ...GATEWAY_ENV, CI_ANTHROPIC_API_KEY: SECRETS.key, CI_ANTHROPIC_BASE_URL: '' }]) {
+        const env: Record<string, string> = { ...credentials, ...(value === undefined ? {} : { CSCB_TEST_DIAGNOSTICS: value }) }
+        const original = { ...env }
+        const rig = shardRig({ env })
+        // Every profile-capable script, an ordinary recovery script, and a dedicated Codex shard.
+        for (const [index, number] of [32, 44, 45, 65].entries()) {
+          const shard = index + 1
+          expect((await rig.start(shard, { assignment: { shard, assigned: [realScriptFileName(1), realScriptFileName(number)] } })).start.kind).toBe('started')
+        }
+        const projection = JSON.stringify({ version: 1, keys: [['model']] })
+        expect((await rig.start(5, {
+          assignment: { shard: 5, assigned: [realScriptFileName(1), 'test-999-fmk-real-codex.sh'] },
+          codexLoginSource: join(root, 'fake-login.json'), codexModel: 'test/model:1', codexHostConfigKeys: projection,
+        })).start.kind).toBe('started')
+        const spawns = runSpawns(rig)
+        expect(spawns).toHaveLength(5)
+        for (const [index, spawn] of spawns.entries()) {
+          const codex = index === 4
+          const expectedEnv: Record<string, string> = { ...e9.childEnvironment(env), CODEX_TEST_MODEL: codex ? 'test/model:1' : '', CODEX_HOST_CONFIG_KEYS: codex ? projection : '' }
+          if (env.CI_ANTHROPIC_API_KEY !== undefined) {
+            for (const name of ['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL']) delete expectedEnv[name]
+          }
+          expect(spawn.env).toEqual(expectedEnv)
+          expect(Object.hasOwn(spawn.env, 'CSCB_TEST_DIAGNOSTICS')).toBe(value !== undefined)
+          expect(spawn.env.CSCB_TEST_DIAGNOSTICS === value).toBe(true)
+          const names = valuesOf(spawn.argv, '--env')
+          expect(names.filter(name => name === 'CSCB_TEST_DIAGNOSTICS')).toEqual(value === undefined ? [] : ['CSCB_TEST_DIAGNOSTICS'])
+          expect(names.filter(name => name !== 'CSCB_TEST_DIAGNOSTICS')).toEqual(
+            env.CI_ANTHROPIC_API_KEY === undefined
+              ? ['ANTHROPIC_API_KEY', 'CODEX_TEST_MODEL', 'CODEX_HOST_CONFIG_KEYS']
+              : ['CI_ANTHROPIC_API_KEY', 'CI_ANTHROPIC_BASE_URL', 'CODEX_TEST_MODEL', 'CODEX_HOST_CONFIG_KEYS'],
+          )
+          expect(spawn.argv.some(arg => arg.includes('CSCB_TEST_DIAGNOSTICS='))).toBe(false)
+          expect(e9.checkShardRunList(spawn.argv, rig.secretValues)).toEqual({ ok: true })
+          // The diagnostic switch adds no resource, credential or login mount option.
+          const assigned = codex ? [realScriptFileName(1), 'test-999-fmk-real-codex.sh'] : [realScriptFileName(1), realScriptFileName([32, 44, 45, 65][index]!)]
+          expect(valuesOf(spawn.argv, '--cpus')).toEqual([String(e9.shardCpus(assigned))])
+          expect(valuesOf(spawn.argv, '--mount').filter(mount => mount.includes(CODEX_LOGIN_TARGET))).toHaveLength(codex ? 1 : 0)
+        }
+        expect(env).toEqual(original)
+      }
+    })
+
     test.each(['CI family', 'native family'] as const)('%s forwards only defined child environment names, preserving explicit empty values', async family => {
       const ci = family === 'CI family'
       const env = ci
@@ -2297,6 +2372,29 @@ describe('result rendering: outcomes, verdict and results ()', () => {
         expected: [script(3), script(0), script(2), script(1)],
       })
       expect(verdictOf(run)).toBe(`${selectivePrefixOf([1, 2, 3, 0])}${e10.PASS_VERDICT}`)
+    })
+
+    test('a complete scheduler lane, each local workload, and even an explicit whole-list selection remain SELECTIVE through reader exit 3', () => {
+      const workloads = resultHelpers.realScriptFileNames().filter(file => file !== script(1))
+      const local = workloads.filter(file => file.includes('-fmk-real-') || e10.isBurstDriverScript(file))
+      const scheduler = workloads.filter(file => !local.includes(file))
+      const runDir = newRunDir()
+      for (const selected of [scheduler, ...local.map(file => [file]), workloads]) {
+        const assigned = e10.sortCanonical([script(1), ...selected])
+        const run = decideRun({ args: selected, shards: [passingShard(1, assigned)] })
+        expect(run.passed).toBe(true)
+        expect(e10.isGateEligible(run.invocation)).toBe(false)
+        const line = verdictOf(run)
+        expect(line).toBe(`${e10.selectiveVerdictPrefix(assigned)}${e10.PASS_VERDICT}`)
+        const verdict = { kind: 'line' as const, line }
+        const report = decideReport({
+          files: { runDir, runDirExists: true, verdict, status: null, timingSummary: ['synthetic timing summary'], logTail: [] },
+          judgement: judgeVerdict(selected, verdict), grace: { kind: 'none' }, runnerPid: RUNNER_PID, pidArgument: String(RUNNER_PID),
+        }, secretMask([]))
+        expect(report).toMatchObject({ outcome: 'selective-pass', exitCode: REPORT_EXIT_SELECTIVE_PASS })
+        expect(report.exitCode).toBe(3)
+        shardCredentials.assertNoLeak({ run, line, report })
+      }
     })
 
     test.each([

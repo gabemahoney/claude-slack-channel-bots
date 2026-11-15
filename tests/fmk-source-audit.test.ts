@@ -3165,7 +3165,7 @@ sleep() {
 ${declarations}
 ${command}`], {
       stdin: 'pipe', stdout: 'pipe', stderr: 'pipe', timeout: 5000,
-      env: hostSafeChildEnv(root, { tools: ['cat', 'jq', 'realpath', 'sha256sum', 'cut', 'grep'], extras: { FIXTURE_ROOT: root, ...extras } }),
+      env: hostSafeChildEnv(root, { tools: ['cat', 'jq', 'python3', 'realpath', 'sha256sum', 'cut', 'grep'], extras: { FIXTURE_ROOT: root, ...extras } }),
     })
     // Every file the exchange wrote, arguments files included, by name and content.
     const written = () => Object.fromEntries(readdirSync(join(root, 'stub')).filter(p => p !== 'stub-mcp-session.ts')
@@ -3287,7 +3287,7 @@ ${command}`], {
     expect(result.responses).toEqual([{ id: expect.any(String), isError: true, text: '', error: 'Error: fixture listing failure' }])
   })
 
-  // test-46 Phase 19's reply: two parts that exceed the default reply chunk
+  // test-67 Phase 19's reply: two parts that exceed the default reply chunk
   // limit together, too long for one request line.
   const longReply = { chat_id: 'C0CHUNK0001', text: `${'abcdefgh'.repeat(375)}\n${'ijklmnop'.repeat(375)}` }
   test('an oversized inline tool request is still refused before anything is written, and the refusal never quotes its arguments', async () => {
@@ -3298,13 +3298,42 @@ ${command}`], {
     expect(result.requests).toEqual([]); expect(result.files).toEqual({})
   })
 
-  test('test-46 Phase 19\'s 6,001-character reply reaches the tool whole through its arguments file, on a request line within the bound', async () => {
+  test('test-67 Phase 19\'s 6,001-character reply reaches the tool whole through its arguments file, on a request line within the bound', async () => {
     expect(longReply.text).toHaveLength(6001)
+    const recovery = readFileSync(join(import.meta.dir, 'integration/test-67-shared-channel-recovery-identity-repair.sh'), 'utf8')
+    const helper = readFileSync(join(import.meta.dir, 'integration/lib/shared-channel-recovery.sh'), 'utf8')
+    const between = (text: string, from: string, to: string) => {
+      const start = text.indexOf(from), end = text.indexOf(to, start)
+      if (start < 0 || end < 0) throw new Error(`missing chunk scenario block: ${from}`)
+      return text.slice(start, end)
+    }
+    const { parsePersonaConfigBytes } = await import('../src/config.ts')
+    const { chunkText } = await import('../src/lib.ts')
+    const home = mkdtempSync(join(tmpdir(), 'recovery-chunk-config-'))
+    let settings: ReturnType<typeof parsePersonaConfigBytes>
+    try {
+      mkdirSync(join(home, 'p')); mkdirSync(join(home, 'q'))
+      const config = spawnSync('bash', ['-euc', [
+        'declare -A NAME=([p]=alpha [q]=bravo) CREDS=([p]="$HOME/p.json" [q]="$HOME/q.json") WORK=([p]="$HOME/p" [q]="$HOME/q")',
+        'A=C0ALL001 B=C0HYBRID1 NOTICE=C0NOTICE1 CONTACT=U0CONTACT SCENARIO_PORT=4100 MCP_CONFIG="$HOME/mcp.json"',
+        'write_config() { cat; }', between(helper, 'write_config <<EOF', '\n\n# These helpers'),
+      ].join('\n')], { encoding: 'utf8', timeout: 5000, env: hostSafeChildEnv(home, { tools: ['bash', 'cat'] }) })
+      assertNoLeak({ stdout: config.stdout, stderr: config.stderr })
+      expect(config.error).toBeUndefined(); expect({ status: config.status, stderr: config.stderr }).toEqual({ status: 0, stderr: '' })
+      settings = parsePersonaConfigBytes(config.stdout, join(home, 'config.json'), home, { home })
+    } finally { rmSync(home, { recursive: true, force: true }) }
     const calls: unknown[] = []
     const dispatch = fileDispatcher({ callTool: async (request: unknown) => {
+      const { arguments: args } = request as { arguments: typeof longReply }
+      expect(chunkText(args.text, settings.reply_chunk_limit, settings.reply_chunk_mode))
+        .toEqual([`${'abcdefgh'.repeat(375)}\n`, 'ijklmnop'.repeat(375)])
       calls.push(request); return { isError: false, content: [{ type: 'text', text: 'fixture result' }] }
     } })
-    const result = await exchange('stub_session_call "$ALPHA_DIR" reply "$CALL_ARGS" arguments-file', dispatch, { CALL_ARGS: JSON.stringify(longReply) })
+    const payload = between(recovery, 'first_chunk=', '\nslack_stub_post_fail ')
+    const call = between(recovery, 'result="$(stub_session_call ', '\nprintf ')
+    const result = await exchange([
+      'declare -A WORK=([p]="$ALPHA_DIR")', `chunk_channel=${longReply.chat_id}`, payload, call, 'printf "%s\\n" "$result"',
+    ].join('\n'), dispatch)
     expect(result.status).toBe(0); expect(result.errors).toEqual([])
     expect(result.requests).toEqual([{ id: expect.any(String), method: 'tools/call', tool: 'reply', arguments_file: expect.any(String) }])
     const request = result.requests[0] as { id: string; arguments_file: string }
@@ -3501,12 +3530,16 @@ ${latencyLoop(source)}
 
 describe('shared scenario consumer evidence boundaries', () => {
   const integration = join(import.meta.dir, 'integration')
-  const recovery = readFileSync(join(integration, 'test-46-shared-channel-recovery.sh'), 'utf8')
+  const recovery = {
+    helper: readFileSync(join(integration, 'lib/shared-channel-recovery.sh'), 'utf8'),
+    ownPost: readFileSync(join(integration, 'test-66-shared-channel-recovery-own-post.sh'), 'utf8'),
+    identity: readFileSync(join(integration, 'test-67-shared-channel-recovery-identity-repair.sh'), 'utf8'),
+  }
   const healthy = readFileSync(join(integration, 'test-29-invited-channels.sh'), 'utf8')
   const clean = (source: string) => source.replace(/\\\n\s*/g, ' ').split('\n')
     .filter(line => !line.trim().startsWith('#')).map(line => line.trim()).join('\n')
   const fn = (source: string, name: string) => source.match(new RegExp(`^${name}\\(\\) \\{\\n[\\s\\S]*?^\\}`, 'm'))?.[0] ?? ''
-  const ordered = (source: string, pieces: string[]) => {
+  const ordered = (source: string, pieces: readonly string[]) => {
     let offset = 0
     for (const piece of pieces) {
       const at = source.indexOf(piece, offset)
@@ -3515,8 +3548,9 @@ describe('shared scenario consumer evidence boundaries', () => {
     }
     return true
   }
-  function recoveryFindings(source: string): string[] {
-    const findings: string[] = [], pending = clean(fn(source, 'pending_post')), hold = clean(fn(source, 'post_hold')), all = clean(source)
+  function recoveryFindings(source: typeof recovery): string[] {
+    const findings: string[] = [], pending = clean(fn(source.helper, 'pending_post')), hold = clean(fn(source.helper, 'post_hold'))
+    const ownPost = clean(source.ownPost), identity = clean(source.identity)
     const exact = 'shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" unresolved'
     if (!ordered(pending, [
       'OP_STAMP="$(stamp p "${OP_CHANNEL}")"', 'before="$(shared_own_post_records',
@@ -3531,15 +3565,15 @@ describe('shared scenario consumer evidence boundaries', () => {
       exact + '  > "${EVIDENCE}/post-${case_name}-held-unresolved.json"',
     ])) findings.push('post hold lacks exact operation/stamp or unresolved observation')
     // Each composed crash first reaches the guarded pending_post declaration.
-    for (const pair of [
-      ['pending_post "recovered-${performed}" "${performed}"', 'post_hold "recovered-${performed}"'],
-      ['pending_post "lookup-${problem}" true'], ['pending_post stale-value true'],
-      ['pending_post ambiguous true'], ['pending_post "identity-${reset}" true'],
-    ]) {
+    for (const [all, pair] of [
+      [ownPost, ['pending_post "recovered-${performed}" "${performed}"', 'post_hold "recovered-${performed}"']],
+      [ownPost, ['pending_post "lookup-${problem}" true']], [ownPost, ['pending_post stale-value true']],
+      [ownPost, ['pending_post ambiguous true']], [identity, ['pending_post "identity-${reset}" true']],
+    ] as const) {
       const start = all.indexOf(pair[0]!), end = all.indexOf('\ncrash', start)
       if (start < 0 || end < 0 || !ordered(all.slice(start, end), pair)) findings.push('missing pending/crash boundary: ' + pair[0])
     }
-    const leave = all.slice(all.indexOf('for boundary in before after; do'), all.indexOf('pending_post stale-value true'))
+    const leave = ownPost.slice(ownPost.indexOf('for boundary in before after; do'), ownPost.indexOf('pending_post stale-value true'))
     if (!ordered(leave, [
       'pending_post "leave-${boundary}" true', 'post_hold "leave-${boundary}"',
       'old_channel="${OP_CHANNEL}"; old_stamp="${OP_STAMP}"',
@@ -3549,16 +3583,21 @@ describe('shared scenario consumer evidence boundaries', () => {
       'shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${old_channel}" "${old_stamp}" unresolved  > "${EVIDENCE}/leave-after-kill-historical-intent.json"',
       '\ncrash',
     ])) findings.push('leave boundary lacks historical exact observation')
-    for (const [start, target] of [
-      ['pending_post live-hold true', 'post-live-hold-after-receipts.json'],
-      ['pending_post confirmed-unsaved true 25000', 'confirmed-unsaved-before-kill.json'],
+    for (const [all, start, target] of [
+      [ownPost, 'pending_post live-hold true', 'post-live-hold-after-receipts.json'],
+      [identity, 'pending_post confirmed-unsaved true 25000', 'confirmed-unsaved-before-kill.json'],
     ]) {
       const begin = all.indexOf(start), end = all.indexOf('\ncrash', begin)
       const boundary = all.slice(begin, end)
       if (begin < 0 || end < 0 || !boundary.includes(exact) || !boundary.includes(target)) findings.push('missing fresh unresolved boundary: ' + target)
     }
-    const unresolved = all.split('\n').filter(line => line.startsWith('shared_wait_own_post_state ') && line.includes(' unresolved'))
+    const unresolved = clean([source.helper, source.ownPost, source.identity].join('\n')).split('\n')
+      .filter(line => line.startsWith('shared_wait_own_post_state ') && line.includes(' unresolved'))
     if (unresolved.length !== 6 || unresolved.some(line => /\|\||;|&&/.test(line))) findings.push('missing or ignored unresolved assertion')
+    if (!ordered(clean(fn(source.helper, 'recovery_finish')), [
+      'stop_server --stop-bots', 'for who in p q; do snapshot "${who}"; done',
+      'if (( $# > 1 )); then "$2"; fi', 'shared_assert_accounting --per-server-run ',
+    ]) || !/^recovery_finish 0 assert_chunk_posts$/m.test(source.identity)) findings.push('missing final stopped-worker chunk assertion')
     return findings
   }
   function healthyFindings(source: string): string[] {
@@ -3592,6 +3631,7 @@ describe('shared scenario consumer evidence boundaries', () => {
     ['recovery observer', 'recovery', 'shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" unresolved', ':'],
     ['recovery identity', 'recovery', 'OP_STAMP="$(stamp p "${OP_CHANNEL}")"', 'OP_STAMP=from-own-post'],
     ['historical leave stamp', 'recovery', '"${OP_ID}" "${old_channel}" "${old_stamp}" unresolved', '"${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" unresolved'],
+    ['final chunk assertion', 'recovery', 'recovery_finish 0 assert_chunk_posts', 'recovery_finish 0'],
     ['manual receipt boundary', 'healthy', 'RECEIPT_MODE["${key}"]=ordinary', ':'],
     ['independent input', 'healthy', 'EXPECTED_INPUTS["${identity}"]="${PUSHED_EVENTS[$2|$3]}"', 'EXPECTED_INPUTS["${identity}"]=queue'],
     ['early marker', 'healthy', '[[ "$(shared_thread_created "${THREAD_KEY}")" == false ]]', 'true'],
@@ -3603,15 +3643,31 @@ describe('shared scenario consumer evidence boundaries', () => {
     mkdirSync('/tmp/c9', { recursive: true })
     const root = mkdtempSync('/tmp/c9/consumer-audit-'), path = join(root, 'scenario.sh')
     try {
-      const source = kind === 'recovery' ? recovery : healthy
-      expect(source).toContain(needle!)
-      writeFileSync(path, source.replaceAll(needle!, replacement!))
-      const findings = (kind === 'recovery' ? recoveryFindings : healthyFindings)(readFileSync(path, 'utf8'))
+      let findings: string[]
+      if (kind === 'recovery') {
+        expect(Object.values(recovery).join('\n')).toContain(needle!)
+        const copy = { ...recovery }
+        for (const name of ['helper', 'ownPost', 'identity'] as const) {
+          const file = join(root, `${name}.sh`)
+          writeFileSync(file, copy[name].replaceAll(needle!, replacement!))
+          copy[name] = readFileSync(file, 'utf8')
+        }
+        findings = recoveryFindings(copy)
+      } else {
+        expect(healthy).toContain(needle!)
+        writeFileSync(path, healthy.replaceAll(needle!, replacement!))
+        findings = healthyFindings(readFileSync(path, 'utf8'))
+      }
       assertNoLeak(findings)
       expect(findings.length).toBeGreaterThan(0)
     } finally { rmSync(root, { recursive: true, force: true }) }
   })
-  test('unchanged CI discovery accepts recovery46 exactly once with no duplicate script number', async () => {
+  test.each([
+    'test-46-shared-channel-recovery.sh',
+    'test-65-shared-channel-recovery-membership-memory.sh',
+    'test-66-shared-channel-recovery-own-post.sh',
+    'test-67-shared-channel-recovery-identity-repair.sh',
+  ])('CI discovery selects %s by short and complete name with no duplicate script number', async fileName => {
     const ci = await import('../scripts/ci-run.ts')
     const entries = ci.readIntegrationEntries(join(import.meta.dir, '..'))
     expect(entries.ok).toBe(true)
@@ -3619,10 +3675,11 @@ describe('shared scenario consumer evidence boundaries', () => {
     expect(ci.checkScriptNames(entries.value)).toEqual([])
     expect(ci.checkDuplicateNumbers(entries.value)).toEqual([])
     const scripts = ci.scriptListOf(entries.value)
-    const selected = ci.matchScript('test-46', scripts)
-    expect(selected?.fileName).toBe('test-46-shared-channel-recovery.sh')
-    expect(ci.matchScript('test-46-shared-channel-recovery.sh', scripts)).toEqual(selected)
-    expect(ci.checkDuplicateNumbers([...entries.value, { name: 'test-46-duplicate.sh', kind: 'regular' }])).toHaveLength(1)
+    const shortName = fileName.match(/^test-\d+/)![0]
+    const selected = ci.matchScript(shortName, scripts)
+    expect(selected?.fileName).toBe(fileName)
+    expect(ci.matchScript(fileName, scripts)).toEqual(selected)
+    expect(ci.checkDuplicateNumbers([...entries.value, { name: `${shortName}-duplicate.sh`, kind: 'regular' }])).toHaveLength(1)
   })
 })
 

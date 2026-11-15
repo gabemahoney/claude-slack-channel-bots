@@ -640,8 +640,8 @@ export const CI_CPUS = 12
 export const CPUS_PER_SHARD = 2
 /** The extra CPU a burst-driver shard takes for its driver, beside the server's `CPUS_PER_SHARD`. */
 export const DRIVER_CPUS = 1
-/** The burst-driver scripts, tests 44, 45 and 48: their `sr8-evidence.ts` driver runs outside the server's CPU quota. */
-export const BURST_DRIVER_SCRIPTS = /-fmk-(?:thread-burst|membership-load(?:-open)?)\.sh$/
+/** Thread-burst and every membership-load group: their `sr8-evidence.ts` driver runs outside the server's CPU quota. */
+export const BURST_DRIVER_SCRIPTS = /-fmk-(?:thread-burst|membership-load(?:-[a-z0-9]+)*)\.sh$/
 /** A burst-driver shard's `--security-opt`: its entrypoint splits the container's CPU quota (docker/entrypoint.sh). */
 export const DRIVER_SHARD_SECURITY_OPT = 'writable-cgroups=true'
 /** A burst-driver shard's `--cgroupns`: its writable cgroup is its own, never a wider view the daemon's default could give. */
@@ -11547,7 +11547,7 @@ export async function cleanupRunImages(context: RunImageCleanupContext, state: R
 /** The mark between the owner and k in a shard container's name, `cscb-ci-<RUN_ID>-<PID>-s<k>`. */
 export const SHARD_CONTAINER_NAME_SHARD_MARK = '-s'
 /** Allowlisted variables a shard's `docker run` names by bare name when defined in its child environment. */
-export const SHARD_ENV_NAMES = ['CI_ANTHROPIC_API_KEY', 'CI_ANTHROPIC_BASE_URL', 'CI_ANTHROPIC_MODEL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'CODEX_TEST_MODEL', CODEX_HOST_CONFIG_KEYS_ENV] as const
+export const SHARD_ENV_NAMES = ['CI_ANTHROPIC_API_KEY', 'CI_ANTHROPIC_BASE_URL', 'CI_ANTHROPIC_MODEL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'CODEX_TEST_MODEL', CODEX_HOST_CONFIG_KEYS_ENV, 'CSCB_TEST_DIAGNOSTICS'] as const
 /** The secret credentials by name: never passed to a shard as `NAME=value`. The base-build token has no variable of its own here; its value is checked like every secret value. */
 export const SECRET_CREDENTIAL_NAMES = ['CI_ANTHROPIC_API_KEY', 'ANTHROPIC_API_KEY', 'GH_TOKEN'] as const
 /** The in-container runner's option that names a script to fail, as `--fail <file name>` pairs. */

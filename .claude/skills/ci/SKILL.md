@@ -63,6 +63,47 @@ Run kinds:
 - A selective run (any SCRIPT) or an injected run (any `--inject`) is never a
   gate result.
 
+### Authorized integration evidence across two lanes
+
+When the caller explicitly authorizes complete integration evidence across
+two lanes, follow the [two-lane integration procedure](../../../tests/README.md#two-lane-integration-procedure).
+Recheck the current script listing and runner driver classification, then
+resolve transitive prerequisites before launching:
+
+- **Scheduler:** select every no-model, non-burst workload in one invocation.
+  Include test-13 and all recovery groups; do not use `/ad-gate`'s different
+  offline published-release selection.
+- **Local:** select one native model or burst workload per disposable-container
+  invocation and finish it before starting the next. Native filenames contain
+  `-fmk-real-`; burst workloads are test-44 and every strict/open membership
+  group. Keep native Claude and Codex local, with all existing admission,
+  memory/resource, performance and credential/login guards. An independent
+  selection can use `--shards 1`, including Codex-only.
+
+Every workload must appear in exactly one lane; test-1 is mandatory bootstrap
+repeated in every shard/invocation. If prerequisite closure crosses lanes,
+resolve the execution plan before running. Retain each run's script list,
+commit, diagnostic state, verdict and evidence for the caller to judge
+complete combined coverage under its recorded authorization.
+
+Use existing SCRIPT arguments and the launch/wait/report procedure below.
+Every such invocation stays `SELECTIVE`, including a whole lane or an explicit
+whole-list selection: PASS has reader exit **3**, no default-full success line
+and no valid cap-source claim. No individual selection suffices for the
+integration gate. With no SCRIPT arguments, `/ci` still runs every integration
+script.
+
+### Optional diagnostics
+
+This skill never sets or defaults `CSCB_TEST_DIAGNOSTICS`; leave it unset for
+gate measurements. Only literal value `1` enables optional diagnostics.
+When deliberately supplied in the caller's environment, the runner forwards
+the defined value unchanged, including empty, through bare
+`--env CSCB_TEST_DIAGNOSTICS`; absence adds no option or default. Required
+measurement records and numerical verdicts stay enabled. See
+[optional test diagnostics](../../../tests/README.md#optional-test-diagnostics)
+for disabled behavior and the limited profiling scope.
+
 ## Outcomes and exit codes
 
 The verdict reader produces every row but the last, in this precedence. The
@@ -755,9 +796,21 @@ Other outcomes print no timing summary; the same items are in the run's
 
 To refresh `tests/ci-durations.tsv`, paste the block's lines (not the
 introducing line) over the whole file and commit it as an ordinary change.
-The runner never writes the table. A `slow:` line does not fail the run; it
-means the table is stale. Detail:
-[`tests/README.md`'s Refreshing the table](../../../tests/README.md#refreshing-the-table).
+The runner never writes the table. Only scripts that actually passed in that
+run supply fresh measurements; carried-forward rows remain estimates.
+
+For authorized evidence across both lanes, follow the
+[measured-row and provenance procedure](../../../tests/README.md#refreshing-the-table).
+After all contributing runs pass on the final source with diagnostics unset,
+merge only their actual printed passed-script rows into one canonical TSV.
+Retain each script/row's lane, run identity, commit and diagnostic state; use
+the highest contributing measured test-1 row, with test-1 passed in every
+contributing shard. Do not guess seconds, divide totals or paste successive
+lane blocks as proof of complete measurement: a later block can carry older
+estimates. Timing rows alone establish no runtime acceptance or default-full
+PASS.
+
+A `slow:` line does not fail the run; it means the table is stale.
 
 ## The cap line
 

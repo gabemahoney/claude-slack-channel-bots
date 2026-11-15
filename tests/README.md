@@ -465,10 +465,10 @@ tests/
     test-43-fmk-displayed-legacy.sh  # verified legacy AD in a separate HOME/store/socket: actual idle_screen and needs_intelligence;
                                    # unnormalized real-client negative controls and production normalized positive behavior
     test-44-fmk-thread-burst.sh     # fmk mode: burst acks, store p99, Post Holds and compactions at 0/10,000/100,000 Joined Threads, and the 1,000-channel shared list
-    test-45-fmk-membership-load.sh  # strict mode: hung and late membership pages and name lookups, retries and idle repair under load at 100,000 Joined Threads
-    test-46-shared-channel-recovery.sh # shared mode: shared-channel and thread recovery across storage faults, kills and restarts, lost answers and connection gaps
+    test-45-fmk-membership-load.sh  # strict mode: first/later hung membership pages, retries and idle repair at 100,000 joins per persona
+    test-46-shared-channel-recovery.sh # shared mode, phases 1–5: queue/directory faults, kills, review replay and lost bot-attempt answers
     test-47-shared-channel-upgrade.sh # shared mode: the manual upgrade from 0.18.0 over tests/fixtures/shared-channel-upgrade/, prepared baselines, refused inputs and kept queues
-    test-48-fmk-membership-load-open.sh # open mode: hung and late membership pages and name lookups, retries and idle repair under load at 100,000 Joined Threads
+    test-48-fmk-membership-load-open.sh # open mode: first/later hung membership pages, retries and idle repair at 100,000 joins per persona
     test-49-fmk-model-effort.sh    # per-persona model and effort: each launch's `--model=`/`--effort=` elements whole; resume kept across a death,
                                    # clean_restart and stop/start; a changed value starts a fresh conversation with one Fresh-Start Line, the old kept
     test-50-reaction-notices.sh    # shared mode, live against the Slack stub, two personas from the first start: Reaction Notices typed and receipted exactly
@@ -480,7 +480,26 @@ tests/
                                    # real Tool Post brings alpha one empty-body notice naming bravo (persona name, bot user ID) and Slack's own event for it
                                    # none; two overlapping react calls (ok then already_reacted, and the reverse) bring one notice each with unchanged
                                    # results; bravo's react on its own post brings neither persona anything
+    test-51-fmk-membership-load-transient.sh # strict: first/later transient membership faults under load
+    test-52-fmk-membership-load-rate.sh # strict: first/later rate limits and Retry-After under load
+    test-53-fmk-membership-load-scope.sh # strict: first/later missing-scope faults under load
+    test-54-fmk-membership-load-denied.sh # strict: first/later authorization faults under load
+    test-55-fmk-membership-load-late.sh # strict: first/later abandoned late membership answers
+    test-56-fmk-membership-load-lookup.sh # strict: hung/late users.info and conversations.info lookups
+    test-57-fmk-membership-load-undurable.sh # strict: undurable live membership event, zero ACK and unchanged stores
+    test-58-fmk-membership-load-open-transient.sh # open: first/later transient membership faults under load
+    test-59-fmk-membership-load-open-rate.sh # open: first/later rate limits and Retry-After under load
+    test-60-fmk-membership-load-open-scope.sh # open: first/later missing-scope faults under load
+    test-61-fmk-membership-load-open-denied.sh # open: first/later authorization faults under load
+    test-62-fmk-membership-load-open-late.sh # open: first/later abandoned late membership answers
+    test-63-fmk-membership-load-open-lookup.sh # open: hung/late users.info and conversations.info lookups
+    test-64-fmk-membership-load-open-undurable.sh # open: undurable live membership event, zero ACK and unchanged stores
+    test-65-shared-channel-recovery-membership-memory.sh # shared mode, phases 6–11: membership scans/gaps, memory faults and incomplete startup
+    test-66-shared-channel-recovery-own-post.sh # shared mode, phases 12–18: unresolved posts, FIFO, lookup deadlines, leave and ambiguous roots
+    test-67-shared-channel-recovery-identity-repair.sh # shared mode, phases 19–29: chunks, identity resets, crash recovery, restoration and replacement
     lib/
+      membership-load.sh           # selected strict/open fault group, fresh 100,000-join cases and unchanged per-case verdicts
+      shared-channel-recovery.sh   # independent production-path setup, observations and cumulative recovery closure
       displayed-states.sh          # contained setup, runtime provenance and success/failure leak checks before closing diagnostics and driver evidence release
       real-scenario.sh             # native agent setup, minimal permissions, exact evidence, faults, bounds and once-only EXIT accounting
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards; SCENARIO_START_ENV supplies fake-only start overrides (see Scenario helper below)
@@ -576,6 +595,53 @@ There is no Test 11. It is retired, with its driver: CSCB makes no tmux call
 of its own, and fmk scenarios 3 and 17 replace it. Scenario 3 is Test 15 (`test-15-fmk-prefix-neighbour.sh`);
 scenario 17 is `assert_no_server_tmux` across server-backed fmk scripts (see Closing
 assertions).
+
+### Membership and recovery groups
+
+The membership helper runs eight groups in each mode, retaining 14 cases per
+mode: first/later hang, transient, rate, scope, denied and late, plus lookup
+and undurable. Tests 45/48 select hang; strict 51–57 and open 58–64 select
+the remaining groups in that order. Every case freshly seeds and reopens
+100,000 joins per persona P and Q, with the full original bursts, ordered
+writes, fault/recovery accounting, seal/compaction checks and numerical bounds.
+Test 44 and every membership group use separated server/driver CPU cgroups;
+see [Thread Memory performance runs](../docs/testing-guide.md#thread-memory-performance-runs).
+
+Recovery tests 46/65/66/67 are independent shared-mode, no-model, non-burst
+groups. Each sources `lib/scenario.sh` first, then the recovery helper, with
+its own state, port, persona namespace and evidence. Each requires only
+test-1; no sibling script supplies its setup. Tests 65–67 accept and receipt
+genuine P/Q bootstrap inputs and gracefully transition registered workers
+from manual to ordinary receipts; memory setup uses a real qualifying mention.
+Every group closes over its own originals, per-server-run accounting, exact
+content and own-session receipts, expected/withheld ACKs, total pushes and leak
+checks. Test 66 retains all four restart-released replies from phases 12/15;
+test 67 retains phase 22→23 compaction and phase 19's final chunk no-repost
+check after worker stop and final snapshots. Source and synthetic controls
+verify these compositions; contained runs supply runtime and timing evidence.
+
+### Optional test diagnostics
+
+Only the literal `CSCB_TEST_DIAGNOSTICS=1` enables optional diagnostics.
+Unset, empty, `0` and every other value leave them off. Deliberate host
+opt-in reaches contained `/ci` shards through the runner's conditional
+`--env CSCB_TEST_DIAGNOSTICS` forwarding: values travel in the child
+environment unchanged, never in arguments; absence adds no option or default.
+`/ci` does not set the switch. Gate measurements leave it unset.
+
+| Entrypoint | Enabled scope |
+|---|---|
+| Test 32 | Each strict/open thread phase's measured server, one continuous wave around all 20 samples; 100 ms sampling, capped at 300 s. |
+| Test 44 | Its measured burst cases; optional server timing rows, wave CPU/latency observations and CPU profile. |
+| Test 45 | Strict first-hang measured start/burst/ordered writes only. |
+
+Off runs create no profile, load no profile preload and perform no optional
+profile waits; Test 44's optional timing rows and observers are also off.
+Enabled profiles stay in scenario scratch and use bounded best-effort cleanup
+and content-free summaries without changing the test's status or observation
+boundaries. Seed/seal and reopen starts, later-hang, open membership, new
+membership groups and recovery groups gain no profiling. Required measurement records,
+startup/performance evidence and numerical verdicts remain active in both states.
 
 ### Real Claude gate and heavy legs
 
@@ -1979,9 +2045,9 @@ first in every shard. The units are the connected groups of the run's other
 scripts, joined by their prerequisite links; a script with no link is a unit
 of its own.
 
-A unit goes whole into one shard, and each of its scripts runs once there. On
-the current tree test-2 and test-3 form one unit, so the 29 scripts give 27
-units.
+A unit goes whole into one shard, and each of its scripts runs once there.
+Test-2 and test-3 form one unit; each membership or recovery split group is
+independent, with no prerequisite beyond universal test-1.
 
 The requested N is the `--shards` value, else 6. The effective N is the
 smaller of the requested N and the number of units, but at least 1, so
@@ -2042,6 +2108,36 @@ to the effective N, so `/ci --inject kill:2 test-3` is refused too.
 
 A selective run is never a gate result. Its verdict shape is in Verdict file
 format below.
+
+#### Two-lane integration procedure
+
+When a complete integration run is authorized across two lanes, use the
+current `tests/integration/test-*.sh` listing and the runner's
+`isBurstDriverScript` classifier, then resolve transitive prerequisite
+closure before launching either lane. Each workload belongs to exactly one
+lane; test-1 is mandatory bootstrap repeated in every shard/invocation and
+is excluded from workload partition counts.
+
+| Lane | Explicit SCRIPT selection and execution |
+|---|---|
+| Scheduler | One selected `/ci` invocation on the job scheduler containing every workload whose filename lacks `-fmk-real-` and whose driver classification is false. Include no-model Test 13 and recovery 46/65/66/67. Test 49 exercises model arguments with a stub and belongs here. |
+| Local | One disposable-container `/ci` invocation per workload whose filename contains `-fmk-real-` or whose driver classification is true: Test 44 and every strict/open membership group. Finish each invocation before starting the next. Retain normal admission, memory/resource guards, performance locks and native credential/login isolation; an independent selection can use `--shards 1`, including Codex-only. |
+
+Compare the selections with the whole current manifest for complete,
+nonoverlapping workload coverage. If a closure brings in a workload from the
+other lane, stop and resolve the execution plan before running it. Do not
+reuse `/ad-gate`'s offline published-release selection: it excludes Test 13
+and uses a different burst policy. The heavy `tests/real-agent/` suite stays
+separate from this integration manifest.
+
+Leave `CSCB_TEST_DIAGNOSTICS` unset for gate measurements. Retain each lane's
+script list, commit, diagnostic state, actual verdict and run evidence.
+Every explicit SCRIPT invocation stays `SELECTIVE`, even if it names a whole
+lane or every integration script; a selective PASS has reader exit **3**.
+The caller judges complete combined coverage under its recorded authorization.
+Do not turn individual verdicts into default-full PASS or change exit codes,
+gate eligibility or cap eligibility. With no SCRIPT arguments, default-full
+continues to mean every integration script.
 
 ### Version-specific displayed-state coverage (b.iy3)
 
@@ -2152,7 +2248,7 @@ passes alone do not establish runtime behavior.
 
 #### Shared-channel and Thread Memory helpers
 
-`lib/scenario.sh` fences production-state readers and request publication to scenario scratch with `require_scenario_state [step]`. These helpers read committed evidence or submit the normal operator request; none repairs a running authority. The following argument lists are positional; `key` is a persona key, `label` a stub token label, and optional arguments use brackets. Tests 29 and 31 compose delivery/own-post cases; Tests 40 and 44–48 share the queue, recovery and population evidence adapters. Direct users are visible beside each call in `tests/integration/`; wrappers retain the same evidence contracts. Unit own-post suites, including `tests/own-post.test.ts`, use `makeOwnPostHarness` for real composition, captured reads, controlled publication and startup/replay with caller-owned membership/queue boundaries; its options and snapshot surfaces are documented once in [Factory Functions](../docs/testing-guide.md#factory-functions).
+`lib/scenario.sh` fences production-state readers and request publication to scenario scratch with `require_scenario_state [step]`. These helpers read committed evidence or submit the normal operator request; none repairs a running authority. The following argument lists are positional; `key` is a persona key, `label` a stub token label, and optional arguments use brackets. Tests 29 and 31 compose delivery/own-post cases; Test 40, Test 44, all membership groups and recovery tests 46/65/66/67 share the queue, recovery and population evidence adapters. Direct users are visible beside each call in `tests/integration/`; wrappers retain the same evidence contracts. Unit own-post suites, including `tests/own-post.test.ts`, use `makeOwnPostHarness` for real composition, captured reads, controlled publication and startup/replay with caller-owned membership/queue boundaries; its options and snapshot surfaces are documented once in [Factory Functions](../docs/testing-guide.md#factory-functions).
 
 | Helper and arguments | Result or action |
 |---|---|
@@ -2934,8 +3030,7 @@ These hold for every fmk script:
   any state.
 - CSCB's timings are shortened only through its configuration
   (`health_check_interval`, `session_restart_delay`) and the package's
-  exported seams, never by editing `src/`; scenarios 20 (Test 23) and 24
-  (Test 26), delivery scenarios and real-agent scenarios also use the
+  exported seams, never by editing `src/`; the writers listed below use the
   test-only `test_timer_overrides` block of that configuration (next bullet).
   agent-director's are changed only through the `[tmux]` table of scenarios
   10, 20 and 24, written with
@@ -2943,9 +3038,15 @@ These hold for every fmk script:
   table; every other scenario
   waits out agent-director's default windows (at least 300 s where it needs
   the starting-session bound, as the finished-row kill does).
-- The test-only timer overrides are used by scenarios 20 (Test 23),
-  24 (Test 26), delivery scenarios and real-agent scenarios. These include
-  the existing `delivery_stuck_after_ms` override. The block is the
+- The complete test-only timer-override writers are `test-23-fmk-latch-recheck.sh`,
+  `test-26-fmk-timing-settings.sh`, `test-32-fmk-real-order.sh`,
+  `test-44-fmk-thread-burst.sh`, all 16 membership entrypoints in
+  [Layout](#layout) (45/48/51–64), and the separate heavy
+  `test-101-fmk-real-busy.sh`. Test 32 writes through `lib/real-scenario.sh`
+  and `fixtures/sr8-evidence.ts`; Test 44 and membership's common helper use
+  that same config writer for `queue_compact_interval_ms` (Test 32 keeps its
+  production value). Heavy Test 101 uses `delivery_stuck_after_ms`.
+  Recovery 46/65/66/67 writes no override. The block is the
   top-level `test_timer_overrides` object of the `config.json` the scenario
   writes; it is off by default, never written into a user's configuration
   or shipped settings example, and undocumented for users. Keep any timer
@@ -4501,13 +4602,32 @@ in canonical order:
 - An entry for a script not in the list is left out.
 
 A selective run's block is therefore safe to paste: the scripts it did not run
-keep their entries.
+keep their entries. Those carried-forward estimates are not measurements
+from this run.
 
 To refresh, paste the block's lines (not the introducing line) over the whole
 of `tests/ci-durations.tsv` and commit it as an ordinary change; the runner
 never writes the table. `tests/ci-run-schedule.test.ts` checks that the
 committed file parses with no note, so a paste that lost its tabs fails the
 unit suite; it does not check the seconds.
+
+For a refresh assembled from authorized passing selective runs across
+[both lanes](#two-lane-integration-procedure), collect only rows for scripts
+that actually passed in each contributing run. Keep provenance for every
+chosen script/row: lane, run identity, commit and diagnostic state. Require
+the complete intended workload set on the final source with diagnostics
+unset; use the highest contributing measured test-1 row, each contribution
+having passed test-1 in all its shards. Assemble one canonical tab-separated
+table from the actual printed measurements, with the existing header and
+number-form keys. Do not divide old totals, guess missing rows or treat
+carried-forward estimates as fresh evidence.
+
+Sequentially pasting lane blocks is insufficient: later blocks can carry
+older estimates for scripts measured in an earlier lane. The ordinary
+single-run paste above remains valid for retaining untouched estimates;
+complete measurement coverage requires the provenance merge. Refresh after
+all contributing runs pass; timing data alone establishes no default-full
+PASS or runtime acceptance.
 
 A `slow: <file> took <s> s, estimate <e> s` line names a script whose time was
 more than 1.5 × its estimate (the default for a script with no entry), its

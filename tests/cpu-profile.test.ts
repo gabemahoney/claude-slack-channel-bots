@@ -512,6 +512,67 @@ CONTEXT=(test-44-fmk-thread-burst strict 0 1)
     expect(SCRIPT.match(/cpu-profile\.ts|PROFILER}/g)).toHaveLength(3)
   })
 
+  test.each([null, '', '0', 'true', '01', '1'])('diagnostics=%j controls timings, measured preload, wave observers and cleanup without changing the burst verdict', diagnostics => {
+    const on = diagnostics === '1', evidence = join(root, 'evidence')
+    mkdirSync(evidence)
+    // Execute the real config/profile block, measured and unmeasured starts,
+    // burst submission and final observe/check boundary with inert dependencies.
+    const config = SCRIPT.slice(SCRIPT.indexOf('config_args=('), SCRIPT.indexOf('# Test-only CPU profile'))
+    const burst = SCRIPT.slice(SCRIPT.indexOf('        burst_status=0'), SCRIPT.indexOf('        # Observe zero'))
+    const verdict = SCRIPT.slice(SCRIPT.indexOf('        # Latency decomposition only:'), SCRIPT.indexOf('        ;;\n    pending)'))
+    const program = `${HARNESS}
+mode=strict population=0 recipients=1 CASE_ROOT="$1/people" SCENARIO_PORT=0 compact_ms=250 SR8=/sr8
+RESULTS="$1/burst" BATCH=/batch SCENARIO_SLACK_STUB_URL=/stub SCENARIO_SLACK_RECORD=/record SLACK_STATE_DIR="$1/state"
+MEASUREMENTS=/measurements measurement_mark=0 SERVER_PID=11 SLACK_PID=22 BURST_DRIVER=/driver
+OVERRIDES_STEM=o KEYS=(alpha)
+bun() { printf 'bun %s\\n' "$*"; return 0; }
+write_config() { cat; }
+printed() { printf 'recorder\\n'; }
+matcher() { printf '%s\\n' "$*"; }
+completion_match() { printf 'complete\\n'; }
+count_log() { printf '0\\n'; }
+mono_ms() { printf '7\\n'; }
+wait_for_count() { printf 'wait %s\\n' "$1"; }
+expect_one_overrides_line() { :; }
+wait_membership_complete() { :; }
+start_server() { printf 'start %s profile=%s\\n' "$*" "\${CSCB_TEST_CPU_PROFILE_DIR:-off}"; }
+bash() { printf 'driver cpu=%s pids=%s profile=%s\\n' "\${SR8_PHASE_CPU_FILE:-off}" "\${SR8_PHASE_CPU_PIDS:-off}" "\${SR8_PROFILE_DIR:-off}"; return 7; }
+sr8_verdicts() { printf 'verdict %s\\n' "$1"; }
+${config}${block()}
+${shellFunction(SCRIPT, 'start_ready')}
+printf 'hooks=%s\\n' "\${hooks[*]}"
+start_ready
+sr8_verdicts seal first
+start_ready measured
+sr8_verdicts seal measured
+${burst}
+start_ready
+sr8_verdicts seal measured
+${verdict}
+`
+    const child = spawnSync('bash', ['--noprofile', '--norc', '-c', program, 'test-44', evidence, FIXTURES], {
+      env: hostSafeChildEnv(root, { tools: ['bash', 'mkdir', 'cat'], extras: diagnostics === null ? {} : { CSCB_TEST_DIAGNOSTICS: diagnostics } }),
+      encoding: 'utf8', timeout: 10_000 })
+    expect(child.error).toBeUndefined(); expect(child.signal).toBeNull()
+    expect(child.status).toBe(1)
+    expect(child.stderr).toBe('FAIL: burst submission or ACK observation failed\n')
+    const lines = child.stdout.trim().split('\n')
+    expect(lines[0]).toBe(`bun /sr8 config strict 0 1 ${evidence}/people 0 250${on ? ' timings' : ''}`)
+    expect(lines.filter(l => l.startsWith('hooks='))).toEqual([`hooks=${on ? 'profile_summary' : ''}`])
+    expect(lines.filter(l => l.startsWith('start '))).toEqual([
+      'start --live profile=off', `start --live profile=${on ? `${evidence}/cpu-profile` : 'off'}`, 'start --live profile=off',
+    ])
+    expect(lines.filter(l => l.startsWith('wait recorder'))).toHaveLength(3)
+    expect(lines.filter(l => l.startsWith('verdict '))).toEqual(['verdict seal', 'verdict seal', 'verdict seal', 'verdict check'])
+    expect(lines.find(l => l.startsWith('driver '))).toBe(on
+      ? `driver cpu=${evidence}/burst/phase-cpu.jsonl pids=server=11,stub=22 profile=${evidence}/cpu-profile`
+      : 'driver cpu=off pids=off profile=off')
+    expect(lines.filter(l => l.startsWith('bun /sr8 observe'))).toHaveLength(on ? 1 : 0)
+    expect(lines.filter(l => l.includes('/cpu-profile.ts stop '))).toHaveLength(on ? 1 : 0)
+    expect(lines.filter(l => l.includes('/cpu-profile.ts summary '))).toHaveLength(on ? 1 : 0)
+    expect(readdirSync(evidence)).toEqual(on ? ['cpu-profile'] : [])
+  })
+
   test.each<ShellRow>([
     ['a step after the profile stops fails', complete, 'profile_stop\nprofile_summary\nfail "cannot read own-post evidence"',
       1, (dir: string) => [STOPPED, ...summaryReport(dir, CONTEXT)], 'FAIL: cannot read own-post evidence\n'],
@@ -528,7 +589,7 @@ CONTEXT=(test-44-fmk-thread-burst strict 0 1)
     const evidence = join(root, 'evidence')
     const fixtures = prepare(evidence)
     const child = spawnSync('bash', ['--noprofile', '--norc', '-c', `${HARNESS}${block()}\n${steps}\n`, 'test-44', evidence, fixtures ?? FIXTURES], {
-      env: hostSafeChildEnv(root, { tools: ['bash', 'mkdir'], extras: { BUN: process.execPath, BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0' } }),
+      env: hostSafeChildEnv(root, { tools: ['bash', 'mkdir'], extras: { BUN: process.execPath, BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0', CSCB_TEST_DIAGNOSTICS: '1' } }),
       encoding: 'utf8', timeout: 10_000 })
     expect(child.error).toBeUndefined(); expect(child.signal).toBeNull()
     expect({ status: child.status, stdout: child.stdout, stderr: child.stderr })
@@ -584,7 +645,7 @@ const CONTEXT45 = `scenario=${C45[0]} mode=strict population=100000 recipients=2
 const t45Program = (kind: string, steps: string) => `${CLEANUP_HARNESS}ROOT="$1"\nCASE_KIND=${kind}\nC=(${C45.join(' ')})\n${loadBlock()}
 MEMBERSHIP_PROFILE_CLEANUP_STOP_S=${CLEANUP_STOP_S}\nMEMBERSHIP_PROFILE_CASE=first-hang\non_before_cleanup membership_profile_cleanup\nmembership_profile_open\n${steps}\n`
 const CONTEXT32 = 'scenario=test-32-fmk-real-order mode=strict population=100000 recipients=2'
-const t32Program = (steps: string) => `${CLEANUP_HARNESS}REAL_THREAD_EVIDENCE="$1"\nREAL_THREAD_CONTEXT=(test-32-fmk-real-order strict 100000 2)
+const t32Program = (steps: string, diagnostics: string | null = '1') => `${CLEANUP_HARNESS}${diagnostics === null ? '' : `CSCB_TEST_DIAGNOSTICS=${JSON.stringify(diagnostics)}\n`}REAL_THREAD_EVIDENCE="$1"\nREAL_THREAD_CONTEXT=(test-32-fmk-real-order strict 100000 2)
 ${t32Block()}PROFILE_CLEANUP_STOP_S=${CLEANUP_STOP_S}\n${steps}\n`
 // Only test-32's profile_open, which writes the profile directory; the hook then collects nothing.
 const OPEN_ONLY = 'profile_open\nPROFILE_DIR=""'
@@ -641,7 +702,7 @@ describe('test-45 profile steps (stub shell)', () => {
 describe('test-45/48 profile opt-in (run_membership_load in a stub shell)', () => {
   // The real library sourced; run_membership_load runs until its first case's
   // state directory, where the stub reports the case's profile and stops.
-  const run = (...args: string[]) => {
+  const run = (diagnostics: string | null, ...args: string[]) => {
     writeFileSync(join(root, 'membership-load.sh'), LOAD)
     const program = `set -euo pipefail
 log() { printf '%s\\n' "$*" >> "$HOME/calls"; }
@@ -659,27 +720,40 @@ printed() { printf '1\\n'; }
 run_membership_load "$@"
 `
     const child = spawnSync('bash', ['--noprofile', '--norc', '-c', program, 'stub', ...args], {
-      env: hostSafeChildEnv(root, { tools: ['bash', 'mkdir', 'cat'] }), encoding: 'utf8', timeout: 10_000 })
+      env: hostSafeChildEnv(root, { tools: ['bash', 'mkdir', 'cat'], extras: diagnostics === null ? {} : { CSCB_TEST_DIAGNOSTICS: diagnostics } }), encoding: 'utf8', timeout: 10_000 })
     expect(child.error).toBeUndefined(); expect(child.signal).toBeNull()
     return { status: child.status, stdout: child.stdout, stderr: child.stderr }
   }
 
   test('test-45\'s option registers the profile\'s cleanup hook and profiles its first-hang case', () => {
-    expect(run('strict', '--cpu-profile', 'first-hang')).toEqual({ status: 0, stderr: '',
+    expect(run('1', 'strict', 'hang', '--cpu-profile', 'first-hang')).toEqual({ status: 0, stderr: '',
       stdout: 'hook reopen_observe\nhook membership_profile_cleanup\ncase=first-hang profile=strict-first-hang/cpu-profile\n' })
     expect(readdirSync(join(root, 'strict-first-hang')).sort()).toEqual(['batch', 'cpu-profile', 'writes'])
   })
 
   test('test-48\'s plain call registers no profile hook and profiles nothing', () => {
-    expect(run('open')).toEqual({ status: 0, stderr: '', stdout: 'hook reopen_observe\ncase=first-hang profile=\n' })
+    expect(run('1', 'open', 'hang')).toEqual({ status: 0, stderr: '', stdout: 'hook reopen_observe\ncase=first-hang profile=\n' })
     expect(readdirSync(join(root, 'open-first-hang')).sort()).toEqual(['batch', 'writes'])
   })
 
+  test.each([null, '', '0', 'true', '01'])('diagnostics=%j leaves test-45 unprofiled despite its first-hang option', diagnostics => {
+    expect(run(diagnostics, 'strict', 'hang', '--cpu-profile', 'first-hang'))
+      .toEqual({ status: 0, stderr: '', stdout: 'hook reopen_observe\ncase=first-hang profile=\n' })
+    expect(readdirSync(join(root, 'strict-first-hang')).sort()).toEqual(['batch', 'writes'])
+  })
+
+  test.each(['strict', 'open'])('diagnostics on does not add profiling to a plain %s group', mode => {
+    expect(run('1', mode, 'transient')).toEqual({ status: 0, stderr: '', stdout: 'hook reopen_observe\ncase=first-transient profile=\n' })
+    expect(readdirSync(join(root, `${mode}-first-transient`)).sort()).toEqual(['batch', 'writes'])
+  })
+
   test.each([
-    [['strict', '--cpu-profile']], [['strict', 'first-hang']], [['strict', '--cpu-profile', '']], [['strict', '--profile', 'first-hang']],
-    [['strict', '--cpu-profile', 'first-hang', 'extra']], [['both', '--cpu-profile', 'first-hang']],
+    [['strict']], [['strict', 'hang', '--cpu-profile']], [['strict', 'hang', '--cpu-profile', '']], [['strict', 'hang', '--profile', 'first-hang']],
+    [['strict', 'hang', '--cpu-profile', 'first-hang', 'extra']], [['both', 'hang', '--cpu-profile', 'first-hang']],
+    [['open', 'hang', '--cpu-profile', 'first-hang']], [['strict', 'transient', '--cpu-profile', 'first-hang']],
+    [['strict', 'hang', '--cpu-profile', 'later-hang']],
   ])('refuses %j before any hook or case', args => {
-    expect(run(...args)).toEqual({ status: 1, stdout: '', stderr: 'FAIL: membership load requires one channel mode and optionally --cpu-profile <case>\n' })
+    expect(run('1', ...args)).toEqual({ status: 1, stdout: '', stderr: 'FAIL: membership load requires a channel mode and fault group, optionally --cpu-profile first-hang for strict hang\n' })
   })
 
   test('start_ready runs only the profiled case\'s measured start with the preload', () => {
@@ -707,6 +781,42 @@ describe('test-32 profile steps (stub shell)', () => {
   const program = t32Program
   const complete = (scratch: string) => writeProfile(join(scratch, 'cpu-profile'), [roots, replies], 'roots\nreplies-drops\nend\n', 2)
 
+  test.each([null, '', '0', 'true', '01', '1'])('diagnostics=%j controls profile creation, hook, measured preload, sample metadata and waits', diagnostics => {
+    const on = diagnostics === '1', scratch = join(root, 'evidence')
+    mkdirSync(scratch)
+    const start = T32.indexOf('    profile_open\n'), end = T32.indexOf('\n', T32.indexOf('    THREAD_READY_MS=', start))
+    const steps = `
+real_thread_now_ms() { printf '7\\n'; }
+start_server() {
+    printf 'start %s profile=%s\\n' "$*" "\${CSCB_TEST_CPU_PROFILE_DIR:-off}"
+    if [[ -n "\${CSCB_TEST_CPU_PROFILE_DIR:-}" ]]; then printf '{"phase":"started"}\\n' > "\${CSCB_TEST_CPU_PROFILE_DIR}/observer.jsonl"; fi
+}
+bun() { printf 'profiler %s\\n' "$2"; }
+sleep() { echo 'unexpected profile wait' >&2; exit 9; }
+start_server --live
+${T32.slice(start, end)}
+REAL_THREAD_DELAYED_TS=7 REAL_THREAD_HUNG_TS=14
+profile_begin
+profile_sample_begin
+profile_sample_end 7
+profile_end
+profile_collect 30
+printf 'hooks=%s\\n' "\${hooks[*]}"
+fail 'workload failed'
+`
+    expect(stubShell(program(steps, diagnostics), scratch)).toEqual({ status: 1, stderr: 'FAIL: workload failed\n',
+      stdout: ['start --live profile=off', `start --live profile=${on ? `${scratch}/cpu-profile` : 'off'}`,
+        ...(on ? ['profiler stop', 'profiler summary'] : []), `hooks=${on ? 'profile_cleanup' : ''}`].join('\n') + '\n' })
+    expect(readdirSync(scratch)).toEqual(on ? ['cpu-profile'] : [])
+    if (on) {
+      const dir = join(scratch, 'cpu-profile')
+      expect(readdirSync(dir).sort()).toEqual(['interval-us', 'max-seconds', 'observer.jsonl', 'samples.tsv', 'waves'])
+      expect(readFileSync(join(dir, 'waves'), 'utf8')).toBe('thread-samples\nend\n')
+      expect(readFileSync(join(dir, 'samples.tsv'), 'utf8')).toMatch(/^delayed-lookup\t\d+\t\d+\n$/)
+      expect([samplingIntervalUs(dir), profileCapS(dir)]).toEqual([100_000, 300])
+    }
+  })
+
   test('one wave spans the samples: begun before the active window, ended after the last sample, collected after the empty window and before any verdict; no profile step inside the loop waits', () => {
     const phase = T32.slice(T32.indexOf('for thread_mode in strict open; do'))
     const at = (text: string) => { const i = phase.indexOf(text); expect(i).toBeGreaterThan(0); return i }
@@ -726,7 +836,7 @@ describe('test-32 profile steps (stub shell)', () => {
       .toEqual(['profile_open', 'profile_begin', 'profile_sample_begin', 'profile_sample_end', 'profile_end', 'profile_collect'])
     expect(T32.match(/^profile_\w+(?=\(\))/gm)).toEqual(['profile_open', 'profile_started', 'profile_begin', 'profile_epoch_ms',
       'profile_sample_begin', 'profile_sample_end', 'profile_end', 'profile_collect', 'profile_cleanup'])
-    expect(T32.indexOf('on_before_cleanup profile_cleanup\n')).toBeLessThan(T32.indexOf('real_prepare'))
+    expect(T32.indexOf('on_before_cleanup profile_cleanup; fi\n')).toBeLessThan(T32.indexOf('real_prepare'))
   })
 
   test('the profile\'s memory budget: test-32\'s cap at its interval keeps a profile of deep stacks far under the shard cap beside the server', () => {
@@ -808,7 +918,7 @@ describe('test-32 sample phase on an injected clock (stub shell)', () => {
   }
   const samples = Array.from({ length: 20 }, (_, n) => `1700000000.0000${String(n + 1).padStart(2, '0')}`)
   interface Options { startDelayMs?: number; failed?: boolean; admissionMs?: number; callsPerSample?: number }
-  const program = (profiled: boolean, { startDelayMs = 0, failed = false, admissionMs = 0, callsPerSample = 0 }: Options) => `${t32Program('')}CLOCK_LOG="$1/clock.log" CALLS="$1/calls"
+  const program = (profiled: boolean, { startDelayMs = 0, failed = false, admissionMs = 0, callsPerSample = 0 }: Options) => `${t32Program('', profiled ? '1' : null)}CLOCK_LOG="$1/clock.log" CALLS="$1/calls"
 CLOCK_US=1700000100000000
 unset EPOCHREALTIME
 START_DELAY_MS=${startDelayMs} ADMISSION_MS=${admissionMs} CALLS_PER_SAMPLE=${callsPerSample} ANSWERED=0
@@ -858,7 +968,7 @@ stop_server() { :; }
 REAL_KEY=alpha THREAD_INSTANCE=i-1 REAL_SR8=/sr8 SLACK_STATE_DIR="$1/state" SERVER_PID=1
 REAL_THREAD_SAMPLES=(${samples.join(' ')})
 REAL_THREAD_DELAYED_TS=${samples[6]} REAL_THREAD_HUNG_TS=${samples[13]}
-${profiled ? 'profile_open' : 'PROFILE_DIR=""'}
+profile_open
 ${failed ? `printf '{}' > "\${PROFILE_DIR}/error.txt"` : ''}
 ${phase()}`
   const run = (profiled: boolean, options: Options = {}) => {
@@ -1050,10 +1160,10 @@ describe('cpu-profile opt-in', () => {
     expect(forwarder.split('\n').filter(line => opted.test(line))).toEqual(['DRIVER_ENV=(SCENARIO_ROOT SR8_PHASE_CPU_FILE SR8_PHASE_CPU_PIDS SR8_PROFILE_DIR)'])
     expect(shells.filter(f => readFileSync(join(integration, f), 'utf8').includes('--cpu-profile')).sort())
       .toEqual(['lib/membership-load.sh', 'test-45-fmk-membership-load.sh'])
-    expect(T45.match(/^run_membership_load .*$/gm)).toEqual(['run_membership_load strict --cpu-profile first-hang'])
-    expect(T48.match(/^run_membership_load .*$/gm)).toEqual(['run_membership_load open'])
+    expect(T45.match(/^run_membership_load .*$/gm)).toEqual(['run_membership_load strict hang --cpu-profile first-hang'])
+    expect(T48.match(/^run_membership_load .*$/gm)).toEqual(['run_membership_load open hang'])
     const preload = (dir: string) => `BUN_OPTIONS="--preload \${SCENARIO_FIXTURES}/cpu-profile-preload.ts" CSCB_TEST_CPU_PROFILE_DIR="\${${dir}}" start_server --live\n`
-    expect(SCRIPT).toContain('if [[ "${CASE}" == burst ]]; then\n    if mkdir -p "${EVIDENCE}/cpu-profile" 2> /dev/null; then\n        PROFILE_DIR="${EVIDENCE}/cpu-profile"\n')
+    expect(SCRIPT).toContain('if [[ "${CSCB_TEST_DIAGNOSTICS:-}" == 1 && "${CASE}" == burst ]]; then\n    if mkdir -p "${EVIDENCE}/cpu-profile" 2> /dev/null; then\n        PROFILE_DIR="${EVIDENCE}/cpu-profile"\n')
     expect(SCRIPT.match(/PROFILE_DIR="\$\{EVIDENCE\}/g)).toHaveLength(1)
     expect(SCRIPT).toContain(`    if [[ "\${1:-}" == measured && -n "\${PROFILE_DIR}" ]]; then\n        ${preload('PROFILE_DIR')}    else\n        start_server --live\n    fi\n`)
     expect(LOAD).toContain(`    if [[ "\${1:-}" == measured && -n "\${MEMBERSHIP_PROFILE_DIR:-}" ]]; then\n        ${preload('MEMBERSHIP_PROFILE_DIR')}    else\n        start_server --live\n    fi\n`)

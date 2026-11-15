@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared AC-C06 workload for test-45 (strict) and test-48 (open).
+# Shared AC-C06 workload for the strict/open membership-load group scripts.
 # Each entrypoint sources scenario.sh first and keeps its own EXIT evidence.
 # Verdicts, workloads and limits are owned by sr8-evidence.ts.
 
@@ -325,8 +325,10 @@ REOPEN_SAFE='def safe: if . == null then "absent" else tostring | if test("^[A-Z
 reopen_ad_rows() {
     local phase="$1" name key id
     for name in "${KEYS[@]}"; do
-        key="$(persona_key "${name}")" && id="$(printed personaInstanceId "${key}")" \
-            || { printf 'reopen-observe: phase=%s persona=%s ad=unavailable\n' "${phase}" "${name}"; continue; }
+        if ! key="$(persona_key "${name}")" || ! id="$(printed personaInstanceId "${key}")"; then
+            printf 'reopen-observe: phase=%s persona=%s ad=unavailable\n' "${phase}" "${name}"
+            continue
+        fi
         ad_capture get --instance-id "${id}"
         if (( AD_RC != 0 )); then
             printf 'reopen-observe: phase=%s persona=%s ad_rc=%s\n' "${phase}" "${name}" "${AD_RC}"
@@ -390,7 +392,8 @@ reopen_observe() {
 
 # Test-only CPU profile of one case's measured server over its fault burst
 # and ordered writes (tests/integration/fixtures/cpu-profile.ts): only the
-# case `--cpu-profile` names opts in, and only test-45 passes it. The profile
+# case `--cpu-profile` names opts in when CSCB_TEST_DIAGNOSTICS=1, and only
+# test-45 passes it (strict first-hang). The profile
 # stays in the case's scratch; only its content-free summary reaches the log,
 # once: right after the burst and ordered writes, or from the cleanup hook,
 # which first stops the profile (bounded) while the server still runs, so the
@@ -422,12 +425,20 @@ membership_profile_collect() {
 membership_profile_cleanup() { membership_profile_collect "${MEMBERSHIP_PROFILE_CLEANUP_STOP_S}"; }
 
 run_membership_load() {
+    local group="${2:-}" case_kinds=()
     require_ci_image "membership load"
     require_scenario_home "membership load"
-    [[ ( "$#" == 1 || ( "$#" == 3 && "$2" == --cpu-profile && -n "$3" ) ) && ( "$1" == strict || "$1" == open ) ]] \
-        || fail 'membership load requires one channel mode and optionally --cpu-profile <case>'
+    [[ ( "$#" == 2 || ( "$#" == 4 && "$3" == --cpu-profile && "$4" == first-hang && "$1" == strict && "${group}" == hang ) ) && ( "$1" == strict || "$1" == open ) ]] \
+        || fail 'membership load requires a channel mode and fault group, optionally --cpu-profile first-hang for strict hang'
     MODE="$1"
-    MEMBERSHIP_PROFILE_CASE="${3:-}"
+    case "${group}" in
+        hang|transient|rate|scope|denied) case_kinds=("first-${group}" "later-${group}") ;;
+        late) case_kinds=(late later-late) ;;
+        lookup|undurable) case_kinds=("${group}") ;;
+        *) fail 'unknown membership load fault group' ;;
+    esac
+    MEMBERSHIP_PROFILE_CASE=''
+    if [[ "${CSCB_TEST_DIAGNOSTICS:-}" == 1 ]]; then MEMBERSHIP_PROFILE_CASE="${4:-}"; fi
     E="${SCENARIO_FIXTURES}/sr8-evidence.ts"
     PRINTER="${SCENARIO_FIXTURES}/fmk-texts.ts"
     # Every burst driver runs off the server's CPU quota; driver-cpu judges that.
@@ -456,8 +467,9 @@ run_membership_load() {
     # Keep a fresh seed per case: the fixture's joins verdict requires the before
     # set to equal the seeded population exactly. Sharing a prior burst's lifetime
     # would carry its extra joins into that set. No snapshot copy or join reset.
-    for CASE_KIND in first-hang later-hang first-transient later-transient first-rate later-rate \
-        first-scope later-scope first-denied later-denied late later-late lookup undurable; do
+    # Each scheduler entrypoint selects exactly one group; every selected case
+    # still performs this entire fresh seed/start/burst/recovery/reopen lifetime.
+    for CASE_KIND in "${case_kinds[@]}"; do
         CASE="${TEST_NAME}-${MODE}-${CASE_KIND}"
         KIND="${CASE_KIND#*-}"
         PAGE="${CASE_KIND%%-*}"

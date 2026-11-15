@@ -8,7 +8,8 @@ source "$(dirname "$0")/lib/real-recovery.sh"
 CASE_ASSERT="${SCENARIO_FIXTURES}/real-case-assertions.ts"
 case_assert() { bun "${CASE_ASSERT}" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${@:2}"; }
 # Test-only CPU profile of each thread phase's measured server over its 20
-# samples (fixtures/cpu-profile.ts): one continuous `thread-samples` wave,
+# samples, enabled only by CSCB_TEST_DIAGNOSTICS=1 (fixtures/cpu-profile.ts):
+# one continuous `thread-samples` wave,
 # started before the active window and ended after the last sample, so no
 # profiler checkpoint falls inside a sample and nothing waits between samples.
 # It samples every 100 ms, and the server stops sampling for good
@@ -32,6 +33,7 @@ PROFILE_CLEANUP_STOP_S=10
 profile_open() {
     PROFILE_DIR=""
     PROFILE_SUMMARIZED=0
+    [[ "${CSCB_TEST_DIAGNOSTICS:-}" == 1 ]] || return 0
     if mkdir -p "${REAL_THREAD_EVIDENCE}/cpu-profile" 2> /dev/null \
         && { printf '%s\n' "${PROFILE_INTERVAL_US}" > "${REAL_THREAD_EVIDENCE}/cpu-profile/interval-us" \
             && printf '%s\n' "${PROFILE_MAX_S}" > "${REAL_THREAD_EVIDENCE}/cpu-profile/max-seconds"; } 2> /dev/null; then
@@ -84,7 +86,7 @@ profile_collect() {
     bun "${PROFILER}" summary "${PROFILE_DIR}" "${REAL_THREAD_CONTEXT[@]}" || printf 'recorded: cpu-profile summary unavailable\n'
 }
 profile_cleanup() { profile_collect "${PROFILE_CLEANUP_STOP_S}"; }
-on_before_cleanup profile_cleanup
+if [[ "${CSCB_TEST_DIAGNOSTICS:-}" == 1 ]]; then on_before_cleanup profile_cleanup; fi
 real_prepare
 # Real reply calls resolve candidates before the next measured DM. This
 # replaces real_persona's default no-tool acknowledgement instruction.
