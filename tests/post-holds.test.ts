@@ -68,25 +68,24 @@ async function resolverFixture(options: { names?: string[]; canRun?: (key: strin
   const parked: string[] = [], events: PostHoldEvent[] = [], saves: Array<{ key: string; resolutions: HoldResolution[] }> = []
   let beforeSave: (key: string) => Promise<void> = async () => {}
   let feedback: (key: string, seq: number) => void | Promise<void> = () => {}
-  let operationReads = 0, decisionReads = 0
+  let operationReads = 0, decisionReads = 0, refuseTimer = false
   const resolver = createPostHoldResolver({
     queue: { ...queue, async resolveHolds(key, resolutions, current, onCommitted) {
       saves.push({ key, resolutions: structuredClone([...resolutions]) })
       await beforeSave(key)
       return queue.resolveHolds(key, resolutions, current, onCommitted)
     } },
-    owner: {
-      operation: (key, id) => { operationReads++; return h.owner.operation(key, id) },
-      retainOutcomes: (key, ids) => h.owner.retainOutcomes(key, ids),
-    },
+    owner: { operation: (key, id) => { operationReads++; return h.owner.operation(key, id) } },
     release(key, item, mode) {
       releases.push({ key, seq: item.accepted.seq, mode, hold: item.hold?.state })
       return feedback(key, item.accepted.seq)
     },
     onParked(key) { parked.push(key) },
-    // A real timer may fire before the monotonic clock reaches its deadline.
-    clock: options.timerEarlyMs === undefined ? holdClock : { now: holdClock.now,
-      setTimeout: (callback, ms) => holdClock.setTimeout(callback, ms - options.timerEarlyMs!), clearTimeout: holdClock.clearTimeout },
+    // A real timer may fire before the monotonic clock reaches its deadline, and its setup can fail.
+    clock: { now: holdClock.now, clearTimeout: holdClock.clearTimeout, setTimeout: (callback, ms) => {
+      if (refuseTimer) { refuseTimer = false; throw new Error('fixture hold timer setup refused') }
+      return holdClock.setTimeout(callback, ms - (options.timerEarlyMs ?? 0))
+    } },
     decisionNow: () => { decisionReads++; return h.clock.now() },
     onEvent: event => { events.push(event) },
     ...(options.canRun ? { canRun: options.canRun } : {}),
@@ -118,29 +117,39 @@ async function resolverFixture(options: { names?: string[]; canRun?: (key: strin
   }
   let replies = 0
   /** A reply in `root` stored as a Post Hold through the queue's decided accept with 6q's builder,
-   * registered through `held` in its store's turn as routing's afterStore does. `receivedAt` is the
-   * hold-clock reading at receipt; `register: false` stores one an earlier life registered. */
+   * registered as routing registers it: the decision takes the owner's outcome retention before the
+   * store, the store's afterStore hands it to `held` in its turn, and any other ending releases it.
+   * `receivedAt` is the hold-clock reading at receipt; `register: false` stores one an earlier life
+   * registered, taking no retention. */
   async function hold(operations: readonly string[], options: {
     root?: string; key?: string; rootUnknown?: boolean; receivedAt?: number; register?: false
-    afterStore?: (seq: number) => void
+    afterStore?: (seq: number, retention: () => void) => void
   } = {}) {
     const key = options.key ?? 'alpha', root = options.root ?? ROOT, rootUnknown = options.rootUnknown ?? false
     const receivedAt = options.receivedAt ?? holdClock.now(), ts = `1700000500.${String(++replies).padStart(6, '0')}`
     const field = postHold(h.clock.now(), { operations: [...operations], thread_ts: root, stamp: h.threads.fact({}, key).stamp, root_unknown: rootUnknown })
-    const afterStore = options.afterStore ?? (options.register === false ? undefined
-      : (seq: number) => resolver.held(key, { seq, operations, threadRoot: root, rootUnknown, receivedAt }))
-    const result = await queue.acceptDecided(key, { chat_id: C, ts }, () => ({
-      store: heldSlackInput(field, { channel: C, ts, key: { chat_id: C, ts }, text: MESSAGE_BODY }),
-      ...(afterStore ? { afterStore: ({ seq }: { seq: number }) => afterStore(seq) } : {}),
-    }))
-    if (result.status !== 'accepted') throw new Error('fixture hold not stored')
-    return result.seq
+    const register = options.afterStore ?? (options.register === false ? undefined
+      : (seq: number, retention: () => void) => resolver.held(key, { seq, operations, threadRoot: root, rootUnknown, receivedAt }, retention))
+    let retention: (() => void) | undefined
+    try {
+      const result = await queue.acceptDecided(key, { chat_id: C, ts }, () => {
+        if (register) retention = h.owner.retainOutcomes(key, operations)
+        return {
+          store: heldSlackInput(field, { channel: C, ts, key: { chat_id: C, ts }, text: MESSAGE_BODY }),
+          ...(register ? { afterStore: ({ seq }: { seq: number }) => { const handed = retention!; retention = undefined; register(seq, handed) } } : {}),
+        }
+      })
+      if (result.status !== 'accepted') throw new Error('fixture hold not stored')
+      return result.seq
+    } finally { retention?.() }
   }
   const state = (seq: number, key = 'alpha') => queue.item(key, seq)?.hold?.state
   return {
     dir, h, io, queue, holdClock, resolver, releases, parked, events, saves, post, end, upload, hold, state,
     operationReads: () => operationReads, decisionReads: () => decisionReads,
     beforeSave(gate: typeof beforeSave) { beforeSave = gate },
+    /** The resolver's next timer setup throws. */
+    refuseNextTimer() { refuseTimer = true },
     releaseFeedback(next: typeof feedback) { feedback = next },
     /** Fail this key's queue appends at the durable write, as k8's queue cases do. */
     failQueue(times = Infinity, key = 'alpha') { io.fail('writeSync', key, { times, match: path => path === queuePath(dir, key) }) },
@@ -327,12 +336,12 @@ describe('Post Hold resolver: the four rules', () => {
 })
 
 describe('Post Hold resolver: kept outcomes, saves and retries', () => {
-  test('an answer landing after held, before its first check, is read through the retention held took', async () => {
+  test('an answer landing after held, before its first check, is read through the retention held took over', async () => {
     const f = await resolverFixture(), sent = await f.post(ROOT), answer = await inThread(ROOT)
     let seq = 0
-    await f.hold([sent.id], { afterStore: stored => {
+    await f.hold([sent.id], { afterStore: (stored, retention) => {
       seq = stored
-      f.resolver.held('alpha', { seq: stored, operations: [sent.id], threadRoot: ROOT, rootUnknown: false, receivedAt: f.holdClock.now() })
+      f.resolver.held('alpha', { seq: stored, operations: [sent.id], threadRoot: ROOT, rootUnknown: false, receivedAt: f.holdClock.now() }, retention)
       // Unretained, the owner would drop the decided entry right after its decided event.
       f.end(sent, answer)
     } })
@@ -492,6 +501,114 @@ describe('Post Hold resolver: kept outcomes, saves and retries', () => {
     expect(f.saves.map(s => s.resolutions.map(r => r.seq))).toEqual([[first, second], [third]])
     expect(f.releases.map(r => r.seq)).toEqual([first, second, third])
     stuck.resolve()
+  })
+})
+
+describe('Post Hold resolver: the decision\'s retention', () => {
+  test.each(['stopped', 'not runnable', 'already tracked'] as const)('a registration while %s releases the retention it is handed at once', async state => {
+    let running = true
+    const f = await resolverFixture({ canRun: () => running }), sent = await f.post(ROOT)
+    const gate = Promise.withResolvers<void>()
+    f.beforeSave(() => gate.promise)
+    try {
+      let seq: number
+      if (state === 'already tracked') {
+        seq = await f.hold([sent.id])
+        // A second registration of the tracked seq, with a retention of its own.
+        f.resolver.held('alpha', { seq, operations: [sent.id], threadRoot: ROOT, rootUnknown: false, receivedAt: f.holdClock.now() }, f.retain(sent.id))
+      } else {
+        if (state === 'stopped') f.resolver.stop(); else running = false
+        seq = await f.hold([sent.id])
+      }
+      f.end(sent, failure()); await f.holdClock.flush()
+      if (state === 'already tracked') {
+        // Only the tracked hold keeps the outcome, until its resolution is saved.
+        expect(f.saves).toEqual([f.resolved(seq, 'withdrawn')])
+        expect(f.h.owner.operation('alpha', sent.id)).toMatchObject({ state: 'decided', outcome: { kind: 'failed' } })
+        gate.resolve(); await f.holdClock.flush()
+        expect(f.state(seq)).toBe('withdrawn')
+      } else {
+        expect(f.saves).toEqual([]); expect(f.state(seq)).toBe('unresolved')
+      }
+      expect(f.h.owner.operation('alpha', sent.id)).toBeUndefined()
+      expect(f.holdClock.pendingCount()).toBe(0)
+    } finally { gate.resolve(); await f.holdClock.flush() }
+  })
+
+  test.each(['deadline setup', 'first check'] as const)('a Post Hold registration whose %s fails keeps no live entry and no outcome retention; releaseUntracked then saves its release once', async failure => {
+    const f = await resolverFixture(), sent = await f.post(ROOT)
+    let seq: number
+    if (failure === 'deadline setup') {
+      f.refuseNextTimer()
+      seq = await f.hold([sent.id])
+    } else {
+      // The deadline is armed, then queueing the first check throws (promise jobs are unaffected).
+      seq = await f.hold([sent.id], { afterStore: (stored, retention) => {
+        const queue = globalThis.queueMicrotask
+        globalThis.queueMicrotask = () => { throw new Error('fixture microtask queue refused') }
+        try { f.resolver.held('alpha', { seq: stored, operations: [sent.id], threadRoot: ROOT, rootUnknown: false, receivedAt: f.holdClock.now() }, retention) }
+        finally { globalThis.queueMicrotask = queue }
+      } })
+    }
+    // No timer survives the failed registration, and the handed retention is gone:
+    // the decided outcome is dropped at once, not kept for a forget.
+    expect(f.holdClock.pendingCount()).toBe(0)
+    f.end(sent, await inThread(ROOT)); await f.holdClock.flush()
+    expect(f.h.owner.operation('alpha', sent.id)).toBeUndefined()
+    expect(f.saves).toEqual([]); expect(f.events).toEqual([]); expect(f.state(seq)).toBe('unresolved')
+    // The saved hold is untracked work, released once as recovered.
+    let settled = false
+    const done = f.resolver.releaseUntracked('alpha').then(() => { settled = true })
+    await f.holdClock.flush()
+    expect(settled).toBe(true)
+    expect(f.saves).toEqual([f.resolved(seq, 'released')])
+    expect(f.releases).toEqual([{ key: 'alpha', seq, mode: 'recovered', hold: 'released' }])
+    expect(f.events).toEqual([{ kind: 'post-hold-resolved', key: 'alpha', seq, outcome: 'released', cause: 'restart' }])
+    await f.resolver.releaseUntracked('alpha'); await done
+    expect(f.saves).toHaveLength(1)
+    // Checks still run: no stale queued flag holds back the next hold's outcome.
+    const next = await f.post(ROOT2), later = await f.hold([next.id], { root: ROOT2 })
+    f.end(next, await inThread(ROOT2)); await f.holdClock.flush()
+    expect(f.saves.at(-1)).toEqual(f.resolved(later, 'released'))
+    expect(f.events.at(-1)).toEqual({ kind: 'post-hold-resolved', key: 'alpha', seq: later, outcome: 'released', cause: 'thread', heldMs: 0 })
+    expect(f.holdClock.pendingCount()).toBe(0)
+  })
+
+  test('an outcome one hold resolved stays retained for another hold still unresolved, which it then decides', async () => {
+    const f = await resolverFixture(), [a, b] = [await f.post(ROOT), await f.post(ROOT)]
+    const one = await f.hold([a.id]), both = await f.hold([a.id, b.id])
+    await f.holdClock.advance(500)
+    f.end(a, failure()); await f.holdClock.flush()
+    expect(f.saves).toEqual([f.resolved(one, 'withdrawn')])
+    expect(f.state(both)).toBe('unresolved')
+    expect(f.h.owner.operation('alpha', a.id)).toMatchObject({ state: 'decided', outcome: { kind: 'failed' } })
+    f.end(b, failure()); await f.holdClock.flush()
+    // Withdrawn by both outcomes, long before its timer.
+    expect(f.saves).toEqual([f.resolved(one, 'withdrawn'), f.resolved(both, 'withdrawn')])
+    expect(f.events.map(e => e.kind === 'post-hold-resolved' && [e.seq, e.outcome, e.cause])).toEqual([[one, 'withdrawn', 'outcomes'], [both, 'withdrawn', 'outcomes']])
+    expect([a.id, b.id].map(id => f.h.owner.operation('alpha', id))).toEqual([undefined, undefined])
+    expect(f.holdClock.pendingCount()).toBe(0)
+  })
+
+  test('a retention from before the key\'s forget, released late, never frees an outcome the next life\'s hold retains', async () => {
+    const f = await resolverFixture(), sent = await f.post(ROOT)
+    // A decision of the old life whose store has not finished yet.
+    const late = f.retain(sent.id)
+    f.resolver.forget('alpha'); f.h.owner.forget('alpha')
+    // The next life reads the kept intent back and a new hold retains it.
+    const seq = await f.hold([sent.id])
+    const gate = Promise.withResolvers<void>()
+    f.beforeSave(() => gate.promise)
+    try {
+      f.h.owner.recordLookup('alpha', sent.id, { found: { ts: REPLY, threadTs: ROOT }, holds: 'thread' })
+      await f.holdClock.flush()
+      expect(f.saves).toEqual([f.resolved(seq, 'released')])
+      late()
+      expect(f.h.owner.operation('alpha', sent.id)).toMatchObject({ state: 'decided', lookup: { holds: 'thread', thread: ROOT } })
+      gate.resolve(); await f.holdClock.flush()
+      expect(f.state(seq)).toBe('released')
+      expect(f.h.owner.operation('alpha', sent.id)).toBeUndefined()
+    } finally { gate.resolve(); await f.holdClock.flush() }
   })
 })
 
@@ -718,9 +835,9 @@ describe('Post Hold resolver: cancellation and isolation', () => {
     f.unresolvedMembership(); f.end(sent, await inThread(ROOT))
     const counts = () => ({ reads: f.operationReads(), decisions: f.decisionReads(), saves: f.saves.length, io: f.io.calls.length })
     let before: ReturnType<typeof counts> | undefined, after: ReturnType<typeof counts> | undefined
-    const seq = await f.hold([sent.id], { afterStore: stored => {
+    const seq = await f.hold([sent.id], { afterStore: (stored, retention) => {
       before = counts()
-      f.resolver.held('alpha', { seq: stored, operations: [sent.id], threadRoot: ROOT, rootUnknown: false, receivedAt: f.holdClock.now() })
+      f.resolver.held('alpha', { seq: stored, operations: [sent.id], threadRoot: ROOT, rootUnknown: false, receivedAt: f.holdClock.now() }, retention)
       f.resolver.check('alpha'); f.resolver.check('alpha')
       after = counts()
     } })

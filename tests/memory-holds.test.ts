@@ -35,7 +35,16 @@ function expectMemoryReportsSafe(run: ReloadRun) {
 const cleanups: Array<() => Promise<void>> = []
 afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await close() })
 
-async function resolverFixture(releaseFeedback?: () => Promise<void>) {
+/** A resolve's result once it settles, read without awaiting it: a writer chain still waiting on a release callback leaves it unset. */
+function settled(pending: Promise<unknown>): { result?: unknown } {
+  const seen: { result?: unknown } = {}
+  void pending.then(result => { seen.result = result })
+  return seen
+}
+
+/** The real resolver over a real durable queue on a fake clock. `releaseFeedback` is routing's
+ * release callback for one saved release: it may return a gate, throw or reject. */
+async function resolverFixture(releaseFeedback?: (key: string, seq: number) => void | Promise<void>) {
   const dir = mkdtempSync(join(tmpdir(), 'memory-resolver-')), clock = createFakeClock({ start: THREAD_TIME })
   const io = threadFsControls(dir), queue = await makeQueue(dir, { now: clock.now, fs: io.fs })
   clock.settleOn(io.durable)
@@ -55,7 +64,7 @@ async function resolverFixture(releaseFeedback?: () => Promise<void>) {
     clock, now: () => { nowReads++; return clock.now() },
     release(key, item, mode) {
       releases.push({ key, seq: item.accepted.seq, mode }); order.push(`released:${key}:${item.accepted.seq}`)
-      return releaseFeedback?.()
+      return releaseFeedback?.(key, item.accepted.seq)
     },
     onEvent(event) { events.push(event); order.push(event.type) },
   })
@@ -194,9 +203,11 @@ describe('Memory Hold resolver', () => {
         ] as const : []),
       ])
       if (compacted) {
-        expect(f.releases).toEqual(expectedReleases.slice(0, 1)); expect(f.events).toEqual(expectedEvents)
+        // Every saved release has started, in order, and the resolve has finished, while the first one's feedback waits.
+        expect(f.releases).toEqual(expectedReleases); expect(f.events).toEqual(expectedEvents)
+        expect(await pending).toBe('resolved')
         expect(f.queue.item('alpha', 4)!.hold!.state).toBe('withdrawn')
-        // Remove the full withdrawal while the first release's feedback waits.
+        // Remove the full withdrawal while that feedback still waits.
         await f.queue.compact('alpha')
         expect(f.queue.item('alpha', 4)).toBeUndefined()
         expect(f.queue.item('alpha', 5)!.accepted.released_at).toBe(at)
@@ -213,6 +224,87 @@ describe('Memory Hold resolver', () => {
       expect(f.releases).toEqual(expectedReleases); expect(f.events).toEqual(expectedEvents)
       expect(f.saves).toHaveLength(1); expect(readQueue(f.dir)).toEqual(records)
     } finally { gate.resolve(); feedback.resolve(); await pending }
+  })
+
+  // SR-4.3.2: the queue owns the durable decision; release feedback runs beside the writer chain.
+  test('with the first release callback pending, later releases start in order with their own modes, the resolve and its second compaction finish, and a fresh hold resolves', async () => {
+    const first = Promise.withResolvers<void>()
+    const f = await resolverFixture((key, seq) => key === 'alpha' && seq === 1 ? first.promise : undefined)
+    try {
+      await f.hold()
+      f.answers.set(root, 'unknown')
+      // The start's recovered request, with its second compaction, captures seq 1's mode before memory is known.
+      expect(await f.resolver.resolve('alpha', 'recovered', true)).toBe('unknown')
+      await f.hold(); await f.hold(THREAD_ROOTS.secondary)
+      f.answers.set(root, true); f.answers.set(THREAD_ROOTS.secondary, true)
+      const live = settled(f.resolver.resolve('alpha', 'live'))
+      await f.clock.flush()
+      expect(live.result).toBe('resolved')
+      expect(f.releases).toEqual([{ key: 'alpha', seq: 1, mode: 'recovered' }, { key: 'alpha', seq: 2, mode: 'live' }, { key: 'alpha', seq: 3, mode: 'live' }])
+      expect(f.order).toEqual(['saved:alpha', 'released:alpha:1', 'released:alpha:2', 'released:alpha:3', 'pruned:alpha'])
+      // The requested compaction ran: the saved releases now live in their accepted records.
+      expect(readQueue(f.dir).filter(r => r.kind === 'released')).toEqual([])
+      expect([1, 2, 3].map(seq => f.queue.item('alpha', seq)!.accepted.released_at)).toEqual([f.clock.now(), f.clock.now(), f.clock.now()])
+      // Another request for the same persona saves and releases a fresh hold before seq 1's feedback settles.
+      const fresh = await f.hold(THREAD_ROOTS.third)
+      f.answers.set(THREAD_ROOTS.third, true)
+      const next = settled(f.resolver.resolve('alpha', 'live'))
+      await f.clock.flush()
+      expect(next.result).toBe('resolved')
+      expect(f.saves.map(s => s.decisions.map(d => [d.seq, d.outcome]))).toEqual([[[1, 'released'], [2, 'released'], [3, 'released']], [[fresh, 'released']]])
+      expect(f.releases.slice(3)).toEqual([{ key: 'alpha', seq: fresh, mode: 'live' }])
+      expect(f.events).toEqual([])
+      first.resolve(); await f.clock.flush()
+      expect(f.releases).toHaveLength(4); expect(f.events).toEqual([])
+    } finally { first.resolve(); await f.clock.flush() }
+  })
+
+  test.each(['throws', 'rejects'] as const)('a release callback that %s reports release-failed for its key and seq; later releases, resolves and the neighbor continue', async fault => {
+    const f = await resolverFixture((key, seq) => {
+      if (key !== 'alpha' || seq !== 1) return
+      const error = new Error('fixture release feedback failed')
+      if (fault === 'throws') throw error
+      return Promise.reject(error)
+    })
+    f.answers.set(root, true)
+    await f.hold(); await f.hold(); await f.hold(root, 'beta')
+    expect(await f.resolver.resolve('alpha', 'live')).toBe('resolved')
+    await f.clock.flush()
+    expect(f.releases).toEqual([1, 2].map(seq => ({ key: 'alpha', seq, mode: 'live' })))
+    expect(f.events).toEqual([{ type: 'release-failed', key: 'alpha', seq: 1, error: expect.objectContaining({ message: 'fixture release feedback failed' }) }])
+    const later = await f.hold()
+    expect(await f.resolver.resolve('alpha', 'live')).toBe('resolved')
+    expect(await f.resolver.resolve('beta', 'live')).toBe('resolved')
+    expect(f.releases.slice(2)).toEqual([{ key: 'alpha', seq: later, mode: 'live' }, { key: 'beta', seq: 1, mode: 'live' }])
+    expect(f.queue.unresolvedHolds('alpha')).toEqual([]); expect(f.queue.unresolvedHolds('beta')).toEqual([])
+    expect(f.events).toHaveLength(1)
+  })
+
+  test.each(['forget', 'stop', 'a replacement life'] as const)('a release rejection settling after %s reports nothing', async retire => {
+    const late = Promise.withResolvers<void>()
+    late.promise.catch(() => {})
+    const f = await resolverFixture((key, seq) => key === 'alpha' && seq === 1 ? late.promise : undefined)
+    const failure = new Error('fixture late release failure')
+    try {
+      f.answers.set(root, true)
+      await f.hold(); await f.hold(root, 'beta')
+      const resolved = settled(f.resolver.resolve('alpha', 'live'))
+      await f.clock.flush()
+      expect(f.releases).toEqual([{ key: 'alpha', seq: 1, mode: 'live' }])
+      expect(resolved.result).toBe('resolved')
+      if (retire === 'stop') f.resolver.stop(); else f.resolver.forget('alpha')
+      if (retire === 'a replacement life') {
+        const next = await f.hold()
+        expect(await f.resolver.resolve('alpha', 'live')).toBe('resolved')
+        expect(f.releases.at(-1)).toEqual({ key: 'alpha', seq: next, mode: 'live' })
+      }
+      late.reject(failure); await f.clock.flush()
+      expect(f.events).toEqual([])
+      // The neighbor still resolves unless the whole resolver stopped.
+      expect(await f.resolver.resolve('beta', 'live')).toBe(retire === 'stop' ? 'cancelled' : 'resolved')
+      expect(f.releases.filter(r => r.key === 'beta')).toEqual(retire === 'stop' ? [] : [{ key: 'beta', seq: 1, mode: 'live' }])
+      expect(f.clock.pendingCount()).toBe(0)
+    } finally { late.reject(failure); await f.clock.flush() }
   })
 
   test.each(['forget', 'stop'] as const)('%s cancels a failed append retry', async cancel => {
@@ -737,7 +829,7 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold outage', mode => {
   })
 
   test.each(['before-append', 'durable-completion', 'synchronous-queue-observer', 'release-feedback'] as const)(
-    'firstRead cancellation at %s preserves exactly one committed loss across same-key bring-up', async boundary => {
+    'a teardown at %s of the first read\'s resolution preserves exactly one committed loss across same-key bring-up', async boundary => {
       const f = outageFixture(mode), first = await f.start()
       await f.intake(first, 'mention'); await f.drain(first); await first.stop()
       const io = threadFsControls(f.h.stateDir); io.fail('readFileSync', 'alpha')
@@ -772,13 +864,16 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold outage', mode => {
         expect(run.threadMemoryWindow('alpha')).not.toBe('none')
         expect(run.appliedKeys()).toContain('alpha')
         beforeAppend.resolve(); feedback.resolve(); await run.clock.flush()
-        expect(await pending).toBe('cancelled')
+        // Release feedback is not awaited: that resolution had finished, saved, before the teardown began.
+        expect(await pending).toBe(boundary === 'release-feedback' ? 'resolved' : 'cancelled')
         const committed = boundary !== 'before-append'
         expect(run.queue.unresolvedHolds('alpha')).toHaveLength(committed ? 0 : 2)
         expect(readQueue(f.h.stateDir).filter(r => r.kind === 'hold-withdrawn')).toHaveLength(committed ? 1 : 0)
         expect(run.memoryHoldEvents.filter(e => e.type === 'withdrawn')).toHaveLength(committed ? 1 : 0)
         expect(run.heldReleases).toHaveLength(boundary === 'release-feedback' ? 1 : 0)
-        expect(run.threadMemoryRetryEvents.filter(e => e.type === 'read-after-retries')).toEqual([])
+        // Only a teardown inside the resolution cancels the first read; one during detached feedback finds it complete.
+        expect(run.threadMemoryRetryEvents.filter(e => e.type === 'read-after-retries'))
+          .toEqual(boundary === 'release-feedback' ? [{ type: 'read-after-retries', key: 'alpha', attempts: 1 }] : [])
         const writes = io.writes().length
         run.threadMemoryRetries!.appendFailed('alpha')
         run.observeThreadMemoryEvent(run.threadMemoryEvents.find(e => e.type === 'read-failed' && e.key === 'alpha')!)

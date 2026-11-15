@@ -18,6 +18,7 @@ import { LIVENESS_READING_DEAD_ENDED } from '../src/liveness-reading.ts'
 import { sanitizeFilename } from '../src/lib.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { durableIo } from './test-helpers/durable-io.ts'
+import { outputDuringAsync } from './test-helpers/slack-logger-probes.ts'
 import { makeRestartDeps, makeRoutingHarness, observedMembership, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness, type RoutingHarnessOptions } from './test-helpers/persona-routing-harness.ts'
 import { broadcastText, makeAppMention, makeChannelMessage, makeDm, makeGroupDmMessage, makeBotMessage, makeOwnFileShare, makeReaction, makeWebhookPost, makeStubSlack, makeDeferredWebApiCall, makeMembershipEvent, mentionText, ENVELOPE_FLAG_FORMS, type EnvelopeOverrides, type OwnFileShareOptions, type SlackEvent } from './test-helpers/slack-stub.ts'
 import type { ChannelMode, Persona } from '../src/config.ts'
@@ -29,7 +30,7 @@ import { describeSlackCallFailure } from '../src/persona-connection-errors.ts'
 import { personaKey } from '../src/persona-identity.ts'
 import { assertNoLeak, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
 import { deliveredRecord, readQueue, seedQueue, slackInput, injectedInput, queuePath, memoryHold, postHold } from './test-helpers/delivery-queue.ts'
-import { OWN_ROOT_CLOCK_SKEW_MS } from '../src/delivery-constants.ts'
+import { OWN_ROOT_CLOCK_SKEW_MS, THREAD_REPLY_HOLD_MS } from '../src/delivery-constants.ts'
 import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
 import { configBytes, makeSharedAuthority, makeMembershipHarness, membershipPage, sharedRecoveryRequest } from './test-helpers/shared-channels.ts'
 import { makeReloadHarness } from './test-helpers/reload-harness.ts'
@@ -40,13 +41,18 @@ import { makeQueue } from './test-helpers/delivery-queue.ts'
 import { initRestart, isRestartPendingOrActive } from '../src/restart.ts'
 import { createQueuedAckCallback, createDeliveryAckCallback } from '../src/ack-tracker.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
-import { THREAD_CHANNELS, THREAD_ROOTS, THREAD_TIME, readThreads, slackTsOfMs, threadPath, threadFsControls, seedThreads, threadHeader, threadConfig } from './test-helpers/thread-memory.ts'
+import { THREAD_CHANNELS, THREAD_ROOTS, THREAD_TIME, joinRecord, readThreads, slackTsOfMs, threadPath, threadFsControls, seedThreads, threadHeader, threadConfig } from './test-helpers/thread-memory.ts'
 const CA = 'C0TEST001', CB = 'C0TEST002', CS = 'C0SHARED1', CX = 'C0OTHER01'
 let dir: string; let harnesses: RoutingHarness[]
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'routing-queue-')); harnesses = []; resetRoutingState() })
 afterEach(async () => {
   try {
-    for (const h of harnesses) { h.hold.cancelAll(); h.releaseLaunches(); await h.ready(); await h.threads?.close(); await h.preparation.stop(); await h.queue.stop(); assertNoLeak(h.captured()) }
+    for (const h of harnesses) {
+      h.hold.cancelAll(); h.releaseLaunches(); await h.ready(); await h.threads?.close()
+      // Closing stops the opt-in resolvers, cancelling every hold and retry timer.
+      if (h.resolvers) expect(h.resolvers.clock.pendingCount()).toBe(0)
+      await h.preparation.stop(); await h.queue.stop(); assertNoLeak(h.captured())
+    }
   } finally { resetRoutingState(); rmSync(dir, { recursive: true, force: true }) }
 })
 function harness(opts: Parameters<typeof makeRoutingHarness>[2] = {}) {
@@ -300,7 +306,8 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold routing', mode => {
     if (failQ) {
       expect(atAck).toEqual([])
       expect(h.queued('alpha')).toHaveLength(1); expect(h.queued('beta')).toEqual([])
-      expect(h.holdStored).toEqual([])
+      // P's stored hold notifies its resolver though Q's failed store withholds the ack.
+      expect(h.holdStored).toEqual(['alpha'])
       expect(received).toEqual([])
       expect(h.p('alpha').stub.callLog).toEqual([])
       queueIo.heal(); await h.receive(event, ['alpha', 'beta'], ack)
@@ -312,13 +319,66 @@ describe.each(['strict', 'open'] as const)('%s Memory Hold routing', mode => {
     ]])
     // Recipients store concurrently: each once, in either order; atAck proves both were on disk at the ack.
     expect(events.filter(e => e.type === 'stored').map(e => e.key).sort()).toEqual(['alpha', 'beta'])
-    expect(h.holdStored).toEqual(['alpha'])
-    expect(h.order.indexOf('hold-stored:alpha')).toBeGreaterThan(h.order.indexOf('ack'))
+    // The retry's duplicate of the still unresolved hold notifies again, after the one ack.
+    expect(h.holdStored).toEqual(failQ ? ['alpha', 'alpha'] : ['alpha'])
+    expect(h.order.lastIndexOf('hold-stored:alpha')).toBeGreaterThan(h.order.indexOf('ack'))
     expect(received).toEqual([{ key: 'beta', seq: h.queued('beta')[0]!.accepted.seq, mode: 'live' }])
     expect(h.queued('alpha')[0]!.fixed).toBeUndefined()
     expect(h.p('alpha').stub.callLog).toEqual([])
     expect(h.queued('beta')[0]!.fixed).toBeDefined()
     expect(h.p('beta').stub.calls.reactionsAdd).toHaveLength(1)
+  })
+
+  // SR-4.3.2 on the ack-suppressed path: the stored hold's notification needs no ack, retry or timer.
+  test.each(['released', 'withdrawn'] as const)('a Memory Hold stored beside a failed sibling store is %s by the production resolver at once, though the ack is withheld; the retry adds nothing for P', async outcome => {
+    const { h, t, io, queueIo, received, settleFeedback } = await unreadable({ threadMemory: { resolvers: true } })
+    const holds = h.resolvers!, R = THREAD_ROOTS.primary, released = outcome === 'released'
+    expect(t.choose('all', 'beta', A).kind).toBe('applied')
+    const event = reply(), arrival = t.memory.clock('alpha') + 1, atAck: unknown[] = []
+    const ack = () => { atAck.push({ prepared: [...h.preparationCalls], rowReads: [...h.rowReads] }); h.order.push('ack') }
+    queueIo.fail('writeSync', 'beta', { match: path => path === queuePath(dir, 'beta') })
+    const store = queueIo.hold('fsync', 'alpha', { match: path => path === queuePath(dir) })
+    const intake = h.receive(event, ['alpha', 'beta'], ack)
+    try {
+      await store.reached
+      // While P's hold store waits, P's journal becomes readable: it names the thread before the arrival, or not at all.
+      seedThreads(dir, [threadHeader(), ...(released ? [joinRecord(t.fact({ channel: A, root: R, at: arrival - 1 }))] : [])])
+      io.heal(); await t.memory.retryRead('alpha')
+      expect(t.memory.view('alpha', A, R)).toBe(released ? 'joined' : 'not-joined')
+      // Feedback uses the reaction stored at the decision.
+      h.config!.queued_ack_reaction = 'changed_after_hold'
+    } finally { store.release(); await intake; await holds.clock.flush() }
+    await settleFeedback()
+    const item = h.queued('alpha')[0]!, seq = item.accepted.seq
+    expect(h.order.filter(x => x === 'ack')).toEqual([])
+    expect(h.holdStored).toEqual(['alpha'])
+    expect(item.hold?.state).toBe(outcome)
+    expect(readQueue(dir).filter(r => r.kind === 'released' || r.kind === 'hold-withdrawn')).toEqual([{ v: 1, kind: released ? 'released' : 'hold-withdrawn', seq, at: t.clock.now() }])
+    expect(holds.memoryEvents).toEqual(released ? [] : [{ type: 'withdrawn', key: 'alpha', holds: [{ seq, channel: A, thread_ts: R, ts: event.ts as string }] }])
+    expect([holds.clock.now(), holds.clock.firedCount(), holds.clock.pendingCount()]).toEqual([0, 0, 0])
+    /** P's feedback: none once withdrawn; once released, the stored reaction and one live preparation. `later` is Q's preparation. */
+    const feedback = (later: RoutingHarness['preparationCalls'] = []) => {
+      const mine = received.filter(r => r.key === 'alpha')
+      if (!released) { quiet(h, mine, 0, later); expect(holds.releases).toEqual([]); return }
+      expect(holds.releases).toEqual([{ owner: 'memory', key: 'alpha', seq, mode: 'live' }])
+      expect(mine).toEqual([{ key: 'alpha', seq, mode: 'live' }])
+      expect(item.accepted.queued_ack_reaction).not.toBe('changed_after_hold')
+      expect(h.p('alpha').stub.calls.reactionsAdd).toEqual([{ channel: A, timestamp: event.ts as string, name: item.accepted.queued_ack_reaction! }])
+      expect(h.preparationCalls).toEqual([{ key: 'alpha', seq }, ...later])
+      expect(h.queued('alpha')[0]!.fixed).toBeDefined()
+    }
+    feedback()
+    expect(h.queued('beta')).toEqual([]); expect(h.p('beta').stub.callLog).toEqual([])
+    // Slack's retry: Q is stored once and prepared only after the one ack; P's stored work is a duplicate.
+    const before = readQueue(dir)
+    queueIo.heal(); await h.receive(event, ['alpha', 'beta'], ack)
+    await holds.clock.flush(); await settleFeedback()
+    const beta = h.queued('beta')[0]!.accepted.seq
+    expect(atAck).toEqual([{ prepared: released ? [{ key: 'alpha', seq }] : [], rowReads: [] }])
+    expect(received.filter(r => r.key === 'beta')).toEqual([{ key: 'beta', seq: beta, mode: 'live' }])
+    expect(readQueue(dir)).toEqual(before)
+    expect(h.holdStored).toEqual(['alpha'])
+    feedback([{ key: 'beta', seq: beta }])
   })
 
   test.each([['live', 'uncompacted'], ['recovered', 'uncompacted'], ['live', 'compacted'], ['recovered', 'compacted']] as const)('%s release at time zero (%s) reports, uses the stored reaction and prepares; only live recovers a disconnected session', async (releaseMode, representation) => {
@@ -2105,6 +2165,17 @@ describe.each(['strict', 'open'] as const)('%s Post Hold routing through real ow
         await call
       } }
   }
+  /** Hold `key`'s next queue-file sync: its intake's group commit, after the decision and before publication. Release it before the case ends. */
+  const holdStore = (queueIo: ReturnType<typeof threadFsControls>, key = 'alpha') => queueIo.hold('fsync', key, { match: path => path === queuePath(dir, key) })
+  /** Slack answers P's held post: a refusal, or its confirmation in the thread it was posted to. */
+  async function answer(post: Awaited<ReturnType<typeof heldPost>>, outcome: 'failed' | 'confirmed') {
+    if (outcome === 'confirmed') { await post.settle(); return }
+    // The reply tool reports the refusal on the console, captured here and leak-checked.
+    assertNoLeak(await outputDuringAsync(async () => {
+      post.answer.settle({ kind: 'platform', error: 'not_in_channel' })
+      await expect(post.settle()).rejects.toThrow('reported an error')
+    }))
+  }
 
   test("a reply in P's thread before Slack answers P's post there is held for that post and acknowledged while the answer waits", async () => {
     const { h, t, received, settleFeedback } = await postHarness({ sessions: [] })
@@ -2337,14 +2408,16 @@ describe.each(['strict', 'open'] as const)('%s Post Hold routing through real ow
       if (failQ) {
         expect(atAck).toEqual([])
         expect(h.queued('alpha')).toHaveLength(1); expect(h.queued('beta')).toEqual([])
-        expect(h.holdStored).toEqual([])
+        // P's stored hold notifies its resolver though Q's failed store withholds the ack.
+        expect(h.holdStored).toEqual(['alpha'])
         queueIo.heal(); await h.receive(event, ['alpha', 'beta'], ack)
       }
       await settleFeedback()
       expect(atAck).toEqual([[[['thread', 'post']], [['receive_all', undefined]]]])
       expect(h.queued('alpha')).toHaveLength(1)
-      expect(h.holdStored).toEqual(['alpha'])
-      expect(h.order.indexOf('hold-stored:alpha')).toBeGreaterThan(h.order.indexOf('ack'))
+      // The retry's duplicate of the still unresolved hold notifies again, after the one ack.
+      expect(h.holdStored).toEqual(failQ ? ['alpha', 'alpha'] : ['alpha'])
+      expect(h.order.lastIndexOf('hold-stored:alpha')).toBeGreaterThan(h.order.indexOf('ack'))
       expect(received).toEqual([{ key: 'beta', seq: h.queued('beta')[0]!.accepted.seq, mode: 'live' }])
       expect(h.p('beta').stub.calls.reactionsAdd).toHaveLength(1)
       quiet(h, [], calls, [{ key: 'beta', seq: h.queued('beta')[0]!.accepted.seq }])
@@ -2513,6 +2586,21 @@ describe.each(['strict', 'open'] as const)('%s Post Hold routing through real ow
       } finally { await alphaPost.settle(); await betaPost.settle() }
     })
 
+    test.each(['record', 'throw'] as const)('a held that records (%s) leaves no outcome retained once intake returns', async variant => {
+      const { h, queueIo } = await registering({}, variant)
+      const post = await heldPost(h, { thread_ts: R }), store = holdStore(queueIo)
+      const intake = h.receive(humanReply(), ['alpha'])
+      try {
+        await store.reached
+        await answer(post, 'failed')
+        expect(h.ownPostJoins!.operation('alpha', post.operation!)).toMatchObject({ state: 'decided' })
+      } finally { store.release(); await intake; if (!post.answer.settled) await post.settle() }
+      expect(h.heldPostHolds).toEqual([registration(h, 'alpha', 0, RECEIPT_START)])
+      expect(acks(h)).toHaveLength(1)
+      // The recorder tracks nothing and releases its retention; a throwing one leaves routing to release it.
+      expect(h.ownPostJoins!.operation('alpha', post.operation!)).toBeUndefined()
+    })
+
     test.each(['monotonicNow', 'postHolds'] as const)('with only %s, a Post Hold is stored and acknowledged as without both, and nothing registers', async only => {
       const receipt = createFakeClock({ start: RECEIPT_START })
       const { h } = await postHarness({ threadMemory: only === 'monotonicNow' ? { monotonicNow: receipt.now } : { postHolds: 'record' } })
@@ -2524,6 +2612,87 @@ describe.each(['strict', 'open'] as const)('%s Post Hold routing through real ow
         expect(h.heldPostHolds).toEqual([])
       } finally { await post.settle() }
     })
+  })
+
+  // SR-4.2.4: an outcome decided while a reply's store is in flight survives
+  // that store, so the hold resolves from it at once rather than by its timer.
+  describe('outcome retention through the production hold resolvers', () => {
+    const resolving = (options: Parameters<typeof holdRoutingHarness>[1] = {}) =>
+      postHarness({ ...options, threadMemory: { resolvers: true, ...options.threadMemory } })
+    const resolutions = () => existsSync(queuePath(dir)) ? readQueue(dir).filter(r => r.kind === 'released' || r.kind === 'hold-withdrawn') : []
+    const outcomes = () => readThreads(dir).filter(r => r.kind === 'post-outcome')
+
+    test.each([['fails', 'failed'], ["is confirmed in the reply's thread", 'confirmed']] as const)(
+      "a post that %s while its reply's Post Hold store waits on disk resolves that hold durably as the store finishes, before THREAD_REPLY_HOLD_MS", async (_label, outcome) => {
+        const { h, t, queueIo, received, settleFeedback } = await resolving()
+        const holds = h.resolvers!, post = await heldPost(h, { thread_ts: R }), event = humanReply()
+        const calls = h.p('alpha').stub.callLog.length, store = holdStore(queueIo)
+        const intake = h.receive(event, ['alpha'])
+        try {
+          await store.reached
+          // Decided and staged: neither durable nor published, so nothing else retains the post.
+          expect(h.queued('alpha')).toEqual([])
+          await answer(post, outcome)
+          expect(h.ownPostJoins!.operation('alpha', post.operation!)).toMatchObject({ state: 'decided', outcome: { kind: outcome } })
+        } finally { store.release(); await intake; if (!post.answer.settled) await post.settle(); await holds.clock.flush() }
+        await settleFeedback()
+        const item = h.queued('alpha')[0]!, seq = item.accepted.seq, released = outcome === 'confirmed'
+        expect(acks(h)).toHaveLength(1)
+        // Durable in both journals with no later event, verdict or deadline: the hold clock never moved.
+        expect(resolutions()).toEqual([{ v: 1, kind: released ? 'released' : 'hold-withdrawn', seq, at: t.clock.now() }])
+        expect(outcomes()).toEqual([expect.objectContaining({ operationId: post.operation, outcome: released ? 'joined' : 'none' })])
+        expect(holds.postEvents).toEqual([{ kind: 'post-hold-resolved', key: 'alpha', seq, outcome: released ? 'released' : 'withdrawn', cause: released ? 'thread' : 'outcomes', heldMs: 0 }])
+        expect(holds.clock.now()).toBeLessThan(THREAD_REPLY_HOLD_MS)
+        expect([holds.clock.now(), holds.clock.firedCount(), holds.clock.pendingCount()]).toEqual([0, 0, 0])
+        expect(h.ownPostJoins!.operation('alpha', post.operation!)).toBeUndefined()
+        const feedback = () => {
+          if (!released) { quiet(h, received, calls); expect(holds.releases).toEqual([]); return }
+          // Released once, live: the stored reaction, then normal preparation.
+          expect(holds.releases).toEqual([{ owner: 'post', key: 'alpha', seq, mode: 'live' }])
+          expect(received).toEqual([{ key: 'alpha', seq, mode: 'live' }])
+          expect(h.p('alpha').stub.calls.reactionsAdd).toEqual([{ channel: A, timestamp: event.ts as string, name: item.accepted.queued_ack_reaction! }])
+          expect(h.preparationCalls).toEqual([{ key: 'alpha', seq }])
+          expect(h.queued('alpha')[0]!.fixed).toBeDefined()
+          expect(h.rowReads).toEqual([])
+        }
+        feedback()
+        await holds.clock.advance(THREAD_REPLY_HOLD_MS); await settleFeedback()
+        feedback()
+        expect(resolutions()).toHaveLength(1); expect(holds.postEvents).toHaveLength(1)
+        // The sibling persona's queue and client are untouched.
+        expect(h.queued('beta')).toEqual([]); expect(h.p('beta').stub.callLog).toEqual([]); expect(existsSync(queuePath(dir, 'beta'))).toBe(false)
+      })
+
+    test.each(['its store fails', 'the queue rejects after the decision', 'the resolver stops while the store waits'] as const)(
+      'when %s, the outcome landing meanwhile is not retained once intake returns', async ending => {
+        const { h, queueIo } = await resolving()
+        const holds = h.resolvers!, post = await heldPost(h, { thread_ts: R }), store = holdStore(queueIo)
+        if (ending === 'the queue rejects after the decision') {
+          store.release()
+          h.queue.acceptDecided = async (_key, _slackKey, decide) => {
+            expect(decide({ keyChecked: true })).toMatchObject({ store: { hold: { on: 'post', operations: [post.operation] } } })
+            await answer(post, 'failed')
+            expect(h.ownPostJoins!.operation('alpha', post.operation!)).toMatchObject({ state: 'decided' })
+            throw new Error('fixture queue rejected the store')
+          }
+        }
+        const intake = h.receive(humanReply(), ['alpha'])
+        try {
+          if (ending !== 'the queue rejects after the decision') {
+            await store.reached
+            await answer(post, 'failed')
+            expect(h.ownPostJoins!.operation('alpha', post.operation!)).toMatchObject({ state: 'decided' })
+            if (ending === 'its store fails') store.fail(Object.assign(new Error('fixture fsync refused'), { code: 'EIO' }))
+            else holds.post.stop()
+          }
+        } finally { store.release(); await intake; if (!post.answer.settled) await post.settle(); await holds.clock.flush() }
+        expect(h.ownPostJoins!.operation('alpha', post.operation!)).toBeUndefined()
+        expect(resolutions()).toEqual([]); expect(holds.postEvents).toEqual([]); expect(holds.clock.pendingCount()).toBe(0)
+        // A stored hold whose resolver stopped stays durable and acknowledged; a refused store withholds the ack.
+        const stored = ending === 'the resolver stops while the store waits'
+        expect(h.queued('alpha').map(i => i.hold?.state)).toEqual(stored ? ['unresolved'] : [])
+        expect(acks(h)).toHaveLength(stored ? 1 : 0)
+      })
   })
 })
 

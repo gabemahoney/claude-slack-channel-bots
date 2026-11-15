@@ -2482,8 +2482,11 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           try { reporting?.holdStored(key) } catch { /* reporting is independent of the holds */ }
         },
         monotonicNow: connections.clock.now,
-        postHolds: { held: (key: string, hold: StoredPostHold) => postHolds?.held(key, hold) },
+        // As server.ts binds them: the resolver takes the decision's retention (released
+        // with no resolver), and that retention comes from the owner pendingOwnPosts reads.
+        postHolds: { held: (key: string, hold: StoredPostHold, retention: () => void) => postHolds ? postHolds.held(key, hold, retention) : retention() },
         pendingOwnPosts: (key: string, channel: string) => pendingOwnPostViews(ownPostJoins?.pendingOwnPosts(key, channel) ?? []),
+        retainOwnPostOutcomes: (key: string, operationIds: readonly string[]) => ownPostJoins?.retainOutcomes(key, operationIds) ?? (() => {}),
         // As server.ts binds it: no runner in a dry run, so the hook does nothing.
         onOwnMessage: (...args: Parameters<OwnPostLookups['ownMessage']>) => ownPostLookups?.ownMessage(...args),
       }),

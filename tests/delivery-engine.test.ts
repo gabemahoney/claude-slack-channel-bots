@@ -332,7 +332,8 @@ test('incremental policy inputs preserve ordered sends, refusal positions, unkno
   expect(compacted.p).toEqual({ accepted: [1, 2, 3, 4], fixed: [2, 3], sent: [send(2, 2, 2, 'unknown'), send(2, 2, 3)], refused: [], delivered: [[2, 1]] , withdrawn: [] })
   expect(compacted.holds).toEqual([{ item: 4, kind: 'memory' }])
   expect(compacted.e.noticed).toEqual([2, 3])
-  expect(h.engine.status('alpha')).toMatchObject({ seq: 1, count: 3 })
+  // Item 2's durable in-flight attempt stays the reported target though released item 1 now precedes it.
+  expect(h.engine.status('alpha')).toMatchObject({ seq: 2, count: 3 })
   expect(h.engine.snapshot('beta')?.p).toEqual({ accepted: [1], fixed: [1], sent: [], refused: [], delivered: [] , withdrawn: [] })
   await h.restartServer(); await h.tick()
   expect(h.engine.snapshot('alpha')?.p).toEqual(compacted.p)

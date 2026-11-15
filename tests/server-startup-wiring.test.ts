@@ -4655,7 +4655,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
       'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
       'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS, 'getChannelDelivery', 'membership',
       'threadMemory', 'pendingOwnPosts', 'joins', 'threadStampUndecided', 'threadStampEpisodes', 'onHoldStored', ROUTING_OWN_MESSAGE,
-      'monotonicNow', 'ackTiming', 'postHolds',
+      'monotonicNow', 'ackTiming', 'postHolds', 'retainOwnPostOutcomes',
     ]
     expect([...onlyCallProps('createPersonaRouting').keys()].sort()).toEqual([...MEMBERS].sort())
   })
@@ -6226,21 +6226,23 @@ describe('the own-post observer shares one Thread Memory owner', () => {
       `${member}: opts.threadMemory === undefined ? undefined : ${binding.slice(0, arrow)} => { h.pendingOwnPostReads.push([key, channel]) return ${binding.slice(arrow + 4)} }`,
     ])
     expect(indicesOf(new RegExp(`(?<![\\w.$])${mapping}\\s*\\(`, 'g'), harness)).toHaveLength(1)
-    // Post Hold registration: production's two members, each bound only behind its own opt-in, so runs
-    // that don't opt in keep routing's absent defaults; the recording `postHolds` keeps `held`'s shape.
+    // Post Hold registration and outcome retention: production's members, each bound only behind an opt-in,
+    // so runs that don't opt in keep routing's absent defaults; `held` keeps production's shape, and the
+    // retention is production's adapter over the same owner pendingOwnPosts reads.
     const parts = splitTopLevel(routingDeps.slice(...balancedAfter(routingDeps, 0, '{', '}')))
-    const bound = (name: keyof PersonaRoutingDeps) => {
+    const bound = (name: keyof PersonaRoutingDeps, optIn: string) => {
       const found = parts.filter(part => part.startsWith(`${name}:`))
       expect(found).toHaveLength(1)
-      const optIn = `${name}: opts.threadMemory?.${name} === undefined ? undefined : `
-      expect(found[0]!.startsWith(optIn)).toBe(true)
-      return found[0]!.slice(optIn.length)
+      const prefix = `${name}: ${optIn} ? undefined : `
+      expect(found[0]!.startsWith(prefix)).toBe(true)
+      return found[0]!.slice(prefix.length)
     }
     expect(onlyCallProps('createPersonaRouting').get('monotonicNow')).toBe('HOLD_CLOCK.now')
-    expect(bound('monotonicNow')).toMatch(/^\(\) => \{ .* return opts\.threadMemory!\.monotonicNow!\(\) \}$/)
+    expect(bound('monotonicNow', 'receiptNow === undefined')).toMatch(/^\(\) => \{ .* return receiptNow\(\) \}$/)
     const held = (value: string) => [...objectProperties(value)].map(([name, arrow]) => [name, arrow.slice(0, arrow.indexOf(' => '))])
-    expect(held(bound('postHolds'))).toEqual(held(onlyCallProps('createPersonaRouting').get('postHolds')!))
-    expect(held(bound('postHolds'))).toEqual([['held', '(key, hold)']])
+    expect(held(bound('postHolds', '!registers'))).toEqual(held(onlyCallProps('createPersonaRouting').get('postHolds')!))
+    expect(held(bound('postHolds', '!registers'))).toEqual([['held', '(key, hold, retention)']])
+    expect(bound('retainOwnPostOutcomes', 'opts.threadMemory === undefined')).toBe(onlyCallProps('createPersonaRouting').get('retainOwnPostOutcomes')!)
   })
 
   // The end-to-end Post Hold and k8 crash cases run over the reload harness's
@@ -6284,11 +6286,17 @@ describe('the own-post observer shares one Thread Memory owner', () => {
     expect(harness.loaded).toBe(asHarness(server.loaded))
     expect(harness.start).toEqual(server.start.map(asHarness))
     expect(harness.bringUp.map(asserted)).toEqual(server.bringUp.map(asHarness))
-    // Routing's thread view and stored-hold hook bodies, in the harness's names:
+    // Routing's thread view, stored-hold hook and outcome retention bodies, in the harness's names:
     // its queue always exists, and its delivery reporting is `reporting`.
-    const intake = (code: string, names: Array<[RegExp, string]> = []) => ['threadMemory', 'onHoldStored']
+    const intake = (code: string, names: Array<[RegExp, string]> = []) => ['threadMemory', 'onHoldStored', 'retainOwnPostOutcomes']
       .map(name => names.reduce((out, [from, to]) => out.replace(from, to), flat(bound(code, name).body.getText())))
     expect(intake(reload)).toEqual(intake(SERVER_CODE, [[/\bdeliveryQueue\?\./g, 'queue.'], [/\bdeliveryReporting\b/g, 'reporting']]))
+    // The decision's retention reaches the resolver, or is released when there is none.
+    const handoff = (code: string) => {
+      const held = (only(code, node => ts.isPropertyAssignment(node) && node.name.getText() === 'postHolds') as ts.PropertyAssignment).initializer as ts.ObjectLiteralExpression
+      return held.properties.map(member => [member.name!.getText(), flat(((member as ts.PropertyAssignment).initializer as ts.ArrowFunction).body.getText())])
+    }
+    expect(handoff(reload)).toEqual(handoff(SERVER_CODE))
   })
 
   test('every posting surface shares the one observer, which reads the one owner holder at call time', () => {
@@ -7562,11 +7570,12 @@ describe('Memory Hold server wiring', () => {
     expect(calls).toEqual([['set', fire, 25], ['unref'], ['clear', timer]])
   })
 
-  test('routing registers through the current Post Hold holder, and the one owner subscription only checks each event\'s key', () => {
+  test('routing retains through the one owner holder and hands each retention to the current Post Hold holder, which releases it when absent, and the one owner subscription only checks each event\'s key', () => {
     const binding = onlyCallProps('createPersonaRouting').get('postHolds')!
-    expect(binding).toBe('{ held: (key, hold) => postHolds?.held(key, hold) }')
-    // Both registration members are bound only in the routing call (the holder's declaration aside).
-    const members: Array<keyof PersonaRoutingDeps> = ['monotonicNow', 'postHolds']
+    expect(binding).toBe('{ held: (key, hold, retention) => postHolds ? postHolds.held(key, hold, retention) : retention() }')
+    const retain = onlyCallProps('createPersonaRouting').get('retainOwnPostOutcomes')!
+    // The registration and retention members are bound only in the routing call (the holder's declaration aside).
+    const members: Array<keyof PersonaRoutingDeps> = ['monotonicNow', 'postHolds', 'retainOwnPostOutcomes']
     for (const member of members) {
       const bound = indicesOf(new RegExp(`(?<!\\blet\\s+)\\b${member}\\s*:`, 'g'), SERVER_CODE)
       expect(bound).toHaveLength(1)
@@ -7584,26 +7593,37 @@ describe('Memory Hold server wiring', () => {
     const listener = callArguments(SERVER_CODE, subscriptions[0]!)
     const adapter = expression<() => {
       held: NonNullable<PersonaRoutingDeps['postHolds']>['held']
+      retain: NonNullable<PersonaRoutingDeps['retainOwnPostOutcomes']>
       listener(event: OwnPostModule.OwnPostEvent): void
       set(resolver?: Pick<PostHoldsModule.PostHoldResolver, 'held' | 'check'>): void
+      own(owner?: Pick<OwnPostModule.OwnPostJoins, 'retainOutcomes'>): void
     }>(`() => {
-      let postHolds;
-      return { held: (${binding}).held, listener: (${listener}), set: value => { postHolds = value } };
+      let postHolds, ownPostJoins;
+      return { held: (${binding}).held, retain: (${retain}), listener: (${listener}), set: value => { postHolds = value }, own: value => { ownPostJoins = value } };
     }`, {})()
     const key = THREAD_PERSONAS.primary, hold: PostHoldsModule.StoredPostHold = { seq: 3, operations: ['op'], threadRoot: THREAD_ROOTS.primary, rootUnknown: false, receivedAt: 7 }
     const kinds: Array<OwnPostModule.OwnPostEvent['type']> = ['registered', 'decided', 'unknown', 'awaiting-thread', 'deferred']
     const event = (type: OwnPostModule.OwnPostEvent['type'], at: string = key): OwnPostModule.OwnPostEvent => ({ type, key: at, channel: THREAD_CHANNELS.primary, operationId: 'op' })
-    // Before the resolver exists, neither does anything.
-    expect(adapter.held(key, hold)).toBeUndefined()
+    const released: string[] = [], retention = (name: string) => () => { released.push(name) }
+    // Before the owner and resolver exist, a retention is a no-op, held releases
+    // the one it is handed, and the listener does nothing.
+    const none = adapter.retain(key, ['op'])
+    expect(none()).toBeUndefined()
+    expect(adapter.held(key, hold, retention('absent'))).toBeUndefined()
+    expect(released).toEqual(['absent'])
     adapter.listener(event('registered'))
     const calls: unknown[][] = []
     for (const life of ['first', 'replacement']) {
-      adapter.set({ held: (...args) => { calls.push([life, 'held', ...args]) }, check: (...args) => { calls.push([life, 'check', ...args]) } })
-      adapter.held(key, hold)
+      const handle = retention(life)
+      adapter.own({ retainOutcomes: (...args) => { calls.push([life, 'retain', ...args]); return handle } })
+      adapter.set({ held: (k, stored, r) => { calls.push([life, 'held', k, stored, r === handle]) }, check: (...args) => { calls.push([life, 'check', ...args]) } })
+      adapter.held(key, hold, adapter.retain(key, ['op']))
       for (const type of kinds) adapter.listener(event(type, type === 'deferred' ? THREAD_PERSONAS.secondary : key))
     }
-    expect(calls).toEqual(['first', 'replacement'].flatMap(life => [[life, 'held', key, hold],
+    // Each life's resolver takes its owner's very handle, and the adapter releases none of them.
+    expect(calls).toEqual(['first', 'replacement'].flatMap(life => [[life, 'retain', key, ['op']], [life, 'held', key, hold, true],
       ...kinds.map(type => [life, 'check', type === 'deferred' ? THREAD_PERSONAS.secondary : key])]))
+    expect(released).toEqual(['absent'])
   })
 
   test('bring-up releases the key\'s Post Holds after its recovery, then resolves its Memory Holds, detached and fenced', async () => {

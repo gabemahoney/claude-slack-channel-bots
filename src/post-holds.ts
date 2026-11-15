@@ -33,7 +33,7 @@ export type PostHoldEvent =
 export interface PostHoldClock extends DeliveryPreparationClock { now(): number }
 export interface PostHoldResolverDeps {
   queue: Pick<DeliveryQueue, 'unresolvedHolds' | 'resolveHolds' | 'item'>
-  owner: Pick<OwnPostJoins, 'operation' | 'retainOutcomes'>
+  owner: Pick<OwnPostJoins, 'operation'>
   release(key: string, item: QueueItem, mode: MemoryHoldMode): void | Promise<void>
   onParked(key: string): void | Promise<unknown>
   clock: PostHoldClock
@@ -45,7 +45,15 @@ export interface PostHoldResolverDeps {
   canRun?(key: string): boolean
 }
 export interface PostHoldResolver {
-  held(key: string, hold: StoredPostHold): void
+  /**
+   * Track a stored hold, taking over `retention`: the owner's outcome
+   * retention its decision took before the store (`OwnPostJoins.retainOutcomes`).
+   * A tracked hold keeps it through failed saves until its durable resolution,
+   * forget or stop; an inactive, already tracked or failed registration
+   * releases it at once, and a failed one leaves no tracked entry, so the
+   * saved hold stays for `releaseUntracked`. Never throws.
+   */
+  held(key: string, hold: StoredPostHold, retention: () => void): void
   check(key: string): void
   releaseUntracked(key: string): Promise<void>
   forget(key: string): void
@@ -181,30 +189,41 @@ export function createPostHoldResolver(deps: PostHoldResolverDeps): PostHoldReso
     }
   }
   const api: PostHoldResolver = {
-    held(key, input) {
-      if (!active(key)) return
-      let retention: (() => void) | undefined
+    held(key, input, retention) {
+      // All or nothing: the decision's retention passes, with no gap, only to a
+      // hold whose deadline is armed and first check queued.
+      let life: Life | undefined, hold: Tracked | undefined
       try {
-        // This must precede the microtask: an answer can land after this turn.
-        retention = deps.owner.retainOutcomes(key, input.operations)
-        const life = lifeFor(key)
-        if (life.holds.has(input.seq)) { retention(); return }
-        const hold: Tracked = { seq: input.seq, input: { ...input, operations: [...input.operations] }, retention, expired: false, mode: 'live' }
-        life.holds.set(input.seq, hold)
-        arm(key, life, hold)
-        api.check(key)
-      } catch { try { retention?.() } catch { /* cannot fail acceptance */ } }
+        life = active(key) ? lifeFor(key) : undefined
+        if (life && !life.holds.has(input.seq)) {
+          hold = { seq: input.seq, input: { ...input, operations: [...input.operations] }, retention, expired: false, mode: 'live' }
+          life.holds.set(input.seq, hold)
+          arm(key, life, hold)
+          api.check(key)
+          return
+        }
+      } catch {
+        // Undo the partial entry; the saved hold stays for untracked recovery.
+        if (life && hold && life.holds.get(hold.seq) === hold) { clearTimer(hold); life.holds.delete(hold.seq) }
+      }
+      try { retention() } catch { /* cannot fail acceptance */ }
     },
     check(key) {
       if (!active(key)) return
       const life = lives.get(key)
       if (!life || life.queued) return
       life.queued = true
-      queueMicrotask(() => {
+      try {
+        queueMicrotask(() => {
+          life.queued = false
+          if (!current(key, life)) return
+          try { evaluate(key, life) } catch { /* no exception reaches intake or an owner event */ }
+        })
+      } catch (error) {
+        // A check that was never queued must not suppress the next one.
         life.queued = false
-        if (!current(key, life)) return
-        try { evaluate(key, life) } catch { /* no exception reaches intake or an owner event */ }
-      })
+        throw error
+      }
     },
     releaseUntracked(key) {
       if (!active(key)) return Promise.resolve()

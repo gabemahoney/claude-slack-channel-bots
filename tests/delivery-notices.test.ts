@@ -116,27 +116,116 @@ test('items behind an unresolved Post Hold keep their queued reactions and stuck
   expect(JSON.stringify({ logs: r.logs, posts: r.h.allPosts() })).not.toContain('private held reply')
 })
 
-test.each(['memory', 'post'] as const)('later in-flight completion does not move a released head back to an unresolved or withdrawn %s hold', async kind => {
+test.each((['memory', 'post'] as const).flatMap(kind => (['released head', 'later in-flight item'] as const).map(reported => [kind, reported] as const)))(
+  'with %s holds, completing another item keeps the reported %s\'s episode and never moves to an unresolved or withdrawn hold', async (kind, reported) => {
   const r = await run({ holds: true }), field = HOLD_FIELDS[kind]
   const unresolved = await noticeHold(r, THREAD_ROOTS.secondary, field), withdrawn = await noticeHold(r, THREAD_ROOTS.third, field)
   const released = await noticeHold(r, THREAD_ROOTS.primary, field)
   const later = await r.accept({ key: { chat_id: 'C0TEST001', ts: 'later' } })
+  // The engine may report an in-flight item behind the earlier released one, which heads the open items.
+  const inFlight = reported === 'later in-flight item' ? await r.accept({ key: { chat_id: 'C0TEST001', ts: 'in-flight' } }) : undefined
   await r.queue.resolveHolds(r.alpha, [
     { seq: withdrawn.accepted.seq, outcome: 'withdrawn', at: r.h.clock.now() },
     { seq: released.accepted.seq, outcome: 'released', at: r.h.clock.now() },
   ])
-  const head = r.queue.item(r.alpha, released.accepted.seq)!
+  const head = inFlight ?? r.queue.item(r.alpha, released.accepted.seq)!
   r.waiting(head, 'state', { row: 'ended' }); await r.flush()
   expect(r.rig.episodes.isOpen(r.alpha, 'messages-waiting')).toBe(true)
-  // Completion of an item already in flight can follow release of this older head.
+  // Another item completes: one in flight when the older head was released, or one not reported.
   await r.complete(later)
   expect(r.rig.episodes.isOpen(r.alpha, 'messages-waiting')).toBe(true)
   r.waiting(head, 'state', { row: 'ended' }); await r.flush()
   expect(r.h.posts(r.alpha)).toHaveLength(1)
-  expect(r.delivered.map(d => d.item.accepted.seq)).toEqual([later.accepted.seq])
+  // The reported item's own completion ends its episode.
+  await r.complete(r.queue.item(r.alpha, head.accepted.seq)!)
+  expect(r.rig.episodes.isOpen(r.alpha, 'messages-waiting')).toBe(false)
+  expect(r.delivered.map(d => d.item.accepted.seq)).toEqual([later.accepted.seq, head.accepted.seq])
   expect(r.queue.item(r.alpha, unresolved.accepted.seq)?.fixed).toBeUndefined()
   expect(r.queue.item(r.alpha, withdrawn.accepted.seq)?.fixed).toBeUndefined()
   expect(r.queued).toEqual([])
+})
+
+// F9: status, waiting facts and stuck reporting name the engine's in-flight item, not the first open one.
+test('an earlier Memory Hold released mid-attempt leaves status, waiting and stuck reporting on the in-flight item until its durable completion, then on the released item aged from release', async () => {
+  let r: DeliveryNoticeHarness | undefined, laterSeq = 0
+  const e = await makeEngineHarness({ onEvent: event => {
+    r?.reporting.engineEvent(event)
+    // The released item then waits, relay off, so its own facts can be read.
+    if (event.type === 'item-delivered' && event.seq === laterSeq) e.p().row.relay_mode = 'off'
+  } })
+  r = await run({ queue: e.queue, holds: true })
+  try {
+    const p = e.p(), text = partialReceiptText, second = 'the in-flight item\'s second part'
+    const held = await noticeHold(r)
+    const later = await e.accept(text, r.alpha, [text, second]); laterSeq = later.accepted.seq
+    // Every Enter lands only the text's tail: a partial receipt, then retypes.
+    p.autoReceipt = false
+    p.keyHook = params => { if (params.key === 'Enter') appendTranscript(p.path, [promptEntry(partialReceiptSuffix)]); return undefined }
+    await e.tick(); await e.until(() => e.events.some(event => event.type === 'retyped'))
+    await e.advance(DELIVERY_STUCK_AFTER_MS - 60_000 - e.clock.now())
+    const releasedAt = e.clock.now(), released = e.events.length
+    await e.queue.resolveHolds(r.alpha, [{ seq: held.accepted.seq, outcome: 'released', at: releasedAt }])
+    await e.preparation.recover(); e.engine.wake(r.alpha); await e.tick()
+    // Status reads make no AD call, record, timer, post or line.
+    const effects = () => ({ calls: e.calls.length, records: e.records().length, timers: e.clock.pendingCount(), posts: r!.h.totalPosts(), logs: r!.logs.length })
+    const quiet = effects(), status = e.engine.status(r.alpha)!
+    expect(e.engine.status(r.alpha)).toEqual(status)
+    expect(effects()).toEqual(quiet)
+    const inFlight = e.queue.item(r.alpha, laterSeq)!
+    expect(status).toMatchObject({ seq: laterSeq, count: 2, ageMs: e.clock.now() - inFlight.accepted.received_at, retypeCount: inFlight.retypeCount,
+      partialReceipt: { part: 1, expectedBytes: Buffer.byteLength(text), receivedBytes: Buffer.byteLength(partialReceiptSuffix) } })
+    expect(status.retypeCount).toBeGreaterThan(0)
+    // Past the threshold of the in-flight item's age, not the released item's.
+    await e.advance(60_000 + DELIVERY_ROW_POLL_MS); await r.flush()
+    const waits = e.events.slice(released).filter(event => event.type === 'waiting')
+    expect(waits.length).toBeGreaterThan(0)
+    expect(waits.map(event => [event.seq, event.status?.seq, event.status?.count, event.status?.partialReceipt?.part])).toEqual(waits.map(() => [laterSeq, laterSeq, 2, 1]))
+    const trigger = waits.find(event => event.ageMs > DELIVERY_STUCK_AFTER_MS)
+    if (trigger?.type !== 'waiting' || !trigger.status) throw new Error('no waiting fact passed the stuck threshold')
+    const stuckForLater = formatPersonaNotice(r.config.personas[0]!, buildDeliveryStuckNotice(r.ref(), r.alpha, 2, trigger.ageMs, 'not-taken-in', trigger.status.retypeCount + 1, true))
+    expect(r.h.posts(r.alpha).map(post => post.text)).toEqual([
+      formatPersonaNotice(r.config.personas[0]!, buildMessageNotTakenInNotice(r.ref(), 'interject', true)), stuckForLater])
+    const stuckLines = () => r!.logs.filter(line => line.includes('delivery-stuck'))
+    expect(stuckLines()).toHaveLength(1)
+    expect(stuckLines()[0]).toContain(deliveryIdentity(inFlight.accepted))
+    expect(r.rig.episodes.isOpen(r.alpha, 'delivery-stuck')).toBe(true)
+
+    // A full receipt completes part 1; part 2 keeps the same item reported until its own receipt.
+    p.keyHook = undefined
+    appendTranscript(p.path, [promptEntry(pastedText(text))])
+    await e.until(() => e.textCalls().some(call => call.params.text === second))
+    expect(e.engine.status(r.alpha)).toMatchObject({ seq: laterSeq, count: 2 })
+    expect(e.engine.status(r.alpha)?.partialReceipt).toBeUndefined()
+    p.autoReceipt = true
+    appendTranscript(p.path, [promptEntry(second)])
+    await e.until(() => e.queue.item(r!.alpha, laterSeq)!.delivered)
+    await e.advance(DELIVERY_ROW_POLL_MS); await r.flush()
+    expect(r.delivered.map(({ item }) => item.accepted.seq)).toEqual([laterSeq])
+    expect(r.rig.episodes.isOpen(r.alpha, 'delivery-stuck')).toBe(false)
+    // Now the released item: its release age, no retypes and no other item's receipt evidence.
+    const next = e.engine.status(r.alpha)!
+    expect(next).toMatchObject({ seq: held.accepted.seq, count: 1, ageMs: e.clock.now() - releasedAt, retypeCount: 0 })
+    expect(next.partialReceipt).toBeUndefined()
+    const after = e.events.slice(e.events.findIndex(event => event.type === 'item-delivered')).flatMap(event => event.type === 'waiting' ? [event] : [])
+    expect(after.length).toBeGreaterThan(0)
+    expect(after.map(event => [event.seq, event.reason, event.status?.seq, event.status?.count, event.status?.partialReceipt, event.ageMs === event.status?.ageMs]))
+      .toEqual(after.map(() => [held.accepted.seq, 'relay-off', held.accepted.seq, 1, undefined, true]))
+    expect(after.every(event => event.ageMs < DELIVERY_STUCK_AFTER_MS)).toBe(true)
+    // Its own episode begins only once its release age passes the threshold.
+    await e.advance(releasedAt + DELIVERY_STUCK_AFTER_MS - e.clock.now()); await r.flush()
+    expect(r.h.posts(r.alpha)).toHaveLength(2)
+    await e.advance(DELIVERY_ROW_POLL_MS); await r.flush()
+    const releasedStuck = e.events.find(event => event.type === 'waiting' && event.seq === held.accepted.seq && event.ageMs > DELIVERY_STUCK_AFTER_MS)
+    if (releasedStuck?.type !== 'waiting') throw new Error('the released item never passed the stuck threshold')
+    expect(r.h.posts(r.alpha).map(post => post.text).slice(2)).toEqual([
+      formatPersonaNotice(r.config.personas[0]!, buildDeliveryStuckNotice(r.ref(), r.alpha, 1, releasedStuck.ageMs, 'relay-off', 1))])
+    expect(stuckLines()).toHaveLength(2)
+    expect(stuckLines()[1]).toContain(deliveryIdentity(e.queue.item(r.alpha, held.accepted.seq)!.accepted))
+    expect(r.h.posts(r.beta)).toEqual([])
+    expect(e.errors).toEqual([])
+    assertNoLeak([e.events, e.calls, e.errors])
+    expect(JSON.stringify({ logs: r.logs, posts: r.h.allPosts() })).not.toContain('private held reply')
+  } finally { await e.cleanup() }
 })
 
 test('launch timing diagnostics preserve structured engine evidence without posting a notice or requiring queued work', async () => {

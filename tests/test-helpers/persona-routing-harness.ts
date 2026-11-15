@@ -2,7 +2,8 @@ import { mkdtempSync } from 'node:fs'
 
 import { createDeliveryQueue, type QueueAccept, type QueueItem, type DeliveryQueueOptions } from '../../src/delivery-queue.ts'
 import { createOwnPostObserver, createOwnPostJoins, ownPostChoice, ownPostEligibility, pendingOwnPostViews, type OwnPostJoins } from '../../src/own-post.ts'
-import type { StoredPostHold } from '../../src/post-holds.ts'
+import { createPostHoldResolver, type PostHoldEvent, type PostHoldResolver, type StoredPostHold } from '../../src/post-holds.ts'
+import { createMemoryHoldResolver, type MemoryHoldEvent, type MemoryHoldMode, type MemoryHoldResolver } from '../../src/memory-holds.ts'
 import { createDeliveryPreparation, type DeliveryPreparation, type DeliveryPreparationDeps } from '../../src/delivery-intake.ts'
 import * as fs from 'node:fs'
 import { join, resolve } from 'node:path'
@@ -573,8 +574,21 @@ export interface RoutingHarnessOptions {
     onHoldStored?: PersonaRoutingDeps['onHoldStored']
     /** Routing's receipt clock: a fake clock's `now`, never the wall clock. Each reading adds `monotonic` to `h.order`. */
     monotonicNow?: () => number
-    /** Give routing a recording `postHolds` (`h.heldPostHolds`, `held:<key>` in `h.order`); `'throw'` throws after recording. */
+    /**
+     * Give routing a recording `postHolds` (`h.heldPostHolds`, `held:<key>` in
+     * `h.order`). It tracks nothing, so it releases the outcome retention it is
+     * handed; `'throw'` throws after recording, leaving routing to release it.
+     */
     postHolds?: 'record' | 'throw'
+    /**
+     * Compose the production Post Hold and Memory Hold resolvers as server.ts
+     * does (`h.resolvers`), replacing `monotonicNow` and `postHolds`: over this
+     * harness's queue, Thread Memory and own-post owner, with routing's
+     * `releaseHeld` as their release, the owner's events checking the Post Hold
+     * resolver, and both hold owners notified on `onHoldStored`. Their clock is
+     * `h.resolvers.clock`; the harness's `threads.close()`/`crash()` stops them.
+     */
+    resolvers?: true
   }
   /** Queue I/O and event seams; all paths remain under baseDir. */
   queueOptions?: Pick<DeliveryQueueOptions, 'fs' | 'onEvent'>
@@ -655,7 +669,23 @@ export interface RaisedNotice {
   text: string
 }
 
-/** One `held` call routing made on the opt-in recording `postHolds`. */
+/** The opt-in production hold resolvers (`threadMemory.resolvers`), as server.ts composes them. */
+export interface RoutingHoldResolvers {
+  /**
+   * The hold clock: routing's receipt reading (`monotonic` in `h.order`) and
+   * both resolvers' timers, as HOLD_CLOCK. Its flush waits for the queue's and
+   * Thread Memory's disk work. Decision times are Thread Memory's clock.
+   */
+  clock: FakeClock
+  post: PostHoldResolver
+  memory: MemoryHoldResolver
+  postEvents: PostHoldEvent[]
+  memoryEvents: MemoryHoldEvent[]
+  /** Each release a resolver fed back through routing's `releaseHeld`, in order. */
+  releases: Array<{ owner: 'post' | 'memory'; key: string; seq: number; mode: MemoryHoldMode }>
+}
+
+/** One `held` call routing made on the opt-in recording `postHolds` or production resolvers. */
 export interface HeldPostHoldCall {
   key: string
   hold: StoredPostHold
@@ -677,8 +707,12 @@ export interface RoutingHarness {
   pendingOwnPostReads: Array<[string, string]>
   /** Resolver notifications, recorded only by the opt-in Thread Memory wiring. */
   holdStored: string[]
-  /** Each `held` call of the opt-in recording `postHolds`, in order. */
+  /** Each `held` call of the opt-in recording `postHolds` or production resolvers, in order. */
   heldPostHolds: HeldPostHoldCall[]
+  /** The one own-post owner the opt-in Thread Memory wiring builds; its `operation` views show which outcomes stay retained. */
+  readonly ownPostJoins: OwnPostJoins | undefined
+  /** The opt-in production hold resolvers (`threadMemory.resolvers`). */
+  resolvers?: RoutingHoldResolvers
   releaseHeld: PersonaRouting['releaseHeld']
   /** Preparation requests made by opt-in routing, including requests the preparer refuses. */
   preparationCalls: Array<{ key: string; seq: number }>
@@ -1007,9 +1041,10 @@ export function makeRoutingHarness(
   }
 
   const queueFaults: RoutingHarness['queueFaults'] = {}
-  // With the recording `postHolds`, a key's store turn lasts until the next microtask after its `stored` event.
+  // With a `postHolds` bound, a key's store turn lasts until the next microtask after its `stored` event.
   const storeTurns = new Set<string>()
-  const queueOptions: RoutingHarnessOptions['queueOptions'] = opts.threadMemory?.postHolds === undefined ? opts.queueOptions : {
+  const registers = opts.threadMemory?.postHolds !== undefined || opts.threadMemory?.resolvers === true
+  const queueOptions: RoutingHarnessOptions['queueOptions'] = !registers ? opts.queueOptions : {
     ...opts.queueOptions,
     onEvent: event => {
       if (event.type === 'stored') { storeTurns.add(event.key); queueMicrotask(() => { storeTurns.delete(event.key) }) }
@@ -1032,6 +1067,7 @@ export function makeRoutingHarness(
     pendingOwnPostReads: [],
     holdStored: [],
     heldPostHolds: [],
+    get ownPostJoins() { return ownPostJoins },
     releaseHeld: (key, item, mode) => routing.releaseHeld(key, item, mode),
     preparationCalls: [],
     holdJoinSaves(key) {
@@ -1104,7 +1140,11 @@ export function makeRoutingHarness(
     channelDelivery: null,
     channelDeliveryWrites: [],
     heardChannels: (key) => routing.heardChannels(key),
-    forget: (key) => { try { ownPostJoins?.forget(key) } finally { routing.forget(key) } },
+    forget: (key) => {
+      try { ownPostJoins?.forget(key) } finally {
+        try { h.resolvers?.post.forget(key); h.resolvers?.memory.forget(key) } finally { routing.forget(key) }
+      }
+    },
     keys: (names) => names.map((n) => byName(n).persona.key),
     registerFor: (name, reg) => {
       const session = registerFor(name, reg)
@@ -1131,6 +1171,7 @@ export function makeRoutingHarness(
       notices: h.notices,
       episodeNotices: h.episodeNotices,
       outageNotices: h.outageNotices,
+      holdEvents: [h.resolvers?.postEvents ?? [], h.resolvers?.memoryEvents ?? []],
     }),
   }
 
@@ -1194,12 +1235,52 @@ export function makeRoutingHarness(
     const unsubscribe = h.channelDelivery!.authority.subscribeThreadView(() => {
       for (const persona of h.config?.personas ?? []) ownPostJoins?.onSharedStatePublished(persona.key)
     })
+    const unsubscribeHolds = opts.threadMemory?.resolvers === true ? composeResolvers(h.threads, ownPostJoins) : undefined
     for (const method of ['close', 'crash'] as const) {
       const closeMemory = h.threads[method]
-      h.threads[method] = async () => { ownPostJoins?.stop(); unsubscribe(); await closeMemory() }
+      h.threads[method] = async () => {
+        h.resolvers?.memory.stop(); h.resolvers?.post.stop(); unsubscribeHolds?.()
+        ownPostJoins?.stop(); unsubscribe(); await closeMemory()
+      }
     }
   }
 
+  /**
+   * As main() builds them: one Memory Hold resolver and one Post Hold
+   * resolver over the same queue, memory and owner, releasing through
+   * routing (read at call time), parked holds handed to k8, and one owner
+   * subscription that only checks each event's key. Returns that unsubscribe.
+   */
+  function composeResolvers(threads: ThreadMemoryHarness, owner: OwnPostJoins): () => void {
+    const clock = createFakeClock()
+    clock.settleOn(queueIo); clock.settleOn(threads.io.durable)
+    const resolvers: RoutingHoldResolvers = {
+      clock, postEvents: [], memoryEvents: [], releases: [],
+      memory: undefined as unknown as MemoryHoldResolver, post: undefined as unknown as PostHoldResolver,
+    }
+    const release = (from: 'post' | 'memory') => (key: string, item: QueueItem, mode: MemoryHoldMode) => {
+      resolvers.releases.push({ owner: from, key, seq: item.accepted.seq, mode })
+      return routing.releaseHeld(key, item, mode)
+    }
+    resolvers.memory = createMemoryHoldResolver({
+      queue, memory: threads.memory, release: release('memory'), now: threads.clock.now, clock,
+      onEvent: event => { resolvers.memoryEvents.push(event) },
+    })
+    resolvers.post = createPostHoldResolver({
+      queue, owner, release: release('post'), onParked: key => resolveMemoryHolds(key),
+      clock, decisionNow: threads.clock.now,
+      onEvent: event => { resolvers.postEvents.push(event) },
+    })
+    h.resolvers = resolvers
+    return owner.subscribe(event => resolvers.post.check(event.key))
+  }
+  /** server.ts's resolveMemoryHolds: an applied persona's live resolution. */
+  function resolveMemoryHolds(key: string): Promise<unknown> {
+    return getPersona(key) ? h.resolvers?.memory.resolve(key, 'live') ?? Promise.resolve() : Promise.resolve()
+  }
+
+  // Routing's receipt reading: the resolvers' hold clock, as main() binds HOLD_CLOCK, else the case's own.
+  const receiptNow = h.resolvers ? h.resolvers.clock.now : opts.threadMemory?.monotonicNow
   const preparation = createDeliveryPreparation({ queue, clock: opts.preparationClock, clientFor: webClientFor, resolveUserName: opts.resolveUserName ?? resolveUserName })
   const routing = createPersonaRouting({
     membership: opts.membership,
@@ -1229,18 +1310,28 @@ export function makeRoutingHarness(
       },
     },
     // Post Hold registration, each opt-in: production binds the hold clock's `now` and the resolver's `held`.
-    monotonicNow: opts.threadMemory?.monotonicNow === undefined ? undefined : () => {
+    monotonicNow: receiptNow === undefined ? undefined : () => {
       h.order.push('monotonic')
-      return opts.threadMemory!.monotonicNow!()
+      return receiptNow()
     },
-    postHolds: opts.threadMemory?.postHolds === undefined ? undefined : { held: (key, hold) => {
+    postHolds: !registers ? undefined : { held: (key, hold, retention) => {
       h.heldPostHolds.push({ key, hold: structuredClone(hold), storeTurn: storeTurns.has(key) })
       h.order.push(`held:${key}`)
       if (opts.threadMemory?.postHolds === 'throw') throw new Error('recording postHolds: held throws')
+      // The resolver takes the decision's retention; the recorder tracks nothing and releases it.
+      if (h.resolvers) h.resolvers.post.held(key, hold, retention)
+      else retention()
     } },
+    // As server.ts binds it: the same owner that answers pendingOwnPosts.
+    retainOwnPostOutcomes: opts.threadMemory === undefined ? undefined : (key, operationIds) => ownPostJoins?.retainOutcomes(key, operationIds) ?? (() => {}),
     onHoldStored: opts.threadMemory === undefined ? undefined : key => {
       h.holdStored.push(key)
       h.order.push(`hold-stored:${key}`)
+      // As server.ts: both hold owners, each isolated, then the case's own hook.
+      if (h.resolvers) {
+        try { void resolveMemoryHolds(key).catch(() => {}) } catch { /* independent hold owners */ }
+        try { h.resolvers.post.check(key) } catch { /* independent hold owners */ }
+      }
       return opts.threadMemory?.onHoldStored?.(key)
     },
     onReceived: (key, item, mode) => {

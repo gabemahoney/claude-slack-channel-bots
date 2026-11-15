@@ -1316,7 +1316,8 @@ const personaRouting = createPersonaRouting({
   },
   monotonicNow: HOLD_CLOCK.now,
   ackTiming: () => ackTimingObserver,
-  postHolds: { held: (key, hold) => postHolds?.held(key, hold) },
+  // The resolver takes the decision's retention; with no resolver it is released.
+  postHolds: { held: (key, hold, retention) => postHolds ? postHolds.held(key, hold, retention) : retention() },
   onHoldStored: key => {
     try { void resolveMemoryHolds(key).catch(() => {}) } catch { /* independent hold owners */ }
     try { postHolds?.check(key) } catch { /* independent hold owners */ }
@@ -1341,6 +1342,8 @@ const personaRouting = createPersonaRouting({
   },
   // The one owner's in-memory posts under the current stamp; none before it exists.
   pendingOwnPosts: (key, channel) => pendingOwnPostViews(ownPostJoins?.pendingOwnPosts(key, channel) ?? []),
+  // The same owner's retention, which a Post Hold's decision hands to postHolds.held.
+  retainOwnPostOutcomes: (key, operationIds) => ownPostJoins?.retainOutcomes(key, operationIds) ?? (() => {}),
   joins: {
     stamp: (key, channel) => threadMemory ? reloadController?.sharedChannels()?.channelStamp(key, channel) : undefined,
     hasSavedJoin: (key, channel, root, stamp) => threadMemory?.hasSavedJoin(key, channel, root, stamp) ?? false,

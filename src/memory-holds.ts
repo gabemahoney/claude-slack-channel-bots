@@ -39,7 +39,9 @@ export interface MemoryHoldResolverDeps {
 }
 export interface MemoryHoldResolver {
   /** compactAfter is used only for the second startup compaction. Its failed
-   * rewrite retries hourly and does not hold intake or resolution open. */
+   * rewrite retries hourly and does not hold intake or resolution open. The
+   * result describes the saved resolutions: released items' feedback starts
+   * in sequence order and is not awaited. */
   resolve(key: string, mode: MemoryHoldMode, compactAfter?: boolean): Promise<MemoryHoldResult>
   /** After publication has recovered deferred joins, retry only work already
    * requested in this life, preserving each hold's live/recovered feedback. */
@@ -72,6 +74,13 @@ export function createMemoryHoldResolver(deps: MemoryHoldResolverDeps): MemoryHo
       life.compactRetry = deps.clock.setTimeout(() => { life.compactRetry = undefined; void compact(key, life) }, QUEUE_COMPACT_INTERVAL_MS)
     }
   }
+  /** Start a saved release's feedback in sequence order without making the
+   * writer chain, a later resolution or compaction wait on it. A failure is
+   * reported only while this life is current. */
+  function release(key: string, life: Life, seq: number, item: QueueItem, mode: MemoryHoldMode): void {
+    const failed = (error: unknown) => { if (current(key, life)) event({ type: 'release-failed', key, seq, error }) }
+    try { void Promise.resolve(deps.release(key, item, mode)).catch(failed) } catch (error) { failed(error) }
+  }
   function schedule(key: string, life: Life): Promise<MemoryHoldResult> {
     const next = life.writer.catch(() => {}).then(() => run(key, life))
     life.writer = next
@@ -89,7 +98,7 @@ export function createMemoryHoldResolver(deps: MemoryHoldResolverDeps): MemoryHo
     const decisions = judgeMemoryHolds(holds, hold => deps.memory.joinedBy(key, hold.channel, hold.thread_ts, hold.stamp, hold.arrived_at), deps.now())
     if (!decisions) return 'unknown'
     // Capture names before an unrelated queue compaction can remove a saved
-    // withdrawal. Release feedback may await preparation for another item.
+    // withdrawal.
     const withdrawn = decisions.flatMap(decision => {
       if (decision.outcome !== 'withdrawn') return []
       const hold = holds.find(h => h.seq === decision.seq)!, item = deps.queue.item(key, decision.seq)
@@ -100,7 +109,7 @@ export function createMemoryHoldResolver(deps: MemoryHoldResolverDeps): MemoryHo
       if (decisions.length) saved = await deps.queue.resolveHolds(key, decisions, () => current(key, life), committed => {
         // This handoff belongs to the durable commit, not this resolver life.
         // It must precede both cancellation at the async return boundary and
-        // any released item's awaited feedback. Only newly saved holds count.
+        // any released item's feedback. Only newly saved holds count.
         const savedSeqs = new Set(committed.map(decision => decision.seq))
         const savedWithdrawn = withdrawn.filter(hold => savedSeqs.has(hold.seq))
         if (savedWithdrawn.length) event({ type: 'withdrawn', key, holds: savedWithdrawn })
@@ -119,11 +128,7 @@ export function createMemoryHoldResolver(deps: MemoryHoldResolverDeps): MemoryHo
     for (const decision of saved) {
       if (!current(key, life)) return 'cancelled'
       const item = deps.queue.item(key, decision.seq)
-      if (!item) continue
-      if (decision.outcome === 'released' && isOpenItem(item)) {
-        try { await deps.release(key, item, life.modes.get(decision.seq)!) }
-        catch (error) { if (current(key, life)) event({ type: 'release-failed', key, seq: decision.seq, error }) }
-      }
+      if (item && decision.outcome === 'released' && isOpenItem(item)) release(key, life, decision.seq, item, life.modes.get(decision.seq)!)
     }
     if (!current(key, life)) return 'cancelled'
     for (const decision of decisions) life.modes.delete(decision.seq)

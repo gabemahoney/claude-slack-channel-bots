@@ -171,7 +171,10 @@ export async function makeStorageNoticeHarness(options: {
         hasSavedJoin: (key, channel, root, stamp) => t.memory.hasSavedJoin(key, channel, root, stamp),
         clock: key => t.memory.clock(key), addJoin: (key, fact) => t.memory.addJoin(key, fact),
         saveJoins: (key, facts) => t.memory.saveJoins(key, facts) },
+      // As src/server.ts binds them: the resolver takes the retention each Post Hold's decision
+      // took from the same owner pendingOwnPosts reads.
       monotonicNow: t.clock.now, postHolds: resolver,
+      retainOwnPostOutcomes: (key, operationIds) => joins.retainOutcomes(key, operationIds),
       // As src/server.ts binds it, less the Memory Hold resolver this harness doesn't build.
       onHoldStored: key => {
         try { resolver.check(key) } catch { /* independent hold owners */ }

@@ -13,7 +13,6 @@ import { buildThreadMemoryJoinsLostLine, buildThreadMemoryJoinsLostNotice } from
 import { assertNoLeak, LEAK_SENTINEL, writtenFile } from './test-helpers/credentials.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { queuePath, readQueue } from './test-helpers/delivery-queue.ts'
-import { holdOwnPostReady } from './test-helpers/own-post.ts'
 import { makeReloadHarness, TEMPLATE_REFRESH_KEY, type ReloadHarness, type ReloadRun, type ReloadRunOptions } from './test-helpers/reload-harness.ts'
 import { membershipPage, SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
 import { makeChannelMessage, makeDeferredWebApiCall, makeDm, makeMembershipEvent, makeOwnFileShare, makePagedThread, mentionText, slackFileId, stubOpenedDmId, type PagedMessageSpec, type SlackEvent, type WebApiOutcome } from './test-helpers/slack-stub.ts'
@@ -288,7 +287,7 @@ describe.each(['strict', 'open'] as const)('%s own-post crash recovery', mode =>
     expectDeliveries(run, [[mention, 'mention'], [next, 'thread']], [[sibling, 'thread']])
   })
 
-  test.each(['recovered', 'live'] as const)('unreadable journal: %s intent waits; read-time end precedes delayed release', async origin => {
+  test.each(['recovered', 'live'] as const)('unreadable journal: %s intent waits; read-time end precedes a delayed resolution save', async origin => {
     setup(mode)
     const first = await start()
     // A persisted joined thread supplies a releasable Memory Hold after read.
@@ -296,15 +295,11 @@ describe.each(['strict', 'open'] as const)('%s own-post crash recovery', mode =>
     expectDeliveries(first, [[mention, 'mention']])
     if (origin === 'recovered') await hungPost(first)
     await crash(first)
-    const io = threadFsControls(h.stateDir), release = holdOwnPostReady()
-    releases.push(release.resolve)
+    const io = threadFsControls(h.stateDir), queueIo = threadFsControls(h.stateDir)
     io.fail('readFileSync', 'alpha')
-    let releaseEntered = false
     const history = pages()
     const run = await start({
-      threadMemory: { fs: io.fs, beforeRelease: async key => {
-        if (key === 'alpha') { releaseEntered = true; await release.ready }
-      } },
+      threadMemory: { fs: io.fs, queueFs: queueIo.fs },
       slack: { alpha: { historyResponder: history.respondHistory } },
     })
     expect(run.threadMemory!.store('alpha')!.readable).toBe(false)
@@ -317,19 +312,26 @@ describe.each(['strict', 'open'] as const)('%s own-post crash recovery', mode =>
     // Let unreadable retries run well past the skew; none can call Slack.
     await run.clock.advance(OWN_ROOT_CLOCK_SKEW_MS + THREAD_MEMORY_RETRY_MIN_MS)
     expect(lookups(run)).toHaveLength(0)
+    // The first read's lookup kick waits for k8's durable resolution, so the
+    // queue's next sync (that resolution's append) holds the kick back.
+    const save = queueIo.hold('fsync', 'alpha', { match: path => path === queuePath(h.stateDir, 'alpha') })
+    releases.push(save.release)
+    let saveReached = false
+    void save.reached.then(() => { saveReached = true })
     io.heal()
     // Read retry is the next memory retry, potentially after its backoff grew.
-    for (let i = 0; i < 8 && !releaseEntered; i++) await run.clock.runNext()
-    expect(releaseEntered).toBe(true)
+    for (let i = 0; i < 8 && !saveReached; i++) await run.clock.runNext()
+    expect(saveReached).toBe(true)
     expect(run.threadMemory!.store('alpha')!.readable).toBe(true)
     const readTime = run.clock.now()
     expect(lookups(run)).toHaveLength(0)
     await run.clock.advance(OWN_ROOT_CLOCK_SKEW_MS + THREAD_MEMORY_RETRY_MIN_MS)
     expect(lookups(run)).toHaveLength(0)
-    release.resolve(); await flush(run)
+    expect(run.queue.unresolvedHolds('alpha')).toHaveLength(1)
+    save.release(); await flush(run)
     expect(lookups(run)).toHaveLength(1)
     // The persona clock can be 1 ms ahead of wall time. Both bounds are still
-    // at the read event, far before the asynchronous recovery released above.
+    // at the read event, far before the delayed resolution saved above.
     const end = Number(run.stub('alpha').calls.conversationsHistory[0]!.latest) * 1000 - OWN_ROOT_CLOCK_SKEW_MS
     expect(end).toBeGreaterThanOrEqual(readTime)
     expect(end).toBeLessThanOrEqual(readTime + 1)

@@ -258,7 +258,11 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
       completed.add(id)
       receivedItem(key, item)
       log(MESSAGE_DELIVERED, key, identity, `at=${event.at} wait_ms=${event.waitMs}`)
-      move(key, deps.queue.items(key).find(isOpenItem)?.accepted.seq)
+      // Episodes follow the engine's reported item: they end once it is no
+      // longer open, and its next waiting fact names the new target. Another
+      // item's completion leaves a still-open reported item's episodes.
+      const head = heads.get(key), reported = head === undefined ? undefined : deps.queue.item(key, head)
+      if (!reported || !isOpenItem(reported)) move(key)
       protect(() => deps.delivered?.(key, item)); return
     }
     if (event.type === 'first-typed') {

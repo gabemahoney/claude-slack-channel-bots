@@ -187,7 +187,9 @@ export interface DeliveryQueue {
   start(): Promise<void>
   accept: QueueAccept
   /** Decide after the durable key check in the persona's writer turn. Both
-   * callbacks must be synchronous: no I/O, network, log or shared-state write.
+   * callbacks must be synchronous: no I/O, network, log or shared-state write,
+   * except that `decide` may take an in-memory retention no decision reads,
+   * which its caller releases unless `afterStore` hands it on.
    * `decide` may run while the persona's earlier stores are staged in a group
    * commit but not yet durable or published. It never reads an unfinished
    * store's record (`unresolvedHolds` lists staged holds) or depends on that

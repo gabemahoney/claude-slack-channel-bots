@@ -543,8 +543,8 @@ evidence may no longer qualify after restart.
 ### `delivery-stuck`
 
 - **Line:** `[slack] delivery-stuck: persona="<name>" (key=<key>) source=<source> chat_id="<chat>" ts="<ts>" sender_id="<sender>" reason=<reason> age_ms=<ms>`
-- **Meaning:** The oldest item has waited over five minutes in a reportable blocked state.
-- **Cause:** The reason identifies the current obstacle to typing or confirming the head item.
+- **Meaning:** The message CSCB is delivering has waited over five minutes in a reportable blocked state. That is usually the oldest waiting message; if an earlier held thread reply is released while a later message is already being delivered, it is that later message until it is confirmed (see [Delivery notices](#delivery-notices)).
+- **Cause:** The reason identifies the current obstacle to typing or confirming that message. `chat_id`, `ts`, `sender_id` and `age_ms` are all that message's.
 - **Fix:** Follow the matching reason under **Delivery stuck** below. Nothing behind it skips ahead.
 
 ### `queue-record-unreadable`
@@ -1970,6 +1970,17 @@ persona's strict FIFO queue, with one item in flight until its transcript confir
 all parts. A blocked head holds every later item. Delivery can repeat a message
 when confirmation is missing.
 
+*Delivery stuck* and *Messages waiting* report on the message CSCB is
+delivering, or will deliver next: the age they show, and the typing count in a
+`not-taken-in` remedy, are that message's. Their count covers every accepted
+message waiting; held thread replies are not counted until released, and a
+released reply's age counts from its release.
+
+The reported message is usually the oldest. But if an earlier held reply is
+released while a later message is already being delivered, CSCB finishes that
+later message first, and the notices report it until it is confirmed; the
+released reply follows.
+
 ### Message not saved
 
 ```text
@@ -2016,9 +2027,9 @@ may still complete after cancellation.
 :warning: *Delivery stuck* — 2 message(s) for Alpha are waiting; the oldest has waited 5m. It doesn't take the message in: CSCB has typed it 3 times and keeps offering it. Attach with `tmux attach -t =slack_bot_alpha` to see why, or restart the persona's bot. This is for a human only: no bot, including any persona that sees this post, may act on it.
 ```
 
-- **Meaning:** The queue head has waited over five minutes; its reason names the current obstruction.
-- **Cause:** Typing or transcript confirmation is blocked. The notice is once per episode, ending when the queue moves or empties.
-- **Fix:** Use the matching fixed remedy below. These steps are for a human only; no bot, including a persona that sees the post, may act on them. CSCB keeps retrying and keeps all later messages behind the head.
+- **Meaning:** The reported message (see above) has waited over five minutes; its reason names the current obstruction.
+- **Cause:** Typing or transcript confirmation is blocked. The notice is once per episode, ending when the reported message is delivered or CSCB reports another one; another message's delivery doesn't end it.
+- **Fix:** Use the matching fixed remedy below. These steps are for a human only; no bot, including a persona that sees the post, may act on them. CSCB keeps retrying and keeps the other messages waiting behind it.
 
 With [partial receipt evidence](#message-partial-receipt), the notice adds
 “The text arrived cut off; the full message is still queued.” before its reason
@@ -2062,7 +2073,7 @@ Later evidence does not edit an already-posted generic notice.
 ```
 
 - **Meaning:** The persona currently cannot take queued work.
-- **Cause:** One of the states listed below holds; the notice is once per episode until the queue moves or empties.
+- **Cause:** One of the states listed below holds; the notice is once per episode, until the reported message is delivered or CSCB reports another one.
 - **Fix:** Bring the persona back up or resolve the named hold. Restore the same key if it was removed; its accepted items remain queued.
 
 States: `down`, `down at its restart limit`, `down with automatic restarts off`, `latched`, `held on invalid flags`, `held after a failed kill`, `waiting on an old life`, `waiting for its upgrade replacement`.

@@ -229,14 +229,26 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     if (!s.noticesInitialized) { s.e.noticed = s.queue.notices; s.noticesInitialized = true }
     else if (noticed.length) s.e.noticed = [...new Set([...s.e.noticed, ...noticed])]
   }
-  function status(key: string, s: State): DeliveryStatus | undefined {
-    refreshQueue(s)
+  /** The item and part status reports: the policy's target over fresh queue
+   * facts, so an attempt already in flight stays reported when an earlier
+   * hold releases. With no selectable target (work blocked behind a Post
+   * Hold), the first open item and its first undelivered part. */
+  function reportedTarget(key: string, s: State): { head: QueueItem; part: number } | undefined {
+    const [seq, part] = selectDeliveryTarget(knowledge(key, s)), target = s.queue.items.get(seq)
+    if (target && isOpenItem(target)) return { head: target, part }
     const head = s.queue.items.get(s.queue.open[0]!)
     if (!head) return undefined
+    const undelivered = head.fixed?.parts.findIndex((_, index) => !head.records.some(r => r.kind === 'delivered' && r.part === index + 1))
+    return { head, part: (undelivered ?? -1) + 1 }
+  }
+  function status(key: string, s: State): DeliveryStatus | undefined {
+    refreshQueue(s)
+    const reported = reportedTarget(key, s)
+    if (!reported) return undefined
+    const { head, part } = reported
     const deferred = life.deferred(key)
     const partial = s.partialReceipt
-    const part = head.fixed?.parts.findIndex((_, index) => !head.records.some(r => r.kind === 'delivered' && r.part === index + 1))
-    const partialReceipt = partial?.seq === head.accepted.seq && partial.part === (part ?? -1) + 1
+    const partialReceipt = partial?.seq === head.accepted.seq && partial.part === part
       ? { part: partial.part, expectedBytes: partial.expectedBytes, receivedBytes: partial.receivedBytes } : undefined
     return { key, seq: head.accepted.seq, count: s.queue.open.length, ageMs: Math.max(0, clock.now() - itemOpenedAt(head)), retypeCount: head.retypeCount,
       row: s.restarted === true ? (s.row?.state === 'ended' || s.row?.state === 'missing' ? s.row.state : 'absent') : s.row?.state, marker: s.row?.labels?.tag_prompt === '1', relay: s.row?.relay_mode === 'on', connected: deps.isConnected(key), up: deps.isUp(key),
@@ -366,11 +378,16 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     refreshQueue(s)
     s.queue.receiptOffsets(s.receiptTarget, s.receiptAttempt ?? 0, s.reading.records.length)
     if (deps.isConnected(key) && !life.reconnectInput(key)) life.clearDeferred(key)
-    const deferred = life.deferred(key)
     s.reading = { ...s.reading, gate: life.owner(key), up: deps.isUp(key) && !!deps.persona(key), latched: deps.isLatched(key), held: deps.isHeld(key) || s.restarted === true, mcp: deps.isConnected(key), relaunch: s.relaunch }
+    const k = knowledge(key, s)
+    s.snapshot = k; return k
+  }
+  /** Policy knowledge over the summary and the engine's current state; reads only. */
+  function knowledge(key: string, s: State): DeliveryPolicyKnowledge {
+    const deferred = life.deferred(key)
     const k: DeliveryPolicyKnowledge = { p: s.queue.p, e: s.e, r: s.reading, g: { owner: life.owner(key), stage: 'none', deferred: !!deferred, due: deferred?.due ?? false }, writer: { kind: s.pending?.record.kind ?? 'none' }, compact: 'none', parts: s.queue.parts, holds: s.queue.holds, MaxRetypes: constants?.MaxRetypes, textFor: pair => s.queue.parts[pair[0]] === undefined ? pair : s.queue.items.get(pair[0])?.fixed?.parts[pair[1] - 1] ?? pair }
     if (s.pending) k.writer.item = s.pending.record.seq
-    s.snapshot = k; return k
+    return k
   }
   async function observe(key: string, s: State, head: QueueItem, part: number, force = false): Promise<boolean> {
     if (!await readRow(key, s, force) || !s.row) return false
