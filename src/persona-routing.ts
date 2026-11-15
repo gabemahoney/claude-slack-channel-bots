@@ -40,9 +40,9 @@ import {
   PERSONA_THREAD_STAMP_UNDECIDED,
   threadStampUndecidedCause,
   fungibleUnclaimedChannelCause,
-  invitedChannelCause,
+  openChannelCause,
   PERSONA_DM_DROPPED,
-  PERSONA_INVITED_CHANNEL,
+  PERSONA_OPEN_CHANNEL,
   UNCLAIMED_CHANNEL,
   unclaimedChannelCause,
 } from './persona-diagnostics.ts'
@@ -421,9 +421,10 @@ export interface PersonaRouting {
   forget(key: string): void
   /**
    * A snapshot of the persona's heard set: the channels whose
-   * events took its fungible path in its current persona life. Empty for an
-   * unknown or forgotten key; creates no state. The "heard" half of
-   * `set_channel_delivery`'s known channels.
+   * events took its open path in its current persona life. Empty for an
+   * unknown or forgotten key; creates no state. Diagnostic only: it
+   * establishes neither current membership nor `set_channel_delivery`
+   * authorization.
    */
   heardChannels(key: string): ReadonlySet<string>
 }
@@ -847,7 +848,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       case 'own-reaction':
       case 'bot-reaction':
         return
-      case 'fungible-refused':
+      case 'open-refused':
         drop = { reason: decision.reason, refusal: decision.refusal, ...at }
         break
       default:
@@ -979,9 +980,9 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   }
 
   /**
-   * the first event in P's life that took P's fungible path
+   * the first event in P's life that took P's open path
    * for `channel` adds it to P's heard set and logs one
-   * `persona-invited-channel` line, before any drop line or dispatch. Later
+   * `persona-open-channel` line, before any drop line or dispatch. Later
    * events from that channel log nothing here.
    */
   function logFirstHeard(persona: Persona, channel: string, path: FungiblePath): void {
@@ -993,11 +994,11 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     if (heard.has(channel)) return
     heard.add(channel)
     log(formatPersonaDiagnostic({
-      class: PERSONA_INVITED_CHANNEL,
+      class: PERSONA_OPEN_CHANNEL,
       name: persona.name,
       key: persona.key,
       index: persona.index,
-      cause: invitedChannelCause(channel, path.channelType, path.channelDelivery),
+      cause: openChannelCause(channel, path.channelType, path.channelDelivery),
     }))
   }
 
@@ -1015,7 +1016,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
           cause: unclaimedChannelCause(channel),
         }))
         return
-      case 'fungible-refused':
+      case 'open-refused':
         // one line naming the refusal's reason.
         log(formatPersonaDiagnostic({
           class: UNCLAIMED_CHANNEL,
@@ -1198,7 +1199,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   }
 }
 
-/** The fungible-path part of a decision, or undefined when the event did not take the path. */
+/** The open-path part of a decision, or undefined when the event did not take the path. */
 function fungiblePathOf(decision: DeliveryDecision): FungiblePath | undefined {
   return 'fungible' in decision ? decision.fungible : undefined
 }

@@ -78,9 +78,9 @@
 #   (the second request arrives before the first is answered): two unchanged
 #   results and one notice each. The overlap notices are the later positive
 #   progress for the AC1 and AC3 negatives.
-# - Fungible (AC5): an externally shared envelope is a logged fungible-refused
+# - Fungible (AC5): an externally shared envelope is a logged open-refused
 #   drop; sharing learned from conversations.info and a failed lookup are
-#   withdrawn (fungible-refused externally-shared, conversation-unknown); a
+#   withdrawn (open-refused externally-shared, conversation-unknown); a
 #   successor passes.
 # - Closing: no RAW line and no message-received line for any reaction, no
 #   acknowledgement on any notice's message or event ts (bravo's react calls
@@ -276,11 +276,11 @@ LOOKUP_ERROR='internal_error'
 # The reasons, refusals and conditions passed to the printer, which checks
 # each against the package's exported lists.
 DROP_UNSERVED='unserved-conversation'
-DROP_FUNGIBLE='fungible-refused'
+DROP_FUNGIBLE='open-refused'
 REFUSAL_EXTERNALLY_SHARED='externally-shared'
 WITHDRAWN_SERVER_POST='server-post'
 WITHDRAWN_GROUP_DM='group-dm'
-WITHDRAWN_FUNGIBLE='fungible-refused'
+WITHDRAWN_FUNGIBLE='open-refused'
 WITHDRAWN_UNKNOWN='conversation-unknown'
 CONDITION_EXTERNALLY_SHARED='externally-shared'
 
@@ -1798,8 +1798,8 @@ for chat in "${FS}" "${FU}" "${FP}"; do
 done
 push_reaction "fungible: shared envelope" added "${FX}" "${PFX}" "${HUMAN}" tada "${ALPHA_BOT_USER}" true
 FX_LINE="$(printed buildReactionDroppedLine "${ALPHA}" "${ALPHA_KEY}" "${DROP_FUNGIBLE}" "${FX}" "${PFX}" "${REFUSAL_EXTERNALLY_SHARED}")"
-wait_until "${EVENT_WAIT_S}" "fungible: no fungible-refused line for the shared envelope" log_end_at_least "${FX_LINE}" 1
-[[ "$(log_end_count "${FX_LINE}")" == 1 ]] || fail "fungible: more than one fungible-refused line"
+wait_until "${EVENT_WAIT_S}" "fungible: no open-refused line for the shared envelope" log_end_at_least "${FX_LINE}" 1
+[[ "$(log_end_count "${FX_LINE}")" == 1 ]] || fail "fungible: more than one open-refused line"
 evidence "fungible: server.log ${FX_LINE}"
 WITHDRAWN_SEQS=()
 withdrawn_leg "fungible: shared by conversations.info" "${FS}" "${PFS}" "${WITHDRAWN_FUNGIBLE}" "${CONDITION_EXTERNALLY_SHARED}"

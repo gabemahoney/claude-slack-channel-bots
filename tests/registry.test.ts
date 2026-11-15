@@ -96,6 +96,10 @@ import {
   matchPersonaByRootsPath,
   checkPersonaTarget,
   FUNGIBLE_TARGET_REFUSAL,
+  STRICT_TARGET_REFUSAL,
+  THREAD_HYBRID_GLOSS,
+  SET_CHANNEL_DELIVERY_DESCRIPTION,
+  SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION,
   isSlackHostedFileUrl,
   MCP_INSTRUCTIONS,
   MCP_INSTRUCTIONS_MAX_CHARS,
@@ -395,7 +399,7 @@ function totalSlackCalls(): number {
 
 /** Why `checkPersonaTarget` refuses a target. */
 const WHY = {
-  channel: "it is not one of the persona's configured channels.",
+  channel: STRICT_TARGET_REFUSAL,
   dmsOff: 'DMs are off for this persona (dm.enabled is false).',
   userId: 'this tool needs a conversation ID (a channel ID or a D… DM conversation ID), not a user ID.',
 } as const
@@ -1291,6 +1295,10 @@ describe('checkPersonaTarget', () => {
   /** An allowed target's kind, or the reason for its refusal. */
   type Expected = 'channel' | 'dm' | 'user' | { why: string }
 
+  test('pins the strict channel refusal', () => {
+    expect(STRICT_TARGET_REFUSAL).toBe("it is not one of the persona's channels with a non-off delivery choice in strict mode.")
+  })
+
   function expectedCheck(persona: Persona, target: string, expected: Expected): PersonaTargetCheck {
     return typeof expected === 'string'
       ? { allowed: true, kind: expected }
@@ -1349,12 +1357,12 @@ describe('tool posting scope (through the MCP server)', () => {
   // DM targets (D…, U…, W…) are in `DM targets` below. The DMs switch does not widen the channel scope.
   test.each(
     TOOLS.flatMap((tool) =>
-      [B_CHANNEL, UNCONFIGURED, 'G0GROUP01'].flatMap((target) => (['off', 'on'] as const).map((dms) => [tool, target, dms] as const)),
+      [A_ALL, B_CHANNEL, UNCONFIGURED, 'G0GROUP01'].flatMap((target) => (['off', 'on'] as const).map((dms) => [tool, target, dms] as const)),
     ),
   )(
     '%s to %s with DMs %s is refused with a tool error naming persona and target, and no Slack call',
     async (tool, target, dms) => {
-      applyPersona(h.alpha, dms === 'on')
+      applyPersona(h.alpha, dms === 'on', target === A_ALL ? { channels: [{ id: A_ALL, delivery: 'off' }] } : {})
       const session = await openPersonaSession(h.alpha)
 
       const result = await session.call(tool, TOOL_ARGS[tool](target))
@@ -1728,13 +1736,15 @@ describe('dry run (SLACK_DRY_RUN=1)', () => {
     expectNoSlackCall()
   })
 
-  test.each(TOOLS)('%s to an unconfigured channel is still refused (scope runs before dry run)', async (tool) => {
+  test.each(TOOLS.flatMap(tool => [UNCONFIGURED, A_ALL].map(target => [tool, target] as const)))('%s to absent/off channel %s is still refused (scope runs before dry run)', async (tool, target) => {
+    if (target === A_ALL) applyPersona(h.alpha, false, { channels: [{ id: A_ALL, delivery: 'off' }] })
     const session = await openPersonaSession(h.alpha)
 
-    const result = await session.call(tool, TOOL_ARGS[tool](UNCONFIGURED))
+    const result = await session.call(tool, TOOL_ARGS[tool](target))
 
     expect(result.isError).toBe(true)
-    expect(result.content[0]!.text).toBe(refusal(h.alpha, UNCONFIGURED))
+    expect(result.content[0]!.text).toBe(refusal(h.alpha, target))
+    expectNoSlackCall()
   })
 })
 
@@ -4557,6 +4567,8 @@ describe('tool list and instructions', () => {
     const tool = tools.find(t => t.name === SET_CHANNEL_DELIVERY_TOOL)!
     expect(tool).toBeDefined()
     const delivery = tool.inputSchema.properties!.delivery as { description: string }
+    expect(tool.description).toBe(SET_CHANNEL_DELIVERY_DESCRIPTION)
+    expect(delivery.description).toBe(SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION)
     for (const description of [tool.description, delivery.description]) {
       expect(typeof description).toBe('string')
       for (const value of ['off', 'mentions', 'all', 'thread_hybrid']) {
@@ -4564,7 +4576,7 @@ describe('tool list and instructions', () => {
       }
       expect(description).not.toMatch(/participat|followed[ -]thread/i)
     }
-    expect(delivery.description).toContain('"thread_hybrid" (mentions and replies in threads the bot is in)')
+    expect(SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION).toContain(`"thread_hybrid" ${THREAD_HYBRID_GLOSS}`)
   })
 
   // CSCB knows only the personas on this server, so receive_all claims no more.
@@ -4585,6 +4597,9 @@ describe('tool list and instructions', () => {
 // SET_CHANNEL_DELIVERY_TOOL. The DM text is the DM cases' above; the tool
 // list, the clear-latch check and the content audits are elsewhere.
 describe('session instructions in both channel modes', () => {
+  test('pins the shared thread_hybrid gloss', () => {
+    expect(THREAD_HYBRID_GLOSS).toBe('(@mentions, broadcasts and replies in threads the bot is in)')
+  })
   /** `text` matched literally inside a pattern. */
   const literal = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
@@ -4610,8 +4625,9 @@ describe('session instructions in both channel modes', () => {
     expect(MCP_INSTRUCTIONS).toContain('In strict mode you may act in your configured non-off channels.')
     expect(MCP_INSTRUCTIONS).toContain('In open mode Slack enforces channel access.')
     expect(MCP_INSTRUCTIONS).toMatch(new RegExp(`${literal(SET_CHANNEL_DELIVERY_TOOL)} sets listening to off, mentions[^\n]*all[^\n]*thread_hybrid`))
-    expect(MCP_INSTRUCTIONS).toContain('thread_hybrid (mentions and replies in threads the bot is in)')
-    expect(MCP_INSTRUCTIONS).toContain('Use it when someone in that channel asks; new assignments require open mode.')
+    expect(MCP_INSTRUCTIONS).toContain(`thread_hybrid ${THREAD_HYBRID_GLOSS}`)
+    expect(MCP_INSTRUCTIONS).toContain('Use when asked in that channel; new assignments need open mode.')
+    expect(MCP_INSTRUCTIONS).toContain('Retain attempt_id before submission; fresh assignments use fresh IDs. Retry keeps ID/channel/value and only reads history.')
   })
 })
 

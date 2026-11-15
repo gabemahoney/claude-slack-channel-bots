@@ -1820,7 +1820,7 @@ wait_membership_complete "${ALPHA}"
 
 # The texts, printed while the start pass brings the personas up.
 UNCLAIMED_CHANNEL="$(printed UNCLAIMED_CHANNEL)"
-PERSONA_INVITED_CHANNEL="$(printed PERSONA_INVITED_CHANNEL)"
+PERSONA_OPEN_CHANNEL="$(printed PERSONA_OPEN_CHANNEL)"
 PERSONA_CHANNEL_DELIVERY_SET="$(printed PERSONA_CHANNEL_DELIVERY_SET)"
 SWITCH_KEY="$(printed MODE_SWITCH_SETTING)"
 FUNGIBLE="$(printed channelModeOf open)"
@@ -1844,10 +1844,10 @@ X3_CAUSE="$(printed fungibleUnclaimedChannelCause "${X3}" "${REFUSAL_FLAG_NOT_BO
 for pair in "${X1_CAUSE}|${REASON_EXTERNALLY_SHARED}" "${X2_CAUSE}|${REASON_FLAG_MISSING}" "${X3_CAUSE}|${REASON_FLAG_NOT_BOOLEAN}"; do
     [[ "${pair%%|*}" == *"${pair#*|}"* ]] || fail "fmk-texts: the cause '${pair%%|*}' lacks its reason '${pair#*|}'"
 done
-F1_HEARD_CAUSE="$(printed invitedChannelCause "${F1}" public mentions)"
-F1_HEARD_ALL_CAUSE="$(printed invitedChannelCause "${F1}" public all)"
-A1_HEARD_CAUSE="$(printed invitedChannelCause "${A1}" public mentions)"
-F2_HEARD_CAUSE="$(printed invitedChannelCause "${F2}" private mentions)"
+F1_HEARD_CAUSE="$(printed openChannelCause "${F1}" public mentions)"
+F1_HEARD_ALL_CAUSE="$(printed openChannelCause "${F1}" public all)"
+A1_HEARD_CAUSE="$(printed openChannelCause "${A1}" public mentions)"
+F2_HEARD_CAUSE="$(printed openChannelCause "${F2}" private mentions)"
 F1_SET_CAUSE="$(printed channelDeliverySetCause "${F1}" mentions all all)"
 F1_SET_AGAIN_CAUSE="$(printed channelDeliverySetCause "${F1}" all all all)"
 A1_SET_ALL_CAUSE="$(printed channelDeliverySetCause "${A1}" mentions all all)"
@@ -1855,22 +1855,22 @@ F1_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${F1_CAUSE}")"
 X1_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${X1_CAUSE}")"
 X2_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${X2_CAUSE}")"
 X3_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${X3_CAUSE}")"
-ALPHA_HEARS_F1="$(persona_line "${PERSONA_INVITED_CHANNEL}" alpha "${F1_HEARD_CAUSE}")"
-ALPHA_HEARS_F1_ALL="$(persona_line "${PERSONA_INVITED_CHANNEL}" alpha "${F1_HEARD_ALL_CAUSE}")"
-ALPHA_HEARS_A1="$(persona_line "${PERSONA_INVITED_CHANNEL}" alpha "$(printed invitedChannelCause "${A1}" public all)")"
-BRAVO_HEARS_F2="$(persona_line "${PERSONA_INVITED_CHANNEL}" bravo "${F2_HEARD_CAUSE}")"
-BRAVO_HEARS_A1="$(persona_line "${PERSONA_INVITED_CHANNEL}" bravo "${A1_HEARD_CAUSE}")"
+ALPHA_HEARS_F1="$(persona_line "${PERSONA_OPEN_CHANNEL}" alpha "${F1_HEARD_CAUSE}")"
+ALPHA_HEARS_F1_ALL="$(persona_line "${PERSONA_OPEN_CHANNEL}" alpha "${F1_HEARD_ALL_CAUSE}")"
+ALPHA_HEARS_A1="$(persona_line "${PERSONA_OPEN_CHANNEL}" alpha "$(printed openChannelCause "${A1}" public all)")"
+BRAVO_HEARS_F2="$(persona_line "${PERSONA_OPEN_CHANNEL}" bravo "${F2_HEARD_CAUSE}")"
+BRAVO_HEARS_A1="$(persona_line "${PERSONA_OPEN_CHANNEL}" bravo "${A1_HEARD_CAUSE}")"
 ALPHA_SET_F1="$(persona_line "${PERSONA_CHANNEL_DELIVERY_SET}" alpha "${F1_SET_CAUSE}")"
 ALPHA_SET_F1_AGAIN="$(persona_line "${PERSONA_CHANNEL_DELIVERY_SET}" alpha "${F1_SET_AGAIN_CAUSE}")"
 BRAVO_SET_A1="$(persona_line "${PERSONA_CHANNEL_DELIVERY_SET}" bravo "${A1_SET_ALL_CAUSE}")"
 BRAVO_SET_F1="$(persona_line "${PERSONA_CHANNEL_DELIVERY_SET}" bravo "${F1_SET_CAUSE}")"
-# alpha's persona-invited-channel head, whatever the cause: its line printed
+# alpha's persona-open-channel head, whatever the cause: its line printed
 # with a marker cause and cut there.
-INVITED_MARKER="${TEST_NAME}-cause-marker"
-ALPHA_INVITED_LINE="$(persona_line "${PERSONA_INVITED_CHANNEL}" alpha "${INVITED_MARKER}")"
-[[ "${ALPHA_INVITED_LINE}" == *"${INVITED_MARKER}" && -n "${ALPHA_INVITED_LINE%"${INVITED_MARKER}"}" ]] \
+OPEN_MARKER="${TEST_NAME}-cause-marker"
+ALPHA_OPEN_LINE="$(persona_line "${PERSONA_OPEN_CHANNEL}" alpha "${OPEN_MARKER}")"
+[[ "${ALPHA_OPEN_LINE}" == *"${OPEN_MARKER}" && -n "${ALPHA_OPEN_LINE%"${OPEN_MARKER}"}" ]] \
     || fail "fmk-texts: formatPersonaDiagnostic does not end in its cause after a head"
-ALPHA_INVITED_HEAD="${ALPHA_INVITED_LINE%"${INVITED_MARKER}"}"
+ALPHA_OPEN_HEAD="${ALPHA_OPEN_LINE%"${OPEN_MARKER}"}"
 ALPHA_DECLARATIVE_REFUSAL="$(printed channelDeliveryDeclarativeRefusal "${ALPHA}" "${ALPHA_KEY}")"
 BAD_DELIVERY='everything'
 ALPHA_VALUE_REFUSAL="$(printed channelDeliveryValueRefusal "${ALPHA}" "${ALPHA_KEY}" "${BAD_DELIVERY}")"
@@ -1929,7 +1929,7 @@ wait_until "${RECORD_WAIT_S}" "start: the stub's record holds no push-refused li
 # fungible mode, or a class or line this work adds.
 check_upgrade_log() {
     local term
-    for term in "${SWITCH_KEY}" "${FUNGIBLE}" "${PERSONA_INVITED_CHANNEL}" "${PERSONA_CHANNEL_DELIVERY_SET}" \
+    for term in "${SWITCH_KEY}" "${FUNGIBLE}" "${PERSONA_OPEN_CHANNEL}" "${PERSONA_CHANNEL_DELIVERY_SET}" \
         ; do
         [[ -n "${term}" ]] || fail "$1: an empty term from the printer"
         [[ "$(count_server_log "${term}")" == 0 ]] || fail "$1: server.log names '${term}' in declarative mode"
@@ -2118,14 +2118,14 @@ check_thread_persistence "strict to open" "${ALPHA_LABEL}" "${JOINED_ROOTS[stric
 
 # --- Phase B: fungible mode --------------------------------------
 # 1. alpha, public F1 (flag false), plain: no delivery, a not-mentioned line,
-#    one persona-invited-channel line (alpha, F1, public, mentions).
+#    one persona-open-channel line (alpha, F1, public, mentions).
 B1_MARK="$(log_mark)"
 push_message "${ALPHA_LABEL}" "${F1}" channel "$(plain_text)" false
 B1_TS="${PUSH_TS}"
 wait_since "${B1_MARK}" "$(plain_drop "${ALPHA_REF}" "${F1}" "${DROP_NOT_MENTIONED}")" "${EVENT_WAIT_S}" \
     "step 1: no not-mentioned line for alpha F1"
 expect_queued "step 1: alpha F1 plain" 0 "${ALPHA_DIR}" "${F1}" "${B1_TS}"
-expect_since "${B1_MARK}" "${ALPHA_HEARS_F1}" 1 "step 1: alpha's persona-invited-channel lines for F1"
+expect_since "${B1_MARK}" "${ALPHA_HEARS_F1}" 1 "step 1: alpha's persona-open-channel lines for F1"
 
 # 2. alpha, F1, a mention as app_mention then message: one delivery with
 #    `mention`, no unclaimed-channel line.
@@ -2150,12 +2150,12 @@ expect_queued "step 3: alpha F1 mention (message first)" 1 "${ALPHA_DIR}" "${F1}
 expect_since "${B3_MARK}" "[slack] ${UNCLAIMED_CHANNEL}:" 0 "step 3: unclaimed-channel lines"
 
 # 4. bravo, private F2 (`group`, a G… ID), a mention: one delivery with
-#    `mention`, one persona-invited-channel line (bravo, F2, private, mentions).
+#    `mention`, one persona-open-channel line (bravo, F2, private, mentions).
 B4_MARK="$(log_mark)"
 push_message "${BRAVO_LABEL}" "${F2}" group "$(mention_text "${BRAVO_BOT_USER}")"
 B4_TS="${PUSH_TS}"
 wait_queued "step 4: bravo F2 mention" "${BRAVO_DIR}" "${F2}" "${B4_TS}" "${VIA_MENTION}"
-expect_since "${B4_MARK}" "${BRAVO_HEARS_F2}" 1 "step 4: bravo's persona-invited-channel lines for F2"
+expect_since "${B4_MARK}" "${BRAVO_HEARS_F2}" 1 "step 4: bravo's persona-open-channel lines for F2"
 # The switch kept both sessions, read after alpha's step 3
 # broadcast and bravo's step 4 mention, each delivered since the confirmation.
 expect_sessions_kept "switch on" "${F1}" "${B3_HERE_TS}" "${F2}" "${B4_TS}"
@@ -2173,7 +2173,7 @@ b5_refused() {
     expect_since "${mark}" "${line}" 1 "${step}: unclaimed-channel lines"
     expect_since "${mark}" "[slack] ${UNCLAIMED_CHANNEL}:" 1 "${step}: unclaimed-channel lines of any cause"
     expect_queued "${step}" 0 "${ALPHA_DIR}" "${channel}" "${ts}"
-    expect_since "${mark}" "[slack] ${PERSONA_INVITED_CHANNEL}:" 0 "${step}: persona-invited-channel lines"
+    expect_since "${mark}" "[slack] ${PERSONA_OPEN_CHANNEL}:" 0 "${step}: persona-open-channel lines"
 }
 b5_refused "step 5: alpha X1, flag true" "${X1}" true "${X1_UNCLAIMED}"
 # The broadcast's count is final after a later decision on alpha's connection.
@@ -2200,7 +2200,7 @@ B7_MARK="$(log_mark)"
 push_message "${ALPHA_LABEL}" "${A1}" channel "$(plain_text)"
 B7_TS="${PUSH_TS}"
 wait_queued "step 7: alpha A1 retains its applied all preference" "${ALPHA_DIR}" "${A1}" "${B7_TS}" "${VIA_RECEIVE_ALL}"
-expect_since "${B7_MARK}" "${ALPHA_HEARS_A1}" 1 "step 7: alpha's persona-invited-channel lines for A1"
+expect_since "${B7_MARK}" "${ALPHA_HEARS_A1}" 1 "step 7: alpha's persona-open-channel lines for A1"
 
 # 8. alpha stores `all` for F1: accepted, naming F1, the stored `all` and the
 #    delivery `all`; one persona-channel-delivery-set line; then alpha, F1,
@@ -2227,7 +2227,7 @@ expect_since "${B9_MARK}" "[slack] ${PERSONA_CHANNEL_DELIVERY_SET}:" 0 "step 9: 
 B10_MARK="$(log_mark)"
 push_message "${BRAVO_LABEL}" "${A1}" channel "$(mention_text "${BRAVO_BOT_USER}")"
 wait_queued "step 10: bravo A1 mention" "${BRAVO_DIR}" "${A1}" "${PUSH_TS}" "${VIA_MENTION}"
-expect_since "${B10_MARK}" "${BRAVO_HEARS_A1}" 1 "step 10: bravo's persona-invited-channel lines for A1"
+expect_since "${B10_MARK}" "${BRAVO_HEARS_A1}" 1 "step 10: bravo's persona-open-channel lines for A1"
 expect_attempt "step 10: bravo's set_channel_delivery A1 all" "${BRAVO_DIR}" "${BRAVO_A1_ALL_ARGS}" "${BRAVO_KEY}" all
 expect_since "${B10_MARK}" "${BRAVO_SET_A1}" 1 "step 10: bravo's persona-channel-delivery-set lines for A1"
 push_message "${BRAVO_LABEL}" "${A1}" channel "$(plain_text)"
@@ -2391,12 +2391,12 @@ python3 "${STUB_RECORDS}" once "${REQUESTS_FILE[${ALPHA_DIR}]}" "${RESULTS_FILE[
     || fail "restart: a request ID has no result line, or more than one"
 
 # alpha, F1, plain: delivered `receive_all_shared`; exactly one
-# persona-invited-channel line for alpha and F1 in this server run.
+# persona-open-channel line for alpha and F1 in this server run.
 push_message "${ALPHA_LABEL}" "${F1}" channel "$(plain_text)"
 wait_queued "restart: alpha F1 plain" "${ALPHA_DIR}" "${F1}" "${PUSH_TS}" "${VIA_RECEIVE_ALL_SHARED}"
-expect_since "${RESTART_MARK}" "${ALPHA_HEARS_F1_ALL}" 1 "restart: alpha's persona-invited-channel lines for F1 in this run"
-expect_since "${RESTART_MARK}" "$(matcher "${ALPHA_INVITED_HEAD}" " ${F1} ")" 1 \
-    "restart: alpha's persona-invited-channel lines naming F1 in this run"
+expect_since "${RESTART_MARK}" "${ALPHA_HEARS_F1_ALL}" 1 "restart: alpha's persona-open-channel lines for F1 in this run"
+expect_since "${RESTART_MARK}" "$(matcher "${ALPHA_OPEN_HEAD}" " ${F1} ")" 1 \
+    "restart: alpha's persona-open-channel lines naming F1 in this run"
 configuration_request after-restart-intent refresh > /dev/null
 expect_preview_choice "${ALPHA_KEY}" "${WRITE_CHANNEL}" declared all off eligible all off "$(assignment_order "${ALPHA_KEY}" "${WRITE_CHANNEL}")"
 confirm_review after-restart-intent

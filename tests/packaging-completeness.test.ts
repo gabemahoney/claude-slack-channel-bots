@@ -60,7 +60,7 @@
  * by heading title through the markdown helper, with every class label, drop
  * reason, `unclaimed-channel` reason text, file name and setting name
  * imported from `src/`:
- *   - the entries for `persona-invited-channel`, `persona-channel-delivery-set`
+ *   - the entries for `persona-open-channel`, `persona-channel-delivery-set`
  *     and `channel-delivery-unreadable` each quote their `[slack] <label>:`
  *     line and have a Line, Meaning, Cause and Fix bullet;
  *   - `unclaimed-channel` has a strict-mode and a open-mode part: the
@@ -161,12 +161,12 @@ import {
   THREAD_MEMORY_JOINS_LOST,
   THREAD_MEMORY_CHANGED_WHILE_STOPPED,
   THREAD_MEMORY_RECOVERED,
-  PERSONA_INVITED_CHANNEL,
+  PERSONA_OPEN_CHANNEL,
   UNCLAIMED_CHANNEL,
   channelDeliverySetCause,
   formatPersonaDiagnostic,
   fungibleUnclaimedChannelCause,
-  invitedChannelCause,
+  openChannelCause,
   NO_STORED_CHOICE,
   type PersonaDiagnosticClass,
 } from '../src/persona-diagnostics.ts'
@@ -865,7 +865,7 @@ function rowHolding(section: string, has: string, where: string): string {
 
 /** The classes gives an entry each: the two persona classes this work adds and the store's class. */
 const INVITED_CHANNEL_CLASSES = [
-PERSONA_INVITED_CHANNEL,
+PERSONA_OPEN_CHANNEL,
 PERSONA_CHANNEL_DELIVERY_SET
 ] as const
 
@@ -1236,17 +1236,17 @@ function modeSwitchTemplate(mode: ChannelMode): string {
  * `set_channel_delivery` refusals and failed-write texts, the store's lines, the stored-choice
  * `reload-record-write-failed` line, and the switch's and the
  * recorded change's preview lines, and the
- * `persona-invited-channel`, `persona-channel-delivery-set` and open-mode
+ * `persona-open-channel`, `persona-channel-delivery-set` and open-mode
  * `unclaimed-channel` lines, and the start's state directory lines, `[slack] state-migrate:` and
  * `[slack] Warning: state-migrate:`. Rendered when a case runs,
  * never at collection.
  */
 const QUOTED_TEXTS: [label: string, where: HeadingMatch, render: () => string][] = [
 [
-    `the ${PERSONA_INVITED_CHANNEL} line`,
-    classHeading(PERSONA_INVITED_CHANNEL),
+    `the ${PERSONA_OPEN_CHANNEL} line`,
+    classHeading(PERSONA_OPEN_CHANNEL),
     () =>
-      personaLineTemplate(PERSONA_INVITED_CHANNEL, invitedChannelCause(CHANNEL, 'public', 'mentions'))
+      personaLineTemplate(PERSONA_OPEN_CHANNEL, openChannelCause(CHANNEL, 'public', 'mentions'))
         .replace('hears public channel', 'hears <public|private> channel')
         .replace('at channel delivery mentions', `at channel delivery <${DELIVERY_MODES.join('|')}>`),
   ],

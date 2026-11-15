@@ -28,13 +28,13 @@ Read this before turning open mode on. Each persona's Claude worker runs with to
 - **Slack Connect channels are never served.** An externally shared channel is never served in open mode; serve it in strict mode, with the channel listed.
 - **Enterprise Grid: Slack's flag decides.** A channel shared between workspaces of one Enterprise Grid organization can be served when Slack marks it as not externally shared, and then members of every workspace sharing it can reach the persona.
 
-The audit lines in `server.log` are `persona-invited-channel`, logged the first time a persona hears a channel in open mode (naming the channel, `public` or `private`, and its `delivery` value), and `persona-channel-delivery-set`, logged for each choice a `set_channel_delivery` call newly applies, as `stored choice for channel <channel> set from <none|off|mentions|all|thread_hybrid> to <value>, at channel delivery <value>`. The debugging skill explains both ([`persona-invited-channel`](../skills/debug-slack-channel-bots/SKILL.md#persona-invited-channel), [`persona-channel-delivery-set`](../skills/debug-slack-channel-bots/SKILL.md#persona-channel-delivery-set)). To list them:
+The audit lines in `server.log` are `persona-open-channel`, logged the first time a persona hears a channel in open mode (naming the channel, `public` or `private`, and its `delivery` value), and `persona-channel-delivery-set`, logged for each choice a `set_channel_delivery` call newly applies, as `delivery choice for channel <channel> set from <none|off|mentions|all|thread_hybrid> to <value>, at channel delivery <value>`. The debugging skill explains both ([`persona-open-channel`](../skills/debug-slack-channel-bots/SKILL.md#persona-open-channel), [`persona-channel-delivery-set`](../skills/debug-slack-channel-bots/SKILL.md#persona-channel-delivery-set)). To list them:
 
 ```sh
-grep -E 'persona-(invited-channel|channel-delivery-set)' ~/.config/claude-slack-channel-bots/server.log*
+grep -E 'persona-(open-channel|channel-delivery-set)' ~/.config/claude-slack-channel-bots/server.log*
 ```
 
-A persona logs a channel's `persona-invited-channel` line only once until the server restarts or the persona is brought up fresh, so on a long-running server, log rotation can discard a channel's only audit line (see [Server log rotation](troubleshooting.md#server-log-rotation)). After a restart, the first event from each channel a persona hears in open mode logs its line again.
+A persona logs a channel's `persona-open-channel` line only once until the server restarts or the persona is brought up fresh, so on a long-running server, log rotation can discard a channel's only audit line (see [Server log rotation](troubleshooting.md#server-log-rotation)). After a restart, the first event from each channel a persona hears in open mode logs its line again.
 
 ## Turning open mode on or off
 

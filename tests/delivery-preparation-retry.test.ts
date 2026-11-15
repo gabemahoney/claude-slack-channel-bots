@@ -273,8 +273,8 @@ describe('reaction preparation fixes or withdraws through the real queue', () =>
   const RETRIED: Array<['fixed' | 'withdrawn', ReactionAcceptedInput['mode'], SettledWebApiOutcome, QueueRecord, string[], [SettledWebApiOutcome, SettledWebApiOutcome]]> = [
     ['fixed', 'strict', exact({ thread_ts: ROOT_TS }), { v: 1, kind: 'fixed', seq: 1, parts: buildTagParts(notice({ thread_ts: ROOT_TS })) }, [],
       [exact(SERVER_POST), conversation({ ...PUBLIC, is_ext_shared: true })]],
-    ['withdrawn', 'open', { kind: 'platform', error: 'not_in_channel' }, withdrawal(1, 'fungible-refused', START, 'not_in_channel'),
-      [buildReactionWithdrawnLine(SUBJECT, 'fungible-refused', 'not_in_channel')], [exact({ thread_ts: ROOT_TS }), conversation(PUBLIC)]],
+    ['withdrawn', 'open', { kind: 'platform', error: 'not_in_channel' }, withdrawal(1, 'open-refused', START, 'not_in_channel'),
+      [buildReactionWithdrawnLine(SUBJECT, 'open-refused', 'not_in_channel')], [exact({ thread_ts: ROOT_TS }), conversation(PUBLIC)]],
   ]
   test.each(RETRIED)('a failed %s append keeps ownership and its decided record, then retries it unchanged at the backoff step', async (kind, mode, replies, record, lines, changed) => {
     const h = await harness(), p = preparer(h)
@@ -338,10 +338,10 @@ describe('reaction preparation fixes or withdraws through the real queue', () =>
       expect(h.textCalls().map(c => c.params.text)).toEqual(['later'])
       // Decided before the backoff and retried after it, the withdrawal keeps its first time.
       expect(h.clock.now()).toBeGreaterThanOrEqual(START + RETYPE_BACKOFF_MS[0])
-      expect(outcomes(h)).toEqual([withdrawal(1, 'fungible-refused', START, 'externally-shared')])
+      expect(outcomes(h)).toEqual([withdrawal(1, 'open-refused', START, 'externally-shared')])
       expect(h.events.filter(e => DELIVERY_EVENTS.includes(e.type) && 'seq' in e && e.seq === 1)).toEqual([])
       expect(h.events.filter(e => e.type === 'delivered').map(e => e.seq)).toEqual([2])
-      expect(logs).toEqual([buildReactionWithdrawnLine(SUBJECT, 'fungible-refused', 'externally-shared')])
+      expect(logs).toEqual([buildReactionWithdrawnLine(SUBJECT, 'open-refused', 'externally-shared')])
     }
   })
 
@@ -391,7 +391,7 @@ describe('fresh lookups and the L1 and L7 fallbacks at the factory', () => {
     p.stub.script.info.push(conversation({ ...PUBLIC, is_ext_shared: true }))
     const refused = await acceptReaction(h, reaction({ mode: 'open', ts: LATER_EVENT_TS }))
     await p.preparation.prepare('alpha', refused)
-    expect(h.queue.item('alpha', refused.accepted.seq)!.withdrawn).toEqual(withdrawal(refused.accepted.seq, 'fungible-refused', START, 'externally-shared'))
+    expect(h.queue.item('alpha', refused.accepted.seq)!.withdrawn).toEqual(withdrawal(refused.accepted.seq, 'open-refused', START, 'externally-shared'))
     expect(p.stub.calls.conversationsInfo).toHaveLength(3)
   })
 
@@ -447,7 +447,7 @@ describe('reaction preparation lines', () => {
     } })
     p.stub.script.info.push(conversation({ ...PUBLIC, is_ext_shared: true }))
     await p.preparation.prepare('alpha', await acceptReaction(h, reaction({ mode: 'open' })))
-    expect(outcomes(h)).toEqual([withdrawal(1, 'fungible-refused', START, 'externally-shared')])
+    expect(outcomes(h)).toEqual([withdrawal(1, 'open-refused', START, 'externally-shared')])
     expect(effects(h)).toEqual(['append:withdrawn:1', 'log', 'wake:alpha'])
     expect(p.preparation.owns('alpha', 1)).toBe(false)
     expect(h.clock.pendingCount()).toBe(0)
@@ -467,8 +467,8 @@ describe('reaction preparation lines', () => {
     await p.preparation.prepare('alpha', await acceptReaction(h, reaction({ mode: 'open', ts: LATER_EVENT_TS })))
     expect(p.resolved).toEqual(['U0REACTOR', 'U0REACTOR'])
     expect(p.logs).toEqual([
-      buildReactionWithdrawnLine(SUBJECT, 'fungible-refused', 'externally-shared'),
-      buildReactionWithdrawnLine(SUBJECT, 'fungible-refused', 'not_in_channel'),
+      buildReactionWithdrawnLine(SUBJECT, 'open-refused', 'externally-shared'),
+      buildReactionWithdrawnLine(SUBJECT, 'open-refused', 'not_in_channel'),
     ])
     assertNoLeak({ logs: p.logs, errors: h.errors, events: h.events, journal: writtenFile(queuePath(h.root)) })
   })
@@ -498,8 +498,8 @@ describe('reaction preparation stop, forget and competing outcomes', () => {
     const next = preparer(h), at = h.clock.now()
     next.stub.script.info.push(conversation({ ...PUBLIC, is_ext_shared: true }))
     await next.preparation.recover()
-    expect(outcomes(h)).toEqual([withdrawal(1, 'fungible-refused', at, 'externally-shared')])
-    expect(next.logs).toEqual([buildReactionWithdrawnLine(SUBJECT, 'fungible-refused', 'externally-shared')])
+    expect(outcomes(h)).toEqual([withdrawal(1, 'open-refused', at, 'externally-shared')])
+    expect(next.logs).toEqual([buildReactionWithdrawnLine(SUBJECT, 'open-refused', 'externally-shared')])
     expect(p.logs).toEqual([])
   })
 
@@ -563,9 +563,9 @@ describe('reaction preparation stop, forget and competing outcomes', () => {
     expect(h.clock.pending()).toEqual(retry)
     // The other persona's retry appends its identical decided record, unaffected.
     await h.clock.advanceTo(retry[0]!.dueAt)
-    expect(outcomes(h, 1, BETA.key)).toEqual([withdrawal(1, 'fungible-refused', START, 'externally-shared')])
+    expect(outcomes(h, 1, BETA.key)).toEqual([withdrawal(1, 'open-refused', START, 'externally-shared')])
     expect(lookups(p, BETA.key)).toBe(3)
-    expect(p.logs).toEqual([buildReactionWithdrawnLine(BETA_SUBJECT, 'fungible-refused', 'externally-shared')])
+    expect(p.logs).toEqual([buildReactionWithdrawnLine(BETA_SUBJECT, 'open-refused', 'externally-shared')])
     expect(p.wakes).toEqual([BETA.key])
     expect(p.preparation.owns(BETA.key, 1)).toBe(false)
     await h.clock.advance(RETYPE_BACKOFF_MS.at(-1)! * 2)
@@ -581,7 +581,7 @@ describe('reaction preparation stop, forget and competing outcomes', () => {
     const h = await harness(), p = preparer(h, { holdAppend: record => { held.push(record); return gate.promise } })
     p.stub.script.info.push(conversation({ ...PUBLIC, is_ext_shared: true }))
     if (append === 'fails') h.failAppend('withdrawn')
-    const record = withdrawal(1, 'fungible-refused', START, 'externally-shared')
+    const record = withdrawal(1, 'open-refused', START, 'externally-shared')
     const preparing = p.preparation.prepare(PERSONA.key, await acceptReaction(h, reaction({ mode: 'open' })))
     await h.clock.flush()
     expect(held).toEqual([record])

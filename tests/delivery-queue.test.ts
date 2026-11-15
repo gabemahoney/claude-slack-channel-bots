@@ -3028,10 +3028,11 @@ describe('Reaction Item journal', () => {
 
   test.each([
     ...(['server-post', 'conversation-unknown', 'group-dm'] as const).map(reason => [`withdrawn ${reason}`, withdrawn({ reason }), true] as const),
-    ...(['not-a-channel', 'externally-shared', 'not_in_channel', 'channel_not_found'] as const).map(failed_condition => [`withdrawn fungible-refused ${failed_condition}`, withdrawn({ reason: 'fungible-refused', failed_condition }), true] as const),
-    ['withdrawn fungible-refused without its condition', withdrawn({ reason: 'fungible-refused' }), false],
-    ['withdrawn fungible-refused with an unknown condition', { ...withdrawn({ reason: 'fungible-refused' }), failed_condition: 'archived' }, false],
-    ['withdrawn group-dm with a condition', withdrawn({ reason: 'group-dm', failed_condition: 'not-a-channel' }), false],
+    ...(['not-a-channel', 'externally-shared', 'not_in_channel', 'channel_not_found'] as const).map(failed_condition => [`withdrawn open-refused ${failed_condition}`, withdrawn({ reason: 'open-refused', failed_condition }), true] as const),
+    ['withdrawn open-refused without its condition', withdrawn({ reason: 'open-refused' }), false],
+    ['withdrawn open-refused with an unknown condition', { ...withdrawn({ reason: 'open-refused' }), failed_condition: 'archived' }, false],
+    ...(['server-post', 'conversation-unknown', 'group-dm'] as const).map(reason => [`withdrawn ${reason} with a condition`, withdrawn({ reason, failed_condition: 'not-a-channel' }), false] as const),
+    ['withdrawn with the removed reason', { ...withdrawn({ reason: 'open-refused', failed_condition: 'externally-shared' }), reason: 'fungible-refused' }, false],
     ['withdrawn with an unknown reason', { ...withdrawn(), reason: 'spam' }, false],
     ['withdrawn without a reason', { ...withdrawn(), reason: undefined }, false],
     // A withdrawn hold has its own kind: the reason-less form above is no hold record either.
@@ -3047,8 +3048,8 @@ describe('Reaction Item journal', () => {
     ['withdrawn version 2', { ...withdrawn(), v: 2 }, false],
     // Permitted values inside arrays, which a String() membership test would admit.
     ['withdrawn with an array reason', { ...withdrawn(), reason: ['server-post'] }, false],
-    ['withdrawn with an array fungible-refused reason and no condition', { ...withdrawn(), reason: ['fungible-refused'] }, false],
-    ['withdrawn fungible-refused with an array condition', { ...withdrawn({ reason: 'fungible-refused' }), failed_condition: ['not-a-channel'] }, false],
+    ['withdrawn with an array open-refused reason and no condition', { ...withdrawn(), reason: ['open-refused'] }, false],
+    ['withdrawn open-refused with an array condition', { ...withdrawn({ reason: 'open-refused' }), failed_condition: ['not-a-channel'] }, false],
     ['reaction-key compact', { v: 1, kind: 'accepted', seq: 1, compact: 'reaction-key', reaction_key: key, received_at: 1000, closed_at: 2000 }, true],
     ['reaction-key compact without closed_at', { v: 1, kind: 'accepted', seq: 1, compact: 'reaction-key', reaction_key: key, received_at: 1000 }, false],
     ['reaction-key compact with string closed_at', { v: 1, kind: 'accepted', seq: 1, compact: 'reaction-key', reaction_key: key, received_at: 1000, closed_at: '2000' }, false],
@@ -3256,7 +3257,7 @@ describe('Reaction Item journal', () => {
     await q.accept('alpha', reactionInput())
     await q.accept('alpha', injectedInput())
     expect(q.openCount('alpha')).toBe(2)
-    const record = withdrawn({ reason: 'fungible-refused', failed_condition: 'externally-shared' })
+    const record = withdrawn({ reason: 'open-refused', failed_condition: 'externally-shared' })
     await q.append('alpha', record)
     const closed = q.item('alpha', 1)!
     expect(closed).toMatchObject({ withdrawn: record, delivered: false, unknownSend: false, retypeCount: 0, nextAttempt: 1 })
@@ -3348,7 +3349,7 @@ describe('Reaction Item journal', () => {
 
   test.each([
     ['delivered', [{ v: 1, kind: 'fixed', seq: 2, parts: ['CLOSED-PART-MARKER'] }, deliveredRecord(2, 1000 + QUEUE_KEY_KEEP_MS - 10)]],
-    ['withdrawn', [withdrawn({ seq: 2, at: 1000 + QUEUE_KEY_KEEP_MS - 10 })]],
+    ['withdrawn', [withdrawn({ seq: 2, reason: 'open-refused', failed_condition: 'externally-shared', at: 1000 + QUEUE_KEY_KEEP_MS - 10 })]],
   ] as [string, QueueRecord[]][])('a %s reaction compacts to its content-free key until QUEUE_KEY_KEEP_MS after intake while open reaction facts survive', async (_, closing) => {
     const clock = createFakeClock({ start: 1000 })
     let q = await open({ now: clock.now })
@@ -3393,7 +3394,7 @@ describe('Reaction Item journal', () => {
   test.each([
     ['accepted reaction without its mode', { ...reactionRecord({ emoji: 'eyes' }), seq: 2, mode: undefined }, true],
     // Read as a durable outcome, it would close seq 1 on replay.
-    ['withdrawal of seq 1 with an array fungible-refused reason', { ...withdrawn(), reason: ['fungible-refused'] }, false],
+    ['withdrawal of seq 1 with an array open-refused reason', { ...withdrawn(), reason: ['open-refused'] }, false],
     // A known kind inside an array is still an unknown kind, so it alerts.
     ['record whose kind is an array', { v: 1, kind: ['withdrawn'], seq: 9 }, true],
   ] as [string, Record<string, unknown>, boolean][])('a malformed %s in the middle of a journal is quarantined while valid work replays in order and stays open', async (_, record, alert) => {

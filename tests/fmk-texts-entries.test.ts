@@ -688,7 +688,7 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
   }
 
   // test-29's references (test-29-invited-channels.sh), each
-  // `<file>:<export>:<kind>`: the invited-channel texts it matches, the
+  // `<file>:<export>:<kind>`: the open-channel texts it matches, the
   // persona lines' framing, the switch's key (the configuration's and the
   // mode lookup's), mode name and class labels its upgrade phase checks no
   // line names, and the applied line, tmux session names and relaunch line
@@ -707,8 +707,8 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
     'persona-diagnostics.ts:UNCLAIMED_REASON_FLAG_NOT_BOOLEAN:constant',
     'persona-diagnostics.ts:fungibleUnclaimedChannelCause:function',
     'delivery-decision.ts:FUNGIBLE_REFUSALS:defined',
-    'persona-diagnostics.ts:PERSONA_INVITED_CHANNEL:constant',
-    'persona-diagnostics.ts:invitedChannelCause:function',
+    'persona-diagnostics.ts:PERSONA_OPEN_CHANNEL:constant',
+    'persona-diagnostics.ts:openChannelCause:function',
     'persona-diagnostics.ts:PERSONA_CHANNEL_DELIVERY_SET:constant',
     'persona-diagnostics.ts:channelDeliverySetCause:function',
     'persona-diagnostics.ts:NO_STORED_CHOICE:string',
@@ -892,6 +892,76 @@ test('SR-8 printer entries print the current package exports', () => sharedPrint
     ['buildTestMeasurementsStartLine', [path], testMeasurements.buildTestMeasurementsStartLine(path)],
   ]
   for (const [name, args, expected] of rows) expect(await printer.entryValue(name, args)).toBe(String(expected))
+}))
+
+test('Tests 29/50 print current open-channel and reaction contracts and reject obsolete inputs', () => sharedPrinterControl(async ({ printer }) => {
+  const { entryValue: print, ENTRIES } = printer
+  const subject = { name: 'alpha', key: 'alpha', chat_id: 'COPEN', message_ts: '1700000000.000001' }
+  const { name, key, chat_id: channel, message_ts: ts } = subject
+  const rows: Array<[string, string[], string]> = [
+    ['PERSONA_OPEN_CHANNEL', [], personaDiagnostics.PERSONA_OPEN_CHANNEL],
+    ['openChannelCause', [channel, 'public', 'mentions'], personaDiagnostics.openChannelCause(channel, 'public', 'mentions')],
+    ['openChannelCause', [channel, 'private', 'all'], personaDiagnostics.openChannelCause(channel, 'private', 'all')],
+    ['channelDeliverySetCause', [channel, personaDiagnostics.NO_STORED_CHOICE, 'all', 'all'], personaDiagnostics.channelDeliverySetCause(channel, undefined, 'all', 'all')],
+    ['channelDeliverySetCause', [channel, 'mentions', 'all', 'all'], personaDiagnostics.channelDeliverySetCause(channel, 'mentions', 'all', 'all')],
+    ['buildReactionDroppedLine', [name, key, 'open-refused', channel, ts, 'externally-shared'], reactionIntakeDiagnostics.buildReactionDroppedLine(subject, { reason: 'open-refused', chat_id: channel, message_ts: ts, refusal: 'externally-shared' })],
+    ['buildReactionDroppedLine', [name, key, 'unserved-conversation', channel, ts], reactionIntakeDiagnostics.buildReactionDroppedLine(subject, { reason: 'unserved-conversation', chat_id: channel, message_ts: ts })],
+  ]
+  for (const reason of ['server-post', 'conversation-unknown', 'group-dm'] as const) {
+    rows.push(['buildReactionWithdrawnLine', [name, key, channel, ts, reason], reactionPreparationDiagnostics.buildReactionWithdrawnLine(subject, reason)])
+  }
+  for (const condition of ['not-a-channel', 'externally-shared', 'not_in_channel', 'channel_not_found'] as const) {
+    rows.push(['buildReactionWithdrawnLine', [name, key, channel, ts, 'open-refused', condition], reactionPreparationDiagnostics.buildReactionWithdrawnLine(subject, 'open-refused', condition)])
+  }
+  for (const [entry, args, expected] of rows) expect(await print(entry, args)).toBe(expected)
+
+  for (const obsolete of ['PERSONA_INVITED_CHANNEL', 'invitedChannelCause']) {
+    expect(Object.hasOwn(ENTRIES, obsolete)).toBe(false)
+    await expect(print(obsolete, [])).rejects.toMatchObject({ exitCode: 64 })
+  }
+  const invalid: Array<[string, string[]]> = [
+    ['openChannelCause', [channel, 'dm', 'mentions']],
+    ['openChannelCause', [channel, 'public', 'invalid']],
+    ['channelDeliverySetCause', [channel, 'invalid', 'all', 'all']],
+    ['channelDeliverySetCause', [channel, 'mentions', 'invalid', 'all']],
+    ['channelDeliverySetCause', [channel, 'mentions', 'all', 'invalid']],
+    ['buildReactionDroppedLine', [name, key, 'fungible-refused', channel, ts, 'externally-shared']],
+    ['buildReactionDroppedLine', [name, key, 'open-refused', channel, ts]],
+    ['buildReactionDroppedLine', [name, key, 'unserved-conversation', channel, ts, 'externally-shared']],
+    ['buildReactionWithdrawnLine', [name, key, channel, ts, 'fungible-refused', 'externally-shared']],
+    ['buildReactionWithdrawnLine', [name, key, channel, ts, 'open-refused', 'invalid']],
+  ]
+  for (const [entry, args] of invalid) await expect(print(entry, args)).rejects.toMatchObject({ exitCode: 64 })
+}))
+
+test('renamed printer entries retain argument and installed-export failure checks', () => sharedPrinterControl(async ({ printer }) => {
+  const { entryValue: print, ENTRIES } = printer
+  const cases = [
+    ['PERSONA_OPEN_CHANNEL', 'persona-diagnostics.ts', [], false],
+    ['openChannelCause', 'persona-diagnostics.ts', ['COPEN', 'public', 'mentions'], true],
+    ['channelDeliverySetCause', 'persona-diagnostics.ts', ['COPEN', personaDiagnostics.NO_STORED_CHOICE, 'all', 'all'], true],
+    ['buildReactionDroppedLine', 'reaction-intake-diagnostics.ts', ['alpha', 'alpha', 'open-refused', 'COPEN', '1.000001', 'externally-shared'], true],
+    ['buildReactionWithdrawnLine', 'reaction-preparation-diagnostics.ts', ['alpha', 'alpha', 'COPEN', '1.000001', 'open-refused', 'externally-shared'], true],
+  ] as const
+  for (const [entry, file, args, callable] of cases) {
+    const missing = entry.startsWith('buildReaction') ? args.slice(0, 4) : args.slice(0, -1)
+    if (args.length > 0) await expect(print(entry, missing)).rejects.toMatchObject({ exitCode: 64 })
+    await expect(print(entry, [...args, 'extra'])).rejects.toMatchObject({ exitCode: 64 })
+    for (let i = 0; i < args.length; i++) {
+      const empty: string[] = [...args]; empty[i] = ''
+      await expect(print(entry, empty)).rejects.toMatchObject({ exitCode: 64 })
+    }
+    for (const bad of [undefined, {}]) {
+      const context = { importPackageModule: async (path: string) =>
+        path === file ? { ...MODULES[file], [entry]: bad } : MODULES[path] }
+      await expect(ENTRIES[entry].print(args, context)).rejects.toMatchObject({ exitCode: 1 })
+    }
+    if (callable) {
+      const context = { importPackageModule: async (path: string) =>
+        path === file ? { ...MODULES[file], [entry]: () => 7 } : MODULES[path] }
+      await expect(ENTRIES[entry].print(args, context)).rejects.toMatchObject({ exitCode: 1 })
+    }
+  }
 }))
 
 describe('shared scenario printer evidence contracts', () => {

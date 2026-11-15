@@ -7,13 +7,11 @@
  * one top-level message with no `thread_ts` and no username or icon override.
  * The destination is resolved, and a DM opened when needed, by the shared
  * destination resolver (`persona-destination.ts`) through the one destination
- * rule (`personaDestinationOf`) over the
- * configuration in effect at each attempt: its
- * `permission_prompts` in declarative mode, its fungible destination in
- * fungible mode. The notifier reads no destination setting
- * and no switch itself, the lost-message notice included, and no notice
- * carries a destination: one held before a confirmed switch change posts at
- * the destination of the mode turned on. The notifier adds the
+ * rule (`personaDestinationOf`) over the applied persona at each attempt:
+ * its common `permission_prompts` in both strict and open modes. The notifier
+ * reads no destination setting or mode itself, the lost-message notice
+ * included, and no notice carries a destination: a held notice posts at the
+ * current applied destination when its attempt runs. The notifier adds the
  * persona reference to every notice text, so callers pass only the key and
  * the notice body.
  *

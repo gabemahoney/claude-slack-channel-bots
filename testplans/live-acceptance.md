@@ -2432,7 +2432,7 @@ Steps:
 
    ```sh
    tags c <TS_BEFORE>
-   since "$MARK2" | grep -F '] persona-invited-channel: ' | grep -F '"persona_c" (key=persona_c)' | grep -F '<RUN_CHANNEL_ID>'
+   since "$MARK2" | grep -F '] persona-open-channel: ' | grep -F '"persona_c" (key=persona_c)' | grep -F '<RUN_CHANNEL_ID>'
    ```
 
 9. Read the shared authority in `config.json.last-applied`: C’s applied channel entry for `<RUN_CHANNEL_ID>` must be `mentions`, and `.personas.persona_c.membership[<RUN_CHANNEL_ID>].member` must be true. Record the entry and membership together after the authenticated join; the mention alone is not membership evidence.
@@ -2448,12 +2448,12 @@ Expected:
 - With D still declared, the header has the same counts and the mode line is `server-wide setting channel_mode changed: turns open mode on, applied in place at once, from the next event, tool call, prompt and notice, for "persona_a" (key=persona_a), "persona_b" (key=persona_b), "persona_c" (key=persona_c), "persona_d" (key=persona_d).`
 - After the rename, exactly one `[slack] reload-applied: applied the confirmed configuration change without a restart (personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 1 changed); the last-applied record "<path of config.json>.last-applied" now holds it` line (`0 modified in place` with D).
 - Step 7: C answers "invited" in `<RUN_CHANNEL_NAME>`, under C's own name and avatar.
-- Step 8's `grep` prints exactly one line, containing `[slack] persona-invited-channel: personas[2] "persona_c" (key=persona_c): hears public channel <RUN_CHANNEL_ID> in open mode, at channel delivery mentions`.
+- Step 8's `grep` prints exactly one line, containing `[slack] persona-open-channel: personas[2] "persona_c" (key=persona_c): hears public channel <RUN_CHANNEL_ID> in open mode, at channel delivery mentions`.
 - Record in Notes whether `tags c <TS_BEFORE>` printed a tag: whether the mention before the invite was delivered to C. Either way is acceptable.
 
 Pass: the switch went on with zero persona in-place changes, and after the
 invite C answered the mention in the run channel as itself, with one
-`persona-invited-channel` line naming C and the channel (public,
+`persona-open-channel` line naming C and the channel (public,
 `mentions`).
 
 ### Check 31: asked in the channel, C switches it to all with set_channel_delivery, then answers a message that does not mention it
@@ -2485,7 +2485,7 @@ Steps:
 Expected:
 
 - C says done. Step 3's `toolcalls` line is newer than step 1's count, names the run channel and has `"delivery":"all"`, `"attemptId":"<ATTEMPT_ID>"`, explicit `"intent":"assignment"` (or `"intent":"retry"` after response loss with the same binding), and `"outcome":"ok"`. Missing or wrong identifier/intent/value, no result, or a refusal fails the check.
-- Step 3's `grep` prints exactly one line, containing `[slack] persona-channel-delivery-set: personas[2] "persona_c" (key=persona_c): stored choice for channel <RUN_CHANNEL_ID> set from mentions to all, at channel delivery all` for the first run after Check 30. Match `from` to step 1's actual `<PREVIOUS_CHOICE>`: on a deliberate repeat with `all` already saved, expect `from all to all` instead.
+- Step 3's `grep` prints exactly one line, containing `[slack] persona-channel-delivery-set: personas[2] "persona_c" (key=persona_c): delivery choice for channel <RUN_CHANNEL_ID> set from mentions to all, at channel delivery all` for the first run after Check 30. Match `from` to step 1's actual `<PREVIOUS_CHOICE>`: on a deliberate repeat with `all` already saved, expect `from all to all` instead.
 
   No line or duplicate lines fails the check. An `ok` history response alone is not evidence of a fresh application; the one diagnostic since the mark must establish this run's new application.
 - Step 4: C answers "heard-all" in `<RUN_CHANNEL_NAME>`, under its own name and avatar.

@@ -60,19 +60,19 @@ describe('pins: the one place the class labels and line spelling are written out
   test('labels and the logged drop reasons', () => {
     expect(REACTION_RECEIVED).toBe('reaction-received')
     expect(REACTION_DROPPED).toBe('reaction-dropped')
-    expect([...REACTION_LOGGED_DROP_REASONS]).toEqual(['no-reactor', 'notices-off', 'dm-disabled', 'unserved-conversation', 'fungible-refused'])
+    expect([...REACTION_LOGGED_DROP_REASONS]).toEqual(['no-reactor', 'notices-off', 'dm-disabled', 'unserved-conversation', 'open-refused'])
   })
 
   test('lines', () => {
     const lines = [
       buildReactionReceivedLine(NAMED, reaction()),
-      buildReactionDroppedLine(NAMED, { reason: 'fungible-refused', chat_id: CHAT, message_ts: MSG_TS, refusal: 'externally-shared' }),
+      buildReactionDroppedLine(NAMED, { reason: 'open-refused', chat_id: CHAT, message_ts: MSG_TS, refusal: 'externally-shared' }),
       buildBotToolReactionStoreFailedLine(ref(NAMED), ' (reason=internal_error): Error code=EIO message="store refused"'),
       buildBotToolReactionErrorLine(`key=${KEY_ONLY.key}`, ': TypeError message="lookup broke"'),
     ]
     expect(lines).toEqual([
       '[slack] reaction-received: persona="Ops Bot" (key=ops_bot) chat_id="C0GENERAL" message_ts="1700000100.000100" change=added emoji="thumbsup" user="U0REACTOR" seq=7',
-      '[slack] reaction-dropped: persona="Ops Bot" (key=ops_bot) chat_id="C0GENERAL" message_ts="1700000100.000100" reason=fungible-refused refusal=externally-shared',
+      '[slack] reaction-dropped: persona="Ops Bot" (key=ops_bot) chat_id="C0GENERAL" message_ts="1700000100.000100" reason=open-refused refusal=externally-shared',
       '[slack] persona-routing: bot-tool reaction store failed for persona "Ops Bot" (key=ops_bot) (reason=internal_error): Error code=EIO message="store refused"',
       '[slack] persona-routing: error handling bot-tool reaction for persona key=ops_bot: TypeError message="lookup broke"',
     ])
@@ -107,7 +107,7 @@ describe('drop reasons', () => {
     'bot-reaction': 'silent',
     'dm-disabled': 'logged',
     'unserved-conversation': 'logged',
-    'fungible-refused': 'logged',
+    'open-refused': 'logged',
   }
 
   test('exactly the logged reasons are exported; not-a-message-reaction, not-own-message, own-reaction and bot-reaction log nothing', () => {
@@ -144,21 +144,21 @@ describe('reaction-dropped', () => {
   })
 
   const DROPS: ReactionDroppedInput[] = [
-    ...REACTION_LOGGED_DROP_REASONS.filter(reason => reason !== 'fungible-refused').map(reason => ({ reason, chat_id: CHAT, message_ts: MSG_TS }) as ReactionDroppedInput),
-    ...REFUSALS.map(refusal => ({ reason: 'fungible-refused', chat_id: CHAT, message_ts: MSG_TS, refusal }) as ReactionDroppedInput),
+    ...REACTION_LOGGED_DROP_REASONS.filter(reason => reason !== 'open-refused').map(reason => ({ reason, chat_id: CHAT, message_ts: MSG_TS }) as ReactionDroppedInput),
+    ...REFUSALS.map(refusal => ({ reason: 'open-refused', chat_id: CHAT, message_ts: MSG_TS, refusal }) as ReactionDroppedInput),
   ]
   const ROWS = [NAMED, KEY_ONLY].flatMap(persona => DROPS.map(drop =>
     [`${persona.name === undefined ? 'key-only' : 'named'} ${drop.reason}${drop.refusal ? ` ${drop.refusal}` : ''}`, persona, drop] as const))
 
-  test.each(ROWS)('%s: the reason, and the refusal only for fungible-refused', (_label, persona, drop) => {
+  test.each(ROWS)('%s: the reason, and the refusal only for open-refused', (_label, persona, drop) => {
     const line = buildReactionDroppedLine(persona, drop)
-    const end = `reason=${drop.reason}${drop.reason === 'fungible-refused' ? ` refusal=${drop.refusal}` : ''}`
+    const end = `reason=${drop.reason}${drop.reason === 'open-refused' ? ` refusal=${drop.refusal}` : ''}`
     expect(line).toBe(`[slack] ${REACTION_DROPPED}: persona=${ref(persona)} chat_id=${quoted(CHAT)} message_ts=${quoted(MSG_TS)} ${end}`)
     assertNoLeak(line)
   })
 
   test('notices-off carries no refusal: the input type refuses one, and one planted on it is not rendered', () => {
-    // @ts-expect-error a refusal belongs only to fungible-refused
+    // @ts-expect-error a refusal belongs only to open-refused
     const typed: ReactionDroppedInput = { reason: 'notices-off', chat_id: CHAT, message_ts: MSG_TS, refusal: 'externally-shared' }
     const line = buildReactionDroppedLine(NAMED, typed)
     expect(line).toBe(buildReactionDroppedLine(NAMED, { reason: 'notices-off', chat_id: CHAT, message_ts: MSG_TS }))
@@ -169,12 +169,12 @@ describe('reaction-dropped', () => {
     const lines = [
       buildReactionDroppedLine(NAMED, { reason: 'no-reactor' }),
       buildReactionDroppedLine(NAMED, { reason: 'no-reactor', chat_id: CHAT }),
-      buildReactionDroppedLine(KEY_ONLY, { reason: 'fungible-refused', message_ts: MSG_TS, refusal: 'flag-missing' }),
+      buildReactionDroppedLine(KEY_ONLY, { reason: 'open-refused', message_ts: MSG_TS, refusal: 'flag-missing' }),
     ]
     expect(lines).toEqual([
       `[slack] ${REACTION_DROPPED}: persona=${ref(NAMED)} reason=no-reactor`,
       `[slack] ${REACTION_DROPPED}: persona=${ref(NAMED)} chat_id=${quoted(CHAT)} reason=no-reactor`,
-      `[slack] ${REACTION_DROPPED}: persona=${KEY_ONLY.key} message_ts=${quoted(MSG_TS)} reason=fungible-refused refusal=flag-missing`,
+      `[slack] ${REACTION_DROPPED}: persona=${KEY_ONLY.key} message_ts=${quoted(MSG_TS)} reason=open-refused refusal=flag-missing`,
     ])
     assertNoLeak(lines)
   })
@@ -206,12 +206,12 @@ describe('event values stay on one line, redacted and escaped', () => {
   test('reaction-dropped: conversation and message ts', () => {
     const lines = [
       buildReactionDroppedLine(NAMED, { reason: 'unserved-conversation', chat_id: HOSTILE_CHAT, message_ts: HOSTILE_MSG_TS }),
-      buildReactionDroppedLine(KEY_ONLY, { reason: 'fungible-refused', chat_id: HOSTILE_CHAT, message_ts: HOSTILE_MSG_TS, refusal: 'channel-id-malformed' }),
+      buildReactionDroppedLine(KEY_ONLY, { reason: 'open-refused', chat_id: HOSTILE_CHAT, message_ts: HOSTILE_MSG_TS, refusal: 'channel-id-malformed' }),
       buildReactionDroppedLine(KEY_ONLY, { reason: 'notices-off', chat_id: HOSTILE_CHAT, message_ts: HOSTILE_MSG_TS }),
     ]
     expect(lines).toEqual([
       `[slack] ${REACTION_DROPPED}: persona=${ref(NAMED)} ${CHAT_OUT} ${MSG_TS_OUT} reason=unserved-conversation`,
-      `[slack] ${REACTION_DROPPED}: persona=${KEY_ONLY.key} ${CHAT_OUT} ${MSG_TS_OUT} reason=fungible-refused refusal=channel-id-malformed`,
+      `[slack] ${REACTION_DROPPED}: persona=${KEY_ONLY.key} ${CHAT_OUT} ${MSG_TS_OUT} reason=open-refused refusal=channel-id-malformed`,
       `[slack] ${REACTION_DROPPED}: persona=${KEY_ONLY.key} ${CHAT_OUT} ${MSG_TS_OUT} reason=notices-off`,
     ])
     for (const line of lines) expect(line).not.toMatch(UNSAFE)
@@ -253,7 +253,7 @@ describe('only the listed metadata reaches a line', () => {
     const drops: ReactionDroppedInput[] = [
       { reason: 'dm-disabled', chat_id: 'D0DIRECT1', message_ts: MSG_TS },
       { reason: 'notices-off', chat_id: CHAT, message_ts: MSG_TS },
-      { reason: 'fungible-refused', chat_id: CHAT, message_ts: MSG_TS, refusal: 'flag-not-boolean' },
+      { reason: 'open-refused', chat_id: CHAT, message_ts: MSG_TS, refusal: 'flag-not-boolean' },
     ]
     expectClean(
       drops.map(drop => buildReactionDroppedLine(NAMED, { ...drop, ...extras, user: 'U0REACTOR', emoji: 'thumbsup' } as unknown as ReactionDroppedInput)),

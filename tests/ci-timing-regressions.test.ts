@@ -2283,7 +2283,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       '    wait_since "${mark}" "$(plain_drop "${ALPHA_REF}" "${EXTERNAL}" channel-ineligible)" "${EVENT_WAIT_S}" \'external joined reply was not excluded\''),
     1, 'external joined reply was not excluded\n'],
   ] as const)('test-29 waits for the external joined reply\'s refusal line: %s', (_form, steps, status, stderr) => {
-    expect(reply(true)).toEqual({ action: 'drop', reason: 'fungible-refused', refusal: 'externally-shared' })
+    expect(reply(true)).toEqual({ action: 'drop', reason: 'open-refused', refusal: 'externally-shared' })
     expect(reply(false)).toEqual({ action: 'drop', reason: 'channel-ineligible' })
     const cause = fungibleUnclaimedChannelCause('CEXTERNAL', 'externally-shared')
     const logged = formatPersonaDiagnostic({ class: UNCLAIMED_CHANNEL, name: 't29_alpha', key: 'k_alpha', index: 0, cause })

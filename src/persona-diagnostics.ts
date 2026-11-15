@@ -21,11 +21,11 @@
  * The labels cover credentials refused, Slack unreachable, connection lost
  * and restored, the unclaimed channel and the DM drop, the per-persona start
  * line, the destination failure, the failed credentials change, the
- * unresolvable claude_config_dir, the channel a persona hears in fungible
+ * unresolvable claude_config_dir, the channel a persona hears in open
  * mode, and the channel delivery its agent stores. The channel causes are built here once:
- * `invitedChannelCause`, `channelDeliverySetCause`, `unclaimedChannelCause`
- * for declarative mode, and `fungibleUnclaimedChannelCause` with its exported
- * reason texts for fungible mode. None carries message text, a user ID or a
+ * `openChannelCause`, `channelDeliverySetCause`, `unclaimedChannelCause`
+ * for strict mode, and `fungibleUnclaimedChannelCause` with its exported
+ * reason texts for open mode. None carries message text, a user ID or a
  * token.
  *
  * SPDX-License-Identifier: MIT
@@ -81,11 +81,11 @@ export const PERSONA_DIRECTORY_UNUSABLE = 'persona-directory-unusable'
 
 /**
  * A channel message was not delivered because no persona serves its channel
- * Declarative mode: a message in a
+ * Strict mode: a message in a
  * channel that no applied persona lists, logged by each receiving persona,
  * and not logged when another applied persona lists the channel
- * (`unclaimedChannelCause`). Fungible mode: a `message` event refused on the
- * fungible path, with the reason (`fungibleUnclaimedChannelCause`). The cause
+ * (`unclaimedChannelCause`). Open mode: a `message` event refused on the
+ * open path, with the reason (`fungibleUnclaimedChannelCause`). The cause
  * names the channel.
  */
 export const UNCLAIMED_CHANNEL = 'unclaimed-channel'
@@ -137,14 +137,14 @@ export const PERSONA_CREDENTIALS_CHANGE_FAILED = 'persona-credentials-change-fai
 export const PERSONA_CONFIG_DIR_UNRESOLVABLE = 'persona-config-dir-unresolvable'
 
 /**
- * A persona heard a channel in fungible mode: the
- * first event in the persona's life that took its fungible path for that
+ * A persona heard a channel in open mode: the
+ * first event in the persona's life that took its open path for that
  * channel, delivered or not. Logged once per persona life and channel, to
- * `server.log` only. The cause (`invitedChannelCause`) names the channel ID,
+ * `server.log` only. The cause (`openChannelCause`) names the channel ID,
  * `public` or `private`, and the persona's saved channel delivery
  * (`off`, `mentions`, `all` or `thread_hybrid`); the line has no path.
  */
-export const PERSONA_INVITED_CHANNEL = 'persona-invited-channel'
+export const PERSONA_OPEN_CHANNEL = 'persona-open-channel'
 
 /**
  * A persona's agent stored a channel delivery with `set_channel_delivery`
@@ -312,7 +312,7 @@ export const PERSONA_DIAGNOSTIC_CLASSES = [
   PERSONA_DESTINATION_FAILED,
   PERSONA_CREDENTIALS_CHANGE_FAILED,
   PERSONA_CONFIG_DIR_UNRESOLVABLE,
-  PERSONA_INVITED_CHANNEL,
+  PERSONA_OPEN_CHANNEL,
   PERSONA_CHANNEL_DELIVERY_SET,
 ] as const
 
@@ -425,14 +425,14 @@ export function formatCredentialsChangeFailed(failure: CredentialsChangeFailure)
 // ---------------------------------------------------------------------------
 
 /**
- * The `persona-invited-channel` cause, formatted through
+ * The `persona-open-channel` cause, formatted through
  * `formatPersonaDiagnostic` with no path:
  *
  *   `hears <public|private> channel <channel> in open mode, at channel delivery <off|mentions|all|thread_hybrid>`
  *
  * `delivery` is the persona's channel delivery. Pure.
  */
-export function invitedChannelCause(
+export function openChannelCause(
   channel: string,
   channelType: FungibleChannelType,
   delivery: DeliveryMode,
@@ -447,7 +447,7 @@ export const NO_STORED_CHOICE = 'none'
  * The `persona-channel-delivery-set` cause, formatted through
  * `formatPersonaDiagnostic` with no path:
  *
- *   `stored choice for channel <channel> set from <none|off|mentions|all|thread_hybrid> to <off|mentions|all|thread_hybrid>, at channel delivery <off|mentions|all|thread_hybrid>`
+ *   `delivery choice for channel <channel> set from <none|off|mentions|all|thread_hybrid> to <off|mentions|all|thread_hybrid>, at channel delivery <off|mentions|all|thread_hybrid>`
  *
  * `before` is the stored choice before the call, undefined when there was
  * none (written `none`); `after` is the choice the call stored; `delivery`
@@ -460,13 +460,13 @@ export function channelDeliverySetCause(
   delivery: DeliveryMode,
 ): string {
   return (
-    `stored choice for channel ${channel} set from ${before ?? NO_STORED_CHOICE} to ${after}, ` +
+    `delivery choice for channel ${channel} set from ${before ?? NO_STORED_CHOICE} to ${after}, ` +
     `at channel delivery ${delivery}`
   )
 }
 
 /**
- * The declarative-mode `unclaimed-channel` cause, formatted through `formatPersonaDiagnostic` with no path:
+ * The strict-mode `unclaimed-channel` cause, formatted through `formatPersonaDiagnostic` with no path:
  *
  *   `message in channel <channel> not delivered: no applied persona lists this channel`
  *
@@ -476,22 +476,22 @@ export function unclaimedChannelCause(channel: string): string {
   return `message in channel ${channel} not delivered: no applied persona lists this channel`
 }
 
-/** Fungible-mode `unclaimed-channel` reason: the envelope flag is `true`. */
+/** Open-mode `unclaimed-channel` reason: the envelope flag is `true`. */
 export const UNCLAIMED_REASON_EXTERNALLY_SHARED = 'the channel is externally shared'
 
-/** Fungible-mode `unclaimed-channel` reason: the envelope carries no `is_ext_shared_channel`. */
+/** Open-mode `unclaimed-channel` reason: the envelope carries no `is_ext_shared_channel`. */
 export const UNCLAIMED_REASON_FLAG_MISSING = 'the event envelope carries no is_ext_shared_channel flag'
 
-/** Fungible-mode `unclaimed-channel` reason: the envelope's `is_ext_shared_channel` is not a boolean. */
+/** Open-mode `unclaimed-channel` reason: the envelope's `is_ext_shared_channel` is not a boolean. */
 export const UNCLAIMED_REASON_FLAG_NOT_BOOLEAN = "the event envelope's is_ext_shared_channel flag is not a boolean"
 
-/** Fungible-mode `unclaimed-channel` reason: the channel ID does not match `CHANNEL_ID_RE`. */
+/** Open-mode `unclaimed-channel` reason: the channel ID does not match `CHANNEL_ID_RE`. */
 export const UNCLAIMED_REASON_CHANNEL_ID_MALFORMED = 'the channel ID is malformed'
 
-/** Fungible-mode `unclaimed-channel` reason: `channel_type` is not `channel` or `group`. */
+/** Open-mode `unclaimed-channel` reason: `channel_type` is not `channel` or `group`. */
 export const UNCLAIMED_REASON_NOT_A_CHANNEL = 'the conversation is not a public or private channel'
 
-/** Each fungible-path refusal's reason text: a closed mapping, one text per refusal. */
+/** Each open-path refusal's reason text: a closed mapping, one text per refusal. */
 export const FUNGIBLE_REFUSAL_TEXTS: Readonly<Record<FungibleRefusal, string>> = {
   'not-a-channel': UNCLAIMED_REASON_NOT_A_CHANNEL,
   'channel-id-malformed': UNCLAIMED_REASON_CHANNEL_ID_MALFORMED,
@@ -501,7 +501,7 @@ export const FUNGIBLE_REFUSAL_TEXTS: Readonly<Record<FungibleRefusal, string>> =
 }
 
 /**
- * The fungible-mode `unclaimed-channel` cause, formatted
+ * The open-mode `unclaimed-channel` cause, formatted
  * through `formatPersonaDiagnostic` with no path:
  *
  *   `message in channel <channel> not delivered in open mode: <reason>; to serve this channel, use strict mode with the channel listed`

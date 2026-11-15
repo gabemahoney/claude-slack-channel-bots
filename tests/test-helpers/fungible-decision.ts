@@ -400,7 +400,7 @@ function unresolved(reason: 'state-unavailable' | 'membership-unresolved' | 'cho
 }
 
 function refused(refusal: FungibleRefusal): DeliveryDecision {
-  return { action: 'drop', reason: 'fungible-refused', refusal }
+  return { action: 'drop', reason: 'open-refused', refusal }
 }
 
 /** `channelDeliveryFor`'s result. */

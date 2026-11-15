@@ -836,9 +836,8 @@ export function resolveRealPathStrict(path: string, fs?: Partial<StrictRealPathF
  * The current file is read tolerantly and not validated, so a file with an
  * invalid edit still protects the paths it names. It is read through
  * `readPersonaConfigBytes`, so a path that is not a regular file (a FIFO or a
- * device) is never read. It reads without the 64 KiB cap (`uncapped`, as the
- * retired-key record's start read and the stored-choice file's start read do,
- *): a configuration file larger than `MAX_RELOAD_FILE_BYTES`
+ * device) is never read. It reads without the 64 KiB cap (`uncapped`), so
+ * a configuration file larger than `MAX_RELOAD_FILE_BYTES`
  * still protects the paths it names, so the cap never shrinks what the guard
  * refuses. An unreadable or non-regular file, unparseable JSON, or a file
  * without a `personas` array contributes nothing; this never throws. The

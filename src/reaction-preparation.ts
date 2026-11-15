@@ -20,14 +20,14 @@ import { slackPlatformReason } from './persona-connection-errors.ts'
 import { isRecord } from './record.ts'
 import { isServerPost } from './server-post.ts'
 
-/** The channel mode in which a Reaction Item takes the fungible path's conditions. */
+/** The channel mode in which a Reaction Item takes the open path's conditions. */
 const FUNGIBLE_MODE: ChannelMode = 'open'
 
 export type ReactionPreparationDecision =
   | { kind: 'fixed'; user: string; channel_name: string; thread_ts?: string; messageUnknown: boolean }
   | { kind: 'withdrawn'; reason: ReactionWithdrawalReason; failed_condition?: ReactionFungibleCondition }
 
-/** The two Slack refusals of lookup 2 that can refuse a fungible item. */
+/** The two Slack refusals of lookup 2 that can refuse a open-mode item. */
 export type ReactionMessageRefusal = 'not_in_channel' | 'channel_not_found'
 
 /** Lookup 2: the returned message whose ts is the reacted ts, a membership refusal, or unknown (failed, timed out, or no such message). */
@@ -88,7 +88,7 @@ export interface ReactionLookupDeps {
 
 /**
  * The pure decision (SR-5.4, SR-5.5). The first applying reason of
- * `server-post`, `conversation-unknown`, `group-dm` and `fungible-refused`
+ * `server-post`, `conversation-unknown`, `group-dm` and `open-refused`
  * wins. Otherwise the notice is fixed; an unknown message (L1) fixes it
  * without `thread_ts`, and a strict-mode item whose conversation lookup
  * failed is kept (L7).
@@ -104,7 +104,7 @@ export function decideReactionPreparation(mode: ChannelMode, facts: ReactionPrep
       : conversation.state === 'known' && conversation.externallyShared ? 'externally-shared'
       : message.state === 'refused' ? message.code
       : undefined
-    if (failed) return { kind: 'withdrawn', reason: 'fungible-refused', failed_condition: failed }
+    if (failed) return { kind: 'withdrawn', reason: 'open-refused', failed_condition: failed }
   }
   if (message.state === 'found') {
     return message.thread_ts === undefined

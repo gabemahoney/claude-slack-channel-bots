@@ -32,8 +32,8 @@
  * injected, as `createCronScheduler` is: the paths, the durable
  * writer and delete, the server's retired-key store (`retired-keys.ts`,
  * whose writes go through the same writer), an accessor over the server's
- * stored-choice store (`channel-delivery.ts`,
- *), which only a confirmed apply calls, the dialog approver stop that
+ * shared-authority adapter (`channel-delivery.ts`), whose retirement
+ * operations only a confirmed apply calls, the dialog approver stop that
  * step 1 calls for each key it records, the server's
  * old-life hold set step 1 begins holds in, the log sink, the
  * lifecycle operations (the start bring-up pass, and the apply's per-step

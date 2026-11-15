@@ -518,8 +518,8 @@
  *                                                src/persona-diagnostics.ts: the fungible-mode
  *                                                `unclaimed-channel` cause, <refusal> one of
  *                                                src/delivery-decision.ts FUNGIBLE_REFUSALS
- *   PERSONA_INVITED_CHANNEL                      src/persona-diagnostics.ts, the class label
- *   invitedChannelCause <channel> <public|private> <delivery>
+ *   PERSONA_OPEN_CHANNEL                         src/persona-diagnostics.ts, the class label
+ *   openChannelCause <channel> <public|private> <delivery>
  *                                                src/persona-diagnostics.ts: its cause
  *   PERSONA_CHANNEL_DELIVERY_SET                 src/persona-diagnostics.ts, the class label
  *   MESSAGE_RECEIVED, MESSAGE_DELIVERED          src/persona-diagnostics.ts, delivery evidence labels
@@ -1407,7 +1407,7 @@
  *                                 src/reaction-intake-diagnostics.ts: a logged
  *                                 drop, <reason> one of its
  *                                 REACTION_LOGGED_DROP_REASONS, <refusal> given
- *                                 for `fungible-refused` and only for it
+ *                                 for `open-refused` and only for it
  *   buildReactionWithdrawnLine <name> <key> <chat> <message-ts> <reason> [<condition>]
  *                                 src/reaction-preparation-diagnostics.ts: a
  *                                 withdrawal's line, <reason> and <condition> as
@@ -4283,11 +4283,11 @@ const fungibleUnclaimedCause: Entry = {
   },
 }
 
-/** `invitedChannelCause(<channel>, <public|private>, <delivery>)` (persona-diagnostics.ts). */
-const invitedCause: Entry = {
+/** `openChannelCause(<channel>, <public|private>, <delivery>)` (persona-diagnostics.ts). */
+const openCause: Entry = {
   synopsis: '<channel> <public|private> <delivery>',
   async print(args, context) {
-    const entry = 'invitedChannelCause'
+    const entry = 'openChannelCause'
     expectArguments(entry, args, ['channel', 'public|private', 'delivery'])
     const [channel, channelType, delivery] = args
     if (channelType !== 'public' && channelType !== 'private') usageFail(`${entry}: the channel type must be public or private (got '${channelType}')`)
@@ -5851,7 +5851,7 @@ const freshStartLine: Entry = {
 const REACTION_CHANGES: readonly string[] = ['added', 'removed']
 
 /** The withdrawal reasons and fungible conditions a queue's withdrawn record names (src/delivery-queue.ts's types; the package exports no list). */
-const REACTION_WITHDRAWAL_REASONS: readonly string[] = ['server-post', 'conversation-unknown', 'group-dm', 'fungible-refused']
+const REACTION_WITHDRAWAL_REASONS: readonly string[] = ['server-post', 'conversation-unknown', 'group-dm', 'open-refused']
 const REACTION_FUNGIBLE_CONDITIONS: readonly string[] = ['not-a-channel', 'externally-shared', 'not_in_channel', 'channel_not_found']
 
 /** Fails with a usage failure unless `value` is one of `allowed`. */
@@ -5884,7 +5884,7 @@ const reactionReceivedLine: Entry = {
 /**
  * `buildReactionDroppedLine({ key, name }, { reason, chat_id, message_ts, refusal })`
  * (reaction-intake-diagnostics.ts): <reason> one of the package's
- * REACTION_LOGGED_DROP_REASONS, <refusal> given for `fungible-refused` only.
+ * REACTION_LOGGED_DROP_REASONS, <refusal> given for `open-refused` only.
  */
 const reactionDroppedLine: Entry = {
   synopsis: '<name> <key> <reason> <chat> <message-ts> [<refusal>]',
@@ -5894,7 +5894,7 @@ const reactionDroppedLine: Entry = {
     const [name, key, reason, channel, messageTs, refusal] = args
     const reasons = await packageExport(context, 'reaction-intake-diagnostics.ts', 'REACTION_LOGGED_DROP_REASONS')
     if (!Array.isArray(reasons) || !reasons.includes(reason)) usageFail(`${entry}: <reason> '${reason}' is not one of the package's REACTION_LOGGED_DROP_REASONS`)
-    if ((reason === 'fungible-refused') !== (refusal !== undefined)) usageFail(`${entry}: <refusal> is given for fungible-refused and only for it`)
+    if ((reason === 'open-refused') !== (refusal !== undefined)) usageFail(`${entry}: <refusal> is given for open-refused and only for it`)
     const build = await packageFunction<(p: { key: string; name: string }, drop: Record<string, unknown>) => unknown>(
       context,
       'reaction-intake-diagnostics.ts',
@@ -6165,8 +6165,8 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   unclaimedChannelCause: builderEntry('persona-diagnostics.ts', 'unclaimedChannelCause', ['channel']),
   ...constantEntries('persona-diagnostics.ts', UNCLAIMED_REASON_NAMES),
   fungibleUnclaimedChannelCause: fungibleUnclaimedCause,
-  PERSONA_INVITED_CHANNEL: constantEntry('persona-diagnostics.ts', 'PERSONA_INVITED_CHANNEL'),
-  invitedChannelCause: invitedCause,
+  PERSONA_OPEN_CHANNEL: constantEntry('persona-diagnostics.ts', 'PERSONA_OPEN_CHANNEL'),
+  openChannelCause: openCause,
   PERSONA_CHANNEL_DELIVERY_SET: constantEntry('persona-diagnostics.ts', 'PERSONA_CHANNEL_DELIVERY_SET'),
   MESSAGE_RECEIVED: constantEntry('persona-diagnostics.ts', 'MESSAGE_RECEIVED'),
   MESSAGE_DELIVERED: constantEntry('persona-diagnostics.ts', 'MESSAGE_DELIVERED'),

@@ -79,19 +79,19 @@ describe('decideReactionPreparation: the stored mode and normalized facts decide
     ['group DM', 'strict', found(), known('group-dm', false, 'mpdm-ada--bob-1'), withdrawn('group-dm')],
     ['group DM', 'open', found(), known('group-dm', false, 'mpdm-ada--bob-1'), withdrawn('group-dm')],
     ['conversation unknown', 'open', found(), noConversation, withdrawn('conversation-unknown')],
-    ['not a channel', 'open', found(), known('other', false, 'odd'), withdrawn('fungible-refused', 'not-a-channel')],
-    ['externally shared', 'open', found(), known('public-channel', true), withdrawn('fungible-refused', 'externally-shared')],
-    ['not_in_channel refusal', 'open', refused('not_in_channel'), known('public-channel'), withdrawn('fungible-refused', 'not_in_channel')],
-    ['channel_not_found refusal', 'open', refused('channel_not_found'), known('private-channel'), withdrawn('fungible-refused', 'channel_not_found')],
-    ['DM whose message read is refused', 'open', refused('not_in_channel'), dm, withdrawn('fungible-refused', 'not_in_channel')],
-    // Precedence (SR-5.5): server-post, conversation-unknown, group-dm, fungible-refused.
+    ['not a channel', 'open', found(), known('other', false, 'odd'), withdrawn('open-refused', 'not-a-channel')],
+    ['externally shared', 'open', found(), known('public-channel', true), withdrawn('open-refused', 'externally-shared')],
+    ['not_in_channel refusal', 'open', refused('not_in_channel'), known('public-channel'), withdrawn('open-refused', 'not_in_channel')],
+    ['channel_not_found refusal', 'open', refused('channel_not_found'), known('private-channel'), withdrawn('open-refused', 'channel_not_found')],
+    ['DM whose message read is refused', 'open', refused('not_in_channel'), dm, withdrawn('open-refused', 'not_in_channel')],
+    // Precedence (SR-5.5): server-post, conversation-unknown, group-dm, open-refused.
     ['Server Post over conversation unknown', 'open', serverPost, noConversation, withdrawn('server-post')],
     ['Server Post over group DM', 'strict', serverPost, known('group-dm'), withdrawn('server-post')],
     ['conversation unknown over a refusal', 'open', refused('not_in_channel'), noConversation, withdrawn('conversation-unknown')],
     ['group DM over fungible conditions', 'open', refused('channel_not_found'), known('group-dm', true), withdrawn('group-dm')],
     // Among fungible conditions, the order recorded on the implementation Subtask.
-    ['not a channel over sharing and refusal', 'open', refused('not_in_channel'), known('other', true), withdrawn('fungible-refused', 'not-a-channel')],
-    ['externally shared over a refusal', 'open', refused('channel_not_found'), known('public-channel', true), withdrawn('fungible-refused', 'externally-shared')],
+    ['not a channel over sharing and refusal', 'open', refused('not_in_channel'), known('other', true), withdrawn('open-refused', 'not-a-channel')],
+    ['externally shared over a refusal', 'open', refused('channel_not_found'), known('public-channel', true), withdrawn('open-refused', 'externally-shared')],
   ]
 
   test.each(ROWS)('%s (%s)', (_label, mode, message, conversation, expected) => {
@@ -357,7 +357,7 @@ describe('lookup 2: the reacted message, read with its metadata', () => {  test(
       r.stubs.alpha.script.info.push(channelInfo(PUBLIC))
       decisions.push(await r.run(accepted({ mode })).promise)
     }
-    expect(decisions).toStrictEqual([withdrawn('fungible-refused', code), fixed('Name of U0ADA', 'general', { messageUnknown: true })])
+    expect(decisions).toStrictEqual([withdrawn('open-refused', code), fixed('Name of U0ADA', 'general', { messageUnknown: true })])
     assertNoLeak(decisions)
     const r = rig()
     r.stubs.alpha.script.replies.push({ kind: 'platform', error: code })
@@ -431,8 +431,8 @@ describe('lookup 3: the conversation, read fresh for every item', () => {
     ['a private channel (is_group)', channelInfo({ name: 'secret', is_group: true, is_private: true }), { strict: kept('secret'), open: kept('secret') }],
     ['a private channel (is_channel, is_private)', channelInfo({ name: 'secret', is_channel: true, is_private: true }), { strict: kept('secret'), open: kept('secret') }],
     ['a group DM', channelInfo({ name: 'mpdm-ada--bob-1', is_mpim: true, is_group: true, is_private: true }), { strict: withdrawn('group-dm'), open: withdrawn('group-dm') }],
-    ['a conversation that is not a channel', channelInfo({ name: 'odd', is_im: true }), { strict: kept('odd'), open: withdrawn('fungible-refused', 'not-a-channel') }],
-    ['an externally shared channel', channelInfo({ ...PUBLIC, is_ext_shared: true }), { strict: kept('general'), open: withdrawn('fungible-refused', 'externally-shared') }],
+    ['a conversation that is not a channel', channelInfo({ name: 'odd', is_im: true }), { strict: kept('odd'), open: withdrawn('open-refused', 'not-a-channel') }],
+    ['an externally shared channel', channelInfo({ ...PUBLIC, is_ext_shared: true }), { strict: kept('general'), open: withdrawn('open-refused', 'externally-shared') }],
     ['an answer with no channel', { kind: 'ok', result: { channel: undefined } }, unknownConversation],
     ['a channel that is not an object', { kind: 'ok', result: { channel: 'general' } }, unknownConversation],
     ['a channel array carrying a valid channel name and flags', { kind: 'ok', result: { channel: Object.assign([], { id: CHANNEL, ...PUBLIC }) } }, unknownConversation],
@@ -477,7 +477,7 @@ describe('lookup 3: the conversation, read fresh for every item', () => {
       r.stubs.alpha.script.replies.push(exactMessage())
       decisions.push(await r.run(accepted({ mode: 'open' })).promise)
     }
-    expect(decisions).toStrictEqual([kept('general'), withdrawn('fungible-refused', 'externally-shared'), withdrawn('group-dm')])
+    expect(decisions).toStrictEqual([kept('general'), withdrawn('open-refused', 'externally-shared'), withdrawn('group-dm')])
     expect(r.stubs.alpha.calls.conversationsInfo).toStrictEqual([{ channel: CHANNEL }, { channel: CHANNEL }, { channel: CHANNEL }])
   })
 
@@ -580,8 +580,8 @@ describe('lookup 1 for a bot-tool item: the persona name stored with it, with no
 
   const GROUP_DM_INFO = channelInfo({ name: 'mpdm-ada--bob-1', is_mpim: true, is_group: true, is_private: true })
   test.each([
-    ['an externally shared channel', 'open', exactMessage(), channelInfo({ ...PUBLIC, is_ext_shared: true }), withdrawn('fungible-refused', 'externally-shared')],
-    ['a reacted-message read refused with not_in_channel', 'open', { kind: 'platform', error: 'not_in_channel' }, channelInfo(PUBLIC), withdrawn('fungible-refused', 'not_in_channel')],
+    ['an externally shared channel', 'open', exactMessage(), channelInfo({ ...PUBLIC, is_ext_shared: true }), withdrawn('open-refused', 'externally-shared')],
+    ['a reacted-message read refused with not_in_channel', 'open', { kind: 'platform', error: 'not_in_channel' }, channelInfo(PUBLIC), withdrawn('open-refused', 'not_in_channel')],
     ['a group DM', 'open', exactMessage(), GROUP_DM_INFO, withdrawn('group-dm')],
     ['a group DM', 'strict', exactMessage(), GROUP_DM_INFO, withdrawn('group-dm')],
   ] as Array<[string, ChannelMode, WebApiOutcome, WebApiOutcome, Expected]>)('%s still withdraws a %s bot-tool item, read with no membership call', async (_label, mode, replies, info, expected) => {

@@ -739,13 +739,11 @@ const sessionToolDeps: SessionToolDeps = {
   onReactClaimed: (claim) => reactHandoff?.onReactClaimed(claim),
   onReplyCall: key => replyReminders?.noteReplyCall(key),
   serverPort: 0, // updated to actual port in main() before Bun.serve
-  // The channel mode of the configuration in effect, read at each tool call
-  //.
+  // The applied channel mode, read at each tool call.
   getChannelMode: () => channelModeOf(personaConfig),
-  // beside set_channel_delivery's inputs, each
-  // read at call time. The one stored-choice store, through the holder main()
-  // sets (undefined before then, so the call is refused and nothing is
-  // written); and current up/membership evidence.
+  // The shared-authority adapter and current up/membership evidence are read
+  // beside set_channel_delivery's inputs at call time. Before main() binds the
+  // adapter, the call is refused and nothing is written.
   getChannelDelivery: () => channelDeliveryStore,
   isPersonaUp: key => !shuttingDown && isPersonaUp(key),
   readChannelMembership: (key, channel, mode) => channelMembership?.read(key, channel, mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' },
@@ -1330,10 +1328,9 @@ const personaRouting = createPersonaRouting({
   // No runner in a dry run: the hook does nothing.
   onOwnMessage: (key, event, identity) => ownPostLookups?.ownMessage(key, event, identity),
   log: (line) => console.error(line),
-  // beside the stored choices and their
-  // readability, read at each fungible-mode event through the holder main()
-  // sets, which the session tools and the reload controller read too. Before
-  // main() loads the store it is undefined, so no stored choice applies.
+  // Both intake modes read current shared choices and readability through
+  // the adapter main() binds, also used by session tools and reload. Before
+  // it is bound, channel selection remains unresolved.
   getChannelDelivery: () => channelDeliveryStore,
   threadMemory: (key, channel, root) => {
     ownPostJoins?.settleDeferred(key, channel)
@@ -1455,13 +1452,12 @@ let personaConfig: PersonaConfig | null = null
 let reloadController: ReloadController | undefined
 
 /**
- * The one stored-choice store (`channel-delivery.ts`,
- *): set once by main, which loads it after the start resolves its
- * configuration and before the start bring-up pass, and read at call time by
- * the routing's `getChannelDelivery`, the session tools' `getChannelDelivery`
- * and the reload controller's `channelDelivery`
- * accessor. Undefined before main() loads it (nothing is read at import):
- * the routing then applies no stored choice and the tool refuses.
+ * The adapter (`channel-delivery.ts`) over the sole shared authority in
+ * config.json.last-applied: bound by main after startup recovery resolves the
+ * applied configuration and before bring-up. Routing in both modes, session
+ * tools and reload read it at call time. It owns no separate file or fallback
+ * choices. Undefined before main() binds it (nothing is read at import):
+ * channel selection is unresolved and the assignment tool refuses.
  */
 let channelDeliveryStore: ChannelDeliveryStore | undefined
 
@@ -3176,14 +3172,11 @@ export async function main(): Promise<void> {
     oldLifeHolds,
     // A retired key's react hand-off is cancelled first, as at persona teardown.
     stopDelivery: async (key) => { reactHandoff?.forget(key); const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); const remindersStopping = replyReminders?.forget(key); await Promise.all([stopping, remindersStopping]) },
-    // beside,
-    // a confirmed apply's step 1 writes the unwritten
-    // drops of a key it brings up, drops the retired keys' stored choices and
-    // marks the retiring keys through the one stored-choice store, loaded
-    // below after the start resolution, so this reads the holder at call
-    // time. An apply before the load is never expected (detection is armed
-    // only after the start bring-up); it throws, before anything is written,
-    // and the controller logs it.
+    // Confirmed apply step 1 marks retiring keys through the shared-authority
+    // adapter; the reviewed authority transaction applies choice changes.
+    // Read the holder at call time. Applying before it is bound is unexpected
+    // (detection starts after bring-up) and throws before any write; the
+    // controller logs the failure.
     channelDelivery: () => {
       if (channelDeliveryStore === undefined) throw new Error('a confirmed apply ran before the start loaded the stored-choice store')
       return channelDeliveryStore

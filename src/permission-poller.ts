@@ -16,13 +16,11 @@
  * with the per-persona notifier). Which destination that is comes from the
  * one destination rule (`personaDestinationOf`),
  * through the resolver, its DM refusal (`refusalOf`) and the destination
- * hold, with the persona and the configuration in effect read at each attempt
- * the poller reads no destination setting and no switch
- * itself. In fungible mode that is the fungible destination, and after a confirmed switch change the next prompt goes to the
- * destination of the mode turned on. The refusal line of a
- * `dm` destination names the setting in force, `permission_prompts` or
- * `invited.permission_prompts`, asked of the resolver
- * (`destinationSettingFrom`). Each live entry records the
+ * hold, with the applied persona read at each attempt. The common
+ * `permission_prompts` destination applies in both strict and open modes;
+ * the poller reads no destination setting or mode itself. A confirmed
+ * destination change affects the next post. A `dm` refusal names the common
+ * setting through the resolver (`destinationSettingFrom`). Each live entry records the
  * conversation the prompt was posted in (the `D…` ID for a DM) and the
  * posting persona; closing updates and clicks go there, whatever the
  * persona's destination, DMs switch or channel mode is now (an

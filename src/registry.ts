@@ -26,9 +26,9 @@
  * the persona with no username or icon override. While its `dm.enabled` is on,
  * it may target its DM conversations and (for `reply`) user IDs in both modes
  * (`checkPersonaTarget`). Its channel targets depend on the mode: in
- * declarative mode only the channels in the persona's current applied
- * configuration; in fungible mode any channel ID, with Slack enforcing
- * membership, and Slack's refusal returned as a tool error naming the
+ * strict mode only channels with a non-off choice in the persona's current
+ * applied configuration; in open mode any channel ID, with Slack enforcing
+ * access, and Slack's refusal returned as a tool error naming the
  * persona, the channel and Slack's error code (
  * `slackRefusalToolErrorText`).
  *
@@ -700,14 +700,14 @@ export interface SessionToolDeps {
   /**
    * The channel mode of the configuration in effect, read on every tool call together with the persona and never
    * copied at session creation (production: `channelModeOf` over the applied
-   * configuration). Absent: declarative mode.
+   * configuration). Absent: strict mode.
    */
   getChannelMode?: () => ChannelMode
   /**
-   * The one stored-choice store `main()` loads,
-   * read at each `set_channel_delivery` call (production: the server's
-   * module-scope holder). Undefined while no store is bound (before `main()`
-   * loads it): the call is refused and nothing is written. Absent: the same.
+   * The adapter over the recovered shared authority, read at each
+   * `set_channel_delivery` call (production: the server's module-scope
+   * holder). Undefined before `main()` binds it: the call is refused and
+   * nothing is written. Absent: the same.
    */
   getChannelDelivery?(): SessionChannelDeliveryStore | undefined
   /** Current applied/up status, including shutdown. Required for attempt access. */
@@ -718,7 +718,7 @@ export interface SessionToolDeps {
    * Receives the `persona-channel-delivery-set` line of each newly applied
    * `set_channel_delivery` call: the `[slack]`
    * stream of `server.log`, as the routing's `log` receives
-   * `persona-invited-channel` (production: `console.error`). Absent:
+   * `persona-open-channel` (production: `console.error`). Absent:
    * `console.error`.
    */
   log?: (line: string) => void
@@ -744,7 +744,7 @@ export interface ReactClaimContext {
 }
 
 /**
- * What `set_channel_delivery` uses of the stored-choice store:
+ * What `set_channel_delivery` uses of the shared-authority adapter:
  * current readability, incarnation and the single
  * authority's attempt API. `ChannelDeliveryStore` satisfies it as it is.
  */
@@ -762,19 +762,19 @@ const DM_CONVERSATION_ID_RE = /^D[A-Z0-9]+$/
 
 /**
  * What a tool target is, for one persona in one channel mode:
- * - `channel`: in declarative mode, the `id` of one of the persona's
- *   configured channels; in fungible mode, any value matching
+ * - `channel`: in strict mode, the `id` of a persona channel with a non-off
+ *   delivery choice; in open mode, any value matching
  *   `CHANNEL_ID_RE` (a `C…` or `G…` ID);
  * - `dm`: a DM conversation ID (`D…`);
  * - `user`: a Slack user ID (`U…`/`W…`, the `dm.contact` format);
- * - `other`: anything else (in declarative mode another channel or a group
- *   DM; in either mode a malformed ID, an empty value …).
+ * - `other`: anything else (in strict mode a channel outside that non-off
+ *   scope; in either mode a malformed ID, an empty value …).
  */
 type PersonaTargetKind = 'channel' | 'dm' | 'user' | 'other'
 
 /**
- * Classify `target` for `persona` in `mode`. In declarative mode a
- * configured channel wins over the ID shapes; in fungible mode the persona's
+ * Classify `target` for `persona` in `mode`. In strict mode a channel with
+ * a non-off choice wins over the ID shapes; in open mode the persona's
  * `channels` is never read and the channel-ID shape decides.
  * Pure: no Slack call, logging or state.
  */
@@ -790,11 +790,14 @@ function classifyPersonaTarget(persona: Persona, target: string, mode: ChannelMo
 }
 
 /**
- * The reason a fungible-mode refusal of a target that is neither a channel ID
+ * The reason an open-mode refusal of a target that is neither a channel ID
  * nor a DM target gives, after `checkPersonaTarget`'s lead
  * naming the persona and the target.
  */
 export const FUNGIBLE_TARGET_REFUSAL = 'it is neither a channel ID nor an allowed DM target.'
+
+/** Why a target outside the persona's non-off strict channel scope is refused. */
+export const STRICT_TARGET_REFUSAL = "it is not one of the persona's channels with a non-off delivery choice in strict mode."
 export const CHANNEL_TARGET_STATE_UNRESOLVED = 'The current channel choice is unresolved; retry after reviewed state recovery.'
 
 /**
@@ -816,10 +819,10 @@ export type PersonaTargetCheck =
 /**
  * The posting scope of a persona, decided from
  * the persona and the channel mode as applied now (callers pass both,
- * resolved at call time). `mode` absent is declarative mode.
- * - Declarative mode: a configured channel is allowed, whatever its delivery
- *   mode.
- * - Fungible mode: any target matching `CHANNEL_ID_RE` is allowed, whatever
+ * resolved at call time). `mode` absent is strict mode.
+ * - Strict mode: a configured channel is allowed only with a non-off
+ *   delivery choice.
+ * - Open mode: any target matching `CHANNEL_ID_RE` is allowed, whatever
  *   any persona lists (Slack enforces membership); the persona's `channels`
  *   is not read.
  * - In both modes, a `D…` conversation is allowed only while `dm.enabled` is
@@ -827,8 +830,8 @@ export type PersonaTargetCheck =
  *   only for `post` and only while `dm.enabled` is on, as `kind: 'user'`
  *   (open the DM first); for `act` a user ID is refused whatever the switch,
  *   so no read, edit or reaction ever opens a DM.
- * - Everything else is refused: in declarative mode as not a configured
- *   channel, in fungible mode with `FUNGIBLE_TARGET_REFUSAL`.
+ * - Everything else is refused: in strict mode with `STRICT_TARGET_REFUSAL`,
+ *   in open mode with `FUNGIBLE_TARGET_REFUSAL`.
  * A refusal message names the persona (`renderPersonaRef` with its stored
  * key) and the target. While `dm.enabled` is off, every `D…`/`U…`/`W…`
  * target on any tool gets the DMs-off reason, so the model is never steered
@@ -847,7 +850,7 @@ export function checkPersonaTarget(
   })
   if (kind === 'channel') return { allowed: true, kind }
   if (kind === 'other') {
-    return refuse(mode === 'open' ? FUNGIBLE_TARGET_REFUSAL : `it is not one of the persona's configured channels.`)
+    return refuse(mode === 'open' ? FUNGIBLE_TARGET_REFUSAL : STRICT_TARGET_REFUSAL)
   }
   if (!persona.dm.enabled) return refuse(`DMs are off for this persona (dm.enabled is false).`)
   if (kind === 'user' && action !== 'post') {
@@ -897,7 +900,7 @@ export function replyPartialFailureLogLine(ref: string, prefix: ReplyPostedPrefi
 }
 
 /**
- * The tool error for a failed call on a channel target in fungible mode
+ * The tool error for a failed call on a channel target in open mode
  * where Slack enforces membership: it names
  * the tool, the persona (`renderPersonaRef`), the channel and Slack's error
  * code (`slackPlatformReason` of the thrown value, e.g. `not_in_channel` or
@@ -963,8 +966,9 @@ export const SET_CHANNEL_DELIVERY_DESCRIPTION =
   'A current session of the same persona incarnation may read historical results in strict mode or dry run.'
 export const SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION =
   'A public or private channel ID (C... or G...). New assignments require authenticated current membership and explicit non-external-sharing evidence.'
+export const THREAD_HYBRID_GLOSS = '(@mentions, broadcasts and replies in threads the bot is in)'
 export const SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION =
-  '"off", "mentions" (@mentions and broadcasts), "all" (every message), or "thread_hybrid" (mentions and replies in threads the bot is in). Keep the original value on retry.'
+  `"off", "mentions" (@mentions and broadcasts), "all" (every message), or "thread_hybrid" ${THREAD_HYBRID_GLOSS}. Keep the original value on retry.`
 export const SET_CHANNEL_DELIVERY_ATTEMPT_DESCRIPTION =
   'A nonempty identifier you create and retain before first submission. Use a fresh identifier for each deliberate assignment; retain it across response loss, reconnect and restart. Never change it on retry.'
 export const SET_CHANNEL_DELIVERY_INTENT_DESCRIPTION =
@@ -1242,7 +1246,7 @@ export const MCP_INSTRUCTIONS = [
   '<@ID> mentions a Slack user or persona. Use <@ID> to address another persona.',
   'If attachment_count is present, use download_attachment(chat_id, message_id) to fetch attachments.',
   'In strict mode you may act in your configured non-off channels. In open mode Slack enforces channel access.',
-  `${SET_CHANNEL_DELIVERY_TOOL} sets listening to off, mentions (@mentions and broadcasts), all (every message), or thread_hybrid (mentions and replies in threads the bot is in). Use it when someone in that channel asks; new assignments require open mode. Retain attempt_id before submission; fresh assignments use fresh IDs. Retry keeps ID/channel/value and only reads history.`,
+  `${SET_CHANNEL_DELIVERY_TOOL} sets listening to off, mentions (@mentions and broadcasts), all (every message), or thread_hybrid ${THREAD_HYBRID_GLOSS}. Use when asked in that channel; new assignments need open mode. Retain attempt_id before submission; fresh assignments use fresh IDs. Retry keeps ID/channel/value and only reads history.`,
   'Thread Memory notices (including Joins lost) in your notice destination are for the operator; do not act on them.',
   'With DMs on, you may reply, react, edit_message, fetch_messages and download_attachment in a DM you belong to (D... chat_id). To start a DM, reply takes a user ID (U... or W...) as chat_id and returns the D... ID for later calls. Other tools take no user ID. With DMs off you have no DM target. Any other target is refused.',
   'To remove the ack reaction, reply with message_id (the triggering message ts) or react to that message.',
@@ -1392,12 +1396,12 @@ export function createSessionServer(
   //
   // Every call resolves the session's persona and the channel mode at call
   // time (the persona from the entry this server closes over, the mode
-  // through `deps.getChannelMode`, declarative when it is absent), checks the
+  // through `deps.getChannelMode`, strict when it is absent), checks the
   // tool's target against them (`checkPersonaTarget`, before the dry-run
   // branch), and outside dry run makes every Slack call on the persona's own
   // client, with no username or icon override. A refusal is a tool error
   // (`isError: true`), never a protocol error, and makes no Slack call. In
-  // fungible mode, a failed call on a channel target returns
+  // open mode, a failed call on a channel target returns
   // `slackRefusalToolErrorText`.
   //
   // A user-ID target (`reply` only) is opened with `conversations.open` on the
@@ -1966,7 +1970,7 @@ export function createSessionServer(
     try {
       return await runTool(name, args, persona, web, scope.kind, dm, botUserId)
     } catch (err) {
-      // Fungible mode, channel target: Slack enforces
+      // Open mode, channel target: Slack enforces
       // membership, so its refusal names the persona, the channel and
       // Slack's error code. The log line stays token-safe.
       if (mode === 'open' && scope.kind === 'channel') {

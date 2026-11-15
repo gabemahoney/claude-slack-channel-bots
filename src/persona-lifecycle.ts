@@ -197,17 +197,17 @@
  *   agent-director call.
  *
  * - **in-place update** (apply step 3): a
- *   persona whose `channels`, `delivery`, `permission_prompts` (declarative
- *   mode), `invited.permission_prompts` (fungible mode) or `dm.*` changed
+ *   persona whose channel list or a kept channel's `delivery`, common
+ *   `permission_prompts`, `dm.*`,
+ *   `stop_hook_bootstrap` or `reaction_notices` changed
  *   keeps its instance, Slack connection, Web API client, MCP session, restart,
  *   backoff, health, outage and retry state, reply reminders, tracked
  *   prompts and held notices. The new values already took effect at apply
  *   step 1: every consumer (tool scope, delivery decision, destination, DM
  *   switch, archive evidence) reads the persona's entry from the applied
  *   configuration at each use. What is left is the persona's cached DM
- *   conversation, forgotten when `dm.contact`, `dm.enabled`,
- *   `permission_prompts` (declarative mode) or `invited.permission_prompts`
- * (fungible mode) changed, so the next
+ *   conversation, forgotten when `dm.contact`, `dm.enabled`
+ *   or the common `permission_prompts` changed, so the next
  *   DM-destination post opens the DM for the current contact; then one line
  *   naming what changed. A key no longer applied when the operation runs gets
  *   nothing. Makes no Slack or agent-director call; never rejects. Dry run:
@@ -275,7 +275,7 @@
  *
  * `<settings>` lists the changed setting groups, comma-separated, in the
  * change plan's order (`IN_PLACE_SETTINGS`: `channels`, `delivery`,
- * `permission_prompts`, `invited.permission_prompts`, `dm.enabled`,
+ * `permission_prompts`, `dm.enabled`,
  * `dm.contact`, `stop_hook_bootstrap`, `reaction_notices`).
  *
  * Pure module: nothing is created, read or scheduled at
@@ -652,8 +652,7 @@ export interface PersonaLifecycle {
  * its cached DM conversation is forgotten when
  * one changed (the cache also re-checks the contact on
  * each use).
- * `permission_prompts` is the destination setting in declarative mode,
- * `invited.permission_prompts` the one in fungible mode.
+ * `permission_prompts` is the common destination setting in both modes.
  */
 export const DM_DESTINATION_SETTINGS: ReadonlySet<InPlaceSetting> = new Set<InPlaceSetting>([
   'permission_prompts',

@@ -192,10 +192,10 @@ import { PENDING_FILE_HEADER } from '../src/reload-fingerprint.ts'
 import {
   channelDeliverySetCause as srcChannelDeliverySetCause,
   formatPersonaDiagnostic,
-  invitedChannelCause as srcInvitedChannelCause,
+  openChannelCause as srcOpenChannelCause,
   NO_STORED_CHOICE,
   PERSONA_CHANNEL_DELIVERY_SET,
-  PERSONA_INVITED_CHANNEL,
+  PERSONA_OPEN_CHANNEL,
   type PersonaDiagnosticClass,
   UNCLAIMED_CHANNEL,
   unclaimedChannelCause as srcUnclaimedChannelCause,
@@ -329,9 +329,9 @@ import {
   CONFIG_COPY,
   EDIT_MESSAGE_TOOL,
   FETCH_MESSAGES_TOOL,
-  INVITED_CHANNEL_CLASS,
+  OPEN_CHANNEL_CLASS,
   INVITED_CHECKS,
-  invitedChannelCause as runnerInvitedChannelCause,
+  openChannelCause as runnerOpenChannelCause,
   invitedInPlaceLine,
   invitedRecordedLine,
   modeSwitchPreviewLine,
@@ -3795,7 +3795,7 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
   afterEach(() => rmSync(home, { recursive: true, force: true }))
 
   const C = DRY_RUN_IDS.bots.c
-  const cLog = (cls: typeof PERSONA_INVITED_CHANNEL | typeof PERSONA_CHANNEL_DELIVERY_SET | typeof UNCLAIMED_CHANNEL, cause: string) =>
+  const cLog = (cls: typeof PERSONA_OPEN_CHANNEL | typeof PERSONA_CHANNEL_DELIVERY_SET | typeof UNCLAIMED_CHANNEL, cause: string) =>
     formatPersonaDiagnostic({ class: cls, name: personaName('c'), key: personaName('c'), index: 2, cause })
 
   /** How C and the server depart from the package's behaviour in one `invitedRun`. */
@@ -3812,8 +3812,10 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
     editFails?: boolean
     /** The mention before the invite shows in C's transcript (`tags c` prints a line). */
     earlyDelivered?: boolean
-    /** How many persona-invited-channel lines C's first event logs (default 1). */
+    /** How many persona-open-channel lines C's first event logs (default 1). */
     invitedLines?: number
+    /** A stale class label must not count as the current first-heard line. */
+    firstHeardClass?: string
     /** How C's set_channel_delivery call ends (default ok), and how many persona-channel-delivery-set lines it logs (default 1). */
     callOutcome?: 'ok' | 'error'
     setLines?: number
@@ -3837,7 +3839,7 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
    * as setup and Check 1 leave it, applied, the server running) and a
    * workspace where C behaves as the package makes it: with the switch on in
    * the record and its app in the channel, C answers a mention there (the
-   * first event logging the package's persona-invited-channel line), calls
+   * first event logging the package's persona-open-channel line), calls
    * set_channel_delivery when asked (the package's line, then done) and, at
    * `all`, answers a message that does not mention it; with the switch off,
    * the listed shared choice is retained and C still answers a mention.
@@ -3875,7 +3877,8 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
           if (opts.switchedOff !== 'silent') answer(channel, 'off-check')
           return
         }
-        if (!heard.has(channel)) logTimes(opts.invitedLines ?? 1, cLog(PERSONA_INVITED_CHANNEL, srcInvitedChannelCause(channel, 'public', delivery)))
+        if (!heard.has(channel)) logTimes(opts.invitedLines ?? 1, cLog(PERSONA_OPEN_CHANNEL, srcOpenChannelCause(channel, 'public', delivery))
+          .replace(PERSONA_OPEN_CHANNEL, opts.firstHeardClass ?? PERSONA_OPEN_CHANNEL))
         heard.add(channel)
         if (text.includes(`${SET_CHANNEL_DELIVERY_TOOL} tool once`)) {
           if (!opts.noCall) {
@@ -3981,10 +3984,18 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
     expect([r.status, r.reason, r.notes]).toEqual(['PASS', undefined, ['Check 30: the mention before the invite was delivered to C']])
   })
 
-  test('Check 30 FAILs when C answers but logs two persona-invited-channel lines for the channel', async () => {
+  test('Check 30 FAILs when C answers but logs two persona-open-channel lines for the channel', async () => {
     const run = invitedRun({ invitedLines: 2 })
     const r = await check30.run(run.ctx)
-    expect([r.status, r.reason]).toEqual(['FAIL', `expected one ${PERSONA_INVITED_CHANNEL} line naming C and the run channel (public, mentions), found 2`])
+    expect([r.status, r.reason]).toEqual(['FAIL', `expected one ${PERSONA_OPEN_CHANNEL} line naming C and the run channel (public, mentions), found 2`])
+  })
+
+  test.each<InvitedOpts>([{ invitedLines: 0 }, { firstHeardClass: 'persona-invited-channel' }])('Check 30 FAILs when C answers without the current first-heard line: %j', async opts => {
+    const run = invitedRun(opts)
+    const r = await check30.run(run.ctx)
+    expect(run.messages.filter(m => m.user === C.userId)).toHaveLength(1)
+    expect([r.status, r.reason]).toEqual(['FAIL', `expected one ${PERSONA_OPEN_CHANNEL} line naming C and the run channel (public, mentions), found 0`])
+    assertNoLeak(r)
   })
 
   test('Check 30 FAILs when the guarded edit of config.json fails: the copy is kept for Check 34, and no channel is created', async () => {
@@ -4011,7 +4022,7 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
     expect(run.ctx.shared.invitedChannel).toBeUndefined()
     const quiet = invitedRun({ quiet: true })
     const r = await check30.run(quiet.ctx)
-    expect([r.status, r.reason]).toEqual(['FAIL', `C did not answer the mention in the run channel after the invite; expected one ${PERSONA_INVITED_CHANNEL} line naming C and the run channel (public, mentions), found 0`])
+    expect([r.status, r.reason]).toEqual(['FAIL', `C did not answer the mention in the run channel after the invite; expected one ${PERSONA_OPEN_CHANNEL} line naming C and the run channel (public, mentions), found 0`])
     expect([quiet.ctx.shared.invitedConfigCopy, quiet.ctx.shared.invitedChannel, quiet.ctx.shared.invitedCAnswerTs]).toEqual([CONFIG_COPY, RUN_CHANNEL, undefined])
   })
 
@@ -4781,7 +4792,7 @@ describe('expected texts match the package', () => {
   })
 
   test.each([
-    ['persona-invited-channel (public, mentions)', INVITED_CHANNEL_CLASS, PERSONA_INVITED_CHANNEL, runnerInvitedChannelCause(CH, 'public', 'mentions'), srcInvitedChannelCause(CH, 'public', 'mentions')],
+    ['persona-open-channel (public, mentions)', OPEN_CHANNEL_CLASS, PERSONA_OPEN_CHANNEL, runnerOpenChannelCause(CH, 'public', 'mentions'), srcOpenChannelCause(CH, 'public', 'mentions')],
     ['persona-channel-delivery-set (none to all, at all)', CHANNEL_DELIVERY_SET_CLASS, PERSONA_CHANNEL_DELIVERY_SET, runnerChannelDeliverySetCause(CH, undefined, 'all', 'all'), srcChannelDeliverySetCause(CH, undefined, 'all', 'all')],
     ['persona-channel-delivery-set (mentions to all, at all)', CHANNEL_DELIVERY_SET_CLASS, PERSONA_CHANNEL_DELIVERY_SET, runnerChannelDeliverySetCause(CH, 'mentions', 'all', 'all'), srcChannelDeliverySetCause(CH, 'mentions', 'all', 'all')],
     ["unclaimed-channel (0.11.1's declarative cause)", UNCLAIMED_CHANNEL_CLASS, UNCLAIMED_CHANNEL, runnerUnclaimedChannelCause(CH), srcUnclaimedChannelCause(CH)],
@@ -5019,7 +5030,7 @@ describe('expected texts match the package', () => {
         ...lines('30', 'the switch-on preview with A, B and C', switchOnPreview(ABC).preview),
         ...lines('30', 'the mode-only preview with D still declared', switchOnPreview([a, b, c, d]).preview),
         ['30', 'the reload-applied line', planPath(appliedLine(switchOnPreview(ABC).counts))],
-        ['30', 'the persona-invited-channel line', personaLine(INVITED_CHANNEL_CLASS, 2, c, runnerInvitedChannelCause(RUN, 'public', 'mentions'))],
+        ['30', 'the persona-open-channel line', personaLine(OPEN_CHANNEL_CLASS, 2, c, runnerOpenChannelCause(RUN, 'public', 'mentions'))],
         ['31', 'the persona-channel-delivery-set line', personaLine(CHANNEL_DELIVERY_SET_CLASS, 2, c, runnerChannelDeliverySetCause(RUN, 'mentions', 'all', 'all'))],
         ...lines('32', 'the switch-off preview', switchOnlyPreview(false, ABC)),
         ['32', 'the reload-applied line', planPath(appliedLine({ settings: 1 }))],

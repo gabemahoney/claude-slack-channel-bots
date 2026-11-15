@@ -1,8 +1,13 @@
 /**
- * thread-memory.ts — Per-persona Thread Memory journals and the bounded,
- * revocable metadata calls their lookups use.
+ * thread-memory.ts — Per-persona Thread Memory journals, in-memory views
+ * and the bounded, revocable metadata calls their lookups use.
  *
- * Every lookup attempt (`conversations.replies`, `conversations.history`)
+ * The store owns stamped joins, pending writes, durable replay, repair and
+ * compaction. It coordinates journal identity with the shared seal and keeps
+ * content out of the metadata journal. Store activation, saves and maintenance
+ * are explicit; metadata attempts below supply evidence to lookup callers.
+ *
+ * Every metadata lookup attempt (`conversations.replies`, `conversations.history`)
  * runs under one end-to-end deadline (`THREAD_MEMORY_LOOKUP_DEADLINE_MS`). Its
  * abort signal reaches the queued and in-flight HTTP work through the
  * connection manager's metadata client (`metadataWebClientOptions`: no SDK
@@ -42,6 +47,8 @@ import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_ME
 import type { PersonaConnectionClock } from './persona-connections.ts'
 import { SLACK_ERROR_CODE_RE, WEB_API_AUTH_FAILURE_ERRORS, slackRetryAfterSeconds } from './persona-slack-validation.ts'
 import { sameChannelStamp, type ChannelStamp } from './shared-channels.ts'
+
+// --- Bounded metadata attempts (the journal and views follow below) ---
 
 /** The metadata methods Thread Memory's lookups may call; nothing else. */
 export const THREAD_MEMORY_LOOKUP_METHODS = ['conversations.replies', 'conversations.history'] as const

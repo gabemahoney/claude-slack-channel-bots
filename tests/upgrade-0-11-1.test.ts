@@ -72,7 +72,7 @@ import { renderPersonaRef } from '../src/persona-identity.ts'
 import {
   FUNGIBLE_REFUSAL_TEXTS,
   PERSONA_CHANNEL_DELIVERY_SET,
-  PERSONA_INVITED_CHANNEL,
+  PERSONA_OPEN_CHANNEL,
   PERSONA_START,
   UNCLAIMED_CHANNEL,
 } from '../src/persona-diagnostics.ts'
@@ -193,7 +193,7 @@ function modeSwitchLineHead(mode: (typeof CHANNEL_MODES)[number]): string {
  * they are checked by equality with their exported texts.
  */
 const TERM_LIST: readonly Term[] = [
-  { label: 'PERSONA_INVITED_CHANNEL', text: PERSONA_INVITED_CHANNEL },
+  { label: 'PERSONA_OPEN_CHANNEL', text: PERSONA_OPEN_CHANNEL },
   { label: 'PERSONA_CHANNEL_DELIVERY_SET', text: PERSONA_CHANNEL_DELIVERY_SET },
   // The switch's key. Its membership in the top-level keys is pinned below,
   // so a rename fails the suite instead of leaving this entry checking nothing.

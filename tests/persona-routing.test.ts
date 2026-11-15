@@ -35,7 +35,7 @@ import { OWN_ROOT_CLOCK_SKEW_MS, THREAD_REPLY_HOLD_MS } from '../src/delivery-co
 import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
 import { configBytes, makeSharedAuthority, makeMembershipHarness, membershipPage, sharedRecoveryRequest } from './test-helpers/shared-channels.ts'
 import { makeReloadHarness } from './test-helpers/reload-harness.ts'
-import { PERSONA_THREAD_STAMP_UNDECIDED, threadStampUndecidedCause } from '../src/persona-diagnostics.ts'
+import { formatPersonaDiagnostic, PERSONA_OPEN_CHANNEL, openChannelCause, PERSONA_THREAD_STAMP_UNDECIDED, threadStampUndecidedCause } from '../src/persona-diagnostics.ts'
 import { createPersonaEpisodes } from '../src/persona-episodes.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './test-helpers/persona-config.ts'
 import { makeQueue } from './test-helpers/delivery-queue.ts'
@@ -1385,7 +1385,13 @@ describe('fungible mode', () => {
   test.each([false, true])('paired app mention is ignored in either order and message enters queue once (%p)', async mentionFirst => {
     const h = harness({ mode: 'open', channelDelivery: undefined });
     const alpha = h.p('alpha').persona; _assignFixture(h.channelDelivery!.authority, alpha.key, h.channelDelivery!.incarnation(alpha.key)!, CX, 'mentions', h.channelDelivery!.authority.revision, fixtureThreadHybridSince(h.channelDelivery!.authority.snapshot())); const message = makeChannelMessage({ channel: CX, text: mentionText(h.p('alpha').stub.identity.botUserId) + ' hello' }); const app = { ...message, type: 'app_mention' }
-    await h.receive(mentionFirst ? app : message, ['alpha']); await h.receive(mentionFirst ? message : app, ['alpha']); expect(facts(h, 'alpha')).toEqual([{ channel: CX, ts: message.ts as string, via: 'mention', text: message.text as string }]); expect(facts(h, 'beta')).toEqual([]); expect(h.heardChannels('alpha')).toEqual(new Set([CX])); expect(h.logs.filter(s => s.includes('persona-invited-channel'))).toHaveLength(1)
+    await h.receive(mentionFirst ? app : message, ['alpha']); await h.receive(mentionFirst ? message : app, ['alpha']); expect(facts(h, 'alpha')).toEqual([{ channel: CX, ts: message.ts as string, via: 'mention', text: message.text as string }]); expect(facts(h, 'beta')).toEqual([]); expect(h.heardChannels('alpha')).toEqual(new Set([CX]))
+    expect(h.logs.filter(s => s.includes(PERSONA_OPEN_CHANNEL))).toEqual([formatPersonaDiagnostic({
+      class: PERSONA_OPEN_CHANNEL, name: alpha.name, key: alpha.key, index: alpha.index,
+      cause: openChannelCause(CX, 'public', 'mentions'),
+    })])
+    expect(h.allPosts()).toEqual([])
+    expect(h.notices).toEqual([])
   })
   test.each(Object.entries(ENVELOPE_FLAG_FORMS))('envelope flag %s retains decision behavior', async (form, envelope) => {
     const h = harness({ mode: 'open', channelDelivery: undefined });
@@ -3097,7 +3103,7 @@ describe('reaction intake', () => {
     { reason: 'no-reactor', event: () => reaction({ user: undefined }), drop: { reason: 'no-reactor', chat_id: CA, message_ts: MSG_TS } },
     { reason: 'dm-disabled', name: 'beta', event: () => reaction({ item_user: BETA_BOT, item: { channel: DM } }), drop: { reason: 'dm-disabled', chat_id: DM, message_ts: MSG_TS } },
     { reason: 'unserved-conversation', event: () => reaction({ item: { channel: CX } }), drop: { reason: 'unserved-conversation', chat_id: CX, message_ts: MSG_TS } },
-    { reason: 'fungible-refused', mode: 'open', envelope: ENVELOPE_FLAG_FORMS.true, event: () => reaction({ item: { channel: CX } }), drop: { reason: 'fungible-refused', chat_id: CX, message_ts: MSG_TS, refusal: 'externally-shared' } },
+    { reason: 'open-refused', mode: 'open', envelope: ENVELOPE_FLAG_FORMS.true, event: () => reaction({ item: { channel: CX } }), drop: { reason: 'open-refused', chat_id: CX, message_ts: MSG_TS, refusal: 'externally-shared' } },
     { reason: 'not-a-message-reaction', event: () => reaction({ item: { type: 'file' } }) },
     { reason: 'not-own-message', event: () => reaction({ item_user: BETA_BOT }) },
     { reason: 'own-reaction', event: () => reaction({ user: ALPHA_BOT }) },

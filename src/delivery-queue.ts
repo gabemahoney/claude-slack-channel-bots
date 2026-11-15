@@ -108,13 +108,13 @@ export interface QueueReactionKeyRecord extends BaseRecord {
   closed_at: number
 }
 export interface FixedRecord extends BaseRecord { kind: 'fixed'; parts: string[] }
-export type ReactionWithdrawalReason = 'server-post' | 'conversation-unknown' | 'group-dm' | 'fungible-refused'
+export type ReactionWithdrawalReason = 'server-post' | 'conversation-unknown' | 'group-dm' | 'open-refused'
 /** `not_in_channel` and `channel_not_found` are Slack refusal codes. */
 export type ReactionFungibleCondition = 'not-a-channel' | 'externally-shared' | 'not_in_channel' | 'channel_not_found'
 /** Terminal: a withdrawn Reaction Item is closed, never typed or delivered. */
 export interface WithdrawnRecord extends BaseRecord {
   kind: 'withdrawn'; reason: ReactionWithdrawalReason; at: number
-  /** Present exactly when `reason` is `fungible-refused`. */
+  /** Present exactly when `reason` is `open-refused`. */
   failed_condition?: ReactionFungibleCondition
 }
 export interface SentRecord extends BaseRecord {
@@ -304,7 +304,7 @@ function isHoldResolution(r: QueueRecord): r is HoldResolutionRecord { return r.
 const REACTION_CHANGES: readonly string[] = ['added', 'removed'] satisfies ReactionChange[]
 const REACTION_ORIGINS: readonly string[] = ['slack-event', 'bot-tool'] satisfies ReactionOrigin[]
 const REACTION_MODES: readonly string[] = ['strict', 'open'] satisfies ChannelMode[]
-const WITHDRAWAL_REASONS: readonly string[] = ['server-post', 'conversation-unknown', 'group-dm', 'fungible-refused'] satisfies ReactionWithdrawalReason[]
+const WITHDRAWAL_REASONS: readonly string[] = ['server-post', 'conversation-unknown', 'group-dm', 'open-refused'] satisfies ReactionWithdrawalReason[]
 const FUNGIBLE_CONDITIONS: readonly string[] = ['not-a-channel', 'externally-shared', 'not_in_channel', 'channel_not_found'] satisfies ReactionFungibleCondition[]
 const REACTION_KEY_FIELDS = ['chat_id', 'message_ts', 'reactor', 'emoji', 'change', 'event_ts']
 const REACTION_ACCEPTED_FIELDS = ['v', 'kind', 'seq', 'source', 'text', 'received_at', 'ts', 'channel', 'message_ts', 'change', 'emoji', 'user', 'bot_id', 'origin', 'mode', 'reaction_key', 'reactor_persona_name', 'attempt_high_watermark']
@@ -351,7 +351,7 @@ export function isQueueRecord(value: unknown): value is QueueRecord {
       if (r.files !== undefined && (!Array.isArray(r.files) || !r.files.every(f => object(f) && str(f.name) && (f.mimetype === undefined || str(f.mimetype)) && (f.size === undefined || number(f.size))))) return false
       return r.source === 'slack' ? isSlackKey(r.key) && str(r.channel) && str(r.via) : timestamp(r.ts) && str(r.sender) && r.key === undefined
     case 'fixed': return Array.isArray(r.parts) && r.parts.length > 0 && r.parts.every(p => str(p) && p !== '')
-    case 'withdrawn': return positive(r.seq) && number(r.at) && oneOf(WITHDRAWAL_REASONS, r.reason) && (r.reason === 'fungible-refused' ? oneOf(FUNGIBLE_CONDITIONS, r.failed_condition) : r.failed_condition === undefined) && onlyKeys(r, ['v', 'kind', 'seq', 'reason', 'at', 'failed_condition'])
+    case 'withdrawn': return positive(r.seq) && number(r.at) && oneOf(WITHDRAWAL_REASONS, r.reason) && (r.reason === 'open-refused' ? oneOf(FUNGIBLE_CONDITIONS, r.failed_condition) : r.failed_condition === undefined) && onlyKeys(r, ['v', 'kind', 'seq', 'reason', 'at', 'failed_condition'])
     case 'sent':
       if (!positive(r.attempt) || !number(r.at)) return false
       if (r.unknown_outcome === true) return object(r.quarantine) && str(r.quarantine.path) && positive(r.quarantine.line)

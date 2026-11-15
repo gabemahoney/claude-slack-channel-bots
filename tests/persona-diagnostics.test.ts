@@ -1,8 +1,22 @@
 import { describe, expect, test } from 'bun:test'
-import { deliveryIdentity, formatPersonaDiagnostic, PERSONA_THREAD_STAMP_UNDECIDED, threadStampUndecidedCause } from '../src/persona-diagnostics.ts'
+import { channelDeliverySetCause, deliveryIdentity, formatPersonaDiagnostic, NO_STORED_CHOICE, openChannelCause, PERSONA_OPEN_CHANNEL, PERSONA_THREAD_STAMP_UNDECIDED, threadStampUndecidedCause } from '../src/persona-diagnostics.ts'
 import { threadMemoryLoadAtApplyFailedLine } from '../src/persona-lifecycle.ts'
 import { assertNoLeak, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage } from './test-helpers/credentials.ts'
 import { injectedInput, slackInput } from './test-helpers/delivery-queue.ts'
+
+describe('open channel and delivery choice diagnostics', () => {
+  test('pins the first-heard class and complete cause', () => {
+    expect(PERSONA_OPEN_CHANNEL).toBe('persona-open-channel')
+    expect(openChannelCause('C0PUBLIC1', 'public', 'mentions')).toBe('hears public channel C0PUBLIC1 in open mode, at channel delivery mentions')
+    expect(openChannelCause('G0PRIVATE', 'private', 'thread_hybrid')).toBe('hears private channel G0PRIVATE in open mode, at channel delivery thread_hybrid')
+  })
+
+  test('pins the absent choice marker and complete before/after/delivery fields', () => {
+    expect(NO_STORED_CHOICE).toBe('none')
+    expect(channelDeliverySetCause('C0PUBLIC1', undefined, 'mentions', 'mentions')).toBe('delivery choice for channel C0PUBLIC1 set from none to mentions, at channel delivery mentions')
+    expect(channelDeliverySetCause('G0PRIVATE', 'off', 'thread_hybrid', 'all')).toBe('delivery choice for channel G0PRIVATE set from off to thread_hybrid, at channel delivery all')
+  })
+})
 
 describe('delivery identity thread reason', () => {
   test('pins the fixed thread suffix on Slack identities', () => {

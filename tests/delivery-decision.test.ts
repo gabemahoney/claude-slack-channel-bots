@@ -587,8 +587,8 @@ function accepted(facts: AcceptedFacts = {}, reactor: ReactionReactor = { user: 
   return { ...ACCEPTED, ...facts, ...reactor }
 }
 
-const dropped = (reason: Exclude<ReactionDropReason, 'fungible-refused'>): ReactionDecision => ({ action: 'drop', reason })
-const refused = (refusal: ReactionFungibleRefusal): ReactionDecision => ({ action: 'drop', reason: 'fungible-refused', refusal })
+const dropped = (reason: Exclude<ReactionDropReason, 'open-refused'>): ReactionDecision => ({ action: 'drop', reason })
+const refused = (refusal: ReactionFungibleRefusal): ReactionDecision => ({ action: 'drop', reason: 'open-refused', refusal })
 
 type ReactionRow = [label: string, event: unknown, expected: ReactionDecision, receiver: ReactionDecisionPersona, inputs: ReactionDecisionInputs]
 

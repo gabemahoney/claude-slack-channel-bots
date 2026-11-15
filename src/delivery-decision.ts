@@ -37,21 +37,21 @@
  *    DM, accepted when P's DMs switch is on and `dm-disabled` otherwise. In
  *    strict mode any other conversation must be one of P's channel entries,
  *    else `unserved-conversation`; the envelope flag and the channel-ID
- *    pattern play no part. In open mode (the fungible path) no persona's
+ *    pattern play no part. In open mode no persona's
  *    channel entries are read: the conversation ID must match the channel-ID
  *    pattern and, for a `slack-event`, the envelope flag must be present, a
- *    boolean and `false`, else `fungible-refused` with the refusal of the
+ *    boolean and `false`, else `open-refused` with the refusal of the
  *    first that fails. In both modes P then serves the channel only with a
  *    readable stored choice other than `off` and verified (`eligible`)
  *    membership, else `unserved-conversation`; a real group DM never has
  *    verified membership, the channel inventory holding no group DM.
  *    Reaction events carry no `channel_type`, so the conversation kind and
- *    the fungible path's channel-type condition are checked again by the
+ *    the open path's channel-type condition are checked again by the
  *    reaction's preparation after acceptance, and so is a `bot-tool`
  *    event's external sharing.
  *
  * Which choice other than `off` P stored and Thread Memory play no part in a
- * reaction's decision. Both decisions check the fungible path's
+ * reaction's decision. Both decisions check the open path's
  * channel-ID and envelope-flag conditions with the same helpers, in
  * `FUNGIBLE_REFUSALS`' order. Both are pure: no I/O, logging or state kept
  * between calls.
@@ -93,7 +93,7 @@ const PUBLIC_CHANNEL_TYPE = 'channel'
 /** `channel_type` of a private channel. */
 const PRIVATE_CHANNEL_TYPE = 'group'
 
-/** The channel mode in which the fungible path applies. */
+/** The channel mode in which the open path applies. */
 const FUNGIBLE_MODE: ChannelMode = 'open'
 
 /** The channel delivery that hears every message. */
@@ -112,7 +112,7 @@ const MESSAGE_ITEM_TYPE = 'message'
 const BOT_TOOL_ORIGIN: ReactionDecisionOrigin = 'bot-tool'
 
 /**
- * Why an event that passed steps 1 to 3 does not take the fungible path
+ * Why an event that passed steps 1 to 3 does not take the open path
  * in the order the conditions are checked: its `channel_type`
  * is not `channel` or `group`; its channel ID does not match the channel-ID
  * pattern; the envelope flag is missing; it is not a boolean; it is `true`
@@ -151,12 +151,11 @@ export type Via = 'dm' | 'mention' | 'broadcast' | 'receive_all_shared' | 'recei
  * - `dm-disabled`: a direct message to P while P's DMs switch (`dm.enabled`)
  *   is off.
  * - `group-dm`: a group DM; never delivered to any persona.
- * - `channel-not-configured`: P does not list the channel (declarative mode).
- * - `not-mentioned`: a channel P hears at `mentions` (its `delivery` entry in
- *   declarative mode, its channel delivery in fungible mode) without P's
- *   mention or a broadcast.
+ * - `channel-not-configured`: P does not list the channel (strict mode).
+ * - `not-mentioned`: a channel P hears at `mentions` under its shared saved
+ *   choice, in either mode, without P's mention or a broadcast.
  *
- * A fungible-mode event that does not take the fungible path is dropped with
+ * An open-mode event that does not take the open path is dropped with
  * `FungibleDropReason` instead.
  */
 export type DeliveryDropReason =
@@ -171,19 +170,19 @@ export type DeliveryDropReason =
   | 'channel-ineligible'
 
 /**
- * The drop reason of a fungible-mode event that did not take the fungible
+ * The drop reason of an open-mode event that did not take the open
  * path; the outcome carries which condition failed.
  */
-export type FungibleDropReason = 'fungible-refused'
+export type FungibleDropReason = 'open-refused'
 
-/** One of `FUNGIBLE_REFUSALS`: the first fungible-path condition an event failed. */
+/** One of `FUNGIBLE_REFUSALS`: the first open-path condition an event failed. */
 export type FungibleRefusal = (typeof FUNGIBLE_REFUSALS)[number]
 
-/** A channel on the fungible path: `public` (`channel_type` `channel`) or `private` (`group`). */
+/** A channel on the open path: `public` (`channel_type` `channel`) or `private` (`group`). */
 export type FungibleChannelType = 'public' | 'private'
 
 /**
- * What an outcome says about an event that took the fungible path: the channel type and P's saved channel delivery, applied as written.
+ * What an outcome says about an event that took the open path: the channel type and P's saved channel delivery, applied as written.
  */
 export interface FungiblePath {
   /** `public` for `channel_type` `channel`, `private` for `group`. */
@@ -197,7 +196,7 @@ export interface DeliverDecision {
   action: 'deliver'
   /** How the message reached P. */
   via: Via
-  /** Present only when the event took the fungible path. */
+  /** Present only when the event took the open path. */
   fungible?: FungiblePath
 }
 
@@ -206,7 +205,7 @@ export type DropDecision =
   | {
       action: 'drop'
       reason: Exclude<DeliveryDropReason, 'channel-not-configured'>
-      /** Present only when the event took the fungible path (a `not-mentioned` drop). */
+      /** Present only when the event took the open path (a `not-mentioned` drop). */
       fungible?: FungiblePath
     }
   | {
@@ -218,7 +217,7 @@ export type DropDecision =
   | {
       action: 'drop'
       reason: FungibleDropReason
-      /** The first fungible-path condition the event failed. */
+      /** The first open-path condition the event failed. */
       refusal: FungibleRefusal
     }
 
@@ -255,14 +254,15 @@ export type DeliveryDecision = DeliverDecision | DropDecision | HoldDecision | {
 }
 
 /**
- * The stored choices as the decision reads them:
- * whether the store was readable at start, and P's stored choice for a
- * channel. The stored-choice store (`src/channel-delivery.ts`) satisfies it.
+ * The shared authority's choices as the decision reads them in both modes:
+ * current readability and P's saved choice for a channel. The adapter in
+ * `src/channel-delivery.ts` supplies this projection, with no independent file
+ * or fallback choices.
  */
 export interface StoredChoices {
   /** A still-trustworthy projection while another channel's write is unresolved. */
   readableFor?(key: string, channel?: string): boolean
-  /** Whether the store was readable at start; when false no stored choice applies. */
+  /** Current shared-authority readability; when false selection is unresolved. */
   readonly readable: boolean
   /** The stored choice of persona `key` for `channel`, or undefined when there is none. */
   storedChoice(key: string, channel: string): DeliveryMode | undefined
@@ -296,7 +296,7 @@ export interface FungibleDecisionInputs extends ChannelDeliveryInputs {
    * `false`, any other value, or undefined when absent.
    */
   isExtSharedChannel?: unknown
-  /** The channel-ID pattern a fungible-path channel matches (`CHANNEL_ID_RE`). */
+  /** The channel-ID pattern an open-path channel matches (`CHANNEL_ID_RE`). */
   channelIdPattern: RegExp
 }
 
@@ -400,7 +400,7 @@ export type ReactionAcceptDecision = {
  * - `unserved-conversation`: in a channel P does not serve: not one of P's
  *   channel entries (strict mode), or stored `off`, with no readable stored
  *   choice or without verified membership (both modes).
- * - `fungible-refused`: the conversation fails a fungible-path condition
+ * - `open-refused`: the conversation fails an open-path condition
  *   (open mode); the outcome carries which.
  */
 export type ReactionDropReason =
@@ -415,12 +415,12 @@ export type ReactionDropReason =
   | FungibleDropReason
 
 /**
- * A fungible-path condition a reaction can fail at its decision. Reaction
+ * An open-path condition a reaction can fail at its decision. Reaction
  * events carry no `channel_type`, so `not-a-channel` is never one.
  */
 export type ReactionFungibleRefusal = Exclude<FungibleRefusal, 'not-a-channel'>
 
-/** A drop outcome of `decideReaction`; only `fungible-refused` carries a refusal. */
+/** A drop outcome of `decideReaction`; only `open-refused` carries a refusal. */
 export type ReactionDropDecision =
   | {
       action: 'drop'
@@ -430,7 +430,7 @@ export type ReactionDropDecision =
   | {
       action: 'drop'
       reason: FungibleDropReason
-      /** The first fungible-path condition the conversation failed. */
+      /** The first open-path condition the conversation failed. */
       refusal: ReactionFungibleRefusal
     }
 
@@ -445,8 +445,9 @@ export type ReactionDecision = ReactionAcceptDecision | ReactionDropDecision
  * Decide whether the receiving persona P gets `event`, and how (see the
  * module comment for the step order). `applied` is every applied persona
  * (P's entry included), from the applied configuration, never live
- * connection state. `fungible` holds the fungible-mode inputs; absent, or
- * with its mode `declarative`, the decision is declarative mode's.
+ * connection state. `fungible` holds the shared choice and membership inputs
+ * for both modes, with additional envelope checks in open mode. Absent inputs
+ * cannot authorize channel delivery; only `mode: 'open'` selects the open path.
  */
 export function decideDelivery(
   event: unknown,
@@ -498,9 +499,10 @@ export function decideDelivery(
 }
 
 /**
- * Fungible mode's channel steps for an
- * event that passed steps 1 to 3: the fungible path's conditions, then P's
- * channel delivery and `via`. No persona's channel entries are read.
+ * Open mode's channel steps for an event that passed steps 1 to 3: the
+ * open-path conditions, then shared-authority readability, current membership,
+ * P's saved delivery choice and `via`. No persona's configured entries are
+ * used as membership evidence.
  */
 function decideFungibleChannel(
   ev: Record<string, unknown>,
@@ -511,7 +513,7 @@ function decideFungibleChannel(
 ): DeliveryDecision {
   const channelType = ev['channel_type']
   const refusal = fungibleRefusalOf(channelType, channel, inputs)
-  if (refusal !== undefined) return { action: 'drop', reason: 'fungible-refused', refusal }
+  if (refusal !== undefined) return { action: 'drop', reason: 'open-refused', refusal }
 
   const availability = channelAvailability(persona.key, channel, inputs)
   if (availability) return availability
@@ -621,7 +623,7 @@ function channelAvailability(key: string, channel: string, inputs?: FungibleDeci
 }
 
 /**
- * The first fungible-path condition a message event fails, in
+ * The first open-path condition a message event fails, in
  * `FUNGIBLE_REFUSALS`' order, or undefined when it takes the path: its
  * `channel_type` is `channel` or `group`; then the channel-ID and
  * envelope-flag conditions `decideReaction` shares.
@@ -635,13 +637,13 @@ function fungibleRefusalOf(
   return channelIdRefusalOf(channel, inputs.channelIdPattern) ?? envelopeFlagRefusalOf(inputs.isExtSharedChannel)
 }
 
-/** The fungible path's channel-ID condition: `channel` matches the channel-ID pattern. */
+/** The open path's channel-ID condition: `channel` matches the channel-ID pattern. */
 function channelIdRefusalOf(channel: string, channelIdPattern: RegExp): 'channel-id-malformed' | undefined {
   return channelIdPattern.test(channel) ? undefined : 'channel-id-malformed'
 }
 
 /**
- * The fungible path's envelope-flag conditions, in `FUNGIBLE_REFUSALS`'
+ * The open path's envelope-flag conditions, in `FUNGIBLE_REFUSALS`'
  * order: the flag (`is_ext_shared_channel`, exactly as received) is
  * present, is a boolean, and is `false`. Kept apart from the channel-ID
  * condition because an event that has no envelope still needs that one.
@@ -810,7 +812,7 @@ function reactionConversationDropOf(
   if (inputs.mode === FUNGIBLE_MODE) {
     const refusal = channelIdRefusalOf(channel, inputs.channelIdPattern)
       ?? (inputs.origin === BOT_TOOL_ORIGIN ? undefined : envelopeFlagRefusalOf(inputs.isExtSharedChannel))
-    if (refusal !== undefined) return { action: 'drop', reason: 'fungible-refused', refusal }
+    if (refusal !== undefined) return { action: 'drop', reason: 'open-refused', refusal }
   } else if (!persona.channels.some((entry) => entry.id === channel)) {
     return { action: 'drop', reason: 'unserved-conversation' }
   }

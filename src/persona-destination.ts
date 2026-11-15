@@ -39,9 +39,8 @@
  * (`destinationSettingOf`): the common `permission_prompts`. It does
  * not go through the MCP tool-scope check (`checkPersonaTarget`).
  *
- * Every line elsewhere that names a destination setting (the destination
- * hold's `persona-destination-failed` lines, the permission poller's
- * refusal) takes it from the resolver (`settingOf`, read through
+ * Every line elsewhere that names a destination setting (such as the
+ * permission poller's refusal) takes it from the resolver (`settingOf`, read through
  * `destinationSettingFrom`) in the same step as the destination it names, so
  * it names the setting that destination came from.
  *
@@ -206,10 +205,9 @@ export interface DestinationMessage {
 }
 
 /**
- * The part of a configuration the one destination rule reads: its
- * `channel_mode` switch (`channelModeOf`). Null or undefined when
- * there is no configuration (before the server's start resolves): declarative
- * mode.
+ * Configuration shape retained by the resolver's injection interface.
+ * The common destination rule reads only the persona's `permission_prompts`;
+ * it does not depend on this mode or on configuration availability.
  */
 export type DestinationConfig = Pick<ServerSettings, 'channel_mode'> | null | undefined
 

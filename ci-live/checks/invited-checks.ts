@@ -9,7 +9,7 @@
  * for the run:
  * - Check 30: the switch goes on (`switchOnFilter`, a confirmed edit), the
  *   human creates the channel, mentions C there, invites C's app and mentions
- *   it again: C answers, one `persona-invited-channel` line names it, and the
+ *   it again: C answers, one `persona-open-channel` line names it, and the
  *   verified join (`member_joined_channel`) gives C's shared entry for the
  *   channel open mode's default, `mentions`, with verified membership;
  * - Check 31: asked in the channel, C stores `all` there with
@@ -94,8 +94,8 @@ const LIVE: ['workspace', 'claude'] = ['workspace', 'claude']
 // Copied texts (each pinned against its src/ builder or constant)
 // ---------------------------------------------------------------------------
 
-/** src/persona-diagnostics.ts `PERSONA_INVITED_CHANNEL`. */
-export const INVITED_CHANNEL_CLASS = 'persona-invited-channel'
+/** src/persona-diagnostics.ts `PERSONA_OPEN_CHANNEL`. */
+export const OPEN_CHANNEL_CLASS = 'persona-open-channel'
 /** src/persona-diagnostics.ts `PERSONA_CHANNEL_DELIVERY_SET`. */
 export const CHANNEL_DELIVERY_SET_CLASS = 'persona-channel-delivery-set'
 /** src/persona-diagnostics.ts `UNCLAIMED_CHANNEL`. */
@@ -125,8 +125,8 @@ export function personaLine(cls: string, index: number, name: string, cause: str
   return `[slack] ${cls}: personas[${index}] ${ref(name)}: ${cause}`
 }
 
-/** src/persona-diagnostics.ts `invitedChannelCause`. */
-export function invitedChannelCause(channel: string, channelType: 'public' | 'private', delivery: 'mentions' | 'all'): string {
+/** src/persona-diagnostics.ts `openChannelCause`. */
+export function openChannelCause(channel: string, channelType: 'public' | 'private', delivery: 'mentions' | 'all'): string {
   return `hears ${channelType} channel ${channel} in open mode, at channel delivery ${delivery}`
 }
 
@@ -137,7 +137,7 @@ export function channelDeliverySetCause(
   after: 'off' | 'mentions' | 'all' | 'thread_hybrid',
   delivery: 'off' | 'mentions' | 'all' | 'thread_hybrid',
 ): string {
-  return `stored choice for channel ${channel} set from ${before ?? 'none'} to ${after}, at channel delivery ${delivery}`
+  return `delivery choice for channel ${channel} set from ${before ?? 'none'} to ${after}, at channel delivery ${delivery}`
 }
 
 /** src/persona-diagnostics.ts `unclaimedChannelCause` (the declarative cause, as 0.11.1 writes it). */
@@ -430,9 +430,9 @@ export const check30: CheckDef<CheckContext> = {
     }
     const before = await tags(ctx, 'c', early)
     f.note(`Check 30: the mention before the invite was ${before.length > 0 ? '' : 'not '}delivered to C`)
-    const heard = await cLinesOf(ctx, m2, INVITED_CHANNEL_CLASS, channel)
-    const want = cLine(names, INVITED_CHANNEL_CLASS, invitedChannelCause(channel, 'public', 'mentions'))
-    f.expect(heard.length === 1 && heard[0]!.includes(want), `expected one ${INVITED_CHANNEL_CLASS} line naming C and the run channel (public, mentions), found ${heard.length}`)
+    const heard = await cLinesOf(ctx, m2, OPEN_CHANNEL_CLASS, channel)
+    const want = cLine(names, OPEN_CHANNEL_CLASS, openChannelCause(channel, 'public', 'mentions'))
+    f.expect(heard.length === 1 && heard[0]!.includes(want), `expected one ${OPEN_CHANNEL_CLASS} line naming C and the run channel (public, mentions), found ${heard.length}`)
     // The verified join adds C's shared entry once, at open mode's default.
     const joined = await waitSharedEntry(ctx, channel, { choice: 'mentions', member: true })
     f.add(`shared entry after the invite: ${entryText(joined.entry)}`)

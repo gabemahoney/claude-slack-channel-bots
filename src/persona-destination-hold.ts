@@ -1,12 +1,12 @@
 /**
  * persona-destination-hold.ts — Hold and retry a persona's permission prompts
- * and server notices while its destination fails (failure part,
- *).
+ * and server notices while its destination fails.
  *
  * A post to a persona's destination (`persona-destination.ts`) can fail: the
  * app was not re-installed with `im:write`, so `conversations.open` answers
  * `missing_scope`; the bot is not in the channel (`not_in_channel`), a
- * fungible destination channel the app was never invited to included; Slack cannot be reached. Such a failure is a destination failure
+ * destination channel the app was never invited to included, in either
+ * mode; Slack cannot be reached. Such a failure is a destination failure
  * and opens an episode for the persona. While the episode is open the
  * persona is held: nothing is attempted for it before its next retry is due,
  * on its own schedule (5 s doubling to 300 s, no give-up, never

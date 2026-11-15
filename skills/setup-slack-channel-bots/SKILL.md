@@ -285,7 +285,7 @@ share one, and the configuration is rejected.
 In both modes, collect each channel’s fields below. A fresh persona with no channels must have DMs enabled:
 
 - **`id`**: a Slack channel ID, pattern `^[CG][A-Z0-9]+$`. In Slack, click the channel name; the ID is at the bottom of **About**.
-- **`delivery`**: explicitly choose `off`, `mentions`, `all` or `thread_hybrid`. `off` disables channel listening; `mentions` delivers direct mentions and broadcasts; `all` delivers every message. A newly verified member without a choice starts at `off` in strict or `mentions` in open; existing choices are preserved.
+- **`delivery`**: explicitly choose `off`, `mentions`, `all` or `thread_hybrid` (@mentions, broadcasts and replies in threads the bot is in). `off` disables channel listening; `mentions` delivers direct mentions and broadcasts; `all` delivers every message. A newly verified member without a choice starts at `off` in strict or `mentions` in open; existing choices are preserved.
 
 See `docs/configuration.md`’s `### Channel entries` and `### Delivery values`.
 
@@ -573,7 +573,7 @@ grep -F '(key=<key>)' "$STATE_DIR/server.log" | tail -n 20
 ```
 
 In open mode, the first event a persona hears from a channel logs its
-`persona-invited-channel` line, naming the channel. If a persona stays silent
+`persona-open-channel` line, naming the channel. If a persona stays silent
 in a channel its app was invited to, point to the debugging skill's entry
 "A persona is silent in a channel its app was invited to".
 

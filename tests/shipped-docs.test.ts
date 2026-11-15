@@ -338,7 +338,9 @@ import {
 } from '../src/conflict-latch.ts'
 import { CRONTABLE_TEMPLATE_HEADER } from '../src/cron-bootstrap.ts'
 import { DELIVERY_STUCK_AFTER_MS, THREAD_REPLY_HOLD_MS } from '../src/delivery-constants.ts'
-import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
+import { QUEUE_COMPACT_INTERVAL_MS, parseQueueRecord, type WithdrawnRecord } from '../src/delivery-queue.ts'
+import { REACTION_LOGGED_DROP_REASONS, buildReactionDroppedLine } from '../src/reaction-intake-diagnostics.ts'
+import { buildReactionWithdrawnLine } from '../src/reaction-preparation-diagnostics.ts'
 import type { Via } from '../src/delivery-decision.ts'
 import {
   buildMessageNotSavedNotice,
@@ -386,7 +388,10 @@ import {
   FUNGIBLE_REFUSAL_TEXTS,
   NO_STORED_CHOICE,
   PERSONA_CHANNEL_DELIVERY_SET,
-  PERSONA_INVITED_CHANNEL,
+  PERSONA_OPEN_CHANNEL,
+  PERSONA_DIAGNOSTIC_CLASSES,
+  formatPersonaDiagnostic,
+  openChannelCause,
   UNCLAIMED_CHANNEL,
   UNCLAIMED_REASON_CHANNEL_ID_MALFORMED,
   UNCLAIMED_REASON_EXTERNALLY_SHARED,
@@ -417,6 +422,8 @@ import {
   FUNGIBLE_TARGET_REFUSAL,
   MCP_INSTRUCTIONS,
   MCP_INSTRUCTIONS_MAX_CHARS,
+  STRICT_TARGET_REFUSAL,
+  THREAD_HYBRID_GLOSS,
   personaNotAppliedRefusal,
   sessionNotMatchedRefusal,
   SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION,
@@ -1635,11 +1642,11 @@ interface TermGroup {
  * - The removed per-persona key `invited` matches only as a key (a code span
  *   holding exactly `invited`, `"invited":`, an `invited:` line, and the
  *   removed-key error's `invited has been removed`); "an app invited to a
- *   channel" and `persona-invited-channel` never match. "declarative" matches
+ *   channel" never matches. Retired diagnostic labels have their own group,
+ *   with no scoped exemption. "declarative" matches
  *   only in the old mode and section phrases ("declarative mode",
  *   "declarative-mode", "declarative and fungible mode", "declarative
- *   section"); `fungible` matches in any use except the complete lowercase token
- *   `fungible-refused`, which is a log value the server writes.
+ *   section"); `fungible` matches in any use, including former log values.
  */
 const FORBIDDEN_TERMS: readonly TermGroup[] = [
   {
@@ -1728,16 +1735,24 @@ const FORBIDDEN_TERMS: readonly TermGroup[] = [
     // Strict and open mode take `channel_mode` and one shared list; the
     // removed switch, the removed per-persona `invited` key and the old mode
     // names appear only where an upgrading operator reads the removed-key
-    // errors. Plain-prose "invited", `persona-invited-channel` and bare
+    // errors. Plain-prose "invited" and bare
     // "declarative" stay legal.
     name: 'the removed channel-mode configuration',
     terms: [
       ['allow_invited_channels', /\ballow_invited_channels\b/g],
       ['invited.permission_prompts', /\binvited\.permission_prompts\b/g],
       ['invited as a configuration key', /`invited`|"invited"\s*:|^[ \t-]*invited:|\binvited\s+has\s+been\s+removed\b/gm],
-      // Explicit case pairs keep rejection case-insensitive while the log-token exception is case-sensitive.
-      ['fungible', /\b(?!(?<![\w-])fungible-refused(?![\w-]))[fF][uU][nN][gG][iI][bB][lL][eE]\b/g],
+      ['fungible', /\bfungible\b/gi],
       ['declarative mode or section', /\bdeclarative(?:-|\s+)(?:(?:and|or)\s+fungible(?:-|\s+))?(?:modes?|sections?)\b/gi],
+    ],
+  },
+  {
+    // Current log and queue values use open-mode vocabulary, even inside
+    // guidance that may quote removed configuration keys and mode names.
+    name: 'retired diagnostic labels',
+    terms: [
+      ['fungible-refused', /\bfungible-refused\b/gi],
+      ['persona-invited-channel', /\bpersona-invited-channel\b/gi],
     ],
   },
 ]
@@ -1891,6 +1906,54 @@ function auditText(
 
 /** Every forbidden term, across the groups. */
 const ALL_FORBIDDEN_TERMS: readonly Term[] = FORBIDDEN_TERMS.flatMap((group) => group.terms)
+
+describe('runtime diagnostic vocabulary uses the shipped-text audit', () => {
+  const subject = { name: 'Alpha', key: 'alpha', chat_id: 'C123', message_ts: '1.000001' }
+  const withdrawn = {
+    v: 1, kind: 'withdrawn', seq: 1, at: 1000,
+    reason: 'open-refused', failed_condition: 'externally-shared',
+  } satisfies WithdrawnRecord
+  const samples: readonly [string, () => string, string, string][] = [
+    ['logged drop reason inventory', () => JSON.stringify(REACTION_LOGGED_DROP_REASONS), withdrawn.reason, 'fungible-refused'],
+    ['reaction drop line', () => buildReactionDroppedLine(subject, {
+      reason: withdrawn.reason, chat_id: subject.chat_id,
+      message_ts: subject.message_ts, refusal: 'externally-shared',
+    }), withdrawn.reason, 'fungible-refused'],
+    ['reaction withdrawal line', () => buildReactionWithdrawnLine(subject, withdrawn.reason, withdrawn.failed_condition), withdrawn.reason, 'fungible-refused'],
+    ['serialized withdrawal record', () => JSON.stringify(withdrawn), withdrawn.reason, 'fungible-refused'],
+    ['persona class inventory', () => JSON.stringify(PERSONA_DIAGNOSTIC_CLASSES), PERSONA_OPEN_CHANNEL, 'persona-invited-channel'],
+    ['first-heard persona line', () => formatPersonaDiagnostic({
+      class: PERSONA_OPEN_CHANNEL, name: subject.name, key: subject.key, index: 0,
+      cause: openChannelCause(subject.chat_id, 'public', 'mentions'),
+    }), PERSONA_OPEN_CHANNEL, 'persona-invited-channel'],
+  ]
+
+  test('the withdrawal sample is a current production-format queue record', () => {
+    expect(parseQueueRecord(JSON.stringify(withdrawn))).toEqual(withdrawn)
+    expect(parseQueueRecord(JSON.stringify({ ...withdrawn, reason: 'fungible-refused' }))).toBeUndefined()
+    expect(REACTION_LOGGED_DROP_REASONS).toContain(withdrawn.reason)
+    expect(PERSONA_DIAGNOSTIC_CLASSES).toContain(PERSONA_OPEN_CHANNEL)
+  })
+
+  test.each(samples)('%s passes now and fails if its retired value returns', (name, read, current, retired) => {
+    const text = read()
+    assertNoLeak(text, name)
+    expect(text).toContain(current)
+    expect(auditText(name, text, ALL_FORBIDDEN_TERMS).hits.map(formatHit)).toEqual([])
+    const reverted = text.replaceAll(current, retired)
+    expect(reverted).not.toBe(text)
+    expect(auditText(name, reverted, ALL_FORBIDDEN_TERMS).hits.map(hit => hit.term)).toContain(retired)
+  })
+
+  test.each(['fungible-refused', 'persona-invited-channel'])('%s stays forbidden inside every sanctioned exemption', retired => {
+    for (const exception of AUDIT_EXCEPTIONS) {
+      const text = operatorText(exception.file)
+      const edited = text.replace(exception.heading, `${exception.heading}\n\n${code(retired)}`)
+      expect(edited).not.toBe(text)
+      expect(auditText(exception.file, edited, ALL_FORBIDDEN_TERMS).hits.map(hit => hit.term)).toContain(retired)
+    }
+  })
+})
 
 /** A group's term labels, for case titles. */
 function termLabels(group: TermGroup): string {
@@ -2088,8 +2151,8 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
     [SERVER_SETTINGS_DOC, 'slack-channel-router', 'the MCP server name; no route term matches it'],
     [CREDENTIALS_SCRIPT, 'header = "Authorization: Bearer %s"', "the credentials script's curl config line, read from curl's stdin, not a command-line argument"],
     [WIZARD_FILE, /^allowed-tools:.*$/m, 'skill frontmatter: a tool list, not an allowlist'],
-    [DEBUG_SKILL_FILE, '### `persona-invited-channel`', 'a current class label: `invited` counts only as a configuration key'],
-    [DEBUG_SKILL_FILE, '`fungible-refused`', 'a current server log value; the mode is still called open mode'],
+    [DEBUG_SKILL_FILE, `### ${code(PERSONA_OPEN_CHANNEL)}`, 'the current open-path class label'],
+    [DEBUG_SKILL_FILE, '`open-refused`', 'the current open-path refusal reason'],
     [DEBUG_SKILL_FILE, '## A persona is silent in a channel its app was invited to', 'plain-prose "invited": a Slack invitation, not the removed key'],
     [RUNBOOK_DOC, /^.*this release never reads `channel-delivery\.json`.*$/m, 'the upgrade keeps channel-delivery.json as a preserved reference; the file name is not banned'],
   ]
@@ -2154,6 +2217,8 @@ describe('forbidden-term scanner self-checks', () => {
     'invited as a configuration key': 'Move the `invited` section into the persona entry.',
     fungible: 'In fungible mode a persona serves every channel.',
     'declarative mode or section': 'In declarative mode a persona serves its listed channels.',
+    'fungible-refused': 'reason=fungible-refused',
+    'persona-invited-channel': '### `persona-invited-channel`',
   }
 
   /**
@@ -2184,6 +2249,10 @@ describe('forbidden-term scanner self-checks', () => {
     ['fungible', '"fungible-mode"', 'Use fungible-mode.'],
     ['fungible', '"a fungible destination"', 'Use a fungible destination.'],
     ['fungible', '"fungible destination"', "The persona's fungible destination is its DM."],
+    ['fungible', 'the exact former log value', 'reason=fungible-refused'],
+    ['fungible-refused', 'a code span', '`fungible-refused`'],
+    ['persona-invited-channel', 'a diagnostic line', '[slack] persona-invited-channel: personas[0] "Alpha" (key=alpha): hears a channel'],
+    ['persona-invited-channel', 'a case-changed class label', 'PERSONA-INVITED-CHANNEL'],
     ['fungible', 'a longer token starting with the log value', 'reason=fungible-refused-mode'],
     ['fungible', 'a longer word starting with the log value', 'reason=fungible-refusedly'],
     ['fungible', 'a token with a prefix before the log value', 'reason=legacy-fungible-refused'],
@@ -2238,12 +2307,12 @@ describe('forbidden-term scanner self-checks', () => {
     ['a persona held at a startup prompt', 'The persona is held at a startup prompt until the operator answers it.'],
     ['a choice that applies as written', "Each persona's `delivery` applies as written in a channel where another persona posts its permission prompts and notices."],
     ['plain-prose "invited"', 'A persona is silent in a channel its app was invited to: an app invited to a channel needs it listed.'],
-    ['the persona-invited-channel label', '### `persona-invited-channel`\n`[slack] persona-invited-channel: …`'],
+    ['the current open-path label', `### ${code(PERSONA_OPEN_CHANNEL)}\n[slack] ${PERSONA_OPEN_CHANNEL}: …`],
     ['channel-delivery.json as a preserved reference', '`channel-delivery.json` is a preserved reference the current release does not read.'],
     ['channel_mode with its values', 'Set `channel_mode` to `"strict"` or `"open"`; absence defaults to strict.'],
     ['strict and open mode', 'In strict mode a persona serves its listed channels; in open mode, every eligible channel.'],
     ['bare "declarative"', 'The configuration is declarative: each persona lists its channels in the shared list.'],
-    ['the server log value', 'reason=fungible-refused and `fungible-refused`'],
+    ['the current server log value', 'reason=open-refused and `open-refused`'],
   ])('%s is not flagged', (_label, text) => {
     expect(findTerms('sample', text, ALL_FORBIDDEN_TERMS).map(formatHit)).toEqual([])
   })
@@ -2599,6 +2668,11 @@ describe('exported thread reason wording', () => {
 
   test('the MCP instruction budget still holds', () => {
     expect(MCP_INSTRUCTIONS.length).toBeLessThanOrEqual(MCP_INSTRUCTIONS_MAX_CHARS)
+  })
+
+  test('the MCP instructions explain the thread delivery choice with the exported gloss', () => {
+    expect(MCP_INSTRUCTIONS).toContain(`thread_hybrid ${THREAD_HYBRID_GLOSS}`)
+    expect(SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION).toContain(`"thread_hybrid" ${THREAD_HYBRID_GLOSS}`)
   })
 
   test.each([
@@ -8405,8 +8479,8 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci("**Enterprise Grid: Slack's flag decides.**"),
     ci('can be served when Slack marks it as not externally shared, and then members of every workspace sharing it can reach the persona'),
   ]],
-[`security: the audit lines ${PERSONA_INVITED_CHANNEL} and ${PERSONA_CHANNEL_DELIVERY_SET}`, readmeSection(WHO_CAN_REACH_HEADING), [
-    ci(`The audit lines in ${code('server.log')} are ${code(PERSONA_INVITED_CHANNEL)}, logged the first time a persona hears a channel in open mode`),
+[`security: the audit lines ${PERSONA_OPEN_CHANNEL} and ${PERSONA_CHANNEL_DELIVERY_SET}`, readmeSection(WHO_CAN_REACH_HEADING), [
+    ci(`The audit lines in ${code('server.log')} are ${code(PERSONA_OPEN_CHANNEL)}, logged the first time a persona hears a channel in open mode`),
     () => ci(`and ${code(PERSONA_CHANNEL_DELIVERY_SET)}, logged for each choice a ${TOOL} call newly applies, as ${code(deliverySetCauseQuote())}`),
   ]],
 ["security: log rotation can discard a channel's only audit line, and a restart logs every heard channel again", readmeSection(WHO_CAN_REACH_HEADING), [
@@ -8547,6 +8621,42 @@ const WIZARD_SWITCH_LINE_ROW: DocRow = [
   sectionOf(WIZARD_FILE, WIZARD_TAKES_EFFECT_HEADING),
   [() => code(switchLineQuote('open')), () => code(switchLineQuote('strict'))],
 ]
+
+describe('shipped tool guidance quotes the current exported wording', () => {
+  const rows: readonly [file: string, row: DocRow][] = [
+    [WIZARD_FILE, ['the setup channel choice has its thread gloss',
+      sectionOf(WIZARD_FILE, /^#### (?:\d+(?:\.\d+)*\s+)?Channels$/),
+      [() => `${code('thread_hybrid')} ${THREAD_HYBRID_GLOSS}`],
+    ]],
+    [DEBUG_SKILL_FILE, ['the ordinary-tool refusal explains absent and off choices in strict mode',
+      text => {
+        const section = requiredSection(text, '## Other lines you may see', DEBUG_SKILL_FILE)
+        const rows = section.split('\n').filter(line => line.startsWith('| `[slack] Tool "<tool>" failed'))
+        if (rows.length !== 1) throw new Error(`expected one ordinary-tool failure row, found ${rows.length}`)
+        return flat(rows[0])
+      },
+      [() => code(`Persona "<name>" (key=<key>) may not target "<target>": ${STRICT_TARGET_REFUSAL}`),
+        ci('an absent channel or a listed channel whose delivery choice is `off` is refused before any Slack call')],
+    ]],
+  ]
+
+  test.each(rows)('%s: %s', (file, [element, passage, required]) => {
+    expect({ element, problems: docRowProblems(passage, required, operatorText(file)) }).toEqual({ element, problems: [] })
+  })
+
+  test.each(rows)('self-check: %s loses each exact wording obligation when cut or reworded', (file, [, passage, required]) => {
+    const text = operatorText(file)
+    for (const item of required.map(resolveItem)) {
+      const cut = withItemCut(text, passage, item)
+      expect(docRowProblems(passage, [item], cut).length).toBeGreaterThan(0)
+    }
+    const current = file === WIZARD_FILE ? THREAD_HYBRID_GLOSS : STRICT_TARGET_REFUSAL
+    const former = file === WIZARD_FILE ? '(every message)' : "it is not one of the persona's configured channels."
+    const reverted = text.replaceAll(current, former)
+    expect(reverted).not.toBe(text)
+    expect(docRowProblems(passage, required, reverted).length).toBeGreaterThan(0)
+  })
+})
 
 /** Where a README heading must stand: exactly once, inside `parent`, right after `previous` (the nearest heading at its level or above), and after a line matching `after`. */
 interface Placement {
