@@ -4628,16 +4628,22 @@ function sharedRecoveryObservation(consumed: boolean): Entry { return {
       const reviewBytes = sharedScratchBytes(reviewPath)
       const fp = fingerprint(new TextDecoder('utf-8', { fatal: true }).decode(reviewBytes))
       const recovery = state?.recovery
-      if (!state || !request || !fp || !recovery || recovery.cancelled || !isDeepStrictEqual(recovery.request, request)) throw new Error()
+      if (!state || !request || !fp || !recovery) throw new Error()
       const ledger = ledgerOf(state)
       if (consumed) {
+        // An activated record keeps only its identity (SR-5.2), so the retained
+        // full request matches it by request ID, action and evidence hash.
         const outcome = ledger?.outcomes[fp]
-        if (recovery.phase !== 'active' || recovery.activation?.fingerprint !== fp ||
+        if (recovery.phase !== 'active' || recovery.activation.fingerprint !== fp ||
+            recovery.request.request_id !== request.request_id || recovery.request.action !== request.action ||
+            recovery.request.evidence_sha256 !== request.evidence_sha256 ||
             outcome?.status !== 'consumed' || outcome.revision !== recovery.activation.order ||
             outcome.revision > state.revision || ledger?.active || ledger?.retirement) throw new Error()
       } else {
+        // A stage keeps the whole request, a replacement's chosen input included.
         const active = ledger?.active
-        if (recovery.phase !== 'review' || !active || active.fingerprint !== fp || !matches(state, active) ||
+        if (recovery.phase !== 'review' || recovery.cancelled || !isDeepStrictEqual(recovery.request, request) ||
+            !active || active.fingerprint !== fp || !matches(state, active) ||
             !reviewBytes.equals(Buffer.from(compose(fp, render(state)))) ||
             !sharedScratchBytes(config).equals(Buffer.from(recovery.preparedBase64, 'base64'))) throw new Error()
       }

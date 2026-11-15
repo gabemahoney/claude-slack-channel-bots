@@ -458,13 +458,13 @@ function readSharedChannelState(bytes: Uint8Array, path: string, deps: SharedCha
   if (state.recovery !== undefined) validateSharedRecovery(state.recovery)
   if (Object.hasOwn(state.pendingIntent, 'operator')) validateOperatorIntent(state.pendingIntent['operator'])
   if (Object.hasOwn(state.outcomes, 'operatorReviews')) validateReviewLedger(state.outcomes['operatorReviews'], state.revision)
-  if (state.recovery?.cancelled) {
+  if (state.recovery?.phase === 'review' && state.recovery.cancelled) {
     const intent = state.pendingIntent['operator'] as OperatorIntent | undefined
     if (!intent || intent.requested || reviewLedger(state)?.active || !Object.values(intent.requests).some(record =>
       record.generation === intent.generation && record.request.action === 'cancel')) throw new Error('Unconfirmed shared recovery cancellation.')
   }
   if (state.recovery?.phase === 'active') {
-    const activation = state.recovery.activation!
+    const activation = state.recovery.activation
     const outcome = reviewLedger(state)?.outcomes[activation.fingerprint]
     if (activation.order > state.revision || outcome?.status !== 'consumed' || outcome.revision !== activation.order) throw new Error('Unconfirmed shared recovery activation.')
   }
@@ -1664,9 +1664,13 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
       }))
     },
     transactMembership(key, expectedRevision, change, orderSpan = 1) {
-      // A staged recovery is checked against its anchor's whole state.
+      // A staged recovery is checked against its anchor's whole state, which a
+      // membership write changes, so it takes the whole-state path; so does a
+      // staged replacement. An activated record's checks read only its own
+      // object, the outcomes and a revision bound: scope keeps both objects and
+      // the revision only grows, so its identity needs no whole-state parse.
       const list = current.applied['personas']
-      if (current.recovery !== undefined || !own(current.personas, key) || !Array.isArray(list) || rawPersonaIndex(list, key) < 0) {
+      if (current.recovery?.phase === 'review' || !own(current.personas, key) || !Array.isArray(list) || rawPersonaIndex(list, key) < 0) {
         return authority.transact(expectedRevision, change, orderSpan)
       }
       return reportOutcome(() => commit(expectedRevision, orderSpan, undefined, revision => {

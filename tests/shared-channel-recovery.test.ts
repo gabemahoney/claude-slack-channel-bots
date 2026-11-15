@@ -5,7 +5,7 @@ import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import * as nodeFs from 'node:fs'
 import { readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { DEFAULT_PERSONA_CONFIG_FS, type DeliveryMode, type PersonaConfigFs } from '../src/config.ts'
+import { DEFAULT_PERSONA_CONFIG_FS, type DeliveryMode, type PersonaConfigFs, type PersonaInput } from '../src/config.ts'
 import { isDeepStrictEqual } from 'node:util'
 import {
   createSharedChannelAuthority, parseSharedChannelState, sameChannelStamp, serializeSharedChannelState, sharedChannelLifetime,
@@ -1074,11 +1074,18 @@ test('recording/refusing filesystem sees zero legacy access through startup, rel
 // Reviewed damaged-start composition. The ordinary request/pending/apply owner
 // is exercised through starts/ticks and real durable files, never a repair mock.
 import { sharedRecoveryRequest, membershipPage, deliveryAttempt, retryAttempt } from './test-helpers/shared-channels.ts'
-import { recoveryBytes, recoveryHash } from '../src/shared-recovery.ts'
-import { renderSharedRecovery, sharedRecoveryLine } from '../src/reload-recovery.ts'
+import {
+  activatedIdentity, activationOf, changedReplacementRequest, foreignRecoveryRequests, malformedActiveRecoveries, numericWidth, repairOriginals,
+  seriesDamage, seriesRecoveryId, stagedRecoveryMissingBytes, stagedRecoveryOf,
+} from './test-helpers/shared-channels.ts'
+import { NO_RUN_ACTIVITY } from './test-helpers/reload-harness.ts'
+import { RELOAD_PREVIEW } from '../src/reload-plan.ts'
+import { reviewOutcomeLine } from '../src/reload-review.ts'
+import { parseSharedRecoveryRequest, recoveryBytes, recoveryHash, type SharedRecoveryRequest } from '../src/shared-recovery.ts'
+import { RELOAD_SHARED_RECOVERY, renderSharedRecovery, sharedRecoveryLine } from '../src/reload-recovery.ts'
 import { RECOVERY_CURRENT_MEMBERSHIP, RECOVERY_LOSS, RECOVERY_PRESERVATION, RECOVERY_RESTORE, RECOVERY_THREADS_FORGOTTEN } from '../src/reload-preview-clauses.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
-import { buildReviewRequest, REVIEW_REQUEST_SUFFIX } from '../src/reload-request.ts'
+import { buildReviewRequest, REVIEW_REQUEST_SUFFIX, reviewRequestDiagnostic } from '../src/reload-request.ts'
 
 const REPAIR_SLACK = { alpha: { appId: 'A0REPAIR', botUserId: 'U0REPAIR', botId: 'B0REPAIR', teamId: 'T0REPAIR' } }
 async function recoveryStart(opts: ReloadRunOptions = {}) {
@@ -1088,7 +1095,7 @@ async function recoveryStart(opts: ReloadRunOptions = {}) {
   expectRepairSecrecy(run)
   // Cold repair activates through startup, not live apply fan-out. A refused
   // preview/confirmation must not start any persona; an accepted one starts
-  // only alpha, once. These checks also cover the preserved source regressions.
+  // each applied persona once. These checks also cover the preserved source regressions.
   expect(run.lifecycle.timeline).toEqual([])
   expect(run.appliedConfigs).toEqual([])
   expect(run.composition?.calls ?? []).toEqual([])
@@ -1101,11 +1108,13 @@ async function recoveryStart(opts: ReloadRunOptions = {}) {
     expect(run.session('alpha')).toBe(previousSession)
     expect(run.connections.clientFor('alpha')).toBeUndefined()
   } else {
-    expect(run.appliedKeys()).toEqual([h.key('alpha')])
+    const keys = run.controller.applied()!.config.personas.map(persona => persona.key)
+    expect(keys).toContain(h.key('alpha'))
+    expect(run.appliedKeys()).toEqual(keys)
     expect(run.lifecycle.startPasses).toEqual([run.controller.applied()!.config])
     expect(run.lifecycle.records).toEqual([
-      { op: 'bring-up', key: h.key('alpha'), via: 'start', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
-      { op: 'launch', key: h.key('alpha'), via: 'start' },
+      ...keys.map(key => ({ op: 'bring-up' as const, key, via: 'start' as const, result: expect.objectContaining({ outcome: 'up', failures: [] }) })),
+      ...keys.map(key => ({ op: 'launch' as const, key, via: 'start' as const })),
     ])
   }
   return run
@@ -1122,47 +1131,175 @@ function expectRecoveryChoiceLines(choice: 'restored' | 'new', entries: Array<[s
 function acceptedContents(run: ReloadRun, key = 'alpha') {
   return run.queue.items(key).map(({ accepted: { attempt_high_watermark, ...content } }) => content)
 }
+/** Accepts `repairOriginals()` for alpha in a started queue; returns their contents, in FIFO order. */
+async function acceptOriginals(run: ReloadRun) {
+  const inputs = repairOriginals().map(overrides => slackInput(overrides))
+  for (const input of inputs) expect((await run.queue.accept('alpha', input)).status).toBe('accepted')
+  const original = acceptedContents(run)
+  expect(original.map(item => [item.key, item.text, item.thread_ts])).toEqual(inputs.map(input => [input.key, input.text, input.thread_ts]))
+  for (const item of original) expectRepairSecrecy(run, item.text)
+  return original
+}
+/** The originals keep their keys, content, context and FIFO order, and each replay is a duplicate. */
+async function expectOriginalsKept(run: ReloadRun, original: ReturnType<typeof acceptedContents>) {
+  expect(acceptedContents(run)).toEqual(original)
+  for (const item of original) expect((await run.queue.accept('alpha', item)).status).toBe('duplicate')
+  expect(acceptedContents(run)).toEqual(original)
+}
 function expectRepairSecrecy(run: ReloadRun, body?: string) {
   if (body !== undefined) repairBodies.add(body)
   const surfaces = { logs: run.logs, pending: h.readPendingText(), apply: h.readApply()?.toString(), slack: run.slackCalls() }
   // Only operator inputs are excluded. Private authority/evidence and queue files
   // remain in the credential sweep; original message bytes belong in the queue.
   assertNoLeak({ ...run.captured(), public: surfaces, server: h.serverSideFiles(
-    h.paths.config, h.paths.config + REVIEW_REQUEST_SUFFIX, h.persona('alpha').credentials_file,
+    h.paths.config, h.paths.config + REVIEW_REQUEST_SUFFIX, ...['alpha', 'beta'].map(name => h.persona(name).credentials_file),
   ) })
   expect(run.slackPosts()).toEqual([])
   for (const original of repairBodies) expect(JSON.stringify(surfaces)).not.toContain(JSON.stringify(original).slice(1, -1))
 }
+/** Stages a reviewed repair of `personas` over `damage` on production paths
+ * and returns after the refused start that reviewed it. A running owner
+ * stages a restoration of its validated state; a cold start stages a
+ * replacement whose chosen input is the prepared configuration. The review
+ * binds credentials only outside a dry run, so `opts` for that start match the
+ * activating one's. */
+async function stageRepair(action: 'restore' | 'replace', id: string, personas: PersonaInput[], damaged: string | Uint8Array, opts: ReloadRunOptions = {}) {
+  const input = h.writeConfig({ personas })
+  const owner = action === 'restore' ? await start() : undefined
+  const damage = h.writeRecordBytes(damaged), request = sharedRecoveryRequest(id, damage, action === 'replace' ? input : undefined)
+  h.writeRequestBytes(configBytes(request))
+  if (owner) {
+    await owner.ticks.tick()
+    expect(owner.controller.sharedChannels()!.unreadableCause).toBe('restoration-staged')
+    await owner.stop()
+  }
+  const run = await recoveryStart(opts); expect(run.outcome.kind).toBe('refused')
+  return { run, input, damage, request, stage: stagedRecoveryOf(disk()), fingerprint: h.pendingFingerprint()! }
+}
+/** Confirms the reviewed repair and starts again, which activates it; returns
+ * that run, the confirmation and the activation's own durable write. */
+async function activateRepair(opts: ReloadRunOptions = {}) {
+  h.confirm()
+  const confirmation = h.readApply()!
+  let activation: SharedChannelState | undefined
+  const run = await recoveryStart({ ...opts, beforeWrite(path, bytes) {
+    const state = path === h.paths.lastApplied ? parseSharedChannelState(bytes, path) : undefined
+    if (state?.recovery?.phase === 'active') activation ??= state
+    opts.beforeWrite?.(path, bytes)
+  } })
+  return { run, confirmation, activation }
+}
+type RecoveryIdentity = ReturnType<typeof activatedIdentity>
+/** A restart reads the activated identity with no second activation or
+ * repair-completion report, and logs the retained activation once, at its order. */
+function expectRetainedActivation(run: ReloadRun, identity: RecoveryIdentity) {
+  expect(run.controller.repairActivated()).toBe(false)
+  expect(run.logs.filter(line => line.startsWith(sharedRecoveryLine('durable repair activated')))).toEqual([])
+  const retained = run.logs.filter(line => line.startsWith(sharedRecoveryLine('retained repair activation')))
+  expect(retained).toHaveLength(1)
+  expect(retained[0]).toContain(`order=${identity.activation.order}; it is not applied again`)
+  expect([disk().recovery, run.controller.sharedChannels()!.snapshot().recovery]).toEqual([identity, identity])
+}
+/** Each of `writes`, in order, is an ordinary review write over `before`: it
+ * changes the review history, never the activation's consumed outcome, and
+ * every other saved fact stays as `before` holds it. */
+function expectReviewWrites(writes: SharedChannelState[], before: SharedChannelState) {
+  const { fingerprint } = activationOf(before), pinned = reviewLedger(before)!.outcomes[fingerprint]
+  let previous = before
+  for (const state of writes) {
+    expect(applicationState(state)).toEqual(applicationState(before))
+    expect(reviewLedger(state)!.outcomes[fingerprint]).toEqual(pinned)
+    expect(reviewLedger(state)).not.toEqual(reviewLedger(previous))
+    previous = state
+  }
+}
+/** The full request left in place applies nothing at detection: no stage, no
+ * second activation, no recovery-only write and no lifecycle or client effect;
+ * the first pass's only writes are ordinary review writes (`written` collects
+ * the run's authority writes). A request differing from the identity only in
+ * its ID, action or evidence hash takes the existing refusal; an identity
+ * alone is no operator request; a replacement differing only in its chosen
+ * input matches the identity and applies nothing. */
+async function expectRetainedRequestInert(run: ReloadRun, written: SharedChannelState[], request: SharedRecoveryRequest,
+  identity: RecoveryIdentity, damage: Uint8Array) {
+  const before = disk(), from = written.length, authority = run.controller.sharedChannels()!
+  const live = () => [run.controller.applied(), run.appliedConfigs.length, run.lifecycle.timeline.length, run.session('alpha'), run.connections.clientFor('alpha')]
+  const kept = live()
+  // One pass with `bytes` as the request file (none when undefined): exactly
+  // `logs` and otherwise nothing, so no write, removal, lifecycle or Slack effect.
+  const pass = async (bytes: Uint8Array | undefined, logs: Array<(line: string) => boolean> = []) => {
+    if (bytes) h.writeRequestBytes(bytes)
+    else h.remove(h.requestPath)
+    const cp = run.checkpoint(); await run.ticks.tick()
+    const activity = run.since(cp)
+    expect(activity.logs).toHaveLength(logs.length)
+    expect(activity.logs.every((line, i) => logs[i]!(line))).toBe(true)
+    expect({ ...activity, logs: [] as string[] }).toEqual(NO_RUN_ACTIVITY)
+  }
+  const refused = (line: string) => line.startsWith(sharedRecoveryLine('request refused'))
+  // The first pass refuses a replayed consumed confirmation, if any, and
+  // reviews the separate pending input or intent: one review write and its
+  // preview, as any detection makes, and no recovery line.
+  const replayed = h.applyExists(), cp = run.checkpoint()
+  expect(run.startDetection()).toBe(true); await run.ticks.tick()
+  const detected = run.since(cp)
+  expect([detected.lifecycle, detected.slackBuilds, detected.slackCalls]).toEqual([[], 0, []])
+  expect(detected.logs.filter(line => !line.startsWith(`[slack] ${RELOAD_PREVIEW}:`))).toEqual(replayed ? [reviewOutcomeLine('consumed')] : [])
+  expect(detected.writes).toEqual([h.lastAppliedWrite(), { path: h.paths.pending, ok: true }])
+  expect(detected.removes).toEqual(replayed ? [{ path: h.paths.apply, ok: true, removed: true, unsynced: false }] : [])
+  expect(written.length - from).toBe(1)
+  expectReviewWrites(written.slice(from), before)
+  await pass(configBytes(request))
+  for (const foreign of foreignRecoveryRequests(request, damage, h.readConfig()!)) {
+    // Without the request file in between, a refusal of the same request ID logs once.
+    await pass(configBytes(foreign), [refused]); await pass(undefined)
+  }
+  if (request.action === 'replace') {
+    // The identity alone parses as neither a recovery nor an operator request.
+    expect(parseSharedRecoveryRequest(identity.request)).toBeUndefined()
+    const invalid = reviewRequestDiagnostic('invalid', authority.operatorIntent().generation)
+    await pass(configBytes(identity.request), [line => line === invalid])
+    await pass(configBytes(changedReplacementRequest(request)))
+  }
+  await pass(configBytes(request)); await pass(configBytes(request))
+  // Saved and published: `before`, or its last review write, and nothing else.
+  const last = written.slice(from).at(-1) ?? before
+  expect([authority.readable, disk(), authority.snapshot()]).toEqual([true, last, last])
+  for (const [i, value] of live().entries()) expect(value).toBe(kept[i])
+}
 
-test.each(['strict', 'open'] as const)('cold %s replacement retains exact evidence/input and original-key queues without granting historical attempts or membership', async channel_mode => {
+test.each(['strict', 'open'] as const)('cold %s replacement, revised before activation, keeps exact evidence/input until activation and then only its identity, and original-key queues without granting historical attempts or membership', async channel_mode => {
   const alpha = h.persona('alpha'); h.materialize(alpha)
   const prepared = h.writeConfig({ personas: [alpha], stop_hook_bootstrap: false })
   const replacement = configBytes({ personas: [alpha], channel_mode })
-  const body = '  original <@U0SENDER>\r\n😀  '
   const damage = Buffer.concat([Buffer.from('{broken-authority:'), Buffer.from([0xff]), Buffer.from('}')])
   h.writeRecordBytes(damage)
-  const request = sharedRecoveryRequest('cold-repair', damage, replacement)
+  // The first request chooses the prepared input; its revision chooses the replacement.
+  h.writeRequestBytes(configBytes(sharedRecoveryRequest('cold-repair', damage, prepared)))
+  let run = await recoveryStart(); expect(run.outcome.kind).toBe('refused'); await run.stop()
+  const request = sharedRecoveryRequest('cold-revised', damage, replacement)
   h.writeRequestBytes(configBytes(request))
-  let run = await recoveryStart()
+  run = await recoveryStart()
   expect(run.outcome.kind).toBe('refused'); expect(run.controller.sharedChannels()).toBeUndefined()
   expect(run.startDetection()).toBe(false); expect(run.appliedKeys()).toBeUndefined()
-  const stage = disk()
-  expect(stage.recovery?.phase).toBe('review')
-  expect(recoveryBytes(stage.recovery!.evidenceBase64)).toEqual(damage)
-  expect(recoveryBytes(stage.recovery!.preparedBase64)).toEqual(prepared)
+  // The stage keeps every byte its review, revision and activation read.
+  const stage = stagedRecoveryOf(disk()), fingerprint = h.pendingFingerprint()!
+  expect(stage).toEqual({ boundary: expect.any(String), phase: 'review', request, evidenceBase64: damage.toString('base64'),
+    preparedBase64: prepared.toString('base64'), supersededRequestIds: ['cold-repair'] })
   for (const text of [RECOVERY_LOSS, RECOVERY_CURRENT_MEMBERSHIP, RECOVERY_PRESERVATION]) expect(h.readPendingText()).toContain(text)
   expect(h.readConfig()).toEqual(prepared)
   await run.queue.start()
-  const accepted = await run.queue.accept('alpha', slackInput({ text: body, queued_ack_reaction: 'hourglass' }))
-  expect(accepted.status).toBe('accepted')
-  const original = acceptedContents(run)
-  expectRepairSecrecy(run, body)
-  await run.stop(); h.confirm(); const confirmation = h.readApply()!
-  run = await recoveryStart(); expect(run.outcome.kind).toBe('applied')
-  const authority = run.controller.sharedChannels()!, active = authority.snapshot()
-  expect(active.recovery?.phase).toBe('active')
+  const original = await acceptOriginals(run)
+  await run.stop()
+  const activated = await activateRepair(), confirmation = activated.confirmation
+  run = activated.run; expect(run.outcome.kind).toBe('applied')
+  const authority = run.controller.sharedChannels()!
+  // Its own write saves, and the authority publishes, only the identity beside its consumed outcome.
+  const identity = activatedIdentity(stage, { fingerprint, order: activated.activation!.revision })
+  expect([activated.activation!.recovery, disk().recovery, authority.snapshot().recovery]).toEqual([identity, identity, identity])
+  expect(reviewLedger(disk())!.outcomes[fingerprint]).toMatchObject({ status: 'consumed', revision: identity.activation.order })
   expect(authority.sourceBytes()).toEqual(replacement); expect(h.readConfig()).toEqual(prepared)
-  expect(acceptedContents(run)).toEqual(original)
+  await expectOriginalsKept(run, original)
   expect(run.membership.read('alpha', alpha.permission_prompts, channel_mode).kind).toBe('unresolved')
   const lost = retryAttempt(deliveryAttempt('lost-before-repair', alpha.permission_prompts, 'all'))
   const revision = authority.revision
@@ -1170,15 +1307,18 @@ test.each(['strict', 'open'] as const)('cold %s replacement retains exact eviden
   expect(authority.botAttempt('alpha', authority.incarnation('alpha')!, lost, () => { throw new Error('retry cannot authorize a write') }).kind).toBe('unresolved')
   expect(authority.revision).toBe(revision)
   const boundary = authority.lifetime('alpha', alpha.permission_prompts)!
-  expectRepairSecrecy(run, body)
+  expectRepairSecrecy(run)
+  // A restart from the same files, with the old confirmation back in place.
   await run.stop(); h.writeApplyBytes(confirmation)
-  run = await recoveryStart()
+  const written: SharedChannelState[] = []
+  run = await recoveryStart({ beforeWrite(path, bytes) { if (path === h.paths.lastApplied) written.push(parseSharedChannelState(bytes, path)!) } })
   expect(run.outcome.kind).toBe('applied')
+  expectRetainedActivation(run, identity)
   expect(run.controller.sharedChannels()!.lifetime('alpha', alpha.permission_prompts)).toEqual(boundary)
   expect(Object.values(reviewLedger(disk())!.outcomes).filter(o => o.status === 'consumed')).toHaveLength(1)
-  expect(acceptedContents(run)).toEqual(original)
-  expect(recoveryBytes(disk().recovery!.evidenceBase64)).toEqual(damage)
-  expect((await run.queue.accept('alpha', original[0]!)).status).toBe('duplicate')
+  await expectOriginalsKept(run, original)
+  await expectRetainedRequestInert(run, written, request, identity, damage)
+  await expectOriginalsKept(run, original)
 })
 
 test.each(['request', 'prepared-input', 'credentials', 'working-directory'] as const)('recovery confirmation observes %s ABA and requires a newly reviewed gesture', async changed => {
@@ -1200,13 +1340,13 @@ test.each(['request', 'prepared-input', 'credentials', 'working-directory'] as c
   h.writeRequestBytes(request); h.writeConfigBytes(input); restoreCredentials()
   if (changed === 'working-directory') { nodeFs.unlinkSync(work); nodeFs.renameSync(work + '-held', work) }
   run = await recoveryStart(opts); expect(run.outcome.kind).toBe('refused')
-  expect(h.readPending()).not.toEqual(stale); expect(disk().recovery?.phase).toBe('review')
-  expect(recoveryBytes(disk().recovery!.preparedBase64)).toEqual(input)
+  expect(h.readPending()).not.toEqual(stale)
+  expect(recoveryBytes(stagedRecoveryOf(disk()).preparedBase64)).toEqual(input)
   if (changed === 'request') {
     // A valid new request is now a durable revision, so returning to the old
     // reserved ID cannot revive it. Confirm only the retained current request.
     expect(disk().recovery!.request.request_id).toBe('changed-repair')
-    expect(disk().recovery!.supersededRequestIds).toContain('aba-repair')
+    expect(stagedRecoveryOf(disk()).supersededRequestIds).toContain('aba-repair')
     await run.stop(); h.writeRequestBytes(configBytes(disk().recovery!.request))
     run = await recoveryStart(opts); expect(run.outcome.kind).toBe('refused')
     expect(h.readPending()).not.toEqual(stale)
@@ -1216,76 +1356,91 @@ test.each(['request', 'prepared-input', 'credentials', 'working-directory'] as c
   expect(Object.values(reviewLedger(disk())!.outcomes).filter(o => o.status === 'consumed')).toHaveLength(1)
 })
 
-test.each(['before-rename', 'installed-unsynced'] as const)('repair interruption %s recovers exactly one activation with one Thread Hybrid Since and preserves accepted work', async boundary => {
+/** SR-8.2's durable-write failure controls at the activation's own write. */
+const ACTIVATION_FAULTS = [
+  ['before the rename', { step: 'writeSync', call: 1, code: 'ENOSPC' }],
+  ['after the rename', { step: 'openSync', call: 2, code: 'EIO' }],
+  ['at the directory sync', { step: 'fsyncSync', call: 2, code: 'EIO' }],
+] as const
+test.each((['restore', 'replace'] as const).flatMap(action => ACTIVATION_FAULTS.map(([at, failure]) => [action, at, failure] as const)))(
+  '%s activation interrupted %s reopens to the whole stage or the whole identity, with one Thread Hybrid Since, and preserves accepted work', async (action, _at, failure) => {
   const alpha = threaded('alpha'); h.materialize(alpha)
-  const input = h.writeConfig({ personas: [alpha] }), damage = h.writeRecordBytes('damaged input')
-  h.writeRequestBytes(configBytes(sharedRecoveryRequest('interrupted-repair', damage, input)))
-  let run = await recoveryStart(); expect(run.outcome.kind).toBe('refused')
-  expectRecoveryChoiceLines('new', [[alpha.permission_prompts, 'all'], [THREAD, 'thread_hybrid']])
+  let { run, input, stage, fingerprint } = await stageRepair(action, 'interrupted-repair', [alpha], 'damaged input')
+  expectRecoveryChoiceLines(action === 'restore' ? 'restored' : 'new', [[alpha.permission_prompts, 'all'], [THREAD, 'thread_hybrid']])
   // A stage in review decides no stamp, whatever Thread Hybrid Since it holds.
   const stageStamp = () => createSharedChannelAuthority(h.paths.lastApplied, disk(), { write: () => { throw new Error('read only') } }).channelStamp('alpha', THREAD)
   const staged = sinceOf(disk())
   expect(staged).toEqual(expect.any(String)); expect(stageStamp()).toEqual({ kind: 'undecided' })
   await run.queue.start()
-  expect((await run.queue.accept('alpha', slackInput({ text: '  original\r\n😀 ', queued_ack_reaction: 'hourglass' }))).status).toBe('accepted')
-  const original = acceptedContents(run)
-  expectRepairSecrecy(run, original[0]!.text)
-  await run.stop(); h.confirm(); const confirmation = h.readApply()!; let armed = true
-  let attempted: string | undefined
-  run = await recoveryStart({ beforeWrite: (path, bytes) => {
+  const original = await acceptOriginals(run)
+  await run.stop(); let armed = true
+  let attempted: SharedChannelState | undefined
+  const activated = await activateRepair({ beforeWrite: (path, bytes) => {
     const state = path === h.paths.lastApplied ? parseSharedChannelState(bytes, path) : undefined
     if (!armed || state?.recovery?.phase !== 'active') return
     armed = false
-    attempted = sinceOf(state)
-    h.failWrites(boundary === 'before-rename' ? { step: 'writeSync', call: 1, code: 'ENOSPC' } : { step: 'fsyncSync', call: 2, code: 'EIO' })
+    attempted = state
+    h.failWrites(failure)
   } })
-  expect(attempted).toEqual(expect.any(String)); expect(attempted).not.toBe(staged)
-  expect(sinceOf(disk())).toBe(boundary === 'before-rename' ? staged : attempted)
-  if (boundary === 'before-rename') expect(stageStamp()).toEqual({ kind: 'undecided' })
+  run = activated.run
+  const installed = failure.step !== 'writeSync', attemptedSince = sinceOf(attempted!)
+  expect(attemptedSince).toEqual(expect.any(String)); expect(attemptedSince).not.toBe(staged)
+  // The disk holds the whole stage, its attempt rejected, or the whole identity
+  // beside its consumed outcome: never part of a reduction.
+  const identity = activatedIdentity(stage, { fingerprint, order: attempted!.revision })
+  expect(attempted!.recovery).toEqual(identity)
+  expect(disk().recovery).toEqual(installed ? identity : stage)
+  expect(reviewLedger(disk())!.outcomes[fingerprint]).toMatchObject(installed ? { status: 'consumed', revision: identity.activation.order } : { status: 'rejected' })
+  expect(sinceOf(disk())).toBe(installed ? attemptedSince : staged)
+  if (!installed) expect(stageStamp()).toEqual({ kind: 'undecided' })
   expect(armed).toBe(false); expect(run.outcome.kind).toBe('refused')
   expect(run.controller.sharedChannels()).toBeUndefined(); expect(run.appliedConfigs).toEqual([])
   expect(h.readConfig()).toEqual(input)
-  if (boundary === 'installed-unsynced') {
+  // A replacement's retirement continues once installed and is rolled back otherwise.
+  if (action === 'replace') expect(run.retiredKeys.isRecorded('alpha')).toBe(installed)
+  if (installed) {
     expect(run.logs.filter(line => line.startsWith(sharedRecoveryLine('durability unresolved')))).toHaveLength(1)
     expect(run.logs.join('\n')).not.toContain('confirmation not activated')
     expect(run.outcome.kind === 'refused' && run.outcome.line).toContain('recover the retained outcome before any new review')
-    expect(h.readApply()).toEqual(confirmation)
+    expect(h.readApply()).toEqual(activated.confirmation)
     expect(run.writes.filter(write => write.path === h.paths.pending)).toEqual([])
-    expect(disk().recovery?.phase).toBe('active')
   } else {
     expect(run.logs.filter(line => line.startsWith(sharedRecoveryLine('confirmation not activated')))).toHaveLength(1)
-    expect(disk().recovery?.phase).toBe('review')
   }
   await run.stop(); h.clearWriteFailure()
-  run = await recoveryStart(); expect(run.outcome.kind).toBe(boundary === 'before-rename' ? 'refused' : 'applied')
-  if (boundary === 'before-rename') {
+  run = await recoveryStart(); expect(run.outcome.kind).toBe(installed ? 'applied' : 'refused')
+  expect(disk().recovery).toEqual(installed ? identity : stage)
+  if (!installed) {
     expect(sinceOf(disk())).toBe(staged); expect(stageStamp()).toEqual({ kind: 'undecided' })
   } else {
-    expect(run.controller.sharedChannels()!.channelStamp('alpha', THREAD)).toEqual({ kind: 'decided', incarnation: disk().personas.alpha!.incarnation, threadHybridSince: attempted })
+    expect(run.controller.sharedChannels()!.channelStamp('alpha', THREAD)).toEqual({ kind: 'decided', incarnation: disk().personas.alpha!.incarnation, threadHybridSince: attemptedSince })
   }
-  await run.queue.start(); expect(acceptedContents(run)).toEqual(original)
-  await run.stop(); if (boundary === 'before-rename') h.confirm()
+  await run.queue.start(); await expectOriginalsKept(run, original)
+  const refreshed = h.pendingFingerprint()
+  await run.stop(); if (!installed) h.confirm()
   run = await recoveryStart(); expect(run.outcome.kind).toBe('applied')
   // The retained activation is not applied again, so its Thread Hybrid Since stays.
   const final = sinceOf(disk())
-  if (boundary === 'installed-unsynced') expect(final).toBe(attempted)
+  if (installed) expect(final).toBe(attemptedSince)
   else { expect(final).toEqual(expect.any(String)); expect(final).not.toBe(staged) }
   expect(run.controller.sharedChannels()!.channelStamp('alpha', THREAD)).toEqual({ kind: 'decided', incarnation: disk().personas.alpha!.incarnation, threadHybridSince: final })
+  const activation = activationOf(disk())
+  expect(disk().recovery).toEqual(installed ? identity : activatedIdentity(stage, { fingerprint: refreshed!, order: activation.order }))
   const retained = run.logs.filter(line => line.startsWith(sharedRecoveryLine('retained repair activation')))
   expect(retained).toHaveLength(1)
-  expect(retained[0]).toContain(`order=${disk().recovery!.activation!.order}; it is not applied again`)
+  expect(retained[0]).toContain(`order=${activation.order}; it is not applied again`)
   expect(retained[0]).toContain('Current authenticated membership is still required')
-  expect(Object.values(reviewLedger(disk())!.outcomes).filter(o => o.status === 'consumed')).toHaveLength(1)
-  expect(recoveryBytes(disk().recovery!.evidenceBase64)).toEqual(damage)
-  expect(acceptedContents(run)).toEqual(original)
+  expect(Object.values(reviewLedger(disk())!.outcomes).filter(o => o.status === 'consumed')).toEqual([{ generation: expect.any(Number), status: 'consumed', revision: activation.order }])
+  await expectOriginalsKept(run, original)
   const preparation = createDeliveryPreparation({ queue: run.queue, clientFor: () => undefined, resolveUserName: async (_key, user) => user })
   await preparation.recover(); await preparation.stop()
-  const fixed = run.queue.items('alpha')[0]!.fixed!.parts
+  const fixed = run.queue.items('alpha').flatMap(item => item.fixed!.parts)
   const engine = await makeEngineHarness({ stateDir: h.stateDir, queue: run.queue, keys: ['alpha'] }); engines.push(engine)
   engine.p('alpha').row.state = 'waiting'; await engine.tick('alpha')
   await engine.until(() => run.queue.openCount('alpha') === 0)
+  // Delivered once each, in their accepted order.
   expect(engine.textCalls('alpha').map(c => c.params.text)).toEqual(fixed)
-  expect(engine.events.filter(e => e.type === 'item-delivered')).toHaveLength(1)
+  expect(engine.events.flatMap(e => e.type === 'item-delivered' && e.key === 'alpha' ? [e.seq] : [])).toEqual(original.map(item => item.seq))
   expect(run.membership.read('alpha', alpha.permission_prompts, 'strict').kind).toBe('unresolved')
 })
 
@@ -1332,16 +1487,24 @@ test.each(['readable', 'invalid', 'absent', 'unparsable'] as const)('explicit re
   expect(active.channelStamp('alpha', THREAD)).toEqual({ kind: 'decided', incarnation: state.personas.alpha!.incarnation, threadHybridSince: minted })
 })
 
-test('owned restoration retains actual MCP history, separately pending intent and the marker, starting a new Thread Hybrid Since; known-not-applied retries stay nonwriting after repair', async () => {
-  const alpha = threaded('alpha'); h.materialize(alpha); h.writeConfig({ personas: [alpha], channel_mode: 'open' })
+test('owned restoration retains actual MCP, leave and identity history, separately pending intent, the marker and accepted work, starting a new Thread Hybrid Since; known-not-applied retries stay nonwriting after repair', async () => {
+  // alpha also lists a channel it will leave; beta's identity is retired by a reviewed removal.
+  const threadedAlpha = threaded('alpha'), beta = h.persona('beta')
+  const alpha = { ...threadedAlpha, channels: [...threadedAlpha.channels, { id: C.secondary, delivery: 'all' as const }] }
+  h.materialize(alpha, beta); h.writeConfig({ personas: [alpha, beta], channel_mode: 'open' })
   let run = await start({ dryRun: false, realLifecycle: true, slack: REPAIR_SLACK })
   const channel = alpha.permission_prompts
-  run.stub('alpha').script.inventory.push(membershipPage([channel, THREAD])); await run.membershipClock.runNext()
+  h.writeConfig({ personas: [alpha], channel_mode: 'open' }); await run.ticks.tick(); h.confirm(); await run.ticks.tick()
+  expect(run.controller.applied()!.config.personas.map(persona => persona.key)).toEqual([h.key('alpha')])
+  await reconcileAlpha(run, [channel, THREAD, C.secondary])
   run.registerSession('alpha')
   const attempt = deliveryAttempt('retained-success', channel, 'all')
   expect((await run.callTool('alpha', 'set_channel_delivery', attempt)).isError).toBe(false)
   const failed = deliveryAttempt('retained-rejection', 'C0ABSENT', 'all')
   expect((await run.callTool('alpha', 'set_channel_delivery', failed)).isError).toBe(true)
+  await run.stub('alpha').socket.deliver({ type: 'channel_left', channel: C.secondary,
+    event_ts: ((run.membershipClock.now() + 1) / 1000).toFixed(3) }, { event_id: 'EvRETAINEDLEAVE' })
+  expect(run.stub('alpha').socket.acks).toHaveLength(1)
   const session = run.session('alpha')!, client = run.connections.clientFor('alpha'), socket = run.stub('alpha').socket
   expect(session.connected).toBe(true); expect(socket.connected).toBe(true); expect(client).toBeDefined()
   const live = run
@@ -1370,26 +1533,36 @@ test('owned restoration retains actual MCP history, separately pending intent an
   expect(authority.setThreadMemoryCreated('alpha')).toEqual({ kind: 'saved' })
   const prior = authority.snapshot(), input = h.readConfig()!, anchorSince = sinceOf(prior)
   expect(anchorSince).toEqual(expect.any(String))
+  // The owner's state holds retained identity and leave history.
+  expect(Object.values(prior.retiredIdentities).map(retired => retired.key)).toEqual([h.key('beta')])
+  expect(Object.keys(prior.personas.alpha!.leaves)).toEqual([C.secondary])
   const damage = h.writeRecordBytes('damaged while owner retains its validated state')
-  h.writeRequestBytes(configBytes(sharedRecoveryRequest('owned-restoration', damage)))
+  const request = sharedRecoveryRequest('owned-restoration', damage)
+  h.writeRequestBytes(configBytes(request))
   const staging = snapshot()
   await run.ticks.tick()
   expectRepairSecrecy(run); expectNoLiveEffects(staging)
   expect(authority.readable).toBe(false); expect(authority.readableFor('alpha', channel)).toBe(true)
   expect(authority.snapshot()).toEqual(prior)
-  expect(recoveryBytes(disk().recovery!.anchorBase64)).toEqual(Buffer.from(serializeSharedChannelState(prior)))
+  // The stage keeps the exact evidence, prepared input, request and the owner's anchor.
+  expect(stagedRecoveryOf(disk())).toEqual({ boundary: expect.any(String), phase: 'review', request, evidenceBase64: damage.toString('base64'),
+    preparedBase64: input.toString('base64'), anchorBase64: Buffer.from(serializeSharedChannelState(prior)).toString('base64') })
   await run.stop(); run = await recoveryStart({ dryRun: false, slack: REPAIR_SLACK }); expect(run.outcome.kind).toBe('refused')
   expect(h.readPendingText()).toContain(RECOVERY_RESTORE)
   expectRecoveryChoiceLines('restored', [[channel, 'all'], [THREAD, 'thread_hybrid']])
   expect(sinceOf(disk())).toBe(anchorSince)
-  await run.stop(); h.confirm()
-  let activation: SharedChannelState | undefined
-  run = await recoveryStart({ dryRun: false, realLifecycle: true, slack: REPAIR_SLACK, beforeWrite: (path, bytes) => {
-    const state = path === h.paths.lastApplied ? parseSharedChannelState(bytes, path) : undefined
-    if (state?.recovery?.phase === 'active') activation ??= state
-  } })
+  const stage = stagedRecoveryOf(disk()), fingerprint = h.pendingFingerprint()!
+  await run.queue.start()
+  const original = await acceptOriginals(run)
+  await run.stop()
+  const activated = await activateRepair({ dryRun: false, realLifecycle: true, slack: REPAIR_SLACK }), activation = activated.activation
+  run = activated.run
   expect(run.outcome.kind).toBe('applied')
   const restored = run.controller.sharedChannels()!
+  // Its own write saves, and the authority publishes, only the identity beside its consumed outcome.
+  const identity = activatedIdentity(stage, { fingerprint, order: activation!.revision })
+  expect([activation!.recovery, disk().recovery, restored.snapshot().recovery]).toEqual([identity, identity, identity])
+  expect(reviewLedger(disk())!.outcomes[fingerprint]).toMatchObject({ status: 'consumed', revision: identity.activation.order })
   // Only the thread_hybrid entry's Thread Hybrid Since differs from the
   // anchor, minted in the activation's own write; the marker is kept.
   const restoredSince = sinceOf(restored.snapshot())
@@ -1398,15 +1571,34 @@ test('owned restoration retains actual MCP history, separately pending intent an
   const expected = structuredClone(prior.personas)
   expected.alpha!.assignments[THREAD]!.threadHybridSince = restoredSince
   expect(restored.snapshot().personas).toEqual(expected)
+  expect(restored.snapshot().retiredIdentities).toEqual(prior.retiredIdentities)
   expect(restored.snapshot().threadMemoryCreated).toEqual({ alpha: true })
   expect(restored.snapshot().outcomes.botAttempts).toEqual(prior.outcomes.botAttempts)
   expect(restored.operatorIntent()).toEqual(authority.operatorIntent()); expect(h.readConfig()).toEqual(input)
+  await expectOriginalsKept(run, original)
   expect(run.membership.read('alpha', channel, 'open').kind).toBe('unresolved')
   run.registerSession('alpha'); const revision = restored.revision
   expect((await run.callTool('alpha', 'set_channel_delivery', retryAttempt(attempt))).isError).toBe(false)
   expect((await run.callTool('alpha', 'set_channel_delivery', retryAttempt(failed))).isError).toBe(true)
   expect(restored.revision).toBe(revision)
   expect(restored.snapshot().outcomes.botAttempts).toEqual(prior.outcomes.botAttempts)
+  // A restart from the same files keeps the identity, choices with their
+  // Thread Hybrid Since, leave and identity history, the marker, attempt
+  // history, pending intent and the accepted originals.
+  const kept = (state: SharedChannelState) => [state.personas, state.retiredIdentities, state.threadMemoryCreated, state.outcomes.botAttempts, state.pendingIntent]
+  const before = kept(restored.snapshot())
+  await run.stop()
+  const written: SharedChannelState[] = []
+  run = await recoveryStart({ dryRun: false, realLifecycle: true, slack: REPAIR_SLACK, beforeWrite(path, bytes) {
+    if (path === h.paths.lastApplied) written.push(parseSharedChannelState(bytes, path)!)
+  } })
+  expect(run.outcome.kind).toBe('applied')
+  expectRetainedActivation(run, identity)
+  expect(kept(run.controller.sharedChannels()!.snapshot())).toEqual(before)
+  await expectOriginalsKept(run, original)
+  await expectRetainedRequestInert(run, written, request, identity, damage)
+  expect(kept(run.controller.sharedChannels()!.snapshot())).toEqual(before)
+  await expectOriginalsKept(run, original)
 })
 
 test('a cold restore request cannot import an absent owner anchor or reinterpret prepared config as authority', async () => {
@@ -1420,20 +1612,20 @@ test('a cold restore request cannot import an absent owner anchor or reinterpret
   expect(run.logs.join('\n')).toContain(RECOVERY_PRESERVATION)
 })
 
-test('real staged recovery renders bounded facts and rejects derived malformed durable evidence without exposing damaged content', async () => {
+test.each(['restore', 'replace'] as const)('real staged %s renders bounded facts and rejects malformed stages and activations derived from it without exposing damaged content', async action => {
   const alpha = h.persona('alpha'); h.materialize(alpha)
-  const prepared = h.writeConfig({ personas: [alpha] })
-  const damage = h.writeRecordBytes(sentinelInMessage('damaged recovery evidence'))
-  h.writeRequestBytes(configBytes(sharedRecoveryRequest('render-repair', damage, prepared)))
-  const run = await recoveryStart(); expect(run.outcome.kind).toBe('refused')
+  const staged = await stageRepair(action, 'render-repair', [alpha], sentinelInMessage('damaged recovery evidence'))
+  const { input: prepared, damage } = staged
+  let run = staged.run
   const stage = disk(), rendered = renderSharedRecovery(stage)
-  expect(rendered).toContain(RECOVERY_LOSS)
+  expect(rendered).toContain(action === 'replace' ? RECOVERY_LOSS : RECOVERY_RESTORE)
   expect(rendered).toContain(RECOVERY_CURRENT_MEMBERSHIP)
   expect(rendered).toContain(RECOVERY_PRESERVATION)
-  expect(rendered).not.toContain(RECOVERY_RESTORE)
-  expect(rendered).toContain(`channel=${alpha.permission_prompts}; new choice=all`)
+  expect(rendered).not.toContain(action === 'replace' ? RECOVERY_RESTORE : RECOVERY_LOSS)
+  expect(rendered).toContain(`channel=${alpha.permission_prompts}; ${action === 'replace' ? 'new' : 'restored'} choice=all`)
   assertNoLeak({ rendered, logs: run.logs, pending: h.readPendingText() })
   expectRepairSecrecy(run, damage.toString())
+  const readable = (state: unknown) => { try { return parseSharedChannelState(configBytes(state), h.paths.lastApplied) !== undefined } catch { return false } }
   const changes: Array<(record: Record<string, any>) => void> = [
     record => { record.recovery.evidenceBase64 = Buffer.from('other evidence').toString('base64') },
     record => { record.recovery.preparedBase64 += '\n' },
@@ -1450,7 +1642,120 @@ test('real staged recovery renders bounded facts and rejects derived malformed d
     const invalid = structuredClone(stage); change(invalid)
     expect(() => parseSharedChannelState(configBytes(invalid), h.paths.lastApplied)).toThrow()
   }
+  // The stage reads back; without any byte its review, revision or activation reads it is unreadable.
+  expect(readable(stage)).toBe(true)
+  for (const { label, state } of stagedRecoveryMissingBytes(stage)) expect([label, readable(state)]).toEqual([label, false])
   expect(disk()).toEqual(stage); expect(h.readConfig()).toEqual(prepared)
+  // An activated record reads only as its identity.
+  await run.stop()
+  run = (await activateRepair()).run; expect(run.outcome.kind).toBe('applied')
+  const active = disk(), bytes = h.readRecord()!
+  expect(readable(active)).toBe(true)
+  const malformed = malformedActiveRecoveries(active, stage)
+  for (const { label, state } of malformed) expect([label, readable(state)]).toEqual([label, false])
+  expect(h.readRecord()).toEqual(bytes); expect(h.readConfig()).toEqual(prepared)
+  // A start over one refuses and leaves its bytes as they were.
+  await run.stop()
+  const kept = h.writeRecordBytes(configBytes(malformed[0]!.state))
+  run = await recoveryStart(); expect(run.outcome.kind).toBe('refused')
+  expect(h.readRecord()).toEqual(kept)
+})
+
+test('three successive owned restorations each stage an anchor and evidence holding no earlier repair\'s bytes, and each activated state outgrows the first by at most its numbers\' added width', async () => {
+  const alpha = threaded('alpha'); h.materialize(alpha)
+  const earlier: Array<{ stage: ReturnType<typeof stagedRecoveryOf>; identity: RecoveryIdentity }> = []
+  let first: { size: number; width: number } | undefined
+  for (let n = 1; n <= 3; n++) {
+    const { run, stage, fingerprint } = await stageRepair('restore', seriesRecoveryId(n), [alpha], seriesDamage(n))
+    await run.stop()
+    const staged = stagedRecoveryOf(disk()), anchor = recoveryBytes(staged.anchorBase64)!
+    expect(recoveryBytes(staged.evidenceBase64)).toEqual(seriesDamage(n))
+    // The anchor keeps only the previous repair's fixed-size identity, none of its bytes or history.
+    expect(parseSharedChannelState(anchor, h.paths.lastApplied)!.recovery).toEqual(earlier.at(-1)?.identity)
+    for (const prior of earlier) {
+      for (const bytes of [prior.stage.evidenceBase64, prior.stage.anchorBase64!, recoveryBytes(prior.stage.evidenceBase64)!.toString()]) {
+        expect(anchor.toString()).not.toContain(bytes)
+      }
+    }
+    const activated = await activateRepair(); expect(activated.run.outcome.kind).toBe('applied')
+    const identity = activatedIdentity(stage, { fingerprint, order: activated.activation!.revision })
+    expect(disk().recovery).toEqual(identity)
+    // The production-encoded state differs from the first activation's only in its numbers' width.
+    const saved = h.readRecord()!, measured = { size: saved.length, width: numericWidth(saved) }
+    first ??= measured
+    expect(measured.size - first.size).toBeLessThanOrEqual(measured.width - first.width)
+    await activated.run.stop()
+    earlier.push({ stage, identity })
+  }
+  expect(earlier.map(({ identity }) => identity.request.request_id)).toEqual([1, 2, 3].map(seriesRecoveryId))
+})
+
+test('after activation an authenticated membership write keeps the identity and its consumed outcome, refuses changes outside its persona and reopens readable', async () => {
+  const alpha = threaded('alpha'), beta = h.persona('beta'); h.materialize(alpha, beta)
+  const { run: refused, stage, fingerprint } = await stageRepair('restore', 'membership-repair', [alpha, beta], 'damaged before a membership write', { dryRun: false, slack: REPAIR_SLACK })
+  await refused.stop()
+  const { run, activation } = await activateRepair({ dryRun: false, realLifecycle: true, slack: REPAIR_SLACK })
+  expect(run.outcome.kind).toBe('applied')
+  const authority = run.controller.sharedChannels()!, channel = alpha.permission_prompts
+  const identity = activatedIdentity(stage, { fingerprint, order: activation!.revision })
+  const consumed = reviewLedger(disk())!.outcomes[fingerprint]
+  expect(consumed).toMatchObject({ status: 'consumed', revision: identity.activation.order })
+  await reconcileAlpha(run, [channel, THREAD])
+  expect(run.membership.read('alpha', channel, 'strict').kind).toBe('eligible')
+  const saved = disk()
+  expect(saved.revision).toBeGreaterThan(identity.activation.order)
+  expect([saved.personas.alpha!.membership[channel]?.member, saved.personas.alpha!.membership[THREAD]?.member]).toEqual([true, true])
+  expect([saved.recovery, authority.snapshot().recovery, reviewLedger(saved)!.outcomes[fingerprint]]).toEqual([identity, identity, consumed])
+  // The membership path's scope: a change to the recovery record, the
+  // outcomes or the sibling persona's membership is refused, with nothing written.
+  const bytes = h.readRecord(), published = authority.snapshot()
+  const copy = () => createSharedChannelAuthority(h.paths.lastApplied, published, { write: () => {} })
+  // beta's own production membership write, in a copy of the authority, gives the sibling change.
+  const sibling = copy(), join = { event: 'EvSIBLINGJOIN', identity: 'authenticated-app', channel: beta.permission_prompts, member: true, boundary: 0 } as const
+  expect(sibling.observeMembership('beta', published.personas.beta!.incarnation, join, sibling.revision).kind).toBe('applied')
+  const joined = sibling.snapshot().personas.beta!
+  expect(published.personas.beta!.membership[beta.permission_prompts]).toBeUndefined()
+  expect(joined.membership[beta.permission_prompts]?.member).toBe(true)
+  const outside: Array<(next: SharedChannelState) => void> = [
+    next => { next.recovery = { ...identity, boundary: 'another-recovery-boundary' } },
+    next => { next.outcomes = { ...next.outcomes, outsideMembership: 'refused' } },
+    next => { next.personas = { ...next.personas, beta: structuredClone(joined) } },
+  ]
+  for (const change of outside) {
+    expect(authority.transactMembership('alpha', authority.revision, change).kind).toBe('failed')
+    expect([h.readRecord(), authority.snapshot(), authority.readable]).toEqual([bytes, published, true])
+    // Each is a valid whole state: only the membership path's scope refuses it.
+    const control = copy()
+    expect(control.transact(control.revision, change).kind).toBe('applied')
+  }
+  await run.stop()
+  const reopened = await start(), state = reopened.controller.sharedChannels()!
+  expect([state.readable, state.snapshot()]).toEqual([true, saved])
+  expectRetainedActivation(reopened, identity)
+})
+
+test.each(['restore', 'replace'] as const)('a staged %s keeps the whole-state path for membership writes; a restoration still refuses one that changes its anchored facts', async action => {
+  const alpha = threaded('alpha'); h.materialize(alpha)
+  const { run, stage } = await stageRepair(action, 'staged-membership', [alpha], 'damaged before a staged membership write')
+  await run.stop()
+  const state = disk(), bytes = h.readRecord()
+  const leave = { event: 'verified-leave', identity: 'authenticated-app', channel: THREAD, member: false, boundary: 0 } as const
+  // The staging owner's guard holds every write, so this reads the real staged disk again.
+  const written: SharedChannelState[] = []
+  const reopened = createSharedChannelAuthority(h.paths.lastApplied, state, { write: (path, next) => { written.push(parseSharedChannelState(next, path)!) } })
+  if (action === 'restore') {
+    // The same production membership write commits over the anchor.
+    const anchor = parseSharedChannelState(recoveryBytes(stagedRecoveryOf(state).anchorBase64)!, h.paths.lastApplied)!
+    const owner = createSharedChannelAuthority(h.paths.lastApplied, anchor, { write: () => {} })
+    expect(owner.observeMembership('alpha', anchor.personas.alpha!.incarnation, leave, owner.revision).kind).toBe('applied')
+    expect(reopened.observeMembership('alpha', state.personas.alpha!.incarnation, leave, reopened.revision).kind).toBe('failed')
+    expect([written, reopened.snapshot()]).toEqual([[], state])
+  } else {
+    // A staged replacement's whole-state path has no persona scope.
+    expect(reopened.transactMembership('alpha', reopened.revision, next => { next.pendingIntent = { ...next.pendingIntent, outsideMembership: 'kept' } }).kind).toBe('applied')
+    expect(written.map(next => [next.recovery, next.pendingIntent.outsideMembership])).toEqual([[stage, 'kept']])
+  }
+  expect(h.readRecord()).toEqual(bytes)
 })
 
 test.each((['strict', 'open'] as const).flatMap(mode => (['none', 'before-rename', 'installed-unsynced'] as const).map(fault => [mode, fault] as const)))(
@@ -1617,7 +1922,7 @@ test('a revised cold replacement replaces the inert review and permanently revok
   run = await recoveryStart(); expect(run.outcome.kind).toBe('refused')
   expect(disk().recovery!.request).toEqual(revised)
   expect(h.readPending()).not.toEqual(obsolete)
-  expect(recoveryBytes(disk().recovery!.evidenceBase64)).toEqual(damage)
+  expect(recoveryBytes(stagedRecoveryOf(disk()).evidenceBase64)).toEqual(damage)
   expect(h.readConfig()).toEqual(input)
   await run.stop(); h.confirm()
   run = await recoveryStart(); expect(run.outcome.kind).toBe('applied')
@@ -1639,9 +1944,8 @@ test('ordinary cancellation of a staged cold replacement survives restart and pe
   h.writeRequestBytes(configBytes(cancel))
   run = await recoveryStart(); expect(run.outcome.kind).toBe('refused')
   expect(run.controller.sharedChannels()).toBeUndefined()
-  expect(disk().recovery?.phase).toBe('review')
-  expect(recoveryBytes(disk().recovery!.evidenceBase64)).toEqual(damage)
-  expect(recoveryBytes(disk().recovery!.preparedBase64)).toEqual(input)
+  expect(recoveryBytes(stagedRecoveryOf(disk()).evidenceBase64)).toEqual(damage)
+  expect(recoveryBytes(stagedRecoveryOf(disk()).preparedBase64)).toEqual(input)
   expect(h.readConfig()).toEqual(input)
   await run.stop()
   // A repeated original request and its exact old gesture cannot resurrect a
@@ -1649,9 +1953,8 @@ test('ordinary cancellation of a staged cold replacement survives restart and pe
   h.writeRequestBytes(request); h.writeApplyBytes(obsolete)
   run = await recoveryStart(); expect(run.outcome.kind).toBe('refused')
   expect(run.controller.sharedChannels()).toBeUndefined()
-  expect(disk().recovery?.phase).toBe('review')
-  expect(recoveryBytes(disk().recovery!.evidenceBase64)).toEqual(damage)
-  expect(recoveryBytes(disk().recovery!.preparedBase64)).toEqual(input)
+  expect(recoveryBytes(stagedRecoveryOf(disk()).evidenceBase64)).toEqual(damage)
+  expect(recoveryBytes(stagedRecoveryOf(disk()).preparedBase64)).toEqual(input)
   expect(h.readConfig()).toEqual(input)
   const cancelled = disk()
   expect(cancelled.pendingIntent).toMatchObject({ operator: { generation: 1, requested: false, requests: {

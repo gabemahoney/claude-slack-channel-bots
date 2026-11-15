@@ -12,7 +12,7 @@ import { RELOAD_STALE_CONFIRMATION, renderStaleConfirmationLogLine } from '../sr
 import { parseSharedChannelState, serializeSharedChannelState, reviewedReplacementIncarnation, type SharedChannelState, type SharedPersona } from '../src/shared-channels.ts'
 import { REVIEW_OMISSION_CLAUSE, REVIEW_RETENTION_CLAUSE, REVIEW_RESET_CLAUSE } from '../src/reload-preview-clauses.ts'
 import { makeReloadHarness, NO_RUN_ACTIVITY, type ReloadHarness, type ReloadRun, type ReloadRunOptions } from './test-helpers/reload-harness.ts'
-import { activationRecord, applicationState, botApplications, botAttemptAtReviewOutcome, configBytes, deliveryAttempt, sharedRecoveryRequest, withPreRuleReviewOutcomes } from './test-helpers/shared-channels.ts'
+import { activationOf, activationRecord, applicationState, botApplications, botAttemptAtReviewOutcome, configBytes, deliveryAttempt, sharedRecoveryRequest, withPreRuleReviewOutcomes } from './test-helpers/shared-channels.ts'
 import { sharedRecoveryLine } from '../src/reload-recovery.ts'
 import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { membershipPage, SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
@@ -1018,8 +1018,8 @@ async function activatedReplacement(personas: PersonaInput[], writes: ReturnType
   expect(historyWrites(writes.written, from)).toEqual([revision, revision + 1].map(at => ({ revision: at, outcomes: outcomeOf(staged, 'superseded', revision), retirement: undefined })))
   await run.stop(); h.confirm(); from = writes.written.length
   run = await start(writes)
-  const { order } = disk().recovery!.activation!
-  expect(disk().recovery!.activation!.fingerprint).toBe(revised.fingerprint)
+  const { order, fingerprint } = activationOf(disk())
+  expect(fingerprint).toBe(revised.fingerprint)
   expect(historyWrites(writes.written, from)).toEqual([
     { revision: order - 1, outcomes: outcomeOf(revised, 'attempted', order - 1), retirement: revised.fingerprint },
     { revision: order, outcomes: outcomeOf(revised, 'consumed', order), retirement: undefined },
@@ -1069,7 +1069,7 @@ test('a repair activation keeps its consumed outcome beside the last outcome thr
   expect(reviewLedger(disk())!.outcomes).toEqual(outcomeOf(third, 'superseded', disk().revision))
   await run.stop(); h.confirm()
   run = await start(writes)
-  const replaced = disk().recovery!.activation!
+  const replaced = activationOf(disk())
   expect(replaced.fingerprint).toBe(restoring.fingerprint)
   expect(retainedOutcomes(run)).toEqual(outcomeOf(restoring, 'consumed', replaced.order))
   // The same reviewed facts under the restoration's new boundary bind another dependency.
@@ -1189,7 +1189,7 @@ test.each(['written', 'refused before the rename', 'installed but unsynced', 'st
     expect(reviewLedger(disk())!.outcomes).toEqual(kept)
     expect(authority(run).readable).toBe(false)
     expect(reviewLedger(authority(run).snapshot())!.outcomes).toEqual(oldOutcomes)
-    expect(authority(run).snapshot().recovery!.activation!.fingerprint).toBe(activation.fingerprint)
+    expect(activationOf(authority(run).snapshot()).fingerprint).toBe(activation.fingerprint)
   } else expect(run.stoppedBeforeWrite).toBe(true)
   await run.stop(); h.clearWriteFailure()
 

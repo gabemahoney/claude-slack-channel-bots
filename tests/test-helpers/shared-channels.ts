@@ -45,7 +45,7 @@ export function sharedChannelPath(stateDir: string): string { return join(resolv
 export function configBytes(input: unknown): Buffer { return Buffer.from(JSON.stringify(input, null, 2) + '\n') }
 
 import { REVIEW_REQUEST_FORMAT } from '../../src/reload-request.ts'
-import { parseSharedRecoveryRequest, recoveryHash, type SharedRecoveryRequest } from '../../src/shared-recovery.ts'
+import { parseSharedRecoveryRequest, recoveryHash, type SharedRecoveryRecord, type SharedRecoveryRequest } from '../../src/shared-recovery.ts'
 /** Bound recovery input, validated by the production grammar. No snapshot
  * field is offered: restoration belongs only to the running authority. */
 export function sharedRecoveryRequest(id: string, evidence: Uint8Array, replacement?: Uint8Array): SharedRecoveryRequest {
@@ -54,6 +54,124 @@ export function sharedRecoveryRequest(id: string, evidence: Uint8Array, replacem
   const request = parseSharedRecoveryRequest(value)
   if (!request) throw new Error('sharedRecoveryRequest: invalid fixture input')
   return request
+}
+/** `request` with only its request ID, its action or its evidence hash
+ * changed, each still valid in the production grammar. A restoration turned
+ * replacement chooses `input`; a changed hash binds `evidence` plus a newline. */
+export function foreignRecoveryRequests(request: SharedRecoveryRequest, evidence: Uint8Array, input: Uint8Array): SharedRecoveryRequest[] {
+  const replacement = request.action === 'replace' ? Buffer.from(request.replacement_source_base64, 'base64') : undefined
+  return [
+    sharedRecoveryRequest('foreign-repair', evidence, replacement),
+    sharedRecoveryRequest(request.request_id, evidence, replacement ? undefined : input),
+    sharedRecoveryRequest(request.request_id, Buffer.concat([evidence, Buffer.from('\n')]), replacement),
+  ]
+}
+import type { AcceptedInput } from '../../src/delivery-queue.ts'
+/** Two distinct originals a repair's queue keeps, in FIFO order, as overrides
+ * of delivery-queue.ts's `slackInput` (which imports this module through
+ * thread-memory.ts): different keys, text, channels and thread context. */
+export function repairOriginals(): Array<Partial<AcceptedInput>> {
+  return [
+    { text: '  original <@U0SENDER>\r\n😀  ', queued_ack_reaction: 'hourglass' },
+    { text: 'second original, in a thread', channel: SHARED_CHANNEL_IDS.secondary, key: { chat_id: SHARED_CHANNEL_IDS.secondary, ts: '1700000000.000002' },
+      ts: '1700000000.000002', thread_ts: '1700000000.000001' },
+  ]
+}
+/** A replacement `request` whose chosen input gains a final newline: the same
+ * identity, so only whole-request equality tells the two apart. */
+export function changedReplacementRequest(request: SharedRecoveryRequest): SharedRecoveryRequest {
+  if (request.action !== 'replace') throw new Error('changedReplacementRequest needs a replacement request')
+  const input = Buffer.concat([Buffer.from(request.replacement_source_base64, 'base64'), Buffer.from('\n')])
+  const changed = parseSharedRecoveryRequest({ ...request, replacement_source_base64: input.toString('base64') })
+  if (!changed) throw new Error('changedReplacementRequest: invalid fixture input')
+  return changed
+}
+/** A staged recovery record; throws for an activated record or none, so each
+ * read of the bytes only a stage keeps names its phase. */
+export function stagedRecoveryOf(state: SharedChannelState): Extract<SharedRecoveryRecord, { phase: 'review' }> {
+  const recovery = state.recovery
+  if (recovery?.phase !== 'review') throw new Error(`stagedRecoveryOf: expected a staged recovery, found ${recovery?.phase ?? 'none'}`)
+  return recovery
+}
+/** An activated recovery's activation; throws for a staged record or none. */
+export function activationOf(state: SharedChannelState) {
+  const recovery = state.recovery
+  if (recovery?.phase !== 'active') throw new Error(`activationOf: expected an activated recovery, found ${recovery?.phase ?? 'none'}`)
+  return recovery.activation
+}
+/** The whole record activation leaves of `stage` (SR-5.2): its boundary, the
+ * request's four identity fields, named one by one, and the activation. */
+export function activatedIdentity(stage: SharedRecoveryRecord, activation: { fingerprint: string; order: number }) {
+  const { format, action, request_id, evidence_sha256 } = stage.request
+  return { boundary: stage.boundary, phase: 'active' as const, request: { format, action, request_id, evidence_sha256 }, activation }
+}
+/** The `n`th review ID and damaged authority of a repair series, each one
+ * width for n < 10000, so a series saves equal-width identities and evidence. */
+export function seriesRecoveryId(n: number): string { return `series-repair-${String(n).padStart(4, '0')}` }
+export function seriesDamage(n: number): Buffer { return Buffer.from(`damaged authority, series repair ${String(n).padStart(4, '0')}`) }
+/** The decimal width of every number in saved JSON: all an equal-shape state
+ * may add to its size as its orders and revision gain digits. */
+export function numericWidth(bytes: Uint8Array): number {
+  let width = 0
+  const visit = (value: unknown): void => {
+    if (typeof value === 'number') width += String(value).length
+    else if (Array.isArray(value)) value.forEach(visit)
+    else if (typeof value === 'object' && value !== null) Object.values(value).forEach(visit)
+  }
+  visit(JSON.parse(Buffer.from(bytes).toString('utf8')))
+  return width
+}
+/** Readability cases from a valid production stage (SR-8.10): each removes
+ * one byte field its review, revision or activation reads; a restoration's
+ * anchor too. Deliberately bypasses the validating seed writer. */
+export function stagedRecoveryMissingBytes(stage: SharedChannelState): Array<{ label: string; state: SharedChannelState }> {
+  const fields = ['evidenceBase64', 'preparedBase64', ...(stagedRecoveryOf(stage).request.action === 'restore' ? ['anchorBase64'] : [])]
+  return fields.map(field => {
+    const copy = structuredClone(stage)
+    delete (copy.recovery as unknown as Record<string, unknown>)[field]
+    return { label: `stage without ${field}`, state: copy }
+  })
+}
+/** Readability cases from a valid production activation and the stage it
+ * activated (SR-8.10): each puts back a field activation drops, with the
+ * stage's value and empty, adds a surplus field, breaks the identity grammar,
+ * or breaks the activation's link to the consumed outcome SR-3.5 keeps.
+ * Deliberately bypasses the validating seed writer. */
+export function malformedActiveRecoveries(active: SharedChannelState, stage: SharedChannelState): Array<{ label: string; state: SharedChannelState }> {
+  const staged = stagedRecoveryOf(stage), { fingerprint, order } = activationOf(active)
+  const source = staged.request.action === 'replace' ? staged.request.replacement_source_base64 : staged.preparedBase64
+  type Change = [string, (recovery: Record<string, any>, state: SharedChannelState) => void]
+  const changes: Change[] = [
+    ...(['evidenceBase64', 'preparedBase64', 'anchorBase64'] as const).flatMap((field): Change[] => [
+      [`${field} kept`, r => { r[field] = staged[field] ?? staged.evidenceBase64 }],
+      [`${field} empty`, r => { r[field] = '' }],
+    ]),
+    ['replacement source kept', r => { r.request.replacement_source_base64 = source }],
+    ['replacement source empty', r => { r.request.replacement_source_base64 = '' }],
+    ['superseded IDs kept', r => { r.supersededRequestIds = staged.supersededRequestIds ?? [staged.request.request_id] }],
+    ['superseded IDs empty', r => { r.supersededRequestIds = [] }],
+    ['cancelled', r => { r.cancelled = true }],
+    ['cancellation false', r => { r.cancelled = false }],
+    ['surplus record field', r => { r.snapshot = {} }],
+    ['surplus request field', r => { r.request.intent_generation = 0 }],
+    ['surplus activation field', r => { r.activation.generation = 0 }],
+    ['missing activation', r => { delete r.activation }],
+    ['missing identity field', r => { delete r.request.evidence_sha256 }],
+    ['operator action', r => { r.request.action = 'cancel' }],
+    ['invalid request ID', r => { r.request.request_id = 'not a review id' }],
+    ['invalid evidence hash', r => { r.request.evidence_sha256 = 'evidence' }],
+    ['relabelled review', r => { r.phase = 'review' }],
+    ['foreign activation', r => { r.activation.fingerprint = 'f'.repeat(64) }],
+    ['activation before its outcome', r => { r.activation.order = order - 1 }],
+    ['activation after the revision', (r, s) => { r.activation.order = s.revision + 1 }],
+    ['consumed outcome pruned', (_r, s) => { delete reviewLedger(s)!.outcomes[fingerprint] }],
+    ['outcome not consumed', (_r, s) => { reviewLedger(s)!.outcomes[fingerprint]!.status = 'superseded' }],
+  ]
+  return changes.map(([label, mutate]) => {
+    const copy = structuredClone(active)
+    mutate(copy.recovery as unknown as Record<string, any>, copy)
+    return { label, state: copy }
+  })
 }
 export function channelPopulation(count: number, offset = 0) {
   return Array.from({ length: count }, (_, i) => ({

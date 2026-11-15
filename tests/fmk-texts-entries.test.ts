@@ -1261,6 +1261,8 @@ describe('shared scenario printer evidence contracts', () => {
       process.env.SCENARIO_ROOT=scratch
     })
 
+    // The shared builder: the retained request with only its ID, action or evidence hash changed.
+    const foreignRequests = (request: any) => shared.foreignRecoveryRequests(request, damaged, replacement)
     async function fixture(action: 'restore'|'replace') {
       const root = mkdtempSync(join(scratch,action+'-'))
       const paths = {config:join(root,'config.json'),lastApplied:join(root,'config.json.last-applied'),pending:join(root,'config.json.pending'),apply:join(root,'config.json.apply')}
@@ -1323,27 +1325,53 @@ describe('shared scenario printer evidence contracts', () => {
         assert.equal(a.requestReview(req,readFileSync(f.paths.config)).kind,'recorded')
         await failure(()=>print('sharedRecoveryPending',f.args));writeFileSync(f.paths.lastApplied,f.saved)
       })
-      await check(action+' real scratch activation supplies durable consumed evidence',async()=>{
+      await check(action+' real scratch activation keeps only the identity and the retained full request supplies consumed evidence',async()=>{
         copyFileSync(f.paths.pending,f.paths.apply)
         assert.equal(f.recover(),'activated')
-        const got=JSON.parse(await print('sharedRecoveryConsumed',f.args));assert.equal(got.phase,'active')
+        const request=JSON.parse(f.requestBytes.toString()), got=JSON.parse(await print('sharedRecoveryConsumed',f.args))
+        assert.deepEqual([got.phase,got.request_id,got.action],['active',request.request_id,action])
+        assert.equal(Object.hasOwn(request,'replacement_source_base64'),action==='replace')
         await failure(()=>print('sharedRecoveryPending',f.args))
         const state=f.read(), outcome=reviewModule.reviewLedger(state).outcomes[got.fingerprint]
-        assert.equal(state.recovery.activation.order,outcome.revision)
+        const staged=stateModule.parseSharedChannelState(f.saved,f.paths.lastApplied,{sourcePath:f.paths.config})!
+        assert.deepEqual(state.recovery,shared.activatedIdentity(shared.stagedRecoveryOf(staged),{fingerprint:got.fingerprint,order:outcome.revision}))
+        assert.equal(got.boundary,state.recovery.boundary);assert.equal(outcome.status,'consumed')
         const activeBytes=readFileSync(f.paths.lastApplied)
-        writeFileSync(f.paths.lastApplied,f.saved);await failure(()=>print('sharedRecoveryConsumed',f.args));writeFileSync(f.paths.lastApplied,activeBytes)
-        const wrong=JSON.parse(f.requestBytes.toString());wrong.request_id='different-request';writeFileSync(f.request,JSON.stringify(wrong))
-        await failure(()=>print('sharedRecoveryConsumed',f.args));writeFileSync(f.request,f.requestBytes)
+        const pruned=shared.malformedActiveRecoveries(state,staged).find((c: any)=>c.label==='consumed outcome pruned').state
+        writeFileSync(f.paths.lastApplied,f.saved);await failure(()=>print('sharedRecoveryConsumed',f.args))
+        writeFileSync(f.paths.lastApplied,shared.configBytes(pruned));await failure(()=>print('sharedRecoveryConsumed',f.args));writeFileSync(f.paths.lastApplied,activeBytes)
+        writeFileSync(f.paths.pending,f.preview.toString().replace(got.fingerprint,'a'.repeat(64)));await failure(()=>print('sharedRecoveryConsumed',f.args));writeFileSync(f.paths.pending,f.preview)
+        for(const foreign of foreignRequests(request)) {
+          writeFileSync(f.request,JSON.stringify(foreign));await failure(()=>print('sharedRecoveryConsumed',f.args))
+        }
+        writeFileSync(f.request,f.requestBytes);assert.equal(JSON.parse(await print('sharedRecoveryConsumed',f.args)).fingerprint,got.fingerprint)
       })
     }
-    await check('scratch mutation dropping exact request equality admits a foreign request',async()=>{
-      const f=await fixture('replace'), wrong=JSON.parse(f.requestBytes.toString());wrong.request_id='foreign-id'
-      writeFileSync(f.request,JSON.stringify(wrong));await failure(()=>print('sharedRecoveryPending',f.args))
-      const mutant=join(scratch,'mutant-request.ts')
-      const changed=body.replace(' || !isDeepStrictEqual(recovery.request, request)', '')
-      assert.notEqual(changed,body);writeFileSync(mutant,changed+'\nexport {entryValue};\n')
-      const m=evidence.wrap(await import(mutant))
-      assert.equal(JSON.parse(await m.entryValue('sharedRecoveryPending',f.args)).request_id,'foreign-id')
+    await check('scratch mutants dropping one exact request clause admit a foreign request',async()=>{
+      const f=await fixture('replace'), foreign=foreignRequests(JSON.parse(f.requestBytes.toString()))
+      const mutant=async(name: string,clause: string)=>{
+        assert.equal(body.split(clause).length,2,clause)
+        const changed=body.replace(clause,'false');assert.notEqual(changed,body)
+        const path=join(scratch,'mutant-'+name+'.ts');writeFileSync(path,changed+'\nexport {entryValue};\n')
+        return evidence.wrap(await import(path))
+      }
+      const admitted=async(m: any,entry: string,request: any)=>{
+        const got=JSON.parse(await m.entryValue(entry,f.args));assert.deepEqual([got.request_id,got.action],[request.request_id,request.action])
+      }
+      // Pending compares the whole request, a replacement's chosen input included.
+      const changedInput=shared.changedReplacementRequest(JSON.parse(f.requestBytes.toString()))
+      const pending=await mutant('pending','!isDeepStrictEqual(recovery.request, request)')
+      for(const request of [foreign[0],changedInput]) {
+        writeFileSync(f.request,JSON.stringify(request));await failure(()=>print('sharedRecoveryPending',f.args))
+        await admitted(pending,'sharedRecoveryPending',request)
+      }
+      writeFileSync(f.request,f.requestBytes);copyFileSync(f.paths.pending,f.paths.apply);assert.equal(f.recover(),'activated')
+      // Consumed compares each identity field; dropping one admits a request differing only there.
+      for(const [i,clause] of ['recovery.request.request_id !== request.request_id','recovery.request.action !== request.action',
+        'recovery.request.evidence_sha256 !== request.evidence_sha256'].entries()) {
+        writeFileSync(f.request,JSON.stringify(foreign[i]));await failure(()=>print('sharedRecoveryConsumed',f.args))
+        await admitted(await mutant('consumed-'+i,clause),'sharedRecoveryConsumed',foreign[i])
+      }
     })
     const table=join(dir,'crontable'), prompt=join(dir,'scheduled.prompt.md')
     await check('cron identity is production parsed from independently retained schedule',async()=>{

@@ -7279,7 +7279,9 @@ This uses `config.json.request`, the existing preview and the confirming rename;
 
 A restored or new choice that ends at `thread_hybrid` starts with its Joined Threads empty: its preview line ends `Joined Threads forgotten, not restored.`, and the persona joins each thread again as it would a new one (see [Threads in `thread_hybrid` channels](../../docs/channel-modes.md#threads-in-thread_hybrid-channels)).
 
-For an initial repair, the following writes only a request, never the authority. Set `RECOVERY_ACTION` to `restore` for the still-running owner; `replace` reads the separately prepared replacement file. It hashes the exact current damaged bytes, regardless of apparent recovery fields inside them. Use the separate revision example below only for a known retained cold stage.
+For an initial repair, the following writes only a request, never the authority. Set `RECOVERY_ACTION` to `restore` for the still-running owner; `replace` reads the separately prepared replacement file.
+
+The example hashes the exact current damaged bytes, regardless of apparent recovery fields inside them. Use the separate revision example below only for a known retained cold stage.
 
 ```sh
 STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}"
@@ -7306,7 +7308,9 @@ PYRECOVERY
 
 For damaged start, run `claude-slack-channel-bots start` to stage the request; runtime startup remains refused. Read the complete `config.json.pending`: it shows the boundary, local revision, intent generation, each new or restored choice and the loss/preservation clauses. Rename that exact preview as [Confirming a change](../../docs/reload.md#confirming-a-change) describes, then run `claude-slack-channel-bots start` again; activation consumes the review once through the same durable authority.
 
-To deliberately revise an unactivated cold replacement, first obtain `review pending` from the procedure above and read its preview. Use this example only while that validated retained stage is unchanged; apparent fields in damaged JSON do not establish a stage. Prepare the revised `replacement-config.json` separately, keeping the original evidence and prepared input. This reads the known stage's original evidence hash and generates a fresh request ID:
+To deliberately revise an unactivated cold replacement, first obtain `review pending` from the procedure above and read its preview. Use this example only while that validated retained stage is unchanged; apparent fields in damaged JSON do not establish a stage.
+
+Prepare the revised `replacement-config.json` separately, keeping the original evidence and prepared input. This reads the known stage's original evidence hash and generates a fresh request ID:
 
 ```sh
 python3 - "$STATE" <<'PYREVISION'
@@ -7329,7 +7333,9 @@ os.replace(path, state / "config.json.request")
 PYREVISION
 ```
 
-Run `start` again, read the fresh preview and confirm it by rename before the activating start. Old IDs remain permanently reserved, even after activation or byte reversion. Invalid revisions do not activate the proposal, and a replacement cannot revise an owned restoration stage.
+Run `start` again, read the fresh preview and confirm it by rename before the activating start. Invalid revisions do not activate the proposal, and a replacement cannot revise an owned restoration stage.
+
+While the stage is retained, a revision that reuses its current or any earlier request ID is refused as `request unresolved`, even with that request's earlier bytes put back. Activation forgets the earlier IDs, so give every revision and every later repair a fresh ID.
 
 To cancel an unactivated cold replacement, use the ordinary cancel grammar with the **current retained intent generation**, also shown in the preview (initially zero). This records cancellation without needing readable `config.json`; run `start` to process it:
 
@@ -7342,7 +7348,9 @@ mv "$STATE/config.json.request.next" "$STATE/config.json.request"
 claude-slack-channel-bots start
 ```
 
-Accepted cancellation advances the generation and retains its tombstone, original damaged evidence and prepared bytes; it does not activate the proposal. Replaying the same cancellation request cannot cancel a later proposal. Rerunning this generator creates a new cancellation request for the current proposal. Old confirmations cannot revive a cancelled proposal; a later replacement requires a fresh ID and fresh review.
+Accepted cancellation advances the generation and retains its tombstone, original damaged evidence and prepared bytes; it does not activate the proposal. Replaying the same cancellation request cannot cancel a later proposal.
+
+Rerunning this generator creates a new cancellation request for the current proposal. Old confirmations cannot revive a cancelled proposal; a later replacement requires a fresh ID and fresh review.
 
 | Status after `[slack] reload-shared-recovery:` | Meaning and action |
 |---|---|
@@ -7354,9 +7362,11 @@ Accepted cancellation advances the generation and retains its tombstone, origina
 | `stage unresolved` / `repair unresolved` | Preserve staged evidence and prepared input; correct the reported safe filesystem cause and restart to verify the retained stage. |
 | `durability unresolved` | The operation may already be installed. Preserve authority, retirement evidence, request, confirmation and prepared input; restart to recover the retained outcome **before any new review**. This is not definite nonactivation or permission to reconfirm. |
 | `confirmation not activated` | A definite failure or stale gesture; read the genuinely fresh pending preview after recovery before confirming again. |
-| `durable repair activated` / `retained repair activation` | The repair is consumed once; the latter reports its retained order on a later start, without applying it again. Current authenticated membership is still required. Once it is verified, each affected persona posts a [*Channel state recovered*](#shared-state-recovered) report with `cause=repair`. |
+| `durable repair activated` / `retained repair activation` | The repair is consumed once; the latter reports its retained order on a later start, without applying it again. Current authenticated membership is still required. Only in the run whose start activated the repair, each affected persona posts a [*Channel state recovered*](#shared-state-recovered) report with `cause=repair` once membership is verified; a later start has only the retained line, so don't wait for that report (see that entry). |
 
-History is not current membership. Missing membership or eligibility evidence remains unresolved; independently provable work may progress, but a wholly unprovable authority cannot expose runtime configuration. Repair preserves exact damaged/prepared bytes privately and accepted work under its original keys, content, context and FIFO; unrelated input remains for ordinary review.
+History is not current membership. Missing membership or eligibility evidence remains unresolved; independently provable work may progress, but a wholly unprovable authority cannot expose runtime configuration. Repair preserves accepted work under its original keys, content, context and FIFO; unrelated input remains for ordinary review.
+
+The authority keeps the damaged state's exact bytes and the separately prepared input privately only until activation. Activation keeps just the request's ID, action and evidence hash, so the copies preserved before repair are the lasting ones. A request matching them left in place applies nothing.
 
 Repair never retries an unknown or proven-not-applied assignment, and finite Slack retries cannot recover events never accepted. For a channel's unresolved absence order, the ordinary reviewed assignment may explicitly replace that conflict: its preview distinguishes retained history, the removal boundary and a new future preference, requiring fresh membership. It recovers no lost Joined Threads.
 
@@ -7931,7 +7941,7 @@ No `config.json` and no last-applied record. See the `missing prerequisite: conf
 
 ### Symptom: The server won't start: last-applied record error
 
-For a removed-key message from a hand-written record that has never started, correct both baseline files as [Removed configuration keys](#removed-configuration-keys) says; reviewed repair is for an adopted authority. Otherwise see [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid), then [`reload-shared-recovery`](#reload-shared-recovery): a repaired choice ending at `thread_hybrid` starts with no Joined Threads, and once the repair is active and membership verified, the persona posts *Channel state recovered*.
+For a removed-key message from a hand-written record that has never started, correct both baseline files as [Removed configuration keys](#removed-configuration-keys) says; reviewed repair is for an adopted authority. Otherwise see [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid), then [`reload-shared-recovery`](#reload-shared-recovery): a repaired choice ending at `thread_hybrid` starts with no Joined Threads, and once membership is verified in the run whose start activated the repair, the persona posts *Channel state recovered* (a later start doesn't).
 
 ### Symptom: The server won't start: `reload-record-write-failed`
 

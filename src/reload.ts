@@ -1042,7 +1042,11 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
     const input = readConfigFile(paths.config, deps.configFs)
     const recovery = read.ok ? readSharedRecoveryRequest(read.bytes) : undefined
     if (recovery) {
-      if (JSON.stringify(authority.snapshot().recovery?.request) === JSON.stringify(recovery)) return false
+      // A request left in place after its activation applies nothing. The
+      // activated record keeps only its identity, never a replacement's input.
+      const retained = authority.snapshot().recovery
+      if (retained?.phase === 'active' && retained.request.request_id === recovery.request_id &&
+          retained.request.action === recovery.action && retained.request.evidence_sha256 === recovery.evidence_sha256) return false
       const evidence = readConfigFile(paths.lastApplied, deps.configFs)
       const result = evidence.ok && input.ok ? authority.stageRestoration(recovery, evidence.bytes, input.bytes) : { kind: 'failed' }
       if (result.kind === 'unresolved') recoveryPending = true
@@ -1718,7 +1722,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     })
     deps.log(reloadSharedAuthorityStartLine(paths.lastApplied, sharedChannels.revision))
     if (sharedState.recovery?.phase === 'active') deps.log(sharedRecoveryLine('retained repair activation',
-      `The installed authority retains the consumed repair at order=${sharedState.recovery.activation!.order}; it is not applied again. Current authenticated membership is still required before dependent intake or a recovery-complete claim.`))
+      `The installed authority retains the consumed repair at order=${sharedState.recovery.activation.order}; it is not applied again. Current authenticated membership is still required before dependent intake or a recovery-complete claim.`))
     phase = 'applied'
     appliedState = applied
     return { kind: 'applied', ...applied }

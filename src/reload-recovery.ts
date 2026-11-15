@@ -10,7 +10,7 @@ import { composePendingFile, parsePendingFingerprint, reloadFingerprint, reloadR
 import { parseReviewRequestBytes, REVIEW_REQUEST_SUFFIX, REVIEW_ID_RE, type OperatorIntent } from './reload-request.ts'
 import { beginReviewAttempt, createReviewObserver, rejectReviewAttempt, retainReviewOutcomes, reviewLedger, reviewMatches, sharedReviewDependency, supersedeReview } from './reload-review.ts'
 import { createSharedChannelAuthority, initialSharedChannelState, parseSharedChannelState, restartThreadHybridSince, serializeSharedChannelState, validThreadMemoryMarker, type SharedChannelAuthority, type SharedChannelState, type SharedMutationResult } from './shared-channels.ts'
-import { readSharedRecoveryRequest, recoveryBytes, recoveryHash, type SharedRecoveryRequest } from './shared-recovery.ts'
+import { readSharedRecoveryRequest, recoveryBytes, recoveryHash, recoveryIdentity, type SharedRecoveryRequest } from './shared-recovery.ts'
 import { RETIRED_KEYS_WRITE_FAILED, RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, retiredReviewRecovery, restoreReviewedRetirement, type RetiredKeyStore } from './retired-keys.ts'
 import { DurableWriteUnsyncedError } from './atomic-write.ts'
 import { RECOVERY_CURRENT_MEMBERSHIP, RECOVERY_LOSS, RECOVERY_PRESERVATION, RECOVERY_RESTORE, RECOVERY_THREADS_FORGOTTEN } from './reload-preview-clauses.ts'
@@ -36,7 +36,7 @@ export function sharedRecoveryLine(status: string, detail = ''): string {
 /** Pure, finite preview. No credential content or damaged bytes are rendered. */
 export function renderSharedRecovery(state: SharedChannelState): string {
   const recovery = state.recovery!
-  if (recovery.cancelled) return `Recovery proposal cancelled. No confirmation can activate it; submit a replacement with a fresh request ID for a new review. ${RECOVERY_PRESERVATION}`
+  if (recovery.phase === 'review' && recovery.cancelled) return `Recovery proposal cancelled. No confirmation can activate it; submit a replacement with a fresh request ID for a new review. ${RECOVERY_PRESERVATION}`
   const lines = [
     `Reviewed ${recovery.request.action}; boundary=${recovery.boundary}; local revision=${state.revision}; intent generation=${(state.pendingIntent.operator as OperatorIntent | undefined)?.generation ?? 0}.`,
     recovery.request.action === 'replace' ? RECOVERY_LOSS : RECOVERY_RESTORE,
@@ -111,9 +111,10 @@ function reviseReplacement(authority: SharedChannelAuthority, request: SharedRec
       life.resetOrder = order
       for (const assignment of Object.values(life.assignments)) assignment.order = order
     }
-    next.recovery!.supersededRequestIds = [...(current.supersededRequestIds ?? []), current.request.request_id]
-    next.recovery!.request = request
-    delete next.recovery!.cancelled
+    // The snapshot's stage at this same revision, revised and no longer cancelled.
+    next.recovery = { boundary: current.boundary, phase: 'review', request,
+      evidenceBase64: current.evidenceBase64, preparedBase64: current.preparedBase64,
+      supersededRequestIds: [...(current.supersededRequestIds ?? []), current.request.request_id] }
     supersedeReview(next, order)
   })
 }
@@ -144,8 +145,11 @@ function activate(authority: SharedChannelAuthority, deps: ReloadRecoveryDeps, b
   if (!unchanged()) return fail('stale')
   const result = authority.transact(authority.revision, (next, order) => {
     if (!reviewMatches(next, review, true) || next.recovery?.phase !== 'review' || next.recovery.cancelled) throw new Error('Obsolete recovery confirmation.')
-    next.recovery.phase = 'active'
-    next.recovery.activation = { fingerprint: review.fingerprint, order }
+    // Only the identity outlives activation: nothing later reads the stage's
+    // bytes or request history, and keeping them would rewrite them in every
+    // later application and nest them in a later stage's anchor.
+    next.recovery = { boundary: next.recovery.boundary, phase: 'active', request: recoveryIdentity(next.recovery.request),
+      activation: { fingerprint: review.fingerprint, order } }
     if (replacement) for (const life of Object.values(next.personas)) {
       life.resetOrder = order
       life.createdAt = (deps.now ?? Date.now)()
@@ -189,7 +193,8 @@ function processRecoveryRequest(authority: SharedChannelAuthority, deps: ReloadR
       return 'pending'
     }
   }
-  if (authority.snapshot().recovery!.cancelled) {
+  const recovery = authority.snapshot().recovery!
+  if (recovery.phase === 'review' && recovery.cancelled) {
     deps.log(sharedRecoveryLine('proposal cancelled', `No configuration is activated. Intent generation=${authority.operatorIntent().generation}; prior confirmations remain invalid. Submit a replacement with a fresh request ID for a new review. ${RECOVERY_PRESERVATION}`))
     return 'pending'
   }
