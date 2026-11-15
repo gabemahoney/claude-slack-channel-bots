@@ -10,7 +10,6 @@
  * outside the image first.
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { spawnSync } from 'node:child_process'
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -22,7 +21,7 @@ import { parseSharedChannelState } from '../src/shared-channels.ts'
 import { THREAD_MEMORY_SEAL_FILE } from '../src/thread-memory-seal.ts'
 import { assertNoLeak, TOKEN_LIKE, writtenFile } from './test-helpers/credentials.ts'
 import { makeQueue, queuePath, readQueue } from './test-helpers/delivery-queue.ts'
-import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 import { SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
 import {
   buildUpgradeCases, fillHome, guardScratchDir, listFixtureFiles, materializeUpgradeCase, OLD_PERSONA_KEYS, OLD_TOP_LEVEL_KEYS, oldConfigBytes018, oldReloadFingerprint018, readUpgradeManifest, runUpgradeCaseCommand,
@@ -34,6 +33,12 @@ const REPO_ROOT = resolve(import.meta.dir, '..')
 const GENERATOR = join(REPO_ROOT, 'tests', 'test-helpers', 'shared-channel-upgrade.ts')
 const ENTRY = join(REPO_ROOT, 'tests', 'integration', 'fixtures', 'shared-channel-upgrade-case.ts')
 const IMAGE_MARKER = '/etc/cscb-ci-image'
+const UPGRADE_CHILD_TIMEOUT_MS = 10_000
+// The write case runs two children in sequence; allow both full child timeouts
+// plus 5 s for termination/output and scratch cleanup on a loaded host.
+const UPGRADE_WRITE_CASE_TIMEOUT_MS = 2 * UPGRADE_CHILD_TIMEOUT_MS + 5_000
+// Single-child cases allow the same termination/output and cleanup margin.
+const UPGRADE_ENTRY_CASE_TIMEOUT_MS = UPGRADE_CHILD_TIMEOUT_MS + 5_000
 const AC_U_ROWS = ['AC-U01', 'AC-U02', 'AC-U03', 'AC-U04', 'AC-U05', 'AC-U06', 'AC-U07', 'AC-U08', 'AC-U09', 'AC-U11', 'AC-U12', 'AC-U13']
 const manifest = readUpgradeManifest()
 
@@ -333,15 +338,29 @@ describe('the committed tree is what the generator writes', () => {
     const home = join(scratch, 'home'), otherTmp = join(scratch, 'other-tmp')
     mkdirSync(home)
     mkdirSync(otherTmp)
-    const probe = join(scratch, 'probe.ts')
-    writeFileSync(probe, `await import(${JSON.stringify(stubbed)}).then(m => m.writeUpgradeFixtures(m.UPGRADE_FIXTURE_DIR + '-sibling')).then(() => console.log('wrote'), e => console.log(e.message))`)
-    const guarded = spawnSync(process.execPath, [probe], { encoding: 'utf8', timeout: 10_000, env: hostSafeChildEnv(home, { tools: [], extras: { TMPDIR: otherTmp } }) })
-    expect(guarded.stdout).toContain('refused: not under the OS temp dir or SCENARIO_ROOT')
-    const child = spawnSync(process.execPath, [stubbed, 'write'], { encoding: 'utf8', timeout: 10_000, env: hostSafeChildEnv(home, { tools: [], extras: { TMPDIR: otherTmp } }) })
+    const guarded = runInFakeHome({
+      modulePath: stubbed, input: null,
+      call: `await mod.writeUpgradeFixtures(mod.UPGRADE_FIXTURE_DIR + '-sibling').then(() => console.log('wrote'), e => console.log(e.message))`,
+      home, tools: [], env: { TMPDIR: otherTmp }, timeoutMs: UPGRADE_CHILD_TIMEOUT_MS,
+    })
+    expect(guarded.observedHomedir).toBe(home)
+    expect(guarded.status).toBe(0)
+    expect(guarded.stderr).toBe('')
+    expect(guarded.payloadStdout).toContain('refused: not under the OS temp dir or SCENARIO_ROOT')
+    // The launch-time home is refused before a preload or the write entry runs.
+    expect(() => runInFakeHome({ scriptPath: stubbed, args: ['write'], home: homedir(), tools: [] })).toThrow(/^runInFakeHome: .*not the real home/)
+    expect(existsSync(committed)).toBe(false)
+    const child = runInFakeHome({
+      scriptPath: stubbed, args: ['write'],
+      home, tools: [], env: { TMPDIR: otherTmp }, timeoutMs: UPGRADE_CHILD_TIMEOUT_MS,
+    })
+    expect(child.observedHomedir).toBe(home)
     expect(child.stderr).toBe('')
     expect(child.status).toBe(0)
     expect(listFixtureFiles(committed)).toEqual(['manifest.json', 'stub/file.json'])
-  })
+    expect(readFileSync(join(committed, 'stub/file.json'), 'utf8')).toBe('{}\n')
+    expect(readFileSync(join(committed, 'manifest.json'), 'utf8')).toBe('{}\n')
+  }, UPGRADE_WRITE_CASE_TIMEOUT_MS)
 })
 
 describe('the manifest describes every case and file', () => {
@@ -829,40 +848,46 @@ describe('loading in the image', () => {
     const scenario = join(scratch, 'scenario'), home = join(scenario, 'home'), otherTmp = join(scratch, 'other-tmp')
     mkdirSync(home, { recursive: true })
     mkdirSync(otherTmp)
-    const probe = join(scratch, 'probe.ts')
-    writeFileSync(probe, [
-      `const m = await import(${JSON.stringify(join(tree, 'tests/test-helpers/shared-channel-upgrade.ts'))})`,
-      `const root = process.env.SCENARIO_ROOT`,
-      `const a = m.runUpgradeCaseCommand(['materialize', '--case', ${JSON.stringify(first.name)}, '--root', root, '--state-dir', root + '/state-1', '--home', process.env.HOME, ...${JSON.stringify([...settingArgs(SCENARIO_SETTINGS), '--persona-prefix', PREFIX])}], () => {})`,
-      `const b = m.runUpgradeCaseCommand(['reference-0.18.0', '--out', root + '/ref', '--mode', 'declarative', '--name', 'alpha', '--credentials-file', '/c', '--working-directory', '/w'], () => {})`,
-      `console.log(JSON.stringify([a, b]))`,
-    ].join('\n'))
-    const child = spawnSync(process.execPath, [probe], { encoding: 'utf8', timeout: 10_000, env: hostSafeChildEnv(home, { tools: [], extras: { TMPDIR: otherTmp, SCENARIO_ROOT: scenario } }) })
+    const child = runInFakeHome({
+      modulePath: join(tree, 'tests/test-helpers/shared-channel-upgrade.ts'),
+      input: { caseName: first.name, settings: [...settingArgs(SCENARIO_SETTINGS), '--persona-prefix', PREFIX] },
+      call: `
+        const root = process.env.SCENARIO_ROOT;
+        const a = mod.runUpgradeCaseCommand(['materialize', '--case', input.caseName, '--root', root, '--state-dir', root + '/state-1', '--home', process.env.HOME, ...input.settings], () => {});
+        const b = mod.runUpgradeCaseCommand(['reference-0.18.0', '--out', root + '/ref', '--mode', 'declarative', '--name', 'alpha', '--credentials-file', '/c', '--working-directory', '/w'], () => {});
+        console.log(JSON.stringify([a, b]));
+      `,
+      home, tools: [], env: { TMPDIR: otherTmp, SCENARIO_ROOT: scenario }, timeoutMs: UPGRADE_CHILD_TIMEOUT_MS,
+    })
+    expect(child.observedHomedir).toBe(home)
+    expect(child.status).toBe(0)
     expect(child.stderr).toBe('')
-    expect(child.stdout.trim()).toBe('[0,0]')
+    expect(child.payloadStdout.trim()).toBe('[0,0]')
     expect(existsSync(join(tree, 'src'))).toBe(false)
     expect(existsSync(join(scenario, 'state-1', 'config.json'))).toBe(true)
     expect(readFileSync(join(scenario, 'state-1', 'channel-delivery.json'), 'utf8')).toContain(`"${home}/personas/${PREFIX}alpha/credentials.json"`)
     expect(JSON.parse(readFileSync(join(scenario, 'state-1', 'config.json'), 'utf8'))).toMatchObject(SCENARIO_SETTINGS)
     expect(existsSync(join(scenario, 'ref', 'config.json.last-applied'))).toBe(true)
-  })
+  }, UPGRADE_ENTRY_CASE_TIMEOUT_MS)
 
   test('the entry refuses outside the image before reading an argument; inside, it runs', () => {
     const home = join(scratch, 'home')
     mkdirSync(home)
     const root = join(scratch, 'root')
     mkdirSync(root)
-    const child = spawnSync(process.execPath, [ENTRY, 'materialize', '--case', first.name, '--root', root, '--state-dir', join(root, 'state'), '--home', join(root, 'home')], {
-      encoding: 'utf8', timeout: 10_000, env: hostSafeChildEnv(home, { tools: [], extras: { TMPDIR: tmpdir() } }),
+    const child = runInFakeHome({
+      scriptPath: ENTRY, args: ['materialize', '--case', first.name, '--root', root, '--state-dir', join(root, 'state'), '--home', join(root, 'home')],
+      home, tools: [], env: { TMPDIR: tmpdir() }, timeoutMs: UPGRADE_CHILD_TIMEOUT_MS,
     })
+    expect(child.observedHomedir).toBe(home)
     if (existsSync(IMAGE_MARKER)) {
       expect(child.status).toBe(0)
       expect(existsSync(join(root, 'state', 'config.json'))).toBe(true)
     } else {
       expect(child.status).toBe(2)
-      expect(child.stdout).toBe('')
+      expect(child.payloadStdout).toBe('')
       expect(child.stderr).toBe(`FAIL: shared-channel-upgrade-case: refused: ${IMAGE_MARKER} is absent; this fixture runs only in a cscb-ci image (/ci)\n`)
       expect(readdirSync(root)).toEqual([])
     }
-  })
+  }, UPGRADE_ENTRY_CASE_TIMEOUT_MS)
 })

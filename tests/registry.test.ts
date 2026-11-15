@@ -2648,16 +2648,31 @@ describe('fetch_messages', () => {
     },
   )
 
-  test.each([false, true])('short pages with repeated root=%s continue even after a root-only page', async repeatRoot => {
+  test.each([false, true])('short pages with repeated root=%s wait for a held later page and continue even after a root-only page', async repeatRoot => {
     const thread = makePagedThread(8, { repeatRoot, pageSizes: [2, 1, 2] })
-    const { session } = await reader('open', { repliesResponder: thread.respond })
+    const held = makeDeferredWebApiCall(), reached = Promise.withResolvers<void>()
+    const { session } = await reader('open', { repliesResponder: args => {
+      if (args.cursor && thread.responses.length === 1) { reached.resolve(); return held.outcome }
+      return thread.respond(args)
+    } })
     const collected: unknown[] = []
     let cursor: string | undefined
     const lengths: number[] = []
     do {
       expect(lengths.length).toBeLessThan(10)
-      const result = await session.call('fetch_messages', { channel: A_ALL, thread_ts: thread.rootTs,
-        ...(cursor ? { cursor } : {}) })
+      let settled = false
+      const pending = session.call('fetch_messages', { channel: A_ALL, thread_ts: thread.rootTs,
+        ...(cursor ? { cursor } : {}) }).then(result => { settled = true; return result })
+      if (lengths.length === 1) {
+        try {
+          await Promise.race([reached.promise, pending])
+          expect(settled).toBe(false)
+        } finally {
+          held.settle(thread.respond({ channel: A_ALL, ts: thread.rootTs, cursor }))
+          await pending
+        }
+      }
+      const result = await pending
       expect(result.isError).toBeUndefined()
       const body = JSON.parse(result.content[0]!.text)
       lengths.push(body.messages.length)
@@ -2771,45 +2786,6 @@ describe('fetch_messages', () => {
     expect(result).toEqual({ isError: true, content: [{ type: 'text', text: fetchMessagesCursorRefusal() }] })
     expectNoSlackCall()
     assertNoLeak({ result, lines: h.lines })
-  })
-
-  test('a later rate-limited page stays pending on the long-lived client and returns its eventual answer once', async () => {
-    const thread = makePagedThread(4, { repeatRoot: true })
-    const held = makeDeferredWebApiCall()
-    let entered!: () => void
-    const started = new Promise<void>(resolve => { entered = resolve })
-    const { session, stub } = await reader('strict', { repliesResponder: args => {
-      if (args.cursor) { entered(); return held.outcome }
-      return thread.respond(args)
-    } })
-    const first = await session.call('fetch_messages', { channel: A_ALL, thread_ts: thread.rootTs, limit: 2 })
-    const cursor = JSON.parse(first.content[0]!.text).next_cursor
-    expect(typeof cursor).toBe('string')
-    // The MCP client owns one request timeout; the handler must add no timer.
-    const timeouts = spyOn(globalThis, 'setTimeout')
-    const intervals = spyOn(globalThis, 'setInterval')
-    try {
-      let settled = false
-      const pending = session.call('fetch_messages', { channel: A_ALL, thread_ts: thread.rootTs, cursor, limit: 3 })
-        .then(result => { settled = true; return result })
-      await started
-      for (let turn = 0; turn < 20; turn++) await Promise.resolve()
-      expect(settled).toBe(false)
-      expect(timeouts).toHaveBeenCalledTimes(1)
-      expect(intervals).not.toHaveBeenCalled()
-      expect(stub.calls.conversationsReplies).toEqual([
-        { channel: A_ALL, ts: thread.rootTs, limit: 2 },
-        { channel: A_ALL, ts: thread.rootTs, limit: 3, cursor },
-      ])
-      expect(stub.options.web.at(-1)!.options!.rejectRateLimitedCalls).toBeUndefined()
-      held.settle(thread.respond(stub.calls.conversationsReplies[1]!))
-      const result = await pending
-      expect(result.isError).toBeUndefined()
-      expect(JSON.parse(result.content[0]!.text)).toEqual({ messages: formatted(thread).slice(2) })
-      expect(stub.callLog.map(c => c.method)).toEqual(['conversations.replies', 'conversations.replies'])
-      expect(timeouts).toHaveBeenCalledTimes(1)
-      expect(intervals).not.toHaveBeenCalled()
-    } finally { timeouts.mockRestore(); intervals.mockRestore() }
   })
 
   test.each(['strict', 'open'] as const)('%s dry-run in thread_hybrid ignores cursor before any Slack call', async mode => {

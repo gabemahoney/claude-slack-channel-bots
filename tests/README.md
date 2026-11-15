@@ -32,6 +32,21 @@ Those are the canonical queue/shared-authority input contracts; the inventory
 also describes exact byte/shutdown assertions and isolated jq projections.
 See [Bounded costs](../docs/testing-guide.md#bounded-costs) for the own-root skew pin.
 
+Unit checks assert values, bytes, mutation isolation and order; the existing
+[Thread Memory performance runs](../docs/testing-guide.md#thread-memory-performance-runs)
+measure end-to-end costs and shard memory at scale. The full 0/10,000/100,000-join
+unit coverage uses named seed/case hang backstops with measured host headroom,
+as [Framework](../docs/testing-guide.md#framework) explains; timeouts are no product budgets.
+
+`runInFakeHome` takes either absolute `modulePath` with `call`/JSON `input`, or
+absolute `scriptPath` with optional `args` preserving entry/argv semantics;
+both share `home`, optional `stateDir`, explicit `env`, `timeoutMs` and narrow `tools`.
+It refuses real/launch homes, filters the child environment and bounds abnormal
+exits; verify the same child's `observedHomedir` before status/output, and use
+`payloadStdout` to omit the control line retained in raw `stdout`.
+The [detailed helper contract](../docs/testing-guide.md#credentials-fixtures-and-leak-checks)
+covers defaults, tool isolation and caller scratch cleanup.
+
 The `env … HOME=$S` prefix covers one command only. Give every `bun test`
 its own prefix and scratch directory; a second `bun test` chained after the
 first (`… bun test a; bun test b`) starts with your own HOME, and the guard
@@ -4106,7 +4121,7 @@ Successful completion deliberately retains exactly 1,000 outstanding items
 through server shutdown until scratch cleanup. It asserts no typing,
 connected MCP session, receipt, delivered diagnostic or receipt reaction;
 the silent bot makes no model calls. This proves Slack acknowledgement
-latency and retained intake under load. Queue-store accept p99 and
+latency and retained intake under load. Test-44's durable-store p99 on actual storage and
 real-agent transcript latency have separate proofs.
 
 Record the measured script duration from the container `/ci` run; no

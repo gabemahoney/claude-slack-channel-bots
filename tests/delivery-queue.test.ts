@@ -18,7 +18,6 @@ import { makeThreadMemoryHarness, THREAD_CHANNELS, THREAD_ROOTS, THREAD_STAMP, T
 import { recoverQueuedJoins } from '../src/thread-join-recovery.ts'
 import { createMemoryHoldResolver } from '../src/memory-holds.ts'
 import { createDeliveryQueue as createMainDeliveryQueue, isQueueRecord as isMainQueueRecord } from './fixtures/main-delivery-queue/delivery-queue.ts'
-import { spyOnCopies } from './test-helpers/copies.ts'
 
 let dir: string
 let queues: DeliveryQueue[]
@@ -945,12 +944,7 @@ describe('b.2is repair composed with the durable journal and thread facts', () =
   })
 })
 
-test('1000 real-file accepts satisfy p99 <50ms without network', async () => {
-  const q = await open(); const timings: number[] = []
-  for (let i = 0; i < 1000; i++) { const at = performance.now(); expect((await q.accept('alpha', injectedInput())).status).toBe('accepted'); timings.push(performance.now() - at) }
-  timings.sort((a, b) => a - b); const p99 = timings[Math.ceil(timings.length * .99) - 1]!
-  console.info(`queue accepts=1000 p99_ms=${p99.toFixed(3)}`); expect(p99).toBeLessThan(50); expect(q.openCount('alpha')).toBe(1000)
-})
+// Integration test 44 measures durable store p99 on its required real-storage workloads.
 
 test.each(['fixed', 'delivered'] as const)('damaged %s is quarantined and cannot falsely fix or deliver the accepted item', async kind => {
   const damaged = JSON.stringify({ v: 1, kind, seq: 1, ...(kind === 'fixed' ? { parts: [] } : { part: 1, at: 1000 }) }) + '\n'
@@ -982,10 +976,9 @@ test('simultaneous redeliveries share one durable Slack acceptance; per-persona 
   expect((await q.accept('beta', slackInput())).status).toBe('accepted'); expect(q.items('beta')).toHaveLength(1)
 })
 
-test.each([16, 64])('%i concurrent accepts and preparations clone only two item snapshots per acceptance', async count => {
+test.each([16, 64])('%i concurrent accepts retain every prepared item in acceptance order', async count => {
   const q = await open()
   const preparation = createDeliveryPreparation({ queue: q, resolveUserName: async () => 'human', clientFor: () => undefined, clock: createFakeClock() })
-  const copies = spyOnCopies()
   try {
     await Promise.all(Array.from({ length: count }, (_, i) => {
       const ts = `1700000000.${String(i + 1).padStart(6, '0')}`
@@ -995,22 +988,10 @@ test.each([16, 64])('%i concurrent accepts and preparations clone only two item 
         await preparation.prepare('alpha', result.item)
       })
     }))
-    const snapshots = copies.values.filter(value => value && typeof value === 'object' && 'accepted' in value && 'records' in value).length
-    console.info(`queue preparation accepts=${count} item_snapshots=${snapshots} expected=${2 * count}`)
-    // One detached acceptance result and one fresh preparation snapshot. A
-    // whole-queue refresh instead grows quadratically as this burst queues.
-    expect(snapshots).toBe(2 * count)
-    // Item snapshots are copied field by field, not through a structured
-    // clone's serialisation of every string (t3.yiv.sf.ws.ih). Only what
-    // callers hand in takes structuredClone: each accepted input and each
-    // fixation record the preparation appends (review-r2 R1).
-    expect(copies.serialised).toBe(2 * count)
-  } finally {
-    copies.restore()
-    await preparation.stop()
-  }
+  } finally { await preparation.stop() }
   expect(q.openCount('alpha')).toBe(count)
-  expect(q.items('alpha').every(item => item.fixed !== undefined)).toBe(true)
+  expect(q.items('alpha').map(item => [item.accepted.seq, item.accepted.ts, item.fixed !== undefined])).toEqual(
+    Array.from({ length: count }, (_, i) => [i + 1, `1700000000.${String(i + 1).padStart(6, '0')}`, true]))
 })
 
 test.each(['item', 'items'] as const)('%s snapshots are fresh, deeply frozen and absent after compaction removes their item', async reader => {
@@ -1051,7 +1032,7 @@ test.each(['item', 'items'] as const)('%s snapshots are fresh, deeply frozen and
   expect(q.item('beta', 1)!.accepted.text).toBe('other persona')
 })
 
-test.each([16, 64])('%i queued items and holds reuse snapshots between changes', async count => {
+test.each([16, 64])('%i queued items and holds retain old snapshots while appends and resolutions update current reads', async count => {
   const inputs = Array.from({ length: count }, (_, i) => {
     const ts = `1700000000.${String(i + 1).padStart(6, '0')}`
     return heldSlackInput(unknownRootPostHold(1000), { ts, key: { chat_id: THREAD_CHANNELS.primary, ts } })
@@ -1059,35 +1040,29 @@ test.each([16, 64])('%i queued items and holds reuse snapshots between changes',
   seedQueue(dir, inputs.map((input, i) => acceptedRecord(i + 1, input, 1000)))
   const q = await open()
   const initial = q.items('alpha'), holds = q.unresolvedHolds('alpha')
-  const copies = spyOnCopies()
-  try {
-    for (let i = 0; i < 4; i++) {
-      expect(q.items('alpha')).toEqual(initial)
-      expect(q.unresolvedHolds('alpha')).toEqual(holds)
-      expect(q.item('alpha', count)).toEqual(initial.at(-1))
-    }
-    expect(copies.values).toHaveLength(0)
-    // An append and a resolution invalidate only their item/hold versions.
-    await q.append('alpha', noticedRecord(count))
-    await q.resolveHolds('alpha', [{ seq: 1, outcome: 'parked', at: 1100 }])
-    copies.clear()
-    const changed = q.items('alpha'), changedHolds = q.unresolvedHolds('alpha')
-    expect(changed[0]!.hold).toMatchObject({ kind: 'memory', state: 'unresolved' })
-    expect(changed.at(-1)!.records.at(-1)).toEqual(noticedRecord(count))
-    expect(changedHolds[0]).toMatchObject({ on: 'memory', seq: 1 })
-    expect(changed.slice(1, -1)).toEqual(initial.slice(1, -1))
-    // Two changed items and their two replaced hold entries, independent of count.
-    expect(copies.values).toHaveLength(4)
-    copies.clear()
-    expect(q.item('alpha', 1)).toEqual(changed[0])
-    expect(q.items('alpha')).toEqual(changed)
-    expect(q.unresolvedHolds('alpha')).toEqual(changedHolds)
-    expect(copies.values).toHaveLength(0)
-  } finally { copies.restore() }
+  for (let i = 0; i < 4; i++) {
+    expect(q.items('alpha')).toEqual(initial)
+    expect(q.unresolvedHolds('alpha')).toEqual(holds)
+    expect(q.item('alpha', count)).toEqual(initial.at(-1))
+  }
+  // The old snapshots remain unchanged after an append and a hold resolution.
+  await q.append('alpha', noticedRecord(count))
+  await q.resolveHolds('alpha', [{ seq: 1, outcome: 'parked', at: 1100 }])
+  const changed = q.items('alpha'), changedHolds = q.unresolvedHolds('alpha')
+  expect(changed[0]!.hold).toMatchObject({ kind: 'memory', state: 'unresolved' })
+  expect(changed.at(-1)!.records.at(-1)).toEqual(noticedRecord(count))
+  expect(changedHolds[0]).toMatchObject({ on: 'memory', seq: 1 })
+  expect(changed.slice(1, -1)).toEqual(initial.slice(1, -1))
+  expect(q.item('alpha', 1)).toEqual(changed[0])
+  expect(q.items('alpha')).toEqual(changed)
+  expect(q.unresolvedHolds('alpha')).toEqual(changedHolds)
+
+  expect(initial.at(-1)!.records.some(record => record.kind === 'noticed')).toBe(false)
+  expect(initial[0]!.hold).toMatchObject({ kind: 'post', state: 'unresolved' })
+  expect(holds[0]).toMatchObject({ on: 'post', seq: 1 })
 })
 
-// t3.yiv.sf.ws.ih: the queue copied its inputs, results, snapshots and
-// reports through structuredClone, which serialises every string.
+// Preserve results and durable replay across supported internal copying strategies.
 test('a queue history returns, stores, reports and replays what structuredClone copies gave', async () => {
   async function history(label: string, structured: boolean) {
     const stateDir = join(dir, label), clock = createFakeClock({ start: THREAD_TIME }), events: unknown[] = []
@@ -1150,24 +1125,35 @@ test('accept and acceptDecided store and return what one structuredClone of an i
   expect(now).toEqual(before)
 })
 
-// review-r2 R1: cloneJournalData copies only records the queue built or
-// already copied; every value a caller hands in keeps structuredClone.
-test('every queue entry point copies what its caller hands in with structuredClone itself', async () => {
+test('queue entry points retain caller values despite mutation after submission', async () => {
   const q = await open()
-  const serialising = spyOn(globalThis, 'structuredClone'), copying = spyOn(journal, 'cloneJournalData')
-  const handed: Array<[string, unknown]> = []
-  const hand = <T>(name: string, value: T): T => { handed.push([name, value]); return value }
-  try {
-    await q.accept('alpha', hand('accept input', slackInput()))
-    const ts = '1700000000.000002'
-    await q.acceptDecided('alpha', hand('acceptDecided key', { chat_id: 'C0TEST001', ts }), () => ({ store: hand('acceptDecided store', slackInput({ ts, key: { chat_id: 'C0TEST001', ts } })) }))
-    await q.append('alpha', hand('append record', fixedRecord(1, ['fixed'])))
-    await q.recordReplyCall('alpha', hand('recordReplyCall targets', q.replyCallTargets('alpha')))
-    await q.resolveHolds('alpha', hand('resolveHolds resolutions', [{ seq: 1, outcome: 'parked' as const, at: 1000 }]))
-    for (const [name, value] of handed) {
-      expect([name, serialising.mock.calls.filter(([arg]) => arg === value).length, copying.mock.calls.filter(([arg]) => arg === value).length]).toEqual([name, 1, 0])
-    }
-  } finally { serialising.mockRestore(); copying.mockRestore() }
+  const input = slackInput({ files: [{ name: 'original.txt' }] })
+  const accepting = q.accept('alpha', input)
+  input.text = 'changed'; input.files![0]!.name = 'changed.txt'
+  expect((await accepting).status).toBe('accepted')
+  expect(q.item('alpha', 1)!.accepted).toMatchObject({ text: slackInput().text, files: [{ name: 'original.txt' }] })
+
+  const ts = '1700000000.000002', key = { chat_id: THREAD_CHANNELS.primary, ts }
+  const deciding = q.acceptDecided('alpha', key, () => ({ store: heldSlackInput(unknownRootPostHold(1000), { ts, key: { chat_id: THREAD_CHANNELS.primary, ts } }) }))
+  key.ts = THREAD_ROOTS.third
+  expect((await deciding).status).toBe('accepted')
+  expect(q.lookupSlackKey('alpha', { chat_id: THREAD_CHANNELS.primary, ts })?.status).toBe('duplicate')
+
+  const fixed = fixedRecord(1, ['fixed']), appending = q.append('alpha', fixed)
+  fixed.parts[0] = 'changed'
+  await appending
+  expect(q.item('alpha', 1)!.fixed!.parts).toEqual(['fixed'])
+
+  const targets = [{ seq: 1 }], replying = q.recordReplyCall('alpha', targets)
+  targets[0]!.seq = 2; targets.length = 0
+  await replying
+  expect(readQueue(dir).filter(record => record.kind === 'reply-reminder')).toEqual([expect.objectContaining({ seq: 1, state: 'replied' })])
+
+  const resolutions = [{ seq: 2, outcome: 'parked' as const, at: 1100 }]
+  const resolving = q.resolveHolds('alpha', resolutions)
+  resolutions[0]!.seq = 1; resolutions.length = 0
+  expect(await resolving).toEqual([{ seq: 2, outcome: 'parked', at: 1100 }])
+  expect(q.item('alpha', 2)!.hold).toMatchObject({ kind: 'memory', state: 'unresolved' })
 })
 
 // review-r2 R1: an object with internal slots behind a plain object's

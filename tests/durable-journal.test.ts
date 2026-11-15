@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -690,15 +690,6 @@ describe('whole-file rewrite', () => {
 })
 
 describe('disk waits run on the I/O pool; only read-time quarantine blocks', () => {
-  /** Event-loop turns (immediates) that run while `work` is outstanding. */
-  async function turnsDuring(work: () => Promise<void> | void): Promise<number> {
-    let turns = 0, done = false
-    const tick = () => { if (done) return; turns++; setImmediate(tick) }
-    setImmediate(tick)
-    try { await work() } finally { done = true }
-    return turns
-  }
-
   test('every promise operation waits only through callback fsync and rename; the blocking append runs the same steps through the Sync forms', async () => {
     const r = recordingFs(), j = journal(r.fs), rollback: AppendRollback = {}
     seed('old\n')
@@ -763,37 +754,77 @@ describe('disk waits run on the I/O pool; only read-time quarantine blocks', () 
     expect(r.paths.size).toBe(0)
   })
 
-  test('with the default node:fs backend, the event loop runs while append, rollback repair, rewrite and a new directory wait for the disk; the blocking append gives it no turn', async () => {
+  test('the default node:fs backend preserves append, rewrite and rollback bytes; a blocking append is complete on return', async () => {
     const j = createDurableJournal({ dir, parentDir: root, directoryMode: 0o700, fileMode: 0o600 }), rollback: AppendRollback = {}
-    expect(await turnsDuring(() => j.durableAppend(path, Buffer.from('first\n')))).toBeGreaterThan(0)
-    expect(await turnsDuring(() => j.durableAppend(path, Buffer.from('second\n'), rollback))).toBeGreaterThan(0)
-    expect(await turnsDuring(() => j.rewrite(path, Buffer.from('rewritten\n')))).toBeGreaterThan(0)
-    fs.appendFileSync(path, 'unaccepted\n'); rollback.pendingRollback = 'rewritten\n'.length
-    expect(await turnsDuring(() => j.reconcileRollback(path, rollback))).toBeGreaterThan(0)
+    await j.durableAppend(path, Buffer.from('first\n'))
+    await j.durableAppend(path, Buffer.from('second\n'), rollback)
+    expect(read()).toEqual(Buffer.from('first\nsecond\n'))
+    await j.rewrite(path, Buffer.from('rewritten\n'))
     expect(read()).toEqual(Buffer.from('rewritten\n'))
-    expect(await turnsDuring(() => j.durableAppendSync(path, Buffer.from('quarantined\n')))).toBe(0)
+    fs.appendFileSync(path, 'unaccepted\n'); rollback.pendingRollback = 'rewritten\n'.length
+    await j.reconcileRollback(path, rollback)
+    expect(read()).toEqual(Buffer.from('rewritten\n'))
+    expect(rollback.pendingRollback).toBeUndefined()
+    expect(j.durableAppendSync(path, Buffer.from('quarantined\n'))).toBeUndefined()
     expect(read()).toEqual(Buffer.from('rewritten\nquarantined\n'))
   })
 
-  test('while a file sync is held, timers fire and another journal path appends; that path\'s later directory sync vouches for the held append, which resolves only after its file sync, with no directory sync of its own', async () => {
-    const r = recordingFs(), j = journal(r.fs), gate = heldStep(), other = join(dir, 'beta.jsonl')
+  test.each(['rollback repair', 'rewrite rename', 'new directory sync'] as const)('%s waits for durability while an independent path completes', async boundary => {
+    const r = recordingFs(), j = journal(r.fs), gate = heldStep(), reached = Promise.withResolvers<void>()
+    const other = join(dir, 'beta.jsonl'), rollback: AppendRollback = {}, order: string[] = []
+    if (boundary !== 'new directory sync') await j.durableAppend(path, Buffer.from('old\n'))
+    if (boundary === 'rollback repair') {
+      fs.appendFileSync(path, 'unaccepted\n'); rollback.pendingRollback = 'old\n'.length
+    }
+    let held = false
+    r.control.hold = op => {
+      const matches = boundary === 'rollback repair' ? op.step === 'sync' && op.path === path :
+        boundary === 'rewrite rename' ? op.step === 'rename' : op.step === 'sync' && op.path === root
+      if (held || !matches || op.form !== 'callback') return
+      held = true; order.push('held'); reached.resolve(); return gate.promise
+    }
+    const pending = (boundary === 'rollback repair' ? j.reconcileRollback(path, rollback) :
+      boundary === 'rewrite rename' ? j.rewrite(path, Buffer.from('new\n')) : j.ensureDir())
+      .then(() => { order.push('complete') })
+    try {
+      await Promise.race([reached.promise, pending])
+      expect(order).toEqual(['held'])
+      if (boundary !== 'new directory sync') expect(read()).toEqual(Buffer.from('old\n'))
+      await j.durableAppend(other, Buffer.from('beta\n')); order.push('independent')
+      expect(fs.readFileSync(other)).toEqual(Buffer.from('beta\n'))
+      expect(order).toEqual(['held', 'independent'])
+      gate.release(); order.push('released'); await pending
+      expect(order).toEqual(['held', 'independent', 'released', 'complete'])
+      if (boundary === 'new directory sync') expect(fs.readdirSync(dir)).toEqual(['beta.jsonl'])
+      else expect(read()).toEqual(Buffer.from(boundary === 'rollback repair' ? 'old\n' : 'new\n'))
+      expect(rollback.pendingRollback).toBeUndefined()
+    } finally { gate.release(); await pending }
+    expect(r.paths.size).toBe(0)
+  })
+
+  test('while a file sync is held, another journal path appends; that path\'s later directory sync vouches for the held append, which resolves only after its file sync, with no directory sync of its own', async () => {
+    const r = recordingFs(), j = journal(r.fs), gate = heldStep(), reached = Promise.withResolvers<void>(), other = join(dir, 'beta.jsonl')
     await j.ensureDir()
-    r.control.hold = op => op.step === 'sync' && op.path === path ? gate.promise : undefined
-    let settled = false
-    const held = j.durableAppend(path, Buffer.from('held\n')).then(() => { settled = true })
-    const fired = await new Promise<boolean>(resolve => setTimeout(() => resolve(true), 0))
-    expect(fired).toBe(true)
-    expect(r.io.held()).toBe(1)
-    await j.durableAppend(other, Buffer.from('beta\n'))
-    expect(fs.readFileSync(other)).toEqual(Buffer.from('beta\n'))
-    expect(settled).toBe(false)
-    expect(r.ops.filter(op => op.step === 'sync' && op.path === dir)).toHaveLength(1)
-    r.ops.length = 0
-    gate.release(); await held
-    expect(settled).toBe(true)
-    // The held step was recorded when it began; the other path's directory sync began after this file's creation.
-    expect(syncs(r.ops)).toEqual([])
-    expect(read()).toEqual(Buffer.from('held\n'))
+    r.control.hold = op => {
+      if (op.step === 'sync' && op.path === path) { reached.resolve(); return gate.promise }
+    }
+    const order: string[] = []
+    const held = j.durableAppend(path, Buffer.from('held\n')).then(() => { order.push('complete') })
+    try {
+      await Promise.race([reached.promise, held])
+      expect(r.io.held()).toBe(1)
+      await j.durableAppend(other, Buffer.from('beta\n')); order.push('independent')
+      expect(fs.readFileSync(other)).toEqual(Buffer.from('beta\n'))
+      expect(order).toEqual(['independent'])
+      expect(r.ops.filter(op => op.step === 'sync' && op.path === dir)).toHaveLength(1)
+      r.ops.length = 0
+      gate.release(); order.push('released'); await held
+      expect(order).toEqual(['independent', 'released', 'complete'])
+      // The other path's directory sync began after this file's creation.
+      expect(syncs(r.ops)).toEqual([])
+      expect(read()).toEqual(Buffer.from('held\n'))
+    } finally { gate.release(); await held }
+    expect(r.paths.size).toBe(0)
   })
 
   test('a held file sync that fails rolls back the append before it rejects', async () => {
@@ -948,10 +979,7 @@ function copyOutcome(copy: () => unknown): { value?: unknown; error?: string } {
   try { return { value: copy() } } catch (error) { return { error: `${(error as Error).name}: ${(error as Error).message}` } }
 }
 
-// t3.yiv.sf.ws.ih: queue and shared-state copies went through structuredClone,
-// whose serialisation round trip copies every string of every record. The
-// copier's contract: data CSCB built, or values structuredClone already
-// copied; values callers hand in keep structuredClone (delivery-queue tests).
+// Journal copies preserve native clone values, errors, detachment and side effects.
 describe('journal data copies', () => {
   const shared = { incarnation: 'life', threadHybridSince: 'since' }
   const fixed = { v: 1, kind: 'fixed', seq: 1, parts: ['a', 'b'] }
@@ -1021,21 +1049,6 @@ describe('journal data copies', () => {
     expect([copy.file.type, await copy.file.text()]).toEqual([blob.file.type, 'payload'])
   })
 
-  test('journal data is copied without structuredClone; any other value goes through it once, unchanged', () => {
-    const copied = nativelyCopied() as Record<string, unknown>
-    const serialising = spyOn(globalThis, 'structuredClone')
-    try {
-      for (const value of [...Object.values(journalData()), copied['record'], copied['fromNullPrototype']]) cloneJournalData(value)
-      expect(serialising).not.toHaveBeenCalled()
-      for (const [name, value] of [...Object.entries(otherData()), ['builtIns', copied['builtIns']], ['blob', copied['blob']]] as Array<[string, unknown]>) {
-        serialising.mockClear()
-        copyOutcome(() => cloneJournalData(value))
-        expect(`${name}: ${serialising.mock.calls.length}`).toBe(`${name}: 1`)
-        expect(serialising.mock.calls[0]![0]).toBe(value)
-      }
-    } finally { serialising.mockRestore() }
-  })
-
   /** A proxy handler logging every trap a copy could run. */
   function traps(log: string[]): ProxyHandler<object> {
     return {
@@ -1072,18 +1085,9 @@ describe('journal data copies', () => {
     expect(actualLog).toEqual(expectedLog)
   })
 
-  test('frozen plain data is inspected once; frozen data holding code or an unfrozen part is read as given each time', () => {
+  test('frozen plain data keeps its values; frozen data holding code or an unfrozen part is read as given each time', () => {
     const data = Object.freeze({ a: Object.freeze([1, Object.freeze({ b: 'x' })]), c: Object.freeze({}), d: Object.freeze({ e: 1n }) })
-    const descriptors = spyOn(Object, 'getOwnPropertyDescriptor')
-    let inspected: number[]
-    let copies: unknown[]
-    try {
-      copies = [cloneJournalData(data)]; inspected = [descriptors.mock.calls.length]
-      descriptors.mockClear()
-      copies.push(cloneJournalData(data), cloneJournalData({ again: data })); inspected.push(descriptors.mock.calls.length)
-    } finally { descriptors.mockRestore() }
-    // Each own property once (a, c, d, both indexes, b, e); the record wrapping `data` again.
-    expect(inspected).toEqual([7, 1])
+    const copies = [cloneJournalData(data), cloneJournalData(data), cloneJournalData({ again: data })]
     expect(copies.map(copy => sameCopy(structuredClone(data), (copy as { again?: unknown }).again ?? copy) ?? 'same')).toEqual(['same', 'same', 'same'])
     // An unfrozen part can change between copies.
     const inner = { b: 1 }, partly = Object.freeze({ inner })

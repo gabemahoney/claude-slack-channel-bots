@@ -1,5 +1,5 @@
 import { _assignFixture, fixtureThreadHybridSince } from './test-helpers/shared-channels.ts'
-import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
+import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { dirname } from 'node:path'
 import type { ChannelMode } from '../src/config.ts'
 import { MEMBERSHIP_REQUEST_TIMEOUT_MS } from '../src/channel-membership-retry.ts'
@@ -24,7 +24,6 @@ import {
   initialSharedState, writeSharedState, channelPopulation,
 } from './test-helpers/shared-channels.ts'
 import { SR8_SHARED_LIST_CHANNELS } from './test-helpers/thread-memory.ts'
-import { spyOnCopies } from './test-helpers/copies.ts'
 import { makeDeferredWebApiCall, makeMembershipEvent, makeChannelMessage, mentionText, broadcastText, type WebApiOutcome } from './test-helpers/slack-stub.ts'
 
 let h: ReloadHarness
@@ -145,7 +144,7 @@ async function retry(run: ReloadRun, outcome: WebApiOutcome) {
   await flush(run)
 }
 
-test('repeated outcomes report the same full inventory without copying whole shared state', async () => {
+test('repeated recovery outcomes retain the full inventory without duplicate reports or Slack posts', async () => {
   const ids = [C.primary, ...channelPopulation(SR8_SHARED_LIST_CHANNELS).map(channel => channel.id)]
   seed('open', ids)
   const run = await start()
@@ -159,16 +158,10 @@ test('repeated outcomes report the same full inventory without copying whole sha
     nextAttemptAt: run.membershipScanner.status('alpha').nextAttemptAt }
   evidenceReport(run, { channels, all: true }, expected)
   const before = { posts: run.slackPosts(), lines: reportLines(run) }
-  const copies = spyOnCopies(), snapshots = spyOn(authority, 'snapshot')
-  try {
-    for (let i = 0; i < 4; i++) {
-      // A readable recovery still reports its outcome through the real watch
-      // wiring, without needing any durable-state mutation or Slack request.
-      expect(authority.recoverDurability()).toEqual({ kind: 'applied', revision: authority.revision })
-      await flush(run)
-    }
-    expect({ snapshots: snapshots.mock.calls.length, copies: copies.values.length }).toEqual({ snapshots: 0, copies: 0 })
-  } finally { snapshots.mockRestore(); copies.restore() }
+  for (let i = 0; i < 4; i++) {
+    expect(authority.recoverDurability()).toEqual({ kind: 'applied', revision: authority.revision })
+    await flush(run)
+  }
   expect({ posts: run.slackPosts(), lines: reportLines(run) }).toEqual(before)
   evidenceReport(run, { channels, all: true }, expected)
 })

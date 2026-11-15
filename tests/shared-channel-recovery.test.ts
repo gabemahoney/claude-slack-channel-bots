@@ -155,17 +155,19 @@ test.each(['recover', 'stage'] as const)('changed uncertain bytes keep the exist
     expect(authority.failure).toBe(''); expect(authority.snapshot()).toEqual(uncertain)
     expect(h.readRecord()).toEqual(exact)
   } else {
-    // t3.yiv.sf.ws.ih, review-r2 R1: the caller's request keeps structuredClone;
-    // the fast copier copies only committed or parsed state.
-    const request = sharedRecoveryRequest('report-stage', damaged), serialising = spyOn(globalThis, 'structuredClone')
-    try {
-      expect(authority.stageRestoration(request, damaged, configBytes(input)).kind).toBe('unresolved')
-      expect(serialising.mock.calls.filter(([value]) => value === request)).toHaveLength(1)
-    } finally { serialising.mockRestore() }
+    const request = sharedRecoveryRequest('report-stage', damaged), originalRequest = { ...request }, prepared = configBytes(input)
+    expect(authority.stageRestoration(request, damaged, prepared)).toEqual({ kind: 'unresolved', revision: before.revision })
+    const stagedBytes = h.readRecord()!, staged = disk()
+    request.request_id = 'changed-after-staging'
+    request.evidence_sha256 = recoveryHash(Buffer.from('different evidence'))
+    expect(stagedRecoveryOf(staged)).toEqual({ boundary: expect.any(String), phase: 'review', request: originalRequest,
+      evidenceBase64: damaged.toString('base64'), preparedBase64: prepared.toString('base64'),
+      anchorBase64: Buffer.from(serializeSharedChannelState(uncertain)).toString('base64') })
     expect(authority.unreadableCause).toBe('restoration-staged')
-    expect(authority.recoverDurability().kind).toBe('unresolved')
+    expect(authority.recoverDurability()).toEqual({ kind: 'unresolved', revision: before.revision })
     expect(authority.unreadableCause).toBe('restoration-staged')
-    expectScopeMatches(authority, [before, disk()])
+    expect(h.readRecord()).toEqual(stagedBytes); expect(disk()).toEqual(staged)
+    expectScopeMatches(authority, [before, staged])
   }
   expect(writes).toBe(priorWrites + 1)
 })

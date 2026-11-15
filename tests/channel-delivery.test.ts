@@ -1,5 +1,5 @@
 /** The file-free adapter and the durable shared-authority mutation contract. */
-import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -14,7 +14,6 @@ import {
   sharedChannelPath, withThreadMemoryCreated, writeSharedState,
 } from './test-helpers/shared-channels.ts'
 import { osTempDir } from './test-helpers/host-safe-env.ts'
-import { spyOnCopies } from './test-helpers/copies.ts'
 
 let root: string, mint: () => string
 beforeEach(() => { mint = fixtureThreadHybridSince(); root = mkdtempSync(join(tmpdir(), 'shared-authority-')) })
@@ -137,20 +136,13 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     check(authority.snapshot())
   })
 
-  // t2.yiv.sf.ht: membership recovery copies its target persona, never the whole authority.
-  test('a persona snapshot clones only that persona and cannot mutate the authority', () => {
+  // Large-list costs are measured by integration tests 44, 45 and 48.
+  test('a persona snapshot is detached and cannot mutate the authority', () => {
     const authority = makeSharedAuthority(root, input())
     const join = membershipJoin(C.primary, 'join')
     expect(authority.observeMembership('alpha', authority.incarnation('alpha')!, join, authority.revision).kind).toBe('applied')
     const before = authority.snapshot()
-    const copies = spyOnCopies()
-    let alpha: ReturnType<typeof authority.personaSnapshot>
-    try {
-      alpha = authority.personaSnapshot('alpha')
-      expect(copies.values).toEqual([before.personas['alpha']])
-      // t3.yiv.sf.ws.ih: field by field, not through a structured clone's serialisation.
-      expect(copies.serialised).toBe(0)
-    } finally { copies.restore() }
+    const alpha = authority.personaSnapshot('alpha')
     expect(alpha).toEqual(before.personas['alpha'])
     alpha!.assignments = {}; alpha!.membershipEvents['join']!.channel = C.forged; alpha!.incarnation = 'forged-life'
     expect(authority.snapshot()).toEqual(before)
@@ -570,17 +562,14 @@ test('the production reader refuses malformed typed evidence without dumping ide
   check(authority.snapshot())
 })
 
-import { closeSync, fsyncSync, openSync, readdirSync, renameSync, statSync, unlinkSync, writeSync } from 'node:fs'
+import { closeSync, fsyncSync, openSync, readdirSync, renameSync, unlinkSync, writeSync } from 'node:fs'
 import type { DurableWriteFs } from '../src/atomic-write.ts'
-import { applySharedMembership, applySharedMemberships, SHARED_CHANNEL_FORMAT, sharedAppliedConfig, type SharedChannelAuthority, type SharedChannelDeps, type VerifiedSharedMembership } from '../src/shared-channels.ts'
+import { applySharedMembership, applySharedMemberships, sharedAppliedConfig, type SharedChannelAuthority, type SharedChannelDeps, type VerifiedSharedMembership } from '../src/shared-channels.ts'
 import { channelPopulation } from './test-helpers/shared-channels.ts'
 import { SR8_SHARED_LIST_CHANNELS } from './test-helpers/thread-memory.ts'
-import { MEMBERSHIP_PAGE_LIMIT } from '../src/channel-membership-retry.ts'
-import { heapStats } from 'bun:jsc'
-describe('membership transactions copy only their persona', () => {
+describe('membership transactions preserve durable state and publications', () => {
   const observe = (authority: SharedChannelAuthority, key: string, channel: string, member: boolean, event: string) =>
     authority.observeMembership(key, authority.incarnation(key)!, membershipObservation(authority, key, channel, member, event), authority.revision)
-  const wholeState = (value: unknown) => typeof value === 'object' && value !== null && (value as { format?: unknown }).format === SHARED_CHANNEL_FORMAT
   /** An open-mode authority in `dir` whose observers record each publication
    * with the revision on disk; `whole` routes membership through `transact`. */
   function historyRun(dir: string, whole: boolean, write: NonNullable<SharedChannelDeps['write']> = durableWriteFileSync) {
@@ -619,17 +608,11 @@ describe('membership transactions copy only their persona', () => {
   }
 
   test('a membership history commits the bytes, outcomes, publications and observer order of whole-state transactions', () => {
-    const clones = spyOnCopies()
     const runs = [false, true].map(whole => {
-      clones.clear()
       const run = historyRun(join(root, whole ? 'whole' : 'narrow'), whole)
-      return { ...run, results: membershipHistory(run.authority), copies: clones.values.filter(wholeState).length }
+      return { ...run, results: membershipHistory(run.authority) }
     })
-    clones.restore()
     const [narrow, whole] = runs as [typeof runs[0], typeof runs[0]]
-    // The paths differ: the bot attempt's two writes copy the whole state on
-    // both; whole-state membership adds one copy per write and one for the refusal.
-    expect([narrow.copies, whole.copies]).toEqual([2, 10])
     expect(narrow.results).toEqual(whole.results)
     expect(narrow.results.map(result => (result as { kind: string }).kind)).toEqual(['applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'failed', 'stale'])
     expect(narrow.writes).toEqual(whole.writes)
@@ -642,9 +625,7 @@ describe('membership transactions copy only their persona', () => {
     check([narrow.seen, narrow.authority.snapshot()])
   })
 
-  // t3.yiv.sf.ws.ih: each observation of a batch rebuilt the persona's raw
-  // channel list from all its assignments, though only the last list survives.
-  test('a batch of mixed observations commits the bytes, outcomes and publications of one application per observation, deriving the raw channel list once', () => {
+  test('a batch of mixed observations commits the bytes, outcomes and publications of one application per observation', () => {
     const batches: Array<[string, (authority: SharedChannelAuthority) => VerifiedSharedMembership[]]> = [
       ['alpha', a => [membershipObservation(a, 'alpha', C.secondary, true, 'EvB1J2'), membershipObservation(a, 'alpha', C.primary, false, 'EvB1L1'),
         membershipObservation(a, 'alpha', C.third, true, 'EvB1J3', membershipTimestamp()), membershipObservation(a, 'alpha', C.fourth, true, 'EvB1J4')]],
@@ -659,19 +640,15 @@ describe('membership transactions copy only their persona', () => {
       const { authority } = run
       let minted = 0
       const mint = () => `minted-${++minted}`
-      const entries = spyOn(Object, 'entries'), derivations: number[] = []
-      try {
-        const results = batches.map(([key, of]) => {
-          const staged = of(authority), incarnation = authority.incarnation(key)!
-          return authority.transactMembership(key, authority.revision, (next, order) => {
-            const assignments = next.personas[key]!.assignments, first = order - staged.length + 1, before = entries.mock.calls.length
-            if (batched) applySharedMemberships(next, first, key, incarnation, staged, mint)
-            else staged.forEach((observation, index) => applySharedMembership(next, first + index, key, incarnation, observation, mint))
-            derivations.push(entries.mock.calls.slice(before).filter(([value]) => value === assignments).length)
-          }, staged.length)
-        })
-        return { ...run, results, derivations, minted }
-      } finally { entries.mockRestore() }
+      const results = batches.map(([key, of]) => {
+        const staged = of(authority), incarnation = authority.incarnation(key)!
+        return authority.transactMembership(key, authority.revision, (next, order) => {
+          const first = order - staged.length + 1
+          if (batched) applySharedMemberships(next, first, key, incarnation, staged, mint)
+          else staged.forEach((observation, index) => applySharedMembership(next, first + index, key, incarnation, observation, mint))
+        }, staged.length)
+      })
+      return { ...run, results, minted }
     })
     const [single, batched] = runs as [typeof runs[0], typeof runs[0]]
     expect(single.results.map(result => result.kind)).toEqual(['applied', 'applied', 'failed', 'applied', 'applied'])
@@ -679,8 +656,6 @@ describe('membership transactions copy only their persona', () => {
     expect([batched.minted, batched.writes, batched.seen]).toEqual([single.minted, single.writes, single.seen])
     expect(batched.authority.snapshot()).toEqual(single.authority.snapshot())
     expect(readFileSync(batched.authority.path)).toEqual(readFileSync(single.authority.path))
-    // One raw channel list per applied observation before; one per batch now.
-    expect([single.derivations, batched.derivations]).toEqual([[4, 3, 3, 2], [1, 1, 1, 1]])
     check([batched.seen, batched.authority.snapshot()])
   })
 
@@ -798,9 +773,7 @@ describe('membership transactions copy only their persona', () => {
     check(committed)
   })
 
-  // t2.yiv.sf.s3: each membership outcome cloned, reserialized, reparsed and
-  // revalidated the whole shared state, work that grew with the population.
-  test('live membership outcomes beside SR8_SHARED_LIST_CHANNELS channels per persona copy and reparse no whole state and share untouched records', () => {
+  test('live membership outcomes preserve untouched records beside SR8_SHARED_LIST_CHANNELS channels per persona', () => {
     const authority = makeSharedAuthority(root, input())
     const ids = channelPopulation(SR8_SHARED_LIST_CHANNELS).map(channel => channel.id)
     for (const key of ['alpha', 'beta']) {
@@ -809,32 +782,22 @@ describe('membership transactions copy only their persona', () => {
         for (const channel of ids) applySharedMembership(next, ++position, key, authority.incarnation(key)!, { ...membershipJoin(channel, `scan:setup:${channel}`), channelType: 'channel', isExtSharedChannel: false })
       }, ids.length).kind).toBe('applied')
     }
-    const size = readFileSync(authority.path).length
-    const persona = (key: string) => authority.inspectMembershipHistory(key, life => life as never) as SharedChannelState['personas'][string]
-    const setup = `scan:setup:${ids[0]}`
-    const [alpha, beta] = [persona('alpha'), persona('beta')]
-    const clones = spyOnCopies(), parses = spyOn(JSON, 'parse')
-    let outcomes: string[], copies: number, reparses: number, untouched: unknown
-    try {
-      outcomes = [...ids.slice(1, 6).map(channel => observe(authority, 'alpha', channel, false, `EvLEAVE${channel}`)),
-        ...ids.slice(1, 6).map(channel => observe(authority, 'alpha', channel, true, `EvREJOIN${channel}`))].map(outcome => outcome.kind)
-      untouched = persona('beta')
-      outcomes.push(observe(authority, 'beta', C.additional, true, 'EvBETA').kind)
-      copies = clones.values.filter(wholeState).length
-      reparses = parses.mock.calls.filter(([text]) => typeof text === 'string' && text.length >= size).length
-    } finally { clones.restore(); parses.mockRestore() }
-    expect({ outcomes, copies, reparses }).toEqual({ outcomes: outcomes.map(() => 'applied'), copies: 0, reparses: 0 })
-    // Another persona's outcomes share this one whole, and their own untouched records.
-    expect(untouched).toBe(beta)
-    expect(persona('alpha').membershipEvents[setup]).toBe(alpha.membershipEvents[setup]!)
-    expect(persona('beta').membershipEvents[setup]).toBe(beta.membershipEvents[setup]!)
+    const before = authority.snapshot()
+    const outcomes = [...ids.slice(1, 6).map(channel => observe(authority, 'alpha', channel, false, `EvLEAVE${channel}`)),
+      ...ids.slice(1, 6).map(channel => observe(authority, 'alpha', channel, true, `EvREJOIN${channel}`))]
+    expect(authority.personaSnapshot('beta')).toEqual(before.personas.beta)
+    outcomes.push(observe(authority, 'beta', C.additional, true, 'EvBETA'))
+    expect(outcomes.map(outcome => outcome.kind)).toEqual(Array(11).fill('applied'))
+    for (const key of ['alpha', 'beta']) {
+      const setup = `scan:setup:${ids[0]}`
+      expect(authority.personaSnapshot(key)!.membershipEvents[setup]).toEqual(before.personas[key]!.membershipEvents[setup])
+    }
     expect(readSharedState(root)).toEqual(authority.snapshot())
     check(authority.snapshot())
   })
 
-  // t3.yiv.sf.ws.ih: every commit encoded the whole state as pretty JSON again,
-  // though a membership commit shares all but one persona's changed records.
-  test('membership commits beside SR8_SHARED_LIST_CHANNELS channels per persona write the native pretty JSON of each state, encoding only what they changed', () => {
+  // Integration test 44 covers large-list writes and growth under load.
+  test('membership commits beside SR8_SHARED_LIST_CHANNELS channels per persona write the native pretty JSON of each state', () => {
     function populated(dir: string, whole: boolean) {
       mkdirSync(dir)
       const config = input(); config.channel_mode = 'open'
@@ -858,7 +821,7 @@ describe('membership transactions copy only their persona', () => {
     const steps = (authority: SharedChannelAuthority, ids: string[]): Array<[string, () => unknown]> => {
       const store = createChannelDeliveryStore(authority, () => true)
       return [
-        // The first membership commit over a state that \`transact\` installed encodes it whole.
+        // A membership update after installing the initial population.
         ['first', () => observe(authority, 'alpha', ids[0]!, false, 'EvFIRST')],
         ...ids.slice(1, 6).map((channel): [string, () => unknown] => ['membership', () => observe(authority, 'alpha', channel, false, `EvLEAVE${channel}`)]),
         ['membership', () => applyMembershipPage(authority, 'beta', [C.primary, C.secondary, ids[7]!], 'beta')],
@@ -872,26 +835,18 @@ describe('membership transactions copy only their persona', () => {
         ['membership', () => observe(authority, 'beta', ids[8]!, true, 'EvREJOINBETA')],
       ]
     }
-    const rawInput = (value: unknown) => typeof value === 'object' && value !== null && Array.isArray((value as { personas?: unknown }).personas) && !wholeState(value)
     const runs = [false, true].map(whole => {
       const { authority, writes, ids } = populated(join(root, whole ? 'whole' : 'narrow'), whole)
-      const size = readFileSync(authority.path).length, start = writes.length
-      const encodes = spyOn(JSON, 'stringify')
-      const measured: Array<{ kind: string; writes: number; encoded: number }> = []
+      const start = writes.length
+      const measured: Array<{ kind: string; writes: number }> = []
       const results: unknown[] = []
-      try {
-        for (const [kind, step] of steps(authority, ids)) {
-          const calls = encodes.mock.results.length, before = writes.length
-          results.push(step())
-          // Pretty encodings of state objects; validation still encodes the applied configuration input whole.
-          const encoded = encodes.mock.calls.slice(calls).reduce((sum, [value, , space], i) => sum +
-            (space === 2 && !rawInput(value) && typeof encodes.mock.results[calls + i]!.value === 'string' ? (encodes.mock.results[calls + i]!.value as string).length : 0), 0)
-          measured.push({ kind, writes: writes.length - before, encoded })
-          // The bytes written last are the native pretty JSON of the installed state.
-          if (writes.length > before) expect(writes.at(-1)!.toString()).toBe(JSON.stringify(authority.snapshot(), null, 2) + '\n')
-        }
-      } finally { encodes.mockRestore() }
-      return { authority, results, writes: writes.slice(start), measured, size }
+      for (const [kind, step] of steps(authority, ids)) {
+        const before = writes.length
+        results.push(step())
+        measured.push({ kind, writes: writes.length - before })
+        if (writes.length > before) expect(writes.at(-1)!.toString()).toBe(JSON.stringify(authority.snapshot(), null, 2) + '\n')
+      }
+      return { authority, results, writes: writes.slice(start), measured }
     })
     const [narrow, whole] = runs as [typeof runs[0], typeof runs[0]]
     expect(narrow.results.map(result => (result as { kind: string }).kind)).toEqual([
@@ -900,59 +855,13 @@ describe('membership transactions copy only their persona', () => {
     expect(narrow.writes).toEqual(whole.writes)
     expect(readFileSync(narrow.authority.path)).toEqual(readFileSync(whole.authority.path))
     const steady = (run: typeof narrow) => run.measured.filter(step => step.kind === 'membership')
-    console.info(`membership commit encoding size=${narrow.size} narrow=${steady(narrow).map(step => step.encoded).join(' ')} whole=${steady(whole).map(step => step.encoded).join(' ')} first=${narrow.measured.filter(step => step.kind === 'first').map(step => step.encoded).join(' ')}`)
     for (const run of [narrow, whole]) {
       expect(steady(run).every(step => step.writes === 1)).toBe(true)
       expect(run.measured.filter(step => step.kind === 'duplicate' || step.kind === 'refused').map(step => step.writes)).toEqual([0, 0])
     }
-    // A whole encoding per commit fails the bound. A commit now encodes the records it changed, and once
-    // a container's members: the first time a commit copies it after it was encoded whole (beta's page
-    // and alpha's first new assignment here).
-    expect(steady(whole).every(step => step.encoded >= narrow.size)).toBe(true)
-    const encoded = steady(narrow).map(step => step.encoded)
-    expect(encoded.every(chars => chars < narrow.size / 2)).toBe(true)
-    expect(encoded.map(chars => chars < narrow.size / 10)).toEqual(encoded.map((_, i) => i !== 5 && i !== 10))
     check(narrow.authority.snapshot())
   })
 
-  // t3.yiv.sf.pk.tj: the encodings kept for later commits held each copied
-  // container's text, which repeats its members' at every level above them:
-  // about five copies of the state, growing with the membership events each
-  // scan adds, until test-32's measured server outgrew its shard.
-  test('repeated scans beside SR8_SHARED_LIST_CHANNELS channels per persona retain under three bytes of text per state byte they add', () => {
-    const config = input(); config.channel_mode = 'open'
-    const state = initialSharedState(root, config)
-    writeSharedState(root, state)
-    const authority = createSharedChannelAuthority(sharedChannelPath(root), state, { threadHybridSince: () => 'since' })
-    const ids = channelPopulation(SR8_SHARED_LIST_CHANNELS).map(channel => channel.id)
-    // One full scan of both personas: a write per page of positives. Each
-    // round alternates the issuing identity, so its records are change records
-    // SR-3.5 keeps and the state grows by a round of records per scan, as it
-    // did when every repeat was kept. Unchanged scans now add only the width of
-    // their numbers, too little to measure retained text against.
-    const scan = (round: number) => {
-      for (const key of ['alpha', 'beta']) for (let at = 0; at < ids.length; at += MEMBERSHIP_PAGE_LIMIT) {
-        expect(applyMembershipPage(authority, key, ids.slice(at, at + MEMBERSHIP_PAGE_LIMIT), `round-${round}`, `app-${round % 2}`).kind).toBe('applied')
-      }
-    }
-    // String text lives outside the collected heap; a full collection leaves
-    // only what is retained. Read before anything else is allocated.
-    const reading = () => { Bun.gc(true); Bun.gc(true); const retained = heapStats().extraMemorySize; return { retained, bytes: statSync(authority.path).size } }
-    scan(0)
-    const first = reading()
-    for (let round = 1; round <= 10; round++) scan(round)
-    const last = reading()
-    const grown = (last.retained - first.retained) / (last.bytes - first.bytes)
-    console.info(`retained text per state byte added: ${grown.toFixed(2)} (state ${first.bytes} -> ${last.bytes} bytes)`)
-    // Measured in this file and run alone: 5.6 and 9.8 with container
-    // encodings kept (029eb0f7), 1.5 and 1.9 with the records' alone.
-    expect(grown).toBeLessThan(3)
-    expect(readFileSync(authority.path).toString()).toBe(JSON.stringify(authority.snapshot(), null, 2) + '\n')
-    check(authority.snapshot())
-  })
-
-  // t3.yiv.sf.ws.ih: each recipient of a commit parsed the applied
-  // configuration again, including the listeners that read none of it.
   test('commits give each configuration reader its own copy of the configuration they validated, and call configuration-free listeners in subscription order with none', () => {
     const dir = join(root, 'listeners'); mkdirSync(dir)
     const config = input(); config.channel_mode = 'open'
@@ -968,27 +877,14 @@ describe('membership transactions copy only their persona', () => {
     const late = authority.subscribeChange((...args: unknown[]) => { calls.push(['late', args.length]) })
     const publish = reader('publish')
     const beta = (next: SharedChannelState, order: number) => applySharedMembership(next, order, 'beta', authority.incarnation('beta')!, membershipJoin(C.third, 'EvBETA'))
-    const parses = spyOn(authority, 'config'), copies = spyOnCopies()
-    // A parsed configuration, not the raw applied input that whole-state copies carry.
-    const configCopy = (value: unknown) => typeof value === 'object' && value !== null && !wholeState(value) && 'reply_chunk_limit' in value &&
-      Array.isArray((value as Config).personas) && (value as Config).personas.every(persona => typeof persona.key === 'string')
-    let results: string[], parsed: number, copied: number[]
-    try {
-      const counted = (step: () => { kind: string }) => { const before = copies.values.filter(configCopy).length; const kind = step().kind; return [kind, copies.values.filter(configCopy).length - before] as const }
-      const steps = [
-        counted(() => observe(authority, 'alpha', C.primary, true, 'EvJOIN')),
-        counted(() => authority.transact(authority.revision, beta, 1, publish)),
-        // A metadata commit publishes the configuration but notifies no listener.
-        counted(() => authority.transact(authority.revision, next => { next.threadMemoryCreated = { alpha: true } }, 1, publish)),
-        counted(() => { late(); return observe(authority, 'alpha', C.primary, false, 'EvLEAVE') }),
-      ]
-      results = steps.map(([kind]) => kind)
-      copied = steps.map(([, count]) => count)
-      parsed = parses.mock.calls.length
-    } finally { copies.restore(); parses.mockRestore() }
-    expect(results).toEqual(['applied', 'applied', 'applied', 'applied'])
-    // One parse per recipient before; now the commit's own validated configuration, copied for the publisher and for all but its last reader.
-    expect({ parsed, copied }).toEqual({ parsed: 0, copied: [1, 2, 1, 1] })
+    const results = [
+      observe(authority, 'alpha', C.primary, true, 'EvJOIN'),
+      authority.transact(authority.revision, beta, 1, publish),
+      // A metadata commit publishes the configuration but notifies no listener.
+      authority.transact(authority.revision, next => { next.threadMemoryCreated = { alpha: true } }, 1, publish),
+      (() => { late(); return observe(authority, 'alpha', C.primary, false, 'EvLEAVE') })(),
+    ]
+    expect(results.map(result => result.kind)).toEqual(['applied', 'applied', 'applied', 'applied'])
     const first: [string, number] = ['first', 1], plain: [string, number] = ['plain', 0], second: [string, number] = ['second', 1], publisher: [string, number] = ['publish', 1]
     expect(calls).toEqual([first, plain, second, ['late', 0], publisher, first, plain, second, ['late', 0], publisher, first, plain, second])
     // Every recipient owns its configuration: what parsing the installed state gives.
