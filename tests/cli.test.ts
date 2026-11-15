@@ -365,6 +365,7 @@ import {
 } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { reloadFilePaths } from '../src/reload.ts'
 import {
   makeMultiPersonaConfig,
   makePersona,
@@ -417,8 +418,8 @@ afterAll(() => {
 const formatLine = (args: unknown[]): string => args.map((a) => (a instanceof Error ? a.message : String(a))).join(' ')
 
 /** An initLogging that sends console.error to `log`, as the real one sends it to clean_restart.log. */
-const redirectTo = (log: string[]) => (): void => {
-  console.error = (...args: unknown[]) => { log.push(formatLine(args)) }
+const redirectTo = (log: string[], rawArgs?: unknown[][]) => (): void => {
+  console.error = (...args: unknown[]) => { rawArgs?.push(args); log.push(formatLine(args)) }
 }
 
 class ExitError extends Error {
@@ -630,7 +631,7 @@ interface Bundle {
   exitCodes: number[]
   /** Fake-clock time of each exit. */
   exitTimes: number[]
-  spawnCalls: Array<{ cmd: string; args: string[] }>
+  spawnCalls: Array<{ cmd: string; args: string[]; env: NodeJS.ProcessEnv | undefined }>
   daemonSpawns: Array<{ cmd: string; args: string[]; opts: DaemonSpawnOptions; child: FakeDaemon }>
   logOpens: string[]
   closedFds: number[]
@@ -663,6 +664,7 @@ interface Bundle {
   configFileLoads: string[]
   /** Each credentials file the fake credentials-script runner was given. */
   credentialsRuns: string[]
+  credentialsEnvs: Array<NodeJS.ProcessEnv | undefined>
   /** Each path given to `unlinkSync`, in call order; the fake removes nothing. */
   unlinked: string[]
   /** Each `dialClearLatch` call as `[port, persona]`, in call order, the default's included. */
@@ -705,14 +707,15 @@ function makeDeps(o: Overrides = {}): Bundle {
   const initClientGates: Bundle['initClientGates'] = []
   const configFileLoads: string[] = []
   const credentialsRuns: string[] = []
+  const credentialsEnvs: Bundle['credentialsEnvs'] = []
   const unlinked: string[] = []
   const dialCalls: Bundle['dialCalls'] = []
   let startServerCalled = false
   if (o.serverPid !== undefined) writeFileSync(pidPath, `${o.serverPid}\n`)
   const stateEnv = { SLACK_STATE_DIR: stateDir }
   const deps: CliDeps = {
-    spawnSync: (cmd, args) => {
-      spawnCalls.push({ cmd, args })
+    spawnSync: (cmd, args, env?: NodeJS.ProcessEnv) => {
+      spawnCalls.push({ cmd, args, env })
       events.push(`spawnSync:${args.at(-1)}`)
       return { status: o.spawnSyncStatus !== undefined ? o.spawnSyncStatus : 0 }
     },
@@ -773,8 +776,9 @@ function makeDeps(o: Overrides = {}): Bundle {
       events.push('loadConfigFile')
       return o.loadConfigFile ? o.loadConfigFile(path) : loadPersonaConfig(path, root)
     },
-    runCredentialsScript: (credentialsFile) => {
+    runCredentialsScript: (credentialsFile, env?: NodeJS.ProcessEnv) => {
       credentialsRuns.push(credentialsFile)
+      credentialsEnvs.push(env)
       events.push('runCredentialsScript')
       return o.credentialsScriptStatus ?? 0
     },
@@ -837,7 +841,7 @@ function makeDeps(o: Overrides = {}): Bundle {
   return {
     deps, clock, exitCodes, exitTimes, spawnCalls, daemonSpawns, logOpens, closedFds, logInits, loadPaths,
     getCalls, readPaneCalls, directorCallTimes, statusCalls, pauseCalls, killCalls,
-    serverSignals, events, initClientCalls, initClientGates, configFileLoads, credentialsRuns, unlinked, dialCalls,
+    serverSignals, events, initClientCalls, initClientGates, configFileLoads, credentialsRuns, credentialsEnvs, unlinked, dialCalls,
     get startServerCalled() { return startServerCalled },
   }
 }
@@ -2130,6 +2134,143 @@ function readOwnSessionId(): number | null {
     return null
   }
 }
+
+describe('b.c13 CLI child environments', () => {
+  const names = ['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN', 'SLACK_USER_TOKEN', 'SLACK_SIGNING_SECRET', 'SLACK_OTHER_TOKEN', 'slack_other_secret']
+  let saved: NodeJS.ProcessEnv
+  let credentialValue: string
+  let redirectedLogs: string[]
+  let redirectedErrorArgs: unknown[][]
+  beforeEach(() => {
+    saved = Object.fromEntries([...names, 'GH_TOKEN'].map(name => [name, process.env[name]]))
+    credentialValue = fakeToken(BOT_TOKEN_PREFIX)
+    redirectedLogs = []
+    redirectedErrorArgs = []
+    for (const name of names) process.env[name] = credentialValue
+    process.env.GH_TOKEN = 'fake-not-a-token'
+  })
+
+  // A finally block runs before the file's afterEach restores spies/removes
+  // the scratch tree, including when a behavioral assertion fails.
+  function leakChecked(run: () => void | Promise<void>) {
+    return async () => {
+      try { await run() } finally {
+        assertNoLeak({
+          stderr, consoleErrorArgs: errorSpy.mock.calls, redirectedLogs, redirectedErrorArgs,
+          files: readdirSync(stateDir).filter(name => name.endsWith('.log')).map(name => writtenFile(join(stateDir, name))),
+        })
+      }
+    }
+  }
+  afterEach(() => {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  })
+
+  function expectClean(env: NodeJS.ProcessEnv | undefined, daemon = false) {
+    expect(env).toBeDefined()
+    expect(env).not.toBe(process.env)
+    expect(Object.keys(env!).filter(name => names.includes(name))).toEqual([])
+    expect(env!._CLI_DAEMON_CHILD).toBe(daemon ? '1' : undefined)
+    expect(env!.GH_TOKEN).toBe('fake-not-a-token')
+  }
+
+  test('daemon spawn removes Slack credentials, sets its own marker and keeps host GH_TOKEN', leakChecked(async () => {
+    const b = makeDeps()
+    await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
+    expect(b.exitCodes).toEqual([0])
+    expect(b.daemonSpawns).toHaveLength(1)
+    expectClean(b.daemonSpawns[0]!.opts.env, true)
+    // Building a child env must not mutate the parent's inputs.
+    expect(process.env.SLACK_BOT_TOKEN).toBe(credentialValue)
+  }))
+
+  test('clean_restart passes explicit clean environments to both stop and start', leakChecked(async () => {
+    process.env._CLI_DAEMON_CHILD = 'leaked-marker'
+    const b = makeDeps({ initLogging: redirectTo(redirectedLogs, redirectedErrorArgs) })
+    await createCli(b.deps).clean_restart(['--server'])
+    expect(b.spawnCalls.map(call => call.args.at(-1))).toEqual(['stop', 'start'])
+    for (const call of b.spawnCalls) expectClean(call.env)
+  }))
+
+  test('credentials passes an explicit clean environment to the script runner', leakChecked(async () => {
+    process.env._CLI_DAEMON_CHILD = 'leaked-marker'
+    const b = makeDeps()
+    await expect(createCli(b.deps).credentials([OPS_NAME])).rejects.toBeInstanceOf(ExitError)
+    expect(b.exitCodes).toEqual([0])
+    expect(b.credentialsRuns).toHaveLength(1)
+    expectClean(b.credentialsEnvs[0])
+  }))
+
+  // Run the actual start body with a deterministic session-leader answer. This
+  // never starts a process or imports server.ts. The fixture deps remain fake.
+  // Extracting the whole body keeps the marker's dispatch and removal ordering
+  // under test, without making the runner a real detached session leader.
+  async function runTrustedDaemon(env: NodeJS.ProcessEnv) {
+    const code = stripComments(readFileSync(CLI_SOURCE, 'utf8'))
+    const startAt = code.indexOf('async function start()')
+    expect(startAt).toBeGreaterThan(0)
+    const body = code.slice(...balancedAfter(code, startAt, '{', '}'))
+    const js = new Bun.Transpiler({ loader: 'ts' }).transformSync(`async function start() {${body.replaceAll('import.meta.filename', JSON.stringify(CLI_SOURCE))}}`)
+    const b = makeDeps()
+    let observedMarker: string | undefined = 'not-called'
+    b.deps.startServer = async () => { observedMarker = env._CLI_DAEMON_CHILD }
+    const run = new Function('deps', 'process', 'isSessionLeader', 'join', 'reloadFilePaths',
+      `${js}; return start();`)
+    await run(b.deps, { env }, () => true, join, reloadFilePaths)
+    expect(b.daemonSpawns).toEqual([])
+    expect(observedMarker).toBeUndefined()
+    expect(env._CLI_DAEMON_CHILD).toBeUndefined()
+    expect(b.startServerCalled).toBe(false) // only the replacement callback ran
+  }
+
+  test('a trusted daemon removes the marker before calling startServer', leakChecked(async () => {
+    await runTrustedDaemon({ _CLI_DAEMON_CHILD: '1', GH_TOKEN: 'fake-not-a-token' })
+  }))
+
+  // Execute the actual entry setup through subcommand validation, stopping
+  // before it builds real director operations or dispatches any command.
+  async function entryEnvironment(subcommand: string, code = stripComments(readFileSync(CLI_SOURCE, 'utf8'))) {
+    const entryAt = code.indexOf('if (import.meta.main)')
+    const entry = code.slice(...balancedAfter(code, entryAt, '{', '}'))
+    const dispatchAt = entry.indexOf('const directorOps')
+    expect(dispatchAt).toBeGreaterThan(0)
+    const prefix = entry.slice(0, dispatchAt)
+    expect(callsOf(prefix, 'scrubProcessEnv')).toHaveLength(1)
+    const { scrubProcessEnv } = await import('../src/child-env.ts')
+    const env: NodeJS.ProcessEnv = { _CLI_DAEMON_CHILD: '1', SLACK_BOT_TOKEN: credentialValue, GH_TOKEN: 'fake-not-a-token' }
+    // Bind the helper's default to this fixture, so a no-argument entry call
+    // also tests the real scrub without touching the runner's environment.
+    const scrubFixture = (target = env, options?: Parameters<typeof scrubProcessEnv>[1]) => scrubProcessEnv(target, options)
+    new Function('scrubProcessEnv', 'process', 'CLEAR_LATCH_COMMAND', 'CLI_USAGE_LINES', prefix)(scrubFixture, {
+      env, argv: [process.execPath, CLI_SOURCE, subcommand], exit: (code: number) => { throw new ExitError(code) },
+    }, CLEAR_LATCH_COMMAND, CLI_USAGE_LINES)
+    return env
+  }
+
+  test('the actual CLI entry scrub preserves the marker until start consumes it', leakChecked(async () => {
+    const env = await entryEnvironment('start')
+    expect(env._CLI_DAEMON_CHILD).toBe('1')
+    expect(Object.keys(env)).not.toContain('SLACK_BOT_TOKEN')
+    await runTrustedDaemon(env)
+  }))
+
+  test.each(['stop', 'clean_restart', 'credentials', CLEAR_LATCH_COMMAND])('%s entry removes the marker before director operations', subcommand => leakChecked(async () => {
+    const env = await entryEnvironment(subcommand)
+    expect(Object.keys(env)).not.toContain('SLACK_BOT_TOKEN')
+    expect(env._CLI_DAEMON_CHILD).toBeUndefined()
+    expect(env.GH_TOKEN).toBe('fake-not-a-token')
+  })())
+
+  test('the non-start marker oracle rejects deletion of the entry cleanup branch', leakChecked(async () => {
+    const code = stripComments(readFileSync(CLI_SOURCE, 'utf8'))
+    const mutant = code.replace(/if\s*\(subcommand !== 'start'\)\s*delete process\.env\['_CLI_DAEMON_CHILD'\]/, '')
+    expect(mutant).not.toBe(code)
+    expect((await entryEnvironment('stop', mutant))._CLI_DAEMON_CHILD).toBe('1')
+  }))
+})
 
 describe('start — daemonize session-leader guard', () => {
   beforeEach(() => {
@@ -5010,9 +5151,9 @@ describe('after a failed teardown: stop --stop-bots stays stopped, clean_restart
   function printedAtStart(b: Bundle): () => number {
     const spawn = b.deps.spawnSync
     let printed = -1
-    b.deps.spawnSync = (cmd, args) => {
+    b.deps.spawnSync = (cmd, args, env) => {
       if (args.at(-1) === 'start') printed = stderr.length
-      return spawn(cmd, args)
+      return spawn(cmd, args, env)
     }
     return () => printed
   }
@@ -5960,7 +6101,12 @@ describe('credentials <persona>', () => {
     const props = objectProperties(code.slice(code.indexOf('const realDeps: CliDeps =')))
     expect(props.get('loadConfigFile')).toBe('(path) => loadPersonaConfig(path)')
     expect(props.get('runCredentialsScript')).toBe('runCredentialsScript')
-    expect(code).toMatch(/spawnSync\('bash', \[CREDENTIALS_SCRIPT_PATH, credentialsFile\], \{ stdio: 'inherit' \}\)/)
+    const runner = code.slice(...balancedAfter(code, code.indexOf('function runCredentialsScript('), '{', '}'))
+    const bashArgs = splitTopLevel(onlyCallArguments(runner, 'spawnSync'))
+    expect(bashArgs.slice(0, 2)).toEqual(["'bash'", '[CREDENTIALS_SCRIPT_PATH, credentialsFile]'])
+    const options = objectProperties(bashArgs[2]!)
+    expect(options.get('stdio')).toBe("'inherit'")
+    expect(options.has('env')).toBe(true)
     expect(CREDENTIALS_SCRIPT_PATH).toBe(resolve(import.meta.dir, '..', 'scripts', 'write-credentials.sh'))
     expect(existsSync(CREDENTIALS_SCRIPT_PATH)).toBe(true)
   })

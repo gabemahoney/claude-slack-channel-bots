@@ -133,7 +133,14 @@ build_batches() {
         fi
         text="$(scenario_text "${CASE}-${phase}-${ts}")"
         case "${phase}" in
-            roots) body="$(slack_mention_event "${channel}" "${mention_text}${text}" "${ts}" "${sender}")" ;;
+            # Open intake uses the paired message; app_mention is ignored.
+            roots)
+                if [[ "${MODE}" == open ]]; then
+                    body="$(slack_message_event "${channel}" "${mention_text}${text}" "${ts}" "${sender}")"
+                else
+                    body="$(slack_mention_event "${channel}" "${mention_text}${text}" "${ts}" "${sender}")"
+                fi
+                ;;
             replies) body="$(slack_reply_event "${channel}" "${root}" "${text}" "${ts}" "${sender}" "${HUMAN}")" ;;
             dropped) body="$(slack_message_event "${channel}" "${text}" "${ts}" "${sender}")" ;;
             *) fail 'unknown plan phase' ;;
@@ -199,7 +206,7 @@ pending_results() {
 
 write_states() {
     read_jsonl "$1" shared_persona_facts "${Q}"
-    shared_persona_facts "${P}" >> "$1" || fail 'write-state reader failed'
+    shared_persona_facts "${P}" | cat >> "$1" || fail 'write-state reader failed'
     printf '\n' >> "$1"
 }
 applied_events() {
@@ -302,11 +309,12 @@ membership_settled_twice() {
 }
 
 late_state() {
-    read_jsonl "$1" shared_persona_facts "${P}"
-    shared_attempt_order "${P}" >> "$1" || fail 'late-state order reader failed'
-    printf '\n' >> "$1"
-    shared_thread_joins "${P}" >> "$1" || fail 'late-state join reader failed'
-    printf '\n' >> "$1"
+    # Bun.write(stdout) must not receive an append-open file. Keep each
+    # reader separate; read_jsonl also omits a separator for an empty reader.
+    read_jsonl "$1.facts" shared_persona_facts "${P}"
+    read_jsonl "$1.order" shared_attempt_order "${P}"
+    read_jsonl "$1.joins" shared_thread_joins "${P}"
+    cat "$1.facts" "$1.order" "$1.joins" > "$1" || fail 'late-state concatenation failed'
 }
 
 # Reopen observation, printed only when the case fails between the reopen stop
@@ -422,6 +430,8 @@ run_membership_load() {
     MEMBERSHIP_PROFILE_CASE="${3:-}"
     E="${SCENARIO_FIXTURES}/sr8-evidence.ts"
     PRINTER="${SCENARIO_FIXTURES}/fmk-texts.ts"
+    # Every burst driver runs off the server's CPU quota; driver-cpu judges that.
+    BURST_DRIVER="${SCENARIO_FIXTURES}/burst-driver.sh"
     on_exit repair_modes
     on_before_cleanup reopen_observe
     if [[ -n "${MEMBERSHIP_PROFILE_CASE}" ]]; then on_before_cleanup membership_profile_cleanup; fi
@@ -603,13 +613,14 @@ PY
         esac
 
         if [[ "${KIND}" == undurable ]]; then
-            bun "${E}" burst "${C[@]}" "${BATCH}" "${SCENARIO_SLACK_STUB_URL}" "${SCENARIO_SLACK_RECORD}" \
+            bash "${BURST_DRIVER}" "${OUT}/driver-cgroup" bun "${E}" burst "${C[@]}" "${BATCH}" "${SCENARIO_SLACK_STUB_URL}" "${SCENARIO_SLACK_RECORD}" \
                 "${SLACK_STATE_DIR}" "${OUT}" "${WAIT_MS}" "${MEASUREMENTS}" "${MEASURE_MARK}" &
         else
             # Strict keeps its whole second wave concurrent: no tail release.
             TAIL_RELEASE=()
             if [[ "${MODE}" == open ]]; then TAIL_RELEASE=("${OUT}/tail-release"); fi
-            SR8_PROFILE_DIR="${MEMBERSHIP_PROFILE_DIR}" bun "${E}" fault-burst "${C[@]}" "${OUT}" "${SCENARIO_SLACK_STUB_URL}" "${SCENARIO_SLACK_RECORD}" \
+            SR8_PROFILE_DIR="${MEMBERSHIP_PROFILE_DIR}" bash "${BURST_DRIVER}" "${OUT}/driver-cgroup" \
+                bun "${E}" fault-burst "${C[@]}" "${OUT}" "${SCENARIO_SLACK_STUB_URL}" "${SCENARIO_SLACK_RECORD}" \
                 "${SLACK_STATE_DIR}" "${MEASUREMENTS}" "${MEASURE_MARK}" "${WAIT_MS}" ${TAIL_RELEASE[@]+"${TAIL_RELEASE[@]}"} &
         fi
         BURST_PID=$!
@@ -673,7 +684,7 @@ PY
         if [[ "${KIND}" != undurable ]]; then
             # One bounded driver retains every attempt and waits for each root's
             # own ACK before dependent replies. Numeric verdicts remain unchanged.
-            bun "${E}" fault-recover "${C[@]}" "${OUT}" "${SCENARIO_SLACK_STUB_URL}" \
+            bash "${BURST_DRIVER}" "${OUT}/driver-cgroup" bun "${E}" fault-recover "${C[@]}" "${OUT}" "${SCENARIO_SLACK_STUB_URL}" \
                 "${SCENARIO_SLACK_RECORD}" "${WAIT_MS}" 64
             bun "${E}" fault-ids "${C[@]}" "${OUT}" > "${OUT}/all-ids.txt"
         else cp "${OUT}/during-ids.txt" "${OUT}/all-ids.txt"; fi
@@ -688,6 +699,7 @@ PY
         # Stop drains the measurement recorder. Queue contents remain retained
         # by the manual-receipt stub; capture before the required clean restart.
         bun "${E}" conditions "${SLACK_STATE_DIR}" "${SERVER_PID}" "${ROOT}/cpu.before"
+        verdict driver-cpu "${C[@]}" "${SERVER_PID}" "${OUT}/driver-cgroup"
         REOPEN_OBSERVE_LOG="$(byte_mark "${SLACK_STATE_DIR}/server.log")"
         reopen_ad_rows before-stop > "${ROOT}/reopen-observe.rows"
         REOPEN_OBSERVE=1

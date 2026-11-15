@@ -371,6 +371,7 @@ import {
   setupStateClass,
 } from '../ci-live/checks/membership-setup.ts'
 import { parseArgs } from '../ci-live/lib/args.ts'
+import { RN4_PROMPT } from '../ci-live/checks/reaction-checks.ts'
 import { AD_CLIENT_CHECK_FAILED, installCheck, s2Check, s3Check } from '../ci-live/checks/setup-checks.ts'
 import { AD_CLIENT_CHECK, AD_CLIENT_CHECK_PASSED } from '../ci-live/lib/ad-client-check.ts'
 import { FlowError, type BrowserDriver, type HumanApi } from '../ci-live/lib/browser-types.ts'
@@ -880,7 +881,7 @@ describe('the check list', () => {
     const lastOf28 = Math.max(...ids.map((id, i) => (id.startsWith('28') ? i : -1)))
     expect(lastOf28).toBeGreaterThan(-1)
     expect(at('30')).toBeGreaterThan(lastOf28)
-    expect(ids.slice(at('34') + 1)).toEqual(['29a', '29b'])
+    expect(ids.slice(at('34') + 1)).toEqual(['RN1', 'RN2', 'RN3', 'RN4', 'RN5', 'RN6', '29a', '29b'])
     expect(INVITED_CHECKS.map((c) => [c.row, c.needs, c.blocking ?? false, c.prerequisite ?? false, c.always ?? false, c.skip ?? null, c.undoes ?? []])).toEqual(
       ['30', '31', '32', '33', '34'].map((row) => [row, ['workspace', 'claude'], false, false, false, null, row === '34' ? ['30', '31', '32', '33'] : []]),
     )
@@ -902,7 +903,7 @@ describe('the check list', () => {
     expect(ids.filter((id) => !id.startsWith('setup-'))).toEqual([
       'preflight', 'install', 'setup', 'S1', 'S2', 'S3', ...CHANNEL_CHECKS.map((c) => c.id),
       '14', '15', '16', 'A-DMs-on', '17', '18', '19', '20', '21', '22', '23', '24-setup', '24', '24-teardown', '25', '26', '27', '28',
-      '30', '31', '32', '33', '34', '29a', '29b',
+      '30', '31', '32', '33', '34', 'RN1', 'RN2', 'RN3', 'RN4', 'RN5', 'RN6', '29a', '29b',
     ])
     // Runner-only checks: no Results column, nothing blocking, nothing run unselected, nothing undone.
     for (const c of [membershipSetupCheck, membershipSetupRestartCheck]) {
@@ -2752,7 +2753,7 @@ const ROWS = (['a', 'b', 'c'] as const).map((l) => rowLine(l)).join('\n')
 function rebootedRun(
   cAt: number | null,
   lines: readonly (readonly [number, string])[] = startLog(cAt),
-  opts: { rows?: (n: number) => string; broughtUp?: PersonaLetter[]; dRowKept?: boolean } = {},
+  opts: { rows?: (n: number) => string; broughtUp?: PersonaLetter[]; dRowKept?: boolean; pending?: string } = {},
 ) {
   const clock = virtualClock()
   const log = timedLog(clock, lines)
@@ -2761,6 +2762,7 @@ function rebootedRun(
   const { container } = fakeContainer([
     ['echo BOOT', 'BOOT'],
     ['kill -0', 'running'],
+    ['showpending', () => opts.pending ?? ''],
     ['', (script) => (script === 'mark' || script === 'cat ~/cscb-live/reboot-log-mark' ? '1:0' : script === 'rows' ? rowsAt(reads++) : (log.since(script) ?? ''))],
   ])
   const shared = {
@@ -2769,6 +2771,24 @@ function rebootedRun(
   }
   return makeCtx({ mode: 'real', clock, human: scriptedHuman(clock).human, browser: idleBrowser(), container, shared, restartContainer: async () => log.begin() })
 }
+
+describe("Check 28 step 6: B's credentials change is no longer pending", () => {
+  test.each([
+    ['a channel line for B', [], 0, []],
+    ['a credentials line for B despite zero in the counts', ['persona "persona_b" (key=persona_b): credentials file "/test/b.json" changed: a new connection opens, then the old one closes, instance kept.'], 0, ["step 6: B's credentials change is still pending"]],
+    ['a nonzero credentials count without a credentials line', [], 1, ["step 6: the counts are not 1 removed (B's change still pending?)", 'step 6: the counts are not 0 with changed credentials']],
+  ] as const)('%s', async (_what, credentialsLines, credentials, expected) => {
+    const pending = [
+      PENDING_FILE_HEADER, `fingerprint: sha256:${'0'.repeat(64)}`, '',
+      previewHeader({ removed: 1, credentials }), removedPreviewLine('c'),
+      'Channel persona=persona_b channel=C_TEST: copied; unchanged.', ...credentialsLines,
+    ].join('\n')
+    const result = await check28.run(rebootedRun(155, undefined, { pending }))
+    const failures = (result.reason ?? '').split('; ').filter((line) =>
+      line.startsWith('step 6: the counts') || line.startsWith("step 6: B's credentials") || line.includes('pending file names persona_b'))
+    expect(failures).toEqual([...expected])
+  })
+})
 
 describe('Check 28 step 5: the start after the reboot waits for every persona to connect, not only for B', () => {
   /** The findings that step 5's start lines give. */
@@ -3323,7 +3343,8 @@ describe('the switch is absent before Check 30', () => {
     expect(Object.keys(buildLiveConfig(DRY_RUN_IDS).personas[0]!)).not.toContain('invited')
   })
 
-  test("source audit: the switch's key is spelled only in live-config.ts's constant, and only invited-checks.ts uses the switch's names", () => {
+  // reaction-checks.ts's RN6 runs after Check 34 and restores config.json itself.
+  test("source audit: the switch's key is spelled only in live-config.ts's constant, and only invited-checks.ts and reaction-checks.ts use the switch's names", () => {
     const root = join(import.meta.dir, '..', 'ci-live')
     const files = (readdirSync(root, { recursive: true }) as string[]).filter((f) => f.endsWith('.ts') && !f.split('/').includes('node_modules'))
     expect(files.length).toBeGreaterThan(20)
@@ -3332,7 +3353,7 @@ describe('the switch is absent before Check 30', () => {
     expect(spelled.map(([f]) => f)).toEqual(['lib/live-config.ts'])
     expect(spelled[0]![1].split(SWITCH_KEY).length - 1).toBe(1)
     const names = /\b(SWITCH_KEY|SWITCH_VALUE_JQ|switchOnFilter|switchFilter)\b/
-    expect([...code].filter(([, c]) => names.test(c)).map(([f]) => f).sort()).toEqual(['checks/invited-checks.ts', 'lib/live-config.ts'])
+    expect([...code].filter(([, c]) => names.test(c)).map(([f]) => f).sort()).toEqual(['checks/invited-checks.ts', 'checks/reaction-checks.ts', 'lib/live-config.ts'])
   })
 })
 
@@ -4413,6 +4434,7 @@ describe('the prompts each check declares to the prompt guard, before it raises 
       { persona: 'b', command: CHECK23_B_EXTRA },
     ],
     '27': [{ persona: 'd', command: CHECK27_PROMPT, leaveOpen: true }],
+    RN4: [{ persona: 'a', command: RN4_PROMPT }],
   }
   const live = PLAN_CHECKS.filter((c) => c.needs.includes('workspace') && !c.skip)
 
@@ -4460,7 +4482,7 @@ describe('the prompts each check declares to the prompt guard, before it raises 
   }
 
   test('the checks that raise prompts are the ones run 6 named', () => {
-    expect(Object.keys(DECLARED).sort()).toEqual(['18', '22', '23', '27', '5'])
+    expect(Object.keys(DECLARED).sort()).toEqual(['18', '22', '23', '27', '5', 'RN4'])
     expect(CHECK23_B_EXTRA.test('anything B runs')).toBe(true)
   })
 

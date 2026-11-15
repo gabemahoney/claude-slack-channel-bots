@@ -1,19 +1,23 @@
 /** durable final receipts trigger reactions through the owning app. */
 import { afterEach, beforeEach, expect, test } from 'bun:test'
-import { writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { _resetAckTracker, addDeliveryAck, consumeAck, createQueuedAckCallback, createDeliveryAckCallback, forgetPersonaAcks } from '../src/ack-tracker.ts'
+import type { AcceptedInput, ReplyReminderQueue } from '../src/delivery-queue.ts'
 import { buildDeliveryDiagnostic, buildDeliveryDispatchLine, createDeliveryReporting, deliveryIdentity, MESSAGE_DELIVERED, MESSAGE_RECEIVED } from '../src/delivery-notices.ts'
-import { assertNoLeak } from './test-helpers/credentials.ts'
+import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
 import { makeDeliveryNoticeHarness, type DeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
-import { slackInput } from './test-helpers/delivery-queue.ts'
+import { reactionInput, deliveredRecord, queuePath, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
 import { makeQueuedAckHarness, type QueuedAckHarness } from './test-helpers/queued-ack.ts'
 import { makeStubSlack } from './test-helpers/slack-stub.ts'
+import type { GetResult } from 'agent-director'
+import { createReplyReminders, REPLY_TOOL_PREALLOWED_LABEL, type ReplyReminders } from '../src/reply-reminder.ts'
+import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
 const engines: EngineHarness[] = [], notices: DeliveryNoticeHarness[] = []
-const queuedHarnesses: QueuedAckHarness[] = []
+const queuedHarnesses: QueuedAckHarness[] = [], reminderMonitors: ReplyReminders[] = []
 beforeEach(_resetAckTracker)
-afterEach(async () => { for (const h of queuedHarnesses.splice(0)) await h.cleanup(); for (const n of notices.splice(0)) { assertNoLeak({ logs: n.logs, posts: n.h.allPosts() }); await n.cleanup() }; for (const e of engines.splice(0)) await e.cleanup(); _resetAckTracker() })
+afterEach(async () => { for (const m of reminderMonitors.splice(0)) await m.stop(); for (const h of queuedHarnesses.splice(0)) await h.cleanup(); for (const n of notices.splice(0)) { assertNoLeak({ logs: n.logs, posts: n.h.allPosts() }); await n.cleanup() }; for (const e of engines.splice(0)) await e.cleanup(); _resetAckTracker() })
 
 async function setup() {
   let reporting: ReturnType<typeof createDeliveryReporting> | undefined
@@ -25,12 +29,13 @@ async function setup() {
   })
   return { e, n, reporting }
 }
-test.each([false, true])('multipart receipt adds only after the final durable part; early successful reply=%p', async early => {
+test.each([false, 'reply', 'react with the ack emoji'] as const)('multipart receipt adds only after the final durable part; early successful answer=%p', async early => {
   const { e, n, reporting } = await setup()
   const result = await e.queue.accept('alpha', slackInput({ text: 'ordinary private body' }))
   if (result.status === 'failed') throw new Error('store failed')
   await e.queue.append('alpha', { v: 1, kind: 'fixed', seq: result.seq, parts: ['one', 'two'] })
-  if (early) expect(consumeAck('alpha', 'C0TEST001', result.item!.accepted.ts)).toBe(false)
+  if (early === 'reply') expect(consumeAck('alpha', 'C0TEST001', result.item!.accepted.ts)).toBe(false)
+  if (early === 'react with the ack emoji') await consumeAck('alpha', 'C0TEST001', result.item!.accepted.ts, async () => { throw new Error('legacy removal') }, 'white_check_mark')
   expect(n.h.stub('alpha').calls.reactionsAdd).toEqual([])
   await e.tick(); await e.until(() => e.events.some(event => event.type === 'delivered'))
   expect(n.h.stub('alpha').calls.reactionsAdd).toEqual([])
@@ -121,8 +126,9 @@ async function queuedSetup() {
   const h = await makeQueuedAckHarness(); queuedHarnesses.push(h)
   return h
 }
-function expectOnlyOneStage(h: QueuedAckHarness) {
-  expect(h.snapshots.filter(snapshot => snapshot.names.length > 1)).toEqual([])
+/** `answer`: a bot's own reaction, which may sit beside one ack stage. */
+function expectOnlyOneStage(h: QueuedAckHarness, answer?: string) {
+  expect(h.snapshots.filter(snapshot => snapshot.names.filter(name => name !== answer).length > 1)).toEqual([])
 }
 async function flushUntil(h: QueuedAckHarness, condition: () => boolean) {
   // Bound the fixture's promise turns, without advancing time or releasing held work.
@@ -261,9 +267,132 @@ test('a failed reply preserves queued, and wrong message/persona correlation can
   expect(h.visible()).toEqual([])
 })
 
-test.each(['queued-add', 'queued-remove', 'delivered-add'].flatMap(point => ['reply', 'teardown'].map(race => ({ point, race }))))(
-  '$race during $point leaves no reaction when held Slack work settles', async ({ point, race }) => {
+test.each(['queued', 'delivered'] as const)('a correlated react clears %s and later delivery/redelivery cannot resurrect it', async stage => {
+  const h = await queuedSetup()
+  await h.receive()
+  if (stage === 'delivered') await h.deliver()
+  const name = stage === 'queued' ? h.settings.queued_ack_reaction : h.settings.ack_reaction
+  expect((await h.react()).isError).toBeUndefined()
+  expect(h.visible()).toEqual(['thumbsup'])
+  expect(h.stub().calls.reactionsRemove.at(-1)).toEqual({ channel: h.event.channel, timestamp: h.event.ts, name })
+  await h.deliver(); await h.receive()
+  h.reporting.received('alpha', h.item())
+  h.reporting.engineEvent(h.e.events.find(event => event.type === 'item-delivered')!)
+  await h.e.clock.flush()
+  expect(h.visible()).toEqual(['thumbsup'])
+  expect(h.stub().calls.reactionsAdd.map(call => call.name)).toEqual(stage === 'queued'
+    ? [h.settings.queued_ack_reaction, 'thumbsup'] : [h.settings.queued_ack_reaction, h.settings.ack_reaction, 'thumbsup'])
+})
+
+test("a failed react or another persona's react leaves the acknowledgement", async () => {
+  const h = await queuedSetup()
+  await h.receive(); await h.receive('beta')
+  h.stub().script.reactionsAdd.push({ kind: 'platform', error: 'invalid_name' })
+  expect((await h.react()).isError).toBe(true)
+  await h.react({}, 'beta')
+  expect(h.visible()).toEqual([h.settings.queued_ack_reaction])
+  expect(h.visible('beta')).toEqual(['thumbsup'])
+  await h.deliver()
+  expect(h.visible()).toEqual([h.settings.ack_reaction])
+})
+
+/**
+ * The queued-ack harness with alpha's applied reaction_notices set, and one real reply-reminder monitor over its queue and
+ * clock, bound to the tools' onReplyCall as the server binds it; `order` marks the call and its durable record around it.
+ */
+async function reminderSetup(reactionNotices: boolean) {
+  let monitor: ReplyReminders | undefined
+  const h = await makeQueuedAckHarness({ onReplyCall: async key => { h.order.push(`reply-call:${key}`); await monitor!.noteReplyCall(key); h.order.push(`reply-call-recorded:${key}`) } })
+  queuedHarnesses.push(h)
+  const alpha = h.n.config.personas.find(p => p.key === 'alpha')!
+  alpha.reaction_notices = reactionNotices
+  const prepared: number[] = [], errors: unknown[] = []
+  // The harness's own queue is a real one, so it has the reminder operations.
+  const realQueue = h.e.realQueue as ReplyReminderQueue
+  monitor = createReplyReminders({ queue: realQueue, clock: h.e.clock, getRow: async () => undefined, ready: () => true, enabled: () => true,
+    prepare: async (key, item) => { prepared.push(item.accepted.seq); await h.e.preparation.prepare(key, item) }, onError: (_key, error) => { errors.push(error) } })
+  reminderMonitors.push(monitor)
+  const labels = Object.fromEntries([REPLY_TOOL_PREALLOWED_LABEL.split('=')])
+  const row = (state: GetResult['state']): GetResult => { const result = cannedGetResult({ state, session_id: 'alpha-session' }, alpha, h.e.root); return { ...result, labels: { ...result.labels, ...labels } } }
+  const nudges = () => h.e.queue.items('alpha').filter(item => item.accepted.reminder_for !== undefined)
+  const reminderStates = (seq: number) => h.e.records().flatMap(record => record.kind === 'reply-reminder' && record.seq === seq ? [record.state] : [])
+  return { h, monitor, prepared, errors, row, nudges, reminderStates }
+}
+
+// SR-8.3, SR-9.3: reaction_notices is read only by reaction intake; the react tool's reminder and acknowledgement paths ignore it.
+const REACT_WITH_NOTICES_OFF: Array<{ case: string; react?: 'ok' | 'invalid_name' }> = [
+  { case: 'a successful react', react: 'ok' },
+  { case: 'a failed react', react: 'invalid_name' },
+  { case: 'no react (the control)' },
+]
+test.each(REACT_WITH_NOTICES_OFF)('with reaction notices off, $case on a receipt-delivered message: the call is recorded before Slack and suppresses the reminder; only success clears the ack', async ({ react }) => {
+  const { h, monitor, prepared, errors, row, nudges, reminderStates } = await reminderSetup(false)
+  await h.receive(); await h.deliver()
+  const seq = h.item().accepted.seq
+  expect(h.e.records().filter(record => record.kind === 'delivered').map(record => record.seq)).toEqual([seq])
+  expect(h.visible()).toEqual([h.settings.ack_reaction])
+  expect((h.e.realQueue as ReplyReminderQueue).replyReminderItems('alpha').map(record => record.seq)).toEqual([seq])
+  await monitor.observe('alpha', row('working'))
+  if (react) {
+    const held = h.hold('reactionsAdd')
+    const call = h.react()
+    await flushUntil(h, () => h.order.includes('add:alpha:thumbsup'))
+    // Recorded durably before the handler reaches Slack, and still while Slack's answer is pending.
+    expect(h.order.filter(step => step.startsWith('reply-call') || step === 'add:alpha:thumbsup')).toEqual(['reply-call:alpha', 'reply-call-recorded:alpha', 'add:alpha:thumbsup'])
+    expect(held.settled).toBe(false)
+    expect(reminderStates(seq).at(-1)).toBe('replied')
+    held.settle(react === 'ok' ? undefined : { kind: 'platform', error: react })
+    expect((await call).isError).toBe(react === 'ok' ? undefined : true)
+  }
+  await monitor.observe('alpha', row('waiting'))
+  expect(errors).toEqual([])
+  if (react) {
+    expect(nudges()).toEqual([]); expect(prepared).toEqual([])
+    expect(reminderStates(seq).at(-1)).toBe('replied')
+  } else {
+    expect(nudges().map(item => [item.accepted.reminder_for, item.accepted.sender, item.fixed !== undefined])).toEqual([[seq, 'reply-reminder', true]])
+    expect(prepared).toEqual([nudges()[0]!.accepted.seq])
+    expect(reminderStates(seq).at(-1)).toBe('nudged')
+  }
+  const shown = react === 'ok' ? ['thumbsup'] : [h.settings.ack_reaction]
+  expect(h.visible()).toEqual(shown)
+  expect(h.stub().calls.reactionsRemove.map(call => call.name)).toEqual(react === 'ok' ? [h.settings.queued_ack_reaction, h.settings.ack_reaction] : [h.settings.queued_ack_reaction])
+  // Later stages: a redelivered event and repeated reporting change nothing visible.
+  await h.deliver(); await h.receive()
+  h.reporting.received('alpha', h.item())
+  h.reporting.engineEvent(h.e.events.find(event => event.type === 'item-delivered')!)
+  await h.e.clock.flush()
+  expect(h.visible()).toEqual(shown)
+  expect(h.stub().calls.reactionsAdd.map(call => call.name)).toEqual([h.settings.queued_ack_reaction, h.settings.ack_reaction, ...(react ? ['thumbsup'] : [])])
+  expect(h.stub('beta').calls.reactionsAdd).toEqual([]); expect(h.stub('beta').calls.reactionsRemove).toEqual([])
+  // The router's raw-event and dispatch lines carry the body by design; no other line does.
+  expect(JSON.stringify(h.n.logs.filter(line => !line.startsWith('[slack] dispatch:') && !line.startsWith('[slack] RAW ')))).not.toContain('queued body')
+  assertNoLeak({ errors, journal: writtenFile(queuePath(h.e.root)) })
+  // Only a successful react consumed the tracked acknowledgement.
+  expect(consumeAck('alpha', h.event.channel as string, h.event.ts as string)).toBe(react !== 'ok')
+})
+
+test.each((['queued', 'delivered'] as const).flatMap(stage => [true, false].map(notices => ({ stage, notices }))))("a react with the $stage ack's own emoji keeps the bot's reaction and suppresses later stages (reaction notices $notices)", async ({ stage, notices }) => {
+  const h = await queuedSetup()
+  h.n.config.personas.find(p => p.key === 'alpha')!.reaction_notices = notices
+  await h.receive()
+  if (stage === 'delivered') await h.deliver()
+  const name = stage === 'queued' ? h.settings.queued_ack_reaction : h.settings.ack_reaction
+  const removed = h.stub().calls.reactionsRemove.length
+  h.stub().script.reactionsAdd.push({ kind: 'platform', error: 'already_reacted' })
+  expect((await h.react({ emoji: name })).isError).toBeUndefined()
+  await h.deliver()
+  expect(h.visible()).toEqual([name])
+  expect(h.stub().calls.reactionsRemove).toHaveLength(removed)
+  expect(h.stub().calls.reactionsAdd.map(call => call.name)).toEqual(stage === 'queued'
+    ? [name, name] : [h.settings.queued_ack_reaction, name, name])
+})
+
+test.each(['queued-add', 'queued-remove', 'delivered-add'].flatMap(point => ['reply', 'teardown', 'react', 'react-own'].map(race => ({ point, race }))))(
+  '$race during $point leaves no ack reaction when held Slack work settles', async ({ point, race }) => {
     const h = await queuedSetup()
+    // The stage being established when the held call settles.
+    const own = point === 'queued-add' ? h.settings.queued_ack_reaction : h.settings.ack_reaction
     const held = point === 'queued-add' ? h.hold('reactionsAdd') : undefined
     await h.receive()
     expect(h.stub().calls.reactionsAdd.map(call => call.name)).toEqual([h.settings.queued_ack_reaction])
@@ -273,17 +402,38 @@ test.each(['queued-add', 'queued-remove', 'delivered-add'].flatMap(point => ['re
     else expect(h.stub().calls.reactionsAdd.map(call => call.name)).toEqual([h.settings.queued_ack_reaction, h.settings.ack_reaction])
     // A reply may await serialized cleanup. Start it, let the successful post
     // run, then release the held reaction; do not force reply completion early.
-    const reply = race === 'reply' ? h.reply() : undefined
+    const reply = race === 'reply' ? h.reply() : race === 'react' ? h.react() : race === 'react-own' ? h.react({ emoji: own }) : undefined
     if (race === 'teardown') forgetPersonaAcks('alpha')
     await h.e.clock.flush()
     if (race === 'reply') expect(h.stub().calls.postMessage).toHaveLength(1)
     transition.settle()
-    await reply
+    expect((await reply)?.isError).toBeUndefined()
     await h.e.clock.flush()
-    expect(h.visible()).toEqual([])
-    expectOnlyOneStage(h)
+    expect(h.visible()).toEqual(race === 'react' ? ['thumbsup'] : race === 'react-own' ? [own] : [])
+    expectOnlyOneStage(h, race === 'react-own' ? own : 'thumbsup')
   },
 )
+
+test("an early react with the queued ack's emoji, then a reply, keeps the bot's reaction when the queued callback runs late", async () => {
+  const h = await queuedSetup()
+  const name = h.settings.queued_ack_reaction
+  expect((await h.react({ emoji: name })).isError).toBeUndefined()
+  expect((await h.reply()).isError).toBeUndefined()
+  await h.receive()
+  expect(h.visible()).toEqual([name])
+  expect(h.stub().calls.reactionsRemove).toEqual([])
+})
+
+test("a react with the held queued ack's emoji after a reply keeps the bot's reaction when the add settles", async () => {
+  const h = await queuedSetup(), held = h.hold('reactionsAdd')
+  const name = h.settings.queued_ack_reaction
+  await h.receive()
+  expect((await h.reply()).isError).toBeUndefined()
+  expect((await h.react({ emoji: name })).isError).toBeUndefined()
+  held.settle(); await h.e.clock.flush()
+  expect(h.visible()).toEqual([name])
+  expect(h.stub().calls.reactionsRemove).toEqual([])
+})
 
 test('failed queued removal never adds a second visible stage, blocks no delivery, and reply can still clear queued', async () => {
   const h = await queuedSetup()
@@ -600,4 +750,67 @@ test.each(['reply', 'teardown'] as const)('metadata: %s during legacy adoption c
   expect(h.visible()).toEqual([])
   expect(h.stub().calls.reactionsAdd.map(call => call.name)).toEqual(race === 'reply' ? [] : [originalName])
   expectOnlyOneStage(h)
+})
+
+async function acceptOn(e: EngineHarness, input: AcceptedInput): Promise<number> {
+  const result = await e.queue.accept('alpha', input)
+  if (result.status !== 'accepted') throw new Error('fixture acceptance failed')
+  return result.seq
+}
+async function deliverDurably(e: EngineHarness, seq: number): Promise<void> {
+  await e.queue.append('alpha', { v: 1, kind: 'fixed', seq, parts: ['body'] })
+  await e.queue.append('alpha', sentRecord(seq))
+  await e.queue.append('alpha', deliveredRecord(seq))
+}
+
+test('both production callbacks skip a Reaction Item at its queued and final durable stages; a Slack control on the same client acknowledges', async () => {
+  const { e, n } = await setup()
+  const clientKeys: string[] = [], adoptions: number[] = []
+  const deps = {
+    queue: { rememberQueuedReaction: (key: string, seq: number, name: string) => { adoptions.push(seq); return e.queue.rememberQueuedReaction(key, seq, name) } },
+    clientFor: (key: string) => { clientKeys.push(key); return n.h.stub(key).web },
+  }
+  const queued = createQueuedAckCallback({ ...deps, getReaction: () => 'hourglass' })
+  const delivered = createDeliveryAckCallback({ ...deps, getReaction: () => 'white_check_mark' })
+  // Reporting may call either stage with the current durable item.
+  const bothStages = async (seq: number) => { await queued('alpha', e.queue.item('alpha', seq)!); await delivered('alpha', e.queue.item('alpha', seq)!) }
+  const untouched = (key: string) => ({ added: n.h.stub(key).calls.reactionsAdd, removed: n.h.stub(key).calls.reactionsRemove })
+  const reaction = await acceptOn(e, reactionInput())
+  await bothStages(reaction)
+  await deliverDurably(e, reaction)
+  expect(e.queue.item('alpha', reaction)!.delivered).toBe(true)
+  await bothStages(reaction)
+  expect({ clientKeys, adoptions }).toEqual({ clientKeys: [], adoptions: [] })
+  for (const key of ['alpha', 'beta']) expect(untouched(key)).toEqual({ added: [], removed: [] })
+  expect(e.queue.item('alpha', reaction)!.accepted.queued_ack_reaction).toBeUndefined()
+  expect(consumeAck('alpha', 'C0TEST001', '1700000000.000002')).toBe(false)
+
+  // The same settings and own client acknowledge the reacted-to Slack message.
+  const target = { channel: 'C0TEST001', timestamp: '1700000000.000001' }
+  const slack = await acceptOn(e, slackInput())
+  await bothStages(slack)
+  expect(untouched('alpha')).toEqual({ added: [{ ...target, name: 'hourglass' }], removed: [] })
+  await deliverDurably(e, slack)
+  await bothStages(slack)
+  expect(untouched('alpha')).toEqual({ added: [{ ...target, name: 'hourglass' }, { ...target, name: 'white_check_mark' }], removed: [{ ...target, name: 'hourglass' }] })
+  expect({ clientKeys, adoptions }).toEqual({ clientKeys: ['alpha', 'alpha'], adoptions: [slack] })
+  expect(untouched('beta')).toEqual({ added: [], removed: [] })
+  expect(consumeAck('alpha', target.channel, target.timestamp)).toBe(true)
+})
+
+test('rememberQueuedReaction gives a Reaction Item no queued-ack metadata and leaves its journal unchanged', async () => {
+  const { e } = await setup()
+  const reaction = await acceptOn(e, reactionInput())
+  const slack = await acceptOn(e, slackInput())
+  const journal = readFileSync(queuePath(e.root), 'utf8'), item = e.queue.item('alpha', reaction)
+  const record = e.records().find(r => r.kind === 'accepted' && r.seq === reaction)
+  expect(await e.queue.rememberQueuedReaction('alpha', reaction, 'hourglass')).toBeUndefined()
+  expect(readFileSync(queuePath(e.root), 'utf8')).toBe(journal)
+  expect(e.queue.item('alpha', reaction)).toEqual(item!)
+  expect(item!.accepted.queued_ack_reaction).toBeUndefined()
+  // The Slack control's rewrite still leaves the reaction record as it was.
+  expect(await e.queue.rememberQueuedReaction('alpha', slack, 'hourglass')).toBe('hourglass')
+  expect(e.queue.item('alpha', slack)!.accepted.queued_ack_reaction).toBe('hourglass')
+  expect(e.records().find(r => r.kind === 'accepted' && r.seq === reaction)).toEqual(record!)
+  expect(e.queue.item('alpha', reaction)).toEqual(item!)
 })

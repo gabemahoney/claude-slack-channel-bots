@@ -5,6 +5,7 @@ import { mkdtempSync, mkdirSync, rmSync, symlinkSync, realpathSync, readFileSync
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { cannedGetResult, makeStubClient } from './test-helpers/agent-director-stub.ts'
 import { codexContainment, codexArguments, configureScratchCodex, createScratchCodexLifecycle, scratchCodexContract, codexRetirementCheckpoint, CODEX_NATIVE, CODEX_AUTH_MOUNT, CODEX_NO_REPLY } from './real-agent/codex-guards.ts'
 import { checkCodexScratchConfigKeys, encodeCodexHostConfigKeys } from '../src/codex-config-keys.ts'
 import { completedCodexTurn, projectCodexRollout, safeCodexEvents } from './real-agent/codex-evidence.ts'
@@ -14,6 +15,80 @@ import { projectCrashProgress, publishCrashProgress, readCrashProgress, waitForC
 const session = 'synthetic-session', model = 'synthetic/model', text = 'synthetic exact input', sentAt = 1000
 const hostProjection = encodeCodexHostConfigKeys([['model']])
 const nativeConfig = '[tui]\nscreen_reader_detection_done = true\n'
+
+describe('Codex driver late AD readiness (synthetic; no native process)', () => {
+  function driver(observations: Record<string, unknown>[]) {
+    // Execute the actual poll, identity guard, launch and AI begin closure.
+    // The guarded driver entrypoint is never imported or executed.
+    const source = readFileSync(join(import.meta.dir, 'real-agent/codex-delivery.ts'), 'utf8')
+    const extract = (name: string) => {
+      const declaration = source.match(new RegExp(`^async function ${name}[\\s\\S]*?^\\}`, 'm'))?.[0]
+      if (!declaration) throw new Error(`missing driver declaration: ${name}`)
+      return declaration
+    }
+    const begin = source.slice(source.indexOf('  const begin = async '), source.indexOf('  const audit = async '))
+    expect(begin).toContain('const begin = async ')
+    let at = 0, reads = 0, builds = 0
+    const records: { label: string; value: any; reads: number }[] = [], checkpoints: string[] = []
+    const client = makeStubClient({ getFn: ({ instance_id }) => {
+      const observation = observations[Math.min(reads++, observations.length - 1)]!
+      return cannedGetResult({ instance_id, agent: 'codex', labels: { tag_prompt: '1' }, relay_mode: 'on',
+        cwd: '/synthetic/work', state: 'waiting', session_id: session, ...observation })
+    } })
+    const program = `
+      const { client, join, codexArguments, CODEX_NATIVE, Date, Bun, record, authContract, buildEngine } = deps;
+      let instance, stage, lastKey, engines;
+      const work = '/synthetic/work', codexHome = '/synthetic/home', key = 'synthetic';
+      const sessions = new Set(), liveInstances = new Set(), paths = { model: 'synthetic/model' };
+      const tagDescription = 'synthetic instructions', queue = { items: () => [{ accepted: { seq: 7 } }] };
+      const scratchLifecycle = { beforeSpawn() {}, afterSpawn() {} };
+      const writeFileSync = () => {}, stopEngine = async () => {};
+      ${['poll', 'row', 'waiting', 'start'].map(extract).join('\n')}
+      ${begin}
+      return { begin, sessions };
+    `
+    const actual = new Function('deps', new Bun.Transpiler({ loader: 'ts' }).transformSync(program))({
+      client, join, codexArguments, CODEX_NATIVE, Date: { now: () => at }, Bun: { sleep: async (ms: number) => { at += ms } },
+      record: (label: string, value: any) => records.push({ label, value, reads }),
+      authContract: (checkpoint: string) => checkpoints.push(checkpoint), buildEngine: async () => { builds++ },
+    }) as { begin(label: string, instructions: string): Promise<number>; sessions: Set<string> }
+    return { ...actual, records, checkpoints, reads: () => reads, builds: () => builds, elapsed: () => at }
+  }
+
+  test.each(['already valid', 'empty then valid', 'working then waiting'])('begins only with a validated waiting session: %s', async kind => {
+    const observations = kind === 'empty then valid' ? [{ session_id: '' }, { session_id: '' }, {}]
+      : kind === 'working then waiting' ? [{ state: 'working' }, {}] : [{}]
+    const d = driver(observations)
+    expect(await d.begin('case-one', 'synthetic instructions')).toBe(7)
+    expect([...d.sessions]).toEqual([session]); expect(d.builds()).toBe(1)
+    expect(d.checkpoints).toEqual(['postidle'])
+    expect(d.records.filter(r => r.label === 'launch').map(r => r.reads)).toEqual([observations.length])
+  })
+  test.each(['', 123])('times out without declaring readiness or building for session %j', async session_id => {
+    const d = driver([{ session_id }])
+    await expect(d.begin('case-one', 'synthetic instructions')).rejects.toThrow('AD waiting row: observation incomplete within bound')
+    const bound = d.records.find(r => r.label === 'bound')!
+    expect(bound.value.step).toBe('AD waiting row'); expect(d.elapsed()).toBe(bound.value.milliseconds)
+    expect([...d.sessions]).toEqual([]); expect(d.builds()).toBe(0)
+    expect(d.checkpoints).toEqual([]); expect(d.records.some(r => r.label === 'launch')).toBe(false)
+  })
+  test('rejects a foreign instance even with a nonempty waiting session', async () => {
+    const d = driver([{ instance_id: 'foreign' }])
+    await expect(d.begin('case-one', 'synthetic instructions')).rejects.toThrow('wrong native row identity')
+    expect(d.records).toEqual([]); expect([...d.sessions]).toEqual([]); expect(d.builds()).toBe(0)
+  })
+  test.each(['', 'unvalidated-session'])('begin retains the validated row when a later read would have session %j', async session_id => {
+    const d = driver([{}, { session_id }])
+    expect(await d.begin('case-one', 'synthetic instructions')).toBe(7)
+    expect([...d.sessions]).toEqual([session]); expect(d.reads()).toBe(1); expect(d.builds()).toBe(1)
+  })
+  test('rejects a previously used conversation before building the next case', async () => {
+    const d = driver([{}])
+    await d.begin('case-one', 'synthetic instructions')
+    await expect(d.begin('case-two', 'synthetic instructions')).rejects.toThrow('AI case did not get a fresh native conversation')
+    expect([...d.sessions]).toEqual([session]); expect(d.builds()).toBe(1)
+  })
+})
 
 describe('D1 crash-worker checkpoints and durable-pair boundary (synthetic; no native process)', () => {
   const progress = (patch: Partial<CrashProgress> = {}): CrashProgress => ({ version: 1, pid: 321, instance: 'cscb_codex_gate',
@@ -685,5 +760,56 @@ describe('synthetic Codex native-evidence controls', () => {
     expect(JSON.stringify(safe).includes(secret)).toBe(false)
     expect(JSON.stringify(safe).includes(text)).toBe(false)
     assertNoLeak(safe)
+  })
+})
+
+describe('Codex AI case labels the model sees equal its oracle (static; no native process)', () => {
+  const source = readFileSync(join(import.meta.dir, 'real-agent/codex-delivery.ts'), 'utf8')
+  /** Resolve every case label in one criterion's branch of the driver's ai():
+   * each model-facing spelling (JSON in instructions and the plain query
+   * wording) and each `case` the oracle expects. A label is a literal or a
+   * top-level string constant (interpolated as `${NAME}` where the model sees
+   * it); an unresolved name stays undefined. */
+  function caseLabels(text: string, ac: 15 | 106) {
+    const constants = new Map([...text.matchAll(/^(?:export )?const\s+(.+)$/gm)].flatMap(m =>
+      [...m[1]!.matchAll(/([A-Za-z_$][\w$]*)\s*=\s*(?:'([^'\n]*)'|"([^"\n]*)")/g)].map(c => [c[1]!, c[2] ?? c[3]!] as const)))
+    const start = text.indexOf(`begin('ai_${ac}'`), end = text.indexOf(ac === 15 ? "begin('ai_106'" : 'await summary(', start)
+    if (start < 0 || end < 0) throw new Error(`missing ai_${ac} branch`)
+    const branch = text.slice(start, end)
+    const interpolated = (label: string) => {
+      const name = /^\$\{([A-Za-z_$][\w$]*)\}$/.exec(label)?.[1]
+      return name === undefined ? label : constants.get(name)
+    }
+    return {
+      prompt: [...branch.matchAll(/"case"\s*:\s*"([^"]*)"|\bcase\s+"([^"]*)"/g)].map(m => interpolated(m[1] ?? m[2]!)),
+      oracle: [...branch.matchAll(/\bcase:\s*(?:'([^']*)'|"([^"]*)"|([A-Za-z_$][\w$]*))/g)].map(m => m[1] ?? m[2] ?? constants.get(m[3]!)),
+    }
+  }
+
+  test.each([15, 106] as const)('criterion %s asks the model for exactly the non-empty case its oracle requires', ac => {
+    const { prompt, oracle } = caseLabels(source, ac)
+    // Both instructions and every case-bearing oracle answer are checked.
+    expect(prompt.length).toBeGreaterThanOrEqual(ac === 106 ? 2 : 1)
+    expect(oracle.length).toBe(2)
+    expect(typeof oracle[0]).toBe('string'); expect(oracle[0]).not.toBe('')
+    expect({ prompt: [...new Set(prompt)], oracle: [...new Set(oracle)] }).toEqual({ prompt: [oracle[0]], oracle: [oracle[0]] })
+  })
+  // The pre-fix driver's spellings (df42e4d9): the model was asked for an empty case.
+  const preFix = [
+    `const after = await begin('ai_15', 'Once complete return {"case":"","messages":the number of messages received,"body":the joined BODY}.')`,
+    `part < 3 ? { status: 'received' } : { case: "AC15", messages: 1, body }, true))`,
+    `await completedItem(seq, 3, { case: "AC15", messages: 1, body }, true)`,
+    `const after = await begin('ai_106', 'When asked for a count, return {"case":"","messages":the number of distinct prior DMs received before the query}. Use no tools.')`,
+    `const query = await accept(dm('How many distinct DMs have you received before this query? Return a JSON object with case "" and messages set to the count you observed.', 111))`,
+    `await delivered(query); await completedItem(query, 1, { case: "AC106", messages: 1 }, true); await waiting()`,
+    `await completedItem(query, 1, { case: "AC106", messages: 1 }, true)`,
+    `await summary(duplicates, true)`,
+  ].join('\n')
+  test.each([[15, 'AC15'], [106, 'AC106']] as const)('the label check tells the pre-fix criterion %s empty prompt case from its oracle %s', (ac, label) => {
+    const { prompt, oracle } = caseLabels(preFix, ac)
+    expect({ prompt: [...new Set(prompt)], oracle: [...new Set(oracle)] }).toEqual({ prompt: [''], oracle: [label] })
+  })
+  test('no model-facing string in the driver asks for an empty case label', () => {
+    expect(source.split('\n').flatMap((line, i) => /"case"\s*:\s*""|\bcase\s+""/.test(line) ? [`line ${i + 1}`] : [])).toEqual([])
   })
 })

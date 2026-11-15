@@ -10,6 +10,7 @@ source "$(dirname "$0")/lib/scenario.sh"
 
 PRINTER="${SCENARIO_FIXTURES}/fmk-texts.ts"
 SR8="${SCENARIO_FIXTURES}/sr8-evidence.ts"
+BURST_DRIVER="${SCENARIO_FIXTURES}/burst-driver.sh"
 EVIDENCE="${SCENARIO_ROOT}/evidence"
 mkdir -p "${EVIDENCE}"
 RECORD_WAIT_S=30
@@ -19,6 +20,25 @@ LOG="${SLACK_STATE_DIR}/server.log"
 printed() { bun "${PRINTER}" "$@" || fail "printer entry $1 failed"; }
 mono_ms() { python3 -c 'import time; print(time.monotonic_ns() / 1000000)'; }
 byte_mark() { if [[ -e "$1" ]]; then stat -c %s "$1"; else printf '0\n'; fi; }
+# Runs one sr8-evidence verdict command and prints all its rows; a failing
+# exit then prints a FAIL line in fail's form naming each fail/missing verdict (with its
+# persona, if any), so the runner's FAIL line says which measures failed, and
+# exits with the command's own status (64 for a usage error, 137 when killed).
+sr8_verdicts() {
+    local rows="${EVIDENCE}/verdicts.txt" status=0 line name failed=()
+    local verdict_re='^recorded: sr8 ([^ ]+) .* verdict=(fail|missing)$' persona_re=' persona=([^ ]+) '
+    bun "${SR8}" "$@" > "${rows}" || status=$?
+    cat "${rows}"
+    (( status == 0 )) && return 0
+    while IFS= read -r line; do
+        [[ "${line}" =~ ${verdict_re} ]] || continue
+        name="${BASH_REMATCH[1]}=${BASH_REMATCH[2]}"
+        if [[ "${line}" =~ ${persona_re} ]]; then name="${name%=*}[${BASH_REMATCH[1]}]=${name##*=}"; fi
+        failed+=("${name}")
+    done < "${rows}"
+    echo "FAIL: ${TEST_NAME}: ${failed[*]:-sr8 $1 exited ${status} with no verdict} (${mode}/${population}/${recipients})" >&2
+    exit "${status}"
+}
 
 # These are serial child invocations of this same script, not additional CI
 # scripts. sr8Combinations owns their order and populations. Do not split or
@@ -220,13 +240,13 @@ if [[ "${population}" != 0 ]]; then
     bun "${SR8}" seed "${CONFIG}" "${SLACK_STATE_DIR}" "${population}"
     first_mark="$(byte_mark "${LOG}")"
     start_ready
-    bun "${SR8}" seal first "${CONTEXT[@]}" "${LOG}" "${first_mark}" "${CONFIG}"
+    sr8_verdicts seal first "${CONTEXT[@]}" "${LOG}" "${first_mark}" "${CONFIG}"
     clean_stop
 fi
 measured_log_mark="$(byte_mark "${LOG}")"
 measurement_mark="$(byte_mark "${MEASUREMENTS}")"
 start_ready measured
-bun "${SR8}" seal measured "${CONTEXT[@]}" "${LOG}" "${measured_log_mark}" "${CONFIG}"
+sr8_verdicts seal measured "${CONTEXT[@]}" "${LOG}" "${measured_log_mark}" "${CONFIG}"
 
 start_pending_post() {
     local key="$1" request facts
@@ -280,8 +300,10 @@ case "${CASE}" in
         done
         burst_status=0
         # Observer-only CPU readings at each wave boundary, for observe below.
+        # The driver runs off the server's CPU quota; driver-cpu judges that.
         SR8_PHASE_CPU_FILE="${RESULTS}/phase-cpu.jsonl" SR8_PHASE_CPU_PIDS="server=${SERVER_PID},stub=${SLACK_PID}" \
-            SR8_PROFILE_DIR="${PROFILE_DIR}" bun "${SR8}" burst "${CONTEXT[@]}" "${BATCH}" "${SCENARIO_SLACK_STUB_URL}" \
+            SR8_PROFILE_DIR="${PROFILE_DIR}" bash "${BURST_DRIVER}" "${RESULTS}/driver-cgroup" \
+            bun "${SR8}" burst "${CONTEXT[@]}" "${BATCH}" "${SCENARIO_SLACK_STUB_URL}" \
             "${SCENARIO_SLACK_RECORD}" "${SLACK_STATE_DIR}" "${RESULTS}" 30000 \
             "${MEASUREMENTS}" "${measurement_mark}" || burst_status=$?
         # The profile ends with the waves, before the observation wait below,
@@ -289,7 +311,7 @@ case "${CASE}" in
         profile_stop
         profile_summary
         # Observe zero as well as positive ACKs; check judges the exact set.
-        jq -er '.envelope_id // error("burst push has no envelope")' "${RESULTS}/burst.jsonl" > "${RESULTS}/envelopes"
+        jq -ser 'if all(.[]; (.envelope_id | type)=="string") then .[].envelope_id else error("burst push has no string envelope_id") end' "${RESULTS}/burst.jsonl" > "${RESULTS}/envelopes" || fail 'burst push has no string envelope_id'
         _scenario_complete_jsonl "${SCENARIO_SLACK_RECORD}" > "${RESULTS}/final-stub.jsonl"
         bun "${SR8}" envelope-times "${RESULTS}/envelopes" "${RESULTS}/final-stub.jsonl" > "${RESULTS}/times.jsonl"
         # An observation wait, not an allowance: check uses each hold's actual
@@ -305,12 +327,13 @@ case "${CASE}" in
         if [[ "${mode}/${population}/${recipients}" == open/100000/2 ]]; then
             bun "${SR8}" conditions "${SLACK_STATE_DIR}" "${SERVER_PID}"
         fi
+        sr8_verdicts driver-cpu "${CONTEXT[@]}" "${SERVER_PID}" "${RESULTS}/driver-cgroup"
         clean_stop
         cp "${MEASUREMENTS}" "${RESULTS}/measurements.jsonl"
         for key in "${KEYS[@]}"; do snapshot "${key}" "${RESULTS}/${key}.queue.jsonl"; done
         reopen_mark="$(byte_mark "${LOG}")"
         start_ready
-        bun "${SR8}" seal measured "${CONTEXT[@]}" "${LOG}" "${reopen_mark}" "${CONFIG}"
+        sr8_verdicts seal measured "${CONTEXT[@]}" "${LOG}" "${reopen_mark}" "${CONFIG}"
         for key in "${KEYS[@]}"; do shared_thread_joins "${key}" > "${RESULTS}/${key}.after.jsonl"; done
         clean_stop
         closing_assertions
@@ -318,7 +341,7 @@ case "${CASE}" in
         # It prints before check, whose failure ends the script.
         bun "${SR8}" observe "${CONTEXT[@]}" "${RESULTS}" "${RESULTS}/measurements.jsonl" "${measurement_mark}" \
             "${RESULTS}/phase-cpu.jsonl" || printf 'recorded: sr8 observe unavailable\n'
-        bun "${SR8}" check "${CONTEXT[@]}" "${RESULTS}" "${RESULTS}/measurements.jsonl" "${measurement_mark}" "${start_ms}" "${ready_ms}"
+        sr8_verdicts check "${CONTEXT[@]}" "${RESULTS}" "${RESULTS}/measurements.jsonl" "${measurement_mark}" "${start_ms}" "${ready_ms}"
         [[ "${burst_status}" == 0 ]] || fail 'burst submission or ACK observation failed'
         ;;
     pending)
@@ -351,7 +374,7 @@ case "${CASE}" in
         pending_seq="$(slack_post_mark)"
         # The probes lead the burst's second wave, while the post stays pending.
         burst_status=0
-        bun "${SR8}" burst "${CONTEXT[@]}" "${BATCH}" "${SCENARIO_SLACK_STUB_URL}" \
+        bash "${BURST_DRIVER}" "${RESULTS}/driver-cgroup" bun "${SR8}" burst "${CONTEXT[@]}" "${BATCH}" "${SCENARIO_SLACK_STUB_URL}" \
             "${SCENARIO_SLACK_RECORD}" "${SLACK_STATE_DIR}" "${RESULTS}" 30000 || burst_status=$?
         # The actual measured interval includes the burst and these 120 seconds.
         # Repeated lost-post and hung-history controls retain the same unresolved intent.
@@ -363,18 +386,22 @@ case "${CASE}" in
         shared_wait_own_post_state "${key}" "${OPERATION[${key}]}" "${HOLD_CHANNEL}" "${STAMP[${key}]}" unresolved \
             > "${EVIDENCE}/after.unresolved.json"
         window_end="$(mono_ms)"
-        jq -er '.envelope_id // error("burst push has no envelope")' "${RESULTS}/burst.jsonl" > "${RESULTS}/envelopes"
+        jq -ser 'if all(.[]; (.envelope_id | type)=="string") then .[].envelope_id else error("burst push has no string envelope_id") end' "${RESULTS}/burst.jsonl" > "${RESULTS}/envelopes" || fail 'burst push has no string envelope_id'
         _scenario_complete_jsonl "${SCENARIO_SLACK_RECORD}" > "${RESULTS}/final-stub.jsonl"
         bun "${SR8}" envelope-times "${RESULTS}/envelopes" "${RESULTS}/final-stub.jsonl" > "${RESULTS}/times.jsonl"
         : > "${EVIDENCE}/probes.tsv"
         while IFS=$'\t' read -r parent channel ts; do
-            envelope="$(jq -er --arg ts "${ts}" 'select(.phase=="probes" and .ts==$ts) | .envelope_id' "${RESULTS}/burst.jsonl")"
+            # Slurp: jq 1.6's -e reports only the last JSONL line, which is rarely the probe.
+            envelope="$(jq -ser --arg ts "${ts}" '[.[] | select(.phase=="probes" and .ts==$ts) | .envelope_id]
+                | if length==1 and (.[0]|type)=="string" and (.[0]|length)>0 then .[0] else error("missing or ambiguous") end' \
+                "${RESULTS}/burst.jsonl")" || fail "pending ${parent} probe ${ts} has no unique burst envelope"
             printf '%s\t%s\t%s\t%s\n' "${parent}" "${channel}" "${ts}" "${envelope}" >> "${EVIDENCE}/probes.tsv"
         done < "${EVIDENCE}/probe-plan.tsv"
         for persona in "${KEYS[@]}"; do snapshot "${persona}" "${RESULTS}/${persona}.queue.jsonl"; done
+        sr8_verdicts driver-cpu "${CONTEXT[@]}" "${SERVER_PID}" "${RESULTS}/driver-cgroup"
         clean_stop
         closing_assertions
-        bun "${SR8}" pending-post "${CONTEXT[@]}" "${key}" "${OPERATION[${key}]}" "${pending_start}" "${pending_end}" \
+        sr8_verdicts pending-post "${CONTEXT[@]}" "${key}" "${OPERATION[${key}]}" "${pending_start}" "${pending_end}" \
             "${EVIDENCE}/before.posts.jsonl" "${EVIDENCE}/after.posts.jsonl" "${EVIDENCE}/probes.tsv" "${RESULTS}/${key}.queue.jsonl" \
             "${RESULTS}/times.jsonl" "${MEASUREMENTS}" "${pending_mark}" "${HOLD_CHANNEL}" \
             "${RESULTS}" "${pending_seq}" "${settled_seq}" "${compact_ms}" "${start_ms}" "${window_end}"
@@ -394,7 +421,7 @@ case "${CASE}" in
             cp "${CONFIG}" "${EVIDENCE}/${phase}.input"
             : > "${EVIDENCE}/${phase}.facts.jsonl"
             for key in "${KEYS[@]}"; do
-                shared_persona_facts "${key}" >> "${EVIDENCE}/${phase}.facts.jsonl" || fail 'cannot read shared-list facts'
+                shared_persona_facts "${key}" | cat >> "${EVIDENCE}/${phase}.facts.jsonl" || fail 'cannot read shared-list facts'
                 printf '\n' >> "${EVIDENCE}/${phase}.facts.jsonl"
             done
         }
@@ -450,6 +477,6 @@ PY
         restore_permissions
         clean_stop
         closing_assertions
-        bun "${SR8}" shared-list "${CONTEXT[@]}" "${EVIDENCE}" "${probe_exit}"
+        sr8_verdicts shared-list "${CONTEXT[@]}" "${EVIDENCE}" "${probe_exit}"
         ;;
 esac

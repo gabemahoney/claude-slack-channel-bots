@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { SERVER_POST_METADATA } from './test-helpers/server-post.ts'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ChannelMode, DeliveryMode, PersonaInput } from '../src/config.ts'
@@ -7,7 +8,7 @@ import { DELIVERY_ROW_POLL_MS } from '../src/delivery-engine.ts'
 import { THREAD_MEMORY_JOINS_LOST } from '../src/persona-diagnostics.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
-import { dropPersonaSession, OWN_POST_UPLOAD_FILENAME } from '../src/registry.ts'
+import { dropPersonaSession } from '../src/registry.ts'
 import { buildThreadMemoryJoinsLostLine, buildThreadMemoryJoinsLostNotice } from '../src/thread-memory-reports.ts'
 import { assertNoLeak, LEAK_SENTINEL, writtenFile } from './test-helpers/credentials.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
@@ -164,7 +165,7 @@ function expectLoss(run: ReloadRun, cause?: string, threads: string[] = [], key 
   const loss = { threads: [], messages: [], ownPosts: [{ channel, threads, cause }] }
   const notice = buildThreadMemoryJoinsLostNotice(persona, loss)
   expect(run.stub(key).calls.postMessage.filter(p => 'text' in p && p.text === formatPersonaNotice(persona, notice.text, notice.options)))
-    .toEqual([{ channel: stubOpenedDmId('U0OPERATOR'), text: formatPersonaNotice(persona, notice.text, notice.options) }])
+    .toEqual([{ channel: stubOpenedDmId('U0OPERATOR'), text: formatPersonaNotice(persona, notice.text, notice.options), metadata: SERVER_POST_METADATA }])
   expect(lines).toEqual([buildThreadMemoryJoinsLostLine(persona, loss)])
 }
 
@@ -528,7 +529,7 @@ describe.each(['strict', 'open'] as const)('%s own-post crash recovery', mode =>
 // share message, learnt from P's Event or a history read (SR-3.2.3).
 const share = '20.000001'
 const fileId = slackFileId(1)
-// The caller's file sits under the harness root the leak check scans, so only the reply text carries the sentinel.
+// The caller's file sits under the harness root the leak check scans, so it carries no sentinel.
 const uploadBody = 'upload body'
 function uploadFile() {
   const dir = join(h.root, 'inbox')
@@ -537,10 +538,10 @@ function uploadFile() {
   writeFileSync(path, uploadBody)
   return path
 }
-/** A reply with one file; Slack's completion names `fileId`, or `completion` answers instead. */
+/** A files-only reply, whose one file is uploaded as a new channel message; Slack's completion names `fileId`, or `completion` answers instead. */
 function upload(run: ReloadRun, completion?: WebApiOutcome, key = 'alpha') {
   run.stub(key).script.completeUpload.push(completion ?? { kind: 'ok', result: { files: [{ id: fileId }] } })
-  return run.callTool(key, 'reply', { chat_id: channel, text: body, files: [uploadFile()] })
+  return run.callTool(key, 'reply', { chat_id: channel, text: '', files: [uploadFile()] })
 }
 function uploads(run: ReloadRun, key = 'alpha') { return run.stub(key).calls.filesUploadV2 }
 function histories(run: ReloadRun, key = 'alpha') { return run.stub(key).calls.conversationsHistory }
@@ -548,7 +549,7 @@ function histories(run: ReloadRun, key = 'alpha') { return run.stub(key).calls.c
 function sharePages(found: boolean, extra: { outcomes?: Record<number, WebApiOutcome[]>; key?: string } = {}) {
   return makePagedThread(1, { channel, identity: extra.key === 'bravo' ? siblingIdentity : identity, pageOutcomes: extra.outcomes,
     message: (): PagedMessageSpec => found
-      ? { author: 'own-user', placement: 'channel', ts: share, text: '', file: { name: OWN_POST_UPLOAD_FILENAME, size: Buffer.byteLength(uploadBody) }, fileIds: [fileId] }
+      ? { author: 'own-user', placement: 'channel', ts: share, text: '', file: { name: 'upload.txt', size: Buffer.byteLength(uploadBody) }, fileIds: [fileId] }
       : { author: 'other-user', placement: 'channel', ts: share, text: 'unrelated', file: false } })
 }
 function shareEvent(run: ReloadRun, key = 'alpha') {
@@ -565,7 +566,7 @@ async function deliverOwnShare(run: ReloadRun, key = 'alpha') {
   expect(run.queued(key)).toHaveLength(queued)
 }
 function uploadJoins(key = 'alpha') { return joins(key).filter(j => j.source === 'own-post' && j.root === share) }
-/** The upload's outcomes: its intent follows the reply text's, which a restart may compact away. */
+/** The upload's outcomes: its intent is the latest, which a restart may compact away. */
 function uploadOutcomes(key = 'alpha') {
   const intent = intents(key).at(-1)
   return intent ? outcomes(key).filter(o => o.operationId === intent.operationId) : []
@@ -580,7 +581,7 @@ describe.each(['strict', 'open'] as const)('%s upload threads', mode => {
     withPages(run, sharePages(true, { outcomes: { 0: [late.outcome] } }))
     expect((await upload(run)).isError).toBe(false)
     await run.clock.flush()
-    expect(uploads(run)).toHaveLength(1); expect(posted(run)).toHaveLength(1)
+    expect(uploads(run)).toHaveLength(1); expect(run.stub('alpha').calls.postMessage).toHaveLength(0)
     // The completion's own kick has started a read, which is still unanswered.
     expect(histories(run)).toHaveLength(1)
     expect(view(run, share)).toBe('not-joined')
@@ -647,7 +648,7 @@ describe.each(['strict', 'open'] as const)('%s upload threads', mode => {
     // di's digest lookup, bounded above by the read end.
     expect(histories(recovered)).toHaveLength(1); expect(histories(recovered)[0]).toHaveProperty('latest')
     expect(uploads(first)).toHaveLength(1); expect(uploads(recovered)).toHaveLength(0)
-    expect(posted(first)).toHaveLength(1); expect(posted(recovered)).toHaveLength(0)
+    expect(first.stub('alpha').calls.postMessage).toHaveLength(0); expect(posted(recovered)).toHaveLength(0)
     const next = await intake(recovered, share)
     expectDeliveries(recovered, [[next, 'thread']])
     expectLoss(recovered)
@@ -812,7 +813,7 @@ async function heldReply(run: ReloadRun, thread: string, key = 'alpha', parentUs
   return { event, receivedAt, seq: item.accepted.seq }
 }
 function resolutions(key = 'alpha') {
-  return readQueue(h.stateDir, key).filter(r => r.kind === 'released' || r.kind === 'withdrawn' || r.kind === 'parked')
+  return readQueue(h.stateDir, key).filter(r => r.kind === 'released' || r.kind === 'hold-withdrawn' || r.kind === 'parked')
 }
 function expectHoldOutputsQuiet(run: ReloadRun) {
   expect(JSON.stringify({ events: run.postHoldEvents, releases: run.postHoldReleases, saved: resolutions() })).not.toContain(heldBody)
@@ -869,7 +870,7 @@ describe.each(['strict', 'open'] as const)('%s Post Holds end to end', mode => {
     }
     await run.clock.flush()
     const resolved = outcome === 'failed' ? 'withdrawn' : 'released'
-    expect(resolutions()).toEqual([{ v: 1, kind: resolved, seq: held.seq, at: expect.any(Number) }])
+    expect(resolutions()).toEqual([{ v: 1, kind: resolved === 'withdrawn' ? 'hold-withdrawn' : resolved, seq: held.seq, at: expect.any(Number) }])
     expect(run.postHoldEvents).toEqual([{ kind: 'post-hold-resolved', key: 'alpha', seq: held.seq, outcome: resolved,
       cause: outcome === 'confirmed' ? 'thread' : outcome === 'failed' ? 'outcomes' : 'timer',
       heldMs: outcome === 'confirmed' ? 1000 : outcome === 'failed' ? 0 : THREAD_REPLY_HOLD_MS }])

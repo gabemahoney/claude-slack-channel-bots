@@ -7,13 +7,17 @@ import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import ts from 'typescript'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
-import { TEST_MEASUREMENTS_KEY, TEST_MEASUREMENT_TIMINGS_KEY } from '../src/config.ts'
+import { TEST_MEASUREMENTS_KEY, TEST_MEASUREMENT_TIMINGS_KEY, CHANNEL_ID_RE, parsePersonaConfigBytes } from '../src/config.ts'
+import { decideDelivery } from '../src/delivery-decision.ts'
+import { buildDeliveryDispatchLine } from '../src/delivery-notices.ts'
+import { createPersonaEventRouter } from '../src/persona-event-router.ts'
+import { RELOAD_NOOP } from '../src/reload-apply.ts'
 import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX } from './test-helpers/credentials.ts'
 import { test29ClosingFixture, test29EvidencePrinter, test29PrinterFixture, test29PrinterBindings, test29SwitchBindings, test29SwitchCallOrder } from './test-helpers/test29-controls.ts'
 import { TEST29_ROOT, test29RestartFixture, test29CompactionFixture, test29DiagnosticFixture, test29WatchdogFixture, test29DiagnosticExpectedItem } from './test-helpers/test29-queue.ts'
 import { percentile } from './integration/fixtures/transcript-receipts.ts'
 import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVerdict, storeVerdict, postHoldVerdict,
-  n4Verdict, n2Verdict, n2Samples, sealVerdict, requireSeedPopulation, startupVerdict, compactionVerdict, joinsVerdict,
+  n4Verdict, n2Verdict, n2Samples, sealVerdict, requireSeedPopulation, startupVerdict, compactionVerdict, storeWindow, faultWindow, faultRewriters, joinsVerdict,
   windowsVerdict, resultLine, summary, evidenceExit, printResults, type Measurement, type Times, type Result,
   SR8_PENDING_POST_MS, SR8_LARGE_BYTES, SR8_SHARED_CHANNELS, pendingPostVerdicts, sharedListVerdicts,
   scanDiagnostics, membershipFaultVerdicts, membershipFaultRows, cpuThrottle, cpuConditionFields, membershipRepairVerdict, membershipLateVerdict, zeroAckVerdict,
@@ -23,19 +27,26 @@ import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVer
   burstAckVerdicts, pendingBurstVerdict, type BurstItem, type PendingWindow,
   SR8_DIAGNOSTIC_KINDS, SR8_USER_HZ, cgroupCpuCounters, procCpuTicks, phasePids, phaseCpuSample, phaseCpuResults, ackClockSamples, ackClockResults,
   ackBinResults, ackEventResults, serverWaves, serverPhase, appendResults, saveResults, observeResults, type PhaseCpuSample, type ClockSample,
+  SR8_SERVER_CPUS, SR8_GUARDED_CGROUP_FILES, cgroupPathOf, cgroupChain, cpuMaxCpus, driverCpuVerdict, guardedCgroups, cgroupWriteAccess, cgroupOpenFailure,
+  type CgroupWriteAccess, type CgroupOpenOutcome,
 } from './integration/fixtures/sr8-evidence.ts'
-import { serializeTestMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement,
+import { CPUS_PER_SHARD } from '../scripts/ci-run.ts'
+import { serializeTestMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, threadCompactionMeasurement,
   type TestMeasurement, type TestMeasurementRecord } from '../src/test-measurements.ts'
-import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
+import { QUEUE_COMPACT_INTERVAL_MS, type AcceptedRecord } from '../src/delivery-queue.ts'
 import { THREAD_REPLY_HOLD_MS, DELIVERY_MAX_AD_CALLS_PER_S } from '../src/delivery-constants.ts'
 import { NAME_LOOKUP_TIMEOUT_MS } from '../src/tag-wrapper.ts'
 import { buildThreadMemoryChangedWhileStoppedLine } from '../src/thread-memory-reports.ts'
-import { THREAD_MEMORY_CHANGED_WHILE_STOPPED, THREAD_MEMORY_JOINS_LOST } from '../src/persona-diagnostics.ts'
+import { THREAD_MEMORY_CHANGED_WHILE_STOPPED, THREAD_MEMORY_JOINS_LOST, UNCLAIMED_CHANNEL, fungibleUnclaimedChannelCause, formatPersonaDiagnostic } from '../src/persona-diagnostics.ts'
 import { MEMBERSHIP_REQUEST_TIMEOUT_MS, MEMBERSHIP_ATTEMPT_TIMEOUT_MS, MEMBERSHIP_RETRY_MAX_MS, MEMBERSHIP_PAGE_LIMIT, membershipRetryDelay } from '../src/channel-membership-retry.ts'
 import { startSlackStub, type StubAnswers } from './integration/fixtures/slack-stub-server.ts'
+import { WebClient } from '@slack/web-api'
+import { longLivedWebClientOptions, PERSONA_WEB_API_REQUEST_TIMEOUT_MS } from '../src/persona-slack-clients.ts'
+import { judgeOwnPostLookup } from '../src/own-post-lookup.ts'
+import { outputDuringAsync } from './test-helpers/slack-logger-probes.ts'
 import { MEMBERSHIP_INVENTORY_INCOMPLETE, MEMBERSHIP_INVENTORY_COMPLETE, membershipScanDiagnostic } from '../src/channel-membership-scan.ts'
 import { MEMBERSHIP_STORAGE_FAILED, membershipDiagnostic } from '../src/channel-membership.ts'
-import { burstSpec, sr8Personas, sr8Combinations, SR8_BURST_JOINS, SR8_BURST_REPLIES, SR8_BURST_DROPPED, readThreads } from './test-helpers/thread-memory.ts'
+import { burstSpec, sr8Personas, sr8Combinations, SR8_BURST_JOINS, SR8_BURST_REPLIES, SR8_BURST_DROPPED, readThreads, threadJoin, joinRecord } from './test-helpers/thread-memory.ts'
 import { makeQueue, slackInput, heldSlackInput, postHold, queuePath, readQueue } from './test-helpers/delivery-queue.ts'
 import { makeRoutingHarness, observedMembership, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness } from './test-helpers/persona-routing-harness.ts'
 
@@ -96,11 +107,18 @@ function shell(program: string, files: Record<string, string> = {}) {
 const jsonl = (rows: unknown[]) => rows.map(row => JSON.stringify(row)).join('\n') + '\n'
 /** A measurement line exactly as the server's recorder serializes it. */
 const serverLine = (entry: TestMeasurement, at: number) => serializeTestMeasurement({ ...entry, v: 1, at_mono_ms: at } as TestMeasurementRecord)
+/** A completed Thread Memory compaction as the server writes it; `at_mono_ms` is its end. */
+const compactionLine = (key: string, startMonoMs: number, endMonoMs: number, outcome: 'rewritten' | 'skipped') =>
+  serverLine(threadCompactionMeasurement({ key, startMonoMs, endMonoMs, outcome }), endMonoMs)
+/** That line as the verdicts read it back. */
+const compactionRow = (key: string, startMonoMs: number, endMonoMs: number, outcome: 'rewritten' | 'skipped'): Measurement =>
+  JSON.parse(compactionLine(key, startMonoMs, endMonoMs, outcome))
 const serverRows = {
   ack: serverLine(ackTimingMeasurement({ keys: ['alpha'], ts: '1700000000.000001', targets: [{ key: 'alpha', seq: 1 }], outcome: 'acked', receiveToAckMs: 4, ackCallMs: 1, atMonoMs: 9 }), 9),
   append: serverLine(durableAppendMeasurement({ dir: '/s/queue', path: '/s/queue/alpha.jsonl', records: 2, bytes: 10, appendMs: 3,
     fileFsyncMs: 2, dirFsyncMs: 1, fsyncs: 2, atMonoMs: 9 }, '/s')!, 9),
   save: serverLine(threadSaveMeasurement({ key: 'alpha', records: 1, joins: 1, intents: 0, outcomes: 0 }), 9),
+  compaction: compactionLine('alpha', 3, 9, 'rewritten'),
 }
 /** A full SR-8.2 burst ledger and stub record, in burst's order, with the
  * pending-post probes leading the second wave. Stub seqs start after mark 10. */
@@ -138,6 +156,70 @@ const queueControls = [
 const restartAssertion = block(test29, 'bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedAuthorityPreserved', '\npreserved_four_values')
 
 describe('retained timing regressions', () => {
+  test.each([0, 1].flatMap(index => ['valid', 'missing-first', 'missing-middle', 'missing-last', 'non-string'].map(variant => [index, variant] as const)))
+  ('test-44 envelope lookup %i validates every row: %s', (index, variant) => {
+    const lookups = source('test-44-fmk-thread-burst.sh').split('\n').filter(line => line.includes('> "${RESULTS}/envelopes"'))
+    expect(lookups).toHaveLength(2)
+    const rows: Record<string, unknown>[] = ['first', 'middle', 'last'].map(envelope_id => ({ envelope_id }))
+    if (variant.startsWith('missing-')) delete rows[['first', 'middle', 'last'].indexOf(variant.slice('missing-'.length))].envelope_id
+    if (variant === 'non-string') rows[1].envelope_id = 123
+    const result = shell([
+      'RESULTS="$HOME"', 'fail() { printf "FAIL %s\\n" "$*"; exit 1; }', lookups[index], 'cat "$RESULTS/envelopes"',
+    ].join('\n'), { 'burst.jsonl': jsonl(rows) })
+    expect(result.status).toBe(variant === 'valid' ? 0 : 1)
+    if (variant === 'valid') expect(result.stdout).toBe('first\nmiddle\nlast\n')
+    else expect(result.stdout).toContain('FAIL burst push has no string envelope_id\n')
+  })
+  test.each([
+    ['lib/membership-load.sh', 'shared_persona_facts "${P}" >>'],
+    ['test-44-fmk-thread-burst.sh', 'shared_persona_facts "${key}" >>'],
+    ['test-46-shared-channel-recovery.sh', 'shared_delivery_expectation "${KEY[${who}]}" "${NAME[${who}]}" slack'],
+    ['test-46-shared-channel-recovery.sh', 'shared_delivery_expectation "${KEY[${who}]}" "${NAME[${who}]}" "${source}"'],
+    ['test-47-shared-channel-upgrade.sh', 'shared_assert_content "${key}" "${LOG}"'],
+  ].flatMap(([file, prefix]) => ['bytes', 'silent-failure'].map(mode => [file, prefix, mode])))
+  ('printer append in %s (%s): %s', (file, prefix, mode) => {
+    // Execute each swept command verbatim; only its reader is synthetic.
+    const text = source(file).replaceAll('\\\n', '')
+    const command = text.split('\n').find(line => line.includes(prefix.replace(' >>', '')) && line.includes('>>'))
+    expect(command).toBeDefined()
+    const result = shell([
+      declaration(scenario, 'fail'), 'TEST_NAME=reader-control',
+      'P=alpha; key=alpha; who=p; source=cron; sender=sender; ts=1; channel=C; HUMAN=U; via=-; LOG=-; text=-; parts=-',
+      'declare -A KEY=([p]=alpha) NAME=([p]=alpha) SNAP=([alpha]=snapshot)',
+      'EXPECTED="$HOME/out"; EVIDENCE="$HOME"; phase=out; set -- "$HOME/out"',
+      'shared_persona_facts() { bun "$HOME/printer.ts"; }',
+      'shared_delivery_expectation() { bun "$HOME/printer.ts"; }',
+      'shared_assert_content() { bun "$HOME/printer.ts"; }',
+      // Point every real command at the same seeded output.
+      'printf "prior\\n" > "$HOME/out"',
+      command!.replaceAll('${EVIDENCE}/${phase}.facts.jsonl', '${HOME}/out').replaceAll('${EVIDENCE}/${key}-old-content.jsonl', '${HOME}/out'),
+      'cat "$HOME/out"',
+    ].join('\n'), { 'printer.ts': mode === 'silent-failure' ? 'process.exit(1)\n' : 'await Bun.write(Bun.stdout, "next".repeat(5000) + "\\n")\n' })
+    if (mode === 'silent-failure') {
+      expect(result.status).toBe(1)
+      expect(result.stderr).toMatch(/^FAIL: reader-control: .+\n$/)
+      expect(result.stdout).toBe('')
+    } else {
+      expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: '' })
+      expect(result.stdout).toBe('prior\n' + 'next'.repeat(5000) + '\n')
+    }
+  })
+  test.each([
+    ['late_state', 'facts-p'], ['late_state', 'order'], ['late_state', 'joins'], ['write_states', 'facts-q'],
+  ])('%s emits FAIL when its %s reader exits silently', (name, reader) => {
+    const load = source('lib/membership-load.sh')
+    const result = shell([
+      declaration(scenario, 'fail'), 'TEST_NAME=reader-control',
+      declaration(load, 'read_jsonl'), declaration(load, name), 'P=p; Q=q',
+      'shared_persona_facts() { bun "$HOME/reader.ts" "facts-$1"; }',
+      'shared_attempt_order() { bun "$HOME/reader.ts" order; }',
+      'shared_thread_joins() { bun "$HOME/reader.ts" joins; }',
+      `${name} "$HOME/state"`, 'echo continued',
+    ].join('\n'), { 'reader.ts': `if (process.argv[2] === ${JSON.stringify(reader)}) process.exit(1)\nprocess.stdout.write('{"saved":true}')\n` })
+    expect(result.status).toBe(1)
+    expect(result.stderr).toBe('FAIL: reader-control: evidence reader failed\n')
+    expect(result.stdout).toBe('')
+  })
   test('test-29 compaction preserves both consumer drains and diagnostics across restart', async () => {
     const fixture = await test29CompactionFixture()
     const result = shell([
@@ -552,6 +634,23 @@ describe('retained timing regressions', () => {
     expect(script).toContain('real_assert_latency "${REAL_KEY}" 20')
   })
 
+  test.each([
+    ['20', 'first', true], ['20', 'last', false],
+    ['100', 'first', true], ['100', 'last', false],
+  ] as const)('measures only the last %s of n+1 timings: one extra slow %s timing', (count, slow, passes) => {
+    const n = Number(count), fast = { typing_ms: 40, delivery_ms: 1600 }, late = { typing_ms: 3000, delivery_ms: 1600 }
+    // One slow timing cannot move a nearest-rank p95, so n/20 in-window slow
+    // timings hold p95 at its edge: the extra one fails only inside the window.
+    const extra = slow === 'first' ? 0 : n
+    const timings = Array.from({ length: n + 1 }, (_, i) => i === extra || (i >= 5 && i < 5 + n / 20) ? late : fast)
+    const check = new Function('result', 'count', 'percentile', 'console', block(source('fixtures/transcript-receipts.ts'), '        const n = Number(count)', '\n      }'))
+    const recorded: string[] = []
+    const run = () => check({ timings }, count, percentile, { log: (line: string) => recorded.push(line) })
+    if (passes) expect(run).not.toThrow()
+    else expect(run).toThrow('latency exceeded')
+    expect(recorded).toEqual([`recorded: p95 typing_start_ms=${passes ? 40 : 3000} delivery_ms=1600 samples=${n}`])
+  })
+
   test('rejects the observed 18-fast/two-slow sample shape without dropping either slow trial', () => {
     // Numeric-only projection of run 20261021t182831z-lmk9ayre's final 20
     // originals. This tests the oracle, not the cause of either slow sample.
@@ -772,7 +871,8 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     const problem = { hang: 'deadline', transient: 'transport', scope: 'access', denied: 'authentication', rate: 'transport' }[kind]!
     const faults: any[] = [0, 1].map(i => ({ seq: i * 2 + 1, event: 'fault', control: 'faults', method: 'users.conversations', label: key,
       request_id: `request-${i}`, outcome, arrival_mono_ms: 100 + i * gap, arrival_epoch_ms: clock + i * gap, ts: iso(clock + i * gap), text: token }))
-    if (kind !== 'hang') faults.push(...[0, 1].map(i => ({ event: 'api', request_id: `request-${i}`, ts: iso(clock + i * gap), answer, status: kind === 'rate' ? 429 : 200 })))
+    if (kind !== 'hang') faults.push(...[0, 1].map(i => ({ event: 'api', request_id: `request-${i}`, ts: iso(clock + i * gap), cursor: page === 'later' ? 'later' : '',
+      answer, status: kind === 'rate' ? 429 : 200 })))
     else faults.push(...[0, 1].map(i => ({ seq: i * 2 + 2, event: 'fault-settled', request_id: `request-${i}`, resolution: 'abort', ts: iso(clock + i * gap + duration) })))
     const log = [0, 1].map(i => scanLine(clock + i * gap + duration, false, page === 'later' ? 1 : 0, problem,
       kind === 'rate' ? after : undefined, clock + i * gap + MEMBERSHIP_ATTEMPT_TIMEOUT_MS)).join('\n')
@@ -781,6 +881,52 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
   }
   test.each(['hang', 'transient', 'scope', 'denied', 'rate'])('membership %s first and later page published outcomes', kind => {
     for (const page of ['first', 'later']) { const f = member(kind, page); output(f.run(), 0) }
+  })
+  // The kept test-45/test-48 later-denied runs: each refusal resets the scan
+  // (pages=0) and republishes reason=none before the next attempt.
+  function reset(kind: string) {
+    const f = member(kind, 'later')
+    const [first, second] = f.log.replace(/ pages=1 positives=1 /g, ' pages=0 positives=0 ').split('\n')
+    const idle = `[${iso(f.faults[1].arrival_epoch_ms - 1)}] ${membershipScanDiagnostic(key, { state: 'unverified', pages: 0, positives: 0 })}`
+    f.log = [first, idle, second].join('\n')
+    return f
+  }
+  test('membership denied later page passes the credentials-refusal reset: pages=0 reason=authentication slack=invalid_auth', () => {
+    const f = reset('denied')
+    expect(f.log).toContain('pages=0 positives=0 reason=authentication slack_error=invalid_auth')
+    expect(f.run().map(r => r.verdict)).toEqual(['pass', 'pass'])
+    expect(f.run()[0].stats).toMatchObject({ case: 'denied', page: 'later', fired: 2, incomplete: 2 }); output(f.run(), 0)
+  })
+  test.each(['other-reason', 'no-slack-error', 'other-slack-error', 'first-page-cursor', 'one-first-page-cursor', 'before-its-fault', 'no-diagnostic'] as const)
+  ('membership denied later page reset does not pass with %s', defect => {
+    const f = reset('denied')
+    const api = f.faults.filter(r => r.event === 'api')
+    if (defect === 'other-reason') f.log = f.log.replaceAll('reason=authentication slack_error=invalid_auth', 'reason=storage')
+    if (defect === 'no-slack-error') f.log = f.log.replaceAll(' slack_error=invalid_auth', '')
+    if (defect === 'other-slack-error') f.log = f.log.replaceAll('slack_error=invalid_auth', 'slack_error=missing_scope')
+    // The faulted requests asked for the first page, so pages=0 proves nothing about a later one.
+    if (defect === 'first-page-cursor') for (const r of api) r.cursor = ''
+    if (defect === 'one-first-page-cursor') api[1].cursor = ''
+    // Diagnostic 0 is published before fault 0, so membership-retry's correlation rejects it.
+    if (defect === 'before-its-fault') f.log = [0, 1].map(i => scanLine(clock - 1 + i * f.wait, false, 0, 'authentication')).join('\n')
+    if (defect === 'no-diagnostic') f.log = f.log.split('\n').filter(l => l.includes('reason=none')).join('\n')
+    const rows = f.run(), verdicts = rows.map(r => r.verdict)
+    if (defect === 'before-its-fault') {
+      expect(verdicts).toEqual(['pass', 'fail'])
+      expect(rows[1].stats.min_ms).toBeDefined()
+    } else if (defect === 'no-diagnostic') expect(verdicts).toEqual(['missing', 'missing'])
+    else expect(verdicts).toEqual(['fail', 'missing'])
+    output(rows, 1)
+  })
+  test.each(['hang', 'transient', 'scope', 'rate'])('membership %s later page with pages=0 still fails', kind => {
+    const f = reset(kind)
+    expect(f.log).toContain('pages=0 positives=0')
+    expect(f.run()[0]).toMatchObject({ verdict: 'fail', stats: { page: 'later', incomplete: 0 } }); output(f.run(), 1)
+  })
+  test('membership denied first page still requires pages=0', () => {
+    const f = member('denied', 'first')
+    f.log = f.log.replace(/ pages=0 positives=0 /g, ' pages=1 positives=1 ')
+    expect(f.run()[0]).toMatchObject({ verdict: 'fail', stats: { page: 'first', incomplete: 0 } }); output(f.run(), 1)
   })
   test.each(['early-start', 'early-429', 'early-after-deadline', 'state-changed', 'false-complete', 'wrong-page', 'wrong-outcome'] as const)
   ('membership fails %s without an allowance', defect => {
@@ -885,6 +1031,77 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     expect(cpuConditionFields(undefined, '', v2(1, 0, 0))).toBe('cpu_max=unknown nr_periods_delta=unknown nr_throttled_delta=unknown throttled_usec_delta=unknown')
     expect(cpuConditionFields('garbage', v2(5, 5, 5), v2(1, 1, 1))).toBe('cpu_max=unknown nr_periods_delta=unknown nr_throttled_delta=unknown throttled_usec_delta=unknown')
   })
+  describe('driver-cpu: the burst driver off the server\'s CPU quota', () => {
+    const files = (entries: Record<string, string>) => (path: string, file: string) => entries[`${path === '/' ? '' : path}/${file}`]
+    const stat = (usec: number) => `usage_usec ${usec}\nuser_usec 1\nsystem_usec 1\nnr_periods 1\nnr_throttled 0\nthrottled_usec 0\n`
+    // Before: one 2-CPU container quota holds the server, the stub and the driver.
+    const shared = { '/cpu.max': '200000 100000\n', '/cpu.stat': stat(7_806_000) }
+    // Now: a 3-CPU container; the server's group keeps 2 CPUs and the driver's 0.9 sits beside it.
+    const split = { '/cpu.max': '300000 100000\n', '/cpu.stat': stat(9_000_000), '/shard/cpu.max': 'max 100000\n',
+      '/shard/server/cpu.max': '200000 100000\n', '/shard/server/cpu.stat': stat(5_000_000),
+      '/shard/driver/cpu.max': '90000 100000\n', '/shard/driver/cpu.stat': stat(1_860_000) }
+    // The server's UID could open none of the guarded files it checked for writing.
+    const contained = { checked: 34, writable: 0, unknown: 0 }
+    test('today\'s shard, one quota for the server and the driver, is missing; the split shard passes', () => {
+      expect(driverCpuVerdict('/', ['/'], files(shared), { checked: 10, writable: 0, unknown: 0 })).toEqual({ measure: 'driver-cpu', samples: 1, stats: { server_cgroup: '/', server_cpu_max: '200000/100000',
+        server_cpus: 2, server_usage_ms: 7806, driver_cgroup: '/', driver_cpu_max: '200000/100000', driver_cpus: 2, driver_usage_ms: 7806, shared_cpus: 2,
+        guarded_files: 10, writable_files: 0, unprobed_files: 0 }, limit: 2, verdict: 'missing' })
+      expect(driverCpuVerdict('/shard/server', ['/shard/driver', '/shard/driver'], files(split), contained)).toEqual({ measure: 'driver-cpu', samples: 2, stats: {
+        server_cgroup: '/shard/server', server_cpu_max: '200000/100000', server_cpus: 2, server_usage_ms: 5000, driver_cgroup: '/shard/driver',
+        driver_cpu_max: '90000/100000', driver_cpus: 0.9, driver_usage_ms: 1860, shared_cpus: 3, guarded_files: 34, writable_files: 0, unprobed_files: 0 }, limit: 2, verdict: 'pass' })
+      expect(SR8_SERVER_CPUS).toBe(CPUS_PER_SHARD)
+    })
+    // Injected probe outcomes: the tally the real write-only probe feeds, whoever runs the suite.
+    test('every present guarded file counts; an opened file is writable and an unexpected probe error is unknown', () => {
+      const paths = guardedCgroups('/shard/server', ['/shard/driver'])
+      const outcome = (bad: Record<string, CgroupOpenOutcome>) => (path: string, file: string) => bad[`${path} ${file}`] ?? (file === 'memory.max' && path !== '/' ? 'absent' : 'refused')
+      const present = paths.length * SR8_GUARDED_CGROUP_FILES.length - (paths.length - 1)
+      expect(cgroupWriteAccess(paths, outcome({}))).toEqual({ checked: present, writable: 0, unknown: 0 })
+      // A write-only migration file the server's UID may write: R2.2's escape.
+      expect(cgroupWriteAccess(paths, outcome({ '/shard cgroup.procs': 'writable' }))).toEqual({ checked: present, writable: 1, unknown: 0 })
+      expect(cgroupWriteAccess(paths, outcome({ '/shard/driver cpu.max': 'error' }))).toEqual({ checked: present, writable: 0, unknown: 1 })
+      expect(cgroupWriteAccess(paths, () => 'absent')).toEqual({ checked: 0, writable: 0, unknown: 0 })
+      expect([undefined, 'EACCES', 'EPERM', 'EROFS', 'ENOENT', 'EMFILE', 'EISDIR', 'ELOOP', 'ENXIO'].map(code => cgroupOpenFailure(code)))
+        .toEqual(['error', 'refused', 'refused', 'refused', 'absent', 'error', 'error', 'error', 'error'])
+    })
+    test.each<[string, string | undefined, (string | undefined)[] | undefined, Record<string, string>, CgroupWriteAccess | undefined]>([
+      ['one driver run in the server\'s group', '/shard/server', ['/shard/driver', '/shard/server'], split, contained],
+      ['a driver beside the server under a container quota with no room for it', '/shard/server', ['/shard/driver'], { ...split, '/cpu.max': '200000 100000\n' }, contained],
+      ['an uncapped driver', '/shard/server', ['/shard/driver'], { ...split, '/shard/driver/cpu.max': 'max 100000\n' }, contained],
+      ['a server quota other than the shard\'s', '/shard/server', ['/shard/driver'], { ...split, '/shard/server/cpu.max': '250000 100000\n' }, contained],
+      ['an unreadable cpu.max on the path', '/shard/server', ['/shard/driver'], Object.fromEntries(Object.entries(split).filter(([path]) => path !== '/shard/cpu.max')), contained],
+      ['an unreadable server cgroup', undefined, ['/shard/driver'], split, contained],
+      ['a malformed record line', '/shard/server', [undefined], split, contained],
+      ['no recorded driver run', '/shard/server', [], split, contained],
+      ['no record', '/shard/server', undefined, split, contained],
+      // The server's UID could move a process (for example into shard or shard/driver) or change a limit.
+      ['one guarded file the server\'s UID can write', '/shard/server', ['/shard/driver'], split, { checked: 34, writable: 1, unknown: 0 }],
+      ['one guarded file it could not probe', '/shard/server', ['/shard/driver'], split, { checked: 34, writable: 0, unknown: 1 }],
+      ['no guarded file checked', '/shard/server', ['/shard/driver'], split, { checked: 0, writable: 0, unknown: 0 }],
+      ['no permission check', '/shard/server', ['/shard/driver'], split, undefined],
+    ])('%s is missing', (_name, server, drivers, entries, access) => {
+      const row = driverCpuVerdict(server, drivers, files(entries), access)
+      expect(row.verdict).toBe('missing')
+      expect(resultLine({ scenario: 'test-45-fmk-membership-load-strict-lookup', mode: 'strict', population: 100_000, recipients: 2 }, row))
+        .toMatch(/^recorded: sr8 driver-cpu scenario=\S+ mode=strict population=100000 recipients=2 samples=\d+ server_cgroup=\S+ server_cpu_max=\S+ server_cpus=\S+ server_usage_ms=\S+ driver_cgroup=\S+ driver_cpu_max=\S+ driver_cpus=\S+ driver_usage_ms=\S+ shared_cpus=\S+ guarded_files=\S+ writable_files=\S+ unprobed_files=\S+ limit=2 verdict=missing$/)
+    })
+    test('permissions are checked on every cgroup of both paths, once each, root first', () => {
+      expect(guardedCgroups('/shard/server', ['/shard/driver', '/shard/driver'])).toEqual(['/', '/shard', '/shard/server', '/shard/driver'])
+      expect(guardedCgroups('/', ['/'])).toEqual(['/'])
+      expect(guardedCgroups(undefined, undefined)).toEqual([])
+      expect(SR8_GUARDED_CGROUP_FILES).toEqual(expect.arrayContaining(['cgroup.procs', 'cgroup.threads', 'cpu.max', 'cpu.max.burst', 'memory.max', 'pids.max']))
+    })
+    test('cgroup paths, chains and cpu.max values parse strictly', () => {
+      expect(cgroupPathOf('0::/shard/server\n')).toBe('/shard/server')
+      expect(cgroupPathOf('0::/\n')).toBe('/')
+      expect(cgroupPathOf('12:cpu,cpuacct:/x\n0::/a.b/c-d_e\n')).toBe('/a.b/c-d_e')
+      for (const text of ['12:cpu,cpuacct:/x\n', '0::/a/../b\n', '0::/a b\n', '0::relative\n', '0::/a//b\n', '', undefined]) expect(cgroupPathOf(text)).toBeUndefined()
+      expect(cgroupChain('/shard/server')).toEqual(['/', '/shard', '/shard/server'])
+      expect(cgroupChain('/')).toEqual(['/'])
+      expect([cpuMaxCpus('200000 100000\n'), cpuMaxCpus('90000 100000'), cpuMaxCpus('max 100000')]).toEqual([2, 0.9, Infinity])
+      for (const text of ['200000', '1 0', 'max', '-1 100000', undefined]) expect(cpuMaxCpus(text)).toBeUndefined()
+    })
+  })
   test.each(['epoch', 'settlement', 'settlement-id', 'diagnostic-endpoint', 'reversed-clock', 'attempt-bound'] as const)
   ('membership measured deadline rejects %s', absent => {
     const f = member()
@@ -921,6 +1138,68 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     const missing = membershipRepairVerdict(clear, diag(log), MEMBERSHIP_ATTEMPT_TIMEOUT_MS, MEMBERSHIP_RETRY_MAX_MS)
     expect(missing.verdict).toBe('missing'); output([missing], 1)
   })
+  // The answers25 strict-first-scope shape: a refused page carries no
+  // deadline_at, and neither do the repair attempt's republication or its
+  // complete line.
+  function scope(refusedAt = 1794157684876, next = 1794157704876, clear = 1794157685660, start = 1794157704880, done = 1794157705325) {
+    const at = (t: number, status: Parameters<typeof membershipScanDiagnostic>[1]) => `[${iso(t)}] ${membershipScanDiagnostic(key, status)}`
+    const lines = [at(refusedAt, { state: 'incomplete', pages: 0, positives: 0, problem: 'access', slackError: 'missing_scope', nextAttemptAt: next }),
+      at(start, { state: 'unverified', pages: 0, positives: 0, nextAttemptAt: start }),
+      at(done, { state: 'complete', pages: 6, positives: 1100 })]
+    const f = { clear, lines, run: (log = lines.join('\n')) => membershipRepairVerdict(f.clear, diag(log), MEMBERSHIP_ATTEMPT_TIMEOUT_MS, MEMBERSHIP_RETRY_MAX_MS) }
+    return f
+  }
+  test('idle repair after an access refusal: the recorded run passes with no remaining deadline and the attempt\'s own scan time', () => {
+    const r = scope().run()
+    expect(r.stats).toMatchObject({ elapsed_ms: 19665, remaining_ms: 0, retry_ms: MEMBERSHIP_RETRY_MAX_MS, scan_ms: 445 })
+    expect(r.limit).toBe(MEMBERSHIP_RETRY_MAX_MS + 445); expect(r.verdict).toBe('pass'); output([r], 0)
+  })
+  test.each([0, 1])('idle repair after an access refusal at its bound +%d', extra => {
+    const clear = clock, start = clear + MEMBERSHIP_RETRY_MAX_MS + extra
+    const r = scope(clear - 1, start, clear, start, start + 20).run()
+    expect(r.stats).toMatchObject({ remaining_ms: 0, scan_ms: 20 }); expect(r.verdict).toBe(extra ? 'fail' : 'pass'); output([r], extra ? 1 : 0)
+  })
+  test('idle repair after an access refusal fails a scan beyond its attempt deadline and never passes without completion', () => {
+    const f = scope(), slow = scope(undefined, undefined, undefined, undefined, 1794157704880 + MEMBERSHIP_ATTEMPT_TIMEOUT_MS + 1)
+    expect(slow.run().verdict).toBe('fail'); output([slow.run()], 1)
+    const never = f.run(f.lines.slice(0, 2).join('\n'))
+    expect(never.stats.elapsed_ms).toBe('missing'); expect(never.verdict).toBe('missing'); output([never], 1)
+  })
+  test.each(['no-attempt', 'attempt-before-next', 'attempt-before-clear', 'refusal-without-slack', 'transport-without-deadline', 'hang-complete-without-deadline'] as const)
+  ('idle repair stays missing on %s', shape => {
+    const f = scope()
+    let log = f.lines.join('\n')
+    if (shape === 'no-attempt') log = [f.lines[0], f.lines[2]].join('\n')
+    if (shape === 'attempt-before-next') log = log.replace(iso(1794157704880), iso(1794157704875))
+    if (shape === 'attempt-before-clear') { f.clear = 1794157704881; log = [f.lines[0].replace(iso(1794157684876), iso(1794157704870)), f.lines[1], f.lines[2]].join('\n') }
+    if (shape === 'refusal-without-slack') log = log.replace(' slack_error=missing_scope', '')
+    if (shape === 'transport-without-deadline') log = log.replace('reason=access slack_error=missing_scope', 'reason=transport slack_error=internal_error')
+    if (shape === 'hang-complete-without-deadline') log = [scanLine(f.clear - 1, false, 0, 'deadline', undefined, f.clear + 1000), f.lines[1], f.lines[2]].join('\n')
+    const r = f.run(log)
+    expect(r.verdict).toBe('missing'); output([r], 1)
+  })
+  // The denied case publishes the same shape, with its own reason and code.
+  const denied = (log: string) => log.replace('reason=access slack_error=missing_scope', 'reason=authentication slack_error=invalid_auth')
+  test('idle repair after an authentication refusal: pass, over-bound fail and missing', () => {
+    const f = scope(), r = f.run(denied(f.lines.join('\n')))
+    expect(r.stats).toMatchObject({ elapsed_ms: 19665, remaining_ms: 0, scan_ms: 445 }); expect(r.verdict).toBe('pass'); output([r], 0)
+    for (const extra of [0, 1]) {
+      const start = clock + MEMBERSHIP_RETRY_MAX_MS + extra, b = scope(clock - 1, start, clock, start, start + 20)
+      const over = b.run(denied(b.lines.join('\n')))
+      expect(over.stats).toMatchObject({ remaining_ms: 0, scan_ms: 20 }); expect(over.verdict).toBe(extra ? 'fail' : 'pass'); output([over], extra ? 1 : 0)
+    }
+    for (const log of [[f.lines[0], f.lines[2]], f.lines.slice(0, 2)].map(l => denied(l.join('\n')))) {
+      const missing = f.run(log)
+      expect(missing.verdict).toBe('missing'); output([missing], 1)
+    }
+    const storage = f.run(f.lines.join('\n').replace('reason=access slack_error=missing_scope', 'reason=storage slack_error=missing_scope'))
+    expect(storage.verdict).toBe('missing'); output([storage], 1)
+  })
+  test('idle repair after an access refusal keeps a complete line\'s own deadline_at as its scan start', () => {
+    const f = scope(), withDeadline = f.lines[2].replace('reason=none.', `reason=none deadline_at=${1794157704876 + MEMBERSHIP_ATTEMPT_TIMEOUT_MS}.`)
+    const r = f.run([f.lines[0], f.lines[1], withDeadline].join('\n'))
+    expect(r.stats).toMatchObject({ remaining_ms: 0, scan_ms: 449 }); expect(r.verdict).toBe('pass'); output([r], 0)
+  })
   function late() {
     const stub: any[] = [{ seq: 1, event: 'fault', control: 'faults', method: 'users.conversations', label: key, request_id: 'late', outcome: 'late', arrival_mono_ms: 1 },
       { seq: 5, event: 'fault-settled', request_id: 'late', resolution: 'late', socket_open: false },
@@ -929,6 +1208,71 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       run() { return membershipLateVerdict(key, 'late', this.stub, this.mark, diag(this.log), this.before, this.after) } }
   }
   test('abandoned late answer after replacement completion leaves state equal', () => output([late().run()], 0))
+  function lateMembershipState() {
+    const f = late()
+    const facts = { key, incarnation: 'life', assignments: {}, historicalMembership: {} }
+    const order = { key, channel, startedOrder: 1, resolvedOrder: 2 }
+    const joins = [joinRecord(threadJoin({ channel })),
+      joinRecord(threadJoin({ channel, root: '1700000000.000002', source: 'own-post' }), 3)]
+    f.before = f.after = jsonl([facts, order, ...joins])
+    return { f, facts, order, joins }
+  }
+  test.each(['join-added', 'join-removed', 'join-changed', 'broadcast-added', 'facts', 'attempt-order',
+    'own-post-changed', 'own-post-removed', 'own-post-duplicated', 'join-reordered', 'bytes'] as const)
+  ('late membership state still rejects %s', defect => {
+    const { f, facts, order, joins } = lateMembershipState()
+    if (defect === 'join-added' || defect === 'broadcast-added') joins.push(joinRecord(threadJoin({
+      channel, root: '1700000000.000003', source: defect === 'join-added' ? 'mention' : 'broadcast' }), 4))
+    if (defect === 'join-removed') joins.shift()
+    if (defect === 'join-changed') joins[0].source = 'own-post'
+    if (defect === 'facts') facts.historicalMembership = { [channel]: { member: false } }
+    if (defect === 'attempt-order') order.resolvedOrder++
+    if (defect === 'own-post-changed') joins[1].at++
+    if (defect === 'own-post-removed') joins.pop()
+    if (defect === 'own-post-duplicated') joins.push({ ...joins[1] })
+    if (defect === 'join-reordered') joins.reverse()
+    f.after = jsonl([facts, order, ...joins])
+    if (defect === 'bytes') f.after = f.after.replace('\n', ' \n')
+    // Reject the change alone and when new own posts accompany it.
+    const changed = f.after
+    for (const extra of ['', jsonl([joinRecord(threadJoin({ channel, root: '1700000000.000004', source: 'own-post' }), 5)])]) {
+      f.after = changed + extra
+      const r = f.run()
+      expect(r.stats.unchanged).toBe('no'); expect(r.verdict).toBe('fail'); output([r], 1)
+    }
+  })
+  test('late membership state excludes only own-post joins first observed after the complete-mark read', () => {
+    const { f } = lateMembershipState()
+    f.after += jsonl([3, 4].map((n, i) => joinRecord(threadJoin({
+      channel, root: `1700000000.00000${n}`, source: 'own-post' }), i + 4)))
+    const r = f.run()
+    expect(r.stats.unchanged).toBe('yes'); expect(r.verdict).toBe('pass'); output([r], 0)
+  })
+  test.each(['empty-order', 'empty-joins', 'large-readers'] as const)('late_state preserves reader bytes: %s', variant => {
+    const facts = JSON.stringify({ persona: key, saved: 'facts' })
+    const large = Array.from({ length: 1000 }, (_, n) => JSON.stringify({ ordinal: n, saved: 'x'.repeat(200) })).join('\n')
+    const order = variant === 'empty-order' ? '' : large
+    const joins = variant === 'empty-joins' ? '' : large
+    const expected = [facts, order, joins].filter(Boolean).map(value => value + '\n').join('')
+    const result = shell([
+      declaration(source('lib/membership-load.sh'), 'read_jsonl'),
+      declaration(source('lib/membership-load.sh'), 'late_state'),
+      'P=alpha',
+      'shared_persona_facts() { bun "$HOME/printer.ts" "$HOME/facts"; }',
+      'shared_attempt_order() { bun "$HOME/printer.ts" "$HOME/order"; }',
+      'shared_thread_joins() { bun "$HOME/printer.ts" "$HOME/joins"; }',
+      'late_state "$HOME/late.state"', 'cat "$HOME/late.state"',
+    ].join('\n'), {
+      // Match the real printer's stdout call, including its empty-value path.
+      'printer.ts': 'await Bun.write(Bun.stdout, await Bun.file(process.argv[2]).text())\n',
+      facts, order, joins,
+    })
+    expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: '' })
+    expect(result.stdout).toBe(expected)
+    const f = late(); f.before = result.stdout; f.after = result.stdout
+    // This exercises stateRead through its unchanged public verdict caller.
+    expect(f.run().verdict).toBe('pass')
+  })
   test.each(['fault', 'settlement', 'api', 'complete', 'state', 'too-early', 'abort', 'changed', 'incomplete-after'] as const)
   ('late answer rejects %s', defect => {
     const f = late()
@@ -1426,6 +1770,233 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     ])
     expect(run.stdout).not.toContain(secret); expect(run.stdout).not.toContain(tok)
   })
+  test('test-46 accept_observe prints the acceptance journal\'s counts and whitelisted fields, never content', () => {
+    const secret = 'private message text', tok = fakeToken(BOT_TOKEN_PREFIX, 'accept-observer')
+    const hold = { on: 'post', operations: ['op-a'], thread_ts: '1.0', stamp: { incarnation: 1, threadHybridSince: 2 }, root_unknown: false, arrived_at: 10 }
+    const files = {
+      'state/queue/p.jsonl': jsonl([
+        { v: 1, kind: 'accepted', seq: 1, compact: 'key', key: { channel: 'CX', ts: '0.5' }, received_at: 5, delivered_at: 6 },
+        { v: 1, kind: 'accepted', seq: 2, source: 'slack', channel: 'CX', ts: '1.5', via: 'thread', thread_ts: '1.0', user: 'U1', text: secret, received_at: 10, hold },
+        { v: 1, kind: 'released', seq: 2, at: 13 },
+        { v: 1, kind: 'sent', seq: 2, attempt: 1, part: 1, send_kind: 'text', at: 14, session_id: 's1', transcript_path: `/w/${secret}`, transcript_size: 3 },
+        { v: 1, kind: 'accepted', seq: 3, source: 'slack', channel: 'CY', ts: '1.5', via: tok, text: secret, received_at: 11 },
+      ]) + '{"v":1,"kind":"acc',
+    }
+    const program = (who: string, via: string) => [
+      'SLACK_STATE_DIR="$HOME/state"', 'declare -A KEY=([p]=p [q]=q)', declaration(test46, 'accept_observe'), `accept_observe ${who} CX 1.5 '${via}'`,
+    ].join('\n')
+    const run = shell(program('p', 'thread'), files)
+    expect({ status: run.status, stderr: run.stderr }).toEqual({ status: 0, stderr: '' })
+    const tail = [
+      'accept-observe: tail kind=accepted seq=1 compact=key channel=absent ts=absent via=absent hold=absent',
+      'accept-observe: tail kind=accepted seq=2 compact=absent channel=CX ts=1.5 via=thread hold=post',
+      'accept-observe: tail kind=released seq=2 compact=absent channel=absent ts=absent via=absent hold=absent',
+      'accept-observe: tail kind=sent seq=2 compact=absent channel=absent ts=absent via=absent hold=absent',
+      'accept-observe: tail kind=accepted seq=3 compact=absent channel=CY ts=1.5 via=invalid hold=absent',
+    ]
+    const lines = (via: string, withVia: number) => [
+      `accept-observe: persona=p channel=CX ts=1.5 via=${via || 'any'} failed`,
+      'accept-observe: journal lines=6 records=5 compact=1 max_seq=3',
+      `accept-observe: matching accepted=1 with_via=${withVia}`,
+      'accept-observe: accepted seq=2 source=slack via=thread thread_ts=1.0 received_at=10 released_at=absent hold=post hold_root_unknown=false hold_operations=1 hold_arrived_at=10',
+      'accept-observe: record kind=released seq=2 attempt=absent part=absent send_kind=absent at=13 unknown_outcome=absent',
+      'accept-observe: record kind=sent seq=2 attempt=1 part=1 send_kind=text at=14 unknown_outcome=absent',
+      ...tail,
+    ]
+    expect(run.stdout.trim().split('\n')).toEqual(lines('thread', 1))
+    expect(run.stdout).not.toContain(secret); expect(run.stdout).not.toContain(tok); expect(run.stdout).not.toContain('op-a')
+    expect(shell(program('p', 'mention'), files).stdout.trim().split('\n')).toEqual(lines('mention', 0))
+    expect(shell(program('p', ''), files).stdout.trim().split('\n')).toEqual(lines('', 1))
+    const absent = shell(program('q', 'thread'), files)
+    expect({ status: absent.status, stdout: absent.stdout, stderr: absent.stderr }).toEqual({ status: 0, stderr: '',
+      stdout: 'accept-observe: persona=q channel=CX ts=1.5 via=thread failed\naccept-observe: journal=absent\n' })
+  })
+  test.each([['ok', 0], ['timeout', 1], ['timeout, observer error', 1]] as const)(
+    'test-46 accepted keeps wait_until\'s check, poll and failure text, and prints the journal only at the timeout: %s', (outcome, status) => {
+      const stubs = (poll: string) => [
+        '_scenario_check_timeout() { printf "check %s|%s\\n" "$1" "$2"; }',
+        `_scenario_poll_until() { printf "poll %s\\n" "$*"; [[ ${poll} == ok ]]; }`,
+      ]
+      const program = [
+        ...stubs(`'${outcome}'`),
+        `accept_observe() { printf "observe %s\\n" "$*"; [[ '${outcome}' != *error ]]; }`,
+        'shared_delivery_expectation() { printf "expectation %s\\n" "$*"; }',
+        'declare -A KEY=([p]=kp) NAME=([p]=np) INPUTS', 'EXPECTED="$HOME/expected" HUMAN=UH EVENT_WAIT_S=30',
+        declaration(test46, 'accepted'), 'accepted p CX 1.5 thread "the text" 1.0', 'printf "expected: %s\\n" "$(cat "$EXPECTED")"',
+      ].join('\n')
+      const run = shell(program)
+      // wait_until itself, given the same step, timeout and predicate.
+      const reference = shell([...stubs("'timeout'"), declaration(scenario, 'wait_until'),
+        "wait_until 30 'expected one acceptance' queued p CX 1.5 thread"].join('\n'))
+      expect(reference.stdout).toBe('check 30|expected one acceptance\npoll 30 queued p CX 1.5 thread\n')
+      expect(run.status).toBe(status)
+      if (outcome === 'ok') {
+        expect(run.stderr).toBe('')
+        expect(run.stdout).toBe(reference.stdout + 'expected: expectation kp np slack CX 1.5 UH thread\n')
+      } else {
+        expect(run.stderr).toBe(reference.stderr)
+        expect(run.stdout).toBe(reference.stdout + 'observe p CX 1.5 thread\n')
+      }
+    })
+  test('test-46 retain declares every channel the input lists for the persona, as written, and fails on none', () => {
+    const config = JSON.stringify({ personas: [
+      { name: 'p', channels: [{ id: 'CA', delivery: 'all' }, { id: 'CB', delivery: 'thread_hybrid' }, { id: 'CN', delivery: 'mentions' }] },
+      { name: 'q', channels: [{ id: 'CA', delivery: 'off' }] },
+      { name: 'r', channels: [] },
+    ] })
+    const program = (name: string) => ['CONFIG="$HOME/config.json"', declaration(test46, 'retain'), `retain ${name}`, 'printf "%s\\n" "${RETAIN[@]}"'].join('\n')
+    const run = shell(program('p'), { 'config.json': config })
+    expect({ status: run.status, stdout: run.stdout, stderr: run.stderr }).toEqual({ status: 0, stderr: '', stdout: 'p/CA/all\np/CB/thread_hybrid\np/CN/mentions\n' })
+    for (const name of ['r', 'absent']) {
+      const none = shell(program(name), { 'config.json': config })
+      expect({ status: none.status, stdout: none.stdout, stderr: none.stderr }).toEqual({ status: 1, stdout: '', stderr: `no configured channel to retain for ${name}\n` })
+    }
+  })
+  // test-46's real pending_post and lose_post build the faults through
+  // scenario.sh's real control helpers; pending_post's other steps are
+  // stand-ins. The real stub answers a real Web client with the production
+  // long-lived options, only its per-attempt timeout and retry spacing
+  // shortened (one retry): the library retries a timed-out attempt as a new
+  // chat.postMessage, as it does after PERSONA_WEB_API_REQUEST_TIMEOUT_MS.
+  test.each([[true, ''], [false, ''], [true, '100']] as const)(
+    'test-46 lose_post holds the Web client\'s retry of a lost post unperformed, so only the first attempt can settle it: performed=%p delay=%p', async (performed, delay) => {
+      const options = longLivedWebClientOptions()
+      expect([options.timeout, 'retryConfig' in options]).toEqual([PERSONA_WEB_API_REQUEST_TIMEOUT_MS, false])
+      const channel = 'C0LOSTPOST01', stamp = '{"incarnation":"i1","threadHybridSince":"t1"}'
+      const built = shell([
+        'require_ci_image() { :; }', '_scenario_scratch_file() { :; }', '_scenario_stub_control_http() { :; }', 'write_file() { cat > "$1"; }',
+        ...['_scenario_stub_control_patch', 'slack_stub_fault', 'slack_stub_post_lost', 'slack_stub_history_fault', 'slack_stub_faults_clear'].map(name => declaration(scenario, name)),
+        `scenario_id() { echo ${channel}; }`, 'slack_stub_inventory_page() { :; }', 'slack_push_member_joined() { echo env-1; }', 'ack() { :; }',
+        'scenario_ts() { echo 1.5; }', 'wait_membership_complete() { :; }', 'set_choice() { :; }', `stamp() { echo '${stamp}'; }`,
+        `shared_own_post_records() { [[ ! -e "$HOME/posted" ]] || echo '{"kind":"post-intent","operationId":"op-1","channel":"${channel}","stamp":${stamp}}'; }`,
+        'slack_post_mark() { echo 0; }', 'scenario_text() { echo "text-$1"; }', 'stub_session_submit() { : > "$HOME/posted"; echo call-1; }',
+        'wait_until() { :; }', `record_after() { echo '[{"performed":${performed},"response_ts":"9.1"}]'; }`,
+        `shared_persona_facts() { echo '{"incarnation":"i1","assignments":{"${channel}":{"threadHybridSince":"t1"}}}'; }`, 'shared_wait_own_post_state() { :; }',
+        'declare -A LABEL=([p]=p) KEY=([p]=p) WORK=([p]=/w)', 'declare -a EXTRA_CHANNELS=()', 'A=CA B=CB NOTICE=CN EVIDENCE="$HOME" SCENARIO_SLACK_CONTROL="$HOME/control.json"',
+        declaration(test46, 'lose_post'), declaration(test46, 'pending_post'), `pending_post lost ${performed} ${delay}`, 'cat "$SCENARIO_SLACK_CONTROL"',
+      ].join('\n'), { 'control.json': JSON.stringify({ tokens: [{ label: 'p', suffix: 'lostp', auth: 'ok', connections: 'ok' }] }) + '\n' })
+      expect({ status: built.status, stderr: built.stderr }).toEqual({ status: 0, stderr: '' })
+      mkdirSync('/tmp/c9', { recursive: true })
+      const root = mkdtempSync('/tmp/c9/test46-lost-post-'), recordPath = join(root, 'record.jsonl')
+      // The real client's output, its answer or error and every caught error
+      // are leak-checked, on a failing assertion too.
+      const captured: unknown[] = []
+      try { const stub = startSlackStub({ recordPath, control: JSON.parse(built.stdout) }); try {
+        const web = new WebClient(fakeToken(BOT_TOKEN_PREFIX, 'lostp'),
+          { ...longLivedWebClientOptions(stub.apiUrl), timeout: 300, retryConfig: { retries: 1, minTimeout: 10, maxTimeout: 10 } })
+        let answer: unknown
+        const output = await outputDuringAsync(async () => {
+          answer = await web.chat.postMessage({ channel, text: 'lost post' }).then(r => ({ ok: r.ok, ts: r.ts }), (e: Error) => { captured.push(e); return { error: e.message } })
+        })
+        captured.push(answer, output)
+        // One library warning per timed-out attempt, so the scan sees real output.
+        expect(output.filter(call => JSON.stringify(call.args).includes('http request failed'))).toHaveLength(delay ? 0 : 2)
+        const posts = readFileSync(recordPath, 'utf8').trim().split('\n').map(line => JSON.parse(line)).filter(r => r.method === 'chat.postMessage')
+        const history = await fetch(`${stub.apiUrl}conversations.history`, { method: 'POST', body: new URLSearchParams({ channel }),
+          headers: { Authorization: `Bearer ${fakeToken(BOT_TOKEN_PREFIX, 'reader')}`, 'Content-Type': 'application/x-www-form-urlencoded' } }).then(r => r.json())
+        captured.push(history)
+        const first = posts[0]
+        if (delay) {
+          // The delayed answer comes inside the attempt: the first attempt's own post, no retry.
+          expect(posts.map(r => [r.event, r.outcome ?? r.answer, r.performed ?? null])).toEqual([['fault', 'lost', true], ['api', 'ok', null]])
+          expect(answer).toEqual({ ok: true, ts: first.response_ts })
+        } else {
+          // Each attempt times out unanswered: the retry is held and never performed.
+          expect(posts.map(r => [r.event, r.fault_index, r.outcome, r.performed])).toEqual([['fault', 0, 'lost', performed], ['fault', 1, 'lost', false]])
+          expect(answer).toEqual({ error: expect.stringContaining('timeout of 300ms exceeded') })
+        }
+        expect(history.messages.map((m: { ts: string }) => m.ts)).toEqual(performed ? [first.response_ts] : [])
+      } catch (error) { captured.push(error); throw error } finally {
+        try { await stub.stop() } catch (error) { captured.push(error); throw error }
+      }
+      } finally {
+        try { assertNoLeak({ captured, record: existsSync(recordPath) ? readFileSync(recordPath, 'utf8') : '' }) }
+        finally { rmSync(root, { recursive: true, force: true }) }
+      }
+    })
+  test('test-46 confirmed-unsaved\'s held answer comes 5 s inside the Web client\'s per-attempt timeout', () => {
+    const delay = Number(/^pending_post confirmed-unsaved true (\d+)$/m.exec(test46)?.[1])
+    expect(delay + 5000).toBeLessThanOrEqual(PERSONA_WEB_API_REQUEST_TIMEOUT_MS)
+  })
+  // The production lookup judges the situation Phase 13 builds: its live post,
+  // with no parent, is P's only own message in range, and the behind-post
+  // mention and broadcast joined its root. `found` records joined; `none`
+  // and `lost` record none.
+  test('test-46 Phase 13 expects the production lookup\'s outcome for its mention-joined live post: none, with the thread still joined', () => {
+    const post = { ts: '1794561089.000002', digests: ['digest'], fileIds: [] }
+    const judged = (joined: boolean) => judgeOwnPostLookup({ digest: 'digest', hasParent: false, own: [post], leftOut: ts => joined && ts === post.ts })
+    expect(judged(false)).toEqual({ kind: 'found', ts: post.ts, holds: 'thread' })
+    expect(judged(true)).toEqual({ kind: 'none', holds: 'none' })
+    const fifo = block(test46, 'for route in all dm mention broadcast; do', 'inject_sender=')
+    for (const route of ['mention', 'broadcast']) expect(fifo).toContain(route + ') channel="${OP_CHANNEL}"; parent="${OP_ROOT}"; via=' + route + ';')
+    const restart = block(test46, "'restarted manual FIFO worker did not reconnect'", "'ordinary FIFO worker did not reconnect'")
+    expect(restart).toContain('shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" none')
+    expect(restart).not.toContain('"${OP_STAMP}" joined')
+    expect(restart).toContain('root_saved p "${OP_CHANNEL}" "${OP_ROOT}" || fail')
+  })
+  // test-46's real newest_first against the production lookup's lost-join
+  // threads, read from a history page ordered as the stub and Slack order it
+  // (by numeric ts, newest first), whichever of Phase 18's two roots is newer.
+  test.each([
+    ['the seeded root is newer in the same second', '1794572342.001409', '1794572342.989009'],
+    ['the post is newer in the same second', '1794572342.001409', '1794572342.000500'],
+    ['the seeded root is a second later', '1794572342.989009', '1794572343.000100'],
+  ] as const)('test-46 Phase 18 lists its lost roots in the lookup\'s history order: %s', (_name, opRoot, secondRoot) => {
+    const history = [opRoot, secondRoot].sort((a, b) => Number(b) - Number(a))
+    const judged = judgeOwnPostLookup({ digest: 'digest', hasParent: false, leftOut: () => false,
+      own: history.map(ts => ({ ts, digests: ['digest'], fileIds: [] })) })
+    expect(judged).toEqual({ kind: 'lost', reason: 'several', holds: 'none', threads: history })
+    const run = shell([declaration(test46, 'newest_first'), `newest_first ${opRoot} ${secondRoot}`].join('\n'))
+    expect({ status: run.status, stdout: run.stdout, stderr: run.stderr }).toEqual({ status: 0, stdout: history.join(',') + '\n', stderr: '' })
+    const phase = block(test46, 'pending_post ambiguous true', 'for root in "${OP_ROOT}" "${second_root}"; do')
+    expect(phase).toContain('lost_roots="$(newest_first "${OP_ROOT}" "${second_root}")"')
+    expect(phase.match(/"\$\{lost_roots\}" several/g)).toHaveLength(3)
+    expect(phase).not.toContain('"${OP_ROOT},${second_root}"')
+  })
+  // test-47's real refused_start, queue_items_digest and state_digest, and
+  // scenario.sh's real shared_queue_items over the production reader
+  // (fmk-texts acceptedQueueItems: parseQueueRecord). Stand-ins replace only
+  // the image guards, the printer's refusal texts, Slack, AD and the start
+  // itself, whose effect on the case I 0.18.0 journal each case supplies.
+  test.each([
+    ['start compaction (watermark, allocation row, mode 0600)', 'if .kind == "accepted" then . + {attempt_high_watermark: 0} else . end', 0, ''],
+    ['one accepted item dropped', 'select(.seq != 2) | if .kind == "accepted" then . + {attempt_high_watermark: 0} else . end', 1, 'interrupted: refused start changed accepted queue items\n'],
+    ['one accepted item altered', 'if .seq == 2 then .text = "altered" else . end | if .kind == "accepted" then . + {attempt_high_watermark: 0} else . end', 1, 'interrupted: refused start changed accepted queue items\n'],
+    ['another state file changed', '.', 1, 'interrupted: refused start changed state\n'],
+  ] as const)('test-47 refused_start leaves queue journal bytes to start compaction and fails on any accepted item change: %s', (label, filter, status, stderr) => {
+    mkdirSync('/tmp/c9', { recursive: true })
+    const fixtures = mkdtempSync('/tmp/c9/refused-start-printer-')
+    try {
+      sharedPrinterControl(fixtures, join(fixtures, 'fmk-texts.ts'))
+      const test47 = source('test-47-shared-channel-upgrade.sh')
+      const journal = readFileSync(join(import.meta.dir, 'fixtures/shared-channel-upgrade/interrupted-and-invalid-preparation/reference-0.18.0/queue/alpha.jsonl'), 'utf8')
+      const program = [
+        'SLACK_STATE_DIR="$HOME/state" EVIDENCE="$HOME/evidence" CONFIG="$HOME/state/config.json" PRINTER=printer KEYS_ONLY=false REMOVED_SEEN=0',
+        `SCENARIO_FIXTURES=${JSON.stringify(fixtures)} J="$HOME/state/queue/k_alpha.jsonl" FILTER='${filter}' OTHER=${label.startsWith('another') ? 1 : 0}`,
+        'mkdir -p "$EVIDENCE"; declare -A P=([alpha]=k_alpha)',
+        'require_ci_image() { :; }; require_scenario_state() { :; }; _scenario_scratch_file() { :; }',
+        'bun() { if [[ "$2" == removedKeyRefusal ]]; then return 64; fi; command bun "$@"; }',
+        'case_json() { echo config.json.last-applied; }; printed() { echo "refused: alpha"; }; rows_of() { ROWS=(alpha); }',
+        'slack_post_mark() { echo 0; }; count_log() { echo 0; }; count_in() { echo 1; }; expect_count() { :; }; none_after() { :; }; no_session() { :; }',
+        '_scenario_pid_file_live() { return 1; }; references_unchanged() { echo "references checked"; }',
+        'cmp() { [[ "$1" == -s ]] && shift; [[ "$(cat "$1")" == "$(cat "$2")" ]]; }',
+        // The refused start: its effect on the journal, an allocation row,
+        // mode 0600 and a server.log line; OTHER also edits config.json.
+        'run_start() {',
+        '    START_RC=1 START_OUT="$HOME/start.out"; echo "refused: alpha" > "$START_OUT"',
+        '    jq -c "$FILTER" "$J" > "$J.tmp"; echo \'{"v":1,"kind":"accepted","seq":2,"compact":"allocation"}\' >> "$J.tmp"; mv "$J.tmp" "$J"',
+        '    python3 -c "import os,sys; os.chmod(sys.argv[1], 0o600)" "$J"; printf x >> "$SLACK_STATE_DIR/server.log"',
+        '    if [[ "$OTHER" == 1 ]]; then printf " " >> "$CONFIG"; fi',
+        '}',
+        declaration(scenario, 'shared_queue_items'),
+        ...['state_digest', 'queue_items_digest', 'refused_start'].map(name => declaration(test47, name)),
+        'refused_start interrupted',
+      ].join('\n')
+      const run = shell(program, { 'state/config.json': '{}', 'state/server.log': '', 'state/queue/k_alpha.jsonl': journal })
+      expect({ status: run.status, stderr: run.stderr }).toEqual({ status, stderr })
+      expect(run.stdout).toBe(status ? '' : 'references checked\n')
+    } finally { rmSync(fixtures, { recursive: true, force: true }) }
+  })
   test('test-29 exit_observe prints the last queue rows, last hook records, AD row and controls as whitelisted fields only', () => {
     const secret = 'private message text', tok = fakeToken(BOT_TOKEN_PREFIX, 'exit-observer')
     const session = '0123abcd-0000-4000-8000-000000000001'
@@ -1473,6 +2044,334 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     ])
     expect(run.stdout).not.toContain(secret); expect(run.stdout).not.toContain('cscb_other'); expect(run.stdout).not.toContain('updated_at')
     expect(run.stdout).not.toContain(tok)
+  })
+  // In a script file, a failure inside a call whose stdout is discarded runs
+  // the exit hooks with that stdout (as the scenario's cleanup runs them, in a
+  // subshell each); test-29 registers its dump through the stderr wrapper.
+  test.each([['exit_observe_stderr', 'printer refused\nexit-observe: dump\n'], ['exit_observe', 'printer refused\n']] as const)(
+    'test-29 exit dump survives a failure under a discarded stdout: %s', (hook, stderr) => {
+      expect(test29Script).toMatch(/^on_before_cleanup exit_observe_stderr$/m)
+      const run = shell('bash "$HOME/case.sh"', { 'case.sh': [
+        'set -euo pipefail', 'fail() { printf "%s\\n" "$*" >&2; exit 1; }',
+        'exit_observe() { printf "exit-observe: dump\\n"; }', test29Script.match(/^exit_observe_stderr\(\) \{.*\}$/m)![0],
+        `cleanup() { trap - EXIT; ( ${hook} ); }`, 'trap cleanup EXIT',
+        'discarded() { fail "printer refused"; }', 'discarded > /dev/null', '',
+      ].join('\n') })
+      expect({ status: run.status, stdout: run.stdout, stderr: run.stderr }).toEqual({ status: 1, stdout: '', stderr })
+    })
+  // test-29's real leave steps and expect_stale_review. The stand-in server
+  // applies the leave on its ACK and, when pending, lands the staged rescan at
+  // its next chance: the rescan wait, or the stale confirmation's reload tick.
+  // The rescan rewrites what sharedApplicationPreserved compares (the left
+  // channel's isExtSharedChannel), here the stand-in record's bytes.
+  const leaveSteps = block(test29Script, '        member_unlist alpha "${channel}"', '        configuration_request "leave-cancel-')
+  const rescanWait = '        wait_membership_rescan "${ALPHA}" "${ALPHA_LABEL}" "$(slack_stub_record_field seq push "envelope_id=${first}")"\n'
+  test.each([
+    ['pending', 'with the wait', 0, ''],
+    ['pending', 'without the wait', 1, 'leave-stale-open-off: stale confirmation changed applied facts\n'],
+    ['landed', 'with the wait', 0, ''],
+    ['landed', 'without the wait', 0, ''],
+  ] as const)('test-29 leave lets its staged rescan land before the stale check: rescan %s, %s', (rescan, variant, status, stderr) => {
+    expect(leaveSteps.split(rescanWait)).toHaveLength(2)
+    const steps = variant === 'with the wait' ? leaveSteps : leaveSteps.replace(rescanWait, '')
+    const run = shell([
+      'CONFIG="$HOME/config.json" LAST="$HOME/config.json.last-applied" APPLY="$HOME/config.json.apply" CAPTURED="$HOME/captured"',
+      'ALPHA=t29_alpha ALPHA_LABEL=alpha ALPHA_KEY=k_alpha BRAVO_KEY=k_bravo M_HYBRID=CHYBRID EVENT_WAIT_S=15 APPLY_WAIT_S=20',
+      `SUPERSEDED_OUTCOME=superseded RESCAN=${rescan} mode=open value=off channel=CLEFT`, 'declare -A LEAVE_ENVELOPES=()',
+      'mkdir -p "$CAPTURED"; printf "stale\\n" > "$CAPTURED/leave-preview-open-off.pending"; printf "member ext=false\\n" > "$LAST"',
+      'land_rescan() { [[ -e "$HOME/rescan-due" ]] || return 0; printf "left ext=absent\\n" > "$LAST"; rm "$HOME/rescan-due"; }',
+      'member_unlist() { :; }', 'scenario_ts() { echo 1.1; }', 'slack_push_channel_left() { echo env-left; }',
+      'ack_control() { [[ "$1" == env-left ]] || return 1; printf "left ext=false\\n" > "$LAST"; touch "$HOME/rescan-due"; [[ "$RESCAN" == pending ]] || land_rescan; }',
+      'wait_until() { shift 2; "$@"; }', 'choice_is() { [[ "$3" == "" ]]; }', 'shared_thread_since() { :; }', 'channel_facts() { echo "facts $1 $2"; }',
+      'slack_stub_record_field() { [[ "$*" == "seq push envelope_id=env-left" ]] || return 1; echo 41; }',
+      'wait_membership_rescan() { printf "%s\\n" "$*" >> "$HOME/waits"; land_rescan; }',
+      'wait_since() { land_rescan; mv -- "$APPLY" "$HOME/spent"; }',
+      'configuration_application_preserved() { cmp -s "$2" "$3"; }',
+      declaration(test29Script, 'log_mark'), declaration(test29Script, 'expect_stale_review'),
+      'sibling="$(channel_facts "${BRAVO_KEY}" "${channel}")"; before="$(channel_facts "${ALPHA_KEY}" "${M_HYBRID}")"',
+      steps, 'cat "$HOME/waits" 2> /dev/null || true', 'cat "$LAST"',
+    ].join('\n'))
+    expect({ status: run.status, stderr: run.stderr }).toEqual({ status, stderr })
+    if (status) return
+    expect(run.stdout).toBe((variant === 'with the wait' ? 't29_alpha alpha 41\n' : '') + 'left ext=absent\n')
+  })
+  // test-29's real DM enable in own_posts_phase, with the real input_has and
+  // edit_input. The stand-in review fails as the server's reload-noop does when
+  // the confirmed input equals the applied one.
+  const dmEnable = block(test29Script, '    name="$(if [[ "${q}" == alpha ]]', '    successful_tool "${mode}-own-dm"')
+  const unguarded = dmEnable.replace(/^ {4}if ! input_has .*; then\n/m, '').replace(/^ {4}fi\n/m, '')
+  test.each([
+    ['bravo', 'UCONTACT', 'guarded', 0, '', [], { enabled: true, contact: 'UCONTACT' }],
+    ['bravo', 'UCONTACT', 'unguarded', 1, 'open-enable-dm: confirmation did not apply (reload-noop)\n', [], { enabled: true, contact: 'UCONTACT' }],
+    ['bravo', 'UOTHER', 'guarded', 0, '', ['open-enable-dm'], { enabled: true, contact: 'UCONTACT' }],
+    ['alpha', '', 'guarded', 0, '', ['open-enable-dm'], { enabled: true, contact: 'UCONTACT' }],
+  ] as const)('test-29 reviews a DM enable only when the input changes: %s contact=%s %s', (q, contact, form, status, stderr, reviews, dm) => {
+    expect(unguarded.length).toBeLessThan(dmEnable.length)
+    const config = { personas: [{ name: 't29_alpha', dm: { enabled: false } },
+      { name: 't29_bravo', dm: contact ? { enabled: true, contact } : { enabled: false } }] }
+    const run = shell([
+      'CONFIG="$HOME/config.json" ALPHA=t29_alpha BRAVO=t29_bravo CONTACT=UCONTACT mode=open', `q=${q}`, 'cp -- "$CONFIG" "$HOME/applied.json"',
+      'review_assign() { printf "%s\\n" "$*" >> "$HOME/reviews"; [[ "$(jq -cS . "$CONFIG")" != "$(jq -cS . "$HOME/applied.json")" ]] || fail "$1: confirmation did not apply (reload-noop)"; cp -- "$CONFIG" "$HOME/applied.json"; }',
+      declaration(test29Script, 'edit_input'), test29Script.match(/^input_has\(\) \{.*\}$/m)![0],
+      form === 'guarded' ? dmEnable : unguarded,
+      'cat "$HOME/reviews" 2> /dev/null || true', `jq -c --arg who "t29_${q}" '.personas[]|select(.name==$who)|.dm' "$CONFIG"`,
+    ].join('\n'), { 'config.json': JSON.stringify(config) })
+    expect({ status: run.status, stderr: run.stderr }).toEqual({ status, stderr })
+    if (status) return
+    expect(run.stdout.trim().split('\n')).toEqual([...reviews, JSON.stringify(dm)])
+  })
+  // test-29's real write_persona_config, read by the production parser. A
+  // persona without the opt-out inherits reminders on, and each nudge takes a
+  // manual receipt release meant for a real item.
+  // Its heredoc's closing brace sits in column 0, so it ends at the next section.
+  const personaConfig = block(test29Script, 'write_persona_config() {', '\n\n# --- Start')
+  const optOut = /^ {6}"stop_hook_bootstrap": false,\n/gm
+  const personaConfigSetup = [
+    'CONFIG="$HOME/config.json" ALPHA=t29_alpha BRAVO=t29_bravo ALPHA_CREDS="$HOME/alpha.json" BRAVO_CREDS="$HOME/bravo.json"',
+    'ALPHA_DIR="$HOME/alpha" BRAVO_DIR="$HOME/bravo" CONTACT=UCONTACT SWITCH_KEY=channel_mode SCENARIO_PORT=3999 MCP_CONFIG="$HOME/mcp.json"',
+    'A1=CA1 A2=CA2 B1=CB1 T1=CT1 N1=CN1 N2=CN2 N3=CN3 F1=CF1 F2=GF2 U1=CU1 M_OFF=CMOFF M_MENTIONS=CMMENTIONS M_ALL=CMALL M_HYBRID=CMHYBRID WRITE_CHANNEL=CWRITE FUTURE=CFUTURE',
+    'write_config() { cat > "$CONFIG"; }',
+    declaration(test29Script, 'edit_input'), test29Script.match(/^input_has\(\) \{.*\}$/m)![0], declaration(test29Script, 'input_choice'),
+  ]
+  test.each((['declarative', 'fungible', 'switch-off'] as const).flatMap(shape => (['with', 'without'] as const).map(form => [shape, form] as const)))(
+    'test-29 written config turns reply reminders off for both personas: %s, %s the opt-out', (shape, form) => {
+      expect(personaConfig.match(optOut)).toHaveLength(2)
+      const ready = shape === 'declarative' ? 'false' : 'true'
+      const run = shell([
+        ...personaConfigSetup, `ALPHA_THREADS=${ready} MATRIX_READY=${ready}`,
+        form === 'with' ? personaConfig : personaConfig.replace(optOut, ''),
+        `write_persona_config ${shape}`, 'cat "$CONFIG"',
+      ].join('\n'))
+      assertNoLeak([run.stdout, run.stderr])
+      expect({ status: run.status, stderr: run.stderr }).toEqual({ status: 0, stderr: '' })
+      const config = parsePersonaConfigBytes(run.stdout, '/scratch/config.json', '/scratch')
+      expect(config.personas.map(p => [p.name, p.stop_hook_bootstrap])).toEqual([['t29_alpha', form === 'without'], ['t29_bravo', form === 'without']])
+    })
+  // test-29's real permission_post destination step, notice_phase destination
+  // step and destination_post_matrix back-edit (set_composed_choice,
+  // edit_destination, input_has, input_choice, edit_input) over bravo's real
+  // open-shape input. The stand-in review reads the input with the production
+  // parser, as configuration_request's printer does, then saves its gestures;
+  // the stand-in tool saves its value. The old step (909132aa's permission_post
+  // edit) points permission_prompts at an unlisted channel, which the parser
+  // refuses.
+  const destinationStep = block(test29Script, '    set_composed_choice "${mode}" "${q}" "${DEST}" "${value}" "${mode}-prompt-${number}-${value}"', '    wait_queue_drained "${dir}"')
+  const noticeStep = block(test29Script, '    set_composed_choice "${mode}" "${q}" "${DEST}" "${value}" "${phase}-own-value"', '    wait_queue_drained "${ALPHA_DIR}"')
+  const backEdit = test29Script.match(/^ {12}edit_destination "\$\{qname\}" "\$\{qkey\}" .*$/m)![0]
+  const oldDestination = [
+    '    if ! input_has --arg who "${name}" --arg dest "${DEST}" \'.personas[]|select(.name==$who)|.permission_prompts==$dest\'; then',
+    '        edit_input --arg who "${name}" --arg dest "${DEST}" \'(.personas[]|select(.name==$who)|.permission_prompts)=$dest\'',
+    '        review_assign "${mode}-prompt-destination-${number}"', '    fi', '',
+  ].join('\n')
+  const parser = [`import { parsePersonaConfigBytes } from ${JSON.stringify(join(import.meta.dir, '..', 'src', 'config.ts'))}`,
+    "import { readFileSync } from 'node:fs'",
+    'try { parsePersonaConfigBytes(readFileSync(process.argv[2]!), process.argv[2]!, process.argv[3]!) }',
+    'catch (error) { process.stderr.write(`${(error as Error).message}\\n`); process.exit(1) }', ''].join('\n')
+  test.each([
+    ['permission', 'old step', 1, []],
+    ['permission', 'fixed step', 0, ['bot open-prompt-1-off off', 'review open-prompt-destination-1 t29_bravo/CDEST/off',
+      'review open-prompt-2-thread_hybrid t29_bravo/CDEST/thread_hybrid', 'review open-prompt-destination-dm', 'review open-prompt-destination-back']],
+    ['notice', 'fixed step', 0, ['review open-notice-off-own-value t29_bravo/CDEST/off', 'review open-notice-off-destination',
+      'review open-notice-thread_hybrid-own-value t29_bravo/CDEST/thread_hybrid']],
+  ] as const)('test-29 open destination steps list DEST in bravo\'s input: %s, %s', (steps, form, status, calls) => {
+    expect(destinationStep.split('\n')).toHaveLength(3)
+    const program = steps === 'notice' ? [
+      // As the strict phases leave it: DEST listed at its saved value.
+      'input_choice "$BRAVO" CDEST all; printf "all\\n" > "$HOME/saved.k_bravo.CDEST"',
+      'notice() { local q=bravo value="$1" phase="open-notice-$1" dir key name="$BRAVO"', 'thread_persona "$q"; dir="$THREAD_DIR"; key="$THREAD_KEY"', noticeStep, '}',
+      'notice off', 'notice thread_hybrid',
+    ] : [
+      // own_posts_phase's tool-stored choice, with DEST still unlisted.
+      'printf "thread_hybrid\\n" > "$HOME/saved.k_bravo.CDEST"',
+      'post() { local q=bravo number="$1" value="$2" dir key name="$BRAVO"', 'thread_persona "$q"; dir="$THREAD_DIR"; key="$THREAD_KEY"',
+      form === 'old step' ? destinationStep.replace(/^ {4}edit_destination .*\n/m, oldDestination) : destinationStep, '}',
+      'post 1 off', 'post 2 thread_hybrid', 'qname="$BRAVO" qkey="$BRAVO_KEY" kind=prompt',
+      'edit_input --arg who "$qname" \'(.personas[]|select(.name==$who)|.permission_prompts)="dm"\'', 'review_assign "${mode}-${kind}-destination-dm"', backEdit,
+    ]
+    const run = shell([
+      ...personaConfigSetup, 'ALPHA_THREADS=false MATRIX_READY=false', personaConfig, 'write_persona_config fungible',
+      'ALPHA_KEY=k_alpha BRAVO_KEY=k_bravo ALPHA_BOT_USER=UALPHA BRAVO_BOT_USER=UBRAVO ALPHA_REF=alpha BRAVO_REF=bravo DEST=CDEST mode=open',
+      declaration(test29Script, 'thread_persona'),
+      'attempt_args() { printf "%s\\n" "$2"; }',
+      'expect_attempt() { printf "bot %s %s\\n" "$1" "$5" >> "$HOME/calls"; printf "%s\\n" "$5" > "$HOME/saved.$4.$3"; }',
+      'shared_channel_saved() { cat "$HOME/saved.$1.$2" 2> /dev/null || true; }',
+      'review_assign() {', '    local step="$1" gesture name channel value; shift', '    printf "review %s%s\\n" "$step" "${*:+ $*}" >> "$HOME/calls"',
+      '    bun "$HOME/parser.ts" "$CONFIG" "$HOME" || fail "$step: cannot build the operator request"',
+      '    for gesture in "$@"; do IFS=/ read -r name channel value <<< "$gesture"; printf "%s\\n" "$value" > "$HOME/saved.k_${name#t29_}.$channel"; done', '}',
+      ...['set_composed_choice', 'edit_destination'].map(name => declaration(test29Script, name)),
+      ...program,
+      'cat "$HOME/calls"', 'jq -c \'.personas[1]|{permission_prompts,dm,listed:[.channels[]|select(.id=="CDEST")]}\' "$CONFIG"', 'cat "$HOME/saved.k_bravo.CDEST"',
+    ].join('\n'), { 'parser.ts': parser })
+    assertNoLeak([run.stdout, run.stderr])
+    expect(run.status).toBe(status)
+    if (status) {
+      expect(run.stderr).toContain("permission_prompts names channel CDEST, which is not in the persona's channels.")
+      expect(run.stderr).toEndWith('open-prompt-destination-1: cannot build the operator request\n')
+      return
+    }
+    expect(run.stderr).toBe('')
+    expect(run.stdout.trim().split('\n')).toEqual([...calls,
+      JSON.stringify({ permission_prompts: 'CDEST', dm: { enabled: true, contact: 'UCONTACT' }, listed: [{ id: 'CDEST', delivery: 'thread_hybrid' }] }), 'thread_hybrid'])
+  })
+  // test-29's real confirm_review, its omit-member call and its NOOP_CLASS. The
+  // stand-in server consumes the confirmed review and logs reload-noop for no
+  // effective change and reload-applied otherwise, as src/reload.ts does; an
+  // omission is no effective change. `both` logs the two, which production never
+  // does, to reach the applied-count check.
+  const omitConfirm = test29Script.match(/^ {4}confirm_review omit-member .*$/m)![0]
+  const noopClass = test29Script.match(/^NOOP_CLASS=.*$/m)![0]
+  test.each([
+    ['omit-member', omitConfirm, 'noop', 0, ''],
+    ['omit-member', '    confirm_review omit-member', 'noop', 1, 'omit-member: confirmation did not apply\n'],
+    ['omit-member', omitConfirm, 'applied', 1, 'omit-member: confirmation was not a no-op\n'],
+    ['omit-member', omitConfirm, 'both', 1, 'omit-member: a no-op confirmation applied a change\n'],
+    ['applying review', '    confirm_review same-operator', 'applied', 0, ''],
+  ] as const)('test-29 confirms a review with no effective change by its reload-noop line: %s, %s', (_name, call, effect, status, stderr) => {
+    expect(noopClass).toBe(`NOOP_CLASS='[slack] ${RELOAD_NOOP}:'`)
+    const run = shell([
+      'CONFIG="$HOME/config.json" LAST="$HOME/last" PENDING="$HOME/pending" APPLY="$HOME/apply" CAPTURED="$HOME/captured" PRINTER=printer.ts',
+      `APPLY_WAIT_S=20 APPLIED_CLASS=applied EFFECT=${effect}`, noopClass,
+      'mkdir -p "$CAPTURED"; printf "review\\n" > "$PENDING"; printf "0\\n" > "$HOME/applied"; printf "0\\n" > "$HOME/noop"',
+      'count_log() { case "$1" in "$APPLIED_CLASS") cat "$HOME/applied" ;; "$NOOP_CLASS") cat "$HOME/noop" ;; *) return 1 ;; esac; }',
+      'check_pending_layout() { :; }', 'configuration_record_matches() { :; }',
+      'serve() { [[ -e "$APPLY" ]] || return 0; rm -- "$APPLY"; touch "$HOME/consumed"',
+      '    [[ "$EFFECT" == applied ]] || printf "1\\n" > "$HOME/noop"; [[ "$EFFECT" == noop ]] || printf "1\\n" > "$HOME/applied"; }',
+      'wait_for_count() { serve; (( $(count_log "$1") >= $2 )) || fail "$4"; }', 'wait_until() { serve; shift 2; "$@"; }',
+      'bun() { [[ "$2" == sharedReviewConsumed && -e "$HOME/consumed" && "$5" == "$CAPTURED/"*.pending ]]; }',
+      declaration(test29Script, 'capture_review'), declaration(test29Script, 'confirm_review'), call,
+      'printf "applied=%s noop=%s\\n" "$(cat "$HOME/applied")" "$(cat "$HOME/noop")"',
+    ].join('\n'))
+    expect({ status: run.status, stderr: run.stderr }).toEqual({ status, stderr })
+    if (!status) expect(run.stdout).toBe(effect === 'noop' ? 'applied=0 noop=1\n' : 'applied=1 noop=0\n')
+  })
+  // test-29's ineligible step pushes its joined-thread reply with Slack's
+  // external-sharing flag set, as the channel now is. Open mode refuses that
+  // flag before membership (decideDelivery), and routing logs the refusal as
+  // an unclaimed-channel line (logDrop), never a channel-ineligible drop. The
+  // stand-in log holds the production line; the step's real wait reads it.
+  const externalWait = test29Script.match(/^ {4}wait_since "\$\{mark\}" "\$\{unclaimed\}" .*$/m)![0]
+  const externalReply = block(test29Script, '    unclaimed="$(persona_line "${UNCLAIMED_CHANNEL}"', '    expect_queued external-joined-reply')
+  const reply = (flag: boolean) => decideDelivery(
+    { type: 'message', channel: 'CEXTERNAL', channel_type: 'channel', user: 'UHUMAN', text: 'plain', ts: '1700000001.000002', thread_ts: '1700000001.000001' },
+    { key: 'k_alpha', botUserId: 'UALPHA', botId: 'BALPHA', channels: [], dmEnabled: false }, [{ key: 'k_alpha', channels: [] }],
+    { mode: 'open', channelIdPattern: CHANNEL_ID_RE, isExtSharedChannel: flag, storedChoices: { readable: true, storedChoice: () => 'thread_hybrid' },
+      memberships: new Map([['k_alpha', { kind: 'ineligible', reason: 'external-sharing' } as const]]) })
+  test.each([
+    ['fixed step', externalReply, 0, ''],
+    // 909132aa's wait.
+    ['old step', externalReply.replace(externalWait,
+      '    wait_since "${mark}" "$(plain_drop "${ALPHA_REF}" "${EXTERNAL}" channel-ineligible)" "${EVENT_WAIT_S}" \'external joined reply was not excluded\''),
+    1, 'external joined reply was not excluded\n'],
+  ] as const)('test-29 waits for the external joined reply\'s refusal line: %s', (_form, steps, status, stderr) => {
+    expect(reply(true)).toEqual({ action: 'drop', reason: 'fungible-refused', refusal: 'externally-shared' })
+    expect(reply(false)).toEqual({ action: 'drop', reason: 'channel-ineligible' })
+    const cause = fungibleUnclaimedChannelCause('CEXTERNAL', 'externally-shared')
+    const logged = formatPersonaDiagnostic({ class: UNCLAIMED_CHANNEL, name: 't29_alpha', key: 'k_alpha', index: 0, cause })
+    const run = shell([
+      'SLACK_STATE_DIR="$HOME/state" EXTERNAL=CEXTERNAL ALPHA_REF=\'"t29_alpha" (key=k_alpha)\' UNCLAIMED_CHANNEL=unclaimed-channel REFUSAL_EXTERNALLY_SHARED=externally-shared',
+      'EVENT_WAIT_S=15 HUMAN=UHUMAN root=1700000001.000001 SCENARIO_SEP=$\'\\x1f\'', 'mkdir -p "$SLACK_STATE_DIR"; printf "earlier\\n" > "$SLACK_STATE_DIR/server.log"',
+      'printed() { [[ "$*" == "fungibleUnclaimedChannelCause CEXTERNAL externally-shared" ]] || return 1; cat "$HOME/cause.txt"; }',
+      'persona_line() { [[ "$1|$2|$3" == "unclaimed-channel|alpha|$(cat "$HOME/cause.txt")" ]] || return 1; cat "$HOME/logged.txt"; }',
+      'new_ts() { PUSH_TS=1700000001.000002; }', 'plain_text() { echo plain; }', 'slack_reply_event() { printf "%s\\n" "$*"; }',
+      // The stand-in server logs the production line for a flagged reply.
+      'push_event() { [[ "$1 $3" == "alpha true" ]] || return 1; cat "$HOME/logged.txt" >> "$SLACK_STATE_DIR/server.log"; }',
+      'wait_until() { local step="$2"; shift 2; "$@" || fail "$step"; }',
+      // _scenario_scan's count: every fragment, in order, on one line after the mark.
+      'count_since_at_least() { local line rest frag n=0 ok; local -a frags; IFS=$\'\\x1f\' read -r -a frags <<< "$2"',
+      '    while IFS= read -r line; do rest="$line"; ok=1',
+      '        for frag in "${frags[@]}"; do [[ "$rest" == *"$frag"* ]] || { ok=0; break; }; rest="${rest#*"$frag"}"; done',
+      '        (( ok == 0 )) || n=$(( n + 1 ))', '    done < <(tail -n "+$(( $1 + 1 ))" "$SLACK_STATE_DIR/server.log"); (( n >= $3 )); }',
+      declaration(scenario, 'matcher'), declaration(test29Script, 'plain_drop'), declaration(test29Script, 'log_mark'), declaration(test29Script, 'wait_since'),
+      steps,
+    ].join('\n'), { 'cause.txt': cause + '\n', 'logged.txt': logged + '\n' })
+    expect({ status: run.status, stderr: run.stderr }).toEqual({ status, stderr })
+  })
+  // test-29's unverified case waits three times for a stub control: the socket
+  // close, the reconnect's delayed inventory request and that request's settled
+  // record. The real record readers (lib/scenario.sh) and the fake-clock poll;
+  // a stand-in sleep writes the wait's record during the second sleep, so the
+  // third poll is the first to see it, as the stub writes it only once the
+  // control fires. The old step is 909132aa's wait: the same line polling
+  // slack_stub_control_fired, which fails the script on the first empty poll.
+  const controlWaits = test29Script.match(/^ {4}wait_until \S+ '[^']*' control_fired .*$/gm)!
+  const controlRecords: Record<string, string> = {
+    'socket-close': '{"seq":2,"event":"socket-close","label":"alpha"}',
+    fault: '{"seq":2,"event":"fault","label":"alpha","method":"users.conversations","outcome":"delay","request_id":"r1"}',
+    'fault-settled': '{"seq":2,"event":"fault-settled","request_id":"r1","resolution":"delay"}',
+  }
+  type ControlCase = [event: string, form: string, fires: boolean, status: number, stderr: string]
+  const controlCases: ControlCase[] = [
+    ...Object.keys(controlRecords).flatMap((event): ControlCase[] => [
+      [event, 'fixed step', true, 0, ''], [event, 'old step', true, 1, 'the requested control has no fired record\n'],
+    ]),
+    ['fault', 'fixed step, never fired', false, 1, 'inventory delay did not fire (not within 3s)\n'],
+  ]
+  test.each(controlCases)(
+    'test-29 polls a stub control until it fires: %s, %s', (event, form, fires, status, stderr) => {
+      expect(controlWaits).toHaveLength(3)
+      const fixed = controlWaits.find(line => line.includes(` control_fired ${event} `))!
+      const run = shell([
+        polling, 'RECORD_WAIT_S=3 SCENARIO_SLACK_RECORD="$HOME/record.jsonl" request_id=r1', `FIRES=${fires}`,
+        'printf \'{"seq":1,"event":"ws-open","label":"alpha"}\\n\' > "$SCENARIO_SLACK_RECORD"',
+        'sleep() { local now; read -r now < "$HOME/clock"; printf "%s\\n" "$((now+1000))" > "$HOME/clock"',
+        '    [[ "$FIRES" == true && "$now" == 1000 ]] || return 0', '    cat "$HOME/fired.jsonl" >> "$SCENARIO_SLACK_RECORD"; }',
+        'require_ci_image() { :; }',
+        ...['_scenario_scratch_file', '_scenario_complete_jsonl', 'slack_stub_records', 'slack_stub_record_count', 'slack_stub_control_fired'].map(name => declaration(scenario, name)),
+        test29Script.match(/^control_fired\(\) \{.*\}$/m)![0],
+        form === 'old step' ? fixed.replace(' control_fired ', ' slack_stub_control_fired ') : fixed,
+        'printf "after the wait at %s ms\\n" "$(cat "$HOME/clock")"',
+      ].join('\n'), { 'fired.jsonl': controlRecords[event] + '\n' })
+      expect({ status: run.status, stderr: run.stderr }).toEqual({ status, stderr })
+      if (!status) expect(run.stdout).toBe('after the wait at 2000 ms\n')
+    })
+  // test-29's closing body check, its real function and heads. The heads are
+  // pinned to the lines production builds: the event router's RAW line and the
+  // delivery dispatch line. A body on those timestamped lines alone passes; on
+  // any other log line, an unstamped line, in a captured result, or past a head
+  // that is not the line's start, it fails, as with the old check on every line.
+  const bodyCheck = declaration(test29Script, 'body_sentinels_absent')
+  const bodyHeads = test29Script.match(/^BODY_LINE_HEADS=.*$/m)![0]
+  const oldBodyCheck = [
+    '# 909132aa\'s check.', 'body_sentinels_absent() {',
+    '    python3 - "$1" "$2" "$3" <<\'PY\'', 'import json, pathlib, sys',
+    'texts = {json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()}',
+    "assert texts and all(texts), 'missing independent message-body sentinels'",
+    'paths = [pathlib.Path(sys.argv[2]), *pathlib.Path(sys.argv[3]).iterdir()]', 'for path in paths:',
+    '    if any(text in path.read_text() for text in texts):',
+    "        raise SystemExit('message body leaked into diagnostics or a captured result')", 'PY', '}',
+  ].join('\n')
+  test.each([
+    ['fixed check, body on RAW and dispatch lines', 'fixed', 'excerpts', 0],
+    ['old check, body on RAW and dispatch lines', 'old', 'excerpts', 1],
+    ['fixed check, body on another log line', 'fixed', 'other-line', 1],
+    ['fixed check, body after a head mid-line', 'fixed', 'mid-line', 1],
+    ['fixed check, body on an unstamped line that starts with a head', 'fixed', 'unstamped', 1],
+    ['fixed check, body in a captured result', 'fixed', 'captured', 1],
+  ] as const)('test-29 closing body check skips only the RAW and dispatch lines: %s', async (_name, form, where, status) => {
+    const body = 'test-29-invited-channels plain-7'
+    const logged: string[] = []
+    const router = createPersonaEventRouter({ routing: { receive: async () => {}, receiveReaction: async () => {} }, clientFor: () => undefined as never, getPersona: () => undefined as never, log: line => logged.push(line) })
+    const event = { type: 'message', channel: 'CHUMAN', text: body, ts: '1700000001.000001', user: 'UHUMAN', channel_type: 'channel' }
+    await router('t29_alpha', 'message', { event, ack: async () => {} } as never)
+    await router('t29_alpha', 'app_mention', { event: { ...event, type: 'app_mention' }, ack: async () => {} } as never)
+    logged.push(buildDeliveryDispatchLine('"t29_alpha" (key=t29_alpha)',
+      { v: 1, kind: 'accepted', seq: 1, source: 'slack', channel: 'CHUMAN', ts: '1700000001.000001', user: 'UHUMAN', text: body, received_at: 1 } as AcceptedRecord))
+    // Each production line's head, through its `persona=`, in the script's order.
+    const heads = logged.map(line => line.slice(0, line.indexOf('persona=') + 'persona='.length))
+    expect(bodyHeads).toBe(`BODY_LINE_HEADS=(${heads.map(head => `'${head}'`).join(' ')})`)
+    expect(logged.every(line => line.includes(body))).toBe(true)
+    const stamp = (line: string) => `[2026-11-13T18:03:53.751Z] ${line}`
+    const lines = [...logged.map(stamp), stamp('[slack] message-received: persona="t29_alpha" (key=t29_alpha) source=slack')]
+    if (where === 'other-line') lines.push(stamp(`[slack] reload-preview: ${body}`))
+    if (where === 'mid-line') lines.push(stamp(`[slack] persona=t29_alpha: note ${logged[0]}`))
+    // A continuation line of a multi-line entry carries no timestamp.
+    if (where === 'unstamped') lines.push(stamp('[slack] persona=t29_alpha: note'), logged[2]!)
+    const run = shell([
+      bodyHeads, form === 'fixed' ? bodyCheck : oldBodyCheck, 'mkdir -p "$HOME/captured"',
+      `printf '%s\\n' ${where === 'captured' ? `"echo ${body}"` : '"no body"'} > "$HOME/captured/step.result"`,
+      'body_sentinels_absent "$HOME/inputs.jsonl" "$HOME/server.log" "$HOME/captured"',
+    ].join('\n'), { 'inputs.jsonl': JSON.stringify(body) + '\n', 'server.log': lines.join('\n') + '\n' })
+    expect({ status: run.status, stderr: run.stderr }).toEqual({ status, stderr: status ? 'message body leaked into diagnostics or a captured result\n' : '' })
   })
   test('burst slice removes exactly the two write envelopes and keeps every other stub line byte-for-byte', () => {
     const lines = ['{"seq":1,"event":"push","envelope_id":"burst","sent_mono_ms":1.250000}', '{"seq":2,"event":"push","envelope_id":"leave-env"}',
@@ -1651,7 +2550,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       'e/alpha.queue.jsonl': jsonl([{ kind: 'accepted', channel, ts: '1', seq: 1 }]), 'e/beta.queue.jsonl': jsonl([{ kind: 'accepted', channel, ts: '2', seq: 2 }]) })
     expect(child.status).toBe(1); expect(child.stdout).toContain('persona=1 limit=50 verdict=pass'); expect(child.stdout).toContain('persona=2 limit=50 verdict=fail')
   })
-  test('the measurement reader skips only the server diagnostic kinds; every verdict is unchanged by them', () => {
+  test('the measurement reader skips only the server diagnostic kinds and keeps thread-compaction for the compaction proof; every other verdict is unchanged by them', () => {
     const items = [{ key, phase: 'roots', channel, ts: '1' }, { key: 'beta', phase: 'roots', channel, ts: '2' }]
     const queues = { 'e/alpha.queue.jsonl': jsonl([{ kind: 'accepted', channel, ts: '1', seq: 1 }]), 'e/beta.queue.jsonl': jsonl([{ kind: 'accepted', channel, ts: '2', seq: 2 }]) }
     const rows = [measure(1), measure(2, 'accepted', SR8_STORE_LIMIT_MS, 'beta')]
@@ -1660,9 +2559,40 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     // One row of each kind as the server's own serializer writes it.
     const diagnostic = [serverRows.ack, serverRows.append, serverRows.save].map(l => JSON.parse(l))
     expect(diagnostic.map(r => r.kind)).toEqual([...SR8_DIAGNOSTIC_KINDS])
-    expect({ status: run(diagnostic).status, stdout: run(diagnostic).stdout }).toEqual({ status: plain.status, stdout: plain.stdout })
+    const all = run([...diagnostic, JSON.parse(serverRows.compaction)])
+    expect({ status: all.status, stdout: all.stdout }).toEqual({ status: plain.status, stdout: plain.stdout })
     const unknown = run([{ v: 1, kind: 'unreviewed', key, at_mono_ms: 1 }])
     expect(unknown.status).toBe(1); expect(unknown.stdout.split('\n').filter(l => l.includes(' store ')).every(l => l.endsWith('verdict=missing'))).toBe(true)
+  })
+  test('CLI check proves each recipient\'s Thread Memory compaction from its measurement file, inside the burst\'s server-clock store span only', () => {
+    const keys = sr8Personas(2), [alpha, beta] = keys as [string, string], { ledger } = pendingBurst(keys, channel, [])
+    const accepted = ledger.filter(i => i.phase !== 'dropped')
+    // Server clock: the burst's 4,000 acceptance stores span 1000..5000. The stub's
+    // push/ACK clock starts at 9,000,000 and the harness's start/ready at 0.
+    const stores = accepted.map((i, n) => serverLine({ kind: 'store', key: i.key, seq: n + 1, store: 'accepted', store_ms: 1, at_mono_ms: 1001 + n }, 1001 + n))
+    const files: Record<string, string> = { 'e/burst.jsonl': jsonl(ledger),
+      'e/times.jsonl': jsonl(ledger.map((i, n) => ({ envelope_id: i.envelope_id, push: { sent_mono_ms: 9_000_000 + n, connection_id: 'socket' },
+        acks: [{ ack_mono_ms: 9_000_001 + n, connection_id: 'socket' }] }))),
+      'e/compactions.jsonl': jsonl(keys.map(k => ({ key: k, kind: 'queue', before: '1:1', after: '1:2', inside: true }))) }
+    for (const k of keys) files[`e/${k}.queue.jsonl`] = jsonl(accepted.flatMap((i, n) => i.key === k ? [{ kind: 'accepted', channel: i.channel, ts: i.ts, seq: n + 1 }] : []))
+    const run = (measured: string[], mark = 0) => {
+      const out = cli('check', ['@/e', '@/measurements', String(mark), '0', '1'], { ...files, measurements: measured.map(l => `${l}\n`).join('') }).stdout.trim().split('\n')
+      return { compaction: out.filter(l => l.startsWith('recorded: sr8 compaction ')),
+        others: out.filter(l => !l.startsWith('recorded: sr8 compaction ') && !l.startsWith('recorded: sr8 summary ')) }
+    }
+    const line = (stats: string, verdict: string) => [`recorded: sr8 compaction scenario=test-cli mode=strict population=100000 recipients=2 ${stats} limit=inside-burst verdict=${verdict}`]
+    const startup = keys.map(k => compactionLine(k, 10, 900, 'rewritten')), alphaRewrite = compactionLine(alpha, 1500, 1600, 'rewritten')
+    const skips = [compactionLine(alpha, 2000, 2100, 'skipped'), compactionLine(beta, 3000, 3100, 'skipped')]
+    const plain = run(stores), pass = run([...startup, ...stores, alphaRewrite, ...skips, compactionLine(beta, 4000, 4999, 'rewritten')])
+    expect(plain.compaction).toEqual(line('samples=2 required=4 queue=2 threads=0 rewritten=0 skipped=0 outside=0 window_ms=4000', 'missing'))
+    expect(pass.compaction).toEqual(line('samples=4 required=4 queue=2 threads=2 rewritten=2 skipped=2 outside=2 window_ms=4000', 'pass'))
+    expect(pass.others).toEqual(plain.others)
+    // beta's rewrite inside the stub's push-to-ACK span is outside the server's: beta only skipped.
+    expect(run([...startup, ...stores, alphaRewrite, ...skips, compactionLine(beta, 9_000_100, 9_000_200, 'rewritten')]).compaction)
+      .toEqual(line('samples=3 required=4 queue=2 threads=1 rewritten=1 skipped=2 outside=3 window_ms=4000', 'fail'))
+    // Entries before the byte mark are not read: alpha's rewrite precedes it.
+    expect(run([alphaRewrite, ...stores, ...skips, compactionLine(beta, 4000, 4999, 'rewritten')], alphaRewrite.length + 1).compaction)
+      .toEqual(line('samples=3 required=4 queue=2 threads=1 rewritten=1 skipped=2 outside=0 window_ms=4000', 'fail'))
   })
   test('CLI seal passes the printer lost-join marker into the measured verdict', () => {
     const child = cli('seal', ['@/log', '0', '@/config'], { log: THREAD_MEMORY_JOINS_LOST + ' ' + token,
@@ -1671,7 +2601,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
   })
 })
 
-describe('test-44 root payloads through durable intake (synthetic only)', () => {
+describe('test-44, test-32 and test-45/48 root payloads through durable intake (synthetic only)', () => {
   let root: string, h: RoutingHarness | undefined
   beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'test44-intake-')); h = undefined; resetRoutingState() })
   afterEach(async () => {
@@ -1683,7 +2613,7 @@ describe('test-44 root payloads through durable intake (synthetic only)', () => 
       }
     } finally { resetRoutingState(); rmSync(root, { recursive: true, force: true }) }
   })
-  test.each(['strict', 'open'] as const)('%s roots store and join before the unmentioned reply; plain messages still drop', async mode => {
+  test.each(['strict', 'open'] as const)('test-44 %s roots store and join before the unmentioned reply; plain messages still drop', async mode => {
     const keys = sr8Personas(2), channel = 'C0LARGE00003'
     h = makeRoutingHarness(keys.map(name => ({ name, channels: [{ id: channel, delivery: 'thread_hybrid' }] })), root, {
       mode, threadMemory: {}, membership: observedMembership(Object.fromEntries(keys.map(key => [key, [channel]]))),
@@ -1736,6 +2666,355 @@ describe('test-44 root payloads through durable intake (synthetic only)', () => 
       expect(readThreads(root, key).filter(r => r.kind === 'join').map(r => [r.channel, r.root, r.source]))
         .toEqual([[channel, spec.rootMentions[0]!.ts, 'mention']])
     }
+  })
+  test.each(['strict', 'open'] as const)('test-32 %s thread root stores and joins before the first latency reply', async mode => {
+    const keys = sr8Personas(2), channel = 'C0LARGE00003', [alpha, beta] = keys as [string, string]
+    h = makeRoutingHarness(keys.map(name => ({ name, channels: [{ id: channel, delivery: 'thread_hybrid' }] })), root, {
+      mode, threadMemory: {}, membership: observedMembership(Object.fromEntries(keys.map(key => [key, [channel]]))),
+      restartDelayS: NEVER_FIRE_RESTART_DELAY_S,
+    })
+    await h.ready()
+    const bot = h.p(alpha).stub.identity.botUserId, rootTs = '1800000000.000001', replyTs = '1800000000.000002'
+    // Execute test-32's actual root block and sample-reply line from its
+    // workload builder (the whole builder's 20 samples cost seconds of jq).
+    const workload = declaration(real, 'real_thread_workload')
+    const built = shell([
+      'require_ci_image() { :; }',
+      ...['_scenario_channel_type', 'slack_message_event', 'slack_mention_event', 'slack_reply_event', 'scenario_text', 'scenario_mention_text']
+        .map(name => declaration(scenario, name)),
+      'scenario_ts() { printf \'1800000000.000001\\n\'; }', 'scenario_id() { printf \'U0HUMAN\\n\'; }',
+      `TEST_NAME=test-32-fmk-real-order REAL_THREAD_MODE=${mode} REAL_THREAD_EVIDENCE="$HOME" REAL_CHANNEL=${channel} REAL_BOT_USER_ID=${bot}`,
+      block(workload, '    REAL_THREAD_ROOT="$(scenario_ts)"', '    REAL_THREAD_SAMPLES=()'),
+      `n=1 ts=${replyTs} sender=U0HUMAN; text="$(scenario_text "thread-latency-\${n}")"`,
+      block(workload, '        slack_reply_event "${REAL_CHANNEL}"', '\n        if'),
+      'cat "$HOME/root.json" "$HOME/sample-1.json"',
+    ].join('\n'))
+    expect({ status: built.status, stderr: built.stderr }).toEqual({ status: 0, stderr: '' })
+    const events = built.stdout.trim().split('\n').map(line => JSON.parse(line))
+    // The scenario pushes both to alpha's connection only.
+    const atAck: unknown[] = []
+    for (const event of events) {
+      await h.receive(event, [alpha], () => {
+        const records = existsSync(queuePath(root, alpha)) ? readQueue(root, alpha) : []
+        atAck.push({ stored: records.filter(r => r.kind === 'accepted' && 'ts' in r).map(r => r.ts), joined: h!.threads!.memory.view(alpha, channel, rootTs) })
+      })
+    }
+    expect(atAck).toEqual([{ stored: [rootTs], joined: 'joined' }, { stored: [rootTs, replyTs], joined: 'joined' }])
+    expect(events.map(e => [e.type, e.channel_type, e.channel, e.ts, e.thread_ts, e.text])).toEqual([
+      [mode === 'open' ? 'message' : 'app_mention', mode === 'open' ? 'channel' : undefined, channel, rootTs, undefined, `<@${bot}> test-32-fmk-real-order thread-root`],
+      ['message', 'channel', channel, replyTs, rootTs, 'test-32-fmk-real-order thread-latency-1'],
+    ])
+    await h.settleJoinSaves()
+    expect(h.queued(alpha).map(({ accepted: a }) => ({ channel: a.channel, ts: a.ts, via: a.via })))
+      .toEqual([{ channel, ts: rootTs, via: 'mention' }, { channel, ts: replyTs, via: 'thread' }])
+    expect(h.queued(beta)).toEqual([])
+    expect(readThreads(root, alpha).filter(r => r.kind === 'join').map(r => [r.channel, r.root, r.source])).toEqual([[channel, rootTs, 'mention']])
+  })
+  test.each(['strict', 'open'] as const)('test-45/48 %s roots store and join before the unmentioned reply; plain messages still drop', async mode => {
+    const keys = sr8Personas(2), channel = 'C0LARGE00003'
+    h = makeRoutingHarness(keys.map(name => ({ name, channels: [{ id: channel, delivery: 'thread_hybrid' }] })), root, {
+      mode, threadMemory: {}, membership: observedMembership(Object.fromEntries(keys.map(key => [key, [channel]]))),
+      restartDelayS: NEVER_FIRE_RESTART_DELAY_S,
+    })
+    await h.ready()
+    const spec = burstSpec({ mode, population: 0, recipients: keys.length }, [channel], 1_800_000_000), rootTs = spec.rootMentions[0]!.ts
+    const plan = [['roots', spec.rootMentions[0]], ['replies', spec.replies[0]], ['dropped', spec.dropped[0]]] as const
+    const bots = Object.fromEntries(keys.map(key => [key, h!.p(key).stub.identity.botUserId]))
+    // Execute membership-load.sh's real build_batches; bun stands in for the
+    // CI-only sr8-evidence `bodies`, which only wraps each event per label.
+    const built = shell([
+      'require_ci_image() { :; }',
+      ...['_scenario_channel_type', 'slack_message_event', 'slack_mention_event', 'slack_reply_event', 'scenario_text', 'scenario_mention_text']
+        .map(name => declaration(scenario, name)),
+      `slack_stub_identity() { case "$1" in ${keys.map(key => `${key}) printf '%s\\n' ${bots[key]} ;;`).join(' ')} *) exit 9 ;; esac; }`,
+      'scenario_id() { local name="${2//[^A-Za-z0-9]/}"; printf \'%s0%s\\n\' "$1" "${name^^}"; }',
+      'bun() { [[ "$1" == "$E" && "$2" == bodies && "$#" == 4 ]] || exit 9; jq -c --arg key "$3" \'{"label":$key,event:.}\' "$4"; }',
+      declaration(source('lib/membership-load.sh'), 'build_batches'),
+      `MODE=${mode} TEST_NAME=test-48-fmk-membership-load-open CASE=test-48-${mode}-first-hang BATCH="$HOME" PLAN="$HOME/plan.tsv" E=e.ts`,
+      `KEYS=(${keys.join(' ')}) HOLD_KEYS=()`, 'build_batches',
+      'cat "$BATCH/roots.batch.jsonl" "$BATCH/replies.batch.jsonl" "$BATCH/dropped.batch.jsonl"',
+    ].join('\n'), { 'plan.tsv': plan.map(([phase, m]) => [phase, m!.channel, m!.ts, m!.threadTs ?? '-', m!.mentions.length].join('\t')).join('\n') + '\n' })
+    expect({ status: built.status, stderr: built.stderr }).toEqual({ status: 0, stderr: '' })
+    const bodies: { label: string; event: any }[] = built.stdout.trim().split('\n').map(line => JSON.parse(line))
+    expect(bodies.map(b => b.label)).toEqual(plan.flatMap(() => keys))
+    const sender = 'U0TEST48' + mode.toUpperCase() + 'FIRSTHANGORDINARY'
+    const text = (phase: string, ts: string) => `test-48-fmk-membership-load-open test-48-${mode}-first-hang-${phase}-${ts}`
+    const rootText = keys.map(key => `<@${bots[key]}> test-48-fmk-membership-load-open `).join('') + text('roots', rootTs)
+    expect(bodies.filter((_, n) => n % keys.length === 0).map(({ event: e }) => [e.type, e.channel_type, e.channel, e.ts, e.thread_ts, e.user, e.parent_user_id, e.text])).toEqual([
+      [mode === 'open' ? 'message' : 'app_mention', mode === 'open' ? 'channel' : undefined, channel, rootTs, undefined, sender, undefined, rootText],
+      ['message', 'channel', channel, spec.replies[0]!.ts, rootTs, sender, sender, text('replies', spec.replies[0]!.ts)],
+      ['message', 'channel', channel, spec.dropped[0]!.ts, undefined, sender, undefined, text('dropped', spec.dropped[0]!.ts)],
+    ])
+    const atAck: unknown[] = []
+    for (const { label: key, event } of bodies) {
+      await h.receive(event, [key], () => {
+        const records = existsSync(queuePath(root, key)) ? readQueue(root, key) : []
+        atAck.push({ key, stored: records.filter(r => r.kind === 'accepted' && 'ts' in r).map(r => r.ts), joined: h!.threads!.memory.view(key, channel, rootTs) })
+      })
+    }
+    expect(atAck).toEqual(plan.flatMap(([phase]) => keys.map(key => ({ key, joined: 'joined',
+      stored: phase === 'roots' ? [rootTs] : [rootTs, spec.replies[0]!.ts] }))))
+    await h.settleJoinSaves()
+    for (const key of keys) {
+      expect(h.queued(key).map(({ accepted: a }) => ({ channel: a.channel, ts: a.ts, via: a.via })))
+        .toEqual([{ channel, ts: rootTs, via: 'mention' }, { channel, ts: spec.replies[0]!.ts, via: 'thread' }])
+      expect(readThreads(root, key).filter(r => r.kind === 'join').map(r => [r.channel, r.root, r.source])).toEqual([[channel, rootTs, 'mention']])
+    }
+  })
+})
+
+describe('test-44 verdict failures print a FAIL line naming them (stub shell)', () => {
+  const t44 = source('test-44-fmk-thread-burst.sh')
+  const row = (measure: string, verdict: Result['verdict'], stats: Result['stats'] = {}): Result => ({ measure, samples: 1, stats, limit: 3000, verdict })
+  // Runs the script's sr8_verdicts and scenario.sh's fail over a stand-in
+  // verdict command that prints rows through the real printResults, then
+  // exits with printResults' status, a given status, or SIGKILLs itself.
+  const run = (rows: Result[] | null, exit: number | 'SIGKILL' | null = null) => shell([
+    declaration(scenario, 'fail'), declaration(t44, 'sr8_verdicts'),
+    'TEST_NAME=test-44-fmk-thread-burst EVIDENCE="$HOME" SR8="$HOME/e.ts" mode=open population=0 recipients=2',
+    'sr8_verdicts check test-44-fmk-thread-burst open 0 2', 'echo after',
+  ].join('\n'), {
+    'rows.json': JSON.stringify({ rows, exit }),
+    'e.ts': `import { printResults } from ${JSON.stringify(join(integration, 'fixtures/sr8-evidence.ts'))}
+const { rows, exit } = await Bun.file(import.meta.dir + '/rows.json').json()
+const status = rows === null ? 1 : printResults({ scenario: 'test-44-fmk-thread-burst', mode: 'open', population: 0, recipients: 2 }, rows)
+if (exit === 'SIGKILL') process.kill(process.pid, 'SIGKILL')
+process.exit(exit ?? status)\n`,
+  })
+  const printed = (rows: Result[]) => {
+    const lines: string[] = []
+    printResults({ scenario: 'test-44-fmk-thread-burst', mode: 'open', population: 0, recipients: 2 }, rows, line => lines.push(line))
+    return lines.map(line => `${line}\n`).join('')
+  }
+  // answers22's open/0/2 check: both ACK verdicts over the limit, the rest passing.
+  const answers22 = [row('ack-accepted', 'fail', { max_ms: 3338.7 }), row('store', 'pass'), row('joins', 'pass', { persona: 'alpha' }),
+    row('post-hold-overlap-ack', 'fail', { max_ms: 3338.7 })]
+  test.each<[string, Result[] | null, string]>([
+    ['failing ACK verdicts', answers22, 'ack-accepted=fail post-hold-overlap-ack=fail'],
+    ['a persona\'s missing joins', [row('store', 'pass'), row('joins', 'pass', { persona: 'alpha' }), row('joins', 'missing', { persona: 'beta' })], 'joins[beta]=missing'],
+    ['a failing exit with no verdict rows', null, 'sr8 check exited 1 with no verdict'],
+  ])('%s', (_name, rows, named) => {
+    const r = run(rows)
+    expect({ status: r.status, stdout: r.stdout, stderr: r.stderr })
+      .toEqual({ status: 1, stdout: rows ? printed(rows) : '', stderr: `FAIL: test-44-fmk-thread-burst: ${named} (open/0/2)\n` })
+  })
+  // The FAIL line still names the failure, and the scenario exits with the
+  // command's own status rather than fail's 1. For the kill, bash's own
+  // "Killed" report precedes the FAIL line.
+  test.each<[string, Result[] | null, number | 'SIGKILL', number, string]>([
+    ['a usage error (64) with no verdict rows', null, 64, 64, 'sr8 check exited 64 with no verdict'],
+    ['a killed command (137) after failing verdict rows', answers22, 'SIGKILL', 137, 'ack-accepted=fail post-hold-overlap-ack=fail'],
+  ])('%s keeps its exit status', (_name, rows, exit, status, named) => {
+    const r = run(rows, exit), failLine = `FAIL: test-44-fmk-thread-burst: ${named} (open/0/2)\n`
+    const killed = exit === 'SIGKILL' ? /^[^\n]* Killed +bun "\$\{SR8\}" "\$@" > "\$\{rows\}"\n/.exec(r.stderr)?.[0] ?? '' : ''
+    if (exit === 'SIGKILL') expect(killed).not.toBe('')
+    expect({ status: r.status, stdout: r.stdout, stderr: r.stderr })
+      .toEqual({ status, stdout: rows ? printed(rows) : '', stderr: killed + failLine })
+  })
+  test('passing verdicts print the same rows and continue', () => {
+    const rows = [row('store', 'pass'), row('joins', 'pass', { persona: 'alpha' })], r = run(rows)
+    expect({ status: r.status, stdout: r.stdout, stderr: r.stderr }).toEqual({ status: 0, stdout: `${printed(rows)}after\n`, stderr: '' })
+  })
+  test('every verdict command goes through sr8_verdicts; setup and observation commands do not', () => {
+    expect([...new Set([...t44.matchAll(/bun "\$\{SR8\}" ([a-z-]+)/g)].map(m => m[1]))].sort())
+      .toEqual(['bodies', 'burst', 'combinations', 'conditions', 'config', 'envelope-times', 'observe', 'plan', 'seed'])
+    expect([...t44.matchAll(/^\s*sr8_verdicts (seal [a-z]+|[a-z-]+) /gm)].map(m => m[1]))
+      .toEqual(['seal first', 'seal measured', 'driver-cpu', 'seal measured', 'check', 'driver-cpu', 'pending-post', 'shared-list'])
+  })
+})
+
+describe('the burst driver runs off the server\'s CPU quota (stub shell)', () => {
+  const entrypoint = readFileSync(join(import.meta.dir, '..', 'docker', 'entrypoint.sh'), 'utf8')
+  /** Every driver command in a script, and those burst-driver.sh runs, recording into `record`. */
+  const drivers = (text: string, bun: string, record: string) => ({
+    all: [...text.matchAll(new RegExp(`bun "\\$\\{${bun}\\}" (burst|fault-burst|fault-recover) `, 'g'))].map(m => m[1]),
+    wrapped: [...text.matchAll(new RegExp(`bash "\\$\\{BURST_DRIVER\\}" "\\$\\{${record}\\}/driver-cgroup"(?: \\\\\\n\\s*| )bun "\\$\\{${bun}\\}" (burst|fault-burst|fault-recover) `, 'g'))].map(m => m[1]),
+  })
+  test('tests 44, 45 and 48 run every burst driver through burst-driver.sh and judge it with driver-cpu while the measured server runs', () => {
+    const t44 = source('test-44-fmk-thread-burst.sh'), load = source('lib/membership-load.sh')
+    expect(drivers(t44, 'SR8', 'RESULTS')).toEqual({ all: ['burst', 'burst'], wrapped: ['burst', 'burst'] })
+    expect(drivers(load, 'E', 'OUT')).toEqual({ all: ['burst', 'fault-burst', 'fault-recover'], wrapped: ['burst', 'fault-burst', 'fault-recover'] })
+    expect(t44.match(/^\s*sr8_verdicts driver-cpu "\$\{CONTEXT\[@\]\}" "\$\{SERVER_PID\}" "\$\{RESULTS\}\/driver-cgroup"\n\s*clean_stop$/gm)).toHaveLength(2)
+    expect(load).toContain('        verdict driver-cpu "${C[@]}" "${SERVER_PID}" "${OUT}/driver-cgroup"\n'
+      + '        REOPEN_OBSERVE_LOG="$(byte_mark "${SLACK_STATE_DIR}/server.log")"\n        reopen_ad_rows before-stop > "${ROOT}/reopen-observe.rows"\n'
+      + '        REOPEN_OBSERVE=1\n        stop_server --stop-bots\n')
+  })
+  // burst-driver.sh with its image guard removed and its spool and cgroup
+  // membership read from the case's own files, never the host's /proc or /run.
+  const fixture = source('fixtures/burst-driver.sh')
+  const guard = "[[ -f /etc/cscb-ci-image ]] || { echo 'burst-driver requires the CI image' >&2; exit 70; }\n"
+  const spool = 'SPOOL=/run/cscb-burst-driver\n', membership = 'MEMBERSHIP=/proc/self/cgroup\n'
+  const bun = 'BUN=/usr/local/bin/bun\n', trustedUid = 'TRUSTED_UID=0\n', trustedGid = 'TRUSTED_GID=0\n'
+  /** The fixture with its launcher's Bun planted as `bunPath` and this test's user and group trusted in place of root. */
+  const planted = (bunPath = '$HOME/bin/bun') => {
+    for (const line of [guard, spool, membership, bun, trustedUid, trustedGid]) expect(fixture.split(line)).toHaveLength(2)
+    return fixture.replace(guard, '').replace(spool, 'SPOOL="$HOME/spool"\n').replace(membership, 'MEMBERSHIP="$HOME/membership"\n')
+      .replace(bun, `BUN="${bunPath}"\n`).replace(trustedUid, 'TRUSTED_UID="$(id -u)"\n').replace(trustedGid, 'TRUSTED_GID="$(id -g)"\n')
+  }
+  // The planted Bun (a script that runs this suite's Bun by its absolute path), closed to
+  // others like the image's root-owned one, and a stub driver closed to others too.
+  const setup = [
+    'mkdir -m 0755 "$HOME/bin"', `printf '#!/bin/bash\\nexec %s "$@"\\n' '${process.execPath}' > "$HOME/bin/bun"`,
+    'chmod 0755 "$HOME/bin/bun"', 'chmod 0644 "$HOME/sr8-evidence.ts"', 'chmod 0700 "$HOME"',
+    'mkdir -m 0700 "$HOME/spool" "$HOME/work"', 'mkfifo -m 0600 "$HOME/spool/requests"', 'printf "0::/shard/driver\\n" > "$HOME/membership"',
+  ]
+  // A stand-in for sr8-evidence.ts: prints what it ran with, and for fault-burst waits to be stopped.
+  const stubDriver = `import { readFileSync, writeFileSync } from 'node:fs'
+const [command, ...rest] = process.argv.slice(2), grand = readFileSync('/proc/' + process.ppid + '/stat', 'utf8').split(') ')[1].split(' ')[1], e = process.env
+console.log('driver ' + command + ' ' + rest.join(' ') + ' cwd=' + process.cwd() + ' root=' + e.SCENARIO_ROOT + ' cpu=' + e.SR8_PHASE_CPU_FILE + ' pids=' + e.SR8_PHASE_CPU_PIDS
+  + ' profile=' + e.SR8_PROFILE_DIR + ' path=' + e.PATH + ' home=' + e.HOME + ' options=' + e.BUN_OPTIONS + ' extra=' + e.EXTRA + ' pid=' + process.pid + ' grandparent=' + grand)
+console.error('driver stderr')
+writeFileSync(e.SCENARIO_ROOT + '/driver.pid', String(process.pid))
+if (command === 'fault-burst') setTimeout(() => {}, 20000)
+else process.exitCode = command === 'burst' ? 3 : 0
+`
+  /** A request written straight to the launcher, skipping the caller's checks: its spec entries, then its status. */
+  const craft = 'craft() { local request; request="$(mktemp -d "$HOME/spool/request.XXXXXX")"; mkfifo "$request/spec" "$request/status"; '
+    + 'echo "${request##*/}" > "$HOME/spool/requests"; printf "%s\\0" "$@" > "$request/spec"; cat "$request/status"; rm -rf "$request"; }'
+  test('burst-driver.sh without a launcher records the membership it runs in and execs the driver as the same PID', () => {
+    const r = shell([
+      'printf "0::/shard/server\\n" > "$HOME/membership"',
+      'SCENARIO_ROOT="$HOME" bash "$HOME/driver.sh" "$HOME/record" bun "$HOME/sr8-evidence.ts" burst one & pid=$!',
+      'status=0; wait "$pid" || status=$?; echo "status $status, caller pid $pid"',
+      'status=0; bash "$HOME/driver.sh" "$HOME/record" bash -c "echo not a driver" || status=$?; echo "other command $status"',
+      'status=0; bash "$HOME/driver.sh" record bun "$HOME/sr8-evidence.ts" burst || status=$?; echo "relative record $status"',
+      'cat "$HOME/record"',
+    ].join('\n'), { 'driver.sh': planted(), 'sr8-evidence.ts': stubDriver })
+    const pid = r.stdout.match(/caller pid (\d+)/)?.[1]
+    expect(r.status).toBe(0)
+    expect(r.stdout).toContain(` pid=${pid} grandparent=`)
+    expect(r.stdout.replace(/^driver .*\n/m, '')).toBe(`status 3, caller pid ${pid}\nother command 64\nrelative record 64\n/shard/server\n`)
+    const usage = 'usage: burst-driver.sh <record> bun <fixtures>/sr8-evidence.ts burst|fault-burst|fault-recover <arguments>... | --serve <spool>\n'
+    expect(r.stderr).toBe(`driver stderr\n${usage}${usage}`)
+  })
+  test('the launcher runs all three driver commands under itself, with its own Bun, directory, PATH and HOME and only the driver fields, relaying output and status', () => {
+    const r = shell([
+      ...setup, 'bash "$HOME/driver.sh" --serve "$HOME/spool" & launcher=$!', 'cd "$HOME/work"', 'echo "launcher $launcher"',
+      'export SCENARIO_ROOT="$HOME" SR8_PHASE_CPU_FILE="$HOME/cpu.jsonl" SR8_PHASE_CPU_PIDS=server=7,stub=8 SR8_PROFILE_DIR="$HOME/profile" EXTRA=dropped',
+      'for command in burst fault-recover; do',
+      '  status=0; bash "$HOME/driver.sh" "$HOME/record" bun "$HOME/sr8-evidence.ts" "$command" "a b" \'$HOME\' & caller=$!; wait "$caller" || status=$?',
+      '  echo "$command status $status caller $caller"',
+      'done',
+      // SIGTERM to the caller reaches the fault-burst driver it started.
+      'rm "$HOME/driver.pid"; bash "$HOME/driver.sh" "$HOME/record" bun "$HOME/sr8-evidence.ts" fault-burst & caller=$!',
+      'for _ in $(seq 100); do [[ -s "$HOME/driver.pid" ]] && break; sleep 0.05; done; kill -TERM "$caller"',
+      'status=0; wait "$caller" || status=$?; driver="$(cat "$HOME/driver.pid")"; for _ in $(seq 100); do kill -0 "$driver" 2> /dev/null || break; sleep 0.05; done',
+      'kill -0 "$driver" 2> /dev/null && echo "driver alive" || echo "fault-burst stopped $status"',
+      'kill "$launcher"', 'cat "$HOME/record"', 'ls "$HOME/spool"',
+    ].join('\n'), { 'driver.sh': planted(), 'sr8-evidence.ts': stubDriver })
+    expect(r.status).toBe(0)
+    const home = r.stdout.match(/ root=(\S+) /)![1]!, launcher = r.stdout.match(/^launcher (\d+)$/m)![1]
+    const literal = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const fields = literal(`cwd=/ root=${home} cpu=${home}/cpu.jsonl pids=server=7,stub=8 profile=${home}/profile path=/usr/local/bin:/usr/bin:/bin home=/ options=undefined extra=undefined`)
+    // Arguments arrive as given, unevaluated; each driver's grandparent is the launcher, not its caller.
+    for (const [command, status] of [['burst', 3], ['fault-recover', 0]] as const) {
+      const caller = r.stdout.match(new RegExp(`^${command} status ${status} caller (\\d+)$`, 'm'))![1]
+      const line = r.stdout.match(new RegExp(`^driver ${command} a b \\$HOME ${fields} pid=(\\d+) grandparent=(\\d+)$`, 'm'))!
+      expect([line[1] === caller, line[2]]).toEqual([false, launcher])
+    }
+    expect(r.stdout).toMatch(new RegExp(`^driver fault-burst  ${fields} pid=\\d+ grandparent=${launcher}$`, 'm'))
+    expect(r.stdout).toContain('fault-burst stopped 143\n/shard/driver\n/shard/driver\n/shard/driver\nrequests\n')
+    expect(r.stderr).toBe('driver stderr\ndriver stderr\ndriver stderr\n')
+  })
+  test('the launcher ignores a caller\'s PATH, Bun options, preload, bunfig and .env files, and refuses crafted environment entries, arguments and records', () => {
+    const r = shell([
+      ...setup, 'mkdir -m 0755 "$HOME/evil"',
+      // A fake bun first on the caller's PATH, and a preload every Bun override names.
+      'printf "#!/bin/bash\\ntouch %s/fake-bun\\n" "$HOME" > "$HOME/evil/bun"', 'chmod 0755 "$HOME/evil/bun"',
+      `printf '%s\\n' "import { writeFileSync } from 'node:fs'; writeFileSync('$HOME/preloaded', '')" > "$HOME/evil/preload.ts"`,
+      'printf "preload = [\\"%s/evil/preload.ts\\"]\\n" "$HOME" | tee "$HOME/work/bunfig.toml" > "$HOME/.bunfig.toml"',
+      'printf "EXTRA=from-dotenv\\n" > "$HOME/work/.env"',
+      // The preload is live: Bun itself honors BUN_OPTIONS.
+      'BUN_OPTIONS="--preload=$HOME/evil/preload.ts" SCENARIO_ROOT="$HOME" "$HOME/bin/bun" "$HOME/sr8-evidence.ts" fault-recover > /dev/null 2>&1',
+      '[[ -e "$HOME/preloaded" ]] && echo "preload live"; rm -f "$HOME/preloaded" "$HOME/driver.pid"',
+      'bash "$HOME/driver.sh" --serve "$HOME/spool" & launcher=$!', 'cd "$HOME/work"',
+      'status=0; PATH="$HOME/evil:$PATH" BUN_OPTIONS="--preload=$HOME/evil/preload.ts" NODE_OPTIONS="--require=$HOME/evil/preload.ts" SCENARIO_ROOT="$HOME" \\',
+      '  bash "$HOME/driver.sh" "$HOME/record" bun "$HOME/sr8-evidence.ts" fault-recover || status=$?',
+      'echo "overridden caller $status"; for f in fake-bun preloaded; do [[ -e "$HOME/$f" ]] && echo "$f ran"; done',
+      craft, 'rm -f "$HOME/driver.pid"',
+      'for entry in -u --unset=SCENARIO_ROOT -i -- PATH=/tmp BUN_OPTIONS=--preload=x HOME=/tmp NODE_OPTIONS=x SR8_PROFILE_DIR SCENARIO_ROOTX=1 " SR8_PROFILE_DIR=x"; do',
+      '  echo "entry [$entry]: $(craft "$HOME/record" 3 bun "$HOME/sr8-evidence.ts" burst "$entry")"',
+      'done',
+      'echo "argv: $(craft "$HOME/record" 3 bash -c "touch $HOME/ran")"',
+      'echo "other entry file: $(craft "$HOME/record" 3 bun "$HOME/work/../sr8-evidence.ts" burst)"',
+      'echo "relative record: $(craft record 3 bun "$HOME/sr8-evidence.ts" burst)"',
+      'echo "short argv: $(craft "$HOME/record" 5 bun "$HOME/sr8-evidence.ts" burst)"',
+      '[[ -e "$HOME/driver.pid" || -e "$HOME/ran" ]] && echo "a crafted request ran" || echo "no crafted request ran"',
+      'kill "$launcher"', 'cat "$HOME/record"',
+    ].join('\n'), { 'driver.sh': planted(), 'sr8-evidence.ts': stubDriver })
+    expect(r.status).toBe(0)
+    expect(r.stdout).toMatch(/^driver fault-recover  cwd=\/ root=\S+ cpu=undefined pids=undefined profile=undefined path=\/usr\/local\/bin:\/usr\/bin:\/bin home=\/ options=undefined extra=undefined pid=\d+ grandparent=\d+$/m)
+    const entries = ['-u', '--unset=SCENARIO_ROOT', '-i', '--', 'PATH=/tmp', 'BUN_OPTIONS=--preload=x', 'HOME=/tmp', 'NODE_OPTIONS=x', 'SR8_PROFILE_DIR', 'SCENARIO_ROOTX=1', ' SR8_PROFILE_DIR=x']
+    expect(r.stdout.replace(/^driver .*\n/m, '')).toBe(['preload live', 'overridden caller 0', ...entries.map(entry => `entry [${entry}]: exit 64`),
+      'argv: exit 64', 'other entry file: exit 64', 'relative record: exit 64', 'short argv: exit 64', 'no crafted request ran', '/shard/driver', ''].join('\n'))
+    expect(r.stderr).toBe('driver stderr\n')
+  })
+  test.each([['other-writable', 'chmod 0757 "$HOME/bin/bun"'], ['a link', 'ln -s "$HOME/bin/bun" "$HOME/bin/link"'],
+    ['a group-writable entry file of another group', 'chmod 0664 "$HOME/sr8-evidence.ts"']])('the launcher does not serve when what it runs is %s', (_name, change) => {
+    const planting = change.includes('link') ? '$HOME/bin/link' : '$HOME/bin/bun'
+    const r = shell([...setup, change, 'status=0; bash "$HOME/driver.sh" --serve "$HOME/spool" || status=$?; echo "launcher $status"'].join('\n'),
+      { 'driver.sh': change.includes('0664') ? planted().replace('TRUSTED_GID="$(id -g)"\n', 'TRUSTED_GID=0\n') : planted(planting), 'sr8-evidence.ts': stubDriver })
+    expect({ status: r.status, stdout: r.stdout }).toEqual({ status: 0, stdout: 'launcher 70\n' })
+    expect(r.stderr).toMatch(/^burst-driver: \S+ is not root-owned and closed to others; the launcher does not serve\n$/)
+  })
+  test('a burst-driver shard\'s entrypoint keeps the server at all but one CPU, starts the driver\'s launcher in the driver\'s group, and gives testuser no cgroup file', () => {
+    expect(entrypoint).toContain('if [[ -w /sys/fs/cgroup/cgroup.subtree_control ]] && (( $$ != 1 )); then\n'
+      + '    split_driver_cpu /sys/fs/cgroup /proc/self/cgroup /run/cscb-burst-driver\nfi\n\nexec gosu testuser bash /tests/runner.sh "$@"\n')
+    expect(fixture).toContain(spool)
+    expect(entrypoint.split('\n').filter(line => /\bchown\b/.test(line) && /cgroup|\$\{root\}/.test(line))).toEqual([])
+    const split = (cpuMax: string, member = '0::/', listed = true) => shell([
+      'chown() { printf "chown %s\\n" "$*" >> "$HOME/log"; }', 'gosu() { printf "gosu %s\\n" "$*" >> "$HOME/log"; }', declaration(entrypoint, 'split_driver_cpu'),
+      'mkdir "$HOME/cg"', `printf '%s\\n' '${cpuMax}' > "$HOME/cg/cpu.max"`, `printf '%s\\n' '${member}' > "$HOME/membership"`,
+      listed ? 'printf "1\\n%s\\n" "$$" > "$HOME/cg/cgroup.procs"' : 'printf "1\\n" > "$HOME/cg/cgroup.procs"',
+      'split_driver_cpu "$HOME/cg" "$HOME/membership" "$HOME/spool"', 'wait', 'cd "$HOME/cg"',
+      'for f in cgroup.subtree_control shard/cgroup.type shard/cgroup.subtree_control shard/server/cgroup.type shard/driver/cgroup.type shard/server/cpu.max shard/driver/cpu.max; do echo "$f=$(cat "$f")"; done',
+      '[[ "$(cat shard/driver/cgroup.procs)" == "$$" && "$(cat shard/server/cgroup.procs)" == "$$" ]] && echo "forked from the driver group, then moved to the server group"',
+      // Permission bits only: the scratch root's setgid bit may carry into the spool.
+      '[[ -p "$HOME/spool/requests" ]] && printf "spool %o requests %o\\n" "$(( 0$(stat -c %a "$HOME/spool") & 0777 ))" "$(( 0$(stat -c %a "$HOME/spool/requests") & 0777 ))"',
+      'while read -r line; do echo "${line//"$HOME"/<home>}"; done < "$HOME/log"',
+    ].join('\n'))
+    const r = split('300000 100000')
+    expect({ status: r.status, stdout: r.stdout, stderr: r.stderr }).toEqual({ status: 0, stderr: '', stdout: [
+      'cgroup.subtree_control=+cpu', 'shard/cgroup.type=threaded', 'shard/cgroup.subtree_control=+cpu', 'shard/server/cgroup.type=threaded',
+      'shard/driver/cgroup.type=threaded', 'shard/server/cpu.max=200000 100000', 'shard/driver/cpu.max=90000 100000',
+      'forked from the driver group, then moved to the server group', 'spool 700 requests 600',
+      'chown testuser:testuser <home>/spool <home>/spool/requests', 'gosu testuser bash /tests/integration/fixtures/burst-driver.sh --serve <home>/spool', ''].join('\n') })
+    for (const [cpuMax, member, listed, message] of [
+      ['300000 100000', '0::/docker/0123abcd', true, 'the cgroup mount is not this container\'s own; a burst-driver shard needs --cgroupns private'],
+      ['300000 100000', '0::/', false, 'the cgroup mount is not this container\'s own; a burst-driver shard needs --cgroupns private'],
+      ['max 100000', '0::/', true, 'the container\'s cpu.max leaves no CPU for the burst driver'],
+      ['100000 100000', '0::/', true, 'the container\'s cpu.max leaves no CPU for the burst driver'],
+      ['', '0::/', true, 'the container\'s cpu.max leaves no CPU for the burst driver'],
+    ] as const) {
+      const refused = split(cpuMax, member, listed)
+      expect({ status: refused.status, stdout: refused.stdout, stderr: refused.stderr }).toEqual({ status: 1, stdout: '', stderr: `entrypoint.sh: ${message}\n` })
+    }
+  })
+})
+
+describe('test-44 pending probe lookup over burst.jsonl (stub shell)', () => {
+  // The script's own probe loop and scenario.sh's fail, over a ledger whose
+  // probes lead the second wave, so later replies follow every probe row.
+  const loop = block(source('test-44-fmk-thread-burst.sh'), '        : > "${EVIDENCE}/probes.tsv"\n', '        for persona in "${KEYS[@]}"; do snapshot')
+  const plan = [['other', 'C1', '1.000002'], ['bot', 'C1', '1.000003']]
+  const item = (phase: string, ts: string, envelope_id: string) => ({ key: 'alpha', phase, channel: 'C1', ts, sender: 'U1', envelope_id })
+  const run = (ledger: unknown[]) => shell([
+    declaration(scenario, 'fail'), 'TEST_NAME=test-44-fmk-thread-burst EVIDENCE="$HOME" RESULTS="$HOME"', loop, 'cat "${EVIDENCE}/probes.tsv"',
+  ].join('\n'), { 'probe-plan.tsv': plan.map(row => `${row.join('\t')}\n`).join(''), 'burst.jsonl': jsonl(ledger) })
+  test('each probe resolves to its one envelope when other rows follow it', () => {
+    const r = run([item('roots', '1.000001', 'e-root'), item('probes', '1.000002', 'e-other'), item('probes', '1.000003', 'e-bot'),
+      item('replies', '1.000004', 'e-reply')])
+    expect({ status: r.status, stdout: r.stdout, stderr: r.stderr })
+      .toEqual({ status: 0, stdout: 'other\tC1\t1.000002\te-other\nbot\tC1\t1.000003\te-bot\n', stderr: '' })
+  })
+  test.each<[string, unknown[], string]>([
+    ['no probe row', [item('probes', '1.000002', 'e-other'), item('replies', '1.000003', 'e-reply')], 'bot probe 1.000003'],
+    ['a duplicate probe row', [item('probes', '1.000002', 'e-other'), item('probes', '1.000002', 'e-again'), item('probes', '1.000003', 'e-bot')], 'other probe 1.000002'],
+    ['a probe row without an envelope', [item('probes', '1.000002', ''), item('probes', '1.000003', 'e-bot')], 'other probe 1.000002'],
+  ])('%s is a FAIL line, not a bare exit', (_name, ledger, named) => {
+    const r = run(ledger)
+    expect({ status: r.status, stdout: r.stdout, failLine: r.stderr.split('\n').at(-2) })
+      .toEqual({ status: 1, stdout: '', failLine: `FAIL: test-44-fmk-thread-burst: pending ${named} has no unique burst envelope` })
   })
 })
 
@@ -2133,6 +3412,28 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
     expect(rows.filter(r => r.measure === 'store')).toHaveLength(3)
     assertNoLeak(rows)
   })
+  // answers28: only personas with stored burst items in Q's window must rewrite there.
+  test.each([['a P with independent items must rewrite in it', false], ['a P with every item withheld (all) is proved by a skip', true]] as const)
+  ('the compaction window is Q\'s original store span, never P\'s items or recovery replays; %s', (_name, all) => {
+    const e = composed(all), [p, q] = e.plan.keys as [string, string]
+    expect(e.plan.all).toBe(all); expect(faultRewriters(e.plan)).toEqual(all ? [q] : [p, q])
+    // Q's held probe's store starts the span at 99 and its others end it at 1000; P's stores, replays' included, come later.
+    for (const r of e.rows!) if (r.key === p) r.at_mono_ms = 200_000
+    expect(faultWindow(e)).toEqual({ start: 99, end: 1000 })
+    const verdict = (entries: Measurement[]) => compactionVerdict(e.plan.keys.map(key => ({ key, kind: 'queue', before: '1:1', after: '1:2', inside: true })),
+      [...e.rows!, ...entries], faultWindow(e), e.plan.keys, true, faultRewriters(e.plan)).verdict
+    const qEntries = [compactionRow(q, 99, 150, 'skipped'), compactionRow(q, 900, 1000, 'rewritten')]
+    expect(verdict([compactionRow(p, 200, 300, 'rewritten'), ...qEntries])).toBe('pass')
+    // P's rewrite after Q's last store, among P's own later stores, is outside Q's burst: P only skipped inside it.
+    expect(verdict([compactionRow(p, 1500, 199_000, 'rewritten'), compactionRow(p, 200, 300, 'skipped'), ...qEntries])).toBe(all ? 'pass' : 'fail')
+    // P still needs an in-span entry, and Q always a rewrite.
+    expect(verdict([compactionRow(p, 1500, 199_000, 'rewritten'), ...qEntries])).toBe('missing')
+    expect(verdict([compactionRow(p, 200, 300, 'rewritten'), compactionRow(q, 99, 150, 'skipped')])).toBe('fail')
+    // Without one of Q's acceptances or its store there is no window.
+    const reply = e.plan.items.find(i => i.key === q && i.phase === 'replies')!
+    expect(faultWindow({ ...e, rows: e.rows!.filter(r => !(r.key === q && r.seq === reply.ordinal + 1)) })).toBeUndefined()
+    expect(faultWindow({ ...e, queues: { ...e.queues, [q]: e.queues[q]!.filter(a => a.ts !== reply.ts) } })).toBeUndefined()
+  })
   test.each(['never-replayed', 'stored-twice', 'late-replay', 'late-q', 'nondependent-p-withheld', 'stored-while-withheld', 'no-overlap',
     'q-root-missing', 'unlisted-envelope', 'q-store-slow', 'q-drop-slow', 'dependency-changed', 'held-unresolved', 'original-ack-after-clear'] as const)
   ('fault-aware composition rejects %s', defect => {
@@ -2346,7 +3647,7 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
       }
     } finally { await q.stop(); rmSync(root, { recursive: true, force: true }) }
   })
-  async function withCLI(body: (root: string, cli: (command: string, args: string[]) => ReturnType<typeof spawnSync>) => void | Promise<void>, prefix = '') {
+  async function withCLI(body: (root: string, cli: (command: string, args: string[], population?: number) => ReturnType<typeof spawnSync>) => void | Promise<void>, prefix = '') {
     const root = mkdtempSync(join(tmpdir(), 'sr8-cli-'))
     try {
       const dir = join(root, 'tests/integration/fixtures'), marker = join(root, 'image')
@@ -2355,9 +3656,9 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
       writeFileSync(join(dir, 'transcript-receipts.ts'), source('fixtures/transcript-receipts.ts'))
       writeFileSync(join(root, 'tests/test-helpers/thread-populations.ts'), readFileSync(join(import.meta.dir, 'test-helpers/thread-populations.ts')))
       writeFileSync(join(dir, 'fmk-texts.ts'), `import {readFileSync} from 'node:fs'; if(process.argv[2]==='sharedQueueSnapshot') console.log(readFileSync(process.argv[3],'utf8')); else console.log(${JSON.stringify({ THREAD_REPLY_HOLD_MS, DELIVERY_MAX_AD_CALLS_PER_S, NAME_LOOKUP_TIMEOUT_MS })}[process.argv[2]]);`)
-      const cli = (command: string, args: string[]) => {
+      const cli = (command: string, args: string[], population = 0) => {
         const child = spawnSync(process.execPath, [join(dir, 'sr8-evidence.ts'), command,
-          ...(['envelope-times', 'combinations'].includes(command) ? [] : ['test-fault', 'strict', '0', '2']), ...args],
+          ...(['envelope-times', 'combinations'].includes(command) ? [] : ['test-fault', 'strict', String(population), '2']), ...args],
           // observe prints one line per burst event: a full workload exceeds the default 1 MiB.
           { env: hostSafeChildEnv(root, { extras: { SCENARIO_ROOT: root } }), encoding: 'utf8', timeout: 3000, maxBuffer: 16 * 1024 * 1024 })
         expect(child.error).toBeUndefined(); expect(child.signal).toBeNull(); assertNoLeak({ stdout: child.stdout, stderr: child.stderr })
@@ -2380,8 +3681,10 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
       const accepted = snapshot.trim().split('\n').map(l => JSON.parse(l)).filter(r => r.kind === 'accepted' && !r.compact)
       expect(accepted).toHaveLength(samples.length)
       expect(accepted.every(r => r.source === 'slack' && typeof r.user === 'string' && !Object.hasOwn(r, 'sender'))).toBe(true)
+      // test-32's file also holds the server's thread-compaction lines; n4 reads past them.
       writeFileSync(join(root, 'measurements'), lines([
         { v: 1, kind: 'store', store: 'accepted', key, seq: accepted[0].seq, at_mono_ms: 100, store_ms: 1 },
+        compactionRow(key, 100, 150, 'skipped'),
         { v: 1, kind: 'store', store: 'fixed', key, seq: accepted[0].seq, at_mono_ms: 101 + NAME_LOOKUP_TIMEOUT_MS, store_ms: 1 },
       ]))
       writeFileSync(join(root, 'stub'), lines(samples.flatMap((s, i) => [
@@ -2581,9 +3884,10 @@ globalThis.fetch = async (_url, init) => {
       recovered_id: replay.find(l => l.ordinal === i.ordinal)?.envelope_id ?? '-' }))
     expect(accountingVerdicts(accounts, records, during, final, queues, seq).every(r => r.verdict === 'pass')).toBe(true)
   }, recoveryTransport))
-  test('fault CLI check reads every original, replay, snapshot and unchanged ordinary predicate', () => withCLI((root, cli) => {
-    const e = composed(), dir = join(root, 'e'); mkdirSync(join(dir, 'during'), { recursive: true })
-    writeFileSync(join(dir, 'fault-plan.json'), JSON.stringify({ context: { scenario: 'test-fault', mode: 'strict', population: 0, recipients: 2 }, plan: e.plan }))
+  // fault-check's evidence directory for composed(); `before` gives each key's pre-burst joins, `after` its post-restart extras.
+  function faultCheckEvidence(root: string, before: (key: string) => object[] = () => [], after: (key: string) => object[] = () => [], population = 0, denied = false) {
+    const e = composed(denied), dir = join(root, 'e'); mkdirSync(join(dir, 'during'), { recursive: true })
+    writeFileSync(join(dir, 'fault-plan.json'), JSON.stringify({ context: { scenario: 'test-fault', mode: 'strict', population, recipients: 2 }, plan: e.plan }))
     writeFileSync(join(dir, 'fault-ledger.jsonl'), lines(e.ledger!))
     writeFileSync(join(dir, 'during-times.jsonl'), lines(e.during!)); writeFileSync(join(dir, 'times.jsonl'), lines(e.times!))
     writeFileSync(join(dir, 'compactions.jsonl'), '')
@@ -2591,10 +3895,13 @@ globalThis.fetch = async (_url, init) => {
     for (const key of e.plan.keys) {
       writeFileSync(join(dir, `${key}.queue.jsonl`), lines(e.queues[key]!))
       writeFileSync(join(dir, 'during', `${key}.queue.jsonl`), lines(e.duringQueues[key]!))
-      writeFileSync(join(dir, `${key}.before.jsonl`), '')
-      writeFileSync(join(dir, `${key}.after.jsonl`), lines(e.plan.items.filter(i => i.key === key && i.phase === 'roots').map(i => ({ channel: i.channel, root: i.ts }))))
+      writeFileSync(join(dir, `${key}.before.jsonl`), before(key).length ? lines(before(key)) : '')
+      writeFileSync(join(dir, `${key}.after.jsonl`), lines([...e.plan.items.filter(i => i.key === key && i.phase === 'roots').map(i => ({ channel: i.channel, root: i.ts })), ...after(key)]))
     }
-    const args = [dir, join(root, 'stub'), String(e.clearMark), String(e.clearAt), join(root, 'measurements'), '0', '0', '1']
+    return { e, dir, args: [dir, join(root, 'stub'), String(e.clearMark), String(e.clearAt), join(root, 'measurements'), '0', '0', '1'] }
+  }
+  test('fault CLI check reads every original, replay, snapshot and unchanged ordinary predicate', () => withCLI((root, cli) => {
+    const { e, dir, args } = faultCheckEvidence(root)
     const pass = cli('fault-check', args)
     expect(pass.status).toBe(0); expect(String(pass.stdout)).toContain('fault-overlap'); expect(String(pass.stdout)).toContain('post-hold-overlap')
     const q = e.plan.items.find(i => i.key !== e.plan.key)!
@@ -2602,6 +3909,44 @@ globalThis.fetch = async (_url, init) => {
     writeFileSync(join(dir, 'times.jsonl'), lines(e.times!))
     const fail = cli('fault-check', args)
     expect(fail.status).toBe(1); expect(String(fail.stdout)).toContain('verdict=fail'); expect(String(fail.stdout)).toContain('recorded: sr8 summary')
+  }))
+  // answers28: a P with independent items must rewrite inside Q's span; a P with every item withheld (all) is proved by a skip.
+  test.each([
+    ['a P with independent items that only skipped fails', false, 'samples=3 required=4 queue=2 threads=1 rewritten=1 skipped=2 outside=1 window_ms=901', 'fail'],
+    ['a P with every item withheld that only skipped passes', true, 'samples=4 required=4 queue=2 threads=2 rewritten=1 skipped=2 outside=1 window_ms=901', 'pass'],
+  ] as const)('fault CLI check reads Thread Memory compactions from its measurement file over Q\'s original store span: %s', (_name, all, stats, verdict) => withCLI((root, cli) => {
+    const { e, dir, args } = faultCheckEvidence(root, undefined, undefined, 100_000, all), [p, q] = e.plan.keys as [string, string]
+    writeFileSync(join(dir, 'compactions.jsonl'), lines(e.plan.keys.map(key => ({ key, kind: 'queue', before: '1:1', after: '1:2', inside: true }))))
+    // Q's own acceptance stores span 99..1000 on the server clock; P's stores, replays' included, come later.
+    for (const r of e.rows!) if (r.key === p) r.at_mono_ms = 200_000
+    const run = (entries: string[]) => {
+      writeFileSync(join(root, 'measurements'), lines(e.rows!) + entries.map(l => `${l}\n`).join(''))
+      const out = String(cli('fault-check', args, 100_000).stdout).trim().split('\n')
+      return { compaction: out.filter(l => l.startsWith('recorded: sr8 compaction ')),
+        others: out.filter(l => !l.startsWith('recorded: sr8 compaction ') && !l.startsWith('recorded: sr8 summary ')) }
+    }
+    const line = (stats: string, verdict: string) => [`recorded: sr8 compaction scenario=test-fault mode=strict population=100000 recipients=2 ${stats} limit=inside-burst verdict=${verdict}`]
+    // P's rewrite, after Q's last store and among P's own later stores, is outside Q's burst (window_ms is Q's alone): P only skipped inside it.
+    const plain = run([]), measured = run([compactionLine(p, 200, 300, 'skipped'), compactionLine(p, 1500, 199_000, 'rewritten'),
+      compactionLine(q, 99, 150, 'skipped'), compactionLine(q, 900, 1000, 'rewritten')])
+    expect(plain.compaction).toEqual(line('samples=2 required=4 queue=2 threads=0 rewritten=0 skipped=0 outside=0 window_ms=901', 'missing'))
+    expect(measured.compaction).toEqual(line(stats, verdict))
+    expect(measured.others).toEqual(plain.others)
+  }))
+  test.each([
+    ['kept after the restart passes', true],
+    ['lost through the burst and restart fails', false],
+  ])('fault CLI check judges each persona\'s joins by identity, printing the baseline excess: a notice\'s extra pre-burst join %s', (_name, kept) => withCLI((root, cli) => {
+    const notice = (key: string) => [{ channel: 'C0LARGE00003', root: `5.${key}`, source: 'own-post' }]
+    const { e, args } = faultCheckEvidence(root, notice, key => kept ? notice(key) : [])
+    const child = cli('fault-check', args)
+    expect(child.status).toBe(kept ? 0 : 1)
+    expect(String(child.stdout).split('\n').filter(l => l.startsWith('recorded: sr8 joins '))).toEqual(e.plan.keys.map(key => {
+      const roots = e.plan.items.filter(i => i.key === key && i.phase === 'roots').length, after = roots + (kept ? 1 : 0)
+      return `recorded: sr8 joins scenario=test-fault mode=strict population=0 recipients=2 samples=${after} before=1 after=${after} oldest_retained=0 forgotten=0`
+        + ` baseline_excess=1 excess_sources=own-post:1 excess_channels=C0LARGE00003:1 baseline_lost=${kept ? 0 : 1} burst_missing=0 persona=${key}`
+        + ` limit=>=${roots} verdict=${kept ? 'pass' : 'fail'}`
+    }))
   }))
   test('fault CLI declares plan-derived dependencies and sends both waves without withheld ACKs', () => withCLI((root, cli) => {
     const e = composed(), batch = join(root, 'batches'), out = join(root, 'e'), state = join(root, 'state')
@@ -2700,6 +4045,56 @@ globalThis.fetch = async (_url, init) => {
   return Response.json({ok:true,envelope_id:id});
 };
 `))
+  // Real file permissions stand in for the kernel's checks on root-owned cgroup
+  // files, so root, which opens any of them for writing, cannot run this case;
+  // the injected-outcome tally above covers the verdict for every runner.
+  test.skipIf(process.getuid?.() === 0)('driver-cpu reads the measured server\'s cgroup and burst-driver.sh\'s record: missing in one shared quota, passing when split, missing when a guarded file opens for writing or cannot be probed', () => withCLI((root, cli) => {
+    const copy = join(root, 'tests/integration/fixtures/sr8-evidence.ts'), host = join(root, 'host')
+    let text = readFileSync(copy, 'utf8')
+    for (const [from, to] of [["const CGROUP_ROOT = '/sys/fs/cgroup'", `const CGROUP_ROOT = ${JSON.stringify(join(host, 'cgroup'))}`],
+      ['textFile(`/proc/${pid}/cgroup`)', `textFile(join(${JSON.stringify(join(host, 'proc'))}, String(pid), 'cgroup'))`]]) {
+      expect(text.split(from)).toHaveLength(2); text = text.replace(from, to)
+    }
+    writeFileSync(copy, text)
+    // Read-only files stand in for root-owned guarded files.
+    const put = (path: string, contents: string, mode = 0o444) => {
+      mkdirSync(dirname(join(host, path)), { recursive: true }); rmSync(join(host, path), { force: true }); writeFileSync(join(host, path), contents, { mode })
+    }
+    const stat = (usec: number) => `usage_usec ${usec}\nuser_usec 0\nsystem_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\n`
+    put('proc/101/cgroup', '0::/\n'); put('cgroup/cpu.max', '200000 100000\n'); put('cgroup/cpu.stat', stat(7_000)); put('cgroup/cgroup.procs', '1\n')
+    writeFileSync(join(root, 'shared'), '/\n')
+    const shared = cli('driver-cpu', ['101', join(root, 'shared')])
+    expect({ status: shared.status, stdout: shared.stdout }).toEqual({ status: 1, stdout: 'recorded: sr8 driver-cpu scenario=test-fault mode=strict population=0 recipients=2 samples=1 '
+      + 'server_cgroup=/ server_cpu_max=200000/100000 server_cpus=2 server_usage_ms=7 driver_cgroup=/ driver_cpu_max=200000/100000 driver_cpus=2 driver_usage_ms=7 shared_cpus=2 '
+      + 'guarded_files=2 writable_files=0 unprobed_files=0 limit=2 verdict=missing\n'
+      + 'recorded: sr8 summary scenario=test-fault measures=1 pass=0 fail=0 missing=1\n' })
+    put('proc/102/cgroup', '0::/shard/server\n'); put('cgroup/cpu.max', '300000 100000\n'); put('cgroup/shard/cpu.max', 'max 100000\n')
+    put('cgroup/shard/cgroup.procs', ''); put('cgroup/shard/driver/cgroup.procs', ''); put('cgroup/shard/server/cgroup.procs', '7\n')
+    put('cgroup/shard/server/cpu.max', '200000 100000\n'); put('cgroup/shard/server/cpu.stat', stat(5_000))
+    put('cgroup/shard/driver/cpu.max', '90000 100000\n'); put('cgroup/shard/driver/cpu.stat', stat(2_000))
+    writeFileSync(join(root, 'split'), '/shard/driver\n/shard/driver\n')
+    const split = cli('driver-cpu', ['102', join(root, 'split')])
+    expect({ status: split.status, stdout: split.stdout }).toEqual({ status: 0, stdout: 'recorded: sr8 driver-cpu scenario=test-fault mode=strict population=0 recipients=2 samples=2 '
+      + 'server_cgroup=/shard/server server_cpu_max=200000/100000 server_cpus=2 server_usage_ms=5 driver_cgroup=/shard/driver driver_cpu_max=90000/100000 driver_cpus=0.9 driver_usage_ms=2 shared_cpus=3 '
+      + 'guarded_files=8 writable_files=0 unprobed_files=0 limit=2 verdict=pass\n'
+      + 'recorded: sr8 summary scenario=test-fault measures=1 pass=1 fail=0 missing=0\n' })
+    // R1's escape: the server's UID able to write the parent's cgroup.procs, so it could leave its group,
+    // whether the file is also readable (0644) or write-only (0200), which a read-write probe would miss.
+    for (const mode of [0o644, 0o200]) {
+      put('cgroup/shard/cgroup.procs', '', mode)
+      expect(cli('driver-cpu', ['102', join(root, 'split')]).stdout).toContain(' guarded_files=8 writable_files=1 unprobed_files=0 limit=2 verdict=missing\n')
+    }
+    put('cgroup/shard/cgroup.procs', '')
+    // A guarded file the probe cannot open for an unexpected reason (EISDIR here) is no evidence, so missing.
+    rmSync(join(host, 'cgroup/shard/driver/cgroup.procs')); mkdirSync(join(host, 'cgroup/shard/driver/cgroup.procs'))
+    expect(cli('driver-cpu', ['102', join(root, 'split')]).stdout).toContain(' guarded_files=8 writable_files=0 unprobed_files=1 limit=2 verdict=missing\n')
+    rmSync(join(host, 'cgroup/shard/driver/cgroup.procs'), { recursive: true }); put('cgroup/shard/driver/cgroup.procs', '')
+    expect(cli('driver-cpu', ['102', join(root, 'split')]).status).toBe(0)
+    // A record cut mid-line, an absent one or a gone server is missing; a bad PID is a usage error.
+    writeFileSync(join(root, 'cut'), '/shard/driver')
+    for (const args of [['102', join(root, 'cut')], ['102', join(root, 'absent')], ['103', join(root, 'split')]]) expect(cli('driver-cpu', args).status).toBe(1)
+    expect(cli('driver-cpu', ['x', join(root, 'split')]).status).toBe(64)
+  }))
   test('burst writes wave-boundary CPU readings only when SR8_PHASE_CPU_FILE opts in, and observe reads them with the server rows', () => withCLI((root, cli) => {
     const batch = join(root, 'batches'), keys = sr8Personas(2), phases = ['roots', 'replies', 'dropped'] as const
     mkdirSync(batch); writeFileSync(join(root, 'stub'), '')
@@ -2708,18 +4103,22 @@ globalThis.fetch = async (_url, init) => {
       ...(phase === 'replies' ? { thread_ts: ts('roots', n) } : {}) } })
     for (const [phase, count] of [['roots', SR8_BURST_JOINS], ['replies', SR8_BURST_REPLIES], ['dropped', SR8_BURST_DROPPED]] as const)
       writeFileSync(join(batch, `${phase}.batch.jsonl`), lines(keys.flatMap(k => Array.from({ length: count }, (_, n) => body(k, phase, n)))))
-    // The copied CLI reads cpu.stat and each process's stat from controlled files
+    // The copied CLI reads cgroups and each process's stat from controlled files
     // under its root, never the host's: server readable, stub absent, observer malformed.
+    // The cgroup read is the server's own, not the namespace root the driver shares.
     const copy = join(root, 'tests/integration/fixtures/sr8-evidence.ts'), host = join(root, 'host')
     const reads: Array<[string, string]> = [
-      ["textFile('/sys/fs/cgroup/cpu.stat') ?? textFile('/sys/fs/cgroup/cpu/cpu.stat')", `textFile(${JSON.stringify(join(host, 'cpu.stat'))})`],
+      ["const CGROUP_ROOT = '/sys/fs/cgroup'", `const CGROUP_ROOT = ${JSON.stringify(join(host, 'cgroup'))}`],
+      ['textFile(`/proc/${pid}/cgroup`)', `textFile(join(${JSON.stringify(join(host, 'proc'))}, String(pid), 'cgroup'))`],
       ['textFile(`/proc/${pid}/stat`)', `textFile(join(${JSON.stringify(join(host, 'proc'))}, name === 'observer' ? name : String(pid), 'stat'))`],
     ]
     let text = readFileSync(copy, 'utf8')
     for (const [from, to] of reads) { expect(text.split(from)).toHaveLength(2); text = text.replace(from, to) }
     writeFileSync(copy, text)
-    mkdirSync(join(host, 'proc/101'), { recursive: true }); mkdirSync(join(host, 'proc/observer'))
-    writeFileSync(join(host, 'cpu.stat'), 'usage_usec 5000\nuser_usec 3000\nsystem_usec 2000\nnr_periods 10\nnr_throttled 2\nthrottled_usec 300\n')
+    mkdirSync(join(host, 'proc/101'), { recursive: true }); mkdirSync(join(host, 'proc/observer')); mkdirSync(join(host, 'cgroup/shard/server'), { recursive: true })
+    writeFileSync(join(host, 'proc/101/cgroup'), '0::/shard/server\n')
+    writeFileSync(join(host, 'cgroup/cpu.stat'), 'usage_usec 9\nuser_usec 9\nsystem_usec 9\nnr_periods 9\nnr_throttled 9\nthrottled_usec 9\n')
+    writeFileSync(join(host, 'cgroup/shard/server/cpu.stat'), 'usage_usec 5000\nuser_usec 3000\nsystem_usec 2000\nnr_periods 10\nnr_throttled 2\nthrottled_usec 300\n')
     writeFileSync(join(host, 'proc/101/stat'), '101 (bun (x) y) S 1 101 101 0 -1 4194304 10 0 0 0 250 75 0 0 20 0 9 0 100 0 0\n')
     writeFileSync(join(host, 'proc/observer/stat'), 'garbage\n')
     const burst = (out: string) => cli('burst', [batch, 'http://127.0.0.1:1', join(root, 'stub'), join(root, 'state'), out, '1000'])
@@ -2996,18 +4395,95 @@ describe('SR-8 evidence verdicts (synthetic evidence, no runtime performance cla
       expect(child.stdout).toContain('start_to_ready_ms=missing limit=none verdict=missing\n')
     })
   })
-  test('both compactions need distinct existing file identities INSIDE the burst', () => {
-    const rows = ['queue', 'threads'].map(kind => ({ key, kind, before: '1:1', after: '1:2', inside: true }))
-    expect(compactionVerdict(rows, [key], true).verdict).toBe('pass')
-    missing(compactionVerdict(undefined, [key], true))
-    missing(compactionVerdict(rows.slice(1), [key], true))
-    for (const change of [{ inside: false }, { after: '1:1' }, { before: '' }]) missing(compactionVerdict([{ ...rows[0], ...change }, rows[1]], [key], true))
+  describe('compaction: the queue by file identity, Thread Memory by its entries wholly inside the burst\'s server-clock store span', () => {
+    // The burst's own acceptance stores: alpha's starts the span at 1000 (at_mono_ms - store_ms), beta's ends it at 2000.
+    const stores = [store(1, 5, 'accepted', 1005), { ...store(1, 10, 'post-hold', 2000), key: other }]
+    const burst = [item(), { key: other, seq: 1 }], keys = [key, other]
+    const queue = (k: string) => ({ key: k, kind: 'queue', before: '1:1', after: '1:2', inside: true })
+    // alpha rewrote inside the span; each case gives beta's entries.
+    const run = (entries: Measurement[], q = keys.map(queue)) => {
+      const rows = [...stores, compactionRow(key, 1100, 1200, 'rewritten'), ...entries]
+      return compactionVerdict(q, rows, storeWindow(rows, burst), keys, true)
+    }
+    test('a skipped compaction inside the span counts as complete beside a rewrite, at both inclusive edges', () => {
+      expect(storeWindow(stores, burst)).toEqual({ start: 1000, end: 2000 })
+      const r = run([compactionRow(other, 1000, 1050, 'skipped'), compactionRow(other, 1300, 1400, 'rewritten'), compactionRow(other, 1900, 2000, 'skipped')])
+      expect(resultLine(context, r)).toContain(' samples=4 required=4 queue=2 threads=2 rewritten=2 skipped=2 outside=0 window_ms=1000 limit=inside-burst verdict=pass')
+    })
+    test('a persona whose in-burst compactions all skipped fails, though the other rewrote', () => {
+      const r = run([compactionRow(other, 1100, 1200, 'skipped'), compactionRow(other, 1500, 1600, 'skipped')])
+      expect(r.verdict).toBe('fail'); expect(r.stats).toMatchObject({ threads: 1, rewritten: 1, skipped: 2 })
+    })
+    test.each([['at startup, before the first store', 10, 500], ['across the first store\'s start', 990, 1010],
+      ['across the last store', 1990, 2010], ['after the last store', 2001, 2100]] as const)
+    ('beta\'s rewrite %s never counts', (_name, start, end) => {
+      const outside = compactionRow(other, start, end, 'rewritten')
+      missing(run([outside]))
+      const r = run([outside, compactionRow(other, 1500, 1600, 'skipped')])
+      expect(r.verdict).toBe('fail'); expect(r.stats).toMatchObject({ threads: 1, skipped: 1, outside: 1 })
+    })
+    test('no entries, none for one persona, or an unreadable measurement file is missing', () => {
+      missing(compactionVerdict(keys.map(queue), stores, storeWindow(stores, burst), keys, true))
+      missing(run([]))
+      missing(compactionVerdict(keys.map(queue), undefined, storeWindow(stores, burst), keys, true))
+    })
+    test.each<[string, (rows: Measurement[]) => Measurement[]]>([
+      ['no store rows', rows => rows.filter(r => r.kind !== 'store')],
+      ['a burst item\'s store absent', rows => rows.filter(r => !(r.kind === 'store' && r.key === other))],
+      ['an item stored twice', rows => [...rows, { ...stores[1]! }]],
+      ['only a later fixed append for an item', rows => rows.map(r => r.kind === 'store' && r.key === other ? { ...r, store: 'fixed' } : r)],
+      ['a store taking longer than its own time', rows => rows.map(r => r.kind === 'store' && r.key === key ? { ...r, store_ms: 1006 } : r)],
+    ])('no window (%s) is missing, even with every entry inside', (_name, change) => {
+      const rows = change([...stores, compactionRow(key, 1100, 1200, 'rewritten'), compactionRow(other, 1300, 1400, 'rewritten')])
+      expect(storeWindow(rows, burst)).toBeUndefined()
+      missing(compactionVerdict(keys.map(queue), rows, storeWindow(rows, burst), keys, true))
+    })
+    test.each<[string, Partial<Measurement>]>([
+      ['a negative start', { start_mono_ms: -1 }], ['no end', { end_mono_ms: undefined }], ['an end before its start', { start_mono_ms: 1450 }],
+      ['an unknown outcome', { outcome: 'partial' }], ['an unknown persona key', { key: 'gamma' }], ['at_mono_ms other than its end', { at_mono_ms: 1350 }],
+    ])('beta\'s malformed rewrite (%s) never counts and cannot make the proof pass', (_name, change) => {
+      const bad = { ...compactionRow(other, 1300, 1400, 'rewritten'), ...change }
+      missing(run([bad]))
+      expect(run([bad, compactionRow(other, 1500, 1600, 'skipped')]).verdict).toBe('fail')
+    })
+    test.each([['absent', undefined], ['outside the burst', { inside: false }], ['one identity', { after: '1:1' }], ['no identity before', { before: '' }]] as const)
+    ('beta\'s queue proof %s stays missing whatever the entries show', (_name, change) => {
+      const r = run([compactionRow(other, 1300, 1400, 'rewritten')], [queue(key), ...(change ? [{ ...queue(other), ...change }] : [])])
+      missing(r); expect(r.stats).toMatchObject({ queue: 1, threads: 2 })
+    })
+    test('Thread Memory file identity rows no longer count, and below 100,000 nothing is required', () => {
+      const r = compactionVerdict(keys.flatMap(k => [queue(k), { ...queue(k), kind: 'threads' }]), stores, storeWindow(stores, burst), keys, true)
+      missing(r); expect(r.samples).toBe(2)
+      expect(compactionVerdict(undefined, undefined, undefined, keys, false)).toMatchObject({ verdict: 'pass', stats: { required: 0 } })
+    })
   })
-  test('joins preserve each oldest identity, not only the count', () => {
-    const old = [{ channel: 'channel', root: '1' }], added = [{ channel: 'channel', root: '2' }]
-    expect(joinsVerdict(old, [...old, ...added], old, added, 1).verdict).toBe('pass')
-    expect(joinsVerdict(old, [...added, { channel: 'channel', root: '3' }], old, added, 1).verdict).toBe('fail')
-    missing(joinsVerdict(undefined, [...old, ...added], old, added, 1))
+  describe('joins: every seed before the burst, every pre-burst join and burst root after it', () => {
+    // S seeds, N burst roots, and the first start's seal-report notice's own-post join.
+    const joined = (channel: string, root: string, source = 'mention') => ({ channel, root, source })
+    const S = [joined('C1', '1'), joined('C1', '2')], N = [joined('C1', '9')], notice = joined('C0LARGE00003', '5', 'own-post')
+    const other = joined('C1', '7')
+    test.each([
+      ['the seal notice\'s extra pre-burst join, kept', [...S, notice], [...S, notice, ...N], 'pass', [1, 'own-post:1', 'C0LARGE00003:1', 0, 0]],
+      ['no extra join', S, [...S, ...N], 'pass', [0, 'none', 'none', 0, 0]],
+      ['a seed lost before the burst while the extra keeps the count', [S[0]!, notice], [...S, notice, ...N], 'fail', [1, 'own-post:1', 'C0LARGE00003:1', 0, 0]],
+      ['the extra pre-burst join lost through the burst and restart', [...S, notice], [...S, ...N, other], 'fail', [1, 'own-post:1', 'C0LARGE00003:1', 1, 0]],
+      ['a burst root missing while another join keeps the count', [...S, notice], [...S, notice, other], 'fail', [1, 'own-post:1', 'C0LARGE00003:1', 0, 1]],
+    ] as const)('%s', (_name, before, after, verdict, [excess, sources, channels, lost, burstMissing]) => {
+      const r = joinsVerdict([...before], [...after], S, N, 1)
+      expect(r.verdict).toBe(verdict)
+      expect(r.stats).toMatchObject({ baseline_excess: excess, excess_sources: sources, excess_channels: channels, baseline_lost: lost, burst_missing: burstMissing })
+    })
+    test('missing snapshots stay missing', () => {
+      missing(joinsVerdict(undefined, [...S, ...N], S, N, 1))
+      missing(joinsVerdict([...S, notice], undefined, S, N, 1))
+    })
+    test('the baseline excess prints content-free: counts per source and channel word, never other text', () => {
+      const odd = [joined('C2', '6', 'own post <text>'), joined('C2', '8', 'own-post'), { channel: 'C3 x', root: '4' }]
+      const output: string[] = []
+      printResults(context, [joinsVerdict([...S, ...odd], [...S, ...odd, ...N], S, N, 1)], line => output.push(line))
+      expect(output[0]).toBe('recorded: sr8 joins scenario=test-control mode=strict population=100000 recipients=1 samples=6 before=5 after=6'
+        + ' oldest_retained=2 forgotten=0 baseline_excess=3 excess_sources=other:2,own-post:1 excess_channels=C2:2,other:1 baseline_lost=0 burst_missing=0 limit=>=3 verdict=pass')
+    })
   })
   test('N2 sample counts are distinct and all required samples remain present', () => {
     const samples = Array.from({ length: 20 }, (_, i) => ({ ...item(i + 1), name: 'fallback' }))

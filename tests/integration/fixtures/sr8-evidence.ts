@@ -56,9 +56,11 @@
  *     With SR8_PROFILE_DIR set (only test-44's burst case runs burst with it), each wave's name is
  *     appended to <dir>/waves at its start and `end` after the last, as the
  *     phase-cpu readings are taken, for cpu-profile.ts's per-wave profile parts.
- *     Compaction proof: two existing dev:ino identities, both observed after the first
- *     push and before the final ACK. The observer reads the stub record AFTER stat too;
- *     a replacement first seen after completion cannot pass. Creation is not compaction.
+ *     Queue compaction proof: two existing queue journal dev:ino identities, both observed
+ *     after the first push and before the final ACK. The observer reads the stub record
+ *     AFTER stat too; a replacement first seen after completion cannot pass. Creation is
+ *     not compaction. Thread Memory compactions are proved by check from the measurement
+ *     file's thread-compaction entries, not by file identity (a skip changes no file).
  *   seal <first|measured> C <server-log> <log-byte-mark> <config-path>
  *     First: exactly one printer-built entry-missing report per seeded key. Measured:
  *     no changed-while-stopped OR THREAD_MEMORY_JOINS_LOST report, including any
@@ -69,8 +71,10 @@
  *     <key>.queue.jsonl from shared_queue_snapshot (retain pre-compaction snapshots);
  *     <key>.before.jsonl and <key>.after.jsonl from shared_thread_joins, before the burst
  *     and AFTER a clean restart. Reader failures must fail the script, never become [].
- *     Joins must retain every seeded identity and every burst root; additional joins
- *     (e.g. the held-probe setup's successful own post) are counted, never subtracted.
+ *     Joins: every seeded identity before the burst, and every pre-burst join and
+ *     burst root after the restart (S ⊆ B, B ∪ N ⊆ A). Additional joins (the first
+ *     start's seal-report notice's own post, say) are counted, never subtracted,
+ *     and printed by count, source and channel (baseline_excess, excess_*).
  *     External start/ready timestamps MUST be from the same clock for the measured start.
  *     Required N2 count defaults to zero for stub-only bursts; test-32 passes >=20.
  *     With held probes, also emits post-hold-overlap and post-hold-overlap-ack:
@@ -79,6 +83,17 @@
  *     post-hold admission and resolution on the SERVER measurement clock. N1 for
  *     every overlapping item uses its own envelope's STUB push/ACK times. No overlap
  *     or missing endpoints is missing; slow overlapping ACK is fail. Clocks never mix.
+ *     Compaction (required at 100000 only), per recipient: the queue by compactions.jsonl's
+ *     file identities as burst records them; Thread Memory by that persona's
+ *     thread-compaction entries after the byte mark lying WHOLLY inside the burst's
+ *     span on the SERVER clock: the first store's start (at_mono_ms - store_ms) to
+ *     the last store's at_mono_ms, over the acceptance stores of the burst's own
+ *     accepted items (key/seq bound through the queue snapshots). Each store follows
+ *     its push and precedes its ACK, so the span lies inside push-to-final-ACK.
+ *     Rewritten and skipped-identical entries both count as complete, and at least
+ *     one must be rewritten: all skipped fails; none, an incomplete store set or a
+ *     malformed entry alone is missing. Startup, bring-up and other entries outside
+ *     the span never count. Entry times are never compared with any other clock.
  *   startup-load C <start-ms> <ready-ms>
  *     Standalone startup evidence for test-32; no burst files are needed. Population
  *     is per recipient: samples/joined report population * recipients, as check does.
@@ -150,10 +165,20 @@
  *     bun "$E" concurrent-overlap "$TEST_NAME" "$mode" 100000 2 "$out/operations.tsv" "$out/sample-intervals.tsv" "$out/n2.txt"
  *   conditions <state-dir> <server-pid> [<cpu-mark-file>]
  *     Bun, CPUs, cgroup memory limit, filesystem/mount, server VmHWM (KiB). With a
- *     cpu-mark file, also cgroup cpu_max and the nr_periods/nr_throttled/
+ *     cpu-mark file, also the server's cgroup cpu_max and the nr_periods/nr_throttled/
  *     throttled_usec deltas since that mark (cpuConditionFields; unknown if unread).
  *   cpu-mark <new-file>
- *     Saves the cgroup cpu.stat counters (empty when unreadable) at a case's start.
+ *     Saves its own cgroup's cpu.stat counters (empty when unreadable) at a case's
+ *     start: the server's cgroup, since only the burst driver runs elsewhere.
+ *   driver-cpu C <server-pid> <driver-record>
+ *     The control that the burst driver ran off the server's CPU quota: placement,
+ *     configured quotas and permissions, not throttling. The record is
+ *     burst-driver.sh's, one cgroup path per driver run; run as the server's UID
+ *     from the server's group while the measured server runs. Prints both
+ *     cgroups, cpu.max, CPUs and usage, and how many guarded cgroup files on
+ *     their paths a write-only open reached, and how many it could not probe;
+ *     missing unless driverCpuVerdict passes every run and every present file
+ *     was refused.
  *   observe C <burst-dir> <measurement-file> <byte-mark> <phase-cpu-file>
  *     Test-44's latency observation, never a verdict: exits 0 and prints no summary.
  *     The phase-cpu file is what burst appends when SR8_PHASE_CPU_FILE names it
@@ -244,7 +269,10 @@
  *     Stage ONLY this fault/page in the slice. Use users.conversations hang,
  *     error internal_error/missing_scope/invalid_auth, or rate_limit respectively.
  *     Need >=2 fired records and scoped incomplete diagnostics for key; pages=0
- *     for first, >0 for later. Hang requires reason=deadline with deadline/next
+ *     for first, >0 for later, except denied later also accepts pages=0 when
+ *     every fault's api row carries a non-empty cursor, proving the later page
+ *     (the credentials refusal resets scan progress before publishing
+ *     reason=authentication slack=invalid_auth). Hang requires reason=deadline with deadline/next
  *     attempt timestamps and each request's own fault-settled/abort. Capture through
  *     the LAST fault's diagnostic/settlement. Each diagnostic is uniquely correlated
  *     to the staged request's arrival interval before the next faulted attempt.
@@ -279,7 +307,11 @@
  *     send NO traffic/tool/reconnect until complete. The line records elapsed_ms,
  *     remaining_ms, retry_ms, scan_ms. Published bound = remaining attempt deadline
  *     + max(MEMBERSHIP_RETRY_MAX_MS, Retry-After) + successful scan/persistence time;
- *     scan start is complete.deadline_at - MEMBERSHIP_ATTEMPT_TIMEOUT_MS. No fixed
+ *     scan start is complete.deadline_at - MEMBERSHIP_ATTEMPT_TIMEOUT_MS. After an
+ *     access or authentication refusal (no deadline_at) the remaining deadline is 0
+ *     and, when the complete line has no deadline_at, scan start is the last
+ *     reason=none incomplete line after clear and at/after the refusal's
+ *     next_attempt_at. No fixed
  *     extra 30 seconds, rounding tolerance or dispatch allowance. Missing timestamps
  *     or completion is missing, elapsed above the bound or scan above its deadline
  *     fails. This does not claim a constant bound on arbitrary persistence work.
@@ -294,7 +326,9 @@
  *     record, both seq > complete-seq-mark. The same stub's seq is monotonic record
  *     order. Line: membership-late(fired,late_after_complete,unchanged; unchanged).
  *     Abort always fails. Missing evidence or a settlement before completion is
- *     missing; different state reads fail. Never accept an aborted delay as late.
+ *     missing; different state reads fail except own-post joins first present in
+ *     after-state. Every join already in before-state remains byte-exact and ordered.
+ *     Never accept an aborted delay as late.
  *
  *   zero-ack C <key> <envelope-id> <times> <start-ms> <end-ms> <probe-exit> <log-slice>
  *     Attempt the actual write probe while permissions deny writes. Capture start
@@ -388,7 +422,7 @@
  *     Appends each original HTTP result to fault-ledger.jsonl by planned ordinal:
  *     envelope_id, or denied-case no-open-socket/send-failed refusal with NO invented
  *     envelope. Unrecognized refusals/timeouts fail and retain the attempted item.
- *     Compaction observations cover the Q burst window; keeps compactions.jsonl and
+ *     Queue compaction observations cover the Q burst window; keeps compactions.jsonl and
  *     held-admission snapshots. Prints submitted/expected/refused. No HTTP ACK oracle.
  *   fault-ids C <out>
  *     Every original/replay envelope in the ledger, one per line, excluding only
@@ -440,6 +474,13 @@
  *     window; no overlap is missing), accounting/accounting-ack/recovered-ack,
  *     ordinary ack-accepted/ack-dropped per nonempty independent persona class,
  *     combined/per-persona store, post-hold and overlap, joins, startup and compaction.
+ *     Compaction follows check's rule for both P and Q, over Q's ORIGINAL burst
+ *     (what fault-burst observes): the span of Q's own acceptance stores, never P's
+ *     items or any recovery replay. Only personas with stored burst items there
+ *     must rewrite: Q always, P only when the plan has independent accepted P
+ *     items (not all). A P with every item withheld has no Thread Memory change in
+ *     that span, so any complete in-span entry, rewritten or skipped, proves it;
+ *     no in-span entry is still missing (answers28).
  *     Q keeps ALL ordinary counts and limits, P's independent work keeps N1, all
  *     recovery ACKs start at their NEW push and all accepted recoveries store once.
  *     This replaces ordinary check ONLY for this declared fault-aware workload;
@@ -473,7 +514,9 @@
  *   accepted burst items (fixed appends are excluded from both the count and p99);
  * - a push without its unique ACK, missing push/timing/accepted/join snapshots;
  * - fewer real-agent N2 samples than required;
- * - either required compaction not proved INSIDE the burst at population 100000;
+ * - either required compaction not proved INSIDE the burst at population 100000
+ *   (a persona that must rewrite and whose in-burst Thread Memory compactions all
+ *   skipped fails; only fault-check's fully withheld P need not rewrite);
  * - a held reply without its resolution or its OWN key/seq resolution-store append;
  * - absent hung N2 sample or accepted/fixed record of its key/seq;
  * - absent fired fault for either hung or delayed sample;
@@ -486,7 +529,7 @@
  * Post Hold and N4 STRICT limits and the membership hang request duration D-A;
  * each prints signed excess and allowance always.
  */
-import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, statSync, statfsSync, openSync, readSync, closeSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, statSync, statfsSync, openSync, readSync, closeSync, constants as fsConstants } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { cpus } from 'node:os'
@@ -503,7 +546,7 @@ export const SR8_USER_HZ = 100
 export type Verdict = 'pass' | 'fail' | 'missing' | 'recorded'
 export interface Context { scenario: string; mode: 'strict' | 'open'; population: number; recipients: number }
 export interface Result { measure: string; samples: number; stats: Record<string, string | number>; limit: string | number; verdict: Verdict }
-export interface Measurement { v: number; kind: string; key: string; seq?: number; seqs?: number[]; store?: string; at_mono_ms: number; store_ms?: number; held_ms?: number; outcome?: string; cause?: string }
+export interface Measurement { v: number; kind: string; key: string; seq?: number; seqs?: number[]; store?: string; at_mono_ms: number; store_ms?: number; held_ms?: number; outcome?: string; cause?: string; start_mono_ms?: number; end_mono_ms?: number }
 export interface Accepted { key: string; seq: number }
 export interface Times { envelope_id: string; push: { sent_mono_ms: number; connection_id: unknown }; acks: { ack_mono_ms: number; connection_id: unknown }[] }
 export interface BurstItem { key: string; phase: string; channel: string; ts: string; sender: string; envelope_id?: string }
@@ -557,8 +600,10 @@ export function burstAckVerdicts(keys: string[], items: BurstItem[] | undefined,
   if (ackDropped.verdict !== 'missing' && droppedStored > 0) ackDropped.verdict = 'fail'
   return [ackAccepted, ackDropped]
 }
+/** An accepted item's own acceptance store; a later `fixed` append is not one. */
+const ACCEPTANCE_STORES = ['accepted', 'post-hold', 'memory-hold']
 export function storeVerdict(rows: Measurement[] | undefined, accepted: Accepted[], percentile: (values: number[], q: number) => number): Result {
-  const stores = rows?.filter(r => r.kind === 'store' && ['accepted', 'post-hold', 'memory-hold'].includes(r.store!)) ?? []
+  const stores = rows?.filter(r => r.kind === 'store' && ACCEPTANCE_STORES.includes(r.store!)) ?? []
   const wanted = new Set(accepted.map(identity))
   const samples = stores.filter(r => wanted.has(identity(r as Accepted)))
   const counts = new Map<string, number>()
@@ -634,19 +679,76 @@ export function startupVerdict(start: number, ready: number, count: number): Res
     nonnegative(start) && nonnegative(ready) && ready >= start ? 'recorded' : 'missing')
 }
 export interface Compaction { key: string; kind: string; before: string; after: string; inside: boolean }
-export function compactionVerdict(rows: Compaction[] | undefined, keys: string[], required: boolean): Result {
-  const count = keys.flatMap(key => ['queue', 'threads'].map(kind => rows?.some(r => r.key === key && r.kind === kind
-    && r.inside === true && !!r.before && !!r.after && r.before !== r.after))).filter(Boolean).length
-  return result('compaction', count, { required: required ? keys.length * 2 : 0 }, 'inside-burst', !required || count === keys.length * 2 ? 'pass' : 'missing')
+/** A span on the server's measurement clock (`performance.now`), ms. */
+export interface ServerWindow { start: number; end: number }
+/** The measured burst on the server clock, from the burst items' own acceptance
+ * stores (by key and seq): the first store's start (`at_mono_ms - store_ms`) to
+ * the last store's `at_mono_ms`. Each store follows its item's push and precedes
+ * its ACK, so the span lies inside the burst's push-to-final-ACK window. Undefined
+ * unless every item has exactly one usable store. Pure. */
+export function storeWindow(rows: Measurement[] | undefined, accepted: Accepted[]): ServerWindow | undefined {
+  const wanted = new Set(accepted.map(identity))
+  const stores = rows?.filter(r => r.kind === 'store' && ACCEPTANCE_STORES.includes(r.store!) && wanted.has(identity(r as Accepted))) ?? []
+  // Distinct identities, one store each: every item's own store, none twice.
+  if (!rows || !accepted.length || wanted.size !== accepted.length || stores.length !== accepted.length
+    || new Set(stores.map(r => identity(r as Accepted))).size !== stores.length) return undefined
+  let start = Infinity, end = -Infinity
+  for (const s of stores) {
+    if (!nonnegative(s.store_ms) || !nonnegative(s.at_mono_ms - s.store_ms)) return undefined
+    start = Math.min(start, s.at_mono_ms - s.store_ms); end = Math.max(end, s.at_mono_ms)
+  }
+  return { start, end }
 }
-export function joinsVerdict(before: { channel: string; root: string }[] | undefined, after: { channel: string; root: string }[] | undefined,
-  expected: { channel: string; root: string }[], newJoins: { channel: string; root: string }[], recipients: number): Result {
-  const id = (r: { channel: string; root: string }) => `${r.channel}:${r.root}`
+/** A `thread-compaction` entry as the server writes it: start and end on the
+ * server clock, end at or after start and equal to `at_mono_ms`, a known outcome. */
+const threadCompaction = (r: Measurement) => r.kind === 'thread-compaction' && nonnegative(r.start_mono_ms) && nonnegative(r.end_mono_ms)
+  && r.end_mono_ms >= r.start_mono_ms && r.at_mono_ms === r.end_mono_ms && ['rewritten', 'skipped'].includes(r.outcome!)
+/** SR-8.2's compaction proof, required only at 100,000. Per recipient: a queue
+ * compaction by file identity (`compactions.jsonl`), and that persona's
+ * `thread-compaction` entries wholly inside `window`, rewritten and
+ * skipped-identical alike complete. Each persona in `rewriters` (every recipient
+ * unless fault-check narrows it) needs at least one of them rewritten, and fails
+ * when all skipped; any other persona is proved by any such entry. None, or no
+ * window, is missing. Entries outside the window (startup and bring-up included)
+ * and Thread Memory file identity rows never count. Pure. */
+export function compactionVerdict(queue: Compaction[] | undefined, rows: Measurement[] | undefined, window: ServerWindow | undefined,
+  keys: string[], required: boolean, rewriters: string[] = keys): Result {
+  const entries = rows?.filter(r => keys.includes(r.key) && threadCompaction(r)) ?? []
+  const span = window && nonnegative(window.start) && finite(window.end) && window.end >= window.start ? window : undefined
+  const inside = span ? entries.filter(r => r.start_mono_ms! >= span.start && r.end_mono_ms! <= span.end) : []
+  const queued = keys.filter(key => queue?.some(r => r.key === key && r.kind === 'queue' && r.inside === true && !!r.before && !!r.after && r.before !== r.after))
+  const proved = keys.filter(key => inside.some(r => r.key === key && (r.outcome === 'rewritten' || !rewriters.includes(key))))
+  const skippedOnly = keys.filter(key => !proved.includes(key) && inside.some(r => r.key === key))
+  const missing = queued.length < keys.length || proved.length + skippedOnly.length < keys.length
+  return result('compaction', queued.length + proved.length, { required: required ? keys.length * 2 : 0, queue: queued.length, threads: proved.length,
+    rewritten: inside.filter(r => r.outcome === 'rewritten').length, skipped: inside.filter(r => r.outcome === 'skipped').length,
+    outside: entries.length - inside.length, window_ms: span ? round3(span.end - span.start) : 'missing' }, 'inside-burst',
+    !required ? 'pass' : missing ? 'missing' : skippedOnly.length ? 'fail' : 'pass')
+}
+interface JoinIdentity { channel: string; root: string; source?: unknown }
+/** Counts per value, e.g. `own-post:1`; a value that is not one short word counts as `other`. */
+function tally(values: unknown[]): string {
+  const counts = new Map<string, number>()
+  for (const v of values) { const w = typeof v === 'string' && /^[A-Za-z0-9._-]{1,64}$/.test(v) ? v : 'other'; counts.set(w, (counts.get(w) ?? 0) + 1) }
+  const sorted = [...counts].sort((x, y) => y[1] - x[1] || (x[0] < y[0] ? -1 : 1)).map(([w, n]) => `${w}:${n}`)
+  return sorted.length ? sorted.slice(0, 5).join(',') + (sorted.length > 5 ? `,+${sorted.length - 5}` : '') : 'none'
+}
+/** With S the seeded identities, B the pre-burst snapshot, N the burst roots
+ * and A the snapshot after the restart: S ⊆ B and B ∪ N ⊆ A. The baseline
+ * excess B \ S (the seal report's own-post join, say) is printed by count,
+ * source and channel only. */
+export function joinsVerdict(before: JoinIdentity[] | undefined, after: JoinIdentity[] | undefined,
+  expected: JoinIdentity[], newJoins: JoinIdentity[], recipients: number): Result {
+  const id = (r: JoinIdentity) => `${r.channel}:${r.root}`
   const b = new Set(before?.map(id)), a = new Set(after?.map(id)), old = new Set(expected.map(id)), added = new Set(newJoins.map(id))
   const retained = [...old].filter(k => a.has(k)).length
-  return result('joins', a.size, { before: b.size, after: a.size, oldest_retained: retained, forgotten: old.size - retained }, `>=${(old.size + added.size) * recipients}`,
-    !before || !after ? 'missing' : b.size === old.size && [...old].every(k => b.has(k) && a.has(k))
-      && a.size >= old.size + added.size && [...added].every(k => a.has(k)) ? 'pass' : 'fail')
+  const excess = [...new Map((before ?? []).filter(r => !old.has(id(r))).map(r => [id(r), r])).values()]
+  const lost = [...b].filter(k => !a.has(k)).length, missingRoots = [...added].filter(k => !a.has(k)).length
+  return result('joins', a.size, { before: b.size, after: a.size, oldest_retained: retained, forgotten: old.size - retained,
+    baseline_excess: excess.length, excess_sources: tally(excess.map(r => r.source)), excess_channels: tally(excess.map(r => r.channel)),
+    baseline_lost: lost, burst_missing: missingRoots }, `>=${(old.size + added.size) * recipients}`,
+    !before || !after ? 'missing' : [...old].every(k => b.has(k)) && lost === 0 && missingRoots === 0
+      && a.size >= old.size + added.size ? 'pass' : 'fail')
 }
 export interface ObservationWindow { instance: string; start: number; end: number }
 export function windowsVerdict(calls: { instance: string; ms: number }[] | undefined, empty: ObservationWindow[] | undefined,
@@ -850,8 +952,13 @@ export function membershipFaultVerdicts(kind: string, page: string, key: string,
   const faults = stub?.filter(r => r.event === 'fault' && r.control === 'faults' && r.method === 'users.conversations' && r.label === key && r.outcome === expected[0]) ?? []
   const observed = diagnostics?.filter(d => d.reason !== 'none') ?? []
   const answers = faults.map(f => stub?.filter(r => r.event === 'api' && r.request_id === f.request_id) ?? [])
+  // A later-page invalid_auth is a credentials refusal: connectionChanged
+  // resets the scan status (pages=0) before publishing the authentication failure.
+  // With pages=0 the diagnostic no longer shows page 1 succeeded, so the stub's
+  // request cursor must prove each fault was a later page.
+  const laterCursor = answers.length > 0 && answers.every(a => a.length === 1 && typeof a[0].cursor === 'string' && a[0].cursor !== '')
   const matches = observed.filter(d => !d.complete && d.reason === expected[1] && (expected[2] === undefined || d.slack === expected[2])
-    && (page === 'first' ? d.pages === 0 : d.pages > 0))
+    && (page === 'first' ? d.pages === 0 : d.pages > 0 || kind === 'denied' && d.pages === 0 && laterCursor))
   let missing = !stub || !diagnostics || faults.length < 2 || !observed.length || !stateRead(before) || !stateRead(after)
     || faults.some(f => !nonnegative(f.arrival_mono_ms) || !nonnegative(f.arrival_epoch_ms) || !f.request_id) || !positive(retryMs) || !positive(requestMs)
   let bad = diagnostics?.some(d => d.complete) === true || (observed.length > 0 && matches.length === 0) || (stateRead(before) && stateRead(after) && before !== after)
@@ -941,16 +1048,46 @@ export function membershipFaultRows(kind: string, key: string, stub: any[] | und
 export function membershipRepairVerdict(clearAt: number, diagnostics: ScanDiagnostic[] | undefined, attemptMs: number, retryMaxMs: number): Result {
   const completed = diagnostics?.filter(d => d.complete && d.at >= clearAt) ?? []
   const last = diagnostics?.filter(d => !d.complete && d.at <= clearAt).at(-1)
-  const done = completed[0], scanStart = done ? done.deadline - attemptMs : NaN
+  const done = completed[0]
+  // A refused page (access: missing_scope; authentication: invalid_auth) is
+  // published once its attempt has ended, so no deadline remains. Attempts
+  // after a refusal revalidate by reconnecting, whose status republication
+  // drops deadline_at, so a complete line without one starts at that
+  // attempt's own publication, never before the refusal's next_attempt_at.
+  const refused = !!last && ['access', 'authentication'].includes(last.reason) && !!last.slack && !finite(last.deadline) && nonnegative(last.next)
+  const attempt = refused && done && !finite(done.deadline)
+    ? diagnostics!.filter(d => !d.complete && d.reason === 'none' && d.at > clearAt && d.at >= last!.next && d.at <= done.at).at(-1) : undefined
+  const scanStart = !done ? NaN : finite(done.deadline) ? done.deadline - attemptMs : attempt ? attempt.at : NaN
   const scan = done ? done.at - scanStart : NaN, elapsed = done ? done.at - clearAt : NaN
   const remaining = last && nonnegative(last.deadline) ? Math.max(0, last.deadline - clearAt) : 0
   const retry = Math.max(retryMaxMs, last && nonnegative(last.retryAfter) ? last.retryAfter * 1000 : 0)
   const bound = remaining + retry + scan
   const missing = !last || !done || !nonnegative(clearAt) || !nonnegative(scan) || !nonnegative(elapsed)
-    || !nonnegative(last.deadline) || !positive(attemptMs) || !positive(retryMaxMs)
+    || (!refused && !nonnegative(last.deadline)) || !positive(attemptMs) || !positive(retryMaxMs)
   return result('membership-repair', done ? 1 : 0, { elapsed_ms: finite(elapsed) ? elapsed : 'missing',
     remaining_ms: remaining, retry_ms: retry, scan_ms: finite(scan) ? scan : 'missing' }, finite(bound) ? bound : 'missing',
     missing ? 'missing' : scan > attemptMs || remaining > attemptMs || elapsed > bound ? 'fail' : 'pass')
+}
+/** The before read follows the complete mark. Only own-post joins for threads
+ * absent from that read may be removed from after; existing joins (including
+ * changed/removed own posts), facts and attempt order retain exact reader bytes.
+ * Keep stateRead and the verdict's missing-evidence rules independent of this
+ * comparison. Non-JSONL inputs still compare exactly, as before. */
+function lateMembershipStateUnchanged(before: string | undefined, after: string | undefined): boolean {
+  if (before === undefined || after === undefined) return false
+  if (before === after) return true
+  try {
+    // Retain line endings: parsing identifies exclusions, never normalises state.
+    const lines = (text: string) => text.split(/(?<=\n)/).filter(line => line !== '')
+    const joinId = (row: any) => row.kind === 'join' && typeof row.channel === 'string'
+      && typeof row.root === 'string' && object(row.stamp)
+      ? JSON.stringify([row.channel, row.root, row.stamp.incarnation, row.stamp.threadHybridSince]) : undefined
+    const prior = new Set(lines(before).map(line => joinId(JSON.parse(line))).filter(id => id !== undefined))
+    return lines(after).filter(line => {
+      const row = JSON.parse(line), id = joinId(row)
+      return row.source !== 'own-post' || id === undefined || prior.has(id)
+    }).join('') === before
+  } catch { return false }
 }
 export function membershipLateVerdict(key: string, request: string, stub: any[] | undefined, completedMark: number,
   diagnostics: ScanDiagnostic[] | undefined, before: string | undefined, after: string | undefined): Result {
@@ -964,8 +1101,9 @@ export function membershipLateVerdict(key: string, request: string, stub: any[] 
     && settled[0].seq > completedMark && answered.length === 1 && answered[0].seq > completedMark
   const missing = !stub || !integer(completedMark) || faults.length !== 1 || !nonnegative(faults[0]?.arrival_mono_ms)
     || !(faults[0]?.seq <= completedMark) || !complete || !late || !stateRead(before) || !stateRead(after)
-  return result('membership-late', settled.length, { fired: faults.length, late_after_complete: late ? 'yes' : 'no', unchanged: before !== undefined && before === after ? 'yes' : 'no' }, 'unchanged',
-    changedCompleteness || settled.some(s => s.resolution === 'abort') ? 'fail' : missing ? 'missing' : before === after ? 'pass' : 'fail')
+  const unchanged = lateMembershipStateUnchanged(before, after)
+  return result('membership-late', settled.length, { fired: faults.length, late_after_complete: late ? 'yes' : 'no', unchanged: unchanged ? 'yes' : 'no' }, 'unchanged',
+    changedCompleteness || settled.some(s => s.resolution === 'abort') ? 'fail' : missing ? 'missing' : unchanged ? 'pass' : 'fail')
 }
 
 export function zeroAckVerdict(id: string, times: Times[] | undefined, start: number, end: number, probeExit: number,
@@ -1290,6 +1428,26 @@ export function faultLoadVerdicts(e: FaultLoadEvidence, counts: { roots: number;
   if (items.some(i => i.phase === 'held')) results.push(...postHoldOverlapVerdicts(rows, holds, ordinary, e.times))
   return results
 }
+/** fault-check's compaction window: Q's original burst, the items fault-burst
+ * observes, by their own acceptance stores. P's items and recovery replays never
+ * bound it. Pure. */
+export function faultWindow(e: FaultLoadEvidence): ServerWindow | undefined {
+  const accepted: Accepted[] = []
+  for (const i of e.plan.items.filter(i => i.key !== e.plan.key && i.phase !== 'dropped')) {
+    const found = acceptedFor(e.queues[i.key], i.channel, i.ts)
+    if (found.length !== 1) return undefined
+    accepted.push({ key: i.key, seq: found[0].seq })
+  }
+  return storeWindow(e.rows, accepted)
+}
+/** fault-check's personas that must rewrite inside Q's window: those with stored
+ * burst items there, Q always and P only when the plan has an independent
+ * accepted P item (never under `all`). A P whose every item is withheld has no
+ * Thread Memory change in the window, so its passes there correctly skip
+ * (answers28). Pure. */
+export function faultRewriters(plan: FaultPlan): string[] {
+  return plan.keys.filter(key => key !== plan.key || plan.items.some(i => i.key === key && !i.dependent && i.phase !== 'dropped'))
+}
 
 // CLI adapters. Errors never echo raw evidence, event text, credentials or exceptions.
 const pkg = () => resolve(process.env.CSCB_PKG_DIR ?? '/test-repo/node_modules/claude-slack-channel-bots')
@@ -1493,6 +1651,14 @@ async function additional(command: string, c: Context, args: string[]): Promise<
     const { percentile } = await import('./transcript-receipts.ts')
     return personaStoreVerdicts(complete ? measurements(file, numeric(mark)) : undefined, accepted, keys, percentile)
   }
+  if (command === 'driver-cpu') {
+    countArgs(args, 2)
+    const [pid, record] = args, text = textFile(record)
+    if (!/^\d+$/.test(pid)) throw new Error('usage')
+    const runs = text === undefined || !text.endsWith('\n') ? undefined : text.slice(0, -1).split('\n').map(line => cgroupPathOf(`0::${line}`))
+    const server = procCgroup(Number(pid))
+    return [driverCpuVerdict(server, runs, cgroupFile, cgroupWriteAccess(guardedCgroups(server, runs), probeCgroupFile))]
+  }
   if (command === 'lookup-faults') {
     countArgs(args, 3)
     return lookupFaultVerdicts(tsv(args[0], ['key', 'method', 'outcome', 'match', 'envelope_id']), evidenceRows(args[1]), timingRows(args[2]))
@@ -1513,10 +1679,11 @@ async function additional(command: string, c: Context, args: string[]): Promise<
   }
 }
 /** The verdicts' measurement rows. The server's diagnostic kinds feed only
- * `observe` (SR8_DIAGNOSTIC_KINDS); any other unknown kind is still invalid. */
+ * `observe` (SR8_DIAGNOSTIC_KINDS); `thread-compaction` feeds only the compaction
+ * proof, which checks its own fields; any other unknown kind is still invalid. */
 function measurements(path: string, offset: number): Measurement[] | undefined {
   const rows = jsonl(path, offset, true)?.filter(r => !SR8_DIAGNOSTIC_KINDS.includes(r?.kind))
-  return rows?.every(r => r.v === 1 && ['store', 'resolution-store', 'post-hold-resolved'].includes(r.kind)
+  return rows?.every(r => r.v === 1 && ['store', 'resolution-store', 'post-hold-resolved', 'thread-compaction'].includes(r.kind)
     && typeof r.key === 'string' && nonnegative(r.at_mono_ms)) ? rows : undefined
 }
 function context(args: string[]): Context {
@@ -1660,9 +1827,10 @@ async function faultBurst(c: Context, args: string[]): Promise<number> {
   const observe = () => {
     const first = observed()
     if (!first?.pushes.length || first.acked.size >= qIdentities.size) return
-    const stats = plan.keys.flatMap(key => ['queue', 'threads'].map(kind => {
-      try { const st = statSync(join(stateDir, kind, `${key}.jsonl`)); return { key, kind, id: `${st.dev}:${st.ino}` } } catch { return { key, kind, id: '' } }
-    }))
+    // Queue journals only: Thread Memory compactions are proved by their measurement entries.
+    const stats = plan.keys.map(key => {
+      try { const st = statSync(join(stateDir, 'queue', `${key}.jsonl`)); return { key, kind: 'queue', id: `${st.dev}:${st.ino}` } } catch { return { key, kind: 'queue', id: '' } }
+    })
     const after = observed()
     if (!after || after.acked.size >= qIdentities.size) return
     for (const s of stats) {
@@ -1870,15 +2038,16 @@ async function faultCommands(command: string, c: Context, args: string[]): Promi
   const [, stub, clearMark, clearAt, measurement, mark, start, ready] = args, p = await population(), { percentile } = await import('./transcript-receipts.ts')
   const queues = Object.fromEntries(plan.keys.map(key => [key, evidenceRows(join(dir, `${key}.queue.jsonl`))]))
   const duringQueues = Object.fromEntries(plan.keys.map(key => [key, evidenceRows(join(dir, 'during', `${key}.queue.jsonl`))]))
-  const rows = faultLoadVerdicts({ plan, ledger, stub: evidenceRows(stub), during: timingRows(join(dir, 'during-times.jsonl')), times: timingRows(join(dir, 'times.jsonl')),
-    queues, duringQueues, rows: measurements(measurement, numeric(mark)), clearMark: numeric(clearMark), clearAt: numeric(clearAt) },
-    { roots: p.SR8_BURST_JOINS, replies: p.SR8_BURST_REPLIES, dropped: p.SR8_BURST_DROPPED }, Number(printer('THREAD_REPLY_HOLD_MS')), percentile)
+  const e: FaultLoadEvidence = { plan, ledger, stub: evidenceRows(stub), during: timingRows(join(dir, 'during-times.jsonl')), times: timingRows(join(dir, 'times.jsonl')),
+    queues, duringQueues, rows: measurements(measurement, numeric(mark)), clearMark: numeric(clearMark), clearAt: numeric(clearAt) }
+  const rows = faultLoadVerdicts(e, { roots: p.SR8_BURST_JOINS, replies: p.SR8_BURST_REPLIES, dropped: p.SR8_BURST_DROPPED }, Number(printer('THREAD_REPLY_HOLD_MS')), percentile)
   for (const key of plan.keys) {
     const expected = p.populationJoins(key, c.population, await channels()), added = plan.items.filter(i => i.key === key && i.phase === 'roots').map(i => ({ channel: i.channel, root: i.ts }))
     const r = joinsVerdict(evidenceRows(join(dir, `${key}.before.jsonl`)), evidenceRows(join(dir, `${key}.after.jsonl`)), expected, added, 1)
     r.stats.persona = key; rows.push(r)
   }
-  rows.push(startupVerdict(numeric(start), numeric(ready), c.population * c.recipients), compactionVerdict(evidenceRows(join(dir, 'compactions.jsonl')), plan.keys, c.population === 100_000))
+  rows.push(startupVerdict(numeric(start), numeric(ready), c.population * c.recipients),
+    compactionVerdict(evidenceRows(join(dir, 'compactions.jsonl')), e.rows, faultWindow(e), plan.keys, c.population === 100_000, faultRewriters(plan)))
   return printResults(c, rows)
 }
 
@@ -1923,9 +2092,10 @@ async function burst(c: Context, args: string[]): Promise<number> {
   const observe = () => {
     const first = observed()
     if (!first?.pushes.length || first.acked.size >= expectedCount) return
-    const stats = keys.flatMap(key => ['queue', 'threads'].map(kind => {
-      try { const st = statSync(join(stateDir, kind, `${key}.jsonl`)); return { key, kind, id: `${st.dev}:${st.ino}` } } catch { return { key, kind, id: '' } }
-    }))
+    // Queue journals only: Thread Memory compactions are proved by their measurement entries.
+    const stats = keys.map(key => {
+      try { const st = statSync(join(stateDir, 'queue', `${key}.jsonl`)); return { key, kind: 'queue', id: `${st.dev}:${st.ino}` } } catch { return { key, kind: 'queue', id: '' } }
+    })
     const after = observed()
     if (!after || after.acked.size >= expectedCount) return
     for (const s of stats) {
@@ -1939,13 +2109,14 @@ async function burst(c: Context, args: string[]): Promise<number> {
   }
   let failed = false
   const cpuFile = process.env.SR8_PHASE_CPU_FILE, cpuPids = phasePids(process.env.SR8_PHASE_CPU_PIDS, process.pid)
+  const cpuCgroup = phaseCgroup(cpuPids)
   // test-44's opt-in CPU profile cuts one part per wave at these marks (cpu-profile.ts).
   const profileDir = process.env.SR8_PROFILE_DIR
   const phaseCpu = (phase: string) => {
     if (profileDir) try { appendFileSync(join(profileDir, 'waves'), `${phase}\n`, { mode: 0o600 }) } catch { /* never changes the burst */ }
     if (!cpuFile) return
     try {
-      const sample = phaseCpuSample(phase, performance.now(), cgroupCpuStat(), cpuPids.map(([name, pid]) => [name, textFile(`/proc/${pid}/stat`)]))
+      const sample = phaseCpuSample(phase, performance.now(), cgroupCpuStat(cpuCgroup), cpuPids.map(([name, pid]) => [name, textFile(`/proc/${pid}/stat`)]))
       appendFileSync(cpuFile, JSON.stringify(sample) + '\n', { mode: 0o600 })
     } catch { /* an observation never changes the burst */ }
   }
@@ -2021,7 +2192,7 @@ async function check(c: Context, args: string[]): Promise<Result[]> {
   const store = storeVerdict(complete ? rows : undefined, accepted, percentile)
   const results = [ackAccepted, ackDropped, store, postHoldVerdict(rows, holds, Number(printer('THREAD_REPLY_HOLD_MS'))),
     startupVerdict(Number(start), Number(ready), c.population * c.recipients), ...joins,
-    compactionVerdict(jsonl(join(dir, 'compactions.jsonl')), keys, c.population === 100_000)]
+    compactionVerdict(jsonl(join(dir, 'compactions.jsonl')), rows, storeWindow(complete ? rows : undefined, accepted), keys, c.population === 100_000)]
   if (items?.some(i => i.phase === 'held')) results.push(...postHoldOverlapVerdicts(rows, holds, ordinary, times))
   if (Number(required) > 0) results.push(n2Verdict(n2File && textFile(n2File) !== undefined ? n2Samples(textFile(n2File)!) : undefined, Number(required)))
   return results
@@ -2082,6 +2253,98 @@ export function cpuConditionFields(cpuMax: string | undefined, before: string | 
   return `cpu_max=${max ? `${max[1]}/${max[2]}` : 'unknown'} nr_periods_delta=${delta(t => t.periods)} nr_throttled_delta=${delta(t => t.throttled)} throttled_usec_delta=${delta(t => t.throttledUsec)}`
 }
 
+/** The measured server's CPU quota, in CPUs: a shard's `CPUS_PER_SHARD` (scripts/ci-run.ts), which the driver's own CPU leaves unchanged. */
+export const SR8_SERVER_CPUS = 2
+/** A cgroup v2 path from `/proc/<pid>/cgroup`'s `0::` line, below the namespace root; undefined when absent or not a plain path. Pure. */
+export function cgroupPathOf(text: string | undefined): string | undefined {
+  const path = text?.match(/^0::(.*)$/m)?.[1]
+  return path !== undefined && /^\/(?:[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*)?$/.test(path)
+    && !path.split('/').some(s => s === '.' || s === '..') ? path : undefined
+}
+/** A cgroup path and its ancestors, the namespace root first. Pure. */
+export function cgroupChain(path: string): string[] {
+  return path === '/' ? ['/'] : path.split('/').map((_, i, parts) => parts.slice(0, i + 1).join('/') || '/')
+}
+/** A cpu.max as CPUs: quota ÷ period, Infinity for `max`; undefined when unreadable or malformed. Pure. */
+export function cpuMaxCpus(text: string | undefined): number | undefined {
+  const m = text?.trim().match(/^(max|\d+) (\d+)$/)
+  return !m || Number(m[2]) === 0 ? undefined : m[1] === 'max' ? Infinity : Number(m[1]) / Number(m[2])
+}
+/** Reads one file of the cgroup at a path below the namespace root. */
+export type CgroupRead = (path: string, file: string) => string | undefined
+/** The cgroup files that move a process or change a CPU, memory or PID limit. */
+export const SR8_GUARDED_CGROUP_FILES: readonly string[] = ['cgroup.procs', 'cgroup.threads', 'cgroup.subtree_control', 'cgroup.type',
+  'cpu.max', 'cpu.max.burst', 'cpu.weight', 'cpu.idle', 'memory.max', 'memory.high', 'memory.swap.max', 'pids.max']
+/** One guarded file's write-only open: it opened (writable), the kernel refused it, the file is absent, or it failed for another reason (no evidence). */
+export type CgroupOpenOutcome = 'writable' | 'refused' | 'absent' | 'error'
+/** A failed write-only open's outcome by its error code: EACCES, EPERM and EROFS are refusals, ENOENT an absent file, anything else no evidence. Pure. */
+export function cgroupOpenFailure(code: string | undefined): CgroupOpenOutcome {
+  return code === 'EACCES' || code === 'EPERM' || code === 'EROFS' ? 'refused' : code === 'ENOENT' ? 'absent' : 'error'
+}
+/** Of the guarded files on some cgroups: how many are present, how many the checking process could open to write, and how many it could not probe. */
+export interface CgroupWriteAccess { checked: number; writable: number; unknown: number }
+/** Tallies every guarded file on these cgroups by its probe's outcome; absent files are not counted. Pure given `probe`. */
+export function cgroupWriteAccess(paths: string[], probe: (path: string, file: string) => CgroupOpenOutcome): CgroupWriteAccess {
+  const access = { checked: 0, writable: 0, unknown: 0 }
+  for (const path of paths) for (const file of SR8_GUARDED_CGROUP_FILES) {
+    const outcome = probe(path, file)
+    if (outcome === 'absent') continue
+    access.checked++
+    if (outcome === 'writable') access.writable++
+    if (outcome === 'error') access.unknown++
+  }
+  return access
+}
+/**
+ * driver-cpu, the control that the burst driver's CPU no longer counts
+ * against the measured server's quota. It checks placement, configured
+ * quotas and permissions, not throttling: a pass does not rule out the
+ * container's own quota throttling the server's group. A cgroup's CPUs are
+ * the smallest cpu.max on its path. The server's must be `SR8_SERVER_CPUS`;
+ * each recorded driver run's must be finite; and every cgroup holding both
+ * (their common ancestors, the server's own when they share it) must allow
+ * the server's CPUs plus the driver's. The server's UID, checking from the
+ * server's group, must be able to open none of the guarded files on either
+ * path for writing, so it can neither move a process nor change a limit.
+ * Any other placement, an unreadable path or cpu.max, a writable guarded
+ * file, one it could not probe, none checked, or no recorded run is missing.
+ * Usage is each cgroup's cumulative cpu.stat `usage_usec`, in ms. Pure.
+ */
+export function driverCpuVerdict(server: string | undefined, drivers: (string | undefined)[] | undefined, read: CgroupRead, access: CgroupWriteAccess | undefined): Result {
+  const limit = (path: string) => cpuMaxCpus(read(path, 'cpu.max'))
+  const cpusOf = (path: string | undefined) => {
+    const chain = path === undefined ? [] : cgroupChain(path).map(limit)
+    return chain.length && chain.every(c => c !== undefined) ? Math.min(...chain as number[]) : undefined
+  }
+  const shared = (driver: string | undefined) => server === undefined || driver === undefined ? undefined
+    : cgroupChain(server).filter(path => cgroupChain(driver).includes(path)).map(limit)
+  const fits = (driver: string | undefined) => {
+    const serverCpus = cpusOf(server), driverCpus = cpusOf(driver), common = shared(driver)
+    return serverCpus === SR8_SERVER_CPUS && driverCpus !== undefined && Number.isFinite(driverCpus)
+      && !!common?.every(c => c !== undefined && c >= serverCpus + driverCpus)
+  }
+  const shown = (path: string | undefined) => path ?? 'unknown'
+  const cpus = (n: number | undefined) => n === undefined ? 'unknown' : Number.isFinite(n) ? round3(n) : 'max'
+  const cpuMax = (path: string | undefined) => {
+    const m = path === undefined ? undefined : read(path, 'cpu.max')?.trim().match(/^(max|\d+) (\d+)$/)
+    return m ? `${m[1]}/${m[2]}` : 'unknown'
+  }
+  const usage = (path: string | undefined) => {
+    const used = path === undefined ? undefined : cgroupCpuCounters(read(path, 'cpu.stat'))?.usage_usec
+    return used === undefined ? 'unknown' : round3(used / 1000)
+  }
+  const driver = drivers?.[0], common = shared(driver)
+  return result('driver-cpu', drivers?.length ?? 0, { server_cgroup: shown(server), server_cpu_max: cpuMax(server), server_cpus: cpus(cpusOf(server)),
+    server_usage_ms: usage(server), driver_cgroup: shown(driver), driver_cpu_max: cpuMax(driver), driver_cpus: cpus(cpusOf(driver)),
+    driver_usage_ms: usage(driver), shared_cpus: common === undefined ? 'unknown' : !common.length ? 'none' : cpus(common.some(c => c === undefined) ? undefined : Math.min(...common as number[])),
+    guarded_files: access?.checked ?? 'unknown', writable_files: access?.writable ?? 'unknown', unprobed_files: access?.unknown ?? 'unknown' },
+  SR8_SERVER_CPUS, drivers?.length && drivers.every(fits) && !!access?.checked && access.writable === 0 && access.unknown === 0 ? 'pass' : 'missing')
+}
+/** The cgroups driver-cpu checks permissions on: every cgroup on the server's and the drivers' paths, once each, root first. Pure. */
+export function guardedCgroups(server: string | undefined, drivers: (string | undefined)[] | undefined): string[] {
+  return [...new Set([server, ...drivers ?? []].flatMap(path => path === undefined ? [] : cgroupChain(path)))]
+}
+
 /** The cgroup's cpu.stat counters: v2 usage/user/system microseconds, and the
  * throttling counters through cpuThrottle (v1 has no usage here). Pure. */
 export function cgroupCpuCounters(text: string | undefined): Record<string, number> | undefined {
@@ -2108,6 +2371,11 @@ export function phasePids(spec: string | undefined, self: number): [string, numb
   const named = (spec ?? '').split(',').map(s => s.match(/^([a-z]+)=(\d+)$/)).filter(m => m !== null && m[1] !== 'observer')
     .map(m => [m![1], Number(m![2])] as [string, number])
   return [...named, ['observer', self]]
+}
+/** The cgroup a phase sample reads: the named server's, whose CPU quota the burst loads; else the namespace root. */
+function phaseCgroup(pids: [string, number][]): string {
+  const server = pids.find(([name]) => name === 'server')
+  return server ? cgroupOfPid(server[1]) : '/'
 }
 export interface PhaseCpuSample { phase: string; mono_ms: number; cgroup: Record<string, number> | null; procs: Record<string, { utime: number; stime: number } | null> }
 /** One boundary reading: the phase starting here, or `end`. Pure. */
@@ -2298,16 +2566,40 @@ async function observe(args: string[]): Promise<Result[]> {
   return observeResults({ rows: integer(numeric(mark)) ? jsonl(file, Number(mark), true) : undefined, items: records(items) ? items : undefined,
     times: timingRows(join(dir, 'times.jsonl')), cpu: cpu?.every(phaseCpuRow) ? cpu : undefined }, percentile)
 }
-function cgroupCpuMax() {
-  const v2 = textFile('/sys/fs/cgroup/cpu.max')
-  if (v2 !== undefined) return v2
+/** The cgroup v2 namespace root's mount. */
+const CGROUP_ROOT = '/sys/fs/cgroup'
+/** A cgroup v2 file of the cgroup at `path` below the namespace root. */
+const cgroupFile = (path: string, file: string) => textFile(join(CGROUP_ROOT, path, file))
+/**
+ * One guarded file's probe by this process: a write-only open, the kernel's
+ * write-permission check, closed with nothing written. No create or truncate
+ * flag; O_NONBLOCK and O_NOFOLLOW turn a FIFO or a link, which no cgroup file
+ * is, into an error rather than a wait or a followed path.
+ */
+function probeCgroupFile(path: string, file: string): CgroupOpenOutcome {
+  try {
+    closeSync(openSync(join(CGROUP_ROOT, path, file), fsConstants.O_WRONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW))
+    return 'writable'
+  } catch (error) {
+    return cgroupOpenFailure((error as NodeJS.ErrnoException).code)
+  }
+}
+/** A process's cgroup v2 path; undefined when unreadable (cgroup v1, or a gone process). */
+const procCgroup = (pid: number | 'self') => cgroupPathOf(textFile(`/proc/${pid}/cgroup`))
+/** A process's cgroup v2 path, else the namespace root. */
+const cgroupOfPid = (pid: number | 'self') => procCgroup(pid) ?? '/'
+/** cpu.max of the cgroup at `path`; at the root, cgroup v1's quota and period. */
+function cgroupCpuMax(path: string) {
+  const v2 = cgroupFile(path, 'cpu.max')
+  if (v2 !== undefined || path !== '/') return v2
   const quota = textFile('/sys/fs/cgroup/cpu/cpu.cfs_quota_us')?.trim(), period = textFile('/sys/fs/cgroup/cpu/cpu.cfs_period_us')?.trim()
   return quota === undefined || period === undefined ? undefined : `${quota === '-1' ? 'max' : quota} ${period}`
 }
-const cgroupCpuStat = () => textFile('/sys/fs/cgroup/cpu.stat') ?? textFile('/sys/fs/cgroup/cpu/cpu.stat')
+const cgroupCpuStat = (path: string) => cgroupFile(path, 'cpu.stat') ?? (path === '/' ? textFile('/sys/fs/cgroup/cpu/cpu.stat') : undefined)
+/** The case's mark: this process's cgroup, the measured server's (the burst driver alone runs elsewhere). */
 function cpuMark(args: string[]) {
   countArgs(args, 1)
-  const stat = cgroupCpuStat()
+  const stat = cgroupCpuStat(cgroupOfPid('self'))
   writeFileSync(args[0], cpuThrottle(stat) ? stat! : '', { flag: 'wx' })
 }
 function conditions(args: string[]) {
@@ -2317,7 +2609,8 @@ function conditions(args: string[]) {
   const memory = textFile('/sys/fs/cgroup/memory.max')?.trim() ?? textFile('/sys/fs/cgroup/memory/memory.limit_in_bytes')?.trim() ?? 'unknown'
   const mount = (textFile('/proc/self/mountinfo') ?? '').split('\n').map(l => l.split(' ')).filter(s => s[4] && (resolve(state) === s[4] || resolve(state).startsWith(s[4].replace(/\/$/, '') + '/'))).sort((a, b) => b[4].length - a[4].length)[0]?.[4] ?? 'unknown'
   const peak = textFile(`/proc/${pid}/status`)?.match(/^VmHWM:\s+(\d+) kB$/m)?.[1] ?? 'unknown'
-  const cpu = mark === undefined ? '' : ` ${cpuConditionFields(cgroupCpuMax(), textFile(mark), cgroupCpuStat())}`
+  const server = cgroupOfPid(Number(pid))
+  const cpu = mark === undefined ? '' : ` ${cpuConditionFields(cgroupCpuMax(server), textFile(mark), cgroupCpuStat(server))}`
   console.log(`recorded: sr8 conditions bun=${Bun.version} cpus=${cpus().length} memory_limit=${memory} fs_type=${statfsSync(state).type} state_dir_mount=${mount} peak_rss_kib=${peak}${cpu}`)
 }
 async function main(args: string[]): Promise<number> {

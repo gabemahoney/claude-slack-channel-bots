@@ -495,9 +495,10 @@ export const check28: CheckDef<CheckContext> = {
     const p6 = await waitPending(ctx)
     if (f.expect(p6 !== null, 'step 6: config.json.pending is missing after the reboot')) {
       f.expect((p6!.preview[0] ?? '').includes(countsText({ removed: 1 })), "step 6: the counts are not 1 removed (B's change still pending?)")
+      f.expect((p6!.preview[0] ?? '').includes('0 with changed credentials'), 'step 6: the counts are not 0 with changed credentials')
+      f.expect(!p6!.preview.some((line) => line.startsWith('persona "persona_b" (key=persona_b): credentials file "')), "step 6: B's credentials change is still pending")
       f.expect(p6!.preview.includes(destructiveC), "step 6: C's DESTRUCTIVE line is missing")
     }
-    f.expect((await lines(ctx, 'grep -c persona_b "$S/config.json.pending"'))[0] === '0', 'step 6: the pending file names persona_b')
     f.expect((await sinceGrep(ctx, bmark, '[slack] reload-preview: DESTRUCTIVE:')).length === 1, 'step 6: the DESTRUCTIVE preview was not logged exactly once since the reboot')
     f.expect(!(await recorded(ctx)), 'step 6: config.json matches the record')
     const recNames = await lines(ctx, `jq -r '.applied.personas[].name' "$S/config.json.last-applied"`)

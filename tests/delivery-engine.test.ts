@@ -17,14 +17,17 @@ import { KILL_RETRY_TRIES } from '../src/kill-retry.ts'
 import { UNAVAILABLE_RETRY_MODE_PENDING_ONLY, UNAVAILABLE_RETRY_RUN_NOW_ARMED, UNAVAILABLE_RETRY_RUN_NOW_CLOSED, UNAVAILABLE_RETRY_RUN_NOW_RAN, UNAVAILABLE_RETRY_RUN_NOW_RUNNING, UNAVAILABLE_RETRY_STOP_ROW_LIVE, type UnavailableRetryController, type UnavailableRetryRunNowResult } from '../src/unavailable-retry.ts'
 import { cannedPermissionRequest, errCallTimeout, errConfigMalformed, errDialogMaybeOpen, errInstanceIdCollision, errInternal, errInvalidFlags, errPaneChanged, errRelayFallenBack, errSendKeysWhileRelayed, errSpawnNotFound, errSpawnNotInteractive, errSystemInstallDisappeared, errTmuxNotAvailable, errTmuxSendKeys, errTmuxSessionConflict, errTmuxUnresponsive, errUnusableName } from './test-helpers/agent-director-stub.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
-import { heldSlackInput, HOLD_FIELDS, memoryHold, injectedInput, makeQueue, postHold, readQueue, seedQueue, slackInput, unknownRootPostHold } from './test-helpers/delivery-queue.ts'
-import type { AcceptedRecord, HoldField, HoldOutcome, QueueRecord } from '../src/delivery-queue.ts'
+import { partialReceiptText, partialReceiptSuffix } from './test-helpers/partial-receipt.ts'
+import { heldSlackInput, HOLD_FIELDS, memoryHold, injectedInput, makeQueue, postHold, reactionInput, readQueue, seedQueue, slackInput, unknownRootPostHold } from './test-helpers/delivery-queue.ts'
+import type { AcceptedRecord, HoldField, HoldOutcome, QueueRecord, ReactionAcceptedInput } from '../src/delivery-queue.ts'
+import { createDeliveryPolicyState, createDeliveryReading, decideEngine, decideGate, NO_DELIVERY_PAIR, selectDeliveryTarget, type DeliveryPair, type DeliveryPolicyKnowledge } from '../src/delivery-policy.ts'
 import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
 import { THREAD_CHANNELS, THREAD_ROOTS } from './test-helpers/thread-memory.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { makeRecoveryHarness, personaOf, personaRow, retryNow } from './test-helpers/recovery-harness.ts'
 import { balancedAfter, onlyCallArguments, stripComments } from './test-helpers/source-audit.ts'
 import { appendTranscript, codexPromptEntry, endedTurn, promptEntry, queueOperationEntry, replyEntry, writeTranscript } from './test-helpers/working-row-panes.ts'
+import { spyOnCopies } from './test-helpers/copies.ts'
 
 const harnesses: EngineHarness[] = []
 afterEach(async () => { for (const h of harnesses.splice(0).reverse()) await h.cleanup() })
@@ -42,28 +45,57 @@ async function hold(h: EngineHarness, ts: string = THREAD_ROOTS.secondary, key =
 test.each([16, 64])('wakes over a growing %i-item queue clone at most the newly accepted item', async count => {
   const h = await harness()
   h.p().up = false
-  const clone = globalThis.structuredClone
-  const cloning = spyOn(globalThis, 'structuredClone').mockImplementation(value => clone(value))
+  const copies = spyOnCopies()
   let reads = 0
   try {
     for (let i = 0; i < count; i++) {
       expect((await h.queue.accept('alpha', injectedInput({ text: `queued ${i}` }))).status).toBe('accepted')
-      cloning.mockClear()
+      copies.clear()
       h.engine.wake('alpha')
       await h.tick()
       expect(h.engine.status('alpha')).toMatchObject({ seq: 1, count: i + 1, up: false })
-      reads += cloning.mock.calls.length
+      reads += copies.values.length
     }
     expect(reads).toBeLessThanOrEqual(count)
-    cloning.mockClear()
+    copies.clear()
     await h.tick()
     expect(h.engine.status('alpha')).toMatchObject({ seq: 1, count, up: false })
-    expect(cloning).not.toHaveBeenCalled()
-  } finally { cloning.mockRestore() }
+    expect(copies.values).toHaveLength(0)
+  } finally { copies.restore() }
   expect(h.calls).toEqual([])
   expect(h.queue.openCount('alpha')).toBe(count)
   expect(h.errors).toEqual([])
   assertNoLeak([h.events, h.calls, h.errors, h.records()])
+})
+
+test.each([64, 512])('receipt observations do not revisit the %i-item queue behind a pending head', async count => {
+  const h = await harness()
+  h.p().row.state = 'pending'
+  for (let n = 0; n < count; n++) await h.accept(`queued ${n}`)
+  let visits = 0
+  const items = h.queue.items.bind(h.queue)
+  const reads = spyOn(h.queue, 'items').mockImplementation(key => new Proxy(items(key), {
+    get(target, property, receiver) {
+      if (typeof property === 'string' && /^\d+$/.test(property)) visits++
+      return Reflect.get(target, property, receiver)
+    },
+  }))
+  try {
+    await h.tick() // Initial indexes may read the existing queue once.
+    visits = 0
+    reads.mockClear()
+    for (let n = 0; n < 4; n++) {
+      await h.accept(`later ${n}`)
+      await h.advance(DELIVERY_ROW_POLL_MS)
+    }
+    expect(h.calls.filter(c => c.verb === 'get').length).toBeGreaterThanOrEqual(4)
+    expect(h.engine.snapshot('alpha')?.r.row).toBe('pending')
+    expect(h.queue.openCount('alpha')).toBe(count + 4)
+    expect(h.keyCalls()).toEqual([])
+    expect(h.errors).toEqual([])
+    expect(visits).toBe(0)
+    expect(reads).not.toHaveBeenCalled()
+  } finally { reads.mockRestore() }
 })
 
 test.each([16, 64])('engine summaries visit only changed items over %i growing acceptances and unchanged wakes', async count => {
@@ -182,7 +214,7 @@ describe('queue summaries across executor retirement', () => {
         expect(h.engine.running('alpha')).toBe(false)
         expect(h.engine.status('alpha')).toBeUndefined()
         expect(h.clock.pendingCount()).toBe(0)
-        counter.take() // Receipt observation deliberately reads the full queue.
+        counter.take() // Each fresh executor initializes its receipt index.
       }
       expect(h.queue.items('alpha')).toHaveLength(17)
       expect(h.events.flatMap(e => e.type === 'item-delivered' ? [e.seq] : [])).toEqual(Array.from({ length: 17 }, (_, n) => n + 1))
@@ -222,7 +254,7 @@ describe('queue summaries across executor retirement', () => {
       h.p().up = false
       await h.tick()
       expect(counter.take()).toBe(0)
-      expect(h.engine.snapshot('alpha')?.p).toEqual({ accepted: [3], fixed: [3], sent: [], refused: [], delivered: [] })
+      expect(h.engine.snapshot('alpha')?.p).toEqual({ accepted: [3], fixed: [3], sent: [], refused: [], delivered: [] , withdrawn: [] })
       expect(h.engine.snapshot('alpha')?.e.noticed).toEqual([3])
       expect(h.engine.snapshot('alpha')?.holds).toEqual([])
       expect(h.engine.status('alpha')).toMatchObject({ seq: 3, count: 1 })
@@ -282,7 +314,7 @@ test('incremental policy inputs preserve ordered sends, refusal positions, unkno
   const send = (item: number, part: number, attempt: number, how = 'text') => ({ item, part, attempt, how, offset: 0 })
   await h.tick()
   const first = h.engine.snapshot('alpha')!
-  expect(first.p).toEqual({ accepted: [1, 2, 3, 4], fixed: [2, 3], sent: [send(2, 1, 1), send(2, 1, 2, 'unknown'), send(3, 1, 1)], refused: [1, 3], delivered: [] })
+  expect(first.p).toEqual({ accepted: [1, 2, 3, 4], fixed: [2, 3], sent: [send(2, 1, 1), send(2, 1, 2, 'unknown'), send(3, 1, 1)], refused: [1, 3], delivered: [] , withdrawn: [] })
   expect(first.parts).toEqual({ 1: 1, 2: 2, 3: 1, 4: 1 })
   expect(first.holds).toEqual([{ item: 1, kind: 'memory' }, { item: 4, kind: 'post' }])
   expect(first.e.noticed).toEqual([2, 3])
@@ -292,16 +324,16 @@ test('incremental policy inputs preserve ordered sends, refusal positions, unkno
   await append({ v: 1, kind: 'delivered', seq: 2, part: 1, at: h.clock.now(), receipt: { path: h.p().path, offset: 1 } })
   await append(sent(2, 3, 2))
   await h.tick()
-  expect(h.engine.snapshot('alpha')?.p).toEqual({ accepted: [1, 2, 3, 4], fixed: [2, 3], sent: [send(2, 1, 1), send(2, 2, 2, 'unknown'), send(2, 2, 3), send(3, 1, 1)], refused: [1, 4], delivered: [[2, 1]] })
+  expect(h.engine.snapshot('alpha')?.p).toEqual({ accepted: [1, 2, 3, 4], fixed: [2, 3], sent: [send(2, 1, 1), send(2, 2, 2, 'unknown'), send(2, 2, 3), send(3, 1, 1)], refused: [1, 4], delivered: [[2, 1]] , withdrawn: [] })
   expect(first.p.sent).toEqual([send(2, 1, 1), send(2, 1, 2, 'unknown'), send(3, 1, 1)])
   await h.queue.resolveHolds('alpha', [{ seq: 1, outcome: 'released', at: h.clock.now() }, { seq: 4, outcome: 'parked', at: h.clock.now() }])
   await h.queue.compact('alpha'); await h.tick()
   const compacted = h.engine.snapshot('alpha')!
-  expect(compacted.p).toEqual({ accepted: [1, 2, 3, 4], fixed: [2, 3], sent: [send(2, 2, 2, 'unknown'), send(2, 2, 3)], refused: [], delivered: [[2, 1]] })
+  expect(compacted.p).toEqual({ accepted: [1, 2, 3, 4], fixed: [2, 3], sent: [send(2, 2, 2, 'unknown'), send(2, 2, 3)], refused: [], delivered: [[2, 1]] , withdrawn: [] })
   expect(compacted.holds).toEqual([{ item: 4, kind: 'memory' }])
   expect(compacted.e.noticed).toEqual([2, 3])
   expect(h.engine.status('alpha')).toMatchObject({ seq: 1, count: 3 })
-  expect(h.engine.snapshot('beta')?.p).toEqual({ accepted: [1], fixed: [1], sent: [], refused: [], delivered: [] })
+  expect(h.engine.snapshot('beta')?.p).toEqual({ accepted: [1], fixed: [1], sent: [], refused: [], delivered: [] , withdrawn: [] })
   await h.restartServer(); await h.tick()
   expect(h.engine.snapshot('alpha')?.p).toEqual(compacted.p)
   expect(h.engine.snapshot('alpha')?.holds).toEqual(compacted.holds)
@@ -1476,6 +1508,112 @@ describe('durable FIFO and send sequence', () => {
 
 describe('fresh send guards', () => {
 
+  test.each(['prior session', 'late current path'] as const)(
+    'b.x4j server replay never promotes a pre-send fragment from %s', async location => {
+      const h = await harness(), p = h.p(), prior = join(h.root, 'prior.jsonl')
+      p.autoReceipt = false
+      p.row.launch_started_at = new Date(h.clock.now()).toISOString()
+      const oldPath = location === 'prior session' ? prior : p.path
+      writeTranscript(oldPath, [{ ...promptEntry(partialReceiptSuffix),
+        sessionId: location === 'prior session' ? 'prior-session' : p.row.session_id,
+        timestamp: new Date(h.clock.now() - 1).toISOString() }])
+      if (location === 'prior session') p.row.prior_sessions = [{ jsonl_path: prior, session_id: 'prior-session' }]
+      else { p.row.jsonl_path = ''; p.row.transcript_status = 'never_written' }
+      await h.accept(partialReceiptText)
+      await h.tick(); await h.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+      expect(h.engine.status('alpha')?.partialReceipt).toBeUndefined()
+      expect(h.events.filter(event => event.type === 'partial-receipt')).toEqual([])
+
+      await h.restartServer()
+      p.row.jsonl_path = p.path; p.row.transcript_status = 'present'
+      await h.tick(); await h.advance(DELIVERY_ROW_POLL_MS)
+      expect(h.engine.status('alpha')).toBeDefined()
+      expect(h.engine.status('alpha')?.partialReceipt).toBeUndefined()
+      expect(h.events.filter(event => event.type === 'partial-receipt')).toEqual([])
+      expect(h.queue.openCount('alpha')).toBe(1)
+      expect(h.queue.items('alpha')[0]).toMatchObject({ accepted: { text: partialReceiptText }, fixed: { parts: [partialReceiptText] } })
+      expect(h.records().filter(record => record.kind === 'delivered')).toEqual([])
+      // Replay retains the existing recovery Enter for the uncertain attempt.
+      const replayKeys = h.keyCalls()
+      expect(replayKeys.map(call => call.params.key ?? call.params.text)).toEqual([partialReceiptText, 'Enter', 'Enter'])
+
+      appendTranscript(p.path, [{ ...promptEntry(partialReceiptSuffix), sessionId: p.row.session_id,
+        timestamp: new Date(h.clock.now()).toISOString() }])
+      await h.advance(DELIVERY_ROW_POLL_MS)
+      expect(h.events.filter(event => event.type === 'partial-receipt')).toEqual([
+        { type: 'partial-receipt', key: 'alpha', seq: 1, part: 1,
+          expectedBytes: Buffer.byteLength(partialReceiptText), receivedBytes: Buffer.byteLength(partialReceiptSuffix) },
+      ])
+      expect(h.engine.status('alpha')?.partialReceipt?.part).toBe(1)
+      expect(h.queue.openCount('alpha')).toBe(1)
+      const full = promptEntry(partialReceiptText)
+      appendTranscript(p.path, [full])
+      await delivered(h)
+      expect(h.records().filter(record => record.kind === 'delivered')).toMatchObject([{ receipt: { uuid: full.uuid } }])
+      expect(h.keyCalls()).toEqual(replayKeys)
+      expect(h.calls.filter(call => call.verb === 'read-pane')).toEqual([])
+      expect(h.errors).toEqual([])
+    })
+
+  test.each(['uuid', 'path-offset'] as const)('b.x4j partial diagnostic dedup uses %s and new-launch evidence can be reported', async identity => {
+    const h = await harness(), p = h.p()
+    p.autoReceipt = false
+    p.row.launch_started_at = new Date(h.clock.now()).toISOString()
+    await h.accept(partialReceiptText)
+    await h.tick(); await h.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+    const fragment = promptEntry(partialReceiptSuffix)
+    if (identity === 'path-offset') delete fragment.uuid
+    appendTranscript(p.path, [fragment])
+    await h.advance(DELIVERY_ROW_POLL_MS * 3)
+    const partials = () => h.events.filter(event => event.type === 'partial-receipt')
+    expect(partials()).toEqual([{ type: 'partial-receipt', key: 'alpha', seq: 1, part: 1,
+      expectedBytes: Buffer.byteLength(partialReceiptText), receivedBytes: Buffer.byteLength(partialReceiptSuffix) }])
+    expect(h.engine.status('alpha')?.partialReceipt).toEqual({ part: 1,
+      expectedBytes: Buffer.byteLength(partialReceiptText), receivedBytes: Buffer.byteLength(partialReceiptSuffix) })
+    p.row.launch_started_at = new Date(h.clock.now()).toISOString()
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    expect(h.engine.status('alpha')?.partialReceipt).toBeUndefined()
+    await h.until(() => h.textCalls().length === 2)
+    await h.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+    expect(partials()).toHaveLength(1) // Old file bytes cannot label the new send.
+    appendTranscript(p.path, [promptEntry(partialReceiptSuffix)])
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    expect(partials()).toHaveLength(2)
+    expect(h.engine.status('alpha')?.partialReceipt?.part).toBe(1)
+    appendTranscript(p.path, [promptEntry(partialReceiptText)])
+    await delivered(h)
+    expect(h.engine.status('alpha')).toBeUndefined()
+    expect(h.calls.filter(call => call.verb === 'read-pane')).toEqual([])
+    expect(h.errors).toEqual([])
+  })
+
+  test.each(['working', 'relay-off', 'held'] as const)('b.x4j partial receipt cannot bypass %s or authorize another key', async guard => {
+    const h = await harness(), p = h.p()
+    await h.accept(partialReceiptText)
+    p.autoReceipt = false
+    await h.tick(); await h.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+    appendTranscript(p.path, [promptEntry(partialReceiptSuffix)])
+    if (guard === 'working') p.row.state = 'working'
+    else if (guard === 'relay-off') p.row.relay_mode = 'off'
+    else p.held = true
+    await h.advance(RECEIPT_WAIT_MS * 4)
+    expect(h.keyCalls().map(call => call.params.key ?? call.params.text)).toEqual([partialReceiptText, 'Enter'])
+    expect(h.queue.openCount('alpha')).toBe(1)
+    expect(h.queue.items('alpha')[0]!.fixed?.parts).toEqual([partialReceiptText])
+    expect(h.records().filter(record => record.kind === 'delivered')).toEqual([])
+    if (guard === 'working') expect(h.engine.status('alpha')?.row).toBe('working')
+    p.row.state = 'waiting'; p.row.relay_mode = 'on'; p.held = false
+    await h.until(() => h.events.some(event => event.type === 'retyped'))
+    expect(h.keyCalls().map(call => call.params.key ?? call.params.text)).toEqual([partialReceiptText, 'Enter', 'Enter', partialReceiptText, 'Enter'])
+    expect(h.textCalls()[1]!.at - h.textCalls()[0]!.at).toBeGreaterThanOrEqual(RECEIPT_WAIT_MS)
+    const retyped = h.textCalls()[1]!, enter = h.keyCalls().at(-1)!
+    expect(enter.at - retyped.at).toBeGreaterThanOrEqual(ENTER_DELAY_MS)
+    appendTranscript(p.path, [promptEntry(partialReceiptText)])
+    await delivered(h)
+    expect(h.calls.filter(call => call.verb === 'read-pane')).toEqual([])
+    expect(h.errors).toEqual([])
+  })
+
   test.each(['working', 'relay', 'pending', 'check_permission', 'ask_user', 'latched', 'held', 'down', 'mcp', 'marker'] as const)('%s blocks and then releases the head', async guard => {
     const h = await harness(), p = h.p()
     await h.accept()
@@ -2281,4 +2419,132 @@ test('a reconnect timer outlived by a six-second AD read resumes its retained co
   await h.clock.flush()
   expect(stopped).toBe(true)
   await stopping
+})
+
+async function acceptReaction(h: EngineHarness, overrides: Partial<ReactionAcceptedInput> = {}): Promise<number> {
+  const result = await h.queue.accept('alpha', reactionInput(overrides))
+  if (result.status !== 'accepted') throw new Error('fixture reaction acceptance failed')
+  return result.seq
+}
+const withdraw = (h: EngineHarness, seq: number) => h.queue.append('alpha', { v: 1, kind: 'withdrawn', seq, reason: 'server-post', at: h.clock.now() })
+const journalShape = (h: EngineHarness) => h.records().map(r => ['compact' in r ? r.compact : r.kind, r.seq])
+
+describe('Reaction Items in the FIFO', () => {
+  // The file-level hook still owns cleanup; these captures are in memory.
+  const checked: EngineHarness[] = []
+  afterEach(() => { for (const h of checked.splice(0)) assertNoLeak([h.errors, h.events, h.calls, h.order], 'reaction FIFO captures') })
+  async function reactionHarness() { const h = await harness(); checked.push(h); return h }
+  const ready = (p: Partial<DeliveryPolicyKnowledge['p']>, extra: Partial<DeliveryPolicyKnowledge>): DeliveryPolicyKnowledge => ({
+    p: { accepted: [], fixed: [], sent: [], refused: [], delivered: [], ...p },
+    e: { ...createDeliveryPolicyState(), sessionSeen: 'session' },
+    r: { ...createDeliveryReading(), row: 'waiting', relay: true, marker: true, mcp: true, up: true, session: 'session', gate: 'delivery' },
+    g: { owner: 'free', stage: 'none', deferred: false, due: false }, writer: { kind: 'none' }, compact: 'none', ...extra,
+  })
+  test.each([
+    ['an explicit withdrawn head passes to its fixed successor', { accepted: [1, 2], fixed: [2], withdrawn: [1] }, {}, [2, 1], 'recordSend'],
+    ['an absent withdrawn field keeps the head', { accepted: [1, 2], fixed: [1, 2] }, {}, [1, 1], 'recordSend'],
+    ['unsorted acceptance is taken in ascending order past a withdrawn item', { accepted: [5, 3, 4], fixed: [4, 5], withdrawn: [3] }, {}, [4, 1], 'recordSend'],
+    ['a delivered head and a withdrawn item pass to the next item', { accepted: [1, 2, 3], fixed: [1, 3], delivered: [[1, 1]], withdrawn: [2] }, {}, [3, 1], 'recordSend'],
+    ['a multipart successor continues at its next part', { accepted: [1, 2], fixed: [2], delivered: [[2, 1]], withdrawn: [1] }, { parts: { 1: 1, 2: 2 } }, [2, 2], 'recordSend'],
+    ['a withdrawn first item ignores bounded MaxParts', { accepted: [1, 2], fixed: [2], withdrawn: [1] }, { MaxParts: 3 }, [2, 1], 'recordSend'],
+    ['all-withdrawn work has no target', { accepted: [1, 2], withdrawn: [1, 2] }, {}, NO_DELIVERY_PAIR, 'wait'],
+  ] as [string, Partial<DeliveryPolicyKnowledge['p']>, Partial<DeliveryPolicyKnowledge>, DeliveryPair, 'recordSend' | 'fixText' | 'wait'][])('pure policy: %s', (_, p, extra, target, action) => {
+    const k = ready(p, extra)
+    expect(selectDeliveryTarget(k)).toEqual(target)
+    expect(decideEngine(k)).toBe(action)
+    const free = { ...k, r: { ...k.r, gate: 'free' } }
+    expect(decideEngine(free)).toBe(action === 'recordSend' ? 'requestGate' : action)
+    // The gate grants a pending delivery request only for a send this same target permits.
+    expect(decideGate({ ...free, e: { ...k.e, request: 'delivery' } })).toBe(action === 'recordSend' ? 'grantDelivery' : 'cancelRequest')
+  })
+
+  test.each(['live', 'restarted'] as const)('a withdrawn reaction head is passed for its fixed successor (%s)', async via => {
+    const h = await reactionHarness()
+    expect(await acceptReaction(h)).toBe(1)
+    await withdraw(h, 1)
+    await h.clock.advance(5000)
+    await h.accept('successor')
+    if (via === 'restarted') await h.restartServer()
+    await start(h)
+    expect(h.engine.snapshot('alpha')!.p).toMatchObject(via === 'live' ? { accepted: [1, 2], fixed: [2], withdrawn: [1] } : { accepted: [2], fixed: [2], withdrawn: [] })
+    expect(h.engine.snapshot('alpha')!.e.target).toEqual([2, 1])
+    // Status facts come from the successor only: its seq, age and a count of one.
+    expect(h.engine.status('alpha')).toMatchObject({ key: 'alpha', seq: 2, count: 1, ageMs: 0 })
+    await delivered(h)
+    expect(h.keyCalls().map(c => c.params.key ?? c.params.text)).toEqual(['successor', 'Enter'])
+    expect(journalShape(h).filter(([, seq]) => seq === 1)).toEqual(via === 'live' ? [['accepted', 1], ['withdrawn', 1]] : [['reaction-key', 1]])
+    expect(h.records().filter(r => r.kind === 'sent' || r.kind === 'delivered' || r.kind === 'fixed').map(r => r.seq)).toEqual([2, 2, 2])
+    expect(h.events.filter(e => 'seq' in e && e.seq === 1)).toEqual([])
+    expect(h.events.filter(e => e.type === 'item-delivered').map(e => 'seq' in e && e.seq)).toEqual([2])
+    expect(h.queue.item('alpha', 1)?.delivered).toBe(via === 'live' ? false : undefined)
+    expect(h.errors).toEqual([])
+  })
+
+  test.each(['live', 'restarted'] as const)('an all-withdrawn queue (%s) starts no engine, takes no lease or keys, and passes reconnect recovery', async via => {
+    const h = await reactionHarness()
+    await acceptReaction(h); await acceptReaction(h, { emoji: 'eyes' })
+    await withdraw(h, 1); await withdraw(h, 2)
+    if (via === 'restarted') await h.restartServer()
+    expect(h.queue.openCount('alpha')).toBe(0)
+    h.engine.wake('alpha')
+    await start(h)
+    await h.clock.advance(RECEIPT_WAIT_MS)
+    expect(h.engine.running('alpha')).toBe(false)
+    expect(h.engine.status('alpha')).toBeUndefined()
+    expect(h.engine.snapshot('alpha')).toBeUndefined()
+    expect(h.lifecycle.owner('alpha')).toBe('free')
+    expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(true)
+    expect(await h.lifecycle.recoverBeforeReconnect('alpha')).toBe(true)
+    expect(h.engine.running('alpha')).toBe(false)
+    expect(h.calls).toEqual([])
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(journalShape(h)).toEqual(via === 'live'
+      ? [['accepted', 1], ['accepted', 2], ['withdrawn', 1], ['withdrawn', 2]]
+      : [['reaction-key', 1], ['reaction-key', 2], ['allocation', 2]])
+    expect(h.events).toEqual([])
+    expect(h.errors).toEqual([])
+  })
+
+  test.each(['fixed', 'withdrawn'] as const)('an unowned accepted-only reaction head holds a later fixed item until it is durably %s', async outcome => {
+    const h = await reactionHarness()
+    await acceptReaction(h)
+    await h.accept('successor')
+    await start(h)
+    await h.advance(RECEIPT_WAIT_MS)
+    expect(h.preparation.owns('alpha', 1)).toBe(false)
+    expect(h.engine.running('alpha')).toBe(true)
+    expect(h.engine.snapshot('alpha')!.e.target).toEqual([1, 1])
+    expect(h.engine.status('alpha')).toMatchObject({ seq: 1, count: 2 })
+    expect(h.keyCalls()).toEqual([])
+    expect(h.lifecycle.owner('alpha')).toBe('free')
+    expect(h.records().filter(r => r.kind !== 'accepted').map(r => [r.kind, r.seq])).toEqual([['fixed', 2]])
+    expect(h.order).not.toContain('lookup')
+    await h.queue.append('alpha', outcome === 'fixed' ? { v: 1, kind: 'fixed', seq: 1, parts: ['reaction text'] } : { v: 1, kind: 'withdrawn', seq: 1, reason: 'server-post', at: h.clock.now() })
+    h.engine.wake('alpha')
+    await delivered(h)
+    const seqs = outcome === 'fixed' ? [1, 2] : [2]
+    expect(h.textCalls().map(c => c.params.text)).toEqual(outcome === 'fixed' ? ['reaction text', 'successor'] : ['successor'])
+    expect(h.records().filter(r => r.kind === 'delivered').map(r => r.seq)).toEqual(seqs)
+    expect(h.events.filter(e => e.type === 'item-delivered').map(e => 'seq' in e && e.seq)).toEqual(seqs)
+    expect(h.errors).toEqual([])
+  })
+
+  test('reconnect recovery passes a withdrawn head and reconciles its successor\'s retained draft first', async () => {
+    const h = await reactionHarness(), p = h.p()
+    await acceptReaction(h)
+    await withdraw(h, 1)
+    await h.accept('retained draft')
+    p.connected = false
+    p.box = 'retained draft'
+    await h.queue.append('alpha', { v: 1, kind: 'sent', seq: 2, part: 1, attempt: 1, send_kind: 'text', at: 0,
+      session_id: p.row.session_id, transcript_path: p.path, transcript_size: 0 })
+    expect(await h.lifecycle.recoverBeforeReconnect('alpha')).toBe(false)
+    expect(h.keyCalls().map(c => c.params)).toEqual([{ instance_id: 'cscb_alpha', key: 'Enter' }])
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    expect(await h.lifecycle.recoverBeforeReconnect('alpha')).toBe(true)
+    expect(h.queue.item('alpha', 2)?.delivered).toBe(true)
+    expect(h.textCalls()).toEqual([])
+    expect(journalShape(h).filter(([, seq]) => seq === 1)).toEqual([['accepted', 1], ['withdrawn', 1]])
+    expect(h.errors).toEqual([])
+  })
 })

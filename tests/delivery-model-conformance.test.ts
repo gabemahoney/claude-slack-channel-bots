@@ -140,7 +140,9 @@ test.each([
     if (fault === 'omitted Post Holds') return { ...k, holds: k.holds!.filter(hold => hold.kind !== 'post') }
     if (fault === 'Post Holds rendered as memory') return { ...k, holds: k.holds!.map(hold => ({ ...hold, kind: 'memory' as const })) }
     const withdrawn = (k.p as typeof k.p & { withdrawn: number[] }).withdrawn
-    return { ...k, p: { ...k.p, accepted: [...new Set([...k.p.accepted, ...withdrawn])] } }
+    // Production now also skips items its knowledge lists as withdrawn (Reaction Items), so the
+    // fault retains them as ordinary accepted items: in `accepted`, not listed as withdrawn.
+    return { ...k, p: { ...k.p, accepted: [...new Set([...k.p.accepted, ...withdrawn])], withdrawn: [] } }
   }
   await expect(replayDeliveryFixture(envelope, {
     decideEngine: k => decideEngine(knowledge(k)),

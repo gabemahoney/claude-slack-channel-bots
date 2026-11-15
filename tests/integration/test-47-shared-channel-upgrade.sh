@@ -250,7 +250,10 @@ references_unchanged() {
     reference_digest > "${EVIDENCE}/${CASE}-references.now" || fail "$1: cannot digest the references"
     cmp -s "${EVIDENCE}/${CASE}-references" "${EVIDENCE}/${CASE}-references.now" || fail "$1: a preserved reference changed"
 }
-# Every state file but the server's logs, for refused starts.
+# Every state file but the server's logs and the queue journals, for refused
+# starts. Every start replays and compacts each queue journal before it
+# resolves its configuration, so a refused start may rewrite a journal's
+# bytes; queue_items_digest holds what it must keep (t1.tad.5i AC-U09).
 state_digest() {
     python3 - "${SLACK_STATE_DIR}" <<'PY'
 import hashlib, os, re, sys
@@ -258,12 +261,23 @@ root = sys.argv[1]
 for base, _, names in sorted(os.walk(root)):
     for name in sorted(names):
         path = os.path.join(base, name); rel = os.path.relpath(path, root)
-        if re.fullmatch(r'(server\.log|startup-errors\.log).*', rel): continue
+        if re.fullmatch(r'(server\.log|startup-errors\.log).*', rel) or rel.startswith('queue' + os.sep): continue
         st = os.lstat(path)
         try: digest = hashlib.sha256(open(path, 'rb').read()).hexdigest()
         except PermissionError: digest = 'unreadable'
         print(f'{rel}\t{st.st_mode:o}\t{st.st_mtime_ns}\t{digest}')
 PY
+}
+# Each queue journal's accepted items in seq order, read by the production
+# parser, without the attempt watermark that start compaction adds.
+queue_items_digest() {
+    local file key
+    for file in "${SLACK_STATE_DIR}"/queue/*.jsonl; do
+        [[ -f "${file}" ]] || continue
+        key="${file##*/}"; key="${key%.jsonl}"
+        printf '%s\t' "${key}"
+        shared_queue_items "${key}" | jq -cS -s 'map(del(.attempt_high_watermark))|sort_by(.seq)' || return 1
+    done
 }
 # switch_baseline <variant>: the operator's next preparation, as the fixture
 # entry says: the variant's files, keeping their applied dates.
@@ -531,7 +545,7 @@ old_queue_delivered() {
         parts="$(shared_expected_parts "${text}" "${ts}" "${user}" "$(scenario_stub_name user "${user}")" \
             "${channel}" "$(scenario_stub_name channel "${channel}")" "${via}" - -)"
         shared_assert_content "${key}" "${LOG}" "${SNAP[${key}]}" "${channel}" "${ts}" "${text}" "${parts}" - \
-            >> "${EVIDENCE}/${key}-old-content.jsonl"
+            | cat >> "${EVIDENCE}/${key}-old-content.jsonl" || fail 'old queue content reader failed'
         wait_until "${RECORD_WAIT_S}" "queued emoji of item ${seq} not removed" has_record_after 0 api \
             "label=${LABEL[${key}]}" method=reactions.remove "channel=${channel}" "timestamp=${ts}" "name=${emoji}"
     done
@@ -575,6 +589,7 @@ refused_start() {
         REMOVED_SEEN=$((REMOVED_SEEN + 1))
     fi
     state_digest > "${EVIDENCE}/${variant}.before" || fail "${variant}: cannot digest the state"
+    queue_items_digest > "${EVIDENCE}/${variant}.queue-before" || fail "${variant}: cannot read the accepted queue items"
     mark="$(slack_post_mark)"
     before="$(count_log "${expected}")" || fail "${variant}: cannot read server.log"
     run_start --live
@@ -586,6 +601,8 @@ refused_start() {
     for name in "${P[@]}"; do no_session "${name}" || fail "${variant}: refused start launched a bot"; done
     state_digest > "${EVIDENCE}/${variant}.after" || fail "${variant}: cannot digest the state"
     cmp -s "${EVIDENCE}/${variant}.before" "${EVIDENCE}/${variant}.after" || fail "${variant}: refused start changed state"
+    queue_items_digest > "${EVIDENCE}/${variant}.queue-after" || fail "${variant}: cannot read the accepted queue items"
+    cmp -s "${EVIDENCE}/${variant}.queue-before" "${EVIDENCE}/${variant}.queue-after" || fail "${variant}: refused start changed accepted queue items"
     references_unchanged "${variant}"
 }
 # refuse_all: every refused variant, in manifest order, from the default.
@@ -891,7 +908,8 @@ set_input_mode open
 review f-back-to-open
 for key in "${FA}" "${FB}"; do mode_is "${key}" open || fail 'open switch not applied'; done
 set_choice "${FA}" G0TEST003 all f-open-bot-write
-for key in "${FA}" "${FB}"; do drain "${key}"; done
+# Bravo accepts nothing in case F, so it has no queue journal to drain.
+drain "${FA}"
 before_a="$(facts "${FA}")" || fail 'cannot read alpha choices'
 before_b="$(facts "${FB}")" || fail 'cannot read bravo choices'
 stop_server
@@ -912,7 +930,11 @@ prepare_case interrupted-and-invalid-preparation i case-i
 IA="${P[alpha]}"
 inventory "${IA}" C0TEST001 C0TEST002 G0TEST003/private
 cp -p "${SLACK_STATE_DIR}/queue/${IA}.jsonl" "${EVIDENCE}/i-queue-prepared.jsonl"
-queue_kept() { cmp -s "${SLACK_STATE_DIR}/queue/${IA}.jsonl" "${EVIDENCE}/i-queue-prepared.jsonl" || fail 'refused start changed the queue'; }
+queue_items_digest > "${EVIDENCE}/i-queue-prepared.items" || fail 'cannot read the prepared queue items'
+queue_kept() {
+    queue_items_digest > "${EVIDENCE}/i-queue-now.items" || fail 'cannot read the queue items'
+    cmp -s "${EVIDENCE}/i-queue-now.items" "${EVIDENCE}/i-queue-prepared.items" || fail 'refused start changed the queue'
+}
 refuse_all queue_kept
 switch_baseline "$(case_json '.baselines[]|select(.chosen)|.name')"
 start "${IA}"

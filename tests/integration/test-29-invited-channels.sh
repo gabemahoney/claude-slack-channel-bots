@@ -289,6 +289,9 @@ STARTUP_COMPLETE="$(completion_match 2)"
 ALPHA_START="$(persona_start_match "${ALPHA_INDEX}" "${ALPHA}")"
 BRAVO_START="$(persona_start_match "${BRAVO_INDEX}" "${BRAVO}")"
 # src/reload-apply.ts renderAppliedLogLine: `[slack] <RELOAD_APPLIED>:`.
+# src/reload-apply.ts renderNoopLogLine: `[slack] <RELOAD_NOOP>:`, which the
+# printer has no entry for; ci-timing-regressions.test.ts pins it to the export.
+NOOP_CLASS='[slack] reload-noop:'
 # fixtures/slack-stub-server.ts: the refusal of a push to a label with no open
 # WebSocket.
 NO_OPEN_SOCKET='no-open-socket'
@@ -753,9 +756,6 @@ edit_input() {
     jq "$@" "${CONFIG}" > "${CONFIG}.candidate"
     mv -- "${CONFIG}.candidate" "${CONFIG}"
 }
-# Confirming an input with no effective change logs reload-noop, never
-# reload-applied (src/reload-plan.ts noEffectiveChange), so callers review
-# a destination edit only when the input differs.
 input_has() { jq -e "$@" "${CONFIG}" > /dev/null; }
 input_choice() {
     edit_input --arg who "$1" --arg c "$2" --arg d "$3" \
@@ -769,12 +769,22 @@ capture_review() {
     cp -- "${PENDING}" "${CAPTURED}/$1.pending"
     check_pending_layout "$1"
 }
+# confirm_review <step> [wait-s] [noop]: given noop, the review has no
+# effective change, so production consumes it and logs reload-noop, never
+# reload-applied (src/reload-plan.ts noEffectiveChange). Callers therefore
+# confirm an unchanged input only as noop.
 confirm_review() {
-    local step="$1" before wait_s="${2:-${APPLY_WAIT_S}}"
+    local step="$1" before noops wait_s="${2:-${APPLY_WAIT_S}}" noop="${3:-}"
     before="$(count_log "${APPLIED_CLASS}")"
+    noops="$(count_log "${NOOP_CLASS}")"
     capture_review "${step}"
     mv -f -- "${PENDING}" "${APPLY}"
-    wait_for_count "${APPLIED_CLASS}" $(( before + 1 )) "${wait_s}" "${step}: confirmation did not apply"
+    if [[ "${noop}" == noop ]]; then
+        wait_for_count "${NOOP_CLASS}" $(( noops + 1 )) "${wait_s}" "${step}: confirmation was not a no-op"
+        [[ "$(count_log "${APPLIED_CLASS}")" == "${before}" ]] || fail "${step}: a no-op confirmation applied a change"
+    else
+        wait_for_count "${APPLIED_CLASS}" $(( before + 1 )) "${wait_s}" "${step}: confirmation did not apply"
+    fi
     wait_until "${wait_s}" "${step}: review not durably consumed" \
         bun "${PRINTER}" sharedReviewConsumed "${CONFIG}" "${LAST}" "${CAPTURED}/${step}.pending" > /dev/null
     configuration_record_matches "${CONFIG}" "${LAST}" reviewed > /dev/null
@@ -983,6 +993,10 @@ live_membership_phase() {
         LEAVE_ENVELOPES["${mode}|${value}"]="${first}"
         ack_control "${first}"
         wait_until "${EVENT_WAIT_S}" 'leave did not remove saved entry' choice_is "${ALPHA_KEY}" "${channel}" ''
+        # The applied leave staged an inventory rescan. Let it land before the
+        # stale check's snapshot, so that check's window holds only the refused
+        # confirmation.
+        wait_membership_rescan "${ALPHA}" "${ALPHA_LABEL}" "$(slack_stub_record_field seq push "envelope_id=${first}")"
         [[ -z "$(shared_thread_since "${ALPHA_KEY}" "${channel}")" ]] || fail 'leave retained Thread Hybrid Since'
         [[ "$(channel_facts "${BRAVO_KEY}" "${channel}")" == "${sibling}" ]] || fail 'leave changed sibling choice'
         [[ "$(channel_facts "${ALPHA_KEY}" "${M_HYBRID}")" == "${before}" ]] || fail 'leave changed another channel'
@@ -1036,11 +1050,12 @@ write_order_phase() {
     matrix_message away-back-forgets alpha "${WRITE_CHANNEL}" plain "${original}" not-mentioned
     matrix_message away-back-fresh-join alpha "${WRITE_CHANNEL}" mention "${original}" mention
     matrix_message away-back-next-reply alpha "${WRITE_CHANNEL}" plain "${original}" thread
-    # Omitting a member differs from declaring off.
+    # Omitting a member differs from declaring off. The omission retains the
+    # entry, so its confirmation changes nothing.
     edit_input --arg c "${WRITE_CHANNEL}" '.personas[0].channels |= map(select(.id!=$c))'
     configuration_request omit-member request > /dev/null
     pending_has_line "$(printed REVIEW_OMISSION_CLAUSE)" || fail 'omission preview lacks retention clause'
-    confirm_review omit-member
+    confirm_review omit-member "${APPLY_WAIT_S}" noop
     matrix_message omission-keeps alpha "${WRITE_CHANNEL}" plain "${original}" thread
     # Cancel and revise invalidate their retained original previews.
     configuration_request cancel-intent request "${ALPHA}/${WRITE_CHANNEL}/off" > /dev/null
@@ -1069,14 +1084,39 @@ write_order_phase() {
     matrix_message pending-not-applied alpha "${WRITE_CHANNEL}" plain - receive_all
 }
 
+# A channel the persona's input lists is changed by review in either mode,
+# so the input keeps naming its saved value; open mode's bot tool sets only
+# an unlisted one.
 set_composed_choice() {
     local mode="$1" who="$2" channel="$3" value="$4" step="$5" name
     thread_persona "${who}"
     if [[ "${who}" == alpha ]]; then name="${ALPHA}"; else name="${BRAVO}"; fi
-    if [[ "${mode}" == strict ]]; then
+    if [[ "${mode}" == strict ]] || input_has --arg who "${name}" --arg c "${channel}" '.personas[]|select(.name==$who)|any(.channels[]; .id==$c)'; then
         input_choice "${name}" "${channel}" "${value}"
         review_assign "${step}" "${name}/${channel}/${value}"
     else expect_attempt "${step}" "${THREAD_DIR}" "$(attempt_args "${step}" "${channel}" "${value}")" "${THREAD_KEY}" "${value}"; fi
+}
+# edit_destination <name> <key> <step> [dm]: one input edit points the
+# persona's permission_prompts at DEST (and enables DMs with CONTACT, given
+# dm) and lists DEST at its saved value, reviewed only when the input
+# changes. The production parser refuses a permission_prompts channel the
+# input does not list (src/config.ts checkPersonaCrossSettings). Listing a
+# channel is an operator assignment at the review's order in either mode
+# (src/shared-channels.ts prepareReviewed), so it carries its gesture; at
+# the saved value it keeps the value and its Thread Hybrid Since.
+edit_destination() {
+    local name="$1" key="$2" step="$3" dm="${4:-}" saved filter gesture=()
+    saved="$(shared_channel_saved "${key}" "${DEST}")"
+    [[ -n "${saved}" ]] || fail "${step}: ${DEST} has no saved choice to list"
+    local args=(--arg who "${name}" --arg c "${DEST}" --arg d "${saved}" --arg contact "${CONTACT}")
+    filter='(.personas[]|select(.name==$who)) |= (.permission_prompts=$c'
+    [[ "${dm}" != dm ]] || filter+=' | .dm={enabled:true,contact:$contact}'
+    filter+=' | .channels |= (if any(.[]; .id==$c) then map(if .id==$c then .delivery=$d else . end) else . + [{id:$c,delivery:$d}] end))'
+    ! input_has "${args[@]}" "(${filter}) == ." || return 0
+    input_has "${args[@]}" '.personas[]|select(.name==$who)|any(.channels[]; .id==$c and .delivery==$d)' \
+        || gesture=("${name}/${DEST}/${saved}")
+    edit_input "${args[@]}" "${filter}"
+    review_assign "${step}" "${gesture[@]}"
 }
 join_count() {
     local stamp
@@ -1093,7 +1133,7 @@ successful_tool() {
 }
 
 own_posts_phase() {
-    local mode="$1" q="$2" dir key bot root text mark result post_ts stamp before file method envelope outside
+    local mode="$1" q="$2" dir key bot root text mark result post_ts stamp before file method envelope outside name
     thread_persona "${q}"; dir="${THREAD_DIR}"; key="${THREAD_KEY}"; bot="${THREAD_BOT}"
     set_composed_choice "${mode}" "${q}" "${DEST}" thread_hybrid "${mode}-own-hybrid"
     # No inbound mention supplied either own-post join. The root's original
@@ -1129,10 +1169,13 @@ own_posts_phase() {
     successful_tool "${mode}-react-only" "${dir}" react "$(jq -cn --arg c "${DEST}" --arg id "${outside}" '{chat_id:$c,message_id:$id,emoji:"thumbsup"}')"
     [[ "$(shared_thread_joins "${key}" "${DEST}" "${stamp}" | jq -scS 'sort_by(.root)')" == "${before}" ]] || fail 'reaction/edit/delete/outside post joined a thread'
     # DM tools may post, but do not create channel participation. Group DM
-    # ingress remains excluded, even with a direct mention.
-    edit_input --arg who "$(if [[ "${q}" == alpha ]]; then echo "${ALPHA}"; else echo "${BRAVO}"; fi)" --arg contact "${CONTACT}" \
-        '(.personas[]|select(.name==$who)|.dm)={enabled:true,contact:$contact}'
-    review_assign "${mode}-enable-dm"
+    # ingress remains excluded, even with a direct mention. Bravo's input
+    # already enables DMs, and an unchanged input confirms as reload-noop.
+    name="$(if [[ "${q}" == alpha ]]; then echo "${ALPHA}"; else echo "${BRAVO}"; fi)"
+    if ! input_has --arg who "${name}" --arg contact "${CONTACT}" '.personas[]|select(.name==$who)|.dm=={enabled:true,contact:$contact}'; then
+        edit_input --arg who "${name}" --arg contact "${CONTACT}" '(.personas[]|select(.name==$who)|.dm)={enabled:true,contact:$contact}'
+        review_assign "${mode}-enable-dm"
+    fi
     successful_tool "${mode}-own-dm" "${dir}" reply "$(jq -cn --arg c "${DM}" --arg t "$(scenario_text own-dm)" '{chat_id:$c,text:$t}')"
     mark="$(log_mark)"
     push_message "${q}" "${GDM}" mpim "$(mention_text "${bot}")"
@@ -1151,10 +1194,7 @@ permission_post() {
     thread_persona "${q}"; dir="${THREAD_DIR}"; key="${THREAD_KEY}"
     if [[ "${q}" == alpha ]]; then name="${ALPHA}"; else name="${BRAVO}"; fi
     set_composed_choice "${mode}" "${q}" "${DEST}" "${value}" "${mode}-prompt-${number}-${value}"
-    if ! input_has --arg who "${name}" --arg dest "${DEST}" '.personas[]|select(.name==$who)|.permission_prompts==$dest'; then
-        edit_input --arg who "${name}" --arg dest "${DEST}" '(.personas[]|select(.name==$who)|.permission_prompts)=$dest'
-        review_assign "${mode}-prompt-destination-${number}"
-    fi
+    edit_destination "${name}" "${key}" "${mode}-prompt-destination-${number}"
     wait_queue_drained "${dir}"
     mark="$(slack_post_mark)"
     request="$(shared_stub_permission "permission-${number}" "${dir}" "${key}")"
@@ -1186,10 +1226,10 @@ observe_other_post() {
     ack_control "$(slack_push_observed_post "${p}" "${q}" "${DEST}" "${seq}")"
 }
 destination_post_matrix() {
-    local mode="$1" p="$2" q="$3" post="$4" kind="$5" value name qname ts dir key ref mark before stamp joins
+    local mode="$1" p="$2" q="$3" post="$4" kind="$5" value name qname qkey ts dir key ref mark before stamp joins
     ts="$(jq -er '.ts' <<< "${post}")"
     thread_persona "${p}"; dir="${THREAD_DIR}"; key="${THREAD_KEY}"; ref="${THREAD_REF}"
-    if [[ "${q}" == alpha ]]; then qname="${ALPHA}"; else qname="${BRAVO}"; fi
+    if [[ "${q}" == alpha ]]; then qname="${ALPHA}"; qkey="${ALPHA_KEY}"; else qname="${BRAVO}"; qkey="${BRAVO_KEY}"; fi
     # The same real post is redelivered after successive choices. Dropped
     # events store no dedupe key; exactly one acceptance occurs at all.
     for value in off mentions thread_hybrid all; do
@@ -1213,8 +1253,7 @@ destination_post_matrix() {
             review_assign "${mode}-${kind}-destination-dm"
             [[ "$(channel_facts "${key}" "${DEST}")" == "${before}" ]] || fail 'Q destination DM changed P'
             matrix_message "${mode}-${kind}-follow-in-dm" "${p}" "${DEST}" plain "${ts}" thread
-            edit_input --arg who "${qname}" --arg c "${DEST}" '(.personas[]|select(.name==$who)|.permission_prompts)=$c'
-            review_assign "${mode}-${kind}-destination-back"
+            edit_destination "${qname}" "${qkey}" "${mode}-${kind}-destination-back"
             [[ "$(channel_facts "${key}" "${DEST}")" == "${before}" ]] || fail 'Q destination back changed P'
             [[ "$(shared_thread_joins "${key}" "${DEST}" "${stamp}" | jq -scS 'sort_by(.root)')" == "${joins}" ]] || fail 'destination edits changed P joins'
         fi
@@ -1241,12 +1280,7 @@ notice_phase() {
     thread_persona "${q}"; dir="${THREAD_DIR}"; key="${THREAD_KEY}"
     if [[ "${q}" == alpha ]]; then name="${ALPHA}"; input="${A2}"; else name="${BRAVO}"; input="${B1}"; fi
     set_composed_choice "${mode}" "${q}" "${DEST}" "${value}" "${phase}-own-value"
-    if ! input_has --arg who "${name}" --arg c "${DEST}" --arg contact "${CONTACT}" \
-        '.personas[]|select(.name==$who)|.permission_prompts==$c and .dm=={enabled:true,contact:$contact}'; then
-        edit_input --arg who "${name}" --arg c "${DEST}" --arg contact "${CONTACT}" \
-            '(.personas[]|select(.name==$who)) |= (.permission_prompts=$c | .dm={enabled:true,contact:$contact})'
-        review_assign "${phase}-destination"
-    fi
+    edit_destination "${name}" "${key}" "${phase}-destination" dm
     wait_queue_drained "${ALPHA_DIR}"; wait_queue_drained "${BRAVO_DIR}"
     evidence="${SCENARIO_ROOT}/${phase}-worker.jsonl"; mark="$(slack_post_mark)"
     connected="$(count_log "$(session_connected "${THREAD_REF}")")"
@@ -1312,8 +1346,13 @@ future_after_leave() {
     NEVER_JOINED_FACTS="$(channel_facts "${ALPHA_KEY}" "${FUTURE}")"
 }
 
+# control_fired <event> [field=value...]: a fired control record exists, as a
+# wait predicate. slack_stub_control_fired requires one and fails the script
+# on the first poll that finds none (lib/scenario.sh).
+control_fired() { [[ "$(slack_stub_record_count "$@")" -ge 1 ]]; }
+
 ineligible_and_unverified() {
-    local root outside before stamp event mark fault request_id sockets request_ms
+    local root outside before stamp event mark fault request_id sockets request_ms unclaimed
     # Known, authenticated channel: all writes are refused in open while
     # external sharing makes it ineligible. Its previous joins remain saved.
     member_list alpha "${EXTERNAL}"
@@ -1329,9 +1368,13 @@ ineligible_and_unverified() {
     ack_control "$(slack_stub_push alpha "${event}" true)"
     wait_membership_complete "${ALPHA}"
     expect_attempt external-refusal "${ALPHA_DIR}" "$(attempt_args external-refusal "${EXTERNAL}" all)" "${ALPHA_KEY}" external-sharing new true
+    # The reply carries Slack's external-sharing flag, as the channel now does.
+    # Open mode refuses that flag before membership (src/delivery-decision.ts
+    # decideFungibleChannel), with X1's unclaimed-channel line.
+    unclaimed="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "$(printed fungibleUnclaimedChannelCause "${EXTERNAL}" "${REFUSAL_EXTERNALLY_SHARED}")")"
     mark="$(log_mark)"; new_ts
     push_event alpha "$(slack_reply_event "${EXTERNAL}" "${root}" "$(plain_text)" "${PUSH_TS}" "${HUMAN}")" true
-    wait_since "${mark}" "$(plain_drop "${ALPHA_REF}" "${EXTERNAL}" channel-ineligible)" "${EVENT_WAIT_S}" 'external joined reply was not excluded'
+    wait_since "${mark}" "${unclaimed}" "${EVENT_WAIT_S}" 'external joined reply was not excluded'
     expect_queued external-joined-reply 0 "${ALPHA_DIR}" "${EXTERNAL}" "${PUSH_TS}"
     outside="$(scenario_ts)"
     successful_tool external-own-post "${ALPHA_DIR}" reply "$(jq -cn --arg c "${EXTERNAL}" --arg r "${outside}" --arg t "$(scenario_text ineligible-post)" '{chat_id:$c,thread_ts:$r,text:$t}')"
@@ -1355,16 +1398,16 @@ ineligible_and_unverified() {
     request_ms="$(printed MEMBERSHIP_REQUEST_TIMEOUT_MS)"
     slack_stub_inventory_fault alpha '' delay "delay_ms=$(( request_ms * 4 / 5 ))"
     slack_stub_close_socket alpha 0
-    wait_until "${RECORD_WAIT_S}" 'socket close control did not fire' slack_stub_control_fired socket-close label=alpha > /dev/null
+    wait_until "${RECORD_WAIT_S}" 'socket close control did not fire' control_fired socket-close label=alpha > /dev/null
     wait_until "${RECORD_WAIT_S}" 'new socket did not open' rec_at_least $(( sockets + 1 )) event=ws-open label=alpha
-    wait_until "${RECORD_WAIT_S}" 'inventory delay did not fire' slack_stub_control_fired fault label=alpha method=users.conversations outcome=delay > /dev/null
+    wait_until "${RECORD_WAIT_S}" 'inventory delay did not fire' control_fired fault label=alpha method=users.conversations outcome=delay > /dev/null
     fault="$(slack_stub_control_fired fault label=alpha method=users.conversations outcome=delay)"
     request_id="$(jq -er '.request_id' <<< "${fault}")"
     [[ "$(slack_stub_record_count fault-settled "request_id=${request_id}")" == 0 ]] || fail 'inventory resolved before unverified case'
     expect_attempt unverified-refusal "${ALPHA_DIR}" "$(attempt_args unverified-refusal "${M_MENTIONS}" all)" "${ALPHA_KEY}" current-membership-missing new true
     [[ "$(slack_stub_record_count fault-settled "request_id=${request_id}")" == 0 ]] || fail 'unverified result was observed after inventory resolved'
     [[ "$(channel_facts "${ALPHA_KEY}" "${M_MENTIONS}")" == "${before}" ]] || fail 'unverified bot write changed saved facts'
-    wait_until 30 'successful delayed inventory did not settle' slack_stub_control_fired fault-settled "request_id=${request_id}" resolution=delay > /dev/null
+    wait_until 30 'successful delayed inventory did not settle' control_fired fault-settled "request_id=${request_id}" resolution=delay > /dev/null
     # Every later control post re-arms faults still in the control file.
     slack_stub_faults_clear alpha
     wait_membership_complete "${ALPHA}"
@@ -1595,7 +1638,10 @@ exit_observe() {
         fi
     done
 }
-on_before_cleanup exit_observe
+# A failure inside a call whose stdout is discarded (`> /dev/null`) runs the
+# hooks with that stdout, so the dump goes to stderr.
+exit_observe_stderr() { exit_observe >&2; }
+on_before_cleanup exit_observe_stderr
 
 # --- Credentials, stub control and MCP config ------------------------------
 # write_credentials <path> <suffix>: a fresh fake bot/app pair ending in
@@ -1650,6 +1696,9 @@ slack_stub_inventory_page "${BRAVO_LABEL}" '' '' "${BRAVO_MEMBERS[@]}"
 # - fungible: open mode plus explicit mentions/all choices for discovered
 # channels; alpha's permission destination remains A1 ;
 # - switch-off: the same reviewed choices with strict mode.
+# Every shape turns Slack reply reminders off for both personas
+# (stop_hook_bootstrap): a reminder nudge is a delivery, and in manual
+# receipt mode it would take a receipt release meant for a real item.
 write_persona_config() {
     local switch='' extra_alpha='' extra_bravo=''
     local at=off an1=off an2=mentions an3=all bt=off bn1=off bn2=mentions bn3=all
@@ -1674,6 +1723,7 @@ write_persona_config() {
       "name": "${ALPHA}",
       "credentials_file": "${ALPHA_CREDS}",
       "working_directory": "${ALPHA_DIR}",
+      "stop_hook_bootstrap": false,
       "channels": [
         { "id": "${A1}", "delivery": "all" },
         { "id": "${A2}", "delivery": "mentions" },
@@ -1689,6 +1739,7 @@ write_persona_config() {
       "name": "${BRAVO}",
       "credentials_file": "${BRAVO_CREDS}",
       "working_directory": "${BRAVO_DIR}",
+      "stop_hook_bootstrap": false,
       "channels": [{ "id": "${B1}", "delivery": "mentions" },
         { "id": "${T1}", "delivery": "${bt}" },
         { "id": "${N1}", "delivery": "${bn1}" },
@@ -2429,15 +2480,31 @@ done
 # The bodies belong in delivery evidence, never in server diagnostics or
 # captured reviews/tool results. Q's own notice wording is excluded from this
 # sentinel check because the server legitimately prints its own notice text.
-python3 - "${HUMAN_INPUTS}" "${SLACK_STATE_DIR}/server.log" "${CAPTURED}" <<'PY'
-import json, pathlib, sys
+# Two server.log line kinds carry a body excerpt by design, and no SR forbids
+# it: the event router's RAW line (src/persona-event-router.ts routeInbound,
+# for message and app_mention) and the dispatch line (src/delivery-notices.ts
+# buildDeliveryDispatchLine). Only a timestamped line whose text starts with
+# one of these heads is skipped; an unstamped continuation line of a
+# multi-line log entry is always checked. ci-timing-regressions.test.ts pins
+# the heads to the lines those functions build.
+BODY_LINE_HEADS=('[slack] RAW message event persona=' '[slack] RAW app_mention event persona=' '[slack] dispatch: persona=')
+# body_sentinels_absent <human-inputs> <server-log> <captured-dir>
+body_sentinels_absent() {
+    python3 - "$1" "$2" "$3" "${BODY_LINE_HEADS[@]}" <<'PY'
+import json, pathlib, re, sys
 texts = {json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()}
 assert texts and all(texts), 'missing independent message-body sentinels'
-paths = [pathlib.Path(sys.argv[2]), *pathlib.Path(sys.argv[3]).iterdir()]
-for path in paths:
-    if any(text in path.read_text() for text in texts):
+heads, stamp = tuple(sys.argv[4:]), re.compile(r'\[\d{4}-\d{2}-\d{2}T[0-9:.]+Z\] ')
+def diagnostic(line):
+    at = stamp.match(line)
+    return not (at and line[at.end():].startswith(heads))
+log = '\n'.join(filter(diagnostic, pathlib.Path(sys.argv[2]).read_text().splitlines()))
+for content in [log, *(path.read_text() for path in pathlib.Path(sys.argv[3]).iterdir())]:
+    if any(text in content for text in texts):
         raise SystemExit('message body leaked into diagnostics or a captured result')
 PY
+}
+body_sentinels_absent "${HUMAN_INPUTS}" "${SLACK_STATE_DIR}/server.log" "${CAPTURED}"
 while IFS= read -r envelope; do
     [[ "$(slack_ack_count "${envelope}")" == 1 ]] || fail 'closing: missing or repeated ACK'
 done < "${ACKS}"

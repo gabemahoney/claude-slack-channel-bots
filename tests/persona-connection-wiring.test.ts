@@ -14,10 +14,19 @@ import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
  * How the routing uses the flag is covered in tests/persona-routing.test.ts
  * and tests/delivery-decision-fungible.test.ts.
  *
+ * SR-1.3: a `reaction_added` or `reaction_removed` event goes to the reaction
+ * intake (`receiveReaction`) once, with the event and its own ack unchanged,
+ * the receiving persona's key and the envelope flag in each of its forms; the
+ * router writes no RAW line for it and never acks it for the intake. Over the
+ * real routing, the reaction decision asks the manager's own Run Bot
+ * Identities. How the intake decides, stores and acks is covered in
+ * tests/persona-routing.test.ts.
+ *
  * Code under test (never `src/server.ts`, which is only read as text):
  * - `src/persona-event-router.ts` `createPersonaEventRouter`: the handler the
- *   connection manager forwards every `message`, `app_mention` and
- *   `interactive` event to, with the receiving persona's key;
+ *   connection manager forwards every `message`, `app_mention`,
+ *   `reaction_added`, `reaction_removed` and `interactive` event to, with the
+ *   receiving persona's key;
  * - `src/persona-start.ts` `createPersonaClientLookup` (`clientFor`, whose
  *   serving rule is driven through the real manager's statuses),
  *   `createPersonaIdentityLookup` and `createPersonaUpFlushListener`;
@@ -72,7 +81,7 @@ import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Database } from 'bun:sqlite'
@@ -116,7 +125,7 @@ import {
   openArchiveDatabase,
   type NameResolverWebClient,
 } from '../src/message-archive.ts'
-import { createSessionServer, OWN_POST_UPLOAD_FILENAME, registerSession, type SessionToolDeps } from '../src/registry.ts'
+import { createSessionServer, registerSession, type SessionToolDeps } from '../src/registry.ts'
 import { consumeAck } from '../src/ack-tracker.ts'
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
@@ -125,6 +134,7 @@ import {
   ENVELOPE_FLAG_FORMS,
   makeAppMention,
   makeChannelMessage,
+  makeReaction,
   type EnvelopeFlagForm,
   type SlackEvent,
 } from './test-helpers/slack-stub.ts'
@@ -157,6 +167,8 @@ import {
 } from './test-helpers/credentials.ts'
 import { makeManagedRouting } from './test-helpers/persona-routing-managed.ts'
 import { outputDuringAsync, socketLogLine, ticketUrl } from './test-helpers/slack-logger-probes.ts'
+import { startSlackStub } from './integration/fixtures/slack-stub-server.ts'
+import type { OwnPostAnswer, OwnPostObserver, OwnPostOperation } from '../src/own-post.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -284,27 +296,42 @@ async function bringUpBoth(h: ConnectionHarness & { A: Persona; B: Persona }): P
   for (const p of [h.A, h.B]) expect(await h.bringUp(p)).toMatchObject({ state: 'up' })
 }
 
-/** One `receive` call the recording intake saw. */
+/** The router's routing intakes: `receive` for messages and mentions, `receiveReaction` for reactions. */
+type RouterIntakes = Pick<PersonaRouting, 'receive' | 'receiveReaction'>
+
+/** One intake call a recording intake saw. */
 interface IntakeCall {
   event: unknown
   key: unknown
 }
 
-/** An intake that records each call (event and the receiver argument as given) and acks. */
-function recordingIntake(): Pick<PersonaRouting, 'receive'> & { calls: IntakeCall[] } {
+/**
+ * An intake that records each call (event and the receiver argument as given)
+ * and acks: `calls` for `receive`, `reactions` for `receiveReaction`, kept
+ * apart so a delegation to the wrong one shows.
+ */
+function recordingIntake(): RouterIntakes & { calls: IntakeCall[]; reactions: IntakeCall[] } {
   const calls: IntakeCall[] = []
+  const reactions: IntakeCall[] = []
   return {
     calls,
+    reactions,
     receive: async (event, ack, key) => {
       calls.push({ event, key })
+      await ack()
+    },
+    receiveReaction: async (event, ack, key) => {
+      reactions.push({ event, key })
       await ack()
     },
   }
 }
 
-/** One `receive` call the flag-recording intake saw. */
+/** One intake call the flag-recording intake saw. */
 interface FlagIntakeCall {
   event: unknown
+  /** The second argument, as given. */
+  ack: unknown
   key: unknown
   /** The fourth argument, the envelope flag: undefined when absent. */
   flag: unknown
@@ -315,17 +342,47 @@ interface FlagIntakeCall {
   data: unknown[]
 }
 
-/** An intake that records each call with every argument as given (the envelope flag included) and acks. */
-function flagIntake(): Pick<PersonaRouting, 'receive'> & { calls: FlagIntakeCall[] } {
+/**
+ * An intake that records each call with every argument as given (the envelope
+ * flag included), `calls` for `receive` and `reactions` for
+ * `receiveReaction`, and acks; with `ackReactions: false` the reaction intake
+ * never acks, so any ack the envelope gets is the router's.
+ */
+function flagIntake({ ackReactions = true } = {}): RouterIntakes & { calls: FlagIntakeCall[]; reactions: FlagIntakeCall[] } {
   const calls: FlagIntakeCall[] = []
-  return {
-    calls,
-    receive: async (...args: Parameters<PersonaRouting['receive']>) => {
-      const [event, ack, key, flag, provenance] = args
-      calls.push({ event, key, flag, provenance, arity: args.length, data: args.filter((arg) => arg !== ack) })
-      await ack()
-    },
-  }
+  const reactions: FlagIntakeCall[] = []
+  const recorder = (into: FlagIntakeCall[], acks: boolean) =>
+    async (...args: Parameters<PersonaRouting['receive']> | Parameters<PersonaRouting['receiveReaction']>): Promise<void> => {
+      const [event, ack, key, flag] = args
+      // Only `receive` takes the issuing connection's provenance, as its fifth argument.
+      const provenance = (args as unknown[])[4] as FlagIntakeCall['provenance']
+      into.push({ event, ack, key, flag, provenance, arity: args.length, data: args.filter((arg) => arg !== ack) })
+      if (acks) await ack()
+    }
+  return { calls, reactions, receive: recorder(calls, true), receiveReaction: recorder(reactions, ackReactions) }
+}
+
+/** A Slack reaction event name the manager forwards. */
+type ReactionEventName = Extract<PersonaSocketEventName, 'reaction_added' | 'reaction_removed'>
+const REACTION_EVENTS: ReactionEventName[] = ['reaction_added', 'reaction_removed']
+
+/** A person who reacts (no persona's bot). */
+const REACTOR = 'U0WIREREACT'
+/** The reacted message's ts. */
+const REACTED_TS = '1700000000.888888'
+
+/**
+ * A reaction event on a message in `CS`: `overrides` replace its fields and
+ * `item` its item's.
+ */
+function reactionEvent(type: ReactionEventName, overrides: Record<string, unknown> = {}, item: Record<string, unknown> = {}): SlackEvent {
+  return makeReaction(type, {
+    user: REACTOR,
+    reaction: 'thumbsup',
+    item_user: 'U0WIREBOTA',
+    event_ts: '1700000001.000001',
+    ...overrides,
+  }, { channel: CS, ts: REACTED_TS, ...item })
 }
 
 /** One click-handler call a spy saw. */
@@ -353,7 +410,7 @@ function clickSpy(handled: (actionId: string) => boolean | Promise<boolean> = ()
 /** Build the event router over the harness's seams and plug it into the manager. */
 function plugRouter(
   h: ConnectionHarness,
-  routing: Pick<PersonaRouting, 'receive'>,
+  routing: RouterIntakes,
   extra: Partial<PersonaEventRouterDeps> = {},
 ): { logs: string[]; trail: TrailCapture; router: ReturnType<typeof createPersonaEventRouter> } {
   const logs: string[] = []
@@ -405,6 +462,7 @@ describe('each connection\'s inbound events reach the intake with its own person
     await h.stub(h.A).socket.deliver(onA)
 
     expect(intake.calls).toEqual([{ event: onA, key: h.A.key }])
+    expect(intake.reactions).toEqual([])
     expect(h.stub(h.A).socket.acks).toHaveLength(1)
     expect(h.stub(h.B).socket.acks).toHaveLength(0)
     const raw = logs.filter((l) => l.startsWith(`[slack] RAW ${eventName} event`))
@@ -470,24 +528,25 @@ describe('each connection\'s inbound events reach the intake with its own person
     expect(slackCalls(h.stub(h.A), h.stub(h.B))).toBe(before)
   })
 
-  test('an unknown event name is acked once and ignored: no intake, no click handler, no trail event', async () => {
+  test('an event name the router does not handle is acked once and ignored, even carrying a reaction event: neither intake, no click handler, no trail event', async () => {
     const h = harness()
     const intake = recordingIntake()
     const click = clickSpy()
     const { router, logs, trail } = plugRouter(h, intake, { handleClick: click.handleClick })
     const ack = recordingAck()
 
-    await router(h.A.key, 'reaction_added' as PersonaSocketEventName, {
+    await router(h.A.key, 'channel_created' as PersonaSocketEventName, {
       ack: ack.ack,
-      event: makeChannelMessage({ channel: CA }),
+      event: reactionEvent('reaction_added'),
       body: blockActions([encodePermissionActionId('allow', personaInstanceId(h.A.key), REQUEST_TOKEN)]),
     })
 
     expect(ack.count()).toBe(1)
     expect(intake.calls).toEqual([])
+    expect(intake.reactions).toEqual([])
     expect(click.calls).toEqual([])
     expect(trail.events).toEqual([])
-    expect(logs).toEqual([`[slack] persona=${h.A.key}: ignoring unexpected reaction_added event`])
+    expect(logs).toEqual([`[slack] persona=${h.A.key}: ignoring unexpected channel_created event`])
   })
 
   test('a throw while handling A\'s event is logged with A\'s key and its message redacted, token-safely, never reaches the manager, and B\'s events are still delivered', async () => {
@@ -495,11 +554,12 @@ describe('each connection\'s inbound events reach the intake with its own person
     await bringUpBoth(h)
     const intake = recordingIntake()
     // Throw for A only, with a code and a message carrying the marker in a token and a URL.
-    const throwing: Pick<PersonaRouting, 'receive'> = {
+    const throwing: RouterIntakes = {
       receive: async (event, ack, key) => {
         if (key === h.A.key) throw Object.assign(new Error(markedMessage('boom')), { code: 'EBOOM' })
         return intake.receive(event, ack, key)
       },
+      receiveReaction: intake.receiveReaction,
     }
     const { logs } = plugRouter(h, throwing)
 
@@ -535,6 +595,78 @@ describe('each connection\'s inbound events reach the intake with its own person
     expect(failed[0]).toContain(redactedMessageField('click failed'))
     expect(h.lines.filter((l) => l.includes('event handler failed'))).toEqual([])
     assertNoLeak({ logs })
+  })
+})
+
+describe('a throwing logger never skips an intake, an action or an ack (b.aos)', () => {
+  /** Plug the router with a logger that records each line, then throws. */
+  function plugThrowing(h: ConnectionHarness, routing: RouterIntakes, extra: Partial<PersonaEventRouterDeps> = {}) {
+    const logs: string[] = []
+    const plugged = plugRouter(h, routing, { log: (line) => { logs.push(line); throw new Error('log sink closed') }, ...extra })
+    return { ...plugged, logs }
+  }
+
+  test.each<[PersonaSocketEventName, (overrides: Record<string, unknown>) => SlackEvent]>([
+    ['message', (o) => makeChannelMessage(o)],
+    ['app_mention', (o) => makeAppMention(o)],
+  ])('a `%s` event still reaches the intake and is acked once after the RAW line throws', async (eventName, build) => {
+    const h = harness()
+    const intake = recordingIntake()
+    const { router, logs } = plugThrowing(h, intake)
+    const event = build({ channel: CS })
+    const ack = recordingAck()
+
+    await expect(router(h.A.key, eventName, { ack: ack.ack, event })).resolves.toBeUndefined()
+
+    expect(intake.calls).toEqual([{ event, key: h.A.key }])
+    expect(ack.count()).toBe(1)
+    expect(logs.filter((l) => l.startsWith(`[slack] RAW ${eventName} event`))).toHaveLength(1)
+    assertNoLeak({ logs })
+  })
+
+  test('an unknown event name is still acked once', async () => {
+    const h = harness()
+    const intake = recordingIntake()
+    const { router, logs } = plugThrowing(h, intake)
+    const ack = recordingAck()
+
+    await expect(router(h.A.key, 'channel_created' as PersonaSocketEventName, { ack: ack.ack })).resolves.toBeUndefined()
+
+    expect(ack.count()).toBe(1)
+    expect(intake.calls).toEqual([])
+    expect(intake.reactions).toEqual([])
+    expect(logs).toEqual([`[slack] persona=${h.A.key}: ignoring unexpected channel_created event`])
+  })
+
+  test('an intake throw still resolves the handler, so the manager logs no handler failure', async () => {
+    const h = harness()
+    await bringUpBoth(h)
+    const { logs } = plugThrowing(h, { receive: async () => { throw new Error('intake failed') }, receiveReaction: recordingIntake().receiveReaction })
+
+    await h.stub(h.A).socket.deliver(makeChannelMessage({ channel: CS }))
+
+    expect(logs.filter((l) => l.includes('message event handling failed'))).toHaveLength(1)
+    expect(h.lines.filter((l) => l.includes('event handler failed'))).toEqual([])
+    assertNoLeak({ logs, lines: h.lines })
+  })
+
+  test('a throw on action 1 still lets action 2 run, and the payload is acked once after both', async () => {
+    const h = harness()
+    const order: string[] = []
+    const click = clickSpy((actionId) => {
+      order.push(actionId)
+      if (actionId === 'first_action') throw new Error('click failed')
+      return true
+    })
+    const { router, logs } = plugThrowing(h, recordingIntake(), { handleClick: click.handleClick })
+
+    await expect(router(h.A.key, 'interactive', {
+      ack: async () => void order.push('ack'),
+      body: blockActions(['first_action', 'second_action']),
+    })).resolves.toBeUndefined()
+
+    expect(order).toEqual(['first_action', 'second_action', 'ack'])
+    expect(logs.filter((l) => l.includes('interactive action 1 of 2 handling failed'))).toHaveLength(1)
   })
 })
 
@@ -645,6 +777,127 @@ describe('the envelope flag reaches the intake exactly as sent, and the RAW line
     expect(raw).toEqual(FORMS.map(() => expected))
     for (const envelopeText of ENVELOPE_ONLY_TEXTS) expect(raw.join('\n')).not.toContain(envelopeText)
     assertNoLeak({ logs })
+  })
+
+  test.each(REACTION_EVENTS.flatMap((eventName) => FORMS.map(([form, flag]) => [eventName, form, flag] as const)))(
+    'a `%s` event whose envelope flag is %s reaches the reaction intake once with the event unchanged, the receiving persona\'s key and the flag exactly as sent, and nothing else of the envelope; no message intake, click handler or line, RAW included',
+    async (eventName, form, flag) => {
+      const h = harness()
+      await bringUpBoth(h)
+      const intake = flagIntake()
+      const click = clickSpy()
+      const { logs } = plugRouter(h, intake, { handleClick: click.handleClick })
+      const event = reactionEvent(eventName)
+      const sent = structuredClone(event)
+
+      await h.stub(h.A).socket.deliver(event, { ...MARKED_ENVELOPE, ...ENVELOPE_FLAG_FORMS[form] })
+
+      expect(intake.reactions).toHaveLength(1)
+      const [call] = intake.reactions
+      expect(call!.event).toBe(event)
+      expect(call!.event).toEqual(sent)
+      expect(call!.key).toBe(h.A.key)
+      expect(call!.flag).toBe(flag)
+      expect(call!.arity).toBeLessThanOrEqual(4)
+      expectNoEnvelopeField(call!)
+      expect(intake.calls).toEqual([])
+      expect(click.calls).toEqual([])
+      // The intake's one ack is A's socket's own; B's socket is untouched.
+      expect(h.stub(h.A).socket.acks).toHaveLength(1)
+      expect(h.stub(h.B).socket.acks).toHaveLength(0)
+      expect(logs).toEqual([])
+    },
+  )
+
+  test.each(REACTION_EVENTS)('control: a `%s` event carrying `is_ext_shared_channel: false` on the event, with the envelope\'s flag removed, reaches the reaction intake with the flag absent (read from the envelope only)', async (eventName) => {
+    const h = harness()
+    await bringUpBoth(h)
+    const intake = flagIntake()
+    plugRouter(h, intake)
+    const event = reactionEvent(eventName, { is_ext_shared_channel: false })
+
+    await h.stub(h.A).socket.deliver(event, ENVELOPE_FLAG_FORMS.absent)
+
+    expect(intake.reactions).toHaveLength(1)
+    expect(intake.reactions[0]!.event).toBe(event)
+    expect(intake.reactions[0]!.flag).toBeUndefined()
+  })
+
+  test.each(REACTION_EVENTS)('a `%s` listener argument with no envelope (`body`) reaches the reaction intake with its own ack and the flag absent, and the router acks nothing for an intake that does not ack', async (eventName) => {
+    const h = harness()
+    const intake = flagIntake({ ackReactions: false })
+    const { router, logs } = plugRouter(h, intake)
+    const event = reactionEvent(eventName)
+    const ack = recordingAck()
+
+    await router(h.A.key, eventName, { event, ack: ack.ack })
+
+    expect(intake.reactions).toHaveLength(1)
+    expect(intake.reactions[0]!.event).toBe(event)
+    expect(intake.reactions[0]!.ack).toBe(ack.ack)
+    expect(intake.reactions[0]!.key).toBe(h.A.key)
+    expect(intake.reactions[0]!.flag).toBeUndefined()
+    expect(ack.count()).toBe(0)
+    expect(logs).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// reactions on each connection
+// ---------------------------------------------------------------------------
+
+describe('each connection\'s reaction events reach the reaction intake with its own persona key', () => {
+  test('real routing over the manager: a person\'s reaction to A\'s message received on A\'s connection is stored for A alone; B\'s bot reacting to it (a Run Bot Identity the manager confirmed) and B\'s connection receiving the same reaction store nothing; each envelope is acked once on its own socket', async () => {
+    const h = harness()
+    await bringUpBoth(h)
+    // A serves CS: a stored choice and verified membership (a reaction needs both).
+    const { routing, logs, queue } = managedRouting(h)
+    plugRouter(h, routing)
+    const aBot = h.identityFor(h.A.key)!.botUserId
+    const bBot = h.identityFor(h.B.key)!.botUserId
+    const bCallsBefore = slackCalls(h.stub(h.B))
+
+    const personTs = '1700000001.000001'
+    await h.stub(h.A).socket.deliver(reactionEvent('reaction_added', { item_user: aBot, event_ts: personTs }))
+    await h.stub(h.A).socket.deliver(reactionEvent('reaction_added', { item_user: aBot, user: bBot, event_ts: '1700000001.000002' }))
+    await h.stub(h.B).socket.deliver(reactionEvent('reaction_removed', { item_user: aBot, event_ts: '1700000001.000003' }))
+
+    expect(queue.items(h.A.key)!.map((i) => [i.accepted.source, i.accepted.ts])).toEqual([['reaction', personTs]])
+    expect(queue.items(h.B.key)).toEqual([])
+    expect(h.stub(h.A).socket.acks).toHaveLength(2)
+    expect(h.stub(h.B).socket.acks).toHaveLength(1)
+    expect(slackCalls(h.stub(h.B))).toBe(bCallsBefore)
+    expect(logs.filter((l) => l.includes('RAW'))).toEqual([])
+    assertNoLeak({ logs })
+  })
+
+  test('a throw from the reaction intake on A\'s connection is logged with A\'s key and its message redacted, token-safely, is not acked by the router, never reaches the manager, and B\'s reactions still reach the intake', async () => {
+    const h = harness()
+    await bringUpBoth(h)
+    const intake = recordingIntake()
+    const throwing: RouterIntakes = {
+      receive: intake.receive,
+      receiveReaction: async (event, ack, key) => {
+        if (key === h.A.key) throw Object.assign(new Error(markedMessage('boom')), { code: 'EBOOM' })
+        return intake.receiveReaction(event, ack, key)
+      },
+    }
+    const { logs } = plugRouter(h, throwing)
+
+    await h.stub(h.A).socket.deliver(reactionEvent('reaction_added'))
+    const onB = reactionEvent('reaction_removed')
+    await h.stub(h.B).socket.deliver(onB)
+
+    const failed = logs.filter((l) => l.includes('event handling failed'))
+    expect(failed).toHaveLength(1)
+    expect(failed[0]).toStartWith(`[slack] persona=${h.A.key}: reaction_added event handling failed: Error code=EBOOM`)
+    expect(failed[0]).toContain(redactedMessageField('boom'))
+    expect(h.stub(h.A).socket.acks).toHaveLength(0)
+    expect(intake.reactions).toEqual([{ event: onB, key: h.B.key }])
+    expect(intake.calls).toEqual([])
+    expect(h.stub(h.B).socket.acks).toHaveLength(1)
+    expect(h.lines.filter((l) => l.includes('event handler failed'))).toEqual([])
+    assertNoLeak({ logs, lines: h.lines })
   })
 })
 
@@ -980,6 +1233,35 @@ describe('carry: clientFor serves A\'s long-lived client only while A is serving
 // carry: `reply` uploads on the long-lived client (README 30 s note)
 // ---------------------------------------------------------------------------
 
+/** A's session server with an MCP client connected to it, sending from `<dir>/state/inbox`. */
+async function openReplySession(
+  h: ConnectionHarness & { A: Persona; B: Persona },
+  { getPersona, clientFor, ownPosts }: Pick<SessionToolDeps, 'getPersona' | 'clientFor' | 'ownPosts'>,
+): Promise<{ client: Client; stateDir: string; inboxDir: string }> {
+  const stateDir = join(dir, 'state')
+  const inboxDir = join(stateDir, 'inbox')
+  mkdirSync(inboxDir, { recursive: true })
+  const deps: SessionToolDeps = {
+    assertSendable: (p) => assertSendable(p, stateDir, inboxDir, credentialsFilesToProtect(h.config!.personas, join(stateDir, 'config.json'))),
+    getReplySettings: () => ({ reply_chunk_limit: DEFAULT_REPLY_CHUNK_LIMIT, reply_chunk_mode: DEFAULT_REPLY_CHUNK_MODE }),
+    getPersona,
+    clientFor,
+    inboxDir,
+    resolveUserName: async (_key, userId) => userId,
+    consumeAck,
+    serverPort: 0,
+    ...(ownPosts ? { ownPosts } : {}),
+  }
+  const entry = registerSession(h.A.working_directory, h.A.key, makeTransport(`mcp-${h.A.key}`), makeSessionServer([]))
+  const server = createSessionServer(entry, deps)
+  const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair()
+  await server.connect(serverTransport)
+  const client = new Client({ name: 'wiring-test', version: '1.0.0' }, { capabilities: {} })
+  await client.connect(clientTransport)
+  openClients.push(client)
+  return { client, stateDir, inboxDir }
+}
+
 describe('carry: reply file uploads go through the manager\'s long-lived client (README "File attachment fails after a long wait")', () => {
   test('each persona\'s long-lived Web client is built once with longLivedWebClientOptions(): a 30 s per-attempt timeout, the library\'s default retries and a logger of its own', async () => {
     const h = harness()
@@ -1003,32 +1285,12 @@ describe('carry: reply file uploads go through the manager\'s long-lived client 
   test('a reply with a file, through clientFor, uploads on A\'s long-lived client and on no other client', async () => {
     const h = harness()
     await bringUpBoth(h)
-    const stateDir = join(dir, 'state')
-    const inboxDir = join(stateDir, 'inbox')
-    mkdirSync(inboxDir, { recursive: true })
+    const { client, inboxDir } = await openReplySession(h, { getPersona: (key) => h.getPersona(key), clientFor: h.clientFor })
     const file = join(inboxDir, 'report.txt')
     writeFileSync(file, 'report')
     const webA = h.manager.webClient(h.A.key)!
     const uploadSpy = spyOn(webA, 'filesUploadV2')
     const postSpy = spyOn(webA.chat, 'postMessage')
-
-    const deps: SessionToolDeps = {
-      assertSendable: (p) => assertSendable(p, stateDir, inboxDir, credentialsFilesToProtect(h.config!.personas, join(stateDir, 'config.json'))),
-      getReplySettings: () => ({ reply_chunk_limit: DEFAULT_REPLY_CHUNK_LIMIT, reply_chunk_mode: DEFAULT_REPLY_CHUNK_MODE }),
-      getPersona: (key) => h.getPersona(key),
-      clientFor: h.clientFor,
-      inboxDir,
-      resolveUserName: async (_key, userId) => userId,
-      consumeAck,
-      serverPort: 0,
-    }
-    const entry = registerSession(h.A.working_directory, h.A.key, makeTransport(`mcp-${h.A.key}`), makeSessionServer([]))
-    const server = createSessionServer(entry, deps)
-    const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair()
-    await server.connect(serverTransport)
-    const client = new Client({ name: 'wiring-test', version: '1.0.0' }, { capabilities: {} })
-    await client.connect(clientTransport)
-    openClients.push(client)
     const bBefore = slackCalls(h.stub(h.B))
 
     const result = (await client.callTool({ name: 'reply', arguments: { chat_id: CA, text: 'attached', files: [file] } })) as {
@@ -1039,10 +1301,158 @@ describe('carry: reply file uploads go through the manager\'s long-lived client 
     expect(result.isError).toBeUndefined()
     expect(postSpy).toHaveBeenCalledTimes(1)
     expect(uploadSpy).toHaveBeenCalledTimes(1)
-    expect(uploadSpy.mock.calls[0]![0]).toEqual({ channel_id: CA, file, filename: OWN_POST_UPLOAD_FILENAME } as never)
+    const posted = (await postSpy.mock.results[0]!.value) as { ts: string }
+    expect(uploadSpy.mock.calls[0]![0]).toEqual({
+      channel_id: CA,
+      file_uploads: [{ file, filename: 'report.txt' }],
+      thread_ts: posted.ts,
+    } as never)
     expect(h.stub(h.A).calls.filesUploadV2).toHaveLength(1)
     expect(slackCalls(h.stub(h.B))).toBe(bBefore)
     assertNoLeak({ result, consoleLines })
+  })
+
+  // Library integration: what the real WebClient's filesUploadV2 sends for the reply's arguments.
+  test('a reply with a mention and two files, on a real long-lived WebClient against a local Slack Web API: each upload URL is asked for under the file\'s own name, and one completion shares both files in the text\'s thread with the mention', async () => {
+    const h = harness()
+    const mention = '<@U0WIREM01>'
+    const postedTs = '1800000000.000001'
+    const calls: Array<{ method: string; params: Record<string, string> }> = []
+    const uploaded: string[] = []
+    const issuedNames: Record<string, string> = {}
+    const api = serveSlackApi(async req => {
+      const url = new URL(req.url)
+      if (url.pathname.startsWith('/upload/')) {
+        await req.arrayBuffer()
+        uploaded.push(url.pathname)
+        return new Response('OK')
+      }
+      const method = url.pathname.replace(/^\/api\//, '')
+      const params = Object.fromEntries(new URLSearchParams(await req.text()))
+      calls.push({ method, params })
+      switch (method) {
+        case 'chat.postMessage':
+          return Response.json({ ok: true, channel: params['channel'], ts: postedTs })
+        case 'files.getUploadURLExternal': {
+          const id = `F0WIRE${calls.length}`
+          issuedNames[id] = params['filename']!
+          return Response.json({ ok: true, upload_url: `${url.origin}/upload/${id}`, file_id: id })
+        }
+        case 'files.completeUploadExternal':
+          return Response.json({ ok: true, files: (JSON.parse(params['files']!) as Array<{ id: string; title: string }>).map(f => ({ id: f.id, title: f.title })) })
+        default:
+          return Response.json({ ok: true })
+      }
+    })
+    try {
+      const web = PRODUCTION_SLACK_CLIENT_FACTORY.createWebClient(fakeToken(BOT_TOKEN_PREFIX, 'reply'), {
+        ...longLivedWebClientOptions(),
+        slackApiUrl: api.url,
+      }) as WebClient
+      const { client, inboxDir } = await openReplySession(h, {
+        getPersona: (key) => (key === h.A.key ? h.A : undefined),
+        clientFor: (key) => (key === h.A.key ? web : undefined),
+      })
+      const files = ['plan.md', 'diagram.png'].map(name => {
+        const path = join(inboxDir, name)
+        writeFileSync(path, name)
+        return path
+      })
+
+      let result: unknown
+      const output = await outputDuringAsync(async () => {
+        result = await client.callTool({ name: 'reply', arguments: { chat_id: CA, text: `${mention} here is the plan`, files } })
+      })
+
+      assertNoLeak({ result, calls, output })
+      expect(output).toEqual([])
+      expect((result as { isError?: boolean }).isError).toBeUndefined()
+      const urlRequests = calls.filter(c => c.method === 'files.getUploadURLExternal')
+      expect(urlRequests.map(c => c.params['filename']).sort()).toEqual(['diagram.png', 'plan.md'])
+      expect(uploaded).toHaveLength(2)
+      const completions = calls.filter(c => c.method === 'files.completeUploadExternal')
+      expect(completions).toHaveLength(1)
+      const completion = completions[0]!.params
+      expect(completion['channel_id']).toBe(CA)
+      expect(completion['thread_ts']).toBe(postedTs)
+      expect(completion['initial_comment']).toBe(mention)
+      const shared = JSON.parse(completion['files']!) as Array<{ id: string; title: string }>
+      expect(Object.fromEntries(shared.map(f => [f.id, f.title]))).toEqual(issuedNames)
+      expect(calls.map(c => c.method)).toEqual([
+        'chat.postMessage',
+        'files.getUploadURLExternal',
+        'files.getUploadURLExternal',
+        'files.completeUploadExternal',
+      ])
+    } finally {
+      api.server.stop(true)
+    }
+  })
+
+  // The integration scripts' Slack stub (test-29, test-49) through the same
+  // real upload path: one completion carries both files, so its answer must
+  // name each one, or registry.ts confirms only the first.
+  test('a reply with two files against the integration Slack stub: its one completion answers each file with the request\'s id and title, and each file\'s own operation is confirmed with the id it was uploaded under', async () => {
+    const h = harness()
+    const recordPath = join(dir, 'stub-record.jsonl')
+    const stub = startSlackStub({ recordPath })
+    const ends: Array<{ name: string; answer: OwnPostAnswer }> = []
+    const ownPosts: OwnPostObserver = {
+      start: (_key, _surface, _target, content) => ({ operation: { name: content.kind === 'file' ? content.name : 'text' } as unknown as OwnPostOperation }),
+      end: (operation, answer) => { ends.push({ name: (operation as unknown as { name: string }).name, answer }) },
+    }
+    // Output, results, own-post answers, stub records and any caught error are
+    // leak-checked, on a failing assertion too.
+    const captured: unknown[] = [ends]
+    try {
+      const web = PRODUCTION_SLACK_CLIENT_FACTORY.createWebClient(fakeToken(BOT_TOKEN_PREFIX, 'stub-reply'), {
+        ...longLivedWebClientOptions(),
+        slackApiUrl: stub.apiUrl,
+      }) as WebClient
+      const { client, inboxDir } = await openReplySession(h, {
+        getPersona: (key) => (key === h.A.key ? h.A : undefined),
+        clientFor: (key) => (key === h.A.key ? web : undefined),
+        ownPosts,
+      })
+      const files = ['plan.md', 'diagram.png'].map(name => {
+        const path = join(inboxDir, name)
+        writeFileSync(path, name)
+        return path
+      })
+
+      // A rejection stays inside the capture, so its recorded output is still
+      // returned and scanned; the original failure is rethrown afterwards.
+      let result: unknown, rejected: { error: unknown } | undefined
+      const output = await outputDuringAsync(async () => {
+        try { result = await client.callTool({ name: 'reply', arguments: { chat_id: CA, text: '', files } }) } catch (error) { rejected = { error } }
+      })
+      captured.push(result, output)
+      if (rejected) throw rejected.error
+      const direct = await fetch(`${stub.apiUrl}files.completeUploadExternal`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${fakeToken(BOT_TOKEN_PREFIX, 'stub-direct')}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ channel_id: CA, files: JSON.stringify([{ id: 'F0DIRECT01', title: 'a.md' }, { id: 'F0DIRECT02', title: 'b.png' }]) }),
+      }).then(r => r.json())
+      captured.push(direct)
+      const records = readFileSync(recordPath, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+
+      expect(output).toEqual([])
+      expect((result as { isError?: boolean }).isError).toBeUndefined()
+      const uploaded = records.filter(r => r.event === 'upload').map(r => r.file_id as string)
+      expect(uploaded).toHaveLength(2)
+      expect(records.filter(r => r.event === 'api' && r.method === 'files.completeUploadExternal').map(r => r.answer)).toEqual(['ok', 'ok'])
+      expect(ends.map(e => [e.name, e.answer.kind])).toEqual([['plan.md', 'confirmed'], ['diagram.png', 'confirmed']])
+      expect(ends.map(e => (e.answer as { file?: string }).file).sort()).toEqual([...uploaded].sort())
+      expect(ends.every(e => (e.answer as { channel?: string }).channel === CA)).toBe(true)
+      expect(direct).toEqual({ ok: true, files: [{ id: 'F0DIRECT01', title: 'a.md' }, { id: 'F0DIRECT02', title: 'b.png' }] })
+    } catch (error) {
+      captured.push(error)
+      throw error
+    } finally {
+      try { await stub.stop() } catch (error) { captured.push(error); throw error } finally {
+        assertNoLeak({ captured, record: existsSync(recordPath) ? readFileSync(recordPath, 'utf8') : '' })
+      }
+    }
   })
 })
 
@@ -1065,9 +1475,15 @@ function loggersOf(client: SocketModeClient): { own: unknown; webClient: unknown
   return { own: inner.logger, webClient: inner.webClient.logger }
 }
 
-/** A local stand-in for Slack's Web API (port 0): every method answers `answer`. The caller stops it. */
-function serveSlackApi(answer: Record<string, unknown>): { server: ReturnType<typeof Bun.serve>; url: string } {
-  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => Response.json(answer) })
+/**
+ * A local stand-in for Slack's Web API (port 0): every request is answered
+ * with `answer`, or with what `answer` returns for it. The caller stops it.
+ */
+function serveSlackApi(
+  answer: Record<string, unknown> | ((req: Request) => Response | Promise<Response>),
+): { server: ReturnType<typeof Bun.serve>; url: string } {
+  const fetch = typeof answer === 'function' ? answer : () => Response.json(answer)
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch })
   return { server, url: `http://127.0.0.1:${server.port}/api/` }
 }
 

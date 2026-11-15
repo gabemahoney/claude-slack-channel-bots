@@ -45,6 +45,10 @@ import {
   CI_LIVE_RUNNER_ALLOWANCE_BYTES,
   CI_REQUIRES_KEYWORD,
   CPUS_PER_SHARD,
+  BURST_DRIVER_SCRIPTS,
+  DRIVER_CPUS,
+  DRIVER_SHARD_SECURITY_OPT,
+  DRIVER_SHARD_CGROUPNS,
   DEFAULT_ESTIMATE_SECONDS,
   DEFAULT_TEMP_DIR,
   DEPENDENCY_FINGERPRINT_FILE_NAME,
@@ -206,6 +210,9 @@ import { runtimeSpecifiers, stripComments } from './test-helpers/source-audit.ts
 /** The repository root: this file sits in `tests/`. */
 const REPO_ROOT = join(import.meta.dir, '..')
 
+/** The import-free memory measure the runner shares with /ci-live's watchdog. */
+const SHARED_MEMORY_MEASURE = './non-reclaimable-memory.ts'
+
 /** The runner's source text, read when a case runs. */
 function runnerSource(): string {
   return readFileSync(join(REPO_ROOT, RUNNER_PATH_SUFFIX), 'utf-8')
@@ -364,11 +371,17 @@ describe('module properties', () => {
 
   test('runtime loads use built-ins and the import-safe Codex policy, with no production modules', () => {
     const specifiers = runtimeSpecifiers(stripComments(runnerSource()))
-    const allowed = (specifier: string): boolean => specifier.startsWith('node:') || specifier === 'bun' || specifier === 'bun:ffi' || specifier === './codex-login.ts' || specifier === './safe-docker-inspect.ts'
+    const allowed = (specifier: string): boolean => specifier.startsWith('node:') || specifier === 'bun' || specifier === 'bun:ffi' || specifier === './codex-login.ts' || specifier === './safe-docker-inspect.ts' || specifier === SHARED_MEMORY_MEASURE
 
     expect(specifiers.length).toBeGreaterThan(0)
     expect(specifiers.filter((specifier) => !allowed(specifier))).toEqual([])
     expect(specifiers.filter((specifier) => /(^|\/)(src|ci-live)\//.test(specifier))).toEqual([])
+  })
+
+  test("the memory measure shared with /ci-live is loaded and loads nothing itself", () => {
+    expect(runtimeSpecifiers(stripComments(runnerSource()))).toContain(SHARED_MEMORY_MEASURE)
+    const shared = readFileSync(join(REPO_ROOT, 'scripts', SHARED_MEMORY_MEASURE), 'utf-8')
+    expect(runtimeSpecifiers(stripComments(shared))).toEqual([])
   })
 })
 
@@ -1050,6 +1063,10 @@ const CONSTANT_PINS: readonly (readonly [string, unknown, unknown])[] = [
   // CPUs and ranges.
   ['CI_CPUS', CI_CPUS, 12],
   ['CPUS_PER_SHARD', CPUS_PER_SHARD, 2],
+  ['DRIVER_CPUS', DRIVER_CPUS, 1],
+  ['BURST_DRIVER_SCRIPTS', BURST_DRIVER_SCRIPTS, /-fmk-(?:thread-burst|membership-load(?:-open)?)\.sh$/],
+  ['DRIVER_SHARD_SECURITY_OPT', DRIVER_SHARD_SECURITY_OPT, 'writable-cgroups=true'],
+  ['DRIVER_SHARD_CGROUPNS', DRIVER_SHARD_CGROUPNS, 'private'],
   ['OPTION_RANGE_MIN', OPTION_RANGE_MIN, 1],
   ['MAX_SHARDS', MAX_SHARDS, 6],
   ['MAX_SHARD_TIMEOUT_MINUTES', MAX_SHARD_TIMEOUT_MINUTES, 720],

@@ -1,6 +1,8 @@
 /** Shared byte-level journal operations. Construction performs no I/O. */
 import * as nodeFs from 'node:fs'
 import { randomUUID } from 'node:crypto'
+import { types } from 'node:util'
+import { durableUnlinkSync } from './atomic-write.ts'
 
 export interface AppendRollback { pendingRollback?: number }
 export interface JournalLine {
@@ -30,6 +32,83 @@ export function removeTornTail(rollback: AppendRollback, line: JournalLine): voi
  * a resolved promise would not, because microtasks run before them. */
 export function yieldToEventLoop(): Promise<void> {
   return new Promise(resolve => setImmediate(resolve))
+}
+
+const NOT_JOURNAL_DATA = Symbol('not journal data')
+/** Objects found frozen and plain data all the way down. They can never
+ * change, so their properties are read without inspecting them again. */
+const frozenData = new WeakSet<object>()
+/** Whether `source` is an array, or else whether it is an object with a plain
+ * object's prototype; throws for anything else. Runs no code of `source`'s,
+ * as a proxy's traps would. */
+function plainShape(source: object): boolean {
+  if (types.isProxy(source)) throw NOT_JOURNAL_DATA
+  const prototype = Object.getPrototypeOf(source)
+  if (Array.isArray(source)) {
+    // A hole or a named property needs structuredClone's array form.
+    if (prototype !== Array.prototype || Object.keys(source).length !== source.length) throw NOT_JOURNAL_DATA
+    return true
+  }
+  if (prototype !== Object.prototype && prototype !== null) throw NOT_JOURNAL_DATA
+  return false
+}
+/** An own enumerable data property's value, read without calling an accessor. */
+function dataProperty(source: object, key: string | number): unknown {
+  // Assigning `__proto__` would set the prototype, not an own property.
+  if (key === '__proto__') throw NOT_JOURNAL_DATA
+  const property = Object.getOwnPropertyDescriptor(source, key)
+  if (!property?.enumerable || !('value' in property)) throw NOT_JOURNAL_DATA
+  return property.value
+}
+function frozenDataValue(value: unknown): boolean {
+  return typeof value !== 'object' || value === null || frozenData.has(value)
+}
+/** `structuredClone` of journal and state data without its serialisation
+ * round trip, which copies every string: plain objects and dense arrays of
+ * enumerable data properties, and scalars, shared and cyclic references kept
+ * as `structuredClone` keeps them. Any other value goes to `structuredClone`
+ * itself, untouched: the copy runs no code of the value's first.
+ *
+ * Contract: pass only data CSCB built itself (parsed JSON, its own records)
+ * or values `structuredClone` already copied. Their plain objects are
+ * ordinary, so the copy equals `structuredClone`'s. A caller-supplied value
+ * can be anything, such as an object with internal slots behind a plain
+ * object's prototype, which this copy would take for plain data: every entry
+ * point taking one copies it with `structuredClone` itself. */
+export function cloneJournalData<T>(value: T): T {
+  const copies = new Map<object, unknown>()
+  const copy = (source: unknown): unknown => {
+    if (typeof source === 'function' || typeof source === 'symbol') throw NOT_JOURNAL_DATA
+    if (typeof source !== 'object' || source === null) return source
+    const seen = copies.get(source)
+    if (seen !== undefined) return seen
+    // Frozen data's properties are known to be plain data.
+    const known = frozenData.has(source)
+    const array = known ? Array.isArray(source) : plainShape(source)
+    let frozen = !known && Object.isFrozen(source)
+    if (array) {
+      const list = source as unknown[], target: unknown[] = []
+      copies.set(source, target)
+      for (let i = 0; i < list.length; i++) {
+        const member = known ? list[i] : dataProperty(list, i)
+        target.push(copy(member))
+        frozen &&= frozenDataValue(member)
+      }
+      if (frozen) frozenData.add(source)
+      return target
+    }
+    const record = source as Record<string, unknown>, target: Record<string, unknown> = {}
+    copies.set(source, target)
+    for (const key of Object.keys(record)) {
+      const member = known ? record[key] : dataProperty(record, key)
+      target[key] = copy(member)
+      frozen &&= frozenDataValue(member)
+    }
+    if (frozen) frozenData.add(source)
+    return target
+  }
+  // The copy ran no code of the value's, so `structuredClone` sees it as given.
+  try { return copy(value) as T } catch { return structuredClone(value) }
 }
 
 export interface DurableJournalOptions {
@@ -64,13 +143,35 @@ export function setDurableAppendTimer(timer: DurableAppendTimer | undefined): vo
 type DurableStep = { op: 'fsync'; fd: number; target: 'file' | 'dir' } | { op: 'rename'; from: string; to: string }
 type DurableSteps = Generator<DurableStep, void, void>
 interface StepTimes { now(): number; fileFsyncMs: number; dirFsyncMs: number; fsyncs: number }
+interface FileIdentity { dev: number; ino: number; birthtimeMs: number }
+const sameFile = (a: FileIdentity, b: FileIdentity) => a.dev === b.dev && a.ino === b.ino && a.birthtimeMs === b.birthtimeMs
+/** `readFileSync`'s steps after a successful open. */
+const AFTER_OPEN_SYSCALLS = new Set(['read', 'fstat'])
 export function createDurableJournal(options: DurableJournalOptions) {
   const fs = options.fs ?? nodeFs, dir = options.dir
   let durableDirectory: { dev: number; ino: number } | undefined
-  const fileModes = new Map<string, { dev: number; ino: number; birthtimeMs: number }>()
+  const fileModes = new Map<string, FileIdentity>()
   // Concurrent personas share this directory. Only the latest ensure may
   // publish its identity, so an older one cannot vouch for a recreation.
   let directoryGeneration = 0
+  // A file's entry in `dir` is known durable only once a directory fsync that
+  // started after the entry was created, replaced by rename or first opened in
+  // this run has succeeded. Each of those events, and each fsync's start, takes
+  // the next tick; entries opened before `durableBefore` are known durable.
+  // Ticks order events on this thread, so concurrent personas' fsyncs, in
+  // either run form, can only vouch for what preceded their start.
+  let tick = 0, durableBefore = 0
+  let seenDirectory: { dev: number; ino: number } | undefined
+  const entries = new Map<string, { opened: number; file?: FileIdentity }>()
+  /** This run's first opening of `path`, unless the entry is already tracked. */
+  function opened(path: string): void { if (!entries.has(path)) entries.set(path, { opened: ++tick }) }
+  function knownDurable(path: string): boolean { const entry = entries.get(path); return entry !== undefined && entry.opened < durableBefore }
+  /** A file at `path` other than the one last seen there is a new entry. */
+  function noteFile(path: string, stat: nodeFs.Stats): void {
+    const entry = entries.get(path)!, file = { dev: stat.dev, ino: stat.ino, birthtimeMs: stat.birthtimeMs }
+    if (entry.file && !sameFile(entry.file, file)) entry.opened = ++tick
+    entry.file = file
+  }
   function runSync(steps: DurableSteps): void {
     for (let next = steps.next(); !next.done;) {
       const step = next.value
@@ -104,16 +205,32 @@ export function createDurableJournal(options: DurableJournalOptions) {
     try {
       const atMonoMs = timer.now()
       let records = 0
-      for (const byte of bytes) if (byte === 10) records++
+      for (let at = bytes.indexOf(10); at >= 0; at = bytes.indexOf(10, at + 1)) records++
       timer.record({ dir, path, records, bytes: bytes.length, appendMs: atMonoMs - started,
         fileFsyncMs: times.fileFsyncMs, dirFsyncMs: times.dirFsyncMs, fsyncs: times.fsyncs, atMonoMs })
     } catch { /* a measurement cannot change a durable append's outcome */ }
   }
   function* syncDir(path: string): DurableSteps { const fd = fs.openSync(path, 'r'); try { yield { op: 'fsync', fd, target: 'dir' } } finally { fs.closeSync(fd) } }
+  function* syncJournalDir(): DurableSteps {
+    const started = ++tick
+    yield* syncDir(dir)
+    durableBefore = Math.max(durableBefore, started)
+  }
   function* ensureDirSteps(): DurableSteps {
+    if (durableDirectory) {
+      // A directory still known durable, with its identity and mode, exists:
+      // mkdir would create nothing, and the walk below would return here.
+      let stat: nodeFs.Stats | undefined
+      try { stat = fs.statSync(dir) } catch { /* the full ensure below decides */ }
+      if (stat?.isDirectory() && stat.dev === durableDirectory.dev && stat.ino === durableDirectory.ino &&
+          (stat.mode & 0o7777) === options.directoryMode) return
+    }
     // A recreated directory may reuse the cached device/inode identity.
-    if (fs.mkdirSync(dir, { recursive: true, mode: options.directoryMode }) !== undefined) { durableDirectory = undefined; fileModes.clear(); directoryGeneration++ }
+    if (fs.mkdirSync(dir, { recursive: true, mode: options.directoryMode }) !== undefined) { durableDirectory = undefined; fileModes.clear(); entries.clear(); directoryGeneration++ }
     const stat = fs.statSync(dir)
+    // Every file in a replaced directory is new to this run.
+    if (seenDirectory && (seenDirectory.dev !== stat.dev || seenDirectory.ino !== stat.ino)) entries.clear()
+    seenDirectory = { dev: stat.dev, ino: stat.ino }
     if (durableDirectory?.dev === stat.dev && durableDirectory.ino === stat.ino && (stat.mode & 0o7777) === options.directoryMode) return
     durableDirectory = undefined
     const generation = ++directoryGeneration
@@ -137,22 +254,32 @@ export function createDurableJournal(options: DurableJournalOptions) {
   function* appendSteps(path: string, bytes: Uint8Array, rollback?: AppendRollback): DurableSteps {
     yield* ensureDirSteps()
     const fd = fs.openSync(path, 'a+', options.fileMode)
+    // This open may have created the file or be this run's first opening of it.
+    opened(path)
     let original: number | undefined
     try {
       // A failed reconciliation still owes the original rollback, not the
       // current file length, which may contain an unaccepted append.
       const stat = fs.fstatSync(fd)
+      noteFile(path, stat)
       original = rollback?.pendingRollback ?? stat.size
       ensureFileMode(path, fd, stat)
       if (rollback?.pendingRollback !== undefined) {
         fs.ftruncateSync(fd, rollback.pendingRollback); yield { op: 'fsync', fd, target: 'file' }
         original = rollback.pendingRollback; delete rollback.pendingRollback
       }
-      if (original > 0) { const last = Buffer.alloc(1); fs.readSync(fd, last, 0, 1, original - 1); if (last[0] !== 10) writeAll(fd, Buffer.from('\n')) }
+      if (original > 0) {
+        // Metadata can stay unchanged across a same-size external edit. Check
+        // the actual tail on every append, using the descriptor already open.
+        const last = Buffer.alloc(1)
+        fs.readSync(fd, last, 0, 1, original - 1)
+        if (last[0] !== 10) writeAll(fd, Buffer.from('\n'))
+      }
       writeAll(fd, bytes)
       yield { op: 'fsync', fd, target: 'file' }
-      // Always sync: a previous failed first append may have left an unsynced directory entry.
-      yield* syncDir(dir)
+      // Only a successful directory fsync that started after the entry was
+      // created, replaced or first opened in this run makes it known durable.
+      if (!knownDurable(path)) yield* syncJournalDir()
     } catch (error) {
       if (rollback && original !== undefined) {
         rollback.pendingRollback ??= original
@@ -167,13 +294,17 @@ export function createDurableJournal(options: DurableJournalOptions) {
     try {
       const fd = fs.openSync(temp, 'wx', options.fileMode)
       try { writeAll(fd, bytes); yield { op: 'fsync', fd, target: 'file' } } finally { fs.closeSync(fd) }
-      yield { op: 'rename', from: temp, to: path }
-      yield* syncDir(dir)
+      // A failed rename may have replaced the entry or left no file, so the
+      // path is untracked until its next opening, a creating append's included.
+      try { yield { op: 'rename', from: temp, to: path } } catch (error) { entries.delete(path); throw error }
+      entries.set(path, { opened: ++tick })
+      yield* syncJournalDir()
     } finally { try { fs.unlinkSync(temp) } catch { /* rename consumed temp */ } }
   }
   function* reconcileSteps(path: string, j: AppendRollback): DurableSteps {
     if (j.pendingRollback !== undefined) {
       const fd = fs.openSync(path, 'r+')
+      opened(path)
       try { fs.ftruncateSync(fd, j.pendingRollback); yield { op: 'fsync', fd, target: 'file' }; delete j.pendingRollback } finally { fs.closeSync(fd) }
     }
   }
@@ -190,5 +321,31 @@ export function createDurableJournal(options: DurableJournalOptions) {
     durableAppendSync: (path: string, bytes: Uint8Array, rollback?: AppendRollback): void => runSync(appendSteps(path, bytes, rollback)),
     reconcileRollback: (path: string, j: AppendRollback): Promise<void> => run(reconcileSteps(path, j)),
     rewrite: (path: string, bytes: Uint8Array): Promise<void> => run(rewriteSteps(path, bytes)),
+    /** The caller's read of the file at `path`. A successful open is an opening
+     * even if the read then fails, so a failure counts only when it names a
+     * step after the open. Any other failure, ENOENT or one naming no syscall
+     * (a fixture's) included, records nothing: a path must never be tracked
+     * before its creation, and an opening recorded later costs at most one
+     * directory fsync. */
+    read: (path: string): Buffer => {
+      try { const bytes = fs.readFileSync(path); opened(path); return bytes } catch (error) {
+        const { code, syscall } = error as NodeJS.ErrnoException
+        if (code !== 'ENOENT' && syscall !== undefined && AFTER_OPEN_SYSCALLS.has(syscall)) opened(path)
+        throw error
+      }
+    },
+    /** Another module opened the existing file at `path`, such as the seal's read of a queue journal. */
+    opened,
+    /** `durableUnlinkSync` of a file in this directory. A later file at `path`
+     * is new whatever the outcome; a `true` return's directory fsync vouches
+     * for every entry opened before the call. */
+    unlinkSync: (path: string): boolean => {
+      const started = ++tick
+      try {
+        const removed = durableUnlinkSync(path, fs)
+        if (removed) durableBefore = Math.max(durableBefore, started)
+        return removed
+      } finally { entries.delete(path) }
+    },
   }
 }

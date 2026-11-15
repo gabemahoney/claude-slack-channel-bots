@@ -10,7 +10,16 @@
 # SessionStart re-fires every two seconds while AD says pending, until its grace
 # bound, to make lost-create-reply cases deterministic. Exact user messages go
 # to the transcript for receipt assertions. No native dialog bytes are fixtures.
-# Launch argv are recorded under flock; --version only prints its pinned line.
+# displayed-states fires the registered UserPromptSubmit hook on each typed
+# message and holds it until a command in its per-session control file
+# (stub-claude-hooks.<session>): `receipt` writes the held message's
+# transcript record and fires the registered Stop hook at once; opt-in,
+# `receipt-only` writes the record and leaves the turn open (no Stop) until a
+# later `stop` fires Stop. While a turn is open no new message may be typed,
+# and `stop` without an open turn is refused (the stub exits 1).
+# Launch argv are recorded under flock, shell-quoted in stub-claude-launch-args
+# and as one JSON object per launch (cwd, instance_id, argv elements whole) in
+# stub-claude-launches.jsonl; --version only prints its pinned line.
 
 set -uo pipefail
 
@@ -100,6 +109,24 @@ launch_args_line=""
 printf -v launch_args_line '%q ' "$@"
 { /usr/bin/flock -x 9 && printf '%s\n' "${launch_args_line% }" >&9; } 9>> "${STUB_LAUNCH_ARGS_FILE}" 2> /dev/null \
     || printf 'stub-claude[%s]: could not record the launch arguments in %s\n' "$$" "${STUB_LAUNCH_ARGS_FILE}" >&2
+
+# A second record of every launch, for reading one launch's argument elements
+# exactly: one JSON object per line appended to `stub-claude-launches.jsonl`
+# beside the stub, `{"cwd": <the resolved working directory>, "instance_id":
+# <AGENT_DIRECTOR_INSTANCE_ID, or "" when unset>, "argv": [<each argument
+# element, whole, as the stub received it>]}`. Built by jq and written under
+# flock in one append, as the record above is; a failed build or write is
+# reported on standard error and changes nothing else.
+STUB_LAUNCHES_FILE="${STUB_DIR}/stub-claude-launches.jsonl"
+launch_record=""
+if launch_record="$(jq -nc --arg cwd "${REALCWD}" --arg instance_id "${AGENT_DIRECTOR_INSTANCE_ID:-}" \
+        '{cwd: $cwd, instance_id: $instance_id, argv: $ARGS.positional}' --args -- "$@" 2> /dev/null)" \
+        && [[ -n "${launch_record}" ]]; then
+    { /usr/bin/flock -x 9 && printf '%s\n' "${launch_record}" >&9; } 9>> "${STUB_LAUNCHES_FILE}" 2> /dev/null \
+        || printf 'stub-claude[%s]: could not record the launch in %s\n' "$$" "${STUB_LAUNCHES_FILE}" >&2
+else
+    printf 'stub-claude[%s]: could not build the launch record for %s\n' "$$" "${STUB_LAUNCHES_FILE}" >&2
+fi
 
 MODE="${MODE_AT_ONCE}"
 if [[ -f "${STUB_MODES_FILE}" ]]; then
@@ -227,6 +254,8 @@ DISPLAY_CONTROL="${STUB_DIR}/stub-claude-hooks.${SESSION_ID}"
 DISPLAY_RECORD="${DISPLAY_CONTROL}.jsonl"
 DISPLAY_NEXT=0
 DISPLAY_TEXT=""
+# 1 between `receipt-only` and `stop`: the receipt written, Stop not yet fired.
+DISPLAY_STOP_DUE=0
 declare -A DISPLAY_HOOK_PIDS=()
 display_record() {
     jq -nc --arg command "$1" --arg event "$2" --arg instance "${AGENT_DIRECTOR_INSTANCE_ID:-}" \
@@ -250,6 +279,20 @@ display_controls() {
                 [[ -n "${DISPLAY_TEXT}" ]] || exit 1
                 append_user_receipt "${DISPLAY_TEXT}"
                 DISPLAY_TEXT=""
+                display_payload Stop
+                fire_hooks "${STOP_HOOKS[@]}"
+                display_record "${command}" Stop
+                ;;
+            receipt-only)
+                [[ -n "${DISPLAY_TEXT}" ]] || exit 1
+                append_user_receipt "${DISPLAY_TEXT}"
+                DISPLAY_TEXT=""
+                DISPLAY_STOP_DUE=1
+                display_record "${command}" none
+                ;;
+            stop)
+                (( DISPLAY_STOP_DUE == 1 )) || exit 1
+                DISPLAY_STOP_DUE=0
                 display_payload Stop
                 fire_hooks "${STOP_HOOKS[@]}"
                 display_record "${command}" Stop
@@ -649,7 +692,9 @@ handle_line() {
     # as `/exit` or `/mcp reconnect`) is no message.
     if (( REPORTED )) && [[ "${line}" =~ [^[:space:]] && ! "${line}" =~ ^[[:space:]]*/ ]]; then
         if [[ "${MODE}" == "${MODE_DISPLAYED_STATES}" ]]; then
-            [[ -z "${DISPLAY_TEXT}" ]] || exit 1
+            if [[ -n "${DISPLAY_TEXT}" ]] || (( DISPLAY_STOP_DUE )); then
+                exit 1
+            fi
             DISPLAY_TEXT="${line}"
             display_payload UserPromptSubmit
             fire_hooks "${PROMPT_HOOKS[@]}"

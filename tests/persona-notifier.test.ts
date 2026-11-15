@@ -66,6 +66,7 @@
  * posting independent of bookkeeping. Only eligible channel notices join.
  */
 
+import { SERVER_POST_METADATA, noticePost } from './test-helpers/server-post.ts'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -120,6 +121,7 @@ import { LEAK_SENTINEL, assertNoLeak, sentinelInMessage, writtenFile } from './t
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
+
 
 interface Fixture {
   h: NotifierHarness
@@ -246,8 +248,9 @@ describe('destination and identity', () => {
       expect(h.posts(self.key)).toHaveLength(1)
       const [args] = h.posts(self.key)
       expect(args!.channel).toBe(self.permission_prompts!)
-      // Top-level, persona's own identity: no thread_ts, username or icon override.
-      expect(Object.keys(args!).sort()).toEqual(['channel', 'text'])
+      // Top-level, persona's own identity: no thread_ts, username or icon override; only the Server Post Marker beside the text.
+      expect(Object.keys(args!).sort()).toEqual(['channel', 'metadata', 'text'])
+      expect(args).toEqual(noticePost(self.permission_prompts!, formatPersonaNotice(self, 'Spawn failure:\n  Error: boom')))
       expect(h.posts(peer.key)).toHaveLength(0)
       expect(h.totalPosts()).toBe(1)
 
@@ -302,7 +305,7 @@ describe('the persona reference uses the stored key', () => {
 
     await s.notifier.notify(p.key, 'body')
 
-    expect(s.posts(p.key)).toEqual([{ channel: STAND_IN, text: `Persona ${renderPersonaRef(p.name, p.key)}: body` }])
+    expect(s.posts(p.key)).toEqual([noticePost(STAND_IN, `Persona ${renderPersonaRef(p.name, p.key)}: body`)])
     expect(formatPersonaNotice(p, 'body')).toBe(`Persona "${STAND_IN}" (key=${STAND_IN}): body`)
     expect(s.logs).toEqual([])
     assertNoLeak({ lines: s.logs, posts: s.allPosts() })
@@ -397,10 +400,10 @@ describe('fungible mode: notices go to the fungible destination (beside)', () =>
     expect(text).toContain(ref(self))
     const expectedCalls =
       dmContact === undefined
-        ? [['chat.postMessage', { channel: F_DEST, text }]]
+        ? [['chat.postMessage', { channel: F_DEST, text, metadata: SERVER_POST_METADATA }]]
         : [
             ['conversations.open', { users: dmContact }],
-            ['chat.postMessage', { channel: stubOpenedDmId(dmContact), text }],
+            ['chat.postMessage', { channel: stubOpenedDmId(dmContact), text, metadata: SERVER_POST_METADATA }],
           ]
     // One top-level message: no thread_ts, username or icon override.
     expect(fh.stub(self.key).callLog.map((c) => [c.method, c.args])).toEqual(expectedCalls)
@@ -427,7 +430,7 @@ describe('dm-destination notices', () => {
 
     expect(h.stub(f.D.key).callLog.map((c) => [c.method, c.args])).toEqual([
       ['conversations.open', { users: 'U0DELTA01' }],
-      ['chat.postMessage', { channel: dmId(), text: formatPersonaNotice(f.D, 'Spawn failure:\n  Error: boom') }],
+      ['chat.postMessage', { channel: dmId(), text: formatPersonaNotice(f.D, 'Spawn failure:\n  Error: boom'), metadata: SERVER_POST_METADATA }],
     ])
     for (const p of [f.A, f.B]) expect(methods(p)).toEqual([])
     expect(h.logs).toEqual([])
@@ -440,7 +443,7 @@ describe('dm-destination notices', () => {
     await h.notifier.notify(f.D.key, 'D4')
 
     expect(methods(f.D)).toEqual(['conversations.open', ...Array(4).fill('chat.postMessage')])
-    expect(h.posts(f.D.key)).toEqual(['D1', 'D2', 'D3', 'D4'].map((t) => ({ channel: dmId(), text: formatPersonaNotice(f.D, t) })))
+    expect(h.posts(f.D.key)).toEqual(['D1', 'D2', 'D3', 'D4'].map((t) => noticePost(dmId(), formatPersonaNotice(f.D, t))))
   })
 
   test.each<[string, WebApiOutcome, string, boolean]>([
@@ -476,7 +479,7 @@ describe('dm-destination notices', () => {
       await h.clock.runNext()
 
       expect(methods(f.D)).toEqual(['conversations.open', 'conversations.open', 'chat.postMessage', 'chat.postMessage'])
-      expect(h.posts(f.D.key)).toEqual(['x', 'y'].map((t) => ({ channel: dmId(), text: formatPersonaNotice(f.D, t) })))
+      expect(h.posts(f.D.key)).toEqual(['x', 'y'].map((t) => noticePost(dmId(), formatPersonaNotice(f.D, t))))
       expect(h.logs).toHaveLength(2)
       expect(h.logs[1]).toStartWith(clearedStart(f.D, 'dm'))
       expect(failures).toHaveLength(1)
@@ -507,7 +510,7 @@ describe('dm-destination notices', () => {
     recover(h.stub(f.D.key).script.open)
     await h.clock.runNext()
 
-    expect(h.posts(f.D.key)).toEqual(['D1', 'D2', 'D3'].map((t) => ({ channel: dmId(), text: formatPersonaNotice(f.D, t) })))
+    expect(h.posts(f.D.key)).toEqual(['D1', 'D2', 'D3'].map((t) => noticePost(dmId(), formatPersonaNotice(f.D, t))))
     expect(h.logs).toHaveLength(2)
     expect(h.logs[1]).toStartWith(clearedStart(f.D, 'dm'))
     expect(failed).toEqual(['D1', 'D2', 'D3'])
@@ -538,7 +541,7 @@ describe('dm-destination notices', () => {
     await notifier.notify(f.D.key, 'notice')
 
     expect(methods(f.D)).toEqual(['conversations.open', 'chat.postMessage', 'chat.postMessage'])
-    expect(h.posts(f.D.key).at(-1)).toEqual({ channel: dmId(), text: formatPersonaNotice(f.D, 'notice') })
+    expect(h.posts(f.D.key).at(-1)).toEqual(noticePost(dmId(), formatPersonaNotice(f.D, 'notice')))
     expect(h.logs).toEqual([])
   })
 
@@ -858,7 +861,7 @@ describe('destination failures are held and retried, one line per episode', () =
       // Each notice posted exactly once, in raised order, to the destination (a DM's `D…` ID, never the contact).
       const failedPosts = queue === 'post' ? 4 : 0
       expect(h.posts(p.key).slice(failedPosts)).toEqual(
-        ['Spawn failure:\n  Error: boom', 'second'].map((t) => ({ channel: postedTo, text: formatPersonaNotice(p, t) })),
+        ['Spawn failure:\n  Error: boom', 'second'].map((t) => noticePost(postedTo, formatPersonaNotice(p, t))),
       )
       expect(h.logs).toHaveLength(2)
       expect(h.logs[1]).toStartWith(clearedStart(p, destination))
@@ -904,7 +907,7 @@ describe('destination failures are held and retried, one line per episode', () =
     await h.clock.runNext()
 
     expect(h.clock.now()).toBe(15_000)
-    expect(h.posts(f.D.key)).toEqual([{ channel: stubOpenedDmId(f.D.dm.contact!), text: formatPersonaNotice(f.D, 'd1') }])
+    expect(h.posts(f.D.key)).toEqual([noticePost(stubOpenedDmId(f.D.dm.contact!), formatPersonaNotice(f.D, 'd1'))])
     expect(h.logs).toHaveLength(4)
     expect(h.logs[3]).toStartWith(clearedStart(f.D, 'dm'))
     expect(texts(f.B)).toHaveLength(1)
@@ -1217,7 +1220,7 @@ describe('the persona teardown window: every notice for the key is a log line an
     expectNoSlackCallOrHold()
 
     await h.notifier.notify(f.A.key, 'survivor version', survivor)
-    expect(h.posts(f.A.key)).toEqual([{ channel: f.A.permission_prompts!, text: formatPersonaNotice(f.A, 'survivor version') }])
+    expect(h.posts(f.A.key)).toEqual([noticePost(f.A.permission_prompts!, formatPersonaNotice(f.A, 'survivor version'))])
     expect(h.startupEntries()).toHaveLength(1)
   })
 
@@ -1250,7 +1253,7 @@ describe('the persona teardown window: every notice for the key is a log line an
     expect(h.logs).toEqual([windowLine(f.A, text, classLabel)])
     expect(h.stub(f.A.key).callLog).toEqual([])
     expect(h.hold.view(f.A.key)).toEqual(NOT_HELD)
-    expect(h.posts(f.B.key)).toEqual([{ channel: f.B.permission_prompts!, text: formatPersonaNotice(f.B, text) }])
+    expect(h.posts(f.B.key)).toEqual([noticePost(f.B.permission_prompts!, formatPersonaNotice(f.B, text))])
   })
 
   test('forget in the window drops none of the notices raised in it; a notice queued before the window is dropped by it with its one line, and a flush in the window posts nothing of it', async () => {
@@ -1277,10 +1280,10 @@ describe('the persona teardown window: every notice for the key is a log line an
     for (const p of [f.A, f.B]) h.validate(p.key)
 
     await h.duringTeardown(f.A, () => h.notifier.notify(f.B.key, 'B in A\'s window'))
-    expect(h.posts(f.B.key)).toEqual([{ channel: f.B.permission_prompts!, text: formatPersonaNotice(f.B, 'B in A\'s window') }])
+    expect(h.posts(f.B.key)).toEqual([noticePost(f.B.permission_prompts!, formatPersonaNotice(f.B, 'B in A\'s window'))])
 
     await h.notifier.notify(f.A.key, 'after')
-    expect(h.posts(f.A.key)).toEqual([{ channel: f.A.permission_prompts!, text: formatPersonaNotice(f.A, 'after') }])
+    expect(h.posts(f.A.key)).toEqual([noticePost(f.A.permission_prompts!, formatPersonaNotice(f.A, 'after'))])
 
     h.personas.splice(h.personas.indexOf(f.A), 1)
     await h.duringTeardown(f.A, () => undefined)
@@ -1308,7 +1311,7 @@ describe('the persona teardown window: every notice for the key is a log line an
 
     // The mark is spent: the next all-clear of that class is an ordinary notice.
     await h.notifier.notify(f.A.key, 'all clear again', allClear('ad-unreachable'))
-    expect(h.posts(f.A.key)).toEqual([{ channel: newHalf.permission_prompts!, text: formatPersonaNotice(newHalf, 'all clear again') }])
+    expect(h.posts(f.A.key)).toEqual([noticePost(newHalf.permission_prompts!, formatPersonaNotice(newHalf, 'all clear again'))])
     expect(h.startupEntries()).toHaveLength(2)
   })
 
@@ -1459,7 +1462,7 @@ describe('the persona teardown window: every notice for the key is a log line an
     await h.notifier.notify(f.A.key, onsetText, onset('ad-config-malformed'))
     await h.notifier.notify(f.A.key, 'onset: tmux', onset('tmux-unavailable'))
 
-    expect(h.posts(f.A.key)).toEqual([{ channel: f.A.permission_prompts!, text: formatPersonaNotice(f.A, 'onset: tmux') }])
+    expect(h.posts(f.A.key)).toEqual([noticePost(f.A.permission_prompts!, formatPersonaNotice(f.A, 'onset: tmux'))])
     expect(h.startupEntries()).toEqual([])
     expect(h.logs).toEqual([mutedOnsetLine(f.A, ['ad-config-malformed'], onsetText)])
     expect(h.logs[0]).toContain('config <tmux> section & more is malformed')
@@ -1522,8 +1525,8 @@ describe('the persona teardown window: every notice for the key is a log line an
     ])
     expect(h.logs).toEqual([windowLine(f.A, 'onset: unreachable'), allClearLine(f.A, 'All clear: ad-unreachable')])
     expect(h.posts(f.A.key)).toEqual([
-      { channel: f.A.permission_prompts!, text: formatPersonaNotice(f.A, 'onset: tmux') },
-      { channel: f.A.permission_prompts!, text: formatPersonaNotice(f.A, 'All clear: tmux-unavailable') },
+      noticePost(f.A.permission_prompts!, formatPersonaNotice(f.A, 'onset: tmux')),
+      noticePost(f.A.permission_prompts!, formatPersonaNotice(f.A, 'All clear: tmux-unavailable')),
     ])
   })
 
@@ -1583,7 +1586,7 @@ describe('notices as own-post operations', () => {
         content: { kind: 'text', text: formatPersonaNotice(persona, text) }, operation: starts[0]!.operation,
       }])
       expect(starts[0]!.operation).toBeDefined()
-      expect(h.posts(persona.key)).toEqual([{ channel, text: formatPersonaNotice(persona, text) }])
+      expect(h.posts(persona.key)).toEqual([{ channel, text: formatPersonaNotice(persona, text), metadata: SERVER_POST_METADATA }])
       expect(h.totalPosts()).toBe(1)
       expect(h.stub(persona.key).callLog.map(call => call.method)).toEqual(
         destination === 'dm' ? ['conversations.open', 'chat.postMessage'] : ['chat.postMessage'],
@@ -1623,7 +1626,7 @@ describe('notices as own-post operations', () => {
       gate.resolve()
       await h.clock.flush()
       expect(h.posts(f.A.key)).toEqual(bodies.slice(0, index + 1).map(body => ({
-        channel: f.A.permission_prompts!, text: formatPersonaNotice(f.A, body),
+        channel: f.A.permission_prompts!, text: formatPersonaNotice(f.A, body), metadata: SERVER_POST_METADATA,
       })))
       expect(recording.calls.filter(call => call.kind === 'end').map(call => call.operation)).toEqual(
         starts.slice(0, index + 1).map(call => call.operation),
@@ -1705,7 +1708,7 @@ describe('notices as own-post operations', () => {
         await work
         await owner.flush()
         await baseline.notifier.notify(persona.key, 'Owner-backed notice')
-        expect(h.posts(persona.key)).toEqual([{ channel: target, text: formatPersonaNotice(persona, 'Owner-backed notice') }])
+        expect(h.posts(persona.key)).toEqual([{ channel: target, text: formatPersonaNotice(persona, 'Owner-backed notice'), metadata: SERVER_POST_METADATA }])
         expect(h.allPosts()).toEqual(baseline.allPosts())
         expect(h.logs).toEqual(baseline.logs)
         expect(h.hold.view(persona.key)).toEqual(baseline.hold.view(persona.key))
@@ -1824,7 +1827,7 @@ describe('notice join failures through notifier, owner, store, dispatcher and re
       h.stub(key).script.post.push({ kind: 'ok', result: { ts: THREAD_ROOTS.primary } },
         { kind: 'ok', result: { ts: THREAD_ROOTS.secondary } }, { kind: 'ok', result: { ts: THREAD_ROOTS.third } })
       await h.notifier.notify(key, originalNotice); await owner.flush()
-      const original = { channel, text: formatPersonaNotice(persona, originalNotice) }
+      const original = { channel, text: formatPersonaNotice(persona, originalNotice), metadata: SERVER_POST_METADATA }
       expect(h.posts(key)).toEqual([original])
       expect(episodes.isOpen(key, THREAD_MEMORY_NOT_SAVED)).toBe(true)
       expect(episodes.hasPosted(key, THREAD_MEMORY_NOT_SAVED)).toBe(false)
@@ -1836,7 +1839,7 @@ describe('notice join failures through notifier, owner, store, dispatcher and re
         const mention = owner.threads.fact({ root: THREAD_ROOTS.third })
         expect((await owner.memory.saveJoins(key, [mention])).kind).toBe('failed')
         await owner.flush()
-        expected.push({ channel, text: notSaved(error) })
+        expected.push({ channel, text: notSaved(error), metadata: SERVER_POST_METADATA })
         expect(h.posts(key)).toEqual(expected)
         expect(h.posts(key)[1]!.text).toContain(THREAD_MEMORY_OWN_POST_LOSS_WARNING)
         expect(episodes.hasPosted(key, THREAD_MEMORY_NOT_SAVED)).toBe(true)
@@ -1845,7 +1848,7 @@ describe('notice join failures through notifier, owner, store, dispatcher and re
       expect(h.posts(key)).toEqual(expected)
       owner.io.heal()
       await owner.clock.advance(THREAD_MEMORY_RETRY_MAX_MS)
-      if (ordinary) expected.push({ channel, text: recovered() })
+      if (ordinary) expected.push({ channel, text: recovered(), metadata: SERVER_POST_METADATA })
       expect(h.posts(key)).toEqual(expected)
       expect(episodes.isOpen(key, THREAD_MEMORY_NOT_SAVED)).toBe(false)
       expect(owner.memory.outage(key).unsaved).toBe(0)
@@ -1868,7 +1871,7 @@ describe('notice join failures through notifier, owner, store, dispatcher and re
       const mention = owner.threads.fact({ root: THREAD_ROOTS.third })
       expect((await owner.memory.saveJoins(key, [mention])).kind).toBe('failed')
       await owner.flush()
-      expect(h.posts(key)).toEqual([{ channel, text: notSaved(error) }])
+      expect(h.posts(key)).toEqual([{ channel, text: notSaved(error), metadata: SERVER_POST_METADATA }])
       expect(owner.memory.outage(key).unsaved).toBe(4)
       owner.io.heal()
       expect((await owner.memory.saveJoins(key, [mention])).kind).toBe('kept')
@@ -1876,10 +1879,10 @@ describe('notice join failures through notifier, owner, store, dispatcher and re
       expect(owner.memory.isJoinSaved(key, mention)).toBe(true)
       expect(owner.memory.outage(key).unsaved).toBe(3)
       await owner.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
-      expect(h.posts(key)).toEqual([{ channel, text: notSaved(error) }])
+      expect(h.posts(key)).toEqual([{ channel, text: notSaved(error), metadata: SERVER_POST_METADATA }])
       expect(episodes.isOpen(key, THREAD_MEMORY_NOT_SAVED)).toBe(true)
       owner.io.heal(); await owner.clock.advance(THREAD_MEMORY_RETRY_MAX_MS)
-      expect(h.posts(key)).toEqual([{ channel, text: notSaved(error) }, { channel, text: recovered() }])
+      expect(h.posts(key)).toEqual([{ channel, text: notSaved(error), metadata: SERVER_POST_METADATA }, { channel, text: recovered(), metadata: SERVER_POST_METADATA }])
       expect(owner.memory.outage(key).unsaved).toBe(0)
       expectSavedNotice(owner, key, THREAD_ROOTS.primary)
       expect(episodes.isOpen(key, THREAD_MEMORY_NOT_SAVED)).toBe(false)
@@ -1897,7 +1900,7 @@ describe('notice join failures through notifier, owner, store, dispatcher and re
       expect((await owner.memory.saveJoins(key, [mention])).kind).toBe('failed')
       await owner.flush()
       owner.io.heal(); await owner.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
-      const expected = [{ channel, text: notSaved(error) }, { channel, text: recovered() }]
+      const expected = [{ channel, text: notSaved(error), metadata: SERVER_POST_METADATA }, { channel, text: recovered(), metadata: SERVER_POST_METADATA }]
       expect(h.posts(key)).toEqual(expected)
       expect(episodes.isOpen(key, THREAD_MEMORY_NOT_SAVED)).toBe(false)
       const flapError = fail()
@@ -1938,12 +1941,12 @@ describe('notice join failures through notifier, owner, store, dispatcher and re
       expect(h.totalPosts()).toBe(1)
       expect((await owner.memory.flush(key)).kind).toBe('failed')
       await owner.flush()
-      const expected = [{ channel, text: formatPersonaNotice(persona, originalNotice) }, { channel, text: notSaved(error) }]
+      const expected = [{ channel, text: formatPersonaNotice(persona, originalNotice), metadata: SERVER_POST_METADATA }, { channel, text: notSaved(error), metadata: SERVER_POST_METADATA }]
       expect(h.posts(key)).toEqual(expected)
       await owner.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
       expect(h.posts(key)).toEqual(expected)
       owner.io.heal(); await owner.clock.advance(THREAD_MEMORY_RETRY_MAX_MS)
-      expected.push({ channel, text: recovered() })
+      expected.push({ channel, text: recovered(), metadata: SERVER_POST_METADATA })
       expect(h.posts(key)).toEqual(expected)
       expect(owner.memory.outage(key).unsaved).toBe(0)
       expectSavedNotice(owner, key, THREAD_ROOTS.primary)

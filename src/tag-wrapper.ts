@@ -1,17 +1,36 @@
 /** Deterministic typed tags, with no I/O or module state. */
 export const TAG_MAX_BYTES = 1900
+/** Claude Code on macOS loses a typed burst over about 900 bytes, wrapper included. */
+export const TAG_MAX_BYTES_MACOS = 880
 export const TAG_MIN_BODY_BYTES = 400
 export const NAME_LOOKUP_TIMEOUT_MS = 2000
 export const TAG_SOURCE = 'slack-channel-router'
-export const TAG_ATTRIBUTE_ORDER = ['chat_id', 'channel_name', 'message_id', 'user', 'user_id', 'bot_id', 'ts', 'thread_ts', 'via', 'attachment_count', 'attachments', 'part'] as const
+export const TAG_ATTRIBUTE_ORDER = ['chat_id', 'channel_name', 'message_id', 'user', 'user_id', 'bot_id', 'ts', 'thread_ts', 'via', 'reaction', 'emoji', 'attachment_count', 'attachments', 'part'] as const
 export type TagAttributes = Partial<Record<typeof TAG_ATTRIBUTE_ORDER[number], string>>
 export type TagMessage = TagAttributes & { text?: string }
+/** A Reaction Notice's fields: message_id is the reacted message's ts, ts the reaction event's ts, emoji the name without colons. */
+export type ReactionNoticeInput = {
+  chat_id: string; channel_name: string; message_id: string; user: string; ts: string; thread_ts?: string
+  reaction: 'added' | 'removed'; emoji: string
+} & ({ user_id: string; bot_id?: never } | { bot_id: string; user_id?: never })
+/** The only builder that sets via="reaction", reaction or emoji. Fields are copied by name, never spread, so nothing else reaches the tag. */
+export function buildReactionNoticeMessage(input: ReactionNoticeInput): TagMessage {
+  const message: TagMessage = {
+    chat_id: input.chat_id, channel_name: input.channel_name, message_id: input.message_id, user: input.user,
+    ts: input.ts, thread_ts: input.thread_ts, via: 'reaction', reaction: input.reaction, emoji: input.emoji, text: '',
+  }
+  if (input.user_id !== undefined) message.user_id = input.user_id
+  else message.bot_id = input.bot_id
+  return message
+}
 const PY_SPACE = /^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]$/u
 const IGNORABLE = /^\p{Default_Ignorable_Code_Point}$/u
 const WORD = /^[\p{L}\p{N}_]$/u
 const OPENERS = '<\uff1c\ufe64\u2039\u2329\u27e8\u3008\u276e'
+const ANY_OPENER = /[<\uff1c\ufe64\u2039\u2329\u27e8\u3008\u276e]/
+/** Each unpaired surrogate becomes U+FFFD; paired ones stay. */
 export function replaceLoneSurrogates(value: string): string {
-  return Array.from(value, c => c.length === 1 && c.charCodeAt(0) >= 0xd800 && c.charCodeAt(0) <= 0xdfff ? '\ufffd' : c).join('')
+  return (value as string & { toWellFormed(): string }).toWellFormed()
 }
 export function escapeAttr(value: unknown): string {
   return replaceLoneSurrogates(String(value)).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -22,8 +41,10 @@ export function escapeBody(value: string): string {
   // LF and composes U+0301/U+0308 with their preceding letters. Escape
   // those observed characters in the body before fixing parts;
   // receipt matching stays exact, with no normalization in the matcher.
-  const chars = Array.from(replaceLoneSurrogates(value).replace(/\r\n?/g, '\n').replace(/\t/g, '    ').replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, ''))
-  let out = ''
+  const cleaned = replaceLoneSurrogates(value).replace(/\r\n?/g, '\n').replace(/\t/g, '    ').replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, '')
+  // With no opener, the walk below copies every character unchanged.
+  const chars = ANY_OPENER.test(cleaned) ? Array.from(cleaned) : []
+  let out = chars.length ? '' : cleaned
   for (let i = 0; i < chars.length; i++) {
     const c = chars[i]!
     if (!OPENERS.includes(c)) { out += c; continue }
@@ -43,7 +64,10 @@ export function escapeBody(value: string): string {
   }
   return out.replace(/[\u0301\u0308\u2028]/g, c => `&#${c.codePointAt(0)};`)
 }
-export function tagByteLength(value: string): number { return new TextEncoder().encode(value).byteLength }
+/** UTF-8 bytes, counting an unpaired surrogate as its U+FFFD replacement's three, as `TextEncoder` encodes it. */
+export function tagByteLength(value: string): number { return Buffer.byteLength(value, 'utf8') }
+/** The typed part limit for the host the agent runs on, which is the server's own host. */
+export function tagMaxBytesFor(platform: string): number { return platform === 'darwin' ? TAG_MAX_BYTES_MACOS : TAG_MAX_BYTES }
 function render(attrs: TagAttributes, body: string, part?: string): string {
   const values = { ...attrs, part }
   const attributes = TAG_ATTRIBUTE_ORDER.flatMap(key => values[key] === undefined || values[key] === '' ? [] : [`${key}="${escapeAttr(values[key])}"`])
@@ -51,10 +75,11 @@ function render(attrs: TagAttributes, body: string, part?: string): string {
 }
 /** Unsized reference formatter, useful for wrapper.py parity. */
 export function buildWrapper(message: TagMessage): string { return render(message, escapeBody(message.text ?? ''), message.part) }
-function boundedAttrs(input: TagAttributes, part?: string): TagAttributes {
+function boundedAttrs(input: TagAttributes, maxBytes: number, part?: string): TagAttributes {
   const attrs = { ...input }
-  for (const key of ['attachments', 'user'] as const) {
-    if (tagByteLength(render(attrs, '', part)) <= TAG_MAX_BYTES - TAG_MIN_BODY_BYTES) break
+  const allowance = maxBytes - TAG_MIN_BODY_BYTES
+  for (const key of ['attachments', 'user', 'channel_name'] as const) {
+    if (tagByteLength(render(attrs, '', part)) <= allowance) break
     const original = attrs[key]
     if (original === undefined || original === '') continue
     const chars = Array.from(replaceLoneSurrogates(original))
@@ -62,17 +87,23 @@ function boundedAttrs(input: TagAttributes, part?: string): TagAttributes {
     while (low < high) {
       const mid = Math.ceil((low + high) / 2)
       attrs[key] = chars.slice(0, mid).join('') + '…'
-      if (tagByteLength(render(attrs, '', part)) <= TAG_MAX_BYTES - TAG_MIN_BODY_BYTES) low = mid
+      if (tagByteLength(render(attrs, '', part)) <= allowance) low = mid
       else high = mid - 1
     }
     attrs[key] = chars.slice(0, low).join('') + '…'
   }
-  if (tagByteLength(render(attrs, '', part)) > TAG_MAX_BYTES - TAG_MIN_BODY_BYTES) throw new Error('Tag attributes exceed the minimum body allowance')
+  if (tagByteLength(render(attrs, '', part)) > allowance) throw new Error('Tag attributes exceed the minimum body allowance')
   return attrs
 }
+/** `tagByteLength` of one code point: an unpaired surrogate's is U+FFFD's. */
+function codePointBytes(codePoint: number): number { return codePoint < 0x80 ? 1 : codePoint < 0x800 ? 2 : codePoint < 0x10000 ? 3 : 4 }
 function cutBody(body: string, budget: number): [string, string] {
   let used = 0, end = 0
-  for (const c of body) { const size = tagByteLength(c); if (used + size > budget) break; used += size; end += c.length }
+  while (end < body.length) {
+    const codePoint = body.codePointAt(end)!, size = codePointBytes(codePoint)
+    if (used + size > budget) break
+    used += size; end += codePoint > 0xffff ? 2 : 1
+  }
   if (end === body.length) return [body, '']
   const prefix = body.slice(0, end)
   const lf = prefix.lastIndexOf('\n')
@@ -82,15 +113,15 @@ function cutBody(body: string, budget: number): [string, string] {
   return [body.slice(0, cut), body.slice(cut)]
 }
 /** Escape once, then split losslessly, accounting for the widest part index. */
-export function buildTagParts(message: TagMessage): string[] {
+export function buildTagParts(message: TagMessage, maxBytes: number = TAG_MAX_BYTES): string[] {
   const body = escapeBody(message.text ?? '')
-  const singleAttrs = boundedAttrs(message)
-  if (tagByteLength(render(singleAttrs, body)) <= TAG_MAX_BYTES) return [render(singleAttrs, body)]
+  const singleAttrs = boundedAttrs(message, maxBytes)
+  if (tagByteLength(render(singleAttrs, body)) <= maxBytes) return [render(singleAttrs, body)]
   let count = 2
   for (;;) {
     const widest = `${count}/${count}`
-    const attrs = boundedAttrs(message, widest)
-    const budget = TAG_MAX_BYTES - tagByteLength(render(attrs, '', widest))
+    const attrs = boundedAttrs(message, maxBytes, widest)
+    const budget = maxBytes - tagByteLength(render(attrs, '', widest))
     const bodies: string[] = []
     let remaining = body
     do { const [part, rest] = cutBody(remaining, budget); bodies.push(part); remaining = rest } while (remaining !== '')

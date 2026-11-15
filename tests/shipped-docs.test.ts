@@ -689,6 +689,34 @@ describe('slack-app-manifest.yml', () => {
     }
   })
 
+  // b.n3k: the reaction paragraph carries its own migration, so an earlier
+  // paragraph's re-install note cannot stand in for it.
+  const reactionGuidance = [
+    '`reaction_added`', '`reaction_removed`', '`mpim:read`',
+    /`mpim:read`[^.]*(?:recogni[sz]e|identify|look)[^.]*group DM/i,
+    migrationGuidance[0],
+    /(?=[^.]*`reaction_added`)(?=[^.]*`reaction_removed`)(?=[^.]*`mpim:read`)[^.]*\badded\b[^.]*re-?install/i,
+  ] as const
+
+  test('manifest header explains the reaction events, mpim:read and existing-app re-install', () => {
+    expect(lacking(scopeParagraph(header, 'mpim:read'), reactionGuidance)).toEqual([])
+  })
+
+  test('sensitivity: reaction guidance rejects each omitted obligation, despite other paragraphs\' re-install notes', () => {
+    const paragraphs = header.split(/\n\s*\n/)
+    const index = paragraphs.findIndex(paragraph => paragraph.includes('`mpim:read`'))
+    const paragraph = flat(paragraphs[index] ?? '')
+    expect(lacking(paragraph, reactionGuidance)).toEqual([])
+    for (const item of reactionGuidance) {
+      const pattern = typeof item === 'string' ? new RegExp(escapeRegExp(item), 'g') : new RegExp(item.source, `${item.flags}g`)
+      const edited = paragraph.replace(pattern, '')
+      expect(edited).not.toBe(paragraph)
+      const editedHeader = paragraphs.map((p, i) => (i === index ? edited : p)).join('\n\n')
+      expect(editedHeader.replace(edited, '')).toMatch(/added[^.]*re-?install/i)
+      expect(lacking(scopeParagraph(editedHeader, 'mpim:read'), reactionGuidance).length).toBeGreaterThan(0)
+    }
+  })
+
   test('message.im stays subscribed and message.mpim is not (group DMs unsubscribed)', () => {
     const events = manifest.settings.event_subscriptions.bot_events
     expect(events).toContain('message.im')
@@ -712,6 +740,7 @@ describe('slack-app-manifest.yml', () => {
         'im:write',
         'lists:read',
         'lists:write',
+        'mpim:read',
         'reactions:read',
         'reactions:write',
         'users:read',
@@ -732,7 +761,7 @@ describe('slack-app-manifest.yml', () => {
 
   test('the bot events are exactly the pinned list (none dropped, none added)', () => {
     expect([...manifest.settings.event_subscriptions.bot_events].sort()).toEqual(
-      ['app_mention', 'message.channels', 'message.groups', 'message.im', 'member_joined_channel', 'channel_left'].sort(),
+      ['app_mention', 'message.channels', 'message.groups', 'message.im', 'member_joined_channel', 'channel_left', 'reaction_added', 'reaction_removed'].sort(),
     )
   })
 
@@ -924,9 +953,11 @@ describe('README.md', () => {
     const naming = (...settings: readonly string[]) => (row: Row) =>
       settings.every((s) => codeSpans(row.change).includes(s))
 
-    /** each next-launch setting keeps the instance, `claude_config_dir` only until the next launch. */
+    /** each next-launch setting keeps the instance until the persona's next launch. */
     const NEXT_LAUNCH_SESSION: Record<NextLaunchSetting, string> = {
       claude_config_dir: 'Kept until the next launch',
+      model: 'Kept until the next launch',
+      effort: 'Kept until the next launch',
     }
 
     /**
@@ -2522,8 +2553,9 @@ describe(`${BOTS_DOC} "${RECEIVING_HEADING}"`, () => {
 
   test('the table contains each delivery reason and injected kind exactly once', () => {
     const { viaColumn, rows } = kindsTable()
-    expect(rows.map(row => row[0]).sort()).toEqual([...Object.values(VIA_ROWS), ...INJECTED_ROWS].sort())
-    expect(rows.flatMap(row => codeSpans(row[viaColumn] ?? '')).sort()).toEqual([...VIA_VALUES].sort())
+    // The Reaction Notice row's `reaction` is a tag value outside the message `Via` union.
+    expect(rows.map(row => row[0]).sort()).toEqual([...Object.values(VIA_ROWS), ...INJECTED_ROWS, 'Reaction Notice'].sort())
+    expect(rows.flatMap(row => codeSpans(row[viaColumn] ?? '')).sort()).toEqual([...VIA_VALUES, 'reaction'].sort())
   })
 
   test('the receiving explanation includes thread precedence and no obsolete denial of thread following', () => {
@@ -7471,7 +7503,8 @@ function migrationCronProblems(readme: string): string[] {
  * side can gain or lose an entry alone. Returns each problem. Pure.
  */
 function troubleshootingIndexProblems(index: string, skill: string): string[] {
-  const titles = requiredSection(index, TROUBLESHOOTING_HEADING, TROUBLESHOOTING_DOC).split('\n').filter((line) => /^\*\*.+\*\*\s*$/.test(line)).map((line) => line.trim().slice(2, -2))
+  const titles = [...requiredSection(index, TROUBLESHOOTING_HEADING, TROUBLESHOOTING_DOC)
+    .matchAll(/^\*\*(.+?)\*\*(?=\s|$)/gm)].map((match) => match[1])
   const entries = troubleshootingEntries(skill).map((entry) => entry.title.slice(2, -2))
   const skillLink = relative(dirname(TROUBLESHOOTING_DOC), DEBUG_SKILL_FILE)
   const links = markdownLinks(index).filter((link) => link.path === skillLink).map((link) => link.anchor)
@@ -7491,9 +7524,11 @@ describe(`${TROUBLESHOOTING_DOC} indexes the debugging skill's "${SYMPTOM_REFERE
   test('self-check: an entry added to the skill alone, or a title dropped from the page, is reported', () => {
     const index = operatorText(TROUBLESHOOTING_DOC)
     const skill = operatorText(DEBUG_SKILL_FILE)
+    const standaloneTitles = index.replace(/^(\*\*.+?\*\*)[ \t]+/gm, '$1\n')
+    expect(troubleshootingIndexProblems(standaloneTitles, skill)).toEqual([])
     const added = skill.replace(SYMPTOM_REFERENCE_HEADING, `${SYMPTOM_REFERENCE_HEADING}\n\n${SYMPTOM_PREFIX}A new symptom\n\nText.\n`)
     expect(troubleshootingIndexProblems(index, added)).toEqual(['the symptom entry "A new symptom" is not on the index', 'the index does not link the symptom entry "A new symptom"'])
-    const dropped = index.replace(/^\*\*config\.json not found\*\*\n/m, '')
+    const dropped = index.replace(/^\*\*config\.json not found\*\*(?=\s|$)/m, '')
     expect(dropped).not.toBe(index)
     expect(troubleshootingIndexProblems(dropped, skill)).toEqual(['the symptom entry "config.json not found" is not on the index'])
   })
@@ -9274,10 +9309,10 @@ Each decision is saved before the affected reply moves on, and a failed save is 
     /200/, /(?:durable storage|durably stored)/i, /(?:not delivery|not a delivery)/i,
     /\| 500 \|/, 'Message not stored', /\| 404 \|[^\n]*applied configuration/,
   ], 'After durable storage, 200 acknowledges storage, not delivery.\n| 500 | Message not stored |\n| 404 | No persona in the applied configuration |'],
-  [BOTS_DOC, '## Slack reply reminders', 'reminders use AD state and own reply calls for both agents, at most once per Slack delivery', [
-    /agent-director row/i, /working[^.]*waiting/i, /no [`]?reply[`]? tool call since that delivery/i,
+  [BOTS_DOC, '## Slack reply reminders', 'reminders use AD state and own reply or react calls for both agents, at most once per Slack delivery', [
+    /agent-director row/i, /working[^.]*waiting/i, /no [`]?reply[`]? or [`]?react[`]? tool call since that delivery/i,
     /at most one reminder per delivered Slack message/i, /Claude and Codex/i, 'stop_hook_bootstrap',
-  ], 'The agent-director row goes working to waiting, with no reply tool call since that delivery. There is at most one reminder per delivered Slack message. Claude and Codex use stop_hook_bootstrap.'],
+  ], 'The agent-director row goes working to waiting, with no reply or react tool call since that delivery. There is at most one reminder per delivered Slack message. Claude and Codex use stop_hook_bootstrap.'],
   [SERVER_SETTINGS_DOC, '## Server-wide settings', 'bind keeps clear-latch loopback and scheduled queueing independent of HTTP', [
     /`bind`[^|\n]*\|[^\n]*clear-latch/, /clear-latch[^.]*loopback/i,
     /(?:scheduled|cron)[^.]*(?:directly|in.process)[^.]*queue/i,
@@ -9291,10 +9326,10 @@ Each decision is saved before the affected reply moves on, and a failed save is 
     /tag description[^.]*always/i, /`system_prompt_mode`/, /`none`/,
     /(?:one|same|single|shared) file[^.]*every persona/i, /(?:whom|whose)[^.]*(?:obey|follow)/i,
   ], 'The tag description is always carried, with `system_prompt_mode` `none` included. One file serves every persona and defines whom to obey.'],
-  [SERVER_SETTINGS_DOC, '## Server-wide settings', 'acknowledgement waits for the whole transcript receipt, an early reply suppresses it, and a held thread reply gets its queued reaction only once released', [
-    /`ack_reaction`[^\n]*transcript[^\n]*whole message/i, /reply before delivery[^.]*suppress/i,
+  [SERVER_SETTINGS_DOC, '## Server-wide settings', 'acknowledgement waits for the whole transcript receipt, an early reply or reaction suppresses it, and a held thread reply gets its queued reaction only once released', [
+    /`ack_reaction`[^\n]*transcript[^\n]*whole message/i, /reply or reaction before delivery[^.]*suppress/i,
     /held thread reply gets its queued reaction only once released/i,
-  ], '| `ack_reaction` | Its transcript confirms the whole message first; a reply before delivery suppresses the later reaction. |\nA held thread reply gets its queued reaction only once released.'],
+  ], '| `ack_reaction` | Its transcript confirms the whole message first; a reply or reaction before delivery suppresses the later reaction. |\nA held thread reply gets its queued reaction only once released.'],
   [SERVER_SETTINGS_DOC, "# Server settings", PRIVACY_ROW, [
     /undelivered[^.]*(?:kept|retain)[^.]*(?:until delivered|until delivery)/i,
     /removed persona[^.]*queue/i, /delivered text is (?:removed|deleted) when the queue is compacted/i,

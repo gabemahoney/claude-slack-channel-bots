@@ -2,7 +2,7 @@
  * fmk-texts-entries.test.ts — Every `src/` export the `/ci` scenarios' value
  * printer (`tests/integration/fixtures/fmk-texts.ts`
  * read by every fmk scenario and by the shared-mode
- * test-29-invited-channels.sh) names exists in `src/` with the kind the
+ * test-29-invited-channels.sh and test-50-reaction-notices.sh) names exists in `src/` with the kind the
  * printer reads it as, so a renamed, removed or retyped export fails on the
  * host, before `/ci` runs a scenario.
  *
@@ -61,6 +61,7 @@ import ts from 'typescript'
 import * as adDescriptionPhrases from '../src/ad-description-phrases.ts'
 import * as adConfigFile from '../src/ad-config-file.ts'
 import * as adErrorClass from '../src/ad-error-class.ts'
+import * as agentDirectorTemplate from '../src/agent-director-template.ts'
 import * as adSettings from '../src/ad-settings.ts'
 import * as adVersionGate from '../src/ad-version-gate.ts'
 import * as backoff from '../src/backoff.ts'
@@ -94,10 +95,13 @@ import * as livenessReading from '../src/liveness-reading.ts'
 import * as outageState from '../src/outage-state.ts'
 import * as paneRead from '../src/pane-read.ts'
 import * as pendingRow from '../src/pending-row.ts'
+import * as permissionActionId from '../src/permission-action-id.ts'
 import * as personaDiagnostics from '../src/persona-diagnostics.ts'
 import * as personaEpisodes from '../src/persona-episodes.ts'
 import * as personaIdentity from '../src/persona-identity.ts'
 import * as personaNotifier from '../src/persona-notifier.ts'
+import * as reactionIntakeDiagnostics from '../src/reaction-intake-diagnostics.ts'
+import * as reactionPreparationDiagnostics from '../src/reaction-preparation-diagnostics.ts'
 import * as registry from '../src/registry.ts'
 import * as reloadApply from '../src/reload-apply.ts'
 import * as reload from '../src/reload.ts'
@@ -105,8 +109,10 @@ import * as reloadPlan from '../src/reload-plan.ts'
 import * as reloadRequest from '../src/reload-request.ts'
 import * as reloadReview from '../src/reload-review.ts'
 import * as reloadFingerprint from '../src/reload-fingerprint.ts'
+import * as replyReminder from '../src/reply-reminder.ts'
 import * as restart from '../src/restart.ts'
 import * as rowReadRules from '../src/row-read-rules.ts'
+import * as serverPost from '../src/server-post.ts'
 import * as sessionManager from '../src/session-manager.ts'
 import * as channelMembershipReadiness from '../src/channel-membership-readiness.ts'
 import * as channelMembershipScan from '../src/channel-membership-scan.ts'
@@ -235,6 +241,7 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'ad-description-phrases.ts': adDescriptionPhrases,
   'ad-config-file.ts': adConfigFile,
   'ad-error-class.ts': adErrorClass,
+  'agent-director-template.ts': agentDirectorTemplate,
   'ad-settings.ts': adSettings,
   'ad-version-gate.ts': adVersionGate,
   'backoff.ts': backoff,
@@ -268,10 +275,13 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'outage-state.ts': outageState,
   'pane-read.ts': paneRead,
   'pending-row.ts': pendingRow,
+  'permission-action-id.ts': permissionActionId,
   'persona-diagnostics.ts': personaDiagnostics,
   'persona-episodes.ts': personaEpisodes,
   'persona-identity.ts': personaIdentity,
   'persona-notifier.ts': personaNotifier,
+  'reaction-intake-diagnostics.ts': reactionIntakeDiagnostics,
+  'reaction-preparation-diagnostics.ts': reactionPreparationDiagnostics,
   'registry.ts': registry,
   'reload-apply.ts': reloadApply,
   'reload.ts': reload,
@@ -279,8 +289,10 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'reload-request.ts': reloadRequest,
   'reload-review.ts': reloadReview,
   'reload-fingerprint.ts': reloadFingerprint,
+  'reply-reminder.ts': replyReminder,
   'restart.ts': restart,
   'row-read-rules.ts': rowReadRules,
+  'server-post.ts': serverPost,
   'session-manager.ts': sessionManager,
   'shared-channels.ts': sharedChannels,
   'test-timer-overrides.ts': testTimerOverrides,
@@ -1955,6 +1967,72 @@ test('shared receipt archives, saved joins, accounting and recorded buttons need
   } finally { await q.stop() }
 }))
 
+// test-47 case I: 0.18.0 items delivered, then a restart's start compaction,
+// then a newer item drained against the cumulative snapshot. Production keeps
+// a delivered key only while younger than QUEUE_KEY_KEEP_MS, so the fixture's
+// months-old keys leave only the allocation; recent keys keep their key rows.
+test.each(['expired', 'recent'] as const)('shared queue receipts follow production key retention across a post-delivery restart: %s 0.18.0 keys', mode => sharedPrinterControl(async ({ scratch, pkg, printer: { entryValue: print }, evidence }) => {
+  const f = await import(join(pkg, 'tests/test-helpers/delivery-queue.ts'))
+  const reference = readFileSync(join(pkg, 'tests/fixtures/shared-channel-upgrade/interrupted-and-invalid-preparation/reference-0.18.0/queue/alpha.jsonl'), 'utf8')
+  const old = reference.trim().split('\n').map(line => JSON.parse(line))
+  // The /ci run delivered them 171 days after intake; the control within the hour.
+  let wall = Math.max(...old.map(r => r.received_at)) + (mode === 'expired' ? 171 * 24 : 1) * 3_600_000
+  const now = () => wall, key = 't47_i_alpha'
+  const dir = mkdtempSync(join(scratch, 'upgrade-state-')), journal = f.queuePath(dir, key)
+  const log = join(dir, 'server.log'), session = 'session-upgrade', transcript = join(dir, session + '.jsonl')
+  const snapshot = join(dir, 'snapshot.jsonl'), variant = join(dir, 'variant.jsonl')
+  writeFileSync(log, ''); writeFileSync(transcript, '')
+  f.seedQueue(dir, [reference], key)
+  const takes: string[] = [], deliveredAt = new Map<number, number>()
+  const deliver = async (q: any, seq: number) => {
+    const text = `upgraded part ${seq}`
+    await q.append(key, f.fixedRecord(seq, [text]))
+    await q.append(key, { ...f.sentRecord(seq), at: wall, session_id: session, transcript_path: transcript })
+    takes.push(JSON.stringify({ type: 'user', uuid: `take-${seq}`, sessionId: session, timestamp: wall + 1, message: { role: 'user', content: text } }))
+    writeFileSync(transcript, takes.join('\n') + '\n')
+    await q.append(key, { ...f.deliveredRecord(seq, wall + 2), receipt: { path: transcript, uuid: `take-${seq}` } })
+    deliveredAt.set(seq, wall + 2)
+    wall += 10
+  }
+  // test-47's drain: snapshot (live journal plus the earlier snapshot), read, snapshot.
+  let snapped = false
+  const snap = async () => {
+    writeFileSync(snapshot, await print('sharedQueueSnapshot', snapped ? [journal, snapshot] : [journal]))
+    snapped = true; evidence.files(snapshot)
+  }
+  const drain = async () => {
+    await snap()
+    const state = JSON.parse(await print('sharedQueueReceipts', [key, log, journal, snapshot, snapshot]))
+    await snap()
+    return state
+  }
+  let q = await f.makeQueue(dir, { now })
+  try {
+    for (const seq of [1, 2]) await deliver(q, seq)
+    assert.equal((await drain()).complete, true)
+  } finally { await q.stop() }
+  q = await f.makeQueue(dir, { now })
+  try {
+    const compacted = f.readQueue(dir, key).filter((r: any) => r.kind === 'accepted').map((r: any) => [r.seq, r.compact])
+    assert.deepEqual(compacted, mode === 'expired' ? [[2, 'allocation']] : [[1, 'key'], [2, 'key'], [2, 'allocation']])
+    const ts = '1794560791.855589'
+    const accepted = await q.accept(key, f.slackInput({ channel: 'G0TEST003', channel_type: 'group', key: { chat_id: 'G0TEST003', ts }, ts, via: 'receive_all' }))
+    assert.equal(accepted.status, 'accepted')
+    await deliver(q, accepted.seq)
+    assert.deepEqual(await drain(), { accepted: 3, complete: true, progress: 3, incomplete: 0, first_incomplete: [], incomplete_items_omitted: 0 })
+    // Altered live journals stay refused on each side of the expiry.
+    const live = f.readQueue(dir, key)
+    const refused = async (label: string, records: any[]) => {
+      writeFileSync(variant, records.map(r => JSON.stringify(r) + '\n').join('')); evidence.files(variant)
+      await assert.rejects(print('sharedQueueReceipts', [key, log, variant, snapshot, snapshot]), /archived item lacks matching live compaction evidence/, label)
+    }
+    if (mode === 'expired') {
+      await refused('a key row production cannot keep', [...live, { v: 1, kind: 'accepted', seq: 1, compact: 'key', key: old[0].key, received_at: old[0].received_at, delivered_at: deliveredAt.get(1) }])
+      await refused('no allocation', live.filter((r: any) => r.compact !== 'allocation'))
+    } else await refused('an unexpired key row removed', live.filter((r: any) => !(r.compact === 'key' && r.seq === 1)))
+  } finally { await q.stop() }
+}))
+
 test('a failed queue evidence read names only its input, role, stage, errno, type and sizes, never an empty queue', () => sharedPrinterControl(async ({ scratch, printer: { entryValue: print } }) => {
   const dir = mkdtempSync(join(scratch, 'PRIVATE_PATH-'))
   const current = join(dir, 'current.jsonl'), missing = join(dir, 'missing.jsonl'), linked = join(dir, 'linked.jsonl')
@@ -2021,6 +2099,146 @@ test('a short or failed queue evidence read names its stage, errno and partial c
     })
     assert.deepEqual(evidence.value(mod.counts()), { opens: 1, reads: 2, closes: 1 })
   }
+}))
+
+// test-46's two recovery requests, read from the script with its TEST_NAME
+// expanded, through the real printer and the installed parser. The colon
+// form scenario_attempt_id prints is not a review ID.
+test('test-46 builds its recovery requests with review IDs: the printer accepts them and refuses the attempt-ID colon form', () => sharedPrinterControl(async ({ scratch, printer }) => {
+  const script = readFileSync(join(REPO_ROOT, 'tests/integration/test-46-shared-channel-recovery.sh'), 'utf8')
+  const testName = /^TEST_NAME="([^"]+)"$/m.exec(script)![1]!
+  const ids = [...script.matchAll(/^configuration_recovery_request "([^"]+)"/gm)].map(m => m[1]!.replace('${TEST_NAME}', testName))
+  expect(ids).toEqual([`${testName}-owned-restoration`, `${testName}-cold-replacement`])
+  const damaged = join(scratch, 'damaged')
+  writeFileSync(damaged, 'controlled damaged authority\n')
+  const requestModule = await import(join(REPO_ROOT, 'src/reload-request.ts'))
+  for (const id of ids) {
+    expect(requestModule.REVIEW_ID_RE.test(id)).toBe(true)
+    expect(JSON.parse(await printer.entryValue('sharedRecoveryRequest', [id, damaged]))).toMatchObject({ request_id: id, action: 'restore' })
+  }
+  for (const name of ['owned-restoration', 'cold-replacement']) {
+    await assert.rejects(printer.entryValue('sharedRecoveryRequest', [`${testName}:${name}`, damaged]), (e: any) => {
+      assert.equal(e.exitCode, 1); assert.match(e.message, /invalid recovery request arguments/)
+      return true
+    })
+  }
+}))
+
+// test-46's closing accounting (MI answers46): message-received is logged once
+// per server run, so an item still queued at a stop is logged again when the
+// next start recovers it. Runs split on the production start line.
+test('per-server-run accounting keeps the exact sets and allows a repeat only in a later server run', () => sharedPrinterControl(async ({ scratch, pkg, printer: { entryValue: print }, evidence }) => {
+  const f = await import(join(pkg, 'tests/test-helpers/delivery-queue.ts'))
+  const diag = await import(join(pkg, 'src/persona-diagnostics.ts'))
+  const identity = await import(join(pkg, 'src/persona-identity.ts'))
+  // The boundary precedes the delivery reporting that writes every
+  // message-received line, start-time releases of recovered holds included.
+  const server = readFileSync(join(pkg, 'src/server.ts'), 'utf8')
+  const startCall = 'console.error(`[slack] Loaded persona config: ${personaConfig.personas.length} persona(s)`)'
+  expect(server.split(startCall).length).toBe(2)
+  expect(server.indexOf(startCall)).toBeLessThan(server.indexOf('deliveryReporting = createDeliveryReporting('))
+  // The line that call logs: its template between the backticks with a
+  // persona count of 2, behind src/logging.ts's `[<ISO time>] ` prefix.
+  const start = '[2026-11-13T16:04:35.359Z] ' +
+    startCall.slice(startCall.indexOf('`') + 1, startCall.lastIndexOf('`')).replace('${personaConfig.personas.length}', '2')
+  const dir = mkdtempSync(join(scratch, 'runs-')), key = 'alpha', name = 'Alpha', channel = 'C0TEST001'
+  const journal = f.queuePath(dir, key), log = join(dir, 'server.log'), snapshot = join(dir, 'snapshot.jsonl'), expectations = join(dir, 'expected.jsonl')
+  const q = await f.makeQueue(dir, { now: () => 100 })
+  try {
+    let expected = ''
+    for (const ts of ['1794584146.055887', '1794584146.066438']) {
+      assert.equal((await q.accept(key, f.slackInput({ ts, key: { chat_id: channel, ts }, via: 'mention', received_at: 100 }))).status, 'accepted')
+      expected += await print('sharedDeliveryExpectation', [key, name, 'slack', channel, ts, 'U0TEST001', 'mention'])
+    }
+    writeFileSync(expectations, expected)
+    writeFileSync(snapshot, await print('sharedQueueSnapshot', [journal]))
+    evidence.files(expectations, snapshot)
+    const received = (item: any) => '[2026-11-13T16:04:36.000Z] ' + evidence.call(() =>
+      diag.buildDeliveryDiagnostic(diag.MESSAGE_RECEIVED, identity.renderPersonaRef(name, key), diag.deliveryIdentity(item)))
+    const [first, second] = q.items(key).map((item: any) => item.accepted)
+    const a = received(first), b = received(second), other = received({ ...first, ts: '1794584146.077777' })
+    const logs = (files: Record<string, string[]>) => {
+      for (const n of readdirSync(dir).filter(n => n.startsWith('server.log'))) rmSync(join(dir, n))
+      for (const [n, lines] of Object.entries(files)) writeFileSync(join(dir, n), lines.map(l => l + '\n').join(''))
+      evidence.files(...Object.keys(files).map(n => join(dir, n)))
+    }
+    const perRun = () => print('sharedAssertAccounting', ['--per-server-run', expectations, log, key, snapshot])
+    const refused = (pattern: RegExp, run = perRun) =>
+      assert.rejects(run(), (e: any) => { assert.equal(e.exitCode, 1); assert.match(e.message, pattern); return true })
+    // Recovered: B, still queued at the first run's stop, is logged again in
+    // the next run. Run 1 spans a rotation; files are read oldest first.
+    logs({ 'server.log.2': [start, a], 'server.log.1': [b, '[2026-11-13T16:04:37.000Z] [slack] Shutdown complete'], 'server.log': [start, b] })
+    assert.deepEqual(JSON.parse(await perRun()), { accepted: 2, received: 3, runs: 2, repeated: 1 })
+    // test-29's form keeps one line per identity over all runs.
+    await refused(/^exact received diagnostic set mismatch$/, () => print('sharedAssertAccounting', [expectations, log, key, snapshot]))
+    // A duplicate in one run, in one file or across a rotation with no start between.
+    logs({ 'server.log': [start, a, b, b] })
+    await refused(/^received diagnostic repeated within one server run \(identities=1\)$/)
+    logs({ 'server.log.1': [start, a, b], 'server.log': [b] })
+    await refused(/^received diagnostic repeated within one server run \(identities=1\)$/)
+    // Missing and extra identities.
+    logs({ 'server.log': [start, a] })
+    await refused(/^exact received diagnostic set mismatch \(missing=1 extra=0\)$/)
+    logs({ 'server.log': [start, a, b, other] })
+    await refused(/^exact received diagnostic set mismatch \(missing=0 extra=1\)$/)
+    // A line no start precedes, and a lost rotation, leave runs unknown.
+    logs({ 'server.log': [a, start, b] })
+    await refused(/^received diagnostic before any server start$/)
+    logs({ 'server.log.2': [start, a], 'server.log': [b] })
+    await refused(/^server log rotations are not contiguous$/)
+  } finally { await q.stop() }
+}))
+
+// test-46's closing content check (MI answers47 Q1): a reply the next start
+// releases from a Post Hold is fixed before p's client serves, so its tag
+// keeps the documented ID fallback; every other input expects the names.
+test('test-46 expects the ID fallback for exactly the replies a restart releases from a Post Hold', () => sharedPrinterControl(async ({ scratch, pkg, printer: { entryValue: print } }) => {
+  const script = readFileSync(join(REPO_ROOT, 'tests/integration/test-46-shared-channel-recovery.sh'), 'utf8')
+  // Phase 12's and Phase 15's held replies are marked; Phase 13's live hold is released while p serves.
+  const lines = script.split('\n')
+  const holds = lines.flatMap((line, i) => {
+    const m = /^\s*post_hold "?([^"\s]+)"?$/.exec(line)
+    return m ? [[m[1], lines[i + 1]!.trim() === 'released_at_start']] : []
+  })
+  expect(holds).toEqual([['recovered-${performed}', true], ['live-hold', false], ['leave-${boundary}', true]])
+  expect(lines.filter(line => line.trim() === 'released_at_start')).toHaveLength(2)
+  // The real marking and name selection, with only the stub's name lookup replaced.
+  const fn = (name: string) => new RegExp(`^${name}\\(\\) \\{.*\\}$|^${name}\\(\\) \\{\\n[\\s\\S]*?\\n\\}$`, 'm').exec(script)![0]
+  const home = mkdtempSync(join(scratch, 'home-'))
+  const result = spawnSync('bash', ['-c', [
+    'set -euo pipefail', 'declare -A RESTART_RELEASED', 'HUMAN=U0HUMAN01',
+    'scenario_stub_name() { printf "%s-name\\n" "$1"; }', fn('released_at_start'), fn('expected_names'),
+    'OP_CHANNEL=C0POST001; OP_REPLY_TS=1700000000.000001; released_at_start',
+    'expected_names "p|C0POST001|1700000000.000001|thread" C0POST001 thread',
+    'expected_names "p|C0POST001|1700000000.000002|thread" C0POST001 thread',
+    'expected_names "p|D0DIRECT1|1700000000.000003|dm" D0DIRECT1 dm',
+  ].join('\n')], { env: hostSafeChildEnv(home, { tools: ['bash'] }), encoding: 'utf8', timeout: 5000 })
+  assertNoLeak({ stdout: result.stdout, stderr: result.stderr })
+  expect(result.error).toBeUndefined()
+  expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: '' })
+  expect(result.stdout).toBe('U0HUMAN01\tC0POST001\nuser-name\tchannel-name\nuser-name\tdm\n')
+  // The marked expectation is what production fixes with no serving client.
+  const intake = await import(join(pkg, 'src/delivery-intake.ts'))
+  const f = await import(join(pkg, 'tests/test-helpers/delivery-queue.ts'))
+  const { createFakeClock } = await import(join(pkg, 'tests/test-helpers/fake-clock.ts'))
+  const queue = await f.makeQueue(mkdtempSync(join(scratch, 'state-'))), clock = createFakeClock()
+  // src/server.ts resolvePersonaUserName answers the user ID without a serving client.
+  const preparation = intake.createDeliveryPreparation({ queue, clock, clientFor: () => undefined, resolveUserName: async (_key: string, user: string) => user })
+  try {
+    const root = '1699999999.000001', ts = '1700000000.000001', text = 'held reply'
+    const accepted = await queue.accept('alpha', f.slackInput({ channel: 'C0POST001', ts, key: { chat_id: 'C0POST001', ts }, user: 'U0HUMAN01', via: 'thread', thread_ts: root, text }))
+    if (accepted.status === 'failed' || !accepted.item) throw new Error('fixture acceptance failed')
+    await preparation.prepare('alpha', accepted.item)
+    // Both lookups fall back at once; neither lookup deadline stays armed.
+    expect(clock.pendingCount()).toBe(0)
+    const fixed = queue.item('alpha', accepted.item.accepted.seq)!.fixed!.parts
+    const expected = async (user: string, channelName: string) =>
+      JSON.parse(await print('sharedExpectedParts', [text, ts, 'U0HUMAN01', user, 'C0POST001', channelName, 'thread', root, '-']))
+    const [user, channelName] = result.stdout.split('\n')[0]!.split('\t')
+    expect(fixed).toEqual(await expected(user!, channelName!))
+    // The names test-46 expected for these replies before answers47 differ.
+    expect(fixed).not.toEqual(await expected('user-name', 'channel-name'))
+  } finally { await preparation.stop(); await queue.stop() }
 }))
 
 describe("test-47's refused starts and test-40's earlier release", () => {

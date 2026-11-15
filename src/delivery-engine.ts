@@ -2,8 +2,8 @@
  * All environment access is injected; importing this module does no I/O. */
 import type { Client, GetResult, SendKeysParams } from 'agent-director'
 import type { DeliveryQueue, QueueItem, QueueRecord, SentRecord } from './delivery-queue.ts'
-import { createQueueItemReader, isOpenItem, itemOpenedAt } from './delivery-queue.ts'
-import { createDeliveryReceiptReader, effectiveSends, type DeliveryReceiptReader, type ReceiptObservation } from './delivery-receipt.ts'
+import { createQueueItemReader, isOpenItem, isQueueItemClosed, itemOpenedAt } from './delivery-queue.ts'
+import { createQueueDeliveryReceiptReader, effectiveSends, type DeliveryReceiptReader, type ReceiptObservation } from './delivery-receipt.ts'
 import { type DeliveryLifecycle, type DeliveryClock, systemDeliveryClock, NOT_NOW_RETRY_MS } from './delivery-lifecycle.ts'
 import { decideEngine, decideGate, firstSendGate, recoveryEnterGate, latestDeliveryAttempt, retypeGate, selectDeliveryTarget, NO_DELIVERY_PAIR, createDeliveryReading, createDeliveryPolicyState, type DeliveryPair, type DeliveryPolicyEngine, type DeliveryPolicyKnowledge, type DeliveryReading, type DeliveryTimer } from './delivery-policy.ts'
 import { classifyAdError, isAdErrorInstance, classifyWithInvalidFlagsRecheck, type AdCall } from './ad-error-class.ts'
@@ -17,12 +17,15 @@ export type { DeliveryLifecycle, DeliveryClock } from './delivery-lifecycle.ts'
 
 export * from './delivery-constants.ts'
 export type DeliveryReason = 'state' | 'marker' | 'mcp' | 'relay-off' | 'held' | 'dialog-hold' | 'transcript-unreadable' | 'queue-unwritable' | 'not-now' | 'receipt' | 'backoff'
+/** Reporting only; never an input to delivery policy or permission to type. */
+export interface PartialReceiptEvidence { part: number; expectedBytes: number; receivedBytes: number }
 /** Safe operational facts; never composer or message body text. */
 export interface DeliveryStatus {
   key: string; seq: number; count: number; ageMs: number; retypeCount: number
   row?: string; marker: boolean; relay: boolean; connected: boolean; up: boolean
   latched: boolean; held: boolean; receiptWorking: boolean; dialogMaybeOpen: boolean
   reconnectDeferred: boolean
+  partialReceipt?: PartialReceiptEvidence
 }
 export type DeliveryEngineEvent =
   | { type: 'launch-observed'; key: string; sessionId: string; at: number }
@@ -31,7 +34,9 @@ export type DeliveryEngineEvent =
   | { type: 'delivered'; key: string; seq: number; part: number }
   | { type: 'item-delivered'; key: string; seq: number; at: number; waitMs: number }
   | { type: 'first-typed'; key: string; seq: number; part: number }
-  | { type: 'retyped' | 'first-unconfirmed-retype'; key: string; seq: number; part: number; count: number }
+  | { type: 'partial-receipt'; key: string; seq: number; part: number; expectedBytes: number; receivedBytes: number }
+  | { type: 'retyped'; key: string; seq: number; part: number; count: number }
+  | { type: 'first-unconfirmed-retype'; key: string; seq: number; part: number; count: number; partialReceipt?: PartialReceiptEvidence }
   | { type: 'waiting'; key: string; seq: number; reason: DeliveryReason; ageMs: number; status?: DeliveryStatus }
   | { type: 'marker-missing'; key: string }
 export type DeliveryClient = Pick<Client, 'get' | 'sendKeys'>
@@ -76,16 +81,24 @@ export interface DeliveryEngines {
   status(key: string): DeliveryStatus | undefined
 }
 export class DeliveryBudgetWait extends Error { constructor(readonly delayMs: number) { super('Delivery call budget') } }
+/** Calling it records one call. `cover` records nothing: it throws until a
+ * step's `calls` all fit the window together. */
+export interface DeliveryCallBudget { (): void; cover(calls: number): void }
 /** The sliding ten-second window counts every engine and deferred call. */
-export function createDeliveryCallBudget(now: () => number, callsPerSecond = DELIVERY_MAX_AD_CALLS_PER_S): () => void {
-  const calls: number[] = []
-  return () => {
-    const at = now()
+export function createDeliveryCallBudget(now: () => number, callsPerSecond = DELIVERY_MAX_AD_CALLS_PER_S): DeliveryCallBudget {
+  const calls: number[] = [], limit = callsPerSecond * 10
+  function check(at: number, count: number): void {
     while (calls.length && calls[0]! <= at - 10000) calls.shift()
-    if (calls.length >= callsPerSecond * 10) throw new DeliveryBudgetWait(calls[0]! + 10000 - at)
-    calls.push(at)
+    // Calls leave in age order: wait for the one whose expiry makes room for all.
+    const over = calls.length + Math.min(count, limit) - limit
+    if (over > 0) throw new DeliveryBudgetWait(calls[over - 1]! + 10000 - at)
   }
+  return Object.assign(() => { const at = now(); check(at, 1); calls.push(at) }, { cover: (count: number) => check(now(), count) })
 }
+// A key's fresh reads are spent only when the budget also covers the key:
+// a read whose key is then refused fills the window that the key waits on.
+const KEY_STEP_CALLS = 2 // revalidation get, key
+const GATE_STEP_CALLS = 3 // gate observation get, then a key step
 /** A definite refusal of the *text* call; Enter never removes an earlier text. */
 export function deliveryTextWasRefused(error: unknown): boolean {
   const cls = classifyAdError(error).errorClass
@@ -114,7 +127,7 @@ function setItemMember(values: number[], seq: number, present: boolean): void {
 function createQueueSummary(queue: DeliveryQueue, key: string) {
   const read = createQueueItemReader(queue, key)
   const items = new Map<number, QueueItem>(), open: number[] = []
-  const p = { accepted: [] as number[], fixed: [] as number[], sent: [] as DeliveryPolicyKnowledge['p']['sent'][number][], refused: [] as number[], delivered: [] as DeliveryPair[] }
+  const p = { accepted: [] as number[], fixed: [] as number[], sent: [] as DeliveryPolicyKnowledge['p']['sent'][number][], refused: [] as number[], delivered: [] as DeliveryPair[], withdrawn: [] as number[] }
   const parts: Record<number, number> = {}, holds: { item: number; kind: 'memory' | 'post' }[] = []
   // Immutable between membership changes, so a new executor can inherit the
   // durable notices without copying a queue-sized list on every blocked wake.
@@ -125,6 +138,7 @@ function createQueueSummary(queue: DeliveryQueue, key: string) {
     setItemMember(open, seq, isOpenItem(item))
     setItemMember(p.accepted, seq, included)
     setItemMember(p.fixed, seq, included && !!item.fixed)
+    setItemMember(p.withdrawn, seq, included && !!item.withdrawn)
     if (included) parts[seq] = item.fixed?.parts.length ?? 1; else delete parts[seq]
     const sends: typeof p.sent = [], refused: number[] = [], delivered: DeliveryPair[] = []
     let noticed = false
@@ -185,25 +199,27 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   interface State {
     queue: ReturnType<typeof createQueueSummary>; noticesInitialized: boolean
     e: DeliveryPolicyEngine; reading: DeliveryReading; row?: GetResult; receipt?: ReceiptObservation
-    reader: DeliveryReceiptReader; receiptTarget?: DeliveryPair; receiptAttempt?: number; deadlines: Partial<Record<DeliveryTimer, number>>; budget: () => void
+    reader: DeliveryReceiptReader; receiptTarget?: DeliveryPair; receiptAttempt?: number; deadlines: Partial<Record<DeliveryTimer, number>>; budget: DeliveryCallBudget
     rowAt: number; notNowStep: number; retryStep: number; appendRetryStep: number; lastSeq?: number; lastPart?: number; transcriptReference?: string
+    partialReceipt?: PartialReceiptEvidence & { seq: number }; partialLaunch?: string; partialAfterAttempts: Map<number, number>
     pending?: { record: QueueRecord; complete(): void }; lease?: () => void; timer?: unknown; busy?: Promise<void>; stopped: boolean
     relaunch: boolean; restarted?: boolean; gone?: { row: GetResult; handedOff?: boolean }; receiptWorking: boolean; pollAfter: number; snapshot?: DeliveryPolicyKnowledge; lastRetypeEvent?: number; dialogHold: boolean; dialogMaybeOpen: boolean; recoveringReconnect?: boolean
   }
-  const states = new Map<string, State>(), budgets = new Map<string, () => void>()
+  const states = new Map<string, State>(), budgets = new Map<string, DeliveryCallBudget>()
   // Blocked/empty executors retire without polling. Their queue-derived facts
   // and change cursor live until persona teardown; rebuilds invalidate the
   // cursor inside createQueueItemReader, including while no executor is active.
   const summaries = new Map<string, ReturnType<typeof createQueueSummary>>()
   let stopped = false
   const typed = new Set<string>()
+  const reportedPartials = new Set<string>()
   function emit(event: DeliveryEngineEvent): void { try { void Promise.resolve(deps.onEvent?.(event)).catch(() => {}) } catch {} }
-  function budget(key: string): () => void { let b = budgets.get(key); if (!b) { b = createDeliveryCallBudget(clock.now); budgets.set(key, b) }; return b }
+  function budget(key: string): DeliveryCallBudget { let b = budgets.get(key); if (!b) { b = createDeliveryCallBudget(clock.now); budgets.set(key, b) }; return b }
   function create(key: string): State {
     let queue = summaries.get(key)
     if (!queue) { queue = createQueueSummary(deps.queue, key); summaries.set(key, queue) }
     queue.receiptOffsets(undefined, 0, 0)
-    const s: State = { queue, noticesInitialized: false, e: createDeliveryPolicyState(), reading: createDeliveryReading(), reader: deps.receiptReader?.() ?? createDeliveryReceiptReader(), deadlines: {}, budget: budget(key), rowAt: -Infinity, notNowStep: 0, retryStep: 0, appendRetryStep: 0, stopped: false, relaunch: true, receiptWorking: false, pollAfter: 0, dialogHold: false, dialogMaybeOpen: false }
+    const s: State = { queue, noticesInitialized: false, e: createDeliveryPolicyState(), reading: createDeliveryReading(), reader: deps.receiptReader?.() ?? createQueueDeliveryReceiptReader(deps.queue, key), partialAfterAttempts: new Map(), deadlines: {}, budget: budget(key), rowAt: -Infinity, notNowStep: 0, retryStep: 0, appendRetryStep: 0, stopped: false, relaunch: true, receiptWorking: false, pollAfter: 0, dialogHold: false, dialogMaybeOpen: false }
     states.set(key, s); life.engineRunning(key, true); return s
   }
   function release(s: State): void { s.lease?.(); s.lease = undefined; s.e.request = 'none' }
@@ -218,9 +234,28 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     const head = s.queue.items.get(s.queue.open[0]!)
     if (!head) return undefined
     const deferred = life.deferred(key)
+    const partial = s.partialReceipt
+    const part = head.fixed?.parts.findIndex((_, index) => !head.records.some(r => r.kind === 'delivered' && r.part === index + 1))
+    const partialReceipt = partial?.seq === head.accepted.seq && partial.part === (part ?? -1) + 1
+      ? { part: partial.part, expectedBytes: partial.expectedBytes, receivedBytes: partial.receivedBytes } : undefined
     return { key, seq: head.accepted.seq, count: s.queue.open.length, ageMs: Math.max(0, clock.now() - itemOpenedAt(head)), retypeCount: head.retypeCount,
       row: s.restarted === true ? (s.row?.state === 'ended' || s.row?.state === 'missing' ? s.row.state : 'absent') : s.row?.state, marker: s.row?.labels?.tag_prompt === '1', relay: s.row?.relay_mode === 'on', connected: deps.isConnected(key), up: deps.isUp(key),
-      latched: deps.isLatched(key), held: deps.isHeld(key), receiptWorking: s.receiptWorking, dialogMaybeOpen: s.dialogMaybeOpen, reconnectDeferred: !!deferred }
+      latched: deps.isLatched(key), held: deps.isHeld(key), receiptWorking: s.receiptWorking, dialogMaybeOpen: s.dialogMaybeOpen, reconnectDeferred: !!deferred, partialReceipt }
+  }
+  function resetPartialLaunch(key: string, s: State): void {
+    // AD's observed transition excludes earlier sends even when a resumed
+    // conversation keeps its session ID and has no launch timestamp.
+    s.partialReceipt = undefined
+    s.partialAfterAttempts = new Map(deps.queue.items(key).filter(i => !isQueueItemClosed(i)).map(i => [i.accepted.seq, i.nextAttempt - 1]))
+  }
+  function observePartialReceipt(key: string, s: State, head: QueueItem, part: number, receipt: ReceiptObservation): void {
+    const partial = receipt.receipt ? undefined : receipt.partialReceipt
+    s.partialReceipt = partial ? { seq: head.accepted.seq, part, expectedBytes: Buffer.byteLength(head.fixed!.parts[part - 1]!), receivedBytes: partial.receivedBytes } : undefined
+    if (!partial || !s.partialReceipt) return
+    const identity = JSON.stringify([key, head.accepted.seq, part, partial.uuid ? ['uuid', partial.uuid] : [partial.path, partial.offset]])
+    if (reportedPartials.has(identity)) return
+    reportedPartials.add(identity)
+    emit({ type: 'partial-receipt', key, ...s.partialReceipt })
   }
   function wait(key: string, s: State, reason: DeliveryReason): void { const facts = status(key, s); if (facts) emit({ type: 'waiting', key, seq: facts.seq, reason, ageMs: facts.ageMs, status: facts }) }
   function schedule(key: string, s: State, delay = DELIVERY_ROW_POLL_MS): void {
@@ -241,6 +276,9 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     try {
       const row = await ad(key, s, 'get', client => client.get({ instance_id: deps.instanceId(key) }))
       if (stopped || s.stopped) return false
+      const partialLaunch = JSON.stringify([row.session_id, row.launch_started_at])
+      if (s.partialLaunch !== undefined && s.partialLaunch !== partialLaunch) resetPartialLaunch(key, s)
+      s.partialLaunch = partialLaunch
       s.row = row
       if (row.state !== 'waiting' || !row.unproven_requests?.length || row.unproven_requests.some(r => r.decision === null)) s.dialogHold = false
       life.observeRow(key, row)
@@ -339,7 +377,8 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     const persona = deps.persona(key)
     const agentOf = (row: GetResult): DeliveryAgent => row.agent === 'codex' ? 'codex' : persona?.agent ?? 'claude'
     let row = s.row
-    let receipt = s.reader.read(agentOf(row), row, head, part, deps.queue.items(key))
+    const readReceipt = () => s.reader.read(agentOf(row), row, head, part, deps.receiptReader ? deps.queue.items(key) : undefined, s.partialAfterAttempts.get(head.accepted.seq))
+    let receipt = readReceipt()
     // Claude's SessionStart can precede its first transcript write. AD keeps
     // that reference empty until find-missing heals it; get alone cannot.
     // Keep receipts from recorded/prior paths usable without a sweep. Only
@@ -353,7 +392,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       if (stopped || s.stopped || !life.active(key) || !deps.isUp(key) || deps.isLatched(key) || deps.isHeld(key)) return false
       if (!await readRow(key, s, true) || !s.row) return false
       row = s.row
-      receipt = s.reader.read(agentOf(row), row, head, part, deps.queue.items(key))
+      receipt = readReceipt()
     }
     // Preserve an AD binding absent from an earlier durable attempt.
     // This is reference evidence, independent of whether a receipt matched.
@@ -364,6 +403,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     }
     s.receipt = receipt
     s.receiptTarget = [head.accepted.seq, part]; s.receiptAttempt = effectiveSends(head, part).at(-1)?.attempt ?? 0
+    observePartialReceipt(key, s, head, part, receipt)
     const text = head.fixed?.parts[part - 1]
     const records = [
       ...(receipt.receipt ? [{ kind: 'take-in', text }] : []),
@@ -375,6 +415,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   // A durable append or the text-to-Enter pause may outlive its gate read.
   // Revalidate AD's row and CSCB's lifecycle guards before each unused key.
   async function revalidateKeys(key: string, s: State): Promise<boolean> {
+    s.budget.cover(KEY_STEP_CALLS)
     const fresh = await readRow(key, s, true), row = s.row
     const allowed = fresh && row && life.owner(key) === 'delivery' &&
       !s.relaunch && row.session_id === s.e.sessionSeen &&
@@ -507,6 +548,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           break
         }
         if (action === 'requestGate') {
+          s.budget.cover(GATE_STEP_CALLS)
           s.e.request = 'delivery'
           // Revalidate every unused request against a fresh independent gate
           // observation. The engine's prior external reading stays frozen.
@@ -583,7 +625,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           // Concrete receipt time must elapse before calling a retype
           // unconfirmed; a receipt arriving meanwhile wins the next choice.
           if (s.e.phase === 'receipt' && (s.deadlines.receipt ?? 0) > clock.now()) { nextDelay = Math.min(DELIVERY_ROW_POLL_MS, s.deadlines.receipt! - clock.now()); break }
-          queueWrite(s, { v: 1, kind: 'noticed', seq: pair[0], at: clock.now() }, () => { s.e.noticed = [...s.e.noticed, pair[0]]; emit({ type: 'first-unconfirmed-retype', key, seq: pair[0], part, count: head!.retypeCount }) }); continue
+          queueWrite(s, { v: 1, kind: 'noticed', seq: pair[0], at: clock.now() }, () => { s.e.noticed = [...s.e.noticed, pair[0]]; emit({ type: 'first-unconfirmed-retype', key, seq: pair[0], part, count: head!.retypeCount, partialReceipt: status(key, s)?.partialReceipt }) }); continue
         }
         if (action === 'deferReconnect') {
           release(s)
@@ -610,7 +652,8 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         break
       }
     } catch (error) {
-      if (error instanceof DeliveryBudgetWait) { release(s); nextDelay = error.delayMs }
+      // Typed text keeps its lease through a budget wait until its Enter.
+      if (error instanceof DeliveryBudgetWait) { if (s.e.phase === 'enter' && life.owner(key) === 'delivery') s.e.request = 'none'; else release(s); nextDelay = error.delayMs }
       else { release(s); deps.onError?.(key, error) }
     } finally { if (states.get(key) === s && !stopped && !s.stopped) schedule(key, s, nextDelay) }
   }
@@ -674,7 +717,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       // Diagnostic callers retain independent policy inputs. Only the engine's
       // private summaries are updated in place between synchronous decisions.
       const items = new Map(s.queue.items), parts = { ...k.parts }
-      return { ...k, parts, p: { accepted: [...k.p.accepted], fixed: [...k.p.fixed], sent: k.p.sent.map(send => ({ ...send })), refused: [...k.p.refused], delivered: k.p.delivered.map(pair => [pair[0], pair[1]] as const) }, holds: k.holds?.map(hold => ({ ...hold })),
+      return { ...k, parts, p: { accepted: [...k.p.accepted], fixed: [...k.p.fixed], sent: k.p.sent.map(send => ({ ...send })), refused: [...k.p.refused], delivered: k.p.delivered.map(pair => [pair[0], pair[1]] as const), ...(k.p.withdrawn ? { withdrawn: [...k.p.withdrawn] } : {}) }, holds: k.holds?.map(hold => ({ ...hold })),
         textFor: pair => parts[pair[0]] === undefined ? pair : items.get(pair[0])?.fixed?.parts[pair[1] - 1] ?? pair }
     },
     status: key => { const s = states.get(key); return s ? status(key, s) : undefined },
@@ -682,6 +725,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   life.setRelaunchObserver((key, row) => {
     const s = states.get(key)
     if (s) {
+      resetPartialLaunch(key, s)
       s.relaunch = true
       if (row.state === 'pending' || (row.session_id !== undefined && row.session_id !== s.gone?.row.session_id)) s.gone = undefined
       s.restarted = !!s.gone

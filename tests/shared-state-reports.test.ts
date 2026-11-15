@@ -4,7 +4,7 @@ import type { ChannelMode } from '../src/config.ts'
 import type { ReloadApplyFailure } from '../src/reload.ts'
 import type { ChannelMembership, MembershipGeneration, MembershipReading } from '../src/channel-membership.ts'
 import type { MembershipScanStatus } from '../src/channel-membership-scan.ts'
-import type { SharedChannelAuthority, SharedUnresolvedScope } from '../src/shared-channels.ts'
+import { sharedPersonaChannels, type SharedChannelAuthority, type SharedUnresolvedScope } from '../src/shared-channels.ts'
 import { createPersonaEpisodes, type PersonaEpisodes, type PersonaEpisodeView } from '../src/persona-episodes.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { MEMBERSHIP_EVIDENCE_UNRESOLVED, SHARED_STATE_UNRESOLVED } from '../src/persona-diagnostics.ts'
@@ -76,8 +76,9 @@ function harness(mode: ChannelMode = 'open') {
     get path() { touch('path'); return control.path },
     get failure() { touch('failure'); return control.failure },
     unresolvedScope(key: string) { touch('unresolvedScope'); return row(key).scope },
-    snapshot() { touch('snapshot'); return state },
-  } satisfies Pick<SharedChannelAuthority, 'readable' | 'unreadableCause' | 'path' | 'failure' | 'unresolvedScope' | 'snapshot'>)
+    reportingChannels(key) { touch('reportingChannels'); return sharedPersonaChannels(state, key) },
+    inspectMembershipHistory(key, read) { touch('inspectMembershipHistory'); return read(state.personas[key]) },
+  } satisfies SharedStateReportingDeps['authority'])
   const membership: SharedStateReportingDeps['membership'] = readOnly('membership', {
     generation(key) { touch('generation'); return row(key).generation },
     read(key, channel, seenMode) { touch('read'); calls.push(`read:${key}:${channel}:${seenMode}`); return row(key).readings.get(channel) ?? { kind: 'ineligible', reason: 'absent' } },
@@ -293,7 +294,8 @@ describe('shared-state reporter episodes', () => {
   test('storage after an unsaved hold adds no duplicate report', () => {
     const h = harness(); h.unsaved(); h.check(); h.scan('storage'); h.check()
     expectReports(h, [h.stateReport('not-saved')])
-    expect(h.calls).not.toContain('snapshot')
+    expect(h.calls).not.toContain('reportingChannels')
+    expect(h.calls).not.toContain('inspectMembershipHistory')
   })
 
   test.each(['open', 'strict'] as const)('remembered channels delay recovery in %s and the next episode posts afresh', mode => {
@@ -387,12 +389,19 @@ describe('shared-state reporter episodes', () => {
     expect(h.posts.filter(p => p.key === 'beta')).toHaveLength(1)
   })
 
-  test.each(['unresolvedScope', 'generation', 'scanStatus', 'scanEnded', 'readable', 'unreadableCause', 'snapshot',
+  test.each(['unresolvedScope', 'generation', 'scanStatus', 'scanEnded', 'readable', 'unreadableCause', 'reportingChannels',
     'unresolvedChannels', 'read', 'path', 'failure', 'persona', 'mode', 'log'])('throwing %s is contained', dependency => {
     const h = harness(); h.unsaved(); h.row().scope = { channels: [A], all: true, dm: true }
     h.control.cause = 'restoration-staged'; h.scan('storage'); h.throwAt.add(dependency)
     expect(() => h.check()).not.toThrow()
     expect(h.calls).toContain(dependency)
+  })
+
+  test('throwing history inspection is contained', () => {
+    const h = harness(); h.row().generation.holds.set(A, 'history-unresolved')
+    h.throwAt.add('inspectMembershipHistory')
+    expect(() => h.check()).not.toThrow()
+    expect(h.calls).toContain('inspectMembershipHistory')
   })
 
   test('stop prevents every reporting entry point from logging, posting or reading dependencies', () => {

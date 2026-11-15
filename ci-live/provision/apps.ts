@@ -36,8 +36,9 @@
  * exist from another VM).
  *
  * The configuration token is optional once apps.json records all four app
- * IDs: when it is missing or refused (`ConfigTokenUnavailableError`) the
- * stage warns (never the value) and reuses the recorded apps without their
+ * IDs: when it is missing, refused or cannot manage the apps (`no_permission`,
+ * also a `ConfigTokenUnavailableError`) the stage warns (never the value)
+ * and reuses the recorded apps without their
  * export, drift check or update. When an app would have to be created (or
  * an unfinished create resolved), the token's absence is not runnable as
  * before.

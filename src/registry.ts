@@ -54,7 +54,8 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import type { WebClient } from '@slack/web-api'
 import { statSync, writeFileSync } from 'fs'
-import { join, resolve } from 'path'
+import { basename, join, resolve } from 'path'
+import { claimReactAnswer } from './ack-tracker.ts'
 import {
   CHANNEL_DELIVERY_FILE_NAME,
   currentChannelDeliveryFacts,
@@ -89,8 +90,6 @@ import { completionFiles, ownPostAnswerOfError, ownPostAnswerOfPost, type OwnPos
 import { withFileCompletions } from './file-upload-observation.ts'
 
 export { SET_CHANNEL_DELIVERY_TOOL }
-/** The filename sent to Slack and used in each upload's content digest. */
-export const OWN_POST_UPLOAD_FILENAME = 'file.txt'
 /** An upload refused by the final file guard before any upload call. */
 export const OWN_POST_UPLOAD_REFUSED = 'upload_refused'
 // Peer-PID + sessions.json registry have been deleted. The
@@ -656,7 +655,7 @@ export function resolveTransportForRequest(
  * its client are looked up through these on every tool call, never cached.
  */
 export interface SessionToolDeps {
-  /** Records an attempted reply using CSCB records, before any scope or Slack outcome. */
+  /** Records an attempted reply or react using CSCB records, before any scope or Slack outcome. */
   onReplyCall?(key: string): void | Promise<void>
   /** File exfiltration guard — throws when the file must not be sent */
   assertSendable: (filePath: string) => void
@@ -675,9 +674,28 @@ export interface SessionToolDeps {
   resolveUserName: (personaKey: string, userId: string) => Promise<string>
   /**
    * Record a successful correlated reply and clean up its captured ack stage.
-   * The removal fallback is only for legacy entries without a captured reaction.
+   * The removal fallback is only for legacy entries without a captured reaction;
+   * `kept` is a react's emoji, never removed.
    */
-  consumeAck: (personaKey: string, channelId: string, messageTs: string, removeLegacy?: () => Promise<unknown>) => boolean | Promise<void>
+  consumeAck: (personaKey: string, channelId: string, messageTs: string, removeLegacy?: () => Promise<unknown>, kept?: string) => boolean | Promise<void>
+  /**
+   * Record a successful react as consumeAck does, with its emoji kept, and
+   * answer in the same step whether the persona already held that answer
+   * (true) or this one is the first (false). Absent: the ack tracker's own
+   * `claimReactAnswer`.
+   */
+  claimReactAnswer?: typeof claimReactAnswer
+  /**
+   * The persona's confirmed bot user ID from its serving connection, or
+   * undefined when unavailable; read with `clientFor` before a react's add.
+   * Absent: unavailable.
+   */
+  getBotUserId?: (key: string) => string | undefined
+  /**
+   * Told synchronously of each react whose claim was the first, when the
+   * persona's bot user ID was available before the add. Absent: nothing.
+   */
+  onReactClaimed?: (claim: ReactClaimContext) => void
   /** TCP port the MCP HTTP server is listening on (retained for diagnostics). */
   serverPort: number
   /**
@@ -710,6 +728,20 @@ export interface SessionToolDeps {
    * nothing is observed and posting is unchanged.
    */
   ownPosts?: OwnPostObserver
+}
+
+/**
+ * A react whose claim was the first: the persona, the client that made the
+ * add and the bot user ID read with it before the add, never re-resolved
+ * after it, with the add's validated target and emoji.
+ */
+export interface ReactClaimContext {
+  persona: Persona
+  client: WebClient
+  botUserId: string
+  chatId: string
+  messageId: string
+  emoji: string
 }
 
 /**
@@ -1167,6 +1199,69 @@ async function fetchSlackHostedFile(url: string, token: string): Promise<SlackFi
   }
 }
 
+// ---------------------------------------------------------------------------
+// Reply file uploads
+// ---------------------------------------------------------------------------
+
+/** A `<@ID>` user or persona mention token in message text. */
+const USER_MENTION_TOKEN_RE = /<@[^>]+>/g
+
+/**
+ * The refusal reason of the first of `files` that `assertSendable` refuses,
+ * or undefined when every file may be sent.
+ */
+function firstUnsendableReason(
+  files: readonly string[],
+  assertSendable: (filePath: string) => void,
+): string | undefined {
+  for (const filePath of files) {
+    try {
+      assertSendable(filePath)
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err)
+    }
+  }
+  return undefined
+}
+
+/**
+ * The `filesUploadV2` arguments for a reply's files: one upload sharing every
+ * file in one message under its own name, in `threadTs` if given, otherwise
+ * threaded under the reply's first message (`firstTs`, empty when none was
+ * posted or Slack returned no ts), with the text's distinct mentions repeated
+ * so mention-only bots get it. Pure.
+ */
+function replyUploadArgs(
+  chatId: string,
+  files: readonly string[],
+  threadTs: string | undefined,
+  firstTs: string,
+  text: string,
+): Record<string, any> {
+  const args: Record<string, any> = {
+    channel_id: chatId,
+    file_uploads: files.map((p) => ({ file: resolve(p), filename: basename(p) })),
+  }
+  const uploadThreadTs = threadTs || firstTs
+  if (uploadThreadTs) args.thread_ts = uploadThreadTs
+  const mentions = [...new Set(text.match(USER_MENTION_TOKEN_RE) ?? [])]
+  if (mentions.length > 0) args.initial_comment = mentions.join(' ')
+  return args
+}
+
+/**
+ * The tool error text for a reply whose files the pre-upload check refused
+ * with `reason`: `posted` describes the text already posted, or is undefined
+ * when the reply had no text. Pure.
+ */
+function buildFilesRefusedText(reason: string, fileCount: number, posted?: string): string {
+  if (posted === undefined) return `${reason} None of the ${fileCount} file(s) were uploaded.`
+  return (
+    `${reason} The reply text was already posted (${posted}); ` +
+    `none of the ${fileCount} file(s) were uploaded.`
+  )
+}
+
 export const FETCH_MESSAGES_DESCRIPTION = 'Fetch message history from a channel, DM conversation or thread. Returns a JSON array, oldest first. In a thread_hybrid channel with thread_ts, returns { messages, next_cursor } instead: one page of the thread, its channel message on the first page only; pass next_cursor back as cursor for the next page until none is returned.'
 export const FETCH_MESSAGES_CURSOR_DESCRIPTION = 'In a thread_hybrid channel with thread_ts: the next_cursor from the previous page, to read the next page (optional)'
 
@@ -1177,16 +1272,16 @@ export function fetchMessagesCursorRefusal(): string {
 /** Every session receives these eleven points in order. */
 export const MCP_INSTRUCTIONS_MAX_CHARS = 2048
 export const MCP_INSTRUCTIONS = [
-  'The sender reads Slack. Answer with reply, using chat_id and thread_ts for a thread; terminal output is not seen there.',
+  'The sender reads Slack, not your terminal. Answer with reply, using chat_id and thread_ts for a thread; end a turn with no terminal text unless a terminal reader needs it.',
   'Messages arrive as the <channel> tag described in the system prompt, carrying channel_name and, for a long message, part.',
-  'via: dm = a direct message; mention = you were @mentioned; broadcast = @here or @channel; thread = a reply in a thread the bot is in; receive_all_shared = a channel where you and another persona receive every message; receive_all = a channel where only you receive every message.',
+  'via: dm = a direct message; mention = you were @mentioned; broadcast = @here or @channel; thread = a reply in a thread the bot is in; receive_all_shared = a channel where you and another persona receive every message; receive_all = a channel where you, and no other persona on this server, receive every message.',
   '<@ID> mentions a Slack user or persona. Use <@ID> to address another persona.',
   'If attachment_count is present, use download_attachment(chat_id, message_id) to fetch attachments.',
   'In strict mode you may act in your configured non-off channels. In open mode Slack enforces channel access.',
   `${SET_CHANNEL_DELIVERY_TOOL} sets listening to off, mentions (@mentions and broadcasts), all (every message), or thread_hybrid (mentions and replies in threads the bot is in). Use it when someone in that channel asks; new assignments require open mode. Retain attempt_id before submission; fresh assignments use fresh IDs. Retry keeps ID/channel/value and only reads history.`,
   'Thread Memory notices (including Joins lost) in your notice destination are for the operator; do not act on them.',
-  'With DMs on, you may reply, react, edit_message, fetch_messages and download_attachment in a DM you belong to (D... chat_id). To start a DM, reply takes a user ID (U... or W...) as chat_id and returns the D... ID for later edits, reactions, reads and thread replies. Other tools take no user ID. With DMs off you have no DM target. Any other target is refused.',
-  'Pass message_id (the triggering message ts) to reply to remove the ack reaction.',
+  'With DMs on, you may reply, react, edit_message, fetch_messages and download_attachment in a DM you belong to (D... chat_id). To start a DM, reply takes a user ID (U... or W...) as chat_id and returns the D... ID for later calls. Other tools take no user ID. With DMs off you have no DM target. Any other target is refused.',
+  'To remove the ack reaction, reply with message_id (the triggering message ts) or react to that message.',
   'reply accepts files: ["/abs/path.png"] for attachments. react adds emoji reactions; edit_message updates a sent message; fetch_messages reads Slack history; in a thread_hybrid channel, pass its next_cursor back as cursor to read a whole thread.',
 ].join('\n')
 
@@ -1244,7 +1339,8 @@ export function createSessionServer(
             files: {
               type: 'array',
               items: { type: 'string' },
-              description: 'Absolute paths of files to upload (optional)',
+              description:
+                'Absolute paths of files to upload (optional). All files share one message under their own names: in thread_ts if given, otherwise threaded under the text, or in the conversation when text is ""; the text\'s <@ID> mentions are repeated with them.',
             },
             message_id: {
               type: 'string',
@@ -1261,7 +1357,7 @@ export function createSessionServer(
           type: 'object' as const,
           properties: {
             chat_id: { type: 'string', description: 'A channel ID or a DM conversation ID (D...)' },
-            message_id: { type: 'string', description: 'Message timestamp (ts)' },
+            message_id: { type: 'string', description: 'Message timestamp (ts); reacting to the triggering message removes its ack reaction' },
             emoji: {
               type: 'string',
               description: 'Emoji name without colons (e.g. "thumbsup")',
@@ -1414,6 +1510,43 @@ export function createSessionServer(
     }
   }
 
+  /** A legacy tracked ack's removal through the caller's client; `kept` (a react's emoji) is never removed. */
+  function legacyAckRemoval(web: WebClient, chatId: string, messageId: string, ackReaction: string | undefined, kept?: string): () => Promise<unknown> {
+    return async () => {
+      if (ackReaction && ackReaction !== kept) await web.reactions.remove({ channel: chatId, timestamp: messageId, name: ackReaction })
+    }
+  }
+
+  /**
+   * Record a successful correlated reply and detach removal of the persona's
+   * own ack reaction, so a held reaction call never delays the remaining
+   * content or the tool result.
+   */
+  function releaseAck(persona: Persona, web: WebClient, chatId: string, messageId: string, ackReaction: string | undefined): void {
+    try {
+      void Promise.resolve(consumeAck(persona.key, chatId, messageId, legacyAckRemoval(web, chatId, messageId, ackReaction))).catch(() => {})
+    } catch { /* reaction cleanup cannot fail a successful tool call */ }
+  }
+
+  /**
+   * Claim a successful react's answer, which also releases the persona's ack
+   * as releaseAck does, keeping the emoji. Only a first answer with the bot
+   * user ID read before the add reaches `onReactClaimed`. Cleanup is
+   * detached, and neither a claim failure nor the callback can delay or
+   * change the tool result.
+   */
+  function claimReact(persona: Persona, web: WebClient, botUserId: string | undefined, chatId: string, messageId: string, emoji: string): void {
+    const removeLegacy = legacyAckRemoval(web, chatId, messageId, getReplySettings().ack_reaction, emoji)
+    let alreadyHeld = true
+    try {
+      alreadyHeld = (deps.claimReactAnswer ?? claimReactAnswer)(persona.key, chatId, messageId, emoji, removeLegacy)
+    } catch { /* a failed claim is never a first answer */ }
+    if (alreadyHeld !== false || !botUserId || !deps.onReactClaimed) return
+    try {
+      deps.onReactClaimed({ persona, client: web, botUserId, chatId, messageId, emoji })
+    } catch { /* the hand-off cannot fail a successful react */ }
+  }
+
   /**
    * Run one tool on the persona's client. `kind` is the target's kind from
    * the scope check; a `user` target (reply only) is opened first, and the
@@ -1428,6 +1561,7 @@ export function createSessionServer(
     web: WebClient,
     kind: PersonaTargetKind,
     dm: { opened?: string },
+    botUserId: string | undefined,
   ) {
     switch (name) {
       // ---------------------------------------------------------------------
@@ -1441,13 +1575,8 @@ export function createSessionServer(
         const messageId: string | undefined = args.message_id
 
         // File exfiltration guard, for every file before any Slack call.
-        for (const filePath of files ?? []) {
-          try {
-            assertSendable(filePath)
-          } catch (err) {
-            return toolError(err instanceof Error ? err.message : String(err))
-          }
-        }
+        const refused = firstUnsendableReason(files ?? [], assertSendable)
+        if (refused !== undefined) return toolError(refused)
 
         // A user ID is never posted to: open the DM, then act only in it.
         let where = chatId
@@ -1468,19 +1597,15 @@ export function createSessionServer(
         }
 
         const settings = getReplySettings()
-        const chunks = chunkText(text, settings.reply_chunk_limit, settings.reply_chunk_mode)
-        // Record the first successful reply immediately; a held reaction call
-        // may delay cleanup, but never the remaining content or tool result.
+        const hasFiles = (files?.length ?? 0) > 0
+        const filesOnly = text === '' && hasFiles
+        const chunks = filesOnly ? [] : chunkText(text, settings.reply_chunk_limit, settings.reply_chunk_mode)
         const clearAck = () => {
-          if (!messageId) return
-          try {
-            void Promise.resolve(consumeAck(persona.key, chatId, messageId, async () => {
-              if (settings.ack_reaction) await web.reactions.remove({ channel: chatId, timestamp: messageId, name: settings.ack_reaction })
-            })).catch(() => {})
-          } catch { /* reaction cleanup cannot fail a successful reply */ }
+          if (messageId) releaseAck(persona, web, chatId, messageId, settings.ack_reaction)
         }
 
         let lastTs = ''
+        let firstTs = ''
         let firstChunk = true
         // The calling persona's own ack reaction, removed through its own
         // client at most once (first success), only when its own entry for
@@ -1528,71 +1653,75 @@ export function createSessionServer(
           try {
             deps.ownPosts?.end(op?.operation, ownPostAnswerOfPost(chatId, res))
           } catch { /* join bookkeeping cannot stop the remaining parts */ }
-          sent++
           const ts = typeof res.ts === 'string' && res.ts !== '' ? res.ts : undefined
+          if (sent === 0) firstTs = ts ?? ''
+          sent++
           lastTs = ts ?? lastTs
           succeeded()
         }
 
-        // Check each file again right before its upload: the text posts above
-        // widen the window in which a symlink could be re-pointed at a file
-        // the up-front pass would have refused.
-        for (const filePath of files ?? []) {
-          let op: OwnPostStart | undefined
-          try {
-            const size = statSync(resolve(filePath)).size
-            op = deps.ownPosts?.start(persona.key, 'file', target, { kind: 'file', name: OWN_POST_UPLOAD_FILENAME, size })
-            if (op?.ready) await op.ready
-          } catch { /* missing metadata or join bookkeeping cannot stop the upload */ }
-          let ended = false
-          const endUpload = (answer: OwnPostAnswer) => {
-            if (ended) return
-            ended = true
+        if (hasFiles) {
+          // One upload shares every file in one message; each file is still
+          // its own operation, under the parent the upload is threaded in and
+          // digested by the name the upload sends.
+          const uploadParent = threadTs || firstTs
+          const fileTarget = { channel: chatId, ...(uploadParent ? { parent: uploadParent } : {}) }
+          const ops: (OwnPostStart | undefined)[] = []
+          for (const filePath of files!) {
+            let op: OwnPostStart | undefined
             try {
-              deps.ownPosts?.end(op?.operation, answer)
+              const size = statSync(resolve(filePath)).size
+              op = deps.ownPosts?.start(persona.key, 'file', fileTarget, { kind: 'file', name: basename(filePath), size })
+              if (op?.ready) await op.ready
+            } catch { /* missing metadata or join bookkeeping cannot stop the upload */ }
+            ops.push(op)
+          }
+          const ended = new Set<number>()
+          const endUpload = (at: number, answer: OwnPostAnswer) => {
+            if (ended.has(at)) return
+            ended.add(at)
+            try {
+              deps.ownPosts?.end(ops[at]?.operation, answer)
             } catch { /* join bookkeeping cannot stop the remaining parts */ }
           }
-          try {
-            assertSendable(filePath)
-          } catch (err) {
-            endUpload({ kind: 'failed', code: OWN_POST_UPLOAD_REFUSED })
-            const posted = `${sent} message(s) to ${where}${lastTs ? ` [ts: ${lastTs}]` : ''}`
-            return toolError(
-              `${err instanceof Error ? err.message : String(err)} ` +
-                `The reply text was already posted (${posted}); ` +
-                `${uploaded} of ${files!.length} file(s) were uploaded before this refusal.`,
-            )
+          const endRemaining = (answer: OwnPostAnswer) => { for (let at = 0; at < ops.length; at++) endUpload(at, answer) }
+          // Check every file again right before the upload: the text posts
+          // above widen the window in which a symlink could be re-pointed at
+          // a file the up-front pass would have refused.
+          const reason = firstUnsendableReason(files!, assertSendable)
+          if (reason !== undefined) {
+            endRemaining({ kind: 'failed', code: OWN_POST_UPLOAD_REFUSED })
+            const posted = filesOnly
+              ? undefined
+              : `${sent} message(s) to ${where}${lastTs ? ` [ts: ${lastTs}]` : ''}`
+            return toolError(buildFilesRefusedText(reason, files!.length, posted))
           }
-          const uploadArgs: Record<string, any> = {
-            channel_id: chatId,
-            file: resolve(filePath),
-            filename: OWN_POST_UPLOAD_FILENAME,
-          }
-          if (threadTs) uploadArgs.thread_ts = threadTs
-          // Each nested completion is confirmed in its own reaction, so a
-          // group that succeeded stays a success when the aggregate rejects.
-          let completed = false
+          // Each nested completion is confirmed in its own reaction, so files
+          // a group completed stay uploaded when the aggregate rejects.
+          // Confirmed files end the operations in file order.
+          let completed = 0
           const onCompletion = (response: unknown) => {
             for (const file of completionFiles(response)) {
-              completed = true
-              endUpload({ kind: 'confirmed', channel: chatId, file: file.id })
+              if (completed < ops.length) endUpload(completed, { kind: 'confirmed', channel: chatId, file: file.id })
+              completed++
             }
             if (completed) succeeded()
           }
           try {
-            const result: unknown = await withFileCompletions(onCompletion, () => web.filesUploadV2(uploadArgs as any))
+            const result: unknown = await withFileCompletions(onCompletion, () => web.filesUploadV2(replyUploadArgs(chatId, files!, threadTs, firstTs, text) as any))
             // A client built without the observation reports its completions only in the aggregate.
             const responses = (result as { files?: unknown } | undefined)?.files
             if (!completed && Array.isArray(responses)) for (const response of responses) onCompletion(response)
-            endUpload({ kind: 'no-answer' })
+            endRemaining({ kind: 'no-answer' })
           } catch (err) {
-            endUpload(ownPostAnswerOfError(err))
-            if (!completed) {
+            endRemaining(ownPostAnswerOfError(err))
+            uploaded = Math.min(completed, files!.length)
+            if (uploaded < files!.length) {
               if (sent === 0 && uploaded === 0) throw err
               return partialFailure(err)
             }
           }
-          uploaded++
+          uploaded = files!.length
           succeeded()
         }
 
@@ -1600,7 +1729,7 @@ export function createSessionServer(
           content: [
             {
               type: 'text',
-              text: `Sent ${chunks.length} message(s)${files?.length ? ` + ${files.length} file(s)` : ''} to ${where}${lastTs ? ` [ts: ${lastTs}]` : ''}`,
+              text: `Sent ${chunks.length} message(s)${hasFiles ? ` + ${files!.length} file(s)` : ''} to ${where}${lastTs ? ` [ts: ${lastTs}]` : ''}`,
             },
           ],
         }
@@ -1610,13 +1739,16 @@ export function createSessionServer(
       // react
       // ---------------------------------------------------------------------
       case 'react': {
-        await web.reactions.add({
-          channel: args.chat_id,
-          timestamp: args.message_id,
-          name: args.emoji,
-        })
+        const chatId: string = args.chat_id, messageId: string = args.message_id, emoji: string = args.emoji
+        try {
+          await web.reactions.add({ channel: chatId, timestamp: messageId, name: emoji })
+        } catch (err) {
+          // The persona's own reaction is already there, as when it matches its ack.
+          if (slackPlatformReason(err) !== 'already_reacted') throw err
+        }
+        claimReact(persona, web, botUserId, chatId, messageId, emoji)
         return {
-          content: [{ type: 'text', text: `Reacted :${args.emoji}: to ${args.message_id}` }],
+          content: [{ type: 'text', text: `Reacted :${emoji}: to ${messageId}` }],
         }
       }
 
@@ -1845,7 +1977,7 @@ export function createSessionServer(
     const key = entry.personaKey
     if (!key) return toolError(sessionNotMatchedRefusal(name))
     if (!getPersona(key) || !currentSessionLife()) return toolError(personaNotAppliedRefusal(name, key))
-    if (name === 'reply') await deps.onReplyCall?.(key)
+    if (name === 'reply' || name === 'react') await deps.onReplyCall?.(key)
     const persona = getPersona(key)
     if (!persona || !currentSessionLife()) return toolError(personaNotAppliedRefusal(name, key))
     // The channel mode, read now with the persona.
@@ -1861,11 +1993,14 @@ export function createSessionServer(
 
     const ref = renderPersonaRef(persona.name, persona.key)
     const web = clientFor(key)
+    // Read with the client, before the add: an identity swap while the add is
+    // pending cannot pair this client with another bot user ID.
+    const botUserId = name === 'react' ? deps.getBotUserId?.(key) : undefined
     if (!web) return toolError(`Tool "${name}" refused: the Slack client for persona ${ref} is not available.`)
 
     const dm: { opened?: string } = {}
     try {
-      return await runTool(name, args, persona, web, scope.kind, dm)
+      return await runTool(name, args, persona, web, scope.kind, dm, botUserId)
     } catch (err) {
       // Fungible mode, channel target: Slack enforces
       // membership, so its refusal names the persona, the channel and

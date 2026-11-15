@@ -13,7 +13,6 @@ import { ownPostDigest, metadataRetryDelay, MetadataCancelledError, type Metadat
 import { OWN_ROOT_CLOCK_SKEW_MS, THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS } from '../src/delivery-constants.ts'
 import { MAX_TIMER_DELAY_MS } from '../src/persona-retry-schedule.ts'
 import { createPersonaUpPredicate } from '../src/persona-start.ts'
-import { OWN_POST_UPLOAD_FILENAME } from '../src/registry.ts'
 import { makeOwnPostHarness } from './test-helpers/own-post.ts'
 import { THREAD_TIME, threadFsControls } from './test-helpers/thread-memory.ts'
 import { SHARED_CHANNEL_IDS, membershipPage } from './test-helpers/shared-channels.ts'
@@ -102,7 +101,7 @@ describe('lookup pure contracts', () => {
     expect(result).toEqual({ kind: 'page', own: [{ ts: ROOT, digests: [ownPostDigest(DIGEST_KEY, { kind: 'text', text: original! })], fileIds: [] }] })
   })
 
-  test.each([OWN_POST_UPLOAD_FILENAME, `${LEAK_SENTINEL}.txt`])('file digest uses exact name and bytes: %s', async name => {
+  test.each(['report.txt', `${LEAK_SENTINEL}.txt`])('file digest uses exact name and bytes: %s', async name => {
     const size = 123, result = await rawPage([{ author: 'own-bot', placement: 'root', text: TEXT, file: { name, size } }])
     expect(result.kind).toBe('page')
     if (result.kind !== 'page') throw new Error('expected page')

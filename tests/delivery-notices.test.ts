@@ -1,24 +1,28 @@
 /** notice decisions only; engine/intake/ack suites own their transitions. */
+import { SERVER_POST_METADATA, noticePost, expectNoMetadata } from './test-helpers/server-post.ts'
 import { afterEach, describe, expect, test } from 'bun:test'
+import * as fs from 'node:fs'
+import { join } from 'node:path'
 import { CONFLICT_NOTICE_HUMAN_ONLY_LINE } from '../src/conflict-latch.ts'
-import { DELIVERY_STUCK_AFTER_MS, THREAD_REPLY_HOLD_MS } from '../src/delivery-constants.ts'
+import { DELIVERY_STUCK_AFTER_MS, DELIVERY_ROW_POLL_MS, ENTER_DELAY_MS, THREAD_REPLY_HOLD_MS } from '../src/delivery-constants.ts'
 import { NOTICE_CORRECTION_TIMEOUT_MS, type NoticeCorrectionOutcome } from '../src/notice-correction.ts'
-import type { SlackKey } from '../src/delivery-queue.ts'
+import type { AcceptedInput, QueueItem, ReactionAcceptedInput, SlackKey } from '../src/delivery-queue.ts'
+import { createDeliveryPreparation, type DeliveryPreparation } from '../src/delivery-intake.ts'
 import type { DeliveryReason, DeliveryStatus } from '../src/delivery-engine.ts'
-import { buildDeliveryDiagnostic, buildDeliveryStuckNotice, buildMessageNotSavedNotice, buildMessageSavedAfterRetryNotice, buildStorageNoticeRecoveryLine, buildMessageNotTakenInNotice, buildMessagesWaitingNotice, buildQueueRecordUnreadableNotice, deliveryIdentity, deliveryStuckRemedy, MESSAGE_NOT_TAKEN_IN, MESSAGE_RECEIVED, MESSAGE_RETYPED, QUEUE_KEPT, QUEUE_UNWRITABLE, type DeliveryReportState, type DeliveryStuckReason } from '../src/delivery-notices.ts'
+import { buildDeliveryDiagnostic, buildDeliveryStuckNotice, buildMessageNotSavedNotice, buildMessageSavedAfterRetryNotice, buildStorageNoticeRecoveryLine, buildMessageNotTakenInNotice, buildMessagesWaitingNotice, buildQueueRecordUnreadableNotice, deliveryIdentity, deliveryStuckRemedy, MESSAGE_DELIVERED, MESSAGE_NOT_SAVED, MESSAGE_NOT_TAKEN_IN, MESSAGE_RECEIVED, MESSAGE_RETYPED, QUEUE_KEPT, QUEUE_UNWRITABLE, type DeliveryReportState, type DeliveryStuckReason } from '../src/delivery-notices.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
-import { MESSAGE_NOT_SAVED, PERSONA_DESTINATION_FAILED } from '../src/persona-diagnostics.ts'
+import { MESSAGE_PARTIAL_RECEIPT, PERSONA_DESTINATION_FAILED } from '../src/persona-diagnostics.ts'
 import { OWN_POST_CANCELLED } from '../src/persona-destination.ts'
 import { holdOwnPostReady, makeRecordingOwnPostObserver, type OwnPostStep } from './test-helpers/own-post.ts'
 import { assertNoLeak, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
-import { join } from 'node:path'
 import { existsSync } from 'node:fs'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { makeDeliveryNoticeHarness, makeStorageNoticeHarness, STORAGE_NOTICE_IDS, type DeliveryNoticeHarness, type StorageNoticeHarness } from './test-helpers/delivery-notices.ts'
-import { injectedInput, readQueue } from './test-helpers/delivery-queue.ts'
+import { injectedInput, queuePath, readQueue } from './test-helpers/delivery-queue.ts'
+import { durableIo } from './test-helpers/durable-io.ts'
+import { partialReceiptText, partialReceiptSuffix } from './test-helpers/partial-receipt.ts'
 import { openedDm } from './test-helpers/slack-stub.ts'
-import { appendTranscript, replyEntry } from './test-helpers/working-row-panes.ts'
-import { MESSAGE_DELIVERED } from '../src/persona-diagnostics.ts'
+import { appendTranscript, pastedText, promptEntry, replyEntry } from './test-helpers/working-row-panes.ts'
 import { heldSlackInput, HOLD_FIELDS, memoryHold, postHold, slackInput } from './test-helpers/delivery-queue.ts'
 import type { HoldField } from '../src/delivery-queue.ts'
 import { THREAD_ROOTS } from './test-helpers/thread-memory.ts'
@@ -184,9 +188,12 @@ test('delivery notices and all nine fixed remedies keep their required wording',
   ])
   expect(buildDeliveryStuckNotice('Alpha', 'alpha', 2, DELIVERY_STUCK_AFTER_MS, 'refused', 3)).toBe(
     ':warning: *Delivery stuck* — 2 message(s) for Alpha are waiting; the oldest has waited 5m. ' + deliveryStuckRemedy('refused', 'alpha', 3) + ' ' + CONFLICT_NOTICE_HUMAN_ONLY_LINE)
+  expect(buildDeliveryStuckNotice('Alpha', 'alpha', 2, DELIVERY_STUCK_AFTER_MS, 'refused', 3, true)).toBe(
+    ':warning: *Delivery stuck* — 2 message(s) for Alpha are waiting; the oldest has waited 5m. The text arrived cut off; the full message is still queued. ' + deliveryStuckRemedy('refused', 'alpha', 3) + ' ' + CONFLICT_NOTICE_HUMAN_ONLY_LINE)
   expect(buildMessageNotSavedNotice('Alpha', 'U0SENDER1')).toBe(":warning: *Message not saved* — a message from U0SENDER1 for Alpha could not be saved. Slack will send it again a few times; it is delivered if one copy is saved, otherwise it is lost and should be sent again. Further messages to this persona may fail the same way until storing works; server.log counts them. Check the server's disk.")
   expect(buildMessageSavedAfterRetryNotice('Alpha', 'U0SENDER1')).toBe(':white_check_mark: *Message saved after retry* — the message from U0SENDER1 for Alpha was saved after a retry. No resend is needed.')
   expect(buildMessageNotTakenInNotice('Alpha', 'U0SENDER1')).toBe(":warning: *Message not taken in* — the message from U0SENDER1 for Alpha is still queued. CSCB keeps offering it (again at least every 15 minutes while it can type it) until the bot's transcript shows it. Later messages for this persona wait behind it. The bot may see it more than once.")
+  expect(buildMessageNotTakenInNotice('Alpha', 'U0SENDER1', true)).toBe(":warning: *Message not taken in* — the message from U0SENDER1 for Alpha is still queued. The text arrived cut off; the full message is kept. CSCB keeps offering it (again at least every 15 minutes while it can type it) until the bot's transcript shows it. Later messages for this persona wait behind it. The bot may see it more than once.")
   expect(buildMessagesWaitingNotice('Alpha', 2, DELIVERY_STUCK_AFTER_MS, 'down')).toBe(':warning: *Messages waiting* — 2 message(s) for Alpha are waiting; the oldest has waited 5m. The persona is down. The messages are kept and delivered once the persona is up.')
   expect(buildQueueRecordUnreadableNotice('Alpha', 2, '/scratch/quarantine')).toBe(':warning: *Queue record unreadable* — 2 queued message(s) for Alpha could not be read at start and will not be delivered. Their bytes are kept in `/scratch/quarantine`. Ask the senders to send them again.')
 })
@@ -215,6 +222,17 @@ test.each(reasons)('%s: over five minutes, once until queue progress; only the o
   await r.complete(item)
   r.waiting(next, engineReason, { ageMs: DELIVERY_STUCK_AFTER_MS + 1, ...patch }); await r.flush()
   expect(posts).toHaveLength(2)
+})
+
+test.each(reasons)('b.x4j partial evidence retains the %s remedy and episode deduplication', async (reason, engineReason, patch) => {
+  const r = await run(), item = await r.accept(), ageMs = DELIVERY_STUCK_AFTER_MS + 1
+  const status = { ageMs, ...patch, partialReceipt: { part: 1, expectedBytes: Buffer.byteLength(partialReceiptText), receivedBytes: Buffer.byteLength(partialReceiptSuffix) } }
+  r.waiting(item, engineReason, status); await r.flush()
+  r.waiting(item, engineReason, status); await r.flush()
+  expect(r.h.posts(r.alpha).map(post => post.text)).toEqual([
+    formatPersonaNotice(r.config.personas[0]!, buildDeliveryStuckNotice(r.ref(), r.alpha, 1, ageMs, reason, (patch.retypeCount ?? 0) + 1, true)),
+  ])
+  expect(r.h.posts(r.beta)).toEqual([])
 })
 
 const waiting: [string, Partial<DeliveryReportState>, Partial<DeliveryStatus>][] = [
@@ -344,6 +362,142 @@ test.each([false, true])('received and delivered logs retain via=thread through 
     assertNoLeak(r.logs)
   } finally { await engine.cleanup() }
 })
+
+describe('Reaction Items: the queue store-failure path and delivered diagnostics only (SR-4.4, SR-8.1, SR-10.1)', () => {
+  const preparations: DeliveryPreparation[] = []
+  afterEach(async () => { for (const p of preparations.splice(0)) await p.stop() })
+  async function runWith(options: Parameters<typeof makeDeliveryNoticeHarness>[0]) {
+    const h = await makeDeliveryNoticeHarness(options); runs.push(h); return h
+  }
+  /** The b.vki fsync seam: while failing, every journal fsync fails as a full disk. */
+  function diskFault() {
+    let failing = false
+    const faulty = durableIo({ before(step) {
+      if (step.op === 'fsync' && failing && fs.fstatSync(step.fd!).isFile()) throw Object.assign(new Error(sentinelInMessage('store')), { code: 'ENOSPC' })
+    } }).fs
+    return { fs: faulty, fail(value = true) { failing = value } }
+  }
+  type Reactor = { user: string } | { bot_id: string }
+  const REACTORS: Array<[string, Reactor]> = [['user', { user: 'U0REACTOR' }], ['bot_id', { bot_id: 'B0REACTOR' }]]
+  const reactorId = (reactor: Reactor) => ('user' in reactor ? reactor.user : reactor.bot_id)
+  /** One reaction on alpha's channel as intake stores it. */
+  function reaction(reactor: Reactor, overrides: { ts?: string; mode?: ReactionAcceptedInput['mode'] } = {}): ReactionAcceptedInput {
+    const channel = 'C0ALPHA01', message_ts = '1700000100.000100', ts = overrides.ts ?? '1700000200.000200'
+    return { source: 'reaction', text: '', channel, message_ts, ts, change: 'added', emoji: 'eyes', ...reactor, origin: 'slack-event',
+      mode: overrides.mode ?? 'strict', reaction_key: { chat_id: channel, message_ts, reactor: reactorId(reactor), emoji: 'eyes', change: 'added', event_ts: ts } }
+  }
+  async function store(r: DeliveryNoticeHarness, input: AcceptedInput): Promise<QueueItem> {
+    const result = await r.queue.accept(r.alpha, input)
+    if (result.status !== 'accepted') throw new Error('reaction fixture store failed')
+    return result.item!
+  }
+  function notSaved(r: DeliveryNoticeHarness, input: AcceptedInput, count: number) {
+    const identity = deliveryIdentity({ source: input.source, channel: input.channel, ts: input.ts ?? '', user: input.user, bot_id: input.bot_id })
+    return buildDeliveryDiagnostic(MESSAGE_NOT_SAVED, r.ref(), identity, `count=${count} path=${JSON.stringify(queuePath(r.root, r.alpha))} code=ENOSPC`)
+  }
+  const slackCalls = (r: DeliveryNoticeHarness) => [...r.h.stubs.values()].flatMap(stub => stub.callLog)
+  const receivedLine = (r: DeliveryNoticeHarness, item: QueueItem) => buildDeliveryDiagnostic(MESSAGE_RECEIVED, r.ref(), deliveryIdentity(item.accepted))
+  /** Real preparation with no Slack client: a strict-mode reaction is fixed, an open-mode one withdrawn. */
+  function preparation(r: DeliveryNoticeHarness) {
+    const p = createDeliveryPreparation({ queue: r.queue, clock: r.h.clock, resolveUserName: async (_key, user) => user, clientFor: () => undefined, onReceived: r.reporting.received })
+    preparations.push(p); return p
+  }
+
+  test.each(REACTORS)('reactor %s: a failed reaction store is logged and counted with the reaction identity, reset by a successful store, and reaches no Slack API', async (_label, reactor) => {
+    const disk = diskFault(), r = await runWith({ fs: disk.fs })
+    const first = reaction(reactor), other = reaction(reactor, { ts: '1700000200.000201' })
+    disk.fail()
+    for (const input of [first, first, other]) expect((await r.queue.accept(r.alpha, input)).status).toBe('failed')
+    await r.flush()
+    expect(r.logs).toEqual([notSaved(r, first, 1), notSaved(r, first, 2), notSaved(r, other, 3)])
+    expect(r.logs[0]).toContain(` source=reaction chat_id="C0ALPHA01" ts="${first.ts}" sender_id="${reactorId(reactor)}" count=1 `)
+    // Slack's redelivery is stored; preparation then reports it received.
+    disk.fail(false)
+    r.reporting.received(r.alpha, await store(r, first))
+    disk.fail()
+    expect((await r.queue.accept(r.alpha, other)).status).toBe('failed')
+    await r.flush(); await r.h.clock.advance(NOTICE_CORRECTION_TIMEOUT_MS * 2)
+    expect(r.logs.slice(3)).toEqual([notSaved(r, other, 1)])
+    expect(slackCalls(r)).toEqual([])
+    expect(r.h.hold.view(r.alpha).heldNotices).toBe(0)
+    expect(r.h.clock.pendingCount()).toBe(0)
+    expect(readQueue(r.root, r.alpha).filter(record => record.kind === 'accepted')).toEqual([expect.objectContaining({ source: 'reaction', ts: first.ts })])
+  })
+
+  test('reaction storage neither takes, recovers nor forgets a Slack message warning, which still posts and recovers on its exact retry', async () => {
+    const disk = diskFault(), r = await runWith({ fs: disk.fs }), warningTs = '1800000000.000001'
+    const react = reaction({ user: 'U0REACTOR' })
+    const slack = slackInput({ channel: 'C0SOURCE1', user: 'U0SENDER1', key: { chat_id: 'C0SOURCE1', ts: '1700000000.000001' }, ts: '1700000000.000001' })
+    r.h.stub(r.alpha).script.post.push({ kind: 'ok', result: { ts: warningTs } })
+    disk.fail()
+    expect((await r.queue.accept(r.alpha, react)).status).toBe('failed')
+    await r.flush()
+    expect(r.h.totalPosts()).toBe(0)
+    expect((await r.queue.accept(r.alpha, slack)).status).toBe('failed')
+    await r.flush()
+    expect(r.h.posts(r.alpha)).toMatchObject([{ channel: 'C0ALPHA01', text: formatPersonaNotice(r.config.personas[0]!, buildMessageNotSavedNotice(r.ref(), 'U0SENDER1')) }])
+    disk.fail(false)
+    r.reporting.received(r.alpha, await store(r, react))
+    await r.flush()
+    expect(r.h.stub(r.alpha).calls.update).toEqual([])
+    const saved = await store(r, slack)
+    r.reporting.received(r.alpha, saved)
+    await r.flush()
+    expect(r.h.stub(r.alpha).calls.update).toMatchObject([{ channel: 'C0ALPHA01', ts: warningTs,
+      text: formatPersonaNotice(r.config.personas[0]!, buildMessageSavedAfterRetryNotice(r.ref(), 'U0SENDER1')) }])
+    expect(r.h.posts(r.alpha)).toHaveLength(1)
+    expect(r.h.posts(r.beta)).toEqual([])
+    expect(r.logs).toEqual([
+      notSaved(r, react, 1), notSaved(r, slack, 2), receivedLine(r, saved),
+      buildStorageNoticeRecoveryLine(r.ref(), slack.key!, 'edit', { outcome: 'success' }),
+    ])
+  })
+
+  test('preparation, startup recovery and queued reconciliation report no Reaction Item as received or queued; the Slack control is', async () => {
+    const r = await runWith({ recordQueued: true })
+    const slack = await r.accept()
+    const kept = await store(r, reaction({ user: 'U0REACTOR' }))
+    const withdrawn = await store(r, reaction({ bot_id: 'B0REACTOR' }, { ts: '1700000200.000201', mode: 'open' }))
+    const prep = preparation(r)
+    r.reporting.received(r.alpha, kept)
+    for (const item of [slack, kept, withdrawn]) await prep.prepare(r.alpha, item)
+    r.reporting.reconcileQueued(r.alpha)
+    await r.flush()
+    expect(r.queue.item(r.alpha, kept.accepted.seq)).toMatchObject({ fixed: { seq: kept.accepted.seq }, delivered: false })
+    expect(r.queue.item(r.alpha, withdrawn.accepted.seq)).toMatchObject({ withdrawn: { reason: 'conversation-unknown' }, delivered: false })
+    expect(r.logs).toEqual([receivedLine(r, slack)])
+    expect(r.queued.map(({ key, item }) => [key, item.accepted.seq])).toEqual([[r.alpha, slack.accepted.seq], [r.alpha, slack.accepted.seq]])
+
+    // A restarted server's reporting has seen nothing; recovery prepares every retained open item again.
+    const restarted = await runWith({ queue: r.queue, recordQueued: true })
+    const recovering = createDeliveryPreparation({ queue: r.queue, clock: restarted.h.clock, resolveUserName: async (_key, user) => user,
+      clientFor: () => undefined, onReceived: restarted.reporting.received })
+    preparations.push(recovering)
+    await recovering.recover([r.alpha])
+    await restarted.flush()
+    expect(restarted.logs).toEqual([receivedLine(restarted, slack)])
+    expect(restarted.queued.map(({ item }) => item.accepted.seq)).toEqual([slack.accepted.seq])
+  })
+
+  test('the final delivery fallback logs a Reaction Item delivered without a received line or queued callback; a withdrawn one is never delivered', async () => {
+    const r = await runWith({ recordQueued: true })
+    const slack = await r.accept()
+    const kept = await store(r, reaction({ user: 'U0REACTOR' }))
+    const withdrawn = await store(r, reaction({ bot_id: 'B0REACTOR' }, { ts: '1700000200.000201', mode: 'open' }))
+    await preparation(r).prepare(r.alpha, withdrawn)
+    // Nothing above reported slack or kept received, so final delivery is their first report.
+    r.logs.length = 0; r.queued.length = 0
+    await r.complete(slack); await r.complete(kept)
+    r.reporting.engineEvent({ type: 'item-delivered', key: r.alpha, seq: withdrawn.accepted.seq, at: r.h.clock.now(), waitMs: 0 })
+    await r.flush()
+    const deliveredLine = (item: QueueItem) => buildDeliveryDiagnostic(MESSAGE_DELIVERED, r.ref(), deliveryIdentity(item.accepted), `at=${r.h.clock.now()} wait_ms=0`)
+    expect(r.logs).toEqual([receivedLine(r, slack), deliveredLine(slack), deliveredLine(kept)])
+    expect(r.logs[2]).toContain(` source=reaction chat_id="C0ALPHA01" ts="${kept.accepted.ts}" sender_id="U0REACTOR" `)
+    expect(r.delivered.map(({ item }) => item.accepted.seq)).toEqual([slack.accepted.seq, kept.accepted.seq])
+    expect(r.queued).toEqual([])
+    expect(r.queue.item(r.alpha, withdrawn.accepted.seq)).toMatchObject({ withdrawn: { reason: 'conversation-unknown' }, delivered: false })
+  })
+})
 test('the durable per-item not-taken-in notice survives server restart while retyping continues', async () => {
   let r: DeliveryNoticeHarness | undefined
   const e = await makeEngineHarness({ onEvent: event => r?.reporting.engineEvent(event) })
@@ -368,6 +522,169 @@ test('the durable per-item not-taken-in notice survives server restart while ret
     expect(e.records().filter(record => record.kind === 'noticed')).toHaveLength(1)
     expect(r.h.posts(r.alpha)).toHaveLength(1)
     expect(r.h.posts(r.beta)).toEqual([])
+  } finally { await e.cleanup() }
+})
+
+describe('b.x4j transcript-to-notice partial receipt guard', () => {
+  async function compose() {
+    let r: DeliveryNoticeHarness | undefined
+    const e = await makeEngineHarness({ onEvent: event => r?.reporting.engineEvent(event) })
+    r = await makeDeliveryNoticeHarness({ queue: e.queue }); runs.push(r)
+    e.p().autoReceipt = false
+    return { e, r, async resetReporting() {
+      r!.rig.episodes.close()
+      r = await makeDeliveryNoticeHarness({ queue: e.queue }); runs.push(r)
+      return r
+    } }
+  }
+  const partialLines = (r: DeliveryNoticeHarness) => r.logs.filter(line => line.includes(MESSAGE_PARTIAL_RECEIPT))
+
+  test.each(['raw', 'paste'] as const)('%s suffix: retain full FIFO head, report cut-off text, then accept late full receipt', async framing => {
+    const { e, r } = await compose()
+    try {
+      // Put a fake secret inside the surviving suffix, not only the lost prefix.
+      const text = partialReceiptText.replace('END-round2-trial.', `END-round2-trial. ${sentinelInMessage('partial-receipt')}`)
+      const suffix = text.slice(-349), fragment = promptEntry(framing === 'paste' ? `\n\n${pastedText(suffix)}\n\n` : suffix)
+      const head = await e.accept(text), next = await e.accept('FIFO successor')
+      e.p().keyHook = params => { if (params.key === 'Enter') appendTranscript(e.p().path, [fragment]); return undefined }
+      await e.tick(); await e.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+      expect(e.keyCalls().map(call => call.params.key ?? call.params.text)).toEqual([text, 'Enter'])
+      expect(e.queue.openCount('alpha')).toBe(2)
+      expect(head.accepted.text).toBe(text)
+      expect(e.queue.items('alpha')[0]!.fixed?.parts).toEqual([text])
+      expect(e.records().filter(record => record.kind === 'delivered')).toEqual([])
+      expect(r.delivered).toEqual([])
+      expect(e.engine.status('alpha')?.row).toBe('waiting')
+      await e.until(() => e.events.some(event => event.type === 'retyped'))
+      // The existing recovery Enter and full retype remain the only key path.
+      expect(e.keyCalls().map(call => call.params.key ?? call.params.text)).toEqual([text, 'Enter', 'Enter', text, 'Enter'])
+      await e.advance(DELIVERY_STUCK_AFTER_MS + DELIVERY_ROW_POLL_MS - e.clock.now())
+      await r.flush()
+      const notices = [...r.h.posts(r.alpha)], diagnostics = [...partialLines(r)], typedCount = e.queue.items('alpha')[0]!.retypeCount + 1
+      expect(notices).toHaveLength(2)
+      expect(e.records().filter(record => record.kind === 'noticed')).toHaveLength(1)
+      expect(e.records().filter(record => record.kind === 'delivered')).toEqual([])
+      expect(e.textCalls().every(call => call.params.text === text)).toBe(true)
+      expect(r.h.posts(r.beta)).toEqual([])
+      assertNoLeak({ logs: r.logs, notices })
+      expect(JSON.stringify({ logs: r.logs, notices })).not.toContain('END-round2-trial')
+      expect(JSON.stringify({ logs: r.logs, notices })).not.toContain('Inert numbered transport data')
+
+      e.p().keyHook = undefined; e.p().autoReceipt = true
+      const full = promptEntry(pastedText(text))
+      appendTranscript(e.p().path, [full])
+      const textsBeforeFull = e.textCalls().length
+      await e.until(() => e.queue.openCount('alpha') === 0)
+      expect(e.textCalls().slice(textsBeforeFull).map(call => call.params.text)).toEqual(['FIFO successor'])
+      expect(r.delivered.map(({ item }) => item.accepted.seq)).toEqual([head.accepted.seq, next.accepted.seq])
+      expect(e.records().filter(record => record.kind === 'delivered')).toMatchObject([
+        { seq: head.accepted.seq, part: 1, receipt: { uuid: full.uuid } }, { seq: next.accepted.seq, part: 1 },
+      ])
+      expect(e.calls.filter(call => call.verb === 'read-pane')).toEqual([])
+      expect(e.errors).toEqual([])
+      // Keep all safety/progression assertions above the expected pre-fix failure.
+      expect({ diagnosticCount: diagnostics.length, afterFullCount: partialLines(r).length,
+        notTakenIn: /cut off/i.test(notices[0]!.text), stuck: /cut off/i.test(notices[1]!.text) })
+        .toEqual({ diagnosticCount: 1, afterFullCount: 1, notTakenIn: true, stuck: true })
+      expect(diagnostics[0]).toContain(deliveryIdentity(head.accepted))
+      expect(diagnostics[0]).toContain('part=1')
+      expect(diagnostics[0]).toContain(`expected_bytes=${Buffer.byteLength(text)}`)
+      expect(diagnostics[0]).toContain(`received_bytes=${Buffer.byteLength(suffix)}`)
+      expect(notices[0]!.text).toBe(formatPersonaNotice(r.config.personas[0]!, buildMessageNotTakenInNotice(r.ref(), 'interject', true)))
+      expect(notices[1]!.text).toContain(deliveryStuckRemedy('not-taken-in', r.alpha, typedCount))
+      expect(diagnostics[0]).not.toContain(e.p().path)
+      expect(diagnostics[0]).not.toContain(fragment.uuid as string)
+    } finally { await e.cleanup() }
+  })
+
+  test.each(['part', 'item', 'launch', 'session', 'launch-timestamp', 'replay', 'timestamped-replay'] as const)('%s scopes cut-off reporting to applicable evidence', async scope => {
+    const composition = await compose(), e = composition.e
+    let r = composition.r
+    try {
+      if (scope === 'launch-timestamp' || scope === 'timestamped-replay') e.p().row.launch_started_at = new Date(e.clock.now()).toISOString()
+      await e.accept(partialReceiptText, 'alpha', scope === 'part' ? [partialReceiptText, 'later part'] : undefined)
+      if (scope === 'item') await e.accept('later item')
+      await e.tick(); await e.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+      appendTranscript(e.p().path, [promptEntry(partialReceiptSuffix)])
+      await e.advance(DELIVERY_ROW_POLL_MS)
+      const firstDiagnostics = partialLines(r).length
+      if (scope === 'part' || scope === 'item') {
+        appendTranscript(e.p().path, [promptEntry(partialReceiptText)])
+      } else if (scope === 'launch') {
+        // Same conversation, new AD launch; the old fragment precedes this send.
+        e.p().row.state = 'pending'; await e.advance(DELIVERY_ROW_POLL_MS)
+        e.p().row.state = 'waiting'; await e.advance(DELIVERY_ROW_POLL_MS)
+      } else if (scope === 'session') {
+        e.p().row.session_id = 'new-session'; await e.advance(DELIVERY_ROW_POLL_MS)
+      } else if (scope === 'launch-timestamp') {
+        e.p().row.launch_started_at = new Date(e.clock.now()).toISOString(); await e.advance(DELIVERY_ROW_POLL_MS)
+      } else {
+        if (scope === 'timestamped-replay') e.p().row.launch_started_at = new Date(e.clock.now()).toISOString()
+        await e.restartServer() // Evidence is rebuilt from journal + transcript.
+        r = await composition.resetReporting()
+      }
+      await e.until(() => e.records().some(record => record.kind === 'noticed'))
+      await e.advance(DELIVERY_STUCK_AFTER_MS + DELIVERY_ROW_POLL_MS - e.clock.now())
+      await r.flush()
+      const notices = r.h.posts(r.alpha)
+      expect(notices).toHaveLength(2)
+      expect(notices.map(post => /cut off/i.test(post.text))).toEqual(scope === 'replay' ? [true, true] : [false, false])
+      expect(e.queue.openCount('alpha')).toBe(1)
+      expect(e.calls.filter(call => call.verb === 'read-pane')).toEqual([])
+      expect(e.errors).toEqual([])
+      expect(firstDiagnostics).toBe(1)
+    } finally { await e.cleanup() }
+  })
+
+  test('b.x4j replay reconstructs a partial diagnostic once while retaining the durable not-taken-in notice', async () => {
+    const composition = await compose(), e = composition.e
+    let r = composition.r
+    try {
+      await e.accept(partialReceiptText)
+      await e.tick(); await e.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+      appendTranscript(e.p().path, [promptEntry(partialReceiptSuffix)])
+      await e.until(() => e.records().some(record => record.kind === 'noticed'))
+      await r.flush()
+      expect(r.h.posts(r.alpha).map(post => post.text)).toEqual([
+        formatPersonaNotice(r.config.personas[0]!, buildMessageNotTakenInNotice(r.ref(), 'interject', true)),
+      ])
+      expect(partialLines(r)).toHaveLength(1)
+      await e.restartServer(); r = await composition.resetReporting()
+      await e.advance(DELIVERY_STUCK_AFTER_MS + DELIVERY_ROW_POLL_MS - e.clock.now()); await r.flush()
+      expect(e.records().filter(record => record.kind === 'noticed')).toHaveLength(1)
+      expect(r.logs.filter(line => line.includes(MESSAGE_NOT_TAKEN_IN))).toEqual([])
+      expect(partialLines(r)).toHaveLength(1)
+      const posts = r.h.posts(r.alpha)
+      expect(posts).toHaveLength(1)
+      expect(posts[0]!.text).toBe(formatPersonaNotice(r.config.personas[0]!, buildDeliveryStuckNotice(r.ref(), r.alpha, 1, e.clock.now(), 'not-taken-in', e.queue.items('alpha')[0]!.retypeCount + 1, true)))
+    } finally { await e.cleanup() }
+  })
+})
+
+test.each([false, true])('b.eh9 an aged head awaiting its receipt on a waiting row posts no stuck notice (gone prior session: %p)', async gonePrior => {
+  let r: DeliveryNoticeHarness | undefined
+  const e = await makeEngineHarness({ onEvent: event => r?.reporting.engineEvent(event) })
+  try {
+    r = await makeDeliveryNoticeHarness({ queue: e.queue }); runs.push(r)
+    const p = e.p()
+    if (gonePrior) p.row.prior_sessions = [{ jsonl_path: join(e.root, 'gone-prior.jsonl'), session_id: 'gone-prior' }]
+    p.autoReceipt = false; p.row.state = 'working'
+    const item = await e.accept('hello from slack')
+    e.engine.wake('alpha')
+    await e.advance(DELIVERY_STUCK_AFTER_MS + 5_000)
+    const before = e.events.length
+    p.row.state = 'waiting'
+    await e.until(() => e.keyCalls().some(call => call.params.key === 'Enter'))
+    await e.advance(4_000); await r.flush()
+    const waits = e.events.slice(before).filter(event => event.type === 'waiting')
+    expect(waits.at(-1)?.status?.ageMs).toBeGreaterThan(DELIVERY_STUCK_AFTER_MS)
+    expect([...new Set(waits.map(event => event.reason))]).toEqual(['receipt'])
+    expect(r.h.posts(r.alpha)).toEqual([])
+    expect(r.logs.filter(line => line.includes('delivery-stuck'))).toEqual([])
+    appendTranscript(p.path, [promptEntry('hello from slack')])
+    await e.until(() => e.queue.items('alpha').find(i => i.accepted.seq === item.accepted.seq)?.delivered === true, 60_000)
+    expect({ textSends: e.textCalls().length, retyped: e.events.filter(event => event.type === 'retyped').length }).toEqual({ textSends: 1, retyped: 0 })
+    expect(e.errors).toEqual([])
   } finally { await e.cleanup() }
 })
 
@@ -475,6 +792,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     expect(updates).toHaveLength(1)
     expect(updates[0]).toMatchObject({ channel: destination === 'dm' ? noticeDm : 'C0NOTICE1', ts: warningTs })
     recovered(r, updates[0]!)
+    expectNoMetadata(updates[0]!)
     expect(r.h.posts(r.alpha)).toHaveLength(1)
     expect(r.h.stub(r.beta).callLog).toEqual([])
     expect(recoveryLines(r)).toEqual([recoveryLine(r, 'edit', { outcome: 'success' }, edited.edited.ts)])
@@ -506,11 +824,14 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     await retry(r)
     expect(r.h.stub(r.alpha).calls.update).toHaveLength(1)
     expect(r.h.stub(r.alpha).calls.update[0]).toMatchObject({ channel: destination === 'dm' ? noticeDm : 'C0NOTICE1', ts: warningTs })
+    expectNoMetadata(r.h.stub(r.alpha).calls.update[0]!)
     expect(r.h.posts(r.alpha)).toHaveLength(2)
     const correction = r.h.stub(r.alpha).calls.postMessage[1]!
     expect(correction.channel).toBe(r.h.posts(r.alpha)[0]!.channel)
     expect(correction.thread_ts).toBe(r.h.stub(r.alpha).calls.postMessage[0]!.thread_ts)
     recovered(r, correction)
+    // The fallback is a Server Post: the marker rides in its one request.
+    expect(correction).toEqual(noticePost(r.h.posts(r.alpha)[0]!.channel, noticeText(correction)!))
     expect(noticeText(correction)!.length).toBeLessThan(warning(r).length)
     expect(recoveryLines(r)).toEqual([
       expect.stringContaining(recoveryLine(r, 'edit', { outcome: 'failed', reason: '' })),
@@ -539,7 +860,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     expect(r.acks).toHaveLength(1)
     expect(r.queue.items(r.alpha)).toHaveLength(1)
     opening.settle(openedDm(noticeDm)); await r.flush()
-    expect(r.h.posts(r.alpha)).toEqual([{ channel: noticeDm, text: warning(r) }])
+    expect(r.h.posts(r.alpha)).toEqual([noticePost(noticeDm, warning(r))])
     expect(r.h.stub(r.alpha).calls.update).toEqual([])
   })
   test.each(unrelated)('posted edited warning survives %s, then the exact edit still corrects it', async (_label, other) => {
@@ -583,7 +904,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     await r.receive(); await r.receive()
     await r.h.clock.advance(90 * 24 * 60 * 60 * 1000)
     await r.receive()
-    expect(r.h.posts(r.alpha)).toEqual([{ channel: noticeDm, text: warning(r) }])
+    expect(r.h.posts(r.alpha)).toEqual([noticePost(noticeDm, warning(r))])
     expect(r.h.stub(r.alpha).calls.update).toEqual([])
     expect(r.acks).toEqual([])
     expect(r.queue.items(r.alpha)).toEqual([])
@@ -635,6 +956,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     expect(r.h.posts(r.alpha)).toHaveLength(2)
     expect(r.h.posts(r.alpha)[1]!.channel).toBe('C0NOTICE1')
     recovered(r, r.h.stub(r.alpha).calls.postMessage[1]!)
+    expect(r.h.stub(r.alpha).calls.postMessage[1]!.metadata).toEqual(SERVER_POST_METADATA)
     expect(recoveryLines(r)).toEqual([
       recoveryLine(r, 'edit', { outcome: 'failed', reason: 'missing_message_ts' }),
       recoveryLine(r, 'correction', { outcome: 'success' }),
@@ -657,7 +979,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     expect(r.h.clock.pendingCount()).toBe(keepOther ? 1 : 0)
     if (keepOther) {
       await r.h.clock.runNext()
-      expect(r.h.posts(r.alpha)[1]).toEqual({ channel: 'C0NOTICE1', text: formatPersonaNotice(r.config.personas[0]!, other) })
+      expect(r.h.posts(r.alpha)[1]).toEqual(noticePost('C0NOTICE1', formatPersonaNotice(r.config.personas[0]!, other)))
     }
     await r.h.clock.advance(NOTICE_CORRECTION_TIMEOUT_MS * 2)
     expect(r.h.posts(r.alpha)).toHaveLength(keepOther ? 2 : 1)
@@ -700,7 +1022,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     // an open timeout: abort itself must release this persona's drain.
     await r.h.clock.advance(1)
     expect(opening.settled).toBe(false)
-    const expectedPosts = [{ channel: 'C0FIXED01', text: formatPersonaNotice(r.h.personas[0]!, other) }]
+    const expectedPosts = [noticePost('C0FIXED01', formatPersonaNotice(r.h.personas[0]!, other))]
     expect(r.h.posts(r.alpha)).toEqual(expectedPosts)
     expect(r.h.hold.view(r.alpha)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
     const destinationOutcomes = destinationLines(r)
@@ -765,8 +1087,8 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     await r.receive(edited, r.beta)
     expect(r.acks).toEqual([])
     expect(readQueue(r.root, r.beta)).toEqual([])
-    expect(r.h.posts(r.beta)).toEqual([{ channel: betaDm,
-      text: formatPersonaNotice(r.config.personas[1]!, buildMessageNotSavedNotice(r.ref(r.beta), 'U0SENDER1')) }])
+    expect(r.h.posts(r.beta)).toEqual([noticePost(betaDm,
+      formatPersonaNotice(r.config.personas[1]!, buildMessageNotSavedNotice(r.ref(r.beta), 'U0SENDER1')))])
     expect(opening.settled).toBe(false)
     // Both warning registrations exist before only alpha is forgotten.
     r.forget()
@@ -924,7 +1246,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
         expect(r.h.posts(r.alpha)).toHaveLength(1)
         ready.reject(fault); await r.flush()
       }
-      expect(r.h.posts(r.alpha)).toEqual([{ channel: IDS.notice, text: warning(r) }, { channel: IDS.notice, text: correctionText(r) }])
+      expect(r.h.posts(r.alpha)).toEqual([{ channel: IDS.notice, text: warning(r), metadata: SERVER_POST_METADATA }, { channel: IDS.notice, text: correctionText(r), metadata: SERVER_POST_METADATA }])
       expect(recoveryLines(r)).toEqual([editFailed(r), scenario === 'refused by Slack'
         ? expect.stringContaining(recoveryLine(r, 'correction', { outcome: 'failed', reason: '' })) : recoveryLine(r, 'correction', { outcome: 'success' })])
       if (scenario === 'refused by Slack') expect(recoveryLines(r)[1]).toContain('reason=is_archived')
@@ -945,7 +1267,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
       const correcting = r.hold('post')
       await retry(r)
       await until(r, () => r.h.posts(r.alpha).length === 2)
-      expect(r.h.posts(r.alpha)[1]).toEqual({ channel: IDS.notice, text: correctionText(r) })
+      expect(r.h.posts(r.alpha)[1]).toEqual({ channel: IDS.notice, text: correctionText(r), metadata: SERVER_POST_METADATA })
       // A reply in the correction's thread, before Slack has answered the correction.
       const inThread = (ts: string) => ({ channel: IDS.notice, thread_ts: IDS.correctionTs, ts, text: r.body })
       await r.receive(inThread(IDS.replyTs))
@@ -969,7 +1291,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
       await pendingPost(r)
       r.h.stub(r.alpha).script.post.push({ kind: 'ok', result: { ts: IDS.warningTs } })
       await fail(r, reply(r))
-      expect(r.h.posts(r.alpha)).toEqual([{ channel: IDS.notice, text: warning(r) }])
+      expect(r.h.posts(r.alpha)).toEqual([{ channel: IDS.notice, text: warning(r), metadata: SERVER_POST_METADATA }])
       r.failStores(false); await r.receive(reply(r))
       // Nothing before the ack waits on Slack; the held save corrects after it.
       expect(r.editsAtAck).toEqual([0])
@@ -1014,7 +1336,7 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
       await fail(r)
       // The failed store kept no join; the warning is the plain storage warning.
       expect(r.threads!.memory.view(r.alpha, IDS.source, IDS.ts)).toBe('not-joined')
-      expect(r.h.posts(r.alpha)).toEqual([{ channel: IDS.notice, text: warning(r) }])
+      expect(r.h.posts(r.alpha)).toEqual([{ channel: IDS.notice, text: warning(r), metadata: SERVER_POST_METADATA }])
       await retry(r)
       expect(r.queue.items(r.alpha)[0]!.accepted.thread_join).toMatchObject({ thread_ts: IDS.ts })
       expect(r.threads!.memory.view(r.alpha, IDS.source, IDS.ts)).toBe('joined')

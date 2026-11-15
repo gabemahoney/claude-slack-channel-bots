@@ -15,6 +15,7 @@ import { Findings, type CheckDef } from './framework.ts'
 import { INVITED_CHECKS } from './invited-checks.ts'
 import { CLOSING_CHECKS, LIFECYCLE_CHECKS } from './lifecycle-checks.ts'
 import { membershipSetupCheck, membershipSetupRestartCheck } from './membership-setup.ts'
+import { REACTION_CHECKS } from './reaction-checks.ts'
 import { installCheck, preflightCheck, s1Check, s2Check, s3Check, setupCheck } from './setup-checks.ts'
 
 export const teardownCheck: CheckDef<CheckContext> = {
@@ -74,6 +75,7 @@ export const PLAN_CHECKS: CheckDef<CheckContext>[] = [
   ...LIFECYCLE_CHECKS,
   membershipSetupRestartCheck,
   ...INVITED_CHECKS,
+  ...REACTION_CHECKS,
   ...CLOSING_CHECKS,
 ]
 

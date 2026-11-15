@@ -498,10 +498,10 @@ the host and fits the run. Every figure below is a runner constant.
 
 | Figure | Value |
 |---|---|
-| CPUs | 2 per shard; all live `/ci` runs together hold at most 12 CI CPUs |
+| CPUs | 2 per shard, the server's quota; a shard holding test 44, 45 or 48 takes a third for the SR-8 burst driver, and needs a Docker that supports `--security-opt writable-cgroups=true` and `--cgroupns private`. Admission counts one more CPU per such script, at most N, so a full run takes at most 4 shards. All live `/ci` runs together hold at most 12 CI CPUs |
 | Memory per shard | Ordinary cap: 2 GiB. Each dedicated Codex shard adds 2 GiB (currently 4 GiB), for both memory and memory-swap |
 | Admission margin | 1 GiB |
-| Ceiling C | 85% of the pod memory limit (54.4 GiB on the 64 GiB pod); while a `/ci-live` run is active, the lower of that and 40 GiB, `/ci-live`'s working-set stop line |
+| Ceiling C | 85% of the pod memory limit (54.4 GiB on the 64 GiB pod); while a `/ci-live` run is active, the lower of that and 40 GiB, `/ci-live`'s non-reclaimable memory stop line |
 | Memory fit | pod non-reclaimable memory U + other runs' commitments + N × the ordinary cap + 2 GiB per Codex shard + 1 GiB margin ≤ C |
 | Stop line | C less 0.5 GiB (53.9 GiB, or 39.5 GiB while `/ci-live` runs). The memory watchdog checks U every 30 s and stops the run there |
 | Disk line | 85%: (used + 1 GiB) ÷ (used + available) must stay under it on the volume holding the run directory |
@@ -525,8 +525,9 @@ reservation; reducing ordinary shards does not remove that extra cost.
 The full reservation stays held while Track B waits and after either track
 finishes; early login release does not release or overbook reserved capacity.
 
-Detail: [`docker/README.md`'s Admission: memory, disk and CPU](../../../docker/README.md#admission-memory-disk-and-cpu)
-and [The admission lock, reservations and the sweep](../../../docker/README.md#the-admission-lock-reservations-and-the-sweep).
+Detail: [`docker/README.md`'s Admission: memory, disk and CPU](../../../docker/README.md#admission-memory-disk-and-cpu),
+[The admission lock, reservations and the sweep](../../../docker/README.md#the-admission-lock-reservations-and-the-sweep)
+and [Burst-driver shards](../../../docker/README.md#burst-driver-shards).
 
 ## Refusals and what to do
 
@@ -693,7 +694,7 @@ two actual identical DM take-ins before counting one.
 Report actual verdicts; completed native observation and synthetic controls
 are not final gate, full CI or heavy acceptance.
 
-The heavy leg's AI criteria run on the model set by CI_ANTHROPIC_AI_MODEL (azure/openai/gpt-6-astra for release runs); gate and other scripts use CI_ANTHROPIC_MODEL.
+The heavy leg's AI criteria run on the model set by CI_ANTHROPIC_AI_MODEL, which defaults to CI_ANTHROPIC_MODEL (release runs leave it unset); gate and other scripts use CI_ANTHROPIC_MODEL.
 
 Provision `CI_ANTHROPIC_API_KEY`, optional `CI_ANTHROPIC_BASE_URL` and
 `CI_ANTHROPIC_MODEL` in the runner and reader environment through the existing

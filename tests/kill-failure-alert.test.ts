@@ -41,6 +41,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { noticePost } from './test-helpers/server-post.ts'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -146,6 +147,7 @@ import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNoticeAlertsRig, makeNotifierHarness, readStartupEntries, type NotifierHarness, type StartupEntry } from './test-helpers/persona-notifier.ts'
 import { forbiddenServerLoads } from './test-helpers/source-audit.ts'
+
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -873,7 +875,7 @@ describe('kill-failure alert: the alerts layer over every context, and a stopped
       const keptRoute = expectedRoute(version, context, true, false)
       expect(h.posts(kept.key)).toEqual(
         keptRoute.destination
-          ? [{ channel: kept.permission_prompts!, text: formatPersonaNotice(kept, killFailureAlertText(contentFor(kept.key, decision), keptRoute.closing, true)) }]
+          ? [noticePost(kept.permission_prompts!, formatPersonaNotice(kept, killFailureAlertText(contentFor(kept.key, decision), keptRoute.closing, true)))]
           : [],
       )
       expect(h.posts(removed.key)).toEqual([])

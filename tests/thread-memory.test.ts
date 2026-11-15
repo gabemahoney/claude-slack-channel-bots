@@ -5,11 +5,11 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test'
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from 'bun:test'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync, type Stats } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
-import { join, relative } from 'node:path'
+import { basename, join, relative } from 'node:path'
 import { THREAD_MEMORY_LOOKUP_METHODS, MetadataCancelledError, classifyMetadataFailure, createMetadataAttempts, metadataRetryDelay,
   type MetadataFailure } from '../src/thread-memory.ts'
 import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS, THREAD_MEMORY_NOTICE_MAX_CHARS } from '../src/delivery-constants.ts'
@@ -18,26 +18,28 @@ import { INITIAL_CREDENTIALS, slackHttpError, slackPlatformError, slackRateLimit
 import { assertNoLeak, LEAK_SENTINEL, writeCredentialsFile, fakeToken, BOT_TOKEN_PREFIX, APP_TOKEN_PREFIX, writtenFile } from './test-helpers/credentials.ts'
 import { PersonaSlackTokens } from '../src/persona-credentials.ts'
 import { isThreadMemoryRecord, parseThreadMemoryRecord, serializeThreadMemoryRecords, THREAD_MEMORY_COMPACTION_SLICE, THREAD_MEMORY_DIRECTORY_MODE, THREAD_MEMORY_FILE_MODE,
-  normaliseOwnPostText, ownPostDigest, type OwnPostIntent, type ThreadJoin, type ThreadMemory } from '../src/thread-memory.ts'
+  normaliseOwnPostText, ownPostDigest, type OwnPostIntent, type ThreadJoin, type ThreadMemory, type ThreadMemoryCompaction } from '../src/thread-memory.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
 import { recoverQueuedJoins } from '../src/thread-join-recovery.ts'
 import { createOwnPostJoins, ownPostAnswerOfPost, type OwnPostSurface } from '../src/own-post.ts'
 import { DurableWriteUnsyncedError } from '../src/atomic-write.ts'
-import { isThreadMemorySealEntry, isThreadMemorySealFile, serializeThreadMemorySeal, judgeSeal, queueIdentitiesMatch,
+import { createThreadMemorySeal, isThreadMemorySealEntry, isThreadMemorySealFile, serializeThreadMemorySeal, judgeSeal, queueIdentitiesMatch,
   type JudgeSealInput, type ThreadMemorySealCase, type ThreadMemorySealEntry } from '../src/thread-memory-seal.ts'
 import {
   makeThreadMemoryHarness, makeThreadMembershipHarness, threadConfig, threadPath, threadHeader,
   threadJoin, joinRecord, postIntent, postOutcome, seedThreads, readThreads, damagedThreadLine,
   THREAD_CHANNELS as C, THREAD_ROOTS as R, THREAD_TIME, type ThreadMemoryHarness, type ThreadHarnessOptions, slackTsOfMs,
   runningSealEntry, cleanSealEntry, cleanOwnPostSealEntry, seedThreadSeal, readThreadSeal, threadSealPath, damagedThreadSeal,
-  threadFsControls, populationConfig, populationEligible, seedUnitPopulation, populationChannels, populationJoins, oldestJoins, stampedJoins,
+  threadFsControls, threadSealFsControls, populationConfig, populationEligible, seedUnitPopulation, populationChannels, populationJoins, oldestJoins, stampedJoins,
   sr8Personas, SR8_POPULATIONS, SR8_ELIGIBLE_CHANNELS, SR8_POPULATION_CHANNEL_COUNT, SR8_SHARED_LIST_CHANNELS, SR8_BURST_JOINS, SEED_BATCH_JOINS,
 } from './test-helpers/thread-memory.ts'
 import { makeOwnPostHarness, type OwnPostHarness } from './test-helpers/own-post.ts'
 import { channelPopulation, makeSharedAuthority, membershipPage, readSharedState, FIXTURE_THREAD_HYBRID_SINCE_PREFIX } from './test-helpers/shared-channels.ts'
 import type { SharedChannelAuthority } from '../src/shared-channels.ts'
 import { makeReloadHarness, type ReloadRun } from './test-helpers/reload-harness.ts'
-import { deliveredRecord, fixedRecord, makeQueue, queuePath, slackInput, memoryHold, heldSlackInput } from './test-helpers/delivery-queue.ts'
+import { acceptedRecord, deliveredRecord, fixedRecord, injectedInput, makeQueue, queuePath, seedQueue, slackInput, memoryHold, heldSlackInput } from './test-helpers/delivery-queue.ts'
+import { durableIo } from './test-helpers/durable-io.ts'
+import { spyOnCopies } from './test-helpers/copies.ts'
 import { makeDeferredWebApiCall, makeStubSlack } from './test-helpers/slack-stub.ts'
 import { MEMBERSHIP_PAGE_LIMIT, MEMBERSHIP_RETRY_MIN_MS } from '../src/channel-membership-retry.ts'
 import { _resetRegistry } from '../src/registry.ts'
@@ -1112,6 +1114,105 @@ describe('Thread Memory store', () => {
     expect(h.memory.clock('alpha')).toBe(fact.at + 1)
     h.memory.advancePast('alpha', fact.at + 200); expect(h.memory.clock('alpha')).toBe(fact.at + 201)
     h.memory.advancePast('alpha', 0); expect(h.memory.clock('alpha')).toBe(fact.at + 202)
+  })
+})
+
+describe('the threads directory is synced only while a journal entry may not be durable', () => {
+  const threadsDir = (h: ThreadMemoryHarness) => join(h.stateDir, 'threads')
+  /** Each fsync's target from `h.io.calls[from]` on: the threads or parent directory, `key`'s journal, or another file. */
+  function syncTargets(h: ThreadMemoryHarness, from = 0, key = 'alpha') {
+    return h.io.calls.slice(from).filter(c => c.op === 'fsync' || c.op === 'fsyncSync').map(({ path }) => path === threadsDir(h) ? 'threads'
+      : path === h.stateDir ? 'parent' : path === threadPath(h.stateDir, key) ? 'journal' : relative(threadsDir(h), path))
+  }
+  function seedCreated(h: ThreadMemoryHarness, key = 'alpha') {
+    seedThreads(h.stateDir, [threadHeader()], key)
+    expect(h.authority.setThreadMemoryCreated(key).kind).toBe('saved')
+  }
+
+  test('a store created by its header append syncs the threads directory; later saves sync only the journal', async () => {
+    const h = fixture(); await h.start()
+    expect(syncTargets(h)).toEqual(['parent', 'journal', 'threads'])
+    const from = h.io.calls.length
+    for (const root of [R.primary, R.secondary]) expect(await h.memory.saveJoins('alpha', [h.fact({ root })])).toEqual({ kind: 'saved' })
+    expect(syncTargets(h, from)).toEqual(['journal', 'journal'])
+  })
+
+  test.each((['start', 'later bring-up'] as const).flatMap(at => (['succeeds', 'fails at its rename', 'fails at its directory sync'] as const)
+    .map(compaction => [at, compaction] as const)))('an existing journal first read at %s, whose compaction %s: only a failed compaction leaves the first save to sync the threads directory, retryably', async (at, compaction) => {
+    const h = fixture(), isThreads = (path: string) => path === threadsDir(h)
+    seedCreated(h)
+    const breakCompaction = () => {
+      if (compaction === 'fails at its rename') h.io.fail('rename')
+      else if (compaction === 'fails at its directory sync') h.io.fail('fsync', 'alpha', { match: isThreads })
+    }
+    // The fixture refuses the start read before the file opens, so the later bring-up's read is the first opening.
+    if (at === 'start') breakCompaction(); else h.io.fail('readFileSync')
+    await h.start()
+    if (at === 'later bring-up') {
+      expect(view(h)).toBe('unknown')
+      h.io.heal(); breakCompaction(); await h.memory.loadKey('alpha')
+    }
+    h.io.heal()
+    const from = h.io.calls.length, first = h.fact()
+    if (compaction === 'succeeds') expect(await h.memory.saveJoins('alpha', [first])).toEqual({ kind: 'saved' })
+    else {
+      h.io.fail('fsync', 'alpha', { match: isThreads, times: 1 })
+      expect((await h.memory.saveJoins('alpha', [first])).kind).toBe('failed')
+      expect(h.memory.keptFacts('alpha')).toEqual([first])
+      expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+    }
+    expect(await h.memory.saveJoins('alpha', [h.fact({ root: R.secondary })])).toEqual({ kind: 'saved' })
+    expect(syncTargets(h, from)).toEqual(compaction === 'succeeds' ? ['journal', 'journal']
+      // The refused directory sync and its rollback's file sync; the retry syncs the directory again.
+      : ['journal', 'threads', 'journal', 'journal', 'threads', 'journal'])
+    expect(savedJoins(h).map(r => r.root)).toEqual([R.primary, R.secondary])
+  })
+
+  test('a read retry of a journal this run already opened opens nothing new, so the start compaction still vouches for the first save', async () => {
+    const h = fixture(); seedCreated(h); await h.start()
+    h.memory.forget('alpha'); h.io.fail('readFileSync'); await h.memory.loadKey('alpha')
+    expect(view(h)).toBe('unknown')
+    h.io.heal(); expect(await h.memory.retryRead('alpha')).toBe('read')
+    const from = h.io.calls.length
+    expect(await h.memory.saveJoins('alpha', [h.fact()])).toEqual({ kind: 'saved' })
+    expect(syncTargets(h, from)).toEqual(['journal'])
+  })
+
+  test("a journal recreated after remove is a new entry even when it reuses the removed file's identity: its first append syncs the threads directory", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'thread-memory-')), controls = threadFsControls(dir)
+    let reused: Pick<Stats, 'dev' | 'ino' | 'birthtimeMs'> | undefined
+    // Model the filesystem giving the recreated journal the removed one's device, inode and birth time.
+    const io = { ...controls, fs: { ...controls.fs, fstatSync(fd: number, ...rest: unknown[]) {
+      const stat = (controls.fs.fstatSync as Function)(fd, ...rest) as Stats
+      if (reused && existsSync(threadPath(dir)) && statSync(threadPath(dir)).ino === stat.ino) Object.assign(stat, reused)
+      return stat
+    } } as typeof controls.fs }
+    const h = fixture({ fs: io }, dir); await h.start()
+    expect(await h.memory.saveJoins('alpha', [h.fact()])).toEqual({ kind: 'saved' })
+    const { dev, ino, birthtimeMs } = statSync(threadPath(dir)); reused = { dev, ino, birthtimeMs }
+    expect(await h.memory.remove('alpha')).toEqual({ kind: 'saved' })
+    const from = h.io.calls.length
+    await h.memory.loadKey('alpha')
+    expect(h.authority.threadMemoryCreated('alpha')).toBe(true)
+    expect(await h.memory.saveJoins('alpha', [h.fact({ root: R.secondary })])).toEqual({ kind: 'saved' })
+    expect(syncTargets(h, from)).toEqual(['journal', 'threads', 'journal'])
+  })
+
+  test.each(['removes the file and syncs the directory', 'finds no file', 'cannot sync the directory'] as const)("a removal that %s vouches for another journal's earlier opening only when its directory sync succeeded", async outcome => {
+    const h = fixture()
+    h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta']))
+    for (const key of ['alpha', 'beta']) seedCreated(h, key)
+    // Every start compaction fails before its rename: both journals stay opened with no directory sync since.
+    h.io.fail('fsync', 'alpha', { match: path => path.endsWith('.tmp') })
+    await h.start(); h.io.heal()
+    if (outcome === 'finds no file') h.io.removeJournal('alpha')
+    if (outcome === 'cannot sync the directory') h.io.fail('fsyncSync', 'alpha', { match: path => path === threadsDir(h) })
+    expect(await h.memory.remove('alpha')).toEqual({ kind: 'saved' })
+    expect(existsSync(threadPath(h.stateDir))).toBe(false)
+    h.io.heal()
+    const from = h.io.calls.length
+    expect(await h.memory.saveJoins('beta', [h.fact({}, 'beta')])).toEqual({ kind: 'saved' })
+    expect(syncTargets(h, from, 'beta')).toEqual(outcome === 'removes the file and syncs the directory' ? ['journal'] : ['journal', 'threads'])
   })
 })
 
@@ -2470,6 +2571,218 @@ describe('Thread Memory compaction in slices', () => {
     expect(journalBytes(h).equals(serializeThreadMemoryRecords([written, ...[...records].sort(bySeq)]))).toBe(true)
   }
 
+  const spies: Array<{ mockRestore(): void }> = []
+  afterEach(() => { for (const spy of spies.splice(0)) spy.mockRestore() })
+  const identity = (h: ThreadMemoryHarness) => {
+    const { ino, mtimeNs } = statSync(threadPath(h.stateDir), { bigint: true })
+    return { ino, mtimeNs, bytes: journalBytes(h) }
+  }
+  // Record the real durability boundaries, including their order before entryCompacted.
+  const operations = (h: ThreadMemoryHarness) => h.io.calls
+    .filter(c => ['writeSync', 'fsync', 'rename'].includes(c.op))
+    .map(c => `${c.op}:${isTemp(h)(c.path) ? 'temp' : c.path === join(h.stateDir, 'threads') ? 'directory' : c.path === h.stateDir ? 'parent' : 'journal'}`)
+  const fullRewrite = ['writeSync:temp', 'fsync:temp', 'rename:temp', 'fsync:directory']
+  function observe(h: ThreadMemoryHarness) {
+    const completed: ThreadMemoryCompaction[] = [], sealed: Array<{ key: string; steps: string[] }> = []
+    h.memory.setCompactionObserver(c => completed.push(c))
+    if (h.seal) {
+      const original = h.seal.entryCompacted.bind(h.seal)
+      spies.push(spyOn(h.seal, 'entryCompacted').mockImplementation((key, storeId, lastRecordNumber) => {
+        sealed.push({ key, steps: operations(h) })
+        return original(key, storeId, lastRecordNumber)
+      }))
+    }
+    return {
+      completed, sealed,
+      reset() { h.io.reset(); h.sealIo.reset(); completed.length = 0; sealed.length = 0 },
+      rewritten(prefix: string[] = []) {
+        const steps = [...prefix, ...fullRewrite]
+        expect(operations(h)).toEqual(steps)
+        expect(sealed).toEqual([{ key: 'alpha', steps }])
+        expect(h.sealIo.writes().length).toBeGreaterThan(0)
+        expect(completed.map(c => [c.key, c.outcome])).toEqual([['alpha', 'rewritten']])
+      },
+      skipped(before: ReturnType<typeof identity>) {
+        expect(h.io.calls).toEqual([]); expect(h.sealIo.calls).toEqual([])
+        expect(sealed).toEqual([]); expect(identity(h)).toEqual(before)
+        expect(completed.map(c => [c.key, c.outcome])).toEqual([['alpha', 'skipped']])
+        expect(completed[0]!.startMonoMs).toBeLessThanOrEqual(completed[0]!.endMonoMs)
+        expect(h.events.filter(e => e.type === 'compaction-failed')).toEqual([])
+      },
+    }
+  }
+
+  test('a mostly cached compaction yields only for new work', async () => {
+    const { h, header, records } = await large('alternate')
+    await h.memory.compact('alpha')
+    expect(await h.memory.saveJoins('alpha', [h.fact({ root: rootOf(COUNT) })])).toEqual({ kind: 'saved' })
+    const expected = readThreads(h.stateDir).slice(1)
+    const temp = h.io.hold('fsync', 'alpha', { match: isTemp(h) })
+    const yielding = spyOn(globalThis, 'setImmediate')
+    const compaction = h.memory.compact('alpha')
+    let yields = 0
+    try {
+      // The held temp-file sync is the first disk wait: count preparation only.
+      await temp.reached
+      yields = yielding.mock.calls.length
+    } finally {
+      yielding.mockRestore(); temp.release(); await compaction
+    }
+    // Two cached full chunks plus a two-record dirty tail fit in one slice.
+    expect(yields).toBe(0)
+    expectSynchronousImage(h, header, expected)
+    expect(savedJoins(h)).toHaveLength(records.length + 1)
+    const bytes = journalBytes(h)
+    await h.close()
+    const reopened = fixture({ reopen: true }, h.stateDir); await reopened.start()
+    expect(journalBytes(reopened)).toEqual(bytes)
+    expect(readThreads(reopened.stateDir).slice(1)).toEqual(expected)
+  })
+
+  test.each(['temp', 'directory'] as const)('a mostly cached rewrite handles %s fsync failure and retries the full rewrite', async failure => {
+    const { h, header, records } = await large('alternate', { seal: true })
+    await h.memory.compact('alpha')
+    await h.memory.saveJoins('alpha', [h.fact({ root: rootOf(COUNT) })])
+    const before = journalBytes(h), expected = readThreads(h.stateDir).slice(1)
+    const notifications = spyOn(h.seal!, 'entryCompacted')
+    const cause = h.io.fail('fsync', 'alpha', {
+      match: failure === 'directory' ? path => path === join(h.stateDir, 'threads') : isTemp(h),
+    })
+    try {
+      await h.memory.compact('alpha')
+      expect(notifications).not.toHaveBeenCalled()
+      expect(h.events.at(-1)).toMatchObject({ type: 'compaction-failed', error: cause })
+      if (failure === 'directory') expectSynchronousImage(h, header, expected)
+      else expect(journalBytes(h)).toEqual(before)
+      expect(readdirSync(join(h.stateDir, 'threads')).filter(name => name.endsWith('.tmp'))).toEqual([])
+      h.io.heal(); h.io.reset()
+      await h.memory.compact('alpha')
+      const steps = h.io.calls.filter(c => ['writeSync', 'fsync', 'rename'].includes(c.op))
+        .map(c => [c.op, isTemp(h)(c.path) ? 'temp' : c.path === join(h.stateDir, 'threads') ? 'directory' : 'journal'])
+      expect(steps).toEqual([['writeSync', 'temp'], ['fsync', 'temp'], ['rename', 'temp'], ['fsync', 'directory']])
+      expect(notifications).toHaveBeenCalledTimes(1)
+      expectSynchronousImage(h, header, expected)
+    } finally { h.io.heal(); notifications.mockRestore() }
+    const bytes = journalBytes(h)
+    await h.crash()
+    const reopened = fixture({ reopen: true, seal: true }, h.stateDir); await reopened.start()
+    expect(savedJoins(reopened)).toHaveLength(records.length + 1)
+    expect(journalBytes(reopened)).toEqual(bytes)
+  })
+
+  test('successive saves and compactions serialize only new records and do not sort the saved population again', async () => {
+    const { h, header, records } = await large('alternate')
+    await h.memory.compact('alpha')
+    let serialized = 0, sorted = 0, encoded = 0
+    const from = Buffer.from
+    const buffers = spyOn(Buffer, 'from').mockImplementation(((...args: Parameters<typeof from>) => {
+      if (typeof args[0] === 'string') encoded += args[0].split('"kind":"join"').length - 1
+      return (from as Function)(...args)
+    }) as typeof from)
+    const stringify = JSON.stringify, sort = Array.prototype.sort
+    const encoding = spyOn(JSON, 'stringify').mockImplementation(((...args: Parameters<typeof stringify>) => {
+      if (args[0]?.kind === 'join') serialized++
+      return stringify(...args)
+    }) as typeof stringify)
+    const sorting = spyOn(Array.prototype, 'sort').mockImplementation(function (this: unknown[], compare) {
+      if (this.some(value => typeof value === 'object' && value !== null && 'seq' in value)) sorted += this.length
+      return sort.call(this, compare)
+    })
+    try {
+      for (let i = 0; i < 4; i++) {
+        const fact = h.fact({ root: rootOf(COUNT + i) })
+        expect(await h.memory.saveJoins('alpha', [fact])).toEqual({ kind: 'saved' })
+        await h.memory.compact('alpha')
+      }
+    } finally { encoding.mockRestore(); sorting.mockRestore(); buffers.mockRestore() }
+    expect({ serialized, sorted }).toEqual({ serialized: 4, sorted: 0 })
+    // Four appends plus the changed tail chunks (2, 3, 4, 5 records).
+    // Full unchanged chunks must not be walked/joined/UTF-8 encoded again.
+    expect(encoded).toBe(18)
+    const written = readThreads(h.stateDir)
+    expect(written.slice(1, records.length + 1)).toEqual(records)
+    expect(written).toHaveLength(records.length + 5)
+    expectSynchronousImage(h, header, written.slice(1))
+    expect(h.events.filter(e => e.type === 'compaction-failed')).toEqual([])
+  })
+
+  test('new and earlier joins copy normalized facts without per-join structuredClone, retaining caller isolation', async () => {
+    const h = fixture(); await h.start()
+    const fact = h.fact(), original = structuredClone(fact)
+    const copying = spyOnCopies()
+    let calls: number
+    try {
+      expect(h.memory.addJoin('alpha', fact)).toBe(true)
+      fact.stamp.incarnation = 'caller changed'; fact.root = rootOf(999)
+      expect(h.memory.addJoin('alpha', { ...original, at: original.at - 1 })).toBe(true)
+      expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+      calls = copying.values.length
+    } finally { copying.restore() }
+    expect(calls!).toBe(0)
+    expect(h.memory.joins('alpha')).toEqual([{ join: { ...original, at: original.at - 1 }, savedAt: original.at - 1 }])
+    expect(savedJoins(h).map(({ v, kind, seq, ...join }) => join)).toEqual([
+      original, { ...original, at: original.at - 1 },
+    ])
+  })
+
+  test('a cached image replaces earlier saved times only after append durability and drops resolved intents and unnamed held joins', async () => {
+    let held: ThreadJoin[] = []
+    const h = fixture({ heldStamps: () => held }); await h.start()
+    const later = h.fact({ at: THREAD_TIME + 20 }), earlier = { ...later, at: THREAD_TIME + 10 }
+    await h.memory.saveJoins('alpha', [later])
+    const pending = h.memory.keepIntent('alpha', postIntent(later))
+    expect(pending.kept && await pending.ready).toBe('saved')
+    await h.memory.compact('alpha')
+    const [header, ...saved] = readThreads(h.stateDir)
+
+    h.io.fail('writeSync')
+    expect((await h.memory.saveJoins('alpha', [earlier])).kind).toBe('failed')
+    h.io.heal(); await h.memory.compact('alpha')
+    expectSynchronousImage(h, header!, saved)
+    expect(h.memory.isJoinSaved('alpha', earlier)).toBe(false)
+
+    expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+    const replacement = readThreads(h.stateDir).at(-1)!
+    expect(replacement).toMatchObject({ kind: 'join', at: earlier.at })
+    await h.memory.compact('alpha')
+    expectSynchronousImage(h, header!, [saved[1]!, replacement])
+
+    expect(h.memory.resolveIntent('alpha', postIntent(later).operationId, { none: true })).toBe('none')
+    await h.memory.flush('alpha')
+    held = [earlier]
+    expect(h.choose('mentions').kind).toBe('applied')
+    await h.memory.compact('alpha')
+    expectSynchronousImage(h, header!, [replacement])
+    expect(h.memory.joinedBy('alpha', earlier.channel, earlier.root, earlier.stamp, earlier.at)).toBe(true)
+
+    held = []; h.memory.pruneHeldJoins('alpha')
+    await h.memory.compact('alpha')
+    expectSynchronousImage(h, header!, [])
+    const bytes = journalBytes(h)
+    await h.close()
+    const reopened = fixture({ reopen: true }, h.stateDir); await reopened.start()
+    expect(journalBytes(reopened)).toEqual(bytes)
+    expect(reopened.memory.unresolvedIntents('alpha')).toEqual([])
+  })
+
+  test('loaded records with equal sequence numbers retain the original stable walk order across stamp changes', async () => {
+    let held: ThreadJoin[] = []
+    const h = fixture({ heldStamps: () => held })
+    h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha'], [C.primary, C.secondary]))
+    const primary = h.fact(), secondary = h.fact({ channel: C.secondary })
+    const a = joinRecord(primary, 2), b = joinRecord(secondary, 2)
+    seedThreads(h.stateDir, [threadHeader(), a, b])
+    await h.start()
+    expectSynchronousImage(h, threadHeader(), [a, b])
+    held = [primary]
+    expect(h.choose('mentions').kind).toBe('applied')
+    await h.memory.compact('alpha')
+    expectSynchronousImage(h, threadHeader(), [b, a])
+    held = []; h.memory.pruneHeldJoins('alpha')
+    await h.memory.compact('alpha')
+    expectSynchronousImage(h, threadHeader(), [b])
+  })
+
   test(`over ${SLICE} records, the image is the synchronous serialization's bytes, and the event loop turns between slices before any disk wait`, async () => {
     const { h, header, records } = await large('alternate')
     const temp = h.io.hold('fsync', 'alpha', { match: isTemp(h) }), steps = h.io.durable.steps.length
@@ -2487,10 +2800,18 @@ describe('Thread Memory compaction in slices', () => {
     expect(h.events.filter(e => e.type === 'compaction-failed')).toEqual([])
   })
 
-  test('a saved join that publication moves to the held index during a yield is written exactly once', async () => {
+  test.each([false, true])('a saved join that publication moves to the held index during a yield is written exactly once (cached=%s)', async cached => {
     let held: ThreadJoin[] = [], checks = 0
     const { h, facts, header, records } = await large('one-primary', {
       heldStamps: key => key === 'alpha' ? held : [], canRun: () => { checks++; return true } })
+    if (cached) {
+      await h.memory.compact('alpha')
+      // Cached references no longer yield as if they encoded every record.
+      // Add a full slice of new work to exercise publication during a build.
+      const added = Array.from({ length: SLICE }, (_, i) => h.fact({ channel: C.secondary, root: rootOf(COUNT + i) }))
+      await h.memory.saveJoins('alpha', added)
+      records.push(...readThreads(h.stateDir).slice(records.length + 1))
+    }
     const moved = facts[0]!
     held = [moved]; checks = 0; h.io.reset()
     let atYield: { started: boolean; rewriting: boolean } | undefined
@@ -2499,7 +2820,8 @@ describe('Thread Memory compaction in slices', () => {
       expect(h.choose('mentions').kind).toBe('applied')
     })
     await h.memory.compact('alpha')
-    // The compaction had started and walked its first slice, which visits the primary join first, and had not begun its rewrite.
+    // The compaction had collected the primary join and yielded for actual
+    // building work, before beginning its rewrite.
     expect(atYield).toEqual({ started: true, rewriting: false })
     expect(view(h, moved.root)).toBe('not-joined')
     expect(h.memory.joinedBy('alpha', moved.channel, moved.root, moved.stamp, moved.at)).toBe(true)
@@ -2509,8 +2831,8 @@ describe('Thread Memory compaction in slices', () => {
 
   test.each(['forget', 'stop'] as const)('%s between slices ends the compaction with the old image and no rewrite', async end => {
     let checks = 0
-    const { h } = await large('alternate', { canRun: () => { checks++; return true } })
-    const before = journalBytes(h)
+    const { h } = await large('alternate', { seal: true, canRun: () => { checks++; return true } })
+    const probe = observe(h), before = journalBytes(h), records = readThreads(h.stateDir).slice(1)
     checks = 0; h.io.reset()
     let started: boolean | undefined, stopping: Promise<void> | undefined
     setImmediate(() => { started = checks > 0; if (end === 'forget') h.memory.forget('alpha'); else stopping = h.memory.stop() })
@@ -2520,6 +2842,12 @@ describe('Thread Memory compaction in slices', () => {
     expect(h.io.writes()).toEqual([])
     expect(h.io.calls.filter(c => c.op === 'fsync' || c.op === 'rename')).toEqual([])
     expect(h.events.filter(e => e.type === 'compaction-failed')).toEqual([])
+    expect(probe.completed).toEqual([]); expect(probe.sealed).toEqual([])
+    await h.crash()
+    const next = fixture({ reopen: true, seal: true }, h.stateDir), restarted = observe(next)
+    await next.start()
+    expect(readThreads(next.stateDir).slice(1)).toEqual(records)
+    expect(restarted.completed.map(c => c.outcome)).toEqual(['rewritten'])
   })
 
   test.each(['forget', 'stop'] as const)('%s while the rewrite waits on its temp-file sync lets that rewrite finish whole', async end => {
@@ -2542,6 +2870,8 @@ describe('Thread Memory compaction in slices', () => {
 
   test('maintenance triggers behind a queued, unstarted maintenance compaction add none; it compacts state after the last trigger, and a trigger once it starts queues one more', async () => {
     const { h, header, records } = await large('alternate')
+    const completed: ThreadMemoryCompaction[] = []
+    h.memory.setCompactionObserver(c => completed.push(c))
     const rewrites = () => h.io.calls.filter(c => c.op === 'rename' && isTemp(h)(c.path)).length
     const first = h.io.hold('fsync', 'alpha', { match: isTemp(h) })
     h.memory.startMaintenance()
@@ -2554,16 +2884,255 @@ describe('Thread Memory compaction in slices', () => {
     const second = h.io.hold('fsync', 'alpha', { match: isTemp(h) })
     first.release(); await second.reached
     expect(rewrites()).toBe(1)
-    const third = h.io.hold('fsync', 'alpha', { match: isTemp(h) })
+    const firedBefore = h.clock.firedCount()
     await h.clock.advance(QUEUE_COMPACT_INTERVAL_MS)
-    // The third compaction waits on its own sync, so the journal holds the queued second compaction's image.
-    second.release(); await third.reached
+    // The third pass is queued behind second: this further trigger must add no fourth pass.
+    await h.clock.advance(QUEUE_COMPACT_INTERVAL_MS)
+    const firedWhileHeld = h.clock.firedCount() - firedBefore
+    const completedWhileHeld = completed.map(c => c.outcome)
+    // The third pass sees the second pass's unchanged durable image and completes by skipping.
+    second.release(); await h.memory.flush('alpha')
+    expect(firedWhileHeld).toBe(2)
+    expect(completedWhileHeld).toEqual(['rewritten'])
     expect(rewrites()).toBe(2)
     expectSynchronousImage(h, header, records.filter(r => r.kind === 'join' && r.channel === C.primary))
-    third.release()
-    await h.memory.flush('alpha')
-    expect(rewrites()).toBe(3)
+    expect(completed.map(c => [c.key, c.outcome])).toEqual([
+      ['alpha', 'rewritten'], ['alpha', 'rewritten'], ['alpha', 'skipped'],
+    ])
     expect(h.events.filter(e => e.type === 'compaction-failed')).toEqual([])
+  })
+
+  describe('maintenance compaction proof', () => {
+    async function established(options: ThreadHarnessOptions = {}) {
+      const h = fixture({ ...options, seal: true }); await h.start()
+      await h.memory.saveJoins('alpha', [h.fact()]); await h.memory.compact('alpha')
+      const probe = observe(h); probe.reset()
+      return { h, probe }
+    }
+    async function maintenance(h: ThreadMemoryHarness) {
+      h.memory.startMaintenance()
+      await h.clock.advance(QUEUE_COMPACT_INTERVAL_MS)
+    }
+
+    test.each(['graceful', 'crash'] as const)('repeated skips preserve journal and seal identity through a %s restart', async end => {
+      const { h, probe } = await established(), before = identity(h), seal = sealEntry(h)
+      for (let pass = 0; pass < 2; pass++) {
+        probe.reset(); await maintenance(h); probe.skipped(before)
+        expect(sealEntry(h)).toEqual(seal)
+      }
+      if (end === 'graceful') await h.close(); else await h.crash()
+      const next = fixture({ reopen: true, seal: true }, h.stateDir)
+      const restarted = observe(next)
+      await next.start()
+      expect(journalBytes(next)).toEqual(before.bytes)
+      expect(next.memory.store('alpha')).toMatchObject({ storeId: seal.storeId, lastRecordNumber: seal.lastRecordNumber })
+      expectSealFinding(next, end === 'crash' ? 'unclean-stop' : undefined, 'unclean')
+      expect(restarted.completed.map(c => c.outcome)).toEqual(['rewritten'])
+    })
+
+    test.each(['unrelated stamp', 'move saved join into hold', 'release hold on current join'] as const)('%s leaves the saved image identical and still skips', async change => {
+      let held: ThreadJoin[] = []
+      const { h, probe } = await established({ heldStamps: () => held }), before = identity(h)
+      if (change === 'unrelated stamp') {
+        expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha'], [C.primary, C.secondary])).kind).toBe('applied')
+        expect(h.choose('mentions', 'alpha', C.secondary).kind).toBe('applied')
+      } else {
+        held = [h.fact()]
+        if (change === 'move saved join into hold') expect(h.choose('mentions').kind).toBe('applied')
+        else { held = []; h.memory.pruneHeldJoins('alpha') }
+      }
+      await maintenance(h); probe.skipped(before)
+      expect(savedJoins(h)).toHaveLength(1)
+    })
+
+    test.each((['join', 'intent', 'outcome-only'] as const).flatMap(kind =>
+      (['saved', 'failed'] as const).map(result => [kind, result] as const)))('%s append attempt (%s) requires a maintenance rewrite', async (kind, result) => {
+      const failed = result === 'failed'
+      const { h, probe } = await established()
+      const intent = postIntent(h.fact({ root: R.secondary }))
+      if (kind === 'outcome-only') {
+        const kept = h.memory.keepIntent('alpha', intent)
+        expect(kept.kept && await kept.ready).toBe('saved')
+        await h.memory.compact('alpha')
+      }
+      const before = journalBytes(h)
+      if (failed) h.io.fail('writeSync')
+      if (kind === 'join') expect((await h.memory.saveJoins('alpha', [h.fact({ root: R.secondary })])).kind).toBe(failed ? 'failed' : 'saved')
+      else if (kind === 'intent') {
+        const kept = h.memory.keepIntent('alpha', intent)
+        expect(kept.kept && await kept.ready).toBe(failed ? 'failed' : 'saved')
+      } else {
+        expect(h.memory.resolveIntent('alpha', intent.operationId, { none: true })).toBe('none')
+        expect((await h.memory.flush('alpha')).kind).toBe(failed ? 'failed' : 'saved')
+        if (!failed) expect(readThreads(h.stateDir).at(-1)).toMatchObject({ kind: 'post-outcome', outcome: 'none' })
+      }
+      if (failed) expect(journalBytes(h)).toEqual(before)
+      h.io.heal(); probe.reset()
+      await maintenance(h); probe.rewritten()
+      expect(sealEntry(h).lastRecordNumber).toBe(h.memory.store('alpha')!.lastRecordNumber)
+    })
+
+    test.each(['stamp', 'held stamp release'] as const)('%s that drops saved evidence requires a maintenance rewrite', async change => {
+      let held: ThreadJoin[] = []
+      const { h, probe } = await established({ heldStamps: () => held })
+      if (change === 'held stamp release') held = [h.fact()]
+      expect(h.choose('mentions').kind).toBe('applied')
+      if (change === 'held stamp release') {
+        await h.memory.compact('alpha')
+        expect(savedJoins(h)).toHaveLength(1)
+        held = []; h.memory.pruneHeldJoins('alpha')
+      }
+      probe.reset(); await maintenance(h); probe.rewritten()
+      expect(savedJoins(h)).toEqual([])
+    })
+
+    test.each(['saved header', 'failed header', 'existing empty file'] as const)('creation from %s certifies no maintenance skip', async creation => {
+      const h = fixture({ seal: true }), probe = observe(h)
+      if (creation === 'existing empty file') seedThreads(h.stateDir, [])
+      if (creation === 'failed header') h.io.fail('writeSync', 'alpha', { times: 1 })
+      await h.start()
+      if (creation === 'failed header') {
+        expect(h.events.some(e => e.type === 'creation-failed' && e.step === 'journal-header')).toBe(true)
+        h.io.heal(); expect((await h.memory.flush('alpha')).kind).toBe('saved')
+      }
+      expect(h.memory.store('alpha')?.created).toBe(true)
+      expect(probe.completed.map(c => c.outcome)).toEqual(creation === 'existing empty file' ? ['rewritten'] : [])
+      probe.reset(); await maintenance(h); probe.rewritten()
+    })
+
+    test('a retry read requires a full maintenance rewrite before it can skip', async () => {
+      const { h } = await established(); await h.close()
+      const next = fixture({ reopen: true, seal: true }, h.stateDir), probe = observe(next)
+      next.io.fail('readFileSync'); await next.start()
+      expect(probe.completed).toEqual([])
+      next.io.heal(); expect(await next.memory.retryRead('alpha')).toBe('read')
+      expect(probe.completed).toEqual([])
+      probe.reset(); await maintenance(next); probe.rewritten(['fsync:parent'])
+    })
+
+    test.each(['write', 'file fsync', 'rename', 'directory fsync'] as const)('a rewrite failing at %s certifies nothing for the next maintenance pass', async step => {
+      const { h, probe } = await established()
+      const op = step === 'write' ? 'writeSync' : step === 'rename' ? 'rename' : 'fsync'
+      const error = h.io.fail(op, 'alpha', { match: step === 'directory fsync' ? p => p === join(h.stateDir, 'threads') : isTemp(h) })
+      await h.memory.compact('alpha')
+      expect(probe.completed).toEqual([]); expect(probe.sealed).toEqual([])
+      expect(h.events.at(-1)).toMatchObject({ type: 'compaction-failed', error })
+      h.io.heal(); probe.reset(); await maintenance(h); probe.rewritten()
+    })
+
+    test.each(['slice', 'awaited fsync'] as const)('saved evidence changed during a %s cannot certify the next maintenance pass', async boundary => {
+      const { h, header, records } = await large('one-primary', { seal: true }), probe = observe(h)
+      probe.reset()
+      let changed = false
+      const change = () => { expect(h.choose('mentions').kind).toBe('applied'); changed = true }
+      if (boundary === 'slice') setImmediate(change)
+      const held = boundary === 'awaited fsync' ? h.io.hold('fsync', 'alpha', { match: isTemp(h) }) : undefined
+      const rewrite = h.memory.compact('alpha')
+      try { if (held) { await held.reached; change() } } finally { held?.release() }
+      await rewrite
+      expect(changed).toBe(true)
+      expect(probe.completed.map(c => c.outcome)).toEqual(['rewritten'])
+      probe.reset(); await maintenance(h); await h.memory.flush('alpha'); probe.rewritten()
+      expectSynchronousImage(h, header, records.filter(r => r.kind === 'join' && r.channel === C.secondary))
+    })
+
+    test('a resumed pass after a cancelled build still rewrites', async () => {
+      let allowed = true, cancelled = false
+      const { h } = await large('alternate', { seal: true, canRun: () => allowed })
+      await h.memory.compact('alpha')
+      await h.memory.saveJoins('alpha', Array.from({ length: SLICE }, (_, i) => h.fact({ root: rootOf(COUNT + i) })))
+      const probe = observe(h), before = identity(h)
+      probe.reset()
+      setImmediate(() => { allowed = false; cancelled = true })
+      await h.memory.compact('alpha')
+      expect(cancelled).toBe(true); expect(probe.completed).toEqual([]); expect(probe.sealed).toEqual([])
+      expect(identity(h)).toEqual(before); expect(h.io.writes()).toEqual([])
+      allowed = true; probe.reset(); await maintenance(h); probe.rewritten()
+    })
+
+    test('legacy equal sequence records never certify an ordered-image skip', async () => {
+      const h = fixture({ seal: true }), first = joinRecord(h.fact(), 2), second = joinRecord(h.fact({ root: R.secondary }), 2)
+      seedThreads(h.stateDir, [threadHeader(), first, second]); await h.start()
+      const probe = observe(h)
+      for (let pass = 0; pass < 2; pass++) {
+        probe.reset(); await maintenance(h); probe.rewritten()
+        expect(savedJoins(h)).toEqual([first, second])
+      }
+    })
+
+    test.each(['key', 'all'] as const)('explicit compact(%s) always rewrites an unchanged journal', async scope => {
+      const { h, probe } = await established()
+      await h.memory.compact(scope === 'key' ? 'alpha' : undefined); probe.rewritten()
+    })
+
+    test('an observer installed before start times every startup and later loadKey rewrite inside its writer turn', async () => {
+      let now = 10
+      const h = fixture({ seal: true, monotonicNow: () => now++ })
+      h.unsubscribe() // Configure the startup fixture without scheduling a publication-driven loadKey.
+      h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta']))
+      for (const key of ['alpha', 'beta']) seedThreads(h.stateDir, [threadHeader(), joinRecord(h.fact({}, key))], key)
+      const probe = observe(h)
+      await h.start()
+      expect(probe.completed.map(c => [c.key, c.outcome]).sort()).toEqual([['alpha', 'rewritten'], ['beta', 'rewritten']])
+      for (const key of ['alpha', 'beta']) {
+        expect(h.io.calls.filter(c => c.path.startsWith(`${threadPath(h.stateDir, key)}.`) &&
+          ['writeSync', 'fsync', 'rename'].includes(c.op)).map(c => c.op)).toEqual(['writeSync', 'fsync', 'rename'])
+      }
+      expect(h.io.calls.filter(c => c.op === 'fsync' && c.path === join(h.stateDir, 'threads'))).toHaveLength(2)
+      expect(probe.sealed.map(c => c.key).sort()).toEqual(['alpha', 'beta'])
+      for (const c of probe.completed) expect(c.startMonoMs).toBeLessThanOrEqual(c.endMonoMs)
+      h.memory.forget('beta'); probe.reset()
+      const held = h.io.hold('fsync', 'beta', { match: p => p.startsWith(`${threadPath(h.stateDir, 'beta')}.`) })
+      const loading = h.memory.loadKey('beta')
+      try {
+        expect(await Promise.race([held.reached.then(() => 'held'), loading.then(() => 'completed')])).toBe('held')
+        expect(probe.completed).toEqual([])
+        now = 100
+      } finally { held.release(); await loading }
+      expect(probe.completed).toEqual([{ key: 'beta', startMonoMs: 14, endMonoMs: 100, outcome: 'rewritten' }])
+      expect(h.io.calls.filter(c => ['writeSync', 'fsync', 'rename'].includes(c.op)).map(c => c.op))
+        .toEqual(['writeSync', 'fsync', 'rename', 'fsync'])
+      expect(probe.sealed.map(c => c.key)).toEqual(['beta'])
+    })
+
+    test('startup cancelled between slices emits no completion', async () => {
+      const { h } = await large('alternate', { seal: true }); await h.close()
+      const next = fixture({ reopen: true, seal: true }, h.stateDir), probe = observe(next), before = journalBytes(next)
+      let stopping: Promise<void> | undefined
+      next.memory.readAtStart(); await next.seal!.loadAtStart(next.memory.journalFacts())
+      setImmediate(() => { stopping = next.memory.stop() })
+      await next.memory.activate(); await stopping
+      expect(stopping).toBeDefined(); expect(probe.completed).toEqual([]); expect(probe.sealed).toEqual([])
+      expect(journalBytes(next)).toEqual(before)
+    })
+
+    test.each(['not live', 'dry run', 'unreadable', 'absent', 'empty non-hybrid', 'seal without header'] as const)('early return for %s emits nothing and reads no clock', async reason => {
+      let reads = 0
+      const h = fixture({ seal: true, dryRun: reason === 'dry run', monotonicNow: () => ++reads })
+      if (reason === 'absent' || reason === 'empty non-hybrid') h.choose('mentions')
+      if (reason !== 'absent') seedThreads(h.stateDir, reason === 'empty non-hybrid' || reason === 'seal without header' ? [] : [threadHeader()])
+      if (reason === 'unreadable') h.io.fail('readFileSync')
+      if (reason === 'seal without header') h.sealIo.failWrite()
+      const probe = observe(h)
+      if (reason === 'not live') h.memory.readAtStart(); else await h.start()
+      await h.memory.compact('alpha')
+      expect(probe.completed).toEqual([]); expect(reads).toBe(0)
+    })
+
+    test('throwing observers cannot fail completed rewrites or skips; unset observers never read the clock', async () => {
+      let reads = 0
+      const outcomes: ThreadMemoryCompaction['outcome'][] = []
+      const { h } = await established({ monotonicNow: () => ++reads })
+      // established installs its observer only after creating the durable baseline.
+      expect(reads).toBe(0)
+      h.memory.setCompactionObserver(c => { outcomes.push(c.outcome); throw new Error('fixture observer failure') })
+      await h.memory.compact('alpha'); await maintenance(h)
+      expect(outcomes).toEqual(['rewritten', 'skipped']); expect(reads).toBe(4)
+      expect(h.events.filter(e => e.type === 'compaction-failed')).toEqual([])
+      h.memory.setCompactionObserver(undefined)
+      await h.memory.compact('alpha'); await maintenance(h)
+      expect(reads).toBe(4)
+    })
   })
 })
 
@@ -2893,6 +3462,361 @@ describe('Thread Memory rejudges only channels whose stamp changed (t2.yiv.sf.aa
   })
 })
 
+// t3.yiv.sf.ws.ih: each save judged every joined channel again, reading its
+// stamp, though no fact any stamp derives from had changed since.
+describe('Thread Memory judges no channel again under unchanged stamp facts', () => {
+  const channels = channelPopulation(24).map(channel => channel.id)
+  /** Saves across `channels` between publications that keep, change, hold and
+   * leave undecided their stamps, with each save's stamp reads. */
+  async function history(stampFacts: boolean) {
+    let held: ThreadJoin[] = []
+    const h = fixture({ heldStamps: key => key === 'alpha' ? held : [], ...(stampFacts ? {} : { stampFacts: false as const }) })
+    expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha'], channels)).kind).toBe('applied')
+    await h.start()
+    const read = h.authority.channelStamp
+    let reads = 0
+    h.authority.channelStamp = (key, channel) => { reads++; return read(key, channel) }
+    const saveReads: number[] = [], results: unknown[] = []
+    let n = 0
+    const factOn = (channel: string) => h.fact({ channel, root: `1700000002.${String(++n).padStart(6, '0')}` })
+    async function save(facts: ThreadJoin[]) {
+      const before = reads
+      results.push(await h.memory.saveJoins('alpha', facts))
+      saveReads.push(reads - before)
+      return facts
+    }
+    await save(channels.map(factOn))
+    for (const channel of channels.slice(0, 12)) await save([factOn(channel)])
+    // A changed stamp forgets that channel's joins at its publication.
+    results.push(h.choose('mentions', 'alpha', channels[0]!).kind, h.choose('thread_hybrid', 'alpha', channels[0]!).kind)
+    for (const channel of channels.slice(0, 6)) await save([factOn(channel)])
+    // A join a hold names moves to the held index when its stamp changes.
+    held = await save([factOn(channels[1]!)])
+    results.push(h.choose('mentions', 'alpha', channels[1]!).kind)
+    for (const channel of channels.slice(2, 8)) await save([factOn(channel)])
+    results.push(held.map(fact => h.memory.joinedBy('alpha', fact.channel, fact.root, fact.stamp, fact.at)))
+    held = []
+    // Undecided stamps keep every join until the authority recovers.
+    const pending = [factOn(channels[2]!), factOn(channels[3]!)]
+    h.failShared(() => 'unsynced')
+    results.push(h.choose('mentions', 'alpha', channels[2]!).kind)
+    await save(pending)
+    h.failShared(); results.push(h.authority.recoverDurability().kind)
+    for (const channel of channels.slice(3, 9)) await save([factOn(channel)])
+    h.authority.channelStamp = read
+    // Store IDs, digest keys and stamps are minted per run; each history mints them in the same order.
+    const minted = new Map<string, string>()
+    const text = JSON.stringify({ results, joins: h.memory.joins('alpha'), records: readThreads(h.stateDir), events: h.events })
+      .replaceAll(h.stateDir, '<dir>')
+      .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{64}/g, id => minted.get(id) ?? minted.set(id, `id-${minted.size + 1}`).get(id)!)
+    return { history: JSON.parse(text) as unknown, saveReads }
+  }
+
+  test('a history of saves and publications keeps the outcomes, journal and events of judging every channel, reading stamps only after a fact changed', async () => {
+    const unwired = await history(false), wired = await history(true)
+    console.info(`judge stamp reads unwired=${unwired.saveReads.join(',')} wired=${wired.saveReads.join(',')}`)
+    expect(wired.history).toEqual(unwired.history)
+    // Each save after the first judged all 24 channels again; now only what it saves and keeps.
+    expect(Math.min(...unwired.saveReads.slice(1))).toBeGreaterThanOrEqual(channels.length)
+    expect(Math.max(...wired.saveReads.slice(1))).toBeLessThan(channels.length / 2)
+  })
+})
+
+// t3.yiv.sf.ws.ih: each save filtered and searched every unsaved join and
+// queued write, reading a channel stamp per unsaved join, so a backlog made
+// every later save cost more than the last.
+describe('Thread Memory upkeep visits only the unsaved joins a change can affect', () => {
+  const channels = channelPopulation(4).map(channel => channel.id), wide = channelPopulation(16).map(channel => channel.id)
+  const brief = (fact: Pick<ThreadJoin, 'channel' | 'root' | 'at'>) =>
+    `${wide.includes(fact.channel) ? wide.indexOf(fact.channel) : fact.channel}:${fact.root.slice(-3)}@${fact.at - THREAD_TIME}`
+  /** Each step's unsaved joins in order, unsaved count, save block and kept probes, then the journal, joins and events. */
+  function tracer(h: ThreadMemoryHarness, probes: () => readonly ThreadJoin[]) {
+    const trace: unknown[] = []
+    return {
+      trace,
+      look(label: string) {
+        const outage = h.memory.outage('alpha')
+        trace.push(`${label} | kept ${h.memory.keptFacts('alpha').map(brief).join(' ')} | unsaved ${outage.unsaved}${outage.unknown ? ' unknown' : ''}` +
+          `${h.memory.saveBlocked('alpha') ? ' blocked' : ''} | has ${probes().map(p => Number(h.memory.hasKeptJoin('alpha', p.channel, p.root))).join('')}`)
+      },
+      end() {
+        trace.push(readThreads(h.stateDir).map(r => r.kind === 'join' ? `${r.seq} ${brief(r)}` : r.kind === 'post-intent' ? `${r.seq} intent ${r.operationId}`
+          : r.kind === 'post-outcome' ? `${r.seq} ${r.operationId} ${r.outcome}` : `${r.seq} ${r.kind}`).join(', '))
+        trace.push(h.memory.joins('alpha').map(({ join, savedAt }) => `${brief(join)}${savedAt === undefined ? '' : ` saved@${savedAt - THREAD_TIME}`}`).join(', '))
+        trace.push(h.events.map(e => e.type).join(' '))
+        return trace
+      },
+    }
+  }
+  const holdJournalSync = (h: ThreadMemoryHarness) => h.io.hold('fsync', 'alpha', { match: path => path === threadPath(h.stateDir) })
+  // Recorded from the linear scans at 339a4ee1: kept order, counts, kept
+  // answers, save results, journal records, joins and events, step by step.
+  const backlogTrace = [
+    'backlog | kept 0:001@0 0:002@1 1:003@2 2:004@3 3:005@4 0:006@5 1:007@6 2:008@7 3:009@8 0:010@9 1:011@10 2:012@11 3:013@12 0:014@13 1:015@14 2:016@15 3:017@16 1:018@17 2:019@18 1:007@5 3:020@19 3:020@18 | unsaved 22 | has 11111111',
+    'applied',
+    'applied',
+    'stamps changed | kept 0:001@0 0:002@1 2:004@3 3:005@4 0:006@5 2:008@7 3:009@8 0:010@9 2:012@11 3:013@12 0:014@13 2:016@15 3:017@16 2:019@18 3:020@19 3:020@18 | unsaved 16 | has 11001100',
+    'applied',
+    'new stamp | kept 0:001@0 0:002@1 2:004@3 3:005@4 0:006@5 2:008@7 3:009@8 0:010@9 2:012@11 3:013@12 0:014@13 2:016@15 3:017@16 2:019@18 3:020@19 3:020@18 1:021@20 | unsaved 17 | has 11001100',
+    '0:001@0 kept, 0:002@1 kept, 1:003@2 kept, 2:004@3 kept, 3:005@4 kept, 0:006@5 kept, 1:007@6 kept, 2:008@7 kept, 3:009@8 kept, 0:010@9 kept, 1:011@10 kept, 2:012@11 kept, 3:013@12 kept, 0:014@13 kept, 1:015@14 kept, 2:016@15 kept, 3:017@16 kept, 1:018@17+2:019@18 kept, 0:006@6 kept, 1:007@5 kept, 3:020@18 kept, 1:021@20 kept',
+    'released | kept  | unsaved 0 | has 00000000',
+    'unresolved',
+    'undecided | kept 0:022@21 3:023@22 0:024@23 3:025@24 | unsaved 4 | has 00000000',
+    '0:022@21 kept, 3:023@22 kept, 0:024@23+3:025@24 kept',
+    'deferred | kept 3:023@22 3:025@24 | unsaved 2 | has 00000000',
+    'applied',
+    'recovered | kept  | unsaved 0 | has 00000000',
+    'saved',
+    'flushed | kept  | unsaved 0 | has 00000000',
+    '0:026@25 failed',
+    'failed | kept 0:026@25 | unsaved 1 blocked | has 00000000',
+    '0:027@26 kept',
+    'saved after failure | kept 0:026@25 | unsaved 1 blocked | has 00000000',
+    'saved',
+    'flushed again | kept  | unsaved 0 | has 00000000',
+    'joined',
+    'posts held | kept 0:028@28 | unsaved 4 | has 00000000',
+    'saved',
+    'saved',
+    'none',
+    'saved',
+    'posts saved | kept  | unsaved 0 | has 00000000',
+    '1 header, 2 0:001@0, 3 0:002@1, 4 2:004@3, 5 3:005@4, 6 0:006@5, 7 2:008@7, 8 3:009@8, 9 0:010@9, 10 2:012@11, 11 3:013@12, 12 0:014@13, 13 2:016@15, 14 3:017@16, 15 2:019@18, 16 3:020@18, 17 1:021@20, 18 0:022@21, 19 0:024@23, 20 0:027@26, 21 0:026@25, 22 intent post-a, 23 intent post-b, 24 0:028@28, 25 post-a joined, 26 post-b none',
+    '0:001@0 saved@0, 0:002@1 saved@1, 0:006@5 saved@5, 0:010@9 saved@9, 0:014@13 saved@13, 0:022@21 saved@21, 0:024@23 saved@23, 0:026@25 saved@25, 0:027@26 saved@26, 0:028@28 saved@28, 1:021@20 saved@20',
+    'created outage-settled outage-settled outage-settled append-failed saved-after-failure outage-settled',
+  ]
+  const readRetryTrace = [
+    true,
+    true,
+    true,
+    'unreadable | kept C0TEST001:002@1 C0TEST001:001@0 C0TEST001:001@-1 | unsaved 3 unknown | has 11',
+    'read',
+    'read | kept C0TEST001:002@1 C0TEST001:001@-1 | unsaved 2 | has 11',
+    'saved',
+    'flushed | kept  | unsaved 0 | has 00',
+    '1 header, 2 C0TEST001:001@0, 3 C0TEST001:002@1, 4 C0TEST001:001@0, 5 C0TEST001:001@-1',
+    'C0TEST001:002@1 saved@1, C0TEST001:001@-1 saved@-1',
+    'read-failed read outage-settled',
+  ]
+
+  // Recorded from judging and counting every kept channel at each save, before
+  // per-channel judgements under unchanged stamp facts.
+  const wideTrace = [
+    'backlog | kept 0:001@0 0:002@1 1:003@2 2:004@3 3:005@4 4:006@5 5:007@6 6:008@7 7:009@8 8:010@9 9:011@10 10:012@11 11:013@12 12:014@13 13:015@14 14:016@15 15:017@16 0:018@17 1:019@18 2:020@19 3:021@20 4:022@21 5:023@22 6:024@23 7:025@24 8:026@25 9:027@26 10:028@27 11:029@28 12:030@29 13:031@30 14:032@31 15:033@32 | unsaved 33 | has 111111',
+    'applied',
+    'applied',
+    'stamps changed | kept 0:001@0 0:002@1 1:003@2 2:004@3 3:005@4 4:006@5 5:007@6 6:008@7 7:009@8 8:010@9 10:012@11 11:013@12 12:014@13 13:015@14 14:016@15 15:017@16 0:018@17 1:019@18 2:020@19 3:021@20 4:022@21 5:023@22 6:024@23 7:025@24 8:026@25 10:028@27 11:029@28 12:030@29 13:031@30 14:032@31 15:033@32 | unsaved 31 | has 110000',
+    'one judged | kept 0:002@1 1:003@2 2:004@3 3:005@4 4:006@5 5:007@6 6:008@7 7:009@8 8:010@9 10:012@11 11:013@12 12:014@13 13:015@14 14:016@15 15:017@16 0:018@17 1:019@18 2:020@19 3:021@20 4:022@21 5:023@22 6:024@23 7:025@24 8:026@25 10:028@27 11:029@28 12:030@29 13:031@30 14:032@31 15:033@32 | unsaved 30 | has 110000',
+    'hold withdrawn | kept 0:002@1 1:003@2 2:004@3 3:005@4 4:006@5 5:007@6 6:008@7 7:009@8 8:010@9 10:012@11 11:013@12 12:014@13 13:015@14 14:016@15 15:017@16 0:018@17 1:019@18 2:020@19 3:021@20 4:022@21 5:023@22 6:024@23 7:025@24 8:026@25 10:028@27 11:029@28 12:030@29 13:031@30 14:032@31 15:033@32 | unsaved 28 | has 110000',
+    'next judged | kept 1:003@2 2:004@3 3:005@4 4:006@5 6:008@7 7:009@8 8:010@9 10:012@11 11:013@12 12:014@13 13:015@14 14:016@15 15:017@16 0:018@17 1:019@18 2:020@19 3:021@20 4:022@21 6:024@23 7:025@24 8:026@25 10:028@27 11:029@28 12:030@29 13:031@30 14:032@31 15:033@32 | unsaved 27 | has 010000',
+    'unresolved',
+    'undecided | kept 1:003@2 2:004@3 3:005@4 4:006@5 6:008@7 7:009@8 8:010@9 10:012@11 11:013@12 12:014@13 13:015@14 14:016@15 15:017@16 0:018@17 1:019@18 2:020@19 3:021@20 4:022@21 6:024@23 7:025@24 8:026@25 10:028@27 11:029@28 12:030@29 13:031@30 14:032@31 15:033@32 3:035@34 | unsaved 28 | has 000000',
+    'applied',
+    'recovered | kept 1:003@2 3:005@4 4:006@5 6:008@7 7:009@8 8:010@9 10:012@11 11:013@12 12:014@13 13:015@14 14:016@15 15:017@16 0:018@17 1:019@18 3:021@20 4:022@21 6:024@23 7:025@24 8:026@25 10:028@27 11:029@28 12:030@29 13:031@30 14:032@31 15:033@32 3:035@34 | unsaved 26 | has 000000',
+    '0:001@0 kept, 0:002@1 kept, 1:003@2 kept, 2:004@3 kept, 3:005@4 kept, 4:006@5 kept, 5:007@6 kept, 6:008@7 kept, 7:009@8 kept, 8:010@9 kept, 9:011@10 kept, 10:012@11 kept, 11:013@12 kept, 12:014@13 kept, 13:015@14 kept, 14:016@15 kept, 15:017@16 kept, 0:018@17 kept, 1:019@18 kept, 2:020@19 kept, 3:021@20 kept, 4:022@21 kept, 5:023@22 kept, 6:024@23 kept, 7:025@24 kept, 8:026@25 kept, 9:027@26 kept, 10:028@27 kept, 11:029@28 kept, 12:030@29 kept, 13:031@30 kept, 14:032@31 kept, 15:033@32 kept, 2:034@33 kept, 3:035@34 saved',
+    'drained | kept  | unsaved 0 | has 000000',
+    'saved',
+    'flushed | kept  | unsaved 0 | has 000000',
+    '1 header, 2 0:001@0, 3 0:002@1, 4 1:003@2, 5 3:005@4, 6 4:006@5, 7 6:008@7, 8 7:009@8, 9 8:010@9, 10 10:012@11, 11 11:013@12, 12 12:014@13, 13 13:015@14, 14 14:016@15, 15 15:017@16, 16 0:018@17, 17 1:019@18, 18 3:021@20, 19 4:022@21, 20 6:024@23, 21 7:025@24, 22 8:026@25, 23 10:028@27, 24 11:029@28, 25 12:030@29, 26 13:031@30, 27 14:032@31, 28 15:033@32, 29 3:035@34',
+    '0:001@0 saved@0, 0:002@1 saved@1, 0:018@17 saved@17, 1:003@2 saved@2, 1:019@18 saved@18, 3:005@4 saved@4, 3:021@20 saved@20, 3:035@34 saved@34, 4:006@5 saved@5, 4:022@21 saved@21, 6:008@7 saved@7, 6:024@23 saved@23, 7:009@8 saved@8, 7:025@24 saved@24, 8:010@9 saved@9, 8:026@25 saved@25, 10:012@11 saved@11, 10:028@27 saved@27, 11:013@12 saved@12, 11:029@28 saved@28, 12:014@13 saved@13, 12:030@29 saved@29, 13:015@14 saved@14, 13:031@30 saved@30, 14:016@15 saved@15, 14:032@31 saved@31, 15:017@16 saved@16, 15:033@32 saved@32',
+    'created outage-settled',
+  ]
+
+  /** Saves queued behind held appends, through stamp changes, holds, undecided stamps, a failed append and posts. */
+  async function backlogHistory() {
+    let held: ThreadJoin[] = []
+    const h = fixture({ heldStamps: key => key === 'alpha' ? held : [] })
+    expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha'], channels)).kind).toBe('applied')
+    await h.start()
+    let n = 0
+    const on = (i: number) => h.fact({ channel: channels[i]!, root: `1700000003.${String(++n).padStart(6, '0')}` })
+    const facts: ThreadJoin[] = [], results: string[] = [], saving: Promise<void>[] = []
+    const { trace, look, end } = tracer(h, () => facts.slice(0, 8))
+    const save = (batch: ThreadJoin[]) => {
+      facts.push(...batch)
+      saving.push(h.memory.saveJoins('alpha', batch).then(result => { results.push(`${batch.map(brief).join('+')} ${result.kind}`) }))
+    }
+    const settle = async () => { await Promise.all(saving.splice(0)); trace.push(results.splice(0).join(', ')) }
+    const sync = holdJournalSync(h)
+    save([on(0)]); await sync.reached
+    for (let i = 0; i < 16; i++) save([on(i % 4)])
+    save([on(1), on(2)])
+    // A later time for a kept root keeps nothing new; an earlier one keeps another join.
+    save([{ ...facts[5]!, at: facts[5]!.at + 1 }]); save([{ ...facts[6]!, at: facts[6]!.at - 1 }])
+    // Kept with no save of its own; an earlier join's save saves its root first.
+    const alone = on(3)
+    expect(h.memory.addJoin('alpha', alone)).toBe(true); facts.push(alone)
+    save([{ ...alone, at: alone.at - 1 }])
+    look('backlog')
+    // A changed stamp forgets its channel's unsaved joins; a hold keeps another channel's.
+    trace.push(h.choose('mentions', 'alpha', channels[1]!).kind)
+    held = [facts[3]!]
+    trace.push(h.choose('mentions', 'alpha', channels[2]!).kind)
+    look('stamps changed')
+    trace.push(h.choose('thread_hybrid', 'alpha', channels[1]!).kind)
+    save([on(1)])
+    look('new stamp')
+    sync.release(); await settle(); look('released')
+    // Undecided stamps defer joins until the authority recovers.
+    const again = holdJournalSync(h)
+    save([on(0)]); await again.reached
+    save([on(3)]); save([on(0), on(3)])
+    h.failShared(() => 'unsynced'); trace.push(h.choose('mentions', 'alpha', channels[3]!).kind)
+    look('undecided')
+    again.release(); await settle(); look('deferred')
+    h.failShared(); trace.push(h.authority.recoverDurability().kind)
+    look('recovered')
+    trace.push((await h.memory.flush('alpha')).kind); look('flushed')
+    // A failed append blocks saves until one succeeds.
+    h.io.fail('writeSync', 'alpha', { times: 1 })
+    save([on(0)]); await settle(); look('failed')
+    save([on(0)]); await settle(); look('saved after failure')
+    trace.push((await h.memory.flush('alpha')).kind); look('flushed again')
+    // Posts count as unsaved until their intent and outcome are saved.
+    const post = holdJournalSync(h), target = on(0)
+    const first = h.memory.keepIntent('alpha', { operationId: 'post-a', channel: target.channel, root: target.root, at: target.at, stamp: target.stamp,
+      content: { kind: 'text', text: 'first post' } })
+    await post.reached
+    const second = h.memory.keepIntent('alpha', { operationId: 'post-b', channel: target.channel, at: target.at, stamp: target.stamp, digest: 'cd'.repeat(32) })
+    trace.push(h.memory.resolveIntent('alpha', 'post-a', { joined: { channel: target.channel, root: target.root, stamp: target.stamp } }) ?? 'unresolved')
+    look('posts held')
+    post.release()
+    trace.push(String(first.kept && await first.ready), String(second.kept && await second.ready))
+    trace.push(h.memory.resolveIntent('alpha', 'post-b', { none: true }) ?? 'unresolved')
+    trace.push((await h.memory.flush('alpha')).kind); look('posts saved')
+    return end()
+  }
+
+  /** Saves across many channels behind held appends: a hold alone keeps a
+   * changed channel's joins and is then withdrawn with no new stamp facts;
+   * then undecided stamps, recovery and a drained backlog. */
+  async function wideHistory() {
+    let held: ThreadJoin[] = []
+    const h = fixture({ heldStamps: key => key === 'alpha' ? held : [] })
+    expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha'], wide)).kind).toBe('applied')
+    await h.start()
+    let n = 0
+    const on = (i: number) => h.fact({ channel: wide[i]!, root: `1700000005.${String(++n).padStart(6, '0')}` })
+    const facts: ThreadJoin[] = [], results: string[] = [], saving: Promise<void>[] = []
+    // facts[k] is on channel (k - 1) % 16 for k >= 1.
+    const { trace, look, end } = tracer(h, () => [1, 3, 6, 10, 22, 26].map(k => facts[k]!))
+    const save = (batch: ThreadJoin[]) => {
+      facts.push(...batch)
+      saving.push(h.memory.saveJoins('alpha', batch).then(result => { results.push(`${batch.map(brief).join('+')} ${result.kind}`) }))
+    }
+    const settle = async () => { await Promise.all(saving.splice(0)); trace.push(results.splice(0).join(', ')) }
+    const first = holdJournalSync(h)
+    save([on(0)]); await first.reached
+    for (let i = 0; i < 32; i++) save([on(i % 16)])
+    look('backlog')
+    // Only a hold keeps channel 5's joins once its stamp changes; channel 9's are forgotten.
+    held = [facts[6]!]
+    trace.push(h.choose('mentions', 'alpha', wide[5]!).kind, h.choose('mentions', 'alpha', wide[9]!).kind)
+    look('stamps changed')
+    const second = holdJournalSync(h)
+    first.release(); await second.reached
+    look('one judged')
+    // Withdrawn with no publication: the next judgement forgets channel 5's joins.
+    held = []
+    look('hold withdrawn')
+    const third = holdJournalSync(h)
+    second.release(); await third.reached
+    look('next judged')
+    const late = [on(2), on(3)]
+    h.failShared(() => 'unsynced'); trace.push(h.choose('mentions', 'alpha', wide[2]!).kind)
+    for (const fact of late) save([fact])
+    look('undecided')
+    h.failShared(); trace.push(h.authority.recoverDurability().kind)
+    look('recovered')
+    third.release(); await settle(); look('drained')
+    trace.push((await h.memory.flush('alpha')).kind); look('flushed')
+    return end()
+  }
+  /** Joins kept while the journal is unreadable, then read: saved evidence on disk settles them. */
+  async function readRetryHistory() {
+    const h = fixture()
+    const saved = h.fact(), other = h.fact({ root: R.secondary })
+    seedReadable(h, [saved])
+    h.io.fail('readFileSync'); await h.start()
+    const { trace, look, end } = tracer(h, () => [saved, other])
+    for (const fact of [other, { ...saved }, { ...saved, at: saved.at - 1 }]) trace.push(h.memory.addJoin('alpha', fact))
+    look('unreadable')
+    h.io.heal(); trace.push(await h.memory.retryRead('alpha')); look('read')
+    trace.push((await h.memory.flush('alpha')).kind); look('flushed')
+    return end()
+  }
+
+  test('saves queued behind held appends keep the unsaved order, counts, kept answers, journal and events of scanning every unsaved join', async () => {
+    expect(await backlogHistory()).toEqual(backlogTrace)
+  })
+
+  test('joins kept while the journal was unreadable settle against its saved evidence as scanning every unsaved join did', async () => {
+    expect(await readRetryHistory()).toEqual(readRetryTrace)
+  })
+
+  test('saves across many channels keep the unsaved order, counts, kept answers, journal and events of judging and counting every kept channel', async () => {
+    expect(await wideHistory()).toEqual(wideTrace)
+  })
+
+  test('a save reads a bounded number of channel stamps, however many channels hold unsaved joins', async () => {
+    const many = channelPopulation(200).map(channel => channel.id)
+    const h = fixture()
+    expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha'], many)).kind).toBe('applied')
+    await h.start()
+    const sync = holdJournalSync(h)
+    const saves = [h.memory.saveJoins('alpha', [h.fact({ channel: many[0]! })])]
+    await sync.reached
+    saves.push(...Array.from({ length: 400 }, (_, i) =>
+      h.memory.saveJoins('alpha', [h.fact({ channel: many[i % many.length]!, root: `1700000006.${String(i).padStart(6, '0')}` })])))
+    const read = h.authority.channelStamp
+    let reads = 0
+    h.authority.channelStamp = (key, channel) => { reads++; return read(key, channel) }
+    let results: Awaited<(typeof saves)[number]>[]
+    try {
+      sync.release()
+      results = await Promise.all(saves)
+    } finally { h.authority.channelStamp = read }
+    console.info(`kept-channel upkeep per save: stamp reads ${(reads / saves.length).toFixed(1)}`)
+    expect(results!.at(-1)).toEqual({ kind: 'saved' })
+    expect(h.memory.keptFacts('alpha')).toEqual([])
+    expect(h.events.filter(e => e.type === 'outage-settled')).toHaveLength(1)
+    expect(savedJoins(h)).toHaveLength(saves.length)
+    // Judging and counting every kept channel read about 304 stamps per save here.
+    expect(reads / saves.length).toBeLessThan(12)
+  })
+  test('a save reads each kept channel\'s stamp and encodes stamp keys a bounded number of times, however long the backlog', async () => {
+    let held: ThreadJoin[] = []
+    const h = fixture({ heldStamps: key => key === 'alpha' ? held : [] })
+    expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha'], channels)).kind).toBe('applied')
+    await h.start()
+    const sync = holdJournalSync(h)
+    const saves = [h.memory.saveJoins('alpha', [h.fact({ channel: channels[0]! })])]
+    await sync.reached
+    const backlog = Array.from({ length: 400 }, (_, i) => h.fact({ channel: channels[i % 4]!, root: `1700000004.${String(i).padStart(6, '0')}` }))
+    saves.push(...backlog.map(fact => h.memory.saveJoins('alpha', [fact])))
+    // The last channel's unsaved joins are stale but named by a hold.
+    held = [backlog[3]!]
+    expect(h.choose('mentions', 'alpha', channels[3]!).kind).toBe('applied')
+    const read = h.authority.channelStamp
+    let reads = 0, encodings = 0
+    h.authority.channelStamp = (key, channel) => { reads++; return read(key, channel) }
+    const stringify = JSON.stringify
+    const encoding = spyOn(JSON, 'stringify').mockImplementation(((...args: Parameters<typeof JSON.stringify>) => { encodings++; return stringify(...args) }) as typeof JSON.stringify)
+    let results: Awaited<(typeof saves)[number]>[]
+    try {
+      sync.release()
+      results = await Promise.all(saves)
+    } finally { encoding.mockRestore(); h.authority.channelStamp = read }
+    console.info(`unsaved-join upkeep per save: stamp reads ${(reads / saves.length).toFixed(1)}, encodings ${(encodings / saves.length).toFixed(1)}`)
+    expect(results!.at(-1)).toEqual({ kind: 'saved' })
+    expect(h.memory.keptFacts('alpha')).toEqual([])
+    expect(savedJoins(h)).toHaveLength(saves.length)
+    // Scanning every unsaved join read about 208 stamps and encoded about 212 values per save here.
+    expect(reads / saves.length).toBeLessThan(24)
+    expect(encodings / saves.length).toBeLessThan(24)
+  })
+})
+
 describe('Thread Memory seal judgments and closed metadata', () => {
   test.each(['running-own-posts', 'own-post-channel', 'own-post-root', 'duplicate-own-post', 'own-post-extra-key'] as const)(
     'own-post seal rejects %s damage as no entries and rewrites valid running metadata', async damage => {
@@ -3029,6 +3953,22 @@ describe('Thread Memory seal judgments and closed metadata', () => {
     expect(h.sealIo.calls.at(-1)).toEqual({ op: 'closeSync', path: queuePath(h.stateDir) })
     h.sealIo.heal(); writeFileSync(queuePath(h.stateDir), Buffer.alloc(0))
     expect(queueIdentitiesMatch(absent, h.seal.queueIdentity('alpha'))).toBe(false)
+  })
+
+  test("an observer of the seal's queue-journal openings changes nothing it reads or hashes, even when it throws; an absent journal notifies nothing", () => {
+    const dir = mkdtempSync(join(tmpdir(), 'thread-memory-')); threadDirs.push(dir)
+    seedQueue(dir, [acceptedRecord(1, slackInput(), THREAD_TIME)])
+    function identify(key: string, observer?: (key: string) => void) {
+      const io = threadSealFsControls(dir)
+      const seal = createThreadMemorySeal({ stateDir: dir, fs: io.fs, queueJournalPath: k => queuePath(dir, k), appliedKeys: () => [],
+        threadHybrid: () => false, created: () => false, ...(observer ? { onQueueJournalOpened: observer } : {}) })
+      return { identity: seal.queueIdentity(key), reads: io.queueReads() }
+    }
+    const plain = identify('alpha'), opened: string[] = []
+    expect(identify('alpha', key => { opened.push(key) })).toEqual(plain)
+    expect(identify('alpha', () => { throw new Error('fixture observer failed') })).toEqual(plain)
+    expect(identify('beta', key => { opened.push(key) }).identity).toEqual({ size: '0', sha256: createHash('sha256').digest('hex') })
+    expect(opened).toEqual(['alpha'])
   })
 })
 
@@ -3300,6 +4240,30 @@ describe('Thread Memory seal startup and restart', () => {
     expect(next.seal.queueIdentity('alpha')).not.toEqual(old.queue!)
     await next.memory.activate()
     expect(next.seal.startupFindings()).toEqual([{ key: 'beta', case: 'unclean-stop', wording: 'unclean' }])
+  })
+
+  test.each([
+    ['succeeds', ['journal']],
+    ['also fails before its rename', ['journal', 'queue']],
+  ] as const)("the seal's read is a queue journal's first opening: when the earlier start compaction %s, the later journal's first append syncs %j", async (earlier, expected) => {
+    // Start compacts the queue journals one at a time; the later one's rewrite always fails before its rename.
+    let temps = 0, later = ''
+    const rewrites = durableIo({ before(step) {
+      if (step.op !== 'fsync' || !step.path.endsWith('.tmp') || (++temps === 1 && earlier === 'succeeds')) return
+      later = basename(step.path).split('.')[0]!
+      throw new Error('fixture temp sync refused')
+    } })
+    const h = sealFixture({ queueOptions: { fs: rewrites.fs } })
+    h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta']))
+    for (const key of ['alpha', 'beta']) { seedQueue(h.stateDir, [acceptedRecord(1, slackInput(), THREAD_TIME)], key); seedReadable(h, [], key) }
+    await h.start()
+    expect(h.sealIo.queueReads().filter(c => c.op === 'openSync').map(c => c.path).sort()).toEqual([queuePath(h.stateDir), queuePath(h.stateDir, 'beta')])
+    expect(temps).toBe(2)
+    expectSealFinding(h)
+    const from = h.queueIo.steps.length
+    expect((await h.queue.accept(later, injectedInput())).status).toBe('accepted')
+    expect(h.queueIo.steps.slice(from).filter(step => step.op === 'fsync').map(({ path }) =>
+      path === join(h.stateDir, 'queue') ? 'queue' : path === queuePath(h.stateDir, later) ? 'journal' : path)).toEqual([...expected])
   })
 
   test.each(['json', 'version', 'persona-key', 'missing-queue', 'read-failure'] as const)('%s seal is reported, treated as empty and replaced with valid running entries', async damage => {
@@ -3605,9 +4569,10 @@ describe('Thread Memory seal creation and durable writer', () => {
     ])
   })
 
-  test('startup compaction and the hourly interval update record numbers; failed compaction does not, and failed sealing cannot fail compaction', async () => {
+  test('startup compaction updates record numbers; a failed seal retries independently while unchanged maintenance skips', async () => {
     const h = sealFixture(); await h.start(); await h.memory.saveJoins('alpha', [h.fact()]); await h.crash()
-    const next = sealFixture({ reopen: true }, h.stateDir); await next.start()
+    const interval = THREAD_MEMORY_RETRY_MIN_MS / 2
+    const next = sealFixture({ reopen: true, failureHandling: true, compactIntervalMs: interval }, h.stateDir); await next.start()
     expect(sealEntry(next).lastRecordNumber).toBe(next.memory.store('alpha')!.lastRecordNumber)
     await next.memory.saveJoins('alpha', [next.fact({ root: R.secondary })]); const previous = readFileSync(threadSealPath(h.stateDir))
     next.io.fail('rename'); await next.memory.compact('alpha')
@@ -3617,7 +4582,17 @@ describe('Thread Memory seal creation and durable writer', () => {
     expect(readThreads(h.stateDir)[0]).toMatchObject({ highWater: next.memory.store('alpha')!.lastRecordNumber })
     expect(readFileSync(threadSealPath(h.stateDir))).toEqual(previous)
     expect(next.sealEvents.at(-1)).toMatchObject({ type: 'seal-write-failed', unsynced: false })
-    next.sealIo.heal(); await next.clock.advance(QUEUE_COMPACT_INTERVAL_MS)
+    const completed: ThreadMemoryCompaction[] = []
+    next.memory.setCompactionObserver(c => completed.push(c))
+    next.io.reset(); next.sealIo.reset()
+    await next.clock.advance(interval)
+    expect(completed.map(c => c.outcome)).toEqual(['skipped'])
+    expect(next.io.calls).toEqual([]); expect(next.sealIo.calls).toEqual([])
+    expect(readFileSync(threadSealPath(h.stateDir))).toEqual(previous)
+    next.sealIo.heal(); await next.clock.advance(interval)
+    expect(next.retryEvents).toContainEqual({ type: 'seal-written-after-retries', attempts: 1 })
+    expect(completed.map(c => c.outcome)).toEqual(['skipped', 'skipped'])
+    expect(next.io.calls).toEqual([])
     expect(sealEntry(next).lastRecordNumber).toBe(next.memory.store('alpha')!.lastRecordNumber)
     expect(savedJoins(next)).toHaveLength(2)
   })

@@ -5,6 +5,7 @@
  * Server shutdown and lifecycle cancellation schedules belong to av/pb.
  */
 import { afterEach, describe, expect, test } from 'bun:test'
+import { SERVER_POST_METADATA } from './test-helpers/server-post.ts'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -267,7 +268,7 @@ describe('Thread Memory reporter event mappings and episodes', () => {
     expect(f.logs).toEqual(Array.from({ length: 2 }, () => buildThreadMemoryJoinsLostLine(f.a, loss)))
     await f.clock.flush()
     expect(f.notifier.posts(f.a.key)).toEqual(Array.from({ length: 2 }, () => ({
-      channel: C.primary, text: formatPersonaNotice(f.a, notice.text, notice.options),
+      channel: C.primary, text: formatPersonaNotice(f.a, notice.text, notice.options), metadata: SERVER_POST_METADATA,
     })))
     expect(f.notifier.posts(f.b.key)).toEqual([])
   })
@@ -634,7 +635,7 @@ describe('CR5/CR6 configured fields through the reporter and notifier', () => {
     }
     await f.clock.flush()
     const posts = f.notifier.posts(f.a.key)
-    expect(posts).toEqual(bodies.map(text => ({ channel: C.primary, text: formatPersonaNotice(f.a, text) })))
+    expect(posts).toEqual(bodies.map(text => ({ channel: C.primary, text: formatPersonaNotice(f.a, text), metadata: SERVER_POST_METADATA })))
     const ref = escapeSlackControlCharacters(renderPersonaRef(name, f.a.key))
     for (const { text } of posts) {
       expect(text.startsWith(`Persona ${ref}: `)).toBe(true)

@@ -252,6 +252,10 @@ export interface ThreadHarnessOptions {
   failureHandling?: boolean
   /** Passed through to `createThreadMemory` as given, absent by default. */
   compactIntervalMs?: ThreadMemoryOptions['compactIntervalMs']
+  monotonicNow?: ThreadMemoryOptions['monotonicNow']
+  /** Stamp facts are wired as main() wires them; `false` leaves the judge
+   * reading every channel's stamp, its path before stamp facts existed. */
+  stampFacts?: false
 }
 export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarnessOptions = {}) {
   const clock = options.clock ?? createFakeClock({ start: THREAD_TIME }), io = options.fs ?? threadFsControls(stateDir)
@@ -284,6 +288,8 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
   const sealIo = sealOptions.fs ?? threadSealFsControls(stateDir), sealEvents: ThreadMemorySealEvent[] = []
   const seal = options.seal ? createThreadMemorySeal({ stateDir, fs: sealIo.fs,
     queueJournalPath: key => queuePath(stateDir, key),
+    // As main() wires it: the seal's read can be a queue journal's first opening.
+    onQueueJournalOpened: key => queue?.journalOpened(key),
     appliedKeys: options.appliedKeys ?? (() => authority.config().personas.map(p => p.key)),
     threadHybrid: key => authority.threadView().threadHybridChannels(key).length > 0,
     created: key => authority.threadMemoryCreated(key),
@@ -302,8 +308,10 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
   const memory = createThreadMemory({
     stateDir, fs: io.fs, now: options.now ?? clock.now, ...intervalTimers(clock), dryRun: options.dryRun, seal,
     compactIntervalMs: options.compactIntervalMs,
+    monotonicNow: options.monotonicNow,
     appliedKeys: options.appliedKeys ?? (() => authority.config().personas.map(p => p.key)),
     stamp: (key, channel) => authority.channelStamp(key, channel),
+    stampFacts: options.stampFacts === false ? undefined : () => authority.stampFacts(),
     heldStamps: options.heldStamps,
     unsavedOwnPosts: key => ownPosts?.unsavedDeferredPosts(key) ?? 0,
     canRun: options.canRun,

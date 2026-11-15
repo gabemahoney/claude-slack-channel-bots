@@ -38,6 +38,7 @@ import { CHANNEL_TARGET_STATE_UNRESOLVED } from '../src/registry.ts'
  * SPDX-License-Identifier: MIT
  */
 
+import { expectNoMetadata } from './test-helpers/server-post.ts'
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
@@ -104,15 +105,20 @@ import {
   SET_CHANNEL_DELIVERY_TOOL,
   slackRefusalToolErrorText,
   replyPartialFailureText,
-  OWN_POST_UPLOAD_FILENAME,
   OWN_POST_UPLOAD_REFUSED,
   type PersonaTargetAction,
   type PersonaTargetCheck,
   _resetRegistry,
+  type ReactClaimContext,
   type SessionEntry,
   type SessionToolDeps,
 } from '../src/registry.ts'
-import { trackAck, consumeAck, _resetAckTracker, addDeliveryAck } from '../src/ack-tracker.ts'
+import { trackAck, consumeAck, claimReactAnswer, _resetAckTracker, addDeliveryAck } from '../src/ack-tracker.ts'
+import type { BotToolReactionInput, BotToolReactionIntakeResult } from '../src/persona-routing.ts'
+import { buildReactionHandoffFailedLine, type ReactionHandoffFailureReason } from '../src/react-handoff.ts'
+import { NAME_LOOKUP_TIMEOUT_MS } from '../src/tag-wrapper.ts'
+import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { makeReactHandoffFixture, drainReactHandoff, type ReactHandoffFixture } from './test-helpers/react-handoff.ts'
 import {
   makePersona,
   makeMultiPersonaConfig,
@@ -139,6 +145,7 @@ import {
   slackPlatformError,
   openedDm,
   stubOpenedDmId,
+  type SettledWebApiOutcome,
   type StubSlack,
   type StubSlackOptions,
   type StubSlackScript,
@@ -146,7 +153,6 @@ import {
   type StubWebMethod,
   type PagedMessageSpec,
   type WebApiOutcome,
-  type SettledWebApiOutcome,
 } from './test-helpers/slack-stub.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import {
@@ -1335,6 +1341,7 @@ describe('tool posting scope (through the MCP server)', () => {
       expect(result.isError).toBeUndefined()
       const captured = stubOf(h.alpha).calls[TOOL_CAPTURE[tool]] as Array<{ channel?: string }>
       expect(captured.map((c) => c.channel)).toEqual([target])
+      expectNoMetadata(captured)
       expect(slackCallCount(stubOf(h.beta))).toBe(0)
     },
   )
@@ -1372,6 +1379,7 @@ describe('tool posting scope (through the MCP server)', () => {
     expect(Object.keys(stubOf(h.alpha).calls.postMessage[0]!)).toEqual(
       expect.not.arrayContaining(['username', 'icon_emoji', 'icon_url']),
     )
+    expectNoMetadata(stubOf(h.alpha).calls.postMessage)
   })
 })
 
@@ -1380,24 +1388,24 @@ describe('tool posting scope (through the MCP server)', () => {
 // ---------------------------------------------------------------------------
 
 describe('reply reminder tool facts', () => {
-  test.each(['success', 'Slack failure', 'target refusal', 'dry run'] as const)('%s: reply records its own persona before scope validation or Slack outcome', async outcome => {
+  test.each((['reply', 'react'] as const).flatMap(tool => (['success', 'Slack failure', 'target refusal', 'dry run'] as const).map(outcome => [outcome, tool] as const)))('%s: %s records its own persona before scope validation or Slack outcome', async (outcome, tool) => {
     const keys: string[] = []
     const deps = { ...h.deps, onReplyCall: async (key: string) => {
       expect(totalSlackCalls()).toBe(0)
       keys.push(key)
     } }
-    if (outcome === 'Slack failure') stubOf(h.alpha).script.post.push({ kind: 'platform', error: 'not_in_channel' })
+    if (outcome === 'Slack failure') stubOf(h.alpha).script[tool === 'reply' ? 'post' : 'reactionsAdd'].push({ kind: 'platform', error: 'not_in_channel' })
     if (outcome === 'dry run') process.env['SLACK_DRY_RUN'] = '1'
     const entry = registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer())
     const session = await openSession(entry, deps)
-    const result = await session.call('reply', TOOL_ARGS.reply(outcome === 'target refusal' ? B_CHANNEL : A_ALL))
+    const result = await session.call(tool, TOOL_ARGS[tool](outcome === 'target refusal' ? B_CHANNEL : A_ALL))
     expect(keys).toEqual([h.alpha.key])
     expect(result.isError === true).toBe(outcome === 'Slack failure' || outcome === 'target refusal')
     expect(slackCallCount(stubOf(h.beta))).toBe(0)
     if (outcome === 'target refusal' || outcome === 'dry run') expectNoSlackCall()
   })
 
-  test('a reply waits for its durable fact before posting, while other tools create no reply fact', async () => {
+  test('a reply waits for its durable fact before posting, while tools other than react create no reply fact', async () => {
     let release!: () => void
     let entered!: () => void
     const started = new Promise<void>(resolve => { entered = resolve })
@@ -1411,7 +1419,7 @@ describe('reply reminder tool facts', () => {
     release()
     expect((await replying).isError).toBeUndefined()
     expect(stubOf(h.alpha).calls.postMessage).toHaveLength(1)
-    await session.call('react', TOOL_ARGS.react(A_ALL))
+    await session.call('edit_message', TOOL_ARGS.edit_message(A_ALL))
     expect(keys).toEqual([h.alpha.key])
   })
 
@@ -1510,11 +1518,12 @@ describe('DM targets (through the MCP server)', () => {
     },
   )
 
-  test('a multi-chunk reply with a file to a user ID opens the DM once and sends every chunk and the file there', async () => {
+  test('a multi-chunk reply with a file to a user ID opens the DM once and sends every chunk there, then the file under the first chunk', async () => {
     applyPersona(h.alpha, true)
     stubOf(h.alpha).script.open.push(openedDm(OPENED))
     const file = join(h.inboxDir, 'out.txt')
     writeFileSync(file, 'data')
+    const posted = recordPostedTs(h.alpha)
     const deps = depsWithReplySettings({ reply_chunk_limit: 5 })
     const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), deps)
 
@@ -1524,7 +1533,12 @@ describe('DM targets (through the MCP server)', () => {
     const log = stubOf(h.alpha).callLog
     expect(log.map((c) => c.method)).toEqual(['conversations.open', 'chat.postMessage', 'chat.postMessage', 'chat.postMessage', 'filesUploadV2'])
     expect(stubOf(h.alpha).calls.postMessage.map((c) => [c.channel, (c as { text?: string }).text])).toEqual([[OPENED, 'one\n'], [OPENED, 'two\n'], [OPENED, 'three']])
-    expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([{ channel_id: OPENED, file, filename: OWN_POST_UPLOAD_FILENAME }] as any)
+    expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([
+      { channel_id: OPENED, file_uploads: [{ file, filename: 'out.txt' }], thread_ts: posted[0] },
+    ] as any)
+    // Every chunk and the upload are Tool Posts.
+    expectNoMetadata(stubOf(h.alpha).calls.postMessage)
+    expectNoMetadata(stubOf(h.alpha).calls.filesUploadV2)
     expect(stubOf(h.beta).callLog).toEqual([])
   })
 
@@ -2814,53 +2828,198 @@ describe('reply files', () => {
     assertNoLeak({ result, lines: h.lines })
   })
 
-  test('a sendable file is uploaded through the persona client after the text', async () => {
-    const file = join(h.inboxDir, 'out.txt')
-    writeFileSync(file, 'data')
-    const session = await openPersonaSession(h.alpha)
+  // Each row's upload target is built from the ts of every posted chunk, in order.
+  test.each<[string, Record<string, unknown>, Partial<ReplySettings>, number, (posted: (string | undefined)[]) => Record<string, unknown>]>([
+    [
+      'top-level text with a mention: threaded under the text, the mention repeated',
+      { text: '<@U0OMNI001> here is the plan' },
+      {},
+      1,
+      (posted) => ({ thread_ts: posted[0], initial_comment: '<@U0OMNI001>' }),
+    ],
+    [
+      "the caller's thread_ts, text with a mention and a broadcast: in that thread, only the user mention repeated",
+      { text: '<@U0OMNI001> <!here> two files', thread_ts: MSG_TS },
+      {},
+      1,
+      () => ({ thread_ts: MSG_TS, initial_comment: '<@U0OMNI001>' }),
+    ],
+    [
+      'multi-chunk text with several and repeated mentions: under the FIRST chunk, every distinct mention once, in order',
+      { text: 'hi <@U0BBB>\n<@U0AAA> and <@U0BBB>\nlast <@U0CCC|carol>' },
+      { reply_chunk_limit: 30, reply_chunk_mode: 'newline' },
+      3,
+      (posted) => ({ thread_ts: posted[0], initial_comment: '<@U0BBB> <@U0AAA> <@U0CCC|carol>' }),
+    ],
+  ])('%s; every file goes in one upload under its own name', async (_label, args, settings, chunks, target) => {
+    const files = writeReplyFiles('plan.md', 'shot.png')
+    const posted = recordPostedTs(h.alpha)
+    const session = await openWithSettings(h.alpha, settings)
 
-    const result = await session.call('reply', { chat_id: A_ALL, text: 'here', files: [file], thread_ts: MSG_TS })
+    const result = await session.call('reply', { chat_id: A_ALL, files, ...args })
 
     expect(result.isError).toBeUndefined()
-    expect(stubOf(h.alpha).calls.postMessage).toHaveLength(1)
-    expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([{ channel_id: A_ALL, file, filename: OWN_POST_UPLOAD_FILENAME, thread_ts: MSG_TS }] as any)
+    expect(posted).toHaveLength(chunks)
+    expect(new Set(posted).size).toBe(chunks)
+    expect(result.content[0]!.text).toBe(`Sent ${chunks} message(s) + 2 file(s) to ${A_ALL} [ts: ${posted.at(-1)}]`)
+    expect(stubOf(h.alpha).callLog.map((c) => c.method)).toEqual([...Array(chunks).fill('chat.postMessage'), 'filesUploadV2'])
+    expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([{ channel_id: A_ALL, file_uploads: fileUploads('plan.md', 'shot.png'), ...target(posted) }] as any)
     expect(slackCallCount(stubOf(h.beta))).toBe(0)
-    expect(existsSync(file)).toBe(true)
+    for (const file of files) expect(existsSync(file)).toBe(true)
   })
 
-  test('a symlink re-pointed at a credentials file while the text posts is refused at its upload', async () => {
-    const plain = join(h.inboxDir, 'out.txt')
-    writeFileSync(plain, 'data')
-    const benign = join(h.inboxDir, 'benign.txt')
-    writeFileSync(benign, 'benign')
-    const link = join(h.inboxDir, 'link.txt')
-    symlinkSync(benign, link)
+  test.each<[string, Record<string, unknown>, Record<string, unknown>]>([
+    ['the channel', {}, {}],
+    ["the caller's thread", { thread_ts: MSG_TS }, { thread_ts: MSG_TS }],
+  ])('a files-only reply (text "") posts no message and uploads every file in one call to %s', async (_label, args, target) => {
+    const files = writeReplyFiles('plan.md', 'shot.png')
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: '', files, ...args })
+
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0]!.text).toBe(`Sent 0 message(s) + 2 file(s) to ${A_ALL}`)
+    expect(stubOf(h.alpha).callLog.map((c) => c.method)).toEqual(['filesUploadV2'])
+    expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([{ channel_id: A_ALL, file_uploads: fileUploads('plan.md', 'shot.png'), ...target }] as any)
+  })
+
+  test('when Slack returns no ts for the first chunk, the files go unthreaded, not under a later chunk', async () => {
+    const files = writeReplyFiles('plan.md')
+    stubOf(h.alpha).script.post.push({ kind: 'ok', result: { ts: undefined } })
+    const posted = recordPostedTs(h.alpha)
+    const session = await openWithSettings(h.alpha, { reply_chunk_limit: 5, reply_chunk_mode: 'newline' })
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: 'one\ntwo', files })
+
+    expect(result.isError).toBeUndefined()
+    expect(posted).toEqual([undefined, expect.any(String)])
+    expect(stubOf(h.alpha).callLog.map((c) => c.method)).toEqual(['chat.postMessage', 'chat.postMessage', 'filesUploadV2'])
+    expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([{ channel_id: A_ALL, file_uploads: fileUploads('plan.md') }] as any)
+  })
+
+  test('a files-only reply clears its tracked ack after the upload succeeds', async () => {
+    const files = writeReplyFiles('plan.md')
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: '', files, message_id: MSG_TS })
+
+    expect(result.isError).toBeUndefined()
+    expect(stubOf(h.alpha).callLog.map((c) => c.method)).toEqual(['filesUploadV2', 'reactions.remove'])
+    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([{ channel: A_ALL, timestamp: MSG_TS, name: 'eyes' }])
+  })
+
+  test('a files-only reply whose upload fails is a token-safe tool error and keeps its ack', async () => {
+    const files = writeReplyFiles('plan.md')
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    stubOf(h.alpha).script.upload.push({ kind: 'platform', error: 'not_in_channel' })
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: '', files, message_id: MSG_TS })
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(
+      `Tool "reply" failed for persona ${renderPersonaRef(h.alpha.name, h.alpha.key)}: the tool call failed (not_in_channel).`,
+    )
+    expect(stubOf(h.alpha).callLog.map((c) => c.method)).toEqual(['filesUploadV2'])
+    assertNoLeak({ result, lines: h.lines })
+  })
+
+  test('a symlink re-pointed at a credentials file while the text posts is refused at the recheck, and no file is uploaded', async () => {
+    const { plain, link, repoint } = recheckFiles()
     const stub = stubOf(h.alpha)
     const post = stub.web.chat.postMessage
-    let postedTs = ''
     stub.web.chat.postMessage = (async (args: Parameters<typeof post>[0]) => {
-      rmSync(link)
-      symlinkSync(h.credentialsFile, link)
-      const res = await post(args)
-      postedTs = res.ts as string
-      return res
+      repoint()
+      return post(args)
     }) as typeof post
+    const posted = recordPostedTs(h.alpha)
     const session = await openPersonaSession(h.alpha)
 
     const result = await session.call('reply', { chat_id: A_ALL, text: 'here', files: [plain, link] })
 
     expect(result.isError).toBe(true)
+    expect(posted).toEqual([expect.any(String)])
     expect(result.content[0]!.text).toBe(
       `Blocked: cannot send ${link} — it is a persona credentials file. ` +
-        `The reply text was already posted (1 message(s) to ${A_ALL} [ts: ${postedTs}]); ` +
-        '1 of 2 file(s) were uploaded before this refusal.',
+        `The reply text was already posted (1 message(s) to ${A_ALL} [ts: ${posted[0]}]); ` +
+        'none of the 2 file(s) were uploaded.',
     )
-    expect(postedTs).not.toBe('')
     expect(stub.calls.postMessage).toHaveLength(1)
-    expect(stub.calls.filesUploadV2).toEqual([{ channel_id: A_ALL, file: plain, filename: OWN_POST_UPLOAD_FILENAME }] as any)
+    expect(stub.calls.filesUploadV2).toEqual([])
+    assertNoLeak({ result, lines: h.lines })
+  })
+
+  // No text posts on a files-only reply, so the link is re-pointed when the
+  // recheck (its second check) reaches it.
+  test('a files-only reply whose recheck refuses a file uploads nothing and keeps its ack', async () => {
+    const { plain, link, repoint } = recheckFiles()
+    let linkChecks = 0
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), {
+      ...h.deps,
+      assertSendable: (p) => {
+        if (p === link && ++linkChecks === 2) repoint()
+        h.deps.assertSendable(p)
+      },
+    })
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: '', files: [plain, link], message_id: MSG_TS })
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(
+      `Blocked: cannot send ${link} — it is a persona credentials file. None of the 2 file(s) were uploaded.`,
+    )
+    expect(linkChecks).toBe(2)
+    expect(stubOf(h.alpha).callLog).toEqual([])
     assertNoLeak({ result, lines: h.lines })
   })
 })
+
+/** Write each named file, with its own name as content, into the inbox; returns the paths. */
+function writeReplyFiles(...names: string[]): string[] {
+  return names.map((name) => {
+    const path = join(h.inboxDir, name)
+    writeFileSync(path, name)
+    return path
+  })
+}
+
+/**
+ * The recheck cases' inbox files: `plain`, and `link`, a symlink to a benign
+ * inbox file until `repoint()` re-points it at the persona credentials file.
+ */
+function recheckFiles(): { plain: string; link: string; repoint(): void } {
+  const [plain, benign] = writeReplyFiles('out.txt', 'benign.txt')
+  const link = join(h.inboxDir, 'link.txt')
+  symlinkSync(benign!, link)
+  return {
+    plain: plain!,
+    link,
+    repoint: () => {
+      rmSync(link)
+      symlinkSync(h.credentialsFile, link)
+    },
+  }
+}
+
+/** The `file_uploads` entries the one upload carries for the inbox files `names`. */
+function fileUploads(...names: string[]) {
+  return names.map((name) => ({ file: join(h.inboxDir, name), filename: name }))
+}
+
+/** Record the ts of every `chat.postMessage` persona `p`'s client answers, in order (undefined when it has none). */
+function recordPostedTs(p: Persona): (string | undefined)[] {
+  const stub = stubOf(p)
+  const post = stub.web.chat.postMessage
+  const posted: (string | undefined)[] = []
+  stub.web.chat.postMessage = (async (args: Parameters<typeof post>[0]) => {
+    const res = await post(args)
+    posted.push(res.ts)
+    return res
+  }) as typeof post
+  return posted
+}
 
 // ---------------------------------------------------------------------------
 // reply files: each nested upload completion observed on the persona's client
@@ -2915,14 +3074,14 @@ describe('reply files: nested upload completions observed on the real client', (
     expect(done()).toBe(true)
   }
 
-  test('a group completed before its aggregate rejected keeps its one confirmation, counts as uploaded and clears the ack once; a later file that fails reports the partial post and nothing is posted or completed again', async () => {
+  test('a group completed before its aggregate rejected keeps its one confirmation, counts as uploaded and clears the ack once; the other group\'s failure reports the partial post and nothing is posted or completed again', async () => {
     const recording = makeRecordingOwnPostObserver()
     const ownPosts = recording.observer
     const stub = stubOf(h.alpha)
     trackAck(h.alpha.key, A_ALL, MSG_TS)
     stub.script.post.push({ kind: 'ok', result: { ts: TEXT_TS } })
-    stub.uploadGroups.push(2, 1)
-    stub.script.completeUpload.push(completion('F0DONE0001', A_ALL, SHARE_TS), { kind: 'platform', error: 'internal_error' }, { kind: 'platform', error: 'file_upload_failed' })
+    stub.uploadGroups.push(2)
+    stub.script.completeUpload.push(completion('F0DONE0001', A_ALL, SHARE_TS), { kind: 'platform', error: 'file_upload_failed' })
     const session = await openWith(h.alpha, observedDeps(ownPosts))
 
     const result = await session.call('reply', { chat_id: A_ALL, text: 'here', files: [inboxFile('one.txt'), inboxFile('two.txt')], message_id: MSG_TS })
@@ -2934,7 +3093,7 @@ describe('reply files: nested upload completions observed on the real client', (
       { kind: 'failed', code: 'file_upload_failed' },
     ])
     expectOwnPostPairs(recording, 3)
-    expect([stub.calls.postMessage.length, stub.calls.filesUploadV2.length, stub.calls.completeUploadExternal.length]).toEqual([1, 2, 3])
+    expect([stub.calls.postMessage.length, stub.calls.filesUploadV2.length, stub.calls.completeUploadExternal.length]).toEqual([1, 1, 2])
     expect(stub.calls.reactionsRemove).toEqual([REMOVE_EYES])
     expect(slackCallCount(stubOf(h.beta))).toBe(0)
     assertNoLeak({ result, lines: h.lines })
@@ -2975,7 +3134,7 @@ describe('reply files: nested upload completions observed on the real client', (
       expect(result.content[0]!.text).toBe(`Sent 1 message(s) + 1 file(s) to ${A_ALL} [ts: ${TEXT_TS}]`)
       expect(fileEndAnswers(recording)).toEqual([{ kind: 'confirmed', channel: A_ALL, file: 'F0STUB0001' }])
       expectOwnPostPairs(recording, 2)
-      expect(stub.calls.completeUploadExternal).toEqual([{ files: [{ id: 'F0STUB0001' }], channel_id: A_ALL }] as any)
+      expect(stub.calls.completeUploadExternal).toEqual([{ files: [{ id: 'F0STUB0001' }], channel_id: A_ALL, thread_ts: TEXT_TS }] as any)
     })
 
   test('concurrent uploads of one persona and of two personas each end with only their own completion, settled in reverse order', async () => {
@@ -3161,8 +3320,10 @@ describe('reply own-post call boundaries', () => {
     try {
       for (let i = 0; i < gates.length; i++) {
         await replyReached(() => recording.calls.filter(c => c.kind === 'start').length === i + 1)
-        expect(recording.calls.map(c => c.kind)).toEqual([...Array.from({ length: i }, () => ['start', 'end'] as const).flat(), 'start'])
-        expect(stub.calls.postMessage.length + stub.calls.filesUploadV2.length).toBe(i)
+        // Each chunk ends before the next starts; the files' operations all start before their one upload.
+        const ended = Math.min(i, 3)
+        expect(recording.calls.map(c => c.kind)).toEqual([...Array.from({ length: ended }, () => ['start', 'end'] as const).flat(), ...Array.from({ length: i + 1 - ended }, () => 'start' as const)])
+        expect(stub.calls.postMessage.length + stub.calls.filesUploadV2.length).toBe(ended)
         gates[i]!.resolve()
       }
       const result = await pending
@@ -3170,10 +3331,10 @@ describe('reply own-post call boundaries', () => {
       expectOwnPostPairs(recording, 5)
       expect(recording.calls.filter(c => c.kind === 'start').map(({ key, surface, target, content }) => ({ key, surface, target, content }))).toEqual([
         ...['aaa', 'bbb', 'ccc'].map(text => ({ key: h.alpha.key, surface: 'text' as const, target: { channel, parent: MSG_TS }, content: { kind: 'text' as const, text } })),
-        ...[2, 5].map(size => ({ key: h.alpha.key, surface: 'file' as const, target: { channel, parent: MSG_TS }, content: { kind: 'file' as const, name: OWN_POST_UPLOAD_FILENAME, size } })),
+        ...([['one.bin', 2], ['two.bin', 5]] as const).map(([name, size]) => ({ key: h.alpha.key, surface: 'file' as const, target: { channel, parent: MSG_TS }, content: { kind: 'file' as const, name, size } })),
       ])
       expect(stub.calls.postMessage).toEqual(['aaa', 'bbb', 'ccc'].map(text => ({ channel, text, thread_ts: MSG_TS, unfurl_links: false, unfurl_media: false })))
-      expect(stub.calls.filesUploadV2).toEqual(files.map(file => ({ channel_id: channel, file, filename: OWN_POST_UPLOAD_FILENAME, thread_ts: MSG_TS })))
+      expect(stub.calls.filesUploadV2).toEqual([{ channel_id: channel, file_uploads: fileUploads('one.bin', 'two.bin'), thread_ts: MSG_TS }] as any)
       expect(recording.calls.filter(c => c.kind === 'end').map(c => c.answer)).toEqual([
         ...[1, 2, 3].map(n => ({ kind: 'confirmed' as const, channel, ts: `1700000000.00000${n}` })),
         ...[1, 2].map(n => ({ kind: 'confirmed' as const, channel, file: `F0STUB000${n}` })),
@@ -3200,7 +3361,7 @@ describe('reply own-post call boundaries', () => {
       refuse = true; gate.resolve()
       const result = await pending
       expect(result.isError).toBe(true)
-      expect(result.content[0]!.text).toBe(`file is no longer sendable The reply text was already posted (1 message(s) to ${A_ALL} [ts: 1700000000.000001]); 0 of 1 file(s) were uploaded before this refusal.`)
+      expect(result.content[0]!.text).toBe(`file is no longer sendable The reply text was already posted (1 message(s) to ${A_ALL} [ts: 1700000000.000001]); none of the 1 file(s) were uploaded.`)
       expect(checked).toEqual([0, 0])
       expect(fileEndAnswers(recording)).toEqual([{ kind: 'failed', code: OWN_POST_UPLOAD_REFUSED }])
       expectOwnPostPairs(recording, 2)
@@ -3235,7 +3396,7 @@ describe('reply own-post call boundaries', () => {
     const session = await openReply({ ...h.deps, ownPosts: recording.observer })
     const result = await session.call('reply', { chat_id: A_ALL, text: '', files: [replyFile()] })
     expect(fileEndAnswers(recording)).toEqual([answer])
-    expectOwnPostPairs(recording, 2)
+    expectOwnPostPairs(recording, 1)
     expect(stub.calls.filesUploadV2).toHaveLength(1)
     expect(result.isError).toBe(outcome.kind === 'ok' ? undefined : true)
   })
@@ -3271,7 +3432,7 @@ describe('reply bookkeeping faults preserve posting and reaction cleanup', () =>
     const result = await session.call('reply', { chat_id: A_ALL, text: 'aaaabbbbcccc', files: [replyFile(), replyFile('two.txt')], message_id: MSG_TS })
     expect(result).toEqual({ content: [{ type: 'text', text: `Sent 3 message(s) + 2 file(s) to ${A_ALL} [ts: 1700000000.000003]` }] })
     expect(stub.calls.postMessage.map(c => 'text' in c ? c.text : undefined)).toEqual(['aaaa', 'bbbb', 'cccc'])
-    expect(stub.calls.filesUploadV2).toHaveLength(2)
+    expect(stub.calls.filesUploadV2).toHaveLength(1)
     expect(atAck).toEqual([[1, 0]])
     expect(stub.calls.reactionsRemove).toEqual([{ ...REMOVE_EYES, name: 'hourglass' }])
     expect(h.lines).toEqual([])
@@ -3280,6 +3441,7 @@ describe('reply bookkeeping faults preserve posting and reaction cleanup', () =>
   test.each([...faults])('%s: a later upload failure keeps completed parts and the first text success clears the ack', async fault => {
     const stub = stubOf(h.alpha)
     observeFileCompletions(stub.web)
+    stub.uploadGroups.push(2)
     stub.script.completeUpload.push({ kind: 'ok' }, { kind: 'platform', error: 'file_upload_failed' })
     await captureReplyAck(stub, h.alpha.key)
     const session = await openReply({ ...h.deps, ownPosts: observer(fault) })
@@ -3287,7 +3449,7 @@ describe('reply bookkeeping faults preserve posting and reaction cleanup', () =>
     expect(result.isError).toBe(true)
     expect(result.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 1, total: 1, lastTs: '1700000000.000001', uploaded: 1, files: 2 }, 'file_upload_failed'))
     expect(stub.calls.postMessage).toHaveLength(1)
-    expect(stub.calls.filesUploadV2).toHaveLength(2)
+    expect(stub.calls.filesUploadV2).toHaveLength(1)
     expect(stub.calls.reactionsRemove).toEqual([{ ...REMOVE_EYES, name: 'hourglass' }])
     expect(h.lines).toHaveLength(1)
     expect(h.lines[0]).toContain('sent=1/1 uploaded=1/2:')
@@ -3416,21 +3578,22 @@ describe('reply joins through real Thread Memory', () => {
     } finally { await finish(owner) }
   })
 
+  // A files-only reply is the one that uploads as a new channel message: with
+  // text, the files are threaded under the first chunk.
   test('a new-message upload remains pending for its thread even when completion shares name a root', async () => {
     const owner = await makeOwnPostHarness(join(h.dir, 'owner'), options)
     try {
       const { session, stub } = await openOwner(owner)
-      stub.script.post.push({ kind: 'ok', result: { ts: ROOT } })
       stub.script.completeUpload.push({ kind: 'ok', result: { files: [{ id: 'F0AWAIT001', shares: { public: { [A_ALL]: [{ ts: OTHER, thread_ts: PARENT }] } } }] } })
-      expect((await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL, files: [replyFile()] })).isError).toBeUndefined()
-      expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined')
+      expect((await session.call('reply', { chat_id: A_ALL, text: '', files: [replyFile()] })).isError).toBeUndefined()
+      expect(stub.calls.postMessage).toHaveLength(0)
       expect(owner.view('alpha', A_ALL, OTHER)).toBe('not-joined')
       expect(owner.view('alpha', A_ALL, PARENT)).toBe('not-joined')
       expect(owner.read.pendingOwnPosts('alpha', A_ALL)).toMatchObject([{ state: 'awaiting-thread' }])
       expect(owner.owner.awaitingUploads('alpha', A_ALL)).toMatchObject([{ file: 'F0AWAIT001' }])
       await owner.flush()
-      expect(registrations(owner)).toHaveLength(2)
-      expect(outcomes(owner).map(r => r.outcome)).toEqual(['joined'])
+      expect(registrations(owner)).toHaveLength(1)
+      expect(outcomes(owner)).toEqual([])
       expect(owner.memory.unresolvedIntents('alpha')).toHaveLength(1)
     } finally { await finish(owner) }
   })
@@ -3440,11 +3603,10 @@ describe('reply joins through real Thread Memory', () => {
     try {
       const stub = owner.members.h.stub(owner.members.h.p('alpha'))
       const { session } = await openOwner(owner, 'alpha', source === 'Event' ? { ownPosts: shareAtCompletion(owner, stub) } : {})
-      stub.script.post.push({ kind: 'ok', result: { ts: ROOT } })
       stub.script.completeUpload.push(completion(FILE, A_ALL, OTHER))
       history(stub) // no share yet
-      const result = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL, files: [replyFile('one.txt', LEAK_SENTINEL)] })
-      expect(result).toEqual(sent(1, ROOT))
+      const result = await session.call('reply', { chat_id: A_ALL, text: '', files: [replyFile('one.txt', LEAK_SENTINEL)] })
+      expect(result).toEqual({ content: [{ type: 'text', text: `Sent 0 message(s) + 1 file(s) to ${A_ALL}` }] })
       if (source === 'history') {
         // A complete read without the share learns nothing; the next read, once the share is listed, does.
         await replyReached(() => historyCalls(stub).length === 1)
@@ -3456,23 +3618,23 @@ describe('reply joins through real Thread Memory', () => {
       }
       await owner.flush()
       expect(owner.owner.awaitingUploads('alpha')).toEqual([])
-      expect(confirmations(owner)).toEqual([[ROOT, true], [SHARE, true]])
-      for (const ts of [ROOT, SHARE]) expect(owner.view('alpha', A_ALL, ts)).toBe('joined')
+      expect(confirmations(owner)).toEqual([[SHARE, true]])
+      expect(owner.view('alpha', A_ALL, SHARE)).toBe('joined')
       for (const ts of [OTHER, LATER]) expect(owner.view('alpha', A_ALL, ts)).toBe('not-joined')
       // A later share Event, and later time, change nothing.
       owner.lookups!.ownMessage('alpha', ownShare(stub, LATER))
       await owner.clock.advance(metadataRetryDelay(2))
       await owner.flush()
       expect(historyCalls(stub)).toHaveLength(source === 'Event' ? 0 : 2)
-      expect(confirmations(owner)).toEqual([[ROOT, true], [SHARE, true]])
+      expect(confirmations(owner)).toEqual([[SHARE, true]])
       expect(owner.view('alpha', A_ALL, LATER)).toBe('not-joined')
-      expect(stub.calls.postMessage).toHaveLength(1)
+      expect(stub.calls.postMessage).toHaveLength(0)
       expect(stub.calls.filesUploadV2).toHaveLength(1)
-      expect(outcomes(owner).map(r => r.outcome)).toEqual(['joined', 'joined'])
+      expect(outcomes(owner).map(r => r.outcome)).toEqual(['joined'])
       expect(owner.memory.unresolvedIntents('alpha')).toEqual([])
       owner = await owner.reopen()
-      for (const ts of [ROOT, SHARE]) expect(owner.view('alpha', A_ALL, ts)).toBe('joined')
-      expect(owner.records().filter(r => r.kind === 'join').map(r => r.root)).toEqual([ROOT, SHARE])
+      expect(owner.view('alpha', A_ALL, SHARE)).toBe('joined')
+      expect(owner.records().filter(r => r.kind === 'join').map(r => r.root)).toEqual([SHARE])
     } finally { await finish(owner) }
   })
 
@@ -3496,6 +3658,29 @@ describe('reply joins through real Thread Memory', () => {
       for (const ts of [PARENT, OTHER, SHARE]) expect(owner.view('alpha', A_ALL, ts)).toBe('not-joined')
       owner = await owner.reopen()
       expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined')
+      expect(owner.records().filter(r => r.kind === 'join').map(r => r.root)).toEqual([ROOT])
+    } finally { await finish(owner) }
+  })
+
+  test('a reply\'s files, threaded under its first chunk, register no intent and read no history: that root is already joined', async () => {
+    let owner = await makeOwnPostHarness(join(h.dir, 'owner'), lookupOptions)
+    try {
+      const { session, stub } = await openOwner(owner)
+      stub.script.post.push({ kind: 'ok', result: { ts: ROOT } })
+      stub.script.completeUpload.push(completion(FILE, A_ALL, OTHER))
+      history(stub, SHARE) // even a listed share of the file is never read
+      const result = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL, files: [replyFile('one.txt', LEAK_SENTINEL)] })
+      expect(result).toEqual(sent(1, ROOT))
+      expect(stub.calls.filesUploadV2).toEqual([{ channel_id: A_ALL, file_uploads: fileUploads('one.txt'), thread_ts: ROOT }] as any)
+      await owner.clock.advance(metadataRetryDelay(2))
+      await owner.flush()
+      expect(historyCalls(stub)).toEqual([])
+      expect(owner.owner.awaitingUploads('alpha')).toEqual([])
+      expect(registrations(owner)).toHaveLength(1)
+      expect(confirmations(owner)).toEqual([[ROOT, true]])
+      expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined')
+      for (const ts of [OTHER, SHARE]) expect(owner.view('alpha', A_ALL, ts)).toBe('not-joined')
+      owner = await owner.reopen()
       expect(owner.records().filter(r => r.kind === 'join').map(r => r.root)).toEqual([ROOT])
     } finally { await finish(owner) }
   })
@@ -3610,11 +3795,12 @@ describe('reply joins through real Thread Memory', () => {
       const result = await pending
       expect(result).toEqual({ content: [{ type: 'text', text: `Sent 2 message(s) + 2 file(s) to ${A_ALL} [ts: ${OTHER}]` }] })
       expect(stub.calls.postMessage.map(c => 'text' in c ? c.text : undefined)).toEqual([LEAK_SENTINEL, LEAK_SENTINEL])
-      expect(stub.calls.filesUploadV2).toHaveLength(2)
+      expect(stub.calls.filesUploadV2).toHaveLength(1)
       expect(stub.calls.reactionsRemove).toEqual([{ ...REMOVE_EYES, name: 'hourglass' }])
       expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined')
       expect(owner.view('alpha', A_ALL, OTHER)).toBe('joined')
-      expect(registrations(owner)).toHaveLength(4)
+      // The files go under the first chunk's root, already joined, so only the chunks register.
+      expect(registrations(owner)).toHaveLength(2)
       if (failure === 'unreadable') expect(readyFlags).toEqual([false, false, false, false])
       await owner.flush()
       expect(owner.threads.events.some(e => e.type === (failure === 'unreadable' ? 'read-failed' : 'append-failed'))).toBe(true)
@@ -3624,7 +3810,7 @@ describe('reply joins through real Thread Memory', () => {
       expect(partial.isError).toBe(true)
       expect(partial.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 1, total: 3, lastTs: PARENT, uploaded: 0, files: 1 }, 'not_in_channel'))
       expect(stub.calls.postMessage).toHaveLength(4)
-      expect(stub.calls.filesUploadV2).toHaveLength(2)
+      expect(stub.calls.filesUploadV2).toHaveLength(1)
       expect(owner.view('alpha', A_ALL, PARENT)).toBe('joined')
       expect(h.lines).toHaveLength(1)
       expect(h.lines[0]).toContain('sent=1/3 uploaded=0/1:')
@@ -3636,32 +3822,32 @@ describe('reply joins through real Thread Memory', () => {
     const owner = await makeOwnPostHarness(join(h.dir, 'owner'), lookupOptions)
     try {
       const { session, stub } = await openOwner(owner)
-      stub.script.post.push({ kind: 'ok', result: { ts: ROOT } })
+      stub.uploadGroups.push(2)
       stub.script.completeUpload.push(completion(FILE), { kind: 'platform', error: 'file_upload_failed' })
       if (fault === 'hung') stub.script.history.push({ kind: 'never' })
       else if (fault === 'failing') stub.script.history.push({ kind: 'platform', error: 'channel_not_found' })
       else { history(stub, SHARE); owner.io.fail('writeSync') }
       await captureReplyAck(stub, 'alpha')
-      const result = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL, files: [replyFile('one.txt', LEAK_SENTINEL), replyFile('two.txt')], message_id: MSG_TS })
+      // Files only, so the upload is a new channel message whose thread is read.
+      const result = await session.call('reply', { chat_id: A_ALL, text: '', files: [replyFile('one.txt', LEAK_SENTINEL), replyFile('two.txt')], message_id: MSG_TS })
       expect(result.isError).toBe(true)
-      expect(result.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 1, total: 1, lastTs: ROOT, uploaded: 1, files: 2 }, 'file_upload_failed'))
+      expect(result.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 0, total: 0, uploaded: 1, files: 2 }, 'file_upload_failed'))
       // Past a hung attempt's deadline and its retry.
       await owner.clock.advance(THREAD_MEMORY_LOOKUP_DEADLINE_MS + metadataRetryDelay(1))
       await owner.flush()
-      expect(stub.calls.postMessage).toHaveLength(1)
-      expect(stub.calls.filesUploadV2).toHaveLength(2)
+      expect(stub.calls.postMessage).toHaveLength(0)
+      expect(stub.calls.filesUploadV2).toHaveLength(1)
       expect(stub.calls.reactionsRemove).toEqual([{ ...REMOVE_EYES, name: 'hourglass' }])
       expect(h.lines).toHaveLength(1)
-      expect(h.lines[0]).toContain('sent=1/1 uploaded=1/2:')
+      expect(h.lines[0]).toContain('sent=0/0 uploaded=1/2:')
       expect(h.lines[0]).toContain('file_upload_failed')
-      expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined')
       expect(historyCalls(stub)).toHaveLength(fault === 'hung' ? 2 : 1)
       expect(owner.owner.awaitingUploads('alpha')).toHaveLength(fault === 'hung' ? 1 : 0)
       expect(owner.view('alpha', A_ALL, SHARE)).toBe(fault === 'appends failing' ? 'joined' : 'not-joined')
       expect(owner.lookups!.events).toMatchObject(fault === 'failing' ? [{ kind: 'joins-lost', key: 'alpha', channel: A_ALL, threads: [] }] : [])
       if (fault === 'appends failing') {
         expect(owner.threads.events.some(e => e.type === 'append-failed')).toBe(true)
-        expect(confirmations(owner)).toEqual([[ROOT, true], [SHARE, true]])
+        expect(confirmations(owner)).toEqual([[SHARE, true]])
       }
     } finally { await finish(owner) }
   })
@@ -3795,6 +3981,396 @@ describe('reply — ack reaction removal', () => {
     expect(methods.indexOf('reactions.remove')).toBeGreaterThan(methods.indexOf('chat.postMessage'))
     expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([REMOVE_EYES])
     expect(stubOf(h.beta).callLog).toEqual([])
+  })
+})
+
+// A react on the triggering message answers it like a correlated reply.
+describe('react — ack reaction removal', () => {
+  test("a react removes only its own persona's tracked ack, once, through its own client", async () => {
+    shareAlphaChannelWithBeta()
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    trackAck(h.beta.key, A_ALL, MSG_TS)
+    const alpha = await openWithSettings(h.alpha)
+
+    expect((await alpha.call('react', TOOL_ARGS.react(A_ALL))).isError).toBeUndefined()
+    await alpha.call('react', { ...TOOL_ARGS.react(A_ALL), emoji: 'tada' })
+
+    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([REMOVE_EYES])
+    expect(stubOf(h.beta).callLog).toEqual([])
+    expect(consumeAck(h.beta.key, A_ALL, MSG_TS)).toBe(true)
+  })
+
+  test.each(['Slack failure', 'dry run'] as const)('a react ending in %s consumes nothing', async outcome => {
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    if (outcome === 'Slack failure') stubOf(h.alpha).script.reactionsAdd.push({ kind: 'platform', error: 'invalid_name' })
+    else process.env['SLACK_DRY_RUN'] = '1'
+    const session = await openWithSettings(h.alpha)
+
+    const result = await session.call('react', TOOL_ARGS.react(A_ALL))
+
+    expect(result.isError === true).toBe(outcome === 'Slack failure')
+    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([])
+    expect(consumeAck(h.alpha.key, A_ALL, MSG_TS)).toBe(true)
+  })
+
+  test("a react with the ack's own emoji succeeds on already_reacted and keeps that reaction", async () => {
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    stubOf(h.alpha).script.reactionsAdd.push({ kind: 'platform', error: 'already_reacted' })
+    const session = await openWithSettings(h.alpha)
+
+    const result = await session.call('react', { ...TOOL_ARGS.react(A_ALL), emoji: 'eyes' })
+
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0]!.text).toBe(`Reacted :eyes: to ${MSG_TS}`)
+    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([])
+    expect(consumeAck(h.alpha.key, A_ALL, MSG_TS)).toBe(false)
+  })
+})
+
+// SR-6.1/SR-6.4: a successful react claims its answer through the ack
+// tracker. Only the first answer for the message and emoji, with the bot user
+// ID read with the client before the add, reaches onReactClaimed. With the
+// real react hand-off bound to it (`makeWorker`), the winning call's result
+// returns before the detached read (SR-6.2, SR-6.5), the read runs on the
+// captured client, and a losing, failed, refused or dry-run call reads nothing.
+describe('react — the first-answer claim and onReactClaimed', () => {
+  const BOT_USER = 'U0ALPHABOT'
+  const REACTED = { content: [{ type: 'text', text: `Reacted :thumbsup: to ${MSG_TS}` }] }
+  const ANSWER: Record<'ok' | 'already_reacted', SettledWebApiOutcome> = {
+    ok: { kind: 'ok' },
+    already_reacted: { kind: 'platform', error: 'already_reacted' },
+  }
+
+  /** Yield promise turns, never time, until `condition` holds; fails after a bound. */
+  async function turnsUntil(condition: () => boolean): Promise<void> {
+    const clock = createFakeClock()
+    for (let round = 0; round < 20 && !condition(); round++) await clock.flush()
+    expect(condition()).toBe(true)
+  }
+
+  /**
+   * Alpha's session with its confirmed bot user ID and a recording
+   * onReactClaimed (`told`) that passes each claim on to `worker`, then `over`.
+   */
+  async function claimSession(over: Partial<SessionToolDeps> = {}, worker?: HandoffWorker) {
+    const told: ReactClaimContext[] = []
+    const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), {
+      ...h.deps, getBotUserId: () => BOT_USER, onReactClaimed: (claim) => { told.push(claim); worker?.handoff.onReactClaimed(claim) }, ...over,
+    })
+    return { ...session, told }
+  }
+
+  const BETA_BOT = 'U0BETABOT'
+  /** Virtual time when the winning react's answer is observed, and the event ts Beta's intake must get for it. */
+  const OBSERVED_MS = 1700000000123
+  const OBSERVED_TS = '1700000000.123000'
+  /** Content the read passes over and a raw error carries; no line may hold one. */
+  const MARKERS = { body: 'reacted-body-marker', error: 'raw-error-marker' }
+  /** The reacted message as Alpha's read returns it: Beta's Tool Post, its text beside its author. */
+  const BETA_POST: SettledWebApiOutcome = { kind: 'ok', result: { messages: [{ type: 'message', ts: MSG_TS, user: BETA_BOT, text: `${MARKERS.body} ${LEAK_SENTINEL}` }] } }
+
+  type HandoffWorker = ReactHandoffFixture
+  const workers: HandoffWorker[] = []
+
+  /**
+   * The real react hand-off over the harness, as main builds it: the applied
+   * personas (`h.personas`) and confirmed bot users read at each use, a fake
+   * clock, a recording intake for A and its lines on console.error.
+   */
+  function makeWorker(): HandoffWorker {
+    const worker = makeReactHandoffFixture({
+      getAppliedPersonas: () => [...h.personas.values()],
+      identities: new Map([[h.alpha.key, BOT_USER], [h.beta.key, BETA_BOT]]),
+      clock: createFakeClock({ start: OBSERVED_MS }),
+      log: line => console.error(line),
+    })
+    workers.push(worker)
+    return worker
+  }
+
+  afterEach(async () => {
+    for (const w of workers.splice(0)) await drainReactHandoff(w)
+    for (const marker of Object.values(MARKERS)) expect(h.lines.join('\n')).not.toContain(marker)
+  })
+
+  /** What Beta's intake gets for Alpha's winning react, written out. */
+  const handedToBeta = (): { key: string; input: BotToolReactionInput } => ({
+    key: h.beta.key,
+    input: {
+      change: 'added', reactorUserId: BOT_USER, reactorPersonaName: 'Alpha Bot', emoji: 'thumbsup',
+      channel: A_ALL, messageTs: MSG_TS, eventTs: OBSERVED_TS, messageAuthorUserId: BETA_BOT,
+    },
+  })
+
+  /** Every message read on any persona's client. */
+  const reads = () => [...h.clients.values()].flatMap((stub) => stub.calls.conversationsReplies)
+
+  test.each(
+    ([['already_reacted', 'already_reacted'], ['ok', 'already_reacted'], ['already_reacted', 'ok']] as const)
+      .flatMap(([first, second]) => (['first', 'second'] as const).map((add) => [first, second, add] as const)),
+  )('overlapping reacts answered %s, then %s (the %s add answering first): only the first answer to arrive reaches onReactClaimed', async (first, second, add) => {
+    const stub = stubOf(h.alpha)
+    const adds = [makeDeferredWebApiCall(), makeDeferredWebApiCall()]
+    for (const held of adds) stub.script.reactionsAdd.push(held.outcome)
+    const { call, told } = await claimSession()
+    // What onReactClaimed had seen when each call returned, in completion order.
+    const done: { told: number; result: ToolResult }[] = []
+    const calls = [0, 1].map(() => call('react', TOOL_ARGS.react(A_ALL)).then((result) => { done.push({ told: told.length, result }) }))
+    try {
+      await turnsUntil(() => stub.calls.reactionsAdd.length === 2)
+      expect({ told: told.length, done: done.length }).toEqual({ told: 0, done: 0 })
+      const [answersFirst, answersSecond] = add === 'first' ? [adds[0]!, adds[1]!] : [adds[1]!, adds[0]!]
+      answersFirst.settle(ANSWER[first])
+      await turnsUntil(() => done.length === 1)
+      answersSecond.settle(ANSWER[second])
+      await Promise.all(calls)
+    } finally {
+      for (const held of adds) if (!held.settled) held.settle()
+      await Promise.allSettled(calls)
+    }
+    expect(done).toEqual([{ told: 1, result: REACTED }, { told: 1, result: REACTED }])
+    expect(told.map(({ persona, client, ...rest }) => rest)).toEqual([{ botUserId: BOT_USER, chatId: A_ALL, messageId: MSG_TS, emoji: 'thumbsup' }])
+    expect(told[0]!.persona).toBe(h.alpha)
+    expect(told[0]!.client).toBe(asWebClient(stub.web))
+    expect(stubOf(h.beta).callLog).toEqual([])
+  })
+
+  test("an injected claim is asked once per successful react with the persona's key, target and emoji; its false answer reaches onReactClaimed before any promise turn, its true answer never does, so the losing react's hand-off reads nothing", async () => {
+    const events: string[] = [], asked: Parameters<typeof claimReactAnswer>[] = [], told: ReactClaimContext[] = []
+    const w = makeWorker()
+    stubOf(h.alpha).script.replies.push(BETA_POST)
+    const { call } = await claimSession({
+      consumeAck: (key, channel, ts, remove, kept) => {
+        events.push('consumeAck')
+        return remove ? consumeAck(key, channel, ts, remove, kept) : consumeAck(key, channel, ts)
+      },
+      claimReactAnswer: (...args) => {
+        asked.push(args)
+        const held = claimReactAnswer(...args)
+        events.push(`claim:${held}`)
+        queueMicrotask(() => events.push('turn'))
+        return held
+      },
+      onReactClaimed: (claim) => { events.push('claimed'); told.push(claim); w.handoff.onReactClaimed(claim) },
+    })
+
+    expect(await call('react', TOOL_ARGS.react(A_ALL))).toEqual(REACTED)
+    expect(await call('react', TOOL_ARGS.react(A_ALL))).toEqual(REACTED)
+    await w.clock.advance(1)
+    await turnsUntil(() => w.intakes.length > 0)
+    await w.clock.advance(NAME_LOOKUP_TIMEOUT_MS)
+
+    expect(events).toEqual(['claim:false', 'claimed', 'turn', 'claim:true', 'turn'])
+    expect(asked.map((args) => args.slice(0, 4))).toEqual([0, 1].map(() => [h.alpha.key, A_ALL, MSG_TS, 'thumbsup']))
+    expect(asked.map((args) => typeof args[4])).toEqual(['function', 'function'])
+    expect(told).toHaveLength(1)
+    expect(stubOf(h.beta).callLog).toEqual([])
+    expect({ reads: reads().length, intakes: w.intakes }).toEqual({ reads: 1, intakes: [handedToBeta()] })
+  })
+
+  test("clientFor and getBotUserId are read together after onReplyCall, before the add; a client and bot user ID swapped while the add is held never reach the winning context or its hand-off's read and intake", async () => {
+    const events: string[] = [], told: ReactClaimContext[] = []
+    const key = h.alpha.key, original = stubOf(h.alpha), add = original.web.reactions.add
+    original.web.reactions.add = (args) => { events.push('reactions.add'); return add(args) }
+    const held = makeDeferredWebApiCall()
+    original.script.reactionsAdd.push(held.outcome)
+    original.script.replies.push(BETA_POST)
+    const w = makeWorker()
+    let botUser = BOT_USER
+    const { call } = await claimSession({
+      onReplyCall: async () => { events.push('onReplyCall') },
+      clientFor: (k) => { events.push(`clientFor:${k}`); queueMicrotask(() => events.push('turn')); return h.deps.clientFor(k) },
+      getBotUserId: (k) => { events.push(`getBotUserId:${k}`); return botUser },
+      onReactClaimed: (claim) => { told.push(claim); w.handoff.onReactClaimed(claim) },
+    })
+
+    const reacting = call('react', TOOL_ARGS.react(A_ALL))
+    try {
+      await turnsUntil(() => original.calls.reactionsAdd.length === 1)
+      expect(events.slice(0, 3)).toEqual(['onReplyCall', `clientFor:${key}`, `getBotUserId:${key}`])
+      expect(events.indexOf('reactions.add')).toBeGreaterThan(2)
+      const replacement = makeStubSlack({ token: fakeToken(BOT_TOKEN_PREFIX, 'alpha-2'), leakMarker: LEAK_SENTINEL })
+      h.clients.set(key, replacement)
+      botUser = 'U0SWAPPED'
+      w.identities.set(key, botUser)
+      held.settle()
+      expect(await reacting).toEqual(REACTED)
+      await w.clock.advance(1)
+      await turnsUntil(() => w.intakes.length > 0)
+      expect(replacement.callLog).toEqual([])
+    } finally {
+      if (!held.settled) held.settle()
+      await Promise.allSettled([reacting])
+      await w.handoff.stop()
+    }
+    expect(told).toHaveLength(1)
+    expect(told[0]!.client).toBe(asWebClient(original.web))
+    expect(told[0]!.botUserId).toBe(BOT_USER)
+    expect(events.filter((e) => /^(clientFor|getBotUserId):/.test(e))).toEqual([`clientFor:${key}`, `getBotUserId:${key}`])
+    // The hand-off read on the client and reacted as the bot user captured with the claim.
+    expect(original.callLog.map((c) => c.method)).toEqual(['reactions.add', 'conversations.replies'])
+    expect(original.calls.conversationsReplies.map(({ channel, ts }) => ({ channel, ts }))).toEqual([{ channel: A_ALL, ts: MSG_TS }])
+    expect(w.intakes).toEqual([handedToBeta()])
+  })
+
+  test.each<[string, Pick<SessionToolDeps, 'getBotUserId'>]>([
+    ['no getBotUserId', {}],
+    ['getBotUserId answering undefined', { getBotUserId: () => undefined }],
+    ['getBotUserId answering an empty ID', { getBotUserId: () => '' }],
+  ])('%s: a successful react still makes its one real claim, returns its result, records its reply call and removes its ack, and tells onReactClaimed nothing, so its hand-off reads nothing', async (_label, identity) => {
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    const asked: boolean[] = [], replyCalls: string[] = [], told: ReactClaimContext[] = []
+    const w = makeWorker()
+    const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), {
+      ...h.deps, ...identity,
+      onReplyCall: (key) => { replyCalls.push(key) },
+      claimReactAnswer: (...args) => { const held = claimReactAnswer(...args); asked.push(held); return held },
+      onReactClaimed: (claim) => { told.push(claim); w.handoff.onReactClaimed(claim) },
+    })
+
+    expect(await session.call('react', TOOL_ARGS.react(A_ALL))).toEqual(REACTED)
+    await turnsUntil(() => stubOf(h.alpha).calls.reactionsRemove.length > 0)
+    const fired = await w.clock.advance(NAME_LOOKUP_TIMEOUT_MS)
+
+    expect({ asked, replyCalls, told, removed: stubOf(h.alpha).calls.reactionsRemove, fired, reads: reads(), intakes: w.intakes })
+      .toEqual({ asked: [false], replyCalls: [h.alpha.key], told: [], removed: [REMOVE_EYES], fired: 0, reads: [], intakes: [] })
+    expect(claimReactAnswer(h.alpha.key, A_ALL, MSG_TS, 'thumbsup')).toBe(true)
+  })
+
+  test.each(['Slack failure', 'scope refusal', 'dry run'] as const)('a react ending in %s makes no claim, tells onReactClaimed nothing and its hand-off reads nothing', async (outcome) => {
+    const asked: Parameters<typeof claimReactAnswer>[] = []
+    if (outcome === 'Slack failure') stubOf(h.alpha).script.reactionsAdd.push({ kind: 'platform', error: 'invalid_name' })
+    if (outcome === 'dry run') process.env['SLACK_DRY_RUN'] = '1'
+    const target = outcome === 'scope refusal' ? B_CHANNEL : A_ALL
+    const w = makeWorker()
+    const { call, told } = await claimSession({ claimReactAnswer: (...args) => { asked.push(args); return claimReactAnswer(...args) } }, w)
+
+    const result = await call('react', TOOL_ARGS.react(target))
+    const fired = await w.clock.advance(NAME_LOOKUP_TIMEOUT_MS)
+
+    expect(result.isError === true).toBe(outcome !== 'dry run')
+    expect({ asked, told, fired, reads: reads(), intakes: w.intakes }).toEqual({ asked: [], told: [], fired: 0, reads: [], intakes: [] })
+    expect(claimReactAnswer(h.alpha.key, target, MSG_TS, 'thumbsup')).toBe(false)
+  })
+
+  test('a react with no onReactClaimed still records its answer: the same react afterwards with the callback is not first, another emoji is', async () => {
+    const plain = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), { ...h.deps, getBotUserId: () => BOT_USER })
+    expect(await plain.call('react', TOOL_ARGS.react(A_ALL))).toEqual(REACTED)
+    const { call, told } = await claimSession()
+
+    expect(await call('react', TOOL_ARGS.react(A_ALL))).toEqual(REACTED)
+    expect(told).toEqual([])
+    expect((await call('react', { ...TOOL_ARGS.react(A_ALL), emoji: 'tada' })).isError).toBeUndefined()
+    expect(told.map((claim) => claim.emoji)).toEqual(['tada'])
+  })
+
+  test.each<[string, Partial<SessionToolDeps>]>([
+    ['onReactClaimed throws', { onReactClaimed: () => { throw new Error('hand-off failed') } }],
+    ['the claim throws', { claimReactAnswer: () => { throw new Error('claim failed') } }],
+  ])('%s: the react returns its exact success result and no first answer is invented', async (_label, over) => {
+    const { call, told } = await claimSession(over)
+
+    expect(await call('react', TOOL_ARGS.react(A_ALL))).toEqual(REACTED)
+    expect(told).toEqual([])
+  })
+
+  test('a held legacy ack removal delays neither onReactClaimed nor the result, and its later failure changes neither', async () => {
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    const removal = makeDeferredWebApiCall()
+    stubOf(h.alpha).script.reactionsRemove.push(removal.outcome)
+    let removalWork: Promise<unknown> | undefined
+    const claims: boolean[] = []
+    const removals: string[] = []
+    const { call, told } = await claimSession({
+      claimReactAnswer: (key, channel, ts, emoji, remove) => {
+        const held = claimReactAnswer(key, channel, ts, emoji, async () => {
+          removalWork = remove!()
+          try { await removalWork } catch (error) {
+            removals.push('failed')
+            throw error
+          }
+        })
+        claims.push(held)
+        return held
+      },
+    })
+
+    try {
+      const result = await call('react', TOOL_ARGS.react(A_ALL))
+      expect(result).toEqual(REACTED)
+      expect(told).toHaveLength(1)
+      await turnsUntil(() => stubOf(h.alpha).calls.reactionsRemove.length > 0)
+      expect(removal.settled).toBe(false)
+      removal.settle({ kind: 'platform', error: 'internal_error' })
+      await turnsUntil(() => removals.length === 1)
+    } finally {
+      if (!removal.settled) removal.settle()
+      await Promise.allSettled([removalWork])
+    }
+    expect({ claims, removals, results: h.results }).toEqual({ claims: [false], removals: ['failed'], results: [REACTED] })
+    expect(told).toHaveLength(1)
+    expect(told[0]!.client).toBe(asWebClient(stubOf(h.alpha).web))
+    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([REMOVE_EYES])
+    expect(allCallLogs()).toEqual({ [h.alpha.key]: ['reactions.add', 'reactions.remove'], [h.beta.key]: [] })
+  })
+
+  test("with the real hand-off bound, the winning react's exact result returns before its read is due; the read then runs on Alpha's captured client, and Beta, not subscribed to the conversation, gets the whole bot-tool input while the result stays as returned", async () => {
+    const w = makeWorker()
+    const stub = stubOf(h.alpha)
+    const read = makeDeferredWebApiCall()
+    stub.script.replies.push(read.outcome)
+    w.releases.push(() => { if (!read.settled) read.settle() })
+    let answerIntake: (result: BotToolReactionIntakeResult) => void = () => {}
+    w.answer = () => new Promise((resolve) => { answerIntake = resolve })
+    w.releases.push(() => answerIntake({ status: 'stored', seq: 1 }))
+    const { call } = await claimSession({ onReactClaimed: w.handoff.onReactClaimed })
+
+    const result = await call('react', TOOL_ARGS.react(A_ALL))
+    expect(result).toEqual(REACTED)
+    expect(w.clock.pending().map((t) => t.delayMs)).toEqual([0])
+    expect({ calls: allCallLogs(), intakes: w.intakes }).toEqual({ calls: { [h.alpha.key]: ['reactions.add'], [h.beta.key]: [] }, intakes: [] })
+
+    await w.clock.advance(1)
+    expect(stub.calls.conversationsReplies.map(({ channel, ts }) => ({ channel, ts }))).toEqual([{ channel: A_ALL, ts: MSG_TS }])
+    expect(w.intakes).toEqual([])
+    read.settle(BETA_POST)
+    await turnsUntil(() => w.intakes.length > 0)
+    expect(w.intakes).toEqual([handedToBeta()])
+    expect(h.beta.channels.map((c) => c.id)).not.toContain(A_ALL)
+    expect(h.results).toEqual([REACTED])
+
+    answerIntake({ status: 'stored', seq: 1 })
+    await w.handoff.stop()
+    expect(result).toEqual(REACTED)
+    expect({ results: h.results, lines: h.lines, calls: allCallLogs() })
+      .toEqual({ results: [REACTED], lines: [], calls: { [h.alpha.key]: ['reactions.add', 'conversations.replies'], [h.beta.key]: [] } })
+  })
+
+  test.each<[string, ReactionHandoffFailureReason]>([
+    ["Alpha's read of the reacted message is rejected", 'read-failed'],
+    ["Beta's intake rejects the hand-off", 'handoff-rejected'],
+  ])("%s: the successful react's result is unchanged, one content-free line names the failure, no notice is posted and nothing retries", async (_label, reason) => {
+    const w = makeWorker()
+    const raw = new Error(`${MARKERS.error} ${LEAK_SENTINEL}`)
+    const readFails = reason === 'read-failed'
+    stubOf(h.alpha).script.replies.push(readFails ? { kind: 'reject', value: raw } : BETA_POST)
+    w.answer = () => Promise.reject(raw)
+    const { call } = await claimSession({ onReactClaimed: w.handoff.onReactClaimed })
+
+    const result = await call('react', TOOL_ARGS.react(A_ALL))
+    await w.clock.advance(1)
+    await turnsUntil(() => h.lines.length > 0)
+    await w.clock.advance(NAME_LOOKUP_TIMEOUT_MS * 2)
+
+    expect({ result, results: h.results }).toEqual({ result: REACTED, results: [REACTED] })
+    expect(h.lines).toEqual([buildReactionHandoffFailedLine({
+      reactor: { key: h.alpha.key, name: h.alpha.name },
+      ...(readFails ? {} : { receiver: { key: h.beta.key, name: h.beta.name } }),
+      chat_id: A_ALL, message_ts: MSG_TS, reason,
+    })])
+    expect(w.intakes).toEqual(readFails ? [] : [handedToBeta()])
+    expect(allCallLogs()).toEqual({ [h.alpha.key]: ['reactions.add', 'conversations.replies'], [h.beta.key]: [] })
+    expect(w.clock.pendingCount()).toBe(0)
   })
 })
 
@@ -3947,7 +4523,7 @@ describe('tool list and instructions', () => {
     const points = [
       'The sender reads Slack', 'Messages arrive as the <channel> tag described in the system prompt',
       'via:', '<@ID>', 'attachment_count', 'In strict mode', SET_CHANNEL_DELIVERY_TOOL,
-      'Thread Memory notices', 'With DMs on', 'Pass message_id', 'reply accepts files',
+      'Thread Memory notices', 'With DMs on', 'To remove the ack reaction', 'reply accepts files',
     ]
     expect(MCP_INSTRUCTIONS.split('\n')).toHaveLength(points.length)
     let last = -1
@@ -3963,9 +4539,10 @@ describe('tool list and instructions', () => {
     expect(MCP_INSTRUCTIONS).not.toMatch(/participat|followed[ -]thread/i)
     expect(via.split(';').find(reason => reason.trim().startsWith('thread ='))).not.toMatch(/whole.channel|exclusive|only (?:you|this persona)/i)
     expect(MCP_INSTRUCTIONS).toMatch(/<@ID> mentions a Slack user or persona/)
+    expect(MCP_INSTRUCTIONS).toContain('end a turn with no terminal text unless a terminal reader needs it.')
     expect(MCP_INSTRUCTIONS).toMatch(/user ID \(U\.\.\. or W\.\.\.\) as chat_id/)
     expect(MCP_INSTRUCTIONS).toContain('With DMs off you have no DM target. Any other target is refused.')
-    expect(MCP_INSTRUCTIONS).toContain('to reply to remove the ack reaction')
+    expect(MCP_INSTRUCTIONS).toContain('To remove the ack reaction, reply with message_id (the triggering message ts) or react to that message.')
     const lastLine = MCP_INSTRUCTIONS.split('\n').at(-1)!
     expect(lastLine).toMatch(/fetch_messages.*thread_hybrid.*next_cursor.*cursor.*whole thread/)
     expect(MCP_INSTRUCTIONS).not.toContain('conversations.history')
@@ -3987,6 +4564,17 @@ describe('tool list and instructions', () => {
       expect(description).not.toMatch(/participat|followed[ -]thread/i)
     }
     expect(delivery.description).toContain('"thread_hybrid" (mentions and replies in threads the bot is in)')
+  })
+
+  // CSCB knows only the personas on this server, so receive_all claims no more.
+  test('the via line scopes receive_all to personas on this server', async () => {
+    const { client } = await openPersonaSession(h.alpha)
+    const via = client.getInstructions()!.split('\n').find(line => line.startsWith('via:'))!
+    const clause = 'receive_all = a channel where you, and no other persona on this server, receive every message.'
+    const at = via.search(/\breceive_all =/)
+
+    expect(via.slice(at, at + clause.length)).toBe(clause)
+    expect(via).not.toContain('only you')
   })
 })
 

@@ -268,13 +268,14 @@ if (import.meta.main) {
     else if (command === 'wait' && args.length === 7) {
       const [started, state, key, shim, root, expectedPath, seq] = args, caseNumber = Number(seq), waitStarted = Number(started)
       if (!integer(waitStarted) || waitStarted > Date.now()) throw new Error('original wait start unavailable')
-      if (![1, 2].includes(caseNumber) || scope(directory) !== caseNumber || process.env.REAL_AGENT_MODEL_PIN !== 'azure/openai/gpt-6-astra') throw new Error('completion identity changed')
+      if (![1, 2].includes(caseNumber) || scope(directory) !== caseNumber || process.env.REAL_AGENT_MODEL_PIN !== 'aws/anthropic/bedrock-claude-opus-5-5') throw new Error('completion identity changed')
       const adapters = await packedReceiptAdapters(), expected = JSON.parse(readFileSync(expectedPath!, 'utf8'))
       const completed = async () => { try {
         const paths = transcriptFiles(root!), all = readTranscripts(paths, adapters), journal = receiptJournal(state!, key!)
         auditReceipts({ stateDir: state!, key: key!, shimLog: shim!, transcripts: paths }, all, adapters)
-        const own = personaTranscripts(key!, journal, readFileSync(join(state!, 'server.log'), 'utf8').split('\n'), all)
-        completedAIReadback({ seq: caseNumber, expected, journal, own, adapters, model: process.env.REAL_AGENT_MODEL_PIN! }); return true
+        const log = readFileSync(join(state!, 'server.log'), 'utf8').split('\n')
+        const own = personaTranscripts(key!, journal, log, all)
+        completedAIReadback({ seq: caseNumber, expected, journal, own, adapters, model: process.env.REAL_AGENT_MODEL_PIN!, key: key!, log }); return true
       } catch { return false } }
       const retryObserved = () => {
         const events = readFileSync(join(directory, 'gateway.jsonl'), 'utf8').split('\n').slice(0, -1).filter(Boolean).map(line => JSON.parse(line))

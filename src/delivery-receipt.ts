@@ -1,20 +1,26 @@
 /** Transcript I/O and schemas are private to this adapter. */
 import * as nodeFs from 'node:fs'
 import { locateTranscript } from './session-transcript.ts'
-import type { QueueItem, SentRecord, DeliveredRecord } from './delivery-queue.ts'
+import { parseLaunchStart } from './pending-row.ts'
+import { createQueueItemReader, type DeliveryQueue, type QueueItem, type SentRecord, type DeliveredRecord } from './delivery-queue.ts'
 
 export type DeliveryAgent = 'claude' | 'codex'
 
 export interface DeliveryTranscriptRow {
   jsonl_path?: string; session_id?: string; cwd?: string; transcript_status?: string
+  launch_started_at?: string | null
   prior_sessions?: readonly { jsonl_path?: string; session_id?: string; cwd?: string }[]
 }
 export interface ReceiptRecord { path: string; offset: number; end: number; uuid?: string; at?: number; text: string; kind: string }
 export interface ReceiptObservation {
   path: string; size: number; availability: 'readable' | 'not-yet-written' | 'unreadable'
   records: readonly ReceiptRecord[]; receipt?: ReceiptRecord
+  partialReceipt?: ReceiptRecord & { receivedBytes: number }
 }
 const TRANSCRIPT_READ_BYTES = 256 * 1024
+const MIN_PARTIAL_BYTES = 128
+const MIN_PARTIAL_NONSPACE_CHARACTERS = 96
+const MIN_PARTIAL_DISTINCT_FOURS = 48
 const object = (v: unknown): Record<string, any> | undefined => typeof v === 'object' && v !== null && !Array.isArray(v) ? v as Record<string, any> : undefined
 function textBlocks(value: unknown, type: string): string | undefined {
   if (typeof value === 'string') return value
@@ -49,6 +55,33 @@ export function receiptTextMatches(record: string, expected: string): boolean {
   }
   return match(0, 0, 0)
 }
+/** Evidence only: a substantial, varied, exact proper suffix. Whitespace is
+ * ignored only for the distinctiveness check, never for receipt matching. */
+function distinctiveSuffix(text: string): boolean {
+  if (Buffer.byteLength(text) < MIN_PARTIAL_BYTES) return false
+  const characters = Array.from(text.replace(/\s/g, ''))
+  if (characters.length < MIN_PARTIAL_NONSPACE_CHARACTERS) return false
+  const fours = new Set<string>()
+  for (let i = 0; i + 4 <= characters.length; i++) {
+    fours.add(characters.slice(i, i + 4).join(''))
+    if (fours.size >= MIN_PARTIAL_DISTINCT_FOURS) return true
+  }
+  return false
+}
+function partialReceiptBytes(record: string, expected: string): number | undefined {
+  if (record.length < expected.length && expected.endsWith(record) && distinctiveSuffix(record)) return Buffer.byteLength(record)
+  // Bound the possible suffix lengths using only the exact matcher's paste
+  // frames and optional adjacent LFs. The matcher still validates every byte;
+  // this does not trim whitespace or accept arbitrary embedded quotations.
+  const frames = [...record.matchAll(/<pasted_content id="([^"]+)">\n([\s\S]*?)\n<\/pasted_content id="\1">/g)]
+  const longest = frames.reduce((length, frame) => length - frame[0].length + frame[2]!.length, record.length)
+  const shortest = Math.max(1, longest - 4 * frames.length)
+  for (let length = Math.min(longest, expected.length - 1); length >= shortest; length--) {
+    const suffix = expected.slice(-length)
+    if (distinctiveSuffix(suffix) && receiptTextMatches(record, suffix)) return Buffer.byteLength(suffix)
+  }
+  return undefined
+}
 export function parseDeliveryTranscriptRecord(agent: DeliveryAgent, value: unknown): { text?: string; kind: string; uuid?: string } {
   const e = object(value); if (!e) return { kind: 'other' }
   const uuid = typeof e.uuid === 'string' ? e.uuid : undefined
@@ -71,7 +104,8 @@ export function deliveryTranscriptPath(agent: DeliveryAgent, row: DeliveryTransc
 }
 interface CachedFile { dev: number; ino: number; size: number; pending: Buffer; records: ReceiptRecord[] }
 export interface DeliveryReceiptReader {
-  read(agent: DeliveryAgent, row: DeliveryTranscriptRow, item: QueueItem, part: number, allItems?: readonly QueueItem[]): ReceiptObservation
+  /** partialAfterAttempt excludes old-life diagnostics only, never full receipts. */
+  read(agent: DeliveryAgent, row: DeliveryTranscriptRow, item: QueueItem, part: number, allItems?: readonly QueueItem[], partialAfterAttempt?: number): ReceiptObservation
   forget(): void
 }
 function receiptIdentity(receipt: { path: string; uuid?: string; offset?: number }): string {
@@ -80,14 +114,36 @@ function receiptIdentity(receipt: { path: string; uuid?: string; offset?: number
 /** Open NONBLOCK, fstat before reading, and consume only appended bytes. A
  * missing new session and an existing empty file are not read failures. */
 export function createDeliveryReceiptReader(options: { fs?: typeof nodeFs } = {}): DeliveryReceiptReader {
-  const fs = options.fs ?? nodeFs, files = new Map<string, CachedFile>()
+  return createReader(options.fs ?? nodeFs)
+}
+/** Internal engine adapter. Keep its change cursor independent of policy
+ * refreshes: a send's window freezes only when a receipt read first sees it. */
+export function createQueueDeliveryReceiptReader(queue: DeliveryQueue, key: string): DeliveryReceiptReader {
+  let read = createQueueItemReader(queue, key)
+  return createReader(nodeFs, { read: () => read(), forget: () => { read = createQueueItemReader(queue, key) } })
+}
+function createReader(fs: typeof nodeFs, source?: { read(): { reset: boolean; items: QueueItem[] }; forget(): void }): DeliveryReceiptReader {
+  const files = new Map<string, CachedFile>()
+  // Counts preserve exclusion if two retained items credit the same identity.
+  // A rebuild drops credits removed by compaction, but never refreezes sends.
+  const credits = new Map<string, number>(), itemCredits = new Map<number, Set<string>>()
+  function updateCredits(item: QueueItem): void {
+    const seq = item.accepted.seq
+    for (const id of itemCredits.get(seq) ?? []) {
+      const count = credits.get(id)! - 1
+      if (count) credits.set(id, count); else credits.delete(id)
+    }
+    const ids = new Set(item.records.filter((r): r is DeliveredRecord => r.kind === 'delivered').map(r => receiptIdentity(r.receipt)))
+    if (ids.size) itemCredits.set(seq, ids); else itemCredits.delete(seq)
+    for (const id of ids) credits.set(id, (credits.get(id) ?? 0) + 1)
+  }
   // Freeze each known file's pre-send EOF when the durable attempt first
-  // appears. An absent entry means the file was discovered after that send,
-  // so its entire contents are eligible. Keep this independently of
-  // the parsed cache, including when a file cannot currently be opened.
+  // appears. Unknown EOFs permit searching entire files for full receipts;
+  // partial evidence needs additional post-send proof. Keep these windows
+  // independently of the parsed cache, even when a file cannot be opened.
   const observed = new Map<string, number>(), windows = new Map<string, ReadonlyMap<string, number>>()
   const sendIdentity = (seq: number, send: SentRecord): string => `${seq}:${send.part}:${send.attempt}`
-  function readFile(agent: DeliveryAgent, path: string, missingAllowed: boolean): { size: number; availability: ReceiptObservation['availability']; records: readonly ReceiptRecord[] } {
+  function readFile(agent: DeliveryAgent, path: string, missingAllowed: boolean): { size: number; availability: ReceiptObservation['availability']; gone?: boolean; records: readonly ReceiptRecord[] } {
     let fd: number | undefined, observedSize: number | undefined
     try {
       // EOF is still meaningful when opening a regular file is refused.
@@ -121,17 +177,20 @@ export function createDeliveryReceiptReader(options: { fs?: typeof nodeFs } = {}
       }
       return { size: st.size, availability: st.size ? 'readable' : 'not-yet-written', records: c.records }
     } catch (err) {
-      const c = files.get(path)
-      return { size: observedSize ?? c?.size ?? 0, availability: missingAllowed && (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'not-yet-written' : 'unreadable', records: c?.records ?? [] }
+      const c = files.get(path), code = (err as NodeJS.ErrnoException).code
+      return { size: observedSize ?? c?.size ?? 0, availability: missingAllowed && code === 'ENOENT' ? 'not-yet-written' : 'unreadable', gone: code === 'ENOENT' || code === 'ENOTDIR', records: c?.records ?? [] }
     } finally { if (fd !== undefined) try { fs.closeSync(fd) } catch {} }
   }
   return {
-    forget() { files.clear(); observed.clear(); windows.clear() },
-    read(agent, row, item, part, allItems = [item]) {
+    forget() { files.clear(); observed.clear(); windows.clear(); credits.clear(); itemCredits.clear(); source?.forget() },
+    read(agent, row, item, part, allItems = [item], partialAfterAttempt = 0) {
+      const changes = source?.read()
+      if (changes?.reset) { credits.clear(); itemCredits.clear() }
+      if (changes) for (const queued of changes.items) updateCredits(queued)
       // Register all durable sends before discovering/reading this lap's
       // files. This also preserves the discovery order when the next FIFO
       // head is first observed after another item's receipt was read.
-      for (const queued of allItems) {
+      for (const queued of changes?.items ?? allItems) {
         for (const record of queued.records) {
           if (record.kind !== 'sent' || 'unknown_outcome' in record) continue
           const identity = sendIdentity(queued.accepted.seq, record)
@@ -145,14 +204,26 @@ export function createDeliveryReceiptReader(options: { fs?: typeof nodeFs } = {}
       const records: ReceiptRecord[] = []
       const availability = new Map<string, ReceiptObservation['availability']>()
       let size = 0, unreadable = false
-      const credited = new Set(allItems.flatMap(i => i.records.filter((r): r is DeliveredRecord => r.kind === 'delivered').map(r => receiptIdentity(r.receipt))))
+      const credited = source ? credits : new Set(allItems.flatMap(i => i.records.filter((r): r is DeliveredRecord => r.kind === 'delivered').map(r => receiptIdentity(r.receipt))))
       const inWindow = (r: ReceiptRecord, send: SentRecord | undefined): boolean => send
         ? r.offset >= (r.path === send.transcript_path ? send.transcript_size : windows.get(sendIdentity(item.accepted.seq, send))?.get(r.path) ?? 0)
         : !!unknown && r.at !== undefined && r.at >= unknown.at
+      const inPartialWindow = (r: ReceiptRecord, send: SentRecord): boolean => {
+        if (r.at !== undefined && r.at < send.at) return false
+        const start = r.path === send.transcript_path ? send.transcript_size : windows.get(sendIdentity(item.accepted.seq, send))?.get(r.path)
+        if (start !== undefined) return r.offset >= start
+        // Replay and late discovery cannot recover a prior path's pre-send EOF.
+        // Without one, require dated evidence on AD's current path; partialSend
+        // below binds that path's session to the send and its launch.
+        return r.path === path && !!row.session_id && r.at !== undefined && r.at >= send.at
+      }
       for (const p of paths) {
         const current = p === path
         const f = readFile(agent, p, current && row.transcript_status !== 'present')
         observed.set(p, f.size)
+        // A removed historical file can hold no new evidence; only AD's
+        // current path and files that exist decide availability.
+        if (!current && f.gone) continue
         availability.set(p, f.availability)
         if (current) size = f.size
         if (f.availability === 'unreadable') unreadable = true
@@ -160,7 +231,19 @@ export function createDeliveryReceiptReader(options: { fs?: typeof nodeFs } = {}
       }
       const text = item.fixed?.parts[part - 1] ?? ''
       const receipt = records.find(r => availability.get(r.path) === 'readable' && r.kind === 'take-in' && inWindow(r, first) && receiptTextMatches(r.text, text) && !credited.has(receiptIdentity(r)))
-      return { path, size, availability: unreadable ? 'unreadable' : size ? 'readable' : 'not-yet-written', records, receipt }
+      // Full historical receipts may still finish delivery after a relaunch.
+      // Partial diagnostics instead belong to a known send in this AD life.
+      // Replay uses durable send time/session plus AD's launch start; observed
+      // lifecycle transitions also exclude all attempts preceding that change.
+      const launchAt = row.launch_started_at == null ? -Infinity : parseLaunchStart(row.launch_started_at)
+      const partialSend = launchAt === undefined ? undefined : sends.find(s => s.attempt > partialAfterAttempt && s.session_id === row.session_id && s.at >= launchAt)
+      let partialReceipt: ReceiptObservation['partialReceipt']
+      if (!receipt && partialSend) for (const r of records) {
+        if (availability.get(r.path) !== 'readable' || r.kind !== 'take-in' || !inPartialWindow(r, partialSend) || credited.has(receiptIdentity(r))) continue
+        const receivedBytes = partialReceiptBytes(r.text, text)
+        if (receivedBytes !== undefined) { partialReceipt = { ...r, receivedBytes }; break }
+      }
+      return { path, size, availability: unreadable ? 'unreadable' : size ? 'readable' : 'not-yet-written', records, receipt, partialReceipt }
     },
   }
 }

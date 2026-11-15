@@ -34,7 +34,7 @@ printed() { bun "${PRINTER}" "$@" || fail "printer entry $1 failed"; }
 session_connected() {
     matcher "[slack] Session connected: persona $1"
 }
-declare -A NAME KEY WORK CREDS LABEL SNAP MANUAL INPUTS INJECTED
+declare -A NAME KEY WORK CREDS LABEL SNAP MANUAL INPUTS INJECTED RESTART_RELEASED
 for who in p q; do
     NAME[${who}]="${SCENARIO_TAG}_${who}"
     KEY[${who}]="$(persona_key "${NAME[${who}]}")"
@@ -156,10 +156,36 @@ queued_total() {
     jq -s --arg c "${channel}" --arg ts "${ts}" --arg via "${via}" \
         '[.[]|select(.kind=="accepted" and (has("compact")|not) and .channel==$c and .ts==$ts and ($via=="" or .via==$via))]|length' "${SNAP[${who}]}"
 }
+# accept_observe <who> <channel> <ts> <via>: at a timed-out acceptance wait,
+# the queue journal's counts and whitelisted record fields, never text,
+# files or tokens. Output only; it decides nothing.
+accept_observe() {
+    local who="$1" channel="$2" ts="$3" via="$4" journal
+    journal="${SLACK_STATE_DIR}/queue/${KEY[${who}]}.jsonl"
+    printf 'accept-observe: persona=%s channel=%s ts=%s via=%s failed\n' "${KEY[${who}]}" "${channel}" "${ts}" "${via:-any}"
+    if [[ ! -f "${journal}" || -L "${journal}" ]]; then printf 'accept-observe: journal=absent\n'; return 0; fi
+    jq -n -r -R --arg c "${channel}" --arg ts "${ts}" --arg via "${via}" '
+        def safe: if . == null then "absent" else tostring | if test("^[A-Za-z0-9_.:+-]{1,64}$") and (test("^xox") | not) then . else "invalid" end end;
+        [inputs] as $lines | [$lines[] | fromjson? | select(type == "object")] as $all |
+        [$all[] | select(.kind == "accepted" and (has("compact") | not) and .channel == $c and .ts == $ts)] as $match |
+        "accept-observe: journal lines=\($lines | length) records=\($all | length) compact=\([$all[] | select(.kind == "accepted" and has("compact"))] | length) max_seq=\([$all[].seq] | max | safe)",
+        "accept-observe: matching accepted=\($match | length) with_via=\([$match[] | select($via == "" or .via == $via)] | length)",
+        ($match[] | "accept-observe: accepted seq=\(.seq | safe) source=\(.source | safe) via=\(.via | safe) thread_ts=\(.thread_ts | safe) received_at=\(.received_at | safe) released_at=\(.released_at | safe) hold=\(.hold.on | safe) hold_root_unknown=\(.hold.root_unknown | safe) hold_operations=\(.hold.operations | if . == null then null else length end | safe) hold_arrived_at=\(.hold.arrived_at | safe)"),
+        ($all[] | select(.kind != "accepted" and (.seq as $s | any($match[]; .seq == $s))) |
+            "accept-observe: record kind=\(.kind | safe) seq=\(.seq | safe) attempt=\(.attempt | safe) part=\(.part | safe) send_kind=\(.send_kind | safe) at=\(.at | safe) unknown_outcome=\(.unknown_outcome | safe)"),
+        ($all[-20:][] | "accept-observe: tail kind=\(.kind | safe) seq=\(.seq | safe) compact=\(.compact | safe) channel=\(.channel | safe) ts=\(.ts | safe) via=\(.via | safe) hold=\(.hold.on | safe)")
+    ' "${journal}" 2> /dev/null || printf 'accept-observe: journal=unreadable\n'
+}
 accepted() {
     local who="$1" channel="$2" ts="$3" via="$4" text="$5" root="${6:--}"
-    wait_until "${EVENT_WAIT_S}" 'expected one acceptance' queued "${who}" "${channel}" "${ts}" "${via}"
-    shared_delivery_expectation "${KEY[${who}]}" "${NAME[${who}]}" slack "${channel}" "${ts}" "${HUMAN}" "${via}" >> "${EXPECTED}"
+    # wait_until's own check, poll and failure text, with the journal
+    # printed at the timeout.
+    _scenario_check_timeout "${EVENT_WAIT_S}" 'expected one acceptance'
+    if ! _scenario_poll_until "${EVENT_WAIT_S}" queued "${who}" "${channel}" "${ts}" "${via}"; then
+        accept_observe "${who}" "${channel}" "${ts}" "${via}" || true
+        fail "expected one acceptance (not within ${EVENT_WAIT_S}s)"
+    fi
+    shared_delivery_expectation "${KEY[${who}]}" "${NAME[${who}]}" slack "${channel}" "${ts}" "${HUMAN}" "${via}" | cat >> "${EXPECTED}" || fail 'expected Slack delivery reader failed'
     INPUTS["${who}|${channel}|${ts}|${via}"]="$(jq -cn --arg text "${text}" --arg root "${root}" '{text:$text,root:$root}')"
 }
 injected_ready() {
@@ -173,7 +199,7 @@ injected() {
         '[.[]|select(.source==$source and .sender==$sender and .text==$text and (has("reminder_for")|not))]|if length==1 then .[0] else error("ambiguous original") end')"
     ts="$(jq -er .ts <<< "${original}")"
     jq -e 'has("hold")|not' <<< "${original}" > /dev/null || fail 'injected work acquired a Post Hold'
-    shared_delivery_expectation "${KEY[${who}]}" "${NAME[${who}]}" "${source}" "${sender}" "${ts}" "${sender}" - >> "${EXPECTED}"
+    shared_delivery_expectation "${KEY[${who}]}" "${NAME[${who}]}" "${source}" "${sender}" "${ts}" "${sender}" - | cat >> "${EXPECTED}" || fail 'expected injected delivery reader failed'
     INJECTED["${who}|${source}|${sender}|${ts}"]="${text}"
     snapshot "${who}"
 }
@@ -247,6 +273,15 @@ review() {
     mv "${CONFIG}.pending" "${CONFIG}.apply"
     wait_until "${START_WAIT_S}" 'review not durably consumed' bun "${PRINTER}" sharedReviewConsumed \
         "${CONFIG}" "${LAST}" "${EVIDENCE}/${id}.pending" > /dev/null
+}
+# A reviewed change of a persona's name, credentials location or working
+# directory, or its re-add, replaces its life: copied channel entries reset
+# and discovered channels take the mode default (t1.tad.5i AC-W13, SR-4.2).
+# retain <name> sets RETAIN to every channel the current input lists for that
+# persona, as written, declared for replacement retention in its review.
+retain() {
+    mapfile -t RETAIN < <(jq -r --arg who "$1" '.personas[]|select(.name==$who)|.channels[]|"\($who)/\(.id)/\(.delivery)"' "${CONFIG}")
+    (( ${#RETAIN[@]} > 0 )) || fail "no configured channel to retain for $1"
 }
 set_choice() {
     local who="$1" channel="$2" value="$3" id="$4"
@@ -1100,6 +1135,17 @@ lookup_min_ms="$(printed THREAD_MEMORY_RETRY_MIN_MS)"
 lookup_max_ms="$(printed THREAD_MEMORY_RETRY_MAX_MS)"
 lookup_bound_s="$(( (lookup_deadline_ms + lookup_max_ms + 999) / 1000 + 30 ))"
 declare -a EXTRA_CHANNELS=()
+# The persona's Web client gives each attempt 30 s
+# (PERSONA_WEB_API_REQUEST_TIMEOUT_MS) and its library retries a timed-out
+# attempt as a new chat.postMessage. Phase 13 holds its post past that, so
+# every later attempt is lost too, never performed: only the first attempt's
+# answer (a delayed one must come inside its 30 s) can settle the post.
+lose_post() {
+    local performed="$1" delay="${2:-}"
+    if [[ -n "${delay}" ]]; then slack_stub_post_lost "${LABEL[p]}" "${OP_CHANNEL}" "${performed}" "delay_ms=${delay}"
+    else slack_stub_post_lost "${LABEL[p]}" "${OP_CHANNEL}" "${performed}"; fi
+    slack_stub_post_lost "${LABEL[p]}" "${OP_CHANNEL}" false after=1 times=100000
+}
 pending_post() {
     local case_name="$1" performed="$2" delay="${3:-}" before rows facts
     OP_CHANNEL="$(scenario_id C "post-${case_name}")"
@@ -1111,8 +1157,7 @@ pending_post() {
     OP_STAMP="$(stamp p "${OP_CHANNEL}")"
     before="$(shared_own_post_records "${KEY[p]}" | jq -sc '[.[]|select(.kind=="post-intent")|.operationId]')"
     slack_stub_faults_clear "${LABEL[p]}"
-    if [[ -n "${delay}" ]]; then slack_stub_post_lost "${LABEL[p]}" "${OP_CHANNEL}" "${performed}" "delay_ms=${delay}"
-    else slack_stub_post_lost "${LABEL[p]}" "${OP_CHANNEL}" "${performed}"; fi
+    lose_post "${performed}" "${delay}"
     slack_stub_history_fault "${LABEL[p]}" history hang "channel=${OP_CHANNEL}" times=100000
     OP_MARK="$(slack_post_mark)"
     OP_TEXT="$(scenario_text "post-${case_name}")"
@@ -1155,9 +1200,14 @@ post_hold() {
     shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" unresolved \
         > "${EVIDENCE}/post-${case_name}-held-unresolved.json"
 }
+# The next start releases this Post Hold's reply before p's client serves
+# (src/server.ts recoverQueueKeyAtStart), so its tag keeps the documented ID
+# fallback for user and channel names (docs/bots.md; MI answers47 Q1).
+released_at_start() { RESTART_RELEASED["p|${OP_CHANNEL}|${OP_REPLY_TS}|thread"]=1; }
 for performed in true false; do
     pending_post "recovered-${performed}" "${performed}"
     post_hold "recovered-${performed}"
+    released_at_start
     connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
     crash
     start
@@ -1203,7 +1253,8 @@ shared_stub_permission_setup "${WORK[p]}" > /dev/null
 jq --arg work "${WORK[p]}" '.personas[0].working_directory=$work' "${CONFIG}" > "${CONFIG}.tmp"
 mv "${CONFIG}.tmp" "${CONFIG}"
 connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
-review fifo-manual-worker
+retain "${NAME[p]}"
+review fifo-manual-worker "${RETAIN[@]}"
 wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'manual FIFO worker did not connect'
 wait_membership_complete "${KEY[p]}"
 MANUAL[p]=true
@@ -1272,11 +1323,16 @@ crash
 start
 wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restarted manual FIFO worker did not reconnect'
 slack_stub_faults_clear "${LABEL[p]}"
-RECORD_WAIT_S="${lookup_bound_s}" shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" joined \
+# The behind-post mention and broadcast joined the post's own thread
+# (SR-3.1), so the lookup leaves that root out of its range and, with no own
+# message left in it, records none (SR-3.4.2). The thread stays joined.
+RECORD_WAIT_S="${lookup_bound_s}" shared_wait_own_post_state "${KEY[p]}" "${OP_ID}" "${OP_CHANNEL}" "${OP_STAMP}" none \
     > "${EVIDENCE}/post-live-hold-outcome.json"
+root_saved p "${OP_CHANNEL}" "${OP_ROOT}" || fail 'live-hold thread lost its mention join'
 connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
 cp "${EVIDENCE}/fifo-original-config.json" "${CONFIG}"
-review fifo-original-worker
+retain "${NAME[p]}"
+review fifo-original-worker "${RETAIN[@]}"
 WORK[p]="${fifo_work}"
 MANUAL[p]=false
 wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'ordinary FIFO worker did not reconnect'
@@ -1339,6 +1395,7 @@ done
 for boundary in before after; do
     pending_post "leave-${boundary}" true
     post_hold "leave-${boundary}"
+    released_at_start
     old_channel="${OP_CHANNEL}"; old_stamp="${OP_STAMP}"; old_root="${OP_ROOT}"; old_envelope="${OP_ENVELOPE}"
     file_fault "${SLACK_STATE_DIR}/queue/${KEY[p]}.jsonl" >> "${EVIDENCE}/faults"
     before="$(same_channel_facts p "${old_channel}")"
@@ -1446,11 +1503,18 @@ set_choice p "${B}" thread_hybrid choice-storage-repaired
 # Phase 18: several actual matching candidates lose the join, with one
 # production-built report at the Notice Destination. The unrelated reply
 # remains outside the thread, including after another restart.
+# The lookup names a lost join's threads in the order Slack's history lists
+# them, newest first (src/own-post-lookup.ts), so expected loss texts list
+# the roots by ts, newest first.
+newest_first() {
+    jq -rn '$ARGS.positional | sort_by(tonumber) | reverse | join(",")' --args "$@"
+}
 pending_post ambiguous true
 second_root="$(scenario_ts)"
 slack_stub_history_seed "${OP_CHANNEL}" "$(slack_message_event "${OP_CHANNEL}" "${OP_TEXT}" "${second_root}" "$(slack_stub_identity "${LABEL[p]}" user_id)")"
-loss_line="$(printed buildThreadMemoryOwnPostLostLine "${NAME[p]}" "${KEY[p]}" "${OP_CHANNEL}" "${OP_ROOT},${second_root}" several)"
-loss_notice="$(printed buildThreadMemoryOwnPostLostNotice "${NAME[p]}" "${KEY[p]}" "${OP_CHANNEL}" "${OP_ROOT},${second_root}" several)"
+lost_roots="$(newest_first "${OP_ROOT}" "${second_root}")"
+loss_line="$(printed buildThreadMemoryOwnPostLostLine "${NAME[p]}" "${KEY[p]}" "${OP_CHANNEL}" "${lost_roots}" several)"
+loss_notice="$(printed buildThreadMemoryOwnPostLostNotice "${NAME[p]}" "${KEY[p]}" "${OP_CHANNEL}" "${lost_roots}" several)"
 loss_count="$(count_log "${loss_line}")"
 crash
 slack_stub_faults_clear "${LABEL[p]}"
@@ -1461,7 +1525,7 @@ RECORD_WAIT_S="${lookup_bound_s}" shared_wait_own_post_state "${KEY[p]}" "${OP_I
 wait_for_count "${loss_line}" "$((loss_count + 1))" 30 'ambiguous lookup did not report lost joins'
 slack_wait_successful_post "${LABEL[p]}" "${NOTICE}" "${mark}" "${loss_notice}" > "${EVIDENCE}/ambiguous-notice.json"
 report_post p "${mark}" ambiguous-exact-notice buildThreadMemoryOwnPostLostNotice \
-    "${NAME[p]}" "${KEY[p]}" "${OP_CHANNEL}" "${OP_ROOT},${second_root}" several
+    "${NAME[p]}" "${KEY[p]}" "${OP_CHANNEL}" "${lost_roots}" several
 for root in "${OP_ROOT}" "${second_root}"; do
     ts="$(scenario_ts)"; text="$(scenario_text after-ambiguous-loss)"
     ack "$(push p "${OP_CHANNEL}" "${ts}" "${text}" "${root}")"
@@ -1501,7 +1565,8 @@ second_chunk="$(python3 -c 'print("ijklmnop" * 375, end="")')"
 chunk_text="${first_chunk}${second_chunk}"
 slack_stub_post_fail "${LABEL[p]}" "${chunk_channel}" error error=channel_not_found after=1
 chunk_mark="$(slack_post_mark)"
-result="$(stub_session_call "${WORK[p]}" reply "$(jq -cn --arg c "${chunk_channel}" --arg t "${chunk_text}" '{chat_id:$c,text:$t}')")"
+# The two parts exceed one request line, so the reply's arguments go in a file.
+result="$(stub_session_call "${WORK[p]}" reply "$(jq -cn --arg c "${chunk_channel}" --arg t "${chunk_text}" '{chat_id:$c,text:$t}')" arguments-file)"
 printf '%s\n' "${result}" > "${EVIDENCE}/chunk-result.json"
 jq -e '.isError==true and (has("error")|not)' <<< "${result}" > /dev/null || fail 'later failed chunk falsely succeeded'
 wait_until 30 'later chunk fault not reached' has_record_after "${chunk_mark}" fault "label=${LABEL[p]}" method=chat.postMessage outcome=error
@@ -1598,8 +1663,9 @@ done
 
 # Phase 22: each destructive identity boundary with accepted old-key work,
 # delayed membership evidence and a hung own-post lookup. Configuration uses
-# the real reviewed input path. Only its baseline choices survive; every
-# current Thread Hybrid Since belongs to the new incarnation.
+# the real reviewed input path. Only the input's choices, declared for
+# replacement retention, survive; every current Thread Hybrid Since belongs
+# to the new incarnation.
 cp "${CONFIG}" "${EVIDENCE}/identity-original-config.json"
 identity_compaction_before=''
 for reset in remove rename credentials working-directory; do
@@ -1651,14 +1717,17 @@ for reset in remove rename credentials working-directory; do
             ;;
     esac
     connected="$(count_log "$(session_connected "$(persona_ref "${new_name}")")")"
-    review "identity-${reset}"
+    # Removal leaves no persona to declare; its re-add below declares them.
+    RETAIN=(); [[ "${reset}" == remove ]] || retain "${new_name}"
+    review "identity-${reset}" ${RETAIN[@]+"${RETAIN[@]}"}
     reset_mark="$(slack_post_mark)"
     if [[ "${reset}" == remove ]]; then
         # Applied removal is observable in the reviewed durable projection;
         # the old queue remains, before re-add reactivates its original key.
         [[ -f "${SLACK_STATE_DIR}/queue/${KEY[p]}.jsonl" ]] || fail 'removal deleted accepted queue'
         cp "${EVIDENCE}/identity-original-config.json" "${CONFIG}"
-        review identity-readd
+        retain "${NAME[p]}"
+        review identity-readd "${RETAIN[@]}"
     fi
     wait_for_count "$(session_connected "$(persona_ref "${new_name}")")" "$((connected + 1))" "${START_WAIT_S}" 'new identity worker did not connect'
     wait_membership_complete "${new_key}"
@@ -1691,7 +1760,8 @@ for reset in remove rename credentials working-directory; do
     if [[ "${reset}" != remove ]]; then
         connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
         cp "${EVIDENCE}/identity-original-config.json" "${CONFIG}"
-        review "identity-${reset}-restore"
+        retain "${NAME[p]}"
+        review "identity-${reset}-restore" "${RETAIN[@]}"
         wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'restored original worker did not connect'
     fi
     wait_membership_complete "${KEY[p]}"
@@ -1710,8 +1780,9 @@ done
 
 # Phase 23: confirmation after the durable intent but with the outcome/join
 # append refused. A successful Slack API record binds the actual root; the
-# exact unresolved intent plus the effective file fault gate the kill.
-pending_post confirmed-unsaved true 30000
+# exact unresolved intent plus the effective file fault gate the kill. The
+# held answer comes 5 s inside the client's 30 s attempt (lose_post).
+pending_post confirmed-unsaved true 25000
 file_fault "${memory_path}" >> "${EVIDENCE}/faults"
 post="$(RECORD_WAIT_S=45 slack_wait_successful_post "${LABEL[p]}" "${OP_CHANNEL}" "${OP_MARK}" "${OP_TEXT}")"
 [[ "$(jq -er .ts <<< "${post}")" == "${OP_ROOT}" ]] || fail 'confirmed root differs from controlled Slack post'
@@ -1877,7 +1948,8 @@ shared_stub_notice_setup "${WORK[p]}" > /dev/null
 slack_stub_inventory_page "${LABEL[p]}" '' '' "${A}" "${B}" "${NOTICE}"
 edit_input --arg work "${WORK[p]}" '.personas[0].working_directory=$work'
 connected="$(count_log "$(session_connected "$(persona_ref "${NAME[p]}")")")"
-review reviewed-repair-worker
+retain "${NAME[p]}"
+review reviewed-repair-worker "${RETAIN[@]}"
 wait_for_count "$(session_connected "$(persona_ref "${NAME[p]}")")" "$((connected + 1))" "${START_WAIT_S}" 'reviewed repair worker did not connect'
 wait_membership_complete "${KEY[p]}"
 restore_root="$(scenario_ts)"
@@ -1906,7 +1978,8 @@ staged_count="$(count_log "${staged_diagnostic}")"
 mark="$(slack_post_mark)"
 printf '%s\n' 'controlled damaged authority while the live owner retains its anchor' > "${LAST}"
 cp "${LAST}" "${EVIDENCE}/restoration-damaged"
-configuration_recovery_request "$(scenario_attempt_id owned-restoration)" "${EVIDENCE}/restoration-damaged" "${EVIDENCE}/restoration-request.json"
+# Recovery request IDs are review IDs (REVIEW_ID_RE): no colon, unlike an attempt ID.
+configuration_recovery_request "${TEST_NAME}-owned-restoration" "${EVIDENCE}/restoration-damaged" "${EVIDENCE}/restoration-request.json"
 wait_for_count "${stage_line}" "$((stage_count + 1))" 30 'owner did not stage restoration'
 configuration_application_preserved "${CONFIG}" "${EVIDENCE}/restoration-anchor" "${LAST}" > /dev/null
 wait_for_count "${staged_diagnostic}" "$((staged_count + 1))" 30 'staged repair diagnostic missing'
@@ -2071,7 +2144,7 @@ cp "${SNAP[p]}" "${EVIDENCE}/replacement-queue-before.jsonl"
 crash
 printf '%s\n' 'controlled irrecoverable authority without a running owner' > "${LAST}"
 cp "${LAST}" "${EVIDENCE}/replacement-damaged"
-configuration_recovery_request "$(scenario_attempt_id cold-replacement)" "${EVIDENCE}/replacement-damaged" \
+configuration_recovery_request "${TEST_NAME}-cold-replacement" "${EVIDENCE}/replacement-damaged" \
     "${EVIDENCE}/replacement-request.json" "${EVIDENCE}/replacement-source.json"
 refused_recovery_start
 shared_recovery_pending "${EVIDENCE}/replacement-request.json" "${CONFIG}.pending" > "${EVIDENCE}/replacement-review.json"
@@ -2140,15 +2213,29 @@ for who in p q; do drain "${who}"; done
 stop_server --stop-bots
 for who in p q; do snapshot "${who}"; done
 assert_chunk_posts # No later restart or recovery reposted either chunk.
-shared_assert_accounting "${EXPECTED}" "${LOG}" "${KEY[p]}" "${SNAP[p]}" "${KEY[q]}" "${SNAP[q]}" > /dev/null
+# message-received is a per-server-run diagnostic: an item still queued at a
+# stop is logged again when the next start recovers it (MI answers46).
+shared_assert_accounting --per-server-run "${EXPECTED}" "${LOG}" "${KEY[p]}" "${SNAP[p]}" "${KEY[q]}" "${SNAP[q]}" > /dev/null
+# expected_names <identity> <channel> <via>: the user and channel names an
+# input's tag must carry, tab-separated. Only a reply released at start
+# (released_at_start) expects the IDs.
+expected_names() {
+    local identity="$1" channel="$2" via="$3" user channel_name
+    if [[ -n "${RESTART_RELEASED[${identity}]:-}" ]]; then printf '%s\t%s\n' "${HUMAN}" "${channel}"; return 0; fi
+    user="$(scenario_stub_name user "${HUMAN}")"; channel_name="$(scenario_stub_name channel "${channel}")"
+    # src/delivery-intake.ts channelName uses the fixed DM display name.
+    [[ "${via}" != dm ]] || channel_name=dm
+    printf '%s\t%s\n' "${user}" "${channel_name}"
+}
+[[ "${#RESTART_RELEASED[@]}" == 4 ]] || fail 'expected four replies released from a Post Hold at a restart'
+for identity in "${!RESTART_RELEASED[@]}"; do [[ -n "${INPUTS[${identity}]:-}" ]] || fail 'restart-released reply is not an accepted input'; done
 for identity in "${!INPUTS[@]}"; do
     IFS='|' read -r who channel ts via <<< "${identity}"
     input="${INPUTS[${identity}]}"
     text="$(jq -r .text <<< "${input}")"; root="$(jq -r .root <<< "${input}")"
-    channel_name="$(scenario_stub_name channel "${channel}")"
-    # src/delivery-intake.ts channelName uses the fixed DM display name.
-    [[ "${via}" != dm ]] || channel_name=dm
-    parts="$(shared_expected_parts "${text}" "${ts}" "${HUMAN}" "$(scenario_stub_name user "${HUMAN}")" \
+    names="$(expected_names "${identity}" "${channel}" "${via}")"
+    IFS=$'\t' read -r user_name channel_name <<< "${names}"
+    parts="$(shared_expected_parts "${text}" "${ts}" "${HUMAN}" "${user_name}" \
         "${channel}" "${channel_name}" "${via}" "${root}" -)"
     shared_assert_content "${KEY[${who}]}" "${LOG}" "${SNAP[${who}]}" "${channel}" "${ts}" "${text}" "${parts}" - > /dev/null
 done

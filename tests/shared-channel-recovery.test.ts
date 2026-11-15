@@ -5,15 +5,16 @@ import * as nodeFs from 'node:fs'
 import { readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { DEFAULT_PERSONA_CONFIG_FS, type DeliveryMode, type PersonaConfigFs } from '../src/config.ts'
+import { isDeepStrictEqual } from 'node:util'
 import {
-  createSharedChannelAuthority, parseSharedChannelState, sameChannelStamp, serializeSharedChannelState,
+  createSharedChannelAuthority, parseSharedChannelState, sameChannelStamp, serializeSharedChannelState, sharedChannelLifetime,
   type ChannelStamp, type SharedChannelAuthority, type SharedChannelStampState, type SharedChannelState, type SharedThreadView, type ThreadMemoryMarkerResult,
 } from '../src/shared-channels.ts'
 import { reloadSharedAuthorityApplyFailedLine } from '../src/reload.ts'
 import { errnoSuffix } from '../src/persona-credentials.ts'
 import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { makeReloadHarness, type ReloadHarness, type ReloadRun, type ReloadRunOptions } from './test-helpers/reload-harness.ts'
-import { activationRecord, applicationState, botAttemptRecord, channelPopulation, configBytes, expectCurrent, expectSuperseded, holdsLifetime, makeSharedAuthority, makeMembershipHarness, SHARED_CHANNEL_IDS as C } from './test-helpers/shared-channels.ts'
+import { activationRecord, applicationState, botAttemptRecord, channelPopulation, configBytes, expectCurrent, expectSuperseded, holdsLifetime, makeSharedAuthority, makeMembershipHarness, SHARED_CHANNEL_IDS as C, withPreRuleScanRepeats } from './test-helpers/shared-channels.ts'
 import { durableWriteFileSync, DurableWriteUnsyncedError } from '../src/atomic-write.ts'
 import { makeDm } from './test-helpers/slack-stub.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
@@ -153,7 +154,13 @@ test.each(['recover', 'stage'] as const)('changed uncertain bytes keep the exist
     expect(authority.failure).toBe(''); expect(authority.snapshot()).toEqual(uncertain)
     expect(h.readRecord()).toEqual(exact)
   } else {
-    expect(authority.stageRestoration(sharedRecoveryRequest('report-stage', damaged), damaged, configBytes(input)).kind).toBe('unresolved')
+    // t3.yiv.sf.ws.ih, review-r2 R1: the caller's request keeps structuredClone;
+    // the fast copier copies only committed or parsed state.
+    const request = sharedRecoveryRequest('report-stage', damaged), serialising = spyOn(globalThis, 'structuredClone')
+    try {
+      expect(authority.stageRestoration(request, damaged, configBytes(input)).kind).toBe('unresolved')
+      expect(serialising.mock.calls.filter(([value]) => value === request)).toHaveLength(1)
+    } finally { serialising.mockRestore() }
     expect(authority.unreadableCause).toBe('restoration-staged')
     expect(authority.recoverDurability().kind).toBe('unresolved')
     expect(authority.unreadableCause).toBe('restoration-staged')
@@ -1669,4 +1676,122 @@ test('installed repair with failed directory sync reports uncertainty rather tha
   expect(run.outcome.kind).toBe('applied')
   expect(diagnostics.join('\n')).not.toContain('confirmation not activated')
   expect(diagnostics.join('\n')).toMatch(/durability unresolved|installed[^\n]*unresolved|activation[^\n]*uncertain/i)
+})
+
+// t2.yiv.sf.in (SR-8.9): scan record retention inside durable applications and at startup.
+const RETAINED = [C.primary, C.secondary, C.private]
+/** alpha in open mode with RETAINED listed, its Notice Destination C.primary. */
+function retentionConfig() {
+  const alpha = h.persona('alpha', { channels: RETAINED.map(id => ({ id, delivery: 'all' })), permission_prompts: C.primary, dm: { enabled: true, contact: 'U0OPERATOR' } })
+  h.materialize(alpha); h.writeConfig({ channel_mode: 'open', personas: [alpha] })
+}
+/** A complete reconciliation of alpha listing `channels`, through the run's production scanner. */
+async function reconcileAlpha(run: ReloadRun, channels: string[]) {
+  run.stub('alpha').script.inventory.push(membershipPage(channels))
+  run.membershipScanner.request('alpha'); await run.membershipClock.runNext()
+}
+/** Each channel's newest membership-history record. */
+function newestRecords(state: SharedChannelState, channels = RETAINED) {
+  const events = Object.entries(state.personas.alpha!.membershipEvents)
+  return channels.map(channel => events.filter(([, event]) => event.channel === channel).sort(([, a], [, b]) => b.order - a.order)[0]?.[0])
+}
+/** Each channel's scan records, oldest first. */
+function scanRecordsOf(state: SharedChannelState, channel: string) {
+  return Object.entries(state.personas.alpha!.membershipEvents).filter(([id, event]) => id.startsWith('scan:') && event.channel === channel)
+    .sort(([, a], [, b]) => a.order - b.order).map(([id]) => id)
+}
+
+test.each([
+  ['before the rename', { step: 'renameSync' }],
+  ['after the rename', { step: 'openSync', call: 2 }],
+  ['at the directory sync', { step: 'fsyncSync', call: 2 }],
+] as const)('a page application dropping superseded repeats, interrupted %s, reopens readable with that side\'s newest records and reconciles again', async (_at, failure) => {
+  retentionConfig()
+  let armed = false, attempted: SharedChannelState | undefined
+  const run = await start({ dryRun: false, realLifecycle: true, slack: REPAIR_SLACK, beforeWrite(path, bytes) {
+    if (!armed || path !== h.paths.lastApplied) return
+    armed = false; attempted = parseSharedChannelState(bytes, path); h.failWrites(failure)
+  } })
+  for (let i = 0; i < 2; i++) { await reconcileAlpha(run, RETAINED); expect(run.membershipScanner.status('alpha').state).toBe('complete') }
+  const saved = disk(), second = newestRecords(saved)
+  armed = true
+  await reconcileAlpha(run, RETAINED)
+  h.clearWriteFailure()
+  expect(run.membershipScanner.status('alpha')).toMatchObject({ state: 'incomplete', problem: 'storage' })
+  // The interrupted write is the page's: its repeats supersede the second
+  // reconciliation's, which it drops in the same whole-state write.
+  const third = newestRecords(attempted!)
+  expect(third.map((id, i) => [id === second[i], id!.startsWith('scan:'), Object.hasOwn(attempted!.personas.alpha!.membershipEvents, second[i]!)]))
+    .toEqual(RETAINED.map(() => [false, true, false]))
+  const before = failure.step === 'renameSync'
+  expect(run.controller.sharedChannels()!.readable).toBe(before)
+  const side = before ? saved : attempted!
+  expect(disk()).toEqual(side)
+  await run.stop()
+  const reopened = await start({ dryRun: false, realLifecycle: true, slack: REPAIR_SLACK })
+  const authority = reopened.controller.sharedChannels()!
+  expect([authority.readable, authority.snapshot()]).toEqual([true, side])
+  // Readability cannot show it (SR-3.5): each channel keeps that side's newest record.
+  expect(newestRecords(authority.snapshot())).toEqual(before ? second : third)
+  for (const channel of RETAINED) expect(scanRecordsOf(side, channel)).toHaveLength(2)
+  await reconcileAlpha(reopened, RETAINED)
+  expect(reopened.membershipScanner.status('alpha').state).toBe('complete')
+  const next = authority.snapshot()
+  for (const [i, channel] of RETAINED.entries()) {
+    expect(scanRecordsOf(next, channel)).toEqual([scanRecordsOf(side, channel)[0], newestRecords(next)[i]])
+    expect(reopened.membership.read('alpha', channel, 'open').kind).toBe('eligible')
+  }
+  expect(newestRecords(next).filter((id, i) => id === newestRecords(side)[i])).toEqual([])
+})
+
+test('a history saved before SR-3.5 reads with no report and a dry-run start keeps its bytes; the first reconciliation drops its superseded repeats and decides as on the saved history', async () => {
+  retentionConfig()
+  const first = await start({ dryRun: false, realLifecycle: true, slack: REPAIR_SLACK })
+  await reconcileAlpha(first, RETAINED)
+  // A live leave of the Notice Destination, then the pre-rule reconciliations repeat its absence.
+  const leave = { type: 'channel_left', channel: C.primary, channel_type: 'C', event_ts: ((first.membershipClock.now() + 1) / 1000).toFixed(3) }
+  await first.deliver('alpha', leave, { event_id: 'EvPRERULELEAVE' })
+  expect(first.stub('alpha').socket.acks).toHaveLength(1)
+  await first.stop()
+  // Start logs name the authority's revision, which the seeded reconciliations advance.
+  const startLogs = (run: ReloadRun) => run.logs.map(line => line.replace(/ at revision \d+$/, ' at revision N'))
+  const plain = await start(), plainLogs = startLogs(plain); await plain.stop()
+  const seeded = withPreRuleScanRepeats(disk(), 'alpha', 3, h.paths.lastApplied), history = seeded.personas.alpha!
+  const preRule = Object.keys(history.membershipEvents).filter(id => id.startsWith('scan:00000000-'))
+  expect(preRule).toHaveLength(3 * RETAINED.length)
+  const bytes = h.writeRecordBytes(serializeSharedChannelState(seeded))
+  // A dry-run start reads it as saved, reports nothing a plain history did not and writes nothing.
+  const dry = await start()
+  expect([dry.writes, dry.controller.sharedChannels()!.readable, dry.controller.sharedChannels()!.snapshot()]).toEqual([[], true, seeded])
+  expect(startLogs(dry)).toEqual(plainLogs)
+  await dry.stop()
+  expect(h.readRecord()).toEqual(bytes)
+  const written: SharedChannelState[] = []
+  const run = await start({ dryRun: false, realLifecycle: true, slack: REPAIR_SLACK, beforeWrite(path, bytes) {
+    if (path === h.paths.lastApplied) written.push(parseSharedChannelState(bytes, path)!)
+  } })
+  const authority = run.controller.sharedChannels()!
+  expect([written, authority.snapshot(), h.readRecord()]).toEqual([[], seeded, bytes])
+  await reconcileAlpha(run, [C.secondary, C.private])
+  expect(run.membershipScanner.status('alpha').state).toBe('complete')
+  // The persona's first membership application, the page, drops every
+  // superseded repeat; only C.primary's newest absence, which it did not supersede, stays.
+  const page = written[0]!.personas.alpha!
+  expect(preRule.filter(id => Object.hasOwn(page.membershipEvents, id))).toEqual([newestRecords(seeded, [C.primary])[0]])
+  expect(Object.keys(history.membershipEvents).filter(id => !preRule.includes(id) && !isDeepStrictEqual(page.membershipEvents[id], history.membershipEvents[id]))).toEqual([])
+  // Decisions agree with the seeded history: membership, choices, the leave
+  // and destination proof, lifetimes and readings.
+  const after = authority.snapshot().personas.alpha!
+  for (const channel of RETAINED) {
+    expect([after.membership[channel]?.member, after.membership[channel]?.boundary, after.membership[channel]?.identity])
+      .toEqual([history.membership[channel]?.member, history.membership[channel]?.boundary, history.membership[channel]?.identity])
+    expect(authority.lifetime('alpha', channel)).toEqual(sharedChannelLifetime(seeded, 'alpha', channel))
+  }
+  expect([after.assignments, after.leaves, after.removedDestinations]).toEqual([history.assignments, history.leaves, history.removedDestinations])
+  expect(RETAINED.map(channel => run.membership.read('alpha', channel, 'open').kind)).toEqual(['ineligible', 'eligible', 'eligible'])
+  expect(preRule.filter(id => Object.hasOwn(after.membershipEvents, id))).toEqual([])
+  // Replaying the leave still finds its own record: acknowledged, with no write.
+  const writes = written.length, state = authority.snapshot()
+  await run.deliver('alpha', leave, { event_id: 'EvPRERULELEAVE' })
+  expect([run.stub('alpha').socket.acks.length, written.length, authority.snapshot()]).toEqual([1, writes, state])
 })

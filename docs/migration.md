@@ -12,6 +12,9 @@ For a 0.18.x host, follow [Upgrading from 0.18.x](#upgrading-from-018x). This re
   ```
 - Install `docs/logrotate-startup-errors.conf` as `/etc/logrotate.d/claude-slack-channel-bots`, replacing `USER` with the server's OS account; update an existing snippet to `~/.config/claude-slack-channel-bots/startup-errors.log`.
 - Stop an old server before the first start that moves its state directory. Create nothing at the new location first. See [The state directory's location and its move at start](../skills/debug-slack-channel-bots/SKILL.md#the-state-directorys-location-and-its-move-at-start); with `SLACK_STATE_DIR` set, nothing moves.
+- **Enable Reaction Notices on each receiving persona's existing app.** Add any missing `reaction_added` and `reaction_removed` bot events under **Event Subscriptions → Subscribe to bot events**, and the `mpim:read` bot scope under **OAuth & Permissions → Bot Token Scopes**, or edit the app's own manifest, then reinstall the app. Follow the [do-not-paste warning](../skills/debug-slack-channel-bots/SKILL.md#the-message-archive-shows-channel-ids-re-install-each-app-to-gain-channelsread-and-groupsread) rather than replacing the app's manifest with [the shipped manifest](../slack-app-manifest.yml). Before the receiving persona's app has the reaction-event subscriptions in place, that persona gets no notices for reactions by people or other apps, though other personas served by this CSCB server deliberately using `react` still bring notices. `mpim:read` enables group-DM recognition, not group-DM message delivery. For new apps see [Quick Start](../README.md#quick-start); for behavior see [Reaction Notices](bots.md#reaction-notices).
+
+Server notices and already-closed permission prompts posted before the upgrade have no server-post marker, so reactions on them can bring notices as if they were the persona's own replies. Still-open old permission prompts remain excluded, and server notices and permission prompts posted after the upgrade are recognised.
 
 ### Switching over to agent-director Phase 1
 
@@ -178,6 +181,8 @@ The shared orchestrator prompt's "hold until after" wording goes out now (operat
 
 This runbook takes the host back to the previous CSCB on its previous compatible agent-director, whether agent-director Phase 1 was installed by [Switching over to agent-director Phase 1](#switching-over-to-agent-director-phase-1) or some other way. Both binaries are rolled back together.
 
+An earlier CSCB release without Reaction Notice support quarantines queued Reaction Notices; undelivered notices cannot be delivered by that release. This is separate from restoring agent-director's store below.
+
 - Stop all callers before restoring the previous agent-director using the released way-back procedure in step 6: restore the retained old directory and any external store's pre-upgrade copy. Schema 9 has no SQL downgrade. Data written since the upgrade is lost; restart only callers compatible with the restored CLI, including the previous CSCB.
 - The store is shared by every agent-director user on the host. Without stopping all callers first, a restore would drop the rows of other services' workers spawned since the switch-over, leaving them running with no row.
 - Every agent on the host, with every long-running agent-director process (`agent-director serve` included), is stopped before the previous binary is restored and started again after it.
@@ -290,7 +295,7 @@ For a pre-persona host, do steps 1, 2, 3, 5 and 6 in the separate staged file at
 2. **Pick persona names whose keys don't start with one another.** The configuration check rejects such a pair. If your bots were named `team`, `team_admin`, …, don't name a persona `team` beside `team_admin`: give the shorter name a suffix, such as `team_main` (see [Persona name and key](configuration.md#persona-name-and-key)).
 3. **Set the reply settings in `config.json`.** Choose top-level `queued_ack_reaction` and `ack_reaction`, or use their defaults after checking both emoji exist in the Slack workspace; custom emoji must exist before configuration. See [Acknowledgement reactions](server-settings.md#acknowledgement-reactions). If you had changed how replies are split, set `reply_chunk_limit` and `reply_chunk_mode` there too.
 4. **Move the tokens into credentials files.** Tokens come only from each persona's credentials file. Create one [credentials file](configuration.md#credentials-files) per persona, then remove any token environment variables you exported for the previous version.
-5. **Give each persona its own Slack app.** Your existing app can serve one persona; create another app for each additional persona. Add the `im:write`, `channels:read` and `groups:read` bot scopes to the existing app and re-install it; the `debug-slack-channel-bots` skill has the steps under "A persona can't open a DM" and "The message archive shows channel IDs".
+5. **Give each persona its own Slack app.** Your existing app can serve one persona; create another app for each additional persona. Add the `im:write`, `channels:read` and `groups:read` bot scopes to the existing app and re-install it; the `debug-slack-channel-bots` skill has the steps under "A persona can't open a DM" and "The message archive shows channel IDs". Also follow [Migration](#migration) for the reaction events, `mpim:read` and reinstall.
 6. **Decide who can reach each persona.** Choose strict or open mode, the shared `channels` list with explicit delivery values, one `permission_prompts` destination and `dm.enabled`. See [Delivery values](configuration.md#delivery-values), [Direct messages](configuration.md#direct-messages-dmenabled) and [Who can reach a persona in open mode](channel-modes.md#who-can-reach-a-persona-in-open-mode).
 7. **Rewrite crontable lines to name personas.** A crontable target that names a channel matches no persona, and the line is logged `unknown-persona` each time it fires. Rewrite each target as a persona's name or key (see [Scheduled Prompts](scheduled-prompts.md#scheduled-prompts-cscb_cron)).
 8. **Update `/interject` callers to send `persona`.** A request without `persona` is refused with 400, and a successful response holds only `ok` and `persona`. Change every script that calls `/interject`, including host crontab `curl` lines, to name a persona by name or key (see [Interject](bots.md#interject)).
@@ -299,9 +304,12 @@ For a pre-persona host, do steps 1, 2, 3, 5 and 6 in the separate staged file at
 
 Follow all four phases in order, including when the configuration already fits the target release. An earlier release cannot use `channel_mode`, the shared list or `thread_hybrid`; restore its configuration and applied baseline from the [preserved upgrade references](#upgrading-from-018x). Those references contain no changes made since the upgrade; `channel-delivery.json` is a stale preserved reference that the current release never reads.
 
-1. **Stop sending and empty the queues.** While the current release runs, change every `thread_hybrid` channel to another delivery value and confirm; wait until every *Thread Memory not saved* or *Thread Memory unreadable* report has been followed by *Thread Memory recovered*; then restart once with `claude-slack-channel-bots clean_restart --server` to tidy the queues at start. Wait until `server.log` shows every received item delivered. Otherwise explicitly accept that undelivered messages are lost when using the earlier release.
+An earlier CSCB release without Reaction Notice support quarantines queued Reaction Notices, so undelivered notices cannot be delivered there.
+
+1. **Stop sending and empty the queues.** While the current release runs, change every `thread_hybrid` channel to another delivery value and confirm; wait until every *Thread Memory not saved* or *Thread Memory unreadable* report has been followed by *Thread Memory recovered*; then restart once with `claude-slack-channel-bots clean_restart --server` to tidy the queues at start. Wait until `server.log` shows every received item delivered. A reaction is finished when its `reaction-received` line is followed by `message-delivered` with `source=reaction`, or by `reaction-withdrawn` (which needs no delivered line). Otherwise explicitly accept that undelivered messages and Reaction Notices are lost when using the earlier release.
 2. **Disable resume on the current release.** Set `resume_enabled` to `false` in `config.json`, [confirm the pending change](reload.md#confirming-a-change), and verify `config.json.last-applied` holds `resume_enabled: false`. Keep the current server running until this is applied.
-   If the target release does not support `queued_ack_reaction`, remove it from `config.json`, confirm while the current server is running, and verify it is absent from `config.json.last-applied`. These precautions do not replace any phase.
+   If the target release does not support `queued_ack_reaction`, remove it from `config.json`, confirm while the current server is running, and verify it is absent from `config.json.last-applied`.
+   If the target release does not support the persona keys `model` and `effort`, remove them from every persona that sets them, confirm while the current server is running, and verify `config.json.last-applied` holds neither. These precautions do not replace any phase.
 3. **Stop with the bots, then install and pin the earlier build.** Run `claude-slack-channel-bots stop --stop-bots` and verify it succeeds, then install the earlier build (for example `bun install -g claude-slack-channel-bots@<version>`). While stopped, save the current `config.json`, `config.json.last-applied`, `config.json.request`, `config.json.pending` and `config.json.apply` outside the state directory for upgrading again. Prepare copies of the old references with `resume_enabled: false` and phase 2's settings precautions, validate them with the earlier release, then restore them as `config.json` and `config.json.last-applied`; keep the current request, pending and apply files out of the state directory. Restore the earlier build's required Claude Code version pin before starting it.
 4. **Start the earlier release fresh with channels, then restore resume.** Run `claude-slack-channel-bots start`; verify every bot starts a new conversation with that release’s channels launch and no configuration load error. Only then set `resume_enabled` back to its previous value and confirm the change.
 
@@ -311,30 +319,15 @@ The earlier release ignores Thread Memory and leaves its files alone. It deliver
 
 ## Upgrading from pre-v0.6 (v0.5.x → v0.6.x)
 
-If you installed CSCB before v0.6.0 you may have legacy artifacts on disk that are no longer needed. Clean them up by hand; no install step removes them.
+Remove these old relay artifacts by hand; installation does not remove them. The permission relay runs through agent-director.
 
 ### 1. Remove old relay hook files
 
-The `.sh` relay hooks are no longer shipped by CSCB. Delete them if present:
-
-```sh
-rm -f ~/.claude/hooks/permission-relay.sh ~/.claude/hooks/ask-relay.sh
-```
+Delete `~/.claude/hooks/permission-relay.sh` and `~/.claude/hooks/ask-relay.sh` if present.
 
 ### 2. Remove orphan settings.json hook entries
 
-If you wired the hooks into `~/.claude/settings.json` by hand, remove the stale entries. Use this `jq` filter to check whether any are present:
-
-```sh
-jq '
-  (.hooks.PermissionRequest // [] | map(select(.hooks[]?.command | strings | test("\\.sh$")))),
-  (.hooks.PreToolUse // [] | map(select(.matcher == "AskUserQuestion" and (.hooks[]?.command | strings | test("\\.sh$")))))
-' ~/.claude/settings.json 2>/dev/null
-```
-
-Any non-empty arrays in the output are orphan entries. Remove:
+In `~/.claude/settings.json`, remove only the matching stale entries:
 
 - Any object inside `hooks.PermissionRequest` whose `hooks[].command` ends in `permission-relay.sh`.
 - Any object inside `hooks.PreToolUse` with `"matcher": "AskUserQuestion"` whose `hooks[].command` ends in `ask-relay.sh`.
-
-The modern permission relay runs automatically via agent-director — no `PermissionRequest` or `PreToolUse` hook entries for `.sh` files are needed.

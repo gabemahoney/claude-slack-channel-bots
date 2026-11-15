@@ -10,7 +10,7 @@ import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { durableIo, failFileSyncs, type DurableIo } from './test-helpers/durable-io.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
-import { deliveredRecord, fixedRecord, heldSlackInput, memoryHold, postHold, injectedInput, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
+import { reactionInput, deliveredRecord, fixedRecord, heldSlackInput, memoryHold, postHold, injectedInput, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { THREAD_ROOTS, THREAD_STAMP } from './test-helpers/thread-memory.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
@@ -734,5 +734,87 @@ describe('AD row reply reminders', () => {
     await resumed.monitor.observe('alpha', resumed.row('working')); await resumed.monitor.observe('alpha', resumed.row('waiting'))
     expect(nudges(replay)).toHaveLength(action === 'reply' ? 0 : 1)
     expect(resumed.prepared).toEqual([])
+  })
+})
+
+const reminderFacts = () => readQueue(dir).filter(record => record.kind === 'reply-reminder')
+const reminderView = (q: ReplyReminderQueue) => ({ candidates: q.replyReminderItems('alpha'), targets: q.replyCallTargets('alpha'), facts: reminderFacts() })
+
+describe('Reaction Items and reply reminders', () => {
+  // The file-level hook still owns cleanup; these captures are in memory.
+  const checked: ReturnType<typeof harness>[] = []
+  afterEach(() => { for (const h of checked.splice(0)) assertNoLeak([h.errors, h.prepared], 'reaction reminder captures') })
+  const reminderHarness = (queue: ReplyReminderQueue) => { const h = harness(queue); checked.push(h); return h }
+  test('accepted, withdrawn, sent and delivered reactions add no candidate, target or reminder, live or replayed', async () => {
+    const q = await open(), h = reminderHarness(q)
+    const accepted = await q.accept('alpha', reactionInput({ ts: '1700000000.000003', emoji: 'eyes' }))
+    const withdrawn = await q.accept('alpha', reactionInput({ ts: '1700000000.000004', emoji: 'tada' }))
+    if (accepted.status !== 'accepted' || withdrawn.status !== 'accepted') throw new Error('fixture acceptance failed')
+    await q.append('alpha', { v: 1, kind: 'withdrawn', seq: withdrawn.seq, reason: 'server-post', at: 1001 })
+    const seq = await send(q, 'alpha', reactionInput(), false)
+    expect(reminderView(q)).toEqual({ candidates: [], targets: [], facts: [] })
+    await q.append('alpha', deliveredRecord(seq))
+    expect(q.item('alpha', seq)!.delivered).toBe(true)
+    expect(reminderView(q)).toEqual({ candidates: [], targets: [], facts: [] })
+    await h.monitor.observe('alpha', h.row('working'))
+    await h.monitor.observe('alpha', h.row('waiting'))
+    expect({ nudges: nudges(q), prepared: h.prepared, errors: h.errors }).toEqual({ nudges: [], prepared: [], errors: [] })
+    await h.monitor.stop(); await q.stop()
+    // Startup replay derives reminder facts for every delivered item before its
+    // compaction drops the closed reactions and keeps any observed candidate.
+    const replay = await open(), resumed = reminderHarness(replay)
+    expect(replay.items('alpha').map(item => item.accepted.seq)).toEqual([accepted.seq])
+    expect(reminderView(replay)).toEqual({ candidates: [], targets: [], facts: [] })
+    await resumed.monitor.observe('alpha', resumed.row('working'))
+    await resumed.monitor.observe('alpha', resumed.row('waiting'))
+    expect({ nudges: nudges(replay), prepared: resumed.prepared, errors: resumed.errors }).toEqual({ nudges: [], prepared: [], errors: [] })
+    expect(reminderFacts()).toEqual([])
+  })
+
+  test("delivering a reaction on a Slack candidate's message leaves its facts unchanged, live and replayed, and it still nudges once", async () => {
+    const q = await open(), h = reminderHarness(q)
+    const slack = await send(q)
+    await h.monitor.observe('alpha', h.row('working'))
+    const before = reminderView(q)
+    expect(before.candidates).toEqual([expect.objectContaining({ seq: slack, state: 'observed', delivered_at: 1000, row_state: 'working', session_id: 'session' })])
+    expect(before.targets).toEqual([{ seq: slack }])
+    const reaction = await send(q, 'alpha', reactionInput(), false)
+    expect(reminderView(q)).toEqual(before)
+    await q.append('alpha', deliveredRecord(reaction, 2000))
+    expect(q.item('alpha', reaction)!.delivered).toBe(true)
+    expect(reminderView(q)).toEqual(before)
+    await h.monitor.stop(); await q.stop()
+    const replay = await open(), resumed = reminderHarness(replay)
+    expect({ candidates: replay.replyReminderItems('alpha'), targets: replay.replyCallTargets('alpha') }).toEqual({ candidates: before.candidates, targets: before.targets })
+    expect(reminderFacts()).toEqual(before.candidates)
+    await resumed.monitor.observe('alpha', resumed.row('working'))
+    await resumed.monitor.observe('alpha', resumed.row('waiting'))
+    expect(nudges(replay).map(item => item.accepted.reminder_for)).toEqual([slack])
+    expect(resumed.prepared.map(p => p.item.accepted.seq)).toEqual(nudges(replay).map(item => item.accepted.seq))
+    expect(resumed.errors).toEqual([])
+  })
+
+  test('a reply-call cutoff while a reaction is sent targets only the Slack delivery, before and after receipts and replay', async () => {
+    const q = await open(), h = reminderHarness(q)
+    const slack = await send(q, 'alpha', slackInput(), false)
+    const reaction = await send(q, 'alpha', reactionInput(), false)
+    expect(q.replyCallTargets('alpha')).toEqual([{ seq: slack, attempts: [1] }])
+    await h.monitor.noteReplyCall('alpha')
+    const replied = reminderFacts()
+    expect(replied).toEqual([expect.objectContaining({ seq: slack, state: 'replied', reply_attempts: [1] })])
+    await q.append('alpha', deliveredRecord(reaction))
+    await q.append('alpha', deliveredRecord(slack))
+    expect(reminderFacts()).toEqual(replied)
+    expect(q.replyCallTargets('alpha').map(target => target.seq)).toEqual([slack])
+    await h.monitor.observe('alpha', h.row('working'))
+    await h.monitor.observe('alpha', h.row('waiting'))
+    expect({ nudges: nudges(q), prepared: h.prepared, errors: h.errors }).toEqual({ nudges: [], prepared: [], errors: [] })
+    await h.monitor.stop(); await q.stop()
+    // Both delivered items compact away on startup; only a wrongly derived reaction candidate would remain.
+    const replay = await open(), resumed = reminderHarness(replay)
+    expect(reminderView(replay)).toEqual({ candidates: [], targets: [], facts: [] })
+    await resumed.monitor.observe('alpha', resumed.row('working'))
+    await resumed.monitor.observe('alpha', resumed.row('waiting'))
+    expect({ nudges: nudges(replay), prepared: resumed.prepared, errors: resumed.errors }).toEqual({ nudges: [], prepared: [], errors: [] })
   })
 })

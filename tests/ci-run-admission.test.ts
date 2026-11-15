@@ -1873,6 +1873,7 @@ import {
   ciLiveRealRunLockPath,
   ciLiveTempDir,
   cpuFits,
+  runCpus,
   CPU_REFUSAL_ADVICE,
   decideAdmission,
   DISK_CHECK_ALLOWANCE_BYTES,
@@ -3147,6 +3148,26 @@ describe('admission: admission readings, /ci-live, commitments, fits and refusal
     ])(`the CPU fit at %p shard(s), other runs' CPUs + ${CPUS_PER_SHARD}N = ${CI_CPUS} + %p: fits is %p`, (shards, overCpus, fits) => {
       const reservedCpus = CI_CPUS - CPUS_PER_SHARD * shards + overCpus
       expect(cpuFits(reservedCpus, shards)).toBe(fits)
+    })
+
+    test.each([
+      [1, 0, 2], [1, 3, 3], [3, 3, 9], [4, 3, 11], [5, 3, 13], [6, 3, 15], [6, 1, 13], [2, 0, 4],
+    ])('burst-driver scripts: %p shard(s) with %p of them take %p CPUs, one more for each shard that can hold one', (shards, driverScripts, cpus) => {
+      expect(runCpus(shards, driverScripts)).toBe(cpus)
+      expect(cpuFits(CI_CPUS - cpus, shards, driverScripts)).toBe(true)
+      expect(cpuFits(CI_CPUS - cpus + 1, shards, driverScripts)).toBe(false)
+      expect(buildReservation({ owner: LIVE_OWNER, shards, memoryCapBytes: SHARD_MEMORY_CAP_BYTES, driverScripts, kind: 'full' }).cpus).toBe(cpus)
+    })
+
+    test('burst-driver scripts: a full run holding all three takes the largest N whose CPUs, driver CPUs included, fit, and a refusal counts them', async () => {
+      const rig = makeAdmission(), figures = await rig.figures()
+      const plain = admittedOf(decideAdmission(figures, defaultFullRun(), rig.listResultsDirs))
+      const driven = admittedOf(decideAdmission(figures, { ...defaultFullRun(), driverScripts: 3 }, rig.listResultsDirs))
+      expect([plain.shards, driven.shards]).toEqual([MAX_SHARDS, 4])
+      expect(driven.limitsAtNext).toEqual(['cpu'])
+      const pinned = decideAdmission(figures, { ...defaultFullRun(), canChooseShards: false, driverScripts: 3 }, rig.listResultsDirs)
+      expect(refusalOf(pinned).summary).toBe(`${MAX_SHARDS} shard(s) need ${runCpus(MAX_SHARDS, 3)} CPUs; active /ci runs hold 0 of the ${CI_CPUS} CI CPUs`)
+      expect(() => decideAdmission(figures, { ...defaultFullRun(), driverScripts: -1 }, rig.listResultsDirs)).toThrow('invalid driver scripts')
     })
 
     // --- Choosing N ---

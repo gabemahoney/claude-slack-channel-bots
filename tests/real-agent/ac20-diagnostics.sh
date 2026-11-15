@@ -4,7 +4,7 @@ AC20_DIAGNOSTIC_HELPER="${BASH_SOURCE[0]%/*}/ac20-diagnostics.ts"
 real_ac20_diagnostics_start() {
     [[ "${REAL_AGENT_AC20_DIAGNOSTICS:-}" == decision21c ]] || return 0
     require_scenario_home real_ac20_diagnostics_start
-    [[ "${TEST_NAME}" == test-120-fmk-real-ai-ac20 && "${AI_CRITERION:-}" == 20 && "${REAL_CLAUDE_VERSION}" == 2.1.296 && "${REAL_AGENT_MODEL_PIN:-}" == azure/openai/gpt-6-astra ]] || fail 'diagnostic selection changed'
+    [[ "${TEST_NAME}" == test-120-fmk-real-ai-ac20 && "${AI_CRITERION:-}" == 20 && "${REAL_CLAUDE_VERSION}" == 2.1.296 && "${REAL_AGENT_MODEL_PIN:-}" == aws/anthropic/bedrock-claude-opus-5-5 ]] || fail 'diagnostic selection changed'
     AC20_DIAGNOSTIC_DIR="${SCENARIO_ROOT}/ac20-diagnostics"
     export AC20_DIAGNOSTIC_DIR AC20_DIAGNOSTIC_HELPER
     mkdir -m 700 "${AC20_DIAGNOSTIC_DIR}"

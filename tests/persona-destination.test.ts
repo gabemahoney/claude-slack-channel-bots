@@ -22,7 +22,9 @@
  * with `conversations.open` on the persona's own client and cached per persona
  * until the contact changes, the persona is forgotten, the open fails, or a
  * post to the cached conversation fails `channel_not_found`. Concurrent posts
- * share one open. A `dm` destination with DMs off or no contact is refused
+ * share one open. Every post, to a channel or a DM, with or without blocks,
+ * carries the Server Post Marker in its one `chat.postMessage` request, with
+ * no other call. A `dm` destination with DMs off or no contact is refused
  * with no Slack call. Nothing rejects. A `channel_not_found` eviction is
  * synchronous and drops only the entry the post used, never a newer (even
  * pending) one. An open in flight across a `forget(key)` (an in-place update,
@@ -35,6 +37,7 @@
  * `afterEach` runs `assertNoLeak` over every log line and result.
  */
 
+import { SERVER_POST_METADATA } from './test-helpers/server-post.ts'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -120,7 +123,7 @@ const client = (p: Persona): DestinationSlackClient => asWebClient(stub(p).web)
 const methods = (p: Persona): string[] => stub(p).callLog.map((c) => c.method)
 const opens = (p: Persona) => stub(p).calls.conversationsOpen
 /** `chat.postMessage` arguments on `p`'s stub, as the module passes them. */
-const posts = (p: Persona) => stub(p).calls.postMessage as { channel: string; text: string; blocks?: unknown[] }[]
+const posts = (p: Persona) => stub(p).calls.postMessage as { channel: string; text: string; blocks?: unknown[]; metadata?: unknown }[]
 
 /** The persona with another contact (an in-place contact change, as reload makes). */
 const withContact = (p: Persona, contact: string): Persona => ({ ...p, dm: { ...p.dm, contact } })
@@ -188,7 +191,7 @@ describe('bounded, cancellable shared DM opens', () => {
     expect(await other).toMatchObject(outcome === 'success'
       ? { outcome: 'posted', channelId: 'D0SHARED1' }
       : { outcome: 'failed', step: 'conversations.open', code: 'missing_scope' })
-    expect(posts(A)).toEqual(outcome === 'success' ? [{ channel: 'D0SHARED1', text: 'survivor' }] : [])
+    expect(posts(A)).toEqual(outcome === 'success' ? [{ channel: 'D0SHARED1', text: 'survivor', metadata: SERVER_POST_METADATA }] : [])
     expect(t.callbacks).toEqual([])
     expect(clock.pendingCount()).toBe(0)
     if (outcome === 'failure') stub(A).script.open.push(openedDm('D0SHARED1'))
@@ -245,7 +248,7 @@ describe('bounded, cancellable shared DM opens', () => {
     expect(await newer).toMatchObject({ outcome: 'posted', channelId: 'D0FRESH01' })
     expect(await peer).toMatchObject({ outcome: 'posted', channelId: 'D0FRESH01' })
     await post(A, 'cached fresh')
-    expect(posts(A)).toEqual(['newer', 'fresh peer', 'cached fresh'].map(text => ({ channel: 'D0FRESH01', text })))
+    expect(posts(A)).toEqual(['newer', 'fresh peer', 'cached fresh'].map(text => ({ channel: 'D0FRESH01', text, metadata: SERVER_POST_METADATA })))
     expect(opens(A)).toHaveLength(2)
     t.abort.abort()
     await clock.advance(DM_OPEN_TIMEOUT_MS * 2)
@@ -285,9 +288,9 @@ describe('resolution', () => {
     expect(opens(A)).toHaveLength(1)
     expect(settled.map((r) => r.outcome)).toEqual(['posted', 'posted', 'posted'])
     expect(posts(A)).toEqual([
-      { channel: 'D0ALPHADM', text: 'p1' },
-      { channel: 'D0ALPHADM', text: 'p2' },
-      { channel: 'D0ALPHADM', text: 'p3' },
+      { channel: 'D0ALPHADM', text: 'p1', metadata: SERVER_POST_METADATA },
+      { channel: 'D0ALPHADM', text: 'p2', metadata: SERVER_POST_METADATA },
+      { channel: 'D0ALPHADM', text: 'p3', metadata: SERVER_POST_METADATA },
     ])
   })
 
@@ -367,11 +370,11 @@ describe('resolution', () => {
     expect(rb).toEqual({ outcome: 'posted', channelId: stubOpenedDmId('U0BETA002'), ts: expect.any(String) })
     expect(stub(A).callLog.map((c) => [c.method, c.args])).toEqual([
       ['conversations.open', { users: 'U0ALPHA01' }],
-      ['chat.postMessage', { channel: stubOpenedDmId('U0ALPHA01'), text: 'for A' }],
+      ['chat.postMessage', { channel: stubOpenedDmId('U0ALPHA01'), text: 'for A', metadata: SERVER_POST_METADATA }],
     ])
     expect(stub(B).callLog.map((c) => [c.method, c.args])).toEqual([
       ['conversations.open', { users: 'U0BETA002' }],
-      ['chat.postMessage', { channel: stubOpenedDmId('U0BETA002'), text: 'for B' }],
+      ['chat.postMessage', { channel: stubOpenedDmId('U0BETA002'), text: 'for B', metadata: SERVER_POST_METADATA }],
     ])
     expect(methods(C)).toEqual([])
   })
@@ -404,7 +407,7 @@ describe('a failed conversations.open', () => {
       const again = await post(A, 'second')
       expect(again).toEqual({ outcome: 'posted', channelId: stubOpenedDmId('U0ALPHA01'), ts: expect.any(String) })
       expect(methods(A)).toEqual(['conversations.open', 'conversations.open', 'chat.postMessage'])
-      expect(posts(A)).toEqual([{ channel: stubOpenedDmId('U0ALPHA01'), text: 'second' }])
+      expect(posts(A)).toEqual([{ channel: stubOpenedDmId('U0ALPHA01'), text: 'second', metadata: SERVER_POST_METADATA }])
       // A failure is returned to the caller, not logged here.
       expect(logs).toEqual([])
     },
@@ -498,15 +501,18 @@ describe('posting', () => {
     expect(r).toEqual({ outcome: 'posted', channelId: dm, ts: expect.any(String) })
     expect(methods(A)).toEqual(['conversations.open', 'chat.postMessage'])
     const [args] = posts(A)
-    expect(args).toEqual({ channel: dm, text: 'prompt', blocks: [{ type: 'section' }] })
+    expect(args).toEqual({ channel: dm, text: 'prompt', blocks: [{ type: 'section' }], metadata: SERVER_POST_METADATA })
     expect(args!.channel).not.toBe('U0ALPHA01')
     for (const s of [B, C]) expect(methods(s)).toEqual([])
   })
 
-  test('a channel destination posts exactly {channel, text} to the configured channel with no open and no log line, and the post is issued synchronously', () => {
-    const pending = d.post(C, client(C), { text: 'now' })
-    // Before any await: the channel post is already made.
-    expect(posts(C)).toEqual([{ channel: 'C0CHAN002', text: 'now' }])
+  test.each([
+    ['{channel, text, metadata}', undefined],
+    ['{channel, text, blocks, metadata}', [{ type: 'section' }]],
+  ] as const)('a channel destination posts exactly %s (the Server Post Marker) to the configured channel with no open and no log line, and the post is issued synchronously', (_label, blocks) => {
+    const pending = d.post(C, client(C), blocks === undefined ? { text: 'now' } : { text: 'now', blocks: [...blocks] })
+    // Before any await: the channel post, marker included, is already made.
+    expect(posts(C)).toEqual([{ channel: 'C0CHAN002', text: 'now', ...(blocks === undefined ? {} : { blocks: [...blocks] }), metadata: SERVER_POST_METADATA }])
     expect(methods(C)).toEqual(['chat.postMessage'])
     return pending.then((r) => {
       record(r)
@@ -650,7 +656,7 @@ describe('own-post operations', () => {
     // No await has occurred: both the start and the actual Slack call exist.
     expect(calls).toEqual([{ kind: 'start', key: C.key, surface,
       target: { channel: 'C0CHAN002' }, content: { kind: 'text', text: message.text }, operation: expect.any(Object) }])
-    expect(posts(C)).toEqual([{ channel: 'C0CHAN002', ...message }])
+    expect(posts(C)).toEqual([{ channel: 'C0CHAN002', ...message, metadata: SERVER_POST_METADATA }])
     expect(atPost).toEqual([['start']])
     await drainMicrotasks()
     expect(calls).toHaveLength(1)
@@ -683,7 +689,7 @@ describe('own-post operations', () => {
     if (result.outcome !== 'posted') throw new Error('expected posted result')
     expect(callbacks).toEqual([result]); results.push(callbacks)
     expect(calls.map(c => c.kind)).toEqual(['start', 'end'])
-    expect(posts(C)).toEqual([{ channel: 'C0CHAN002', text: 'waiting' }])
+    expect(posts(C)).toEqual([{ channel: 'C0CHAN002', text: 'waiting', metadata: SERVER_POST_METADATA }])
     expect(logs).toEqual([])
   })
 
@@ -728,7 +734,7 @@ describe('own-post operations', () => {
     expect(calls.map(c => c.kind)).toEqual(['start', 'end'])
     expect(calls[1]).toMatchObject({ answer: { kind: 'failed', code: 'invalid_blocks' } })
     await drainMicrotasks()
-    expect(posts(C)).toEqual([{ channel: 'C0CHAN002', text: 'bad payload' }])
+    expect(posts(C)).toEqual([{ channel: 'C0CHAN002', text: 'bad payload', metadata: SERVER_POST_METADATA }])
     expect(callbacks).toBe(0)
     expect(logs).toEqual([])
   })
@@ -790,7 +796,7 @@ describe('own-post operations', () => {
       const posted = { outcome: 'posted' as const, channelId: 'C0CHAN002', ts: '1700000000.000901' }
       expect(result).toEqual(posted)
       expect(callbacks).toEqual([posted]); results.push(callbacks)
-      expect(posts(C)).toEqual([{ channel: 'C0CHAN002', text: 'notice' }])
+      expect(posts(C)).toEqual([{ channel: 'C0CHAN002', text: 'notice', metadata: SERVER_POST_METADATA }])
       if (fault.startsWith('owner')) expect(ownerCalls).toBe(1)
       expect(logs).toEqual([])
     })

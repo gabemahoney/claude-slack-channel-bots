@@ -28,7 +28,11 @@
  *   action is still handled. The payload is acked exactly once, after
  *   handling, even when an action throws. The click handler refuses a click
  *   whose action names another persona's instance (`cscb_<other key>`).
- * - Any other event name (defensive: the manager forwards only the five
+ * - `reaction_added` and `reaction_removed`: no RAW line; the event, its
+ *   `ack`, the receiving persona's key and the envelope flag (read as for
+ *   messages) go to the reaction intake (`persona-routing.ts`
+ *   `receiveReaction`), which acks and writes the only lines.
+ * - Any other event name (defensive: the manager forwards only the seven
  *   above) is acked and ignored.
  *
  * Every event is handled only for the persona whose connection received it:
@@ -36,7 +40,8 @@
  * while handling one event is caught and logged with the persona key through
  * `describeThrownValue` (the error's message only through
  * `redactSlackLogText`, since it can hold a token or a URL), and never
- * escapes to the manager.
+ * escapes to the manager. Logging is best-effort: a throwing `log` never
+ * skips an intake, an action or an ack.
  *
  * Side-effect free: importing this module creates no client,
  * reads no file, environment variable or token and starts no timer. Every
@@ -71,8 +76,8 @@ const ENVELOPE_FLAG_FIELD = 'is_ext_shared_channel'
 
 /** Dependencies injected into `createPersonaEventRouter`. */
 export interface PersonaEventRouterDeps {
-  /** The persona-routing intake `message` and `app_mention` events go to. */
-  routing: Pick<PersonaRouting, 'receive'>
+  /** The persona-routing intakes: `receive` for `message` and `app_mention`, `receiveReaction` for reactions. */
+  routing: Pick<PersonaRouting, 'receive' | 'receiveReaction'>
   membership?: Pick<ChannelMembership, 'observe'>
   /** The persona's Slack client for the click handler (`clientFor`). */
   clientFor: ClickDeps['clientFor']
@@ -97,9 +102,14 @@ export interface PersonaEventRouterDeps {
 export function createPersonaEventRouter(deps: PersonaEventRouterDeps): PersonaEventHandler {
   const handleClick = deps.handleClick ?? handlePermissionClick
 
+  /** A failing logger must not skip an intake, an action or an ack. */
+  function log(line: string): void {
+    try { deps.log(line) } catch { /* non-critical */ }
+  }
+
   async function routeInbound(key: string, eventName: string, payload: PersonaSocketEventPayload, provenance?: PersonaEventProvenance): Promise<void> {
     const { event, ack } = payload
-    deps.log(`[slack] RAW ${eventName} event persona=${key}: ${JSON.stringify(event)?.slice(0, RAW_EVENT_LOG_LENGTH)}`)
+    log(`[slack] RAW ${eventName} event persona=${key}: ${JSON.stringify(event)?.slice(0, RAW_EVENT_LOG_LENGTH)}`)
     await deps.routing.receive(event, ack, key, envelopeFlagOf(payload), provenance)
   }
 
@@ -140,7 +150,7 @@ export function createPersonaEventRouter(deps: PersonaEventRouterDeps): PersonaE
           }
         } catch (err) {
           // One action's failure does not stop the others.
-          deps.log(
+          log(
             `[slack] persona=${key}: interactive action ${index + 1} of ${actions.length} handling failed: ` +
               describeThrownValue(err),
           )
@@ -152,7 +162,7 @@ export function createPersonaEventRouter(deps: PersonaEventRouterDeps): PersonaE
   }
 
   async function ackAndIgnore(key: string, eventName: string, payload: PersonaSocketEventPayload): Promise<void> {
-    deps.log(`[slack] persona=${key}: ignoring unexpected ${eventName} event`)
+    log(`[slack] persona=${key}: ignoring unexpected ${eventName} event`)
     await payload.ack()
   }
 
@@ -169,6 +179,10 @@ export function createPersonaEventRouter(deps: PersonaEventRouterDeps): PersonaE
         case 'app_mention':
           await routeInbound(key, eventName, payload, provenance)
           return
+        case 'reaction_added':
+        case 'reaction_removed':
+          await deps.routing.receiveReaction(payload.event, payload.ack, key, envelopeFlagOf(payload))
+          return
         case 'interactive':
           await routeInteractive(key, payload)
           return
@@ -176,7 +190,7 @@ export function createPersonaEventRouter(deps: PersonaEventRouterDeps): PersonaE
           await ackAndIgnore(key, String(eventName), payload)
       }
     } catch (err) {
-      deps.log(`[slack] persona=${key}: ${String(eventName)} event handling failed: ${describeThrownValue(err)}`)
+      log(`[slack] persona=${key}: ${String(eventName)} event handling failed: ${describeThrownValue(err)}`)
     }
   }
 }

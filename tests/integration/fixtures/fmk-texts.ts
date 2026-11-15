@@ -2,13 +2,13 @@
  * fmk-texts.ts — the one value printer of the `/ci` scenarios that match
  * texts `src/` exports: every fmk scenario, and the shared-mode
  * test-29-invited-channels.sh (b.jg5 SRJ-1401, SRJ-1306; b.deo SRI-1401,
- * SRI-1404). A scenario script cannot import TypeScript, and a test never
+ * SRI-1404) and test-50-reaction-notices.sh (b.n3k). A scenario script cannot import TypeScript, and a test never
  * retypes a notice text, class label, version or settings value that `src/`
  * exports. So a script asks this printer for the value, and the printer
  * prints the installed package's own export (the tarball under test): a
  * constant as it is, or a builder's output for the script's arguments.
  *
- * Every fmk scenario uses this one printer, and so does test-29. A scenario
+ * Every fmk scenario uses this one printer, and so do test-29 and test-50. A scenario
  * that needs another value adds a named entry to `ENTRIES` here, and never a
  * second printer.
  *
@@ -113,9 +113,11 @@
  *       Prints the installed delivery-notices.ts builder's production notice body.
  *   sharedDeliveryExpectation <key> <name> <slack|cron|interject> <channel-or-sender>
  *       <ts> <sender-id> <via-or-dash>   independently specified expected acceptance, JSONL
- *   sharedAssertAccounting <expectations-jsonl> <server-log> (<key> <queue-snapshot>)...
+ *   sharedAssertAccounting [--per-server-run] <expectations-jsonl> <server-log> (<key> <queue-snapshot>)...
  *       Exact full acceptance and received-diagnostic multisets using production text builders;
  *       compares source, sender and reason, including actual bot posts and injected work.
+ *       --per-server-run: the received set stays exact, but an identity may repeat in later
+ *       server runs (split on the start's `Loaded persona config` line), at most once per run.
  *   sharedExpectedParts <text> <ts> <user-id> <user-name> <channel> <channel-name> <via>
  *       <root-or-dash> <attachment-json-or-dash> independent production-built tag parts, JSON
  *   sharedAssertContent <key> <server-log> <queue-snapshot> <channel> <ts> <text>
@@ -228,8 +230,9 @@
  *   sharedConfigurationMatches <config-path> <record-path> <reviewed|applied>
  *       Validate the whole shared authority and exact reviewed input; applied
  *       also compares resolved applied configuration with that input.
- *   sharedConfigurationValue <config-path> <record-path> <port|resume_enabled>
- *       Print only the named safe applied setting, never pending input.
+ *   sharedConfigurationValue <config-path> <record-path> <port|resume_enabled|channel_mode>
+ *       Print only the named safe applied setting, never pending input;
+ *       channel_mode through src/config.ts's channelModeOf.
  *   sharedAuthorityPreserved <config-path> <before-record> <after-record>
  *       Validate preserved choices, identity and reviewed input across fresh discovery.
  *   sharedThreadStamp <config-path> <record-path> <persona-key> <channel>
@@ -1261,6 +1264,11 @@
  *                                 1 to LIVE_ROW_SEQUENCE_STEP3_RUNS, one line each:
  *                                 every line a step-3 run of the live-row sequence
  *                                 logs when it marked the row `missing`
+ *   liveRowSequenceStep2GetMissingLine <ref>
+ *                                 src/live-row-sequence.ts liveRowSequenceGetLine(<ref>,
+ *                                 2, a LIVE_ROW_READ_ROW read of state `missing`): the
+ *                                 line the live-row sequence's step-2 `get` logs when
+ *                                 it read the row `missing`
  *   stuckLaunchHeldPostedLines <key>
  *                                 src/pending-row.ts stuckLaunchPostLine(<key>,
  *                                 STUCK_LAUNCH_MARK_HELD, STUCK_LAUNCH_POSTED, …) for
@@ -1362,6 +1370,62 @@
  *                                 `<home>/.claude` to its real path (the one
  *                                 derivation the spawn labels and the collision
  *                                 ladder's `config_dir` comparison share)
+ *
+ * The per-persona model and effort entries (test-49; b.fx2):
+ *   MODEL_ARG_PREFIX              src/agent-director-template.ts MODEL_ARG_PREFIX:
+ *                                 the start-argument element's text before a
+ *                                 persona's `model` value
+ *   EFFORT_ARG_PREFIX             src/agent-director-template.ts EFFORT_ARG_PREFIX:
+ *                                 the start-argument element's text before a
+ *                                 persona's `effort` level
+ *   EFFORT_LEVELS                 src/config.ts EFFORT_LEVELS, the levels
+ *                                 `effort` accepts, in order, joined by single
+ *                                 spaces
+ * None of the above takes an argument.
+ *   freshStartLine <ref> <key> [<key>]
+ *                                 src/live-row-sequence.ts freshStartLine(<ref>,
+ *                                 <keys>): the server's line when a persona's
+ *                                 relaunch starts a fresh conversation because
+ *                                 these start values differ from the ones its
+ *                                 conversation started with; each <key> is
+ *                                 src/persona-identity.ts MODEL_LABEL_KEY or
+ *                                 EFFORT_LABEL_KEY by its value (any other
+ *                                 fails), in that order (any other order
+ *                                 fails)
+ *
+ * test-50's entries (test-50-reaction-notices.sh, a shared-mode scenario;
+ * b.n3k). <name> is a persona name, <key> its key, <chat> a conversation ID
+ * and <message-ts> the reacted message's ts:
+ *   REACTION_RECEIVED, REACTION_DROPPED
+ *                                 src/reaction-intake-diagnostics.ts, the class
+ *                                 labels
+ *   REACTION_WITHDRAWN, REACTION_MESSAGE_UNKNOWN
+ *                                 src/reaction-preparation-diagnostics.ts, the
+ *                                 class labels
+ *   buildReactionReceivedLine <name> <key> <chat> <message-ts> <added|removed> <emoji> <user> <seq>
+ *                                 src/reaction-intake-diagnostics.ts: the line of
+ *                                 a newly stored Reaction Item from user <user>,
+ *                                 <seq> its sequence in decimal
+ *   buildReactionDroppedLine <name> <key> <reason> <chat> <message-ts> [<refusal>]
+ *                                 src/reaction-intake-diagnostics.ts: a logged
+ *                                 drop, <reason> one of its
+ *                                 REACTION_LOGGED_DROP_REASONS, <refusal> given
+ *                                 for `fungible-refused` and only for it
+ *   buildReactionWithdrawnLine <name> <key> <chat> <message-ts> <reason> [<condition>]
+ *                                 src/reaction-preparation-diagnostics.ts: a
+ *                                 withdrawal's line, <reason> and <condition> as
+ *                                 src/delivery-queue.ts's withdrawn record names
+ *                                 them
+ *   buildReactionMessageUnknownLine <name> <key> <chat> <message-ts>
+ *                                 src/reaction-preparation-diagnostics.ts: a
+ *                                 notice fixed without `thread_ts`
+ *   TAG_SOURCE                    src/tag-wrapper.ts, a typed tag's `source`
+ *   SERVER_POST_EVENT_TYPE        src/server-post.ts, a Server Post's metadata
+ *                                 event type
+ *   encodePermissionActionId <allow|deny> <instance-id> <token>
+ *                                 src/permission-action-id.ts: a permission
+ *                                 prompt button's action_id
+ *   REPLY_REMINDER_TEXT           src/reply-reminder.ts, the reply reminder's text
  *
  * An entry is one `Entry` in `ENTRIES`: its argument synopsis, the export it
  * prints and a `print` function from its arguments to the value. Constants
@@ -3856,6 +3920,13 @@ async function liveRowSequenceStep3MarkedMissingLines(ref: string): Promise<stri
   return lines.join('\n')
 }
 
+/** The live-row sequence's step-2 `get` line for `ref` when it read the row `missing`. */
+async function liveRowSequenceStep2GetMissingLine(ref: string): Promise<string> {
+  const lineOf = await functionExport('live-row-sequence.ts', 'liveRowSequenceGetLine')
+  const row = await stringExport('live-row-sequence.ts', 'LIVE_ROW_READ_ROW')
+  return builtText('live-row-sequence.ts', 'liveRowSequenceGetLine', lineOf(ref, 2, { kind: row, row: { state: 'missing' } }))
+}
+
 /** Every line the held text's poster logs for persona `key` with the answer `posted`: both forms of the text, each unmuted and muted, joined by newlines. */
 async function stuckLaunchHeldPostedLines(key: string): Promise<string> {
   const lineOf = await functionExport('pending-row.ts', 'stuckLaunchPostLine')
@@ -4074,6 +4145,7 @@ const FN_ENTRIES: Readonly<Record<string, FnEntry>> = {
   }),
   stuckLaunchAbortKillSucceededHead: oneArgument('stuckLaunchAbortKillSucceededHead', 'key', stuckLaunchAbortKillSucceededHead),
   liveRowSequenceStep3MarkedMissingLines: oneArgument('liveRowSequenceStep3MarkedMissingLines', 'ref', liveRowSequenceStep3MarkedMissingLines),
+  liveRowSequenceStep2GetMissingLine: oneArgument('liveRowSequenceStep2GetMissingLine', 'ref', liveRowSequenceStep2GetMissingLine),
   stuckLaunchHeldPostedLines: oneArgument('stuckLaunchHeldPostedLines', 'key', stuckLaunchHeldPostedLines),
   pendingRowRuleRoundLineHead: exactArguments('pendingRowRuleRoundLineHead', ['ref', 'origin'], ([ref, origin]) =>
     pendingRowRuleRoundLineHead(ref!, origin!),
@@ -4415,15 +4487,21 @@ const sharedThreadStamp: Entry = {
   },
 }
 
-// sharedConfigurationValue <config-path> <record-path> <port|resume_enabled>:
+// sharedConfigurationValue <config-path> <record-path> <port|resume_enabled|channel_mode>:
 // the applied view only, never the pending input or an arbitrary JSON path.
 const sharedConfigurationValue: Entry = {
-  synopsis: '<config-path> <record-path> <port|resume_enabled>',
+  synopsis: '<config-path> <record-path> <port|resume_enabled|channel_mode>',
   async print(args, context) {
     expectArguments('sharedConfigurationValue', args, ['config-path', 'record-path', 'setting'])
     const [configPath, recordPath, setting] = args
-    if (setting !== 'port' && setting !== 'resume_enabled') usageFail('setting must be port or resume_enabled')
+    if (setting !== 'port' && setting !== 'resume_enabled' && setting !== 'channel_mode') usageFail('setting must be port, resume_enabled or channel_mode')
     const { applied } = await readSharedConfiguration(context, configPath, recordPath)
+    if (setting === 'channel_mode') {
+      const modeOf = await packageFunction<(config: object) => unknown>(context, 'config.ts', 'channelModeOf')
+      const mode = modeOf(applied)
+      if (mode !== 'strict' && mode !== 'open') throw new PrinterFailure('shared configuration setting has an unexpected type', PRINTER_FAIL_EXIT)
+      return mode
+    }
     const value = applied[setting]
     if (setting === 'port' ? !Number.isSafeInteger(value) : typeof value !== 'boolean') {
       throw new PrinterFailure('shared configuration setting has an unexpected type', PRINTER_FAIL_EXIT)
@@ -4921,10 +4999,10 @@ function sharedHoldTransition(before: SharedAccepted, after: SharedAccepted,
     rows.some(r => r.kind === 'accepted' && 'compact' in r && r.compact === 'allocation' && r.seq >= after.seq)),
   'hold transition lacks same-observation compaction evidence')
   const resolutions = observations.flat().filter((r): r is import('../../../src/delivery-queue.ts').HoldResolutionRecord =>
-    r.seq === before.seq && ['released', 'withdrawn', 'parked'].includes(r.kind))
+    r.seq === before.seq && ['released', 'hold-withdrawn', 'parked'].includes(r.kind))
   const released = new Set(resolutions.filter(r => r.kind === 'released').map(r => r.at))
   const parked = new Set(resolutions.filter(r => r.kind === 'parked').map(r => r.at))
-  evidenceAssert(!resolutions.some(r => r.kind === 'withdrawn') && released.size <= 1 && parked.size <= 1,
+  evidenceAssert(!resolutions.some(r => r.kind === 'hold-withdrawn') && released.size <= 1 && parked.size <= 1,
     'conflicting hold resolution evidence')
   if (after.hold) {
     evidenceAssert(hold.on === 'post' && hold.root_unknown && after.released_at === undefined &&
@@ -5205,6 +5283,8 @@ const sharedQueueReceipts: Entry = {
     const { accepted, items } = await sharedReceiptView(context, key, log, rows)
     const current = await sharedQueueRecords(context, [journal])
     const currentSeqs = new Set(sharedAccepts(current).map(r => r.seq))
+    const keyKeepMs = await packageExport(context, 'delivery-queue.ts', 'QUEUE_KEY_KEEP_MS')
+    evidenceAssert(Number.isSafeInteger(keyKeepMs) && (keyKeepMs as number) > 0, 'invalid production key retention')
     // Archives are observed evidence, not authority to resurrect lost work.
     // Require the live journal's compacted key/allocation and the archived
     // exact receipt proof before allowing a historical item to complete.
@@ -5212,10 +5292,15 @@ const sharedQueueReceipts: Entry = {
       const proof = items.find(r => r.seq === item.seq)!
       evidenceAssert(proof.complete, 'archived item lacks complete observed receipts')
       const marker = current.find(r => r.kind === 'accepted' && 'compact' in r && r.compact === 'key' && r.seq === item.seq)
-      const retained = item.source === 'slack'
-        ? marker && 'key' in marker && 'delivered_at' in marker && isDeepStrictEqual(marker.key, item.key) &&
-          marker.received_at === item.received_at && marker.delivered_at === Math.max(...proof.receipts.map(r => r.at))
-        : current.some(r => r.kind === 'accepted' && 'compact' in r && r.compact === 'allocation' && r.seq >= item.seq)
+      const allocated = current.some(r => r.kind === 'accepted' && 'compact' in r && r.compact === 'allocation' && r.seq >= item.seq)
+      const deliveredAt = Math.max(...proof.receipts.map(r => r.at))
+      // Compaction follows the final receipt and keeps a Slack key only while
+      // it is younger than QUEUE_KEY_KEEP_MS, so a key already that old at its
+      // final receipt leaves only the allocation (an upgraded 0.18.0 item).
+      const retained = item.source !== 'slack' ? allocated
+        : deliveredAt - item.received_at >= (keyKeepMs as number) ? !marker && allocated
+        : marker && 'key' in marker && 'delivered_at' in marker && isDeepStrictEqual(marker.key, item.key) &&
+          marker.received_at === item.received_at && marker.delivered_at === deliveredAt
       evidenceAssert(retained, 'archived item lacks matching live compaction evidence')
     }
     const progress = items.filter(r => originals.some(a => a.seq === r.seq)).reduce((n, r) => n + r.receipted_parts, 0)
@@ -5349,9 +5434,26 @@ const sharedDeliveryExpectation: Entry = {
       ...(via === '-' ? {} : { via }) }) + '\n'
   },
 }
+// src/server.ts main() logs this once per start, before it creates the
+// delivery reporting that writes every message-received line, the
+// start-time releases of recovered holds included.
+const SHARED_SERVER_START_RE = /^(?:\[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z\] )?\[slack\] Loaded persona config: (?:0|[1-9][0-9]*) persona\(s\)$/
+// Oldest first: the rotations `.K` … `.1` (src/logging.ts shifts each one
+// up), then the active file. Within a file, lines are in write order.
+function sharedLogsInOrder(path: string): string[] {
+  const rotated = sharedLogPaths(path).filter(p => p !== path)
+    .map(p => ({ p, n: Number(/\.([0-9]+)$/.exec(p)?.[1]) })).sort((a, b) => b.n - a.n)
+  evidenceAssert(rotated.every((r, i) => r.n === rotated.length - i), 'server log rotations are not contiguous')
+  return [...rotated.map(r => r.p), path]
+}
 const sharedAssertAccounting: Entry = {
-  synopsis: '<expectations-jsonl> <server-log> (<key> <queue-snapshot>)...',
-  async print(args, context) {
+  synopsis: '[--per-server-run] <expectations-jsonl> <server-log> (<key> <queue-snapshot>)...',
+  async print(input, context) {
+    // message-received is deduplicated for one server run
+    // (src/delivery-notices.ts), so an item still queued at a stop is logged
+    // again when the next start recovers it. --per-server-run keeps the exact
+    // accepted and received sets, allowing each identity at most once per run.
+    const perRun = input[0] === '--per-server-run', args = perRun ? input.slice(1) : input
     evidenceAssert(args.length >= 4 && args.length % 2 === 0, 'accounting needs expectations, log and key/snapshot pairs')
     const expected: SharedExpected[] = sharedJSON(args[0])
     evidenceAssert(expected.length > 0, 'empty expected acceptance set')
@@ -5370,13 +5472,32 @@ const sharedAssertAccounting: Entry = {
         accepts.push(diagnostic(label, ref(e.name, key), identity(row)))
       }
     }
-    for (const path of sharedLogPaths(args[1])) for (const line of sharedLines(path)) {
+    let run = 0
+    const runs = new Map<string, number[]>()
+    for (const path of perRun ? sharedLogsInOrder(args[1]) : sharedLogPaths(args[1])) for (const line of sharedLines(path)) {
+      if (perRun && SHARED_SERVER_START_RE.test(line)) { run++; continue }
       const marker = `[slack] ${label}: `, i = line.indexOf(marker)
-      if (i >= 0) actual.push(line.slice(i))
+      if (i < 0) continue
+      const received = line.slice(i)
+      actual.push(received)
+      if (!perRun) continue
+      evidenceAssert(run > 0, 'received diagnostic before any server start')
+      runs.set(received, [...runs.get(received) ?? [], run])
     }
     evidenceAssert(isDeepStrictEqual(accepts.sort(), [...wanted].sort()), 'exact accepted set mismatch')
-    evidenceAssert(isDeepStrictEqual(actual.sort(), [...wanted].sort()), 'exact received diagnostic set mismatch')
-    return JSON.stringify({ accepted: accepts.length, received: actual.length })
+    if (!perRun) {
+      evidenceAssert(isDeepStrictEqual(actual.sort(), [...wanted].sort()), 'exact received diagnostic set mismatch')
+      return JSON.stringify({ accepted: accepts.length, received: actual.length })
+    }
+    const wantedSet = new Set(wanted)
+    const missing = wanted.filter(w => !runs.has(w)).length, extra = [...runs.keys()].filter(r => !wantedSet.has(r)).length
+    evidenceAssert(!missing && !extra, `exact received diagnostic set mismatch (missing=${missing} extra=${extra})`)
+    // Lines are read in write order, so a repeat in a run after the first
+    // line's run is a strictly later run; equal runs are a same-run repeat.
+    const repeated = [...runs.values()].filter(r => r.length > 1)
+    const sameRun = repeated.filter(r => r.some((n, j) => j > 0 && n <= r[j - 1]!)).length
+    evidenceAssert(!sameRun, `received diagnostic repeated within one server run (identities=${sameRun})`)
+    return JSON.stringify({ accepted: accepts.length, received: actual.length, runs: run, repeated: repeated.length })
   },
 }
 const sharedExpectedParts: Entry = {
@@ -5700,6 +5821,142 @@ const SHARED_DIAGNOSTIC_NAMES = [
   'THREAD_MEMORY_SEAL_UNREADABLE', 'THREAD_MEMORY_SEAL_NOT_SAVED', 'THREAD_MEMORY_HOLDS_NOT_RESOLVED',
 ] as const
 
+/** `EFFORT_LEVELS` (src/config.ts), the levels in order, joined by single spaces. */
+const effortLevels: Entry = {
+  synopsis: '',
+  async print(args, context) {
+    const entry = 'EFFORT_LEVELS'
+    expectArguments(entry, args, [])
+    const levels = await packageExport(context, 'config.ts', entry)
+    if (!Array.isArray(levels) || levels.length === 0 || levels.some((l) => typeof l !== 'string' || !/^[a-z]+$/.test(l))) {
+      fail(PRINTER_FAIL_EXIT, `the installed package's src/config.ts export ${entry} is not an array of level names`)
+    }
+    return (levels as string[]).join(' ')
+  },
+}
+
+/** `freshStartLine(<ref>, <keys>)` (src/live-row-sequence.ts), each key MODEL_LABEL_KEY or EFFORT_LABEL_KEY by its value. */
+const freshStartLine: Entry = {
+  synopsis: '<ref> <key> [<key>]',
+  async print(args, context) {
+    const entry = 'freshStartLine'
+    expectSomeArguments(entry, args, ['ref', 'key', 'key'], 2)
+    const [ref, ...keys] = args
+    const known = [
+      await packageString(context, 'persona-identity.ts', 'MODEL_LABEL_KEY'),
+      await packageString(context, 'persona-identity.ts', 'EFFORT_LABEL_KEY'),
+    ]
+    for (const key of keys) {
+      if (!known.includes(key)) usageFail(`${entry}: <key> must be one of ${known.join(', ')} (got '${key}')`)
+    }
+    if (new Set(keys).size !== keys.length) usageFail(`${entry}: <key> '${keys[0]}' is given twice`)
+    if (keys.some((key, i) => i > 0 && known.indexOf(keys[i - 1]) > known.indexOf(key))) {
+      usageFail(`${entry}: the <key>s must come in the order ${known.join(', ')} (got ${keys.join(', ')})`)
+    }
+    const build = await packageFunction<(ref: string, differing: readonly string[]) => unknown>(context, 'live-row-sequence.ts', entry)
+    return builtString(entry, build(ref, keys))
+  },
+}
+
+// ---------------------------------------------------------------------------
+// test-50's Reaction Notice texts (test-50-reaction-notices.sh, a shared-mode
+// scenario), every one from reaction-intake-diagnostics.ts,
+// reaction-preparation-diagnostics.ts, tag-wrapper.ts, server-post.ts,
+// permission-action-id.ts or reply-reminder.ts.
+// ---------------------------------------------------------------------------
+
+/** The changes a reaction event names, as a Reaction Notice's `reaction` attribute carries them. */
+const REACTION_CHANGES: readonly string[] = ['added', 'removed']
+
+/** The withdrawal reasons and fungible conditions a queue's withdrawn record names (src/delivery-queue.ts's types; the package exports no list). */
+const REACTION_WITHDRAWAL_REASONS: readonly string[] = ['server-post', 'conversation-unknown', 'group-dm', 'fungible-refused']
+const REACTION_FUNGIBLE_CONDITIONS: readonly string[] = ['not-a-channel', 'externally-shared', 'not_in_channel', 'channel_not_found']
+
+/** Fails with a usage failure unless `value` is one of `allowed`. */
+function checkOneOf(entry: string, name: string, value: string, allowed: readonly string[]): void {
+  if (!allowed.includes(value)) usageFail(`${entry}: <${name}> must be one of ${allowed.join(', ')} (got '${value}')`)
+}
+
+/**
+ * `buildReactionReceivedLine({ key, name }, record)` (reaction-intake-diagnostics.ts)
+ * for a user reactor: the line of a newly stored Reaction Item, <seq> its
+ * sequence in decimal.
+ */
+const reactionReceivedLine: Entry = {
+  synopsis: '<name> <key> <chat> <message-ts> <added|removed> <emoji> <user> <seq>',
+  async print(args, context) {
+    const entry = 'buildReactionReceivedLine'
+    expectArguments(entry, args, ['name', 'key', 'chat', 'message-ts', 'added|removed', 'emoji', 'user', 'seq'])
+    const [name, key, channel, messageTs, change, emoji, user, seq] = args
+    checkOneOf(entry, 'added|removed', change!, REACTION_CHANGES)
+    if (!/^[1-9][0-9]{0,8}$/.test(seq!)) usageFail(`${entry}: <seq> '${seq}' is not a positive whole number in decimal`)
+    const build = await packageFunction<(p: { key: string; name: string }, record: Record<string, unknown>) => unknown>(
+      context,
+      'reaction-intake-diagnostics.ts',
+      entry,
+    )
+    return builtString(entry, build({ key: key!, name: name! }, { channel, message_ts: messageTs, change, emoji, user, seq: Number(seq) }))
+  },
+}
+
+/**
+ * `buildReactionDroppedLine({ key, name }, { reason, chat_id, message_ts, refusal })`
+ * (reaction-intake-diagnostics.ts): <reason> one of the package's
+ * REACTION_LOGGED_DROP_REASONS, <refusal> given for `fungible-refused` only.
+ */
+const reactionDroppedLine: Entry = {
+  synopsis: '<name> <key> <reason> <chat> <message-ts> [<refusal>]',
+  async print(args, context) {
+    const entry = 'buildReactionDroppedLine'
+    expectSomeArguments(entry, args, ['name', 'key', 'reason', 'chat', 'message-ts', 'refusal'], 5)
+    const [name, key, reason, channel, messageTs, refusal] = args
+    const reasons = await packageExport(context, 'reaction-intake-diagnostics.ts', 'REACTION_LOGGED_DROP_REASONS')
+    if (!Array.isArray(reasons) || !reasons.includes(reason)) usageFail(`${entry}: <reason> '${reason}' is not one of the package's REACTION_LOGGED_DROP_REASONS`)
+    if ((reason === 'fungible-refused') !== (refusal !== undefined)) usageFail(`${entry}: <refusal> is given for fungible-refused and only for it`)
+    const build = await packageFunction<(p: { key: string; name: string }, drop: Record<string, unknown>) => unknown>(
+      context,
+      'reaction-intake-diagnostics.ts',
+      entry,
+    )
+    const drop: Record<string, unknown> = { reason, chat_id: channel, message_ts: messageTs }
+    if (refusal !== undefined) drop.refusal = refusal
+    return builtString(entry, build({ key: key!, name: name! }, drop))
+  },
+}
+
+/**
+ * `buildReactionWithdrawnLine({ key, name, chat_id, message_ts }, <reason>, <condition>)`
+ * (reaction-preparation-diagnostics.ts), <condition> given or not.
+ */
+const reactionWithdrawnLine: Entry = {
+  synopsis: '<name> <key> <chat> <message-ts> <reason> [<condition>]',
+  async print(args, context) {
+    const entry = 'buildReactionWithdrawnLine'
+    expectSomeArguments(entry, args, ['name', 'key', 'chat', 'message-ts', 'reason', 'condition'], 5)
+    const [name, key, channel, messageTs, reason, condition] = args
+    checkOneOf(entry, 'reason', reason!, REACTION_WITHDRAWAL_REASONS)
+    if (condition !== undefined) checkOneOf(entry, 'condition', condition, REACTION_FUNGIBLE_CONDITIONS)
+    const build = await packageFunction<(s: Record<string, string>, reason: string, condition?: string) => unknown>(
+      context,
+      'reaction-preparation-diagnostics.ts',
+      entry,
+    )
+    return builtString(entry, build({ key: key!, name: name!, chat_id: channel!, message_ts: messageTs! }, reason!, condition))
+  },
+}
+
+/** `buildReactionMessageUnknownLine({ key, name, chat_id, message_ts })` (reaction-preparation-diagnostics.ts). */
+const reactionMessageUnknownLine: Entry = {
+  synopsis: '<name> <key> <chat> <message-ts>',
+  async print(args, context) {
+    const entry = 'buildReactionMessageUnknownLine'
+    expectArguments(entry, args, ['name', 'key', 'chat', 'message-ts'])
+    const [name, key, channel, messageTs] = args
+    const build = await packageFunction<(s: Record<string, string>) => unknown>(context, 'reaction-preparation-diagnostics.ts', entry)
+    return builtString(entry, build({ key: key!, name: name!, chat_id: channel!, message_ts: messageTs! }))
+  },
+}
+
 /** The printer's entries, by the name a script passes. Later scenarios add entries here. */
 const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   buildSharedStateUnresolvedNotice,
@@ -5956,6 +6213,24 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   MODE_SWITCH_SETTING: constantEntry('reload-plan.ts', 'MODE_SWITCH_SETTING'),
   CHANNEL_DELIVERY_FILE_NAME: constantEntry('channel-delivery.ts', 'CHANNEL_DELIVERY_FILE_NAME'),
   formatPersonaDiagnostic: personaDiagnosticLine,
+  // Per-persona model and effort (test-49-fmk-model-effort.sh; b.fx2).
+  MODEL_ARG_PREFIX: constantEntry('agent-director-template.ts', 'MODEL_ARG_PREFIX'),
+  EFFORT_ARG_PREFIX: constantEntry('agent-director-template.ts', 'EFFORT_ARG_PREFIX'),
+  EFFORT_LEVELS: effortLevels,
+  freshStartLine,
+  // test-50 (test-50-reaction-notices.sh), a shared-mode scenario.
+  REACTION_RECEIVED: constantEntry('reaction-intake-diagnostics.ts', 'REACTION_RECEIVED'),
+  REACTION_DROPPED: constantEntry('reaction-intake-diagnostics.ts', 'REACTION_DROPPED'),
+  REACTION_WITHDRAWN: constantEntry('reaction-preparation-diagnostics.ts', 'REACTION_WITHDRAWN'),
+  REACTION_MESSAGE_UNKNOWN: constantEntry('reaction-preparation-diagnostics.ts', 'REACTION_MESSAGE_UNKNOWN'),
+  buildReactionReceivedLine: reactionReceivedLine,
+  buildReactionDroppedLine: reactionDroppedLine,
+  buildReactionWithdrawnLine: reactionWithdrawnLine,
+  buildReactionMessageUnknownLine: reactionMessageUnknownLine,
+  TAG_SOURCE: constantEntry('tag-wrapper.ts', 'TAG_SOURCE'),
+  SERVER_POST_EVENT_TYPE: constantEntry('server-post.ts', 'SERVER_POST_EVENT_TYPE'),
+  encodePermissionActionId: builderEntry('permission-action-id.ts', 'encodePermissionActionId', ['allow|deny', 'instance-id', 'token']),
+  REPLY_REMINDER_TEXT: constantEntry('reply-reminder.ts', 'REPLY_REMINDER_TEXT'),
 }, argsEntries(ARGS_ENTRIES), fnEntries(FN_ENTRIES))
 
 /** The value entry `name` prints for `args`; a usage failure for no entry or an unknown one. */

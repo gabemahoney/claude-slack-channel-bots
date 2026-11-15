@@ -102,7 +102,7 @@ const HELPER_DEFS = ['mark', 'since', 'tokcount', 'showsafe'].map(helperDef).joi
 const CONTAINER_TOOLS = ['bash', 'cat', 'jq', 'curl', 'grep', 'stat', 'wc', 'tail']
 
 /** C's manifest with sentinels in fields the evidence must never copy. */
-function exportedManifest(events: readonly string[] = ['message.channels', 'message.im', 'message.groups', 'app_mention', 'member_joined_channel', 'channel_left']): JsonObject {
+function exportedManifest(events: readonly string[] = ['message.channels', 'message.im', 'message.groups', 'app_mention', 'member_joined_channel', 'channel_left', 'reaction_added', 'reaction_removed']): JsonObject {
   const m = structuredClone(MANIFEST_C) as Record<string, any>
   m.display_information = { ...m.display_information, long_description: `${BODY_SENTINEL} ${TOKEN}` }
   m.settings = { ...m.settings, event_subscriptions: { ...m.settings.event_subscriptions, bot_events: [...events] } }

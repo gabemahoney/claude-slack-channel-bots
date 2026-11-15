@@ -70,6 +70,7 @@ export function makePersonaConfig(overrides: Partial<PersonaConfig> = {}, baseDi
     sections: { channels: input.channels, permission_prompts: input.permission_prompts },
     dm: { enabled: false },
     stop_hook_bootstrap: true,
+    reaction_notices: true,
   }
   return {
     personas: [persona],
@@ -123,6 +124,7 @@ export function makeMultiPersonaConfig(
       sections: { channels: structuredClone(channels), permission_prompts: permissionPrompts },
       dm: { enabled: false },
       stop_hook_bootstrap: base.stop_hook_bootstrap,
+      reaction_notices: true,
       ...spec,
     }
     if (claudeConfigDir !== undefined) persona.claude_config_dir = claudeConfigDir

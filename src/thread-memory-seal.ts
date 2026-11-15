@@ -149,6 +149,8 @@ export interface ThreadMemorySealShared {
 export interface ThreadMemorySealOptions extends ThreadMemorySealShared {
   stateDir: string; fs?: typeof nodeFs
   queueJournalPath(key: string): string
+  /** Each successful open of an existing queue journal, before it is read (SR-2.1.3). */
+  onQueueJournalOpened?(key: string): void
   onEvent?(event: ThreadMemorySealEvent): void
 }
 /** Optional port consumed by Thread Memory; the seal owns its shared writer. */
@@ -222,6 +224,7 @@ export function createThreadMemorySeal(options: ThreadMemorySealOptions): Thread
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { size: '0', sha256: EMPTY_SHA256 }
       throw error
     }
+    try { options.onQueueJournalOpened?.(key) } catch { /* an observer cannot change the identity */ }
     try {
       const stat = fs.fstatSync(fd, { bigint: true }), hash = createHash('sha256'), buffer = Buffer.alloc(QUEUE_HASH_CHUNK_BYTES)
       for (;;) {

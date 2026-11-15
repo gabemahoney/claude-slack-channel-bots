@@ -201,9 +201,13 @@ export CSCB_SLACK_API_URL
 # Reading the rows, the logs, the record, the trail and the times
 # ---------------------------------------------------------------------------
 
-# t21_row_state <id>: print the row's state (a harness `status`), or nothing
-# when the read fails.
+# t21_row_state <id>: print the passive store state from 0.18.0, otherwise
+# a harness `status`; nothing when absent or the legacy read fails.
 t21_row_state() {
+    if ad_release_at_least 0.18.0; then
+        ad_store_peek "$1" | jq -r '.state // empty'
+        return 0
+    fi
     ad_capture status --instance-id "$1"
     [[ "${AD_RC}" == 0 ]] || return 0
     jq -r '.state // empty' "${AD_OUT}" 2> /dev/null || true
@@ -215,6 +219,12 @@ t21_row_is() {
 
 # True when the row reads `pending` with a launch start.
 t21_row_pending_launched() {
+    if ad_release_at_least 0.18.0; then
+        AD_OUT="${SCENARIO_ROOT}/t21-pending-row.json"
+        ad_store_peek "$1" > "${AD_OUT}" || exit 1
+        jq -e '.state == "pending" and (.launch_started_at // "" | length > 0)' "${AD_OUT}" > /dev/null
+        return
+    fi
     ad_capture status --instance-id "$1"
     [[ "${AD_RC}" == 0 ]] || return 1
     jq -e '.state == "pending" and (.launch_started_at // "" | length > 0)' "${AD_OUT}" > /dev/null 2>&1
@@ -233,8 +243,19 @@ t21_row_get() {
 # id and earlier sessions, and its tmux session, agent and arguments. Fields
 # agent-director refreshes on an idle row (last_seen_at, context, liveness_*,
 # family_state, transcript_status) are left out, so two reads seconds or
-# minutes apart match unless the row's life changed.
+# minutes apart match unless the row's life changed. From 0.18.0 a `get`
+# checks the row it reads and can change it itself, so the snapshot is the
+# same fields of the store row (`ad_store_peek`) instead, with its launch
+# token for its earlier sessions.
 t21_row_snapshot() {
+    local row
+    if ad_release_at_least 0.18.0; then
+        row="$(ad_store_peek "$1")" || exit 1
+        [[ -n "${row}" ]] || fail "$2: the store has no row $1"
+        jq -cS '{instance_id, state, state_changed_at, started_at, ended_at, launch_started_at, launch_token,
+            session_id, tmux_session_name, tmux_socket, agent, agent_args, cwd}' <<< "${row}"
+        return 0
+    fi
     t21_row_get "$1" "$2"
     jq -cS '{instance_id, state, state_changed_at, started_at, ended_at, launch_started_at,
         session_id, prior_session_ids: [.prior_sessions[]?.session_id],
@@ -554,14 +575,98 @@ t21_check_last_line() {
 # S3: the precheck legs ( design note)
 # ---------------------------------------------------------------------------
 
+# Join the same two shim logs as assert_no_server_tmux: tmux's immediate
+# parent is agent-director, whose parent is the recorded CSCB server. A
+# cscb_tmux_count call only counts direct CSCB -> tmux calls, so it cannot
+# prove this chain. Check the first create on this socket, not a later call
+# that could hide a foreign create; the AD PID must belong to the latest
+# preceding call with that PID, as in the closing assertion's reuse guard.
+t21_assert_first_tmux_create() {
+    local step="child environment boundary" socket="$1" ad_lines=() tmux_lines=() parent=()
+    local i entry best owned
+    local -A ad_calls=()
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_query_prep "${step}"
+    _scenario_read_log "${step}" "${SCENARIO_AD_SHIM_LOG}" ad_lines
+    _scenario_read_log "${step}" "${SCENARIO_TMUX_SHIM_LOG}" tmux_lines
+    for i in "${!ad_lines[@]}"; do
+        _scenario_split_line "${ad_lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        owned=0
+        _scenario_decode_words
+        _scenario_ad_verb
+        _scenario_ad_id
+        if _scenario_role_at "${_L_PPID}" "${_L_US}" && [[ "${_SCENARIO_ROLE}" == server ]] \
+            && [[ "${_L_VERB}" == spawn && ( "${_L_ID}" == "${A_ID}" || "${_L_ID}" == "${B_ID}" ) ]]; then
+            owned=1
+        fi
+        ad_calls["${_L_PID}"]+=" ${_L_US}:${owned}"
+    done
+    for i in "${!tmux_lines[@]}"; do
+        _scenario_split_line "${tmux_lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        _scenario_decode_words
+        # AD's create argv is -u -S <socket> new-session ... (the release
+        # used here), or start-server ; source-file - for private input.
+        [[ "${_L_WORDS[0]:-}" == -u && "${_L_WORDS[1]:-}" == -S \
+            && "${_L_WORDS[2]:-}" == "${socket}" ]] || continue
+        case "${_L_WORDS[3]:-}" in new-session | start-server) ;; *) continue ;; esac
+        best=""
+        for entry in ${ad_calls[${_L_PPID}]:-}; do
+            (( ${entry%:*} <= _L_US )) || continue
+            if [[ -z "${best}" ]] || (( ${entry%:*} >= ${best%:*} )); then best="${entry}"; fi
+        done
+        [[ "${best}" == *:1 ]] \
+            || fail "${step}: first tmux create has no preceding CSCB-server persona spawn"
+        _scenario_eval_words parent "${_L_PARENT}" || fail "${step}: unreadable tmux parent"
+        entry="${parent[0]:-}"
+        case "${entry##*/}" in agent-director | agent-director.real) ;; \
+            *) fail "${step}: first tmux create was not made by agent-director" ;; esac
+        return 0
+    done
+    fail "${step}: no scenario-socket tmux create in the shim log"
+}
+
 t21_precheck_legs() {
     local step="precheck" a_before b_before after pid out cmd cmd_name args head nothing n ids a_sid
+    # b.c13: this is the scenario's FIRST start. Do not seed tmux: the
+    # environment of CSCB's first launch must become the new server's env.
+    require_ci_image "child environment boundary"
+    require_scenario_home "child environment boundary"
+    local socket="${TMUX_TMPDIR}/tmux-$(id -u)/default" names
+    [[ ! -S "${socket}" ]] || fail "child environment boundary: socket already exists before CSCB's first launch"
+    if "${SCENARIO_REAL_TMUX}" -S "${socket}" list-sessions > /dev/null 2>&1; then
+        fail "child environment boundary: tmux was seeded before CSCB's first launch"
+    fi
+    [[ ! -s "${SCENARIO_TMUX_SHIM_LOG}" ]] || fail "child environment boundary: tmux shim calls preceded CSCB's first launch"
+    # run_start ordinarily unsets SLACK_BOT_TOKEN; the fixture override puts
+    # these fake values into the actual CLI parent's environment afterwards.
+    SCENARIO_START_ENV=(SLACK_BOT_TOKEN=fake-not-a-token GH_TOKEN=fake-not-a-token)
     t21_up "${step}: setup" A B
+    unset SCENARIO_START_ENV
+    [[ -S "${socket}" ]] || fail "child environment boundary: CSCB did not create the scenario socket"
+    t21_assert_first_tmux_create "${socket}"
+    # Only names leave this pipe. Never retain the raw global environment.
+    names="$("${SCENARIO_REAL_TMUX}" -S "${socket}" show-environment -g | cut -d= -f1)" \
+        || fail "child environment boundary: could not read tmux environment names"
+    if grep -qiE '^SLACK_.*(TOKEN|SECRET)$|^_CLI_DAEMON_CHILD$' <<< "${names}"; then
+        fail "child environment boundary: CSCB credentials or daemon marker reached tmux"
+    fi
+    grep -qxF GH_TOKEN <<< "${names}" \
+        || fail "child environment boundary: host GH_TOKEN did not pass through"
 
     # The harness respawns A's worker pane with another process: A's
     # `read-pane` answers CONFLICT ("the agent's pane was not found") while
-    # its row stays live.
-    respawn_worker_pane "${A_SESSION}" sleep 86400 > /dev/null
+    # its row stays live. From 0.18.0 every read judges the row's agent
+    # process, the recorded pane process first, so a respawn gets the row
+    # marked missing; instead the row records a pane id no pane has, its
+    # process identity kept, so every check finds the worker alive.
+    if ad_release_at_least 0.18.0; then
+        ad_store_no_agent_pane "${step}" "${A_ID}"
+    else
+        respawn_worker_pane "${A_SESSION}" sleep 86400 > /dev/null
+    fi
     a_before="$(t21_row_snapshot "${A_ID}" "${step}")" || exit 1
     b_before="$(t21_row_snapshot "${B_ID}" "${step}")" || exit 1
     pid="$(server_pid)"
@@ -810,8 +915,21 @@ t21_ms_since() {
     echo $(( $(date +%s%3N) - then_ms ))
 }
 
+# 0.18.0: a retry's get/status may mark D before a find-missing runs. The
+# harness observes the store, and the tick must belong to this bot server.
+t21_check_missing_mark() {
+    local step="$1" since="$2" from="$3" tick caller pos time ppid verb role after_ms
+    after_ms="$(awk -v t="${since}" 'BEGIN { printf "%.0f", int(t * 1000) }')"
+    tick="$(ad_missing_tick "${D_ID}" "${after_ms}")" || fail "${step}: no missing tick for ${D_ID} after the restart"
+    caller="$(ad_mark_caller "${tick}" "${from}")" || fail "${step}: no unambiguous call made ${D_ID}'s missing mark"
+    IFS=$'\t' read -r pos time ppid verb role <<< "${caller}"
+    [[ "${role}" == cscb && "${ppid}" == "${SERVER_PID}" ]] \
+        || fail "${step}: ${D_ID}'s mark came from ${verb} at shim line ${pos}, parent ${ppid}, not the bot server ${SERVER_PID}"
+    echo "${TEST_NAME}: ${step}: ${D_ID} marked missing by the bot server's ${verb} at ${time} (shim line ${pos})"
+}
+
 t21_pending_leg() {
-    local step="pending persona" out ref n launch session mark tick tick_t launches fm_before age_ms
+    local step="pending persona" out ref n launch session mark tick tick_t launches fm_before age_ms restart_ad_mark
     stub_mode "${D_WORK}" "${STUB_MODE_MANUAL_START}"
     t21_config_for_next_start D
     t21_start_and_wait 1
@@ -846,6 +964,7 @@ t21_pending_leg() {
     stub_mode "${D_WORK}" "${STUB_MODE_AT_ONCE}"
     t21_mark
     mark="${MARK_TIME}"
+    if ad_release_at_least 0.18.0; then restart_ad_mark="$(ad_shim_mark)"; fi
     t21_start_and_wait 1
     wait_until "${D_RECOVER_WAIT_S}" "${step}: ${D_ID} never came back (waiting)" t21_row_is "${D_ID}" waiting
 
@@ -856,16 +975,20 @@ t21_pending_leg() {
     [[ "${n}" == 0 ]] || fail "${step}: ${n} find-missing call(s) from no CSCB process (the harness runs none for an unlatched persona)"
 
     # CSCB's own run marked D's row missing: one trail mark, from pending,
-    # with a CSCB find-missing at or before it.
+    # with a CSCB call at or before it (a find-missing before 0.18.0).
     tick="$(t21_trail_after "${mark}" ad.find_missing.tick "${D_ID}" | jq -c 'select(.new_state == "missing")')" \
         || fail "${step}: could not read the trail's find-missing marks of ${D_ID}"
     n="$(grep -c . <<< "${tick}" || true)"
     [[ "${n}" == 1 ]] || fail "${step}: ${n} trail mark(s) of ${D_ID} missing after the restart, not 1: ${tick}"
     [[ "$(jq -r '.prior_state' <<< "${tick}")" == pending ]] || fail "${step}: the trail marks ${D_ID} missing from '$(jq -r '.prior_state' <<< "${tick}")', not pending"
     tick_t="$(jq -r '.epoch' <<< "${tick}")"
-    fm_before="$(t21_cscb_calls_since "${mark}" find-missing | awk -F'\t' -v t="${tick_t}" '$2 + 0 <= t + 0' | wc -l | tr -d ' ')"
-    (( fm_before >= 1 )) || fail "${step}: no CSCB find-missing call after the restart at or before the trail's mark of ${D_ID} (${tick_t})"
-    echo "${TEST_NAME}: ${step}: ${D_ID} marked missing at ${tick_t} ($(jq -r '.reconciliation_reason' <<< "${tick}")), after ${fm_before} CSCB find-missing call(s)"
+    if ad_release_at_least 0.18.0; then
+        t21_check_missing_mark "${step}" "${mark}" "${restart_ad_mark}"
+    else
+        fm_before="$(t21_cscb_calls_since "${mark}" find-missing | awk -F'\t' -v t="${tick_t}" '$2 + 0 <= t + 0' | wc -l | tr -d ' ')"
+        (( fm_before >= 1 )) || fail "${step}: no CSCB find-missing call after the restart at or before the trail's mark of ${D_ID} (${tick_t})"
+        echo "${TEST_NAME}: ${step}: ${D_ID} marked missing at ${tick_t} ($(jq -r '.reconciliation_reason' <<< "${tick}")), after ${fm_before} CSCB find-missing call(s)"
+    fi
 
     # Brought up once: one launch record after the restart, after the mark.
     launches="$( { t21_trail_after "${mark}" ad.spawn.reused "${D_ID}"; t21_trail_after "${mark}" ad.resume.moved_to_pending "${D_ID}"; } )" \

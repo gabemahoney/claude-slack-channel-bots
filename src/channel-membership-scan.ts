@@ -3,7 +3,7 @@
 import { randomUUID } from 'node:crypto'
 import { CHANNEL_ID_RE } from './config.ts'
 import type { ChannelMembership, MembershipGeneration } from './channel-membership.ts'
-import { applySharedMembership, type SharedChannelAuthority, type VerifiedSharedMembership } from './shared-channels.ts'
+import { applySharedMemberships, type SharedChannelAuthority, type VerifiedSharedMembership } from './shared-channels.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock, type PersonaConnectionManager, type PersonaStatusListener } from './persona-connections.ts'
 import { classifySlackValidationError, slackRetryAfterSeconds, type SlackValidationFailure } from './persona-slack-validation.ts'
 import {
@@ -118,7 +118,7 @@ export function createMembershipScanner(deps: MembershipScanDeps): MembershipSca
   const clock = deps.clock ?? SYSTEM_PERSONA_CONNECTION_CLOCK
   const entries = new Map<string, ScanEntry>()
   let closed = false
-  const unsubscribe = deps.authority.subscribe(() => {
+  const unsubscribe = deps.authority.subscribeChange(() => {
     for (const [key, entry] of entries) {
       if (entry.incarnation !== deps.authority.incarnation(key)) stop(key)
     }
@@ -207,7 +207,7 @@ export function createMembershipScanner(deps: MembershipScanDeps): MembershipSca
   }
   /** Durably applied positives become this generation's current evidence. */
   function adopt(entry: ScanEntry, generation: MembershipGeneration, boundaries: Map<string, number>, applied: readonly VerifiedSharedMembership[]): void {
-    const records = deps.authority.snapshot().personas[entry.key]!.membership
+    const records = deps.authority.membershipSnapshot(entry.key, applied.map(observation => observation.channel))!
     for (const { channel } of applied) {
       const record = records[channel]!
       boundaries.set(channel, record.boundary)
@@ -222,9 +222,8 @@ export function createMembershipScanner(deps: MembershipScanDeps): MembershipSca
   function applyPositives(entry: ScanEntry, controller: AbortController, generation: MembershipGeneration, observations: number,
     deadline: number, boundaries: Map<string, number>, staged: readonly VerifiedSharedMembership[]): void {
     const { authority } = deps
-    if (staged.length > 1 && authority.transact(authority.revision, (next, order) => {
-      let position = order - staged.length
-      for (const observation of staged) applySharedMembership(next, ++position, entry.key, generation.incarnation, observation)
+    if (staged.length > 1 && authority.transactMembership(entry.key, authority.revision, (next, order) => {
+      applySharedMemberships(next, order - staged.length + 1, entry.key, generation.incarnation, staged)
     }, staged.length).kind === 'applied') {
       adopt(entry, generation, boundaries, staged)
       return
@@ -242,10 +241,9 @@ export function createMembershipScanner(deps: MembershipScanDeps): MembershipSca
     entry.observations = observations
     const scanId = randomUUID()
     const through = (clock.now() / 1000).toFixed(3)
-    const start = authority.snapshot()
-    const observedRevision = start.revision
-    const baseline = start.personas[entry.key]!
-    const boundaries = new Map(Object.entries(baseline.membership).map(([channel, record]) => [channel, record.boundary]))
+    const observedRevision = authority.revision
+    const baseline = authority.membershipSnapshot(entry.key)!
+    const boundaries = new Map(Object.entries(baseline).map(([channel, record]) => [channel, record.boundary]))
     const seen = new Set<string>()
     const seenMetadata = new Map<string, string>()
     const cursors = new Set<string>()
@@ -324,7 +322,7 @@ export function createMembershipScanner(deps: MembershipScanDeps): MembershipSca
     // History recovery, all absence effects and the complete cutoff share one
     // durable transaction; a late write failure cannot publish a partial leave.
     const absent = new Map<string, number>()
-    for (const channel of new Set([...Object.keys(baseline.membership), ...membership.unresolvedChannels(entry.key)])) {
+    for (const channel of new Set([...Object.keys(baseline), ...membership.unresolvedChannels(entry.key)])) {
       if (!seen.has(channel)) absent.set(channel, boundaries.get(channel) ?? 0)
     }
     const result = membership.commitInventory(generation, { scanId, observedThrough: through, observedRevision, absent })

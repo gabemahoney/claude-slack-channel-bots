@@ -185,7 +185,7 @@ _real_latency_admission() {
         "${SCENARIO_AD_ROOT}/bin/agent-director.real" "${SCENARIO_ROOT}/relaunch-$1.json" "${REAL_CONNECTION_LINE_BASE}"
 }
 real_wait_latency_admission() {
-    # Test32 only: unresolved prior candidates remain closed even when AD is
+    # Test32 and test103 only: unresolved prior candidates remain closed even when AD is
     # waiting. Poll evidence under a watchdog; elapsed time never grants entry.
     _scenario_check_timeout "${REAL_DELIVERY_WAIT_S}" real_wait_latency_admission
     if _scenario_poll_until "${REAL_DELIVERY_WAIT_S}" _real_latency_admission "$1" "$2"; then return 0; fi
@@ -335,7 +335,12 @@ real_thread_workload() {
     local n ts sender text args delivery
     REAL_THREAD_ROOT="$(scenario_ts)"
     text="$(scenario_mention_text "${REAL_BOT_USER_ID}" "$(scenario_text thread-root)")"
-    slack_mention_event "${REAL_CHANNEL}" "${text}" "${REAL_THREAD_ROOT}" > "${REAL_THREAD_EVIDENCE}/root.json"
+    # Open intake uses the paired message; app_mention is ignored.
+    if [[ "${REAL_THREAD_MODE}" == open ]]; then
+        slack_message_event "${REAL_CHANNEL}" "${text}" "${REAL_THREAD_ROOT}" > "${REAL_THREAD_EVIDENCE}/root.json"
+    else
+        slack_mention_event "${REAL_CHANNEL}" "${text}" "${REAL_THREAD_ROOT}" > "${REAL_THREAD_EVIDENCE}/root.json"
+    fi
     REAL_THREAD_SAMPLES=()
     REAL_THREAD_DELAYED_USER="$(scenario_id U "thread-${REAL_THREAD_MODE}-delayed-sender")"
     REAL_THREAD_HUNG_USER="$(scenario_id U "thread-${REAL_THREAD_MODE}-hung-sender")"

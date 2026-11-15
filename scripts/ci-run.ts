@@ -49,6 +49,8 @@
 import { acquireCodexLogin, realCodexLoginDeps, isCodexScript, assertNoCodexLoginContainers, codexLoginContainerListArgs, CODEX_LOGIN_CONTAINER_LABEL, CODEX_LOGIN_LOCK_WAIT_MS, CODEX_LOGIN_TARGET, CODEX_EXTRA_MEMORY_BYTES, CODEX_HOST_CONFIG_KEYS_ENV, decodeCodexHostConfigKeys, type CodexLoginDeps, type CodexLoginLease } from './codex-login.ts'
 export { CODEX_LOGIN_SCRIPTS, CODEX_LOGIN_LOCK_WAIT_MS } from './codex-login.ts'
 import { isDockerInspectCommand, safeDockerInspect } from './safe-docker-inspect.ts'
+import { nonReclaimableMemoryBytes, type NonReclaimableMemoryReading } from './non-reclaimable-memory.ts'
+export { nonReclaimableMemoryBytes } from './non-reclaimable-memory.ts'
 import { randomBytes as cryptoRandomBytes } from 'node:crypto'
 import { readFileSync, readlinkSync, realpathSync, statfsSync, writeSync } from 'node:fs'
 import { constants as osConstants } from 'node:os'
@@ -634,8 +636,16 @@ export const CI_LIVE_RUNNER_ALLOWANCE_BYTES = GIB_BYTES
 
 /** The CPUs all `/ci` runs share, 12. */
 export const CI_CPUS = 12
-/** The CPUs each shard takes, its `--cpus`. */
+/** The CPUs each shard takes, its `--cpus`; the server's CPU quota in a burst-driver shard. */
 export const CPUS_PER_SHARD = 2
+/** The extra CPU a burst-driver shard takes for its driver, beside the server's `CPUS_PER_SHARD`. */
+export const DRIVER_CPUS = 1
+/** The burst-driver scripts, tests 44, 45 and 48: their `sr8-evidence.ts` driver runs outside the server's CPU quota. */
+export const BURST_DRIVER_SCRIPTS = /-fmk-(?:thread-burst|membership-load(?:-open)?)\.sh$/
+/** A burst-driver shard's `--security-opt`: its entrypoint splits the container's CPU quota (docker/entrypoint.sh). */
+export const DRIVER_SHARD_SECURITY_OPT = 'writable-cgroups=true'
+/** A burst-driver shard's `--cgroupns`: its writable cgroup is its own, never a wider view the daemon's default could give. */
+export const DRIVER_SHARD_CGROUPNS = 'private'
 /** The lower bound of the `--shards` and `--shard-timeout` ranges. */
 export const OPTION_RANGE_MIN = 1
 /** The maximum N, `--shards`' upper bound; also the requested N when `--shards` is not given. */
@@ -1006,7 +1016,7 @@ export interface Reservation {
   readonly shards: number
   /** N × the cap. */
   readonly memoryBytes: number
-  /** 2 × N. */
+  /** 2 × N, plus one per shard that can hold a burst-driver script (`runCpus`). */
   readonly cpus: number
   readonly kind: RunKind
 }
@@ -1283,15 +1293,9 @@ export type Unreadable = typeof UNREADABLE_READING
 export type Reading<T> = T | Unreadable
 
 /** W with its parts (`workingSet`). */
-export interface WorkingSetReading {
+export interface WorkingSetReading extends NonReclaimableMemoryReading {
   readonly bytes: number
-  readonly anonBytes: number
   readonly activeFileBytes: number
-  /** Gate-only counters; omitted from the version 1 results diagnostics. */
-  readonly shmemBytes?: number
-  readonly activeAnonBytes?: number
-  readonly inactiveAnonBytes?: number
-  readonly unevictableBytes?: number
 }
 
 /** One active `/ci-live` run as admission or a sample saw it. */
@@ -6647,10 +6651,12 @@ export interface ReservationRequest {
   /** The per-shard memory cap in bytes. */
   readonly memoryCapBytes: number
   readonly extraMemoryBytes?: number
+  /** The run's burst-driver scripts. */
+  readonly driverScripts?: number
   readonly kind: RunKind
 }
 
-/** The reservation a spec gives: memory N × the cap, CPUs `CPUS_PER_SHARD` × N. */
+/** The reservation a spec gives: memory N × the cap, CPUs `runCpus`. */
 export function buildReservation(spec: ReservationRequest): Reservation {
   return {
     version: RESERVATION_FORMAT_VERSION,
@@ -6658,7 +6664,7 @@ export function buildReservation(spec: ReservationRequest): Reservation {
     pid: spec.owner.pid,
     shards: spec.shards,
     memoryBytes: spec.shards * spec.memoryCapBytes + (spec.extraMemoryBytes ?? 0),
-    cpus: CPUS_PER_SHARD * spec.shards,
+    cpus: runCpus(spec.shards, spec.driverScripts ?? 0),
     kind: spec.kind,
   }
 }
@@ -7389,21 +7395,6 @@ export function readPodMemory(deps: Pick<RunnerDeps, 'readCgroupFile'>): Reading
 /** W's rest: W minus anon and active page cache, never below 0. */
 export function workingSetRestBytes(reading: WorkingSetReading): number {
   return Math.max(0, reading.bytes - reading.anonBytes - reading.activeFileBytes)
-}
-
-/**
- * Memory counted by admission and the watchdog, excluding reclaimable file
- * cache. anon and shmem are separate type counters. shmem is on the anon LRU
- * lists; locked anon/shmem move to the unevictable list, so adding unevictable
- * to the type counters would count those pages twice. The disjoint anon and
- * unevictable lists account for locked file pages too. Take the larger of
- * that sum and anon + shmem because type and LRU counters can differ.
- * Legacy diagnostics have only anon; production reads all four extra keys.
- */
-export function nonReclaimableMemoryBytes(reading: WorkingSetReading): number {
-  const anonAndShmem = reading.anonBytes + (reading.shmemBytes ?? 0)
-  const anonAndUnevictableLists = (reading.activeAnonBytes ?? 0) + (reading.inactiveAnonBytes ?? 0) + (reading.unevictableBytes ?? 0)
-  return Math.max(anonAndShmem, anonAndUnevictableLists)
 }
 
 /** Throws unless `bytes` is a whole number of bytes, 0 or more. */
@@ -8251,6 +8242,8 @@ const ADMISSION_LIMIT_ORDER: readonly AdmissionLimit[] = ['memory', 'disk', 'cpu
 export interface AdmissionRequest {
   readonly minimumShards?: number
   readonly extraMemoryBytes?: number
+  /** The run's burst-driver scripts (`isBurstDriverScript`); each one's shard takes `DRIVER_CPUS` more. */
+  readonly driverScripts?: number
   /** r: the `--shards` value, or `MAX_SHARDS` when it is not given (validation's `ValidatedRun.requestedShards`). */
   readonly requestedShards: number
   /** u: the count of the run's scheduling units (validation, `ValidatedRun.units.length`). */
@@ -8300,23 +8293,32 @@ export function diskFits(volume: VolumeReading): boolean {
   return (used + BigInt(DISK_CHECK_ALLOWANCE_BYTES)) * BigInt(PERCENT_WHOLE) < BigInt(DISK_LINE_PERCENT) * whole
 }
 
-/** The CPU fit at N shards: h + 2 × N ≤ the 12 CI CPUs. */
-export function cpuFits(reservedCpus: number, shards: number): boolean {
-  return reservedCpus + CPUS_PER_SHARD * shards <= CI_CPUS
+/**
+ * The CPUs N shards take: 2 each, plus `DRIVER_CPUS` for each shard that can
+ * hold one of the run's burst-driver scripts, at most one per script, since
+ * admission comes before scheduling places them.
+ */
+export function runCpus(shards: number, driverScripts: number): number {
+  return CPUS_PER_SHARD * shards + DRIVER_CPUS * Math.min(shards, driverScripts)
+}
+
+/** The CPU fit at N shards: h + `runCpus` ≤ the 12 CI CPUs. */
+export function cpuFits(reservedCpus: number, shards: number, driverScripts = 0): boolean {
+  return reservedCpus + runCpus(shards, driverScripts) <= CI_CPUS
 }
 
 /** The N-dependent limits that fail at N shards, memory then CPU. */
-function shardFitFailures(figures: AdmissionFigures, shards: number, capBytes: number, extraMemoryBytes = 0): ShardFitLimit[] {
+function shardFitFailures(figures: AdmissionFigures, shards: number, capBytes: number, extraMemoryBytes = 0, driverScripts = 0): ShardFitLimit[] {
   const failed: ShardFitLimit[] = []
   if (!memoryFits(figures, shards, capBytes, extraMemoryBytes)) failed.push('memory')
-  if (!cpuFits(figures.commitments.reservedCpus, shards)) failed.push('cpu')
+  if (!cpuFits(figures.commitments.reservedCpus, shards, driverScripts)) failed.push('cpu')
   return failed
 }
 
 /** The largest N, from `fromShards` down to 1, that passes both the memory and the CPU fit; null when none does. */
-function largestFittingShards(figures: AdmissionFigures, fromShards: number, capBytes: number, minimumShards = OPTION_RANGE_MIN, extraMemoryBytes = 0): number | null {
+function largestFittingShards(figures: AdmissionFigures, fromShards: number, capBytes: number, minimumShards = OPTION_RANGE_MIN, extraMemoryBytes = 0, driverScripts = 0): number | null {
   for (let shards = fromShards; shards >= minimumShards; shards--) {
-    if (shardFitFailures(figures, shards, capBytes, extraMemoryBytes).length === 0) return shards
+    if (shardFitFailures(figures, shards, capBytes, extraMemoryBytes, driverScripts).length === 0) return shards
   }
   return null
 }
@@ -8334,6 +8336,7 @@ function assertAdmissionRequest(request: AdmissionRequest): void {
   const unitBound = Math.max(OPTION_RANGE_MIN, request.units)
   if (request.effectiveShards > unitBound) throw new Error(`decideAdmission: effectiveShards ${request.effectiveShards} is above max(${OPTION_RANGE_MIN}, units) ${unitBound}`)
   if (!Number.isSafeInteger(request.extraMemoryBytes ?? 0) || (request.extraMemoryBytes ?? 0) < 0) throw new Error('decideAdmission: invalid extra memory')
+  if (!Number.isSafeInteger(request.driverScripts ?? 0) || (request.driverScripts ?? 0) < 0) throw new Error('decideAdmission: invalid driver scripts')
   if (!Number.isSafeInteger(request.minimumShards ?? 1) || (request.minimumShards ?? 1) < 1 || (request.minimumShards ?? 1) > request.effectiveShards) throw new Error('decideAdmission: invalid minimum shards')
   if (request.capBytes === 0) throw new Error('decideAdmission: capBytes is 0')
 }
@@ -8416,7 +8419,7 @@ export type AdmissionDecision = AdmittedDecision | RefusedDecision
  */
 export function decideAdmission(admission: AdmissionFigures, request: AdmissionRequest, listResultsDirs: ResultsDirectoryLister): AdmissionDecision {
   assertAdmissionRequest(request)
-  const largest = largestFittingShards(admission, request.effectiveShards, request.capBytes, request.minimumShards, request.extraMemoryBytes)
+  const largest = largestFittingShards(admission, request.effectiveShards, request.capBytes, request.minimumShards, request.extraMemoryBytes, request.driverScripts)
   const figures: AdmissionDecisionFigures = {
     request,
     admission,
@@ -8429,12 +8432,12 @@ export function decideAdmission(admission: AdmissionFigures, request: AdmissionR
   const chosen = request.canChooseShards || largest === request.effectiveShards ? largest : null
   if (!figures.diskFits || chosen === null) {
     const judgedShards = request.canChooseShards ? (request.minimumShards ?? OPTION_RANGE_MIN) : request.effectiveShards
-    const failed = new Set<AdmissionLimit>(shardFitFailures(admission, judgedShards, request.capBytes, request.extraMemoryBytes))
+    const failed = new Set<AdmissionLimit>(shardFitFailures(admission, judgedShards, request.capBytes, request.extraMemoryBytes, request.driverScripts))
     if (!figures.diskFits) failed.add('disk')
     const failedLimits = ADMISSION_LIMIT_ORDER.filter((limit) => failed.has(limit))
     return { kind: 'refused', judgedShards, failedLimits, figures, refusal: admissionRefusal(failedLimits, judgedShards, figures, listResultsDirs) }
   }
-  const limitsAtNext = chosen < request.effectiveShards ? shardFitFailures(admission, chosen + 1, request.capBytes, request.extraMemoryBytes) : []
+  const limitsAtNext = chosen < request.effectiveShards ? shardFitFailures(admission, chosen + 1, request.capBytes, request.extraMemoryBytes, request.driverScripts) : []
   const unitReason: ShardCountReason[] = request.effectiveShards < request.requestedShards ? ['units'] : []
   return {
     kind: 'admitted',
@@ -8827,7 +8830,7 @@ export function diskRefusalPart(volume: VolumeReading, listing: ResultsDirectory
 
 /**
  * The CPU refusal: `<n> shard(s) need <c> CPUs; active /ci
- * runs hold <h> of the 12 CI CPUs`, c being 2 × n; then each active run
+ * runs hold <h> of the 12 CI CPUs`, c being `runCpus` at n; then each active run
  * (RUN_ID, runner PID, shards, CPUs, full or selective), the largest
  * `--shards` value that fits now (or that none does), and the advice.
  */
@@ -8839,7 +8842,7 @@ export function cpuRefusalPart(judgedShards: number, figures: AdmissionDecisionF
       : runs.map((run) => `active /ci run ${run.runId}: runner PID ${run.pid}, ${run.shards} shard(s), ${run.cpus} CPUs, ${run.kind}`)
   return {
     kind: 'cpu',
-    summary: `${judgedShards} shard(s) need ${CPUS_PER_SHARD * judgedShards} CPUs; active /ci runs hold ${figures.reservedCpus} of the ${CI_CPUS} CI CPUs`,
+    summary: `${judgedShards} shard(s) need ${runCpus(judgedShards, figures.request.driverScripts ?? 0)} CPUs; active /ci runs hold ${figures.reservedCpus} of the ${CI_CPUS} CI CPUs`,
     details: [...runTexts, largestFittingShardsText(figures.largestFittingShards), CPU_REFUSAL_ADVICE],
   }
 }
@@ -11783,21 +11786,36 @@ export interface ShardRunPlan {
   readonly runArguments: readonly string[]
 }
 
+/** Whether a script drives an SR-8 burst (`BURST_DRIVER_SCRIPTS`), so its shard takes `DRIVER_CPUS` more. */
+export function isBurstDriverScript(fileName: string): boolean {
+  return BURST_DRIVER_SCRIPTS.test(fileName)
+}
+
+/** A shard's `--cpus`: `CPUS_PER_SHARD`, plus `DRIVER_CPUS` when it holds a burst-driver script. */
+export function shardCpus(assigned: readonly string[]): number {
+  return CPUS_PER_SHARD + (assigned.some(isBurstDriverScript) ? DRIVER_CPUS : 0)
+}
+
 /**
  * Shard k's `docker run` arguments after `docker run --detach`, a pure
  * builder, in this order:
  * `--pull never`; `--name` and the two labels; `--memory` and
- * `--memory-swap` both at the cap in bytes, `--pids-limit`, `--cpus`; the
- * `--mount`s; bare `--env` names from `SHARD_ENV_NAMES` defined in `env`; the image ID; the
- * in-container runner's arguments. Nothing sets a network (the default only),
- * `--privileged`, a PID, IPC or network namespace, `--rm`, an entrypoint, an
- * env file or any other variable. Throws on inputs that cannot make a valid
- * list (an image that is not an ID, a bad path, name or runner argument).
+ * `--memory-swap` both at the cap in bytes, `--pids-limit`, `--cpus`
+ * (`shardCpus`); a burst-driver shard's `--init`, `--cgroupns private` and
+ * `--security-opt writable-cgroups=true`, so its entrypoint can keep the
+ * server's `CPUS_PER_SHARD` quota apart from the driver's CPU in the
+ * container's own cgroup, under its own PID 1; the `--mount`s; bare `--env` names from
+ * `SHARD_ENV_NAMES` defined in `env`; the image ID; the in-container runner's
+ * arguments. Nothing sets a network (the default only), `--privileged`, a
+ * PID, IPC or network namespace, `--rm`, an entrypoint, an env file or any
+ * other variable. Throws on inputs that cannot make a valid list (an image
+ * that is not an ID, a bad path, name or runner argument).
  */
 export function shardRunPlan(input: ShardRunPlanInput): ShardRunPlan {
   const name = dockerOperand(shardContainerName(input.owner, input.shard), 'container name')
   const imageId = imageIdOperand(shardImageId(input.faults, input.shard, input.pinnedImageId, input.driftImageId))
   const codex = input.assigned.some(isCodexScript)
+  const driver = input.assigned.some(isBurstDriverScript)
   if (codex && (!input.codexLoginSource || input.assigned.length !== 2 || !isTestOneName(input.assigned[0]!))) throw new Error('Codex shard requires validated login and dedicated assignment')
   if (!codex && input.codexLoginSource) throw new Error('Ordinary shard cannot mount Codex login')
   const mounts = [...shardMounts(input.faults, input.runDir, input.shard, input.tarballPath),
@@ -11819,7 +11837,8 @@ export function shardRunPlan(input: ShardRunPlanInput): ShardRunPlan {
     '--pids-limit',
     String(SHARD_PIDS_LIMIT),
     '--cpus',
-    String(CPUS_PER_SHARD),
+    String(shardCpus(input.assigned)),
+    ...(driver ? ['--init', '--cgroupns', DRIVER_SHARD_CGROUPNS, '--security-opt', DRIVER_SHARD_SECURITY_OPT] : []),
     ...(codex ? ['--ulimit', 'core=0'] : []),
     ...mounts.flatMap((mount) => ['--mount', bindMountValue(mount)]),
     ...SHARD_ENV_NAMES.filter((envName) => input.env?.[envName] !== undefined).flatMap((envName) => ['--env', envName]),
@@ -15998,6 +16017,7 @@ function admissionRequestOf(validated: ValidatedRun): AdmissionRequest {
     canChooseShards: canChooseShards(validated.invocation),
     capBytes: SHARD_MEMORY_CAP_BYTES,
     extraMemoryBytes: validated.runScripts.filter(script => isCodexScript(script.fileName)).length * CODEX_EXTRA_MEMORY_BYTES,
+    driverScripts: validated.runScripts.filter(script => isBurstDriverScript(script.fileName)).length,
     minimumShards: Math.max(1, validated.units.filter(unit => unit.scripts.some(script => isCodexScript(script.fileName))).length + (validated.units.some(unit => !unit.scripts.some(script => isCodexScript(script.fileName))) ? 1 : 0)),
   }
 }
@@ -16057,12 +16077,13 @@ async function admitRun(seq: RunSequence): Promise<SequencePartOutcome> {
   seq.figures = figures
   // Step 9: the disk check, then the memory and CPU fits, choosing N.
   if (enterStep(seq, 'admission')) return TO_END_OF_RUN
-  const decision = decideAdmission(figures, admissionRequestOf(validated), () => listResultsDirectories(deps.env))
+  const request = admissionRequestOf(validated)
+  const decision = decideAdmission(figures, request, () => listResultsDirectories(deps.env))
   if (decision.kind === 'refused') return refuseUnlessStopped(seq, decision.refusal)
   seq.admission = decision
   // Step 10: the reservation, then the watchdog.
   if (enterStep(seq, 'reservation')) return TO_END_OF_RUN
-  const reserved = writeReservation(lockDir, { owner: seq.owner, shards: decision.shards, memoryCapBytes: SHARD_MEMORY_CAP_BYTES, extraMemoryBytes: admissionRequestOf(validated).extraMemoryBytes, kind: validated.kind })
+  const reserved = writeReservation(lockDir, { owner: seq.owner, shards: decision.shards, memoryCapBytes: SHARD_MEMORY_CAP_BYTES, extraMemoryBytes: request.extraMemoryBytes, driverScripts: request.driverScripts, kind: validated.kind })
   if (!reserved.ok) return refuseUnlessStopped(seq, reservationWriteFailedRefusal(reserved.error))
   seq.reservationHeld = true
   const watchdog = createMemoryWatchdog({

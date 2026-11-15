@@ -150,6 +150,8 @@
  * runs `assertNoLeak` over every captured post and line.
  */
 
+import { noticePost } from './test-helpers/server-post.ts'
+import { SERVER_POST_METADATA } from './test-helpers/server-post.ts'
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -299,6 +301,7 @@ import {
   fakeToken,
   sentinelInMessage,
 } from './test-helpers/credentials.ts'
+
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -477,7 +480,7 @@ describe('budgeted loss reference through episodes and the real notifier', () =>
         await h.notifier.flush(persona.key)
       }
       const text = formatPersonaNotice(persona, notice.text, notice.options)
-      expect(h.posts(persona.key)).toEqual([{ channel: persona.permission_prompts!, text }])
+      expect(h.posts(persona.key)).toEqual([{ channel: persona.permission_prompts!, text, metadata: SERVER_POST_METADATA }])
       const ref = escapeSlackControlCharacters(renderPersonaRef(Array.from(name).slice(0, 64).join('') + '…', persona.key))
       expect(text.split(ref)).toHaveLength(3)
       expect(text.length).toBeLessThanOrEqual(THREAD_MEMORY_NOTICE_MAX_CHARS)
@@ -3541,7 +3544,7 @@ describe('the kill-failure alerts', () => {
 
       expect(alerts.raise(raiseInput(key, ordinary(), KILL_FAILURE_CONTEXT_RECOVERY, {}))).toBe('posted')
       await clock.flush()
-      expect(h.posts(key)).toEqual([{ channel: kept.permission_prompts!, text: formatPersonaNotice(kept, killFailureAlertText(contentOf(key, ordinary()), KILL_FAILURE_CLOSING_DESTINATION, true)) }])
+      expect(h.posts(key)).toEqual([noticePost(kept.permission_prompts!, formatPersonaNotice(kept, killFailureAlertText(contentOf(key, ordinary()), KILL_FAILURE_CLOSING_DESTINATION, true)))])
 
       await h.duringTeardown(kept, async () => {
         expect(alerts.raise(raiseInput(key, ordinary(), KILL_FAILURE_CONTEXT_RECOVERY, STOP))).toBe('stopped')
