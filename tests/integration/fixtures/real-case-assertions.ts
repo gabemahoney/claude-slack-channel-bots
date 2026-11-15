@@ -210,6 +210,18 @@ try {
       const f=j.find(r=>r.kind==='fixed'&&r.seq===i.seq)
       check(f?.parts?.every((_:unknown,n:number)=>j.some(r=>r.kind==='delivered'&&r.seq===i.seq&&r.part===n+1)), 'prefix not yet delivered')
     }
+  } else if(command==='before-pause-transcript') {
+    const row=JSON.parse(readFileSync(arg,'utf8'))
+    check(row.instance_id==='cscb_'+key&&row.transcript_status==='present',
+      'before-pause transcript must be present after the receipted Claude turn')
+    console.log('recorded: before-pause transcript present')
+  } else if(command==='down-start') {
+    // Journal and diagnostic counts are cumulative. Retain the completed
+    // pre-pause work as a baseline; the shim has its separate DOWN_MARK.
+    const j=cumulativeJournal()
+    writeFileSync(arg+'.down-start',JSON.stringify({accepted:workloadItems(j).map(r=>r.seq),
+      sent:j.filter(r=>r.kind==='sent').length,delivered:j.filter(r=>r.kind==='delivered').length,
+      logLines:readFileSync(join(state!,'server.log'),'utf8').split('\n').filter(Boolean).length}))
   } else if(command==='down') {
     const before=JSON.parse(readFileSync(arg,'utf8')), after=JSON.parse(readFileSync(arg+'.end','utf8'))
     const hasMissing=[before,after].some(row=>row.state==='missing')
@@ -224,11 +236,13 @@ try {
     for(const row of [before,after]) check(row.instance_id==='cscb_'+key&&(row.state==='ended'||(hasMissing&&row.state==='missing')),'DOWN interval has a live or wrong native row')
     check(before.session_id&&(before.state==='missing'||before.ended_at),'DOWN interval lacks the paused native session')
     for(const field of ['session_id','started_at','ended_at','launch_started_at','launch_token']) check(before[field]===after[field],'native launch changed during DOWN interval')
-    const j=cumulativeJournal(), accepted=workloadItems(j)
+    const baseline=JSON.parse(readFileSync(arg+'.down-start','utf8'))
+    const j=cumulativeJournal(), all=workloadItems(j), accepted=all.filter(r=>!baseline.accepted.includes(r.seq))
+    check(baseline.accepted.every((seq:number)=>all.some(r=>r.seq===seq)),'DOWN interval lost baseline acceptance')
     check(accepted.length===Number(arg3),'DOWN interval acceptance count differs')
     for(const [source,count] of [['slack',10],['interject',2],['cron',1]] as const) check(accepted.filter(r=>r.source===source).length===count,'DOWN interval source count differs: '+source)
-    check(!j.some(r=>r.kind==='sent'),'send recorded during DOWN interval')
-    check(!j.some(r=>r.kind==='delivered'),'delivery recorded during DOWN interval')
+    check(j.filter(r=>r.kind==='sent').length===baseline.sent,'send recorded during DOWN interval')
+    check(j.filter(r=>r.kind==='delivered').length===baseline.delivered,'delivery recorded during DOWN interval')
     const lines=readFileSync(shim!,'utf8').split('\n').filter(Boolean), mark=Number(arg2)
     check(Number.isSafeInteger(mark)&&mark>=0&&mark<=lines.length,'invalid DOWN interval shim mark')
     const interval=lines.slice(mark).map(line=>{const f=line.split('\t');return {kind:f[0],pid:f[2],ppid:f[3],parent:f[4],words:shimWords(f[5]!)}})
@@ -242,7 +256,9 @@ try {
       const effects=interval.slice(index+1,next<0?undefined:next)
       check(effects.some(f=>f.kind==='fault'&&f.pid===call.pid&&f.ppid===call.ppid&&f.parent===call.parent&&f.words[0]===verb(call.words)&&f.words[1]==='*'&&f.words[2]==='unknown-untyped'&&Number(f.words[3])>0),'unblocked native launch during DOWN interval')
     }
-    check(!readFileSync(join(state!,'server.log'),'utf8').split('\n').some(line=>line.includes('message-delivered:')&&line.includes('(key='+key+')')),'delivery logged during DOWN interval')
+    const log=readFileSync(join(state!,'server.log'),'utf8').split('\n').filter(Boolean)
+    check(log.length>=baseline.logLines,'DOWN interval lost diagnostic baseline')
+    check(!log.slice(baseline.logLines).some(line=>line.includes('message-delivered:')&&line.includes('(key='+key+')')),'delivery logged during DOWN interval')
     console.log('recorded: DOWN interval '+JSON.stringify({accepted:accepted.length,slack:10,interject:2,cron:1,refused_launches:launches.length,successful_launches:0,sends:0,deliveries:0}))
   } else if(command==='no-send') {
     check(!calls().some(c=>c.at>=Number(arg)&&c.words.includes('send-keys')), 'keys typed during a hold')
@@ -569,6 +585,7 @@ try {
       +'fault\t3.1\t10\t1\tbun\tresume \\* unknown-untyped 999998\n'
     const writeDown=(rows:any[]=downItems,log=downCalls,after=paused,diagnostics='')=>{
       writeFileSync(downRow,JSON.stringify(paused));writeFileSync(downRow+'.end',JSON.stringify(after))
+      writeFileSync(downRow+'.down-start',JSON.stringify({accepted:[],sent:0,delivered:0,logLines:0}))
       writeFileSync(join(downDir,'queue','control.jsonl'),rows.map(r=>JSON.stringify(r)).join('\n')+'\n')
       writeFileSync(downLog,log);writeFileSync(join(downDir,'server.log'),diagnostics)
     }

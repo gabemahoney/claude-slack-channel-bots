@@ -12,10 +12,11 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 function fixture(state: 'ended' | 'missing' = 'missing', proof = true) {
   const root = mkdtempSync(join(tmpdir(), 'down-pause-')); roots.push(root)
   const down = join(root, 'order-down-row.json'), shim = join(root, 'shim.log')
-  const live = { instance_id: 'cscb_order', state: 'waiting', session_id: 'native-session', started_at: 'start', launch_started_at: 'launch', launch_token: 'token' }
+  const live = { instance_id: 'cscb_order', state: 'waiting', session_id: 'native-session', transcript_status: 'present', started_at: 'start', launch_started_at: 'launch', launch_token: 'token' }
   const row = { ...live, state, ...(state === 'ended' ? { ended_at: 'end' } : {}) }
   const save = (path: string, value: unknown) => writeFileSync(path, JSON.stringify(value))
   save(down, row); save(down + '.end', row); save(down + '.before-pause', live)
+  save(down + '.down-start', { accepted: [], sent: 0, delivered: 0, logLines: 0 })
   if (proof) writeFileSync(down + '.pause-succeeded', live.instance_id + '\n')
   mkdirSync(join(root, 'queue'))
   writeFileSync(join(root, 'queue/order.jsonl'), Array.from({ length: 13 }, (_, i) => JSON.stringify({
@@ -53,7 +54,7 @@ test('test-32 runs the same-conversation assertion before waiting for resumed re
   const resume = text.indexOf('start_server --live', text.indexOf('case_assert down'))
   const proof = text.indexOf('case_assert same-conversation-resume', resume)
   expect(proof).toBeGreaterThan(resume)
-  expect(proof).toBeLessThan(text.indexOf('real_wait_delivery "${REAL_KEY}" 13', resume))
+  expect(proof).toBeLessThan(text.indexOf('real_wait_delivery "${REAL_KEY}" 14', resume))
   expect(text.slice(resume, proof)).toContain('real_ad get --instance-id')
   expect(text.slice(proof, text.indexOf('\n', proof))).toContain('"${DOWN_ROW}.before-pause"')
 })
@@ -94,9 +95,95 @@ test.each([0, 1])('regression: test-32 records pause proof only after exit statu
   const result = Bun.spawnSync(['bash', '-c', [
     'set -euo pipefail', 'SCENARIO_ROOT="$HOME"', 'REAL_KEY=order',
     'real_instance() { printf "%s" cscb_order; }',
+    'case_assert() { :; }',
     `real_ad() { if [[ "$1" == pause ]]; then return ${status}; fi; printf '%s' '${JSON.stringify(h.live)}'; }`,
     script.slice(start, end),
   ].join('\n')], { env: hostSafeChildEnv(h.root, { tools: ['bash'] }) })
   expect(result.exitCode).toBe(status)
   expect(existsSync(h.down + '.pause-succeeded')).toBe(status === 0)
+})
+
+test.each(['present', 'never_written', 'no_session', 'rotated', undefined])(
+  'test-32 requires a written before-pause transcript: %s', async transcript_status => {
+    const h = fixture()
+    h.save(h.down + '.before-pause', { ...h.live, transcript_status })
+    const result = await runFixture('fixtures/real-case-assertions.ts', ['before-pause-transcript', h.root, 'order',
+      join(h.root, 'shim.log'), h.root, h.down + '.before-pause'])
+    expect(result.code).toBe(transcript_status === 'present' ? 0 : 1)
+    if (transcript_status !== 'present') expect(result.err.join('\n'))
+      .toContain('before-pause transcript must be present after the receipted Claude turn')
+  },
+)
+
+// Only the pre-DOWN slice, with inert shell functions. No integration script
+// is sourced, and no AD binary, shim, Slack service or native agent is run.
+test.each([0, 1])('test-32 receipts one real turn before pause and stops on transcript-check exit %s', async verdict => {
+  const h = fixture('missing', false)
+  const script = await Bun.file(join(import.meta.dir, 'integration/test-32-fmk-real-order.sh')).text()
+  const start = script.indexOf('real_wait_launch "${REAL_KEY}"\n')
+  const end = script.indexOf('DOWN_MARK=', start)
+  const result = Bun.spawnSync(['bash', '-c', [
+    'set -euo pipefail', 'SCENARIO_ROOT="$HOME"', 'REAL_KEY=order', 'REAL_LABEL=order',
+    'real_instance() { printf "%s" cscb_order; }',
+    `real_ad() { if [[ "$1" == get ]]; then printf '%s' '${JSON.stringify(h.live)}'; else printf 'pause\\n' >&2; fi; }`,
+    'real_wait_launch() { :; }', 'real_fault() { printf "fault\\n" >&2; }',
+    'real_dm() { printf "dm\\n" >&2; }', 'real_wait_delivery() { printf "receipts:%s\\n" "$2" >&2; }',
+    'real_wait_idle() { printf "idle\\n" >&2; }',
+    `case_assert() { printf '%s\\n' "$1" >&2; if [[ "$1" == before-pause-transcript ]]; then return ${verdict}; fi; }`,
+    script.slice(start, end),
+  ].join('\n')], { env: hostSafeChildEnv(h.root, { tools: ['bash'] }) })
+  expect(result.exitCode).toBe(verdict)
+  const trace = result.stderr.toString().trim().split('\n')
+  expect(trace.slice(0, 3)).toEqual(['dm', 'receipts:1', 'idle'])
+  expect(trace).toContain('before-pause-transcript')
+  expect(trace.includes('pause')).toBe(verdict === 0)
+  if (verdict === 0) expect(trace.indexOf('before-pause-transcript')).toBeLessThan(trace.indexOf('pause'))
+})
+
+test.each(['none', 'send', 'delivery', 'log', 'extra-accepted'])(
+  'test-32 DOWN baseline allows the completed pre-pause DM but rejects new %s', async fault => {
+    const h = fixture(), queue = join(h.root, 'queue/order.jsonl'), log = join(h.root, 'server.log')
+    const interval = (await Bun.file(queue).text()).trim().split('\n')
+      .map(line => ({ ...JSON.parse(line), seq: JSON.parse(line).seq + 1 }))
+      .map(row => JSON.stringify(row) + '\n').join('')
+    const warmup = [
+      { kind: 'accepted', seq: 1, source: 'slack' },
+      { kind: 'sent', seq: 1, at: 1 }, { kind: 'delivered', seq: 1, at: 2 },
+    ].map(r => JSON.stringify(r) + '\n').join('')
+    writeFileSync(queue, warmup)
+    writeFileSync(log, '[slack] message-delivered: persona="order" (key=order)\n')
+    const baseline = await runFixture('fixtures/real-case-assertions.ts', ['down-start', h.root, 'order',
+      join(h.root, 'shim.log'), h.root, h.down])
+    expect(baseline.code).toBe(0)
+    const extra = fault === 'send' ? { kind: 'sent', seq: 1, at: 3 }
+      : fault === 'delivery' ? { kind: 'delivered', seq: 1, at: 4 }
+      : fault === 'extra-accepted' ? { kind: 'accepted', seq: 15, source: 'slack' } : undefined
+    writeFileSync(queue, warmup + interval + (extra ? JSON.stringify(extra) + '\n' : ''))
+    if (fault === 'log') writeFileSync(log, (await Bun.file(log).text()) + '[slack] message-delivered: persona="order" (key=order)\n')
+    const result = await h.run()
+    expect(result.code).toBe(fault === 'none' ? 0 : 1)
+    const reason = { none: undefined, send: 'send recorded', delivery: 'delivery recorded', log: 'delivery logged', 'extra-accepted': 'acceptance count differs' }[fault]
+    if (reason) expect(result.err.join('\n')).toContain(reason)
+    else expect(result.out.join('\n')).toContain('"accepted":13')
+  },
+)
+
+test('test-32 pins cumulative 14/34 inputs and all 20 shifted latency indices', async () => {
+  const h = fixture()
+  const script = await Bun.file(join(import.meta.dir, 'integration/test-32-fmk-real-order.sh')).text()
+  expect(script).toContain("case_assert accepted 14")
+  expect(script).toContain('case_assert down "${DOWN_ROW}" "${DOWN_MARK}" 13')
+  const resume = script.indexOf('case_assert same-conversation-resume')
+  expect(script.slice(resume)).toContain('real_wait_delivery "${REAL_KEY}" 14')
+  const start = script.indexOf('# Admit each sample'), end = script.indexOf('\ncase_assert launches', start)
+  const result = Bun.spawnSync(['bash', '-c', [
+    'set -euo pipefail', 'REAL_KEY=order', 'REAL_LABEL=order',
+    'real_wait_latency_admission() { printf "admit:%s\\n" "$2"; }', 'real_dm() { :; }',
+    'real_wait_delivery() { printf "receipt:%s\\n" "$2"; }', 'real_assert_latency() { printf "samples:%s\\n" "$2"; }',
+    script.slice(start, end),
+  ].join('\n')], { env: hostSafeChildEnv(h.root, { tools: ['bash'] }) })
+  expect(result.exitCode).toBe(0)
+  expect(result.stdout.toString().trim().split('\n')).toEqual([
+    ...Array.from({ length: 20 }, (_, i) => [`admit:${34 + i}`, `receipt:${35 + i}`]).flat(), 'samples:20',
+  ])
 })

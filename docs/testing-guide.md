@@ -26,7 +26,7 @@ Each source module has a corresponding test file under `tests/`. Every `tests/*.
 
 | Source | Test File | What It Tests |
 |--------|-----------|---------------|
-| tests/integration/test-32-fmk-real-order.sh, fixtures/real-case-assertions.ts | real-down-pause.test.ts | Executes the DOWN assertion with synthetic structured AD evidence and the actual pause boundary with an inert AD function. Accepts `missing` after the scenario's successful pause only with the same native session and available launch fields; rejects absent/foreign success proof, session loss, changed launches and live/foreign end rows. Preserves `ended` and absent optional launch fields. No native agent or credentials. |
+| tests/integration/test-32-fmk-real-order.sh, fixtures/real-case-assertions.ts | real-down-pause.test.ts | Executes the DOWN assertion with synthetic structured AD evidence and the actual pre-pause/pause boundaries with inert functions. Requires one receipted DM and `transcript_status: present` before pause; pins cumulative 14/34/54 counts and 20 latency indices, permits completed baseline work, and rejects any send/delivery during DOWN. Accepts `missing` after the scenario's successful pause only with the same native session and available launch fields; rejects absent/foreign success proof, session loss, changed launches and live/foreign end rows. Preserves `ended` and absent optional launch fields. No native agent or credentials. |
 | child-env.ts, bundled agent-director client | child-env.test.ts | Case-insensitive Slack credential-name removal, host-variable pass-through, pure child copies and in-place entry scrub, and daemon-only marker handoff. A scratch child drives the real npm client's discovery and one verb against an inert fake executable, recording environment names only; an unscrubbed control proves the verb boundary is exercised. See the fake-executable exception under Host safety. |
 | tests/integration/test-21-fmk-teardown.sh, tests/integration/lib/scenario.sh | Docker integration boundary leg (not a bun test file) | The first CSCB start creates an unseeded scenario tmux server. `SCENARIO_START_ENV` injects fake Slack and host credentials after the helper's ordinary unsets; a names-only check rejects Slack credential names and the daemon marker while requiring `GH_TOKEN`. See tests/README.md's scenario 9. |
 | scripts/ci-base-build.sh, docker/ad-client-check.sh | ci-ad-runtime.test.ts | b.iy3 current-runtime installer selection and independent client/runtime version decisions, with drift, stale-runtime, foreign-commit and migration-fixture controls. Executes isolated shell blocks with recording dependencies; no real AD binary, Docker or credential access. Runtime integration is separate evidence. |
@@ -289,9 +289,25 @@ and from historical captures; see
 
 ### Busy-send integration and candidate AD
 
-Test-32 captures AD's row before its own pause and again after resume, and
-requires the same non-empty native `session_id` and instance before waiting
-for receipts. `tests/real-down-pause.test.ts` rejects a replacement session.
+Test-32 delivers one DM through the ordinary receipt/FIFO audit and waits for
+AD idle before its own pause. Its saved before-pause AD row must report
+`transcript_status: present` on both candidate AD and legacy AD 0.17.1;
+other values fail immediately with a before-pause transcript message.
+
+The DOWN baseline records prior acceptances, send/delivery counts and a
+diagnostic cursor after pause, alongside the shim's `DOWN_MARK`. Exactly 13
+new inputs (10 DMs, two interjects, one cron fire) must be accepted while DOWN,
+with zero new sends or deliveries, including attempts on the earlier DM.
+
+The acceptance wait and receipt wait after resume count 14 cumulative inputs,
+including the pre-pause DM. Test-32 captures AD's row again after resume and
+requires the same non-empty native `session_id` and instance before that
+receipt wait.
+
+`tests/real-down-pause.test.ts` uses synthetic AD rows and inert shell
+stand-ins to pin the pre-pause turn, transcript rejection, interval baseline,
+shifted totals and conversation continuity. These controls do not establish
+native runtime compatibility.
 
 The real-scenario receipt audit keeps two distinct evidence paths. Legacy
 records retain the packed production parser, exact-text matcher and durable
@@ -330,9 +346,13 @@ lose one confirmed Wait Turn reply only after the real call runs.
 
 Require a consumed `send_mode=wait_turn` / `unknown-typed` fault bound by PID
 to its actual send and pre-existing durable intent. After kill/reconcile and
-resume, audit all 33 original inputs and reminders, then require the same
+resume, audit all 34 original inputs and reminders, then require the same
 pair's `get-delivery` lookup, one send, no raw-key recovery and no duplicate
-take-ins. Keep the 20 latency samples after that proof.
+take-ins.
+
+The 20 latency samples follow that proof: admission counts run from 34 to 53
+and delivery counts from 35 to 54. The pre-pause DM is outside the last 20
+timings used by the latency assertion.
 
 Host controls execute the real fault-leg slice and extracted argument matcher
 with inert stand-ins only. Full shim execution and native AD custody/recovery
@@ -554,7 +574,9 @@ unit passes do not establish current native acceptance.
 
 Real-agent actions wait on AD `waiting` and typed refusals. Explicit `/compact` trials verify later exact receipts and durable queue progress; no pane or native compaction marker establishes lifecycle state. Diagnostics omit pane text.
 
-Test 32's down interval must block real spawn/resume before pausing, using counted `unknown-untyped` faults. Prove all 13 mixed-source acceptances with the real row ended and unchanged, every attempted launch refused before execution, and zero sends/deliveries; only then release the faults under lock with the server stopped and restart. Retain cumulative 13/33/53 delivery checks.
+Test 32 first receipts one DM and requires a present transcript before pausing. Its down interval must block real spawn/resume before pausing, using counted `unknown-untyped` faults. Prove all 13 new mixed-source acceptances with the real row ended (or missing after its own successful pause) and unchanged, every attempted launch refused before execution, and zero new sends/deliveries; only then release the faults under lock with the server stopped and restart.
+
+Retain cumulative 14/34/54 delivery checks, including the pre-pause DM, while keeping the DOWN-interval count at 13.
 
 Test `test_mcp_drop_endpoint` only through internal fixtures: absent/false gives no route; true is captured at start, validates the actual peer and uses the SDK DELETE lifecycle. Never put it in shipped configuration or settings examples. Keep `delivery_stuck_after_ms` documented as the existing override. Preserve the 3 s Slack ACK test separately from real delivery p95 limits of 2 s typing and 10 s receipt confirmation.
 

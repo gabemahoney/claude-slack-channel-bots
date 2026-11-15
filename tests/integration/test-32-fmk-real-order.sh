@@ -15,16 +15,23 @@ real_write_config '{"session_restart_delay":0}'
 real_start_stub
 start_server --live
 real_wait_launch "${REAL_KEY}"
+# A prompt-free Claude launch may have no transcript to resume. Complete one
+# real turn through the ordinary receipt/FIFO audit on either AD runtime.
+real_dm "${REAL_LABEL}" 'order before-pause turn'
+real_wait_delivery "${REAL_KEY}" 1
+real_wait_idle "${REAL_KEY}"
 # A pause alone permits message-triggered relaunch during intake. Refuse
 # launches before pausing; these faults never invoke the real launch binary.
 real_fault spawn '*' unknown-untyped 999999
 real_fault resume '*' unknown-untyped 999999
 DOWN_ROW="${SCENARIO_ROOT}/order-down-row.json"
 real_ad get --instance-id "$(real_instance "${REAL_KEY}")" > "${DOWN_ROW}.before-pause"
+case_assert before-pause-transcript "${DOWN_ROW}.before-pause"
 real_ad pause --instance-id "$(real_instance "${REAL_KEY}")" >/dev/null
 # set -e prevents this proof from being written if our own pause failed.
 printf '%s\n' "$(real_instance "${REAL_KEY}")" > "${DOWN_ROW}.pause-succeeded"
 real_ad get --instance-id "$(real_instance "${REAL_KEY}")" > "${DOWN_ROW}"
+case_assert down-start "${DOWN_ROW}"
 DOWN_MARK="$(ad_shim_mark)"
 # Ten DMs interleaved with interject and a real minute fire while down.
 printf 'order cron fire\n' > "${SCENARIO_ROOT}/order.prompt"
@@ -33,7 +40,7 @@ for n in {1..10}; do
     real_dm "${REAL_LABEL}" "order DM ${n}"
     if [[ "${n}" == 3 || "${n}" == 7 ]]; then expect_interject "${REAL_NAME}" 200 "queued interject ${n}"; fi
 done
-wait_until 180 'scheduled item not durably accepted while down' case_assert accepted 13
+wait_until 180 'scheduled item not durably accepted while down' case_assert accepted 14
 printf '' > "${SLACK_STATE_DIR}/crontab"
 # The first minute fire can precede the production retry's first attempt.
 # Keep the bot down until that attempt has exercised the counted refusal.
@@ -51,7 +58,7 @@ real_wait_launch "${REAL_KEY}"
 real_ad get --instance-id "$(real_instance "${REAL_KEY}")" > "${DOWN_ROW}.resumed"
 case_assert same-conversation-resume "${DOWN_ROW}.before-pause" "${DOWN_ROW}.resumed"
 # Count original Slack/cron/interject inputs separately from legitimate no-reply reminders.
-real_wait_delivery "${REAL_KEY}" 13
+real_wait_delivery "${REAL_KEY}" 14
 # Twenty queued items: actual faults plus bot restart during the blocked head.
 real_wait_idle "${REAL_KEY}"
 ORDER_ROW="${SCENARIO_ROOT}/order-fault-row.json"
@@ -79,15 +86,15 @@ start_server --live
 real_wait_relaunch "${REAL_KEY}"
 case_assert reply-permission-resume "${REAL_KILLED_ROW}" "${SCENARIO_ROOT}/relaunch-${REAL_KEY}.json"
 if [[ "${ORDER_COVERAGE}" == covered ]]; then
-    real_wait_delivery "${REAL_KEY}" 33 -- case_assert covered-lost-reply-proof 33 "${FAULT_MARK}"
+    real_wait_delivery "${REAL_KEY}" 34 -- case_assert covered-lost-reply-proof 34 "${FAULT_MARK}"
 else
-    real_wait_delivery "${REAL_KEY}" 33
+    real_wait_delivery "${REAL_KEY}" 34
 fi
 # Admit each sample only after prior reply candidates and accepted work drain.
 for n in {1..20}; do
-    real_wait_latency_admission "${REAL_KEY}" "$((33+n-1))"
+    real_wait_latency_admission "${REAL_KEY}" "$((34+n-1))"
     real_dm "${REAL_LABEL}" "latency ${n}"
-    real_wait_delivery "${REAL_KEY}" "$((33+n))"
+    real_wait_delivery "${REAL_KEY}" "$((34+n))"
 done
 real_assert_latency "${REAL_KEY}" 20
 

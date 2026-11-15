@@ -345,8 +345,8 @@ test.each([undefined, 'not_covered', 'covered'])('test32 fault leg consumes a tr
   expect(r.requests).toContainEqual(['rule', coverage === 'covered' ? 'send_mode=wait_turn' : 'no_enter', coverage === 'covered' ? 'unknown-typed' : 'swallow', '1'])
   expect(r.requests).toContainEqual(['consumed', coverage === 'covered' ? 'unknown-typed' : 'swallow'])
   expect(r.requests).toContainEqual(['kill', 'alpha'])
-  expect(r.requests.some(r => r[0] === 'delivery' && r[1] === 'alpha' && r[2] === '33')).toBe(true)
-  if (coverage === 'covered') expect(r.requests).toContainEqual(['assertion', 'covered-lost-reply-proof', '33', '0'])
+  expect(r.requests.some(r => r[0] === 'delivery' && r[1] === 'alpha' && r[2] === '34')).toBe(true)
+  if (coverage === 'covered') expect(r.requests).toContainEqual(['assertion', 'covered-lost-reply-proof', '34', '0'])
 })
 
 test('ordinary covered send cannot satisfy test32 legacy fault leg', async () => {
@@ -397,7 +397,7 @@ test.each(['complete', 'no-fault', 'no-lookup', 'wrong-lookup-pair', 'duplicate-
  * DM boundary. Only AD, the receipt CLI transport, and the clock are injected. */
 async function firstLatencyAdmission(home: string, reply: (request: string) => Promise<string>, timeout = false) {
   const script = readFileSync(join(import.meta.dir, 'integration/test-32-fmk-real-order.sh'), 'utf8')
-  const preceding = script.indexOf('real_wait_delivery "${REAL_KEY}" 33')
+  const preceding = script.indexOf('real_wait_delivery "${REAL_KEY}" 34')
   const start = script.indexOf('for n in {1..20}; do', preceding)
   const end = script.indexOf('real_assert_latency', start)
   if (preceding < 0 || start < 0 || end < start) throw new Error('Missing test32 latency loop')
@@ -413,12 +413,12 @@ async function firstLatencyAdmission(home: string, reply: (request: string) => P
 test.each(['held observation', 'accepted reminder', 'drained control'] as const)(
   'pre-sample admission waits for prior reminders: %s', async mode => {
     const h = await fixture(false), clock = createFakeClock()
-    // Match the real loop's preceding 33 originals; only two need reminders.
+    // Match the real loop's preceding 34 originals; only two need reminders.
     await h.send(slackInput())
     await h.send(slackInput({ ts: '1700000000.000002', key: { chat_id: 'C0TEST001', ts: '1700000000.000002' } }))
-    for (let i = 2; i < 33; i++) await h.send(injectedInput())
-    h.options.expectedCount = 33
-    expect(h.audit()).toMatchObject({ items: 33, reminders: 0 })
+    for (let i = 2; i < 34; i++) await h.send(injectedInput())
+    h.options.expectedCount = 34
+    expect(h.audit()).toMatchObject({ items: 34, reminders: 0 })
     const row = (state: 'working' | 'waiting') => {
       const r = cannedGetResult({ state, session_id: 'session' }, h.persona, h.options.stateDir)
       return { ...r, labels: { ...r.labels, reply_tool_preallowed: '1' } }
@@ -450,7 +450,7 @@ test.each(['held observation', 'accepted reminder', 'drained control'] as const)
       for (const item of prepared) await h.complete(item)
       admission.connect()
       drained = true
-      expect(h.audit()).toMatchObject({ items: 33, reminders: 2 })
+      expect(h.audit()).toMatchObject({ items: 34, reminders: 2 })
     }
     try {
       await monitor.observe('alpha', row('working'))
@@ -808,10 +808,10 @@ test.each(['working', 'AD rejection', 'missing journal', 'wrong original count',
 test('unresolved candidate without observed working reaches the watchdog without a DM or cancellation', async () => {
   const h = await fixture(false)
   await h.send(slackInput())
-  for (let i = 1; i < 33; i++) await h.send(injectedInput())
-  h.options.expectedCount = 33
+  for (let i = 1; i < 34; i++) await h.send(injectedInput())
+  h.options.expectedCount = 34
   const a = admissionFor(h), bytes = readFileSync(h.journal)
-  expect(h.audit().items).toBe(33)
+  expect(h.audit().items).toBe(34)
   expect(h.queue.replyReminderItems('alpha')).toHaveLength(1)
   let polls = 0, attempts = 0, dms = 0
   await firstLatencyAdmission(h.options.stateDir, async request => {
