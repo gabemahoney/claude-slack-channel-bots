@@ -8,7 +8,7 @@ import { parseConfigJsonBytes, parsePersonaConfigBytes, readPersonaConfigBytes, 
 import { errnoSuffix, readCredentialsFile, type CredentialsFs } from './persona-credentials.ts'
 import { composePendingFile, parsePendingFingerprint, reloadFingerprint, reloadReviewBinding } from './reload-fingerprint.ts'
 import { parseReviewRequestBytes, REVIEW_REQUEST_SUFFIX, REVIEW_ID_RE, type OperatorIntent } from './reload-request.ts'
-import { beginReviewAttempt, createReviewObserver, rejectReviewAttempt, reviewLedger, reviewMatches, sharedReviewDependency, supersedeReview } from './reload-review.ts'
+import { beginReviewAttempt, createReviewObserver, rejectReviewAttempt, retainReviewOutcomes, reviewLedger, reviewMatches, sharedReviewDependency, supersedeReview } from './reload-review.ts'
 import { createSharedChannelAuthority, initialSharedChannelState, parseSharedChannelState, restartThreadHybridSince, serializeSharedChannelState, validThreadMemoryMarker, type SharedChannelAuthority, type SharedChannelState, type SharedMutationResult } from './shared-channels.ts'
 import { readSharedRecoveryRequest, recoveryBytes, recoveryHash, type SharedRecoveryRequest } from './shared-recovery.ts'
 import { RETIRED_KEYS_WRITE_FAILED, RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, retiredReviewRecovery, restoreReviewedRetirement, type RetiredKeyStore } from './retired-keys.ts'
@@ -156,6 +156,8 @@ function activate(authority: SharedChannelAuthority, deps: ReloadRecoveryDeps, b
     ledger.outcomes[review.fingerprint] = { generation: review.generation, revision: order, status: 'consumed' }
     delete ledger.active
     delete ledger.retirement
+    // The activation now pins this consumed outcome; the same application drops the rest.
+    retainReviewOutcomes(next)
     // Repair consumes its gesture, never the separately pending operator intent.
   })
   if (result.kind === 'failed' || result.kind === 'stale') return fail(result.kind)

@@ -2059,41 +2059,61 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       ].join('\n') })
       expect({ status: run.status, stdout: run.stdout, stderr: run.stderr }).toEqual({ status: 1, stdout: '', stderr })
     })
-  // test-29's real leave steps and expect_stale_review. The stand-in server
-  // applies the leave on its ACK and, when pending, lands the staged rescan at
-  // its next chance: the rescan wait, or the stale confirmation's reload tick.
-  // The rescan rewrites what sharedApplicationPreserved compares (the left
-  // channel's isExtSharedChannel), here the stand-in record's bytes.
-  const leaveSteps = block(test29Script, '        member_unlist alpha "${channel}"', '        configuration_request "leave-cancel-')
+  // test-29's real leave steps, review_replaced and expect_stale_review. The
+  // stand-in server applies the leave on its ACK and, when pending, lands the
+  // staged rescan at its next chance: the rescan wait, or the stale
+  // confirmation's reload tick. The rescan rewrites what
+  // sharedApplicationPreserved compares (the left channel's
+  // isExtSharedChannel), here the stand-in record's bytes. Its reload check
+  // observes the leave, replacing the captured review, only while the script
+  // waits for that replacement: the allowed schedule in which no check falls
+  // between the leave and the cancel. A cancel published before that check
+  // would be observed with the leave in one supersession, which keeps the
+  // captured outcome, so the stale line the leave case expects would not be
+  // certain. The stale check runs after the cancel, expects the stale line and
+  // rules out the superseded one.
+  const leaveSteps = block(test29Script, '        member_unlist alpha "${channel}"', '        if [[ "${mode}" == open ]]; then')
   const rescanWait = '        wait_membership_rescan "${ALPHA}" "${ALPHA_LABEL}" "$(slack_stub_record_field seq push "envelope_id=${first}")"\n'
+  const supersessionWait = '        wait_until "${APPLY_WAIT_S}" \'leave did not supersede the captured review\' \\\n' +
+    '            review_replaced "${CAPTURED}/leave-preview-${mode}-${value}.pending"\n'
   test.each([
-    ['pending', 'with the wait', 0, ''],
-    ['pending', 'without the wait', 1, 'leave-stale-open-off: stale confirmation changed applied facts\n'],
-    ['landed', 'with the wait', 0, ''],
-    ['landed', 'without the wait', 0, ''],
-  ] as const)('test-29 leave lets its staged rescan land before the stale check: rescan %s, %s', (rescan, variant, status, stderr) => {
+    ['pending', 'with both waits', 0, ''],
+    ['pending', 'without the rescan wait', 1, 'leave-stale-open-off: stale confirmation changed applied facts\n'],
+    ['landed', 'with both waits', 0, ''],
+    ['landed', 'without the rescan wait', 0, ''],
+    ['landed', 'without the supersession wait', 1, 'leave-cancel-open-off: cancel published before a reload check observed the leave\n'],
+  ] as const)('test-29 leave lets its staged rescan land, and its supersession be observed before the cancel, ahead of the stale check: rescan %s, %s', (rescan, variant, status, stderr) => {
     expect(leaveSteps.split(rescanWait)).toHaveLength(2)
-    const steps = variant === 'with the wait' ? leaveSteps : leaveSteps.replace(rescanWait, '')
+    expect(leaveSteps.split(supersessionWait)).toHaveLength(2)
+    expect(leaveSteps).toContain('expect_stale_review "leave-stale-${mode}-${value}" "${CAPTURED}/leave-preview-${mode}-${value}.pending" dropped\n')
+    const steps = variant === 'without the rescan wait' ? leaveSteps.replace(rescanWait, '') :
+      variant === 'without the supersession wait' ? leaveSteps.replace(supersessionWait, '') : leaveSteps
     const run = shell([
-      'CONFIG="$HOME/config.json" LAST="$HOME/config.json.last-applied" APPLY="$HOME/config.json.apply" CAPTURED="$HOME/captured"',
+      'CONFIG="$HOME/config.json" LAST="$HOME/config.json.last-applied" APPLY="$HOME/config.json.apply" PENDING="$HOME/config.json.pending" CAPTURED="$HOME/captured"',
       'ALPHA=t29_alpha ALPHA_LABEL=alpha ALPHA_KEY=k_alpha BRAVO_KEY=k_bravo M_HYBRID=CHYBRID EVENT_WAIT_S=15 APPLY_WAIT_S=20',
-      `SUPERSEDED_OUTCOME=superseded RESCAN=${rescan} mode=open value=off channel=CLEFT`, 'declare -A LEAVE_ENVELOPES=()',
-      'mkdir -p "$CAPTURED"; printf "stale\\n" > "$CAPTURED/leave-preview-open-off.pending"; printf "member ext=false\\n" > "$LAST"',
+      `SUPERSEDED_OUTCOME=superseded STALE_CONFIRMATION=stale RESCAN=${rescan} mode=open value=off channel=CLEFT`, 'declare -A LEAVE_ENVELOPES=()',
+      'mkdir -p "$CAPTURED"; printf "header\\nfingerprint: captured\\n" > "$CAPTURED/leave-preview-open-off.pending"',
+      'cp -- "$CAPTURED/leave-preview-open-off.pending" "$PENDING"; printf "member ext=false\\n" > "$LAST"',
       'land_rescan() { [[ -e "$HOME/rescan-due" ]] || return 0; printf "left ext=absent\\n" > "$LAST"; rm "$HOME/rescan-due"; }',
+      'reload_check() { [[ -e "$HOME/leave-unobserved" ]] || return 0; printf "header\\nfingerprint: after-leave\\n" > "$PENDING"; rm "$HOME/leave-unobserved"; }',
       'member_unlist() { :; }', 'scenario_ts() { echo 1.1; }', 'slack_push_channel_left() { echo env-left; }',
-      'ack_control() { [[ "$1" == env-left ]] || return 1; printf "left ext=false\\n" > "$LAST"; touch "$HOME/rescan-due"; [[ "$RESCAN" == pending ]] || land_rescan; }',
-      'wait_until() { shift 2; "$@"; }', 'choice_is() { [[ "$3" == "" ]]; }', 'shared_thread_since() { :; }', 'channel_facts() { echo "facts $1 $2"; }',
+      'ack_control() { [[ "$1" == env-left ]] || return 1; printf "left ext=false\\n" > "$LAST"; touch "$HOME/rescan-due" "$HOME/leave-unobserved"; [[ "$RESCAN" == pending ]] || land_rescan; }',
+      'wait_until() { shift 2; [[ "$1" != review_replaced ]] || reload_check; "$@"; }',
+      'choice_is() { [[ "$3" == "" ]]; }', 'shared_thread_since() { :; }', 'channel_facts() { echo "facts $1 $2"; }',
       'slack_stub_record_field() { [[ "$*" == "seq push envelope_id=env-left" ]] || return 1; echo 41; }',
       'wait_membership_rescan() { printf "%s\\n" "$*" >> "$HOME/waits"; land_rescan; }',
-      'wait_since() { land_rescan; mv -- "$APPLY" "$HOME/spent"; }',
+      'configuration_request() { [[ "$*" == "leave-cancel-open-off cancel" ]] || return 1; [[ ! -e "$HOME/leave-unobserved" ]] || fail "$1: cancel published before a reload check observed the leave"; touch "$HOME/cancelled"; }',
+      'wait_since() { [[ -e "$HOME/cancelled" && "$2" == "$STALE_CONFIRMATION" ]] || return 1; land_rescan; mv -- "$APPLY" "$HOME/spent"; }',
+      'expect_since() { [[ "$2" == "$SUPERSEDED_OUTCOME" && "$3" == 0 ]]; }',
       'configuration_application_preserved() { cmp -s "$2" "$3"; }',
-      declaration(test29Script, 'log_mark'), declaration(test29Script, 'expect_stale_review'),
+      declaration(test29Script, 'log_mark'), declaration(test29Script, 'review_replaced'), declaration(test29Script, 'expect_stale_review'),
       'sibling="$(channel_facts "${BRAVO_KEY}" "${channel}")"; before="$(channel_facts "${ALPHA_KEY}" "${M_HYBRID}")"',
-      steps, 'cat "$HOME/waits" 2> /dev/null || true', 'cat "$LAST"',
+      steps, 'cat "$HOME/waits" 2> /dev/null || true', 'cat "$LAST"', 'sed -n 2p "$PENDING"', 'cat "$HOME/spent"',
     ].join('\n'))
     expect({ status: run.status, stderr: run.stderr }).toEqual({ status, stderr })
     if (status) return
-    expect(run.stdout).toBe((variant === 'with the wait' ? 't29_alpha alpha 41\n' : '') + 'left ext=absent\n')
+    expect(run.stdout).toBe((variant === 'with both waits' ? 't29_alpha alpha 41\n' : '') +
+      'left ext=absent\nfingerprint: after-leave\nheader\nfingerprint: captured\n')
   })
   // test-29's real DM enable in own_posts_phase, with the real input_has and
   // edit_input. The stand-in review fails as the server's reload-noop does when

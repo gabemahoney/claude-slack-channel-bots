@@ -769,6 +769,13 @@ capture_review() {
     cp -- "${PENDING}" "${CAPTURED}/$1.pending"
     check_pending_layout "$1"
 }
+# review_replaced <copy>: the pending file now holds a review other than the
+# captured copy's (line 2, its fingerprint): the server durably superseded it.
+review_replaced() {
+    local now
+    now="$(sed -n '2p' "${PENDING}" 2> /dev/null)" || return 1
+    [[ -n "${now}" && "${now}" != "$(sed -n '2p' "$1")" ]]
+}
 # confirm_review <step> [wait-s] [noop]: given noop, the review has no
 # effective change, so production consumes it and logs reload-noop, never
 # reload-applied (src/reload-plan.ts noEffectiveChange). Callers therefore
@@ -795,14 +802,19 @@ review_assign() {
     confirm_review "${step}"
 }
 # A retained review that a later cancel, revision or dependency change replaced
-# is durably superseded: production's outcome line refuses that exact copied
-# gesture and spends it, and no applied fact changes.
+# is durably superseded. While that supersession is the outcome recorded last,
+# production's outcome line refuses that exact copied gesture; given dropped,
+# a later review's outcome has replaced it, so the gesture matches no current
+# review and gets the stale-confirmation line. Either way it is spent and no
+# applied fact changes.
 expect_stale_review() {
-    local step="$1" old="$2" mark before
+    local step="$1" old="$2" dropped="${3:-}" mark before refusal="${SUPERSEDED_OUTCOME}" other="${STALE_CONFIRMATION}"
+    if [[ "${dropped}" == dropped ]]; then refusal="${STALE_CONFIRMATION}"; other="${SUPERSEDED_OUTCOME}"; fi
     mark="$(log_mark)"; before="${SCENARIO_ROOT}/${step}-authority"
     cp -- "${LAST}" "${before}"
     cp -- "${old}" "${APPLY}"
-    wait_since "${mark}" "${SUPERSEDED_OUTCOME}" "${APPLY_WAIT_S}" "${step}: stale preview was not refused"
+    wait_since "${mark}" "${refusal}" "${APPLY_WAIT_S}" "${step}: stale preview was not refused"
+    expect_since "${mark}" "${other}" 0 "${step}: stale preview refused by the other review state"
     [[ ! -e "${APPLY}" ]] || fail "${step}: refused confirmation was not spent"
     configuration_application_preserved "${CONFIG}" "${before}" "${LAST}" > /dev/null \
         || fail "${step}: stale confirmation changed applied facts"
@@ -1000,8 +1012,14 @@ live_membership_phase() {
         [[ -z "$(shared_thread_since "${ALPHA_KEY}" "${channel}")" ]] || fail 'leave retained Thread Hybrid Since'
         [[ "$(channel_facts "${BRAVO_KEY}" "${channel}")" == "${sibling}" ]] || fail 'leave changed sibling choice'
         [[ "$(channel_facts "${ALPHA_KEY}" "${M_HYBRID}")" == "${before}" ]] || fail 'leave changed another channel'
-        expect_stale_review "leave-stale-${mode}-${value}" "${CAPTURED}/leave-preview-${mode}-${value}.pending"
+        # Nothing else changed since the capture, so the leave superseded it.
+        # Its rescan may supersede once more, depending on when checks fall;
+        # the cancel then supersedes the current review, so the captured
+        # outcome is no longer kept and the refusal is the stale line.
+        wait_until "${APPLY_WAIT_S}" 'leave did not supersede the captured review' \
+            review_replaced "${CAPTURED}/leave-preview-${mode}-${value}.pending"
         configuration_request "leave-cancel-${mode}-${value}" cancel > /dev/null
+        expect_stale_review "leave-stale-${mode}-${value}" "${CAPTURED}/leave-preview-${mode}-${value}.pending" dropped
         if [[ "${mode}" == open ]]; then
             expect_attempt 'removed channel refuses bot write' "${ALPHA_DIR}" "$(attempt_args "removed-${value}" "${channel}" all)" "${ALPHA_KEY}" channel-removed new true
         fi
@@ -1811,6 +1829,8 @@ STORE_FILE="${SLACK_STATE_DIR}/$(printed CHANNEL_DELIVERY_FILE_NAME)"
 SET_TOOL="$(printed SET_CHANNEL_DELIVERY_TOOL)"
 APPLIED_CLASS="[slack] $(printed RELOAD_APPLIED):"
 SUPERSEDED_OUTCOME="$(printed reviewOutcomeLine superseded)"
+STALE_CONFIRMATION_CLASS="$(printed RELOAD_STALE_CONFIRMATION)"
+STALE_CONFIRMATION="$(matcher "[slack] ${STALE_CONFIRMATION_CLASS}:" "\"${APPLY}\"")"
 NO_CHOICE="$(printed NO_STORED_CHOICE)"
 SWITCH_ON_LINE="$(printed modeSwitchLine "${FUNGIBLE}" "${ALPHA}" "${BRAVO}")"
 SWITCH_OFF_LINE="$(printed modeSwitchLine "${DECLARATIVE}" "${ALPHA}" "${BRAVO}")"

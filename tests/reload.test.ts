@@ -3321,12 +3321,14 @@ describe('confirmation and apply', () => {
     expect(run.logsOf(RELOAD_REVIEW_OUTCOME)).toHaveLength(1)
     expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
 
-    // Its content changes (the preview edited, the fingerprint kept): processed again, and it matches.
+    // Its content changes (the preview edited, the fingerprint kept): processed again. The edit back
+    // superseded the review in between, which dropped this one's outcome, so it is stale.
     h.writeApplyBytes(Buffer.concat([h.readApply()!, Buffer.from('an edit to the preview\n')]))
     await run.ticks.tick()
     expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     expect(run.appliedConfigs).toEqual([])
-    expect(run.logsOf(RELOAD_REVIEW_OUTCOME)).toEqual([reviewOutcomeLine('superseded'), reviewOutcomeLine('superseded')])
+    expect(run.logsOf(RELOAD_REVIEW_OUTCOME)).toEqual([reviewOutcomeLine('superseded')])
+    expect(run.logsOf(RELOAD_STALE_CONFIRMATION)).toEqual([staleLogged(STALE_MISMATCH)])
     assertNoLeak(run.captured())
     h.clearRemoveFailure(); h.confirm(); await run.ticks.tick()
     expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))

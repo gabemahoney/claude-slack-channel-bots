@@ -53,11 +53,11 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto'
-import { beginReviewAttempt, createReviewObserver, rejectReviewAttempt, reviewLedger, reviewMatches, reviewOutcomeLine, reviewRecoveryLine, reviewRecoveredBringUpFailedLine, reviewRecoveredLifecycleFailedLine, sharedReviewDependency, RELOAD_REVIEW_OUTCOME, RELOAD_REVIEW_RECOVERY, type DurableReview } from './reload-review.ts'
+import { beginReviewAttempt, createReviewObserver, rejectReviewAttempt, reviewLedger, reviewMatches, reviewOutcomeLine, reviewRecoveryLine, reviewRecoveredBringUpFailedLine, reviewRecoveredLifecycleFailedLine, reviewedMembershipFact, sharedReviewDependency, RELOAD_REVIEW_OUTCOME, RELOAD_REVIEW_RECOVERY, type DurableReview } from './reload-review.ts'
 import { parseReviewRequestBytes, REVIEW_REQUEST_SUFFIX, reviewRequestDiagnostic, REVIEW_REQUEST_INVALID, REVIEW_REQUEST_RECORDED, REVIEW_REQUEST_STORAGE } from './reload-request.ts'
 import { readSharedRecoveryRequest } from './shared-recovery.ts'
 import { runStartupRecovery, sharedRecoveryLine } from './reload-recovery.ts'
-import type { ChannelMembership } from './channel-membership.ts'
+import type { ChannelMembership, MembershipGeneration } from './channel-membership.ts'
 import type { ReviewedAssignment, ReviewedChannelEffect } from './shared-channels.ts'
 import { createSharedChannelAuthority, initialSharedChannelState, parseSharedChannelState, sharedAppliedConfig, serializeSharedChannelState, type SharedChannelAuthority, type SharedChannelState, type SharedMutationResult } from './shared-channels.ts'
 import { dirname, resolve } from 'node:path'
@@ -865,6 +865,23 @@ function fingerprintContentOf(read: { ok: true; bytes: Uint8Array } | { ok: fals
   return read.missing ? FINGERPRINT_MISSING : FINGERPRINT_UNREADABLE
 }
 
+/**
+ * A current membership generation's reviewed facts: its life, authenticated
+ * installation, completeness, and each channel's member fact, absence and hold
+ * reason in channel order. The generation ID, observation counter and scan
+ * watermarks are bookkeeping, so a rescan or reconnect that finds the same
+ * facts binds the same review; an unverified interval it observes does not.
+ */
+function reviewedGenerationFacts(generation: MembershipGeneration): unknown[] {
+  const { positives, holds } = generation
+  return [
+    generation.incarnation, generation.identityKey, generation.complete,
+    [...positives.keys()].sort().map(channel => [channel, ...reviewedMembershipFact(positives.get(channel)!)]),
+    [...generation.absent].sort(),
+    [...holds.keys()].sort().map(channel => [channel, holds.get(channel)!]),
+  ]
+}
+
 /** What the log last said about the pending state, for logging only its changes. */
 type LoggedPendingState =
   /** Before the first pass: counts as nothing pending, but a leftover pending file may still be deleted. */
@@ -1223,10 +1240,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
     const membership = deps.membership?.()
     const memberFacts = applied.config.personas.map(persona => {
       const generation = membership?.generation(persona.key)
-      return !generation || !membership?.isCurrent(generation) ? [persona.key, 'unverified'] : [
-        persona.key, generation.incarnation, generation.generation, generation.identityKey, generation.complete,
-        generation.observations, [...generation.positives].sort(), [...generation.absent].sort(), [...generation.holds].sort(),
-      ]
+      return !generation || !membership?.isCurrent(generation) ? [persona.key, 'unverified'] : [persona.key, ...reviewedGenerationFacts(generation)]
     })
     const declarations = [...applied.config.personas, ...(candidate.kind === 'valid' ? candidate.config.personas : [])]
       .map(persona => [persona.key, persona.name, realPathOf(persona.credentials_file), realPathOf(persona.working_directory), persona.permission_prompts])

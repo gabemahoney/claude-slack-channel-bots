@@ -364,6 +364,37 @@ export function contradictoryBotHistory(state: SharedChannelState, shape: 'rejec
   return next
 }
 
+import { reviewLedger } from '../../src/reload-review.ts'
+/** `state`'s review history as a CSCB before SR-3.5 saved it, which dropped no
+ * outcome: after `state`'s own outcomes, every other outcome the `earlier`
+ * production states recorded, each at its last saved status. Validated by the
+ * production parser. */
+export function withPreRuleReviewOutcomes(state: SharedChannelState, earlier: readonly SharedChannelState[], path = 'fixture-authority'): SharedChannelState {
+  const next = structuredClone(state)
+  const ledger = reviewLedger(next)
+  if (!ledger) throw new Error('withPreRuleReviewOutcomes needs a review history')
+  const own = new Set(Object.keys(ledger.outcomes))
+  for (const old of earlier) {
+    for (const [fingerprint, outcome] of Object.entries(reviewLedger(old)?.outcomes ?? {})) {
+      if (!own.has(fingerprint)) ledger.outcomes[fingerprint] = structuredClone(outcome)
+    }
+  }
+  const parsed = parseSharedChannelState(serializeSharedChannelState(next), path)
+  if (!parsed) throw new Error('withPreRuleReviewOutcomes: expected a shared authority')
+  return parsed
+}
+/** A readability fixture derived from a real bot application in a valid
+ * production state: only the attempt's start moves, onto the saved revision of
+ * the review outcome `fingerprint`, so the one broken relation is that shared
+ * position. Deliberately bypasses the validating seed writer. */
+export function botAttemptAtReviewOutcome(state: SharedChannelState, fingerprint: string): SharedChannelState {
+  const next = structuredClone(state)
+  const application = botApplications(next)[0], outcome = reviewLedger(next)?.outcomes[fingerprint]
+  if (!application || !outcome) throw new Error('botAttemptAtReviewOutcome needs a production application and a saved outcome')
+  application.startedOrder = outcome.revision
+  return next
+}
+
 import type { BotAttemptResult } from '../../src/channel-delivery-attempt.ts'
 import { BOT_ATTEMPT_REJECTIONS } from '../../src/channel-delivery-attempt.ts'
 import type { ChannelDeliveryCurrentFacts, ChannelDeliveryUnavailableReason } from '../../src/channel-delivery.ts'

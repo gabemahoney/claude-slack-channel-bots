@@ -521,15 +521,20 @@ done
 configuration_request pending-refresh refresh > /dev/null
 cp "${CONFIG}.pending" "${EVIDENCE}/refreshed-intent.pending"
 # Stale confirmation is checked by its production refusal and unchanged
-# applied projection, never inferred from a quiet interval. Later review
-# generations (membership changes, restarts, the refresh) durably superseded
-# the old review, so production's outcome line refuses that exact copied
-# gesture and spends it.
+# applied projection, never inferred from a quiet interval. The bot write
+# superseded the old review, then each restart and the refresh superseded a
+# later one, so the review history no longer keeps the old review's outcome:
+# that exact copied gesture matches no current review, and production's
+# stale-confirmation line refuses and spends it.
 cp "${LAST}" "${EVIDENCE}/before-stale"
 superseded_line="$(printed reviewOutcomeLine superseded)"
+stale_class="$(printed RELOAD_STALE_CONFIRMATION)"
+stale_line="$(matcher "[slack] ${stale_class}:" "\"${CONFIG}.apply\"")"
 superseded_count="$(count_log "${superseded_line}")"
+stale_count="$(count_log "${stale_line}")"
 cp "${EVIDENCE}/old-intent.pending" "${CONFIG}.apply"
-wait_for_count "${superseded_line}" "$((superseded_count + 1))" 30 'old intent confirmation not refused'
+wait_for_count "${stale_line}" "$((stale_count + 1))" 30 'old intent confirmation not refused as stale'
+expect_count "${superseded_line}" "${superseded_count}" 'old intent confirmation still had an outcome'
 [[ ! -e "${CONFIG}.apply" ]] || fail 'refused old intent confirmation was not spent'
 configuration_application_preserved "${CONFIG}" "${EVIDENCE}/before-stale" "${LAST}" > /dev/null
 # A fresh confirmation applies both retained edits, proving their survival

@@ -11,11 +11,13 @@
 #    `reload-applied`, the record now holds the configuration file's bytes,
 #    and the pending file is removed.
 # 2. Stale confirmation. A second edit is previewed and its pending file set
-#    aside; config.json is edited again, and once the server's fresh pending
-#    file for that newest edit is written, the second edit's preview is
-#    renamed into place as config.json.apply. The server logs
-#    `reload-stale-confirmation`, applies nothing, and keeps a pending file
-#    for the newest edit, which is then confirmed and applied.
+#    aside; config.json is edited again and, once that edit alone has a
+#    review, its request revised, so two later reviews are superseded and the
+#    review history no longer keeps the second edit's outcome. Once the
+#    server's fresh pending file for that newest edit is written, the second
+#    edit's preview is renamed into place as config.json.apply. The server
+#    logs `reload-stale-confirmation`, applies nothing, and keeps a pending
+#    file for the newest edit, which is then confirmed and applied.
 #
 # Lines are matched by class prefix, persona ref and distinguishing fragments
 # ( the current rule; lib/scenario.sh "Matchers"), each quoted from src/: the
@@ -65,7 +67,7 @@ BRAVO_DIR="$(make_workdir bravo)"
 # --- Expected text (fragments quoted from src/, see the header) -----------
 PREVIEW='[slack] reload-preview: '
 APPLIED_CLASS='[slack] reload-applied:'
-STALE_CLASS='[slack] reload-review-outcome:'
+OUTCOME_CLASS='[slack] reload-review-outcome:'
 NOTHING_PENDING='[slack] reload-nothing-pending:'
 
 # A persona's preview line (in the pending file; its log line is the same
@@ -99,8 +101,10 @@ BRAVO_DELIVERY_BODY="$(in_place_body "${BRAVO}" delivery)"
 ALPHA_UPDATED_CHANNELS="$(updated_in_place_match "${ALPHA}" channels)"
 ALPHA_UPDATED_DELIVERY="$(updated_in_place_match "${ALPHA}" delivery)"
 BRAVO_UPDATED_DELIVERY="$(updated_in_place_match "${BRAVO}" delivery)"
-# A durably superseded review is reported by the production outcome builder.
-STALE_MATCH="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" reviewOutcomeLine superseded)"
+# A review whose outcome is no longer kept matches no current review: its
+# confirmation gets the production stale-confirmation class, naming the apply file.
+STALE_CONFIRMATION_CLASS="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" RELOAD_STALE_CONFIRMATION)"
+STALE_MATCH="$(matcher "[slack] ${STALE_CONFIRMATION_CLASS}:" "\"${APPLY}\"")"
 APPLIED_1="$(applied_match in_place=1)"
 APPLIED_2="$(applied_match in_place=2)"
 HEADER_1="$(preview_logged_header in_place=1)"
@@ -156,6 +160,14 @@ fingerprint_of() {
 fresh_pending_for_v3() {
     pending_has_line "${BRAVO_DELIVERY_BODY}" \
         && [[ "$(fingerprint_of "${PENDING}")" != "${STALE_FINGERPRINT}" ]]
+}
+
+# The pending file holds a review other than <fingerprint>'s: the server has
+# durably superseded that review.
+review_replaced() {
+    local now
+    now="$(fingerprint_of "${PENDING}")"
+    [[ -n "${now}" && "${now}" != "$1" ]]
 }
 
 # True when every preview line of the pending-file copy <file> (line 4 on:
@@ -253,8 +265,13 @@ if (( $(count_in "${STALE_COPY}" "${ALPHA_DELIVERY_BODY}") == 0 )) || [[ -z "${S
     fail "edit 2: the copy of config.json.pending is not edit 2's preview"
 fi
 
-# Edit 3; once the server has previewed it, confirm edit 2's preview.
+# Edit 3; once the server has previewed it, confirm edit 2's preview. The
+# config edit's own review supersedes edit 2's before the request is
+# published, so the revision then supersedes a later review: edit 2's outcome
+# is no longer kept, whatever checks fall between the two writes.
 emit_config "${V2_ALPHA}" mentions | write_config
+wait_until "${TICK_WAIT_S}" "edit 3: the config edit alone did not supersede edit 2's review" \
+    review_replaced "${STALE_FINGERPRINT}"
 configuration_request edit3 revise "${ALPHA}/${A2}/mentions" "${BRAVO}/${B1}/mentions"
 wait_until "${TICK_WAIT_S}" "edit 3: no fresh config.json.pending naming persona ${BRAVO}'s delivery change" \
     fresh_pending_for_v3
@@ -266,7 +283,7 @@ configuration_application_preserved "${CONFIG}" "${AUTHORITY_V1}" "${LAST}" || f
 
 mv -f -- "${STALE_COPY}" "${APPLY}"
 
-wait_for_log "${STALE_MATCH}" "${TICK_WAIT_S}" "stale confirmation: superseded review outcome not logged"
+wait_for_log "${STALE_MATCH}" "${TICK_WAIT_S}" "stale confirmation: reload-stale-confirmation not logged"
 [[ ! -e "${APPLY}" ]] || fail "stale confirmation: config.json.apply still present"
 configuration_application_preserved "${CONFIG}" "${AUTHORITY_V1}" "${LAST}" || fail "stale confirmation: config.json.last-applied changed"
 expect_count "${APPLIED_CLASS}" 1 "stale confirmation: a change was applied (reload-applied lines)"
@@ -286,7 +303,8 @@ wait_for_log "${ALPHA_UPDATED_DELIVERY}" 10 "confirm 3: persona ${ALPHA} not upd
 wait_for_log "${BRAVO_UPDATED_DELIVERY}" 10 "confirm 3: persona ${BRAVO} not updated in place"
 wait_until 10 "confirm 3: config.json.pending not removed after the apply" test ! -e "${PENDING}"
 expect_count "${APPLIED_CLASS}" 2 "confirm 3: reload-applied lines"
-expect_count "${STALE_CLASS}" 1 "confirm 3: review outcome lines"
+expect_count "${STALE_MATCH}" 1 "confirm 3: reload-stale-confirmation lines"
+expect_count "${OUTCOME_CLASS}" 0 "confirm 3: review outcome lines"
 
 # --- Stop -----------------------------------------------------------------
 # shellcheck disable=SC2119 # no bot was launched: no --stop-bots

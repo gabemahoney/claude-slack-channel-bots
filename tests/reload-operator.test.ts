@@ -1,5 +1,5 @@
 import { _assignFixture, fixtureThreadHybridSince } from './test-helpers/shared-channels.ts'
-import { makeDeferredWebApiCall, stubOpenedDmId } from './test-helpers/slack-stub.ts'
+import { makeDeferredConnect, makeDeferredWebApiCall, stubOpenedDmId } from './test-helpers/slack-stub.ts'
 import { consumeAck } from '../src/ack-tracker.ts'
 /** wc: the public request / review / rename gesture over the real authority. */
 import { afterEach, beforeEach, expect, test } from 'bun:test'
@@ -7,10 +7,13 @@ import { readFileSync, writeFileSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { DEFAULT_PERSONA_CONFIG_FS, DELIVERY_MODES, type DeliveryMode, type PersonaInput } from '../src/config.ts'
 import { buildOperatorAssignment, buildReviewRequest, composeReviewRequest, parseReviewRequestBytes, reviewIntentLine } from '../src/reload-request.ts'
-import { reviewLedger, reviewOutcomeLine, reviewRecoveredBringUpFailedLine, reviewRecoveredLifecycleFailedLine } from '../src/reload-review.ts'
-import { parseSharedChannelState, serializeSharedChannelState, reviewedReplacementIncarnation } from '../src/shared-channels.ts'
+import { RELOAD_REVIEW_OUTCOME, RELOAD_REVIEW_RECOVERY, reviewLedger, reviewOutcomeLine, reviewRecoveredBringUpFailedLine, reviewRecoveredLifecycleFailedLine, reviewRecoveryLine, sharedReviewDependency, type ReviewOutcome } from '../src/reload-review.ts'
+import { RELOAD_STALE_CONFIRMATION, renderStaleConfirmationLogLine } from '../src/reload-apply.ts'
+import { parseSharedChannelState, serializeSharedChannelState, reviewedReplacementIncarnation, type SharedChannelState, type SharedPersona } from '../src/shared-channels.ts'
 import { REVIEW_OMISSION_CLAUSE, REVIEW_RETENTION_CLAUSE, REVIEW_RESET_CLAUSE } from '../src/reload-preview-clauses.ts'
-import { makeReloadHarness, type ReloadHarness, type ReloadRun, type ReloadRunOptions } from './test-helpers/reload-harness.ts'
+import { makeReloadHarness, NO_RUN_ACTIVITY, type ReloadHarness, type ReloadRun, type ReloadRunOptions } from './test-helpers/reload-harness.ts'
+import { activationRecord, applicationState, botApplications, botAttemptAtReviewOutcome, configBytes, deliveryAttempt, sharedRecoveryRequest, withPreRuleReviewOutcomes } from './test-helpers/shared-channels.ts'
+import { sharedRecoveryLine } from '../src/reload-recovery.ts'
 import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { membershipPage, SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
 import { stubCallCount } from './test-helpers/agent-director-stub.ts'
@@ -19,12 +22,19 @@ const { primary: A, secondary: B, private: C } = SHARED_CHANNEL_IDS
 let h: ReloadHarness
 let runs: ReloadRun[]
 let allowedPosts: Map<ReloadRun, unknown[]>
-beforeEach(() => { h = makeReloadHarness(); runs = []; allowedPosts = new Map() })
+/** Each authority version `authorityWrites()` saw attempted, as text. Checked
+ * here, outside the authority writer's catch, so a failed, unsynced, stopped
+ * or later-replaced version still fails the test if it leaks. */
+let attemptedAuthorities: string[]
+beforeEach(() => { h = makeReloadHarness(); runs = []; allowedPosts = new Map(); attemptedAuthorities = [] })
 afterEach(async () => {
-  try { for (const run of runs) {
-    expect(run.slackPosts().map(call => call.args)).toEqual(allowedPosts.get(run) ?? [])
-    assertNoLeak(run.captured())
-  } }
+  try {
+    for (const run of runs) {
+      expect(run.slackPosts().map(call => call.args)).toEqual(allowedPosts.get(run) ?? [])
+      assertNoLeak(run.captured())
+    }
+    assertNoLeak({ attemptedAuthorities })
+  }
   finally { for (const run of runs) await run.stop(); await h.cleanup() }
 })
 function persona(name = 'alpha', delivery: DeliveryMode = 'all') {
@@ -55,6 +65,8 @@ function _fixtureChoice(run: ReloadRun, delivery: DeliveryMode, channel: string 
 }
 async function confirm(run: ReloadRun) { assertNoLeak(run.captured()); h.confirm(); await tick(run) }
 async function reopen(run: ReloadRun, opts: ReloadRunOptions = {}) { await run.stop(); return start(opts) }
+/** The production line for a confirmation that matches no current review. */
+function staleLine() { return renderStaleConfirmationLogLine(h.paths.apply, { kind: 'mismatch' }) }
 
 // Changed and unchanged values are declarations. Fixture choices use hk's
 // one-position transaction; logical MCP retries are tested separately.
@@ -101,9 +113,14 @@ test.each(['cancel', 'revise'] as const)('%s replaces durable intent, invalidate
   h.writeRequest(original); await tick(run)
   expect(authority(run).operatorIntent()).toMatchObject({ generation: 2, requested })
   run = await reopen(run)
+  const replayed = run.checkpoint()
   h.writeApplyBytes(oldReview); await tick(run)
   expect(choice(run)).toBe('all'); expect(order(run)).toBe(originalOrder)
-  expect(reviewLedger(disk())!.outcomes[oldFingerprint]!.status).toBe('superseded')
+  // Cancel leaves nothing pending, so its supersession stays the outcome
+  // recorded last. Reopen supersedes the revised review, which drops it.
+  if (requested) expect(reviewLedger(disk())!.outcomes[oldFingerprint]).toBeUndefined()
+  else expect(reviewLedger(disk())!.outcomes[oldFingerprint]!.status).toBe('superseded')
+  expect(run.since(replayed).logs).toEqual([requested ? staleLine() : reviewOutcomeLine('superseded')])
   run.request('refresh'); await tick(run)
   expect(authority(run).operatorIntent().assignments.map(a => a.delivery)).toEqual(requested ? ['thread_hybrid'] : [])
   await confirm(run)
@@ -695,4 +712,494 @@ test('reviewed absence replacement preserves the exact conflict and unrelated ch
   run.stub('alpha').script.inventory.push(membershipPage([A, B])); await run.membershipClock.runNext()
   expect(run.membership.read('alpha', A, 'open').kind).toBe('eligible')
   expect(choice(run)).toBe('all'); expect(absenceReplacementBinding(owner.snapshot(), 'alpha', A)).toBeUndefined()
+})
+
+// --- Review outcome retention (SR-3.5, SR-8.10) ---
+// "Latest" is the greatest saved outcome revision: each expected outcome names
+// the application that recorded it, never insertion order or generation.
+
+/** Every successful authority write, parsed, in order. Before the writer runs,
+ * each attempted write's bytes are copied into `attemptedAuthorities` (failed,
+ * unsynced, stopped and later-replaced versions included); the callback
+ * asserts nothing, so it cannot change the write's result. */
+function authorityWrites(): { written: SharedChannelState[]; beforeWrite: ReloadRunOptions['beforeWrite']; afterWrite: ReloadRunOptions['afterWrite'] } {
+  const written: SharedChannelState[] = []
+  return {
+    written,
+    beforeWrite: (path, bytes) => { if (path === h.paths.lastApplied) attemptedAuthorities.push(Buffer.from(bytes).toString('utf8')) },
+    afterWrite: (path, bytes) => { if (path === h.paths.lastApplied) written.push(parseSharedChannelState(bytes, path)!) },
+  }
+}
+/** The saved outcomes, once the published authority is shown to hold the same. */
+function retainedOutcomes(run: ReloadRun) {
+  const saved = reviewLedger(disk())!.outcomes
+  expect(reviewLedger(authority(run).snapshot())!.outcomes).toEqual(saved)
+  return saved
+}
+function outcomeOf(review: { fingerprint: string; generation: number }, status: ReviewOutcome['status'], revision: number) {
+  return { [review.fingerprint]: { generation: review.generation, revision, status } }
+}
+/** The pending review: its saved file, fingerprint and durable generation. */
+function pendingReview() {
+  const fingerprint = h.pendingFingerprint()!, active = reviewLedger(disk())!.active!
+  expect(active.fingerprint).toBe(fingerprint)
+  return { file: h.readPending()!, fingerprint, generation: active.generation }
+}
+function applyRemoved() { return { path: h.paths.apply, ok: true, removed: true, unsynced: false } }
+/** A saved confirmation is processed once and changes nothing: no write,
+ * lifecycle, assignment, applied/source/identity fact or pending intent. */
+async function expectRefused(run: ReloadRun, file: Buffer, line: string) {
+  const before = applicationState(disk()), intent = authority(run).operatorIntent(), pending = h.pendingFingerprint()
+  h.writeApplyBytes(file); const cp = run.checkpoint(); await tick(run)
+  expect(run.since(cp)).toEqual({ ...NO_RUN_ACTIVITY, logs: [line], removes: [applyRemoved()] })
+  expect(applicationState(disk())).toEqual(before); expect(applicationState(authority(run).snapshot())).toEqual(before)
+  expect(authority(run).operatorIntent()).toEqual(intent); expect(h.pendingFingerprint()).toBe(pending)
+}
+
+test('the review history keeps only its last outcome through supersessions and consumption; a dropped review is stale, the last keeps its line, and a consumed replay never assigns again', async () => {
+  const alpha = persona(), beta = persona('beta'); h.materialize(alpha, beta); const bytes = h.writeConfig({ personas: [alpha, beta] })
+  const writes = authorityWrites()
+  let run = await start(writes)
+  const betaLife = () => authority(run).snapshot().personas.beta
+  const sibling = betaLife()
+  run.request('request', [assignment(run, alpha, 'off')]); await tick(run)
+  const first = pendingReview()
+  expect(retainedOutcomes(run)).toEqual({})
+  // Each revision supersedes the active review in the observation that
+  // installs the next one, the last write of that check.
+  run.request('revise', [assignment(run, alpha, 'mentions')]); await tick(run)
+  const second = pendingReview()
+  expect(retainedOutcomes(run)).toEqual(outcomeOf(first, 'superseded', authority(run).revision))
+  run.request('revise', [assignment(run, alpha, 'thread_hybrid')]); await tick(run)
+  const third = pendingReview(), secondAt = authority(run).revision
+  expect(retainedOutcomes(run)).toEqual(outcomeOf(second, 'superseded', secondAt))
+  await expectRefused(run, first.file, staleLine())
+  await expectRefused(run, second.file, reviewOutcomeLine('superseded'))
+  expect(choice(run)).toBe('all')
+
+  // A consumed confirmation whose cleanup fails stays at the apply path.
+  const confirming = writes.written.length
+  h.failRemoves(); await confirm(run)
+  expect(choice(run)).toBe('thread_hybrid'); expect(h.applyExists()).toBe(true)
+  const consumedAt = order(run)!
+  expect(writes.written.slice(confirming).map(state => [state.revision, reviewLedger(state)!.outcomes])).toEqual([
+    [consumedAt - 1, outcomeOf(third, 'attempted', consumedAt - 1)],
+    [consumedAt, outcomeOf(third, 'consumed', consumedAt)],
+    [consumedAt + 1, outcomeOf(third, 'consumed', consumedAt)],
+  ])
+  expect(retainedOutcomes(run)).toEqual(outcomeOf(third, 'consumed', consumedAt))
+  expect(betaLife()).toEqual(sibling)
+  const consumedFile = h.readApply()!
+
+  // Restarted, the leftover still has the outcome recorded last.
+  run = await reopen(run, writes)
+  expect(run.logsOf(RELOAD_REVIEW_OUTCOME)).toEqual([reviewOutcomeLine('consumed')])
+  expect(choice(run)).toBe('thread_hybrid'); expect(order(run)).toBe(consumedAt)
+  expect(retainedOutcomes(run)).toEqual(outcomeOf(third, 'consumed', consumedAt))
+  // Newer outcomes drop it: after the next restart the leftover is stale.
+  run.request('request', [assignment(run, alpha, 'all')]); await tick(run)
+  const fourth = pendingReview()
+  run.request('revise', [assignment(run, alpha, 'off')]); await tick(run)
+  const fifth = pendingReview()
+  expect(retainedOutcomes(run)).toEqual(outcomeOf(fourth, 'superseded', authority(run).revision))
+  run = await reopen(run, writes)
+  expect(run.logsOf(RELOAD_REVIEW_OUTCOME)).toEqual([])
+  expect(run.logsOf(RELOAD_STALE_CONFIRMATION)).toEqual([staleLine()])
+  expect(choice(run)).toBe('thread_hybrid'); expect(order(run)).toBe(consumedAt); expect(h.applyExists()).toBe(true)
+  // Reopen superseded the fifth review in its first observation.
+  const sixth = pendingReview()
+  expect(retainedOutcomes(run)).toEqual(outcomeOf(fifth, 'superseded', authority(run).revision))
+  expect(sixth.generation).toBeGreaterThan(fifth.generation)
+  h.clearRemoveFailure(); await tick(run); expect(h.applyExists()).toBe(false)
+  await expectRefused(run, consumedFile, staleLine())
+  await expectRefused(run, fourth.file, staleLine())
+  await expectRefused(run, fifth.file, reviewOutcomeLine('superseded'))
+  expect(choice(run)).toBe('thread_hybrid'); expect(order(run)).toBe(consumedAt)
+  expect(authority(run).operatorIntent()).toMatchObject({ requested: true, assignments: [{ delivery: 'off' }] })
+  await confirm(run)
+  expect(choice(run)).toBe('off'); expect(order(run)).toBeGreaterThan(consumedAt)
+  expect(retainedOutcomes(run)).toEqual(outcomeOf(sixth, 'consumed', order(run)!))
+  expect(betaLife()).toEqual(sibling); expect(h.readConfig()).toEqual(bytes)
+})
+
+test('a bot attempt recorded after outcomes were dropped reopens readable; its derived variant at a kept outcome position is refused', async () => {
+  const alpha = persona(); h.materialize(alpha); h.writeConfig({ channel_mode: 'open', personas: [alpha] })
+  const opts: ReloadRunOptions = { dryRun: false, slack: { alpha: { inventory: [membershipPage([A])] } }, ...authorityWrites() }
+  let run = await start(opts)
+  await run.membershipClock.runNext(); await run.membershipClock.flush()
+  expect(run.membership.read('alpha', A, 'open').kind).toBe('eligible')
+  run.request('request', [assignment(run, alpha, 'off')]); await tick(run)
+  const first = pendingReview()
+  run.request('revise', [assignment(run, alpha, 'mentions')]); await tick(run)
+  const second = pendingReview()
+  run.request('revise', [assignment(run, alpha, 'thread_hybrid')]); await tick(run)
+  const kept = outcomeOf(second, 'superseded', authority(run).revision)
+  expect(retainedOutcomes(run)).toEqual(kept)
+  expect(reviewLedger(disk())!.outcomes[first.fingerprint]).toBeUndefined()
+  run.registerSession('alpha')
+  expect((await run.callTool('alpha', 'set_channel_delivery', deliveryAttempt('after-pruning', A, 'all'))).isError).toBe(false)
+  const seed = disk(), [application] = botApplications(seed)
+  expect(application).toMatchObject({ key: 'alpha', channel: A, delivery: 'all', resolvedOrder: order(run) })
+  expect(application!.startedOrder).toBeGreaterThan(kept[second.fingerprint]!.revision)
+  // A bot application writes no review history.
+  expect(retainedOutcomes(run)).toEqual(kept)
+  run = await reopen(run, opts)
+  expect(authority(run).readable).toBe(true); expect(authority(run).readableFor('alpha', A)).toBe(true)
+  expect(choice(run)).toBe('all'); expect(botApplications(disk())).toEqual([application])
+  expect(() => parseSharedChannelState(serializeSharedChannelState(botAttemptAtReviewOutcome(seed, second.fingerprint)), h.paths.lastApplied))
+    .toThrow('Inconsistent durable bot attempt effect.')
+})
+
+// --- Review binding (SR-4.3): reviewed membership facts, not scan bookkeeping ---
+
+/** An open-mode alpha whose authenticated inventory lists A and B, with a pending review. */
+async function reviewedMembership() {
+  const alpha = persona(); h.materialize(alpha); h.writeConfig({ channel_mode: 'open', personas: [alpha] })
+  const run = await start({ dryRun: false, slack: { alpha: { inventory: [membershipPage([A, B])] } }, ...authorityWrites() })
+  await run.membershipClock.runNext(); await run.membershipClock.flush()
+  expect(run.membershipScanner.status('alpha').state).toBe('complete')
+  expect(run.membership.read('alpha', B, 'open').kind).toBe('eligible')
+  run.request('request', [assignment(run, alpha, 'off')]); await tick(run)
+  return { run, review: pendingReview() }
+}
+/** One complete production reconciliation listing `channels` in this order. */
+async function reconcile(run: ReloadRun, channels: string[]) {
+  run.currentStub('alpha').script.inventory.push(membershipPage(channels))
+  if (run.membershipScanner.status('alpha').nextAttemptAt === undefined) run.membershipScanner.request('alpha')
+  await run.membershipClock.advanceTo(run.membershipScanner.status('alpha').nextAttemptAt!); await run.membershipClock.flush()
+  expect(run.membershipScanner.status('alpha').state).toBe('complete')
+}
+/** Slack closes alpha's socket; the returned settle lets its reconnect open. */
+async function dropConnection(run: ReloadRun) {
+  const reconnect = makeDeferredConnect()
+  run.currentStub('alpha').script.connect.push(reconnect.outcome)
+  run.currentStub('alpha').socket.drop(); await run.clock.flush()
+  expect(run.membership.read('alpha', A, 'open').kind).toBe('unresolved')
+  return async () => { reconnect.settle({ kind: 'ok' }); await run.clock.flush() }
+}
+
+test.each(['a rescan', 'a reordered rescan', 'a reconnect'] as const)('%s that finds the same reviewed membership keeps the pending review, its generation and outcomes', async change => {
+  const { run, review } = await reviewedMembership()
+  const before = disk(), ledger = reviewLedger(before), generation = run.membership.generation('alpha')!.generation
+  if (change === 'a reconnect') { const reconnect = await dropConnection(run); await reconnect() }
+  await reconcile(run, change === 'a reordered rescan' ? [B, A] : [A, B])
+  // The scan writes its own records and watermarks, never review metadata.
+  const scanned = disk()
+  expect(scanned.revision).toBeGreaterThan(before.revision)
+  expect(scanned.personas.alpha!.membershipInventory).not.toEqual(before.personas.alpha!.membershipInventory)
+  expect(scanned.personas.alpha!.membershipEvents).not.toEqual(before.personas.alpha!.membershipEvents)
+  if (change === 'a reconnect') expect(run.membership.generation('alpha')!.generation).not.toBe(generation)
+  expect(reviewLedger(scanned)).toEqual(ledger)
+  const cp = run.checkpoint(); await tick(run)
+  expect(run.since(cp)).toEqual(NO_RUN_ACTIVITY)
+  expect(pendingReview()).toEqual(review); expect(reviewLedger(disk())).toEqual(ledger)
+  await confirm(run)
+  expect(choice(run)).toBe('off'); expect(retainedOutcomes(run)).toEqual(outcomeOf(review, 'consumed', order(run)!))
+})
+
+test.each(['an observed unverified reconnect', 'a leave', 'a join'] as const)('%s supersedes the pending review; its confirmation applies nothing', async change => {
+  const { run, review } = await reviewedMembership()
+  if (change === 'an observed unverified reconnect') {
+    const reconnect = await dropConnection(run)
+    await tick(run)
+    expect(h.pendingFingerprint()).not.toBe(review.fingerprint)
+    await reconnect()
+    await reconcile(run, [A, B])
+  } else await reconcile(run, change === 'a leave' ? [A] : [A, B, C])
+  await tick(run)
+  expect(h.pendingFingerprint()).not.toBe(review.fingerprint)
+  // A reconnect that is observed both ways supersedes twice, dropping the outcome.
+  await expectRefused(run, review.file, change === 'an observed unverified reconnect' ? staleLine() : reviewOutcomeLine('superseded'))
+  expect(choice(run)).toBe('all')
+  await confirm(run); expect(choice(run)).toBe('off')
+})
+
+// The same authenticated connection keeps its generation; a failed rescan
+// changes only that generation's current evidence, never the saved facts.
+test.each([
+  ['a hold for missing eligibility metadata', [A, { id: B }], 'eligibility-missing', [[B, 'eligibility-missing']]],
+  ['contradictory page metadata', [A, B, { id: A }], 'malformed-page', []],
+] as const)('%s leaves the current generation incomplete and supersedes the pending review with saved membership unchanged; reconciling the same facts keeps it revoked', async (_change, channels, problem, holds) => {
+  const { run, review } = await reviewedMembership()
+  const generation = run.membership.generation('alpha')!, dependency = sharedReviewDependency(disk())
+  expect([generation.complete, [...generation.holds]]).toEqual([true, []])
+  run.currentStub('alpha').script.inventory.push(membershipPage([...channels]))
+  run.membershipScanner.request('alpha')
+  await run.membershipClock.advanceTo(run.membershipScanner.status('alpha').nextAttemptAt!); await run.membershipClock.flush()
+  expect(run.membershipScanner.status('alpha')).toMatchObject({ state: 'incomplete', problem })
+  expect(run.membership.generation('alpha')).toBe(generation); expect(run.membership.isCurrent(generation)).toBe(true)
+  expect([generation.complete, Object.fromEntries(generation.holds)]).toEqual([false, Object.fromEntries(holds)])
+  expect(sharedReviewDependency(disk())).toBe(dependency)
+  await tick(run)
+  const incomplete = pendingReview()
+  expect(incomplete.fingerprint).not.toBe(review.fingerprint)
+  expect(retainedOutcomes(run)).toEqual(outcomeOf(review, 'superseded', authority(run).revision))
+  await expectRefused(run, review.file, reviewOutcomeLine('superseded'))
+  // The same facts again: the generation is complete with the reviewed
+  // evidence, but its reversion revokes the incomplete review too.
+  await reconcile(run, [A, B])
+  expect(run.membership.generation('alpha')).toBe(generation)
+  expect([generation.complete, [...generation.holds]]).toEqual([true, []])
+  expect(sharedReviewDependency(disk())).toBe(dependency)
+  await tick(run)
+  expect(h.pendingFingerprint()).not.toBe(incomplete.fingerprint); expect(h.pendingFingerprint()).not.toBe(review.fingerprint)
+  await expectRefused(run, review.file, staleLine())
+  await expectRefused(run, incomplete.file, reviewOutcomeLine('superseded'))
+  expect(choice(run)).toBe('all')
+  await confirm(run); expect(choice(run)).toBe('off')
+})
+
+test('the review dependency binds each reviewed membership, leave, life and choice fact, and leaves out scan bookkeeping and enumeration order', async () => {
+  const { run } = await reviewedMembership()
+  await reconcile(run, [A])
+  const base = authority(run).snapshot(), dependency = sharedReviewDependency(base)
+  expect(base.personas.alpha!.membership[A]).toMatchObject({ member: true, isExtSharedChannel: false, channelType: 'channel' })
+  expect(base.personas.alpha!.membership[B]!.isExtSharedChannel).toBeUndefined()
+  const after = (change: (life: SharedPersona, state: SharedChannelState) => void) => {
+    const next = structuredClone(base); change(next.personas.alpha!, next); return sharedReviewDependency(next)
+  }
+  const reversed = <T>(record: Record<string, T>) => Object.fromEntries(Object.entries(record).reverse())
+  const reviewed: Record<string, (life: SharedPersona, state: SharedChannelState) => void> = {
+    'membership': life => { life.membership[A]!.member = false },
+    'issuing identity': life => { life.membership[A]!.identity += '-rotated' },
+    'membership boundary': life => { life.membership[A]!.boundary++ },
+    'external sharing, false to missing': life => { delete life.membership[A]!.isExtSharedChannel },
+    'external sharing, missing to false': life => { life.membership[B]!.isExtSharedChannel = false },
+    'channel type': life => { life.membership[A]!.channelType = 'group' },
+    'same-value ordered choice': life => { life.assignments[A]!.order++ },
+    'leave boundary': life => { life.leaves[B]!.boundary++ },
+    'leave life': life => { life.leaves[B]!.incarnation += '-replaced' },
+    'life incarnation': life => { life.incarnation += '-replaced' },
+    'reset order': life => { life.resetOrder = base.revision },
+  }
+  const bookkeeping: Record<string, (life: SharedPersona, state: SharedChannelState) => void> = {
+    'membership watermark': life => { life.membership[A]!.observedThrough = life.membershipInventory!.observedThrough + '1' },
+    'scan records and their IDs': life => { life.membershipEvents = Object.fromEntries(Object.entries(life.membershipEvents).slice(1).map(([id, event]) => [id + '-rescan', event])) },
+    'inventory watermark': life => { life.membershipInventory = { ...life.membershipInventory!, observedThrough: life.membershipInventory!.observedThrough + '1', observedRevision: base.revision, recordedOrder: base.revision } },
+    'leave event ID': life => { life.leaves[B]!.event += '-rescan' },
+    'enumeration order': (life, state) => { life.membership = reversed(life.membership); life.membershipEvents = reversed(life.membershipEvents); state.personas = reversed(state.personas) },
+    'review metadata and revision': (_life, state) => { state.revision++; delete state.outcomes.operatorReviews },
+    'Thread Memory marker': (_life, state) => { state.threadMemoryCreated = { alpha: true } },
+  }
+  for (const [fact, change] of Object.entries(reviewed)) expect([fact, after(change)]).not.toEqual([fact, dependency])
+  for (const [record, change] of Object.entries(bookkeeping)) expect([record, after(change)]).toEqual([record, dependency])
+})
+
+// --- Pinned outcomes: retirement recovery and repair activation (SR-3.5, SR-5.2) ---
+
+/** A refused start that staged or reviewed recovery. Its preview is
+ * leak-checked now, while it exists: a later start replaces it and a direct
+ * confirmation renames it. */
+async function startRefused(opts: ReloadRunOptions = {}) {
+  const run = await h.start({ dryRun: true, ...opts }); runs.push(run)
+  expect(run.outcome.kind).toBe('refused')
+  expect(h.pendingExists()).toBe(true)
+  assertNoLeak({ ...run.captured(), pending: h.readPendingText() })
+  return run
+}
+/** Each authority write from `from` on: its revision, saved outcomes and retirement pin. */
+function historyWrites(written: SharedChannelState[], from: number) {
+  return written.slice(from).map(state => ({ revision: state.revision, outcomes: reviewLedger(state)?.outcomes, retirement: reviewLedger(state)?.retirement?.fingerprint }))
+}
+/** A damaged authority replaced through reviewed recovery: the staged review
+ * is revised (supersedeReview), then confirmed at a start whose attempt
+ * (beginReviewAttempt, retiring every replaced life) and activation (activate)
+ * apply it. Returns the running server and the activation's review. */
+async function activatedReplacement(personas: PersonaInput[], writes: ReturnType<typeof authorityWrites>) {
+  const input = h.writeConfig({ personas }), damage = h.writeRecordBytes('damaged authority evidence')
+  h.writeRequestBytes(configBytes(sharedRecoveryRequest('replace-staged', damage, input)))
+  let run = await startRefused(writes)
+  const staged = pendingReview()
+  await run.stop()
+  let from = writes.written.length
+  h.writeRequestBytes(configBytes(sharedRecoveryRequest('replace-revised', damage, input)))
+  run = await startRefused(writes)
+  const revised = pendingReview(), revision = writes.written[from]!.revision
+  expect(historyWrites(writes.written, from)).toEqual([revision, revision + 1].map(at => ({ revision: at, outcomes: outcomeOf(staged, 'superseded', revision), retirement: undefined })))
+  await run.stop(); h.confirm(); from = writes.written.length
+  run = await start(writes)
+  const { order } = disk().recovery!.activation!
+  expect(disk().recovery!.activation!.fingerprint).toBe(revised.fingerprint)
+  expect(historyWrites(writes.written, from)).toEqual([
+    { revision: order - 1, outcomes: outcomeOf(revised, 'attempted', order - 1), retirement: revised.fingerprint },
+    { revision: order, outcomes: outcomeOf(revised, 'consumed', order), retirement: undefined },
+    { revision: order + 1, outcomes: outcomeOf(revised, 'consumed', order), retirement: undefined },
+  ])
+  return { run, activation: { ...revised, order } }
+}
+function retainedActivationLines(run: ReloadRun) { return run.logs.filter(line => line.startsWith(sharedRecoveryLine('retained repair activation'))) }
+/** The seed keeps `saved`'s outcomes first, then older ones, so the outcome
+ * recorded last is never the one inserted last. */
+function expectPreRuleSeed(seed: SharedChannelState, saved: SharedChannelState) {
+  const own = reviewLedger(saved)!.outcomes, seeded = reviewLedger(seed)!.outcomes
+  expect(Object.keys(seeded).slice(0, Object.keys(own).length)).toEqual(Object.keys(own))
+  expect(Object.keys(seeded).length).toBeGreaterThan(Object.keys(own).length)
+  expect(seeded).toMatchObject(own)
+}
+
+test('a repair activation keeps its consumed outcome beside the last outcome through later reviews and restarts, until a later repair stages and replaces it', async () => {
+  const alpha = persona(); h.materialize(alpha)
+  const writes = authorityWrites()
+  let { run, activation } = await activatedReplacement([alpha], writes)
+  const pin = outcomeOf(activation, 'consumed', activation.order)
+  expect(retainedOutcomes(run)).toEqual(pin)
+  run.request('request', [assignment(run, alpha, 'off')]); await tick(run)
+  const first = pendingReview()
+  expect(retainedOutcomes(run)).toEqual(pin)
+  run.request('revise', [assignment(run, alpha, 'mentions')]); await tick(run)
+  const second = pendingReview()
+  expect(retainedOutcomes(run)).toEqual({ ...pin, ...outcomeOf(first, 'superseded', authority(run).revision) })
+  run = await reopen(run, writes)
+  expect(retainedActivationLines(run)).toHaveLength(1); expect(retainedActivationLines(run)[0]).toContain(`order=${activation.order}`)
+  const third = pendingReview()
+  expect(retainedOutcomes(run)).toEqual({ ...pin, ...outcomeOf(second, 'superseded', authority(run).revision) })
+  await expectRefused(run, first.file, staleLine())
+  await expectRefused(run, second.file, reviewOutcomeLine('superseded'))
+
+  // An owned restoration stages this state. Its review phase pins nothing, so
+  // the stage's first history write keeps only the outcome recorded last.
+  const owned = authority(run).snapshot()
+  const damage = h.writeRecordBytes('damaged while the owner keeps its validated state')
+  h.writeRequestBytes(configBytes(sharedRecoveryRequest('owned-restoration', damage)))
+  await tick(run); expect(authority(run).readable).toBe(false)
+  await run.stop()
+  run = await startRefused(writes)
+  const restoring = pendingReview()
+  expect(disk().recovery!.phase).toBe('review')
+  expect(reviewLedger(disk())!.outcomes).toEqual(outcomeOf(third, 'superseded', disk().revision))
+  await run.stop(); h.confirm()
+  run = await start(writes)
+  const replaced = disk().recovery!.activation!
+  expect(replaced.fingerprint).toBe(restoring.fingerprint)
+  expect(retainedOutcomes(run)).toEqual(outcomeOf(restoring, 'consumed', replaced.order))
+  // The same reviewed facts under the restoration's new boundary bind another dependency.
+  const restored = authority(run).snapshot(), facts = (state: SharedChannelState) => [state.sourceBytesBase64, state.applied, state.personas, state.retiredIdentities]
+  expect(facts(restored)).toEqual(facts(owned)); expect(restored.recovery!.boundary).not.toBe(owned.recovery!.boundary)
+  expect(sharedReviewDependency(restored)).not.toBe(sharedReviewDependency(owned))
+  expect(authority(run).operatorIntent()).toMatchObject({ requested: true, assignments: [{ delivery: 'mentions' }] })
+  const fourth = pendingReview()
+  expect(fourth.fingerprint).not.toBe(third.fingerprint)
+  await confirm(run); expect(choice(run)).toBe('mentions')
+  expect(retainedOutcomes(run)).toEqual({ ...outcomeOf(restoring, 'consumed', replaced.order), ...outcomeOf(fourth, 'consumed', order(run)!) })
+})
+
+test('an interrupted retirement keeps its attempted outcome beside the activation through a failed recovery and restart; its rejection prunes a pre-rule history, releases the pin and a later outcome drops it', async () => {
+  const alpha = persona(), beta = persona('beta'); h.materialize(alpha, beta)
+  const writes = authorityWrites()
+  let { run, activation } = await activatedReplacement([alpha, beta], writes)
+  const pin = outcomeOf(activation, 'consumed', activation.order)
+  run.request('request', [assignment(run, alpha, 'off')]); await tick(run)
+  // A reviewed destructive change retires beta's life; the server stops after its attempt.
+  let armed = false
+  run = await reopen(run, { ...writes, stopBeforeWrite: (path, bytes) => armed && path === h.paths.lastApplied && activationRecord(bytes, path) })
+  const moved = { ...beta, working_directory: h.persona('beta-moved').working_directory }; h.materialize(moved)
+  const input = h.writeConfig({ personas: [alpha, moved] }); await tick(run)
+  const retiring = pendingReview()
+  armed = true; await confirm(run)
+  expect(run.stoppedBeforeWrite).toBe(true); await run.stop()
+  const interrupted = disk(), attempt = outcomeOf(retiring, 'attempted', interrupted.revision)
+  expect(reviewLedger(interrupted)!.outcomes).toEqual({ ...pin, ...attempt })
+  expect(reviewLedger(interrupted)!.retirement!.fingerprint).toBe(retiring.fingerprint)
+  // The same interruption as a CSCB before SR-3.5 saved it, with every older outcome.
+  const seed = withPreRuleReviewOutcomes(interrupted, writes.written)
+  expectPreRuleSeed(seed, interrupted)
+  const seedBytes = h.writeChannelDeliveryBytes(serializeSharedChannelState(seed))
+
+  // A start whose rejection cannot be saved keeps the whole history and both pins.
+  h.failWrites({ step: 'renameSync', path: h.paths.lastApplied })
+  run = await start(writes)
+  expect(h.readRecord()).toEqual(seedBytes)
+  expect(reviewLedger(authority(run).snapshot())).toEqual(reviewLedger(seed))
+  expect(run.logs.filter(line => line === reviewRecoveryLine('unresolved'))).toHaveLength(1)
+  expect(run.lifecycle.keys('bring-up')).toEqual(['alpha'])
+  await run.stop()
+  run = await start(writes)
+  expect(h.readRecord()).toEqual(seedBytes)
+  // Its recovery, once storage works, is the next history write.
+  h.clearWriteFailure(); const from = writes.written.length
+  await tick(run)
+  const rejection = writes.written[from]!, rejected = { ...pin, ...outcomeOf(retiring, 'rejected', rejection.revision) }
+  expect(historyWrites(writes.written, from)[0]).toEqual({ revision: rejection.revision, outcomes: rejected, retirement: undefined })
+  expect(retainedOutcomes(run)).toEqual(rejected)
+  expect(run.logs).toContain(reviewRecoveryLine('recovered'))
+  expect(run.lifecycle.keys('bring-up')).toEqual(['alpha', 'beta'])
+  await until(() => run.lifecycle.keys('launch').includes('beta'))
+  const reviewed = pendingReview()
+  await expectRefused(run, retiring.file, reviewOutcomeLine('rejected'))
+  // Reopen supersedes the pending review, which drops the rejected outcome.
+  run = await reopen(run, writes)
+  expect(retainedOutcomes(run)).toEqual({ ...pin, ...outcomeOf(reviewed, 'superseded', authority(run).revision) })
+  await expectRefused(run, retiring.file, staleLine())
+  const fresh = pendingReview()
+  await confirm(run)
+  const replacedAt = authority(run).snapshot().personas.beta!.resetOrder!
+  expect(retainedOutcomes(run)).toEqual({ ...pin, ...outcomeOf(fresh, 'consumed', replacedAt) })
+  expect(authority(run).config().personas.find(p => p.name === 'beta')!.working_directory).toBe(moved.working_directory)
+  expect(choice(run)).toBe('off'); expect(h.readConfig()).toEqual(input)
+})
+
+test.each(['written', 'refused before the rename', 'installed but unsynced', 'stopped before the write'] as const)('a pre-rule oversized review history reads as saved; its next history write, an observation adding no outcome, keeps only the last outcome and the activation (%s)', async boundary => {
+  const alpha = persona(), beta = persona('beta'); h.materialize(alpha, beta)
+  const writes = authorityWrites()
+  let { run, activation } = await activatedReplacement([alpha, beta], writes)
+  run.request('request', [assignment(run, alpha, 'off')]); await tick(run)
+  run.request('revise', [assignment(run, alpha, 'mentions')]); await tick(run)
+  const cancelled = pendingReview()
+  run.request('cancel', []); await tick(run)
+  expect(h.pendingExists()).toBe(false)
+  const kept = { ...outcomeOf(activation, 'consumed', activation.order), ...outcomeOf(cancelled, 'superseded', authority(run).revision) }
+  expect(retainedOutcomes(run)).toEqual(kept)
+  await run.stop()
+  const saved = disk(), seed = withPreRuleReviewOutcomes(saved, writes.written)
+  expectPreRuleSeed(seed, saved)
+  const seedBytes = h.writeChannelDeliveryBytes(serializeSharedChannelState(seed))
+  const oldOutcomes = reviewLedger(seed)!.outcomes, betaChoice = () => [authority(run).readableFor('beta', A), choice(run, A, 'beta')]
+
+  // Opening and reading alone neither convert nor report it.
+  let armed = false
+  run = await h.start({ dryRun: true, realLifecycle: true, ...writes, stopBeforeWrite: path => armed && path === h.paths.lastApplied }); runs.push(run)
+  expect(run.outcome.kind).toBe('applied')
+  expect(h.readRecord()).toEqual(seedBytes)
+  expect(run.writes.filter(write => write.path === h.paths.lastApplied)).toEqual([])
+  expect([RELOAD_REVIEW_OUTCOME, RELOAD_REVIEW_RECOVERY].flatMap(label => run.logsOf(label))).toEqual([])
+  expect(retainedActivationLines(run)).toHaveLength(1)
+  expect(reviewLedger(authority(run).snapshot())!.outcomes).toEqual(oldOutcomes)
+  const betaBefore = betaChoice()
+
+  if (boundary === 'refused before the rename') h.failWrites({ step: 'renameSync', path: h.paths.lastApplied })
+  if (boundary === 'installed but unsynced') h.failWrites({ step: 'fsyncSync', call: 2, path: h.paths.lastApplied })
+  armed = boundary === 'stopped before the write'
+  const from = writes.written.length, attempts = attemptedAuthorities.length
+  run.startDetection(); await tick(run)
+  expect(h.pendingExists()).toBe(false)
+  // The pruning attempt is retained for the closing leak check whatever its result.
+  expect(attemptedAuthorities.slice(attempts).map(text => reviewLedger(parseSharedChannelState(Buffer.from(text), h.paths.lastApplied)!)!.outcomes)).toEqual([kept])
+  if (boundary === 'written') {
+    expect(historyWrites(writes.written, from).map(write => write.outcomes)).toEqual([kept])
+    expect(retainedOutcomes(run)).toEqual(kept)
+  } else if (boundary === 'refused before the rename') {
+    // A definite failure publishes nothing and leaves the authority readable.
+    expect(h.readRecord()).toEqual(seedBytes)
+    expect(authority(run).readable).toBe(true); expect(reviewLedger(authority(run).snapshot())!.outcomes).toEqual(oldOutcomes)
+    expect(betaChoice()).toEqual(betaBefore)
+  } else if (boundary === 'installed but unsynced') {
+    // The new bytes are installed but unconfirmed: unresolved, never published.
+    // The disk holds the whole new history, the published authority the old
+    // one with its activation pin.
+    expect(reviewLedger(disk())!.outcomes).toEqual(kept)
+    expect(authority(run).readable).toBe(false)
+    expect(reviewLedger(authority(run).snapshot())!.outcomes).toEqual(oldOutcomes)
+    expect(authority(run).snapshot().recovery!.activation!.fingerprint).toBe(activation.fingerprint)
+  } else expect(run.stoppedBeforeWrite).toBe(true)
+  await run.stop(); h.clearWriteFailure()
+
+  // Reopened: the whole old or new history with the activation, never part of one.
+  const installed = boundary === 'written' || boundary === 'installed but unsynced'
+  expect(h.readRecord()!.equals(seedBytes)).toBe(!installed)
+  run = await h.start({ dryRun: true, realLifecycle: true, ...writes }); runs.push(run)
+  expect(run.outcome.kind).toBe('applied')
+  expect(reviewLedger(authority(run).snapshot())!.outcomes).toEqual(installed ? kept : oldOutcomes)
+  run.startDetection(); await tick(run)
+  expect(retainedOutcomes(run)).toEqual(kept)
+  expect(betaChoice()).toEqual(betaBefore)
 })

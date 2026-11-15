@@ -1,7 +1,7 @@
 /** Durable review generations and one-time confirmation outcomes. This is
  * metadata in the existing shared authority, never a second store. */
 import { createHash } from 'node:crypto'
-import type { SharedChannelAuthority, SharedChannelState, SharedMutationResult } from './shared-channels.ts'
+import type { SharedChannelAuthority, SharedChannelState, SharedMembership, SharedMutationResult, SharedPersona } from './shared-channels.ts'
 import { emptyOperatorIntent, type OperatorIntent } from './reload-request.ts'
 import { type RetiredReviewRecovery, validateRetiredReviewRecovery } from './retired-keys.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
@@ -67,12 +67,86 @@ export function validateReviewLedger(value: unknown, revision: number): asserts 
 export function reviewFingerprint(binding: string, generation: number): string {
   return createHash('sha256').update(JSON.stringify(['cscb-review-v1', binding, generation])).digest('hex')
 }
-/** Metadata cannot invalidate itself. Assignment orders, membership histories,
- * readiness, declarations, destinations and applied mode remain dependencies. */
+
+// --- Review dependency: the current facts a reviewed result reads ---
+
+/** A record's keys in code-unit order, so enumeration order never matters. */
+function keysInOrder(record: Readonly<Record<string, unknown>>): string[] {
+  return Object.keys(record).sort()
+}
+/** One channel's current membership fact: member, issuing identity, boundary
+ * and eligibility metadata, where missing metadata stays distinct from false.
+ * The scan watermark that last refreshed it is bookkeeping, not a fact. */
+export function reviewedMembershipFact(membership: SharedMembership): unknown[] {
+  return [membership.member, membership.identity, membership.boundary, membership.isExtSharedChannel ?? null, membership.channelType ?? null]
+}
+/** One life's current facts: incarnation and reset provenance, declaration,
+ * ordered choices (a same-value write still moves its order), each channel's
+ * membership fact, leave and destination proofs (a leave's boundary names its
+ * event), absence conflicts and unresolved live evidence, which hold reviewed
+ * absence replacement and membership reads. The histories that established
+ * these (membership events, applied evidence, inventory and setup records)
+ * and their scan IDs, watermarks and recorded positions stay out, so a rescan,
+ * repeat retention or reconnect that finds the same facts keeps them. */
+function reviewedLifeFacts(life: SharedPersona): unknown[] {
+  const { assignments, membership, leaves, removedDestinations, resetDestination } = life
+  const conflicts = life.membershipAbsenceConflicts ?? {}, evidence = life.membershipEvidence ?? {}
+  return [
+    life.incarnation, life.resetOrder ?? null, life.createdAt ?? null,
+    [life.declaration.name, life.declaration.credentials_file, life.declaration.working_directory],
+    keysInOrder(assignments).map(channel => {
+      const choice = assignments[channel]!
+      return [channel, choice.delivery, choice.order, choice.threadHybridSince ?? null]
+    }),
+    keysInOrder(membership).map(channel => [channel, ...reviewedMembershipFact(membership[channel]!)]),
+    keysInOrder(leaves).map(channel => [channel, leaves[channel]!.boundary, leaves[channel]!.incarnation]),
+    keysInOrder(removedDestinations).map(channel => [channel, removedDestinations[channel]!.boundary, removedDestinations[channel]!.incarnation]),
+    resetDestination ? [resetDestination.channel, resetDestination.incarnation, resetDestination.order] : null,
+    keysInOrder(conflicts).map(channel => [channel, conflicts[channel]!.identity, conflicts[channel]!.boundary, conflicts[channel]!.assignmentOrder]),
+    keysInOrder(evidence).filter(event => evidence[event]!.state === 'pending' || evidence[event]!.state === 'conflict')
+      .map(event => [event, evidence[event]!.channel, evidence[event]!.originalEvent ?? null, evidence[event]!.state]),
+  ]
+}
+/** Metadata cannot invalidate itself. The applied source and configuration,
+ * each life's current facts, retired identity provenance and the recovery
+ * boundary remain dependencies; every review after a repair binds its
+ * boundary, so a later history's restarted generations never reuse a
+ * fingerprint. Every review, attempt, application and recovery caller reads
+ * this one projection. */
 export function sharedReviewDependency(state: SharedChannelState): string {
+  const { personas, retiredIdentities } = state
   return createHash('sha256').update(JSON.stringify([
-    state.sourceBytesBase64, state.applied, state.personas, state.retiredIdentities, state.recovery?.boundary,
+    state.sourceBytesBase64, state.applied,
+    keysInOrder(personas).map(key => [key, reviewedLifeFacts(personas[key]!)]),
+    // Retirement writes each record once; no scan or metadata write touches it.
+    keysInOrder(retiredIdentities).map(id => [id, retiredIdentities[id]]),
+    state.recovery?.boundary ?? null,
   ])).digest('hex')
+}
+
+// --- Review outcome retention (SR-3.5) ---
+
+/** Keeps the review history's outcomes a reader still needs and drops the
+ * rest: the outcome recorded last (greatest durable revision), whose
+ * confirmation gets the outcome line; the attempted outcome the interrupted
+ * retirement names, which its recovery reads; and the consumed outcome an
+ * active recovery's activation names, which readability requires. A dropped
+ * fingerprint never recurs, because later reviews bind a greater generation
+ * and the current recovery boundary, so its confirmation is refused as stale.
+ * Every history writer calls this on its transaction draft once its outcome
+ * and references are final, so dropping shares the one durable application
+ * that records the outcome: an interruption leaves the earlier or the later
+ * ledger, never a partly pruned one. Creates nothing and checks nothing;
+ * validation still reads every reference. */
+export function retainReviewOutcomes(next: SharedChannelState): void {
+  const ledger = reviewLedger(next)
+  if (!ledger) return
+  const outcomes = Object.entries(ledger.outcomes)
+  const last = Math.max(...outcomes.map(([, outcome]) => outcome.revision))
+  const kept = new Set(outcomes.filter(([, outcome]) => outcome.revision === last).map(([fingerprint]) => fingerprint))
+  if (ledger.retirement) kept.add(ledger.retirement.fingerprint)
+  if (next.recovery?.phase === 'active' && next.recovery.activation) kept.add(next.recovery.activation.fingerprint)
+  for (const [fingerprint] of outcomes) if (!kept.has(fingerprint)) delete ledger.outcomes[fingerprint]
 }
 /** Each detection controller retains observed revocations until a new durable
  * generation supersedes them. Revalidation observes without writing metadata
@@ -96,6 +170,7 @@ export function supersedeReview(state: SharedChannelState, order: number): void 
     generation: ledger.active.generation, status: 'superseded', revision: order,
   })
   delete ledger.active
+  retainReviewOutcomes(state)
 }
 function observeReview(
   authority: SharedChannelAuthority, binding: string, pending: boolean, intentGeneration: number, sourceHash: string,
@@ -116,6 +191,8 @@ function observeReview(
     if (review) ledger.active = review
     else delete ledger.active
     put(next.outcomes, 'operatorReviews', ledger)
+    // A new generation without a new outcome still bounds an older ledger.
+    retainReviewOutcomes(next)
   })
   return { result, review: result.kind === 'applied' ? review : undefined }
 }
@@ -135,6 +212,7 @@ export function beginReviewAttempt(authority: SharedChannelAuthority, review: Du
     const ledger = reviewLedger(next)!
     put(ledger.outcomes, review.fingerprint, { generation: review.generation, status: 'attempted', revision: order })
     if (recovery) ledger.retirement = { fingerprint: review.fingerprint, recovery }
+    retainReviewOutcomes(next)
   })
 }
 /** Called only inside the authority's reviewed application transaction. */
@@ -144,6 +222,7 @@ export function consumeReview(next: SharedChannelState, review: DurableReview, o
   put(ledger.outcomes, review.fingerprint, { generation: review.generation, status: 'consumed', revision: order })
   delete ledger.active
   delete ledger.retirement
+  retainReviewOutcomes(next)
   const intent = next.pendingIntent['operator'] as OperatorIntent | undefined
   if (intent?.generation === review.intentGeneration && intent.requested) {
     intent.assignments = []
@@ -159,6 +238,7 @@ export function rejectReviewAttempt(authority: SharedChannelAuthority, fingerpri
     outcome.status = 'rejected'
     outcome.revision = order
     if (ledger.retirement?.fingerprint === fingerprint) delete ledger.retirement
+    retainReviewOutcomes(next)
   })
 }
 export function reviewRecoveryLine(result: 'recovered' | 'unresolved'): string {
