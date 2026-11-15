@@ -186,7 +186,7 @@ It prints one line on stderr and never repeats its argument:
 | `clear-latch: cleared the latch of persona "<name>" (key=<key>)` | `0` | The persona was held; the hold and its restart limit are cleared. |
 | `clear-latch: persona "<name>" (key=<key>) was not latched; nothing changed` | `0` | The persona was not held, or only by a *Cannot launch* hold, which this command does not end. Its restart limit is unchanged. |
 
-It reaches the server at `127.0.0.1`, at the port the running server recorded in `server.port`, not at the `port` of `config.json`. It connects directly and ignores proxy environment variables such as `HTTP_PROXY`, so its argument never leaves the host. So the server's `bind` must be `127.0.0.1` (the default) or `0.0.0.0`, as scheduled prompts need. On any other `bind` it cannot reach the server, and a hold ends only by the server's own check every 2 minutes, by the persona's teardown (removing it, or a destructive change to it), or by a server restart, which drops every hold.
+It reaches the server at `127.0.0.1`, at the port the running server recorded in `server.port`, not at the `port` of `config.json`. It connects directly and ignores proxy environment variables such as `HTTP_PROXY`, so its argument never leaves the host. So the server's `bind` must be `127.0.0.1` (the default) or `0.0.0.0`. On any other `bind` it cannot reach the server, and a hold ends only by the server's own check every 2 minutes, by the persona's teardown (removing it, or a destructive change to it), or by a server restart, which drops every hold.
 
 It needs no agent-director, reads no configuration file and writes or removes no file.
 

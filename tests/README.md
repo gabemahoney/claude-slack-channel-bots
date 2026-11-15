@@ -250,6 +250,11 @@ calls.
 
 ```
 tests/
+  fixtures/
+    shared-channel-upgrade/       # generated reference-0.18.0, new-baseline, pending-edits and manifest
+  test-helpers/
+    thread-populations.ts         # deterministic Thread Memory populations and expected bursts
+    shared-channel-upgrade.ts     # fixture generator, materializer and command assertions
   integration/
     test-1-install-startup.sh # install the package, then check its pinned npm client against the independently pinned runtime, changing nothing (ad-client-check.sh --package),
                                    # then run fixtures/phase1-client-check.ts on the installed package; a pre-persona config fails start; the persona config starts in dry run
@@ -411,7 +416,7 @@ tests/
                                    # tmux line. From AD 0.18.0 the no-launch-start row is marked by CSCB's first active read, with no launch-start
                                    # latch or loop; B must still get a resume decision with no reuse spawn, and other latches are recorded under S8.
                                    # It runs at agent-director's default settings, holds past the outage's third retry and runs about 22 minutes
-    test-29-invited-channels.sh    # shared strict/open mode against explicit Slack membership inventory: strict discovery off, open choices retained through restart/strict reactivation, exact received-log acceptance, paired-event dedupe, shared recipients and direct DM evidence
+    test-29-invited-channels.sh    # composed strict/open shared channels and threads: explicit membership, retained choices, exact intake/receipts, own posts, holds, paired-event dedupe and DMs
     test-30-state-dir-upgrade.sh #, shared mode, dry run: the state directory's first start of this build from each layout an earlier release left,
                                    # each in a fresh HOME under SCENARIO_ROOT (the container's agent-director install linked in) with no SLACK_STATE_DIR or
                                    # XDG_CONFIG_HOME: up to 0.13 (only ~/.claude/channels/slack), 0.14.0 (that, plus ~/.config/cscb holding only the crontable
@@ -421,7 +426,7 @@ tests/
                                    # warning, and that the CLI's `stop` finds the server
     test-31-fmk-ack-burst.sh # /, fmk mode: explicit membership/readiness before 1,000 concurrent Slack events for one silent stub persona, every actual WebSocket ACK
                                    # within 3,000 ms of its pre-send monotonic timestamp; exactly 1,000 items remain outstanding with no typing, receipts or model calls
-    test-32-fmk-real-order.sh      # real Claude: down-queue order, one in flight with faults/restart, 20-DM p95 latency
+    test-32-fmk-real-order.sh      # real Claude: down-queue FIFO/faults/restart, 20-DM and strict/open thread-selected latency at 100,000 threads with two personas
     test-33-fmk-real-keys.sh       # swallowed text/Enter, repeated misses, unknown outcomes and 5,000-byte multipart recovery
     test-34-fmk-real-compact.sh    # explicit /compact on every gate run proves post-compaction delivery with ordered exact receipts
     test-35-fmk-real-restarts.sh   # restart, resume, new conversation and markerless upgrade replacement
@@ -429,7 +434,7 @@ tests/
     test-37-fmk-real-mcp.sh        # server restart, test-only MCP drop, deferred reconnect and an occupied draft
     test-38-fmk-real-cron.sh       # three down-persona fires in order, fire-time timestamps and non-loopback bind
     test-39-fmk-real-fidelity.sh   # Unicode and 850/1,400/1,900-byte bodies, exact receipts with no retype
-    test-40-fmk-real-downgrade.sh  # R55/the current rule downgrade to published 0.16.1 on native Claude 2.1.280
+    test-40-fmk-real-downgrade.sh  # operator downgrade to published 0.18.0 on native Claude 2.1.280, preserved references, held/queued content and untouched Thread Memory
     test-41-fmk-real-codex.sh      # guarded Codex 0.159.2 D1 receipt-only gate: native observations, FIFO/faults,
                                    # actual harness SIGKILL/recovery and trailing @/$ fidelity; final native gate passed
     test-42-fmk-displayed-current.sh # current AD: raw working/displayed idle_screen; known aged permissions stay check_permission;
@@ -474,6 +479,8 @@ tests/
       tmux-shim.sh                 # the logging tmux shim of fmk mode, first on the PATH of every CSCB process: logs each call's argv and parent, then acts on its
                                    # mode (log, fail-kill, fail-create, slow-create, wedge); fail-kill may be limited to a target list
       fmk-driver.ts                # AD row/refusal and lifecycle recovery scenario; startup dialogs receive no CSCB answer
+      shared-channel-upgrade-case.ts # scratch fixture materializer and image commands; no source import
+      sr8-evidence.ts               # population and fault evidence/measurement verdicts
       fmk-texts.ts                 # the one value printer of the fmk scenarios and Tests 29, 31 and 50: prints the installed package's own export (a constant, or a builder's output for
                                    # the given arguments) by entry name, so no script retypes a value src/ exports; refuses to run without the image marker
                                    # /etc/cscb-ci-image and imports the package only after that check (see The value printer)
@@ -619,7 +626,7 @@ Claude Code 2.1.296 through agent-director's `[launch].claude_path`, and keep
 the stub first on PATH for ordinary scripts. The downgrade gate explicitly
 selects and verifies 2.1.280 with `real_prepare` before either release starts.
 The helper sets agent-director’s `claude_path`; this retained native selection
-governs startup after installing 0.16.1. The script does not restore a pin
+governs startup after installing 0.18.0. The script does not restore a pin
 after package installation. Its four R55 phases match the maintained
 [operator downgrade procedure](../docs/migration.md#downgrading-to-an-earlier-release). Each real script owns an isolated HOME, agent-director
 install/store and tmux server, with onboarding completed, the run's key
@@ -1073,7 +1080,7 @@ independently completed duplicate copies. They reject classifier stops
 with or without exact JSON, late linked stops, synthetic/API-error answers,
 fallback, unfinished duplicates and spoof actions, and reject `stop` mode.
 
-Run these controls only in the marked `cscb-ci-base:v9` image or a CI test
+Run these controls only in the marked `cscb-ci-base:v10` image or a CI test
 image derived from it (see
 `docker/README.md`), which supplies Bun, Python 3, Bash and jq. Set
 `AI_CONTROLS_PACKAGE` to the absolute `package/` directory extracted from a
@@ -1090,7 +1097,7 @@ docker run --rm --network none --memory 512m --cpus 1 --pids-limit 128 \
   --mount type=bind,src="$PWD/tests",dst=/tests,readonly \
   --mount type=bind,src="$AI_CONTROLS_PACKAGE",dst=/control/package,readonly \
   --mount type=bind,src="$PWD/node_modules",dst=/control/node_modules,readonly \
-  --entrypoint /usr/local/bin/bun cscb-ci-base:v9 \
+  --entrypoint /usr/local/bin/bun cscb-ci-base:v10 \
   /tests/real-agent/ai-readback-controls.ts
 ```
 
@@ -1222,7 +1229,7 @@ one `REAL-AGENT-VERDICT PASS|FAIL <run-id>` line; plan-only ends with
 
 The downgrade scenario requires the safe downgrade order: empty queues, confirm
 `resume_enabled:false`, stop server/bots, restore native 2.1.280 and install
-the published 0.16.1 tarball, start fresh with channels, then confirm resume
+the published 0.18.0 tarball, start fresh with channels, then confirm resume
 on again. `docs/migration.md` describes the operator procedure. Measured script
 durations belong in `tests/ci-durations.tsv` after an actual run; this
 inventory alone establishes no gate/full-CI or heavy verdict or duration.
@@ -1871,7 +1878,7 @@ root, with the existing base image available (no pull/build):
     --mount "type=bind,src=$PWD/tests/runner.sh,dst=/source/runner.sh,readonly" \
     --mount "type=bind,src=$PWD/tests/runner-keep-going-controls.py,dst=/controls.py,readonly" \
     --mount "type=bind,src=$CI_CONTROL_LOCK,dst=/run/cscb-ci-performance.lock,readonly" \
-    --entrypoint /usr/bin/python3 cscb-ci-base:v9 /controls.py
+    --entrypoint /usr/bin/python3 cscb-ci-base:v10 /controls.py
 )
 ```
 
@@ -2119,6 +2126,82 @@ Bug's artifacts. Require both scenarios in `/ci`; syntax and isolated unit
 passes alone do not establish runtime behavior.
 
 ### Scenario helper
+
+#### Shared-channel and Thread Memory helpers
+
+`lib/scenario.sh` fences production-state readers and request publication to scenario scratch with `require_scenario_state [step]`. These helpers read committed evidence or submit the normal operator request; none repairs a running authority. The following argument lists are positional; `key` is a persona key, `label` a stub token label, and optional arguments use brackets. Tests 29 and 31 compose delivery/own-post cases; Tests 40 and 44–48 share the queue, recovery and population evidence adapters. Direct users are visible beside each call in `tests/integration/`; wrappers retain the same evidence contracts.
+
+| Helper and arguments | Result or action |
+|---|---|
+| `configuration_record_matches config record [reviewed\|applied]` | Production-valid authority and exact reviewed bytes; applied also compares resolved settings. |
+| `configuration_applied_value config record setting`, `configuration_applied_is config record setting expected` | Project/compare applied `port`, `resume_enabled` or `channel_mode`, independently of pending edits. |
+| `configuration_request id action [arguments…]` | Publish an operator request and await that exact generation or cancellation; confirmation remains a separate rename. |
+| `configuration_application_preserved config before after` | Compare applied facts while permitting request/review history to advance. |
+| `wait_membership_complete persona`, `wait_membership_rescan persona label push-seq` | Await authenticated inventory, or a first-page request after the live event followed by completion, bounded at 30 s. |
+| `scenario_id kind name`, `scenario_ts`, `scenario_text suffix` | Deterministic per-test Slack ID, retained unique event timestamp, or tagged text. Retain a timestamp for paired events. |
+| `scenario_mention_text user [text]`, `scenario_broadcast_text here\|channel text` | Build mention/Broadcast content. |
+| `slack_message_event channel text ts [user] [kind]`, `slack_mention_event channel text ts [user]` | Build message or app-mention JSON; an empty kind omits channel_type. |
+| `slack_reply_event channel root text ts [user] [parent-user]` | Build a reply with its real Thread Root. |
+| `slack_push_message label channel text ts [user] [kind] [envelope]`, `slack_push_mention label channel text ts [user] [envelope]` | Send the corresponding built event through Socket Mode. |
+| `slack_push_broadcast label channel here\|channel text ts [envelope]`, `slack_push_reply label channel root text ts [user] [parent-user] [envelope]` | Send Broadcast or reply. |
+| `slack_push_own_reply label channel root text ts [envelope]`, `slack_push_other_bot label channel text ts [envelope]` | Own-parent reply, or independently identified bot message. |
+| `slack_push_edit label channel ts text edited-ts [envelope]`, `slack_push_delete label channel ts event-ts [envelope]` | Send change/deletion events without inventing a delivered message. |
+| `slack_push_reaction label channel message-ts emoji event-ts` | Send reaction_added from the deterministic `scenario_id U human` user. |
+| `slack_push_dm label channel text ts`, `slack_push_group_dm label channel text ts` | Send `im` or `mpim`. |
+| `slack_membership_event type label channel ts [user]` | Build `member_joined_channel` or `channel_left`. `user` is `self` (default: the label’s bot user), `other` (the deterministic other-member user) or an explicit user ID; channel kind is `G` for a `G…` ID and `C` otherwise. |
+| `slack_push_member_joined label channel ts [user]`, `slack_push_channel_left label channel ts [user]` | Send the built membership event with the same `self`/`other`/explicit user selection and derived channel kind. |
+| `slack_push_membership_ids type label channel ts`, `slack_push_event_ids label event-json` | Return envelope ID and event ID, tab-separated, so durable live-event application can be matched exactly. |
+| `scenario_attachment name`, `scenario_stub_name user\|channel id` | Fake attachment metadata/expected attributes, or deterministic resolved name. |
+| `slack_attachment_event kind channel root text ts user fixture-json`, `slack_push_attachment label kind channel root text ts user fixture-json` | Add the fixture’s Slack file metadata to a message/mention/reply, then optionally push. |
+| `slack_recorded_button label channel message-ts action`, `slack_push_button label channel message-ts action user` | Read and click an observed permission button through the stub. |
+| `shared_stub_permission action [arguments…]`, `shared_stub_permission_setup workdir`, `shared_stub_notice_setup workdir` | Install/control the fixture’s real permission/notice path; arguments follow shared-stub-permission.ts. |
+| `shared_stub_notice end\|ended\|resume [arguments…]` | Drive a notice lifecycle through the fixture, under scratch state. |
+| `slack_post_mark`, `slack_successful_post label channel after-seq text…` | Last complete record sequence, or the observed successful post. |
+| `slack_wait_successful_post label channel after-seq text…`, `slack_wait_messages_waiting label channel after-seq name key count` | Await successful post evidence; never infer posting from an attempted call. |
+| `slack_push_observed_post receiver sender channel post-seq [envelope]` | Echo one successful post as its actual author. |
+| `shared_queue_snapshot output key [prior-snapshot…]` | Atomically write production-parsed queue evidence outside live state. |
+| `shared_queue_receipts key originals [prior-snapshot…]`, `shared_wait_queue_drained key originals [prior-snapshot…]` | Exact native receipts and progress; the wait uses the delivery idle/overall watchdogs. |
+| `shared_thread_joins key [channel stamp-json]`, `shared_queue_joins_saved key snapshot…` | Read saved joins or assert every carried queue join is durable. |
+| `shared_own_post_records key`, `shared_own_post_state key operation channel stamp state`, `shared_wait_own_post_state key operation channel stamp state` | Production-parsed own-post evidence; state is unresolved/joined/none. The wait shares one deadline across bounded reads. |
+| `shared_dedupe_preserved key before-snapshot` | Keys/allocation remain after compaction. |
+| `shared_delivery_expectation key name source channel-or-sender …`, `shared_assert_accounting [--per-server-run] expectations log key snapshot…` | Build independent expected identities and reconcile exact accepted/received/delivered counts, with optional server-run boundaries. |
+| `shared_expected_parts text ts user user-name channel channel-name via root attachment`, `shared_assert_content key log snapshot channel ts text parts attachment` | Build exact expected tags and verify stored/receipted content. |
+| `shared_injected_expected_parts text retained-ts sender`, `shared_assert_injected_content key log snapshot source sender ts text parts` | The same exact check for cron/interject, with no Slack attributes. |
+| `shared_cron_identity crontable prompt-path` | Retained injected identity from the schedule as written. |
+| `configuration_recovery_request id damaged retained-request [replacement]` | Preserve exact recovery request bytes outside live state, then publish normally. |
+| `shared_recovery_pending retained-request preview`, `shared_recovery_consumed retained-request preview` | Observe the request’s pending or durably consumed reviewed recovery. |
+| `shared_persona_facts key [channel]`, `shared_membership_event key event-id` | Safe production-parsed shared state or exact membership history record. |
+| `scenario_attempt_id name`, `attempt_args id channel delivery [assignment\|retry]` | Retain logical attempt identity and immutable binding. |
+| `stub_session_submit dir tool args [keep\|lose]`, `stub_session_group dir tool args keep-or-lose …` | Submit one call or one atomic concurrent group; print request IDs. |
+| `stub_session_result dir id [seconds]`, `stub_session_call_lost dir tool args`, `stub_session_sessions dir` | Await a result, prove response loss after headers, or read session observations. |
+| `scenario_attempt_call dir args [keep\|lose]`, `scenario_attempt_group dir args…` | Call set_channel_delivery through its installed name, singly or concurrently. |
+| `expect_attempt step dir args key effective [new\|retry] [is-error]` | Compare the actual text with retained outcome/current-fact builders. |
+| `shared_channel_saved key channel`, `shared_channel_effective key channel eligible-or-reason`, `shared_thread_since key channel` | Shared saved/effective choice or Thread Hybrid Since marker. |
+| `shared_thread_created key`, `shared_thread_file key`, `shared_queue_items key`, `shared_queued_count key channel ts [via]` | Created marker, journal existence, parsed items or matching count. |
+| `shared_attempt_order key [channel]`, `shared_attempt_applications key [channel]` | Applied logical-attempt order or count. |
+
+The stub controls below are used by these scenarios and by the real-thread and population/fault scripts. Call `slack_stub_controls` once before patching controls; replacing a whole control resets fault counters, while staging only inventory preserves them. Use fake suffixes only and never print the private control snapshot.
+
+| Helper and arguments | Control or evidence |
+|---|---|
+| `slack_stub_control_seed path label fake-suffix …`, `slack_stub_controls path`, `slack_stub_identity label field` | Seed explicit identities/empty membership, install a control, or read user_id/bot_id/team_id/app_id. |
+| `slack_stub_redeliver label envelope-id [attempt] [reason]`, `slack_stub_push_installation label event-json identity-label` | Replay the exact envelope or send explicit issuing-installation metadata. |
+| `slack_stub_close_socket label [refuse-count]` | Close that label’s sockets and refuse its next N opens. |
+| `slack_stub_inventory_body next channel-spec…`, `slack_stub_inventory_page label cursor next channel-spec…` | Build/install a raw page. A channel spec is `id/public-or-private/internal-or-external/member-or-nonmember-or-omit`. |
+| `slack_stub_inventory_pages label cursor final page-size channel-spec…`, `slack_stub_inventory_clear label`, `slack_stub_inventory_stage label page-size-or-memberships channel…` | Install/clear pages, or change only inventory with a recorded sequence while preserving fault counters. |
+| `slack_stub_fault label method outcome [field=value…]`, `slack_stub_inventory_fault label cursor outcome [field=value…]` | Ordered matching fault, or users.conversations fault. Selectors: cursor/channel/user/thread_ts; counters after/times; retry_after/delay_ms/error/body/performed set the answer. |
+| `slack_stub_post_lost label channel performed [field=value…]`, `slack_stub_post_fail label channel error-or-rate_limit [field=value…]` | Explicit uncertain post outcome, or refusal/rate limit. |
+| `slack_stub_history_fault label history-or-replies outcome [field=value…]`, `slack_stub_faults_clear label`, `slack_stub_history page-size`, `slack_stub_history_seed channel message-json` | Fault/clear/read-history controls and deterministic seed messages. |
+| `slack_stub_records event [field=value…]`, `slack_stub_record_count event [field=value…]`, `slack_stub_record_field field event [field=value…]` | Complete JSONL records, count or last matching field; only a partial final line is ignored. |
+| `slack_stub_control_fired event [field=value…]` | Require an actual control firing; absence fails immediately, so poll with a nonfatal record predicate first. |
+| `slack_ack_count envelope`, `slack_wait_one_ack envelope [seconds]`, `slack_expect_no_ack envelope seconds`, `slack_envelope_times envelope` | Exact one-push evidence, bounded ACK checks and push/ACK monotonic times. Missing evidence cannot pass as zero ACKs. |
+
+`stub-mcp-session.ts` requests support `group` (submit the whole group in one append), `lose_response` (cancel after headers), and a two-call `_stub_session` pair (`stale`, `replacement`) removed before tools see arguments. Results retain `id`, `session_id`, text/error and loss status; session records retain connection observations. A lost response proves no application outcome: inspect the authority and retry the retained attempt. Test 29 and shared-channel recovery use these controls; the replacement control exercises server-side admission without giving two sessions authority.
+
+`lib/real-scenario.sh` supplies Test 32’s `real_thread_personas strict-or-open` (two personas, 100,000 joined threads), `real_seed_threads` (before start), `real_thread_workload` (root plus 20 prepared samples), `real_thread_root`, `real_thread_reply n`, `real_thread_writer_start`, `real_thread_concurrent_work n` and `real_thread_membership_write n`. Open-mode writes run through beta’s MCP session; strict-mode writes are beta’s live leave/rejoin events and wait for their own durable event application and settled rescan. `real_thread_now_ms` is monotonic; `real_thread_epoch_ms` shares queue wall time. `real_assert_thread_latency` judges the thread samples, including delayed and hung names, through sr8-evidence.ts. `real_report [arguments…]` captures native usage/receipt evidence, `real_finish` runs the closing safety assertions, and `real_drop_mcp` calls the enabled test endpoint. These helpers make no host agent or Slack calls.
+
+`tests/test-helpers/thread-populations.ts` defines deterministic populations, channel cycles and independently expected burst identities; `tests/integration/fixtures/sr8-evidence.ts` exposes their image commands and verdicts. `tests/test-helpers/shared-channel-upgrade.ts` provides `writeUpgradeFixtures`, `materializeUpgradeCase` and `runUpgradeCaseCommand`; `bun tests/test-helpers/shared-channel-upgrade.ts write` regenerates the committed fixture tree and manifest. Each case has `reference-0.18.0/`, `new-baseline/` and `pending-edits/`; manifest.json records variants, expected load/refusal, target paths, modes, times, identity/channel dispositions and pending edits. Materialization confines paths to scratch, expands home-relative paths and supplies scenario settings/names. Test 47 drives the manual upgrade cases; Test 40 uses the preserved 0.18.0 reference for downgrade and checks that Thread Memory remains untouched.
+
 
 `tests/integration/lib/scenario.sh` is sourced by Test 0 and Tests 5
 onwards; its header comment is the full function list. Its first step is the
@@ -3362,6 +3445,9 @@ too.
 
 ### The value printer
 
+Shared-state entries include `sharedChannelSaved`, `sharedChannelEffective`, `sharedThreadSince`, `sharedThreadCreated`, `sharedAttemptOrder`, `sharedQueueSnapshot`, `sharedQueueReceipts`, `sharedThreadJoins`, `sharedOwnPostRecords`, `sharedOwnPostState`, `sharedQueueJoinsSaved`, `sharedDedupePreserved`, `sharedPersonaFacts`, `sharedMembershipEvent`, `sharedRecordedButton`, `sharedPostMark`, `sharedSuccessfulPost`, `sharedMessagesWaitingPost`, `sharedObservedPostEvent`, `sharedDeliveryExpectation`, `sharedAssertAccounting`, `sharedExpectedParts`, `sharedAssertContent`, `sharedInjectedExpectedParts`, `sharedAssertInjectedContent`, `sharedCronIdentity`, `sharedRecoveryRequest`, `sharedRecoveryPending`, `sharedRecoveryConsumed`, `sharedConfigurationMatches`, `sharedConfigurationValue`, `sharedAuthorityPreserved`, `sharedThreadStamp`, `sharedApplicationPreserved` and `sharedReviewConsumed`. Their argument/evidence contracts are exercised by the Scenario helper wrappers above; direct calls use the explicit config/record/log/journal paths listed in fmk-texts.ts’s entry synopsis. Production constants and diagnostic builders, including membershipRetryDelay, hold bounds and Thread Memory/shared-state reports, are printed from the installed package; they supply expected text, never the observation that makes a scenario pass.
+
+
 `tests/integration/fixtures/fmk-texts.ts` is the one value printer of the
 fmk scenarios and of Tests 29 and 50, which run it in shared mode; its header
 comment is its full statement. A scenario script
@@ -4544,3 +4630,5 @@ either suite above:
   its check's Expected list. A change to a check's Steps or Expected, or to
   the run order, updates the matching check in `ci-live/checks/` in the same
   edit.
+
+Test 32 measures strict/open thread-selected real-agent deliveries alongside its DM series, including concurrent shared-state writes and delayed/hung name lookups. Test 40 follows the maintained downgrade procedure using the pinned 0.18.0 package, saved queue/hold evidence and preserved Thread Memory files.

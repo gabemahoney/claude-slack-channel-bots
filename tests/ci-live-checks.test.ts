@@ -161,6 +161,7 @@ import { createHash } from 'node:crypto'
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import ts from 'typescript'
 
 import { buildMessagesWaitingNotice, deliveryAge } from '../src/delivery-notices.ts'
 import { queueEvidence, queueEvidenceScript, type QueueEvidence } from '../ci-live/checks/delivery-evidence.ts'
@@ -410,7 +411,7 @@ import { deliveredRecord, makeQueue, sentRecord, slackInput } from './test-helpe
 import { virtualClock } from './test-helpers/ci-live.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
-import { type HeadingMatch, requiredSection } from './test-helpers/markdown.ts'
+import { flat, type HeadingMatch, requiredSection } from './test-helpers/markdown.ts'
 import { stripComments } from './test-helpers/source-audit.ts'
 import { makeReloadHarness } from './test-helpers/reload-harness.ts'
 import { BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION, OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
@@ -4900,6 +4901,10 @@ describe('expected texts match the package', () => {
       expect(separator).toMatch(/^\|(?:-+\|)+$/)
       expect(rows.length).toBeGreaterThan(0)
       for (const row of [separator!, ...rows]) expect(cells(row).length).toBe(cells(header!).length)
+      for (const c of [membershipSetupCheck, membershipSetupRestartCheck]) {
+        expect(c.row).toBeNull()
+        expect(cells(planHeader!).map((cell) => cell.trim())).not.toContain(c.id)
+      }
     })
 
     test("Check 29a step 1's F=(…) list is the runner's state files (CHECK29A_STATE_FILES), in order", () => {
@@ -4917,6 +4922,77 @@ describe('expected texts match the package', () => {
       const runner = toolCallsScript('c', REPLY_TOOL)
       expect(planCopy).toContain(`--arg server ${CSCB_MCP_SERVER_NAME} --arg tool "$2" '`)
       expect(between(planCopy, `--arg tool "$2" '`, `' "$t"`)).toBe(between(runner, `--arg tool ${q(REPLY_TOOL)} '`, `' "$t"`))
+    })
+
+    describe('new membership and readiness quotes track the runner', () => {
+      // The membership readers are private. Read their actual templates and
+      // assertion arguments without exporting helpers or copying their texts.
+      const source = ts.createSourceFile('invited-checks.ts', readFileSync(join(import.meta.dir, '../ci-live/checks/invited-checks.ts'), 'utf-8'), ts.ScriptTarget.Latest, true)
+      const nodes = (root: ts.Node): ts.Node[] => {
+        const found: ts.Node[] = []
+        const visit = (node: ts.Node): void => { found.push(node); ts.forEachChild(node, visit) }
+        visit(root)
+        return found
+      }
+      const only = <T,>(items: T[]): T => {
+        if (items.length !== 1) throw new Error(`expected one runner expression, found ${items.length}`)
+        return items[0]!
+      }
+      const binding = (root: ts.Node, name: string) => only(nodes(root).filter(ts.isVariableDeclaration).filter((n) => n.name.getText(source) === name)).initializer!
+      const reader = only(source.statements.filter(ts.isFunctionDeclaration).filter((n) => n.name?.text === 'cMembership'))
+      const RUN = '<RUN_CHANNEL_ID>'
+      const substitutions: Record<string, string> = {
+        "JSON.stringify(personaName('c'))": JSON.stringify(personaName('c')),
+        'JSON.stringify(channel)': JSON.stringify(RUN),
+      }
+      const renderTemplate = (node: ts.Expression): string => {
+        if (!ts.isTemplateExpression(node)) throw new Error('expected a runner template')
+        return node.head.text + node.templateSpans.map((span) => {
+          const expression = span.expression.getText(source)
+          if (!Object.hasOwn(substitutions, expression)) throw new Error(`unhandled runner interpolation: ${expression}`)
+          return substitutions[expression]! + span.literal.text
+        }).join('')
+      }
+      substitutions.life = renderTemplate(binding(reader, 'life'))
+      const filter = renderTemplate(binding(reader, 'filter'))
+      // Render the plan's equivalent path notation: dot persona key and an
+      // unquoted channel placeholder, rather than jq's quoted string indexes.
+      const planPath = (path: string) => path.replaceAll(`[${JSON.stringify(personaName('c'))}]`, `.${personaName('c')}`).replaceAll(JSON.stringify(RUN), RUN)
+      const memberPath = only([...filter.matchAll(/^\{member: (.*?), left:/g)]).at(1)!
+      const leavesPath = only([...filter.matchAll(/left: \(\((.*?) \/\/ \{\}\)/g)]).at(1)! + `[${JSON.stringify(RUN)}]`
+      const recordCommand = only(nodes(reader).filter(ts.isTemplateExpression).filter((n) => n.head.text.startsWith('jq -c ')))
+      const recordFile = only([...recordCommand.getText(source).matchAll(/"\$S\/([^"]+)"/g)]).at(1)!
+      const checkSource = (name: string) => binding(source, name)
+      const joinAssertion = only(nodes(checkSource('check30')).filter(ts.isCallExpression).filter((n) => n.expression.getText(source) === 'waitSharedEntry')).arguments[2]!
+      if (!ts.isObjectLiteralExpression(joinAssertion)) throw new Error('expected the join assertion object')
+      const choice = only(joinAssertion.properties.filter(ts.isPropertyAssignment).filter((n) => n.name.getText(source) === 'choice')).initializer
+      if (!ts.isStringLiteral(choice)) throw new Error('expected the joined delivery literal')
+      // Check 32 retains the choice that Check 31's actual call assertion asks for.
+      const retained = only(nodes(checkSource('check31')).filter(ts.isBinaryExpression).filter((n) => n.left.getText(source) === 'call.delivery' && n.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken)).right
+      if (!ts.isStringLiteral(retained)) throw new Error('expected the requested delivery literal')
+
+      const readiness: HeadingMatch = '## Runner-only membership readiness'
+      const checkHeading = (id: string): HeadingMatch => new RegExp(`^### Check ${id}:`)
+      const quotes: [HeadingMatch, string, string][] = [
+        [checkHeading('30'), 'the authority record filename', recordFile],
+        [checkHeading('30'), 'the joined choice', choice.text],
+        [checkHeading('30'), 'the verified membership path', planPath(memberPath)],
+        [checkHeading('32'), 'the retained choice', retained.text],
+        [checkHeading('32'), 'the membership field', memberPath.split('.').at(-1)!],
+        [checkHeading('33'), 'the verified membership path', planPath(memberPath)],
+        [checkHeading('33'), 'the recorded leave path', planPath(leavesPath)],
+        ...MEMBERSHIP_REQUIRED_SUBSCRIPTIONS.map((subscription): [HeadingMatch, string, string] => [readiness, `the required ${subscription} subscription`, subscription]),
+      ]
+      // Readiness diagnostics, route and limit notes are prose or a link in
+      // this plan, so no pins require it to quote those unquoted runner texts.
+      test.each(quotes)('%s quotes %s (and rejects removed, altered and stale quotes)', (heading, _what, text) => {
+        const section = block(heading)
+        const assertQuote = (copy: string, expected: string) => expect(flat(copy)).toContain(quoted(expected))
+        assertQuote(section, text)
+        expect(() => assertQuote(section.replaceAll(quoted(text), ''), text)).toThrow()
+        expect(() => assertQuote(section.replaceAll(quoted(text), quoted(`${text}-changed`)), text)).toThrow()
+        expect(() => assertQuote(section, `${text}-changed`)).toThrow()
+      })
     })
 
     describe("Part 11 quotes the runner's texts, rendered with the plan's placeholders", () => {

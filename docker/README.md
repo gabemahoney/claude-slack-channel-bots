@@ -6,7 +6,7 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
 
 ## Images
 
-- **`cscb-ci-base:v9`** (built from `docker/Dockerfile.test.base`) — slow base
+- **`cscb-ci-base:v10`** (built from `docker/Dockerfile.test.base`) — slow base
   layers (apt deps incl. tmux, bun, nodejs, cozempic, agent-director and native
   Claude/Codex versions). Built lazily once per host. No checkout source
   inside; published CSCB tarballs are fixtures. From the repo build context
@@ -14,7 +14,7 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   `docker/install-real-codex.sh`, and no `package.json`. What it holds is in
   [What the base holds](#what-the-base-holds).
 - **The run's test image** (built from `docker/Dockerfile.test`,
-  `FROM cscb-ci-base:v9`) — adds `docker/entrypoint.sh`, `tests/`,
+  `FROM cscb-ci-base:v10`) — adds `docker/entrypoint.sh`, `tests/`,
   `testplans/`, the `testuser` account, and the `ENTRYPOINT`. It also copies
   the current tree's `docker/ad-client-check.sh` with mode `0755` over
   `/opt/agent-director/check/ad-client-check.sh`, refreshing the checker even
@@ -23,7 +23,7 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   tags it only `cscb-ci-run:<RUN_ID>-<PID>-test`, and removes it at the run's
   end (see [The run's images and tags](#the-runs-images-and-tags)). The build
   should complete in under 10 s on a warm base.
-- **`cscb-ci-live:v2`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v9`)
+- **`cscb-ci-live:v2`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v10`)
   — the `/ci-live` image (see [/ci-live](#ci-live-the-live-slack-acceptance-run)
   below). It adds Claude Code at a pinned version with auto-update off, the
   agent-director binary the runner stages, checked against the base's
@@ -35,7 +35,7 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   Built on every `/ci-live` run.
 
 - **The heavy run's image** (`docker/Dockerfile.real-agent`,
-  `FROM cscb-ci-base:v9`) — a self-contained packed `package.tgz`, tests and
+  `FROM cscb-ci-base:v10`) — a self-contained packed `package.tgz`, tests and
   `docker/real-agent-job.sh` and `docker/real-agent-codex-job.sh`, tagged `cscb-real-agent:<run-id>` and removed
   by `scripts/real-agent-matrix.ts`. Jobs select native Claude through
   agent-director, install runtime latest inside the container when needed,
@@ -79,7 +79,7 @@ the live image build, where it is checked (see
 The base build fetches bun, agent-director 0.10.0's binary and both binaries
 for each of the current and legacy displayed-state releases from GitHub,
 native Claude releases from their distribution service, and the pinned
-client, two 0.10.0 fixtures, the 0.16.1 downgrade fixture and native Codex
+client, two 0.10.0 fixtures, the 0.18.0 downgrade fixture and native Codex
 platform package from the npm registry. `/ci` runs it with
 `docker build --network=host`. On some hosts the default docker bridge network
 intermittently fails those fetches with SSL/timeout errors even when the host
@@ -109,7 +109,7 @@ Every path is readable by every user, `testuser` included, except the global cli
 | `/opt/claude-code/2.1.280/claude`, `/opt/claude-code/2.1.296/claude` | Native Linux x64 Claude programs, off PATH; manifests supply SHA-256 checks, and each `--version` must match. `DISABLE_AUTOUPDATER=1` is set in the base |
 | `/opt/codex/0.159.2/codex` | Native ELF from the Codex platform npm package, off PATH; build requires `codex-cli 0.159.2`. Selected explicitly by the isolated D1 gate and local heavy harness |
 | `/opt/cscb-ci/install-real-agents.sh`, `/opt/cscb-ci/install-real-codex.sh` | Marked-image-only native installers; the Claude installer also supports the heavy job's resolved latest |
-| `/opt/claude-slack-channel-bots-0.16.1/claude-slack-channel-bots-0.16.1.tgz` and `release.json` | Published-before-work downgrade fixture, separate from the retained 0.10.0 fixture. Publication: `2026-10-14T17:20:30.700Z`; SHA-256: `95bd53d19f4950caf8a13a4d9a4b7a8c85d22433ba87dd69cabbba20570e8164`. Build checks the hash/version; record includes registry provenance |
+| `/opt/claude-slack-channel-bots-0.18.0/claude-slack-channel-bots-0.18.0.tgz` and `release.json` | Published downgrade fixture, separate from the retained 0.10.0 fixture. Publication: `2026-10-21T08:49:18.397Z`; SHA-256: `16d102793cc62395b771c431078b4124267b3d11cb8b56e84c48e8910d096b62`. Build checks the hash/version; record includes registry provenance |
 | `/etc/cscb-ci-image` | The image marker (see [Image marker](#image-marker)) |
 
 It also installs `sqlite3` (the harness's store reads and edits) and `file`
@@ -249,7 +249,7 @@ git -C "$CSCB_AD_SRC_DIR" show "v$AD_VERSION:skills/install-agent-director/insta
 GH_TOKEN="$(gh auth token)" docker build --network=host \
   --secret id=gh_token,env=GH_TOKEN --progress=quiet \
   --build-context agent-director-install="$AD_INSTALL_CTX" \
-  -f docker/Dockerfile.test.base -t cscb-ci-base:v9 .
+  -f docker/Dockerfile.test.base -t cscb-ci-base:v10 .
 rm -rf "$AD_INSTALL_CTX"
 ```
 
@@ -269,7 +269,7 @@ rm -rf "$AD_INSTALL_CTX"
   that message, and every other check's `ERROR:` line: rerun with
   `--progress=plain` to see which step failed and why.
 - **Check an image by counts only**, never by printing its history:
-  `docker history --no-trunc cscb-ci-base:v9 | grep -c GH_TOKEN=` prints `0`.
+  `docker history --no-trunc cscb-ci-base:v10 | grep -c GH_TOKEN=` prints `0`.
 - **Earlier tags are retired.** Nothing names `v4` or an earlier tag. Tags
   before `v4` took the token as a build-arg, so their image history held its
   value, as did every image built on them; they are removed from the hosts
@@ -319,7 +319,7 @@ against Anthropic's direct endpoint.
 
 ## When to bump the base image version
 
-Bump `cscb-ci-base`'s version tag (next, `v9` → `v10`) whenever you change
+Bump `cscb-ci-base`'s version tag (next, `v10` → `v11`) whenever you change
 `docker/Dockerfile.test.base`, its pins included: the release's
 `AD_VERSION`, `AD_COMMIT`, `AD_SHA256`, `AD_ADMIN_SHA256`,
 `AD_INSTALL_SH_SHA256`, independent `AD_CLIENT_VERSION` and
@@ -401,7 +401,7 @@ the pin revision. A live-only pin change leaves `cscb-ci-base`'s tag alone.
 To simulate a fresh host, remove the base tag by its name, and nothing else:
 
 ```sh
-docker rmi cscb-ci-base:v9
+docker rmi cscb-ci-base:v10
 /ci   # with CSCB_AD_SRC_DIR set; or run the hand build above
 ```
 
@@ -416,7 +416,7 @@ build comes near it, raise an issue.
 After a `/ci` run, confirm the base layers are intact:
 
 ```sh
-docker history cscb-ci-base:v9
+docker history cscb-ci-base:v10
 ```
 
 Then edit a comment in (e.g.) `tests/integration/test-1-install-startup.sh`
@@ -429,7 +429,7 @@ docker build -f docker/Dockerfile.test -t "$WARM_TAG" .
 ```
 
 This should complete in seconds, and needs neither build context nor the
-token. `docker history cscb-ci-base:v9` should show the same layer IDs as
+token. `docker history cscb-ci-base:v10` should show the same layer IDs as
 before — proof the source edit didn't invalidate the base. Then remove the
 tag by its name:
 
@@ -839,7 +839,7 @@ The sweep never touches:
 
 - anything whose owner is alive;
 - any `cscb-live=1` container, or any container without `cscb-ci=1`;
-- any other tag shape, such as `cscb-ci:latest`, `cscb-ci-base:v9`,
+- any other tag shape, such as `cscb-ci:latest`, `cscb-ci-base:v10`,
   `cscb-ci-live:v2` or a lane tag like `cscb-ci-l5:m5`;
 - an image that still has a tag, or an image with no owner label;
 - any file beside the lock but a dead owner's reservation;
@@ -1439,7 +1439,7 @@ The template's `Dockerfile` mirrors the `/ci` image at the tag
   manifest's expected version and, when the manifest records a commit, a
   commit starting with it; the admin tool reports the same version; and the
   installed files match the manifest's digests.
-- There is no native Claude Code or Codex and no 0.16.1 downgrade fixture.
+- There is no native Claude Code or Codex and no 0.18.0 downgrade fixture.
   The 0.10.0 fixtures and the 0.17.0 legacy fixture come from `inputs/`, the
   latter checked against the pins of v0.18.2's base Dockerfile.
 - `/test-repo` is pre-installed from the same package tarball, so test-1's
@@ -1953,7 +1953,7 @@ against the runtime record and proves the client accepts it.
   - Anything else (a missing or malformed release record, steps 1
     (tarball) to 4 (exports), a missing check script, the check's refusal or
     usage error):
-    `ERROR: the base image's global agent-director client or its ad-client check failed (the line above names what failed): the base image cscb-ci-base:v9 predates this tree's docker/Dockerfile.test.base or docker/ad-client-check.sh; bump the base image version as the When to bump the base image version section of docker/README.md describes`.
+    `ERROR: the base image's global agent-director client or its ad-client check failed (the line above names what failed): the base image cscb-ci-base:v10 predates this tree's docker/Dockerfile.test.base or docker/ad-client-check.sh; bump the base image version as the When to bump the base image version section of docker/README.md describes`.
 
   Whichever line it is, the run reports a `container` FAIL row for the failed
   build, `docker build of the live image failed (exit N)`, followed by what
@@ -2301,16 +2301,9 @@ writes. A clean start's summary ends `0 failed, 0 not brought up, 0 not
 reconnected, 0 latched, 0 retrying, 0 waiting on a live-row sequence, 0 held
 on invalid flags, 0 fresh as retired keys`.
 
-Checks 30 to 34 take the other texts they expect from copies: those held
-once in `ci-live/checks/invited-checks.ts` (the switch's preview lines, the
-in-place and recorded lines, the no-effective-change preview and
-`reload-noop` line, the `persona-invited-channel`,
-`persona-channel-delivery-set` and `unclaimed-channel` lines, and Check 33's
-tool-error form), the preview header and `reload-applied` line in
-`ci-live/checks/helpers.ts`, and the setting names in
-`ci-live/lib/live-config.ts`. The runner loads no other `src/` module, so
-each copy names the `src/` builder or constant it copies and is pinned
-against it in `tests/ci-live-checks.test.ts`.
+Checks 30 to 34 use copies in `ci-live/checks/invited-checks.ts`: `modeSwitchPreviewLine` from `src/reload-plan.ts`’s `modeSwitchLine`; `invitedInPlaceLine` / `invitedRecordedLine` for the common destination’s in-place preview; `NO_EFFECTIVE_CHANGE_PREVIEW` from `PENDING_PREVIEW_TITLE` / `NO_EFFECTIVE_CHANGE`; `noopLine` from `src/reload-apply.ts`’s `renderNoopLogLine`; and persona references/lines and `invitedChannelCause`, `channelDeliverySetCause`, `unclaimedChannelCause` from `src/persona-diagnostics.ts`. Tool names come from `src/registry.ts` / `src/channel-delivery.ts`, and `slackRefusalText` copies `slackRefusalToolErrorText`; its safe code pattern follows `src/persona-connection-errors.ts`’s `SAFE_IDENTIFIER_RE`. `ci-live/checks/helpers.ts` copies preview counts/header and the applied line; `ci-live/lib/live-config.ts` copies `channel_mode` and its strict/open interpretation.
+
+`ci-live/checks/membership-setup.ts` copies `MEMBERSHIP_READINESS_ROUTE`, `MEMBERSHIP_REQUIRED_SUBSCRIPTIONS`, the five `MEMBERSHIP_SETUP_*` / subscription/reinstall diagnostic labels, `membershipSetupRecordedDiagnostic` and readiness diagnostic formatting from `src/channel-membership-readiness.ts`. Each copy names its source and is pinned in `tests/ci-live-checks.test.ts`; the runner imports no other runtime source beyond the two import-free text modules above.
 
 | Check | In `/ci-live` |
 |---|---|
@@ -2330,8 +2323,10 @@ against it in `tests/ci-live-checks.test.ts`.
 | 26 | `SKIPPED (optional)` |
 | 27 | Automated, with step 2's optional prompt. The teardown kills D's row and keeps it: once the teardown's complete line is logged, the runner runs a guarded `agent-director find-missing` in the container (a kill never changes a row's state; find-missing marks the row once its agent process is gone), then expects A's, B's and C's rows unchanged and D's row kept and not live (`ended` or `missing`), with one teardown line for a kill that kept the row. It records whether D's row was there before the removal, which tells Check 28 whether to expect D's kept row |
 | 28 | Automated; the reboot is a container restart (see below). Steps 1, 3 and 5 expect one live row per configured persona, plus D's kept row, not live, when Check 27 found D's row before removing D (whether or not D connected in Check 25), and no row for D otherwise. A persona Slack was unreachable for at the start, up after its bring-up retry and connected within the wait, is a note, not a failure |
-| 30 to 34 | Automated, after Check 28 and before 29a, against persona C (in no channel, DMs on, the test human its contact). Check 30 starts only from the applied, nothing-pending, running state, copies `config.json` to `~/cscb-live/config-before-invited.json` in the container, and turns the switch on with a confirmed config edit that gives every persona an `invited.permission_prompts` keeping its destination where it is (A `a-home`, B and C `"dm"`, D `d-home` when still declared); it expects A's, B's and C's (and D's) in-place lines. The test human then creates the run channel, public and named `cscb-live-invited-<RUN_ID>`, mentions C there, invites C's app and mentions it again. Check 31 asks C in the channel to call `set_channel_delivery` with `all`; Check 32 turns the switch off and waits the full 3-minute reply window; Check 33 turns it on again, kicks C's app and asks C by DM for the calls. Checks 31 and 33 read C's calls from its transcript and follow Check 16's ask rule (at most two asks; no call after two is `SKIPPED (not run: …)`). Check 33 judges each of its `reply` and `fetch_messages` calls C made, even when the other is missing: it finds the tool-error form anywhere in the tool error (the client may wrap it), and writes each refusal, `reply: refused by Slack (<code>)` and `fetch_messages without thread_ts: refused by Slack (<code>)`, to both the evidence and Notes; a call that is not Slack's refusal fails it, and it is `SKIPPED (not run: …)`, naming the missing call or calls, only when one is still missing and nothing failed. Check 33's outcomes for `react`, `edit_message` on C's earlier post and `fetch_messages` with `thread_ts` are recorded as notes, never judged, one per call: `Check 33 residual: <call> after the kick: <outcome>`. Check 34 runs whatever 30 to 33 found: it restores the copied bytes through a confirmed edit, kicks C's app if it is still in the channel, archives the channel, and passes only when C is in no channel, archived ones included. When an earlier edit's `config.json.pending` is already there and the restore changes `config.json`, it notes that file's fingerprint and waits for the restore's own file (a different fingerprint) before reading the preview and renaming; it never confirms the earlier file, and with none rewritten for the restore it fails and renames nothing. Under `--only`, Check 34 runs whenever any of Checks 30 to 33 is selected. Against a silent workspace it passes only as "nothing to restore", when Check 30 copied nothing and created no channel. `--only 30,31,32,33,34` runs them from the state setup and Check 1 leave (A, B and C applied, A's DMs off, no D): the switch-on edit handles either state |
-| 29a | Automated. Always runs, also in a dry run and after a blocking failure; adds a host-side scan of the results. It scans the plan's file list, the stored-choice file `channel-delivery.json` included, and requires a transcript only for each persona this run brought up (A to C in Check 1, D in Check 25) and sent a message to |
+| setup-ready (`membershipSetupCheck`) | Runner-only, after channel checks with C up and before Check 24. Uses this run’s provisioning/reinstall results, apps.json needs_reinstall and a configuration-token apps.manifest.export. Records/readbacks the authenticated installation, rejects another app’s installation and verifies unchanged saved choices. Verified setup passes; missing subscriptions/incomplete reinstall or inconsistent evidence fails; uninspectable setup is SKIPPED (not run). Inventory is reported separately. No Results column. |
+| setup-restart (`membershipSetupRestartCheck`) | Runner-only, after Check 28 and before Part 11. Requires the same installation, record order/time/state and no further reinstall under a different server PID owning server.port. A missing prior check, unchanged PID or unknown setup is SKIPPED (not run), never PASS; a changed/lost record, installation or invalid setup fails. No Results column. |
+| 30 to 34 | After Check 28 and setup-restart, C starts with no channel and DMs on. Check 30 saves config.json, confirms channel_mode=open without changing common channels/destination settings, creates the public run channel, invites C and requires its shared mentions choice and verified membership. Check 31 proves one new logical all assignment and an unmentioned answer. Check 32 confirms strict mode and requires the same all choice, member=true, a reply and no unclaimed-channel line. Check 33 returns to open, kicks C, judges reply/unthreaded fetch refusals and records residual calls, then requires the choice absent, member=false and a recorded leave. Check 34 restores the saved config, kicks/archives and requires C in no channel, archived channels included; it runs whenever any of 30–33 is selected. Calls follow the at-most-two-asks rule; missing calls are SKIPPED as not run, never passed. |
+| 29a | Automated. Always runs, also in a dry run and after a blocking failure; adds a host-side scan of the results. It scans the plan's file list, including the shared authority `config.json.last-applied`, and requires a transcript only for each persona this run brought up (A to C in Check 1, D in Check 25) and sent a message to |
 | 29b | `SKIPPED (optional: needs host sudo/iptables)` |
 | Teardown | The personas' tmux panes, the container's own logs and the personas' transcript tails are copied into `container-logs/` (see [Outputs](#outputs)), then the container is removed. The apps and the three provisioned channels stay for the next run; each run's invited channel is archived by Check 34 |
 | HOST | The host is unchanged (see [Isolation](#isolation-from-the-production-bots)) |
