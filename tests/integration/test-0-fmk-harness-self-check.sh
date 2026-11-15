@@ -1835,11 +1835,12 @@ leg_mcp_end() {
     stop_tracked_pid "${SLACK_STUB_PID}" 10 "${step}: the Slack stub did not exit on SIGTERM"
 }
 
-# Scan the stub's records and captured output after tracked processes stop,
+# Scan the stub's record and the completion answer after tracked processes stop,
 # including when a request or assertion failed before the leg's closing scan.
+# The chat answers are not scanned: they echo the leg's own sent text, fake token included.
 slack_stub_record_no_leak() {
     local dir="${SCENARIO_ROOT}/slack-stub-record" file
-    for file in "${dir}/record.jsonl" "${dir}"/*.out; do
+    for file in "${dir}/record.jsonl" "${dir}/completion.out"; do
         [[ -f "${file}" ]] || continue
         [[ "$(count_token_like "${file}")" == 0 ]] || fail 'slack stub record: captured output holds token-like text'
     done
