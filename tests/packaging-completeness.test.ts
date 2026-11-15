@@ -56,17 +56,17 @@
  * the exception over all shipped text live in
  * tests/shipped-docs.test.ts.
  *
- * : the debugging skill's open-mode content, read
+ * The debugging skill's strict/open content is read
  * by heading title through the markdown helper, with every class label, drop
  * reason, `unclaimed-channel` reason text, file name and setting name
  * imported from `src/`:
  *   - the entries for `persona-open-channel`, `persona-channel-delivery-set`
  *     and `channel-delivery-unreadable` each quote their `[slack] <label>:`
  *     line and have a Line, Meaning, Cause and Fix bullet;
- *   - `unclaimed-channel` has a strict-mode and a open-mode part: the
- *     declarative Fix offers open mode as a second fix for a public or
- *     private channel that is not externally shared, and never for a group
- *     DM; the fungible part quotes its line and has a table row with a fix
+ *   - `unclaimed-channel` has a strict-mode and an open-mode part: the
+ *     strict-mode Fix offers an explicit non-off shared choice in open mode
+ *     as a second fix for a public or private channel that is not externally shared, and never for a group
+ *     DM; the open-mode part quotes its line and has a table row with a fix
  *     for each open-mode reason;
  *   - `### \`channel-delivery-unreadable\`` and the store's
  *     `[slack] channel-delivery:` lines subsection sit inside the
@@ -76,10 +76,8 @@
  *     a heading exactly once;
  *   - each passage that describes a destination as the `permission_prompts`
  *     value (a file-local list, located by heading, table row or bullet
- *     lead) also names `invited.permission_prompts` and its `"dm"` default
- *     (`DM_DESTINATION`, quoted or bare as a log line renders it); a passage
- *     naming the setting a confirmed change moves the destination by names
- *     `invited.permission_prompts`.
+ *     lead) names the shared explicit `permission_prompts` setting; a passage
+ *     about a confirmed destination change also names `permission_prompts`.
  * Each check is a pure function of the skill's text and has a self-check
  * that cuts its element from an in-memory copy and sees that element alone
  * reported.
@@ -895,7 +893,7 @@ const FUNGIBLE_LEAD = '**Open mode**'
  * What `unclaimed-channel`'s entry in `text` lacks under both
  * per-mode parts; in the strict part, a Fix requiring an explicit shared choice,
  * explaining that a mode change alone creates none, and restricting open mode
- * to eligible public/private channels, never group DMs; in the fungible part, the line, and for each
+ * to eligible public/private channels, never group DMs; in the open-mode part, the line, and for each
  * open-mode reason (imported) a table row with a fix.
  */
 function unclaimedProblems(text: string): string[] {
@@ -948,12 +946,12 @@ function silenceEntryCount(text: string): number {
 /** `DM_DESTINATION` as its own code span, quoted as a setting value (`"dm"`) or bare as a line renders it (`dm`). */
 const DM_SPAN = `\`"?${escapeRegExp(DM_DESTINATION)}"?\``
 
-/** What a passage lacks of the fungible destination setting's name. */
+/** What a passage lacks of the shared explicit destination setting's name. */
 function settingProblems(passage: string): string[] {
   return flat(passage).includes(DECLARATIVE_DESTINATION_SETTING) ? [] : [`names no ${DECLARATIVE_DESTINATION_SETTING}`]
 }
 
-/** What a destination passage lacks: the fungible destination setting, and its `"dm"` default. */
+/** What a destination passage lacks: the shared explicit destination setting. */
 function destinationProblems(passage: string): string[] {
   return settingProblems(passage)
 }
@@ -993,8 +991,7 @@ function triageStep(text: string, n: number): string {
 /**
  * Every passage that describes a persona's destination as its
  * `permission_prompts` value, each located in the skill (T18's closing notes,
- * report-deo-e1 (d)). Each must also give the open-mode wording:
- * `invited.permission_prompts`, or `"dm"` when it is absent.
+ * report-deo-e1 (d)). Each must name the shared explicit destination setting.
  */
 const DESTINATION_PASSAGES: [string, (text: string) => string][] = [
   [`the \`${PERSONA_DESTINATION_FAILED}\` entry's open-mode <dest>`, (text) => destinationFailedBullet(text, '- **Both modes:**')],
@@ -1027,9 +1024,7 @@ const DESTINATION_PASSAGES: [string, (text: string) => string][] = [
 /**
  * Passages that name the destination setting a confirmed change moves the
  * destination by, rather than the destination itself: each must name
- * `invited.permission_prompts` for open mode. An absent value and `"dm"`
- * count as the same, so no change between them moves the destination and no
- * `"dm"` default is asked of them.
+ * `permission_prompts`, the same explicit destination setting in both modes.
  */
 const SETTING_PASSAGES: [string, (text: string) => string][] = [
   [
@@ -1101,7 +1096,7 @@ describe(' : the debugging skill describes open mode ', () => {
       ['the strict-mode lead', (body) => body.replace(DECLARATIVE_LEAD, 'Strict mode'), ['no strict-mode part']],
       ['the open-mode lead', (body) => body.replace(FUNGIBLE_LEAD, 'Open mode'), ['no open-mode part']],
       [
-        "the declarative part's Fix lead",
+        "the strict-mode part's Fix lead",
         (body) => body.replace(new RegExp(`(${DECLARATIVE_LEAD.replace(/\*/g, '\\*')}[\\s\\S]*?)- \\*\\*Fix:\\*\\*`), '$1- Fix:'),
         ['declarative: no Fix'],
       ],
@@ -1113,7 +1108,7 @@ describe(' : the debugging skill describes open mode ', () => {
         ['declarative Fix: shared choice not scoped to public or private channels that are not externally shared'],
       ],
       ['"never for a group DM"', (body) => body.replace(/never for\s+a\s+group\s+DM/, 'not a DM'), ['declarative Fix: no "never for a group DM"']],
-      ["the fungible part's line", (body) => body.replace(/^(\*\*Open mode\*\*[\s\S]*?)- \*\*Line:\*\*/m, '$1- Shown:'), ['fungible: no line']],
+      ["the open-mode part's line", (body) => body.replace(/^(\*\*Open mode\*\*[\s\S]*?)- \*\*Line:\*\*/m, '$1- Shown:'), ['fungible: no line']],
     ])('self-check: %s cut fails on it alone', (_label, edit, expected) => {
       expect(unclaimedProblems(cutEntry(edit))).toEqual(expected)
     })

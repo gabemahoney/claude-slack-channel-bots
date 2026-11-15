@@ -415,7 +415,7 @@ describe('retained timing regressions', () => {
   })
 
   test.each([
-    ['switch-off', 'kept', ''], ['fungible', 'kept', ''],
+    ['switch-off', 'kept', ''], ['open', 'kept', ''],
     ...['configuration_request', 'configuration_application_preserved', 'configuration_record_matches'].map(helper => ['switch-off', 'unredirected', helper]),
     ...['operatorReviewPending', 'sharedApplicationPreserved', 'sharedConfigurationMatches'].map(printer => ['switch-off', 'fails', printer]),
   ])('test-29 switch retains restart diagnostics: %s %s %s', (shape, mode, target) => {
@@ -2153,10 +2153,10 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     'write_config() { cat > "$CONFIG"; }',
     declaration(test29Script, 'edit_input'), test29Script.match(/^input_has\(\) \{.*\}$/m)![0], declaration(test29Script, 'input_choice'),
   ]
-  test.each((['declarative', 'fungible', 'switch-off'] as const).flatMap(shape => (['with', 'without'] as const).map(form => [shape, form] as const)))(
+  test.each((['strict-upgrade', 'open', 'switch-off'] as const).flatMap(shape => (['with', 'without'] as const).map(form => [shape, form] as const)))(
     'test-29 written config turns reply reminders off for both personas: %s, %s the opt-out', (shape, form) => {
       expect(personaConfig.match(optOut)).toHaveLength(2)
-      const ready = shape === 'declarative' ? 'false' : 'true'
+      const ready = shape === 'strict-upgrade' ? 'false' : 'true'
       const run = shell([
         ...personaConfigSetup, `ALPHA_THREADS=${ready} MATRIX_READY=${ready}`,
         form === 'with' ? personaConfig : personaConfig.replace(optOut, ''),
@@ -2209,7 +2209,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       'edit_input --arg who "$qname" \'(.personas[]|select(.name==$who)|.permission_prompts)="dm"\'', 'review_assign "${mode}-${kind}-destination-dm"', backEdit,
     ]
     const run = shell([
-      ...personaConfigSetup, 'ALPHA_THREADS=false MATRIX_READY=false', personaConfig, 'write_persona_config fungible',
+      ...personaConfigSetup, 'ALPHA_THREADS=false MATRIX_READY=false', personaConfig, 'write_persona_config open',
       'ALPHA_KEY=k_alpha BRAVO_KEY=k_bravo ALPHA_BOT_USER=UALPHA BRAVO_BOT_USER=UBRAVO ALPHA_REF=alpha BRAVO_REF=bravo DEST=CDEST mode=open',
       declaration(test29Script, 'thread_persona'),
       'attempt_args() { printf "%s\\n" "$2"; }',

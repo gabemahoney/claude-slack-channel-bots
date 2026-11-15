@@ -4,11 +4,10 @@
  * Every notice about a persona goes only to that persona's destination
  * channel, through that persona's own Web client, as one top-level message
  * whose text carries the persona reference built from the persona's stored
- * key: its `permission_prompts` in declarative mode, its fungible destination
- * (`permission_prompts`, `dm` when absent) in fungible mode (
- * beside and), proven for a channel, an explicit
- * and a defaulted `dm` fungible destination with the resolver reading the
- * switch at each attempt, as `src/server.ts` wires it. A `dm` destination gets
+ * key: its explicit `permission_prompts` destination in both strict and
+ * open modes, proven for a channel and two explicitly configured `dm`
+ * destinations, with the resolver reading the applied configuration at each
+ * attempt, as `src/server.ts` wires it. A `dm` destination gets
  * its notices in the persona's DM with its
  * contact, opened at post time through the shared destination resolver (whose
  * cache and failures `persona-destination.test.ts` proves), dry run posts
@@ -337,12 +336,12 @@ describe('the persona reference uses the stored key', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Fungible mode: notices at the fungible destination
+// Open mode: notices at the shared explicit destination
 // ---------------------------------------------------------------------------
 
-describe('fungible mode: notices go to the fungible destination (beside)', () => {
-  // F's fungible destination is a channel; X names `dm` explicitly; Y has no
-  // `invited` section, so its fungible destination is `dm` by default.
+describe('open mode: notices go to the explicit permission_prompts destination', () => {
+  // F explicitly targets a channel; X and Y both explicitly target `dm`
+  // through permission_prompts, the destination setting in both modes.
   const F_DEST = 'C0FUNGNOT1'
   const X_CONTACT = 'U0XRAYNOT1'
   const Y_CONTACT = 'U0YANKNOT1'
@@ -379,17 +378,16 @@ describe('fungible mode: notices go to the fungible destination (beside)', () =>
   const BODY = 'Spawn failure:\n  Error: boom'
 
   test.each<[string, () => Persona, () => string, () => string | undefined]>([
-    ['a channel fungible destination (F): one top-level post to that channel', () => F, () => F_DEST, () => undefined],
-    ['an explicit "dm" fungible destination (X): the DM with its dm.contact, opened at post time', () => X, () => DM_DESTINATION, () => X_CONTACT],
+    ['an explicit channel destination (F): one top-level post to that channel', () => F, () => F_DEST, () => undefined],
+    ['an explicit "dm" destination (X): the DM with its dm.contact, opened at post time', () => X, () => DM_DESTINATION, () => X_CONTACT],
     [
       'an explicit "dm" destination (Y, shared permission_prompts): the DM with its dm.contact, opened at post time',
       () => Y, () => DM_DESTINATION, () => Y_CONTACT,
     ],
-  ])('%s, carrying the persona reference, through the persona\'s own client; no other persona\'s stub is called', async (_label, pick, fungibleDestination, contact) => {
+  ])('%s, carrying the persona reference, through the persona\'s own client; no other persona\'s stub is called', async (_label, pick, destination, contact) => {
     const self = pick()
-    // Preconditions: the destination is the loader's fungible destination,
-    // and the declarative section is not in force.
-    expect(self.permission_prompts).toBe(fungibleDestination())
+    // The loader preserves the explicit permission_prompts destination in open mode too.
+    expect(self.permission_prompts).toBe(destination())
     const dmContact = contact()
     // Nothing is opened before a notice is raised.
     expect(fh.stub(self.key).callLog).toEqual([])

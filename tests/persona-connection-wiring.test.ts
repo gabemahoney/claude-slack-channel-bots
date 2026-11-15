@@ -167,8 +167,6 @@ import {
 } from './test-helpers/credentials.ts'
 import { makeManagedRouting } from './test-helpers/persona-routing-managed.ts'
 import { outputDuringAsync, socketLogLine, ticketUrl } from './test-helpers/slack-logger-probes.ts'
-import { startSlackStub } from './integration/fixtures/slack-stub-server.ts'
-import type { OwnPostAnswer, OwnPostObserver, OwnPostOperation } from '../src/own-post.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1236,7 +1234,7 @@ describe('carry: clientFor serves A\'s long-lived client only while A is serving
 /** A's session server with an MCP client connected to it, sending from `<dir>/state/inbox`. */
 async function openReplySession(
   h: ConnectionHarness & { A: Persona; B: Persona },
-  { getPersona, clientFor, ownPosts }: Pick<SessionToolDeps, 'getPersona' | 'clientFor' | 'ownPosts'>,
+  { getPersona, clientFor }: Pick<SessionToolDeps, 'getPersona' | 'clientFor'>,
 ): Promise<{ client: Client; stateDir: string; inboxDir: string }> {
   const stateDir = join(dir, 'state')
   const inboxDir = join(stateDir, 'inbox')
@@ -1250,7 +1248,6 @@ async function openReplySession(
     resolveUserName: async (_key, userId) => userId,
     consumeAck,
     serverPort: 0,
-    ...(ownPosts ? { ownPosts } : {}),
   }
   const entry = registerSession(h.A.working_directory, h.A.key, makeTransport(`mcp-${h.A.key}`), makeSessionServer([]))
   const server = createSessionServer(entry, deps)
@@ -1386,72 +1383,6 @@ describe('carry: reply file uploads go through the manager\'s long-lived client 
       ])
     } finally {
       api.server.stop(true)
-    }
-  })
-
-  // The integration scripts' Slack stub (test-29, test-49) through the same
-  // real upload path: one completion carries both files, so its answer must
-  // name each one, or registry.ts confirms only the first.
-  test('a reply with two files against the integration Slack stub: its one completion answers each file with the request\'s id and title, and each file\'s own operation is confirmed with the id it was uploaded under', async () => {
-    const h = harness()
-    const recordPath = join(dir, 'stub-record.jsonl')
-    const stub = startSlackStub({ recordPath })
-    const ends: Array<{ name: string; answer: OwnPostAnswer }> = []
-    const ownPosts: OwnPostObserver = {
-      start: (_key, _surface, _target, content) => ({ operation: { name: content.kind === 'file' ? content.name : 'text' } as unknown as OwnPostOperation }),
-      end: (operation, answer) => { ends.push({ name: (operation as unknown as { name: string }).name, answer }) },
-    }
-    // Output, results, own-post answers, stub records and any caught error are
-    // leak-checked, on a failing assertion too.
-    const captured: unknown[] = [ends]
-    try {
-      const web = PRODUCTION_SLACK_CLIENT_FACTORY.createWebClient(fakeToken(BOT_TOKEN_PREFIX, 'stub-reply'), {
-        ...longLivedWebClientOptions(),
-        slackApiUrl: stub.apiUrl,
-      }) as WebClient
-      const { client, inboxDir } = await openReplySession(h, {
-        getPersona: (key) => (key === h.A.key ? h.A : undefined),
-        clientFor: (key) => (key === h.A.key ? web : undefined),
-        ownPosts,
-      })
-      const files = ['plan.md', 'diagram.png'].map(name => {
-        const path = join(inboxDir, name)
-        writeFileSync(path, name)
-        return path
-      })
-
-      // A rejection stays inside the capture, so its recorded output is still
-      // returned and scanned; the original failure is rethrown afterwards.
-      let result: unknown, rejected: { error: unknown } | undefined
-      const output = await outputDuringAsync(async () => {
-        try { result = await client.callTool({ name: 'reply', arguments: { chat_id: CA, text: '', files } }) } catch (error) { rejected = { error } }
-      })
-      captured.push(result, output)
-      if (rejected) throw rejected.error
-      const direct = await fetch(`${stub.apiUrl}files.completeUploadExternal`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${fakeToken(BOT_TOKEN_PREFIX, 'stub-direct')}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ channel_id: CA, files: JSON.stringify([{ id: 'F0DIRECT01', title: 'a.md' }, { id: 'F0DIRECT02', title: 'b.png' }]) }),
-      }).then(r => r.json())
-      captured.push(direct)
-      const records = readFileSync(recordPath, 'utf8').trim().split('\n').map(line => JSON.parse(line))
-
-      expect(output).toEqual([])
-      expect((result as { isError?: boolean }).isError).toBeUndefined()
-      const uploaded = records.filter(r => r.event === 'upload').map(r => r.file_id as string)
-      expect(uploaded).toHaveLength(2)
-      expect(records.filter(r => r.event === 'api' && r.method === 'files.completeUploadExternal').map(r => r.answer)).toEqual(['ok', 'ok'])
-      expect(ends.map(e => [e.name, e.answer.kind])).toEqual([['plan.md', 'confirmed'], ['diagram.png', 'confirmed']])
-      expect(ends.map(e => (e.answer as { file?: string }).file).sort()).toEqual([...uploaded].sort())
-      expect(ends.every(e => (e.answer as { channel?: string }).channel === CA)).toBe(true)
-      expect(direct).toEqual({ ok: true, files: [{ id: 'F0DIRECT01', title: 'a.md' }, { id: 'F0DIRECT02', title: 'b.png' }] })
-    } catch (error) {
-      captured.push(error)
-      throw error
-    } finally {
-      try { await stub.stop() } catch (error) { captured.push(error); throw error } finally {
-        assertNoLeak({ captured, record: existsSync(recordPath) ? readFileSync(recordPath, 'utf8') : '' })
-      }
     }
   })
 })

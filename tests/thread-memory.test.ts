@@ -5150,15 +5150,9 @@ describe('SR-8 Joined Thread populations (t1.k49.39 SR-8.1, SR-8.3, SR-2.4.4)', 
     expect(memory.joins(key).map(({ join, savedAt }) => line({ ...join, at: savedAt ?? Number.NaN })).sort()).toEqual(joins.map(line).sort())
     expect(oldestJoins(joins, SR8_BURST_JOINS).filter(j => memory.view(key, j.channel, j.root) !== 'joined')).toEqual([])
   }
-  test('the src-free channel builder equals channelPopulation at the population and shared-list counts', () => {
-    for (const [count, offset] of [[SR8_POPULATION_CHANNEL_COUNT, 0], [SR8_SHARED_LIST_CHANNELS, 0], [SR8_SHARED_LIST_CHANNELS, SR8_POPULATION_CHANNEL_COUNT]] as const) {
-      expect(populationChannels(count, offset)).toEqual(channelPopulation(count, offset))
-    }
-    expect(populationEligible()).toHaveLength(SR8_ELIGIBLE_CHANNELS)
-  }, POPULATION_CASE_TIMEOUT_MS)
-
   test.each([...SR8_POPULATIONS])('%i Joined Threads per persona, for two personas, reopen from disk with every join and the oldest, and nothing lost', async population => {
     const dir = seeded.get(population)!, h = reopen(dir); await h.start()
+    expect(eligible).toHaveLength(SR8_ELIGIBLE_CHANNELS)
     // A population of 0 has no journal: activation creates each store.
     expect(byKey(h.events)).toEqual(population ? readEvents(dir) : keys.map(key => ({ type: 'created', key, path: threadPath(dir, key) })))
     for (const key of keys) expectPopulation(h.memory, key, population)

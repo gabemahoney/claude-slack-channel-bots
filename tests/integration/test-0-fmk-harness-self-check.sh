@@ -1835,13 +1835,33 @@ leg_mcp_end() {
     stop_tracked_pid "${SLACK_STUB_PID}" 10 "${step}: the Slack stub did not exit on SIGTERM"
 }
 
+# Scan the stub's records and captured output after tracked processes stop,
+# including when a request or assertion failed before the leg's closing scan.
+slack_stub_record_no_leak() {
+    local dir="${SCENARIO_ROOT}/slack-stub-record" file
+    for file in "${dir}/record.jsonl" "${dir}"/*.out; do
+        [[ -f "${file}" ]] || continue
+        [[ "$(count_token_like "${file}")" == 0 ]] || fail 'slack stub record: captured output holds token-like text'
+    done
+}
+
+restore_slack_stub_api() {
+    if [[ -n "$1" ]]; then
+        export CSCB_SLACK_API_URL="$1"
+    else
+        unset CSCB_SLACK_API_URL
+    fi
+}
+
 # The Slack stub's record (fixtures/slack-stub-server.ts --record): a
 # `chat.postMessage` whose text, longer than SLACK_RECORD_CUT, holds a fake
 # token is recorded whole with `<token>` in the token's place; the same text
 # sent to `chat.update` is recorded cut to SLACK_RECORD_CUT characters after
-# the replacement; and the record holds no token-like text.
+# the replacement; and the record holds no token-like text. One multi-file
+# completion answers every distinct requested ID and title in request order.
 leg_slack_stub_record() {
     local step="slack stub record" dir="${SCENARIO_ROOT}/slack-stub-record" prev="${CSCB_SLACK_API_URL-}" token text want got method
+    on_exit slack_stub_record_no_leak
     start_slack_stub "${dir}" recv1
     token="$(fake_token bot recv1)"
     printf -v text '%*s' "${SLACK_RECORD_FILLER}" ''
@@ -1851,21 +1871,24 @@ leg_slack_stub_record() {
     for method in chat.postMessage chat.update; do
         curl -sS --fail --max-time 10 -H "Authorization: Bearer ${token}" --data-urlencode "channel=C0T0REC01" \
             --data-urlencode "text=${text}" "${CSCB_SLACK_API_URL}${method}" > "${dir}/${method}.out" 2>&1 \
-            || fail "${step}: the Slack stub did not answer ${method}: $(head -c 300 "${dir}/${method}.out")"
+            || { restore_slack_stub_api "${prev}"; fail "${step}: the Slack stub did not answer ${method}"; }
     done
+    curl -sS --fail --max-time 10 -H "Authorization: Bearer ${token}" --data-urlencode 'channel_id=C0T0REC01' \
+        --data-urlencode 'files=[{"id":"F0DIRECT01","title":"a.md"},{"id":"F0DIRECT02","title":"b.png"}]' \
+        "${CSCB_SLACK_API_URL}files.completeUploadExternal" > "${dir}/completion.out" 2>&1 \
+        || { restore_slack_stub_api "${prev}"; fail "${step}: the Slack stub did not answer multi-file completion"; }
+    restore_slack_stub_api "${prev}"
+    jq -e -s '. == [{ok: true, files: [{id: "F0DIRECT01", title: "a.md"}, {id: "F0DIRECT02", title: "b.png"}]}]' \
+        "${dir}/completion.out" > /dev/null \
+        || fail "${step}: completion did not answer ok with every requested file ID and title in order"
     got="$(jq -r 'select(.event == "api" and .method == "chat.postMessage") | .text' "${dir}/record.jsonl")"
     [[ "${got}" == "${want}" ]] \
         || fail "${step}: the recorded chat.postMessage text (${#got} characters) is not the whole text with <token> in the token's place (${#want} characters)"
     got="$(jq -r 'select(.event == "api" and .method == "chat.update") | .text' "${dir}/record.jsonl")"
     [[ "${got}" == "${want:0:${SLACK_RECORD_CUT}}" ]] \
         || fail "${step}: the recorded chat.update text (${#got} characters) is not the text with <token> in the token's place cut to ${SLACK_RECORD_CUT}"
-    [[ "$(count_token_like "${dir}/record.jsonl")" == 0 ]] || fail "${step}: the Slack stub's record holds token-like text"
+    slack_stub_record_no_leak
     stop_tracked_pid "${SLACK_STUB_PID}" 10 "${step}: the Slack stub did not exit on SIGTERM"
-    if [[ -n "${prev}" ]]; then
-        export CSCB_SLACK_API_URL="${prev}"
-    else
-        unset CSCB_SLACK_API_URL
-    fi
 }
 
 # True when CSCB processes made at least <n> <verb> calls naming <instance-id>.

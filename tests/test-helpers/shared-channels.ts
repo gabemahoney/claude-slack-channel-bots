@@ -14,6 +14,7 @@ import {
 import { isRealHome, isUnder, osTempDir } from './host-safe-env.ts'
 import { makePersonaConfigInput } from './persona-config.ts'
 import { writtenFile } from './credentials.ts'
+import { populationChannels } from './thread-populations.ts'
 import type { JSONRPCResponse, JSONRPCError } from '@modelcontextprotocol/sdk/types.js'
 
 /** Compare whole protocol payloads; only the request correlation ID differs. */
@@ -185,10 +186,7 @@ export function malformedActiveRecoveries(active: SharedChannelState, stage: Sha
   })
 }
 export function channelPopulation(count: number, offset = 0) {
-  return Array.from({ length: count }, (_, i) => ({
-    id: `C0LARGE${String(i + offset).padStart(5, '0')}`,
-    delivery: (['off', 'mentions', 'all', 'thread_hybrid'] as const)[i % 4]!,
-  }))
+  return populationChannels(count, offset)
 }
 export const FIXTURE_THREAD_HYBRID_SINCE_PREFIX = 'fixture-thread-hybrid-since-'
 /** A deterministic Thread Hybrid Since mint: `fixture-thread-hybrid-since-N`,

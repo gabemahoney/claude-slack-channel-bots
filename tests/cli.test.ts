@@ -6314,7 +6314,7 @@ describe('no CLI command reads, writes, creates or removes the stored-choice fil
   /**
    * What could load, write, parse or locate the file: the store factory, the
    * start load, the serialiser, the parser, the path function and the file
-   * name. Typed against the module, so a rename fails the typecheck.
+   * name. This string inventory is checked against the CLI source below.
    */
   const FILE_NAMES: ReadonlyArray<string> = [
     'loadChannelDeliveryStore',

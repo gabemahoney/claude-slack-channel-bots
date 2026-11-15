@@ -161,7 +161,8 @@ function populationEntryFindings(file: string, source: string): string[] {
   const findings: string[] = []
   const root = resolve(import.meta.dir, '..')
   const target = join(root, 'tests/test-helpers/thread-populations.ts')
-  const allowed = ['tests/test-helpers/thread-memory.ts', 'tests/integration/fixtures/sr8-evidence.ts']
+  // shared-channels.ts loads only the pure channel builder that channelPopulation delegates to.
+  const allowed = ['tests/test-helpers/thread-memory.ts', 'tests/test-helpers/shared-channels.ts', 'tests/integration/fixtures/sr8-evidence.ts']
   const visit = (node: ts.Node) => {
     const specifier = ts.isImportDeclaration(node) || ts.isExportDeclaration(node) ? node.moduleSpecifier :
       ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference) ? node.moduleReference.expression :
@@ -176,7 +177,7 @@ function populationEntryFindings(file: string, source: string): string[] {
 }
 
 describe('SR-8 population builder entry rule', () => {
-  test('only thread-memory and sr8-evidence load thread-populations in the tests tree', () => {
+  test('only thread-memory, shared-channels and sr8-evidence load thread-populations in the tests tree', () => {
     const files = (readdirSync(import.meta.dir, { recursive: true }) as string[])
       .filter(file => /\.(?:[cm]?[jt]sx?|sh)$/.test(file))
     const findings = files.flatMap(file => populationEntryFindings(`tests/${file}`, readFileSync(join(import.meta.dir, file), 'utf8')))
@@ -2935,17 +2936,17 @@ ${body}
 write_persona_config '${mode}'`], { encoding: 'utf8', timeout: 5000, env: hostSafeChildEnv(home, { tools: ['cat', 'jq', 'sha256sum', 'tr', 'sort'], extras: { FIXTURE_ROOT: home } }) })
     } finally { if (!root) rmSync(home, { recursive: true, force: true }) }
   }
-  test.each(['declarative', 'fungible', 'switch-off'])('test29 %s builder executes with nounset and retains distinct intended channel values', mode => {
+  test.each(['strict-upgrade', 'open', 'switch-off'])('test29 %s builder executes with nounset and retains distinct intended channel values', mode => {
     const result = build(mode)
     assertNoLeak({ stdout: result.stdout, stderr: result.stderr })
     expect(result.status).toBe(0); expect(result.stderr).toBe('')
     const config = JSON.parse(result.stdout)
-    expect(config.channel_mode).toBe(mode === 'declarative' ? undefined : mode === 'fungible' ? 'open' : 'strict')
+    expect(config.channel_mode).toBe(mode === 'strict-upgrade' ? undefined : mode === 'open' ? 'open' : 'strict')
     for (const persona of config.personas) {
       const channelIds = persona.channels.map((entry: { id: string }) => entry.id)
       expect(new Set(channelIds).size).toBe(channelIds.length)
       expect(channelIds.every((id: string) => /^[CG][A-Z0-9]+$/.test(id))).toBe(true)
-      if (mode !== 'declarative') {
+      if (mode !== 'strict-upgrade') {
         // U1 was discovered off in phase A; both personas explicitly share it after the mode change.
         expect(persona.channels).toContainEqual({ id: ids.U1!, delivery: 'all' })
         expect(persona.channels).toContainEqual({ id: ids.F1!, delivery: 'mentions' })
@@ -2953,7 +2954,7 @@ write_persona_config '${mode}'`], { encoding: 'utf8', timeout: 5000, env: hostSa
     }
   })
   test('regression control: the original undefined S1 aborts the actual extracted builder', () => {
-    const result = build('fungible', builder.replaceAll('${U1}', '${S1}'))
+    const result = build('open', builder.replaceAll('${U1}', '${S1}'))
     expect(result.status).not.toBe(0)
     expect(result.stderr).toContain('S1: unbound variable')
   })
@@ -2973,7 +2974,7 @@ write_persona_config '${mode}'`], { encoding: 'utf8', timeout: 5000, env: hostSa
     const routerLines: string[] = []
     f.h.onEvent = createPersonaEventRouter({ membership: f.membership, routing: managed.routing, clientFor: f.h.clientFor, getPersona: f.h.getPersona, log: line => routerLines.push(line) })
     try {
-      const initial = build('declarative', builder, home), inventory = build('declarative', `${control}\nwrite_persona_config() { :; }`, home)
+      const initial = build('strict-upgrade', builder, home), inventory = build('strict-upgrade', `${control}\nwrite_persona_config() { :; }`, home)
       expect(initial.status).toBe(0); expect(inventory.status).toBe(0)
       expect(f.authority.applyReviewed(Buffer.from(initial.stdout), f.authority.revision).kind).toBe('applied')
       for (const token of JSON.parse(inventory.stdout).tokens as Array<{ label: string; memberships: string[] }>) {
@@ -3062,7 +3063,7 @@ write_persona_config '${mode}'`], { encoding: 'utf8', timeout: 5000, env: hostSa
     const check = source.slice(source.indexOf('check_phase_a_inventory() {'), source.indexOf('\ncheck_phase_a_inventory ||'))
     const checkBody = `${check}\nwrite_persona_config() { check_phase_a_inventory; }`
     try {
-      const initial = build('declarative', builder, home), inventory = build('declarative', `${control}\nwrite_persona_config() { :; }`, home)
+      const initial = build('strict-upgrade', builder, home), inventory = build('strict-upgrade', `${control}\nwrite_persona_config() { :; }`, home)
       expect(initial.status).toBe(0); expect(inventory.status).toBe(0)
       assertNoLeak({ initial, inventory })
       writeFileSync(join(home, 'config.json'), initial.stdout)
@@ -3078,29 +3079,29 @@ write_persona_config '${mode}'`], { encoding: 'utf8', timeout: 5000, env: hostSa
         expect(f.authority.snapshot().personas[key]!.assignments[ids.U1!]?.delivery).toBe('off')
         expect(f.authority.snapshot().personas[key]!.assignments[ids.U0!]).toBeUndefined()
       }
-      expect(build('declarative', checkBody, home).status).toBe(0)
+      expect(build('strict-upgrade', checkBody, home).status).toBe(0)
       const strict = f.authority.snapshot()
       expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, ids.U1!, 'mentions', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
-      expect(build('declarative', checkBody, home).status).not.toBe(0)
+      expect(build('strict-upgrade', checkBody, home).status).not.toBe(0)
       expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, ids.U1!, 'off', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
-      expect(build('declarative', checkBody, home).status).toBe(0)
+      expect(build('strict-upgrade', checkBody, home).status).toBe(0)
       expect(_assignFixture(f.authority, 'alpha', f.authority.incarnation('alpha')!, ids.U0!, 'off', f.authority.revision, f.threadHybridSince).kind).toBe('applied')
-      expect(build('declarative', checkBody, home).status).not.toBe(0)
+      expect(build('strict-upgrade', checkBody, home).status).not.toBe(0)
       // Resume the untouched strict authority, then use the actual builders.
       const authority = createSharedChannelAuthority(f.authority.path, strict)
       const threadHybridSince = fixtureThreadHybridSince(strict)
-      for (const mode of ['fungible', 'switch-off']) {
+      for (const mode of ['open', 'switch-off']) {
         const next = build(mode, builder, home)
         expect(next.status).toBe(0)
         expect(authority.applyReviewed(Buffer.from(next.stdout), authority.revision).kind).toBe('applied')
         for (const key of ['alpha', 'bravo']) {
           expect(authority.snapshot().personas[key]!.assignments[ids.U0!]).toBeUndefined()
           expect(authority.snapshot().personas[key]!.assignments[ids.U1!]?.delivery).toBe('all')
-          expect(authority.snapshot().personas[key]!.assignments[ids.F1!]?.delivery).toBe(mode === 'fungible' ? 'mentions' : 'all')
+          expect(authority.snapshot().personas[key]!.assignments[ids.F1!]?.delivery).toBe(mode === 'open' ? 'mentions' : 'all')
         }
         expect(authority.snapshot().personas.alpha!.assignments[ids.F2!]?.delivery).toBe('off')
         expect(authority.snapshot().personas.bravo!.assignments[ids.F2!]?.delivery).toBe('mentions')
-        if (mode === 'fungible') for (const key of ['alpha', 'bravo']) {
+        if (mode === 'open') for (const key of ['alpha', 'bravo']) {
           expect(_assignFixture(authority, key, authority.incarnation(key)!, ids.F1!, 'all', authority.revision, threadHybridSince).kind).toBe('applied')
         }
       }

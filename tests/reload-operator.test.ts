@@ -1,21 +1,29 @@
-import { _assignFixture, fixtureThreadHybridSince } from './test-helpers/shared-channels.ts'
+/** wc: the public request / review / rename gesture over the real authority. */
+import {
+  _assignFixture, fixtureThreadHybridSince, activationOf, activationRecord, applicationState, botApplications,
+  botAttemptAtReviewOutcome, configBytes, deliveryAttempt, sharedRecoveryRequest, withPreRuleReviewOutcomes, membershipPage,
+  SHARED_CHANNEL_IDS,
+} from './test-helpers/shared-channels.ts'
 import { makeDeferredConnect, makeDeferredWebApiCall, stubOpenedDmId } from './test-helpers/slack-stub.ts'
 import { consumeAck } from '../src/ack-tracker.ts'
-/** wc: the public request / review / rename gesture over the real authority. */
 import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { readFileSync, writeFileSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { DEFAULT_PERSONA_CONFIG_FS, DELIVERY_MODES, type DeliveryMode, type PersonaInput } from '../src/config.ts'
 import { buildOperatorAssignment, buildReviewRequest, composeReviewRequest, parseReviewRequestBytes, reviewIntentLine } from '../src/reload-request.ts'
-import { RELOAD_REVIEW_OUTCOME, RELOAD_REVIEW_RECOVERY, reviewLedger, reviewOutcomeLine, reviewRecoveredBringUpFailedLine, reviewRecoveredLifecycleFailedLine, reviewRecoveryLine, sharedReviewDependency, type ReviewOutcome } from '../src/reload-review.ts'
+import {
+  RELOAD_REVIEW_OUTCOME, RELOAD_REVIEW_RECOVERY, reviewLedger, reviewOutcomeLine, reviewRecoveredBringUpFailedLine,
+  reviewRecoveredLifecycleFailedLine, reviewRecoveryLine, sharedReviewDependency, type ReviewOutcome,
+} from '../src/reload-review.ts'
 import { RELOAD_STALE_CONFIRMATION, renderStaleConfirmationLogLine } from '../src/reload-apply.ts'
-import { parseSharedChannelState, serializeSharedChannelState, reviewedReplacementIncarnation, type SharedChannelState, type SharedPersona } from '../src/shared-channels.ts'
-import { REVIEW_OMISSION_CLAUSE, REVIEW_RETENTION_CLAUSE, REVIEW_RESET_CLAUSE } from '../src/reload-preview-clauses.ts'
+import {
+  parseSharedChannelState, serializeSharedChannelState, reviewedReplacementIncarnation, type SharedChannelState, type SharedPersona,
+  absenceReplacementBinding,
+} from '../src/shared-channels.ts'
+import { REVIEW_OMISSION_CLAUSE, REVIEW_RETENTION_CLAUSE, REVIEW_RESET_CLAUSE, REVIEW_ABSENCE_REPLACEMENT } from '../src/reload-preview-clauses.ts'
 import { makeReloadHarness, NO_RUN_ACTIVITY, type ReloadHarness, type ReloadRun, type ReloadRunOptions } from './test-helpers/reload-harness.ts'
-import { activationOf, activationRecord, applicationState, botApplications, botAttemptAtReviewOutcome, configBytes, deliveryAttempt, sharedRecoveryRequest, withPreRuleReviewOutcomes } from './test-helpers/shared-channels.ts'
 import { sharedRecoveryLine } from '../src/reload-recovery.ts'
 import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
-import { membershipPage, SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
 import { stubCallCount } from './test-helpers/agent-director-stub.ts'
 
 const { primary: A, secondary: B, private: C } = SHARED_CHANNEL_IDS
@@ -655,9 +663,6 @@ test.each(['changed', 'observation-write-fails', 'unchanged'] as const)('confirm
   await confirm(run)
   expect(authority(run).config().personas[0]!.stop_hook_bootstrap).toBe(false)
 })
-
-import { absenceReplacementBinding } from '../src/shared-channels.ts'
-import { REVIEW_ABSENCE_REPLACEMENT } from '../src/reload-preview-clauses.ts'
 
 test('reviewed absence replacement preserves the exact conflict and unrelated channel while requiring fresh current evidence', async () => {
   const alpha = persona(); h.materialize(alpha); h.writeConfig({ personas: [alpha], channel_mode: 'open' })

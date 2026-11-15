@@ -8,18 +8,18 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { CHANNEL_ID_RE, DELIVERY_MODES, channelModeOf, type ChannelMode } from '../src/config.ts'
-import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
 import { OWN_ROOT_CLOCK_SKEW_MS } from '../src/delivery-constants.ts'
 import { decideDelivery, type DeliveryDecision } from '../src/delivery-decision.ts'
-import { completionFiles, createOwnPostJoins, createOwnPostObserver,
-  ownPostAnswerOfError, ownPostAnswerOfPost, ownPostChoice, ownPostEligibility, pendingOwnPostViews,
+import { completionFiles, createOwnPostObserver,
+  ownPostAnswerOfError, ownPostAnswerOfPost, ownPostEligibility, pendingOwnPostViews,
   type OwnPostAnswer, type OwnPostContent, type OwnPostEvent, type OwnPostOperation, type OwnPostOperationView,
   type OwnPostOutcome, type OwnPostOwner,
 } from '../src/own-post.ts'
 import { OWN_POST_UPLOAD_REFUSED } from '../src/registry.ts'
-import { SHARED_CHANNEL_IDS, makeMembershipHarness, membershipPage } from './test-helpers/shared-channels.ts'
-import { makeThreadMemoryHarness, readThreads, slackTsOfMs, threadFsControls, threadPath, type ThreadHarnessOptions } from './test-helpers/thread-memory.ts'
-import { makeQueue, slackInput } from './test-helpers/delivery-queue.ts'
+import { SHARED_CHANNEL_IDS, membershipPage } from './test-helpers/shared-channels.ts'
+import { slackTsOfMs, threadFsControls, threadPath, type ThreadHarnessOptions } from './test-helpers/thread-memory.ts'
+import { slackInput } from './test-helpers/delivery-queue.ts'
+import { makeOwnPostHarness } from './test-helpers/own-post.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeChannelMessage, makeStubSlack, slackPlatformError, slackRateLimited, slackHttpError, slackRequestError, slackAbortError } from './test-helpers/slack-stub.ts'
 import { assertNoLeak, LEAK_SENTINEL, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
@@ -148,67 +148,25 @@ async function fixture(options: { mode?: ChannelMode; names?: string[]; sharedId
   operationId?: () => string } = {}) {
   const dir = options.reopen ?? mkdtempSync(join(tmpdir(), 'own-post-'))
   if (!options.reopen) cleanups.push(() => rmSync(dir, { recursive: true, force: true }))
-  const members = makeMembershipHarness(dir, { mode: options.mode ?? 'strict', names: options.names,
-    channels: [{ id: C, delivery: 'thread_hybrid' }, { id: C2, delivery: 'thread_hybrid' }], reopen: !!options.reopen })
-  if (options.sharedIdentity) {
-    const alpha = members.h.stub(members.h.p('alpha')), beta = members.h.stub(members.h.p('beta'))
-    Object.assign(beta.identity, alpha.identity)
-    beta.script.botsInfo.push({ kind: 'ok', result: { bot: {
-      id: alpha.identity.botId, user_id: alpha.identity.botUserId, app_id: alpha.identity.appId, deleted: false,
-    } } })
-  }
-  const h = makeThreadMemoryHarness(dir, { ...options.memory, authority: members.authority, clock: members.h.clock })
-  const queue = await makeQueue(dir, { now: h.clock.now, setInterval: (() => ({ unref() {} })) as unknown as typeof setInterval,
-    clearInterval: (() => {}) as typeof clearInterval })
-  const choices = createChannelDeliveryStore(h.authority)
-  const sources = { config: () => h.authority.config(), persona: (key: string) => h.authority.config().personas.find(p => p.key === key),
-    choices: () => choices, membership: members.membership.read }
-  // Snapshot reads when used: releasing an outcome, forgetting a persona or
-  // settling a pending operation must not erase its earlier output from checks.
-  const returned: unknown[] = []
-  const capture = <T>(value: T): T => { returned.push(structuredClone(value)); return value }
-  let dryRun = false, serial = 0
-  const rawOwner = createOwnPostJoins({ memory: h.memory, lookupSlackKey: queue.lookupSlackKey,
-    choice: ownPostChoice(sources), eligibility: ownPostEligibility(sources), now: h.clock.now,
-    operationId: options.operationId ?? (() => 'post-' + ++serial), isDryRun: () => dryRun })
-  const owner = { ...rawOwner,
-    pendingOwnPosts: (...args: Parameters<typeof rawOwner.pendingOwnPosts>) => capture(rawOwner.pendingOwnPosts(...args)),
-    unknownOwnPosts: (...args: Parameters<typeof rawOwner.unknownOwnPosts>) => capture(rawOwner.unknownOwnPosts(...args)),
-    operation: (...args: Parameters<typeof rawOwner.operation>) => capture(rawOwner.operation(...args)),
-    awaitingUploads: (...args: Parameters<typeof rawOwner.awaitingUploads>) => capture(rawOwner.awaitingUploads(...args)),
-    memoryOnlyJoins: (...args: Parameters<typeof rawOwner.memoryOnlyJoins>) => capture(rawOwner.memoryOnlyJoins(...args)),
-    resolvedThreads: (...args: Parameters<typeof rawOwner.resolvedThreads>) => capture(rawOwner.resolvedThreads(...args)),
-  }
-  const memory = { ...h.memory,
-    unresolvedIntents: (key: string) => capture(h.memory.unresolvedIntents(key)),
-  }
-  const observer = createOwnPostObserver(() => owner), events: OwnPostEvent[] = []
-  owner.subscribe(event => { events.push(event) })
-  const checkOutputs = () => assertNoLeak({
-    membership: members.captured(), sharedWrites: members.writes, events, returned,
-    threadMemory: { events: h.events, logs: h.logs, posts: h.posts, retryEvents: h.retryEvents, sealEvents: h.sealEvents },
-    // These are output directories, across all personas, including quarantines.
-    // The fixture root also holds credential inputs, which are not outputs.
-    files: ['threads', 'queue'].map(name => join(dir, name)).filter(existsSync).map(writtenFile),
+  let serial = 0
+  const h = await makeOwnPostHarness(dir, {
+    membership: { mode: options.mode ?? 'strict', names: options.names,
+      channels: [{ id: C, delivery: 'thread_hybrid' }, { id: C2, delivery: 'thread_hybrid' }], reopen: !!options.reopen },
+    prepareMembership(members) {
+      if (!options.sharedIdentity) return
+      const alpha = members.h.stub(members.h.p('alpha')), beta = members.h.stub(members.h.p('beta'))
+      Object.assign(beta.identity, alpha.identity)
+      beta.script.botsInfo.push({ kind: 'ok', result: { bot: {
+        id: alpha.identity.botId, user_id: alpha.identity.botUserId, app_id: alpha.identity.appId, deleted: false,
+      } } })
+    },
+    memory: options.memory, start: options.start,
+    operationId: options.operationId ?? (() => 'post-' + ++serial),
+    // These cases explicitly drive publication/settlement; no subscription may pre-settle them.
+    publishSharedState: false,
   })
-  let closed = false
-  const close = async () => {
-    if (closed) return
-    closed = true
-    try { checkOutputs() } finally {
-      try { owner.stop(); await queue.stop() } finally {
-        try { await h.close() } finally {
-          try { await members.close() } finally { checkOutputs() }
-        }
-      }
-    }
-  }
-  cleanups.push(close)
-  if (options.start !== false) {
-    await h.start()
-    for (const persona of h.authority.config().personas) members.h.stub(members.h.p(persona.key)).script.inventory.push(membershipPage([C, C2]))
-    await members.start(); await members.scan()
-  }
+  cleanups.push(h.close)
+  const { members, owner, observer, events } = h
   const begin = (parent?: string, key = 'alpha', surface: 'text' | 'file' = 'text', channel: string = C) => {
     const started = observer.start(key, surface, { channel, ...(parent ? { parent } : {}) },
       surface === 'file' ? { kind: 'file', name: LEAK_SENTINEL, size: 12 } : CONTENT)
@@ -223,14 +181,11 @@ async function fixture(options: { mode?: ChannelMode; names?: string[]; sharedId
     await h.clock.flush(); await members.scan()
     expect(members.membership.read(key, C, h.authority.config().channel_mode).kind).toBe(kind)
   }
-  const records = (key = 'alpha') => capture(existsSync(threadPath(dir, key)) ? readThreads(dir, key) : [])
   const pending = (key = 'alpha') => owner.pendingOwnPosts(key, C)
-  const view = (root = ROOT, key = 'alpha') => capture(h.memory.view(key, C, root))
-  const flush = () => h.clock.flush()
-  return { ...h, memory, dir, members, choices, sources, queue, owner, observer, events, begin, scan, records, pending, view, flush, close,
-    dryRun(value: boolean) { dryRun = value },
-    stale() { expect(h.choose('off').kind).toBe('applied'); expect(h.choose('thread_hybrid').kind).toBe('applied') },
-    undecided() { members.unsyncWrites(() => true); expect(h.mode(h.authority.config().channel_mode === 'strict' ? 'open' : 'strict').kind).toBe('unresolved') },
+  const view = (root = ROOT, key = 'alpha') => h.view(key, C, root)
+  return { ...h.threads, ...h, dir, begin, scan, pending, view,
+    stale() { expect(h.threads.choose('off').kind).toBe('applied'); expect(h.threads.choose('thread_hybrid').kind).toBe('applied') },
+    undecided() { members.unsyncWrites(() => true); expect(h.threads.mode(h.authority.config().channel_mode === 'strict' ? 'open' : 'strict').kind).toBe('unresolved') },
     decideStamp() { members.unsyncWrites(() => false); expect(h.authority.recoverDurability().kind).toBe('applied') },
   }
 }
@@ -668,8 +623,6 @@ describe('Pending Own Posts for Post Holds', () => {
     const h = await fixture({ reopen: first.dir, start: false })
     expect(h.pending()).toEqual([])
     await h.start()
-    h.members.h.stub(h.members.h.p('alpha')).script.inventory.push(membershipPage([C, C2]))
-    await h.members.start(); await h.members.scan()
     expect(h.pending()).toMatchObject([{ operationId: post.id, root: ROOT, state: 'unknown' }])
     expect(decideReply(h, ROOT)).toEqual(heldFor(ROOT, [post.id]))
   })

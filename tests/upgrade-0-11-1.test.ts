@@ -1,29 +1,29 @@
 /**
- * upgrade-0-11-1.test.ts — An upgrade from 0.11.1 stays declarative.
+ * upgrade-0-11-1.test.ts — An upgrade from 0.11.1 stays in strict mode.
  *
  * What this suite proves: a 0.11.1 `config.json`, with neither the
  * `allow_invited_channels` switch nor any `invited` section, loads unchanged
- * and behaves as 0.11.1 did. Each fixture below, written into a temp state
- * directory:
+ * and keeps strict-mode behavior under current membership eligibility. Each
+ * fixture below, written into a temp state directory:
  *
  * - keeps its bytes, through `loadPersonaConfig` and through a reload-harness
  *   start, a start over its last-applied record and a confirmed 0.11.1-style
  *   edit; the record is a byte copy of the file at each step;
- * - runs in declarative mode, with no fungible destination and no `invited`
- *   section on any persona;
+ * - runs in strict mode, with an explicit `permission_prompts` destination
+ *   and no `invited` section on any persona;
  * - never gets a stored-choice file (`'channel-delivery.json'`);
  * - logs, previews and posts nothing that names the switch, fungible mode or
  *   a class this work adds (the term list below), so no line suggests
- * fungible mode and, with the switch absent, no recorded line
- * can appear;
+ *   open mode and, with the switch absent, no recorded line can appear;
  * - previews a 0.11.1-style edit as the counted header and the persona's
  *   in-place line, and once it is confirmed updates only that persona in
  *   place, with the edit in effect for the next event;
  * - posts each notice to the persona's `permission_prompts` destination;
- * - decides sample events from listed and unlisted channels as says;
- * - lists `set_channel_delivery` and refuses it with the declarative
+ * - decides sample events from listed and unlisted channels using current
+ *   membership;
+ * - lists `set_channel_delivery` and refuses it with the strict-mode
  *   refusal, and sends `MCP_INSTRUCTIONS` as the session instructions: the
- * two agent-visible additions allows.
+ *   two agent-visible additions covered by this suite.
  *
  * Fixtures, owned by this suite and pinned by SHA-256 so an edit
  * to either fails:
@@ -35,10 +35,10 @@
  *   Its `"port": 3100` is as the README has it; no case binds or reaches a
  *   port.
  * - `tests/fixtures/upgrade-0.11.1/two-personas.json`: the shape of
- * phase A, the configuration test-29's declarative phase
+ *   phase A, the configuration test-29's strict phase
  *   writes, with fixed IDs and `~/` paths: `alpha` in A1 (`all`) and A2
  *   (`mentions`), DMs off, prompts to A1; `bravo` in B1 (`mentions`), DMs on
- * with a contact, prompts by `"dm"`server-wide keys.
+ *   with a contact, prompts by `"dm"`, and server-wide keys.
  *
  * Every `~/` path expands under a temp home inside the test's own
  * `mkdtempSync` root, never the operator's home. Tokens are the
@@ -104,7 +104,7 @@ import {
   type StartedReloadRun,
 } from './test-helpers/reload-harness.ts'
 import { makeAppMention, makeChannelMessage, mentionText, stubOpenedDmId, type SlackEvent } from './test-helpers/slack-stub.ts'
-import { membershipPage } from './test-helpers/shared-channels.ts'
+import { deliveryAttempt, membershipPage } from './test-helpers/shared-channels.ts'
 
 // ---------------------------------------------------------------------------
 // The fixtures: paths and bytes, read once
@@ -190,8 +190,8 @@ function modeSwitchLineHead(mode: (typeof CHANNEL_MODES)[number]): string {
 /**
  * What no log line, preview or pending-file text, or Slack-posted text of a
  * 0.11.1 configuration may carry. Every entry is imported from `src/`. It
- * does not apply to `set_channel_delivery`'s listing, its declarative
- * refusal or the session instructions: allows those additions, and
+ * does not apply to `set_channel_delivery`'s listing, its strict-mode
+ * refusal or the session instructions: this suite allows those additions, and
  * they are checked by equality with their exported texts.
  */
 const TERM_LIST: readonly Term[] = [
@@ -207,7 +207,7 @@ const TERM_LIST: readonly Term[] = [
 
 /**
  * Beside the list: the words "fungible" and "invited", in any case.
- * says no line may suggest fungible mode, and the 0.11.1 source holds
+ * No line may suggest the removed modes, and the 0.11.1 source holds
  * neither word.
  */
 const SUGGESTIVE_WORDS = /fungible|invited/i
@@ -347,7 +347,7 @@ describe('upgrade fixtures and the term list', () => {
   )
 })
 
-describe('a 0.11.1 configuration loaded directly stays declarative', () => {
+describe('a 0.11.1 configuration loaded directly stays in strict mode', () => {
   test.each(['invited', 'fungible_destination'] as const)('the loader rejects a removed %s input instead of silently dropping it', field => {
     const { home, stateDir } = makeRig()
     const fixture = FIXTURES[0]!
@@ -361,7 +361,7 @@ describe('a 0.11.1 configuration loaded directly stays declarative', () => {
   })
 
   test.each(FIXTURES.map((f) => [f.file, f] as const))(
-    '%s loads through loadPersonaConfig in declarative mode with its bytes unchanged, no load-time message and no stored-choice file',
+    '%s loads through loadPersonaConfig in strict mode with its bytes unchanged, no load-time message and no stored-choice file',
     (_file, fixture) => {
       const { home, stateDir } = makeRig()
       const configPath = join(stateDir, 'config.json')
@@ -442,11 +442,11 @@ async function startFixture(h: ReloadHarness, fixture: UpgradeFixture): Promise<
 /**
  * The facts every step leaves: `config.json` holds `bytes`,
  * the last-applied record is a byte copy of them, the configuration the
- * server runs is in declarative mode with no fungible destination, and no
- * stored-choice file exists, at `h.channelDeliveryFile` or by its name
+ * server runs is in strict mode with an explicit `permission_prompts`
+ * destination, and no stored-choice file exists, at `h.channelDeliveryFile` or by its name
  * anywhere under the harness root.
  */
-function expectDeclarativeAndUnchanged(h: ReloadHarness, run: ReloadRun, bytes: Buffer): void {
+function expectStrictAndUnchanged(h: ReloadHarness, run: ReloadRun, bytes: Buffer): void {
   expect({
     config: h.readConfig()?.equals(bytes),
     record: Buffer.from(parseSharedChannelState(h.readRecord()!, h.paths.lastApplied, { home: h.home })!.sourceBytesBase64, 'base64').equals(bytes),
@@ -468,7 +468,7 @@ function expectDeclarativeAndUnchanged(h: ReloadHarness, run: ReloadRun, bytes: 
 const PROBE_NOTICE = 'a probe notice'
 
 /**
- * Where a persona's notice goes in declarative mode: its `permission_prompts`
+ * Where a persona's notice goes in both modes: its `permission_prompts`
  * channel, or, for `"dm"`, the DM the stub opens with its contact.
  */
 function noticeTargetOf(entry: FixturePersona): string {
@@ -510,15 +510,15 @@ function expectNoLeak(h: ReloadHarness, run: ReloadRun, placed: PlacedFixture, e
   assertNoLeak(h.serverSideFiles(...placed.credentialsFiles))
 }
 
-describe('a 0.11.1 configuration through a reload-harness start stays declarative', () => {
+describe('a 0.11.1 configuration through a reload-harness start stays in strict mode', () => {
   test.each(FIXTURES.map((f) => [f.file, f] as const))(
-    '%s, first start with no record: config.json keeps its bytes, the record is a byte copy, declarative mode, no stored-choice file, and each notice posts to its permission_prompts destination',
+    '%s, first start with no record: config.json keeps its bytes, the record is a byte copy, strict mode, no stored-choice file, and each notice posts to its permission_prompts destination',
     async (_file, fixture) => {
       const h = makeHarness()
       const { run, placed } = await startFixture(h, fixture)
 
       expect(run.outcome.kind).toBe('applied')
-      expectDeclarativeAndUnchanged(h, run, fixture.bytes)
+      expectStrictAndUnchanged(h, run, fixture.bytes)
       expect(run.logsOf(PERSONA_START)).toHaveLength(fixture.input.personas.length)
 
       const personas = fixture.input.personas
@@ -542,14 +542,14 @@ describe('a 0.11.1 configuration through a reload-harness start stays declarativ
       const run = await h.start()
       expect(run.outcome.kind).toBe('applied')
       expect(run.writes).toEqual([])
-      expectDeclarativeAndUnchanged(h, run, fixture.bytes)
+      expectStrictAndUnchanged(h, run, fixture.bytes)
 
       expect(run.startDetection()).toBe(true)
       const cp = run.checkpoint()
       await run.ticks.ticks(3)
       expect(run.since(cp)).toEqual({ ...NO_RUN_ACTIVITY, writes: [h.lastAppliedWrite()] })
       expect(h.pendingExists()).toBe(false)
-      expectDeclarativeAndUnchanged(h, run, fixture.bytes)
+      expectStrictAndUnchanged(h, run, fixture.bytes)
       expect(run.slackPosts()).toEqual([])
       expectNoTerms(run, PERSONA_START)
       expectNoLeak(h, run, first.placed)
@@ -616,7 +616,7 @@ const NO_COUNTS: ChangePlanCounts = { added: 0, removed: 0, destructive: 0, inPl
 
 describe("a 0.11.1-style edit is previewed and confirmed as in 0.11.1 (switch-absent half)", () => {
   test.each(FIXTURES.flatMap((f) => EDITS.map((e) => [f.file, e.edit, f, e] as const)))(
-    '%s, %s: the preview is the header and the in-place line, with no recorded line, no switch line and no term; the confirmation updates that persona in place, records the edited bytes and stays declarative',
+    '%s, %s: the preview is the header and the in-place line, with no recorded line, no switch line and no term; the confirmation updates that persona in place, records the edited bytes and stays in strict mode',
     async (_file, _edit, fixture, edit) => {
       const h = makeHarness()
       const { run, placed } = await startWithSessions(h, fixture)
@@ -648,7 +648,7 @@ describe("a 0.11.1-style edit is previewed and confirmed as in 0.11.1 (switch-ab
       await run.ticks.tick()
       expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
       expect(run.since(atConfirm).lifecycle).toEqual([{ op: 'update-in-place', key: h.key(name), via: 'apply', settings: edit.settings }])
-      expectDeclarativeAndUnchanged(h, run, editedBytes)
+      expectStrictAndUnchanged(h, run, editedBytes)
       expect(h.pendingExists()).toBe(false)
 
       // The edit's effect: the probe reaches only the changed persona, as its edited entry says.
@@ -849,7 +849,7 @@ async function openListingClient(run: ReloadRun, name: string): Promise<Client> 
   return client
 }
 
-describe('a 0.11.1 configuration retains its choices under current membership eligibility (; current )', () => {
+describe('a 0.11.1 configuration retains its choices under current membership eligibility', () => {
   test.each(FIXTURES.map((f) => [f.file, f] as const))(
     '%s: current members deliver by their entries; proven absence drops each event, while unresolved membership holds intake',
     async (_file, fixture) => {
@@ -861,7 +861,7 @@ describe('a 0.11.1 configuration retains its choices under current membership el
       for (const [sample] of samples) outcomes.push(await deliverSample(run, fixture, sample))
 
       expect(outcomes).toEqual(samples.map(([sample, expected]) => ({ event: sample.event, ...expected })))
-      expectDeclarativeAndUnchanged(h, run, fixture.bytes)
+      expectStrictAndUnchanged(h, run, fixture.bytes)
       // Proved absence is a drop; lost current evidence is a hold, not a
       // legacy unclaimed-channel diagnostic or an acknowledgement of loss.
       const name = channelPersonas(fixture)[0]!.name, key = h.key(name), channel = listed(fixture, name, 0)
@@ -880,10 +880,9 @@ describe('a 0.11.1 configuration retains its choices under current membership el
   )
 })
 
-import { deliveryAttempt } from './test-helpers/shared-channels.ts'
 describe('set_channel_delivery is listed and refused, and the instructions are MCP_INSTRUCTIONS', () => {
   test.each(FIXTURES.map((f) => [f.file, f] as const))(
-    '%s: every channel persona lists the tool, gets the declarative refusal for one of its channels at all, and receives MCP_INSTRUCTIONS',
+    '%s: every channel persona lists the tool, gets the strict-mode refusal for one of its channels at all, and receives MCP_INSTRUCTIONS',
     async (_file, fixture) => {
       const h = makeHarness()
       const { run, placed } = await startWithSessions(h, fixture)
@@ -909,7 +908,7 @@ describe('set_channel_delivery is listed and refused, and the instructions are M
       }
 
       expect(seen).toEqual(expected)
-      expectDeclarativeAndUnchanged(h, run, fixture.bytes)
+      expectStrictAndUnchanged(h, run, fixture.bytes)
       expectNoTerms(run, PERSONA_START)
       expectNoLeak(h, run, placed, { seen })
     },

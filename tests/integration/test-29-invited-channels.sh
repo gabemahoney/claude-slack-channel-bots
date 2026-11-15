@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test 29: declarative and fungible channel
+# Test 29: strict and open channel
 # modes, end to end against the loopback Slack stub, outside dry run.
 #
 # A shared-mode scenario (no `-fmk-` in its name; lib/scenario.sh "Two
@@ -31,14 +31,14 @@
 # - A, a 0.11.x configuration (the upgrade path): neither key of this
 #   work; config.json equals its copy and the authority's reviewed input;
 #   discovery adds strict `off` entries to the applied view, never a legacy
-#   store; no server.log line names the switch's key, fungible
-#   mode or a class this work adds. alpha A1 plain is delivered `receive_all`
+#   store; no server.log line names the switch's key, complete open-mode
+#   switch line or a class this work adds. alpha A1 plain is delivered `receive_all`
 #   (the first-delivery control); U1 is discovered and drops as `off`;
 #   U0, absent from both inventories and configurations, one mention as both its
 #   events, logs exactly two `channel-ineligible` drops after completed
 #   inventories establish absence (drops store no dedupe fact); A2 plain is a
 #   `not-mentioned` drop; A2 and B1 mentions are delivered `mention`; the
-#   tool is refused with the declarative text (the first-tool-result control),
+#   tool is refused with the strict text (the first-tool-result control),
 #   and nothing is written.
 # - Threads in strict mode: off/mentions/all leave no Thread Memory; a
 #   reviewed configuration enables alpha's T1 and the three value controls.
@@ -48,11 +48,12 @@
 #   the pending file carries the switch's line; its confirmation applies it
 #   with both sessions kept (no registration or launch line, read after a
 #   delivery on each persona's connection, in phase B).
-# - B, fungible mode (steps 1 to 11): the fungible path, both orders
+# - B, open mode (steps 1 to 11): the open path, both orders
 #   of a mention's two events, a broadcast, a private channel, the externally
-#   shared, missing and non-boolean flags, a group DM, alpha's own fungible
-#   destination, then set_channel_delivery: stored, refused, applied as written
-#   in another persona's destination, and shared delivery, exactly once to each persona.
+#   shared, missing and non-boolean flags, a group DM, alpha's explicit
+#   permission_prompts destination (the same in both modes), then
+#   set_channel_delivery: stored, refused, applied as written in another
+#   persona's destination, and shared delivery, exactly once to each persona.
 # - Threads in open mode: alpha's strict join and stamp survive the switch;
 #   bravo's ordinary channels have no stamp or joins. Tool assignments
 #   enable bravo's threads; both mentioned personas join on their connections.
@@ -69,7 +70,7 @@
 #   Both personas' joined threads and Channel Stamps survive too.
 #   Pending intent stays unapplied until refreshed and confirmed afterward;
 #   the complete inventory retains every member and excludes observed leaves.
-# - Switch off: declarative mode again, sessions kept (read after
+# - Switch off: strict mode again, sessions kept (read after
 #   a delivery on each persona's connection), shared choices still applied
 #   and new tool assignments refused.
 #   Joined replies still arrive; a fresh two-persona mention joins in strict.
@@ -101,8 +102,8 @@
 # on the same connection, never after a quiet period. Every push has its own
 # `ts`, but the two events of one mention and the one message pushed to both
 # personas.
-# Earlier complete coverage was about 284 s. This expanded scenario's duration
-# is unmeasured until parent /ci; its many confirmed reviews add reload ticks.
+# This expanded scenario measured 1,057 seconds on the reviewed baseline;
+# its many confirmed reviews add reload ticks.
 #
 # Texts. Every text src/ exports comes from fixtures/fmk-texts.ts (the one
 # value printer), run in this shell. Texts src/ does not export are fragments,
@@ -930,7 +931,7 @@ start_matrix() {
     local before="${SCENARIO_ROOT}/strict-tool-authority" value
     cp -- "${LAST}" "${before}"
     for value in off mentions all thread_hybrid; do
-        expect_tool "strict refuses ${value}" "${ALPHA_DIR}" "$(attempt_args "strict-${value}" "${WRITE_CHANNEL}" "${value}")" true "${ALPHA_DECLARATIVE_REFUSAL}"
+        expect_tool "strict refuses ${value}" "${ALPHA_DIR}" "$(attempt_args "strict-${value}" "${WRITE_CHANNEL}" "${value}")" true "${ALPHA_STRICT_REFUSAL}"
     done
     configuration_application_preserved "${CONFIG}" "${before}" "${LAST}" > /dev/null
 }
@@ -1709,11 +1710,12 @@ slack_stub_inventory_page "${ALPHA_LABEL}" '' '' "${ALPHA_MEMBERS[@]}"
 slack_stub_inventory_page "${BRAVO_LABEL}" '' '' "${BRAVO_MEMBERS[@]}"
 
 # --- Configurations --------------------------------------------------------
-# write_persona_config <declarative|fungible|switch-off>:
-# - declarative: the 0.11.x shape of the contract (neither key of this work);
-# - fungible: open mode plus explicit mentions/all choices for discovered
-# channels; alpha's permission destination remains A1 ;
-# - switch-off: the same reviewed choices with strict mode.
+# write_persona_config <strict-upgrade|open|switch-off>:
+# - strict-upgrade: the 0.11.x shape of the contract (neither key of this work);
+# - open: open mode plus explicit mentions/all choices for discovered
+# channels; alpha's explicit permission_prompts destination remains A1;
+# - switch-off: the same reviewed choices with explicit strict mode.
+# permission_prompts is explicit and unchanged across all three shapes.
 # Every shape turns Slack reply reminders off for both personas
 # (stop_hook_bootstrap): a reminder nudge is a delivery, and in manual
 # receipt mode it would take a receipt release meant for a real item.
@@ -1724,8 +1726,8 @@ write_persona_config() {
         at=thread_hybrid an1=thread_hybrid an2=thread_hybrid an3=thread_hybrid
     fi
     case "$1" in
-        declarative) ;;
-        fungible|switch-off)
+        strict-upgrade) ;;
+        open|switch-off)
             local mode='open'
             [[ "$1" == 'switch-off' ]] && mode='strict'
             switch=$'\n  "'"${SWITCH_KEY}"'": "'"${mode}"'",'
@@ -1787,7 +1789,7 @@ EOF
 
 # --- Start --------------------------------------------
 ALPHA_THREADS=false
-write_persona_config declarative
+write_persona_config strict-upgrade
 shared_stub_permission_setup "${ALPHA_DIR}" > /dev/null
 shared_stub_permission_setup "${BRAVO_DIR}" > /dev/null
 RECEIPT_MODE["${ALPHA_KEY}"]=manual
@@ -1823,8 +1825,8 @@ UNCLAIMED_CHANNEL="$(printed UNCLAIMED_CHANNEL)"
 PERSONA_OPEN_CHANNEL="$(printed PERSONA_OPEN_CHANNEL)"
 PERSONA_CHANNEL_DELIVERY_SET="$(printed PERSONA_CHANNEL_DELIVERY_SET)"
 SWITCH_KEY="$(printed MODE_SWITCH_SETTING)"
-FUNGIBLE="$(printed channelModeOf open)"
-DECLARATIVE="$(printed channelModeOf strict)"
+OPEN_MODE="$(printed channelModeOf open)"
+STRICT_MODE="$(printed channelModeOf strict)"
 STORE_FILE="${SLACK_STATE_DIR}/$(printed CHANNEL_DELIVERY_FILE_NAME)"
 SET_TOOL="$(printed SET_CHANNEL_DELIVERY_TOOL)"
 APPLIED_CLASS="[slack] $(printed RELOAD_APPLIED):"
@@ -1832,8 +1834,8 @@ SUPERSEDED_OUTCOME="$(printed reviewOutcomeLine superseded)"
 STALE_CONFIRMATION_CLASS="$(printed RELOAD_STALE_CONFIRMATION)"
 STALE_CONFIRMATION="$(matcher "[slack] ${STALE_CONFIRMATION_CLASS}:" "\"${APPLY}\"")"
 NO_CHOICE="$(printed NO_STORED_CHOICE)"
-SWITCH_ON_LINE="$(printed modeSwitchLine "${FUNGIBLE}" "${ALPHA}" "${BRAVO}")"
-SWITCH_OFF_LINE="$(printed modeSwitchLine "${DECLARATIVE}" "${ALPHA}" "${BRAVO}")"
+SWITCH_ON_LINE="$(printed modeSwitchLine "${OPEN_MODE}" "${ALPHA}" "${BRAVO}")"
+SWITCH_OFF_LINE="$(printed modeSwitchLine "${STRICT_MODE}" "${ALPHA}" "${BRAVO}")"
 REASON_EXTERNALLY_SHARED="$(printed UNCLAIMED_REASON_EXTERNALLY_SHARED)"
 REASON_FLAG_MISSING="$(printed UNCLAIMED_REASON_FLAG_MISSING)"
 REASON_FLAG_NOT_BOOLEAN="$(printed UNCLAIMED_REASON_FLAG_NOT_BOOLEAN)"
@@ -1871,7 +1873,7 @@ ALPHA_OPEN_LINE="$(persona_line "${PERSONA_OPEN_CHANNEL}" alpha "${OPEN_MARKER}"
 [[ "${ALPHA_OPEN_LINE}" == *"${OPEN_MARKER}" && -n "${ALPHA_OPEN_LINE%"${OPEN_MARKER}"}" ]] \
     || fail "fmk-texts: formatPersonaDiagnostic does not end in its cause after a head"
 ALPHA_OPEN_HEAD="${ALPHA_OPEN_LINE%"${OPEN_MARKER}"}"
-ALPHA_DECLARATIVE_REFUSAL="$(printed channelDeliveryDeclarativeRefusal "${ALPHA}" "${ALPHA_KEY}")"
+ALPHA_STRICT_REFUSAL="$(printed channelDeliveryDeclarativeRefusal "${ALPHA}" "${ALPHA_KEY}")"
 BAD_DELIVERY='everything'
 ALPHA_VALUE_REFUSAL="$(printed channelDeliveryValueRefusal "${ALPHA}" "${ALPHA_KEY}" "${BAD_DELIVERY}")"
 [[ "${ALPHA_VALUE_REFUSAL}" == *"\"${BAD_DELIVERY}\""* ]] || fail "fmk-texts: the value refusal does not name ${BAD_DELIVERY}"
@@ -1932,7 +1934,7 @@ check_upgrade_log() {
     for term in "${SWITCH_KEY}" "${SWITCH_ON_LINE}" "${PERSONA_OPEN_CHANNEL}" "${PERSONA_CHANNEL_DELIVERY_SET}" \
         ; do
         [[ -n "${term}" ]] || fail "$1: an empty term from the printer"
-        [[ "$(count_server_log "${term}")" == 0 ]] || fail "$1: server.log names '${term}' in declarative mode"
+        [[ "$(count_server_log "${term}")" == 0 ]] || fail "$1: server.log names '${term}' in strict mode"
     done
 }
 
@@ -2016,7 +2018,7 @@ expect_queued "phase A: alpha A1 plain" 1 "${ALPHA_DIR}" "${A1}" "${A_A1_TS}"
 push_message "${BRAVO_LABEL}" "${B1}" channel "$(mention_text "${BRAVO_BOT_USER}")"
 wait_queued "phase A: bravo B1 mention" "${BRAVO_DIR}" "${B1}" "${PUSH_TS}" "${VIA_MENTION}"
 
-# alpha calls the tool for A1 with `all`: refused with the declarative text,
+# alpha calls the tool for A1 with `all`: refused with the strict text,
 # found in the results record with isError set (the first-tool-result
 # control); nothing written.
 SCHEMA_RESULT="$(stub_session_list_tools "${ALPHA_DIR}")"
@@ -2025,13 +2027,13 @@ jq -e '.text | fromjson | .[] | select(.name == "set_channel_delivery") | .input
     .required == ["channel","delivery","attempt_id","intent"] and .additionalProperties == false and
     .properties.intent.enum == ["assignment","retry"] and .properties.delivery.enum == ["off","mentions","all","thread_hybrid"]' <<< "${SCHEMA_RESULT}" > /dev/null || fail "negotiated attempt schema differs"
 expect_tool "phase A: alpha's set_channel_delivery A1 all" "${ALPHA_DIR}" \
-    "$(attempt_args "${TEST_NAME}-strict-initial" "${A1}" all)" true "${ALPHA_DECLARATIVE_REFUSAL}"
+    "$(attempt_args "${TEST_NAME}-strict-initial" "${A1}" all)" true "${ALPHA_STRICT_REFUSAL}"
 [[ ! -e "${SLACK_STATE_DIR}/channel-delivery.json" ]] || fail "phase A: the refused call created a legacy store"
 cmp -s -- "${CONFIG}" "${CONFIG_A_COPY}" || fail "phase A: config.json changed after the refused call"
 check_upgrade_log "phase A after its last control"
 
 # --- The mode switch -----------------------------------
-# confirm_switch <fungible|switch-off> <switch-line> <step>: note each
+# confirm_switch <open|switch-off> <switch-line> <step>: note each
 # persona's registration and launch lines (launch_counts), write the
 # configuration of that shape, wait for the pending file to carry the
 # switch's line, confirm it and wait for its applied line; config.json's
@@ -2049,7 +2051,7 @@ confirm_switch() {
     local authority_before="${SCENARIO_ROOT}/authority-before-${shape}.json"
     cp -- "${LAST}" "${authority_before}"
     write_persona_config "${shape}"
-    if [[ "${shape}" == fungible ]]; then
+    if [[ "${shape}" == open ]]; then
         configuration_request "mode-${shape}" request "${ALPHA}/${F1}/mentions" "${ALPHA}/${U1}/all" \
             "${BRAVO}/${F1}/mentions" "${BRAVO}/${F2}/mentions" "${BRAVO}/${A1}/mentions" "${BRAVO}/${U1}/all" > /dev/null
     else
@@ -2089,7 +2091,7 @@ other_value_threads "strict: other values" "${ALPHA_LABEL}" "${VIA_RECEIVE_ALL_S
 # no-file/no-marker proof above runs before either persona has a hybrid entry.
 ALPHA_THREADS=true
 threads_applied_before="$(count_log "${APPLIED_CLASS}")"
-write_persona_config declarative
+write_persona_config strict-upgrade
 configuration_request threads-strict request "${ALPHA}/${T1}/thread_hybrid" \
     "${ALPHA}/${N1}/thread_hybrid" "${ALPHA}/${N2}/thread_hybrid" "${ALPHA}/${N3}/thread_hybrid" > /dev/null
 wait_for_file "${PENDING}" "${TICK_WAIT_S}" "strict threads: no pending review"
@@ -2112,11 +2114,11 @@ permission_phase strict alpha
 freeze_four_values
 
 # --- Switch on ---------------------------------------------------
-confirm_switch fungible "${SWITCH_ON_LINE}" "switch on"
+confirm_switch open "${SWITCH_ON_LINE}" "switch on"
 preserved_four_values strict-to-open
 check_thread_persistence "strict to open" "${ALPHA_LABEL}" "${JOINED_ROOTS[strict]}"
 
-# --- Phase B: fungible mode --------------------------------------
+# --- Phase B: open mode --------------------------------------
 # 1. alpha, public F1 (flag false), plain: no delivery, a not-mentioned line,
 #    one persona-open-channel line (alpha, F1, public, mentions).
 B1_MARK="$(log_mark)"
@@ -2434,10 +2436,10 @@ wait_queued "switch off: bravo B1 mention" "${BRAVO_DIR}" "${B1}" "${OFF_B1_TS}"
 # Both sessions kept, read after the two deliveries above.
 expect_sessions_kept "switch off" "${A1}" "${OFF_A1_TS}" "${B1}" "${OFF_B1_TS}"
 
-# alpha's call for F1: refused with the declarative text; the file unchanged.
+# alpha's call for F1: refused with the strict text; the file unchanged.
 cp -- "${STORE_FILE}" "${STORE_BEFORE_OFF}"
 expect_attempt "switch off: retained history remains readable" "${ALPHA_DIR}" "${F1_RETRY_ARGS}" "${ALPHA_KEY}" all history
-expect_tool "switch off: alpha's set_channel_delivery F1 all" "${ALPHA_DIR}" "${STRICT_FRESH_ARGS}" true "${ALPHA_DECLARATIVE_REFUSAL}"
+expect_tool "switch off: alpha's set_channel_delivery F1 all" "${ALPHA_DIR}" "${STRICT_FRESH_ARGS}" true "${ALPHA_STRICT_REFUSAL}"
 configuration_application_preserved "${CONFIG}" "${STORE_BEFORE_OFF}" "${STORE_FILE}" > /dev/null \
     || fail 'switch off: refused calls changed the applied authority'
 check_thread_persistence "open to strict: original strict join" "${ALPHA_LABEL}" "${JOINED_ROOTS[strict]}"

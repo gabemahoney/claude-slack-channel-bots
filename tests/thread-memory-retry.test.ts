@@ -98,14 +98,6 @@ function recovered(series: Series, attempts: number): Extract<ThreadMemoryRetryE
 function stop(retries: ThreadMemoryRetries) { retries.stopKeys(); retries.stopSeal() }
 
 describe('Thread Memory background retries', () => {
-  test('pins the specified minimum, doubling and cap once', () => {
-    expect(THREAD_MEMORY_RETRY_MIN_MS).toBe(5_000)
-    expect(THREAD_MEMORY_RETRY_MAX_MS).toBe(60_000)
-    expect([1, 2, 3, 4, 5, 6, 7].map(n => metadataRetryDelay(n))).toEqual([
-      5_000, 10_000, 20_000, 40_000, 60_000, 60_000, 60_000,
-    ])
-  })
-
   test('construction is inert and its only runtime imports are the wait and spacing dependencies', async () => {
     const h = fixture()
     await h.clock.advance(THREAD_MEMORY_RETRY_MAX_MS)

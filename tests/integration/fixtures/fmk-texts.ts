@@ -509,13 +509,13 @@
  * <after> and <before> one of src/config.ts DELIVERY_MODES (<before> may also
  * be NO_STORED_CHOICE, below), <name> a persona name and <key> its key:
  *   UNCLAIMED_CHANNEL                            src/persona-diagnostics.ts, the class label
- *   unclaimedChannelCause <channel>              src/persona-diagnostics.ts: the declarative-mode
+ *   unclaimedChannelCause <channel>              src/persona-diagnostics.ts: the strict-mode
  *                                                `unclaimed-channel` cause (0.11.1's)
- *   UNCLAIMED_REASON_EXTERNALLY_SHARED           src/persona-diagnostics.ts, the fungible-mode
+ *   UNCLAIMED_REASON_EXTERNALLY_SHARED           src/persona-diagnostics.ts, the open-mode
  *   UNCLAIMED_REASON_FLAG_MISSING                `unclaimed-channel` reasons test-29 meets, each
  *   UNCLAIMED_REASON_FLAG_NOT_BOOLEAN            printed as it is
  *   fungibleUnclaimedChannelCause <channel> <refusal>
- *                                                src/persona-diagnostics.ts: the fungible-mode
+ *                                                src/persona-diagnostics.ts: the open-mode
  *                                                `unclaimed-channel` cause, <refusal> one of
  *                                                src/delivery-decision.ts FUNGIBLE_REFUSALS
  *   PERSONA_OPEN_CHANNEL                         src/persona-diagnostics.ts, the class label
@@ -544,13 +544,13 @@
  *   channelDeliveryChannelRefusal <name> <key> <channel>
  *   channelDeliveryValueRefusal <name> <key> <value>
  *                                                src/registry.ts: the tool's refusals in
- *                                                declarative mode, for a channel not known, and
+ *                                                strict mode, for a channel not known, and
  *                                                for a delivery value it does not take
  *   modeSwitchLine <mode> [<persona-name>…]      src/reload-plan.ts: the switch's preview line
  *                                                turning <mode> (one of src/config.ts
  *                                                CHANNEL_MODES) on, for the personas named, in
  *                                                order, each keyed by the package's personaKey
- *   channelModeOf <true|false>                   src/config.ts: the name of the mode the switch's
+ *   channelModeOf <strict|open>                  src/config.ts: the name of the mode the switch's
  *                                                value picks, keyed by MODE_SWITCH_SETTING
  *   formatPersonaDiagnostic <class> <index> <name> <key> <cause>
  *                                                src/persona-diagnostics.ts: a persona line with
@@ -4184,7 +4184,7 @@ function fnEntries(table: Readonly<Record<string, FnEntry>>): Record<string, Ent
 // config.ts.
 // ---------------------------------------------------------------------------
 
-/** persona-diagnostics.ts's fungible-mode `unclaimed-channel` reasons test-29 meets, each printed as it is. */
+/** persona-diagnostics.ts's open-mode `unclaimed-channel` reasons test-29 meets, each printed as it is. */
 const UNCLAIMED_REASON_NAMES: readonly string[] = [
   'UNCLAIMED_REASON_EXTERNALLY_SHARED',
   'UNCLAIMED_REASON_FLAG_MISSING',
@@ -4207,7 +4207,7 @@ async function checkDeliveryArgument(context: EntryContext, entry: string, name:
 }
 
 /**
- * `channelModeOf({ <MODE_SWITCH_SETTING>: <true|false> })` (config.ts): the
+ * `channelModeOf({ <MODE_SWITCH_SETTING>: <strict|open> })` (config.ts): the
  * name of the mode the switch's value picks, the switch keyed by the
  * package's MODE_SWITCH_SETTING (reload-plan.ts).
  */
@@ -5850,7 +5850,7 @@ const freshStartLine: Entry = {
 /** The changes a reaction event names, as a Reaction Notice's `reaction` attribute carries them. */
 const REACTION_CHANGES: readonly string[] = ['added', 'removed']
 
-/** The withdrawal reasons and fungible conditions a queue's withdrawn record names (src/delivery-queue.ts's types; the package exports no list). */
+/** The withdrawal reasons and open-mode conditions a queue's withdrawn record names (src/delivery-queue.ts's types; the package exports no list). */
 const REACTION_WITHDRAWAL_REASONS: readonly string[] = ['server-post', 'conversation-unknown', 'group-dm', 'open-refused']
 const REACTION_FUNGIBLE_CONDITIONS: readonly string[] = ['not-a-channel', 'externally-shared', 'not_in_channel', 'channel_not_found']
 

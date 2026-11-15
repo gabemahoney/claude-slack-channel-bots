@@ -69,6 +69,8 @@ export interface OwnPostHarnessOptions {
   choices?: ReturnType<typeof createChannelDeliveryStore>
   queue?: Awaited<ReturnType<typeof makeQueue>>
   membership?: Parameters<typeof makeMembershipHarness>[1]
+  /** Configure Slack's external seam before helper-owned membership authenticates. */
+  prepareMembership?: (members: MembershipHarness) => void
   memory?: Omit<ThreadHarnessOptions, 'authority' | 'clock' | 'seal' | 'queueOptions'>
   operationId?: () => string
   isDryRun?: () => boolean
@@ -76,6 +78,8 @@ export interface OwnPostHarnessOptions {
   lookups?: boolean
   /** False leaves memory and helper-owned membership for start() to initialize. */
   start?: boolean
+  /** False lets a case explicitly publish to the owner at its controlled boundary. */
+  publishSharedState?: boolean
 }
 
 type LookupDeps = Parameters<typeof createOwnPostLookups>[0]
@@ -112,6 +116,7 @@ async function buildOwnPostHarness(stateDir: string, options: OwnPostHarnessOpti
   const members = options.members ?? makeMembershipHarness(stateDir, {
     mode: 'strict', channels: [{ id: SHARED_CHANNEL_IDS.primary, delivery: 'thread_hybrid' }], ...options.membership,
   })
+  options.prepareMembership?.(members)
   const threads = makeThreadMemoryHarness(stateDir, { ...options.memory, authority: members.authority, clock: members.h.clock })
   const queue = options.queue ?? await makeQueue(stateDir, { now: threads.clock.now,
     setInterval: (() => ({ unref() {} })) as unknown as typeof setInterval,
@@ -124,26 +129,41 @@ async function buildOwnPostHarness(stateDir: string, options: OwnPostHarnessOpti
   }
   let dryRun = options.memory?.dryRun ?? false
   const isDryRun = options.isDryRun ?? (() => dryRun)
-  const owner = createOwnPostJoins({ memory: threads.memory, lookupSlackKey: queue.lookupSlackKey,
+  // Capture reads before later settlement, retention release or forgetting can erase them.
+  const returned: unknown[] = []
+  const capture = <T>(value: T): T => { returned.push(structuredClone(value)); return value }
+  const memory = { ...threads.memory,
+    unresolvedIntents: (...args: Parameters<typeof threads.memory.unresolvedIntents>) => capture(threads.memory.unresolvedIntents(...args)),
+  }
+  const rawOwner = createOwnPostJoins({ memory: threads.memory, lookupSlackKey: queue.lookupSlackKey,
     choice: ownPostChoice(sources), eligibility: ownPostEligibility(sources), now: threads.clock.now,
     operationId: options.operationId ?? (() => crypto.randomUUID()), isDryRun })
+  const owner = { ...rawOwner,
+    pendingOwnPosts: (...args: Parameters<typeof rawOwner.pendingOwnPosts>) => capture(rawOwner.pendingOwnPosts(...args)),
+    unknownOwnPosts: (...args: Parameters<typeof rawOwner.unknownOwnPosts>) => capture(rawOwner.unknownOwnPosts(...args)),
+    operation: (...args: Parameters<typeof rawOwner.operation>) => capture(rawOwner.operation(...args)),
+    awaitingUploads: (...args: Parameters<typeof rawOwner.awaitingUploads>) => capture(rawOwner.awaitingUploads(...args)),
+    memoryOnlyJoins: (...args: Parameters<typeof rawOwner.memoryOnlyJoins>) => capture(rawOwner.memoryOnlyJoins(...args)),
+    resolvedThreads: (...args: Parameters<typeof rawOwner.resolvedThreads>) => capture(rawOwner.resolvedThreads(...args)),
+  }
   const observer = createOwnPostObserver(() => owner), events: OwnPostEvent[] = []
   owner.subscribe(event => { events.push(event) })
   const lookups = options.lookups && !isDryRun()
     ? buildOwnPostLookups({ owner, memory: threads.memory, clock: threads.clock }, members, key => sources.persona(key) !== undefined)
     : undefined
-  const unsubscribe = members.authority.subscribeThreadView(() => {
+  const unsubscribe = options.publishSharedState === false ? () => {} : members.authority.subscribeThreadView(() => {
     for (const persona of members.authority.config().personas) {
       owner.onSharedStatePublished(persona.key)
       lookups?.runner.kick(persona.key)
     }
   })
-  // Keep snapshots so later settlement/forgetting cannot erase output evidence.
-  const returned: unknown[] = []
-  const capture = <T>(value: T): T => { returned.push(structuredClone(value)); return value }
   const read = {
-    pendingOwnPosts: (...args: Parameters<typeof owner.pendingOwnPosts>) => capture(owner.pendingOwnPosts(...args)),
-    operation: (...args: Parameters<typeof owner.operation>) => capture(owner.operation(...args)),
+    pendingOwnPosts: owner.pendingOwnPosts,
+    unknownOwnPosts: owner.unknownOwnPosts,
+    operation: owner.operation,
+    awaitingUploads: owner.awaitingUploads,
+    memoryOnlyJoins: owner.memoryOnlyJoins,
+    resolvedThreads: owner.resolvedThreads,
     subscribe: owner.subscribe,
   }
   const captured = () => ({ membership: members.captured(), sharedWrites: members.writes, events, returned,
@@ -182,7 +202,7 @@ async function buildOwnPostHarness(stateDir: string, options: OwnPostHarnessOpti
     try { await start() } catch (error) { await close(); throw error }
   }
   return {
-    stateDir, threads, memory: threads.memory, io: threads.io, clock: threads.clock,
+    stateDir, threads, memory, io: threads.io, clock: threads.clock,
     authority: members.authority, members, choices, sources, queue, owner, observer, read, events, lookups,
     start, close, captured, flush: threads.clock.flush,
     dryRun(value: boolean) { dryRun = value },

@@ -295,7 +295,7 @@ tests/
                                    #, live against the Slack stub: every hook `command` path of an agent-director-launched persona is an absolute path to an existing executable
                                    # (agent-director's exec-form `command` read verbatim, CSCB's shell-form Stop hook by its first word); agent-director's run the user's agent-director install,
                                    # the reply guard runs the installed package's script
-    test-0-fmk-harness-self-check.sh # Isolated harness, typed fault/receipt controls, AD state progression and no production pane parsing
+    test-0-fmk-harness-self-check.sh # Isolated harness, multi-file completion response, typed fault/receipt controls, AD state progression and no production pane parsing
     test-13-fmk-switch-over.sh # legs A, B and C, fmk mode on agent-director 0.10.0: fmk scenario 1, the switch-over. From a
                                    # pre-persona 0.10.0 fleet (the published CSCB 0.10.0 on agent-director's 0.10.0 client, two channels seeded by
                                    # `seed_prepersona_fleet`, no server started), it follows the maintained switch-over runbook, steps 1 to 11 once each, read from the
@@ -2152,7 +2152,7 @@ passes alone do not establish runtime behavior.
 
 #### Shared-channel and Thread Memory helpers
 
-`lib/scenario.sh` fences production-state readers and request publication to scenario scratch with `require_scenario_state [step]`. These helpers read committed evidence or submit the normal operator request; none repairs a running authority. The following argument lists are positional; `key` is a persona key, `label` a stub token label, and optional arguments use brackets. Tests 29 and 31 compose delivery/own-post cases; Tests 40 and 44–48 share the queue, recovery and population evidence adapters. Direct users are visible beside each call in `tests/integration/`; wrappers retain the same evidence contracts.
+`lib/scenario.sh` fences production-state readers and request publication to scenario scratch with `require_scenario_state [step]`. These helpers read committed evidence or submit the normal operator request; none repairs a running authority. The following argument lists are positional; `key` is a persona key, `label` a stub token label, and optional arguments use brackets. Tests 29 and 31 compose delivery/own-post cases; Tests 40 and 44–48 share the queue, recovery and population evidence adapters. Direct users are visible beside each call in `tests/integration/`; wrappers retain the same evidence contracts. Unit own-post suites, including `tests/own-post.test.ts`, use `makeOwnPostHarness` for real composition, captured reads, controlled publication and startup/replay with caller-owned membership/queue boundaries; its options and snapshot surfaces are documented once in [Factory Functions](../docs/testing-guide.md#factory-functions).
 
 | Helper and arguments | Result or action |
 |---|---|
@@ -2223,7 +2223,7 @@ The stub controls below are used by these scenarios and by the real-thread and p
 
 `lib/real-scenario.sh` supplies Test 32’s `real_thread_personas strict-or-open` (two personas, 100,000 joined threads), `real_seed_threads` (before start), `real_thread_workload` (root plus 20 prepared samples), `real_thread_root`, `real_thread_reply n`, `real_thread_writer_start`, `real_thread_concurrent_work n` and `real_thread_membership_write n`. Open-mode writes run through beta’s MCP session; strict-mode writes are beta’s live leave/rejoin events and wait for their own durable event application and settled rescan. `real_thread_now_ms` is monotonic; `real_thread_epoch_ms` shares queue wall time. `real_assert_thread_latency` judges the thread samples, including delayed and hung names, through sr8-evidence.ts. `real_report [arguments…]` captures native usage/receipt evidence, `real_finish` runs the closing safety assertions, and `real_drop_mcp` calls the enabled test endpoint. These helpers make no host agent or Slack calls.
 
-`tests/test-helpers/thread-populations.ts` defines deterministic populations, channel cycles and independently expected burst identities; `tests/integration/fixtures/sr8-evidence.ts` exposes their image commands and verdicts. Unit fixtures select named `SHARED_CHANNEL_IDS` or explicit `channelPopulation(count, offset?)` inputs, and use production membership writers with shared event/time inputs; their canonical contracts are in [Operator review fixtures and diagnostics](../docs/testing-guide.md#operator-review-fixtures-and-diagnostics) and [Membership fixtures and evidence](../docs/testing-guide.md#membership-fixtures-and-evidence). These unit helpers do not make scenario/image commands host entry points.
+`tests/test-helpers/thread-populations.ts` defines deterministic populations, channel cycles and independently expected burst identities; `tests/integration/fixtures/sr8-evidence.ts` exposes their image commands and verdicts. The source audit permits only `tests/test-helpers/thread-memory.ts`, `tests/test-helpers/shared-channels.ts` and `tests/integration/fixtures/sr8-evidence.ts` to load the src-free population module; unit suites and shell scripts never load it directly. Unit fixtures select named `SHARED_CHANNEL_IDS` or explicit `channelPopulation(count, offset?)` inputs (delegating to the single `populationChannels` builder, preserving count, zero default offset, padded IDs, order/shape and delivery-cycle phase relative to local `i`), and use production membership writers with shared event/time inputs; their canonical contracts are in [Operator review fixtures and diagnostics](../docs/testing-guide.md#operator-review-fixtures-and-diagnostics) and [Membership fixtures and evidence](../docs/testing-guide.md#membership-fixtures-and-evidence). These unit helpers do not make scenario/image commands host entry points.
 
 `tests/test-helpers/shared-channel-upgrade.ts` provides `writeUpgradeFixtures`, `materializeUpgradeCase` and `runUpgradeCaseCommand`; `bun tests/test-helpers/shared-channel-upgrade.ts write` regenerates the committed fixture tree and manifest. Each case has `reference-0.18.0/`, `new-baseline/` and `pending-edits/`; manifest.json records variants, expected load/refusal, target paths, modes, times, identity/channel dispositions and pending edits.
 
@@ -3980,7 +3980,14 @@ variable for the integration suite only (see Environment Variables in
   a control `suffix`.
 - It has no `bun test` suite of its own; Test 10 exercises it end to end,
   Tests 29 and 50 exercise its push control end to end (see below), Test 50 its `users`, `channels` and `replies` lookups, Test 0's `slack_stub_record` leg checks the record's text cut and token
-  replacement, and Test 20's whole-text checks exercise its
+  replacement. In that same once-invoked leg, a bounded multi-file
+  `files.completeUploadExternal` request must answer `ok: true` with every
+  distinct requested file ID and exact title in request order; exact answer
+  equality rejects a first-file-only response. The leg restores the API override
+  and scans records and captured output for leaks on success and failure.
+  This is contained Test 0 evidence, separate from the wiring unit probe's real
+  `filesUploadV2` request/forwarding checks and registry reply-files confirmation
+  and ownership checks. Test 20's whole-text checks exercise its
   `chat.postMessage` record.
 
 The push control. `POST /_push` sends one Socket Mode

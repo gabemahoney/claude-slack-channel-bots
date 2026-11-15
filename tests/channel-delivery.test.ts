@@ -1,19 +1,25 @@
 /** The file-free adapter and the durable shared-authority mutation contract. */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, closeSync, fsyncSync, openSync, readdirSync, renameSync, unlinkSync, writeSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { DurableWriteUnsyncedError, durableWriteFileSync } from '../src/atomic-write.ts'
+import { DurableWriteUnsyncedError, durableWriteFileSync, type DurableWriteFs } from '../src/atomic-write.ts'
 import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
-import { createSharedChannelAuthority, parseSharedChannelState, serializeSharedChannelState, type SharedChannelState } from '../src/shared-channels.ts'
+import {
+  createSharedChannelAuthority, parseSharedChannelState, serializeSharedChannelState, type SharedChannelState, applySharedMembership,
+  applySharedMemberships, sharedAppliedConfig, type SharedChannelAuthority, type SharedChannelDeps, type VerifiedSharedMembership,
+} from '../src/shared-channels.ts'
 import { assertNoLeak, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
 import { makePersona, makePersonaConfigInput } from './test-helpers/persona-config.ts'
 import {
-  SHARED_CHANNEL_IDS as C, retainedScanHistory, RETAINED_SCAN_EVENTS, membershipJoin, membershipObservation, applyMembershipPage, membershipTimestamp,
-  _assignFixture, fixtureThreadHybridSince, configBytes, FIXTURE_THREAD_HYBRID_SINCE_PREFIX, initialSharedState, makeSharedAuthority, malformedThreadMemoryMarkers, readSharedState,
-  sharedChannelPath, withThreadMemoryCreated, writeSharedState,
+  SHARED_CHANNEL_IDS as C, retainedScanHistory, RETAINED_SCAN_EVENTS, membershipJoin, membershipObservation, applyMembershipPage,
+  membershipTimestamp, _assignFixture, fixtureThreadHybridSince, configBytes, FIXTURE_THREAD_HYBRID_SINCE_PREFIX, initialSharedState,
+  makeSharedAuthority, malformedThreadMemoryMarkers, readSharedState, sharedChannelPath, withThreadMemoryCreated, writeSharedState,
+  contradictoryBotHistory, deliveryAttempt, malformedBotHistories, makeMembershipHarness, membershipPage, channelPopulation,
 } from './test-helpers/shared-channels.ts'
 import { osTempDir } from './test-helpers/host-safe-env.ts'
+import { botAttemptBinding, botAttemptKey, validChannelDeliveryAttemptId } from '../src/channel-delivery-attempt.ts'
+import { SR8_SHARED_LIST_CHANNELS } from './test-helpers/thread-memory.ts'
 
 let root: string, mint: () => string
 beforeEach(() => { mint = fixtureThreadHybridSince(); root = mkdtempSync(join(tmpdir(), 'shared-authority-')) })
@@ -23,7 +29,7 @@ function input() {
 }
 function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedChannelPath(root)) ? writtenFile(sharedChannelPath(root)) : undefined }) }
 
- describe('one durable authority', () => {
+describe('one durable authority', () => {
   test('adapter reads only applied choices and each of the four values survives reopen', () => {
     const source = input(); source.channel_mode = 'open'
     const authority = makeSharedAuthority(root, source)
@@ -186,7 +192,7 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     expect(store.attempt('alpha', authority.incarnation('alpha')!, request, () => undefined).kind).toBe('applied')
     check(authority.snapshot())
   })
- })
+})
 
 test('replaying a verified leave preserves a later future preference, while a never-joined preference has no leave evidence', () => {
   const authority = makeSharedAuthority(root, input())
@@ -344,7 +350,7 @@ describe('thread fields in the production format', () => {
   })
 })
 
- describe('identity and provenance foundations', () => {
+describe('identity and provenance foundations', () => {
   test('a real-path spelling preserves the life while a changed path retires it and rejects old work', () => {
     const edited = input(); const persona = edited.personas[0]!
     mkdirSync(persona.working_directory, { recursive: true })
@@ -398,7 +404,7 @@ describe('thread fields in the production format', () => {
     expect(() => writeSharedState(dir, initialSharedState(root, input()))).toThrow('owned directory')
     assertNoLeak({ dir })
   })
- })
+})
 
 // The retirement revision, never JSON property order, identifies the latest reviewed source.
 test.each((['strict', 'open'] as const).flatMap(mode =>
@@ -499,7 +505,6 @@ test.each(['missing', 'zero', 'fractional', 'future'] as const)('retirement orde
   check(state)
 })
 
-import { contradictoryBotHistory, deliveryAttempt } from './test-helpers/shared-channels.ts'
 test.each(['rejection-at-assignment', 'colliding-attempts'] as const)('F1: production reader rejects %s rather than trusting contradictory history', shape => {
   const config = input(); config.channel_mode = 'open'
   const authority = makeSharedAuthority(root, config)
@@ -512,9 +517,6 @@ test.each(['rejection-at-assignment', 'colliding-attempts'] as const)('F1: produ
   check(bytes)
 })
 
-import { malformedBotHistories } from './test-helpers/shared-channels.ts'
-import { botAttemptBinding, botAttemptKey, validChannelDeliveryAttemptId } from '../src/channel-delivery-attempt.ts'
-import { makeMembershipHarness, membershipPage } from './test-helpers/shared-channels.ts'
 test.each(['pending-at-terminal', 'pending-at-inventory'] as const)('attempt positions exclude %s while an inventory may reference the applied revision', async shape => {
   const h = makeMembershipHarness(root)
   try {
@@ -562,11 +564,6 @@ test('the production reader refuses malformed typed evidence without dumping ide
   check(authority.snapshot())
 })
 
-import { closeSync, fsyncSync, openSync, readdirSync, renameSync, unlinkSync, writeSync } from 'node:fs'
-import type { DurableWriteFs } from '../src/atomic-write.ts'
-import { applySharedMembership, applySharedMemberships, sharedAppliedConfig, type SharedChannelAuthority, type SharedChannelDeps, type VerifiedSharedMembership } from '../src/shared-channels.ts'
-import { channelPopulation } from './test-helpers/shared-channels.ts'
-import { SR8_SHARED_LIST_CHANNELS } from './test-helpers/thread-memory.ts'
 describe('membership transactions preserve durable state and publications', () => {
   const observe = (authority: SharedChannelAuthority, key: string, channel: string, member: boolean, event: string) =>
     authority.observeMembership(key, authority.incarnation(key)!, membershipObservation(authority, key, channel, member, event), authority.revision)

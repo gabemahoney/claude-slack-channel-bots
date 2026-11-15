@@ -1626,7 +1626,7 @@ describe('persona teardown: every step for the removed key only, in order', () =
     expect(clock.pendingCount()).toBe(0)
   })
 
-  test('over the real routing in fungible mode, tearing B down empties B\'s heard set and leaves A\'s, holding the same channel, unchanged', async () => {
+  test('over the real routing in open mode, tearing B down empties B\'s heard set and leaves A\'s, holding the same channel, unchanged', async () => {
     const clock = createFakeClock()
     const h = makeRoutingHarness([{ name: NAME_A }, { name: NAME_B }], dir, { mode: 'open', dedupeClock: () => clock.now(), membership: { read: key => eligibleMembership(key), hasUnresolved: () => false, request: () => {} } })
     cleanups.push(resetRoutingState)

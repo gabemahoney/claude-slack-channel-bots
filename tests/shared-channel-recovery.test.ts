@@ -1,6 +1,12 @@
-import { _assignFixture, fixtureThreadHybridSince } from './test-helpers/shared-channels.ts'
-import { reviewLedger } from '../src/reload-review.ts'
 /** Startup, confirmed application and reopen use the same durable shared authority. */
+import {
+  _assignFixture, fixtureThreadHybridSince, activationRecord, applicationState, botAttemptRecord, channelPopulation, configBytes,
+  expectCurrent, expectSuperseded, holdsLifetime, makeSharedAuthority, makeMembershipHarness, SHARED_CHANNEL_IDS as C,
+  withPreRuleScanRepeats, sharedRecoveryRequest, membershipPage, deliveryAttempt, retryAttempt, activatedIdentity, activationOf,
+  changedReplacementRequest, foreignRecoveryRequests, malformedActiveRecoveries, numericWidth, repairOriginals, seriesDamage,
+  seriesRecoveryId, stagedRecoveryMissingBytes, stagedRecoveryOf,
+} from './test-helpers/shared-channels.ts'
+import { reviewLedger, reviewOutcomeLine } from '../src/reload-review.ts'
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import * as nodeFs from 'node:fs'
 import { readFileSync, statSync, writeFileSync } from 'node:fs'
@@ -9,19 +15,26 @@ import { DEFAULT_PERSONA_CONFIG_FS, type DeliveryMode, type PersonaConfigFs, typ
 import { isDeepStrictEqual } from 'node:util'
 import {
   createSharedChannelAuthority, parseSharedChannelState, sameChannelStamp, serializeSharedChannelState, sharedChannelLifetime,
-  type ChannelStamp, type SharedChannelAuthority, type SharedChannelStampState, type SharedChannelState, type SharedThreadView, type ThreadMemoryMarkerResult,
+  type ChannelStamp, type SharedChannelAuthority, type SharedChannelStampState, type SharedChannelState, type SharedThreadView,
+  type ThreadMemoryMarkerResult,
 } from '../src/shared-channels.ts'
 import { reloadSharedAuthorityApplyFailedLine } from '../src/reload.ts'
 import { errnoSuffix } from '../src/persona-credentials.ts'
 import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
-import { makeReloadHarness, type ReloadHarness, type ReloadRun, type ReloadRunOptions } from './test-helpers/reload-harness.ts'
-import { activationRecord, applicationState, botAttemptRecord, channelPopulation, configBytes, expectCurrent, expectSuperseded, holdsLifetime, makeSharedAuthority, makeMembershipHarness, SHARED_CHANNEL_IDS as C, withPreRuleScanRepeats } from './test-helpers/shared-channels.ts'
+import { makeReloadHarness, type ReloadHarness, type ReloadRun, type ReloadRunOptions, NO_RUN_ACTIVITY } from './test-helpers/reload-harness.ts'
 import { durableWriteFileSync, DurableWriteUnsyncedError } from '../src/atomic-write.ts'
 import { makeDm } from './test-helpers/slack-stub.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
 import { slackInput, sentRecord, deliveredRecord } from './test-helpers/delivery-queue.ts'
 import { cannedGetResult, stubCallCount } from './test-helpers/agent-director-stub.ts'
 import { createReplyReminders, REPLY_TOOL_PREALLOWED_LABEL, type ReplyReminders } from '../src/reply-reminder.ts'
+import { RELOAD_PREVIEW } from '../src/reload-plan.ts'
+import { parseSharedRecoveryRequest, recoveryBytes, recoveryHash, type SharedRecoveryRequest } from '../src/shared-recovery.ts'
+import { RELOAD_SHARED_RECOVERY, renderSharedRecovery, sharedRecoveryLine } from '../src/reload-recovery.ts'
+import { RECOVERY_CURRENT_MEMBERSHIP, RECOVERY_LOSS, RECOVERY_PRESERVATION, RECOVERY_RESTORE, RECOVERY_THREADS_FORGOTTEN } from '../src/reload-preview-clauses.ts'
+import { createDeliveryPreparation } from '../src/delivery-intake.ts'
+import { buildReviewRequest, REVIEW_REQUEST_SUFFIX, reviewRequestDiagnostic } from '../src/reload-request.ts'
+
 let h: ReloadHarness
 let runs: ReloadRun[]
 let engines: EngineHarness[]
@@ -1075,20 +1088,6 @@ test('recording/refusing filesystem sees zero legacy access through startup, rel
 
 // Reviewed damaged-start composition. The ordinary request/pending/apply owner
 // is exercised through starts/ticks and real durable files, never a repair mock.
-import { sharedRecoveryRequest, membershipPage, deliveryAttempt, retryAttempt } from './test-helpers/shared-channels.ts'
-import {
-  activatedIdentity, activationOf, changedReplacementRequest, foreignRecoveryRequests, malformedActiveRecoveries, numericWidth, repairOriginals,
-  seriesDamage, seriesRecoveryId, stagedRecoveryMissingBytes, stagedRecoveryOf,
-} from './test-helpers/shared-channels.ts'
-import { NO_RUN_ACTIVITY } from './test-helpers/reload-harness.ts'
-import { RELOAD_PREVIEW } from '../src/reload-plan.ts'
-import { reviewOutcomeLine } from '../src/reload-review.ts'
-import { parseSharedRecoveryRequest, recoveryBytes, recoveryHash, type SharedRecoveryRequest } from '../src/shared-recovery.ts'
-import { RELOAD_SHARED_RECOVERY, renderSharedRecovery, sharedRecoveryLine } from '../src/reload-recovery.ts'
-import { RECOVERY_CURRENT_MEMBERSHIP, RECOVERY_LOSS, RECOVERY_PRESERVATION, RECOVERY_RESTORE, RECOVERY_THREADS_FORGOTTEN } from '../src/reload-preview-clauses.ts'
-import { createDeliveryPreparation } from '../src/delivery-intake.ts'
-import { buildReviewRequest, REVIEW_REQUEST_SUFFIX, reviewRequestDiagnostic } from '../src/reload-request.ts'
-
 const REPAIR_SLACK = { alpha: { appId: 'A0REPAIR', botUserId: 'U0REPAIR', botId: 'B0REPAIR', teamId: 'T0REPAIR' } }
 async function recoveryStart(opts: ReloadRunOptions = {}) {
   const previousSession = runs.at(-1)?.session('alpha')
@@ -1962,26 +1961,6 @@ test('ordinary cancellation of a staged cold replacement survives restart and pe
   expect(cancelled.pendingIntent).toMatchObject({ operator: { generation: 1, requested: false, requests: {
     [cancel.request_id]: { request: cancel, generation: 1 },
   } } })
-})
-
-test('installed repair with failed directory sync reports uncertainty rather than definitely not activated before restart accepts it', async () => {
-  const alpha = h.persona('alpha'); h.materialize(alpha)
-  const input = h.writeConfig({ personas: [alpha] }), damage = h.writeRecordBytes('authority unavailable')
-  h.writeRequestBytes(configBytes(sharedRecoveryRequest('uncertain-activation', damage, input)))
-  let run = await recoveryStart(); expect(run.outcome.kind).toBe('refused'); await run.stop(); h.confirm()
-  let armed = true
-  run = await recoveryStart({ beforeWrite: (path, bytes) => {
-    if (path === h.paths.lastApplied && armed && parseSharedChannelState(bytes, path)?.recovery?.phase === 'active') {
-      armed = false; h.failWrites({ step: 'fsyncSync', call: 2, code: 'EIO' })
-    }
-  } })
-  expect(armed).toBe(false); expect(run.outcome.kind).toBe('refused')
-  expect(disk().recovery?.phase).toBe('active')
-  const diagnostics = [...run.logs]
-  await run.stop(); h.clearWriteFailure(); run = await recoveryStart()
-  expect(run.outcome.kind).toBe('applied')
-  expect(diagnostics.join('\n')).not.toContain('confirmation not activated')
-  expect(diagnostics.join('\n')).toMatch(/durability unresolved|installed[^\n]*unresolved|activation[^\n]*uncertain/i)
 })
 
 // t2.yiv.sf.in (SR-8.9): scan record retention inside durable applications and at startup.

@@ -25,12 +25,12 @@ import { CHANNEL_TARGET_STATE_UNRESOLVED } from '../src/registry.ts'
  * and not the instructions a session receives name `clear-latch`.
  * Per channel mode: the harness's
  * mode seam (`h.mode`, read by `h.modeDeps.getChannelMode` at each call) and
- * a fungible-mode persona (`applyFungibleAlpha`) drive the posting scope per
+ * an open-mode persona (`applyOpenAlpha`) drive the posting scope per
  * mode, directly and through the MCP server, dry run included; the mode read
- * at each call; Slack's refusals as tool errors in fungible mode; the
- * declarative section never read in fungible mode, through the real loader
+ * at each call; Slack's refusals as tool errors in open mode; the
+ * strict channel-list scope bypassed in open mode, through the real loader
  * too; and one instructions text in both modes. `h.deps` binds no mode
- * reader, so every case that opens a session on it runs in declarative mode.
+ * reader, so every case that opens a session on it runs in strict mode.
  * The global `fetch` is stubbed for every test (it throws unless a test sets
  * `h.fetchHandler`), so no test reaches the network, and every tool result
  * and log line is leak-checked in `afterEach`.
@@ -256,7 +256,7 @@ interface Harness {
   /** Per-persona stubs behind `deps.clientFor`; edit between calls. */
   clients: Map<string, StubSlack>
   alphaToken: string
-  /** The session tool deps; no channel-mode reader is bound, so declarative mode. */
+  /** The session tool deps; no channel-mode reader is bound, so strict mode. */
   deps: SessionToolDeps
   /** The channel mode `modeDeps.getChannelMode` returns at each call; set it between calls. */
   mode: ChannelMode
@@ -429,15 +429,14 @@ function applyPersona(p: Persona, on: boolean, overrides: Partial<Persona> = {})
 }
 
 /**
- * Alpha Bot as the loader resolves it in fungible mode, with
- * its DMs switch set to `on`: no `channels` and no top-level
- * `permission_prompts` in force, and its destination from `invited`. `spec`
- * sets further fields; its `channels` or `permission_prompts` stand for a
- * declarative section beside the fungible one, which fungible mode never
- * reads. Applied as the persona `getPersona` returns at the
- * next call, under Alpha's key, so its tools land on Alpha's stub.
+ * Alpha Bot as the loader resolves it in open mode, with its DMs switch
+ * set to `on` and an explicit `permission_prompts` destination, shared by
+ * both modes. `spec` sets further fields; listed channels remain in the
+ * fixture while open-mode posting accepts eligible unlisted targets too.
+ * Applied as the persona `getPersona` returns at the next call, under
+ * Alpha's key, so its tools land on Alpha's stub.
  */
-function applyFungibleAlpha(on: boolean, spec: PersonaSpec = {}): Persona {
+function applyOpenAlpha(on: boolean, spec: PersonaSpec = {}): Persona {
   const config = makeMultiPersonaConfig(
     [{ name: h.alpha.name, permission_prompts: A_ALL, ...spec, dm: { enabled: on } }],
     h.dir,
@@ -1773,7 +1772,7 @@ interface ScopeRow {
   label: string
   target: string
   expected: (dms: boolean, action: PersonaTargetAction) => ScopeExpected
-  /** A DM target (`D…` or a user ID): its outcome is the declarative one in fungible mode too. */
+  /** A DM target (`D…` or a user ID): its outcome is the strict-mode one in open mode too. */
   dmTarget?: boolean
 }
 
@@ -1788,8 +1787,8 @@ const notListed = (): ScopeExpected => ({ why: WHY.channel })
 const neitherChannelNorDm = (): ScopeExpected => ({ why: FUNGIBLE_TARGET_REFUSAL })
 const anyChannel = (): ScopeExpected => 'channel'
 
-/** six targets, decided by Alpha Bot's listed channels in declarative mode. */
-const DECLARATIVE_SCOPE_ROWS: readonly ScopeRow[] = [
+/** six targets, decided by Alpha Bot's listed channels in strict mode. */
+const STRICT_SCOPE_ROWS: readonly ScopeRow[] = [
   { label: 'a listed channel', target: A_ALL, expected: anyChannel },
   { label: 'an unlisted C… channel', target: UNCONFIGURED, expected: notListed },
   { label: 'a G… ID', target: GROUP_DM, expected: notListed },
@@ -1798,8 +1797,8 @@ const DECLARATIVE_SCOPE_ROWS: readonly ScopeRow[] = [
   { label: 'a U… user ID', target: USER_U, expected: userIdOutcome, dmTarget: true },
 ]
 
-/** Targets fungible mode refuses as neither a channel ID nor an allowed DM target. */
-const FUNGIBLE_OTHER_TARGETS: ReadonlyArray<readonly [label: string, target: string]> = [
+/** Targets open mode refuses as neither a channel ID nor an allowed DM target. */
+const OPEN_OTHER_TARGETS: ReadonlyArray<readonly [label: string, target: string]> = [
   ['a malformed ID', MALFORMED_ID],
   ['an empty value', ''],
   ['a lower-case ID', 'c0nope001'],
@@ -1807,15 +1806,15 @@ const FUNGIBLE_OTHER_TARGETS: ReadonlyArray<readonly [label: string, target: str
   ['a D… ID with trailing text', `${DM_CONV},${UNCONFIGURED}`],
 ]
 
-/** six targets plus a `W…` user ID and the other refused shapes, in fungible mode. */
-const FUNGIBLE_SCOPE_ROWS: readonly ScopeRow[] = [
+/** six targets plus a `W…` user ID and the other refused shapes, in open mode. */
+const OPEN_SCOPE_ROWS: readonly ScopeRow[] = [
   { label: 'a listed channel', target: A_ALL, expected: anyChannel },
   { label: 'an unlisted C… channel', target: UNCONFIGURED, expected: anyChannel },
   { label: 'a G… ID', target: GROUP_DM, expected: anyChannel },
   { label: 'a D… conversation', target: DM_CONV, expected: dmConversationOutcome, dmTarget: true },
   { label: 'a U… user ID', target: USER_U, expected: userIdOutcome, dmTarget: true },
   { label: 'a W… user ID', target: USER_W, expected: userIdOutcome, dmTarget: true },
-  ...FUNGIBLE_OTHER_TARGETS.map(([label, target]): ScopeRow => ({ label, target, expected: neitherChannelNorDm })),
+  ...OPEN_OTHER_TARGETS.map(([label, target]): ScopeRow => ({ label, target, expected: neitherChannelNorDm })),
 ]
 
 /** Each row × DMs off and on × `post` and `act`, in `mode`. */
@@ -1835,11 +1834,11 @@ function scopeCheck(persona: Persona, target: string, expected: ScopeExpected): 
 }
 
 // the table over mode × target × dm.enabled ×
-// action. Alpha Bot lists A_ALL and A_MENTIONS in both modes, so a fungible
+// action. Alpha Bot lists A_ALL and A_MENTIONS in both modes, so an open-mode
 // row's outcome shows the persona's list is not what decides there. Every
 // refusal is checked by its full message.
 describe('checkPersonaTarget per channel mode', () => {
-  test.each([...scopeCases('strict', DECLARATIVE_SCOPE_ROWS), ...scopeCases('open', FUNGIBLE_SCOPE_ROWS)])(
+  test.each([...scopeCases('strict', STRICT_SCOPE_ROWS), ...scopeCases('open', OPEN_SCOPE_ROWS)])(
     '$mode: $label, DMs $dmsLabel, $action',
     ({ mode, target, dms, action, expected, dmTarget }) => {
       const persona = applyPersona(h.alpha, dms)
@@ -1851,18 +1850,18 @@ describe('checkPersonaTarget per channel mode', () => {
     },
   )
 
-  // gives the fungible refusal's content, not its text: it says
+  // gives the open-mode refusal's content, not its text: it says
   // the target is neither a channel ID nor an allowed DM target. `refusal`
   // pins the persona and the target around it.
-  test('the fungible refusal says the target is neither a channel ID nor an allowed DM target', () => {
+  test('the open-mode refusal says the target is neither a channel ID nor an allowed DM target', () => {
     expect(FUNGIBLE_TARGET_REFUSAL).toContain('neither a channel ID')
     expect(FUNGIBLE_TARGET_REFUSAL).toContain('nor an allowed DM target')
   })
 })
 
-// the five Slack tools of a fungible-mode
+// the five Slack tools of an open-mode
 // persona, through the MCP server.
-describe('tool posting scope in fungible mode (through the MCP server)', () => {
+describe('tool posting scope in open mode (through the MCP server)', () => {
   const ACT_TOOLS = TOOLS.filter((t) => t !== 'reply')
 
   beforeEach(() => {
@@ -1872,7 +1871,7 @@ describe('tool posting scope in fungible mode (through the MCP server)', () => {
   test.each(TOOLS.flatMap((tool) => [UNCONFIGURED, GROUP_DM].map((target) => [tool, target] as const)))(
     "%s to the unlisted %s passes and lands on the persona's own client only",
     async (tool, target) => {
-      applyFungibleAlpha(false)
+      applyOpenAlpha(false)
       const session = await openModeSession(h.alpha)
 
       const result = await session.call(tool, TOOL_ARGS[tool](target))
@@ -1887,7 +1886,7 @@ describe('tool posting scope in fungible mode (through the MCP server)', () => {
 
   test.each([
     ...TOOLS.flatMap((tool) =>
-      FUNGIBLE_OTHER_TARGETS.map(([label, target]) => ({ tool, label, target, dms: true, why: FUNGIBLE_TARGET_REFUSAL as string })),
+      OPEN_OTHER_TARGETS.map(([label, target]) => ({ tool, label, target, dms: true, why: FUNGIBLE_TARGET_REFUSAL as string })),
     ),
     ...TOOLS.flatMap((tool) => [
       { tool, label: 'a D… conversation, DMs off', target: DM_CONV, dms: false, why: WHY.dmsOff as string },
@@ -1895,7 +1894,7 @@ describe('tool posting scope in fungible mode (through the MCP server)', () => {
     ]),
     ...ACT_TOOLS.map((tool) => ({ tool, label: 'a W… user ID, DMs on', target: USER_W, dms: true, why: WHY.userId as string })),
   ])('$tool to $label is refused with a tool error naming persona and target, and no Slack call on any stub', async ({ tool, target, dms, why }) => {
-    const persona = applyFungibleAlpha(dms)
+    const persona = applyOpenAlpha(dms)
     const session = await openModeSession(h.alpha)
 
     const result = await session.call(tool, TOOL_ARGS[tool](target))
@@ -1906,7 +1905,7 @@ describe('tool posting scope in fungible mode (through the MCP server)', () => {
   })
 
   test("a reply to a user ID with DMs on opens the DM on the persona's own client, then posts to the opened conversation", async () => {
-    applyFungibleAlpha(true)
+    applyOpenAlpha(true)
     stubOf(h.alpha).script.open.push(openedDm(OPENED_DM))
     const session = await openModeSession(h.alpha)
 
@@ -1922,7 +1921,7 @@ describe('tool posting scope in fungible mode (through the MCP server)', () => {
 })
 
 // the mode is read at each call, with
-// the persona, and an absent reader is declarative mode.
+// the persona, and an absent reader is strict mode.
 describe('the channel mode at each call', () => {
   test('flipping the mode between calls to the same unlisted channel flips the outcome', async () => {
     const session = await openModeSession(h.alpha)
@@ -1941,8 +1940,8 @@ describe('the channel mode at each call', () => {
     expect(stubOf(h.alpha).calls.postMessage.map((c) => c.channel)).toEqual([UNCONFIGURED])
   })
 
-  test('a deps object with no mode reader decides as declarative mode, even for a persona in fungible shape', async () => {
-    const persona = applyFungibleAlpha(true)
+  test('a deps object with no mode reader decides as strict mode, even for a persona in the open-mode fixture shape', async () => {
+    const persona = applyOpenAlpha(true)
     h.mode = 'open'
     expect(h.deps.getChannelMode).toBeUndefined()
     const session = await openPersonaSession(h.alpha)
@@ -1960,15 +1959,15 @@ describe('the channel mode at each call', () => {
 })
 
 // the scope check runs before the dry-run
-// branch in fungible mode too.
-describe('dry run in fungible mode (SLACK_DRY_RUN=1)', () => {
+// branch in open mode too.
+describe('dry run in open mode (SLACK_DRY_RUN=1)', () => {
   beforeEach(() => {
     process.env['SLACK_DRY_RUN'] = '1'
     h.mode = 'open'
   })
 
   test.each(TOOLS)('%s to an unlisted channel returns the dry-run result with no Slack call', async (tool) => {
-    applyFungibleAlpha(false)
+    applyOpenAlpha(false)
     const session = await openModeSession(h.alpha)
 
     const result = await session.call(tool, TOOL_ARGS[tool](UNCONFIGURED))
@@ -1978,10 +1977,10 @@ describe('dry run in fungible mode (SLACK_DRY_RUN=1)', () => {
     expectNoSlackCall()
   })
 
-  test.each(TOOLS.flatMap((tool) => FUNGIBLE_OTHER_TARGETS.map(([label, target]) => [tool, label, target] as const)))(
-    '%s to %s gets the fungible refusal, not the dry-run result, and no Slack call',
+  test.each(TOOLS.flatMap((tool) => OPEN_OTHER_TARGETS.map(([label, target]) => [tool, label, target] as const)))(
+    '%s to %s gets the open-mode refusal, not the dry-run result, and no Slack call',
     async (tool, _label, target) => {
-      const persona = applyFungibleAlpha(true)
+      const persona = applyOpenAlpha(true)
       const session = await openModeSession(h.alpha)
 
       const result = await session.call(tool, TOOL_ARGS[tool](target))
@@ -2014,7 +2013,7 @@ describe('shared configuration on the outbound path', () => {
   })
 
   test('open mode permits an unlisted valid channel without permitting malformed or disabled DM targets', async () => {
-    const persona = applyFungibleAlpha(false)
+    const persona = applyOpenAlpha(false)
     h.mode = 'open'
     const session = await openModeSession(persona)
     const allowed = await session.call('reply', TOOL_ARGS.reply(UNCONFIGURED))
@@ -2167,14 +2166,14 @@ describe('Slack call failures', () => {
   })
 })
 
-// in fungible mode Slack enforces membership, so
+// in open mode Slack enforces membership, so
 // its refusal of a call on a channel target reaches the persona as a tool
 // error naming the tool, the persona, the channel and Slack's code, built by
-// `slackRefusalToolErrorText`. DM targets in either mode, and declarative
-// mode, keep the declarative text (pinned by "Slack call failures" and "DM targets"
+// `slackRefusalToolErrorText`. DM targets in either mode, and strict
+// mode, keep the strict-mode text (pinned by "Slack call failures" and "DM targets"
 // above, whose sessions bind no mode reader). Every scripted failure carries
 // the leak marker (Alpha's stub is built with it).
-describe("Slack's refusals as tool errors in fungible mode", () => {
+describe("Slack's refusals as tool errors in open mode", () => {
   /** The stub's script queue each tool's one Slack call takes. */
   const TOOL_QUEUE: Record<ToolName, keyof StubSlackScript> = {
     reply: 'post',
@@ -2214,7 +2213,7 @@ describe("Slack's refusals as tool errors in fungible mode", () => {
   test.each(TOOLS.flatMap((tool) => CODES.map((code) => [tool, code] as const)))(
     '%s on an unlisted channel Slack refuses with %s → the builder\'s tool error naming the persona, the channel and the code; token-safe',
     async (tool, code) => {
-      const persona = applyFungibleAlpha(false)
+      const persona = applyOpenAlpha(false)
       const outcome: WebApiOutcome = { kind: 'platform', error: code }
       stubOf(h.alpha).script[TOOL_QUEUE[tool]].push(outcome)
       const session = await openModeSession(h.alpha)
@@ -2239,7 +2238,7 @@ describe("Slack's refusals as tool errors in fungible mode", () => {
   test.each(TOOLS)(
     '%s on an unlisted channel whose call fails with no platform code (network) → the builder\'s no-code form, naming the persona and the channel and no code',
     async (tool) => {
-      const persona = applyFungibleAlpha(false)
+      const persona = applyOpenAlpha(false)
       const outcome: WebApiOutcome = { kind: 'network' }
       stubOf(h.alpha).script[TOOL_QUEUE[tool]].push(outcome)
       const session = await openModeSession(h.alpha)
@@ -2290,21 +2289,21 @@ describe("Slack's refusals as tool errors in fungible mode", () => {
     ['a user ID whose post fails after the open', USER_U, [openedDm(OPENED_DM)]],
     ['a D… conversation', DM_CONV, []],
   ])('a reply to %s fails with the DM failure text a session with no mode reader gets', async (_label, target, open) => {
-    const persona = applyFungibleAlpha(true)
+    const persona = applyOpenAlpha(true)
 
     const unbound = await failedReply(h.deps, target, open)
-    const fungible = await failedReply(h.modeDeps, target, open)
+    const openResult = await failedReply(h.modeDeps, target, open)
 
-    expect(fungible.result.isError).toBe(true)
-    expect(fungible.leads).toHaveLength(1)
-    expect(fungible).toEqual(unbound)
-    expect(fungible.result.content[0]!.text).not.toBe(slackRefusalToolErrorText('reply', persona, target, 'not_in_channel'))
-    expect(fungible.result.content[0]!.text).toContain(JSON.stringify(target))
-    assertNoLeak({ unbound, fungible })
+    expect(openResult.result.isError).toBe(true)
+    expect(openResult.leads).toHaveLength(1)
+    expect(openResult).toEqual(unbound)
+    expect(openResult.result.content[0]!.text).not.toBe(slackRefusalToolErrorText('reply', persona, target, 'not_in_channel'))
+    expect(openResult.result.content[0]!.text).toContain(JSON.stringify(target))
+    assertNoLeak({ unbound, openResult })
   })
 
   test.each(TOOLS)(
-    "declarative mode with the reader bound: %s on a listed channel Slack refuses keeps the text a session with no mode reader gets",
+    "strict mode with the reader bound: %s on a listed channel Slack refuses keeps the text a session with no mode reader gets",
     async (tool) => {
       h.mode = 'strict'
       const run = async (deps: SessionToolDeps) => {
@@ -4582,19 +4581,19 @@ describe('session instructions in both channel modes', () => {
   /** The instructions a session for Alpha Bot receives when opened with the mode seam at `mode`. */
   async function instructionsIn(mode: ChannelMode): Promise<string | undefined> {
     h.mode = mode
-    if (mode === 'open') applyFungibleAlpha(false)
+    if (mode === 'open') applyOpenAlpha(false)
     else h.personas.set(h.alpha.key, h.alpha)
     const { client } = await openModeSession(h.alpha)
     return client.getInstructions()
   }
 
-  test('a session opened in fungible mode and one opened in declarative mode each receive exactly MCP_INSTRUCTIONS', async () => {
-    const fungible = await instructionsIn('open')
-    const declarative = await instructionsIn('strict')
+  test('a session opened in open mode and one opened in strict mode each receive exactly MCP_INSTRUCTIONS', async () => {
+    const openInstructions = await instructionsIn('open')
+    const strictInstructions = await instructionsIn('strict')
 
-    expect(fungible).toBe(MCP_INSTRUCTIONS)
-    expect(declarative).toBe(MCP_INSTRUCTIONS)
-    expect(fungible).toBe(declarative!)
+    expect(openInstructions).toBe(MCP_INSTRUCTIONS)
+    expect(strictInstructions).toBe(MCP_INSTRUCTIONS)
+    expect(openInstructions).toBe(strictInstructions!)
   })
 
   test('the text describes both channel modes and all listening choices when someone asks', () => {
