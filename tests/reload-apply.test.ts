@@ -7231,6 +7231,9 @@ async function heldSlackHead(run: ReloadRun, source: 'slack' | 'reaction', looku
   scriptLookup(run, source, lookup.outcome)
   const asked = run.stub('bravo').calls.conversationsInfo.length
   const delivered = run.deliver('bravo', slackEventOf(run, source, HEAD_SENDER, HEAD_TS))
+  // Acceptance must finish its real journal I/O before post-ack preparation
+  // asks Slack. Event-loop turns alone can outrun the fsync callback.
+  await run.clock.flush()
   await until(() => run.stub('bravo').calls.conversationsInfo.length === asked + 1)
   return { delivered }
 }
@@ -7336,6 +7339,7 @@ describe("a confirmed change of bravo while its preparation is in flight: the en
         expect(delivery.owns('bravo', 1)).toBe(true)
         expect(journalOf('bravo', 1)).toEqual(['accepted'])
       } else {
+        await run.clock.flush()
         await until(() => fixedParts('bravo', 1).length === 1)
       }
       // The next tick does nothing meanwhile.
@@ -7471,6 +7475,7 @@ describe("a confirmed change of bravo while its preparation is in flight: the en
       expect(run.settledConfigs).toHaveLength(1)
 
       // The reclaim fixed the claimed head from the next life's lookups, and took nothing else.
+      await run.clock.flush()
       await until(() => fixedParts('bravo', 1).length === 1 && !delivery.owns('bravo', 1))
       expect(fixedParts('bravo', 1)[0]!.join('')).toContain('channel_name="new-life-name"')
       const reclaimed = { calls: run.stub('bravo').callLog.length, wakes: delivery.wakes.length }
@@ -7522,6 +7527,7 @@ describe("a confirmed change of bravo while its preparation is in flight: the en
       scriptLookup(run, 'slack', conversationNamed('new-life-name'))
       await (await confirmPreviewed(run, [alpha!, bravo!])).applying
       expect(run.settledConfigs.map((c) => c.personas.map((p) => p.key))).toEqual([[alphaKey], [alphaKey, bravoKey]])
+      await run.clock.flush()
       await until(() => fixedParts('bravo', 1).length === 1)
       expect(fixedParts('bravo', 1)[0]!.join('')).toContain('channel_name="new-life-name"')
       expect(fixedParts('bravo', 1)[0]!.join('')).not.toContain('old-life-name')
