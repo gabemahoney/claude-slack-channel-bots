@@ -1353,7 +1353,7 @@ export function cleanRestartRelaunchLineOf(
 /**
  * The teardown's line when a poll read after `clean_restart <bot>…`'s
  * successful pause finds the row live, `elapsedMs` after the pause: `pause`
- * answers only once the row reads `ended`, so this is the persona's next
+ * completed the shutdown (the row may read `ended` or `missing`), so this is the persona's next
  * life, launched by the running server, and it is never killed:
  * `[slack] teardownBots: persona <ref> reads live <ms>ms after a successful pause, which ended its old life — this is its next life; it is left running`.
  * Pure.

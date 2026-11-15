@@ -26,6 +26,7 @@ Each source module has a corresponding test file under `tests/`. Every `tests/*.
 
 | Source | Test File | What It Tests |
 |--------|-----------|---------------|
+| tests/integration/test-32-fmk-real-order.sh, fixtures/real-case-assertions.ts | real-down-pause.test.ts | Executes the DOWN assertion with synthetic structured AD evidence and the actual pause boundary with an inert AD function. Accepts `missing` after the scenario's successful pause only with the same native session and available launch fields; rejects absent/foreign success proof, session loss, changed launches and live/foreign end rows. Preserves `ended` and absent optional launch fields. No native agent or credentials. |
 | child-env.ts, bundled agent-director client | child-env.test.ts | Case-insensitive Slack credential-name removal, host-variable pass-through, pure child copies and in-place entry scrub, and daemon-only marker handoff. A scratch child drives the real npm client's discovery and one verb against an inert fake executable, recording environment names only; an unscrubbed control proves the verb boundary is exercised. See the fake-executable exception under Host safety. |
 | tests/integration/test-21-fmk-teardown.sh, tests/integration/lib/scenario.sh | Docker integration boundary leg (not a bun test file) | The first CSCB start creates an unseeded scenario tmux server. `SCENARIO_START_ENV` injects fake Slack and host credentials after the helper's ordinary unsets; a names-only check rejects Slack credential names and the daemon marker while requiring `GH_TOKEN`. See tests/README.md's scenario 9. |
 | scripts/ci-base-build.sh, docker/ad-client-check.sh | ci-ad-runtime.test.ts | b.iy3 current-runtime installer selection and independent client/runtime version decisions, with drift, stale-runtime, foreign-commit and migration-fixture controls. Executes isolated shell blocks with recording dependencies; no real AD binary, Docker or credential access. Runtime integration is separate evidence. |
@@ -301,6 +302,16 @@ synthetic custody facts through an explicit fixture adapter. They check
 submitted-before-send, lookup-only recovery after queue/engine recreation,
 no duplicate/raw send, and no automatic pause/resume before E6. Native stub
 receipt counts guard against accidental input from synthetic covered cases.
+After removing the custody shim's control file, fixture cleanup runs a real
+AD `kill` through `cscb_run`, with a shell retained as AD's recorded parent.
+This exercises the AD-to-tmux shim chain even when the runtime skips all
+legacy sends. The closing assertions still require that positive evidence,
+reject direct bot-server tmux calls, finished-row kills and CSCB deletes,
+and recheck at exit. `tests/busy-send-closing.test.ts` executes the extracted
+cleanup and closing functions with inert recording stand-ins and synthetic
+logs; missing tmux evidence, a failed kill and direct server tmux evidence
+must fail closure. The full logging shims and native AD-to-tmux chain are
+exercised only by the container test-50 rerun.
 These checks do not prove E2 client serialization, Claude busy-send transport,
 native holds/turn-start confirmation, an OS crash during send, or E6 reconnect.
 Those need the matching candidate/client and real Claude; the stub has no
@@ -461,6 +472,8 @@ Within the original shared 180 s deadline, require both actual durable acceptanc
 Synthetic controls in `codex-delivery-controls.test.ts` cover delayed startup/successor acceptance, failed transport, early exit/signal, malformed/foreign/oversize/symlink checkpoints, atomic publication, marker-first snapshots, deadlines and diagnostics-before-kill. `codex-ai-controls.test.ts` holds successor parts until real completion and refuses failed acknowledgement; `codex-gate-controls.test.ts` checks the preserved prefix/suffix and rejects missing receipts, sends and FIFO violations. Host-safety audits pin the added helper and executable surfaces; controls supply no native acceptance.
 
 On a failed native delivery wait, capture structured AD row and exact-receipt/journal evidence before cleanup. `transcript-receipts.ts` projects counts and send/receipt state with fixed reason classes; no composer observation, pane text, arbitrary parser errors, message bodies or credentials enter diagnostics. Preserve the original wait, FAIL and cleanup order; late readiness cannot pass.
+
+Test 32's DOWN interval accepts `ended`, or `missing` only after its own successful pause. The script saves the pre-pause row and writes an instance-bound success marker only after AD returns success. The assertion requires the same non-empty native session and unchanged available launch fields through the interval; a missing row alone grants no exception. `ended_at` remains required for `ended`, but can be absent for `missing`. `real-down-pause.test.ts` exercises these checks without native agents. Production's existing finished-row resume policy and the ended-only early restart timer are unchanged.
 
 Real-scenario expected counts and latency samples cover original Slack, cron and interject inputs. Reply reminders are counted separately but still require full receipt and FIFO evidence, one link to a previously delivered Slack input, and no recursive link. `transcript-receipts.test.ts` checks these rules with the real queue in scratch directories, including compacted history and deliberately damaged reminder evidence.
 Scenario workload ordinals resolve through `workloadItem` over the cumulative receipt journal: open-head, key-retry, restart-spacing, reconnect and fidelity-size assertions use the original input's durable sequence even when reminders have been inserted. Selection does not remove reminders from receipt, FIFO or no-retype audits.

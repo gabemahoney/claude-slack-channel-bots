@@ -73,8 +73,12 @@ fi
 [[ "${actual}" == "${expected}" ]] \
     || fail 'duplicate or unexpected native prompt receipt'
 rm -f "${control}"
-ad_capture kill --instance-id "${instance}"
-(( AD_RC == 0 )) || fail 'fixture kill failed'
+# Covered legs use synthetic custody and never reach tmux. End the live
+# fixture through a recorded CSCB run so both runtimes exercise the real
+# AD -> tmux shim chain. Keep bash as AD's parent (a direct cscb_run exec
+# would make AD itself the recorded process, losing the parent evidence).
+cscb_run bash -c '"$@"; exit $?' fixture-kill "${SCENARIO_AD_BIN}" kill --instance-id "${instance}" \
+    || fail 'fixture kill failed'
 assert_no_server_tmux
 assert_busy_send_no_finished
 assert_no_cscb_delete

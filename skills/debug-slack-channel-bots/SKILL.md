@@ -5221,7 +5221,7 @@ then waits for each stopped bot to read live again. It never stops the
 server, starts nothing, checks no answer and raises no
 `clean-restart-not-restarted`.
 
-- **Next life:** once a bot's pause has ended it, a live row is the bot's
+- **Next life:** a successful bot pause can leave its row `ended` or `missing`, with its native session kept for resume. A `missing` row alone does not establish a successful pause. Once a bot's pause has ended it, a live row is the bot's
   next life, launched by the server: it counts as stopped and is never
   killed. A bot whose pause succeeds is never force-killed, whatever
   `exit_timeout` is. A `pause_in_progress` refusal instead waits for row evidence and can reach the checked kill at the bound. A row

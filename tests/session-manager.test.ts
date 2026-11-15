@@ -1341,20 +1341,24 @@ describe('spawnForPersona: persona identity', () => {
 // ---------------------------------------------------------------------------
 
 describe('spawnForPersona: collision-then-act', () => {
-  test('ended state + resume_enabled → resume()', async () => {
+  test.each(['ended', 'missing'] as const)('pinning: %s without a prior CSCB pause + resume_enabled → resume()', async state => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
+    const killCalls: import('agent-director').KillParams[] = []
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       spawnCalls,
       resumeCalls,
+      killCalls,
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: personaRow(cfg, 'C', { state: 'ended' }),
+      getResult: personaRow(cfg, 'C', { state }),
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('resumed')
     expect(resumeCalls).toHaveLength(1)
     expect(resumeCalls[0].instance_id).toBe('cscb_C')
+    expect(spawnCalls).toHaveLength(1) // the initial colliding spawn only
+    expect(killCalls).toEqual([])
   })
 
   // the no-transcript answer brings the persona up by one
@@ -24890,10 +24894,13 @@ describe('b.r6d covered reconnect factory E6 seam', () => {
     expect(h.calls.includes('resume')).toBe(false)
     if (boundary !== 'after-pause') expect(h.calls.includes('pause')).toBe(false)
   })
-  test('E6 ordinary success reads ended row before resume', async () => {
+  test.each(['ended', 'missing'] as const)('pinning: E6 successful own pause reads same-session %s before resume', async state => {
     const h = await fixture(true)
+    const session = h.input.row.session_id
+    h.input.pause = async () => { h.calls.push('pause'); h.row({ ...h.input.row, state }) }
+    h.input.resume = async () => { h.calls.push('resume'); expect((await h.input.readRow())?.session_id).toBe(session) }
     expect(await h.run()).toBe('ok')
-    expect(h.calls).toEqual(['get', 'pause', 'get', 'resume'])
+    expect(h.calls).toEqual(['get', 'pause', 'get', 'resume', 'get'])
     expect(h.notices).toEqual([])
   })
   test('E6 successful pause with a still-live row defers rather than resuming', async () => {

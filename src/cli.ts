@@ -69,8 +69,8 @@
  * A poll read after a persona's pause that shows its next life stops it:
  * its old life counts as stopped, and the next life is never killed. For
  * `clean_restart <bot>…`, whose server keeps running, that is any live read
- * after a successful pause (`pause` answers only once the row reads
- * `ended`), and a successful pause is never followed by the kill; for the
+ * after a successful pause (AD completed it; the finished row may read
+ * `ended` or `missing`), and a successful pause is never followed by the kill; for the
  * other commands, a launch start (`parseLaunchStart`) other than the one read
  * before the pause. A `status` read between the kill's tries that shows such
  * a launch start ends the tries with no further kill, and the persona counts
@@ -980,7 +980,7 @@ export function createCli(deps: CliDeps): CliHandlers {
    *
    *   1. one `status` read of `cscb_<key>` (`stateReadVerdictOf`): no row or
    *      a finished row is stopped; any other error fails the persona;
-   *   2. `pause` (`/exit` → SessionEnd → the row reaches `ended`), decided by
+   *   2. `pause` (AD completes shutdown; the row may read `ended` or `missing`), decided by
    *      `pauseVerdictOf`: UNAVAILABLE is tried again, only the `pause`, up
    *      to PRECHECK_TRIES calls PRECHECK_TRY_SPACING_MS apart, then
    *      escalates; an escalation goes to the kill; a fail-at-once verdict
@@ -990,7 +990,7 @@ export function createCli(deps: CliDeps): CliHandlers {
    *      the last wait is cut short at `exit_timeout`; a read error fails the
    *      persona (`stateReadVerdictOf`). A read that shows the persona's next
    *      life stops it, with no kill: with `serverRelaunches`, any live read after a completed pause
-   *      (`pause` answers only once the row reads `ended`); otherwise a
+   *      (AD completed the pause, whether the row reads `ended` or `missing`); otherwise a
    *      launch start other than the one step 1 read. An underway pause
    *      requires both launch starts to be known before claiming replacement;
    *   4. at `exit_timeout`, or after an escalated pause, the kill's bounded

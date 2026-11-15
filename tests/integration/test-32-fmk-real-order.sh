@@ -19,8 +19,11 @@ real_wait_launch "${REAL_KEY}"
 # launches before pausing; these faults never invoke the real launch binary.
 real_fault spawn '*' unknown-untyped 999999
 real_fault resume '*' unknown-untyped 999999
-real_ad pause --instance-id "$(real_instance "${REAL_KEY}")" >/dev/null
 DOWN_ROW="${SCENARIO_ROOT}/order-down-row.json"
+real_ad get --instance-id "$(real_instance "${REAL_KEY}")" > "${DOWN_ROW}.before-pause"
+real_ad pause --instance-id "$(real_instance "${REAL_KEY}")" >/dev/null
+# set -e prevents this proof from being written if our own pause failed.
+printf '%s\n' "$(real_instance "${REAL_KEY}")" > "${DOWN_ROW}.pause-succeeded"
 real_ad get --instance-id "$(real_instance "${REAL_KEY}")" > "${DOWN_ROW}"
 DOWN_MARK="$(ad_shim_mark)"
 # Ten DMs interleaved with interject and a real minute fire while down.

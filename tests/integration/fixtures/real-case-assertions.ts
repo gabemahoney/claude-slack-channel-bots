@@ -171,9 +171,18 @@ try {
     }
   } else if(command==='down') {
     const before=JSON.parse(readFileSync(arg,'utf8')), after=JSON.parse(readFileSync(arg+'.end','utf8'))
-    for(const row of [before,after]) check(row.instance_id==='cscb_'+key&&row.state==='ended','DOWN interval has a live or wrong native row')
-    check(before.session_id&&before.ended_at,'DOWN interval lacks the paused native session')
-    for(const field of ['session_id','started_at','ended_at','launch_started_at']) check(before[field]===after[field],'native launch changed during DOWN interval')
+    const hasMissing=[before,after].some(row=>row.state==='missing')
+    if(hasMissing) {
+      // A missing row alone proves no successful pause. This scenario owns
+      // the pause; its success marker is written only after AD returned 0.
+      check(existsSync(arg+'.pause-succeeded')&&readFileSync(arg+'.pause-succeeded','utf8').trim()==='cscb_'+key,'DOWN missing row lacks successful own pause')
+      const paused=JSON.parse(readFileSync(arg+'.before-pause','utf8'))
+      check(paused.instance_id==='cscb_'+key&&paused.session_id,'DOWN pause lacks its native session')
+      for(const field of ['session_id','started_at','launch_started_at','launch_token']) check(paused[field]===before[field],'native session or launch changed after pause')
+    }
+    for(const row of [before,after]) check(row.instance_id==='cscb_'+key&&(row.state==='ended'||(hasMissing&&row.state==='missing')),'DOWN interval has a live or wrong native row')
+    check(before.session_id&&(before.state==='missing'||before.ended_at),'DOWN interval lacks the paused native session')
+    for(const field of ['session_id','started_at','ended_at','launch_started_at','launch_token']) check(before[field]===after[field],'native launch changed during DOWN interval')
     const j=cumulativeJournal(), accepted=workloadItems(j)
     check(accepted.length===Number(arg3),'DOWN interval acceptance count differs')
     for(const [source,count] of [['slack',10],['interject',2],['cron',1]] as const) check(accepted.filter(r=>r.source===source).length===count,'DOWN interval source count differs: '+source)

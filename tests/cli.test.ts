@@ -2502,6 +2502,24 @@ describe('persona-set teardown', () => {
 // ---------------------------------------------------------------------------
 
 describe('clean_restart', () => {
+  test.each(['ended', 'missing'] as const)('pinning: successful own pause followed by %s stops the old life without a kill', async terminal => {
+    let paused = false, terminalRead = false
+    const b = makeDeps({ serverPid: 4242, isProcessRunning: () => true, config: opsConfig({ exit_timeout: 2 }),
+      directorGet: async () => ({ state: 'waiting' }),
+      directorPause: async () => { paused = true },
+      directorStatus: async () => {
+        if (!paused) return { state: 'waiting' }
+        if (!terminalRead) { terminalRead = true; return { state: terminal } }
+        return { state: 'waiting' }
+      },
+    })
+    await settled(createCli(b.deps).clean_restart([OPS_NAME]))
+    expect(terminalRead).toBe(true)
+    expect(b.pauseCalls).toEqual([opsId()]); expect(b.killCalls).toEqual([])
+    expect(stderr.some(line => line.includes('exited cleanly in'))).toBe(true)
+    expect(stderr.some(line => line.includes('this is its next life'))).toBe(false)
+    expect(b.exitCodes).toEqual([])
+  })
   test.each(['ended', 'missing', 'absent'] as const)('b.r6d C1 underway keeps polling the old live launch until %s', async terminal => {
     const old = { state: 'waiting', launch_started_at: SAMPLE_LAUNCH_START_DEFAULT }
     let reads = 0
