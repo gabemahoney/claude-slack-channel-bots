@@ -172,12 +172,14 @@ import {
   type PersonaSlackClientFactory,
   type PersonaSocketClient,
   type PersonaSocketListener,
+  type PersonaValidationClient,
 } from './persona-slack-clients.ts'
 import { createSlackEpisodeTracker, type SlackEpisodeTracker } from './persona-slack-episodes.ts'
 import {
   SLACK_AUTH_TEST_TIMEOUT_MS,
   SlackAuthTestTimeoutError,
   SlackStartTimeoutError,
+  WEB_API_AUTH_FAILURE_ERRORS,
   botIdentityFromAuthTest,
   installationFromBotInfo,
   slackInstallationIdentity,
@@ -777,6 +779,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
       if (attempt.settled) return // abandoned at the 10 s bound, or cancelled
       clearStartTimer(attempt)
       if (validated.kind !== 'up') {
+        // A refused bots.info is an auth failure: its membership-origin repair stays bounded.
         if (phase === 'bring-up' && validated.kind === 'credentials-refused' && validated.method === 'bots.info') {
           entry.membershipNeedsValidation = true
           entry.membershipRefused = true
@@ -807,7 +810,8 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
   }
 
   /**
-   * `auth.test` on a short-lived validation client (bot token), under the
+   * `auth.test`, then `supplementInstallation` when it names a team but no
+   * app, on a short-lived validation client (bot token), under the
    * manager's own 10 s bound on the injected clock (`SLACK_AUTH_TEST_TIMEOUT_MS`).
    * On expiry the attempt is settled Slack-unreachable (`timeout`) and the
    * call is abandoned: whatever it settles to later is caught and ignored.
@@ -817,19 +821,38 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     armAttemptBound(attempt, SLACK_AUTH_TEST_TIMEOUT_MS, () => {
       attempt.finish({ kind: 'failed', outcome: classifySlackValidationError(new SlackAuthTestTimeoutError(), 'auth.test') })
     })
-    let metadata = false
+    let client: PersonaValidationClient
+    let outcome: SlackUpOutcome | SlackUnreachableOutcome
     try {
-      const client = factory.createValidationClient(tokens.botToken, validationWebClientOptions(slackApiUrl))
-      const outcome = botIdentityFromAuthTest(await client.auth.test())
-      if (attempt.settled || outcome.kind !== 'up' || !outcome.identity.teamId || outcome.identity.appId || !client.bots) return outcome
-      // Existing users:read permission; the same end-to-end validation bound
-      // covers this metadata request. Never inspect a token for identity.
-      metadata = true
-      const result = await client.bots.info({ bot: outcome.identity.botId, team_id: outcome.identity.teamId })
-      return { kind: 'up', identity: installationFromBotInfo(outcome.identity, result) }
+      client = factory.createValidationClient(tokens.botToken, validationWebClientOptions(slackApiUrl))
+      outcome = botIdentityFromAuthTest(await client.auth.test())
+    } catch (err) {
+      return classifySlackValidationError(err, 'auth.test')
+    }
+    if (attempt.settled || outcome.kind !== 'up' || !outcome.identity.teamId || outcome.identity.appId || !client.bots) return outcome
+    return supplementInstallation(client.bots, outcome)
+  }
+
+  /**
+   * `bots.info` (users:read) supplies the app ID `auth.test` omitted, under
+   * the same validation bound. Never inspect a token for identity. Only an
+   * auth failure (`WEB_API_AUTH_FAILURE_ERRORS`) refuses the bot token; any
+   * other refusal (`missing_scope`, …) keeps exactly the `auth.test` identity,
+   * its installation unverified, so the persona comes up with membership held.
+   * Slack-unreachable failures stay failures and are retried.
+   */
+  async function supplementInstallation(
+    bots: NonNullable<PersonaValidationClient['bots']>,
+    authenticated: SlackUpOutcome,
+  ): Promise<SlackUpOutcome | SlackValidationFailure> {
+    const { identity } = authenticated
+    try {
+      const result = await bots.info({ bot: identity.botId, team_id: identity.teamId })
+      return { kind: 'up', identity: installationFromBotInfo(identity, result) }
     } catch (err) {
       const outcome = classifySlackValidationError(err, 'auth.test')
-      return metadata && outcome.kind === 'credentials-refused' ? { ...outcome, method: 'bots.info' } : outcome
+      if (outcome.kind !== 'credentials-refused') return outcome
+      return WEB_API_AUTH_FAILURE_ERRORS.has(outcome.slackError) ? { ...outcome, method: 'bots.info' } : authenticated
     }
   }
 
@@ -1259,8 +1282,11 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     }
   }
 
-  /** Every discovery client is factory-built, abortable and watched. A refusal
-   * affects the manager before the caller receives its rejection. */
+  /** Every discovery client is factory-built, abortable and watched. An auth
+   * refusal (the watch's `WEB_API_AUTH_FAILURE_ERRORS`) marks the persona
+   * before the caller receives its rejection. Any other failure is only the
+   * scanner's: it retries the page on this same connection, so the manager
+   * keeps it up and arms no revalidation. */
   async function membershipPage(key: string, connectionId: string, cursor: string | undefined, signal: AbortSignal): Promise<unknown> {
     const entry = entries.get(key)
     const binding = entry?.socket
@@ -1275,13 +1301,8 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
       entry.membershipRefused = true
       markRefusedWhileRunning(entry, outcome)
     })
-    try {
-      return await client.users.conversations({ types: 'public_channel,private_channel', limit: MEMBERSHIP_PAGE_LIMIT,
-        team_id: binding.identity.teamId, ...(cursor ? { cursor } : {}) })
-    } catch (error) {
-      if (applies() && classifySlackValidationError(error, 'web-api').kind === 'credentials-refused') entry.membershipNeedsValidation = true
-      throw error
-    }
+    return client.users.conversations({ types: 'public_channel,private_channel', limit: MEMBERSHIP_PAGE_LIMIT,
+      team_id: binding.identity.teamId, ...(cursor ? { cursor } : {}) })
   }
 
   /** Thread Memory lookups use the metadata client options (no SDK retries,

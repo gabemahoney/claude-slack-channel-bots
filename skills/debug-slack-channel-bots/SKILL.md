@@ -710,22 +710,33 @@ evidence may no longer qualify after restart.
 ### `persona-credentials-refused`
 
 - **State:** `broken`. Logged by the connection manager, with the credentials
-  file as `path`. A membership-origin refusal has bounded idle revalidation
-  of already applied credentials; other refusals keep the confirmed-change
-  recovery below. See [Membership recovery bounds](#membership-recovery-bounds).
+  file as `path`. A membership-origin refusal (Slack refusing the bot token on
+  the membership inventory, or on `bots.info` at bring-up) has bounded idle
+  revalidation of already applied credentials; other refusals keep the
+  confirmed-change recovery below. See [Membership recovery bounds](#membership-recovery-bounds).
 - **Meaning:** Slack answered and refused a token. Three checks can refuse:
-  - `bot_token refused by auth.test: Slack error <code>` (at bring-up)
+  - `bot_token refused by auth.test: Slack error <code>` (at bring-up; also
+    when the `bots.info` installation check that follows `auth.test` refuses
+    the bot token)
   - `app_token refused by the Socket Mode open: Slack error <code>` (at
     bring-up, or when a running persona's connection is reopened)
   - `bot_token refused by a Web API call (<method>): Slack error <code>` (a
-    running persona's call, such as `chat.postMessage`, was refused)
+    running persona's call, such as `chat.postMessage` or the membership
+    inventory's `users.conversations`, was refused)
 - **Codes:** for `auth.test` and the Socket Mode open, any Slack error except
   the five transient ones listed under `persona-slack-unreachable`. The
   expected ones are `not_authed`, `invalid_auth`, `account_inactive`,
-  `token_revoked`, `token_expired` and `not_allowed_token_type`. For a Web API
-  call, `invalid_auth`, `token_revoked`, `account_inactive` and `not_authed`;
-  membership discovery also classifies access failures such as `missing_scope`
-  and `access_denied`. Check the accompanying inventory reason.
+  `token_revoked`, `token_expired` and `not_allowed_token_type`. For `bots.info`
+  and a Web API call, only `invalid_auth`, `token_revoked`, `account_inactive`
+  and `not_authed`. Any other non-transient code there, such as
+  `missing_scope` or `access_denied`, is that call's own failure and refuses
+  no token: after `bots.info` at bring-up the persona comes up with its
+  installation unverified, and on the membership inventory it stays up with
+  reason `access` (see
+  [`channel-membership-inventory-incomplete`](#channel-membership-inventory-incomplete)).
+  A transient code is not a refusal either: on `bots.info` at bring-up the
+  persona is `persona-slack-unreachable` and retries, as for `auth.test`, and
+  on the membership inventory it is reason `transport`.
 - **Fix:** Get a working token from the persona's Slack app and have the
   operator write it into the credentials file, in their own terminal, with
   `claude-slack-channel-bots credentials <persona>` (it asks for both tokens
@@ -978,7 +989,8 @@ The named persona/channel lacks trustworthy current membership. The causes are
 `installation-unverified`, `current-membership-missing`, `eligibility-missing`,
 `event-order-conflict`, `shared-state-unreadable` and `history-unresolved`.
 `installation-unverified`
-requires the current authenticated app; `current-membership-missing` requires
+requires a verified installation of the current authenticated app (see its
+[inventory reason](#channel-membership-inventory-incomplete)); `current-membership-missing` requires
 responsive inventory after startup, a gap or a live observation. A received
 join/leave is authenticated history, not current presence or absence by itself.
 `eligibility-missing` needs valid channel type and sharing metadata;
@@ -1026,12 +1038,29 @@ readback uses `problem`, `slackError`, `deadline`, `nextAttemptAt` and
 `retryAfterSeconds`. Times ending in `At` and `deadline` are epoch milliseconds;
 Retry-After is seconds.
 
+A scan needs a verified installation first. `auth.test` identifies the bot;
+when it gives no app ID, `bots.info` supplies it, which needs the `users:read`
+bot scope.
+
+The scan then reads `users.conversations` for public and private channels
+(`channels:read` and `groups:read`) on the persona's current connection. Add
+a missing scope with
+[Update and reinstall an existing app](../setup-slack-channel-bots/SKILL.md#update-and-reinstall-an-existing-app).
+A complete inventory still verifies no subscriptions or reinstall (see
+[membership readiness](#membership-setup-record-and-readback)).
+
+A reason classifies the last failure, not the call that failed: an inventory
+read, a retry's revalidation of the persona, or the refusal that broke it all
+use the same reasons. Read it with the persona's own class lines since its
+latest `persona-start` line (see [Triage](#triage)).
+
 | Reason | Missing evidence and action |
 |---|---|
 | `none` | No classified failure yet; read `inventory.state` for unverified/scanning progress. |
-| `deadline`, `transport`, `malformed-page` | No complete responsive pagination; restore Slack/network service and let the bounded retry run. A short or empty page with a cursor is not completion. |
-| `access` | Slack refused membership access, for example `missing_scope` or `access_denied`. Check the current app's public/private read scopes and workspace access, complete any required reinstall, and record setup separately. |
-| `authentication`, `installation-unverified` | Current authenticated installation is unavailable; follow the credential diagnostic. Invalid/revoked credentials stay held while validation fails. |
+| `deadline`, `transport`, `malformed-page` | No complete responsive pagination; `transport` includes Slack's transient errors and rate limits. Restore Slack/network service and let the bounded retry run. A short or empty page with a cursor is not completion. |
+| `access` | A non-transient Slack refusal outside the four authentication codes, for example `missing_scope` or `access_denied`. On a persona that is up with a verified installation, `users.conversations` refused: restore the app's `channels:read`/`groups:read` scopes or workspace access through the linked update and reinstall, and the bounded retry reads the pages again on the same connection without revalidating it. On a persona that is broken, or whose installation is unverified, Slack refused its credentials check (`auth.test` or the Socket Mode open) instead: read `slack_error` and follow [`persona-credentials-refused`](#persona-credentials-refused). Record setup separately. |
+| `installation-unverified` | The persona's current app installation is unverified. For a persona that is up with no credentials line, `auth.test` accepted the bot token but `bots.info` was refused with a non-transient, non-authentication code, usually for a missing `users:read`, or described another bot. It stays up on its `auth.test` identity: DMs and already accepted queued work continue, while a channel message or mention whose membership is unresolved, and join and leave events, stay held and unacknowledged, and bot channel choices are not applied. An unverified installation grants no membership. Add `users:read` through the linked update and reinstall; each retry checks the installation again with the held credentials. |
+| `authentication` | Slack refused a token (`invalid_auth`, `token_revoked`, `account_inactive` or `not_authed`): the bot token or the Socket Mode app token. The reason does not say which; use the key and check named on the credentials line when one is present. If the persona is broken, follow [`persona-credentials-refused`](#persona-credentials-refused): only a break on `users.conversations`, or on `bots.info` at bring-up, is also revalidated on its held credentials within [Membership recovery bounds](#membership-recovery-bounds); a refusal from posting or any other call recovers only through a confirmed change. If the persona is still up, a retry's revalidation was refused and the persona keeps its current connection; fix the token as that entry says. Invalid/revoked credentials stay held while validation fails. |
 | `storage` | Restore shared-state readability/writability; no incomplete negative batch may remove choices. |
 | `superseded`, `current-membership-missing` | The observation is obsolete or current evidence was invalidated; wait for the replacement reconciliation. |
 | `eligibility-missing`, `event-order-conflict`, `history-unresolved` | Follow [`channel-membership-unresolved`](#channel-membership-unresolved); current scans cannot solve unprovable history. |
@@ -1094,12 +1123,27 @@ two pages taking at most 10000 ms each, that is **160000 ms plus persistence**,
 provided the successful attempt completes within its 120000 ms bound. This is
 a conditional calculation, not a fixed total independent of pages/rate limits.
 
-Membership-origin access repair runs while idle without a new message,
-reconnect request or restart. The existing credential/client owner revalidates
-already applied credentials, the current authenticated installation and all
-persona admission checks. Pending credential edits are not adopted. Other
-credential/posting failures retain their recovery policy; this is not automatic
-recovery for every broken persona.
+Membership repair runs while idle without a new message, reconnect request or
+restart. Which repair applies depends on the persona's state and the call that
+failed, not on the inventory reason alone.
+
+When `users.conversations` refuses a persona that is up with a verified
+installation, for any reason but authentication, the persona stays up. The
+next permitted attempt reads the pages again on the same connection, without
+revalidating it.
+
+A persona that is up with an unverified installation, or broken by a
+membership-origin refusal (Slack refusing its bot token on
+`users.conversations`, or on `bots.info` at bring-up), is revalidated at each
+attempt. The existing credential/client owner checks the already applied
+credentials, the current authenticated installation and all persona admission
+checks; pending credential edits are not adopted, and a failed check leaves the
+persona as it was.
+
+A persona broken by any other refusal, such as a posting call's, is not
+revalidated: its scans report that refusal's reason, and it keeps the
+confirmed-change recovery. This is not automatic recovery for every broken
+persona.
 
 Shutdown, the persona's teardown and a new persona incarnation cancel the
 running attempt and its pending retry. A connection change cancels a running
@@ -1743,8 +1787,8 @@ file, but it cuts off every persona and isn't the fix.
 
 ### Fixed on Slack's side, same tokens
 
-A **membership-origin** refusal can recover after the app's access is repaired
-in Slack, using the already applied tokens. The existing credential/client
+A **membership-origin** refusal can recover after its cause is fixed in Slack,
+using the already applied tokens. The existing credential/client
 owner revalidates the current authenticated installation and all admission
 checks while idle, within [Membership recovery bounds](#membership-recovery-bounds).
 Read inventory status and its next attempt; no re-save, message or restart is
@@ -7978,7 +8022,7 @@ See [A persona is silent in a channel its app was invited to](#a-persona-is-sile
 
 ### Symptom: Membership inventory or app setup is unresolved
 
-Read [membership readiness](#membership-setup-record-and-readback) to separate inventory completeness from current-app subscription/reinstall evidence; for app setup, follow [Update and reinstall an existing app](../setup-slack-channel-bots/SKILL.md#update-and-reinstall-an-existing-app). Follow the named access/storage cause and [recovery bounds](#membership-recovery-bounds); retain unprovable history as [`channel-membership-unresolved`](#channel-membership-unresolved) describes.
+Read [membership readiness](#membership-setup-record-and-readback) to separate inventory completeness from current-app subscription/reinstall evidence; for app setup, follow [Update and reinstall an existing app](../setup-slack-channel-bots/SKILL.md#update-and-reinstall-an-existing-app). Follow the named [inventory reason](#channel-membership-inventory-incomplete) and [recovery bounds](#membership-recovery-bounds); retain unprovable history as [`channel-membership-unresolved`](#channel-membership-unresolved) describes.
 
 ### Symptom: A persona receives every message in a channel
 

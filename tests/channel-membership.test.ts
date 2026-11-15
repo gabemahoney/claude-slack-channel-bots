@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import { _assignFixture, deliveryAttempt, makeMembershipHarness, membershipPage, readSharedState, writeSharedState, SHARED_CHANNEL_IDS as C, type MembershipHarness, configBytes, channelPopulation, withPreRuleScanRepeats } from './test-helpers/shared-channels.ts'
-import { makeDeferredWebApiCall, makeDeferredConnect, makeChannelMessage, makeDm } from './test-helpers/slack-stub.ts'
+import { makeDeferredWebApiCall, makeDeferredConnect, makeChannelMessage, makeDm, makeMembershipEvent, mentionText, type SlackEvent, type WebApiOutcome } from './test-helpers/slack-stub.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { MEMBERSHIP_REQUEST_TIMEOUT_MS, MEMBERSHIP_ATTEMPT_TIMEOUT_MS, MEMBERSHIP_RETRY_MIN_MS, MEMBERSHIP_RETRY_MAX_MS, MEMBERSHIP_PAGE_LIMIT } from '../src/channel-membership-retry.ts'
 import { makeManagedRouting } from './test-helpers/persona-routing-managed.ts'
@@ -22,6 +22,8 @@ import { spyOnCopies } from './test-helpers/copies.ts'
 import * as sharedChannels from '../src/shared-channels.ts'
 import { makeReloadHarness } from './test-helpers/reload-harness.ts'
 import { buildOperatorAssignment } from '../src/reload-request.ts'
+import { membershipDiagnostic } from '../src/channel-membership.ts'
+import { slackInstallationIdentity } from '../src/persona-slack-validation.ts'
 
 const runs: MembershipHarness[] = [], dirs: string[] = []
 function fixture(opts: Parameters<typeof makeMembershipHarness>[1] = {}, dir = mkdtempSync(join(tmpdir(), 'membership-'))) {
@@ -321,13 +323,54 @@ test.each(['off', 'mentions', 'all', 'thread_hybrid'] as const)('complete absenc
   expect(life(reopened).leaves[C.primary]).toEqual(leave)
 })
 
-test.each(['missing_scope', 'access_denied', 'invalid_auth', 'token_revoked'] as const)('real watched manager repairs membership-origin %s while idle using applied credentials only', async error => {
-  const f = fixture({ realBringUp: true }); stub(f).script.inventory.push({ kind: 'platform', error }); await f.start(); await f.scan()
-  expect(f.scanner.status('alpha').state).toBe('incomplete')
-  if (error === 'invalid_auth' || error === 'token_revoked') expect(f.h.manager.status('alpha')?.state).toBe('broken')
+test.each(['missing_scope', 'access_denied'] as const)('%s inventory refusal keeps the real watched persona up; the next permitted scan completes on the same socket, provenance and generation', async error => {
+  const f = fixture({ realBringUp: true, channels: [{ id: C.primary, delivery: 'all' }, { id: C.secondary, delivery: 'mentions' }] })
+  const s = stub(f)
+  s.script.inventory.push(membershipPage([C.primary], 'next'), { kind: 'platform', error })
+  await f.start()
+  const socket = s.socket, provenance = f.h.manager.provenance('alpha')!, generation = f.membership.generation('alpha')!.generation
+  const assignments = life(f).assignments
+  // Validation, reconnect and status evidence: none may follow from an access error.
+  const connection = () => ({
+    state: f.h.manager.status('alpha')?.state, bringUp: f.bringUps.state('alpha')?.outcome, statuses: f.h.statuses.length,
+    authTest: s.calls.authTest.length, botsInfo: s.calls.botsInfo.length, sockets: s.sockets.length, starts: socket.startCalls,
+    clients: f.h.slack.activityOf('alpha').filter(a => a.kind !== 'web').length,
+    connection: f.h.manager.provenance('alpha')?.connectionId, current: provenance.isCurrent(), generation: f.membership.generation('alpha')?.generation,
+  })
+  const before = connection()
+  expect(before).toMatchObject({ state: 'up', bringUp: 'up', authTest: 1, botsInfo: 1, sockets: 1, connection: provenance.connectionId, current: true, generation })
+  await f.scan()
+  expect(f.scanner.status('alpha')).toMatchObject({ state: 'incomplete', problem: 'access', slackError: error, pages: 1, positives: 1 })
+  expect(connection()).toEqual(before)
+  // Page 1's positive stays current; the refused page proves no absence.
+  expect([reading(f), reading(f, C.secondary)]).toEqual([expect.objectContaining({ kind: 'eligible', generation }), { kind: 'unresolved', reason: 'current-membership-missing' }])
+  expect(life(f).assignments).toEqual(assignments)
+  expect(life(f).membershipInventory).toBeUndefined()
+  const next = f.scanner.status('alpha').nextAttemptAt!
+  expect(next - f.h.clock.now()).toBeGreaterThanOrEqual(MEMBERSHIP_RETRY_MIN_MS)
+  await f.h.clock.advanceTo(next - 1)
+  expect(s.calls.inventory).toHaveLength(2)
+  s.script.inventory.push(membershipPage([C.primary, C.secondary]))
+  await f.h.clock.advance(1)
+  expect(f.scanner.status('alpha')).toMatchObject({ state: 'complete', pages: 1, positives: 2 })
+  expect(s.calls.inventory).toHaveLength(3)
+  expect(connection()).toEqual(before)
+  expect([C.primary, C.secondary].map(channel => reading(f, channel))).toEqual([C.primary, C.secondary].map(() =>
+    expect.objectContaining({ kind: 'eligible', generation })))
+  expect(life(f).assignments).toEqual(assignments)
+  expect(readSharedState(f.stateDir)!.personas.alpha!.assignments).toEqual(assignments)
+})
+
+test.each([['users.conversations', 'invalid_auth'], ['users.conversations', 'token_revoked'], ['bots.info', 'invalid_auth']] as const)('real watched manager repairs a membership-origin %s %s refusal while idle using applied credentials only', async (method, error) => {
+  const f = fixture({ realBringUp: true })
+  stub(f).script[method === 'bots.info' ? 'botsInfo' : 'inventory'].push({ kind: 'platform', error })
+  await f.start()
+  if (method === 'users.conversations') await f.scan()
+  expect(f.scanner.status('alpha')).toMatchObject({ state: 'incomplete', problem: 'authentication', slackError: error })
+  expect(f.h.manager.status('alpha')?.state).toBe('broken')
   expect(reading(f).kind).toBe('unresolved')
   const starts = stub(f).calls.inventory.length, validations = stub(f).calls.authTest.length
-  expect(f.bringUps.state('alpha')?.outcome).toBe(error === 'invalid_auth' || error === 'token_revoked' ? 'broken' : 'up')
+  expect(f.bringUps.state('alpha')?.outcome).toBe('broken')
   const digest = f.bringUps.credentialsDigest('alpha')
   const { writeCredentialsFile, fakeToken, BOT_TOKEN_PREFIX, APP_TOKEN_PREFIX } = await import('./test-helpers/credentials.ts')
   writeCredentialsFile(f.stateDir, 'personas/alpha/credentials.json', { bot_token: fakeToken(BOT_TOKEN_PREFIX, 'pending-unconfirmed'), app_token: fakeToken(APP_TOKEN_PREFIX, 'pending-unconfirmed') })
@@ -639,6 +682,89 @@ test('metadata validation hang stays inside the manager deadline; late completio
   metadata.settle({ kind: 'ok', result: { bot: { id: stub(f).identity.botId, user_id: stub(f).identity.botUserId, app_id: 'A0MEMBER0' } } })
   await f.h.clock.flush()
   expect(stub(f).sockets).toHaveLength(0); expect(reading(f).kind).toBe('unresolved')
+})
+
+test('a non-auth bots.info refusal brings the persona up on its auth.test identity with membership held; its DM and accepted work deliver beside a verified sibling', async () => {
+  const f = fixture({ realBringUp: true, names: ['alpha', 'beta'], channels: [{ id: C.primary, delivery: 'mentions' }] })
+  const alpha = stub(f), beta = stub(f, 'beta')
+  // Every metadata retry takes a refusal: an empty queue would verify the installation.
+  alpha.script.botsInfo.push(...Array<WebApiOutcome>(20).fill({ kind: 'platform', error: 'missing_scope' }))
+  beta.script.inventory.push(membershipPage([C.primary]))
+  await f.start()
+  const { appId: _unverified, ...authenticated } = alpha.identity
+  expect([f.h.manager.status('alpha'), f.bringUps.state('alpha')?.outcome]).toEqual([{ state: 'up', identity: authenticated }, 'up'])
+  expect(slackInstallationIdentity(f.h.manager.provenance('alpha')!.identity)).toBeUndefined()
+  const socket = alpha.socket, connectionId = f.h.manager.provenance('alpha')!.connectionId
+  await f.scan()
+  const expectUnverified = () => {
+    expect(f.scanner.status('alpha')).toMatchObject({ state: 'incomplete', problem: 'installation-unverified', slackError: undefined })
+    expect(scanLines(f)).toContain(membershipScanDiagnostic('alpha', f.scanner.status('alpha')))
+    expect(f.h.manager.status('alpha')).toEqual({ state: 'up', identity: authenticated })
+    expect(f.h.manager.provenance('alpha')).toMatchObject({ connectionId, identity: authenticated })
+    expect(alpha.calls.inventory).toEqual([])
+    expect(reading(f)).toEqual({ kind: 'unresolved', reason: 'current-membership-missing' })
+  }
+  expectUnverified()
+  expect([f.scanner.status('beta').state, reading(f, C.primary, 'beta').kind]).toEqual(['complete', 'eligible'])
+  const choices = createChannelDeliveryStore(f.authority, (key, channel) =>
+    f.h.manager.status(key)?.state === 'up' && f.membership.read(key, channel, 'open').kind === 'eligible')
+  const managed = makeManagedRouting(f.h, f.stateDir, { membership: f.membership, getChannelDelivery: () => choices })
+  const forwarded: Array<{ key: unknown; channel: unknown; current: boolean | undefined }> = []
+  f.h.onEvent = createPersonaEventRouter({ membership: f.membership, clientFor: f.h.clientFor, getPersona: f.h.getPersona, log: line => managed.logs.push(line),
+    routing: { ...managed.routing, receive: (event, ack, keys, flag, provenance) => {
+      forwarded.push({ key: keys, channel: (event as SlackEvent)['channel'], current: provenance?.isCurrent() })
+      return managed.routing.receive(event, ack, keys, flag, provenance)
+    } } })
+  const { makeEngineHarness } = await import('./test-helpers/delivery-engine.ts')
+  const e = await makeEngineHarness({ stateDir: f.stateDir, queue: managed.queue, keys: ['alpha', 'beta'] })
+  try {
+    await managed.ready
+    // Open mode takes a mention from its channel message.
+    const held = makeChannelMessage({ channel: C.primary, text: `${mentionText(alpha.identity.botUserId)} unverified mention body`, ts: '1700000005.000001' })
+    const dm = makeDm({ text: 'unverified direct body', ts: '1700000005.000002' })
+    const sibling = makeChannelMessage({ channel: C.primary, text: `${mentionText(beta.identity.botUserId)} verified mention body`, ts: '1700000005.000003' })
+    await socket.deliver(held)
+    expect(socket.acks).toEqual([]); expect(managed.queued('alpha')).toEqual([])
+    await socket.deliver(dm)
+    expect(socket.acks).toHaveLength(1)
+    await beta.socket.deliver(sibling)
+    expect(beta.socket.acks).toHaveLength(1)
+    expect(forwarded).toEqual([{ key: 'alpha', channel: C.primary, current: true }, { key: 'alpha', channel: dm.channel, current: true }, { key: 'beta', channel: C.primary, current: true }])
+    // Membership intake and a bot's channel choice gain no authority.
+    const revision = f.authority.revision
+    await socket.deliver(...makeMembershipEvent(alpha.identity, 'join', C.primary, f.h.clock.now()))
+    expect(socket.acks).toHaveLength(1)
+    expect([f.authority.revision, life(f).membership]).toEqual([revision, {}])
+    expect(f.lines).toContain(membershipDiagnostic('alpha', C.primary, 'installation-unverified'))
+    expect(choices.attempt('alpha', f.authority.incarnation('alpha')!, deliveryAttempt('unverified-choice', C.primary, 'off'), () => undefined))
+      .toEqual({ kind: 'not-applied', reason: 'membership' })
+    expect(f.authority.choice('alpha', C.primary)).toBe('mentions')
+    // The next metadata retry is refused again; Slack's retry of the mention stays held.
+    await f.h.clock.advanceTo(f.scanner.status('alpha').nextAttemptAt!)
+    expectUnverified()
+    await socket.deliver(held)
+    expect(socket.acks).toHaveLength(1)
+    const queued = (key: string) => managed.queued(key).map(({ accepted: { seq, text, channel, via } }) => ({ seq, text, channel, via }))
+    const accepted = { alpha: queued('alpha'), beta: queued('beta') }
+    expect(accepted).toEqual({
+      alpha: [{ seq: expect.any(Number), text: String(dm.text), channel: String(dm.channel), via: 'dm' }],
+      beta: [{ seq: expect.any(Number), text: String(sibling.text), channel: C.primary, via: 'mention' }],
+    })
+    const durable = (key: 'alpha' | 'beta', kind: string) => e.records(key).filter(record => record.kind === kind).map(record => record.seq)
+    for (const key of ['alpha', 'beta'] as const) expect(durable(key, 'accepted')).toEqual(accepted[key].map(item => item.seq))
+    // Previously accepted work delivers while bots.info stays refused.
+    for (const key of ['alpha', 'beta']) { e.p(key).row.state = 'waiting'; await e.tick(key) }
+    await e.until(() => managed.queue.openCount('alpha') === 0 && managed.queue.openCount('beta') === 0)
+    for (const key of ['alpha', 'beta'] as const) {
+      expect(durable(key, 'delivered')).toEqual(accepted[key].map(item => item.seq))
+      expect(e.events.flatMap(event => event.type === 'item-delivered' && event.key === key ? [event.seq] : [])).toEqual(accepted[key].map(item => item.seq))
+    }
+    expect(alpha.script.botsInfo.length).toBeGreaterThan(0)
+    expectUnverified()
+    const diagnostics = JSON.stringify({ lines: f.lines, manager: f.h.lines, statuses: f.h.statuses, scan: f.scanner.status('alpha') })
+    for (const body of [held.text, dm.text, sibling.text]) expect(diagnostics).not.toContain(String(body))
+    assertNoLeak({ logs: managed.logs, errors: e.errors, events: e.events, journal: writtenFile(join(f.stateDir, 'queue')) })
+  } finally { await e.cleanup(); await managed.close() }
 })
 
 test.each(['same', 'foreign'] as const)('%s installation candidate socket cannot mutate assignments before credential swap', async installation => {

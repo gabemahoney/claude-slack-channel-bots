@@ -212,11 +212,14 @@ terminal command in 5.10.
 
 **Reusing an existing app** for this persona: collect all missing scopes and
 subscriptions before following **Update and reinstall an existing app**,
-linked below, for one reinstall. Check for `im:write`, `channels:read` and `groups:read`;
-the debugging skill's entries "A persona can't open a DM: re-install its app
+linked below, for one reinstall. Check for `im:write`, `channels:read`, `groups:read`
+and `users:read`; the debugging skill's entries "A persona can't open a DM: re-install its app
 to gain `im:write`" and "The message archive shows channel IDs: re-install
 each app to gain `channels:read` and `groups:read`"
-(`skills/debug-slack-channel-bots/SKILL.md`) explain the corresponding symptoms.
+(`skills/debug-slack-channel-bots/SKILL.md`) explain the corresponding symptoms,
+and its [`channel-membership-inventory-incomplete`](../debug-slack-channel-bots/SKILL.md#channel-membership-inventory-incomplete)
+entry explains the membership ones, including the unverified installation a
+missing `users:read` leaves.
 
 Also collect missing `lists:read` and `lists:write` scopes, which a bot needs
 to use a Slack List, in the same update.
@@ -237,7 +240,8 @@ An app already used by another persona can't be reused.
 **Membership setup for a new app:** check the currently installed
 app's **Event Subscriptions** → **Subscribe to bot events** for both
 `member_joined_channel` and `channel_left`, and its bot scopes for
-`channels:read` (public) and `groups:read` (private). A fresh manifest install
+`channels:read` (public), `groups:read` (private) and `users:read` (verifying
+the app installation). A fresh manifest install
 includes them and needs no extra reinstall. For an existing app, follow
 [Update and reinstall an existing app](#update-and-reinstall-an-existing-app).
 Ordinary CSCB startup neither
