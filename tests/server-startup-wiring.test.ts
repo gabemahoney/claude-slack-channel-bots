@@ -86,6 +86,7 @@ import type {
   UnclassifiedErrorEpisodesDeps,
 } from '../src/persona-episodes.ts'
 import type { PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
+import type { PollerDeps } from '../src/permission-poller.ts'
 import type * as PersonaNotifierModule from '../src/persona-notifier.ts'
 import type { PersonaNotifier } from '../src/persona-notifier.ts'
 import type { PersonaRouting, PersonaRoutingDeps } from '../src/persona-routing.ts'
@@ -3723,7 +3724,7 @@ describe('main() builds the one per-persona latch, in server memory only, before
     expect(indicesOf(new RegExp(`\\.\\s*${ADD_OBSERVER}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
   })
 
-  test('nothing in main() loads latch state from a file: no statement of main() sets the latch, the instance is named only at its build, its two bindings, its install, the latch re-check\'s build and binding, its four latched queries in main() (the retry action\'s, the restart work\'s, the reconnect adapter\'s inside the restart module\'s call, and the health tick\'s), the persona routing\'s holder assignment and the teardown\'s forget, and the latch module imports no file-system module', () => {
+  test('nothing in main() loads latch state from a file: no statement of main() sets the latch, the instance is named only at its build, its two bindings, its install, the latch re-check\'s build and binding, its five latched queries in main() (the retry action\'s, the restart work\'s, the reconnect adapter\'s inside the restart module\'s call, the health tick\'s and the permission poller\'s), the persona routing\'s holder assignment and the teardown\'s forget, and the latch module imports no file-system module', () => {
     const latch = constOf(LATCH_FACTORY)
     const IS_LATCHED: keyof ConflictLatch = 'isLatched'
 
@@ -3742,13 +3743,14 @@ describe('main() builds the one per-persona latch, in server memory only, before
     // check's latched query, and the persona teardown's latch forget (its
     // form is pinned in tests/reload-wiring.test.ts); twice inside the restart
     // module's call: its own latched query and the reconnect adapter's, asked
-    // right before /mcp reconnect is typed; and once as the
+    // right before /mcp reconnect is typed; once inside the permission
+    // poller's call, its latched-persona query; and once as the
     // value of the persona routing's module-scope holder, which the routing's
     // lost-message latched query reads at call time. The
     // queries' forms are pinned in the describe below; the holder's in the
     // persona routing's describe.
     const named = indicesOf(new RegExp(`\\b${latch}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(16)
+    expect(named).toHaveLength(17)
     expect(withinCall(named, onlyCallOf('createReplyReminders'))).toBe(1)
     expect(withinCall(named, onlyCallOf('createDeliveryReporting'))).toBe(1)
     const decl = SERVER_CODE.match(new RegExp(`\\bconst\\s+${latch}\\b`))!
@@ -3759,8 +3761,8 @@ describe('main() builds the one per-persona latch, in server memory only, before
     }
     const within = (call: string) => withinAt(onlyCallOf(call))
     expect(
-      [BIND_LATCH_HOLDS, BIND, RECHECK_BUILDER, RECHECK_BIND, 'setConflictLatch', 'createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaLifecycle'].map(within),
-    ).toEqual([1, 1, 1, 1, 1, 0, 2, 1, 1])
+      [BIND_LATCH_HOLDS, BIND, RECHECK_BUILDER, RECHECK_BIND, 'setConflictLatch', 'createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaLifecycle', 'startPermissionPoller'].map(within),
+    ).toEqual([1, 1, 1, 1, 1, 0, 2, 1, 1, 1])
     expect(onlyCallProps(RECHECK_BUILDER).get(RECHECK_LATCH)).toBe(latch)
     expect(within('createDeliveryEngines')).toBe(1)
     expect(withinRetryRunGate(named)).toBe(1)
@@ -3805,7 +3807,7 @@ describe('main() builds the one per-persona latch, in server memory only, before
 // tests/health-check.test.ts; pinned here: the bindings.
 // ---------------------------------------------------------------------------
 
-describe('main() binds the latch\'s holds before its CONFLICT notice, installs the latch in the session manager before the start pass, and binds its latched query into the retry action, the restart work and the health tick', () => {
+describe('main() binds the latch\'s holds before its CONFLICT notice, installs the latch in the session manager before the start pass, and binds its latched query into the retry action, the restart work, the health tick and the permission poller', () => {
   // Tied to src by type: renaming any of these fails the typecheck.
   const BIND_NOTICE: keyof typeof ConflictLatchModule = 'bindConflictNotice'
   const HOLD_OBSERVER_FACTORY: keyof typeof ConflictLatchModule = 'createConflictLatchHoldObserver'
@@ -3813,6 +3815,7 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
   const RETRY_LATCHED: keyof FullModeRetryDeps = 'isLatched'
   const RESTART_LATCHED: keyof RestartDeps = 'isLatched'
   const TICK_LATCHED: keyof HealthCheckDeps = 'isLatched'
+  const POLLER_LATCHED: keyof PollerDeps = 'isPersonaLatched'
   const STOP: keyof UnavailableRetryController = 'stop'
   const CONDITION_END: keyof TmuxUnresponsiveCondition = 'end'
   const EPISODE_END: keyof UnclassifiedErrorEpisodes = 'end'
@@ -3901,13 +3904,16 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     expect(indicesOf(/\bawait\b/g, SERVER_CODE.slice(install, last))).toEqual([])
   })
 
-  test('five latched queries and one read: the latched query is bound exactly once into each of the full-mode retry action, the restart work, the reconnect adapter (its second argument, after the persona lookup) and the health tick, as a call-time read of the one latch\'s isLatched for the key it is given, and once into the persona routing, through its module-scope holder of that one latch, which the tmux-unavailable retry check\'s production deps also ask once', () => {
+  test('six latched queries and one read: the latched query is bound exactly once into each of the full-mode retry action, the restart work, the reconnect adapter (its second argument, after the persona lookup), the health tick and the permission poller (its isPersonaLatched), as a call-time read of the one latch\'s isLatched for the key it is given, and once into the persona routing, through its module-scope holder of that one latch, which the tmux-unavailable retry check\'s production deps also ask once', () => {
     const latch = constOf(LATCH_FACTORY)
     declaredOnce(latch)
     const query = oneKeyArrow(`${latch}\\.${IS_LATCHED}\\(\\1\\)`)
     expect(onlyCallProps('createFullModeRetryAction').get(RETRY_LATCHED)).toMatch(query)
     expect(onlyCallProps('initRestart').get(RESTART_LATCHED)).toMatch(query)
     expect(onlyCallProps('initHealthCheck').get(TICK_LATCHED)).toMatch(query)
+    // the permission poller skips a latched persona's rows outside
+    // check_permission, so the latch's re-check rounds stay its only reads.
+    expect(onlyCallProps('startPermissionPoller').get(POLLER_LATCHED)).toMatch(query)
     // the reconnect adapter asks it right before typing /mcp reconnect.
     const [lookup, adapterQuery, ...extra] = reconnectAdapterArgs()
     expect([lookup, extra]).toEqual(['getAppliedPersona', []])
@@ -3923,7 +3929,8 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     // No other latched member or query anywhere in server.ts: one member
     // inside each of the three calls in main(), one inside the module-scope
     // routing's call and one in the retry check's production deps, and one
-    // query inside each of the three calls, the reconnect adapter's build
+    // query inside each of the three calls, the permission poller's call
+    // (bound as isPersonaLatched, so no `isLatched:` member), the reconnect adapter's build
     // (the one inside the restart module's call), the routing's call and the
     // retry check's deps, which the check itself asks once (its `deps`
     // parameter's). Outside main, `isLatched:` is otherwise only a
@@ -3945,10 +3952,10 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     expect(inCheck(outside)).toBe(1)
     expect(within(outside, SERVER_CODE.search(/\bfunction\s+reconnectLatchedAt\s*\(/))).toBe(1)
     const queries = indicesOf(new RegExp(`\\.\\s*${IS_LATCHED}\\s*\\(`, 'g'), SERVER_CODE)
-    expect(queries).toHaveLength(11)
+    expect(queries).toHaveLength(12)
     expect(withinCall(queries, onlyCallOf('createReplyReminders'))).toBe(1)
     expect(withinCall(queries, onlyCallOf('createDeliveryReporting'))).toBe(1)
-    expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaRouting'].map((call) => within(queries, onlyCallOf(call)))).toEqual([0, 2, 1, 1])
+    expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaRouting', 'startPermissionPoller'].map((call) => within(queries, onlyCallOf(call)))).toEqual([0, 2, 1, 1, 1])
     expect(withinRetryRunGate(queries)).toBe(1)
     expect(within(queries, onlyReconnectAdapterBuild())).toBe(1)
     expect(inCheck(queries)).toBe(1)

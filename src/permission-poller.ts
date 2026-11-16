@@ -31,6 +31,8 @@
  *
  * Behavior per tick:
  *   1. list({label:['service=cscb']}) (finished rows excluded by AD).
+ *      A conflict-latched persona is read only when list reports
+ *      check_permission, preserving the original discovery boundary.
  *   2. For each row, resolve the persona from its `persona` label; a row with
  *      no label, or one naming no applied persona, is logged and skipped.
  *      Then get({instance_id}). An absent permission_requests projection
@@ -294,6 +296,12 @@ interface PollerOwnDeps {
    * `createPersonaUpPredicate`. An applied persona that is not up is skipped.
    */
   isPersonaUp: (key: string) => boolean
+  /**
+   * The server's conflict latch. Latched rows outside list's check_permission
+   * state get no discovery read, preserving the pre-b.92q call pattern.
+   * Absent when the caller has no latch (standalone drivers and unit fixtures).
+   */
+  isPersonaLatched?: (key: string) => boolean
   /** Poll interval in ms; from config.agent_director_poll_interval_ms. */
   intervalMs: number
   /** Hook to record runtime errors. Defaults to console.error. */
@@ -1082,7 +1090,8 @@ async function runTick(deps: PollerDeps): Promise<void> {
     const client = deps.getClient()
     let rows: ListRow[]
     try {
-      // One list, at most one get per listed live row, and at most one
+      // One list, at most one get per eligible listed row (unlatched, or
+      // listed in check_permission), and at most one
       // get-permission per tracked prompt in the closing sweep: 1 + L + P
       // AD calls per tick. Both discovery projections share that get and
       // deduplicate in memory, with no per-request AD read or retry.
@@ -1150,6 +1159,11 @@ async function runTick(deps: PollerDeps): Promise<void> {
           wedgeSkippedThisTick.add(row.instance_id)
           continue
         }
+
+        // The old state-filtered list never read a latched row outside
+        // check_permission. Leave those reads to its latch re-check; retain
+        // the original permission observer and tracked-request closing sweep.
+        if (row.state !== 'check_permission' && deps.isPersonaLatched?.(persona.key)) continue
 
         let got: GetResultWithPermissionRequests
         // this `get` (like the `list` above) is not one of

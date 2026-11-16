@@ -247,6 +247,35 @@ test.each([null, undefined])('a non-conforming unproven projection (%s) holds tr
   expect(logCalls.flat().join(' ')).toContain('non-conforming open-rows response')
 })
 
+test.each(['waiting', 'working', 'ask_user', 'pending'])('a latched %s row gets no discovery read; check_permission and an unlatched row still do', async (shown) => {
+  const first = cannedPermissionRequest({ request_token: TOKEN_1 })
+  const second = cannedPermissionRequest({ request_token: TOKEN_2 })
+  const spawn: StubSpawn = { shown, requests: [], unproven: [first] }
+  spawns.set(INSTANCE_A, spawn)
+  let latched = true
+  const ivl = startPoller(1000, () => latched)
+  await ivl.tick()
+  expect(getCalls).toHaveLength(0)
+  expect(posts(stubA)).toHaveLength(0)
+  expect(permissionCalls).toEqual([])
+  spawn.shown = CHECK_PERMISSION
+  spawn.requests = [first]
+  await ivl.tick()
+  await ivl.tick()
+  expect(getCalls).toHaveLength(2)
+  expect(postedTokens()).toEqual([TOKEN_1])
+  expect(updates(stubA)).toEqual([])
+  latched = false
+  spawn.shown = shown
+  spawn.requests = []
+  spawn.unproven = [first, second]
+  await ivl.tick()
+  expect(getCalls).toHaveLength(3)
+  expect(postedTokens()).toEqual([TOKEN_1, TOKEN_2])
+  expect(permissionCalls).toEqual([])
+  assertNoLeak({ logCalls, trail: trail.events, posts: posts(stubA) }, `latched ${shown}`)
+})
+
 afterEach(() => {
   stopPermissionPoller()
   _resetPollerState()
@@ -256,9 +285,10 @@ afterEach(() => {
 })
 
 /** Start the poller as `src/server.ts` wires it, reading the installed agent-director client. */
-function startPoller(intervalMs = 1000) {
+function startPoller(intervalMs = 1000, isPersonaLatched = (_key: string) => false) {
   const clients = makePersonaClients((key) => (key === KEY_A ? stubA : undefined))
   return startManualPoller({
+    isPersonaLatched,
     intervalMs,
     getClient,
     clientFor: clients.clientFor,

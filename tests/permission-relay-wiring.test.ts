@@ -54,6 +54,7 @@ describe('server.ts wires the permission poller by persona', () => {
     const props = objectProperties(onlyCallArguments(SERVER_CODE, 'startPermissionPoller'))
     expect(props.get('clientFor')).toBe('clientFor')
     expect(props.get('getPersona')).toBe('getAppliedPersona')
+    expect(props.get('isPersonaLatched')).toBe('(key) => conflictLatch.isLatched(key)')
   })
 
   test('the poller gets the one createPersonaDestinations resolver, the same one the persona notifier gets', () => {

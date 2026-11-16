@@ -4015,8 +4015,10 @@ marks the row missing, leaving only the status-failure leg's stop line.
 #### The find-missing loop
 
 `run_find_missing_loop [<interval-s>]` plays the host's `find-missing` loop,
-for a latched persona's row only: CSCB makes no extra call for a
-latched persona beyond its scheduled recheck, so the loop marks its row
+for a latched persona's row only: outside the permission observer's original
+`check_permission` discovery and tracked-request reconciliation, CSCB makes no
+extra call for a latched persona beyond its scheduled recheck. In these scenarios
+there is no permission prompt, so the loop marks its row
 `missing` or clears a `provenance_conflict` note on AD before 0.18.0.
 From AD 0.18.0 a recheck's active read can also mark the row or clear its
 note; test 23 keeps the note's cause until the clearing event and attributes

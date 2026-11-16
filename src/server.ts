@@ -4184,7 +4184,7 @@ export async function main(): Promise<void> {
     resetAllToHealthy(personaConfig.personas.map((p) => p.key))
 
     // permission poller — single-threaded interval loop monitors AD
-    // state for spawns in check_permission and posts Block Kit prompts to
+    // live permission requests and posts Block Kit prompts to
     // each persona's destination through its client. It does
     // not wait for any persona: one with no client yet is skipped.
     startPermissionPoller({
@@ -4199,6 +4199,7 @@ export async function main(): Promise<void> {
       // a not-up persona's rows are skipped, its prompts and
       // wedge state held until it is up.
       isPersonaUp,
+      isPersonaLatched: (key) => conflictLatch.isLatched(key),
       intervalMs: personaConfig.agent_director_poll_interval_ms,
     })
   }
