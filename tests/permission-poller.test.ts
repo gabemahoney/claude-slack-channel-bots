@@ -574,6 +574,199 @@ function getResult(permission_requests?: PermissionRequestRow[] | null, persona:
 }
 
 // ---------------------------------------------------------------------------
+// Listed-row read budget (b.8yp), retaining b.92q discovery and F4.
+// ---------------------------------------------------------------------------
+
+describe('listed-row read budget', () => {
+  function scenario(state: 'waiting' | 'working' | 'check_permission' = 'waiting', timestamp: string | undefined = '2026-11-16T00:00:01.000Z') {
+    const row: ReturnType<typeof checkPermRow> & { state_changed_at?: string } = { ...checkPermRow(), state, state_changed_at: timestamp }
+    let projection: CannedGetResult & { state_changed_at?: string } = {
+      ...cannedGetResult({ state, permission_requests: [], unproven_requests: [] }, A, personaDir),
+      state_changed_at: timestamp,
+    }
+    let listed = true
+    let gets = 0
+    let failNextGet = false
+    const start = (opts: Partial<PollerDeps> = {}) => startPoller(() => ({
+      list: async () => ({ spawns: listed ? [row] : [] }),
+      get: async () => {
+        gets++
+        if (failNextGet) { failNextGet = false; throw new Error('injected get failure') }
+        return projection
+      },
+      getPermission: async () => cannedGetPermissionResponse({ request_token: TOKEN_A, decision: 'deny', decision_reason: 'operator' }),
+    }), opts)
+    return { row, start, gets: () => gets, listed: (value: boolean) => { listed = value },
+      inspect: (patch: Partial<typeof projection>) => { projection = { ...projection, ...patch } },
+      failNextGet: () => { failNextGet = true },
+      requests: (open: boolean) => {
+        projection = { ...cannedGetResult({ state: row.state, permission_requests: [],
+          unproven_requests: open ? [cannedPermissionRequest({ request_token: TOKEN_A })] : [] }, A, personaDir),
+          state_changed_at: row.state_changed_at }
+      } }
+  }
+
+  test('unchanged idle row gets zero reads after its first sighting', async () => {
+    const s = scenario(), ivl = s.start()
+    await ivl.tick()
+    expect(s.gets()).toBe(1)
+    for (let i = 0; i < 4; i++) await ivl.tick()
+    expect(s.gets()).toBe(1)
+  })
+
+  test.each(['state', 'state_changed_at'] as const)('changed %s gets one read and discovers an unproven request', async field => {
+    const s = scenario(), ivl = s.start()
+    await ivl.tick()
+    if (field === 'state') s.row.state = 'working'
+    else s.row.state_changed_at = '2026-11-16T00:00:02.000Z' // waiting → hidden check_permission → waiting
+    s.requests(true)
+    await ivl.tick()
+    expect(s.gets()).toBe(2)
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeDefined()
+    expect(posts(stubA)).toHaveLength(1)
+  })
+
+  test('first sighting after reset reads once and discovers a pre-existing request', async () => {
+    const s = scenario()
+    await s.start().tick()
+    _resetPollerState()
+    s.requests(true)
+    const restarted = s.start()
+    await restarted.tick()
+    expect(s.gets()).toBe(2)
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeDefined()
+  })
+
+  test('check_permission is read every tick and still trips the wedge detector', async () => {
+    const s = scenario('check_permission'), ivl = s.start()
+    const ticks = wedgeTripTicks(1000)
+    for (let i = 0; i < ticks; i++) await ivl.tick()
+    expect(s.gets()).toBe(ticks)
+    expect(posts(stubA)).toHaveLength(1)
+    expect(posts(stubA)[0]?.text).toContain(buildWedgeWarningText(A, INSTANCE_A))
+  })
+
+  test('tracked open request is read every tick until closed, then idle reads stop', async () => {
+    const s = scenario(), ivl = s.start()
+    s.requests(true)
+    for (let i = 0; i < 3; i++) await ivl.tick()
+    expect(s.gets()).toBe(3)
+    s.requests(false)
+    await ivl.tick()
+    expect(s.gets()).toBe(4)
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    await ivl.tick()
+    await ivl.tick()
+    expect(s.gets()).toBe(4)
+  })
+
+  test('older binary without state_changed_at is read every tick', async () => {
+    const s = scenario()
+    s.row.state_changed_at = undefined
+    const ivl = s.start()
+    for (let i = 0; i < 3; i++) await ivl.tick()
+    expect(s.gets()).toBe(3)
+  })
+
+  test('discovered open request keeps being read while its Slack post waits for a client', async () => {
+    const s = scenario()
+    let available = false
+    const ivl = s.start({ clientFor: key => available ? clients.clientFor(key) : undefined })
+    s.requests(true)
+    await ivl.tick()
+    await ivl.tick()
+    expect(s.gets()).toBe(2)
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    available = true
+    await ivl.tick()
+    expect(s.gets()).toBe(3)
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeDefined()
+  })
+
+  test('a row absent from list is forgotten and read once when it returns unchanged', async () => {
+    const s = scenario(), ivl = s.start()
+    await ivl.tick()
+    s.listed(false)
+    await ivl.tick()
+    s.listed(true)
+    await ivl.tick()
+    await ivl.tick()
+    expect(s.gets()).toBe(2)
+  })
+
+  test('final Stop between list and get must not cause two post-Stop gets', async () => {
+    const s = scenario(), ivl = s.start()
+    await ivl.tick()
+    // List snapshots working; Stop publishes waiting before the get runs.
+    s.row.state = 'working'
+    s.row.state_changed_at = '2026-11-16T00:00:02.000Z'
+    s.inspect({ state: 'waiting', state_changed_at: '2026-11-16T00:00:03.000Z' })
+    const beforeStopReads = s.gets()
+    await ivl.tick()
+    s.row.state = 'waiting'
+    s.row.state_changed_at = '2026-11-16T00:00:03.000Z'
+    await ivl.tick()
+    expect(s.gets() - beforeStopReads).toBe(1)
+  })
+
+  test('teardown forgets observations by persona label or canonical instance id and keeps a sibling', async () => {
+    const at = '2026-11-16T00:00:01.000Z'
+    const rows = [
+      { ...checkPermRow(A), instance_id: `${INSTANCE_A}_other`, state: 'waiting' as const, state_changed_at: at },
+      // Canonical A is cleared even when its label names B, per the ownership rule.
+      { ...checkPermRow(B), instance_id: INSTANCE_A, state: 'waiting' as const, state_changed_at: at },
+      { ...checkPermRow(B), state: 'waiting' as const, state_changed_at: at },
+    ]
+    const gets: string[] = []
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: rows }),
+      get: async ({ instance_id }) => {
+        gets.push(instance_id)
+        return { ...cannedGetResult({ instance_id, state: 'waiting', permission_requests: [], unproven_requests: [] }, A, personaDir),
+          state_changed_at: at }
+      },
+    }))
+    await ivl.tick()
+    await ivl.tick()
+    expect(gets).toEqual(rows.map(row => row.instance_id))
+    forgetPersonaPrompts(KEY_A)
+    await ivl.tick()
+    await ivl.tick()
+    expect(gets).toEqual([...rows.map(row => row.instance_id), rows[0]!.instance_id, INSTANCE_A])
+  })
+
+  test('a get lacking state_changed_at counts as changed even when list supplies a timestamp', async () => {
+    const s = scenario(), ivl = s.start()
+    s.inspect({ state_changed_at: undefined })
+    for (let i = 0; i < 3; i++) await ivl.tick()
+    expect(s.gets()).toBe(3)
+  })
+
+  test('a missing get state falls back to list without discarding its inspected timestamp', async () => {
+    const s = scenario(), ivl = s.start()
+    s.inspect({ state: undefined })
+    await ivl.tick()
+    await ivl.tick()
+    expect(s.gets()).toBe(1)
+  })
+
+  test.each(['failure', 'permission_requests', 'unproven_requests'] as const)
+  ('a changed timestamp is retried after a get %s before idle reads stop', async failure => {
+    const s = scenario(), ivl = s.start()
+    await ivl.tick()
+    s.row.state_changed_at = '2026-11-16T00:00:02.000Z'
+    s.inspect({ state_changed_at: s.row.state_changed_at })
+    if (failure === 'failure') s.failNextGet()
+    else s.inspect({ [failure]: undefined })
+    await ivl.tick()
+    s.requests(false)
+    await ivl.tick()
+    await ivl.tick()
+    expect(s.gets()).toBe(3)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Block Kit builder
 // ---------------------------------------------------------------------------
 

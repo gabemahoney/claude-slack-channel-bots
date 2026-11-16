@@ -113,7 +113,7 @@
  *     key.chat_id=channel and key.ts=ts, then bound to the stub push's label/channel/ts.
  *     Never add an injected-input sender field to a Slack acceptance.
  *     N4 joins push identity from stub to f6 timing output by envelope_id, never clocks.
- *   windows C <ad-cscb-calls-tsv> <empty-windows-tsv> <active-windows-tsv>
+ *   windows C <ad-cscb-calls-tsv> <empty-windows-tsv> <active-windows-tsv> [<turn-end-windows-tsv>]
  *     ad_cscb_calls' six columns, time in epoch seconds; every CSCB call counts
  *     conservatively (Decision 9), per instance, in EVERY half-open 10-second window.
  *     Empty windows: instance-id TAB start-seconds TAB end-seconds, at least one.
@@ -127,6 +127,11 @@
  *     Every call must belong to a declared active/empty window. Missing active
  *     coverage, foreign instances or out-of-phase calls are missing, not zero-cost
  *     success. Calls in a verified empty window fail. All intervals are half-open.
+ *     Test 32 also supplies turn-end windows, the same three columns, one per
+ *     measured persona: AD's final state_changed_at through empty-window start.
+ *     They must lie inside the active window and end at the idle boundary.
+ *     A separate n3-turn-end verdict bounds counted get calls to <=1/persona;
+ *     they still count toward N3's sliding rate. No idle call is exempted.
  *     bun "$E" windows "$TEST_NAME" "$mode" 100000 2 "$out/ad.tsv" "$out/empty.tsv" "$out/active.tsv"
  *   concurrent-overlap C <operations-tsv> <sample-intervals-tsv> <n2-file>
  *     Test-32's thread phase only; collect fresh files per mode/phase. TSV has no
@@ -751,6 +756,22 @@ export function joinsVerdict(before: JoinIdentity[] | undefined, after: JoinIden
       && a.size >= old.size + added.size ? 'pass' : 'fail')
 }
 export interface ObservationWindow { instance: string; start: number; end: number }
+type CountedAdCall = { instance: string; ms: number; verb?: string }
+/** The turn-end reaction remains inside N3's active rate budget. */
+export function turnEndVerdict(calls: CountedAdCall[] | undefined, reaction: ObservationWindow[] | undefined,
+  empty: ObservationWindow[] | undefined, active: ObservationWindow[] | undefined): Result {
+  const inside = (c: CountedAdCall, w: ObservationWindow) => c.instance === w.instance && c.ms >= w.start && c.ms < w.end
+  const counts = reaction?.map(w => calls?.filter(c => c.verb === 'get' && inside(c, w)).length ?? 0) ?? []
+  const missing = !calls || !reaction?.length || !active?.length || !empty?.length
+    || calls.some(c => !nonnegative(c.ms) || typeof c.verb !== 'string' || !c.verb)
+    || reaction.length !== active.length || new Set(reaction.map(w => w.instance)).size !== reaction.length
+    || reaction.some(w => !w.instance || !nonnegative(w.start) || !finite(w.end) || w.end <= w.start
+      || !active.some(a => a.instance === w.instance && a.start <= w.start && a.end === w.end)
+      || !empty.some(e => e.instance === w.instance && e.start === w.end))
+  return result('n3-turn-end', counts.reduce((a, b) => a + b, 0),
+    { max_gets_per_persona: maximum(counts), measured_instances: reaction?.length ?? 0 }, 1,
+    missing ? 'missing' : maximum(counts) <= 1 ? 'pass' : 'fail')
+}
 export function windowsVerdict(calls: { instance: string; ms: number }[] | undefined, empty: ObservationWindow[] | undefined,
   rate: number, active: ObservationWindow[] | undefined): Result {
   let max = 0, idle = 0
@@ -2222,12 +2243,14 @@ async function n4(c: Context, args: string[]): Promise<Result[]> {
   return [n4Verdict(measurements(file, Number(mark)), sample(hungTs, hungUser), sample(delayedTs, delayedUser), jsonl(timesFile), text === undefined ? undefined : n2Samples(text), stub, Number(printer('NAME_LOOKUP_TIMEOUT_MS')))]
 }
 async function windows(c: Context, args: string[]): Promise<Result[]> {
-  countArgs(args, 3)
+  countArgs(args, 3, 4)
   const raw = textFile(args[0]), lines = raw === '' ? [] : raw?.endsWith('\n') ? raw.slice(0, -1).split('\n').map(l => l.split('\t')) : undefined
   const calls = lines?.every(s => s.length === 6 && s[1].trim() && s[4].trim())
-    ? lines.map(s => ({ instance: s[4], ms: Number(s[1]) * 1000 })) : undefined
+    ? lines.map(s => ({ instance: s[4], ms: Number(s[1]) * 1000, verb: s[3] })) : undefined
   const windowsAt = (file: string) => tsv(file, ['instance', 'start', 'end'])?.map(w => ({ instance: w.instance, start: numeric(w.start) * 1000, end: numeric(w.end) * 1000 }))
-  return [windowsVerdict(calls, windowsAt(args[1]), Number(printer('DELIVERY_MAX_AD_CALLS_PER_S')), windowsAt(args[2]))]
+  const empty = windowsAt(args[1]), active = windowsAt(args[2])
+  return [windowsVerdict(calls, empty, Number(printer('DELIVERY_MAX_AD_CALLS_PER_S')), active),
+    ...(args[3] ? [turnEndVerdict(calls, windowsAt(args[3]), empty, active)] : [])]
 }
 function concurrentOverlap(c: Context, args: string[]): Result[] {
   countArgs(args, 3)

@@ -15,6 +15,7 @@ import {
 } from './integration/fixtures/cpu-profile.ts'
 import { windowsVerdict } from './integration/fixtures/sr8-evidence.ts'
 import { DELIVERY_MAX_AD_CALLS_PER_S } from '../src/delivery-constants.ts'
+import { DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS } from '../src/config.ts'
 
 const REPO = join(import.meta.dir, '..')
 const FIXTURES = join(import.meta.dir, 'integration/fixtures')
@@ -910,7 +911,7 @@ describe('test-32 sample phase on an injected clock (stub shell)', () => {
   // next poll or sample admission and answers its start START_DELAY_MS
   // later, unless the profiler failed. CSCB makes CALLS_PER_SAMPLE calls at each sample's push;
   // with none, it makes one call in the active window and a stray one 1 s
-  // after the last delivery, where the original empty window starts.
+  // inside the empty window, after the poll interval + 1000 ms margin.
   const phase = () => {
     const start = T32.indexOf('    profile_begin\n'), stop = '    stop_server --stop-bots\n', end = T32.indexOf(stop, start) + stop.length
     expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start + stop.length)
@@ -931,8 +932,10 @@ server_tick() {
 }
 tick() { CLOCK_US=$(( CLOCK_US + $1 )); printf -v EPOCHREALTIME '%d.%06d' $(( CLOCK_US / 1000000 )) $(( CLOCK_US % 1000000 )); }
 tick 0
-date() { printf '%s\\n' "\${EPOCHREALTIME}"; }
-sleep() { server_tick; if [[ "$1" == 0.1 ]]; then tick 100000; else tick $(( $1 * 1000000 )); fi; }
+date() { if [[ "$1" == -d ]]; then printf '%s\\n' "$2"; else printf '%s\\n' "\${EPOCHREALTIME}"; fi; }
+sleep() { server_tick; if [[ "$1" == 0.1 ]]; then tick 100000; elif [[ "$1" == *.* ]]; then tick $(( \${1%.*} * 1000000 + 10#\${1#*.} )); else tick $(( $1 * 1000000 )); fi; }
+${shellFunction(integrationFile('lib/scenario.sh'), '_scenario_us_text')}
+real_ad() { printf '{"state":"waiting","state_changed_at":"%s"}\\n' "$(_scenario_us_text "\${LAST_DELIVERY_US}")"; }
 real_wait_latency_admission() {
     local waves=''
     if [[ "$2" != 21 ]]; then server_tick; tick $(( ADMISSION_MS * 1000 )); return 0; fi
@@ -956,16 +959,18 @@ real_wait_delivery() {
 shared_queue_snapshot() { :; }
 ad_shim_mark() { printf '0\\n'; }
 ad_cscb_calls() {
-    local active=$(( 10#\${THREAD_ACTIVE_START//[!0-9]/} + 500000 )) stray=$(( LAST_DELIVERY_US + 1000000 )) at
+    local active=$(( 10#\${THREAD_ACTIVE_START//[!0-9]/} + 500000 )) stray=$(( LAST_DELIVERY_US + (${DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS} + 1000 + 1000) * 1000 )) at
     if (( CALLS_PER_SAMPLE )); then
         while IFS= read -r at; do printf '%s\\t%d.%06d\\n' "$1" $(( at / 1000000 )) $(( at % 1000000 )); done < "\${CALLS}"
         return 0
     fi
     printf '%s\\t%d.%06d\\n' "$1" $(( active / 1000000 )) $(( active % 1000000 )) "$1" $(( stray / 1000000 )) $(( stray % 1000000 ))
 }
-bun() { if [[ "$1" == "\${PROFILER}" ]]; then tick 2000000; log "profiler-$2"; fi; }
+bun() { if [[ "$1" == "\${PROFILER}" ]]; then tick 2000000; log "profiler-$2"; elif [[ "\${2:-}" == DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS ]]; then printf '%s' '${DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS}'; fi; }
 stop_server() { :; }
 REAL_KEY=alpha THREAD_INSTANCE=i-1 REAL_SR8=/sr8 SLACK_STATE_DIR="$1/state" SERVER_PID=1
+mkdir -p "\${SLACK_STATE_DIR}"
+printf '{}' > "\${SLACK_STATE_DIR}/config.json"
 REAL_THREAD_SAMPLES=(${samples.join(' ')})
 REAL_THREAD_DELAYED_TS=${samples[6]} REAL_THREAD_HUNG_TS=${samples[13]}
 profile_open
@@ -1000,11 +1005,11 @@ ${phase()}`
   const slicesLine = (overlap: string) => `recorded: cpu-profile ${CONTEXT32} wave=none slices=20 clock=epoch checkpoint_overlap=${overlap}`
   const unanswered = 'recorded: cpu-profile start unacknowledged wait_s=5\n'
 
-  test('profiling moves no observation boundary: a stray CSCB call 1 s after the last delivery fails N3 alike with profiling on and off', () => {
+  test('profiling moves no observation boundary: a stray CSCB call 1 s into the settled idle window fails N3 alike with profiling on and off', () => {
     const off = run(false), on = run(true)
     for (const r of [off, on]) {
       expect(r.shell).toEqual({ status: 0, stdout: '', stderr: '' })
-      expect(Math.round(Number(r.tsv('empty.tsv')[0]![1]) * 1000)).toBe(r.at('delivered'))
+      expect(Math.round(Number(r.tsv('empty.tsv')[0]![1]) * 1000)).toBe(r.at('delivered') + DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS + 1000)
     }
     expect(n3(off)).toMatchObject({ measure: 'n3', verdict: 'fail', limit: 40, stats: { empty_calls: 1, covered_instances: 1 } })
     expect(n3(on)).toEqual(n3(off))

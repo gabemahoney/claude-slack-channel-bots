@@ -692,6 +692,7 @@
  *                                                for [tmux] <key>, in decimal; for a minimum
  *                                                with parts (pending_grace_seconds), the
  *                                                named <part> (`floor` or `addend`)
+ *   DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS      src/config.ts, default permission poll interval
  *   MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS          src/config.ts, in decimal: the longest permission
  *                                                poll interval a config may set
  *   sessionEndingCommandsIn                      reads a post's text on standard input and prints
@@ -6095,6 +6096,7 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   AD_PAUSE_TIMEOUT_KEY: constantEntry('ad-settings.ts', 'AD_PAUSE_TIMEOUT_KEY'),
   AD_SETTING_MINIMUMS: adSettingMinimum,
   MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS: constantEntry('config.ts', 'MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS'),
+  DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS: constantEntry('config.ts', 'DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS'),
   sessionEndingCommandsIn: sessionEndingForms,
   // Scenario 26 (test-28-fmk-provenance.sh).
   tmuxServerChangedOnset: builderEntry('outage-state.ts', 'tmuxServerChangedOnset', []),

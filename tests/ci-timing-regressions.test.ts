@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import ts from 'typescript'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
-import { TEST_MEASUREMENTS_KEY, TEST_MEASUREMENT_TIMINGS_KEY, CHANNEL_ID_RE, parsePersonaConfigBytes } from '../src/config.ts'
+import { TEST_MEASUREMENTS_KEY, TEST_MEASUREMENT_TIMINGS_KEY, CHANNEL_ID_RE, parsePersonaConfigBytes, DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS } from '../src/config.ts'
 import { decideDelivery } from '../src/delivery-decision.ts'
 import { buildDeliveryDispatchLine } from '../src/delivery-notices.ts'
 import { createPersonaEventRouter } from '../src/persona-event-router.ts'
@@ -18,7 +18,7 @@ import { TEST29_ROOT, test29RestartFixture, test29CompactionFixture, test29Diagn
 import { percentile } from './integration/fixtures/transcript-receipts.ts'
 import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVerdict, storeVerdict, postHoldVerdict,
   n4Verdict, n2Verdict, n2Samples, sealVerdict, requireSeedPopulation, startupVerdict, compactionVerdict, storeWindow, faultWindow, faultRewriters, joinsVerdict,
-  windowsVerdict, resultLine, summary, evidenceExit, printResults, type Measurement, type Times, type Result,
+  windowsVerdict, turnEndVerdict, resultLine, summary, evidenceExit, printResults, type Measurement, type Times, type Result,
   SR8_PENDING_POST_MS, SR8_LARGE_BYTES, SR8_SHARED_CHANNELS, pendingPostVerdicts, sharedListVerdicts,
   scanDiagnostics, membershipFaultVerdicts, membershipFaultRows, cpuThrottle, cpuConditionFields, membershipRepairVerdict, membershipLateVerdict, zeroAckVerdict,
   accountingVerdicts, personaStoreVerdicts, lookupFaultVerdicts, orderedWriteVerdicts, membershipWriteVerdicts,
@@ -3741,6 +3741,59 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
     expect(child.status).toBe(defect === 'pass' ? 0 : 1)
     expect(child.stdout).toContain(`verdict=${defect === 'pass' ? 'pass' : 'missing'}`)
   }))
+  test.each(['default', 'configured', 'missing-transition', 'not-waiting'] as const)
+  ('test-32 opens idle only after one poll plus the declared margin, requiring AD turn-end evidence: %s', defect => {
+    const script = source('test-32-fmk-real-order.sh')
+    const settle = block(script, '    real_ad get --instance-id "${THREAD_INSTANCE}" > "${REAL_THREAD_EVIDENCE}/turn-end.json"',
+      '    THREAD_EMPTY_START="$(date +%s.%6N)"')
+    const pollMs = defect === 'configured' ? DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS * 2 : DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS
+    const row = { state: defect === 'not-waiting' ? 'working' : 'waiting',
+      ...(defect === 'missing-transition' ? {} : { state_changed_at: '2026-11-16T00:00:01.000Z' }) }
+    const r = shell([
+      'REAL_THREAD_EVIDENCE="$HOME"; THREAD_INSTANCE=measured; SCENARIO_FIXTURES="$HOME"',
+      `printf '%s' '${JSON.stringify(defect === 'configured' ? { agent_director_poll_interval_ms: pollMs } : {})}' > "$HOME/config.json"`,
+      `real_ad() { printf '%s' '${JSON.stringify(row)}'; }`,
+      `bun() { [[ "$2" == DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS ]] || exit 1; printf '%s' '${DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS}'; }`,
+      'sleep() { printf "settle_s=%s\\n" "$1"; }',
+      declaration(scenario, '_scenario_us_text'), settle,
+      'echo "transition=$THREAD_TURN_END_START"',
+    ].join('\n'))
+    const passes = ['default', 'configured'].includes(defect)
+    expect(r.status).toBe(passes ? 0 : 1)
+    if (passes) {
+      expect(r.stdout).toContain(`settle_s=${((pollMs + 1000) / 1000).toFixed(6)}\n`)
+      expect(r.stdout).toContain(`transition=${Date.parse(row.state_changed_at!) / 1000}.000000`)
+    } else {
+      expect(r.stdout).not.toContain('settle_s=')
+      expect(r.stderr).toContain('N3 final turn-end timestamp unavailable')
+    }
+  })
+  test.each(['zero', 'one-each', 'two-one-persona', 'idle-get', 'missing-reaction', 'missing-instance',
+    'wrong-boundary', 'outside-active', 'duplicate', 'invalid-time'] as const)
+  ('N3 CLI separately bounds turn-end gets per persona and keeps idle zero: %s', defect => withCLI((root, cli) => {
+    const ids = sr8Personas(2).map(key => `cscb_${key}`)
+    const rows = ids.map((id, i) => `${i + 1}\t1.5\t100\tget\t${id}\t--instance-id`)
+    if (defect !== 'zero') rows.push(...ids.map((id, i) => `${i + 3}\t2.5\t100\tget\t${id}\t--instance-id`))
+    if (defect === 'two-one-persona') rows.push(`5\t2.75\t100\tget\t${ids[0]}\t--instance-id`)
+    if (defect === 'idle-get') rows.push(`5\t3\t100\tget\t${ids[0]}\t--instance-id`)
+    writeFileSync(join(root, 'calls'), rows.join('\n') + '\n')
+    writeFileSync(join(root, 'active'), ids.map(id => `${id}\t1\t3\n`).join(''))
+    writeFileSync(join(root, 'empty'), ids.map(id => `${id}\t3\t13\n`).join(''))
+    const reaction = ids.slice(0, defect === 'missing-instance' ? 1 : 2)
+      .map(id => `${id}\t${defect === 'outside-active' ? 0.5 : defect === 'invalid-time' ? 'invalid' : 2}\t${defect === 'wrong-boundary' ? 2.9 : 3}\n`)
+    if (defect === 'duplicate') reaction.push(reaction[0])
+    if (defect !== 'missing-reaction') writeFileSync(join(root, 'reaction'), reaction.join(''))
+    const child = cli('windows', ['calls', 'empty', 'active', 'reaction'].map(f => join(root, f)))
+    const passes = ['zero', 'one-each'].includes(defect)
+    expect(child.status).toBe(passes ? 0 : 1)
+    expect(child.stdout).toContain('recorded: sr8 n3-turn-end ')
+    if (passes) expect(child.stdout).toContain(`max_gets_per_persona=${defect === 'zero' ? 0 : 1} measured_instances=2 limit=1 verdict=pass`)
+    if (defect === 'two-one-persona') expect(child.stdout).toContain('max_gets_per_persona=2 measured_instances=2 limit=1 verdict=fail')
+    if (defect === 'idle-get') {
+      expect(child.stdout).toContain('empty_calls=1')
+      expect(child.stdout).toContain('max_gets_per_persona=1 measured_instances=2 limit=1 verdict=pass')
+    }
+  }))
   // Samples are [admission, delivery) = [100, 200) and [300, 400); each kind's
   // operation is shifted by 200 ms per kind. Recorded ends are poll-bounded, so
   // only a start inside a sample is credited, except a strict write, which
@@ -4530,6 +4583,20 @@ describe('SR-8 evidence verdicts (synthetic evidence, no runtime performance cla
     expect(windowsVerdict([...calls, ...calls.map(c => ({ ...c, instance: other }))], [...empty, { ...empty[0], instance: other }], DELIVERY_MAX_AD_CALLS_PER_S, [...active, { ...active[0], instance: other }]).verdict).toBe('pass')
     expect(windowsVerdict([...calls, { instance: key, ms: 30000 }], empty, DELIVERY_MAX_AD_CALLS_PER_S, active).verdict).toBe('fail')
     missing(windowsVerdict(calls, undefined, DELIVERY_MAX_AD_CALLS_PER_S, active))
+  })
+  test('N3 turn-end half-open boundary counts only gets and enforces each persona separately', () => {
+    const active = [key, other].map(instance => ({ instance, start: 1000, end: 3000 }))
+    const empty = active.map(w => ({ ...w, start: 3000, end: 13000 }))
+    const reaction = active.map(w => ({ ...w, start: 2000 }))
+    const calls = [key, other].map(instance => ({ instance, ms: 2000, verb: 'get' }))
+    calls.push({ instance: key, ms: 2500, verb: 'send-keys' }, { instance: key, ms: 3000, verb: 'get' })
+    const got = turnEndVerdict(calls, reaction, empty, active)
+    expect(got.verdict).toBe('pass')
+    expect(got.stats.max_gets_per_persona).toBe(1)
+    expect(windowsVerdict(calls, empty, DELIVERY_MAX_AD_CALLS_PER_S, active).verdict).toBe('fail')
+    expect(turnEndVerdict([...calls, { instance: other, ms: 2999, verb: 'get' }], reaction, empty, active).verdict).toBe('fail')
+    missing(turnEndVerdict(undefined, reaction, empty, active))
+    missing(turnEndVerdict([{ instance: key, ms: 2500 }], reaction, empty, active))
   })
   test.each(['pass', 'empty-active', 'missing-instance', 'wrong-phase'] as const)('N3 requires declared active instance coverage: %s', defect => {
     const active = [key, other].map(instance => ({ instance, start: 1000, end: 2000 }))

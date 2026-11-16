@@ -35,7 +35,13 @@
  *      check_permission, preserving the original discovery boundary.
  *   2. For each row, resolve the persona from its `persona` label; a row with
  *      no label, or one naming no applied persona, is logged and skipped.
- *      Then get({instance_id}). An absent permission_requests projection
+ *      Get once on first sighting or a change to listed state/state_changed_at,
+ *      every tick in check_permission or with a tracked open request (including
+ *      one whose Slack post needs retrying). A missing list or get
+ *      state_changed_at counts as changed (older AD binaries). Thus the cost is
+ *      1 + C + P: one list, C qualifying row reads, and at most P closing reads.
+ *      Unchanged idle rows add no get. Forget observations of unlisted rows.
+ *      An absent permission_requests projection
  *      (undefined/null) skips the row. An absent unproven_requests projection
  *      still permits permission_requests discovery. Either logs non-conformance
  *      and protects existing prompts and wedge state from reconciliation.
@@ -182,7 +188,10 @@ import type {
 
 /** Released client's required plural projection, including delivery facts. */
 export type PermissionRequestRow = ADGetResult['permission_requests'][number]
-export type GetResultWithPermissionRequests = ADGetResult
+/** AD emits this raw-transition timestamp; client 0.12.0 does not type it. */
+type StateChangedAtWire = { state_changed_at?: string }
+export type GetResultWithPermissionRequests = ADGetResult & StateChangedAtWire
+type ListedPermissionRow = ListRow & StateChangedAtWire
 
 // ---------------------------------------------------------------------------
 // Live-permission state
@@ -412,6 +421,16 @@ export function wedgeWarnRetryTicks(intervalMs: number): number {
 // ---------------------------------------------------------------------------
 
 const livePermissions = new Map<string, LivePermission>()
+/** Last successfully inspected snapshot (get preferred over list), with its persona owner. */
+const listedObservations = new Map<string, {
+  personaKey: string
+  state: ListRow['state']
+  state_changed_at: string | undefined
+  /** A list-only timestamp cannot prove which transition get inspected. */
+  hasGetTimestamp: boolean
+  /** Keep retrying discovery even if the open request's Slack post failed. */
+  hasOpenRequests: boolean
+}>()
 /**
  * Composite key → why an open request was not posted (the persona's client
  * unavailable, or its `dm` destination refused). Keeps the not-posted log line to one per
@@ -548,6 +567,9 @@ export function forgetPersonaPrompts(key: string): number {
     }
   }
   failedRows.delete(instanceId)
+  for (const [rowInstanceId, observation] of listedObservations) {
+    if (ownedBy(observation.personaKey, rowInstanceId)) listedObservations.delete(rowInstanceId)
+  }
   for (const [instanceId, state] of [...wedgeStates]) {
     if (ownedBy(state.personaKey, instanceId)) wedgeStates.delete(instanceId)
   }
@@ -567,6 +589,7 @@ export function _resetPollerState(): void {
     else clearInterval(pollerHandle)
   }
   livePermissions.clear()
+  listedObservations.clear()
   unpostedPrompts.clear()
   payloadRejections.clear()
   failedRequests.clear()
@@ -1088,11 +1111,11 @@ async function runTick(deps: PollerDeps): Promise<void> {
   skippedTicks = 0
   try {
     const client = deps.getClient()
-    let rows: ListRow[]
+    let rows: ListedPermissionRow[]
     try {
-      // One list, at most one get per eligible listed row (unlatched, or
-      // listed in check_permission), and at most one
-      // get-permission per tracked prompt in the closing sweep: 1 + L + P
+      // One list, at most one get per changed/first-seen row, check_permission
+      // row or row with a tracked prompt, and at most one
+      // get-permission per tracked prompt in the closing sweep: 1 + C + P
       // AD calls per tick. Both discovery projections share that get and
       // deduplicate in memory, with no per-request AD read or retry.
       const r = await client.list({ label: ['service=cscb'] })
@@ -1102,6 +1125,9 @@ async function runTick(deps: PollerDeps): Promise<void> {
       return
     }
     forgetUnlistedNoLabelRows(rows)
+    const listedIds = new Set(rows.map(row => row.instance_id))
+    for (const id of listedObservations.keys()) if (!listedIds.has(id)) listedObservations.delete(id)
+    const trackedInstances = new Set([...livePermissions.values()].map(entry => entry.instanceId))
 
     const seenComposite = new Set<string>()
     const nonConformingInstanceIds = new Set<string>()
@@ -1165,6 +1191,11 @@ async function runTick(deps: PollerDeps): Promise<void> {
         // the original permission observer and tracked-request closing sweep.
         if (row.state !== 'check_permission' && deps.isPersonaLatched?.(persona.key)) continue
 
+        const previous = listedObservations.get(row.instance_id)
+        if (previous?.hasGetTimestamp && typeof row.state_changed_at === 'string' && row.state === previous.state &&
+            row.state_changed_at === previous.state_changed_at && row.state !== 'check_permission' &&
+            !previous.hasOpenRequests && !trackedInstances.has(row.instance_id)) continue
+
         let got: GetResultWithPermissionRequests
         // this `get` (like the `list` above) is not one of
         // sites, so none of the decisions of `src/row-read-rules.ts`
@@ -1226,6 +1257,19 @@ async function runTick(deps: PollerDeps): Promise<void> {
           ...(got.unproven_requests ?? []).filter((perm) =>
             perm.decision === null && perm.unproven_since === null && perm.proven_gone_at === null),
         ]
+        if (!nonConformingInstanceIds.has(row.instance_id)) {
+          // Stop can land between list and get. Remember the snapshot whose
+          // requests we inspected, so the next list of it needs no second read.
+          // Missing get fields fall back to list, but an unverified timestamp
+          // must keep the row eligible next tick (older AD binaries).
+          listedObservations.set(row.instance_id, {
+            personaKey: persona.key,
+            state: got.state ?? row.state,
+            state_changed_at: got.state_changed_at ?? row.state_changed_at,
+            hasGetTimestamp: typeof got.state_changed_at === 'string',
+            hasOpenRequests: permissions.length > 0,
+          })
+        }
         for (const perm of permissions) {
           const key = makeCompositeKey(row.instance_id, perm.request_token)
           if (seenComposite.has(key)) continue

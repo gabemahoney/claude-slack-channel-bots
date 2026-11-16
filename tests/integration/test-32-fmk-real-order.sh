@@ -251,6 +251,19 @@ for thread_mode in strict open; do
     # Admission proves every reply candidate and accepted item has drained. Both
     # endpoint checks are harness AD reads, excluded by ad_cscb_calls.
     real_wait_latency_admission "${REAL_KEY}" 21
+    # AD 0.17.1 list omits unproven requests: CSCB needs one read on the final
+    # turn-end transition to catch a hidden check_permission → waiting race.
+    # Record AD's actual transition time, including reads before admission
+    # noticed waiting. Give CSCB one poll interval plus a 1000 ms margin for
+    # list/get latency and timer dispatch, conservatively from this observation.
+    # The reaction has its own <=1 get/persona gate; the idle gate stays zero.
+    real_ad get --instance-id "${THREAD_INSTANCE}" > "${REAL_THREAD_EVIDENCE}/turn-end.json"
+    THREAD_TURN_END_AT="$(jq -er 'select(.state == "waiting") | .state_changed_at | select(type == "string" and length > 0)' "${REAL_THREAD_EVIDENCE}/turn-end.json")" || fail 'N3 final turn-end timestamp unavailable'
+    THREAD_TURN_END_START="$(date -d "${THREAD_TURN_END_AT}" +%s.%6N)" || fail 'N3 final turn-end timestamp invalid'
+    THREAD_POLL_MS="$(jq -er '.agent_director_poll_interval_ms // empty' "${SLACK_STATE_DIR}/config.json")" \
+        || THREAD_POLL_MS="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS)"
+    [[ "${THREAD_POLL_MS}" =~ ^[1-9][0-9]*$ ]] || fail 'N3 invalid permission poll interval'
+    sleep "$(_scenario_us_text "$(( (THREAD_POLL_MS + 1000) * 1000 ))")"
     THREAD_EMPTY_START="$(date +%s.%6N)"
     sleep 10
     real_wait_latency_admission "${REAL_KEY}" 21
@@ -258,6 +271,7 @@ for thread_mode in strict open; do
     THREAD_EMPTY_END="$(date +%s.%6N)"
     printf '%s\t%s\t%s\n' "${THREAD_INSTANCE}" "${THREAD_EMPTY_START}" "${THREAD_EMPTY_END}" > "${REAL_THREAD_EVIDENCE}/empty.tsv"
     printf '%s\t%s\t%s\n' "${THREAD_INSTANCE}" "${THREAD_ACTIVE_START}" "${THREAD_EMPTY_START}" > "${REAL_THREAD_EVIDENCE}/active.tsv"
+    printf '%s\t%s\t%s\n' "${THREAD_INSTANCE}" "${THREAD_TURN_END_START}" "${THREAD_EMPTY_START}" > "${REAL_THREAD_EVIDENCE}/turn-end.tsv"
     ad_cscb_calls "${THREAD_INSTANCE}" "${THREAD_AD_MARK}" "${THREAD_AD_END_MARK}" > "${REAL_THREAD_EVIDENCE}/ad.tsv"
     bun "${REAL_SR8}" conditions "${SLACK_STATE_DIR}" "${SERVER_PID}"
     shared_queue_snapshot "${REAL_THREAD_EVIDENCE}/queue.jsonl" "${REAL_KEY}" \
@@ -276,7 +290,7 @@ for thread_mode in strict open; do
         "${REAL_KEY}" "${REAL_THREAD_EVIDENCE}/queue.jsonl" "${REAL_THREAD_EVIDENCE}/times.jsonl" "${SCENARIO_SLACK_RECORD}" "${REAL_THREAD_EVIDENCE}/n2.txt" \
         "${REAL_THREAD_HUNG_TS}" "${REAL_THREAD_HUNG_USER}" "${REAL_THREAD_DELAYED_TS}" "${REAL_THREAD_DELAYED_USER}" || THREAD_N4_STATUS="$?"
     THREAD_N3_STATUS=0
-    bun "${REAL_SR8}" windows "${REAL_THREAD_CONTEXT[@]}" "${REAL_THREAD_EVIDENCE}/ad.tsv" "${REAL_THREAD_EVIDENCE}/empty.tsv" "${REAL_THREAD_EVIDENCE}/active.tsv" || THREAD_N3_STATUS="$?"
+    bun "${REAL_SR8}" windows "${REAL_THREAD_CONTEXT[@]}" "${REAL_THREAD_EVIDENCE}/ad.tsv" "${REAL_THREAD_EVIDENCE}/empty.tsv" "${REAL_THREAD_EVIDENCE}/active.tsv" "${REAL_THREAD_EVIDENCE}/turn-end.tsv" || THREAD_N3_STATUS="$?"
     THREAD_OVERLAP_STATUS=0
     bun "${REAL_RECEIPTS}" thread-intervals "${REAL_KEY}" "${REAL_CHANNEL}" \
         "${REAL_THREAD_EVIDENCE}/queue.jsonl" "${REAL_THREAD_SAMPLES[@]}" > "${REAL_THREAD_EVIDENCE}/sample-intervals.tsv" || THREAD_OVERLAP_STATUS=1
