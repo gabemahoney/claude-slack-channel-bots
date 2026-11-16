@@ -109,7 +109,7 @@ async function setChoice(ctx: CheckContext, f: Findings, letter: PersonaLetter, 
 }
 
 /** A delivery a check expects, re-counted at the check's end (`expectNoDuplicates`). */
-type Heard = { letter: PersonaLetter; ts: string; what: string }
+type Heard = { m: string; letter: PersonaLetter; channel: string; ts: string; what: string }
 
 /**
  * One tag for `ts` in `letter`'s transcript with these attributes, from the
@@ -117,20 +117,24 @@ type Heard = { letter: PersonaLetter; ts: string; what: string }
  * duplicate is caught.
  */
 async function expectHeard(ctx: CheckContext, f: Findings, m: string, heard: Heard[], letter: PersonaLetter, channel: string, ts: string, what: string, attrs: Record<string, string>): Promise<void> {
-  heard.push({ letter, ts, what })
+  heard.push({ m, letter, channel, ts, what })
   const found = await waitTags(ctx, letter, ts, TAG_WAIT_MS)
   f.add(`${what}: ${found.length} tag(s)${found[0] ? `: ${found[0]}` : ''}`)
   expectOneTag(f, found, what, { chat_id: channel, ...attrs }, { user_id: ctx.ids.humanUserId })
+  // The server logs one message-received line per accepted item in a server run.
   const received = await deliveryLines(ctx, m, 'message-received', letter, channel, ts)
   f.add(`${what}: ${received.length} message-received line(s)${received[0] ? `: ${received[0]}` : ''}`)
-  f.expect(received.length >= 1, `${what}: no message-received line`)
+  f.expect(received.length === 1, `${what}: ${received.length} message-received lines, not 1`)
 }
 
-/** At the check's end, after its answers and waits: still exactly one tag for each expected delivery. */
+/** At the check's end, after its answers and waits: still exactly one acceptance and one tag for each expected delivery. */
 async function expectNoDuplicates(ctx: CheckContext, f: Findings, heard: Heard[]): Promise<void> {
   for (const h of heard) {
     const n = (await tags(ctx, h.letter, h.ts)).length
+    const received = (await deliveryLines(ctx, h.m, 'message-received', h.letter, h.channel, h.ts)).length
+    f.add(`${h.what} at the check's end: ${n} tag(s), ${received} message-received line(s)`)
     f.expect(n <= 1, `${h.what}: ${n} tags at the check's end (a duplicate delivery)`)
+    f.expect(received <= 1, `${h.what}: ${received} message-received lines at the check's end (a duplicate acceptance)`)
   }
 }
 
@@ -350,7 +354,11 @@ export const th5: CheckDef<CheckContext> = {
     if (!f.expect(larch !== null, 'A did not answer with "larch" in A-home in time')) return f.result()
     const ownPosts = await postsInThread(ctx, 'a', coord, ment!, again)
     f.add(`A's posts in the thread after the new @mention: ${ownPosts.length === 0 ? 'none' : ownPosts.join(', ')}`)
-    if (ownPosts.length > 0) f.note('TH5: A posted in the thread after the new @mention, so the next reply cannot show the @mention alone put A back')
+    if (ownPosts.length > 0) {
+      f.note('TH5: A posted in the thread after the new @mention, so the next reply cannot show the @mention alone put A back')
+      if (f.failures.length === 0) return notRun('A posted in the thread itself; the mention-only rejoin was not isolated', f)
+      return f.result()
+    }
     const after = await human.post(coord, 'Reply in this thread with the word maple.', ment)
     f.add(`unmentioned reply after the new @mention ${after}`)
     await expectHeard(ctx, f, m, heard, 'a', coord, after, 'A: the reply after the new @mention', { via: 'thread', thread_ts: ment! })
