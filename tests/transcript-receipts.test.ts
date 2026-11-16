@@ -186,7 +186,7 @@ test('thread script: both modes carry isolated population, sequential samples an
   for (const gate of ['seal first', 'seal measured', 'startup-load', 'n4', 'windows', 'concurrent-overlap'])
     expect(phase).toContain(`"${'${REAL_SR8}'}" ${gate} "${'${REAL_THREAD_CONTEXT[@]}'}"`)
   expect(phase).toContain('real_assert_thread_latency')
-  expect(phase).toContain('"${REAL_THREAD_EVIDENCE}/active.tsv" || THREAD_N3_STATUS=')
+  expect(phase).toContain('"${REAL_THREAD_EVIDENCE}/active.tsv" "${REAL_THREAD_EVIDENCE}/turn-end.tsv" || THREAD_N3_STATUS=')
   expect(phase).toContain('THREAD_OVERLAP_STATUS == 0')
   const lib = readFileSync(join(import.meta.dir, 'integration/lib/real-scenario.sh'), 'utf8')
   expect(lib).toContain('thread-${REAL_THREAD_MODE}-state')
