@@ -22,7 +22,7 @@
 # Lines are matched by class prefix, persona ref and distinguishing fragments
 # ( the current rule; lib/scenario.sh "Matchers"), never as whole sentences:
 #   [slack] Loaded persona config: 2 persona(s)                    src/server.ts
-#   [slack] No last-applied record: … "<cfg>" … "<cfg>.last-applied"
+#   The production shared-authority startup line, including its revision.
 #                                                                  src/reload.ts resolveStart
 #   [slack] startupSessionManager: 2 persona(s), …                 src/session-manager.ts startupSessionManager
 #   [slack] persona-start: personas[<i>] "<name>" (key=<key>) …    src/persona-bringup-controller.ts bringUp
@@ -116,10 +116,11 @@ expect_count '[slack] Fatal: ' 0 "config load: the start with E9's reply setting
 CONFIG_FILE="${SLACK_STATE_DIR}/config.json"
 RECORD_FILE="${CONFIG_FILE}.last-applied"
 [[ -f "${RECORD_FILE}" ]] || fail "last-applied: ${RECORD_FILE} not written at the first start"
-cmp -s "${CONFIG_FILE}" "${RECORD_FILE}" \
-    || fail "last-applied: ${RECORD_FILE} is not a byte copy of config.json"
-expect_count "$(matcher '[slack] No last-applied record:' "\"${CONFIG_FILE}\"" "\"${RECORD_FILE}\"")" 1 \
-    "last-applied"
+configuration_record_matches "${CONFIG_FILE}" "${RECORD_FILE}" applied \
+    || fail "last-applied: reviewed bytes or applied configuration differ from config.json"
+AUTHORITY_START="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" reloadSharedAuthorityStartLine "${CONFIG_FILE}" "${RECORD_FILE}")" \
+    || fail "last-applied: could not build the authority startup line"
+expect_count "${AUTHORITY_START}" 1 "last-applied"
 
 # --- Bring-up: one persona-start and one skip line per persona --------------
 expect_count '[slack] startupSessionManager: 2 persona(s),' 1 "startupSessionManager"

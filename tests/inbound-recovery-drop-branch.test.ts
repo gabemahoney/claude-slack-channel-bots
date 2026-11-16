@@ -1,3 +1,4 @@
+import { eligibleMembership } from './test-helpers/fungible-decision.ts'
 import { KILL_RETRY_TRIES } from '../src/kill-retry.ts'
 import { livenessReadingForStatus } from '../src/liveness-reading.ts'
 import type { Persona } from '../src/config.ts'
@@ -37,6 +38,7 @@ import {
 } from '../src/outage-state.ts'
 import { PENDING_ROW_REASON_CWD_MISMATCH, PENDING_ROW_REASON_RETIRED_OLD_LIFE, type PendingRowNotCoveredReason } from '../src/pending-row.ts'
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
+import { createPersonaSerializer, type PersonaSerializer } from '../src/persona-serializer.ts'
 import {
   HUMAN_TRIGGER_DELAY_CEILING,
   initRestart,
@@ -88,6 +90,7 @@ import { absentRow } from './test-helpers/old-life.ts'
 import {
   makeRestartDeps,
   makeRoutingHarness,
+  observedMembership,
   resetRoutingState,
   waitFor,
   type RoutingHarness
@@ -153,6 +156,28 @@ function makeRecovery(options: RecoveryHarnessOptions = {}): RecoveryHarness {
   const h = makeRecoveryHarness(options)
   recoveries.push(h)
   return h
+}
+
+/**
+ * Run `body` with a turn held on the serializer of each of `keys`, then
+ * release them: the restart timer is real and can fire inside the store's
+ * fsync, so without the hold the restart's work could run before `body`'s
+ * checks. The release is not awaited: a turn queued behind work held until
+ * teardown (a launch held open) ends when it starts.
+ */
+async function withRestartsHeld<T>(serializer: PersonaSerializer, keys: string | readonly string[], body: () => T | Promise<T>): Promise<T> {
+  const turn = Promise.withResolvers<void>()
+  for (const key of typeof keys === 'string' ? [keys] : keys) void serializer.run(key, () => turn.promise)
+  try {
+    return await body()
+  } finally {
+    turn.resolve()
+  }
+}
+
+/** The message lost for `key` reports starting now and asks for its restart, the restart held until the report is taken. */
+function expectStartingNow(h: RecoveryHarness, key: string): ReturnType<typeof expectLostMessageReports> {
+  return withRestartsHeld(h.serializer, key, () => expectLostMessageReports(h, key, 'starting-now', { restartRequested: true }))
 }
 
 /** A human's message in `channel`, carrying the message marker. */
@@ -249,7 +274,7 @@ describe('through the recovery harness: the read is the liveness adapter\'s one 
     const id = personaInstanceId(key)
     h.script({ statusQueue: [cannedErr(errInternal()), cannedOk(cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }))] })
 
-    const lost = await expectLostMessageReports(h, key, 'starting-now', { restartRequested: true })
+    const lost = await expectStartingNow(h, key)
 
     expect(lost.restartPending).toBe(true)
     await waitFor(() => !isRestartPendingOrActive(key), 1000)
@@ -395,7 +420,7 @@ describe('an item accepted for a retired key asks for a restart that never resum
       getResult: personaRow(h, key, { state: LIVENESS_DEAD_ROW_ENDED, session_id: 'a-session-id' }),
     })
 
-    await expectLostMessageReports(h, key, 'starting-now', { restartRequested: true })
+    await expectStartingNow(h, key)
     await waitFor(() => !isRestartPendingOrActive(key), 1000)
     await h.settle()
 
@@ -413,7 +438,7 @@ describe('an item accepted for a retired key asks for a restart that never resum
     h.script({ statusResult: cannedStatusResult({ state: 'waiting' }) })
     const hold = holdFindMissing(h.stub.client)
 
-    await expectLostMessageReports(h, key, 'starting-now', { restartRequested: true })
+    await expectStartingNow(h, key)
     await waitFor(() => !isRestartPendingOrActive(key), 1000)
     await h.driveSequence(hold.entered(1))
 
@@ -467,7 +492,7 @@ describe('an item accepted for P whose restart reads P\'s row pending', () => {
   test('a covered row: the message reports starting now; its restart reads the row once and arms P pending-only, with no kill, launch or keystroke; nothing raised', async () => {
     const { h, key } = build(PENDING_ROW)
 
-    await expectLostMessageReports(h, key, 'starting-now', { restartRequested: true })
+    await expectStartingNow(h, key)
     await waitFor(() => !isRestartPendingOrActive(key), 1000)
 
     expect(h.stub.calls.statusCalls).toHaveLength(2)
@@ -484,7 +509,7 @@ describe('an item accepted for P whose restart reads P\'s row pending', () => {
     const { h, key, ref } = build(row, retired)
     const hold = holdFindMissing(h.stub.client)
 
-    await expectLostMessageReports(h, key, 'starting-now', { restartRequested: true })
+    await expectStartingNow(h, key)
     await waitFor(() => !isRestartPendingOrActive(key), 1000)
     await h.driveSequence(hold.entered(1))
 
@@ -747,11 +772,9 @@ describe('an item accepted while P\'s live-row sequence runs reports restarting,
 })
 
 // ===========================================================================
-// Not up (regression guard for) — a message can
-// still reach a persona whose bring-up outcome is not up: one that stopped
-// being up while the message was being handled, or the old half of a
-// destructive modify after its bring-up was cancelled and before its
-// connection is stopped. Such a message used to report "starting now" and ask
+// Not up (regression guard for) — a not-up persona's messages are stored,
+// acknowledged and queued; a lost one reports not up and schedules no restart.
+// Such a message used to report "starting now" and ask
 // for a restart the relaunch gate refused. Now the notice says "not up" and
 // nothing is scheduled: the persona's own recovery launches it. The up check
 // is the real `createPersonaUpPredicate` over a serving connection, with the
@@ -768,12 +791,13 @@ describe('not up: a queued Slack item for a persona that is not up starts no res
       // The relaunch gate over the same bring-up state: before the fix every
       // message asked it for a restart, and it refused with a line.
       const gateLines: string[] = []
-      const deps = makeRestartDeps({ restartDelayS: FAST_DELAY_S })
+      const deps = makeRestartDeps({ restartDelayS: FAST_DELAY_S, serialize: h.serializer.run })
       deps.canRestart = createPersonaRelaunchGate({ status: () => SERVING }, (line) => { gateLines.push(line) }, h.upOutcomes)
       initRestart(deps)
 
       for (let i = 0; i < 3; i++) await h.deliver(messageIn(SHARED, `message ${i} ${MESSAGE_MARKER}`), h.alpha.key)
-
+      expect(h.queued('alpha')).toHaveLength(3)
+      expect(h.order.filter(step => step === 'ack')).toHaveLength(3)
 
       expect(h.postsTo(SHARED)).toEqual([])
       expect(h.upAsks).toEqual(Array(6).fill(h.alpha.key))
@@ -786,9 +810,11 @@ describe('not up: a queued Slack item for a persona that is not up starts no res
 
       // Control: the same persona, up again, is restarted by its next lost message.
       h.notUp.delete(h.alpha.key)
-      await h.deliver(messageIn(SHARED), h.alpha.key)
+      await withRestartsHeld(h.serializer, h.alpha.key, async () => {
+        await h.deliver(messageIn(SHARED), h.alpha.key)
 
-      expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
+        expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
+      })
       await waitFor(() => deps.launches.length > 0)
       expect(deps.launches).toEqual([{ key: h.alpha.key, cwd: expectedLaunchCwd(h, branch) }])
       expect(gateLines).toEqual([])
@@ -800,32 +826,33 @@ describe('not up: a queued Slack item for a persona that is not up starts no res
     // Beta is `mentions` in the shared channel, so it gets the message by mention.
     const event = messageIn(SHARED, `${mentionText(h.p('beta').stub.identity.botUserId)} ${MESSAGE_MARKER}`)
 
-    await h.deliver(event, [h.beta.key, h.alpha.key])
+    await withRestartsHeld(h.serializer, [h.beta.key, h.alpha.key], async () => {
+      await h.deliver(event, [h.beta.key, h.alpha.key])
 
 
-    expect(h.postsTo(SHARED)).toEqual([])
-    expect([...h.upAsks].sort()).toEqual([h.alpha.key, h.alpha.key, h.beta.key, h.beta.key].sort())
-    expect(h.queued('alpha')).toHaveLength(1)
-    expect(h.queued('beta')).toHaveLength(1)
-    expect(h.p('alpha').notifications).toEqual([])
-    expect(h.p('beta').notifications).toEqual([])
-    expect(h.allPosts()).toEqual([])
-    expect(isRestartPendingOrActive(h.beta.key)).toBe(true)
-    expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
+      expect(h.postsTo(SHARED)).toEqual([])
+      // Only the lost-message handling asks the up check; intake never does.
+      expect([...h.upAsks].sort()).toEqual([h.alpha.key, h.alpha.key, h.beta.key, h.beta.key].sort())
+      expect(h.order.filter(step => step === 'ack')).toHaveLength(1)
+      expect(h.queued('alpha')).toHaveLength(1)
+      expect(h.queued('beta')).toHaveLength(1)
+      expect(h.p('alpha').notifications).toEqual([])
+      expect(h.p('beta').notifications).toEqual([])
+      expect(h.allPosts()).toEqual([])
+      expect(isRestartPendingOrActive(h.beta.key)).toBe(true)
+      expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
+    })
     await waitFor(() => h.launches.length > 0)
     await Bun.sleep(WAIT_MS)
     expect(h.launches).toEqual([{ key: h.beta.key, cwd: h.beta.working_directory }])
   })
 
-  test('the up check is asked with the persona\'s key, not its name', async () => {
-    const asked: string[] = []
+  test('the up check is asked with the persona\'s key, not its name; the not-up persona\'s message is queued and acknowledged', async () => {
     const h = makeRoutingHarness([{ name: 'Not Up Persona', channels: [{ id: SHARED, delivery: 'all' }] }], dir, {
+      membership: { read: key => eligibleMembership(key), hasUnresolved: () => false, request: () => {} },
       sessions: [],
       restartDelayS: FAST_DELAY_S,
-      isPersonaUp: (key) => {
-        asked.push(key)
-        return false
-      },
+      notUp: ['Not Up Persona'],
     })
     harnesses.push(h)
     const notUp = h.config!.personas[0]!
@@ -833,9 +860,14 @@ describe('not up: a queued Slack item for a persona that is not up starts no res
 
     await h.receiveKeys(messageIn(SHARED), [notUp.key])
 
-    expect(asked).toEqual([notUp.key])
+    expect(h.upAsks).toEqual([notUp.key])
+    expect(h.queued('Not Up Persona')).toHaveLength(1)
+    expect(h.order.filter(step => step === 'ack')).toEqual(['ack'])
 
     expect(isRestartPendingOrActive(notUp.key)).toBe(false)
+    expect(h.restartAsks).toEqual([])
+    await Bun.sleep(WAIT_MS)
+    expect(h.launches).toEqual([])
   })
 
   // An up persona passing the check to "starting now" is the beta side of the
@@ -866,14 +898,16 @@ describe('(1) a qualifying message for a sessionless persona triggers recovery',
   test('REGRESSION: a message in the persona\'s SECOND channel schedules a launch keyed to the persona, not the source channel, in its working directory, and it fires; the notice goes to the destination', async () => {
     const h = makeHarness()
 
-    await h.deliver(messageIn(ALPHA_SECOND), h.alpha.key)
+    await withRestartsHeld(h.serializer, h.alpha.key, async () => {
+      await h.deliver(messageIn(ALPHA_SECOND), h.alpha.key)
 
-    // Real side effect: a restart is now pending for the persona …
-    expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
-    // … not under the source channel …
-    expect(isRestartPendingOrActive(ALPHA_SECOND)).toBe(false)
-    // … and for no other persona.
-    expectBetaUntouched(h)
+      // Real side effect: a restart is now pending for the persona …
+      expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
+      // … not under the source channel …
+      expect(isRestartPendingOrActive(ALPHA_SECOND)).toBe(false)
+      // … and for no other persona.
+      expectBetaUntouched(h)
+    })
 
 
     // And the timer really fires and launches in the persona's working directory.
@@ -1020,13 +1054,15 @@ describe('x a duplicated mention for a sessionless persona recovers once', () =>
     const mention = makeAppMention({ channel: SHARED, text, ts: message.ts })
     expect(mention.ts).toBe(message.ts)
 
-    await h.deliver(message, h.alpha.key)
-    await h.deliver(mention, h.alpha.key)
+    await withRestartsHeld(h.serializer, h.alpha.key, async () => {
+      await h.deliver(message, h.alpha.key)
+      await h.deliver(mention, h.alpha.key)
 
-    // Without dedupe the app_mention would find the restart pending and raise
-    // a second, "restarting" notice.
-    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'starting-now' })
-    expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
+      // Without dedupe the app_mention would find the restart pending and raise
+      // a second, "restarting" notice.
+      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'starting-now' })
+      expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
+    })
     await Bun.sleep(WAIT_MS)
     expect(h.launches).toEqual([{ key: h.alpha.key, cwd: h.alpha.working_directory }])
     // The launch has finished, so no restart guard would stop a second recovery.
@@ -1097,7 +1133,7 @@ describe('a message dropped for a key outside the applied set arms no restart ti
       (line) => { gateLines.push(line) },
       { isUp: () => true, isApplied: (key) => applied.has(key) },
     )
-    const deps = makeRestartDeps({ restartDelayS: FAST_DELAY_S })
+    const deps = makeRestartDeps({ restartDelayS: FAST_DELAY_S, serialize: h.serializer.run })
     deps.canRestart = gate
     initRestart(deps)
 
@@ -1111,8 +1147,10 @@ describe('a message dropped for a key outside the applied set arms no restart ti
 
     // Control: the same branch arms the timer once the key is applied.
     applied.add(h.alpha.key)
-    await h.deliver(messageIn(SHARED), h.alpha.key)
-    expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
+    await withRestartsHeld(h.serializer, h.alpha.key, async () => {
+      await h.deliver(messageIn(SHARED), h.alpha.key)
+      expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
+    })
     await Bun.sleep(WAIT_MS)
     expect(deps.launches).toEqual([{ key: h.alpha.key, cwd: h.alpha.working_directory }])
   })
@@ -1384,7 +1422,7 @@ describe('a restart a queued Slack item triggers while Q waits on a hold launche
     rowReadsUntilSpawn(h, UNAVAILABLE_RETRY_ROW_ABSENT)
     const hold = holdFindMissing(h.stub.client)
 
-    await expectLostMessageReports(h, q, 'starting-now', { restartRequested: true })
+    await expectStartingNow(h, q)
     await waitFor(() => !isRestartPendingOrActive(q), 1000)
     await h.driveSequence(hold.entered(1))
 
@@ -1421,6 +1459,8 @@ type Harness = RoutingHarness & {
   beta: Persona
   /** Deliver `event` to the receiving persona key(s), as the socket handler does. */
   deliver(event: unknown, keys: string | readonly string[]): Promise<void>
+  /** The restart work's serializer, as main() wires one. */
+  serializer: PersonaSerializer
 }
 
 interface HarnessOptions {
@@ -1464,6 +1504,7 @@ const SERVING: PersonaConnectionStatus = { state: 'up', identity: { botUserId: '
 
 function makeHarness(opts: HarnessOptions = {}): Harness {
   const streamless = opts.branch === 'streamless'
+  const serializer = createPersonaSerializer()
   const h = makeRoutingHarness(
     [
       { name: 'beta', channels: [{ id: BETA_MENTIONS, delivery: 'mentions' }, { id: SHARED, delivery: 'mentions' }] },
@@ -1481,11 +1522,13 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
     ],
     dir,
     {
+      membership: observedMembership({ alpha: [ALPHA_HOME, ALPHA_SECOND, SHARED], beta: [BETA_MENTIONS, SHARED] }),
       sessions: streamless ? ['alpha'] : [],
       streamless: streamless ? ['alpha'] : undefined,
       overrides: { session_restart_delay: opts.sessionRestartDelay ?? 60 },
       restartDelayS: opts.restartDelayS ?? FAST_DELAY_S,
       launchSession: opts.launchSession,
+      serialize: serializer.run,
       holdLaunches: opts.holdLaunches,
       stubOptions: opts.alphaStub ? { alpha: opts.alphaStub } : undefined,
       resolveUserName: opts.resolveUserName,
@@ -1504,6 +1547,7 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
     beta,
     deliver: (event: unknown, keys: string | readonly string[]) =>
       h.receiveKeys(event, typeof keys === 'string' ? [keys] : keys),
+    serializer,
   })
   harnesses.push(harness)
   return harness
@@ -1678,12 +1722,17 @@ describe('recovery selects the recovery state', () => {
       await arrangeState(h, state)
       const asksBefore = h.restartAsks.length
 
-      await h.deliver(messageIn(SHARED), h.alpha.key)
+      await withRestartsHeld(h.serializer, h.alpha.key, async () => {
+        await h.deliver(messageIn(SHARED), h.alpha.key)
 
-      expectStoredWithoutNotice(h, { destination, source: SHARED, sender: STUB_USER_NAME, state })
-      // Only "starting now" asks the relaunch gate (it schedules the restart).
-      expect(h.restartAsks.slice(asksBefore)).toEqual(state === 'starting-now' ? [h.alpha.key] : [])
-      expect(isRestartPendingOrActive(h.alpha.key)).toBe(setup.pending)
+        expectStoredWithoutNotice(h, { destination, source: SHARED, sender: STUB_USER_NAME, state })
+        // Every state, not up included, stores and acknowledges the new event once.
+        expect(h.queued('alpha')).toHaveLength(1)
+        expect(h.order.filter(step => step === 'ack')).toEqual(['ack'])
+        // Only "starting now" asks the relaunch gate (it schedules the restart).
+        expect(h.restartAsks.slice(asksBefore)).toEqual(state === 'starting-now' ? [h.alpha.key] : [])
+        expect(isRestartPendingOrActive(h.alpha.key)).toBe(setup.pending)
+      })
       await Bun.sleep(WAIT_MS) // a launch the message scheduled would have fired by now
       expect(h.launches).toHaveLength(setup.launches)
       for (const launch of h.launches) expect(launch).toEqual({ key: h.alpha.key, cwd: h.alpha.working_directory })
@@ -1836,16 +1885,18 @@ describe('as amended: state 5 applies only while the retry timer is armed, and n
     async (source, _timer, state, armed, armAsks) => {
       const h = gateHarness(source, armed)
 
-      await h.deliver(messageIn(SHARED), h.alpha.key)
+      await withRestartsHeld(h.serializer, h.alpha.key, async () => {
+        await h.deliver(messageIn(SHARED), h.alpha.key)
 
-      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
-      expect(h.retryTimerArms).toEqual(h.keys(armAsks))
-      expect(h.retryArmed.has(h.alpha.key)).toBe(state === 'not-answering')
-      // Not answering is decided at the read gate's check, with no read; a
-      // fall-through makes the one read (live) and then starts now.
-      expect(h.rowReads).toEqual(state === 'not-answering' ? [] : [h.alpha.key])
-      expect(h.restartAsks).toEqual(state === 'starting-now' ? [h.alpha.key] : [])
-      expect(isRestartPendingOrActive(h.alpha.key)).toBe(state === 'starting-now')
+        expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
+        expect(h.retryTimerArms).toEqual(h.keys(armAsks))
+        expect(h.retryArmed.has(h.alpha.key)).toBe(state === 'not-answering')
+        // Not answering is decided at the read gate's check, with no read; a
+        // fall-through makes the one read (live) and then starts now.
+        expect(h.rowReads).toEqual(state === 'not-answering' ? [] : [h.alpha.key])
+        expect(h.restartAsks).toEqual(state === 'starting-now' ? [h.alpha.key] : [])
+        expect(isRestartPendingOrActive(h.alpha.key)).toBe(state === 'starting-now')
+      })
       await Bun.sleep(WAIT_MS)
       expect(h.launches).toEqual(state === 'starting-now' ? [{ key: h.alpha.key, cwd: h.alpha.working_directory }] : [])
     },
@@ -1903,13 +1954,15 @@ describe('state 2: an item accepted while the persona is latched starts no resta
     // Beta is `mentions` in the shared channel, so it gets the message by mention.
     const event = messageIn(SHARED, `${mentionText(h.p('beta').stub.identity.botUserId)} ${MESSAGE_MARKER}`)
 
-    await h.deliver(event, [h.beta.key, h.alpha.key])
+    await withRestartsHeld(h.serializer, [h.beta.key, h.alpha.key], async () => {
+      await h.deliver(event, [h.beta.key, h.alpha.key])
 
 
-    expect(h.postsTo(SHARED)).toEqual([])
-    expect(h.restartAsks).toEqual([h.beta.key])
-    expect(isRestartPendingOrActive(h.beta.key)).toBe(true)
-    expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
+      expect(h.postsTo(SHARED)).toEqual([])
+      expect(h.restartAsks).toEqual([h.beta.key])
+      expect(isRestartPendingOrActive(h.beta.key)).toBe(true)
+      expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
+    })
     await waitFor(() => h.launches.length > 0)
     await Bun.sleep(WAIT_MS)
     expect(h.launches).toEqual([{ key: h.beta.key, cwd: h.beta.working_directory }])
@@ -1959,10 +2012,12 @@ describe('the first state that applies is reported', () => {
       const h = makeHarness(inputOpts(input))
       INPUTS[input].set(h, h.beta.key)
 
-      await h.deliver(messageIn(SHARED), h.alpha.key)
+      await withRestartsHeld(h.serializer, h.alpha.key, async () => {
+        await h.deliver(messageIn(SHARED), h.alpha.key)
 
 
-      expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
+        expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
+      })
       await waitFor(() => h.launches.some((l) => l.key === h.alpha.key))
       expect(h.launches.filter((l) => l.key === h.alpha.key)).toEqual([{ key: h.alpha.key, cwd: h.alpha.working_directory }])
     },
@@ -2020,11 +2075,13 @@ describe('state 6 by the read: a row reading `pending` reports session starting 
   ])('control: %s is not `pending`: one read, then starting now, which asks the relaunch gate once and launches once', async (_label, answer) => {
     const h = makeHarness({ rowRead: { alpha: answer } })
 
-    await h.deliver(messageIn(SHARED), h.alpha.key)
+    await withRestartsHeld(h.serializer, h.alpha.key, async () => {
+      await h.deliver(messageIn(SHARED), h.alpha.key)
 
-    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'starting-now' })
-    expect(h.readOrder).toEqual([`read:${h.alpha.key}`])
-    expect(h.restartAsks).toEqual([h.alpha.key])
+      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'starting-now' })
+      expect(h.readOrder).toEqual([`read:${h.alpha.key}`])
+      expect(h.restartAsks).toEqual([h.alpha.key])
+    })
     await waitFor(() => h.launches.length > 0)
     await Bun.sleep(WAIT_MS)
     expect(h.launches).toEqual([{ key: h.alpha.key, cwd: h.alpha.working_directory }])
@@ -2057,12 +2114,14 @@ describe('a failed row read leaves state 6 out', () => {
     if (input !== undefined) INPUTS[input].set(h, h.alpha.key)
     const asksBefore = h.restartAsks.length
 
-    await h.deliver(messageIn(SHARED), h.alpha.key)
+    await withRestartsHeld(h.serializer, h.alpha.key, async () => {
+      await h.deliver(messageIn(SHARED), h.alpha.key)
 
-    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
-    expect(h.rowReads).toEqual([h.alpha.key])
-    expect(h.restartAsks.slice(asksBefore)).toEqual(state === 'starting-now' ? [h.alpha.key] : [])
-    expect(isRestartPendingOrActive(h.alpha.key)).toBe(state !== 'auto-restart-disabled')
+      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
+      expect(h.rowReads).toEqual([h.alpha.key])
+      expect(h.restartAsks.slice(asksBefore)).toEqual(state === 'starting-now' ? [h.alpha.key] : [])
+      expect(isRestartPendingOrActive(h.alpha.key)).toBe(state !== 'auto-restart-disabled')
+    })
     const failedLines = h.logs.filter((l) => l.includes(ROW_READ_REJECTION_REDACTED))
     if (answer === ROW_READ_REJECTS) {
       expect(failedLines).toHaveLength(1)

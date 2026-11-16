@@ -8,20 +8,233 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { createDeliveryQueue, type AcceptedInput, type QueueItem } from '../src/delivery-queue.ts'
 import { parseDeliveryTranscriptRecord, receiptTextMatches } from '../src/delivery-receipt.ts'
+import { buildTagParts } from '../src/tag-wrapper.ts'
 import { createReplyReminders, REPLY_REMINDER_TEXT } from '../src/reply-reminder.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
-import { injectedInput, slackInput } from './test-helpers/delivery-queue.ts'
+import { acceptedRecord, deliveredRecord, fixedRecord, injectedInput, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
+import { eligibleChannels, populationChannels, SR8_POPULATION_CHANNEL_COUNT } from './test-helpers/thread-memory.ts'
 import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { promptEntry } from './test-helpers/working-row-panes.ts'
-import { auditReceipts, deliveryFailureEvidence, jsonLines, readTranscripts, receiptJournal, receiptProgress, workloadItem, workloadItems } from './integration/fixtures/transcript-receipts.ts'
+import { auditReceipts, deliveryFailureEvidence, jsonLines, readTranscripts, receiptJournal, receiptProgress, threadLatency, threadSampleIntervals, THREAD_N2_MIN_SAMPLES, THREAD_N2_TYPING_MS, THREAD_N2_DELIVERY_MS, workloadItem, workloadItems, type ShimSend, type ThreadLatencyOptions } from './integration/fixtures/transcript-receipts.ts'
 import { checkAc76Admission, connectionVersion, type AdmissionAdapters, type AdmissionOptions } from './integration/fixtures/ac76-admission.ts'
 import { runFixture, runRealSlice, runTest33Slice, SITE_SLICES, type RealSlice, type Site, type Test33Leg, type Test33Result } from './test-helpers/test33-receipt-boundary.ts'
 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup() })
+
+/** Pure controls of the actual thread CLI verdict, after the independent
+ * complete receipt audit. Wrappers and queue records use production builders.
+ * These are synthetic evidence, never a native/performance acceptance. */
+function threadEvidence(count = THREAD_N2_MIN_SAMPLES) {
+  const channel = eligibleChannels(populationChannels(SR8_POPULATION_CHANNEL_COUNT))[0]!
+  const samples = Array.from({ length: count }, (_, i) => `1800000000.${String(i + 1).padStart(6, '0')}`)
+  const options: ThreadLatencyOptions = { key: 'alpha', channel, samples, delayed: samples[6]!, hung: samples[13]!, scenario: 'test-thread-control', mode: 'open' }
+  const journal: any[] = [], sends: ShimSend[] = []
+  const timings = samples.map((ts, i) => {
+    const seq = i + 1, user = `U0SAMPLE${seq}`, name = ts === options.hung ? user : `Resolved ${seq}`
+    journal.push(acceptedRecord(seq, slackInput({ channel, ts, user, key: { chat_id: channel, ts }, via: 'thread', thread_ts: '1799999999.000000' }), seq * 20000))
+    const parts = buildTagParts({ chat_id: channel, message_id: ts, user_id: user, user: name, ts, thread_ts: '1799999999.000000', via: 'thread', text: `Sample ${seq}` })
+    journal.push(fixedRecord(seq, parts))
+    sends.push({ at: seq * 20000 + THREAD_N2_TYPING_MS, text: parts[0]!, words: [], instanceId: 'cscb_alpha' })
+    return { seq, typing_ms: THREAD_N2_TYPING_MS, delivery_ms: THREAD_N2_DELIVERY_MS }
+  })
+  const lines: string[] = []
+  return { options, journal, sends, timings, lines, run: () => threadLatency(options, timings, journal, sends, line => lines.push(line)) }
+}
+test('thread-latency: SR-8 N2 bounds and minimum count', () => {
+  expect([THREAD_N2_MIN_SAMPLES, THREAD_N2_TYPING_MS, THREAD_N2_DELIVERY_MS]).toEqual([20, 2000, 10000])
+})
+test('thread-latency: 20 exact-boundary samples print every sample before the passing verdict', () => {
+  const h = threadEvidence()
+  // Extra later DM timings cannot displace any explicitly named sample.
+  h.timings.push({ seq: 99, typing_ms: 999999, delivery_ms: 999999 })
+  expect(h.run()).toBe(0)
+  expect(h.lines).toHaveLength(THREAD_N2_MIN_SAMPLES + 1)
+  expect(h.lines.slice(0, -1).every(l => l.startsWith('recorded: sr8 n2-sample '))).toBe(true)
+  expect(h.lines[6]).toContain('lookup=delayed name=resolved verdict=pass')
+  expect(h.lines[13]).toContain('lookup=hung name=fallback verdict=pass')
+  expect(h.lines.at(-1)).toContain(`samples=${THREAD_N2_MIN_SAMPLES} typing_p95_ms=${THREAD_N2_TYPING_MS} delivery_p95_ms=${THREAD_N2_DELIVERY_MS}`)
+  expect(h.lines.at(-1)).toEndWith('verdict=pass')
+})
+test('thread-latency: 19 samples are missing evidence', () => {
+  const h = threadEvidence(THREAD_N2_MIN_SAMPLES - 1)
+  expect(h.run()).toBe(1)
+  expect(h.lines.at(-1)).toEndWith('verdict=missing')
+})
+test.each(['via', 'channel', 'missing timing', 'missing send', 'foreign send', 'missing fixed', 'missing name', 'duplicate sample', 'hung absent', 'delayed absent', 'hung resolved', 'delayed fallback'] as const)('thread-latency: rejects %s', change => {
+  const h = threadEvidence(), item = h.journal[0]
+  if (change === 'via') item.via = 'mention'
+  if (change === 'channel') item.channel = 'C0OTHER'
+  if (change === 'missing timing') h.timings.shift()
+  if (change === 'missing send') h.sends.shift()
+  if (change === 'foreign send') h.sends[0]!.instanceId = 'cscb_beta'
+  if (change === 'missing fixed') h.journal.splice(1, 1)
+  if (change === 'duplicate sample') h.options.samples[0] = h.options.samples[1]!
+  if (change === 'hung absent') h.options.hung = '1800000001.000001'
+  if (change === 'delayed absent') h.options.delayed = '1800000001.000002'
+  if (['missing name', 'hung resolved', 'delayed fallback'].includes(change)) {
+    const index = change === 'hung resolved' ? 13 : change === 'delayed fallback' ? 6 : 0
+    const accepted = h.journal[index * 2], fixed = h.journal[index * 2 + 1]
+    fixed.parts[0] = fixed.parts[0].replace(/ user="[^"]*"/, change === 'missing name' ? '' : ` user="${change === 'hung resolved' ? 'Resolved later' : accepted.user}"`)
+    h.sends[index]!.text = fixed.parts[0]
+  }
+  expect(h.run()).toBe(1)
+  expect(h.lines.at(-1)).not.toEndWith('verdict=pass')
+})
+test.each(['typing_ms', 'delivery_ms'] as const)('thread-latency: nearest-rank %s keeps both faulted samples', field => {
+  const h = threadEvidence(), limit = field === 'typing_ms' ? THREAD_N2_TYPING_MS : THREAD_N2_DELIVERY_MS
+  h.timings[13]![field] = limit + 1
+  expect(h.run()).toBe(0) // the single hung outlier is the twentieth value
+  expect(h.lines[13]).toContain(`${field}=${limit + 1}`)
+  h.lines.length = 0
+  h.timings[6]![field] = limit + 1
+  expect(h.run()).toBe(1) // the delayed sample now occupies rank nineteen
+  expect(h.lines.at(-1)).toEndWith('verdict=fail')
+})
+test.each(['typing_ms', 'delivery_ms'] as const)('thread-latency: a sample one ms above %s at the p95 rank fails', field => {
+  const h = threadEvidence(), limit = field === 'typing_ms' ? THREAD_N2_TYPING_MS : THREAD_N2_DELIVERY_MS
+  h.timings[19]![field] = limit + 100
+  h.timings[18]![field] = limit + 1
+  expect(h.run()).toBe(1)
+  expect(h.lines.at(-1)).toContain(`${field === 'typing_ms' ? 'typing' : 'delivery'}_p95_ms=${limit + 1}`)
+})
+test.each((['strict', 'open'] as const).flatMap(mode =>
+  ['pass', 'short', 'wrong via', 'absent hung', 'resolved hung', 'missing receipt'].map(change => ({ mode, change }))))('thread-latency: actual CLI $mode $change', ({ mode, change }) => {
+  const h = threadEvidence(change === 'short' ? THREAD_N2_MIN_SAMPLES - 1 : THREAD_N2_MIN_SAMPLES)
+  h.options.mode = mode
+  const home = mkdtempSync(join(tmpdir(), 'thread-cli-'))
+  cleanups.push(async () => rmSync(home, { recursive: true, force: true }))
+  const transcript = join(home, 'session.jsonl'), shim = join(home, 'shim.log'), marker = join(home, 'image-marker'), cli = join(home, 'receipts.ts')
+  mkdirSync(join(home, 'queue'))
+  writeFileSync(marker, '')
+  // Only the copied entrypoint's marker location changes. The complete
+  // audit, packed matcher, selection, printing and exit path execute as shipped.
+  writeFileSync(cli, readFileSync(join(import.meta.dir, 'integration/fixtures/transcript-receipts.ts'), 'utf8').replaceAll("'/etc/cscb-ci-image'", JSON.stringify(marker)))
+  if (change === 'wrong via') h.journal[0].via = 'dm'
+  if (change === 'absent hung') h.options.hung = '1800000001.000001'
+  if (change === 'resolved hung') {
+    h.journal[27].parts[0] = h.journal[27].parts[0].replace(/ user="[^"]*"/, ' user="Resolved"')
+    h.sends[13]!.text = h.journal[27].parts[0]
+  }
+  const logs: string[] = [], takes: object[] = []
+  for (const item of workloadItems(h.journal)) {
+    const send = h.sends[item.seq - 1]!, at = item.received_at + THREAD_N2_DELIVERY_MS
+    h.journal.push({ ...sentRecord(item.seq), at: send.at, transcript_path: transcript },
+      { ...deliveredRecord(item.seq, at), receipt: { path: transcript, uuid: `take-${item.seq}` } })
+    if (change !== 'missing receipt' || item.seq !== 1) takes.push({ ...promptEntry(send.text), uuid: `take-${item.seq}`, sessionId: 'session', timestamp: new Date(at).toISOString() })
+    for (const [kind, time] of [['message-received', item.received_at], ['message-delivered', at]] as const)
+      logs.push(`[${new Date(time).toISOString()}] [slack] ${kind}: persona="alpha" (key=alpha) source=slack chat_id=${JSON.stringify(item.channel)} ts=${JSON.stringify(item.ts)} sender_id=${JSON.stringify(item.user)}`)
+  }
+  writeFileSync(join(home, 'queue/alpha.jsonl'), h.journal.map(r => JSON.stringify(r)).join('\n') + '\n')
+  writeFileSync(transcript, takes.map(r => JSON.stringify(r)).join('\n') + '\n')
+  writeFileSync(join(home, 'server.log'), logs.join('\n') + '\n')
+  writeFileSync(shim, h.sends.map(s => `call\t${s.at / 1000}\t1\t1\tbun\tsend-keys --instance-id cscb_alpha --text ${s.text.replace(/[^a-zA-Z0-9]/g, c => '\\' + c)} --no-enter`).join('\n') + '\n')
+  const r = Bun.spawnSync([process.execPath, cli, 'thread-latency', home, h.options.key, shim, home,
+    h.options.scenario, h.options.mode, h.options.channel, h.options.delayed, h.options.hung, ...h.options.samples], {
+    env: hostSafeChildEnv(home, { extras: { CSCB_PKG_DIR: dirname(import.meta.dir), SLACK_STATE_DIR: home } }),
+    stdout: 'pipe', stderr: 'pipe', timeout: 3000,
+  })
+  const output = r.stdout.toString()
+  expect(r.exitCode).toBe(change === 'pass' ? 0 : 1)
+  if (change === 'missing receipt') {
+    expect(r.stderr.toString()).toContain('has no exact transcript receipt')
+    expect(output).not.toContain('recorded: sr8 n2 ')
+  } else {
+    expect(r.stderr.toString()).toBe('')
+    expect(output.split('\n').filter(l => l.startsWith('recorded: sr8 n2-sample '))).toHaveLength(h.options.samples.length)
+    expect(output.trim().split('\n').at(-1)).toEndWith(`verdict=${change === 'pass' ? 'pass' : change === 'short' ? 'missing' : 'fail'}`)
+    expect(output).toContain(`mode=${mode} population=100000`)
+  }
+  if (change === 'pass') {
+    const intervals = Bun.spawnSync([process.execPath, cli, 'thread-intervals', h.options.key, h.options.channel,
+      join(home, 'queue/alpha.jsonl'), ...h.options.samples], {
+      env: hostSafeChildEnv(home, { extras: { SLACK_STATE_DIR: home } }), stdout: 'pipe', stderr: 'pipe', timeout: 3000,
+    })
+    expect(intervals.exitCode).toBe(0)
+    expect(intervals.stderr.toString()).toBe('')
+    expect(intervals.stdout.toString()).toBe(h.timings.map(t => [h.options.key, t.seq, t.seq * 20000, t.seq * 20000 + THREAD_N2_DELIVERY_MS].join('\t')).join('\n') + '\n')
+  }
+})
+test.each(['pass', 'missing part', 'wrong key', 'missing acceptance', 'non-thread', 'reversed', 'nonfinite', 'duplicate sample'] as const)('thread intervals: %s', change => {
+  const h = threadEvidence(2)
+  // An earlier first-part receipt cannot shorten a multipart sample. Later
+  // unrelated deliveries must not lengthen the selected sample either.
+  h.journal[1].parts.push(h.journal[3].parts[0])
+  h.journal.push(deliveredRecord(1, 21000), { ...deliveredRecord(1, 23000), part: 2 }, deliveredRecord(2, 45000), deliveredRecord(99, 999999))
+  if (change === 'missing part') h.journal.splice(5, 1)
+  if (change === 'wrong key') h.journal[0].key.ts = h.options.samples[1]
+  if (change === 'missing acceptance') h.journal.shift()
+  if (change === 'non-thread') h.journal[0].via = 'mention'
+  if (change === 'reversed') h.journal[4].at = 19999
+  if (change === 'nonfinite') h.journal[5].at = NaN
+  if (change === 'duplicate sample') h.options.samples[1] = h.options.samples[0]!
+  const intervals = () => threadSampleIntervals(h.options.key, h.options.channel, h.options.samples, h.journal)
+  if (change === 'pass') expect(intervals()).toBe('alpha\t1\t20000\t23000\nalpha\t2\t40000\t45000\n')
+  else expect(intervals).toThrow()
+})
+test('thread script: both modes carry isolated population, sequential samples and every evidence gate', () => {
+  const script = readFileSync(join(import.meta.dir, 'integration/test-32-fmk-real-order.sh'), 'utf8')
+  const phase = script.slice(script.indexOf('for thread_mode in strict open; do'), script.lastIndexOf('\ndone\n'))
+  expect(phase).toContain('real_thread_personas "${thread_mode}"')
+  expect(phase).toContain('real_seed_threads')
+  expect(phase.indexOf('real_seed_threads')).toBeLessThan(phase.indexOf('start_server --live'))
+  expect(phase).toContain('for ((sample=1; sample<=20; sample++)); do')
+  expect(phase).toContain('real_wait_latency_admission "${REAL_KEY}" "${sample}"')
+  for (const gate of ['seal first', 'seal measured', 'startup-load', 'n4', 'windows', 'concurrent-overlap'])
+    expect(phase).toContain(`"${'${REAL_SR8}'}" ${gate} "${'${REAL_THREAD_CONTEXT[@]}'}"`)
+  expect(phase).toContain('real_assert_thread_latency')
+  expect(phase).toContain('"${REAL_THREAD_EVIDENCE}/active.tsv" || THREAD_N3_STATUS=')
+  expect(phase).toContain('THREAD_OVERLAP_STATUS == 0')
+  const lib = readFileSync(join(import.meta.dir, 'integration/lib/real-scenario.sh'), 'utf8')
+  expect(lib).toContain('thread-${REAL_THREAD_MODE}-state')
+  expect(lib).toContain('thread-${REAL_THREAD_MODE}-evidence')
+  expect(lib).toContain('"${TEST_NAME}" "${REAL_THREAD_MODE}" 100000 2')
+  expect(lib).toContain('config "${REAL_THREAD_MODE}" 100000 2')
+  expect(lib).toContain('"${TEST_NAME}" "${REAL_THREAD_MODE}" "${REAL_CHANNEL}"')
+})
+test('thread overlap collection times each operation through its own result before validation', () => {
+  const lib = readFileSync(join(import.meta.dir, 'integration/lib/real-scenario.sh'), 'utf8')
+  const worker = lib.slice(lib.indexOf('real_thread_concurrent_work() {'), lib.indexOf('real_thread_membership_write() {'))
+  expect(worker.match(/real_thread_epoch_ms/g)).toHaveLength(4)
+  expect(worker).toMatch(/start="\$\(real_thread_epoch_ms\)"\n\s+envelope="\$\(slack_stub_push[^\n]+\n\s+slack_wait_one_ack[^\n]+\n\s+end="\$\(real_thread_epoch_ms\)"/)
+  expect(worker).toMatch(/start="\$\(real_thread_epoch_ms\)"\n\s+line="\$\(stub_session_call[^\n]+\n\s+end="\$\(real_thread_epoch_ms\)"/)
+  expect(worker.lastIndexOf('end="$(real_thread_epoch_ms)"')).toBeLessThan(worker.indexOf('expected="$(bun'))
+  expect(worker).toContain('event_id="$(jq -r .event_ts')
+  expect(worker).toContain('attempt_id="$(jq -r .attempt_id')
+  expect(worker).toContain("printf 'membership\\t%s\\t%s\\t%s\\n'")
+  expect(worker).toContain("printf 'write\\t%s\\t%s\\t%s\\n'")
+  // Strict's write is the retained helper, reached only from the worker after alpha's ACK.
+  expect(worker).toMatch(/if \[\[ "\$\{REAL_THREAD_MODE\}" == strict \]\]; then\n\s+real_thread_membership_write "\$\{n\}"\n\s+return/)
+  expect(worker.indexOf('real_thread_membership_write "${n}"')).toBeGreaterThan(worker.indexOf("printf 'membership\\t"))
+  const strict = lib.slice(lib.indexOf('real_thread_membership_write() {'), lib.indexOf('real_assert_thread_latency() {'))
+  expect(strict.match(/real_thread_epoch_ms/g)).toHaveLength(2)
+  // Only beta's own push through its own ACK is timed; staging precedes it
+  // and the scan wait, facts and validation all follow the end.
+  expect(strict).toMatch(/start="\$\(real_thread_epoch_ms\)"\n\s+ids="\$\(slack_push_event_ids "\$\{REAL_WRITER_LABEL\}" "\$\{event\}"\)"\n\s+slack_wait_one_ack[^\n]+\n\s+end="\$\(real_thread_epoch_ms\)"/)
+  expect(strict.indexOf('slack_stub_inventory_stage')).toBeLessThan(strict.indexOf('start="$(real_thread_epoch_ms)"'))
+  const end = strict.indexOf('end="$(real_thread_epoch_ms)"')
+  for (const after of ['wait_membership_rescan', '_real_thread_write_facts "${facts}.after"', 'shared_membership_event', 'jq -en'])
+    expect(strict.indexOf(after)).toBeGreaterThan(end)
+  // Production ignores a live event older than the last rescan, so each
+  // membership event is built fresh before its own start: beta's after staging.
+  const beta = strict.indexOf('slack_membership_event "${membership}" "${REAL_WRITER_LABEL}" "${REAL_WRITE_CHANNEL}" "$(scenario_ts)" > "${REAL_THREAD_EVIDENCE}/beta-membership-${n}.json"')
+  expect(beta).toBeGreaterThan(strict.indexOf('slack_stub_inventory_stage'))
+  expect(strict.indexOf('event="$(cat "${REAL_THREAD_EVIDENCE}/beta-membership-${n}.json")"')).toBeGreaterThan(beta)
+  expect(strict.indexOf('start="$(real_thread_epoch_ms)"')).toBeGreaterThan(strict.indexOf('event="$(cat'))
+  const alpha = worker.indexOf('slack_membership_event "${membership}" "${REAL_LABEL}" "${REAL_MEMBER_CHANNEL}" "$(scenario_ts)" > "${REAL_THREAD_EVIDENCE}/membership-${n}.json"')
+  expect(alpha).toBeGreaterThan(-1)
+  expect(worker.indexOf('event="$(cat "${REAL_THREAD_EVIDENCE}/membership-${n}.json")"')).toBeGreaterThan(alpha)
+  expect(worker.indexOf('start="$(real_thread_epoch_ms)"')).toBeGreaterThan(worker.indexOf('event="$(cat'))
+  expect(strict).toContain("printf 'write\\t%s\\t%s\\t%s\\n' \"${event_id}\" \"${start}\" \"${end}\"")
+  expect(lib).not.toContain('real_thread_operator_write')
+  expect(lib).not.toContain('configuration_request')
+  const workload = lib.slice(lib.indexOf('real_thread_workload() {'), lib.indexOf('real_thread_root() {'))
+  expect(workload).not.toContain('slack_membership_event')
+  expect(lib).toContain('time.time_ns() / 1000000')
+})
 type SendKind = 'text' | 'enter' | 'retype'
 /** Durable attempt offsets for test33's key-fault legs. `fault` names the
  * injected shim outcome consumed by the attempt at that offset; reset adds its

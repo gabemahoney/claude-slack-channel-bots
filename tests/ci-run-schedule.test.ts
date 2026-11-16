@@ -31,7 +31,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -59,6 +59,8 @@ import {
   durationTableWrongHeaderNote,
   fileNameNumberForm,
   isWholeNumber,
+  isBurstDriverScript,
+  isGateEligible,
   numberFormOf,
   parseCiArguments,
   parseDurationTable,
@@ -1203,6 +1205,82 @@ describe("section 8's wordings", () => {
     expect(text).toBe(expected())
     expect(text.includes('\n')).toBe(false)
     assertNoLeak(text)
+  })
+})
+
+describe('current integration entrypoints: split discovery and scheduling', () => {
+  const bootstrap = scriptFile(1)
+  // Read the actual entrypoints; do not maintain a second numbered workload inventory.
+  const split = realScriptFileNames().filter(file => {
+    const text = readFileSync(join(REPO_ROOT, 'tests', 'integration', file), 'utf8')
+    return text.includes('lib/membership-load.sh') || text.includes('lib/shared-channel-recovery.sh')
+  })
+  const scheduleFor = (run: ValidatedRun, table: DurationTableSource = { kind: 'missing' }): Schedule => scheduleRun({
+    pinned: run.scripts.map(script => script.fileName), table, units: run.units,
+    invocation: run.invocation, shards: run.effectiveShards,
+  })
+
+  test.each(split)('%s is discovered, selectable by either name, and independently scheduled after only bootstrap', file => {
+    for (const selected of [file, fileNameNumberForm(file)!]) {
+      const run = validated(REPO_ROOT, ['--shards', '1', selected])
+      expect(run.scripts.map(script => script.fileName)).toContain(file)
+      // Stage 6 omits the universal test-1 dependency from its normalized map.
+      expect(run.prerequisites.get(file)).toEqual([])
+      expect(run.runScripts.map(script => script.fileName)).toEqual([bootstrap, file])
+      expect(run.units.map(unit => unit.scripts.map(script => script.fileName))).toEqual([[file]])
+      expect(run.effectiveShards).toBe(1)
+      expect(isGateEligible(run.invocation)).toBe(false)
+      const schedule = scheduleFor(run)
+      expect(schedule.assignment.map(shard => shard.assigned)).toEqual([[bootstrap, file]])
+      assertNoLeak({ run, schedule })
+    }
+  })
+
+  test('all split groups are placed once, with deterministic longest-first weighting and unchanged limits', () => {
+    const run = validated(REPO_ROOT, ['--shards', '2', ...split])
+    expect(run.units.map(unit => unit.scripts.map(script => script.fileName))).toEqual(sortCanonical(split).map(file => [file]))
+    // Synthetic algorithm data only: one heavy group, all other groups light.
+    // These values never enter the committed duration table or assert measured performance.
+    const heavy = split.at(-1)!
+    const table = textSource(durationTableText({ kind: 'rows', header: DURATION_TABLE_HEADER,
+      rows: [bootstrap, ...split].map(file => ({ script: fileNameNumberForm(file)!, seconds: file === heavy ? 10_000 : 1 })),
+      order: 'canonical',
+    }))
+    const schedule = scheduleFor(run, table)
+    expect(compositionOf(schedule)).toEqual([
+      { shard: 1, assigned: [bootstrap, heavy], expectedSeconds: 10_001 },
+      { shard: 2, assigned: [bootstrap, ...sortCanonical(split.filter(file => file !== heavy))], expectedSeconds: split.length },
+    ])
+    const placed = schedule.assignment.flatMap(shard => shard.assigned.slice(1))
+    expect(sortCanonical(placed)).toEqual(sortCanonical(split))
+    expect(new Set(placed).size).toBe(split.length)
+    const reordered = validated(REPO_ROOT, ['--shards', '2', ...[...split].reverse()])
+    expect(scheduleFor(reordered, table).assignment).toEqual(schedule.assignment)
+    for (const shard of schedule.assignment) expect(schedule.limitsMs.get(shard.shard)).toBe(shardLimitMs(shard.expectedSeconds, null))
+    assertNoLeak(schedule)
+  })
+
+  test('two-lane selections cover the discovered workloads, keep scheduler closures in lane, and isolate every local workload', () => {
+    const full = validated(REPO_ROOT)
+    const workloads = full.scripts.map(script => script.fileName).filter(file => file !== bootstrap)
+    const local = workloads.filter(file => file.includes('-fmk-real-') || isBurstDriverScript(file))
+    const scheduler = workloads.filter(file => !local.includes(file))
+    expect(scheduler).toContain(scriptFile(13))
+    expect(local).toEqual(expect.arrayContaining(realScriptFileNames().filter(isBurstDriverScript)))
+    expect(sortCanonical([...scheduler, ...local])).toEqual(sortCanonical(workloads))
+    const schedulerRun = validated(REPO_ROOT, scheduler)
+    expect(schedulerRun.runScripts.map(script => script.fileName).filter(file => file !== bootstrap)).toEqual(sortCanonical(scheduler))
+    expect(isGateEligible(schedulerRun.invocation)).toBe(false)
+    const scheduled = scheduleFor(schedulerRun)
+    expect(scheduled.assignment.every(shard => shard.assigned[0] === bootstrap)).toBe(true)
+    expect(sortCanonical(scheduled.assignment.flatMap(shard => shard.assigned.slice(1)))).toEqual(sortCanonical(scheduler))
+    for (const file of local) {
+      const run = validated(REPO_ROOT, ['--shards', '1', file])
+      expect(run.runScripts.map(script => script.fileName)).toEqual([bootstrap, file])
+      expect(run.units.map(unit => unit.scripts.map(script => script.fileName))).toEqual([[file]])
+      expect(scheduleFor(run).assignment.map(shard => shard.assigned)).toEqual([[bootstrap, file]])
+      expect(isGateEligible(run.invocation)).toBe(false)
+    }
   })
 })
 

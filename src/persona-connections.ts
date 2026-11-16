@@ -107,8 +107,8 @@
  * reconnect's socket forwards nothing for a persona marked meanwhile until
  * its swap.
  *
- * Events: `message`, `app_mention`, `interactive`, `reaction_added` and
- * `reaction_removed` from a persona's socket reach
+ * Events: `message`, `app_mention`, `interactive`, `member_joined_channel`,
+ * `channel_left`, `reaction_added` and `reaction_removed` from a persona's socket reach
  * `onEvent(key, eventName, payload)` with the library's listener argument
  * unchanged (`{ event, body, ack, … }`). The handler is awaited in try/catch;
  * a throw is logged with `describeThrownValue` and affects no other event or
@@ -152,6 +152,7 @@
  */
 
 import type { WebClient } from '@slack/web-api'
+import { randomUUID } from 'node:crypto'
 
 import type { Persona } from './config.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
@@ -164,18 +165,25 @@ import {
   PERSONA_START_TIMEOUT_MS,
   PRODUCTION_SLACK_CLIENT_FACTORY,
   longLivedWebClientOptions,
+  membershipWebClientOptions,
+  metadataWebClientOptions,
   socketModeClientOptions,
   validationWebClientOptions,
   type PersonaSlackClientFactory,
   type PersonaSocketClient,
   type PersonaSocketListener,
+  type PersonaValidationClient,
 } from './persona-slack-clients.ts'
 import { createSlackEpisodeTracker, type SlackEpisodeTracker } from './persona-slack-episodes.ts'
 import {
   SLACK_AUTH_TEST_TIMEOUT_MS,
   SlackAuthTestTimeoutError,
   SlackStartTimeoutError,
+  WEB_API_AUTH_FAILURE_ERRORS,
   botIdentityFromAuthTest,
+  installationFromBotInfo,
+  slackInstallationIdentity,
+  slackInstallationKey,
   classifySlackValidationError,
   type SlackBotIdentity,
   type SlackCredentialsRefusedOutcome,
@@ -184,6 +192,9 @@ import {
   type SlackValidationFailure,
 } from './persona-slack-validation.ts'
 import { watchWebClientAuth } from './persona-web-api-watch.ts'
+import { observeFileCompletions } from './file-upload-observation.ts'
+import { MetadataCancelledError, type ThreadMemoryLookupMethod } from './thread-memory.ts'
+import { MembershipCancelledError, MEMBERSHIP_PAGE_LIMIT } from './channel-membership-retry.ts'
 
 // ---------------------------------------------------------------------------
 // Clock seam
@@ -212,7 +223,7 @@ export const SYSTEM_PERSONA_CONNECTION_CLOCK: PersonaConnectionClock = {
 // ---------------------------------------------------------------------------
 
 /** The Socket Mode events forwarded to the handler, tagged with the persona. */
-export const PERSONA_FORWARDED_SOCKET_EVENTS = ['message', 'app_mention', 'interactive', 'reaction_added', 'reaction_removed'] as const
+export const PERSONA_FORWARDED_SOCKET_EVENTS = ['message', 'app_mention', 'interactive', 'member_joined_channel', 'channel_left', 'reaction_added', 'reaction_removed'] as const
 
 /** A forwarded Socket Mode event name. */
 export type PersonaSocketEventName = (typeof PERSONA_FORWARDED_SOCKET_EVENTS)[number]
@@ -233,7 +244,20 @@ export type PersonaEventHandler = (
   key: string,
   eventName: PersonaSocketEventName,
   payload: PersonaSocketEventPayload,
+  provenance?: PersonaEventProvenance,
 ) => void | Promise<void>
+
+/** Captured from the issuing socket, never reconstructed from a current lookup
+ * after an await. A candidate socket has no applied mutation authority. */
+export interface PersonaEventProvenance {
+  readonly key: string
+  readonly connectionId: string
+  readonly incarnation: string | undefined
+  readonly identity: Readonly<SlackBotIdentity>
+  readonly applied: boolean
+  readonly candidate: boolean
+  isCurrent(): boolean
+}
 
 // ---------------------------------------------------------------------------
 // Status
@@ -355,6 +379,11 @@ export interface PersonaConnectionManagerDeps {
    * once. Production passes the server's one shared serializer.
    */
   serialize?: PersonaSerialize
+  /** Rechecks applied identity, local directory/config and retirement gates.
+   * Must not reread/adopt pending credentials. Absent means no repair. */
+  canRevalidateMembership?(key: string): boolean
+  /** Capture once when the manager takes ownership of this applied persona. */
+  incarnationFor?(key: string): string | undefined
 }
 
 /** The connection manager handle. */
@@ -371,6 +400,18 @@ export interface PersonaConnectionManager {
   status(key: string): PersonaConnectionStatus | undefined
   /** The persona's bot identity once it has been up (kept while it reopens or after a refused reopen). */
   identity(key: string): SlackBotIdentity | undefined
+  provenance(key: string): PersonaEventProvenance | undefined
+  membershipPage(key: string, connectionId: string, cursor: string | undefined, signal: AbortSignal): Promise<unknown>
+  /**
+   * One Thread Memory lookup request on the persona's current authenticated
+   * connection, through the factory with the metadata client options (no SDK
+   * HTTP timeout: `signal`, aborted by the caller's bounded attempt, ends
+   * it) and the auth watch. Rejects with `MetadataCancelledError` when the
+   * connection is not current, not up, or `signal` already aborted.
+   */
+  metadataCall(key: string, connectionId: string, method: ThreadMemoryLookupMethod, args: Record<string, unknown>, signal: AbortSignal): Promise<unknown>
+  /** One bounded attempt with the held applied token pair; no internal retry. */
+  revalidateMembership(key: string, signal: AbortSignal): Promise<MembershipRevalidation>
   /** The persona's long-lived Web API client once it has been up; always `undefined` in dry run. */
   webClient(key: string): WebClient | undefined
   /**
@@ -439,6 +480,11 @@ export interface PersonaConnectionManager {
   isRunBotIdentity(id: string): boolean
 }
 
+export type MembershipRevalidation =
+  | { kind: 'ready'; provenance: PersonaEventProvenance }
+  | { kind: 'failed'; outcome?: SlackValidationFailure }
+  | { kind: 'cancelled' }
+
 /**
  * The dry-run placeholder identity: derived from the key alone, and
  * distinct for distinct keys (the key is embedded verbatim).
@@ -467,6 +513,9 @@ const RECONNECT_STOPPED =
 /** One Socket Mode client and the listeners the manager subscribed on it. */
 interface SocketBinding {
   readonly client: PersonaSocketClient
+  readonly connectionId: string
+  readonly identity: Readonly<SlackBotIdentity>
+  readonly candidate: boolean
   /** Set when the manager abandons, closes or detaches the client; it then forwards nothing. */
   retired: boolean
   /** Set by any `disconnected` the client emits, so a `start()` resolving after one never counts as up. */
@@ -524,6 +573,7 @@ interface PendingReconnect extends AttemptSlot {
  */
 interface PersonaEntry extends AttemptSlot {
   readonly persona: ConnectionPersona
+  readonly incarnation: string | undefined
   /**
    * Held for later attempts; `undefined` in dry run. Replaced only by a
    * credentials reconnect's swap or `replaceRetryTokens`.
@@ -547,6 +597,9 @@ interface PersonaEntry extends AttemptSlot {
    */
   refusedSocket: SocketBinding | undefined
   stopped: boolean
+  membershipNeedsValidation: boolean
+  membershipRefused: boolean
+  membershipRepair: PendingReconnect | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -602,8 +655,8 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
   }
 
   /** Subscribe the forwarding and `disconnected` handlers on a new client, once. */
-  function bindSocket(entry: PersonaEntry, client: PersonaSocketClient): SocketBinding {
-    const binding: SocketBinding = { client, retired: false, disconnected: false, listeners: [] }
+  function bindSocket(entry: PersonaEntry, client: PersonaSocketClient, identity: SlackBotIdentity, candidate: boolean): SocketBinding {
+    const binding: SocketBinding = { client, connectionId: randomUUID(), identity: Object.freeze({ ...identity }), candidate, retired: false, disconnected: false, listeners: [] }
     for (const eventName of PERSONA_FORWARDED_SOCKET_EVENTS) {
       listen(binding, eventName, (payload: PersonaSocketEventPayload) => forward(entry, binding, eventName, payload))
     }
@@ -649,10 +702,17 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     // delivery, even from a pending reconnect's socket, until a swap.
     if (binding.retired || entry.stopped || entry.status.state === 'broken') return
     try {
-      await onEvent(entry.persona.key, eventName, payload)
+      await onEvent(entry.persona.key, eventName, payload, provenanceOf(entry, binding))
     } catch (err) {
       logFailure(`${eventName} event handler`, entry, err)
     }
+  }
+
+  function provenanceOf(entry: PersonaEntry, binding: SocketBinding): PersonaEventProvenance {
+    const current = () => entries.get(entry.persona.key) === entry && !entry.stopped &&
+      entry.incarnation === deps.incarnationFor?.(entry.persona.key) &&
+      !binding.retired && !binding.disconnected && entry.socket === binding && entry.status.state === 'up'
+    return Object.freeze({ key: entry.persona.key, connectionId: binding.connectionId, incarnation: entry.incarnation, identity: binding.identity, applied: current(), candidate: binding.candidate && entry.socket !== binding, isCurrent: current })
   }
 
   /** A `disconnected` on one of the persona's clients. Only a drop of the live, up connection reopens. */
@@ -719,6 +779,11 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
       if (attempt.settled) return // abandoned at the 10 s bound, or cancelled
       clearStartTimer(attempt)
       if (validated.kind !== 'up') {
+        // A refused bots.info is an auth failure: its membership-origin repair stays bounded.
+        if (phase === 'bring-up' && validated.kind === 'credentials-refused' && validated.method === 'bots.info') {
+          entry.membershipNeedsValidation = true
+          entry.membershipRefused = true
+        }
         attempt.finish({ kind: 'failed', outcome: validated })
         return
       }
@@ -745,7 +810,8 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
   }
 
   /**
-   * `auth.test` on a short-lived validation client (bot token), under the
+   * `auth.test`, then `supplementInstallation` when it names a team but no
+   * app, on a short-lived validation client (bot token), under the
    * manager's own 10 s bound on the injected clock (`SLACK_AUTH_TEST_TIMEOUT_MS`).
    * On expiry the attempt is settled Slack-unreachable (`timeout`) and the
    * call is abandoned: whatever it settles to later is caught and ignored.
@@ -755,11 +821,38 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     armAttemptBound(attempt, SLACK_AUTH_TEST_TIMEOUT_MS, () => {
       attempt.finish({ kind: 'failed', outcome: classifySlackValidationError(new SlackAuthTestTimeoutError(), 'auth.test') })
     })
+    let client: PersonaValidationClient
+    let outcome: SlackUpOutcome | SlackUnreachableOutcome
     try {
-      const client = factory.createValidationClient(tokens.botToken, validationWebClientOptions(slackApiUrl))
-      return botIdentityFromAuthTest(await client.auth.test())
+      client = factory.createValidationClient(tokens.botToken, validationWebClientOptions(slackApiUrl))
+      outcome = botIdentityFromAuthTest(await client.auth.test())
     } catch (err) {
       return classifySlackValidationError(err, 'auth.test')
+    }
+    if (attempt.settled || outcome.kind !== 'up' || !outcome.identity.teamId || outcome.identity.appId || !client.bots) return outcome
+    return supplementInstallation(client.bots, outcome)
+  }
+
+  /**
+   * `bots.info` (users:read) supplies the app ID `auth.test` omitted, under
+   * the same validation bound. Never inspect a token for identity. Only an
+   * auth failure (`WEB_API_AUTH_FAILURE_ERRORS`) refuses the bot token; any
+   * other refusal (`missing_scope`, …) keeps exactly the `auth.test` identity,
+   * its installation unverified, so the persona comes up with membership held.
+   * Slack-unreachable failures stay failures and are retried.
+   */
+  async function supplementInstallation(
+    bots: NonNullable<PersonaValidationClient['bots']>,
+    authenticated: SlackUpOutcome,
+  ): Promise<SlackUpOutcome | SlackValidationFailure> {
+    const { identity } = authenticated
+    try {
+      const result = await bots.info({ bot: identity.botId, team_id: identity.teamId })
+      return { kind: 'up', identity: installationFromBotInfo(identity, result) }
+    } catch (err) {
+      const outcome = classifySlackValidationError(err, 'auth.test')
+      if (outcome.kind !== 'credentials-refused') return outcome
+      return WEB_API_AUTH_FAILURE_ERRORS.has(outcome.slackError) ? { ...outcome, method: 'bots.info' } : authenticated
     }
   }
 
@@ -778,7 +871,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
   ): Promise<void> {
     let binding: SocketBinding
     try {
-      binding = bindSocket(entry, factory.createSocketClient(socketModeClientOptions(tokens.appToken, entry.persona, log, slackApiUrl)))
+      binding = bindSocket(entry, factory.createSocketClient(socketModeClientOptions(tokens.appToken, entry.persona, log, slackApiUrl)), identity, phase === 'reconnect')
     } catch (err) {
       attempt.finish({ kind: 'failed', outcome: classifySlackValidationError(err, 'socket-mode') })
       return
@@ -927,6 +1020,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
   ): Promise<PersonaReconnectOutcome> {
     const entry = entries.get(key)
     if (dryRun || entry === undefined || entry.stopped) return { kind: 'cancelled' }
+    cancelMembershipRepair(entry)
     // A new reconnect supersedes a pending one: its timer, attempt and clients go.
     void cancelReconnect(entry, RECONNECT_SUPERSEDED)
     const reconnect: PendingReconnect = {
@@ -1026,6 +1120,8 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     entry.identity = result.identity
     if (result.web !== undefined) entry.web = result.web
     entry.socket = result.binding
+    entry.membershipNeedsValidation = false
+    entry.membershipRefused = false
     entry.schedule.reset()
     if (previous !== undefined && previous !== result.binding) void retire(previous, true)
     reconnect.tracker.record({ kind: 'up' })
@@ -1087,6 +1183,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     if (dryRun || entry === undefined || entry.stopped) return false
     const { status } = entry
     if (!(status.state === 'connecting' || (status.state === 'retrying' && status.phase === 'bring-up'))) return false
+    cancelMembershipRepair(entry)
     entry.tokens = tokens
     // A client an earlier attempt built from the old bot token (its socket
     // then failed) was never handed out; the next attempt builds one anew.
@@ -1106,6 +1203,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
   /** The persona's long-lived Web API client for `tokens`, wrapped by the auth-failure watch. */
   function createWatchedWebClient(entry: PersonaEntry, tokens: PersonaSlackTokens): WebClient {
     const raw = factory.createWebClient(tokens.botToken, longLivedWebClientOptions(slackApiUrl))
+    observeFileCompletions(raw)
     const watched: WebClient = watchWebClientAuth(raw, outcome => onWebApiRefused(entry, watched, outcome))
     return watched
   }
@@ -1143,7 +1241,8 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
    * gate, the bring-up controller) refuses from now on. Only the detached
    * socket's network close is submitted through the serializer, never
    * awaited. A pending credentials reconnect is left to finish: its swap
-   * brings the persona back up.
+   * brings the persona back up. A membership-origin refusal can also recover
+   * through revalidateMembership's bounded held-credential validation.
    */
   function markRefusedWhileRunning(entry: PersonaEntry, outcome: SlackCredentialsRefusedOutcome): void {
     clearRetryTimer(entry)
@@ -1171,6 +1270,108 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     void disconnectQuietly(socket.client)
   }
 
+  function cancelMembershipRepair(entry: PersonaEntry): void {
+    const repair = entry.membershipRepair
+    entry.membershipRepair = undefined
+    if (!repair) return
+    repair.cancelled = true
+    const attempt = repair.attempt
+    if (attempt) {
+      attempt.finish({ kind: 'cancelled' })
+      if (attempt.binding) void retire(attempt.binding, true)
+    }
+  }
+
+  /** Every discovery client is factory-built, abortable and watched. An auth
+   * refusal (the watch's `WEB_API_AUTH_FAILURE_ERRORS`) marks the persona
+   * before the caller receives its rejection. Any other failure is only the
+   * scanner's: it retries the page on this same connection, so the manager
+   * keeps it up and arms no revalidation. */
+  async function membershipPage(key: string, connectionId: string, cursor: string | undefined, signal: AbortSignal): Promise<unknown> {
+    const entry = entries.get(key)
+    const binding = entry?.socket
+    if (dryRun || !entry?.tokens || !binding || binding.connectionId !== connectionId ||
+        !provenanceOf(entry, binding).isCurrent() || signal.aborted) throw new MembershipCancelledError()
+    const tokens = entry.tokens
+    const applies = () => entries.get(key) === entry && entry.tokens === tokens && !entry.stopped && !signal.aborted && entry.socket === binding
+    const raw = factory.createWebClient(tokens.botToken, membershipWebClientOptions(signal, slackApiUrl))
+    const client = watchWebClientAuth(raw, outcome => {
+      if (!applies()) return
+      entry.membershipNeedsValidation = true
+      entry.membershipRefused = true
+      markRefusedWhileRunning(entry, outcome)
+    })
+    return client.users.conversations({ types: 'public_channel,private_channel', limit: MEMBERSHIP_PAGE_LIMIT,
+      team_id: binding.identity.teamId, ...(cursor ? { cursor } : {}) })
+  }
+
+  /** Thread Memory lookups use the metadata client options (no SDK retries,
+   * rate limits rejected, abort reaching queued HTTP work, and no SDK HTTP
+   * timeout, so the caller's metadata deadline alone ends a hung request) and
+   * the membership connection guard. A refusal marks the persona before the
+   * caller sees it. */
+  async function metadataCall(key: string, connectionId: string, method: ThreadMemoryLookupMethod,
+    args: Record<string, unknown>, signal: AbortSignal): Promise<unknown> {
+    const entry = entries.get(key)
+    const binding = entry?.socket
+    if (dryRun || !entry?.tokens || !binding || binding.connectionId !== connectionId ||
+        !provenanceOf(entry, binding).isCurrent() || signal.aborted || entry.status.state !== 'up') throw new MetadataCancelledError()
+    const tokens = entry.tokens
+    const applies = () => entries.get(key) === entry && entry.tokens === tokens && !entry.stopped && !signal.aborted &&
+      entry.socket === binding && entry.status.state !== 'broken'
+    const raw = factory.createWebClient(tokens.botToken, metadataWebClientOptions(signal, slackApiUrl))
+    const client = watchWebClientAuth(raw, outcome => { if (applies()) markRefusedWhileRunning(entry, outcome) })
+    switch (method) {
+      case 'conversations.replies': return client.conversations.replies(args as never)
+      case 'conversations.history': return client.conversations.history(args as never)
+    }
+  }
+
+  async function revalidateMembership(key: string, signal: AbortSignal): Promise<MembershipRevalidation> {
+    const entry = entries.get(key)
+    if (dryRun || !entry?.tokens || entry.stopped || signal.aborted || entry.reconnect || entry.membershipRepair || entry.attempt) return { kind: 'cancelled' }
+    const current = entry.socket && provenanceOf(entry, entry.socket)
+    if (!entry.membershipNeedsValidation && current?.isCurrent() && slackInstallationIdentity(current.identity)) return { kind: 'ready', provenance: current }
+    // An unrelated posting/reopen refusal keeps its existing confirmed-change
+    // policy. Only a membership-origin failure can reopen that latch here.
+    if (entry.status.state === 'broken' && !entry.membershipRefused) return { kind: 'failed', outcome: entry.status.outcome }
+    const allowed = () => !signal.aborted && !entry.stopped && entries.get(key) === entry &&
+      !entry.reconnect && entry.incarnation === deps.incarnationFor?.(key) && deps.canRevalidateMembership?.(key) === true
+    if (!allowed()) return { kind: 'failed' }
+    const tokens = entry.tokens
+    const identity = entry.identity
+    const repair: PendingReconnect = {
+      tokens, schedule: createPersonaRetrySchedule(), tracker: trackerFor(entry.persona),
+      onLater: undefined, beforeSwap: undefined, timer: undefined, attempt: undefined, cancelled: false,
+    }
+    entry.membershipRepair = repair
+    const abort = () => { if (entry.membershipRepair === repair) cancelMembershipRepair(entry) }
+    signal.addEventListener('abort', abort, { once: true })
+    try {
+      const result = await runAttempt(entry, 'reconnect', repair, tokens)
+      if (!allowed() || repair.cancelled || entry.membershipRepair !== repair || entry.tokens !== tokens) {
+        if (result.kind === 'up') void retire(result.binding, true)
+        return { kind: 'cancelled' }
+      }
+      if (result.kind === 'cancelled') return { kind: 'cancelled' }
+      if (result.kind === 'failed') return { kind: 'failed', outcome: result.outcome }
+      const installation = slackInstallationIdentity(result.identity)
+      const previous = slackInstallationIdentity(identity)
+      if (!installation || (previous && slackInstallationKey(previous) !== slackInstallationKey(installation)) ||
+          (identity && (identity.botId !== installation.botId || identity.botUserId !== installation.botUserId || identity.teamId !== installation.teamId))) {
+        void retire(result.binding, true)
+        return { kind: 'failed' }
+      }
+      // Validate held credentials and all local admission gates immediately
+      // before publishing up; no pending token bytes were read or adopted.
+      swapToReconnect(entry, repair, result)
+      return { kind: 'ready', provenance: provenanceOf(entry, result.binding) }
+    } finally {
+      signal.removeEventListener('abort', abort)
+      if (entry.membershipRepair === repair) entry.membershipRepair = undefined
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Public surface
   // -------------------------------------------------------------------------
@@ -1183,6 +1384,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     }
     const entry: PersonaEntry = {
       persona,
+      incarnation: deps.incarnationFor?.(persona.key),
       tokens: dryRun ? undefined : tokens,
       schedule: createPersonaRetrySchedule(),
       tracker: trackerFor(persona),
@@ -1195,6 +1397,9 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
       reconnect: undefined,
       refusedSocket: undefined,
       stopped: false,
+      membershipNeedsValidation: false,
+      membershipRefused: false,
+      membershipRepair: undefined,
     }
     entries.set(persona.key, entry)
 
@@ -1218,6 +1423,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     if (endReason !== undefined) entry.tracker.end(endReason)
     entries.delete(key)
     entry.stopped = true
+    cancelMembershipRepair(entry)
     clearRetryTimer(entry)
     const closing: Promise<void>[] = [cancelOwnAttempt(entry), cancelReconnect(entry, RECONNECT_STOPPED)]
     if (entry.socket !== undefined) {
@@ -1243,11 +1449,18 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     bringUp,
     status: key => entries.get(key)?.status,
     identity: key => entries.get(key)?.identity,
+    provenance: key => {
+      const entry = entries.get(key)
+      return entry?.socket ? provenanceOf(entry, entry.socket) : undefined
+    },
     webClient: key => {
       const entry = entries.get(key)
       return entry?.identity === undefined ? undefined : entry.web
     },
     reconnectCredentials,
+    membershipPage,
+    metadataCall,
+    revalidateMembership,
     replaceRetryTokens,
     stop,
     stopAll,

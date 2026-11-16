@@ -8,17 +8,15 @@ import { cannedDelivery } from './test-helpers/agent-director-stub.ts'
  * - request_id is `number`: a compile-time tripwire that fails
  *     closed if the library widens the type.
  * - the section not in force is never read:
- *     outside a fixed list of `src/` files, no file reads a persona's
+ *     outside a fixed list of `src/` files, no unreviewed read of a persona's
  *     `channels`, `permission_prompts`, `invited`, `fungible_destination` or
- *     `sections`; inside it, `src/registry.ts` reads them only in the
+ *     `sections` is allowed; inside it, `src/registry.ts` reads them only in the
  *     posting-scope check and its classifier, `src/persona-routing.ts` only
  *     in the decisions' inputs (the arguments of `decideDelivery` and
  *     `decideReaction`), `src/persona-destination.ts` only in the one
  *     destination rule.
- * - the readers of the resolved forms: `sections` is read
- *     only by the reload plan; `fungible_destination` only by the one
- *     destination rule, the delivery decision, the routing's input to it and
- *     the reload plan (`src/config.ts` reads it only where it builds it).
+ *   - The retired split forms `sections`, `invited` and
+ *     `fungible_destination` have no source readers.
  * - one destination rule: declared once, in
  *     `src/persona-destination.ts`; the destination hold, the permission
  *     poller, the persona notifier and the lost-message notice read none of
@@ -37,7 +35,9 @@ import { cannedDelivery } from './test-helpers/agent-director-stub.ts'
  *   constant, imported or not, or a union of literals); a key of type
  *   `string` is no read. An object literal that builds the field, a type and
  *   a setting name held as a string are no read. A same-named field of a
- *   non-persona object is admitted only by an exact `ADMITTED_READS` entry
+ *   non-persona object, or the destination declaration bound into a durable
+ *   operator review (AC-W05/W07/W08), is admitted only by an exact
+ *   `ADMITTED_READS` entry
  *   (the file, the function, the read, how many times it occurs and the
  *   reason), and an entry whose count differs from the reads it matches
  *   fails the audit. Negative controls pin the matcher and the checks on
@@ -148,6 +148,7 @@ const FIXED_READERS: readonly string[] = [
   'registry.ts',
   'persona-destination.ts',
   'jsonl-persistence-check.ts',
+  'shared-channels.ts',
 ]
 
 /** The one destination rule, declared in `src/persona-destination.ts`. */
@@ -155,9 +156,6 @@ const ONE_DESTINATION_RULE = 'personaDestinationOf'
 
 /** Where `src/config.ts` builds a persona's resolved forms: building them is no read. */
 const PERSONA_BUILDER = 'parsePersonaEntry'
-
-/** the only files that may read `sections` (the reload plan). */
-const SECTIONS_READERS: readonly string[] = ['reload-plan.ts']
 
 /**
  * the only files that may read `fungible_destination`: the one
@@ -210,11 +208,11 @@ const PLACEMENT: readonly PlacementRow[] = [
 ]
 
 /**
- * A read of a same-named field of a non-persona object, outside the fixed
- * list: the file, the functions it lies in (outermost first,
+ * A read of a same-named field of a non-persona object or a review dependency,
+ * outside the fixed list : the file, the functions it lies in (outermost first,
  * joined by ` > `), the read's text, how many reads of that text lie there
- * and why it is no persona read. The reads an entry matches must number
- * exactly its `count`, or the audit fails.
+ * and why it does not make a runtime delivery/destination decision. The reads
+ * an entry matches must number exactly its `count`, or the audit fails.
  */
 interface AdmittedRead {
   readonly file: string
@@ -228,18 +226,20 @@ interface AdmittedRead {
 const STORED_CHOICES_ENTRY = "a persona key's entry of the stored-choice file: its own `channels` map of stored choices, never a persona's"
 
 const ADMITTED_READS: readonly AdmittedRead[] = [
-  { file: 'channel-delivery.ts', within: 'serializeChannelDelivery', read: 'entry.channels', count: 3, reason: STORED_CHOICES_ENTRY },
-  {
-    file: 'channel-delivery.ts',
-    within: 'personaEntryOf',
-    read: "value['channels']",
-    count: 1,
-    reason: "a persona key's entry of the stored-choice file as parsed from JSON, checked before it is a record",
-  },
-  { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > set', read: 'existing?.channels', count: 2, reason: STORED_CHOICES_ENTRY },
-  { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > drop', read: 'entry.channels', count: 1, reason: STORED_CHOICES_ENTRY },
-  { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > storedChoice', read: 'entries.get(key)?.channels', count: 1, reason: STORED_CHOICES_ENTRY },
-  { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > storedChannels', read: 'entries.get(key)?.channels', count: 1, reason: STORED_CHOICES_ENTRY },
+  { file: 'channel-membership-scan.ts', within: 'parsePage', read: "value['channels']", count: 2, reason: 'validate and iterate the Slack users.conversations response array, not a persona configuration' },
+  { file: 'channel-membership-scan.ts', within: 'createMembershipScanner > collect', read: 'page.channels', count: 1, reason: 'iterate the parsed users.conversations page returned by the connection manager membershipPage call, not a persona configuration' },
+  { file: 'reload.ts', within: 'createPendingDetection > candidateOf', read: 'reviewed.channels', count: 1, reason: 'channel effects returned by shared authority planReviewed for the preview, not a persona channels list or a delivery decision' },
+  { file: 'reload.ts', within: 'createPendingDetection > derive', read: 'persona.permission_prompts', count: 1, reason: 'AC-W05/W07/W08: bind applied and candidate destination declarations into reloadReviewBinding so a changed destination revokes review authorization; no destination resolution or posting' },
+  { file: 'reload-recovery.ts', within: 'fingerprint', read: 'p.permission_prompts', count: 1, reason: 'bind the retained repair destination to its review fingerprint; never selects a runtime destination or admits delivery' },
+  { file: 'persona-diagnostics.ts', within: 'sharedScopeIdentity', read: 'scope.channels', count: 1, reason: 'serialize the report scope DTO channel identifiers into a diagnostic, not persona configuration' },
+  { file: 'shared-state-reports.ts', within: 'scopeText', read: 'scope.channels', count: 1, reason: 'format channel identifiers from the reporting scope DTO, not persona configuration' },
+  { file: 'shared-state-reports.ts', within: 'buildMembershipEvidenceUnresolvedNotice', read: 'scope.channels', count: 1, reason: 'bound displayed evidence to the report scope DTO channel identifiers' },
+  { file: 'shared-state-reports.ts', within: 'scopeOf', read: 'scope.channels', count: 1, reason: 'copy the remembered reporting scope set into a notice DTO' },
+  { file: 'shared-state-reports.ts', within: 'remember', read: 'scope.channels', count: 1, reason: 'accumulate affected channel identifiers from the reporting DTO' },
+  { file: 'shared-state-reports.ts', within: 'remember', read: 'target.channels', count: 1, reason: 'extend the remembered report scope set; no configuration or membership write' },
+  { file: 'shared-state-reports.ts', within: 'createSharedStateReporting > reportState', read: 'scope?.channels', count: 1, reason: 'observe the authority unresolved-scope metadata, not persona configuration' },
+  { file: 'shared-state-reports.ts', within: 'createSharedStateReporting > reportState', read: 'reportScope.channels', count: 1, reason: 'classify reporting DTO channel identifiers as usable or held for the staged notice' },
+  { file: 'shared-state-reports.ts', within: 'createSharedStateReporting > closeReady > decided', read: 'remembered.channels', count: 2, reason: 'extend and check the report episode scope before a closing notice; no configuration or intake decision' },
 ]
 
 /** How a field is read. */
@@ -612,7 +612,6 @@ describe('the section not in force is never read', () => {
     expect([...modules.keys()]).toEqual(everyTs)
     const named = [
       ...FIXED_READERS,
-      ...SECTIONS_READERS,
       ...FUNGIBLE_DESTINATION_READERS,
       ...DESTINATION_CONSUMERS,
       ...PLACEMENT.map((row) => row.file),
@@ -625,7 +624,7 @@ describe('the section not in force is never read', () => {
     expect(syntaxFindings(modules)).toEqual([])
   })
 
-  test('outside the fixed list, no src/ file reads a persona field, and every admitted read matches its count', () => {
+  test('outside the fixed list, no src/ file has an unreviewed field read, and every admitted read matches its count', () => {
     expect(outsideListFindings(modules, FIXED_READERS, ADMITTED_READS)).toEqual([])
   })
 
@@ -634,21 +633,14 @@ describe('the section not in force is never read', () => {
   })
 })
 
-describe('the readers of sections and fungible_destination', () => {
+describe('the shared schema has no readers of retired split fields', () => {
   const modules = srcSources()
 
-  test('sections is read only by the reload plan', () => {
-    expect(readersFindings(modules, 'sections', SECTIONS_READERS)).toEqual([])
-    expect(allFieldReads(modules).filter((r) => r.field === 'sections').length).toBeGreaterThan(0)
-  })
-
-  test('fungible_destination is read only by the one destination rule, the delivery decision, the routing and the reload plan', () => {
-    expect(readersFindings(modules, 'fungible_destination', FUNGIBLE_DESTINATION_READERS)).toEqual([])
-    expect(allFieldReads(modules).filter((r) => r.field === 'fungible_destination' && r.file === 'reload-plan.ts').length).toBeGreaterThan(0)
-  })
-
-  test('src/config.ts reads fungible_destination only where it builds a persona', () => {
-    expect(placementFindings(modules, { file: 'config.ts', regions: [{ fn: PERSONA_BUILDER }], fields: ['fungible_destination'] })).toEqual([])
+  test.each(['sections', 'invited', 'fungible_destination'] as const)('removed field %s has no reader under src/', field => {
+    expect(readersFindings(modules, field, [])).toEqual([])
+    const planted = new Map([['reload-plan.ts', `export const read = (persona: P) => persona.${field}`]])
+    expect(readersFindings(planted, field, [])).toHaveLength(1)
+    expect(readersFindings(new Map([['reload-plan.ts', 'export const read = (persona: P) => persona.name']]), field, [])).toEqual([])
   })
 })
 
@@ -656,11 +648,11 @@ describe('one destination rule', () => {
   const modules = srcSources()
   const { sources } = auditProgram(modules)
 
-  test('the rule is declared once, in src/persona-destination.ts, and reads both destination fields', () => {
+  test('the rule is declared once, in src/persona-destination.ts, and reads the single permission destination', () => {
     const declared = [...sources].flatMap(([file, sf]) => functionsNamed(sf, ONE_DESTINATION_RULE).map(() => file))
     expect(declared).toEqual(['persona-destination.ts'])
     const ruleReads = fieldReads(modules, 'persona-destination.ts').filter((r) => inRegion(r.node, { fn: ONE_DESTINATION_RULE }))
-    expect([...new Set(ruleReads.map((r) => r.field))].sort()).toEqual(['fungible_destination', 'permission_prompts'])
+    expect([...new Set(ruleReads.map((r) => r.field))].sort()).toEqual(['permission_prompts'])
   })
 
   test.each(DESTINATION_CONSUMERS.map((file) => [`src/${file}`, file] as const))('%s reads none of the persona fields', (_label, file) => {
@@ -763,6 +755,78 @@ describe('negative controls for the reader audit', () => {
     expect(outsideListFindings(modules, FIXED_READERS, [{ ...entry, count: 3 }])).toEqual(['admitted read matches 2 reads, not 3: src/planted.ts p.channels (in f)'])
   })
 
+  test.each([
+    ['reviewed channels', 'reviewed.channels', 'createPendingDetection > candidateOf', 'persona.channels', 'channels', 'reviewed', 'reload.ts'],
+    ['review destination binding', 'persona.permission_prompts', 'createPendingDetection > derive', 'persona.channels', 'permission_prompts', 'persona', 'reload.ts'],
+    ['repair destination binding', 'p.permission_prompts', 'fingerprint', 'p.channels', 'permission_prompts', 'p', 'reload-recovery.ts'],
+  ] as const)('%s admission rejects extra, missing, adjacent and relocated reads', (_label, read, within, adjacent, field, receiver, file) => {
+    const source = readFileSync(join(SRC_DIR, file), 'utf8')
+    const admitted = ADMITTED_READS.filter(entry => entry.file === file)
+    expect(outsideListFindings(new Map([[file, source]]), FIXED_READERS, admitted)).toEqual([])
+    expect(source.split(read)).toHaveLength(2)
+    const countFinding = (count: number) => `admitted read matches ${count} reads, not 1: src/${file} ${read} (in ${within})`
+    const cases: readonly [string, string[]][] = [
+      [source.replace(read, `[${read}, ${read}]`), [countFinding(2)]],
+      [source.replace(read, 'undefined'), [countFinding(0)]],
+      [source.replace(read, `[${read}, ${adjacent}]`), [`src/${file}: property read of channels ${adjacent} (in ${within})`]],
+      [source.replace(read, 'undefined') + `\nfunction other(${receiver}: any) { return ${read} }`, [
+        `src/${file}: property read of ${field} ${read} (in other)`, countFinding(0),
+      ]],
+    ]
+    for (const [code, findings] of cases) {
+      const mutant = new Map([[file, code]])
+      expect(syntaxFindings(mutant)).toEqual([])
+      expect(outsideListFindings(mutant, FIXED_READERS, admitted)).toEqual(findings)
+    }
+  })
+
+  test.each([
+    ['a persona field in the page parser', "const metadata = value['response_metadata']", "const metadata = value['response_metadata']; persona.channels", 'property read of channels persona.channels (in parsePage)'],
+    ['a persona field beside the parsed page', 'const metadata = JSON.stringify(', 'persona.channels; const metadata = JSON.stringify(', 'property read of channels persona.channels (in createMembershipScanner > collect)'],
+    ['the same read outside the parser', "return { channels, cursor: typeof cursor === 'string' ? cursor : '' }", "return { channels, cursor: typeof cursor === 'string' ? cursor : '' } } function other(value: any) { return value['channels']", "string key read of channels value['channels'] (in other)"],
+    ['an extra response read', "const metadata = value['response_metadata']", "value['channels']; const metadata = value['response_metadata']", "admitted read matches 3 reads, not 2: src/channel-membership-scan.ts value['channels'] (in parsePage)"],
+    ['a removed response read', "for (const raw of value['channels'])", 'for (const raw of [])', "admitted read matches 1 reads, not 2: src/channel-membership-scan.ts value['channels'] (in parsePage)"],
+    ['an extra parsed-page read', 'for (const channel of page.channels)', 'page.channels; for (const channel of page.channels)', 'admitted read matches 2 reads, not 1: src/channel-membership-scan.ts page.channels (in createMembershipScanner > collect)'],
+    ['a removed parsed-page read', 'for (const channel of page.channels)', 'for (const channel of [])', 'admitted read matches 0 reads, not 1: src/channel-membership-scan.ts page.channels (in createMembershipScanner > collect)'],
+  ] as const)('Slack page admissions still reject %s', (_what, from, to, finding) => {
+    const file = 'channel-membership-scan.ts'
+    const source = readFileSync(join(SRC_DIR, file), 'utf8')
+    const admitted = ADMITTED_READS.filter(entry => entry.file === file)
+    expect(outsideListFindings(new Map([[file, source]]), FIXED_READERS, admitted)).toEqual([])
+    expect(source.split(from)).toHaveLength(2)
+    const mutant = new Map([[file, source.replace(from, to)]])
+    expect(syntaxFindings(mutant)).toEqual([])
+    const findings = outsideListFindings(mutant, FIXED_READERS, admitted)
+    expect(findings).toEqual([finding.startsWith('admitted read') ? finding : `src/${file}: ${finding}`])
+  })
+
+  test.each(ADMITTED_READS.filter(entry => ['persona-diagnostics.ts', 'shared-state-reports.ts'].includes(entry.file)))
+  ('report metadata admission rejects extra, missing, adjacent and relocated reads: %j', entry => {
+    const { file, within, read, count } = entry
+    const source = readFileSync(join(SRC_DIR, file), 'utf8')
+    const modules = new Map([[file, source]])
+    const admitted = ADMITTED_READS.filter(candidate => candidate.file === file)
+    expect(outsideListFindings(modules, FIXED_READERS, admitted)).toEqual([])
+    const sites = fieldReads(modules, file).filter(site => admits(entry, site))
+    expect(sites).toHaveLength(count)
+    const site = sites[0]!.node
+    const replace = (replacement: string) => source.slice(0, site.getStart()) + replacement + source.slice(site.getEnd())
+    const countFinding = (actual: number) => `admitted read matches ${actual} reads, not ${count}: src/${file} ${read} (in ${within})`
+    const cases: readonly [string, string[]][] = [
+      [replace(`(${read}, ${read})`), [countFinding(count + 1)]],
+      [replace('undefined'), [countFinding(count - 1)]],
+      [replace(`(persona.channels, ${read})`), [`src/${file}: property read of channels persona.channels (in ${within})`]],
+      [replace('undefined') + `\nfunction other() { return ${read} }`, [
+        `src/${file}: ${read.includes('?.') ? 'optional property' : 'property'} read of channels ${read} (in other)`, countFinding(count - 1),
+      ]],
+    ]
+    for (const [code, findings] of cases) {
+      const mutant = new Map([[file, code]])
+      expect(syntaxFindings(mutant)).toEqual([])
+      expect(outsideListFindings(mutant, FIXED_READERS, admitted)).toEqual(findings)
+    }
+  })
+
   test("a read inside the list but outside its file's part is a finding, and a part with no read is one", () => {
     const row = { file: 'planted.ts', regions: [{ fn: 'scope' }, { argsOf: 'decide' }], fields: AUDITED_FIELDS }
     const inside = 'function scope(p: P) { return p.channels }\nexport const g = (p: P) => decide({ channels: p.channels })'
@@ -796,10 +860,10 @@ describe('negative controls for the reader audit', () => {
 describe('negative controls for the one-rule checks', () => {
   const resolver = plantedSource(
     [
-      'function personaDestinationOf(c: C, p: P) { return p.dm }',
-      'function direct(p: P) { return personaDestinationOf(undefined, p) }',
+      'function personaDestinationOf(p: P) { return p.dm }',
+      'function direct(p: P) { return personaDestinationOf(p) }',
       'function viaHelper(p: P) { return helper(p) }',
-      'function helper(p: P) { return personaDestinationOf(undefined, p) }',
+      'function helper(p: P) { return personaDestinationOf(p) }',
       'function apart(p: P) { return other(p) }',
       'function other(p: P) { return p.key }',
       'function loopA(p: P): unknown { return loopB(p) }',

@@ -29,7 +29,7 @@ exception is `hgx`, which takes a value only as an argument (see
     created on the current VM through mail.tm's API, and its address is also
     in `/tmp/cscb-test-mailbox-address.txt`.
 - On the VM: docker, the `/ci` base image (check with
-  `bun scripts/safe-docker-inspect.ts docker image inspect cscb-ci-base:v9`;
+  `bun scripts/safe-docker-inspect.ts docker image inspect cscb-ci-base:v10`;
   if confirmed missing, run `/ci` once with `CSCB_AD_SRC_DIR` set: see
   `docker/README.md`; an inspection error stops the check, with no raw fallback), Google Chrome
   (`google-chrome --version`), bun, and `CSCB_AD_SRC_DIR` set to a checkout
@@ -73,6 +73,14 @@ A VM reboot can loosen these modes: at boot the pod's `fsGroup` re-applies
 its group to the files. After a reboot, check the modes with the `stat`
 above before a run.
 
+## Membership readiness in a run
+
+For verified setup results, supply a usable app configuration token so the runner can export C’s manifest and check both `member_joined_channel` and `channel_left`. Keep `apps.json` and provisioning outcomes available: a manifest update/adopted drift needs one reinstall, a newly created app one install, and unchanged reuse no redundant reinstall. Tokenless reuse can run other checks but leaves setup uninspectable, recorded as `SKIPPED (not run: …)` with its limit.
+
+The runner’s `setup-ready` check runs after channel checks with C up, before Check 24. It matches the authenticated installation, records subscription/reinstall evidence, rejects another app’s installation, reads back the record and checks C’s saved choices stayed unchanged. `setup-restart` runs after Check 28, before Part 11, and requires the same record and installation under a different server PID with no further reinstall. Missing subscriptions or incomplete reinstall fails; missing prior evidence, unknown setup or the same process cannot pass. Neither check fills a Results column, and inventory status is separate from setup readiness.
+
+Checks 30–34 use `channel_mode` strict/open and one shared list: the live join gives C `mentions` with verified membership, strict mode preserves its proven `all` assignment, and the kick removes its choice while recording membership false and the leave. Ordinary live events do not verify app subscriptions. The runner cannot inspect subscriptions without a usable manifest export, and it does not exercise or reconstruct a leave and rejoin wholly during downtime with no authoritative absence or observed leave. See [the live plan](../testplans/live-acceptance.md#runner-only-membership-readiness) for the evidence steps.
+
 ## 1. The files
 
 Each snippet reads the value at a prompt and writes it with the shell's
@@ -83,9 +91,12 @@ already existed keeps its old mode.
 The configuration token and its refresh token. A run uses the configuration
 token to check the apps against `slack-app-manifest.yml` through the manifest
 API, and to update a drifted app or create a missing one. Once `apps.json`
-records all four apps, the token is optional: without a usable one, a run
-logs a `WARNING` and reuses the recorded apps unchecked. A configuration
-token lasts 12 hours. With the refresh token, the runner rotates the pair
+records all four apps, the token is optional: a missing or refused token, or
+`no_permission` (the token cannot manage the test apps), gives one `WARNING`
+and reuses the recorded apps unchecked, with no further export, drift check
+or update. `no_permission` never triggers rotation; creating an app or
+resolving an unfinished create still needs a usable token (exit 2 without it).
+A configuration token lasts 12 hours. With the refresh token, the runner rotates the pair
 when the token has expired and saves both files (mode 600). Write the
 refresh token issued with the token in `slack_config_token` (the same
 **Generate Token** click shows both). If you no longer have it, generate a

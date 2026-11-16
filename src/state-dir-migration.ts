@@ -994,7 +994,10 @@ function mergeEntries(fs: StateDirMigrationFs, paths: StateDirPaths, log: (line:
   const redundant: string[] = []
   const conflicts: string[] = []
   const failures: { name: string; cause: string }[] = []
+  let ignoredRemovedStore = false
   for (const name of fs.readdir(paths.legacyDir).sort()) {
+    // This removed store is never opened, compared, copied or imported.
+    if (name === 'channel-delivery.json') { ignoredRemovedStore = true; continue }
     const src = join(paths.legacyDir, name)
     const dst = join(paths.newDir, name)
     try {
@@ -1018,6 +1021,15 @@ function mergeEntries(fs: StateDirMigrationFs, paths: StateDirPaths, log: (line:
   if (conflicts.length > 0) {
     log(stateDirPendingLine(paths.legacyDir, paths.newDir, moved, conflicts, []))
     return { kind: 'pending', entries: moved, conflicts, leftover: [] }
+  }
+
+  if (ignoredRemovedStore) {
+    // Preserve the per-file links at the old location: configuration may
+    // still refer to active credentials or other files through that path.
+    // The removed file stays unopened in place and never makes startup wait.
+    if (moved.length === 0) return { kind: 'already-migrated' }
+    log(stateDirMergedLine(paths.legacyDir, paths.newDir, moved, paths.legacyIsXdg === true))
+    return { kind: 'moved', via: 'merge', entries: moved }
   }
 
   // Nothing conflicts: what is left in the legacy directory is the links just
@@ -1239,6 +1251,11 @@ export function migrateStateDirAtStart(
   let reported: { paths: StateDirPaths; outcome: StateDirMigrationOutcome } | undefined
   for (const step of steps) {
     if (reported?.outcome.kind === 'pending' && linksToDirectory(fs, step.legacyDir, reported.paths.legacyDir)) continue
+    // A settled merge may retain L2 solely for an ignored removed store and
+    // active per-file links. L1 reaching that directory is already migrated;
+    // do not classify it as an unrelated legacy server location.
+    if ((reported?.outcome.kind === 'already-migrated' || reported?.outcome.kind === 'moved') &&
+        linksToDirectory(fs, step.legacyDir, reported.paths.legacyDir)) continue
     const outcome = prepareStateDir(step, deps)
     if (stateDirMigrationStopsStart(outcome)) return { paths: step, outcome, startupErrorDir: stopLogDir(fs, startupErrorDir, step) }
     if (reported === undefined || OUTCOME_RANK[outcome.kind] >= OUTCOME_RANK[reported.outcome.kind]) reported = { paths: step, outcome }

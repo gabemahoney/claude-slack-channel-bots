@@ -63,6 +63,8 @@ import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, LEAK_SENTINEL, fakeToken, writeCred
 
 export interface ConnectionHarnessOptions {
   /** Dry run: no stub is registered and no token is handed to the manager. */
+  incarnationFor?: (key: string) => string | undefined
+  canRevalidateMembership?: (key: string) => boolean
   dryRun?: boolean
   /** Per-persona-name stub options, merged over the leak marker. */
   stubOptions?: Readonly<Record<string, StubSlackOptions>>
@@ -170,13 +172,15 @@ export function makeConnectionHarness(
   const manager = createPersonaConnectionManager({
     dryRun,
     factory: slack.factory,
+    incarnationFor: opts.incarnationFor,
+    canRevalidateMembership: opts.canRevalidateMembership,
     clock,
     log: (line) => void lines.push(line),
     onStatus: (key, status) => {
       statuses.push([key, status])
       return h.onStatus?.(key, status)
     },
-    onEvent: (key, eventName, payload) => h.onEvent(key, eventName, payload),
+    onEvent: (key, eventName, payload, provenance) => h.onEvent(key, eventName, payload, provenance),
     ...(opts.serialize === undefined ? {} : { serialize: opts.serialize }),
   })
 

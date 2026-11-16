@@ -48,7 +48,7 @@
  * - Fungible mode (beside), in its own
  *     describe with the switch on and a resolver reading it at each attempt,
  *     as `src/server.ts` wires it: a prompt for a persona whose fungible
- *     destination (`invited.permission_prompts`) is a channel posts once to
+ *     destination (`permission_prompts`) is a channel posts once to
  *     that channel, and one whose fungible destination is `dm`, explicit or
  *     by default, opens the DM with `dm.contact` and posts there, each on the
  *     persona's own client, no other client asked for or called; the live
@@ -160,6 +160,15 @@
  *     line still leaves the short prompt to post next. Each line is
  * asserted with its text from its builder, whose
  *     literal texts one `pin:` case holds.
+ * - Own-post operations: each prompt, fallback and warning starts and ends
+ *     separately. A held intent wait blocks posting and registration; later
+ *     ticks never duplicate it. Observer/owner, intent/outcome append, hold
+ *     and trail faults leave successful prompts registered and updateable.
+ *     A destination change keeps the original message answerable through its
+ *     own persona's connection. Real-owner prompts join their returned ts,
+ *     a rejected full prompt records none before its fallback joins, and off
+ *     channels and DMs register no own post. No observer still permits prompt
+ *     registration; a success without a ts is never reposted.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -184,6 +193,7 @@ import {
   buildSpawnFailedLine,
   buildTickFailedLine,
   buildWedgeWarningBody,
+  buildPromptPostedWithoutTsLine,
   buildWedgeWarningText,
   dropPermission,
   forgetPersonaPrompts,
@@ -206,14 +216,17 @@ import {
   type PersonaDestinations,
 } from '../src/persona-destination.ts'
 import { createPersonaDestinationHold, type PersonaDestinationHold } from '../src/persona-destination-hold.ts'
+import { createOwnPostObserver, type OwnPostObserver } from '../src/own-post.ts'
 import type { PersonaTeardownWindowState } from '../src/persona-notifier.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
-import { parsePermissionActionId } from '../src/permission-action-id.ts'
+import { encodePermissionActionId, parsePermissionActionId } from '../src/permission-action-id.ts'
+import { handlePermissionClick } from '../src/permission-click-handler.ts'
 import { personaKeyFromActionId } from './test-helpers/action-id-key.ts'
 import { personaInstanceId, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import { createPersonaUpPredicate } from '../src/persona-start.ts'
 import type { PersonaConnectionStatus } from '../src/persona-connections.ts'
 import {
+  cannedDecideResult,
   cannedGetPermissionResponse,
   cannedGetResult,
   cannedListRow,
@@ -226,7 +239,10 @@ import {
   makeStubClient,
   type CannedGetResult,
 } from './test-helpers/agent-director-stub.ts'
-import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { makeMultiPersonaConfig, makePersona, makePersonaConfigInput } from './test-helpers/persona-config.ts'
+import { holdOwnPostReady, makeOwnPostHarness, makeRecordingOwnPostObserver, type OwnPostHarness } from './test-helpers/own-post.ts'
+import { configBytes, makeMembershipHarness, membershipPage } from './test-helpers/shared-channels.ts'
+import { THREAD_ROOTS } from './test-helpers/thread-memory.ts'
 import { HUMAN_ONLY_SENTENCE } from './test-helpers/conflict-cases.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 import { asWebClient, makeDeferredWebApiCall, makeStubSlack, openedDm, stubOpenedDmId, type StubSlack } from './test-helpers/slack-stub.ts'
@@ -259,6 +275,8 @@ import {
 } from '../src/agent-director-client.ts'
 import {
   ErrSystemInstallDisappeared,
+  type Client as AgentDirectorClient,
+  type DecideParams,
 } from 'agent-director'
 import {
   _resetOutageState,
@@ -1265,11 +1283,6 @@ describe('poller tick — `dm` destination', () => {
 // ---------------------------------------------------------------------------
 
 describe('poller tick — fungible mode: prompts at the fungible destination (beside)', () => {
-  /** The configuration in effect in declarative mode, as the one destination rule reads it. */
-  const DECLARATIVE_MODE: DestinationConfig = { allow_invited_channels: false }
-  /** The configuration in effect in fungible mode, as the one destination rule reads it. */
-  const FUNGIBLE_MODE: DestinationConfig = { allow_invited_channels: true }
-
   // F's fungible destination is a channel; X names `dm` explicitly; Y has no
   // `invited` section, so its fungible destination is `dm` by default.
   const NAME_F = 'Foxtrot Invited'
@@ -1288,12 +1301,12 @@ describe('poller tick — fungible mode: prompts at the fungible destination (be
   beforeEach(() => {
     config = makeMultiPersonaConfig(
       [
-        { name: NAME_F, invited: { permission_prompts: F_DEST } },
-        { name: NAME_X, dm: { enabled: true, contact: X_CONTACT }, invited: { permission_prompts: DM_DESTINATION } },
-        { name: NAME_Y, dm: { enabled: true, contact: Y_CONTACT } },
+        { name: NAME_F, permission_prompts: F_DEST },
+        { name: NAME_X, dm: { enabled: true, contact: X_CONTACT }, permission_prompts: DM_DESTINATION },
+        { name: NAME_Y, permission_prompts: DM_DESTINATION, dm: { enabled: true, contact: Y_CONTACT } },
       ],
       personaDir,
-      { allow_invited_channels: true },
+      { channel_mode: 'open' },
     )
     ;[F, X, Y] = config.personas as [Persona, Persona, Persona]
     fungibleStubs = new Map(config.personas.map((p) => [p.key, makeStubSlack({ leakMarker: LEAK_SENTINEL })]))
@@ -1330,16 +1343,15 @@ describe('poller tick — fungible mode: prompts at the fungible destination (be
       () => X, () => DM_DESTINATION, ['conversations.open', 'chat.postMessage'], () => X_CONTACT,
     ],
     [
-      'a defaulted "dm" fungible destination (Y, no invited section): conversations.open for its dm.contact, then chat.postMessage to the returned D…',
+      'an explicit "dm" destination (Y, shared permission_prompts): conversations.open for its dm.contact, then chat.postMessage to the returned D…',
       () => Y, () => DM_DESTINATION, ['conversations.open', 'chat.postMessage'], () => Y_CONTACT,
     ],
   ])('%s — posted once on the persona\'s own client, no other client asked for or called; the live entry records that conversation and the persona key', async (_label, pick, fungibleDestination, expectedMethods, contact) => {
     const persona = pick()
     // Preconditions: the switch is on, the destination is the loader's
     // fungible destination, and the declarative section is not in force.
-    expect(config.allow_invited_channels).toBe(true)
-    expect(persona.fungible_destination).toBe(fungibleDestination())
-    expect(persona.permission_prompts).toBeUndefined()
+    expect(config.channel_mode).toBe('open')
+    expect(persona.permission_prompts).toBe(fungibleDestination())
     const stub = fungibleStubs.get(persona.key)!
     const dmContact = contact()
     const expectedChannel = dmContact === undefined ? F_DEST : stubOpenedDmId(dmContact)
@@ -1399,15 +1411,15 @@ describe('poller tick — fungible mode: prompts at the fungible destination (be
     expect(declarative.logCalls).toHaveLength(1)
     const fungibleLine = String(fungible.logCalls[0]![0])
     const declarativeLine = String(declarative.logCalls[0]![0])
-    const fungibleSetting = destinationSettingOf(FUNGIBLE_MODE)
-    const declarativeSetting = destinationSettingOf(DECLARATIVE_MODE)
+    const fungibleSetting = destinationSettingOf()
+    const declarativeSetting = destinationSettingOf()
     expect(declarativeLine).toContain(`${renderPersonaRef(persona.name, persona.key)} has ${declarativeSetting} set to "${DM_DESTINATION}" but ${describeDmDestinationRefusal(reason)}`)
     expect(declarativeLine).toContain(instance)
     expect(declarativeLine).toContain(TOKEN_A)
     // The declarative line names its setting once, so the swap below is exact.
     expect(declarativeLine.split(declarativeSetting)).toHaveLength(2)
     expect(fungibleLine).toBe(declarativeLine.replace(declarativeSetting, fungibleSetting))
-    expect(fungibleLine).not.toBe(declarativeLine)
+    expect(fungibleLine).toBe(declarativeLine)
     assertNoLeak({ fungible: fungible.logCalls, declarative: declarative.logCalls }, 'fungible destination refused')
   })
 })
@@ -4278,9 +4290,13 @@ const NOT_UP: Array<[string, PersonaConnectionStatus | undefined, boolean]> = [
  * up predicate over a per-persona connection status and bring-up outcome.
  * `down(key, variant?)` puts a persona in a `NOT_UP` state, `up(key)`
  * brings it up. `trailFault`, when it returns an error for an event, makes
- * the trail emitter throw it instead of capturing the event.
+ * the trail emitter throw it instead of capturing the event. `extra` adds
+ * poller deps, such as a resolver over a recording own-post adapter.
  */
-function makeNotUpScenario(trailFault: (event: CapturedTrailEvent) => Error | undefined = () => undefined) {
+function makeNotUpScenario(
+  trailFault: (event: CapturedTrailEvent) => Error | undefined = () => undefined,
+  extra: Partial<PollerDeps> = {},
+) {
   const statuses = new Map<string, PersonaConnectionStatus | undefined>([[KEY_A, UP], [KEY_B, UP], [KEY_D, UP]])
   const outcomeUp = new Set<string>([KEY_A, KEY_B, KEY_D])
   const isPersonaUp = createPersonaUpPredicate({ status: (key) => statuses.get(key) }, { isUp: (key) => outcomeUp.has(key) })
@@ -4310,6 +4326,7 @@ function makeNotUpScenario(trailFault: (event: CapturedTrailEvent) => Error | un
       trail.emit(event)
     },
     log: (...args) => { logCalls.push(args) },
+    ...extra,
   })
   return {
     ivl,
@@ -4628,6 +4645,28 @@ describe('forgetPersonaPrompts — a teardown drops one persona\'s poller state'
 
     expect(posts(stubA)[1]!.blocks).toEqual(buildFallbackPermissionBlocks('Bash', 'invalid_blocks', INSTANCE_A, TOKEN_A))
     expect(posts(stubB)[1]!.blocks).toEqual(posts(stubB)[0]!.blocks)
+    expect(droppedLines(s.logCalls)).toEqual([])
+  })
+
+  test('drops B\'s posted-without-ts record: B\'s open request posts again on the next tick, while A\'s, posted without a ts the same way, is not posted again', async () => {
+    const s = makeNotUpScenario()
+    s.open.set(INSTANCE_A, [requestA()])
+    s.open.set(INSTANCE_B, [requestB()])
+    scriptPostTs(stubA, undefined)
+    scriptPostTs(stubB, undefined, POST_TS_2)
+    await s.drive(2)
+    expect(posts(stubA)).toHaveLength(1)
+    expect(posts(stubB)).toHaveLength(1)
+    expect(getLivePermission(INSTANCE_B, TOKEN_B)).toBeUndefined()
+
+    expect(forgetPersonaPrompts(KEY_B)).toBe(0)
+    await s.drive(2)
+
+    expect(posts(stubB).map((c) => c.channel)).toEqual([B_DEST, B_DEST])
+    expect(getLivePermission(INSTANCE_B, TOKEN_B)).toMatchObject({ personaKey: KEY_B, channelId: B_DEST, messageTs: POST_TS_2 })
+    expect(posts(stubA)).toHaveLength(1)
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    expect(logLines(s.logCalls, buildPromptPostedWithoutTsLine(INSTANCE_A, TOKEN_A))).toHaveLength(1)
     expect(droppedLines(s.logCalls)).toEqual([])
   })
 
@@ -4998,5 +5037,325 @@ describe('poller tick — a throw on one row, request or closed entry is caught 
       [buildPromptFailedLine(INSTANCE_A, TOKEN_A, describeThrownValue(thrown))],
     ])
     assertNoLeak({ logCalls }, 'payload line throws')
+  })
+})
+
+describe('a confirmed prompt or warning stays registered and latched through post-success faults', () => {
+  const POST_TS = THREAD_ROOTS.primary
+  type Fault = 'observer start' | 'observer end' | 'owner end' | 'intent append' | 'outcome append' | 'hold settle' | 'trail'
+  const cleanups: Array<() => void | Promise<void>> = []
+  afterEach(async () => {
+    const failures: unknown[] = []
+    for (const cleanup of cleanups.splice(0).reverse()) {
+      try { await cleanup() } catch (error) { failures.push(error) }
+    }
+    if (failures.length) throw new AggregateError(failures, 'permission own-post cleanup failed')
+  })
+
+  /** Same applied config feeds the poller, resolver, membership and own-post owner. */
+  async function realOwner(delivery: 'thread_hybrid' | 'off' = 'thread_hybrid', destination = A_DEST) {
+    const dir = mkdtempSync(join(tmpdir(), 'poller-own-post-'))
+    cleanups.push(() => { rmSync(dir, { recursive: true, force: true }) })
+    const members = makeMembershipHarness(dir, {
+      mode: 'strict', names: [NAME_A], channels: [{ id: A_DEST, delivery }],
+    })
+    cleanups.push(() => members.close())
+    const input = makePersonaConfigInput({ channel_mode: 'strict', personas: [makePersona({
+      name: NAME_A, channels: [{ id: A_DEST, delivery }], permission_prompts: destination,
+      dm: { enabled: true, contact: D_CONTACT },
+    }, dir)] }, dir)
+    expect(members.authority.applyReviewed(configBytes(input), members.authority.revision).kind).toBe('applied')
+    members.h.stub(members.h.p(NAME_A)).script.inventory.push(membershipPage([A_DEST]))
+    await members.start()
+    await members.scan()
+    const h = await makeOwnPostHarness(dir, { members })
+    cleanups.push(() => h.close())
+    config = h.authority.config()
+    A = config.personas[0]!
+    return h
+  }
+
+  /** Persona A's poller over the real resolver and fake-clock destination hold. */
+  function confirmedScenario(fault?: Fault, observer?: OwnPostObserver | null, owner?: OwnPostHarness) {
+    const logCalls: unknown[][] = [], ownerFaults: string[] = []
+    const failure = new Error(sentinelInMessage('own-post fault'))
+    const recording = makeRecordingOwnPostObserver(Array.from({ length: 3 }, () => ({
+      ...(fault === 'observer start' ? { throwStart: failure } : {}),
+      ...(fault === 'observer end' || fault === 'owner end' ? { throwEnd: failure } : {}),
+    })))
+    const ownPosts = observer === null ? undefined : observer ?? (fault === 'owner end'
+      ? createOwnPostObserver(() => ({ startOperation: recording.observer.start, endOperation: recording.observer.end }),
+        error => { ownerFaults.push(describeThrownValue(error)) })
+      : recording.observer)
+    const log = (line: string): void => {
+      logCalls.push([line])
+      if (fault === 'hold settle' && line.includes(': cleared: ')) throw new Error('injected settle failure')
+    }
+    const currentConfig = () => owner?.authority.config() ?? config
+    const currentPersona = (key: string) => currentConfig().personas.find(p => p.key === key)
+    const destinations = createPersonaDestinations({ log, getPersonaConfig: currentConfig, ownPosts })
+    const clock = owner?.clock ?? createFakeClock()
+    const hold = createPersonaDestinationHold({ destinations, getPersona: currentPersona, clientFor: clients.clientFor, clock, log })
+    const trail = makeTrailCapture()
+    let trailFaults = 0
+    let open: PermissionRequestRow[] = [requestA()]
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => getResult(open),
+      getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> =>
+        cannedGetPermissionResponse({ request_token: params.request_token, decision: 'allow', decision_reason: null }),
+    }), {
+      destinations, destinationHold: hold, getPersona: currentPersona, log: (...args) => { logCalls.push(args) },
+      emitTrail: (event) => {
+        if (fault === 'trail' && (event.event === 'cscb.chat_post.attempted' || event.event === 'cscb.poller.wedge_detected') && event['ok'] === true) {
+          trailFaults++
+          throw new Error('injected trail failure')
+        }
+        trail.emit(event)
+      },
+    })
+    cleanups.push(() => { assertNoLeak({ logCalls, trail: trail.events, ownerFaults, events: owner?.events }) })
+    const tick = async () => { ivl.fire(); await clock.flush() }
+    return { ivl, tick, clock, logCalls, recording, ownerFaults, trail, trailFaults: () => trailFaults, close: (rows: PermissionRequestRow[]) => { open = rows } }
+  }
+
+  /** Exact ordered start/end pairs, with a distinct operation for each actual Slack call. */
+  function expectOperations(recording: ReturnType<typeof makeRecordingOwnPostObserver>, surface: 'prompt' | 'warning',
+    answers: Array<Parameters<OwnPostObserver['end']>[1]>, channel = A_DEST) {
+    expect(recording.calls).toHaveLength(answers.length * 2)
+    const operations = []
+    for (const [i, answer] of answers.entries()) {
+      const start = recording.calls[i * 2]!
+      expect(start).toMatchObject({ kind: 'start', key: KEY_A, surface, target: { channel },
+        content: { kind: 'text', text: posts(stubA)[i]!.text } })
+      if (start.kind !== 'start') throw new Error('expected own-post start')
+      expect(start.operation).toBeDefined()
+      operations.push(start.operation)
+      const end = recording.calls[i * 2 + 1]!
+      expect(end).toEqual({ kind: 'end', operation: start.operation, answer })
+      if (end.kind !== 'end') throw new Error('expected own-post end')
+      expect(end.operation).toBe(start.operation)
+    }
+    expect(new Set(operations).size).toBe(answers.length)
+  }
+
+  test.each<[Fault, 'full' | 'short']>([
+    ['observer start', 'full'], ['observer start', 'short'],
+    ['observer end', 'full'], ['observer end', 'short'], ['owner end', 'full'], ['owner end', 'short'],
+    ['intent append', 'full'], ['intent append', 'short'], ['outcome append', 'full'], ['outcome append', 'short'],
+    ['trail', 'full'], ['trail', 'short'], ['hold settle', 'full'],
+  ])('%s fault with a %s prompt: posts once, remains registered, and closes at its returned channel and ts', async (fault, form) => {
+    const owner = fault === 'intent append' || fault === 'outcome append' ? await realOwner() : undefined
+    const s = confirmedScenario(fault, owner?.observer, owner)
+    if (fault === 'hold settle') {
+      stubA.script.post.push({ kind: 'platform', error: 'not_in_channel' })
+      await s.tick()
+      await s.clock.advance(5000)
+    }
+    if (form === 'short') {
+      stubA.script.post.push({ kind: 'platform', error: 'invalid_blocks' })
+      await s.tick()
+      expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    }
+    if (fault === 'intent append') owner!.io.fail('writeSync', KEY_A)
+    const pending = makeDeferredWebApiCall()
+    stubA.script.post.push(pending.outcome)
+    await s.tick()
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    const attempts = 1 + (fault === 'hold settle' ? 1 : 0) + (form === 'short' ? 1 : 0)
+    expect(posts(stubA)).toHaveLength(attempts)
+    if (fault === 'outcome append') {
+      expect(owner!.records(KEY_A).filter(r => r.kind === 'post-intent')).toHaveLength(form === 'short' ? 2 : 1)
+      owner!.io.fail('writeSync', KEY_A)
+    }
+    pending.settle({ kind: 'ok', result: { ts: POST_TS } })
+    await s.clock.flush()
+    if (form === 'short') expect(posts(stubA).at(-1)!.blocks).toEqual(buildFallbackPermissionBlocks('Bash', 'invalid_blocks', INSTANCE_A, TOKEN_A))
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ personaKey: KEY_A, channelId: A_DEST, messageTs: POST_TS, handled: false })
+    for (let n = 0; n < 3; n++) await s.tick()
+    expect(posts(stubA)).toHaveLength(attempts)
+    if (owner) {
+      expect(owner.view(KEY_A, A_DEST, POST_TS)).toBe('joined')
+      expect(owner.events.filter(e => e.type === 'registered')).toHaveLength(attempts)
+      expect(owner.threads.events.filter(e => e.type === 'append-failed')).toHaveLength(1)
+      const records = owner.records(KEY_A)
+      expect(records.filter(r => r.kind === 'post-intent')).toHaveLength(fault === 'intent append' ? attempts - 1 : attempts)
+      expect(records.filter(r => r.kind === 'post-outcome').map(r => r.outcome)).toEqual(form === 'short' ? ['none'] : [])
+    } else if (fault === 'observer start') {
+      expect(s.recording.calls).toHaveLength(attempts * 2)
+      expect(s.recording.calls.filter(c => c.kind === 'start')).toHaveLength(attempts)
+      expect(s.recording.calls.at(-1)).toEqual({ kind: 'end', operation: undefined,
+        answer: { kind: 'confirmed', channel: A_DEST, ts: POST_TS } })
+    } else {
+      expectOperations(s.recording, 'prompt', [
+        ...(fault === 'hold settle' ? [{ kind: 'failed' as const, code: 'not_in_channel' }] : []),
+        ...(form === 'short' ? [{ kind: 'failed' as const, code: 'invalid_blocks' }] : []),
+        { kind: 'confirmed', channel: A_DEST, ts: POST_TS },
+      ])
+    }
+    if (fault === 'owner end') expect(s.ownerFaults).toHaveLength(attempts)
+    if (fault === 'trail') expect(s.trailFaults()).toBe(1)
+    s.close([])
+    await s.tick()
+    expect(updates(stubA).map(c => [c.channel, c.ts])).toEqual([[A_DEST, POST_TS]])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    expect(posts(stubA)).toHaveLength(attempts)
+    expect(slackCalls(stubB, stubD)).toBe(0)
+  })
+
+  test.each(['full', 'short'] as const)('%s prompt has one operation per call, including a failed full prompt before its fallback', async form => {
+    const s = confirmedScenario()
+    if (form === 'short') stubA.script.post.push({ kind: 'platform', error: 'invalid_blocks' })
+    scriptPostTs(stubA, POST_TS)
+    await s.tick()
+    if (form === 'short') {
+      expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+      expectOperations(s.recording, 'prompt', [{ kind: 'failed', code: 'invalid_blocks' }])
+      await s.tick()
+      expect(posts(stubA)[1]!.blocks).toEqual(buildFallbackPermissionBlocks('Bash', 'invalid_blocks', INSTANCE_A, TOKEN_A))
+    }
+    for (let n = 0; n < 3; n++) await s.tick()
+    expect(posts(stubA)).toHaveLength(form === 'short' ? 2 : 1)
+    expectOperations(s.recording, 'prompt', [
+      ...(form === 'short' ? [{ kind: 'failed' as const, code: 'invalid_blocks' }] : []),
+      { kind: 'confirmed', channel: A_DEST, ts: POST_TS },
+    ])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ channelId: A_DEST, messageTs: POST_TS })
+  })
+
+  test.each(['resolve', 'reject'] as const)('ready held then %s: no early post or registration, and overlapping ticks never duplicate it', async settlement => {
+    const ready = holdOwnPostReady()
+    const recording = makeRecordingOwnPostObserver([{ ready: ready.ready }])
+    const s = confirmedScenario(undefined, recording.observer)
+    scriptPostTs(stubA, POST_TS)
+    await s.tick()
+    expect(recording.calls).toHaveLength(1)
+    expect(recording.calls[0]).toMatchObject({ kind: 'start', surface: 'prompt', target: { channel: A_DEST } })
+    for (let n = 0; n < 3; n++) await s.tick()
+    expect(posts(stubA)).toEqual([])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    expect(recording.calls).toHaveLength(1)
+    if (settlement === 'resolve') ready.resolve()
+    else ready.reject(new Error(sentinelInMessage('intent wait failed')))
+    await s.clock.flush()
+    expect(posts(stubA)).toHaveLength(1)
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ channelId: A_DEST, messageTs: POST_TS })
+    await s.tick()
+    expect(posts(stubA)).toHaveLength(1)
+    expectOperations(recording, 'prompt', [{ kind: 'confirmed', channel: A_DEST, ts: POST_TS }])
+  })
+
+  test.each(['full', 'short'] as const)('%s prompt joins its returned ts through the real owner; only a failed full prompt records none', async form => {
+    const h = await realOwner()
+    const s = confirmedScenario(undefined, h.observer, h)
+    if (form === 'short') {
+      stubA.script.post.push({ kind: 'platform', error: 'invalid_blocks' })
+      await s.tick()
+      expect(h.view(KEY_A, A_DEST, POST_TS)).toBe('not-joined')
+      expect(h.records(KEY_A).filter(r => r.kind === 'post-outcome').map(r => r.outcome)).toEqual(['none'])
+    }
+    scriptPostTs(stubA, POST_TS)
+    await s.tick()
+    for (let n = 0; n < 3; n++) await s.tick()
+    const count = form === 'short' ? 2 : 1
+    expect(posts(stubA)).toHaveLength(count)
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ channelId: A_DEST, messageTs: POST_TS })
+    expect(h.view(KEY_A, A_DEST, POST_TS)).toBe('joined')
+    const intents = h.records(KEY_A).filter(r => r.kind === 'post-intent')
+    const outcomes = h.records(KEY_A).filter(r => r.kind === 'post-outcome')
+    expect(intents).toHaveLength(count)
+    expect(outcomes.map(r => [r.operationId, r.outcome])).toEqual(intents.map((r, i) => [r.operationId, i === count - 1 ? 'joined' : 'none']))
+    expect(new Set(intents.map(r => r.operationId)).size).toBe(count)
+    expect(h.events.filter(e => e.type === 'registered')).toHaveLength(count)
+    const reopened = await h.reopen()
+    cleanups.push(() => reopened.close())
+    expect(reopened.view(KEY_A, A_DEST, POST_TS)).toBe('joined')
+  })
+
+  test.each(['off', 'dm'] as const)('%s destination posts and stays answerable but registers no own-post operation or join', async destination => {
+    const channel = destination === 'dm' ? D_DM : A_DEST
+    const h = await realOwner(destination === 'off' ? 'off' : 'thread_hybrid', destination === 'dm' ? DM_DESTINATION : A_DEST)
+    const s = confirmedScenario(undefined, h.observer, h)
+    scriptPostTs(stubA, POST_TS)
+    for (let n = 0; n < 3; n++) await s.tick()
+    expect(posts(stubA).map(c => c.channel)).toEqual([channel])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ channelId: channel, messageTs: POST_TS })
+    expect(h.events).toEqual([])
+    expect(h.read.pendingOwnPosts(KEY_A, channel)).toEqual([])
+    expect(h.records(KEY_A).filter(r => r.kind === 'post-intent' || r.kind === 'join')).toEqual([])
+    expect(h.view(KEY_A, channel, POST_TS)).not.toBe('joined')
+    s.close([])
+    await s.tick()
+    expect(updates(stubA).map(c => [c.channel, c.ts])).toEqual([[channel, POST_TS]])
+  })
+
+  test('with no observer, a prompt posts once and registers its channel and ts', async () => {
+    const s = confirmedScenario(undefined, null)
+    scriptPostTs(stubA, POST_TS)
+    for (let n = 0; n < 4; n++) await s.tick()
+    expect(posts(stubA).map(c => c.channel)).toEqual([A_DEST])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ personaKey: KEY_A, channelId: A_DEST, messageTs: POST_TS, handled: false })
+    expect(chatPosts(s.trail).filter(e => e['ok'] === true)).toHaveLength(1)
+  })
+
+  test('a prompt returned without a ts is posted but not answerable: never registered or posted again', async () => {
+    const s = confirmedScenario()
+    scriptPostTs(stubA, undefined)
+    for (let n = 0; n < 4; n++) await s.tick()
+    expect(posts(stubA)).toHaveLength(1)
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    expectOperations(s.recording, 'prompt', [{ kind: 'no-answer' }])
+    expect(logLines(s.logCalls, buildPromptPostedWithoutTsLine(INSTANCE_A, TOKEN_A))).toHaveLength(1)
+    expect(chatPosts(s.trail).filter(e => e['ok'] === true)).toHaveLength(1)
+  })
+
+  test('a Slack destination failure ends failed; its later retry has a separate successful operation', async () => {
+    const s = confirmedScenario()
+    stubA.script.post.push({ kind: 'platform', error: 'not_in_channel' })
+    scriptPostTs(stubA, POST_TS)
+    await s.tick()
+    expectOperations(s.recording, 'prompt', [{ kind: 'failed', code: 'not_in_channel' }])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    await s.clock.advance(5000)
+    await s.tick()
+    expectOperations(s.recording, 'prompt', [
+      { kind: 'failed', code: 'not_in_channel' }, { kind: 'confirmed', channel: A_DEST, ts: POST_TS },
+    ])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ messageTs: POST_TS })
+  })
+
+  test('a prompt whose observer end throws stays answerable at its original destination, only through its own persona connection', async () => {
+    const s = confirmedScenario('observer end')
+    scriptPostTs(stubA, POST_TS)
+    await s.tick()
+    reconfigure(KEY_A, { permission_prompts: A_WORK })
+    await s.tick()
+    expect(posts(stubA)).toHaveLength(1)
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ personaKey: KEY_A, channelId: A_DEST, messageTs: POST_TS, handled: false })
+    const decided: DecideParams[] = []
+    const decider = { decide: async (params: DecideParams) => { decided.push(params); return cannedDecideResult('delivered') } }
+    initOutageState({ getClient: () => decider as unknown as AgentDirectorClient, notify: () => {} })
+    const click = (receivingPersonaKey: string) => handlePermissionClick(encodePermissionActionId('allow', INSTANCE_A, TOKEN_A), {
+      receivingPersonaKey, clientFor: clients.clientFor, getPersona, log: (...args) => { s.logCalls.push(args) }, emitTrail: s.trail.emit,
+    })
+    expect(await click(KEY_B)).toBe(true)
+    expect(decided).toEqual([])
+    expect(await click(KEY_A)).toBe(true)
+    expect(decided).toEqual([{ instance_id: INSTANCE_A, request_token: TOKEN_A, decision: 'allow' }])
+    expect(updates(stubA).map(c => [c.channel, c.ts])).toEqual([[A_DEST, POST_TS]])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ handled: true })
+    expect(slackCalls(stubB, stubD)).toBe(0)
+    expect(posts(stubA)).toHaveLength(1)
+    expectOperations(s.recording, 'prompt', [{ kind: 'confirmed', channel: A_DEST, ts: POST_TS }])
+  })
+
+  test.each(['none', 'observer end', 'trail'] as const)('warning operation stays latched through %s fault', async fault => {
+    const s = confirmedScenario(fault === 'none' ? undefined : fault)
+    s.close([])
+    scriptPostTs(stubA, POST_TS)
+    for (let n = 0; n < K * 3; n++) await s.tick()
+    expect(wedgeWarnings().map(c => c.channel)).toEqual([A_DEST])
+    expectOperations(s.recording, 'warning', [{ kind: 'confirmed', channel: A_DEST, ts: POST_TS }])
+    if (fault === 'trail') expect(s.trailFaults()).toBe(1)
   })
 })

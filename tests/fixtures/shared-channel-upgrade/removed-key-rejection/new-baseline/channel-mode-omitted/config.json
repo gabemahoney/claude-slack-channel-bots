@@ -1,0 +1,19 @@
+{
+  "personas": [
+    {
+      "name": "alpha",
+      "credentials_file": "~/personas/alpha/credentials.json",
+      "working_directory": "~/personas/alpha/work",
+      "channels": [
+        {
+          "id": "C0TEST001",
+          "delivery": "all"
+        }
+      ],
+      "dm": {
+        "enabled": false
+      },
+      "permission_prompts": "C0TEST001"
+    }
+  ]
+}

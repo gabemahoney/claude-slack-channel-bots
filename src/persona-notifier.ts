@@ -7,13 +7,11 @@
  * one top-level message with no `thread_ts` and no username or icon override.
  * The destination is resolved, and a DM opened when needed, by the shared
  * destination resolver (`persona-destination.ts`) through the one destination
- * rule (`personaDestinationOf`) over the
- * configuration in effect at each attempt: its
- * `permission_prompts` in declarative mode, its fungible destination in
- * fungible mode. The notifier reads no destination setting
- * and no switch itself, the lost-message notice included, and no notice
- * carries a destination: one held before a confirmed switch change posts at
- * the destination of the mode turned on. The notifier adds the
+ * rule (`personaDestinationOf`) over the applied persona at each attempt:
+ * its common `permission_prompts` in both strict and open modes. The notifier
+ * reads no destination setting or mode itself, the lost-message notice
+ * included, and no notice carries a destination: a held notice posts at the
+ * current applied destination when its attempt runs. The notifier adds the
  * persona reference to every notice text, so callers pass only the key and
  * the notice body.
  *
@@ -156,6 +154,9 @@ export { MAX_HELD_NOTICES_PER_PERSONA }
 
 /** Per-notice options. */
 export interface PersonaNoticeOptions {
+  /** Joins lost only: the builder's escaped full reference or approved name
+   * excerpt, budgeted together with the body. Retained with a held notice. */
+  personaRef?: string
   /** Exact-message cancellation and the identity of a notice that actually posted. */
   tracking?: Omit<DestinationMessageTracking, 'onPosted'> & {
     onPosted(post: PostedPersonaNotice): void
@@ -289,10 +290,9 @@ export interface PersonaNotifier {
    * Post the persona's held notices in raised order once its client is
    * validated; leaves the queue as it is while the client is not validated,
    * or while the persona's teardown window is open (posts nothing then).
-   * For a channel destination every post is issued before this returns; for
-   * a `dm` destination the posts go out, still in raised order, once the
-   * shared DM open settles. The promise resolves once they all settle. Never
-   * rejects.
+   * Each post may wait for its own-post intent; a post with no wait can
+   * overtake a waiting one. A `dm` destination first waits for the shared DM
+   * open. The promise resolves once they all settle. Never rejects.
    */
   flush(key: string): Promise<void>
   /**
@@ -350,8 +350,8 @@ export function firstNoticeLine(text: string): string {
  * persona's stored key (never one derived again from the name), then the
  * body. Pure; shared by `notify` and the permission poller.
  */
-export function formatPersonaNotice(persona: Pick<Persona, 'name' | 'key'>, text: string): string {
-  return `Persona ${renderPersonaRef(persona.name, persona.key)}: ${text}`
+export function formatPersonaNotice(persona: Pick<Persona, 'name' | 'key'>, text: string, options?: Pick<PersonaNoticeOptions, 'personaRef'>): string {
+  return `Persona ${options?.personaRef ?? renderPersonaRef(persona.name, persona.key)}: ${text}`
 }
 
 /**
@@ -479,19 +479,18 @@ export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifie
     deps.log(`[slack] persona-notifier: failed to post notice for ${ref} to ${where}: ${describeThrownValue(failure.error)}`)
   }
 
-  // Handed to the hold, which for a channel destination issues the post
-  // before the first `await` when the persona is not held, so calling `post`
-  // issues it synchronously; only the settling is awaited. A `dm` destination
+  // Handed to the hold, which attempts an unheld persona's post at once.
+  // A channel post waits only for its own-post intent; a `dm` destination
   // is resolved first (the open, or the cached conversation).
   function post(persona: Persona, client: WebClient, notice: HeldNotice): Promise<void> {
     const ref = renderPersonaRef(persona.name, persona.key)
     const holdNotice: HoldNotice = {
       message: {
-        text: formatPersonaNotice(persona, notice.text),
+        text: formatPersonaNotice(persona, notice.text, notice.options),
         ...(notice.options?.tracking ? { tracking: {
           ...notice.options.tracking,
           onPosted: (posted: DestinationPostedMessage) => notice.options!.tracking!.onPosted({
-            ...posted, format: text => formatPersonaNotice(persona, text),
+            ...posted, format: text => formatPersonaNotice(persona, text, notice.options),
           }),
         } } : {}),
       },
@@ -728,10 +727,9 @@ export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifie
     held.delete(key)
     // Re-route each held notice: the persona is looked up again, so one no
     // longer applied is dropped with a log line. `map` calls `notify` for
-    // every notice before the first `await`, so the posts keep raised order:
-    // to a channel each is issued before this yields; to a `dm` destination
-    // they all wait on the one shared open and go out in raised order once it
-    // settles.
+    // every notice before the first `await`, starting attempts in raised
+    // order. Each may wait for its own-post intent; a post with no wait can
+    // overtake a waiting one. A `dm` destination shares one open first.
     await Promise.all(queue.map((notice) => notify(key, notice.text, notice.options)))
   }
 

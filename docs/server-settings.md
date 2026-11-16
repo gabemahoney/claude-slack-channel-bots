@@ -4,7 +4,7 @@ The top-level `config.json` settings that apply to the whole server, the environ
 
 ## Server-wide settings
 
-These top-level fields apply to the whole server. Confirmed changes take effect at the next server start, with exceptions: `allow_invited_channels` applies in place at once; `claude_config_dir` applies at each inheriting persona's next launch; `stop_hook_bootstrap` applies immediately to each inheriting persona; and the CLI reads `stop_timeout`, `exit_timeout` and `agent_director_call_timeout_ms` from the confirmed record at once. See [Reload](reload.md#reload).
+These top-level fields apply to the whole server. Confirmed changes take effect at the next server start, with exceptions: `channel_mode` applies in place at once; `claude_config_dir` applies at each inheriting persona's next launch; `stop_hook_bootstrap` applies immediately to each inheriting persona; and the CLI reads `stop_timeout`, `exit_timeout` and `agent_director_call_timeout_ms` from the confirmed record at once. See [Reload](reload.md#reload).
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -32,7 +32,7 @@ These top-level fields apply to the whole server. Confirmed changes take effect 
 | `ack_reaction` | string | `"spinthinking"` | Emoji name, without colons, replacing the queued reaction after transcript receipts confirm the whole message and delivery is durably recorded. Must be non-empty when set. `spinthinking` is a custom emoji; see the prerequisite below. |
 | `reply_chunk_limit` | number | `4000` | Maximum Unicode code points per posted message: the `reply` tool splits longer text into several messages without splitting a surrogate pair. Must be a positive integer. |
 | `reply_chunk_mode` | `"length"` \| `"newline"` | `"newline"` | How the `reply` tool splits text longer than `reply_chunk_limit`. `length`: hard split at the limit. `newline`: prefer the last newline within the limit, keeping that newline in the preceding message; hard split a line that exceeds the limit. Both modes preserve all whitespace: concatenating the posted texts in order reproduces the supplied text exactly. |
-| `allow_invited_channels` | boolean | `false` | Picks the channel mode for every persona. Absent or `false` is **declarative mode**: each persona's `channels` and top-level `permission_prompts` are in force, and its `invited` section is not read. `true` is **fungible mode**: each persona's `channels` and top-level `permission_prompts` are not read, and its `invited` section is in force. A confirmed change applies in place at once and keeps every session. Non-boolean values are rejected at load. See [Channel modes](channel-modes.md#channel-modes), and read [Who can reach a persona in fungible mode](channel-modes.md#who-can-reach-a-persona-in-fungible-mode) before turning it on. |
+| `channel_mode` | `"strict"` or `"open"` | `"strict"` | Selects the channel mode; a confirmed change applies in place, at once. Shared channel choices and the destination are retained. See [Channel modes](channel-modes.md). |
 
 ---
 
@@ -40,7 +40,7 @@ These top-level fields apply to the whole server. Confirmed changes take effect 
 
 **Custom emoji must exist in the Slack workspace before you configure them.** `spinthinking` is custom; before starting, make sure both selected names are available in each persona's workspace. Omitting either setting selects its default; empty strings and `null` are invalid.
 
-CSCB removes the queued reaction before adding the delivered reaction. Setting both names alike keeps one reaction through both stages; dropped messages and injected messages get neither. The first successful `reply` text post or file upload carrying the original `message_id`, or that persona's successful `react` on the message, clears that persona's actual stage without delaying the tool. A `react` with the stage's own emoji keeps that reaction.
+CSCB removes the queued reaction before adding the delivered reaction. Setting both names alike keeps one reaction through both stages; dropped messages, injected messages and Reaction Notices get neither, and a held thread reply gets its queued reaction only once released. The first successful `reply` text post or file upload carrying the original `message_id`, or that persona's successful `react` on the message, clears that persona's actual stage without delaying the tool. A `react` with the stage's own emoji keeps that reaction.
 
 Both settings take effect only at server startup after a [confirmed change](reload.md#what-a-confirmation-applies). Outstanding work retains its original queued name across restarts and setting changes, including when queued feedback is restored after reconnect; its delivered stage uses the setting in effect at delivery.
 
@@ -87,6 +87,8 @@ If you change `port` or `bind` in `config.json`, the confirmed change takes effe
 
 ## Message text and privacy
 
-Undelivered message text is kept until delivery, including a removed persona’s queue. Delivered text is removed within 24 hours. Typed Slack text also remains in the agent’s native transcript and prompt history file; Claude Code keeps these in its config directory.
+Undelivered message text is kept until delivery, including a removed persona’s queue. Delivered text is removed when the queue is compacted, at each start and about hourly. A delivered message that joined the persona to a thread is kept until Thread Memory has saved that join or no longer needs it, then removed at the next compaction.
+
+Typed Slack text also remains in the agent’s native transcript and prompt history file; Claude Code keeps these in its config directory.
 
 `server.log` retains message text in received-event, dispatch and `/interject` lines. Protect the state and Claude Code config directories and any log copies accordingly.

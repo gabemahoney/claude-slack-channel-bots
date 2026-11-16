@@ -1,0 +1,8 @@
+claude-slack-channel-bots: pending configuration change (written by the server)
+fingerprint: sha256:71cda4b062a183fabc765f0c88b6dc240d662be6957fe3343dad0ebee85731f7
+
+A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 1 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 2 changed.
+DESTRUCTIVE: persona "bravo" (key=bravo) credentials_file changed to "~/personas/bravo/rotated-credentials.json": the persona will be retired and brought up fresh: its session stopped and never resumed.
+persona "alpha" (key=alpha): channels changed in the declarative section: recorded, with no effect until allow_invited_channels selects declarative mode.
+server-wide setting stop_timeout changed: once applied, it is recorded, and the CLI takes it from the record from then on (the running server does not use it).
+server-wide setting allow_invited_channels changed: turns fungible mode on, applied in place at once, from the next event, tool call, prompt and notice, for "alpha" (key=alpha), "bravo" (key=bravo).

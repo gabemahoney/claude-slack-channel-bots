@@ -111,7 +111,7 @@ ALPHA_SKIP_OLD="$(skip_match "${ALPHA}" "${ALPHA_OLD_DIR}")"
 ALPHA_SKIP_NEW="$(skip_match "${ALPHA}" "${ALPHA_NEW_DIR}")"
 BRAVO_SKIP="$(skip_match "${BRAVO}" "${BRAVO_DIR}")"
 STARTUP_COMPLETE="$(completion_match 2)"
-FROM_RECORD="$(matcher '[slack] Starting from the last-applied record' "\"${LAST}\"")"
+FROM_RECORD="$(matcher '[slack] Starting from the shared channel authority' "\"${LAST}\"")"
 # Lines no step here may log.
 STALE='[slack] reload-stale-confirmation:'
 INVALID='[slack] reload-invalid:'
@@ -126,8 +126,16 @@ LISTENING_NEW="$(listening_match "${NEW_PORT}")"
 
 # --- Helpers ---------------------------------------------------------------
 
+# Reviews may name every current persona; any other new line for an unchanged
+# persona still fails this isolation check, including starts and teardowns.
+persona_runtime_count() {
+    awk -v ref="(key=$1)" 'index($0, ref) && !index($0, "[slack] reload-preview:") { n++ } END { print n+0 }' "${SLACK_STATE_DIR}/server.log"
+}
+
 # The two-persona config: $1 alpha's working directory, $2 the port.
 emit_config() {
+    local alpha_delivery=all
+    if [[ "$1" != "${ALPHA_OLD_DIR}" ]]; then alpha_delivery=mentions; fi
     cat << EOF
 {
   "personas": [
@@ -135,7 +143,7 @@ emit_config() {
       "name": "${ALPHA}",
       "credentials_file": "${SCENARIO_ROOT}/credentials-alpha.json",
       "working_directory": "$1",
-      "channels": [{ "id": "${A1}", "delivery": "all" }],
+      "channels": [{ "id": "${A1}", "delivery": "${alpha_delivery}" }],
       "permission_prompts": "${A1}"
     },
     {
@@ -193,7 +201,7 @@ confirm_pending() {
 }
 
 record_port() {
-    python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["port"])' "${LAST}" 2> /dev/null || true
+    configuration_applied_value "${CONFIG}" "${LAST}" port
 }
 
 expect_no_reload_errors() {
@@ -211,18 +219,23 @@ wait_for_log "${LISTENING_OLD}" "${START_LINE_WAIT_S}" \
 wait_for_log "${STARTUP_COMPLETE}" "${START_LINE_WAIT_S}" \
     "start: startupSessionManager never completed for 2 personas"
 port_listening "${OLD_PORT}" || fail "start: nothing answers on port ${OLD_PORT}"
-cmp -s "${CONFIG}" "${LAST}" || fail "start: ${LAST} does not hold config.json's bytes"
+configuration_record_matches "${CONFIG}" "${LAST}" applied || fail "start: ${LAST} does not hold config.json's bytes"
 expect_count "${ALPHA_START}" 1 "start: persona-start lines for ${ALPHA}"
 expect_count "${ALPHA_SKIP_OLD}" 1 "start: dry-run spawn skip lines for ${ALPHA} in ${ALPHA_OLD_DIR}"
 expect_count "${BRAVO_SKIP}" 1 "start: dry-run spawn skip lines for ${BRAVO}"
 
+AUTHORITY_START="${SCENARIO_ROOT}/authority.start.json"
+cp -- "${LAST}" "${AUTHORITY_START}"
+
 # --- 1. Destructive modify: alpha's working_directory ----------------------
-bravo_lines="$(count_log "(key=${BRAVO_KEY})")"
+bravo_lines="$(persona_runtime_count "${BRAVO_KEY}")"
 
 set_config "${ALPHA_NEW_DIR}" "${OLD_PORT}"
+configuration_request replacement request "${ALPHA}/${A1}/mentions"
 wait_for_log "${DESTRUCTIVE_LOG}" "${TICK_WAIT_S}" \
     "destructive: no DESTRUCTIVE: reload-preview line for the working_directory change"
-expect_count "${DESTRUCTIVE_LOG}" 1 "destructive: DESTRUCTIVE: reload-preview lines"
+# A source edit and its request can be observed on separate ticks. Both are
+# reviews; only the exact request generation below may be confirmed.
 expect_log "${HEADER_DESTRUCTIVE}" "destructive: reload-preview header lacks '$(counts destructive=1)'"
 
 wait_for_file "${PENDING}" "${SETTLE_WAIT_S}" "destructive: ${PENDING} never appeared"
@@ -232,7 +245,7 @@ n="$(grep -c '^DESTRUCTIVE:' "${pending_copy}" || true)"
 [[ "${n}" == 1 ]] || fail "destructive: pending file holds ${n} DESTRUCTIVE: line(s), expected 1"
 (( $(count_in "${pending_copy}" "${ALPHA_DESTRUCTIVE}") == 1 )) \
     || fail "destructive: pending file's DESTRUCTIVE: line does not name ${ALPHA}, working_directory and ${ALPHA_NEW_DIR}"
-if grep -qF -- "(key=${BRAVO_KEY})" "${pending_copy}"; then
+if grep -F -- "(key=${BRAVO_KEY})" "${pending_copy}" | grep -qE '^(DESTRUCTIVE: )?persona .* changed'; then
     fail "destructive: pending file names ${BRAVO}, which did not change"
 fi
 wait_until 10 "destructive: the pending file's lines were not all logged as reload-preview lines" \
@@ -240,8 +253,9 @@ wait_until 10 "destructive: the pending file's lines were not all logged as relo
 
 # Nothing is applied before the confirmation.
 expect_count "${TEARDOWN_START}" 0 "destructive: ${ALPHA}'s teardown lines before the confirmation"
-grep -qF -- "${ALPHA_OLD_DIR}" "${LAST}" || fail "destructive: ${LAST} changed before the confirmation"
+configuration_application_preserved "${CONFIG}" "${AUTHORITY_START}" "${LAST}" || fail "destructive: authority envelope changed before the confirmation"
 
+destructive_previews="$(count_log "${DESTRUCTIVE_LOG}")"
 confirm_pending destructive
 wait_for_log "${APPLIED_CLASS}" "${TICK_WAIT_S}" "destructive: no reload-applied line after the confirmation"
 expect_count "${APPLIED_CLASS}" 1 "destructive: reload-applied lines"
@@ -266,23 +280,26 @@ if [[ -z "${teardown_ln}" || -z "${start_ln}" || -z "${applied_ln}" ]] \
     fail "destructive: expected teardown complete < persona-start < reload-applied, got lines ${teardown_ln}, ${start_ln}, ${applied_ln}"
 fi
 
-got="$(count_log "(key=${BRAVO_KEY})")"
+got="$(persona_runtime_count "${BRAVO_KEY}")"
 [[ "${got}" == "${bravo_lines}" ]] \
     || fail "destructive: ${BRAVO} got $(( got - bravo_lines )) new line(s) from ${ALPHA}'s change"
 
 [[ ! -e "${APPLY}" ]] || fail "destructive: ${APPLY} still present after the apply"
 wait_until "${SETTLE_WAIT_S}" "destructive: ${PENDING} still present after the apply" pending_gone
-cmp -s "${CONFIG}" "${LAST}" || fail "destructive: ${LAST} does not hold config.json's bytes after the apply"
+configuration_record_matches "${CONFIG}" "${LAST}" applied || fail "destructive: ${LAST} does not hold config.json's bytes after the apply"
 expect_no_reload_errors destructive
 
 # --- 2. Server-wide change: port ------------------------------------------
-alpha_lines="$(count_log "(key=${ALPHA_KEY})")"
-bravo_lines="$(count_log "(key=${BRAVO_KEY})")"
+alpha_lines="$(persona_runtime_count "${ALPHA_KEY}")"
+bravo_lines="$(persona_runtime_count "${BRAVO_KEY}")"
 
+AUTHORITY_BEFORE_PORT="${SCENARIO_ROOT}/authority.before-port.json"
+cp -- "${LAST}" "${AUTHORITY_BEFORE_PORT}"
 set_config "${ALPHA_NEW_DIR}" "${NEW_PORT}"
+configuration_request port request
 wait_for_log "${PORT_LOG}" "${TICK_WAIT_S}" "port: no reload-preview line for the port change"
 expect_log "${HEADER_PORT}" "port: reload-preview header lacks '$(counts settings=1)'"
-expect_count "${DESTRUCTIVE_LOG}" 1 "port: DESTRUCTIVE: reload-preview lines (only the first change's)"
+expect_count "${DESTRUCTIVE_LOG}" "${destructive_previews}" "port: no new destructive preview after the confirmed replacement"
 
 wait_for_file "${PENDING}" "${SETTLE_WAIT_S}" "port: ${PENDING} never appeared"
 check_pending_layout port settings=1
@@ -294,6 +311,7 @@ fi
 wait_until 10 "port: the pending file's lines were not all logged as reload-preview lines" \
     preview_logged "${pending_copy}"
 
+configuration_application_preserved "${CONFIG}" "${AUTHORITY_BEFORE_PORT}" "${LAST}" || fail "port: authority envelope changed before the confirmation"
 confirm_pending port
 wait_for_count "${APPLIED_CLASS}" 2 "${TICK_WAIT_S}" "port: no reload-applied line after the confirmation"
 expect_count "${APPLIED_CLASS}" 2 "port: reload-applied lines"
@@ -301,7 +319,7 @@ expect_log "${APPLIED_PORT}" "port: reload-applied line lacks '$(counts settings
 
 got="$(record_port)"
 [[ "${got}" == "${NEW_PORT}" ]] || fail "port: ${LAST} holds port '${got}', expected ${NEW_PORT}"
-cmp -s "${CONFIG}" "${LAST}" || fail "port: ${LAST} does not hold config.json's bytes after the apply"
+configuration_record_matches "${CONFIG}" "${LAST}" applied || fail "port: ${LAST} does not hold config.json's bytes after the apply"
 [[ ! -e "${APPLY}" ]] || fail "port: ${APPLY} still present after the apply"
 wait_until "${SETTLE_WAIT_S}" "port: ${PENDING} still present after the apply" pending_gone
 
@@ -315,9 +333,9 @@ fi
 expect_count "${LISTENING_NEW}" 0 "port: listener lines for the new port before a restart"
 
 # No persona is torn down or brought up for a server-wide change.
-got="$(count_log "(key=${ALPHA_KEY})")"
+got="$(persona_runtime_count "${ALPHA_KEY}")"
 [[ "${got}" == "${alpha_lines}" ]] || fail "port: ${ALPHA} got $(( got - alpha_lines )) new line(s)"
-got="$(count_log "(key=${BRAVO_KEY})")"
+got="$(persona_runtime_count "${BRAVO_KEY}")"
 [[ "${got}" == "${bravo_lines}" ]] || fail "port: ${BRAVO} got $(( got - bravo_lines )) new line(s)"
 expect_no_reload_errors port
 

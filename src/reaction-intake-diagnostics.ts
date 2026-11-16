@@ -27,13 +27,13 @@ export interface ReactionIntakePersona {
 }
 
 /** The drop reasons that log a `reaction-dropped` line, in decision order. */
-export const REACTION_LOGGED_DROP_REASONS = ['no-reactor', 'notices-off', 'dm-disabled', 'unserved-conversation', 'fungible-refused'] as const
+export const REACTION_LOGGED_DROP_REASONS = ['no-reactor', 'notices-off', 'dm-disabled', 'unserved-conversation', 'open-refused'] as const
 export type ReactionLoggedDropReason = typeof REACTION_LOGGED_DROP_REASONS[number]
 
-/** A logged drop: the conversation and reacted message when known, and the refusal only for `fungible-refused`. */
+/** A logged drop: the conversation and reacted message when known, and the refusal only for `open-refused`. */
 export type ReactionDroppedInput =
-  | { reason: Exclude<ReactionLoggedDropReason, 'fungible-refused'>; chat_id?: string; message_ts?: string; refusal?: never }
-  | { reason: 'fungible-refused'; chat_id?: string; message_ts?: string; refusal: ReactionFungibleRefusal }
+  | { reason: Exclude<ReactionLoggedDropReason, 'open-refused'>; chat_id?: string; message_ts?: string; refusal?: never }
+  | { reason: 'open-refused'; chat_id?: string; message_ts?: string; refusal: ReactionFungibleRefusal }
 
 /** `[slack] reaction-received: persona=<ref> chat_id="…" message_ts="…" change=<added|removed> emoji="…" <user|bot_id>="…" seq=<n>` */
 export function buildReactionReceivedLine(p: ReactionIntakePersona, record: ReactionAcceptedRecord): string {
@@ -45,7 +45,7 @@ export function buildReactionReceivedLine(p: ReactionIntakePersona, record: Reac
 export function buildReactionDroppedLine(p: ReactionIntakePersona, drop: ReactionDroppedInput): string {
   const chat = drop.chat_id !== undefined ? ` chat_id=${quote(drop.chat_id)}` : ''
   const message = drop.message_ts !== undefined ? ` message_ts=${quote(drop.message_ts)}` : ''
-  const refusal = drop.reason === 'fungible-refused' ? ` refusal=${word(drop.refusal)}` : ''
+  const refusal = drop.reason === 'open-refused' ? ` refusal=${word(drop.refusal)}` : ''
   return `[slack] ${REACTION_DROPPED}: persona=${renderReactionPersonaRef(p)}${chat}${message} reason=${word(drop.reason)}${refusal}`
 }
 

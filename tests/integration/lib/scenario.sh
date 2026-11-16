@@ -146,6 +146,9 @@
 # sqlite3, or plays a human's tmux step, seeds a session or label, or runs the
 # find-missing loop calls `require_ci_image` and then `require_scenario_home`
 # as its first two steps, before any copy, move, install, sqlite3 or tmux step.
+# The shared_stub_permission helpers are a separate shared-mode fixture route:
+# they keep the image HOME, bind reads to the actual persona's AD session, and
+# write only scratch-fenced stub controls. They never bypass an fmk HOME guard.
 #
 # Matchers. Scenario scripts assert a line's class prefix,
 # persona ref and distinguishing fragments, never a whole sentence the unit
@@ -160,6 +163,248 @@
 #
 # Functions (every step that can fail calls `fail`, which prints the runner's
 # `FAIL: <test>: <step>` line and exits 1; the trap then cleans up):
+#
+#   Composed shared-channel scenarios (both modes; permission fixture exception above)
+#   configuration_request <id> <request|revise|refresh|cancel> [name/channel/delivery...]
+#       publish production-built request in scratch state; wait at most 30 s for its
+#       current durable review, or for cancel's exact retained request to be recorded
+#       with requested intent and active review cleared. Missing/stale evidence fails.
+#   scenario_id <C|G|D|U|B|T|A|F> <name> deterministic Slack ID from TEST_NAME and name
+#   scenario_ts                          fresh increasing Slack ts, retained counter under run tag
+#   scenario_text <name>                 plain message text tagged with TEST_NAME
+#   scenario_mention_text <user> [text]   Slack mention markup owned by this helper
+#   scenario_broadcast_text <here|channel> [text]
+#   slack_message_event <channel> <text> <ts> [user] [channel-type]
+#   slack_mention_event <channel> <text> <ts> [user]
+#   slack_reply_event <channel> <root> <text> <ts> [user] [parent-user]
+#                                       print Slack events, for seeding or paired pushes
+#   slack_push_message <label> <channel> <text> <ts> [user] [type] [flag]
+#   slack_push_mention <label> <channel> <text> <ts> [user] [flag]
+#                                       one app_mention; use slack_push_message at the same ts
+#                                       for the second message event of a mention
+#   slack_push_broadcast <label> <channel> <here|channel> <text> <ts> [flag]
+#   slack_push_reply <label> <channel> <root> <text> <ts> [user] [parent-user] [flag]
+#   slack_push_own_reply <label> <channel> <root> <text> <ts> [flag]
+#                                       reply whose parent user is this label's configured bot
+#   slack_push_other_bot <label> <channel> <text> <ts> [flag]
+#   slack_push_edit <label> <channel> <original-ts> <text> <edit-ts> [flag]
+#   slack_push_delete <label> <channel> <deleted-ts> <event-ts> [flag]
+#   slack_push_reaction <label> <channel> <message-ts> <reaction> <event-ts>
+#   slack_push_dm <label> <channel> <text> <ts>
+#   slack_push_group_dm <label> <channel> <text> <ts>
+#   slack_push_member_joined <label> <channel> <event-ts> [self|other|user-id]
+#   slack_push_channel_left <label> <channel> <event-ts> [self|other|user-id]
+#                                       all push helpers print the envelope ID; HTTP bounded by
+#                                       SCENARIO_SLACK_PUSH_S, any refusal fails
+#   slack_membership_event <member_joined_channel|channel_left> <label> <channel>
+#       <event-ts> [self|other|user-id]   pure event, usable by slack_stub_push_installation
+#   scenario_attachment <name>          JSON fixture: Slack file + independent queue/tag expectations
+#   scenario_stub_name <user|channel> <id> default stub lookup name (channel D… is dm);
+#       only for unmodified, successful default name lookups, not custom overrides/fallbacks
+#   slack_attachment_event <message|mention|reply> <channel> <root-or-dash> <text>
+#       <ts> <user> <attachment-json>    pure event; mention text comes from scenario_mention_text
+#   slack_push_attachment <label> <same event args...>   returns envelope ID
+#   slack_recorded_button <label> <channel> <message-ts> <action-id-or-prefix>
+#       prints the one matching button of the last successful recorded post/update;
+#       missing/ambiguous evidence fails; preserves action ID, value and block ID
+#   slack_push_button <same button args...> <human-user> returns interactive envelope ID
+#   shared_stub_permission_setup <work> BEFORE launch: select existing displayed-states stub,
+#       fence/export scratch TMPDIR. Stub must already be copied into SCENARIO_STUB_DIR.
+#   shared_stub_permission <permission-1|permission-2|receipt|outcome|complete-1|complete-2> <work> <key> [token]
+#       uses actual AD session; each permission once/session. receipt releases ONE submitted
+#       text because displayed-states delays receipts. outcome reads a previously returned
+#       request token's decision/delivery. complete-N <token>, once AD reads that request
+#       allow/delivered, ends its turn through the registered Stop hook and waits for AD
+#       itself to read waiting; once/session, no retry. 30 s total / 5 s per AD call; no
+#       pane inspection.
+#       Setup and controls preserve HOME; all control files stay under SCENARIO_ROOT.
+#   shared_stub_notice_setup <work> BEFORE launch: select ordinary at-once receipts and
+#       scratch TMPDIR; unnecessary if shared_stub_permission_setup selected that work.
+#   shared_stub_notice <end|ended|resume> <work> <key> <evidence-file>
+#       applied session_restart_delay MUST be 0; exact configured work/key and actual AD
+#       session must bind to our scratch stub. end requires waiting, no open/unproven
+#       permission and a fresh evidence path; submits the fixture sentinel ONCE through
+#       AD and proves ended. ended rechecks it before/after queuing real work. resume
+#       requires that exact completed end evidence, calls AD resume ONCE and proves
+#       waiting in the same conversation (30 s total, 5 s/call, 20 s observation).
+#       Resume selects ordinary receipts: do displayed-state permission phases first;
+#       their retained controls are never replayed. Errors/uncertain submissions fail
+#       without retry. No queue/state edits. Caller drains prior work before end,
+#       admits no concurrent workload, then snapshots and proves queued work's receipts
+#       after resume via shared_wait_queue_drained. AD waiting alone is not delivery.
+#   slack_post_mark                     last complete stub record seq (capture before trigger)
+#   slack_successful_post <label> <channel> <after-seq> <expected-fragment>...
+#   slack_wait_successful_post <same args...>
+#       exactly one successful top-level post; ordered nonempty literal fragments.
+#       JSON {seq,label,channel,ts}, independent of Thread Memory. Missing match exits 75;
+#       missing/invalid/ambiguous evidence fails. Wait retries ONLY 75 to RECORD_WAIT_S.
+#   slack_wait_messages_waiting <label> <channel> <after-seq> <name> <key> <count>
+#       same wait, matching the full production restarts-off notice except its valid
+#       elapsed age. Actual persona label and destination are independent expectations.
+#       Readers cap each regular file at 64 MiB; incomplete final records are deferred.
+#   slack_push_observed_post <recipient-label> <sender-label> <channel> <post-seq> [flag]
+#       echo that exact successful post's actual text/ts through Socket Mode, with sender
+#       IDs from its configured installation. Returns the envelope ID; caller checks ACK.
+#       The stub does not automatically broadcast its API posts. This echo proves intake,
+#       while the independent API record proves the post; it creates no post/join fact.
+#   shared_queue_snapshot <output> <key> [prior-snapshot...]
+#       validated union of actual journal observations, atomically to a fenced scratch file;
+#       retain before compaction; never reconstruct discarded content from a key marker
+#   shared_queue_receipts <key> <original-snapshot> [prior-snapshot...]
+#       JSON completion/progress over current journal plus archives, exact own-session
+#       transcript receipts via production parser/matcher. Original snapshot fixes progress;
+#       pass it also as a prior snapshot after compaction. New items/reminders cannot renew
+#       progress. Completion covers ALL accepted items/parts, including reminders.
+#   shared_wait_queue_drained <same args...> uses DELIVERY_IDLE_WAIT_S and DELIVERY_MAX_WAIT_S;
+#       only increasing original receipted parts renew idle bound. Failure detail is numeric,
+#       at most eight incomplete items; unreadable evidence cannot pass or renew progress.
+#   shared_thread_joins <key> [channel stamp-json] production-parsed saved joins as JSONL
+#   shared_own_post_records <key> production-parsed post-intent/outcome JSONL for discovery;
+#       header/digest key omitted. Discovery does not establish freshness or unresolved state.
+#   shared_own_post_state <key> <operation-id> <channel> <stamp-json> <unresolved|joined|none>
+#   shared_wait_own_post_state <same args...>
+#       exact durable intent/outcome JSON {intent,outcome}; retain the operation and expected
+#       stamp from independent scenario evidence (e.g. that reply's accepted Post Hold).
+#       unresolved requires a complete intent with NO outcome. Pending intent/outcome or
+#       incomplete tail returns 75; malformed/missing/unreadable evidence, wrong channel/stamp
+#       and a contrary outcome fail. Reads cap regular files at 64 MiB in scratch state and
+#       SCENARIO_SLACK_PUSH_S per call; wait retries only 75 to RECORD_WAIT_S (fallback push
+#       bound), each read capped by the remaining wait. Never loads/repairs a store. Observe
+#       before kill, retain output before compaction; no inference from API records/file existence.
+#       Caller controls concurrent resolution and checks current authority/membership separately.
+#   Membership timing: use text MEMBERSHIP_REQUEST_TIMEOUT_MS / MEMBERSHIP_ATTEMPT_TIMEOUT_MS /
+#       MEMBERSHIP_RETRY_MIN_MS / MEMBERSHIP_RETRY_MAX_MS, and text membershipRetryDelay
+#       <failures> [retry-after-seconds]. These print the production membership exports.
+#   shared_queue_joins_saved <key> <snapshot>... requires a saved join for EVERY queue join
+#   shared_dedupe_preserved <key> <before-snapshot> exact dedupe facts, no full accepted content
+#   shared_persona_facts <key> [channel] saved assignments/stamps/leaves/incarnation/marker;
+#       historicalMembership is disk history, never live eligibility
+#   shared_delivery_expectation <key> <name> <slack|cron|interject> <channel-or-sender>
+#       <ts> <sender-id> <via-or-dash>    one independent JSONL expected acceptance
+#   shared_assert_accounting <expectations-jsonl> <server-log> (<key> <snapshot>)...
+#       exact accepted set AND received diagnostic multiset across rotations; one cumulative
+#       snapshot per persona, including pre-compaction history; source/sender/via all checked
+#   shared_expected_parts <text> <ts> <user-id> <user-name> <channel> <channel-name> <via>
+#       <root-or-dash> <attachment-json-or-dash> production tag-builder JSON parts, independent
+#       of actual accepted/fixed records (explicit resolved names, no online lookup)
+#   shared_injected_expected_parts <text> <retained-ts> <sender>
+#       Production-built injected tag parts, independent of fixed output (JSON).
+#   shared_assert_injected_content <key> <server-log> <snapshot> <cron|interject>
+#       <sender> <retained-ts> <text> <expected-parts-json>: exact original plus all
+#       own-session receipts; wrong source/sender/time, reminders or missing evidence fail.
+#       Snapshot/logs stay under SCENARIO_ROOT. Transcripts use the separate shared HOME:
+#       only direct .claude/projects/<project>/<session>.jsonl files bound by the existing
+#       receipt adapter to this persona's attempts/logs; symlink traversal is refused.
+#   shared_cron_identity <crontable-file> <prompt-path-as-written>
+#       Production parser's identity; exactly one matching schedule and no errors required.
+#   configuration_recovery_request <id> <damaged-file> <new-retained-request> [replacement-file]
+#       Publish a production-validated restore (no replacement) or replace request through
+#       config.json.request.tmp -> .request. Retain exact JSON outside live state, refusing
+#       an existing artifact. No wait: caller owns refused start/live review and confirmation.
+#   shared_recovery_pending <retained-request> <preview-file>
+#   shared_recovery_consumed <retained-request> <reviewed-preview-file>
+#       One-shot durable exact request/preview or consumed activation evidence, JSON metadata.
+#       Caller retains the preview before confirmation; missing/stale evidence fails.
+#       All six helpers are image guarded, preserve HOME and use SCENARIO_SLACK_PUSH_S
+#       as a positive process bound (no polling). File arguments are scratch fenced;
+#       recovery/cron reads cap at 64 MiB and never load, repair or mutate an authority.
+#       _scenario_shared_read <entry> <args...> is their bounded, allowlisted printer dispatch.
+#   shared_assert_content <key> <server-log> <snapshot> <channel> <ts> <original-text>
+#       <expected-parts-json> <attachment-json-or-dash> requires original queue text/file,
+#       exact independent fixed parts AND transcript receipts; prints metadata only
+#   Evidence bounds in fmk-texts.ts: sharedEvidenceBytes, sharedScratchBytes and the injected
+#       transcript reader cap regular files at 64 MiB; missing/nonregular/oversized files fail.
+#       sharedQueueRecords accepts 1-32 journals, sharedLogPaths at most 32 log rotations,
+#       and sharedReceiptView at most 256 transcript paths. Their JSONL readers defer partial
+#       tails and reject damaged complete records; a partial receipt cannot prove delivery.
+#       These limits do not apply to every reader: shared_queue_items/acceptedQueueItems
+#       reads the whole journal with readFileSync and no byte cap; ENOENT returns no items,
+#       other read errors or damaged complete records fail. _scenario_complete_jsonl (stub/
+#       session records) streams without a byte cap, returns no rows for an absent file and
+#       rejects malformed complete rows. Both defer partial tails; callers decide whether
+#       an empty result meets their assertion (ACK assertions require positive evidence).
+#   slack_stub_control_seed <file> (<label> <fake-suffix>)...
+#                                       atomically write initial controls with tagged bot/app/user IDs,
+#                                       one common team and empty memberships, before starting the stub
+#   slack_stub_controls <control-file>  initialize private control snapshot from scratch file;
+#                                       subsequent wrappers POST it, never rewrite the watched file
+#   slack_stub_identity <label> <user_id|bot_id|team_id|app_id>
+#                                       read explicit identity from control; absent/ambiguous fails
+#   slack_stub_redeliver <label> <envelope-id> [attempt] [reason]
+#   slack_stub_push_installation <label> <event-json> <foreign-label>
+#                                       retry preserves event identity; foreign installation uses
+#                                       that label's configured identity; print new envelope ID
+#   slack_stub_close_socket <label> [refuse-count]
+#   slack_stub_inventory_page <label> <cursor> <next-cursor> [channel/flags...]
+#                                       flags: public|private, local|external, member|nonmember|omit;
+#                                       e.g. C…/private/local/omit; no channels is an empty page
+#   slack_stub_inventory_pages <label> <cursor> <next-cursor> <page-size> [channel/flags...]
+#                                       the same channels as chained raw pages of at most <page-size>:
+#                                       the first at <cursor>, the last naming <next-cursor>; pass the
+#                                       production MEMBERSHIP_PAGE_LIMIT (fmk-texts) to page as Slack does
+#   slack_stub_inventory_clear <label>  remove all custom pages (then add desired pages)
+#   slack_stub_fault <label> <method> <outcome> [key=value...]
+#                                       keys cursor/channel/user/thread_ts/error (strings), after/times/
+#                                       retry_after/delay_ms (integers), performed (boolean),
+#                                       body (JSON from slack_stub_inventory_body or event builder)
+#   slack_stub_inventory_fault <label> <cursor> <outcome> [key=value...]
+#   slack_stub_post_lost <label> <channel> <true|false> [key=value...]
+#   slack_stub_post_fail <label> <channel> <error|rate_limit> [key=value...]
+#   slack_stub_history_fault <label> <history|replies> <outcome> [key=value...]
+#   slack_stub_faults_clear <label>
+#   slack_stub_history <page-size>       enable history/replies, preserve existing seeds/posts
+#   slack_stub_history_seed <channel> <event-json>
+#   slack_stub_inventory_body <next-cursor> [channel/flags...]
+#                                       print raw page for a delayed conflicting inventory answer
+#                                       Controls use SCENARIO_SLACK_PUSH_S; HTTP rejection fails.
+#                                       Every replacement resets fault counters, drops prior one-shot
+#                                       closes/pushes, and preserves other settings. Initialize once;
+#                                       do not concurrently edit the original control or snapshot.
+#   slack_stub_records <event> [field=value...]
+#   slack_stub_record_count <event> [field=value...]
+#   slack_stub_record_field <field> <event> [field=value...]
+#                                       complete matching JSONL records/count/last field; malformed
+#                                       complete records fail, partial trailing line is ignored
+#   slack_stub_control_fired <event> [field=value...]
+#                                       require and print matching fault/redelivery/close evidence
+#   slack_ack_count <envelope-id>        exact count, requires a recorded push (missing != zero)
+#   slack_wait_one_ack <envelope-id> [seconds]
+#                                       poll up to RECORD_WAIT_S (else push bound), fail on >1 or 0
+#   slack_expect_no_ack <envelope-id> <seconds>
+#                                       observe the whole bound, fail on any acknowledgement
+#   slack_envelope_times <envelope-id>   push/ack monotonic times and connection IDs, no verdict
+#   scenario_attempt_id <name>          retained TEST_NAME-scoped logical attempt ID
+#   attempt_args <id> <channel> <delivery> [assignment|retry]
+#   stub_session_submit <dir> <tool> <args> [keep|lose]
+#                                       append once and return request ID immediately
+#   stub_session_group <dir> (<tool> <args> <keep|lose>)...
+#                                       append whole group in ONE write; return each request ID
+#   stub_session_result <dir> <id> [seconds]
+#                                       wait at most SCENARIO_STUB_CALL_S; print result, error or lost
+#   stub_session_call_lost <dir> <tool> <args>
+#                                       submit then wait; fail unless status is lost (no apply claim)
+#   stub_session_sessions <dir>          complete session/request observation JSONL, no wait
+#   scenario_attempt_call <dir> <args> [keep|lose]
+#   scenario_attempt_group <dir> <args>...
+#                                       actual set_channel_delivery calls; grouped calls return IDs
+#   expect_attempt <step> <dir> <args> <key> <effective|unavailable-reason> [new|history] [isError]
+#                                       compare result with installed production builder/durable outcome
+#   shared_channel_saved <key> <channel>
+#   shared_channel_effective <key> <channel> <eligible|membership-reason>
+#                                       effective uses caller's independently observed LIVE membership;
+#                                       persisted membership alone never proves current eligibility
+#   shared_thread_since <key> <channel>
+#   shared_thread_created <key>          read production-validated authority; missing persona fails
+#   shared_thread_file <key>             print true/false; reject symlink/non-regular journal
+#   shared_attempt_applications <key> [channel]
+#   shared_attempt_order <key> [channel] count/ordered JSONL applied outcomes, including retired lives
+#   shared_queue_items <key>             production-validated accepted records in seq order, with via
+#                                       and hold metadata (a held record does not prove release);
+#                                       current journal only, no reconstruction of compacted history
+#   shared_queued_count <key> <channel> <ts> [via]
+#                                       state readers are immediate, scratch-fenced and read-only
+#                                       Disk records do not certify runtime durabilityPending repair
+#                                       or hold release; scenarios prove those through router evidence.
 #
 #   Steps and cleanup
 #   fail <step>                        print the FAIL line and exit 1
@@ -210,10 +455,20 @@
 #                                      printer): the server read the test_timer_overrides block
 #   wait_for_file <path> <timeout-s> [<step>]
 #   wait_until <timeout-s> <step> <command> [<arg>...]
+#   session_barrier_mark [--position] <name>...
+#                                      before a server (re)start, record each persona's Session
+#                                      connected count; with --position (inside one server),
+#                                      record server.log's line count instead
+#   session_barrier_wait <timeout-s> <step>
+#                                      under one timeout, wait until every marked persona's count
+#                                      has risen or, with --position, its last Session connected
+#                                      line is after the mark and its last MCP session dropped
+#                                      line; fail naming the personas still waiting
 #
 #   Line builders (each prints a matcher; see "Line builders" for the fragments)
 #   persona_ref <name>                 print `"<name>" (key=<key>)` (text, not a matcher)
 #   persona_start_match <index> <name>
+#   session_connected_match <name>
 #   skip_match <name> [<cwd>]
 #   completion_match <persona-count>
 #   counts [<field>=<n>]...            print the reload counts field (text, not a matcher)
@@ -1051,7 +1306,7 @@
 #                                      JSON object per line, as recorded, in record order; only
 #                                      complete lines. Prints nothing when there is no record yet.
 #                                      Read-only
-#   stub_session_call <dir> <tool> <json-args>
+#   stub_session_call <dir> <tool> <json-args> [arguments-file]
 #                                      (harness addition, both modes) call the MCP tool <tool>
 #                                      (1 to 128 letters, digits, `_`, `-` or `.`) with
 #                                      <json-args> (a JSON object) over the session of the stub
@@ -1069,12 +1324,26 @@
 #                                      naming <tool>, the request ID and <dir>, when no result
 #                                      line comes in time; an `isError: true` result is the
 #                                      scenario's to judge, not a failure. Writes only the request
-#                                      file, in SCENARIO_STUB_DIR
+#                                      file, in SCENARIO_STUB_DIR. With `arguments-file`, for
+#                                      arguments too long for one line: first writes them whole
+#                                      to a new `stub-mcp-arguments.<key>.<id>.json` there (at
+#                                      most SCENARIO_STUB_ARGUMENTS_MAX_BYTES), and the request
+#                                      line names that file instead of carrying them; their
+#                                      content is never printed
+#   stub_session_list_tools <dir>      list the negotiated tools over the same MCP session.
+#                                      Uses a tools/list method request, never a tool name.
+#                                      The same bounded record exchange returns the tools
+#                                      array as JSON in the result's text field.
 #
 # Line builders (every fragment is quoted from src/; <ref> is `persona_ref`):
 #   persona_start_match   `[slack] persona-start: personas[<index>] <ref>`
 #                         (src/persona-bringup-controller.ts bringUp, format
 #                         src/persona-diagnostics.ts formatPersonaDiagnostic)
+#   session_connected_match
+#                         `[slack] Session connected: persona <ref>` (src/server.ts
+#                         handleInitialized). The barrier's position form also reads
+#                         `[slack] persona <ref>: MCP session dropped` (src/persona-bringup-controller.ts
+#                         createNotUpSessionDropper)
 #   skip_match            `[slack] dry-run: skipping spawn for <ref>`, then ` cwd=<cwd>` when given
 #                         (src/session-manager.ts spawnForPersona)
 #   completion_match      `[slack] startupSessionManager: complete — <n> persona(s):`
@@ -1820,6 +2089,67 @@ persona_start_match() {
     matcher "[slack] persona-start: personas[$1] ${ref}"
 }
 
+# session_connected_match <name>: the server's line for a persona's new MCP session.
+session_connected_match() {
+    local ref
+    ref="$(persona_ref "$1")" || exit 1
+    matcher "[slack] Session connected: persona ${ref}"
+}
+
+# The session barrier. session_barrier_mark <name>... records each persona's
+# Session connected count before a server (re)start; session_barrier_wait
+# <timeout-s> <step> then waits, under that one timeout, until every marked
+# persona's count has risen, so no MCP request goes to a session the previous
+# server held.
+# Inside one server, where a persona can connect and then drop again before it
+# recovers, a count can rise on a session that is already gone. There,
+# session_barrier_mark --position <name>... records server.log's line count
+# instead, and the wait passes for a persona only when its last Session
+# connected line is after both the mark and its last MCP session dropped line.
+session_barrier_mark() {
+    declare -gA SESSION_BARRIER=()
+    declare -g SESSION_BARRIER_MODE=count
+    local name at
+    if [[ "${1:-}" == --position ]]; then SESSION_BARRIER_MODE=position; shift; fi
+    [[ "$#" -gt 0 ]] || fail 'session_barrier_mark: no persona named'
+    if [[ "${SESSION_BARRIER_MODE}" == position ]]; then
+        at=0
+        [[ ! -f "${SLACK_STATE_DIR}/server.log" ]] || at="$(LC_ALL=C grep -c '' -- "${SLACK_STATE_DIR}/server.log" || true)"
+        for name in "$@"; do SESSION_BARRIER["${name}"]="${at}"; done
+        return 0
+    fi
+    for name in "$@"; do SESSION_BARRIER["${name}"]="$(count_log "$(session_connected_match "${name}")")"; done
+}
+
+_scenario_session_reconnected() {
+    local name="$1" connected dropped ref
+    if [[ "${SESSION_BARRIER_MODE:-count}" == count ]]; then
+        [[ "$(count_log "$(session_connected_match "${name}")")" -gt "${SESSION_BARRIER[${name}]}" ]]
+        return
+    fi
+    connected="$(last_log_line "$(session_connected_match "${name}")")"
+    ref="$(persona_ref "${name}")" || exit 1
+    dropped="$(last_log_line "$(matcher "[slack] persona ${ref}: MCP session dropped")")"
+    [[ -n "${connected}" ]] && [[ "${connected}" -gt "${SESSION_BARRIER[${name}]}" ]] && [[ "${connected}" -gt "${dropped:-0}" ]]
+}
+
+_scenario_sessions_reconnected() {
+    local name
+    for name in "${!SESSION_BARRIER[@]}"; do _scenario_session_reconnected "${name}" || return 1; done
+}
+
+session_barrier_wait() {
+    local timeout_s="$1" step="$2" name waiting=''
+    [[ -v SESSION_BARRIER[@] ]] || fail "${step}: session_barrier_mark was not run"
+    _scenario_check_timeout "${timeout_s}" "${step}"
+    _scenario_poll_until "${timeout_s}" _scenario_sessions_reconnected && return 0
+    for name in "${!SESSION_BARRIER[@]}"; do _scenario_session_reconnected "${name}" || waiting+=" ${name}"; done
+    if [[ "${SESSION_BARRIER_MODE:-count}" == position ]]; then
+        fail "${step} (not within ${timeout_s}s; no session after the mark and the last drop for:${waiting})"
+    fi
+    fail "${step} (not within ${timeout_s}s; no new session for:${waiting})"
+}
+
 skip_match() {
     local ref
     ref="$(persona_ref "$1")" || exit 1
@@ -1914,14 +2244,12 @@ check_pending_layout() {
 }
 
 # One poll of hold_not_applied (0 while nothing is applied): the record
-# keeps the inode and bytes it had when the hold began, the reload-applied
+# keeps its applied facts and pending intent when review metadata changes; the reload-applied
 # count is unchanged, and the extra command, if any, holds.
 _scenario_hold_ok() {
-    local record="$1" snapshot="$2" inode="$3" applied="$4"; shift 4
-    [[ "$(stat -c '%i' "${record}" 2>/dev/null || true)" == "${inode}" ]] || {
-        _SCENARIO_HOLD_WHY="config.json.last-applied was rewritten"; return 1; }
-    cmp -s -- "${snapshot}" "${record}" || {
-        _SCENARIO_HOLD_WHY="config.json.last-applied changed"; return 1; }
+    local record="$1" snapshot="$2" applied="$3"; shift 3
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedAuthorityPreserved "${SLACK_STATE_DIR}/config.json" "${snapshot}" "${record}" || {
+        _SCENARIO_HOLD_WHY="config.json.last-applied application or intent changed"; return 1; }
     (( $(count_log '[slack] reload-applied:') == applied )) || {
         _SCENARIO_HOLD_WHY="a reload-applied line was logged"; return 1; }
     if (( $# > 0 )) && ! "$@"; then
@@ -1934,20 +2262,19 @@ hold_not_applied() {
     local hold_s="$1" step="$2"; shift 2
     local record="${SLACK_STATE_DIR}/config.json.last-applied"
     local pending="${SLACK_STATE_DIR}/config.json.pending"
-    local snapshot="${SCENARIO_ROOT}/hold.last-applied" inode applied deadline
+    local snapshot="${SCENARIO_ROOT}/hold.last-applied" applied deadline
     _scenario_check_timeout "${hold_s}" "${step}"
     [[ -f "${record}" ]] || fail "${step}: ${record} is missing at the start of the hold"
     cp -- "${record}" "${snapshot}" || fail "${step}: could not snapshot ${record}"
-    inode="$(stat -c '%i' "${record}")" || fail "${step}: could not stat ${record}"
     applied="$(count_log '[slack] reload-applied:')"
     _SCENARIO_HOLD_WHY=""
     deadline=$(( $(_scenario_now_ms) + hold_s * 1000 ))
     while (( $(_scenario_now_ms) < deadline )); do
-        _scenario_hold_ok "${record}" "${snapshot}" "${inode}" "${applied}" "$@" \
+        _scenario_hold_ok "${record}" "${snapshot}" "${applied}" "$@" \
             || fail "${step}: ${_SCENARIO_HOLD_WHY} before a confirmation"
         sleep "${SCENARIO_POLL_S}"
     done
-    _scenario_hold_ok "${record}" "${snapshot}" "${inode}" "${applied}" "$@" \
+    _scenario_hold_ok "${record}" "${snapshot}" "${applied}" "$@" \
         || fail "${step}: ${_SCENARIO_HOLD_WHY} before a confirmation"
     [[ -e "${pending}" ]] || fail "${step}: config.json.pending vanished before a confirmation"
 }
@@ -5654,6 +5981,15 @@ SCENARIO_STUB_CALL_S=30
 # the request file in one write.
 SCENARIO_STUB_REQUEST_MAX_BYTES=4000
 
+# A tool call's arguments file, for arguments too long for one request line:
+# `<prefix><key>.<request id><suffix>` in SCENARIO_STUB_DIR, at most this many
+# bytes, newline included (fixtures/stub-mcp-session.ts ARGUMENTS_PREFIX,
+# ARGUMENTS_SUFFIX and ARGUMENTS_FILE_MAX_BYTES). Well below the kernel's
+# 128 KiB bound on one argument, which every jq call here passes them in.
+SCENARIO_STUB_ARGUMENTS_PREFIX=stub-mcp-arguments.
+SCENARIO_STUB_ARGUMENTS_SUFFIX=.json
+SCENARIO_STUB_ARGUMENTS_MAX_BYTES=65536
+
 # _scenario_check_stub_url <step>: fail, with the reason, unless
 # SCENARIO_SLACK_STUB_URL is exactly `http://127.0.0.1:<port>` (a port from 1
 # to 65535, never 3100).
@@ -5795,14 +6131,43 @@ stub_session_deliveries() {
 }
 
 stub_session_call() {
-    local dir="${1:-}" tool="${2:-}" args="${3:-}" stub key requests results id line found deadline step
+    local dir="${1:-}" tool="${2:-}" step
     step="stub_session_call ${dir} ${tool}"
     require_ci_image "${step}"
-    (( $# == 3 )) || fail "${step}: takes <dir> <tool> <json-args>"
-    [[ "${tool}" =~ ^[A-Za-z0-9_.-]{1,128}$ ]] \
-        || fail "${step}: '${tool}' is not a tool name (1 to 128 letters, digits, '_', '-' or '.')"
-    jq -n -e --argjson a "${args}" '$a | type == "object"' > /dev/null 2>&1 \
-        || fail "${step}: the arguments are not a JSON object"
+    (( $# == 3 )) || [[ $# == 4 && "$4" == arguments-file ]] || fail "${step}: takes <dir> <tool> <json-args> [arguments-file]"
+    _scenario_stub_request "${dir}" tools/call "${tool}" "$3" "${@:4}"
+}
+
+stub_session_list_tools() {
+    local step="stub_session_list_tools ${1:-}"
+    require_ci_image "${step}"
+    (( $# == 1 )) || fail "${step}: takes <dir>"
+    _scenario_stub_request "$1" tools/list
+}
+
+# Shared bounded exchange. A method and a tool name are distinct fields;
+# listing has no tool or arguments, and every tools/call validates both.
+_scenario_stub_request() {
+    local dir="${1:-}" method="${2:-}" tool="${3:-}" args="${4:-}" via="${5:-}" payload stub key requests results id line found deadline step argfile content
+    step="stub session ${method} ${dir}${tool:+ ${tool}}"
+    require_ci_image "${step}"
+    case "${method}" in
+        tools/call)
+            (( $# == 4 )) || [[ $# == 5 && "${via}" == arguments-file ]] \
+                || fail "${step}: takes <dir> tools/call <tool> <json-args> [arguments-file]"
+            [[ "${tool}" =~ ^[A-Za-z0-9_.-]{1,128}$ ]] \
+                || fail "${step}: '${tool}' is not a tool name (1 to 128 letters, digits, '_', '-' or '.')"
+            jq -n -e --argjson a "${args}" '$a | type == "object"' > /dev/null 2>&1 \
+                || fail "${step}: the arguments are not a JSON object"
+            payload="$(jq -c -a -n --arg tool "${tool}" --argjson a "${args}" \
+                '{method: "tools/call", tool: $tool, arguments: $a}')" || fail "${step}: could not build the tool request"
+            ;;
+        tools/list)
+            (( $# == 2 )) || fail "${step}: takes <dir> tools/list"
+            payload='{"method":"tools/list"}'
+            ;;
+        *) fail "${step}: unsupported stub method" ;;
+    esac
     stub="$(_scenario_stub_dir "${step}")" || exit 1
     key="$(_scenario_stub_key "${step}" "${dir}")" || exit 1
     requests="${stub}/${SCENARIO_STUB_REQUESTS_PREFIX}${key}${SCENARIO_STUB_RECORD_SUFFIX}"
@@ -5820,9 +6185,23 @@ stub_session_call() {
     if [[ -f "${requests}" ]] && grep -qF -- "\"id\":\"${id}\"" "${requests}"; then
         fail "${step}: the request ID ${id} is already in ${requests}"
     fi
+    if [[ "${via}" == arguments-file ]]; then
+        # The arguments go whole into their own new file before the request
+        # line names it, so the client never reads part of them. Neither the
+        # file's content nor the arguments are ever printed.
+        [[ "${id}" =~ ^[A-Za-z0-9_.-]{1,200}$ ]] || fail "${step}: the request ID ${id} cannot name an arguments file"
+        argfile="${stub}/${SCENARIO_STUB_ARGUMENTS_PREFIX}${key}.${id}${SCENARIO_STUB_ARGUMENTS_SUFFIX}"
+        [[ ! -e "${argfile}" && ! -L "${argfile}" ]] || fail "${step}: the arguments file ${argfile} already exists"
+        content="$(jq -c -a -n --argjson a "${args}" '$a')" || fail "${step}: could not build the arguments file"
+        (( ${#content} < SCENARIO_STUB_ARGUMENTS_MAX_BYTES )) \
+            || fail "${step}: the arguments take ${#content} bytes; at most $(( SCENARIO_STUB_ARGUMENTS_MAX_BYTES - 1 )) fit an arguments file"
+        ( set -C; printf '%s\n' "${content}" > "${argfile}" ) 2> /dev/null || fail "${step}: could not write the arguments file ${argfile}"
+        payload="$(jq -c -a -n --arg tool "${tool}" --arg file "${argfile##*/}" \
+            '{method: "tools/call", tool: $tool, arguments_file: $file}')" || fail "${step}: could not build the tool request"
+    fi
     # ASCII only (-a), so the line's length is its size in bytes.
-    line="$(jq -c -a -n --arg id "${id}" --arg tool "${tool}" --argjson a "${args}" \
-        '{id: $id, tool: $tool, arguments: $a}')" || fail "${step}: could not build the request line"
+    line="$(jq -c -a -n --arg id "${id}" --argjson payload "${payload}" \
+        '{id: $id} + $payload')" || fail "${step}: could not build the request line"
     (( ${#line} < SCENARIO_STUB_REQUEST_MAX_BYTES )) \
         || fail "${step}: the request line takes ${#line} bytes; at most $(( SCENARIO_STUB_REQUEST_MAX_BYTES - 1 )) reach the file in one write"
     # One append of the whole line in one write: the client reads only
@@ -5996,4 +6375,1099 @@ queue_accepted() {
     [[ -f "${file}" && ! -L "${file}" ]] || fail "queue_accepted: not a regular queue file"
     jq -cS 'select(.v == 1 and .kind == "accepted" and .compact == null) | del(.attempt_high_watermark)' "${file}" \
         || fail "queue_accepted: could not read accepted queue records"
+}
+
+# Production-validated authority and byte-exact reviewed input. The optional
+# applied comparison also requires the resolved applied settings to match;
+# reviewed permits valid automatic channel changes independent of the input.
+configuration_record_matches() {
+    require_ci_image "configuration_record_matches"
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedConfigurationMatches "$1" "$2" "${3:-reviewed}"
+}
+
+# Safe applied-setting projection; neither reads pending config.json bytes.
+configuration_applied_value() {
+    require_ci_image "configuration_applied_value"
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedConfigurationValue "$1" "$2" "$3"
+}
+
+configuration_applied_is() {
+    require_ci_image "configuration_applied_is"
+    local value
+    value="$(configuration_applied_value "$1" "$2" "$3")" || return 1
+    [[ "${value}" == "$4" ]]
+}
+
+# Authenticated inventory is a separate prerequisite from agent/MCP readiness.
+# Only scenarios testing the current membership feature call this helper.
+_scenario_membership_complete() {
+    require_ci_image "_scenario_membership_complete"
+    local persona="$1" route="$2"
+    curl -fsS --max-time 3 -H 'Content-Type: application/json' \
+        --data "$(jq -cn --arg persona "${persona}" '{action:"read",persona:$persona}')" \
+        "http://127.0.0.1:${SCENARIO_PORT}${route}" \
+        | jq -e '.ok == true and .view.inventory.state == "complete"' > /dev/null 2>&1
+}
+wait_membership_complete() {
+    require_ci_image "wait_membership_complete"
+    local persona="$1" route
+    route="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" MEMBERSHIP_READINESS_ROUTE)" || fail 'cannot print membership readiness route'
+    wait_until 30 "authenticated inventory did not complete for ${persona}" _scenario_membership_complete "${persona}" "${route}"
+}
+# An applied live join or leave aborts any inventory scan and marks the
+# inventory incomplete before its ACK. A first-page request after the event's
+# push therefore begins a scan of the inventory then staged, and a complete
+# status seen after it is that scan's or a later one's, never an earlier one's.
+_scenario_membership_rescanned() {
+    require_ci_image _scenario_membership_rescanned
+    slack_stub_records api method=users.conversations "label=$2" \
+        | jq -se --argjson mark "$3" 'any(.[]; .seq > $mark and .cursor == "")' > /dev/null || return 1
+    _scenario_membership_complete "$1" "$4"
+}
+# wait_membership_rescan <persona> <label> <event-push-seq>
+wait_membership_rescan() {
+    require_ci_image wait_membership_rescan
+    local route
+    route="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" MEMBERSHIP_READINESS_ROUTE)" || fail 'cannot print membership readiness route'
+    wait_until 30 "staged inventory was not rescanned for $1" _scenario_membership_rescanned "$1" "$2" "$3" "${route}"
+}
+
+# An explicit operator request precedes its separate rename confirmation.
+# Wait for this exact request's generation in the server-written preview,
+# or its durable cancellation. Retain submitted bytes across polling so a
+# replaced request file cannot change which cancellation is being awaited.
+configuration_request() {
+    require_ci_image "configuration_request"
+    require_scenario_state "configuration_request"
+    local id="$1" action="$2"; shift 2
+    local config="${SLACK_STATE_DIR}/config.json" request
+    request="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" operatorReviewRequest "${config}" "${config}.last-applied" "${id}" "${action}" "$@")" \
+        || fail 'cannot build the operator request'
+    printf '%s' "${request}" > "${config}.request.tmp" || fail 'cannot write the operator request'
+    mv -- "${config}.request.tmp" "${config}.request" || fail 'cannot publish the operator request'
+    if [[ "${action}" == cancel ]]; then
+        wait_until 30 'operator cancellation is not durably recorded and cleared' \
+            bun "${SCENARIO_FIXTURES}/fmk-texts.ts" operatorReviewCancelled "${config}" "${config}.last-applied" "${request}"
+    else
+        wait_until 30 'operator request has no current pending review' \
+            bun "${SCENARIO_FIXTURES}/fmk-texts.ts" operatorReviewPending "${config}" "${config}.last-applied" "${config}.pending" "${id}"
+    fi
+}
+
+# Shared-mode scenarios retain the container HOME. This request-only guard
+# fences every file the printer reads or the publisher writes to scratch state.
+require_scenario_state() {
+    local step="${1:-require_scenario_state}" real_root real_state name path
+    [[ -n "${SCENARIO_ROOT:-}" && -d "${SCENARIO_ROOT}" ]] \
+        || fail "${step}: refused: SCENARIO_ROOT is not a directory"
+    [[ -n "${SLACK_STATE_DIR:-}" && "${SLACK_STATE_DIR}" == "${SCENARIO_ROOT}"/* && -d "${SLACK_STATE_DIR}" ]] \
+        || fail "${step}: refused: state directory is not under SCENARIO_ROOT"
+    real_root="$(realpath -e -- "${SCENARIO_ROOT}" 2> /dev/null)" \
+        || fail "${step}: refused: cannot resolve SCENARIO_ROOT"
+    real_state="$(realpath -e -- "${SLACK_STATE_DIR}" 2> /dev/null)" \
+        || fail "${step}: refused: cannot resolve state directory"
+    [[ "${real_state}" == "${real_root}"/* ]] \
+        || fail "${step}: refused: state directory resolves outside SCENARIO_ROOT"
+    for name in config.json config.json.last-applied config.json.pending config.json.request config.json.request.tmp; do
+        path="${SLACK_STATE_DIR}/${name}"
+        [[ ! -L "${path}" && ( ! -e "${path}" || -f "${path}" ) ]] \
+            || fail "${step}: refused: request files must be regular files, never symlinks"
+    done
+}
+
+# Pending requests/review history may advance; these applied facts may not.
+configuration_application_preserved() {
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedApplicationPreserved "$@"
+}
+
+# Shared scenario values and Slack shapes. Pure builders do not source any
+# production state; pushes still enter through the real Socket Mode router.
+scenario_id() {
+    require_ci_image scenario_id
+    [[ "${1:-}" =~ ^[CGDUBTAF]$ && -n "${2:-}" ]] || fail 'scenario_id: takes kind and name'
+    local digest
+    digest="$(printf '%s\n%s' "${TEST_NAME}" "$2" | sha256sum)" || fail 'scenario_id: hash failed'
+    printf '%s%s\n' "$1" "${digest:0:20}" | tr '[:lower:]' '[:upper:]'
+}
+scenario_ts() {
+    require_ci_image scenario_ts
+    (( $# == 0 )) || fail 'scenario_ts: takes no arguments; retain the result for paired events'
+    local file="${SCENARIO_ROOT}/event-time-${SCENARIO_TAG}"
+    _scenario_scratch_file "${file}"
+    python3 - "${file}" <<'PY'
+import fcntl, sys, time
+with open(sys.argv[1], "a+") as stream:
+    fcntl.flock(stream, fcntl.LOCK_EX)
+    stream.seek(0)
+    before = stream.read().strip()
+    now = max(time.time_ns() // 1000, int(before) + 1 if before else 0)
+    stream.seek(0)
+    stream.truncate()
+    stream.write(str(now))
+    stream.flush()
+    print(f"{now // 1000000}.{now % 1000000:06d}")
+PY
+}
+scenario_text() {
+    require_ci_image scenario_text
+    printf '%s %s\n' "${TEST_NAME}" "$1"
+}
+scenario_mention_text() {
+    require_ci_image scenario_mention_text
+    printf '<@%s> %s\n' "$1" "${2:-${TEST_NAME}}"
+}
+scenario_broadcast_text() {
+    require_ci_image scenario_broadcast_text
+    [[ "$1" == here || "$1" == channel ]] || fail 'scenario_broadcast_text: expected here or channel'
+    printf '<!%s> %s\n' "$1" "${2:-${TEST_NAME}}"
+}
+_scenario_channel_type() {
+    require_ci_image _scenario_channel_type
+    case "$1" in
+        G*) printf 'group\n' ;;
+        D*) printf 'im\n' ;;
+        *) printf 'channel\n' ;;
+    esac
+}
+slack_message_event() {
+    require_ci_image slack_message_event
+    local user="${4:-}" kind="${5-$(_scenario_channel_type "$1")}"
+    [[ -n "${user}" ]] || user="$(scenario_id U human)" || exit 1
+    jq -cn --arg c "$1" --arg text "$2" --arg ts "$3" --arg user "${user}" --arg kind "${kind}" \
+        '{type:"message",channel:$c,text:$text,ts:$ts,user:$user} + (if $kind == "" then {} else {channel_type:$kind} end)'
+}
+slack_mention_event() {
+    require_ci_image slack_mention_event
+    slack_message_event "$1" "$2" "$3" "${4:-}" '' | jq -c '.type="app_mention"'
+}
+slack_reply_event() {
+    require_ci_image slack_reply_event
+    slack_message_event "$1" "$3" "$4" "${5:-}" | jq -c --arg root "$2" --arg parent "${6:-}" \
+        '. + {thread_ts:$root} + (if $parent == "" then {} else {parent_user_id:$parent} end)'
+}
+slack_push_message() {
+    require_ci_image slack_push_message
+    local event
+    event="$(slack_message_event "$2" "$3" "$4" "${5:-}" "${6-$(_scenario_channel_type "$2")}")" || fail 'cannot build message'
+    slack_stub_push "$1" "${event}" "${7:-}"
+}
+slack_push_mention() {
+    require_ci_image slack_push_mention
+    local event
+    event="$(slack_mention_event "$2" "$3" "$4" "${5:-}")" || fail 'cannot build mention'
+    slack_stub_push "$1" "${event}" "${6:-}"
+}
+slack_push_broadcast() {
+    require_ci_image slack_push_broadcast
+    local text
+    text="$(scenario_broadcast_text "$3" "$4")" || exit 1
+    slack_push_message "$1" "$2" "${text}" "$5" '' "$(_scenario_channel_type "$2")" "${6:-}"
+}
+slack_push_reply() {
+    require_ci_image slack_push_reply
+    local event
+    event="$(slack_reply_event "$2" "$3" "$4" "$5" "${6:-}" "${7:-}")" || fail 'cannot build reply'
+    slack_stub_push "$1" "${event}" "${8:-}"
+}
+slack_push_own_reply() {
+    require_ci_image slack_push_own_reply
+    local user
+    user="$(slack_stub_identity "$1" user_id)" || exit 1
+    slack_push_reply "$1" "$2" "$3" "$4" "$5" '' "${user}" "${6:-}"
+}
+slack_push_other_bot() {
+    require_ci_image slack_push_other_bot
+    local event user bot
+    user="$(scenario_id U other-bot)" || exit 1
+    bot="$(scenario_id B other-bot)" || exit 1
+    event="$(slack_message_event "$2" "$3" "$4" "${user}" | jq -c --arg bot "${bot}" '. + {subtype:"bot_message",bot_id:$bot}')" \
+        || fail 'cannot build other bot message'
+    slack_stub_push "$1" "${event}" "${5:-}"
+}
+slack_push_edit() {
+    require_ci_image slack_push_edit
+    local event
+    event="$(slack_message_event "$2" "$4" "$3" | jq -c --arg at "$5" \
+        '. as $m | {type:"message",subtype:"message_changed",channel:$m.channel,channel_type:$m.channel_type,event_ts:$at,ts:$at,message:($m | del(.channel,.channel_type) | .edited={user:.user,ts:$at})}')" \
+        || fail 'cannot build edit'
+    slack_stub_push "$1" "${event}" "${6:-}"
+}
+slack_push_delete() {
+    require_ci_image slack_push_delete
+    local event
+    event="$(jq -cn --arg c "$2" --arg ts "$3" --arg at "$4" --arg ct "$(_scenario_channel_type "$2")" \
+        '{type:"message",subtype:"message_deleted",channel:$c,channel_type:$ct,deleted_ts:$ts,event_ts:$at,ts:$at}')" || fail 'cannot build delete'
+    slack_stub_push "$1" "${event}" "${5:-}"
+}
+slack_push_reaction() {
+    require_ci_image slack_push_reaction
+    local event user
+    user="$(scenario_id U human)" || exit 1
+    event="$(jq -cn --arg c "$2" --arg ts "$3" --arg reaction "$4" --arg at "$5" --arg user "${user}" \
+        '{type:"reaction_added",user:$user,reaction:$reaction,item:{type:"message",channel:$c,ts:$ts},event_ts:$at}')" || fail 'cannot build reaction'
+    slack_stub_push "$1" "${event}"
+}
+slack_push_dm() {
+    require_ci_image slack_push_dm
+    slack_push_message "$1" "$2" "$3" "$4" '' im
+}
+slack_push_group_dm() {
+    require_ci_image slack_push_group_dm
+    slack_push_message "$1" "$2" "$3" "$4" '' mpim
+}
+_scenario_push_membership() {
+    require_ci_image _scenario_push_membership
+    local event
+    event="$(slack_membership_event "$@")" || fail 'cannot build membership event'
+    slack_stub_push "$2" "${event}"
+}
+slack_membership_event() {
+    require_ci_image slack_membership_event
+    [[ "$1" == member_joined_channel || "$1" == channel_left ]] || fail 'unknown membership event'
+    local event user="${5:-self}" kind=C
+    case "${user}" in
+        self) user="$(slack_stub_identity "$2" user_id)" || exit 1 ;;
+        other) user="$(scenario_id U other-member)" || exit 1 ;;
+    esac
+    [[ "$3" != G* ]] || kind=G
+    event="$(jq -cn --arg type "$1" --arg c "$3" --arg at "$4" --arg user "${user}" --arg kind "${kind}" \
+        '{type:$type,channel:$c,channel_type:$kind,user:$user,event_ts:$at}')" || fail 'cannot build membership event'
+    printf '%s\n' "${event}"
+}
+slack_push_member_joined() {
+    require_ci_image slack_push_member_joined
+    _scenario_push_membership member_joined_channel "$@"
+}
+slack_push_channel_left() {
+    require_ci_image slack_push_channel_left
+    _scenario_push_membership channel_left "$@"
+}
+# slack_push_membership_ids <member_joined_channel|channel_left> <label> <channel> <ts>
+# Prints the envelope ID and the Slack event_id it carries, tab separated:
+# a live membership effect is recorded under that event_id.
+slack_push_membership_ids() {
+    require_ci_image slack_push_membership_ids
+    local event
+    event="$(slack_membership_event "$@")" || fail 'cannot build membership event'
+    slack_push_event_ids "$2" "${event}"
+}
+# slack_push_event_ids <label> <event-json>: push one prebuilt event; print as
+# slack_push_membership_ids does.
+slack_push_event_ids() {
+    require_ci_image slack_push_event_ids
+    local request answer
+    _scenario_check_stub_url push
+    request="$(jq -cn --arg l "$1" --argjson e "$2" '{label:$l,event:$e}')" || fail 'cannot build event push'
+    answer="$(curl -fsS --max-time "${SCENARIO_SLACK_PUSH_S}" -H 'Content-Type: application/json' \
+        --data-binary @- "${SCENARIO_SLACK_STUB_URL}/_push" 2>/dev/null <<< "${request}")" || fail 'Slack stub push refused or timed out'
+    jq -er 'select(.ok == true and (.envelope_id|type)=="string" and (.event_id|type)=="string") | "\(.envelope_id)\t\(.event_id)"' \
+        <<< "${answer}" || fail 'push returned no envelope or event ID'
+}
+
+# The fixture supplies Slack metadata and independently expected queue/tag
+# metadata. It represents an attachment notification, not a binary download.
+scenario_attachment() {
+    require_ci_image scenario_attachment
+    local id
+    id="$(scenario_id F "$1")" || exit 1
+    jq -cn --arg id "${id}" '{slack:{id:$id,name:"scenario-note.txt",mimetype:"text/plain",size:23},
+        queue:{name:"scenario-note.txt",mimetype:"text/plain",size:23},
+        attributes:{attachment_count:"1",attachments:"scenario-note.txt (text/plain, 23 bytes)"}}'
+}
+scenario_stub_name() {
+    require_ci_image scenario_stub_name
+    [[ "$1" == user || "$1" == channel ]] || fail 'expected user or channel name'
+    if [[ "$1" == channel && "$2" == D* ]]; then printf 'dm\n'
+    else printf 'stub-%s\n' "${2,,}"; fi
+}
+slack_attachment_event() {
+    require_ci_image slack_attachment_event
+    local event
+    case "$1" in
+        message) event="$(slack_message_event "$2" "$4" "$5" "$6")" ;;
+        mention) event="$(slack_mention_event "$2" "$4" "$5" "$6")" ;;
+        reply) event="$(slack_reply_event "$2" "$3" "$4" "$5" "$6")" ;;
+        *) fail 'slack_attachment_event: expected message, mention or reply' ;;
+    esac
+    [[ -n "${event}" ]] || fail 'cannot build attachment event'
+    jq -ce --argjson fixture "$7" '.files=[$fixture.slack] | if .files[0].id then . else error("missing attachment") end' <<< "${event}"
+}
+slack_push_attachment() {
+    require_ci_image slack_push_attachment
+    local label="$1" event; shift
+    event="$(slack_attachment_event "$@")" || fail 'cannot build attachment push'
+    slack_stub_push "${label}" "${event}"
+}
+slack_recorded_button() {
+    require_ci_image slack_recorded_button
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedRecordedButton "${SCENARIO_SLACK_RECORD:?}" "$@"
+}
+slack_push_button() {
+    require_ci_image slack_push_button
+    local button body
+    button="$(slack_recorded_button "$1" "$2" "$3" "$4")" || fail 'missing or ambiguous recorded button'
+    body="$(jq -cn --arg l "$1" --arg c "$2" --arg ts "$3" --arg user "$5" --argjson action "${button}" \
+        '{label:$l,interactive:{type:"block_actions",user:{id:$user},channel:{id:$c},message:{ts:$ts},actions:[$action]}}')" || exit 1
+    _scenario_stub_special_push "${body}"
+}
+shared_stub_permission() {
+    require_ci_image shared_stub_permission
+    local stub
+    stub="$(_scenario_stub_dir shared_stub_permission)" || exit 1
+    bun "${SCENARIO_FIXTURES}/shared-stub-permission.ts" "${stub}" "$@"
+}
+shared_stub_permission_setup() {
+    require_ci_image shared_stub_permission_setup
+    _scenario_scratch_file "${SCENARIO_ROOT}/stub-hooks-tmp-probe"
+    [[ ! -L "${SCENARIO_ROOT}/stub-hooks-tmp" ]] || fail 'hook TMPDIR is a symlink'
+    mkdir -p -- "${SCENARIO_ROOT}/stub-hooks-tmp"
+    export TMPDIR="${SCENARIO_ROOT}/stub-hooks-tmp"
+    shared_stub_permission setup "$1"
+}
+shared_stub_notice_setup() {
+    require_ci_image shared_stub_notice_setup
+    _scenario_scratch_file "${SCENARIO_ROOT}/stub-hooks-tmp-probe"
+    [[ ! -L "${SCENARIO_ROOT}/stub-hooks-tmp" ]] || fail 'hook TMPDIR is a symlink'
+    mkdir -p -- "${SCENARIO_ROOT}/stub-hooks-tmp"
+    export TMPDIR="${SCENARIO_ROOT}/stub-hooks-tmp"
+    shared_stub_permission notice-setup "$1"
+}
+shared_stub_notice() {
+    require_ci_image shared_stub_notice
+    local action="$1"; shift
+    case "${action}" in end|ended|resume) ;; *) fail 'expected notice end, ended or resume' ;; esac
+    require_scenario_state shared_stub_notice
+    shared_stub_permission "notice-${action}" "$@"
+}
+slack_post_mark() {
+    require_ci_image slack_post_mark
+    _scenario_scratch_file "${SCENARIO_SLACK_RECORD:?}"
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedPostMark "${SCENARIO_SLACK_RECORD}"
+}
+slack_successful_post() {
+    require_ci_image slack_successful_post
+    _scenario_scratch_file "${SCENARIO_SLACK_RECORD:?}"
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedSuccessfulPost "${SCENARIO_SLACK_RECORD}" "$@"
+}
+_scenario_wait_post() {
+    require_ci_image _scenario_wait_post
+    local entry="$1"; shift
+    case "${entry}" in sharedSuccessfulPost|sharedMessagesWaitingPost) ;; *) fail 'unsupported post observer' ;; esac
+    _scenario_scratch_file "${SCENARIO_SLACK_RECORD:?}"
+    local bound="${RECORD_WAIT_S:-${SCENARIO_SLACK_PUSH_S}}" deadline value rc
+    _scenario_check_timeout "${bound}" 'successful post wait'
+    deadline=$(( $(_scenario_now_ms) + bound * 1000 ))
+    while :; do
+        if value="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" "${entry}" "${SCENARIO_SLACK_RECORD}" "$@" 2>/dev/null)"; then
+            printf '%s\n' "${value}"
+            return 0
+        else rc=$?; fi
+        (( rc == 75 )) || fail 'successful post evidence invalid'
+        (( $(_scenario_now_ms) < deadline )) || fail 'successful post not observed within bound'
+        sleep "${SCENARIO_POLL_S}"
+    done
+}
+slack_wait_successful_post() {
+    require_ci_image slack_wait_successful_post
+    _scenario_wait_post sharedSuccessfulPost "$@"
+}
+slack_wait_messages_waiting() {
+    require_ci_image slack_wait_messages_waiting
+    _scenario_wait_post sharedMessagesWaitingPost "$@"
+}
+slack_push_observed_post() {
+    require_ci_image slack_push_observed_post
+    _scenario_scratch_file "${SCENARIO_SLACK_RECORD:?}"
+    local user bot event
+    user="$(slack_stub_identity "$2" user_id)" || exit 1
+    bot="$(slack_stub_identity "$2" bot_id)" || exit 1
+    event="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedObservedPostEvent "${SCENARIO_SLACK_RECORD}" "$2" "$3" "$4" "${user}" "${bot}")" \
+        || fail 'cannot build echo of observed successful post'
+    slack_stub_push "$1" "${event}" "${5:-}"
+}
+
+# Read-only evidence adapters. Snapshot publication writes only a fenced
+# scenario artifact; no reader loads or repairs a running production store.
+shared_queue_snapshot() {
+    require_ci_image shared_queue_snapshot
+    local output="$1" key="$2"; shift 2
+    _scenario_scratch_file "${output}"
+    _scenario_scratch_file "${output}.tmp"
+    [[ "$(realpath -m -- "${output}")" != "$(realpath -e -- "${SLACK_STATE_DIR}")"/* ]] \
+        || fail 'queue snapshots must be outside the live state directory'
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedQueueSnapshot "${SLACK_STATE_DIR}/queue/${key}.jsonl" "$@" > "${output}.tmp" \
+        || fail 'cannot capture queue evidence'
+    mv -- "${output}.tmp" "${output}"
+}
+shared_queue_receipts() {
+    require_ci_image shared_queue_receipts
+    local key="$1" originals="$2"; shift 2
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedQueueReceipts "${key}" "${SLACK_STATE_DIR}/server.log" \
+        "${SLACK_STATE_DIR}/queue/${key}.jsonl" "${originals}" "$@"
+}
+shared_wait_queue_drained() {
+    require_ci_image shared_wait_queue_drained
+    local key="$1" originals="$2"; shift 2
+    local idle="${DELIVERY_IDLE_WAIT_S:?}" overall="${DELIVERY_MAX_WAIT_S:?}" started last now status progress most=0
+    _scenario_check_timeout "${idle}" shared_wait_queue_drained
+    _scenario_check_timeout "${overall}" shared_wait_queue_drained
+    started="$(_scenario_now_ms)"; last="${started}"
+    while :; do
+        status="$(shared_queue_receipts "${key}" "${originals}" "$@")" || status=''
+        now="$(_scenario_now_ms)"
+        (( now - started < overall * 1000 )) || break
+        if [[ -n "${status}" ]]; then
+            if jq -e '.complete' <<< "${status}" > /dev/null; then return 0; fi
+            progress="$(jq -er '.progress' <<< "${status}")" || progress=0
+            if (( progress > most )); then most="${progress}"; last="${now}"; fi
+        fi
+        (( now - last < idle * 1000 )) || break
+        sleep "${SCENARIO_POLL_S}"
+    done
+    [[ -z "${status}" ]] || printf 'recorded: queue receipt evidence %s\n' "${status}"
+    fail "shared_wait_queue_drained: incomplete receipts for ${key} (progress=${most}, idle=${idle}s, overall=${overall}s)"
+}
+shared_thread_joins() {
+    require_ci_image shared_thread_joins
+    local key="$1"; shift
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedThreadJoins "${SLACK_STATE_DIR}/threads/${key}.jsonl" "$@"
+}
+_scenario_own_post_read() {
+    require_ci_image _scenario_own_post_read
+    local remaining_ms="$1" entry="$2" key="$3" seconds; shift 3
+    case "${entry}" in sharedOwnPostRecords|sharedOwnPostState) ;; *) fail 'unsupported own-post observer' ;; esac
+    [[ "${remaining_ms}" =~ ^[0-9]+$ && "${remaining_ms}" -gt 0 ]] || fail 'invalid own-post read bound'
+    [[ "${key}" =~ ^[A-Za-z0-9_-]+$ ]] || fail 'invalid own-post persona key'
+    require_scenario_state _scenario_own_post_read
+    _scenario_scratch_file "${SLACK_STATE_DIR}/threads/${key}.jsonl"
+    printf -v seconds '%d.%03d' "$(( remaining_ms / 1000 ))" "$(( remaining_ms % 1000 ))"
+    timeout --signal=KILL "${seconds}s" bun "${SCENARIO_FIXTURES}/fmk-texts.ts" "${entry}" \
+        "${SLACK_STATE_DIR}/threads/${key}.jsonl" "$@"
+}
+shared_own_post_records() {
+    require_ci_image shared_own_post_records
+    _scenario_check_timeout "${SCENARIO_SLACK_PUSH_S}" shared_own_post_records
+    _scenario_own_post_read "$(( SCENARIO_SLACK_PUSH_S * 1000 ))" sharedOwnPostRecords "$@"
+}
+shared_own_post_state() {
+    require_ci_image shared_own_post_state
+    _scenario_check_timeout "${SCENARIO_SLACK_PUSH_S}" shared_own_post_state
+    _scenario_own_post_read "$(( SCENARIO_SLACK_PUSH_S * 1000 ))" sharedOwnPostState "$@"
+}
+shared_wait_own_post_state() {
+    require_ci_image shared_wait_own_post_state
+    local bound="${RECORD_WAIT_S:-${SCENARIO_SLACK_PUSH_S}}" deadline remaining read_ms value rc
+    _scenario_check_timeout "${bound}" shared_wait_own_post_state
+    _scenario_check_timeout "${SCENARIO_SLACK_PUSH_S}" shared_wait_own_post_state
+    [[ "${bound}" -gt 0 && "${SCENARIO_SLACK_PUSH_S}" -gt 0 ]] || fail 'own-post wait bounds must be positive'
+    deadline=$(( $(_scenario_now_ms) + bound * 1000 ))
+    while :; do
+        remaining=$(( deadline - $(_scenario_now_ms) ))
+        (( remaining > 0 )) || fail 'own-post state not observed within bound'
+        read_ms=$(( SCENARIO_SLACK_PUSH_S * 1000 ))
+        (( read_ms <= remaining )) || read_ms="${remaining}"
+        if value="$(_scenario_own_post_read "${read_ms}" sharedOwnPostState "$@" 2>/dev/null)"; then
+            (( $(_scenario_now_ms) < deadline )) || fail 'own-post state observed after bound'
+            printf '%s\n' "${value}"
+            return 0
+        else rc=$?; fi
+        (( rc == 75 )) || fail 'own-post evidence invalid or read timed out'
+        (( $(_scenario_now_ms) < deadline )) || fail 'own-post state not observed within bound'
+        sleep "${SCENARIO_POLL_S}"
+    done
+}
+shared_queue_joins_saved() {
+    require_ci_image shared_queue_joins_saved
+    local key="$1"; shift
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedQueueJoinsSaved "${SLACK_STATE_DIR}/threads/${key}.jsonl" "$@"
+}
+shared_dedupe_preserved() {
+    require_ci_image shared_dedupe_preserved
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedDedupePreserved "$2" "${SLACK_STATE_DIR}/queue/$1.jsonl"
+}
+shared_delivery_expectation() {
+    require_ci_image shared_delivery_expectation
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedDeliveryExpectation "$@"
+}
+shared_assert_accounting() {
+    require_ci_image shared_assert_accounting
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedAssertAccounting "$@"
+}
+shared_expected_parts() {
+    require_ci_image shared_expected_parts
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedExpectedParts "$@"
+}
+shared_assert_content() {
+    require_ci_image shared_assert_content
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedAssertContent "$@"
+}
+# One process bound for new read-only projections and the pure request builder.
+_scenario_shared_read() {
+    require_ci_image _scenario_shared_read
+    local entry="$1"; shift
+    case "${entry}" in sharedRecoveryRequest|sharedRecoveryPending|sharedRecoveryConsumed|sharedInjectedExpectedParts|sharedAssertInjectedContent|sharedCronIdentity) ;; *) fail 'unsupported shared reader' ;; esac
+    _scenario_check_timeout "${SCENARIO_SLACK_PUSH_S}" _scenario_shared_read
+    [[ "${SCENARIO_SLACK_PUSH_S}" -gt 0 ]] || fail 'shared read bound must be positive'
+    timeout --signal=KILL "${SCENARIO_SLACK_PUSH_S}s" bun "${SCENARIO_FIXTURES}/fmk-texts.ts" "${entry}" "$@"
+}
+shared_injected_expected_parts() {
+    require_ci_image shared_injected_expected_parts
+    _scenario_shared_read sharedInjectedExpectedParts "$@"
+}
+shared_assert_injected_content() {
+    require_ci_image shared_assert_injected_content
+    (( $# == 8 )) || fail 'injected content needs key, log, snapshot, source, sender, timestamp, text and parts'
+    _scenario_scratch_file "$2"
+    _scenario_scratch_file "$3"
+    _scenario_shared_read sharedAssertInjectedContent "$@"
+}
+shared_cron_identity() {
+    require_ci_image shared_cron_identity
+    (( $# == 2 )) || fail 'cron identity needs crontable file and prompt path as written'
+    _scenario_scratch_file "$1"
+    _scenario_shared_read sharedCronIdentity "$@"
+}
+
+# Publish only the normal operator request. No authority repair or server
+# lifecycle happens here, and a cold refused start cannot be awaited here.
+configuration_recovery_request() {
+    require_ci_image configuration_recovery_request
+    require_scenario_state configuration_recovery_request
+    (( $# == 3 || $# == 4 )) || fail 'recovery request needs id, damaged evidence, new retained request file and optional replacement input'
+    local id="$1" damaged="$2" retained="$3" replacement="${4:-}" request
+    local config="${SLACK_STATE_DIR}/config.json"
+    _scenario_scratch_file "${damaged}"
+    _scenario_scratch_file "${retained}"
+    [[ "$(realpath -m -- "${retained}")" != "$(realpath -e -- "${SLACK_STATE_DIR}")"/* ]] \
+        || fail 'retained recovery request must be outside live state'
+    [[ ! -e "${retained}" ]] || fail 'retained recovery request already exists'
+    if [[ $# == 4 ]]; then
+        _scenario_scratch_file "${replacement}"
+        request="$(_scenario_shared_read sharedRecoveryRequest "${id}" "${damaged}" "${replacement}")" \
+            || fail 'cannot build replacement recovery request'
+    else
+        request="$(_scenario_shared_read sharedRecoveryRequest "${id}" "${damaged}")" \
+            || fail 'cannot build restoration recovery request'
+    fi
+    ( set -o noclobber; printf '%s' "${request}" > "${retained}" ) || fail 'cannot retain exact recovery request'
+    cp -- "${retained}" "${config}.request.tmp" || fail 'cannot stage recovery request'
+    mv -- "${config}.request.tmp" "${config}.request" || fail 'cannot publish recovery request'
+}
+shared_recovery_pending() {
+    require_ci_image shared_recovery_pending
+    require_scenario_state shared_recovery_pending
+    (( $# == 2 )) || fail 'recovery preview needs retained request and preview files'
+    _scenario_scratch_file "$1"
+    _scenario_scratch_file "$2"
+    _scenario_shared_read sharedRecoveryPending "${SLACK_STATE_DIR}/config.json" "${SLACK_STATE_DIR}/config.json.last-applied" "$@"
+}
+shared_recovery_consumed() {
+    require_ci_image shared_recovery_consumed
+    require_scenario_state shared_recovery_consumed
+    (( $# == 2 )) || fail 'recovery consumption needs retained request and reviewed preview files'
+    _scenario_scratch_file "$1"
+    _scenario_scratch_file "$2"
+    _scenario_shared_read sharedRecoveryConsumed "${SLACK_STATE_DIR}/config.json" "${SLACK_STATE_DIR}/config.json.last-applied" "$@"
+}
+shared_persona_facts() {
+    require_ci_image shared_persona_facts
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedPersonaFacts "${SLACK_STATE_DIR}/config.json" "${SLACK_STATE_DIR}/config.json.last-applied" "$@"
+}
+shared_membership_event() {
+    require_ci_image shared_membership_event
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedMembershipEvent "${SLACK_STATE_DIR}/config.json" "${SLACK_STATE_DIR}/config.json.last-applied" "$@"
+}
+
+# Control snapshots contain fake token suffixes only. Never print a whole
+# control or server rejection body. The stub's first file load precedes our
+# POST, so its watched file cannot later overwrite this snapshot unchanged.
+_scenario_scratch_file() {
+    local path="$1" root real
+    [[ -n "${SCENARIO_ROOT:-}" && "$1" == "${SCENARIO_ROOT}"/* && ! -L "$1" ]] || fail 'file is outside scenario scratch or is a symlink'
+    root="$(realpath -e -- "${SCENARIO_ROOT}")" || fail 'cannot resolve scratch root'
+    real="$(realpath -m -- "${path}")" || fail 'cannot resolve scratch file'
+    [[ "${real}" == "${root}"/* && ( ! -e "${path}" || -f "${path}" ) ]] || fail 'scratch file is not regular or escapes scratch'
+}
+_scenario_stub_control_http() {
+    require_ci_image _scenario_stub_control_http
+    _scenario_check_stub_url controls
+    local answer
+    # Body on stdin: a control with full inventory pages exceeds one argv
+    # string's kernel limit (MAX_ARG_STRLEN, 128 KiB) and curl would not start.
+    answer="$(curl -fsS --max-time "${SCENARIO_SLACK_PUSH_S}" -H 'Content-Type: application/json' \
+        --data-binary @- "${SCENARIO_SLACK_STUB_URL}/_control" 2>/dev/null <<< "$1")" || fail 'Slack stub rejected control or timed out'
+    jq -e '.ok == true' <<< "${answer}" >/dev/null || fail 'Slack stub did not accept control'
+}
+slack_stub_control_seed() {
+    require_ci_image slack_stub_control_seed
+    local path="$1" team label suffix user bot app rules='[]' rule; shift
+    _scenario_scratch_file "${path}"
+    (( $# > 0 && $# % 2 == 0 )) || fail 'control seed needs label/fake-suffix pairs'
+    team="$(scenario_id T team)" || exit 1
+    while (( $# )); do
+        label="$1"; suffix="$2"; shift 2
+        [[ -n "${label}" && -n "${suffix}" ]] || fail 'empty stub label or suffix'
+        user="$(scenario_id U "${label}-bot")" || exit 1
+        bot="$(scenario_id B "${label}-bot")" || exit 1
+        app="$(scenario_id A "${label}-app")" || exit 1
+        rule="$(jq -cn --arg l "${label}" --arg s "${suffix}" --arg u "${user}" --arg b "${bot}" --arg a "${app}" --arg t "${team}" \
+            '{label:$l,suffix:$s,user_id:$u,bot_id:$b,app_id:$a,team_id:$t,memberships:[],auth:"ok",connections:"ok"}')" || fail 'cannot build stub rule'
+        rules="$(jq -cn --argjson rules "${rules}" --argjson rule "${rule}" '$rules+[$rule]')" || fail 'cannot collect stub rules'
+    done
+    jq -cn --argjson rules "${rules}" '{tokens:$rules}' | write_file "${path}"
+}
+slack_stub_controls() {
+    require_ci_image slack_stub_controls
+    _scenario_scratch_file "$1"
+    local body
+    body="$(jq -ce 'del(.socket_closes,.pushes)' "$1")" || fail 'cannot read initial Slack controls'
+    SCENARIO_SLACK_CONTROL="${SCENARIO_ROOT}/shared-slack-control.json"
+    [[ "$1" != "${SCENARIO_SLACK_CONTROL}" ]] || fail 'initial control must differ from private snapshot'
+    _scenario_scratch_file "${SCENARIO_SLACK_CONTROL}"
+    _scenario_stub_control_http "${body}"
+    write_file "${SCENARIO_SLACK_CONTROL}" <<< "${body}"
+}
+_scenario_stub_control_patch() {
+    require_ci_image _scenario_stub_control_patch
+    local filter="$1" body; shift
+    [[ -n "${SCENARIO_SLACK_CONTROL:-}" ]] || fail 'call slack_stub_controls first'
+    _scenario_scratch_file "${SCENARIO_SLACK_CONTROL}"
+    body="$(jq -ce "$@" "del(.socket_closes,.pushes) | ${filter}" "${SCENARIO_SLACK_CONTROL}")" || fail 'invalid Slack control arguments'
+    _scenario_stub_control_http "${body}"
+    write_file "${SCENARIO_SLACK_CONTROL}" <<< "${body}"
+}
+slack_stub_identity() {
+    require_ci_image slack_stub_identity
+    case "$2" in user_id|bot_id|team_id|app_id) ;; *) fail 'unknown Slack identity field' ;; esac
+    [[ -n "${SCENARIO_SLACK_CONTROL:-}" ]] || fail 'call slack_stub_controls first'
+    _scenario_scratch_file "${SCENARIO_SLACK_CONTROL}"
+    jq -er --arg l "$1" --arg field "$2" \
+        '[.tokens[] | select(.label==$l) | .[$field]] | unique | if length==1 and (.[0]|type)=="string" and (.[0]|length)>0 then .[0] else error("identity must be explicit and unambiguous") end' \
+        "${SCENARIO_SLACK_CONTROL}" || fail 'control has no unambiguous explicit identity'
+}
+_scenario_stub_special_push() {
+    require_ci_image _scenario_stub_special_push
+    _scenario_check_stub_url push
+    local answer
+    answer="$(curl -fsS --max-time "${SCENARIO_SLACK_PUSH_S}" -H 'Content-Type: application/json' \
+        --data-binary @- "${SCENARIO_SLACK_STUB_URL}/_push" 2>/dev/null <<< "$1")" || fail 'Slack stub push refused or timed out'
+    jq -er 'select(.ok == true) | .envelope_id | select(type=="string" and length>0)' <<< "${answer}" || fail 'push returned no envelope ID'
+}
+slack_stub_redeliver() {
+    require_ci_image slack_stub_redeliver
+    local body
+    body="$(jq -cn --arg l "$1" --arg id "$2" --arg n "${3:-}" --arg reason "${4:-timeout}" \
+        '{label:$l,redeliver:({envelope_id:$id,retry_reason:$reason} + (if $n=="" then {} else {retry_attempt:($n|tonumber)} end))}')" || fail 'invalid redelivery'
+    _scenario_stub_special_push "${body}"
+}
+slack_stub_push_installation() {
+    require_ci_image slack_stub_push_installation
+    local team app user body
+    team="$(slack_stub_identity "$3" team_id)" || exit 1
+    app="$(slack_stub_identity "$3" app_id)" || exit 1
+    user="$(slack_stub_identity "$3" user_id)" || exit 1
+    body="$(jq -cn --arg l "$1" --argjson e "$2" --arg team "${team}" --arg app "${app}" --arg user "${user}" \
+        '{label:$l,event:$e,installation:{team_id:$team,api_app_id:$app,authorizations:[{team_id:$team,user_id:$user,is_bot:true,is_enterprise_install:false}]}}')" || fail 'invalid installation push'
+    _scenario_stub_special_push "${body}"
+}
+slack_stub_close_socket() {
+    require_ci_image slack_stub_close_socket
+    _scenario_stub_control_patch '.socket_closes=[{label:$l,refuse_connections:$n}]' --arg l "$1" --argjson n "${2:-0}"
+}
+slack_stub_inventory_body() {
+    require_ci_image slack_stub_inventory_body
+    local next="$1"; shift
+    # Slack's own type fields: CSCB takes a channel's type only from
+    # is_channel/is_group beside is_im/is_mpim false, else eligibility is missing.
+    jq -cn --arg next "${next}" --args '
+      {ok:true,channels:[$ARGS.positional[] | split("/") as $p |
+        {id:$p[0],is_channel:($p[1]!="private"),is_group:($p[1]=="private"),is_im:false,is_mpim:false,
+         is_private:($p[1]=="private"),is_ext_shared:($p[2]=="external")} +
+        (if $p[3]=="omit" then {} else {is_member:($p[3]!="nonmember")} end)],response_metadata:{next_cursor:$next}}' "$@"
+}
+slack_stub_inventory_page() {
+    require_ci_image slack_stub_inventory_page
+    local label="$1" cursor="$2" body; shift 2
+    body="$(slack_stub_inventory_body "$@")" || fail 'invalid inventory page'
+    # A large page (test-45's 1,100 channels) exceeds one argv string's kernel
+    # limit, so jq reads it from a file descriptor, not --argjson.
+    _scenario_stub_control_patch 'if any(.tokens[]; .label==$l) then (.tokens[] | select(.label==$l) | .inventory_pages[$c])=$page[0] else error("unknown label") end' \
+        --arg l "${label}" --arg c "${cursor}" --slurpfile page <(printf '%s\n' "${body}")
+}
+slack_stub_inventory_pages() {
+    require_ci_image slack_stub_inventory_pages
+    local label="$1" cursor="$2" final="$3" limit="$4" key next part=1 pages='{}' body
+    shift 4
+    [[ "${limit}" =~ ^[1-9][0-9]*$ ]] || fail 'inventory page size must be a positive integer'
+    key="${cursor}"
+    while :; do
+        next="${final}"
+        (( $# <= limit )) || next="${cursor:-first}-page-$((part + 1))"
+        body="$(slack_stub_inventory_body "${next}" "${@:1:limit}")" || fail 'invalid inventory page'
+        pages="$(jq -c --arg k "${key}" --slurpfile page <(printf '%s\n' "${body}") '.[$k]=$page[0]' <<< "${pages}")" \
+            || fail 'cannot collect inventory pages'
+        (( $# > limit )) || break
+        shift "${limit}"
+        part=$((part + 1))
+        key="${next}"
+    done
+    # One control replacement installs the whole chain.
+    _scenario_stub_control_patch 'if any(.tokens[]; .label==$l) then (.tokens[] | select(.label==$l) | .inventory_pages) += $pages[0] else error("unknown label") end' \
+        --arg l "${label}" --slurpfile pages <(printf '%s\n' "${pages}")
+}
+slack_stub_inventory_clear() {
+    require_ci_image slack_stub_inventory_clear
+    _scenario_stub_control_patch 'if any(.tokens[]; .label==$l) then (.tokens[] | select(.label==$l) | .inventory_pages)={} else error("unknown label") end' --arg l "$1"
+}
+# slack_stub_inventory_stage <label> <page-size|memberships> <channel>...
+# Replaces only the label's inventory, as raw pages from the first cursor or
+# as memberships, without a control replacement: every fault counter and
+# refusal count stays armed. Prints the stub's inventory record seq. The
+# private snapshot takes the same value, so a later replacement keeps it.
+slack_stub_inventory_stage() {
+    require_ci_image slack_stub_inventory_stage
+    local label="$1" limit="$2" field=inventory_pages value='{}' key='' next part=1 page request answer body
+    shift 2
+    [[ -n "${SCENARIO_SLACK_CONTROL:-}" ]] || fail 'call slack_stub_controls first'
+    _scenario_scratch_file "${SCENARIO_SLACK_CONTROL}"
+    _scenario_check_stub_url inventory
+    if [[ "${limit}" == memberships ]]; then
+        field=memberships
+        value="$(jq -cn '$ARGS.positional' --args "$@")" || fail 'invalid memberships'
+    else
+        [[ "${limit}" =~ ^[1-9][0-9]*$ ]] || fail 'inventory page size must be a positive integer'
+        while :; do
+            next=''
+            (( $# <= limit )) || next="first-page-$((part + 1))"
+            page="$(slack_stub_inventory_body "${next}" "${@:1:limit}")" || fail 'invalid inventory page'
+            value="$(jq -c --arg k "${key}" --slurpfile page <(printf '%s\n' "${page}") '.[$k]=$page[0]' <<< "${value}")" \
+                || fail 'cannot collect inventory pages'
+            (( $# > limit )) || break
+            shift "${limit}"
+            part=$((part + 1))
+            key="${next}"
+        done
+    fi
+    request="$(jq -cn --arg l "${label}" --arg f "${field}" --slurpfile v <(printf '%s\n' "${value}") '{label:$l,($f):$v[0]}')" \
+        || fail 'cannot build inventory stage'
+    answer="$(curl -fsS --max-time "${SCENARIO_SLACK_PUSH_S}" -H 'Content-Type: application/json' \
+        --data-binary @- "${SCENARIO_SLACK_STUB_URL}/_inventory" 2>/dev/null <<< "${request}")" || fail 'Slack stub refused inventory stage'
+    body="$(jq -ce --arg l "${label}" --arg f "${field}" --slurpfile v <(printf '%s\n' "${value}") \
+        'if any(.tokens[]; .label==$l) then (.tokens[] | select(.label==$l) | .[$f])=$v[0] else error("unknown label") end' \
+        "${SCENARIO_SLACK_CONTROL}")" || fail 'cannot update Slack control snapshot'
+    write_file "${SCENARIO_SLACK_CONTROL}" <<< "${body}"
+    jq -er 'select(.ok == true) | .seq | select(type=="number")' <<< "${answer}" || fail 'inventory stage returned no record seq'
+}
+slack_stub_fault() {
+    require_ci_image slack_stub_fault
+    local label="$1" method="$2" outcome="$3" fault; shift 3
+    fault="$(jq -cen --arg method "${method}" --arg outcome "${outcome}" --args '
+      reduce $ARGS.positional[] as $arg ({method:$method,outcome:$outcome};
+        ($arg|index("=")) as $i | if $i==null then error("expected key=value") else
+        ($arg[0:$i]) as $k | ($arg[$i+1:]) as $v |
+        if (["cursor","channel","user","thread_ts","error"]|index($k))!=null then .[$k]=$v
+        elif (["after","times","retry_after","delay_ms"]|index($k))!=null then .[$k]=($v|tonumber)
+        elif $k=="performed" or $k=="body" then .[$k]=($v|fromjson)
+        else error("unknown fault field") end end)' "$@")" || fail 'invalid fault fields'
+    _scenario_stub_control_patch 'if any(.tokens[]; .label==$l) then (.tokens[] | select(.label==$l) | .faults) += [$fault] else error("unknown label") end' \
+        --arg l "${label}" --argjson fault "${fault}"
+}
+slack_stub_inventory_fault() {
+    require_ci_image slack_stub_inventory_fault
+    local l="$1" c="$2" o="$3"
+    shift 3
+    slack_stub_fault "${l}" users.conversations "${o}" "cursor=${c}" "$@"
+}
+slack_stub_post_lost() {
+    require_ci_image slack_stub_post_lost
+    local l="$1" c="$2" p="$3"
+    shift 3
+    slack_stub_fault "${l}" chat.postMessage lost "channel=${c}" "performed=${p}" "$@"
+}
+slack_stub_post_fail() {
+    require_ci_image slack_stub_post_fail
+    local l="$1" c="$2" o="$3"
+    shift 3
+    [[ "${o}" == error || "${o}" == rate_limit ]] || fail 'expected error or rate_limit'
+    slack_stub_fault "${l}" chat.postMessage "${o}" "channel=${c}" "$@"
+}
+slack_stub_history_fault() {
+    require_ci_image slack_stub_history_fault
+    local l="$1" m="$2" o="$3"
+    shift 3
+    [[ "${m}" == history || "${m}" == replies ]] || fail 'expected history or replies'
+    slack_stub_fault "${l}" "conversations.${m}" "${o}" "$@"
+}
+slack_stub_faults_clear() {
+    require_ci_image slack_stub_faults_clear
+    _scenario_stub_control_patch 'if any(.tokens[]; .label==$l) then (.tokens[] | select(.label==$l) | .faults)=[] else error("unknown label") end' --arg l "$1"
+}
+slack_stub_history() {
+    require_ci_image slack_stub_history
+    _scenario_stub_control_patch '.history.page_size=$n' --argjson n "$1"
+}
+slack_stub_history_seed() {
+    require_ci_image slack_stub_history_seed
+    _scenario_stub_control_patch '.history.messages += [{channel:$c,message:$message}]' --arg c "$1" --argjson message "$2"
+}
+
+# JSONL readers ignore only a partial last line. Missing evidence for an ACK
+# assertion is a failure, never a successful zero observation.
+_scenario_complete_jsonl() {
+    require_ci_image _scenario_complete_jsonl
+    _scenario_scratch_file "$1"
+    [[ -e "$1" ]] || return 0
+    python3 - "$1" <<'PY'
+import json, sys
+with open(sys.argv[1]) as stream:
+    for line in stream:
+        if not line.endswith("\n"):
+            break
+        try:
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise ValueError()
+        except ValueError:
+            sys.exit("malformed complete evidence record")
+        print(line, end="")
+PY
+}
+slack_stub_records() {
+    require_ci_image slack_stub_records
+    local event="$1"; shift
+    [[ -n "${SCENARIO_SLACK_RECORD:-}" ]] || fail 'SCENARIO_SLACK_RECORD is unset'
+    _scenario_complete_jsonl "${SCENARIO_SLACK_RECORD}" | jq -c --arg event "${event}" --args '
+      select(.event==$event) | . as $row | select(all($ARGS.positional[];
+        index("=") as $i | if $i==null then error("expected field=value") else
+        .[0:$i] as $k | .[$i+1:] as $v | ($row[$k]!=null and ($row[$k]|tostring)==$v) end))' "$@"
+}
+slack_stub_record_count() {
+    require_ci_image slack_stub_record_count
+    slack_stub_records "$@" | jq -s 'length'
+}
+slack_stub_record_field() {
+    require_ci_image slack_stub_record_field
+    local field="$1"
+    shift
+    slack_stub_records "$@" | jq -sr --arg field "${field}" 'last | .[$field] // empty'
+}
+slack_stub_control_fired() {
+    require_ci_image slack_stub_control_fired
+    case "$1" in fault|fault-settled|redelivery|push-installation|socket-close|socket-close-missed|connection-refused) ;; *) fail 'not a control evidence event' ;; esac
+    local lines
+    lines="$(slack_stub_records "$@")" || fail 'cannot read control evidence'
+    [[ -n "${lines}" ]] || fail 'the requested control has no fired record'
+    printf '%s\n' "${lines}"
+}
+slack_ack_count() {
+    require_ci_image slack_ack_count
+    [[ "$(slack_stub_record_count push "envelope_id=$1")" == 1 ]] || fail 'ACK query needs exactly one recorded push'
+    slack_stub_record_count ws-message "envelope_id=$1"
+}
+_scenario_ack_bound() {
+    [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail 'ACK bound must be nonnegative seconds'
+    python3 - "$1" <<'PY'
+import math,sys
+value = float(sys.argv[1]) * 1000
+if not math.isfinite(value): sys.exit("invalid ACK bound")
+print(math.ceil(value))
+PY
+}
+slack_wait_one_ack() {
+    require_ci_image slack_wait_one_ack
+    local bound deadline count
+    bound="$(_scenario_ack_bound "${2:-${RECORD_WAIT_S:-${SCENARIO_SLACK_PUSH_S}}}")" || exit 1
+    deadline=$(( $(_scenario_now_ms) + bound ))
+    while :; do
+        count="$(slack_ack_count "$1")" || exit 1
+        (( count <= 1 )) || fail 'more than one ACK for the envelope'
+        (( count != 1 )) || return 0
+        (( $(_scenario_now_ms) < deadline )) || fail 'no ACK within bound'
+        sleep "${SCENARIO_POLL_S}"
+    done
+}
+slack_expect_no_ack() {
+    require_ci_image slack_expect_no_ack
+    local bound deadline count
+    bound="$(_scenario_ack_bound "$2")" || exit 1
+    deadline=$(( $(_scenario_now_ms) + bound ))
+    while :; do
+        count="$(slack_ack_count "$1")" || exit 1
+        (( count == 0 )) || fail 'unexpected ACK for envelope'
+        (( $(_scenario_now_ms) < deadline )) || return 0
+        sleep "${SCENARIO_POLL_S}"
+    done
+}
+slack_envelope_times() {
+    require_ci_image slack_envelope_times
+    [[ "$(slack_stub_record_count push "envelope_id=$1")" == 1 ]] || fail 'timing query needs exactly one push'
+    _scenario_complete_jsonl "${SCENARIO_SLACK_RECORD}" | jq -cs --arg id "$1" '
+      [ .[] | select(.envelope_id==$id)] as $rows |
+      {envelope_id:$id,push:([$rows[]|select(.event=="push")|{sent_mono_ms,connection_id}]|first),
+       acks:[$rows[]|select(.event=="ws-message")|{ack_mono_ms,connection_id}]} |
+      if (.push.sent_mono_ms|type)!="number" or any(.acks[]; (.ack_mono_ms|type)!="number") then error("missing monotonic evidence") else . end'
+}
+
+scenario_attempt_id() {
+    require_ci_image scenario_attempt_id
+    [[ -n "${1:-}" ]] || fail 'attempt name is required'
+    printf '%s:%s\n' "${TEST_NAME}" "$1"
+}
+attempt_args() {
+    require_ci_image attempt_args
+    jq -cn --arg id "$1" --arg c "$2" --arg d "$3" --arg intent "${4:-assignment}" \
+        '{channel:$c,delivery:$d,attempt_id:$id,intent:$intent}'
+}
+_scenario_session_file() {
+    require_ci_image _scenario_session_file
+    local stub key path
+    stub="$(_scenario_stub_dir session-record)" || exit 1
+    key="$(_scenario_stub_key session-record "$1")" || exit 1
+    case "$2" in requests|results|sessions) ;; *) fail 'unknown session record kind' ;; esac
+    path="${stub}/stub-mcp-$2.${key}${SCENARIO_STUB_RECORD_SUFFIX}"
+    _scenario_scratch_file "${path}"
+    printf '%s\n' "${path}"
+}
+_scenario_session_submit() {
+    require_ci_image _scenario_session_submit
+    local dir="$1" grouped="$2" file id lines count; shift 2
+    (( $# > 0 && $# % 3 == 0 )) || fail 'session submission needs tool/args/keep-or-lose triples'
+    file="$(_scenario_session_file "${dir}" requests)" || exit 1
+    id="${SCENARIO_TAG}-${BASHPID}-${EPOCHREALTIME//[.,]/}-${RANDOM}"
+    lines="$(jq -crn --arg id "${id}" --argjson grouped "${grouped}" --args '
+      $ARGS.positional as $a | range(0; $a|length; 3) as $i |
+      ($a[$i+1]|fromjson) as $args |
+      if ($args|type)!="object" or ($a[$i]|test("^[A-Za-z0-9_.-]{1,128}$")|not) or
+         ($a[$i+2]!="keep" and $a[$i+2]!="lose") then error("invalid call") else
+      {id:($id+"-"+($i/3|tostring)),method:"tools/call",tool:$a[$i],arguments:$args} +
+      (if $grouped then {group:$id} else {} end) +
+      (if $a[$i+2]=="lose" then {lose_response:true} else {} end) end' "$@" | jq -ca '.')" || fail 'invalid session call group'
+    # ASCII JSON and the whole group plus final newline fit one printf write.
+    (( ${#lines} < SCENARIO_STUB_REQUEST_MAX_BYTES )) || fail 'session group exceeds single-write bound'
+    if [[ -f "${file}" ]]; then
+        count="$(jq -sr --arg id "${id}" '[.[]|select(.id|startswith($id+"-"))]|length' "${file}")" || fail 'cannot read prior requests'
+        (( count == 0 )) || fail 'duplicate request identifier'
+    fi
+    printf '%s\n' "${lines}" >> "${file}" || fail 'cannot append session group'
+    jq -r '.id' <<< "${lines}"
+}
+stub_session_submit() {
+    require_ci_image stub_session_submit
+    _scenario_session_submit "$1" false "$2" "$3" "${4:-keep}"
+}
+stub_session_group() {
+    require_ci_image stub_session_group
+    local dir="$1"; shift
+    _scenario_session_submit "${dir}" true "$@"
+}
+stub_session_result() {
+    require_ci_image stub_session_result
+    local file bound deadline found
+    file="$(_scenario_session_file "$1" results)" || exit 1
+    bound="$(_scenario_ack_bound "${3:-${SCENARIO_STUB_CALL_S}}")" || exit 1
+    deadline=$(( $(_scenario_now_ms) + bound ))
+    while :; do
+        found="$(_scenario_complete_jsonl "${file}" | jq -cs --arg id "$2" \
+            '[.[]|select(.id==$id)] | if length>1 then error("duplicate results") elif length==1 then .[0] else empty end')" || fail 'cannot read call result'
+        if [[ -n "${found}" ]]; then printf '%s\n' "${found}"; return 0; fi
+        (( $(_scenario_now_ms) < deadline )) || fail 'no session result within bound'
+        sleep "${SCENARIO_POLL_S}"
+    done
+}
+stub_session_call_lost() {
+    require_ci_image stub_session_call_lost
+    local id line
+    id="$(stub_session_submit "$1" "$2" "$3" lose)" || exit 1
+    line="$(stub_session_result "$1" "${id}")" || exit 1
+    jq -e '.status=="lost" and .text=="" and .isError==true and (.session_id|type)=="string"' <<< "${line}" >/dev/null \
+        || fail 'the response was not demonstrably lost after HTTP headers'
+    printf '%s\n' "${line}"
+}
+stub_session_sessions() {
+    require_ci_image stub_session_sessions
+    local file
+    file="$(_scenario_session_file "$1" sessions)" || exit 1
+    _scenario_complete_jsonl "${file}"
+}
+scenario_attempt_call() {
+    require_ci_image scenario_attempt_call
+    local tool
+    tool="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" SET_CHANNEL_DELIVERY_TOOL)" || fail 'cannot print tool name'
+    case "${3:-keep}" in
+        keep) stub_session_call "$1" "${tool}" "$2" ;;
+        lose) stub_session_call_lost "$1" "${tool}" "$2" ;;
+        *) fail 'attempt call expects keep or lose' ;;
+    esac
+}
+scenario_attempt_group() {
+    require_ci_image scenario_attempt_group
+    local dir="$1" tool args calls=(); shift
+    tool="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" SET_CHANNEL_DELIVERY_TOOL)" || fail 'cannot print tool name'
+    for args in "$@"; do calls+=("${tool}" "${args}" keep); done
+    stub_session_group "${dir}" "${calls[@]}"
+}
+expect_attempt() {
+    require_ci_image expect_attempt
+    require_scenario_state expect_attempt
+    local step="$1" dir="$2" args="$3" key="$4" effective="$5" history="${6:-new}" want_error="${7:-false}" line expected
+    line="$(scenario_attempt_call "${dir}" "${args}")" || exit 1
+    jq -e 'has("error")|not' <<< "${line}" >/dev/null || fail "${step}: no tool result"
+    expected="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" channelDeliveryAttemptResultText \
+        "${SLACK_STATE_DIR}/config.json" "${SLACK_STATE_DIR}/config.json.last-applied" "${key}" \
+        "$(jq -r .channel <<< "${args}")" "$(jq -r .delivery <<< "${args}")" "$(jq -r .attempt_id <<< "${args}")" "${history}" "${effective}")" \
+        || fail "${step}: cannot read durable attempt result"
+    [[ "$(jq -r .isError <<< "${line}")" == "${want_error}" && "$(jq -r .text <<< "${line}")" == "${expected}" ]] \
+        || fail "${step}: tool result differs from retained outcome/current facts"
+}
+_scenario_shared_value() {
+    require_ci_image _scenario_shared_value
+    require_scenario_state shared-value
+    local entry="$1"; shift
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" "${entry}" \
+        "${SLACK_STATE_DIR}/config.json" "${SLACK_STATE_DIR}/config.json.last-applied" "$@"
+}
+shared_channel_saved() {
+    require_ci_image shared_channel_saved
+    _scenario_shared_value sharedChannelSaved "$@"
+}
+shared_channel_effective() {
+    require_ci_image shared_channel_effective
+    _scenario_shared_value sharedChannelEffective "$@"
+}
+shared_thread_since() {
+    require_ci_image shared_thread_since
+    _scenario_shared_value sharedThreadSince "$@"
+}
+shared_thread_created() {
+    require_ci_image shared_thread_created
+    _scenario_shared_value sharedThreadCreated "$@"
+}
+shared_thread_file() {
+    require_ci_image shared_thread_file
+    require_scenario_state shared_thread_file
+    [[ "$1" =~ ^[a-z0-9_]+$ ]] || fail 'invalid persona key'
+    local file="${SLACK_STATE_DIR}/threads/$1.jsonl"
+    _scenario_scratch_file "${file}"
+    if [[ -f "${file}" ]]; then printf 'true\n'; else printf 'false\n'; fi
+}
+shared_attempt_order() {
+    require_ci_image shared_attempt_order
+    _scenario_shared_value sharedAttemptOrder "$@"
+}
+shared_attempt_applications() {
+    require_ci_image shared_attempt_applications
+    shared_attempt_order "$@" | jq -s 'length'
+}
+shared_queue_items() {
+    require_ci_image shared_queue_items
+    require_scenario_state shared_queue_items
+    [[ "$1" =~ ^[a-z0-9_]+$ ]] || fail 'invalid persona key'
+    local file="${SLACK_STATE_DIR}/queue/$1.jsonl"
+    _scenario_scratch_file "${file}"
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" acceptedQueueItems "${file}"
+}
+shared_queued_count() {
+    require_ci_image shared_queued_count
+    shared_queue_items "$1" | jq -s --arg c "$2" --arg ts "$3" --arg via "${4:-}" \
+        '[.[]|select(.channel==$c and .ts==$ts and ($via=="" or .via==$via))]|length'
 }

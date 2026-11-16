@@ -27,8 +27,10 @@ const PY_SPACE = /^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2
 const IGNORABLE = /^\p{Default_Ignorable_Code_Point}$/u
 const WORD = /^[\p{L}\p{N}_]$/u
 const OPENERS = '<\uff1c\ufe64\u2039\u2329\u27e8\u3008\u276e'
+const ANY_OPENER = /[<\uff1c\ufe64\u2039\u2329\u27e8\u3008\u276e]/
+/** Each unpaired surrogate becomes U+FFFD; paired ones stay. */
 export function replaceLoneSurrogates(value: string): string {
-  return Array.from(value, c => c.length === 1 && c.charCodeAt(0) >= 0xd800 && c.charCodeAt(0) <= 0xdfff ? '\ufffd' : c).join('')
+  return (value as string & { toWellFormed(): string }).toWellFormed()
 }
 export function escapeAttr(value: unknown): string {
   return replaceLoneSurrogates(String(value)).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -39,8 +41,10 @@ export function escapeBody(value: string): string {
   // LF and composes U+0301/U+0308 with their preceding letters. Escape
   // those observed characters in the body before fixing parts;
   // receipt matching stays exact, with no normalization in the matcher.
-  const chars = Array.from(replaceLoneSurrogates(value).replace(/\r\n?/g, '\n').replace(/\t/g, '    ').replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, ''))
-  let out = ''
+  const cleaned = replaceLoneSurrogates(value).replace(/\r\n?/g, '\n').replace(/\t/g, '    ').replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, '')
+  // With no opener, the walk below copies every character unchanged.
+  const chars = ANY_OPENER.test(cleaned) ? Array.from(cleaned) : []
+  let out = chars.length ? '' : cleaned
   for (let i = 0; i < chars.length; i++) {
     const c = chars[i]!
     if (!OPENERS.includes(c)) { out += c; continue }
@@ -60,7 +64,8 @@ export function escapeBody(value: string): string {
   }
   return out.replace(/[\u0301\u0308\u2028]/g, c => `&#${c.codePointAt(0)};`)
 }
-export function tagByteLength(value: string): number { return new TextEncoder().encode(value).byteLength }
+/** UTF-8 bytes, counting an unpaired surrogate as its U+FFFD replacement's three, as `TextEncoder` encodes it. */
+export function tagByteLength(value: string): number { return Buffer.byteLength(value, 'utf8') }
 /** The typed part limit for the host the agent runs on, which is the server's own host. */
 export function tagMaxBytesFor(platform: string): number { return platform === 'darwin' ? TAG_MAX_BYTES_MACOS : TAG_MAX_BYTES }
 function render(attrs: TagAttributes, body: string, part?: string): string {
@@ -90,9 +95,15 @@ function boundedAttrs(input: TagAttributes, maxBytes: number, part?: string): Ta
   if (tagByteLength(render(attrs, '', part)) > allowance) throw new Error('Tag attributes exceed the minimum body allowance')
   return attrs
 }
+/** `tagByteLength` of one code point: an unpaired surrogate's is U+FFFD's. */
+function codePointBytes(codePoint: number): number { return codePoint < 0x80 ? 1 : codePoint < 0x800 ? 2 : codePoint < 0x10000 ? 3 : 4 }
 function cutBody(body: string, budget: number): [string, string] {
   let used = 0, end = 0
-  for (const c of body) { const size = tagByteLength(c); if (used + size > budget) break; used += size; end += c.length }
+  while (end < body.length) {
+    const codePoint = body.codePointAt(end)!, size = codePointBytes(codePoint)
+    if (used + size > budget) break
+    used += size; end += codePoint > 0xffff ? 2 : 1
+  }
   if (end === body.length) return [body, '']
   const prefix = body.slice(0, end)
   const lf = prefix.lastIndexOf('\n')

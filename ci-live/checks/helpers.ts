@@ -15,7 +15,7 @@
 
 // The two src/ modules below import nothing, so the runner loads no Slack SDK
 // or agent-director client on the host; no other src/ module is imported here.
-import { DESTRUCTIVE_PREFIX, queueRetentionClause, REMOVED_RETIRED_CLAUSE } from '../../src/reload-preview-clauses.ts'
+import { DESTRUCTIVE_PREFIX, queueRetentionClause, REMOVED_RETIRED_CLAUSE, REVIEW_OMISSION_CLAUSE, REVIEW_FUTURE_CLAUSE, REVIEW_RESET_CLAUSE, REVIEW_RETENTION_CLAUSE } from '../../src/reload-preview-clauses.ts'
 import { startupSummaryEnding, type StartupSummaryEndingCounts } from '../../src/startup-summary-ending.ts'
 import { CONTAINER_STATE_DIR } from '../lib/live-config.ts'
 import { isFrom, messageText, type HumanSession, type SlackMessage } from '../lib/human-session.ts'
@@ -115,6 +115,9 @@ export interface ToolCall {
   threadTs: boolean
   /** Its `delivery` input (set_channel_delivery), or null. */
   delivery: string | null
+  /** Caller-retained logical identity and explicit intent; absent/wrong type stays null. */
+  attemptId: string | null
+  intent: string | null
   /** `ok` (the server returned no error), `error`, or `none` (no result in the transcript yet). */
   outcome: 'ok' | 'error' | 'none'
   /** A refused call's tool error text, or null (an accepted call's content is never carried). */
@@ -144,6 +147,8 @@ export function toolCallsScript(letter: PersonaLetter, tool: string): string {
     '    ts: (if $in.message_id == null then null else ($in.message_id | tostring) end),',
     '    threadTs: ((($in.thread_ts // "") | tostring) != ""),',
     '    delivery: (if $in.delivery == null then null else ($in.delivery | tostring) end),',
+    '    attemptId: (if ($in.attempt_id | type) == "string" then $in.attempt_id else null end),',
+    '    intent: (if ($in.intent | type) == "string" then $in.intent else null end),',
     '    outcome: $outcome,',
     '    error: (if $outcome == "error" then ($r.content | if type == "string" then . elif type == "array" then ([ .[] | .text? // empty ] | join(" ")) else "" end) else null end) }',
   ].join('\n')
@@ -165,6 +170,8 @@ function asToolCall(value: unknown): ToolCall | null {
     ts: typeof v.ts === 'string' ? v.ts : null,
     threadTs: v.threadTs === true,
     delivery: typeof v.delivery === 'string' ? v.delivery : null,
+    attemptId: typeof v.attemptId === 'string' ? v.attemptId : null,
+    intent: typeof v.intent === 'string' ? v.intent : null,
     outcome,
     error: outcome === 'error' && typeof v.error === 'string' ? v.error : null,
   }
@@ -359,8 +366,13 @@ export async function waitFile(ctx: CheckContext, path: string, timeoutMs: numbe
   return (await waitFor(async () => fileExists(ctx, path), { timeoutMs, intervalMs: POLL_MS, clock: ctx.clock })) === true
 }
 
-export async function recorded(ctx: CheckContext): Promise<boolean> {
-  return (await run(ctx, 'cmp -s "$S/config.json" "$S/config.json.last-applied"')).code === 0
+/** Compare exact source evidence rather than the envelope's unrelated applied facts. */
+export function recordedCommand(sourceFile = '"$S/config.json"'): string {
+  return `jq -e --rawfile source ${sourceFile} '.sourceBytesBase64 == ($source | @base64)' "$S/config.json.last-applied" >/dev/null`
+}
+
+export async function recorded(ctx: CheckContext, sourceFile?: string): Promise<boolean> {
+  return (await run(ctx, recordedCommand(sourceFile))).code === 0
 }
 
 export async function serverPid(ctx: CheckContext): Promise<string> {
@@ -599,9 +611,47 @@ export function checkPreview(f: Findings, pending: Pending, expect: string[]): v
   f.expect(pending.header === PENDING_HEADER, 'config.json.pending has another first line')
   f.expect(/^fingerprint: sha256:[0-9a-f]{64}$/.test(pending.fingerprint), 'config.json.pending has no sha256 fingerprint line')
   f.expect(
-    JSON.stringify(pending.preview) === JSON.stringify(expect),
+    JSON.stringify(pending.preview.slice(0, expect.length)) === JSON.stringify(expect),
     `the preview is not as expected (got ${pending.preview.length} line(s): ${pending.preview.join(' / ').slice(0, 400)})`,
   )
+  const review = pending.preview.slice(expect.length)
+  // These lifecycle checks assert their complete lifecycle prefix and the
+  // mandatory review grammar. Current projections are covered independently
+  // by reload-operator; the log check below requires every review line too.
+  f.expect(validReviewSuffix(review), 'the preview has missing or invalid operator/channel review evidence')
+}
+
+export function validReviewSuffix(lines: readonly string[]): boolean {
+  if (!/^Operator intent generation=\d+; declared assignments=0\. Requests change intent only; rename the reviewed pending file to the apply name to confirm\.$/.test(lines[0] ?? '')) return false
+  const choice = '(?:none|off|mentions|all|thread_hybrid)'
+  const effective = '(?:unlisted|off|mentions|all|thread_hybrid|unverified|(?:inactive|unverified) \\((?:[a-z-]+)\\))'
+  const linePattern = new RegExp(`^Channel persona=([a-z0-9_-]+) channel=([CG][A-Z0-9]+): (automatic|omitted|reset|edited|copied); saved=${choice}; reviewed=${choice}; saved order=(?:none|[0-9]+); membership=(?:eligible|ineligible|unresolved); effective now=${effective}; reviewed effective=${effective}\\.(.*)$`)
+  const endings = [REVIEW_OMISSION_CLAUSE, REVIEW_FUTURE_CLAUSE, REVIEW_RESET_CLAUSE, REVIEW_RETENTION_CLAUSE]
+  const seen = new Set<string>()
+  for (const line of lines.slice(1)) {
+    const match = linePattern.exec(line)
+    if (!match || seen.has(`${match[1]}/${match[2]}`)) return false
+    seen.add(`${match[1]}/${match[2]}`)
+    let tail = match[4]!
+    for (const clause of [' Deliberately overwrites the current saved choice.', ' Explicit same-value assignment.', ...endings.map(text => ` ${text}`), ' The saved mentions choice becomes eligible in strict; the saved value is unchanged.']) {
+      if (tail.startsWith(clause)) tail = tail.slice(clause.length)
+    }
+    if (tail !== '') return false
+  }
+  return true
+}
+
+/** Require the complete pending body in the log once, including all projections. */
+export function checkPreviewLog(f: Findings, pending: Pending | null, log: readonly string[]): void {
+  const prefix = '[slack] reload-preview: '
+  const actual = log.map((line, i) => {
+    const at = line.indexOf(prefix)
+    if (at < 0) return line
+    const text = line.slice(at + prefix.length)
+    const suffix = ` (preview in "${S}/config.json.pending")`
+    return i === 0 && text.endsWith(suffix) ? text.slice(0, -suffix.length) : text
+  })
+  f.expect(pending !== null && JSON.stringify(actual) === JSON.stringify(pending.preview), 'the reload-preview log does not exactly match the complete pending review')
 }
 
 // ---------------------------------------------------------------------------
@@ -722,7 +772,7 @@ export async function checkStartLines(
   const all = await since(ctx, m)
   const has = (s: string) => all.filter((l) => l.includes(s))
   if (fromRecord) {
-    f.expect(has(`[slack] Starting from the last-applied record "${S}/config.json.last-applied"`).length === 1, 'no single "Starting from the last-applied record" line')
+    f.expect(has(`[slack] Starting from the shared channel authority "${S}/config.json.last-applied" at revision `).length === 1, 'no single shared channel authority start line')
     f.expect(has('[slack] No last-applied record').length === 0, 'a "No last-applied record" line appeared')
   }
   letters.forEach((l, i) => {

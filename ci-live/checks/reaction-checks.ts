@@ -153,7 +153,7 @@ async function aPost(ctx: CheckContext, f: Findings, channel: string, text: stri
  * comparing the preview (recorded as evidence); waits for `reload-applied` or
  * `reload-noop`.
  */
-async function confirmLoose(ctx: CheckContext, f: Findings, what: string, script: string): Promise<boolean> {
+export async function confirmLoose(ctx: CheckContext, f: Findings, what: string, script: string): Promise<boolean> {
   const m = await mark(ctx)
   const edit = await guarded(ctx, script)
   if (!f.expect(edit.ok && edit.code === 0, `${what}: the guarded config edit did not run`)) return false
@@ -336,7 +336,7 @@ export const rn6: CheckDef<CheckContext> = {
     const copied = await guarded(ctx, `cp "$S/config.json" ${RN6_COPY}`)
     if (!f.expect(copied.ok && copied.code === 0, 'could not copy config.json')) return f.result()
     try {
-      const on = `jq ${q(switchOnFilter(ctx.ids))} "$S/config.json" > "$S/config.json.tmp" && mv "$S/config.json.tmp" "$S/config.json"`
+      const on = `jq ${q(switchOnFilter())} "$S/config.json" > "$S/config.json.tmp" && mv "$S/config.json.tmp" "$S/config.json"`
       if (!(await confirmLoose(ctx, f, 'fungible on', on))) return f.result()
       const m = await mark(ctx)
       const post = await aPost(ctx, f, ctx.ids.aHome, `${mention(ctx, 'a')} reply here with the word fungible.`, 'fungible')

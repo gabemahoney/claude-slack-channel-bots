@@ -40,7 +40,7 @@
  * , beside); its opening and cleared lines are what
  *   `destinationFailedCause` and `destinationClearedCause` build with the
  *   setting in force (`destinationSettingOf`), naming
- *   `invited.permission_prompts` beside `destination=<value>`, while each
+ *   `permission_prompts` beside `destination=<value>`, while each
  *   cause given the declarative setting is the declarative line unchanged
  * (beside).
  *
@@ -57,7 +57,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { DM_DESTINATION, type Persona } from '../src/config.ts'
-import { describeThrownValue } from '../src/persona-connection-errors.ts'
+import { describeThrownValue, describeThrownValueWithoutStack } from '../src/persona-connection-errors.ts'
 import {
   createPersonaDestinations,
   DM_OPEN_TIMEOUT_MS,
@@ -68,6 +68,7 @@ import {
 } from '../src/persona-destination.ts'
 import {
   MAX_HELD_NOTICES_PER_PERSONA,
+  buildHoldSettleFailedLine,
   createPersonaDestinationHold,
   destinationClearedCause,
   destinationFailedCause,
@@ -77,6 +78,7 @@ import {
   type PersonaDestinationHold,
 } from '../src/persona-destination-hold.ts'
 import { PERSONA_DESTINATION_FAILED, formatPersonaDiagnostic } from '../src/persona-diagnostics.ts'
+import { holdOwnPostReady, makeRecordingOwnPostObserver } from './test-helpers/own-post.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
@@ -129,6 +131,18 @@ let lookupThrows: 'getPersona' | 'clientFor' | undefined
 let lookupError: Error
 /** How many of the next resolver posts throw instead of settling (breaking its never-rejects contract). */
 let resolverThrows: number
+/** A logged line matching this throws after it is recorded (a failing post-success logger). */
+let logThrows: RegExp | undefined
+let ownPosts: ReturnType<typeof makeRecordingOwnPostObserver>
+/** Successful settlements, retaining the corresponding start's surface. */
+function observedPosts() {
+  return ownPosts.calls.flatMap(call => {
+    if (call.kind !== 'end' || call.answer.kind !== 'confirmed') return []
+    const start = ownPosts.calls.find(c => c.kind === 'start' && c.operation === call.operation)
+    if (!start || start.kind !== 'start') throw new Error('end without a matching start')
+    return [{ surface: start.surface, channel: call.answer.channel }]
+  })
+}
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'persona-destination-hold-'))
@@ -154,17 +168,20 @@ beforeEach(() => {
   // ticket URL: its line logs the message redacted, so no line may copy it.
   lookupError = new Error(`lookup failed (${sentinelInMessage('lookup')})`)
   resolverThrows = 0
+  logThrows = undefined
+  ownPosts = makeRecordingOwnPostObserver()
   const log = (line: string): void => {
     logs.push(line)
+    if (logThrows?.test(line)) throw new Error('injected log failure')
   }
-  const real = createPersonaDestinations({ log, clock, getPersonaConfig: () => inEffect })
+  const real = createPersonaDestinations({ log, clock, getPersonaConfig: () => inEffect, ownPosts: ownPosts.observer })
   const destinations: PersonaDestinations = {
-    post: (persona, c, message) => {
+    post: (persona, c, message, options) => {
       if (resolverThrows > 0) {
         resolverThrows -= 1
         return Promise.reject(new Error('resolver threw'))
       }
-      return real.post(persona, c, message)
+      return real.post(persona, c, message, options)
     },
     destinationOf: (p) => real.destinationOf(p),
     refusalOf: (p) => real.refusalOf(p),
@@ -770,10 +787,140 @@ describe('the gate (begin)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Confirmed successes survive the hold's own bookkeeping
+// ---------------------------------------------------------------------------
+
+describe('a confirmed post survives a failing settle', () => {
+  const CLEARED = /: cleared:/
+  // The line's description is the describer's, then the throw site's stack frames.
+  const settleFailed = (p: Persona) => logs.filter(l => l.startsWith(buildHoldSettleFailedLine(p.key, describeThrownValueWithoutStack(new Error('injected log failure')))))
+  /** C's one episode logged exactly one opening line, naming its not_in_channel failure at C0CEE0001. */
+  function expectOneOpening(): void {
+    expect(startLines()).toHaveLength(1)
+    expect(startLines()[0]).toContain(`persona-destination-failed: ${refOf(C)}: chat.postMessage failed for destination=C0CEE0001 with error not_in_channel`)
+  }
+
+  test('a gated success whose cleared line throws still resolves posted, releases the gate and drains the held notices once', async () => {
+    stub(C).script.post.push({ kind: 'platform', error: 'not_in_channel' })
+    await hold.begin(C.key)!.post(C, client(C), { text: 'prompt 1' })
+    await deliver(C, 'n1')
+    await clock.advance(4999)
+    logThrows = CLEARED
+    // The gate opens at the due time; the held notice's retry timer then finds it in flight.
+    const retry = hold.begin(C.key)
+    expect(retry).toBeUndefined()
+    await clock.advance(1)
+    expect(postedTexts(C)).toEqual(['prompt 1', 'n1'])
+    expect(settleFailed(C)).toHaveLength(1)
+    const gated = hold.begin(C.key)!
+    expect(await gated.post(C, client(C), { text: 'prompt 2' }, { surface: 'prompt' })).toMatchObject({ outcome: 'posted', channelId: 'C0CEE0001' })
+    await clock.flush()
+    expect(postedTexts(C)).toEqual(['prompt 1', 'n1', 'prompt 2'])
+    expect(hold.view(C.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+    expect(observedPosts()).toEqual([{ surface: 'notice', channel: 'C0CEE0001' }, { surface: 'prompt', channel: 'C0CEE0001' }])
+    expectOneOpening()
+    expect(clearedLines()).toHaveLength(1)
+    hold.begin(C.key)!.release()
+  })
+
+  test('a gated success during an open episode whose cleared line throws resolves posted, never rejects, and the next attempt is admitted', async () => {
+    stub(C).script.post.push({ kind: 'platform', error: 'not_in_channel' })
+    await hold.begin(C.key)!.post(C, client(C), { text: 'prompt 1' })
+    await clock.advance(5000)
+    logThrows = CLEARED
+    const result = await hold.begin(C.key)!.post(C, client(C), { text: 'prompt 2' }, { surface: 'prompt' })
+    expect(result).toMatchObject({ outcome: 'posted' })
+    expect(settleFailed(C)).toHaveLength(1)
+    expect(hold.view(C.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+    await deliver(C, 'after')
+    expect(postedTexts(C)).toEqual(['prompt 1', 'prompt 2', 'after'])
+    expect(observedPosts().map(p => p.surface)).toEqual(['prompt', 'notice'])
+    expectOneOpening()
+    expect(clearedLines()).toHaveLength(1)
+  })
+
+  test('a drained notice whose cleared line throws leaves the FIFO before settling: never reposted, and the notices behind it post in order', async () => {
+    stick(C, 'post', 'not_in_channel')
+    await deliver(C, 'n1')
+    await deliver(C, 'n2')
+    await deliver(C, 'n3')
+    expect(hold.view(C.key).heldNotices).toBe(3)
+    unstick(C, 'post')
+    logThrows = CLEARED
+    await clock.advance(5000)
+    await clock.flush()
+    // The first failed attempt, then each notice exactly once.
+    expect(postedTexts(C)).toEqual(['n1', 'n1', 'n2', 'n3'])
+    expect(settleFailed(C)).toHaveLength(1)
+    expect(hold.view(C.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+    await clock.advance(60_000)
+    expect(postedTexts(C)).toEqual(['n1', 'n1', 'n2', 'n3'])
+    expect(observedPosts()).toEqual([0, 1, 2].map(() => ({ surface: 'notice', channel: 'C0CEE0001' })))
+    expectOneOpening()
+    expect(clearedLines()).toHaveLength(1)
+  })
+
+  test('a delivered notice whose opening line throws is still held and retried on schedule, then posted once; failures record no successful post', async () => {
+    stub(C).script.post.push({ kind: 'platform', error: 'not_in_channel' })
+    logThrows = /persona-destination-failed:(?!.*: cleared:)/
+    await deliver(C, 'n1')
+    expect(settleFailed(C)).toHaveLength(1)
+    // Written once, then it threw: the settle-failure line follows it.
+    expectOneOpening()
+    expect(logs.indexOf(startLines()[0]!)).toBeLessThan(logs.indexOf(settleFailed(C)[0]!))
+    expect(hold.view(C.key)).toEqual({ held: true, heldNotices: 1, nextDueAt: 5000 })
+    expect(observedPosts()).toEqual([])
+    logThrows = undefined
+    await clock.advance(5000)
+    expect(postedTexts(C)).toEqual(['n1', 'n1'])
+    expect(posts(C).length).toBe(2)
+    expect(hold.view(C.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+    expect(observedPosts()).toEqual([{ surface: 'notice', channel: 'C0CEE0001' }])
+    expectOneOpening()
+    expect(clearedLines()).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Held-notice retries in flight, not up, no longer applied
 // ---------------------------------------------------------------------------
 
 describe('held-notice retries', () => {
+  test('a retry waiting on ready posts nothing, starts no duplicate attempt and arms no extra timer', async () => {
+    stub(C).script.post.push({ kind: 'platform', error: 'not_in_channel' })
+    await deliver(C, 'n1')
+    expect(startLines()).toHaveLength(1)
+    expect(clock.pendingCount()).toBe(1)
+    const ready = holdOwnPostReady()
+    ownPosts.enqueue({ ready: ready.ready })
+    await clock.runNext()
+    expect(ownPosts.calls.map(c => c.kind)).toEqual(['start', 'end', 'start'])
+    expect(postedTexts(C)).toEqual(['n1'])
+    expect(clock.pendingCount()).toBe(0)
+    const fired = clock.firedCount()
+    await clock.advance(3_600_000)
+    expect(hold.begin(C.key)).toBeUndefined()
+    expect(ownPosts.calls.map(c => c.kind)).toEqual(['start', 'end', 'start'])
+    expect(postedTexts(C)).toEqual(['n1'])
+    expect(clock.firedCount()).toBe(fired)
+    expect(clock.pendingCount()).toBe(0)
+    expect(hold.view(C.key).heldNotices).toBe(1)
+    ready.resolve()
+    await clock.flush()
+    expect(postedTexts(C)).toEqual(['n1', 'n1'])
+    expect(ownPosts.calls.map(c => c.kind)).toEqual(['start', 'end', 'start', 'end'])
+    expect(observedPosts()).toEqual([{ surface: 'notice', channel: 'C0CEE0001' }])
+    expect(hold.view(C.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+    expect(clearedLines()).toHaveLength(1)
+    expect(startLines()).toHaveLength(1)
+    expect(clock.pendingCount()).toBe(0)
+    await clock.advance(3_600_000)
+    expect(postedTexts(C)).toEqual(['n1', 'n1'])
+    expect(clock.firedCount()).toBe(fired)
+    expect(ownPosts.calls).toHaveLength(4)
+    hold.begin(C.key)!.release()
+  })
+
   test('while a held-notice retry is in flight nothing else is attempted for the persona, however long it takes', async () => {
     const retry = makeDeferredWebApiCall()
     stub(C).script.post.push({ kind: 'platform', error: 'not_in_channel' }, retry.outcome)
@@ -1164,10 +1311,6 @@ describe('isolation and secrecy', () => {
 // A fungible destination channel the app is not in
 // ---------------------------------------------------------------------------
 
-/** The configuration in effect in each mode, as `destinationSettingOf` reads it. */
-const FUNGIBLE_MODE: DestinationConfig = { allow_invited_channels: true }
-const DECLARATIVE_MODE: DestinationConfig = { allow_invited_channels: false }
-
 /** One `persona-destination-failed` line for `p`, with `cause`, as the hold formats it. */
 function destinationLine(p: Persona, cause: string): string {
   return formatPersonaDiagnostic({ class: PERSONA_DESTINATION_FAILED, name: p.name, key: p.key, index: p.index, cause })
@@ -1176,14 +1319,14 @@ function destinationLine(p: Persona, cause: string): string {
 describe('fungible mode: a destination channel the app is not in is held and retried', () => {
   /** The fungible destination channel, which the persona's app was never invited to. */
   const F_CHANNEL = 'C0EPH0001'
-  /** A persona loaded in fungible mode, its destination `invited.permission_prompts` = `F_CHANNEL`. */
+  /** A persona loaded in fungible mode, its destination `permission_prompts` = `F_CHANNEL`. */
   let F: Persona
 
   beforeEach(() => {
     const config = makeMultiPersonaConfig(
-      [{ name: 'Eph Fungible', dm: { enabled: false }, invited: { permission_prompts: F_CHANNEL } }],
+      [{ name: 'Eph Fungible', dm: { enabled: false }, permission_prompts: F_CHANNEL }],
       dir,
-      { allow_invited_channels: true },
+      { channel_mode: 'open' },
     )
     // The configuration in effect is the fungible one, so the resolver reads the fungible section.
     inEffect = config
@@ -1202,7 +1345,7 @@ describe('fungible mode: a destination channel the app is not in is held and ret
    * F, the step, the code, `destination=<value>` and the fungible setting.
    */
   function expectFungibleEpisodeLines(code: string): void {
-    const setting = destinationSettingOf(FUNGIBLE_MODE)
+    const setting = destinationSettingOf()
     const at: NamedDestination = { setting, destination: F_CHANNEL }
     const was: DestinationFailedAt = { step: 'chat.postMessage', code }
     const opening = destinationLine(F, destinationFailedCause(at, was))
@@ -1216,7 +1359,7 @@ describe('fungible mode: a destination channel the app is not in is held and ret
       expect(line).toContain('chat.postMessage')
       expect(line).toContain(code)
       expect(line).toContain(`destination=${F_CHANNEL}`)
-      expect(line).toContain(setting)
+      expect(destinationSettingOf()).toBe('permission_prompts')
     }
   }
 
@@ -1318,7 +1461,7 @@ describe('fungible mode: a destination channel the app is not in is held and ret
 
 describe('the causes given the declarative setting are the declarative lines', () => {
   test('each cause reproduces the declarative line byte for byte, and C\'s logged episode lines are those', async () => {
-    const at: NamedDestination = { setting: destinationSettingOf(DECLARATIVE_MODE), destination: 'C0CEE0001' }
+    const at: NamedDestination = { setting: destinationSettingOf(), destination: 'C0CEE0001' }
     const was: DestinationFailedAt = { step: 'chat.postMessage', code: 'not_in_channel' }
     const opening =
       'chat.postMessage failed for destination=C0CEE0001 with error not_in_channel; ' +

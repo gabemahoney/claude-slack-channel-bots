@@ -6,16 +6,18 @@
 #    is previewed: config.json.pending appears holding a preview that names
 #    that persona, each of its preview lines is logged as a `reload-preview`
 #    line, and for a full tick interval nothing is applied
-#    (config.json.last-applied keeps the start's bytes). Renaming the pending
+#    (config.json.last-applied keeps the start's authority). Renaming the pending
 #    file to config.json.apply confirms it: the server deletes .apply, logs
 #    `reload-applied`, the record now holds the configuration file's bytes,
 #    and the pending file is removed.
 # 2. Stale confirmation. A second edit is previewed and its pending file set
-#    aside; config.json is edited again, and once the server's fresh pending
-#    file for that newest edit is written, the second edit's preview is
-#    renamed into place as config.json.apply. The server logs
-#    `reload-stale-confirmation`, applies nothing, and keeps a pending file
-#    for the newest edit, which is then confirmed and applied.
+#    aside; config.json is edited again and, once that edit alone has a
+#    review, its request revised, so two later reviews are superseded and the
+#    review history no longer keeps the second edit's outcome. Once the
+#    server's fresh pending file for that newest edit is written, the second
+#    edit's preview is renamed into place as config.json.apply. The server
+#    logs `reload-stale-confirmation`, applies nothing, and keeps a pending
+#    file for the newest edit, which is then confirmed and applied.
 #
 # Lines are matched by class prefix, persona ref and distinguishing fragments
 # ( the current rule; lib/scenario.sh "Matchers"), each quoted from src/: the
@@ -65,7 +67,7 @@ BRAVO_DIR="$(make_workdir bravo)"
 # --- Expected text (fragments quoted from src/, see the header) -----------
 PREVIEW='[slack] reload-preview: '
 APPLIED_CLASS='[slack] reload-applied:'
-STALE_CLASS='[slack] reload-stale-confirmation:'
+OUTCOME_CLASS='[slack] reload-review-outcome:'
 NOTHING_PENDING='[slack] reload-nothing-pending:'
 
 # A persona's preview line (in the pending file; its log line is the same
@@ -99,8 +101,10 @@ BRAVO_DELIVERY_BODY="$(in_place_body "${BRAVO}" delivery)"
 ALPHA_UPDATED_CHANNELS="$(updated_in_place_match "${ALPHA}" channels)"
 ALPHA_UPDATED_DELIVERY="$(updated_in_place_match "${ALPHA}" delivery)"
 BRAVO_UPDATED_DELIVERY="$(updated_in_place_match "${BRAVO}" delivery)"
-# The mismatch reason (src/reload-apply.ts renderStaleConfirmationLogLine).
-STALE_MATCH="$(matcher "${STALE_CLASS}" "\"${APPLY}\"" 'does not match')"
+# A review whose outcome is no longer kept matches no current review: its
+# confirmation gets the production stale-confirmation class, naming the apply file.
+STALE_CONFIRMATION_CLASS="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" RELOAD_STALE_CONFIRMATION)"
+STALE_MATCH="$(matcher "[slack] ${STALE_CONFIRMATION_CLASS}:" "\"${APPLY}\"")"
 APPLIED_1="$(applied_match in_place=1)"
 APPLIED_2="$(applied_match in_place=2)"
 HEADER_1="$(preview_logged_header in_place=1)"
@@ -158,6 +162,14 @@ fresh_pending_for_v3() {
         && [[ "$(fingerprint_of "${PENDING}")" != "${STALE_FINGERPRINT}" ]]
 }
 
+# The pending file holds a review other than <fingerprint>'s: the server has
+# durably superseded that review.
+review_replaced() {
+    local now
+    now="$(fingerprint_of "${PENDING}")"
+    [[ -n "${now}" && "${now}" != "$1" ]]
+}
+
 # True when every preview line of the pending-file copy <file> (line 4 on:
 # after the header, the fingerprint and a blank line) is in server.log as
 # `[slack] reload-preview: <line>` (the header's log line goes on with the
@@ -193,11 +205,15 @@ cp -- "${CONFIG}" "${V0_COPY}"
 # shellcheck disable=SC2119 # dry-run start: no --live
 start_server
 wait_for_file "${LAST}" "${TICK_WAIT_S}" "start never wrote config.json.last-applied"
-same_bytes "${CONFIG}" "${LAST}" || fail "start: config.json.last-applied does not hold config.json's bytes"
+configuration_record_matches "${CONFIG}" "${LAST}" applied || fail "start: config.json.last-applied does not hold config.json's bytes"
 [[ ! -e "${PENDING}" ]] || fail "start: config.json.pending exists with no edit made"
+
+AUTHORITY_V0="${SCENARIO_ROOT}/authority.v0.json"
+cp -- "${LAST}" "${AUTHORITY_V0}"
 
 # --- 1. Apply: preview, hold, confirm ------------------------------------
 emit_config "${V1_ALPHA}" all | write_config
+configuration_request edit1 request "${ALPHA}/${A2}/all"
 
 wait_for_file "${PENDING}" "${TICK_WAIT_S}" "edit 1: config.json.pending never appeared"
 wait_until 10 "edit 1: config.json.pending never named persona ${ALPHA}'s channels change" \
@@ -205,17 +221,18 @@ wait_until 10 "edit 1: config.json.pending never named persona ${ALPHA}'s channe
 check_pending_layout "edit 1" in_place=1
 wait_for_log "${HEADER_1}" 10 "edit 1: reload-preview header not logged"
 expect_preview_logged "edit 1" edit1
-same_bytes "${V0_COPY}" "${LAST}" || fail "edit 1: config.json.last-applied changed before a confirmation"
+configuration_application_preserved "${CONFIG}" "${AUTHORITY_V0}" "${LAST}" || fail "edit 1: config.json.last-applied changed before a confirmation"
 
 # An unconfirmed edit never applies: watch a full tick interval (the record
-# keeps its bytes, no reload-applied line, alpha is not updated in place).
+# keeps applied facts, no reload-applied line, alpha is not updated in place).
 hold_not_applied "${HOLD_S}" "edit 1 unconfirmed" no_alpha_channels_update
+configuration_application_preserved "${CONFIG}" "${AUTHORITY_V0}" "${LAST}" || fail "edit 1 unconfirmed: authority envelope changed"
 
 mv -f -- "${PENDING}" "${APPLY}"
 
 wait_for_log "${APPLIED_1}" "${TICK_WAIT_S}" "confirm 1: reload-applied not logged"
 [[ ! -e "${APPLY}" ]] || fail "confirm 1: config.json.apply still present after the apply"
-same_bytes "${CONFIG}" "${LAST}" || fail "confirm 1: config.json.last-applied does not hold the confirmed config.json"
+configuration_record_matches "${CONFIG}" "${LAST}" applied || fail "confirm 1: config.json.last-applied does not hold the confirmed config.json"
 wait_for_log "${ALPHA_UPDATED_CHANNELS}" 10 "confirm 1: persona ${ALPHA} not updated in place"
 # The same pass removes the pending file (nothing is pending any more) and,
 # having applied, logs no reload-nothing-pending line.
@@ -224,14 +241,18 @@ expect_count "${NOTHING_PENDING}" 0 "confirm 1: reload-nothing-pending logged af
 expect_count "${APPLIED_CLASS}" 1 "confirm 1: reload-applied lines"
 V1_COPY="${SCENARIO_ROOT}/config.v1.json"
 cp -- "${CONFIG}" "${V1_COPY}"
+AUTHORITY_V1="${SCENARIO_ROOT}/authority.v1.json"
+cp -- "${LAST}" "${AUTHORITY_V1}"
 
 # --- 2. Stale confirmation -----------------------------------------------
 emit_config "${V2_ALPHA}" all | write_config
+configuration_request edit2 request "${ALPHA}/${A2}/mentions"
 
 wait_until "${TICK_WAIT_S}" "edit 2: config.json.pending never named persona ${ALPHA}'s delivery change" \
     pending_has_line "${ALPHA_DELIVERY_BODY}"
 check_pending_layout "edit 2" in_place=1
-# Same counts as edit 1's header, so this is its second occurrence.
+# Both edits have these lifecycle counts; request processing may add a review.
+# The exact current review's full body is checked below.
 wait_for_count "${HEADER_1}" 2 10 "edit 2: reload-preview header not logged"
 expect_preview_logged "edit 2" edit2
 
@@ -244,21 +265,27 @@ if (( $(count_in "${STALE_COPY}" "${ALPHA_DELIVERY_BODY}") == 0 )) || [[ -z "${S
     fail "edit 2: the copy of config.json.pending is not edit 2's preview"
 fi
 
-# Edit 3; once the server has previewed it, confirm edit 2's preview.
+# Edit 3; once the server has previewed it, confirm edit 2's preview. The
+# config edit's own review supersedes edit 2's before the request is
+# published, so the revision then supersedes a later review: edit 2's outcome
+# is no longer kept, whatever checks fall between the two writes.
 emit_config "${V2_ALPHA}" mentions | write_config
+wait_until "${TICK_WAIT_S}" "edit 3: the config edit alone did not supersede edit 2's review" \
+    review_replaced "${STALE_FINGERPRINT}"
+configuration_request edit3 revise "${ALPHA}/${A2}/mentions" "${BRAVO}/${B1}/mentions"
 wait_until "${TICK_WAIT_S}" "edit 3: no fresh config.json.pending naming persona ${BRAVO}'s delivery change" \
     fresh_pending_for_v3
 check_pending_layout "edit 3" in_place=2
 pending_has_line "${ALPHA_DELIVERY_BODY}" || fail "edit 3: config.json.pending lost persona ${ALPHA}'s delivery change"
 wait_for_log "${HEADER_2}" 10 "edit 3: reload-preview header not logged"
 expect_preview_logged "edit 3" edit3
-same_bytes "${V1_COPY}" "${LAST}" || fail "edit 3: config.json.last-applied changed before a confirmation"
+configuration_application_preserved "${CONFIG}" "${AUTHORITY_V1}" "${LAST}" || fail "edit 3: config.json.last-applied changed before a confirmation"
 
 mv -f -- "${STALE_COPY}" "${APPLY}"
 
 wait_for_log "${STALE_MATCH}" "${TICK_WAIT_S}" "stale confirmation: reload-stale-confirmation not logged"
 [[ ! -e "${APPLY}" ]] || fail "stale confirmation: config.json.apply still present"
-same_bytes "${V1_COPY}" "${LAST}" || fail "stale confirmation: config.json.last-applied changed"
+configuration_application_preserved "${CONFIG}" "${AUTHORITY_V1}" "${LAST}" || fail "stale confirmation: config.json.last-applied changed"
 expect_count "${APPLIED_CLASS}" 1 "stale confirmation: a change was applied (reload-applied lines)"
 expect_count "${ALPHA_UPDATED_DELIVERY}" 0 "stale confirmation: persona ${ALPHA} updated in place"
 expect_count "${BRAVO_UPDATED_DELIVERY}" 0 "stale confirmation: persona ${BRAVO} updated in place"
@@ -271,12 +298,13 @@ mv -f -- "${PENDING}" "${APPLY}"
 
 wait_for_log "${APPLIED_2}" "${TICK_WAIT_S}" "confirm 3: reload-applied not logged"
 [[ ! -e "${APPLY}" ]] || fail "confirm 3: config.json.apply still present after the apply"
-same_bytes "${CONFIG}" "${LAST}" || fail "confirm 3: config.json.last-applied does not hold the confirmed config.json"
+configuration_record_matches "${CONFIG}" "${LAST}" applied || fail "confirm 3: config.json.last-applied does not hold the confirmed config.json"
 wait_for_log "${ALPHA_UPDATED_DELIVERY}" 10 "confirm 3: persona ${ALPHA} not updated in place"
 wait_for_log "${BRAVO_UPDATED_DELIVERY}" 10 "confirm 3: persona ${BRAVO} not updated in place"
 wait_until 10 "confirm 3: config.json.pending not removed after the apply" test ! -e "${PENDING}"
 expect_count "${APPLIED_CLASS}" 2 "confirm 3: reload-applied lines"
-expect_count "${STALE_CLASS}" 1 "confirm 3: reload-stale-confirmation lines"
+expect_count "${STALE_MATCH}" 1 "confirm 3: reload-stale-confirmation lines"
+expect_count "${OUTCOME_CLASS}" 0 "confirm 3: review outcome lines"
 
 # --- Stop -----------------------------------------------------------------
 # shellcheck disable=SC2119 # no bot was launched: no --stop-bots

@@ -1,3 +1,4 @@
+import { REVIEW_REQUEST_SUFFIX } from '../../src/reload-request.ts'
 /**
  * test-helpers/reload-terms.ts — The reload wording no advertised surface may
  * carry: the CLI usage text (cli.test.ts), the MCP tool
@@ -8,7 +9,7 @@
  */
 
 /** `reload` in any case, the two gesture files and their suffixes. */
-export const RELOAD_TERMS: readonly (string | RegExp)[] = [/reload/i, 'config.json.apply', 'config.json.pending', '.apply', '.pending']
+export const RELOAD_TERMS: readonly (string | RegExp)[] = [/reload/i, 'config.json.apply', 'config.json.pending', '.apply', '.pending', `config.json${REVIEW_REQUEST_SUFFIX}`, REVIEW_REQUEST_SUFFIX]
 
 /** The listed reload terms found in `text`, as written in `RELOAD_TERMS`. */
 export function reloadTermsIn(text: string): string[] {

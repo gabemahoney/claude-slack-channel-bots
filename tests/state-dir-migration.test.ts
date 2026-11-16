@@ -2282,10 +2282,18 @@ function warnings(): string[] {
 
 /**
  * What `N` holds once every file moved: the server's files, the crontab and `prompts/` (each unless `has` says the
- * release never had it; `'linked'` is a crontab that stays a link to the operator's own file), each real.
+ * release never had it; marked separately is the legacy delivery file carried by a whole-directory move
+ * or retained at L1 by a merge; `'linked'` is a crontab that stays a link to the operator's own file), each real.
  */
-function expectEverythingAtN(l: Layout, has: { crontab: boolean | 'linked'; prompts: boolean } = { crontab: true, prompts: true }): void {
-  for (const [name, content] of Object.entries(SERVER_FILES)) {
+function expectEverythingAtN(l: Layout, has: { crontab: boolean | 'linked'; prompts: boolean; legacyDelivery: 'carried' | 'retained-at-l1' }): void {
+  const expectedFiles = Object.keys(SERVER_FILES).filter(name => name !== 'channel-delivery.json' || has.legacyDelivery === 'carried')
+  if (has.legacyDelivery === 'retained-at-l1') {
+    expect(() => lstatSync(join(l.n, 'channel-delivery.json'))).toThrow()
+    expect(isLink(join(l.l1, 'channel-delivery.json'))).toBe(false)
+    expect(readFileSync(join(l.l1, 'channel-delivery.json'))).toEqual(Buffer.from(SERVER_FILES['channel-delivery.json']!))
+  }
+  for (const name of expectedFiles) {
+    const content = SERVER_FILES[name]!
     expect(isLink(join(l.n, name))).toBe(false)
     expect(readFileSync(join(l.n, name))).toEqual(Buffer.from(content))
   }
@@ -2297,7 +2305,7 @@ function expectEverythingAtN(l: Layout, has: { crontab: boolean | 'linked'; prom
     expect(isLink(join(l.n, 'crontab'))).toBe(has.crontab === 'linked')
     expect(readFileSync(join(l.n, 'crontab'), 'utf-8')).toBe(CRONTAB_TEXT)
   }
-  expect(names(l.n)).toEqual([...Object.keys(SERVER_FILES), ...(has.crontab ? ['crontab'] : []), ...(has.prompts ? ['prompts'] : [])].sort())
+  expect(names(l.n)).toEqual([...expectedFiles, ...(has.crontab ? ['crontab'] : []), ...(has.prompts ? ['prompts'] : [])].sort())
   expectNoTemporaries(l.n)
 }
 
@@ -2309,7 +2317,7 @@ function expectHomeConfigUntouched(l: Layout): void {
 }
 
 /** The names `L1` holds that move into `N` in the 0.14.0 merge: the server's files (the links are redundant). */
-const MERGED_FROM_L1 = Object.keys(SERVER_FILES).sort()
+const MERGED_FROM_L1 = Object.keys(SERVER_FILES).filter(name => name !== 'channel-delivery.json').sort()
 
 describe('the names (legacyXdgStateDir, stateDirMigrationSteps, the default state directory)', () => {
   test("the directory 0.14.0 and 0.15.0 used is still 'cscb', for the migration to find", () => {
@@ -2446,7 +2454,7 @@ describe.each([
       startupErrorDir: l.l1,
     })
     expect(lines).toEqual([stateDirRenamedLine(l.l1, l.n)])
-    expectEverythingAtN(l, { crontab: false, prompts: false })
+    expectEverythingAtN(l, { crontab: false, prompts: false, legacyDelivery: 'carried' })
     expect(readlinkSync(l.l1)).toBe(l.n)
     expect(existsSync(l.l2)).toBe(false)
     expect(lstatSync(l.n).isDirectory()).toBe(true)
@@ -2464,9 +2472,13 @@ describe.each([
       startupErrorDir: l.l1,
     })
     expect(lines).toEqual([stateDirRenamedLine(l.l2, l.n, true), stateDirMergedLine(l.l1, l.n, MERGED_FROM_L1)])
-    expectEverythingAtN(l)
+    expectEverythingAtN(l, { crontab: true, prompts: true, legacyDelivery: 'retained-at-l1' })
     expect(readlinkSync(l.l2)).toBe(l.n)
-    expect(readlinkSync(l.l1)).toBe(l.n)
+    expect(lstatSync(l.l1).isDirectory()).toBe(true)
+    expect(isLink(l.l1)).toBe(false)
+    expect(readFileSync(join(l.l1, 'channel-delivery.json'), 'utf-8')).toBe(SERVER_FILES['channel-delivery.json'] as string)
+    expect(existsSync(join(l.n, 'channel-delivery.json'))).toBe(false)
+    for (const name of MERGED_FROM_L1) expect(readlinkSync(join(l.l1, name))).toBe(join(l.n, name))
     // The old names still reach the files (a downgrade, a script that names them).
     expect(readFileSync(join(l.l1, 'crontab'), 'utf-8')).toBe(CRONTAB_TEXT)
     expect(readFileSync(join(l.l1, 'prompts', 'daily.md'), 'utf-8')).toBe(PROMPT_TEXT)
@@ -2483,10 +2495,14 @@ describe.each([
 
     expect(result.outcome).toEqual({ kind: 'moved', via: 'merge', entries: MERGED_FROM_L1 })
     expect(lines).toEqual([stateDirRenamedLine(l.l2, l.n, true), stateDirMergedLine(l.l1, l.n, MERGED_FROM_L1)])
-    expectEverythingAtN(l, { crontab: false, prompts: true })
+    expectEverythingAtN(l, { crontab: false, prompts: true, legacyDelivery: 'retained-at-l1' })
     expect(() => lstatSync(join(l.n, 'crontab'))).toThrow()
     expect(readlinkSync(l.l2)).toBe(l.n)
-    expect(readlinkSync(l.l1)).toBe(l.n)
+    expect(lstatSync(l.l1).isDirectory()).toBe(true)
+    expect(isLink(l.l1)).toBe(false)
+    expect(readFileSync(join(l.l1, 'channel-delivery.json'), 'utf-8')).toBe(SERVER_FILES['channel-delivery.json'] as string)
+    expect(existsSync(join(l.n, 'channel-delivery.json'))).toBe(false)
+    for (const name of MERGED_FROM_L1) expect(readlinkSync(join(l.l1, name))).toBe(join(l.n, name))
     // The deleted crontab stays deleted: no entry at any of the three names.
     expect(existsSync(join(l.l1, 'crontab'))).toBe(false)
     expect(existsSync(join(l.l2, 'crontab'))).toBe(false)
@@ -2505,10 +2521,15 @@ describe.each([
     expect(stateDirMigrationStopsStart(result.outcome)).toBe(false)
     expect(warnings()).toEqual([])
     expect(lines.length).toBeGreaterThanOrEqual(1)
-    expectEverythingAtN(l, has)
+    expectEverythingAtN(l, { ...has, legacyDelivery: 'retained-at-l1' })
     expect(readlinkSync(l.l2)).toBe(l.n)
-    expect(readlinkSync(l.l1)).toBe(l.n)
-    expect(readFileSync(join(l.l1, 'crontab'), 'utf-8')).toBe(CRONTAB_TEXT)
+    expect(lstatSync(l.l1).isDirectory()).toBe(true)
+    expect(isLink(l.l1)).toBe(false)
+    expect(readFileSync(join(l.l1, 'channel-delivery.json'), 'utf-8')).toBe(SERVER_FILES['channel-delivery.json'] as string)
+    expect(existsSync(join(l.n, 'channel-delivery.json'))).toBe(false)
+    for (const name of MERGED_FROM_L1) expect(readlinkSync(join(l.l1, name))).toBe(join(l.n, name))
+    if (variant === 'no-crontab-links') expect(existsSync(join(l.l1, 'crontab'))).toBe(false)
+    else expect(readFileSync(join(l.l1, 'crontab'), 'utf-8')).toBe(CRONTAB_TEXT)
     expect(readFileSync(join(l.l2, 'prompts', 'daily.md'), 'utf-8')).toBe(PROMPT_TEXT)
     expectNoTemporaries(dirname(l.l1))
     expectNoTemporaries(dirname(l.l2))
@@ -2533,7 +2554,7 @@ describe.each([
       startupErrorDir: l.l2,
     })
     expect(lines).toEqual([stateDirRenamedLine(l.l2, l.n, true), stateDirRepointedLine(l.l1, l.l2, l.n)])
-    expectEverythingAtN(l)
+    expectEverythingAtN(l, { crontab: true, prompts: true, legacyDelivery: 'carried' })
     expect(readlinkSync(l.l2)).toBe(l.n)
     // L1 no longer goes through L2, so removing ~/.config/cscb leaves it intact.
     expect(readlinkSync(l.l1)).toBe(l.n)
@@ -2708,7 +2729,7 @@ describe.each([
     })
     expect(lines).toEqual([stateDirRenamedLine(l.l2, l.n, true)])
     expect(warnings()).toEqual([])
-    expectEverythingAtN(l)
+    expectEverythingAtN(l, { crontab: true, prompts: true, legacyDelivery: 'carried' })
     expect(readlinkSync(l.l2)).toBe(l.n)
     expect(() => lstatSync(l.l1)).toThrow()
     expect(existsSync(dirname(l.l1))).toBe(false)
@@ -2759,7 +2780,7 @@ describe.each([
       expect(readlinkSync(l.l2)).toBe(l.n)
       expect(readlinkSync(l.l1)).toBe(l.l2)
       expect(realpathSync(l.l1)).toBe(realpathSync(l.n))
-      expectEverythingAtN(l)
+      expectEverythingAtN(l, { crontab: true, prompts: true, legacyDelivery: 'carried' })
       expectNoTemporaries(dirname(l.l1))
 
       lines.length = 0
@@ -2912,12 +2933,13 @@ describe('the start, with ~/.config, in the other situations', () => {
       // The operator settled it: the old file is removed, the next start finishes.
       lines.length = 0
       unlinkSync(join(l.l2, 'config.json'))
-      expect(startFor(l).outcome.kind).toBe('moved')
-      expect(readlinkSync(l.l2)).toBe(l.n)
-      expect(readlinkSync(l.l1)).toBe(l.n)
+      expect(startFor(l).outcome.kind).toBe('already-migrated')
+      expect(isLink(l.l2)).toBe(false)
+      expect(readlinkSync(l.l1)).toBe(l.l2)
+      expect(readFileSync(join(l.l2, 'channel-delivery.json'), 'utf-8')).toBe(SERVER_FILES['channel-delivery.json'] as string)
+      expect(existsSync(join(l.n, 'channel-delivery.json'))).toBe(false)
       expect(readFileSync(join(l.n, 'config.json'))).toEqual(NEW_CONFIG)
-      // Everything else moved when it was pending (its old names are links), so the finish moves nothing.
-      expect(lines).toEqual([stateDirMergedLine(l.l2, l.n, [], true), stateDirRepointedLine(l.l1, l.l2, l.n)])
+      expect(lines).toEqual([])
     })
 
     test('0.14.0 with a different config.json already at N: L2 merges (crontab, prompts), then one WARN naming L1, which stays a directory', () => {
@@ -3111,12 +3133,14 @@ describe('the start, with ~/.config, in the other situations', () => {
       expect(isLink(l.l2)).toBe(false)
       expect(isLink(l.l1)).toBe(false)
       // The server's files reached N through L1's step.
-      for (const [name, content] of Object.entries(SERVER_FILES)) expect(readFileSync(join(l.n, name))).toEqual(Buffer.from(content))
+      for (const name of MERGED_FROM_L1) expect(readFileSync(join(l.n, name))).toEqual(Buffer.from(SERVER_FILES[name]!))
+      expect(readFileSync(join(l.l1, 'channel-delivery.json'), 'utf-8')).toBe(SERVER_FILES['channel-delivery.json'] as string)
+      expect(existsSync(join(l.n, 'channel-delivery.json'))).toBe(false)
       expect(isLink(join(l.n, 'prompts'))).toBe(false)
       expect(readFileSync(join(l.n, 'prompts', 'daily.md'), 'utf-8')).toBe(PROMPT_TEXT)
       // What is left in L1: the old names of what moved (links to N's files) and the crontab link of the conflict.
       expect(names(l.l1)).toEqual([...Object.keys(SERVER_FILES), 'crontab', 'prompts'].sort())
-      for (const name of Object.keys(SERVER_FILES)) expect(readlinkSync(join(l.l1, name))).toBe(join(l.n, name))
+      for (const name of MERGED_FROM_L1) expect(readlinkSync(join(l.l1, name))).toBe(join(l.n, name))
       expect(readFileSync(join(l.l1, 'crontab'), 'utf-8')).toBe(CRONTAB_TEXT)
     })
   })

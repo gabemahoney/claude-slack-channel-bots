@@ -1,6 +1,6 @@
 /** Post-accept immutable fixation shared by fresh and recovered work. */
 import type { WebClient } from '@slack/web-api'
-import { isQueueItemClosed, QueueOutcomeFinal, type DeliveryQueue, type FixedRecord, type QueueAccept, type QueueItem, type QueueEvent, type ReactionAcceptedRecord, type WithdrawnRecord } from './delivery-queue.ts'
+import { isOpenItem, isQueueItemClosed, QueueOutcomeFinal, type DeliveryQueue, type FixedRecord, type QueueAccept, type QueueItem, type QueueEvent, type ReactionAcceptedRecord, type WithdrawnRecord } from './delivery-queue.ts'
 import { buildReactionNoticeMessage, buildTagParts, NAME_LOOKUP_TIMEOUT_MS, TAG_MAX_BYTES, type ReactionNoticeInput, type TagMessage } from './tag-wrapper.ts'
 import { sanitizeFilename } from './lib.ts'
 import { RETYPE_BACKOFF_MS } from './delivery-constants.ts'
@@ -120,7 +120,11 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
       result = bounded(async () => {
         const info = await deps.clientFor(key)?.conversations.info({ channel })
         return info?.channel?.name?.replace(/^#/, '') || channel
-      }, channel)
+      }, channel).then(name => {
+        // Share in-flight lookups, but let the next message retry a fallback.
+        if (name === channel) cache!.delete(channel)
+        return name
+      })
       cache.set(channel, result)
     }
     return result
@@ -184,8 +188,9 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
     item = fresh ?? item
     const settled = !fresh || item.fixed !== undefined || isQueueItemClosed(item)
     if (item.fixed || isQueueItemClosed(item)) life.reactionOutcomes.delete(item.accepted.seq)
-    // A withdrawn outcome is final: no fixation, retry or wake.
-    if (!current(life) || isQueueItemClosed(item)) return settled
+    // A withdrawn outcome is final, and an unreleased hold is not yet
+    // delivery work: no fixation, retry or wake.
+    if (!current(life) || !isOpenItem(item)) return settled
     if (!item.fixed && item.accepted.source === 'reaction') {
       // The queue admits a reaction record only in its validated reaction shape.
       const wake = await fixReaction(key, item.accepted as ReactionAcceptedRecord, life)
@@ -221,6 +226,7 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
     return true
   }
   function prepare(key: string, item: QueueItem): Promise<void> {
+    if (stopped || !isOpenItem(item)) return Promise.resolve()
     try { void Promise.resolve(deps.onReceived?.(key, item)).catch(() => {}) } catch { /* reporting never owns acceptance */ }
     const life = lifeOf(key), seq = item.accepted.seq
     claim(key, seq)
@@ -253,14 +259,14 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
     owns: (key, seq) => { const life = lives.get(key); return life !== undefined && (life.inFlight.has(seq) || life.retries.has(seq)) },
     prepare,
     async recover(keys = deps.queue.keys()) {
-      await Promise.allSettled(keys.flatMap(key => deps.queue.items(key).filter(item => !isQueueItemClosed(item)).map(item => prepare(key, item))))
+      await Promise.allSettled(keys.flatMap(key => deps.queue.items(key).filter(isOpenItem).map(item => prepare(key, item))))
     },
     async reclaim(keys) {
       await Promise.allSettled(keys.flatMap(key => {
         lifeOf(key)
         const seqs = claimed.get(key)
         return deps.queue.items(key)
-          .filter(item => !isQueueItemClosed(item) && (item.fixed !== undefined || seqs?.has(item.accepted.seq) === true))
+          .filter(item => isOpenItem(item) && (item.fixed !== undefined || seqs?.has(item.accepted.seq) === true))
           .map(item => prepare(key, item))
       }))
     },

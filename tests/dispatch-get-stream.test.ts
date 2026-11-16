@@ -5,13 +5,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { makeChannelMessage } from './test-helpers/slack-stub.ts'
 import { registerSession } from '../src/registry.ts'
-import { makeRoutingHarness, makeTransport, makeSessionServer, resetRoutingState } from './test-helpers/persona-routing-harness.ts'
+import { makeRoutingHarness, observedMembership, makeTransport, makeSessionServer, resetRoutingState } from './test-helpers/persona-routing-harness.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 let dir: string
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'connected-delivery-')); resetRoutingState() })
 afterEach(() => { resetRoutingState(); rmSync(dir, { recursive: true, force: true }) })
 test('connected streamless intake stores and acknowledges without probing the stream or requesting recovery', async () => {
-  const h = makeRoutingHarness([{ name: 'alpha' }, { name: 'beta' }], dir, { streamless: ['alpha'] })
+  const h = makeRoutingHarness([{ name: 'alpha' }, { name: 'beta' }], dir, { streamless: ['alpha'], membership: observedMembership({ alpha: ['C0TEST001'], beta: ['C0TEST001'] }) })
   const notifications: Parameters<typeof makeSessionServer>[0] = []
   const p = h.p('alpha').persona
   // No delivery consumer may inspect the SDK stream mapping.

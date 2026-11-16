@@ -34,6 +34,9 @@ import {
   FLAG_FORMS,
   FUNGIBLE_DECISION_GROUPS,
   SWITCH_FORMS,
+  THREAD_DECISION_GROUPS,
+  type OwnPostRead,
+  type ThreadRead,
   channelDeliveryArgsOf,
   channelTypeFormOf,
   decisionArgsOf,
@@ -62,6 +65,10 @@ function outcomeText(outcome: DeliveryDecision): string {
   const path = pathOf(outcome)
   const onPath = path === undefined ? '' : ` [fungible path: ${path.channelType}, at ${path.channelDelivery}]`
   if (outcome.action === 'deliver') return `delivered via ${outcome.via}${onPath}`
+  if (outcome.action === 'hold' && outcome.hold === 'post') {
+    return `held for post via ${outcome.via} in ${outcome.threadRoot} on [${outcome.operations.join(', ')}]${outcome.rootUnknown ? ', root unknown' : ''}${onPath}`
+  }
+  if (outcome.action === 'hold') return `held for ${outcome.hold} via ${outcome.via} in ${outcome.threadRoot}${onPath}`
   if ('refusal' in outcome) return `not delivered: ${outcome.reason} (${outcome.refusal})`
   if ('unclaimed' in outcome) return `not delivered: ${outcome.reason} (${outcome.unclaimed ? 'unclaimed' : 'claimed'})`
   return `not delivered: ${outcome.reason}${onPath}`
@@ -74,7 +81,10 @@ function cases<R extends FungibleDecisionRow>(group: FungibleDecisionGroup<R>): 
 
 /** The one assertion of every row: the whole outcome, by strict equality. */
 function expectOutcome(row: FungibleDecisionRow): void {
-  expect(decideDelivery(...decisionArgsOf(row))).toStrictEqual(row.expected)
+  const reads: ThreadRead[] = [], ownPostReads: OwnPostRead[] = []
+  expect(decideDelivery(...decisionArgsOf(row, reads, ownPostReads))).toStrictEqual(row.expected)
+  expect(reads).toEqual([...(row.threadReads ?? [])])
+  expect(ownPostReads).toEqual([...(row.ownPostReads ?? [])])
 }
 
 /**
@@ -84,7 +94,9 @@ function expectOutcome(row: FungibleDecisionRow): void {
 function expectOutcomeAndChannelDelivery(row: ChannelDeliveryRow): void {
   expectOutcome(row)
   const result = channelDeliveryFor(...channelDeliveryArgsOf(row))
-  expect<unknown[]>([result, result.delivery]).toStrictEqual([row.channelDelivery, pathOf(row.expected)?.channelDelivery])
+  expect(result).toStrictEqual(row.channelDelivery)
+  const path = pathOf(row.expected)
+  if (path) expect(result.delivery).toBe(path.channelDelivery)
 }
 
 /** Every row of every group. */
@@ -93,6 +105,19 @@ function allRows(): FungibleDecisionRow[] {
 }
 
 const G = FUNGIBLE_DECISION_GROUPS
+
+describe('current shared authority, eligibility and effective sibling selection', () => {
+  test.each(cases(G.currentAuthority))('%s', (_title, row) => expectOutcome(row))
+})
+
+for (const [name, group] of Object.entries(THREAD_DECISION_GROUPS)) {
+  describe(`open Thread Memory: ${name}`, () => {
+    test.each(cases({ rows: group.rows.filter(row => row.config.channel_mode === 'open') }))('%s', (_title, row) => {
+      expectOutcome(row)
+      if (row.channelDelivery) expect(channelDeliveryFor(...channelDeliveryArgsOf(row))).toStrictEqual(row.channelDelivery)
+    })
+  })
+}
 
 // ---------------------------------------------------------------------------
 // The decision table
@@ -120,10 +145,6 @@ describe('group 5: the fungible path\'s five conditions, first failure decides, 
 
 describe('group 6: group DMs in fungible mode', () => {
   test.each(cases(G.groupDms))('%s', (_title, row) => expectOutcome(row))
-})
-
-describe('group 7: the loop guard under P\'s stored all', () => {
-  test.each(cases(G.loopGuard))('%s; channelDeliveryFor agrees', (_title, row) => expectOutcomeAndChannelDelivery(row))
 })
 
 describe('group 8: in fungible mode non-message, no-author and own run before the fungible conditions', () => {
@@ -237,6 +258,11 @@ function stateFindings(code: string): string[] {
 /** A deep copy of `value` with every object and array frozen. Accessors are copied, never read; functions and regexes are kept as they are. */
 function frozenCopy<T>(value: T): T {
   if (typeof value !== 'object' || value === null || value instanceof RegExp) return value
+  if (value instanceof Map) {
+    const copy = new Map([...value].map(([key, reading]) => [key, frozenCopy(reading)]))
+    for (const method of ['set', 'delete', 'clear']) Object.defineProperty(copy, method, { value: () => { throw new Error('decision mutated current observations') } })
+    return Object.freeze(copy) as T
+  }
   const copy: object = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value))
   for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
     Object.defineProperty(copy, key, 'value' in descriptor ? { ...descriptor, value: frozenCopy(descriptor.value) } : descriptor)
@@ -268,14 +294,24 @@ describe('the decision stays pure', () => {
   })
 
   test('decideDelivery gives every row its outcome with deep-frozen arguments, forwards then in reverse', () => {
-    const mismatches = forwardsThenReversed(allRows()).filter(
-      (row) => !Bun.deepEquals(decideDelivery(...frozenCopy(decisionArgsOf(row))), row.expected, true),
-    )
+    const mismatches = forwardsThenReversed(allRows()).filter(row => {
+      const reads: ThreadRead[] = [], ownPostReads: OwnPostRead[] = []
+      const viewsBefore = structuredClone(row.threadViews), postsBefore = structuredClone(row.ownPosts)
+      const args = frozenCopy(decisionArgsOf(row, reads, ownPostReads))
+      const first = decideDelivery(...args)
+      const repeated = decideDelivery(...args)
+      const expectedReads = row.threadReads ?? [], expectedPostReads = row.ownPostReads ?? []
+      // The lists the reader returns are frozen too, so writing to one throws.
+      return !Bun.deepEquals(first, row.expected, true) || !Bun.deepEquals(repeated, first, true) ||
+        !Bun.deepEquals(reads, [...expectedReads, ...expectedReads], true) ||
+        !Bun.deepEquals(ownPostReads, [...expectedPostReads, ...expectedPostReads.map(([key, channel, before]) => [key, channel, before + expectedReads.length])], true) ||
+        !Bun.deepEquals(row.threadViews, viewsBefore, true) || !Bun.deepEquals(row.ownPosts, postsBefore, true)
+    })
     expect(mismatches.map((row) => row.label)).toEqual([])
   })
 
   test('channelDeliveryFor gives every channel-delivery row its result with deep-frozen arguments, forwards then in reverse', () => {
-    const rows: ChannelDeliveryRow[] = [...G.ignoresChannels.rows, ...G.loopGuard.rows, ...G.unreadableStore.rows]
+    const rows: ChannelDeliveryRow[] = [...G.ignoresChannels.rows, ...G.destinations.rows, ...G.unreadableStore.rows]
     const mismatches = forwardsThenReversed(rows).filter(
       (row) => !Bun.deepEquals(channelDeliveryFor(...frozenCopy(channelDeliveryArgsOf(row))), row.channelDelivery, true),
     )

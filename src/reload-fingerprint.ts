@@ -100,6 +100,7 @@ function updateContent(hash: ReturnType<typeof createHash>, content: Fingerprint
 export function reloadFingerprint(
   config: FingerprintContent,
   credentials: readonly FingerprintCredentialsEntry[],
+  authorityRevision?: number,
 ): string {
   const hash = createHash('sha256')
   hash.update(FINGERPRINT_DOMAIN, 'utf-8')
@@ -111,7 +112,19 @@ export function reloadFingerprint(
     hash.update(path)
     updateContent(hash, entry.content)
   }
+  if (authorityRevision !== undefined) {
+    hash.update('shared-authority-revision:')
+    hash.update(String(authorityRevision))
+  }
   return hash.digest('hex')
+}
+
+/** Bind transient content comparison to non-secret authority/current facts.
+ * Persist only this composite and its generation-bound review identity. */
+export function reloadReviewBinding(contentFingerprint: string, authorityDependency: string, session: string, intentGeneration: number, facts: unknown): string {
+  return createHash('sha256').update(JSON.stringify([
+    'cscb-review-binding-v1', contentFingerprint, authorityDependency, session, intentGeneration, facts,
+  ])).digest('hex')
 }
 
 // ---------------------------------------------------------------------------

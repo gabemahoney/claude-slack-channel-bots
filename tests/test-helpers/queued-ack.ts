@@ -12,6 +12,9 @@ import { createSessionServer, registerSession, unregisterSession, type SessionEn
 import { assertNoLeak, LEAK_SENTINEL } from './credentials.ts'
 import { makeEngineHarness } from './delivery-engine.ts'
 import { makeDeliveryNoticeHarness } from './delivery-notices.ts'
+import { makeSharedAuthority } from './shared-channels.ts'
+import { observedMembership } from './persona-routing-harness.ts'
+import { createChannelDeliveryStore } from '../../src/channel-delivery.ts'
 import { asWebClient, makeChannelMessage, makeDeferredWebApiCall, type DeferredWebApiCall, type StubWebClient } from './slack-stub.ts'
 
 type AckCallback = (key: string, item: QueueItem) => Promise<void>
@@ -22,6 +25,13 @@ export async function makeQueuedAckHarness(options: { onReplyCall?: (key: string
   const n = await makeDeliveryNoticeHarness({ queue: e.queue, leakMarker: LEAK_SENTINEL })
   const settings = { queued_ack_reaction: DEFAULT_QUEUED_ACK_REACTION, ack_reaction: DEFAULT_ACK_REACTION, reply_chunk_limit: DEFAULT_REPLY_CHUNK_LIMIT, reply_chunk_mode: DEFAULT_REPLY_CHUNK_MODE }
   Object.assign(n.config, settings)
+  const authority = makeSharedAuthority(e.root, { ...n.config,
+    personas: n.config.personas.map(({ key, index, ...persona }) => persona),
+  })
+  const choices = createChannelDeliveryStore(authority)
+  // Independent positive observations for the acknowledgement fixture. The
+  // production membership collection and its holds have their own composition.
+  const membership = observedMembership({ alpha: ['C0ALPHA01', 'C0BETA001'], beta: ['C0ALPHA01', 'C0BETA001'] })
   const entries = new Map<string, SessionEntry>(), clients = new Map<string, McpClient>()
   const servers: ReturnType<typeof createSessionServer>[] = []
   const held: DeferredWebApiCall[] = []
@@ -51,7 +61,9 @@ export async function makeQueuedAckHarness(options: { onReplyCall?: (key: string
   for (const persona of n.config.personas) {
     e.p(persona.key).row.state = 'working'
     const transport = { close: async () => {} } as SessionEntry['transport']
-    entries.set(persona.key, registerSession(persona.working_directory, persona.key, transport, {} as SessionEntry['server']))
+    const entry = registerSession(persona.working_directory, persona.key, transport, {} as SessionEntry['server'])
+    entry.personaIncarnation = authority.incarnation(persona.key)
+    entries.set(persona.key, entry)
     const web = n.h.stub(persona.key).web
     const add = web.reactions.add, remove = web.reactions.remove
     web.reactions.add = async args => {
@@ -89,6 +101,7 @@ export async function makeQueuedAckHarness(options: { onReplyCall?: (key: string
   }
   reporting = createDeliveryReporting(deps)
   const routing = createPersonaRouting({
+    getChannelDelivery: () => choices, membership,
     getPersonaConfig: () => ({ ...n.config, ...settings }), getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }),
     queue: e.queue, prepare: e.preparation.prepare, onReceived: (key, item) => reporting!.received(key, item),
     archive: () => {}, log: line => n.logs.push(line), now: e.clock.now,
@@ -160,6 +173,7 @@ export async function makeQueuedAckHarness(options: { onReplyCall?: (key: string
     let client = clients.get(key)
     if (!client) {
       const server = createSessionServer(entries.get(key)!, {
+        getChannelDelivery: () => choices,
         assertSendable: () => {}, getReplySettings: () => settings,
         getPersona: personaKey => n.config.personas.find(p => p.key === personaKey),
         clientFor: personaKey => asWebClient(clientFor(personaKey)),

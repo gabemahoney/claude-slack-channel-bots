@@ -84,6 +84,117 @@
  * - `user_id` / `bot_id`: `auth.test`'s identity; default `U`/`B` plus the
  *   token's hash, so two tokens get two identities.
  *
+ * OPTIONAL RECOVERY CONTROLS
+ * --------------------------
+ * With all controls absent, the original wire behavior and records are kept,
+ * except that successful ordinary plain-text chat.postMessage records include
+ * response_ts (see the recorded post fields below).
+ *
+ * Each token rule (or `default`) can carry `faults`, an ordered list:
+ *   { "method": "users.conversations", "cursor": "", "after": 0, "times": 1,
+ *     "outcome": "delay", "delay_ms": 250, "body": { "ok": true,
+ *       "channels": [], "response_metadata": { "next_cursor": "later" } } }
+ * Methods: users.conversations, conversations.history, conversations.replies,
+ * chat.postMessage, users.info, conversations.info. Optional exact selectors:
+ * cursor ("" means first page), channel, thread_ts, and user (users.info
+ * only). `after` skips that many matching requests; `times`
+ * applies to the next N (defaults 0/1). First applicable rule wins. Counters
+ * count every selector match, even when an earlier rule wins that request;
+ * they are per token rule and reset whenever the control is replaced. Requests
+ * already held keep their original answer. Authentication failures win.
+ * Outcomes:
+ * - `hang`: no answer until client abort or stub stop.
+ * - `error`: `ok:false,error:<error>` (default internal_error); use Slack
+ *   codes such as missing_scope, invalid_auth, not_in_channel or internal_error.
+ * - `rate_limit`: HTTP 429, `Retry-After` seconds (`retry_after`, default 1).
+ * - `delay`: answer after positive `delay_ms`; optional raw `body` overrides
+ *   a read's answer, otherwise snapshot its normal answer at request time.
+ *   A client disconnect before then settles as `abort`, with no answer.
+ * - `lost` (chat.postMessage only): required boolean `performed`. True stores
+ *   the own post before holding its answer; false stores nothing. With a
+ *   positive `delay_ms`, eventually return success (performed) or internal_error
+ *   (not performed); without it hold until abort/stop. Ordinary hang/delay on
+ *   chat.postMessage is refused: use lost to specify the posting outcome.
+ * - `late` (users.info, conversations.info and users.conversations only): the
+ *   normal answer after a required positive `delay_ms`, even if the client
+ *   disconnected meanwhile. Only users.conversations may supply a raw `body`
+ *   override with `late`; snapshot that page at request time too.
+ * No files.info, root-evidence or file-upload fault controls are added.
+ *
+ * Name lookups (t1.tad.5i SR-6.3, AC-C06): a users.info or conversations.info
+ * fault matches one looked-up id (`user` or `channel`) or, with neither, any
+ * id. Without one, both methods answer as before, from `users`/`channels`.
+ *   { "method": "users.info", "user": "U…", "times": 1, "outcome": "hang" }
+ *   { "method": "conversations.info", "channel": "C…", "outcome": "delay", "delay_ms": 500 }
+ *   { "method": "users.info", "user": "U…", "outcome": "late", "delay_ms": 2500 }
+ * A caller that gives up at its own deadline without closing the request (CSCB
+ * races NAME_LOOKUP_TIMEOUT_MS) leaves a `hang` held until its HTTP client's
+ * timeout; give `late` a delay_ms past that deadline. A held lookup never
+ * blocks another request, /_push or /_control.
+ *
+ * Top-level `history: { page_size?: number, messages?: [{channel, message}] }`
+ * enables conversations.history/replies from performed posts plus raw seeded
+ * Slack messages (each needs ts). Once enabled, it stays enabled for this stub
+ * instance; a lost-post fault enables it too. Posts are retained even if
+ * made before enabling; replacing control replaces seeds, never performed
+ * posts. page_size defaults to 100 and is capped by a positive request limit.
+ * History returns roots newest first; replies returns the root and its replies
+ * oldest first, resolving a requested reply's parent. oldest/latest/inclusive
+ * filter the range. Opaque cursors retain a snapshot and are bound to the
+ * label, method, channel and requested parent; an invalid cursor is refused.
+ * No history control/lost post: the original empty history/replies answer.
+ * users.conversations answers from `memberships` as Slack pages: at most a
+ * positive requested `limit` of channels per page (CSCB requests
+ * MEMBERSHIP_PAGE_LIMIT), chained by the stub's own `stubmembers-<offset>`
+ * cursors; with no limit, every membership in one page.
+ * `inventory_pages` still accepts raw cursor-keyed pages, including short or
+ * empty nonterminal pages and channels without is_member; a raw page for the
+ * requested cursor wins, whatever its length. To attempt a
+ * contradictory users.conversations page after an abandoned scan, use `late`
+ * with `body` and delay_ms past the replacement scan; `delay` still aborts on
+ * disconnect. Read faults work on any page.
+ *
+ * `POST /_inventory` with `{label, memberships?, inventory_pages?}` (at least
+ * one of the two, validated as in a control) replaces only those inventory
+ * answers on every token rule of that label, in place. Unlike a control
+ * replacement it resets no fault counter or connection refusal and fires no
+ * socket close or push, so a scenario can change one persona's inventory
+ * while another's faults are armed. It answers `{"ok":true,"seq":<n>}`, the
+ * seq of its `inventory` record ({label, fields}); a later control
+ * replacement supersedes it. Refusals: 400 `inventory-invalid`, 409
+ * `unknown-label`, each with an `inventory-refused` record.
+ *
+ * Top-level `socket_closes: [{label, refuse_connections?: N}]` closes every
+ * live socket for that label with code 1001. The next N apps.connections.open
+ * calls for it return temporarily_unavailable, then normal control resumes.
+ * Replacing control resets those counts. Each entry fires once per control
+ * replacement (file change, POST /_control or setControl), never per API call.
+ * Top-level `pushes: [<a /_push body>, ...]` also fires once per replacement,
+ * after closes, through the same push handler. It permits file/HTTP control
+ * of membership and redelivery; normally use /_push for its immediate result.
+ *
+ * Evidence: `fault` names control:"faults", fault_index, request_id, method,
+ * label, matching_call and outcome; lost also carries performed and the stored
+ * message's response_ts. Its eventual api line shares request_id. Held requests
+ * emit `fault-settled` with resolution delay/abort/stop/late. Each fired request
+ * has exactly one `fault` line. A name lookup's also carries `match` (the
+ * request's user or channel id, whichever selector fired). Name lookups and
+ * users.conversations faults carry `arrival_mono_ms` (their arrival on the
+ * push/ack monotonic clock, before control-file I/O or body parsing), and
+ * `arrival_epoch_ms` captured beside it at handler entry with Date.now(). The
+ * latter shares the container wall clock with the server logger's ISO stamps;
+ * the monotonic field is comparable only within this stub process. A `late`
+ * settlement adds `socket_open`: whether the client was still connected when
+ * the answer went; its api line is written either way. It settles exactly
+ * once, as `late` after delay_ms even on disconnect, never as `abort`.
+ * Compare the records' increasing `seq` to prove that a late settlement
+ * followed the replacement scan's last api line.
+ * `socket-close` names
+ * control:"socket_closes", control_index, label and independent connection_id;
+ * socket-close-missed proves no live socket matched. `connection-refused` names
+ * request_id/control_index/remaining and shares request_id with its api line.
+ * These new evidence lines contain neither tokens nor connection tickets.
+ *
  * `users` (keys `U…`/`W…`) overlays `users.info`'s defaults with the given
  * `name`, `real_name` and `profile` texts.
  *
@@ -173,7 +284,8 @@
  * `POST /_push` (below), and `POST /upload/<id>` (the upload URL
  * `files.getUploadURLExternal` hands out). Every other Web API method answers
  * `ok: true` with the shape CSCB reads (`chat.postMessage` a `ts`,
- * `conversations.open` a channel ID, …).
+ * `conversations.open` a channel ID, `files.completeUploadExternal` one file
+ * per file it completed, with the request's id and title, …).
  *
  * PUSH (`POST /_push`, JSON; b.deo SRI-1402)
  * ----
@@ -206,12 +318,35 @@
  *   as given: `true`, `false` or any non-boolean (`null`, a string, a number,
  *   an object). `"omit": ["is_ext_shared_channel"]` in place of it leaves the
  *   flag out of the payload. Every other envelope field is fixed or generated
- *   by the stub: `envelope_id` and `event_id` are unique per push, and
- *   `team_id` and `api_app_id` are the stub's team and app.
+ *   by the stub: `envelope_id` and `event_id` are unique per original push, and
+ *   `team_id`, `api_app_id` and bot authorization match the label's most
+ *   recent successful auth.test (including per-token identity overrides),
+ *   unless the separate `installation` control below overrides them.
  * - The push goes to the label's newest open WebSocket: the one opened last
  *   among its sockets that are open now. A closed or closing socket is never
  *   chosen.
  * - A push carries no token, and `/_push` reads none.
+ * - Membership uses ordinary `event`: member_joined_channel with channel,
+ *   channel_type (C/G) and user; or channel_left with channel and optional user.
+ *   Set user to auth.test's user_id for self or another user for the negative
+ *   case. The stub sends the event unchanged and never changes membership
+ *   inventory implicitly. Both events receive ordinary push/ack records.
+ * - Optional top-level `installation` overrides payload team_id, api_app_id
+ *   or authorizations (array of {team_id?,user_id?,is_bot?,is_enterprise_install?})
+ *   to simulate another installation/bot. `push-installation` evidence names
+ *   the envelope_id/connection_id; it records no supplied authorization data.
+ * - Redeliver with {label, redeliver:{envelope_id:<previous push response>,
+ *   retry_attempt?:positive integer, retry_reason?:string}} instead of event.
+ *   Payload, event_id and event_time stay identical; envelope_id is fresh.
+ *   Retry defaults to the previous attempt + 1 and reason timeout. No event,
+ *   envelope, installation or interactive override is allowed on a retry.
+ *   Only a successful events_api push for the same label may be redelivered.
+ *   The ordinary push record is followed by `redelivery` with control:redeliver,
+ *   original_envelope_id, source_envelope_id, envelope_id, event_id,
+ *   connection_id and retry_attempt. Thus zero original ACKs and one retry ACK
+ *   can be distinguished. Unknown/cross-label IDs return 409 redelivery-unknown;
+ *   malformed retry/installation controls return 400 redelivery-invalid or
+ *   installation-invalid. Legacy push records and synthetic tickets stay intact.
  *
  * For a recorded button click, replace `event`/`envelope` with:
  *   "interactive": { "type": "block_actions", "user": { "id": "U…" },
@@ -231,7 +366,8 @@
  *   200 {"ok":true,"envelope_id":"<uuid>","event_id":"Ev…"}   sent
  *   400 {"ok":false,"error":"<reason>"}   malformed, the reason one of:
  *       `not-json`; `not-an-object`; `unknown-field` (a top-level key other
- *       than `label`, `event` and `envelope`); `no-label`; `event-not-object`;
+ *       than `label`, `event`, `envelope`, `interactive`, `installation` and
+ *       `redeliver`); `no-label`; `event-not-object`;
  *       `envelope-not-object`; `envelope-field-fixed` (an envelope key other
  *       than `is_ext_shared_channel` and `omit`); `omit-invalid` (`omit` not a
  *       non-empty list naming only `is_ext_shared_channel`, or given beside it)
@@ -299,15 +435,20 @@
  * `answer` set to its code. No line carries a returned message, its metadata
  * or blocks, or a `channels` entry; each `conversations.info` call is its own
  * line, its `channel` the requested one.
- * Posts/updates with `blocks` additionally record their redacted structured
- * display/button fields (no arbitrary fields or URLs), and successful ones
- * carry `response_ts`, the returned message timestamp used for a click.
+ * Successful `chat.postMessage` answers carry `response_ts`, the exact returned
+ * message timestamp, including plain-text posts. Posts/updates with `blocks`
+ * additionally record their redacted structured display/button fields (no
+ * arbitrary fields or URLs); successful block updates also carry `response_ts`
+ * for clicks. Failed or still-held answers have no successful api timestamp;
+ * a performed lost post's timestamp remains on its separate `fault` line.
  * `text` always has token-like text replaced by `<token>`, before it is
  * written. A `chat.postMessage` text is then recorded whole, so a scenario
  * can compare a posted notice in full; every other method's `text` is cut to
  * at most 300 characters. No token value is ever written or printed: only its kind (`bot`,
  * `app`, `user`, `other`, `none`) and the first 12 hex digits of its SHA-256.
  * The control's `suffix` values are not written either.
+ * Legacy ticket fields contain only markers this stub generated; an unknown
+ * externally supplied ticket is refused and recorded as null, never copied.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -322,6 +463,32 @@ import { appendFileSync, readFileSync, renameSync, statSync, writeFileSync } fro
 /** How `apps.connections.open` and the WebSocket behave for a token. */
 export type StubConnectionsMode = 'ok' | 'closed-port' | 'refuse-handshake' | 'no-hello' | 'no-url' | string
 
+const FAULT_METHODS = ['users.conversations', 'conversations.history', 'conversations.replies', 'chat.postMessage', 'users.info', 'conversations.info'] as const
+
+/** Name lookups also accept `late`, with their normal answer only. */
+const NAME_LOOKUP_METHODS: readonly string[] = ['users.info', 'conversations.info']
+
+export interface StubFault {
+  method: typeof FAULT_METHODS[number]
+  cursor?: string
+  channel?: string
+  thread_ts?: string
+  user?: string
+  after?: number
+  times?: number
+  outcome: 'hang' | 'error' | 'rate_limit' | 'delay' | 'lost' | 'late'
+  error?: string
+  retry_after?: number
+  delay_ms?: number
+  performed?: boolean
+  body?: Record<string, unknown>
+}
+
+export interface StubHistory {
+  page_size?: number
+  messages?: { channel: string; message: Record<string, unknown> & { ts: string } }[]
+}
+
 /** Answers for tokens: every field optional. */
 export interface StubAnswers {
   auth?: string
@@ -330,6 +497,13 @@ export interface StubAnswers {
   ws_scheme?: 'ws' | 'wss'
   user_id?: string
   bot_id?: string
+  team_id?: string
+  app_id?: string
+  /** Explicit Slack-side memberships; never inferred from posted traffic/config. */
+  memberships?: string[]
+  /** Cursor-keyed raw pages allow empty nonterminal and malformed responses. */
+  inventory_pages?: Record<string, Record<string, unknown>>
+  faults?: StubFault[]
 }
 
 /** One control entry: the tokens ending in `suffix` are `label`'s. */
@@ -386,6 +560,9 @@ export interface StubControl {
   /** Channel ID, then the requested message `ts`. */
   replies?: Record<string, Record<string, StubRepliesEntry>>
   reaction_pairs?: StubReactionPair[]
+  history?: StubHistory
+  socket_closes?: { label: string; refuse_connections?: number }[]
+  pushes?: Record<string, unknown>[]
 }
 
 export interface SlackStubOptions {
@@ -494,7 +671,7 @@ function recordedBlocks(text: string): Record<string, unknown>[] | null {
 // Control validation
 // ---------------------------------------------------------------------------
 
-const ANSWER_KEYS = ['auth', 'connections', 'ticket', 'ws_scheme', 'user_id', 'bot_id'] as const
+const ANSWER_KEYS = ['auth', 'connections', 'ticket', 'ws_scheme', 'user_id', 'bot_id', 'team_id', 'app_id'] as const
 
 /** The boolean `conversations.info` facts a `channels` entry may set. */
 const CHANNEL_FLAGS: readonly string[] = ['is_member', 'is_channel', 'is_private', 'is_mpim', 'is_im', 'is_ext_shared']
@@ -508,6 +685,42 @@ const SLACK_ERROR_RE = /^[a-z][a-z0-9_]*$/
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function positiveInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) > 0
+}
+
+/** The stub's own `memberships` cursors: the offset of the next page's first channel. */
+const MEMBERSHIP_CURSOR_PREFIX = 'stubmembers-'
+/** Where a `memberships` page starts: 0 for the first page, undefined for a cursor the stub never issued. */
+function membershipOffset(cursor: string | undefined): number | undefined {
+  if (!cursor) return 0
+  const offset = cursor.startsWith(MEMBERSHIP_CURSOR_PREFIX) ? Number(cursor.slice(MEMBERSHIP_CURSOR_PREFIX.length)) : NaN
+  return positiveInteger(offset) && `${MEMBERSHIP_CURSOR_PREFIX}${offset}` === cursor ? offset : undefined
+}
+
+function parseFault(value: unknown): StubFault {
+  const invalid = (): never => { throw new Error('faults entry is invalid') }
+  if (!isObject(value)) return invalid()
+  const keys = ['method', 'cursor', 'channel', 'thread_ts', 'user', 'after', 'times', 'outcome', 'error', 'retry_after', 'delay_ms', 'performed', 'body']
+  if (Object.keys(value).some(key => !keys.includes(key)) || !FAULT_METHODS.includes(value.method as StubFault['method'])) return invalid()
+  if (!['hang', 'error', 'rate_limit', 'delay', 'lost', 'late'].includes(value.outcome as string)) return invalid()
+  for (const key of ['cursor', 'channel', 'thread_ts', 'user']) if (value[key] !== undefined && typeof value[key] !== 'string') return invalid()
+  if (value.user !== undefined && value.method !== 'users.info') return invalid()
+  if (value.outcome === 'late' && value.method !== 'users.conversations' && !NAME_LOOKUP_METHODS.includes(value.method as string)) return invalid()
+  if (value.after !== undefined && !(value.after === 0 || positiveInteger(value.after))) return invalid()
+  if (value.times !== undefined && !positiveInteger(value.times)) return invalid()
+  if (value.delay_ms !== undefined && (!positiveInteger(value.delay_ms) || value.delay_ms > 2_147_483_647 || !['delay', 'lost', 'late'].includes(value.outcome as string))) return invalid()
+  if ((value.outcome === 'delay' || value.outcome === 'late') && value.delay_ms === undefined) return invalid()
+  if (value.error !== undefined && (value.outcome !== 'error' || typeof value.error !== 'string' || !/^[a-z][a-z0-9_]*$/.test(value.error))) return invalid()
+  if (value.retry_after !== undefined && (value.outcome !== 'rate_limit' || !positiveInteger(value.retry_after))) return invalid()
+  if (value.outcome === 'lost') {
+    if (value.method !== 'chat.postMessage' || typeof value.performed !== 'boolean') return invalid()
+  } else if (value.performed !== undefined) return invalid()
+  if (value.method === 'chat.postMessage' && ['hang', 'delay'].includes(value.outcome as string)) return invalid()
+  if (value.body !== undefined && ((value.outcome !== 'delay' && !(value.outcome === 'late' && value.method === 'users.conversations')) || value.method === 'chat.postMessage' || !isObject(value.body))) return invalid()
+  return structuredClone(value) as unknown as StubFault
 }
 
 /** `map[key]` when `map` holds `key` itself, so a request argument never reaches a prototype member. */
@@ -624,6 +837,18 @@ function checkAnswers(value: unknown, where: string): StubAnswers {
     if (key === 'ticket' && !/^[A-Za-z0-9_-]+$/.test(field)) throw new Error(`${where}.ticket must be letters, digits, _ or -`)
     ;(answers as Record<string, string>)[key] = field
   }
+  if (value.memberships !== undefined) {
+    if (!Array.isArray(value.memberships) || value.memberships.some(id => typeof id !== 'string' || !/^[CG][A-Z0-9]+$/.test(id))) throw new Error(`${where}.memberships must contain channel IDs`)
+    answers.memberships = [...value.memberships] as string[]
+  }
+  if (value.inventory_pages !== undefined) {
+    if (!isObject(value.inventory_pages) || Object.values(value.inventory_pages).some(page => !isObject(page))) throw new Error(`${where}.inventory_pages must contain pages`)
+    answers.inventory_pages = structuredClone(value.inventory_pages) as Record<string, Record<string, unknown>>
+  }
+  if (value.faults !== undefined) {
+    if (!Array.isArray(value.faults)) throw new Error('faults must be an array')
+    answers.faults = value.faults.map(parseFault)
+  }
   return answers
 }
 
@@ -642,6 +867,26 @@ export function parseControl(value: unknown): StubControl {
     })
   }
   if (value.default !== undefined) control.default = checkAnswers(value.default, 'default')
+  if (value.history !== undefined) {
+    const history = value.history
+    if (!isObject(history) || Object.keys(history).some(key => !['page_size', 'messages'].includes(key)) ||
+        (history.page_size !== undefined && !positiveInteger(history.page_size))) throw new Error('control.history is invalid')
+    if (history.messages !== undefined && (!Array.isArray(history.messages) || history.messages.some(entry =>
+      !isObject(entry) || Object.keys(entry).some(key => !['channel', 'message'].includes(key)) ||
+      typeof entry.channel !== 'string' || !/^[CDG][A-Z0-9]+$/.test(entry.channel) || !isObject(entry.message) ||
+      typeof entry.message.ts !== 'string' || !/^\d+\.\d{1,6}$/.test(entry.message.ts)))) throw new Error('control.history.messages is invalid')
+    control.history = structuredClone(history) as StubHistory
+  }
+  if (value.socket_closes !== undefined) {
+    if (!Array.isArray(value.socket_closes) || value.socket_closes.some(entry => !isObject(entry) ||
+      Object.keys(entry).some(key => !['label', 'refuse_connections'].includes(key)) || typeof entry.label !== 'string' || entry.label === '' ||
+      (entry.refuse_connections !== undefined && entry.refuse_connections !== 0 && !positiveInteger(entry.refuse_connections)))) throw new Error('control.socket_closes is invalid')
+    control.socket_closes = structuredClone(value.socket_closes) as StubControl['socket_closes']
+  }
+  if (value.pushes !== undefined) {
+    if (!Array.isArray(value.pushes) || value.pushes.some(entry => !parsePush(JSON.stringify(entry)).ok)) throw new Error('control.pushes is invalid')
+    control.pushes = structuredClone(value.pushes) as Record<string, unknown>[]
+  }
   for (const kind of ['users', 'channels'] as const) {
     const entries = value[kind]
     if (entries === undefined) continue
@@ -723,8 +968,13 @@ function okBody(method: string, args: Record<string, string>, seq: number, uploa
       const fileId = `F0STUB${String(seq).padStart(4, '0')}`
       return { ok: true, file_id: fileId, upload_url: `${uploadBase}${fileId}` }
     }
-    case 'files.completeUploadExternal':
-      return { ok: true, files: [{ id: 'F0STUBFILE', title: 'stub' }] }
+    case 'files.completeUploadExternal': {
+      // One entry per file the call completed, with the id and title it named.
+      let files: unknown
+      try { files = JSON.parse(args.files ?? '') } catch { files = undefined }
+      return { ok: true, files: (Array.isArray(files) ? files : []).filter(f => isObject(f) && typeof f.id === 'string')
+        .map(f => ({ id: f.id, title: typeof f.title === 'string' ? f.title : '' })) }
+    }
     default:
       return { ok: true }
   }
@@ -784,7 +1034,7 @@ function pairDefinition(entry: StubReactionPair): string {
 const PUSH_FLAG = 'is_ext_shared_channel'
 
 /** The keys a push request may carry, and the keys its `envelope` may carry. */
-const PUSH_KEYS: readonly string[] = ['label', 'event', 'envelope', 'interactive']
+const PUSH_KEYS: readonly string[] = ['label', 'event', 'envelope', 'interactive', 'installation', 'redeliver']
 const PUSH_ENVELOPE_KEYS: readonly string[] = [PUSH_FLAG, 'omit']
 
 /** The most characters of a push-supplied value a `push` or `push-refused` line carries. */
@@ -807,6 +1057,9 @@ type PushRefusalReason =
   | 'omit-invalid'
   | 'no-open-socket'
   | 'send-failed'
+  | 'installation-invalid'
+  | 'redelivery-invalid'
+  | 'redelivery-unknown'
 
 /** The HTTP status of each refusal: 400 for a malformed push. */
 const PUSH_REFUSAL_STATUS: Readonly<Record<PushRefusalReason, number>> = {
@@ -822,6 +1075,9 @@ const PUSH_REFUSAL_STATUS: Readonly<Record<PushRefusalReason, number>> = {
   'omit-invalid': 400,
   'no-open-socket': 409,
   'send-failed': 503,
+  'installation-invalid': 400,
+  'redelivery-invalid': 400,
+  'redelivery-unknown': 409,
 }
 
 /** The flag a push asks for: a value sent as given, or left out. */
@@ -843,9 +1099,19 @@ interface PushInteractive {
 }
 
 type ParsedPush =
-  | { ok: true; label: string; event: Record<string, unknown>; flag: PushFlag }
+  | { ok: true; label: string; event: Record<string, unknown>; flag: PushFlag; installation?: Record<string, unknown> }
   | { ok: true; label: string; interactive: PushInteractive }
+  | { ok: true; label: string; redeliver: { envelope_id: string; retry_attempt?: number; retry_reason?: string } }
   | { ok: false; label: string | null; reason: PushRefusalReason }
+
+function validInstallation(value: unknown): value is Record<string, unknown> {
+  if (!isObject(value) || Object.keys(value).some(key => !['team_id', 'api_app_id', 'authorizations'].includes(key))) return false
+  for (const key of ['team_id', 'api_app_id']) if (value[key] !== undefined && (typeof value[key] !== 'string' || value[key] === '')) return false
+  return value.authorizations === undefined || (Array.isArray(value.authorizations) && value.authorizations.every(auth =>
+    isObject(auth) && Object.entries(auth).every(([key, field]) =>
+      ['team_id', 'user_id'].includes(key) ? typeof field === 'string' :
+      ['is_bot', 'is_enterprise_install'].includes(key) && typeof field === 'boolean')))
+}
 
 /** The interactive control accepts only button clicks; team/app/container are generated. */
 function parseInteractive(value: unknown): PushInteractive | undefined {
@@ -877,23 +1143,34 @@ function parsePush(text: string): ParsedPush {
   const label = typeof body.label === 'string' && body.label !== '' ? body.label : null
   if (Object.keys(body).some(key => !PUSH_KEYS.includes(key))) return { ok: false, label, reason: 'unknown-field' }
   if (label === null) return { ok: false, label, reason: 'no-label' }
+  if (body.redeliver !== undefined) {
+    const retry = body.redeliver
+    if (Object.keys(body).some(key => !['label', 'redeliver'].includes(key)) || !isObject(retry) ||
+        Object.keys(retry).some(key => !['envelope_id', 'retry_attempt', 'retry_reason'].includes(key)) ||
+        typeof retry.envelope_id !== 'string' || retry.envelope_id === '' ||
+        (retry.retry_attempt !== undefined && !positiveInteger(retry.retry_attempt)) ||
+        (retry.retry_reason !== undefined && typeof retry.retry_reason !== 'string')) return { ok: false, label, reason: 'redelivery-invalid' }
+    return { ok: true, label, redeliver: retry as { envelope_id: string; retry_attempt?: number; retry_reason?: string } }
+  }
   if (body.interactive !== undefined) {
     const interactive = parseInteractive(body.interactive)
-    if (body.event !== undefined || body.envelope !== undefined || interactive === undefined) return { ok: false, label, reason: 'interactive-invalid' }
+    if (body.event !== undefined || body.envelope !== undefined || body.installation !== undefined || interactive === undefined) return { ok: false, label, reason: 'interactive-invalid' }
     return { ok: true, label, interactive }
   }
   const event = body.event
   if (!isObject(event)) return { ok: false, label, reason: 'event-not-object' }
-  if (body.envelope === undefined) return { ok: true, label, event, flag: { sent: true, value: false } }
+  if (body.installation !== undefined && !validInstallation(body.installation)) return { ok: false, label, reason: 'installation-invalid' }
+  const installation = body.installation as Record<string, unknown> | undefined
+  if (body.envelope === undefined) return { ok: true, label, event, installation, flag: { sent: true, value: false } }
   const envelope = body.envelope
   if (!isObject(envelope)) return { ok: false, label, reason: 'envelope-not-object' }
   if (Object.keys(envelope).some(key => !PUSH_ENVELOPE_KEYS.includes(key))) return { ok: false, label, reason: 'envelope-field-fixed' }
   if (envelope.omit !== undefined) {
     const omit = envelope.omit
     const valid = envelope[PUSH_FLAG] === undefined && Array.isArray(omit) && omit.length > 0 && omit.every(name => name === PUSH_FLAG)
-    return valid ? { ok: true, label, event, flag: { sent: false } } : { ok: false, label, reason: 'omit-invalid' }
+    return valid ? { ok: true, label, event, installation, flag: { sent: false } } : { ok: false, label, reason: 'omit-invalid' }
   }
-  return { ok: true, label, event, flag: { sent: true, value: envelope[PUSH_FLAG] === undefined ? false : envelope[PUSH_FLAG] } }
+  return { ok: true, label, event, installation, flag: { sent: true, value: envelope[PUSH_FLAG] === undefined ? false : envelope[PUSH_FLAG] } }
 }
 
 /** A push-supplied string as a record line carries it: token-like text replaced, then cut; null when not a string. */
@@ -944,13 +1221,22 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
   let seq = 0
   let ticketSeq = 0
   let pushSeq = 0
-  let control: StubControl = options.control ?? {}
+  let control: StubControl = parseControl(options.control ?? {})
+  const authenticatedInstallations = new Map<string, { team_id: string; app_id: string; user_id: string }>()
   let controlStamp = ''
   const tickets = new Map<string, { label: string; mode: string }>()
+  const issuedTicketMarkers = new Set<string>()
   const sockets = new Set<Bun.ServerWebSocket<ConnData>>()
   // Only this stub instance's successful posts/updates authorize a click.
   const messageActions = new Map<string, PushAction[]>()
   const messageKey = (label: string, channel: string, ts: string): string => JSON.stringify([label, channel, ts])
+  const sentEvents = new Map<string, { label: string; payload: Record<string, unknown>; originalEnvelopeId: string; attempt: number }>()
+  const faultCalls = new Map<StubAnswers, number[]>()
+  const connectionRefusals = new Map<string, { remaining: number; index: number }>()
+  const heldRequests = new Set<() => void>()
+  const ownPosts: NonNullable<StubHistory['messages']> = []
+  let historyEnabled = control.history !== undefined
+  const historyCursors = new Map<string, { key: string; messages: Record<string, unknown>[]; offset: number }>()
   // Pair state by id: retained across control reloads, so a spent id stays spent.
   const pairStates = new Map<string, PairState>()
   const pairWaits = new Set<() => void>()
@@ -981,6 +1267,9 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
 
   function applyControl(next: StubControl, source: 'file' | 'http'): void {
     control = next
+    faultCalls.clear()
+    connectionRefusals.clear()
+    if (next.history !== undefined) historyEnabled = true
     record('control', { source, labels: labelsOf(next) })
     // Checked here, not at slot 2: a pending pair matches by tuple before the
     // control is read, so a held slot 1 would otherwise complete with the
@@ -989,6 +1278,116 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
       const known = pairStates.get(entry.id)
       if (known?.phase === 'pending' && known.definition !== pairDefinition(entry)) settlePair(known, 'reused')
     }
+    applyActions()
+  }
+
+  function applyActions(): void {
+    for (const [index, close] of (control.socket_closes ?? []).entries()) {
+      connectionRefusals.set(close.label, { remaining: close.refuse_connections ?? 0, index })
+      let count = 0
+      for (const ws of sockets) {
+        if (ws.data.label !== close.label || ws.readyState !== WS_OPEN) continue
+        record('socket-close', { control: 'socket_closes', control_index: index, label: pushFieldText(close.label), connection_id: ws.data.connectionId })
+        ws.close(1001, 'stub connection gap')
+        count += 1
+      }
+      if (count === 0) record('socket-close-missed', { control: 'socket_closes', control_index: index, label: pushFieldText(close.label) })
+    }
+    for (const body of control.pushes ?? []) push(JSON.stringify(body))
+  }
+
+  function matchingFault(answers: StubAnswers, method: string, args: Record<string, string>): { fault: StubFault; index: number; call: number } | undefined {
+    if (answers.faults === undefined) return undefined
+    const counts = faultCalls.get(answers) ?? []
+    faultCalls.set(answers, counts)
+    let selected: { fault: StubFault; index: number; call: number } | undefined
+    for (const [index, fault] of (answers.faults ?? []).entries()) {
+      if (fault.method !== method || (['cursor', 'channel', 'thread_ts', 'user'] as const).some(key => fault[key] !== undefined && fault[key] !== (args[key] ?? ''))) continue
+      const call = counts[index] = (counts[index] ?? 0) + 1
+      const after = fault.after ?? 0
+      if (selected === undefined && call > after && call - after <= (fault.times ?? 1)) selected = { fault, index, call }
+    }
+    return selected
+  }
+
+  /**
+   * Held HTTP responses own their timer/abort listener; stopping releases all.
+   * A late answer ignores the client's abort and records whether it was still connected.
+   */
+  function holdAnswer(req: Request, requestId: string, delayMs: number | undefined, release: () => Response, late = false): Promise<Response> {
+    return new Promise(resolve => {
+      let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const finish = (resolution: 'delay' | 'abort' | 'stop' | 'late'): void => {
+        if (settled) return
+        settled = true
+        if (timer !== undefined) clearTimeout(timer)
+        req.signal.removeEventListener('abort', abort)
+        heldRequests.delete(stop)
+        record('fault-settled', { request_id: requestId, resolution, ...(resolution === 'late' ? { socket_open: !req.signal.aborted } : {}) })
+        resolve(resolution === 'delay' || resolution === 'late' ? release() : new Response(null, { status: 499 }))
+      }
+      const abort = (): void => finish('abort')
+      const stop = (): void => finish('stop')
+      heldRequests.add(stop)
+      if (late) timer = setTimeout(() => finish('late'), delayMs)
+      else {
+        req.signal.addEventListener('abort', abort, { once: true })
+        if (req.signal.aborted) abort()
+        else if (delayMs !== undefined) timer = setTimeout(() => finish('delay'), delayMs)
+      }
+    })
+  }
+
+  function rememberPost(label: string, answers: StubAnswers, token: string, args: Record<string, string>, body: Record<string, unknown>): void {
+    if (typeof body.ts !== 'string' || typeof body.channel !== 'string') return
+    const identity = authenticatedInstallations.get(label)
+    const hash = tokenHash(token).toUpperCase().slice(0, 10)
+    const parent = args.thread_ts === undefined ? undefined :
+      ownPosts.find(post => post.channel === body.channel && post.message.ts === args.thread_ts)?.message ??
+      control.history?.messages?.find(post => post.channel === body.channel && post.message.ts === args.thread_ts)?.message
+    const thread = typeof parent?.thread_ts === 'string' ? parent.thread_ts : args.thread_ts
+    ownPosts.push({ channel: body.channel, message: {
+      type: 'message', user: answers.user_id ?? identity?.user_id ?? `U${hash}`,
+      bot_id: answers.bot_id ?? `B${hash}`, text: args.text ?? '', ts: body.ts,
+      ...(thread === undefined ? {} : { thread_ts: thread }),
+    } })
+    // Opted-in callers see Slack's canonical thread in the post answer too.
+    if (historyEnabled && thread !== undefined && isObject(body.message)) body.message.thread_ts = thread
+  }
+
+  function historyBody(label: string, method: string, args: Record<string, string>): Record<string, unknown> {
+    const key = JSON.stringify([label, method, args.channel ?? '', args.ts ?? ''])
+    let messages: Record<string, unknown>[]
+    let offset = 0
+    if (args.cursor) {
+      const cursor = historyCursors.get(args.cursor)
+      if (cursor === undefined || cursor.key !== key) return { ok: false, error: 'invalid_cursor' }
+      ;({ messages, offset } = cursor)
+    } else {
+      const byTimestamp = new Map<string, Record<string, unknown>>()
+      for (const post of [...(control.history?.messages ?? []), ...ownPosts]) {
+        if (post.channel === args.channel) byTimestamp.set(post.message.ts, post.message)
+      }
+      const parent = args.ts === undefined ? undefined : byTimestamp.get(args.ts)
+      const root = typeof parent?.thread_ts === 'string' ? parent.thread_ts : args.ts
+      messages = [...byTimestamp.values()].filter(message => {
+        if (method === 'conversations.history' ? message.thread_ts !== undefined && message.thread_ts !== message.ts :
+          root === undefined || (message.ts !== root && message.thread_ts !== root)) return false
+        const ts = Number(message.ts), inclusive = args.inclusive === 'true'
+        if (args.oldest && (inclusive ? ts < Number(args.oldest) : ts <= Number(args.oldest))) return false
+        if (args.latest && (inclusive ? ts > Number(args.latest) : ts >= Number(args.latest))) return false
+        return true
+      }).sort((a, b) => (Number(a.ts) - Number(b.ts)) * (method === 'conversations.history' ? -1 : 1))
+      messages = structuredClone(messages)
+    }
+    const limit = Number(args.limit)
+    const size = Math.min(control.history?.page_size ?? 100, positiveInteger(limit) ? limit : Infinity)
+    const page = messages.slice(offset, offset + size)
+    const hasMore = offset + page.length < messages.length
+    const next = hasMore ? `stubcursor-${randomUUID()}` : ''
+    if (hasMore) historyCursors.set(next, { key, messages, offset: offset + page.length })
+    return { ok: true, messages: page, has_more: hasMore, response_metadata: { next_cursor: next } }
   }
 
   /** Re-read the control file when its mtime or size changed; keep the old control on a bad file. */
@@ -1017,6 +1416,30 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
       return { label: `unlabelled-${tokenHash(token)}`, answers: control.default ?? {} }
     }
     return { label: 'no-token', answers: control.default ?? {} }
+  }
+
+  /** Replace one label's inventory answers on its existing rule objects, which key the fault counters. */
+  function stageInventory(text: string): Response {
+    let label: unknown, fields: StubAnswers
+    try {
+      const value: unknown = JSON.parse(text)
+      if (!isObject(value) || Object.keys(value).some(key => !['label', 'memberships', 'inventory_pages'].includes(key)) ||
+          (value.memberships === undefined && value.inventory_pages === undefined)) throw new Error('inventory-invalid')
+      label = value.label
+      if (typeof label !== 'string' || label === '') throw new Error('inventory-invalid')
+      fields = checkAnswers({ memberships: value.memberships, inventory_pages: value.inventory_pages }, 'inventory')
+    } catch {
+      record('inventory-refused', { label: pushFieldText(label), reason: 'inventory-invalid' })
+      return Response.json({ ok: false, error: 'inventory-invalid' }, { status: 400 })
+    }
+    const rules = (control.tokens ?? []).filter(rule => rule.label === label)
+    if (!rules.length) {
+      record('inventory-refused', { label: pushFieldText(label), reason: 'unknown-label' })
+      return Response.json({ ok: false, error: 'unknown-label' }, { status: 409 })
+    }
+    for (const rule of rules) Object.assign(rule, structuredClone(fields))
+    record('inventory', { label: pushFieldText(label), fields: Object.keys(fields) })
+    return Response.json({ ok: true, seq })
   }
 
   /** A `reaction-pair` record line: the pair's bounded, validated identity and `fields`. */
@@ -1130,27 +1553,46 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
       })
       return Response.json({ ok: true, envelope_id: envelopeId })
     }
-    // The original events_api path and its records remain unchanged.
-    if (!('event' in parsed)) return refusePush(label, 'event-not-object')
-    const { event, flag } = parsed
-    pushSeq += 1
     const envelopeId = randomUUID()
-    const eventId = `Ev0STUB${String(pushSeq).padStart(4, '0')}${randomUUID().slice(0, 8).toUpperCase()}`
-    const payload: Record<string, unknown> = {
-      type: 'event_callback',
-      team_id: TEAM_ID,
-      api_app_id: APP_ID,
-      event,
-      event_id: eventId,
-      event_time: Math.floor(Date.now() / 1000),
+    let payload: Record<string, unknown>
+    let flag: PushFlag
+    let retryAttempt = 0
+    let retryReason = ''
+    let originalEnvelopeId: string = envelopeId
+    if ('redeliver' in parsed) {
+      const previous = sentEvents.get(parsed.redeliver.envelope_id)
+      if (previous === undefined || previous.label !== label) return refusePush(label, 'redelivery-unknown')
+      payload = structuredClone(previous.payload)
+      flag = Object.hasOwn(payload, PUSH_FLAG) ? { sent: true, value: payload[PUSH_FLAG] } : { sent: false }
+      retryAttempt = parsed.redeliver.retry_attempt ?? previous.attempt + 1
+      retryReason = parsed.redeliver.retry_reason ?? 'timeout'
+      originalEnvelopeId = previous.originalEnvelopeId
+    } else if ('event' in parsed) {
+      flag = parsed.flag
+      pushSeq += 1
+      const installation = authenticatedInstallations.get(label) ?? control.tokens?.find(rule => rule.label === label) ?? control.default ?? {}
+      payload = {
+        authorizations: [{ team_id: installation.team_id ?? TEAM_ID, user_id: installation.user_id, is_bot: true }],
+        type: 'event_callback',
+        team_id: installation.team_id ?? TEAM_ID,
+        api_app_id: installation.app_id ?? APP_ID,
+        event: parsed.event,
+        event_id: `Ev0STUB${String(pushSeq).padStart(4, '0')}${randomUUID().slice(0, 8).toUpperCase()}`,
+        event_time: Math.floor(Date.now() / 1000),
+      }
+      if (flag.sent) payload[PUSH_FLAG] = flag.value
+      Object.assign(payload, parsed.installation)
+    } else {
+      return refusePush(label, 'event-not-object')
     }
-    if (flag.sent) payload[PUSH_FLAG] = flag.value
+    const event = payload.event as Record<string, unknown>
+    const eventId = payload.event_id as string
     const envelope = {
       envelope_id: envelopeId,
       type: 'events_api',
       accepts_response_payload: false,
-      retry_attempt: 0,
-      retry_reason: '',
+      retry_attempt: retryAttempt,
+      retry_reason: retryReason,
       payload,
     }
     const wire = JSON.stringify(envelope)
@@ -1174,6 +1616,15 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
       channel: pushFieldText(event.channel),
       channel_type: pushFieldText(event.channel_type),
       ...pushFlagFields(flag),
+    })
+    sentEvents.set(envelopeId, { label, payload: structuredClone(payload), originalEnvelopeId, attempt: retryAttempt })
+    if ('redeliver' in parsed) record('redelivery', {
+      control: 'redeliver', label: pushFieldText(label), original_envelope_id: originalEnvelopeId,
+      source_envelope_id: parsed.redeliver.envelope_id, envelope_id: envelopeId, event_id: eventId,
+      connection_id: target.data.connectionId, retry_attempt: retryAttempt,
+    })
+    if ('installation' in parsed && parsed.installation !== undefined) record('push-installation', {
+      control: 'installation', label: pushFieldText(label), envelope_id: envelopeId, connection_id: target.data.connectionId,
     })
     return Response.json({ ok: true, envelope_id: envelopeId, event_id: eventId })
   }
@@ -1237,12 +1688,16 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
     return configured(2)
   }
 
-  refreshControl()
+  if (controlPath === undefined) applyActions()
+  else refreshControl()
 
   const server = Bun.serve<ConnData>({
     hostname: '127.0.0.1',
     port: options.port ?? 0,
     async fetch(req, srv) {
+      // A name-lookup fault's arrival, captured before control-file I/O or body parsing.
+      const arrivalMonoMs = performance.now()
+      const arrivalEpochMs = Date.now()
       refreshControl()
       const url = new URL(req.url)
       const path = url.pathname
@@ -1260,12 +1715,13 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
         }
       }
       if (path === '/_push' && req.method === 'POST') return push(await req.text())
+      if (path === '/_inventory' && req.method === 'POST') return stageInventory(await req.text())
 
       if (path.startsWith('/link')) {
         const ticket = url.searchParams.get('ticket') ?? ''
         const issued = tickets.get(ticket)
         if (issued === undefined || issued.mode === 'refuse-handshake') {
-          record('ws-refused', { label: issued?.label ?? 'unknown', ticket, reason: issued === undefined ? 'unknown-ticket' : 'refuse-handshake' })
+          record('ws-refused', { label: issued?.label ?? 'unknown', ticket: issuedTicketMarkers.has(ticket) ? ticket : null, reason: issued === undefined ? 'unknown-ticket' : 'refuse-handshake' })
           return new Response('handshake refused', { status: 400 })
         }
         tickets.delete(ticket) // single use, like Slack's
@@ -1301,6 +1757,7 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
         if (args.name !== undefined) fields.name = recordedText(method, args.name)
         if (args.timestamp !== undefined) fields.timestamp = recordedText(method, args.timestamp)
       }
+      if (method === 'users.conversations') { fields.cursor = recordedText(method, args.cursor ?? ''); fields.types = recordedText(method, args.types ?? ''); fields.team_id = recordedText(method, args.team_id ?? '') }
       if (method === 'conversations.replies') {
         // `request_ts`, because a record line's own `ts` is its write time.
         for (const [arg, field] of [['ts', 'request_ts'], ['oldest', 'oldest'], ['latest', 'latest'], ['inclusive', 'inclusive'], ['include_all_metadata', 'include_all_metadata']] as const) {
@@ -1315,8 +1772,11 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
 
       const answer = (name: string, body: Record<string, unknown> | undefined, status = 200): Response => {
         if (body?.ok === true && typeof body.ts === 'string' && typeof body.channel === 'string' &&
-            (method === 'chat.postMessage' || method === 'chat.update') && args.blocks !== undefined) {
+            (method === 'chat.postMessage' || (method === 'chat.update' && args.blocks !== undefined))) {
           fields.response_ts = body.ts.replace(TOKEN_LIKE_ALL, '<token>')
+        }
+        if (body?.ok === true && typeof body.ts === 'string' && typeof body.channel === 'string' &&
+            (method === 'chat.postMessage' || method === 'chat.update') && args.blocks !== undefined) {
           let blocks: unknown
           try { blocks = JSON.parse(args.blocks) } catch { blocks = undefined }
           const actions: PushAction[] = []
@@ -1347,11 +1807,20 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
 
       if (method === 'apps.connections.open') {
         if (kind !== 'app') return answer('not_allowed_token_type', { ok: false, error: 'not_allowed_token_type' })
+        const refusal = connectionRefusals.get(label)
+        if (refusal !== undefined && refusal.remaining > 0) {
+          refusal.remaining -= 1
+          fields.request_id = randomUUID()
+          record('connection-refused', { control: 'socket_closes', control_index: refusal.index, label: pushFieldText(label),
+            method, request_id: fields.request_id, remaining: refusal.remaining })
+          return failWith('temporarily_unavailable')
+        }
         const mode = answers.connections ?? 'ok'
         if (mode === 'no-url') return answer(mode, { ok: true })
         if (!['ok', 'closed-port', 'refuse-handshake', 'no-hello'].includes(mode)) return failWith(mode)
         ticketSeq += 1
         const ticket = `${answers.ticket ?? 'stubticket'}${ticketSeq}`
+        issuedTicketMarkers.add(ticket)
         const scheme = answers.ws_scheme ?? (mode === 'closed-port' ? 'wss' : 'ws')
         const port = mode === 'closed-port' ? closedPort : srv.port
         if (mode !== 'closed-port') tickets.set(ticket, { label, mode })
@@ -1366,6 +1835,49 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
       }
       if (auth !== 'ok') return failWith(auth)
 
+      const normalBody = (): Record<string, unknown> => {
+        if (method === 'users.conversations') {
+          const page = answers.inventory_pages?.[args.cursor ?? '']
+          if (page) return structuredClone(page)
+          const start = membershipOffset(args.cursor)
+          if (start === undefined) return { ok: false, error: 'invalid_cursor' }
+          const memberships = answers.memberships ?? [], limit = Number(args.limit)
+          const end = positiveInteger(limit) ? start + limit : memberships.length
+          return { ok: true, channels: memberships.slice(start, end).map(id => ({
+            id, is_channel: id.startsWith('C'), is_group: id.startsWith('G'), is_im: false, is_mpim: false, is_ext_shared: false,
+          })), response_metadata: { next_cursor: end < memberships.length ? `${MEMBERSHIP_CURSOR_PREFIX}${end}` : '' } }
+        }
+        if (historyEnabled && (method === 'conversations.history' || method === 'conversations.replies')) return historyBody(label, method, args)
+        return okBody(method, args, n, `http://127.0.0.1:${srv.port}/upload/`, control)
+      }
+      const matched = matchingFault(answers, method, args)
+      if (matched !== undefined) {
+        const { fault, index, call } = matched
+        const requestId = randomUUID()
+        fields.request_id = requestId
+        const body = fault.outcome === 'delay' || fault.outcome === 'late' ? structuredClone(fault.body ?? normalBody()) :
+          fault.outcome === 'lost' && fault.performed ? normalBody() : { ok: false, error: 'internal_error' }
+        if (fault.outcome === 'lost') {
+          historyEnabled = true
+          if (fault.performed) rememberPost(label, answers, token!, args, body)
+        }
+        record('fault', { control: 'faults', fault_index: index, method, label: pushFieldText(label), request_id: requestId,
+          matching_call: call, outcome: fault.outcome,
+          ...(fault.outcome === 'lost' ? { performed: fault.performed, response_ts: fault.performed ? body.ts : null } : {}),
+          ...(method === 'users.info' || method === 'conversations.info' ?
+            { match: pushFieldText(method === 'users.info' ? args.user : args.channel), arrival_mono_ms: arrivalMonoMs, arrival_epoch_ms: arrivalEpochMs } : {}),
+          ...(method === 'users.conversations' ? { arrival_mono_ms: arrivalMonoMs, arrival_epoch_ms: arrivalEpochMs } : {}) })
+        if (fault.outcome === 'error') return failWith(fault.error ?? 'internal_error')
+        if (fault.outcome === 'rate_limit') {
+          const response = answer('ratelimited', { ok: false, error: 'ratelimited' }, 429)
+          response.headers.set('Retry-After', String(fault.retry_after ?? 1))
+          return response
+        }
+        // A held fault belongs to the client's deadline, not Bun's HTTP idle timeout.
+        srv.timeout(req, 0)
+        return holdAnswer(req, requestId, fault.delay_ms, () => answer(body.ok === true ? 'ok' : 'controlled-error', body), fault.outcome === 'late')
+      }
+
       const configuredError = method === 'conversations.info' ? ownEntry(control.channels, args.channel ?? 'C0STUBCHAN')?.error
         : method === 'conversations.replies' ? (ownEntry(ownEntry(control.replies, args.channel), args.ts) as { error?: string } | undefined)?.error
           : undefined
@@ -1373,18 +1885,29 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
 
       if (method === 'auth.test') {
         const hash = tokenHash(token!).toUpperCase().slice(0, 10)
+        authenticatedInstallations.set(label, { team_id: answers.team_id ?? TEAM_ID, app_id: answers.app_id ?? APP_ID, user_id: answers.user_id ?? `U${hash}` })
         return answer('ok', {
           ok: true,
           url: `http://127.0.0.1:${srv.port}/`,
           team: 'stub-team',
-          team_id: TEAM_ID,
+          team_id: answers.team_id ?? TEAM_ID,
           user: label,
           user_id: answers.user_id ?? `U${hash}`,
           bot_id: answers.bot_id ?? `B${hash}`,
           is_enterprise_install: false,
         })
       }
-      return answer('ok', okBody(method, args, n, `http://127.0.0.1:${srv.port}/upload/`, control))
+      if (method === 'bots.info') {
+        const hash = tokenHash(token!).toUpperCase().slice(0, 10)
+        return answer('ok', { ok: true, bot: { id: answers.bot_id ?? `B${hash}`, user_id: answers.user_id ?? `U${hash}`, app_id: answers.app_id ?? APP_ID, deleted: false } })
+      }
+      if (method === 'users.conversations') {
+        const body = normalBody()
+        return answer(body.ok === false ? String(body.error) : 'ok', body)
+      }
+      const body = normalBody()
+      if (method === 'chat.postMessage') rememberPost(label, answers, token!, args, body)
+      return answer(body.ok === false ? String(body.error) : 'ok', body)
     },
     websocket: {
       // Slack's pings would start the client's 30 s server-ping watch; the
@@ -1443,6 +1966,7 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
     async stop() {
       if (stopped) return
       stopped = true
+      for (const release of [...heldRequests]) release()
       pairsStopped = true
       for (const state of pairStates.values()) settlePair(state, 'stopped')
       for (const done of [...pairWaits]) done()

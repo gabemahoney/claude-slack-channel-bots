@@ -110,6 +110,11 @@ export function fail(reason: string, evidence: string[], notes?: string[]): Chec
   return { status: 'FAIL', reason, evidence, notes }
 }
 
+/** A SKIPPED "not run" result that keeps the evidence and notes: never a pass. */
+export function notRun(reason: string, f: Pick<Findings, 'evidence' | 'notes'>): CheckResult {
+  return { status: 'SKIPPED', reason: `not run: ${reason} (the plan records this as "not run", not a pass)`, evidence: f.evidence, notes: f.notes }
+}
+
 export function skipped(reason: string, evidence: string[] = []): CheckResult {
   return { status: 'SKIPPED', reason, evidence }
 }

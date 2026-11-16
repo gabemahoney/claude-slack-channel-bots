@@ -13,10 +13,14 @@ import { RETYPE_BACKOFF_MS } from '../src/delivery-constants.ts'
 import { buildReactionMessageUnknownLine, buildReactionWithdrawnLine } from '../src/reaction-preparation-diagnostics.ts'
 import { buildTagParts, NAME_LOOKUP_TIMEOUT_MS, tagByteLength, type TagMessage } from '../src/tag-wrapper.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
-import { reactionInput, injectedInput, queuePath, slackInput } from './test-helpers/delivery-queue.ts'
+import { heldSlackInput, memoryHold, injectedInput, queuePath, reactionInput, slackInput } from './test-helpers/delivery-queue.ts'
+import { THREAD_ROOTS } from './test-helpers/thread-memory.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { asWebClient, makeChannelMessage, makeDeferredWebApiCall, makeStubSlack, type DeferredWebApiCall, type SettledWebApiOutcome, type StubSlack } from './test-helpers/slack-stub.ts'
 import { assertNoLeak, LEAK_SENTINEL, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
+import { makeSharedAuthority } from './test-helpers/shared-channels.ts'
+import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
+import { observedMembership } from './test-helpers/persona-routing-harness.ts'
 
 const harnesses: EngineHarness[] = []
 const preparations: DeliveryPreparation[] = []
@@ -35,15 +39,57 @@ afterEach(async () => {
   assertNoLeak(lines, 'diagnostics')
 })
 
+test('Memory Hold recovery and failed fixation retries prepare only released work', async () => {
+  const h = await makeEngineHarness(); harnesses.push(h)
+  for (const ts of [THREAD_ROOTS.secondary, THREAD_ROOTS.third]) {
+    const input = heldSlackInput(memoryHold(h.clock.now()), { ts, key: { chat_id: 'C0TEST001', ts } })
+    expect((await h.queue.acceptDecided('alpha', input.key, () => ({ store: input }))).status).toBe('accepted')
+  }
+  await h.restartServer()
+  await h.queue.resolveHolds('alpha', [{ seq: 2, outcome: 'withdrawn', at: h.clock.now() }])
+  await h.preparation.recover()
+  for (const item of h.queue.items('alpha')) await h.preparation.prepare('alpha', item)
+  await h.advance(RETYPE_BACKOFF_MS[0])
+  expect(h.order).not.toContain('lookup')
+  expect(h.records().filter(r => r.kind === 'fixed')).toEqual([])
+  expect(h.preparation.owns('alpha', 1)).toBe(false)
+  expect(h.preparation.owns('alpha', 2)).toBe(false)
+  expect(h.keyCalls()).toEqual([])
+
+  await h.queue.resolveHolds('alpha', [{ seq: 1, outcome: 'released', at: h.clock.now() }])
+  h.failAppend('fixed')
+  await h.preparation.recover()
+  expect(h.preparation.owns('alpha', 1)).toBe(true)
+  expect(h.preparation.owns('alpha', 2)).toBe(false)
+  expect(h.queue.item('alpha', 1)?.fixed).toBeUndefined()
+  await h.accept('later')
+  await h.tick()
+  await h.advance(RETYPE_BACKOFF_MS[0] - 1)
+  expect(h.keyCalls()).toEqual([])
+  expect(h.queue.item('alpha', 1)?.fixed).toBeUndefined()
+  await h.until(() => h.queue.openCount('alpha') === 0)
+  expect(h.records().filter(r => r.kind === 'fixed').map(r => r.seq)).toEqual([3, 1])
+  expect(h.events.filter(e => e.type === 'item-delivered').map(e => e.seq)).toEqual([1, 3])
+  expect(h.order.filter(entry => entry === 'lookup')).toHaveLength(1)
+  expect(h.queue.item('alpha', 2)?.fixed).toBeUndefined()
+  expect(h.preparation.owns('alpha', 1)).toBe(false)
+  expect(h.errors).toEqual([])
+})
+
 test.each(['slack-post-ack', 'injected', 'startup-accepted-only'] as const)('%s autonomously retries fixation, preserving ack and FIFO boundaries', async source => {
   const h = await makeEngineHarness(); harnesses.push(h)
   h.failAppend('fixed')
   if (source === 'slack-post-ack') {
     const config = makeMultiPersonaConfig([{ name: 'alpha', key: 'alpha' }], h.root)
+    const choices = createChannelDeliveryStore(makeSharedAuthority(h.root, { ...config,
+      personas: config.personas.map(({ key, index, ...persona }) => persona),
+    }))
     const routing = createPersonaRouting({
+      getChannelDelivery: () => choices, membership: observedMembership({ alpha: ['C0TEST001'] }),
       queue: h.queue, prepare: h.preparation.prepare, getPersonaConfig: () => config,
       getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }),
-      archive: () => {}, log: line => h.order.push(line), isPersonaUp: () => false, now: h.clock.now,
+      archive: () => {}, log: line => h.order.push(line), isPersonaUp: () => true,
+      readRowLiveness: async () => { h.order.push('row-read'); return { kind: 'live' } }, now: h.clock.now,
     })
     await routing.receive(makeChannelMessage({ channel: config.personas[0]!.channels[0]!.id, user: 'U0SENDER1', text: 'first' }), () => {
       expect(h.records().filter(r => r.kind === 'accepted')).toHaveLength(1)
@@ -52,6 +98,7 @@ test.each(['slack-post-ack', 'injected', 'startup-accepted-only'] as const)('%s 
       h.order.push('ack')
     }, 'alpha')
     expect(h.order.indexOf('ack')).toBeLessThan(h.order.indexOf('lookup'))
+    expect(h.order.indexOf('ack')).toBeLessThan(h.order.indexOf('row-read'))
   } else if (source === 'injected') {
     const accepted = await h.preparation.accept('alpha', injectedInput({ text: 'first' }))
     expect(accepted.status).toBe('accepted')
@@ -189,7 +236,7 @@ describe('reaction preparation fixes or withdraws through the real queue', () =>
   const ASSEMBLY: Array<[string, Partial<ReactionAcceptedInput>, SettledWebApiOutcome, SettledWebApiOutcome, TagMessage, string[]]> = [
     ['a user adds a reaction to a threaded message', { change: 'added', emoji: 'white_check_mark' }, exact({ thread_ts: ROOT_TS }), conversation(PUBLIC),
       notice({ thread_ts: ROOT_TS, emoji: 'white_check_mark' }), ['U0REACTOR']],
-    ['a bot with no user removes a reaction from an unthreaded message', { user: undefined, bot_id: 'B0OTHER01', change: 'removed', emoji: 'eyes', mode: 'fungible' }, exact(),
+    ['a bot with no user removes a reaction from an unthreaded message', { user: undefined, bot_id: 'B0OTHER01', change: 'removed', emoji: 'eyes', mode: 'open' }, exact(),
       conversation({ name: 'secret', is_group: true, is_private: true }),
       notice({ channel_name: 'secret', user: 'B0OTHER01', user_id: undefined, bot_id: 'B0OTHER01', reaction: 'removed', emoji: 'eyes' }), []],
   ]
@@ -224,10 +271,10 @@ describe('reaction preparation fixes or withdraws through the real queue', () =>
   })
 
   const RETRIED: Array<['fixed' | 'withdrawn', ReactionAcceptedInput['mode'], SettledWebApiOutcome, QueueRecord, string[], [SettledWebApiOutcome, SettledWebApiOutcome]]> = [
-    ['fixed', 'declarative', exact({ thread_ts: ROOT_TS }), { v: 1, kind: 'fixed', seq: 1, parts: buildTagParts(notice({ thread_ts: ROOT_TS })) }, [],
+    ['fixed', 'strict', exact({ thread_ts: ROOT_TS }), { v: 1, kind: 'fixed', seq: 1, parts: buildTagParts(notice({ thread_ts: ROOT_TS })) }, [],
       [exact(SERVER_POST), conversation({ ...PUBLIC, is_ext_shared: true })]],
-    ['withdrawn', 'fungible', { kind: 'platform', error: 'not_in_channel' }, withdrawal(1, 'fungible-refused', START, 'not_in_channel'),
-      [buildReactionWithdrawnLine(SUBJECT, 'fungible-refused', 'not_in_channel')], [exact({ thread_ts: ROOT_TS }), conversation(PUBLIC)]],
+    ['withdrawn', 'open', { kind: 'platform', error: 'not_in_channel' }, withdrawal(1, 'open-refused', START, 'not_in_channel'),
+      [buildReactionWithdrawnLine(SUBJECT, 'open-refused', 'not_in_channel')], [exact({ thread_ts: ROOT_TS }), conversation(PUBLIC)]],
   ]
   test.each(RETRIED)('a failed %s append keeps ownership and its decided record, then retries it unchanged at the backoff step', async (kind, mode, replies, record, lines, changed) => {
     const h = await harness(), p = preparer(h)
@@ -270,7 +317,7 @@ describe('reaction preparation fixes or withdraws through the real queue', () =>
     stub.script.replies.push(exact({ thread_ts: ROOT_TS }))
     stub.script.info.push(conversation(kind === 'withdrawn' ? { ...PUBLIC, is_ext_shared: true } : PUBLIC))
     h.failAppend(kind)
-    const head = await acceptReaction(h, reaction({ mode: kind === 'withdrawn' ? 'fungible' : 'declarative' }))
+    const head = await acceptReaction(h, reaction({ mode: kind === 'withdrawn' ? 'open' : 'strict' }))
     await expect(h.preparation.prepare('alpha', head)).rejects.toThrow('injected append failure')
     await h.accept('later')
     await h.tick()
@@ -291,10 +338,10 @@ describe('reaction preparation fixes or withdraws through the real queue', () =>
       expect(h.textCalls().map(c => c.params.text)).toEqual(['later'])
       // Decided before the backoff and retried after it, the withdrawal keeps its first time.
       expect(h.clock.now()).toBeGreaterThanOrEqual(START + RETYPE_BACKOFF_MS[0])
-      expect(outcomes(h)).toEqual([withdrawal(1, 'fungible-refused', START, 'externally-shared')])
+      expect(outcomes(h)).toEqual([withdrawal(1, 'open-refused', START, 'externally-shared')])
       expect(h.events.filter(e => DELIVERY_EVENTS.includes(e.type) && 'seq' in e && e.seq === 1)).toEqual([])
       expect(h.events.filter(e => e.type === 'delivered').map(e => e.seq)).toEqual([2])
-      expect(logs).toEqual([buildReactionWithdrawnLine(SUBJECT, 'fungible-refused', 'externally-shared')])
+      expect(logs).toEqual([buildReactionWithdrawnLine(SUBJECT, 'open-refused', 'externally-shared')])
     }
   })
 
@@ -342,9 +389,9 @@ describe('fresh lookups and the L1 and L7 fallbacks at the factory', () => {
     expect(p.stub.calls.conversationsInfo).toHaveLength(2)
     p.stub.script.replies.push(exact())
     p.stub.script.info.push(conversation({ ...PUBLIC, is_ext_shared: true }))
-    const refused = await acceptReaction(h, reaction({ mode: 'fungible', ts: LATER_EVENT_TS }))
+    const refused = await acceptReaction(h, reaction({ mode: 'open', ts: LATER_EVENT_TS }))
     await p.preparation.prepare('alpha', refused)
-    expect(h.queue.item('alpha', refused.accepted.seq)!.withdrawn).toEqual(withdrawal(refused.accepted.seq, 'fungible-refused', START, 'externally-shared'))
+    expect(h.queue.item('alpha', refused.accepted.seq)!.withdrawn).toEqual(withdrawal(refused.accepted.seq, 'open-refused', START, 'externally-shared'))
     expect(p.stub.calls.conversationsInfo).toHaveLength(3)
   })
 
@@ -377,9 +424,9 @@ describe('fresh lookups and the L1 and L7 fallbacks at the factory', () => {
       p.stub.script.replies.push(exact({ thread_ts: ROOT_TS }))
       p.stub.script.info.push({ kind: 'platform', error: 'internal_error' })
     }
-    const kept = await acceptReaction(h, reaction({ mode: 'declarative' }))
+    const kept = await acceptReaction(h, reaction({ mode: 'strict' }))
     await p.preparation.prepare('alpha', kept)
-    const refused = await acceptReaction(h, reaction({ mode: 'fungible', ts: LATER_EVENT_TS }))
+    const refused = await acceptReaction(h, reaction({ mode: 'open', ts: LATER_EVENT_TS }))
     await p.preparation.prepare('alpha', refused)
     expect(outcomes(h, kept.accepted.seq)).toEqual([{ v: 1, kind: 'fixed', seq: kept.accepted.seq, parts: buildTagParts(notice({ channel_name: CHANNEL, thread_ts: ROOT_TS })) }])
     expect(outcomes(h, refused.accepted.seq)).toEqual([withdrawal(refused.accepted.seq, 'conversation-unknown', START)])
@@ -399,8 +446,8 @@ describe('reaction preparation lines', () => {
       return Promise.reject(error)
     } })
     p.stub.script.info.push(conversation({ ...PUBLIC, is_ext_shared: true }))
-    await p.preparation.prepare('alpha', await acceptReaction(h, reaction({ mode: 'fungible' })))
-    expect(outcomes(h)).toEqual([withdrawal(1, 'fungible-refused', START, 'externally-shared')])
+    await p.preparation.prepare('alpha', await acceptReaction(h, reaction({ mode: 'open' })))
+    expect(outcomes(h)).toEqual([withdrawal(1, 'open-refused', START, 'externally-shared')])
     expect(effects(h)).toEqual(['append:withdrawn:1', 'log', 'wake:alpha'])
     expect(p.preparation.owns('alpha', 1)).toBe(false)
     expect(h.clock.pendingCount()).toBe(0)
@@ -414,14 +461,14 @@ describe('reaction preparation lines', () => {
     const h = await harness(), p = preparer(h, { resolve: async () => `Reactor ${LEAK_SENTINEL}` })
     p.stub.script.replies.push(exact({ thread_ts: ROOT_TS, username: `Author ${LEAK_SENTINEL}` }))
     p.stub.script.info.push(conversation({ name: `chan-${LEAK_SENTINEL}`, is_channel: true, is_ext_shared: true }))
-    await p.preparation.prepare('alpha', await acceptReaction(h, reaction({ mode: 'fungible' })))
+    await p.preparation.prepare('alpha', await acceptReaction(h, reaction({ mode: 'open' })))
     p.stub.script.replies.push({ kind: 'platform', error: 'not_in_channel' })
     p.stub.script.info.push(conversation({ name: `chan-${LEAK_SENTINEL}`, is_channel: true }))
-    await p.preparation.prepare('alpha', await acceptReaction(h, reaction({ mode: 'fungible', ts: LATER_EVENT_TS })))
+    await p.preparation.prepare('alpha', await acceptReaction(h, reaction({ mode: 'open', ts: LATER_EVENT_TS })))
     expect(p.resolved).toEqual(['U0REACTOR', 'U0REACTOR'])
     expect(p.logs).toEqual([
-      buildReactionWithdrawnLine(SUBJECT, 'fungible-refused', 'externally-shared'),
-      buildReactionWithdrawnLine(SUBJECT, 'fungible-refused', 'not_in_channel'),
+      buildReactionWithdrawnLine(SUBJECT, 'open-refused', 'externally-shared'),
+      buildReactionWithdrawnLine(SUBJECT, 'open-refused', 'not_in_channel'),
     ])
     assertNoLeak({ logs: p.logs, errors: h.errors, events: h.events, journal: writtenFile(queuePath(h.root)) })
   })
@@ -433,7 +480,7 @@ describe('reaction preparation stop, forget and competing outcomes', () => {
     const replies = heldCall()
     p.stub.script.replies.push(replies.outcome)
     p.stub.script.info.push(conversation({ ...PUBLIC, is_ext_shared: true }))
-    const item = await acceptReaction(h, reaction({ mode: 'fungible' }))
+    const item = await acceptReaction(h, reaction({ mode: 'open' }))
     const preparing = p.preparation.prepare('alpha', item)
     await h.clock.flush()
     expect(p.preparation.owns('alpha', 1)).toBe(true)
@@ -451,8 +498,8 @@ describe('reaction preparation stop, forget and competing outcomes', () => {
     const next = preparer(h), at = h.clock.now()
     next.stub.script.info.push(conversation({ ...PUBLIC, is_ext_shared: true }))
     await next.preparation.recover()
-    expect(outcomes(h)).toEqual([withdrawal(1, 'fungible-refused', at, 'externally-shared')])
-    expect(next.logs).toEqual([buildReactionWithdrawnLine(SUBJECT, 'fungible-refused', 'externally-shared')])
+    expect(outcomes(h)).toEqual([withdrawal(1, 'open-refused', at, 'externally-shared')])
+    expect(next.logs).toEqual([buildReactionWithdrawnLine(SUBJECT, 'open-refused', 'externally-shared')])
     expect(p.logs).toEqual([])
   })
 
@@ -460,7 +507,7 @@ describe('reaction preparation stop, forget and competing outcomes', () => {
     const h = await harness(), p = preparer(h)
     p.stub.script.info.push(conversation({ ...PUBLIC, is_ext_shared: true }))
     h.failAppend('withdrawn')
-    const item = await acceptReaction(h, reaction({ mode: 'fungible' }))
+    const item = await acceptReaction(h, reaction({ mode: 'open' }))
     await expect(p.preparation.prepare('alpha', item)).rejects.toThrow('injected append failure')
     expect(h.clock.pendingCount()).toBe(1)
     if (how === 'stop') await p.preparation.stop()
@@ -488,7 +535,7 @@ describe('reaction preparation stop, forget and competing outcomes', () => {
     // The other persona: a decided withdrawal whose append failed, waiting for its retry.
     p.stubs[BETA.key]!.script.info.push(conversation({ ...PUBLIC, is_ext_shared: true }))
     h.failAppend('withdrawn')
-    const other = await acceptReaction(h, reaction({ mode: 'fungible' }), BETA.key)
+    const other = await acceptReaction(h, reaction({ mode: 'open' }), BETA.key)
     await expect(p.preparation.prepare(BETA.key, other)).rejects.toThrow('injected append failure')
     const retry = h.clock.pending()
     expect(retry.map(t => t.delayMs)).toEqual([RETYPE_BACKOFF_MS[0]])
@@ -516,9 +563,9 @@ describe('reaction preparation stop, forget and competing outcomes', () => {
     expect(h.clock.pending()).toEqual(retry)
     // The other persona's retry appends its identical decided record, unaffected.
     await h.clock.advanceTo(retry[0]!.dueAt)
-    expect(outcomes(h, 1, BETA.key)).toEqual([withdrawal(1, 'fungible-refused', START, 'externally-shared')])
+    expect(outcomes(h, 1, BETA.key)).toEqual([withdrawal(1, 'open-refused', START, 'externally-shared')])
     expect(lookups(p, BETA.key)).toBe(3)
-    expect(p.logs).toEqual([buildReactionWithdrawnLine(BETA_SUBJECT, 'fungible-refused', 'externally-shared')])
+    expect(p.logs).toEqual([buildReactionWithdrawnLine(BETA_SUBJECT, 'open-refused', 'externally-shared')])
     expect(p.wakes).toEqual([BETA.key])
     expect(p.preparation.owns(BETA.key, 1)).toBe(false)
     await h.clock.advance(RETYPE_BACKOFF_MS.at(-1)! * 2)
@@ -534,8 +581,8 @@ describe('reaction preparation stop, forget and competing outcomes', () => {
     const h = await harness(), p = preparer(h, { holdAppend: record => { held.push(record); return gate.promise } })
     p.stub.script.info.push(conversation({ ...PUBLIC, is_ext_shared: true }))
     if (append === 'fails') h.failAppend('withdrawn')
-    const record = withdrawal(1, 'fungible-refused', START, 'externally-shared')
-    const preparing = p.preparation.prepare(PERSONA.key, await acceptReaction(h, reaction({ mode: 'fungible' })))
+    const record = withdrawal(1, 'open-refused', START, 'externally-shared')
+    const preparing = p.preparation.prepare(PERSONA.key, await acceptReaction(h, reaction({ mode: 'open' })))
     await h.clock.flush()
     expect(held).toEqual([record])
     expect(h.records().map(r => r.kind)).toEqual(['accepted'])
@@ -564,7 +611,7 @@ describe('reaction preparation stop, forget and competing outcomes', () => {
     const old = heldCall()
     p.stub.script.replies.push(old.outcome)
     p.stub.script.info.push(conversation({ ...PUBLIC, is_ext_shared: true }))
-    const item = await acceptReaction(h, reaction({ mode: 'fungible' }))
+    const item = await acceptReaction(h, reaction({ mode: 'open' }))
     const oldWork = p.preparation.prepare(PERSONA.key, item)
     await h.clock.flush()
     p.preparation.forget(PERSONA.key)
@@ -607,7 +654,7 @@ describe('reaction preparation stop, forget and competing outcomes', () => {
     const h = await harness(), p = preparer(h)
     // This preparation alone would withdraw the item as externally shared.
     p.stub.script.info.push(conversation({ ...PUBLIC, is_ext_shared: true }))
-    const item = await acceptReaction(h, reaction({ mode: 'fungible' }))
+    const item = await acceptReaction(h, reaction({ mode: 'open' }))
     if (when === 'during the lookups') {
       const replies = heldCall()
       p.stub.script.replies.push(replies.outcome)
@@ -715,7 +762,7 @@ describe('closed and fixed reaction preparation recovery', () => {
     expect(h.errors).toEqual([])
   })
 
-  const ACCEPTED_ONLY = (['fungible', 'declarative'] as const).flatMap(mode => (['slack-event', 'bot-tool'] as const).map(origin => [mode, origin] as const))
+  const ACCEPTED_ONLY = (['open', 'strict'] as const).flatMap(mode => (['slack-event', 'bot-tool'] as const).map(origin => [mode, origin] as const))
   test.each(ACCEPTED_ONLY)('an accepted-only %s %s reaction whose append failed before a stop is decided afresh, under its stored mode and with its stored name, by a new preparation after reopen', async (mode, origin) => {
     const botTool = origin === 'bot-tool'
     const h = await harness()
@@ -748,7 +795,7 @@ describe('closed and fixed reaction preparation recovery', () => {
       [],
     ])
     expect(asked).not.toContain(BETA.key)
-    if (mode === 'fungible') {
+    if (mode === 'open') {
       expect(outcomes(h)).toEqual([withdrawal(1, 'conversation-unknown', at)])
       expect(second.logs).toEqual([buildReactionWithdrawnLine(SUBJECT, 'conversation-unknown')])
     } else {

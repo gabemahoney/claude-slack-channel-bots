@@ -1,4 +1,3 @@
-import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 /**
  * cli.test.ts — Coverage for the CLI surface (`start`, `stop`,
  * `clean_restart`, `credentials`) at the createCli factory level, with all
@@ -104,6 +103,10 @@ import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
  * SPDX-License-Identifier: MIT
  */
 
+import { SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
+import { UPGRADE_FIXTURE_DIR, UPGRADE_GROUP_DIRS } from './test-helpers/shared-channel-upgrade.ts'
+import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
+
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 
 import { SocketModeClient } from '@slack/socket-mode'
@@ -159,9 +162,6 @@ import {
 import type * as ChannelDeliveryModule from '../src/channel-delivery.ts'
 import {
   CHANNEL_DELIVERY_FILE_NAME,
-  CHANNEL_DELIVERY_LOG_PREFIX,
-  CHANNEL_DELIVERY_UNREADABLE,
-  channelDeliveryPath,
 } from '../src/channel-delivery.ts'
 import {
   KILL_OUTCOME_ROW_FINISHED,
@@ -503,7 +503,7 @@ function snapshotTree(): Record<string, string | null> {
 
 /** A persona whose name differs from its key, so name- or channel-addressing fails. */
 const OPS_NAME = 'Ops Bot'
-const OPS_CHANNEL = 'C0TEST001'
+const OPS_CHANNEL = SHARED_CHANNEL_IDS.primary
 const opsId = (): string => personaInstanceId(personaKey(OPS_NAME))
 /** The Ops persona as the teardown's lines name it. */
 const OPS_PERSONA: CliTeardownPersona = Object.freeze({ name: OPS_NAME, key: personaKey(OPS_NAME) })
@@ -521,8 +521,8 @@ function opsConfig(overrides: Partial<Omit<PersonaConfig, 'personas'>> = {}): Pe
 /** Two personas: Alpha is in two channels, Beta is in none with DMs on. */
 const ALPHA = {
   name: 'Alpha Bot',
-  channels: [{ id: 'C0ALPHA01', delivery: 'all' as const }, { id: 'C0SHARED1', delivery: 'mentions' as const }],
-  permission_prompts: 'C0ALPHA01',
+  channels: [{ id: SHARED_CHANNEL_IDS.secondary, delivery: 'all' as const }, { id: SHARED_CHANNEL_IDS.private, delivery: 'mentions' as const }],
+  permission_prompts: SHARED_CHANNEL_IDS.secondary,
 }
 const BETA = { name: 'Beta', channels: [], dm: { enabled: true, contact: 'U0TEST001' }, permission_prompts: 'dm' }
 /** The configuration of {@link ALPHA} and {@link BETA}, in that order. */
@@ -1438,7 +1438,7 @@ describe('stop — server.port is removed with the PID file', () => {
 
 describe('last-applied record', () => {
   /** Only in the edited config.json: a record-sourced teardown never addresses it. */
-  const GAMMA = { name: 'Gamma Bot', channels: [{ id: 'C0GAMMA01', delivery: 'all' as const }], permission_prompts: 'C0GAMMA01' }
+  const GAMMA = { name: 'Gamma Bot', channels: [{ id: SHARED_CHANNEL_IDS.third, delivery: 'all' as const }], permission_prompts: SHARED_CHANNEL_IDS.third }
   const alphaId = (): string => personaInstanceId(personaKey(ALPHA.name))
   const betaId = (): string => personaInstanceId(personaKey(BETA.name))
   const gammaId = (): string => personaInstanceId(personaKey(GAMMA.name))
@@ -1731,17 +1731,17 @@ describe('last-applied record', () => {
   /**
    * A record that is not JSON, holding a fake token, beside a valid
    * config.json (EDITED). The parse error must name the record, carry the
-   * deletion hint and quote none of the record's content.
+   * preservation and recovery hint and quote none of the record's content.
    */
   function writeMalformedRecord(): void {
     writeConfigFile(stateDir, EDITED())
     writeFileSync(recordPath(), `{"personas": [{"name": "${fakeToken(BOT_TOKEN_PREFIX, 'record')}"`)
   }
-  const deletionHint = (): string => `Deleting the last-applied record "${recordPath()}"`
+  const recoveryHint = (): string => `Preserve the shared channel authority "${recordPath()}" and prepared configuration "${configPath}"; restore trustworthy authority evidence before starting again.`
   /** `stop`'s one line for a stop_timeout read failure, before the loader's message. */
   const STOP_LOAD_FAILURE_PREFIX = '[slack] stop: could not load the applied configuration — using the default 30s stop_timeout: '
 
-  test('clean_restart with a malformed record: exit 1 naming the record with the deletion hint, no client built, no teardown, no fallback to config.json, never starts', async () => {
+  test('clean_restart with a malformed record: exit 1 naming the record with the preservation and recovery hint, no client built, no teardown, no fallback to config.json, never starts', async () => {
     writeMalformedRecord()
     const b = makeDeps({ loadConfig: appliedLoader, directorStatus: waitingThenEnded(), initClient: async () => { /* gate ok */ } })
 
@@ -1750,14 +1750,14 @@ describe('last-applied record', () => {
     expect(b.exitCodes).toEqual([1])
     expect(stderr).toHaveLength(1)
     expect(stderr[0]!.startsWith('[slack] clean_restart: failed to load config:')).toBe(true)
-    expect(stderr[0]).toContain(deletionHint())
+    expect(stderr[0]).toContain(recoveryHint())
     expect(b.initClientCalls).toEqual([]) // fatal before any client is built
     expect(b.directorCallTimes).toEqual([]) // no get, read-pane, status, pause or kill
     expect(b.spawnCalls).toEqual([])
     assertNoLeak({ stderr, exitCodes: b.exitCodes }, 'clean_restart (malformed record)')
   })
 
-  test('stop --stop-bots with a malformed record: logs the record with the deletion hint, builds its client with the default call timeout, skips teardown (no fallback to config.json), still stops the server', async () => {
+  test('stop --stop-bots with a malformed record: logs the record with the preservation and recovery hint, builds its client with the default call timeout, skips teardown (no fallback to config.json), still stops the server', async () => {
     writeMalformedRecord()
     const b = makeDeps({
       serverPid: 4242,
@@ -1773,11 +1773,11 @@ describe('last-applied record', () => {
     expect(b.serverSignals).toEqual(['SIGTERM'])
     const skip = stderr.filter((l) => l.startsWith('[slack] stop --stop-bots: could not load config — skipping bot teardown:'))
     expect(skip).toHaveLength(1)
-    expect(skip[0]).toContain(deletionHint())
+    expect(skip[0]).toContain(recoveryHint())
     // The server stop's own read failed too, and says so once, with the same hint.
     const stopLine = stderr.filter((l) => l.startsWith(STOP_LOAD_FAILURE_PREFIX))
     expect(stopLine).toHaveLength(1)
-    expect(stopLine[0]).toContain(deletionHint())
+    expect(stopLine[0]).toContain(recoveryHint())
     // the default, never the edited config.json's value.
     expect(b.initClientCalls).toEqual([DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
     expect(b.directorCallTimes).toEqual([]) // no get, read-pane, status, pause or kill
@@ -1803,7 +1803,7 @@ describe('last-applied record', () => {
 
   interface NonRegularFile {
     loader: (path: string) => PersonaConfig
-    /** The start's wording for the refused file (with the deletion hint for the record). */
+    /** The start's wording for the refused file (with the preservation and recovery hint for the record). */
     cause: string
     /** For the FIFO kind: the target was opened, nothing was read and every descriptor was closed. */
     assertUnreadAndClosed(): void
@@ -1814,8 +1814,7 @@ describe('last-applied record', () => {
     const target = source === 'record' ? recordPath() : configPath
     const cause =
       source === 'record'
-        ? `The last-applied record "${recordPath()}" cannot be read (${code}). ${deletionHint()} makes the next start ` +
-          `apply the configuration file "${configPath}" as it stands.`
+        ? `The last-applied record "${recordPath()}" cannot be read (${code}). ${recoveryHint()}`
         : `The configuration file "${configPath}" cannot be read (${code}). The server requires the configuration file to start.`
     if (kind === 'directory') {
       rmSync(target)
@@ -1903,7 +1902,7 @@ describe('last-applied record', () => {
   )
 
   // Plain `stop` reports the load failure in exactly one line, first, with the
-  // loader's message (the record's deletion hint, or the config wording), then
+  // loader's message (the record's preservation and recovery hint, or the config wording), then
   // falls back to the 30 s default stop_timeout and still stops the server.
   test.each(NON_REGULAR_CASES)(
     'stop (%s) where that file is %s: logs one "could not load" line with the "cannot be read" wording, then uses the 30 s default stop_timeout (fake clock) and still stops a server that ignores SIGTERM',
@@ -4752,7 +4751,7 @@ const WRITE_FAILURES: ReadonlyArray<readonly [string, WriteFailure]> = [
 ]
 
 describe('the teardown\'s report and where each line goes', () => {
-  const GAMMA = { name: 'Gamma', channels: [{ id: 'C0GAMMA01', delivery: 'all' as const }] }
+  const GAMMA = { name: 'Gamma', channels: [{ id: SHARED_CHANNEL_IDS.third, delivery: 'all' as const }] }
   const [alphaP, betaP, gammaP] = [ALPHA.name, BETA.name, GAMMA.name].map(personaOf) as [CliTeardownPersona, CliTeardownPersona, CliTeardownPersona]
   const idOf = (p: CliTeardownPersona): string => personaInstanceId(p.key)
   const sessionOf = (p: CliTeardownPersona): string => personaTmuxSessionName(p.key)
@@ -6026,7 +6025,7 @@ describe('credentials <persona>', () => {
   test('the persona comes from config.json as it stands, never the last-applied record: one declared but not yet confirmed is found', async () => {
     // The record holds only Ops Bot; config.json adds "newbie", not yet confirmed.
     writeFileSync(recordPath(), readFileSync(configPath))
-    const newbie = makePersona({ name: 'newbie', channels: [{ id: 'C0NEW0001', delivery: 'all' }], permission_prompts: 'C0NEW0001' }, root)
+    const newbie = makePersona({ name: 'newbie', channels: [{ id: SHARED_CHANNEL_IDS.future, delivery: 'all' }], permission_prompts: SHARED_CHANNEL_IDS.future }, root)
     writeConfigFile(stateDir, makePersonaConfigInput({ personas: [makePersona({ name: OPS_NAME }, root), newbie] }, root))
     const b = makeDeps()
 
@@ -6315,42 +6314,30 @@ describe('no CLI command reads, writes, creates or removes the stored-choice fil
   /**
    * What could load, write, parse or locate the file: the store factory, the
    * start load, the serialiser, the parser, the path function and the file
-   * name. Typed against the module, so a rename fails the typecheck.
+   * name. This string inventory is checked against the CLI source below.
    */
-  const FILE_NAMES: ReadonlyArray<keyof typeof ChannelDeliveryModule> = [
+  const FILE_NAMES: ReadonlyArray<string> = [
     'loadChannelDeliveryStore',
     'loadChannelDeliveryAtStart',
     'serializeChannelDelivery',
     'parseChannelDelivery',
     'channelDeliveryPath',
-    'CHANNEL_DELIVERY_FILE_NAME',
+    'LEGACY_FILE_NAME',
   ]
 
   /** What the file's module logs: its drop and failed-write lines, its class, and the file's name in a line naming the file. */
-  const MODULE_MARKS = [CHANNEL_DELIVERY_LOG_PREFIX, CHANNEL_DELIVERY_UNREADABLE, CHANNEL_DELIVERY_FILE_NAME]
+  const MODULE_MARKS = ['[slack] channel-delivery:', 'channel-delivery-unreadable']
+  const LEGACY_FILE_NAME = 'channel-delivery.json'
+  const legacyPath = () => join(stateDir, LEGACY_FILE_NAME)
 
   /** The state directory's entries named after the file: the file itself, or a write's temporary file beside it. */
-  const fileEntries = (): string[] => readdirSync(stateDir).filter((name) => name.startsWith(CHANNEL_DELIVERY_FILE_NAME))
+  const fileEntries = (): string[] => readdirSync(stateDir).filter((name) => name.startsWith(LEGACY_FILE_NAME))
 
-  /**
-   * The file: the Ops persona's two channels under its declaration as the
-   * applied configuration resolves it, and a key that configuration lacks,
-   * which the server's start would drop. `refused` appends a
-   * byte to what the serialiser wrote, so the module's parser refuses the
-   * file and a load through the module would log its unreadable line. Answers the file's bytes.
-   */
+  /** Preserved obsolete reference bytes, with one extra byte for the malformed control. */
   function seedStoredChoices(refused: boolean): Uint8Array {
-    const ops = appliedLoader(recordPath()).personas[0]!
-    const path = writeChannelDeliveryRecord(stateDir, {
-      [personaKey(OPS_NAME)]: {
-        declaration: declarationOf(ops),
-        channels: { [OPS_CHANNEL]: { delivery: 'all' }, C0TEST002: { delivery: 'mentions' } },
-      },
-      [personaKey('Retired Bot')]: {
-        declaration: declarationOf({ ...ops, name: 'Retired Bot' }),
-        channels: { C0TEST003: { delivery: 'all' } },
-      },
-    })
+    // Deliberately obsolete reference bytes: no application reader may touch them.
+    const path = legacyPath()
+    writeFileSync(path, readFileSync(join(UPGRADE_FIXTURE_DIR, 'declarative-choices-and-queues', UPGRADE_GROUP_DIRS.reference, LEGACY_FILE_NAME)))
     if (refused) appendFileSync(path, '}')
     return new Uint8Array(readFileSync(path))
   }
@@ -6375,11 +6362,11 @@ describe('no CLI command reads, writes, creates or removes the stored-choice fil
     if (before === null) {
       expect(fileEntries()).toEqual([])
     } else {
-      expect(fileEntries()).toEqual([CHANNEL_DELIVERY_FILE_NAME])
-      expect(new Uint8Array(readFileSync(channelDeliveryPath(stateDir))) as Uint8Array).toEqual(before)
+      expect(fileEntries()).toEqual([LEGACY_FILE_NAME])
+      expect(new Uint8Array(readFileSync(legacyPath())) as Uint8Array).toEqual(before)
     }
     // The bundle's unlinkSync only records, so a removal shows here, not on disk.
-    expect(acting.b.unlinked.filter((p) => basename(p).startsWith(CHANNEL_DELIVERY_FILE_NAME))).toEqual([])
+    expect(acting.b.unlinked.filter((p) => basename(p).startsWith(LEGACY_FILE_NAME))).toEqual([])
     expect(capturedLines().filter((line) => MODULE_MARKS.some((mark) => line.includes(mark)))).toEqual([])
     assertNoLeak({ stderr, consoleErrorArgs: errorSpy.mock.calls, exitCodes: acting.b.exitCodes, files: writtenTeardownLogs() })
   })

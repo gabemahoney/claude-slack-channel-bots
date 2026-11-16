@@ -1,3 +1,10 @@
+import { createChannelMembership } from '../src/channel-membership.ts'
+import { createMembershipScanner, membershipConnectionListener } from '../src/channel-membership-scan.ts'
+import { createMembershipReadiness } from '../src/channel-membership-readiness.ts'
+import { makeSharedAuthority } from './test-helpers/shared-channels.ts'
+import { makePersonaConfigInput, makePersona, makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { makeNotifierHarness } from './test-helpers/persona-notifier.ts'
+import { renderPersonaRef } from '../src/persona-identity.ts'
 
 
 import { afterEach, describe, expect, test } from 'bun:test'
@@ -13,9 +20,18 @@ import { AD_VERSION_RECHECK_STOP_EXIT_CODE, type AdVersionRecheckDeps } from '..
 import type * as AdStartupModule from '../src/agent-director-startup.ts'
 import type { runAgentDirectorStartupGate, StartupGateOptions } from '../src/agent-director-startup.ts'
 import type * as ChannelDeliveryModule from '../src/channel-delivery.ts'
-import type { PersonaConfig } from '../src/config.ts'
+import { channelModeOf, type PersonaConfig } from '../src/config.ts'
+import type { SharedStateReportingDeps } from '../src/shared-state-reports.ts'
+import type { MembershipScanner } from '../src/channel-membership-scan.ts'
 import { _resetAckTracker, createQueuedAckCallback, forgetPersonaAcks } from '../src/ack-tracker.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
+import type { DeliveryQueueOptions, QueueEvent, QueueThreadJoin, DeliveryQueue, ReplyReminderQueue } from '../src/delivery-queue.ts'
+import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
+import { installTestTimerOverrides } from '../src/test-timer-overrides.ts'
+import { TEST_MEASUREMENTS_FILE_NAME, buildTestMeasurementsStartLine, createTestMeasurements, queueEventMeasurement, postHoldEventMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, threadCompactionMeasurement, type TestMeasurements, type TestMeasurementsDeps, type TestMeasurement } from '../src/test-measurements.ts'
+import type { DurableAppendTimer } from '../src/durable-journal.ts'
+import type { AckTiming } from '../src/persona-routing.ts'
+import type { ThreadMemorySave } from '../src/thread-memory.ts'
 import { createDeliveryReporting, MESSAGE_RECEIVED } from '../src/delivery-notices.ts'
 import { createPersonaBringUpController } from '../src/persona-bringup-controller.ts'
 import { composePersonaStatusListeners, createPersonaUpFlushListener } from '../src/persona-start.ts'
@@ -36,6 +52,25 @@ import type { LiveRowSequenceRegistry, LiveRowSequenceRegistryOptions } from '..
 import type * as LivenessReadingModule from '../src/liveness-reading.ts'
 import type { PendingLivenessReading } from '../src/liveness-reading.ts'
 import type * as OutageStateModule from '../src/outage-state.ts'
+import type * as OwnPostModule from '../src/own-post.ts'
+import type * as OwnPostLookupModule from '../src/own-post-lookup.ts'
+import { createOwnPostLookups } from '../src/own-post-lookup.ts'
+import type * as PostHoldsModule from '../src/post-holds.ts'
+import { createMemoryHoldResolver, type MemoryHoldResolver, type MemoryHoldResult } from '../src/memory-holds.ts'
+import { createPersonaLifecycle, forgetPersonaState } from '../src/persona-lifecycle.ts'
+import { createPersonaSerializer } from '../src/persona-serializer.ts'
+import * as fs from 'node:fs'
+import type * as ThreadMemoryModule from '../src/thread-memory.ts'
+import { createThreadMemory } from '../src/thread-memory.ts'
+import { createThreadMemoryRetries, type ThreadMemoryRetries, type ThreadMemoryRetriesDeps, type ThreadMemoryRetryEvent } from '../src/thread-memory-retry.ts'
+import { createThreadMemoryReporting, buildThreadMemorySealNotSavedLine, buildThreadMemorySealSavedLine, buildThreadMemoryCompactionFailedLine, buildThreadMemoryCompactionRecoveredLine, buildThreadMemoryHoldsNotResolvedLine, buildThreadMemoryHoldsResolvedLine, buildThreadMemoryJoinsLostNotice, buildThreadMemoryUnreadableNotice, buildThreadMemoryNotSavedNotice, buildThreadMemoryRecoveredNotice } from '../src/thread-memory-reports.ts'
+import { createThreadMemorySeal } from '../src/thread-memory-seal.ts'
+import { createPersonaEpisodes } from '../src/persona-episodes.ts'
+import { formatPersonaNotice } from '../src/persona-notifier.ts'
+import { THREAD_MEMORY_RETRY_MIN_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_NOTICE_MAX_CHARS } from '../src/delivery-constants.ts'
+import type * as ThreadJoinRecoveryModule from '../src/thread-join-recovery.ts'
+import { recoverQueuedJoins } from '../src/thread-join-recovery.ts'
+import type * as ThreadMemorySealModule from '../src/thread-memory-seal.ts'
 import type { OutageClass, OutageStateDeps } from '../src/outage-state.ts'
 import type * as PendingRowModule from '../src/pending-row.ts'
 import type * as PersonaConnectionsModule from '../src/persona-connections.ts'
@@ -72,14 +107,20 @@ import type * as SlowRecoveryModule from '../src/slow-recovery.ts'
 import type { SlowRecoveryTracker, SlowRecoveryTrackerDeps } from '../src/slow-recovery.ts'
 import type * as UnavailableRetryModule from '../src/unavailable-retry.ts'
 import type { FullModeRetryDeps, RetryRunGateDeps, UnavailableRetryController, UnavailableRetryDeps } from '../src/unavailable-retry.ts'
-import type { DeliveryQueue, QueueAcceptResult, ReactionKey } from '../src/delivery-queue.ts'
+import type { QueueAcceptResult, ReactionKey } from '../src/delivery-queue.ts'
 import { makeStubCallLog } from './test-helpers/agent-director-stub.ts'
-import { assertNoLeak } from './test-helpers/credentials.ts'
+import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { makeDeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
-import { slackInput } from './test-helpers/delivery-queue.ts'
+import { deliveredRecord, heldSlackInput, memoryHold, makeQueue, queuePath, slackInput } from './test-helpers/delivery-queue.ts'
+import { threadJoin, threadHeader, seedThreads, threadFsControls, threadSealFsControls, threadConfig, threadPath, THREAD_PERSONAS, THREAD_ROOTS, THREAD_CHANNELS, THREAD_STAMP } from './test-helpers/thread-memory.ts'
 import { makeConnectionHarness } from './test-helpers/persona-connection-harness.ts'
+import { makeOwnPostHarness } from './test-helpers/own-post.ts'
+import { makeOwnFileShare } from './test-helpers/slack-stub.ts'
+import { ownPostStampState, pendingOwnPostViews } from '../src/own-post.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
+import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { durableIo } from './test-helpers/durable-io.ts'
 import {
   atMainTopLevel,
   balancedAfter,
@@ -103,6 +144,128 @@ const SERVER_PATH = join(SRC_DIR, 'server.ts')
 
 /** server.ts with every comment removed (see stripComments). */
 const SERVER_CODE = stripComments(readFileSync(SERVER_PATH, 'utf-8'))
+
+/** Run only an actual dependency expression, with isolated bindings, never server main. */
+function expression<T>(code: string, bindings: Record<string, unknown>): T {
+  const js = ts.transpileModule(`const callback = (${code});`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
+  return new Function(...Object.keys(bindings), `${js}\nreturn callback;`)(...Object.values(bindings)) as T
+}
+
+/** The start's per-key recovery step, a module-scope function shared with a journal loaded after start. */
+const START_RECOVERY_STEP = 'recoverQueueKeyAtStart'
+
+/**
+ * main's start recovery loop, located by its call rather than by the other
+ * queue-key loops, preceded by the step it runs, transpiled to a function
+ * body over its free names.
+ */
+function startJoinRecoveryLoop(): string {
+  const tree = ts.createSourceFile('server.ts', SERVER_CODE, ts.ScriptTarget.Latest, true)
+  const loops: string[] = []
+  const visit = (node: ts.Node): void => {
+    if (ts.isForOfStatement(node) && node.statement.getText(tree).includes(`${START_RECOVERY_STEP}(`)) loops.push(node.getText(tree))
+    ts.forEachChild(node, visit)
+  }
+  visit(tree)
+  expect(loops).toHaveLength(1)
+  return ts.transpileModule(`${serverFunction(START_RECOVERY_STEP)}\n${loops[0]!}`,
+    { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
+}
+
+/** Extract the actual module-scope adapter, without importing or starting main. */
+function serverFunction(name: string, code = SERVER_CODE): string {
+  const tree = ts.createSourceFile('adapter.ts', code, ts.ScriptTarget.Latest, true)
+  const functions = tree.statements.filter(node => ts.isFunctionDeclaration(node) && node.name?.text === name)
+  expect(functions).toHaveLength(1)
+  return functions[0]!.getText(tree).replace(/^export /, '')
+}
+
+function serverInitializer(name: string): string {
+  const tree = ts.createSourceFile('server.ts', SERVER_CODE, ts.ScriptTarget.Latest, true)
+  const declarations = tree.statements.filter(ts.isVariableStatement).flatMap(node => [...node.declarationList.declarations])
+    .filter(node => node.name.getText(tree) === name)
+  expect(declarations).toHaveLength(1)
+  return declarations[0]!.initializer!.getText(tree)
+}
+
+function threadMemoryReplay(): string {
+  const tree = ts.createSourceFile('server.ts', SERVER_CODE, ts.ScriptTarget.Latest, true)
+  const main = tree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'main') as ts.FunctionDeclaration
+  const statements = [...main.body!.statements]
+  const replay = statements.findIndex(node => ts.isForOfStatement(node) && node.expression.getText(tree).includes('bufferedThreadMemoryEvents'))
+  expect(replay).toBeGreaterThanOrEqual(0)
+  expect(statements[replay + 1]!.getText(tree)).toBe('threadMemoryReporting.startupFindings(threadMemorySeal.startupFindings())')
+  return statements.slice(replay, replay + 2).map(node => node.getText(tree)).join('\n')
+}
+
+type MemoryReporter = ReturnType<typeof createThreadMemoryReporting>
+interface MemoryWiringHolders {
+  threadMemory?: Pick<ThreadMemoryModule.ThreadMemory, 'outage'> & Partial<Pick<ThreadMemoryModule.ThreadMemory, 'retryRead' | 'flush' | 'retryPendingJoins'>>
+  threadMemorySeal?: Pick<ThreadMemorySealModule.ThreadMemorySeal, 'flush' | 'startupFindings'>
+  threadMemoryRetries?: ThreadMemoryRetries
+  ownPostLookups?: Partial<OwnPostLookupModule.OwnPostLookups>
+  reloadController?: { sharedChannels(): unknown }
+  memoryHolds?: Pick<MemoryHoldResolver, 'resolve' | 'forget'>
+  postHolds?: Pick<PostHoldsModule.PostHoldResolver, 'forget'>
+  threadMemoryReporting?: MemoryReporter
+  personaEpisodes?: Pick<PersonaEpisodes, 'isClosed' | 'teardownWindowState'>
+  shuttingDown?: boolean
+  getAppliedPersona?: (key: string) => unknown
+}
+
+/** Production ports, call-time holders and replay; no copies of dispatch logic. */
+function threadMemoryWiring() {
+  const names = ['threadMemory', 'threadMemorySeal', 'threadMemoryRetries', 'ownPostLookups', 'reloadController', 'memoryHolds', 'postHolds', 'threadMemoryReporting', 'personaEpisodes', 'shuttingDown', 'getAppliedPersona']
+  const retryProps = onlyCallProps('createThreadMemoryRetries')
+  return expression<() => {
+    memory: (event: ThreadMemoryModule.ThreadMemoryEvent) => void
+    seal: (event: ThreadMemorySealModule.ThreadMemorySealEvent) => void
+    holds: MemoryReporter['holdsEvent']
+    lookup: MemoryReporter['lookupEvent']
+    retry: (event: ThreadMemoryRetryEvent) => void
+    firstRead: ThreadMemoryRetriesDeps['firstRead']
+    canRun(key: string): boolean
+    cancel(key: string): void | Promise<void>
+    retryDeps(clock: ReturnType<typeof createFakeClock>): ThreadMemoryRetriesDeps
+    set(next: MemoryWiringHolders): void
+    start(reporting: MemoryReporter, seal: Pick<ThreadMemorySealModule.ThreadMemorySeal, 'startupFindings'>): void
+    buffered(): Array<{ source: string; event: { type: string }; outage?: ThreadMemoryModule.ThreadMemoryOutage }>
+  }>(`() => {
+    let ${names.join(', ')};
+    const bufferedThreadMemoryEvents = [];
+    ${serverFunction('dispatchThreadMemoryReport')}
+    ${serverFunction('threadMemoryWorkAllowed')}
+    return {
+      memory: (${serverInitializer('threadMemoryEvents')}).emit,
+      seal: (${serverInitializer('threadMemorySealEvents')}).emit,
+      holds: (${serverInitializer('memoryHoldEvents')}).emit,
+      lookup: (${onlyCallProps('createOwnPostLookups').get('onEvent')}),
+      retry: (${retryProps.get('onEvent')}),
+      firstRead: (${retryProps.get('firstRead')}),
+      canRun: threadMemoryWorkAllowed,
+      cancel: (${onlyCallProps('createPersonaLifecycle').get('cancelThreadMemory')}),
+      retryDeps(SYSTEM_PERSONA_CONNECTION_CLOCK) { return { ${callArguments(SERVER_CODE, onlyCallOf('createThreadMemoryRetries')).trim().slice(1, -1)} } },
+      set(next) { ${names.map(name => `if ('${name}' in next) ${name} = next.${name};`).join('\n')} },
+      start(reporting, seal) { threadMemoryReporting = reporting; threadMemorySeal = seal; ${threadMemoryReplay()} },
+      buffered: () => bufferedThreadMemoryEvents,
+    };
+  }`, { forgetPersonaState })()
+}
+
+/** Preserve shutdown's own awaited statements, including the final result handler. */
+function threadMemoryShutdown(bindings: Record<string, unknown>): () => Promise<void> {
+  const [start, end] = shutdownBody(SERVER_CODE)
+  const tree = ts.createSourceFile('shutdown.ts', SERVER_CODE.slice(start, end), ts.ScriptTarget.Latest, true)
+  const statements = tree.statements.map(node => node.getText(tree))
+  const first = statements.findIndex(code => code === 'memoryHolds?.stop()')
+  const last = statements.findIndex(code => code === 'threadMemoryRetries?.stopSeal()')
+  expect(first).toBeGreaterThanOrEqual(0)
+  expect(last).toBeGreaterThan(first)
+  return expression(`async () => { ${statements.slice(first, last + 1).join('\n')} }`, {
+    deliveryPreparation: undefined, deliveryStopping: undefined, remindersStopping: undefined, deliveryClients: undefined,
+    reactHandoffDrained: undefined, buildThreadMemorySealNotSavedLine, ...bindings,
+  })
+}
 
 /** The production kill-retry clock; renaming it fails the typecheck. */
 const KILL_RETRY_PRODUCTION_CLOCK: keyof typeof KillRetryModule = 'KILL_RETRY_SYSTEM_CLOCK'
@@ -438,6 +601,8 @@ const ROUTING_ROW_READ: keyof PersonaRoutingDeps = 'readRowLiveness'
 const ROUTING_LATCHED: keyof PersonaRoutingDeps = 'isLatched'
 /** The persona routing's `tmux-unresponsive` member; renaming it fails the typecheck. */
 const ROUTING_TMUX_UNRESPONSIVE: keyof PersonaRoutingDeps = 'isTmuxUnresponsive'
+/** The persona routing's own-message intake hook; renaming it fails the typecheck. */
+const ROUTING_OWN_MESSAGE: keyof PersonaRoutingDeps = 'onOwnMessage'
 
 /**
  * the module-scope holder through which the persona routing's
@@ -1128,7 +1293,9 @@ describe('main() installs the runtime agent-director version re-check right afte
   })
 
   test('shutdown makes no agent-director call: no client, no detection wrapper, no resolve and no verb the stub client records', () => {
-    const code = shutdownCode()
+    // The shutdown wiring test pins this receiver to Thread Memory's identity
+    // Map; its lookup shares the name of AD's get verb but is not an AD call.
+    const code = shutdownCode().replace(/\bcompleted\.get\s*\(/g, 'completed.mapLookup(')
     for (const name of ['getClient', 'withOutageDetection', 'withSpawnDetection', 'resolveSystemBinary']) {
       expect([name, indicesOf(new RegExp(`\\b${name}\\s*\\(`, 'g'), code)]).toEqual([name, []])
     }
@@ -1661,15 +1828,17 @@ describe('server.ts wires the persona connection seams', () => {
     expect(props.get('dryRun')).toBe('isDryRun()')
     expect(props.get('onStatus')).toStartWith('composePersonaStatusListeners(')
     const listeners = onlyCallArgs('composePersonaStatusListeners')
-    expect(listeners).toHaveLength(3)
-    expect(listeners[0]).toBe(`createPersonaUpFlushListener(${notifier})`)
+    expect(listeners).toHaveLength(5)
+    expect(listeners[0]).toBe('(key, status) => { membershipStatus?.(key, status); membershipReadiness?.report(key) }')
+    expect(listeners[1]).toBe(`createPersonaUpFlushListener(${notifier})`)
     // The controller is built after (and over) the manager, so the listener
     // reaches it through the module-scope holder, never the local const (which
     // would be in its temporal dead zone when the manager is built).
-    expect(listeners[1]).toMatch(/^\((\w+), (\w+)\) => bringUps\?\.onConnectionStatus\(\1, \2\)$/)
-    expect(listeners[1]).not.toContain(constOf('createPersonaBringUpController'))
+    expect(listeners[2]).toMatch(/^\((\w+), (\w+)\) => bringUps\?\.onConnectionStatus\(\1, \2\)$/)
+    expect(listeners[2]).not.toContain(constOf('createPersonaBringUpController'))
     // Resolve reporting on the up notification, when the current client is usable.
-    expect(listeners[2]).toMatch(/^\((\w+), (\w+)\) => \{ if \(\2\.state === 'up'\) deliveryReporting\?\.reconcileQueued\(\1\) \}$/)
+    expect(listeners[3]).toMatch(/^\((\w+), (\w+)\) => \{ if \(\2\.state === 'up'\) deliveryReporting\?\.reconcileQueued\(\1\) \}$/)
+    expect(listeners[4]).toBe("(key, status) => { if (status.state === 'up' && threadMemoryWorkAllowed(key)) ownPostLookups?.kick(key) }")
   })
 
   test('the Slack API base URL override (section 4): resolved once, inside main(), from process.env with the manager’s log, before the manager is built, and passed to it as slackApiUrl', () => {
@@ -1788,7 +1957,8 @@ describe('server.ts wires the persona connection seams', () => {
     const runBot = routing.get(RUN_BOT)!
     expect(runBot).toMatch(new RegExp(`^\\(?(\\w+)\\)? => connections\\?\\.${MANAGER_QUERY}\\(\\1\\) \\?\\? false$`))
     const queue = objectProperties(routing.get('queue')!)
-    expect([...queue.keys()].sort()).toEqual([ACCEPT, LOOKUP, SLACK_LOOKUP].sort())
+    // The branch's thread_hybrid intake also stores through acceptDecided.
+    expect([...queue.keys()].sort()).toEqual([ACCEPT, 'acceptDecided', LOOKUP, SLACK_LOOKUP].sort())
     // The same holder as the Slack-key lookup (and preparation's queue, pinned above).
     for (const lookup of [LOOKUP, SLACK_LOOKUP]) {
       expect(queue.get(lookup)).toMatch(new RegExp(`^\\((\\w+), (\\w+)\\) => deliveryQueue\\?\\.${lookup}\\(\\1, \\2\\)$`))
@@ -1950,7 +2120,8 @@ describe('main() builds the one react hand-off before MCP admission, the session
   ])("%s stopDelivery forgets the key's react hand-off work as its first statement, before the delivery engines' forget and any await", (_label, factory, member) => {
     const holder = reactHandoffHolder()
     const body = onlyCallProps(factory).get(member)
-    expect(body).toMatch(new RegExp(`^async \\(?(\\w+)\\)? => \\{ ${holder}\\?\\.${HANDOFF_FORGET}\\(\\1\\); const \\w+ = deliveryEngines\\?\\.forget\\(\\1\\);`))
+    // The persona lifecycle's also stops the branch's membership discovery for the key before the engines' forget.
+    expect(body).toMatch(new RegExp(`^async \\(?(\\w+)\\)? => \\{ ${holder}\\?\\.${HANDOFF_FORGET}\\(\\1\\); (?:membershipScanner\\?\\.stop\\(\\1\\); membershipReadiness\\?\\.forget\\(\\1\\); )?const \\w+ = deliveryEngines\\?\\.forget\\(\\1\\);`))
     expect(body!.indexOf('await')).toBeGreaterThan(body!.indexOf(`${holder}?.${HANDOFF_FORGET}(`))
   })
 
@@ -2792,8 +2963,9 @@ describe('main() builds the one set of per-persona notice episodes before the st
     expect(onlyCallProps(FACTORY).get(TEARDOWN_WINDOW)).toMatch(
       new RegExp(`^(?:${notifier}\\.${WINDOW_STATE}|\\(?(\\w+)\\)? => ${notifier}\\.${WINDOW_STATE}\\(\\1\\))$`),
     )
-    // The notifier's query is read nowhere else in server.ts.
-    expect(indicesOf(new RegExp(`\\b${WINDOW_STATE}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
+    // This remains the notifier's only reader; Thread Memory asks the central
+    // episodes for the same window through its shared work gate.
+    expect(indicesOf(new RegExp(`\\b${notifier}\\.${WINDOW_STATE}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
   })
 
   test('shutdown closes the episodes exactly once, through the handle, before it first yields, and nothing forgets them all', () => {
@@ -4481,7 +4653,9 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
     const MEMBERS: Array<keyof PersonaRoutingDeps> = [
       'getPersonaConfig', 'getBotIdentity', 'isRunBotIdentity', 'queue', 'prepare', 'onReceived', 'archive', 'log',
       'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
-      'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS, 'getChannelDelivery',
+      'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS, 'getChannelDelivery', 'membership',
+      'threadMemory', 'pendingOwnPosts', 'joins', 'threadStampUndecided', 'threadStampEpisodes', 'onHoldStored', ROUTING_OWN_MESSAGE,
+      'monotonicNow', 'ackTiming', 'postHolds', 'retainOwnPostOutcomes',
     ]
     expect([...onlyCallProps('createPersonaRouting').keys()].sort()).toEqual([...MEMBERS].sort())
   })
@@ -5028,7 +5202,9 @@ describe('server.ts refuses service to a persona that is not up', () => {
     expect(outcomes.get('isUp')).toMatch(/^\((\w+)\) => bringUps\?\.isUp\(\1\) \?\? false$/)
     expect(outcomes.get('isApplied')).toMatch(/^\((\w+)\) => bringUps\?\.isApplied\(\1\) \?\? false$/)
     // Never called directly, and no serving check copied in.
-    expect(callsOf('isPersonaUp')).toHaveLength(3)
+    expect(callsOf('isPersonaUp')).toHaveLength(6)
+    expect(withinCall(callsOf('isPersonaUp'), onlyCallOf('createOwnPostLookups'))).toBe(1)
+    expect(objectProperties(spreadConstObject('sessionToolDeps')).get('isPersonaUp')).toBe('key => !shuttingDown && isPersonaUp(key)')
     expect(withinCall(callsOf('isPersonaUp'), onlyCallOf('createDeliveryReporting'))).toBe(1)
     expect(withinCall(callsOf('isPersonaUp'), onlyCallOf('createDeliveryEngines'))).toBe(1)
     expect(withinCall(callsOf('isPersonaUp'), onlyCallOf('createReplyReminders'))).toBe(1)
@@ -5183,11 +5359,25 @@ describe('server.ts refuses service to a persona that is not up', () => {
     expect(block.trim()).toMatch(/\breturn\s*;?$/)
   })
 
-  test('handleInitialized has no other close path: exactly the four closePendingSession calls, and no direct pending remove, keep-alive stop or transport close', () => {
+  test('a roots result from an obsolete or retiring life closes before registration and carries the matched incarnation only after the guard', () => {
+    const [start, end] = asyncFunctionBody('handleInitialized')
+    const code = SERVER_CODE.slice(start, end)
+    const snapshot = code.indexOf('const startingLives = new Map')
+    const roots = code.indexOf('await server.listRoots')
+    const guard = code.indexOf('if (!incarnation || startingLives.get(persona.key) !== incarnation || channelDeliveryStore?.isRetiring(persona.key))')
+    expect(snapshot).toBeGreaterThanOrEqual(0); expect(snapshot).toBeLessThan(roots)
+    expect(guard).toBeGreaterThan(roots)
+    const block = code.slice(...balancedAfter(code, guard, '{', '}'))
+    expect(closeCallsIn(block)).toEqual([['pendingId', 'pendingEntry.transport', 'pendingSessionCloseDeps']])
+    expect(block.trim()).toMatch(/\breturn\s*;?$/)
+    expect(code.indexOf('registerSession(realCwd, persona.key, pendingId, undefined, incarnation)')).toBeGreaterThan(guard)
+  })
+
+  test('handleInitialized has no other close path: exactly the five closePendingSession calls, and no direct pending remove, keep-alive stop or transport close', () => {
     const [start, end] = asyncFunctionBody('handleInitialized')
     const code = SERVER_CODE.slice(start, end)
     const calls = closeCallsIn(code)
-    expect(calls).toHaveLength(OTHER_CLOSE_BRANCHES.length + 1)
+    expect(calls).toHaveLength(OTHER_CLOSE_BRANCHES.length + 2)
     for (const args of calls) {
       expect(args).toHaveLength(3)
       expect(args[0]).toBe('pendingId')
@@ -5281,26 +5471,19 @@ describe('server.ts\'s file guard refuses every persona credentials file (sectio
     expect(props.get('clientFor')).toBe('clientFor')
   })
 
-  // The 64 KiB cap exempts three reads: the file guard's read of the config
-  // file, so an oversized config still protects the credentials files it
-  // names (behaviour in tests/config.test.ts); the start's read of the
-  // retired-key record, which only the server writes, so a record grown past
-  // the cap never stops a start (behaviour in tests/retired-keys.test.ts);
-  // and the start's read of the stored-choice file, which
-  // only the server writes, so a file of any size loads (behaviour in
-  // tests/channel-delivery.test.ts). Every other reader
-  // (the start's config, the last-applied record, the pending and apply
-  // files, the reload tick) must stay capped; this audit fails if any other
-  // call site passes the option, or names it.
-  test('readPersonaConfigBytes is called uncapped only by credentialsFilesToProtect, loadRetiredKeyStore and loadChannelDeliveryStore, and nothing else names the option', () => {
+  // Configuration and authority reads are complete by default. The unrelated
+  // agent-director settings and legacy hook cleanup explicitly retain their
+  // bounded policies; only these named readers may pass a size-policy option.
+  test('only the named readers pass a size policy, and agent-director settings and legacy hook cleanup explicitly remain bounded', () => {
     const files = srcFiles().map(([path, source]) => [path, stripComments(source)] as const)
-    const UNCAPPED_SITES: ReadonlyArray<[string, RegExp]> = [
-      ['src/config.ts', /\bexport\s+function\s+credentialsFilesToProtect\s*\(/],
-      ['src/retired-keys.ts', /\bexport\s+function\s+loadRetiredKeyStore\s*\(/],
-      ['src/channel-delivery.ts', /\bexport\s+function\s+loadChannelDeliveryStore\s*\(/],
+    const POLICY_SITES: ReadonlyArray<[string, RegExp, string]> = [
+      ['src/config.ts', /\bexport\s+function\s+credentialsFilesToProtect\s*\(/, '{ uncapped: true }'],
+      ['src/retired-keys.ts', /\bexport\s+function\s+loadRetiredKeyStore\s*\(/, '{ uncapped: true }'],
+      ['src/ad-settings.ts', /\bfunction\s+readAdSettingsFile\s*\(/, '{ uncapped: false }'],
+      ['src/legacy-reply-hook-cleanup.ts', /\bexport\s+function\s+removeLegacyReplyHooks\s*\(/, '{ uncapped: false }'],
     ]
-    const sitePaths = UNCAPPED_SITES.map(([path]) => path)
-    // src/config.ts declares the option; any other file may name it only at its one allowed call.
+    const sitePaths = POLICY_SITES.map(([path]) => path)
+    // config.ts declares the option; elsewhere it appears only at its permitted call.
     const namesOutsideCalls = files
       .filter(([path]) => path !== 'src/config.ts')
       .map(([path, code]) => [path, indicesOf(/\buncapped\b/g, code).length] as const)
@@ -5312,8 +5495,8 @@ describe('server.ts\'s file guard refuses every persona credentials file (sectio
         .map((at) => ({ path, code, at, args: splitTopLevel(callArguments(code, at)) }))
         .filter((call) => call.args.length > 2),
     )
-    expect(withOptions.map((c) => [c.path, c.args[2]]).sort()).toEqual(sitePaths.map((path) => [path, '{ uncapped: true }']).sort())
-    for (const [path, fnRe] of UNCAPPED_SITES) {
+    expect(withOptions.map((c) => [c.path, c.args[2]]).sort()).toEqual(POLICY_SITES.map(([path, , policy]) => [path, policy]).sort())
+    for (const [path, fnRe] of POLICY_SITES) {
       const { code, at } = withOptions.find((c) => c.path === path)!
       const fn = code.search(fnRe)
       expect([path, fn]).not.toEqual([path, -1])
@@ -5339,7 +5522,7 @@ describe('the session tools read the channel mode of the configuration in effect
   // mode taken once at start (a const or let, a value handed in, a later
   // reassignment of the member) or a different deps object would not follow
   // the configuration in effect.
-  test('sessionToolDeps, built at module scope and passed to createSessionServer, has getChannelMode exactly `() => channelModeOf(<applied config holder>)`, and server.ts names channelModeOf only there and in its import, and getChannelMode only there', () => {
+  test('sessionToolDeps, built at module scope and passed to createSessionServer, has getChannelMode exactly `() => channelModeOf(<applied config holder>)`, and channelModeOf is used only by the tools and shared-state reporter, with getChannelMode only here', () => {
     const holder = loadedConfigName(SERVER_CODE)
     // An arrow with no parameters whose body calls config.ts's channelModeOf
     // on the holder itself, so each call reads the holder anew.
@@ -5356,9 +5539,10 @@ describe('the session tools read the channel mode of the configuration in effect
     expect(onlyCallArgs('createSessionServer')[1]).toBe('sessionToolDeps')
 
     // Nothing takes the mode once: channelModeOf is named only in its import
-    // and this member, and the member is named nowhere else, so nothing
-    // reassigns it or binds a second one.
-    expect(indicesOf(/\bchannelModeOf\b/g, SERVER_CODE)).toHaveLength(2)
+    // and the two late-bound members. The tools member is named nowhere
+    // else, so nothing reassigns it or binds a second one.
+    expect(onlyCallProps('createSharedStateReporting').get('mode')).toBe(props.get(SESSION_TOOLS_CHANNEL_MODE))
+    expect(indicesOf(/\bchannelModeOf\b/g, SERVER_CODE)).toHaveLength(3)
     expect(indicesOf(new RegExp(`\\b${SESSION_TOOLS_CHANNEL_MODE}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
   })
 })
@@ -5375,10 +5559,8 @@ describe('the session tools read the channel mode of the configuration in effect
 // ---------------------------------------------------------------------------
 
 /** The store's start load and its factory; typed against the module, so a rename fails the typecheck. */
-const CHANNEL_DELIVERY_START_LOAD: keyof typeof ChannelDeliveryModule = 'loadChannelDeliveryAtStart'
-const CHANNEL_DELIVERY_FACTORY: keyof typeof ChannelDeliveryModule = 'loadChannelDeliveryStore'
-/** The declaration a stored choice is kept under; typed against the module. */
-const CHANNEL_DELIVERY_DECLARATION_OF: keyof typeof ChannelDeliveryModule = 'channelDeliveryDeclarationOf'
+const CHANNEL_DELIVERY_START_LOAD: keyof typeof ChannelDeliveryModule = 'createChannelDeliveryStore'
+const CHANNEL_DELIVERY_FACTORY: keyof typeof ChannelDeliveryModule = 'createChannelDeliveryStore'
 /** server.ts's one stored-choice holder: private to server.ts, so named by string. */
 const CHANNEL_DELIVERY_HOLDER = 'channelDeliveryStore'
 /** The reload controller's store accessor; renaming it fails the typecheck. */
@@ -5412,139 +5594,36 @@ function startTimeConfig(): { name: string; at: number } {
   return { name, at }
 }
 
-describe('main() loads the stored-choice store once, behind no branch, after the start resolves and before the first await after it and the start bring-up pass, into the one holder the reload controller reads (beside)', () => {
-  test('imports the start load from the store module, declares it nowhere in server.ts, and its import and one call are its only mentions', () => {
-    expect(importSource(SERVER_CODE, CHANNEL_DELIVERY_START_LOAD)).toBe('./channel-delivery.ts')
-    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${CHANNEL_DELIVERY_START_LOAD}\\b`, 'g'), SERVER_CODE)).toEqual([])
-    expect(indicesOf(new RegExp(`\\b${CHANNEL_DELIVERY_START_LOAD}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
-    channelDeliveryStartLoad()
+describe('main() adapts the recovered shared authority once before bring-up', () => {
+  test('the adapter receives the controller authority after successful start resolution', () => {
+    const at = onlyCallOf('createChannelDeliveryStore')
+    expect(importSource(SERVER_CODE, 'createChannelDeliveryStore')).toBe('./channel-delivery.ts')
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    expect(at).toBeGreaterThan(startResolution(SERVER_CODE).assignAt)
+    expect(at).toBeLessThan(onlyCallOf('runStartBringUp'))
+    expect(onlyCallArgs('createChannelDeliveryStore')).toEqual(['reload.sharedChannels()!', "(key, channel) => !isDryRun() && !shuttingDown && isPersonaUp(key) && channelMembership?.read(key, channel, 'open').kind === 'eligible'"])
+    expect(SERVER_CODE).not.toMatch(/\b(?:loadChannelDeliveryStore|loadChannelDeliveryAtStart|serializeChannelDelivery|parseChannelDelivery)\b/)
   })
-
-  test('the call is the whole right-hand side of an assignment to the holder that is a statement in main()\'s own statement list (behind no branch, so in both modes and in dry run too)', () => {
-    const at = channelDeliveryStartLoad()
-    const assign = SERVER_CODE.slice(0, at).search(new RegExp(`(?<![\\w.$])${CHANNEL_DELIVERY_HOLDER}\\s*=\\s*$`))
-    expect(assign).toBeGreaterThanOrEqual(0)
-    expect(atMainTopLevel(SERVER_CODE, assign)).toBe(true)
-    // Nothing follows the call on its statement (no operand, no member read).
-    const [, argsEnd] = balancedAfter(SERVER_CODE, at, '(', ')')
-    expect(SERVER_CODE.slice(argsEnd + 1)).toMatch(/^\s*;?\s*\n/)
-  })
-
-  test.each<[string, () => number]>([
-    ['the start resolution (<controller>.resolveStart)', () => startResolution(SERVER_CODE).resolveAt],
-    ['the applied config\'s start assignment (<loaded> = <outcome>.config)', () => startResolution(SERVER_CODE).assignAt],
-    ['the start-time applied config\'s assignment (<start-time config> = <loaded>)', () => startTimeConfig().at],
-  ])('loads AFTER %s', (_label, anchor) => {
-    expect(channelDeliveryStartLoad()).toBeGreaterThan(anchor())
-  })
-
-  // The first await after the start resolution and the start-time
-  // assignment: a shutdown begun during it returns from main() early, so a
-  // load after it could be skipped. Text inside literals never counts.
-  const firstAwaitAfterStart = (): number[] => {
-    const after = Math.max(startResolution(SERVER_CODE).assignAt, startTimeConfig().at)
-    return indicesOf(/\bawait\b/g, maskLiterals(SERVER_CODE)).filter((at) => at > after).slice(0, 1)
-  }
-
-  test.each<[string, () => number[]]>([
-    ['the first await after the start resolution and the start-time applied config\'s assignment', firstAwaitAfterStart],
-    ['the start sweep (reconcileOrphans)', () => callsOf('reconcileOrphans')],
-    ['the start bring-up (<controller>.runStartBringUp)', () => [startResolution(SERVER_CODE).bringUpAt]],
-    ['the PID file (writePidFile)', () => callsOf('writePidFile')],
-    ['the connection manager (createPersonaConnectionManager)', () => callsOf('createPersonaConnectionManager')],
-    ['Bun.serve', () => callsOf('Bun\\.serve')],
-  ])('loads BEFORE %s', (_label, anchors) => {
-    const later = anchors()
-    expect(later.length).toBeGreaterThan(0)
-    for (const at of later) expect(channelDeliveryStartLoad()).toBeLessThan(at)
-  })
-
-  test('loads over the server state directory (STATE_DIR), the start\'s applied personas with their declarations, and the one retired-key store, with only a log to console.error, so the store\'s production writer, delete and clock are used', () => {
-    const args = splitTopLevel(callArguments(SERVER_CODE, channelDeliveryStartLoad()))
-    expect(args).toHaveLength(3)
-    expect(args[0]).toBe('STATE_DIR')
-
-    const start = objectProperties(args[1]!)
-    expect([...start.keys()]).toEqual(['applied', 'retiredKeys'])
-    // Each applied persona of the start-time config, by its key and its
-    // declaration (the store module's own builder, imported, not declared).
-    expect(start.get('applied')).toMatch(
-      new RegExp(
-        `^${startTimeConfig().name}\\.personas\\.map\\(\\(?(\\w+)\\)? => \\(\\{ key: \\1\\.key, declaration: ${CHANNEL_DELIVERY_DECLARATION_OF}\\(\\1\\),? \\}\\)\\)$`,
-      ),
-    )
-    expect(importSource(SERVER_CODE, CHANNEL_DELIVERY_DECLARATION_OF)).toBe('./channel-delivery.ts')
-    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${CHANNEL_DELIVERY_DECLARATION_OF}\\b`, 'g'), SERVER_CODE)).toEqual([])
-    // The retired-key store main() bound from the record's start read: the
-    // one store, also the reload controller's `retiredKeys`.
-    const retiredRead = constOf('readRetiredKeysAtStart')
-    const stores = [...SERVER_CODE.matchAll(new RegExp(`\\bconst\\s+(\\w+)(?:\\s*:\\s*\\w+)?\\s*=\\s*${retiredRead}\\s*\\.\\s*store\\b`, 'g'))]
-    expect(stores).toHaveLength(1)
-    expect(start.get('retiredKeys')).toBe(stores[0]![1])
-
-    const deps = objectProperties(args[2]!)
-    expect([...deps.keys()]).toEqual(['log'])
-    expect(deps.get('log')).toMatch(/^\(\s*(\w+)\s*\)\s*=>\s*console\.error\(\s*\1\s*\)$/)
-  })
-
-  test('the holder is declared once, at module scope, with no initializer, and assigned only once, from the start load; every other mention is a call-time read by the reload controller\'s accessor, the routing or the session tools', () => {
+  test('the one adapter holder is assigned only from that recovered authority', () => {
     declaredOnce(CHANNEL_DELIVERY_HOLDER)
-    const decls = indicesOf(new RegExp(`^let\\s+${CHANNEL_DELIVERY_HOLDER}\\s*:\\s*ChannelDeliveryStore\\s*\\|\\s*undefined\\s*$`, 'gm'), SERVER_CODE)
-    expect(decls).toHaveLength(1)
-    expect(insideMain(decls[0]!)).toBe(false)
-
-    const assigned = assignmentsTo(CHANNEL_DELIVERY_HOLDER)
-    expect(assigned.map(({ value }) => value)).toEqual([`${CHANNEL_DELIVERY_START_LOAD}(`])
-    expect(SERVER_CODE.indexOf(CHANNEL_DELIVERY_START_LOAD, assigned[0]!.at)).toBe(channelDeliveryStartLoad())
-    // No compound assignment, update or other write form either.
-    expect(indicesOf(new RegExp(`\\b${CHANNEL_DELIVERY_HOLDER}\\s*(?:\\?\\?|\\|\\||&&|[-+*/%])=|(?:\\+\\+|--)\\s*${CHANNEL_DELIVERY_HOLDER}\\b|\\b${CHANNEL_DELIVERY_HOLDER}\\s*(?:\\+\\+|--)`, 'g'), SERVER_CODE)).toEqual([])
-
-    // Its mentions: the declaration, the assignment, the controller accessor's
-    // check and return, the routing's member and the session tools' member.
-    const named = indicesOf(new RegExp(`\\b${CHANNEL_DELIVERY_HOLDER}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(6)
-    expect(withinCall(named, onlyCallOf('createReloadController'))).toBe(2)
-    expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
-    const tools = SERVER_CODE.search(/\bconst\s+sessionToolDeps\s*:\s*SessionToolDeps\s*=\s*\{/)
-    const [toolsStart, toolsEnd] = balancedAfter(SERVER_CODE, tools, '{', '}')
-    expect(named.filter((at) => at > toolsStart && at < toolsEnd)).toHaveLength(1)
-  })
-
-  // The controller's accessor is required and answers a store, so it reads
-  // the holder at each call and throws, before anything is written, if an
-  // apply ever ran before the load.
-  test('the reload controller\'s channelDelivery is an accessor over the holder, read at each call: it throws while the holder is unset and otherwise answers the holder itself', () => {
+    expect(assignmentsTo(CHANNEL_DELIVERY_HOLDER).map(({ value }) => value)).toEqual(['createChannelDeliveryStore(reload.sharedChannels()!, (key, channel) =>'])
     const accessor = onlyCallProps('createReloadController').get(CONTROLLER_CHANNEL_DELIVERY)
-    const H = CHANNEL_DELIVERY_HOLDER
-    expect(accessor).toMatch(
-      new RegExp(`^\\(\\) => \\{ if \\(${H} === undefined\\) throw new Error\\((['"])[^'"]+\\1\\);? return ${H};? \\}$`),
-    )
-  })
-
-  test('one store: no src file other than server.ts calls the start load, and none other than the store module calls the store factory', () => {
-    const callers = (name: string): string[] =>
-      srcFiles()
-        .filter(([, source]) => new RegExp(`(?<![\\w.$]|function\\s+)${name}\\s*\\(`).test(stripComments(source)))
-        .map(([path]) => path)
-        .sort()
-    expect(callers(CHANNEL_DELIVERY_START_LOAD).filter((path) => path !== 'src/channel-delivery.ts')).toEqual(['src/server.ts'])
-    expect(callers(CHANNEL_DELIVERY_FACTORY)).toEqual(['src/channel-delivery.ts'])
+    expect(accessor).toContain('return channelDeliveryStore')
   })
 })
 
 /** set_channel_delivery's call-time inputs; renaming one fails the typecheck. */
-const SESSION_TOOLS_HEARD: keyof SessionToolDeps = 'heardChannels'
-const SESSION_TOOLS_APPLIED: keyof SessionToolDeps = 'getAppliedPersonas'
+const SESSION_TOOLS_MEMBERSHIP: keyof SessionToolDeps = 'readChannelMembership'
+const SESSION_TOOLS_UP: keyof SessionToolDeps = 'isPersonaUp'
 const SESSION_TOOLS_LOG: keyof SessionToolDeps = 'log'
-/** The routing's heard-set read; renaming it fails the typecheck. */
-const ROUTING_HEARD: keyof PersonaRouting = 'heardChannels'
+
 
 describe('the routing and the session tools read the one stored-choice store through its holder at each call, and set_channel_delivery\'s other inputs at each call', () => {
   // Every member here is optional in PersonaRoutingDeps or SessionToolDeps,
   // so a dropped member, or one bound to a copy taken at import (before
   // main() loads the store), would type-check and pass every behaviour suite
   // while the routing applied no stored choice and the tool refused every
-  // call or judged the loop guard on a stale persona set. Only this audit
+  // call. Only this audit
   // makes sure production binds them, each to a call-time read.
   test.each<[string, () => string | undefined]>([
     ['the routing\'s getChannelDelivery', () => onlyCallProps('createPersonaRouting').get(ROUTING_CHANNEL_DELIVERY)],
@@ -5553,12 +5632,11 @@ describe('the routing and the session tools read the one stored-choice store thr
     expect(member()).toBe(`() => ${CHANNEL_DELIVERY_HOLDER}`)
   })
 
-  test('the session tools\' heardChannels asks the one routing instance for the key at each call, getAppliedPersonas reads the applied config holder\'s personas at each call, and log writes to console.error', () => {
+  test('the session tools read current membership and up/shutdown state at every call, and log writes to console.error', () => {
     const props = objectProperties(spreadConstObject('sessionToolDeps'))
-    const routing = constOf('createPersonaRouting')
     expect(insideMain(onlyCallOf('createPersonaRouting'))).toBe(false)
-    expect(props.get(SESSION_TOOLS_HEARD)).toMatch(new RegExp(`^\\(?(\\w+)\\)? => ${routing}\\.${ROUTING_HEARD}\\(\\1\\)$`))
-    expect(props.get(SESSION_TOOLS_APPLIED)).toBe(`() => ${loadedConfigName(SERVER_CODE)}?.personas ?? []`)
+    expect(props.get(SESSION_TOOLS_MEMBERSHIP)).toBe("(key, channel, mode) => channelMembership?.read(key, channel, mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' }")
+    expect(props.get(SESSION_TOOLS_UP)).toBe('key => !shuttingDown && isPersonaUp(key)')
     expect(props.get(SESSION_TOOLS_LOG)).toMatch(/^\(\s*(\w+)\s*\)\s*=>\s*console\.error\(\s*\1\s*\)$/)
   })
 
@@ -5568,7 +5646,7 @@ describe('the routing and the session tools read the one stored-choice store thr
     const named = indicesOf(/\bgetChannelDelivery\b/g, SERVER_CODE)
     expect(named).toHaveLength(2)
     expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
-    const members = [SESSION_TOOLS_CHANNEL_DELIVERY, SESSION_TOOLS_HEARD, SESSION_TOOLS_APPLIED, SESSION_TOOLS_LOG].join('|')
+    const members = [SESSION_TOOLS_CHANNEL_DELIVERY, SESSION_TOOLS_MEMBERSHIP, SESSION_TOOLS_UP, SESSION_TOOLS_LOG].join('|')
     expect(indicesOf(new RegExp(`\\bsessionToolDeps\\s*(?:\\.\\s*(?:${members})\\b|\\[)`, 'g'), SERVER_CODE)).toEqual([])
   })
 })
@@ -5679,6 +5757,384 @@ describe('main() reads the test-only timer override block once, right after the 
 
 // / D8: runtime unit suites use injected clients and
 // clocks; these bindings prove the server shares that ownership in main.
+describe('test-only measurement wiring (Decision 25)', () => {
+  const tree = ts.createSourceFile('server.ts', SERVER_CODE, ts.ScriptTarget.Latest, true)
+  const main = tree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'main') as ts.FunctionDeclaration
+  const statements = [...main.body!.statements]
+  const statementAt = (at: number) => statements.findIndex(node => node.getStart(tree) <= at && at < node.end)
+  const enabledAt = statements.findIndex(node => ts.isVariableStatement(node) && node.declarationList.declarations.some(d => d.name.getText(tree) === 'testMeasurementsEnabled'))
+  const branchAt = statements.findIndex(node => ts.isIfStatement(node) && node.expression.getText(tree) === 'testMeasurementsEnabled')
+  const installAt = statementAt(onlyCallOf('installTestTimerOverrides'))
+  const branch = statements[branchAt]!
+  const timingsBranch = ((branch as ts.IfStatement).thenStatement as ts.Block).statements
+    .find(node => ts.isIfStatement(node) && node.expression.getText(tree) === 'personaConfig.test_measurement_timings === true')!
+  const shutdown = tree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'shutdown') as ts.FunctionDeclaration
+  const stopAt = onlyCallOf('testMeasurements\\.stop')
+  const stopStatement = shutdown.body!.statements.find(node => node.getStart(tree) <= stopAt && stopAt < node.end)!
+  const detachAt = onlyCallOf('unsubscribeTestMeasurements\\?\\.')
+  // Include the guard and await, not just the call inside the statement.
+  const stopCode = SERVER_CODE.slice(stopStatement.getStart(tree), detachAt + 'unsubscribeTestMeasurements?.()'.length)
+  const exitStatement = shutdown.body!.statements.find(node => node.getText(tree) === 'process.exit(exitCode)')!
+  const roots: string[] = [], stops: Array<() => Promise<void>> = []
+  afterEach(async () => {
+    for (const stop of stops.splice(0)) await stop()
+    for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
+  })
+
+  /** Execute the actual start binding and reload callback over isolated ports.
+   * This does not call main or model a complete server start/stop. */
+  function wired(enabled: boolean | undefined, interval?: number, throws?: 'record' | 'queue-mapper' | 'post-mapper', timings?: boolean) {
+    const root = mkdtempSync(join(tmpdir(), 'cscb-measurement-wiring-')); roots.push(root)
+    const config = makeMultiPersonaConfig([], root, {
+      ...(enabled === undefined ? {} : { test_measurements: enabled }),
+      ...(timings === undefined ? {} : { test_measurement_timings: timings }),
+      ...(interval === undefined ? {} : { test_timer_overrides: { queue_compact_interval_ms: interval } }),
+    })
+    const clock = createFakeClock({ start: 555.25 }), logs: string[] = []
+    const flags: boolean[] = [], intervals: Array<[string, number]> = [], recorded: TestMeasurement[] = []
+    const forwarded: QueueEvent[] = [], original = (event: QueueEvent) => { forwarded.push(event) }
+    const deliveryQueueEvents = { emit: original }
+    const postHoldDeps: Pick<PostHoldsModule.PostHoldResolverDeps, 'onEvent'> = {}
+    let appendTimer: DurableAppendTimer | undefined, saveObserver: ((save: ThreadMemorySave) => void) | undefined
+    let compactionObserver: ((compaction: ThreadMemoryModule.ThreadMemoryCompaction) => void) | undefined
+    const compactionObservers: Array<typeof compactionObserver> = []
+    let created = 0, unrefs = 0
+    const result = expression<() => {
+      stop(): Promise<void>; apply(config: PersonaConfig): void; recorder(): TestMeasurements | undefined
+      ackObserver(): ((timing: AckTiming) => void) | undefined
+    }>(`() => {
+      let personaConfig = config, appliedConfig = config;
+      let testMeasurements, unsubscribeTestMeasurements, ackTimingObserver;
+      ${statements.slice(installAt, branchAt + 1).map(node => node.getText(tree)).join('\n')}
+      return { stop: async () => { ${stopCode} }, apply: ${onlyCallProps('createReloadController').get('onApplied')!}, recorder: () => testMeasurements,
+        ackObserver: () => ackTimingObserver };
+    }`, {
+      config, installTestTimerOverrides, configInEffect,
+      deliveryPreparation: undefined, sharedStateReporting: undefined,
+      deliveryQueue: { setMeasureTimings: (value: boolean) => { flags.push(value) }, startMaintenance: (ms: number) => { intervals.push(['queue', ms]) } },
+      threadMemory: {
+        startMaintenance: (ms: number) => { intervals.push(['memory', ms]) },
+        setSaveObserver: (observer: typeof saveObserver) => { saveObserver = observer },
+        setCompactionObserver: (observer: typeof compactionObserver) => { compactionObservers.push(observer); compactionObserver = observer },
+      },
+      performance: { now: clock.now },
+      setDurableAppendTimer: (timer: DurableAppendTimer | undefined) => { appendTimer = timer },
+      ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, threadCompactionMeasurement,
+      STATE_DIR: root, join, TEST_MEASUREMENTS_FILE_NAME, buildTestMeasurementsStartLine,
+      fsPromises: fs.promises, appendFileSync: fs.appendFileSync,
+      setTimeout: (callback: () => void, ms: number) => Object.assign(clock.setTimeout(callback, ms), { unref() { unrefs++ } }),
+      clearTimeout: clock.clearTimeout, console: { error: (line: string) => { logs.push(line) } },
+      deliveryQueueEvents, postHoldDeps,
+      queueEventMeasurement: (event: QueueEvent) => { if (throws === 'queue-mapper') throw new Error('observer failed'); return queueEventMeasurement(event) },
+      postHoldEventMeasurement: (event: PostHoldsModule.PostHoldEvent) => { if (throws === 'post-mapper') throw new Error('observer failed'); return postHoldEventMeasurement(event) },
+      createTestMeasurements: (deps: TestMeasurementsDeps) => {
+        created++
+        const recorder = createTestMeasurements({ ...deps, monotonicNow: clock.now })
+        return { ...recorder, record(entry: TestMeasurement) { if (throws === 'record') throw new Error('observer failed'); recorded.push(entry); recorder.record(entry) } }
+      },
+    })
+    const run = result(); stops.push(run.stop)
+    return { ...run, root, config, clock, logs, flags, intervals, recorded, forwarded, deliveryQueueEvents, original, postHoldDeps,
+      appendTimer: () => appendTimer, saveObserver: () => saveObserver, compactionObserver: () => compactionObserver, compactionObservers,
+      created: () => created, unrefs: () => unrefs, path: join(root, TEST_MEASUREMENTS_FILE_NAME) }
+  }
+
+  test('one strict switch read follows the one start resolution beside test_mcp_drop_endpoint; all measurement effects are in its true branch', () => {
+    expect(enabledAt).toBeGreaterThan(installAt)
+    expect(branchAt).toBe(enabledAt + 1)
+    expect(statements[enabledAt]!.getText(tree)).toBe('const testMeasurementsEnabled = personaConfig.test_measurements === true')
+    expect(statements[enabledAt - 1]!.getText(tree)).toBe('if (testMcpDropEnabled) console.error(TEST_MCP_DROP_START_LINE)')
+    expect(statements[enabledAt - 2]!.getText(tree)).toBe('const testMcpDropEnabled = personaConfig.test_mcp_drop_endpoint === true')
+    expect(indicesOf(/\btest_measurements\b/g, SERVER_CODE)).toHaveLength(1)
+    expect(callsOf('reload\\.resolveStart')).toHaveLength(1)
+    expect(statements[enabledAt]!.getStart(tree)).toBeGreaterThan(startResolution(SERVER_CODE).assignAt)
+    const within = (at: number, node: ts.Node) => { expect(at).toBeGreaterThan(node.getStart(tree)); expect(at).toBeLessThan(node.end) }
+    for (const name of ['createTestMeasurements', 'buildTestMeasurementsStartLine', 'queueEventMeasurement', 'postHoldEventMeasurement', 'threadCompactionMeasurement']) {
+      expect(importSource(SERVER_CODE, name)).toBe('./test-measurements.ts')
+      within(onlyCallOf(name), branch)
+      expect(timingsBranch.getText(tree)).not.toContain(`${name}(`)
+    }
+    // Compactions need only test_measurements, including the startup compactions.
+    const compactionCalls = callsOf('threadMemory\\??\\.setCompactionObserver')
+    expect(compactionCalls).toHaveLength(2)
+    for (const at of compactionCalls) {
+      within(at, branch)
+      expect(at > timingsBranch.getStart(tree) && at < timingsBranch.end).toBe(false)
+    }
+    const compactionAt = onlyCallOf('threadMemory\\.setCompactionObserver')
+    const binding = ((branch as ts.IfStatement).thenStatement as ts.Block).statements
+      .find(node => node.getStart(tree) === compactionAt)
+    expect(binding).toBeDefined()
+    // The per-event timings need their own switch, read once, strictly, inside the measurement branch.
+    expect(timingsBranch).toBeDefined()
+    expect(indicesOf(/\btest_measurement_timings\b/g, SERVER_CODE)).toHaveLength(1)
+    for (const name of ['ackTimingMeasurement', 'durableAppendMeasurement', 'threadSaveMeasurement']) {
+      expect(importSource(SERVER_CODE, name)).toBe('./test-measurements.ts')
+      within(onlyCallOf(name), timingsBranch)
+    }
+    // Each timing observer is installed only in the timings branch; the cleanup clears all three in the measurement branch.
+    expect(importSource(SERVER_CODE, 'setDurableAppendTimer')).toBe('./durable-journal.ts')
+    for (const name of ['setDurableAppendTimer', 'threadMemory\\??\\.setSaveObserver']) {
+      const calls = callsOf(name)
+      expect(calls).toHaveLength(2)
+      for (const at of calls) within(at, branch)
+      expect(calls.filter(at => at > timingsBranch.getStart(tree) && at < timingsBranch.end)).toHaveLength(1)
+    }
+    // Intake asks for the ack observer at each receipt; only the timings branch sets it, and the cleanup clears it.
+    expect(onlyCallProps('createPersonaRouting').get('ackTiming')).toBe('() => ackTimingObserver')
+    expect(SERVER_CODE).toMatch(/^let ackTimingObserver: \(\(timing: AckTiming\) => void\) \| undefined$/m)
+    const sets = indicesOf(/\backTimingObserver = /g, SERVER_CODE)
+    expect(sets).toHaveLength(2)
+    for (const at of sets) within(at, branch)
+    expect(sets.filter(at => at > timingsBranch.getStart(tree) && at < timingsBranch.end)).toHaveLength(1)
+    expect(onlyCallArgs('deliveryQueue\\.setMeasureTimings')).toEqual(['true'])
+    expect(onlyCallOf('deliveryQueue\\.setMeasureTimings')).toBeGreaterThan(branch.getStart(tree))
+    expect(onlyCallOf('deliveryQueue\\.setMeasureTimings')).toBeLessThan(branch.end)
+    for (const factory of ['createDeliveryQueue', 'createThreadMemory']) {
+      expect(onlyCallProps(factory).has('measureTimings')).toBe(false)
+      expect(onlyCallProps(factory).has('monotonicNow')).toBe(false)
+    }
+    expect(onlyCallProps('createThreadMemory').get('onEvent')).toBe('event => threadMemoryEvents.emit(event)')
+    expect(SERVER_CODE).not.toMatch(/thread-memory-loaded|threadMemoryEventMeasurement/)
+    expect(onlyCallProps('createTestMeasurements').get('fs')).toBe('{ appendFile: fsPromises.appendFile, appendFileSync }')
+    expect(onlyCallProps('createTestMeasurements').get('path')).toBe('path')
+    expect(branch.getText(tree)).toContain('join(STATE_DIR, TEST_MEASUREMENTS_FILE_NAME)')
+    // No measurement construction/option can run from the reload callback.
+    expect(onlyCallProps('createReloadController').get('onApplied')).not.toMatch(/[Mm]easure|startMaintenance|installTestTimer/)
+  })
+
+  test('both maintenance calls immediately follow overrides outside the switch, with no executed await through compaction binding until activation', () => {
+    expect(statements.slice(installAt + 1, installAt + 3).map(node => node.getText(tree))).toEqual([
+      'deliveryQueue.startMaintenance(testTimers.queueCompactIntervalMs)',
+      'threadMemory.startMaintenance(testTimers.queueCompactIntervalMs)',
+    ])
+    for (const name of ['deliveryQueue', 'threadMemory']) {
+      expect(onlyCallArgs(`${name}\\.startMaintenance`)).toEqual(['testTimers.queueCompactIntervalMs'])
+      expect(atMainTopLevel(SERVER_CODE, onlyCallOf(`${name}\\.startMaintenance`))).toBe(true)
+    }
+    const oldSite = statementAt(onlyCallOf('createDeliveryPreparation'))
+    const yields: string[] = []
+    const visit = (node: ts.Node): void => {
+      // Callback bodies are only declared here; the code review separately
+      // checks the constructors and resolveStart do not invoke them.
+      if (ts.isFunctionLike(node)) return
+      if (ts.isAwaitExpression(node) || ts.isYieldExpression(node)) yields.push(node.getText(tree))
+      ts.forEachChild(node, visit)
+    }
+    expect(oldSite).toBeLessThan(installAt)
+    const activationAt = statementAt(onlyCallOf('threadMemory\\.activate'))
+    expect(activationAt).toBeGreaterThan(branchAt)
+    statements.slice(oldSite, activationAt).forEach(visit)
+    expect(yields).toEqual([])
+    expect(branch.end).toBeLessThan(onlyCallOf('threadMemory\\.activate'))
+    const loop = statements.find(node => ts.isForOfStatement(node) && node.getText(tree).includes(`${START_RECOVERY_STEP}(`))!
+    expect(loop.getStart(tree)).toBeGreaterThan(branch.end)
+    expect(onlyCallProps('createDeliveryQueue').get('onLoadedAfterStart')).toContain('if (!queueStartRecovered || shuttingDown) return')
+    expect(SERVER_CODE).toMatch(/let queueStartRecovered = false/)
+    expect(SERVER_CODE.indexOf('queueStartRecovered = true')).toBeGreaterThan(loop.end)
+  })
+
+  test.each([undefined, false, true].flatMap(enabled => [undefined, 37].map(interval => ({ enabled, interval }))))(
+    'switch=$enabled, interval=$interval: maintenance takes the override or hourly default', async ({ enabled, interval }) => {
+      const h = wired(enabled, interval)
+      expect(h.intervals).toEqual([['queue', interval ?? QUEUE_COMPACT_INTERVAL_MS], ['memory', interval ?? QUEUE_COMPACT_INTERVAL_MS]])
+      await h.stop()
+      assertNoLeak(h.logs)
+    },
+  )
+
+  test.each([undefined, false])('switch=%s: no recorder, flag, observer, file or line at binding or stop, including after reload turns it on', async enabled => {
+    const h = wired(enabled)
+    expect(h.created()).toBe(0)
+    expect(h.recorder()).toBeUndefined()
+    expect(h.flags).toEqual([])
+    expect(h.deliveryQueueEvents.emit).toBe(h.original)
+    expect(h.postHoldDeps.onEvent).toBeUndefined()
+    const noNewObservers = () => {
+      expect(h.ackObserver()).toBeUndefined()
+      expect(h.appendTimer()).toBeUndefined()
+      expect(h.saveObserver()).toBeUndefined()
+      expect(h.compactionObserver()).toBeUndefined()
+      expect(h.compactionObservers).toEqual([])
+    }
+    noNewObservers()
+    h.apply({ ...h.config, test_measurements: true, test_measurement_timings: true })
+    h.deliveryQueueEvents.emit({ type: 'fixed-stored', key: 'reader', seq: 7, storeMs: 4, atMonoMs: 90 })
+    noNewObservers()
+    await h.stop()
+    expect(h.created()).toBe(0)
+    expect(h.flags).toEqual([])
+    expect(h.deliveryQueueEvents.emit).toBe(h.original)
+    expect(h.postHoldDeps.onEvent).toBeUndefined()
+    noNewObservers()
+    expect(h.logs).toEqual([])
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(existsSync(h.path)).toBe(false)
+    expect(readdirSync(h.root)).toEqual([])
+    expect(h.forwarded).toHaveLength(1)
+    assertNoLeak(h.logs)
+  })
+
+  test.each([undefined, false])('test_measurement_timings=%s with test_measurements on: store and compaction rows are recorded without per-event timing observers, including after reload', async timings => {
+    const h = wired(true, undefined, undefined, timings)
+    expect(h.created()).toBe(1)
+    expect(h.flags).toEqual([true])
+    expect(h.postHoldDeps.onEvent).toBeFunction()
+    const noTimingObservers = () => {
+      expect(h.ackObserver()).toBeUndefined()
+      expect(h.appendTimer()).toBeUndefined()
+      expect(h.saveObserver()).toBeUndefined()
+    }
+    noTimingObservers()
+    const compactionObserver = h.compactionObserver()
+    expect(compactionObserver).toBeFunction()
+    expect(h.compactionObservers).toEqual([compactionObserver])
+    compactionObserver!({ key: 'reader', startMonoMs: 70.25, endMonoMs: 75.5, outcome: 'rewritten' })
+    h.apply({ ...h.config, test_measurement_timings: true })
+    noTimingObservers()
+    expect(h.compactionObserver()).toBe(compactionObserver)
+    expect(h.compactionObservers).toEqual([compactionObserver])
+    compactionObserver!({ key: 'writer', startMonoMs: 76.25, endMonoMs: 77.5, outcome: 'skipped' })
+    h.deliveryQueueEvents.emit({ type: 'stored', key: 'reader', seq: 7, store: 'accepted', storeMs: 2, atMonoMs: 80 })
+    await h.stop()
+    noTimingObservers()
+    expect(h.compactionObserver()).toBeUndefined()
+    expect(h.compactionObservers).toEqual([compactionObserver, undefined])
+    expect(readFileSync(h.path, 'utf8').trim().split('\n').map(line => JSON.parse(line))).toEqual([
+      { v: 1, kind: 'thread-compaction', at_mono_ms: 75.5, key: 'reader', start_mono_ms: 70.25, end_mono_ms: 75.5, outcome: 'rewritten' },
+      { v: 1, kind: 'thread-compaction', at_mono_ms: 77.5, key: 'writer', start_mono_ms: 76.25, end_mono_ms: 77.5, outcome: 'skipped' },
+      { v: 1, kind: 'store', key: 'reader', seq: 7, store: 'accepted', store_ms: 2, at_mono_ms: 80 },
+    ])
+    assertNoLeak({ logs: h.logs, file: writtenFile(h.path) })
+  })
+
+  test('enabled: timed queue facts and saved Post Holds reach the file, timer is unref\'d, reload keeps the observer, stop detaches it', async () => {
+    const h = wired(true, undefined, undefined, true)
+    expect(h.created()).toBe(1)
+    expect(h.flags).toEqual([true])
+    expect(h.logs).toEqual([buildTestMeasurementsStartLine(h.path)])
+    expect(h.deliveryQueueEvents.emit).not.toBe(h.original)
+    expect(h.postHoldDeps.onEvent).toBeFunction()
+    const events: QueueEvent[] = [
+      { type: 'stored', key: 'reader', seq: 7, store: 'accepted', storeMs: 2, atMonoMs: 80 },
+      { type: 'fixed-stored', key: 'reader', seq: 7, storeMs: 4, atMonoMs: 90 },
+      { type: 'holds-resolved', key: 'reader', resolutions: [{ seq: 8, outcome: 'released', at: 999 }], storeMs: 3, atMonoMs: 100 },
+      { type: 'stored', key: 'reader' },
+    ]
+    events.forEach(event => h.deliveryQueueEvents.emit(event))
+    const observer = h.postHoldDeps.onEvent
+    const compactionObserver = h.compactionObserver()
+    expect(compactionObserver).toBeFunction()
+    h.apply({ ...h.config, test_measurements: false, test_measurement_timings: false })
+    expect(h.postHoldDeps.onEvent).toBe(observer)
+    expect(h.compactionObserver()).toBe(compactionObserver)
+    expect(h.compactionObservers).toEqual([compactionObserver])
+    h.postHoldDeps.onEvent!({ kind: 'post-hold-resolved', key: 'reader', seq: 8, outcome: 'released', cause: 'restart' })
+    // The new observers: the routing ack hook, the journal timer (on performance.now, the recorder's clock) and the Thread Memory save observer.
+    expect(h.ackObserver()).toBeFunction()
+    expect(h.appendTimer()!.now()).toBe(555.25)
+    h.ackObserver()!({ keys: ['reader'], ts: '1730000000.000100', targets: [{ key: 'reader', seq: 7 }], outcome: 'acked', receiveToAckMs: 5, ackCallMs: 1, atMonoMs: 110 })
+    h.appendTimer()!.record({ dir: join(h.root, 'queue'), path: join(h.root, 'queue', 'reader.jsonl'), records: 3, bytes: 300, appendMs: 9, fileFsyncMs: 6, dirFsyncMs: 2, fsyncs: 2, atMonoMs: 120 })
+    h.appendTimer()!.record({ dir: join(h.root, 'queue'), path: join(h.root, 'queue', 'reader.unreadable'), records: 1, bytes: 10, appendMs: 1, fileFsyncMs: 1, dirFsyncMs: 0, fsyncs: 2, atMonoMs: 121 })
+    h.saveObserver()!({ key: 'reader', records: 2, joins: 1, intents: 1, outcomes: 0 })
+    compactionObserver!({ key: 'reader', startMonoMs: 122.25, endMonoMs: 124.5, outcome: 'rewritten' })
+    expect(h.unrefs()).toBe(1)
+    expect(h.forwarded).toEqual(events)
+    expect(h.recorded).toHaveLength(8)
+    await h.stop()
+    const records = readFileSync(h.path, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    expect(records).toEqual([
+      { v: 1, kind: 'store', key: 'reader', seq: 7, store: 'accepted', store_ms: 2, at_mono_ms: 80 },
+      { v: 1, kind: 'store', key: 'reader', seq: 7, store: 'fixed', store_ms: 4, at_mono_ms: 90 },
+      { v: 1, kind: 'resolution-store', key: 'reader', seqs: [8], store_ms: 3, at_mono_ms: 100 },
+      { v: 1, kind: 'post-hold-resolved', key: 'reader', seq: 8, outcome: 'released', cause: 'restart', at_mono_ms: 555.25 },
+      { v: 1, kind: 'ack', at_mono_ms: 110, keys: ['reader'], ts: '1730000000.000100', targets: [{ key: 'reader', seq: 7 }], outcome: 'acked', receive_to_ack_ms: 5, ack_call_ms: 1 },
+      { v: 1, kind: 'append', at_mono_ms: 120, journal: 'queue', key: 'reader', records: 3, bytes: 300, append_ms: 9, file_fsync_ms: 6, dir_fsync_ms: 2, fsyncs: 2 },
+      { v: 1, kind: 'thread-save', at_mono_ms: 555.25, key: 'reader', records: 2, joins: 1, intents: 1, outcomes: 0 },
+      { v: 1, kind: 'thread-compaction', at_mono_ms: 124.5, key: 'reader', start_mono_ms: 122.25, end_mono_ms: 124.5, outcome: 'rewritten' },
+    ])
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(h.deliveryQueueEvents.emit).toBe(h.original)
+    expect(h.postHoldDeps.onEvent).toBeUndefined()
+    expect(h.ackObserver()).toBeUndefined()
+    expect(h.appendTimer()).toBeUndefined()
+    expect(h.saveObserver()).toBeUndefined()
+    expect(h.compactionObserver()).toBeUndefined()
+    expect(h.compactionObservers).toEqual([compactionObserver, undefined])
+    expect(h.created()).toBe(1)
+    assertNoLeak({ logs: h.logs, file: writtenFile(h.path) })
+  })
+
+  test.each(['record', 'queue-mapper', 'post-mapper'] as const)('a throwing %s observer cannot escape or suppress ordinary queue reporting', async throws => {
+    const h = wired(true, undefined, throws)
+    const event: QueueEvent = { type: 'stored', key: 'reader', seq: 1, store: 'accepted', storeMs: 2, atMonoMs: 3 }
+    expect(() => h.deliveryQueueEvents.emit(event)).not.toThrow()
+    expect(h.forwarded).toEqual([event])
+    expect(() => h.postHoldDeps.onEvent!({ kind: 'post-hold-resolved', key: 'reader', seq: 1, outcome: 'released', cause: 'timer', heldMs: 9 })).not.toThrow()
+    // Both observers are synchronous and contain no await or return of a
+    // recorder promise into intake/store/ack/resolution. Those flows themselves
+    // remain covered by their production-module suites, not this slice.
+    expect(branch.getText(tree)).not.toMatch(/\bawait\b/)
+    await h.stop()
+    assertNoLeak({ logs: h.logs, ...(existsSync(h.path) ? { file: writtenFile(h.path) } : {}) })
+  })
+
+  test('recorder stop follows both resolvers, queue drain and Thread Memory/seal stops, then detaches the observers', () => {
+    const [start, end] = shutdownBody(SERVER_CODE)
+    const stop = onlyCallOf('testMeasurements\\.stop'), detach = onlyCallOf('unsubscribeTestMeasurements\\?\\.')
+    expect(stop).toBeGreaterThan(start)
+    expect(detach).toBeLessThan(end)
+    for (const name of ['memoryHolds', 'postHolds', 'deliveryQueue', 'threadMemory', 'threadMemorySeal']) {
+      expect(onlyCallOf(`${name}\\?\\.stop`)).toBeLessThan(stop)
+    }
+    expect(onlyCallOf('threadMemoryRetries\\?\\.stopSeal')).toBeLessThan(stop)
+    expect(SERVER_CODE.slice(stopStatement.getStart(tree), detach).trim()).toBe('if (testMeasurements) await testMeasurements.stop()')
+    expect(detach).toBeLessThan(exitStatement.getStart(tree))
+    const cleanup: string[] = []
+    const visit = (node: ts.Node): void => {
+      if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && node.left.getText(tree) === 'unsubscribeTestMeasurements') cleanup.push(node.right.getText(tree))
+      ts.forEachChild(node, visit)
+    }
+    visit(tree)
+    expect(cleanup).toEqual([`() => {
+      deliveryQueueEvents.emit = emit; delete postHoldDeps.onEvent; ackTimingObserver = undefined
+      setDurableAppendTimer(undefined); threadMemory?.setSaveObserver(undefined)
+      threadMemory?.setCompactionObserver(undefined)
+    }`])
+  })
+
+  test.each([undefined, false, true])('shutdown switch=%s: disabled adds no yield; enabled waits before detach and exit', async enabled => {
+    const h = wired(enabled), order: string[] = []
+    const gate = Promise.withResolvers<void>()
+    const recorder = h.recorder()
+    // Execute the actual measurement shutdown statement and detach, followed
+    // by the actual exit statement as a marker. Unrelated shutdown drains are
+    // omitted here; their relative order is pinned above.
+    const stop = expression<() => Promise<void>>(`async () => {
+      ${stopCode}
+      ${exitStatement.getText(tree)}
+    }`, {
+      testMeasurements: recorder && { stop: () => { order.push('stop'); return gate.promise } },
+      unsubscribeTestMeasurements: () => { order.push('detach') },
+      process: { exit: (code: number) => { order.push(`exit:${code}`) } }, exitCode: 0,
+    })
+    const stopped = stop()
+    try {
+      if (enabled) {
+        expect(order).toEqual(['stop'])
+        await h.clock.flush()
+        expect(order).toEqual(['stop'])
+      } else {
+        // Check before yielding even one microtask: awaiting an absent recorder
+        // would postpone these effects and change production's disabled path.
+        expect(order).toEqual(['detach', 'exit:0'])
+      }
+    } finally { gate.resolve(); await stopped }
+    expect(order).toEqual(enabled ? ['stop', 'detach', 'exit:0'] : ['detach', 'exit:0'])
+    await h.stop()
+  })
+})
+
 describe('delivery ownership wiring', () => {
   test('main installs the same lifecycle in the session manager and engines before the start bring-up', () => {
     const built = onlyCallOf('createDeliveryLifecycle')
@@ -5726,6 +6182,1950 @@ describe('delivery ownership wiring', () => {
     const reconnect = onlyCallProps('createDeliveryEngines').get('reconnect')!
     expect(reconnect).toContain('deliveryScope.run(key, client as Client, beforeCall, async () =>')
     expect(reconnect).toContain('await deferredReconnect(key)')
+  })
+})
+
+describe('the own-post observer shares one Thread Memory owner', () => {
+  const observer: keyof typeof OwnPostModule = 'createOwnPostObserver'
+  const owner: keyof typeof OwnPostModule = 'createOwnPostJoins'
+  const choice: keyof typeof OwnPostModule = 'ownPostChoice'
+  const eligibility: keyof typeof OwnPostModule = 'ownPostEligibility'
+  const harness = stripComments(readFileSync(new URL('./test-helpers/persona-routing-harness.ts', import.meta.url), 'utf-8'))
+
+  test('server.ts builds none of the removed participation pieces and defers no intake notice', () => {
+    expect(SERVER_CODE.match(/participation|rootLookup|grantedScope|RECOVERY_CLOCK|reportOwnPost|beginIntake/gi)).toBeNull()
+  })
+
+  test('the routing harness mirrors the observer and owner over its own memory, queue and current membership', () => {
+    const production = onlyCallArgs(observer)
+    expect(production).toEqual(['() => ownPostJoins'])
+    expect(splitTopLevel(onlyCallArguments(harness, observer))).toEqual(production)
+    for (const name of [observer, owner, choice, eligibility]) expect(importSource(harness, name)).toBe('../../src/own-post.ts')
+    const deps = Object.fromEntries(onlyCallProps(owner))
+    expect(Object.fromEntries(objectProperties(onlyCallArguments(harness, owner)))).toEqual({
+      ...deps,
+      memory: 'h.threads.memory',
+      lookupSlackKey: '(key, slackKey) => queue.lookupSlackKey(key, slackKey)',
+      isDryRun: '() => false',
+    })
+    const sourcesAt = indicesOf(/\bconst\s+ownPostSources\s*=\s*\{/g, harness)
+    expect(sourcesAt).toHaveLength(1)
+    expect(Object.fromEntries(objectProperties(harness.slice(harness.indexOf('{', sourcesAt[0]!))))).toEqual({
+      config: '() => h.config', persona: 'getPersona', choices: '() => h.channelDelivery ?? undefined',
+      membership: '(key: string, channel: string, mode: ChannelMode) => opts.membership?.read(key, channel, mode)',
+    })
+    // Routing's Pending Own Posts: production's adapter body, behind the harness's opt-in and read log only.
+    const member: keyof PersonaRoutingDeps = 'pendingOwnPosts', mapping: keyof typeof OwnPostModule = 'pendingOwnPostViews'
+    const binding = onlyCallProps('createPersonaRouting').get(member)!, arrow = binding.indexOf(' => ')
+    expect(importSource(harness, mapping)).toBe('../../src/own-post.ts')
+    // The harness's routing deps hold a conditional spread, so read its top-level members directly.
+    const routingDeps = onlyCallArguments(harness, 'createPersonaRouting')
+    expect(splitTopLevel(routingDeps.slice(...balancedAfter(routingDeps, 0, '{', '}'))).filter(part => new RegExp(`\\b${member}\\b`).test(part))).toEqual([
+      `${member}: opts.threadMemory === undefined ? undefined : ${binding.slice(0, arrow)} => { h.pendingOwnPostReads.push([key, channel]) return ${binding.slice(arrow + 4)} }`,
+    ])
+    expect(indicesOf(new RegExp(`(?<![\\w.$])${mapping}\\s*\\(`, 'g'), harness)).toHaveLength(1)
+    // Post Hold registration and outcome retention: production's members, each bound only behind an opt-in,
+    // so runs that don't opt in keep routing's absent defaults; `held` keeps production's shape, and the
+    // retention is production's adapter over the same owner pendingOwnPosts reads.
+    const parts = splitTopLevel(routingDeps.slice(...balancedAfter(routingDeps, 0, '{', '}')))
+    const bound = (name: keyof PersonaRoutingDeps, optIn: string) => {
+      const found = parts.filter(part => part.startsWith(`${name}:`))
+      expect(found).toHaveLength(1)
+      const prefix = `${name}: ${optIn} ? undefined : `
+      expect(found[0]!.startsWith(prefix)).toBe(true)
+      return found[0]!.slice(prefix.length)
+    }
+    expect(onlyCallProps('createPersonaRouting').get('monotonicNow')).toBe('HOLD_CLOCK.now')
+    expect(bound('monotonicNow', 'receiptNow === undefined')).toMatch(/^\(\) => \{ .* return receiptNow\(\) \}$/)
+    const held = (value: string) => [...objectProperties(value)].map(([name, arrow]) => [name, arrow.slice(0, arrow.indexOf(' => '))])
+    expect(held(bound('postHolds', '!registers'))).toEqual(held(onlyCallProps('createPersonaRouting').get('postHolds')!))
+    expect(held(bound('postHolds', '!registers'))).toEqual([['held', '(key, hold, retention)']])
+    expect(bound('retainOwnPostOutcomes', 'opts.threadMemory === undefined')).toBe(onlyCallProps('createPersonaRouting').get('retainOwnPostOutcomes')!)
+  })
+
+  // The end-to-end Post Hold and k8 crash cases run over the reload harness's
+  // hand copy of these, so a copy left behind a source change must fail here.
+  test('the reload harness mirrors the start step, its late-load binding, the start loop, the bring-up\'s Post Hold chain, routing\'s thread view and the stored-hold hook', () => {
+    const reload = stripComments(readFileSync(new URL('./test-helpers/reload-harness.ts', import.meta.url), 'utf-8'))
+    const flat = (text: string) => text.replace(/\s+/g, ' ').trim()
+    /** The one node anywhere in `code` that `keep` accepts; fails unless there is exactly one. */
+    const only = (code: string, keep: (node: ts.Node) => boolean): ts.Node => {
+      const found: ts.Node[] = []
+      const visit = (node: ts.Node): void => { if (keep(node)) found.push(node); ts.forEachChild(node, visit) }
+      visit(ts.createSourceFile('audit.ts', code, ts.ScriptTarget.Latest, true))
+      expect(found).toHaveLength(1)
+      return found[0]!
+    }
+    const bound = (code: string, name: string) =>
+      (only(code, node => ts.isPropertyAssignment(node) && node.name.getText() === name) as ts.PropertyAssignment).initializer as ts.ArrowFunction
+    const parts = (code: string) => {
+      const loop = only(code, node => ts.isForOfStatement(node) && node.statement.getText().startsWith(`${START_RECOVERY_STEP}(`)) as ts.Statement
+      const siblings = (loop.parent as ts.Block).statements
+      const bringUp = (bound(code, 'loadThreadMemory').body as ts.Block).statements.find(ts.isIfStatement)!
+      return {
+        step: flat(only(code, node => ts.isFunctionDeclaration(node) && node.name?.text === START_RECOVERY_STEP).getText()),
+        loaded: flat(bound(code, 'onLoadedAfterStart').body.getText()),
+        start: [loop, siblings[siblings.indexOf(loop) + 1]!].map(node => flat(node.getText())),
+        bringUp: (bringUp.thenStatement as ts.Block).statements.map(node => flat(node.getText())),
+      }
+    }
+    // server.ts in the harness's names: its queue always exists, so the step's holder preamble and queue
+    // guard go; its fence is memoryWorkAllowed, its stop flag stopped, and it asserts memoryHolds.
+    const renames: Array<[RegExp, string]> = [
+      [/const queue = deliveryQueue, resolver = postHolds /, ''],
+      [/if \(!queue \|\| !threadMemory \|\| !resolver\) return/, 'if (!threadMemory || !postHolds) return'],
+      [/\bresolver\./g, 'postHolds.'], [/\bthreadMemoryWorkAllowed\b/g, 'memoryWorkAllowed'], [/\bshuttingDown\b/g, 'stopped'],
+      [/\bdeliveryQueue\?\.unresolvedHolds\(key\) \?\? \[\]/g, 'queue.unresolvedHolds(key)'], [/\bdeliveryQueue\b/g, 'queue'],
+    ]
+    const asHarness = (text: string) => renames.reduce((out, [from, to]) => out.replace(from, to), text)
+    const asserted = (text: string) => text.replace(/\bmemoryHolds!\./g, 'memoryHolds?.')
+    const server = parts(SERVER_CODE), harness = parts(reload)
+    expect(asserted(harness.step)).toBe(asHarness(server.step))
+    expect(harness.loaded).toBe(asHarness(server.loaded))
+    expect(harness.start).toEqual(server.start.map(asHarness))
+    expect(harness.bringUp.map(asserted)).toEqual(server.bringUp.map(asHarness))
+    // Routing's thread view, stored-hold hook and outcome retention bodies, in the harness's names:
+    // its queue always exists, and its delivery reporting is `reporting`.
+    const intake = (code: string, names: Array<[RegExp, string]> = []) => ['threadMemory', 'onHoldStored', 'retainOwnPostOutcomes']
+      .map(name => names.reduce((out, [from, to]) => out.replace(from, to), flat(bound(code, name).body.getText())))
+    expect(intake(reload)).toEqual(intake(SERVER_CODE, [[/\bdeliveryQueue\?\./g, 'queue.'], [/\bdeliveryReporting\b/g, 'reporting']]))
+    // The decision's retention reaches the resolver, or is released when there is none.
+    const handoff = (code: string) => {
+      const held = (only(code, node => ts.isPropertyAssignment(node) && node.name.getText() === 'postHolds') as ts.PropertyAssignment).initializer as ts.ObjectLiteralExpression
+      return held.properties.map(member => [member.name!.getText(), flat(((member as ts.PropertyAssignment).initializer as ts.ArrowFunction).body.getText())])
+    }
+    expect(handoff(reload)).toEqual(handoff(SERVER_CODE))
+  })
+
+  test('every posting surface shares the one observer, which reads the one owner holder at call time', () => {
+    expect(importSource(SERVER_CODE, observer)).toBe('./own-post.ts')
+    expect(callsOf(observer)).toHaveLength(1)
+    declaredOnce('ownPosts')
+    expect(constOf(observer)).toBe('ownPosts')
+    // No explicit onFault: retain the observer's default swallowing callback.
+    expect(onlyCallArgs(observer)).toEqual(['() => ownPostJoins'])
+    expect(assignmentsTo('ownPosts')).toEqual([])
+    expect(insideMain(onlyCallOf(observer))).toBe(false)
+    expect(objectProperties(spreadConstObject('sessionToolDeps')).get('ownPosts')).toBe('ownPosts')
+    expect(onlyCallProps('createPersonaDestinations').get('ownPosts')).toBe('ownPosts')
+    declaredOnce('ownPostJoins')
+    const assigned = assignmentsTo('ownPostJoins')
+    expect(assigned.map(({ value }) => value)).toEqual([`${owner}({`])
+    expect(atMainTopLevel(SERVER_CODE, assigned[0]!.at)).toBe(true)
+    expect(onlyCallOf(owner)).toBeGreaterThan(onlyCallOf('createThreadMemory'))
+    expect(onlyCallOf(owner)).toBeLessThan(onlyCallOf('threadMemory\\.readAtStart'))
+    const getter = expression<() => { get(): OwnPostModule.OwnPostJoins | undefined; set(value: OwnPostModule.OwnPostJoins): void }>(`() => {
+      let ownPostJoins;
+      return { get: ${onlyCallArgs(observer)[0]}, set: value => { ownPostJoins = value } };
+    }`, {})()
+    expect(getter.get()).toBeUndefined()
+    const sentinel = {} as OwnPostModule.OwnPostJoins
+    getter.set(sentinel)
+    expect(getter.get()).toBe(sentinel)
+  })
+
+  // GE-1: intake reads the one owner's in-memory Pending Own Posts, as intended.
+  test('routing reads Pending Own Posts from the one owner holder at call time, synchronously and with no I/O', () => {
+    const member: keyof PersonaRoutingDeps = 'pendingOwnPosts', mapping: keyof typeof OwnPostModule = 'pendingOwnPostViews'
+    const routing = onlyCallOf('createPersonaRouting'), binding = onlyCallProps('createPersonaRouting').get(member)
+    // The whole adapter: no await, log, Slack, file or queue call; one owner read through the pure mapping.
+    expect(binding).toBe(`(key, channel) => ${mapping}(ownPostJoins?.pendingOwnPosts(key, channel) ?? [])`)
+    expect(importSource(SERVER_CODE, mapping)).toBe('./own-post.ts')
+    expect(withinCall(callsOf(mapping), routing)).toBe(1)
+    expect(callsOf(mapping)).toHaveLength(1)
+    expect(callsOf('ownPostJoins\\?\\.pendingOwnPosts')).toHaveLength(1)
+    const named = indicesOf(new RegExp(`\\b${member}\\s*:`, 'g'), SERVER_CODE)
+    expect(named).toHaveLength(1)
+    expect(withinCall(named, routing)).toBe(1)
+    expect(indicesOf(new RegExp(`(?:\\.\\s*${member}\\b(?!\\s*\\()|\\[\\s*['"]${member}['"]\\s*\\])`, 'g'), SERVER_CODE)).toEqual([])
+    // Execute the actual adapter over an isolated holder and the real mapping.
+    const adapter = expression<() => {
+      read: NonNullable<PersonaRoutingDeps['pendingOwnPosts']>
+      set(owner?: Pick<OwnPostModule.OwnPostJoins, 'pendingOwnPosts'>): void
+    }>(`() => {
+      let ownPostJoins;
+      return { read: (${binding}), set: value => { ownPostJoins = value } };
+    }`, { [mapping]: pendingOwnPostViews })()
+    const channel = THREAD_CHANNELS.primary, calls: string[][] = []
+    expect(adapter.read(THREAD_PERSONAS.primary, channel)).toEqual([])
+    const posts: OwnPostModule.PendingOwnPost[] = [
+      { operationId: 'reply-post', key: THREAD_PERSONAS.primary, channel, parent: THREAD_ROOTS.primary, root: THREAD_ROOTS.primary, issuedAt: 10, state: 'awaiting-answer' },
+      { operationId: 'channel-post', key: THREAD_PERSONAS.primary, channel, issuedAt: 20, state: 'unknown' },
+    ]
+    for (const marker of ['first', 'replacement']) {
+      adapter.set({ pendingOwnPosts: (key, at) => { calls.push([marker, key, at]); return posts } })
+      expect(adapter.read(THREAD_PERSONAS.primary, channel)).toEqual([
+        { operation: 'reply-post', root: THREAD_ROOTS.primary, issuedAt: 10 }, { operation: 'channel-post', issuedAt: 20 },
+      ])
+    }
+    expect(calls).toEqual([['first', THREAD_PERSONAS.primary, channel], ['replacement', THREAD_PERSONAS.primary, channel]])
+    adapter.set()
+    expect(adapter.read(THREAD_PERSONAS.secondary, channel)).toEqual([])
+  })
+
+  test('the owner gets the existing memory, queue and current shared sources, a wall clock, unique IDs and dry-run check', () => {
+    for (const name of [owner, choice, eligibility]) expect(importSource(SERVER_CODE, name)).toBe('./own-post.ts')
+    expect(Object.fromEntries(onlyCallProps(owner))).toEqual({
+      memory: 'threadMemory',
+      lookupSlackKey: '(key, slackKey) => deliveryQueue?.lookupSlackKey(key, slackKey)',
+      choice: `${choice}(ownPostSources)`, eligibility: `${eligibility}(ownPostSources)`,
+      now: 'Date.now', operationId: '() => crypto.randomUUID()', isDryRun: 'isDryRun',
+    } satisfies Record<keyof OwnPostModule.OwnPostJoinsDeps, string>)
+    expect(onlyCallArgs(choice)).toEqual(['ownPostSources'])
+    expect(onlyCallArgs(eligibility)).toEqual(['ownPostSources'])
+    expect(Object.fromEntries(objectProperties(spreadConstObject('ownPostSources')))).toEqual({
+      config: '() => personaConfig', persona: 'getAppliedPersona', choices: '() => channelDeliveryStore',
+      membership: '(key: string, channel: string, mode: ChannelMode) => channelMembership?.read(key, channel, mode)',
+    } satisfies Record<keyof OwnPostModule.OwnPostEligibilitySources, string>)
+    expect(callsOf('createThreadMemory')).toHaveLength(1)
+    expect(callsOf('createChannelMembership')).toHaveLength(1)
+    expect(importSource(SERVER_CODE, 'isDryRun')).toBe('./tokens.ts')
+  })
+
+  test('shutdown drains preparation and queue, then stops the owner once before closing Thread Memory', () => {
+    const [start, end] = shutdownBody(SERVER_CODE)
+    const code = SERVER_CODE.slice(start, end)
+    expect(code).not.toMatch(/personaRouting\.stop\s*\(/)
+    const calls = ['deliveryPreparation?.stop', 'deliveryQueue?.stop', 'ownPostJoins?.stop', 'threadMemory?.stop']
+    const offsets = calls.map(name => {
+      const at = indicesOf(new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\(', 'g'), code)
+      expect(at).toHaveLength(1)
+      expect(callArguments(code, at[0]!)).toBe('')
+      return at[0]!
+    })
+    expect(offsets).toEqual([...offsets].sort((a, b) => a - b))
+    expect(callsOf('ownPostJoins\\?\\.stop')).toHaveLength(1)
+  })
+})
+
+describe('own-post lookup server wiring', () => {
+  const factory: keyof typeof OwnPostLookupModule = 'createOwnPostLookups'
+
+  test('one runner is built only outside dry run, after the one owner and memory, before their first read', () => {
+    expect(importSource(SERVER_CODE, factory)).toBe('./own-post-lookup.ts')
+    declaredOnce('ownPostLookups')
+    expect(assignmentsTo('ownPostLookups').map(({ value }) => value)).toEqual([`${factory}({`])
+    const built = onlyCallOf(factory)
+    expect(insideMain(built)).toBe(true)
+    expect(built).toBeGreaterThan(onlyCallOf('createOwnPostJoins'))
+    expect(built).toBeGreaterThan(onlyCallOf('createThreadMemory'))
+    expect(built).toBeLessThan(onlyCallOf('threadMemory\\.readAtStart'))
+    const tree = ts.createSourceFile('server.ts', SERVER_CODE, ts.ScriptTarget.Latest, true)
+    const guards: ts.IfStatement[] = []
+    const visit = (node: ts.Node): void => {
+      if (ts.isIfStatement(node) && node.thenStatement.getStart(tree) <= built && node.thenStatement.end > built) guards.push(node)
+      ts.forEachChild(node, visit)
+    }
+    visit(tree)
+    expect(guards).toHaveLength(1)
+    expect(guards[0]!.expression.getText(tree)).toBe('!isDryRun()')
+    expect(guards[0]!.elseStatement).toBeUndefined()
+    expect(atMainTopLevel(SERVER_CODE, guards[0]!.getStart(tree))).toBe(true)
+  })
+
+  test('the runner shares the real owner, memory readers, stamp reader, connection manager and clock', () => {
+    expect(Object.fromEntries(onlyCallProps(factory))).toEqual({
+      owner: 'ownPostJoins', memory: 'threadMemory',
+      stamp: '(key, channel, stamp) => ownPostStampState(threadMemory!, key, channel, stamp)',
+      connections: '{ metadataCall: (key, connectionId, method, args, signal) => connections!.metadataCall(key, connectionId, method, args, signal), currentConnectionId: key => connections?.provenance(key)?.connectionId, isUp: key => threadMemoryWorkAllowed(key) && getAppliedPersona(key) !== undefined && isPersonaUp(key), identity: key => connections?.identity(key), }',
+      clock: 'SYSTEM_PERSONA_CONNECTION_CLOCK',
+      onEvent: "event => dispatchThreadMemoryReport({ source: 'lookup', event })",
+    } satisfies Record<keyof OwnPostLookupModule.OwnPostLookupsDeps, string>)
+    expect(importSource(SERVER_CODE, 'ownPostStampState')).toBe('./own-post.ts')
+    expect(importSource(SERVER_CODE, 'SYSTEM_PERSONA_CONNECTION_CLOCK')).toBe('./persona-connections.ts')
+    expect(callsOf('createPersonaConnectionManager')).toHaveLength(1)
+  })
+
+  test('connection-up kicks only a permitted life and uses the current lookup holder', () => {
+    const listener = onlyCallArgs('composePersonaStatusListeners')[4]!
+    const bindings = expression<() => {
+      status(key: string, status: { state: string }): void
+      set(allowed: boolean, runner?: Pick<OwnPostLookupModule.OwnPostLookups, 'kick'>): void
+    }>(`() => {
+      let allowed = true, ownPostLookups;
+      const threadMemoryWorkAllowed = () => allowed;
+      return { status: ${listener}, set(value, runner) { allowed = value; ownPostLookups = runner } };
+    }`, {})()
+    bindings.status('alpha', { state: 'up' })
+    const calls: string[] = []
+    for (const life of ['initial', 'replacement']) {
+      const runner = { kick: (key: string) => calls.push(`${life}:${key}`) }
+      bindings.set(true, runner)
+      for (const state of ['connecting', 'broken', 'retrying', 'up']) bindings.status('alpha', { state })
+      bindings.set(false, runner); bindings.status('alpha', { state: 'up' })
+    }
+    expect(calls).toEqual(['initial:alpha', 'replacement:alpha'])
+  })
+
+  test('production publication and unknown-event wiring schedule lookup work on a microtask', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cscb-lookup-wiring-')), h = await makeOwnPostHarness(root)
+    const enumerated: string[] = [], reports: OwnPostLookupModule.OwnPostLookupEvent[] = []
+    const owner = { ...h.owner, unknownOwnPosts(key: string) { enumerated.push(key); return h.owner.unknownOwnPosts(key) } }
+    const lookups = createOwnPostLookups(expression<OwnPostLookupModule.OwnPostLookupsDeps>(callArguments(SERVER_CODE, onlyCallOf(factory)), {
+      ownPostJoins: owner, threadMemory: h.memory, ownPostStampState,
+      connections: h.members.h.manager, threadMemoryWorkAllowed: () => true,
+      getAppliedPersona: h.sources.persona, isPersonaUp: () => false,
+      SYSTEM_PERSONA_CONNECTION_CLOCK: h.clock,
+      dispatchThreadMemoryReport: ({ event }: { event: OwnPostLookupModule.OwnPostLookupEvent }) => reports.push(event),
+    }))
+    const key = h.authority.config().personas[0]!.key
+    const publish = expression<() => void>(callArguments(SERVER_CODE, onlyCallOf('subscribeThreadView')), {
+      shuttingDown: false, threadMemory: h.memory, personaConfig: h.authority.config(), ownPostJoins: owner,
+      ownPostLookups: lookups, threadMemoryWorkAllowed: () => true, deliveryQueue: h.queue,
+      getAppliedPersona: h.sources.persona, memoryHolds: undefined,
+    })
+    try {
+      publish()
+      expect(enumerated).toEqual([])
+      await h.flush()
+      expect(enumerated).toContain(key)
+      const post = h.observer.start(key, 'text', { channel: h.authority.threadView().threadHybridChannels(key)[0]! }, { kind: 'text', text: 'wiring unknown post' })
+      expect(post).toBeDefined(); await post!.ready
+      enumerated.length = 0
+      h.observer.end(post!.operation, { kind: 'no-answer' })
+      expect(enumerated).toEqual([])
+      await h.flush()
+      expect(enumerated).toContain(key)
+      expect(h.owner.unknownOwnPosts(key)).toHaveLength(1)
+      assertNoLeak([h.captured(), reports])
+    } finally { lookups.stop(); await h.close(); rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test('routing\'s one own-message hook calls the one runner\'s ownMessage at call time, and does nothing without a runner', () => {
+    type Hook = NonNullable<PersonaRoutingDeps['onOwnMessage']>
+    const binding = onlyCallProps('createPersonaRouting').get(ROUTING_OWN_MESSAGE)
+    // Synchronous and awaits nothing: intake calls it before the ack.
+    expect(binding).toBe('(key, event, identity) => ownPostLookups?.ownMessage(key, event, identity)')
+    expect(callsOf('ownPostLookups\\?\\.ownMessage')).toHaveLength(1)
+    // No second runner or owner; server.ts's one owner subscription is the Post Hold resolver's (pinned with it).
+    expect(callsOf(factory)).toHaveLength(1)
+    expect(callsOf('createOwnPostJoins')).toHaveLength(1)
+    expect(indicesOf(/\bownPostJoins\b[!?]*\.subscribe\s*\(/g, SERVER_CODE)).toHaveLength(1)
+    const hook = expression<() => { call: Hook; set(runner?: Pick<OwnPostLookupModule.OwnPostLookups, 'ownMessage'>): void }>(`() => {
+      let ownPostLookups;
+      return { call: ${binding}, set: value => { ownPostLookups = value } };
+    }`, {})()
+    const identity = { botUserId: 'U0WIRING', botId: 'B0WIRING' } as Parameters<Hook>[2]
+    const event = makeOwnFileShare({ identity, channel: 'C0WIRING', ts: '1.000001' })
+    // No runner, as in a dry run (the guard above): nothing happens.
+    expect(hook.call('alpha', event, identity)).toBeUndefined()
+    const calls: Parameters<Hook>[] = []
+    hook.set({ ownMessage: (...args) => { calls.push(args as Parameters<Hook>) } })
+    hook.call('alpha', event, identity)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]![0]).toBe('alpha'); expect(calls[0]![1]).toBe(event); expect(calls[0]![2]).toBe(identity)
+  })
+
+  test('the owner\'s awaiting-thread event kicks the same runner through its one owner subscription, on a microtask', async () => {
+    const lookupCode = stripComments(readFileSync(join(SRC_DIR, 'own-post-lookup.ts'), 'utf-8'))
+    expect(indicesOf(/\.subscribe\s*\(/g, lookupCode)).toHaveLength(1)
+    const root = mkdtempSync(join(tmpdir(), 'cscb-upload-wiring-')), h = await makeOwnPostHarness(root)
+    const awaited: string[] = [], reports: OwnPostLookupModule.OwnPostLookupEvent[] = []
+    let subscriptions = 0
+    const owner = { ...h.owner,
+      subscribe(listener: Parameters<typeof h.owner.subscribe>[0]) { subscriptions++; return h.owner.subscribe(listener) },
+      awaitingUploads(key: string, channel?: string) { awaited.push(key); return h.owner.awaitingUploads(key, channel) } }
+    const lookups = createOwnPostLookups(expression<OwnPostLookupModule.OwnPostLookupsDeps>(callArguments(SERVER_CODE, onlyCallOf(factory)), {
+      ownPostJoins: owner, threadMemory: h.memory, ownPostStampState,
+      connections: h.members.h.manager, threadMemoryWorkAllowed: () => true,
+      getAppliedPersona: h.sources.persona, isPersonaUp: () => false,
+      SYSTEM_PERSONA_CONNECTION_CLOCK: h.clock,
+      dispatchThreadMemoryReport: ({ event }: { event: OwnPostLookupModule.OwnPostLookupEvent }) => reports.push(event),
+    }))
+    const key = h.authority.config().personas[0]!.key
+    const channel = h.authority.threadView().threadHybridChannels(key)[0]!
+    let stopped = false
+    try {
+      expect(subscriptions).toBe(1)
+      const post = h.observer.start(key, 'file', { channel }, { kind: 'file', name: 'wiring-upload.txt', size: 12 })
+      expect(post).toBeDefined(); await post!.ready
+      await h.flush()
+      awaited.length = 0
+      h.observer.end(post!.operation, { kind: 'confirmed', channel, file: 'F0WIRING1' })
+      expect(h.events.filter(event => event.type === 'awaiting-thread')).toHaveLength(1)
+      expect(awaited).toEqual([])
+      await h.flush()
+      expect(awaited).toContain(key)
+      expect(h.owner.awaitingUploads(key)).toHaveLength(1)
+      // stop() removes that one subscription: a later upload kicks nothing.
+      lookups.stop(); stopped = true
+      const later = h.observer.start(key, 'file', { channel }, { kind: 'file', name: 'wiring-upload.txt', size: 12 })
+      expect(later).toBeDefined(); await later!.ready
+      awaited.length = 0
+      h.observer.end(later!.operation, { kind: 'confirmed', channel, file: 'F0WIRING2' })
+      await h.flush()
+      expect(awaited).toEqual([])
+      expect(h.members.h.stub(h.members.h.p(h.authority.config().personas[0]!.name)).web.callLog
+        .filter(call => call.method === 'conversations.history')).toEqual([])
+      assertNoLeak([h.captured(), reports])
+    } finally { if (!stopped) lookups.stop(); await h.close(); rmSync(root, { recursive: true, force: true }) }
+  })
+})
+
+describe('Thread Memory server lifecycle wiring', () => {
+  const factory: keyof typeof ThreadMemoryModule = 'createThreadMemory'
+  const sealFactory: keyof typeof ThreadMemorySealModule = 'createThreadMemorySeal'
+  const routingMember: keyof PersonaRoutingDeps = 'threadMemory'
+  const joinsMember: keyof PersonaRoutingDeps = 'joins'
+  const retentionMember: keyof DeliveryQueueOptions = 'threadJoinSaved'
+  const recovery: keyof typeof ThreadJoinRecoveryModule = 'recoverQueuedJoins'
+
+  test('routing settles deferred own posts synchronously before reading the live Thread Memory holder, which is unknown while the key\'s queue repair is pending', () => {
+    const routing = onlyCallOf('createPersonaRouting')
+    const binding = onlyCallProps('createPersonaRouting').get(routingMember)
+    expect(binding).toBe("(key, channel, root) => { ownPostJoins?.settleDeferred(key, channel) if (deliveryQueue?.durabilityPending?.(key)) return 'unknown' return threadMemory?.view(key, channel, root) ?? 'unknown' }")
+    expect(callsOf('ownPostJoins\\?\\.settleDeferred')).toHaveLength(1)
+    declaredOnce('threadMemory')
+    const declaration = indicesOf(/\blet\s+threadMemory\s*:\s*ThreadMemory\s*\|\s*undefined\s*(?=\n)/g, SERVER_CODE)
+    expect(declaration).toHaveLength(1)
+    expect(insideMain(declaration[0]!)).toBe(false)
+    expect(declaration[0]!).toBeLessThan(routing)
+    expect(insideMain(routing)).toBe(false)
+    const assigned = assignmentsTo('threadMemory')
+    expect(assigned.map(({ value }) => value)).toEqual([`${factory}({`])
+    expect(atMainTopLevel(SERVER_CODE, assigned[0]!.at)).toBe(true)
+
+    // Execute the actual adapter alone, with its holder in an isolated closure;
+    // importing or starting the server cannot expose this private dependency.
+    const adapter = expression<() => {
+      read: NonNullable<PersonaRoutingDeps['threadMemory']>
+      set: (value: Pick<ThreadMemoryModule.ThreadMemory, 'view'>, owner: Pick<OwnPostModule.OwnPostJoins, 'settleDeferred'>,
+        queue?: Pick<DeliveryQueue, 'durabilityPending'>) => void
+    }>(`() => {
+      let threadMemory, ownPostJoins, deliveryQueue;
+      return { read: (${binding}), set: (value, owner, queue) => { threadMemory = value; ownPostJoins = owner; deliveryQueue = queue } };
+    }`, {})()
+    expect(adapter.read('alpha', 'C0THREAD', '1.000001')).toBe('unknown')
+    const calls: string[][] = []
+    let settled = false
+    const owner = { settleDeferred: (key: string, channel?: string) => { calls.push(['settle', key, channel!]); settled = true } }
+    adapter.set({ view: (...args) => { expect(settled).toBe(true); calls.push(['view', ...args]); return 'joined' } }, owner)
+    expect(adapter.read('alpha', 'C0THREAD', '1.000001')).toBe('joined')
+    settled = false
+    adapter.set({ view: (...args) => { expect(settled).toBe(true); calls.push(['view', ...args]); return 'not-joined' } }, owner)
+    expect(adapter.read('beta', 'C0OTHER', '2.000001')).toBe('not-joined')
+    expect(calls).toEqual([
+      ['settle', 'alpha', 'C0THREAD'], ['view', 'alpha', 'C0THREAD', '1.000001'],
+      ['settle', 'beta', 'C0OTHER'], ['view', 'beta', 'C0OTHER', '2.000001'],
+    ])
+    // A key whose queue replay awaits its repair rewrite has untrusted queued joins:
+    // each of its threads reads unknown once its deferred posts settle; others read the view.
+    calls.length = 0
+    const pending = new Set(['alpha'])
+    adapter.set({ view: (...args) => { calls.push(['view', ...args]); return 'not-joined' } }, owner,
+      { durabilityPending: key => pending.has(key) })
+    expect(adapter.read('alpha', 'C0THREAD', '1.000001')).toBe('unknown')
+    expect(adapter.read('beta', 'C0OTHER', '2.000001')).toBe('not-joined')
+    pending.delete('alpha')
+    expect(adapter.read('alpha', 'C0THREAD', '1.000001')).toBe('not-joined')
+    expect(calls).toEqual([
+      ['settle', 'alpha', 'C0THREAD'],
+      ['settle', 'beta', 'C0OTHER'], ['view', 'beta', 'C0OTHER', '2.000001'],
+      ['settle', 'alpha', 'C0THREAD'], ['view', 'alpha', 'C0THREAD', '1.000001'],
+    ])
+  })
+
+  test('the Thread Memory adapter is supplied only in the routing call and never replaced elsewhere', () => {
+    const named = indicesOf(new RegExp(`\\b${routingMember}\\s*:`, 'g'), SERVER_CODE)
+    // The typed holder declaration and the inline routing member, with no
+    // other object carrying a replacement member (including Object.assign).
+    // An iterable spread of the holder is not a property access on an object.
+    expect(named).toHaveLength(2)
+    expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
+    expect(indicesOf(new RegExp(`(?:(?<!\\.)\\.\\s*${routingMember}\\b|\\[\\s*['"]${routingMember}['"]\\s*\\])`, 'g'), SERVER_CODE)).toEqual([])
+  })
+
+  test('queue retention and routing joins read the live holder, preserve the decision clock and bind every argument', () => {
+    const queue = onlyCallOf('createDeliveryQueue')
+    expect(queue).toBeLessThan(onlyCallOf(factory))
+    expect(onlyCallProps('createDeliveryQueue').get(retentionMember)).toBe(
+      'key => { const memory = threadMemory, isSaved = memory?.threadJoinSavedForPass(key) return (channel, fact) => { memory?.advancePast(key, fact.at) return isSaved?.(channel, fact.thread_ts, fact.stamp, fact.at) ?? false } }',
+    )
+    expect(Object.fromEntries(objectProperties(onlyCallProps('createPersonaRouting').get(joinsMember)!))).toEqual({
+      stamp: '(key, channel) => threadMemory ? reloadController?.sharedChannels()?.channelStamp(key, channel) : undefined',
+      hasSavedJoin: '(key, channel, root, stamp) => threadMemory?.hasSavedJoin(key, channel, root, stamp) ?? false',
+      clock: 'key => threadMemory!.clock(key)',
+      addJoin: '(key, fact) => threadMemory?.addJoin(key, fact) ?? false',
+      saveJoins: "(key, facts) => threadMemory?.saveJoins(key, facts) ?? Promise.resolve({ kind: 'cancelled' })",
+    })
+    for (const [member, call] of [[retentionMember, queue], [joinsMember, onlyCallOf('createPersonaRouting')]] as const) {
+      const bindings = indicesOf(new RegExp(`\\b${member}\\s*:`, 'g'), SERVER_CODE)
+      expect(bindings).toHaveLength(1)
+      expect(withinCall(bindings, call)).toBe(1)
+      // No later assignment, Object.assign target or alternate options object.
+      const accesses = indicesOf(new RegExp(`(?:\\.\\s*${member}\\b|\\[\\s*['"]${member}['"]\\s*\\])`, 'g'), SERVER_CODE)
+      expect(accesses).toHaveLength(0)
+      expect(withinCall(accesses, call)).toBe(accesses.length)
+    }
+  })
+
+  test('the actual join adapters safely answer before creation and observe replacement holders in each new pass', async () => {
+    // Evaluate only the private adapters, with isolated holders. No server
+    // import/start, storage or reproduction of the adapters' implementations.
+    const js = ts.transpileModule(`let threadMemory; let reloadController;
+      const retained = (${onlyCallProps('createDeliveryQueue').get(retentionMember)});
+      const joins = (${onlyCallProps('createPersonaRouting').get(joinsMember)});
+      return { retained, joins, set: value => { threadMemory = value } };`,
+    { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
+    const adapters = new Function(js)() as {
+      retained: NonNullable<DeliveryQueueOptions['threadJoinSaved']>
+      joins: NonNullable<PersonaRoutingDeps['joins']>
+      set(value: Pick<ThreadMemoryModule.ThreadMemory, 'advancePast' | 'threadJoinSavedForPass' | 'hasSavedJoin'>): void
+    }
+    const fact = threadJoin(), key = THREAD_PERSONAS.primary
+    const queued: QueueThreadJoin = { thread_ts: fact.root, stamp: fact.stamp, at: fact.at }
+    expect(adapters.retained(key)(fact.channel, queued)).toBe(false)
+    expect(adapters.joins.stamp(key, fact.channel)).toBeUndefined()
+    expect(adapters.joins.hasSavedJoin(key, fact.channel, fact.root, fact.stamp)).toBe(false)
+    expect(adapters.joins.addJoin(key, fact)).toBe(false)
+    expect(await adapters.joins.saveJoins(key, [fact])).toEqual({ kind: 'cancelled' })
+    for (const saved of [true, false]) {
+      const calls: unknown[][] = []
+      adapters.set({
+        advancePast: (...args) => { calls.push(['advance', ...args]) },
+        threadJoinSavedForPass: k => (...args) => { calls.push(['retention', k, ...args]); return saved },
+        hasSavedJoin: (...args) => { calls.push(['saved', ...args]); return saved },
+      })
+      expect(adapters.retained(key)(fact.channel, queued)).toBe(saved)
+      expect(adapters.joins.hasSavedJoin(key, fact.channel, fact.root, fact.stamp)).toBe(saved)
+      expect(calls).toEqual([
+        ['advance', key, fact.at], ['retention', key, fact.channel, fact.root, fact.stamp, fact.at],
+        ['saved', key, fact.channel, fact.root, fact.stamp],
+      ])
+    }
+  })
+
+  test('one seal uses the queue state directory, real filesystem and live shared-state readers, reports each queue-journal opening to the live queue, and publishes its events', () => {
+    expect(importSource(SERVER_CODE, sealFactory)).toBe('./thread-memory-seal.ts')
+    const seal = onlyCallOf(sealFactory)
+    expect(atMainTopLevel(SERVER_CODE, seal)).toBe(true)
+    declaredOnce('threadMemorySeal')
+    expect(assignmentsTo('threadMemorySeal').map(({ value }) => value)).toEqual([`${sealFactory}({`])
+    const props = onlyCallProps(sealFactory)
+    // No fs override: the seal factory supplies node:fs in production.
+    expect(Object.fromEntries(props)).toEqual({
+      stateDir: onlyCallProps('createDeliveryQueue').get('stateDir')!,
+      queueJournalPath: 'key => join(STATE_DIR, \'queue\', `${key}.jsonl`)',
+      onQueueJournalOpened: 'key => deliveryQueue?.journalOpened(key)',
+      appliedKeys: '() => personaConfig?.personas.map(persona => persona.key) ?? []',
+      threadHybrid: 'key => (reloadController?.sharedChannels()?.threadView().threadHybridChannels(key).length ?? 0) > 0',
+      created: 'key => reloadController?.sharedChannels()?.threadMemoryCreated(key) ?? false',
+      onEvent: 'event => threadMemorySealEvents.emit(event)',
+    })
+    expect(props.get('stateDir')).toBe('STATE_DIR')
+    expect(seal).toBeGreaterThan(onlyCallOf('createDeliveryQueue'))
+    expect(seal).toBeLessThan(onlyCallOf(factory))
+    // The queue holder is set once, by the factory call before the seal, so the seal's start reads find it.
+    expect(assignmentsTo('deliveryQueue').map(({ value }) => value)).toEqual(['createDeliveryQueue({'])
+    // Execute the actual observer alone, with its holder in an isolated closure.
+    const observer = expression<() => {
+      opened: NonNullable<ThreadMemorySealModule.ThreadMemorySealOptions['onQueueJournalOpened']>
+      set: (queue: Pick<ReplyReminderQueue, 'journalOpened'>) => void
+    }>(`() => {
+      let deliveryQueue;
+      return { opened: (${props.get('onQueueJournalOpened')}), set: queue => { deliveryQueue = queue } };
+    }`, {})()
+    observer.opened('alpha')
+    const opened: string[] = []
+    observer.set({ journalOpened: key => { opened.push(key) } })
+    observer.opened('alpha'); observer.opened('beta')
+    expect(opened).toEqual(['alpha', 'beta'])
+  })
+
+  test('one store reads, then awaits the seal before queue replay even in dry run, and maintenance starts beside the queue', () => {
+    expect(importSource(SERVER_CODE, factory)).toBe('./thread-memory.ts')
+    const props = onlyCallProps(factory)
+    expect(Object.fromEntries(props)).toEqual({
+      stateDir: 'STATE_DIR', dryRun: 'isDryRun()', seal: 'threadMemorySeal',
+      canRun: 'threadMemoryWorkAllowed',
+      appliedKeys: '() => personaConfig?.personas.map(persona => persona.key) ?? []',
+      stamp: '(key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel)',
+      stampFacts: '() => reloadController?.sharedChannels()?.stampFacts()',
+      authorityReady: '() => reloadController?.sharedChannels() !== undefined',
+      heldStamps: 'key => deliveryQueue?.unresolvedHolds(key).filter(hold => hold.memoryDependent).map(hold => ({ channel: hold.channel, stamp: hold.stamp })) ?? []',
+      unsavedOwnPosts: 'key => ownPostJoins?.unsavedDeferredPosts(key) ?? 0',
+      threadHybridChannels: 'key => reloadController?.sharedChannels()?.threadView().threadHybridChannels(key) ?? []',
+      markerKeys: '() => reloadController?.sharedChannels()?.threadMemoryCreatedKeys() ?? []',
+      canRemove: 'key => reloadController?.sharedChannels()?.reviewHeld(key) === false',
+      setCreated: "key => reloadController?.sharedChannels()?.setThreadMemoryCreated(key) ?? { kind: 'failed' }",
+      clearCreated: "key => reloadController?.sharedChannels()?.clearThreadMemoryCreated(key) ?? { kind: 'failed' }",
+      onEvent: 'event => threadMemoryEvents.emit(event)',
+    })
+    const read = onlyCallOf('threadMemory\\.readAtStart')
+    const load = onlyCallOf('threadMemorySeal\\.loadAtStart')
+    expect(onlyCallArgs('threadMemorySeal\\.loadAtStart')).toEqual(['threadMemory.journalFacts()'])
+    expect(SERVER_CODE.slice(load - 6, load)).toBe('await ')
+    for (const at of [onlyCallOf(factory), read, load - 6, onlyCallOf('threadMemory\\.startMaintenance')]) {
+      expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    }
+    expect(onlyCallOf(factory)).toBeLessThan(read)
+    // A failed seal result never gates replay; only a shutdown interrupts it.
+    expect(SERVER_CODE.slice(read, onlyCallOf('deliveryQueue\\.start') + 'deliveryQueue.start()'.length).replace(/\s+/g, ' ').trim())
+      .toBe('threadMemory.readAtStart() await threadMemorySeal.loadAtStart(threadMemory.journalFacts()) if (shuttingDown) return await deliveryQueue.start()')
+    expect(SERVER_CODE.slice(onlyCallOf('deliveryQueue\\.startMaintenance'), onlyCallOf('threadMemory\\.startMaintenance')).replace(/\s+/g, ' ').trim()).toBe('deliveryQueue.startMaintenance(testTimers.queueCompactIntervalMs)')
+    expect(onlyCallArgs('threadMemory\\.startMaintenance')).toEqual(['testTimers.queueCompactIntervalMs'])
+  })
+
+  test('thread-view subscription and awaited activation follow the recovered choice adapter and precede membership, connections and bring-up', () => {
+    const subscription = onlyCallOf('subscribeThreadView')
+    // This closed list of calls starts no save in the listener: the owners schedule work.
+    expect(splitTopLevel(callArguments(SERVER_CODE, subscription))).toEqual(['() => { if (shuttingDown) return threadMemory?.published() for (const persona of personaConfig?.personas ?? []) { ownPostJoins?.onSharedStatePublished(persona.key) if (threadMemoryWorkAllowed(persona.key)) ownPostLookups?.kick(persona.key) } for (const key of deliveryQueue?.keys() ?? []) { if (getAppliedPersona(key)) void memoryHolds?.retryPending(key).catch(() => {}) } }'])
+    expect(callsOf('ownPostJoins\\?\\.onSharedStatePublished')).toHaveLength(1)
+    expect(SERVER_CODE.slice(0, subscription).endsWith('reload.sharedChannels()!.')).toBe(true)
+    const activation = onlyCallOf('threadMemory\\.activate')
+    expect(atMainTopLevel(SERVER_CODE, activation)).toBe(true)
+    expect(SERVER_CODE.slice(activation - 6, activation)).toBe('await ')
+    const points = [startResolution(SERVER_CODE).assignAt, onlyCallOf('createChannelDeliveryStore'), subscription, activation,
+      onlyCallOf('createChannelMembership'), onlyCallOf('createPersonaConnectionManager'), startResolution(SERVER_CODE).bringUpAt]
+    expect(points).toEqual([...points].sort((a, b) => a - b))
+    expect(onlyCallProps('createPersonaRouting').get('threadStampUndecided')).toBe("(key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel)?.kind === 'undecided'")
+    expect(Object.fromEntries(objectProperties(onlyCallProps('createPersonaRouting').get('threadStampEpisodes')!))).toEqual({
+      begin: '(key, channel) => personaEpisodes?.threadStampUndecided.begin(key, channel) ?? false',
+      end: '(key, channel) => personaEpisodes?.threadStampUndecided.end(key, channel)',
+    })
+  })
+
+  test('later bring-up loads the key and every teardown forget runs through the isolation helper', () => {
+    const props = onlyCallProps('createPersonaLifecycle')
+    // Recovery, then the Post Hold release and, after it, k8's bring-up resolution, both detached.
+    expect(props.get('loadThreadMemory')).toBe(`async key => { await threadMemory?.loadKey(key) if (!shuttingDown && deliveryQueue && threadMemory) { ${recovery}(key, deliveryQueue, threadMemory) void postHolds?.releaseUntracked(key).then(() => { if (threadMemoryWorkAllowed(key)) return memoryHolds?.resolve(key, 'recovered') }).catch(() => {}) ownPostLookups?.kick(key) } }`)
+    expect(importSource(SERVER_CODE, 'forgetPersonaState')).toBe('./persona-lifecycle.ts')
+    const args = splitTopLevel(onlyCallArguments(props.get('routing')!, 'forgetPersonaState'))
+    expect(args[0]).toBe('key')
+    expect(splitTopLevel(args[1]!.slice(1, -1))).toEqual([
+      'k => personaRouting.forget(k)', 'k => deliveryReporting?.forget(k)', 'k => sharedStateReporting?.forget(k)', 'k => deliveryPreparation?.forget(k)',
+      'k => deliveryEngines?.forget(k)', 'k => deliveryLifecycle?.forget(k)', 'k => memoryHolds?.forget(k)', 'k => postHolds?.forget(k)',
+      'k => threadMemoryRetries?.forget(k)', 'k => ownPostLookups?.forget(k)', 'k => ownPostJoins?.forget(k)', 'k => threadMemory?.forget(k)',
+    ])
+    expect(props.get('routing')).toContain('forget: key => forgetPersonaState(key, [')
+    const teardown = objectProperties(onlyCallProps('createReloadController').get('lifecycle')!).get('teardown')!
+    const removalForgets = indicesOf(/(?<![\w.$])forgetPersonaState\s*\(/g, teardown).map(at => splitTopLevel(callArguments(teardown, at)))
+    expect(removalForgets.map(([key, list]) => [key, splitTopLevel(list!.slice(1, -1))])).toEqual([
+      ['persona.key', ['key => ownPostLookups?.forget(key)', 'key => ownPostJoins?.forget(key)']],
+      ['persona.key', ['key => postHolds?.forget(key)', 'key => memoryHolds?.forget(key)']],
+    ])
+  })
+
+  test('start recovers every queue key immediately after activation, isolates each failure, and precedes all intake wiring', () => {
+    expect(importSource(SERVER_CODE, recovery)).toBe('./thread-join-recovery.ts')
+    const recoveries = callsOf(recovery)
+    expect(recoveries).toHaveLength(2)
+    expect(withinCall(recoveries, onlyCallOf('createPersonaLifecycle'))).toBe(1)
+    const startRecovery = recoveries.find(at => withinCall([at], onlyCallOf('createPersonaLifecycle')) === 0)!
+    // The start's recovery is the one module-scope step, run by main for every queue key right after activation.
+    const step = moduleFunction(START_RECOVERY_STEP)
+    expect(startRecovery).toBeGreaterThan(step.start)
+    expect(startRecovery).toBeLessThan(step.end)
+    const activation = onlyCallOf('threadMemory\\.activate')
+    const membership = onlyCallOf('createChannelMembership')
+    expect(SERVER_CODE.slice(activation, membership).replace(/\s+/g, ' ').trim()).toBe(
+      `threadMemory.activate() if (shuttingDown) return for (const persona of personaConfig.personas) ownPostLookups?.journalRead(persona.key) for (const key of deliveryQueue.keys()) ${START_RECOVERY_STEP}(key) queueStartRecovered = true for (const persona of personaConfig.personas) ownPostLookups?.kick(persona.key) channelMembership =`,
+    )
+    const stepCalls = indicesOf(new RegExp(`(?<!function\\s+)\\b${START_RECOVERY_STEP}\\s*\\(`, 'g'), SERVER_CODE)
+    expect(stepCalls).toHaveLength(2)
+    const startCall = stepCalls.find(at => insideMain(at) && withinCall([at], onlyCallOf('createDeliveryQueue')) === 0)!
+    expect(startCall).toBeLessThan(onlyCallOf('createPersonaConnectionManager'))
+    expect(startCall).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
+    // The other call is a journal loaded after start, in its loading turn.
+    expect(withinCall(stepCalls, onlyCallOf('createDeliveryQueue'))).toBe(1)
+    expect(splitTopLevel(callArguments(SERVER_CODE, startRecovery))).toEqual(['key', 'queue', 'threadMemory'])
+    expect(step.body).toContain('const queue = deliveryQueue')
+    const bringUp = recoveries.find(at => at !== startRecovery)!
+    expect(splitTopLevel(callArguments(SERVER_CODE, bringUp))).toEqual(['key', 'deliveryQueue', 'threadMemory'])
+  })
+
+  test('the actual start loop uses the shared recovery step for every key and preserves retained item order after one key throws', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cscb-join-wiring-'))
+    const queue = await makeQueue(root)
+    const preparation = createDeliveryPreparation({ queue, clientFor: () => undefined,
+      resolveUserName: async (_key, user) => user, clock: createFakeClock(),
+    })
+    try {
+      const facts = [threadJoin({ root: THREAD_ROOTS.secondary, source: 'broadcast' }), threadJoin()]
+      for (const key of Object.values(THREAD_PERSONAS)) {
+        for (const fact of facts) {
+          const stored = await queue.accept(key, slackInput({ channel: fact.channel, ts: fact.root,
+            key: { chat_id: fact.channel, ts: fact.root }, via: fact.source as 'mention' | 'broadcast',
+            thread_join: { thread_ts: fact.root, stamp: fact.stamp, at: fact.at },
+          }))
+          expect(stored.status).toBe('accepted')
+        }
+        await preparation.prepare(key, queue.items(key)[0]!)
+        await queue.append(key, deliveredRecord(1))
+        expect(queue.items(key).map(item => item.delivered)).toEqual([true, false])
+      }
+      const loop = new Function('deliveryQueue', 'threadMemory', recovery, 'postHolds', 'threadMemoryWorkAllowed', 'memoryHolds', startJoinRecoveryLoop())
+      const releases: string[] = [], resolutions: unknown[][] = [], compactions: string[] = []
+      const pending = Promise.withResolvers<'resolved'>()
+      const reads: string[] = [], recovered: Array<[string, readonly ThreadMemoryModule.ThreadJoin[]]> = []
+      loop({ keys: () => queue.keys(), items: (key: string) => { reads.push(key); return queue.items(key) }, compact: async (key: string) => { compactions.push(key) } }, {
+        recoverJoins(key: string, candidates: readonly ThreadMemoryModule.ThreadJoin[]) {
+          recovered.push([key, candidates])
+          if (key === THREAD_PERSONAS.primary) throw new Error('fixture recovery failed')
+        },
+      }, recoverQueuedJoins, { releaseUntracked: async (key: string) => { releases.push(key) } }, () => true,
+      { resolve: (...args: unknown[]) => { resolutions.push(args); return pending.promise } })
+      // A failed key does not stop later recovery or its own release, and a pending resolution
+      // does not keep the loop open or gate intake. The failed key's Memory Holds wait for its
+      // bring-up, so its releases are compacted here; k8 compacts after its own resolution.
+      expect(releases).toEqual([THREAD_PERSONAS.primary, THREAD_PERSONAS.secondary])
+      await createFakeClock().flush()
+      expect(resolutions).toEqual([[THREAD_PERSONAS.secondary, 'recovered', true]])
+      expect(compactions).toEqual([THREAD_PERSONAS.primary])
+      pending.resolve('resolved'); await createFakeClock().flush()
+      expect(compactions).toEqual([THREAD_PERSONAS.primary])
+      expect(reads).toEqual([THREAD_PERSONAS.primary, THREAD_PERSONAS.secondary])
+      expect(recovered).toEqual([[THREAD_PERSONAS.primary, facts], [THREAD_PERSONAS.secondary, facts]])
+    } finally {
+      await preparation.stop()
+      await queue.stop()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  const assertShutdownOrder = (source: string): void => {
+    const code = source.slice(...shutdownBody(source))
+    const tree = ts.createSourceFile('shutdown-body.ts', code, ts.ScriptTarget.Latest, true)
+    const calls: ts.CallExpression[] = []
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node)) calls.push(node)
+      ts.forEachChild(node, visit)
+    }
+    visit(tree)
+    const call = (name: string) => {
+      const matches = calls.filter(node => node.expression.getText(tree).replaceAll('?.', '.') === name)
+      expect(matches).toHaveLength(1)
+      return matches[0]!
+    }
+    const sequence = [
+      'deliveryQueue.stop', 'threadMemoryRetries.stopKeys', 'ownPostLookups.stop',
+      'ownPostJoins.stop', 'unsubscribeThreadMemory', 'threadMemory.quiesce',
+      'threadMemorySeal.writeShutdown', 'threadMemory.stop', 'threadMemorySeal.stop',
+      'threadMemoryRetries.stopSeal',
+    ].map(call)
+    const owners = sequence.map(node => {
+      let statement: ts.Node = node
+      while (statement.parent !== tree) statement = statement.parent
+      return statement
+    })
+    const positions = owners.map(node => tree.statements.indexOf(node as ts.Statement))
+    expect(positions.every((position, i) => i === 0 || position > positions[i - 1]!)).toBe(true)
+    for (let i = 0; i < owners.length; i++) {
+      const owner = owners[i]!
+      if (i === 6) {
+        expect(ts.isIfStatement(owner)).toBe(true)
+        const guard = owner as ts.IfStatement
+        expect(guard.expression.getText(tree).replace(/\s+/g, ' ')).toBe('threadMemorySeal?.loadedAtStart() && threadMemory')
+        expect(guard.elseStatement).toBeUndefined()
+        // The write is directly awaited in the guarded block, never gated by dry run.
+        expect(ts.isBlock(guard.thenStatement)).toBe(true)
+        expect(sequence[i]!.parent.kind).toBe(ts.SyntaxKind.AwaitExpression)
+        let writeStatement: ts.Node = sequence[i]!
+        while (!ts.isVariableStatement(writeStatement) && !ts.isExpressionStatement(writeStatement)) writeStatement = writeStatement.parent
+        expect(writeStatement.parent).toBe(guard.thenStatement)
+      } else {
+        expect(ts.isExpressionStatement(owner)).toBe(true)
+        const expression = (owner as ts.ExpressionStatement).expression
+        const awaited = [0, 5, 7, 8].includes(i)
+        expect(ts.isAwaitExpression(expression)).toBe(awaited)
+        expect(awaited ? (expression as ts.AwaitExpression).expression : expression).toBe(sequence[i]!)
+      }
+    }
+  }
+
+  test('shutdown awaits queue drain and quiescence, seals all known stores only after load, then stops memory and seal even in dry run', () => {
+    assertShutdownOrder(SERVER_CODE)
+    // Local names and diagnostic text inside the seal block are irrelevant.
+    assertShutdownOrder(SERVER_CODE.replaceAll('shutdownEntries', 'entriesForShutdown').replaceAll('const completed =', '/* harmless comment */ const completed ='))
+  })
+
+  test.each([
+    ['missing drain', (code: string) => code.replace('await deliveryQueue?.stop()', 'void 0')],
+    ['duplicate memory stop', (code: string) => code.replace('await threadMemory?.stop()', 'await threadMemory?.stop(); await threadMemory?.stop()')],
+    ['quiescence moved after sealing', (code: string) => code.replace('await threadMemory?.quiesce()', '').replace('await threadMemory?.stop()', 'await threadMemory?.quiesce(); await threadMemory?.stop()')],
+    ['missing loaded-at-start guard', (code: string) => code.replace('threadMemorySeal?.loadedAtStart() && threadMemory', 'threadMemory')],
+    ['missing memory guard', (code: string) => code.replace('threadMemorySeal?.loadedAtStart() && threadMemory', 'threadMemorySeal?.loadedAtStart()')],
+    ['dry-run-gated shutdown', (code: string) => {
+      const [start, end] = shutdownBody(code)
+      return code.slice(0, start) + 'if (!DRY_RUN) {' + code.slice(start, end) + '}' + code.slice(end)
+    }],
+  ] as const)('shutdown audit rejects %s', (_label, mutate) => {
+    expect(() => assertShutdownOrder(mutate(SERVER_CODE))).toThrow()
+  })
+})
+
+describe('Thread Memory failure wiring', () => {
+  const key = THREAD_PERSONAS.primary
+
+  test('one retry owner precedes reads; one reporter follows delivery reporting and precedes replay and bring-up', () => {
+    for (const [factory, path, holder] of [
+      ['createThreadMemoryRetries', './thread-memory-retry.ts', 'threadMemoryRetries'],
+      ['createThreadMemoryReporting', './thread-memory-reports.ts', 'threadMemoryReporting'],
+    ]) {
+      expect(importSource(SERVER_CODE, factory!)).toBe(path!)
+      declaredOnce(holder!)
+      expect(assignmentsTo(holder!).map(({ value }) => value)).toEqual([`${factory}({`])
+      expect(atMainTopLevel(SERVER_CODE, onlyCallOf(factory!))).toBe(true)
+    }
+    const retryAt = onlyCallOf('createThreadMemoryRetries'), reportAt = onlyCallOf('createThreadMemoryReporting')
+    expect(retryAt).toBeGreaterThan(onlyCallOf('createThreadMemory'))
+    expect(retryAt).toBeLessThan(onlyCallOf('threadMemory\\.readAtStart'))
+    expect(reportAt).toBeGreaterThan(onlyCallOf('createDeliveryReporting'))
+    expect(reportAt).toBeLessThan(SERVER_CODE.indexOf(threadMemoryReplay().split('\n')[0]!))
+    expect(reportAt).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
+    const retries = onlyCallProps('createThreadMemoryRetries')
+    expect([...retries.keys()].sort()).toEqual(['canRun', 'clock', 'flush', 'retryRead', 'sealFlush', 'firstRead', 'onEvent'].sort())
+    expect(retries.get('canRun')).toBe('threadMemoryWorkAllowed')
+    expect(retries.get('clock')).toBe('SYSTEM_PERSONA_CONNECTION_CLOCK')
+    expect(retries.get('flush')).toBe('key => threadMemory!.flush(key)')
+    expect(retries.get('retryRead')).toBe('key => threadMemory!.retryRead(key)')
+    expect(retries.get('sealFlush')).toBe('() => threadMemorySeal!.flush()')
+    expect(Object.fromEntries(onlyCallProps('createThreadMemoryReporting'))).toEqual({
+      episodes: constOf('createPersonaEpisodes'), persona: 'getAppliedPersona', log: 'line => console.error(line)',
+      threadHybridChannels: 'key => reload.sharedChannels()?.threadView().threadHybridChannels(key) ?? []',
+      outage: 'key => threadMemory!.outage(key)',
+    })
+  })
+
+  test.each(['none', 'reporter', 'retry'] as const)('dispatcher routes isolate consumers, throwing=%s', throwing => {
+    const wiring = threadMemoryWiring(), reported: unknown[][] = [], retried: unknown[][] = []
+    const report = (source: string) => (...args: unknown[]) => {
+      reported.push([source, ...args]); if (throwing === 'reporter') throw new Error('fixture report refused')
+    }
+    const retry = (series: string) => (...args: unknown[]) => {
+      retried.push([series, ...args]); if (throwing === 'retry') throw new Error('fixture retry refused')
+    }
+    const outage = { unknown: true, unsaved: 1, missing: false }
+    wiring.set({ threadMemory: { outage: () => outage },
+      threadMemoryReporting: { close() {}, threadMemoryEvent: report('memory'), sealEvent: report('seal'), retryEvent: report('retry'), holdsEvent: report('holds'), lookupEvent: report('lookup'), startupFindings: report('findings') },
+      threadMemoryRetries: { appendFailed: retry('append'), readFailed: retry('read'), sealWriteFailed: retry('seal'), forget() {}, stopKeys() {}, stopSeal() {} },
+    })
+    const error = new Error('fixture unavailable'), path = 'fixture-journal'
+    const memoryEvents: ThreadMemoryModule.ThreadMemoryEvent[] = [
+      { type: 'append-failed', key, path, step: 'journal-append', error, noticeOnly: false },
+      { type: 'append-failed', key, path, step: 'journal-append', error, noticeOnly: true },
+      { type: 'creation-failed', key, path, step: 'journal-header', error },
+      { type: 'read-failed', key, path, error }, { type: 'saved-after-failure', key, path },
+      { type: 'outage-settled', key, path },
+      { type: 'compaction-failed', key, path, step: 'journal-rewrite', error },
+      { type: 'compacted', key, path, outcome: 'rewritten' },
+    ]
+    const seal: ThreadMemorySealModule.ThreadMemorySealEvent = { type: 'seal-write-failed', path, error, unsynced: false }
+    const retryEvent: ThreadMemoryRetryEvent = { type: 'read-after-retries', key, attempts: 1 }
+    const holds: Array<Parameters<MemoryReporter['holdsEvent']>[0]> = [
+      { type: 'resolution-failed', key, error }, { type: 'resolution-saved', key }, { type: 'release-failed', key, seq: 1, error },
+    ]
+    const lookup: OwnPostLookupModule.OwnPostLookupEvent = { kind: 'joins-lost', key, channel: THREAD_CHANNELS.primary, threads: [], cause: 'unmatched' }
+    memoryEvents.forEach(wiring.memory); wiring.seal(seal); wiring.retry(retryEvent); holds.forEach(wiring.holds); wiring.lookup(lookup)
+    expect(reported).toEqual([...memoryEvents.map(event => ['memory', event, outage]), ['seal', seal], ['retry', retryEvent, outage], ...holds.map(event => ['holds', event]), ['lookup', lookup]])
+    expect(retried).toEqual([['append', key], ['append', key], ['append', key], ['read', key], ['seal']])
+    assertNoLeak([reported, retried])
+  })
+
+  test.each([false, true])('real reporter deduplicates seal logs while every failure independently reaches retry; logger throws=%s', async throwLog => {
+    const wiring = threadMemoryWiring(), clock = createFakeClock(), logs: string[] = [], posts: string[] = [], retried: string[] = []
+    const episodes = createPersonaEpisodes({ clock, log: line => logs.push(line), sink: (_key, text) => { posts.push(text) } })
+    const reporting = createThreadMemoryReporting({ episodes, log(line) { logs.push(line); if (throwLog) throw new Error('fixture logger refused') },
+      persona: () => ({ key, name: key }), threadHybridChannels: () => [], outage: () => ({ unknown: false, unsaved: 0, missing: false }) })
+    const path = 'fixture-seal', error = new Error('fixture seal unavailable')
+    wiring.set({ personaEpisodes: episodes, threadMemoryRetries: {
+      appendFailed() {}, readFailed() {}, sealWriteFailed() { retried.push('seal') }, forget() {}, stopKeys() {}, stopSeal() {},
+    } })
+    wiring.start(reporting, { startupFindings: () => [] })
+    try {
+      for (const unsynced of [false, true, false]) wiring.seal({ type: 'seal-write-failed', path, error, unsynced })
+      expect(retried).toEqual(['seal', 'seal', 'seal'])
+      expect(logs).toEqual([buildThreadMemorySealNotSavedLine(path, error, false)])
+      wiring.seal({ type: 'seal-written', path }); wiring.seal({ type: 'seal-written', path })
+      wiring.seal({ type: 'seal-write-failed', path, error, unsynced: false })
+      expect(retried).toEqual(['seal', 'seal', 'seal', 'seal'])
+      expect(logs).toEqual([buildThreadMemorySealNotSavedLine(path, error, false), buildThreadMemorySealSavedLine(path), buildThreadMemorySealNotSavedLine(path, error, false)])
+      expect(posts).toEqual([]); assertNoLeak([logs, posts, retried])
+    } finally { reporting.close(); episodes.close(); await clock.flush(); expect(clock.pendingCount()).toBe(0) }
+  })
+
+  test.each(['shutdown', 'episodes closed'] as const)('ordinary seal failures cannot rearm shared retries during %s', state => {
+    const wiring = threadMemoryWiring(), retried: string[] = []
+    wiring.set({ shuttingDown: state === 'shutdown',
+      personaEpisodes: { isClosed: () => state === 'episodes closed', teardownWindowState: () => 'none' },
+      threadMemoryRetries: { appendFailed() {}, readFailed() {}, sealWriteFailed() { retried.push('seal') }, forget() {}, stopKeys() {}, stopSeal() {} },
+    })
+    wiring.seal({ type: 'seal-write-failed', path: 'fixture', error: new Error('late ordinary failure'), unsynced: true })
+    expect(retried).toEqual([])
+  })
+
+  test('shutdown closes ordinary reporting after persona episodes and before draining or writing the final seal', () => {
+    const [start, end] = shutdownBody(SERVER_CODE)
+    const close = onlyCallOf('threadMemoryReporting\\?\\.close')
+    expect(close).toBeGreaterThan(start); expect(close).toBeLessThan(end)
+    expect(close).toBeGreaterThan(onlyCallOf('personaEpisodes\\?\\.close'))
+    expect(close).toBeLessThan(onlyCallOf('memoryHolds\\?\\.stop'))
+    expect(callArguments(SERVER_CODE, close)).toBe('')
+  })
+
+  test('startup replays all five sources in observation order, once, before retained seal findings', () => {
+    const wiring = threadMemoryWiring(), seen: unknown[][] = []
+    let outage = { unknown: true, unsaved: 2, missing: false }
+    wiring.set({ threadMemory: { outage: () => outage } })
+    const memory: ThreadMemoryModule.ThreadMemoryEvent = { type: 'read', key, path: 'fixture', firstSuccessfulRead: true }
+    const retry: ThreadMemoryRetryEvent = { type: 'read-after-retries', key, attempts: 1 }
+    const seal: ThreadMemorySealModule.ThreadMemorySealEvent = { type: 'seal-write-failed', path: 'fixture', error: new Error('fixture failure'), unsynced: true }
+    const holds: Parameters<MemoryReporter['holdsEvent']>[0] = { type: 'resolution-failed', key, error: new Error('fixture failure') }
+    const lookup: OwnPostLookupModule.OwnPostLookupEvent = { kind: 'joins-lost', key, channel: THREAD_CHANNELS.primary, threads: [THREAD_ROOTS.primary], cause: 'ambiguous' }
+    const finding: ThreadMemorySealModule.ThreadMemorySealFinding = { key, case: 'unclean-stop', wording: 'unclean' }
+    const lost: ThreadMemorySealModule.ThreadMemoryOwnPostLossFinding = { key, case: 'own-post-joins-lost', threads: [{ channel: THREAD_CHANNELS.primary, root: THREAD_ROOTS.primary }] }
+    wiring.seal({ type: 'own-post-joins-lost', ...lost })
+    wiring.memory(memory); wiring.seal({ type: 'changed-while-stopped', ...finding }); wiring.retry(retry); wiring.seal(seal); wiring.lookup(lookup); wiring.holds(holds)
+    const completion: ThreadMemoryModule.ThreadMemoryEvent = { type: 'compacted', key, path: 'fixture', outcome: 'skipped' }
+    const resolved: Parameters<MemoryReporter['holdsEvent']>[0] = { type: 'resolution-saved', key }
+    wiring.memory(completion); wiring.holds(resolved); wiring.seal({ type: 'seal-written', path: 'fixture' })
+    const observed = outage
+    outage = { unknown: false, unsaved: 0, missing: false }
+    const record = (source: string) => (...args: unknown[]) => { seen.push([source, ...args]) }
+    const reporting: MemoryReporter = { close() {}, threadMemoryEvent: record('memory'), retryEvent: record('retry'), sealEvent: record('seal'), holdsEvent: record('holds'), lookupEvent: record('lookup'), startupFindings: record('findings') }
+    wiring.start(reporting, { startupFindings: () => [finding, lost] })
+    expect(seen).toEqual([['memory', memory, observed], ['retry', retry, observed], ['seal', seal], ['lookup', lookup], ['holds', holds],
+      ['memory', completion, observed], ['holds', resolved], ['seal', { type: 'seal-written', path: 'fixture' }], ['findings', [finding, lost]]])
+    expect(wiring.buffered()).toEqual([])
+    seen.length = 0
+    wiring.start(reporting, { startupFindings: () => [] })
+    expect(seen).toEqual([['findings', []]])
+    // A finding from a later first read still reaches the live reporter.
+    wiring.seal({ type: 'changed-while-stopped', ...finding })
+    expect(seen.at(-1)).toEqual(['seal', { type: 'changed-while-stopped', ...finding }])
+    assertNoLeak(seen)
+  })
+
+  test.each([false, true])('overlapping real read/write outage reports one recovery; buffered=%s', async buffered => {
+    const root = mkdtempSync(join(tmpdir(), 'cscb-replay-wiring-')), io = threadFsControls(root), wiring = threadMemoryWiring()
+    const clock = createFakeClock(), posts: string[] = [], logs: string[] = [], events: ThreadMemoryModule.ThreadMemoryEvent[] = []
+    clock.settleOn(io.durable)
+    seedThreads(root, [threadHeader()])
+    const episodes = createPersonaEpisodes({ clock, sink: (_key, text) => { posts.push(text) }, log: line => logs.push(line) })
+    const memory = createThreadMemory({ stateDir: root, fs: io.fs, canRun: wiring.canRun, appliedKeys: () => [key], markerKeys: () => [key],
+      stamp: () => ({ kind: 'decided', ...THREAD_STAMP }), threadHybridChannels: () => [THREAD_CHANNELS.primary],
+      setCreated: () => ({ kind: 'saved' }), clearCreated: () => ({ kind: 'saved' }),
+      onEvent(event) { events.push(event); wiring.memory(event) },
+    })
+    const persona = { name: key, key }, channels = [THREAD_CHANNELS.primary], ref = renderPersonaRef(persona.name, key)
+    const reporting = createThreadMemoryReporting({ episodes, log: line => logs.push(line), persona: () => persona, threadHybridChannels: () => channels, outage: k => memory.outage(k) })
+    wiring.set({ threadMemory: memory })
+    try {
+      if (!buffered) wiring.start(reporting, { startupFindings: () => [] })
+      io.fail('readFileSync'); memory.readAtStart(); await memory.activate()
+      memory.recoverJoins(key, [threadJoin()])
+      io.heal(); expect(await memory.retryRead(key)).toBe('read')
+      expect(memory.outage(key).unsaved).toBeGreaterThan(0)
+      io.fail('writeSync'); memory.retryPendingJoins(key); await clock.flush()
+      const failed = events.find((event): event is Extract<ThreadMemoryModule.ThreadMemoryEvent, { type: 'append-failed' | 'creation-failed' }> => event.type === 'append-failed')!
+      expect(failed).toBeDefined()
+      io.heal(); expect(await memory.flush(key)).toEqual({ kind: 'saved' })
+      expect(memory.outage(key)).toEqual({ unknown: false, unsaved: 0, missing: false })
+      const compactionError = io.fail('rename'); await memory.compact(key); await memory.compact(key)
+      io.heal(); await memory.compact(key)
+      const recurrence = io.fail('rename'); await memory.compact(key)
+      io.heal(); await memory.compact(key)
+      const resolutionError = new Error('fixture resolution append failed')
+      wiring.holds({ type: 'resolution-failed', key, error: resolutionError })
+      wiring.holds({ type: 'resolution-saved', key })
+      if (buffered) {
+        expect(posts).toEqual([])
+        expect(wiring.buffered().find(value => value.event.type === 'read')!.outage!.unsaved).toBeGreaterThan(0)
+        wiring.start(reporting, { startupFindings: () => [] })
+      }
+      expect(posts).toEqual([
+        buildThreadMemoryUnreadableNotice(ref, channels, failed.path),
+        buildThreadMemoryNotSavedNotice(ref, channels, failed.path, failed.step, failed.error),
+        buildThreadMemoryRecoveredNotice(ref, channels),
+      ])
+      expect(logs.slice(3)).toEqual([
+        buildThreadMemoryCompactionFailedLine(key, threadPath(root), 'journal-rewrite', compactionError),
+        buildThreadMemoryCompactionRecoveredLine(key, threadPath(root)),
+        buildThreadMemoryCompactionFailedLine(key, threadPath(root), 'journal-rewrite', recurrence),
+        buildThreadMemoryCompactionRecoveredLine(key, threadPath(root)),
+        buildThreadMemoryHoldsNotResolvedLine(key, resolutionError), buildThreadMemoryHoldsResolvedLine(key),
+      ])
+      const prior = [...logs]
+      wiring.start(reporting, { startupFindings: () => [] }); expect(logs).toEqual(prior)
+      assertNoLeak([posts, logs, events])
+    } finally { reporting.close(); episodes.close(); await memory.stop(); rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test('live read captures its boundary before a held resolution and flush, then kicks only after both settle', async () => {
+    const wiring = threadMemoryWiring(), clock = createFakeClock(), calls: unknown[][] = []
+    const resolving = Promise.withResolvers<'resolved'>(), flushing = Promise.withResolvers<ThreadMemoryModule.ThreadMemoryWriteResult>()
+    const readAt = clock.now()
+    wiring.set({ reloadController: { sharedChannels: () => ({}) }, getAppliedPersona: () => ({ key }),
+      ownPostLookups: { journalRead(k) { calls.push(['read', k, clock.now()]) }, kick(k) { calls.push(['kick', k, clock.now()]) } },
+      threadMemory: { outage: () => ({ unknown: false, unsaved: 0, missing: false }),
+        retryPendingJoins(k) { calls.push(['judge', k]) }, flush(k) { calls.push(['flush', k]); return flushing.promise } },
+      memoryHolds: { forget() {}, resolve(k, mode) { calls.push(['resolve', k, mode]); return resolving.promise } },
+    })
+    wiring.memory({ type: 'read', key, path: 'fixture', firstSuccessfulRead: true })
+    const work = wiring.firstRead(key, () => true)
+    expect(calls).toEqual([['read', key, readAt], ['judge', key], ['resolve', key, 'live']])
+    await clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    resolving.resolve('resolved'); await clock.flush()
+    expect(calls).toEqual([['read', key, readAt], ['judge', key], ['resolve', key, 'live'], ['flush', key]])
+    await clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    flushing.resolve({ kind: 'saved' }); await work
+    expect(calls).toEqual([['read', key, readAt], ['judge', key], ['resolve', key, 'live'], ['flush', key], ['kick', key, clock.now()]])
+  })
+
+  test.each(['startup', 'shutdown', 'submitted', 'closed', 'capture-throws'] as const)('read capture is fenced or isolated: %s', state => {
+    const wiring = threadMemoryWiring(), captured: string[] = []
+    wiring.set({ reloadController: { sharedChannels: () => state === 'startup' ? undefined : {} },
+      shuttingDown: state === 'shutdown',
+      personaEpisodes: { isClosed: () => state === 'closed', teardownWindowState: () => state === 'submitted' ? 'submitted' : 'none' },
+      ownPostLookups: { journalRead(k) { captured.push(k); throw new Error('fixture capture failure') } },
+    })
+    const event: ThreadMemoryModule.ThreadMemoryEvent = { type: 'read', key, path: 'fixture', firstSuccessfulRead: true }
+    wiring.memory(event)
+    expect(captured).toEqual(state === 'capture-throws' ? [key] : [])
+    // Capture failure must still deliver the read to reporting.
+    expect(wiring.buffered().map(value => value.event)).toEqual([event])
+  })
+
+  test.each(['none', 'judge', 'resolve', 'flush-failed', 'flush-throws', 'kept-unsaved', 'kept-empty'] as const)('firstRead uses current holders and isolates ordered steps: %s', async failure => {
+    const wiring = threadMemoryWiring(), calls: unknown[][] = [], clock = createFakeClock()
+    const deps = wiring.retryDeps(clock)
+    expect(deps.clock).toBe(clock)
+    wiring.set({ getAppliedPersona: () => ({ key }), shuttingDown: false })
+    await wiring.firstRead(key, () => true) // before the memory/resolver holders exist
+    for (const life of ['first', 'replacement']) {
+      wiring.set({ threadMemory: {
+        outage: () => ({ unknown: false, unsaved: failure === 'kept-unsaved' ? 1 : 0, missing: false }),
+        retryPendingJoins(k) { calls.push([life, 'judge', k]); if (failure === 'judge') throw new Error('fixture judge refused') },
+        async retryRead(k) { calls.push([life, 'read', k]); return 'read' },
+        async flush(k) { calls.push([life, 'flush', k]); if (failure === 'flush-throws') throw new Error('fixture flush refused'); return { kind: failure === 'flush-failed' ? 'failed' : failure.startsWith('kept-') ? 'kept' : 'saved' } },
+      }, memoryHolds: { forget() {}, async resolve(...args) { calls.push([life, 'resolve', ...args]); if (failure === 'resolve') throw new Error('fixture resolution refused'); return 'resolved' } },
+      threadMemoryRetries: { appendFailed(k) { calls.push([life, 'retry', k]) }, readFailed() {}, sealWriteFailed() {}, forget() {}, stopKeys() {}, stopSeal() {} },
+      ownPostLookups: { kick(k) { calls.push([life, 'lookup', k]) } },
+      threadMemorySeal: { startupFindings: () => [], async flush() { calls.push([life, 'seal']); return { kind: 'written' } } } })
+      await deps.firstRead(key, () => true)
+      expect(calls.splice(0)).toEqual([[life, 'judge', key], [life, 'resolve', key, 'live'], [life, 'flush', key],
+        ...(['flush-failed', 'flush-throws', 'kept-unsaved'].includes(failure) ? [[life, 'retry', key]] : []), [life, 'lookup', key]])
+      await deps.retryRead(key); await deps.sealFlush()
+      expect(calls.splice(0)).toEqual([[life, 'read', key], [life, 'seal']])
+    }
+  })
+
+  test.each(['cancelled', 'shutdown', 'removed'] as const)('firstRead refuses initially and after awaited resolution: %s', async stop => {
+    const wiring = threadMemoryWiring(), calls: string[] = [], pending = Promise.withResolvers<'resolved'>()
+    let current = true
+    const halt = () => {
+      if (stop === 'cancelled') current = false
+      if (stop === 'shutdown') wiring.set({ shuttingDown: true })
+      if (stop === 'removed') wiring.set({ getAppliedPersona: () => undefined })
+    }
+    wiring.set({ shuttingDown: false, getAppliedPersona: () => ({ key }), ownPostLookups: { kick() { calls.push('lookup') } }, threadMemory: {
+      outage: () => ({ unknown: false, unsaved: 0, missing: false }), retryPendingJoins() { calls.push('judge') },
+      retryRead: async () => 'read', async flush() { calls.push('flush'); return { kind: 'failed' } },
+    }, memoryHolds: { forget() {}, resolve() { calls.push('resolve'); return pending.promise } } })
+    const work = wiring.firstRead(key, () => current)
+    expect(calls).toEqual(['judge', 'resolve'])
+    halt(); pending.resolve('resolved'); await work
+    await wiring.firstRead(key, () => current)
+    expect(calls).toEqual(['judge', 'resolve'])
+  })
+
+  test.each(['cancelled', 'shutdown', 'removed'] as const)('firstRead cannot start saving from a late kept flush after %s', async stop => {
+    const wiring = threadMemoryWiring(), pending = Promise.withResolvers<ThreadMemoryModule.ThreadMemoryWriteResult>()
+    const calls: string[] = []
+    let current = true
+    wiring.set({ getAppliedPersona: () => ({ key }), ownPostLookups: { kick() { calls.push('lookup') } }, threadMemory: {
+      outage: () => ({ unknown: false, unsaved: 1, missing: false }),
+      retryPendingJoins() {}, flush() { calls.push('flush'); return pending.promise },
+    }, threadMemoryRetries: { appendFailed() { calls.push('append') }, readFailed() {}, sealWriteFailed() {}, forget() {}, stopKeys() {}, stopSeal() {} } })
+    const work = wiring.firstRead(key, () => current)
+    await createFakeClock().flush()
+    expect(calls).toEqual(['flush'])
+    if (stop === 'cancelled') current = false
+    if (stop === 'shutdown') wiring.set({ shuttingDown: true })
+    if (stop === 'removed') wiring.set({ getAppliedPersona: () => undefined })
+    pending.resolve({ kind: 'kept' }); await work
+    expect(calls).toEqual(['flush'])
+  })
+
+  test.each([false, true])('kept first-read hands off to one spaced save owner through publication; buffered=%s', async buffered => {
+    const root = mkdtempSync(join(tmpdir(), 'cscb-kept-wiring-')), io = threadFsControls(root), wiring = threadMemoryWiring()
+    const clock = createFakeClock(), authority = makeSharedAuthority(root, threadConfig(root))
+    clock.settleOn(io.durable)
+    const posts: string[] = [], logs: string[] = [], events: ThreadMemoryModule.ThreadMemoryEvent[] = []
+    const retriesSeen: ThreadMemoryRetryEvent[] = []
+    seedThreads(root, [threadHeader()]); expect(authority.setThreadMemoryCreated(key).kind).toBe('saved')
+    let undecided = false
+    const episodes = createPersonaEpisodes({ clock, sink: (_key, text) => { posts.push(text) }, log: line => logs.push(line) })
+    const memory = createThreadMemory({ stateDir: root, fs: io.fs, canRun: wiring.canRun,
+      appliedKeys: () => authority.config().personas.map(p => p.key), markerKeys: () => authority.threadMemoryCreatedKeys(),
+      stamp: (k, channel) => undecided ? { kind: 'undecided' } : authority.channelStamp(k, channel),
+      threadHybridChannels: k => authority.threadView().threadHybridChannels(k),
+      setCreated: k => authority.setThreadMemoryCreated(k), clearCreated: k => authority.clearThreadMemoryCreated(k),
+      onEvent(event) { events.push(event); wiring.memory(event) },
+    })
+    wiring.set({ threadMemory: memory, personaEpisodes: episodes, getAppliedPersona: k => authority.config().personas.find(p => p.key === k) })
+    const deps = wiring.retryDeps(clock), retries = createThreadMemoryRetries({ ...deps, onEvent(event) { retriesSeen.push(event); deps.onEvent?.(event) } })
+    wiring.set({ threadMemoryRetries: retries })
+    const reporting = createThreadMemoryReporting({ episodes, log: line => logs.push(line), persona: k => authority.config().personas.find(p => p.key === k),
+      threadHybridChannels: k => authority.threadView().threadHybridChannels(k), outage: k => memory.outage(k) })
+    try {
+      if (!buffered) wiring.start(reporting, { startupFindings: () => [] })
+      io.fail('readFileSync'); memory.readAtStart(); await memory.activate()
+      const stamp = authority.channelStamp(key, THREAD_CHANNELS.primary)
+      if (stamp?.kind !== 'decided' || !stamp.threadHybridSince) throw new Error('fixture requires a decided stamp')
+      const fact = threadJoin({ stamp: { incarnation: stamp.incarnation, threadHybridSince: stamp.threadHybridSince } })
+      expect(memory.addJoin(key, fact)).toBe(true)
+      expect(await memory.saveJoins(key, [fact])).toEqual({ kind: 'kept' })
+      undecided = true; io.heal()
+      await clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+      expect(memory.outage(key)).toEqual({ unknown: false, unsaved: 1, missing: false })
+      expect(retriesSeen.filter(e => e.type === 'append-retry-started')).toHaveLength(1)
+      expect(clock.pending().map(t => t.delayMs)).toEqual([THREAD_MEMORY_RETRY_MIN_MS])
+      io.reset()
+      await clock.advance(THREAD_MEMORY_RETRY_MIN_MS - 1); expect(io.writes()).toEqual([])
+      await clock.advance(1); expect(io.writes()).toEqual([])
+      expect(clock.pending().map(t => t.delayMs)).toEqual([2 * THREAD_MEMORY_RETRY_MIN_MS])
+      const due = clock.pending()[0]!.dueAt
+      undecided = false; memory.published(); memory.published(); await clock.flush()
+      expect(clock.pending().map(t => t.dueAt)).toEqual([due])
+      expect(memory.isJoinSaved(key, fact)).toBe(false)
+      await clock.advance(2 * THREAD_MEMORY_RETRY_MIN_MS - 1); expect(io.writes()).toEqual([])
+      await clock.advance(1)
+      expect(memory.isJoinSaved(key, fact)).toBe(true)
+      expect(io.calls.filter(c => c.op === 'writeSync' && c.path === threadPath(root))).toHaveLength(1)
+      expect(clock.pendingCount()).toBe(0)
+      expect(retriesSeen.filter(e => e.type === 'saved-after-retries')).toEqual([{ type: 'saved-after-retries', key, attempts: 2 }])
+      const settled = events.find(e => e.type === 'outage-settled')
+      expect(settled).toBeDefined()
+      if (buffered) {
+        expect(posts).toEqual([])
+        expect(wiring.buffered().find(v => v.event.type === 'read')!.outage!.unsaved).toBe(1)
+        expect(wiring.buffered().find(v => v.event.type === 'outage-settled')!.outage).toEqual({ unknown: false, unsaved: 0, missing: false })
+        // Replay must use the stored settled observation, even if today's view has changed again.
+        wiring.set({ threadMemory: { ...memory, outage: () => ({ unknown: true, unsaved: 9, missing: false }) } })
+        wiring.start(reporting, { startupFindings: () => [] })
+      }
+      const persona = authority.config().personas[0]!, ref = renderPersonaRef(persona.name, key), channels = [THREAD_CHANNELS.primary]
+      expect(posts).toEqual([buildThreadMemoryUnreadableNotice(ref, channels, threadPath(root)), buildThreadMemoryRecoveredNotice(ref, channels)])
+      expect(logs).toHaveLength(2)
+      assertNoLeak([posts, logs, retriesSeen, events, writtenFile(root)])
+    } finally { retries.stopKeys(); retries.stopSeal(); episodes.close(); await memory.stop(); rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test.each(['none', 'retry', 'lookup', 'resolver', 'post-holds'] as const)('submit cancellation calls every owner synchronously and isolates %s failure', async failure => {
+    const wiring = threadMemoryWiring(), calls: string[] = [], pending = Promise.withResolvers<void>()
+    wiring.set({ threadMemoryRetries: {
+      appendFailed() {}, readFailed() {}, sealWriteFailed() {}, stopKeys() {}, stopSeal() {},
+      forget(k) { calls.push(`retry:${k}`); if (failure === 'retry') throw new Error('fixture retry forget failed') },
+    }, ownPostLookups: {
+      forget(k) { calls.push(`lookup:${k}`); if (failure === 'lookup') throw new Error('fixture lookup forget failed') },
+    }, memoryHolds: {
+      resolve: async () => 'resolved',
+      forget(k) { calls.push(`resolver:${k}`); if (failure === 'resolver') throw new Error('fixture resolver forget failed'); return pending.promise },
+    }, postHolds: {
+      forget(k) { calls.push(`post-holds:${k}`); if (failure === 'post-holds') throw new Error('fixture post-holds forget failed') },
+    } })
+    const done = wiring.cancel(key)
+    // No await: an earlier owner's completion cannot defer the next invocation.
+    expect(calls).toEqual([`retry:${key}`, `lookup:${key}`, `resolver:${key}`, `post-holds:${key}`])
+    pending.resolve()
+    if (failure === 'none') await done
+    else await expect(done).rejects.toThrow(`fixture ${failure} forget failed`)
+  })
+
+  test('production gate fences submitted/open windows, cancels late reads, and rearms only the next life', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cscb-cancel-wiring-'))
+    const config = makeMultiPersonaConfig([{ name: key }, { name: THREAD_PERSONAS.secondary }], root)
+    const notifier = makeNotifierHarness(config), clock = notifier.clock, wiring = threadMemoryWiring(), calls: string[] = [], logs: string[] = []
+    const persona = config.personas[0]!, sibling = config.personas[1]!.key
+    const late = Promise.withResolvers<ThreadMemoryModule.ThreadMemoryReadResult>()
+    let first = true
+    const episodes = createPersonaEpisodes({ clock, log: line => logs.push(line),
+      teardownWindow: k => notifier.notifier.teardownWindowState(k), sink: notifier.notifier.notify })
+    const reporting = createThreadMemoryReporting({ episodes, log: line => logs.push(line), persona: k => config.personas.find(p => p.key === k),
+      threadHybridChannels: () => [], outage: () => ({ unknown: true, unsaved: 1, missing: false }) })
+    wiring.set({ personaEpisodes: episodes, getAppliedPersona: k => config.personas.find(p => p.key === k),
+      reloadController: { sharedChannels: () => ({}) },
+      ownPostLookups: { forget(k) { calls.push(`lookup-forget:${k}`) }, kick(k) { calls.push(`lookup-kick:${k}`) }, journalRead(k) { calls.push(`lookup-read:${k}`) } },
+      threadMemory: {
+      outage: () => ({ unknown: true, unsaved: 1, missing: false }),
+      retryPendingJoins(k) { calls.push(`judge:${k}`) },
+      async flush(k) { calls.push(`flush:${k}`); return { kind: 'saved' } },
+      retryRead(k) { calls.push(`read:${k}`); if (first) { first = false; return late.promise }; return Promise.resolve('read') },
+    }, memoryHolds: { forget(k) { calls.push(`forget:${k}`) }, async resolve(k) { calls.push(`resolve:${k}`); return 'resolved' } } })
+    const retries = createThreadMemoryRetries(wiring.retryDeps(clock))
+    wiring.set({ threadMemoryRetries: retries }); wiring.start(reporting, { startupFindings: () => [] })
+    const serializer = createPersonaSerializer(), turn = Promise.withResolvers<void>(), delivery = Promise.withResolvers<void>()
+    const lifecycleLogs: string[] = [], noop = () => {}, unexpected = (): never => { throw new Error('unexpected lifecycle operation') }
+    // Only the unrelated lifecycle edges are inert. Submission, serialization,
+    // notice windows and the production server cancel callback all run for real.
+    const lifecycle = createPersonaLifecycle({ serialize: serializer.run, cancelThreadMemory: wiring.cancel,
+      bringUps: { cancel: noop, state: () => undefined, bringUp: unexpected, changeCredentials: unexpected },
+      connections: { stop: async () => {}, reconnectCredentials: unexpected, replaceRetryTokens: unexpected },
+      routing: { forget: noop }, destinations: notifier.destinations, destinationHold: notifier.hold, notifier: notifier.notifier,
+      appliedPersonas: () => config.personas, dryRun: true, isShuttingDown: () => false, log: line => lifecycleLogs.push(line),
+      stopDelivery: () => delivery.promise, whenLaunchSettled: async () => {}, cancelRestartTimer: noop, stopRetryTimer: noop,
+      forgetFailures: noop, forgetDisconnectedStreak: noop, forgetNoticeEpisodes: k => episodes.forget(k),
+      forgetConflictLatch: noop, forgetInvalidFlagsHold: noop, resetOutageState: noop, forgetPersonaPrompts: noop,
+      forgetAcks: noop, dropSession: async () => {}, killInstance: unexpected, raiseKillFailureAlert: unexpected,
+      storageCheck: unexpected, launch: unexpected, templateRefresh: { get installed(): never { return unexpected() }, getClient: unexpected },
+    })
+    const prior = serializer.run(key, () => turn.promise)
+    let teardown: Promise<void> | undefined
+    try {
+      retries.readFailed(key); await clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+      expect(calls).toEqual([`read:${key}`])
+      teardown = lifecycle.teardown(persona)
+      expect(wiring.canRun(key)).toBe(false); expect(wiring.canRun(sibling)).toBe(true)
+      expect(notifier.notifier.teardownWindowState(key)).toBe('submitted')
+      expect(calls).toEqual([`read:${key}`, `lookup-forget:${key}`, `forget:${key}`])
+      const error = new Error('old life unavailable'), path = threadPath(root)
+      const oldEvents = () => {
+        wiring.memory({ type: 'append-failed', noticeOnly: false, key, path, step: 'journal-append', error }); wiring.memory({ type: 'read-failed', key, path, error })
+        wiring.memory({ type: 'read', key, path, firstSuccessfulRead: true })
+      }
+      oldEvents(); expect(clock.pendingCount()).toBe(0)
+      turn.resolve(); await prior; await clock.flush()
+      expect(notifier.notifier.teardownWindowState(key)).toBe('open')
+      expect(wiring.canRun(key)).toBe(false)
+      expect(calls.filter(c => c === `forget:${key}`)).toHaveLength(2)
+      expect(calls.filter(c => c === `lookup-forget:${key}`)).toHaveLength(2)
+      oldEvents(); expect(clock.pendingCount()).toBe(0)
+      expect(calls).not.toContain(`lookup-read:${key}`)
+      retries.appendFailed(sibling); await clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+      expect(calls).toContain(`flush:${sibling}`)
+      delivery.resolve(); await teardown
+      expect(notifier.notifier.teardownWindowState(key)).toBe('none')
+      expect(wiring.canRun(key)).toBe(true)
+      late.resolve('read'); await clock.flush()
+      expect(calls).not.toContain(`judge:${key}`)
+      expect(calls).not.toContain(`resolve:${key}`)
+      expect(calls).not.toContain(`lookup-kick:${key}`)
+      retries.readFailed(key); await clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+      expect(calls.slice(-5)).toEqual([`read:${key}`, `judge:${key}`, `resolve:${key}`, `flush:${key}`, `lookup-kick:${key}`])
+      expect(clock.pendingCount()).toBe(0)
+      expect(notifier.totalPosts()).toBe(0); expect(logs).toEqual([])
+      wiring.set({ shuttingDown: true }); expect(wiring.canRun(sibling)).toBe(false)
+      wiring.set({ shuttingDown: false }); episodes.close(); expect(wiring.canRun(sibling)).toBe(false)
+      assertNoLeak([calls, logs, lifecycleLogs, notifier.allPosts(), notifier.logs])
+    } finally { turn.resolve(); delivery.resolve(); await prior; await teardown; retries.stopKeys(); retries.stopSeal(); episodes.close(); notifier.cleanup(); rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test.each([
+    { loaded: true, failure: 'failed', throwLog: false },
+    { loaded: true, failure: 'unsynced', throwLog: false },
+    { loaded: true, failure: 'failed', throwLog: true },
+    { loaded: true, failure: 'none', throwLog: false },
+    { loaded: false, failure: 'failed', throwLog: false },
+  ] as const)('final shutdown seal owns its log and cancels all work: %j', async ({ loaded, failure, throwLog }) => {
+    const root = mkdtempSync(join(tmpdir(), 'cscb-shutdown-wiring-')), io = threadSealFsControls(root), wiring = threadMemoryWiring(), clock = createFakeClock()
+    const order: string[] = [], logs: string[] = [], posts: string[] = [], keyCalls: string[] = [], events: ThreadMemorySealModule.ThreadMemorySealEvent[] = []
+    const drain = Promise.withResolvers<void>(), quiesce = Promise.withResolvers<void>()
+    const episodes = createPersonaEpisodes({ clock, log: line => logs.push(line), sink: (_key, text) => { posts.push(text) } })
+    const reporting = createThreadMemoryReporting({ episodes, log: line => logs.push(line), persona: () => ({ name: key, key }),
+      threadHybridChannels: () => [], outage: () => ({ unknown: false, unsaved: 0, missing: false }) })
+    const seal = createThreadMemorySeal({ stateDir: root, fs: io.fs, queueJournalPath: k => queuePath(root, k), appliedKeys: () => [key],
+      threadHybrid: () => true, created: () => true, onEvent(event) { events.push(event); wiring.seal(event) } })
+    wiring.set({ personaEpisodes: episodes, threadMemorySeal: seal, threadMemory: {
+      outage: () => ({ unknown: true, unsaved: 1, missing: false }),
+      async flush(k) { keyCalls.push(`flush:${k}`); return { kind: 'failed' } },
+      async retryRead(k) { keyCalls.push(`read:${k}`); return 'unreadable' },
+    } })
+    const retries = createThreadMemoryRetries(wiring.retryDeps(clock))
+    wiring.set({ threadMemoryRetries: retries }); wiring.start(reporting, seal)
+    const header = threadHeader(), completed = new Map([[key, { storeId: header.storeId, lastRecordNumber: header.highWater }]])
+    try {
+      if (loaded) {
+        await seal.loadAtStart(new Map()); expect((await seal.entryCreated(key, header.storeId, header.highWater)).kind).toBe('written')
+        io.failWrite()
+        expect((await seal.flush()).kind).toBe('failed')
+      }
+      const priorLogs = [...logs], priorFailures = events.filter(e => e.type === 'seal-write-failed').length
+      expect(priorLogs).toHaveLength(loaded ? 1 : 0)
+      retries.appendFailed(key); retries.readFailed(key)
+      expect(clock.pendingCount()).toBe(loaded ? 3 : 2)
+      // shutdown() closes episodes before this drain/final-write segment.
+      episodes.close(); reporting.close(); wiring.set({ shuttingDown: true })
+      io.heal(); io.reset(); if (failure !== 'none') io.failWrite(failure === 'unsynced')
+      const run = threadMemoryShutdown({ memoryHolds: { stop() { order.push('holds') } },
+        postHolds: { stop() { order.push('post-holds') } }, unsubscribePostHolds: () => order.push('post-holds-unsubscribe'),
+        deliveryQueue: { stop() { order.push('queue'); return drain.promise } },
+        ownPostLookups: { stop() { order.push('lookup-stop') } },
+        ownPostJoins: { stop() { order.push('own-post-stop') }, memoryOnlyJoins: () => [] },
+        unsubscribeThreadMemory: () => order.push('unsubscribe'),
+        threadMemory: {
+          quiesce() { order.push('quiesce'); return quiesce.promise },
+          completedStores() { order.push('stores'); return completed },
+          journalFacts() { return new Map([...completed].map(([key, identity]) => [key, { kind: 'read', ...identity }])) },
+          async stop() { order.push('memory-stop') },
+        },
+        threadMemorySeal: { ...seal,
+          async writeShutdown(stores: typeof completed) { order.push('write'); expect(stores).toEqual(completed); return seal.writeShutdown(stores) },
+          async stop() { order.push('seal-stop'); await seal.stop() },
+        },
+        threadMemoryRetries: { ...retries,
+          stopKeys() { order.push('keys-stop'); retries.stopKeys() },
+          stopSeal() { order.push('seal-retries-stop'); retries.stopSeal() },
+        },
+        console: { error(line: string) { order.push('log'); logs.push(line); if (throwLog) throw new Error('fixture diagnostic failed') } },
+      })
+      const stopping = run(); await clock.flush()
+      const holds = ['holds', 'post-holds', 'post-holds-unsubscribe', 'queue']
+      expect(order).toEqual(holds); expect(io.calls).toEqual([])
+      drain.resolve(); await clock.flush()
+      expect(order).toEqual([...holds, 'keys-stop', 'lookup-stop', 'own-post-stop', 'unsubscribe', 'quiesce']); expect(io.calls).toEqual([])
+      // The shared retry owner is deliberately still live until after the final write.
+      // A late ordinary observation must not arm it during that window.
+      const timers = clock.pending()
+      wiring.seal({ type: 'seal-write-failed', path: seal.path, error: new Error('late ordinary failure'), unsynced: true })
+      expect(clock.pending()).toEqual(timers); expect(logs).toEqual(priorLogs)
+      quiesce.resolve(); await stopping
+      const failed = loaded && failure !== 'none'
+      expect(order).toEqual([...holds, 'keys-stop', 'lookup-stop', 'own-post-stop', 'unsubscribe', 'quiesce', ...(loaded ? ['stores', 'write'] : []),
+        ...(failed ? ['log'] : []), 'memory-stop', 'seal-stop', 'seal-retries-stop'])
+      const failureEvents = events.filter((e): e is Extract<ThreadMemorySealModule.ThreadMemorySealEvent, { type: 'seal-write-failed' }> => e.type === 'seal-write-failed')
+      expect(failureEvents).toHaveLength(priorFailures + (failed ? 1 : 0))
+      expect(logs).toEqual([...priorLogs, ...(failed ? [buildThreadMemorySealNotSavedLine(seal.path, failureEvents.at(-1)!.error, failure === 'unsynced')] : [])])
+      if (failed) expect(failureEvents.at(-1)!.unsynced).toBe(failure === 'unsynced')
+      expect(posts).toEqual([]); expect(keyCalls).toEqual([]); expect(clock.pendingCount()).toBe(0)
+      const count = io.calls.length, oldLogs = [...logs]
+      wiring.memory({ type: 'read-failed', key, path: threadPath(root), error: new Error('late closed event') })
+      wiring.seal({ type: 'seal-write-failed', path: seal.path, error: new Error('late closed event'), unsynced: false })
+      wiring.seal({ type: 'seal-written', path: seal.path })
+      wiring.memory({ type: 'compacted', key, path: threadPath(root), outcome: 'rewritten' })
+      wiring.holds({ type: 'resolution-saved', key })
+      wiring.holds({ type: 'release-failed', key, seq: 1, error: new Error('late callback failure') })
+      await clock.advance(2 * THREAD_MEMORY_RETRY_MAX_MS)
+      expect(io.calls).toHaveLength(count); expect(keyCalls).toEqual([]); expect(posts).toEqual([]); expect(logs).toEqual(oldLogs)
+      expect(clock.pendingCount()).toBe(0)
+      assertNoLeak([logs, posts, keyCalls, order, writtenFile(root)])
+    } finally { drain.resolve(); quiesce.resolve(); retries.stopKeys(); await seal.stop(); retries.stopSeal(); reporting.close(); episodes.close(); rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test.each(['none', THREAD_PERSONAS.primary, THREAD_PERSONAS.secondary])('shutdown snapshots the stopped owner after quiescence and isolates a throwing key: %s', async throwing => {
+    const keys = Object.values(THREAD_PERSONAS), header = threadHeader()
+    const completed = new Map(keys.map(key => [key, { storeId: header.storeId, lastRecordNumber: header.highWater }]))
+    const threads = keys.map((_, index) => [{ channel: THREAD_CHANNELS.primary, root: Object.values(THREAD_ROOTS)[index]! }])
+    const quiesce = Promise.withResolvers<void>(), order: string[] = []
+    const writes: Array<Map<string, ThreadMemorySealModule.ThreadMemoryShutdownEntry>> = []
+    let ready = false
+    const run = threadMemoryShutdown({
+      memoryHolds: undefined, postHolds: undefined, unsubscribePostHolds: undefined, deliveryQueue: undefined, ownPostLookups: undefined, unsubscribeThreadMemory: undefined,
+      threadMemoryRetries: { stopKeys() { order.push('retry-stop') }, stopSeal() { order.push('seal-retry-stop') } },
+      ownPostJoins: {
+        stop() { order.push('owner-stop') },
+        memoryOnlyJoins(key: string) {
+          order.push(`snapshot:${key}`)
+          expect(ready).toBe(true)
+          if (key === throwing) throw new Error('fixture snapshot refused')
+          return threads[keys.indexOf(key as typeof keys[number])]
+        },
+      },
+      threadMemory: {
+        quiesce() { order.push('quiesce'); return quiesce.promise },
+        completedStores() { order.push('stores'); return completed },
+        journalFacts() { return new Map([...completed].map(([key, identity]) => [key, { kind: 'read', ...identity }])) },
+        stop() { order.push('memory-stop') },
+      },
+      threadMemorySeal: {
+        loadedAtStart: () => true,
+        writeShutdown(stores: typeof writes[number]) { order.push('write'); writes.push(stores); return { kind: 'written' } },
+        stop() { order.push('seal-stop') },
+      },
+    })
+    const work = run()
+    try {
+      await createFakeClock().flush()
+      expect(order).toEqual(['retry-stop', 'owner-stop', 'quiesce'])
+      expect(writes).toHaveLength(0)
+      ready = true; quiesce.resolve(); await work
+      expect(order).toEqual(['retry-stop', 'owner-stop', 'quiesce', 'stores', ...keys.map(key => `snapshot:${key}`),
+        'write', 'memory-stop', 'seal-stop', 'seal-retry-stop'])
+      expect(writes).toEqual([new Map(keys.map((key, index) => [key, {
+        ...completed.get(key)!, ...(key === throwing ? {} : { memoryOnlyJoins: threads[index] }),
+      }]))])
+      // Gathering a seal snapshot must not mutate the store's identity map.
+      expect([...completed.values()]).toEqual(keys.map(() => ({ storeId: header.storeId, lastRecordNumber: header.highWater })))
+    } finally { ready = true; quiesce.resolve(); await work }
+  })
+
+  test('reporter adapters read the replacement memory and shared authority at call time', () => {
+    const props = onlyCallProps('createThreadMemoryReporting'), clock = createFakeClock()
+    const episodes = createPersonaEpisodes({ clock, sink() {}, log() {} }), calls: unknown[][] = []
+    const adapters = expression<() => { deps: Parameters<typeof createThreadMemoryReporting>[0]; replace(n: number): void }>(`() => {
+      let current = 0;
+      let threadMemory;
+      const reload = { sharedChannels: () => current ? { threadView: () => ({ threadHybridChannels: key => [String(current), key] }) } : undefined };
+      const deps = { ${[...props].map(([name, value]) => `${name}: ${value}`).join(',')} };
+      return { deps, replace(n) { current = n; threadMemory = { outage: key => ({ unknown: false, unsaved: n, missing: false }) } } };
+    }`, { noticeEpisodes: episodes, getAppliedPersona: (key: string) => ({ key, name: key }), console: { error: (...args: unknown[]) => calls.push(args) } })()
+    expect(adapters.deps.episodes).toBe(episodes)
+    expect(adapters.deps.threadHybridChannels(key)).toEqual([])
+    for (const n of [1, 2]) {
+      adapters.replace(n)
+      expect(adapters.deps.outage(key).unsaved).toBe(n)
+      expect(adapters.deps.threadHybridChannels(key)).toEqual([String(n), key])
+      expect(adapters.deps.persona(key)).toEqual({ key, name: key })
+    }
+    adapters.deps.log('fixture diagnostic')
+    expect(calls).toEqual([['fixture diagnostic']])
+    episodes.close(); assertNoLeak(calls)
+  })
+
+  test('committed withdrawals reach the production dispatcher and episode sink with the budgeted notifier prefix', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cscb-loss-wiring-'))
+    const config = makeMultiPersonaConfig([{ name: 'a'.repeat(2100), channels: [{ id: THREAD_CHANNELS.primary, delivery: 'thread_hybrid' }] }], root)
+    const notifier = makeNotifierHarness(config), wiring = threadMemoryWiring(), logs: string[] = []
+    const persona = config.personas[0]!, clock = notifier.clock, queue = await makeQueue(root, { now: clock.now })
+    const episodes = createPersonaEpisodes({ clock, sink: expression(onlyCallProps('createPersonaEpisodes').get('sink')!, { personaNotifier: notifier.notifier }), log: line => logs.push(line) })
+    const reporting = createThreadMemoryReporting({ episodes, log: line => logs.push(line), persona: () => persona,
+      threadHybridChannels: () => [THREAD_CHANNELS.primary], outage: () => ({ unknown: false, unsaved: 0, missing: false }) })
+    const resolver = createMemoryHoldResolver({ queue, memory: { joinedBy: () => false, pruneHeldJoins: () => {} }, now: clock.now, clock,
+      release() { throw new Error('withdrawn item must not release') }, onEvent: expression(onlyCallProps('createMemoryHoldResolver').get('onEvent')!, { memoryHoldEvents: { emit: wiring.holds } }) })
+    try {
+      wiring.start(reporting, { startupFindings: () => [] })
+      const input = heldSlackInput(memoryHold(clock.now()), { channel: THREAD_CHANNELS.primary })
+      expect((await queue.acceptDecided(persona.key, input.key, () => ({ store: input }))).status).toBe('accepted')
+      expect(await resolver.resolve(persona.key, 'live')).toBe('resolved')
+      await clock.flush()
+      expect(input.channel).toBeDefined(); expect(input.ts).toBeDefined(); expect(input.thread_ts).toBeDefined()
+      const loss = { threads: [{ channel: input.channel!, root: input.thread_ts! }], messages: [{ channel: input.channel!, ts: input.ts! }] }
+      const notice = buildThreadMemoryJoinsLostNotice(persona, loss)
+      expect(notifier.posts(persona.key).map(post => post.text)).toEqual([formatPersonaNotice(persona, notice.text, notice.options)])
+      expect(notifier.posts(persona.key)[0]!.text.length).toBeLessThanOrEqual(THREAD_MEMORY_NOTICE_MAX_CHARS)
+      expect(logs).toHaveLength(1)
+      expect(logs[0]).toContain(persona.name)
+      expect(await resolver.resolve(persona.key, 'live')).toBe('resolved')
+      await clock.flush(); expect(notifier.totalPosts()).toBe(1)
+      assertNoLeak([notifier.allPosts(), logs, queue.items(persona.key)])
+    } finally { resolver.stop(); episodes.close(); await queue.stop(); notifier.cleanup(); rmSync(root, { recursive: true, force: true }) }
+  })
+})
+
+describe('Memory Hold server wiring', () => {
+  test('one resolver shares the queue, memory, release callback, clock and event port', () => {
+    expect(importSource(SERVER_CODE, 'createMemoryHoldResolver')).toBe('./memory-holds.ts')
+    declaredOnce('memoryHolds')
+    expect(assignmentsTo('memoryHolds').map(({ value }) => value)).toEqual(['createMemoryHoldResolver({'])
+    const created = onlyCallOf('createMemoryHoldResolver')
+    expect(atMainTopLevel(SERVER_CODE, created)).toBe(true)
+    expect(Object.fromEntries(onlyCallProps('createMemoryHoldResolver'))).toEqual({
+      canRun: 'threadMemoryWorkAllowed',
+      queue: 'deliveryQueue', memory: 'threadMemory',
+      release: '(key, item, mode) => personaRouting.releaseHeld(key, item, mode)',
+      now: 'Date.now',
+      clock: '{ setTimeout: (callback, ms) => setTimeout(callback, ms), clearTimeout: handle => clearTimeout(handle as ReturnType<typeof setTimeout>) }',
+      onEvent: 'event => memoryHoldEvents.emit(event)',
+    })
+    // compactAfter=true in the start's step delegates the detached second
+    // compaction and its hourly retry to this resolver over the real queue,
+    // after the key's Post Hold release; the step compacts itself only when k8
+    // answers unknown or a failed join recovery keeps it from being asked (its
+    // cases below).
+    expect(moduleFunction(START_RECOVERY_STEP).body.replace(/\s+/g, ' ')).toContain("memoryHolds?.resolve(key, 'recovered', true)")
+    expect(created).toBeLessThan(onlyCallOf('threadMemory\\.activate'))
+    const [start, end] = shutdownBody(SERVER_CODE)
+    const stop = onlyCallOf('memoryHolds\\?\\.stop')
+    expect(stop).toBeGreaterThan(start)
+    expect(stop).toBeLessThan(end)
+    expect(stop).toBeLessThan(onlyCallOf('deliveryQueue\\?\\.stop'))
+  })
+
+  test('one Post Hold resolver on the hold clock shares the queue, owner, release adapter and decision clock, and hands parked holds to k8', () => {
+    const factory: keyof typeof PostHoldsModule = 'createPostHoldResolver'
+    expect(importSource(SERVER_CODE, factory)).toBe('./post-holds.ts')
+    declaredOnce('postHolds')
+    expect(assignmentsTo('postHolds').map(({ value }) => value)).toEqual([`${factory}(postHoldDeps)`])
+    const created = onlyCallOf(factory), memory = onlyCallProps('createMemoryHoldResolver')
+    expect(atMainTopLevel(SERVER_CODE, created)).toBe(true)
+    // The retained dependency object has no observer at construction; the
+    // test-only consumer is bound after start resolution, only when enabled.
+    expect(onlyCallArgs(factory)).toEqual(['postHoldDeps'])
+    expect(Object.fromEntries(objectProperties(spreadConstObject('postHoldDeps')))).toEqual({
+      canRun: memory.get('canRun')!, queue: 'deliveryQueue', owner: 'ownPostJoins',
+      release: memory.get('release')!, onParked: 'key => resolveMemoryHolds(key)',
+      clock: 'HOLD_CLOCK', decisionNow: memory.get('now')!,
+    } satisfies Partial<Record<keyof PostHoldsModule.PostHoldResolverDeps, string>>)
+    expect(memory.get('release')).toBe('(key, item, mode) => personaRouting.releaseHeld(key, item, mode)')
+    expect(memory.get('now')).toBe('Date.now')
+    for (const [before, after] of [[onlyCallOf('createMemoryHoldResolver'), created], [onlyCallOf('createOwnPostJoins'), created],
+      [created, onlyCallOf('deliveryQueue\\.startMaintenance')], [created, onlyCallOf('createPersonaConnectionManager')],
+      [created, startResolution(SERVER_CODE).bringUpAt]]) expect(before).toBeLessThan(after!)
+    // Shutdown stops it and drops the owner subscription beside k8's stop, before the queue drains.
+    const [start, end] = shutdownBody(SERVER_CODE)
+    const tree = ts.createSourceFile('shutdown.ts', SERVER_CODE.slice(start, end), ts.ScriptTarget.Latest, true)
+    const statements = tree.statements.map(node => node.getText(tree))
+    const k8Stop = statements.indexOf('memoryHolds?.stop()')
+    expect(k8Stop).toBeGreaterThanOrEqual(0)
+    expect(statements.slice(k8Stop, k8Stop + 3)).toEqual(['memoryHolds?.stop()', 'postHolds?.stop()', 'unsubscribePostHolds?.()'])
+    expect(statements.indexOf('await deliveryQueue?.stop()')).toBeGreaterThan(k8Stop + 2)
+    for (const call of ['postHolds\\?\\.stop', 'unsubscribePostHolds\\?\\.']) expect(callsOf(call)).toHaveLength(1)
+  })
+
+  test('the hold clock reads performance.now with unref\'d timers and is the only clock of the hold timer and routing\'s receipt reading', () => {
+    const name = 'HOLD_CLOCK'
+    const declared = indicesOf(new RegExp(`^const\\s+${name}\\s*:\\s*PostHoldClock\\s*=`, 'gm'), SERVER_CODE)
+    expect(declared).toHaveLength(1)
+    expect(insideMain(declared[0]!)).toBe(false)
+    // Named only by its declaration, routing's receipt reading and the resolver's clock.
+    const named = indicesOf(new RegExp(`\\b${name}\\b`, 'g'), SERVER_CODE)
+    expect(named).toHaveLength(3)
+    expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
+    expect(objectProperties(spreadConstObject('postHoldDeps')).get('clock')).toBe(name)
+    expect(onlyCallProps('createPersonaRouting').get('monotonicNow')).toBe(`${name}.now`)
+    expect(serverInitializer(name)).not.toMatch(/\bDate\b/)
+    const calls: unknown[][] = [], timer = { unref: () => { calls.push(['unref']) } }
+    const clock = expression<PostHoldsModule.PostHoldClock>(serverInitializer(name), {
+      performance: { now: () => 1234.5 },
+      setTimeout: (callback: () => void, ms: number) => { calls.push(['set', callback, ms]); return timer },
+      clearTimeout: (handle: unknown) => { calls.push(['clear', handle]) },
+    })
+    expect(clock.now()).toBe(1234.5)
+    const fire = () => {}
+    expect(clock.setTimeout(fire, 25)).toBe(timer)
+    clock.clearTimeout(timer)
+    expect(calls).toEqual([['set', fire, 25], ['unref'], ['clear', timer]])
+  })
+
+  test('routing retains through the one owner holder and hands each retention to the current Post Hold holder, which releases it when absent, and the one owner subscription only checks each event\'s key', () => {
+    const binding = onlyCallProps('createPersonaRouting').get('postHolds')!
+    expect(binding).toBe('{ held: (key, hold, retention) => postHolds ? postHolds.held(key, hold, retention) : retention() }')
+    const retain = onlyCallProps('createPersonaRouting').get('retainOwnPostOutcomes')!
+    // The registration and retention members are bound only in the routing call (the holder's declaration aside).
+    const members: Array<keyof PersonaRoutingDeps> = ['monotonicNow', 'postHolds', 'retainOwnPostOutcomes']
+    for (const member of members) {
+      const bound = indicesOf(new RegExp(`(?<!\\blet\\s+)\\b${member}\\s*:`, 'g'), SERVER_CODE)
+      expect(bound).toHaveLength(1)
+      expect(withinCall(bound, onlyCallOf('createPersonaRouting'))).toBe(1)
+      expect(indicesOf(new RegExp(`(?:\\.\\s*${member}\\b|\\[\\s*['"]${member}['"]\\s*\\])`, 'g'), SERVER_CODE)).toEqual([])
+    }
+    const subscriptions = indicesOf(/\bownPostJoins\b[!?]*\.subscribe\s*\(/g, SERVER_CODE)
+    expect(subscriptions).toHaveLength(1)
+    declaredOnce('unsubscribePostHolds')
+    expect(assignmentsTo('unsubscribePostHolds').map(({ value }) => value)).toEqual(['ownPostJoins.subscribe(event => postHolds?.check(event.key))'])
+    const subscribed = assignmentsTo('unsubscribePostHolds')[0]!.at
+    expect(atMainTopLevel(SERVER_CODE, subscribed)).toBe(true)
+    expect(subscribed).toBeGreaterThan(onlyCallOf('createPostHoldResolver'))
+    expect(subscribed).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
+    const listener = callArguments(SERVER_CODE, subscriptions[0]!)
+    const adapter = expression<() => {
+      held: NonNullable<PersonaRoutingDeps['postHolds']>['held']
+      retain: NonNullable<PersonaRoutingDeps['retainOwnPostOutcomes']>
+      listener(event: OwnPostModule.OwnPostEvent): void
+      set(resolver?: Pick<PostHoldsModule.PostHoldResolver, 'held' | 'check'>): void
+      own(owner?: Pick<OwnPostModule.OwnPostJoins, 'retainOutcomes'>): void
+    }>(`() => {
+      let postHolds, ownPostJoins;
+      return { held: (${binding}).held, retain: (${retain}), listener: (${listener}), set: value => { postHolds = value }, own: value => { ownPostJoins = value } };
+    }`, {})()
+    const key = THREAD_PERSONAS.primary, hold: PostHoldsModule.StoredPostHold = { seq: 3, operations: ['op'], threadRoot: THREAD_ROOTS.primary, rootUnknown: false, receivedAt: 7 }
+    const kinds: Array<OwnPostModule.OwnPostEvent['type']> = ['registered', 'decided', 'unknown', 'awaiting-thread', 'deferred']
+    const event = (type: OwnPostModule.OwnPostEvent['type'], at: string = key): OwnPostModule.OwnPostEvent => ({ type, key: at, channel: THREAD_CHANNELS.primary, operationId: 'op' })
+    const released: string[] = [], retention = (name: string) => () => { released.push(name) }
+    // Before the owner and resolver exist, a retention is a no-op, held releases
+    // the one it is handed, and the listener does nothing.
+    const none = adapter.retain(key, ['op'])
+    expect(none()).toBeUndefined()
+    expect(adapter.held(key, hold, retention('absent'))).toBeUndefined()
+    expect(released).toEqual(['absent'])
+    adapter.listener(event('registered'))
+    const calls: unknown[][] = []
+    for (const life of ['first', 'replacement']) {
+      const handle = retention(life)
+      adapter.own({ retainOutcomes: (...args) => { calls.push([life, 'retain', ...args]); return handle } })
+      adapter.set({ held: (k, stored, r) => { calls.push([life, 'held', k, stored, r === handle]) }, check: (...args) => { calls.push([life, 'check', ...args]) } })
+      adapter.held(key, hold, adapter.retain(key, ['op']))
+      for (const type of kinds) adapter.listener(event(type, type === 'deferred' ? THREAD_PERSONAS.secondary : key))
+    }
+    // Each life's resolver takes its owner's very handle, and the adapter releases none of them.
+    expect(calls).toEqual(['first', 'replacement'].flatMap(life => [[life, 'retain', key, ['op']], [life, 'held', key, hold, true],
+      ...kinds.map(type => [life, 'check', type === 'deferred' ? THREAD_PERSONAS.secondary : key])]))
+    expect(released).toEqual(['absent'])
+  })
+
+  test('bring-up releases the key\'s Post Holds after its recovery, then resolves its Memory Holds, detached and fenced', async () => {
+    const load = onlyCallProps('createPersonaLifecycle').get('loadThreadMemory')!, key = THREAD_PERSONAS.primary
+    const run = async (release: () => Promise<void>, allowed: boolean) => {
+      const calls: unknown[][] = []
+      const bringUp = expression<(key: string) => Promise<void>>(load, {
+        shuttingDown: false, deliveryQueue: {}, threadMemoryWorkAllowed: () => allowed,
+        threadMemory: { loadKey: async (k: string) => { calls.push(['load', k]) } },
+        recoverQueuedJoins: (k: string) => { calls.push(['recover', k]) },
+        postHolds: { releaseUntracked: (k: string) => { calls.push(['release', k]); return release() } },
+        memoryHolds: { resolve: (...args: unknown[]) => { calls.push(['resolve', ...args]); return Promise.resolve('resolved') } },
+        ownPostLookups: { kick: (k: string) => { calls.push(['kick', k]) } },
+      })
+      await bringUp(key)
+      return calls
+    }
+    const released = Promise.withResolvers<void>(), steps = [['load', key], ['recover', key], ['release', key], ['kick', key]]
+    const calls = await run(() => released.promise, true)
+    // The bring-up does not wait for the release; k8's resolution waits for it.
+    expect(calls).toEqual(steps)
+    released.resolve(); await createFakeClock().flush()
+    expect(calls).toEqual([...steps, ['resolve', key, 'recovered']])
+    // A teardown fence closed by then, or a failed release, resolves nothing.
+    for (const [release, allowed] of [[() => Promise.resolve(), false], [() => Promise.reject(new Error('fixture release failed')), true]] as const) {
+      const fenced = await run(release, allowed)
+      await createFakeClock().flush()
+      expect(fenced).toEqual(steps)
+    }
+  })
+
+  test('held-stamp and stored-hold inputs are bound only in their construction', () => {
+    for (const [member, factory] of [['heldStamps', 'createThreadMemory'], ['onHoldStored', 'createPersonaRouting']]) {
+      const bindings = indicesOf(new RegExp(`\\b${member}\\s*:`, 'g'), SERVER_CODE)
+      expect(bindings).toHaveLength(1)
+      expect(withinCall(bindings, onlyCallOf(factory!))).toBe(1)
+      expect(indicesOf(new RegExp(`(?:\\.\\s*${member}\\b|\\[\\s*['"]${member}['"]\\s*\\])`, 'g'), SERVER_CODE)).toEqual([])
+    }
+    // One hook for its three owners, each in its own try: k8's live resolution,
+    // the Post Hold check, then reporting's correction of a held exact save.
+    expect(onlyCallProps('createPersonaRouting').get('onHoldStored')).toBe('key => { try { void resolveMemoryHolds(key).catch(() => {}) } catch { } try { postHolds?.check(key) } catch { } try { deliveryReporting?.holdStored(key) } catch { } }')
+  })
+
+  test.each([false, true])('actual held-stamp adapter sees the decision during store and its outcome; failed=%s', async fail => {
+    const adapter = expression<() => {
+      held: NonNullable<ThreadMemoryModule.ThreadMemoryOptions['heldStamps']>
+      set(queue?: Pick<DeliveryQueue, 'unresolvedHolds'>): void
+    }>(`() => { let deliveryQueue;
+      const held = (${onlyCallProps('createThreadMemory').get('heldStamps')});
+      return { held, set: value => { deliveryQueue = value } };
+    }`, {})()
+    const key = THREAD_PERSONAS.primary, fact = threadJoin()
+    expect(adapter.held(key)).toEqual([])
+    const root = mkdtempSync(join(tmpdir(), 'cscb-held-stamp-wiring-'))
+    const observed: unknown[] = []
+    const seam = durableIo({ before(step) {
+      if (step.op !== 'fsync' || step.path !== queuePath(root, key)) return
+      observed.push(adapter.held(key))
+      if (fail) throw new Error('fixture hold store failed')
+    } }).fs
+    const queue = await makeQueue(root, { fs: seam })
+    try {
+      adapter.set(queue)
+      const input = heldSlackInput(memoryHold(fact.at, { stamp: fact.stamp }), { channel: fact.channel })
+      const stored = await queue.acceptDecided(key, input.key, () => ({ store: input }))
+      const stamps = [{ channel: fact.channel, stamp: fact.stamp }]
+      // A failed fsync also attempts rollback. Every store-time observation,
+      // including that rollback, must still protect the decided hold.
+      expect(observed.length).toBeGreaterThan(0)
+      for (const value of observed) expect(value).toEqual(stamps)
+      expect(stored.status).toBe(fail ? 'failed' : 'accepted')
+      expect(adapter.held(key)).toEqual(fail ? [] : stamps)
+      expect(adapter.held(THREAD_PERSONAS.secondary)).toEqual([])
+      // A replacement holder is read on the next call; non-dependent holds
+      // must not retain a stamp in Thread Memory.
+      const holds = queue.unresolvedHolds(key)
+      adapter.set({ unresolvedHolds: () => holds.map(hold => ({ ...hold, memoryDependent: false })) })
+      expect(adapter.held(key)).toEqual([])
+      adapter.set(queue)
+      expect(adapter.held(key)).toEqual(fail ? [] : stamps)
+      adapter.set()
+      expect(adapter.held(key)).toEqual([])
+    } finally {
+      await queue.stop()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('stored-hold callback resolves live, checks Post Holds and corrects held storage warnings through the current holders, each isolated, k8 guarded by shutdown and applied key', async () => {
+    const tree = ts.createSourceFile('server.ts', SERVER_CODE, ts.ScriptTarget.Latest, true)
+    const fn = tree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'resolveMemoryHolds')!
+    expect(fn.getText(tree).replace(/\s+/g, ' ')).toBe("export function resolveMemoryHolds(key: string, mode: 'live' | 'recovered' = 'live'): Promise<unknown> { return !shuttingDown && getAppliedPersona(key) ? memoryHolds?.resolve(key, mode) ?? Promise.resolve() : Promise.resolve() }")
+    const adapter = expression<() => {
+      stored: NonNullable<PersonaRoutingDeps['onHoldStored']>
+      resolve: typeof ServerModule.resolveMemoryHolds
+      set(value?: Pick<MemoryHoldResolver, 'resolve'>, stopping?: boolean, applied?: boolean, post?: Pick<PostHoldsModule.PostHoldResolver, 'check'>,
+        reporting?: Pick<ReturnType<typeof createDeliveryReporting>, 'holdStored'>): void
+    }>(`() => {
+      let memoryHolds, postHolds, deliveryReporting, shuttingDown = false, applied = true;
+      const getAppliedPersona = () => applied;
+      ${fn.getText(tree).replace(/^export /, '')}
+      const stored = (${onlyCallProps('createPersonaRouting').get('onHoldStored')});
+      return { stored, resolve: resolveMemoryHolds, set(value, stopping = false, present = true, post, reporting) {
+        memoryHolds = value; shuttingDown = stopping; applied = present; postHolds = post; deliveryReporting = reporting;
+      } };
+    }`, {})()
+    const key = THREAD_PERSONAS.primary, calls: unknown[][] = []
+    await adapter.stored(key)
+    for (const marker of ['first', 'replacement']) {
+      const resolver = { resolve: async (...args: Parameters<MemoryHoldResolver['resolve']>) => {
+        calls.push([marker, ...args]); return 'resolved' as const
+      } }
+      adapter.set(resolver)
+      await adapter.stored(key)
+      await adapter.resolve(key, 'recovered')
+      adapter.set(resolver, true)
+      await adapter.stored(key)
+      adapter.set(resolver, false, false)
+      await adapter.stored(key)
+    }
+    expect(calls).toEqual(['first', 'replacement'].flatMap(marker => [[marker, key, 'live'], [marker, key, 'recovered']]))
+    // The same hook checks the current Post Hold holder, then asks the current
+    // reporting to correct a posted storage warning for an exact held save.
+    // No owner's failure skips a later one or reaches routing.
+    calls.length = 0
+    for (const how of ['ok', 'throws', 'rejects'] as const) {
+      adapter.set({ resolve: (...args: Parameters<MemoryHoldResolver['resolve']>) => {
+        calls.push(['resolve', how, ...args])
+        if (how === 'throws') throw new Error('fixture resolve threw')
+        return how === 'ok' ? Promise.resolve('resolved' as const) : Promise.reject(new Error('fixture resolve rejected'))
+      } }, false, true, { check: (k: string) => { calls.push(['check', how, k]); if (how !== 'ok') throw new Error('fixture check threw') } },
+      { holdStored: (k: string) => { calls.push(['holdStored', how, k]); if (how !== 'ok') throw new Error('fixture holdStored threw') } })
+      expect(() => adapter.stored(key)).not.toThrow()
+    }
+    await createFakeClock().flush()
+    expect(calls).toEqual(['ok', 'throws', 'rejects'].flatMap(how => [['resolve', how, key, 'live'], ['check', how, key], ['holdStored', how, key]]))
+    // The reporting holder is read at call time: a replacement gets the next
+    // stored hold, and none at all is skipped quietly.
+    calls.length = 0
+    for (const marker of ['first', 'replacement']) {
+      adapter.set(undefined, false, true, undefined, { holdStored: (k: string) => { calls.push([marker, k]) } })
+      expect(() => adapter.stored(key)).not.toThrow()
+    }
+    adapter.set()
+    expect(() => adapter.stored(key)).not.toThrow()
+    expect(calls).toEqual([['first', key], ['replacement', key]])
+  })
+
+  test('a saved hold resolution wakes only its key\'s engine through the one call-time adapter, detached from intake', () => {
+    expect(onlyCallProps('createDeliveryQueue').get('onEvent')).toBe('event => deliveryQueueEvents.emit(event)')
+    expect(callsOf('deliveryQueueEvents\\.emit')).toHaveLength(1)
+    declaredOnce('deliveryQueueEvents'); declaredOnce('deliveryQueueWake')
+    const tree = ts.createSourceFile('server.ts', SERVER_CODE, ts.ScriptTarget.Latest, true)
+    const port = tree.statements.flatMap(node => ts.isVariableStatement(node) ? [...node.declarationList.declarations] : [])
+      .find(d => ts.isIdentifier(d.name) && d.name.text === 'deliveryQueueEvents')!.initializer!.getText(tree)
+    // Nothing else joins the resolution path, and nothing in it awaits.
+    expect(port.replace(/\s+/g, ' ')).toBe("{ emit: (event: QueueEvent): void => { if (event.type === 'holds-resolved') { try { deliveryQueueWake.wake(event.key) } catch { } } if (deliveryReporting) deliveryReporting.queueEvent(event); else bufferedQueueEvents.push(event) } }")
+    // The existing adapter, bound once in main to the engines; preparation's wake is the other call.
+    const bound = indicesOf(/\bdeliveryQueueWake\.wake\s*=(?![=>])/g, SERVER_CODE)
+    expect(bound).toHaveLength(1)
+    expect(insideMain(bound[0]!)).toBe(true)
+    expect(SERVER_CODE.slice(bound[0]!).split('\n')[0]!.trim()).toBe('deliveryQueueWake.wake = key => deliveryEngines?.wake(key)')
+    expect(callsOf('deliveryQueueWake\\.wake')).toHaveLength(2)
+    expect(withinCall(callsOf('deliveryQueueWake\\.wake'), onlyCallOf('createDeliveryPreparation'))).toBe(1)
+
+    const woken: string[] = [], reported: QueueEvent[] = [], buffered: QueueEvent[] = []
+    let failing = false
+    const wake = { wake: (key: string) => { woken.push(key); if (failing) throw new Error('fixture wake failed') } }
+    const emitter = (reporting?: { queueEvent(event: QueueEvent): void }) => expression<() => { emit(event: QueueEvent): void }>(
+      `() => (${port})`, { deliveryQueueWake: wake, deliveryReporting: reporting, bufferedQueueEvents: buffered })()
+    const live = emitter({ queueEvent: event => { reported.push(event) } })
+    const resolved = (key: string): QueueEvent => ({ type: 'holds-resolved', key, resolutions: [{ seq: 1, outcome: 'withdrawn', at: 1 }] })
+    const others: QueueEvent[] = [{ type: 'stored', key: 'alpha' }, { type: 'writable', key: 'alpha' }, { type: 'retained', key: 'alpha', count: 1 }]
+    for (const event of others) expect(live.emit(event)).toBeUndefined()
+    expect(woken).toEqual([])
+    expect(live.emit(resolved('alpha'))).toBeUndefined()
+    expect(live.emit(resolved('beta'))).toBeUndefined()
+    expect(woken).toEqual(['alpha', 'beta'])
+    failing = true
+    expect(() => live.emit(resolved('alpha'))).not.toThrow()
+    expect(reported).toEqual([...others, resolved('alpha'), resolved('beta'), resolved('alpha')])
+    failing = false
+    emitter().emit(resolved('beta'))
+    expect(woken).toEqual(['alpha', 'beta', 'alpha', 'beta'])
+    expect(buffered).toEqual([resolved('beta')])
+  })
+
+  test('hold clock advancement follows queue replay and precedes resolution, maintenance and intake', () => {
+    const started = onlyCallOf('deliveryQueue\\.start'), created = onlyCallOf('createMemoryHoldResolver')
+    expect(SERVER_CODE.slice(started, created).replace(/\s+/g, ' ').trim()).toBe(
+      'deliveryQueue.start() if (shuttingDown) return for (const key of deliveryQueue.keys()) for (const hold of deliveryQueue.unresolvedHolds(key)) threadMemory.advancePast(key, hold.arrived_at) memoryHolds =',
+    )
+    expect(created).toBeLessThan(onlyCallOf('deliveryQueue\\.startMaintenance'))
+    expect(created).toBeLessThan(onlyCallOf('createPersonaConnectionManager'))
+    expect(created).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
+    expect(mainExecutionAwaits().map(at => SERVER_CODE.slice(at, at + 70)).some(code => /(?:memoryHolds\.(resolve|retryPending)|postHolds\??\.)/.test(code))).toBe(false)
+  })
+
+  test('publication recovers joins then schedules own posts for applied personas before detached hold retries', async () => {
+    const subscription = callArguments(SERVER_CODE, onlyCallOf('subscribeThreadView'))
+    const keys = Object.values(THREAD_PERSONAS), calls: unknown[][] = []
+    const pending = Promise.withResolvers<void>()
+    for (const shuttingDown of [false, true]) {
+      const publish = expression<() => void>(subscription, {
+        shuttingDown, threadMemory: { published: () => calls.push(['published']) },
+        personaConfig: { personas: keys.map(key => ({ key })) },
+        ownPostJoins: { onSharedStatePublished: (key: string) => calls.push(['own-post', key]) },
+        ownPostLookups: { kick: (key: string) => calls.push(['lookup', key]) },
+        threadMemoryWorkAllowed: () => true,
+        deliveryQueue: { keys: () => keys }, getAppliedPersona: (key: string) => key === keys[1],
+        memoryHolds: { retryPending: (key: string) => { calls.push(['retry', key]); return pending.promise } },
+      })
+      expect(publish()).toBeUndefined()
+    }
+    expect(calls).toEqual([['published'], ...keys.flatMap(key => [['own-post', key], ['lookup', key]]), ['retry', keys[1]]])
+    pending.reject(new Error('fixture resolution failed'))
+    await createFakeClock().flush()
+  })
+
+  test('start runs the step for every key in the loop\'s own turn, and no key\'s resolution waits for another key\'s release', async () => {
+    const keys: string[] = Object.values(THREAD_PERSONAS), calls: unknown[][] = [], releases = keys.map(() => Promise.withResolvers<void>())
+    const loop = new Function('deliveryQueue', 'threadMemory', 'recoverQueuedJoins', 'postHolds', 'threadMemoryWorkAllowed', 'memoryHolds', startJoinRecoveryLoop())
+    loop({ keys: () => keys, compact: async () => {} }, {}, (key: string) => calls.push(['recover', key]),
+      { releaseUntracked: (key: string) => { calls.push(['release', key]); return releases[keys.indexOf(key)]!.promise } }, () => true,
+      { resolve: async (...args: unknown[]) => { calls.push(['resolve', ...args]); return 'resolved' } })
+    expect(calls.splice(0)).toEqual(keys.flatMap(key => [['recover', key], ['release', key]]))
+    // Each key's one start resolution, with k8's second compaction, follows its own release.
+    for (const index of [1, 0]) {
+      releases[index]!.resolve(); await createFakeClock().flush()
+      expect(calls.splice(0)).toEqual([['resolve', keys[index], 'recovered', true]])
+    }
+  })
+
+  /**
+   * The actual start step over recording holders: k8 answers `answer`, the
+   * release settles when `released` does, and the teardown fence is open unless
+   * `fence` closes it, always or only for its first reading (k8's ask).
+   */
+  function startStep(options: { answer?: MemoryHoldResult; fence?: 'closed' | 'closed for k8'; recoveryThrows?: boolean } = {}) {
+    const calls: unknown[][] = [], released = Promise.withResolvers<void>()
+    let readings = 0
+    const step = expression<(key: string, loadingTurn?: boolean) => void>(`(() => { ${serverFunction(START_RECOVERY_STEP)}\nreturn ${START_RECOVERY_STEP} })()`, {
+      deliveryQueue: { compact: async (key: string, current: () => boolean) => { calls.push(['compact', key, current()]) } },
+      threadMemory: {}, threadMemoryWorkAllowed: () => options.fence === undefined || (options.fence === 'closed for k8' && readings++ > 0),
+      recoverQueuedJoins: (key: string) => { calls.push(['recover', key]); if (options.recoveryThrows) throw new Error('fixture recovery failed') },
+      postHolds: { releaseUntracked: (key: string) => { calls.push(['release', key]); return released.promise } },
+      memoryHolds: { resolve: async (...args: unknown[]) => { calls.push(['resolve', ...args]); return options.answer ?? 'resolved' } },
+    })
+    return { calls, released, step }
+  }
+
+  test.each([['resolved', 0], ['unknown', 1], ['retrying', 0], ['cancelled', 0]] as const)('the step compacts the key itself only when k8 cannot judge: %s gives %i', async (answer, compactions) => {
+    const key = THREAD_PERSONAS.primary
+    for (const loadingTurn of [false, true]) {
+      const { calls, released, step } = startStep({ answer })
+      step(key, loadingTurn)
+      await createFakeClock().flush()
+      // Nothing is compacted before the release is saved.
+      expect(calls.filter(call => call[0] === 'compact')).toEqual([])
+      released.resolve(); await createFakeClock().flush()
+      expect(calls).toEqual([['recover', key], ['release', key], ['resolve', key, 'recovered', true], ...Array.from({ length: compactions }, () => ['compact', key, true])])
+    }
+  })
+
+  test('at start k8 resolves only once the release settles; in a loading turn it is asked after the release, before the turn returns', async () => {
+    const key = THREAD_PERSONAS.primary, start = startStep(), loading = startStep()
+    start.step(key)
+    await createFakeClock().flush()
+    expect(start.calls).toEqual([['recover', key], ['release', key]])
+    start.released.resolve(); await createFakeClock().flush()
+    expect(start.calls).toEqual([['recover', key], ['release', key], ['resolve', key, 'recovered', true]])
+    loading.step(key, true)
+    expect(loading.calls).toEqual([['recover', key], ['release', key], ['resolve', key, 'recovered', true]])
+    loading.released.resolve()
+  })
+
+  test.each([
+    ['join recovery throws', { recoveryThrows: true }, 1], ['the fence is closed', { fence: 'closed' }, 0],
+    ['the fence is closed for k8\'s ask and open by the compaction check', { fence: 'closed for k8' }, 0],
+  ] as const)('when %s, the release still runs and k8 is not asked', async (_label, options, compactions) => {
+    const key = THREAD_PERSONAS.primary
+    for (const loadingTurn of [false, true]) {
+      const { calls, released, step } = startStep(options)
+      step(key, loadingTurn)
+      released.resolve(); await createFakeClock().flush()
+      // A failed join recovery compacts the released key itself; a fence closed when k8 would be
+      // asked compacts nothing, even when it has reopened by the check (no start resolution was made).
+      expect(calls).toEqual([['recover', key], ['release', key], ...Array.from({ length: compactions }, () => ['compact', key, true])])
+    }
+  })
+
+  test('a journal loaded after start gets the start step in its loading turn, after its clock passes each unresolved hold, once start has run and never while stopping', () => {
+    const hook = onlyCallProps('createDeliveryQueue').get('onLoadedAfterStart')!
+    expect(hook).toBe(`key => { if (!queueStartRecovered || shuttingDown) return for (const hold of deliveryQueue?.unresolvedHolds(key) ?? []) threadMemory?.advancePast(key, hold.arrived_at) ${START_RECOVERY_STEP}(key, true) }`)
+    declaredOnce('queueStartRecovered')
+    expect(assignmentsTo('queueStartRecovered').map(({ value }) => value)).toEqual(['true'])
+    // Run the binding's own lines: collapsing them would join a bare `return` to the next statement.
+    const bound = indicesOf(/\bonLoadedAfterStart\s*:/g, SERVER_CODE)
+    expect(bound).toHaveLength(1)
+    expect(withinCall(bound, onlyCallOf('createDeliveryQueue'))).toBe(1)
+    const raw = SERVER_CODE.slice(SERVER_CODE.indexOf(':', bound[0]!) + 1, balancedAfter(SERVER_CODE, bound[0]!, '{', '}')[1] + 1)
+    const key = THREAD_PERSONAS.primary
+    const run = (recovered: boolean, stopping: boolean) => {
+      const calls: unknown[][] = []
+      const loaded = expression<(key: string) => void>(`(() => { ${serverFunction(START_RECOVERY_STEP)}\nreturn ${raw} })()`, {
+        queueStartRecovered: recovered, shuttingDown: stopping, threadMemoryWorkAllowed: () => true,
+        deliveryQueue: { unresolvedHolds: () => [{ arrived_at: 11 }, { arrived_at: 12 }], compact: async () => { calls.push(['compact']) } },
+        threadMemory: { advancePast: (...args: unknown[]) => { calls.push(['advance', ...args]) } },
+        recoverQueuedJoins: (k: string) => { calls.push(['recover', k]) },
+        postHolds: { releaseUntracked: (k: string) => { calls.push(['release', k]); return Promise.resolve() } },
+        memoryHolds: { resolve: async (...args: unknown[]) => { calls.push(['resolve', ...args]); return 'resolved' } },
+      })
+      loaded(key)
+      return calls
+    }
+    // Before start's own pass has run, or while stopping, the hook does nothing.
+    expect(run(false, false)).toEqual([])
+    expect(run(true, true)).toEqual([])
+    expect(run(true, false)).toEqual([['advance', key, 11], ['advance', key, 12], ['recover', key], ['release', key], ['resolve', key, 'recovered', true]])
+  })
+
+  test.each(['memoryHolds', 'postHolds', 'ownPostLookups', 'ownPostJoins'])('teardown isolates %s forget from the remaining per-key cleanup', async failed => {
+    const calls: string[] = [], key = THREAD_PERSONAS.primary
+    const error = new Error('fixture forget failed')
+    const owners = ['personaRouting', 'deliveryReporting', 'sharedStateReporting', 'deliveryPreparation', 'deliveryEngines', 'deliveryLifecycle', 'memoryHolds', 'postHolds', 'threadMemoryRetries', 'ownPostLookups', 'ownPostJoins', 'threadMemory']
+    const routing = expression<{ forget(key: string): Promise<void> }>(onlyCallProps('createPersonaLifecycle').get('routing')!, {
+      forgetPersonaState,
+      ...Object.fromEntries(owners.map(name => [name, {
+        forget: (received: string) => { expect(received).toBe(key); calls.push(name); if (name === failed) throw error },
+      }])),
+    })
+    await expect(routing.forget(key)).rejects.toBe(error)
+    expect(calls).toEqual(owners)
+  })
+
+  test('removed-key cleanup forgets both resolvers before removing memory even after lifecycle teardown fails', async () => {
+    const key = THREAD_PERSONAS.primary, calls: unknown[][] = []
+    const teardown = objectProperties(onlyCallProps('createReloadController').get('lifecycle')!).get('teardown')!
+    for (const present of [true, false]) {
+      const error = new Error('fixture teardown failed')
+      const run = expression<(persona: { key: string }) => Promise<void>>(teardown, {
+        forgetPersonaState, ownPostLookups: { forget: (key: string) => calls.push(['lookup', key]) },
+        ownPostJoins: { forget: (key: string) => calls.push(['own-post', key]) },
+        personaLifecycleOps: { teardown: async () => { throw error } },
+        personaConfig: { personas: present ? [{ key }] : [] },
+        postHolds: { forget: (key: string) => calls.push(['post-holds', key]) },
+        memoryHolds: { forget: (key: string) => calls.push(['forget', key]) },
+        threadMemoryRetries: { forget: (...args: unknown[]) => calls.push(['retries', ...args]) },
+        threadMemory: { remove: async (key: string) => { calls.push(['remove', key]) } },
+      })
+      await expect(run({ key })).rejects.toBe(error)
+    }
+    expect(calls).toEqual([['lookup', key], ['own-post', key], ['post-holds', key], ['forget', key], ['retries', key, 'removal'], ['remove', key]])
+  })
+
+  test.each(['memoryHolds', 'postHolds', 'ownPostLookups', 'ownPostJoins'])('removed-key cleanup still removes Thread Memory when %s forget throws', async failed => {
+    const key = THREAD_PERSONAS.primary, calls: unknown[][] = [], error = new Error('fixture forget failed')
+    const teardown = objectProperties(onlyCallProps('createReloadController').get('lifecycle')!).get('teardown')!
+    const run = expression<(persona: { key: string }) => Promise<void>>(teardown, {
+      forgetPersonaState,
+      ownPostLookups: { forget: (key: string) => { calls.push(['lookup', key]); if (failed === 'ownPostLookups') throw error } },
+      ownPostJoins: { forget: (key: string) => { calls.push(['own-post', key]); if (failed === 'ownPostJoins') throw error } },
+      postHolds: { forget: (key: string) => { calls.push(['post-holds', key]); if (failed === 'postHolds') throw error } },
+      personaLifecycleOps: { teardown: async () => {} }, personaConfig: { personas: [] },
+      memoryHolds: { forget: (key: string) => { calls.push(['forget', key]); if (failed === 'memoryHolds') throw error } },
+      threadMemoryRetries: { forget: (...args: unknown[]) => calls.push(['retries', ...args]) },
+      threadMemory: { remove: async (key: string) => { calls.push(['remove', key]) } },
+    })
+    await expect(run({ key })).rejects.toBe(error)
+    expect(calls).toEqual([['lookup', key], ['own-post', key], ['post-holds', key], ['forget', key], ['retries', key, 'removal'], ['remove', key]])
+  })
+
+  test('start wake and reload count read open queue work through the shared predicates', () => {
+    expect(importSource(SERVER_CODE, 'isOpenItem')).toBe('./delivery-queue.ts')
+    expect(SERVER_CODE).toContain("for (const p of personaConfig.personas) if (deliveryQueue!.items(p.key).some(i => isOpenItem(i) && i.records.some(r => r.kind === 'sent'))) deliveryEngines.wake(p.key)")
+    expect(onlyCallProps('createReloadController').get('queueOpenCount')).toBe('key => deliveryQueue?.openCount(key) ?? 0')
+  })
+
+  test('recovered releases buffered before reporting are replayed from the current queue then cleared', () => {
+    const created = onlyCallOf('createDeliveryReporting')
+    const replay = SERVER_CODE.indexOf('for (const { key, item } of bufferedHeldReleases.values())')
+    expect(replay).toBeGreaterThan(created)
+    const end = SERVER_CODE.indexOf('bufferedHeldReleases.clear()', replay) + 'bufferedHeldReleases.clear()'.length
+    expect(SERVER_CODE.slice(replay, end).replace(/\s+/g, ' ').trim()).toBe("for (const { key, item } of bufferedHeldReleases.values()) deliveryReporting.received(key, deliveryQueue.item(key, item.accepted.seq) ?? item, 'recovered') bufferedHeldReleases.clear()")
+    expect(replay).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
   })
 })
 
@@ -5788,7 +8188,8 @@ describe('typed delivery reporting production wiring', () => {
     expect(SERVER_CODE.indexOf('deliveryReporting.startupFindings')).toBeGreaterThan(created)
   })
   test('intake and engine report through the one consumer; upgrade inspection retains the per-persona scope', () => {
-    for (const factory of ['createPersonaRouting', 'createDeliveryPreparation']) expect(onlyCallProps(factory).get('onReceived')).toMatch(/deliveryReporting\?\.received\(key, item\)/)
+    expect(onlyCallProps('createDeliveryPreparation').get('onReceived')).toBe('(key, item) => deliveryReporting?.received(key, item)')
+    expect(onlyCallProps('createPersonaRouting').get('onReceived')).toBe("(key, item, mode) => { if (deliveryReporting) deliveryReporting.received(key, item, mode) else if (mode === 'recovered') bufferedHeldReleases.set(`${key}:${item.accepted.seq}`, { key, item }) }")
     const engine = onlyCallProps('createDeliveryEngines')
     expect(engine.get('onEvent')).toBe('event => deliveryEngineEvents.emit(event)')
     expect(engine.get('inspectUpgrade')).toContain('deliveryScope.run(key, client as Client, beforeCall,')
@@ -5816,20 +8217,15 @@ describe('typed delivery reporting production wiring', () => {
 })
 
 describe('production bring-up reaction recovery', () => {
-  /** Run only the actual dependency expression, never server main or a copy of
-   * its listeners. Bind all effects to the in-process fixtures below. */
-  function expression<T>(code: string, bindings: Record<string, unknown>): T {
-    const js = ts.transpileModule(`const callback = (${code});`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
-    return new Function(...Object.keys(bindings), `${js}\nreturn callback;`)(...Object.values(bindings)) as T
-  }
-
   test.each(['remove/re-add', 'destructive modification', 'startup retry'] as const)('%s restores retained queued feedback on actual client bring-up, without an extra manual recovery', async path => {
     _resetAckTracker()
     const e = await makeEngineHarness()
     e.p().row.state = 'working'
     const n = await makeDeliveryNoticeHarness({ queue: e.queue })
+    const authority = makeSharedAuthority(e.root, makePersonaConfigInput({ personas: [makePersona({ name: 'alpha' }, e.root)] }, e.root))
     const conn = makeConnectionHarness([{ name: 'alpha' }], e.root, {
-      files: true, stubOptions: { alpha: path === 'startup retry' ? { authTest: [{ kind: 'network' }] } : {} },
+      incarnationFor: key => authority.incarnation(key),
+      files: true, stubOptions: { alpha: { appId: 'A0RESTORE', ...(path === 'startup retry' ? { authTest: [{ kind: 'network' } as const] } : {}) } },
     })
     const persona = conn.p('alpha'), config = conn.config!, stub = conn.stub(persona)
     const queuedName = config.queued_ack_reaction!
@@ -5853,9 +8249,14 @@ describe('production bring-up reaction recovery', () => {
       queue: e.queue, clock: conn.clock, clientFor: conn.clientFor, resolveUserName: async (_key, user) => user,
       onReceived: (key, item) => reporting.received(key, item), wake: key => e.engine.wake(key),
     })
+    const membership = createChannelMembership({ authority, dryRun: false, log: line => conn.lines.push(line), requestReconciliation: key => scanner.request(key) })
+    const scanner = createMembershipScanner({ authority, membership, dryRun: false, connections: conn.manager, clock: conn.clock, log: line => conn.lines.push(line) })
+    const membershipStatus = membershipConnectionListener(membership, scanner, conn.manager, false)
+    const membershipReadiness = createMembershipReadiness({ authority, provenance: key => conn.manager.provenance(key), inventory: key => scanner.status(key), dryRun: false, log: line => conn.lines.push(line) })
     const bindings = {
+      membershipStatus, membershipReadiness, ownPostLookups: undefined, threadMemoryWorkAllowed: () => true,
       composePersonaStatusListeners, createPersonaUpFlushListener, personaNotifier: n.h.notifier, bringUps: controller,
-      deliveryPreparation: preparation, deliveryReporting: reporting, clientFor: conn.clientFor,
+      deliveryPreparation: preparation, deliveryReporting: reporting, sharedStateReporting: undefined, clientFor: conn.clientFor,
       personaConfig: config, appliedConfig: config, configInEffect,
     }
     conn.onStatus = expression(onlyCallProps('createPersonaConnectionManager').get('onStatus')!, bindings)
@@ -5890,6 +8291,9 @@ describe('production bring-up reaction recovery', () => {
         await controller.bringUp(persona, conn.personas)
       }
       expect(conn.manager.status(persona.key)?.state).toBe('up')
+      for (let turn = 0; turn < 5 && scanner.status(persona.key).state !== 'complete'; turn++) await conn.clock.runNext()
+      expect(membershipReadiness.read(persona.key).inventory.state).toBe('complete')
+      expect(conn.lines.filter(line => line.includes('status listener'))).toEqual([])
       expect(controller.isUp(persona.key)).toBe(true)
       expect(conn.clientFor(persona.key)).toBeDefined()
       if (path === 'startup retry') expect(launches).toEqual([persona.key])
@@ -5913,12 +8317,229 @@ describe('production bring-up reaction recovery', () => {
         adds: Array(expectedAdds).fill(queuedName), visible: [queuedName],
       })
     } finally {
+      scanner.close(); membership.close(); membershipReadiness.close()
       controller.cancelAll()
       await conn.manager.stopAll()
       await preparation.stop()
       expect(conn.clock.pendingCount()).toBe(0)
-      assertNoLeak({ lines: conn.lines, logs: n.logs, calls: stub.callLog })
+      assertNoLeak({ lines: conn.lines, logs: n.logs, calls: stub.callLog, authority: writtenFile(authority.path) })
       await n.cleanup(); await e.cleanup(); _resetAckTracker()
     }
   })
+})
+
+// Exercise only extracted production wiring, never main or reporter policy.
+describe('shared-state reporting production wiring', () => {
+  const factory = 'createSharedStateReporting'
+  const watch = 'reload\\.sharedChannels\\(\\)!\\.watch'
+
+  function mainStatements(): string[] {
+    const tree = ts.createSourceFile('main.ts', SERVER_CODE.slice(...mainBody(SERVER_CODE)), ts.ScriptTarget.Latest, true)
+    return tree.statements.map(node => node.getText(tree))
+  }
+
+  test('one reporter beside delivery reporting shares episodes, log, persona and the recovered authority', () => {
+    const at = onlyCallOf(factory), props = onlyCallProps(factory)
+    expect(importSource(SERVER_CODE, factory)).toBe('./shared-state-reports.ts')
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    expect(at).toBeGreaterThan(onlyCallOf('createDeliveryReporting'))
+    expect(at).toBeGreaterThan(onlyCallOf('createChannelMembership'))
+    expect(at).toBeLessThan(onlyCallOf('createMembershipScanner'))
+    const delivery = onlyCallProps('createDeliveryReporting')
+    for (const name of ['episodes', 'log', 'persona']) expect(props.get(name)).toBe(delivery.get(name))
+    expect(props.get('episodes')).toBe(constOf('createPersonaEpisodes'))
+    expect(props.get('authority')).toBe(onlyCallProps('createChannelMembership').get('authority'))
+    expect(props.get('membership')).toBe('channelMembership')
+    expect(props.get('mode')).toBe(objectProperties(spreadConstObject('sessionToolDeps')).get(SESSION_TOOLS_CHANNEL_MODE))
+    expect(SERVER_CODE).toMatch(/sharedStateReporting = createSharedStateReporting\(/)
+  })
+
+  test('scanner and mode adapters read holders at call time, including before the scanner exists', () => {
+    const props = onlyCallProps(factory), calls: unknown[][] = []
+    const authority = {}, membership = {}, episodes = {}
+    const adapters = expression<() => {
+      deps: SharedStateReportingDeps
+      replace(scanner: Pick<MembershipScanner, 'status' | 'ended'>, mode: 'strict' | 'open'): void
+    }>(`() => {
+      let membershipScanner;
+      let personaConfig = { channel_mode: 'strict' };
+      const deps = { ${[...props].map(([name, value]) => `${name}: ${value}`).join(',')} };
+      return { deps, replace(scanner, mode) { membershipScanner = scanner; personaConfig = { channel_mode: mode }; } };
+    }`, {
+      noticeEpisodes: episodes, channelMembership: membership, reload: { sharedChannels: () => authority }, channelModeOf,
+      getAppliedPersona: (key: string) => ({ key, name: key }), console: { error: (...args: unknown[]) => calls.push(args) },
+    })()
+    expect<object>(adapters.deps.episodes).toBe(episodes)
+    expect<object>(adapters.deps.authority).toBe(authority)
+    expect<object>(adapters.deps.membership).toBe(membership)
+    expect(adapters.deps.mode()).toBe('strict')
+    expect(adapters.deps.scanStatus(THREAD_PERSONAS.primary)).toEqual({ state: 'unverified', pages: 0, positives: 0 })
+    expect(adapters.deps.scanEnded(THREAD_PERSONAS.primary)).toBe(false)
+    for (const mode of ['open', 'strict'] as const) {
+      const status = { state: 'complete' as const, pages: 1, positives: 1 }
+      adapters.replace({
+        status: key => { calls.push(['status', mode, key]); return status },
+        ended: key => { calls.push(['ended', mode, key]); return mode === 'strict' },
+      }, mode)
+      expect(adapters.deps.mode()).toBe(mode)
+      expect(adapters.deps.scanStatus(THREAD_PERSONAS.primary)).toBe(status)
+      expect(adapters.deps.scanEnded(THREAD_PERSONAS.secondary)).toBe(mode === 'strict')
+    }
+    expect(calls).toEqual(['open', 'strict'].flatMap(mode => [
+      ['status', mode, THREAD_PERSONAS.primary], ['ended', mode, THREAD_PERSONAS.secondary],
+    ]))
+  })
+
+  test('the authority watch coalesces into a deferred full check of current configured keys and suppresses shutdown work', () => {
+    const at = onlyCallOf(watch), statements = mainStatements()
+    expect(at).toBeGreaterThan(onlyCallOf(factory))
+    expect(at).toBeLessThan(onlyCallOf('runStartBringUp'))
+    const index = statements.findIndex(code => code.startsWith('unsubscribeSharedStateReporting ='))
+    expect(index).toBeGreaterThan(0)
+    const registration = statements.slice(index - 1, index + 1).join('\n')
+    const pending: Array<() => void> = [], checks: string[][] = []
+    let listener: (() => void) | undefined
+    const unsubscribe = () => {}
+    const wiring = expression<() => { configure(keys: string[]): void; shutdown(): void; unsubscribe(): void }>(`() => {
+      let shuttingDown = false, personaConfig, unsubscribeSharedStateReporting;
+      ${registration}
+      return {
+        configure(keys) { personaConfig = { personas: keys.map(key => ({ key })) }; },
+        shutdown() { shuttingDown = true; },
+        unsubscribe: unsubscribeSharedStateReporting,
+      };
+    }`, {
+      reload: { sharedChannels: () => ({ watch: (callback: () => void) => { expect(listener).toBeUndefined(); listener = callback; return unsubscribe } }) },
+      sharedStateReporting: { checkAll: (keys: string[]) => checks.push(keys) },
+      queueMicrotask: (callback: () => void) => pending.push(callback),
+    })()
+    expect(wiring.unsubscribe).toBe(unsubscribe)
+    expect(listener).toBeDefined()
+    expect(pending).toHaveLength(0)
+    wiring.configure([THREAD_PERSONAS.primary])
+    listener!(); listener!(); listener!()
+    expect(checks).toEqual([])
+    expect(pending).toHaveLength(1)
+    wiring.configure([THREAD_PERSONAS.secondary, THREAD_PERSONAS.primary])
+    pending.shift()!()
+    expect(checks).toEqual([[THREAD_PERSONAS.secondary, THREAD_PERSONAS.primary]])
+    listener!()
+    expect(pending).toHaveLength(1)
+    pending.shift()!()
+    expect(checks).toHaveLength(2)
+    listener!()
+    expect(pending).toHaveLength(1)
+    wiring.shutdown()
+    pending.shift()!()
+    listener!()
+    expect(pending).toHaveLength(0)
+    expect(checks).toHaveLength(2)
+  })
+
+  test('scanner status and reload callbacks reach the same late-bound reporter', () => {
+    const status = onlyCallProps('createMembershipScanner').get('onStatus')
+    const failed = onlyCallProps('createReloadController').get('onApplyFailed')
+    expect(status).toBe('key => sharedStateReporting?.check(key)')
+    expect(failed).toBe('failure => sharedStateReporting?.reloadApplyFailed(failure)')
+    const applied = onlyCallProps('createReloadController').get('onApplied')!
+    expect(indicesOf(/sharedStateReporting\?\.reloadApplied\(\)/g, applied)).toHaveLength(1)
+    const calls: unknown[][] = []
+    const callbacks = expression<() => {
+      status(key: string): void; failed(value: object): void; install(): void
+    }>(`() => {
+      let sharedStateReporting;
+      return { status: (${status}), failed: (${failed}), install() { sharedStateReporting = reporter; } };
+    }`, { reporter: { check: (key: string) => calls.push(['check', key]), reloadApplyFailed: (value: unknown) => calls.push(['failed', value]) } })()
+    const failure = { record: 'authority', fingerprint: 'fixture' }
+    callbacks.status(THREAD_PERSONAS.primary); callbacks.failed(failure)
+    expect(calls).toEqual([])
+    callbacks.install()
+    callbacks.status(THREAD_PERSONAS.primary); callbacks.failed(failure)
+    expect(calls).toEqual([['check', THREAD_PERSONAS.primary], ['failed', failure]])
+  })
+
+  test.each([false, true])('startup checks all configured keys after bring-up and activates repair only when reported: %s', activated => {
+    const checkAt = onlyCallOf('sharedStateReporting\\.checkAll')
+    const repairAt = onlyCallOf('sharedStateReporting\\.repairActivated')
+    expect(checkAt).toBeGreaterThan(onlyCallOf('runStartBringUp'))
+    expect(repairAt).toBeGreaterThan(onlyCallOf('runStartBringUp'))
+    expect(checkAt).toBeLessThan(onlyCallOf('initHealthCheck'))
+    expect(atMainTopLevel(SERVER_CODE, checkAt)).toBe(true)
+    const statements = mainStatements()
+    const index = statements.findIndex(code => code.startsWith('const sharedStateKeys ='))
+    expect(index).toBeGreaterThan(0)
+    const calls: unknown[][] = [], keys = [THREAD_PERSONAS.primary, THREAD_PERSONAS.secondary]
+    expression<() => void>(`() => { ${statements.slice(index, index + 3).join('\n')} }`, {
+      personaConfig: { personas: keys.map(key => ({ key })) },
+      reload: { repairActivated: () => activated },
+      sharedStateReporting: {
+        repairActivated: (received: string[]) => calls.push(['repair', received]),
+        checkAll: (received: string[]) => calls.push(['check', received]),
+      },
+    })()
+    expect(calls).toEqual([...(activated ? [['repair', keys]] : []), ['check', keys]])
+  })
+
+  test('every delivery forget site also forgets shared reporting, and shutdown stops and unsubscribes before closing episodes', () => {
+    const routing = onlyCallProps('createPersonaLifecycle').get('routing')!
+    const deliveryForget = callsOf('deliveryReporting\\?\\.forget')
+    const sharedForget = callsOf('sharedStateReporting\\?\\.forget')
+    expect(deliveryForget).toHaveLength(1)
+    expect(sharedForget).toHaveLength(deliveryForget.length)
+    expect(routing).toContain('k => deliveryReporting?.forget(k), k => sharedStateReporting?.forget(k)')
+    const [start, end] = shutdownBody(SERVER_CODE)
+    const stop = onlyCallOf('sharedStateReporting\\?\\.stop')
+    const unsubscribe = onlyCallOf('unsubscribeSharedStateReporting\\?\\.')
+    const close = onlyCallOf('personaEpisodes\\?\\.close')
+    for (const at of [stop, unsubscribe]) {
+      expect(at).toBeGreaterThan(start)
+      expect(at).toBeLessThan(end)
+      expect(at).toBeLessThan(close)
+    }
+    expect(SERVER_CODE.slice(start, stop)).toContain('shuttingDown = true')
+    expect(SERVER_CODE.slice(unsubscribe, end)).toContain('unsubscribeSharedStateReporting = undefined')
+  })
+})
+
+describe('membership uses the recovered authority and real lifecycle/HTTP boundaries', () => {
+  test('one membership/scanner/readiness composition is wired before start, with dry run and shutdown cancellation', () => {
+    for (const name of ['createChannelMembership', 'createMembershipScanner', 'createMembershipReadiness']) {
+      const at = onlyCallOf(name)
+      expect(insideMain(at)).toBe(true)
+      expect(at).toBeLessThan(onlyCallOf('runStartBringUp'))
+      expect(onlyCallProps(name).get('authority')).toBe('reload.sharedChannels()!')
+      expect(onlyCallProps(name).get('dryRun')).toBe('isDryRun()')
+    }
+    expect(onlyCallProps('createMembershipScanner').get('connections')).toBe('manager')
+    expect(onlyCallProps('createChannelMembership').get('requestReconciliation')).toBe('key => membershipScanner?.request(key)')
+    expect(onlyCallProps('createPersonaEventRouter').get('membership')).toBe('channelMembership')
+    expect(onlyCallProps('createPersonaConnectionManager').get('incarnationFor')).toBe('key => channelDeliveryStore?.authority.incarnation(key)')
+    expect(onlyCallProps('createPersonaConnectionManager').get('canRevalidateMembership')).toBe('key => !shuttingDown && channelDeliveryStore?.isRetiring(key) === false && bringUps?.canRevalidateMembership(key) === true')
+    for (const owner of ['membershipScanner', 'channelMembership', 'membershipReadiness']) expect(SERVER_CODE).toContain(`${owner}?.close()`)
+    expect(SERVER_CODE).toContain('membershipScanner?.stop(key)')
+  })
+  test('the production HTTP route passes the actual peer address to the operator handler', () => {
+    const args = onlyCallArgs('handleMembershipReadiness')
+    expect(args).toHaveLength(3)
+    expect(args[0]).toBe('req')
+    expect(args[1]).toContain('requestIP(req)')
+    expect(args[1]).not.toContain('headers')
+    expect(args[2]).toContain('readiness: membershipReadiness')
+    expect(SERVER_CODE).toContain('MEMBERSHIP_READINESS_ROUTE')
+  })
+})
+
+
+test('only sharedAppliedConfig grants the validated replacement destination-reset exception to the config reader', () => {
+  const callbacks = srcFiles().flatMap(([file, text]) => {
+    const code = stripComments(text)
+    return [...code.matchAll(/\bresetDestination\s*:\s*persona\s*=>/g)].map(match => ({ file, at: match.index!, code }))
+  })
+  expect(callbacks).toHaveLength(1)
+  const callback = callbacks[0]!
+  expect(callback.file).toEndWith('/shared-channels.ts')
+  const start = callback.code.indexOf('export function sharedAppliedConfig(')
+  const body = callback.code.slice(start, callback.code.indexOf('export function', start + 1))
+  expect(body).toContain('resetDestination: persona => resetDestination(state, persona, deps.realpath)')
+  expect(callback.at).toBeGreaterThan(start)
 })

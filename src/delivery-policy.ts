@@ -26,6 +26,9 @@ export interface DeliveryPolicyEngine {
   recoveryAttempt?: number
 }
 export interface DeliveryPolicyKnowledge {
+  /** Unresolved holds by queue position: a Memory Hold is passed until
+   * released; a Post Hold is the FIFO head, and nothing at or behind it is selected. */
+  holds?: readonly { item: number; kind: 'memory' | 'post' }[]
   p: {
     accepted: readonly number[]; fixed: readonly number[]; sent: readonly PolicySend[]; refused: readonly number[]; delivered: readonly DeliveryPair[]
     /** Durably withdrawn, so closed without delivery. Absent means none. */
@@ -44,8 +47,17 @@ export function sameDeliveryText(a: unknown, b: unknown): boolean {
 export function hasDeliveryPair(pairs: readonly DeliveryPair[], pair: DeliveryPair): boolean { return pairs.some(p => p[0] === pair[0] && p[1] === pair[1]) }
 export function selectDeliveryTarget(k: DeliveryPolicyKnowledge): DeliveryPair {
   const withdrawn = k.p.withdrawn ?? []
+  // A release can insert earlier work. Finish the item whose durable attempt
+  // is already in flight, including across restart and between its parts.
+  const open = (item: number) => k.p.accepted.includes(item) && !withdrawn.includes(item) && !k.holds?.some(h => h.item === item && h.kind === 'memory') &&
+    Array.from({ length: k.parts?.[item] ?? (item === 1 ? k.MaxParts ?? 1 : 1) }, (_, i) => i + 1).some(part => !hasDeliveryPair(k.p.delivered, [item, part]))
+  const pending = k.writer.kind === 'sent' ? k.writer.item : undefined
+  const inFlight = k.holds === undefined ? undefined : pending !== undefined && open(pending) ? pending : k.p.sent.find((s, i) => !k.p.refused.includes(i + 1) && open(s.item))?.item
   for (const item of [...k.p.accepted].sort((a, b) => a - b)) {
     if (withdrawn.includes(item)) continue
+    if (k.holds?.some(hold => hold.item === item && hold.kind === 'memory') || (inFlight !== undefined && item !== inFlight)) continue
+    // An unresolved Post Hold is the head: it and every later item wait.
+    if (k.holds?.some(hold => hold.item === item && hold.kind === 'post')) return NO_DELIVERY_PAIR
     const count = k.parts?.[item] ?? (item === 1 ? k.MaxParts ?? 1 : 1)
     for (let part = 1; part <= count; part++) if (!hasDeliveryPair(k.p.delivered, [item, part])) return [item, part]
   }

@@ -1,6 +1,9 @@
+import { mkdtempSync } from 'node:fs'
 
-
-import { createDeliveryQueue, type QueueAccept, type QueueItem } from '../../src/delivery-queue.ts'
+import { createDeliveryQueue, type QueueAccept, type QueueItem, type DeliveryQueueOptions } from '../../src/delivery-queue.ts'
+import { createOwnPostObserver, createOwnPostJoins, ownPostChoice, ownPostEligibility, pendingOwnPostViews, type OwnPostJoins } from '../../src/own-post.ts'
+import { createPostHoldResolver, type PostHoldEvent, type PostHoldResolver, type StoredPostHold } from '../../src/post-holds.ts'
+import { createMemoryHoldResolver, type MemoryHoldEvent, type MemoryHoldMode, type MemoryHoldResolver } from '../../src/memory-holds.ts'
 import { createDeliveryPreparation, type DeliveryPreparation, type DeliveryPreparationDeps } from '../../src/delivery-intake.ts'
 import * as fs from 'node:fs'
 import { join, resolve } from 'node:path'
@@ -22,8 +25,10 @@ import {
   type ReplySettings,
 } from '../../src/config.ts'
 import { durableWriteFileSync } from '../../src/atomic-write.ts'
-import { loadChannelDeliveryStore, type ChannelDeliveryStore } from '../../src/channel-delivery.ts'
-import { createPersonaRouting, type BotToolReactionInput, type BotToolReactionIntakeResult, type PersonaRoutingDeps, type SlackAck } from '../../src/persona-routing.ts'
+import { createChannelDeliveryStore, type ChannelDeliveryStore } from '../../src/channel-delivery.ts'
+import { createSharedChannelAuthority, type SharedChannelAuthority } from '../../src/shared-channels.ts'
+import { configBytes, initialSharedState, readSharedState, sharedChannelPath } from './shared-channels.ts'
+import { createPersonaRouting, type BotToolReactionInput, type BotToolReactionIntakeResult, type PersonaRouting, type PersonaRoutingDeps, type SlackAck } from '../../src/persona-routing.ts'
 import { formatPersonaNotice, type PersonaNotifier } from '../../src/persona-notifier.ts'
 import type { PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
 import { LOST_MESSAGE_STATES, type LostMessageState } from '../../src/lost-message.ts'
@@ -49,11 +54,12 @@ import {
   type RestartDeps,
 } from '../../src/restart.ts'
 import { LIVENESS_READING_DEAD, type LivenessReading } from '../../src/liveness-reading.ts'
+import type { PersonaSerialize } from '../../src/persona-serializer.ts'
 import { KILL_OUTCOME_KILLED } from '../../src/checked-kill.ts'
 import { _resetBackoffState, isAtCap, recordFailure } from '../../src/backoff.ts'
 import { LATCH_ROW_STATE_NO_ROW, REFUSED_OPERATION_PLAIN_SPAWN } from '../../src/conflict-latch.ts'
 import { createPersonaUpPredicate } from '../../src/persona-start.ts'
-import type { PersonaConnectionStatus } from '../../src/persona-connections.ts'
+import type { PersonaConnectionStatus, PersonaEventProvenance } from '../../src/persona-connections.ts'
 import { _resetAckTracker, consumeAck } from '../../src/ack-tracker.ts'
 import {
   archiveSlackMessage,
@@ -67,10 +73,24 @@ import { isRealHome, isUnder, osTempDir } from './host-safe-env.ts'
 import { makePersonaClients, posts, type PersonaClients } from './permission-relay-harness.ts'
 import { LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage } from './credentials.ts'
 import { createFakeClock, type FakeClock } from './fake-clock.ts'
+import { durableIo, type DurableIo } from './durable-io.ts'
 import { makeNotifierStack } from './persona-notifier.ts'
 import { errTmuxUnresponsive } from './agent-director-stub.ts'
 import { PHASE1_RC_VERSION } from './agent-director-versions.ts'
 import { conflictForPersona } from './conflict-cases.ts'
+import { makeThreadMemoryHarness, type ThreadMemoryHarness, type ThreadHarnessOptions } from './thread-memory.ts'
+import { eligibleMembership } from './fungible-decision.ts'
+
+/** Explicit observations for tests of queue/recovery behavior. This projection
+ * is deliberately separate from configured choices; production membership
+ * composition tests use makeMembershipHarness instead. */
+export function observedMembership(channels: Readonly<Record<string, readonly string[]>>): NonNullable<PersonaRoutingDeps['membership']> {
+  return {
+    read: (key, channel) => channels[key]?.includes(channel) ? eligibleMembership(key) : { kind: 'ineligible', reason: 'absent' },
+    hasUnresolved: () => false,
+    request: () => {},
+  }
+}
 
 /** Default restart delay (seconds): the restart timer fires within a few ms. */
 export const FAST_RESTART_DELAY_S = 0.005
@@ -381,6 +401,8 @@ export interface RestartFakeOptions {
   restartDelayS?: number | (() => number)
   /** Replaces the launch outcome (default: resolves true). Called after the launch is recorded. */
   launchSession?: (key: string, cwd: string, sessionId?: string) => Promise<boolean>
+  /** The restart work's per-persona serializer (`RestartDeps.serialize`); absent, the work runs at once. */
+  serialize?: PersonaSerialize
 }
 
 /** What `makeRestartDeps` adds to the restart deps: its captures and its in-flight query. */
@@ -431,6 +453,7 @@ export function makeRestartDeps(opts: RestartFakeOptions = {}): RestartDeps & Re
     getRestartDelay: () => (typeof delay === 'function' ? delay() : delay),
     isShuttingDown: () => false,
     onCapReached: () => {},
+    ...(opts.serialize === undefined ? {} : { serialize: opts.serialize }),
   }
 }
 
@@ -449,6 +472,8 @@ export interface PersonaHandle {
 }
 
 export interface RoutingHarnessOptions {
+  /** Caller-supplied current observations, never inferred from configuration. */
+  membership?: PersonaRoutingDeps['membership']
   /** Names with a registered session; default every persona. */
   sessions?: readonly string[]
   /** Names whose registered session has lost its `_GET_stream`. */
@@ -475,6 +500,8 @@ export interface RoutingHarnessOptions {
   restartDelayS?: number
   /** Replaces the restart deps' launch outcome, e.g. a promise held open. */
   launchSession?: RestartFakeOptions['launchSession']
+  /** The restart deps' serializer (see `RestartFakeOptions.serialize`). */
+  serialize?: RestartFakeOptions['serialize']
   /** Clock for the per-persona dedupe stores (e.g. a fake clock's `now`); default the module's (`Date.now`). */
   dedupeClock?: () => number
   /** Replaces the routing's `notify` (default: the real notifier, `h.notifier.notify`); calls are still recorded in `h.notices`. */
@@ -539,14 +566,35 @@ export interface RoutingHarnessOptions {
    * mode.
    */
   mode?: ChannelMode
-  /**
-   * Per-name fungible destinations: each
-   * named persona's `invited.permission_prompts` (`"dm"` or a channel ID),
-   * set on its spec, so `h.config` holds it in fungible mode and the
-   * decision's fungible destinations and the notifier read it there. Absent:
-   * a spec's own `invited`, else none (`dm` in fungible mode).
-   */
-  fungibleDestinations?: Readonly<Record<string, string>>
+  /** Opt in to real Thread Memory over the same shared authority as routing. */
+  threadMemory?: {
+    fs?: ThreadHarnessOptions['fs']
+    /** Exercise the unresolved-store boundary when the joins dependency is absent. */
+    joins?: false
+    onHoldStored?: PersonaRoutingDeps['onHoldStored']
+    /** Routing's receipt clock: a fake clock's `now`, never the wall clock. Each reading adds `monotonic` to `h.order`. */
+    monotonicNow?: () => number
+    /**
+     * Give routing a recording `postHolds` (`h.heldPostHolds`, `held:<key>` in
+     * `h.order`). It tracks nothing, so it releases the outcome retention it is
+     * handed; `'throw'` throws after recording, leaving routing to release it.
+     */
+    postHolds?: 'record' | 'throw'
+    /**
+     * Compose the production Post Hold and Memory Hold resolvers as server.ts
+     * does (`h.resolvers`), replacing `monotonicNow` and `postHolds`: over this
+     * harness's queue, Thread Memory and own-post owner, with routing's
+     * `releaseHeld` as their release, the owner's events checking the Post Hold
+     * resolver, and both hold owners notified on `onHoldStored`. Their clock is
+     * `h.resolvers.clock`; the harness's `threads.close()`/`crash()` stops them.
+     */
+    resolvers?: true
+  }
+  /** Queue I/O and event seams; all paths remain under baseDir. */
+  queueOptions?: Pick<DeliveryQueueOptions, 'fs' | 'onEvent'>
+  onReceived?: PersonaRoutingDeps['onReceived']
+  /** Passed to the routing unchanged. Absent, as by default: no own-message hook. */
+  onOwnMessage?: PersonaRoutingDeps['onOwnMessage']
   /**
    * Load the stored-choice store the routing reads (`h.channelDelivery`
    * ) over the caller's state directory (see
@@ -579,6 +627,8 @@ export interface RoutingHarnessOptions {
 
 /** The stored-choice store a routing harness loads. */
 export interface RoutingChannelDeliveryOptions {
+  /** Reuse a membership fixture's live authority, including its publications. */
+  authority?: SharedChannelAuthority
   /**
    * The caller's own `mkdtempSync` state directory, under the OS temp
    * directory, holding the stored-choice file (seeded beforehand with
@@ -619,6 +669,30 @@ export interface RaisedNotice {
   text: string
 }
 
+/** The opt-in production hold resolvers (`threadMemory.resolvers`), as server.ts composes them. */
+export interface RoutingHoldResolvers {
+  /**
+   * The hold clock: routing's receipt reading (`monotonic` in `h.order`) and
+   * both resolvers' timers, as HOLD_CLOCK. Its flush waits for the queue's and
+   * Thread Memory's disk work. Decision times are Thread Memory's clock.
+   */
+  clock: FakeClock
+  post: PostHoldResolver
+  memory: MemoryHoldResolver
+  postEvents: PostHoldEvent[]
+  memoryEvents: MemoryHoldEvent[]
+  /** Each release a resolver fed back through routing's `releaseHeld`, in order. */
+  releases: Array<{ owner: 'post' | 'memory'; key: string; seq: number; mode: MemoryHoldMode }>
+}
+
+/** One `held` call routing made on the opt-in recording `postHolds` or production resolvers. */
+export interface HeldPostHoldCall {
+  key: string
+  hold: StoredPostHold
+  /** No microtask had run since the key's queue `stored` event: the call ran in its store's own turn. */
+  storeTurn: boolean
+}
+
 /** One captured `chat.postMessage`, tagged with the key of the persona whose stub made it. */
 export interface HarnessPost {
   key: string
@@ -627,7 +701,28 @@ export interface HarnessPost {
 }
 
 export interface RoutingHarness {
+  threads?: ThreadMemoryHarness
+  threadMemoryReads: Array<[string, string, string]>
+  /** Every Pending Own Posts read the opt-in Thread Memory wiring answered, in order. */
+  pendingOwnPostReads: Array<[string, string]>
+  /** Resolver notifications, recorded only by the opt-in Thread Memory wiring. */
+  holdStored: string[]
+  /** Each `held` call of the opt-in recording `postHolds` or production resolvers, in order. */
+  heldPostHolds: HeldPostHoldCall[]
+  /** The one own-post owner the opt-in Thread Memory wiring builds; its `operation` views show which outcomes stay retained. */
+  readonly ownPostJoins: OwnPostJoins | undefined
+  /** The opt-in production hold resolvers (`threadMemory.resolvers`). */
+  resolvers?: RoutingHoldResolvers
+  releaseHeld: PersonaRouting['releaseHeld']
+  /** Preparation requests made by opt-in routing, including requests the preparer refuses. */
+  preparationCalls: Array<{ key: string; seq: number }>
+  /** Hold the routing's detached saves for one persona; release before cleanup. */
+  holdJoinSaves(key: string): () => void
+  settleJoinSaves(): Promise<void>
+  ready(): Promise<void>
   queue: ReturnType<typeof createDeliveryQueue>
+  /** Tracks the queue's disk waits; the opt-in Thread Memory clock's flush settles on it. */
+  queueIo: DurableIo
   queued(name: string): QueueItem[]
   /** The applied config the routing reads at call time; set to null for none, or edit it. */
   config: PersonaConfig | null
@@ -637,7 +732,7 @@ export interface RoutingHarness {
   clients: PersonaClients
   /** Lines from the module's log seam. */
   logs: string[]
-  /** Ordered markers: `ack`, `archive:<key>`, `config`, `identity:<key>`. */
+  /** Ordered markers: `ack`, `archive:<key>`, `config`, `identity:<key>`; with Thread Memory, `hold-stored:<key>`, and with its Post Hold options `monotonic` and `held:<key>`. */
   order: string[]
   /** Launches the restart module issued. */
   launches: LaunchCall[]
@@ -691,13 +786,15 @@ export interface RoutingHarness {
    * Feed one event to the named personas (default: all), with a recording ack
    * unless `ack` is given, and the envelope flag an envelope with `envelope`
    * overrides carries (`envelopeFlagOf`, default `false`; one
-   * of `ENVELOPE_FLAG_FORMS` for each form).
+   * of `ENVELOPE_FLAG_FORMS` for each form), and `provenance` passed to
+   * routing unchanged (default none).
    */
   receive(
     event: unknown,
     names?: readonly string[],
     ack?: () => Promise<void> | void,
     envelope?: EnvelopeOverrides,
+    provenance?: PersonaEventProvenance,
   ): Promise<void>
   /** Feed one event to raw persona keys, with a recording ack and the envelope flag as `receive` gives it. */
   receiveKeys(event: unknown, keys: readonly string[], envelope?: EnvelopeOverrides): Promise<void>
@@ -745,6 +842,8 @@ export interface RoutingHarness {
    * returned; rejects when the tool reports an error.
    */
   reply(name: string, args: Record<string, unknown>): Promise<void>
+  /** Results from the real reply tool, including errors, in completion order. */
+  replyResults: Array<Awaited<ReturnType<Client['callTool']>>>
   /**
    * Feed one reaction event to the named persona's reaction intake once the
    * queue is ready, with a recording ack unless `ack` is given and the
@@ -784,21 +883,11 @@ export function makeRoutingHarness(
   opts: RoutingHarnessOptions = {},
 ): RoutingHarness {
   if (opts.channelDelivery !== undefined) requireTempStateDir(opts.channelDelivery.stateDir)
-  // Each persona's fungible destination set on its spec, by the name the
-  // builders give it, so the one configuration holds it.
-  const builtNames = makeMultiPersonaConfig(specs, baseDir, opts.overrides).personas.map((p) => p.name)
-  for (const name of Object.keys(opts.fungibleDestinations ?? {})) {
-    if (!builtNames.includes(name)) throw new Error(`no persona ${name}`)
-  }
-  const configSpecs: PersonaSpec[] = specs.map((spec, i) => {
-    const destination = opts.fungibleDestinations?.[builtNames[i]!]
-    return destination === undefined ? spec : { ...spec, invited: { ...spec.invited, permission_prompts: destination } }
-  })
   /** The configuration under `mode`'s switch, or the switch `overrides` sets when no mode is given. */
   const configIn = (mode: ChannelMode | undefined): PersonaConfig =>
-    makeMultiPersonaConfig(configSpecs, baseDir, {
+    makeMultiPersonaConfig(specs, baseDir, {
       ...opts.overrides,
-      ...(mode === undefined ? {} : { allow_invited_channels: mode === 'fungible' }),
+      ...(mode === undefined ? {} : { channel_mode: mode }),
     })
   const config = configIn(opts.mode)
   const handles = config.personas.map((persona): PersonaHandle => ({
@@ -853,6 +942,7 @@ export function makeRoutingHarness(
   const restartDeps = makeRestartDeps({
     restartDelayS: () => h.restartDelayS,
     launchSession: opts.launchSession ?? (opts.holdLaunches === true ? holdLaunch : undefined),
+    serialize: opts.serialize,
   })
 
   // The up check, as main() builds it: a connection that serves for every
@@ -898,11 +988,15 @@ export function makeRoutingHarness(
   const log = (line: string): void => { h.logs.push(line); opts.logHook?.(line) }
   const getPersona = (key: string): Persona | undefined => h.config?.personas.find((p) => p.key === key)
   const webClientFor = (key: string) => clients.clientFor(key) as unknown as WebClient | undefined
+  // As server.ts: one observer reads the owner built over this harness's memory.
+  let ownPostJoins: OwnPostJoins | undefined
+  const ownPosts = createOwnPostObserver(() => ownPostJoins)
   const { notifier, hold, clock: holdClock } = makeNotifierStack({
     getPersona,
     clientFor: webClientFor,
     getPersonaConfig: () => h.config,
     log,
+    ownPosts,
   })
   // The one reply settings source for the inbound ack step and `h.reply`, as server.ts.
   const getReplySettings = (): ReplySettings => ({ ...replySettingsOf(null), ack_reaction: opts.ackReaction })
@@ -910,6 +1004,7 @@ export function makeRoutingHarness(
   async function reply(name: string, args: Record<string, unknown>): Promise<void> {
     const { persona } = byName(name)
     const deps: SessionToolDeps = {
+      log: line => h.logs.push(line),
       assertSendable: () => {},
       getReplySettings,
       getPersona,
@@ -917,6 +1012,7 @@ export function makeRoutingHarness(
       inboxDir: join(baseDir, 'inbox'),
       resolveUserName: async (_key, userId) => userId,
       consumeAck,
+      ownPosts,
       serverPort: 0,
       // The mode of the configuration in effect, read on every call from
       // `h.config` as src/server.ts reads it.
@@ -936,7 +1032,8 @@ export function makeRoutingHarness(
     const client = new Client({ name: 'routing-harness-reply', version: '1.0.0' }, { capabilities: {} })
     await client.connect(clientTransport)
     try {
-      const result = (await client.callTool({ name: 'reply', arguments: args })) as { isError?: boolean }
+      const result = await client.callTool({ name: 'reply', arguments: args })
+      h.replyResults.push(result)
       if (result.isError) throw new Error(`reply as ${name} reported an error`)
     } finally {
       await client.close()
@@ -944,11 +1041,43 @@ export function makeRoutingHarness(
   }
 
   const queueFaults: RoutingHarness['queueFaults'] = {}
-  const queueFs = { ...fs, fsyncSync(fd: number) { if (queueFaults.fileSync && fs.fstatSync(fd).isFile()) queueFaults.fileSync(); fs.fsyncSync(fd) } }
-  const queue = opts.queue ?? createDeliveryQueue({ stateDir: baseDir, now: opts.dedupeClock, fs: queueFs })
+  // With a `postHolds` bound, a key's store turn lasts until the next microtask after its `stored` event.
+  const storeTurns = new Set<string>()
+  const registers = opts.threadMemory?.postHolds !== undefined || opts.threadMemory?.resolvers === true
+  const queueOptions: RoutingHarnessOptions['queueOptions'] = !registers ? opts.queueOptions : {
+    ...opts.queueOptions,
+    onEvent: event => {
+      if (event.type === 'stored') { storeTurns.add(event.key); queueMicrotask(() => { storeTurns.delete(event.key) }) }
+      opts.queueOptions?.onEvent?.(event)
+    },
+  }
+  // `queueFaults.fileSync` runs before each fsync of a regular queue file, never the directory's.
+  const queueIo = durableIo({
+    base: queueOptions?.fs,
+    before: step => { if (step.op === 'fsync' && step.fd !== undefined && queueFaults.fileSync && fs.fstatSync(step.fd).isFile()) queueFaults.fileSync() },
+  })
+  const queue = opts.queue ?? createDeliveryQueue({ stateDir: baseDir, now: opts.dedupeClock, ...queueOptions, fs: queueIo.fs })
+  const joinSaveHolds = new Map<string, Promise<void>>()
+  const joinSaves: Promise<unknown>[] = []
   const queueReady = opts.queue === undefined ? queue.start() : Promise.resolve()
   const h: RoutingHarness = {
     queue,
+    queueIo,
+    threadMemoryReads: [],
+    pendingOwnPostReads: [],
+    holdStored: [],
+    heldPostHolds: [],
+    get ownPostJoins() { return ownPostJoins },
+    releaseHeld: (key, item, mode) => routing.releaseHeld(key, item, mode),
+    preparationCalls: [],
+    holdJoinSaves(key) {
+      if (joinSaveHolds.has(key)) throw new Error('join saves already held')
+      let release!: () => void
+      joinSaveHolds.set(key, new Promise<void>(resolve => { release = resolve }))
+      return () => { joinSaveHolds.delete(key); release() }
+    },
+    settleJoinSaves: async () => { await Promise.all(joinSaves) },
+    ready: async () => { await queueReady; await threadReady },
     queued: name => queue.items(byName(name).persona.key),
     config,
     p: byName,
@@ -984,19 +1113,20 @@ export function makeRoutingHarness(
     retryArmed: keySet(opts.retryArmed ?? config.personas.map((p) => p.name)),
     restartDelayS: opts.restartDelayS ?? FAST_RESTART_DELAY_S,
     archiveWrites: [],
-    receive: async (event, names, ack, envelope) => { await queueReady; return routing.receive(
+    receive: async (event, names, ack, envelope, provenance) => { await h.ready(); return routing.receive(
       event,
       ack ?? (() => { h.order.push('ack') }),
       h.keys(names ?? handles.map((x) => x.persona.name)),
       envelopeFlagOf(envelope),
+      provenance,
     ) },
-    receiveKeys: async (event, keys, envelope) => { await queueReady; return routing.receive(event, () => { h.order.push('ack') }, keys, envelopeFlagOf(envelope)) },
+    receiveKeys: async (event, keys, envelope) => { await h.ready(); return routing.receive(event, () => { h.order.push('ack') }, keys, envelopeFlagOf(envelope)) },
     receiveReaction: async (event, name, ack, envelope) => {
-      await queueReady
+      await h.ready()
       return routing.receiveReaction(event, ack ?? (() => { h.order.push('ack') }), byName(name).persona.key, envelopeFlagOf(envelope))
     },
     receiveBotToolReaction: async (name, input) => {
-      await queueReady
+      await h.ready()
       return routing.receiveBotToolReaction(byName(name).persona.key, input)
     },
     get preparation() { return preparation },
@@ -1010,7 +1140,11 @@ export function makeRoutingHarness(
     channelDelivery: null,
     channelDeliveryWrites: [],
     heardChannels: (key) => routing.heardChannels(key),
-    forget: (key) => routing.forget(key),
+    forget: (key) => {
+      try { ownPostJoins?.forget(key) } finally {
+        try { h.resolvers?.post.forget(key); h.resolvers?.memory.forget(key) } finally { routing.forget(key) }
+      }
+    },
     keys: (names) => names.map((n) => byName(n).persona.key),
     registerFor: (name, reg) => {
       const session = registerFor(name, reg)
@@ -1027,7 +1161,9 @@ export function makeRoutingHarness(
     notices: [],
     noticeText: (name, body) => formatPersonaNotice(byName(name).persona, body),
     reply,
+    replyResults: [],
     captured: () => ({
+      replyResults: h.replyResults,
       logs: h.logs,
       calls: Object.fromEntries(handles.map((x) => [x.persona.name, x.stub.calls])),
       notifications: [...handles.map((x) => x.notifications), ...extraNotifications],
@@ -1035,6 +1171,7 @@ export function makeRoutingHarness(
       notices: h.notices,
       episodeNotices: h.episodeNotices,
       outageNotices: h.outageNotices,
+      holdEvents: [h.resolvers?.postEvents ?? [], h.resolvers?.memoryEvents ?? []],
     }),
   }
 
@@ -1060,25 +1197,161 @@ export function makeRoutingHarness(
     }
   // The stored-choice store, loaded once as main loads it,
   // its lines in `h.logs` and each write recorded before it is made.
-  if (opts.channelDelivery !== undefined) {
-    h.channelDelivery = loadChannelDeliveryStore(opts.channelDelivery.stateDir, {
-      log,
-      ...(opts.channelDelivery.unreadable === true ? { readFs: UNREADABLE_STORE_FS } : {}),
-      write: (path, bytes) => {
-        h.channelDeliveryWrites.push(path)
-        durableWriteFileSync(path, bytes)
-      },
-    })
+  {
+    const stateDir = opts.channelDelivery?.stateDir ?? mkdtempSync(join(baseDir, 'routing-authority-'))
+    const raw = { ...config, personas: config.personas.map(({ index, key, ...persona }) => persona) }
+    const state = readSharedState(stateDir) ?? initialSharedState(stateDir, raw)
+    h.channelDelivery = createChannelDeliveryStore(opts.channelDelivery?.authority ?? createSharedChannelAuthority(sharedChannelPath(stateDir), state, {
+      write(path, bytes) { h.channelDeliveryWrites.push(path); durableWriteFileSync(path, bytes) },
+    }))
+    h.channelDelivery.authority.subscribe(next => { h.config = next })
   }
+
+  if (opts.threadMemory !== undefined) h.threads = makeThreadMemoryHarness(baseDir, {
+    authority: h.channelDelivery!.authority,
+    fs: opts.threadMemory.fs,
+    // Query at use time: unresolvedHolds includes a decided hold whose store
+    // is still in flight, not just the accepted items visible in the queue.
+    heldStamps: key => queue.unresolvedHolds(key).filter(hold => hold.memoryDependent).map(hold => ({ channel: hold.channel, stamp: hold.stamp })),
+  })
+  h.threads?.clock.settleOn(queueIo)
+  const threadReady = h.threads?.start()
+  if (h.threads) {
+    const ownPostSources = {
+      config: () => h.config,
+      persona: getPersona,
+      choices: () => h.channelDelivery ?? undefined,
+      membership: (key: string, channel: string, mode: ChannelMode) => opts.membership?.read(key, channel, mode),
+    }
+    ownPostJoins = createOwnPostJoins({
+      memory: h.threads.memory,
+      lookupSlackKey: (key, slackKey) => queue.lookupSlackKey(key, slackKey),
+      choice: ownPostChoice(ownPostSources),
+      eligibility: ownPostEligibility(ownPostSources),
+      now: Date.now,
+      operationId: () => crypto.randomUUID(),
+      isDryRun: () => false,
+    })
+    const unsubscribe = h.channelDelivery!.authority.subscribeThreadView(() => {
+      for (const persona of h.config?.personas ?? []) ownPostJoins?.onSharedStatePublished(persona.key)
+    })
+    const unsubscribeHolds = opts.threadMemory?.resolvers === true ? composeResolvers(h.threads, ownPostJoins) : undefined
+    for (const method of ['close', 'crash'] as const) {
+      const closeMemory = h.threads[method]
+      h.threads[method] = async () => {
+        h.resolvers?.memory.stop(); h.resolvers?.post.stop(); unsubscribeHolds?.()
+        ownPostJoins?.stop(); unsubscribe(); await closeMemory()
+      }
+    }
+  }
+
+  /**
+   * As main() builds them: one Memory Hold resolver and one Post Hold
+   * resolver over the same queue, memory and owner, releasing through
+   * routing (read at call time), parked holds handed to k8, and one owner
+   * subscription that only checks each event's key. Returns that unsubscribe.
+   */
+  function composeResolvers(threads: ThreadMemoryHarness, owner: OwnPostJoins): () => void {
+    const clock = createFakeClock()
+    clock.settleOn(queueIo); clock.settleOn(threads.io.durable)
+    const resolvers: RoutingHoldResolvers = {
+      clock, postEvents: [], memoryEvents: [], releases: [],
+      memory: undefined as unknown as MemoryHoldResolver, post: undefined as unknown as PostHoldResolver,
+    }
+    const release = (from: 'post' | 'memory') => (key: string, item: QueueItem, mode: MemoryHoldMode) => {
+      resolvers.releases.push({ owner: from, key, seq: item.accepted.seq, mode })
+      return routing.releaseHeld(key, item, mode)
+    }
+    resolvers.memory = createMemoryHoldResolver({
+      queue, memory: threads.memory, release: release('memory'), now: threads.clock.now, clock,
+      onEvent: event => { resolvers.memoryEvents.push(event) },
+    })
+    resolvers.post = createPostHoldResolver({
+      queue, owner, release: release('post'), onParked: key => resolveMemoryHolds(key),
+      clock, decisionNow: threads.clock.now,
+      onEvent: event => { resolvers.postEvents.push(event) },
+    })
+    h.resolvers = resolvers
+    return owner.subscribe(event => resolvers.post.check(event.key))
+  }
+  /** server.ts's resolveMemoryHolds: an applied persona's live resolution. */
+  function resolveMemoryHolds(key: string): Promise<unknown> {
+    return getPersona(key) ? h.resolvers?.memory.resolve(key, 'live') ?? Promise.resolve() : Promise.resolve()
+  }
+
+  // Routing's receipt reading: the resolvers' hold clock, as main() binds HOLD_CLOCK, else the case's own.
+  const receiptNow = h.resolvers ? h.resolvers.clock.now : opts.threadMemory?.monotonicNow
   const preparation = createDeliveryPreparation({ queue, clock: opts.preparationClock, clientFor: webClientFor, resolveUserName: opts.resolveUserName ?? resolveUserName })
   const routing = createPersonaRouting({
+    membership: opts.membership,
+    threadMemory: opts.threadMemory === undefined ? undefined : (key, channel, root) => {
+      h.threadMemoryReads.push([key, channel, root])
+      ownPostJoins?.settleDeferred(key, channel)
+      return h.threads!.memory.view(key, channel, root)
+    },
+    // As server.ts: the one owner's in-memory posts through the production mapping; none before it exists.
+    pendingOwnPosts: opts.threadMemory === undefined ? undefined : (key, channel) => {
+      h.pendingOwnPostReads.push([key, channel])
+      return pendingOwnPostViews(ownPostJoins?.pendingOwnPosts(key, channel) ?? [])
+    },
+    threadStampUndecided: opts.threadMemory === undefined ? undefined :
+      (key, channel) => h.channelDelivery?.authority.channelStamp(key, channel)?.kind === 'undecided',
+    joins: opts.threadMemory === undefined || opts.threadMemory.joins === false ? undefined : {
+      stamp: (key, channel) => h.channelDelivery?.authority.channelStamp(key, channel),
+      hasSavedJoin: (key, channel, root, stamp) => h.threads!.memory.hasSavedJoin(key, channel, root, stamp),
+      clock: key => h.threads!.memory.clock(key),
+      addJoin: (key, fact) => h.threads!.memory.addJoin(key, fact),
+      saveJoins: (key, facts) => {
+        h.order.push(`save-join:${key}`)
+        const hold = joinSaveHolds.get(key)
+        const saved = hold ? hold.then(() => h.threads!.memory.saveJoins(key, facts)) : h.threads!.memory.saveJoins(key, facts)
+        joinSaves.push(saved)
+        return saved
+      },
+    },
+    // Post Hold registration, each opt-in: production binds the hold clock's `now` and the resolver's `held`.
+    monotonicNow: receiptNow === undefined ? undefined : () => {
+      h.order.push('monotonic')
+      return receiptNow()
+    },
+    postHolds: !registers ? undefined : { held: (key, hold, retention) => {
+      h.heldPostHolds.push({ key, hold: structuredClone(hold), storeTurn: storeTurns.has(key) })
+      h.order.push(`held:${key}`)
+      if (opts.threadMemory?.postHolds === 'throw') throw new Error('recording postHolds: held throws')
+      // The resolver takes the decision's retention; the recorder tracks nothing and releases it.
+      if (h.resolvers) h.resolvers.post.held(key, hold, retention)
+      else retention()
+    } },
+    // As server.ts binds it: the same owner that answers pendingOwnPosts.
+    retainOwnPostOutcomes: opts.threadMemory === undefined ? undefined : (key, operationIds) => ownPostJoins?.retainOutcomes(key, operationIds) ?? (() => {}),
+    onHoldStored: opts.threadMemory === undefined ? undefined : key => {
+      h.holdStored.push(key)
+      h.order.push(`hold-stored:${key}`)
+      // As server.ts: both hold owners, each isolated, then the case's own hook.
+      if (h.resolvers) {
+        try { void resolveMemoryHolds(key).catch(() => {}) } catch { /* independent hold owners */ }
+        try { h.resolvers.post.check(key) } catch { /* independent hold owners */ }
+      }
+      return opts.threadMemory?.onHoldStored?.(key)
+    },
+    onReceived: (key, item, mode) => {
+      h.received.push({ key, seq: item.accepted.seq })
+      return opts.onReceived?.(key, item, mode)
+    },
+    onOwnMessage: opts.onOwnMessage,
     queue: opts.wrapAccept === undefined && opts.wrapLookupReactionKey === undefined ? queue : {
       lookupSlackKey: queue.lookupSlackKey,
       lookupReactionKey: opts.wrapLookupReactionKey?.(queue.lookupReactionKey) ?? queue.lookupReactionKey,
       accept: opts.wrapAccept?.(queue.accept) ?? queue.accept,
+      acceptDecided: queue.acceptDecided,
     },
-    prepare: opts.wrapPrepare?.(preparation.prepare) ?? preparation.prepare,
-    onReceived: (key, item) => { h.received.push({ key, seq: item.accepted.seq }) },
+    prepare: (() => {
+      const prepare = opts.wrapPrepare?.(preparation.prepare) ?? preparation.prepare
+      return opts.threadMemory === undefined ? prepare : (key: string, item: QueueItem) => {
+        h.preparationCalls.push({ key, seq: item.accepted.seq })
+        return prepare(key, item)
+      }
+    })(),
     ...(opts.isRunBotIdentity === undefined ? {} : {
       isRunBotIdentity: (id: string) => {
         h.runBotAsks.push(id)

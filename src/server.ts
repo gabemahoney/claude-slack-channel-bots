@@ -52,6 +52,13 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { createThreadMemory, type ThreadMemory, type ThreadMemoryEvent } from './thread-memory.ts'
+import { createThreadMemoryRetries, type ThreadMemoryRetries, type ThreadMemoryRetryEvent } from './thread-memory-retry.ts'
+import { createThreadMemoryReporting, buildThreadMemorySealNotSavedLine } from './thread-memory-reports.ts'
+import { createMemoryHoldResolver, type MemoryHoldResolver, type MemoryHoldEvent } from './memory-holds.ts'
+import { createPostHoldResolver, type PostHoldResolver, type PostHoldClock, type PostHoldResolverDeps } from './post-holds.ts'
+import { recoverQueuedJoins } from './thread-join-recovery.ts'
+import { createThreadMemorySeal, type ThreadMemorySeal, type ThreadMemorySealEvent } from './thread-memory-seal.ts'
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
 import { prepareBotSystemPrompt, botSystemPromptPath } from './bot-system-prompt.ts'
 import { scrubProcessEnv } from './child-env.ts'
@@ -62,7 +69,7 @@ import { setDeliveryLifecycle, setDeliveryPersonaLookup, inspectPersonaUpgrade, 
 import type { WebClient } from '@slack/web-api'
 import { join, resolve } from 'path'
 import { fileURLToPath } from 'url'
-import { mkdirSync, promises as fsPromises } from 'fs'
+import { appendFileSync, mkdirSync, promises as fsPromises } from 'fs'
 import { assertSendable as libAssertSendable } from './lib.ts'
 import {
   expandTilde,
@@ -76,6 +83,7 @@ import {
   replySettingsOf,
   agentDirectorCallTimeoutMsOf,
   channelModeOf,
+  type ChannelMode,
   type ServerSettings,
   MCP_SERVER_NAME,
 } from './config.ts'
@@ -204,9 +212,12 @@ import { createPersonaDestinations } from './persona-destination.ts'
 import { createPersonaDestinationHold } from './persona-destination-hold.ts'
 import { createSlowRecoveryTracker } from './slow-recovery.ts'
 import { createDeliveryReporting } from './delivery-notices.ts'
+import { createSharedStateReporting } from './shared-state-reports.ts'
 import { buildDeliveryDiagnostic, buildQueuedMessageRetryLine, SYSTEM_PROMPT_UNWRITABLE, queueErrorCode } from './persona-diagnostics.ts'
-import { createPersonaRouting } from './persona-routing.ts'
-import { createDeliveryQueue, isQueueItemClosed, type ReplyReminderQueue, type QueueEvent } from './delivery-queue.ts'
+import { createPersonaRouting, type AckTiming } from './persona-routing.ts'
+import { createDeliveryQueue, isOpenItem, type ReplyReminderQueue, type QueueEvent, type QueueItem } from './delivery-queue.ts'
+import { createOwnPostObserver, createOwnPostJoins, ownPostChoice, ownPostEligibility, ownPostStampState, pendingOwnPostViews, type OwnPostJoins } from './own-post.ts'
+import { createOwnPostLookups, type OwnPostLookups, type OwnPostLookupEvent } from './own-post-lookup.ts'
 import { createReplyReminders, type ReplyReminders } from './reply-reminder.ts'
 import { createDeliveryPreparation, type DeliveryPreparation } from './delivery-intake.ts'
 import { createReactHandoff } from './react-handoff.ts'
@@ -227,6 +238,9 @@ import { resolveSlackApiUrlOverride } from './persona-slack-clients.ts'
 import { createUnhandledRejectionHandler, describeThrownValue, renderLogMessageText } from './persona-connection-errors.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
 import { createPersonaEventRouter } from './persona-event-router.ts'
+import { createChannelMembership, type ChannelMembership } from './channel-membership.ts'
+import { createMembershipScanner, membershipConnectionListener, type MembershipScanner } from './channel-membership-scan.ts'
+import { createMembershipReadiness, handleMembershipReadiness, MEMBERSHIP_READINESS_ROUTE, type MembershipReadiness } from './channel-membership-readiness.ts'
 import {
   composePersonaStatusListeners,
   createPersonaClientLookup,
@@ -242,7 +256,7 @@ import {
   type PersonaBringUpController,
 } from './persona-bringup-controller.ts'
 import { createPersonaSerializer } from './persona-serializer.ts'
-import { createPersonaLifecycle, type PersonaLifecycle } from './persona-lifecycle.ts'
+import { forgetPersonaState, createPersonaLifecycle, type PersonaLifecycle } from './persona-lifecycle.ts'
 import { describeKillOutcome, killOutcomeStopsServer } from './checked-kill.ts'
 import { KILL_RETRY_SEED_NOT_LIVE_VALUE, KILL_RETRY_SYSTEM_CLOCK, killRetryStopped, type KillRetryWait } from './kill-retry.ts'
 import { resolveSystemBinary } from 'agent-director'
@@ -351,6 +365,8 @@ import {
 import { buildPersonaClientOrExit, runAgentDirectorStartupGate, createDeliveryClientFactory } from './agent-director-startup.ts'
 import { disposeAdVersionRecheck, installAdVersionRecheck, onAdVersionChanged } from './ad-version-gate.ts'
 import { installTestTimerOverrides } from './test-timer-overrides.ts'
+import { createTestMeasurements, buildTestMeasurementsStartLine, TEST_MEASUREMENTS_FILE_NAME, queueEventMeasurement, postHoldEventMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, threadCompactionMeasurement, type TestMeasurements } from './test-measurements.ts'
+import { setDurableAppendTimer } from './durable-journal.ts'
 import {
   adAlertThresholdMsInEffect,
   adSettingsInEffect,
@@ -383,8 +399,7 @@ import {
 } from './state-dir-migration.ts'
 import { configInEffect, createReloadController, reloadFilePaths, type ReloadController } from './reload.ts'
 import {
-  channelDeliveryDeclarationOf,
-  loadChannelDeliveryAtStart,
+  createChannelDeliveryStore,
   type ChannelDeliveryStore,
 } from './channel-delivery.ts'
 import { createReloadTickDriver } from './reload-timer.ts'
@@ -481,6 +496,9 @@ export function stopAllKeepAliveTimers(): void {
 // ---------------------------------------------------------------------------
 
 let connections: PersonaConnectionManager | undefined
+let channelMembership: ChannelMembership | undefined
+let membershipScanner: MembershipScanner | undefined
+let membershipReadiness: MembershipReadiness | undefined
 
 /**
  * The per-persona bring-up outcomes and retries; built in main(), told of
@@ -698,7 +716,15 @@ function resolvePersonaUserName(personaKey: string, userId: string): Promise<str
 // persona and its client through these at call time.
 // ---------------------------------------------------------------------------
 
+/**
+ * The one own-post adapter, shared by replies, prompts, warnings and notices.
+ * main() installs its owner after constructing Thread Memory.
+ */
+let ownPostJoins: OwnPostJoins | undefined
+const ownPosts = createOwnPostObserver(() => ownPostJoins)
+
 const sessionToolDeps: SessionToolDeps = {
+  ownPosts,
   assertSendable,
   getReplySettings,
   getPersona: getAppliedPersona,
@@ -713,18 +739,14 @@ const sessionToolDeps: SessionToolDeps = {
   onReactClaimed: (claim) => reactHandoff?.onReactClaimed(claim),
   onReplyCall: key => replyReminders?.noteReplyCall(key),
   serverPort: 0, // updated to actual port in main() before Bun.serve
-  // The channel mode of the configuration in effect, read at each tool call
-  //.
+  // The applied channel mode, read at each tool call.
   getChannelMode: () => channelModeOf(personaConfig),
-  // beside set_channel_delivery's inputs, each
-  // read at call time. The one stored-choice store, through the holder main()
-  // sets (undefined before then, so the call is refused and nothing is
-  // written); the routing's heard set; the applied personas of the
-  // configuration in effect, for the loop guard. The routing is built further
-  // down, so it is named only inside the arrow.
+  // The shared-authority adapter and current up/membership evidence are read
+  // beside set_channel_delivery's inputs at call time. Before main() binds the
+  // adapter, the call is refused and nothing is written.
   getChannelDelivery: () => channelDeliveryStore,
-  heardChannels: (key) => personaRouting.heardChannels(key),
-  getAppliedPersonas: () => personaConfig?.personas ?? [],
+  isPersonaUp: key => !shuttingDown && isPersonaUp(key),
+  readChannelMembership: (key, channel, mode) => channelMembership?.read(key, channel, mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' },
   // the persona-channel-delivery-set line goes to the
   // [slack] stream, as the routing's persona lines do.
   log: (line) => console.error(line),
@@ -1035,6 +1057,8 @@ async function handleInitialized(
   pendingId: string,
   server: import('@modelcontextprotocol/sdk/server/index.js').Server,
 ): Promise<void> {
+  const startingLives = new Map((personaConfig?.personas ?? []).map(persona =>
+    [persona.key, channelDeliveryStore?.authority.incarnation(persona.key)]))
   // Get the pending session's transport so we can wait for SSE stream
   const pendingEntry = getPendingSession(pendingId)
   if (!pendingEntry) {
@@ -1100,12 +1124,17 @@ async function handleInitialized(
   }
 
   const { persona } = admission
+  const incarnation = channelDeliveryStore?.authority.incarnation(persona.key)
+  if (!incarnation || startingLives.get(persona.key) !== incarnation || channelDeliveryStore?.isRetiring(persona.key)) {
+    await closePendingSession(pendingId, pendingEntry.transport, pendingSessionCloseDeps)
+    return
+  }
   const ref = renderPersonaRef(persona.name, persona.key)
   const existingSession = getSessionByPersona(persona.key)
 
   // Promote pending → registered (removes from pendingSessionMap internally;
   // the pending stub becomes the registered entry).
-  registerSession(realCwd, persona.key, pendingId)
+  registerSession(realCwd, persona.key, pendingId, undefined, incarnation)
   forgetNotConnectedEpisode(persona.key)
 
   // Register MCP session ID for future HTTP request routing
@@ -1128,6 +1157,57 @@ async function handleInitialized(
  */
 // Holders are populated in main(), after the duplicate-server guard and before admission.
 let deliveryQueue: ReplyReminderQueue | undefined
+let threadMemory: ThreadMemory | undefined
+let memoryHolds: MemoryHoldResolver | undefined
+let postHolds: PostHoldResolver | undefined
+let unsubscribePostHolds: (() => void) | undefined
+let testMeasurements: TestMeasurements | undefined
+let unsubscribeTestMeasurements: (() => void) | undefined
+/** Set only by the measurement record; intake reads it at each receipt. */
+let ackTimingObserver: ((timing: AckTiming) => void) | undefined
+const HOLD_CLOCK: PostHoldClock = {
+  now: () => performance.now(),
+  setTimeout: (callback, ms) => { const timer = setTimeout(callback, ms); timer.unref(); return timer },
+  clearTimeout: handle => clearTimeout(handle as ReturnType<typeof setTimeout>),
+}
+let threadMemorySeal: ThreadMemorySeal | undefined
+let threadMemoryRetries: ThreadMemoryRetries | undefined
+let ownPostLookups: OwnPostLookups | undefined
+let threadMemoryReporting: ReturnType<typeof createThreadMemoryReporting> | undefined
+type BufferedThreadMemoryEvent = (
+  | { source: 'memory'; event: ThreadMemoryEvent }
+  | { source: 'seal'; event: ThreadMemorySealEvent }
+  | { source: 'retry'; event: ThreadMemoryRetryEvent }
+  | { source: 'holds'; event: MemoryHoldEvent }
+  | { source: 'lookup'; event: OwnPostLookupEvent }
+) & { outage?: ReturnType<ThreadMemory['outage']> }
+const bufferedThreadMemoryEvents: BufferedThreadMemoryEvent[] = []
+function dispatchThreadMemoryReport(value: BufferedThreadMemoryEvent): void {
+  try {
+    // Keep observation-time readiness with startup events. Replaying an early
+    // read against the final healthy store would close its outage too soon.
+    if ((value.source === 'memory' || value.source === 'retry') && 'key' in value.event && value.outage === undefined) {
+      value = { ...value, outage: threadMemory?.outage(value.event.key) }
+    }
+    if (!threadMemoryReporting) {
+      // The seal retains these for startupFindings, including late first reads.
+      if (value.source !== 'seal' || (value.event.type !== 'changed-while-stopped' && value.event.type !== 'own-post-joins-lost')) bufferedThreadMemoryEvents.push(value)
+      return
+    }
+    switch (value.source) {
+      case 'memory': threadMemoryReporting.threadMemoryEvent(value.event, value.outage); return
+      case 'seal': threadMemoryReporting.sealEvent(value.event); return
+      case 'retry': threadMemoryReporting.retryEvent(value.event, value.outage); return
+      case 'holds': threadMemoryReporting.holdsEvent(value.event); return
+      case 'lookup': threadMemoryReporting.lookupEvent(value.event); return
+    }
+  } catch { /* reporting must not reach a store or skip its retry consumer */ }
+}
+/** The existing lifecycle window fences old events as well as armed work. */
+function threadMemoryWorkAllowed(key: string): boolean {
+  return !shuttingDown && !personaEpisodes?.isClosed() && (personaEpisodes?.teardownWindowState(key) ?? 'none') === 'none'
+}
+let unsubscribeThreadMemory: (() => void) | undefined
 let replyReminders: ReplyReminders | undefined
 let deliveryPreparation: DeliveryPreparation | undefined
 let deliveryEngines: DeliveryEngines | undefined
@@ -1138,16 +1218,77 @@ export function _setDeliveryLifecycle(value: DeliveryLifecycle | undefined): voi
   setDeliveryLifecycle(value)
 }
 let deliveryReporting: ReturnType<typeof createDeliveryReporting> | undefined
+let sharedStateReporting: ReturnType<typeof createSharedStateReporting> | undefined
+let unsubscribeSharedStateReporting: (() => void) | undefined
 /** The one `react` hand-off owner (Bot-to-Bot Reaction Notices); persona teardown forgets its key's work, shutdown stops it. */
 let reactHandoff: ReturnType<typeof createReactHandoff> | undefined
 const bufferedQueueEvents: QueueEvent[] = []
+const bufferedHeldReleases = new Map<string, { key: string; item: QueueItem }>()
+/** Independent observer ports; none can interrupt durability. */
+export const memoryHoldEvents = { emit: (event: MemoryHoldEvent): void => dispatchThreadMemoryReport({ source: 'holds', event }) }
+export const threadMemoryEvents = { emit: (event: ThreadMemoryEvent): void => {
+  // At startup the queue must first advance the persona clock past its saved
+  // arrivals; activation below captures that read. A live first read captures
+  // here, before its asynchronous hold resolution and flush can move the end.
+  try {
+    if (event.type === 'read' && reloadController?.sharedChannels() && threadMemoryWorkAllowed(event.key)) ownPostLookups?.journalRead(event.key)
+  } catch { /* range capture cannot interrupt reporting or read recovery */ }
+  dispatchThreadMemoryReport({ source: 'memory', event })
+  try {
+    if (event.type === 'append-failed' || event.type === 'creation-failed') threadMemoryRetries?.appendFailed(event.key)
+    else if (event.type === 'read-failed') threadMemoryRetries?.readFailed(event.key)
+  } catch { /* a retry consumer cannot affect reporting or the store */ }
+} }
+export function resolveMemoryHolds(key: string, mode: 'live' | 'recovered' = 'live'): Promise<unknown> {
+  return !shuttingDown && getAppliedPersona(key) ? memoryHolds?.resolve(key, mode) ?? Promise.resolve() : Promise.resolve()
+}
+/** Set once start has recovered every queue key; a journal loaded later recovers in its loading turn. */
+let queueStartRecovered = false
+/** The start's recovery of one queue key: its queued joins now, then, detached,
+ * its Post Holds' restart release and k8's 'recovered' resolution. k8's
+ * compaction follows both saves, after its own save's retry too; only when k8
+ * can't judge (unknown), or a failed join recovery keeps it from being asked,
+ * are the releases compacted here. At start k8 resolves once the releases are
+ * saved. In the turn that first loads a journal after start, k8 takes the
+ * journal's holds at once, before that turn can store a live one; the
+ * releases' save is already queued ahead of k8's first write. A failed join
+ * recovery leaves the queue's join copies, and k8's resolution, to this key's
+ * next bring-up. */
+function recoverQueueKeyAtStart(key: string, loadingTurn = false): void {
+  const queue = deliveryQueue, resolver = postHolds
+  if (!queue || !threadMemory || !resolver) return
+  let joinsRecovered = true
+  try { recoverQueuedJoins(key, queue, threadMemory) } catch { joinsRecovered = false }
+  const resolveMemory = () => joinsRecovered && threadMemoryWorkAllowed(key) ? memoryHolds?.resolve(key, 'recovered', true) : undefined
+  const releasing = resolver.releaseUntracked(key)
+  const resolving = loadingTurn ? resolveMemory() : releasing.then(resolveMemory)
+  void Promise.all([resolving, releasing]).then(async ([resolved]) => {
+    if ((!joinsRecovered || resolved === 'unknown') && threadMemoryWorkAllowed(key)) await queue.compact(key, () => threadMemoryWorkAllowed(key))
+  }).catch(() => {})
+}
+/** Observer port for Thread Memory reporting; the seal retains startup findings. */
+export const threadMemorySealEvents = { emit: (event: ThreadMemorySealEvent): void => {
+  dispatchThreadMemoryReport({ source: 'seal', event })
+  try {
+    if (event.type === 'seal-write-failed' && !shuttingDown && !personaEpisodes?.isClosed()) threadMemoryRetries?.sealWriteFailed()
+  } catch { /* isolated retry consumer */ }
+} }
 let deliveryClients: ReturnType<typeof createDeliveryClientFactory> | undefined
 export const deliveryEngineEvents = { emit: (event: DeliveryEngineEvent): void => { deliveryReporting?.engineEvent(event); if (event.type === 'item-delivered') replyReminders?.wake(event.key) } }
 /** binds event handling here; supplies facts without notices or wording. */
-export const deliveryQueueEvents = { emit: (event: QueueEvent): void => { if (deliveryReporting) deliveryReporting.queueEvent(event); else bufferedQueueEvents.push(event) } }
+export const deliveryQueueEvents = { emit: (event: QueueEvent): void => {
+  // A saved withdrawal or parking unblocks the FIFO with no new traffic.
+  if (event.type === 'holds-resolved') { try { deliveryQueueWake.wake(event.key) } catch { /* the next tick still delivers */ } }
+  if (deliveryReporting) deliveryReporting.queueEvent(event); else bufferedQueueEvents.push(event)
+} }
 /** engine binds this hook after startup; until then queued work waits. */
 export const deliveryQueueWake = { wake: (_key: string): void => {} }
 const personaRouting = createPersonaRouting({
+  membership: {
+    read: (key, channel, mode) => channelMembership?.read(key, channel, mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' },
+    hasUnresolved: (key, channel) => channelMembership?.hasUnresolved(key, channel) ?? false,
+    request: key => channelMembership?.request(key),
+  },
   getPersonaConfig: () => personaConfig,
   getBotIdentity: identityFor,
   queue: {
@@ -1155,21 +1296,67 @@ const personaRouting = createPersonaRouting({
       if (!deliveryQueue) return Promise.resolve({ status: 'failed' as const, error: new Error('Queue not started') })
       return deliveryQueue.accept(key, input)
     },
+    acceptDecided: (key, slackKey, decide) => {
+      if (!deliveryQueue) {
+        const decision = decide({ keyChecked: false })
+        return Promise.resolve('skip' in decision ? { status: 'skipped' as const, outcome: decision.skip }
+          : { status: 'failed' as const, error: new Error('Queue not started') })
+      }
+      return deliveryQueue.acceptDecided(key, slackKey, decide)
+    },
     lookupSlackKey: (key, slackKey) => deliveryQueue?.lookupSlackKey(key, slackKey),
     lookupReactionKey: (key, reactionKey) => deliveryQueue?.lookupReactionKey(key, reactionKey),
   },
   // main() builds the connection manager after this; no event arrives before it.
   isRunBotIdentity: (id) => connections?.isRunBotIdentity(id) ?? false,
   prepare: (key, item) => deliveryPreparation?.prepare(key, item) ?? Promise.resolve(),
-  onReceived: (key, item) => deliveryReporting?.received(key, item),
+  onReceived: (key, item, mode) => {
+    if (deliveryReporting) deliveryReporting.received(key, item, mode)
+    else if (mode === 'recovered') bufferedHeldReleases.set(`${key}:${item.accepted.seq}`, { key, item })
+  },
+  monotonicNow: HOLD_CLOCK.now,
+  ackTiming: () => ackTimingObserver,
+  // The resolver takes the decision's retention; with no resolver it is released.
+  postHolds: { held: (key, hold, retention) => postHolds ? postHolds.held(key, hold, retention) : retention() },
+  onHoldStored: key => {
+    try { void resolveMemoryHolds(key).catch(() => {}) } catch { /* independent hold owners */ }
+    try { postHolds?.check(key) } catch { /* independent hold owners */ }
+    // A held exact save corrects a posted storage warning without its release.
+    try { deliveryReporting?.holdStored(key) } catch { /* reporting is independent of the holds */ }
+  },
   archive: (key, event) => archiveWrite?.(key, event),
+  // No runner in a dry run: the hook does nothing.
+  onOwnMessage: (key, event, identity) => ownPostLookups?.ownMessage(key, event, identity),
   log: (line) => console.error(line),
-  // beside the stored choices and their
-  // readability, read at each fungible-mode event through the holder main()
-  // sets, which the session tools and the reload controller read too. Before
-  // main() loads the store it is undefined, so no stored choice applies.
+  // Both intake modes read current shared choices and readability through
+  // the adapter main() binds, also used by session tools and reload. Before
+  // it is bound, channel selection remains unresolved.
   getChannelDelivery: () => channelDeliveryStore,
-  // A lost message for a persona that is not up restarts nothing.
+  threadMemory: (key, channel, root) => {
+    ownPostJoins?.settleDeferred(key, channel)
+    // A queue replay awaiting its repair rewrite holds untrusted joins: no
+    // thread is not-joined until the repair turn has recovered them.
+    if (deliveryQueue?.durabilityPending?.(key)) return 'unknown'
+    return threadMemory?.view(key, channel, root) ?? 'unknown'
+  },
+  // The one owner's in-memory posts under the current stamp; none before it exists.
+  pendingOwnPosts: (key, channel) => pendingOwnPostViews(ownPostJoins?.pendingOwnPosts(key, channel) ?? []),
+  // The same owner's retention, which a Post Hold's decision hands to postHolds.held.
+  retainOwnPostOutcomes: (key, operationIds) => ownPostJoins?.retainOutcomes(key, operationIds) ?? (() => {}),
+  joins: {
+    stamp: (key, channel) => threadMemory ? reloadController?.sharedChannels()?.channelStamp(key, channel) : undefined,
+    hasSavedJoin: (key, channel, root, stamp) => threadMemory?.hasSavedJoin(key, channel, root, stamp) ?? false,
+    clock: key => threadMemory!.clock(key),
+    addJoin: (key, fact) => threadMemory?.addJoin(key, fact) ?? false,
+    saveJoins: (key, facts) => threadMemory?.saveJoins(key, facts) ?? Promise.resolve({ kind: 'cancelled' }),
+  },
+  threadStampUndecided: (key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel)?.kind === 'undecided',
+  threadStampEpisodes: {
+    begin: (key, channel) => personaEpisodes?.threadStampUndecided.begin(key, channel) ?? false,
+    end: (key, channel) => personaEpisodes?.threadStampUndecided.end(key, channel),
+  },
+  // Asked for a lost message only: one lost for a persona that is not up
+  // restarts nothing.
   isPersonaUp,
   isLatched: (key) => personaLatch?.isLatched(key) ?? false,
   isTmuxUnresponsive: (key) => personaTmuxUnresponsive?.holds(key) ?? false,
@@ -1249,7 +1436,7 @@ const personaRouting = createPersonaRouting({
  * edited config file. A confirmed apply's step 1 reassigns it (
  * the reload controller's `onApplied`, through
  * `configInEffect`) to the confirmed persona set and the confirmed
- * `allow_invited_channels` switch, with every other server-wide value kept
+ * `channel_mode` switch, with every other server-wide value kept
  * from start time until the next start. The switch is the one server-wide
  * setting applied in place: every consumer of the channel mode reads it from
  * here at call time (`channelModeOf`). Null only before main() resolves the
@@ -1265,13 +1452,12 @@ let personaConfig: PersonaConfig | null = null
 let reloadController: ReloadController | undefined
 
 /**
- * The one stored-choice store (`channel-delivery.ts`,
- *): set once by main, which loads it after the start resolves its
- * configuration and before the start bring-up pass, and read at call time by
- * the routing's `getChannelDelivery`, the session tools' `getChannelDelivery`
- * and the reload controller's `channelDelivery`
- * accessor. Undefined before main() loads it (nothing is read at import):
- * the routing then applies no stored choice and the tool refuses.
+ * The adapter (`channel-delivery.ts`) over the sole shared authority in
+ * config.json.last-applied: bound by main after startup recovery resolves the
+ * applied configuration and before bring-up. Routing in both modes, session
+ * tools and reload read it at call time. It owns no separate file or fallback
+ * choices. Undefined before main() binds it (nothing is read at import):
+ * channel selection is unresolved and the assignment tool refuses.
  */
 let channelDeliveryStore: ChannelDeliveryStore | undefined
 
@@ -1311,6 +1497,7 @@ function getReplySettings(): ReplySettings {
 const personaDestinations = createPersonaDestinations({
   log: (line) => console.error(line),
   getPersonaConfig: () => personaConfig,
+  ownPosts,
 })
 
 /**
@@ -1371,6 +1558,12 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // No new message read or intake from here; an intake already started is
   // awaited below, before preparation and the queue stop.
   const reactHandoffDrained = reactHandoff?.stop()
+  sharedStateReporting?.stop()
+  unsubscribeSharedStateReporting?.()
+  unsubscribeSharedStateReporting = undefined
+  membershipScanner?.close()
+  channelMembership?.close()
+  membershipReadiness?.close()
   stopPermissionPoller()
   stopHealthCheck()
   // The runtime version re-check: its timers are cleared and
@@ -1401,6 +1594,7 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // flight that meets UNAVAILABLE or UNCLASSIFIED starts no condition and no
   // episode), so nothing is posted and no alert check is pending after this.
   personaEpisodes?.close()
+  threadMemoryReporting?.close()
   // the old-life waits' unclassified-error episodes
   // end silently with them, and none begins again.
   oldLifeWaitUnclassifiedErrors?.close()
@@ -1428,12 +1622,40 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // synchronous stop above, before closing the transports and clients.
   const remindersStopping = replyReminders?.stop()
   const deliveryStopping = deliveryEngines?.stop()
+  memoryHolds?.stop()
+  postHolds?.stop()
+  unsubscribePostHolds?.()
   await reactHandoffDrained
   await deliveryPreparation?.stop()
   await deliveryStopping
   await remindersStopping
   await deliveryClients?.close()
   await deliveryQueue?.stop()
+  threadMemoryRetries?.stopKeys()
+  ownPostLookups?.stop()
+  ownPostJoins?.stop()
+  unsubscribeThreadMemory?.()
+  await threadMemory?.quiesce()
+  if (threadMemorySeal?.loadedAtStart() && threadMemory) {
+    const completed = threadMemory.completedStores()
+    const shutdownEntries = new Map([...threadMemory.journalFacts().keys()].map(key => {
+      const identity = completed.get(key) ?? {}
+      let memoryOnlyJoins: { channel: string; root: string }[] = []
+      try { memoryOnlyJoins = ownPostJoins?.memoryOnlyJoins(key) ?? [] } catch { /* isolate each key's snapshot */ }
+      return [key, { ...identity, ...(memoryOnlyJoins.length ? { memoryOnlyJoins } : {}) }] as const
+    }))
+    const result = await threadMemorySeal.writeShutdown(shutdownEntries)
+    // Episodes are already closed, so their observer suppresses this event.
+    // The final authorized durability operation still needs its log-only result.
+    try {
+      if (result.kind === 'failed') console.error(buildThreadMemorySealNotSavedLine(threadMemorySeal.path, result.error, result.unsynced))
+    } catch { /* a diagnostic failure must not skip the remaining shutdown stops */ }
+  }
+  await threadMemory?.stop()
+  await threadMemorySeal?.stop()
+  threadMemoryRetries?.stopSeal()
+  if (testMeasurements) await testMeasurements.stop()
+  unsubscribeTestMeasurements?.()
 
   // Close all pending (not yet routed) MCP transports
   for (const pending of getAllPendingSessions()) {
@@ -2624,7 +2846,7 @@ export async function main(): Promise<void> {
   // (state-dir-migration.ts says what happens to each entry, and why it is
   // not done by the CLI or postinstall). First of all: before the directory
   // is made, and so before anything reads or writes it (the PID check, the
-  // retired keys, the last-applied record, config.json, channel-delivery.json,
+  // retired keys, the last-applied record, config.json,
   // the logs, the permission trail). With SLACK_STATE_DIR set it does nothing.
   // It never throws; a start it cannot make safe (an old server still running
   // on the old directory, a step that failed) stops here with the reason in
@@ -2724,9 +2946,129 @@ export async function main(): Promise<void> {
   checkPidConflict(PID_FILE)
 
   // replay and compact every journal before Slack/HTTP admission.
-  deliveryQueue = createDeliveryQueue({ stateDir: STATE_DIR, onEvent: event => deliveryQueueEvents.emit(event) })
+  deliveryQueue = createDeliveryQueue({
+    stateDir: STATE_DIR, onEvent: event => deliveryQueueEvents.emit(event),
+    // A journal start() couldn't read, or whose repair rewrite failed, gets the
+    // start's steps in the turn that first loads or repairs it, before that
+    // turn's own work: the clock passes its holds' arrivals, then its key is
+    // recovered as at start. Until start has recovered every key, start's own
+    // pass covers it.
+    onLoadedAfterStart: key => {
+      if (!queueStartRecovered || shuttingDown) return
+      for (const hold of deliveryQueue?.unresolvedHolds(key) ?? []) threadMemory?.advancePast(key, hold.arrived_at)
+      recoverQueueKeyAtStart(key, true)
+    },
+    threadJoinSaved: key => {
+      const memory = threadMemory, isSaved = memory?.threadJoinSavedForPass(key)
+      return (channel, fact) => {
+        // A covered delivered join can disappear in start compaction before
+        // recovery reads items(). Its decision time still advances this clock.
+        memory?.advancePast(key, fact.at)
+        return isSaved?.(channel, fact.thread_ts, fact.stamp, fact.at) ?? false
+      }
+    },
+  })
+  threadMemorySeal = createThreadMemorySeal({
+    stateDir: STATE_DIR,
+    queueJournalPath: key => join(STATE_DIR, 'queue', `${key}.jsonl`),
+    onQueueJournalOpened: key => deliveryQueue?.journalOpened(key),
+    appliedKeys: () => personaConfig?.personas.map(persona => persona.key) ?? [],
+    threadHybrid: key => (reloadController?.sharedChannels()?.threadView().threadHybridChannels(key).length ?? 0) > 0,
+    created: key => reloadController?.sharedChannels()?.threadMemoryCreated(key) ?? false,
+    onEvent: event => threadMemorySealEvents.emit(event),
+  })
+  threadMemory = createThreadMemory({
+    stateDir: STATE_DIR, dryRun: isDryRun(), seal: threadMemorySeal,
+    canRun: threadMemoryWorkAllowed,
+    appliedKeys: () => personaConfig?.personas.map(persona => persona.key) ?? [],
+    stamp: (key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel),
+    stampFacts: () => reloadController?.sharedChannels()?.stampFacts(),
+    authorityReady: () => reloadController?.sharedChannels() !== undefined,
+    heldStamps: key => deliveryQueue?.unresolvedHolds(key).filter(hold => hold.memoryDependent).map(hold => ({ channel: hold.channel, stamp: hold.stamp })) ?? [],
+    unsavedOwnPosts: key => ownPostJoins?.unsavedDeferredPosts(key) ?? 0,
+    threadHybridChannels: key => reloadController?.sharedChannels()?.threadView().threadHybridChannels(key) ?? [],
+    markerKeys: () => reloadController?.sharedChannels()?.threadMemoryCreatedKeys() ?? [],
+    canRemove: key => reloadController?.sharedChannels()?.reviewHeld(key) === false,
+    setCreated: key => reloadController?.sharedChannels()?.setThreadMemoryCreated(key) ?? { kind: 'failed' },
+    clearCreated: key => reloadController?.sharedChannels()?.clearThreadMemoryCreated(key) ?? { kind: 'failed' },
+    onEvent: event => threadMemoryEvents.emit(event),
+  })
+  const ownPostSources = {
+    config: () => personaConfig,
+    persona: getAppliedPersona,
+    choices: () => channelDeliveryStore,
+    membership: (key: string, channel: string, mode: ChannelMode) => channelMembership?.read(key, channel, mode),
+  }
+  ownPostJoins = createOwnPostJoins({
+    memory: threadMemory,
+    lookupSlackKey: (key, slackKey) => deliveryQueue?.lookupSlackKey(key, slackKey),
+    choice: ownPostChoice(ownPostSources),
+    eligibility: ownPostEligibility(ownPostSources),
+    now: Date.now,
+    operationId: () => crypto.randomUUID(),
+    isDryRun,
+  })
+  if (!isDryRun()) ownPostLookups = createOwnPostLookups({
+    owner: ownPostJoins, memory: threadMemory,
+    stamp: (key, channel, stamp) => ownPostStampState(threadMemory!, key, channel, stamp),
+    connections: {
+      metadataCall: (key, connectionId, method, args, signal) => connections!.metadataCall(key, connectionId, method, args, signal),
+      currentConnectionId: key => connections?.provenance(key)?.connectionId,
+      isUp: key => threadMemoryWorkAllowed(key) && getAppliedPersona(key) !== undefined && isPersonaUp(key),
+      identity: key => connections?.identity(key),
+    },
+    clock: SYSTEM_PERSONA_CONNECTION_CLOCK,
+    onEvent: event => dispatchThreadMemoryReport({ source: 'lookup', event }),
+  })
+  threadMemoryRetries = createThreadMemoryRetries({
+    canRun: threadMemoryWorkAllowed,
+    clock: SYSTEM_PERSONA_CONNECTION_CLOCK,
+    flush: key => threadMemory!.flush(key),
+    retryRead: key => threadMemory!.retryRead(key),
+    sealFlush: () => threadMemorySeal!.flush(),
+    firstRead: async (key, current) => {
+      const live = () => current() && !shuttingDown && getAppliedPersona(key) !== undefined
+      if (!live()) return
+      try { threadMemory?.retryPendingJoins(key) } catch { /* continue to resolution and saving */ }
+      if (!live()) return
+      try { await memoryHolds?.resolve(key, 'live') } catch { /* saving is independent */ }
+      if (!live()) return
+      try {
+        const result = await threadMemory?.flush(key)
+        // A readable journal can still keep joins behind an undecided stamp.
+        // Keep the existing save owner until publication lets its retry save.
+        if (live() && (result?.kind === 'failed' || (result?.kind === 'kept' && (threadMemory?.outage(key).unsaved ?? 0) > 0))) threadMemoryRetries?.appendFailed(key)
+      } catch { if (live()) threadMemoryRetries?.appendFailed(key) }
+      if (live()) ownPostLookups?.kick(key)
+    },
+    onEvent: event => dispatchThreadMemoryReport({ source: 'retry', event }),
+  })
+  threadMemory.readAtStart()
+  await threadMemorySeal.loadAtStart(threadMemory.journalFacts())
+  if (shuttingDown) return
   await deliveryQueue.start()
-  deliveryQueue.startMaintenance()
+  if (shuttingDown) return
+  for (const key of deliveryQueue.keys()) for (const hold of deliveryQueue.unresolvedHolds(key)) threadMemory.advancePast(key, hold.arrived_at)
+  memoryHolds = createMemoryHoldResolver({
+    canRun: threadMemoryWorkAllowed,
+    queue: deliveryQueue, memory: threadMemory,
+    release: (key, item, mode) => personaRouting.releaseHeld(key, item, mode),
+    now: Date.now,
+    clock: { setTimeout: (callback, ms) => setTimeout(callback, ms), clearTimeout: handle => clearTimeout(handle as ReturnType<typeof setTimeout>) },
+    onEvent: event => memoryHoldEvents.emit(event),
+  })
+  // Retain the deps so the test-only observer can be bound once config resolves.
+  const postHoldDeps: PostHoldResolverDeps = {
+    canRun: threadMemoryWorkAllowed,
+    queue: deliveryQueue, owner: ownPostJoins,
+    release: (key, item, mode) => personaRouting.releaseHeld(key, item, mode),
+    onParked: key => resolveMemoryHolds(key),
+    clock: HOLD_CLOCK, decisionNow: Date.now,
+  }
+  postHolds = createPostHoldResolver(postHoldDeps)
+  // Events may fire within intake's view read; check only queues a microtask.
+  // Include awaiting-thread: it supplies no verdict until its thread is learnt.
+  unsubscribePostHolds = ownPostJoins.subscribe(event => postHolds?.check(event.key))
   deliveryPreparation = createDeliveryPreparation({
     queue: deliveryQueue,
     onReceived: (key, item) => deliveryReporting?.received(key, item),
@@ -2797,7 +3139,7 @@ export async function main(): Promise<void> {
   // record): the server-wide values that hold until the next start, e.g. the
   // restart delay. Set below, right after the start resolves; never replaced
   // after that. A confirmed apply replaces `personaConfig`'s persona set and
-  // its allow_invited_channels switch, and keeps every other server-wide value
+  // its channel_mode switch, and keeps every other server-wide value
   // from here (`configInEffect`); the start
   // bring-up launches over the same rule. The reload controller keeps its own
   // applied configuration, the record's as resolved, without that override.
@@ -2821,6 +3163,7 @@ export async function main(): Promise<void> {
   // The start resolution records nothing.
   const reload = createReloadController({
     paths: reloadFilePaths(CONFIG_PATH),
+    membership: () => channelMembership,
     retiredKeys,
     queueOpenCount: key => deliveryQueue?.openCount(key) ?? 0,
     onQueueRetained: key => deliveryQueue?.retained(key),
@@ -2829,14 +3172,11 @@ export async function main(): Promise<void> {
     oldLifeHolds,
     // A retired key's react hand-off is cancelled first, as at persona teardown.
     stopDelivery: async (key) => { reactHandoff?.forget(key); const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); const remindersStopping = replyReminders?.forget(key); await Promise.all([stopping, remindersStopping]) },
-    // beside,
-    // a confirmed apply's step 1 writes the unwritten
-    // drops of a key it brings up, drops the retired keys' stored choices and
-    // marks the retiring keys through the one stored-choice store, loaded
-    // below after the start resolution, so this reads the holder at call
-    // time. An apply before the load is never expected (detection is armed
-    // only after the start bring-up); it throws, before anything is written,
-    // and the controller logs it.
+    // Confirmed apply step 1 marks retiring keys through the shared-authority
+    // adapter; the reviewed authority transaction applies choice changes.
+    // Read the holder at call time. Applying before it is bound is unexpected
+    // (detection starts after bring-up) and throws before any write; the
+    // controller logs the failure.
     channelDelivery: () => {
       if (channelDeliveryStore === undefined) throw new Error('a confirmed apply ran before the start loaded the stored-choice store')
       return channelDeliveryStore
@@ -2857,7 +3197,19 @@ export async function main(): Promise<void> {
         if (appliedConfig === undefined) throw new Error('the start bring-up ran before the start resolved its configuration')
         return startupSessionManager(configInEffect(appliedConfig, applied), { bringUp: personaBringUps, isShuttingDown: () => shuttingDown })
       },
-      teardown: (persona) => personaLifecycleOps.teardown(persona),
+      teardown: async (persona) => {
+        try { await personaLifecycleOps.teardown(persona) } finally {
+          if (!personaConfig?.personas.some(applied => applied.key === persona.key)) {
+            try { await forgetPersonaState(persona.key, [key => ownPostLookups?.forget(key), key => ownPostJoins?.forget(key)]) } finally {
+              try { await forgetPersonaState(persona.key, [key => postHolds?.forget(key), key => memoryHolds?.forget(key)]) } finally {
+                try { threadMemoryRetries?.forget(persona.key, 'removal') } finally {
+                  await threadMemory?.remove(persona.key)
+                }
+              }
+            }
+          }
+        }
+      },
       updateInPlace: (change) => personaLifecycleOps.updateInPlace(change),
       bringUp: (persona, applied, options) => personaLifecycleOps.bringUp(persona, applied, options),
       reconnectCredentials: (persona, applied) => personaLifecycleOps.reconnectCredentials(persona, applied),
@@ -2875,7 +3227,7 @@ export async function main(): Promise<void> {
     checkConfigDir: checkLaunchConfigDir,
     slackClientFactory: PRODUCTION_SLACK_CLIENT_FACTORY,
     // step 1, once the record holds a confirmed
-    // change, the server runs its persona set and its allow_invited_channels
+    // change, the server runs its persona set and its channel_mode
     // switch, the one server-wide setting applied in place. Every other
     // server-wide setting keeps its start-time value (the next start applies
     // it). Everything that reads the applied set or the channel mode reads
@@ -2888,7 +3240,9 @@ export async function main(): Promise<void> {
     onApplied: (config) => {
       if (appliedConfig === undefined) throw new Error('a confirmed apply ran before the start resolved its configuration')
       personaConfig = configInEffect(appliedConfig, config)
+      sharedStateReporting?.reloadApplied()
     },
+    onApplyFailed: failure => sharedStateReporting?.reloadApplyFailed(failure),
     // once the apply's teardowns and bring-ups have settled, every applied
     // key's claimed work is prepared again, detached from the apply and the
     // tick. A destructive modify's teardown forgot the preparation life that
@@ -2909,8 +3263,51 @@ export async function main(): Promise<void> {
   // (installed before the configuration was read) and sets B's floor. The
   // latch re-check and the retry timers below take their values from it.
   const testTimers = installTestTimerOverrides(personaConfig.test_timer_overrides, (line) => console.error(line))
+  // No await separates replay's end from here: maintenance is still armed in
+  // that same turn, now with the resolved test-only interval (hourly by default).
+  deliveryQueue.startMaintenance(testTimers.queueCompactIntervalMs)
+  threadMemory.startMaintenance(testTimers.queueCompactIntervalMs)
   const testMcpDropEnabled = personaConfig.test_mcp_drop_endpoint === true
   if (testMcpDropEnabled) console.error(TEST_MCP_DROP_START_LINE)
+  const testMeasurementsEnabled = personaConfig.test_measurements === true
+  if (testMeasurementsEnabled) {
+    deliveryQueue.setMeasureTimings(true)
+    const path = join(STATE_DIR, TEST_MEASUREMENTS_FILE_NAME)
+    const recorder = createTestMeasurements({
+      path, fs: { appendFile: fsPromises.appendFile, appendFileSync },
+      timers: {
+        setTimeout: (callback, ms) => { const timer = setTimeout(callback, ms); timer.unref(); return timer },
+        clearTimeout: handle => clearTimeout(handle as ReturnType<typeof setTimeout>),
+      },
+      log: line => console.error(line),
+    })
+    testMeasurements = recorder
+    console.error(buildTestMeasurementsStartLine(path))
+    const emit = deliveryQueueEvents.emit
+    deliveryQueueEvents.emit = event => {
+      try { const entry = queueEventMeasurement(event); if (entry) recorder.record(entry) } catch { /* isolated measurement observer */ }
+      emit(event)
+    }
+    postHoldDeps.onEvent = event => {
+      try { const entry = postHoldEventMeasurement(event); if (entry) recorder.record(entry) } catch { /* isolated measurement observer */ }
+    }
+    threadMemory.setCompactionObserver(compaction => { recorder.record(threadCompactionMeasurement(compaction)) })
+    // The per-event timings add work to every receipt, append and save, so
+    // only the scenario that reads them turns them on.
+    if (personaConfig.test_measurement_timings === true) {
+      ackTimingObserver = timing => { recorder.record(ackTimingMeasurement(timing)) }
+      setDurableAppendTimer({
+        now: () => performance.now(),
+        record: timing => { const entry = durableAppendMeasurement(timing, STATE_DIR); if (entry) recorder.record(entry) },
+      })
+      threadMemory.setSaveObserver(save => { recorder.record(threadSaveMeasurement(save)) })
+    }
+    unsubscribeTestMeasurements = () => {
+      deliveryQueueEvents.emit = emit; delete postHoldDeps.onEvent; ackTimingObserver = undefined
+      setDurableAppendTimer(undefined); threadMemory?.setSaveObserver(undefined)
+      threadMemory?.setCompactionObserver(undefined)
+    }
+  }
   // startup failure is local; every launch retries the write and fails closed.
   const prepareSystemPrompt = (key: string): void => {
     try {
@@ -2931,30 +3328,38 @@ export async function main(): Promise<void> {
   // The start-time applied config (declared before the reload controller).
   appliedConfig = personaConfig
 
-  // beside the stored-choice file
-  // (channel-delivery.json in the state directory) is read once here, right
-  // after the start resolved the configuration it runs and before the first
-  // await that follows, so no early shutdown return skips it and it comes
-  // before the connection manager, Bun.serve, the PID file, the start sweep
-  // and the start bring-up; behind no branch, so in both modes and in dry run
-  // too. The start rules run right after the read, over the applied personas
-  // and the retired-key store loaded above. Its production writer, delete and
-  // clock are the store's defaults (durableWriteFileSync, durableUnlinkSync,
-  // Date.now). An unreadable file is the store's own state and line, never a
-  // stop. This is the server's only stored-choice store: the reload
-  // controller reaches it through `channelDeliveryStore`, and nothing else
-  // builds one.
-  channelDeliveryStore = loadChannelDeliveryAtStart(
-    STATE_DIR,
-    {
-      applied: appliedConfig.personas.map((persona) => ({
-        key: persona.key,
-        declaration: channelDeliveryDeclarationOf(persona),
-      })),
-      retiredKeys,
-    },
-    { log: (line) => console.error(line) },
-  )
+  // Every consumer shares the authority already recovered by the reload controller.
+  // This adapter creates no store and performs no I/O.
+
+  channelDeliveryStore = createChannelDeliveryStore(reload.sharedChannels()!, (key, channel) =>
+    !isDryRun() && !shuttingDown && isPersonaUp(key) && channelMembership?.read(key, channel, 'open').kind === 'eligible')
+  // Thread-view notifications include undecided stamps during restoration,
+  // and run before the authority's ordinary subscribe listeners.
+  unsubscribeThreadMemory = reload.sharedChannels()!.subscribeThreadView(() => {
+    if (shuttingDown) return
+    threadMemory?.published()
+    for (const persona of personaConfig?.personas ?? []) {
+      ownPostJoins?.onSharedStatePublished(persona.key)
+      if (threadMemoryWorkAllowed(persona.key)) ownPostLookups?.kick(persona.key)
+    }
+    // published() synchronously recovers deferred queue joins before these
+    // per-key resolver turns run. A forgotten life is never recreated here.
+    for (const key of deliveryQueue?.keys() ?? []) {
+      if (getAppliedPersona(key)) void memoryHolds?.retryPending(key).catch(() => {})
+    }
+  })
+  await threadMemory.activate()
+  if (shuttingDown) return
+  for (const persona of personaConfig.personas) ownPostLookups?.journalRead(persona.key)
+  for (const key of deliveryQueue.keys()) recoverQueueKeyAtStart(key)
+  queueStartRecovered = true
+  // Resolution and its second compaction are detached; intake never waits.
+  for (const persona of personaConfig.personas) ownPostLookups?.kick(persona.key)
+
+  channelMembership = createChannelMembership({
+    authority: reload.sharedChannels()!, dryRun: isDryRun(),
+    log: line => console.error(line), requestReconciliation: key => membershipScanner?.request(key),
+  })
 
   // agent-director's timing settings. Read once here, after
   // the startup gate has passed and the start has resolved its configuration,
@@ -3472,8 +3877,35 @@ export async function main(): Promise<void> {
     queued: createQueuedAckCallback({ getReaction: () => getReplySettings().queued_ack_reaction, clientFor, queue: deliveryQueue! }),
     delivered: createDeliveryAckCallback({ getReaction: () => getReplySettings().ack_reaction, clientFor, queue: deliveryQueue! }),
   })
+  sharedStateReporting = createSharedStateReporting({
+    episodes: noticeEpisodes, persona: getAppliedPersona,
+    log: line => console.error(line),
+    authority: reload.sharedChannels()!, membership: channelMembership,
+    mode: () => channelModeOf(personaConfig),
+    scanStatus: key => membershipScanner?.status(key) ?? { state: 'unverified', pages: 0, positives: 0 },
+    scanEnded: key => membershipScanner?.ended(key) ?? false,
+  })
+  let sharedStateCheckPending = false
+  unsubscribeSharedStateReporting = reload.sharedChannels()!.watch(() => {
+    if (shuttingDown || sharedStateCheckPending) return
+    sharedStateCheckPending = true
+    queueMicrotask(() => {
+      sharedStateCheckPending = false
+      if (!shuttingDown) sharedStateReporting?.checkAll(personaConfig?.personas.map(persona => persona.key) ?? [])
+    })
+  })
   for (const event of bufferedQueueEvents.splice(0)) deliveryReporting.queueEvent(event)
+  for (const { key, item } of bufferedHeldReleases.values()) deliveryReporting.received(key, deliveryQueue.item(key, item.accepted.seq) ?? item, 'recovered')
+  bufferedHeldReleases.clear()
   deliveryReporting.startupFindings(deliveryQueue!.startupFindings())
+  threadMemoryReporting = createThreadMemoryReporting({
+    episodes: noticeEpisodes, persona: getAppliedPersona,
+    log: line => console.error(line),
+    threadHybridChannels: key => reload.sharedChannels()?.threadView().threadHybridChannels(key) ?? [],
+    outage: key => threadMemory!.outage(key),
+  })
+  for (const event of bufferedThreadMemoryEvents.splice(0)) dispatchThreadMemoryReport(event)
+  threadMemoryReporting.startupFindings(threadMemorySeal.startupFindings())
   deliveryLifecycle = createDeliveryLifecycle({
     onError: error => console.error(`[slack] deferred reconnect failed: ${describeThrownValue(error)}`),
   })
@@ -3551,7 +3983,7 @@ export async function main(): Promise<void> {
   deliveryQueueWake.wake = key => deliveryEngines?.wake(key)
   // Retained in-flight items need recovery before launch reconnects; an
   // accepted-only head has no keys to recover and is fixed after bring-up.
-  for (const p of personaConfig.personas) if (deliveryQueue!.items(p.key).some(i => !isQueueItemClosed(i) && i.records.some(r => r.kind === 'sent'))) deliveryEngines.wake(p.key)
+  for (const p of personaConfig.personas) if (deliveryQueue!.items(p.key).some(i => isOpenItem(i) && i.records.some(r => r.kind === 'sent'))) deliveryEngines.wake(p.key)
   setSessionNotifier(personaNotifier.notify)
 
   // one Slack connection per persona. Each connection's
@@ -3568,9 +4000,11 @@ export async function main(): Promise<void> {
   // logged once), any other value ignored with one warning. Unset, the clients use the library
   // default. Never set on an operator's host.
   const slackApiUrl = resolveSlackApiUrlOverride(process.env, (line) => console.error(line))
+  let membershipStatus: ReturnType<typeof membershipConnectionListener> | undefined
   const manager = createPersonaConnectionManager({
     onEvent: createPersonaEventRouter({
       routing: personaRouting,
+      membership: channelMembership,
       clientFor,
       getPersona: getAppliedPersona,
       log: (line) => console.error(line),
@@ -3578,20 +4012,35 @@ export async function main(): Promise<void> {
     log: (line) => console.error(line),
     dryRun: isDryRun(),
     slackApiUrl,
+    incarnationFor: key => channelDeliveryStore?.authority.incarnation(key),
+    canRevalidateMembership: key => !shuttingDown && channelDeliveryStore?.isRetiring(key) === false && bringUps?.canRevalidateMembership(key) === true,
     // a running persona whose Web API call is refused for its bot
     // token is marked credentials-broken at once; only the network close of
     // its detached socket goes through the per-persona serializer.
     serialize: personaLifecycle.run,
     onStatus: composePersonaStatusListeners(
+      (key, status) => { membershipStatus?.(key, status); membershipReadiness?.report(key) },
       createPersonaUpFlushListener(personaNotifier),
       (key, status) => bringUps?.onConnectionStatus(key, status),
       // Apply recovery runs once the apply's steps settle, which can be before
       // a retried bring-up reaches up. Restore retained feedback with the
       // usable client, on initial success and background retry alike.
       (key, status) => { if (status.state === 'up') deliveryReporting?.reconcileQueued(key) },
+      (key, status) => { if (status.state === 'up' && threadMemoryWorkAllowed(key)) ownPostLookups?.kick(key) },
     ),
   })
   connections = manager
+  membershipScanner = createMembershipScanner({
+    authority: reload.sharedChannels()!, membership: channelMembership,
+    connections: manager, dryRun: isDryRun(), log: line => console.error(line),
+    onStatus: key => sharedStateReporting?.check(key),
+  })
+  membershipStatus = membershipConnectionListener(channelMembership, membershipScanner, manager, isDryRun())
+  membershipReadiness = createMembershipReadiness({
+    authority: reload.sharedChannels()!, provenance: key => manager.provenance(key),
+    inventory: key => membershipScanner!.status(key), dryRun: isDryRun(),
+    isRetiring: key => shuttingDown || channelDeliveryStore!.isRetiring(key), log: line => console.error(line),
+  })
 
   // each persona's bring-up outcome (up, broken or
   // retrying) and its retries on its own timers. A persona that reaches up
@@ -3630,7 +4079,24 @@ export async function main(): Promise<void> {
     serialize: personaLifecycle.run,
     bringUps: personaBringUps,
     connections: manager,
-    routing: { ...personaRouting, forget: key => { personaRouting.forget(key); deliveryReporting?.forget(key); deliveryPreparation?.forget(key); void deliveryEngines?.forget(key); deliveryLifecycle?.forget(key) } },
+    cancelThreadMemory: key => forgetPersonaState(key, [
+      k => threadMemoryRetries?.forget(k), k => ownPostLookups?.forget(k), k => memoryHolds?.forget(k), k => postHolds?.forget(k),
+    ]),
+    routing: { ...personaRouting, forget: key => forgetPersonaState(key, [
+      k => personaRouting.forget(k), k => deliveryReporting?.forget(k), k => sharedStateReporting?.forget(k), k => deliveryPreparation?.forget(k),
+      k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => memoryHolds?.forget(k), k => postHolds?.forget(k),
+      k => threadMemoryRetries?.forget(k), k => ownPostLookups?.forget(k), k => ownPostJoins?.forget(k), k => threadMemory?.forget(k),
+    ]) },
+    loadThreadMemory: async key => {
+      await threadMemory?.loadKey(key)
+      if (!shuttingDown && deliveryQueue && threadMemory) {
+        recoverQueuedJoins(key, deliveryQueue, threadMemory)
+        void postHolds?.releaseUntracked(key).then(() => {
+          if (threadMemoryWorkAllowed(key)) return memoryHolds?.resolve(key, 'recovered')
+        }).catch(() => {})
+        ownPostLookups?.kick(key)
+      }
+    },
     destinations: personaDestinations,
     destinationHold: personaDestinationHold,
     notifier: personaNotifier,
@@ -3640,7 +4106,7 @@ export async function main(): Promise<void> {
     log: (line) => console.error(line),
     whenLaunchSettled,
     // The react hand-off's cancel comes first: called at submission and again in the teardown's turn.
-    stopDelivery: async (key) => { reactHandoff?.forget(key); const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); const remindersStopping = replyReminders?.forget(key); await Promise.all([stopping, remindersStopping]) },
+    stopDelivery: async (key) => { reactHandoff?.forget(key); membershipScanner?.stop(key); membershipReadiness?.forget(key); const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); const remindersStopping = replyReminders?.forget(key); await Promise.all([stopping, remindersStopping]) },
     stopLiveRowSequence: (key) => stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN),
     // a teardown cancels a launch's wait for a `working` row rather
     // than wait it out (up to 10 min).
@@ -3792,6 +4258,12 @@ export async function main(): Promise<void> {
         return handleClearLatch(req, server.requestIP(req)?.address, {
           getPersonaConfig: () => personaConfig,
           clearByHand,
+        })
+      }
+
+      if (url.pathname === MEMBERSHIP_READINESS_ROUTE) {
+        return handleMembershipReadiness(req, server.requestIP(req)?.address, {
+          getPersonaConfig: () => personaConfig, readiness: membershipReadiness!,
         })
       }
 
@@ -4090,6 +4562,11 @@ export async function main(): Promise<void> {
   // shutdown() stops the health check and the detection tick; neither is
   // started after it has begun.
   if (shuttingDown) return
+
+  // Startup reports include keys withheld from bring-up by retirement review.
+  const sharedStateKeys = personaConfig.personas.map(persona => persona.key)
+  if (reload.repairActivated()) sharedStateReporting.repairActivated(sharedStateKeys)
+  sharedStateReporting.checkAll(sharedStateKeys)
 
   // Initialize and start the health-check poller.
   initHealthCheck({

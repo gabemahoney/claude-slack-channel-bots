@@ -26,13 +26,13 @@ describe('pins: the one place the class labels and line spelling are written out
 
   test('lines', () => {
     const lines = [
-      buildReactionWithdrawnLine(SUBJECT, 'fungible-refused', 'externally-shared'),
+      buildReactionWithdrawnLine(SUBJECT, 'open-refused', 'externally-shared'),
       buildReactionWithdrawnLine(KEY_ONLY, 'server-post'),
       buildReactionMessageUnknownLine(SUBJECT),
       buildReactionMessageUnknownLine(KEY_ONLY),
     ]
     expect(lines).toEqual([
-      '[slack] reaction-withdrawn: persona="Ops Bot" (key=ops_bot) chat_id="C0GENERAL" message_ts="1700000100.000100" reason=fungible-refused failed_condition=externally-shared',
+      '[slack] reaction-withdrawn: persona="Ops Bot" (key=ops_bot) chat_id="C0GENERAL" message_ts="1700000100.000100" reason=open-refused failed_condition=externally-shared',
       '[slack] reaction-withdrawn: persona=ops_bot chat_id="C0GENERAL" message_ts="1700000100.000100" reason=server-post',
       '[slack] reaction-message-unknown: persona="Ops Bot" (key=ops_bot) chat_id="C0GENERAL" message_ts="1700000100.000100"',
       '[slack] reaction-message-unknown: persona=ops_bot chat_id="C0GENERAL" message_ts="1700000100.000100"',
@@ -49,10 +49,10 @@ describe('builders', () => {
     ['server-post', undefined],
     ['conversation-unknown', undefined],
     ['group-dm', undefined],
-    ['fungible-refused', 'not-a-channel'],
-    ['fungible-refused', 'externally-shared'],
-    ['fungible-refused', 'not_in_channel'],
-    ['fungible-refused', 'channel_not_found'],
+    ['open-refused', 'not-a-channel'],
+    ['open-refused', 'externally-shared'],
+    ['open-refused', 'not_in_channel'],
+    ['open-refused', 'channel_not_found'],
   ]
   test.each(WITHDRAWALS.map(([reason, condition]) => [condition ? `${reason} ${condition}` : reason, reason, condition] as const))('withdrawal %s: the reason, and the condition only when given', (_label, reason, condition) => {
     const end = `reason=${reason}${condition === undefined ? '' : ` failed_condition=${condition}`}`
@@ -101,8 +101,8 @@ describe('builders', () => {
       error: new Error(sentinelInMessage('replies')),
       response: { ok: false, error: 'not_in_channel', token: fakeToken(BOT_TOKEN_PREFIX, 'response') },
     } as ReactionDiagnosticSubject
-    const lines = [buildReactionWithdrawnLine(planted, 'fungible-refused', 'not_in_channel'), buildReactionMessageUnknownLine(planted)]
-    expect(lines).toEqual([buildReactionWithdrawnLine(SUBJECT, 'fungible-refused', 'not_in_channel'), buildReactionMessageUnknownLine(SUBJECT)])
+    const lines = [buildReactionWithdrawnLine(planted, 'open-refused', 'not_in_channel'), buildReactionMessageUnknownLine(planted)]
+    expect(lines).toEqual([buildReactionWithdrawnLine(SUBJECT, 'open-refused', 'not_in_channel'), buildReactionMessageUnknownLine(SUBJECT)])
     for (const marker of MARKERS) expect(lines.join('\n')).not.toContain(marker)
     assertNoLeak(lines)
   })

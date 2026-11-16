@@ -27,6 +27,11 @@
  * a `never` stub outcome does not. `flush()` yields the same turns without
  * moving time.
  *
+ * Real disk steps: a clock told to `settleOn` a counter of in-flight I/O (a
+ * `durableIo` seam) also waits, at each of those points, until that counter's
+ * started steps complete, then yields the turns again. Virtual time does not
+ * move meanwhile, and steps the test holds do not count.
+ *
  * Isolation: no module-scope state, no real timers, no file system, network or
  * environment access, and no source import.
  *
@@ -84,14 +89,23 @@ export interface FakeClock {
    * then. Resolves with the number fired, 0 when nothing is pending.
    */
   runNext(): Promise<number>
-  /** Yield the microtask turns without moving time. */
+  /** Yield the microtask turns, and wait for settled-on I/O, without moving time. */
   flush(): Promise<void>
+  /** Also wait for `io`'s in-flight steps wherever the clock yields turns. */
+  settleOn(io: FakeClockIo): void
   /** Pending timers, earliest first. A snapshot: later changes do not show. */
   pending(): PendingFakeTimer[]
   /** Number of pending timers. */
   pendingCount(): number
   /** Callbacks fired so far. */
   firedCount(): number
+}
+
+/** In-flight real I/O a clock can wait on; `durableIo` provides one. */
+export interface FakeClockIo {
+  busy(): boolean
+  /** Resolves at the next completion. */
+  next(): Promise<void>
 }
 
 interface TimerEntry extends PendingFakeTimer {
@@ -118,9 +132,15 @@ export function createFakeClock(options: FakeClockOptions = {}): FakeClock {
   let nextId = 1
   let fired = 0
   const timers = new Map<number, TimerEntry>()
+  const ios = new Set<FakeClockIo>()
 
   async function flush(): Promise<void> {
-    for (let turn = 0; turn < flushTurns; turn++) await Promise.resolve()
+    for (;;) {
+      for (let turn = 0; turn < flushTurns; turn++) await Promise.resolve()
+      const busy = [...ios].filter(io => io.busy())
+      if (!busy.length) return
+      await Promise.race(busy.map(io => io.next()))
+    }
   }
 
   function earliestDue(limit: number): TimerEntry | undefined {
@@ -183,6 +203,8 @@ export function createFakeClock(options: FakeClockOptions = {}): FakeClock {
     },
 
     flush,
+
+    settleOn(io) { ios.add(io) },
 
     pending: () =>
       [...timers.values()]

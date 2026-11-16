@@ -1,4 +1,7 @@
-/** Durable Slack intake and existing message-triggered recovery. */
+/** Durable Slack intake and existing message-triggered recovery. Hybrid-channel
+ * decisions, joins, Post Holds and Memory Holds share the queue's writer turn.
+ * Holds are acknowledged on storage and enter reporting/preparation only on
+ * release; nothing before the ack waits on a post's outcome. */
 import {
   CHANNEL_ID_RE,
   DEFAULT_QUEUED_ACK_REACTION,
@@ -8,15 +11,21 @@ import {
   type PersonaConfig,
 } from './config.ts'
 import type { SlackBotIdentity } from './persona-slack-validation.ts'
+import type { ChannelMembership, MembershipReading } from './channel-membership.ts'
+import type { PersonaEventProvenance } from './persona-connections.ts'
 import {
   decideDelivery,
+  channelDeliveryFor,
   decideReaction,
+  isOwn,
+  isThreadTimestamp,
   parseReactionShape,
   REACTION_ADDED_EVENT,
   type DeliveryDecision,
   type DropDecision,
   type FungibleDecisionInputs,
   type FungiblePath,
+  type OwnPostsDecisionInput,
   type ReactionAcceptDecision,
   type ReactionDecision,
   type ReactionDecisionOrigin,
@@ -24,19 +33,21 @@ import {
   type ParsedReactionShape,
   type StoredChoices,
 } from './delivery-decision.ts'
-import { fungibleDestinationsOf } from './persona-destination.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import {
   formatPersonaDiagnostic,
+  buildPostAcceptPreparationFailedLine,
+  PERSONA_THREAD_STAMP_UNDECIDED,
+  threadStampUndecidedCause,
   fungibleUnclaimedChannelCause,
-  invitedChannelCause,
+  openChannelCause,
   PERSONA_DM_DROPPED,
-  PERSONA_INVITED_CHANNEL,
+  PERSONA_OPEN_CHANNEL,
   UNCLAIMED_CHANNEL,
   unclaimedChannelCause,
 } from './persona-diagnostics.ts'
 import { describeSlackCallFailure } from './persona-connection-errors.ts'
-import { isQueueItemClosed, type DeliveryQueue, type QueueAcceptResult, type QueueItem, type AcceptedInput, type ReactionAcceptedInput, type ReactionAcceptedRecord, type ReactionKey } from './delivery-queue.ts'
+import { isOpenItem, isQueueItemClosed, type DeliveryQueue, type QueueAcceptDecision, type QueueAcceptResult, type QueueDecidedResult, type QueueItem, type AcceptedInput, type ReactionAcceptedInput, type ReactionAcceptedRecord, type ReactionKey, type SlackKey } from './delivery-queue.ts'
 import {
   buildBotToolReactionErrorLine,
   buildBotToolReactionStoreFailedLine,
@@ -49,6 +60,10 @@ import {
   type ReactionDroppedInput,
   type ReactionIntakePersona,
 } from './reaction-intake-diagnostics.ts'
+import { OWN_ROOT_CLOCK_SKEW_MS } from './delivery-constants.ts'
+import type { ThreadMemory, ThreadJoin, ThreadMemoryStampState } from './thread-memory.ts'
+import type { PostHoldResolver } from './post-holds.ts'
+import type { OwnPostJoins } from './own-post.ts'
 import { getSessionByPersona } from './registry.ts'
 import { isRestartPendingOrActive, RESTART_FAILURE_CAP, scheduleRestart } from './restart.ts'
 import { isAtCap } from './backoff.ts'
@@ -61,6 +76,7 @@ import {
 import { getOutageFlags } from './outage-state.ts'
 import { LIVENESS_PENDING, livenessKindOf, type LivenessReading } from './liveness-reading.ts'
 import { describeAgentDirectorFailure } from './ad-error-class.ts'
+import type { ThreadStampUndecidedEpisodes } from './persona-episodes.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -73,7 +89,7 @@ const NO_AUTHOR_PLACEHOLDER = '(none)'
 const APP_MENTION_EVENT_TYPE = 'app_mention'
 
 /** The channel mode in which a persona serves the channels its app is in. */
-const FUNGIBLE_MODE: ChannelMode = 'fungible'
+const FUNGIBLE_MODE: ChannelMode = 'open'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -81,6 +97,18 @@ const FUNGIBLE_MODE: ChannelMode = 'fungible'
 
 /** The Slack `ack` handed over with a Socket Mode event. */
 export type SlackAck = () => Promise<void> | void
+
+/**
+ * One event's acknowledgement timing. `targets` are the queue items the event
+ * stored or matched, ordered by key then seq; `ts` is the event's own `ts`
+ * when it has one. `receiveToAckMs` ends when the ack is called, or when a
+ * failed store suppresses it; `ackCallMs` is the ack call itself.
+ */
+export interface AckTiming {
+  keys: string[]; ts?: string; targets: Array<{ key: string; seq: number }>
+  outcome: 'acked' | 'ack-failed' | 'suppressed'
+  receiveToAckMs: number; ackCallMs?: number; atMonoMs: number
+}
 
 /**
  * A reaction persona B made with its own `react` tool on a message of the
@@ -115,13 +143,78 @@ export type BotToolReactionIntakeResult =
 
 /**
  * The persona config fields this module reads: the personas, the restart
- * delay, and the `allow_invited_channels` switch, read through
+ * delay, and the `channel_mode` switch, read through
  * `channelModeOf` at each event.
  */
-export type PersonaRoutingConfig = Pick<PersonaConfig, 'personas' | 'session_restart_delay' | 'allow_invited_channels'> & Partial<Pick<PersonaConfig, 'queued_ack_reaction'>>
+export type PersonaRoutingConfig = Pick<PersonaConfig, 'personas' | 'session_restart_delay' | 'channel_mode'> & Partial<Pick<PersonaConfig, 'queued_ack_reaction'>>
+export interface RoutingThreadJoins extends Pick<ThreadMemory, 'hasSavedJoin' | 'clock' | 'addJoin' | 'saveJoins'> {
+  stamp(key: string, channel: string): ThreadMemoryStampState | undefined
+}
+interface SerialSelection {
+  persona?: Persona
+  decision?: DeliveryDecision
+  stampDecided?: boolean
+  requestMembership?: boolean
+  input?: AcceptedInput
+  join?: ThreadJoin
+}
+/** One event's intake across its receiving personas, gathered for the common completion. */
+interface IntakeRun {
+  isExtSharedChannel: unknown
+  provenance: PersonaEventProvenance | undefined
+  /** Receipt on `monotonicNow`: the Post Hold deadline's start and the ack timing's. */
+  receivedAt: number | undefined
+  /** The stored or matched targets, kept only for the ack timing observer. */
+  ackTargets: Array<{ key: string; seq: number }> | undefined
+  /** Retained targets' queued feedback and join saves, on either completion path. */
+  accepted: Array<() => void>
+  saveJoins: Array<() => void>
+  /** Retained targets' recovery and preparation, only after an ack attempt. */
+  afterAck: Array<() => Promise<void>>
+  /** Keys whose target is a stored, unresolved hold. */
+  heldKeys: Set<string>
+  /** A failed or undecidable target suppresses the aggregate ack. */
+  storeFailed: boolean
+}
+/** The outcome retention a Post Hold's decision took. Intake owns it until `held` takes it. */
+interface DecidedRetention { release?: () => void }
+type StoredResult = Extract<QueueAcceptResult, { status: 'accepted' | 'duplicate' }>
 
 /** Dependencies injected into `createPersonaRouting`. */
 export interface PersonaRoutingDeps {
+  /** Receipt time for the Post Hold deadline, before the serial intake wait. */
+  monotonicNow?: () => number
+  /**
+   * Test-only (`test_measurement_timings`): the observer told, after the ack attempt
+   * or its suppression, how long the event took from receipt on
+   * `monotonicNow`. Asked once at receipt; with none (the default), receive
+   * reads no further clock. The observer's throw is ignored.
+   */
+  ackTiming?(): ((timing: AckTiming) => void) | undefined
+  /**
+   * Registers each stored Post Hold in its store's synchronous turn, with
+   * monotonicNow's receipt time, handing over the outcome retention its
+   * decision took. A throw releases that retention; it cannot undo the store.
+   */
+  postHolds?: Pick<PostHoldResolver, 'held'>
+  /** Read the live Thread Memory view only when the decision needs a reply's membership. */
+  threadMemory?: FungibleDecisionInputs['threadMemory']
+  /** P's in-memory Pending Own Posts, read only for a reply not known to be joined. No I/O. */
+  pendingOwnPosts?: OwnPostsDecisionInput['pending']
+  /**
+   * The same owner's outcome retention, taken in a Post Hold's decision
+   * callback before its store so an outcome landing during the store is kept.
+   * The successful store hands it to `postHolds.held`; every other ending
+   * releases it. Absent: nothing is retained.
+   */
+  retainOwnPostOutcomes?: OwnPostJoins['retainOutcomes']
+  /** Join reads/additions are synchronous; saves run only after the ack attempt. */
+  joins?: RoutingThreadJoins
+  /** Pure stamp observation; independent selection never depends on it. */
+  threadStampUndecided?(key: string, channel: string): boolean
+  /** Shared log-only episode owner. Absent fixtures still hold intake, without the diagnostic. */
+  threadStampEpisodes?: ThreadStampUndecidedEpisodes
+  membership?: Pick<ChannelMembership, 'read' | 'hasUnresolved' | 'request'>
   /** The applied persona config, read at call time; null or undefined when there is none. */
   getPersonaConfig(): PersonaRoutingConfig | null | undefined
   /**
@@ -130,7 +223,7 @@ export interface PersonaRoutingDeps {
    */
   getBotIdentity(key: string): SlackBotIdentity | undefined
   /** Shared queue; acceptance does no network I/O. */
-  queue: Pick<DeliveryQueue, 'accept' | 'lookupSlackKey' | 'lookupReactionKey'>
+  queue: Pick<DeliveryQueue, 'accept' | 'acceptDecided' | 'lookupSlackKey' | 'lookupReactionKey'>
   /**
    * Whether `id` is one of the Run Bot Identities (production: the
    * connection manager's `isRunBotIdentity`, which keeps every bot user ID
@@ -143,28 +236,39 @@ export interface PersonaRoutingDeps {
   prepare(key: string, item: QueueItem): Promise<void>
   /** Durable retained acceptance: after envelope ack, or after partial-fanout
    * failure suppresses it. Reporting must not await Slack or authorize delivery. */
-  onReceived?(key: string, item: QueueItem): void
+  onReceived?(key: string, item: QueueItem, mode?: 'live' | 'recovered'): void
+  /** Once per key with a stored, unresolved hold, after the ack attempt or when
+   * a sibling's failed store suppresses the ack. Not awaited; its throw is ignored. */
+  onHoldStored?(key: string): void | Promise<unknown>
   /** Fire-and-forget archive, before the decision, with no pre-ack await. */
   archive(key: string, event: unknown): void
+  /**
+   * P's own message on P's connection, with the identity the decision uses.
+   * Called synchronously inside intake, once per recipient and event, before
+   * the decision; it reads and updates in-memory state and may start Thread
+   * Memory appends without awaiting them (Task rb Decision 3). It awaits
+   * nothing, calls no Slack method, and its throw is ignored. The decision
+   * still drops the event as P's own.
+   */
+  onOwnMessage?(key: string, event: Record<string, unknown>, identity: SlackBotIdentity): void
   /** Writes one log line. */
   log(line: string): void
   /** Intake clock in epoch milliseconds. */
   now?: () => number
   /**
-   * The stored choices: the store's readability and
-   * its read-only lookup, which the one store `main()` loads
-   * (`src/channel-delivery.ts`) satisfies as it is. Read at each
-   * fungible-mode event, never held across events; the routing never writes
-   * to it or drops from it. Null or undefined (before the store is loaded),
-   * or the dep absent: no stored choice applies, so fungible mode serves
-   * every channel at `mentions`. Not asked in declarative mode.
+   * The shared authority's read-only choice projection. Read in both modes
+   * for each event; routing never writes or drops from it. An absent or
+   * unreadable projection leaves channel selection unresolved. DMs depend
+   * only on their own applied settings, not a channel choice or membership.
    */
   getChannelDelivery?(): StoredChoices | null | undefined
   /**
    * Whether persona P is up (production: the server's one
    * `isPersonaUp` predicate), asked for a lost message only: a message lost
    * for a persona that is not up schedules no restart and reports the
-   * `not-up` recovery state. Without it every persona counts as up.
+   * `not-up` recovery state. Intake does not ask it: a not-up persona's
+   * new messages are stored, acknowledged and queued. Without it
+   * every persona counts as up.
    */
   isPersonaUp?(key: string): boolean
   // The lost-message state inputs, each asked for a lost
@@ -265,7 +369,11 @@ export interface PersonaRouting {
   /**
    * Take one `message` or `app_mention` event received for the persona(s)
    * `personaKeys`: archive without awaiting, decide and store all accepted
-   * targets, ack only after every store succeeds, then recover and fix text.
+   * targets, add any in-memory join, ack only after every store succeeds, then
+   * save joins, report, recover and fix text. Hybrid-channel key checks,
+   * decisions, stores and joins share each persona's serial queue turn;
+   * other events retain their outside key check and decision. Stored Post and
+   * Memory Holds get the ack, but no reporting or preparation until release.
    * Each target is isolated; a failed store suppresses the aggregate ack.
    *
    * `isExtSharedChannel` is the envelope flag: the Events API
@@ -279,7 +387,9 @@ export interface PersonaRouting {
     ack: SlackAck,
     personaKeys: string | readonly string[],
     isExtSharedChannel?: unknown,
+    provenance?: PersonaEventProvenance,
   ): Promise<void>
+  releaseHeld(key: string, item: QueueItem, mode: 'live' | 'recovered'): Promise<void>
   /**
    * Take one `reaction_added` or `reaction_removed` event received on the
    * connection of the persona `personaKey`, its only receiver: an event whose
@@ -311,9 +421,10 @@ export interface PersonaRouting {
   forget(key: string): void
   /**
    * A snapshot of the persona's heard set: the channels whose
-   * events took its fungible path in its current persona life. Empty for an
-   * unknown or forgotten key; creates no state. The "heard" half of
-   * `set_channel_delivery`'s known channels.
+   * events took its open path in its current persona life. Empty for an
+   * unknown or forgotten key; creates no state. Diagnostic only: it
+   * establishes neither current membership nor `set_channel_delivery`
+   * authorization.
    */
   heardChannels(key: string): ReadonlySet<string>
 }
@@ -330,10 +441,46 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   function log(line: string): void {
     try { deps.log(line) } catch { /* non-critical */ }
   }
+  function reportReceived(key: string, item: QueueItem, mode: 'live' | 'recovered' = 'live'): void {
+    try { void Promise.resolve(deps.onReceived?.(key, item, mode)).catch(() => {}) } catch { /* reporting cannot prevent preparation */ }
+  }
+  async function postAccepted(key: string, item: QueueItem, mode: 'live' | 'recovered'): Promise<void> {
+    if (!isOpenItem(item)) return
+    const posted = postAcked.get(key) ?? new Set<number>()
+    if (posted.has(item.accepted.seq)) return
+    posted.add(item.accepted.seq); postAcked.set(key, posted)
+    const config = deps.getPersonaConfig(), persona = config?.personas.find(p => p.key === key)
+    const session = getSessionByPersona(key)
+    if (mode === 'live' && persona && config && (!session || !session.connected)) await handleLostMessage(persona, persona.working_directory, config)
+    if (postAcked.get(key) !== posted) return
+    await deps.prepare(key, item)
+  }
   /** The persona reference for a key: its rendered name when applied, else the bare key. */
   function refForKey(key: string): string {
     const persona = deps.getPersonaConfig()?.personas.find((p) => p.key === key)
     return persona ? renderPersonaRef(persona.name, persona.key) : `key=${key}`
+  }
+  /** The identity the decision uses for a key: the provenance's when it is that key's, else the current one. */
+  function identityFor(key: string, provenance: PersonaEventProvenance | undefined): SlackBotIdentity | undefined {
+    return provenance?.key === key ? provenance.identity : deps.getBotIdentity(key)
+  }
+
+  /** Hand one event's ack timing to the test-only observer; the second reading ends the ack call or the suppression. */
+  function reportAckTiming(
+    observer: (timing: AckTiming) => void, event: unknown, personaKeys: string | readonly string[], receivedAt: number,
+    targets: Array<{ key: string; seq: number }>, outcome: AckTiming['outcome'], ackCalledAt?: number,
+  ): void {
+    try {
+      const atMonoMs = deps.monotonicNow!()
+      const ts = typeof event === 'object' && event !== null ? (event as Record<string, unknown>)['ts'] : undefined
+      observer({
+        keys: typeof personaKeys === 'string' ? [personaKeys] : [...personaKeys],
+        ...(typeof ts === 'string' ? { ts } : {}),
+        targets: [...targets].sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : a.seq - b.seq),
+        outcome, receiveToAckMs: (ackCalledAt ?? atMonoMs) - receivedAt,
+        ...(ackCalledAt !== undefined ? { ackCallMs: atMonoMs - ackCalledAt } : {}), atMonoMs,
+      })
+    } catch { /* a measurement cannot change intake */ }
   }
 
   /** Reaction builders own persona rendering, including the key-only fallback. */
@@ -347,88 +494,196 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     ack: SlackAck,
     personaKeys: string | readonly string[],
     isExtSharedChannel?: unknown,
+    provenance?: PersonaEventProvenance,
   ): Promise<void> {
-    const afterAck: Array<() => Promise<void>> = []
-    const accepted: Array<() => void> = []
-    let storeFailed = false
+    const receivedAt = deps.monotonicNow?.()
+    if (provenance?.candidate) { deps.membership?.request(provenance.key); return }
+    if (provenance?.applied && !provenance.isCurrent()) { await ack(); return }
+    if (provenance && !provenance.applied) return
+    const ackTiming = receivedAt !== undefined ? deps.ackTiming?.() : undefined
+    const run: IntakeRun = {
+      isExtSharedChannel, provenance, receivedAt, ackTargets: ackTiming ? [] : undefined,
+      accepted: [], saveJoins: [], afterAck: [], heldKeys: new Set(), storeFailed: false,
+    }
     if (typeof event === 'object' && event !== null) {
       const keys = typeof personaKeys === 'string' ? [personaKeys] : personaKeys
-      await Promise.all(keys.map(async key => {
-        try { deps.archive(key, event) } catch (err) {
-          log(`[slack] persona-routing: archive write failed for persona ${refForKey(key)}${describeSlackCallFailure(err)}`)
-        }
-        try {
-          const ev = event as Record<string, unknown>
-          const config = deps.getPersonaConfig()
-          const mode = channelModeOf(config)
-          if (mode === FUNGIBLE_MODE && ev['type'] === APP_MENTION_EVENT_TYPE) return
-          const slackKey = typeof ev['channel'] === 'string' && typeof ev['ts'] === 'string'
-            ? { chat_id: ev['channel'], ts: ev['ts'], ...(typeof editedTs(ev) === 'string' ? { edited_ts: editedTs(ev) as string } : {}) } : undefined
-          // A retry after partial fanout must prepare the already retained, unfixed target too.
-          const duplicate = slackKey ? deps.queue.lookupSlackKey(key, slackKey) : undefined
-          const persona = config?.personas.find(p => p.key === key)
-          const report = (item: QueueItem) => accepted.push(() => {
-            try { void Promise.resolve(deps.onReceived?.(key, item)).catch(() => {}) } catch { /* reporting cannot prevent preparation */ }
-          })
-          const post = (item: QueueItem) => async () => {
-            const posted = postAcked.get(key) ?? new Set<number>()
-            if (posted.has(item.accepted.seq)) return
-            // Claim only after the aggregate ack: retained partial fanout can
-            // retry here, but concurrent/redelivered copies recover just once.
-            posted.add(item.accepted.seq)
-            postAcked.set(key, posted)
-            const session = getSessionByPersona(key)
-            if (persona && config && (!session || !session.connected)) await handleLostMessage(persona, persona.working_directory, config)
-            await deps.prepare(key, item)
-          }
-          if (duplicate && duplicate.status !== 'failed') {
-            if (duplicate.item && !duplicate.item.fixed && !duplicate.item.delivered) {
-              report(duplicate.item)
-              afterAck.push(post(duplicate.item))
-            }
-            return
-          }
-          if (!config || !persona) return
-          const identity = deps.getBotIdentity(key)
-          const decision = decideDelivery(ev, { key, botUserId: identity?.botUserId, botId: identity?.botId, channels: persona.channels, dmEnabled: persona.dm.enabled }, config.personas, fungibleInputs(config, mode, isExtSharedChannel))
-          const path = fungiblePathOf(decision)
-          if (path !== undefined) logFirstHeard(persona, String(ev['channel']), path)
-          if (decision.action === 'drop') { logDrop(persona, ev, decision); return }
-          if (!slackKey) return
-          const stringField = (field: string) => typeof ev[field] === 'string' ? ev[field] as string : undefined
-          const profile = ev['bot_profile']
-          const files = Array.isArray(ev['files']) ? ev['files'].filter(f => typeof f === 'object' && f !== null).map(f => ({
-            name: typeof f.name === 'string' ? f.name : 'unnamed',
-            mimetype: typeof f.mimetype === 'string' ? f.mimetype : undefined,
-            size: typeof f.size === 'number' ? f.size : undefined,
-          })) : undefined
-          const input: AcceptedInput = {
-            source: 'slack', key: slackKey, channel: slackKey.chat_id, ts: slackKey.ts,
-            queued_ack_reaction: config.queued_ack_reaction ?? DEFAULT_QUEUED_ACK_REACTION,
-            channel_type: stringField('channel_type'), thread_ts: stringField('thread_ts'), edited_ts: slackKey.edited_ts,
-            user: stringField('user'), bot_id: stringField('bot_id'), username: stringField('username'),
-            bot_profile_name: typeof profile === 'object' && profile !== null && 'name' in profile && typeof profile.name === 'string' ? profile.name : undefined,
-            text: stringField('text') ?? '', files, via: decision.via, received_at: (deps.now ?? Date.now)(),
-          }
-          try {
-            const result = await deps.queue.accept(key, input)
-            if (result.status === 'failed') { storeFailed = true; return }
-            if (result.item && !result.item.delivered) { report(result.item); afterAck.push(post(result.item)) }
-          } catch { storeFailed = true }
-        } catch (err) {
-          // Decision/routing failures keep the historical ack behavior.
-          log(`[slack] persona-routing: error handling event for persona ${refForKey(key)}${describeSlackCallFailure(err)}`)
-        }
-      }))
+      await Promise.all(keys.map(key => intakeFor(run, key, event as Record<string, unknown>)))
     }
     // A failed sibling suppresses the aggregate ack, but retained targets still
-    // deserve queued feedback. Preparation/recovery continue only after ack.
-    if (storeFailed) { for (const report of accepted) report(); return }
-    try { await ack() } catch (err) { log(`[slack] persona-routing: failed to ack event${describeSlackCallFailure(err)}`) }
-    for (const report of accepted) report()
-    await Promise.all(afterAck.map(async work => {
-      try { await work() } catch (err) { log(`[slack] persona-routing: post-accept preparation failed${describeSlackCallFailure(err)}`) }
+    // deserve queued feedback, and stored holds still resolve. Preparation and
+    // recovery continue only after an ack.
+    if (run.storeFailed) {
+      if (ackTiming) reportAckTiming(ackTiming, event, personaKeys, receivedAt!, run.ackTargets!, 'suppressed')
+      completeRetained(run)
+      return
+    }
+    const ackCalledAt = ackTiming ? deps.monotonicNow!() : undefined
+    let ackFailed = false
+    try { await ack() } catch (err) { ackFailed = true; log(`[slack] persona-routing: failed to ack event${describeSlackCallFailure(err)}`) }
+    if (ackTiming) reportAckTiming(ackTiming, event, personaKeys, receivedAt!, run.ackTargets!, ackFailed ? 'ack-failed' : 'acked', ackCalledAt)
+    completeRetained(run)
+    await Promise.all(run.afterAck.map(async work => {
+      try { await work() } catch (err) { log(buildPostAcceptPreparationFailedLine(describeSlackCallFailure(err))) }
     }))
+  }
+
+  /** One receiving persona: archive, the own-message hook, then its target's intake path. */
+  async function intakeFor(run: IntakeRun, key: string, ev: Record<string, unknown>): Promise<void> {
+    try { deps.archive(key, ev) } catch (err) {
+      log(`[slack] persona-routing: archive write failed for persona ${refForKey(key)}${describeSlackCallFailure(err)}`)
+    }
+    // One entry for both intake paths, outside the serial decision callback.
+    try {
+      const identity = identityFor(key, run.provenance)
+      if (deps.onOwnMessage && identity && isOwn(typeof ev['user'] === 'string' ? ev['user'] : undefined,
+        typeof ev['bot_id'] === 'string' ? ev['bot_id'] : undefined, identity)) deps.onOwnMessage(key, ev, identity)
+    } catch { /* the event is handled as before */ }
+    try { await routeTarget(run, key, ev) } catch (err) {
+      // A failed selection is undecidable, never permission to discard.
+      run.storeFailed = true
+      log(`[slack] persona-routing: error handling event for persona ${refForKey(key)}${describeSlackCallFailure(err)}`)
+    }
+  }
+
+  /** The target's path: the serial writer turn, a retained duplicate, or the independent decision. */
+  function routeTarget(run: IntakeRun, key: string, ev: Record<string, unknown>): Promise<void> | undefined {
+    const config = deps.getPersonaConfig()
+    const mode = channelModeOf(config)
+    if (mode === FUNGIBLE_MODE && ev['type'] === APP_MENTION_EVENT_TYPE) return
+    const slackKey = typeof ev['channel'] === 'string' && typeof ev['ts'] === 'string'
+      ? { chat_id: ev['channel'], ts: ev['ts'], ...(typeof editedTs(ev) === 'string' ? { edited_ts: editedTs(ev) as string } : {}) } : undefined
+    if (usesSerialIntake(key, ev, mode, run.isExtSharedChannel)) return serialIntake(run, key, ev, slackKey)
+    // A retry after partial fanout must prepare the already retained, unfixed target too.
+    const duplicate = slackKey ? deps.queue.lookupSlackKey(key, slackKey) : undefined
+    if (duplicate && duplicate.status !== 'failed') { noteStored(run, key, slackKey, duplicate); return }
+    const persona = config?.personas.find(p => p.key === key)
+    if (!config || !persona) return
+    return independentIntake(run, key, ev, slackKey, config, persona, mode)
+  }
+
+  /**
+   * Hybrid-channel intake: key check, decision, store and join share P's
+   * writer turn. A Post Hold's outcome retention is intake's until its
+   * store's afterStore hands it to `held`; any other ending releases it.
+   */
+  async function serialIntake(run: IntakeRun, key: string, ev: Record<string, unknown>, slackKey: SlackKey | undefined): Promise<void> {
+    let selection: SerialSelection | undefined
+    let result: QueueDecidedResult<SerialSelection>
+    const retention: DecidedRetention = {}
+    try {
+      result = await deps.queue.acceptDecided<SerialSelection>(key, slackKey, () => {
+        selection = decideSerialIntake(key, ev, slackKey, run.isExtSharedChannel, run.provenance)
+        return selection.input ? serialStore(key, selection.input, selection.join, run.receivedAt, retention) : { skip: selection }
+      })
+    } finally { releaseDecided(retention) }
+    if (selection) reportSerialSelection(key, ev, slackKey, selection)
+    if (selection?.requestMembership || result.status === 'failed') run.storeFailed = true
+    if (result.status === 'skipped' || result.status === 'failed') return
+    if (result.status === 'accepted' && selection?.join) {
+      const fact = selection.join
+      run.saveJoins.push(() => {
+        try { void deps.joins?.saveJoins(key, [fact]).catch(() => {}) } catch { /* kept join is recovered independently */ }
+      })
+    }
+    noteStored(run, key, slackKey, result)
+  }
+
+  /** The selected input's store and its applied afterStore effect, in the writer turn. */
+  function serialStore(
+    key: string, input: AcceptedInput, join: ThreadJoin | undefined, receivedAt: number | undefined, retention: DecidedRetention,
+  ): QueueAcceptDecision<SerialSelection> {
+    const hold = input.hold, postHolds = deps.postHolds
+    if (hold?.on === 'post' && postHolds && receivedAt !== undefined) {
+      // Before the store: an outcome that lands during its fsync must survive it.
+      retainDecided(retention, key, hold.operations)
+      return { store: input, afterStore: ({ seq }) => {
+        const handed = retention.release ?? NO_RETENTION
+        retention.release = undefined
+        try {
+          postHolds.held(key, { seq, operations: hold.operations, threadRoot: hold.thread_ts, rootUnknown: hold.root_unknown, receivedAt }, handed)
+        } catch { releaseQuietly(handed) /* cannot undo the store or suppress its ack */ }
+      } }
+    }
+    return { store: input, ...(join ? { afterStore: () => { deps.joins?.addJoin(key, join) } } : {}) }
+  }
+
+  /** Take the owner's outcome retention for a Post Hold's operations, replacing any earlier one. */
+  function retainDecided(retention: DecidedRetention, key: string, operations: readonly string[]): void {
+    releaseDecided(retention)
+    try { retention.release = deps.retainOwnPostOutcomes?.(key, operations) } catch { /* the hold still resolves by its deadline */ }
+  }
+
+  /** Release a retention `held` did not take. The owner's handle is idempotent and life-scoped. */
+  function releaseDecided(retention: DecidedRetention): void {
+    const release = retention.release
+    retention.release = undefined
+    if (release) releaseQuietly(release)
+  }
+
+  /** A stored or matched target's ack timing, hold notification, queued feedback and preparation. */
+  function noteStored(run: IntakeRun, key: string, slackKey: SlackKey | undefined, result: StoredResult): void {
+    const item = result.item
+    if (item) run.ackTargets?.push({ key, seq: item.accepted.seq })
+    // Any unresolved hold, Post or Memory, is acknowledged but not open work.
+    if (item?.hold?.state === 'unresolved') run.heldKeys.add(key)
+    if (item && isOpenItem(item) && (result.status !== 'duplicate' || !item.fixed)) retainTarget(run, key, item)
+    if (result.status === 'duplicate' && slackKey && deps.membership?.hasUnresolved(key, slackKey.chat_id)) requestMembership(run, key)
+  }
+
+  /** A retained target: queued feedback on either completion path, recovery and preparation after an ack. */
+  function retainTarget(run: IntakeRun, key: string, item: QueueItem): void {
+    run.accepted.push(() => reportReceived(key, item))
+    run.afterAck.push(() => postAccepted(key, item, 'live'))
+  }
+
+  /** An undecided membership withholds the aggregate ack until Slack's retry. */
+  function requestMembership(run: IntakeRun, key: string): void {
+    run.storeFailed = true
+    deps.membership?.request(key)
+  }
+
+  /** The decision outside the writer turn, for a target the serial path does not take. */
+  async function independentIntake(
+    run: IntakeRun, key: string, ev: Record<string, unknown>, slackKey: SlackKey | undefined,
+    config: PersonaRoutingConfig, persona: Persona, mode: ChannelMode,
+  ): Promise<void> {
+    if (slackKey && deps.threadStampUndecided?.(key, slackKey.chat_id) !== true) deps.threadStampEpisodes?.end(key, slackKey.chat_id)
+    const identity = identityFor(key, run.provenance)
+    const decision = decideDelivery(ev, { key, botUserId: identity?.botUserId, botId: identity?.botId, channels: persona.channels, dmEnabled: persona.dm.enabled }, config.personas, fungibleInputs(config, mode, run.isExtSharedChannel, slackKey?.chat_id))
+    if (decision.action === 'unresolved') {
+      if (decision.reason === 'thread-stamp-undecided') beginStampUndecided(persona, slackKey)
+      requestMembership(run, key)
+      return
+    }
+    const path = fungiblePathOf(decision)
+    if (path !== undefined) logFirstHeard(persona, String(ev['channel']), path)
+    if (decision.action === 'drop') { logDrop(persona, ev, decision); return }
+    // A plain-path choice raced into thread_hybrid. Re-enter on Slack's
+    // retry so a dependent reply is always decided in the writer turn.
+    if (decision.action === 'hold') { run.storeFailed = true; return }
+    if (!slackKey) return
+    if (decision.via !== 'dm' && deps.membership) {
+      const membership = deps.membership.read(key, slackKey.chat_id, mode)
+      if (membership.kind === 'ineligible') return
+      if (membership.kind === 'unresolved' || (run.provenance && !run.provenance.isCurrent())) { requestMembership(run, key); return }
+    }
+    const input = acceptedInput(ev, slackKey, config, decision.via)
+    try {
+      const result = await deps.queue.accept(key, input)
+      if (result.status === 'failed') { run.storeFailed = true; return }
+      if (result.item) run.ackTargets?.push({ key, seq: result.item.accepted.seq })
+      if (result.item && isOpenItem(result.item)) retainTarget(run, key, result.item)
+    } catch { run.storeFailed = true }
+  }
+
+  /** Retained targets' effects on both completion paths, none awaited: join
+   * saves, queued feedback, then each stored hold's notification. */
+  function completeRetained(run: IntakeRun): void {
+    for (const save of run.saveJoins) save()
+    for (const report of run.accepted) report()
+    for (const key of run.heldKeys) {
+      try { void Promise.resolve(deps.onHoldStored?.(key)).catch(() => {}) } catch { /* durable holds recover independently */ }
+    }
   }
 
   /**
@@ -546,8 +801,9 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
    * `decideReaction` for persona `key` under the configuration in effect now:
    * its channels, DMs switch, `reaction_notices` switch and confirmed bot
    * user ID, the mode,
-   * `CHANNEL_ID_RE` and the Run Bot Identities. A `bot-tool` reaction has no
-   * envelope flag.
+   * `CHANNEL_ID_RE`, the stored choices, P's current membership of the
+   * reaction's channel and the Run Bot Identities. A `bot-tool` reaction has
+   * no envelope flag.
    */
   function decideReactionFor(
     event: unknown,
@@ -558,11 +814,17 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     isExtSharedChannel?: unknown,
   ): ReactionDecision {
     const identity = deps.getBotIdentity(key)
+    const mode = channelModeOf(config)
+    const channel = parseReactionShape(event)?.channel
+    const memberships = new Map<string, MembershipReading>()
+    if (channel && CHANNEL_ID_RE.test(channel)) memberships.set(key, membershipReadingOf(key, channel, mode))
     return decideReaction(event, { key, botUserId: identity?.botUserId, channels: persona.channels, dmEnabled: persona.dm.enabled, reaction_notices: persona.reaction_notices }, {
-      mode: channelModeOf(config),
+      mode,
       origin,
       channelIdPattern: CHANNEL_ID_RE,
       isExtSharedChannel,
+      storedChoices: deps.getChannelDelivery?.() ?? undefined,
+      memberships,
       isRunBotIdentity: (id) => deps.isRunBotIdentity?.(id) ?? true,
     })
   }
@@ -586,7 +848,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       case 'own-reaction':
       case 'bot-reaction':
         return
-      case 'fungible-refused':
+      case 'open-refused':
         drop = { reason: decision.reason, refusal: decision.refusal, ...at }
         break
       default:
@@ -595,34 +857,132 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     safeLog(() => buildReactionDroppedLine({ key: persona.key, name: persona.name }, drop))
   }
 
-  /**
-   * The decision's fungible-mode inputs,
-   * built only in fungible mode, from the configuration in effect and the
-   * stored choices read now: the mode, the envelope flag as received,
-   * `CHANNEL_ID_RE`, the stored choices, and each applied persona's
-   * destination through the one destination rule. Undefined in declarative
-   * mode, so the decision is declarative mode's and nothing of the fungible
-   * section is read.
-   */
+  /** Path choice only; selection re-reads these facts in the writer turn. */
+  function usesSerialIntake(key: string, ev: Record<string, unknown>, mode: ChannelMode, extShared: unknown): boolean {
+    const channel = ev['channel'], kind = ev['channel_type']
+    if (typeof channel !== 'string' || !CHANNEL_ID_RE.test(channel) || kind === 'im' || kind === 'mpim') return false
+    if (mode === FUNGIBLE_MODE && (extShared !== false || (kind !== 'channel' && kind !== 'group'))) return false
+    if (channelDeliveryFor(key, channel, { storedChoices: deps.getChannelDelivery?.() ?? undefined }).delivery !== 'thread_hybrid') return false
+    return deps.membership?.read(key, channel, mode).kind !== 'ineligible'
+  }
+
+  /** No effects: the queue can run this even when its journal cannot load. */
+  function decideSerialIntake(
+    key: string, ev: Record<string, unknown>, slackKey: SlackKey | undefined,
+    extShared: unknown, provenance: PersonaEventProvenance | undefined,
+  ): SerialSelection {
+    const config = deps.getPersonaConfig(), persona = config?.personas.find(p => p.key === key)
+    if (!config || !persona) return {}
+    const mode = channelModeOf(config), identity = identityFor(key, provenance)
+    const inputs = fungibleInputs(config, mode, extShared, slackKey?.chat_id)
+    const decision = decideDelivery(ev, { key, botUserId: identity?.botUserId, botId: identity?.botId, channels: persona.channels, dmEnabled: persona.dm.enabled }, config.personas, inputs)
+    const selection: SerialSelection = { persona, decision, stampDecided: !!slackKey && deps.threadStampUndecided?.(key, slackKey.chat_id) !== true }
+    if (decision.action === 'unresolved') return { ...selection, requestMembership: true }
+    if (decision.action === 'drop' || !slackKey) return selection
+    const membership = deps.membership?.read(key, slackKey.chat_id, mode)
+    if (membership?.kind === 'ineligible') return selection
+    if (membership?.kind === 'unresolved' || (provenance && !provenance.isCurrent())) return { ...selection, requestMembership: true }
+    selection.input = acceptedInput(ev, slackKey, config, decision.via)
+    const joins = deps.joins, root = ev['thread_ts'] === undefined ? ev['ts'] : ev['thread_ts']
+    if (decision.action === 'hold') {
+      const stamp = joins?.stamp(key, slackKey.chat_id)
+      if (!joins || stamp?.kind !== 'decided' || !stamp.threadHybridSince) {
+        delete selection.input
+        return { ...selection, requestMembership: true }
+      }
+      const holdStamp = { incarnation: stamp.incarnation, threadHybridSince: stamp.threadHybridSince }, arrived_at = joins.clock(key)
+      selection.input.hold = decision.hold === 'post'
+        ? { on: 'post', operations: [...decision.operations], thread_ts: decision.threadRoot, stamp: holdStamp, root_unknown: decision.rootUnknown, arrived_at }
+        : { on: 'memory', thread_ts: decision.threadRoot, stamp: holdStamp, arrived_at }
+      return selection
+    }
+    if (!joins || (decision.via !== 'mention' && decision.via !== 'broadcast') || 'edited' in ev || ev['subtype'] === 'message_changed' ||
+      !isThreadTimestamp(root) || channelDeliveryFor(key, slackKey.chat_id, inputs ?? {}).delivery !== 'thread_hybrid') return selection
+    const stamp = joins.stamp(key, slackKey.chat_id)
+    if (stamp?.kind !== 'decided' || !stamp.threadHybridSince) return selection
+    const channelStamp = { incarnation: stamp.incarnation, threadHybridSince: stamp.threadHybridSince }
+    if (joins.hasSavedJoin(key, slackKey.chat_id, root, channelStamp)) return selection
+    const at = joins.clock(key)
+    selection.input.thread_join = { thread_ts: root, stamp: channelStamp, at }
+    selection.join = { channel: slackKey.chat_id, root, stamp: channelStamp, at, source: decision.via }
+    return selection
+  }
+
+  /** Delayed effects from the serial decision; never run inside the queue turn. */
+  function reportSerialSelection(key: string, ev: Record<string, unknown>, slackKey: SlackKey | undefined, selection: SerialSelection): void {
+    const { persona, decision } = selection
+    if (!persona || !decision) return
+    if (slackKey && selection.stampDecided) deps.threadStampEpisodes?.end(key, slackKey.chat_id)
+    if (decision.action === 'unresolved') {
+      if (decision.reason === 'thread-stamp-undecided') beginStampUndecided(persona, slackKey)
+    } else {
+      const path = fungiblePathOf(decision)
+      if (path) logFirstHeard(persona, String(ev['channel']), path)
+      if (decision.action === 'drop') logDrop(persona, ev, decision)
+    }
+    if (selection.requestMembership) deps.membership?.request(key)
+  }
+
+  /** One line when a decision first waits on the channel's undecided stamp in this episode. */
+  function beginStampUndecided(persona: Persona, slackKey: SlackKey | undefined): void {
+    if (!slackKey || !deps.threadStampEpisodes?.begin(persona.key, slackKey.chat_id)) return
+    log(formatPersonaDiagnostic({ class: PERSONA_THREAD_STAMP_UNDECIDED, name: persona.name, key: persona.key, index: persona.index, cause: threadStampUndecidedCause(slackKey.chat_id) }))
+  }
+
+  function acceptedInput(ev: Record<string, unknown>, slackKey: SlackKey, config: PersonaRoutingConfig, via: string): AcceptedInput {
+    const stringField = (field: string) => typeof ev[field] === 'string' ? ev[field] as string : undefined
+    const profile = ev['bot_profile']
+    const files = Array.isArray(ev['files']) ? ev['files'].filter(f => typeof f === 'object' && f !== null).map(f => ({
+      name: typeof f.name === 'string' ? f.name : 'unnamed',
+      mimetype: typeof f.mimetype === 'string' ? f.mimetype : undefined,
+      size: typeof f.size === 'number' ? f.size : undefined,
+    })) : undefined
+    return {
+      source: 'slack', key: slackKey, channel: slackKey.chat_id, ts: slackKey.ts,
+      queued_ack_reaction: config.queued_ack_reaction ?? DEFAULT_QUEUED_ACK_REACTION,
+      channel_type: stringField('channel_type'), thread_ts: stringField('thread_ts'), edited_ts: slackKey.edited_ts,
+      user: stringField('user'), bot_id: stringField('bot_id'), username: stringField('username'),
+      bot_profile_name: typeof profile === 'object' && profile !== null && 'name' in profile && typeof profile.name === 'string' ? profile.name : undefined,
+      text: stringField('text') ?? '', files, via, received_at: (deps.now ?? Date.now)(),
+    }
+  }
+
+  /** Persona `key`'s current membership of `channel`; a failed read leaves only it unresolved. */
+  function membershipReadingOf(key: string, channel: string, mode: ChannelMode): MembershipReading {
+    try {
+      return deps.membership?.read(key, channel, mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' }
+    } catch {
+      return { kind: 'unresolved', reason: 'current-membership-missing' }
+    }
+  }
+
+  /** Applied choices and current membership, read for each event in both modes. */
   function fungibleInputs(
     config: PersonaRoutingConfig,
     mode: ChannelMode,
     isExtSharedChannel: unknown,
+    channel: string | undefined,
   ): FungibleDecisionInputs | undefined {
-    if (mode !== FUNGIBLE_MODE) return undefined
+    const memberships = new Map<string, MembershipReading>()
+    if (channel && CHANNEL_ID_RE.test(channel)) {
+      for (const persona of config.personas) memberships.set(persona.key, membershipReadingOf(persona.key, channel, mode))
+    }
     return {
       mode,
       isExtSharedChannel,
       channelIdPattern: CHANNEL_ID_RE,
       storedChoices: deps.getChannelDelivery?.() ?? undefined,
-      fungibleDestinations: fungibleDestinationsOf(config, config.personas),
+      threadMemory: deps.threadMemory,
+      ...(deps.pendingOwnPosts ? { ownPosts: { pending: deps.pendingOwnPosts, clockSkewMs: OWN_ROOT_CLOCK_SKEW_MS } } : {}),
+      threadStampUndecided: deps.threadStampUndecided,
+      memberships,
     }
   }
 
   /**
-   * the first event in P's life that took P's fungible path
+   * the first event in P's life that took P's open path
    * for `channel` adds it to P's heard set and logs one
-   * `persona-invited-channel` line, before any drop line or dispatch. Later
+   * `persona-open-channel` line, before any drop line or dispatch. Later
    * events from that channel log nothing here.
    */
   function logFirstHeard(persona: Persona, channel: string, path: FungiblePath): void {
@@ -634,11 +994,11 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     if (heard.has(channel)) return
     heard.add(channel)
     log(formatPersonaDiagnostic({
-      class: PERSONA_INVITED_CHANNEL,
+      class: PERSONA_OPEN_CHANNEL,
       name: persona.name,
       key: persona.key,
       index: persona.index,
-      cause: invitedChannelCause(channel, path.channelType, path.channelDelivery),
+      cause: openChannelCause(channel, path.channelType, path.channelDelivery),
     }))
   }
 
@@ -656,7 +1016,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
           cause: unclaimedChannelCause(channel),
         }))
         return
-      case 'fungible-refused':
+      case 'open-refused':
         // one line naming the refusal's reason.
         log(formatPersonaDiagnostic({
           class: UNCLAIMED_CHANNEL,
@@ -824,18 +1184,32 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
 
   return {
     receive,
+    async releaseHeld(key, item, mode) {
+      if (!isOpenItem(item) || (item.hold?.state !== 'released' && item.accepted.released_at === undefined)) return
+      reportReceived(key, item, mode)
+      await postAccepted(key, item, mode)
+    },
     receiveReaction,
     receiveBotToolReaction,
     forget: (key) => {
       heardSets.delete(key)
+      postAcked.delete(key)
     },
     heardChannels: (key) => new Set(heardSets.get(key)),
   }
 }
 
-/** The fungible-path part of a decision, or undefined when the event did not take the path. */
+/** The open-path part of a decision, or undefined when the event did not take the path. */
 function fungiblePathOf(decision: DeliveryDecision): FungiblePath | undefined {
   return 'fungible' in decision ? decision.fungible : undefined
+}
+
+/** The retention handed to `held` when its decision took none. */
+const NO_RETENTION = (): void => {}
+
+/** Release an outcome retention; the owner's failure cannot reach intake. */
+function releaseQuietly(release: () => void): void {
+  try { release() } catch { /* isolated owner */ }
 }
 
 // ---------------------------------------------------------------------------

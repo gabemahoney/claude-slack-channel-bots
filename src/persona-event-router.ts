@@ -13,9 +13,12 @@
  * receiving persona as the only receiver. The envelope flag is the `is_ext_shared_channel` field of the listener
  *   argument's `body` (the Events API payload), passed exactly as received:
  *   `true`, `false`, any other value, or undefined when there is no body or
- *   no such field. It is read from the envelope only, never from the event,
- *   and nothing else of the envelope is passed. The intake acks first; an
- *   event with no body is acked and dropped there.
+ *   no such field. It is read from the envelope only, never from the event.
+ *   Issuing connection provenance accompanies intake; unresolved required
+ *   membership or persistence prevents aggregate acknowledgement.
+ * - `member_joined_channel` and `channel_left`: authenticated observations
+ *   go to the shared membership owner, which permits acknowledgement only
+ *   after effects or sufficient recovery evidence are durable.
  * - `interactive`: the payload is unwrapped (`body`, then `payload`, then the
  *   argument itself); the channel, message `ts` and clicking user are taken
  *   from its envelope; `cscb.block_action.received` is emitted for every
@@ -29,7 +32,8 @@
  *   `ack`, the receiving persona's key and the envelope flag (read as for
  *   messages) go to the reaction intake (`persona-routing.ts`
  *   `receiveReaction`), which acks and writes the only lines.
- * - Any other event name is acked and ignored.
+ * - Any other event name (defensive: the manager forwards only the seven
+ *   above) is acked and ignored.
  *
  * Every event is handled only for the persona whose connection received it:
  * no other persona's key, connection or client is consulted here. A throw
@@ -46,9 +50,10 @@
  * SPDX-License-Identifier: MIT
  */
 
-import type { PersonaEventHandler, PersonaSocketEventPayload } from './persona-connections.ts'
+import type { PersonaEventHandler, PersonaEventProvenance, PersonaSocketEventPayload } from './persona-connections.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import type { PersonaRouting } from './persona-routing.ts'
+import type { ChannelMembership } from './channel-membership.ts'
 import {
   emitBlockActionReceived,
   handlePermissionClick,
@@ -73,6 +78,7 @@ const ENVELOPE_FLAG_FIELD = 'is_ext_shared_channel'
 export interface PersonaEventRouterDeps {
   /** The persona-routing intakes: `receive` for `message` and `app_mention`, `receiveReaction` for reactions. */
   routing: Pick<PersonaRouting, 'receive' | 'receiveReaction'>
+  membership?: Pick<ChannelMembership, 'observe'>
   /** The persona's Slack client for the click handler (`clientFor`). */
   clientFor: ClickDeps['clientFor']
   /** The applied persona with this key, for the click handler. */
@@ -101,10 +107,10 @@ export function createPersonaEventRouter(deps: PersonaEventRouterDeps): PersonaE
     try { deps.log(line) } catch { /* non-critical */ }
   }
 
-  async function routeInbound(key: string, eventName: string, payload: PersonaSocketEventPayload): Promise<void> {
+  async function routeInbound(key: string, eventName: string, payload: PersonaSocketEventPayload, provenance?: PersonaEventProvenance): Promise<void> {
     const { event, ack } = payload
     log(`[slack] RAW ${eventName} event persona=${key}: ${JSON.stringify(event)?.slice(0, RAW_EVENT_LOG_LENGTH)}`)
-    await deps.routing.receive(event, ack, key, envelopeFlagOf(payload))
+    await deps.routing.receive(event, ack, key, envelopeFlagOf(payload), provenance)
   }
 
   async function routeInteractive(key: string, payload: PersonaSocketEventPayload): Promise<void> {
@@ -160,12 +166,18 @@ export function createPersonaEventRouter(deps: PersonaEventRouterDeps): PersonaE
     await payload.ack()
   }
 
-  return async (key, eventName, payload) => {
+  return async (key, eventName, payload, provenance) => {
     try {
       switch (eventName) {
+        case 'member_joined_channel':
+        case 'channel_left':
+          // Missing wiring and handler failures withhold acknowledgement.
+          // observe performs only synchronous durable work, never Slack I/O.
+          if (deps.membership?.observe(key, payload, provenance)) await payload.ack()
+          return
         case 'message':
         case 'app_mention':
-          await routeInbound(key, eventName, payload)
+          await routeInbound(key, eventName, payload, provenance)
           return
         case 'reaction_added':
         case 'reaction_removed':

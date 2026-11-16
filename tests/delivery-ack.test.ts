@@ -3,7 +3,7 @@ import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { _resetAckTracker, addDeliveryAck, consumeAck, createQueuedAckCallback, createDeliveryAckCallback, forgetPersonaAcks } from '../src/ack-tracker.ts'
-import type { AcceptedInput } from '../src/delivery-queue.ts'
+import type { AcceptedInput, ReplyReminderQueue } from '../src/delivery-queue.ts'
 import { buildDeliveryDiagnostic, buildDeliveryDispatchLine, createDeliveryReporting, deliveryIdentity, MESSAGE_DELIVERED, MESSAGE_RECEIVED } from '../src/delivery-notices.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
@@ -307,7 +307,9 @@ async function reminderSetup(reactionNotices: boolean) {
   const alpha = h.n.config.personas.find(p => p.key === 'alpha')!
   alpha.reaction_notices = reactionNotices
   const prepared: number[] = [], errors: unknown[] = []
-  monitor = createReplyReminders({ queue: h.e.realQueue, clock: h.e.clock, getRow: async () => undefined, ready: () => true, enabled: () => true,
+  // The harness's own queue is a real one, so it has the reminder operations.
+  const realQueue = h.e.realQueue as ReplyReminderQueue
+  monitor = createReplyReminders({ queue: realQueue, clock: h.e.clock, getRow: async () => undefined, ready: () => true, enabled: () => true,
     prepare: async (key, item) => { prepared.push(item.accepted.seq); await h.e.preparation.prepare(key, item) }, onError: (_key, error) => { errors.push(error) } })
   reminderMonitors.push(monitor)
   const labels = Object.fromEntries([REPLY_TOOL_PREALLOWED_LABEL.split('=')])
@@ -329,7 +331,7 @@ test.each(REACT_WITH_NOTICES_OFF)('with reaction notices off, $case on a receipt
   const seq = h.item().accepted.seq
   expect(h.e.records().filter(record => record.kind === 'delivered').map(record => record.seq)).toEqual([seq])
   expect(h.visible()).toEqual([h.settings.ack_reaction])
-  expect(h.e.realQueue.replyReminderItems('alpha').map(record => record.seq)).toEqual([seq])
+  expect((h.e.realQueue as ReplyReminderQueue).replyReminderItems('alpha').map(record => record.seq)).toEqual([seq])
   await monitor.observe('alpha', row('working'))
   if (react) {
     const held = h.hold('reactionsAdd')

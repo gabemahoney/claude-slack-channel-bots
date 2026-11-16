@@ -427,6 +427,9 @@ export interface PersonaBringUpController {
    * known to the controller or not; true for every key without the getter.
    */
   isApplied(key: string): boolean
+  /** Membership-origin revalidation uses held applied credentials and checks
+   * the current local admission conditions without reading credential edits. */
+  canRevalidateMembership(key: string): boolean
   /** The persona's outcome and causes, or undefined for an unknown or cancelled persona. */
   state(key: string): PersonaBringUpState | undefined
   /**
@@ -1086,9 +1089,9 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
         log(`[slack] persona ${ref(entry)}: launch after its bring-up retry failed: ${describeThrownValue(err)}`),
       )
     } else if (status.state === 'up' && previous?.state === 'broken') {
-      // Only a pending credentials reconnect's swap takes a refused
-      // connection back to up: the persona comes up again, and its kept
-      // instance is launched (reached through the collision ladder).
+      // A confirmed credential swap or bounded membership-origin validation
+      // can restore the connection. Reach the kept instance through the
+      // existing collision ladder; this is no new agent-state mechanism.
       serialize(key, () => launchAfterCredentialsChange(entry)).catch((err) =>
         log(`[slack] persona ${ref(entry)}: launch after its confirmed credentials change failed: ${describeThrownValue(err)}`),
       )
@@ -1289,6 +1292,14 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
       return entry !== undefined && outcomeOf(entry) === 'up'
     },
     isApplied,
+    canRevalidateMembership: key => {
+      const entry = entries.get(key)
+      if (!entry || entry.cancelled || entry.credentials || entry.directory || entry.configDir || !entry.tokens) return false
+      const persona = appliedPersona(key, entry.persona)
+      if (!persona) return false
+      const others = deps.appliedPersonas?.() ?? entry.applied
+      return checkDirectory(persona, { others, fs: deps.fs }).ok && checkConfigDir(persona).ok
+    },
     state: (key) => {
       const entry = entries.get(key)
       return entry === undefined ? undefined : { outcome: outcomeOf(entry), causes: causesOf(entry) }

@@ -9,9 +9,9 @@ User docs are for operators who install and run CSCB. Each page covers one task.
 | File | Holds | Budget |
 |---|---|---|
 | `README.md` | What CSCB is, Quick Start (install), Prerequisites, a first configuration, everyday commands, and the table of the pages below | ~400 lines |
-| `docs/configuration.md` | The persona reference: every persona field, the complete declarative example, credentials files, a summary of the load-time rules | ~200 lines |
+| `docs/configuration.md` | The persona reference: every persona field, the complete strict example, credentials files, a summary of the load-time rules | ~200 lines |
 | `docs/server-settings.md` | The server-wide settings, the environment variables, `slack-mcp.json` | ~200 lines |
-| `docs/channel-modes.md` | Declarative and fungible mode: what each serves, who can reach a persona in fungible mode, switching modes, the fungible-mode example | ~200 lines |
+| `docs/channel-modes.md` | Strict and open mode: what each serves, who can reach a persona in open mode, switching modes, delivery values and the loop warnings, threads in `thread_hybrid` channels, the open-mode example | ~200 lines |
 | `docs/reload.md` | Changing the configuration of a running server: the preview, the confirmation, what each kind of change does | ~200 lines |
 | `docs/cli.md` | Every CLI subcommand: what it does, what it prints, its exit codes; failure paths in summary, linked to the debug skill | ~200 lines |
 | `docs/bots.md` | What a persona can do and how messages reach it: tools, message tags, `/interject`, the permission relay, the Slack reply reminders | ~200 lines |

@@ -114,14 +114,25 @@ The order satisfies every constraint the checks have:
 - Check 16 (A may not message the second test user) runs before Check 20 (A opens that DM).
 - Check 24's teardown restores auto-restart and confirms the original queued item's timestamp and sequence against the transcript before Part 9. Stop if that recovery fails; the retained head blocks later items.
 - Part 9 ends with the applied set back to A, B and C and nothing pending, which Check 28 needs. The optional Check 26 runs on the disposable persona D, before D's removal.
-- Part 11 runs after Check 28, from the state it leaves: A, B and C applied and nothing pending. The switch is absent until Check 30, so every check before it runs with the switch absent.
+- Part 11 runs after Check 28, from the state it leaves: A, B and C applied and nothing pending. Strict mode is in force until Check 30.
 - Check 34 restores the `config.json` bytes Check 30 copied, and archives the run channel, before Check 29a.
-- The run has one crash-and-recover cycle (Check 7) and one reboot (Check 28). Check 29a, then the optional Check 29b, stay last: Check 29a runs after every other required check has written its logs, Part 11's included, so it scans everything Part 11 wrote, the stored-choice file `channel-delivery.json` included. The optional Check 29b, when run, ends by repeating Check 29a's log counts.
+- The run has one crash-and-recover cycle (Check 7) and one reboot (Check 28). Check 29a, then the optional Check 29b, stay last: Check 29a runs after every other required check has written its logs, Part 11's included, so it scans everything Part 11 wrote, the shared authority `config.json.last-applied` included. The optional Check 29b, when run, ends by repeating Check 29a's log counts.
 
 If the test server stops between parts for any other reason, run the
 "Guarded restart" (Part 2.3) before going on. Never rerun the pre-flight after
 Check 1: it fails on the `service=cscb` rows the run created, which the
 restart resumes.
+
+---
+
+## Runner-only membership readiness
+
+These two `/ci-live` checks fill no Results column. They follow [Membership setup record and readback](../skills/debug-slack-channel-bots/SKILL.md#membership-setup-record-and-readback): read `server.port` only after verifying its owning server PID, and send guarded loopback readiness requests. No credential content is read or printed.
+
+1. **setup-ready (`membershipSetupCheck`)**, after the channel checks bring C up and before Check 24’s restart: read C’s authenticated installation and match it to the provisioned app. Obtain both `member_joined_channel` and `channel_left` subscription facts from `apps.manifest.export` using the configuration token, and reinstall facts from this run’s provisioning plus `apps.json`’s `needs_reinstall`. Record that evidence, prove that another app’s installation is refused, and read back the exact record with C’s saved choices unchanged. An updated/adopted drifted app needs one reinstall, a new app one install, and an unchanged reused app no redundant reinstall. Inventory status is reported separately.
+2. **setup-restart (`membershipSetupRestartCheck`)**, after Check 28’s reboot and before Checks 30–34: read back under a different server PID owning `server.port`. Require the same authenticated installation, record order/time/setup state and no further reinstall. Missing/lost/changed evidence or invalid setup fails. No earlier setup-ready, the same server process, or unknown setup is `SKIPPED (not run: …)`, never a pass.
+
+A missing/unusable configuration token, tokenless app reuse, unavailable export or unreported provisioning leaves subscriptions/reinstall unverified and the setup check not run. A missing required subscription or incomplete reinstall fails. Live joins, leaves, scans and silence establish behavior rather than subscription/reinstall setup evidence. A leave and rejoin wholly while the server is stopped, with no authoritative absence or observed leave, is not reconstructed; the live run does not exercise that case.
 
 ---
 
@@ -734,7 +745,9 @@ exactly-once guarantee across failures (and the review answers).
 
 - **Delivered tags:** `tags <persona> <TS>` (Part 1.3). For an edited message, whose tag may not carry the `<TS>` from its link, `tagstext <persona> '<text>'`. Both read only `type == "user"` entries and `queued_command` attachments: the transcript also records a `queue-operation` entry for each incoming message, which would double the count.
 - **Tool calls and tool errors:** `replies <persona>`. Each line is one `reply` call, with its `chat_id`, whether the result was an error, and the result text the server returned. A check picks out its call by target, for example `replies a | grep -F 'chat_id=<SECOND_USER_ID>' | tail -n 1`. A refusal is returned to the persona only, never logged, so the transcript is where it is read. Claude Code may wrap an MCP error's text, so a check matches the expected text with "contains", not as the whole result.
-- **Other tools' calls and results:** `toolcalls <persona> <tool>`, defined below in the shell that runs Part 11 (it is not one of Part 1.3's helpers). It prints one JSON line per call of that CSCB session tool in the persona's current transcript, in call order: the conversation it named (`channel`, from its `chat_id` or `channel` input), its `message_id` (`ts`), whether it gave a `thread_ts` (`threadTs`), its `delivery`, how it ended (`outcome`: `ok`, `error`, or `none` while the transcript holds no result) and a refused call's tool error (`error`). An accepted call's result is never printed. Checks 31 and 33 read C's calls with it, as the runner does:
+- **Other tools' calls and results:** `toolcalls <persona> <tool>`, defined below in the shell that runs Part 11 (it is not one of Part 1.3's helpers). It prints one JSON line per call of that CSCB session tool in the persona's current transcript, in call order: the conversation it named (`channel`, from its `chat_id` or `channel` input), its `message_id` (`ts`), whether it gave a `thread_ts` (`threadTs`), its `delivery`, the retained identifier (`attemptId`, from a string `attempt_id`) and string `intent`, how it ended (`outcome`: `ok`, `error`, or `none` while the transcript holds no result) and a refused call's tool error (`error`). Missing or non-string attempt identity/intent is `null`.
+
+  An accepted call's result is never printed, so `ok` alone does not distinguish a new application from history. Checks 31 and 33 read C's calls with it, as the runner does:
 
   ```sh
   toolcalls() {
@@ -752,6 +765,8 @@ exactly-once guarantee across failures (and the review answers).
           ts: (if $in.message_id == null then null else ($in.message_id | tostring) end),
           threadTs: ((($in.thread_ts // "") | tostring) != ""),
           delivery: (if $in.delivery == null then null else ($in.delivery | tostring) end),
+          attemptId: (if ($in.attempt_id | type) == "string" then $in.attempt_id else null end),
+          intent: (if ($in.intent | type) == "string" then $in.intent else null end),
           outcome: $outcome,
           error: (if $outcome == "error" then ($r.content | if type == "string" then . elif type == "array" then ([ .[] | .text? // empty ] | join(" ")) else "" end) else null end) }' "$t"
   }
@@ -799,8 +814,8 @@ file, and never delete `config.json.last-applied` while the server runs.
 
 What the apply does:
 
-- **Per-persona changes** take effect at the apply. An added persona is brought up, and a removed one is torn down (a `DESTRUCTIVE:` line). `dm.enabled` and `dm.contact` are updated in place. The mode the edited `config.json` turns on (its `allow_invited_channels`) decides which channel section is in force: `channels`, `delivery` and `permission_prompts` in declarative mode, `invited.permission_prompts` in fungible mode. A change to the section in force is updated in place; a change to the other section previews a `… changed in the <section> section: recorded, with no effect until allow_invited_channels selects <section> mode.` line and is only recorded. An edit made only of recorded changes previews `no effective change`, and its confirmation logs one `[slack] reload-noop: …` line in place of `reload-applied`. A persona whose credentials file changed at the same path is reconnected with it, or brought up again when it was down because of its credentials.
-- **Server-wide settings**, such as `session_restart_delay` or `port`, are only recorded at the apply. Their preview line says `once applied, it is recorded and takes effect at the next server start after that.` For such an edit, confirm it, then run the "Guarded restart" (Part 2.3), which starts the server from the record. The one exception is the invited-channel switch, `allow_invited_channels`: it applies in place at the confirmation, with no restart, and its preview line says `applied in place at once, from the next event, tool call, prompt and notice`.
+- **Per-persona changes** apply through the confirmed shared authority. Added personas come up and removed/destructively changed identities are retired. Common channels, delivery, permission_prompts, DM settings, reaction_notices and reply reminders update in place; same-path credential changes reconnect through the credentials apply step. A mode change preserves the common shared choices.
+- **Server-wide settings**, such as session_restart_delay or port, are recorded for the next server start. Confirm them, then use Part 2.3’s Guarded restart. The exception is channel_mode: strict/open applies at confirmation without restart, with the preview clause `applied in place at once, from the next event, tool call, prompt and notice`.
 
 The run uses this gesture in Checks 13 and 24 (and Check 24's teardown),
 "Turn A's DMs on", Checks 25 to 27, and Checks 30, 32, 33 and 34. Check 28 leaves its edits unconfirmed
@@ -1016,7 +1031,7 @@ Pass: one row per persona after the cycle, and A answers the new message.
 
 ## Part 4: Bot-to-bot, broadcast and persona-post event capture
 
-These checks run with the invited-channel switch absent (declarative mode).
+These checks run in strict mode.
 They verify per-persona deduplication, own-post exclusion, unlimited
 bot-to-bot delivery, and the `user_id`, `bot_id` and `via` tag attributes.
 They also capture the real Slack event shape of a persona's post.
@@ -2297,7 +2312,7 @@ Steps:
    ```sh
    ls "$S/config.json.pending"
    showpending
-   grep -c 'persona_b' "$S/config.json.pending"   # must print 0
+   grep -c '^persona "persona_b" (key=persona_b): credentials file "' "$S/config.json.pending"   # must print 0
    since "$BMARK" | grep -F 'reload-preview:' | showsafe | grep -F 'DESTRUCTIVE:'
    cmp "$S/config.json" "$S/config.json.last-applied"
    jq -r '.personas[].name' "$S/config.json.last-applied"
@@ -2340,7 +2355,7 @@ Expected:
 - Step 2: the credentials command prints both `ok` lines and `Wrote <home>/.config/claude-slack-channel-bots/persona_b-credentials.json with mode 0600. …`. After its two header lines and a blank line, the pending file's preview is `A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 1 with changed credentials; server-wide settings: 0 changed.` and `persona "persona_b" (key=persona_b): credentials file "<home>/.config/claude-slack-channel-bots/persona_b-credentials.json" changed: a new connection opens, then the old one closes, instance kept.` The preview names B and the file path and no token, and the `tokcount` prints `0`. The log has the same two lines, prefixed `[slack] reload-preview: `, and no `persona-start`, `Session disconnected`, `persona teardown` or `reload-applied` line: nothing was applied. B replies "still-here" in coordination under its own name and avatar: B keeps serving on its current connection.
 - Step 3: `config.json.pending` has exactly one `DESTRUCTIVE:` line, `DESTRUCTIVE: persona "persona_c" (key=persona_c) is removed: the persona will be retired: its session stopped and never resumed; 0 open queued items kept, delivered only if a persona with the same key is added again.`, and B's credentials line after it. Its first line's counts read `personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 1 with changed credentials; server-wide settings: 0 changed`. The log has exactly one `[slack] reload-preview:` line with that `DESTRUCTIVE:` line, not repeated over the six checks. There is no `persona-start` or `Session disconnected` line, and the list has the same rows as at step 1, C's row still live and D's kept row (if any) still not live: nothing was applied.
 - Step 5: `running` is printed. The log has one `[slack] Starting from the last-applied record "<path of config.json>.last-applied"` line and no `No last-applied record` line. It has `[slack] Loaded persona config: 3 persona(s)` and one `[slack] persona-start: personas[<i>] "<name>" (key=<key>): bring-up starting` line for each of `persona_a`, `persona_b` and `persona_c`. It has one `[slack] startupSessionManager: complete — 3 persona(s): …` line ending `0 failed, 0 not brought up, 0 not reconnected, 0 latched, 0 retrying, 0 waiting on a live-row sequence, 0 held on invalid flags, 0 fresh as retired keys`, and no failure line, none for B included: B connected with its credentials file as it stands, the `cscb-live-rotated` token. It has at least one `[slack] Session connected: persona "persona_b" (key=persona_b)` line. The list has exactly one live row for each of the three personas, C included, plus D's kept row, not live, when step 1 had it, and no other row. Record the summary line's resumed and fresh counts in Notes. One exception, a transient the server recovers from: when Slack was unreachable for a persona at the start, the summary counts it in `not brought up` and the log has its `persona-slack-unreachable` line (and its `cleared:` line). If that persona then logs `[slack] persona "<name>" (key=<key>): up after its bring-up retry (Slack) — launching` and its `Session connected` line appears within the wait, the summary may end `0 failed, <n> not brought up, 0 not reconnected, 0 latched, 0 retrying, 0 waiting on a live-row sequence, 0 held on invalid flags, 0 fresh as retired keys`, `<n>` being the number of such personas, and their `persona-slack-unreachable` lines up to that retry are not failure lines. Record it in Notes. Any other failure line, or a persona that doesn't connect, still fails this step.
-- Step 6: `config.json.pending` is present again. Its first line's counts read `personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed`, it has C's `DESTRUCTIVE:` line, and nothing names `persona_b` (the count prints `0`): the start applied B's credentials change, so it is no longer pending, while the unconfirmed removal of C still is. The log has exactly one `[slack] reload-preview:` line with that `DESTRUCTIVE:` line since the reboot: the first check after the start found the edit and logged it once. `cmp` reports that the files differ, and the record still names all three personas.
+- Step 6: `config.json.pending` is present again. Its first line's counts read `personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed`, it has C's `DESTRUCTIVE:` line, and no credentials line names `persona_b` (the count prints `0`): the start applied B's credentials change, so it is no longer pending, while the unconfirmed removal of C still is. The log has exactly one `[slack] reload-preview:` line with that `DESTRUCTIVE:` line since the reboot: the first check after the start found the edit and logged it once. `cmp` reports that the files differ, and the record still names all three personas.
 - Step 7: A answers "rebooted" in A-home, B in coordination and C in the DM with C, each under its own name and avatar. After the older token is revoked, B answers "rotated" in coordination and the `grep` prints nothing: B's connection runs on the new token. No post in Slack mentions a pending change, a preview, `DESTRUCTIVE` or the configuration. All three counts print `0`.
 - Step 8: `matches` is printed. `ls` reports that `config.json.pending` does not exist. The log has exactly one line starting `[slack] reload-nothing-pending: the configuration file and the credentials files it references match what is applied; no change is pending`. The last `grep` prints nothing: the revert brought nothing up or down.
 
@@ -2360,19 +2375,7 @@ and the revert cleared it with one `reload-nothing-pending` line.
 
 ## Part 11: Invited channels
 
-These checks verify live: with the invited-channel switch
-(`allow_invited_channels`) on, a persona answers in a channel its app was
-invited to, with no `channels` entry for it. In
-order, they cover the invite and the mention (Check 30), the
-persona switching the channel to `all` (Check 31), the switch off
-(Check 32), the calls after a kick (Check 33) and the
-restore (Check 34).
-
-The test persona is C: in no channel, DMs on, the operator its DM contact
-(Part 1.5). The switch is absent from `config.json` until Check 30: every
-check before it runs with the switch absent. Each run uses
-one public channel of its own, which the operator creates in Check 30 and
-Check 34 archives.
+These checks exercise open mode, the common shared channel list and verified membership: invite/mentions (Check 30), a retained `all` assignment (Check 31), strict-mode delivery using the same choice (Check 32), calls and verified leave after a kick (Check 33), then restore (Check 34). The persona is C, initially in no channel, with DMs on and the operator its contact. Earlier checks use strict mode. Each run creates one public channel and archives it at Check 34.
 
 State at the start: the server that is running after Check 28, with A, B and
 C applied and nothing pending. Run these checks on the test workspace only.
@@ -2398,7 +2401,7 @@ Steps:
 1. Confirm the starting state, as Check 25's setup does, only if the guard passes:
 
    ```sh
-   guard && cmp -s "$S/config.json" "$S/config.json.last-applied" && [ ! -e "$S/config.json.pending" ] && kill -0 "$(cat "$S/server.pid")" && echo READY
+   guard && cmp -s "$S/config.json" <(jq -r .sourceBytesBase64 "$S/config.json.last-applied" | base64 -d) && [ ! -e "$S/config.json.pending" ] && kill -0 "$(cat "$S/server.pid")" && echo READY
    ```
 
    If it doesn't print `READY`, stop: change nothing, and record the check as failed.
@@ -2410,13 +2413,12 @@ Steps:
    jq -r '.personas[].name' "$S/config.json"
    ```
 
-3. Turn the switch on with Part 2.2's gesture, giving every persona an `invited.permission_prompts` that keeps its destination where it is: A `<A_HOME_CHANNEL_ID>`, B and C `"dm"`, and D `<D_HOME_CHANNEL_ID>` only if D is still declared. A cannot take `"dm"`: its DMs are off after Part 1.5 and Check 1, and on with no `dm.contact` after "Turn A's DMs on", so `"dm"` would be invalid in either state. The edit changes nothing else: each persona's `channels`, top-level `permission_prompts` and `dm` keep their values. Note the log mark, then edit, only if the guard passes:
+3. Turn `channel_mode` to `open` with Part 2.2’s gesture, preserving every persona’s channels, delivery choices, `permission_prompts` and `dm`. Note the log mark and edit only if the guard passes:
 
    ```sh
    MARK=$(mark)
    if guard; then
-     jq '.allow_invited_channels = true | .personas |= map(if .name == "persona_a" then .invited = {"permission_prompts":"<A_HOME_CHANNEL_ID>"} elif .name == "persona_b" then .invited = {"permission_prompts":"dm"} elif .name == "persona_c" then .invited = {"permission_prompts":"dm"} elif .name == "persona_d" then .invited = {"permission_prompts":"<D_HOME_CHANNEL_ID>"} else . end)' \
-       "$S/config.json" > "$S/config.json.tmp" && mv "$S/config.json.tmp" "$S/config.json"
+     jq '.channel_mode = "open"' "$S/config.json" > "$S/config.json.tmp" && mv "$S/config.json.tmp" "$S/config.json"
    fi
    ```
 
@@ -2430,41 +2432,47 @@ Steps:
 
    ```sh
    tags c <TS_BEFORE>
-   since "$MARK2" | grep -F '] persona-invited-channel: ' | grep -F '"persona_c" (key=persona_c)' | grep -F '<RUN_CHANNEL_ID>'
+   since "$MARK2" | grep -F '] persona-open-channel: ' | grep -F '"persona_c" (key=persona_c)' | grep -F '<RUN_CHANNEL_ID>'
    ```
+
+9. Read the shared authority in `config.json.last-applied`: C’s applied channel entry for `<RUN_CHANNEL_ID>` must be `mentions`, and `.personas.persona_c.membership[<RUN_CHANNEL_ID>].member` must be true. Record the entry and membership together after the authenticated join; the mention alone is not membership evidence.
 
 Expected:
 
+- The shared entry is `mentions` with verified membership true.
+
 - Step 1 prints `READY`, and step 2 prints `COPIED`.
 - Step 3, with A, B and C declared: after its two header lines and a blank line, the pending file's preview is exactly these lines:
-  - `A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 3 modified in place, 0 with changed credentials; server-wide settings: 1 changed.`
-  - `persona "persona_a" (key=persona_a): invited.permission_prompts changed: applied in place immediately, instance kept.`
-  - `persona "persona_b" (key=persona_b): invited.permission_prompts changed: applied in place immediately, instance kept.`
-  - `persona "persona_c" (key=persona_c): invited.permission_prompts changed: applied in place immediately, instance kept.`
-  - `server-wide setting allow_invited_channels changed: turns fungible mode on, applied in place at once, from the next event, tool call, prompt and notice, for "persona_a" (key=persona_a), "persona_b" (key=persona_b), "persona_c" (key=persona_c).`
-- With D still declared, the header counts `4 modified in place`, D's line `persona "persona_d" (key=persona_d): invited.permission_prompts changed: applied in place immediately, instance kept.` follows C's, and the switch's line ends `, "persona_d" (key=persona_d).`
-- After the rename, exactly one `[slack] reload-applied: applied the confirmed configuration change without a restart (personas: 0 added, 0 removed, 0 destructively modified, 3 modified in place, 0 with changed credentials; server-wide settings: 1 changed); the last-applied record "<path of config.json>.last-applied" now holds it` line (`4 modified in place` with D).
+  - `A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 1 changed.`
+  - `server-wide setting channel_mode changed: turns open mode on, applied in place at once, from the next event, tool call, prompt and notice, for "persona_a" (key=persona_a), "persona_b" (key=persona_b), "persona_c" (key=persona_c).`
+- With D still declared, the header has the same counts and the mode line is `server-wide setting channel_mode changed: turns open mode on, applied in place at once, from the next event, tool call, prompt and notice, for "persona_a" (key=persona_a), "persona_b" (key=persona_b), "persona_c" (key=persona_c), "persona_d" (key=persona_d).`
+- After the rename, exactly one `[slack] reload-applied: applied the confirmed configuration change without a restart (personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 1 changed); the last-applied record "<path of config.json>.last-applied" now holds it` line (`0 modified in place` with D).
 - Step 7: C answers "invited" in `<RUN_CHANNEL_NAME>`, under C's own name and avatar.
-- Step 8's `grep` prints exactly one line, containing `[slack] persona-invited-channel: personas[2] "persona_c" (key=persona_c): hears public channel <RUN_CHANNEL_ID> in fungible mode, at channel delivery mentions`.
+- Step 8's `grep` prints exactly one line, containing `[slack] persona-open-channel: personas[2] "persona_c" (key=persona_c): hears public channel <RUN_CHANNEL_ID> in open mode, at channel delivery mentions`.
 - Record in Notes whether `tags c <TS_BEFORE>` printed a tag: whether the mention before the invite was delivered to C. Either way is acceptable.
 
-Pass: the switch went on with one in-place line per persona, and after the
+Pass: the switch went on with zero persona in-place changes, and after the
 invite C answered the mention in the run channel as itself, with one
-`persona-invited-channel` line naming C and the channel (public,
+`persona-open-channel` line naming C and the channel (public,
 `mentions`).
 
 ### Check 31: asked in the channel, C switches it to all with set_channel_delivery, then answers a message that does not mention it
 
 Steps:
 
-1. Note the log mark, and C's calls of `set_channel_delivery` so far:
+1. Create a fresh nonempty `<ATTEMPT_ID>` and retain it in Notes before submission, with channel `<RUN_CHANNEL_ID>` and delivery `all`. Every deliberate run of this check uses a new identifier, even if `all` is already saved.
+
+   Confirm that C has current authenticated eligible membership in this public, non-externally-shared channel and an active current session in open mode; Check 30's heard-event line alone is not membership evidence. Note the log mark, C's existing shared choice (`<PREVIOUS_CHOICE>`, or `none` if absent), and its calls of `set_channel_delivery` so far:
 
    ```sh
    MARK=$(mark)
+   jq -r '.applied.personas[] | select(.name == "persona_c") | .channels[]? | select(.id == "<RUN_CHANNEL_ID>") | .delivery' "$S/config.json.last-applied"
    toolcalls c set_channel_delivery | grep -cF '"channel":"<RUN_CHANNEL_ID>"'
    ```
 
-2. In `<RUN_CHANNEL_NAME>`, post: "@CSCB Test C please listen to every message in this channel from now on: call your set_channel_delivery tool once with channel `<RUN_CHANNEL_ID>` and delivery `all`. Then reply here with the word done." Wait for C's done (up to three minutes).
+2. In `<RUN_CHANNEL_NAME>`, post: "@CSCB Test C please listen to every message in this channel from now on: call your set_channel_delivery tool once with channel `<RUN_CHANNEL_ID>` and delivery `all`, attempt_id `<ATTEMPT_ID>` and intent `assignment`. Retain this identifier before submission.
+
+   If a response is lost, use intent `retry` with this same identifier/channel/value. Then reply here with the word done." Wait for C's done (up to three minutes).
 3. Run:
 
    ```sh
@@ -2476,8 +2484,10 @@ Steps:
 
 Expected:
 
-- C says done. Step 3's `toolcalls` line is a call newer than step 1's count, with `"delivery":"all"` and `"outcome":"ok"`.
-- Step 3's `grep` prints exactly one line, containing `[slack] persona-channel-delivery-set: personas[2] "persona_c" (key=persona_c): stored choice for channel <RUN_CHANNEL_ID> set from none to all, at channel delivery all after the loop guard`.
+- C says done. Step 3's `toolcalls` line is newer than step 1's count, names the run channel and has `"delivery":"all"`, `"attemptId":"<ATTEMPT_ID>"`, explicit `"intent":"assignment"` (or `"intent":"retry"` after response loss with the same binding), and `"outcome":"ok"`. Missing or wrong identifier/intent/value, no result, or a refusal fails the check.
+- Step 3's `grep` prints exactly one line, containing `[slack] persona-channel-delivery-set: personas[2] "persona_c" (key=persona_c): delivery choice for channel <RUN_CHANNEL_ID> set from mentions to all, at channel delivery all` for the first run after Check 30. Match `from` to step 1's actual `<PREVIOUS_CHOICE>`: on a deliberate repeat with `all` already saved, expect `from all to all` instead.
+
+  No line or duplicate lines fails the check. An `ok` history response alone is not evidence of a fresh application; the one diagnostic since the mark must establish this run's new application.
 - Step 4: C answers "heard-all" in `<RUN_CHANNEL_NAME>`, under its own name and avatar.
 
 The live container allows the server's tools as a group, so the call raises
@@ -2485,24 +2495,31 @@ no permission prompt. On a host whose Claude Code settings do not, C's first
 `set_channel_delivery` call raises one at C's destination: allow it, and
 record it in Notes.
 
-If C says done but step 3 shows no new call, ask once more; with still no
-call, record the check as "not run" (Check 16's rule).
+If C says done but step 3 shows no new call, ask once more with the same
+retained identifier/channel/value; with still no call, record the check as
+"not run" (Check 16's rule). No done fails the check.
 
-Pass: C stored `all` for the run channel with one accepted
-`set_channel_delivery` call and one `persona-channel-delivery-set` line, and
-answered a message that does not mention it.
+A response-loss retry
+keeps that binding and cannot create an assignment. Pending, proven
+not-applied or unresolved outcomes cannot count as success; preserve the
+evidence for recovery instead of silently substituting a fresh identifier.
 
-### Check 32: with the switch off and C's app still in the channel, a mention is not delivered, and one unclaimed-channel line says so
+Pass: the retained attempt has matching structured call/result evidence,
+exactly one new durable application with one `persona-channel-delivery-set`
+line, and C answered a message that does not mention it. Duplicate/history
+calls add no application or diagnostic and cannot substitute for that evidence.
+
+### Check 32: strict mode retains C’s shared choice and C answers with no unclaimed-channel line
 
 Steps:
 
-1. Check that the switch is on in the record: `jq -c '(.allow_invited_channels // false)' "$S/config.json.last-applied"` must print `true`. If it doesn't, there is nothing to switch off: record the check as failed.
+1. Require Check 31's proven new `all` application; an accepted historical response alone does not establish it. Check that the switch is on in the record: `jq -c '.applied | ((.channel_mode // "strict") == "open")' "$S/config.json.last-applied"` must print `true`. If it doesn't, there is nothing to switch off: record the check as failed.
 2. Turn the switch off with Part 2.2's gesture, leaving C's app in the channel. Note the log mark, then edit, only if the guard passes:
 
    ```sh
    MARK=$(mark)
    if guard; then
-     jq '.allow_invited_channels = false' "$S/config.json" > "$S/config.json.tmp" && mv "$S/config.json.tmp" "$S/config.json"
+     jq '.channel_mode = "strict"' "$S/config.json" > "$S/config.json.tmp" && mv "$S/config.json.tmp" "$S/config.json"
    fi
    ```
 
@@ -2515,23 +2532,26 @@ Steps:
    since "$MARK2" | grep -F '] unclaimed-channel: ' | grep -F '"persona_c" (key=persona_c)' | grep -F '<RUN_CHANNEL_ID>'
    ```
 
+5. Read C’s shared entry and membership from the authority: the saved choice remains `all` and `member` remains true after the strict-mode confirmation. Keep this evidence separate from the reply/log checks.
+
 Expected:
+
+- C remains a verified member with the same saved `all` choice.
 
 - Step 2: the pending file's preview is exactly these lines:
   - `A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 1 changed.`
-  - `server-wide setting allow_invited_channels changed: turns declarative mode on, applied in place at once, from the next event, tool call, prompt and notice, for "persona_a" (key=persona_a), "persona_b" (key=persona_b), "persona_c" (key=persona_c).`
+  - `server-wide setting channel_mode changed: turns strict mode on, applied in place at once, from the next event, tool call, prompt and notice, for "persona_a" (key=persona_a), "persona_b" (key=persona_b), "persona_c" (key=persona_c).`
 - After the rename, exactly one `[slack] reload-applied: applied the confirmed configuration change without a restart (personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 1 changed); the last-applied record "<path of config.json>.last-applied" now holds it` line.
-- Step 3: C posts nothing in `<RUN_CHANNEL_NAME>` within the three minutes.
-- Step 4 prints exactly one line, containing `[slack] unclaimed-channel: personas[2] "persona_c" (key=persona_c): message in channel <RUN_CHANNEL_ID> not delivered: no applied persona lists this channel`, the declarative cause.
+- Step 3: C answers `off-check` in `<RUN_CHANNEL_NAME>` within three minutes; its shared choice remains `all`.
+- Step 4 prints no line: the listed channel retains its shared choice.
 
-Pass: with the switch off, the mention got no reply, and one
-`unclaimed-channel` line with the declarative cause named C and the channel.
+Pass: strict mode preserves the shared choice, C replies, and there is no listed-channel `unclaimed-channel` diagnostic.
 
 ### Check 33: after C's app is kicked, reply and fetch_messages on the channel are refused with Slack's code; react, edit_message and threaded fetch_messages are recorded
 
 Steps:
 
-1. Turn the switch on again with Part 2.2's gesture, as Check 32's step 2 does with `.allow_invited_channels = true`. If the record already has it on (Check 32 did not turn it off), skip the edit and record that in Notes.
+1. Turn the switch on again with Part 2.2's gesture, as Check 32's step 2 does with `.channel_mode = "open"`. If the record already has it on (Check 32 did not turn it off), skip the edit and record that in Notes.
 2. Remove C's app from `<RUN_CHANNEL_NAME>` (`/remove @CSCB Test C`).
 3. Note C's calls so far: `toolcalls c reply | grep -cF '"channel":"<RUN_CHANNEL_ID>"'` and `toolcalls c fetch_messages | grep -F '"channel":"<RUN_CHANNEL_ID>"' | grep -cF '"threadTs":false'`.
 4. In the operator's DM with app C (`<C_DM_ID>`), send: "Call your reply tool once with chat_id `<RUN_CHANNEL_ID>` and the text `after-kick check`, and your fetch_messages tool once with channel `<RUN_CHANNEL_ID>` and no thread_ts. Call each even if you expect it to fail. Then reply here with the word done." Wait for C's done, then run:
@@ -2549,9 +2569,13 @@ Steps:
    toolcalls c fetch_messages | grep -F '"channel":"<RUN_CHANNEL_ID>"' | grep -F '"threadTs":true' | tail -n 1
    ```
 
+6. Wait for the kick’s verified leave in the authority: the applied shared choice for `<RUN_CHANNEL_ID>` is absent, `.personas.persona_c.membership[<RUN_CHANNEL_ID>].member` is false and `.personas.persona_c.leaves[<RUN_CHANNEL_ID>]` is recorded. Record these facts even when a requested tool call is missing; a tool refusal is not leave evidence.
+
 Expected:
 
-- Step 1: the preview is Check 32's two lines with `turns fungible mode on` in place of `turns declarative mode on`, and one `reload-applied` line with the same counts.
+- The shared entry is removed, membership is false and the leave is recorded.
+
+- Step 1: the preview is Check 32's two lines with `turns open mode on` in place of `turns strict mode on`, and one `reload-applied` line with the same counts.
 - Step 4: each line is a call newer than step 3's count, with `"outcome":"error"`. The `reply` call's `error` contains `Tool "reply" failed for persona "persona_c" (key=persona_c) on channel "<RUN_CHANNEL_ID>": Slack refused the call (<SLACK_ERROR_CODE>).`, and the `fetch_messages` call's contains `Tool "fetch_messages" failed for persona "persona_c" (key=persona_c) on channel "<RUN_CHANNEL_ID>": Slack refused the call (<SLACK_ERROR_CODE>).`. The client may wrap the server's text, so the text is read anywhere in the error, as Check 16 reads it. `<SLACK_ERROR_CODE>` is any code made of letters, digits, `_` and `$`. Record each code in Notes, as `reply: refused by Slack (<SLACK_ERROR_CODE>)` and `fetch_messages without thread_ts: refused by Slack (<SLACK_ERROR_CODE>)`.
 - Step 5 is recorded, never judged. For each of the three calls, add one line to Notes in this form: `Check 33 residual: <call> after the kick: <outcome>`, where `<call>` is `react`, `edit_message on C's earlier post` or `fetch_messages with thread_ts`, and `<outcome>` is:
   - `accepted` (`"outcome":"ok"`);
@@ -2588,9 +2612,9 @@ Steps:
 1. **The config half.** Compare the copy with the record, and note whether a change is pending:
 
    ```sh
-   cmp -s ~/cscb-live/config-before-invited.json "$S/config.json.last-applied" && echo NEVER-CONFIRMED
+   cmp -s ~/cscb-live/config-before-invited.json <(jq -r .sourceBytesBase64 "$S/config.json.last-applied" | base64 -d) && echo NEVER-CONFIRMED
    ls "$S/config.json.pending"
-   jq -c '(.allow_invited_channels // false)' "$S/config.json.last-applied"
+   jq -c '.applied | ((.channel_mode // "strict") == "open")' "$S/config.json.last-applied"
    ```
 
    If `ls` finds a pending file, it is an earlier edit's: note its fingerprint line (`showpending`, line 2) before step 2, and whether `config.json` already holds the copy (`cmp -s ~/cscb-live/config-before-invited.json "$S/config.json" && echo ALREADY-RESTORED`).
@@ -2607,7 +2631,7 @@ Steps:
 
    ```sh
    cmp ~/cscb-live/config-before-invited.json "$S/config.json" && echo restored
-   cmp "$S/config.json" "$S/config.json.last-applied" && echo recorded
+   cmp "$S/config.json" <(jq -r .sourceBytesBase64 "$S/config.json.last-applied" | base64 -d) && echo recorded
    ls "$S/config.json.pending"
    if guard && cmp -s ~/cscb-live/config-before-invited.json "$S/config.json"; then rm ~/cscb-live/config-before-invited.json; fi
    ```
@@ -2617,15 +2641,12 @@ Steps:
 
 Expected:
 
-- With the record holding the switch on (the usual case: Check 33 turned it on), the pending file's preview is exactly these lines, with one recorded line per persona present in both the copy and the record (D's too when it is declared):
+- With the record holding the switch on (the usual case: Check 33 turned it on), the pending file's preview is exactly these lines (include D in the mode line when still declared):
   - `A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 1 changed.`
-  - `persona "persona_a" (key=persona_a): invited changed in the fungible section: recorded, with no effect until allow_invited_channels selects fungible mode.`
-  - `persona "persona_b" (key=persona_b): invited changed in the fungible section: recorded, with no effect until allow_invited_channels selects fungible mode.`
-  - `persona "persona_c" (key=persona_c): invited changed in the fungible section: recorded, with no effect until allow_invited_channels selects fungible mode.`
-  - `server-wide setting allow_invited_channels changed: turns declarative mode on, applied in place at once, from the next event, tool call, prompt and notice, for "persona_a" (key=persona_a), "persona_b" (key=persona_b), "persona_c" (key=persona_c).`
+  - `server-wide setting channel_mode changed: turns strict mode on, applied in place at once, from the next event, tool call, prompt and notice, for "persona_a" (key=persona_a), "persona_b" (key=persona_b), "persona_c" (key=persona_c).`
 
   The rename logs exactly one `[slack] reload-applied: applied the confirmed configuration change without a restart (personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 1 changed); the last-applied record "<path of config.json>.last-applied" now holds it` line.
-- With the record holding the switch off (Check 33's edit did not apply), the preview is `A configuration change is pending; nothing has been applied. no effective change: applying it would change no persona and no server-wide setting.` followed by the same recorded lines, and the rename logs exactly one `[slack] reload-noop: the confirmed configuration has no effective change, so no persona and no server-wide setting changed; the last-applied record "<path of config.json>.last-applied" was rewritten with it` line.
+- With the record holding the switch off (Check 33's edit did not apply), the preview is `A configuration change is pending; nothing has been applied. no effective change: applying it would change no persona and no server-wide setting.`; no recorded persona lines follow, and the rename logs exactly one `[slack] reload-noop: the confirmed configuration has no effective change, so no persona and no server-wide setting changed; the last-applied record "<path of config.json>.last-applied" was rewritten with it` line.
 - With `NEVER-CONFIRMED`: the restore leaves nothing pending. The `grep` prints exactly one `reload-nothing-pending` line if step 1's `ls` found a pending file, and none otherwise. Record in Notes that Check 30's edit was never confirmed.
 - A pending file still showing step 1's fingerprint line, never rewritten for the restore, is a FAIL, and nothing is renamed.
 - Step 4 prints `restored` and `recorded`, and `ls` reports that `config.json.pending` does not exist.
@@ -2642,10 +2663,8 @@ archived channels included.
 ## Part 12: Closing secrecy check
 
 Check 29a verifies live (no credential value appears in the config
-file, the record, the pending file, the stored-choice file
-`channel-delivery.json`, any log line the feature produces, or the tool
-results in the persona transcripts
-to) and the first
+file, the shared authority, the pending file, any log line the feature produces, or the tool
+results in the persona transcripts) and the first
 half of the leak check: no WebSocket `wss://` or `ticket=` URL in any
 log. is unit-verified; the acceptance run is where a real token could
 leak, so the check counts across everything the run wrote. It is required,
@@ -2685,7 +2704,7 @@ Steps:
 
    ```sh
    source ~/cscb-live-helpers.sh
-   F=("$S/config.json" "$S/config.json.last-applied" "$S/config.json.pending" "$S/channel-delivery.json" "$S"/server.log* "$S/startup-errors.log" "$S/permission-trail.jsonl" ~/cscb-live/boot-start.log)
+   F=("$S/config.json" "$S/config.json.last-applied" "$S/config.json.pending" "$S"/server.log* "$S/startup-errors.log" "$S/permission-trail.jsonl" ~/cscb-live/boot-start.log)
    mapfile -d '' T < <(find ~/.claude/projects/ -path '*-cscb-live-[abcd]/*' -name '*.jsonl' -print0)
    echo "persona transcripts: ${#T[@]}"
    ls "$S/config.json.pending"          # nothing is pending, so this reports no such file
@@ -2711,7 +2730,7 @@ Steps:
 
 Expected:
 
-- Step 1: `persona transcripts:` is at least `4` (A, B, C and D each have one). `tokens checked: 8` (the bot and app tokens of A, B, C and D; D's file stays until Teardown). Every `tokcount` count and every `leakcount` file count is `0`, and the pending file reports `absent`. A file that does not exist counts `0` for `tokcount` and reports `absent` for `leakcount`: `channel-delivery.json` reports `0` when C stored its choice in Check 31, and `absent` when no persona stored one.
+- Step 1: `persona transcripts:` is at least `4` (A, B, C and D each have one). `tokens checked: 8` (the bot and app tokens of A, B, C and D; D's file stays until Teardown). Every `tokcount` count and every `leakcount` file count is `0`, and the pending file reports `absent`. A file that does not exist counts `0` for `tokcount` and reports `absent` for `leakcount`.
 - Step 2: the `wss://|ticket=` count and the `message="…"` count print `0`. Record the two placeholder counts in Notes; any value is acceptable.
 - Step 3: no `Spawn failure:` notice, or one that matches the description above.
 
@@ -2893,14 +2912,11 @@ results, and also when the run stopped early.
 
    ```sh
    if guard && [ ! -e "$S/server.pid" ]; then
-     rm -f "$S/config.json.last-applied" "$S/config.json.pending" "$S/config.json.apply" "$S/config.json.tmp" "$S/channel-delivery.json"
+     rm -f "$S/config.json.last-applied" "$S/config.json.pending" "$S/config.json.apply" "$S/config.json.tmp"
      printf '{\n  "personas": []\n}\n' > "$S/config.json"
    fi
    ls "$S/config.json.last-applied"   # must not exist
-   ls "$S/channel-delivery.json"      # must not exist
    ```
-
-   The stored-choice file `channel-delivery.json` holds the channel choices personas stored (Check 31's), so it is removed only here, with the server stopped, like the record.
 
    If `access.json` is still there and Check 14 created it (`CREATED=1`), remove it: `rm "$S/access.json"`.
 

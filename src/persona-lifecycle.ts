@@ -197,17 +197,17 @@
  *   agent-director call.
  *
  * - **in-place update** (apply step 3): a
- *   persona whose `channels`, `delivery`, `permission_prompts` (declarative
- *   mode), `invited.permission_prompts` (fungible mode) or `dm.*` changed
+ *   persona whose channel list or a kept channel's `delivery`, common
+ *   `permission_prompts`, `dm.*`,
+ *   `stop_hook_bootstrap` or `reaction_notices` changed
  *   keeps its instance, Slack connection, Web API client, MCP session, restart,
  *   backoff, health, outage and retry state, reply reminders, tracked
  *   prompts and held notices. The new values already took effect at apply
  *   step 1: every consumer (tool scope, delivery decision, destination, DM
  *   switch, archive evidence) reads the persona's entry from the applied
  *   configuration at each use. What is left is the persona's cached DM
- *   conversation, forgotten when `dm.contact`, `dm.enabled`,
- *   `permission_prompts` (declarative mode) or `invited.permission_prompts`
- * (fungible mode) changed, so the next
+ *   conversation, forgotten when `dm.contact`, `dm.enabled`
+ *   or the common `permission_prompts` changed, so the next
  *   DM-destination post opens the DM for the current contact; then one line
  *   naming what changed. A key no longer applied when the operation runs gets
  *   nothing. Makes no Slack or agent-director call; never rejects. Dry run:
@@ -275,7 +275,7 @@
  *
  * `<settings>` lists the changed setting groups, comma-separated, in the
  * change plan's order (`IN_PLACE_SETTINGS`: `channels`, `delivery`,
- * `permission_prompts`, `invited.permission_prompts`, `dm.enabled`,
+ * `permission_prompts`, `dm.enabled`,
  * `dm.contact`, `stop_hook_bootstrap`, `reaction_notices`).
  *
  * Pure module: nothing is created, read or scheduled at
@@ -335,6 +335,20 @@ import type { PersonaTeardownKillRefusal, PersonaTeardownKillResult } from './se
 // Types
 // ---------------------------------------------------------------------------
 
+/** Start every forget even if another throws; report the first failed step
+ * only after all asynchronous releases settle. */
+export async function forgetPersonaState(key: string, forgetters: readonly ((key: string) => void | Promise<void>)[]): Promise<void> {
+  const results = await Promise.allSettled(forgetters.map(forget => {
+    try { return Promise.resolve(forget(key)) } catch (error) { return Promise.reject(error) }
+  }))
+  for (const result of results) if (result.status === 'rejected') throw result.reason
+}
+
+/** Apply-time load failures are non-fatal and never expose the raw thrown value. */
+export function threadMemoryLoadAtApplyFailedLine(persona: Pick<Persona, 'name' | 'key'>, error: unknown): string {
+  return `[slack] persona ${renderPersonaRef(persona.name, persona.key)}: Thread Memory load at apply failed: ${describeThrownValue(error)}`
+}
+
 /** Dependencies of `createPersonaLifecycle`. */
 export interface PersonaLifecycleDeps {
   /** The per-persona lifecycle serializer's `run` (the server's one shared instance). */
@@ -354,6 +368,11 @@ export interface PersonaLifecycleDeps {
   connections: Pick<PersonaConnectionManager, 'stop' | 'reconnectCredentials' | 'replaceRetryTokens'>
   /** The inbound routing: a removed persona's dedupe store is dropped. */
   routing: Pick<PersonaRouting, 'forget'>
+  /** Cancel Thread Memory retries and hold resolution synchronously at teardown
+   * submission, before any awaited step. Later routing cleanup repeats it. */
+  cancelThreadMemory?(key: string): void
+  /** Load before opening this persona's Socket Mode connection. */
+  loadThreadMemory?(key: string): void | Promise<void>
   /**
    * The shared destination resolver: a removed persona's cached DM is
    * forgotten, an in-place updated one's when its DM destination settings
@@ -633,12 +652,11 @@ export interface PersonaLifecycle {
  * its cached DM conversation is forgotten when
  * one changed (the cache also re-checks the contact on
  * each use).
- * `permission_prompts` is the destination setting in declarative mode,
- * `invited.permission_prompts` the one in fungible mode.
+ * `permission_prompts` is the common destination setting in both modes.
  */
 export const DM_DESTINATION_SETTINGS: ReadonlySet<InPlaceSetting> = new Set<InPlaceSetting>([
   'permission_prompts',
-  'invited.permission_prompts',
+
   'dm.enabled',
   'dm.contact',
 ])
@@ -843,6 +861,7 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     const { key } = persona
     const prefix = `[slack] persona teardown of ${renderPersonaRef(persona.name, key)}`
     const cancels: [string, () => unknown][] = [
+      ['cancelling its Thread Memory background work', () => deps.cancelThreadMemory?.(key)],
       ['stopping its delivery', () => deps.stopDelivery?.(key)],
       [LIVE_ROW_SEQUENCE_STOP_STEP, () => deps.stopLiveRowSequence?.(key)],
       ["cancelling its launch's wait for a working row", () => deps.cancelLaunchWait?.(key)],
@@ -944,6 +963,7 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     const { key } = persona
 
     // first group, before the wait for its launch in flight.
+    await step('cancelling its Thread Memory background work', () => deps.cancelThreadMemory?.(key))
     // its dialog approver first, so no Enter reaches the old
     // life (the approver that launch would start does not start).
     await step('stopping its delivery', () => deps.stopDelivery?.(key))
@@ -1131,6 +1151,10 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     } catch (err) {
       log(`[slack] persona ${ref}: storage check at apply failed: ${describeThrownValue(err)}`)
     }
+    try { await deps.loadThreadMemory?.(persona.key) } catch (err) {
+      log(threadMemoryLoadAtApplyFailedLine(persona, err))
+    }
+    if (deps.isShuttingDown()) { log(skipLine); return { outcome: 'broken', failures: [] } }
     const result = await deps.bringUps.bringUp(persona, applied.personas)
     if (result.outcome !== 'up') return result
     // Shutdown may have begun during the bring-up: no instance is launched.

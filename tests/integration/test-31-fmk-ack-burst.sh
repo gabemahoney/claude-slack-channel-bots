@@ -34,7 +34,7 @@ printf '{"bot_token":"%s","app_token":"%s"}\n' "$(fake_token bot "${LABEL}")" "$
 STUB_DIR="${SCENARIO_ROOT}/slack-stub"
 mkdir "${STUB_DIR}"
 SCENARIO_SLACK_RECORD="${STUB_DIR}/record.jsonl"
-jq -n --arg token_label "${LABEL}" '{tokens:[{suffix:$token_label,label:$token_label,auth:"ok",connections:"ok"}],
+jq -n --arg token_label "${LABEL}" --arg channel "${CHANNEL}" '{tokens:[{suffix:$token_label,label:$token_label,memberships:[$channel],auth:"ok",connections:"ok"}],
     default:{auth:"invalid_auth",connections:"invalid_auth"}}' | write_file "${STUB_DIR}/control.json"
 bun "${SCENARIO_FIXTURES}/slack-stub-server.ts" --record "${SCENARIO_SLACK_RECORD}" \
     --control "${STUB_DIR}/control.json" --ready-file "${STUB_DIR}/ready.json" > "${STUB_DIR}/out" 2>&1 &
@@ -57,6 +57,7 @@ silent_worker() {
     grep -qzxF -- "${SCENARIO_BIN}/claude" "/proc/${pid}/cmdline" 2> /dev/null
 }
 wait_until 20 "the silent stub worker never started" silent_worker
+wait_membership_complete "${KEY}"
 ad_capture status --instance-id "${INSTANCE}"
 (( AD_RC == 0 )) || fail "cannot read silent worker status"
 jq -e '.state == "pending" and (.launch_started_at | type == "string" and length > 0)' "${AD_OUT}" > /dev/null \

@@ -224,8 +224,11 @@ import {
   PERSONA_DIAGNOSTIC_CLASSES,
   PERSONA_DIRECTORY_MISSING,
   PERSONA_DIRECTORY_UNUSABLE,
+  PERSONA_OPEN_CHANNEL,
   PERSONA_SLACK_UNREACHABLE,
   PERSONA_START,
+  THREAD_MEMORY_DIAGNOSTIC_CLASSES,
+  SHARED_STATE_DIAGNOSTIC_CLASSES,
   formatCredentialsChangeFailed,
   formatPersonaDiagnostic,
   personaCheckFailure,
@@ -239,6 +242,8 @@ import { MAX_TIMER_DELAY_MS, createPersonaRetrySchedule } from '../src/persona-r
 import { createPersonaSerializer, type PersonaSerialize, type PersonaSerializer } from '../src/persona-serializer.ts'
 import {
   longLivedWebClientOptions,
+  membershipWebClientOptions,
+  metadataWebClientOptions,
   redactSlackLogText,
   redactingSlackLogger,
   resolveSlackApiUrlOverride,
@@ -249,10 +254,13 @@ import {
 } from '../src/persona-slack-clients.ts'
 import { createSlackEpisodeTracker, type SlackEpisodeTracker } from '../src/persona-slack-episodes.ts'
 import {
+  SLACK_AUTH_TEST_TIMEOUT_MS,
   SlackAuthTestTimeoutError,
   SlackStartTimeoutError,
+  WEB_API_AUTH_FAILURE_ERRORS,
   botIdentityFromAuthTest,
   classifySlackValidationError,
+  slackInstallationIdentity,
   type SlackCredentialsRefusedOutcome,
   type SlackUnreachableOutcome,
   type SlackValidationCheck,
@@ -316,6 +324,7 @@ import {
   type CredentialsOverrides,
 } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { classifyMetadataFailure, MetadataCancelledError, THREAD_MEMORY_LOOKUP_METHODS, type ThreadMemoryLookupMethod } from '../src/thread-memory.ts'
 import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import type { PersonaSpec } from './test-helpers/persona-config.ts'
@@ -1362,8 +1371,9 @@ describe('no writes', () => {
 // ---------------------------------------------------------------------------
 
 describe('diagnostic lines', () => {
-  test('the persona and typed-delivery diagnostic label set is exactly the declared classes', () => {
-    expect([...PERSONA_DIAGNOSTIC_CLASSES].sort()).toEqual([
+  test('the persona, typed-delivery, Thread Memory and shared-state diagnostic label set is exactly the declared classes', () => {
+    expect(new Set(PERSONA_DIAGNOSTIC_CLASSES).size).toBe(PERSONA_DIAGNOSTIC_CLASSES.length)
+    expect([...PERSONA_DIAGNOSTIC_CLASSES].sort()).toEqual(([
       'delivery-stuck',
       'message-delivered',
       'message-not-saved',
@@ -1384,15 +1394,18 @@ describe('diagnostic lines', () => {
       'persona-directory-missing',
       'persona-directory-unusable',
       'persona-dm-dropped',
-      'persona-invited-channel',
+      PERSONA_OPEN_CHANNEL,
       'persona-slack-unreachable',
       'persona-start',
+      'persona-thread-stamp-undecided',
       'queue-kept',
       'queue-record-unreadable',
       'queue-unwritable',
       'system-prompt-unwritable',
       'unclaimed-channel',
-    ])
+      ...THREAD_MEMORY_DIAGNOSTIC_CLASSES,
+      ...SHARED_STATE_DIAGNOSTIC_CLASSES,
+    ] satisfies PersonaDiagnosticClass[]).sort())
   })
 
   // Rows: label, the check to run, and the path its diagnostic must carry.
@@ -1788,7 +1801,7 @@ describe('Slack validation classification (both legs, sentinel-bearing errors)',
     if (run.outcome.kind === 'up') {
       expect(lines).toEqual([])
       if ('identity' in run.outcome) {
-        expect(run.outcome.identity).toEqual({ botUserId: run.stub.identity.botUserId, botId: run.stub.identity.botId })
+        expect(run.outcome.identity).toEqual({ botUserId: run.stub.identity.botUserId, botId: run.stub.identity.botId, teamId: run.stub.identity.teamId })
       }
       return
     }
@@ -2197,6 +2210,8 @@ interface HarnessOptions {
   serialize?: PersonaSerialize
   /** The integration suite's Slack API base URL, passed to the manager as `slackApiUrl` when the key is given (even as `undefined`). Default: the key left out. */
   slackApiUrl?: string
+  /** Stub options of A and B (an `appId` enables bots.info); the leak marker stays on. */
+  stubOptions?: [StubSlackOptions?, StubSlackOptions?]
 }
 
 /** Harnesses built in the running test; stopped and leak-checked after it. */
@@ -2247,7 +2262,7 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
     const persona = makePersona(name, { index })
     if (dryRun) return persona
     const tokens = readTokens(persona)
-    slack.addPersona(persona.key, tokens, { leakMarker: LEAK_SENTINEL })
+    slack.addPersona(persona.key, tokens, { ...opts.stubOptions?.[index], leakMarker: LEAK_SENTINEL })
     return { ...persona, tokens }
   }) as [ManagedPersona, ManagedPersona]
   const manager = createPersonaConnectionManager({
@@ -2361,7 +2376,7 @@ describe('connection manager: bring-up and identity', () => {
 
     for (const p of [h.a, h.b]) {
       const stub = stubOf(h, p)
-      const identity = { botUserId: stub.identity.botUserId, botId: stub.identity.botId }
+      const identity = { botUserId: stub.identity.botUserId, botId: stub.identity.botId, teamId: stub.identity.teamId }
       expect(h.manager.status(p.key)).toEqual({ state: 'up', identity })
       expect(h.manager.identity(p.key)).toEqual(identity)
       expect(h.slack.buildsOf(p.key).map(build => build.kind)).toEqual(['validation', 'web', 'socket'])
@@ -2451,6 +2466,14 @@ describe('connection manager: bring-up and identity', () => {
 
 /** The Web API options of a validation client and of a socket client's `apps.connections.open` client. */
 const NO_RETRY_OPTIONS = { retryConfig: { retries: 0 }, timeout: 10_000, rejectRateLimitedCalls: true, attachOriginalToWebAPIRequestError: false }
+/** A Thread Memory lookup client's options: no SDK HTTP timeout, so the metadata deadline alone ends a hung request. */
+const METADATA_OPTIONS = { ...NO_RETRY_OPTIONS, timeout: 0 }
+
+/** A signal-bound client's options with its logger and request interceptor aside, and the signal the interceptor binds a request to. */
+function signalBoundOptions(options: unknown): { rest: Record<string, unknown>; logger: unknown; bound: unknown } {
+  const { logger, requestInterceptor, ...rest } = options as WebClientOptions
+  return { rest, logger, bound: (requestInterceptor as unknown as (request: Record<string, unknown>) => Record<string, unknown>)({}).signal }
+}
 
 /**
  * Each client kind's exact options, the token and the library logger
@@ -3073,6 +3096,29 @@ describe('Slack API base URL override: the option builders (section 4)', () => {
     expect('slackApiUrl' in without).toBe(false)
     expectRedactingLogger(plainLogger)
     expect(build(STUB_API_URL)).not.toBe(withUrl)
+  })
+
+  // Rows: the signal-bound builder and its exact options, the logger and the interceptor aside.
+  // Membership discovery keeps the 10 s validation timeout; metadata has none, so its deadline owns the clock.
+  test.each<[string, (signal: AbortSignal, slackApiUrl?: string) => WebClientOptions, Record<string, unknown>]>([
+    ['membershipWebClientOptions', membershipWebClientOptions, NO_RETRY_OPTIONS],
+    ['metadataWebClientOptions', metadataWebClientOptions, METADATA_OPTIONS],
+  ])('%s: exactly its options, a redacting logger and an interceptor binding each request to its signal; slackApiUrl only when given; fresh per call', (_name, build, expected) => {
+    const controller = new AbortController(), other = new AbortController()
+    const withUrl = build(controller.signal, STUB_API_URL)
+    const without = build(controller.signal, undefined)
+
+    const bound = signalBoundOptions(withUrl)
+    expect(bound.rest).toStrictEqual({ ...expected, slackApiUrl: STUB_API_URL })
+    expectRedactingLogger(bound.logger)
+    expect(bound.bound).toBe(controller.signal)
+    const plain = signalBoundOptions(without)
+    expect(plain.rest).toStrictEqual(expected)
+    expect('slackApiUrl' in without).toBe(false)
+    expectRedactingLogger(plain.logger)
+    expect(plain.bound).toBe(controller.signal)
+    const again = build(other.signal)
+    expect([again === without, again.logger === without.logger, signalBoundOptions(again).bound]).toEqual([false, false, other.signal])
   })
 
   test('socketModeClientOptions: with a URL, slackApiUrl inside clientOptions only (so apps.connections.open goes there), every other option unchanged; with undefined, exactly the options and no slackApiUrl key anywhere', () => {
@@ -3978,6 +4024,168 @@ describe('connection manager: the 10 s bound on auth.test (carry)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// bots.info supplements the auth.test identity
+// ---------------------------------------------------------------------------
+
+/** A's stub: auth.test names its team but no app, so validation asks bots.info for `appId`. */
+const SUPPLIED = { appId: 'A0SUPPLIED', botUserId: 'U0SUPPLIED', botId: 'B0SUPPLIED' } as const
+const suppliedBot = (bot: Record<string, unknown>): WebApiOutcome => ({ kind: 'ok', result: { bot: { id: SUPPLIED.botId, user_id: SUPPLIED.botUserId, app_id: SUPPLIED.appId, ...bot } } })
+
+/**
+ * Rows: A's bots.info answer after a successful auth.test, and what A becomes:
+ * up with a verified installation, up on exactly the auth.test identity
+ * (installation unverified), refused, or retrying on its backoff.
+ */
+const BOTS_INFO_ANSWERS: Array<[string, WebApiOutcome, 'verified' | 'unverified' | { state: 'broken' | 'retrying'; outcome: Record<string, unknown> }]> = [
+  ['a matching bot verifies the installation', { kind: 'ok' }, 'verified'],
+  ['a non-auth refusal (missing_scope) keeps exactly the auth.test identity, unverified', { kind: 'platform', error: 'missing_scope' }, 'unverified'],
+  ['another bot ID verifies nothing', suppliedBot({ id: 'B0FOREIGN' }), 'unverified'],
+  ['another bot user verifies nothing', suppliedBot({ user_id: 'U0FOREIGN' }), 'unverified'],
+  ['a malformed app ID verifies nothing', suppliedBot({ app_id: 'not-an-app' }), 'unverified'],
+  ['no bot verifies nothing', { kind: 'ok', result: { bot: undefined } }, 'unverified'],
+  ...[...WEB_API_AUTH_FAILURE_ERRORS].map((error): typeof BOTS_INFO_ANSWERS[number] => [`an auth refusal (${error}) refuses the bot token`, { kind: 'platform', error },
+    { state: 'broken', outcome: { kind: 'credentials-refused', check: 'auth.test', key: 'bot_token', slackError: error, method: 'bots.info' } }]),
+  ['a transient platform error leaves A retrying', { kind: 'platform', error: 'internal_error' }, { state: 'retrying', outcome: { kind: 'slack-unreachable', reason: 'platform-transient', slackError: 'internal_error' } }],
+  ['a network error leaves A retrying', { kind: 'network' }, { state: 'retrying', outcome: { kind: 'slack-unreachable', reason: 'network' } }],
+  ['a rate limit leaves A retrying', { kind: 'rate-limited', retryAfter: 30 }, { state: 'retrying', outcome: { kind: 'slack-unreachable', reason: 'rate-limited', retryAfter: 30 } }],
+  ['a malformed error code leaves A retrying', { kind: 'platform', error: 'Not JSON' }, { state: 'retrying', outcome: { kind: 'slack-unreachable', reason: 'unknown' } }],
+]
+
+describe('connection manager: bots.info supplements the auth.test identity', () => {
+  test.each(BOTS_INFO_ANSWERS)('after a successful auth.test, bots.info answering %s; B keeps delivering', async (_label, answer, expected) => {
+    const h = makeHarness({ stubOptions: [SUPPLIED] })
+    const a = stubOf(h, h.a)
+    a.script.botsInfo.push(answer)
+    expect(await h.manager.bringUp(h.b, h.b.tokens)).toMatchObject({ state: 'up' })
+
+    const status = await h.manager.bringUp(h.a, h.a.tokens)
+
+    assertNoLeak(status)
+    const authenticated = initialIdentityOf(h, h.a)
+    expect([a.calls.authTest.length, a.calls.botsInfo]).toEqual([1, [{ bot: SUPPLIED.botId, team_id: authenticated.teamId }]])
+    if (expected === 'verified' || expected === 'unverified') {
+      const identity = expected === 'verified' ? { ...authenticated, appId: SUPPLIED.appId } : authenticated
+      expect(status).toEqual({ state: 'up', identity })
+      expect(h.manager.provenance(h.a.key)?.identity).toEqual(identity)
+      expect(slackInstallationIdentity(identity) === undefined).toBe(expected === 'unverified')
+      expect(h.slack.buildsOf(h.a.key).map(build => build.kind)).toEqual(['validation', 'web', 'socket'])
+      expect(liveSocketsOf(h, h.a)).toBe(1)
+      expect(h.lines).toEqual([])
+      await expectDelivers(h, h.a)
+    } else {
+      // Refused or retrying: no long-lived client, no socket, no confirmed identity.
+      expect(status).toMatchObject({ ...expected, phase: 'bring-up' })
+      expect(h.slack.buildsOf(h.a.key).map(build => build.kind)).toEqual(['validation'])
+      expect(h.manager.provenance(h.a.key)).toBeUndefined()
+      expect(h.lines.map(classOf)).toEqual([expected.state === 'broken' ? PERSONA_CREDENTIALS_REFUSED : PERSONA_SLACK_UNREACHABLE])
+      if (expected.state === 'broken') {
+        expect(h.clock.pendingCount()).toBe(0)
+      } else {
+        // Never sooner than Retry-After; the retry validates again and, answered, verifies the installation.
+        expect(pendingDelays(h)[0]).toBeGreaterThanOrEqual(Number(expected.outcome['retryAfter'] ?? 0) * 1_000)
+        await h.clock.runNext()
+        expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: { ...authenticated, appId: SUPPLIED.appId } })
+        expect(a.calls.botsInfo).toHaveLength(2)
+      }
+    }
+    await expectDelivers(h, h.b)
+    await h.manager.stopAll()
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  test.each([['missing_scope', 'swapped'], ['token_revoked', 'refused']] as const)('a credentials reconnect whose bots.info answers %s is %s, on the new auth.test identity or with the old connection kept; B undisturbed', async (error, kind) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const oldWeb = h.manager.webClient(h.a.key)
+    const rotated = rotateCredentials(h, h.a, ROTATED, { appId: 'A0ROTATED', botsInfo: [{ kind: 'platform', error }] })
+    const since = h.slack.activityOf(h.a.key).length
+
+    const outcome = await h.manager.reconnectCredentials(h.a.key, rotated.tokens)
+
+    assertNoLeak(outcome)
+    expect(rotated.stub.calls.botsInfo).toEqual([{ bot: rotated.identity.botId, team_id: rotated.identity.teamId }])
+    if (kind === 'swapped') {
+      expect(outcome).toEqual({ kind, identity: rotated.identity })
+      expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: rotated.identity })
+      expect(h.manager.provenance(h.a.key)?.identity).toEqual(rotated.identity)
+      // Open before close: the new set connects before the old socket is discarded and disconnected.
+      expect(h.slack.activityOf(h.a.key).slice(since).map(e => [e.event, e.kind, e.credentials])).toEqual([
+        ['built', 'validation', ROTATED],
+        ['built', 'web', ROTATED],
+        ['built', 'socket', ROTATED],
+        ['started', 'socket', ROTATED],
+        ['connected', 'socket', ROTATED],
+        ['discarded', 'socket', INITIAL_CREDENTIALS],
+        ['disconnected', 'socket', INITIAL_CREDENTIALS],
+      ])
+      // Only the replacement is still connected.
+      expect([stubOf(h, h.a).sockets.map(socket => socket.connected), rotated.stub.sockets.map(socket => [socket.startCalls, socket.connected])])
+        .toEqual([[false], [[1, true]]])
+      await expectDelivers(h, h.a, rotated.stub)
+    } else {
+      expect(outcome).toMatchObject({ kind, outcome: { kind: 'credentials-refused', check: 'auth.test', key: 'bot_token', slackError: error, method: 'bots.info' } })
+      expect(builtFrom(h, h.a, ROTATED)).toEqual(['validation'])
+      await expectOldConnectionKept(h, h.a, oldWeb)
+    }
+    await expectBUndisturbed(h)
+  })
+
+  test.each([['bring-up', 'timeout'], ['bring-up', 'stop'], ['reconnect', 'timeout']] as const)('a %s whose bots.info is still pending at its %s gets no fresh budget after auth.test used half the bound; its late non-auth refusal publishes no identity and opens or swaps no socket; B keeps delivering', async (phase, end) => {
+    const h = makeHarness(phase === 'bring-up' ? { stubOptions: [SUPPLIED] } : {})
+    const auth = makeDeferredWebApiCall(), metadata = makeDeferredWebApiCall()
+    let pending: Promise<unknown>, settled: unknown
+    let oldWeb: ManagedWebClient | undefined
+    if (phase === 'reconnect') {
+      await bringUpBoth(h)
+      oldWeb = h.manager.webClient(h.a.key)
+      const rotated = rotateCredentials(h, h.a, ROTATED, { appId: 'A0ROTATED', authTest: [auth.outcome], botsInfo: [metadata.outcome] })
+      pending = h.manager.reconnectCredentials(h.a.key, rotated.tokens)
+    } else {
+      stubOf(h, h.a).script.authTest.push(auth.outcome)
+      stubOf(h, h.a).script.botsInfo.push(metadata.outcome)
+      expect(await h.manager.bringUp(h.b, h.b.tokens)).toMatchObject({ state: 'up' })
+      pending = h.manager.bringUp(h.a, h.a.tokens)
+    }
+    void pending.then(value => { settled = value })
+    const started = h.clock.now()
+    await h.clock.advance(SLACK_AUTH_TEST_TIMEOUT_MS / 2)
+    auth.settle(); await h.clock.flush()
+    expect(metadata.settled).toBe(false)
+    if (end === 'timeout') {
+      await h.clock.advanceTo(started + SLACK_AUTH_TEST_TIMEOUT_MS - 1)
+      expect(settled).toBeUndefined()
+      await expectDelivers(h, h.b)
+      await h.clock.advance(1)
+      const timeout = { kind: 'slack-unreachable', check: 'auth.test', reason: 'timeout' }
+      expect(await pending).toMatchObject(phase === 'reconnect' ? { kind: 'retrying', outcome: timeout, retryInMs: 5_000 }
+        : { state: 'retrying', phase, outcome: timeout, retryInMs: 5_000 })
+    } else {
+      await h.manager.stop(h.a.key)
+      expect(await pending).toEqual({ state: 'stopped' })
+    }
+    const reported = h.statuses.length, logged = h.lines.length
+
+    metadata.settle({ kind: 'platform', error: 'missing_scope' })
+    await h.clock.flush()
+
+    assertNoLeak(settled)
+    expect([h.statuses.length, h.lines.length]).toEqual([reported, logged])
+    expect(pendingDelays(h)).toEqual(end === 'timeout' ? [5_000] : [])
+    if (phase === 'reconnect') {
+      expect(builtFrom(h, h.a, ROTATED)).toEqual(['validation'])
+      await expectOldConnectionKept(h, h.a, oldWeb)
+    } else {
+      expect(h.slack.buildsOf(h.a.key).map(build => build.kind)).toEqual(['validation'])
+      expect([h.manager.identity(h.a.key), h.manager.provenance(h.a.key)]).toEqual([undefined, undefined])
+      expect(h.manager.isRunBotIdentity(SUPPLIED.botUserId)).toBe(false)
+    }
+    await expectDelivers(h, h.b)
+    await h.manager.stopAll()
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // No cross-persona coupling
 // ---------------------------------------------------------------------------
 
@@ -4733,7 +4941,7 @@ type ManagedWebClient = NonNullable<ReturnType<PersonaConnectionManager['webClie
 interface RotatedCredentials {
   tokens: PersonaSlackTokens
   stub: StubSlack
-  identity: { botUserId: string; botId: string }
+  identity: { botUserId: string; botId: string; teamId: string }
 }
 
 /**
@@ -4748,13 +4956,13 @@ function rotateCredentials(h: Harness, p: ManagedPersona, label = ROTATED, opts:
     fakeToken(APP_TOKEN_PREFIX, `${p.key}-${label}-app`),
   )
   const stub = h.slack.addCredentials(p.key, label, tokens, { leakMarker: LEAK_SENTINEL, teamId: 'T0ROTATED', ...opts })
-  return { tokens, stub, identity: { botUserId: stub.identity.botUserId, botId: stub.identity.botId } }
+  return { tokens, stub, identity: { botUserId: stub.identity.botUserId, botId: stub.identity.botId, teamId: stub.identity.teamId } }
 }
 
 /** The identity the persona's initial credential set's `auth.test` returns. */
-function initialIdentityOf(h: Harness, p: ManagedPersona): { botUserId: string; botId: string } {
-  const { botUserId, botId } = stubOf(h, p).identity
-  return { botUserId, botId }
+function initialIdentityOf(h: Harness, p: ManagedPersona): { botUserId: string; botId: string; teamId: string } {
+  const { botUserId, botId, teamId } = stubOf(h, p).identity
+  return { botUserId, botId, teamId }
 }
 
 /** The persona's clients built from credential set `label`, by kind, in build order. */
@@ -5303,7 +5511,7 @@ describe('connection manager: a credentials reconnect’s beforeSwap hook (crede
   /** What beforeSwap saw of A when it ran: its reported status, identity, client and both sockets. */
   interface SwapView {
     status: PersonaConnectionStatus | undefined
-    identity: { botUserId: string; botId: string } | undefined
+    identity: ReturnType<Harness['manager']['identity']>
     oldClient: boolean
     oldSocketConnected: boolean
     newSocketConnected: boolean
@@ -5905,6 +6113,112 @@ function webApiRefusalLine(h: Harness, method: string, code: string): string {
 function brokenReportsOf(h: Harness, p: ManagedPersona): number {
   return h.statuses.filter(([key, status]) => key === p.key && status.state === 'broken').length
 }
+
+// ---------------------------------------------------------------------------
+// Thread Memory lookup calls (the bounded metadata client and auth watch)
+// ---------------------------------------------------------------------------
+
+/** Each Thread Memory lookup method, its arguments, the stub queue that answers it and the stub's capture. */
+const METADATA_CALLS: Array<[ThreadMemoryLookupMethod, Record<string, unknown>, 'replies' | 'history', (s: StubSlack) => unknown[]]> = [
+  ['conversations.replies', { channel: WATCH_CHANNEL, ts: '1700000000.000100', limit: 1, inclusive: true }, 'replies', s => s.calls.conversationsReplies],
+  ['conversations.history', { channel: WATCH_CHANNEL, latest: '1700000000.000100', limit: 1, inclusive: true }, 'history', s => s.calls.conversationsHistory],
+]
+const AUTH_FAILURES = METADATA_CALLS.flatMap(([method, args, queue]) => [...WEB_API_AUTH_CODES].map(code => [method, code, args, queue] as const))
+
+describe('connection manager: Thread Memory lookup calls on the current authenticated connection', () => {
+  test('the lookup methods are exactly conversations.replies and conversations.history', () => {
+    expect(METADATA_CALLS.map(([method]) => method)).toEqual([...THREAD_MEMORY_LOOKUP_METHODS])
+  })
+
+  test.each(METADATA_CALLS)('%s: one request with exactly its arguments, on a fresh metadata-options client (no SDK HTTP timeout) bound to the caller\'s signal; B is untouched', async (method, args, queue, captured) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a), controller = new AbortController()
+    a.script[queue].push({ kind: 'ok', result: { marker: 'answer-7f3a' } })
+    const connectionId = h.manager.provenance(h.a.key)!.connectionId
+    const builds = h.slack.buildsOf(h.a.key).length, calls = a.callLog.length, callsB = stubOf(h, h.b).callLog.length
+
+    expect(await h.manager.metadataCall(h.a.key, connectionId, method, args, controller.signal)).toMatchObject({ ok: true, marker: 'answer-7f3a' })
+    expect(captured(a)).toEqual([args])
+    expect(a.callLog.slice(calls).map(c => c.method)).toEqual([method])
+    const [build] = h.slack.buildsOf(h.a.key).slice(builds)
+    expect([h.slack.buildsOf(h.a.key).length - builds, build!.kind]).toEqual([1, 'web'])
+    const options = signalBoundOptions(build!.options)
+    expect(options.rest).toStrictEqual(METADATA_OPTIONS)
+    expectRedactingLogger(options.logger)
+    expect(options.bound).toBe(controller.signal)
+    expect(stubOf(h, h.b).callLog).toHaveLength(callsB)
+  })
+
+  test('a membership page, unlike a metadata call, still builds its client with the membership options and their 10 s timeout', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a), controller = new AbortController(), builds = h.slack.buildsOf(h.a.key).length
+    a.script.inventory.push({ kind: 'ok', result: { channels: [], response_metadata: { next_cursor: '' } } })
+    await h.manager.membershipPage(h.a.key, h.manager.provenance(h.a.key)!.connectionId, undefined, controller.signal)
+    const fresh = h.slack.buildsOf(h.a.key).slice(builds)
+    expect(fresh.map(b => b.kind)).toEqual(['web'])
+    const options = signalBoundOptions(fresh[0]!.options)
+    expect(options.rest).toStrictEqual(NO_RETRY_OPTIONS)
+    expect(options.bound).toBe(controller.signal)
+  })
+
+  test.each<[string, (h: Harness) => { connectionId: string; signal: AbortSignal; key?: string }]>([
+    ['another connection id', h => ({ connectionId: 'conn-not-current', signal: new AbortController().signal })],
+    ['an already aborted signal', h => { const c = new AbortController(); c.abort(); return { connectionId: h.manager.provenance(h.a.key)!.connectionId, signal: c.signal } }],
+    ['an unmanaged persona', h => ({ key: 'nobody', connectionId: h.manager.provenance(h.a.key)!.connectionId, signal: new AbortController().signal })],
+  ])('with %s the call is cancelled before any client or Slack request', async (_name, arrange) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a), builds = h.slack.builds.length, calls = a.callLog.length
+    const { connectionId, signal, key } = arrange(h)
+    const thrown = await rejectionOf(h.manager.metadataCall(key ?? h.a.key, connectionId, 'conversations.replies', { channel: WATCH_CHANNEL, ts: '1700000000.000100' }, signal))
+    expect(thrown).toBeInstanceOf(MetadataCancelledError)
+    expect([h.slack.builds.length - builds, a.callLog.length - calls, h.manager.status(h.a.key)?.state]).toEqual([0, 0, 'up'])
+    assertNoLeak({ thrown, message: (thrown as Error).message, lines: h.lines })
+  })
+
+  test('a persona not up (its credentials refused) is cancelled with no request; its old connection id never reaches Slack', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a), connectionId = h.manager.provenance(h.a.key)!.connectionId
+    a.script.post.push({ kind: 'platform', error: 'token_revoked' })
+    await rejectionOf(h.manager.webClient(h.a.key)!.chat.postMessage({ channel: WATCH_CHANNEL, text: 'hello' }))
+    expect(h.manager.status(h.a.key)?.state).toBe('broken')
+    const calls = a.callLog.length
+    const thrown = await rejectionOf(h.manager.metadataCall(h.a.key, connectionId, 'conversations.history', { channel: WATCH_CHANNEL }, new AbortController().signal))
+    expect(thrown).toBeInstanceOf(MetadataCancelledError)
+    expect(a.callLog).toHaveLength(calls)
+    assertNoLeak({ thrown, message: (thrown as Error).message, classified: classifyMetadataFailure(thrown) })
+  })
+
+  test.each(AUTH_FAILURES)('%s answering %s marks A credentials-broken before the caller sees Slack\'s rejection; B is untouched', async (method, code, args, queue) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a)
+    a.script[queue].push({ kind: 'platform', error: code })
+    const thrown = await rejectionOf(h.manager.metadataCall(h.a.key, h.manager.provenance(h.a.key)!.connectionId, method, args, new AbortController().signal))
+    expect(thrown).toMatchObject({ code: 'slack_webapi_platform_error', data: { error: code } })
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'broken', phase: 'running', outcome: { kind: 'credentials-refused', slackError: code } })
+    expect(brokenReportsOf(h, h.a)).toBe(1)
+    expect(h.manager.status(h.b.key)?.state).toBe('up')
+    // Slack's rejection carries the stub's sentinel; what the lookup keeps of it, the status and the lines carry none.
+    const classified = classifyMetadataFailure(thrown)
+    expect(classified).toEqual({ kind: 'credentials', slackError: code })
+    assertNoLeak({ classified, status: h.manager.status(h.a.key), lines: h.lines })
+  })
+
+  test.each(['missing_scope', 'not_allowed_token_type', 'channel_not_found', 'thread_not_found', 'ratelimited'])('%s from a metadata call is the caller\'s to classify: A stays up and nothing is logged', async error => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a)
+    a.script.history.push({ kind: 'platform', error })
+    const thrown = await rejectionOf(h.manager.metadataCall(h.a.key, h.manager.provenance(h.a.key)!.connectionId, 'conversations.history', { channel: WATCH_CHANNEL }, new AbortController().signal))
+    expect(thrown).toMatchObject({ code: 'slack_webapi_platform_error', data: { error } })
+    expect([h.manager.status(h.a.key)?.state, brokenReportsOf(h, h.a), h.lines]).toEqual(['up', 0, []])
+    assertNoLeak({ classified: classifyMetadataFailure(thrown), status: h.manager.status(h.a.key) })
+  })
+})
 
 describe('connection manager: a revoked bot token while running (the Web API auth-error watch)', () => {
   test.each([...WEB_API_AUTH_CODES])('%s from a call on A’s client marks A broken at once: the caller gets the original rejection, the listener hears broken once, one line names A and its credentials path, A’s socket is closed as the manager’s own close with no reopen, a later call never reaches Slack; B is untouched', async code => {
@@ -8435,7 +8749,7 @@ describe('bring-up outcomes ()', () => {
       expect(hookCalls).toEqual([swapHook])
       expect(swaps).toEqual([{ late: expected.kind === 'retrying', wasUp }])
       expect(f.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
-      expect(f.h.manager.identity(a.key)).toEqual({ botUserId: fresh.identity.botUserId, botId: fresh.identity.botId })
+      expect(f.h.manager.identity(a.key)).toEqual({ botUserId: fresh.identity.botUserId, botId: fresh.identity.botId, teamId: fresh.identity.teamId })
       expect(f.controller.credentialsDigest(a.key)).toBe(fileDigest(a.credentials_file))
       await f.h.clock.flush()
       expect(f.launches).toEqual(refuse ? [a.key] : [])

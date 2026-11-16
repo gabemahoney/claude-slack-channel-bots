@@ -1,5 +1,5 @@
 /** Delivery reporting consumes durable facts and never authorizes keys. */
-import { isQueueItemClosed, slackKeyString, type SlackKey, type QueueEvent, type QueueItem, type DeliveryQueue, type AcceptedRecord } from './delivery-queue.ts'
+import { isOpenItem, slackKeyString, type SlackKey, type QueueEvent, type QueueItem, type DeliveryQueue, type AcceptedRecord } from './delivery-queue.ts'
 import type { PostedPersonaNotice } from './persona-notifier.ts'
 import { correctPostedNotice, type NoticeCorrectionOutcome } from './notice-correction.ts'
 import type { DeliveryEngineEvent, DeliveryReason, DeliveryStatus } from './delivery-engine.ts'
@@ -96,6 +96,7 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
   const pendingFindings: QueueEvent[] = []
   let findingFlushPending = false
   const received = new Set<string>(), completed = new Set<string>(), failures = new Map<string, number>(), unwritable = new Set<string>(), heads = new Map<string, number>()
+  const recoveredQueued = new Set<string>()
   interface StorageWarning {
     slackKey: SlackKey; posting: boolean; ready: boolean; correcting: boolean
     post?: PostedPersonaNotice; abort: AbortController; dispose(): void; correct(): void
@@ -109,7 +110,7 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     heads.delete(key); if (seq !== undefined) heads.set(key, seq)
     deps.episodes.end(key, 'delivery-stuck'); deps.episodes.end(key, 'messages-waiting')
   }
-  function receivedItem(key: string, item: QueueItem): void {
+  function receivedItem(key: string, item: QueueItem, mode: 'live' | 'recovered' = 'live'): void {
     // Reaction intake logs its own reaction-received line once, at a new
     // store; a Reaction Item gets no message-received line and no queued
     // acknowledgement reaction, from preparation, recovery or final delivery.
@@ -123,22 +124,37 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
         warning.correct()
       }
     }
+    if (item.hold && item.hold.state !== 'released') return
     const id = `${key}:${item.accepted.seq}`
+    if (mode === 'recovered') recoveredQueued.add(id)
     if (!received.has(id)) {
       received.add(id); log(MESSAGE_RECEIVED, key, deliveryIdentity(item.accepted))
     }
     // Log lifetime is the server run; reaction lifetime is one persona life.
     // The tracker deduplicates successful stages and permits restoration/retry.
-    if (item.accepted.source === 'slack' && !item.delivered) protect(() => deps.queued?.(key, item))
+    if (recoveredQueued.has(id) && !deps.state(key).up) return
+    recoveredQueued.delete(id)
+    if (item.accepted.source === 'slack' && isOpenItem(item)) protect(() => deps.queued?.(key, item))
   }
   function reconcileQueued(key: string): void {
     if (!deps.persona(key) || !deps.state(key).up) return
     // One pass when the current life becomes usable, detached from Slack and
     // delivery. Unreported intake still belongs to its normal post-ack path.
     for (const item of deps.queue.items(key)) {
-      if (received.has(`${key}:${item.accepted.seq}`) && item.accepted.source === 'slack' && !item.delivered) {
+      if (received.has(`${key}:${item.accepted.seq}`) && item.accepted.source === 'slack' && isOpenItem(item)) {
+        recoveredQueued.delete(`${key}:${item.accepted.seq}`)
         protect(() => deps.queued?.(key, item))
       }
+    }
+  }
+  /** A reply saved as a hold is received only at its release. Intake reports
+   * the hold's store after its aggregate ack decision, and an exact save
+   * corrects a posted warning then, as receivedItem does for other saves. */
+  function holdStored(key: string): void {
+    for (const warning of storageWarnings.get(key) ?? []) {
+      if (!deps.queue.lookupSlackKey(key, warning.slackKey)) continue
+      warning.ready = true
+      warning.correct()
     }
   }
   function postStorageWarning(key: string, event: Extract<QueueEvent, { type: 'store-failed' }>): void {
@@ -234,7 +250,7 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
       return
     }
     if (event.type === 'marker-missing' || event.type === 'delivered') return
-    const item = deps.queue.items(key).find(i => i.accepted.seq === event.seq)
+    const item = deps.queue.item(key, event.seq)
     if (!item) return
     const identity = deliveryIdentity(item.accepted), id = `${key}:${event.seq}`
     if (event.type === 'item-delivered') {
@@ -242,7 +258,11 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
       completed.add(id)
       receivedItem(key, item)
       log(MESSAGE_DELIVERED, key, identity, `at=${event.at} wait_ms=${event.waitMs}`)
-      move(key, deps.queue.items(key).find(i => !isQueueItemClosed(i))?.accepted.seq)
+      // Episodes follow the engine's reported item: they end once it is no
+      // longer open, and its next waiting fact names the new target. Another
+      // item's completion leaves a still-open reported item's episodes.
+      const head = heads.get(key), reported = head === undefined ? undefined : deps.queue.item(key, head)
+      if (!reported || !isOpenItem(reported)) move(key)
       protect(() => deps.delivered?.(key, item)); return
     }
     if (event.type === 'first-typed') {
@@ -258,7 +278,7 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
       log(MESSAGE_NOT_TAKEN_IN, key, identity)
       protect(() => deps.notify(key, buildMessageNotTakenInNotice(ref(key), item.accepted.user ?? item.accepted.bot_id ?? item.accepted.sender ?? 'unknown', !!event.partialReceipt))); return
     }
-    if (event.type !== 'waiting' || !event.status) return
+    if (event.type !== 'waiting' || !event.status || !isOpenItem(item)) return
     const status = event.status, state = deps.state(key)
     move(key, event.seq)
     if (!state.up) return
@@ -271,7 +291,7 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     if (begun === 'begun') log(DELIVERY_STUCK, key, identity, `reason=${reason} age_ms=${status.ageMs}`)
     deps.episodes.post(key, 'delivery-stuck', buildDeliveryStuckNotice(ref(key), key, status.count, status.ageMs, reason, status.retypeCount + 1, !!status.partialReceipt))
   }
-  return { received: (key: string, item: QueueItem) => protect(() => receivedItem(key, item)), reconcileQueued: (key: string) => protect(() => reconcileQueued(key)), queueEvent: (event: QueueEvent) => protect(() => queueEvent(event)), engineEvent: (event: DeliveryEngineEvent) => protect(() => engineEvent(event)), startupFindings, forget(key: string) {
+  return { received: (key: string, item: QueueItem, mode: 'live' | 'recovered' = 'live') => protect(() => receivedItem(key, item, mode)), holdStored: (key: string) => protect(() => holdStored(key)), reconcileQueued: (key: string) => protect(() => reconcileQueued(key)), queueEvent: (event: QueueEvent) => protect(() => queueEvent(event)), engineEvent: (event: DeliveryEngineEvent) => protect(() => engineEvent(event)), startupFindings, forget(key: string) {
     for (const warning of storageWarnings.get(key) ?? []) warning.dispose()
     failures.delete(key); unwritable.delete(key); heads.delete(key)
   } }

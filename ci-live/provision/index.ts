@@ -7,17 +7,19 @@
  * channels stage's human session, need it) and signed in on first use.
  */
 
-import type { AppsStateFile } from '../lib/apps-state.ts'
+import type { AppSetupSource, ManifestExport } from '../checks/context.ts'
+import type { AppsState, AppsStateFile } from '../lib/apps-state.ts'
 import type { Stage } from '../lib/args.ts'
 import type { BrowserDriver, ListedApp } from '../lib/browser-types.ts'
 import type { JsonObject } from '../lib/manifest.ts'
 import { appDisplayName, PERSONA_LETTERS, type PersonaLetter } from '../lib/personas.ts'
 import type { SecretStore } from '../lib/secrets.ts'
-import type { SlackParams, SlackResponse } from '../lib/slack-api.ts'
+import { safeErrorCode, SlackTransportError, type SlackParams, type SlackResponse } from '../lib/slack-api.ts'
 import { runAppTokenStage, type AppTokenAction } from './app-tokens.ts'
 import { runAppsStage, type AppOutcome } from './apps.ts'
 import type { BotApi } from './bot-api.ts'
 import { runChannelsStage } from './channels.ts'
+import { ConfigTokenUnavailableError } from './config-token.ts'
 import { runInstallStage, type InstallAction } from './install.ts'
 
 export interface ProvisionDeps {
@@ -85,6 +87,47 @@ export async function validateCredentials(
 
 export function allValid(report: ProvisionReport['validate']): boolean {
   return report !== undefined && Object.values(report).every((v) => v.bot === 'ok' && v.app === 'ok')
+}
+
+/** What `buildAppSetupSource` reads: the runner's workspace. */
+export interface AppSetupDeps {
+  callManifest: (method: string, params: SlackParams) => Promise<SlackResponse>
+  appsFile: { load(): AppsState }
+  manifestFor: (letter: PersonaLetter) => JsonObject
+}
+
+/** One `apps.manifest.export`, reduced to the manifest or a safe reason; never throws. */
+async function exportManifestOf(deps: AppSetupDeps, appId: string): Promise<ManifestExport> {
+  let answer: SlackResponse
+  try {
+    answer = await deps.callManifest('apps.manifest.export', { app_id: appId })
+  } catch (err) {
+    if (err instanceof ConfigTokenUnavailableError) return { kind: 'unavailable', why: 'no usable configuration token' }
+    if (err instanceof SlackTransportError) return { kind: 'unavailable', why: `no answer (${err.kind}${err.status !== undefined ? ` ${err.status}` : ''})` }
+    // Any other failure (a rotated pair that could not be saved): a fixed reason, never the error's text.
+    return { kind: 'unavailable', why: 'the configuration token call failed' }
+  }
+  if (!answer.ok) return { kind: 'unavailable', why: safeErrorCode(answer) }
+  const m = answer.manifest
+  if (!m || typeof m !== 'object' || Array.isArray(m)) return { kind: 'unavailable', why: 'no manifest in the answer' }
+  return { kind: 'exported', manifest: m as JsonObject }
+}
+
+/**
+ * The checks' read-only view of this run's app setup (CheckContext.setup):
+ * `report` is this run's provisioning report, or `null` when provisioning
+ * threw (then every stage answers `undefined`).
+ */
+export function buildAppSetupSource(report: ProvisionReport | null, ws: AppSetupDeps): AppSetupSource {
+  return {
+    provisioned: (letter) => {
+      const app = report?.apps?.find((o) => o.letter === letter)
+      return { appId: app?.appId, apps: app?.action, drift: app ? [...app.drift] : undefined, unchecked: app?.unchecked, install: report?.install?.[letter] }
+    },
+    needsReinstall: (letter) => ws.appsFile.load().personas[letter]?.needs_reinstall === true,
+    exportManifest: (appId) => exportManifestOf(ws, appId),
+    wantedManifest: (letter) => ws.manifestFor(letter),
+  }
 }
 
 export async function runProvisioning(deps: ProvisionDeps, stage: Stage | null): Promise<ProvisionReport> {

@@ -397,7 +397,7 @@ const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true })
 function readAdSettingsFile(path: string, fs: Partial<PersonaConfigFs> | undefined): AdSettingsReadOutcome {
   let bytes: Buffer
   try {
-    bytes = readPersonaConfigBytes(path, fs)
+    bytes = readPersonaConfigBytes(path, fs, { uncapped: false })
   } catch (err) {
     const code = err instanceof PersonaConfigReadError ? err.code : undefined
     if (code === 'ENOENT') return { kind: 'accepted', values: DEFAULT_AD_SETTINGS_IN_EFFECT }

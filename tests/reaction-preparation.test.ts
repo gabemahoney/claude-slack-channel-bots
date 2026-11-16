@@ -58,40 +58,40 @@ describe('decideReactionPreparation: the stored mode and normalized facts decide
 
   const ROWS: Array<[string, ChannelMode, ReactionMessageFacts, ReactionConversationFacts, Expected]> = [
     // Kept in both modes.
-    ['public channel, unthreaded', 'declarative', found(), known('public-channel'), kept('general')],
-    ['private channel, threaded', 'declarative', found(ROOT_TS), known('private-channel', false, 'secret'), kept('secret', { thread_ts: ROOT_TS })],
-    ['DM, threaded', 'declarative', found(ROOT_TS), dm, kept('dm', { thread_ts: ROOT_TS })],
-    ['public channel, unthreaded', 'fungible', found(), known('public-channel'), kept('general')],
-    ['private channel, threaded', 'fungible', found(ROOT_TS), known('private-channel', false, 'secret'), kept('secret', { thread_ts: ROOT_TS })],
-    ['DM', 'fungible', found(), dm, kept('dm')],
+    ['public channel, unthreaded', 'strict', found(), known('public-channel'), kept('general')],
+    ['private channel, threaded', 'strict', found(ROOT_TS), known('private-channel', false, 'secret'), kept('secret', { thread_ts: ROOT_TS })],
+    ['DM, threaded', 'strict', found(ROOT_TS), dm, kept('dm', { thread_ts: ROOT_TS })],
+    ['public channel, unthreaded', 'open', found(), known('public-channel'), kept('general')],
+    ['private channel, threaded', 'open', found(ROOT_TS), known('private-channel', false, 'secret'), kept('secret', { thread_ts: ROOT_TS })],
+    ['DM', 'open', found(), dm, kept('dm')],
     // Fungible-only conditions do not apply to declarative items.
-    ['externally shared listed channel', 'declarative', found(), known('public-channel', true), kept('general')],
-    ['conversation that is not a channel', 'declarative', found(), known('other', false, 'odd'), kept('odd')],
+    ['externally shared listed channel', 'strict', found(), known('public-channel', true), kept('general')],
+    ['conversation that is not a channel', 'strict', found(), known('other', false, 'odd'), kept('odd')],
     // L1: an unknown message is fixed without thread_ts; a declarative refusal is L1 too.
-    ['L1: message unknown', 'declarative', noMessage, known('public-channel'), kept('general', { messageUnknown: true })],
-    ['L1: message unknown', 'fungible', noMessage, known('public-channel'), kept('general', { messageUnknown: true })],
-    ['L1: not_in_channel refusal', 'declarative', refused('not_in_channel'), known('public-channel'), kept('general', { messageUnknown: true })],
+    ['L1: message unknown', 'strict', noMessage, known('public-channel'), kept('general', { messageUnknown: true })],
+    ['L1: message unknown', 'open', noMessage, known('public-channel'), kept('general', { messageUnknown: true })],
+    ['L1: not_in_channel refusal', 'strict', refused('not_in_channel'), known('public-channel'), kept('general', { messageUnknown: true })],
     // L7: a declarative item whose conversation lookup failed is kept, typed with the ID.
-    ['L7: conversation unknown', 'declarative', found(ROOT_TS), noConversation, kept(CHANNEL, { thread_ts: ROOT_TS })],
-    ['L1 and L7 together', 'declarative', noMessage, noConversation, kept(CHANNEL, { messageUnknown: true })],
+    ['L7: conversation unknown', 'strict', found(ROOT_TS), noConversation, kept(CHANNEL, { thread_ts: ROOT_TS })],
+    ['L1 and L7 together', 'strict', noMessage, noConversation, kept(CHANNEL, { messageUnknown: true })],
     // Each withdrawal reason and each fungible condition.
-    ['Server Post', 'declarative', serverPost, known('public-channel'), withdrawn('server-post')],
-    ['group DM', 'declarative', found(), known('group-dm', false, 'mpdm-ada--bob-1'), withdrawn('group-dm')],
-    ['group DM', 'fungible', found(), known('group-dm', false, 'mpdm-ada--bob-1'), withdrawn('group-dm')],
-    ['conversation unknown', 'fungible', found(), noConversation, withdrawn('conversation-unknown')],
-    ['not a channel', 'fungible', found(), known('other', false, 'odd'), withdrawn('fungible-refused', 'not-a-channel')],
-    ['externally shared', 'fungible', found(), known('public-channel', true), withdrawn('fungible-refused', 'externally-shared')],
-    ['not_in_channel refusal', 'fungible', refused('not_in_channel'), known('public-channel'), withdrawn('fungible-refused', 'not_in_channel')],
-    ['channel_not_found refusal', 'fungible', refused('channel_not_found'), known('private-channel'), withdrawn('fungible-refused', 'channel_not_found')],
-    ['DM whose message read is refused', 'fungible', refused('not_in_channel'), dm, withdrawn('fungible-refused', 'not_in_channel')],
-    // Precedence (SR-5.5): server-post, conversation-unknown, group-dm, fungible-refused.
-    ['Server Post over conversation unknown', 'fungible', serverPost, noConversation, withdrawn('server-post')],
-    ['Server Post over group DM', 'declarative', serverPost, known('group-dm'), withdrawn('server-post')],
-    ['conversation unknown over a refusal', 'fungible', refused('not_in_channel'), noConversation, withdrawn('conversation-unknown')],
-    ['group DM over fungible conditions', 'fungible', refused('channel_not_found'), known('group-dm', true), withdrawn('group-dm')],
+    ['Server Post', 'strict', serverPost, known('public-channel'), withdrawn('server-post')],
+    ['group DM', 'strict', found(), known('group-dm', false, 'mpdm-ada--bob-1'), withdrawn('group-dm')],
+    ['group DM', 'open', found(), known('group-dm', false, 'mpdm-ada--bob-1'), withdrawn('group-dm')],
+    ['conversation unknown', 'open', found(), noConversation, withdrawn('conversation-unknown')],
+    ['not a channel', 'open', found(), known('other', false, 'odd'), withdrawn('open-refused', 'not-a-channel')],
+    ['externally shared', 'open', found(), known('public-channel', true), withdrawn('open-refused', 'externally-shared')],
+    ['not_in_channel refusal', 'open', refused('not_in_channel'), known('public-channel'), withdrawn('open-refused', 'not_in_channel')],
+    ['channel_not_found refusal', 'open', refused('channel_not_found'), known('private-channel'), withdrawn('open-refused', 'channel_not_found')],
+    ['DM whose message read is refused', 'open', refused('not_in_channel'), dm, withdrawn('open-refused', 'not_in_channel')],
+    // Precedence (SR-5.5): server-post, conversation-unknown, group-dm, open-refused.
+    ['Server Post over conversation unknown', 'open', serverPost, noConversation, withdrawn('server-post')],
+    ['Server Post over group DM', 'strict', serverPost, known('group-dm'), withdrawn('server-post')],
+    ['conversation unknown over a refusal', 'open', refused('not_in_channel'), noConversation, withdrawn('conversation-unknown')],
+    ['group DM over fungible conditions', 'open', refused('channel_not_found'), known('group-dm', true), withdrawn('group-dm')],
     // Among fungible conditions, the order recorded on the implementation Subtask.
-    ['not a channel over sharing and refusal', 'fungible', refused('not_in_channel'), known('other', true), withdrawn('fungible-refused', 'not-a-channel')],
-    ['externally shared over a refusal', 'fungible', refused('channel_not_found'), known('public-channel', true), withdrawn('fungible-refused', 'externally-shared')],
+    ['not a channel over sharing and refusal', 'open', refused('not_in_channel'), known('other', true), withdrawn('open-refused', 'not-a-channel')],
+    ['externally shared over a refusal', 'open', refused('channel_not_found'), known('public-channel', true), withdrawn('open-refused', 'externally-shared')],
   ]
 
   test.each(ROWS)('%s (%s)', (_label, mode, message, conversation, expected) => {
@@ -100,7 +100,7 @@ describe('decideReactionPreparation: the stored mode and normalized facts decide
 })
 
 function accepted(overrides: Partial<ReactionAcceptedRecord> = {}): ReactionAcceptedRecord {
-  const f = { channel: CHANNEL, message_ts: REACTED_TS, ts: EVENT_TS, change: 'added' as const, emoji: 'white_check_mark', user: 'U0ADA', mode: 'declarative' as ChannelMode, ...overrides }
+  const f = { channel: CHANNEL, message_ts: REACTED_TS, ts: EVENT_TS, change: 'added' as const, emoji: 'white_check_mark', user: 'U0ADA', mode: 'strict' as ChannelMode, ...overrides }
   return {
     v: 1, kind: 'accepted', seq: 3, received_at: 1, source: 'reaction', text: '', origin: 'slack-event', ...f,
     reaction_key: { chat_id: f.channel, message_ts: f.message_ts, reactor: f.user || f.bot_id || '', emoji: f.emoji, change: f.change, event_ts: f.ts },
@@ -310,7 +310,7 @@ describe('lookup 2: the reacted message, read with its metadata', () => {  test(
       const r = rig()
       r.stubs.alpha.script.replies.push(exactMessage({ thread_ts: ROOT_TS, ...(user === undefined ? {} : { user }) }))
       r.stubs.alpha.script.info.push(channelInfo(PUBLIC))
-      decisions.push(await r.run(accepted({ mode: 'fungible' })).promise)
+      decisions.push(await r.run(accepted({ mode: 'open' })).promise)
     }
     const kept = fixed('Name of U0ADA', 'general', { thread_ts: ROOT_TS })
     expect(decisions).toStrictEqual([kept, kept, kept])
@@ -328,7 +328,7 @@ describe('lookup 2: the reacted message, read with its metadata', () => {  test(
     ['a thrown string channel_not_found', { kind: 'reject', value: 'channel_not_found' }, 'failed'],
     ['a read that never answers', { kind: 'never' }, 'timeout'],
   ] as Array<[string, WebApiOutcome, ReactionMessageRead['state']]>)('L1 in both modes: %s fixes the notice without thread_ts', async (_label, outcome, state) => {
-    for (const mode of ['declarative', 'fungible'] as const) {
+    for (const mode of ['strict', 'open'] as const) {
       const r = rig()
       r.stubs.alpha.script.replies.push(outcome)
       r.stubs.alpha.script.info.push(channelInfo(PUBLIC))
@@ -351,13 +351,13 @@ describe('lookup 2: the reacted message, read with its metadata', () => {  test(
 
   test.each(['not_in_channel', 'channel_not_found'] as const)('Slack refusing the read with %s refuses a fungible item and is L1 for a declarative one', async code => {
     const decisions: ReactionPreparationDecision[] = []
-    for (const mode of ['fungible', 'declarative'] as const) {
+    for (const mode of ['open', 'strict'] as const) {
       const r = rig()
       r.stubs.alpha.script.replies.push({ kind: 'platform', error: code })
       r.stubs.alpha.script.info.push(channelInfo(PUBLIC))
       decisions.push(await r.run(accepted({ mode })).promise)
     }
-    expect(decisions).toStrictEqual([withdrawn('fungible-refused', code), fixed('Name of U0ADA', 'general', { messageUnknown: true })])
+    expect(decisions).toStrictEqual([withdrawn('open-refused', code), fixed('Name of U0ADA', 'general', { messageUnknown: true })])
     assertNoLeak(decisions)
     const r = rig()
     r.stubs.alpha.script.replies.push({ kind: 'platform', error: code })
@@ -407,13 +407,13 @@ describe('lookup 3: the conversation, read fresh for every item', () => {
   test('a non-DM item makes one conversations.info and no other conversation or membership call', async () => {
     const r = rig()
     r.stubs.alpha.script.replies.push(exactMessage())
-    await r.run(accepted({ mode: 'fungible' })).promise
+    await r.run(accepted({ mode: 'open' })).promise
     expect(r.stubs.alpha.calls.conversationsInfo).toStrictEqual([{ channel: CHANNEL }])
     expect(methods(r.stubs.alpha)).toEqual(['conversations.info', 'conversations.replies'])
     expect(r.stubs.beta.callLog).toEqual([])
   })
 
-  test.each(['declarative', 'fungible'] as const)('a D… conversation is a DM with no conversation call (%s)', async mode => {
+  test.each(['strict', 'open'] as const)('a D… conversation is a DM with no conversation call (%s)', async mode => {
     const r = rig()
     r.stubs.alpha.script.replies.push(exactMessage({ thread_ts: ROOT_TS }))
     const decision = await r.run(accepted({ channel: 'D0DM0001', mode })).promise
@@ -423,23 +423,23 @@ describe('lookup 3: the conversation, read fresh for every item', () => {
   })
 
   const kept = (channel_name: string) => fixed('Name of U0ADA', channel_name)
-  const unknownConversation = { declarative: kept(CHANNEL), fungible: withdrawn('conversation-unknown') }
+  const unknownConversation = { strict: kept(CHANNEL), open: withdrawn('conversation-unknown') }
   test.each([
-    ['a leading # is stripped', channelInfo({ name: '#general', is_channel: true }), { declarative: kept('general'), fungible: kept('general') }],
-    ['no name falls back to the ID', channelInfo({ is_channel: true }), { declarative: kept(CHANNEL), fungible: kept(CHANNEL) }],
-    ['an empty name falls back to the ID', channelInfo({ name: '', is_channel: true }), { declarative: kept(CHANNEL), fungible: kept(CHANNEL) }],
-    ['a private channel (is_group)', channelInfo({ name: 'secret', is_group: true, is_private: true }), { declarative: kept('secret'), fungible: kept('secret') }],
-    ['a private channel (is_channel, is_private)', channelInfo({ name: 'secret', is_channel: true, is_private: true }), { declarative: kept('secret'), fungible: kept('secret') }],
-    ['a group DM', channelInfo({ name: 'mpdm-ada--bob-1', is_mpim: true, is_group: true, is_private: true }), { declarative: withdrawn('group-dm'), fungible: withdrawn('group-dm') }],
-    ['a conversation that is not a channel', channelInfo({ name: 'odd', is_im: true }), { declarative: kept('odd'), fungible: withdrawn('fungible-refused', 'not-a-channel') }],
-    ['an externally shared channel', channelInfo({ ...PUBLIC, is_ext_shared: true }), { declarative: kept('general'), fungible: withdrawn('fungible-refused', 'externally-shared') }],
+    ['a leading # is stripped', channelInfo({ name: '#general', is_channel: true }), { strict: kept('general'), open: kept('general') }],
+    ['no name falls back to the ID', channelInfo({ is_channel: true }), { strict: kept(CHANNEL), open: kept(CHANNEL) }],
+    ['an empty name falls back to the ID', channelInfo({ name: '', is_channel: true }), { strict: kept(CHANNEL), open: kept(CHANNEL) }],
+    ['a private channel (is_group)', channelInfo({ name: 'secret', is_group: true, is_private: true }), { strict: kept('secret'), open: kept('secret') }],
+    ['a private channel (is_channel, is_private)', channelInfo({ name: 'secret', is_channel: true, is_private: true }), { strict: kept('secret'), open: kept('secret') }],
+    ['a group DM', channelInfo({ name: 'mpdm-ada--bob-1', is_mpim: true, is_group: true, is_private: true }), { strict: withdrawn('group-dm'), open: withdrawn('group-dm') }],
+    ['a conversation that is not a channel', channelInfo({ name: 'odd', is_im: true }), { strict: kept('odd'), open: withdrawn('open-refused', 'not-a-channel') }],
+    ['an externally shared channel', channelInfo({ ...PUBLIC, is_ext_shared: true }), { strict: kept('general'), open: withdrawn('open-refused', 'externally-shared') }],
     ['an answer with no channel', { kind: 'ok', result: { channel: undefined } }, unknownConversation],
     ['a channel that is not an object', { kind: 'ok', result: { channel: 'general' } }, unknownConversation],
     ['a channel array carrying a valid channel name and flags', { kind: 'ok', result: { channel: Object.assign([], { id: CHANNEL, ...PUBLIC }) } }, unknownConversation],
     ['a Slack refusal', { kind: 'platform', error: 'missing_scope' }, unknownConversation],
     ['a network failure', { kind: 'network' }, unknownConversation],
   ] as Array<[string, WebApiOutcome, Record<ChannelMode, Expected>]>)('%s', async (_label, info, expected) => {
-    for (const mode of ['declarative', 'fungible'] as const) {
+    for (const mode of ['strict', 'open'] as const) {
       const r = rig()
       r.stubs.alpha.script.replies.push(exactMessage())
       r.stubs.alpha.script.info.push(info)
@@ -459,7 +459,7 @@ describe('lookup 3: the conversation, read fresh for every item', () => {
       ? spyOn(r.stubs.alpha.web.conversations, 'replies').mockResolvedValue(Object.assign([], { ok: true, messages: [{ ts: REACTED_TS, user: 'U0AUTHOR', thread_ts: ROOT_TS, text: BODY, metadata: { event_type: SERVER_POST_METADATA.event_type } }] }))
       : spyOn(r.stubs.alpha.web.conversations, 'info').mockResolvedValue(Object.assign([], { ok: true, channel: { id: CHANNEL, ...PUBLIC } }))
     try {
-      const decision = await r.run(accepted({ mode: 'fungible' })).promise
+      const decision = await r.run(accepted({ mode: 'open' })).promise
       expect(decision).toStrictEqual(leg === 'message' ? fixed('Name of U0ADA', 'general', { messageUnknown: true }) : withdrawn('conversation-unknown'))
       expect(r.stubs.beta.callLog).toEqual([])
       expect(r.clock.pendingCount()).toBe(0)
@@ -475,9 +475,9 @@ describe('lookup 3: the conversation, read fresh for every item', () => {
     const decisions: ReactionPreparationDecision[] = []
     for (let i = 0; i < 3; i++) {
       r.stubs.alpha.script.replies.push(exactMessage())
-      decisions.push(await r.run(accepted({ mode: 'fungible' })).promise)
+      decisions.push(await r.run(accepted({ mode: 'open' })).promise)
     }
-    expect(decisions).toStrictEqual([kept('general'), withdrawn('fungible-refused', 'externally-shared'), withdrawn('group-dm')])
+    expect(decisions).toStrictEqual([kept('general'), withdrawn('open-refused', 'externally-shared'), withdrawn('group-dm')])
     expect(r.stubs.alpha.calls.conversationsInfo).toStrictEqual([{ channel: CHANNEL }, { channel: CHANNEL }, { channel: CHANNEL }])
   })
 
@@ -508,7 +508,7 @@ describe('lookup 3: the conversation, read fresh for every item', () => {
     lateInfo.settle(channelInfo({ name: 'late', is_channel: true, is_ext_shared: true }))
     await r.clock.flush()
     expect(first.value).toStrictEqual(decided)
-    expect(await r.run(accepted({ mode: 'fungible' })).promise).toStrictEqual(kept('general'))
+    expect(await r.run(accepted({ mode: 'open' })).promise).toStrictEqual(kept('general'))
   })
 
   const NO_CLIENT: Array<[string, (key: string) => WebClient | undefined]> = [
@@ -518,8 +518,8 @@ describe('lookup 3: the conversation, read fresh for every item', () => {
   test.each(NO_CLIENT)('with %s, lookups 2 and 3 fail at once and the fallbacks decide', async (_label, clientFor) => {
     const cases: Array<[ReactionAcceptedRecord, Expected]> = [
       [accepted(), fixed('Name of U0ADA', CHANNEL, { messageUnknown: true })],
-      [accepted({ mode: 'fungible' }), withdrawn('conversation-unknown')],
-      [accepted({ channel: 'D0DM0001', mode: 'fungible' }), fixed('Name of U0ADA', 'dm', { messageUnknown: true })],
+      [accepted({ mode: 'open' }), withdrawn('conversation-unknown')],
+      [accepted({ channel: 'D0DM0001', mode: 'open' }), fixed('Name of U0ADA', 'dm', { messageUnknown: true })],
     ]
     for (const [item, expected] of cases) {
       const r = rig({ clientFor })
@@ -541,7 +541,7 @@ describe('lookup 3: the conversation, read fresh for every item', () => {
     const r = rig()
     r.stubs.alpha.script.replies.push({ kind: 'reject', value: Object.assign(new Error(sentinelInMessage('replies')), { data: { error: 'not_in_channel', token: fakeToken(BOT_TOKEN_PREFIX, 'data') } }) })
     r.stubs.alpha.script.info.push({ kind: 'reject', value: new Error(sentinelInMessage('info')) })
-    const decision = await r.run(accepted({ mode: 'fungible' })).promise
+    const decision = await r.run(accepted({ mode: 'open' })).promise
     expect(decision).toStrictEqual(withdrawn('conversation-unknown'))
     assertNoLeak(decision)
   })
@@ -580,10 +580,10 @@ describe('lookup 1 for a bot-tool item: the persona name stored with it, with no
 
   const GROUP_DM_INFO = channelInfo({ name: 'mpdm-ada--bob-1', is_mpim: true, is_group: true, is_private: true })
   test.each([
-    ['an externally shared channel', 'fungible', exactMessage(), channelInfo({ ...PUBLIC, is_ext_shared: true }), withdrawn('fungible-refused', 'externally-shared')],
-    ['a reacted-message read refused with not_in_channel', 'fungible', { kind: 'platform', error: 'not_in_channel' }, channelInfo(PUBLIC), withdrawn('fungible-refused', 'not_in_channel')],
-    ['a group DM', 'fungible', exactMessage(), GROUP_DM_INFO, withdrawn('group-dm')],
-    ['a group DM', 'declarative', exactMessage(), GROUP_DM_INFO, withdrawn('group-dm')],
+    ['an externally shared channel', 'open', exactMessage(), channelInfo({ ...PUBLIC, is_ext_shared: true }), withdrawn('open-refused', 'externally-shared')],
+    ['a reacted-message read refused with not_in_channel', 'open', { kind: 'platform', error: 'not_in_channel' }, channelInfo(PUBLIC), withdrawn('open-refused', 'not_in_channel')],
+    ['a group DM', 'open', exactMessage(), GROUP_DM_INFO, withdrawn('group-dm')],
+    ['a group DM', 'strict', exactMessage(), GROUP_DM_INFO, withdrawn('group-dm')],
   ] as Array<[string, ChannelMode, WebApiOutcome, WebApiOutcome, Expected]>)('%s still withdraws a %s bot-tool item, read with no membership call', async (_label, mode, replies, info, expected) => {
     const r = rig()
     r.stubs.alpha.script.replies.push(replies)

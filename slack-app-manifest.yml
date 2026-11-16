@@ -61,8 +61,18 @@
 # added and then be re-installed to gain them. Until then, Slack sends the app
 # neither event, and looking a group DM up fails with `missing_scope`.
 #
+# Membership requires both member_joined_channel and channel_left bot events,
+# plus channels:read and groups:read for public/private discovery. Check the
+# currently installed app: a new manifest install includes these; an existing
+# app needs missing subscriptions/scopes added and its one-time reinstall
+# completed. An already verified app needs no reinstall on ordinary restart.
+# Startup does not inspect or change Slack installation settings. Record manual
+# evidence for the authenticated app through local /membership-readiness; see
+# the setup/debug skills. Inventory completion does not verify subscriptions or
+# reinstall completion. Thread following adds no separate scope/reinstall.
+#
 # Group DM messages are deliberately not subscribed: do not add a group-DM
-# message event (`message.mpim`).
+# message event.
 
 _metadata:
   major_version: 1
@@ -110,6 +120,8 @@ settings:
       - message.im
       - message.groups
       - app_mention
+      - member_joined_channel
+      - channel_left
       - reaction_added
       - reaction_removed
   interactivity:

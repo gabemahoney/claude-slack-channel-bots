@@ -2628,6 +2628,12 @@ describe('the /ci images (source audit)', () => {
     expect(BASE_IMAGE).not.toBe('cscb-ci-base:v8')
   })
 
+  test('t2.yiv.sf.39: the 0.18.0 downgrade fixture invalidates the cached 0.16.1 base', () => {
+    // v9 already exists with the 0.16.1 downgrade fixture. A cached v9 has no
+    // 0.18.0 package, so test-40 and test-47 would find no earlier release.
+    expect(BASE_IMAGE).not.toBe('cscb-ci-base:v9')
+  })
+
   test.each(TAGGED)('every base-image tag %s names is BASE_IMAGE; a planted previous tag is refused', (rel) => {
     expect(BASE_IMAGE).toMatch(/:v\d+$/)
     const text = repoFile(rel)
@@ -2823,14 +2829,16 @@ describe('the /ci images (source audit)', () => {
   test('the prior published downgrade package has its own exact version, checksum, manifest and tarball beside the retained 0.10.0 fixture', () => {
     const { instructions, args } = baseImage()
     expect(args.CSCB_PREV_VERSION).toBe('0.10.0')
-    expect(args.CSCB_DOWNGRADE_VERSION).toBe('0.16.1')
-    expect(args.CSCB_DOWNGRADE_SHA256).toMatch(/^[a-f0-9]{64}$/)
+    expect(args.CSCB_DOWNGRADE_VERSION).toBe('0.18.0')
+    expect(args.CSCB_DOWNGRADE_SHA256).toBe('16d102793cc62395b771c431078b4124267b3d11cb8b56e84c48e8910d096b62')
     const run = runWith(instructions, '"claude-slack-channel-bots@${CSCB_DOWNGRADE_VERSION}"')
     expect(run).toContain('npm pack --ignore-scripts --pack-destination "$d" "claude-slack-channel-bots@${CSCB_DOWNGRADE_VERSION}"')
-    expect(run).toContain('sha256sum --check --status')
+    expect(run).toContain('printf \'%s  %s\\n\' "$CSCB_DOWNGRADE_SHA256" "$f" | sha256sum --check --status')
     expect(run).toContain('test "$(tar -xOf "$f" package/package.json | jq -r .version)" = "$CSCB_DOWNGRADE_VERSION"')
     expect(run).toContain('release.json')
+    expect(run).toContain('"published":"2026-10-21T08:49:18.397Z"')
     expect(run).toContain('https://registry.npmjs.org/claude-slack-channel-bots')
+    expect(run.indexOf('sha256sum --check --status')).toBeLessThan(run.indexOf('release.json'))
   })
 
   test('the base installs sqlite3 and file with apt and writes the marker /etc/cscb-ci-image', () => {

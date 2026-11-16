@@ -1,0 +1,61 @@
+{
+  "channel_mode": "strict",
+  "stop_timeout": 45,
+  "personas": [
+    {
+      "name": "alpha",
+      "credentials_file": "~/personas/alpha/credentials.json",
+      "working_directory": "~/personas/alpha/work",
+      "channels": [
+        {
+          "id": "C0TEST001",
+          "delivery": "all"
+        },
+        {
+          "id": "C0TEST002",
+          "delivery": "mentions"
+        },
+        {
+          "id": "G0TEST003",
+          "delivery": "all"
+        },
+        {
+          "id": "C0UPGCONFA",
+          "delivery": "all"
+        }
+      ],
+      "dm": {
+        "enabled": false
+      },
+      "permission_prompts": "C0TEST001"
+    },
+    {
+      "name": "bravo",
+      "credentials_file": "~/personas/bravo/credentials.json",
+      "working_directory": "~/personas/bravo/work",
+      "channels": [
+        {
+          "id": "C0UPGCONFB",
+          "delivery": "all"
+        },
+        {
+          "id": "C0TEST001",
+          "delivery": "all"
+        },
+        {
+          "id": "C0TEST002",
+          "delivery": "thread_hybrid"
+        },
+        {
+          "id": "C0UPGOFF",
+          "delivery": "off"
+        }
+      ],
+      "dm": {
+        "enabled": true,
+        "contact": "U0UPGBRAVO"
+      },
+      "permission_prompts": "C0UPGCONFB"
+    }
+  ]
+}

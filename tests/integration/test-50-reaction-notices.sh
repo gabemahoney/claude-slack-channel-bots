@@ -55,9 +55,13 @@
 #   whose conversations.info fails both deliver (L7); a failed message read
 #   delivers without thread_ts and logs reaction-message-unknown (L1).
 # - AC5 (declarative): alpha's own reaction, bravo's bot user as reactor and
-#   another user's message are silent drops; an unlisted channel is a logged
-#   unserved-conversation drop; a marked Server Post, an unmarked open
-#   permission prompt and a listed group DM are withdrawn; a successor passes.
+#   another user's message are silent drops; an unlisted channel and a real
+#   group DM (listed, but absent from the channel inventory, so with no
+#   verified membership) are logged unserved-conversation drops, with no
+#   item, preparation read or notice; a marked Server Post, an unmarked open
+#   permission prompt and GD are withdrawn; a successor in a served channel
+#   passes. GD is a defensive preparation case with inconsistent kind facts:
+#   its inventory row is a private channel, its conversations.info a group DM.
 # - AC3: one reaction event pushed twice, a plain restart, then again: three
 #   ACKed envelopes, one accepted item, received line and typed notice, one
 #   preparation.
@@ -74,15 +78,24 @@
 #   (the second request arrives before the first is answered): two unchanged
 #   results and one notice each. The overlap notices are the later positive
 #   progress for the AC1 and AC3 negatives.
-# - Fungible (AC5): an externally shared envelope is a logged fungible-refused
+# - Fungible (AC5): an externally shared envelope is a logged open-refused
 #   drop; sharing learned from conversations.info and a failed lookup are
-#   withdrawn (fungible-refused externally-shared, conversation-unknown); a
+#   withdrawn (open-refused externally-shared, conversation-unknown); a
 #   successor passes.
 # - Closing: no RAW line and no message-received line for any reaction, no
 #   acknowledgement on any notice's message or event ts (bravo's react calls
 #   aside), no reminder for any notice; bravo accepted, received and was typed no reaction (its journal
 #   saved before the restart included); `stop --stop-bots`; the port closed;
 #   no token-like text.
+#
+# Served channels. This branch serves a channel only with a non-off stored
+# choice and verified membership, for messages and reactions alike. Each
+# app's stub inventory (users.conversations) lists its configured channels,
+# as lib/real-scenario.sh's control does, and the script waits for both
+# inventories after each start, as test-31-fmk-ack-burst.sh does. The
+# fungible leg adds FS, FU and FP to alpha's inventory and pushes a self-join
+# for each, then waits for open mode's `mentions` default and a complete
+# rescan, as test-29-invited-channels.sh's live_membership_phase does.
 #
 # Own client. Every preparation read and API call the script counts is
 # counted on alpha's label and in all, and the two must agree, so a read
@@ -167,7 +180,8 @@ LA="C0${CH_TAG}LA"          # alpha: listed `all`; the Tool Posts, the ordinary 
 LM="C0${CH_TAG}LM"          # alpha: listed `mentions`
 LX="C0${CH_TAG}LX"          # alpha: listed `all`, externally shared (conversations.info)
 LF="C0${CH_TAG}LF"          # alpha: listed `all`, its conversations.info fails
-GD="G0${CH_TAG}GD"          # alpha: a listed group DM (is_mpim)
+GD="G0${CH_TAG}GD"          # alpha: listed `all`; defensive: a private channel in its inventory, a group DM (is_mpim) by conversations.info
+GR="G0${CH_TAG}GR"          # alpha: listed `all`; a real group DM, absent from its channel inventory
 UN="C0${CH_TAG}UN"          # listed by no persona
 DMA="D0${CH_TAG}AD"         # alpha's DM (dm.enabled)
 B1="C0${CH_TAG}B1"          # bravo: listed `mentions`
@@ -183,7 +197,7 @@ BRAVO_BOT_ID="B0${CH_TAG}BRAVO"
 HUMAN="U0${CH_TAG}HUMAN"     # the usual reactor and every message's author; alpha's dm.contact
 HUMAN2="U0${CH_TAG}SECOND"   # a second user
 CONTACT="U0${CH_TAG}CONTACT" # bravo's dm.contact
-for id in "${LA}" "${LM}" "${LX}" "${LF}" "${GD}" "${UN}" "${DMA}" "${B1}" "${BB}" "${FX}" "${FS}" "${FU}" "${FP}" \
+for id in "${LA}" "${LM}" "${LX}" "${LF}" "${GD}" "${GR}" "${UN}" "${DMA}" "${B1}" "${BB}" "${FX}" "${FS}" "${FU}" "${FP}" \
     "${ALPHA_BOT_USER}" "${ALPHA_BOT_ID}" "${BRAVO_BOT_USER}" "${BRAVO_BOT_ID}" "${HUMAN}" "${HUMAN2}" "${CONTACT}"; do
     [[ "${id}" =~ ^[A-Z0-9]{1,24}$ ]] || fail "ID ${id} is not 1 to 24 characters from A-Z0-9"
 done
@@ -262,11 +276,11 @@ LOOKUP_ERROR='internal_error'
 # The reasons, refusals and conditions passed to the printer, which checks
 # each against the package's exported lists.
 DROP_UNSERVED='unserved-conversation'
-DROP_FUNGIBLE='fungible-refused'
+DROP_FUNGIBLE='open-refused'
 REFUSAL_EXTERNALLY_SHARED='externally-shared'
 WITHDRAWN_SERVER_POST='server-post'
 WITHDRAWN_GROUP_DM='group-dm'
-WITHDRAWN_FUNGIBLE='fungible-refused'
+WITHDRAWN_FUNGIBLE='open-refused'
 WITHDRAWN_UNKNOWN='conversation-unknown'
 CONDITION_EXTERNALLY_SHARED='externally-shared'
 
@@ -598,6 +612,10 @@ CTL_REPLIES='{}'
 CTL_PAIRS='[]'
 ALPHA_SUFFIX="${SCENARIO_TAG}alpha"
 BRAVO_SUFFIX="${SCENARIO_TAG}bravo"
+# Each app's Slack-side memberships: its configured channels (lib/real-scenario.sh),
+# except alpha's real group DM GR, which Slack's channel inventory never lists.
+ALPHA_MEMBERS=("${LA}" "${LM}" "${LX}" "${LF}" "${GD}" "${BB}")
+BRAVO_MEMBERS=("${B1}" "${BB}")
 # set_channel <id> <entry-json>; set_reply <channel> <ts> <entry-json>
 set_channel() {
     CTL_CHANNELS="$(jq -c --arg c "$1" --argjson e "$2" '.[$c] = $e' <<< "${CTL_CHANNELS}")"
@@ -624,9 +642,11 @@ control_write() {
         --arg bsuf "${BRAVO_SUFFIX}" --arg bl "${BRAVO_LABEL}" --arg bu "${BRAVO_BOT_USER}" --arg bb "${BRAVO_BOT_ID}" \
         --arg h "${HUMAN}" --arg hn "${HUMAN_NAME}" --arg h2 "${HUMAN2}" --arg h2n "${HUMAN2_NAME}" \
         --argjson channels "${CTL_CHANNELS}" --argjson replies "${CTL_REPLIES}" --argjson pairs "${CTL_PAIRS}" \
+        --argjson am "$(jq -cn '$ARGS.positional' --args "${ALPHA_MEMBERS[@]}")" \
+        --argjson bm "$(jq -cn '$ARGS.positional' --args "${BRAVO_MEMBERS[@]}")" \
         '{tokens: [
-            {suffix: $asuf, label: $al, auth: "ok", connections: "ok", user_id: $au, bot_id: $ab},
-            {suffix: $bsuf, label: $bl, auth: "ok", connections: "ok", user_id: $bu, bot_id: $bb}],
+            {suffix: $asuf, label: $al, auth: "ok", connections: "ok", user_id: $au, bot_id: $ab, memberships: $am},
+            {suffix: $bsuf, label: $bl, auth: "ok", connections: "ok", user_id: $bu, bot_id: $bb, memberships: $bm}],
           default: {auth: "invalid_auth", connections: "invalid_auth"},
           users: {($h): {name: "human", profile: {display_name: $hn}}, ($h2): {name: "second", profile: {display_name: $h2n}}},
           channels: $channels, replies: $replies}
@@ -969,16 +989,15 @@ export CSCB_SLACK_API_URL="${STUB_API_URL}"
 wait_until "${RECORD_WAIT_S}" "the stub never loaded the control file's labels" control_loaded 1
 
 # --- Configurations --------------------------------------------------------
-# write_persona_config <declarative|fungible>: fungible adds the switch and
-# alpha's invited.permission_prompts (as Test 29).
+# write_persona_config <declarative|fungible>: fungible sets the switch to
+# open mode (as Test 29); both modes share the channel list and destination.
 write_persona_config() {
-    local switch='' invited=''
+    local switch=''
     case "$1" in
         declarative) ;;
         fungible)
             [[ "${SWITCH_KEY:-}" =~ ^[a-z_]+$ ]] || fail "write_persona_config: the switch's key is not printed yet"
-            switch=$'\n  "'"${SWITCH_KEY}"$'": true,'
-            invited=$',\n      "invited": { "permission_prompts": "'"${LA}"'" }'
+            switch=$'\n  "'"${SWITCH_KEY}"'": "'"${FUNGIBLE}"'",'
             ;;
         *) fail "write_persona_config: unknown shape '$1'" ;;
     esac
@@ -995,10 +1014,11 @@ write_persona_config() {
         { "id": "${LX}", "delivery": "all" },
         { "id": "${LF}", "delivery": "all" },
         { "id": "${GD}", "delivery": "all" },
+        { "id": "${GR}", "delivery": "all" },
         { "id": "${BB}", "delivery": "all" }
       ],
       "dm": { "enabled": true, "contact": "${HUMAN}" },
-      "permission_prompts": "${LA}"${invited}
+      "permission_prompts": "${LA}"
     },
     {
       "name": "${BRAVO}",
@@ -1034,7 +1054,7 @@ SERVER_POST_EVENT_TYPE="$(printed SERVER_POST_EVENT_TYPE)"
 ALPHA_INSTANCE="$(printed personaInstanceId "${ALPHA_KEY}")"
 PERMISSION_ACTION_ID="$(printed encodePermissionActionId allow "${ALPHA_INSTANCE}" "$(cat /proc/sys/kernel/random/uuid)")"
 SWITCH_KEY="$(printed MODE_SWITCH_SETTING)"
-FUNGIBLE="$(printed channelModeOf true)"
+FUNGIBLE="$(printed channelModeOf open)"
 APPLIED_CLASS="[slack] $(printed RELOAD_APPLIED):"
 SWITCH_ON_LINE="$(printed modeSwitchLine "${FUNGIBLE}" "${ALPHA}" "${BRAVO}")"
 ALPHA_START="$(persona_start_match "${ALPHA_INDEX}" "${ALPHA}")"
@@ -1064,6 +1084,8 @@ ALPHA_HOOK_CONTROL="${STUB_BIN}/stub-claude-hooks.${ALPHA_SESSION}"
 ALPHA_HOOK_RECORD="${ALPHA_HOOK_CONTROL}.jsonl"
 [[ "$(jq -r --arg cwd "$(realpath -e -- "${ALPHA_DIR}")" 'select(.cwd == $cwd) | .instance_id' "${STUB_BIN}/stub-claude-launches.jsonl")" \
     == "${ALPHA_INSTANCE}" ]] || fail "start: alpha's one launch does not carry instance ID ${ALPHA_INSTANCE}"
+# Verified membership of the listed channels (test-31-fmk-ack-burst.sh).
+for who in "${ALPHA}" "${BRAVO}"; do wait_membership_complete "${who}"; done
 
 # --- AC1: Tool Posts and their notices ----------------------------------------
 # alpha's real reply-tool posts: P1 in LA, PT in P1's thread, PD in alpha's DM,
@@ -1330,7 +1352,9 @@ SP1="${PUSH_TS}"  # a marked Server Post
 new_ts
 SP2="${PUSH_TS}"  # an unmarked open permission prompt
 new_ts
-PG="${PUSH_TS}"   # alpha's message in the listed group DM
+PG="${PUSH_TS}"   # alpha's message in GD, the defensive case
+new_ts
+PR="${PUSH_TS}"   # alpha's message in the real group DM GR
 set_reply "${LA}" "${PS}" "$(bot_message "${PS}")"
 set_reply "${LA}" "${PO}" "$(jq -c -n --arg t "${PO}" --arg u "${HUMAN2}" '{message: {ts: $t, user: $u}}')"
 set_reply "${UN}" "${PN}" "$(bot_message "${PN}")"
@@ -1340,6 +1364,8 @@ set_reply "${LA}" "${SP2}" "$(jq -c -n --arg t "${SP2}" --arg u "${ALPHA_BOT_USE
     '{message: {ts: $t, user: $u, bot_id: $b, blocks: [{type: "actions", elements: [{type: "button", action_id: $a, text: {type: "plain_text", text: "Allow"}}]}]}}')"
 set_channel "${GD}" '{"is_mpim": true, "is_private": true}'
 set_reply "${GD}" "${PG}" "$(bot_message "${PG}")"
+set_channel "${GR}" '{"is_mpim": true, "is_private": true}'
+set_reply "${GR}" "${PR}" "$(bot_message "${PR}")"
 control_write "AC5: the excluded messages"
 AC5_MARK="$(rec_lines)"
 # Silent drops: each ACKed, with no line, acceptance or preparation.
@@ -1352,6 +1378,11 @@ push_reaction "AC5: unlisted channel" added "${UN}" "${PN}" "${HUMAN}" tada
 UNSERVED_LINE="$(printed buildReactionDroppedLine "${ALPHA}" "${ALPHA_KEY}" "${DROP_UNSERVED}" "${UN}" "${PN}")"
 wait_until "${EVENT_WAIT_S}" "AC5: no unserved-conversation line" log_end_at_least "${UNSERVED_LINE}" 1
 [[ "$(ev seqs "${ALPHA_JOURNAL}" "${UN}" "${PUSH_TS}" | wc -l)" == 0 ]] || fail "AC5: the unlisted channel's reaction was accepted"
+# A real group DM: listed, but no verified membership, so unserved (Q2).
+push_reaction "AC5: real group DM" added "${GR}" "${PR}" "${HUMAN}" tada
+GROUP_DM_LINE="$(printed buildReactionDroppedLine "${ALPHA}" "${ALPHA_KEY}" "${DROP_UNSERVED}" "${GR}" "${PR}")"
+wait_until "${EVENT_WAIT_S}" "AC5: no unserved-conversation line for the real group DM" log_end_at_least "${GROUP_DM_LINE}" 1
+[[ "$(ev seqs "${ALPHA_JOURNAL}" "${GR}" "${PUSH_TS}" | wc -l)" == 0 ]] || fail "AC5: the real group DM's reaction was accepted"
 # Withdrawn at preparation.
 # withdrawn_leg <step> <chat> <message-ts> <reason> [<condition>]
 withdrawn_leg() {
@@ -1376,19 +1407,21 @@ withdrawn_leg() {
 declare -a WITHDRAWN_SEQS=()
 withdrawn_leg "AC5: marked Server Post" "${LA}" "${SP1}" "${WITHDRAWN_SERVER_POST}"
 withdrawn_leg "AC5: unmarked open permission prompt" "${LA}" "${SP2}" "${WITHDRAWN_SERVER_POST}"
-withdrawn_leg "AC5: listed group DM" "${GD}" "${PG}" "${WITHDRAWN_GROUP_DM}"
-# The successor passes the withdrawn items: later positive progress.
+# Defensive: GD's inconsistent kind facts let it be accepted; preparation's lookup withdraws it.
+withdrawn_leg "AC5: defensive group DM (inventory private, conversations.info group DM)" "${GD}" "${PG}" "${WITHDRAWN_GROUP_DM}"
+# The successor passes the withdrawn items: later positive progress, and the
+# served-channel control for the drops above.
 notice_leg "AC5: successor" added "${LA}" "${LA_NAME}" "${P1}" - tada "${HUMAN}" "${HUMAN_NAME}" 1
 for seq in "${WITHDRAWN_SEQS[@]}"; do
     for kind in fixed sent delivered; do
         expect_kind "AC5: withdrawn seq ${seq}" "${seq}" "${kind}" 0
     done
 done
-for msg in "${PS}" "${PO}" "${PN}"; do
+for msg in "${PS}" "${PO}" "${PN}" "${PR}"; do
     for head in "[slack] ${REACTION_RECEIVED}: " "[slack] ${REACTION_DROPPED}: "; do
         n="$(log_has_count "${head}" "message_ts=\"${msg}\"")"
-        if [[ "${msg}" == "${PN}" && "${head}" == *"${REACTION_DROPPED}"* ]]; then
-            [[ "${n}" == 1 ]] || fail "AC5: ${n} reaction-dropped lines for the unlisted channel, expected 1"
+        if [[ ( "${msg}" == "${PN}" || "${msg}" == "${PR}" ) && "${head}" == *"${REACTION_DROPPED}"* ]]; then
+            [[ "${n}" == 1 ]] || fail "AC5: ${n} reaction-dropped lines for message ${msg}, expected 1"
         else
             [[ "${n}" == 0 ]] || fail "AC5: ${n} '${head}' line(s) for message ${msg}, expected 0"
         fi
@@ -1396,7 +1429,10 @@ for msg in "${PS}" "${PO}" "${PN}"; do
     n="$(rec_after "${AC5_MARK}" event=api method=conversations.replies request_ts="${msg}")"
     [[ "${n}" == 0 ]] || fail "AC5: message ${msg} was prepared (${n} conversations.replies)"
 done
-for chat_msg in "${LA} ${PS}" "${LA} ${PO}" "${UN} ${PN}"; do
+n="$(rec_after "${AC5_MARK}" event=api method=conversations.info channel="${GR}")"
+[[ "${n}" == 0 ]] || fail "AC5: the real group DM was looked up (${n} conversations.info)"
+[[ "$(log_has_count "[slack] ${DELIVERED_LABEL}: " "chat_id=\"${GR}\"")" == 0 ]] || fail "AC5: a notice from the real group DM was delivered"
+for chat_msg in "${LA} ${PS}" "${LA} ${PO}" "${UN} ${PN}" "${GR} ${PR}"; do
     read -r chat msg <<< "${chat_msg}"
     python3 - "${ALPHA_JOURNAL}" "${chat}" "${msg}" << 'EOF' || fail "AC5: an excluded reaction was accepted"
 import json, sys
@@ -1408,7 +1444,7 @@ with open(path) as f:
             sys.exit(1)
 EOF
 done
-evidence "AC5: silent drops (own, bot reactor, other's message): 0 received/dropped lines, 0 acceptances, 0 replies reads; unserved: ${UNSERVED_LINE}; completion: each ACK, then successor seq ${NOTICE_SEQ} delivered"
+evidence "AC5: silent drops (own, bot reactor, other's message): 0 received/dropped lines, 0 acceptances, 0 replies reads; unserved: ${UNSERVED_LINE}; real group DM: ${GROUP_DM_LINE}, 0 acceptances, 0 replies or info reads; completion: each ACK, then successor seq ${NOTICE_SEQ} delivered"
 
 # --- AC3: the same event twice, a restart, then again --------------------------
 new_ts
@@ -1463,6 +1499,7 @@ for who in "${ALPHA_LABEL}" "${BRAVO_LABEL}"; do
     wait_until "${RECORD_WAIT_S}" "AC3: no new WebSocket for ${who}" rec_at_least $(( sockets_before[${who}] + 1 )) event=ws-open label="${who}"
     wait_until "${RECORD_WAIT_S}" "AC3: no new auth.test for ${who}" rec_at_least $(( auth_before[${who}] + 1 )) event=api method=auth.test label="${who}"
 done
+for who in "${ALPHA}" "${BRAVO}"; do wait_membership_complete "${who}"; done
 push_raw "AC3: third push, after the restart" "${DUP_EVENT}"
 DUP_ENVELOPES+=("${PUSH_ENVELOPE}")
 # The later positive control on alpha's connection.
@@ -1724,7 +1761,12 @@ check_switch_applied() {
     check_pending_layout "switch on"
     mv -f -- "${PENDING}" "${APPLY}"
     wait_for_count "${APPLIED_CLASS}" $(( applied_before + 1 )) "${APPLY_WAIT_S}" "switch on: the confirmation was never applied"
-    cmp -s -- "${CONFIG}" "${LAST}" || fail "switch on: config.json.last-applied does not hold config.json's bytes"
+    # config.json.last-applied is the shared authority: its reviewed input is
+    # config.json's bytes, and its applied configuration is in open mode.
+    configuration_record_matches "${CONFIG}" "${LAST}" reviewed > /dev/null \
+        || fail "switch on: the authority's reviewed input is not config.json's bytes"
+    configuration_applied_is "${CONFIG}" "${LAST}" channel_mode "${FUNGIBLE}" \
+        || fail "switch on: the applied configuration is not in ${FUNGIBLE} mode"
 }
 check_switch_applied
 new_ts
@@ -1742,11 +1784,22 @@ for chat_msg in "${FX} ${PFX}" "${FS} ${PFS}" "${FU} ${PFU}" "${FP} ${PFP}"; do
     read -r chat msg <<< "${chat_msg}"
     set_reply "${chat}" "${msg}" "$(bot_message "${msg}")"
 done
+# alpha joins FS, FU and FP: the inventory page changes before each self-join
+# is pushed, and each gets open mode's `mentions` default before its rescan
+# completes (test-29-invited-channels.sh's live_membership_phase).
+ALPHA_MEMBERS+=("${FS}" "${FU}" "${FP}")
 control_write "fungible: the conversations"
+choice_is() { [[ "$(shared_channel_saved "$1" "$2")" == "$3" ]]; }
+for chat in "${FS}" "${FU}" "${FP}"; do
+    # shellcheck disable=SC2119 # scenario_ts requires zero arguments.
+    push_raw "fungible: alpha joins ${chat}" "$(slack_membership_event member_joined_channel "${ALPHA_LABEL}" "${chat}" "$(scenario_ts)" "${ALPHA_BOT_USER}")"
+    wait_until "${EVENT_WAIT_S}" "fungible: alpha's join of ${chat} has no open-mode default" choice_is "${ALPHA_KEY}" "${chat}" mentions
+    wait_membership_complete "${ALPHA}"
+done
 push_reaction "fungible: shared envelope" added "${FX}" "${PFX}" "${HUMAN}" tada "${ALPHA_BOT_USER}" true
 FX_LINE="$(printed buildReactionDroppedLine "${ALPHA}" "${ALPHA_KEY}" "${DROP_FUNGIBLE}" "${FX}" "${PFX}" "${REFUSAL_EXTERNALLY_SHARED}")"
-wait_until "${EVENT_WAIT_S}" "fungible: no fungible-refused line for the shared envelope" log_end_at_least "${FX_LINE}" 1
-[[ "$(log_end_count "${FX_LINE}")" == 1 ]] || fail "fungible: more than one fungible-refused line"
+wait_until "${EVENT_WAIT_S}" "fungible: no open-refused line for the shared envelope" log_end_at_least "${FX_LINE}" 1
+[[ "$(log_end_count "${FX_LINE}")" == 1 ]] || fail "fungible: more than one open-refused line"
 evidence "fungible: server.log ${FX_LINE}"
 WITHDRAWN_SEQS=()
 withdrawn_leg "fungible: shared by conversations.info" "${FS}" "${PFS}" "${WITHDRAWN_FUNGIBLE}" "${CONDITION_EXTERNALLY_SHARED}"

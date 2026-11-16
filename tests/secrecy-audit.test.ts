@@ -52,7 +52,9 @@
  *    config-file writer, the agent-director settings-file writer, the
  *    stored-choice file writer, the reload,
  *    connection, routing and recovery harnesses, the Slack client factory
- *    stub), or sets a stub's `leakMarker`. A suite that matches but has no
+ *    stub and its marker-planting rejection factories, the upgrade fixture
+ *    generator's config builders and writers), or sets a stub's
+ *    `leakMarker`. A suite that matches but has no
  *    secret-bearing surface is listed in `EXEMPT` with its reason; an
  *    exemption that no longer matches
  *    such a suite (missing file, no longer touching, or now calling
@@ -99,13 +101,16 @@
 
 import { describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import ts from 'typescript'
 
-import { LEAK_SENTINEL, TOKEN_LIKE, assertNoLeak } from './test-helpers/credentials.ts'
+import { BOT_TOKEN_PREFIX, LEAK_SENTINEL, TOKEN_LIKE, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { serializeTestMeasurement, queueEventMeasurement, postHoldEventMeasurement, type TestMeasurementRecord } from '../src/test-measurements.ts'
+import { ackVerdict, storeVerdict, postHoldVerdict, n2Verdict, lookupFaultVerdicts, printResults, envelopeTimings } from './integration/fixtures/sr8-evidence.ts'
+import { percentile } from './integration/fixtures/transcript-receipts.ts'
 import { balancedAfter, callArguments, callsOf, splitTopLevel, stripComments } from './test-helpers/source-audit.ts'
 
 /** b.c13: process starts use the shared filter; entries scrub before dispatch.
@@ -379,9 +384,14 @@ const CREDENTIALS_HELPER = 'tests/test-helpers/credentials.ts'
  * SCREAMING_CASE constant from one of them makes a suite touching.
  */
 const SOURCE_SURFACES: [RegExp, string][] = [
+  [/^src\/channel-membership(?:-scan|-readiness|-evidence)?\.ts$/, 'authenticated installation and durable membership evidence, API diagnostics and operator records'],
   [/^src\/codex-config-keys\.ts$/, 'the names-only Codex config scanner and authorized top-level host model reader'],
   [/^src\/config\.ts$/, 'the persona config loader and record validation'],
+  [/^src\/shared-channels\.ts$/, 'the durable applied configuration, source input and persona identity authority'],
+  [/^src\/shared-state-reports\.ts$/, 'shared-state notice builders and reporter carry authority failure text, configured identities and paths into Slack notices and diagnostic lines'],
+  [/^src\/shared-recovery\.ts$/, 'damaged authority evidence, prepared input and recovery request parsing'],
   [/^src\/test-mcp-drop\.ts$/, 'the test-only MCP disconnect route, which reads applied persona config and logs and returns the configured persona key'],
+  [/^src\/test-measurements\.ts$/, 'test-only records project queue and Post Hold metadata; write diagnostics carry configured paths and redacted storage failure codes'],
   [/^src\/persona-credentials\.ts$/, 'the credentials reader and classifier'],
   [/^src\/persona-bringup\.ts$/, 'the local bring-up checks, which read the credentials file'],
   [/^src\/persona-bringup-controller\.ts$/, 'the bring-up controller, which reads credentials and holds their digests'],
@@ -428,7 +438,14 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   // the state directory move walks the directory that holds the credentials files and the config, and logs paths and errors.
   [/^src\/state-dir-migration\.ts$/, "the state directory move, which compares and moves the files of the state directory (the credentials files among them) and logs only their names and errors"],
   // the stored-choice file holds the credentials file's path, never its content.
+  [/^src\/channel-delivery-attempt\.ts$/, 'logical attempt validation and hashed caller identity evidence'],
   [/^src\/channel-delivery\.ts$/, "the stored-choice store, which records each persona's declaration, a credentials file's path among them, and logs its read and write failures"],
+  // Thread Memory's lookups and own-post observation: each makes or reads an authenticated Slack request on a persona's client.
+  [/^src\/thread-memory\.ts$/, "the bounded metadata attempts, which run a persona's authenticated Slack requests and classify their raw failures (an error's message can hold a token) into safe codes"],
+  [/^src\/own-post-lookup\.ts$/, "own-post recovery lookups, which run a persona's authenticated Slack reads, read its own upload-share Events, and classify their raw failures into safe outcomes"],
+  [/^src\/thread-memory-reports\.ts$/, "Thread Memory's notice and diagnostic builders and reporter, which carry configured identities and paths plus described storage failures to Slack posts and log lines"],
+  [/^src\/own-post\.ts$/, "the own-post observer, whose issues carry the issuing persona's bot identity and whose fault callback receives an owner's raw fault, own-post eligibility over the applied config and current membership, and the reading of upload completions as Slack returned them"],
+  [/^src\/file-upload-observation\.ts$/, "the file-completion observation, which wraps a persona's raw Web API client and hands each completion response, as Slack returned it, to its listener"],
 ]
 
 /** Test helpers whose named exports build tokens, credentials or config files, or plant the sentinel. */
@@ -441,19 +458,202 @@ const HELPER_SURFACES: Record<string, Record<string, string>> = {
     sentinelInMessage: 'plants the leak sentinel in an error message (in a fake token and a ticket URL)',
     sentinelTicketUrl: 'plants the leak sentinel in a ticket URL',
   },
+  'tests/test-helpers/shared-channels.ts': { sharedRecoveryRequest: 'binds exact damaged evidence and optional replacement input through the production grammar', deliveryAttempt: 'builds caller-retained attempt inputs', contradictoryBotHistory: 'derives malformed durable attempt evidence', deliveryResultSamples: 'builds durable attempt result variants', makeMembershipHarness: 'builds authenticated connection and durable membership composition', configBytes: 'serializes config input', initialSharedState: 'builds a shared config-state envelope', writeSharedState: 'writes the shared config-state envelope', makeSharedAuthority: 'builds and writes the shared authority' },
   'tests/test-helpers/persona-config.ts': { writeConfigFile: 'writes a config file' },
   'tests/test-helpers/ad-settings.ts': { writeAgentDirectorConfig: "writes agent-director's config.toml" },
   'tests/test-helpers/channel-delivery.ts': { writeChannelDeliveryRecord: 'writes a stored-choice file holding persona declarations' },
   'tests/test-helpers/reload-harness.ts': { makeReloadHarness: 'builds the reload harness' },
+  'tests/test-helpers/thread-memory.ts': {
+    populationConfig: 'builds SR-8 persona configuration through the shared channel builders',
+    seedUnitPopulation: 'reads the applied shared configuration and seeds its Thread Memory journal',
+    threadConfig: 'builds Thread Memory persona configuration',
+    makeThreadMemoryHarness: 'builds applied configuration and captures Thread Memory reports and storage failures',
+    makeThreadMembershipHarness: 'builds authenticated membership and Thread Memory composition',
+  },
+  'tests/test-helpers/own-post.ts': {
+    makeOwnPostHarness: 'builds own-post observation over authenticated membership, applied configuration and Thread Memory',
+  },
   'tests/test-helpers/persona-connection-harness.ts': { makeConnectionHarness: 'builds the connection manager over credentials files' },
   'tests/test-helpers/persona-routing-harness.ts': { makeRoutingHarness: 'builds sentinel-bearing Slack stubs' },
   'tests/test-helpers/recovery-harness.ts': { makeRecoveryHarness: "builds the recovery harness, which writes agent-director's config.toml and captures the retry timer's, settings reader's and tmux-unresponsive condition's lines" },
-  'tests/test-helpers/slack-stub.ts': { makeStubSlackFactory: 'builds Slack clients from tokens' },
+  'tests/test-helpers/slack-stub.ts': {
+    makeStubSlackFactory: 'builds Slack clients from tokens',
+    slackPlatformError: 'builds a Slack platform rejection that, given a leak marker, plants it in a fake bot token in its message',
+    slackRateLimited: 'builds a Slack rate-limited rejection that, given a leak marker, plants it in a fake bot token in its message',
+  },
+  'tests/integration/fixtures/slack-stub-server.ts': { startSlackStub: "serves token-bearing Slack clients; records redeliveries, socket closes, lost answers and history pages without credential or connection-ticket values; only pre-existing synthetic connection markers remain" },
   'tests/test-helpers/ci-run.ts': {
     makeFakeCodexHome: 'writes fake Codex login and config files under the fixture root',
     makeFakeCodexLogin: 'builds injected Codex login dependencies with sentinel-bearing tokens',
   },
+  'tests/test-helpers/shared-channel-upgrade.ts': {
+    oldConfigBytes018: 'serializes a 0.18.0 config naming persona credentials files',
+    oldStoredChoiceBytes018: 'serializes a 0.18.0 stored-choice file holding persona declarations',
+    writeOldReference018: 'writes a 0.18.0 config file and its applied baseline',
+    buildUpgradeCases: "builds every upgrade case's config, stored-choice and queue files",
+    writeUpgradeFixtures: "writes the upgrade cases' config, stored-choice and queue files",
+    materializeUpgradeCase: "writes a case's configs, applied baselines and stored-choice files, naming its credentials paths",
+    runUpgradeCaseCommand: 'runs the materialize and reference commands, printing credentials paths',
+  },
 }
+
+// These executable fixtures have no importable runtime surface: importing
+// them would execute their image entrypoints. Audit their source and captured
+// declaration controls instead of putting them in HELPER_SURFACES's imports.
+const IMAGE_CLIENT_SURFACES = {
+  'tests/integration/fixtures/shared-stub-permission.ts': 'reads registered permission outcomes and actual AD rows after the image guard; emits only bound identity, request token, decision and delivery metadata, with fixed failure text and no raw client errors',
+  'tests/integration/fixtures/stub-mcp-session.ts': 'holds MCP transports and captures SDK tool results; grouping, loss and replacement-session evidence contains request/session identity and HTTP status, never transport headers or credentials',
+} as const
+
+describe('shared fixture evidence secrecy', () => {
+  test('image-only client surfaces have explicit reasons and declaration evidence is leak-checked', () => {
+    for (const [file, reason] of Object.entries(IMAGE_CLIENT_SURFACES)) {
+      expect(existsSync(join(ROOT, file))).toBe(true)
+      expect(reason.length).toBeGreaterThan(30)
+      expect(readFileSync(join(ROOT, file), 'utf8')).toContain("existsSync('/etc/cscb-ci-image')")
+    }
+    for (const file of ['tests/host-safety.test.ts', 'tests/fmk-source-audit.test.ts']) expect(callsAssertNoLeak(file)).toBe(true)
+  })
+
+  const source = readFileSync(join(ROOT, 'tests/integration/fixtures/slack-stub-server.ts'), 'utf8')
+  const ast = ts.createSourceFile('slack-stub-server.ts', source, ts.ScriptTarget.Latest, true)
+  const fields: Record<string, string[]> = {
+    'socket-close': ['control', 'control_index', 'label', 'connection_id'],
+    'socket-close-missed': ['control', 'control_index', 'label'],
+    'fault-settled': ['request_id', 'resolution'],
+    redelivery: ['control', 'label', 'original_envelope_id', 'source_envelope_id', 'envelope_id', 'event_id', 'connection_id', 'retry_attempt'],
+    'push-installation': ['control', 'label', 'envelope_id', 'connection_id'],
+    'connection-refused': ['control', 'control_index', 'label', 'method', 'request_id', 'remaining'],
+    fault: ['control', 'fault_index', 'method', 'label', 'request_id', 'matching_call', 'outcome', 'performed', 'response_ts'],
+  }
+  const calls: ts.CallExpression[] = []
+  function collect(node: ts.Node) {
+    if (ts.isCallExpression(node) && node.expression.getText(ast) === 'record' &&
+      node.arguments[0] && ts.isStringLiteral(node.arguments[0]) && node.arguments[0].text in fields) calls.push(node)
+    ts.forEachChild(node, collect)
+  }
+  collect(ast)
+  const redactorNames = ['TOKEN_LIKE_SOURCE', 'TOKEN_LIKE_ALL', 'PUSH_FIELD_MAX', 'pushFieldText']
+  const redactorSource = ast.statements.filter(n =>
+    ts.isFunctionDeclaration(n) ? redactorNames.includes(n.name?.text ?? '') :
+      ts.isVariableStatement(n) && n.declarationList.declarations.some(d => redactorNames.includes(d.name.getText(ast))))
+    .map(n => n.getText(ast)).join('\n')
+  const pushFieldText = new Function(ts.transpileModule(redactorSource, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText + '\nreturn pushFieldText;')() as (value: unknown) => string | null
+
+  test('every new record kind is explicitly covered', () => {
+    expect(calls.map(c => (c.arguments[0] as ts.StringLiteral).text).sort()).toEqual(Object.keys(fields).sort())
+  })
+  test.each(Object.keys(fields))('%s projects metadata only from credential-bearing inputs', event => {
+    const call = calls.find(c => (c.arguments[0] as ts.StringLiteral).text === event)!
+    const token = fakeToken(BOT_TOKEN_PREFIX, 'shared-evidence'), ticket = 'PRIVATE_CONNECTION_TICKET'
+    const bindings = {
+      pushFieldText, close: { label: token, ticket, token }, ws: { data: { connectionId: 'connection', ticket, token } }, index: 1,
+      requestId: 'request', resolution: 'aborted', label: token, originalEnvelopeId: 'original',
+      parsed: { redeliver: { envelope_id: 'source', ticket, token }, ticket, token, text: LEAK_SENTINEL },
+      envelopeId: 'envelope', eventId: 'event', target: { data: { connectionId: 'connection', ticket, token } }, retryAttempt: 2,
+      refusal: { index: 1, remaining: 3, ticket, token }, method: 'chat.postMessage', fields: { request_id: 'request', ticket, token },
+      call: 4, fault: { outcome: 'lost', performed: true, token, ticket, text: LEAK_SENTINEL },
+      body: { ts: '1234567890.000001', text: LEAK_SENTINEL, token, ticket },
+    }
+    const emitted: Record<string, unknown>[] = []
+    const emit = (kind: string, value: Record<string, unknown>) => { expect(kind).toBe(event); emitted.push(value) }
+    new Function('record', ...Object.keys(bindings), call.getText(ast))(emit, ...Object.values(bindings))
+    expect(emitted).toHaveLength(1)
+    expect(Object.keys(emitted[0]!).sort()).toEqual([...fields[event]!].sort())
+    assertNoLeak(emitted)
+    expect(JSON.stringify(emitted)).not.toContain(ticket)
+    expect(Object.keys(emitted[0]!).some(key => /token|ticket|authorization|headers|text|payload/.test(key))).toBe(false)
+    // The same check must reject a newly copied transport object or field.
+    for (const planted of [{ ...emitted[0], ticket }, { ...emitted[0], token }, { ...emitted[0], text: LEAK_SENTINEL }]) {
+      expect(Object.keys(planted).sort()).not.toEqual([...fields[event]!].sort())
+    }
+  })
+  test.each(['users.info', 'conversations.info', 'users.conversations'].flatMap(method =>
+    ['hang', 'delay', 'late'].map(outcome => [method, outcome])))('%s %s fault arrival projection contains only numeric clocks', (method, outcome) => {
+    const call = calls.find(c => (c.arguments[0] as ts.StringLiteral).text === 'fault')!
+    const token = fakeToken(BOT_TOKEN_PREFIX, 'arrival-evidence')
+    const bindings = { pushFieldText, index: 0, method, label: token, requestId: 'request', call: 1,
+      fault: { outcome, text: LEAK_SENTINEL, token, body: { channels: [{ name: LEAK_SENTINEL }], token } }, args: { user: token, channel: token },
+      body: { text: LEAK_SENTINEL, token },
+      arrivalMonoMs: 123.5, arrivalEpochMs: 1800000000000 }
+    const emitted: Record<string, unknown>[] = []
+    new Function('record', ...Object.keys(bindings), call.getText(ast))((_kind: string, row: Record<string, unknown>) => emitted.push(row), ...Object.values(bindings))
+    expect(emitted).toHaveLength(1)
+    expect(Object.keys(emitted[0]!).sort()).toEqual(['control', 'fault_index', 'method', 'label', 'request_id', 'matching_call', 'outcome',
+      'arrival_mono_ms', 'arrival_epoch_ms', ...(method === 'users.conversations' ? [] : ['match'])].sort())
+    expect(emitted[0]!.arrival_mono_ms).toBe(bindings.arrivalMonoMs)
+    expect(emitted[0]!.arrival_epoch_ms).toBe(bindings.arrivalEpochMs)
+    assertNoLeak(emitted)
+  })
+  test.each([false, true])('late settlement projects socket_open with aborted=%s and no request data', aborted => {
+    const call = calls.find(c => (c.arguments[0] as ts.StringLiteral).text === 'fault-settled')!
+    const token = fakeToken(BOT_TOKEN_PREFIX, 'late-settlement')
+    const req = { signal: { aborted, token }, headers: { authorization: token }, body: LEAK_SENTINEL }
+    const emitted: Record<string, unknown>[] = []
+    new Function('record', 'requestId', 'resolution', 'req', call.getText(ast))(
+      (_kind: string, row: Record<string, unknown>) => emitted.push(row), 'request', 'late', req)
+    expect(emitted).toEqual([{ request_id: 'request', resolution: 'late', socket_open: !aborted }])
+    assertNoLeak(emitted)
+  })
+})
+
+describe('SR-8 measurement evidence secrecy', () => {
+  const poison = () => ({ token: fakeToken(BOT_TOKEN_PREFIX, 'sr8-evidence'), text: LEAK_SENTINEL,
+    headers: { authorization: fakeToken(BOT_TOKEN_PREFIX, 'sr8-header') }, error: new Error(LEAK_SENTINEL) })
+
+  test('bulk envelope timings omit credential-bearing observation fields', () => {
+    const extra = poison()
+    const rows = [
+      { ...extra, event: 'push', envelope_id: 'original', sent_mono_ms: 1, connection_id: 'old' },
+      { ...extra, event: 'push', envelope_id: 'replay', sent_mono_ms: 2, connection_id: 'new' },
+      { ...extra, event: 'ws-message', envelope_id: 'replay', ack_mono_ms: 3, connection_id: 'new' },
+      { ...extra, event: 'api', body: extra },
+    ]
+    const timings = envelopeTimings(['original', 'replay'], rows)
+    expect(timings).toEqual([
+      { envelope_id: 'original', push: { sent_mono_ms: 1, connection_id: 'old' }, acks: [] },
+      { envelope_id: 'replay', push: { sent_mono_ms: 2, connection_id: 'new' },
+        acks: [{ ack_mono_ms: 3, connection_id: 'new' }] },
+    ])
+    assertNoLeak({ timings, lines: timings.map(row => JSON.stringify(row)) })
+  })
+
+  test.each(['stored', 'fixed-stored', 'holds-resolved', 'post-hold-resolved'] as const)('%s records only projected measurement fields', kind => {
+    const extra = poison()
+    const event = { ...extra, type: kind, kind, key: 'alpha', seq: 1, store: 'accepted' as const, storeMs: 2,
+      atMonoMs: 10, resolutions: [{ ...extra, seq: 1, outcome: 'released' as const, at: 10 }],
+      outcome: 'released' as const, cause: 'timer' as const, heldMs: 3 }
+    const projected = kind === 'post-hold-resolved' ? postHoldEventMeasurement(event as Parameters<typeof postHoldEventMeasurement>[0]) :
+      queueEventMeasurement(event as Parameters<typeof queueEventMeasurement>[0])
+    expect(projected).toBeDefined()
+    const record = { ...projected!, ...extra, v: 1, at_mono_ms: 10 } as TestMeasurementRecord
+    const line = serializeTestMeasurement(record)
+    const expected = kind === 'holds-resolved' ? { v: 1, kind: 'resolution-store', at_mono_ms: 10, key: 'alpha', seqs: [1], store_ms: 2 } :
+      kind === 'post-hold-resolved' ? { v: 1, kind, at_mono_ms: 10, key: 'alpha', seq: 1, outcome: 'released', cause: 'timer', held_ms: 3 } :
+      { v: 1, kind: 'store', at_mono_ms: 10, key: 'alpha', seq: 1, store: kind === 'stored' ? 'accepted' : 'fixed', store_ms: 2 }
+    expect(JSON.parse(line)).toEqual(expected)
+    assertNoLeak({ projected, line })
+  })
+
+  test.each(['pass', 'fail', 'missing'] as const)('recorded sr8 %s lines omit credential-bearing input fields', verdict => {
+    const extra = poison(), accepted = [{ ...extra, key: 'alpha', seq: 1 }]
+    const rows = verdict === 'missing' ? undefined : [{ ...extra, v: 1, kind: 'store', key: 'alpha', seq: 1,
+      store: 'accepted', store_ms: verdict === 'fail' ? 1e6 : 1, at_mono_ms: 1 }]
+    const times = verdict === 'missing' ? undefined : [{ ...extra, envelope_id: 'envelope', push: { ...extra, sent_mono_ms: 1, connection_id: 'socket' },
+      acks: [{ ...extra, ack_mono_ms: verdict === 'fail' ? 1e6 : 2, connection_id: 'socket' }] }]
+    const probes = [{ ...extra, key: 'alpha', method: 'users.info', outcome: 'late', match: 'sender', envelope_id: 'envelope' }]
+    const faults = [{ ...extra, event: 'fault', control: 'faults', label: 'alpha', method: 'users.info', outcome: 'late', match: 'sender', arrival_mono_ms: 1 }]
+    const results = [ackVerdict('ack', ['envelope'], times), storeVerdict(rows, accepted, percentile),
+      postHoldVerdict(rows, accepted, 1), n2Verdict([{ ...extra, key: 'alpha', seq: 1, name: extra.token }], 1),
+      ...lookupFaultVerdicts(probes, faults, times)]
+    expect(results.slice(0, 2).map(r => r.verdict)).toEqual([verdict, verdict])
+    const lines: string[] = []
+    printResults({ scenario: 'secrecy', mode: 'open', population: 0, recipients: 1 }, results, line => lines.push(line))
+    expect(lines).toHaveLength(results.length + 1)
+    expect(lines.every(line => line.startsWith('recorded: sr8 '))).toBe(true)
+    assertNoLeak({ results, lines })
+  })
+})
 
 /**
  * Suites that match the touching rule but have no secret-bearing surface:
@@ -691,6 +891,71 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(checked(failures, 'source-surface failures')).toEqual([])
   })
 
+  test('membership functions and the composition helper require leak checks, while constants and types do not', () => {
+    const suite = 'tests/channel-membership.test.ts'
+    for (const [module, name] of [
+      ['channel-membership', 'createChannelMembership'], ['channel-membership-scan', 'createMembershipScanner'],
+      ['channel-membership-readiness', 'handleMembershipReadiness'], ['channel-membership-evidence', 'orderMembershipRecovery'],
+    ]) {
+      expect(SOURCE_SURFACES.some(([re]) => re.test(`src/${module}.ts`))).toBe(true)
+      expect(touchReasonsOf(suite, `import { ${name} as use } from '../src/${module}.ts'`).length).toBe(1)
+      expect(touchReasonsOf(suite, `const use = await import('../src/${module}.ts')`).length).toBe(1)
+      expect(touchReasonsOf(suite, `import type { Example } from '../src/${module}.ts'`)).toEqual([])
+    }
+    expect(touchReasonsOf(suite, "import { MEMBERSHIP_UNRESOLVED } from '../src/channel-membership.ts'")).toEqual([])
+    expect(touchReasonsOf(suite, "import { makeMembershipHarness } from './test-helpers/shared-channels.ts'").length).toBe(1)
+    for (const file of ['tests/channel-membership.test.ts', 'tests/channel-membership-readiness.test.ts']) {
+      expect(callsAssertNoLeak(file)).toBe(true); expect(file in EXEMPT).toBe(false)
+    }
+  })
+
+  test('own-post functions require leak checks, while its constants and types do not, without exemptions', () => {
+    const suite = 'tests/own-post.test.ts'
+    for (const code of [
+      "import { createOwnPostObserver as observer } from '../src/own-post.ts'",
+      "import { ownPostEligibility } from '../src/own-post.ts'",
+      "import { decideOwnPostEligibility as decide } from '../src/own-post.ts'",
+      "import * as ownPost from '../src/own-post.ts'",
+      "const ownPost = await import('../src/own-post.ts')",
+    ]) expect(touchReasonsOf(suite, code)).toEqual([expect.stringContaining('from src/own-post.ts: the own-post observer')])
+    for (const code of [
+      "import { OWN_POST_SURFACES } from '../src/own-post.ts'",
+      "import type { OwnPostAnswer, OwnPostObserver } from '../src/own-post.ts'",
+      "import { type OwnPostObserver } from '../src/own-post.ts'",
+      "import type * as OwnPost from '../src/own-post.ts'",
+    ]) expect(touchReasonsOf(suite, code)).toEqual([])
+    expect(callsAssertNoLeak(suite)).toBe(true)
+    expect(suite in EXEMPT).toBe(false)
+    expect(touchReasonsOf(suite, "import { makeOwnPostHarness } from './test-helpers/own-post.ts'")).toHaveLength(1)
+  })
+
+  test('operator request/review functions and new helpers remain secret-bearing surfaces without exemptions', () => {
+    const suite = 'tests/reload-operator.test.ts'
+    for (const [module, fn, constant] of [['reload-request', 'buildReviewRequest', 'REVIEW_REQUEST_FORMAT'], ['reload-review', 'createReviewObserver', 'RELOAD_REVIEW_OUTCOME']]) {
+      expect(SOURCE_SURFACES.some(([re]) => re.test(`src/${module}.ts`))).toBe(true)
+      for (const source of [`import { ${fn} as use } from '../src/${module}.ts'`, `const use = await import('../src/${module}.ts')`]) expect(touchReasonsOf(suite, source)).toHaveLength(1)
+      expect(touchReasonsOf(suite, `import type { Any } from '../src/${module}.ts'`)).toEqual([])
+      expect(touchReasonsOf(suite, `import { ${constant} } from '../src/${module}.ts'`)).toEqual([])
+    }
+    for (const file of ['tests/reload-operator.test.ts', 'tests/reload-request.test.ts', 'tests/reload-fixtures.test.ts']) {
+      expect(callsAssertNoLeak(file)).toBe(true); expect(file in EXEMPT).toBe(false)
+    }
+    const factory = 'makeReloadHarness'
+    expect(touchReasonsOf(suite, `import { ${factory} } from './test-helpers/reload-harness.ts'`)).toHaveLength(1)
+  })
+
+  test('damaged-start parsers, renderers and request helper require leak checks without exemptions', () => {
+    const suite = 'tests/shared-channel-recovery.test.ts'
+    for (const [module, fn] of [['shared-recovery', 'readSharedRecoveryRequest'], ['reload-recovery', 'renderSharedRecovery']]) {
+      expect(SOURCE_SURFACES.some(([re]) => re.test(`src/${module}.ts`))).toBe(true)
+      for (const source of [`import { ${fn} as use } from '../src/${module}.ts'`, `const use = await import('../src/${module}.ts')`]) expect(touchReasonsOf(suite, source)).toHaveLength(1)
+      expect(touchReasonsOf(suite, `import type { Any } from '../src/${module}.ts'`)).toEqual([])
+    }
+    expect(touchReasonsOf(suite, "import { RELOAD_SHARED_RECOVERY } from '../src/reload-recovery.ts'")).toEqual([])
+    expect(touchReasonsOf(suite, "import { sharedRecoveryRequest as request } from './test-helpers/shared-channels.ts'")).toHaveLength(1)
+    expect(callsAssertNoLeak(suite)).toBe(true); expect(suite in EXEMPT).toBe(false)
+  })
+
   test.each(['quoteReactionLogField', 'reactionLogWord', 'renderReactionPersonaRef'])('reaction-log-fields.ts is a source surface through %s', name => {
     const suite = 'tests/reaction-intake-diagnostics.test.ts'
     expect(touchReasonsOf(suite, `import { ${name} as render } from '../src/reaction-log-fields.ts'`)).toHaveLength(1)
@@ -907,6 +1172,156 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     expect(callsAssertNoLeak(suite, withoutCalls)).toBe(false)
   })
 
+  // Authenticated observations and operator reporting can carry failure text.
+  test.each([
+    ['src/thread-memory.ts', 'classifyMetadataFailure', 'THREAD_MEMORY_LOOKUP_METHODS', 'MetadataFailure', 'tests/thread-memory.test.ts'],
+    ['src/own-post-lookup.ts', 'createOwnPostLookups', 'OWN_POST_LOOKUP_PAGE_LIMIT', 'OwnPostLookupsDeps', 'tests/own-post-lookup.test.ts'],
+    ['src/thread-memory-reports.ts', 'createThreadMemoryReporting', 'THREAD_MEMORY_DIAGNOSTIC_CLASSES', 'ThreadMemoryLoss', 'tests/thread-memory-reports.test.ts'],
+    ['src/shared-state-reports.ts', 'createSharedStateReporting', 'SHARED_STATE_DIAGNOSTIC_CLASSES', 'SharedStateReportScope', 'tests/shared-state-reports.test.ts'],
+    ['src/own-post.ts', 'completionFiles', 'SLACK_FILE_ID_RE', 'CompletedFile', 'tests/own-post.test.ts'],
+    ['src/file-upload-observation.ts', 'observeFileCompletions', undefined, 'FileCompletionListener', 'tests/registry.test.ts'],
+  ] as const)('%s is a source surface: its functions touch, its constants and types alone do not, and every suite that touches it leak-checks with no exemption', (module, fn, constant, type, suite) => {
+    expect(SOURCE_FILES).toContain(module)
+    expect(SOURCE_SURFACES.filter(([re]) => re.test(module))).toHaveLength(1)
+    expect(touchReasonsOf(suite, `import { ${fn} } from '../${module}'`)).toHaveLength(1)
+    expect(touchReasonsOf(suite, `import { ${fn} as used } from '../${module}'`)).toHaveLength(1)
+    if (constant !== undefined) expect(touchReasonsOf(suite, `import { ${constant} } from '../${module}'`)).toEqual([])
+    expect(touchReasonsOf(suite, `import type { ${type} } from '../${module}'`)).toEqual([])
+    const touching = SUITES.filter((file) => touchReasons(file).some((r) => r.includes(module)))
+    expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
+  })
+
+  test('the state stores/reporters, own-post and file-completion modules are touched today, and a suite without its assertNoLeak calls fails the rule', () => {
+    const touched = (module: string) => SUITES.filter((file) => touchReasons(file).some((r) => r.includes(module)))
+    for (const [suite, module] of [
+      ['tests/thread-memory.test.ts', 'src/thread-memory.ts'],
+      ['tests/own-post-lookup.test.ts', 'src/own-post-lookup.ts'],
+      ['tests/thread-memory-reports.test.ts', 'src/thread-memory-reports.ts'],
+      ['tests/shared-state-reports.test.ts', 'src/shared-state-reports.ts'],
+      ['tests/shared-state-reports-integration.test.ts', 'src/shared-state-reports.ts'],
+      ['tests/own-post.test.ts', 'src/own-post.ts'],
+      ['tests/registry.test.ts', 'src/file-upload-observation.ts'],
+    ] as const) {
+      expect([module, touched(module)]).toEqual([module, expect.arrayContaining([suite])])
+      const withoutCalls = codeOf(suite).replace(/(?<![\w.$])assertNoLeak\s*\(/g, 'void (')
+      expect(touchReasonsOf(suite, withoutCalls).some((r) => r.includes(module))).toBe(true)
+      expect(callsAssertNoLeak(suite, withoutCalls)).toBe(false)
+    }
+  })
+
+  test('lookup helpers and runner imports require leak assertions in either recovery suite without exemptions', () => {
+    const reloadFactory = 'makeReloadHarness'
+    for (const suite of ['tests/own-post-lookup.test.ts', 'tests/own-post-recovery.test.ts']) {
+      expect(suite in EXEMPT).toBe(false)
+      for (const name of ['ownPostLookupRange', 'ownPostLookupRequest', 'readOwnPostLookupPage', 'ownUploadShare', 'uploadShareTs',
+        'classifyOwnPostLookupFailure', 'judgeOwnPostLookup', 'createOwnPostLookups']) {
+        const code = `import { ${name} as used } from '../src/own-post-lookup.ts'`
+        expect(touchReasonsOf(suite, code)).toHaveLength(1)
+        expect(callsAssertNoLeak(suite, code)).toBe(false)
+      }
+      for (const code of [
+        "import * as lookup from '../src/own-post-lookup.ts'",
+        "const lookup = await import('../src/own-post-lookup.ts')",
+        // The runner's ownMessage reads the persona's own Events.
+        "import { createOwnPostLookups } from '../src/own-post-lookup.ts'\ncreateOwnPostLookups(deps).ownMessage(key, event, identity)",
+        `import { ${reloadFactory} } from './test-helpers/reload-harness.ts'`,
+      ]) {
+        expect(touchReasonsOf(suite, code)).toHaveLength(1)
+        expect(callsAssertNoLeak(suite, code)).toBe(false)
+      }
+      for (const code of [
+        "import { OWN_POST_LOOKUP_PAGE_LIMIT } from '../src/own-post-lookup.ts'",
+        "import type * as lookup from '../src/own-post-lookup.ts'",
+        "import { type OwnPostLookups, type OwnPostLookupEvent, type OwnUploadShare } from '../src/own-post-lookup.ts'",
+      ]) expect(touchReasonsOf(suite, code)).toEqual([])
+    }
+    // The global consumer scan above checks actual suites, including the reload
+    // harness consumer when it lands, without requiring an unused direct import.
+  })
+
+  test('the own-post and upload-thread suites touch their modules today and leak-check them themselves, with no exemption', () => {
+    for (const [suite, surface] of [
+      ['tests/own-post.test.ts', 'src/own-post.ts'],
+      ['tests/own-post-lookup.test.ts', 'src/own-post-lookup.ts'],
+      ['tests/own-post-recovery.test.ts', 'makeReloadHarness'],
+      ['tests/registry.test.ts', 'src/own-post.ts'],
+    ] as const) {
+      expect([suite, touchReasons(suite).some((r) => r.includes(surface)), callsAssertNoLeak(suite), suite in EXEMPT]).toEqual([suite, true, true, false])
+    }
+  })
+
+  test('Thread Memory report builders and configuration helpers require leak checks without treating record-only fixtures as touching', () => {
+    const suite = 'tests/thread-memory-reports.test.ts'
+    for (const source of [
+      "import { buildThreadMemoryNotSavedNotice as notice } from '../src/thread-memory-reports.ts'",
+      "import * as reports from '../src/thread-memory-reports.ts'",
+      "const reports = await import('../src/thread-memory-reports.ts')",
+    ]) expect(touchReasonsOf(suite, source)).toHaveLength(1)
+    const helper = 'tests/test-helpers/thread-memory.ts'
+    for (const fn of ['threadConfig', 'makeThreadMemoryHarness', 'makeThreadMembershipHarness']) {
+      expect(touchReasonsOf(suite, `import { ${fn} as fixture } from './test-helpers/thread-memory.ts'`)).toHaveLength(1)
+      const touching = SUITES.filter(file => touchReasons(file).some(reason => reason.startsWith(`imports ${fn} from ${helper}:`)))
+      expect(touching.length).toBeGreaterThan(0)
+      expect(touching.map(file => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map(file => [file, true, false]))
+      for (const file of touching) {
+        const withoutCalls = codeOf(file).replace(/(?<![\w.$])assertNoLeak\s*\(/g, 'void (')
+        expect(touchReasonsOf(file, withoutCalls).some(reason => reason.includes(helper))).toBe(true)
+        expect(callsAssertNoLeak(file, withoutCalls)).toBe(false)
+      }
+    }
+    for (const imported of ['threadPath', 'threadJoin', 'THREAD_PERSONAS', 'type ThreadMemoryHarness']) {
+      expect(touchReasonsOf(suite, `import { ${imported} } from './test-helpers/thread-memory.ts'`)).toEqual([])
+    }
+  })
+
+  test("the Slack stub server's startSlackStub touches, its control parser alone does not, and every suite that starts it leak-checks with no exemption", () => {
+    const helper = 'tests/integration/fixtures/slack-stub-server.ts', suite = 'tests/real-ai-classifier-stop.test.ts'
+    expect(touchReasonsOf(suite, "import { startSlackStub } from './integration/fixtures/slack-stub-server.ts'")).toEqual([
+      `imports startSlackStub from ${helper}: ${HELPER_SURFACES[helper]!.startSlackStub}`,
+    ])
+    expect(touchReasonsOf(suite, "import { parseControl } from './integration/fixtures/slack-stub-server.ts'")).toEqual([])
+    expect(touchReasonsOf(suite, "import type { StubControl } from './integration/fixtures/slack-stub-server.ts'")).toEqual([])
+    const touching = SUITES.filter((file) => touchReasons(file).some((r) => r.includes(helper)))
+    expect(touching).toContain(suite)
+    expect(touching.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map((file) => [file, true, false]))
+  })
+
+  test("the Slack stub's marker-planting rejection factories touch, its HTTP rejection alone does not, and every suite that imports them leak-checks with no exemption", () => {
+    const helper = 'tests/test-helpers/slack-stub.ts', suite = 'tests/thread-memory.test.ts'
+    for (const factory of ['slackPlatformError', 'slackRateLimited']) {
+      expect(touchReasonsOf(suite, `import { ${factory} as reject } from './test-helpers/slack-stub.ts'`)).toEqual([`imports ${factory} from ${helper}: ${HELPER_SURFACES[helper]![factory]}`])
+    }
+    expect(touchReasonsOf(suite, "import { slackHttpError } from './test-helpers/slack-stub.ts'")).toEqual([])
+    const importing = SUITES.filter((file) => touchReasons(file).some((r) => /^imports slack(?:PlatformError|RateLimited) from tests\/test-helpers\/slack-stub\.ts:/.test(r)))
+    expect(importing).toContain(suite)
+    expect(importing.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(importing.map((file) => [file, true, false]))
+  })
+
+  test('every helper surface names a module that exists and an export it has (none stale)', async () => {
+    const failures: string[] = []
+    for (const [module, names] of Object.entries(HELPER_SURFACES)) {
+      if (!existsSync(join(ROOT, module))) { failures.push(`${module}: stale helper surface: no such file`); continue }
+      const exported = await import(join(ROOT, module)) as Record<string, unknown>
+      for (const name of Object.keys(names)) if (!(name in exported)) failures.push(`${module} ${name}: stale helper surface: not exported`)
+    }
+    expect(checked(failures, 'stale helper surfaces')).toEqual([])
+  })
+
+  test('attempt evidence functions require leakage checks, including aliased imports and omission mutants, without exemptions', () => {
+    const suite = 'tests/channel-delivery.test.ts', module = 'src/channel-delivery-attempt.ts'
+    expect(SOURCE_SURFACES.some(([re]) => re.test(module))).toBe(true)
+    for (const name of ['botAttemptBinding', 'botAttemptResult', 'validateBotAttempts']) {
+      expect(touchReasonsOf(suite, `import { ${name} as used } from '../${module}'`)).toHaveLength(1)
+    }
+    expect(touchReasonsOf(suite, `import type { BotAttemptResult } from '../${module}'`)).toEqual([])
+    const touching = SUITES.filter(file => touchReasons(file).some(reason => reason.includes(module)))
+    expect(touching).toContain(suite)
+    expect(touching.map(file => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map(file => [file, true, false]))
+    const withoutCalls = codeOf(suite).replace(/(?<![\w.$])assertNoLeak\s*\(/g, 'void (')
+    expect(callsAssertNoLeak(suite, withoutCalls)).toBe(false)
+    expect(touchReasonsOf(suite, withoutCalls).some(reason => reason.includes(module))).toBe(true)
+  })
+
   // the stored-choice file the helper writes holds persona declarations.
   test("the stored-choice helper's writeChannelDeliveryRecord touches, its other exports do not, and every suite that imports it leak-checks with no exemption", () => {
     const suite = 'tests/channel-delivery.test.ts'
@@ -915,8 +1330,23 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     ])
     expect(touchReasonsOf(suite, "import { declarationOf, readChannelDeliveryRecord, SAMPLE_SET_AT } from './test-helpers/channel-delivery.ts'")).toEqual([])
     const importing = SUITES.filter((file) => touchReasons(file).some((r) => r.includes('tests/test-helpers/channel-delivery.ts')))
-    expect(importing).toContain(suite)
+    expect(importing).toContain('tests/cli.test.ts')
     expect(importing.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(importing.map((file) => [file, true, false]))
+  })
+
+  test("the upgrade generator's config builders and writers touch, its readers and constants do not, and every suite that imports them leak-checks with no exemption", () => {
+    const suite = 'tests/shared-channel-upgrade-fixtures.test.ts', helper = 'tests/test-helpers/shared-channel-upgrade.ts'
+    for (const name of Object.keys(HELPER_SURFACES[helper]!)) {
+      expect(touchReasonsOf(suite, `import { ${name} as used } from './test-helpers/shared-channel-upgrade.ts'`)).toEqual([`imports ${name} from ${helper}: ${HELPER_SURFACES[helper]![name]}`])
+    }
+    expect(touchReasonsOf(suite, "import { fillHome, listFixtureFiles, readUpgradeManifest, UPGRADE_FIXTURE_DIR } from './test-helpers/shared-channel-upgrade.ts'")).toEqual([])
+    expect(touchReasonsOf(suite, "import type { MaterializeOptions } from './test-helpers/shared-channel-upgrade.ts'")).toEqual([])
+    const importing = SUITES.filter(file => touchReasons(file).some(reason => reason.includes(helper)))
+    expect(importing).toContain(suite)
+    expect(importing.map(file => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(importing.map(file => [file, true, false]))
+    const withoutCalls = codeOf(suite).replace(/(?<![\w.$])assertNoLeak\s*\(/g, 'void (')
+    expect(callsAssertNoLeak(suite, withoutCalls)).toBe(false)
+    expect(touchReasonsOf(suite, withoutCalls).some(reason => reason.includes(helper))).toBe(true)
   })
 
   test.each(['makeFakeCodexHome', 'makeFakeCodexLogin'])('%s consumers must leak-check without an exemption', helper => {
@@ -1022,6 +1452,9 @@ const SINK_CALL = new RegExp(
  */
 const SAFE_DESCRIBERS = [
   'describeThrownValue',
+  'reviewRecoveredBringUpFailedLine',
+  'reviewRecoveredLifecycleFailedLine',
+  'threadMemoryLoadAtApplyFailedLine',
   'describeLogMessage',
   'describeSlackCallFailure',
   'describeAgentDirectorFailure',
@@ -1272,7 +1705,7 @@ describe("a caught error's text reaches a log line under src/ only redacted (sec
     expect(SOURCE_FILES).toEqual(
       expect.arrayContaining(['src/session-manager.ts', 'src/restart.ts', 'src/persona-connections.ts', 'src/cli.ts', 'src/server.ts', 'src/channel-delivery.ts']),
     )
-    const counts = ['src/session-manager.ts', 'src/restart.ts', 'src/permission-poller.ts', 'src/persona-lifecycle.ts', 'src/persona-episodes.ts', 'src/channel-delivery.ts'].map(
+    const counts = ['src/session-manager.ts', 'src/restart.ts', 'src/permission-poller.ts', 'src/persona-lifecycle.ts', 'src/persona-episodes.ts', 'src/reload.ts'].map(
       (file) => logCalls(codeOf(file)).length,
     )
     expect(counts.every((n) => n > 0)).toBe(true)
@@ -1289,6 +1722,9 @@ describe("a caught error's text reaches a log line under src/ only redacted (sec
     ['an unredacted errDescription', 'log(`x: ${e.errDescription}`)', ['logs an errDescription not through redactSlackLogText']],
     ['an unchecked errName', 'console.error(`x: ${e.errName}`)', ['logs an errName not checked by isSafeIdentifier']],
     ['a wrapper that logs its error raw', 'function logFailure(what, err) { log(`${what}: ${err}`) }\ntry { f() } catch (err) { logFailure("x", err) }', ['interpolates a caught error', 'passes a caught error as a log argument']],
+    ['recovery bring-up describer', 'try { f() } catch (err) { log(reviewRecoveredBringUpFailedLine(err)) }', []],
+    ['recovery activation describer', 'try { f() } catch (err) { log(reviewRecoveredLifecycleFailedLine(err)) }', []],
+    ['Thread Memory apply-load describer', 'try { f() } catch (err) { log(threadMemoryLoadAtApplyFailedLine(persona, err)) }', []],
     ['the describer', 'try { f() } catch (err) { log(`x: ${describeThrownValue(err)}`) }', []],
     ['a redacted errDescription', 'log(`x: ${redactSlackLogText(e.errDescription)}`)', []],
     ['a checked errName', 'log(`x: ${isSafeIdentifier(e.errName) ? e.errName : describeThrownValue(e)}`)', []],

@@ -1,12 +1,12 @@
 /**
  * persona-destination-hold.ts — Hold and retry a persona's permission prompts
- * and server notices while its destination fails (failure part,
- *).
+ * and server notices while its destination fails.
  *
  * A post to a persona's destination (`persona-destination.ts`) can fail: the
  * app was not re-installed with `im:write`, so `conversations.open` answers
  * `missing_scope`; the bot is not in the channel (`not_in_channel`), a
- * fungible destination channel the app was never invited to included; Slack cannot be reached. Such a failure is a destination failure
+ * destination channel the app was never invited to included, in either
+ * mode; Slack cannot be reached. Such a failure is a destination failure
  * and opens an episode for the persona. While the episode is open the
  * persona is held: nothing is attempted for it before its next retry is due,
  * on its own schedule (5 s doubling to 300 s, no give-up, never
@@ -41,8 +41,8 @@
  *   derives the prompt again on a later tick.
  * - Notices are handed over with `deliver`. A persona that is not held (no
  *   episode open, no notice waiting) has the notice attempted at once, with
- *   the post issued before `deliver` first yields (so a channel destination
- *   keeps the raised order the notifier relies on). Otherwise the notice
+ *   the channel post issued before `deliver` first yields unless its
+ *   own-post intent needs to settle first. Otherwise the notice
  *   joins the persona's FIFO of held notices, behind the earlier ones, and
  *   nothing is attempted. When the persona's retry is due its own timer
  *   attempts the held notices in order, one at a time: the first failure
@@ -74,8 +74,7 @@
  *   one `persona-destination-failed` line (`formatPersonaDiagnostic`, its
  *   cause `destinationFailedCause`) naming the persona (JSON-quoted name, key
  *   beside it, `personas[i]`), the destination (`destination=` the channel
- *   ID, or `dm`; in fungible mode followed by the setting in force,
- * `invited.permission_prompts`), the failed step and the
+ *   ID, or `dm`), the failed step and the
  *   Slack error code; for `missing_scope` on the open it names the `im:write`
  *   scope and says the app must be re-installed to gain it.
  * - A failed retry advances the schedule and logs nothing, unless it failed at
@@ -145,13 +144,13 @@ import type { Persona } from './config.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
 import {
-  DECLARATIVE_DESTINATION_SETTING,
   DM_OPEN_SCOPE,
   MISSING_SCOPE_ERROR,
   destinationSettingFrom,
   safeFailureCode,
   type DestinationFailure,
   type DestinationMessage,
+  type DestinationPostOptions,
   type DestinationPostResult,
   type DestinationSetting,
   type DestinationSlackClient,
@@ -195,6 +194,9 @@ export const MESSAGE_PAYLOAD_ERRORS: ReadonlySet<string> = new Set([
   'metadata_too_large',
 ])
 
+/** Every notice the hold posts is a notice-surface own post. */
+const NOTICE_POST: DestinationPostOptions = { surface: 'notice' }
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -229,10 +231,12 @@ export interface HoldNotice {
 export interface HoldAttempt {
   /**
    * Post through the resolver and report the outcome to the hold; resolves
-   * with the resolver's result. Never rejects while the resolver keeps its
-   * never-rejects contract; the attempt ends even if it does not.
+   * with the resolver's result. `options` reach the resolver, so a success is
+   * registered before the hold's own bookkeeping, whose faults never hide it.
+   * Never rejects while the resolver keeps its never-rejects contract; the
+   * attempt ends even if it does not.
    */
-  post(persona: Persona, client: DestinationSlackClient, message: DestinationMessage): Promise<DestinationPostResult>
+  post(persona: Persona, client: DestinationSlackClient, message: DestinationMessage, options?: DestinationPostOptions): Promise<DestinationPostResult>
   /** Give the attempt back without posting (no client after all). */
   release(): void
 }
@@ -271,8 +275,8 @@ export interface PersonaDestinationHold {
   begin(key: string): HoldAttempt | undefined
   /**
    * Hand over one notice for the persona, whose client the caller has just
-   * read. Attempted at once when the persona is not held (the post issued
-   * before this first yields); held otherwise. Resolves once the immediate
+   * read. Attempted at once when the persona is not held (a channel post
+   * waits only for its own-post intent); held otherwise. Resolves once the immediate
    * attempt settles, or at once when the notice is held. Never rejects.
    */
   deliver(persona: Persona, client: DestinationSlackClient, notice: HoldNotice): Promise<void>
@@ -384,22 +388,24 @@ export function isDestinationFailure(failure: Pick<DestinationFailure, 'step' | 
   return failure.step !== 'chat.postMessage' || !MESSAGE_PAYLOAD_ERRORS.has(failure.code)
 }
 
-/**
- * The `destination=` field of a `persona-destination-failed` line: `destination=<value>`, followed in fungible mode
- * by the setting in force in parentheses,
- * `destination=<value> (invited.permission_prompts)`. A declarative-mode
- * field names no setting, as every such line does in declarative mode. Pure.
- */
-function destinationField(at: NamedDestination): string {
-  return at.setting === DECLARATIVE_DESTINATION_SETTING
-    ? `destination=${at.destination}`
-    : `destination=${at.destination} (${at.setting})`
+/** How a result counts, without the episode bookkeeping. Pure. */
+function settledAs(result: DestinationPostResult): SettledAs {
+  if (result.outcome === 'posted') return 'posted'
+  if (result.outcome === 'refused' || result.outcome === 'cancelled') return 'refused'
+  return isDestinationFailure(result) ? 'destination' : 'payload'
 }
 
 /**
- * The cause of a `persona-destination-failed` opening line: the failed step, the destination with the
- * setting in force (`destination=<value>`, plus ` (invited.permission_prompts)`
- * in fungible mode) and the Slack error code, then that the persona's
+ * The `destination=` field of a `persona-destination-failed` line:
+ * `destination=<value>`. Pure.
+ */
+function destinationField(at: NamedDestination): string {
+  return `destination=${at.destination}`
+}
+
+/**
+ * The cause of a `persona-destination-failed` opening line: the failed step,
+ * `destination=<value>` and the Slack error code, then that the persona's
  * prompts and notices are held. For `missing_scope` on the open it names the
  * `im:write` scope and says the app must be re-installed to gain it. A code
  * that is not a short identifier is written `unknown_error`
@@ -423,6 +429,14 @@ export function destinationFailedCause(at: NamedDestination, failure: Destinatio
 export function destinationClearedCause(at: NamedDestination, was: DestinationFailedAt): string {
   return `cleared: ${destinationField(at)} accepts posts again ` +
     `(was ${was.step} error ${safeFailureCode(was.code)}); delivering what was held`
+}
+
+/**
+ * The line when settling an attempt throws; the attempt keeps its result's
+ * classification. `description` is `describeThrownValue` of the thrown value. Pure.
+ */
+export function buildHoldSettleFailedLine(key: string, description: string): string {
+  return `[slack] persona-destination-hold: settling an attempt failed for persona=${key}: ${description}`
 }
 
 /** The key under which an episode tracks a named destination: its setting and value together. Pure. */
@@ -508,8 +522,7 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
       if (current) closeEpisode(entry, at)
       return 'posted'
     }
-    if (result.outcome === 'refused' || result.outcome === 'cancelled') return 'refused'
-    if (!isDestinationFailure(result)) return 'payload'
+    if (result.outcome === 'refused' || result.outcome === 'cancelled' || !isDestinationFailure(result)) return settledAs(result)
     // Stale: the episode opened or closed since this attempt started, so the
     // failure is older evidence than that change. Log nothing, schedule
     // nothing; the caller re-queues a notice and `ensureProgress` retries it.
@@ -520,10 +533,32 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
       // in-place change of the destination setting, or a confirmed switch
       // change that put the other mode's setting in force. Name the setting and value now in force once, in a
       // fresh opening line.
-      if (!entry.episode.named.has(namedKey(at))) nameDestination(entry, entry.episode, persona, at, result)
       scheduleRetry(entry, result)
+      if (!entry.episode.named.has(namedKey(at))) nameDestination(entry, entry.episode, persona, at, result)
     }
     return 'destination'
+  }
+
+  /**
+   * `settle`, whose logging faults cannot change how a result counts: a
+   * confirmed post stays posted, and the episode state is updated before any
+   * line is written.
+   */
+  function settleSafely(
+    entry: HoldEntry,
+    started: number,
+    persona: Persona,
+    at: NamedDestination,
+    result: DestinationPostResult,
+  ): SettledAs {
+    try {
+      return settle(entry, started, persona, at, result)
+    } catch (err) {
+      try {
+        deps.log(buildHoldSettleFailedLine(entry.key, describeThrownValue(err)))
+      } catch { /* the outcome below stands */ }
+      return settledAs(result)
+    }
   }
 
   function openEpisode(entry: HoldEntry, persona: Persona, at: NamedDestination, failure: DestinationFailure): void {
@@ -537,8 +572,8 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
     }
     entry.episode = episode
     entry.generation += 1
-    logOpening(entry, episode)
     scheduleRetry(entry, failure)
+    logOpening(entry, episode)
   }
 
   /** Copy a failure at a destination not yet named in the open episode into it and log its opening line. */
@@ -737,14 +772,16 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
         let result: DestinationPostResult
         try {
           at = attemptDestination(persona)
-          result = await deps.destinations.post(persona, client, queued.notice.message)
+          result = await deps.destinations.post(persona, client, queued.notice.message, NOTICE_POST)
         } finally {
           entry.inFlight = false
           entry.attempting = undefined
         }
+        // A posted notice leaves the FIFO before any bookkeeping, so nothing can repost it.
+        if (result.outcome === 'posted') removeQueued(entry, queued)
         if (!isCurrent(entry)) return
         if (queued.notice.message.tracking?.signal.aborted) { removeQueued(entry, queued); continue }
-        const settled = settle(entry, started, persona, at, result)
+        const settled = settleSafely(entry, started, persona, at, result)
         if (settled === 'destination') {
           noticeFailed(entry, queued, result as DestinationFailure, true)
           return
@@ -792,20 +829,21 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
       return true
     }
     return {
-      async post(persona, client, message) {
+      async post(persona, client, message, options) {
         let at: NamedDestination | undefined
         let result: DestinationPostResult | undefined
         try {
           at = attemptDestination(persona)
-          result = await deps.destinations.post(persona, client, message)
+          result = await deps.destinations.post(persona, client, message, options)
           return result
         } finally {
-          // Settled even when the resolver throws, so the in-flight guard never leaks.
+          // Settled even when the resolver throws, so the in-flight guard never leaks;
+          // a settling fault never replaces the resolver's result.
           if (finish() && isCurrent(entry)) {
             try {
-              if (at !== undefined && result !== undefined) settle(entry, started, persona, at, result)
+              if (at !== undefined && result !== undefined) settleSafely(entry, started, persona, at, result)
             } finally {
-              ensureProgress(entry)
+              try { ensureProgress(entry) } catch { /* held notices retry on their timer */ }
             }
           }
         }
@@ -828,10 +866,10 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
     }
     const started = entry.generation
     const at = attemptDestination(persona)
-    // Issued before the first `await` for a channel destination (the resolver's guarantee).
-    const result = await deps.destinations.post(persona, client, notice.message)
+    // A channel post is issued now unless the resolver must wait for its own-post intent.
+    const result = await deps.destinations.post(persona, client, notice.message, NOTICE_POST)
     if (!isCurrent(entry) || notice.message.tracking?.signal.aborted) return
-    const settled = settle(entry, started, persona, at, result)
+    const settled = settleSafely(entry, started, persona, at, result)
     if (settled === 'destination') {
       noticeFailed(entry, queued, result as DestinationFailure, true)
       if (!isCurrent(entry)) return

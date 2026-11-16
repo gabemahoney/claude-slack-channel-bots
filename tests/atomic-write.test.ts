@@ -19,8 +19,7 @@
  * directory open or fsync failure after the unlink is a
  * `DurableUnlinkUnsyncedError`.
  *
- * `atomicWriteFileSync` is covered by the stop-hook and reply-guard
- * suites and is not tested here.
+ * The older `atomicWriteFileSync` helper is not tested here.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -362,6 +361,32 @@ describe('durableWriteFileSync order through the fs seam', () => {
 const DIRECTORY_ERROR_WITHOUT_CODE = { code: -5, toString: () => 'EIO: directory sync failed' }
 
 describe('durableWriteFileSync failure at each step', () => {
+  test.each([0, -1, 0.5, NaN, Infinity, NEW_BYTES.length, NEW_BYTES.length + 1])(
+    'invalid write progress %s fails before publication and cleans up after a valid short write', count => {
+      writeFileSync(target, OLD_BYTES)
+      const rec = makeRecordingFs({ maxChunk: 1 })
+      let calls = 0
+      const error = caught(() => durableWriteFileSync(target, NEW_BYTES, {
+        ...rec.fs,
+        writeSync(fd, bytes, offset, length) {
+          calls++
+          if (calls === 1) return rec.fs.writeSync(fd, bytes, offset, length)
+          // A broken loop must fail promptly rather than hang the test process.
+          if (calls > 2) throw new Error('writer retried invalid progress')
+          return count
+        },
+      }))
+      expect(error).toBeInstanceOf(Error)
+      expect((error as NodeJS.ErrnoException).code).toBe('EIO')
+      expect(calls).toBe(2)
+      expect(rec.ops.map(op => op.step)).toEqual(['open-temp', 'write', 'close-temp', 'unlink'])
+      expect(rec.openFds.size).toBe(0)
+      expect(new Uint8Array(readFileSync(target))).toEqual(OLD_BYTES)
+      expect(entries()).toEqual(['config.json'])
+      assertNoLeak({ error, written: writtenFile(dir) })
+    },
+  )
+
   test.each<Step>(['open-temp', 'write', 'fsync-temp', 'close-temp', 'rename'])(
     'a %s failure before the rename reaches the caller, keeps the previous bytes, removes the temporary file and closes every descriptor',
     (step) => {

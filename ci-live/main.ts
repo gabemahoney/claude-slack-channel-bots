@@ -122,7 +122,7 @@ import { answerSignInCodeFromMailbox } from './lib/sign-in-code.ts'
 import { realClock } from './lib/wait.ts'
 import { REAL_LOCK_WHAT, runMaintenance } from './maintenance.ts'
 import { appsStateForStrayDeletion, classifyListedApps, deleteStrayApps, testWorkspaceName } from './provision/app-listing.ts'
-import { allValid, runProvisioning, type ProvisionReport } from './provision/index.ts'
+import { allValid, buildAppSetupSource, runProvisioning, type ProvisionReport } from './provision/index.ts'
 import { ContainerRun, type Packed } from './runtime/container-run.ts'
 import { openWorkspace, type Workspace } from './runtime/workspace.ts'
 
@@ -1346,9 +1346,12 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
     // Provisioning.
     const t0 = Date.now()
     let provisionResult: RecordedResult
+    // Kept for the checks' setup facts (ctx.setup); null when provisioning threw.
+    let provisionReport: ProvisionReport | null = null
     try {
       const seeded = dry ? seedDryRunUnfinishedCreate(ws) : null
       const report = await provision(env, ws)
+      provisionReport = report
       const evidence = Object.entries(report.validate ?? {}).map(([l, v]) => `persona ${l}: bot_token ${v.bot}, app_token ${v.app}`)
       if (dry) {
         if (seeded) evidence.push(dryRunAdoptionEvidence(ws, report, seeded))
@@ -1433,6 +1436,8 @@ async function runFull(env: RunEnv, signals: SignalControl): Promise<number> {
         second: sessions?.second ?? null,
         browser: sessions?.browser ?? null,
         creds: hostCredentials(ws),
+        // Over the stub in a dry run, whose apps.manifest.export works.
+        setup: buildAppSetupSource(provisionReport, ws),
         shared: {},
         promptGuard,
         restartContainer: () => container.restart(),

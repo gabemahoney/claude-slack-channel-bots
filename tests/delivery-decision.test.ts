@@ -15,8 +15,11 @@
  */
 
 import { beforeEach, describe, expect, test } from 'bun:test'
+import { OWN_ROOT_CLOCK_SKEW_MS } from '../src/delivery-constants.ts'
+import { eligibleMembership, THREAD_DECISION_GROUPS, decisionArgsOf, channelDeliveryArgsOf, type OwnPostRead, type ThreadRead } from './test-helpers/fungible-decision.ts'
 
 import { CHANNEL_ID_RE, type ChannelEntry, type DeliveryMode } from '../src/config.ts'
+import type { MembershipReading } from '../src/channel-membership.ts'
 import {
   type AppliedPersonaView,
   type DeliveryDecision,
@@ -30,8 +33,10 @@ import {
   type ReactionDropReason,
   type ReactionFungibleRefusal,
   type ReactionReactor,
+  type StoredChoices,
   type Via,
   decideDelivery,
+  channelDeliveryFor,
   decideReaction,
   parseReactionShape,
 } from '../src/delivery-decision.ts'
@@ -50,6 +55,11 @@ import {
   type EnvelopeFlagForm,
   type EventOverrides,
 } from './test-helpers/slack-stub.ts'
+
+
+test('own-root clock skew bound is pinned', () => {
+  expect(OWN_ROOT_CLOCK_SKEW_MS).toBe(120_000)
+})
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -101,7 +111,14 @@ function decide(
   receiver: DeliveryPersona = P,
   applied: readonly AppliedPersonaView[] = [view(P), view(Q)],
 ): DeliveryDecision {
-  return decideDelivery(event, receiver, applied)
+  // Explicit current observations and applied projection, independently passed
+  // to production. Missing choices stay unresolved even for a verified member.
+  return decideDelivery(event, receiver, applied, {
+    mode: 'strict', channelIdPattern: CHANNEL_ID_RE,
+    memberships: new Map(applied.map(p => [p.key, eligibleMembership(p.key)])),
+    storedChoices: { readable: true, storedChoice: (key, channel) =>
+      (key === receiver.key ? receiver : applied.find(p => p.key === key))?.channels.find(c => c.id === channel)?.delivery },
+  })
 }
 
 const deliver = (via: Via): DeliveryDecision => ({ action: 'deliver', via })
@@ -276,8 +293,8 @@ describe('step 3: DMs and group DMs', () => {
   })
 
   test.each<[string, Record<string, unknown>, DeliveryDecision]>([
-    ['channel_type channel, an ID nobody lists', makeChannelMessage({ channel: DM }), { action: 'drop', reason: 'channel-not-configured', unclaimed: true }],
-    ['channel_type group, an ID nobody lists', makeChannelMessage({ channel: DM, channel_type: 'group' }), { action: 'drop', reason: 'channel-not-configured', unclaimed: true }],
+    ['channel_type channel, an ID nobody lists', makeChannelMessage({ channel: DM }), { action: 'unresolved', reason: 'choice-missing' }],
+    ['channel_type group, an ID nobody lists', makeChannelMessage({ channel: DM, channel_type: 'group' }), { action: 'unresolved', reason: 'choice-missing' }],
     ['channel_type channel, an ID P lists as all', makeChannelMessage({ channel: 'D0LISTED01' }), deliver('receive_all')],
     ['channel_type channel, an ID P lists as mentions, no mention', makeChannelMessage({ channel: 'D0LISTED02' }), drop('not-mentioned')],
   ])('a D… ID with a non-im channel_type is decided as a channel: %s', (_label, event, expected) => {
@@ -292,7 +309,7 @@ describe('step 3: DMs and group DMs', () => {
   test.each<[string, Record<string, unknown>, DeliveryDecision]>([
     ['a plain message in an all channel', makeChannelMessage({ channel: ALL }), deliver('receive_all')],
     ['an app_mention of P in a mentions channel', makeAppMention({ channel: MENTIONS, text: `${mention} hi` }), deliver('mention')],
-    ['a channel nobody lists', makeChannelMessage({ channel: NOBODY }), { action: 'drop', reason: 'channel-not-configured', unclaimed: true }],
+    ['a channel nobody lists', makeChannelMessage({ channel: NOBODY }), { action: 'unresolved', reason: 'choice-missing' }],
   ])('the DMs switch off does not change a channel decision: %s', (_label, event, expected) => {
     expect(decide(event, pOff, [view(pOff), view(Q)])).toEqual(expected)
   })
@@ -311,8 +328,8 @@ describe('step 4: channel membership', () => {
       makeChannelMessage({ channel: Q_ONLY, text: `${mentionText(P_USER)} ${broadcastText('here')}` }),
       false,
     ],
-  ])('%s is dropped as channel-not-configured, unclaimed=%p', (_label, event, unclaimed) => {
-    expect(decide(event)).toEqual({ action: 'drop', reason: 'channel-not-configured', unclaimed })
+  ])('%s cannot select from a missing applied choice (old listing control %p)', (_label, event, unclaimed) => {
+    expect(decide(event)).toEqual({ action: 'unresolved', reason: 'choice-missing' })
   })
 })
 
@@ -419,11 +436,23 @@ describe('no arbitration', () => {
       const event = toP
         ? makeBotMessage({ channel: MENTIONS, user: Q_USER, bot_id: Q_BOT, text: `${mentionText(P_USER)} ping ${i}` })
         : makeBotMessage({ channel: MENTIONS, user: P_USER, bot_id: P_BOT, text: `${mentionText(Q_USER)} pong ${i}` })
-      results.push(decideDelivery(event, toP ? P : Q, applied))
+      results.push(decide(event, toP ? P : Q, applied))
     }
     expect(results).toEqual(Array.from({ length: 20 }, () => deliver('mention')))
   })
 })
+
+for (const [name, group] of Object.entries(THREAD_DECISION_GROUPS)) {
+  describe(`strict Thread Memory: ${name}`, () => {
+    test.each(group.rows.filter(row => row.config.channel_mode === 'strict'))('$label', row => {
+      const reads: ThreadRead[] = [], ownPostReads: OwnPostRead[] = []
+      expect(decideDelivery(...decisionArgsOf(row, reads, ownPostReads))).toStrictEqual(row.expected)
+      expect(reads).toEqual([...(row.threadReads ?? [])])
+      expect(ownPostReads).toEqual([...(row.ownPostReads ?? [])])
+      if (row.channelDelivery) expect(channelDeliveryFor(...channelDeliveryArgsOf(row))).toStrictEqual(row.channelDelivery)
+    })
+  })
+}
 
 // ---------------------------------------------------------------------------
 // Reactions (decideReaction): fixtures
@@ -470,12 +499,26 @@ function reactionIn(channel: string, overrides: EventOverrides = {}): Record<str
   return reaction(overrides, { channel })
 }
 
-/** Declarative-mode inputs for a Slack event, the Run Bot Identities `RUN_BOTS`, with `overrides`. */
+/** P's stored choices for reactions: `mentions` in its mentions channel, `all` in any other channel. */
+function reactionStore(stored: Readonly<Record<string, DeliveryMode>> = {}): StoredChoices {
+  return { readable: true, storedChoice: (key, channel) => (key === P.key ? stored[channel] ?? (channel === MENTIONS ? 'mentions' : 'all') : undefined) }
+}
+
+/** P's verified membership, read for any channel. */
+const P_MEMBER: ReadonlyMap<string, MembershipReading> = new Map([[P.key, eligibleMembership(P.key)]])
+
+/**
+ * Declarative-mode inputs for a Slack event, the Run Bot Identities
+ * `RUN_BOTS`, with `overrides`. P serves every channel it may: a stored
+ * choice other than `off` and verified membership.
+ */
 function reactionInputs(overrides: Partial<ReactionDecisionInputs> = {}): ReactionDecisionInputs {
   return {
-    mode: 'declarative',
+    mode: 'strict',
     origin: 'slack-event',
     channelIdPattern: CHANNEL_ID_RE,
+    storedChoices: reactionStore(),
+    memberships: P_MEMBER,
     isRunBotIdentity: (id) => RUN_BOTS.has(id),
     ...overrides,
   }
@@ -483,7 +526,7 @@ function reactionInputs(overrides: Partial<ReactionDecisionInputs> = {}): Reacti
 
 /** Fungible-mode inputs whose envelope flag is the one the Slack stub's `form` carries. */
 function fungibleInputs(form: EnvelopeFlagForm = 'false'): ReactionDecisionInputs {
-  return reactionInputs({ mode: 'fungible', isExtSharedChannel: envelopeFlagOf(ENVELOPE_FLAG_FORMS[form]) })
+  return reactionInputs({ mode: 'open', isExtSharedChannel: envelopeFlagOf(ENVELOPE_FLAG_FORMS[form]) })
 }
 
 /** `base` as a reaction's receiver, its `reaction_notices` switch on unless `notices` is false. */
@@ -516,9 +559,9 @@ const FP = unreadChannels(RP)
 const FP_DM_OFF = unreadChannels(P_DM_OFF)
 const FP_NOTICES_OFF = unreadChannels(P_NOTICES_OFF)
 
-/** A deep copy of `value` with every object and array frozen; accessors are copied unread, functions and regexes kept. */
+/** A deep copy of `value` with every object and array frozen; accessors are copied unread, functions, regexes and maps kept. */
 function frozen<T>(value: T): T {
-  if (typeof value !== 'object' || value === null || value instanceof RegExp) return value
+  if (typeof value !== 'object' || value === null || value instanceof RegExp || value instanceof Map) return value
   const copy: object = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value))
   for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
     Object.defineProperty(copy, key, 'value' in descriptor ? { ...descriptor, value: frozen(descriptor.value) } : descriptor)
@@ -539,7 +582,7 @@ const ACCEPTED = {
   ts: EVENT_TS,
   change: 'added',
   emoji: EMOJI,
-  mode: 'declarative',
+  mode: 'strict',
   origin: 'slack-event',
 } as const
 
@@ -550,8 +593,8 @@ function accepted(facts: AcceptedFacts = {}, reactor: ReactionReactor = { user: 
   return { ...ACCEPTED, ...facts, ...reactor }
 }
 
-const dropped = (reason: Exclude<ReactionDropReason, 'fungible-refused'>): ReactionDecision => ({ action: 'drop', reason })
-const refused = (refusal: ReactionFungibleRefusal): ReactionDecision => ({ action: 'drop', reason: 'fungible-refused', refusal })
+const dropped = (reason: Exclude<ReactionDropReason, 'open-refused'>): ReactionDecision => ({ action: 'drop', reason })
+const refused = (refusal: ReactionFungibleRefusal): ReactionDecision => ({ action: 'drop', reason: 'open-refused', refusal })
 
 type ReactionRow = [label: string, event: unknown, expected: ReactionDecision, receiver: ReactionDecisionPersona, inputs: ReactionDecisionInputs]
 
@@ -604,8 +647,8 @@ describe('reactions: accepted, the reaction kept exactly as received', () => {
   test.each<ReactionRow>([
     row("declarative: reaction_added by a person on P's message in P's all channel", reaction(), accepted()),
     row('declarative: reaction_removed', reaction({ type: 'reaction_removed' }), accepted({ change: 'removed' })),
-    row('fungible: reaction_added', reaction(), accepted({ mode: 'fungible' }), FP, fungibleInputs()),
-    row('fungible: reaction_removed', reaction({ type: 'reaction_removed' }), accepted({ change: 'removed', mode: 'fungible' }), FP, fungibleInputs()),
+    row('fungible: reaction_added', reaction(), accepted({ mode: 'open' }), FP, fungibleInputs()),
+    row('fungible: reaction_removed', reaction({ type: 'reaction_removed' }), accepted({ change: 'removed', mode: 'open' }), FP, fungibleInputs()),
     row("an integration's bot ID with no user, not a Run Bot Identity", reaction({ user: undefined, bot_id: INTEGRATION_BOT }), accepted({}, { bot_id: INTEGRATION_BOT })),
     row('an empty user: the bot ID is the reactor', reaction({ user: '', bot_id: INTEGRATION_BOT }), accepted({}, { bot_id: INTEGRATION_BOT })),
     row('a non-string user: the bot ID is the reactor', reaction({ user: 42, bot_id: INTEGRATION_BOT }), accepted({}, { bot_id: INTEGRATION_BOT })),
@@ -748,10 +791,11 @@ describe('reactions: the first rule an event fails decides', () => {
 
 describe('reactions, rule 5: a conversation P serves now', () => {
   test.each<ReactionRow>([
-    row("declarative: P's mentions channel, whatever its delivery", reactionIn(MENTIONS), accepted({ channel: MENTIONS })),
+    row("declarative: P's mentions channel, stored mentions", reactionIn(MENTIONS), accepted({ channel: MENTIONS })),
     row('declarative: a channel nobody lists', reactionIn(NOBODY), dropped('unserved-conversation')),
     row('declarative: a channel only Q lists', reactionIn(Q_ONLY), dropped('unserved-conversation')),
-    // Whether a listed G… ID is a group DM is decided in preparation, not here.
+    // A listed G… ID with verified membership (a private channel's) is accepted; preparation still checks
+    // the kind. A real group DM has no verified membership, so it is unserved (the served-channel rows below).
     row('declarative: a G… ID P lists', reactionIn(GROUP_DM), accepted({ channel: GROUP_DM }), P_LISTS_G),
     row('declarative: a G… ID P does not list', reactionIn(GROUP_DM), dropped('unserved-conversation')),
     row(
@@ -765,15 +809,15 @@ describe('reactions, rule 5: a conversation P serves now', () => {
     row('declarative: a DM, DMs on', reactionIn(DM), accepted({ channel: DM })),
     row('declarative: a DM, DMs on, P listing no channel', reactionIn(DM), accepted({ channel: DM }), P_NO_CHANNELS),
     row('declarative: a DM, DMs off', reactionIn(DM), dropped('dm-disabled'), P_DM_OFF),
-    row('fungible: a G… channel nobody lists, flag false', reactionIn(GROUP_DM), accepted({ channel: GROUP_DM, mode: 'fungible' }), FP, fungibleInputs()),
+    row('fungible: a G… channel nobody lists, flag false', reactionIn(GROUP_DM), accepted({ channel: GROUP_DM, mode: 'open' }), FP, fungibleInputs()),
     ...FLAG_FORMS.map((form) => row(`fungible: a malformed ID, flag ${form}`, reactionIn(MALFORMED), refused('channel-id-malformed'), FP, fungibleInputs(form))),
-    row('fungible: a DM, DMs on, flag true', reactionIn(DM), accepted({ channel: DM, mode: 'fungible' }), FP, fungibleInputs('true')),
-    row('fungible: a DM, DMs on, flag absent', reactionIn(DM), accepted({ channel: DM, mode: 'fungible' }), FP, fungibleInputs('absent')),
+    row('fungible: a DM, DMs on, flag true', reactionIn(DM), accepted({ channel: DM, mode: 'open' }), FP, fungibleInputs('true')),
+    row('fungible: a DM, DMs on, flag absent', reactionIn(DM), accepted({ channel: DM, mode: 'open' }), FP, fungibleInputs('absent')),
     row('fungible: a DM, DMs off, flag false', reactionIn(DM), dropped('dm-disabled'), FP_DM_OFF, fungibleInputs()),
   ])('%s', expectRow)
 
   const FLAG_OUTCOMES: Record<EnvelopeFlagForm, ReactionDecision> = {
-    false: accepted({ channel: NOBODY, mode: 'fungible' }),
+    false: accepted({ channel: NOBODY, mode: 'open' }),
     true: refused('externally-shared'),
     absent: refused('flag-missing'),
     'non-boolean': refused('flag-not-boolean'),
@@ -785,19 +829,74 @@ describe('reactions, rule 5: a conversation P serves now', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Reactions, rule 5: a channel P no longer serves (PRD t1.n3k.4m)
+// ---------------------------------------------------------------------------
+
+describe('reactions, rule 5: a channel stored off or without verified membership is not served', () => {
+  const UNRESOLVED: MembershipReading = { kind: 'unresolved', reason: 'current-membership-missing' }
+  const ABSENT: MembershipReading = { kind: 'ineligible', reason: 'absent' }
+  /** Each way P stops serving its `all` channel, as inputs over `base`. */
+  const UNSERVED: [string, Partial<ReactionDecisionInputs>][] = [
+    ['stored off', { storedChoices: reactionStore({ [ALL]: 'off' }) }],
+    ['membership unresolved', { memberships: new Map([[P.key, UNRESOLVED]]) }],
+    ['membership ineligible (absent)', { memberships: new Map([[P.key, ABSENT]]) }],
+    ["no membership reading for P", { memberships: new Map([[Q.key, eligibleMembership(Q.key)]]) }],
+    ['no stored choice', { storedChoices: { readable: true, storedChoice: () => undefined } }],
+    ['the stored choices unreadable', { storedChoices: { readable: false, storedChoice: () => 'all' } }],
+  ]
+  /** Each mode and origin: P, its inputs while it serves the channel, and the accept outcome then. */
+  const MODES: [string, ReactionDecisionPersona, ReactionDecisionInputs, ReactionDecision][] = [
+    ['strict', RP, reactionInputs(), accepted()],
+    ['open', FP, fungibleInputs(), accepted({ mode: 'open' })],
+    ['strict, bot-tool', RP, reactionInputs({ origin: 'bot-tool' }), accepted({ origin: 'bot-tool' })],
+    ['open, bot-tool', FP, reactionInputs({ mode: 'open', origin: 'bot-tool' }), accepted({ mode: 'open', origin: 'bot-tool' })],
+  ]
+
+  test.each(MODES.flatMap(([mode, receiver, served, outcome]) => UNSERVED.map(([how, unserved]) => [mode, how, receiver, served, unserved, outcome] as const)))(
+    "%s: P's all channel, %s, is unserved-conversation; served, it is accepted",
+    (_mode, _how, receiver, served, unserved, outcome) => {
+      expect([react(reaction(), receiver, served), react(reaction(), receiver, { ...served, ...unserved })])
+        .toStrictEqual([outcome, dropped('unserved-conversation')])
+    },
+  )
+
+  test.each([
+    ['strict', RP, reactionInputs()],
+    ['open', FP, fungibleInputs()],
+  ] as const)('%s: a DM reads neither the stored choices nor membership', (_mode, receiver, base) => {
+    const unread = { ...base, storedChoices: undefined, memberships: undefined }
+    expect(react(reactionIn(DM), receiver, unread)).toStrictEqual(accepted({ channel: DM, ...(base.mode === 'open' ? { mode: 'open' } : {}) }))
+  })
+
+  test('strict: a channel P does not list stays unserved-conversation whatever it stored', () => {
+    expect(react(reactionIn(NOBODY), RP, reactionInputs({ storedChoices: reactionStore({ [NOBODY]: 'all' }) }))).toStrictEqual(dropped('unserved-conversation'))
+  })
+
+  test.each([
+    ['true', refused('externally-shared')],
+    ['absent', refused('flag-missing')],
+  ] as const)('open: a fungible-path refusal comes before the served check (flag %s, stored off)', (form, expected) => {
+    expect(react(reaction(), FP, { ...fungibleInputs(form), storedChoices: reactionStore({ [ALL]: 'off' }) })).toStrictEqual(expected)
+  })
+
+  test('reaction notices off comes before the served check', () => {
+    expect(react(reaction(), P_NOTICES_OFF, reactionInputs({ storedChoices: reactionStore({ [ALL]: 'off' }) }))).toStrictEqual(dropped('notices-off'))
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Reactions: channel delivery, stored choices and the loop guard (SR-3.2)
 // ---------------------------------------------------------------------------
 
-describe('reactions: channel delivery, stored choices and the loop guard play no part', () => {
-  /** P's stored `mentions` channel, and Q's fungible destination, where P stored `all`. */
+describe('reactions: which choice other than off P stored plays no part', () => {
+  /** P's stored `mentions` channel in open mode. (This branch has no fungible-destination loop guard.) */
   const STORED_MENTIONS = 'C0STOREDM1'
-  const LOOP_HELD = 'C0QDEST001'
-  const P_STORED: Readonly<Record<string, DeliveryMode>> = { [STORED_MENTIONS]: 'mentions', [LOOP_HELD]: 'all' }
+  const P_STORED: Readonly<Record<string, DeliveryMode>> = { [STORED_MENTIONS]: 'mentions' }
   const messageInputs: FungibleDecisionInputs = {
-    mode: 'fungible',
+    mode: 'open',
     isExtSharedChannel: false,
     channelIdPattern: CHANNEL_ID_RE,
-    fungibleDestinations: [{ key: Q.key, destination: LOOP_HELD }],
+    memberships: new Map([P, Q].map(p => [p.key, eligibleMembership(p.key)])),
     storedChoices: { readable: true, storedChoice: (key, channel) => (key === P.key ? P_STORED[channel] : undefined) },
   }
   const heardAtMentions: DeliveryDecision = {
@@ -806,19 +905,18 @@ describe('reactions: channel delivery, stored choices and the loop guard play no
     fungible: { channelType: 'public', channelDelivery: 'mentions' },
   }
 
-  test.each<[string, string, FungibleDecisionInputs | undefined, DeliveryDecision, ReactionDecisionInputs, ReactionDecision]>([
-    ["declarative: P's mentions channel", MENTIONS, undefined, drop('not-mentioned'), reactionInputs(), accepted({ channel: MENTIONS })],
-    ["fungible: P's stored mentions", STORED_MENTIONS, messageInputs, heardAtMentions, fungibleInputs(), accepted({ channel: STORED_MENTIONS, mode: 'fungible' })],
+  test.each<[string, string, (event: unknown) => DeliveryDecision, DeliveryDecision, ReactionDecisionInputs, ReactionDecision]>([
+    ["strict: P's mentions channel", MENTIONS, event => decide(event), drop('not-mentioned'), reactionInputs(), accepted({ channel: MENTIONS })],
     [
-      "fungible: Q's destination, the loop guard holding P's stored all",
-      LOOP_HELD,
-      messageInputs,
+      "open: P's stored mentions",
+      STORED_MENTIONS,
+      event => decideDelivery(event, P, [view(P), view(Q)], messageInputs),
       heardAtMentions,
-      fungibleInputs(),
-      accepted({ channel: LOOP_HELD, mode: 'fungible' }),
+      { ...fungibleInputs(), storedChoices: messageInputs.storedChoices, memberships: messageInputs.memberships },
+      accepted({ channel: STORED_MENTIONS, mode: 'open' }),
     ],
-  ])('%s: a plain message is not delivered, a reaction is accepted', (_label, channel, messageWith, messageOutcome, reactionWith, reactionOutcome) => {
-    const message = decideDelivery(makeChannelMessage({ channel, text: 'plain words' }), P, [view(P), view(Q)], messageWith)
+  ])('%s: a plain message is not delivered, a reaction is accepted', (_label, channel, decideMessage, messageOutcome, reactionWith, reactionOutcome) => {
+    const message = decideMessage(makeChannelMessage({ channel, text: 'plain words' }))
     expect([message, react(reactionIn(channel), RP, reactionWith)]).toStrictEqual([messageOutcome, reactionOutcome])
   })
 })
@@ -853,12 +951,12 @@ describe('reactions: each call reads the configuration it is given', () => {
     expect(calls.map(([event, receiver, inputs]) => decideReaction(event, receiver, inputs))).toStrictEqual([
       accepted(),
       dropped('unserved-conversation'),
-      accepted({ mode: 'fungible' }),
+      accepted({ mode: 'open' }),
       accepted(),
       accepted({ channel: DM }),
       dropped('dm-disabled'),
       dropped('dm-disabled'),
-      accepted({ channel: DM, mode: 'fungible' }),
+      accepted({ channel: DM, mode: 'open' }),
       dropped('notices-off'),
       dropped('notices-off'),
       accepted(),
@@ -891,7 +989,7 @@ describe("reactions from another persona's react tool (origin bot-tool): only th
 
   /** Fungible-mode `bot-tool` inputs carrying the Slack stub's envelope flag form `form`. */
   function botToolFungibleInputs(form: EnvelopeFlagForm): ReactionDecisionInputs {
-    return botToolInputs({ mode: 'fungible', isExtSharedChannel: envelopeFlagOf(ENVELOPE_FLAG_FORMS[form]) })
+    return botToolInputs({ mode: 'open', isExtSharedChannel: envelopeFlagOf(ENVELOPE_FLAG_FORMS[form]) })
   }
 
   /** A `bot-tool` accept outcome: `facts` over the defaults, origin `bot-tool`, Q's bot user the reactor unless given. */
@@ -922,7 +1020,7 @@ describe("reactions from another persona's react tool (origin bot-tool): only th
       FP,
       fungibleInputs(),
       botToolFungibleInputs('false'),
-      botToolAccepted({ channel: NOBODY, mode: 'fungible' }),
+      botToolAccepted({ channel: NOBODY, mode: 'open' }),
     ],
     [
       "Q's reaction with colons, a skin tone and padding in the emoji and both timestamps, kept exactly",
@@ -968,7 +1066,7 @@ describe("reactions from another persona's react tool (origin bot-tool): only th
   ])('every other rule still applies, in order: %s', expectBotToolRow)
 
   test.each(FLAG_FORMS)("fungible: Q's reaction in a channel nobody lists is accepted whatever the envelope flag (form %s)", (form) => {
-    expectBotToolRow('', reactionIn(NOBODY, { user: Q_USER }), botToolAccepted({ channel: NOBODY, mode: 'fungible' }), FP, botToolFungibleInputs(form))
+    expectBotToolRow('', reactionIn(NOBODY, { user: Q_USER }), botToolAccepted({ channel: NOBODY, mode: 'open' }), FP, botToolFungibleInputs(form))
   })
 
   test.each(FLAG_FORMS)("fungible: a malformed ID is still channel-id-malformed, the channel ID checked before the flag (form %s)", (form) => {

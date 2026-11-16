@@ -46,6 +46,9 @@ import { makeSessionServer, makeTransport, type ChannelNotification } from './pe
 export interface ManagedRoutingOptions {
   /** The archive seam, as the server's `archiveWrite`; default: no archive. */
   archive?: PersonaRoutingDeps['archive']
+  membership?: PersonaRoutingDeps['membership']
+  getChannelDelivery?: PersonaRoutingDeps['getChannelDelivery']
+  onReceived?: PersonaRoutingDeps['onReceived']
 }
 
 export interface ManagedRouting {
@@ -54,6 +57,7 @@ export interface ManagedRouting {
   logs: string[]
   /** Notifications each persona's registered session received, by persona key. */
   queue: ReturnType<typeof createDeliveryQueue>
+  close(): Promise<void>
   ready: Promise<void>
   queued(key: string): ReturnType<ReturnType<typeof createDeliveryQueue>['items']>
   notifications: Map<string, ChannelNotification[]>
@@ -71,7 +75,7 @@ export function makeManagedRouting(h: ConnectionHarness, baseDir: string, opts: 
   const log = (line: string): void => void logs.push(line)
   // The notifier reads the same configuration as the routing, so a notice
   // goes to the destination of the channel mode in force.
-  const { notifier } = makeNotifierStack({ getPersona: h.getPersona, clientFor: h.clientFor, getPersonaConfig: () => h.config, log })
+  const { notifier, hold } = makeNotifierStack({ getPersona: h.getPersona, clientFor: h.clientFor, getPersonaConfig: () => h.config, log })
   const queue = createDeliveryQueue({ stateDir: baseDir })
   const ready = queue.start()
   const preparation = createDeliveryPreparation({ queue, clientFor: h.clientFor, resolveUserName: async (key, userId) => {
@@ -80,6 +84,9 @@ export function makeManagedRouting(h: ConnectionHarness, baseDir: string, opts: 
     return result?.user?.profile?.display_name || userId
   } })
   const core = createPersonaRouting({
+    membership: opts.membership,
+    getChannelDelivery: opts.getChannelDelivery,
+    onReceived: opts.onReceived,
     getPersonaConfig: () => h.config,
     getBotIdentity: key => h.identityFor(key),
     isRunBotIdentity: id => h.manager.isRunBotIdentity(id),
@@ -93,5 +100,5 @@ export function makeManagedRouting(h: ConnectionHarness, baseDir: string, opts: 
     receive: async (...args: Parameters<typeof core.receive>) => { await ready; return core.receive(...args) },
     receiveReaction: async (...args: Parameters<typeof core.receiveReaction>) => { await ready; return core.receiveReaction(...args) },
   }
-  return { routing, logs, queue, ready, queued: key => queue.items(key), notifications }
+  return { routing, logs, queue, ready, close: async () => { hold.cancelAll(); await preparation.stop(); await queue.stop() }, queued: key => queue.items(key), notifications }
 }

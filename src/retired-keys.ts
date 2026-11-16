@@ -409,6 +409,38 @@ export interface RetiredKeysSnapshot {
   readonly heldMarks: ReadonlySet<string>
 }
 
+/** Journaled in the shared authority before a reviewed retirement begins.
+ * It is recovery input to this store, never another retirement authority. */
+export interface RetiredReviewRecovery { keys: string[]; beforeBase64: string }
+export function retiredReviewRecovery(store: RetiredKeyStore, keys: readonly string[]): RetiredReviewRecovery {
+  const snapshot = store.snapshot()
+  return { keys: [...new Set(keys)].sort(), beforeBase64: Buffer.from(serializeRetiredKeys(new Map(
+    keys.flatMap(key => snapshot.entries.has(key) ? [[key, snapshot.entries.get(key)!] as const] : []),
+  ))).toString('base64') }
+}
+export function validateRetiredReviewRecovery(value: unknown): asserts value is RetiredReviewRecovery {
+  if (!isJsonObject(value) || Object.keys(value).length !== 2 || !Array.isArray(value['keys']) ||
+      !value['keys'].every(key => typeof key === 'string' && !!key) || new Set(value['keys']).size !== value['keys'].length ||
+      typeof value['beforeBase64'] !== 'string') throw new Error('Invalid reviewed retirement recovery.')
+  const bytes = Buffer.from(value['beforeBase64'], 'base64')
+  const parsed = parseRetiredKeys(bytes)
+  if (bytes.toString('base64') !== value['beforeBase64'] || !parsed.ok ||
+      [...parsed.record.keys()].some(key => !(value['keys'] as string[]).includes(key))) throw new Error('Invalid reviewed retirement recovery.')
+}
+export function restoreReviewedRetirement(store: RetiredKeyStore, recovery: RetiredReviewRecovery): RetiredKeysRestoreOutcome {
+  validateRetiredReviewRecovery(recovery)
+  const parsed = parseRetiredKeys(Buffer.from(recovery.beforeBase64, 'base64'))
+  if (!parsed.ok) throw new Error('Invalid reviewed retirement recovery.')
+  const current = store.snapshot()
+  const entries = new Map(current.entries)
+  for (const key of recovery.keys) {
+    const before = parsed.record.get(key)
+    if (before) entries.set(key, before)
+    else entries.delete(key)
+  }
+  return store.restore({ ...current, entries })
+}
+
 /** The record was written. */
 export const RETIRED_KEYS_WRITTEN = 'written'
 /** Nothing changed, so nothing was written. */

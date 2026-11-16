@@ -7,7 +7,7 @@
  *
  * SPDX-License-Identifier: MIT
  */
-import type { DeliveryQueue, QueueItem } from './delivery-queue.ts'
+import { isOpenItem, type DeliveryQueue, type QueueItem } from './delivery-queue.ts'
 
 export const EARLY_REPLY_EXPIRY_MS = 24 * 60 * 60 * 1000
 const ACK_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000
@@ -48,8 +48,15 @@ export interface DeliveryAckDeps {
 
 const slots = new Map<string, AckSlot>()
 const successfulReplies = new Map<string, Identity>()
+// A lower bound, including forgotten/replaced entries until the next sweep.
+// Keeping it early costs a sweep; keeping it late would change expiry.
+let earliestExpiry = Infinity
 const makeKey = (personaKey: string, channelId: string, messageTs: string) => JSON.stringify([personaKey, channelId, messageTs])
-const newEntry = (personaKey: string, legacy = false): AckEntry => ({ personaKey, createdAt: Date.now(), kept: new Set(), answered: false, legacy, pending: 0, stages: {} })
+function newEntry(personaKey: string, legacy = false): AckEntry {
+  const createdAt = Date.now()
+  earliestExpiry = Math.min(earliestExpiry, createdAt + ACK_EXPIRY_MS)
+  return { personaKey, createdAt, kept: new Set(), answered: false, legacy, pending: 0, stages: {} }
+}
 function slotFor(key: string): AckSlot {
   let slot = slots.get(key)
   if (!slot) { slot = {}; slots.set(key, slot) }
@@ -82,13 +89,18 @@ function cleanup(key: string, slot: AckSlot, entry: AckEntry): Promise<void> {
 }
 function pruneExpired(): void {
   const now = Date.now()
-  for (const [key, reply] of successfulReplies) if (reply.createdAt < now - EARLY_REPLY_EXPIRY_MS) successfulReplies.delete(key)
+  if (now <= earliestExpiry) return
+  earliestExpiry = Infinity
+  for (const [key, reply] of successfulReplies) {
+    if (reply.createdAt < now - EARLY_REPLY_EXPIRY_MS) successfulReplies.delete(key)
+    else earliestExpiry = Math.min(earliestExpiry, reply.createdAt + EARLY_REPLY_EXPIRY_MS)
+  }
   for (const [key, slot] of slots) {
     const entry = slot.entry
     if (entry && !slot.tail && entry.createdAt < now - ACK_EXPIRY_MS) {
       slot.entry = undefined
       void cleanup(key, slot, entry)
-    }
+    } else if (entry) earliestExpiry = Math.min(earliestExpiry, entry.createdAt + ACK_EXPIRY_MS)
   }
 }
 
@@ -173,7 +185,7 @@ function createAckCallback(deps: DeliveryAckDeps, stage: Stage): (key: string, i
     const accepted = item.accepted
     const queuedName = accepted.queued_ack_reaction
     const name = stage === 'queued' ? queuedName ?? deps.getReaction() : deps.getReaction()
-    if (accepted.source !== 'slack' || !accepted.channel || !name || (stage === 'delivered' ? !item.delivered : item.delivered)) return
+    if (accepted.source !== 'slack' || !accepted.channel || !name || (stage === 'delivered' ? !item.delivered : !isOpenItem(item))) return
     const web = deps.clientFor(key)
     const prior: Reaction | undefined = queuedName ? {
       name: queuedName,
@@ -257,7 +269,9 @@ function recordAnswer(personaKey: string, key: string, removeLegacy?: () => Prom
   const slot = slots.get(key), entry = slot?.entry
   const keptNames = successfulReplies.get(key)?.kept ?? new Set<string>()
   if (kept !== undefined) { keptNames.add(kept); entry?.kept.add(kept) }
-  successfulReplies.set(key, { personaKey, createdAt: Date.now(), kept: keptNames })
+  const createdAt = Date.now()
+  successfulReplies.set(key, { personaKey, createdAt, kept: keptNames })
+  earliestExpiry = Math.min(earliestExpiry, createdAt + EARLY_REPLY_EXPIRY_MS)
   let consumed = false, work = Promise.resolve()
   if (slot && entry && !entry.answered) {
     consumed = entry.legacy || entry.pending > 0 || slot.visible?.owner === entry
@@ -285,4 +299,5 @@ export function _resetAckTracker(): void {
   for (const slot of slots.values()) slot.entry = undefined
   slots.clear()
   successfulReplies.clear()
+  earliestExpiry = Infinity
 }

@@ -4,7 +4,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { join } from 'node:path'
 import { CONFLICT_NOTICE_HUMAN_ONLY_LINE } from '../src/conflict-latch.ts'
-import { DELIVERY_STUCK_AFTER_MS, DELIVERY_ROW_POLL_MS, ENTER_DELAY_MS } from '../src/delivery-constants.ts'
+import { DELIVERY_STUCK_AFTER_MS, DELIVERY_ROW_POLL_MS, ENTER_DELAY_MS, THREAD_REPLY_HOLD_MS } from '../src/delivery-constants.ts'
 import { NOTICE_CORRECTION_TIMEOUT_MS, type NoticeCorrectionOutcome } from '../src/notice-correction.ts'
 import type { AcceptedInput, QueueItem, ReactionAcceptedInput, SlackKey } from '../src/delivery-queue.ts'
 import { createDeliveryPreparation, type DeliveryPreparation } from '../src/delivery-intake.ts'
@@ -12,16 +12,221 @@ import type { DeliveryReason, DeliveryStatus } from '../src/delivery-engine.ts'
 import { buildDeliveryDiagnostic, buildDeliveryStuckNotice, buildMessageNotSavedNotice, buildMessageSavedAfterRetryNotice, buildStorageNoticeRecoveryLine, buildMessageNotTakenInNotice, buildMessagesWaitingNotice, buildQueueRecordUnreadableNotice, deliveryIdentity, deliveryStuckRemedy, MESSAGE_DELIVERED, MESSAGE_NOT_SAVED, MESSAGE_NOT_TAKEN_IN, MESSAGE_RECEIVED, MESSAGE_RETYPED, QUEUE_KEPT, QUEUE_UNWRITABLE, type DeliveryReportState, type DeliveryStuckReason } from '../src/delivery-notices.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import { MESSAGE_PARTIAL_RECEIPT, PERSONA_DESTINATION_FAILED } from '../src/persona-diagnostics.ts'
-import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
+import { OWN_POST_CANCELLED } from '../src/persona-destination.ts'
+import { holdOwnPostReady, makeRecordingOwnPostObserver, type OwnPostStep } from './test-helpers/own-post.ts'
+import { assertNoLeak, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
+import { existsSync } from 'node:fs'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
-import { makeDeliveryNoticeHarness, makeStorageNoticeHarness, type DeliveryNoticeHarness, type StorageNoticeHarness } from './test-helpers/delivery-notices.ts'
-import { injectedInput, queuePath, readQueue, slackInput } from './test-helpers/delivery-queue.ts'
+import { makeDeliveryNoticeHarness, makeStorageNoticeHarness, STORAGE_NOTICE_IDS, type DeliveryNoticeHarness, type StorageNoticeHarness } from './test-helpers/delivery-notices.ts'
+import { injectedInput, queuePath, readQueue } from './test-helpers/delivery-queue.ts'
+import { durableIo } from './test-helpers/durable-io.ts'
 import { partialReceiptText, partialReceiptSuffix } from './test-helpers/partial-receipt.ts'
 import { openedDm } from './test-helpers/slack-stub.ts'
 import { appendTranscript, pastedText, promptEntry, replyEntry } from './test-helpers/working-row-panes.ts'
+import { heldSlackInput, HOLD_FIELDS, memoryHold, postHold, slackInput } from './test-helpers/delivery-queue.ts'
+import type { HoldField } from '../src/delivery-queue.ts'
+import { THREAD_ROOTS } from './test-helpers/thread-memory.ts'
 const runs: DeliveryNoticeHarness[] = []
-async function run() { const h = await makeDeliveryNoticeHarness(); runs.push(h); return h }
-afterEach(async () => { for (const r of runs.splice(0)) { try { assertNoLeak({ logs: r.logs, posts: r.h.allPosts(), lines: r.rig.lines }) } finally { await r.cleanup() } } })
+async function run(options: Parameters<typeof makeDeliveryNoticeHarness>[0] = {}) { const h = await makeDeliveryNoticeHarness(options); runs.push(h); return h }
+afterEach(async () => { for (const r of runs.splice(0)) { try {
+  const path = join(r.root, 'queue')
+  assertNoLeak({ logs: r.logs, posts: r.h.allPosts(), lines: r.rig.lines, queue: existsSync(path) ? writtenFile(path) : undefined })
+} finally { await r.cleanup() } } })
+
+async function noticeHold(r: DeliveryNoticeHarness, ts: string = THREAD_ROOTS.secondary, field: (at: number) => HoldField = memoryHold) {
+  const input = heldSlackInput(field(r.h.clock.now()), { ts, key: { chat_id: 'C0TEST001', ts }, text: 'private held reply' })
+  const result = await r.queue.acceptDecided(r.alpha, input.key, () => ({ store: input }))
+  if (result.status !== 'accepted') throw new Error('hold fixture acceptance failed')
+  return result.item!
+}
+
+test.each(['memory', 'post'] as const)('%s holds and withdrawals stay quiet through queued reconciliation and late waiting events', async kind => {
+  const field = HOLD_FIELDS[kind]
+  const r = await run({ holds: true }), held = await noticeHold(r, THREAD_ROOTS.secondary, field), withdrawn = await noticeHold(r, THREAD_ROOTS.third, field)
+  await r.queue.resolveHolds(r.alpha, [{ seq: withdrawn.accepted.seq, outcome: 'withdrawn', at: r.h.clock.now() }])
+  await r.h.clock.advance(DELIVERY_STUCK_AFTER_MS * 2)
+  for (const item of r.queue.items(r.alpha)) {
+    r.reporting.received(r.alpha, item)
+    r.waiting(item, 'not-now')
+    r.waiting(item, 'state', { row: 'ended' })
+  }
+  r.reporting.reconcileQueued(r.alpha)
+  await r.flush()
+  expect(r.queued).toEqual([])
+  expect(r.logs).toEqual([])
+  expect(r.h.totalPosts()).toBe(0)
+  expect(r.delivered).toEqual([])
+
+  await r.queue.resolveHolds(r.alpha, [{ seq: held.accepted.seq, outcome: 'released', at: r.h.clock.now() }])
+  const released = r.queue.item(r.alpha, held.accepted.seq)!
+  r.reporting.received(r.alpha, released)
+  r.reporting.reconcileQueued(r.alpha)
+  expect(r.queued.map(q => [q.key, q.item.accepted.seq])).toEqual([[r.alpha, held.accepted.seq], [r.alpha, held.accepted.seq]])
+  r.waiting(released, 'state', { row: 'ended' }); await r.flush()
+  expect(r.h.posts(r.alpha).map(p => p.text)).toEqual([formatPersonaNotice(r.config.personas[0]!, buildMessagesWaitingNotice(r.ref(), 1, 0, 'down'))])
+  expect(r.h.posts(r.beta)).toEqual([])
+  expect(JSON.stringify({ logs: r.logs, posts: r.h.allPosts() })).not.toContain('private held reply')
+  assertNoLeak(r.queued)
+})
+
+test.each(['memory', 'post'] as const)('%s hold release starts the real engine stuck clock at release', async kind => {
+  let r: DeliveryNoticeHarness | undefined
+  const e = await makeEngineHarness({ onEvent: event => r?.reporting.engineEvent(event) })
+  r = await run({ queue: e.queue, holds: true })
+  try {
+    const held = await noticeHold(r, THREAD_ROOTS.secondary, HOLD_FIELDS[kind]), withdrawn = await noticeHold(r, THREAD_ROOTS.third, HOLD_FIELDS[kind])
+    await e.queue.resolveHolds(r.alpha, [{ seq: withdrawn.accepted.seq, outcome: 'withdrawn', at: e.clock.now() }])
+    e.p().row.relay_mode = 'off'
+    await e.tick()
+    await e.advance(DELIVERY_STUCK_AFTER_MS * 2)
+    expect(r.h.totalPosts()).toBe(0)
+    const releasedAt = e.clock.now()
+    await e.queue.resolveHolds(r.alpha, [{ seq: held.accepted.seq, outcome: 'released', at: releasedAt }])
+    await e.preparation.recover()
+    await e.tick()
+    await e.advance(DELIVERY_STUCK_AFTER_MS)
+    expect(e.engine.status(r.alpha)).toMatchObject({ count: 1, ageMs: DELIVERY_STUCK_AFTER_MS })
+    await r.flush()
+    expect(r.h.totalPosts()).toBe(0)
+    await e.advance(1); await e.tick(); await r.flush()
+    expect(r.h.posts(r.alpha).map(p => p.text)).toEqual([formatPersonaNotice(r.config.personas[0]!, buildDeliveryStuckNotice(r.ref(), r.alpha, 1, DELIVERY_STUCK_AFTER_MS + 1, 'relay-off', 1))])
+    expect(e.keyCalls()).toEqual([])
+    expect(e.errors).toEqual([])
+    expect(r.h.posts(r.beta)).toEqual([])
+    expect(JSON.stringify({ logs: r.logs, posts: r.h.allPosts() })).not.toContain('private held reply')
+    assertNoLeak([e.events, e.calls, e.errors])
+  } finally { await e.cleanup() }
+})
+
+test('items behind an unresolved Post Hold keep their queued reactions and stuck notice, counted and timed without it', async () => {
+  const r = await run({ holds: true }), held = await noticeHold(r, THREAD_ROOTS.secondary, postHold)
+  const behind = [await r.accept({ key: { chat_id: 'C0TEST001', ts: 'behind-one' } }), await r.accept({ key: { chat_id: 'C0TEST001', ts: 'behind-two' } })]
+  const seqs = behind.map(i => i.accepted.seq)
+  for (const item of [held, ...behind]) r.reporting.received(r.alpha, item)
+  r.reporting.reconcileQueued(r.alpha)
+  expect(r.queued.map(q => q.item.accepted.seq)).toEqual([...seqs, ...seqs])
+  await r.h.clock.advance(DELIVERY_STUCK_AFTER_MS + 1)
+  r.waiting(held, 'not-now'); r.waiting(held, 'state', { row: 'ended' }); await r.flush()
+  expect(r.h.totalPosts()).toBe(0)
+  r.waiting(behind[0]!, 'not-now', { ageMs: DELIVERY_STUCK_AFTER_MS }); await r.flush()
+  expect(r.h.totalPosts()).toBe(0)
+  r.waiting(behind[0]!, 'not-now'); await r.flush()
+  expect(r.h.posts(r.alpha).map(p => p.text)).toEqual([formatPersonaNotice(r.config.personas[0]!, buildDeliveryStuckNotice(r.ref(), r.alpha, behind.length, DELIVERY_STUCK_AFTER_MS + 1, 'refused', 1))])
+  expect(r.h.posts(r.beta)).toEqual([])
+  expect(JSON.stringify({ logs: r.logs, posts: r.h.allPosts() })).not.toContain('private held reply')
+})
+
+test.each((['memory', 'post'] as const).flatMap(kind => (['released head', 'later in-flight item'] as const).map(reported => [kind, reported] as const)))(
+  'with %s holds, completing another item keeps the reported %s\'s episode and never moves to an unresolved or withdrawn hold', async (kind, reported) => {
+  const r = await run({ holds: true }), field = HOLD_FIELDS[kind]
+  const unresolved = await noticeHold(r, THREAD_ROOTS.secondary, field), withdrawn = await noticeHold(r, THREAD_ROOTS.third, field)
+  const released = await noticeHold(r, THREAD_ROOTS.primary, field)
+  const later = await r.accept({ key: { chat_id: 'C0TEST001', ts: 'later' } })
+  // The engine may report an in-flight item behind the earlier released one, which heads the open items.
+  const inFlight = reported === 'later in-flight item' ? await r.accept({ key: { chat_id: 'C0TEST001', ts: 'in-flight' } }) : undefined
+  await r.queue.resolveHolds(r.alpha, [
+    { seq: withdrawn.accepted.seq, outcome: 'withdrawn', at: r.h.clock.now() },
+    { seq: released.accepted.seq, outcome: 'released', at: r.h.clock.now() },
+  ])
+  const head = inFlight ?? r.queue.item(r.alpha, released.accepted.seq)!
+  r.waiting(head, 'state', { row: 'ended' }); await r.flush()
+  expect(r.rig.episodes.isOpen(r.alpha, 'messages-waiting')).toBe(true)
+  // Another item completes: one in flight when the older head was released, or one not reported.
+  await r.complete(later)
+  expect(r.rig.episodes.isOpen(r.alpha, 'messages-waiting')).toBe(true)
+  r.waiting(head, 'state', { row: 'ended' }); await r.flush()
+  expect(r.h.posts(r.alpha)).toHaveLength(1)
+  // The reported item's own completion ends its episode.
+  await r.complete(r.queue.item(r.alpha, head.accepted.seq)!)
+  expect(r.rig.episodes.isOpen(r.alpha, 'messages-waiting')).toBe(false)
+  expect(r.delivered.map(d => d.item.accepted.seq)).toEqual([later.accepted.seq, head.accepted.seq])
+  expect(r.queue.item(r.alpha, unresolved.accepted.seq)?.fixed).toBeUndefined()
+  expect(r.queue.item(r.alpha, withdrawn.accepted.seq)?.fixed).toBeUndefined()
+  expect(r.queued).toEqual([])
+})
+
+// F9: status, waiting facts and stuck reporting name the engine's in-flight item, not the first open one.
+test('an earlier Memory Hold released mid-attempt leaves status, waiting and stuck reporting on the in-flight item until its durable completion, then on the released item aged from release', async () => {
+  let r: DeliveryNoticeHarness | undefined, laterSeq = 0
+  const e = await makeEngineHarness({ onEvent: event => {
+    r?.reporting.engineEvent(event)
+    // The released item then waits, relay off, so its own facts can be read.
+    if (event.type === 'item-delivered' && event.seq === laterSeq) e.p().row.relay_mode = 'off'
+  } })
+  r = await run({ queue: e.queue, holds: true })
+  try {
+    const p = e.p(), text = partialReceiptText, second = 'the in-flight item\'s second part'
+    const held = await noticeHold(r)
+    const later = await e.accept(text, r.alpha, [text, second]); laterSeq = later.accepted.seq
+    // Every Enter lands only the text's tail: a partial receipt, then retypes.
+    p.autoReceipt = false
+    p.keyHook = params => { if (params.key === 'Enter') appendTranscript(p.path, [promptEntry(partialReceiptSuffix)]); return undefined }
+    await e.tick(); await e.until(() => e.events.some(event => event.type === 'retyped'))
+    await e.advance(DELIVERY_STUCK_AFTER_MS - 60_000 - e.clock.now())
+    const releasedAt = e.clock.now(), released = e.events.length
+    await e.queue.resolveHolds(r.alpha, [{ seq: held.accepted.seq, outcome: 'released', at: releasedAt }])
+    await e.preparation.recover(); e.engine.wake(r.alpha); await e.tick()
+    // Status reads make no AD call, record, timer, post or line.
+    const effects = () => ({ calls: e.calls.length, records: e.records().length, timers: e.clock.pendingCount(), posts: r!.h.totalPosts(), logs: r!.logs.length })
+    const quiet = effects(), status = e.engine.status(r.alpha)!
+    expect(e.engine.status(r.alpha)).toEqual(status)
+    expect(effects()).toEqual(quiet)
+    const inFlight = e.queue.item(r.alpha, laterSeq)!
+    expect(status).toMatchObject({ seq: laterSeq, count: 2, ageMs: e.clock.now() - inFlight.accepted.received_at, retypeCount: inFlight.retypeCount,
+      partialReceipt: { part: 1, expectedBytes: Buffer.byteLength(text), receivedBytes: Buffer.byteLength(partialReceiptSuffix) } })
+    expect(status.retypeCount).toBeGreaterThan(0)
+    // Past the threshold of the in-flight item's age, not the released item's.
+    await e.advance(60_000 + DELIVERY_ROW_POLL_MS); await r.flush()
+    const waits = e.events.slice(released).filter(event => event.type === 'waiting')
+    expect(waits.length).toBeGreaterThan(0)
+    expect(waits.map(event => [event.seq, event.status?.seq, event.status?.count, event.status?.partialReceipt?.part])).toEqual(waits.map(() => [laterSeq, laterSeq, 2, 1]))
+    const trigger = waits.find(event => event.ageMs > DELIVERY_STUCK_AFTER_MS)
+    if (trigger?.type !== 'waiting' || !trigger.status) throw new Error('no waiting fact passed the stuck threshold')
+    const stuckForLater = formatPersonaNotice(r.config.personas[0]!, buildDeliveryStuckNotice(r.ref(), r.alpha, 2, trigger.ageMs, 'not-taken-in', trigger.status.retypeCount + 1, true))
+    expect(r.h.posts(r.alpha).map(post => post.text)).toEqual([
+      formatPersonaNotice(r.config.personas[0]!, buildMessageNotTakenInNotice(r.ref(), 'interject', true)), stuckForLater])
+    const stuckLines = () => r!.logs.filter(line => line.includes('delivery-stuck'))
+    expect(stuckLines()).toHaveLength(1)
+    expect(stuckLines()[0]).toContain(deliveryIdentity(inFlight.accepted))
+    expect(r.rig.episodes.isOpen(r.alpha, 'delivery-stuck')).toBe(true)
+
+    // A full receipt completes part 1; part 2 keeps the same item reported until its own receipt.
+    p.keyHook = undefined
+    appendTranscript(p.path, [promptEntry(pastedText(text))])
+    await e.until(() => e.textCalls().some(call => call.params.text === second))
+    expect(e.engine.status(r.alpha)).toMatchObject({ seq: laterSeq, count: 2 })
+    expect(e.engine.status(r.alpha)?.partialReceipt).toBeUndefined()
+    p.autoReceipt = true
+    appendTranscript(p.path, [promptEntry(second)])
+    await e.until(() => e.queue.item(r!.alpha, laterSeq)!.delivered)
+    await e.advance(DELIVERY_ROW_POLL_MS); await r.flush()
+    expect(r.delivered.map(({ item }) => item.accepted.seq)).toEqual([laterSeq])
+    expect(r.rig.episodes.isOpen(r.alpha, 'delivery-stuck')).toBe(false)
+    // Now the released item: its release age, no retypes and no other item's receipt evidence.
+    const next = e.engine.status(r.alpha)!
+    expect(next).toMatchObject({ seq: held.accepted.seq, count: 1, ageMs: e.clock.now() - releasedAt, retypeCount: 0 })
+    expect(next.partialReceipt).toBeUndefined()
+    const after = e.events.slice(e.events.findIndex(event => event.type === 'item-delivered')).flatMap(event => event.type === 'waiting' ? [event] : [])
+    expect(after.length).toBeGreaterThan(0)
+    expect(after.map(event => [event.seq, event.reason, event.status?.seq, event.status?.count, event.status?.partialReceipt, event.ageMs === event.status?.ageMs]))
+      .toEqual(after.map(() => [held.accepted.seq, 'relay-off', held.accepted.seq, 1, undefined, true]))
+    expect(after.every(event => event.ageMs < DELIVERY_STUCK_AFTER_MS)).toBe(true)
+    // Its own episode begins only once its release age passes the threshold.
+    await e.advance(releasedAt + DELIVERY_STUCK_AFTER_MS - e.clock.now()); await r.flush()
+    expect(r.h.posts(r.alpha)).toHaveLength(2)
+    await e.advance(DELIVERY_ROW_POLL_MS); await r.flush()
+    const releasedStuck = e.events.find(event => event.type === 'waiting' && event.seq === held.accepted.seq && event.ageMs > DELIVERY_STUCK_AFTER_MS)
+    if (releasedStuck?.type !== 'waiting') throw new Error('the released item never passed the stuck threshold')
+    expect(r.h.posts(r.alpha).map(post => post.text).slice(2)).toEqual([
+      formatPersonaNotice(r.config.personas[0]!, buildDeliveryStuckNotice(r.ref(), r.alpha, 1, releasedStuck.ageMs, 'relay-off', 1))])
+    expect(stuckLines()).toHaveLength(2)
+    expect(stuckLines()[1]).toContain(deliveryIdentity(e.queue.item(r.alpha, held.accepted.seq)!.accepted))
+    expect(r.h.posts(r.beta)).toEqual([])
+    expect(e.errors).toEqual([])
+    assertNoLeak([e.events, e.calls, e.errors])
+    expect(JSON.stringify({ logs: r.logs, posts: r.h.allPosts() })).not.toContain('private held reply')
+  } finally { await e.cleanup() }
+})
 
 test('launch timing diagnostics preserve structured engine evidence without posting a notice or requiring queued work', async () => {
   // the real-agent timing assertion consumes these JSON facts.
@@ -177,7 +382,9 @@ test('injected failures count safely without consuming the first Slack notice; s
   expect(r.h.posts(r.alpha)).toMatchObject([{ channel: 'C0ALPHA01', text: formatPersonaNotice(r.config.personas[0]!, buildMessageNotSavedNotice(r.ref(), 'U0SENDER1')) }])
   expect(r.logs).toHaveLength(4)
   expect(r.logs.map(line => line.match(/count=(\d+)/)?.[1])).toEqual(['1', '2', '3', '4'])
+  expect(r.rig.episodes.isOpen(r.alpha, 'message-not-saved')).toBe(true)
   await r.accept()
+  expect(r.rig.episodes.isOpen(r.alpha, 'message-not-saved')).toBe(false)
   r.reporting.queueEvent({ type: 'store-failed', key: r.alpha, source: 'slack', user: 'U0SENDER2', error })
   await r.flush()
   expect(r.h.posts(r.alpha)).toHaveLength(2)
@@ -211,6 +418,39 @@ test('received is once per accepted identity, including replay preparation and f
   expect(r.logs).toEqual([buildDeliveryDiagnostic(MESSAGE_RECEIVED, r.ref(), deliveryIdentity(item.accepted))])
   expect(JSON.stringify(r.logs)).not.toContain('private accepted body')
 })
+test.each([false, true])('received and delivered logs retain via=thread through real delivery (restart before delivery=%p)', async restart => {
+  let reporting: DeliveryNoticeHarness | undefined
+  const engine = await makeEngineHarness({ onEvent: event => reporting?.reporting.engineEvent(event) })
+  const r = await makeDeliveryNoticeHarness({ queue: engine.queue }); runs.push(r)
+  reporting = r
+  try {
+    const result = await engine.queue.accept('alpha', slackInput({ via: 'thread', thread_ts: THREAD_ROOTS.primary, text: 'private thread reply' }))
+    if (result.status !== 'accepted') throw new Error('thread fixture acceptance failed')
+    if (restart) await engine.restartServer()
+    const item = engine.queue.items('alpha')[0]!
+    expect(item.accepted.via).toBe('thread')
+    expect(item.fixed).toBeUndefined()
+    // Recovered accepted-only work enters the same preparation/reporting path.
+    r.reporting.received('alpha', item)
+    await engine.preparation.prepare('alpha', item)
+    await engine.tick()
+    await engine.until(() => engine.queue.openCount('alpha') === 0)
+    await r.flush()
+    const received = r.logs.filter(line => line.includes(MESSAGE_RECEIVED))
+    const delivered = r.logs.filter(line => line.includes(MESSAGE_DELIVERED))
+    expect(received).toHaveLength(1)
+    expect(delivered).toHaveLength(1)
+    for (const line of [...received, ...delivered]) {
+      expect(line).toContain(' via=thread')
+      expect(line).toContain(`chat_id="${item.accepted.channel}"`)
+      expect(line).not.toContain('private thread reply')
+    }
+    expect(engine.textCalls().map(call => call.params.text)).toEqual(engine.queue.items('alpha')[0]!.fixed!.parts)
+    expect(engine.textCalls()[0]!.params.text).toContain('via="thread"')
+    expect(engine.errors).toEqual([])
+    assertNoLeak(r.logs)
+  } finally { await engine.cleanup() }
+})
 
 describe('Reaction Items: the queue store-failure path and delivered diagnostics only (SR-4.4, SR-8.1, SR-10.1)', () => {
   const preparations: DeliveryPreparation[] = []
@@ -221,10 +461,9 @@ describe('Reaction Items: the queue store-failure path and delivered diagnostics
   /** The b.vki fsync seam: while failing, every journal fsync fails as a full disk. */
   function diskFault() {
     let failing = false
-    const faulty: typeof fs = { ...fs, fsyncSync(fd: number) {
-      if (failing && fs.fstatSync(fd).isFile()) throw Object.assign(new Error(sentinelInMessage('store')), { code: 'ENOSPC' })
-      fs.fsyncSync(fd)
-    } }
+    const faulty = durableIo({ before(step) {
+      if (step.op === 'fsync' && failing && fs.fstatSync(step.fd!).isFile()) throw Object.assign(new Error(sentinelInMessage('store')), { code: 'ENOSPC' })
+    } }).fs
     return { fs: faulty, fail(value = true) { failing = value } }
   }
   type Reactor = { user: string } | { bot_id: string }
@@ -234,7 +473,7 @@ describe('Reaction Items: the queue store-failure path and delivered diagnostics
   function reaction(reactor: Reactor, overrides: { ts?: string; mode?: ReactionAcceptedInput['mode'] } = {}): ReactionAcceptedInput {
     const channel = 'C0ALPHA01', message_ts = '1700000100.000100', ts = overrides.ts ?? '1700000200.000200'
     return { source: 'reaction', text: '', channel, message_ts, ts, change: 'added', emoji: 'eyes', ...reactor, origin: 'slack-event',
-      mode: overrides.mode ?? 'declarative', reaction_key: { chat_id: channel, message_ts, reactor: reactorId(reactor), emoji: 'eyes', change: 'added', event_ts: ts } }
+      mode: overrides.mode ?? 'strict', reaction_key: { chat_id: channel, message_ts, reactor: reactorId(reactor), emoji: 'eyes', change: 'added', event_ts: ts } }
   }
   async function store(r: DeliveryNoticeHarness, input: AcceptedInput): Promise<QueueItem> {
     const result = await r.queue.accept(r.alpha, input)
@@ -247,7 +486,7 @@ describe('Reaction Items: the queue store-failure path and delivered diagnostics
   }
   const slackCalls = (r: DeliveryNoticeHarness) => [...r.h.stubs.values()].flatMap(stub => stub.callLog)
   const receivedLine = (r: DeliveryNoticeHarness, item: QueueItem) => buildDeliveryDiagnostic(MESSAGE_RECEIVED, r.ref(), deliveryIdentity(item.accepted))
-  /** Real preparation with no Slack client: a declarative reaction is fixed, a fungible one withdrawn. */
+  /** Real preparation with no Slack client: a strict-mode reaction is fixed, an open-mode one withdrawn. */
   function preparation(r: DeliveryNoticeHarness) {
     const p = createDeliveryPreparation({ queue: r.queue, clock: r.h.clock, resolveUserName: async (_key, user) => user, clientFor: () => undefined, onReceived: r.reporting.received })
     preparations.push(p); return p
@@ -307,7 +546,7 @@ describe('Reaction Items: the queue store-failure path and delivered diagnostics
     const r = await runWith({ recordQueued: true })
     const slack = await r.accept()
     const kept = await store(r, reaction({ user: 'U0REACTOR' }))
-    const withdrawn = await store(r, reaction({ bot_id: 'B0REACTOR' }, { ts: '1700000200.000201', mode: 'fungible' }))
+    const withdrawn = await store(r, reaction({ bot_id: 'B0REACTOR' }, { ts: '1700000200.000201', mode: 'open' }))
     const prep = preparation(r)
     r.reporting.received(r.alpha, kept)
     for (const item of [slack, kept, withdrawn]) await prep.prepare(r.alpha, item)
@@ -333,7 +572,7 @@ describe('Reaction Items: the queue store-failure path and delivered diagnostics
     const r = await runWith({ recordQueued: true })
     const slack = await r.accept()
     const kept = await store(r, reaction({ user: 'U0REACTOR' }))
-    const withdrawn = await store(r, reaction({ bot_id: 'B0REACTOR' }, { ts: '1700000200.000201', mode: 'fungible' }))
+    const withdrawn = await store(r, reaction({ bot_id: 'B0REACTOR' }, { ts: '1700000200.000201', mode: 'open' }))
     await preparation(r).prepare(r.alpha, withdrawn)
     // Nothing above reported slack or kept received, so final delivery is their first report.
     r.logs.length = 0; r.queued.length = 0
@@ -617,10 +856,10 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
   }
 
   test.each([
-    ['declarative original', false, {}], ['declarative edit', false, edited],
-    ['fungible original', true, {}], ['fungible edit', true, edited],
-  ] as const)('pending DM, %s: exact durable retry cancels at the post boundary', async (_label, fungible, edit) => {
-    const r = await storage({ fungible }), opening = r.hold('open')
+    ['strict original', 'strict', {}], ['strict edit', 'strict', edited],
+    ['open original', 'open', {}], ['open edit', 'open', edited],
+  ] as const)('pending DM, %s: exact durable retry cancels at the post boundary', async (_label, channel_mode, edit) => {
+    const r = await storage({ channel_mode }), opening = r.hold('open')
     await fail(r, edit)
     expect(r.h.stub(r.alpha).calls.conversationsOpen).toHaveLength(1)
     expect(r.h.totalPosts()).toBe(0)
@@ -983,5 +1222,221 @@ describe('b.vki storage-warning recovery through real intake and Slack destinati
     editing.settle({ kind: 'platform', error: 'cant_update_message' }); await r.flush()
     expect(r.h.posts(r.alpha)).toHaveLength(1)
     expect(r.h.clock.pendingCount()).toBe(0)
+  })
+
+  // Ruling 3 of fix Task t2.yiv.5c.zc: the same exact-message tracking through the branch's own posts and Post Holds.
+  describe('composed with own posts and Post Holds', () => {
+    const IDS = STORAGE_NOTICE_IDS
+    /** The fixture message as an unmentioned reply in the earlier root, held while P's own post there is pending. */
+    const reply = (r: StorageNoticeHarness, ts?: string) => ({ thread_ts: IDS.root, text: r.body, ...(ts === undefined ? {} : { ts }) })
+    /** P's own post into the earlier root through the real owner, its Slack answer never given. */
+    async function pendingPost(r: StorageNoticeHarness) {
+      const started = r.observer.start(r.alpha, 'text', { channel: IDS.source, parent: IDS.root }, { kind: 'text', text: 'posted before Slack answers' })
+      if (!started?.ready) throw new Error('fixture own post was not started')
+      await started.ready
+      expect(r.threads!.memory.view(r.alpha, IDS.source, IDS.root)).toBe('not-joined')
+    }
+    const holds = (r: StorageNoticeHarness): unknown[][] => r.queue.items(r.alpha).map(item => [item.accepted.ts, item.hold?.kind, item.hold?.state])
+    /** Flush both fake clocks until `done` holds: real Thread Memory appends settle over several turns. */
+    async function until(r: StorageNoticeHarness, done: () => boolean) {
+      for (let turn = 0; turn < 50 && !done(); turn++) { await r.flush(); await r.threads?.clock.flush() }
+      expect(done()).toBe(true)
+    }
+    const correctionText = (r: StorageNoticeHarness) => formatPersonaNotice(r.config.personas[0]!, buildMessageSavedAfterRetryNotice(r.ref(), IDS.sender))
+    const editFailed = (r: StorageNoticeHarness) => expect.stringContaining(recoveryLine(r, 'edit', { outcome: 'failed', reason: '' }))
+    /** A warning posted to the channel destination, then an edit Slack will refuse: the exact save's
+     * correction falls back to a same-place post, whose Slack answer the caller scripts next. */
+    async function failedEdit(options: Parameters<typeof storage>[0] = {}) {
+      const r = await storage({ destination: 'channel', ...options })
+      r.h.stub(r.alpha).script.post.push({ kind: 'ok', result: { ts: IDS.warningTs } })
+      await fail(r)
+      r.h.stub(r.alpha).script.update.push({ kind: 'platform', error: 'cant_update_message' })
+      return r
+    }
+
+    test('a pending warning is dropped, never posted, when its exact message is saved as a Post Hold', async () => {
+      const r = await storage({ threads: true }), opening = r.hold('open')
+      await pendingPost(r)
+      await fail(r, reply(r))
+      expect(r.h.stub(r.alpha).calls.conversationsOpen).toHaveLength(1)
+      r.failStores(false); await r.receive(reply(r))
+      expect(r.acks).toHaveLength(1)
+      expect(holds(r)).toEqual([[IDS.ts, 'post', 'unresolved']])
+      opening.settle(openedDm(noticeDm)); await r.flush()
+      expect(r.h.totalPosts()).toBe(0)
+      expect(r.h.stub(r.alpha).calls.update).toEqual([])
+      expect(recoveryLines(r)).toEqual([])
+    })
+
+    test('a warning waiting for its own-post intent is dropped when its exact message is saved meanwhile; its operation ends unposted', async () => {
+      const intent = holdOwnPostReady(), recording = makeRecordingOwnPostObserver([{ ready: intent.ready }])
+      const r = await storage({ destination: 'channel', ownPosts: recording.observer })
+      await fail(r)
+      expect(recording.calls).toEqual([expect.objectContaining({ kind: 'start', key: r.alpha, surface: 'notice', target: { channel: IDS.notice } })])
+      await retry(r)
+      intent.resolve(); await r.flush()
+      expect(r.h.totalPosts()).toBe(0)
+      expect(r.h.stub(r.alpha).calls.update).toEqual([])
+      const operation = recording.calls[0]!.kind === 'start' ? recording.calls[0]!.operation : undefined
+      expect(recording.calls.slice(1)).toEqual([{ kind: 'end', operation, answer: { kind: 'failed', code: OWN_POST_CANCELLED } }])
+      expect(recoveryLines(r)).toEqual([])
+    })
+
+    test.each(['answered', 'answered after its bound', 'torn down during its intent'] as const)('an edit failure\'s same-place correction is an own-post operation of the warning\'s kind, ended by Slack\'s answer: %s', async scenario => {
+      const intent = holdOwnPostReady()
+      const recording = makeRecordingOwnPostObserver([{}, scenario === 'torn down during its intent' ? { ready: intent.ready } : {}])
+      const r = await failedEdit({ ownPosts: recording.observer }), correcting = r.hold('post')
+      const web = r.h.stub(r.alpha).web, original = web.chat.postMessage, atCall: string[][] = []
+      web.chat.postMessage = ((...args: Parameters<typeof original>) => {
+        atCall.push(recording.calls.map(call => call.kind)); return original(...args)
+      }) as typeof original
+      await retry(r)
+      // The warning's own operation, then the correction's, started before its Slack call.
+      expect(recording.calls.slice(0, 3)).toEqual([
+        expect.objectContaining({ kind: 'start', surface: 'notice', target: { channel: IDS.notice }, content: { kind: 'text', text: warning(r) } }),
+        expect.objectContaining({ kind: 'end', answer: expect.objectContaining({ kind: 'confirmed', ts: IDS.warningTs }) }),
+        expect.objectContaining({ kind: 'start', key: r.alpha, surface: 'notice', target: { channel: IDS.notice }, content: { kind: 'text', text: correctionText(r) } }),
+      ])
+      const correction = recording.calls[2]!.kind === 'start' ? recording.calls[2]!.operation : undefined
+      if (scenario === 'torn down during its intent') {
+        r.forget(); intent.resolve(); await r.flush()
+        expect(atCall).toEqual([])
+        expect(r.h.posts(r.alpha)).toHaveLength(1)
+        expect(recording.calls.slice(3)).toEqual([{ kind: 'end', operation: correction, answer: { kind: 'failed', code: OWN_POST_CANCELLED } }])
+        expect(recoveryLines(r)).toEqual([editFailed(r)])
+        return
+      }
+      expect(atCall).toEqual([['start', 'end', 'start']])
+      if (scenario === 'answered after its bound') {
+        await r.h.clock.advance(NOTICE_CORRECTION_TIMEOUT_MS)
+        expect(recoveryLines(r)).toEqual([editFailed(r), recoveryLine(r, 'correction', { outcome: 'failed', reason: 'timeout' })])
+        expect(recording.calls).toHaveLength(3)
+      }
+      correcting.settle({ kind: 'ok', result: { ts: IDS.correctionTs } }); await r.flush()
+      expect(recording.calls.slice(3)).toEqual([{ kind: 'end', operation: correction, answer: expect.objectContaining({ kind: 'confirmed', channel: IDS.notice, ts: IDS.correctionTs }) }])
+      expect(recoveryLines(r)).toEqual([editFailed(r), scenario === 'answered'
+        ? recoveryLine(r, 'correction', { outcome: 'success' }) : recoveryLine(r, 'correction', { outcome: 'failed', reason: 'timeout' })])
+      expect(r.h.posts(r.alpha)).toHaveLength(2)
+      expect(r.h.clock.pendingCount()).toBe(0)
+    })
+
+    // Slack's refusal ends the correction's operation as a failed post, and no fault in its own
+    // bookkeeping (on the second operation) changes the correction or its log (SR-3.2.5).
+    test.each(['control', 'refused by Slack', 'start throws', 'ready rejects', 'end throws'] as const)('the correction\'s own operation, %s: one start, then one end with Slack\'s own answer, and the control\'s post and log unless Slack refused it', async scenario => {
+      const fault = new Error('injected own-post bookkeeping fault'), ready = holdOwnPostReady()
+      const correctionStep: OwnPostStep = scenario === 'start throws' ? { throwStart: fault } : scenario === 'end throws' ? { throwEnd: fault }
+        : scenario === 'ready rejects' ? { ready: ready.ready } : {}
+      const recording = makeRecordingOwnPostObserver([{}, correctionStep])
+      const r = await failedEdit({ ownPosts: recording.observer })
+      r.h.stub(r.alpha).script.post.push(scenario === 'refused by Slack' ? { kind: 'platform', error: 'is_archived' } : { kind: 'ok', result: { ts: IDS.correctionTs } })
+      await retry(r)
+      if (scenario === 'ready rejects') {
+        // The correction waits for its intent; a failed intent save must not stop it.
+        expect(r.h.posts(r.alpha)).toHaveLength(1)
+        ready.reject(fault); await r.flush()
+      }
+      expect(r.h.posts(r.alpha)).toEqual([{ channel: IDS.notice, text: warning(r), metadata: SERVER_POST_METADATA }, { channel: IDS.notice, text: correctionText(r), metadata: SERVER_POST_METADATA }])
+      expect(recoveryLines(r)).toEqual([editFailed(r), scenario === 'refused by Slack'
+        ? expect.stringContaining(recoveryLine(r, 'correction', { outcome: 'failed', reason: '' })) : recoveryLine(r, 'correction', { outcome: 'success' })])
+      if (scenario === 'refused by Slack') expect(recoveryLines(r)[1]).toContain('reason=is_archived')
+      const [, , start, ...ends] = recording.calls
+      expect(start).toMatchObject({ kind: 'start', key: r.alpha, surface: 'notice', target: { channel: IDS.notice }, content: { kind: 'text', text: correctionText(r) } })
+      // A throwing start leaves no operation to end; the observer still hears Slack's answer once.
+      const operation = start?.kind === 'start' ? start.operation : undefined
+      expect(operation === undefined).toBe(scenario === 'start throws')
+      expect(ends).toEqual([{ kind: 'end', operation, answer: scenario === 'refused by Slack'
+        ? { kind: 'failed', code: 'is_archived' } : expect.objectContaining({ kind: 'confirmed', channel: IDS.notice, ts: IDS.correctionTs }) }])
+      expect(r.h.clock.pendingCount()).toBe(0)
+    })
+
+    test('in a thread_hybrid notice channel the correction is P\'s own post there: a reply racing it is held, released via thread once Slack confirms it, and a later reply needs no hold', async () => {
+      const r = await failedEdit({ threads: true, noticeDelivery: 'thread_hybrid' })
+      // The real owner keeps the warning's intent before posting it, and its confirmation joins the warning's thread.
+      await until(r, () => r.h.posts(r.alpha).length === 1 && r.threads!.memory.view(r.alpha, IDS.notice, IDS.warningTs) === 'joined')
+      const correcting = r.hold('post')
+      await retry(r)
+      await until(r, () => r.h.posts(r.alpha).length === 2)
+      expect(r.h.posts(r.alpha)[1]).toEqual({ channel: IDS.notice, text: correctionText(r), metadata: SERVER_POST_METADATA })
+      // A reply in the correction's thread, before Slack has answered the correction.
+      const inThread = (ts: string) => ({ channel: IDS.notice, thread_ts: IDS.correctionTs, ts, text: r.body })
+      await r.receive(inThread(IDS.replyTs))
+      expect(r.acks).toHaveLength(3)
+      expect(holds(r)).toEqual([[IDS.ts, undefined, undefined], [IDS.replyTs, 'post', 'unresolved']])
+      expect(r.threads!.memory.view(r.alpha, IDS.notice, IDS.correctionTs)).toBe('not-joined')
+      correcting.settle({ kind: 'ok', result: { ts: IDS.correctionTs } })
+      await until(r, () => holds(r)[1]![2] === 'released')
+      expect(r.threads!.memory.view(r.alpha, IDS.notice, IDS.correctionTs)).toBe('joined')
+      expect(r.queue.items(r.alpha)[1]!.accepted.via).toBe('thread')
+      await r.receive(inThread(IDS.laterReplyTs))
+      expect(r.acks).toHaveLength(4)
+      expect(holds(r).at(-1)).toEqual([IDS.laterReplyTs, undefined, undefined])
+      expect(r.queue.items(r.alpha).at(-1)!.accepted.via).toBe('thread')
+      expect(recoveryLines(r)).toEqual([editFailed(r), recoveryLine(r, 'correction', { outcome: 'success' })])
+      expect(r.h.posts(r.alpha)).toHaveLength(2)
+    })
+
+    test('a posted warning is corrected once after the ack of its exact save as a Post Hold, before release; the release adds nothing', async () => {
+      const r = await storage({ threads: true, destination: 'channel' })
+      await pendingPost(r)
+      r.h.stub(r.alpha).script.post.push({ kind: 'ok', result: { ts: IDS.warningTs } })
+      await fail(r, reply(r))
+      expect(r.h.posts(r.alpha)).toEqual([{ channel: IDS.notice, text: warning(r), metadata: SERVER_POST_METADATA }])
+      r.failStores(false); await r.receive(reply(r))
+      // Nothing before the ack waits on Slack; the held save corrects after it.
+      expect(r.editsAtAck).toEqual([0])
+      const updates = r.h.stub(r.alpha).calls.update
+      expect(updates).toEqual([expect.objectContaining({ channel: IDS.notice, ts: IDS.warningTs })])
+      recovered(r, updates[0]!)
+      expect(recoveryLines(r)).toEqual([recoveryLine(r, 'edit', { outcome: 'success' })])
+      expect(holds(r)).toEqual([[IDS.ts, 'post', 'unresolved']])
+      // A redelivery stores and corrects nothing more.
+      await r.receive(reply(r))
+      expect(r.acks).toHaveLength(2)
+      expect(readQueue(r.root, r.alpha).filter(record => record.kind === 'accepted')).toHaveLength(1)
+      // The post's answer never comes: the hold releases at its deadline, joining nothing.
+      await r.threads!.clock.advance(THREAD_REPLY_HOLD_MS)
+      for (let turn = 0; turn < 20 && holds(r)[0]![2] !== 'released'; turn++) await r.flush()
+      expect(holds(r)).toEqual([[IDS.ts, 'post', 'released']])
+      await r.flush()
+      expect(r.h.stub(r.alpha).calls.update).toHaveLength(1)
+      expect(r.h.posts(r.alpha)).toHaveLength(1)
+      expect(recoveryLines(r)).toHaveLength(1)
+    })
+
+    test('a held save of another message corrects nothing; the exact held save corrects the posted warning once', async () => {
+      const r = await storage({ threads: true })
+      await pendingPost(r)
+      await posted(r, reply(r))
+      r.failStores(false); await r.receive(reply(r, IDS.otherTs))
+      expect(holds(r)).toEqual([[IDS.otherTs, 'post', 'unresolved']])
+      expect(r.h.stub(r.alpha).calls.update).toEqual([])
+      await r.receive(reply(r))
+      expect(r.acks).toHaveLength(2)
+      expect(holds(r)).toEqual([[IDS.otherTs, 'post', 'unresolved'], [IDS.ts, 'post', 'unresolved']])
+      const updates = r.h.stub(r.alpha).calls.update
+      expect(updates).toEqual([expect.objectContaining({ channel: noticeDm, ts: warningTs })])
+      recovered(r, updates[0]!)
+      expect(r.h.posts(r.alpha)).toHaveLength(1)
+    })
+
+    test('a failed store of a mention that joins its thread posts only the ordinary warning, and its exact save corrects it', async () => {
+      const r = await storage({ threads: true, destination: 'channel' })
+      r.h.stub(r.alpha).script.post.push({ kind: 'ok', result: { ts: IDS.warningTs } })
+      await fail(r)
+      // The failed store kept no join; the warning is the plain storage warning.
+      expect(r.threads!.memory.view(r.alpha, IDS.source, IDS.ts)).toBe('not-joined')
+      expect(r.h.posts(r.alpha)).toEqual([{ channel: IDS.notice, text: warning(r), metadata: SERVER_POST_METADATA }])
+      await retry(r)
+      expect(r.queue.items(r.alpha)[0]!.accepted.thread_join).toMatchObject({ thread_ts: IDS.ts })
+      expect(r.threads!.memory.view(r.alpha, IDS.source, IDS.ts)).toBe('joined')
+      const updates = r.h.stub(r.alpha).calls.update
+      expect(updates).toEqual([expect.objectContaining({ channel: IDS.notice, ts: IDS.warningTs })])
+      recovered(r, updates[0]!)
+      expect(r.h.posts(r.alpha)).toHaveLength(1)
+      expect(r.logs.filter(line => line.includes(MESSAGE_NOT_SAVED))).toEqual([
+        expect.stringContaining('count=1'), recoveryLine(r, 'edit', { outcome: 'success' }),
+      ])
+      expect(JSON.stringify(r.captured())).not.toMatch(/participation/i)
+    })
   })
 })

@@ -32,7 +32,8 @@
  * (`describeDestinationFailure`, `describeDestinationFailureCause`).
  *
  * Pure module under test: built over one `makeStubSlack` stub per persona
- * (leak marker on), a line capture and the shared fake clock; no real timer is used;
+ * (leak marker on), a line capture and the shared fake clock; no real timer is used.
+ * Real-owner cases use isolated Thread Memory;
  * `afterEach` runs `assertNoLeak` over every log line and result.
  */
 
@@ -54,6 +55,7 @@ import {
   personaDestinationOf,
   type DestinationConfig,
   type DestinationFailure,
+  type DestinationPosted,
   type DestinationMessageTracking,
   type DestinationPostResult,
   type DestinationSlackClient,
@@ -61,6 +63,9 @@ import {
   type PersonaDestinations,
 } from '../src/persona-destination.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
+import { createOwnPostObserver, ownPostAnswerOfError, type OwnPostObserver } from '../src/own-post.ts'
+import { holdOwnPostReady, makeOwnPostHarness, makeRecordingOwnPostObserver, type OwnPostStep } from './test-helpers/own-post.ts'
+import { SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './test-helpers/persona-config.ts'
 import {
@@ -626,6 +631,211 @@ describe('posting', () => {
 // Never rejects
 // ---------------------------------------------------------------------------
 
+describe('own-post operations', () => {
+  function observed(steps: OwnPostStep[] = []) {
+    const recording = makeRecordingOwnPostObserver(steps)
+    const resolver = createPersonaDestinations({ log: line => logs.push(line), clock,
+      getPersonaConfig: () => ({ channel_mode: 'strict' }), ownPosts: recording.observer })
+    return { ...recording, resolver }
+  }
+
+  test.each(['prompt', 'warning', 'notice'] as const)('%s starts before Slack without a ready wait, and ends once before onPosted and return', async surface => {
+    const { calls, resolver } = observed()
+    const answer = makeDeferredWebApiCall()
+    stub(C).script.post.push(answer.outcome)
+    const message = { text: 'exact notice\nwith whitespace  ', blocks: [{ type: 'section' }] }
+    const atPost: string[][] = [], atCallback: string[][] = [], callbacks: DestinationPosted[] = []
+    const web = stub(C).web, original = web.chat.postMessage
+    web.chat.postMessage = ((...args: Parameters<typeof original>) => {
+      atPost.push(calls.map(c => c.kind))
+      return original(...args)
+    }) as typeof original
+    const pending = resolver.post(C, client(C), message, { surface, onPosted(posted) {
+      atCallback.push(calls.map(c => c.kind)); callbacks.push(posted)
+    } })
+    // No await has occurred: both the start and the actual Slack call exist.
+    expect(calls).toEqual([{ kind: 'start', key: C.key, surface,
+      target: { channel: 'C0CHAN002' }, content: { kind: 'text', text: message.text }, operation: expect.any(Object) }])
+    expect(posts(C)).toEqual([{ channel: 'C0CHAN002', ...message, metadata: SERVER_POST_METADATA }])
+    expect(atPost).toEqual([['start']])
+    await drainMicrotasks()
+    expect(calls).toHaveLength(1)
+    expect(callbacks).toEqual([])
+    answer.settle({ kind: 'ok', result: { ts: '1700000000.000900', message: { thread_ts: '1700000000.000800' } } })
+    const posted = { outcome: 'posted' as const, channelId: 'C0CHAN002', ts: '1700000000.000900' }
+    expect(record(await pending)).toEqual(posted)
+    expect(calls).toHaveLength(2)
+    expect(calls[1]).toEqual({ kind: 'end', operation: calls[0]!.operation,
+      answer: { kind: 'confirmed', channel: 'C0CHAN002', ts: posted.ts, threadTs: '1700000000.000800' } })
+    expect(calls[1]!.operation).toBe(calls[0]!.operation)
+    expect(atCallback).toEqual([['start', 'end']])
+    expect(callbacks).toEqual([posted])
+    results.push(callbacks)
+    expect(logs).toEqual([])
+  })
+
+  test.each(['resolve', 'reject'] as const)('a held ready blocks Slack until it settles (%s), then posts exactly once', async settlement => {
+    const held = holdOwnPostReady(), { calls, resolver } = observed([{ ready: held.ready }])
+    const callbacks: DestinationPosted[] = []
+    const pending = resolver.post(C, client(C), { text: 'waiting' }, { surface: 'notice', onPosted: p => { callbacks.push(p) } })
+    await drainMicrotasks()
+    expect(calls.map(c => c.kind)).toEqual(['start'])
+    expect(posts(C)).toEqual([])
+    expect(callbacks).toEqual([])
+    if (settlement === 'resolve') held.resolve()
+    else held.reject(new Error('injected readiness failure'))
+    const result = record(await pending)
+    expect(result).toMatchObject({ outcome: 'posted', channelId: 'C0CHAN002' })
+    if (result.outcome !== 'posted') throw new Error('expected posted result')
+    expect(callbacks).toEqual([result]); results.push(callbacks)
+    expect(calls.map(c => c.kind)).toEqual(['start', 'end'])
+    expect(posts(C)).toEqual([{ channel: 'C0CHAN002', text: 'waiting', metadata: SERVER_POST_METADATA }])
+    expect(logs).toEqual([])
+  })
+
+  test.each(['platform', 'network', 'sync'] as const)('a %s post failure ends its operation exactly once and never calls onPosted', async kind => {
+    const { calls, resolver } = observed()
+    let synchronousCalls = 0, callbacks = 0
+    if (kind === 'sync') stub(C).web.chat.postMessage = (() => {
+      synchronousCalls++; throw new Error('sync post failure')
+    }) as DestinationSlackClient['chat']['postMessage']
+    else stub(C).script.post.push(kind === 'platform' ? { kind: 'platform', error: 'invalid_blocks' } : { kind: 'network' })
+    const result = record(await resolver.post(C, client(C), { text: 'fails' }, { surface: 'prompt', onPosted: () => { callbacks++ } }))
+    expect(result).toMatchObject({ outcome: 'failed', step: 'chat.postMessage', channelId: 'C0CHAN002' })
+    if (result.outcome !== 'failed') throw new Error('expected failed post')
+    expect(calls).toHaveLength(2)
+    expect(calls[1]).toEqual({ kind: 'end', operation: calls[0]!.operation, answer: ownPostAnswerOfError(result.error) })
+    expect(calls[1]!.operation).toBe(calls[0]!.operation)
+    expect(callbacks).toBe(0)
+    await drainMicrotasks()
+    expect(kind === 'sync' ? synchronousCalls : posts(C).length).toBe(1)
+    expect(logs).toEqual([])
+  })
+
+  test('an ok response without ts ends no-answer and preserves the callback and result', async () => {
+    const { calls, resolver } = observed(), callbacks: DestinationPosted[] = []
+    stub(C).script.post.push({ kind: 'ok', result: { ts: undefined } })
+    const posted = { outcome: 'posted' as const, channelId: 'C0CHAN002', ts: undefined }
+    expect(record(await resolver.post(C, client(C), { text: 'no ts' }, { surface: 'prompt', onPosted: p => { callbacks.push(p) } }))).toEqual(posted)
+    expect(calls).toHaveLength(2)
+    expect(calls[1]).toEqual({ kind: 'end', operation: calls[0]!.operation, answer: { kind: 'no-answer' } })
+    expect(callbacks).toEqual([posted]); results.push(callbacks)
+  })
+
+  test.each(['start', 'end'] as const)('a payload failure with a throwing %s stays failed and is never posted again', async fault => {
+    const error = new Error('injected observer failure')
+    const { calls, resolver } = observed([fault === 'start' ? { throwStart: error } : { throwEnd: error }])
+    stub(C).script.post.push({ kind: 'platform', error: 'invalid_blocks' })
+    let callbacks = 0
+    const result = record(await resolver.post(C, client(C), { text: 'bad payload' }, {
+      surface: 'prompt', onPosted: () => { callbacks++ },
+    }))
+    expect(result).toMatchObject({ outcome: 'failed', step: 'chat.postMessage', code: 'invalid_blocks', channelId: 'C0CHAN002' })
+    expect(calls.map(c => c.kind)).toEqual(['start', 'end'])
+    expect(calls[1]).toMatchObject({ answer: { kind: 'failed', code: 'invalid_blocks' } })
+    await drainMicrotasks()
+    expect(posts(C)).toEqual([{ channel: 'C0CHAN002', text: 'bad payload', metadata: SERVER_POST_METADATA }])
+    expect(callbacks).toBe(0)
+    expect(logs).toEqual([])
+  })
+
+  test('a DM starts only after the open and names the opened conversation', async () => {
+    const { calls, resolver } = observed(), opening = makeDeferredWebApiCall()
+    stub(A).script.open.push(opening.outcome)
+    const pending = resolver.post(A, client(A), { text: 'dm notice' }, { surface: 'notice' })
+    await drainMicrotasks()
+    expect(calls).toEqual([]); expect(posts(A)).toEqual([])
+    const opened = openedDm('D0ALPHADM')
+    if (opened.kind !== 'ok') throw new Error('expected opened DM fixture')
+    opening.settle(opened)
+    const result = record(await pending)
+    expect(result).toMatchObject({ outcome: 'posted', channelId: 'D0ALPHADM' })
+    expect(calls).toHaveLength(2)
+    expect(calls[0]).toMatchObject({ kind: 'start', key: A.key, surface: 'notice',
+      target: { channel: 'D0ALPHADM' }, content: { kind: 'text', text: 'dm notice' } })
+    expect(calls[1]).toMatchObject({ kind: 'end', answer: { kind: 'confirmed', channel: 'D0ALPHADM' } })
+    expect(calls[1]!.operation).toBe(calls[0]!.operation)
+    expect(methods(A)).toEqual(['conversations.open', 'chat.postMessage'])
+  })
+
+  test.each(['no surface', 'DM disabled', 'no contact', 'failed open', 'open without ID'] as const)('%s starts no operation', async kind => {
+    const { calls, resolver } = observed()
+    const persona = kind === 'no surface' ? C : kind === 'DM disabled' ? { ...A, dm: { enabled: false } }
+      : kind === 'no contact' ? { ...A, dm: { enabled: true } } : A
+    if (kind === 'failed open') stub(A).script.open.push({ kind: 'platform', error: 'missing_scope' })
+    if (kind === 'open without ID') stub(A).script.open.push({ kind: 'ok', result: { channel: undefined } })
+    const result = record(await resolver.post(persona, client(persona), { text: 'excluded' }, kind === 'no surface' ? undefined : { surface: 'notice' }))
+    expect(result.outcome).toBe(kind === 'no surface' ? 'posted' : kind.startsWith('open') || kind === 'failed open' ? 'failed' : 'refused')
+    expect(calls).toEqual([])
+    expect(posts(persona)).toHaveLength(kind === 'no surface' ? 1 : 0)
+  })
+
+  const faults = ['no observer', 'start', 'end', 'owner start', 'owner end', 'onPosted', 'no operation'] as const
+  for (const surface of ['prompt', 'warning', 'notice'] as const) {
+    test.each([...faults])(`${surface} with %s preserves one post, callback values and result without logging`, async fault => {
+      const failure = new Error('injected bookkeeping failure')
+      const recording = makeRecordingOwnPostObserver([fault === 'start' ? { throwStart: failure }
+        : fault === 'end' ? { throwEnd: failure } : fault === 'no operation' ? { start: 'undefined' } : {}])
+      let ownerCalls = 0
+      const owner = createOwnPostObserver(() => ({
+        startOperation(...args) {
+          if (fault === 'owner start') { ownerCalls++; throw failure }
+          return recording.observer.start(...args)
+        },
+        endOperation() { ownerCalls++; throw failure },
+      }))
+      const ownPosts: OwnPostObserver | undefined = fault === 'no observer' ? undefined
+        : fault.startsWith('owner') ? owner : recording.observer
+      const resolver = createPersonaDestinations({ log: line => logs.push(line), clock, getPersonaConfig: () => ({ channel_mode: 'strict' }), ownPosts })
+      const callbacks: DestinationPosted[] = []
+      stub(C).script.post.push({ kind: 'ok', result: { ts: '1700000000.000901' } })
+      const result = record(await resolver.post(C, client(C), { text: 'notice' }, { surface, onPosted(posted) {
+        callbacks.push(posted)
+        if (fault === 'onPosted') throw failure
+      } }))
+      const posted = { outcome: 'posted' as const, channelId: 'C0CHAN002', ts: '1700000000.000901' }
+      expect(result).toEqual(posted)
+      expect(callbacks).toEqual([posted]); results.push(callbacks)
+      expect(posts(C)).toEqual([{ channel: 'C0CHAN002', text: 'notice', metadata: SERVER_POST_METADATA }])
+      if (fault.startsWith('owner')) expect(ownerCalls).toBe(1)
+      expect(logs).toEqual([])
+    })
+  }
+})
+
+describe('destination joins through the production owner', () => {
+  test.each(['prompt', 'notice', 'failed', 'off', 'dm', 'intent failure'] as const)('%s preserves posting and records only its eligible join', async scenario => {
+    const channel = SHARED_CHANNEL_IDS.primary, ts = '1700000000.000950'
+    const h = await makeOwnPostHarness(dir, { membership: { channels: [{ id: channel, delivery: scenario === 'off' ? 'off' : 'thread_hybrid' }] } })
+    const slack = makeStubSlack({ leakMarker: LEAK_SENTINEL }), callbacks: DestinationPosted[] = []
+    try {
+      const persona = { ...h.authority.config().personas[0]!, permission_prompts: scenario === 'dm' ? DM_DESTINATION : channel }
+      const resolver = createPersonaDestinations({ log: line => logs.push(line), clock, getPersonaConfig: h.authority.config, ownPosts: h.observer })
+      slack.script.post.push(scenario === 'failed' ? { kind: 'platform', error: 'not_in_channel' } : { kind: 'ok', result: { ts } })
+      if (scenario === 'intent failure') h.io.fail('writeSync')
+      const result = record(await resolver.post(persona, asWebClient(slack.web), { text: 'owner notice' }, {
+        surface: scenario === 'prompt' ? 'prompt' : 'notice', onPosted: p => { callbacks.push(p) },
+      }))
+      await h.flush()
+      expect(slack.calls.postMessage).toHaveLength(1)
+      const target = scenario === 'dm' ? stubOpenedDmId(persona.dm.contact!) : channel
+      expect(result).toMatchObject({ outcome: scenario === 'failed' ? 'failed' : 'posted', channelId: target })
+      expect(callbacks).toEqual(scenario === 'failed' ? [] : [{ outcome: 'posted', channelId: target, ts }])
+      results.push(callbacks)
+      const excluded = scenario === 'off' || scenario === 'dm'
+      expect(h.events.filter(e => e.type === 'registered')).toHaveLength(excluded ? 0 : 1)
+      expect(h.read.pendingOwnPosts(persona.key, target)).toEqual([])
+      expect(h.view(persona.key, target, ts)).toBe(excluded || scenario === 'failed' ? 'not-joined' : 'joined')
+      const records = h.records(persona.key)
+      expect(records.filter(r => r.kind === 'post-intent')).toHaveLength(excluded || scenario === 'intent failure' ? 0 : 1)
+      expect(records.filter(r => r.kind === 'post-outcome').map(r => r.outcome)).toEqual(excluded || scenario === 'intent failure' ? [] : [scenario === 'failed' ? 'none' : 'joined'])
+      if (scenario === 'intent failure') expect(h.owner.memoryOnlyJoins(persona.key)).toEqual([{ channel, root: ts }])
+      expect(logs).toEqual([])
+      assertNoLeak({ result: results, callbacks, logs, owner: h.captured() })
+    } finally { await h.close() }
+  })
+})
+
 describe('never rejects', () => {
   test('a conversations.open that throws synchronously is a failed open, not a rejection', async () => {
     const web = stub(A).web
@@ -820,254 +1030,41 @@ describe('describeDestinationFailureCause (token-safe)', () => {
   })
 })
 
-// ---------------------------------------------------------------------------
-// One destination rule per mode
-// ---------------------------------------------------------------------------
-
-/** The configuration in effect in declarative mode, as the one destination rule reads it. */
-const DECLARATIVE_MODE: DestinationConfig = { allow_invited_channels: false }
-/** The configuration in effect in fungible mode, as the one destination rule reads it. */
-const FUNGIBLE_MODE: DestinationConfig = { allow_invited_channels: true }
-
-/** A channel named by the declarative section (`permission_prompts`). */
-const DECL_CHANNEL = 'C0DECL001'
-/** A channel named by the fungible section (`invited.permission_prompts`). */
-const FUNG_CHANNEL = 'C0FUNG001'
-/** The DM contact of the mode-rule personas. */
-const RULE_CONTACT = 'U0RULE001'
-const DMS_ON = { enabled: true, contact: RULE_CONTACT }
-
-/**
- * The one mode-rule persona, resolved from `spec` as `makeMultiPersonaConfig`
- * resolves it in `mode` (as the loader does, except that a spec field of the
- * section not in force is set as given), under this test's `dir`. Every mode
- * builds it with the same name, so lines from both modes name the same persona.
- */
-function personaIn(mode: DestinationConfig, spec: PersonaSpec): Persona {
-  const config = makeMultiPersonaConfig([{ name: 'Rule Dest', ...spec }], dir, {
-    allow_invited_channels: mode?.allow_invited_channels ?? false,
+describe('one shared destination in strict and open modes', () => {
+  test.each(['strict', 'open'] as const)('%s names permission_prompts for channel and DM destinations', async channel_mode => {
+    const config = { channel_mode }
+    expect(destinationSettingOf()).toBe('permission_prompts')
+    const resolver = createPersonaDestinations({ log: line => logs.push(line), clock, getPersonaConfig: () => config })
+    expect(personaDestinationOf(C)).toBe(C.permission_prompts)
+    expect(resolver.destinationOf(C)).toBe(C.permission_prompts)
+    expect(resolver.destinationOf(A)).toBe('dm')
+    expect(dmDestinationRefusal(config, A)).toBeUndefined()
+    expect(record(await resolver.post(C, client(C), { text: 'channel' }))).toMatchObject({ outcome: 'posted', channelId: C.permission_prompts })
+    expect(record(await resolver.post(A, client(A), { text: 'direct' }))).toMatchObject({ outcome: 'posted' })
+    expect(opens(A)).toEqual([{ users: A.dm.contact! }])
+    expect(stub(B).callLog).toEqual([])
   })
-  return config.personas[0]!
-}
-
-/**
- * A resolver over the configuration in effect `getConfig`, read at each call,
- * whose lines go to `sink` and to the suite's leak check.
- */
-function resolverOn(getConfig: () => DestinationConfig, sink: string[] = []): PersonaDestinations {
-  const log = (line: string): void => {
-    sink.push(line)
-    logs.push(line)
-  }
-  return createPersonaDestinations({ log, clock, getPersonaConfig: getConfig })
-}
-
-describe('destinationSettingOf: the setting in force, pinned per mode', () => {
-  test('declarative mode names permission_prompts; fungible mode names invited.permission_prompts', () => {
-    expect(destinationSettingOf(DECLARATIVE_MODE)).toBe('permission_prompts')
-    expect(destinationSettingOf(FUNGIBLE_MODE)).toBe('invited.permission_prompts')
+  test('a mode-only edit preserves the same destination and DM cache; a destination edit affects the next post', async () => {
+    let config: DestinationConfig = { channel_mode: 'strict' }
+    const resolver = createPersonaDestinations({ log: line => logs.push(line), clock, getPersonaConfig: () => config })
+    await resolver.post(A, client(A), { text: 'first' })
+    config = { channel_mode: 'open' }
+    await resolver.post(A, client(A), { text: 'second' })
+    expect(opens(A)).toHaveLength(1)
+    const changed = { ...A, channels: C.channels, permission_prompts: C.permission_prompts }
+    expect(record(await resolver.post(changed, client(A), { text: 'changed' }))).toMatchObject({ outcome: 'posted', channelId: C.permission_prompts })
+    expect(opens(A)).toHaveLength(1)
+    expect(stub(B).callLog).toEqual([])
   })
-
-  test('with no configuration in effect (before the start resolves) the setting is the declarative one', () => {
-    for (const none of [undefined, null]) expect(destinationSettingOf(none)).toBe(destinationSettingOf(DECLARATIVE_MODE))
-  })
-})
-
-interface RuleRow {
-  mode: DestinationConfig
-  spec: PersonaSpec
-  destination: string
-}
-
-const DECL_CHANNELS = [{ id: DECL_CHANNEL, delivery: 'all' as const }]
-
-const RULE_ROWS: [string, RuleRow][] = [
-  [
-    'declarative mode, permission_prompts "dm": dm',
-    { mode: DECLARATIVE_MODE, spec: { channels: [], dm: DMS_ON, permission_prompts: DM_DESTINATION }, destination: DM_DESTINATION },
-  ],
-  [
-    'declarative mode, permission_prompts a channel: that channel',
-    { mode: DECLARATIVE_MODE, spec: { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL }, destination: DECL_CHANNEL },
-  ],
-  [
-    'fungible mode, invited.permission_prompts a channel: that channel',
-    { mode: FUNGIBLE_MODE, spec: { invited: { permission_prompts: FUNG_CHANNEL } }, destination: FUNG_CHANNEL },
-  ],
-  [
-    'fungible mode, invited.permission_prompts an explicit "dm": dm',
-    { mode: FUNGIBLE_MODE, spec: { dm: DMS_ON, invited: { permission_prompts: DM_DESTINATION } }, destination: DM_DESTINATION },
-  ],
-  [
-    'fungible mode, no invited section: dm by default',
-    { mode: FUNGIBLE_MODE, spec: { dm: DMS_ON }, destination: DM_DESTINATION },
-  ],
-  [
-    'fungible mode, an invited section without permission_prompts: dm by default',
-    { mode: FUNGIBLE_MODE, spec: { dm: DMS_ON, invited: {} }, destination: DM_DESTINATION },
-  ],
-  [
-    'fungible mode ignores a top-level permission_prompts set by spec: the invited.permission_prompts channel',
-    {
-      mode: FUNGIBLE_MODE,
-      spec: { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL, invited: { permission_prompts: FUNG_CHANNEL } },
-      destination: FUNG_CHANNEL,
-    },
-  ],
-  [
-    'fungible mode ignores a top-level permission_prompts set by spec: dm by default when invited is absent',
-    { mode: FUNGIBLE_MODE, spec: { dm: DMS_ON, channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL }, destination: DM_DESTINATION },
-  ],
-  [
-    'declarative mode ignores an invited section: the permission_prompts channel',
-    {
-      mode: DECLARATIVE_MODE,
-      spec: { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL, invited: { permission_prompts: FUNG_CHANNEL } },
-      destination: DECL_CHANNEL,
-    },
-  ],
-  [
-    'declarative mode ignores an invited section: permission_prompts "dm" stays dm beside an invited channel',
-    {
-      mode: DECLARATIVE_MODE,
-      spec: { channels: [], dm: DMS_ON, permission_prompts: DM_DESTINATION, invited: { permission_prompts: FUNG_CHANNEL } },
-      destination: DM_DESTINATION,
-    },
-  ],
-  [
-    'declarative mode ignores a fungible destination set by spec: the permission_prompts channel',
-    {
-      mode: DECLARATIVE_MODE,
-      spec: { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL, invited: { permission_prompts: FUNG_CHANNEL }, fungible_destination: FUNG_CHANNEL },
-      destination: DECL_CHANNEL,
-    },
-  ],
-]
-
-describe('the one destination rule per mode', () => {
-  test.each(RULE_ROWS)('%s', (_label, row) => {
-    const p = personaIn(row.mode, row.spec)
-
-    expect(personaDestinationOf(row.mode, p)).toBe(row.destination)
-    const r = resolverOn(() => row.mode)
-    expect(r.destinationOf(p)).toBe(row.destination)
-    expect(r.settingOf(p)).toBe(destinationSettingOf(row.mode))
-    expect(r.refusalOf(p)).toBeUndefined()
-    expect(dmDestinationRefusal(row.mode, p)).toBeUndefined()
-  })
-
-  test('the declarative-mode rows hold with no configuration in effect too', () => {
-    for (const [, row] of RULE_ROWS.filter(([, r]) => r.mode === DECLARATIVE_MODE)) {
-      const p = personaIn(row.mode, row.spec)
-      for (const none of [undefined, null]) expect(personaDestinationOf(none, p)).toBe(row.destination)
+  test.each(['strict', 'open'] as const)('%s defensively refuses a DM without enabled/contact and makes no Slack call', async channel_mode => {
+    const config = { channel_mode }
+    const resolver = createPersonaDestinations({ log: line => logs.push(line), clock, getPersonaConfig: () => config })
+    for (const dm of [{ enabled: false }, { enabled: true }]) {
+      const persona = { ...A, dm }
+      expect(record(await resolver.post(persona, client(A), { text: 'refused' }))).toEqual({ outcome: 'refused', reason: dm.enabled ? 'no_dm_contact' : 'dm_disabled' })
     }
+    expect(stub(A).callLog).toEqual([])
+    expect(stub(B).callLog).toEqual([])
+    expect(logs.every(line => line.includes('permission_prompts'))).toBe(true)
   })
-})
-
-describe('the resolver in fungible mode', () => {
-  const POST_ROWS: [string, PersonaSpec, 'channel' | 'dm'][] = [
-    ['a channel destination', { dm: DMS_ON, invited: { permission_prompts: FUNG_CHANNEL } }, 'channel'],
-    ['an explicit "dm" destination', { dm: DMS_ON, invited: { permission_prompts: DM_DESTINATION } }, 'dm'],
-    ['a defaulted "dm" destination', { dm: DMS_ON }, 'dm'],
-    ['a defaulted "dm" destination beside a top-level permission_prompts set by spec', { dm: DMS_ON, channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL }, 'dm'],
-  ]
-
-  test.each(POST_ROWS)('%s: the post goes there on the persona\'s own client, with no line', async (_label, spec, kind) => {
-    const p = personaIn(FUNGIBLE_MODE, spec)
-    const own = makeStubSlack({ leakMarker: LEAK_SENTINEL })
-    const r = resolverOn(() => FUNGIBLE_MODE)
-
-    const result = record(await r.post(p, asWebClient(own.web), { text: 'fungible' }))
-
-    const channel = kind === 'channel' ? FUNG_CHANNEL : stubOpenedDmId(RULE_CONTACT)
-    expect(result).toEqual({ outcome: 'posted', channelId: channel, ts: expect.any(String) })
-    expect(own.callLog.map((c) => [c.method, c.args])).toEqual([
-      ...(kind === 'dm' ? [['conversations.open', { users: RULE_CONTACT }]] : []),
-      ['chat.postMessage', { channel, text: 'fungible', metadata: SERVER_POST_METADATA }],
-    ])
-    expect(logs).toEqual([])
-  })
-})
-
-describe('the destination is resolved again at each attempt', () => {
-  test('the switch is read at each attempt, never when the resolver is built: the same persona moves with it, and its DM is opened once', async () => {
-    // Both sections set, as only a spec can: the switch alone picks the one read.
-    const both = personaIn(DECLARATIVE_MODE, { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL, fungible_destination: DM_DESTINATION, dm: DMS_ON })
-    let config = DECLARATIVE_MODE
-    const own = makeStubSlack({ leakMarker: LEAK_SENTINEL })
-    const r = resolverOn(() => config)
-    const attempt = async (text: string) => {
-      const now = { destination: r.destinationOf(both), setting: r.settingOf(both) }
-      return { now, result: record(await r.post(both, asWebClient(own.web), { text })) }
-    }
-
-    const attempts = []
-    for (const [mode, text] of [[DECLARATIVE_MODE, 'declarative 1'], [FUNGIBLE_MODE, 'fungible 1'], [DECLARATIVE_MODE, 'declarative 2'], [FUNGIBLE_MODE, 'fungible 2']] as const) {
-      config = mode
-      attempts.push(await attempt(text))
-    }
-
-    const dm = stubOpenedDmId(RULE_CONTACT)
-    const declarative = { destination: DECL_CHANNEL, setting: destinationSettingOf(DECLARATIVE_MODE) }
-    const fungible = { destination: DM_DESTINATION, setting: destinationSettingOf(FUNGIBLE_MODE) }
-    expect(attempts.map((a) => a.now)).toEqual([declarative, fungible, declarative, fungible])
-    expect(attempts.map((a) => (a.result as { channelId?: string }).channelId)).toEqual([DECL_CHANNEL, dm, DECL_CHANNEL, dm])
-    expect(own.calls.postMessage.map((c) => [(c as { text: string }).text, (c as { channel: string }).channel])).toEqual([
-      ['declarative 1', DECL_CHANNEL],
-      ['fungible 1', dm],
-      ['declarative 2', DECL_CHANNEL],
-      ['fungible 2', dm],
-    ])
-    expect(own.calls.conversationsOpen).toEqual([{ users: RULE_CONTACT }])
-    expect(logs).toEqual([])
-  })
-})
-
-describe('the resolver\'s "dm" refusal in fungible mode names invited.permission_prompts', () => {
-  const DM_STATES: [string, Persona['dm'], DmDestinationRefusal][] = [
-    ['DMs off', { enabled: false, contact: RULE_CONTACT }, 'dm_disabled'],
-    ['no contact', { enabled: true }, 'no_dm_contact'],
-  ]
-  const FORMS: [string, PersonaSpec][] = [
-    ['an explicit "dm"', { invited: { permission_prompts: DM_DESTINATION } }],
-    ['a defaulted "dm"', {}],
-    ['a defaulted "dm" beside a top-level permission_prompts set by spec', { channels: DECL_CHANNELS, permission_prompts: DECL_CHANNEL }],
-  ]
-  const cases = DM_STATES.flatMap(([state, dm, reason]) => FORMS.map(([form, spec]) => [state, form, dm, reason, spec] as const))
-
-  test.each(cases)(
-    '%s, %s: refused with no Slack call; the line names the fungible setting and is otherwise the declarative line',
-    async (_state, _form, dm, reason, spec) => {
-      const fungible = personaIn(FUNGIBLE_MODE, { ...spec, dm })
-      const declarative = personaIn(DECLARATIVE_MODE, { channels: [], permission_prompts: DM_DESTINATION, dm })
-      const fungibleLines: string[] = []
-      const declarativeLines: string[] = []
-      const fungibleStub = makeStubSlack({ leakMarker: LEAK_SENTINEL })
-      const declarativeStub = makeStubSlack({ leakMarker: LEAK_SENTINEL })
-      const fr = resolverOn(() => FUNGIBLE_MODE, fungibleLines)
-      const dr = resolverOn(() => DECLARATIVE_MODE, declarativeLines)
-
-      expect(fr.refusalOf(fungible)).toBe(reason)
-      expect(dmDestinationRefusal(FUNGIBLE_MODE, fungible)).toBe(reason)
-      expect(record(await fr.post(fungible, asWebClient(fungibleStub.web), { text: 'x' }))).toEqual({ outcome: 'refused', reason })
-      expect(record(await dr.post(declarative, asWebClient(declarativeStub.web), { text: 'x' }))).toEqual({ outcome: 'refused', reason })
-
-      expect(fungibleStub.callLog).toEqual([])
-      expect(declarativeStub.callLog).toEqual([])
-      expect(fungibleLines).toHaveLength(1)
-      expect(declarativeLines).toHaveLength(1)
-      const [fungibleLine] = fungibleLines as [string]
-      const [declarativeLine] = declarativeLines as [string]
-      const fungibleSetting = destinationSettingOf(FUNGIBLE_MODE)
-      const declarativeSetting = destinationSettingOf(DECLARATIVE_MODE)
-
-      expect(fungibleLine).toContain(`${renderPersonaRef(fungible.name, fungible.key)} has ${fungibleSetting} set to "${DM_DESTINATION}"`)
-      // Never the top-level setting as the setting named.
-      expect(fungibleLine).not.toContain(`has ${declarativeSetting} `)
-      expect(declarativeLine).toContain(`has ${declarativeSetting} set to "${DM_DESTINATION}"`)
-      // The setting name is the only difference.
-      expect(fungibleLine).not.toBe(declarativeLine)
-      expect(fungibleLine).toBe(declarativeLine.replace(`has ${declarativeSetting} `, `has ${fungibleSetting} `))
-    },
-  )
 })

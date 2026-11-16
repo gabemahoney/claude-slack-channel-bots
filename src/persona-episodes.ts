@@ -1,6 +1,6 @@
 /**
- * persona-episodes.ts — The once-per-episode latch of every per-persona
- * notice kind adds.
+ * persona-episodes.ts — Shared once-per-episode latches for per-persona
+ * notices and log-only diagnostics.
  *
  * An episode is the span in which one notice kind posts at most once for one
  * persona. Each persona key has at most one open episode per kind, and every
@@ -36,6 +36,11 @@
  *   the episode (the `tmux-unresponsive` alert check) is cancelled with it.
  * - `openKeys(kind)` lists the keys with an open episode of the kind; `clock`
  *   is the clock the start times come from.
+ * - `threadStampUndecided` is routing's log-only adapter. Its `begin`
+ *   claims one channel mark in the persona's thread-stamp-undecided episode;
+ *   `end` clears only that channel's mark when its stamp reads decided, and
+ *   closes the episode when no marks remain. Neither calls the notice sink.
+ *   The shared `forget`, `forgetAll` and `close` clear these marks too.
  * - `teardownWindowState(key)` reads the injected teardown query (
  * ; production: the persona notifier's `teardownWindowState`).
  *
@@ -474,7 +479,34 @@ export const PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY = 'slow-dead-sessio
  */
 export const PERSONA_EPISODE_KIND_STUCK_LAUNCH = 'stuck-launch'
 
-/** Every notice kind with a latch here, one per row of the contract table. */
+/** Log-only intake diagnostic, with a separate mark for each undecided channel. */
+export const PERSONA_EPISODE_KIND_THREAD_STAMP_UNDECIDED = 'thread-stamp-undecided'
+
+/** First append/creation failure until every kept fact is saved; Thread Memory
+ * reporting opens notice-only append failures silently. A silent outage that
+ * never posted its report ends without a recovered notice. */
+export const PERSONA_EPISODE_KIND_THREAD_MEMORY_NOT_SAVED = 'thread-memory-not-saved'
+/** Failed read until readable with all kept facts saved, or forgotten; posted by Thread Memory reporting. */
+export const PERSONA_EPISODE_KIND_THREAD_MEMORY_UNREADABLE = 'thread-memory-unreadable'
+/** One read's quarantine or one resolution's withdrawals; Thread Memory reporting posts and ends it immediately. */
+export const PERSONA_EPISODE_KIND_THREAD_MEMORY_JOINS_LOST = 'thread-memory-joins-lost'
+/** A startup/first-read finding until the key is forgotten; Thread Memory reporting posts once per run. */
+export const PERSONA_EPISODE_KIND_THREAD_MEMORY_CHANGED_WHILE_STOPPED = 'thread-memory-changed-while-stopped'
+/** Log-only: first failed journal compaction through a durable rewrite or proved-identical maintenance skip. */
+export const PERSONA_EPISODE_KIND_THREAD_MEMORY_COMPACTION_FAILED = 'thread-memory-compaction-failed'
+/** Log-only: first failed Memory Hold resolution append through a durable requested batch. */
+export const PERSONA_EPISODE_KIND_THREAD_MEMORY_HOLDS_NOT_RESOLVED = 'thread-memory-holds-not-resolved'
+/** Shared-state reporter: first unreadable projection/unsaved evidence through
+ * decided state and membership for all named channels; repair starts silently. */
+export const PERSONA_EPISODE_KIND_SHARED_STATE_UNRESOLVED = 'shared-state-unresolved'
+/** Shared-state reporter: conflicting history or an ended incomplete scan
+ * through a complete scan, no history holds and decided named channels. */
+export const PERSONA_EPISODE_KIND_MEMBERSHIP_EVIDENCE_UNRESOLVED = 'membership-evidence-unresolved'
+/** Shared-state reporter: one definite apply failure per confirmed fingerprint;
+ * ends silently on successful apply or when the persona is forgotten. */
+export const PERSONA_EPISODE_KIND_RELOAD_APPLY_FAILED = 'reload-apply-failed'
+
+/** Every notice or log-only diagnostic kind with a latch here. */
 export const PERSONA_EPISODE_KINDS = [
   'message-not-saved',
   'delivery-stuck',
@@ -489,9 +521,19 @@ export const PERSONA_EPISODE_KINDS = [
   PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR,
   PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY,
   PERSONA_EPISODE_KIND_STUCK_LAUNCH,
+  PERSONA_EPISODE_KIND_THREAD_STAMP_UNDECIDED,
+  PERSONA_EPISODE_KIND_THREAD_MEMORY_NOT_SAVED,
+  PERSONA_EPISODE_KIND_THREAD_MEMORY_UNREADABLE,
+  PERSONA_EPISODE_KIND_THREAD_MEMORY_JOINS_LOST,
+  PERSONA_EPISODE_KIND_THREAD_MEMORY_CHANGED_WHILE_STOPPED,
+  PERSONA_EPISODE_KIND_THREAD_MEMORY_COMPACTION_FAILED,
+  PERSONA_EPISODE_KIND_THREAD_MEMORY_HOLDS_NOT_RESOLVED,
+  PERSONA_EPISODE_KIND_SHARED_STATE_UNRESOLVED,
+  PERSONA_EPISODE_KIND_MEMBERSHIP_EVIDENCE_UNRESOLVED,
+  PERSONA_EPISODE_KIND_RELOAD_APPLY_FAILED,
 ] as const
 
-/** A notice kind with a latch here. */
+/** A notice or log-only diagnostic kind with a latch here. */
 export type PersonaEpisodeKind = (typeof PERSONA_EPISODE_KINDS)[number]
 
 /** The mark a post uses when none is given: a kind with one text posts it at most once per episode. */
@@ -509,7 +551,7 @@ export type PersonaEpisodesClock = PersonaConnectionClock
  * raised during a persona teardown carries its entry's class
  * (`persona-kill-survivor`).
  */
-export type PersonaEpisodeSinkOptions = Pick<PersonaNoticeOptions, 'teardownEntryClass' | 'tracking'>
+export type PersonaEpisodeSinkOptions = Pick<PersonaNoticeOptions, 'teardownEntryClass' | 'personaRef' | 'tracking'>
 
 /**
  * Receives each notice to post: the persona key, the notice body and its
@@ -552,14 +594,26 @@ export interface PersonaEpisodeView {
   readonly startedAt: number
   /** The case it began with, when one was given. */
   readonly caseLabel?: string
-  /** The marks posted in it, in the order posted. */
+  /** The notice or log-only marks claimed in it, in claim order. */
   readonly posted: readonly string[]
+}
+
+/** Routing's log-only adapter; neither method sends a notice to the sink. */
+export interface ThreadStampUndecidedEpisodes {
+  /** Claim this channel's diagnostic once until end or central episode cleanup. False after close. */
+  begin(key: string, channel: string): boolean
+  /** A decided observation ends only this channel's diagnostic episode. */
+  end(key: string, channel: string): void
 }
 
 /** The latches of one server. */
 export interface PersonaEpisodes {
+  /** Read-only shutdown gate for event consumers that also emit log-only diagnostics. */
+  isClosed(): boolean
   /** The clock the episodes' start times come from; a poster's timers for an episode run on it too. */
   readonly clock: PersonaEpisodesClock
+  /** Channel-scoped log marks owned here, cleared by forget, forgetAll and close. */
+  readonly threadStampUndecided: ThreadStampUndecidedEpisodes
   /**
    * Open the persona's episode of this kind, or keep the open one. A case
    * that differs from the open episode's begins a new episode; no case, or
@@ -740,9 +794,28 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
     }
   }
 
-  return {
+  const episodes: PersonaEpisodes = {
     clock,
 
+    threadStampUndecided: {
+      begin(key, channel) {
+        const kind = PERSONA_EPISODE_KIND_THREAD_STAMP_UNDECIDED
+        if (episodes.begin(key, kind) === 'closed') return false
+        const current = open(key, kind)!
+        if (current.posted.has(channel)) return false
+        // Claim before routing logs, without calling the Slack notice sink.
+        current.posted.add(channel)
+        return true
+      },
+      end(key, channel) {
+        const kind = PERSONA_EPISODE_KIND_THREAD_STAMP_UNDECIDED
+        const current = open(key, kind)
+        if (!current?.posted.delete(channel)) return
+        if (current.posted.size === 0) episodes.end(key, kind)
+      },
+    },
+
+    isClosed: () => closed,
     begin(key, kind, caseLabel) {
       if (closed) return 'closed'
       const current = open(key, kind)
@@ -856,6 +929,7 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
       closeAll()
     },
   }
+  return episodes
 }
 
 /** Hand `line` to `log`; a throwing log is swallowed, so no caller throws or rejects because of it. */

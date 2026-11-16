@@ -69,11 +69,13 @@
  * - the completeness guard holds every id from the contract either
  *     in the catalogue or in `NOT_APPLICABLE` with its reason, never both,
  *     and every notice in `NAMED_SLACK_NOTICES` in every variant;
+ *   - the hold settle-failure and no-ts prompt lines are one line of safe
+ *     identifiers that pass `assertNoLeak`;
  *   - self-checks show each pattern finds what it looks for, and that
  *     agent-director's words in a quoted description would fail the checks
  *     if the own-lines helper stopped removing the description.
- * This file pins no notice text: each builder's exact text is asserted in
- * its own suite.
+ * Thread Memory and shared-state text pins live here; other builders pin
+ * their exact text in their own suites.
  *
  * Pure: every builder here is a pure function of its arguments; nothing is
  * started, written or posted. The JSONL safeguard has no pure builder, so it
@@ -146,7 +148,7 @@ import {
   type LatchKind,
   type LatchRecoveryReason,
 } from '../src/conflict-latch.ts'
-import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
+import { DELIVERY_STUCK_AFTER_MS, THREAD_MEMORY_NOTICE_MAX_CHARS } from '../src/delivery-constants.ts'
 import {
   buildDeliveryStuckNotice,
   buildMessageNotSavedNotice,
@@ -192,8 +194,9 @@ import {
   type OutageClass,
 } from '../src/outage-state.ts'
 import { stuckLaunchHeldText, stuckLaunchRelaunchingText } from '../src/pending-row.ts'
-import { buildWedgeWarningText } from '../src/permission-poller.ts'
-import { MAX_LOGGED_MESSAGE_LENGTH } from '../src/persona-connection-errors.ts'
+import { buildPromptPostedWithoutTsLine, buildWedgeWarningText } from '../src/permission-poller.ts'
+import { describeThrownValue, MAX_LOGGED_MESSAGE_LENGTH } from '../src/persona-connection-errors.ts'
+import { buildHoldSettleFailedLine } from '../src/persona-destination-hold.ts'
 import {
   killFailureStoppedRetryText,
   personaUnclassifiedErrorEntryText,
@@ -202,7 +205,7 @@ import {
   tmuxUnresponsiveRecoveryText,
   unclassifiedErrorAlertText,
 } from '../src/persona-episodes.ts'
-import { personaInstanceId, personaTmuxSessionName, tmuxExactSessionTarget } from '../src/persona-identity.ts'
+import { personaInstanceId, personaTmuxSessionName, renderPersonaRef, tmuxExactSessionTarget } from '../src/persona-identity.ts'
 import {
   formatPersonaNotice,
   PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER,
@@ -222,9 +225,34 @@ import {
   waitTimedOutUnreadReport,
   type NotConnectedNotice,
 } from '../src/session-manager.ts'
-import { REDACTED_TOKEN_PLACEHOLDER } from '../src/slack-log-redaction.ts'
+import { REDACTED_TOKEN_PLACEHOLDER, redactSlackLogText } from '../src/slack-log-redaction.ts'
 import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import { slowRecoveryText } from '../src/slow-recovery.ts'
+import {
+  THREAD_MEMORY_SLACK_RETRY_WARNING,
+  THREAD_MEMORY_OWN_POST_LOSS_WARNING,
+  buildThreadMemoryNotSavedNotice, buildThreadMemoryUnreadableNotice,
+  buildThreadMemoryJoinsLostNotice, buildThreadMemoryChangedWhileStoppedNotice,
+  buildThreadMemoryRecoveredNotice,
+  buildThreadMemoryNotSavedLine, buildThreadMemoryUnreadableLine,
+  buildThreadMemoryJoinsLostLine, buildThreadMemoryChangedWhileStoppedLine,
+  buildThreadMemoryRecoveredLine, buildThreadMemoryQuarantinedLine,
+  buildThreadMemoryCompactionFailedLine, buildThreadMemoryRemovalFailedLine,
+  buildThreadMemorySealUnreadableLine, buildThreadMemorySealNotSavedLine,
+  buildThreadMemoryHoldsNotResolvedLine,
+  buildThreadMemoryCompactionRecoveredLine, buildThreadMemorySealSavedLine, buildThreadMemoryHoldsResolvedLine,
+  type ThreadMemoryLoss,
+} from '../src/thread-memory-reports.ts'
+import { THREAD_MEMORY_DIAGNOSTIC_CLASSES, buildPostAcceptPreparationFailedLine } from '../src/persona-diagnostics.ts'
+import { describeSlackCallFailure } from '../src/persona-connection-errors.ts'
+import { PERSONA_DIAGNOSTIC_CLASSES, SHARED_STATE_STAGED_SLACK_RETRY_WARNING } from '../src/persona-diagnostics.ts'
+import {
+  SHARED_STATE_NOTICE_MAX_CHANNELS, SHARED_STATE_DIAGNOSTIC_CLASSES, SHARED_STATE_SLACK_RETRY_WARNING,
+  buildSharedStateUnresolvedNotice, buildMembershipEvidenceUnresolvedNotice, buildSharedStateRecoveredNotice, buildReloadApplyFailedNotice,
+  buildSharedStateDiagnostic, buildSharedStateUnresolvedLine, buildMembershipEvidenceUnresolvedLine, buildSharedStateRecoveredLine,
+  type SharedStateCause, type SharedStateClosing, type SharedStateReportScope,
+  type MembershipHistoryEvidence, type MembershipReportEvidence, type MembershipReportProblem,
+} from '../src/shared-state-reports.ts'
 
 import {
   cannedGetResult,
@@ -257,8 +285,10 @@ import {
   humanOnlySentencesIn,
   sessionEndingCommandsIn,
 } from './test-helpers/conflict-cases.ts'
-import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
+import { assertNoLeak, APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL, sentinelInMessage } from './test-helpers/credentials.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { THREAD_CHANNELS, THREAD_ROOTS, threadPath } from './test-helpers/thread-memory.ts'
+import { channelPopulation, sharedChannelPath, MEMBERSHIP_FIXTURE_TIME } from './test-helpers/shared-channels.ts'
 
 // ---------------------------------------------------------------------------
 // The catalogue
@@ -274,6 +304,8 @@ interface NoticeEntry {
   readonly variant: string
   /** Renders the text; a builder that throws fails its own case. */
   readonly render: () => string
+  /** Exact configured fields, one occurrence each; all other output is leak-checked. */
+  readonly configuredSpans?: readonly string[]
 }
 
 /** The persona the notices concern. */
@@ -287,8 +319,19 @@ function withToken(text: string, label: string): string {
   return `${text} (${sentinelInMessage(label)})`
 }
 
-function entry(group: NoticeGroup, builder: string, variant: string, render: () => string): NoticeEntry {
-  return Object.freeze({ group, builder, variant, render })
+function entry(group: NoticeGroup, builder: string, variant: string, render: () => string, configuredSpans?: readonly string[]): NoticeEntry {
+  return Object.freeze({ group, builder, variant, render, configuredSpans })
+}
+
+/** Mask only an explicitly preserved field, once. A second copy in an error
+ * or an unrelated credential still fails assertNoLeak, even with the same value. */
+function withoutConfiguredSpans(text: string, spans: readonly string[] = []): string {
+  for (const span of spans) {
+    expect(span.length).toBeGreaterThan(0)
+    expect(text).toContain(span)
+    text = text.replace(span, '[configured field]')
+  }
+  return text
 }
 
 /**
@@ -740,6 +783,193 @@ function deliveryEntries(): NoticeEntry[] {
   ]
 }
 
+// Metadata only: these shared fixture identifiers are never read from disk.
+const MEMORY_CHANNELS = [THREAD_CHANNELS.primary, THREAD_CHANNELS.secondary]
+const MEMORY_PATH = threadPath('/scratch/notice-texts', KEY)
+const MEMORY_BODY = 'THREAD-MEMORY-MESSAGE-BODY-MUST-NOT-BE-RENDERED'
+const MEMORY_USER = 'THREAD-MEMORY-USER-NAME-MUST-NOT-BE-RENDERED'
+const MEMORY_FILE = 'thread-memory-private-upload.txt'
+const memoryRef = () => renderPersonaRef(PERSONA.name, KEY)
+function memoryError(path = memoryTokenPath()) {
+  return Object.assign(new Error(`cannot write <journal> & ${sentinelInMessage('memory-error')}; path=${JSON.stringify(path)}`), {
+    code: 'EACCES', data: { text: MEMORY_BODY, user: MEMORY_USER, credentials: LEAK_SENTINEL },
+  })
+}
+const memoryTokenPath = () => threadPath(`/scratch/${fakeToken(BOT_TOKEN_PREFIX, 'memory-path')}/<journal>&`, KEY)
+const MEMORY_CONFIGURED_PATHS = [
+  { label: 'ordinary path', path: MEMORY_PATH },
+  { label: 'bot-token segment and Slack controls', path: memoryTokenPath() },
+  { label: 'app-token segment', path: threadPath(`/scratch/${fakeToken(APP_TOKEN_PREFIX, 'memory-path')}`, KEY) },
+  { label: 'quotes, backslash and line separators', path: threadPath('/scratch/"quoted"\\\r\n\t\u2028\u2029/<journal>&', KEY) },
+]
+/** JSON is the oracle for preserving a path; Unicode line separators must
+ * also be escaped so a diagnostic stays on one physical line. */
+const quotedMemoryPath = (path: string) => JSON.stringify(path).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')
+const MEMORY_CONFIGURED_NAMES = [
+  { label: 'bot-token name', name: fakeToken(BOT_TOKEN_PREFIX, 'configured-name') },
+  { label: 'app-token name', name: fakeToken(APP_TOKEN_PREFIX, 'configured-name') },
+  { label: 'embedded token', name: `Ops ${fakeToken(BOT_TOKEN_PREFIX, 'embedded-name')} bot` },
+  { label: 'quoted name with Slack controls', name: `Ops "<&>" \\ ${fakeToken(APP_TOKEN_PREFIX, 'quoted-name')}` },
+  { label: 'long name has no non-loss excerpt', name: 'Ops 🚀 <&> '.repeat(300) },
+]
+const MEMORY_NON_LOSS_NOTICES = [
+  { builder: buildThreadMemoryNotSavedNotice.name, variant: 'not saved', build: (ref: string) => buildThreadMemoryNotSavedNotice(ref, MEMORY_CHANNELS, MEMORY_PATH, 'journal-append', memoryError()) },
+  { builder: buildThreadMemoryUnreadableNotice.name, variant: 'unreadable', build: (ref: string) => buildThreadMemoryUnreadableNotice(ref, MEMORY_CHANNELS, MEMORY_PATH) },
+  ...(['changed', 'unclean'] as const).map(wording => ({ builder: buildThreadMemoryChangedWhileStoppedNotice.name, variant: wording, build: (ref: string) => buildThreadMemoryChangedWhileStoppedNotice(ref, MEMORY_CHANNELS, wording) })),
+  { builder: buildThreadMemoryRecoveredNotice.name, variant: 'recovered', build: (ref: string) => buildThreadMemoryRecoveredNotice(ref, MEMORY_CHANNELS) },
+]
+type MemoryOwnPostLoss = NonNullable<ThreadMemoryLoss['ownPosts']>[number]
+function memoryOwnPost(overrides: Partial<MemoryOwnPostLoss> = {}): MemoryOwnPostLoss {
+  return Object.assign({ channel: THREAD_CHANNELS.primary, threads: [THREAD_ROOTS.primary, THREAD_ROOTS.secondary], cause: 'several', ...overrides }, {
+    text: MEMORY_BODY, user: MEMORY_USER, file: { name: MEMORY_FILE }, credentials: LEAK_SENTINEL,
+  })
+}
+const MEMORY_LOSSES: readonly (readonly [string, () => ThreadMemoryLoss])[] = [
+  ['threads only', () => ({ threads: [{ channel: THREAD_CHANNELS.primary, root: THREAD_ROOTS.primary }], messages: [] })],
+  ['messages only', () => ({ threads: [], messages: [{ channel: THREAD_CHANNELS.secondary, ts: THREAD_ROOTS.secondary }] })],
+  ['unreadable identities only', () => ({ threads: [], messages: [], unreadableLines: 3 })],
+  ['mixed losses', () => ({
+    threads: [{ channel: THREAD_CHANNELS.primary, root: THREAD_ROOTS.primary }],
+    messages: [{ channel: THREAD_CHANNELS.secondary, ts: THREAD_ROOTS.secondary }], unreadableLines: 3,
+  })],
+  ['identifier overflow', () => ({
+    threads: Array.from({ length: 120 }, (_, i) => ({ channel: THREAD_CHANNELS.primary, root: `1700000000.${String(i).padStart(6, '0')}` })),
+    messages: Array.from({ length: 120 }, (_, i) => ({ channel: THREAD_CHANNELS.secondary, ts: `1700000001.${String(i).padStart(6, '0')}` })),
+    unreadableLines: 3,
+  })],
+  ['lookup named threads', () => ({ threads: [], messages: [], ownPosts: [memoryOwnPost()] })],
+  ['lookup unmatched threads', () => ({ threads: [], messages: [], ownPosts: [memoryOwnPost({ cause: 'unmatched' })] })],
+  ['lookup no named thread', () => ({ threads: [], messages: [], ownPosts: [memoryOwnPost({ threads: [], cause: 'channel_not_found' })] })],
+  ['lookup redacted Slack cause', () => ({ threads: [], messages: [], ownPosts: [memoryOwnPost({ threads: [], cause: `missing_scope\r\n${sentinelInMessage('lookup-code')}\u2028\u2029` })] })],
+  ['lookups mixed with earlier losses', () => ({
+    threads: [{ channel: THREAD_CHANNELS.primary, root: THREAD_ROOTS.primary }],
+    messages: [{ channel: THREAD_CHANNELS.secondary, ts: THREAD_ROOTS.secondary }], unreadableLines: 3,
+    ownPosts: [memoryOwnPost(), memoryOwnPost({ channel: THREAD_CHANNELS.secondary, threads: [], cause: 'not_in_channel' })],
+  })],
+  ['mixed lookup overflow', () => ({
+    threads: [{ channel: THREAD_CHANNELS.secondary, root: THREAD_ROOTS.primary }],
+    messages: [{ channel: THREAD_CHANNELS.secondary, ts: THREAD_ROOTS.secondary }], unreadableLines: 3,
+    ownPosts: [memoryOwnPost({ threads: Array.from({ length: 240 }, (_, i) => `1700000002.${String(i).padStart(6, '0')}`) }),
+      memoryOwnPost({ channel: THREAD_CHANNELS.secondary, threads: [], cause: 'missing_scope' })],
+  })],
+  ['unknown-thread lookup overflow', () => ({
+    threads: [], messages: [], ownPosts: Array.from({ length: 100 }, (_, i) => memoryOwnPost({
+      channel: `C${String(i).padStart(8, '0')}`, threads: [], cause: 'is_archived',
+    })),
+  })],
+]
+function renderMemoryLoss(persona: { name: string; key: string }, loss: ThreadMemoryLoss): string {
+  const notice = buildThreadMemoryJoinsLostNotice(persona, loss)
+  return formatPersonaNotice(persona, notice.text, notice.options)
+}
+const oneThreadLoss = (): ThreadMemoryLoss => ({ threads: [{ channel: THREAD_CHANNELS.primary, root: THREAD_ROOTS.primary }], messages: [] })
+/** A full-name oracle from the small pinned notice, with no budgeting logic. */
+function fullLossForName(name: string): string {
+  const ref = escapeSlackControlCharacters(renderPersonaRef(name, KEY))
+  const small = buildThreadMemoryJoinsLostNotice(PERSONA, oneThreadLoss())
+  return formatPersonaNotice({ name, key: KEY }, small.text.replaceAll(memoryRef(), ref), { personaRef: ref })
+}
+const lastFittingNameLength = () => Math.floor((THREAD_MEMORY_NOTICE_MAX_CHARS - fullLossForName('').length) / 2)
+const MEMORY_NAMES = [
+  { label: 'ordinary name longer than excerpt', name: () => 'Alpha <&> '.repeat(8), excerpt: false },
+  { label: 'just below full-name threshold', name: () => 'N'.repeat(lastFittingNameLength()), excerpt: false },
+  { label: 'just above full-name threshold', name: () => 'N'.repeat(lastFittingNameLength() + 1), excerpt: true },
+  { label: '2100-character name', name: () => 'N'.repeat(2100), excerpt: true },
+  { label: 'Slack escaping alone crosses threshold', name: () => 'N'.repeat(lastFittingNameLength() - 2) + '&', excerpt: true },
+  { label: 'surrogate pair at excerpt boundary', name: () => 'N'.repeat(63) + '🚀' + 'tail'.repeat(600), excerpt: true },
+  { label: 'entity at excerpt boundary', name: () => 'N'.repeat(63) + '&' + '<tail>'.repeat(600), excerpt: true },
+  { label: 'JSON quoting at excerpt boundary', name: () => 'N'.repeat(63) + '"\\' + 'tail'.repeat(600), excerpt: true },
+]
+function threadMemoryEntries(): NoticeEntry[] {
+  const row = (builder: string, variant: string, render: () => string, configuredSpans?: readonly string[]) => entry('thread-memory', builder, variant, render, configuredSpans)
+  const path = escapeSlackControlCharacters(quotedMemoryPath(memoryTokenPath()))
+  return [
+    row(buildThreadMemoryNotSavedNotice.name, 'all channels; token-bearing path and error', () =>
+      formatPersonaNotice(PERSONA, buildThreadMemoryNotSavedNotice(memoryRef(), MEMORY_CHANNELS, memoryTokenPath(), 'journal-append', memoryError())), [`Could not save ${path} (`]),
+    row(buildThreadMemoryUnreadableNotice.name, 'all channels; token-bearing path', () =>
+      formatPersonaNotice(PERSONA, buildThreadMemoryUnreadableNotice(memoryRef(), MEMORY_CHANNELS, memoryTokenPath())), [`Cannot read ${path}.`]),
+    ...(['changed', 'unclean'] as const).map(wording => row(buildThreadMemoryChangedWhileStoppedNotice.name, wording, () =>
+      formatPersonaNotice(PERSONA, buildThreadMemoryChangedWhileStoppedNotice(memoryRef(), MEMORY_CHANNELS, wording)))),
+    row(buildThreadMemoryRecoveredNotice.name, 'all channels', () =>
+      formatPersonaNotice(PERSONA, buildThreadMemoryRecoveredNotice(memoryRef(), MEMORY_CHANNELS))),
+    ...MEMORY_LOSSES.map(([variant, loss]) => row(buildThreadMemoryJoinsLostNotice.name, variant, () => renderMemoryLoss(PERSONA, loss()))),
+    ...MEMORY_NAMES.map(({ label, name }) => row(buildThreadMemoryJoinsLostNotice.name, label, () => renderMemoryLoss({ name: name(), key: KEY }, oneThreadLoss()))),
+    ...MEMORY_CONFIGURED_NAMES.flatMap(({ label, name }) => MEMORY_NON_LOSS_NOTICES.map(({ builder, variant, build }) => {
+      const ref = renderPersonaRef(name, KEY)
+      return row(builder, `${variant}; ${label}`, () => formatPersonaNotice({ name, key: KEY }, build(ref)), [
+        `Persona ${ref}: `, ` — ${escapeSlackControlCharacters(ref)}; channels:`,
+      ])
+    })),
+  ]
+}
+
+// Record keys make additions to the exported unions require a catalogue row.
+const SHARED_CAUSES = { unsynced: true, 'evidence-changed': true, 'restoration-staged': true, 'retirement-unresolved': true, 'not-saved': true } satisfies Record<SharedStateCause, true>
+const SHARED_HISTORY = { 'absence-order': true, 'event-history': true } satisfies Record<MembershipHistoryEvidence, true>
+const SHARED_PROBLEMS = { deadline: true, access: true, authentication: true, 'installation-unverified': true, 'malformed-page': true, 'current-membership-missing': true, 'eligibility-missing': true, 'event-order-conflict': true } satisfies Record<MembershipReportProblem, true>
+const SHARED_CLOSINGS = { state: true, evidence: true, repair: true } satisfies Record<SharedStateClosing, true>
+const sharedCauses = Object.keys(SHARED_CAUSES) as SharedStateCause[]
+const sharedHistory = Object.keys(SHARED_HISTORY) as MembershipHistoryEvidence[]
+const sharedProblems = Object.keys(SHARED_PROBLEMS) as MembershipReportProblem[]
+const sharedClosings = Object.keys(SHARED_CLOSINGS) as SharedStateClosing[]
+const SHARED_CHANNELS = channelPopulation(SHARED_STATE_NOTICE_MAX_CHANNELS + 3).map(c => c.id)
+const SHARED_PATH = sharedChannelPath('/notice-texts-shared-state')
+const sharedRef = () => renderPersonaRef(PERSONA.name, KEY)
+// This directory is a nonsecret configured value, not a credential fixture.
+const sharedTokenPath = () => sharedChannelPath(`/notice-texts-shared-state/${BOT_TOKEN_PREFIX}configured-authority`)
+const sharedFailure = (path = sharedTokenPath()) => `EIO ${sentinelInMessage('authority-failure')}; path=${JSON.stringify(path)}`
+const SHARED_CONFIGURED_FIELDS = [
+  { label: 'ordinary fields', name: PERSONA.name, path: SHARED_PATH },
+  { label: 'URL-like name and nonsecret token-shaped directory', name: 'https://configured.invalid/ops?team=blue', path: sharedTokenPath() },
+  { label: 'token-shaped name and app-token-shaped directory', name: fakeToken(BOT_TOKEN_PREFIX, 'configured-shared-name'), path: sharedChannelPath(`/scratch/${APP_TOKEN_PREFIX}configured-directory`) },
+  { label: 'quotes, backslash, newlines and Slack controls', name: 'Ops "<&>" \\\r\n\t\u2028\u2029', path: sharedChannelPath(`/scratch/"<&>"\\\r\n\t\u2028\u2029/${BOT_TOKEN_PREFIX}configured-directory`) },
+  { label: 'long configured name is not excerpted', name: 'Ops 🚀 <&> '.repeat(300), path: SHARED_PATH },
+]
+// Extra payload fields must never be serialized by these metadata-only builders.
+function sharedScope(overrides: Partial<SharedStateReportScope> = {}): SharedStateReportScope {
+  const scope = { channels: [THREAD_CHANNELS.primary, THREAD_CHANNELS.secondary], text: MEMORY_BODY, user: MEMORY_USER, ...overrides }
+  return scope
+}
+function sharedEvidence(overrides: MembershipReportEvidence): MembershipReportEvidence {
+  const evidence = { text: MEMORY_BODY, user: MEMORY_USER, ...overrides }
+  return evidence
+}
+const SHARED_SCOPE_CASES: readonly (readonly [string, SharedStateReportScope])[] = [
+  ['at bound', sharedScope({ channels: SHARED_CHANNELS.slice(0, SHARED_STATE_NOTICE_MAX_CHANNELS) })],
+  ['over bound', sharedScope({ channels: SHARED_CHANNELS })],
+  ['all and DM', sharedScope({ all: true, dm: true })],
+]
+const SHARED_INVENTORY_SCOPES = SHARED_SCOPE_CASES.map(([label, scope]) => [`inventory ${label}`, { ...scope, all: true }] as const)
+const SHARED_STAGED_SCOPES: readonly (readonly [string, SharedStateReportScope])[] = [
+  ['identical usable projections', sharedScope({ all: true, repairPending: { usable: [THREAD_CHANNELS.primary, THREAD_CHANNELS.secondary], held: [] } })],
+  ['usable and held projections', sharedScope({ all: true, dm: true, repairPending: { usable: [THREAD_CHANNELS.primary], held: [THREAD_CHANNELS.secondary] } })],
+  ['staged over bound', sharedScope({ all: true, channels: SHARED_CHANNELS, repairPending: { held: SHARED_CHANNELS.slice(0, 2), usable: SHARED_CHANNELS.slice(2) } })],
+  ['staged all membership held', sharedScope({ all: true, repairPending: { usable: [], held: [THREAD_CHANNELS.primary, THREAD_CHANNELS.secondary] } })],
+  ['staged empty inventory', sharedScope({ all: true, channels: [], repairPending: { usable: [], held: [] } })],
+]
+function sharedStateEntries(): NoticeEntry[] {
+  const row = (builder: string, variant: string, render: () => string, configuredSpans?: readonly string[]) => entry('shared-state', builder, variant, () => formatPersonaNotice(PERSONA, render()), configuredSpans)
+  const path = escapeSlackControlCharacters(quotedMemoryPath(sharedTokenPath()))
+  return [
+    ...sharedCauses.map(cause => row(buildSharedStateUnresolvedNotice.name, cause, () => buildSharedStateUnresolvedNotice(sharedRef(), sharedScope(), cause, SHARED_PATH))),
+    ...SHARED_INVENTORY_SCOPES.map(([label, scope]) => row(buildSharedStateUnresolvedNotice.name, label, () => buildSharedStateUnresolvedNotice(sharedRef(), scope, 'not-saved', SHARED_PATH))),
+    ...(['authority', 'retired-keys'] as const).map(record => row(buildReloadApplyFailedNotice.name, record,
+      () => buildReloadApplyFailedNotice(sharedRef(), { record, path: sharedTokenPath(), failure: sharedFailure() }),
+      record === 'authority' ? [`the shared channel authority at ${path} (`] : [])),
+    ...sharedHistory.map(evidence => row(buildMembershipEvidenceUnresolvedNotice.name, evidence, () => buildMembershipEvidenceUnresolvedNotice(sharedRef(), sharedScope(), sharedEvidence({ history: [{ channel: THREAD_CHANNELS.primary, evidence }] })))),
+    ...sharedProblems.flatMap(problem => [undefined, 'missing_scope'].map(slackError => row(buildMembershipEvidenceUnresolvedNotice.name, `${problem}; ${slackError ?? 'no slack_error'}`, () => buildMembershipEvidenceUnresolvedNotice(sharedRef(), sharedScope(), sharedEvidence({ problem, slackError, nextAttemptAt: MEMBERSHIP_FIXTURE_TIME }))))),
+    ...sharedClosings.map(closing => row(buildSharedStateRecoveredNotice.name, closing, () => buildSharedStateRecoveredNotice(sharedRef(), sharedScope(), closing))),
+    ...SHARED_SCOPE_CASES.flatMap(([label, scope]) => [
+      row(buildSharedStateUnresolvedNotice.name, label, () => buildSharedStateUnresolvedNotice(sharedRef(), scope, 'unsynced', SHARED_PATH)),
+      row(buildMembershipEvidenceUnresolvedNotice.name, label, () => buildMembershipEvidenceUnresolvedNotice(sharedRef(), scope, sharedEvidence({ history: scope.channels.map(channel => ({ channel, evidence: 'absence-order' })) }))),
+      row(buildSharedStateRecoveredNotice.name, label, () => buildSharedStateRecoveredNotice(sharedRef(), scope, 'repair')),
+    ]),
+    ...SHARED_STAGED_SCOPES.map(([label, scope]) => row(buildSharedStateUnresolvedNotice.name, label, () => buildSharedStateUnresolvedNotice(sharedRef(), scope, 'restoration-staged', SHARED_PATH))),
+    row(buildSharedStateUnresolvedNotice.name, 'token-bearing path and failure', () => buildSharedStateUnresolvedNotice(sharedRef(), sharedScope(), 'unsynced', sharedTokenPath(), sharedFailure()), [`Shared channel authority: ${path} (`]),
+    row(buildMembershipEvidenceUnresolvedNotice.name, 'token-bearing Slack reason', () => buildMembershipEvidenceUnresolvedNotice(sharedRef(), sharedScope(), sharedEvidence({ problem: 'access', slackError: sentinelInMessage('scan-error') }))),
+  ]
+}
+
 /** The JSONL persistence safeguard's storage and AD-reference notices (keeps their text): one per variant. */
 const JSONL_NON_PERSISTENT = 'non-persistent storage'
 const JSONL_ROTATED = 'AD rotated transcript reference'
@@ -929,6 +1159,8 @@ const NOTICE_CATALOGUE: readonly NoticeEntry[] = Object.freeze([
   ...spawnFailureEntries(),
   ...notConnectedEntries(),
   ...deliveryEntries(),
+  ...threadMemoryEntries(),
+  ...sharedStateEntries(),
   ...jsonlSafeguardEntries(),
   ...jsonlDiagnosisEntries(),
   ...capEntries(),
@@ -959,7 +1191,7 @@ const NOT_APPLICABLE: Readonly<Partial<Record<NoticeGroup, string>>> = Object.fr
 })
 
 /** Every id the completeness guard covers: to. */
-const GUARDED_IDS = ['common', 'routing', 'teardown', 'conflict', 'latch-recovery', 'tmux-unresponsive', 'kill-failure', 'invalid-flags', 'unclassified-error', 'slow-recovery', 'queued-delivery', 'permission-wedge', 'startup-errors', 'settings-log', 'startup-summary', 'episodes', 'stuck-launch', 'ad-config-malformed', 'unusable-name', 'launch-start-missing', 'tmux-server-changed'] as const
+const GUARDED_IDS = ['common', 'routing', 'teardown', 'conflict', 'latch-recovery', 'tmux-unresponsive', 'kill-failure', 'invalid-flags', 'unclassified-error', 'slow-recovery', 'queued-delivery', 'permission-wedge', 'startup-errors', 'settings-log', 'startup-summary', 'episodes', 'stuck-launch', 'ad-config-malformed', 'unusable-name', 'launch-start-missing', 'tmux-server-changed', 'thread-memory', 'shared-state'] as const
 
 /**
  * The server notices posted to Slack that names beyond the catalogued
@@ -983,6 +1215,11 @@ const NAMED_SLACK_NOTICES: readonly string[] = Object.freeze([
   buildMessageNotTakenInNotice.name,
   buildMessagesWaitingNotice.name,
   buildQueueRecordUnreadableNotice.name,
+  buildThreadMemoryNotSavedNotice.name,
+  buildThreadMemoryUnreadableNotice.name,
+  buildThreadMemoryJoinsLostNotice.name,
+  buildThreadMemoryChangedWhileStoppedNotice.name,
+  buildThreadMemoryRecoveredNotice.name,
   runPersonaStorageCheck.name,
   runJsonlPersistenceSafeguard.name,
   jsonlRowAbsentInconclusiveNoticeText.name,
@@ -1066,7 +1303,11 @@ describe('no catalogued notice names clear-latch', () => {
 
   test('every rendered text leaks no token: quoted descriptions are redacted', () => {
     const texts = NOTICE_CATALOGUE.map((e) => [e, e.render()] as const)
-    assertNoLeak(Object.fromEntries(texts.map(([e, text]) => [titleOf(e), text])), 'notices')
+    assertNoLeak(Object.fromEntries(texts.map(([e, text]) => [titleOf(e), withoutConfiguredSpans(text, e.configuredSpans)])), 'notices')
+    for (const [, text] of texts) {
+      expect(text).not.toContain(MEMORY_BODY)
+      expect(text).not.toContain(MEMORY_USER)
+    }
     // Not vacuous: the fake tokens reach every builder that quotes agent-director, as its redaction placeholder.
     const redacted = [REDACTED_TOKEN_PLACEHOLDER, escapeSlackControlCharacters(REDACTED_TOKEN_PLACEHOLDER)]
     expect([...new Set(texts.filter(([, text]) => redacted.some((r) => text.includes(r))).map(([e]) => e.group))].sort()).toEqual(([
@@ -1078,6 +1319,8 @@ describe('no catalogued notice names clear-latch', () => {
       "startup-errors",
       "ad-config-malformed",
       "unusable-name",
+      "thread-memory",
+      "shared-state",
     ] as NoticeGroup[]).sort())
   })
 })
@@ -1290,6 +1533,527 @@ const CASES = NOTICE_CATALOGUE.map((e) => [titleOf(e), e] as const)
 /** The entries posted to Slack: every entry outside `LOG_ONLY_GROUPS`. */
 const SLACK_CASES = CASES.filter(([, e]) => !LOG_ONLY_GROUPS.includes(e.group))
 
+describe('Shared-state catalogue content and diagnostic lines', () => {
+  const variants = (builder: string) => NOTICE_CATALOGUE.filter(e => e.group === 'shared-state' && e.builder === builder).map(e => e.variant)
+
+  test('every exported cause, evidence, problem and closing has a catalogue row; no transport or superseded report', () => {
+    expect(variants(buildReloadApplyFailedNotice.name)).toEqual(['authority', 'retired-keys'])
+    expect(variants(buildSharedStateUnresolvedNotice.name)).toEqual([
+      ...sharedCauses, ...SHARED_INVENTORY_SCOPES.map(([label]) => label), ...SHARED_SCOPE_CASES.map(([label]) => label), ...SHARED_STAGED_SCOPES.map(([label]) => label), 'token-bearing path and failure',
+    ])
+    expect(variants(buildMembershipEvidenceUnresolvedNotice.name)).toEqual([
+      ...sharedHistory, ...sharedProblems.flatMap(problem => [`${problem}; no slack_error`, `${problem}; missing_scope`]),
+      ...SHARED_SCOPE_CASES.map(([label]) => label), 'token-bearing Slack reason',
+    ])
+    expect(variants(buildSharedStateRecoveredNotice.name)).toEqual([...sharedClosings, ...SHARED_SCOPE_CASES.map(([label]) => label)])
+    expect([...sharedCauses, ...sharedHistory, ...sharedProblems, ...sharedClosings].filter(v => ['transport', 'superseded'].includes(v))).toEqual([])
+    expect(SHARED_STATE_DIAGNOSTIC_CLASSES).toEqual(['shared-state-unresolved', 'membership-evidence-unresolved', 'shared-state-recovered'])
+    for (const kind of SHARED_STATE_DIAGNOSTIC_CLASSES) expect(PERSONA_DIAGNOSTIC_CLASSES.filter(value => value === kind)).toHaveLength(1)
+  })
+
+  test('notice texts, actions, repair limits and diagnostic actions (one literal pin)', () => {
+    for (const record of ['authority', 'retired-keys'] as const) {
+      const text = buildReloadApplyFailedNotice(sharedRef(), { record, path: SHARED_PATH, failure: 'EIO' })
+      expect(text).toBe(`:warning: *Configuration change not applied* — ${sharedRef()}; could not write ${record === 'authority' ? `the shared channel authority at ${JSON.stringify(SHARED_PATH)}` : 'the retired-key record'} (EIO). Nothing in the confirmed change was applied. This persona and every other persona keep running as before, and the change stays pending. Fix the cause, for example disk space or permissions, then review the pending change again and confirm it afresh; a failed confirmation is not reused.`)
+      const redacted = buildReloadApplyFailedNotice(sharedRef(), { record, path: sharedTokenPath(), failure: sharedFailure() })
+      const fields = record === 'authority' ? [`the shared channel authority at ${escapeSlackControlCharacters(quotedMemoryPath(sharedTokenPath()))} (`] : []
+      assertNoLeak(withoutConfiguredSpans(redacted, fields))
+      expect(redacted).not.toContain(MEMORY_BODY)
+      expect(redacted).not.toContain(MEMORY_USER)
+    }
+    expect(SHARED_STATE_NOTICE_MAX_CHANNELS).toBe(20)
+    expect(SHARED_STATE_SLACK_RETRY_WARNING).toBe('Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.')
+    expect(SHARED_STATE_STAGED_SLACK_RETRY_WARNING).toBe('Only messages whose intake is held remain unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.')
+    const ref = sharedRef(), scope = sharedScope(), channels = scope.channels.join(', ')
+    const continuing = 'Other channels and personas, and already accepted queues, keep working.'
+    const warning = SHARED_STATE_SLACK_RETRY_WARNING
+    const causes: Record<SharedStateCause, readonly [string, string]> = {
+      unsynced: ["A shared-state write was renamed but not synced. CSCB finishes it at its next configuration checks once the state directory can be synced. Check the disk and filesystem. If the file changes meanwhile, existing recovery can still finish when the exact pending bytes return and synchronization succeeds. If that recovery cannot finish, use reviewed restoration, or explicit replacement when restoration is impossible, as the debugging skill's reload-shared-recovery entry describes, then restart.", 'finish the write at configuration checks; check disk/filesystem; if evidence changes, existing recovery can still finish when exact pending bytes return and sync succeeds; if recovery cannot finish, use reviewed restoration or explicit replacement and restart'],
+      'evidence-changed': ["The file no longer holds what CSCB wrote, so CSCB won't guess. Preserve the evidence. Existing recovery can still finish without restarting when the exact pending bytes return and synchronization succeeds. If that recovery cannot finish, use reviewed restoration, or explicit replacement when restoration is impossible, as the debugging skill's reload-shared-recovery entry describes, then restart. Choices that cannot be restored are lost and must be set again.", 'preserve evidence; existing recovery can still finish without restarting when exact pending bytes return and sync succeeds; if recovery cannot finish, use reviewed restoration or explicit replacement and restart; unrestorable choices must be set again'],
+      'restoration-staged': ['A reviewed restoration is staged. Restart CSCB to review and confirm it; staging alone does not complete the repair.', 'restart to review and confirm staged restoration; channel lists describe membership readiness only; thread-dependent replies in thread_hybrid channels stay held and unacknowledged while Channel Stamps are undecided; otherwise eligible @mentions, Broadcasts and other intake independent of Channel Stamps continue'],
+      'retirement-unresolved': ["A confirmed change's persona retirement could not be finished or undone. CSCB retries at each configuration check. Check the state directory's disk; the retirement must be recovered before affected intake resumes.", 'retirement recovery retries at configuration checks; check the state directory disk'],
+      'not-saved': ["CSCB could not save membership evidence for these channels. It retries reconciliation in the background. Check the state directory's disk; retries cannot restore events Slack no longer sends.", 'membership reconciliation retries in the background; check the state directory disk'],
+    }
+    for (const cause of sharedCauses) {
+      const held = cause === 'restoration-staged' ? 'Messages in the affected channels stay held.' : 'Messages there stay held.'
+      const causeWarning = cause === 'restoration-staged' ? SHARED_STATE_STAGED_SLACK_RETRY_WARNING : warning
+      expect(buildSharedStateUnresolvedNotice(ref, scope, cause, SHARED_PATH)).toBe(`:warning: *Channel state unresolved* — ${ref}; channels: ${channels}. Shared channel authority: ${JSON.stringify(SHARED_PATH)}. ${causes[cause][0]} ${held} ${continuing} ${causeWarning}`)
+      expect(buildSharedStateUnresolvedLine(KEY, scope, cause, SHARED_PATH)).toBe(`[slack] shared-state-unresolved: persona=${KEY} cause=${cause} channels=${JSON.stringify(scope.channels)} path=${JSON.stringify(SHARED_PATH)} ${causes[cause][1]}. ${causeWarning}`)
+    }
+    const inventory = { ...scope, all: true }
+    expect(buildSharedStateUnresolvedNotice(ref, inventory, 'not-saved', SHARED_PATH)).toBe(`:warning: *Channel state unresolved* — ${ref}; membership inventory incomplete; known channels: ${channels}. Shared channel authority: ${JSON.stringify(SHARED_PATH)}. CSCB could not save a complete membership inventory. It retries reconciliation in the background. Check the state directory's disk; retries cannot restore events Slack no longer sends. Verified usable channels keep working. Only intake depending on missing membership evidence stays held and unacknowledged. Recovery requires a complete membership inventory. ${continuing} ${warning}`)
+    expect(buildSharedStateUnresolvedLine(KEY, inventory, 'not-saved', SHARED_PATH)).toBe(`[slack] shared-state-unresolved: persona=${KEY} cause=not-saved scope=inventory known_channels=${JSON.stringify(scope.channels)} path=${JSON.stringify(SHARED_PATH)} complete membership inventory not saved; verified usable channels keep working; only intake depending on missing membership evidence stays held and unacknowledged; recovery requires a complete membership inventory; membership reconciliation retries in the background; check the state directory disk. ${warning}`)
+    const history: Record<MembershipHistoryEvidence, string> = {
+      'absence-order': 'the bot was seen absent, but CSCB cannot tell whether that leave came before or after a choice confirmed meanwhile',
+      'event-history': 'a membership event conflicts with recorded history',
+    }
+    const evidenceTail = ` Messages whose eligibility depends on this missing evidence stay held. ${continuing} Elapsed time does not establish missing evidence. ${warning}`
+    for (const evidence of sharedHistory) {
+      const facts = sharedEvidence({ history: [{ channel: THREAD_CHANNELS.primary, evidence }] })
+      expect(buildMembershipEvidenceUnresolvedNotice(ref, scope, facts)).toBe(`:warning: *Channel membership evidence unresolved* — ${ref}; channels: ${channels}. ${THREAD_CHANNELS.primary}: ${history[evidence]}. Retries, reconciliation and time cannot settle this history; only reviewed recovery can, through an explicit absence replacement for the channel or reviewed restoration.${evidenceTail}`)
+      expect(buildMembershipEvidenceUnresolvedLine(KEY, scope, facts, SHARED_PATH)).toBe(`[slack] membership-evidence-unresolved: persona=${KEY} cause=history channels=${JSON.stringify(scope.channels)} path=${JSON.stringify(SHARED_PATH)} missing_evidence=[${THREAD_CHANNELS.primary}:${evidence}] history needs explicit absence replacement or reviewed restoration; retries and time cannot settle it. ${warning}`)
+    }
+    const problems: Record<MembershipReportProblem, string> = {
+      deadline: "Slack's membership list could not be read in time. CSCB retries; if this continues, check Slack's status and the workspace size.",
+      access: 'The bot lacks a scope or channel access needed to read membership. Add the scope named in the debugging skill and reinstall; retries alone cannot fix it.',
+      authentication: "Slack refused the bot's credentials. Fix the bot token through a confirmed configuration change; retries alone cannot fix it.",
+      'installation-unverified': 'CSCB could not verify the app installation. Check the installation and its credentials; retries alone cannot fix it.',
+      'malformed-page': 'Slack returned a membership page CSCB cannot read. CSCB retries; the incomplete page establishes no missing fact.',
+      'current-membership-missing': "A complete scan still left current membership undecided for these channels. CSCB retries; check the debugging skill's current-membership-missing entry.",
+      'eligibility-missing': "A complete scan still left channel eligibility undecided. CSCB retries; check the debugging skill's eligibility-missing entry.",
+      'event-order-conflict': "A complete scan still left membership event order undecided. CSCB retries; check the debugging skill's event-order-conflict entry.",
+    }
+    for (const problem of sharedProblems) for (const slackError of [undefined, 'missing_scope']) {
+      const facts = sharedEvidence({ problem, slackError, nextAttemptAt: MEMBERSHIP_FIXTURE_TIME })
+      expect(buildMembershipEvidenceUnresolvedNotice(ref, scope, facts)).toBe(`:warning: *Channel membership evidence unresolved* — ${ref}; channels: ${channels}.  ${problems[problem]}${slackError ? ` Slack reason: ${slackError}.` : ''} Next attempt at: ${MEMBERSHIP_FIXTURE_TIME}.${evidenceTail}`)
+      expect(buildMembershipEvidenceUnresolvedLine(KEY, scope, facts, SHARED_PATH)).toBe(`[slack] membership-evidence-unresolved: persona=${KEY} cause=scan-ended channels=${JSON.stringify(scope.channels)} path=${JSON.stringify(SHARED_PATH)} problem=${problem}${slackError ? ` slack_error=${slackError}` : ''} next_attempt_at=${MEMBERSHIP_FIXTURE_TIME} background scans retry; restore the named access, authorization, installation or membership evidence; retries and time do not establish missing facts. ${warning}`)
+    }
+    for (const closing of sharedClosings) {
+      expect(buildSharedStateRecoveredNotice(ref, scope, closing)).toBe(`:white_check_mark: *Channel state recovered* — ${ref}; channels: ${channels}. ${closing === 'repair' ? "The reviewed restoration or replacement is applied and this persona's current membership is verified. " : ''}The channel state and current membership for these channels are trustworthy again; held messages there are decided now. Slack retries are finite. Messages Slack stopped retrying meanwhile are not recovered; send missing messages again.`)
+      expect(buildSharedStateRecoveredLine(KEY, scope, closing, SHARED_PATH)).toBe(`[slack] shared-state-recovered: persona=${KEY} cause=${closing} closed=${closing} channels=${JSON.stringify(scope.channels)} path=${JSON.stringify(SHARED_PATH)} state and current membership trustworthy; held messages are decided now. Slack retries are finite; messages Slack stopped retrying are not recovered.`)
+    }
+    for (const [label, staged] of SHARED_STAGED_SCOPES.filter(([, scope]) => scope.channels.length <= SHARED_STATE_NOTICE_MAX_CHANNELS)) {
+      const pending = staged.repairPending!
+      const status = `Repair is pending for this persona. Membership decided: ${pending.usable.join(', ') || 'none'}. Membership unresolved (intake held): ${pending.held.join(', ') || 'none'}${staged.dm ? '; DMs are held too' : ''}. These lists describe membership readiness only. Thread-dependent replies in thread_hybrid channels stay held and unacknowledged while Channel Stamps are undecided. Otherwise eligible @mentions, Broadcasts and other intake independent of Channel Stamps continue.`
+      const text = buildSharedStateUnresolvedNotice(ref, staged, 'restoration-staged', SHARED_PATH)
+      expect(text, label).toBe(`:warning: *Channel state unresolved* — ${ref}; all its channels; repair pending. Shared channel authority: ${JSON.stringify(SHARED_PATH)}. ${causes['restoration-staged'][0]} ${status} ${continuing} ${SHARED_STATE_STAGED_SLACK_RETRY_WARNING}`)
+      expect(text).not.toContain('Still usable:')
+      expect(text).not.toContain('Held: none')
+      const line = buildSharedStateUnresolvedLine(KEY, staged, 'restoration-staged', SHARED_PATH)
+      expect(line, label).toBe(`[slack] shared-state-unresolved: persona=${KEY} cause=restoration-staged scope=all channels=${JSON.stringify(staged.channels)}${staged.dm ? ' dm=true' : ''} repair_pending=true membership_decided=${JSON.stringify(pending.usable)} membership_held=${JSON.stringify(pending.held)} path=${JSON.stringify(SHARED_PATH)} ${causes['restoration-staged'][1]}. ${SHARED_STATE_STAGED_SLACK_RETRY_WARNING}`)
+      expect(line).not.toMatch(/ (?:usable|held)=/)
+    }
+  })
+
+  test.each(SHARED_SCOPE_CASES)('%s names every channel within the shared bound, the remainder and affected DM', (_label, scope) => {
+    const notices = [
+      [buildSharedStateUnresolvedNotice(sharedRef(), scope, 'unsynced', SHARED_PATH), false],
+      [buildMembershipEvidenceUnresolvedNotice(sharedRef(), scope, sharedEvidence({ history: scope.channels.map(channel => ({ channel, evidence: 'absence-order' })) })), false],
+      [buildSharedStateRecoveredNotice(sharedRef(), scope, 'repair'), false],
+      [buildSharedStateUnresolvedNotice(sharedRef(), { ...scope, all: true }, 'not-saved', SHARED_PATH), true],
+    ] as const
+    for (const [text, inventory] of notices) {
+      expect(text).toContain(sharedRef())
+      for (const channel of scope.channels.slice(0, SHARED_STATE_NOTICE_MAX_CHANNELS)) expect(text).toContain(channel)
+      for (const channel of scope.channels.slice(SHARED_STATE_NOTICE_MAX_CHANNELS)) expect(text).not.toContain(channel)
+      const remaining = scope.channels.length - SHARED_STATE_NOTICE_MAX_CHANNELS
+      if (remaining > 0) expect(text).toContain(`and ${remaining} more`)
+      else expect(text).not.toContain(' more')
+      expect(text.includes('all its channels')).toBe(scope.all === true && !inventory)
+      expect(text.includes('membership inventory incomplete; known channels:')).toBe(inventory)
+      expect(text.includes('DMs also affected')).toBe(scope.dm === true)
+    }
+    assertNoLeak(notices)
+  })
+
+  test('staged membership lists share one display budget; no channel beyond it leaks through the heading', () => {
+    const scope = SHARED_STAGED_SCOPES.find(([label]) => label === 'staged over bound')![1]
+    const text = buildSharedStateUnresolvedNotice(sharedRef(), scope, 'restoration-staged', SHARED_PATH)
+    for (const channel of SHARED_CHANNELS.slice(0, SHARED_STATE_NOTICE_MAX_CHANNELS)) expect(text).toContain(channel)
+    for (const channel of SHARED_CHANNELS.slice(SHARED_STATE_NOTICE_MAX_CHANNELS)) expect(text).not.toContain(channel)
+    expect(text).toContain(`and ${SHARED_CHANNELS.length - SHARED_STATE_NOTICE_MAX_CHANNELS} more`)
+    assertNoLeak(text)
+  })
+
+  test.each(SHARED_CONFIGURED_FIELDS.flatMap(fields => [false, true].map(all => ({ ...fields, all }))))('$label: all diagnostic variants preserve the full configured path and redact failures (all=$all)', ({ path, all }) => {
+    const scope = sharedScope({ channels: SHARED_CHANNELS, all, dm: true })
+    const failure = sharedFailure(path)
+    const lines: Array<readonly [string, string, boolean?, boolean?]> = [
+      ...sharedCauses.map(cause => [SHARED_STATE_DIAGNOSTIC_CLASSES[0], buildSharedStateUnresolvedLine(KEY,
+        cause === 'restoration-staged' ? { ...scope, repairPending: { usable: SHARED_CHANNELS, held: [] } } : scope,
+        cause, path, failure), cause === 'not-saved' && all, cause === 'restoration-staged'] as const),
+      ...sharedHistory.map(evidence => [SHARED_STATE_DIAGNOSTIC_CLASSES[1], buildMembershipEvidenceUnresolvedLine(KEY, scope, sharedEvidence({ history: SHARED_CHANNELS.map(channel => ({ channel, evidence })) }), path, failure)] as const),
+      ...sharedProblems.flatMap(problem => [undefined, 'missing_scope'].map(slackError => [SHARED_STATE_DIAGNOSTIC_CLASSES[1], buildMembershipEvidenceUnresolvedLine(KEY, scope, sharedEvidence({ problem, slackError, nextAttemptAt: MEMBERSHIP_FIXTURE_TIME }), path, failure)] as const)),
+      ...sharedClosings.map(closing => [SHARED_STATE_DIAGNOSTIC_CLASSES[2], buildSharedStateRecoveredLine(KEY, scope, closing, path, failure)] as const),
+    ]
+    expect([...new Set(lines.map(([kind]) => kind))]).toEqual([...SHARED_STATE_DIAGNOSTIC_CLASSES])
+    for (const [kind, line, inventory = false, staged = false] of lines) {
+      assertNoLeak(withoutConfiguredSpans(line, [` path=${quotedMemoryPath(path)} `]))
+      expect(line).toStartWith(`[slack] ${kind}: persona=${KEY} `)
+      expect(line).not.toMatch(/[\r\n\u2028\u2029]/)
+      expect(line).toContain(` ${inventory ? 'known_channels' : 'channels'}=${JSON.stringify(SHARED_CHANNELS)}`)
+      expect(line).toContain(`path=${quotedMemoryPath(path)}`)
+      const actualPath = line.match(/ path=("(?:[^"\\]|\\.)*") /)![1]!
+      expect(JSON.parse(actualPath)).toBe(path)
+      expect(line).toContain(redactSlackLogText(failure).replace(/[\r\n\u2028\u2029]/g, ' '))
+      expect(line.includes('scope=all')).toBe(all && !inventory)
+      expect(line.includes('scope=inventory')).toBe(inventory)
+      expect(line).toContain('dm=true')
+      expect(line).not.toContain(MEMORY_BODY)
+      expect(line).not.toContain(MEMORY_USER)
+      if (kind !== SHARED_STATE_DIAGNOSTIC_CLASSES[2]) expect(line).toContain(staged ? SHARED_STATE_STAGED_SLACK_RETRY_WARNING : SHARED_STATE_SLACK_RETRY_WARNING)
+    }
+    for (const evidence of sharedHistory) {
+      const line = buildMembershipEvidenceUnresolvedLine(KEY, scope, { history: SHARED_CHANNELS.map(channel => ({ channel, evidence })) }, SHARED_PATH)
+      for (const channel of SHARED_CHANNELS) expect(line).toContain(`${channel}:${evidence}`)
+    }
+  })
+
+  test('staging diagnostics retain every decided/held membership channel and the generic line builder sanitizes each field', () => {
+    for (const [, scope] of SHARED_STAGED_SCOPES) {
+      const line = buildSharedStateUnresolvedLine(KEY, scope, 'restoration-staged', SHARED_PATH)
+      expect(line).toContain(`repair_pending=true membership_decided=${JSON.stringify(scope.repairPending!.usable)} membership_held=${JSON.stringify(scope.repairPending!.held)}`)
+      assertNoLeak(line)
+    }
+    for (const kind of SHARED_STATE_DIAGNOSTIC_CLASSES) {
+      const line = buildSharedStateDiagnostic(kind, `${KEY}\n${fakeToken(BOT_TOKEN_PREFIX, 'key')}`, `identity\r${fakeToken(APP_TOKEN_PREFIX, 'identity')}`, `detail\u2028${sentinelInMessage('detail')}\u2029`)
+      expect(line).not.toMatch(/[\r\n\u2028\u2029]/)
+      assertNoLeak(line)
+    }
+  })
+
+  test.each(SHARED_CONFIGURED_FIELDS)('$label: all four notices preserve configured fields and redact untrusted failures', ({ name, path }) => {
+    const ref = renderPersonaRef(name, KEY)
+    const escapedRef = escapeSlackControlCharacters(ref).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')
+    const quotedPath = escapeSlackControlCharacters(quotedMemoryPath(path))
+    const failure = `${sharedFailure(path)}\n<&>`
+    const safeFailure = escapeSlackControlCharacters(redactSlackLogText(failure).replace(/[\r\n\u2028\u2029]/g, ' '))
+    const rendered: Array<{ text: string; pathField?: string; hasFailure: boolean }> = [
+      { text: buildSharedStateUnresolvedNotice(ref, sharedScope(), 'unsynced', path, failure), pathField: `Shared channel authority: ${quotedPath} (`, hasFailure: true },
+      { text: buildSharedStateUnresolvedNotice(ref, SHARED_STAGED_SCOPES[0]![1], 'restoration-staged', path, failure), pathField: `Shared channel authority: ${quotedPath} (`, hasFailure: true },
+      ...[false, true].map(all => ({ text: buildSharedStateUnresolvedNotice(ref, sharedScope({ all }), 'not-saved', path, failure), pathField: `Shared channel authority: ${quotedPath} (`, hasFailure: true })),
+      { text: buildMembershipEvidenceUnresolvedNotice(ref, sharedScope(), sharedEvidence({ problem: 'access', slackError: failure })), hasFailure: true },
+      { text: buildSharedStateRecoveredNotice(ref, sharedScope(), 'repair'), hasFailure: false },
+      ...(['authority', 'retired-keys'] as const).map(record => ({
+        text: buildReloadApplyFailedNotice(ref, { record, path, failure }),
+        pathField: record === 'authority' ? `the shared channel authority at ${quotedPath} (` : undefined,
+        hasFailure: true,
+      })),
+    ]
+    for (const { text, pathField, hasFailure } of rendered) {
+      const fields = [` — ${escapedRef}; `, ...(pathField ? [pathField] : [])]
+      assertNoLeak(withoutConfiguredSpans(text, fields))
+      expect(text).toContain(` — ${escapedRef}; `)
+      if (pathField) expect(text).toContain(pathField)
+      if (hasFailure) {
+        expect(text).toContain(safeFailure)
+        expect(text).toContain(escapeSlackControlCharacters(REDACTED_TOKEN_PLACEHOLDER))
+      }
+      expect(text).not.toMatch(/[\r\n\u2028\u2029]/)
+      expect(text).not.toContain('<&>')
+      expect(text).not.toContain('&amp;lt;')
+      expect(text).not.toContain(MEMORY_BODY)
+      expect(text).not.toContain(MEMORY_USER)
+      // Only the designated occurrence is allowed. A duplicate configured
+      // path in untrusted failure text must still trip the credential audit.
+      for (const leak of [sharedTokenPath(), fakeToken(APP_TOKEN_PREFIX, 'unrelated-shared-credential')]) {
+        expect(() => assertNoLeak(withoutConfiguredSpans(`${text} error=${leak}`, fields))).toThrow('assertNoLeak')
+      }
+    }
+  })
+})
+
+describe('Thread Memory catalogue content and loss budget', () => {
+  test('the catalogue retains every loss variant and name boundary', () => {
+    expect(NOTICE_CATALOGUE.filter(e => e.builder === buildThreadMemoryJoinsLostNotice.name).map(e => e.variant)).toEqual([
+      ...MEMORY_LOSSES.map(([label]) => label), ...MEMORY_NAMES.map(row => row.label),
+    ])
+    expect(NOTICE_CATALOGUE.filter(e => e.builder === buildThreadMemoryChangedWhileStoppedNotice.name).map(e => e.variant)).toEqual([
+      'changed', 'unclean', ...MEMORY_CONFIGURED_NAMES.flatMap(({ label }) => [`changed; ${label}`, `unclean; ${label}`]),
+    ])
+  })
+
+  test('notice texts and the final Slack-message bound (one literal pin)', () => {
+    expect(THREAD_MEMORY_NOTICE_MAX_CHARS).toBe(4000)
+    expect(THREAD_MEMORY_SLACK_RETRY_WARNING).toBe("If CSCB also can't save this bot's incoming messages, Slack retries each a limited number of times and can turn off the app's events. Check the app's Event Subscriptions page in Slack for disabled events; after storage works, send missing messages again.")
+    expect(THREAD_MEMORY_OWN_POST_LOSS_WARNING).toBe("Joins from the bot's own posts are lost if CSCB stops before they are saved.")
+    const ref = memoryRef(), channels = MEMORY_CHANNELS.join(', ')
+    const error = Object.assign(new Error('storage unavailable'), { code: 'EIO' })
+    const warning = THREAD_MEMORY_SLACK_RETRY_WARNING
+    expect(buildThreadMemoryNotSavedNotice(ref, MEMORY_CHANNELS, MEMORY_PATH, 'journal-append', error)).toBe(
+      `:warning: *Thread Memory not saved* — ${ref}; channels: ${channels}. Could not save ${JSON.stringify(MEMORY_PATH)} (journal-append): Error code=EIO message="storage unavailable". Joins are kept and will be saved once storage works. ${THREAD_MEMORY_OWN_POST_LOSS_WARNING} Check the file's permissions and storage. ${warning}`,
+    )
+    expect(buildThreadMemoryUnreadableNotice(ref, MEMORY_CHANNELS, MEMORY_PATH)).toBe(
+      `:warning: *Thread Memory unreadable* — ${ref}; channels: ${channels}. Cannot read ${JSON.stringify(MEMORY_PATH)}. Replies in this bot's threads are saved and wait until Thread Memory can be read. ${THREAD_MEMORY_OWN_POST_LOSS_WARNING} ${warning} Fix the file's permissions or storage. To start this bot's Thread Memory empty, stop CSCB, move the journal aside and start CSCB again; a Thread Memory changed while stopped report follows, and Joins lost names waiting replies to send again.`,
+    )
+    for (const [wording, sentence] of [
+      ['changed', 'Some Joined Threads may be missing, or may be ones the bot should have forgotten.'],
+      ['unclean', "CSCB didn't shut down cleanly, so it can't tell whether Thread Memory changed."],
+    ] as const) {
+      expect(buildThreadMemoryChangedWhileStoppedNotice(ref, MEMORY_CHANNELS, wording)).toBe(
+        `:warning: *Thread Memory changed while stopped* — ${ref}; channels: ${channels}. ${sentence} CSCB uses the Thread Memory it found. Check the threads the bot should be in; a new @mention puts it back in a thread.`,
+      )
+    }
+    expect(buildThreadMemoryRecoveredNotice(ref, MEMORY_CHANNELS)).toBe(
+      `:white_check_mark: *Thread Memory recovered* — ${ref}; channels: ${channels}. Thread Memory can be read and every kept join is saved.`,
+    )
+    const loss = MEMORY_LOSSES.find(([label]) => label === 'mixed losses')![1]()
+    expect(buildThreadMemoryJoinsLostNotice(PERSONA, loss)).toEqual({
+      text: `:warning: *Joins lost* — ${ref} is no longer in the listed threads. A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot. 3 quarantined line(s) have no readable thread identity.\nThread: ${THREAD_CHANNELS.primary} / ${THREAD_ROOTS.primary}.\nSend again: ${THREAD_CHANNELS.secondary} / ${THREAD_ROOTS.secondary}.`,
+      options: { personaRef: ref },
+    })
+    const lookupLoss = MEMORY_LOSSES.find(([label]) => label === 'lookups mixed with earlier losses')![1]()
+    expect(buildThreadMemoryJoinsLostNotice(PERSONA, lookupLoss)).toEqual({
+      text: `${buildThreadMemoryJoinsLostNotice(PERSONA, loss).text}\nThread: ${THREAD_CHANNELS.primary} / ${THREAD_ROOTS.primary}.\nThread: ${THREAD_CHANNELS.primary} / ${THREAD_ROOTS.secondary}.\nThe thread for a post by the bot in ${THREAD_CHANNELS.secondary} couldn't be found.`,
+      options: { personaRef: ref },
+    })
+  })
+
+  test.each(threadMemoryEntries().filter(e => [buildThreadMemoryNotSavedNotice.name, buildThreadMemoryUnreadableNotice.name].includes(e.builder)))(
+    '$builder: $variant carries the shared own-post warning once and preserves the notice budget', e => {
+      const text = e.render()
+      expect(text.split(THREAD_MEMORY_OWN_POST_LOSS_WARNING)).toHaveLength(2)
+      // Configured names stay intact; the existing long-name exception is
+      // covered below. Ordinary catalogue renderings still fit the bound.
+      if (!e.variant.includes('long name')) expect(text.length).toBeLessThanOrEqual(THREAD_MEMORY_NOTICE_MAX_CHARS)
+      assertNoLeak(withoutConfiguredSpans(text, e.configuredSpans))
+      expect(text).not.toContain(MEMORY_BODY)
+      expect(text).not.toContain(MEMORY_USER)
+    },
+  )
+
+  test.each(MEMORY_LOSSES)('%s retains complete ordered identifiers or an exact count, and logs every loss', (_label, makeLoss) => {
+    const loss = makeLoss()
+    const notice = buildThreadMemoryJoinsLostNotice(PERSONA, loss)
+    const text = renderMemoryLoss(PERSONA, loss)
+    const line = buildThreadMemoryJoinsLostLine(PERSONA, loss)
+    assertNoLeak({ text, line })
+    const identifiers = [
+      ...loss.threads.map(t => `Thread: ${t.channel} / ${t.root}.`),
+      ...loss.messages.map(m => `Send again: ${m.channel} / ${m.ts}.`),
+      ...(loss.ownPosts ?? []).flatMap(post => {
+        // Fitting fragments supply wording; independent channel/root checks
+        // prevent a builder that silently drops lookup identifiers passing.
+        const entries = post.threads.length ? post.threads.map(root => [root]) : [[]]
+        return entries.map(threads => {
+          const fragment = buildThreadMemoryJoinsLostNotice(PERSONA, {
+            threads: [], messages: [], ownPosts: [{ ...post, threads }],
+          }).text.split('\n')[1]!
+          expect(fragment).toContain(post.channel)
+          for (const root of threads) expect(fragment).toContain(root)
+          return fragment
+        })
+      }),
+    ]
+    const [, ...bodyLines] = notice.text.split('\n')
+    const hasCount = bodyLines.at(-1)?.includes('more thread/message entry(s)') ?? false
+    const kept = hasCount ? bodyLines.slice(0, -1) : bodyLines
+    expect(kept).toEqual(identifiers.slice(0, kept.length))
+    expect(text.length).toBeLessThanOrEqual(THREAD_MEMORY_NOTICE_MAX_CHARS)
+    const omitted = identifiers.length - kept.length
+    if (omitted) {
+      expect(kept.length).toBeGreaterThan(0)
+      expect(bodyLines.at(-1)).toBe(`${omitted} more thread/message entry(s); see the server log for all identifiers.`)
+      expect(line.length).toBeGreaterThan(THREAD_MEMORY_NOTICE_MAX_CHARS)
+    } else {
+      expect(hasCount).toBe(false)
+      expect(kept).toEqual(identifiers)
+    }
+    // The full heading is a fitting builder result, pinned above; overflow
+    // may change the display reference but must not truncate operator advice.
+    const heading = buildThreadMemoryJoinsLostNotice(PERSONA, { threads: [], messages: [], unreadableLines: loss.unreadableLines }).text
+    expect(notice.text.split('\n')[0]).toBe(heading.replaceAll(memoryRef(), notice.options.personaRef))
+    if (loss.unreadableLines) expect(line).toContain(`unreadable_lines=${loss.unreadableLines}`)
+    for (const t of loss.threads) expect(line).toContain(`channel=${t.channel} root=${t.root}`)
+    for (const m of loss.messages) expect(line).toContain(`channel=${m.channel} ts=${m.ts}`)
+    for (const post of loss.ownPosts ?? []) {
+      const safeCause = redactSlackLogText(post.cause).replace(/[\r\n\u2028\u2029]/g, ' ')
+      expect(line).toContain(`channel=${post.channel} threads=${JSON.stringify(post.threads)} cause=${safeCause}`)
+    }
+    expect(line).toStartWith('[slack]')
+    expect(line).toContain(`bot=${memoryRef()}`)
+    expect(line).not.toMatch(/[\r\n\u2028\u2029]/)
+    for (const output of [text, line]) {
+      expect(output).not.toContain(MEMORY_BODY)
+      expect(output).not.toContain(MEMORY_USER)
+      expect(output).not.toContain(MEMORY_FILE)
+    }
+  })
+
+  test.each(MEMORY_NAMES)('$label budgets the escaped prefix and body together; the log retains the full name', ({ label, name, excerpt }) => {
+    const persona = Object.freeze({ name: name(), key: KEY })
+    const before = { ...persona }, full = fullLossForName(persona.name)
+    const notice = buildThreadMemoryJoinsLostNotice(persona, oneThreadLoss())
+    const text = formatPersonaNotice(persona, notice.text, notice.options)
+    const line = buildThreadMemoryJoinsLostLine(persona, oneThreadLoss())
+    expect(full.length > THREAD_MEMORY_NOTICE_MAX_CHARS).toBe(excerpt)
+    if (label.startsWith('just ')) expect(Math.abs(full.length - THREAD_MEMORY_NOTICE_MAX_CHARS)).toBeLessThanOrEqual(2)
+    if (label === 'Slack escaping alone crosses threshold') {
+      expect(full.replaceAll('&amp;', '&').length).toBeLessThanOrEqual(THREAD_MEMORY_NOTICE_MAX_CHARS)
+    }
+    const displayName = excerpt ? Array.from(persona.name).slice(0, 64).join('') + '…' : persona.name
+    const ref = escapeSlackControlCharacters(renderPersonaRef(displayName, KEY))
+    expect(notice.options).toEqual({ personaRef: ref })
+    expect(text).toBe(fullLossForName(displayName))
+    expect(text.split(ref)).toHaveLength(3) // exactly the prefix and body
+    expect(text.length).toBeLessThanOrEqual(THREAD_MEMORY_NOTICE_MAX_CHARS)
+    expect(text).not.toContain('&amp;lt;')
+    expect(text).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u)
+    expect(line).toContain(`bot=${renderPersonaRef(persona.name, KEY)}`)
+    expect(line).toContain(`channel=${THREAD_CHANNELS.primary} root=${THREAD_ROOTS.primary}`)
+    expect(persona).toEqual(before)
+    assertNoLeak({ text, line })
+  })
+
+  test.each(MEMORY_CONFIGURED_NAMES)('$label is preserved in all five non-loss wordings', ({ name, label }) => {
+    const ref = renderPersonaRef(name, KEY), escaped = escapeSlackControlCharacters(ref)
+    const persona = Object.freeze({ name, key: KEY })
+    for (const { variant, build } of MEMORY_NON_LOSS_NOTICES) {
+      const body = build(ref), text = formatPersonaNotice(persona, body)
+      // Reuse the pinned ordinary notice as the content oracle: only the
+      // configured reference changes, never its channels, advice or error.
+      expect({ variant, body }).toEqual({ variant, body: build(memoryRef()).replace(memoryRef(), escaped) })
+      expect(text).toStartWith(`Persona ${ref}: `)
+      expect(body).toContain(` — ${escaped}; channels:`)
+      expect(body).not.toContain('&amp;lt;')
+      if (label.startsWith('long name')) expect(text.length).toBeGreaterThan(THREAD_MEMORY_NOTICE_MAX_CHARS)
+      assertNoLeak(withoutConfiguredSpans(text, [`Persona ${ref}: `, ` — ${escaped}; channels:`]))
+      expect(text).not.toContain(MEMORY_BODY)
+      expect(text).not.toContain(MEMORY_USER)
+    }
+    expect(persona).toEqual({ name, key: KEY })
+  })
+
+  test.each(MEMORY_CONFIGURED_PATHS)('$label is preserved and quoted in both path-bearing notices', ({ path }) => {
+    const quoted = escapeSlackControlCharacters(quotedMemoryPath(path))
+    const error = memoryError(path)
+    const rendered = [
+      [buildThreadMemoryNotSavedNotice(memoryRef(), MEMORY_CHANNELS, path, 'journal-append', error), `Could not save ${quoted} (`],
+      [buildThreadMemoryUnreadableNotice(memoryRef(), MEMORY_CHANNELS, path), `Cannot read ${quoted}.`],
+    ] as const
+    for (const [body, field] of rendered) {
+      const text = formatPersonaNotice(PERSONA, body)
+      expect(text).toContain(field)
+      expect(text).not.toContain('<journal>')
+      expect(text).not.toContain('&amp;lt;')
+      expect(text).not.toMatch(/[\r\n\u2028\u2029]/)
+      expect(text).not.toContain(MEMORY_BODY)
+      expect(text).not.toContain(MEMORY_USER)
+      assertNoLeak(withoutConfiguredSpans(text, [field]))
+    }
+    expect(rendered[0][0]).toContain(escapeSlackControlCharacters(REDACTED_TOKEN_PLACEHOLDER))
+  })
+
+  test('metadata projection ignores extra message and user fields; only configured fields bypass error redaction', () => {
+    const contaminated = {
+      threads: [{ channel: THREAD_CHANNELS.primary, root: THREAD_ROOTS.primary, text: MEMORY_BODY, user: MEMORY_USER, credentials: LEAK_SENTINEL }],
+      messages: [{ channel: THREAD_CHANNELS.secondary, ts: THREAD_ROOTS.secondary, text: MEMORY_BODY, user: MEMORY_USER, credentials: LEAK_SENTINEL }],
+      ownPosts: [memoryOwnPost(), memoryOwnPost({ threads: [], cause: fakeToken(APP_TOKEN_PREFIX, 'lookup-code') })],
+      text: MEMORY_BODY, user: MEMORY_USER,
+    }
+    const captured = [
+      renderMemoryLoss(PERSONA, contaminated), buildThreadMemoryJoinsLostLine(PERSONA, contaminated),
+      ...threadMemoryEntries().map(e => withoutConfiguredSpans(e.render(), e.configuredSpans)),
+    ]
+    assertNoLeak(captured)
+    for (const text of captured) {
+      expect(text).not.toContain(MEMORY_BODY)
+      expect(text).not.toContain(MEMORY_USER)
+      expect(text).not.toContain(MEMORY_FILE)
+    }
+    for (const e of threadMemoryEntries().filter(e => e.variant.includes('token-bearing'))) {
+      const text = e.render()
+      if (e.builder === buildThreadMemoryNotSavedNotice.name) expect(text).toContain(escapeSlackControlCharacters(REDACTED_TOKEN_PLACEHOLDER))
+      expect(text).toContain(escapeSlackControlCharacters(quotedMemoryPath(memoryTokenPath())))
+      expect(text).toContain('&lt;journal&gt;&amp;')
+      expect(text).not.toContain('<journal>')
+      expect(text).not.toContain('&amp;lt;')
+    }
+  })
+
+  test('configured-field masking still rejects the same path, name or a different credential outside those fields', () => {
+    const path = memoryTokenPath(), name = MEMORY_CONFIGURED_NAMES[0]!.name
+    const ref = renderPersonaRef(name, KEY)
+    const body = buildThreadMemoryNotSavedNotice(ref, MEMORY_CHANNELS, path, 'journal-append', memoryError(path))
+    const text = formatPersonaNotice({ name, key: KEY }, body)
+    const fields = [`Persona ${ref}: `, ` — ${escapeSlackControlCharacters(ref)}; channels:`, `Could not save ${escapeSlackControlCharacters(quotedMemoryPath(path))} (`]
+    assertNoLeak(withoutConfiguredSpans(text, fields))
+    for (const leak of [path, ref, fakeToken(APP_TOKEN_PREFIX, 'unrelated-credential')]) {
+      expect(() => assertNoLeak(withoutConfiguredSpans(`${text} error=${leak}`, fields))).toThrow('assertNoLeak')
+    }
+  })
+})
+
+describe('Thread Memory diagnostic builders', () => {
+  function rows(path: string, error: Error) {
+    const channels = MEMORY_CHANNELS
+    const loss = MEMORY_LOSSES.find(([label]) => label === 'mixed losses')![1]()
+    return [
+      ['thread-memory-not-saved', KEY, buildThreadMemoryNotSavedLine(KEY, channels, path, 'journal-append', error), path],
+      ['thread-memory-not-saved', KEY, buildThreadMemoryNotSavedLine(KEY, channels, path, 'journal-append', error, true), path],
+      ['thread-memory-unreadable', KEY, buildThreadMemoryUnreadableLine(KEY, channels, path, error), path],
+      ['thread-memory-unreadable', KEY, buildThreadMemoryUnreadableLine(KEY, channels, path, undefined, true), path],
+      ['thread-memory-joins-lost', KEY, buildThreadMemoryJoinsLostLine(PERSONA, loss)],
+      ['thread-memory-changed-while-stopped', KEY, buildThreadMemoryChangedWhileStoppedLine(KEY, channels, 'journal-changed', 'changed')],
+      ['thread-memory-changed-while-stopped', KEY, buildThreadMemoryChangedWhileStoppedLine(KEY, channels, 'unclean-stop', 'unclean')],
+      ['thread-memory-recovered', KEY, buildThreadMemoryRecoveredLine(KEY, channels)],
+      ['thread-memory-quarantined', KEY, buildThreadMemoryQuarantinedLine(KEY, path, 4, 1), path],
+      ['thread-memory-compaction-failed', KEY, buildThreadMemoryCompactionFailedLine(KEY, path, 'journal-rewrite', error), path],
+      ['thread-memory-removal-failed', KEY, buildThreadMemoryRemovalFailedLine(KEY, path, 'unlink', error), path],
+      ['thread-memory-seal-unreadable', 'all', buildThreadMemorySealUnreadableLine(path, error), path],
+      ...[false, true].map(unsynced => ['thread-memory-seal-not-saved', 'all', buildThreadMemorySealNotSavedLine(path, error, unsynced), path]),
+      ['thread-memory-holds-not-resolved', KEY, buildThreadMemoryHoldsNotResolvedLine(KEY, error)],
+      ['thread-memory-compaction-recovered', KEY, buildThreadMemoryCompactionRecoveredLine(KEY, path), path],
+      ['thread-memory-seal-saved', 'all', buildThreadMemorySealSavedLine(path), path],
+      ['thread-memory-holds-resolved', KEY, buildThreadMemoryHoldsResolvedLine(KEY)],
+    ]
+  }
+
+  test.each(MEMORY_CONFIGURED_PATHS)('$label: every exported class retains configured fields, redacts errors and renders one log line', ({ path }) => {
+    const rendered = rows(path, memoryError(path))
+    expect([...new Set(rendered.map(([kind]) => kind))].sort()).toEqual([...THREAD_MEMORY_DIAGNOSTIC_CLASSES].sort())
+    for (const [kind, key, line, configuredPath] of rendered) {
+      expect(line!).toStartWith(`[slack] ${kind}: persona=${key} `)
+      expect(line!).not.toMatch(/[\r\n\u2028\u2029]/)
+      expect(line!).not.toContain(MEMORY_BODY)
+      expect(line!).not.toContain(MEMORY_USER)
+      const fields = configuredPath === undefined ? [] : [` path=${quotedMemoryPath(configuredPath)} `]
+      assertNoLeak(withoutConfiguredSpans(line!, fields))
+      if (configuredPath !== undefined) {
+        expect(line!).toContain(fields[0]!)
+        // Decode the actual field, not a re-rendered value: quotes, newlines,
+        // backslashes, token-shaped segments and Slack markup all round-trip.
+        const actual = line!.match(/ path=("(?:[^"\\]|\\.)*") /)![1]!
+        expect(JSON.parse(actual)).toBe(path)
+        expect(line!).not.toContain('&lt;journal&gt;')
+      }
+    }
+    expect(rendered.filter(([, , , configuredPath]) => configuredPath !== undefined)).toHaveLength(12)
+    for (const [, , line] of rendered.filter(([, , line]) => line!.includes('code='))) {
+      expect(line!).toContain('code=EACCES')
+      expect(line!).toContain(`cannot write <journal> & ${REDACTED_TOKEN_PLACEHOLDER}`)
+    }
+  })
+
+  test('diagnostic identities and operator actions (one literal pin)', () => {
+    const c = `channels=${JSON.stringify(MEMORY_CHANNELS)}`, p = `path=${JSON.stringify(MEMORY_PATH)}`
+    const error = new Error('storage unavailable'), cause = 'Error message="storage unavailable"'
+    const expected = [
+      `${c} step=journal-append ${p} ${cause}; joins kept, saving retried; check permissions/storage. ${THREAD_MEMORY_SLACK_RETRY_WARNING}`,
+      `${c} step=journal-append ${p} ${cause}; notice's own join bookkeeping failed; no notice posted; joins kept, saving retried; check permissions/storage. ${THREAD_MEMORY_SLACK_RETRY_WARNING}`,
+      `${c} ${p} ${cause}; replies saved and waiting; fix permissions/storage, or stop CSCB, move the journal aside and start again. ${THREAD_MEMORY_SLACK_RETRY_WARNING}`,
+      `${c} ${p} journal missing on retry; Thread Memory stays unknown until the next start; waiting replies remain saved`,
+      `threads=[channel=${THREAD_CHANNELS.primary} root=${THREAD_ROOTS.primary}] messages=[channel=${THREAD_CHANNELS.secondary} ts=${THREAD_ROOTS.secondary}] unreadable_lines=3 bot no longer in these threads; a new @mention puts it back; send each listed message again if meant for the bot bot=${memoryRef()}`,
+      `${c} case=journal-changed wording=changed Joined Threads may be missing or ones the bot should have forgotten; check threads, a new @mention puts the bot back`,
+      `${c} case=unclean-stop wording=unclean CSCB didn't shut down cleanly; cannot tell whether Thread Memory changed; check threads, a new @mention puts the bot back`,
+      `${c} Thread Memory readable; every kept join saved`,
+      `lines=4 invalid_final_lines=1 ${p} invalid lines quarantined; an invalid final line has no Joins lost report`,
+      `step=journal-rewrite ${p} ${cause}; compaction not confirmed; journal retained, retried at maintenance`,
+      `step=unlink ${p} ${cause}; removal retried at next start`,
+      `${p} ${cause}; seal treated as having no entries`,
+      `written_but_not_synced=false ${p} ${cause}; seal write retried`,
+      `written_but_not_synced=true ${p} ${cause}; seal write retried`,
+      `step=resolution-append ${cause}; Memory Hold resolution not saved, retried`,
+      `${p} journal compaction confirmed`,
+      `${p} seal write confirmed`,
+      `step=resolution-append Memory Hold resolution saved`,
+    ]
+    const rendered = rows(MEMORY_PATH, error)
+    expect(rendered.map(([kind, key, line]) => line)).toEqual(rendered.map(([kind, key], i) => `[slack] ${kind}: persona=${key} ${expected[i]}`))
+    expect(buildPostAcceptPreparationFailedLine(': safe\r\nfailure\u2028tail\u2029end')).toBe('[slack] persona-routing: post-accept preparation failed: safe  failure tail end')
+    assertNoLeak(rendered)
+  })
+
+  test('the shared preparation failure builder retains safe Slack classification and redacts the described error', () => {
+    const line = buildPostAcceptPreparationFailedLine(describeSlackCallFailure(memoryError(MEMORY_PATH)))
+    expect(line).not.toMatch(/[\r\n\u2028\u2029]/)
+    expect(line).toContain(REDACTED_TOKEN_PLACEHOLDER)
+    expect(line).not.toContain(MEMORY_BODY)
+    expect(line).not.toContain(MEMORY_USER)
+    assertNoLeak(line)
+  })
+})
+
 describe('no notice names a forbidden term in CSCB\'s own text', () => {
   test.each(CASES)('%s', (_title, e) => {
     expect(forbiddenTermsIn(ownTextOf(e.render()))).toEqual([])
@@ -1498,8 +2262,42 @@ describe('a description quoted from agent-director is redacted and capped at MAX
   })
 
   test('every builder that quotes agent-director has a redaction-and-cap row', () => {
-    const quoting = new Set(NOTICE_CATALOGUE.filter((e) => redacted.some((r) => e.render().includes(r))).map((e) => e.builder))
+    // Thread Memory quotes storage errors, not agent-director descriptions;
+    // its loss notice has its own final-message budget below.
+    const quoting = new Set(NOTICE_CATALOGUE.filter((e) => e.group !== 'thread-memory' && e.group !== 'shared-state' && redacted.some((r) => e.render().includes(r))).map((e) => e.builder))
     const capped = new Set(capRows.map(([, e]) => e.builder))
     expect([...quoting].filter((builder) => !capped.has(builder)).sort()).toEqual([])
+  })
+})
+
+describe('the lines for a fault after a confirmed post are one line of safe identifiers', () => {
+  const settleError = () => Object.assign(new Error(sentinelInMessage('hold-settle')), { code: 'EIO' })
+  const REQUEST_TOKEN = 'req-no-ts-prompt-0001'
+
+  test('the hold settle-failure line names the persona and carries the fault only as its safe description', () => {
+    const line = buildHoldSettleFailedLine(KEY, describeThrownValue(settleError()))
+    assertNoLeak(line, 'hold settle-failure line')
+    expect({
+      prefix: line.startsWith('[slack] persona-destination-hold: '),
+      oneLine: !/[\r\n]/.test(line),
+      persona: line.includes(`persona=${KEY}:`),
+      code: line.includes('code=EIO'),
+    }).toEqual({ prefix: true, oneLine: true, persona: true, code: true })
+  })
+
+  test('self-check: the hold line does not redact a raw message itself, so the leak check catches one', () => {
+    expect(() => assertNoLeak(buildHoldSettleFailedLine(KEY, settleError().message), 'hold line with raw message')).toThrow()
+  })
+
+  test('the no-ts prompt line names the instance and request token and leaks nothing', () => {
+    const instance = personaInstanceId(KEY)
+    const line = buildPromptPostedWithoutTsLine(instance, REQUEST_TOKEN)
+    assertNoLeak(line, 'no-ts prompt line')
+    expect({
+      prefix: line.startsWith('[slack] permission-poller: '),
+      oneLine: !/[\r\n]/.test(line),
+      instance: line.includes(instance),
+      token: line.includes(`request_token=${REQUEST_TOKEN}`),
+    }).toEqual({ prefix: true, oneLine: true, instance: true, token: true })
   })
 })

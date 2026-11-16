@@ -549,6 +549,7 @@ describe('chunkText', () => {
   test.each([
     ['empty input', ''],
     ['whitespace and blank lines', ' \t\r\n\n  \n\r\n '],
+    ['quoted and repeated Slack mentions in a thread reply', '  > "<@U0OTHER>"\r\n<@U0OTHER|label> <@U0OTHER>\n🦀\n\n'],
     ['an oversized line and trailing spaces', 'a'.repeat(23) + '  '],
     ['CRLF line endings', 'alpha\r\nbeta\r\n'],
     ['surrogate pairs at chunk boundaries', 'a😀b🦊c😀'],

@@ -1,7 +1,9 @@
 
 
 import { noticePost } from './test-helpers/server-post.ts'
+import { _assignFixture, fixtureThreadHybridSince } from './test-helpers/shared-channels.ts'
 import type { MakeTemplateParams } from 'agent-director'
+import { eligibleMembership } from './test-helpers/fungible-decision.ts'
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -141,10 +143,12 @@ import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import {
   createPersonaLifecycle,
   DESTINATION_HOLD_CANCEL_AT_WINDOW_STEP,
+  forgetPersonaState,
   LIVE_ROW_SEQUENCE_STOP_AGAIN_STEP,
   LIVE_ROW_SEQUENCE_STOP_STEP,
   OLD_LIFE_WAITS_STEP,
   TEARDOWN_RETRY_TIMER_STOP_AFTER_KILL_STEP,
+  threadMemoryLoadAtApplyFailedLine,
   type PersonaLifecycle,
   type PersonaLifecycleDeps,
 } from '../src/persona-lifecycle.ts'
@@ -1622,15 +1626,20 @@ describe('persona teardown: every step for the removed key only, in order', () =
     expect(clock.pendingCount()).toBe(0)
   })
 
-  test('over the real routing in fungible mode, tearing B down empties B\'s heard set and leaves A\'s, holding the same channel, unchanged', async () => {
+  test('over the real routing in open mode, tearing B down empties B\'s heard set and leaves A\'s, holding the same channel, unchanged', async () => {
     const clock = createFakeClock()
-    const h = makeRoutingHarness([{ name: NAME_A }, { name: NAME_B }], dir, { mode: 'fungible', dedupeClock: () => clock.now() })
+    const h = makeRoutingHarness([{ name: NAME_A }, { name: NAME_B }], dir, { mode: 'open', dedupeClock: () => clock.now(), membership: { read: key => eligibleMembership(key), hasUnresolved: () => false, request: () => {} } })
     cleanups.push(resetRoutingState)
     const f = makeFixture({ overrides: { routing: { forget: (key) => h.forget(key) } } })
     const [a, b] = [f.a.key, f.b.key]
     expect(h.keys([NAME_A, NAME_B])).toEqual([a, b])
     // Channel X is heard by both; Y by A alone; Z, a private channel, by B alone.
     const [x, y, z] = ['C0HEARDX01', 'C0HEARDY01', 'G0HEARDZ01']
+    const authority = h.channelDelivery!.authority, mint = fixtureThreadHybridSince(authority.snapshot())
+    for (const key of [a, b]) for (const channel of [x, y, z]) {
+      expect(_assignFixture(authority, key, authority.incarnation(key)!, channel, 'mentions', authority.revision, mint))
+        .toMatchObject({ kind: 'applied' })
+    }
     await h.receive(makeChannelMessage({ channel: x }), [NAME_A, NAME_B])
     await h.receive(makeChannelMessage({ channel: y }), [NAME_A])
     await h.receive(makePrivateChannelMessage({ channel: z }), [NAME_B])
@@ -3548,6 +3557,210 @@ describe('persona teardown over the real bounded-retry kill, outage state, notif
 // ---------------------------------------------------------------------------
 // Apply bring-up
 // ---------------------------------------------------------------------------
+
+describe('composite persona forget', () => {
+  test('empty and successful composites resolve only after all asynchronous forgets settle', async () => {
+    const { b } = makeFixture()
+    await expect(forgetPersonaState(b.key, [])).resolves.toBeUndefined()
+    const gate = Promise.withResolvers<void>()
+    const calls: string[] = []
+    const done = forgetPersonaState(b.key, [
+      key => { calls.push(`routing:${key}`) },
+      async key => { calls.push(`threads:${key}`); await gate.promise; calls.push(`threads-done:${key}`) },
+      key => { calls.push(`last:${key}`) },
+    ])
+    expect(await settled(done)).toBe(false)
+    expect(calls).toEqual([`routing:${b.key}`, `threads:${b.key}`, `last:${b.key}`])
+    gate.resolve()
+    await expect(done).resolves.toBeUndefined()
+    expect(calls.at(-1)).toBe(`threads-done:${b.key}`)
+  })
+
+  test.each(['throw', 'reject'] as const)('%s: starts every forget and rethrows the first failure in call order only after all settle', async mode => {
+    const { b } = makeFixture()
+    const first = new Error('first forget failure')
+    const later = new Error('later forget failure')
+    const firstGate = Promise.withResolvers<void>()
+    const lastGate = Promise.withResolvers<void>()
+    const calls: string[] = []
+    const done = forgetPersonaState(b.key, [
+      key => { calls.push(`before:${key}`) },
+      key => {
+        calls.push(`first:${key}`)
+        if (mode === 'throw') throw first
+        return firstGate.promise
+      },
+      key => { calls.push(`later:${key}`); return Promise.reject(later) },
+      async key => { calls.push(`last:${key}`); await lastGate.promise; calls.push(`last-done:${key}`) },
+    ])
+    // Observe the rejection immediately, so the deliberate failure can never
+    // escape as an unhandled rejection even under a broken implementation.
+    const observed = done.then(() => ({ ok: true as const }), error => ({ ok: false as const, error }))
+    expect(await settled(observed)).toBe(false)
+    expect(calls).toEqual([`before:${b.key}`, `first:${b.key}`, `later:${b.key}`, `last:${b.key}`])
+    if (mode === 'reject') firstGate.reject(first)
+    expect(await settled(observed)).toBe(false)
+    lastGate.resolve()
+    const result = await observed
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toBe(first)
+    expect(calls.at(-1)).toBe(`last-done:${b.key}`)
+  })
+
+  test.each(['throw', 'reject'] as const)('%s in a composite routing forget: teardown waits, reports one failed step and completes every remaining step in order', async mode => {
+    const gate = Promise.withResolvers<void>()
+    const entered = Promise.withResolvers<void>()
+    const error = failure()
+    const forgets: string[] = []
+    const f = makeFixture({ overrides: { routing: { forget: key => {
+      f.trail.push(`routing.forget:${key}`)
+      entered.resolve()
+      return forgetPersonaState(key, [
+        k => { forgets.push(`routing:${k}`) },
+        k => {
+          forgets.push(`failing:${k}`)
+          if (mode === 'throw') throw error
+          return Promise.reject(error)
+        },
+        async k => { forgets.push(`threads:${k}`); await gate.promise; forgets.push(`threads-done:${k}`) },
+      ])
+    } } } })
+    const done = f.lifecycle.teardown(f.b)
+    await entered.promise
+    expect(await settled(done)).toBe(false)
+    expect(forgets).toEqual([`routing:${f.b.key}`, `failing:${f.b.key}`, `threads:${f.b.key}`])
+    expect(f.trail.at(-1)).toBe(`routing.forget:${f.b.key}`)
+    gate.resolve()
+    await expect(done).resolves.toBeUndefined()
+    expect(forgets.at(-1)).toBe(`threads-done:${f.b.key}`)
+    expect(f.trail).toEqual(fullTeardownTrail(f.b))
+    expect(f.lines).toEqual([
+      `${teardownPrefix(f.b)}: starting`,
+      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: forgetting its ephemeral routing state failed: Error`)}( |$)`)),
+      killOutcomeLine(f.b),
+      `${teardownPrefix(f.b)}: complete, with 1 failed step(s)`,
+    ])
+    assertNoLeak({ lines: f.lines, console: consoleLines() })
+  })
+})
+
+describe('Thread Memory load at lifecycle bring-up', () => {
+  test.each(['added', 'destructive modify', 'recovery', 'recovery fallback'] as const)('%s: awaits its key load immediately before the controller bring-up', async path => {
+    const gate = Promise.withResolvers<void>()
+    const recovery = path === 'recovery' || path === 'recovery fallback'
+    const f = makeFixture({
+      state: () => path === 'recovery fallback' ? STATES.up : STATES.brokenMissing,
+      changeResult: { kind: 'credentials-broken' },
+      overrides: { loadThreadMemory: async key => {
+        f.trail.push(`load:${key}`)
+        await gate.promise
+        f.trail.push(`loaded:${key}`)
+      } },
+    })
+    let persona = f.b
+    if (path === 'destructive modify') {
+      f.applied.push(f.b)
+      await f.lifecycle.teardown(f.b)
+      expect(f.trail).toEqual(stillAppliedTeardownTrail(f.b))
+      f.trail.length = 0
+      persona = { ...f.b, working_directory: join(dir, 'modified-work') }
+    }
+    const k = persona.key
+    const prefix = [
+      ...(recovery ? [`bringUps.state:${k}`] : []),
+      ...(path === 'recovery fallback' ? [`bringUps.changeCredentials:${k}:[${f.a.key},${k}]`] : []),
+      ...(recovery ? [`bringUps.cancel:${k}`, `connections.stop:${k}`, `destinations.forget:${k}`] : []),
+      `storageCheck:${k}`, `load:${k}`,
+    ]
+    const done = f.lifecycle.bringUp(persona, { ...f.config, personas: [f.a, persona] }, { recovery })
+    expect(await settled(done)).toBe(false)
+    expect(f.trail).toEqual(prefix)
+    gate.resolve()
+    expect(await done).toEqual({ outcome: 'up', failures: [] })
+    expect(f.trail).toEqual([...prefix, `loaded:${k}`, `bringUps.bringUp:${k}:[${f.a.key},${k}]`, `launch:${k}`])
+    assertNoLeak({ lines: f.lines })
+  })
+
+  test('a pending load opens no socket for its persona, while another persona loads and connects independently', async () => {
+    const gate = Promise.withResolvers<void>()
+    const loads: string[] = []
+    const { h, f, a, b } = makeControllerStack({ overrides: { loadThreadMemory: key => {
+      loads.push(key)
+      return key === b.key ? gate.promise : undefined
+    } } })
+    const applied = { ...h.config!, personas: [a, b] }
+    const forB = f.lifecycle.bringUp(b, applied)
+    expect(await settled(forB)).toBe(false)
+    expect(loads).toEqual([b.key])
+    expect(h.bringUpCalls).toEqual([])
+    expect(h.stub(b).sockets).toHaveLength(0)
+    expect(await f.lifecycle.bringUp(a, applied)).toEqual({ outcome: 'up', failures: [] })
+    expect(loads).toEqual([b.key, a.key])
+    expect(h.manager.status(a.key)).toMatchObject({ state: 'up' })
+    expect(h.bringUpCalls.map(call => call.key)).toEqual([a.key])
+    expect(h.stub(b).sockets).toHaveLength(0)
+    gate.resolve()
+    expect(await forB).toEqual({ outcome: 'up', failures: [] })
+    expect(h.manager.status(b.key)).toMatchObject({ state: 'up' })
+    expect(h.stub(b).sockets).toHaveLength(1)
+    expect(h.bringUpCalls.map(call => call.key)).toEqual([a.key, b.key])
+    expect(f.trail.filter(c => c.startsWith('launch:'))).toEqual([`launch:${a.key}`, `launch:${b.key}`])
+    assertNoLeak({ lines: h.lines, lifecycle: f.lines })
+  })
+
+  test.each(['throw', 'reject'] as const)('%s from loading is logged through the production builder and does not stop bring-up or launch', async mode => {
+    const error = new Error(sentinelInMessage('thread-memory-load'))
+    Object.assign(error, { data: LEAK_SENTINEL, original: LEAK_SENTINEL })
+    const f = makeFixture({ overrides: { loadThreadMemory: key => {
+      f.trail.push(`load:${key}`)
+      if (mode === 'throw') throw error
+      return Promise.reject(error)
+    } } })
+    const result = await f.lifecycle.bringUp(f.b, appliedAB(f))
+    expect(result).toEqual({ outcome: 'up', failures: [] })
+    expect(f.trail).toEqual([`storageCheck:${f.b.key}`, `load:${f.b.key}`, `bringUps.bringUp:${f.b.key}:[${f.a.key},${f.b.key}]`, `launch:${f.b.key}`])
+    expect(f.lines).toEqual([
+      threadMemoryLoadAtApplyFailedLine(f.b, error),
+      `[slack] persona ${renderPersonaRef(f.b.name, f.b.key)}: up at apply — launching`,
+    ])
+    assertNoLeak({ lines: f.lines, result })
+  })
+
+  test.each(['resolve', 'reject'] as const)('shutdown during a load that will %s prevents bring-up and launch', async outcome => {
+    const gate = Promise.withResolvers<void>()
+    const error = new Error(sentinelInMessage('shutdown-load'))
+    let shuttingDown = false
+    const f = makeFixture({ overrides: {
+      isShuttingDown: () => shuttingDown,
+      loadThreadMemory: key => { f.trail.push(`load:${key}`); return gate.promise },
+    } })
+    const done = f.lifecycle.bringUp(f.b, appliedAB(f))
+    expect(await settled(done)).toBe(false)
+    shuttingDown = true
+    if (outcome === 'reject') gate.reject(error)
+    else gate.resolve()
+    expect(await done).toEqual({ outcome: 'broken', failures: [] })
+    expect(f.trail).toEqual([`storageCheck:${f.b.key}`, `load:${f.b.key}`])
+    expect(f.lines).toEqual([
+      ...(outcome === 'reject' ? [threadMemoryLoadAtApplyFailedLine(f.b, error)] : []),
+      `[slack] persona ${renderPersonaRef(f.b.name, f.b.key)}: not brought up — the server is shutting down`,
+    ])
+    assertNoLeak({ lines: f.lines })
+  })
+
+  test.each(['shutdown', 'already recovered'] as const)('%s skips loading when no fresh bring-up will run', async path => {
+    const loads: string[] = []
+    const f = makeFixture({ state: () => STATES.up, overrides: {
+      isShuttingDown: () => path === 'shutdown',
+      loadThreadMemory: key => { loads.push(key) },
+    } })
+    expect(await f.lifecycle.bringUp(f.b, appliedAB(f), { recovery: true })).toEqual({ outcome: path === 'shutdown' ? 'broken' : 'up', failures: [] })
+    expect(loads).toEqual([])
+    expect(f.trail.some(c => c.startsWith('bringUps.bringUp:'))).toBe(false)
+    expect(f.trail.some(c => c.startsWith('launch:'))).toBe(false)
+    assertNoLeak({ lines: f.lines })
+  })
+})
 
 describe('apply bring-up: storage check, bring-up, then a launch only when up', () => {
   /** An applied config holding A and the added persona B. */
