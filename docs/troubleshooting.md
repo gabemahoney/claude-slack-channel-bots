@@ -2,7 +2,9 @@
 
 The `debug-slack-channel-bots` skill has an entry for every persona log class, every `config.json` rejection and each recovery step; run `/debug-slack-channel-bots` from Claude Code for a guided diagnosis. This page lists the common symptoms, then the server log and the startup-error log.
 
-For rejected channel requests or unusable confirmations, check current intent and the fresh preview; preserve input and authority evidence for uncertain writes. [Request diagnostics](../skills/debug-slack-channel-bots/SKILL.md#reload-request-invalid), [confirmation outcomes](../skills/debug-slack-channel-bots/SKILL.md#reload-review-outcome) and [write recovery](../skills/debug-slack-channel-bots/SKILL.md#reload-record-write-failed); `reload-shared-recovery` distinguishes inert proposals, cancellation, installed uncertainty and retained activation in [reviewed recovery](../skills/debug-slack-channel-bots/SKILL.md#reload-shared-recovery); a repair restores no Joined Threads, and each persona reports *Channel state recovered* once it is active and that persona's membership is verified.
+**A channel request or confirmation is refused** Check current intent and review the fresh preview before confirming again. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-channel-request-or-confirmation-is-refused).
+
+**A persona posts a *Configuration change not applied* notice** Fix storage, review the fresh preview and confirm afresh. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-configuration-change-not-applied-notice).
 
 **Installation fails or launches stay pending** Check Bun, the global package trust, the supported host, and the worker's Claude Code version and launcher. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-installation-fails-or-launches-stay-pending).
 
@@ -50,7 +52,7 @@ A newly verified join without a choice starts `off` in strict or `mentions` in o
 Read inventory completeness separately from current-app subscription/reinstall evidence, and fix app setup with [Update and reinstall an existing app](../skills/setup-slack-channel-bots/SKILL.md#update-and-reinstall-an-existing-app); restore the named access/storage cause and follow the bounded idle retry, keeping unprovable history held. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-membership-inventory-or-app-setup-is-unresolved).
 
 **A persona receives every message in a channel**
-In open mode its agent stored `all` there (a `persona-channel-delivery-set` line): ask it to switch back to `mentions`, or remove its app. In either mode, the operator can set the desired `delivery` in `config.json` and confirm; if the file already shows it, [request an explicit assignment](reload.md#editing-the-configuration). A mode switch preserves the shared choice. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-receives-every-message-in-a-channel).
+In open mode its agent set its saved choice to `all` there (a `persona-channel-delivery-set` line): ask it to switch back to `mentions`, or remove its app. In either mode, the operator can set the desired `delivery` in `config.json` and confirm; if the file already shows it, [request an explicit assignment](reload.md#editing-the-configuration). A mode switch preserves the shared choice. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-receives-every-message-in-a-channel).
 
 **A bot's channel delivery change has no result, or a pending or unresolved outcome**
 Retry with the same `attempt_id`, channel and value and `intent: retry`, never a new identifier. A *pending* or *unresolved* outcome keeps its identifier until storage repair or reviewed repair settles it. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-bots-channel-delivery-change-has-no-result-or-a-pending-or-unresolved-outcome).
@@ -157,6 +159,9 @@ agent-director returned an error the server can't classify; the server keeps ret
 **Session stuck during clean_restart**
 A bot that doesn't exit within `exit_timeout` is force-killed (under `clean_restart <bot>…`, a bot whose pause succeeds is never force-killed, and only a refused pause leads to the force-kill); one that still can't be stopped fails the command (see "`clean_restart` or `stop --stop-bots` exits non-zero with `could not stop`" below). Rows are never deleted, so running `clean_restart` again is safe. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-session-stuck-during-clean_restart).
 
+**`clean_restart` or `stop --stop-bots` exits non-zero with `nothing was stopped`**
+The precheck failed, so the server and every bot keep running. Fix the cause each `precheck failed for persona` line names (see [Precheck before stopping bots](cli.md#precheck-before-stopping-bots)), then run the command again. For `clean_restart <bot>…`, a line naming an argument, no running server or `session_restart_delay is 0` is a refusal, not a precheck failure; it says what to run instead. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-clean_restart-or-stop---stop-bots-exits-non-zero-with-nothing-was-stopped).
+
 **`clean_restart` exits 2 with `Usage:`**
 It needs `--server` (the server and every bot) or the names of the bots to restart; a bare `clean_restart` stops nothing. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-clean_restart-exits-2-with-usage).
 
@@ -165,9 +170,6 @@ The command ended with the bot's session before it started the server. Start it 
 
 **`clean_restart <bot>…` says a bot was `not seen relaunched`**
 The bot was stopped, and the server relaunches it on its own schedule; its `server.log` lines say when or why not. If `session_restart_delay` was changed from `0` since the server started, the server won't relaunch it: restart the server (`clean_restart --server` from a terminal). [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-clean_restart-bot-says-a-bot-was-not-seen-relaunched).
-
-**`clean_restart` or `stop --stop-bots` exits non-zero with `nothing was stopped`**
-The precheck failed, so the server and every bot keep running. Fix the cause each `precheck failed for persona` line names (see [Precheck before stopping bots](cli.md#precheck-before-stopping-bots)), then run the command again. For `clean_restart <bot>…`, a line naming an argument, no running server or `session_restart_delay is 0` is a refusal, not a precheck failure; it says what to run instead. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-clean_restart-or-stop---stop-bots-exits-non-zero-with-nothing-was-stopped).
 
 **`stop --stop-bots` exits non-zero with `only the server was stopped`**
 The installed agent-director is below the client's own minimum, so only the server was stopped. Follow the docs/migration.md section "Switching over to agent-director Phase 1". [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-stop---stop-bots-exits-non-zero-with-only-the-server-was-stopped).

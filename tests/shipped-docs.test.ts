@@ -8131,6 +8131,26 @@ const TARGETING_TOOLS = ['reply', 'react', 'edit_message', 'fetch_messages', 'do
 /** A README section's flattened text (a row's passage). */
 const readmeSection = (heading: HeadingMatch) => sectionOf(USER_DOCS_NAME, heading)
 
+/** The body between the README title and its first section, also used for in-memory edits. */
+function readmeIntroductionBody(text: string): string {
+  const body = requiredSection(text, README_TITLE_HEADING, USER_DOCS_NAME)
+  const firstSection = headings(body)[0]
+  return body.split('\n').slice(0, firstSection?.line).join('\n')
+}
+
+/** Only introductory prose, regardless of paragraph breaks; later sections cannot supply missing facts. */
+const readmeIntroduction = (text: string) => flat(splitFences(readmeIntroductionBody(text)).prose)
+
+/** `text` with its README introduction split into a paragraph per sentence and wrapped at every space outside code spans: formatting only. */
+const wrappedIntroduction = (text: string) => {
+  const body = readmeIntroductionBody(text)
+  const wrapped = body.replace(/\. /g, '.\n\n').split('`').map((part, i) => (i % 2 === 1 ? part : part.replace(/ /g, '\n'))).join('`')
+  return text.replace(body, () => wrapped)
+}
+
+/** `literal` found in raw Markdown however it is wrapped (`rawGapSource`), for in-memory edits of a flattened passage. */
+const rawLiteral = (literal: string) => new RegExp(rawGapSource(escapeRegExp(literal)))
+
 /** The one line of the README section under `heading` that opens a table row with `| <prefix>`; throws unless exactly one does (a row's passage). */
 const tableRowOf = (heading: HeadingMatch, prefix: string) => (text: string) => {
   const rows = requiredSection(text, heading, USER_DOCS_NAME).split('\n').filter((line) => line.startsWith(`| ${prefix}`))
@@ -8173,7 +8193,7 @@ const UPGRADE_ROWS: readonly DocRow[] = [
     ci('outside the state directory'), ...[CONFIG_FILE_NAME, CHANNEL_DELIVERY_FILE_NAME, LEGACY_DELIVERY_FILE, CONFIG_FILE_NAME + PENDING_FILE_SUFFIX].map(code),
     ci('edited, unconfirmed'), ci('keeping their bytes and dates'), ci('manual references only'),
     ci(`this release never reads ${code(LEGACY_DELIVERY_FILE)}`), ci('refuses removed configuration keys'),
-    CONFIGURATION_REJECTIONS_LINK,
+    REMOVED_CONFIGURATION_KEYS_LINK,
   ]],
   ['Upgrade: prepare both baseline files before the first start', upgradeStep(3), [
     ci('Start from the preserved applied configuration'),
@@ -8499,11 +8519,25 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci("log rotation can discard a channel's only audit line"),
     ci('After a restart, the first event from each channel a persona hears in open mode logs its line again'),
   ]],
-['introduction: the channels a persona serves, per mode', unitOf(USER_DOCS_NAME, README_TITLE_HEADING, 'A single HTTP MCP server'), [
+['introduction: a persona has its own identity and worker', readmeIntroduction, [
+    ci('Each persona has its own Slack app and identity'), ci('Claude Code instance'), ci('working directory'),
+  ]],
+['introduction: direct messages require enabled DMs', readmeIntroduction, [
+    ci(`With ${code(`${DM_ENABLED}: true`)}, it can also receive direct messages`),
+  ]],
+['introduction: persona definition and conditional DMs precede channel choices', readmeIntroduction, [
+    /own Slack app and identity.*?Claude Code instance.*?working directory.*?With `dm\.enabled: true`, it can also receive direct messages.*?saved delivery choice/is,
+  ]],
+['introduction: useful Configuration and Channel modes navigation', readmeIntroduction, [
+    `[Configuration](${CONFIGURATION_DOC})`, `[Channel modes](${CHANNEL_MODES_DOC})`,
+  ]],
+['introduction: the channels a persona serves, per mode', readmeIntroduction, [
     ci('in both modes, its non-off applied channel choices determine listening'),
   ]],
-["introduction: what a persona's tool calls may target, per mode", unitOf(USER_DOCS_NAME, README_TITLE_HEADING, 'A single HTTP MCP server'), [
-    ci("Each persona's tool calls act as that persona: in strict mode only in its configured non-off channels, in open mode in any channel ID it names, where the call goes to Slack, which decides"),
+["introduction: what a persona's tool calls may target, per mode", readmeIntroduction, [
+    ci("Each persona's tool calls act as that persona"),
+    ci('in strict mode only in its configured non-off channels'),
+    ci('in open mode in any channel ID it names, where the call goes to Slack, which decides'),
   ]],
 ['Personas (config.json): the channels a persona serves, in both modes, with Tools for what its tools may target', unitOf(USER_DOCS_NAME, PERSONAS_HEADING, 'Each bot is a **persona**'), [
     ci('In both modes, listening follows the shared applied channel choices'),
@@ -8811,6 +8845,65 @@ describe('the README describes both channel modes', () => {
         const edited = withItemCut(readme(), passage, item)
         expect(passage(edited)).not.toBe(passage(readme()))
         expect({ element, item: String(item), reported: docRowProblems(passage, required, edited).includes(`lacks ${String(item)}`) }).toEqual({ element, item: String(item), reported: true })
+      }
+    })
+
+    test.each([
+      ['a persona has its own identity and worker', 'own Slack app and identity', 'shared Slack app and identity'],
+      ['a persona has its own identity and worker', 'Claude Code instance', 'shared terminal'],
+      ['a persona has its own identity and worker', 'working directory', 'workspace label'],
+      ['direct messages require enabled DMs', 'With `dm.enabled: true`,', 'With `dm.enabled: false`,'],
+      ['direct messages require enabled DMs', 'With `dm.enabled: true`, it can also', 'It can always'],
+      ['the channels a persona serves, per mode', 'non-off applied channel choices', 'off applied channel choices'],
+      ["what a persona's tool calls may target, per mode", 'in strict mode only in its configured non-off channels', 'in strict mode in any channel'],
+      ["what a persona's tool calls may target, per mode", 'where the call goes to Slack, which decides', 'where CSCB decides without calling Slack'],
+    ])('self-check: introduction: %s rejects reversed "%s"', (label, original, reversal) => {
+      const row = README_DEO_ROWS.find(([name]) => name === `introduction: ${label}`)
+      if (row === undefined) throw new Error(`no introduction row for ${label}`)
+      const [, passage, required] = row
+      for (const text of [readme(), wrappedIntroduction(readme())]) {
+        expect(docRowProblems(passage, required, text)).toEqual([])
+        const edited = text.replace(rawLiteral(original), () => reversal)
+        expect(passage(edited)).not.toBe(passage(text))
+        expect(docRowProblems(passage, required, edited).length).toBeGreaterThan(0)
+      }
+    })
+
+    test.each([
+      'Each persona has its own Slack app and identity, Claude Code instance and working directory.',
+      'With `dm.enabled: true`, it can also receive direct messages.',
+    ])('self-check: introduction rejects "%s" moved after channel choices', (sentence) => {
+      const row = README_DEO_ROWS.find(([name]) => name === 'introduction: persona definition and conditional DMs precede channel choices')
+      if (row === undefined) throw new Error('no introduction ordering row')
+      const [, passage, required] = row
+      for (const text of [readme(), wrappedIntroduction(readme())]) {
+        expect(docRowProblems(passage, required, text)).toEqual([])
+        const intro = passage(text)
+        const body = readmeIntroductionBody(text)
+        const found = body.match(rawLiteral(sentence))
+        if (found === null) throw new Error(`introduction lacks ${sentence}`)
+        const edited = text.replace(body, () => `${body.replace(found[0], () => '')}\n${found[0]}\n`)
+        expect(passage(edited)).not.toBe(intro)
+        expect(docRowProblems(passage, required, edited).length).toBeGreaterThan(0)
+        // Identity and DM facts remain present: only their teaching order was reversed.
+        for (const [, otherPassage, otherRequired] of README_DEO_ROWS.filter(([name]) => name.startsWith('introduction:') && name !== row[0])) {
+          expect(docRowProblems(otherPassage, otherRequired, edited)).toEqual([])
+        }
+      }
+    })
+
+    test('introduction permits paragraph splitting and wrapping, but facts below its first section cannot satisfy it', () => {
+      const text = readme()
+      const intro = readmeIntroduction(text)
+      const body = readmeIntroductionBody(text)
+      const wrapped = wrappedIntroduction(text)
+      const relocated = text.replace(body, '\n').replace('## Quick Start', `## Quick Start\n\n${body}`)
+      expect(readmeIntroduction(wrapped)).toBe(intro)
+      expect(readmeIntroduction(relocated)).not.toBe(intro)
+      for (const [, passage, required] of README_DEO_ROWS.filter(([name]) => name.startsWith('introduction:'))) {
+        expect(docRowProblems(passage, required, text)).toEqual([])
+        expect(docRowProblems(passage, required, wrapped)).toEqual([])
+        expect(docRowProblems(passage, required, relocated).length).toBeGreaterThan(0)
       }
     })
 

@@ -929,12 +929,6 @@ function unclaimedProblems(text: string): string[] {
   return problems
 }
 
-/** The stored-choice file's section and the store's lines subsection, built from the store's exports. */
-const STORED_CHOICE_HEADING = `## The stored-choice file: \`${CHANNEL_DELIVERY_FILE_NAME}\``
-
-/** What the store's lines subsection in `text` lacks: its place in the stored-choice section, and a row naming each drop reason (imported). */
-
-
 /** The silence entry's title (T18's heading, which the wizard and the triage point to). */
 const SILENCE_TITLE = 'A persona is silent in a channel its app was invited to'
 

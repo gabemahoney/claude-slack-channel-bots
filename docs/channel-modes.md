@@ -64,7 +64,9 @@ Review [Reading the preview](reload.md#reading-the-preview) before switching. If
 
 ## Delivery values in both modes
 
-In both modes, the shared choices are `off`, `mentions`, `all` and `thread_hybrid`. A missing or unreadable assignment holds affected intake; it is not a saved `off` choice. A newly verified member gets the mode's join default described above, preserving any existing choice: `mentions` delivers direct mentions and broadcasts, `all` delivers every message, and `thread_hybrid` is described under [Threads in `thread_hybrid` channels](#threads-in-thread_hybrid-channels).
+In both modes, the shared choices are `off`, `mentions`, `all` and `thread_hybrid`. A missing or unreadable assignment holds affected intake; it is not a saved `off` choice. A newly verified member gets the mode's join default described above, preserving any existing choice.
+
+`off` delivers no channel intake, including @mentions and broadcasts; configured permission prompts and notices, and responses to existing valid prompts, still follow [Permission prompts in both modes](#permission-prompts-in-both-modes). `mentions` delivers direct mentions and broadcasts, `all` delivers every message, and `thread_hybrid` is described under [Threads in `thread_hybrid` channels](#threads-in-thread_hybrid-channels).
 
 - **Saved and effective choice.** A persona's saved choice is the `delivery` value of its entry in the shared list. Its effective choice is what applies to the next message: the saved value while its app is a verified, eligible member and the shared state is readable. While membership is unverified or the state is unresolved, the channel's messages are held, and in a channel the persona can't serve, nothing is delivered; the saved value stays as it is.
 - **Who writes and which choice wins.** The operator can assign through a confirmed edit in both modes; a persona can make new `set_channel_delivery` assignments only in open. The later successful durable application to that persona/channel wins, including explicit same-value assignments. Saving `config.json`, preview creation, call start, file dates and timestamps establish no precedence; copied fields and a mode-only confirmation are not assignments.
@@ -98,7 +100,7 @@ Threads are kept across persona and server restarts, channel mode switches and s
 - A channel switched to `thread_hybrid` starts with none. Messages already waiting are kept, and delivering them joins nothing.
 - A leave and rejoin that CSCB never observes, such as both while it is stopped, is not a verified leave, so the threads stay.
 
-Keep each persona's Slack app internal to the workspace, not distributed: a distributed app gets lower Slack rate limits, which slow whole-thread reading and recovery lookups. The Thread Memory reports a persona's destination can receive are in [Troubleshooting](troubleshooting.md#troubleshooting).
+Keep each persona's Slack app internal to the workspace, not distributed: a distributed app gets lower Slack rate limits, which slow whole-thread reading and recovery lookups. The Thread Memory reports a persona's destination can receive are in [A persona posts a *Thread Memory not saved* notice](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-thread-memory-not-saved-notice).
 
 ## Permission prompts in both modes
 

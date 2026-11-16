@@ -539,7 +539,7 @@ the host and fits the run. Every figure below is a runner constant.
 
 | Figure | Value |
 |---|---|
-| CPUs | 2 per shard, the server's quota; a shard holding test 44, 45 or 48 takes a third for the SR-8 burst driver, and needs a Docker that supports `--security-opt writable-cgroups=true` and `--cgroupns private`. Admission counts one more CPU per such script, at most N, so a full run takes at most 4 shards. All live `/ci` runs together hold at most 12 CI CPUs |
+| CPUs | 2 per shard for the server (`CPUS_PER_SHARD`); test-44 and every strict/open membership-load group use the burst load driver (see the [suite inventory](../../../tests/README.md#layout)). A shard holding any of them adds `DRIVER_CPUS=1` once, with the driver in its separate 0.9-CPU group; it needs `--init`, `--security-opt writable-cgroups=true` and `--cgroupns private`. Before scheduling, admission reserves `2*N + min(N, selected burst-script count)` CPUs. The complete split population needs 12 CPUs for 4 shards; selective limits depend on their selected population. All live `/ci` runs together hold at most 12 CI CPUs |
 | Memory per shard | Ordinary cap: 2 GiB. Each dedicated Codex shard adds 2 GiB (currently 4 GiB), for both memory and memory-swap |
 | Admission margin | 1 GiB |
 | Ceiling C | 85% of the pod memory limit (54.4 GiB on the 64 GiB pod); while a `/ci-live` run is active, the lower of that and 40 GiB, `/ci-live`'s non-reclaimable memory stop line |

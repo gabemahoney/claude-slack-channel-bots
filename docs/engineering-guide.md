@@ -57,7 +57,7 @@ Store accepted Slack text exactly as received, including mentions and whitespace
 Preserve the [intake](architecture.md#durable-intake-queue), [engine](architecture.md#per-persona-delivery-engine) and [reporting](architecture.md#delivery-reporting-and-reactions) contracts.
 
 - Keep `decideDelivery`, `decideEngine`, `decideGate` and head selection pure. Pass observations, durable facts and constants explicitly; inject clients, receipts, queues, clocks and timers. Engines/adapters start no I/O or timers on import, so decisions can be tested independently of execution.
-- Intake order is fungible app-mention rule → durable Slack key check → decision → store → in-memory join, if any → aggregate ack → queued reporting.
+- Intake order is open-mode app-mention rule → durable Slack key check → decision → store → in-memory join, if any → aggregate ack → queued reporting.
 
   For events in a persona's `thread_hybrid` channels, use `acceptDecided` to run key checks and decisions one event at a time inside the queue's per-persona serial store section; a key check waits until an earlier unfinished store of its durable key has finished. A decision waits until each earlier store carrying an after-store effect (the in-memory join or a Post Hold's registration) has finished, saved or failed, and a saved one's effect has been applied; it needn't wait for other earlier stores staged in its own group, but groups commit one at a time per persona.
 

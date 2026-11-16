@@ -91,7 +91,7 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
   `config.json`, with the operator's say-so, as
   [Removed configuration keys](#removed-configuration-keys) says.
   Preserve authority and pending evidence during recovery (see
-  [The stored-choice file: `config.json.last-applied`](#the-stored-choice-file-configjsonlast-applied)).
+  [The shared channel authority: `config.json.last-applied`](#the-shared-channel-authority-configjsonlast-applied)).
 - NEVER move, delete, relink or rewrite the state directory, its old
   location `~/.claude/channels/slack` or the symbolic link that may stand
   there, or anything in them a `state-migrate:` line names, without the
@@ -1934,7 +1934,7 @@ membership or an old setup record does not establish either current state.
 | **An edit that adds a mention** (open mode) | A plain `… dropped message from channel=<id> …: non-message` line for the edit. In open mode an @mention is delivered from its `message` event, and an edit arrives as an `app_mention` (which open mode never decides on) plus a `message_changed` event, which is never delivered. | Post another message that @mentions the persona. |
 | **A message posted before the invite** | No line at all, not even a `RAW message event` line: Slack sends the app no event for a message posted before it joined the channel. | Post the message again. The persona can read earlier messages with `fetch_messages` when asked. |
 | **The channel at `mentions`, and the message doesn't @mention the persona** (open mode) | A plain `… dropped message from channel=<id> …: not-mentioned` line. The channel's `persona-open-channel` line shows `at channel delivery mentions`. | @mention the persona, or ask it in that channel to switch the channel to `all` (it calls `set_channel_delivery`; see [`persona-channel-delivery-set`](#persona-channel-delivery-set)). |
-| **The shared authority is unresolved** | A shared-authority error; further choice writes are refused. | Preserve authority and prepared evidence, then restore trustworthy shared state (see [The stored-choice file](#the-stored-choice-file-configjsonlast-applied)). |
+| **The shared authority is unresolved** | A shared-authority error; further choice writes are refused. | Preserve authority and prepared evidence, then restore trustworthy shared state (see [The shared channel authority](#the-shared-channel-authority-configjsonlast-applied)). |
 | **The persona isn't up, or its instance isn't taking messages** | A class line after its latest `persona-start` line, or an existing recovery notice at its destination. Accepted messages stay queued. | See [A persona is down but its instance is still running](#a-persona-is-down-but-its-instance-is-still-running) and [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected). |
 
 The troubleshooting entry **A persona is silent in a channel it was
@@ -1953,7 +1953,7 @@ channel, not only @mentions and broadcasts.
   the channel ending `to all, at channel delivery all`.
   The choice is kept across restarts, so the line can be in an older log
   generation, or rotated away: the channel's entry in
-  [`config.json.last-applied`](#the-stored-choice-file-configjsonlast-applied)
+  [`config.json.last-applied`](#the-shared-channel-authority-configjsonlast-applied)
   then shows `"delivery": "all"`. Fixes, any one of:
   - ask the persona, in that channel or by DM, to switch the channel back to
     `mentions`;
@@ -7674,7 +7674,7 @@ writes it; it is absent until a key is first recorded. Never edit it.
 
 ---
 
-## The stored-choice file: `config.json.last-applied`
+## The shared channel authority: `config.json.last-applied`
 
 `config.json.last-applied` is the sole shared channel authority. Its envelope holds the revision, applied configuration, reviewed source and exact source bytes (`sourceBytesBase64`), persona identities and incarnations, and ordered channel choices. An uncertain or unresolved outcome requires preserving authority, prepared input and pending evidence.
 
@@ -7916,6 +7916,18 @@ that agent-director could not resume; it does not establish history loss.
 ## Symptom reference
 
 The full entry for each symptom `docs/troubleshooting.md` lists, in the same order and under the same title. The sections above explain each log line in more detail.
+
+### Symptom: A channel request or confirmation is refused
+
+Check current intent and the fresh preview: [request diagnostics](#reload-request-invalid) explain invalid or stale requests, and [confirmation outcomes](#reload-review-outcome) explain why a spent review cannot assign again. Prepare a fresh request or confirmation against the current intent rather than replaying the old one.
+
+For uncertain writes, preserve input, authority, prepared confirmation and retirement evidence; see [write recovery](#reload-record-write-failed). [Reviewed recovery](#reload-shared-recovery) distinguishes inert proposals, cancellation, installed uncertainty and retained activation. Follow its preservation and review steps rather than inferring whether an assignment succeeded; see the separate [Channel state recovered](#symptom-a-persona-posts-a-channel-state-recovered-notice) entry for activation and Joined Threads behavior.
+
+### Symptom: A persona posts a *Configuration change not applied* notice
+
+A definite failed confirmed apply changes nothing: prior applied state and the pending change remain. Fix permissions, free space or directory-sync support, read the fresh preview and confirm afresh; the old confirmation is not reused. See [`reload-record-write-failed`](#reload-record-write-failed).
+
+An unresolved write may already be installed. Preserve authority, prepared input, confirmation and retirement evidence, then restart to recover the exact transaction; use [reviewed recovery](#reload-shared-recovery) only if that cannot resolve it. Do not treat uncertainty as a definite failure or submit a replacement assignment.
 
 ### Symptom: Installation fails or launches stay pending
 

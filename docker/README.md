@@ -621,8 +621,9 @@ names it. A `cscb-ci=1` container is picked by its label, whatever its name.
 The CPU fit counts the CPUs of every other live `/ci` reservation;
 `/ci-live` adds none.
 
-A shard holding a burst-driver script (tests 44, 45 and 48) takes one more
-CPU than the 2 its server keeps, for the SR-8 burst driver (see
+A shard holding test-44 or any strict/open membership-load group takes one
+more CPU than the 2 its server keeps, once per shard even with several such
+scripts, for the burst load driver (see
 [Burst-driver shards](#burst-driver-shards)). Admission comes before
 scheduling places those scripts, so for N shards it counts one more CPU for
 each of the run's burst-driver scripts, at most N; the reservation records
@@ -712,13 +713,15 @@ with a 64 GiB pod limit:
   41.4 GiB, and 5 up to 43.4 GiB.
 - While a `/ci-live` run is active, C is 40 GiB and that run counts 13 GiB,
   so no `/ci` run fits once U is above 24 GiB.
-- A default full run holds tests 44, 45 and 48, so it takes at most 4
-  shards: 8 + 3 = 11 CPUs, where 5 shards would need 13. A second default
-  full run beside it is refused for CPU. It is judged at its isolation
-  minimum of two shards, the dedicated Codex shard and one ordinary shard:
-  4 + 2 = 6 CPUs, with 1 free.
-- A run without those scripts takes 2 CPUs a shard, so a second default run
-  beside a 6-shard one is refused for CPU: that run holds all 12 CI CPUs.
+- The complete split burst workload population exceeds the maximum shard
+  count. A default full run can therefore fit at most 4 shards in an otherwise
+  unoccupied CPU budget: 8 + 4 = 12 CPUs; 5 shards would need 15. A second
+  default full run beside it is refused for CPU. At its isolation minimum of
+  two shards, the dedicated Codex shard and one ordinary shard, it needs
+  4 + 2 = 6 CPUs, with none free beside the 4-shard run.
+- Selective runs depend on their selected burst population; four is not a
+  universal cap. A run without burst scripts takes 2 CPUs a shard, so a
+  6-shard run holds all 12 CI CPUs and leaves none for another run.
 
 **The memory watchdog** checks U every 30 s against C less 0.5 GiB
 (53.9 GiB for a 64 GiB pod, or 39.5 GiB while `/ci-live` lowers C). At or
@@ -1029,9 +1032,12 @@ removes itself, and only the runner removes it, after its final reading.
 
 #### Burst-driver shards
 
-A shard holding test 44, 45 or 48 (`BURST_DRIVER_SCRIPTS` in
-`scripts/ci-run.ts`) keeps the SR-8 burst driver, the test's own load
-generator, off the CPU quota of the server it measures. Its `docker run` adds
+A shard holding test-44 or any strict/open membership-load group keeps the
+burst load driver, the test's own load generator, off the CPU quota of the
+server it measures. `BURST_DRIVER_SCRIPTS` in `scripts/ci-run.ts` recognizes
+the thread-burst and membership-load filename families, including suffixed
+membership groups; see the canonical [suite inventory](../tests/README.md#layout).
+Recovery groups, ACK-only test-31 and model scripts do not use this driver. Its `docker run` adds
 four things to an ordinary shard's:
 
 | Flag | Why |

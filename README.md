@@ -1,6 +1,8 @@
 # Claude Slack Channel Bots
 
-A single HTTP MCP server connects Slack apps to Claude personas; in both modes, its non-off applied channel choices determine listening. Each persona's tool calls act as that persona: in strict mode only in its configured non-off channels, in open mode in any channel ID it names, where the call goes to Slack, which decides. See [Configuration](docs/configuration.md) and [Channel modes](docs/channel-modes.md).
+A single HTTP MCP server connects Slack apps to Claude personas. Each persona has its own Slack app and identity, Claude Code instance and working directory. With `dm.enabled: true`, it can also receive direct messages.
+
+Each persona has a saved delivery choice for each channel; in both modes, its non-off applied channel choices determine listening. Each persona's tool calls act as that persona: in strict mode only in its configured non-off channels, in open mode in any channel ID it names, where the call goes to Slack, which decides. See [Channel modes](docs/channel-modes.md) and [Configuration](docs/configuration.md).
 
 ---
 
