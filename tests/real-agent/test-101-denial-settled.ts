@@ -12,6 +12,12 @@ const ended = (entry: TranscriptEntry) => entry.value?.type === 'assistant'
   && !blocks(entry).some(block => block.type === 'tool_use')
 const requireEvidence = (value: unknown, reason: string): void => { if (!value) throw new Error(reason) }
 
+// The shell polls exit 1 for incomplete evidence; exit 2 ends the scenario now.
+export const MAIN_AGENT_PROBE_EXIT = 2
+class MainAgentProbeError extends Error {
+  constructor() { super('main agent ran the denied probe itself') }
+}
+
 export function denialSettled(key: string, action: any, slack: any[], own: TranscriptEntry[], all: TranscriptEntry[]) {
   const click = action?.interactive, button = click?.actions?.[0]
   const prefix = `perm_deny_cscb_${key}_`
@@ -33,11 +39,17 @@ export function denialSettled(key: string, action: any, slack: any[], own: Trans
 
   for (const launch of own) for (const use of blocks(launch)) {
     if (use.type !== 'tool_use' || use.name !== 'Agent' || !use.input?.prompt?.includes('printf subagent-deny-probe')) continue
+    const session = basename(launch.path, '.jsonl')
+    if (own.some(entry => entry.path === launch.path && entry.offset > launch.offset
+      && entry.value?.sessionId === session && entry.value?.isSidechain !== true && entry.value?.type === 'assistant'
+      && blocks(entry).some(block => block.type === 'tool_use' && block.name === 'Bash' && block.input?.command === 'printf subagent-deny-probe'))) {
+      throw new MainAgentProbeError()
+    }
     const result = own.find(entry => entry.path === launch.path && entry.offset > launch.offset
       && entry.value?.type === 'user' && blocks(entry).some(block => block.type === 'tool_result' && block.tool_use_id === use.id && !block.is_error)
       && typeof entry.value.toolUseResult?.agentId === 'string')
     if (!result) continue
-    const agent = result.value.toolUseResult.agentId, session = basename(launch.path, '.jsonl')
+    const agent = result.value.toolUseResult.agentId
     const sidePath = join(dirname(launch.path), session, 'subagents', `agent-${agent}.jsonl`)
     const side = all.filter(entry => entry.path === sidePath && entry.value?.sessionId === session && entry.value?.agentId === agent && entry.value?.isSidechain === true)
     const probe = side.find(entry => blocks(entry).some(block => block.type === 'tool_use' && block.name === 'Bash' && block.input?.command === 'printf subagent-deny-probe'))
@@ -46,13 +58,15 @@ export function denialSettled(key: string, action: any, slack: any[], own: Trans
     const denied = side.find(entry => entry.offset > probe.offset && entry.value?.type === 'user'
       && entry.value.toolDenialKind === 'permission-rule' && entry.at >= Date.parse(pushed.ts)
       && blocks(entry).some(block => block.type === 'tool_result' && block.tool_use_id === probeId && block.is_error === true))
-    const complete = denied && side.find(entry => entry.offset > denied.offset && ended(entry))
-    if (!denied || !complete) continue
+    if (!denied) continue
+    let complete: TranscriptEntry | undefined
     let mainAfter = result.offset
     if (result.value.toolUseResult.isAsync === true || result.value.toolUseResult.status === 'async_launched') {
-      const notification = own.find(entry => {
+      // Native sidechain finals sometimes have null stop_reason. The consumed
+      // completed task notification proves completion of this async Agent.
+      complete = own.find(entry => {
         if (entry.path !== launch.path || entry.offset <= result.offset || entry.value?.sessionId !== session
-          || entry.value?.isSidechain === true || !Number.isFinite(entry.at) || entry.at < complete.at || entry.at < denied.at) return false
+          || entry.value?.isSidechain === true || !Number.isFinite(entry.at) || entry.at < denied.at) return false
         const fields = taskNotificationFields(nativeTaskNotificationContent(entry.value))
         if (fields?.status !== 'completed') return false
         // Native serializers omit absent optional IDs. At least one must link
@@ -61,9 +75,13 @@ export function denialSettled(key: string, action: any, slack: any[], own: Trans
         return (task === agent || tool === use.id)
           && (task === undefined || task === agent) && (tool === undefined || tool === use.id)
       })
-      if (!notification) continue
-      mainAfter = notification.offset
-    } else if (result.value.toolUseResult.status !== 'completed') continue
+      if (!complete) continue
+      mainAfter = complete.offset
+    } else {
+      if (result.value.toolUseResult.status !== 'completed') continue
+      complete = side.find(entry => entry.offset > denied.offset && ended(entry))
+      if (!complete) continue
+    }
     const mainEnd = own.find(entry => entry.path === launch.path && entry.offset > mainAfter && entry.at >= complete.at && ended(entry))
     if (mainEnd) return { request_token: token, agent_id: agent, session_id: session, denial_at: decision.ts, subagent_completed_at: complete.at, main_completed_at: mainEnd.at }
   }
@@ -78,5 +96,8 @@ if (import.meta.main) {
     const all = readTranscripts(transcriptFiles(root!), await packedReceiptAdapters(), true)
     const own = personaTranscripts(key!, receiptJournal(state!, key!), log, all)
     console.log('recorded: denied subagent settled ' + JSON.stringify(denialSettled(key!, JSON.parse(readFileSync(action!, 'utf8')), jsonLines(slack!), own, all)))
-  } catch (error) { console.error(error instanceof Error ? error.message : 'Test101 observation unavailable'); process.exitCode = 1 }
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : 'Test101 observation unavailable')
+    process.exitCode = error instanceof MainAgentProbeError ? MAIN_AGENT_PROBE_EXIT : 1
+  }
 }

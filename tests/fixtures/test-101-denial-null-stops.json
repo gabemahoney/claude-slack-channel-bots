@@ -1,0 +1,171 @@
+[
+  {
+    "stream": "-tmp-test-101-fmk-real-busy-2hOJQF-work-busy/7ae56508-cbfe-479d-ab1d-d107584ee5ec/subagents/agent-a91d4f68f262c488c.jsonl",
+    "offset": 19847,
+    "at": 1794846623601,
+    "type": "assistant",
+    "sessionId": "7ae56508-cbfe-479d-ab1d-d107584ee5ec",
+    "agentId": "a91d4f68f262c488c",
+    "isSidechain": true,
+    "message": {
+      "stop_reason": "tool_use",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_bdrk_01LMj1p2zemB4VS6cwg3zymy",
+          "name": "Bash",
+          "input": {
+            "command": "printf subagent-deny-probe",
+            "description": "Print probe string"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "stream": "-tmp-test-101-fmk-real-busy-2hOJQF-work-busy/7ae56508-cbfe-479d-ab1d-d107584ee5ec/subagents/agent-a91d4f68f262c488c.jsonl",
+    "offset": 21847,
+    "at": 1794846624602,
+    "type": "user",
+    "sessionId": "7ae56508-cbfe-479d-ab1d-d107584ee5ec",
+    "agentId": "a91d4f68f262c488c",
+    "isSidechain": true,
+    "toolDenialKind": "permission-rule",
+    "message": {
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_bdrk_01LMj1p2zemB4VS6cwg3zymy",
+          "is_error": true
+        }
+      ]
+    }
+  },
+  {
+    "stream": "-tmp-test-101-fmk-real-busy-2hOJQF-work-busy/7ae56508-cbfe-479d-ab1d-d107584ee5ec/subagents/agent-a91d4f68f262c488c.jsonl",
+    "offset": 33399,
+    "at": 1794846628026,
+    "type": "assistant",
+    "sessionId": "7ae56508-cbfe-479d-ab1d-d107584ee5ec",
+    "agentId": "a91d4f68f262c488c",
+    "isSidechain": true,
+    "message": {
+      "stop_reason": null,
+      "content": [
+        {
+          "type": "thinking"
+        }
+      ]
+    }
+  },
+  {
+    "stream": "-tmp-test-101-fmk-real-busy-2hOJQF-work-busy/7ae56508-cbfe-479d-ab1d-d107584ee5ec/subagents/agent-a91d4f68f262c488c.jsonl",
+    "offset": 35403,
+    "at": 1794846628126,
+    "type": "assistant",
+    "sessionId": "7ae56508-cbfe-479d-ab1d-d107584ee5ec",
+    "agentId": "a91d4f68f262c488c",
+    "isSidechain": true,
+    "message": {
+      "stop_reason": null,
+      "content": [
+        {
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "stream": "-tmp-test-101-fmk-real-busy-2hOJQF-work-busy/7ae56508-cbfe-479d-ab1d-d107584ee5ec.jsonl",
+    "offset": 63717,
+    "at": 1794846621078,
+    "type": "assistant",
+    "sessionId": "7ae56508-cbfe-479d-ab1d-d107584ee5ec",
+    "isSidechain": false,
+    "message": {
+      "stop_reason": "tool_use",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_bdrk_01TookYNoRzHLVGfCd6xf2Sb",
+          "name": "Agent",
+          "input": {
+            "description": "Run printf probe command",
+            "subagent_type": "general-purpose",
+            "prompt": "Use the Bash tool to run exactly: printf subagent-deny-probe\nThis call goes through a permission request. If it is denied, do not retry it or try a different approach. Report that it was denied and stop there. If it is allowed, report the output."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "stream": "-tmp-test-101-fmk-real-busy-2hOJQF-work-busy/7ae56508-cbfe-479d-ab1d-d107584ee5ec.jsonl",
+    "offset": 65683,
+    "at": 1794846621115,
+    "type": "user",
+    "sessionId": "7ae56508-cbfe-479d-ab1d-d107584ee5ec",
+    "isSidechain": false,
+    "message": {
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_bdrk_01TookYNoRzHLVGfCd6xf2Sb"
+        }
+      ]
+    },
+    "toolUseResult": {
+      "agentId": "a91d4f68f262c488c",
+      "status": "async_launched",
+      "isAsync": true,
+      "resolvedModel": "aws/anthropic/bedrock-claude-opus-5-5"
+    }
+  },
+  {
+    "stream": "-tmp-test-101-fmk-real-busy-2hOJQF-work-busy/7ae56508-cbfe-479d-ab1d-d107584ee5ec.jsonl",
+    "offset": 71195,
+    "at": 1794846627279,
+    "type": "assistant",
+    "sessionId": "7ae56508-cbfe-479d-ab1d-d107584ee5ec",
+    "isSidechain": false,
+    "message": {
+      "stop_reason": "end_turn",
+      "content": [
+        {
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "stream": "-tmp-test-101-fmk-real-busy-2hOJQF-work-busy/7ae56508-cbfe-479d-ab1d-d107584ee5ec.jsonl",
+    "offset": 75158,
+    "at": 1794846628162,
+    "type": "user",
+    "sessionId": "7ae56508-cbfe-479d-ab1d-d107584ee5ec",
+    "isSidechain": false,
+    "message": {
+      "content": "<text withheld>"
+    },
+    "notification": {
+      "task-id": "a91d4f68f262c488c",
+      "tool-use-id": "toolu_bdrk_01TookYNoRzHLVGfCd6xf2Sb",
+      "status": "completed"
+    }
+  },
+  {
+    "stream": "-tmp-test-101-fmk-real-busy-2hOJQF-work-busy/7ae56508-cbfe-479d-ab1d-d107584ee5ec.jsonl",
+    "offset": 82002,
+    "at": 1794846636274,
+    "type": "assistant",
+    "sessionId": "7ae56508-cbfe-479d-ab1d-d107584ee5ec",
+    "isSidechain": false,
+    "message": {
+      "stop_reason": "end_turn",
+      "content": [
+        {
+          "type": "text"
+        }
+      ]
+    }
+  }
+]

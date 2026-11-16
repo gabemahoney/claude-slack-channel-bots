@@ -1271,12 +1271,14 @@ does not reread the transcript after failure or extend the deadline.
 Before queueing message six, `tests/real-agent/test-101-denial-settled.ts`
 requires the matching successful Slack Denied update, the native
 `permission-rule` denial and completion of the identity-linked subagent.
-It also requires a completed Agent result or a consumed asynchronous
-completion notification and subsequent main completion. It uses the same
+For an asynchronous Agent, the consumed completed task-notification proves
+subagent completion after the denial, even when sidechain finals have null
+`stop_reason`; the main turn must end after that notification. A synchronous
+Agent still requires sidechain completion and a completed Agent result. It uses the same
 observer for user records and `queued_command` attachments (string or
 text-block content). A completed notification must identify this agent or its
 Agent call, every supplied ID must agree, and it must follow the denial and
-sidechain completion in this session. An unlinked, earlier, foreign or merely
+Agent launch result in this session. An unlinked, earlier, foreign or merely
 enqueued notification cannot pass. The native 2.1.280/296/302 source audit and
 the completion-observer sweep are recorded in
 [`fixtures/native-denial-completion/README.md`](fixtures/native-denial-completion/README.md).
@@ -1284,7 +1286,11 @@ Test 101 then runs
 the existing `real_wait_idle` AD waiting check. This preparation uses
 only the Slack stub record and own native transcripts; the permission hold,
 Allow, Agent Deny, actual `dialog-hold` notice, restart and six-delivery
-assertions retain their bounds.
+assertions retain their bounds. The persona prompt and deny-step message reserve
+`printf subagent-deny-probe` for the subagent. A main-session Bash call of that
+command fails immediately as `main agent ran the denied probe itself`, through
+the observer's terminal exit 2; incomplete evidence exits 1 and keeps polling
+within the existing 180-second settle bound.
 
 Test 104 retains its filename but tests uncertain AD delivery outcomes. It injects one `unknown-untyped` text outcome, queues three messages, and requires all three exact receipts in order. Native idle/compaction capability detection, rollout/binary-fragment fixtures and pane observations are removed.
 

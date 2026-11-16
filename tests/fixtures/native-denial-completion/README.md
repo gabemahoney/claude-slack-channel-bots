@@ -16,15 +16,18 @@ and text blocks. The pure captured serializers run in unit regressions with
 fixture IDs, alongside both consumed record shapes.
 
 The observer requires successful relay denial, the matching denied Bash
-result and sidechain completion, then either a completed synchronous Agent
-result or an own-session consumed completion notification and main completion.
+result, then either sidechain completion with a completed synchronous Agent
+result, or an own-session consumed completed task-notification proving async
+subagent completion, followed by main completion. Async sidechain finals need
+no terminal `stop_reason`.
 For either notification shape, a task/agent ID or Agent-call ID must match;
 all supplied IDs must agree. Its timestamp must be finite and no earlier than
-the denied result and sidechain completion, and its main-stream offset must
+the denied result, and its main-stream offset must
 follow the Agent launch result. Earlier, unlinked, foreign, failed, ambiguous
 and merely enqueued notifications fail. Header extraction excludes summary and
 result prose. The observer enforces a bounded timeout and subsequent AD
-dialog-refusal acceptance.
+dialog-refusal acceptance. A main-session Bash call of the denied probe fails
+immediately with its own label, even if a later main turn ends.
 Readiness comes from agent-director row state; notification records never
 authorize typing.
 

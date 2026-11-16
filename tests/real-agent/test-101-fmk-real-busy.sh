@@ -7,6 +7,14 @@ source "$(dirname "$0")/../integration/lib/real-scenario.sh"
 source "$(dirname "$0")/../integration/lib/real-recovery.sh"
 CASE_ASSERT="${SCENARIO_FIXTURES}/real-case-assertions.ts"
 BUSY_SETTLED="$(dirname "$0")/test-101-denial-settled.ts"
+# Exit 2 is the observer's terminal parent-probe failure, not pending evidence.
+busy_denial_settled() {
+    local rc=0
+    bun "${BUSY_SETTLED}" "${SLACK_STATE_DIR}" "${REAL_KEY}" \
+        "${HOME}/.claude/projects" "${SCENARIO_SLACK_RECORD}" "${SCENARIO_ROOT}/deny-click.json" || rc=$?
+    if [[ "${rc}" -eq 2 ]]; then fail 'main agent ran the denied probe itself'; fi
+    return "${rc}"
+}
 case_assert() { bun "${CASE_ASSERT}" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${@:2}"; }
 # Acknowledgements may be replies, edits or reactions. These are not the
 # permission probes; allowing them keeps the scenario independent of that choice.
@@ -23,7 +31,7 @@ settings['permissions']['ask'] = [
 path.write_text(json.dumps(settings))
 print('recorded: busy native permissions ' + json.dumps(settings['permissions']))
 PY
-real_persona busy 'Follow each explicit tool request. When asked for a subagent use Agent, have it ask permission for its requested command, and keep the subagent dialog open after a deny. Otherwise acknowledge OK.'
+real_persona busy 'Follow each explicit tool request. When asked for a subagent use Agent, have it ask permission for its requested command, and keep the subagent dialog open after a deny. Only the subagent may run printf subagent-deny-probe. Never run or retry that command yourself, including after a denial or a task completion notification. After the subagent finishes, report its result and end your turn. Otherwise acknowledge OK.'
 real_write_config '{"test_timer_overrides":{"delivery_stuck_after_ms":3000}}'
 real_start_stub
 start_server --live
@@ -49,7 +57,7 @@ curl -fsS --max-time 20 -X POST -H 'Content-Type: application/json' --data-binar
 wait_until 180 'Allow click did not reach CSCB relay' case_assert relay-decision "${SCENARIO_SLACK_RECORD}" allow
 real_wait_delivery "${REAL_KEY}" 4
 real_wait_idle "${REAL_KEY}"
-real_dm "${REAL_LABEL}" 'Use Agent to ask a subagent to run Bash printf subagent-deny-probe. Keep its dialog open after the denied tool.'
+real_dm "${REAL_LABEL}" 'Use Agent to ask a subagent to run Bash printf subagent-deny-probe. Keep its dialog open after the denied tool. Only the subagent may run this command; do not run or retry it yourself. After its completion notification, report the result and end your turn.'
 wait_until 180 'subagent permission not opened' case_assert subagent-permission "${SCENARIO_SLACK_RECORD}"
 ACTION="$(case_assert relay-action "${SCENARIO_SLACK_RECORD}" deny "${REAL_USER}")"
 printf '%s\n' "${ACTION}" > "${SCENARIO_ROOT}/deny-click.json"
@@ -58,8 +66,7 @@ wait_until 180 'Deny click did not reach CSCB relay' case_assert relay-decision 
 # A Stop can precede background Agent completion. Observe the actual matching
 # denial and native completion first, then AD waiting.
 wait_until 180 'denied subagent did not settle after successful relay response' \
-    bun "${BUSY_SETTLED}" "${SLACK_STATE_DIR}" "${REAL_KEY}" \
-    "${HOME}/.claude/projects" "${SCENARIO_SLACK_RECORD}" "${SCENARIO_ROOT}/deny-click.json"
+    busy_denial_settled
 real_wait_idle "${REAL_KEY}"
 real_dm "${REAL_LABEL}" 'message after denied subagent request'
 wait_until 180 'dialog-hold Delivery stuck was not posted' case_assert dialog-notice "${SCENARIO_SLACK_RECORD}" "${REAL_LABEL}"
