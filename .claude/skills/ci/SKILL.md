@@ -70,11 +70,16 @@ two lanes, follow the [two-lane integration procedure](../../../tests/README.md#
 Recheck the current script listing and runner driver classification, then
 resolve transitive prerequisites before launching:
 
-- **Scheduler:** select every no-model, non-burst workload in one invocation.
-  Include test-13 and all recovery groups; do not use `/ad-gate`'s different
+- **Scheduler:** take scheduler network access into account: select every
+  no-model, non-burst workload in one invocation except Test 13 and Test 47
+  while scheduler jobs run with the network off. Include all recovery groups;
+  do not use `/ad-gate`'s different
   offline published-release selection.
-- **Local:** select one native model or burst workload per disposable-container
-  invocation and finish it before starting the next. Native filenames contain
+- **Local:** while scheduler jobs run with the network off, run Test 13 and
+  Test 47 locally because they install packages from the npm registry. Select
+  one local workload per disposable-container `/ci` invocation and finish it
+  before starting the next. Every other workload keeps its current lane:
+  native model and burst workloads stay local. Native filenames contain
   `-fmk-real-`; burst workloads are test-44 and every strict/open membership
   group. Keep native Claude and Codex local, with all existing admission,
   memory/resource, performance and credential/login guards. An independent

@@ -598,9 +598,12 @@ thread phase of
 socket, and stores on the container's real scratch storage; unit or simulated
 runs do not supply this evidence. For an authorized complete two-lane run,
 follow the [two-lane integration procedure](../tests/README.md#two-lane-integration-procedure):
-all no-model/non-burst workloads, including Test 13 and recovery 46/65/66/67,
-go in one scheduler selection; each native-model or burst workload runs
-locally in its own disposable `/ci` invocation, one at a time. Resolve
+take scheduler network access into account. While scheduler jobs run with the
+network off, Test 13 and Test 47 run locally because they install packages
+from the npm registry; every other no-model/non-burst workload, including
+recovery 46/65/66/67, goes in one scheduler selection. Each local workload,
+including native-model and burst workloads, runs in its own disposable-container
+`/ci` invocation, one at a time. Every other workload keeps its current lane. Resolve
 prerequisite closure and retain SELECTIVE verdicts and reader exit 3;
 the caller judges combined coverage separately.
 
@@ -1764,7 +1767,7 @@ Import each numerical bound from `src/`; only its pin case types the number besi
 
 | Bound | SRJ | Constant | Asserted in |
 |---|---|---|---|
-| Own-root clock skew for pending own posts | SR-1.2.4 | `OWN_ROOT_CLOCK_SKEW_MS` (`src/delivery-constants.ts`) | `tests/delivery-decision.test.ts`, `own-root clock skew bound is pinned` (sole numerical pin) |
+| Own-root clock skew for pending own posts | | `OWN_ROOT_CLOCK_SKEW_MS` (`src/delivery-constants.ts`) | `tests/delivery-decision.test.ts`, `own-root clock skew bound is pinned` (sole numerical pin) |
 | Latch re-check interval | | `LATCH_RECHECK_INTERVAL_MS` | tests/conflict-latch.test.ts |
 | Latch re-check: one read, then at most the one call its case names; the probe reads one line; a latched resume's or reuse's probe or retry runs only on a reading of its row ended or missing | | count rule; `PROBE_PANE_READ_LINES` | tests/conflict-latch.test.ts |
 | Version re-check interval | | `AD_VERSION_RECHECK_INTERVAL_MS` | tests/ad-version-gate.test.ts |

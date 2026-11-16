@@ -2113,15 +2113,18 @@ format below.
 
 When a complete integration run is authorized across two lanes, use the
 current `tests/integration/test-*.sh` listing and the runner's
-`isBurstDriverScript` classifier, then resolve transitive prerequisite
-closure before launching either lane. Each workload belongs to exactly one
+`isBurstDriverScript` classifier and take scheduler network access into account,
+then resolve transitive prerequisite closure before launching either lane.
+While scheduler jobs run with the network off, Test 13 and Test 47 run locally
+because they install packages from the npm registry. Every other workload keeps
+its current lane. Each workload belongs to exactly one
 lane; test-1 is mandatory bootstrap repeated in every shard/invocation and
 is excluded from workload partition counts.
 
 | Lane | Explicit SCRIPT selection and execution |
 |---|---|
-| Scheduler | One selected `/ci` invocation on the job scheduler containing every workload whose filename lacks `-fmk-real-` and whose driver classification is false. Include no-model Test 13 and recovery 46/65/66/67. Test 49 exercises model arguments with a stub and belongs here. |
-| Local | One disposable-container `/ci` invocation per workload whose filename contains `-fmk-real-` or whose driver classification is true: Test 44 and every strict/open membership group. Finish each invocation before starting the next. Retain normal admission, memory/resource guards, performance locks and native credential/login isolation; an independent selection can use `--shards 1`, including Codex-only. |
+| Scheduler | One selected `/ci` invocation on the job scheduler containing every workload whose filename lacks `-fmk-real-` and whose driver classification is false, except Test 13 and Test 47 while scheduler jobs run with the network off. Include recovery 46/65/66/67. Test 49 exercises model arguments with a stub and belongs here. |
+| Local | One disposable-container `/ci` invocation per workload whose filename contains `-fmk-real-` or whose driver classification is true (Test 44 and every strict/open membership group), plus Test 13 and Test 47 while scheduler jobs run with the network off because they install packages from the npm registry. Finish each invocation before starting the next. Retain normal admission, memory/resource guards, performance locks and native credential/login isolation; an independent selection can use `--shards 1`, including Codex-only. |
 
 Compare the selections with the whole current manifest for complete,
 nonoverlapping workload coverage. If a closure brings in a workload from the

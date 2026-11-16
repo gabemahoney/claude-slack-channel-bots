@@ -124,7 +124,7 @@ export function sharedReviewDependency(state: SharedChannelState): string {
   ])).digest('hex')
 }
 
-// --- Review outcome retention (SR-3.5) ---
+// --- Review outcome retention ---
 
 /** Keeps the review history's outcomes a reader still needs and drops the
  * rest: the outcome recorded last (greatest durable revision), whose
