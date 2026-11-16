@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process'
 import { assertNativeSpoofResponse } from './real-agent/ai-classifier-stop.ts'
 import { captureFailureEvidence, claudeFailureRecords, diagnosticValue, projectClaudeFailure, projectCodexFailure, projectFailureState, scenarioFailureRecords, retainFailureLine, scrubDiagnosticText } from './real-agent/ai-failure-diagnostics.ts'
 import type { TranscriptEntry } from './integration/fixtures/transcript-receipts.ts'
-import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX } from './test-helpers/credentials.ts'
+import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX, writtenFile } from './test-helpers/credentials.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
 const model = 'test/model'
@@ -53,11 +53,12 @@ test('each safe field failure is emitted once across separate poll processes', (
 })
 
 test('metadata diagnostics withhold message-shaped values and scrub tokens', () => {
-  expect(diagnosticValue({ text: 'PRIVATE MESSAGE' })).toBe('<object>')
-  expect(diagnosticValue('PRIVATE MESSAGE')).toBe('<string withheld>')
-  expect(diagnosticValue(fakeToken('sk-'))).toBe('[REDACTED]')
-  expect(scrubDiagnosticText('answer secret-value Bearer abc123 access_token="unlisted-value"', { API_KEY: 'secret-value' }))
-    .toBe('answer [REDACTED] Bearer [REDACTED] access_token="[REDACTED]"')
+  const result = { object: diagnosticValue({ text: 'PRIVATE MESSAGE' }), text: diagnosticValue('PRIVATE MESSAGE'),
+    token: diagnosticValue(fakeToken('sk-')),
+    scrubbed: scrubDiagnosticText('answer secret-value Bearer abc123 access_token="unlisted-value"', { API_KEY: 'secret-value' }) }
+  assertNoLeak(result)
+  expect(result).toEqual({ object: '<object>', text: '<string withheld>', token: '[REDACTED]',
+    scrubbed: 'answer [REDACTED] Bearer [REDACTED] access_token="[REDACTED]"' })
 })
 
 function entry(offset: number, value: any, path = '/private/session.jsonl'): TranscriptEntry {
@@ -82,7 +83,7 @@ test.each(['user string', 'user blocks', 'queued string', 'queued blocks'])('%s 
     expect(retained[1].notification['task-id']).toBe('[REDACTED]')
     if (shape.startsWith('queued')) expect(retained[0].attachment).toEqual({ type: 'queued_command', commandMode: 'task-notification', taskId: 'child', agentId: 'owner', source_uuid: 'notification' })
     expect(output).not.toContain('PRIVATE'); expect(output).not.toContain(secret)
-    assertNoLeak({ records, retained, output })
+    assertNoLeak({ records, retained, output, file: writtenFile(join(root, 'real-agent-failures.jsonl')) })
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
@@ -129,7 +130,7 @@ test.each(['claude', 'codex'] as const)('%s preserves structured error facts thr
     if (agent === 'claude') { expect(retained.error).toEqual(expected); expect(retained.message.error).toEqual(expected) }
     else expect(retained.payload.error).toEqual(expected)
     expect(text).not.toContain('PRIVATE'); expect(text).not.toContain(secret)
-    assertNoLeak(retained)
+    assertNoLeak({ records, retained, text, file: writtenFile(join(root, 'real-agent-failures.jsonl')) })
     expect(statSync(join(root, 'real-agent-failures.jsonl')).mode & 0o777).toBe(0o600)
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
@@ -144,7 +145,7 @@ test('error projection keeps null/false and fails closed for malformed, deep or 
   expect(result.payload).toMatchObject({ code: '<string withheld>', status: '<object>', retryable: false, codex_error_info: '<array>' })
 })
 
-test('case projection retains synthetic/error metadata without message text, excludes prompts, tool arguments and foreign sessions', () => {
+test('case projection retains scrubbed assistant/reply text and excludes prompts, action arguments and foreign sessions', () => {
   const v = valid(); Object.assign(v, { type: 'assistant', parentUuid: 'take', isApiErrorMessage: true, error: 'refusal', isSynthetic: true, isMeta: false })
   v.message.stop_reason = 'refusal'; v.message.model = '<synthetic>'
   v.message.content = [{ type: 'text', text: `refused ${fakeToken('sk-')}` }, { type: 'tool_use', name: 'Write', input: { content: 'SECRET ARGUMENT' } },
@@ -156,8 +157,80 @@ test('case projection retains synthetic/error metadata without message text, exc
   assertNoLeak(records)
   const text = JSON.stringify(records)
   for (const absent of ['PRIVATE PROMPT', 'SECRET ARGUMENT', 'fakeCredential123']) expect(text).not.toContain(absent)
-  expect(text).toContain('Write'); expect(text).not.toContain('refused '); expect(text).not.toContain('reply ')
+  expect(text).toContain('Write'); expect(text).toContain('refused [REDACTED]'); expect(text).toContain('reply [REDACTED]')
 })
+
+test('failure JSONL keeps scrubbed reply/edit destinations and assistant text through both redaction stages', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'reply-evidence-')), transcripts = join(root, 'transcripts')
+  try {
+    mkdirSync(transcripts)
+    const secret = fakeToken('sk-'), coordinatorSecret = 'coordinator-only-private-value'
+    const text = `JSON read-back <@U0BOT> ${secret} ${coordinatorSecret}`
+    const content = [
+      ...['reply', 'edit_message'].map(name => ({ type: 'tool_use', name: `mcp__slack-channel-router__${name}`,
+        input: { chat_id: 'C0TESTCHAN1', message_id: '1792000000.000300', text, files: ['PRIVATE FILE'] } })),
+      { type: 'text', text: `Sent. ${secret}` },
+      { type: 'thinking', thinking: 'PRIVATE THINKING', text: 'PRIVATE THINKING' },
+      { type: 'tool_use', name: 'Write', input: { text: 'PRIVATE ACTION', content: 'PRIVATE ACTION' } },
+      { type: 'tool_result', tool_use_id: 'post', content: 'PRIVATE RESULT' },
+    ]
+    writeFileSync(join(transcripts, 'session.jsonl'), [
+      { type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'PRIVATE PROMPT' }] } },
+      { type: 'assistant', message: { role: 'assistant', content } },
+    ].map(v => JSON.stringify(v)).join('\n') + '\n')
+    const lines: string[] = []
+    await captureFailureEvidence('claude', transcripts, { scenario: 'ac11-retention' }, join(root, 'absent-states'), line => lines.push(line))
+    const emitted = lines.join('\n')
+    expect(emitted).not.toContain(secret)
+    assertNoLeak({ lines, emitted })
+    for (const line of lines) retainFailureLine(root, line, value => value.replaceAll(coordinatorSecret, '[COORDINATOR REDACTED]'))
+    const retained = readFileSync(join(root, 'real-agent-failures.jsonl'), 'utf8')
+    const blocks = retained.trim().split('\n').map(line => JSON.parse(line))
+      .find(value => value.record?.type === 'assistant').record.message.content
+    for (const block of blocks.slice(0, 2)) expect(block.input).toEqual({ chat_id: 'C0TESTCHAN1',
+      message_id: '1792000000.000300', text: 'JSON read-back <@U0BOT> [REDACTED] [COORDINATOR REDACTED]' })
+    expect(blocks[2].text).toBe('Sent. [REDACTED]')
+    expect(retained).not.toContain('PRIVATE'); expect(retained).not.toContain(secret); expect(retained).not.toContain(coordinatorSecret)
+    expect(statSync(join(root, 'real-agent-failures.jsonl')).mode & 0o777).toBe(0o600)
+    assertNoLeak({ lines, emitted, retained, blocks, file: writtenFile(join(root, 'real-agent-failures.jsonl')) })
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+test.each(['recognizable', 'environment-known'] as const)(
+  'retained %s text is scrubbed before the 4096-character bound and malformed reply fields stay withheld', kind => {
+    const secret = fakeToken(kind === 'recognizable' ? 'sk-' : '', 'boundary')
+    const prior = process.env.CSCB_DIAGNOSTIC_TEST_SECRET
+    try {
+      if (kind === 'environment-known') process.env.CSCB_DIAGNOSTIC_TEST_SECRET = secret
+      const suffix = '[truncated]', prefixLimit = 4096 - suffix.length
+      // Keep all but five credential characters inside the actual retained
+      // prefix, including its leak sentinel. Truncate-first loses the full
+      // opaque spelling needed by the environment-based scrubber.
+      const prefix = 'a'.repeat(prefixLimit - secret.length + 4) + ' ', tail = ' ' + 'z'.repeat(5000)
+      expect(prefix.length).toBeLessThan(prefixLimit)
+      expect(prefix.length + secret.length).toBeGreaterThan(prefixLimit)
+      const text = prefix + secret + tail
+      const projected = projectClaudeFailure(entry(0, { type: 'assistant', message: { role: 'assistant', content: [
+        { type: 'text', text },
+        { type: 'tool_use', name: 'mcp__slack-channel-router__reply', input: { text, chat_id: text, message_id: text } },
+        { type: 'tool_use', name: 'mcp__slack-channel-router__edit_message', input: { text: { private: secret }, chat_id: [secret], message_id: 3 } },
+      ] } }))
+      const blocks = projected.message.content as any[]
+      assertNoLeak({ projected, blocks })
+      expect(typeof blocks[0].text).toBe('string')
+      expect(blocks[1].input).toBeDefined()
+      const expected = (prefix + '[REDACTED]' + tail).slice(0, prefixLimit) + suffix
+      for (const retained of [blocks[0].text, ...Object.values(blocks[1].input)]) {
+        expect(typeof retained).toBe('string')
+        expect((retained as string).length).toBe(4096)
+        expect(retained).toBe(expected)
+      }
+      expect(blocks[2].input).toEqual({ text: '<object>', chat_id: '<array>', message_id: 3 })
+    } finally {
+      if (prior === undefined) delete process.env.CSCB_DIAGNOSTIC_TEST_SECRET
+      else process.env.CSCB_DIAGNOSTIC_TEST_SECRET = prior
+    }
+  })
 
 test.each([[0, false], [1, false], [0, true]] as const)('shared cleanup retains every native case, initial status=%s, late failure=%s', (status, late) => {
   const root = mkdtempSync(join(tmpdir(), 'real-cleanup-')), scenario = join(root, 'scenario'), home = join(scenario, 'home')
@@ -216,7 +289,8 @@ exit ${status}
       expect(records.filter(r => r.event === 'transcript')).toHaveLength(2)
       expect(text).toContain('permission-rule'); expect(text).toContain('child'); expect(text).toContain('end_turn')
       expect(records.find(r => r.event === 'ad-state').state).toEqual({ state: 'working', family_state: 'working' })
-      expect(text).not.toContain('PRIVATE')
+      expect(text).toContain('PRIVATE MESSAGE') // assistant text is retained
+      expect(text).not.toContain('PRIVATE RESULT')
     }
   } finally { rmSync(root, { recursive: true, force: true }) }
 })

@@ -58,9 +58,21 @@ const identityFields = ['type', 'subtype', 'uuid', 'parentUuid', 'sessionId', 's
   'requestedModel', 'isMeta', 'isApiErrorMessage', 'error', 'isSynthetic', 'refusedUserMessageUuid', 'sourceToolAssistantUUID',
   'toolDenialKind', 'toolDenialEndsTurn', 'toolDenialMonitorBlocked', 'toolDenialUnanswered', 'toolEndsTurn', 'permissionMode',
   'stop_reason', 'terminal_reason', 'is_error', 'toolUseID', 'parentToolUseID'] as const
-function contentMetadata(content: unknown): unknown {
+const MAX_RETAINED_TEXT_CHARS = 4096
+function retainedText(value: unknown): unknown {
+  if (typeof value !== 'string') return diagnosticValue(value)
+  // Scrub before bounding: slicing a credential first could hide its spelling
+  // from both this scrubber and the coordinator's final redaction pass.
+  const text = scrubDiagnosticText(value), suffix = '[truncated]'
+  return text.length <= MAX_RETAINED_TEXT_CHARS ? text : text.slice(0, MAX_RETAINED_TEXT_CHARS - suffix.length) + suffix
+}
+function contentMetadata(content: unknown, assistant = false): unknown {
   if (!Array.isArray(content)) return typeof content === 'string' ? '<text withheld>' : diagnosticValue(content)
-  return content.map(b => fields(b, ['type', 'id', 'name', 'tool_use_id', 'is_error']))
+  return content.map(b => ({ ...fields(b, ['type', 'id', 'name', 'tool_use_id', 'is_error']),
+    ...(assistant && b?.type === 'text' ? { text: retainedText(b.text) } : {}),
+    ...(assistant && b?.type === 'tool_use' && ['mcp__slack-channel-router__reply', 'mcp__slack-channel-router__edit_message'].includes(b.name)
+      ? { input: Object.fromEntries(['chat_id', 'message_id', 'text'].filter(key => b.input?.[key] !== undefined)
+        .map(key => [key, retainedText(b.input[key])])) } : {}) }))
 }
 /** Native notification linkage is metadata; summary/result/body text is never retained. */
 export function notificationMetadata(content: unknown) {
@@ -80,7 +92,8 @@ export function projectClaudeFailure(entry: TranscriptEntry) {
     request: fields(v?.request, ['subtype', 'tool_name', 'tool_use_id', 'request_id']),
     permission_denials: Array.isArray(v?.permission_denials) ? v.permission_denials.map((d: unknown) => fields(d, ['tool_name', 'tool_use_id'])) : undefined,
     notification: notificationMetadata(v?.type === 'attachment' && v.attachment?.type === 'queued_command' ? v.attachment.prompt : m?.content),
-    message: { ...fields(m, ['id', 'role', 'model', 'stop_reason']), ...errorFields(m), content: contentMetadata(m?.content) } }
+    message: { ...fields(m, ['id', 'role', 'model', 'stop_reason']), ...errorFields(m),
+      content: contentMetadata(m?.content, v?.type === 'assistant' && m?.role === 'assistant') } }
 }
 export function projectCodexFailure(entry: TranscriptEntry) {
   const v = entry.value, p = v?.payload
@@ -120,8 +133,9 @@ export async function scenarioFailureRecords(root: string, agent: 'claude' | 'co
 }
 
 /** All attempts/copies for the selected item, including late linked responses.
- * No raw prompt, tool arguments, config, login file or tool-result body leaves
- * the container. An absent send is recorded explicitly, never called a pass. */
+ * Only bounded, scrubbed assistant text and reply/edit destination/text fields
+ * accompany metadata. Prompts, other tool arguments, config, login files and
+ * tool results stay withheld. An absent send is never called a pass. */
 export function claudeFailureRecords(journal: any[], entries: TranscriptEntry[], seq: number) {
   const windows = journal.filter(r => r.kind === 'sent' && r.seq === seq && typeof r.transcript_path === 'string' && Number.isFinite(r.transcript_size))
   return entries.filter(e => windows.some(w => e.path === w.transcript_path && e.offset >= w.transcript_size)).map(projectClaudeFailure)

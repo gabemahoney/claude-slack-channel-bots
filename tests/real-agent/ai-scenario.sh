@@ -27,6 +27,9 @@ real_prepare "${REAL_AGENT_CLAUDE_VERSION:-2.1.296}" mcp__slack-channel-router__
 PROMPT='Answer the test requests in JSON without Markdown.'
 if [[ "${AI_CRITERION}" == 11 || "${AI_CRITERION}" == 12 || "${AI_CRITERION}" == 20 ]]; then
     PROMPT+=' For each message return {case:the corresponding case label in sequence,attributes:a map of all tag attributes and values,body:the message body}. For body, transcribe the received BODY verbatim, preserving every character, whitespace and entity spelling. Apply only JSON string escaping; do not reconstruct the original Slack text before delivery. Case labels are supplied below.'
+    if [[ "${AI_CRITERION}" == 11 ]]; then
+        PROMPT+=' For each message send exactly one reply using chat_id from the outer channel tag and message_id from that same outer tag, with the JSON read-back as the whole text. Add no further text anywhere in the turn: no closing or explanatory sentence before or after the reply. Copy Slack markup such as <@U0BOT> raw, byte for byte; never HTML-escape it as &lt; or &gt;. Send it correctly in that reply and never edit it afterward.'
+    fi
     # A second configured recipient is needed for the reference corpus's
     # receive_all_shared case. The stub pushes only to the tested persona.
     real_persona corpuspeer
