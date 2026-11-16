@@ -5,6 +5,9 @@ import { basename, dirname, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, writtenFile } from './test-helpers/credentials.ts'
+import { makePersona } from './test-helpers/persona-config.ts'
+import { startSlackStub, type SlackStub, type StubControl } from './integration/fixtures/slack-stub-server.ts'
 import { classifierObservation, deliveredAICorpus, spoofTurn } from './real-agent/ai-classifier-stop.ts'
 import { auditedAICorpus, incidentalBait } from './real-agent/ai-fixture-audit.ts'
 import { assertAIReadbackNoShell } from './real-agent/ai-no-shell.ts'
@@ -17,6 +20,39 @@ import { buildTagParts, escapeBody, TAG_MAX_BYTES } from '../src/tag-wrapper.ts'
 import { personaTranscripts, type TranscriptEntry } from './integration/fixtures/transcript-receipts.ts'
 
 // Unpaid native-evidence controls only; no unit result certifies a real AI trial.
+test.each(['users.info', 'conversations.info', 'users.conversations'])('stub arrival epoch precedes parsing and accompanies %s faults only', async method => {
+  const root = mkdtempSync(join(tmpdir(), 'stub-arrival-')), recordPath = join(root, 'record.jsonl')
+  const stub = startSlackStub({ recordPath })
+  const records = (): Record<string, any>[] => readFileSync(recordPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+  try {
+    const source = readFileSync(new URL('./integration/fixtures/slack-stub-server.ts', import.meta.url), 'utf8')
+    const entry = source.slice(source.indexOf('async fetch(req, srv) {'))
+    expect(entry.indexOf('const arrivalEpochMs = Date.now()')).toBeGreaterThan(0)
+    expect(entry.indexOf('const arrivalEpochMs = Date.now()')).toBeLessThan(entry.indexOf('refreshControl()'))
+    expect(entry.indexOf('refreshControl()')).toBeLessThan(entry.indexOf('await readArgs(req)'))
+    const headers = { Authorization: `Bearer ${fakeToken(BOT_TOKEN_PREFIX, 'arrival-clock')}` }
+    const url = `${stub.apiUrl}${method}`
+    const before = await fetch(url, { headers }).then(r => r.text())
+    stub.setControl({ default: { faults: [{ method, outcome: 'error', error: 'internal_error' }] } } as StubControl)
+    const start = Date.now()
+    const faulted = await fetch(url, { headers }).then(r => r.json())
+    const end = Date.now()
+    expect(faulted).toEqual({ ok: false, error: 'internal_error' })
+    const faults = records().filter(r => r.event === 'fault')
+    expect(faults).toHaveLength(1)
+    expect(typeof faults[0]!.arrival_mono_ms).toBe('number')
+    expect(typeof faults[0]!.arrival_epoch_ms).toBe('number')
+    expect(faults[0]!.arrival_epoch_ms as number).toBeGreaterThanOrEqual(start)
+    expect(faults[0]!.arrival_epoch_ms as number).toBeLessThanOrEqual(end)
+    expect(faults[0]!.arrival_epoch_ms as number).toBeLessThanOrEqual(Date.parse(String(faults[0]!.ts)))
+    expect(records().filter(r => r.event === 'api' && r.request_id === faults[0]!.request_id)).toHaveLength(1)
+    stub.setControl({})
+    expect(await fetch(url, { headers }).then(r => r.text())).toBe(before)
+    expect(records().filter(r => r.event !== 'fault').some(r => 'arrival_epoch_ms' in r)).toBe(false)
+    assertNoLeak({ records: records(), faulted, before })
+  } finally { await stub.stop(); rmSync(root, { recursive: true, force: true }) }
+})
+
 function evidence() {
   const fixture = JSON.parse(readFileSync(new URL('./fixtures/delivery-wrapper/wrapper-cases.json', import.meta.url), 'utf8'))[2]
   const path = '/scenario/projects/aiac11/session.jsonl', model = 'aws/anthropic/bedrock-claude-opus-5-5'
@@ -385,6 +421,71 @@ test.each([
     })
     expect(child.error).toBeUndefined(); expect(child.status).toBe(status)
   } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+test.each([11, 12, 20, 15].map(criterion => [criterion] as const))('actual AI corpus setup declares current Slack membership without changing identities: AC%s', async criterion => {
+  const root = mkdtempSync(join(tmpdir(), 'ai-membership-control-'))
+  let stub: SlackStub | undefined
+  try {
+    const source = readFileSync(new URL('./real-agent/ai-scenario.sh', import.meta.url), 'utf8')
+    const shared = readFileSync(new URL('./integration/lib/real-scenario.sh', import.meta.url), 'utf8')
+    const afterPersona = source.slice(source.indexOf('real_persona "aiac${AI_CRITERION}"'))
+    const rewrite = afterPersona.match(/\nif \[\[ [^\n]+\n[\s\S]*?\nfi/)![0]
+    const controlBlock = source.match(/    python3 - [^\n]+<<'CONTROL'\n[\s\S]*?\nCONTROL/)![0]
+    const stubControl = shared.split('\n').find(line => line.includes("jq -s '{tokens:"))!
+    expect(rewrite).toContain('"${REAL_PERSONAS}"')
+    expect(stubControl).toContain('"${REAL_TOKENS}"')
+    const corpusMode = [11, 12, 20].includes(criterion)
+    const names = corpusMode ? ['corpuspeer', `aiac${criterion}`] : [`aiac${criterion}`]
+    const personas = names.map(name => makePersona({ name, channels: [{ id: `C0${name.toUpperCase()}`, delivery: 'all' }] }, root))
+    const tokens = names.map(label => ({ suffix: label, label, user_id: `U0${label.toUpperCase()}BOT`, bot_id: `B0${label.toUpperCase()}`,
+      memberships: [`C0${label.toUpperCase()}`], auth: 'ok', connections: 'ok' }))
+    const personaPath = join(root, 'personas.jsonl'), tokenPath = join(root, 'tokens.jsonl')
+    const stubDir = join(root, 'real-slack-stub'), recordPath = join(root, 'requests.jsonl')
+    mkdirSync(stubDir)
+    writeFileSync(personaPath, personas.map(row => JSON.stringify(row)).join('\n') + '\n')
+    writeFileSync(tokenPath, tokens.map(row => JSON.stringify(row)).join('\n') + '\n')
+    const corpus = auditedAICorpus().ai
+    writeFileSync(join(root, 'corpus.json'), JSON.stringify(corpus))
+    // Execute only the actual fixture rewrite and control builders, never a
+    // scenario entrypoint, server start, native agent or model request.
+    const script = join(root, 'control.sh')
+    writeFileSync(script, `set -eu\n${rewrite}\ndir="$SCENARIO_ROOT/real-slack-stub"\n${stubControl}\n${corpusMode ? controlBlock : 'cp "$dir/control.json" "$EXPECTED/control.json"'}\n`)
+    const child = spawnSync('bash', [script], {
+      env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'mv', 'python3', 'cp'], extras: {
+        AI_CRITERION: String(criterion), REAL_PERSONAS: personaPath, REAL_TOKENS: tokenPath, SCENARIO_ROOT: root, EXPECTED: root,
+      } }), encoding: 'utf8', timeout: 5000,
+    })
+    expect(child.error).toBeUndefined(); expect(child.status).toBe(0)
+    const configured = readFileSync(personaPath, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    const control: StubControl = JSON.parse(readFileSync(join(root, 'control.json'), 'utf8'))
+    const corpusChannels = [...new Set<string>(corpus.map((row: any) => row.msg.chat_id as string).filter((id: string) => id.startsWith('C')))]
+    expect(corpusChannels).toHaveLength(1)
+    stub = startSlackStub({ recordPath })
+    const captured: unknown[] = [child.stdout, child.stderr, configured, control]
+    // Metadata alone must not authorize corpus membership; replacing the
+    // token declarations with their pre-rewrite values reproduces the bug.
+    for (const current of [false, true]) {
+      const update = await fetch(new URL('../_control', stub.apiUrl), { method: 'POST',
+        body: JSON.stringify(current ? control : { ...control, tokens }), headers: { 'Content-Type': 'application/json' } })
+      expect(update.status).toBe(200)
+      captured.push(await update.json())
+      for (const [i, token] of tokens.entries()) {
+        const headers = { Authorization: `Bearer ${fakeToken(BOT_TOKEN_PREFIX, token.suffix)}` }
+        const identity = await fetch(`${stub.apiUrl}auth.test`, { headers }).then(r => r.json())
+        expect(identity).toMatchObject({ ok: true, user_id: token.user_id, bot_id: token.bot_id })
+        const page = await fetch(`${stub.apiUrl}users.conversations`, { headers }).then(r => r.json())
+        captured.push(identity, page)
+        const expected = current && corpusMode ? corpusChannels : token.memberships
+        expect(page).toMatchObject({ ok: true, response_metadata: { next_cursor: '' } })
+        expect(page.channels.map((channel: { id: string }) => channel.id)).toEqual(expected)
+        if (current) expect(configured[i]).toEqual({ ...personas[i], channels: expected.map(id => ({ id, delivery: 'all' })) })
+      }
+    }
+    expect(control.default).toEqual({ auth: 'invalid_auth', connections: 'invalid_auth' })
+    expect(control.tokens?.map(({ memberships, ...identity }) => identity)).toEqual(tokens.map(({ memberships, ...identity }) => identity))
+    assertNoLeak({ captured, record: writtenFile(recordPath), control: writtenFile(join(root, 'control.json')) })
+  } finally { await stub?.stop(); rmSync(root, { recursive: true, force: true }) }
 })
 
 // Generation plus one jq event per case costs about 0.2 s here, so the test
@@ -1494,6 +1595,8 @@ test.each([
   ['extra neutralization permission', 'manifest', (audit: any) => { audit.cases[4].change = { from: '/help', to: '/status' }; return audit }, 'unapproved AI body neutralization'],
   ['missing reviewed input source', 'manifest', (audit: any) => { audit.prompt_input_sources.pop(); return audit }, 'AI prompt/input source inventory changed'],
   ['generated inline prompt', 'scenario', (bytes: string) => bytes.replace('Please acknowledge this DM.', 'Please echo another marker.'), 'reviewed AI prompt/input source changed'],
+  ['corpus membership declaration', 'scenario', (bytes: string) => bytes.replace('.memberships=["C0TESTCHAN1"]', '.memberships=[]'), 'reviewed AI prompt/input source changed: real-agent/ai-scenario.sh'],
+  ['shared persona default prompt', 'shared-scenario', (bytes: string) => bytes.replace('Acknowledge every relayed channel message with exactly OK.', 'Reply with another marker.'), 'reviewed AI prompt/input source changed: integration/lib/real-scenario.sh'],
 ] as const)('rejects unreviewed %s drift before an AI trial', (_name, target, mutate, reason) => {
   const root = mkdtempSync(join(tmpdir(), 'ai-input-audit-'))
   try {
@@ -1505,7 +1608,7 @@ test.each([
       mkdirSync(dirname(join(root, file)), { recursive: true })
       copyFileSync(join(tests, file), join(root, file))
     }
-    const path = join(root, target === 'canonical' ? files[0]! : target === 'ai' ? files[1]! : target === 'manifest' ? files[2]! : 'real-agent/ai-scenario.sh')
+    const path = join(root, target === 'canonical' ? files[0]! : target === 'ai' ? files[1]! : target === 'manifest' ? files[2]! : target === 'shared-scenario' ? 'integration/lib/real-scenario.sh' : 'real-agent/ai-scenario.sh')
     const bytes = readFileSync(path, 'utf8')
     writeFileSync(path, target === 'ai' || target === 'manifest' ? JSON.stringify(mutate(JSON.parse(bytes) as any)) : mutate(bytes as any))
     expect(() => auditedAICorpus(root)).toThrow(reason)

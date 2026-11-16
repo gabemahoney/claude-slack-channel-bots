@@ -1,5 +1,19 @@
+import { _assignFixture, fixtureThreadHybridSince } from './test-helpers/shared-channels.ts'
+import { activationRecord, applicationState } from './test-helpers/shared-channels.ts'
+import { THREAD_ROOTS, threadPath, threadFsControls, readThreads } from './test-helpers/thread-memory.ts'
+import { THREAD_MEMORY_RETRY_MIN_MS } from '../src/delivery-constants.ts'
+import { buildThreadMemoryNotSavedNotice } from '../src/thread-memory-reports.ts'
+import * as nodeFs from 'node:fs'
+import { membershipPage, deliveryAttempt, holdsLifetime, expectCurrent, expectSuperseded } from './test-helpers/shared-channels.ts'
+import { buildOperatorAssignment } from '../src/reload-request.ts'
+import { reviewOutcomeLine } from '../src/reload-review.ts'
 import { REPLY_TOOL_ALLOW_RULE } from '../src/agent-director-template.ts'
-import { queuePath, readQueue } from './test-helpers/delivery-queue.ts'
+import { createHash } from 'node:crypto'
+import { injectedInput, queuePath, readQueue, slackInput, sentRecord, deliveredRecord } from './test-helpers/delivery-queue.ts'
+import { RETYPE_BACKOFF_MS } from '../src/delivery-constants.ts'
+import { describeThrownValue } from '../src/persona-connection-errors.ts'
+import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
+import { createReplyReminders, REPLY_TOOL_PREALLOWED_LABEL, type ReplyReminders } from '../src/reply-reminder.ts'
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
 import { botSystemPromptPath } from '../src/bot-system-prompt.ts'
@@ -13,18 +27,8 @@ import { existsSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileS
 import { dirname, join, relative } from 'node:path'
 
 import type { DecideParams } from 'agent-director'
-import {
-  CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED,
-  CHANNEL_DELIVERY_DROP_NOT_APPLIED,
-  CHANNEL_DELIVERY_DROP_RETIRED,
-  CHANNEL_DELIVERY_FORMAT_VERSION,
-  CHANNEL_DELIVERY_UNREADABLE,
-  channelDeliveryDropLine,
-  channelDeliveryUnreadableLine,
-  parseChannelDelivery,
-  SET_CHANNEL_DELIVERY_TOOL,
-} from '../src/channel-delivery.ts'
 import type { ChannelMode, DeliveryMode, PersonaConfigInput, PersonaInput } from '../src/config.ts'
+
 import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
 import {
   KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN,
@@ -51,7 +55,6 @@ import { handlePermissionClick } from '../src/permission-click-handler.ts'
 import { _resetPollerState, getLivePermission, stopPermissionPoller } from '../src/permission-poller.ts'
 import { isCredentialsBroken, type PersonaBringUpOutcome } from '../src/persona-bringup-controller.ts'
 import { destinationClearedCause, destinationFailedCause, type DestinationFailedAt } from '../src/persona-destination-hold.ts'
-import { destinationSettingOf, FUNGIBLE_DESTINATION_SETTING } from '../src/persona-destination.ts'
 import {
   formatPersonaDiagnostic,
   PERSONA_CONFIG_DIR_UNRESOLVABLE,
@@ -63,7 +66,7 @@ import {
   PERSONA_DESTINATION_FAILED,
   PERSONA_DIRECTORY_MISSING,
   PERSONA_DM_DROPPED,
-  PERSONA_INVITED_CHANNEL,
+  PERSONA_OPEN_CHANNEL,
   PERSONA_SLACK_UNREACHABLE,
   UNCLAIMED_CHANNEL,
 } from '../src/persona-diagnostics.ts'
@@ -72,12 +75,13 @@ import { DM_DESTINATION_SETTINGS as LIFECYCLE_DM_DESTINATION_SETTINGS } from '..
 import { formatPersonaNotice, PERSONA_TEARDOWN_NOTICE_DURING_WAIT } from '../src/persona-notifier.ts'
 import {
   channelDeliveryDeclarativeRefusal,
-  channelDeliverySetResultText,
   channelDeliveryUnreadableRefusal,
   personaNotAppliedRefusal,
   type SessionEntry,
 } from '../src/registry.ts'
+import { buildReactionDroppedLine, REACTION_DROPPED } from '../src/reaction-intake-diagnostics.ts'
 import { renderNoopLogLine } from '../src/reload-apply.ts'
+import { errnoSuffix } from '../src/persona-credentials.ts'
 import { DESTRUCTIVE_SETTINGS, MODE_SWITCH_SETTING, type DestructiveSetting, type InPlaceSetting } from '../src/reload-plan.ts'
 import {
   RELOAD_APPLIED,
@@ -85,9 +89,11 @@ import {
   RELOAD_RECORD_WRITE_FAILED,
   RELOAD_RETIRED_KEYS_RESTORE_FAILED,
   RELOAD_RETIRED_KEYS_RESTORED,
-  reloadChannelDeliveryWriteFailedLine,
+  reloadPostApplyFailedLine,
   reloadRetiredKeysPutBackClause,
   reloadRetiredKeysPutBackFailedClause,
+  reloadSharedAuthorityApplyFailedLine,
+  type ReloadApplyFailure,
 } from '../src/reload.ts'
 import { LAUNCH_RESUMED_UNREPORTED, type LaunchSessionResult } from '../src/restart.ts'
 import {
@@ -111,6 +117,7 @@ import {
   cannedErr,
   cannedFindMissing,
   cannedGetResultPlural,
+  cannedGetResult,
   cannedKillResult,
   cannedListRow,
   cannedOk,
@@ -131,6 +138,7 @@ import {
   assertNoLeak,
   BOT_TOKEN_PREFIX,
   fakeToken,
+  LEAK_SENTINEL,
   REDACTED_SENTINEL_TAIL,
   sentinelInMessage,
   withoutName,
@@ -158,11 +166,17 @@ import {
 import { readRetiredKeysRecord, retiredKeysRecordOf, RFC3339_UTC, writeRetiredKeysRecord } from './test-helpers/retired-keys.ts'
 import {
   makeChannelMessage,
+  makeAppMention,
   makeDeferredConnect,
+  makeDeferredWebApiCall,
   makeDm,
   makePrivateChannelMessage,
+  makeReaction,
   mentionText,
+  broadcastText,
   stubOpenedDmId,
+  type DeferredWebApiCall,
+  type SettledWebApiOutcome,
   type SlackEvent,
   type StubSlackOptions,
   type StubWebCall,
@@ -187,6 +201,612 @@ afterEach(async () => {
 function configOf(...personas: PersonaInput[]): { personas: PersonaInput[] } {
   return { personas }
 }
+
+describe.each(['strict', 'open'] as const)('%s Thread Memory retries at confirmed apply', mode => {
+  const channel = 'C0THREAD1'
+  const options = { channels: [{ id: channel, delivery: 'thread_hybrid' as const }], permission_prompts: 'dm' as const, dm: { enabled: true, contact: 'U0OPERATOR' } }
+  const reportPosts = (run: ReloadRun, key: string, title: string) => run.stub(key).calls.postMessage.filter(p => 'text' in p && String(p.text).includes(`*${title}*`))
+  async function mention(run: ReloadRun, key: string, ts: string) {
+    await run.deliver(key, makeChannelMessage({ channel, ts, thread_ts: THREAD_ROOTS.third,
+      text: `${mentionText(run.stub(key).identity.botUserId)} memory retry fixture` }))
+    await run.clock.flush()
+  }
+  async function checkedRuns(body: () => Promise<void>) {
+    try { await body() } finally {
+      // Check every run even if setup, an assertion, stop or another leak
+      // check failed. The outer afterEach removes files only after this.
+      const failures: unknown[] = []
+      for (const run of h.runs) {
+        try { assertNoLeak(run.captured()) } catch (error) { failures.push(error) }
+        try { await run.stop() } catch (error) { failures.push(error) }
+        try { assertNoLeak(run.captured()) } catch (error) { failures.push(error) }
+      }
+      if (failures.length) throw new AggregateError(failures, 'Thread Memory apply run cleanup checks failed')
+    }
+  }
+
+  test.each(['remove', 'rename'] as const)('%s cancels the old append retry without recreating its journal or disturbing its sibling', async action => checkedRuns(async () => {
+    const io = threadFsControls(h.stateDir)
+    const { run, personas: [alpha, bravo] } = await running([['alpha', options], ['bravo', options]],
+      { sessions: true, top: { channel_mode: mode }, threadMemory: { fs: io.fs } })
+    io.fail('writeSync', 'alpha'); io.fail('writeSync', 'bravo')
+    await mention(run, 'alpha', '1700000500.000001'); await mention(run, 'bravo', '1700000500.000002')
+    expect(reportPosts(run, 'alpha', 'Thread Memory not saved')).toHaveLength(1)
+    expect(reportPosts(run, 'bravo', 'Thread Memory not saved')).toHaveLength(1)
+    const renamed = h.persona('charlie', options)
+    if (action === 'rename') h.materialize(renamed)
+    const untouched = watchUntouched(run, 'alpha')
+    const callsFrom = run.composition!.calls.length
+    const instanceFrom = run.composition!.instanceCallsOf('alpha').length
+    await previewConfig(run, action === 'remove' ? [alpha!] : [alpha!, renamed], { channel_mode: mode })
+    untouched()
+    const cp = run.checkpoint()
+    h.confirm(); await run.ticks.tick()
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: 'bravo', via: 'apply' },
+      ...(action === 'remove' ? [] : [
+        { op: 'bring-up', key: 'charlie', via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+        { op: 'launch', key: 'charlie', via: 'apply' },
+      ] satisfies ReloadLifecycleRecord[]),
+    ])
+    expect(run.lifecycle.applyTimeline).toEqual([
+      { op: 'teardown', key: 'bravo', phase: 'start' },
+      { op: 'teardown', key: 'bravo', phase: 'settled' },
+      ...(action === 'remove' ? [] : [
+        { op: 'bring-up', key: 'charlie', phase: 'start' },
+        { op: 'bring-up', key: 'charlie', phase: 'settled' },
+      ] satisfies ApplyTimelineEntry[]),
+    ])
+    // Apply must leave alpha alone. Its later background recovery is a
+    // separate, permitted report, so check isolation before moving time.
+    untouched()
+    expect(run.composition!.calls.slice(callsFrom).filter(([, key]) => key === 'alpha')).toEqual([])
+    expect(instanceCallsSince(run, 'alpha', instanceFrom)).toEqual([])
+    expect(run.appliedKeys()).toEqual(action === 'remove' ? ['alpha'] : ['alpha', 'charlie'])
+    expect(existsSync(threadPath(h.stateDir, 'bravo'))).toBe(false)
+    expect(run.controller.sharedChannels()!.threadMemoryCreated('bravo')).toBe(false)
+    const oldCalls = io.calls.filter(c => c.path === threadPath(h.stateDir, 'bravo')).length
+    const oldReports = reportPosts(run, 'bravo', 'Thread Memory not saved').length
+    io.heal(); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(io.calls.filter(c => c.path === threadPath(h.stateDir, 'bravo'))).toHaveLength(oldCalls)
+    expect(existsSync(threadPath(h.stateDir, 'bravo'))).toBe(false)
+    expect(run.controller.sharedChannels()!.threadMemoryCreated('bravo')).toBe(false)
+    expect(reportPosts(run, 'bravo', 'Thread Memory not saved')).toHaveLength(oldReports)
+    expect(reportPosts(run, 'bravo', 'Thread Memory recovered')).toEqual([])
+    expect(readThreads(h.stateDir, 'alpha').filter(r => r.kind === 'join')).toHaveLength(1)
+    expect(reportPosts(run, 'alpha', 'Thread Memory recovered')).toHaveLength(1)
+    expect(run.threadMemoryRetryEvents.filter(e => e.type === 'retry-cancelled' && 'key' in e && e.key === 'alpha')).toEqual([])
+    await run.clock.advance(4 * THREAD_MEMORY_RETRY_MIN_MS)
+    expect(existsSync(threadPath(h.stateDir, 'bravo'))).toBe(false)
+    assertNoLeak(run.captured())
+  }))
+
+  test.each(['submitted', 'open'] as const)('destructive modify fences the still-applied key across a read deadline in its %s teardown window', async window => checkedRuns(async () => {
+    await useConfigDirs()
+    const { run: first, personas: [alpha, bravo] } = await running([['alpha', options], ['bravo', options]],
+      { ...REAL_LAUNCH, sessions: true, top: { channel_mode: mode }, threadMemory: {} })
+    await mention(first, 'alpha', '1700000501.000001'); await first.stop()
+    assertNoLeak(first.captured())
+    const io = threadFsControls(h.stateDir); io.fail('readFileSync', 'alpha')
+    const reached = Promise.withResolvers<void>(), stop = Promise.withResolvers<void>()
+    let stops = 0
+    const run = await h.startDetecting({ ...REAL_LAUNCH, threadMemory: { fs: io.fs, stopSequence: key => {
+      if (key !== 'alpha') return Promise.resolve()
+      if (window === 'submitted' || ++stops !== 2) return Promise.resolve()
+      reached.resolve(); return stop.promise
+    } } })
+    for (const key of ['alpha', 'bravo']) {
+      run.registerSession(key); run.stub(key).script.inventory.push(membershipPage([channel]))
+    }
+    await run.membershipClock.runNext(); await run.ticks.tick()
+    const reply = makeChannelMessage({ channel, thread_ts: THREAD_ROOTS.primary, ts: '1700000501.000002', text: 'held reply body' })
+    await run.deliver('alpha', reply); await run.clock.flush()
+    expect(run.queue.unresolvedHolds('alpha')).toHaveLength(1)
+    expect(run.threadMemoryRetryEvents).toContainEqual({ type: 'read-retry-started', key: 'alpha' })
+    const changed = { ...alpha!, working_directory: join(h.root, 'memory-replacement-work') }
+    h.makeWorkingDirectory(changed)
+    const untouched = watchUntouched(run, 'bravo')
+    const callsFrom = run.composition!.calls.length
+    const adFrom = run.composition!.agentDirectorCalls.length
+    const instanceFrom = run.composition!.instanceCallsOf('alpha').length
+    const activityFrom = run.socketActivity('alpha').length
+    const label = h.credentialsLabel('alpha'), id = personaInstanceId('alpha')
+    expect(h.rowOf('alpha')).toMatchObject({ state: 'waiting', cwd: alpha!.working_directory })
+    await previewConfig(run, [changed, bravo!], { channel_mode: mode })
+    untouched()
+    const cp = run.checkpoint()
+    const previousTurn = window === 'submitted' ? run.inPersonaTurn('alpha', async () => { reached.resolve(); await stop.promise }) : Promise.resolve()
+    const bringUp = run.lifecycle.hold('bring-up', 'alpha')
+    let applying: Promise<void> | undefined
+    try {
+      h.confirm(); applying = run.ticks.tick()
+      await reached.promise
+      await run.clock.flush()
+      expect(run.appliedKeys()).toContain('alpha')
+      expect(run.threadMemoryWindow('alpha')).toBe(window)
+      const attempts = io.calls.length
+      io.heal()
+      run.observeThreadMemoryEvent(run.threadMemoryEvents.find(e => e.type === 'read-failed' && e.key === 'alpha')!)
+      run.threadMemoryRetries!.appendFailed('alpha')
+      expect(await run.memoryHolds!.resolve('alpha', 'live')).toBe('cancelled')
+      await run.clock.advance(4 * THREAD_MEMORY_RETRY_MIN_MS)
+      expect(io.calls).toHaveLength(attempts)
+      expect(run.queue.unresolvedHolds('alpha')).toHaveLength(1)
+      expect(run.memoryHoldEvents).toEqual([])
+      expect(reportPosts(run, 'alpha', 'Joins lost')).toEqual([])
+      expect(run.logs.filter(l => l.includes('thread-memory-joins-lost'))).toEqual([])
+      untouched()
+      stop.resolve(); await previousTurn
+      await bringUp.entered
+      // The old life is ended but its row still exists while step 6 waits.
+      expect(h.rowOf('alpha')).toMatchObject({ state: 'ended', cwd: alpha!.working_directory })
+      expect(instanceCallsSince(run, 'alpha', instanceFrom)).toEqual(['kill ok'])
+      expect(run.socketActivity('alpha').slice(activityFrom)).toEqual([`discarded ${label}`, `disconnected ${label}`])
+      untouched()
+    } finally { stop.resolve(); bringUp.release(); await previousTurn; await applying }
+    await run.clock.flush()
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: 'alpha', via: 'apply' },
+      { op: 'bring-up', key: 'alpha', via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key: 'alpha', via: 'apply', action: SPAWN_ACTION_FRESH_RETIRED },
+    ])
+    expect(run.lifecycle.applyTimeline).toEqual([
+      { op: 'teardown', key: 'alpha', phase: 'start' },
+      { op: 'teardown', key: 'alpha', phase: 'settled' },
+      { op: 'bring-up', key: 'alpha', phase: 'start' },
+      { op: 'bring-up', key: 'alpha', phase: 'settled' },
+    ])
+    expect(instanceCallsSince(run, 'alpha', instanceFrom)).toEqual(['kill ok', 'reuse-spawn ok'])
+    expect(lastSpawnOf(run, 'alpha')).toMatchObject({ id, reuse: true, cwd: changed.working_directory, claudeConfigDir: ownConfigDir('alpha') })
+    expect(h.rowOf('alpha')).toMatchObject({ state: 'waiting', cwd: changed.working_directory })
+    expect(run.socketActivity('alpha').slice(activityFrom)).toEqual([
+      `discarded ${label}`, `disconnected ${label}`, `built ${label}`, `started ${label}`, `connected ${label}`,
+    ])
+    untouched()
+    expect(run.composition!.calls.slice(callsFrom).filter(([, key]) => key === 'bravo')).toEqual([])
+    expect(adCallsSince(run, adFrom).filter(call => call.id !== id)).toEqual([])
+    expect(run.threadMemoryWindow('alpha')).toBe('none')
+    expect(run.queue.unresolvedHolds('alpha')).toEqual([])
+    expect(run.memoryHoldEvents).toEqual([
+      { type: 'withdrawn', key: 'alpha', holds: [expect.objectContaining({ thread_ts: THREAD_ROOTS.primary, ts: reply.ts })] },
+      { type: 'resolution-saved', key: 'alpha' },
+    ])
+    expect(reportPosts(run, 'alpha', 'Joins lost')).toHaveLength(1)
+    expect(run.logs.filter(l => l.includes('thread-memory-joins-lost'))).toHaveLength(1)
+    await run.memoryHolds!.resolve('alpha', 'live'); await run.clock.advance(THREAD_MEMORY_RETRY_MIN_MS)
+    expect(reportPosts(run, 'alpha', 'Joins lost')).toHaveLength(1)
+    expect(run.logs.filter(l => l.includes('thread-memory-joins-lost'))).toHaveLength(1)
+    expect(run.threadMemoryRetryEvents.filter(e => e.type === 'read-retry-started')).toHaveLength(1)
+    expect(reportPosts(run, 'bravo', 'Joins lost')).toEqual([])
+    assertNoLeak(run.captured())
+  }))
+})
+
+describe('Thread Memory at confirmed apply', () => {
+  const channel = 'C0THREAD1', root = '1700000000.000001'
+  const pathFor = (key: string) => join(h.stateDir, 'threads', `${key}.jsonl`)
+  async function expectCreatedAfterIo(run: ReloadRun, key: string): Promise<void> {
+    // Publication creates stores behind their durable disk steps. Drain only
+    // existing work, without advancing time or starting a load/flush/retry.
+    await run.clock.flush()
+    expect(run.controller.sharedChannels()!.threadMemoryCreated(key)).toBe(true)
+  }
+  async function seeded(opts: ReloadRunOptions = {}) {
+    const started = await running([
+      ['alpha', { channels: [{ id: channel, delivery: 'thread_hybrid' }], permission_prompts: channel }],
+      ['bravo', { channels: [{ id: channel, delivery: 'thread_hybrid' }], permission_prompts: channel }],
+    ], { ...opts, threadMemory: opts.threadMemory ?? {} })
+    const { run } = started
+    const authority = run.controller.sharedChannels()!
+    for (const key of ['alpha', 'bravo']) {
+      const stamp = authority.channelStamp(key, channel)!
+      if (stamp.kind !== 'decided' || !stamp.threadHybridSince) throw new Error('expected a decided thread stamp')
+      expect(await run.threadMemory!.saveJoins(key, [{ channel, root,
+        stamp: { incarnation: stamp.incarnation, threadHybridSince: stamp.threadHybridSince }, source: 'mention', at: run.threadMemory!.clock(key) }])).toEqual({ kind: 'saved' })
+      expect(run.threadMemory!.view(key, channel, root)).toBe('joined')
+      expect(authority.threadMemoryCreated(key)).toBe(true)
+      const accepted = await run.queue.accept(key, slackInput({ channel, text: `accepted before apply: ${key}` }))
+      expect(accepted.status).toBe('accepted')
+    }
+    await run.prepareQueued()
+    return started
+  }
+
+  test.each((['off', 'mentions', 'all'] as const).flatMap(delivery =>
+    (['addition', 'destructive modify'] as const).map(action => ({ delivery, action })),
+  ))('$action with $delivery and no prior store skips journal reads and creates on the first hybrid apply after storage heals', async ({ delivery, action }) => {
+    const destructive = action === 'destructive modify'
+    if (destructive) await useConfigDirs()
+    const reads: string[] = []
+    let failRead = false
+    const threadFs = { ...nodeFs, readFileSync: ((...args: Parameters<typeof nodeFs.readFileSync>) => {
+      if (String(args[0]) === pathFor('bravo')) {
+        reads.push(String(args[0]))
+        if (failRead) throw Object.assign(new Error('fixture journal read refused'), { code: 'EACCES' })
+      }
+      return Reflect.apply(nodeFs.readFileSync, nodeFs, args)
+    }) as typeof nodeFs.readFileSync }
+    const bravoOptions = { channels: [{ id: channel, delivery }], permission_prompts: channel }
+    const { run, personas: [alpha, oldBravo] } = await running([
+      ['alpha', { channels: [{ id: channel, delivery: 'thread_hybrid' }], permission_prompts: channel }],
+      ...(destructive ? [['bravo', bravoOptions] as PersonaSpec] : []),
+    ], { ...(destructive ? REAL_LAUNCH : {}), threadMemory: { fs: threadFs } })
+    const authority = run.controller.sharedChannels()!
+    const stamp = authority.channelStamp('alpha', channel)!
+    if (stamp.kind !== 'decided' || !stamp.threadHybridSince) throw new Error('expected a decided thread stamp')
+    expect(await run.threadMemory!.saveJoins('alpha', [{ channel, root,
+      stamp: { incarnation: stamp.incarnation, threadHybridSince: stamp.threadHybridSince }, source: 'mention', at: run.threadMemory!.clock('alpha') }])).toEqual({ kind: 'saved' })
+    expect((await run.queue.accept('alpha', slackInput({ channel, text: 'accepted neighbor before apply' }))).status).toBe('accepted')
+    await run.prepareQueued()
+    const neighborJournal = readFileSync(pathFor('alpha'))
+    const neighborQueue = readFileSync(queuePath(h.stateDir, 'alpha'))
+    const untouched = watchUntouched(run, 'alpha')
+    const callsFrom = run.composition!.calls.length
+    const adFrom = run.composition!.agentDirectorCalls.length
+    const bravo = destructive
+      ? { ...oldBravo!, working_directory: join(h.root, 'replacement-work') }
+      : h.persona('bravo', bravoOptions)
+    if (destructive) h.makeWorkingDirectory(bravo)
+    else h.materialize(bravo)
+    const noStore = () => {
+      expect(existsSync(pathFor('bravo'))).toBe(false)
+      expect(authority.threadMemoryCreated('bravo')).toBe(false)
+      expect(run.threadMemoryEvents.filter(event => event.key === 'bravo')).toEqual([])
+      expect(reads).toEqual([])
+    }
+    noStore()
+    failRead = true
+    const cp = run.checkpoint()
+    const instanceFrom = run.composition!.instanceCallsOf('bravo').length
+    const activityFrom = run.socketActivity('bravo').length
+    const label = h.credentialsLabel('bravo')
+    await previewConfig(run, [alpha!, bravo])
+    noStore()
+    expectNoPostNoLeak(run)
+    const gate = run.lifecycle.hold('bring-up', 'bravo')
+    h.confirm()
+    const applying = run.ticks.tick()
+    try {
+      await gate.entered
+      noStore()
+      if (destructive) {
+        expect(h.rowOf('bravo')).toMatchObject({ state: 'ended', cwd: oldBravo!.working_directory })
+        expect(instanceCallsSince(run, 'bravo', instanceFrom)).toEqual(['kill ok'])
+        expect(run.socketActivity('bravo').slice(activityFrom)).toEqual([`discarded ${label}`, `disconnected ${label}`])
+        expect(await run.relaunch('bravo')).toBe('skipped')
+        expect(instanceCallsSince(run, 'bravo', instanceFrom)).toEqual(['kill ok'])
+      }
+    } finally { gate.release(); await applying }
+    expect(run.since(cp).lifecycle).toEqual([
+      ...(destructive ? [{ op: 'teardown', key: 'bravo', via: 'apply' } as const] : []),
+      { op: 'bring-up', key: 'bravo', via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      ...(destructive ? [{ op: 'launch', key: 'bravo', via: 'restart', restart: 'skipped' } as const] : []),
+      { op: 'launch', key: 'bravo', via: 'apply', ...(destructive ? { action: SPAWN_ACTION_FRESH_RETIRED } : {}) },
+    ])
+    expect(run.lifecycle.applyTimeline).toEqual([
+      ...(destructive ? [
+        { op: 'teardown', key: 'bravo', phase: 'start' },
+        { op: 'teardown', key: 'bravo', phase: 'settled' },
+      ] satisfies ApplyTimelineEntry[] : []),
+      { op: 'bring-up', key: 'bravo', phase: 'start' },
+      { op: 'bring-up', key: 'bravo', phase: 'settled' },
+    ])
+    expect(run.socketActivity('bravo').slice(activityFrom)).toEqual([
+      ...(destructive ? [`discarded ${label}`, `disconnected ${label}`] : []),
+      `built ${label}`, `started ${label}`, `connected ${label}`,
+    ])
+    expect(instanceCallsSince(run, 'bravo', instanceFrom)).toEqual(destructive ? ['kill ok', 'reuse-spawn ok'] : [])
+    if (destructive) {
+      expect(lastSpawnOf(run, 'bravo')).toMatchObject({ id: personaInstanceId('bravo'), reuse: true, cwd: bravo.working_directory, claudeConfigDir: ownConfigDir('bravo') })
+      expect(h.rowOf('bravo')).toMatchObject({ state: 'waiting', cwd: bravo.working_directory })
+    }
+    expect(run.appliedKeys()).toEqual(['alpha', 'bravo'])
+    expect(run.isUp('bravo')).toBe(true)
+    noStore()
+    await expectNothingPendingAfter(run)
+    noStore()
+    expectNoPostNoLeak(run)
+
+    // Heal before the first hybrid choice. Only the real apply publication
+    // drives creation: no direct loadKey/flush can rescue a poisoned store.
+    failRead = false
+    const hybrid = { ...bravo, channels: [{ id: channel, delivery: 'thread_hybrid' as const }] }
+    const hybridCp = run.checkpoint()
+    const hybridCallsFrom = run.composition!.agentDirectorCalls.length
+    const bravoSlack = slackSideOf(run, 'bravo')
+    await previewConfig(run, [alpha!, hybrid])
+    noStore()
+    expectNoPostNoLeak(run)
+    h.confirm()
+    await run.ticks.tick()
+    await expectCreatedAfterIo(run, 'bravo')
+    expect(run.since(hybridCp).lifecycle).toEqual([
+      // The identity reset retired the previous channel assignment.
+      { op: 'update-in-place', key: 'bravo', via: 'apply', settings: [destructive ? 'channels' : 'delivery'] },
+    ])
+    expect(run.lifecycle.applyTimeline.slice(-2)).toEqual([
+      { op: 'update-in-place', key: 'bravo', phase: 'start' },
+      { op: 'update-in-place', key: 'bravo', phase: 'settled' },
+    ])
+    expect(authority.threadView().threadHybridChannels('bravo')).toEqual([channel])
+    expect(authority.channelStamp('bravo', channel)).toMatchObject({ kind: 'decided', threadHybridSince: expect.any(String) })
+    expect(existsSync(pathFor('bravo'))).toBe(true)
+    expect(run.threadMemory!.store('bravo')).toMatchObject({ readable: true, created: true })
+    expect(run.threadMemory!.view('bravo', channel, root)).toBe('not-joined')
+    expect(run.threadMemoryEvents.filter(event => event.key === 'bravo')).toEqual([{ type: 'created', key: 'bravo', path: pathFor('bravo') }])
+    expect(reads).toEqual([])
+    expect(slackSideOf(run, 'bravo')).toEqual(bravoSlack)
+    expect(adCallsSince(run, hybridCallsFrom)).toEqual([])
+    await expectNothingPendingAfter(run)
+    untouched()
+    expect(run.composition!.calls.slice(callsFrom).filter(([, key]) => key === 'alpha')).toEqual([])
+    expect(adCallsSince(run, adFrom).filter(call => call.id !== personaInstanceId('bravo'))).toEqual([])
+    expect(readFileSync(pathFor('alpha'))).toEqual(neighborJournal)
+    expect(readFileSync(queuePath(h.stateDir, 'alpha'))).toEqual(neighborQueue)
+    expect(run.queue.openCount('alpha')).toBe(1)
+    expect(run.threadMemory!.view('alpha', channel, root)).toBe('joined')
+    expect(run.lifecycle.startPasses).toHaveLength(1)
+    expect(h.runs).toHaveLength(1)
+    const captures = () => ({ files: h.serverSideFiles(h.paths.config, alpha!.credentials_file, bravo.credentials_file),
+      agentDirectorCalls: run.composition!.agentDirectorCalls, makeTemplateCalls: run.composition!.agentDirector.makeTemplateCalls })
+    for (const capturedRun of h.runs) expectNoPostNoLeak(capturedRun, captures())
+    await run.stop()
+    for (const capturedRun of h.runs) expectNoPostNoLeak(capturedRun, captures())
+  })
+
+  test('the durable-I/O marker assertion rejects when creation is withheld', async () => {
+    const { run, personas: [bravo] } = await running([
+      ['bravo', { channels: [{ id: channel, delivery: 'off' }], permission_prompts: channel }],
+    ], { threadMemory: {} })
+    const authority = run.controller.sharedChannels()!
+    expect(authority.threadMemoryCreated('bravo')).toBe(false)
+    const marker = spyOn(authority, 'setThreadMemoryCreated').mockReturnValue({ kind: 'failed' })
+    try {
+      await previewConfig(run, [{ ...bravo!, channels: [{ id: channel, delivery: 'thread_hybrid' }] }])
+      expectNoPostNoLeak(run)
+      h.confirm()
+      await run.ticks.tick()
+      const now = run.clock.now()
+      // Only the helper's strict toBe(true) on the marker, with or without bun's colour codes.
+      const sgr = '(?:\\u001b\\[[0-9;]*m)*'
+      await expect(expectCreatedAfterIo(run, 'bravo')).rejects.toThrow(
+        new RegExp(`toBe${sgr}\\(${sgr}expected${sgr}\\)${sgr}\\n\\nExpected: ${sgr}true${sgr}\\nReceived: ${sgr}false${sgr}\\n$`))
+      expect(marker).toHaveBeenCalledWith('bravo')
+      expect(authority.threadMemoryCreated('bravo')).toBe(false)
+      expect(run.threadMemoryEvents.some(event => event.type === 'creation-failed' && event.key === 'bravo')).toBe(true)
+      // The failed marker save is reported once, to bravo's prompt channel.
+      const key = h.key('bravo')
+      const notice = buildThreadMemoryNotSavedNotice(renderPersonaRef('bravo', key), [channel], pathFor(key), 'marker',
+        new Error('Thread Memory created marker was not saved'))
+      expect(run.slackPosts().map(postOf)).toEqual([{ channel, text: formatPersonaNotice({ name: 'bravo', key }, notice) }])
+      expect(run.stub('bravo').calls.postMessage).toHaveLength(1)
+      expect(run.clock.now()).toBe(now)
+      assertNoLeak(run.captured())
+    } finally { marker.mockRestore() }
+  })
+
+  test.each(['remove', 'rename'] as const)('%s unlinks only the old key after teardown, clears its marker afterward and preserves accepted queues', async action => {
+    let run!: ReloadRun
+    const unlinkObservations: unknown[] = []
+    const started = await seeded({ threadMemory: { fs: { ...nodeFs, unlinkSync(path) {
+      if (String(path) === pathFor('bravo')) unlinkObservations.push({
+        settled: run.lifecycle.timeline.some(e => e.op === 'teardown' && e.key === 'bravo' && e.phase === 'settled'),
+        marker: run.controller.sharedChannels()!.threadMemoryCreated('bravo'),
+      })
+      nodeFs.unlinkSync(path)
+    } } } })
+    run = started.run
+    const [alpha, bravo] = started.personas
+    const before = ['alpha', 'bravo'].map(key => readFileSync(queuePath(h.stateDir, key)))
+    const siblingBytes = readFileSync(pathFor('alpha'))
+    const renamed = h.persona('charlie', { channels: bravo!.channels, permission_prompts: channel })
+    if (action === 'rename') h.materialize(renamed)
+    const untouched = watchUntouched(run, 'alpha')
+    const cp = run.checkpoint()
+    const callsFrom = run.composition!.calls.length
+    await previewConfig(run, action === 'remove' ? [alpha!] : [alpha!, renamed])
+    expectNoPostNoLeak(run)
+    const gate = run.lifecycle.hold('teardown', 'bravo')
+    h.confirm()
+    const applying = run.ticks.tick()
+    try {
+      await gate.entered
+      expect(existsSync(pathFor('bravo'))).toBe(true)
+      expect(run.controller.sharedChannels()!.threadMemoryCreated('bravo')).toBe(true)
+      expect(unlinkObservations).toEqual([])
+    } finally { gate.release(); await applying }
+    // Publication creates the renamed persona's store in the background, behind its header's disk wait.
+    await run.clock.flush()
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: 'bravo', via: 'apply' },
+      ...(action === 'remove' ? [] : [
+        { op: 'bring-up', key: 'charlie', via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+        { op: 'launch', key: 'charlie', via: 'apply' },
+      ] satisfies ReloadLifecycleRecord[]),
+    ])
+    expect(run.lifecycle.applyTimeline).toEqual([
+      { op: 'teardown', key: 'bravo', phase: 'start' },
+      { op: 'teardown', key: 'bravo', phase: 'settled' },
+      ...(action === 'remove' ? [] : [
+        { op: 'bring-up', key: 'charlie', phase: 'start' },
+        { op: 'bring-up', key: 'charlie', phase: 'settled' },
+      ] satisfies ApplyTimelineEntry[]),
+    ])
+    untouched()
+    expect(run.composition!.calls.slice(callsFrom).filter(([, key]) => key === 'alpha')).toEqual([])
+    expect(unlinkObservations).toEqual([{ settled: true, marker: true }])
+    expect(existsSync(pathFor('bravo'))).toBe(false)
+    expect(run.controller.sharedChannels()!.threadMemoryCreated('bravo')).toBe(false)
+    expect(readFileSync(pathFor('alpha'))).toEqual(siblingBytes)
+    expect(run.threadMemory!.view('alpha', channel, root)).toBe('joined')
+    expect(['alpha', 'bravo'].map(key => readFileSync(queuePath(h.stateDir, key)))).toEqual(before)
+    for (const key of ['alpha', 'bravo']) {
+      expect(run.queue.openCount(key)).toBe(1)
+      expect(run.queue.items(key)[0]!.fixed!.parts.join('')).toContain(`accepted before apply: ${key}`)
+    }
+    if (action === 'rename') {
+      expect(existsSync(pathFor('charlie'))).toBe(true)
+      expect(run.controller.sharedChannels()!.threadMemoryCreated('charlie')).toBe(true)
+      expect(run.threadMemory!.view('charlie', channel, root)).toBe('not-joined')
+    }
+    expectNoPostNoLeak(run)
+  })
+
+  test('a destructive modify keeps its store identity, forgets the old incarnation and leaves accepted work deliverable', async () => {
+    await useConfigDirs()
+    const { run, personas: [alpha, bravo] } = await seeded(REAL_LAUNCH)
+    const authority = run.controller.sharedChannels()!
+    const oldStamp = authority.channelStamp('bravo', channel)
+    const storeId = run.threadMemory!.store('bravo')!.storeId
+    const sibling = readFileSync(pathFor('alpha'))
+    const queues = ['alpha', 'bravo'].map(key => readFileSync(queuePath(h.stateDir, key)))
+    const changed = { ...bravo!, working_directory: join(h.root, 'replacement-work') }
+    h.makeWorkingDirectory(changed)
+    const untouched = watchUntouched(run, 'alpha')
+    const cp = run.checkpoint()
+    const callsFrom = run.composition!.calls.length
+    const adFrom = run.composition!.agentDirectorCalls.length
+    const instanceFrom = run.composition!.instanceCallsOf('bravo').length
+    const activityFrom = run.socketActivity('bravo').length
+    const label = h.credentialsLabel('bravo')
+    const bravoId = personaInstanceId('bravo')
+    expect(h.rowOf('bravo')?.state).toBe('waiting')
+    await previewConfig(run, [alpha!, changed])
+    expectNoPostNoLeak(run)
+    const gate = run.lifecycle.hold('bring-up', 'bravo')
+    h.confirm()
+    const applying = run.ticks.tick()
+    try {
+      await gate.entered
+      expect(h.rowOf('bravo')).toMatchObject({ state: 'ended', cwd: bravo!.working_directory })
+      expect(instanceCallsSince(run, 'bravo', instanceFrom)).toEqual(['kill ok'])
+      expect(run.socketActivity('bravo').slice(activityFrom)).toEqual([`discarded ${label}`, `disconnected ${label}`])
+      expect(await run.relaunch('bravo')).toBe('skipped')
+      expect(instanceCallsSince(run, 'bravo', instanceFrom)).toEqual(['kill ok'])
+    } finally { gate.release(); await applying }
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: 'bravo', via: 'apply' },
+      { op: 'bring-up', key: 'bravo', via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key: 'bravo', via: 'restart', restart: 'skipped' },
+      { op: 'launch', key: 'bravo', via: 'apply', action: SPAWN_ACTION_FRESH_RETIRED },
+    ])
+    expect(run.lifecycle.applyTimeline).toEqual([
+      { op: 'teardown', key: 'bravo', phase: 'start' },
+      { op: 'teardown', key: 'bravo', phase: 'settled' },
+      { op: 'bring-up', key: 'bravo', phase: 'start' },
+      { op: 'bring-up', key: 'bravo', phase: 'settled' },
+    ])
+    expect(instanceCallsSince(run, 'bravo', instanceFrom)).toEqual(['kill ok', 'reuse-spawn ok'])
+    expect(lastSpawnOf(run, 'bravo')).toMatchObject({ id: bravoId, reuse: true, cwd: changed.working_directory, claudeConfigDir: ownConfigDir('bravo') })
+    expect(h.rowOf('bravo')).toMatchObject({ state: 'waiting', cwd: changed.working_directory })
+    expect(run.socketActivity('bravo').slice(activityFrom)).toEqual([
+      `discarded ${label}`, `disconnected ${label}`, `built ${label}`, `started ${label}`, `connected ${label}`,
+    ])
+    untouched()
+    expect(run.composition!.calls.slice(callsFrom).filter(([, key]) => key === 'alpha')).toEqual([])
+    expect(adCallsSince(run, adFrom).filter(call => call.id !== bravoId)).toEqual([])
+    expect(authority.channelStamp('bravo', channel)).not.toEqual(oldStamp)
+    expect(existsSync(pathFor('bravo'))).toBe(true)
+    expect(authority.threadMemoryCreated('bravo')).toBe(true)
+    expect(run.threadMemory!.store('bravo')!.storeId).toBe(storeId)
+    expect(run.threadMemory!.view('bravo', channel, root)).toBe('not-joined')
+    expect(run.threadMemory!.view('alpha', channel, root)).toBe('joined')
+    expect(readFileSync(pathFor('alpha'))).toEqual(sibling)
+    expect(['alpha', 'bravo'].map(key => readFileSync(queuePath(h.stateDir, key)))).toEqual(queues)
+    const item = run.queue.items('bravo')[0]!
+    // The production executor sends the unchanged pre-reset item and observes
+    // a transcript receipt through the established fake-AD delivery driver.
+    expect(item.fixed!.parts.join('')).toContain('accepted before apply: bravo')
+    const delivery = await makeEngineHarness({ queue: run.queue, stateDir: h.stateDir, keys: ['bravo'] })
+    try {
+      await delivery.tick('bravo')
+      await delivery.until(() => run.queue.openCount('bravo') === 0)
+      expect(delivery.textCalls('bravo').map(call => call.params.text)).toEqual(item.fixed!.parts)
+      expect(run.queue.items('bravo')[0]!.delivered).toBe(true)
+      expect(delivery.errors).toEqual([])
+      expect(delivery.restarts).toEqual([])
+      expect(readFileSync(queuePath(h.stateDir, 'alpha'))).toEqual(queues[0]!)
+      expect(run.queue.openCount('alpha')).toBe(1)
+      assertNoLeak({ calls: delivery.calls, events: delivery.events, errors: delivery.errors })
+    } finally { await delivery.cleanup() }
+    expectNoPostNoLeak(run)
+  })
+
+  test('a failed unlink preserves the marker, does not fail apply and is retried on the next start', async () => {
+    let failures = 0
+    const { run, personas: [alpha] } = await seeded({ threadMemory: { fs: { ...nodeFs, unlinkSync(path) {
+      if (String(path) === pathFor('bravo')) { failures++; throw Object.assign(new Error('unlink failed'), { code: 'EACCES' }) }
+      nodeFs.unlinkSync(path)
+    } } } })
+    const bytes = readFileSync(pathFor('bravo'))
+    const queues = ['alpha', 'bravo'].map(key => readFileSync(queuePath(h.stateDir, key)))
+    const untouched = watchUntouched(run, 'alpha')
+    const cp = run.checkpoint()
+    const callsFrom = run.composition!.calls.length
+    await previewConfig(run, [alpha!])
+    expectNoPostNoLeak(run)
+    h.confirm()
+    await run.ticks.tick()
+    expect(run.since(cp).lifecycle).toEqual([{ op: 'teardown', key: 'bravo', via: 'apply' }])
+    expect(run.lifecycle.applyTimeline).toEqual([
+      { op: 'teardown', key: 'bravo', phase: 'start' },
+      { op: 'teardown', key: 'bravo', phase: 'settled' },
+    ])
+    untouched()
+    expect(run.composition!.calls.slice(callsFrom).filter(([, key]) => key === 'alpha')).toEqual([])
+    expect(run.appliedKeys()).toEqual(['alpha'])
+    expect(failures).toBe(1)
+    expect(readFileSync(pathFor('bravo'))).toEqual(bytes)
+    expect(run.controller.sharedChannels()!.threadMemoryCreated('bravo')).toBe(true)
+    expect(['alpha', 'bravo'].map(key => readFileSync(queuePath(h.stateDir, key)))).toEqual(queues)
+    expectNoPostNoLeak(run)
+    await run.stop()
+    const reopened = await h.start({ threadMemory: {} })
+    expect(reopened.outcome.kind).toBe('applied')
+    expect(existsSync(pathFor('bravo'))).toBe(false)
+    expect(reopened.controller.sharedChannels()!.threadMemoryCreated('bravo')).toBe(false)
+    expect(reopened.threadMemory!.view('alpha', channel, root)).toBe('joined')
+    expect(reopened.queue.items('bravo')[0]!.fixed!.parts.join('')).toContain('accepted before apply: bravo')
+    expectNoPostNoLeak(run)
+    expectNoPostNoLeak(reopened)
+  })
+
+  test('dry-run activation and removing apply leave existing Thread Memory bytes and marker intact', async () => {
+    const { run, personas: [alpha] } = await seeded()
+    expectNoPostNoLeak(run)
+    await run.stop()
+    expectNoPostNoLeak(run)
+    const before = ['alpha', 'bravo'].map(key => readFileSync(pathFor(key)))
+    const writes: string[] = []
+    const dry = await h.startDetecting({ dryRun: true, threadMemory: { fs: { ...nodeFs,
+      openSync: ((path: nodeFs.PathLike, flags: nodeFs.OpenMode, mode?: nodeFs.Mode) => {
+        if (flags !== 'r') writes.push(String(path))
+        return nodeFs.openSync(path, flags, mode)
+      }) as typeof nodeFs.openSync,
+      unlinkSync(path) { writes.push(String(path)); nodeFs.unlinkSync(path) },
+    } } })
+    const cp = dry.checkpoint()
+    const callsFrom = dry.composition!.calls.length
+    await previewConfig(dry, [alpha!])
+    expectNoPostNoLeak(dry)
+    h.confirm()
+    await dry.ticks.tick()
+    expect(dry.since(cp).lifecycle).toEqual([{ op: 'teardown', key: 'bravo', via: 'apply' }])
+    expect(dry.lifecycle.applyTimeline).toEqual([
+      { op: 'teardown', key: 'bravo', phase: 'start' },
+      { op: 'teardown', key: 'bravo', phase: 'settled' },
+    ])
+    expect(dry.slack.builds).toEqual([])
+    expect(dry.socketActivity('alpha')).toEqual([])
+    expect(Object.values(dry.slackCalls()).flat()).toEqual([])
+    expect(dry.composition!.calls.slice(callsFrom).filter(([, key]) => key === 'alpha')).toEqual([])
+    expect(dry.appliedKeys()).toEqual(['alpha'])
+    expect(writes).toEqual([])
+    expect(['alpha', 'bravo'].map(key => readFileSync(pathFor(key)))).toEqual(before)
+    expect(dry.controller.sharedChannels()!.threadMemoryCreated('bravo')).toBe(true)
+    expectNoPostNoLeak(dry)
+  })
+})
 
 /** Top-level (server-wide) settings in file form. */
 type TopLevel = Partial<Omit<PersonaConfigInput, 'personas'>>
@@ -238,7 +858,13 @@ async function running(
   const run = await h.startDetecting(runOpts)
   await run.ticks.tick()
   expect(h.pendingExists()).toBe(false)
-  if (sessions) for (const persona of personas) run.registerSession(persona.name)
+  if (sessions) {
+    for (const persona of personas) {
+      run.registerSession(persona.name)
+      run.stub(persona.name).script.inventory.push(membershipPage(persona.channels!.map(c => c.id)))
+    }
+    await run.membershipClock.runNext()
+  }
   return { run, personas }
 }
 
@@ -286,10 +912,19 @@ function expectNoPostNoLeak(run: ReloadRun, extra?: Record<string, unknown>): vo
 async function expectNothingPendingAfter(run: ReloadRun): Promise<void> {
   expect(h.pendingExists()).toBe(false)
   expect(h.applyExists()).toBe(false)
-  expect(h.readRecord()).toEqual(h.readConfig()!)
+  expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(h.readConfig()!.toString()))
   const cp = run.checkpoint()
+  const before = applicationState(h.readRecord()!)
+  await run.ticks.tick()
+  const first = run.since(cp)
+  expect(first.writes.length).toBeLessThanOrEqual(1)
+  expect(first.writes).toEqual(first.writes.length ? [h.lastAppliedWrite()] : [])
+  const metadataOnly = { ...first }; metadataOnly.writes = []
+  expect(metadataOnly).toEqual(NO_RUN_ACTIVITY)
+  expect(applicationState(h.readRecord()!)).toEqual(before)
+  const settled = run.checkpoint()
   await run.ticks.ticks(3)
-  expect(run.since(cp)).toEqual(NO_RUN_ACTIVITY)
+  expect(run.since(settled)).toEqual(NO_RUN_ACTIVITY)
 }
 
 /** Yield event-loop turns (no timer) until `cond` holds; fails if it never does. */
@@ -479,10 +1114,10 @@ describe('the dry-run sprint demo: a confirmed addition (real composition, dry r
     // Edit, check: the pending file previews the addition and nothing is applied.
     h.writeConfig(configOf(alpha!, charlie))
     await run.ticks.tick()
-    expect(h.pendingLines()).toEqual([
+    expect(h.pendingLines()).toEqual([...[
       `A configuration change is pending; nothing has been applied. ${ONE_ADDED}.`,
       `persona ${JSON.stringify('charlie')} (key=${charlieKey}) is added: it will be brought up and launched.`,
-    ])
+    ], ...h.reviewLines()])
     expect(run.since(cp).lifecycle).toEqual([])
     expect(run.appliedKeys()).toEqual(keysOf('alpha'))
 
@@ -657,7 +1292,7 @@ describe('a name change is a removal of the old key and an addition of the new o
     const alphaBefore = slackSideOf(run, 'alpha')
     const cp = run.checkpoint()
 
-    await applyConfig(run, [alpha!, { ...bravo!, name: 'bravo2' }])
+    await applyConfig(run, [alpha!, { ...withIndependentDestination(bravo!), name: 'bravo2' }])
 
     expect(run.since(cp).lifecycle).toEqual([
       { op: 'teardown', key: oldKey, via: 'apply' },
@@ -698,6 +1333,113 @@ function recordWriteFailedLines(run: ReloadRun): string[] {
   return run.logsOf(RELOAD_RECORD_WRITE_FAILED)
 }
 
+describe('confirmed apply failure observer', () => {
+  const points = ['beginReviewAttempt', 'retired-keys', 'commitReview'] as const
+  test.each(points.flatMap(point => [false, true].map(throws => ({ point, throws }))))('$point reports once after its existing line; throwing=$throws preserves the failed apply', async ({ point, throws }) => {
+    const observed: { failure: ReloadApplyFailure; lines: string[] }[] = []
+    const { run, personas: [alpha, bravo] } = await running(['alpha', 'bravo'], {
+      onApplyFailed(failure) {
+        observed.push({ failure, lines: [...recordWriteFailedLines(run)] })
+        if (throws) throw new Error(sentinelInMessage('apply-observer'))
+      },
+    })
+    const added = h.persona('charlie'); h.materialize(added)
+    await previewConfig(run, [alpha!, added])
+    const fingerprint = h.pendingFingerprint()!
+    const before = applicationState(h.readRecord()!), applied = run.controller.applied()
+    const cp = run.checkpoint()
+    h.confirm()
+    // Attempt / retirement / activation each open a temp file and directory.
+    h.failWrites(point === 'retired-keys' ? { path: h.retiredKeysFile, call: 1 } : { path: h.paths.lastApplied, call: point === 'beginReviewAttempt' ? 1 : 3 })
+    await run.ticks.tick()
+    const failureLines = recordWriteFailedLines(run)
+    expect(failureLines).toEqual([reloadSharedAuthorityApplyFailedLine(h.paths.lastApplied, 'failed',
+      point === 'retired-keys' ? '' : errnoSuffix({ code: 'EIO' }), point === 'beginReviewAttempt' ? '' : reloadRetiredKeysPutBackClause(h.retiredKeysFile))])
+    expect(observed).toEqual([{ failure: { fingerprint, record: point === 'retired-keys' ? 'retired-keys' : 'authority',
+      failure: point === 'retired-keys' ? '' : errnoSuffix({ code: 'EIO' }), personas: [h.key(bravo!.name)] }, lines: failureLines }])
+    expect(run.controller.applied()).toBe(applied)
+    expect(applicationState(h.readRecord()!)).toEqual(before)
+    expect(readRetiredKeysRecord(h.stateDir)).toBeNull()
+    expect(run.retiredKeys.keys()).toEqual([])
+    expect(run.since(cp).lifecycle).toEqual([])
+    expect(run.appliedConfigs).toEqual([])
+    expect(h.pendingExists()).toBe(true)
+    expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
+    const observerLines = run.logs.filter(line => line.startsWith('[slack] reload: reporting the failed configuration change failed:'))
+    expect(observerLines).toHaveLength(throws ? 1 : 0)
+    if (throws) expect(observerLines[0]).not.toMatch(/[\r\n]/)
+    assertNoLeak({ observed, observerLines })
+    expectNoPostNoLeak(run)
+  })
+
+  test.each(['settings-only', 'add-only'] as const)('%s failure names every applied persona and no addition', async change => {
+    const failures: ReloadApplyFailure[] = []
+    const { run, personas } = await running(['alpha', 'bravo'], { onApplyFailed: failure => { failures.push(failure) } })
+    const added = h.persona('charlie'); h.materialize(added)
+    await previewConfig(run, change === 'add-only' ? [...personas, added] : personas, change === 'settings-only' ? { reply_chunk_limit: 1234 } : {})
+    const fingerprint = h.pendingFingerprint()!
+    h.confirm(); h.failWrites({ path: h.paths.lastApplied, call: 1 }); await run.ticks.tick()
+    expect(failures).toEqual([{ fingerprint, record: 'authority', failure: errnoSuffix({ code: 'EIO' }), personas: keysOf('alpha', 'bravo') }])
+    expect(run.appliedKeys()).toEqual(keysOf('alpha', 'bravo'))
+    expect(run.appliedConfigs).toEqual([])
+    expectNoPostNoLeak(run)
+  })
+
+  test.each(['destructive', 'in-place', 'credentials', 'next-launch', 'overlapping'] as const)('%s plan names only its applied persona, once', async change => {
+    const failures: ReloadApplyFailure[] = []
+    const { run, personas: [alpha, bravo] } = await running(['alpha', 'bravo'], { onApplyFailed: failure => { failures.push(failure) } })
+    let changed = bravo!
+    if (change === 'destructive') changed = movedDirectory(changed)
+    if (change === 'in-place' || change === 'overlapping') changed = { ...changed, stop_hook_bootstrap: false }
+    if (change === 'credentials' || change === 'overlapping') h.writeCredentials(bravo!)
+    if (change === 'next-launch' || change === 'overlapping') changed = { ...changed, claude_config_dir: h.home }
+    await previewConfig(run, [alpha!, changed])
+    const fingerprint = h.pendingFingerprint()!
+    h.confirm(); h.failWrites({ path: h.paths.lastApplied, call: 1 }); await run.ticks.tick()
+    expect(failures).toEqual([{ fingerprint, record: 'authority', failure: errnoSuffix({ code: 'EIO' }), personas: [h.key(bravo!.name)] }])
+    expect(run.appliedConfigs).toEqual([])
+    expectNoPostNoLeak(run)
+  })
+
+  test.each(['attempt-unresolved', 'commit-unresolved', 'attempt-stale', 'commit-stale', 'stale-confirmation', 'invalid-plan'] as const)('%s never invokes the definite-failure observer', async outcome => {
+    const failures: ReloadApplyFailure[] = []
+    const { run, personas: [alpha, bravo] } = await running(['alpha', 'bravo'], {
+      sharedStateReports: true, onApplyFailed: failure => { failures.push(failure) },
+    })
+    const before = applicationState(h.readRecord()!), applied = run.controller.applied()
+    await previewConfig(run, outcome === 'invalid-plan' ? [{ ...alpha!, channels: [{ id: alpha!.channels![0]!.id, delivery: 'invalid' as DeliveryMode }] }, bravo!] : [alpha!])
+    h.confirm()
+    if (outcome === 'stale-confirmation') h.writeConfig({ ...configOf(alpha!), reply_chunk_limit: 1234 })
+    if (outcome.endsWith('unresolved')) h.failWrites({ path: h.paths.lastApplied, step: 'fsyncSync', call: outcome === 'attempt-unresolved' ? 2 : 4 })
+    // Force the race result at the authority seam; confirmation parsing still runs normally.
+    const authority = run.controller.sharedChannels()!
+    const stale = outcome === 'commit-stale' ? spyOn(authority, 'commitReview').mockReturnValue({ kind: 'stale', revision: authority.revision }) : undefined
+    const staleAttempt = outcome === 'attempt-stale' ? spyOn(authority, 'transact').mockReturnValueOnce({ kind: 'stale', revision: authority.revision }) : undefined
+    const cp = run.checkpoint()
+    try { await run.ticks.tick() } finally { stale?.mockRestore(); staleAttempt?.mockRestore() }
+    expect(failures).toEqual([])
+    expect(run.controller.applied()).toBe(applied)
+    expect(run.appliedConfigs).toEqual([])
+    expect(run.since(cp).lifecycle).toEqual([])
+    if (outcome.endsWith('unresolved')) {
+      expect(authority.readable).toBe(false)
+      expect(recordWriteFailedLines(run)).toHaveLength(1)
+      expect(recordWriteFailedLines(run)[0]).toContain('unresolved')
+    } else {
+      expect(applicationState(h.readRecord()!)).toEqual(before)
+      if (outcome.endsWith('-stale')) expect(recordWriteFailedLines(run)[0]).toContain('stale')
+      if (outcome === 'stale-confirmation') {
+        expect(run.logs.filter(line => line === reviewOutcomeLine('superseded'))).toHaveLength(1)
+        expect(h.applyExists()).toBe(false)
+      }
+      if (outcome === 'invalid-plan') expect(run.invalidLines().some(line => line.includes('confirmed configuration is invalid'))).toBe(true)
+    }
+    // Unresolved authority may report its own hold, never a definite apply failure.
+    expect(run.slackPosts().filter(post => JSON.stringify(post).includes('*Configuration change not applied*'))).toEqual([])
+    assertNoLeak(run.captured())
+  })
+})
+
 /**
  * Hold `key` as retired only in memory, as a start sweep whose write failed
  * leaves it: one batch through the run's store with the
@@ -723,7 +1465,7 @@ type Step1Change = (personas: PersonaInput[]) => { personas: PersonaInput[]; top
  * running as `Bravo` is renamed to its own key.
  */
 const DESTRUCTIVE_CHANGES: Record<DestructiveSetting, { name: string; change: Step1Change }> = {
-  name: { name: 'Bravo', change: ([alpha, bravo]) => ({ personas: [alpha!, { ...bravo!, name: h.key('Bravo') }] }) },
+  name: { name: 'Bravo', change: ([alpha, bravo]) => ({ personas: [alpha!, { ...withIndependentDestination(bravo!), name: h.key('Bravo') }] }) },
   credentials_file: { name: 'bravo', change: ([alpha, bravo]) => ({ personas: [alpha!, movedCredentials(bravo!)] }) },
   working_directory: { name: 'bravo', change: ([alpha, bravo]) => ({ personas: [alpha!, movedDirectory(bravo!)] }) },
 }
@@ -739,7 +1481,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
     {
       label: "a key-changing rename records its old key as removed, and not its new key",
       second: 'bravo',
-      change: ([alpha, bravo]) => ({ personas: [alpha!, { ...bravo!, name: 'bravo2' }] }),
+      change: ([alpha, bravo]) => ({ personas: [alpha!, { ...withIndependentDestination(bravo!), name: 'bravo2' }] }),
       recorded: (run) => recordedNow(run, { [h.key('bravo')]: RETIRED_KEY_CAUSE_REMOVED }),
     },
     ...DESTRUCTIVE_SETTINGS.map((setting) => ({
@@ -760,7 +1502,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
 
     await run.ticks.tick()
 
-    expect(run.since(applying).writes).toEqual([h.retiredKeysWrite(), h.lastAppliedWrite()])
+    expect(run.since(applying).writes).toEqual([h.lastAppliedWrite(), h.retiredKeysWrite(), h.lastAppliedWrite(), h.lastAppliedWrite()])
     expect(readRetiredKeysRecord(h.stateDir)).toEqual(recorded(run))
     expect(run.retiredKeys.isRecorded(h.key('alpha'))).toBe(false)
     expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
@@ -800,7 +1542,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
 
     await run.ticks.tick()
 
-    expect(run.since(applying).writes).toEqual([h.lastAppliedWrite()])
+    expect(run.since(applying).writes).toEqual([h.lastAppliedWrite(), h.lastAppliedWrite(), h.lastAppliedWrite()])
     expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
     expect(readRetiredKeysRecord(h.stateDir)).toBeNull()
     expect(run.retiredKeys.keys()).toEqual([])
@@ -828,6 +1570,9 @@ describe('apply step 1 records the retired keys before the last-applied record i
 
     // Held at step 2's first teardown: both writes are made, the retired-key one first, before any teardown began.
     expect(writesAt).toEqual([
+      [h.paths.lastApplied, -1], // initial observation before the run is assigned
+      [h.paths.lastApplied, 0], // candidate review
+      [h.paths.lastApplied, 0], // spent attempt
       [h.retiredKeysFile, 0],
       [h.paths.lastApplied, 0],
     ])
@@ -838,12 +1583,12 @@ describe('apply step 1 records the retired keys before the last-applied record i
     expect(readRetiredKeysRecord(h.stateDir)).toEqual(
       recordedNow(run, { [bravoKey]: RETIRED_KEY_CAUSE_REMOVED, [charlieKey]: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY }),
     )
-    expect(h.readRecord()).toEqual(h.readConfig())
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(h.readConfig()!.toString()))
 
     gate.release()
     await applying
 
-    expect(run.since(cp).writes).toEqual([{ path: h.paths.pending, ok: true }, h.retiredKeysWrite(), h.lastAppliedWrite()])
+    expect(run.since(cp).writes).toEqual([h.lastAppliedWrite(), { path: h.paths.pending, ok: true }, h.lastAppliedWrite(), h.retiredKeysWrite(), h.lastAppliedWrite(), h.lastAppliedWrite()])
     expect(run.lifecycle.keys('teardown')).toEqual([bravoKey, charlieKey])
     expect(run.since(cp).lifecycle.filter((r) => r.key === h.key('alpha'))).toEqual([])
     // The record is as step 1 wrote it: alpha never recorded, the teardowns change nothing in it.
@@ -865,7 +1610,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
     const applying = run.checkpoint()
     await run.ticks.tick()
 
-    expect(run.since(applying).writes).toEqual(written ? [h.retiredKeysWrite(), h.lastAppliedWrite()] : [h.lastAppliedWrite()])
+    expect(run.since(applying).writes).toEqual([h.lastAppliedWrite(), ...(written ? [h.retiredKeysWrite()] : []), h.lastAppliedWrite(), h.lastAppliedWrite()])
     expect(readRetiredKeysRecord(h.stateDir)).toEqual(written ? recordedNow(run, { [h.key('bravo')]: RETIRED_KEY_CAUSE_REMOVED }) : seeded)
     expect(run.retiredKeys.isMarked(h.key('bravo'))).toBe(false)
     expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
@@ -898,8 +1643,8 @@ describe('apply step 1 records the retired keys before the last-applied record i
     { label: 'a removed key', held: false, cause: RETIRED_KEY_CAUSE_REMOVED },
     // Recording a key held only in memory writes the record, with the cause it holds (design A3).
     { label: 'a removed key held only in memory after a failed start-sweep write', held: true, cause: RETIRED_KEY_CAUSE_ABSENT_AT_START },
-  ])('stopped between the two writes: $label is written by step 1 and stays retired after the restart, which starts from the old last-applied record (part)', async ({ held, cause }) => {
-    const { run, personas } = await running(['alpha', 'bravo'], { stopBeforeWrite: h.paths.lastApplied })
+  ])('stopped between the two writes: $label is prepared by step 1 and rolled back to its prior retirement after restart, which starts from the old last-applied record (part; )', async ({ held, cause }) => {
+    const { run, personas } = await running(['alpha', 'bravo'], { stopBeforeWrite: (path, bytes) => path === h.paths.lastApplied && activationRecord(bytes, path) })
     const bravoKey = h.key('bravo')
     const recordBytes = h.readRecord()
     if (held) holdInMemory(run, bravoKey)
@@ -909,16 +1654,16 @@ describe('apply step 1 records the retired keys before the last-applied record i
     await applyConfig(run, [personas[0]!])
 
     expect(run.stoppedBeforeWrite).toBe(true)
-    expect(run.since(cp).writes).toEqual([{ path: h.paths.pending, ok: true }, h.retiredKeysWrite(), h.lastAppliedWrite()])
+    expect(run.since(cp).writes).toEqual([h.lastAppliedWrite(), { path: h.paths.pending, ok: true }, h.lastAppliedWrite(), h.retiredKeysWrite(), h.lastAppliedWrite(), h.lastAppliedWrite()])
     expectNoPostNoLeak(run)
 
     await run.stop()
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     const restarted = await h.start()
 
     expect(restarted.appliedKeys()).toEqual(keysOf('alpha', 'bravo'))
-    expect(readRetiredKeysRecord(h.stateDir)).toEqual(recordedNow(run, { [bravoKey]: cause }))
-    expect(restarted.retiredKeys.isRecorded(bravoKey)).toBe(true)
+    expect(readRetiredKeysRecord(h.stateDir)).toEqual(held ? recordedNow(run, { [bravoKey]: cause }) : null)
+    expect(restarted.retiredKeys.isRecorded(bravoKey)).toBe(held)
     expect(restarted.retiredKeys.isHeldInMemory(bravoKey)).toBe(false)
     expectNoPostNoLeak(restarted)
   })
@@ -945,7 +1690,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
 
     await run.ticks.tick()
 
-    expect(run.since(cp).writes).toEqual([h.retiredKeysWrite(), h.lastAppliedWrite()])
+    expect(run.since(cp).writes).toEqual([h.lastAppliedWrite(), h.retiredKeysWrite(), h.lastAppliedWrite(), h.lastAppliedWrite()])
     expect(readRetiredKeysRecord(h.stateDir)).toEqual(recordedNow(run, { [charlieKey]: RETIRED_KEY_CAUSE_ABSENT_AT_START }))
     expect(run.retiredKeys.isHeldInMemory(charlieKey)).toBe(false)
     expect(run.appliedKeys()).toEqual(keysOf('alpha', 'charlie'))
@@ -993,10 +1738,9 @@ describe('a failed apply undoes its recording', () => {
   // The retired-key write opens and fsyncs its temporary file and its directory first, so the last-applied
   // write's own open is the third openSync and its directory fsync the fourth fsyncSync, counted from failWrites.
   test.each<{ label: string; failure: Partial<WriteFailure>; seeded: boolean; lastAppliedWrites: boolean[] }>([
-    { label: 'before the rename, over a record seeded before the apply', failure: { step: 'openSync', call: 3 }, seeded: true, lastAppliedWrites: [false] },
-    { label: 'at the directory sync, over a record seeded before the apply', failure: { step: 'fsyncSync', call: 4 }, seeded: true, lastAppliedWrites: [false, true] },
-    { label: 'before the rename, with no record before the apply', failure: { step: 'openSync', call: 3 }, seeded: false, lastAppliedWrites: [false] },
-    { label: 'at the directory sync, with no record before the apply', failure: { step: 'fsyncSync', call: 4 }, seeded: false, lastAppliedWrites: [false, true] },
+    { label: 'before the rename, over a record seeded before the apply', failure: { step: 'openSync', call: 5 }, seeded: true, lastAppliedWrites: [false] },
+    { label: 'before the rename, with no record before the apply', failure: { step: 'openSync', call: 5 }, seeded: false, lastAppliedWrites: [false] },
+    { label: 'before the rename, with secret-bearing errno and error message', failure: { step: 'openSync', call: 5, code: fakeToken(BOT_TOKEN_PREFIX, 'apply-errno') }, seeded: true, lastAppliedWrites: [false] },
   ])('a rewrite failing $label applies nothing, logs one reload-record-write-failed line, and puts the record back: the keys it recorded removed, the marks it cleared back, keys recorded before it kept; a fresh confirmation then applies and records', async ({ failure, seeded, lastAppliedWrites }) => {
     const before = seed(seeded)
     const { run, personas } = await running(['alpha', 'bravo', 'charlie'])
@@ -1014,9 +1758,12 @@ describe('a failed apply undoes its recording', () => {
 
     // Step 1 wrote the record, then put it back: written again, or removed when it was empty before.
     expect(run.since(cp).writes).toEqual([
+      h.lastAppliedWrite(),
       h.retiredKeysWrite(),
       ...lastAppliedWrites.map((ok) => h.lastAppliedWrite(ok)),
       ...(seeded ? [h.retiredKeysWrite()] : []),
+      h.lastAppliedWrite(), // reject the spent attempt
+      h.lastAppliedWrite(), // persist the next review
       { path: h.paths.pending, ok: true },
     ])
     expect(run.since(cp).removes.filter((r) => r.path === h.retiredKeysFile)).toEqual(
@@ -1029,16 +1776,20 @@ describe('a failed apply undoes its recording', () => {
     // restore stops or restarts none.
     // Nothing applied, the change pending, one line naming the last-applied record and the retired-key record.
     const lines = recordWriteFailedLines(run)
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toContain(JSON.stringify(h.paths.lastApplied))
+    assertNoLeak(lines)
+    expect(lines).toEqual([
+      reloadSharedAuthorityApplyFailedLine(h.paths.lastApplied, 'failed', errnoSuffix({ code: failure.code ?? 'EIO' }), reloadRetiredKeysPutBackClause(h.retiredKeysFile)),
+    ])
     // The restore succeeded: the line says the record is put back, never that the apply's keys stay retired.
     expect(lines[0]).toContain(reloadRetiredKeysPutBackClause(h.retiredKeysFile))
     expect(lines[0]).not.toContain(reloadRetiredKeysPutBackFailedClause(h.retiredKeysFile))
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     expect(run.controller.applied()).toBe(applied)
     expect(run.appliedConfigs).toEqual([])
+    // Nothing was applied, so nothing is told the apply settled and nothing is reclaimed.
+    expect(run.settledConfigs).toEqual([])
     expect(run.since(cp).lifecycle).toEqual([])
-    expect(h.pendingFingerprint()).toBe(fingerprint)
+    expect(h.pendingFingerprint()).not.toBe(fingerprint)
     expectNoPostNoLeak(run)
 
     // A fresh confirmation, with the writer working, applies and records.
@@ -1053,6 +1804,44 @@ describe('a failed apply undoes its recording', () => {
     expectNoPostNoLeak(run)
   })
 
+  test.each([
+    { label: 'seeded, safe errno', seeded: true, code: 'EIO' },
+    { label: 'unseeded, safe errno', seeded: false, code: 'EIO' },
+    { label: 'seeded, secret-bearing errno and error message', seeded: true, code: fakeToken(BOT_TOKEN_PREFIX, 'unsynced-apply-errno') },
+  ])('uncertain authority activation preserves retirement and input evidence until reopen ($label)', async ({ seeded, code }) => {
+    seed(seeded)
+    const { run, personas: [alpha, , charlie] } = await running(['alpha', 'bravo', 'charlie'])
+    const applied = run.controller.applied()
+    const before = JSON.parse(h.readRecord()!.toString())
+    const input = h.writeConfig(configOf(alpha!, movedDirectory(charlie!)))
+    await run.ticks.tick()
+    h.confirm()
+    h.failWrites({ step: 'fsyncSync', call: 6, code })
+    const checkpoint = run.checkpoint()
+    await run.ticks.tick()
+    expect(run.controller.sharedChannels()!.readable).toBe(false)
+    expect(run.controller.applied()).toBe(applied)
+    expect(JSON.parse(h.readRecord()!.toString()).revision).toBe(before.revision + 3)
+    expect(h.readConfig()).toEqual(input)
+    expect(run.retiredKeys.keys()).toEqual([h.key('bravo'), h.key('charlie'), ...(seeded ? ['zulu'] : [])].sort())
+    expect(run.since(checkpoint).lifecycle).toEqual([])
+    expect(run.oldLifeHolds.snapshot()).toEqual([])
+    expectNoPostNoLeak(run)
+    expect(recordWriteFailedLines(run)).toEqual([
+      reloadSharedAuthorityApplyFailedLine(h.paths.lastApplied, 'unresolved', errnoSuffix({ code })),
+    ])
+    h.clearWriteFailure()
+    await run.ticks.tick()
+    expect(run.appliedKeys()).toEqual(keysOf('alpha', 'charlie'))
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+    expectNoPostNoLeak(run)
+    await run.stop()
+    const reopened = await h.start()
+    expect(reopened.controller.sharedChannels()!.readable).toBe(true)
+    expect(reopened.appliedKeys()).toEqual(keysOf('alpha', 'charlie'))
+    expectNoPostNoLeak(reopened)
+  })
+
   // The restore clauses' one literal pin; every other case builds them.
   test('the failed rewrite line\'s restore clauses: put back, and its restore failed (pin)', () => {
     expect(reloadRetiredKeysPutBackClause('/state/retired-keys.json')).toBe(
@@ -1065,11 +1854,12 @@ describe('a failed apply undoes its recording', () => {
 
   test('a rewrite that fails with the restore failing too names the failed restore in its one line, and the keys the apply recorded stay retired', async () => {
     const before = seed(true)
+    const code = fakeToken(BOT_TOKEN_PREFIX, 'restore-errno')
     let failing = false
     const { run, personas } = await running(['alpha', 'bravo', 'charlie'], {
       // From the last-applied write on, every write fails: the rewrite and the restore after it.
-      beforeWrite: (path) => {
-        if (failing && path === h.paths.lastApplied) h.failWrites()
+      beforeWrite: (path, bytes) => {
+        if (failing && path === h.paths.lastApplied && activationRecord(bytes, path)) h.failWrites({ code })
       },
     })
     const [alpha, , charlie] = personas
@@ -1081,9 +1871,12 @@ describe('a failed apply undoes its recording', () => {
 
     await run.ticks.tick()
 
-    expect(run.since(cp).writes.slice(0, 3)).toEqual([h.retiredKeysWrite(), h.lastAppliedWrite(false), h.retiredKeysWrite(false)])
+    expect(run.since(cp).writes.slice(0, 4)).toEqual([h.lastAppliedWrite(), h.retiredKeysWrite(), h.lastAppliedWrite(false), h.retiredKeysWrite(false)])
     const lines = recordWriteFailedLines(run)
-    expect(lines).toHaveLength(1)
+    assertNoLeak(lines)
+    expect(lines).toEqual([
+      reloadSharedAuthorityApplyFailedLine(h.paths.lastApplied, 'failed', errnoSuffix({ code }), reloadRetiredKeysPutBackFailedClause(h.retiredKeysFile)),
+    ])
     expect(lines[0]).toContain(reloadRetiredKeysPutBackFailedClause(h.retiredKeysFile))
     expect(lines[0]).not.toContain(reloadRetiredKeysPutBackClause(h.retiredKeysFile))
     // The apply's keys stay recorded, on disk and in memory; the keys recorded before it too.
@@ -1112,23 +1905,24 @@ describe('a failed apply undoes its recording', () => {
     await run.ticks.tick()
     const fingerprint = h.pendingFingerprint()
     h.confirm()
-    h.failWrites(failure)
+    h.failWrites({ ...failure, path: h.retiredKeysFile })
     const cp = run.checkpoint()
 
     await run.ticks.tick()
 
-    expect(run.since(cp).writes[0]).toEqual(h.retiredKeysWrite(false))
-    expect(run.since(cp).writes.filter((w) => w.path === h.paths.lastApplied)).toEqual([])
-    expect(h.readRecord()).toEqual(recordBytes)
+    expect(run.since(cp).writes[1]).toEqual(h.retiredKeysWrite(false))
+    expect(run.since(cp).writes.filter((w) => w.path === h.paths.lastApplied)).toEqual(restoreFails ? [h.lastAppliedWrite()] : [h.lastAppliedWrite(), h.lastAppliedWrite(), h.lastAppliedWrite()])
+    expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     expect(run.controller.applied()).toBe(applied)
     expect(run.appliedConfigs).toEqual([])
+    expect(run.settledConfigs).toEqual([])
     expect(run.since(cp).lifecycle).toEqual([])
     const lines = recordWriteFailedLines(run)
     expect(lines).toHaveLength(1)
     expect(lines[0]).toContain(JSON.stringify(h.retiredKeysFile))
     // How the restore went: put back (the held-only-in-memory key written to the file), or failed too.
-    expect(lines[0]).toContain(restoreFails ? RELOAD_RETIRED_KEYS_RESTORE_FAILED : RELOAD_RETIRED_KEYS_RESTORED)
-    expect(lines[0]).not.toContain(restoreFails ? RELOAD_RETIRED_KEYS_RESTORED : RELOAD_RETIRED_KEYS_RESTORE_FAILED)
+    expect(lines[0]).toContain(restoreFails ? reloadRetiredKeysPutBackFailedClause(h.retiredKeysFile) : reloadRetiredKeysPutBackClause(h.retiredKeysFile))
+    expect(lines[0]).not.toContain(restoreFails ? reloadRetiredKeysPutBackClause(h.retiredKeysFile) : reloadRetiredKeysPutBackFailedClause(h.retiredKeysFile))
     if (held) {
       // Still retired: written by the restore, or still held only in memory when every write fails.
       expect(run.retiredKeys.isRecorded(charlieKey)).toBe(true)
@@ -1143,7 +1937,7 @@ describe('a failed apply undoes its recording', () => {
     // Still pending: with the writer working again, the next check holds the same pending change, and applies nothing.
     h.clearWriteFailure()
     await run.ticks.tick()
-    expect(h.pendingFingerprint()).toBe(fingerprint)
+    expect(h.pendingFingerprint()).not.toBe(fingerprint)
     expect(run.appliedConfigs).toEqual([])
     expectNoPostNoLeak(run)
   })
@@ -1153,14 +1947,31 @@ describe('after a failed rewrite, the persona it would have retired resumes its 
   beforeEach(useConfigDirs)
 
   test('a removal whose rewrite fails leaves bravo applied and unrecorded, and its next launch from an ended row resumes it: no reuse spawn, no delete', async () => {
-    const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH)
+    let activationAttempts = 0
+    let retirementAtActivation = false
+    const { run, personas } = await running(['alpha', 'bravo'], {
+      ...REAL_LAUNCH,
+      beforeWrite: (path, bytes) => {
+        if (path !== h.paths.lastApplied || !activationRecord(bytes, path)) return
+        activationAttempts++
+        retirementAtActivation = readRetiredKeysRecord(h.stateDir) !== null
+        h.failWrites({ path, step: 'openSync', call: 1 })
+      },
+    })
+    const before = applicationState(h.readRecord()!)
+    const cp = run.checkpoint()
     const bravoKey = h.key('bravo')
     h.writeConfig(configOf(personas[0]!))
     await run.ticks.tick()
     h.confirm()
-    h.failWrites({ step: 'openSync', call: 3 })
     await run.ticks.tick()
     h.clearWriteFailure()
+    expect(activationAttempts).toBe(1)
+    expect(retirementAtActivation).toBe(true)
+    expect(run.since(cp).writes.filter(write => !write.ok)).toEqual([h.lastAppliedWrite(false)])
+    expect(applicationState(h.readRecord()!)).toEqual(before)
+    expect(run.appliedConfigs).toEqual([])
+    expect(run.since(cp).lifecycle).toEqual([])
     expect(recordWriteFailedLines(run)).toHaveLength(1)
     expect(run.appliedKeys()).toEqual(keysOf('alpha', 'bravo'))
     expect(readRetiredKeysRecord(h.stateDir)).toBeNull()
@@ -1260,7 +2071,7 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     expect(restarted.appliedKeys()).toEqual(keysOf('alpha'))
     // The restart's start pass launched alpha only.
     expect(launchesOf(restarted, 'bravo')).toEqual([])
-    return { run: restarted, alpha: alpha!, bravo: bravo! }
+    return { run: restarted, alpha: alpha!, bravo: withIndependentDestination(bravo!) }
   }
 
   test("the session manager reads the real-launch run's own store while it runs: a restart installs the new run's, a run without the real launch installs none, and neither a stop nor the cleanup leaves one installed", async () => {
@@ -1355,7 +2166,7 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     const [alpha, bravo] = personas
     const [bravoKey, renamedKey] = keysOf('bravo', 'bravo2')
     const [bravoId, renamedId] = [bravoKey, renamedKey].map(personaInstanceId)
-    const renamed = { ...bravo!, name: 'bravo2' }
+    const renamed = { ...withIndependentDestination(bravo!), name: 'bravo2' }
     const adFrom = run.composition!.agentDirectorCalls.length
 
     await applyConfig(run, [alpha!, renamed])
@@ -1386,7 +2197,7 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     const bravoFrom = run.composition!.instanceCallsOf('bravo').length
     const bravoLaunches = launchesOf(run, 'bravo').length
 
-    await applyConfig(run, [alpha!, bravo!])
+    await applyConfig(run, [alpha!, { ...bravo!, channels: [{ id: 'C0RETURNNEW', delivery: 'all' }], permission_prompts: 'C0RETURNNEW' }])
     await until(() => launchesOf(run, 'bravo').at(-1)?.action === SPAWN_ACTION_FRESH_RETIRED)
 
     // The renamed key's old row now holds the directory: the same wait, then the retired key's reuse.
@@ -1413,7 +2224,7 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     const from = run.composition!.instanceCallsOf('bravo').length
     spawnQueue.push(cannedErr(errTmuxUnresponsive('spawn')))
 
-    await applyConfig(run, [alpha!, bravo!])
+    await applyConfig(run, [alpha!, withIndependentDestination(bravo!)])
 
     expect(launchesOf(run, 'bravo').at(-1)).toMatchObject({ via: 'apply', action: 'failed' })
     expect(instanceCallsSince(run, 'bravo', from)).toEqual(['reuse-spawn ErrTmuxUnresponsive'])
@@ -1533,7 +2344,7 @@ describe('a retired key is launched by a reuse spawn at every launch path, never
     h.deleteWorkingDirectory(bravo!)
     const from = run.composition!.instanceCallsOf('bravo').length
 
-    await applyConfig(run, [alpha!, bravo!])
+    await applyConfig(run, [alpha!, withIndependentDestination(bravo!)])
 
     expect(run.bringUps.state(bravoKey)?.outcome).toBe('retrying')
     expect(instanceCallsSince(run, 'bravo', from)).toEqual([])
@@ -1692,10 +2503,10 @@ const IN_PLACE_ROWS: InPlaceRow[] = [
     settings: ['channels'],
   },
   {
-    label: 'a channel removed',
+    label: 'a channel turned off',
     before: (own) => ({ channels: [{ id: own, delivery: 'all' }, { id: EXTRA_CHANNEL, delivery: 'all' }] }),
-    after: () => ({}),
-    settings: ['channels'],
+    after: (own) => ({ channels: [{ id: own, delivery: 'all' }, { id: EXTRA_CHANNEL, delivery: 'off' }] }),
+    settings: ['delivery'],
   },
   {
     label: "a channel's delivery flipped",
@@ -1794,7 +2605,7 @@ describe('an in-place change keeps the instance (step 3, the in-place row)', () 
 })
 
 describe('routing, posting scope and destinations follow the new values from the next event or post (real composition)', () => {
-  test("channels: bravo gets events in its added channel and not in its removed one (unclaimed-channel logged), and the reply tool refuses the removed channel naming bravo and it while posting to the added one", async () => {
+  test(" channels: bravo gets events in its added channel and not in its disabled one (unclaimed-channel logged), and the reply tool refuses the removed channel naming bravo and it while posting to the added one", async () => {
     const own = ownChannel('bravo')
     const { run, personas } = await running(
       ['alpha', ['bravo', { channels: [{ id: own, delivery: 'all' }, { id: EXTRA_CHANNEL, delivery: 'all' }] }]],
@@ -1810,7 +2621,9 @@ describe('routing, posting scope and destinations follow the new values from the
     const allowedBefore = await run.callTool('bravo', 'reply', { chat_id: EXTRA_CHANNEL, text: 'to the old channel' })
     expect(allowedBefore.isError).toBe(false)
 
-    await applyConfig(run, [alpha!, h.persona('bravo', { channels: [{ id: own, delivery: 'all' }, { id: OTHER_CHANNEL, delivery: 'all' }] })])
+    await applyConfig(run, [alpha!, h.persona('bravo', { channels: [{ id: own, delivery: 'all' }, { id: EXTRA_CHANNEL, delivery: 'off' }, { id: OTHER_CHANNEL, delivery: 'all' }] })])
+    run.stub('bravo').script.inventory.push(membershipPage([own, EXTRA_CHANNEL, OTHER_CHANNEL]))
+    run.membershipScanner.request(h.key('bravo')); await run.membershipClock.runNext()
     const cp = run.checkpoint()
     const bravoCalls = run.stub('bravo').callLog.length
 
@@ -1820,9 +2633,9 @@ describe('routing, posting scope and destinations follow the new values from the
     expect(await deliverTo(run, 'bravo', makeChannelMessage({ channel: EXTRA_CHANNEL }))).toEqual([])
     expect(run.deliveries('alpha')).toEqual([])
     const unclaimed = run.since(cp).logs.filter((l) => l.startsWith(`[slack] ${UNCLAIMED_CHANNEL}: `))
-    expect(unclaimed).toHaveLength(1)
-    expect(unclaimed[0]).toContain(bravoRef)
-    expect(unclaimed[0]).toContain(EXTRA_CHANNEL)
+    expect(unclaimed).toEqual([])
+    // The explicitly off choice is retained, so it is a known channel that delivers nothing.
+    expect(run.controller.applied()!.config.personas.find(p => p.key === h.key('bravo'))!.channels).toContainEqual({ id: EXTRA_CHANNEL, delivery: 'off' })
 
     const refused = await run.callTool('bravo', 'reply', { chat_id: EXTRA_CHANNEL, text: 'to the removed channel' })
     expectRefused(refused, 'bravo', EXTRA_CHANNEL)
@@ -1909,7 +2722,7 @@ describe('routing, posting scope and destinations follow the new values from the
     await applyConfig(run, [personas[0]!, h.persona('bravo', after(own))])
 
     expect(await noticeCalls(run, 'bravo')).toEqual(next(own))
-    expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test'])
+    expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test', 'bots.info', 'users.conversations'])
     assertNoLeak(run.captured())
   })
 
@@ -1931,7 +2744,7 @@ describe('routing, posting scope and destinations follow the new values from the
     expect(run.lifecycle.keys('update-in-place')).toEqual([h.key('bravo')])
     expect(await noticeCalls(run, 'bravo')).toEqual([`conversations.open ${NEW_CONTACT}`, `chat.postMessage ${newDm}`])
     expect(await noticeCalls(run, 'bravo')).toEqual([`chat.postMessage ${newDm}`])
-    expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test'])
+    expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test', 'bots.info', 'users.conversations'])
     assertNoLeak(run.captured())
   })
 
@@ -1951,7 +2764,7 @@ describe('routing, posting scope and destinations follow the new values from the
     // Same contact, yet the conversation is opened again rather than taken from the cache.
     expect(await noticeCalls(run, 'bravo')).toEqual([`conversations.open ${CONTACT}`, `chat.postMessage ${dm}`])
     expect(run.lifecycle.keys('update-in-place')).toEqual(keysOf('bravo', 'bravo'))
-    expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test'])
+    expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test', 'bots.info'])
     assertNoLeak(run.captured())
   })
 
@@ -2100,8 +2913,8 @@ describe('step order with teardowns, in-place updates and bring-ups (steps 2, 3 
    * 3), rotates golf's and hotel's tokens (step 4), and adds echo and foxtrot
    * (step 6): two personas in each step.
    */
-  async function twoOfEach() {
-    const { run, personas } = await running(['alpha', 'bravo', 'charlie', 'delta', 'golf', 'hotel'])
+  async function twoOfEach(opts: RunningOptions = {}) {
+    const { run, personas } = await running(['alpha', 'bravo', 'charlie', 'delta', 'golf', 'hotel'], opts)
     const withExtra = (name: string, extra: string) =>
       h.persona(name, { channels: [{ id: ownChannel(name), delivery: 'all' }, { id: extra, delivery: 'all' }] })
     const [, , , , golf, hotel] = personas
@@ -2125,8 +2938,12 @@ describe('step order with teardowns, in-place updates and bring-ups (steps 2, 3 
     { label: 'step 3', op: 'update-in-place', failing: 'charlie', step: '3 (in-place-updates)' },
     { label: 'step 4', op: 'reconnect', failing: 'hotel', step: '4 (credentials-reconnects)' },
     { label: 'step 6', op: 'bring-up', failing: 'foxtrot', step: '6 (bring-ups)' },
-  ])("$label: when one $op rejects, it is logged once by the controller with its message redacted, the step's other persona still settles, the later steps still run, and the apply finishes", async ({ op, failing, step }) => {
-    const { run, next } = await twoOfEach()
+  ])("$label: when one $op rejects, it is logged once by the controller with its message redacted, the step's other persona still settles, the later steps still run, and the apply finishes, telling its settlement once every step has settled and before reload-applied", async ({ op, failing, step }) => {
+    // How far the apply had got each time its settlement was told.
+    const settledAt: Array<{ timeline: number; applied: number }> = []
+    const { run, next } = await twoOfEach({
+      onApplySettled: () => void settledAt.push({ timeline: run.lifecycle.timeline.length, applied: run.logsOf(RELOAD_APPLIED).length }),
+    })
     const [alphaKey, bravoKey, charlieKey, deltaKey, echoKey, foxtrotKey, golfKey, hotelKey] = keysOf(
       'alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel',
     )
@@ -2168,6 +2985,9 @@ describe('step order with teardowns, in-place updates and bring-ups (steps 2, 3 
     expect(failed[0]).toContain(`lifecycle op exploded ${REDACTED_SENTINEL_TAIL}`)
     expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
     expect(run.appliedKeys()).toEqual(keysOf('alpha', 'charlie', 'golf', 'hotel', 'echo', 'foxtrot'))
+    // Told once, with every step's calls already ended (the rejected one included), before reload-applied.
+    expect(settledAt).toEqual([{ timeline: timeline.length, applied: 0 }])
+    expect(run.settledConfigs.map((c) => c.personas.map((p) => p.key))).toEqual([run.appliedKeys()!])
     expect(run.lifecycle.of('reconnect').find((r) => r.key === golfKey)!.change).toEqual({ kind: 'swapped' })
     if (op === 'reconnect') {
       // The rejected reconnect never ran, so hotel's change is pending again.
@@ -2209,6 +3029,9 @@ describe('a persona that is not up is still updated in place, and nothing brings
       await run.clock.runNext()
       expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
       expect(run.since(retry).lifecycle).toEqual([{ op: 'launch', key: bravoKey, via: 'retry' }])
+      // The new connection must discover its memberships before routing.
+      run.stub('bravo').script.inventory.splice(0, run.stub('bravo').script.inventory.length, membershipPage([own, EXTRA_CHANNEL]))
+      await run.membershipClock.runNext()
       // Up, it routes by the new values: its added channel is delivered.
       expect(await deliverTo(run, 'bravo', makeChannelMessage({ channel: EXTRA_CHANNEL }))).toEqual([
         { chat_id: EXTRA_CHANNEL, via: 'receive_all' },
@@ -2258,8 +3081,8 @@ describe('a persona that is not up is still updated in place, and nothing brings
 // ---------------------------------------------------------------------------
 
 /** A persona's bot identity as the manager and a stub name it. */
-function identityOf(stub: { identity: { botUserId: string; botId: string } }) {
-  return { botUserId: stub.identity.botUserId, botId: stub.identity.botId }
+function identityOf(stub: { identity: { botUserId: string; botId: string; teamId: string; appId?: string } }) {
+  return { ...stub.identity }
 }
 
 /** The start of a preview's credentials line for `persona` (its wording is `tests/reload-preview.test.ts`'s). */
@@ -2302,7 +3125,7 @@ describe('a confirmed token rotation reconnects only that persona (step 4, the c
     const activityFrom = run.socketActivity('bravo').length
     const oldAuthTests = oldStub.calls.authTest.length
 
-    const { tokens, label } = h.rotateCredentials(bravo!)
+    const { tokens, label } = h.rotateCredentials(bravo!, { slack: { appId: 'A0ROTATED' } })
     const cp = run.checkpoint()
     await (await run.confirmPending()).applying
 
@@ -2344,6 +3167,8 @@ describe('a confirmed token rotation reconnects only that persona (step 4, the c
     expect(run.isUp('bravo')).toBe(true)
     // Its next event arrives on the new connection, and the new client names the author.
     const own = ownChannel('bravo')
+    run.credentialsStub('bravo', label).script.inventory.push(membershipPage([own]))
+    await run.membershipClock.runNext()
     const usersInfoFrom = run.credentialsStub('bravo', label).calls.usersInfo.length
     await run.credentialsStub('bravo', label).socket.deliver(makeChannelMessage({ channel: own }))
     expect(deliveredSince(run, 'bravo', 0)).toEqual([{ chat_id: own, via: 'receive_all' }])
@@ -2391,7 +3216,7 @@ describe('a confirmed token rotation reconnects only that persona (step 4, the c
       expect(newCalls).toEqual([])
       expect(callsSince(run, 'bravo', oldFrom)).toEqual([`chat.postMessage ${dm}`])
     }
-    expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test'])
+    expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test', 'bots.info'])
     assertNoLeak(run.captured())
   })
 
@@ -2400,6 +3225,8 @@ describe('a confirmed token rotation reconnects only that persona (step 4, the c
     const [alpha, bravo] = personas
     const [bravoKey, deltaKey] = keysOf('bravo', 'delta')
     run.registerSession('alpha')
+    run.stub('alpha').script.inventory.push(membershipPage([ownChannel('alpha')]))
+    await run.membershipClock.runNext()
     const oldLabel = h.credentialsLabel('bravo')
     const oldIdentity = identityOf(run.stub('bravo'))
     const { label } = h.rotateCredentials(bravo!, { slack: { connect: [{ kind: 'open-never-answers' }] } })
@@ -3104,7 +3931,7 @@ describe('at apply: a credentials file whose real path is another applied person
     const charlieBefore = slackSideOf(run, 'charlie')
 
     // One edit: alpha moved off the shared file onto its own, and the shared file re-saved with bravo's new tokens.
-    const alpha = h.persona('alpha', { credentials_file: join(dirname(shared.credentials_file), 'credentials-own.json') })
+    const alpha = withIndependentDestination(h.persona('alpha', { credentials_file: join(dirname(shared.credentials_file), 'credentials-own.json') }))
     const { tokens: alphaTokens } = h.rotateCredentials(alpha)
     const { tokens: bravoTokens } = h.rotateCredentials(bravo)
     const cp = run.checkpoint()
@@ -3226,16 +4053,22 @@ async function turns(): Promise<void> {
   for (let i = 0; i < 20; i++) await new Promise((done) => setImmediate(done))
 }
 
+/** A replacement life uses an independently valid destination; copied old channel preferences confer no authority. */
+function withIndependentDestination(persona: PersonaInput): PersonaInput {
+  const id = 'C0REVIEW' + createHash('sha256').update(JSON.stringify([persona.name, persona.credentials_file, persona.working_directory])).digest('hex').slice(0, 8).toUpperCase()
+  return { ...persona, channels: [{ id, delivery: 'all' }], permission_prompts: id }
+}
+
 /** bravo's working directory moved to a new directory beside its old one, created unless `create` is false. */
 function movedDirectory(bravo: PersonaInput, create = true): PersonaInput {
-  const moved = h.persona(bravo.name, { working_directory: join(dirname(bravo.working_directory), 'moved') })
+  const moved = withIndependentDestination(h.persona(bravo.name, { working_directory: join(dirname(bravo.working_directory), 'moved') }))
   if (create) h.makeWorkingDirectory(moved)
   return moved
 }
 
 /** bravo's `credentials_file` moved to a new path, written there with a new token set unless `write` is false. */
 function movedCredentials(bravo: PersonaInput, write = true): PersonaInput {
-  const moved = h.persona(bravo.name, { credentials_file: join(dirname(bravo.credentials_file), 'credentials-moved.json') })
+  const moved = withIndependentDestination(h.persona(bravo.name, { credentials_file: join(dirname(bravo.credentials_file), 'credentials-moved.json') }))
   if (write) h.rotateCredentials(moved)
   return moved
 }
@@ -3769,7 +4602,7 @@ describe('apply step 1 begins an old-life hold on each key it records, once the 
   test.each<{ label: string; seeded: boolean; change: (alpha: PersonaInput, bravo: PersonaInput) => PersonaInput[] }>([
     { label: 'a removal', seeded: false, change: (alpha) => [alpha] },
     { label: 'a removal of a key already recorded with no mark (step 1 writes nothing)', seeded: true, change: (alpha) => [alpha] },
-    { label: "a key-changing rename (the old key's only; the new key gets none)", seeded: false, change: (alpha, bravo) => [alpha, { ...bravo, name: 'bravo2' }] },
+    { label: "a key-changing rename (the old key's only; the new key gets none)", seeded: false, change: (alpha, bravo) => [alpha, { ...withIndependentDestination(bravo), name: 'bravo2' }] },
     { label: 'a destructive modify of working_directory', seeded: false, change: (alpha, bravo) => [alpha, movedDirectory(bravo)] },
     { label: 'a destructive modify of credentials_file', seeded: false, change: (alpha, bravo) => [alpha, movedCredentials(bravo)] },
   ])("$label: bravo's key gets exactly one hold on cscb_<key> at its old working directory, begun after the last-applied write and before the teardown runs, with one begin line; alpha gets none", async ({ seeded, change }) => {
@@ -3800,26 +4633,43 @@ describe('apply step 1 begins an old-life hold on each key it records, once the 
 
     // The teardown (the recorder's stand-in) reads no row, so the hold stays.
     expect(run.oldLifeHolds.snapshot()).toEqual([hold])
-    expect(run.since(cp).writes).toEqual([{ path: h.paths.pending, ok: true }, ...(seeded ? [] : [h.retiredKeysWrite()]), h.lastAppliedWrite()])
+    expect(run.since(cp).writes).toEqual([h.lastAppliedWrite(), { path: h.paths.pending, ok: true }, h.lastAppliedWrite(), ...(seeded ? [] : [h.retiredKeysWrite()]), h.lastAppliedWrite(), h.lastAppliedWrite()])
     expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
     expectNoPostNoLeak(run)
   })
 
-  test.each<{ label: string; failure: Partial<WriteFailure> }>([
-    { label: "step 1's own retired-key write fails", failure: { step: 'openSync', call: 1 } },
-    // The retired-key write opens and fsyncs first, so the last-applied write's own open is the third openSync and its directory fsync the fourth.
-    { label: 'the last-applied rewrite fails before its rename, and the record is put back', failure: { step: 'openSync', call: 3 } },
-    { label: 'the last-applied rewrite fails at its directory sync, and the record is put back', failure: { step: 'fsyncSync', call: 4 } },
-  ])('$label: nothing is applied and no hold begins; the same change confirmed again with the writer working begins both holds', async ({ failure }) => {
-    const { run, personas } = await running(['alpha', 'bravo', 'charlie'])
+  test.each([
+    { label: "step 1's own retired-key write fails", boundary: 'retirement' },
+    { label: 'the last-applied rewrite fails before its rename, and the record is put back', boundary: 'activation' },
+  ] as const)('$label: nothing is applied and no hold begins; the same change confirmed again with the writer working begins both holds', async ({ boundary }) => {
+    let armed = false, reached = 0, retirementAtActivation = false
+    const { run, personas } = await running(['alpha', 'bravo', 'charlie'], {
+      beforeWrite: (path, bytes) => {
+        if (!armed || !(boundary === 'retirement' ? path === h.retiredKeysFile : path === h.paths.lastApplied && activationRecord(bytes, path))) return
+        armed = false; reached++
+        if (boundary === 'activation') retirementAtActivation = readRetiredKeysRecord(h.stateDir) !== null
+        h.failWrites({ path, step: 'openSync', call: 1 })
+      },
+    })
+    const before = applicationState(h.readRecord()!)
     const [alpha, bravo, charlie] = personas
     h.writeConfig(configOf(alpha!, movedDirectory(charlie!)))
     await run.ticks.tick()
     h.confirm()
-    h.failWrites(failure)
+    armed = true
+    const cp = run.checkpoint()
 
     await run.ticks.tick()
 
+    expect(reached).toBe(1)
+    if (boundary === 'activation') expect(retirementAtActivation).toBe(true)
+    expect(run.since(cp).writes.filter(write => !write.ok)).toEqual([
+      { path: boundary === 'retirement' ? h.retiredKeysFile : h.paths.lastApplied, ok: false },
+    ])
+    expect(applicationState(h.readRecord()!)).toEqual(before)
+    expect(readRetiredKeysRecord(h.stateDir)).toBeNull()
+    expect(run.retiredKeys.keys()).toEqual([])
+    expect(run.since(cp).lifecycle).toEqual([])
     expect(recordWriteFailedLines(run)).toHaveLength(1)
     expect(run.appliedConfigs).toEqual([])
     expect(run.oldLifeHolds.snapshot()).toEqual([])
@@ -3910,7 +4760,7 @@ describe('apply step 1 begins an old-life hold on each key it records, once the 
     const killQueue: KillQueue = []
     const { run, personas } = await running(['alpha', 'bravo'], { realLaunch: true, agentDirector: { killQueue } })
     const [alpha, bravo] = personas
-    const renamed = { ...bravo!, name: 'bravo2' }
+    const renamed = { ...withIndependentDestination(bravo!), name: 'bravo2' }
     const renamedKey = h.key('bravo2')
     for (let i = 0; i < KILL_RETRY_TRIES; i++) killQueue.push(cannedErr(errTmuxKillFailed()))
     killQueue.push(cannedErr(errTmuxSessionConflict('kill', 'different-id')))
@@ -4055,7 +4905,7 @@ describe('no persona is brought up into a directory an old life holds; once the 
       killLeavesRowLive: (id) => rowSurvivesKill && id === bravoId,
     })
     const [alpha, bravo] = personas
-    const renamed = { ...bravo!, name: 'bravo2' }
+    const renamed = { ...withIndependentDestination(bravo!), name: 'bravo2' }
     const alphaUntouched = watchUntouched(run, 'alpha')
     const adFrom = run.composition!.agentDirectorCalls.length
     const bravoFrom = run.composition!.instanceCallsOf('bravo').length
@@ -4191,7 +5041,7 @@ describe('no persona is brought up into a directory an old life holds; once the 
     const [alpha, bravo] = personas
     const renamedKey = h.key('bravo2')
     killQueue.push(...failedKills(), cannedErr(errTmuxSessionConflict('kill', 'different-id')))
-    const { applying } = await confirmConfig(run, [alpha!, { ...bravo!, name: 'bravo2' }])
+    const { applying } = await confirmConfig(run, [alpha!, { ...withIndependentDestination(bravo!), name: 'bravo2' }])
     await driveTeardownKillTries(run, KILL_RETRY_TRIES)
     await applying
     await until(() => waitEndLines(run, 'bravo').length === 1)
@@ -4307,7 +5157,7 @@ describe('a destructive modify does not carry a latch over to its new half, whic
     expect(h.rowOf('bravo')).toMatchObject({ state: 'ended', cwd: bravo!.working_directory })
     expect(run.episodeNotices).toEqual([{ key: bravoKey, text: REUSE_LEFTOVER.notice.text }])
     const posted = formatPersonaNotice({ name: 'bravo', key: bravoKey }, REUSE_LEFTOVER.notice.text)
-    expect(run.slackPosts().map(postOf)).toEqual([{ channel: oldDestination, text: posted }])
+    expect(run.slackPosts().map(postOf)).toEqual([{ channel: latchedDeclaration.permission_prompts, text: posted }])
 
     // The second destructive modify: a new working directory, and a destination no other persona claims.
     const newDestination = h.persona('charlie').permission_prompts!
@@ -4459,6 +5309,55 @@ describe('a destructive modify ends a held persona\'s ErrInvalidFlags hold at it
 })
 
 describe('reply-reminder configuration applies without relaunching', () => {
+  const monitors: ReplyReminders[] = []
+  afterEach(async () => { for (const monitor of monitors.splice(0)) await monitor.stop() })
+
+  /** Observe the same AD life on either side of a real confirmed reload. */
+  async function observeAcrossConfirmation(run: ReloadRun, names: string[]) {
+    const errors: unknown[] = []
+    const monitor = createReplyReminders({
+      queue: run.queue, clock: run.clock,
+      getRow: async () => undefined,
+      ready: key => run.isUp(names.find(name => h.key(name) === key)!),
+      enabled: key => run.serverConfig()!.personas.find(persona => persona.key === key)?.stop_hook_bootstrap === true,
+      prepare: async () => {}, onError: (_key, error) => { errors.push(error) },
+    })
+    monitors.push(monitor)
+    const rows = names.map(name => {
+      const persona = run.serverConfig()!.personas.find(p => p.key === h.key(name))!
+      const row = h.rowOf(name)!
+      return cannedGetResult({ ...row, state: 'working', labels: { ...row.labels, ...Object.fromEntries([REPLY_TOOL_PREALLOWED_LABEL.split('=')]) } }, persona, h.root)
+    })
+    async function delivered(name: string, i: number) {
+      const key = h.key(name)
+      const accepted = await run.queue.accept(key, slackInput())
+      if (accepted.status !== 'accepted') throw new Error('reminder fixture acceptance failed')
+      await run.queue.append(key, { v: 1, kind: 'fixed', seq: accepted.seq, parts: ['delivered body'] })
+      await run.queue.append(key, { ...sentRecord(accepted.seq), at: run.clock.now(), session_id: rows[i]!.session_id })
+      await run.queue.append(key, deliveredRecord(accepted.seq, run.clock.now()))
+    }
+    for (const [i, name] of names.entries()) {
+      const key = h.key(name)
+      if (!run.serverConfig()!.personas.find(persona => persona.key === key)!.stop_hook_bootstrap) continue
+      await delivered(name, i)
+      await monitor.observe(key, rows[i]!)
+    }
+    return async (enabled: boolean[]) => {
+      for (const [i, name] of names.entries()) {
+        const key = h.key(name)
+        // Opt-in covers the next delivered message; opt-out suppresses the
+        // pending reminder already observed in this same AD life.
+        if (run.queue.items(key).length === 0) await delivered(name, i)
+        await monitor.observe(key, rows[i]!)
+        await monitor.observe(key, { ...rows[i]!, state: 'waiting' })
+        const reminders = run.queue.items(key).filter(item => item.accepted.reminder_for !== undefined)
+        expect(reminders.map(item => item.accepted.reminder_for)).toEqual(enabled[i] ? [1] : [])
+      }
+      expect(errors).toEqual([])
+      assertNoLeak({ errors, captured: run.captured() })
+    }
+  }
+
   test.each([false, true])('an own toggle to %s takes effect on confirmation and keeps both instances', async enabled => {
     const { run, personas } = await running(['alpha', ['bravo', { stop_hook_bootstrap: !enabled }]], { ...REAL_LAUNCH, sessions: true })
     const [alpha] = personas
@@ -4466,6 +5365,7 @@ describe('reply-reminder configuration applies without relaunching', () => {
     const sides = { alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }
     const sessions = { alpha: run.session('alpha'), bravo: run.session('bravo') }
     const rows = { alpha: h.rowOf('alpha'), bravo: h.rowOf('bravo') }
+    const observe = await observeAcrossConfirmation(run, ['alpha', 'bravo'])
     const cp = run.checkpoint()
     const adFrom = run.composition!.agentDirectorCalls.length
     const lines = await previewConfig(run, [alpha!, h.persona('bravo', { stop_hook_bootstrap: enabled })])
@@ -4480,6 +5380,7 @@ describe('reply-reminder configuration applies without relaunching', () => {
     expect(run.session('alpha')).toBe(sessions.alpha!)
     expect(run.session('bravo')).toBe(sessions.bravo!)
     expect({ alpha: h.rowOf('alpha'), bravo: h.rowOf('bravo') }).toEqual(rows)
+    await observe([true, enabled])
     await expectNothingPendingAfter(run)
     expectNoPostNoLeak(run)
   })
@@ -4487,6 +5388,7 @@ describe('reply-reminder configuration applies without relaunching', () => {
   test('a default toggle updates inheritors immediately and keeps an explicit override', async () => {
     const { run, personas } = await running(['alpha', 'bravo', ['charlie', { stop_hook_bootstrap: true }]], { ...REAL_LAUNCH, top: { stop_hook_bootstrap: true } })
     const adFrom = run.composition!.agentDirectorCalls.length
+    const observe = await observeAcrossConfirmation(run, ['alpha', 'bravo', 'charlie'])
     const cp = run.checkpoint()
     await previewConfig(run, personas, { stop_hook_bootstrap: false })
     h.confirm()
@@ -4496,6 +5398,7 @@ describe('reply-reminder configuration applies without relaunching', () => {
     ])
     expect(run.since(cp).lifecycle).toEqual(keysOf('alpha', 'bravo').map(key => ({ op: 'update-in-place', key, via: 'apply', settings: ['stop_hook_bootstrap'] })))
     expect(adCallsSince(run, adFrom)).toEqual([])
+    await observe([false, false, true])
     await expectNothingPendingAfter(run)
     expectNoPostNoLeak(run)
   })
@@ -4839,7 +5742,7 @@ describe('a changed server-wide setting is recorded and takes effect at the next
     expect(run.since(cp).slackBuilds).toBe(0)
     expect({ alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }).toEqual(sides)
     // Recorded, and an effective change; the running server still reads the start-time value.
-    expect(JSON.parse(h.readRecord()!.toString('utf-8'))[setting]).toBe(after)
+    expect(JSON.parse(h.readRecord()!.toString('utf-8')).source[setting]).toBe(after)
     expect(run.appliedConfigs.at(-1)![setting]).toBe(after)
     expect(run.serverConfig()![setting]).toBe(before)
     const applied = run.logsOf(RELOAD_APPLIED)
@@ -5020,7 +5923,7 @@ describe('step 5: the agent-director template refresh (step 5)', () => {
     expect(run.composition!.installedTemplate!.agent_args!.slice(-2)).toEqual(['--system-prompt-snapshot', 'off'])
     expect(run.serverConfig()!.fresh_system_prompt).toBe(true)
     // ... and the record holds the change.
-    expect(JSON.parse(h.readRecord()!.toString('utf-8')).fresh_system_prompt).toBe(false)
+    expect(JSON.parse(h.readRecord()!.toString('utf-8')).source.fresh_system_prompt).toBe(false)
     expect(run.appliedConfigs.at(-1)!.fresh_system_prompt).toBe(false)
     await expectNothingPendingAfter(run)
     expectNoPostNoLeak(run)
@@ -5373,7 +6276,7 @@ describe('at apply: no credential value in any log line, error, notice, tool res
       label: "the fresh bring-up half of bravo's destructive modify (a new credentials_file path) refused by auth.test",
       opts: { realLifecycle: true },
       change: ([alpha, bravo]) => {
-        const moved = h.persona('bravo', { credentials_file: join(dirname(bravo!.credentials_file), 'credentials-moved.json') })
+        const moved = withIndependentDestination(h.persona('bravo', { credentials_file: join(dirname(bravo!.credentials_file), 'credentials-moved.json') }))
         h.rotateCredentials(moved, { slack: REFUSED_AUTH_TEST })
         h.writeConfig(configOf(alpha!, moved))
         return { named: moved, index: 1, files: [moved.credentials_file] }
@@ -5758,1108 +6661,358 @@ describe('at apply: no credential value in any log line, error, notice, tool res
   })
 })
 
-// ---------------------------------------------------------------------------
-// The channel modes at apply
-//
-// The mode rig: alpha and bravo, each with both sections (its own listed
-// `all` channel, which is also its declarative destination, and a fungible
-// destination of its own that no probe uses), running under the switch for
-// one mode; a delivery probe; the stored-choice seed, read and tool helpers;
-// and the rig's leak check over every run of the case plus the stored-choice
-// file's bytes.
-// ---------------------------------------------------------------------------
-
-/** The rig's personas. */
-const MODE_RIG = ['alpha', 'bravo'] as const
-
-/** A private channel no persona lists (`G…`, `channel_type` `group`). */
-const PRIVATE_CHANNEL = 'G0RLDPRIV1'
-
-/** The persona's fungible destination (`invited.permission_prompts`): a channel of its own, listed by no persona. */
-function fungibleDestinationOf(name: string): string {
-  return `C0FUNG${h.key(name).toUpperCase().replace(/[^A-Z0-9]/g, '')}`
-}
-
-/** The switch in file form for `mode`, written either way, so each direction changes its resolved value. */
-function switchTop(mode: ChannelMode): TopLevel {
-  return { [MODE_SWITCH_SETTING]: mode === 'fungible' }
-}
-
-/** A rig persona: `h.persona(name)` with its fungible destination, then `overrides`. */
-function modePersona(name: string, overrides: Partial<PersonaInput> = {}): PersonaInput {
-  return h.persona(name, { invited: { permission_prompts: fungibleDestinationOf(name) }, ...overrides })
-}
-
-/** `persona` with its working directory moved (created there), every other entry kept. */
-function withMovedDirectory(persona: PersonaInput): PersonaInput {
-  return { ...persona, working_directory: movedDirectory(persona).working_directory }
-}
-
-/** `persona` with its credentials file moved (written there with a new token set), every other entry kept. */
-function withMovedCredentials(persona: PersonaInput): PersonaInput {
-  return { ...persona, credentials_file: movedCredentials(persona).credentials_file }
-}
-
-/**
- * The rig running in `mode`: `names` (alpha and bravo by default) as
- * `modePersona`s, each with `overrides[name]`, under the switch for `mode`
- * plus `opts.top`; the real composition with a session each unless `opts`
- * says otherwise.
- */
-async function runningIn(
-  mode: ChannelMode,
-  opts: RunningOptions = {},
-  overrides: Readonly<Record<string, Partial<PersonaInput>>> = {},
-  names: readonly string[] = MODE_RIG,
-): Promise<{ run: ReloadRun; personas: PersonaInput[] }> {
-  const specs = names.map((name): PersonaSpec => [name, { invited: { permission_prompts: fungibleDestinationOf(name) }, ...overrides[name] }])
-  return running(specs, { ...REAL_WITH_SESSIONS, ...opts, top: { ...switchTop(mode), ...opts.top } })
-}
-
-/** `personas` under the switch for `mode` (plus `top`), confirmed and applied. */
-async function applyIn(run: ReloadRun, mode: ChannelMode, personas: PersonaInput[], top: TopLevel = {}): Promise<void> {
-  await applyConfig(run, personas, { ...switchTop(mode), ...top })
-}
-
-/** A probe's kind: a plain message, or one that mentions the persona's bot. */
-type ProbeKind = 'plain' | 'mention'
-
-/** A fresh probe event for the persona in `channel` (a public channel unless `factory` says otherwise). */
-function probeEvent(run: ReloadRun, name: string, channel: string, kind: ProbeKind, factory = makeChannelMessage) {
-  const text = kind === 'mention' ? `${mentionText(run.currentStub(name).identity.botUserId)} a probe` : 'a probe'
-  return factory({ channel, text })
-}
-
-/**
- * Deliver `event` to the persona and return what reached its session for it,
- * as `{chat_id, via}` (`[]`: not delivered). Delivered on the socket of the
- * credential set serving the persona now: `run.deliver` itself while that is
- * the set the run was built with.
- */
-async function deliverNow(run: ReloadRun, name: string, event: SlackEvent) {
-  if (run.currentStub(name) === run.stub(name)) return deliverTo(run, name, event)
-  const from = run.deliveries(name).length
-  await run.currentStub(name).socket.deliver(event)
-  return deliveredSince(run, name, from)
-}
-
-/** The delivery probe: a fresh plain or mention message in `channel` to the persona, and what reached its session. */
-async function probe(run: ReloadRun, name: string, channel: string, kind: ProbeKind, factory = makeChannelMessage) {
-  return deliverNow(run, name, probeEvent(run, name, channel, kind, factory))
-}
-
-/** The persona's stored choices to seed, by channel ID. */
-type StoredSeed = Readonly<Record<string, DeliveryMode>>
-
-/** Seed the stored-choice file with `choices` (through `writeChannelDeliveryRecord`), each under its persona's key and declaration. */
-function seedChoices(...choices: Array<[persona: PersonaInput, channels: StoredSeed]>): void {
-  writeChannelDeliveryRecord(
-    h.stateDir,
-    Object.fromEntries(
-      choices.map(([persona, channels]) => [
-        h.key(persona.name),
-        {
-          declaration: declarationOf(persona),
-          channels: Object.fromEntries(Object.entries(channels).map(([id, delivery]) => [id, { delivery }])),
-        },
-      ]),
-    ),
-  )
-}
-
-/** The stored choices of the persona named `name` as the file holds them, by channel ID; undefined when the file holds none for its key. */
-function storedOnDisk(name: string): Record<string, DeliveryMode> | undefined {
-  const entry = h.readChannelDelivery()?.get(h.key(name))
-  return entry === undefined ? undefined : Object.fromEntries([...entry.channels].map(([id, c]) => [id, c.delivery]))
-}
-
-/** The stored-choice file's bytes, or undefined when there is none. */
-function storedBytes(): Buffer | undefined {
-  return existsSync(h.channelDeliveryFile) ? readFileSync(h.channelDeliveryFile) : undefined
-}
-
-/** The run's writer calls on the stored-choice file since `cp`. */
-function storedWritesSince(run: ReloadRun, cp: ReturnType<ReloadRun['checkpoint']>) {
-  return run.since(cp).writes.filter((w) => w.path === h.channelDeliveryFile)
-}
-
-/** `set_channel_delivery` as the persona's instance, through its registered session now or through `session`. */
-async function setChoice(run: ReloadRun, name: string, channel: string, delivery: DeliveryMode, session?: SessionEntry) {
-  return run.callTool(name, SET_CHANNEL_DELIVERY_TOOL, { channel, delivery }, session)
-}
-
-/** An accepted call's result for a channel the loop guard does not hold. */
-function acceptedText(channel: string, delivery: DeliveryMode): { isError: boolean; text: string } {
-  return { isError: false, text: channelDeliverySetResultText(channel, delivery, { delivery, heldByLoopGuard: false }) }
-}
-
-/** The persona's `persona-invited-channel` lines (one per life and channel heard). */
-function invitedLines(run: ReloadRun, name: string): string[] {
-  return run.logsOf(PERSONA_INVITED_CHANNEL).filter((line) => line.includes(renderPersonaRef(name, h.key(name))))
-}
-
-/**
- * The rig's leak check: `assertNoLeak` over
- * every run the case built (its logs, writer calls and the files they wrote,
- * Slack calls, lifecycle records), `extra`, and the stored-choice file's
- * bytes when it exists.
- */
-function expectModeNoLeak(extra: Record<string, unknown> = {}): void {
-  for (const run of h.runs) assertNoLeak(run.captured(extra))
-  if (existsSync(h.channelDeliveryFile)) assertNoLeak({ storedChoices: writtenFile(h.channelDeliveryFile) })
-}
-
-/**
- * Watch the rig's personas across a confirmed change: the returned check
- * asserts no lifecycle record, timeline entry, composition call or
- * agent-director call since, and each persona's MCP session (by identity,
- * still connected), Slack side and up state as they are now.
- */
-function watchKept(run: ReloadRun, names: readonly string[] = MODE_RIG): () => void {
-  const cp = run.checkpoint()
-  const timeline = run.lifecycle.timeline.length
-  const calls = run.composition!.calls.length
-  const before = names.map((name) => ({ session: run.session(name)!, side: slackSideOf(run, name) }))
-  return () => {
-    expect(run.since(cp).lifecycle).toEqual([])
-    expect(run.lifecycle.timeline.slice(timeline)).toEqual([])
-    expect(run.composition!.calls.slice(calls)).toEqual([])
-    expect(stubCallCount(run.composition!.agentDirector)).toBe(0)
-    expect(run.since(cp).slackBuilds).toBe(0)
-    names.forEach((name, i) => {
-      expect(run.session(name)).toBe(before[i]!.session)
-      expect(before[i]!.session.connected).toBe(true)
-      expect(slackSideOf(run, name)).toEqual(before[i]!.side)
-      expect(run.isUp(name)).toBe(true)
-    })
-  }
-}
-
-const OTHER_MODE: Readonly<Record<ChannelMode, ChannelMode>> = { declarative: 'fungible', fungible: 'declarative' }
-
-describe('a confirmed switch change applies in place, at once, and keeps every session (the server-wide row)', () => {
-  test('after one confirmed change of the switch and port, the configuration in effect holds the confirmed switch and the start-time port, while the record and the applied configuration hold both new values', async () => {
-    const { run, personas } = await runningIn('declarative', { top: { port: 3101 } })
-
-    await applyIn(run, 'fungible', personas, { port: 3102 })
-
-    expect(run.serverConfig()).toMatchObject({ allow_invited_channels: true, port: 3101 })
-    expect(run.appliedConfigs.at(-1)).toMatchObject({ allow_invited_channels: true, port: 3102 })
-    expect(JSON.parse(h.readRecord()!.toString('utf-8'))).toMatchObject({ [MODE_SWITCH_SETTING]: true, port: 3102 })
-    await expectNothingPendingAfter(run)
-    expectModeNoLeak()
-  })
-
-  test.each<{ from: ChannelMode }>([{ from: 'declarative' }, { from: 'fungible' }])(
-    'a switch-only confirmation from $from mode runs no teardown, bring-up, launch, reconnect or in-place update, keeps every session and connection by identity, and keeps the dedupe store: an event delivered before the change is not delivered again after it',
-    async ({ from }) => {
-      const to = OTHER_MODE[from]
-      const { run, personas } = await runningIn(from)
-      const own = ownChannel('bravo')
-      // bravo's own channel is listed (declarative) and served (fungible): a mention there is delivered in both modes.
-      const mention = probeEvent(run, 'bravo', own, 'mention')
-      expect(await deliverTo(run, 'bravo', mention)).toEqual([{ chat_id: own, via: 'mention' }])
-      const kept = watchKept(run)
-
-      await applyIn(run, to, personas)
-
-      kept()
-      expect(run.serverConfig()!.allow_invited_channels).toBe(to === 'fungible')
-      expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
-      expect(run.logsOf(RELOAD_NOOP)).toEqual([])
-      // The same event again is a duplicate; a fresh mention is delivered by the mode turned on.
-      expect(await deliverTo(run, 'bravo', mention)).toEqual([])
-      expect(await probe(run, 'bravo', own, 'mention')).toEqual([{ chat_id: own, via: 'mention' }])
-      expect(run.deliveries('alpha')).toEqual([])
-      expect(storedBytes()).toBeUndefined()
-      await expectNothingPendingAfter(run)
-      expectModeNoLeak()
-    },
-  )
-
-  test('the heard set is kept: a channel bravo heard in fungible mode, with the switch then turned off and on again, is accepted by set_channel_delivery without being heard again, and logs no second persona-invited-channel line', async () => {
-    const { run, personas } = await runningIn('fungible')
-    expect(await probe(run, 'bravo', EXTRA_CHANNEL, 'plain')).toEqual([])
-    expect(invitedLines(run, 'bravo')).toHaveLength(1)
-    const kept = watchKept(run)
-
-    await applyIn(run, 'declarative', personas)
-    await applyIn(run, 'fungible', personas)
-
-    kept()
-    const cp = run.checkpoint()
-    expect(await setChoice(run, 'bravo', EXTRA_CHANNEL, 'all')).toEqual(acceptedText(EXTRA_CHANNEL, 'all'))
-    expect(storedWritesSince(run, cp)).toEqual([h.channelDeliveryWrite()])
-    expect(storedOnDisk('bravo')).toEqual({ [EXTRA_CHANNEL]: 'all' })
-    expect(await probe(run, 'bravo', EXTRA_CHANNEL, 'plain')).toEqual([{ chat_id: EXTRA_CHANNEL, via: 'receive_all' }])
-    expect(invitedLines(run, 'bravo')).toHaveLength(1)
-    expectModeNoLeak()
-  })
-
-  test("turned on, the next events follow fungible mode with no stored-choice file: an unlisted public or private channel's mention is delivered, bravo's listed delivery: all channel is served at mentions (listed values are not carried over), and set_channel_delivery accepts a channel bravo has heard", async () => {
-    const { run, personas } = await runningIn('declarative')
-    const own = ownChannel('bravo')
-    // Declarative: only the listed channel is served, at its listed delivery.
-    expect(await probe(run, 'bravo', EXTRA_CHANNEL, 'mention')).toEqual([])
-    expect(await probe(run, 'bravo', PRIVATE_CHANNEL, 'mention', makePrivateChannelMessage)).toEqual([])
-    expect(await probe(run, 'bravo', own, 'plain')).toEqual([{ chat_id: own, via: 'receive_all' }])
-
-    await applyIn(run, 'fungible', personas)
-
-    expect(await probe(run, 'bravo', EXTRA_CHANNEL, 'mention')).toEqual([{ chat_id: EXTRA_CHANNEL, via: 'mention' }])
-    expect(await probe(run, 'bravo', PRIVATE_CHANNEL, 'mention', makePrivateChannelMessage)).toEqual([
-      { chat_id: PRIVATE_CHANNEL, via: 'mention' },
-    ])
-    expect(await probe(run, 'bravo', own, 'plain')).toEqual([])
-    expect(await probe(run, 'bravo', own, 'mention')).toEqual([{ chat_id: own, via: 'mention' }])
-    expect(run.deliveries('alpha')).toEqual([])
-    expect(storedBytes()).toBeUndefined()
-    expect(await setChoice(run, 'bravo', EXTRA_CHANNEL, 'all')).toEqual(acceptedText(EXTRA_CHANNEL, 'all'))
-    expect(storedOnDisk('bravo')).toEqual({ [EXTRA_CHANNEL]: 'all' })
-    expectModeNoLeak()
-  })
-
-  test('turned off, a channel served only by the fungible path is no longer delivered (one unclaimed-channel line), the declarative section applies again, and set_channel_delivery is refused with the declarative refusal, writing nothing', async () => {
-    const { run, personas } = await runningIn('fungible')
-    const own = ownChannel('bravo')
-    expect(await probe(run, 'bravo', EXTRA_CHANNEL, 'mention')).toEqual([{ chat_id: EXTRA_CHANNEL, via: 'mention' }])
-    expect(await probe(run, 'bravo', own, 'plain')).toEqual([])
-
-    await applyIn(run, 'declarative', personas)
-    const cp = run.checkpoint()
-
-    expect(await probe(run, 'bravo', EXTRA_CHANNEL, 'mention')).toEqual([])
-    const unclaimed = run.since(cp).logs.filter((l) => l.startsWith(`[slack] ${UNCLAIMED_CHANNEL}: `))
-    expect(unclaimed).toHaveLength(1)
-    expect(unclaimed[0]).toContain(renderPersonaRef('bravo', h.key('bravo')))
-    expect(unclaimed[0]).toContain(EXTRA_CHANNEL)
-    expect(await probe(run, 'bravo', own, 'plain')).toEqual([{ chat_id: own, via: 'receive_all' }])
-    const refused = await setChoice(run, 'bravo', EXTRA_CHANNEL, 'all')
-    expect(refused).toEqual({ isError: true, text: channelDeliveryDeclarativeRefusal('bravo', h.key('bravo')) })
-    expect(storedWritesSince(run, cp)).toEqual([])
-    expect(storedBytes()).toBeUndefined()
-    expect(run.deliveries('alpha')).toEqual([])
-    expectModeNoLeak({ refused })
-  })
-})
-
-/** A fungible destination bravo moves to (`invited.permission_prompts`), listed by no persona. */
-const NEW_FUNGIBLE_DESTINATION = 'C0FUNGNEWDEST'
-
-/** bravo with `EXTRA_CHANNEL` added to its declarative `channels`, at `all`. */
-function withExtraListed(bravo: PersonaInput): PersonaInput {
-  return { ...bravo, channels: [{ id: ownChannel('bravo'), delivery: 'all' }, { id: EXTRA_CHANNEL, delivery: 'all' }] }
-}
-
-describe('in-place and recorded section changes at confirmation (the in-place row)', () => {
-  test.each<{ label: string; from: ChannelMode }>([
-    { label: 'the switch turned on with it', from: 'declarative' },
-    { label: 'in fungible mode, the switch unchanged (the in-place row)', from: 'fungible' },
-  ])("a change of bravo's invited.permission_prompts, $label, is one in-place update naming invited.permission_prompts, with its session kept, and the next notice posts at the new destination", async ({ from }) => {
-    const { run, personas } = await runningIn(from)
-    const [alpha, bravo] = personas
-    const bravoKey = h.key('bravo')
-    const session = run.session('bravo')!
-    const sides = { alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }
-    const cp = run.checkpoint()
-    const calls = run.composition!.calls.length
-
-    await applyIn(run, 'fungible', [alpha!, { ...bravo!, invited: { permission_prompts: NEW_FUNGIBLE_DESTINATION } }])
-
-    expect(run.since(cp).lifecycle).toEqual([{ op: 'update-in-place', key: bravoKey, via: 'apply', settings: [FUNGIBLE_DESTINATION_SETTING] }])
-    // A change of the fungible destination forgets the cached DM conversation.
-    expect(run.composition!.calls.slice(calls)).toEqual([['destinations.forget', bravoKey]])
-    expect(stubCallCount(run.composition!.agentDirector)).toBe(0)
-    expect(run.session('bravo')).toBe(session)
-    expect(session.connected).toBe(true)
-    expect({ alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }).toEqual(sides)
-    const personaLines = run.since(cp).logs.filter((l) => l.startsWith('[slack] persona '))
-    expect(personaLines).toHaveLength(1)
-    expect(personaLines[0]).toStartWith(`${inPlaceLineStart('bravo', [FUNGIBLE_DESTINATION_SETTING])}; `)
-    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
-    expect(await noticeCalls(run, 'bravo')).toEqual([`chat.postMessage ${NEW_FUNGIBLE_DESTINATION}`])
-    await expectNothingPendingAfter(run)
-    expectModeNoLeak()
-  })
-
-  test("the switch turned on with bravo's channels changed: no in-place update for channels (nor any lifecycle operation), the switch applies, and the next events follow fungible mode", async () => {
-    const { run, personas } = await runningIn('declarative')
-    const [alpha, bravo] = personas
-    const own = ownChannel('bravo')
-    const kept = watchKept(run)
-
-    await applyIn(run, 'fungible', [alpha!, withExtraListed(bravo!)])
-
-    kept()
-    expect(run.serverConfig()!.allow_invited_channels).toBe(true)
-    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
-    // Fungible mode: the newly listed channel and the listed one are at mentions, and an unlisted channel's mention is served.
-    expect(await probe(run, 'bravo', EXTRA_CHANNEL, 'plain')).toEqual([])
-    expect(await probe(run, 'bravo', own, 'plain')).toEqual([])
-    expect(await probe(run, 'bravo', OTHER_CHANNEL, 'mention')).toEqual([{ chat_id: OTHER_CHANNEL, via: 'mention' }])
-    expectModeNoLeak()
-  })
-
-  test.each<{ label: string; mode: ChannelMode; edit: (bravo: PersonaInput) => PersonaInput }>([
-    { label: 'a channels edit in fungible mode', mode: 'fungible', edit: withExtraListed },
-    { label: 'an invited edit in declarative mode', mode: 'declarative', edit: (bravo) => ({ ...bravo, invited: { permission_prompts: NEW_FUNGIBLE_DESTINATION } }) },
-  ])('a confirmation whose only change is $label rewrites the last-applied record to the candidate and logs reload-noop, with no lifecycle operation and the delivery probe unchanged', async ({ mode, edit }) => {
-    const { run, personas } = await runningIn(mode)
-    const [alpha, bravo] = personas
-    const own = ownChannel('bravo')
-    const probes = async () => [
-      await probe(run, 'bravo', own, 'plain'),
-      await probe(run, 'bravo', EXTRA_CHANNEL, 'plain'),
-      await probe(run, 'bravo', EXTRA_CHANNEL, 'mention'),
-    ]
-    const before = await probes()
-    const recordBefore = h.readRecord()
-    const kept = watchKept(run)
-
-    await applyIn(run, mode, [alpha!, edit(bravo!)])
-
-    kept()
-    expect(h.readRecord()).toEqual(h.readConfig())
-    expect(h.readRecord()).not.toEqual(recordBefore)
-    expect(run.logsOf(RELOAD_NOOP)).toEqual([renderNoopLogLine(h.paths.lastApplied)])
-    expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
-    expect(await probes()).toEqual(before)
-    await expectNothingPendingAfter(run)
-    expectModeNoLeak()
-  })
-
-  test("after a recorded channels edit in fungible mode, turning the switch off delivers by the recorded entries", async () => {
-    const { run, personas } = await runningIn('fungible')
-    const [alpha, bravo] = personas
-    const edited = [alpha!, withExtraListed(bravo!)]
-    await applyIn(run, 'fungible', edited)
-    expect(run.logsOf(RELOAD_NOOP)).toHaveLength(1)
-    expect(await probe(run, 'bravo', EXTRA_CHANNEL, 'plain')).toEqual([])
-    const kept = watchKept(run)
-
-    await applyIn(run, 'declarative', edited)
-
-    kept()
-    expect(await probe(run, 'bravo', EXTRA_CHANNEL, 'plain')).toEqual([{ chat_id: EXTRA_CHANNEL, via: 'receive_all' }])
-    expect(await probe(run, 'bravo', ownChannel('bravo'), 'plain')).toEqual([{ chat_id: ownChannel('bravo'), via: 'receive_all' }])
-    expect(run.deliveries('alpha')).toEqual([])
-    expectModeNoLeak()
-  })
-})
-
-/** bravo's destination in `mode`: its own listed channel (`permission_prompts`) or its fungible destination. */
-function destinationIn(mode: ChannelMode): string {
-  return mode === 'fungible' ? fungibleDestinationOf('bravo') : ownChannel('bravo')
-}
-
-/** Request tokens and prompt message timestamps of the prompt cases (opaque UUIDv4-shaped tokens, as agent-director mints them). */
-const REQUEST_TOKEN_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-const REQUEST_TOKEN_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
-const PROMPT_TS_A = '1700000100.000001'
-const PROMPT_TS_B = '1700000100.000002'
-
-/** An hour of a fake clock: past every retry a held notice waits for. */
-const HOUR_MS = 60 * 60 * 1000
-
-/**
- * The permission relay over a run (the reload harness has none): the real
- * poller on a manual interval (`startManualPoller`) and the real click
- * handler. Shared with the run, as `server.ts` shares them: the run's applied
- * personas (`run.serverConfig()`, read at each use), the run's Slack stubs
- * (`makePersonaClients`, the stub serving each persona now) and the run's up
- * check. Not shared: `server.ts` hands its poller the notifier's destination
- * resolver, destination hold and teardown-notice window, while `ReloadRun`
- * exposes none of them, so this poller runs on its own module-level resolver
- * and hold (reset by `_resetPollerState`), the resolver built over
- * `getPersonaConfig: () => run.serverConfig()` so it reads the switch in force
- * at each attempt, and with no teardown-notice window. agent-director lists
- * bravo's row in `check_permission` with the requests `open()` names; the
- * click's `decide` goes to the run's composition stub (through the outage
- * state the real composition installs). Trail events and lines are captured,
- * never written.
- */
-function promptRelay(run: ReloadRun, open: () => readonly string[]) {
-  const nameOf = (key: string) => MODE_RIG.find((name) => h.key(name) === key)
-  const getPersona = (key: string) => run.serverConfig()?.personas.find((p) => p.key === key)
-  const clients = makePersonaClients((key) => {
-    const name = nameOf(key)
-    return name === undefined ? undefined : run.currentStub(name)
-  })
-  const trail = makeTrailCapture()
-  const lines: string[] = []
-  const log = (...args: unknown[]) => void lines.push(args.map(String).join(' '))
-  const bravoKey = h.key('bravo')
-  const instance = personaInstanceId(bravoKey)
-  const agentDirector = {
-    list: async () => ({ spawns: [cannedListRow({ state: 'check_permission' }, getPersona(bravoKey)!, h.home)] }),
-    get: async () =>
-      cannedGetResultPlural({
-        instance_id: instance,
-        state: 'check_permission',
-        permission_requests: open().map((request_token, i) => cannedPermissionRequest({ request_token, request_id: i + 1 })),
-      }),
-  }
-  const interval = startManualPoller({
-    getClient: () => agentDirector as never,
-    clientFor: clients.clientFor,
-    getPersona,
-    getPersonaConfig: () => run.serverConfig(),
-    isPersonaUp: (key) => run.isUp(nameOf(key)!),
-    emitTrail: trail.emit,
-    log,
-  })
-  return {
-    instance,
-    /** One poller tick, settled once `done` holds. */
-    async tick(done: () => boolean): Promise<void> {
-      interval.fire()
-      await until(done)
-      await turns()
-    },
-    /** A click on bravo's prompt for `token`, received on bravo's connection. */
-    click: (decision: 'allow' | 'deny', token: string) =>
-      handlePermissionClick(encodePermissionActionId(decision, instance, token), {
-        receivingPersonaKey: bravoKey,
-        clientFor: clients.clientFor,
-        getPersona,
-        emitTrail: trail.emit,
-        log,
-      }),
-    captured: () => ({ trail: trail.events, lines }),
-  }
-}
-
-/**
- * A held-notice opening (`failed`) or cleared line of bravo's destination
- * episode: `formatPersonaDiagnostic` over `destinationFailedCause` or
- * `destinationClearedCause` (`src/persona-destination-hold.ts`).
- */
-function destinationLine(run: ReloadRun, mode: ChannelMode, failure: DestinationFailedAt, cleared = false): string {
-  const bravo = run.serverConfig()!.personas.find((p) => p.key === h.key('bravo'))!
-  const at = { setting: destinationSettingOf({ allow_invited_channels: mode === 'fungible' }), destination: destinationIn(mode) }
-  return formatPersonaDiagnostic({
-    class: PERSONA_DESTINATION_FAILED,
-    name: bravo.name,
-    key: bravo.key,
-    index: bravo.index,
-    cause: cleared ? destinationClearedCause(at, failure) : destinationFailedCause(at, failure),
-  })
-}
-
-describe('prompts and notices after a confirmed switch change go to the destination of the mode in force', () => {
-  afterEach(() => {
-    stopPermissionPoller()
-    _resetPollerState()
-  })
-
-  test.each<{ from: ChannelMode }>([{ from: 'declarative' }, { from: 'fungible' }])(
-    'from $from mode: a notice held at the old destination is retried at the destination of the mode turned on, and a failure there, not yet named by the open episode, logs one fresh opening line for it',
-    async ({ from }) => {
-      const to = OTHER_MODE[from]
-      const { run, personas } = await runningIn(from)
-      const notice = 'a notice held across the switch change'
-      const failure: DestinationFailedAt = { step: 'chat.postMessage', code: 'not_in_channel' }
-      // Refused at the old destination, then twice at the new one, then posted.
-      run.stub('bravo').script.post.push(...Array.from({ length: 3 }, (): WebApiOutcome => ({ kind: 'platform', error: failure.code })))
-      await run.notice('bravo', notice)
-      expect(run.logsOf(PERSONA_DESTINATION_FAILED)).toEqual([destinationLine(run, from, failure)])
-      const kept = watchKept(run)
-
-      await applyIn(run, to, personas)
-      kept()
-      await run.noticeClock.advance(HOUR_MS)
-
-      const postsOfNotice = run.stub('bravo').callLog.filter(
-        (c) => c.method === 'chat.postMessage' && String((c.args as { text?: unknown }).text).includes(notice),
-      )
-      expect(callTargets(postsOfNotice)).toEqual([
-        `chat.postMessage ${destinationIn(from)}`,
-        `chat.postMessage ${destinationIn(to)}`,
-        `chat.postMessage ${destinationIn(to)}`,
-        `chat.postMessage ${destinationIn(to)}`,
-      ])
-      expect(run.logsOf(PERSONA_DESTINATION_FAILED)).toEqual([
-        destinationLine(run, from, failure),
-        destinationLine(run, to, failure),
-        destinationLine(run, to, failure, true),
-      ])
-      expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test'])
-      expectModeNoLeak()
-    },
-  )
-
-  test.each<{ from: ChannelMode }>([{ from: 'declarative' }, { from: 'fungible' }])(
-    'from $from mode: a prompt posted before the confirmed switch change stays where it is and still takes a click, and the next prompt and the next notice go to the destination of the mode turned on',
-    async ({ from }) => {
-      const to = OTHER_MODE[from]
-      const { run, personas } = await runningIn(from)
-      let open: string[] = [REQUEST_TOKEN_A]
-      const relay = promptRelay(run, () => open)
-      const stub = run.stub('bravo')
-      stub.script.post.push({ kind: 'ok', result: { ts: PROMPT_TS_A } })
-      await relay.tick(() => getLivePermission(relay.instance, REQUEST_TOKEN_A) !== undefined)
-      expect(getLivePermission(relay.instance, REQUEST_TOKEN_A)).toMatchObject({ channelId: destinationIn(from), messageTs: PROMPT_TS_A })
-      const kept = watchKept(run)
-
-      await applyIn(run, to, personas)
-      kept()
-
-      // The next prompt goes to the destination in force; the earlier one is not posted again, moved or updated.
-      open = [REQUEST_TOKEN_A, REQUEST_TOKEN_B]
-      const calls = stub.callLog.length
-      stub.script.post.push({ kind: 'ok', result: { ts: PROMPT_TS_B } })
-      await relay.tick(() => getLivePermission(relay.instance, REQUEST_TOKEN_B) !== undefined)
-      expect(callsSince(run, 'bravo', calls)).toEqual([`chat.postMessage ${destinationIn(to)}`])
-      expect(getLivePermission(relay.instance, REQUEST_TOKEN_B)).toMatchObject({ channelId: destinationIn(to), messageTs: PROMPT_TS_B })
-      expect(getLivePermission(relay.instance, REQUEST_TOKEN_A)).toMatchObject({ channelId: destinationIn(from), messageTs: PROMPT_TS_A })
-      // The next notice too.
-      expect(await noticeCalls(run, 'bravo')).toEqual([`chat.postMessage ${destinationIn(to)}`])
-      // The earlier prompt still takes a click: decided, and its message updated where it was posted.
-      expect(await relay.click('allow', REQUEST_TOKEN_A)).toBe(true)
-      expect(run.composition!.agentDirector.decideCalls).toEqual([
-        { instance_id: relay.instance, decision: 'allow', request_token: REQUEST_TOKEN_A } as DecideParams,
-      ])
-      expect(updates(stub).map((u) => [u.channel, u.ts])).toEqual([[destinationIn(from), PROMPT_TS_A]])
-      expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test'])
-      expectModeNoLeak({ relay: relay.captured() })
-    },
-  )
-
-  test("a fungible-mode in-place change of bravo's invited.permission_prompts forgets its cached DM conversation: after dm, a channel and dm again, the next DM post opens the conversation again", async () => {
-    const dmOn = { enabled: true, contact: CONTACT }
-    const { run, personas } = await runningIn('fungible', {}, { bravo: { dm: dmOn, invited: { permission_prompts: 'dm' } } })
-    const [alpha, bravo] = personas
-    const bravoKey = h.key('bravo')
-    const dm = stubOpenedDmId(CONTACT)
-    // The first notice opens the DM, the second reuses the cached conversation.
-    expect(await noticeCalls(run, 'bravo')).toEqual([`conversations.open ${CONTACT}`, `chat.postMessage ${dm}`])
-    expect(await noticeCalls(run, 'bravo')).toEqual([`chat.postMessage ${dm}`])
-    // The lifecycle's DM destination settings name the fungible destination.
-    expect(LIFECYCLE_DM_DESTINATION_SETTINGS.has(FUNGIBLE_DESTINATION_SETTING)).toBe(true)
-    const cp = run.checkpoint()
-    const calls = run.composition!.calls.length
-
-    await applyIn(run, 'fungible', [alpha!, { ...bravo!, invited: { permission_prompts: fungibleDestinationOf('bravo') } }])
-    expect(await noticeCalls(run, 'bravo')).toEqual([`chat.postMessage ${fungibleDestinationOf('bravo')}`])
-    await applyIn(run, 'fungible', [alpha!, bravo!])
-
-    const update: ReloadLifecycleRecord = { op: 'update-in-place', key: bravoKey, via: 'apply', settings: [FUNGIBLE_DESTINATION_SETTING] }
-    expect(run.since(cp).lifecycle).toEqual([update, update])
-    expect(run.composition!.calls.slice(calls)).toEqual([['destinations.forget', bravoKey], ['destinations.forget', bravoKey]])
-    expect(run.session('bravo')).toBeDefined()
-    expect(await noticeCalls(run, 'bravo')).toEqual([`conversations.open ${CONTACT}`, `chat.postMessage ${dm}`])
-    expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test'])
-    expectModeNoLeak()
-  })
-})
-
-/** The real launch path with a session for every persona (a relaunch, or a restart that must keep a destructive modify's new-half choice). */
-const REAL_LAUNCH_WITH_SESSIONS: RunningOptions = { realLaunch: true, sessions: true }
-
-/**
- * A restart: `run` stopped, then a second start over the same directories
- * with detection started (`h.startDetecting`), and a session registered for
- * every persona it runs.
- */
-async function restartOf(run: ReloadRun, opts: ReloadRunOptions = { realLifecycle: true }): Promise<ReloadRun> {
-  await run.stop()
-  const restarted = await h.startDetecting(opts)
-  for (const name of restarted.serverConfig()!.personas.map((p) => p.name)) restarted.registerSession(name)
-  return restarted
-}
-
-describe('the stored choice across restarts, relaunches and switch changes, and an unreadable file at apply', () => {
-  test('a choice stored through set_channel_delivery survives a restart: the first event from that channel afterwards is decided by it, the tool accepts a stored channel before it is heard again, and the choice still applies after a persona relaunch (real launch)', async () => {
-    await useConfigDirs()
-    const { run, personas } = await runningIn('fungible', REAL_LAUNCH_WITH_SESSIONS)
-    for (const channel of [EXTRA_CHANNEL, OTHER_CHANNEL]) {
-      expect(await probe(run, 'bravo', channel, 'plain')).toEqual([])
-      expect(await setChoice(run, 'bravo', channel, 'all')).toEqual(acceptedText(channel, 'all'))
+describe('delivery and Joined Threads survive destination changes', () => {
+  test.each((['strict', 'open'] as const).flatMap(mode =>
+    (['off', 'mentions', 'all', 'thread_hybrid'] as const).map(delivery => ({ mode, delivery }))))(
+    '$mode / $delivery keeps choices, stamps and joins through confirmed destinations and mode switches', async ({ mode, delivery }) => {
+    const channel = EXTRA_CHANNEL, neighbor = OTHER_CHANNEL
+    const { run, personas: [alpha, bravo] } = await running([
+      ['alpha', { channels: [{ id: channel, delivery }, { id: neighbor, delivery: 'thread_hybrid' }],
+        permission_prompts: 'dm', dm: { enabled: true, contact: CONTACT } }],
+      ['bravo', { channels: [{ id: channel, delivery: 'mentions' }, { id: neighbor, delivery: 'mentions' }],
+        permission_prompts: 'dm', dm: { enabled: true, contact: CONTACT } }],
+    ], { ...REAL_WITH_SESSIONS, threadMemory: {}, top: { channel_mode: mode } })
+    const authority = run.controller.sharedChannels()!
+    if (delivery === 'thread_hybrid') await run.joinThread('alpha', channel, THREAD_ROOTS.primary)
+    await run.joinThread('alpha', neighbor, THREAD_ROOTS.secondary)
+    const before = authority.snapshot().personas.alpha!, session = run.session('alpha')
+    const stamps = [channel, neighbor].map(c => authority.channelStamp('alpha', c))
+    const journal = readFileSync(threadPath(h.stateDir, 'alpha'))
+    const confirmTransition = async (personas: PersonaInput[], nextMode: 'strict' | 'open', expected: Array<ReloadLifecycleRecord & { op: 'update-in-place' | 'teardown' }>) => {
+      const cp = run.checkpoint(), timeline = run.lifecycle.timeline.length, calls = run.composition!.calls.length
+      const adCalls = stubCallCount(run.composition!.agentDirector)
+      const adOrder = run.composition!.agentDirectorOrder.length
+      const kept = run.serverConfig()!.personas.map(({ name, key }) => ({
+        name, key, side: slackSideOf(run, name), client: run.connections.clientFor(key),
+        socket: run.stub(name).socket, session: run.session(name),
+      }))
+      const untouched = kept.filter(({ key }) => !expected.some(record => record.key === key))
+        .map(({ name }) => watchUntouched(run, name))
+      const expectKept = (removed: string[] = []) => {
+        expect(run.since(cp).slackBuilds).toBe(0)
+        expect(run.since(cp).slackCalls).toEqual([])
+        for (const before of kept) {
+          expect(slackSideOf(run, before.name)).toEqual(removed.includes(before.key)
+            ? { ...before.side, disconnects: before.side.disconnects.map(n => n + 1) } : before.side)
+          if (removed.includes(before.key)) continue
+          expect(run.connections.clientFor(before.key)).toBe(before.client)
+          expect(run.stub(before.name).socket).toBe(before.socket)
+          expect(run.session(before.name)).toBe(before.session)
+          expect(before.session!.connected).toBe(true)
+        }
+      }
+      await previewConfig(run, personas, { channel_mode: nextMode })
+      expect(run.since(cp).lifecycle).toEqual([])
+      expect(run.lifecycle.timeline.slice(timeline)).toEqual([])
+      expect(run.composition!.calls.slice(calls)).toEqual([])
+      expect(stubCallCount(run.composition!.agentDirector)).toBe(adCalls)
+      expectKept()
+      h.confirm(); await run.ticks.tick()
+      expect(run.since(cp).lifecycle).toEqual(expected)
+      expect(run.lifecycle.timeline.slice(timeline)).toEqual(expected.flatMap(({ op, key }) => [
+        { op, key, phase: 'start' }, { op, key, phase: 'settled' },
+      ]))
+      const removed = expected.filter(({ op }) => op === 'teardown').map(({ key }) => key)
+      expectKept(removed)
+      expect(stubCallCount(run.composition!.agentDirector)).toBe(adCalls + removed.length)
+      expect(run.composition!.agentDirectorOrder.slice(adOrder)).toEqual(removed.map(key => `kill ${personaInstanceId(key)}`))
+      for (const key of removed) {
+        expect(run.connections.manager.status(key)).toBeUndefined()
+        expect(run.bringUps.state(key)).toBeUndefined()
+      }
+      for (const check of untouched) check()
+      for (const before of kept.filter(({ key }) => !expected.some(record => record.key === key))) {
+        expect(run.composition!.calls.slice(calls).filter(([, key]) => key === before.key)).toEqual([])
+      }
+      if (removed.length === 0) {
+        expect(run.composition!.calls.slice(calls)).toEqual(expected.map(({ key }) => ['destinations.forget', key]))
+      }
+      expectNoPostNoLeak(run)
     }
-    // From the next event after the call.
-    expect(await probe(run, 'bravo', EXTRA_CHANNEL, 'plain')).toEqual([{ chat_id: EXTRA_CHANNEL, via: 'receive_all' }])
-    expect(storedOnDisk('bravo')).toEqual({ [EXTRA_CHANNEL]: 'all', [OTHER_CHANNEL]: 'all' })
-
-    const restarted = await restartOf(run, { realLaunch: true })
-
-    expect(await probe(restarted, 'bravo', EXTRA_CHANNEL, 'plain')).toEqual([{ chat_id: EXTRA_CHANNEL, via: 'receive_all' }])
-    // OTHER_CHANNEL is not heard in this run: the stored choice makes it known.
-    expect(invitedLines(restarted, 'bravo').filter((l) => l.includes(OTHER_CHANNEL))).toEqual([])
-    expect(await setChoice(restarted, 'bravo', OTHER_CHANNEL, 'mentions')).toEqual(acceptedText(OTHER_CHANNEL, 'mentions'))
-    expect(await probe(restarted, 'bravo', OTHER_CHANNEL, 'plain')).toEqual([])
-    // A relaunch of bravo keeps the stored choice.
-    h.seedRow(personas[1]!, { state: 'ended' })
-    // a resume is counted once its row reports in.
-    expect(await restarted.relaunch('bravo')).toBe(LAUNCH_RESUMED_UNREPORTED)
-    expect(await probe(restarted, 'bravo', EXTRA_CHANNEL, 'plain')).toEqual([{ chat_id: EXTRA_CHANNEL, via: 'receive_all' }])
-    expect(storedOnDisk('bravo')).toEqual({ [EXTRA_CHANNEL]: 'all', [OTHER_CHANNEL]: 'mentions' })
-    expect(restarted.deliveries('alpha')).toEqual([])
-    expectModeNoLeak()
-  })
-
-  test("with stored choices, the switch turned off and on through pending and confirm: while off, a channel listed at mentions and stored as all delivers by its listed entry and an unlisted channel with a stored choice is not delivered; once on, the stored choices apply again; no switch change writes the file", async () => {
-    const own = ownChannel('bravo')
-    const listedAtMentions: Partial<PersonaInput> = { channels: [{ id: own, delivery: 'mentions' }] }
-    seedChoices([modePersona('bravo', listedAtMentions), { [own]: 'all', [EXTRA_CHANNEL]: 'all' }])
-    const { run, personas } = await runningIn('fungible', {}, { bravo: listedAtMentions })
-    const bytes = storedBytes()!
-    const storedApply = async () => {
-      expect(await probe(run, 'bravo', own, 'plain')).toEqual([{ chat_id: own, via: 'receive_all' }])
-      expect(await probe(run, 'bravo', EXTRA_CHANNEL, 'plain')).toEqual([{ chat_id: EXTRA_CHANNEL, via: 'receive_all' }])
+    let sequence = 0
+    const assertUnchanged = async () => {
+      expect(authority.snapshot().personas.alpha!.assignments).toEqual(before.assignments)
+      expect(authority.choice('alpha', channel)).toBe(delivery)
+      expect([channel, neighbor].map(c => authority.channelStamp('alpha', c))).toEqual(stamps)
+      expect(readFileSync(threadPath(h.stateDir, 'alpha'))).toEqual(journal)
+      expect(run.threadMemory!.view('alpha', channel, THREAD_ROOTS.primary)).toBe(delivery === 'thread_hybrid' ? 'joined' : 'not-joined')
+      expect(run.threadMemory!.view('alpha', neighbor, THREAD_ROOTS.secondary)).toBe('joined')
+      expect(run.session('alpha')).toBe(session)
+      const from = run.queued('alpha').length
+      const events = [
+        { text: 'plain message' },
+        { text: 'reply in joined thread', thread_ts: THREAD_ROOTS.primary },
+        { text: 'reply in other thread', thread_ts: THREAD_ROOTS.third },
+        { text: `${mentionText(run.stub('alpha').identity.botUserId)} mention`, thread_ts: THREAD_ROOTS.primary },
+        { text: `${broadcastText()} broadcast`, thread_ts: THREAD_ROOTS.primary },
+      ].map(event => makeChannelMessage({ channel, ...event, ts: `1700000010.${String(++sequence).padStart(6, '0')}` }))
+      for (const event of events) await run.deliver('alpha', event)
+      const selected = delivery === 'off' ? [] : delivery === 'all'
+        ? [[0, 'receive_all'], [1, 'receive_all'], [2, 'receive_all'], [3, 'mention'], [4, 'broadcast']] as const
+        : delivery === 'thread_hybrid' ? [[1, 'thread'], [3, 'mention'], [4, 'broadcast']] as const
+          : [[3, 'mention'], [4, 'broadcast']] as const
+      expect(run.queued('alpha').slice(from).map(({ accepted: { channel, ts, text, via } }) => ({ channel, ts, text, via }))).toEqual(
+        selected.map(([index, via]) => ({ channel, ts: events[index]!.ts as string, text: events[index]!.text as string, via })))
+      expect(run.queued('bravo')).toEqual([])
+      assertNoLeak(run.captured())
     }
-    await storedApply()
-    const cp = run.checkpoint()
-
-    await applyIn(run, 'declarative', personas)
-
-    expect(storedBytes()).toEqual(bytes)
-    expect(await probe(run, 'bravo', own, 'plain')).toEqual([])
-    expect(await probe(run, 'bravo', own, 'mention')).toEqual([{ chat_id: own, via: 'mention' }])
-    expect(await probe(run, 'bravo', EXTRA_CHANNEL, 'plain')).toEqual([])
-    expect(await probe(run, 'bravo', EXTRA_CHANNEL, 'mention')).toEqual([])
-
-    await applyIn(run, 'fungible', personas)
-
-    expect(storedBytes()).toEqual(bytes)
-    await storedApply()
-    expect(storedWritesSince(run, cp)).toEqual([])
-    expect(run.deliveries('alpha')).toEqual([])
-    expectModeNoLeak()
-  })
-
-  test('a declarative start over an unreadable stored-choice file whose bytes hold a stored all, then the switch turned on by a confirmed change: every channel is served at mentions, set_channel_delivery is refused with the unreadable refusal, and the file is never written', async () => {
-    const own = ownChannel('bravo')
-    seedChoices([modePersona('bravo'), { [own]: 'all', [EXTRA_CHANNEL]: 'all' }])
-    // The serialiser's record with an unknown version: every choice still in the bytes, the file refused.
-    const record = JSON.parse(readFileSync(h.channelDeliveryFile, 'utf-8')) as Record<string, unknown>
-    const unreadable = h.writeChannelDeliveryBytes(`${JSON.stringify({ ...record, version: CHANNEL_DELIVERY_FORMAT_VERSION + 1 }, null, 2)}\n`)
-    const refusal = parseChannelDelivery(unreadable)
-    if (refusal.ok) throw new Error('the altered record still parses')
-    const { run, personas } = await runningIn('declarative')
-    expect(run.logsOf(CHANNEL_DELIVERY_UNREADABLE)).toEqual([
-      channelDeliveryUnreadableLine(h.channelDeliveryFile, { stage: refusal.stage, problem: refusal.problem }),
+    await assertUnchanged()
+    // Each transition is a real preview and confirmed application. No assignment
+    // request accompanies it, so destination edits cannot rewrite the choices.
+    for (const destination of [channel, 'dm', neighbor, channel]) {
+      await confirmTransition([alpha!, { ...bravo!, permission_prompts: destination }], mode, [
+        { op: 'update-in-place', key: h.key('bravo'), via: 'apply', settings: ['permission_prompts'] },
+      ])
+      await assertUnchanged()
+    }
+    for (const nextMode of [mode === 'open' ? 'strict' : 'open', mode] as const) {
+      await confirmTransition([alpha!, { ...bravo!, permission_prompts: channel }], nextMode, [])
+      expect(run.serverConfig()!.channel_mode).toBe(nextMode)
+      run.stub('alpha').script.inventory.push(membershipPage([channel, neighbor]))
+      run.membershipScanner.request('alpha'); await run.membershipClock.runNext()
+      await assertUnchanged()
+    }
+    await confirmTransition([alpha!], mode, [{ op: 'teardown', key: h.key('bravo'), via: 'apply' }])
+    await assertUnchanged()
+    await confirmTransition([{ ...alpha!, permission_prompts: channel }], mode, [
+      { op: 'update-in-place', key: h.key('alpha'), via: 'apply', settings: ['permission_prompts'] },
     ])
-
-    await applyIn(run, 'fungible', personas)
-
-    expect(await probe(run, 'bravo', EXTRA_CHANNEL, 'plain')).toEqual([])
-    expect(await probe(run, 'bravo', own, 'plain')).toEqual([])
-    expect(await probe(run, 'bravo', EXTRA_CHANNEL, 'mention')).toEqual([{ chat_id: EXTRA_CHANNEL, via: 'mention' }])
-    const refused = await setChoice(run, 'bravo', EXTRA_CHANNEL, 'all')
-    expect(refused).toEqual({ isError: true, text: channelDeliveryUnreadableRefusal('bravo', h.key('bravo'), h.channelDeliveryFile) })
-    expect(run.writes.filter((w) => w.path === h.channelDeliveryFile)).toEqual([])
-    expect(storedBytes()).toEqual(unreadable)
-    expect(run.logsOf(CHANNEL_DELIVERY_UNREADABLE)).toHaveLength(1)
-    expectModeNoLeak({ refused })
-  })
-})
-
-/** The persona serves `channel` at mentions: a plain message there is not delivered, a mention is. */
-async function expectAtMentions(run: ReloadRun, name: string, channel: string): Promise<void> {
-  expect(await probe(run, name, channel, 'plain')).toEqual([])
-  expect(await probe(run, name, channel, 'mention')).toEqual([{ chat_id: channel, via: 'mention' }])
-}
-
-/**
- * One way a confirmed apply retires a key: `second` is the
- * persona running beside alpha with the stored choice, `change` the
- * personas confirmed, `fresh` the name of the persona the apply brings up in
- * its place, and `readd` whether a later apply adds `second` back instead (a
- * removal brings nothing up).
- */
-interface Retirement {
-  label: string
-  second: string
-  change: (personas: PersonaInput[]) => PersonaInput[]
-  fresh: () => string
-  readd?: boolean
-}
-
-/**
- * bravo renamed to `bravo2`, a new key: its old key is removed and the new
- * one added. The renamed entry names a credentials file of its own, written
- * now, so the new key's connection has its own stub.
- */
-function renamedBravo(bravo: PersonaInput): PersonaInput {
-  const renamed = { ...bravo, name: 'bravo2', credentials_file: h.persona('bravo2').credentials_file }
-  h.writeCredentials(renamed)
-  return renamed
-}
-
-const RETIREMENTS: Retirement[] = [
-  { label: 'a removal', second: 'bravo', change: ([alpha]) => [alpha!], fresh: () => 'bravo', readd: true },
-  { label: 'a key-changing rename', second: 'bravo', change: ([alpha, bravo]) => [alpha!, renamedBravo(bravo!)], fresh: () => 'bravo2' },
-  { label: 'a working_directory change', second: 'bravo', change: ([alpha, bravo]) => [alpha!, withMovedDirectory(bravo!)], fresh: () => 'bravo' },
-  { label: 'a credentials_file change', second: 'bravo', change: ([alpha, bravo]) => [alpha!, withMovedCredentials(bravo!)], fresh: () => 'bravo' },
-  // `personaKey` of a name in key form is the name, so `Bravo` renamed to its own key keeps that key.
-  {
-    label: 'a same-key name change',
-    second: 'Bravo',
-    change: ([alpha, bravo]) => [alpha!, { ...bravo!, name: h.key('Bravo') }],
-    fresh: () => h.key('Bravo'),
-  },
-]
-
-describe('step 1: a confirmed apply drops the stored choices of the keys it retires, and writes an unwritten drop before it brings a key up', () => {
-  test.each(RETIREMENTS)(
-    "$label drops the key's stored choices once the last-applied rewrite has succeeded, and the persona brought up fresh serves the channel at mentions",
-    async ({ second, change, fresh, readd }) => {
-      seedChoices([modePersona(second), { [EXTRA_CHANNEL]: 'all' }])
-      const { run, personas } = await runningIn('fungible', {}, {}, ['alpha', second])
-      const key = h.key(second)
-      expect(await probe(run, second, EXTRA_CHANNEL, 'plain')).toEqual([{ chat_id: EXTRA_CHANNEL, via: 'receive_all' }])
-      const cp = run.checkpoint()
-
-      await applyIn(run, 'fungible', change(personas))
-
-      // The retired-key record, the rewrite, then the drop's write.
-      expect(run.since(cp).writes.filter((w) => w.path !== h.paths.pending)).toEqual([
-        h.retiredKeysWrite(),
-        h.lastAppliedWrite(),
-        h.channelDeliveryWrite(),
-      ])
-      expect(run.since(cp).logs).toContain(channelDeliveryDropLine(key, 1, CHANNEL_DELIVERY_DROP_RETIRED))
-      expect(run.channelDelivery.storedChannels(key)).toEqual([])
-      expect(storedOnDisk(second)).toBeUndefined()
-      if (readd === true) await applyIn(run, 'fungible', personas)
-      run.registerSession(fresh())
-      await expectAtMentions(run, fresh(), EXTRA_CHANNEL)
-      expectModeNoLeak()
-    },
-  )
-
-  test.each<{ label: string; change: (personas: PersonaInput[]) => PersonaInput[] }>([
-    { label: 'a removal', change: ([alpha]) => [alpha!] },
-    { label: 'a working_directory change', change: ([alpha, bravo]) => [alpha!, withMovedDirectory(bravo!)] },
-  ])("$label whose last-applied rewrite fails drops nothing: bravo's entries stay in memory and on disk, with no stored-choice write", async ({ change }) => {
-    seedChoices([modePersona('bravo'), { [EXTRA_CHANNEL]: 'all' }])
-    const { run, personas } = await runningIn('fungible')
-    const bravoKey = h.key('bravo')
-    const bytes = storedBytes()
-    h.writeConfig(configWith(switchTop('fungible'), change(personas)))
-    await run.ticks.tick()
-    h.confirm()
-    // The retired-key write's two opens come first: the third is the rewrite's.
-    h.failWrites({ step: 'openSync', call: 3 })
-    const cp = run.checkpoint()
-
-    await run.ticks.tick()
-    h.clearWriteFailure()
-
-    expect(run.logsOf(RELOAD_RECORD_WRITE_FAILED)).toHaveLength(1)
-    expect(run.appliedKeys()).toEqual(keysOf('alpha', 'bravo'))
-    expect(run.channelDelivery.storedChoice(bravoKey, EXTRA_CHANNEL)).toBe('all')
-    expect(run.channelDelivery.hasUnwrittenDrop(bravoKey)).toBe(false)
-    expect(storedWritesSince(run, cp)).toEqual([])
-    expect(storedBytes()).toEqual(bytes)
-    expect(await probe(run, 'bravo', EXTRA_CHANNEL, 'plain')).toEqual([{ chat_id: EXTRA_CHANNEL, via: 'receive_all' }])
-    expectModeNoLeak()
-  })
-
-  /**
-   * alpha, bravo (its `EXTRA_CHANNEL` stored as `all`) and charlie in
-   * fungible mode, bravo then removed with the drop's write failing, so its
-   * key has an unwritten drop and the file still holds its entry; then the
-   * change adding bravo back and removing charlie (so step 1 also records a
-   * retired key) is checked, pending, ready for `h.confirm()`.
-   */
-  async function removedWithFailedDrop() {
-    seedChoices([modePersona('bravo'), { [EXTRA_CHANNEL]: 'all' }])
-    const { run, personas } = await runningIn('fungible', {}, {}, ['alpha', 'bravo', 'charlie'])
-    const [alpha, bravo] = personas
-    h.failChannelDeliveryWrites()
-    await applyIn(run, 'fungible', [alpha!, personas[2]!])
-    h.clearChannelDeliveryWriteFailure()
-    expect(run.channelDelivery.hasUnwrittenDrop(h.key('bravo'))).toBe(true)
-    expect(storedOnDisk('bravo')).toEqual({ [EXTRA_CHANNEL]: 'all' })
-    h.writeConfig(configWith(switchTop('fungible'), [alpha!, bravo!]))
-    await run.ticks.tick()
-    expect(h.pendingExists()).toBe(true)
-    return { run }
-  }
-
-  test('after a removal whose drop write failed, re-adding bravo writes the stored-choice record first, before the retired-key record and the last-applied rewrite; bravo is then served at mentions, and after a restart too', async () => {
-    const { run } = await removedWithFailedDrop()
-    h.confirm()
-    const applying = run.checkpoint()
-
-    await run.ticks.tick()
-
-    expect(run.since(applying).writes).toEqual([h.channelDeliveryWrite(), h.retiredKeysWrite(), h.lastAppliedWrite()])
-    expect(run.channelDelivery.hasUnwrittenDrop(h.key('bravo'))).toBe(false)
-    expect(storedOnDisk('bravo')).toBeUndefined()
-    expect(run.appliedKeys()).toEqual(keysOf('alpha', 'bravo'))
-    run.registerSession('bravo')
-    await expectAtMentions(run, 'bravo', EXTRA_CHANNEL)
-
-    const restarted = await restartOf(run)
-    await expectAtMentions(restarted, 'bravo', EXTRA_CHANNEL)
-    expectModeNoLeak()
-  })
-
-  test.each<{ label: string; failure: Partial<WriteFailure> }>([
-    { label: 'a write failure', failure: { step: 'openSync' } },
-    { label: 'an unsynced rename', failure: { step: 'fsyncSync', call: 2 } },
-  ])('that first write failing ($label) applies nothing: one reload-record-write-failed line names the stored-choice file, the retired-key record is not written, the change stays pending; after a restart and the change confirmed, bravo is served at mentions', async ({ failure }) => {
-    const { run } = await removedWithFailedDrop()
-    const fingerprint = h.pendingFingerprint()
-    const retired = readRetiredKeysRecord(h.stateDir)
-    const record = h.readRecord()
-    h.confirm()
-    h.failChannelDeliveryWrites(failure)
-    const cp = run.checkpoint()
-
-    await run.ticks.tick()
-    h.clearChannelDeliveryWriteFailure()
-
-    expect(run.since(cp).writes.filter((w) => w.path !== h.paths.pending)).toEqual([h.channelDeliveryWrite(false)])
-    expect(run.logsOf(RELOAD_RECORD_WRITE_FAILED)).toEqual([reloadChannelDeliveryWriteFailedLine(h.channelDeliveryFile, h.paths.lastApplied)])
-    expect(readRetiredKeysRecord(h.stateDir)).toEqual(retired)
-    expect(h.readRecord()).toEqual(record)
-    expect(run.appliedKeys()).toEqual(keysOf('alpha', 'charlie'))
-    expect(run.since(cp).lifecycle).toEqual([])
-    expect(h.pendingFingerprint()).toBe(fingerprint)
-    expectModeNoLeak()
-
-    // The restart runs the record (bravo absent) and keeps the change pending; confirmed, it adds bravo back.
-    const restarted = await restartOf(run)
-    expect(restarted.appliedKeys()).toEqual(keysOf('alpha', 'charlie'))
-    await restarted.ticks.tick()
-    expect(h.pendingFingerprint()).toBe(fingerprint)
-    h.confirm()
-    await restarted.ticks.tick()
-    expect(restarted.appliedKeys()).toEqual(keysOf('alpha', 'bravo'))
-    restarted.registerSession('bravo')
-    await expectAtMentions(restarted, 'bravo', EXTRA_CHANNEL)
-    expectModeNoLeak()
-  })
-
-  test("the stored-choice reload-record-write-failed line carries its class and names the stored-choice file and the last-applied record", () => {
-    const line = reloadChannelDeliveryWriteFailedLine(h.channelDeliveryFile, h.paths.lastApplied)
-    expect(line).toStartWith(`[slack] ${RELOAD_RECORD_WRITE_FAILED}: `)
-    expect(line).toContain(JSON.stringify(h.channelDeliveryFile))
-    expect(line).toContain(JSON.stringify(h.paths.lastApplied))
-  })
-})
-
-// The path "removed, then added back first" (before the bring-up) is
-// the cases above; the held-teardown window is the next block.
-describe("a retired key's stored choices never apply again, on each restart path, with the drop's write failing and a restart before any successful write", () => {
-  test("a destructive modify, the key still applied: the restart drops its choices by the changed declaration, and the new life serves the channel at mentions, before and after the restart (real launch)", async () => {
-    await useConfigDirs()
-    seedChoices([modePersona('bravo'), { [EXTRA_CHANNEL]: 'all' }])
-    const { run, personas } = await runningIn('fungible', REAL_LAUNCH_WITH_SESSIONS)
-    const [alpha, bravo] = personas
-    const bravoKey = h.key('bravo')
-    h.failChannelDeliveryWrites()
-
-    await applyIn(run, 'fungible', [alpha!, withMovedDirectory(bravo!)])
-
-    expect(run.channelDelivery.hasUnwrittenDrop(bravoKey)).toBe(true)
-    expect(storedOnDisk('bravo')).toEqual({ [EXTRA_CHANNEL]: 'all' })
-    run.registerSession('bravo')
-    await expectAtMentions(run, 'bravo', EXTRA_CHANNEL)
-
-    // The write still failing: no successful write before the restart.
-    const restarted = await restartOf(run, { realLaunch: true })
-
-    // The retired-key record no longer holds the key (its entry is removed once the new life is seen running,
-    //), so only the declaration rule can drop it.
-    expect([restarted.retiredKeys.isRecorded(bravoKey), restarted.retiredKeys.isMarked(bravoKey)]).toEqual([false, false])
-    expect(restarted.logs).toContain(channelDeliveryDropLine(bravoKey, 1, CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED))
-    await expectAtMentions(restarted, 'bravo', EXTRA_CHANNEL)
-    expectModeNoLeak()
-  })
-
-  test('a removal: the key is dropped at each of two restarts while it stays absent, and added back after them, the persona serves the channel at mentions', async () => {
-    seedChoices([modePersona('bravo'), { [EXTRA_CHANNEL]: 'all' }])
-    const { run, personas } = await runningIn('fungible')
-    const bravoKey = h.key('bravo')
-    const dropped = channelDeliveryDropLine(bravoKey, 1, CHANNEL_DELIVERY_DROP_NOT_APPLIED)
-    h.failChannelDeliveryWrites()
-    await applyIn(run, 'fungible', [personas[0]!])
-
-    const first = await restartOf(run)
-    expect(first.logs).toContain(dropped)
-    expect(storedOnDisk('bravo')).toEqual({ [EXTRA_CHANNEL]: 'all' })
-    const second = await restartOf(first)
-    expect(second.logs).toContain(dropped)
-    expect(second.channelDelivery.hasUnwrittenDrop(bravoKey)).toBe(true)
-
-    h.clearChannelDeliveryWriteFailure()
-    const cp = second.checkpoint()
-    await applyIn(second, 'fungible', personas)
-
-    expect(storedWritesSince(second, cp)[0]).toEqual(h.channelDeliveryWrite())
-    expect(storedOnDisk('bravo')).toBeUndefined()
-    second.registerSession('bravo')
-    await expectAtMentions(second, 'bravo', EXTRA_CHANNEL)
-    expectModeNoLeak()
-  })
-
-  test('modified, then modified back before any successful write: write runs before the bring-up and, failing, applies nothing; after a restart the channel is at mentions, and stays so once the change back is confirmed and the server restarted again', async () => {
-    seedChoices([modePersona('bravo'), { [EXTRA_CHANNEL]: 'all' }])
-    const { run, personas } = await runningIn('fungible')
-    const [alpha, bravo] = personas
-    const bravoKey = h.key('bravo')
-    h.failChannelDeliveryWrites()
-    await applyIn(run, 'fungible', [alpha!, withMovedDirectory(bravo!)])
-    expect(run.channelDelivery.hasUnwrittenDrop(bravoKey)).toBe(true)
-
-    // Back to the declaration the file's entry was stored under.
-    h.writeConfig(configWith(switchTop('fungible'), personas))
-    await run.ticks.tick()
-    const fingerprint = h.pendingFingerprint()
-    h.confirm()
-    const cp = run.checkpoint()
-    await run.ticks.tick()
-
-    expect(run.logsOf(RELOAD_RECORD_WRITE_FAILED)).toEqual([reloadChannelDeliveryWriteFailedLine(h.channelDeliveryFile, h.paths.lastApplied)])
-    expect(run.since(cp).lifecycle).toEqual([])
-    expect(h.pendingFingerprint()).toBe(fingerprint)
-    expect(storedOnDisk('bravo')).toEqual({ [EXTRA_CHANNEL]: 'all' })
-
-    const restarted = await restartOf(run)
-    expect(restarted.logs).toContain(channelDeliveryDropLine(bravoKey, 1, CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED))
-    await expectAtMentions(restarted, 'bravo', EXTRA_CHANNEL)
-
-    // The change back, confirmed with the writer working: its unwritten drop is written before the bring-up.
-    h.clearChannelDeliveryWriteFailure()
-    await restarted.ticks.tick()
-    h.confirm()
-    await restarted.ticks.tick()
-    expect(restarted.logsOf(RELOAD_APPLIED)).toHaveLength(1)
-    expect(storedOnDisk('bravo')).toBeUndefined()
-    restarted.registerSession('bravo')
-    await expectAtMentions(restarted, 'bravo', EXTRA_CHANNEL)
-    const again = await restartOf(restarted)
-    await expectAtMentions(again, 'bravo', EXTRA_CHANNEL)
-    expectModeNoLeak()
-  })
-})
-
-/** Every mode, with the stored-choice store readable (no file) or unreadable (a file that is not JSON). */
-const MODE_STORE_ROWS = (['declarative', 'fungible'] as const).flatMap((mode) =>
-  (['readable', 'unreadable'] as const).map((store) => ({ mode, store })),
-)
-
-/** Make the start's stored-choice store unreadable: bytes that are not JSON, holding no choice. */
-function storeAs(store: 'readable' | 'unreadable'): void {
-  if (store === 'unreadable') h.writeChannelDeliveryBytes('{')
-}
-
-describe('the destructive-modify window with the teardown held', () => {
-  test("the key is retiring while its teardown is held, and the old session's call for a heard channel is refused and writes nothing; once step 2 has settled and the new half's session is registered, a call through the old session's kept entry is refused, the new half's call for a channel it heard is accepted, and the new half serves the old life's channel at mentions, before and after a restart (real launch)", async () => {
-    await useConfigDirs()
-    const { run, personas } = await runningIn('fungible', REAL_LAUNCH_WITH_SESSIONS)
-    const [alpha, bravo] = personas
-    const bravoKey = h.key('bravo')
-    const notApplied = { isError: true, text: personaNotAppliedRefusal(SET_CHANNEL_DELIVERY_TOOL, bravoKey) }
-    // The old life stores EXTRA_CHANNEL at all, and hears OTHER_CHANNEL.
-    expect(await probe(run, 'bravo', EXTRA_CHANNEL, 'plain')).toEqual([])
-    expect(await setChoice(run, 'bravo', EXTRA_CHANNEL, 'all')).toEqual(acceptedText(EXTRA_CHANNEL, 'all'))
-    expect(await probe(run, 'bravo', OTHER_CHANNEL, 'plain')).toEqual([])
-    const oldSession = run.session('bravo')!
-    const gate = run.lifecycle.hold('teardown', bravoKey)
-    const { applying } = await confirmConfig(run, [alpha!, withMovedDirectory(bravo!)], switchTop('fungible'))
-    await gate.entered
-
-    expect(run.channelDelivery.isRetiring(bravoKey)).toBe(true)
-    const bytes = storedBytes()
-    const inWindow = run.checkpoint()
-    const refusedInWindow = await setChoice(run, 'bravo', OTHER_CHANNEL, 'all', oldSession)
-    expect(refusedInWindow).toEqual(notApplied)
-    expect(storedWritesSince(run, inWindow)).toEqual([])
-    expect(storedBytes()).toEqual(bytes)
-
-    gate.release()
-    await applying
-    expect(run.channelDelivery.isRetiring(bravoKey)).toBe(false)
-    const newSession = run.registerSession('bravo')
-    expect(newSession).not.toBe(oldSession)
-    const after = run.checkpoint()
-    const refusedAfter = await setChoice(run, 'bravo', OTHER_CHANNEL, 'all', oldSession)
-    expect(refusedAfter).toEqual(notApplied)
-    expect(storedWritesSince(run, after)).toEqual([])
-    // The new half hears OTHER_CHANNEL itself and stores a choice for it; the old life's channel is at mentions.
-    expect(await probe(run, 'bravo', OTHER_CHANNEL, 'plain')).toEqual([])
-    expect(await setChoice(run, 'bravo', OTHER_CHANNEL, 'all')).toEqual(acceptedText(OTHER_CHANNEL, 'all'))
-    expect(await probe(run, 'bravo', OTHER_CHANNEL, 'plain')).toEqual([{ chat_id: OTHER_CHANNEL, via: 'receive_all' }])
-    await expectAtMentions(run, 'bravo', EXTRA_CHANNEL)
-    expect(storedOnDisk('bravo')).toEqual({ [OTHER_CHANNEL]: 'all' })
-
-    const restarted = await restartOf(run, { realLaunch: true })
-    await expectAtMentions(restarted, 'bravo', EXTRA_CHANNEL)
-    expect(await probe(restarted, 'bravo', OTHER_CHANNEL, 'plain')).toEqual([{ chat_id: OTHER_CHANNEL, via: 'receive_all' }])
-    expectModeNoLeak({ refusedInWindow, refusedAfter })
-  })
-
-  test.each(MODE_STORE_ROWS.flatMap((row) => (['settles', 'fails'] as const).map((teardown) => ({ ...row, teardown }))))(
-    "in $mode mode with the store $store, the window is open while step 2 is held and has ended once step 2 has settled (the teardown $teardown), before step 6's bring-up",
-    async ({ mode, store, teardown }) => {
-      storeAs(store)
-      const { run, personas } = await runningIn(mode)
-      const [alpha, bravo] = personas
-      const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
-      expect(run.channelDelivery.readable).toBe(store === 'readable')
-      const teardownGate = run.lifecycle.hold('teardown', bravoKey)
-      const bringUpGate = run.lifecycle.hold('bring-up', bravoKey)
-      expect(run.channelDelivery.isRetiring(bravoKey)).toBe(false)
-
-      const { applying } = await confirmConfig(run, [alpha!, withMovedDirectory(bravo!)], switchTop(mode))
-      await teardownGate.entered
-      expect(run.channelDelivery.isRetiring(bravoKey)).toBe(true)
-      expect(run.channelDelivery.isRetiring(alphaKey)).toBe(false)
-
-      if (teardown === 'fails') teardownGate.fail(new Error('the teardown failed'))
-      else teardownGate.release()
-      await bringUpGate.entered
-      expect(run.lifecycle.timeline).toEqual([
-        { op: 'teardown', key: bravoKey, phase: 'start' },
-        { op: 'teardown', key: bravoKey, phase: teardown === 'fails' ? 'rejected' : 'settled' },
-        { op: 'bring-up', key: bravoKey, phase: 'start' },
-      ])
-      expect(run.channelDelivery.isRetiring(bravoKey)).toBe(false)
-
-      bringUpGate.release()
-      await applying
-      expect(run.channelDelivery.isRetiring(bravoKey)).toBe(false)
-      expectModeNoLeak()
-    },
-  )
-
-  test.each(MODE_STORE_ROWS)('in $mode mode with the store $store, an apply whose step 1 fails (its last-applied rewrite) opens no window', async ({ mode, store }) => {
-    storeAs(store)
-    const seen: boolean[] = []
-    let sample: (() => void) | undefined
-    const { run, personas } = await runningIn(mode, { beforeWrite: () => sample?.() })
-    const [alpha, bravo] = personas
-    const bravoKey = h.key('bravo')
-    // Whether the key is retiring, at every write of the apply (the record, the rewrite, its restore, the pending file).
-    sample = () => void seen.push(run.channelDelivery.isRetiring(bravoKey))
-    h.writeConfig(configWith(switchTop(mode), [alpha!, withMovedDirectory(bravo!)]))
-    await run.ticks.tick()
-    h.confirm()
-    // The retired-key write's two opens come first: the third is the rewrite's.
-    h.failWrites({ step: 'openSync', call: 3 })
-    const cp = run.checkpoint()
-
-    await run.ticks.tick()
-    h.clearWriteFailure()
-
-    expect(run.logsOf(RELOAD_RECORD_WRITE_FAILED)).toHaveLength(1)
-    expect(run.since(cp).lifecycle).toEqual([])
-    expect(seen.length).toBeGreaterThan(1)
-    expect(seen.every((retiring) => !retiring)).toBe(true)
-    expect(run.channelDelivery.isRetiring(bravoKey)).toBe(false)
-    expectModeNoLeak()
+    await assertUnchanged()
+    expectNoPostNoLeak(run)
   })
 })
 
 describe('durable queues across confirmed persona changes', () => {
+  test('next routed event and ordinary MCP tools share operator/bot/mode/destination changes without replacing sessions or clients', async () => {
+    const shared = EXTRA_CHANNEL, discovered = 'C0DISCOVER', moved = OTHER_CHANNEL
+    const { run, personas: [alpha, bravo] } = await running([
+      ['alpha', { channels: [{ id: shared, delivery: 'all' }], permission_prompts: 'dm', dm: { enabled: true, contact: CONTACT } }],
+      ['bravo', { channels: [{ id: shared, delivery: 'all' }, { id: moved, delivery: 'all' }], permission_prompts: shared }],
+    ], { ...REAL_WITH_SESSIONS, top: { channel_mode: 'open' } })
+    const authority = run.controller.sharedChannels()!, session = run.session('alpha'), siblingSession = run.session('bravo')
+    const socket = run.stub('alpha').socket, client = run.connections.clientFor('alpha')
+    const confirmTransition = async (expected: Array<ReloadLifecycleRecord & { op: 'update-in-place' }>, forgets: string[] = []) => {
+      const cp = run.checkpoint(), timeline = run.lifecycle.timeline.length, calls = run.composition!.calls.length
+      const adCalls = stubCallCount(run.composition!.agentDirector)
+      const sides = { alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }
+      const identities = ['alpha', 'bravo'].map(name => ({ name, client: run.connections.clientFor(h.key(name)), socket: run.stub(name).socket }))
+      const expectKept = () => {
+        expect(stubCallCount(run.composition!.agentDirector)).toBe(adCalls)
+        expect(run.since(cp).slackBuilds).toBe(0); expect(run.since(cp).slackCalls).toEqual([])
+        expect({ alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }).toEqual(sides)
+        expect(run.session('alpha')).toBe(session); expect(session!.connected).toBe(true)
+        expect(run.session('bravo')).toBe(siblingSession); expect(siblingSession!.connected).toBe(true)
+        for (const kept of identities) {
+          expect(run.connections.clientFor(h.key(kept.name))).toBe(kept.client)
+          expect(run.stub(kept.name).socket).toBe(kept.socket)
+        }
+      }
+      const untouched = ['alpha', 'bravo'].filter(name => !expected.some(record => record.key === h.key(name)))
+        .map(name => watchUntouched(run, name))
+      await run.ticks.tick()
+      expect(h.pendingExists()).toBe(true)
+      expect(run.since(cp).lifecycle).toEqual([])
+      expect(run.lifecycle.timeline.slice(timeline)).toEqual([])
+      expect(run.composition!.calls.slice(calls)).toEqual([])
+      expect({ alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }).toEqual(sides)
+      expectKept()
+      assertNoLeak(run.captured())
+      h.confirm(); await run.ticks.tick()
+      expect(run.since(cp).lifecycle).toEqual(expected)
+      expect(run.lifecycle.timeline.slice(timeline)).toEqual(expected.flatMap(({ op, key }) => [
+        { op, key, phase: 'start' }, { op, key, phase: 'settled' },
+      ]))
+      expect(run.composition!.calls.slice(calls)).toEqual(forgets.map(key => ['destinations.forget', key]))
+      expect(stubCallCount(run.composition!.agentDirector)).toBe(adCalls)
+      expect(run.since(cp).slackBuilds).toBe(0); expect(run.since(cp).slackCalls).toEqual([])
+      expect({ alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }).toEqual(sides)
+      for (const check of untouched) check()
+      expect(run.session('alpha')).toBe(session); expect(run.session('bravo')).toBe(siblingSession)
+      expectKept()
+      assertNoLeak(run.captured())
+    }
+    let number = 0
+    const event = (text: string, channel = shared) => makeChannelMessage({ channel, text, ts: `1700000020.${String(++number).padStart(6, '0')}` })
+    const send = async (text: string) => { await run.deliver('alpha', event(text)); return run.queued('alpha').length }
+    // A saved all applies even in bravo's destination, and the paired mention
+    // events retain exactly one accepted original item.
+    expect(await send('plain at another destination')).toBe(1)
+    const mention = event(`  ${mentionText(run.stub('alpha').identity.botUserId)} original\r\n😀  `)
+    await run.deliver('alpha', makeAppMention({ ...mention, type: 'app_mention' })); await run.deliver('alpha', mention)
+    expect(run.queued('alpha')).toHaveLength(2)
+    expect(run.queued('alpha')[1]!.accepted).toMatchObject({ text: mention.text, via: 'mention' })
+    const movedBravo = { ...bravo!, permission_prompts: moved }
+    h.writeConfig({ personas: [alpha!, movedBravo], channel_mode: 'open' })
+    await confirmTransition([{ op: 'update-in-place', key: h.key('bravo'), via: 'apply', settings: ['permission_prompts'] }], [h.key('bravo')])
+    expect(authority.choice('alpha', shared)).toBe('all')
+    expect(await send('saved all after destination moved')).toBe(3)
+    run.stub('alpha').script.inventory.push(membershipPage([{ id: shared, is_channel: true, is_group: false, is_im: false, is_mpim: false, is_ext_shared: true }]))
+    run.membershipScanner.request('alpha'); await run.membershipClock.runNext()
+    expect(run.membership.read('alpha', shared, 'open')).toEqual({ kind: 'ineligible', reason: 'external-sharing' })
+    expect(await send('open external share refused')).toBe(3)
+    run.stub('alpha').script.inventory.push(membershipPage([shared]))
+    run.membershipScanner.request('alpha'); await run.membershipClock.runNext()
+    const request = deliveryAttempt('composition-bot-off', shared, 'off')
+    expect((await run.callTool('alpha', 'set_channel_delivery', request)).isError).toBe(false)
+    expect(await send('off after real MCP')).toBe(3)
+    expect((await run.callTool('alpha', 'fetch_messages', { channel: shared })).isError).toBe(false)
+    const strictInput = [alpha!, movedBravo]
+    h.writeConfig({ personas: strictInput, channel_mode: 'strict' })
+    await confirmTransition([])
+    expect(authority.choice('alpha', shared)).toBe('off')
+    const tools = [
+      ['reply', (channel: string) => ({ chat_id: channel, text: 'ordinary' })],
+      ['react', (channel: string) => ({ chat_id: channel, message_id: mention.ts, emoji: 'eyes' })],
+      ['edit_message', (channel: string) => ({ chat_id: channel, message_id: mention.ts, text: 'ordinary' })],
+      ['fetch_messages', (channel: string) => ({ channel })],
+      ['download_attachment', (channel: string) => ({ chat_id: channel, message_id: mention.ts })],
+    ] as const
+    async function refusesEveryTool(channel: string) {
+      const checkpoint = run.checkpoint()
+      for (const [tool, args] of tools) expect((await run.callTool('alpha', tool, args(channel))).isError).toBe(true)
+      expect(run.since(checkpoint).slackCalls).toEqual([])
+    }
+    await refusesEveryTool(shared) // open bot-off retained by strict activation
+    run.stub('alpha').script.inventory.push(membershipPage([{ id: shared, is_channel: true, is_group: false, is_im: false, is_mpim: false, is_ext_shared: true }, discovered]))
+    run.membershipScanner.request('alpha'); await run.membershipClock.runNext()
+    expect(authority.choice('alpha', discovered)).toBe('off')
+    await refusesEveryTool(discovered)
+    const target = authority.config().personas.find(p => p.key === 'alpha')!
+    const assign = async (delivery: DeliveryMode) => {
+      run.request('request', [buildOperatorAssignment(target, authority.incarnation('alpha')!, shared, delivery)])
+      await confirmTransition([{ op: 'update-in-place', key: h.key('alpha'), via: 'apply', settings: ['delivery'] }])
+    }
+    await assign('all')
+    expect(run.membership.read('alpha', shared, 'strict').kind).toBe('eligible')
+    expect(await send('strict externally shared accepted')).toBe(4)
+    await assign('off'); expect(await send('operator off')).toBe(4); await refusesEveryTool(shared)
+    await assign('all')
+    expect(authority.choice('alpha', shared)).toBe('all')
+    expect((await run.callTool('alpha', 'fetch_messages', { channel: shared })).isError).toBe(false)
+    await run.stub('alpha').socket.deliver({ type: 'channel_left', channel: shared,
+      event_ts: ((run.membershipClock.now() + 1) / 1000).toFixed(3) }, { event_id: 'EvCOMPOSEDLEAVE' })
+    expect(authority.choice('alpha', shared)).toBeUndefined(); await refusesEveryTool(shared)
+    expect(await send('removed')).toBe(4)
+    expect(run.queued('alpha').map(({ accepted: { text, channel, via } }) => ({ text, channel, via }))).toEqual([
+      { text: 'plain at another destination', channel: shared, via: 'receive_all_shared' },
+      { text: String(mention.text), channel: shared, via: 'mention' },
+      { text: 'saved all after destination moved', channel: shared, via: 'receive_all_shared' },
+      { text: 'strict externally shared accepted', channel: shared, via: 'receive_all_shared' },
+    ])
+    expect(run.queued('bravo')).toEqual([])
+    expect(run.session('alpha')).toBe(session); expect(run.session('bravo')).toBe(siblingSession)
+    expect(run.stub('alpha').socket).toBe(socket); expect(run.connections.clientFor('alpha')).toBe(client)
+    assertNoLeak(run.captured())
+  })
+
+describe('reaction_notices turned off and back on applies in place at confirmation, keeping the instance (the in-place row)', () => {
+  /** The reacted message's ts: the persona's own message in its own channel. */
+  const REACTED_TS = '1700000300.000100'
+
+  test.each<ChannelMode>(['strict', 'open'])(
+    "%s mode: bravo's setting is published only once confirmed, as one in-place update each way, with its session, connection and row kept and alpha untouched; bravo's next new reaction follows it, alpha's never",
+    async (mode) => {
+      const { run, personas } = await running(['alpha', 'bravo'], { ...REAL_WITH_SESSIONS, top: { channel_mode: mode } })
+      const [alpha, bravo] = personas
+      const bravoKey = h.key('bravo')
+      const session = run.session('bravo')!
+      const effective = () => run.serverConfig()!.personas.map((p) => [p.name, p.reaction_notices])
+      expect(effective()).toEqual([['alpha', true], ['bravo', true]])
+      const accepted: Record<string, string[]> = { alpha: [], bravo: [] }
+      let n = 0
+      /**
+       * A new human reaction (a fresh `event_ts`) to the persona's message in
+       * its own channel, through the run's socket and event router. It is
+       * acked once, and either accepted (one more queued item, no drop line)
+       * or, with `notices` false, dropped with only the builder's
+       * `notices-off` line, no item and no Slack call. Every item the
+       * persona holds is one this helper saw accepted, so nothing dropped is
+       * ever backfilled.
+       */
+      async function react(name: string, notices: boolean, type: 'reaction_added' | 'reaction_removed' = 'reaction_added'): Promise<void> {
+        const eventTs = `1700000300.${String(++n).padStart(6, '0')}`
+        const channel = ownChannel(name)
+        const socket = run.stub(name).socket
+        const from = { acks: socket.acks.length, logs: run.logs.length, calls: run.stub(name).callLog.length }
+        await run.deliver(name, makeReaction(type, {
+          user: CONTACT, reaction: 'white_check_mark', item_user: run.stub(name).identity.botUserId, event_ts: eventTs,
+        }, { channel, ts: REACTED_TS }))
+        expect(socket.acks.length - from.acks).toBe(1)
+        const drops = run.logs.slice(from.logs).filter((line) => line.startsWith(`[slack] ${REACTION_DROPPED}: `))
+        if (notices) {
+          accepted[name]!.push(eventTs)
+          expect(drops).toEqual([])
+        } else {
+          expect(drops).toEqual([buildReactionDroppedLine({ key: h.key(name), name }, { reason: 'notices-off', chat_id: channel, message_ts: REACTED_TS })])
+          expect(run.stub(name).callLog.length).toBe(from.calls)
+        }
+        expect(run.queued(name).map((i) => i.accepted.ts)).toEqual(accepted[name])
+      }
+
+      // On at the start, for both.
+      await react('bravo', true)
+      await react('alpha', true)
+
+      // Off by writing false, then back on by removing the key again.
+      for (const [next, value] of [[{ ...bravo!, reaction_notices: false }, false], [bravo!, true]] as const) {
+        const cp = run.checkpoint()
+        const timeline = run.lifecycle.timeline.length
+        const calls = run.composition!.calls.length
+        const applied = run.logsOf(RELOAD_APPLIED).length
+
+        await previewConfig(run, [alpha!, next], { channel_mode: mode })
+        expect(effective()).toEqual([['alpha', true], ['bravo', !value]])
+        expect(run.since(cp).slackBuilds).toBe(0)
+        expect(run.since(cp).slackCalls).toEqual([])
+
+        // Previewed, not confirmed: bravo's next new reaction still follows the applied value, with no lifecycle work.
+        await react('bravo', !value)
+        await react('alpha', true)
+        expect(run.since(cp).lifecycle).toEqual([])
+        expect(h.pendingExists()).toBe(true)
+        assertNoLeak(run.captured())
+
+        const bravoSide = slackSideOf(run, 'bravo')
+        const alphaUntouched = watchUntouched(run, 'alpha')
+        const applyCp = run.checkpoint()
+        h.confirm()
+        await run.ticks.tick()
+
+        expect(effective()).toEqual([['alpha', true], ['bravo', value]])
+        expect(run.since(cp).lifecycle).toEqual([{ op: 'update-in-place', key: bravoKey, via: 'apply', settings: ['reaction_notices'] }])
+        expect(run.lifecycle.timeline.slice(timeline)).toEqual([
+          { op: 'update-in-place', key: bravoKey, phase: 'start' },
+          { op: 'update-in-place', key: bravoKey, phase: 'settled' },
+        ])
+        // Not a destination setting: no destinations.forget, nor any other composition call.
+        expect(run.composition!.calls.slice(calls)).toEqual([])
+        expect(run.since(applyCp).slackBuilds).toBe(0)
+        expect(run.since(applyCp).slackCalls).toEqual([])
+        expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(applied + 1)
+        expect(slackSideOf(run, 'bravo')).toEqual(bravoSide)
+        alphaUntouched()
+        expect(run.session('bravo')).toBe(session)
+
+        // Confirmed: bravo's next new reactions, added and removed, follow the new value; alpha's are still accepted.
+        await react('bravo', value)
+        await react('bravo', value, 'reaction_removed')
+        await react('alpha', true)
+      }
+
+      expect(stubCallCount(run.composition!.agentDirector)).toBe(0)
+      expect(run.session('bravo')).toBe(session)
+      expect(session.connected).toBe(true)
+      expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
+      await expectNothingPendingAfter(run)
+      expectNoPostNoLeak(run)
+    },
+  )
+})
   test('three open items stay under a removed key; re-add restores their order and rename does not transfer them', async () => {
     const { run, personas: [alpha, bravo] } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
     const key = h.key('bravo')
+    const authority = run.controller.sharedChannels()!, token = authority.lifetime(key, bravo!.channels![0]!.id)!
+    expectCurrent(authority, token)
     for (const source of ['slack', 'interject', 'cron'] as const) {
       const input = source === 'slack'
         ? { source, text: 'slack', channel: bravo!.channels![0]!.id, via: 'receive_all', key: { chat_id: bravo!.channels![0]!.id, ts: '1700000000.000001' }, ts: '1700000000.000001' }
@@ -6867,18 +7020,89 @@ describe('durable queues across confirmed persona changes', () => {
       expect((await run.queue.accept(key, input)).status).toBe('accepted')
     }
     const durableBefore = readQueue(h.stateDir, key)
+    const acceptedBefore = run.queued('bravo').map(i => structuredClone(i.accepted))
     const before = run.queued('bravo').map(i => ({ seq: i.accepted.seq, source: i.accepted.source, text: i.accepted.text, via: i.accepted.via }))
     const preview = await previewConfig(run, [alpha!])
     expect(preview.find(line => line.startsWith('DESTRUCTIVE:'))).toContain('3 open queued items kept, delivered only if a persona with the same key is added again')
     h.confirm(); await run.ticks.tick()
+    expectSuperseded(authority, token)
     expect(run.queueEvents).toContainEqual({ type: 'retained', key, count: 3 })
     expect(existsSync(queuePath(h.stateDir, key))).toBe(true)
     expect(readQueue(h.stateDir, key)).toEqual(durableBefore)
     expect(run.queued('bravo').map(i => ({ seq: i.accepted.seq, source: i.accepted.source, text: i.accepted.text, via: i.accepted.via }))).toEqual(before)
-    await applyConfig(run, [alpha!, bravo!])
+    await applyConfig(run, [alpha!, withIndependentDestination(bravo!)])
+    const replacement = authority.lifetime(key, bravo!.channels![0]!.id)!
+    expect(replacement.incarnation).not.toBe(token.incarnation)
+    expectCurrent(authority, replacement)
+    expectSuperseded(authority, token)
     expect(run.queued('bravo').map(i => i.accepted.seq)).toEqual([1, 2, 3]); expect(run.queued('bravo').every(i => i.delivered === false)).toBe(true)
     const renamed = h.persona('bravo_two'); h.materialize(renamed); await applyConfig(run, [alpha!, renamed])
     expect(run.queued('bravo_two')).toEqual([]); expect(run.queue.openCount(key)).toBe(3); assertNoLeak(run.captured())
+    expectSuperseded(authority, replacement)
+    const cp = run.checkpoint(), timeline = run.lifecycle.timeline.length, calls = run.composition!.calls.length
+    const alphaUntouched = watchUntouched(run, 'alpha'), alphaSession = run.session('alpha')!
+    const alphaClient = run.connections.clientFor(h.key('alpha')), alphaSocket = run.stub('alpha').socket
+    const adCalls = stubCallCount(run.composition!.agentDirector), adFrom = run.composition!.agentDirectorCalls.length
+    const renamedKey = h.key('bravo_two'), renamedSocket = run.stub('bravo_two').socket
+    const retainedBeforeBack = readQueue(h.stateDir, key)
+    const sides = { alpha: slackSideOf(run, 'alpha'), renamed: slackSideOf(run, 'bravo_two'), bravo: slackSideOf(run, 'bravo') }
+    await previewConfig(run, [alpha!, withIndependentDestination(bravo!)])
+    expect(run.lifecycle.timeline.slice(timeline)).toEqual([])
+    expect(run.composition!.calls.slice(calls)).toEqual([])
+    expect(stubCallCount(run.composition!.agentDirector)).toBe(adCalls)
+    expect(run.since(cp).slackBuilds).toBe(0); expect(run.since(cp).slackCalls).toEqual([])
+    expect({ alpha: slackSideOf(run, 'alpha'), renamed: slackSideOf(run, 'bravo_two'), bravo: slackSideOf(run, 'bravo') }).toEqual(sides)
+    expect(run.appliedKeys()).toEqual(keysOf('alpha', 'bravo_two'))
+    const gate = run.lifecycle.hold('bring-up', key)
+    h.confirm(); const applying = run.ticks.tick()
+    try {
+      await gate.entered
+      expect(run.lifecycle.timeline.slice(timeline)).toEqual([
+        { op: 'teardown', key: renamedKey, phase: 'start' },
+        { op: 'teardown', key: renamedKey, phase: 'settled' },
+        { op: 'bring-up', key, phase: 'start' },
+      ])
+      expect(run.since(cp).lifecycle).toEqual([
+        { op: 'teardown', key: renamedKey, via: 'apply' },
+        { op: 'bring-up', key, via: 'apply' },
+      ])
+      expect(renamedSocket.disconnectCalls).toBe(sides.renamed.disconnects.at(-1)! + 1)
+      expect(run.since(cp).slackBuilds).toBe(0)
+    } finally { gate.release(); await applying }
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: renamedKey, via: 'apply' },
+      { op: 'bring-up', key, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key, via: 'apply' },
+    ])
+    expect(run.lifecycle.timeline.slice(timeline)).toEqual([
+      { op: 'teardown', key: renamedKey, phase: 'start' },
+      { op: 'teardown', key: renamedKey, phase: 'settled' },
+      { op: 'bring-up', key, phase: 'start' },
+      { op: 'bring-up', key, phase: 'settled' },
+    ])
+    expect(run.composition!.agentDirectorCalls.slice(adFrom)).toEqual([{ verb: 'kill', id: personaInstanceId(renamedKey), result: 'ok' }])
+    expect(stubCallCount(run.composition!.agentDirector)).toBe(adCalls + 1)
+    expect(run.composition!.calls.slice(calls).filter(([, key]) => key === h.key('alpha'))).toEqual([])
+    expect(run.since(cp).slackBuilds).toBe(3)
+    expect(run.since(cp).slackCalls.map(call => call.method)).toEqual(['auth.test', 'bots.info'])
+    expect(run.stub('bravo').callLog.slice(sides.bravo.webCalls).map(call => call.method)).toEqual(['auth.test', 'bots.info'])
+    expect(run.stub('bravo_two').callLog).toHaveLength(sides.renamed.webCalls)
+    alphaUntouched()
+    expect(run.session('alpha')).toBe(alphaSession); expect(alphaSession.connected).toBe(true)
+    expect(run.connections.clientFor(h.key('alpha'))).toBe(alphaClient); expect(run.stub('alpha').socket).toBe(alphaSocket)
+    expect(run.appliedKeys()).toEqual(keysOf('alpha', 'bravo'))
+    expect(run.isUp('bravo')).toBe(true); expect(run.isUp('bravo_two')).toBe(false)
+    const current = authority.lifetime(key, bravo!.channels![0]!.id)!
+    expect(current.incarnation).not.toBe(token.incarnation)
+    expect(current.incarnation).not.toBe(replacement.incarnation)
+    expectCurrent(authority, current)
+    expectSuperseded(authority, token)
+    expectSuperseded(authority, replacement)
+    expect(run.queued('bravo').map(i => ({ seq: i.accepted.seq, source: i.accepted.source, text: i.accepted.text, via: i.accepted.via }))).toEqual(before)
+    expect(run.queued('bravo').map(i => i.accepted)).toEqual(acceptedBefore)
+    expect(readQueue(h.stateDir, key)).toEqual(retainedBeforeBack)
+    expect(run.queued('alpha')).toEqual([]); expect(run.queued('bravo_two')).toEqual([])
+    assertNoLeak(run.captured())
   })
   test('routing edits affect future arrivals while old accepted via and text remain fixed under their original key', async () => {
     const { run, personas: [alpha, bravo] } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
@@ -6893,14 +7117,484 @@ describe('durable queues across confirmed persona changes', () => {
 })
 
 test.each(['credentials_file', 'working_directory'] as const)('a destructive %s edit retains fixed open work under the same key', async field => {
-  const { run, personas: [alpha, bravo] } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
+  await useConfigDirs()
+  const { run, personas: [alpha, bravo] } = await running(['alpha', 'bravo'], { ...REAL_LAUNCH, sessions: true })
   const key = h.key('alpha')
+  const authority = run.controller.sharedChannels()!, token = authority.lifetime(key, alpha!.channels![0]!.id)!
+  let release!: () => void
+  const blocked = new Promise<void>(resolve => { release = resolve })
+  const completion = (async () => { await blocked; return holdsLifetime(authority, token) })()
   expect((await run.queue.accept(key, { source: 'interject', sender: 'ops', text: 'pending' })).status).toBe('accepted')
   await run.queue.append(key, { v: 1, kind: 'fixed', seq: 1, parts: ['immutable fixed input'] })
+  const oldLabel = h.credentialsLabel('alpha')
   const nextPath = join(h.root, field === 'credentials_file' ? 'rotated-credentials.json' : 'new-working-directory')
   const changed = { ...alpha!, [field]: nextPath }; h.materialize(changed)
-  await applyConfig(run, [changed, bravo!])
+  const cp = run.checkpoint(), timeline = run.lifecycle.timeline.length, calls = run.composition!.calls.length
+  const adCalls = stubCallCount(run.composition!.agentDirector), adFrom = run.composition!.agentDirectorCalls.length
+  const instanceFrom = run.composition!.instanceCallsOf('alpha').length
+  const activityFrom = run.socketActivity('alpha').length
+  const newLabel = h.credentialsLabel('alpha')
+  const siblingUntouched = watchUntouched(run, 'bravo'), siblingSession = run.session('bravo')!
+  const siblingClient = run.connections.clientFor(h.key('bravo')), siblingSocket = run.stub('bravo').socket
+  const sides = { alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }
+  try {
+    await previewConfig(run, [changed, bravo!])
+    expect(run.lifecycle.timeline.slice(timeline)).toEqual([])
+    expect(run.composition!.calls.slice(calls)).toEqual([])
+    expect(stubCallCount(run.composition!.agentDirector)).toBe(adCalls)
+    expect(run.since(cp).slackBuilds).toBe(0); expect(run.since(cp).slackCalls).toEqual([])
+    expect({ alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }).toEqual(sides)
+    h.confirm(); await run.ticks.tick()
+  } finally { release() }
+  expect(run.since(cp).lifecycle).toEqual([
+    { op: 'teardown', key, via: 'apply' },
+    { op: 'bring-up', key, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+    { op: 'launch', key, via: 'apply', action: SPAWN_ACTION_FRESH_RETIRED },
+  ])
+  expect(run.lifecycle.timeline.slice(timeline)).toEqual([
+    { op: 'teardown', key, phase: 'start' }, { op: 'teardown', key, phase: 'settled' },
+    { op: 'bring-up', key, phase: 'start' }, { op: 'bring-up', key, phase: 'settled' },
+  ])
+  expect(instanceCallsSince(run, 'alpha', instanceFrom)).toEqual(['kill ok', 'reuse-spawn ok'])
+  expect(lastSpawnOf(run, 'alpha')).toMatchObject({ id: personaInstanceId(key), cwd: changed.working_directory, reuse: true })
+  expect(adCallsSince(run, adFrom).filter(call => call.id !== personaInstanceId(key))).toEqual([])
+  expect(run.composition!.calls.slice(calls).filter(([, key]) => key === h.key('bravo'))).toEqual([])
+  expect(run.socketActivity('alpha').slice(activityFrom)).toEqual([
+    `discarded ${oldLabel}`, `disconnected ${oldLabel}`, `built ${newLabel}`, `started ${newLabel}`, `connected ${newLabel}`,
+  ])
+  siblingUntouched()
+  expect(run.session('bravo')).toBe(siblingSession); expect(siblingSession.connected).toBe(true)
+  expect(run.connections.clientFor(h.key('bravo'))).toBe(siblingClient); expect(run.stub('bravo').socket).toBe(siblingSocket)
+  expect(run.appliedKeys()).toEqual(keysOf('alpha', 'bravo')); expect(run.isUp('alpha')).toBe(true)
+  expect(await completion).toBe(false)
+  expectSuperseded(authority, token)
+  expect(authority.lifetime(key, alpha!.channels![0]!.id)!.incarnation).not.toBe(token.incarnation)
   expect(run.queued('alpha')).toHaveLength(1); expect(run.queued('alpha')[0]!.fixed!.parts).toEqual(['immutable fixed input']); expect(run.queue.openCount(key)).toBe(1)
   expect(readQueue(h.stateDir, key).filter(r => r.kind === 'accepted' && !('compact' in r))).toHaveLength(1)
   expect(run.queued('bravo')).toEqual([]); assertNoLeak(run.captured())
+})
+
+// ---------------------------------------------------------------------------
+// bravo's preparation in flight across a confirmed change of bravo
+// ---------------------------------------------------------------------------
+
+/** The real launch with the run's delivery engines, and an MCP session for every persona. */
+const REAL_DELIVERY: RunningOptions = { ...REAL_LAUNCH, delivery: true, sessions: true }
+
+/** The most virtual time one wait for receipt-backed delivery may drive `run.clock` (`run.delivery.until`). */
+const DRIVE_LIMIT_MS = 60_000
+/**
+ * The lookup bound of a case that holds a lookup while it drives delivery
+ * for other work: past every drive of the case together, so the held lookup
+ * answers only when the case answers it, never by the production bound.
+ */
+const HELD_LOOKUP_BOUND_MS = 10 * DRIVE_LIMIT_MS
+
+/** Where bravo's head item comes from: post-ack Slack intake (a message or a reaction) or injected intake (`/interject`). */
+type HeadSource = 'slack' | 'reaction' | 'interject'
+
+/** bravo's Slack sender, its head message's ts, and the ts of the message of bravo's own that a reaction reacts to. */
+const HEAD_SENDER = 'U0RLDSENDER1'
+/** The sender of an item bravo's new connection stores while the apply runs. */
+const FRESH_SENDER = 'U0RLDSENDER2'
+const HEAD_TS = '1700000500.000100'
+const REACTED_TS = '1700000500.000050'
+const HEAD_TEXT = 'the head item'
+const NEXT_TEXT = 'the item after the head'
+
+/** Slack's answer to a conversation lookup in bravo's channel, named so one life's facts tell from the other's. */
+function conversationNamed(name: string): SettledWebApiOutcome {
+  return { kind: 'ok', result: { channel: { id: ownChannel('bravo'), name, is_channel: true } } }
+}
+
+/** Script bravo's next conversation lookup to answer `lookup`; for a reaction, its reacted-message lookup first finds the message. */
+function scriptLookup(run: ReloadRun, source: 'slack' | 'reaction', lookup: WebApiOutcome): void {
+  const stub = run.stub('bravo')
+  if (source === 'reaction') {
+    stub.script.replies.push({ kind: 'ok', result: { messages: [{ ts: REACTED_TS, user: stub.identity.botUserId, text: 'the reacted message' }] } })
+  }
+  stub.script.info.push(lookup)
+}
+
+/** `user`'s message in bravo's own channel, or `user`'s reaction there to bravo's message, as `ts`. */
+function slackEventOf(run: ReloadRun, source: 'slack' | 'reaction', user: string, ts: string): SlackEvent {
+  const channel = ownChannel('bravo')
+  return source === 'slack'
+    ? makeChannelMessage({ channel, user, text: HEAD_TEXT, ts })
+    : makeReaction('reaction_added', { user, reaction: 'white_check_mark', item_user: run.stub('bravo').identity.botUserId, event_ts: ts }, { channel, ts: REACTED_TS })
+}
+
+/**
+ * bravo's head item from Slack, stored and acked by its current life, whose
+ * preparation then waits on `lookup` (its conversation lookup). Resolves once
+ * that lookup was asked; `delivered` settles once it is answered.
+ */
+async function heldSlackHead(run: ReloadRun, source: 'slack' | 'reaction', lookup: DeferredWebApiCall): Promise<{ delivered: Promise<void> }> {
+  scriptLookup(run, source, lookup.outcome)
+  const asked = run.stub('bravo').calls.conversationsInfo.length
+  const delivered = run.deliver('bravo', slackEventOf(run, source, HEAD_SENDER, HEAD_TS))
+  // Acceptance must finish its real journal I/O before post-ack preparation
+  // asks Slack. Event-loop turns alone can outrun the fsync callback.
+  await run.clock.flush()
+  await until(() => run.stub('bravo').calls.conversationsInfo.length === asked + 1)
+  return { delivered }
+}
+
+/** The kinds of the persona's durable records of item `seq`, in journal order. */
+function journalOf(name: string, seq: number): string[] {
+  return readQueue(h.stateDir, h.key(name)).filter((r) => r.seq === seq).map((r) => r.kind)
+}
+
+/** The parts of every fixed record the journal holds for the persona's item `seq` (a second one would show). */
+function fixedParts(name: string, seq: number): string[][] {
+  return readQueue(h.stateDir, h.key(name)).flatMap((r) => (r.kind === 'fixed' && r.seq === seq ? [r.parts] : []))
+}
+
+/** The seqs the persona's engine reported delivered, in order. */
+function itemsDelivered(run: ReloadRun, name: string): number[] {
+  return run.delivery!.events.flatMap((e) => (e.type === 'item-delivered' && e.key === h.key(name) ? [e.seq] : []))
+}
+
+/** `confirmConfig`, with the pending file leak-checked while it exists (`previewConfig`) before the confirmation. */
+async function confirmPreviewed(run: ReloadRun, personas: PersonaInput[]): Promise<{ applying: Promise<void> }> {
+  await previewConfig(run, personas)
+  h.confirm()
+  return { applying: run.ticks.tick() }
+}
+
+describe("a confirmed change of bravo while its preparation is in flight: the ended life adds nothing, and once the apply's steps settle the next life reclaims bravo's claimed work (real launch, delivery)", () => {
+  beforeEach(useConfigDirs)
+
+  // CR-1: each row fails at ffd0b92b, whose post-apply recovery ran at step 1, before the teardown ended the life that held the head.
+  test.each<{ source: HeadSource; label: string }>([
+    { source: 'slack', label: 'an ordinary Slack message whose name lookup is held' },
+    { source: 'reaction', label: 'a Reaction Item whose conversation lookup is held' },
+    { source: 'interject', label: 'an /interject accepted while the teardown is held, its zero-delay preparation not yet run' },
+  ])("$label across a destructive modify: the ended life appends, logs, wakes and retries nothing; the next life fixes it from its own facts with no manual recovery, and with bravo up it and the item after it are delivered once each, in order, on transcript receipts, while alpha is untouched and delivers meanwhile", async ({ source }) => {
+    const settledAt: Array<{ timeline: LifecycleTimelineEntry[]; applied: number }> = []
+    const { run, personas } = await running(['alpha', 'bravo'], {
+      ...REAL_DELIVERY,
+      lookupTimeoutMs: HELD_LOOKUP_BOUND_MS,
+      onApplySettled: () => void settledAt.push({ timeline: [...run.lifecycle.timeline], applied: run.logsOf(RELOAD_APPLIED).length }),
+    })
+    const [alpha, bravo] = personas
+    const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
+    const delivery = run.delivery!
+    // The old life's lookup and the next life's, each held until the case answers it.
+    const lookups = source === 'interject' ? [] : [makeDeferredWebApiCall(), makeDeferredWebApiCall()]
+    const [oldLookup, newLookup] = lookups
+    // bravo's teardown and bring-up, held in turn; released, with the apply joined, even when an assertion fails.
+    const teardown = run.lifecycle.hold('teardown', bravoKey)
+    const bringUp = run.lifecycle.hold('bring-up', bravoKey)
+    let applying: Promise<void> = Promise.resolve()
+    let head: { delivered: Promise<void> } = { delivered: Promise.resolve() }
+    try {
+      if (source !== 'interject') {
+        head = await heldSlackHead(run, source, oldLookup!)
+        expect(delivery.owns('bravo', 1)).toBe(true)
+      }
+      const moved = movedDirectory(bravo!)
+      const label = h.credentialsLabel('bravo')
+      const alphaUntouched = watchUntouched(run, 'alpha')
+      const bravoInstanceCalls = run.composition!.instanceCallsOf('bravo').length
+      const activityFrom = run.socketActivity('bravo').length
+      const cp = run.checkpoint()
+
+      applying = (await confirmPreviewed(run, [alpha!, moved])).applying
+      await teardown.entered
+      // Step 1 published the change before any lifecycle step, and nothing is told the apply settled yet.
+      expect(run.serverConfig()!.personas.find((p) => p.key === bravoKey)!.working_directory).toBe(moved.working_directory)
+      expect(run.settledConfigs).toEqual([])
+      if (source === 'interject') {
+        expect(await run.accept('bravo', injectedInput({ sender: 'ops', text: HEAD_TEXT }))).toMatchObject({ status: 'accepted', seq: 1 })
+        expect(run.clock.pending().map((t) => t.delayMs)).toContain(0)
+      }
+      teardown.release()
+      await bringUp.entered
+
+      // The teardown ended the life that held the head: answering its lookup (or passing the accept's
+      // boundary, with no life for bravo) appends, logs, wakes and retries nothing.
+      const ended = { logs: run.logs.length, wakes: delivery.wakes.length }
+      if (oldLookup !== undefined) {
+        oldLookup.settle(conversationNamed('old-life-name'))
+        await head.delivered
+      } else {
+        await run.clock.advance(1)
+      }
+      expect(journalOf('bravo', 1)).toEqual(['accepted'])
+      expect(delivery.owns('bravo', 1)).toBe(false)
+      expect(run.logs.slice(ended.logs)).toEqual([])
+      expect(delivery.wakes.slice(ended.wakes)).toEqual([])
+      expect(run.clock.pending().filter((t) => (RETYPE_BACKOFF_MS as readonly number[]).includes(t.delayMs))).toEqual([])
+
+      // The item after the head is accepted before bravo is back, and its own boundary has not passed.
+      expect(await run.accept('bravo', injectedInput({ sender: 'ops', text: NEXT_TEXT }))).toMatchObject({ status: 'accepted', seq: 2 })
+      if (newLookup !== undefined) scriptLookup(run, source as 'slack' | 'reaction', newLookup.outcome)
+      bringUp.release()
+      await applying
+      expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+
+      // With no manual recovery, bravo's next life has claimed the head: its own lookup is asked
+      // and held (the apply finished regardless), or, with no lookup to make, the head is fixed.
+      if (newLookup !== undefined) {
+        expect(run.stub('bravo').calls.conversationsInfo).toHaveLength(2)
+        expect(delivery.owns('bravo', 1)).toBe(true)
+        expect(journalOf('bravo', 1)).toEqual(['accepted'])
+      } else {
+        await run.clock.flush()
+        await until(() => fixedParts('bravo', 1).length === 1)
+      }
+      // The next tick does nothing meanwhile.
+      const tick = run.checkpoint()
+      await run.ticks.tick()
+      expect(run.since(tick)).toEqual(NO_RUN_ACTIVITY)
+      // The reclaim took only claimed work: not the item whose boundary has not passed.
+      expect(delivery.owns('bravo', 2)).toBe(false)
+      expect(journalOf('bravo', 2)).toEqual(['accepted'])
+
+      // bravo's new life connects its MCP session. alpha's own work is delivered meanwhile; its
+      // clock passes the next item's boundary, so that item is fixed, but nothing passes the head.
+      run.registerSession('bravo')
+      expect(await run.accept('alpha', injectedInput({ sender: 'ops', text: 'alpha work' }))).toMatchObject({ status: 'accepted', seq: 1 })
+      await delivery.until(() => itemsDelivered(run, 'alpha').length === 1, DRIVE_LIMIT_MS)
+      expect(fixedParts('alpha', 1)).toEqual([delivery.texts('alpha')])
+      expect(fixedParts('bravo', 2)).toHaveLength(1)
+      if (newLookup !== undefined) {
+        // Still held: alpha's drive left bravo's lookup unanswered and its head unfixed.
+        expect(newLookup.settled).toBe(false)
+        expect(delivery.owns('bravo', 1)).toBe(true)
+        expect(journalOf('bravo', 1)).toEqual(['accepted'])
+        expect(delivery.texts('bravo')).toEqual([])
+        newLookup.settle(conversationNamed('new-life-name'))
+      }
+      await delivery.until(() => run.queue.openCount(bravoKey) === 0, DRIVE_LIMIT_MS)
+
+      // One fixed record each: the head's from the next life's own facts, never the ended life's.
+      const [headParts, nextParts] = [fixedParts('bravo', 1), fixedParts('bravo', 2)]
+      expect([headParts.length, nextParts.length]).toEqual([1, 1])
+      if (source === 'interject') expect(headParts[0]!.join('')).toContain(HEAD_TEXT)
+      else {
+        expect(headParts[0]!.join('')).toContain('channel_name="new-life-name"')
+        expect(headParts[0]!.join('')).not.toContain('old-life-name')
+      }
+      expect(nextParts[0]!.join('')).toContain(NEXT_TEXT)
+      // Each part typed once, the head's first, and each confirmed by its own receipt in the new life's transcript.
+      expect(delivery.texts('bravo')).toEqual([...headParts[0]!, ...nextParts[0]!])
+      expect(readQueue(h.stateDir, bravoKey).flatMap((r) => (r.kind === 'delivered' ? [r.seq] : []))).toEqual([
+        ...headParts[0]!.map(() => 1),
+        ...nextParts[0]!.map(() => 2),
+      ])
+      expect(itemsDelivered(run, 'bravo')).toEqual([1, 2])
+      expect(delivery.errors).toEqual([])
+
+      // The destructive modify itself: one teardown and one bring-up, the row killed and kept, then a reuse spawn,
+      // the old connection closed before the new one opened, and nothing for alpha.
+      expect(run.since(cp).lifecycle).toEqual([
+        { op: 'teardown', key: bravoKey, via: 'apply' },
+        { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+        { op: 'launch', key: bravoKey, via: 'apply', action: SPAWN_ACTION_FRESH_RETIRED },
+      ])
+      expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok', 'reuse-spawn ok'])
+      expect(run.socketActivity('bravo').slice(activityFrom)).toEqual([
+        `discarded ${label}`,
+        `disconnected ${label}`,
+        `built ${label}`,
+        `started ${label}`,
+        `connected ${label}`,
+      ])
+      alphaUntouched()
+      expect(run.composition!.calls.filter(([, key]) => key === alphaKey)).toEqual([])
+
+      // What claimed the head: the apply's settlement, told once with every applied key, after every
+      // step had settled and before reload-applied, its reclaim detached from the apply.
+      expect(settledAt).toEqual([
+        {
+          timeline: [
+            { op: 'teardown', key: bravoKey, phase: 'start' },
+            { op: 'teardown', key: bravoKey, phase: 'settled' },
+            { op: 'bring-up', key: bravoKey, phase: 'start' },
+            { op: 'bring-up', key: bravoKey, phase: 'settled' },
+          ],
+          applied: 0,
+        },
+      ])
+      expect(run.settledConfigs.map((c) => c.personas.map((p) => p.key))).toEqual([[alphaKey, bravoKey]])
+      expect(run.clock.pendingCount()).toBe(0)
+      expectNoPostNoLeak(run)
+    } finally {
+      teardown.release()
+      bringUp.release()
+      for (const lookup of lookups) if (!lookup.settled) lookup.settle()
+      await applying
+      await head.delivered
+    }
+  })
+
+  // CR1-R1: the reclaim takes only claimed work, never an item whose Slack ack is still pending.
+  test.each<{ source: 'slack' | 'reaction'; label: string; lookups: string[] }>([
+    { source: 'slack', label: 'an ordinary Slack message', lookups: ['users.info'] },
+    { source: 'reaction', label: 'a Reaction Item', lookups: ['conversations.info', 'conversations.replies', 'users.info'] },
+  ])("$label stored on bravo's new connection, its channel reassigned to the new life and verified, while the apply's launch is held, its ack still held when the reclaim runs: before the ack nothing looks it up, fixes it, wakes for it or owns it; once acked it is looked up, fixed and woken for once, and the head the ended life held is fixed by the next life in the same apply", async ({ source, lookups }) => {
+    const { run, personas } = await running(['alpha', 'bravo'], REAL_DELIVERY)
+    const [alpha, bravo] = personas
+    const bravoKey = h.key('bravo')
+    const bravoId = personaInstanceId(bravoKey)
+    const delivery = run.delivery!
+    const oldLookup = makeDeferredWebApiCall()
+    const spawns = run.composition!.holdSpawns((id) => id === bravoId)
+    let ack: ReturnType<ReloadRun['holdAck']> | undefined
+    let applying: Promise<void> = Promise.resolve()
+    let head: { delivered: Promise<void> } = { delivered: Promise.resolve() }
+    let fresh: Promise<void> = Promise.resolve()
+    try {
+      head = await heldSlackHead(run, source, oldLookup)
+      applying = (await confirmPreviewed(run, [alpha!, movedDirectory(bravo!)])).applying
+      // Step 6 has connected bravo's new half and holds its launch: the teardown has settled.
+      await spawns.entered(bravoId)
+      oldLookup.settle(conversationNamed('old-life-name'))
+      await head.delivered
+      expect(journalOf('bravo', 1)).toEqual(['accepted'])
+
+      // The destructive modify reset bravo's channel choices and membership with its old identity. Reassign its
+      // channel to the new life and verify the new connection's membership, so that life serves the channel.
+      const authority = run.controller.sharedChannels()!
+      expect(_assignFixture(authority, bravoKey, authority.incarnation(bravoKey)!, ownChannel('bravo'), 'all', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('applied')
+      run.stub('bravo').script.inventory.push(membershipPage([ownChannel('bravo')]))
+      run.membershipScanner.request(bravoKey); await run.membershipClock.runNext()
+
+      // A new item on the new connection: stored, its ack held. Every lookup from here answers with the next life's facts.
+      scriptLookup(run, source, conversationNamed('new-life-name'))
+      scriptLookup(run, source, conversationNamed('new-life-name'))
+      ack = run.holdAck('bravo')
+      const acks = run.stub('bravo').socket.acks.length
+      fresh = run.deliver('bravo', slackEventOf(run, source, FRESH_SENDER, '1700000500.000200'))
+      await ack.entered
+      expect(journalOf('bravo', 2)).toEqual(['accepted'])
+      /** The new item's sender-name lookups, the one lookup only it makes, from before the reclaim on. */
+      const freshNameLookups = () => run.stub('bravo').calls.usersInfo.filter((args) => args.user === FRESH_SENDER).length
+      spawns.release(bravoId)
+      await applying
+      expect(run.settledConfigs).toHaveLength(1)
+
+      // The reclaim fixed the claimed head from the next life's lookups, and took nothing else.
+      await run.clock.flush()
+      await until(() => fixedParts('bravo', 1).length === 1 && !delivery.owns('bravo', 1))
+      expect(fixedParts('bravo', 1)[0]!.join('')).toContain('channel_name="new-life-name"')
+      const reclaimed = { calls: run.stub('bravo').callLog.length, wakes: delivery.wakes.length }
+      await turns()
+      expect(freshNameLookups()).toBe(0)
+      expect(run.stub('bravo').callLog.slice(reclaimed.calls)).toEqual([])
+      expect(journalOf('bravo', 2)).toEqual(['accepted'])
+      expect(delivery.owns('bravo', 2)).toBe(false)
+      expect(delivery.wakes.slice(reclaimed.wakes)).toEqual([])
+      expect(run.stub('bravo').socket.acks).toHaveLength(acks)
+
+      // The ack goes out, then its intake prepares it: its own lookups, one fixed record, one wake.
+      ack.release()
+      await fresh
+      expect(run.stub('bravo').socket.acks).toHaveLength(acks + 1)
+      expect(freshNameLookups()).toBe(1)
+      expect(run.stub('bravo').callLog.slice(reclaimed.calls).map((c): string => c.method).sort()).toEqual(lookups)
+      expect(journalOf('bravo', 2)).toEqual(['accepted', 'fixed'])
+      expect(fixedParts('bravo', 2)[0]!.join('')).toContain('channel_name="new-life-name"')
+      expect(delivery.wakes.slice(reclaimed.wakes)).toEqual([bravoKey])
+      expect(delivery.owns('bravo', 2)).toBe(false)
+      expectNoPostNoLeak(run)
+    } finally {
+      ack?.release()
+      if (!oldLookup.settled) oldLookup.settle()
+      spawns.releaseAll()
+      await applying
+      await head.delivered
+      await fresh
+    }
+  })
+
+  test("an ordinary Slack message whose name lookup is held when bravo is removed stays retained: the removal's reclaim leaves its key alone and the ended life adds nothing, and once bravo is added again under the same key its next life fixes the message from its own facts (real composition)", async () => {
+    const { run, personas } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
+    const [alpha, bravo] = personas
+    const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
+    const oldLookup = makeDeferredWebApiCall()
+    let head: { delivered: Promise<void> } = { delivered: Promise.resolve() }
+    try {
+      head = await heldSlackHead(run, 'slack', oldLookup)
+      await (await confirmPreviewed(run, [alpha!])).applying
+      expect(run.settledConfigs.map((c) => c.personas.map((p) => p.key))).toEqual([[alphaKey]])
+      expect(run.queueEvents).toContainEqual({ type: 'retained', key: bravoKey, count: 1 })
+      oldLookup.settle(conversationNamed('old-life-name'))
+      await head.delivered
+      await turns()
+      expect(journalOf('bravo', 1)).toEqual(['accepted'])
+
+      scriptLookup(run, 'slack', conversationNamed('new-life-name'))
+      await (await confirmPreviewed(run, [alpha!, bravo!])).applying
+      expect(run.settledConfigs.map((c) => c.personas.map((p) => p.key))).toEqual([[alphaKey], [alphaKey, bravoKey]])
+      await run.clock.flush()
+      await until(() => fixedParts('bravo', 1).length === 1)
+      expect(fixedParts('bravo', 1)[0]!.join('')).toContain('channel_name="new-life-name"')
+      expect(fixedParts('bravo', 1)[0]!.join('')).not.toContain('old-life-name')
+      expectNoPostNoLeak(run)
+    } finally {
+      if (!oldLookup.settled) oldLookup.settle()
+      await head.delivered
+    }
+  })
+
+  // The controller does not await the server's post-apply work and isolates its failure.
+  test.each<{ label: string; fails: boolean; work: (error: Error) => unknown }>([
+    { label: 'throws', fails: true, work: (error) => { throw error } },
+    { label: 'returns a promise that rejects', fails: true, work: (error) => Promise.reject(error) },
+    { label: 'returns a promise that never settles', fails: false, work: () => new Promise(() => undefined) },
+  ])("when the server's post-apply work $label, each apply still completes with exactly its own lifecycle effects, stays applied, leaves alpha untouched, and the next ticks find nothing: a failure is one line per apply, describing the error with its message redacted", async ({ fails, work }) => {
+    // The sentinel sits in the message only inside a fake token and a URL (`sentinelInMessage`), and bare in another property.
+    const error = Object.assign(new Error(`post-apply work failed for ${sentinelInMessage('SETTLED')}`), { detail: LEAK_SENTINEL })
+    const { run, personas } = await running(['alpha', 'bravo'], { onApplySettled: () => work(error) })
+    const [alpha, bravo] = personas
+    const bravoKey = h.key('bravo')
+    const failure = reloadPostApplyFailedLine(describeThrownValue(error))
+    expect(failure).toContain(`message="post-apply work failed for ${REDACTED_SENTINEL_TAIL}"`)
+
+    // bravo removed, then added again; each apply's lifecycle records are its own and nothing else's. bravo's own
+    // config directory (`useConfigDirs`) leaves and comes back with it, so each apply also refreshes the template (step 5).
+    const applies: Array<{ next: PersonaInput[]; keys: string[]; lifecycle: ReloadLifecycleRecord[] }> = [
+      { next: [alpha!], keys: keysOf('alpha'), lifecycle: [{ op: 'teardown', key: bravoKey, via: 'apply' }, refreshRecord()] },
+      {
+        next: [alpha!, bravo!],
+        keys: keysOf('alpha', 'bravo'),
+        lifecycle: [
+          refreshRecord(),
+          { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+          { op: 'launch', key: bravoKey, via: 'apply' },
+        ],
+      },
+    ]
+    for (const { next, keys, lifecycle } of applies) {
+      const alphaUntouched = watchUntouched(run, 'alpha')
+      const cp = run.checkpoint()
+      await (await confirmPreviewed(run, next)).applying
+      await turns()
+      expect(run.since(cp).lifecycle).toEqual(lifecycle)
+      alphaUntouched()
+      expect(run.appliedKeys()).toEqual(keys)
+      expect(run.settledConfigs.at(-1)!.personas.map((p) => p.key)).toEqual(keys)
+      await expectNothingPendingAfter(run)
+    }
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(2)
+    expect(run.logsOf('reload')).toEqual(fails ? [failure, failure] : [])
+    expectNoPostNoLeak(run)
+  })
+
+  test('a confirmed candidate the tick refuses as INVALID is not applied, so no settlement is told', async () => {
+    const { run, personas } = await running(['alpha', 'bravo'])
+    h.writeConfig(configOf(personas[0]!, personas[0]!))
+    await run.ticks.tick()
+    expect(run.invalidLines()).toHaveLength(1)
+    assertNoLeak(run.captured())
+    h.confirm()
+    await run.ticks.tick()
+    expect(run.appliedConfigs).toEqual([])
+    expect(run.settledConfigs).toEqual([])
+    expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
+    expectNoPostNoLeak(run)
+  })
 })

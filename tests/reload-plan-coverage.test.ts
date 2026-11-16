@@ -45,7 +45,6 @@ import {
   parsePersonaConfigBytes,
   PERSONA_DM_KEYS,
   PERSONA_ENTRY_KEYS,
-  PERSONA_INVITED_KEYS,
   PERSONA_TOP_LEVEL_KEYS,
   type PersonaConfig,
   type PersonaConfigInput,
@@ -57,7 +56,6 @@ import {
   IN_PLACE_SETTINGS,
   MODE_SWITCH_SETTING,
   NEXT_LAUNCH_SETTINGS,
-  RECORDED_SECTION_KEYS,
   type ServerSettingChange,
   type ValidChangePlan,
 } from '../src/reload-plan.ts'
@@ -85,7 +83,6 @@ function input(top: Record<string, unknown> = {}, overrides: Partial<PersonaInpu
       name: 'alpha',
       channels: [{ id: 'C0A0001', delivery: 'all' }],
       permission_prompts: 'C0A0001',
-      invited: { permission_prompts: 'C0A0001' },
       ...overrides,
     },
     root,
@@ -132,7 +129,6 @@ const UNCOMPARED_PERSONA_FIELDS: readonly string[] = []
 function personaLeafSettings(): string[] {
   return PERSONA_ENTRY_KEYS.flatMap((key): string[] => {
     if (key === 'dm') return PERSONA_DM_KEYS.map((k) => `dm.${k}`)
-    if (key === 'invited') return PERSONA_INVITED_KEYS.map((k) => `invited.${k}`)
     if (key === 'channels') return CHANNEL_ENTRY_KEYS.map((k) => CHANNEL_FIELD_SETTING[k] ?? `channels[].${k}`)
     return [key]
   })
@@ -236,7 +232,7 @@ describe('every top-level key the loader accepts is compared', () => {
     ack_reaction: 'eyes',
     reply_chunk_limit: 2000,
     reply_chunk_mode: 'length',
-    allow_invited_channels: true,
+    channel_mode: 'open',
   })
 
   test('every server-wide key has a changed value to try', () => {
@@ -288,7 +284,6 @@ interface Classes {
   inPlace: [string, readonly string[]][]
   /** Own next-launch settings. */
   nextLaunch: [string, readonly string[]][]
-  recorded: [string, readonly string[]][]
   unchanged: string[]
   settings: ServerSettingChange[]
   noEffectiveChange: boolean
@@ -301,7 +296,6 @@ function classesOf(plan: ValidChangePlan): Classes {
     destructive: plan.destructive.map((p) => [p.key, p.settings]),
     inPlace: plan.inPlace.map((p) => [p.key, p.settings]),
     nextLaunch: plan.nextLaunch.map((p) => [p.key, p.own]),
-    recorded: plan.recorded.map((p) => [p.key, p.fields]),
     unchanged: plan.unchanged.map((p) => p.key),
     settings: plan.settings,
     noEffectiveChange: plan.noEffectiveChange,
@@ -316,7 +310,6 @@ function classes(c: Partial<Classes>): Classes {
     destructive: [],
     inPlace: [],
     nextLaunch: [],
-    recorded: [],
     unchanged: [],
     settings: [],
     noEffectiveChange: false,
@@ -326,14 +319,13 @@ function classes(c: Partial<Classes>): Classes {
 
 /** The top-level settings of each channel mode: the switch absent, and the switch on. */
 const DECLARATIVE_TOP: Record<string, unknown> = {}
-const FUNGIBLE_TOP: Record<string, unknown> = { [MODE_SWITCH_SETTING]: true }
+const FUNGIBLE_TOP: Record<string, unknown> = { [MODE_SWITCH_SETTING]: 'open' }
 
 /** The plan class a row lands in, with the `src/` list that class's settings come from. */
 const PLAN_CLASSES = {
   destructive: DESTRUCTIVE_SETTINGS,
   inPlace: IN_PLACE_SETTINGS,
   nextLaunch: NEXT_LAUNCH_SETTINGS,
-  recorded: RECORDED_SECTION_KEYS,
 } as const satisfies Record<string, readonly string[]>
 type PlanClass = keyof typeof PLAN_CLASSES
 
@@ -344,28 +336,13 @@ describe('a persona change is classified by the section in force when both confi
   // the rows each mode adds or changes, and the next-launch settings with no
   // top-level value in both modes.
   test.each<[string, Record<string, unknown>, Partial<PersonaInput>, Partial<PersonaInput>, PlanClass, string]>([
-    ['declarative: a model change', DECLARATIVE_TOP, { model: 'opus' }, { model: 'sonnet' }, 'nextLaunch', 'model'],
-    ['fungible: a model change', FUNGIBLE_TOP, { model: 'opus' }, { model: 'sonnet' }, 'nextLaunch', 'model'],
-    ['declarative: an effort change', DECLARATIVE_TOP, { effort: 'high' }, { effort: 'max' }, 'nextLaunch', 'effort'],
-    ['fungible: an effort change', FUNGIBLE_TOP, { effort: 'high' }, { effort: 'max' }, 'nextLaunch', 'effort'],
-    ['declarative: an invited change', DECLARATIVE_TOP, {}, { invited: { permission_prompts: 'C0A0002' } }, 'recorded', 'invited'],
-    [
-      'fungible: an invited.permission_prompts change',
-      FUNGIBLE_TOP,
-      {},
-      { invited: { permission_prompts: 'C0A0002' } },
-      'inPlace',
-      'invited.permission_prompts',
-    ],
-    [
-      'fungible: a channels change',
-      FUNGIBLE_TOP,
-      {},
-      { channels: [{ id: 'C0A0001', delivery: 'all' }, { id: 'C0A0002', delivery: 'all' }] },
-      'recorded',
-      'channels',
-    ],
-    ['fungible: a top-level permission_prompts change', FUNGIBLE_TOP, {}, { permission_prompts: 'C0A0002' }, 'recorded', 'permission_prompts'],
+    ['open: a channel change', FUNGIBLE_TOP, {}, { channels: [{ id: 'C0A0001', delivery: 'all' }, { id: 'C0A0002', delivery: 'all' }] }, 'inPlace', 'channels'],
+    ['open: a delivery change', FUNGIBLE_TOP, {}, { channels: [{ id: 'C0A0001', delivery: 'off' }] }, 'inPlace', 'delivery'],
+    ['open: a destination change', FUNGIBLE_TOP, { channels: [{ id: 'C0A0001', delivery: 'all' }, { id: 'C0A0002', delivery: 'all' }] }, { channels: [{ id: 'C0A0001', delivery: 'all' }, { id: 'C0A0002', delivery: 'all' }], permission_prompts: 'C0A0002' }, 'inPlace', 'permission_prompts'],
+    ['strict: a model change', DECLARATIVE_TOP, { model: 'opus' }, { model: 'sonnet' }, 'nextLaunch', 'model'],
+    ['open: a model change', FUNGIBLE_TOP, { model: 'opus' }, { model: 'sonnet' }, 'nextLaunch', 'model'],
+    ['strict: an effort change', DECLARATIVE_TOP, { effort: 'high' }, { effort: 'max' }, 'nextLaunch', 'effort'],
+    ['open: an effort change', FUNGIBLE_TOP, { effort: 'high' }, { effort: 'max' }, 'nextLaunch', 'effort'],
     [
       'fungible: a dm.enabled change',
       FUNGIBLE_TOP,
@@ -384,19 +361,21 @@ describe('a persona change is classified by the section in force when both confi
     ],
     ['fungible: a working_directory change', FUNGIBLE_TOP, {}, { working_directory: '~/moved-work' }, 'destructive', 'working_directory'],
     ['fungible: a stop_hook_bootstrap change', FUNGIBLE_TOP, {}, { stop_hook_bootstrap: false }, 'inPlace', 'stop_hook_bootstrap'],
+    ['declarative: reaction_notices turned off', DECLARATIVE_TOP, {}, { reaction_notices: false }, 'inPlace', 'reaction_notices'],
+    ['fungible: reaction_notices turned off', FUNGIBLE_TOP, {}, { reaction_notices: false }, 'inPlace', 'reaction_notices'],
+    ['declarative: reaction_notices restored by removing false', DECLARATIVE_TOP, { reaction_notices: false }, {}, 'inPlace', 'reaction_notices'],
+    ['fungible: reaction_notices restored by writing true', FUNGIBLE_TOP, { reaction_notices: false }, { reaction_notices: true }, 'inPlace', 'reaction_notices'],
   ])('%s lands in its class', (_label, top, before, after, cls, setting) => {
     expect(PLAN_CLASSES[cls] as readonly string[]).toContain(setting)
     expect(channelModeOf(parse(input(top, after)))).toBe(channelModeOf(parse(input(top, before))))
 
     const result = planBetween(input(top, before), input(top, after))
 
-    // A recorded change modifies no persona: alpha is unchanged and the plan has no effect.
-    const recordedOnly = cls === 'recorded'
     expect(classesOf(result)).toEqual(
       classes({
         [cls]: [['alpha', [setting]]],
-        unchanged: recordedOnly ? ['alpha'] : [],
-        noEffectiveChange: recordedOnly,
+        unchanged: [],
+        noEffectiveChange: false,
       }),
     )
   })
@@ -404,10 +383,10 @@ describe('a persona change is classified by the section in force when both confi
 
 describe('a change of the switch alone modifies no persona, in each direction', () => {
   test.each<[string, Record<string, unknown>, Record<string, unknown>]>([
-    ['absent to true', {}, { [MODE_SWITCH_SETTING]: true }],
-    ['false to true', { [MODE_SWITCH_SETTING]: false }, { [MODE_SWITCH_SETTING]: true }],
-    ['true to absent', { [MODE_SWITCH_SETTING]: true }, {}],
-    ['true to false', { [MODE_SWITCH_SETTING]: true }, { [MODE_SWITCH_SETTING]: false }],
+    ['absent to true', {}, { [MODE_SWITCH_SETTING]: 'open' }],
+    ['false to true', { [MODE_SWITCH_SETTING]: 'strict' }, { [MODE_SWITCH_SETTING]: 'open' }],
+    ['true to absent', { [MODE_SWITCH_SETTING]: 'open' }, {}],
+    ['true to false', { [MODE_SWITCH_SETTING]: 'open' }, { [MODE_SWITCH_SETTING]: 'strict' }],
   ])('the switch from %s is one effective changed setting, the switch with its personas', (_label, from, to) => {
     const mode = channelModeOf(parse(input(to)))
     expect(mode).not.toBe(channelModeOf(parse(input(from))))
@@ -426,11 +405,20 @@ describe('a change of the switch alone modifies no persona, in each direction', 
 
 describe('writing a key\'s default where it was absent (or removing it) is no effective change', () => {
   test.each<[string, Record<string, unknown>, Record<string, unknown>]>([
-    ['the switch, absent to false', {}, { [MODE_SWITCH_SETTING]: false }],
-    ['the switch, false to absent', { [MODE_SWITCH_SETTING]: false }, {}],
+    ['the switch, absent to false', {}, { [MODE_SWITCH_SETTING]: 'strict' }],
+    ['the switch, false to absent', { [MODE_SWITCH_SETTING]: 'strict' }, {}],
     ['fresh_system_prompt, absent to true', {}, { fresh_system_prompt: true }],
     ['fresh_system_prompt, true to absent', { fresh_system_prompt: true }, {}],
   ])('%s changes no setting and no persona', (_label, from, to) => {
     expect(classesOf(planBetween(input(from), input(to)))).toEqual(classes({ unchanged: ['alpha'], noEffectiveChange: true }))
+  })
+
+  test.each<[string, Record<string, unknown>, Partial<PersonaInput>, Partial<PersonaInput>]>([
+    ['declarative: reaction_notices, absent to true', DECLARATIVE_TOP, {}, { reaction_notices: true }],
+    ['declarative: reaction_notices, true to absent', DECLARATIVE_TOP, { reaction_notices: true }, {}],
+    ['fungible: reaction_notices, absent to true', FUNGIBLE_TOP, {}, { reaction_notices: true }],
+    ['fungible: reaction_notices, true to absent', FUNGIBLE_TOP, { reaction_notices: true }, {}],
+  ])('%s changes no setting and no persona', (_label, top, before, after) => {
+    expect(classesOf(planBetween(input(top, before), input(top, after)))).toEqual(classes({ unchanged: ['alpha'], noEffectiveChange: true }))
   })
 })

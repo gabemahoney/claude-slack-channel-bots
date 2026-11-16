@@ -7,7 +7,7 @@
  *
  * SPDX-License-Identifier: MIT
  */
-import type { DeliveryQueue, QueueItem } from './delivery-queue.ts'
+import { isOpenItem, type DeliveryQueue, type QueueItem } from './delivery-queue.ts'
 
 export const EARLY_REPLY_EXPIRY_MS = 24 * 60 * 60 * 1000
 const ACK_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000
@@ -48,8 +48,15 @@ export interface DeliveryAckDeps {
 
 const slots = new Map<string, AckSlot>()
 const successfulReplies = new Map<string, Identity>()
+// A lower bound, including forgotten/replaced entries until the next sweep.
+// Keeping it early costs a sweep; keeping it late would change expiry.
+let earliestExpiry = Infinity
 const makeKey = (personaKey: string, channelId: string, messageTs: string) => JSON.stringify([personaKey, channelId, messageTs])
-const newEntry = (personaKey: string, legacy = false): AckEntry => ({ personaKey, createdAt: Date.now(), kept: new Set(), answered: false, legacy, pending: 0, stages: {} })
+function newEntry(personaKey: string, legacy = false): AckEntry {
+  const createdAt = Date.now()
+  earliestExpiry = Math.min(earliestExpiry, createdAt + ACK_EXPIRY_MS)
+  return { personaKey, createdAt, kept: new Set(), answered: false, legacy, pending: 0, stages: {} }
+}
 function slotFor(key: string): AckSlot {
   let slot = slots.get(key)
   if (!slot) { slot = {}; slots.set(key, slot) }
@@ -82,13 +89,18 @@ function cleanup(key: string, slot: AckSlot, entry: AckEntry): Promise<void> {
 }
 function pruneExpired(): void {
   const now = Date.now()
-  for (const [key, reply] of successfulReplies) if (reply.createdAt < now - EARLY_REPLY_EXPIRY_MS) successfulReplies.delete(key)
+  if (now <= earliestExpiry) return
+  earliestExpiry = Infinity
+  for (const [key, reply] of successfulReplies) {
+    if (reply.createdAt < now - EARLY_REPLY_EXPIRY_MS) successfulReplies.delete(key)
+    else earliestExpiry = Math.min(earliestExpiry, reply.createdAt + EARLY_REPLY_EXPIRY_MS)
+  }
   for (const [key, slot] of slots) {
     const entry = slot.entry
     if (entry && !slot.tail && entry.createdAt < now - ACK_EXPIRY_MS) {
       slot.entry = undefined
       void cleanup(key, slot, entry)
-    }
+    } else if (entry) earliestExpiry = Math.min(earliestExpiry, entry.createdAt + ACK_EXPIRY_MS)
   }
 }
 
@@ -173,7 +185,7 @@ function createAckCallback(deps: DeliveryAckDeps, stage: Stage): (key: string, i
     const accepted = item.accepted
     const queuedName = accepted.queued_ack_reaction
     const name = stage === 'queued' ? queuedName ?? deps.getReaction() : deps.getReaction()
-    if (accepted.source !== 'slack' || !accepted.channel || !name || (stage === 'delivered' ? !item.delivered : item.delivered)) return
+    if (accepted.source !== 'slack' || !accepted.channel || !name || (stage === 'delivered' ? !item.delivered : !isOpenItem(item))) return
     const web = deps.clientFor(key)
     const prior: Reaction | undefined = queuedName ? {
       name: queuedName,
@@ -224,17 +236,42 @@ export function trackAck(personaKey: string, channelId: string, messageTs: strin
 
 export function consumeAck(personaKey: string, channelId: string, messageTs: string): boolean
 export function consumeAck(personaKey: string, channelId: string, messageTs: string, removeLegacy: () => Promise<unknown>, kept?: string): Promise<void>
-/** Called only after a successful reply post/upload or react. Cancel future
- * stages now; cleanup stays serialized but the tool must not wait for Slack
- * reactions. `kept` is a react's own emoji: an ack stage with that name is
- * released, not removed, even after an earlier answer. The fallback closure
- * is used exclusively for legacy trackAck entries. */
+/** Called only after a successful reply post/upload or react (the react tool
+ * records through claimReactAnswer). Cancel future stages now; cleanup stays
+ * serialized but the tool must not wait for Slack reactions. `kept` is a
+ * react's own emoji: an ack stage with that name is released, not removed,
+ * even after an earlier answer. The fallback closure is used exclusively for
+ * legacy trackAck entries. */
 export function consumeAck(personaKey: string, channelId: string, messageTs: string, removeLegacy?: () => Promise<unknown>, kept?: string): boolean | Promise<void> {
   pruneExpired()
-  const key = makeKey(personaKey, channelId, messageTs), slot = slots.get(key), entry = slot?.entry
+  const { consumed, work } = recordAnswer(personaKey, makeKey(personaKey, channelId, messageTs), removeLegacy, kept)
+  return removeLegacy ? work : consumed
+}
+
+/**
+ * A successful react's answer: consumeAck's record with `kept`, in the same
+ * synchronous step as checking whether this persona already held an answer
+ * with that emoji for the message in the early-answer memory (never the
+ * longer-lived stage state). Returns that `alreadyHeld`: false when this call's
+ * answer is the first. Cleanup is detached, so the result never waits on Slack.
+ */
+export function claimReactAnswer(personaKey: string, channelId: string, messageTs: string, kept: string, removeLegacy?: () => Promise<unknown>): boolean {
+  pruneExpired()
+  const key = makeKey(personaKey, channelId, messageTs)
+  const alreadyHeld = successfulReplies.get(key)?.kept.has(kept) ?? false
+  void recordAnswer(personaKey, key, removeLegacy, kept).work
+  return alreadyHeld
+}
+
+/** consumeAck's record after pruning, shared with claimReactAnswer so both
+ * read and write one kept-answer memory. `work` never rejects. */
+function recordAnswer(personaKey: string, key: string, removeLegacy?: () => Promise<unknown>, kept?: string): { consumed: boolean; work: Promise<void> } {
+  const slot = slots.get(key), entry = slot?.entry
   const keptNames = successfulReplies.get(key)?.kept ?? new Set<string>()
   if (kept !== undefined) { keptNames.add(kept); entry?.kept.add(kept) }
-  successfulReplies.set(key, { personaKey, createdAt: Date.now(), kept: keptNames })
+  const createdAt = Date.now()
+  successfulReplies.set(key, { personaKey, createdAt, kept: keptNames })
+  earliestExpiry = Math.min(earliestExpiry, createdAt + EARLY_REPLY_EXPIRY_MS)
   let consumed = false, work = Promise.resolve()
   if (slot && entry && !entry.answered) {
     consumed = entry.legacy || entry.pending > 0 || slot.visible?.owner === entry
@@ -243,7 +280,7 @@ export function consumeAck(personaKey: string, channelId: string, messageTs: str
       ? serialize(key, slot, async () => { await removeLegacy() })
       : cleanup(key, slot, entry)
   }
-  return removeLegacy ? work : consumed
+  return { consumed, work }
 }
 
 export function forgetPersonaAcks(personaKey: string): void {
@@ -262,4 +299,5 @@ export function _resetAckTracker(): void {
   for (const slot of slots.values()) slot.entry = undefined
   slots.clear()
   successfulReplies.clear()
+  earliestExpiry = Infinity
 }

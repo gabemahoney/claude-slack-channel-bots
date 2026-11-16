@@ -46,6 +46,7 @@ import { assertNoLeak } from './test-helpers/credentials.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
 import { deliveredRecord, readQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { durableIo } from './test-helpers/durable-io.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { appendTranscript, promptEntry } from './test-helpers/working-row-panes.ts'
 
@@ -142,7 +143,7 @@ describe('delivery-engine receipt: a row showing idle_screen after Enter holds t
 
 describe('reply reminders: a row read idle_screen then waiting is nudged as from working', () => {
   test.each(['idle_screen', 'working'])('shown %s: the reminder fact records row_state working and one nudge follows waiting', async (shown) => {
-    const queue = createDeliveryQueue({ stateDir: dir, now: () => 1000 })
+    const io = durableIo(), queue = createDeliveryQueue({ stateDir: dir, now: () => 1000, fs: io.fs })
     await queue.start()
     let monitor: ReplyReminders | undefined
     closers.push(async () => { await monitor?.stop(); await queue.stop() })
@@ -156,6 +157,7 @@ describe('reply reminders: a row read idle_screen then waiting is nudged as from
     })
     const factory = deliveryClients(() => stub)
     const clock = createFakeClock(), errors: unknown[] = []
+    clock.settleOn(io)
     monitor = createReplyReminders({ queue, clock, getRow: (key) => deliveryGet(factory, key), ready: () => true, enabled: () => true,
       prepare: async () => {}, onError: (_key, error) => { errors.push(error) } })
     await delivered(queue)

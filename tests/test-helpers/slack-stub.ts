@@ -5,8 +5,11 @@
  * - Web API stubs (`web`, `createWebClient`) with capture arrays for
  *   `chat.postMessage`, `chat.update`, `reactions.add`/`remove`,
  *   `conversations.open`, `auth.test`, `users.info`, `filesUploadV2`,
- *   `conversations.history`, `conversations.replies` and
- *   `conversations.info`. Each client carries the bot token it was built
+ *   `conversations.history`, `conversations.replies`,
+ *   `conversations.info` and `files.completeUploadExternal`. An
+ *   unscripted `filesUploadV2` completes each of its upload groups through
+ *   `this.files.completeUploadExternal` on the client itself and settles after
+ *   all of them, as the SDK does. Each client carries the bot token it was built
  *   with as a non-enumerable `token` (as `WebClient.token`), checked through
  *   `hasToken`, so printing or comparing a client never shows it;
  * - Socket Mode stubs (`createSocketClient`, `socket`, `sockets`) that register
@@ -215,6 +218,154 @@ export function makeDeferredWebApiCall(): DeferredWebApiCall {
   }
 }
 
+/** A thread and argument-driven Slack pages. Cursors are opaque and reusable.
+ * Later pages optionally repeat the root, counting it against the request limit.
+ * At limit 1, root-only and reply-only pages alternate so the fixture progresses.
+ * `pageSizes` can shorten selected pages (including root-only pages); the cursor,
+ * never page length, tells a reader whether more replies remain.
+ */
+export interface PagedMessageSpec {
+  author?: 'own-user' | 'own-bot' | 'other-user' | 'other-bot'
+  placement?: 'channel' | 'root' | 'reply' | 'broadcast'
+  ts?: string
+  threadTs?: string
+  text?: string
+  file?: { name: string; size: number } | false
+  /** The message shares these file IDs, in order, instead of its default `F0THREAD<i>`; each
+   * takes `file`'s name and size. One ID on two messages is one file shared twice. */
+  fileIds?: readonly string[]
+  invalidTimestamp?: 'absent' | 'invalid'
+}
+export type PagedPageDamage = 'messages-absent' | 'messages-object' | 'cursor-number' | 'metadata-array' | 'not-ok'
+export interface PagedSlackMessage {
+  ts?: string; user?: string; bot_id?: string; thread_ts?: string; subtype?: string; text: string
+  files: Array<{ id: string; name: string; mimetype: string; size: number }>
+}
+export interface PagedThreadOptions {
+  repeatRoot?: boolean
+  pageSizes?: readonly number[]
+  finalCursor?: 'empty' | 'absent'
+  rootTs?: string
+  channel?: string
+  identity?: { botUserId: string; botId: string }
+  /** Message descriptions, not Slack payloads; defaults preserve the original thread. */
+  message?: (index: number) => PagedMessageSpec
+  /** Zero-based page number; consumed per attempt, independently of other pages. */
+  pageOutcomes?: Readonly<Record<number, readonly WebApiOutcome[]>>
+}
+type LegacyPagedThreadOptions = Omit<PagedThreadOptions, 'message'> & { message?: never }
+type PagedThreadFixture = ReturnType<typeof buildPagedThread>
+type LegacyPagedThreadFixture = Omit<PagedThreadFixture, 'messages'> & {
+  messages: Array<PagedSlackMessage & { ts: string; user: string; thread_ts: string }>
+}
+export function makePagedThread(count: number, options?: LegacyPagedThreadOptions): LegacyPagedThreadFixture
+export function makePagedThread(count: number, options: PagedThreadOptions): PagedThreadFixture
+// Existing consumers use ReturnType<typeof makePagedThread> for the default fixture.
+export function makePagedThread(count: number, options?: LegacyPagedThreadOptions): LegacyPagedThreadFixture
+export function makePagedThread(count: number, options: PagedThreadOptions = {}): PagedThreadFixture {
+  return buildPagedThread(count, options)
+}
+function buildPagedThread(count: number, options: PagedThreadOptions) {
+  if (!Number.isInteger(count) || count < 1) throw new Error('makePagedThread needs at least the root')
+  const rootTs = options.rootTs ?? '1700000000.000100'
+  const messages: PagedSlackMessage[] = Array.from({ length: count }, (_, i) => {
+    const spec = options.message?.(i) ?? {}
+    const ts = spec.ts ?? (options.rootTs === undefined ? `1700000000.${String(100 + i).padStart(6, '0')}`
+      : (Number(rootTs) + i / 1000).toFixed(6))
+    const author = spec.author
+    if (author?.startsWith('own-') && !options.identity) throw new Error('paged thread: own author needs identity')
+    return {
+      ts: spec.invalidTimestamp === 'invalid' ? 'not-a-timestamp' : spec.invalidTimestamp === 'absent' ? undefined : ts,
+      ...(author === 'own-bot' || author === 'other-bot'
+        ? { bot_id: author === 'own-bot' ? options.identity!.botId : 'B0OTHER' }
+        : { user: author === 'own-user' ? options.identity!.botUserId : `U0THREAD${i % 3}` }),
+      text: spec.text ?? `thread message ${i}`,
+      ...(spec.placement === 'channel' ? {} : { thread_ts: spec.threadTs ?? (spec.placement === 'root' ? ts : rootTs) }),
+      ...(spec.placement === 'broadcast' ? { subtype: 'thread_broadcast' } : {}),
+      files: spec.file === false ? [] : (spec.fileIds ?? [`F0THREAD${i}`]).map(id => ({ id,
+        name: spec.file ? spec.file.name : `file-${i}.txt`, mimetype: 'text/plain', size: spec.file ? spec.file.size : i + 1 })),
+    }
+  })
+  type PageArgs = Parameters<WebClient['conversations']['history']>[0] | Parameters<WebClient['conversations']['replies']>[0]
+  type Position = { offset: number; page: number; scope: string }
+  const positions = new Map<string, Position>()
+  const cursors = new Map<string, string>()
+  const outcomes = new Map(Object.entries(options.pageOutcomes ?? {}).map(([n, values]) => [Number(n), [...values]]))
+  const responses: Array<{ messages: typeof messages; response_metadata?: { next_cursor: string } }> = []
+  function positionOf(args: PageArgs, kind: 'history' | 'replies') {
+    const scope = JSON.stringify([kind, args.channel, 'ts' in args ? args.ts : undefined, args.oldest, args.latest, args.inclusive])
+    const position = args.cursor ? positions.get(args.cursor) : { offset: 0, page: 0, scope }
+    if (!position || position.scope !== scope || (kind === 'replies' && (!('ts' in args) || args.ts !== rootTs)) ||
+      (options.channel !== undefined && args.channel !== options.channel)) throw new Error('paged thread: unknown cursor, root or range')
+    return position
+  }
+  function buildPage(args: PageArgs, kind: 'history' | 'replies') {
+    const position = positionOf(args, kind)
+    const limit = args.limit ?? 20
+    if (!Number.isInteger(limit) || limit < 1) throw new Error('paged thread: positive integer limit required')
+    const size = Math.min(limit, options.pageSizes?.[position.page] ?? limit)
+    const inRange = (message: typeof messages[number]) => {
+      if (message.ts === undefined || !/^\d+\.\d+$/.test(message.ts)) return true // malformed-page tests reach the reader
+      const time = Number(message.ts)
+      return (args.oldest === undefined || (args.inclusive ? time >= Number(args.oldest) : time > Number(args.oldest))) &&
+        (args.latest === undefined || (args.inclusive ? time <= Number(args.latest) : time < Number(args.latest)))
+    }
+    const selected = messages.filter(inRange)
+    if (kind === 'history') selected.sort((a, b) => Number(b.ts) - Number(a.ts))
+    const repeated = kind === 'replies' && position.page > 0 && options.repeatRoot && inRange(messages[0]!) &&
+      (limit > 1 || position.page % 2 === 1)
+    const prefix = repeated ? [messages[0]!] : []
+    const replies = selected.slice(position.offset, position.offset + Math.max(0, size - prefix.length))
+    const offset = position.offset + replies.length
+    let next_cursor = ''
+    if (offset < selected.length) {
+      const next = { offset, page: position.page + 1, scope: position.scope }
+      const key = JSON.stringify(next)
+      next_cursor = cursors.get(key) ?? `page/${crypto.randomUUID()}+opaque=`
+      cursors.set(key, next_cursor)
+      positions.set(next_cursor, next)
+    }
+    return { messages: [...prefix, ...replies],
+      ...(next_cursor || options.finalCursor !== 'absent' ? { response_metadata: { next_cursor } } : {}) }
+  }
+  const page = (args: Parameters<WebClient['conversations']['replies']>[0]) => buildPage(args, 'replies')
+  const historyPage = (args: Parameters<WebClient['conversations']['history']>[0]) => buildPage(args, 'history')
+  function respondPage(args: PageArgs, kind: 'history' | 'replies'): WebApiOutcome {
+    const position = positionOf(args, kind), result = buildPage(args, kind)
+    const outcome = outcomes.get(position.page)?.shift()
+    function finish(answer: SettledWebApiOutcome = { kind: 'ok' }): SettledWebApiOutcome {
+      if (answer.kind !== 'ok') return answer
+      responses.push(result)
+      return { kind: 'ok', result: { ...result, ...answer.result } }
+    }
+    return outcome?.kind === 'deferred' ? { kind: 'deferred', answer: outcome.answer.then(finish) } : finish(outcome)
+  }
+  function malformedOutcome(damage: PagedPageDamage): SettledWebApiOutcome {
+    const result: Record<string, unknown> = { messages }
+    if (damage === 'messages-absent') result.messages = undefined
+    if (damage === 'messages-object') result.messages = {}
+    if (damage === 'cursor-number') result.response_metadata = { next_cursor: 7 }
+    if (damage === 'metadata-array') result.response_metadata = []
+    if (damage === 'not-ok') result.ok = false
+    return { kind: 'ok', result }
+  }
+  return {
+    rootTs, messages, responses, page, historyPage, malformedOutcome,
+    /** Original synchronous API; scripted page failures use respondReplies. */
+    respond(args: Parameters<WebClient['conversations']['replies']>[0]): SettledWebApiOutcome {
+      const result = page(args)
+      responses.push(result)
+      return { kind: 'ok', result }
+    },
+    respondReplies: (args: Parameters<WebClient['conversations']['replies']>[0]) => respondPage(args, 'replies'),
+    respondHistory: (args: Parameters<WebClient['conversations']['history']>[0]) => respondPage(args, 'history'),
+    /** Shared legacy payload builder, keeping Slack shapes out of test bodies. */
+    legacyOutcome(kind: 'history' | 'replies'): SettledWebApiOutcome {
+      return { kind: 'ok', result: { messages: kind === 'history' ? [...messages].reverse() : [...messages] } }
+    },
+  }
+}
+
 /** A socket `start()` result the test can settle a `deferred` outcome with: every kind but `deferred`. */
 export type SettledConnectOutcome =
   /** `hello` arrives: `connected` is emitted and `start()` resolves. */
@@ -287,6 +438,8 @@ export function makeDeferredConnect(): DeferredConnect {
 
 /** Per-call outcome queues. Consumed front to back; an empty queue means success. */
 export interface StubSlackScript {
+  botsInfo: WebApiOutcome[]
+  inventory: WebApiOutcome[]
   authTest: WebApiOutcome[]
   connect: ConnectOutcome[]
   post: WebApiOutcome[]
@@ -294,8 +447,14 @@ export interface StubSlackScript {
   update: WebApiOutcome[]
   /** `chat.delete`, including assertions that no deletion was attempted. */
   delete: WebApiOutcome[]
-  /** `filesUploadV2`. */
+  /** `filesUploadV2`: a scripted outcome settles the whole call at once, with no nested completion. */
   upload: WebApiOutcome[]
+  /**
+   * `files.completeUploadExternal`, one per completion group; an `ok`
+   * `result` can set `files`. Starts empty (no `StubSlackOptions`
+   * counterpart); push onto `stub.script.completeUpload`.
+   */
+  completeUpload: WebApiOutcome[]
   /** `conversations.history`; an `ok` `result` can set `messages`. */
   history: WebApiOutcome[]
   /** `conversations.replies`; an `ok` `result` can set `messages`. */
@@ -320,6 +479,10 @@ export interface StubSlackScript {
 
 export interface StubSlackOptions {
   /** Initial `auth.test` outcomes (copied; push more onto `stub.script.authTest`). */
+  botsInfo?: readonly WebApiOutcome[]
+  inventory?: readonly WebApiOutcome[]
+  /** Enable authenticated installation discovery through bots.info. */
+  appId?: string
   authTest?: readonly WebApiOutcome[]
   /** Initial socket `start()` outcomes, shared by every socket client of this stub. */
   connect?: readonly ConnectOutcome[]
@@ -334,6 +497,9 @@ export interface StubSlackOptions {
   history?: readonly WebApiOutcome[]
   /** Initial `conversations.replies` outcomes. */
   replies?: readonly WebApiOutcome[]
+  /** Argument-driven reply pages; scripted outcomes still take precedence. */
+  repliesResponder?: (args: Parameters<WebClient['conversations']['replies']>[0]) => WebApiOutcome
+  historyResponder?: (args: Parameters<WebClient['conversations']['history']>[0]) => WebApiOutcome
   /** Initial `conversations.info` outcomes. */
   info?: readonly WebApiOutcome[]
   /** Initial `reactions.add` outcomes. */
@@ -386,6 +552,8 @@ export function stubOpenedDmId(users: string): string {
 
 /** A Web API method the stub imitates, as it appears in a `callLog`. */
 export type StubWebMethod =
+  | 'bots.info'
+  | 'users.conversations'
   | 'auth.test'
   | 'chat.postMessage'
   | 'chat.update'
@@ -433,7 +601,10 @@ export interface StubWebClient {
     replies: WebClient['conversations']['replies']
     info: WebClient['conversations']['info']
   }
-  users: { info: WebClient['users']['info'] }
+  /** `completeUploadExternal` is the SDK's inner call of `filesUploadV2`: captured, but not in `callLog`. */
+  files: { completeUploadExternal: WebClient['files']['completeUploadExternal'] }
+  bots?: { info: WebClient['bots']['info'] }
+  users: { info: WebClient['users']['info']; conversations: WebClient['users']['conversations'] }
   /** As on the real `WebClient`, a prototype method that needs the client as `this` (a detached call throws). */
   filesUploadV2: WebClient['filesUploadV2']
   /**
@@ -551,6 +722,8 @@ export interface StubWebClientBuild {
 
 /** Arguments of each captured Web API call. */
 export interface StubSlackCalls {
+  botsInfo: Parameters<WebClient['bots']['info']>[0][]
+  inventory: Parameters<WebClient['users']['conversations']>[0][]
   authTest: Parameters<WebClient['auth']['test']>[0][]
   postMessage: Parameters<WebClient['chat']['postMessage']>[0][]
   update: Parameters<WebClient['chat']['update']>[0][]
@@ -563,6 +736,7 @@ export interface StubSlackCalls {
   conversationsHistory: Parameters<WebClient['conversations']['history']>[0][]
   conversationsReplies: Parameters<WebClient['conversations']['replies']>[0][]
   conversationsInfo: Parameters<WebClient['conversations']['info']>[0][]
+  completeUploadExternal: Parameters<WebClient['files']['completeUploadExternal']>[0][]
   /** `apiCall` calls: the method named and the options passed. */
   apiCall: StubApiCall[]
 }
@@ -575,9 +749,19 @@ export interface StubApiCall {
 
 export interface StubSlack {
   /** The identity a successful `auth.test` returns. */
-  readonly identity: { botUserId: string; botId: string; teamId: string }
+  readonly identity: { botUserId: string; botId: string; teamId: string; appId?: string }
   /** Outcome queues; push onto them at any time. */
   readonly script: StubSlackScript
+  /** May be installed after a connection harness builds its stub. Scripts win. */
+  readonly responders: { history?: StubSlackOptions['historyResponder']; replies?: StubSlackOptions['repliesResponder'] }
+  /**
+   * How many completion groups each unscripted `filesUploadV2` call
+   * completes, consumed front to back (default 1, holding every file of the
+   * call); the call's files split across its groups in order, at least one
+   * file per group, and each group takes the next `script.completeUpload`
+   * outcome.
+   */
+  readonly uploadGroups: number[]
   /** Captured Web API call arguments, shared by every Web API client of this stub. */
   readonly calls: StubSlackCalls
   /**
@@ -763,13 +947,41 @@ function randomIdTail(): string {
   return crypto.randomUUID().replace(/-/g, '').slice(0, 9).toUpperCase()
 }
 
+// ---------------------------------------------------------------------------
+// Standalone rejections (for code that takes a Slack call's rejection directly)
+// ---------------------------------------------------------------------------
+
+/**
+ * A platform error as the stub's scripted failures build it, for a bot-token
+ * call. With `leakMarker`, the marker is in the message through
+ * `sentinelInMessage`, and bare in `data.provided` and the response messages.
+ */
+export const slackPlatformError = (error: string, retryAfter?: number, leakMarker?: string): Error => codedError(
+  `An API error occurred: ${error}${markerSuffix(leakMarker, BOT_TOKEN_PREFIX)}`, WebApiErrorCode.PlatformError,
+  { data: { ok: false, error, ...(leakMarker ? { provided: leakMarker } : {}),
+    ...(retryAfter !== undefined || leakMarker ? { response_metadata: { ...(retryAfter !== undefined ? { retryAfter } : {}), ...(leakMarker ? { messages: [`[ERROR] ${leakMarker}`] } : {}) } } : {}) } })
+/** A rate-limited error with `retryAfter` seconds; with `leakMarker`, as `slackPlatformError`, bare in `data.provided`. */
+export const slackRateLimited = (retryAfter: number, leakMarker?: string): Error => codedError(
+  `A rate-limit has been reached${markerSuffix(leakMarker, BOT_TOKEN_PREFIX)}`, WebApiErrorCode.RateLimitedError,
+  { retryAfter, ...(leakMarker ? { data: { provided: leakMarker } } : {}) })
+/** The HTTP-status rejection (`httpErrorFromResponse`). */
+export const slackHttpError = (statusCode: number): Error => codedError(
+  `An HTTP protocol error occurred: statusCode = ${statusCode}`, WebApiErrorCode.HTTPError,
+  { statusCode, statusMessage: 'stub status', headers: {}, body: {} })
+/** The request wrapper used by clients with original-error attachment off. */
+export const slackRequestError = (kind: 'network' | 'dns' | 'timeout' = 'network'): Error => requestError(kind,
+  { method: 'chat.postMessage', tokenPrefix: BOT_TOKEN_PREFIX, marker: undefined, attachOriginal: false, timeoutMs: undefined })
+/** Cancellation supplies no Slack response. */
+export const slackAbortError = (): Error => new DOMException('The operation was aborted', 'AbortError')
+
 /** Where a stub Web API client keeps what its prototype methods read through `this`. */
 const STUB_WEB_CLIENT_STATE = Symbol('stub web client state')
 
 /** The per-client implementations `apiCall` and `filesUploadV2` reach through `this`. */
 interface StubWebClientState {
   apiCall: WebClient['apiCall']
-  filesUploadV2: WebClient['filesUploadV2']
+  /** `self` is the call's `this`, whose `files.completeUploadExternal` completes each group. */
+  filesUploadV2: (self: unknown, args: Parameters<WebClient['filesUploadV2']>[0]) => ReturnType<WebClient['filesUploadV2']>
 }
 
 /** The client state `self` (a method's `this`) reaches, own or inherited; throws as a real client's method does without its `this`. */
@@ -792,7 +1004,7 @@ const STUB_WEB_CLIENT_PROTOTYPE: Pick<StubWebClient, 'apiCall' | 'filesUploadV2'
     return stubWebClientState(this, 'apiCall').apiCall(method, apiOptions)
   },
   filesUploadV2(this: unknown, args) {
-    return stubWebClientState(this, 'filesUploadV2').filesUploadV2(args)
+    return stubWebClientState(this, 'filesUploadV2').filesUploadV2(this, args)
   },
 }
 
@@ -815,14 +1027,18 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
     botUserId: opts.botUserId ?? `U${randomIdTail()}`,
     botId: opts.botId ?? `B${randomIdTail()}`,
     teamId: opts.teamId ?? 'T0STUB0001',
+    ...(opts.appId === undefined ? {} : { appId: opts.appId }),
   }
   const script: StubSlackScript = {
+    botsInfo: [...(opts.botsInfo ?? [])],
+    inventory: [...(opts.inventory ?? [])],
     authTest: [...(opts.authTest ?? [])],
     connect: [...(opts.connect ?? [])],
     post: [...(opts.post ?? [])],
     update: [...(opts.update ?? [])],
     delete: [...(opts.delete ?? [])],
     upload: [...(opts.upload ?? [])],
+    completeUpload: [],
     history: [...(opts.history ?? [])],
     replies: [...(opts.replies ?? [])],
     info: [...(opts.info ?? [])],
@@ -833,6 +1049,8 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
     apiCall: [...(opts.apiCall ?? [])],
   }
   const calls: StubSlackCalls = {
+    botsInfo: [],
+    inventory: [],
     authTest: [],
     postMessage: [],
     update: [],
@@ -845,8 +1063,11 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
     conversationsHistory: [],
     conversationsReplies: [],
     conversationsInfo: [],
+    completeUploadExternal: [],
     apiCall: [],
   }
+  const uploadGroups: number[] = []
+  const responders: StubSlack['responders'] = { history: opts.historyResponder, replies: opts.repliesResponder }
   const options: StubSlack['options'] = { web: [], socket: [] }
   const sockets: StubSocketClient[] = []
   const stubCallLog: StubWebCall[] = []
@@ -876,14 +1097,26 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
         mergeDroppingUndefined({ ok: true, messages: [], has_more: false }, overrides),
       )
     const state: StubWebClientState = {
-      filesUploadV2: (args) => {
+      filesUploadV2: (self, args) => {
         record('filesUploadV2', args)
         calls.filesUploadV2.push(args)
         const outcome = script.upload.shift()
-        return runWebApiCall(outcome, ctx('files.completeUploadExternal'), (overrides) => {
-          const id = `F0STUB${String(++fileSeq).padStart(4, '0')}`
-          return mergeDroppingUndefined({ ok: true, files: [{ ok: true, files: [{ id }] }] }, overrides)
-        })
+        if (outcome !== undefined) {
+          return runWebApiCall(outcome, ctx('files.completeUploadExternal'), (overrides) => {
+            const id = `F0STUB${String(++fileSeq).padStart(4, '0')}`
+            return mergeDroppingUndefined({ ok: true, files: [{ ok: true, files: [{ id }] }] }, overrides)
+          }) as ReturnType<WebClient['filesUploadV2']>
+        }
+        const { channel_id, thread_ts, file_uploads } = args as { channel_id?: string; thread_ts?: string; file_uploads?: unknown[] }
+        const files = (self as { files: StubWebClient['files'] }).files
+        // The call's files split across its groups in order, at least one per group.
+        const count = file_uploads?.length ?? 1, groupCount = uploadGroups.shift() ?? 1
+        const groups = Array.from({ length: groupCount }, (_, i) => files.completeUploadExternal({
+          files: Array.from({ length: Math.max(1, Math.floor((i + 1) * count / groupCount) - Math.floor(i * count / groupCount)) },
+            () => ({ id: `F0STUB${String(++fileSeq).padStart(4, '0')}` })),
+          ...(channel_id === undefined ? {} : { channel_id }), ...(thread_ts === undefined ? {} : { thread_ts }),
+        } as Parameters<StubWebClient['files']['completeUploadExternal']>[0]))
+        return Promise.all(groups).then(completed => ({ ok: true, files: completed })) as ReturnType<WebClient['filesUploadV2']>
       },
       apiCall: (method, apiOptions) => {
         const captured: StubApiCall = { method, options: apiOptions }
@@ -982,12 +1215,12 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
         history: (args) => {
           record('conversations.history', args)
           calls.conversationsHistory.push(args)
-          return messageList(script.history.shift(), 'conversations.history')
+          return messageList(script.history.shift() ?? responders.history?.(args), 'conversations.history')
         },
         replies: (args) => {
           record('conversations.replies', args)
           calls.conversationsReplies.push(args)
-          return messageList(script.replies.shift(), 'conversations.replies')
+          return messageList(script.replies.shift() ?? responders.replies?.(args), 'conversations.replies')
         },
         info: (args) => {
           record('conversations.info', args)
@@ -1010,7 +1243,29 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
           )
         },
       },
+      files: {
+        completeUploadExternal: (args) => {
+          calls.completeUploadExternal.push(args)
+          // Unscripted: the group's files, with no shares yet.
+          return runWebApiCall(script.completeUpload.shift(), ctx('files.completeUploadExternal'), (overrides) =>
+            mergeDroppingUndefined({ ok: true, files: args.files.map(({ id }) => ({ id })) }, overrides),
+          )
+        },
+      },
+      ...(opts.appId ? { bots: { info: (args: Parameters<WebClient['bots']['info']>[0]) => {
+        record('bots.info', args)
+        calls.botsInfo.push(args)
+        return runWebApiCall(script.botsInfo.shift(), ctx('bots.info'), overrides => mergeDroppingUndefined({
+          ok: true, bot: { id: identity.botId, user_id: identity.botUserId, app_id: opts.appId, deleted: false },
+        }, overrides))
+      } } } : {}),
       users: {
+        conversations: args => {
+          record('users.conversations', args)
+          calls.inventory.push(args)
+          return runWebApiCall(script.inventory.shift(), ctx('users.conversations'), overrides =>
+            mergeDroppingUndefined({ ok: true, channels: [], response_metadata: { next_cursor: '' } }, overrides))
+        },
         info: (args) => {
           record('users.info', args)
           calls.usersInfo.push(args)
@@ -1242,7 +1497,8 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
           {
             type: 'event_callback',
             team_id: identity.teamId,
-            api_app_id: 'A0STUB0001',
+            api_app_id: opts.appId ?? 'A0STUB0001',
+            authorizations: [{ team_id: identity.teamId, user_id: identity.botUserId, is_bot: true }],
             event,
             event_id: `Ev0STUB${envelopeSeq}`,
             event_time: 1700000000,
@@ -1280,6 +1536,8 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
   return {
     identity,
     script,
+    responders,
+    uploadGroups,
     calls,
     callLog: stubCallLog,
     options,
@@ -1631,6 +1889,25 @@ function makeEvent(defaults: SlackEvent, overrides: EventOverrides): SlackEvent 
   return mergeDroppingUndefined({ ...defaults, ts, event_ts: ts }, overrides)
 }
 
+/**
+ * A bot's authenticated membership event and envelope for `deliver`.
+ * `at` is milliseconds on the caller's clock. Rebuilding the same observation
+ * keeps its event ID, so replay does not become a later membership change.
+ */
+export function makeMembershipEvent(
+  identity: StubSlack['identity'], kind: 'leave' | 'join', channel: string, at: number,
+): [SlackEvent, EnvelopeOverrides] {
+  const timestamp = (at / 1000).toFixed(3)
+  return [
+    { type: kind === 'leave' ? 'channel_left' : 'member_joined_channel',
+      channel, user: identity.botUserId, event_ts: timestamp },
+    { team_id: identity.teamId, api_app_id: identity.appId ?? 'A0STUB0001',
+      authorizations: [{ team_id: identity.teamId, user_id: identity.botUserId, is_bot: true }],
+      event_id: `EvMEMBERSHIP${identity.teamId}${identity.botUserId}${kind}${channel}${at}`,
+      event_time: Math.floor(at / 1000) },
+  ]
+}
+
 /** Default user-group ID for `userGroupMentionText`. User-group IDs start `S`. */
 const DEFAULT_USER_GROUP = 'S0STUBGRP1'
 
@@ -1665,6 +1942,27 @@ export function makeChannelMessage(overrides: EventOverrides = {}): SlackEvent {
     { type: 'message', channel: DEFAULT_CHANNEL, channel_type: 'channel', user: DEFAULT_USER, team: DEFAULT_TEAM, text: 'hello from a channel' },
     overrides,
   )
+}
+
+/**
+ * A reaction on a bot's channel message. `item` overrides the default item's
+ * fields; `overrides.item` replaces it whole, including malformed values.
+ * Explicit undefined removes a field at either level. Envelope flags belong
+ * in `deliver`'s separate envelope argument.
+ */
+export function makeReaction(
+  type: 'reaction_added' | 'reaction_removed',
+  overrides: EventOverrides = {},
+  item: EventOverrides = {},
+): SlackEvent {
+  return mergeDroppingUndefined({
+    type,
+    user: DEFAULT_USER,
+    reaction: 'eyes',
+    item_user: DEFAULT_BOT_USER,
+    event_ts: randomTs(),
+    item: mergeDroppingUndefined({ type: 'message', channel: DEFAULT_CHANNEL, ts: randomTs() }, item),
+  }, overrides)
 }
 
 /** A human's message in a private channel (`G…` channel, `channel_type` `group`). */
@@ -1729,6 +2027,58 @@ export function makeWebhookPost(overrides: EventOverrides = {}): SlackEvent {
     },
     overrides,
   )
+}
+
+/** A valid Slack file ID (`F` then upper-case letters or digits), distinct for each `n`. */
+export function slackFileId(n: number): string {
+  return `F0FILE${String(n).padStart(4, '0')}`
+}
+
+/**
+ * Shapes of `makeOwnFileShare`. `own` is the share that counts: P's channel-level
+ * message sharing the files. Every other shape must not count, and keeps the
+ * rest of the share, so only the named difference refuses it:
+ * `reply` (a `thread_ts` before its `ts`), `changed` (`message_changed`, the
+ * share also nested under `message`), `deleted` (`message_deleted`),
+ * `other-user` / `other-bot` (another author), `no-files`, `malformed-id`
+ * (a string that is no Slack file ID) and `non-string-id` (a numeric ID).
+ */
+export type OwnFileShareShape =
+  | 'own' | 'reply' | 'changed' | 'deleted' | 'other-user' | 'other-bot' | 'no-files' | 'malformed-id' | 'non-string-id'
+export interface OwnFileShareOptions {
+  /** The persona whose own share this is (`StubSlack['identity']` fits). */
+  identity: { botUserId: string; botId: string }
+  channel?: string
+  ts?: string
+  /** Default `[slackFileId(1)]`. */
+  fileIds?: readonly string[]
+  /** `user`: by bot user ID (the default); `bot`: by bot ID alone; `both`. */
+  author?: 'user' | 'bot' | 'both'
+  /** `file_share` (the default) or no `subtype`. */
+  subtype?: 'file_share' | 'absent'
+  shape?: OwnFileShareShape
+  /** Each file's name (default `upload.txt`) and the message text (default empty). */
+  name?: string
+  text?: string
+}
+
+/** A persona's own new-message file share, as the Events API delivers it on P's connection. */
+export function makeOwnFileShare(options: OwnFileShareOptions, overrides: EventOverrides = {}): SlackEvent {
+  const shape = options.shape ?? 'own', author = options.author ?? 'user'
+  const ts = typeof overrides.ts === 'string' ? overrides.ts : options.ts ?? randomTs()
+  const ids: readonly unknown[] = shape === 'no-files' ? [] : shape === 'malformed-id' ? ['f0-not-an-id']
+    : shape === 'non-string-id' ? [7] : options.fileIds ?? [slackFileId(1)]
+  const files = ids.map(id => ({ id, name: options.name ?? 'upload.txt', mimetype: 'text/plain', size: 1 }))
+  const by = shape === 'other-user' ? { user: 'U0OTHERUSR' }
+    : shape === 'other-bot' ? { user: 'U0OTHERBOT', bot_id: 'B0OTHERBOT' }
+    : { ...(author === 'bot' ? {} : { user: options.identity.botUserId }), ...(author === 'user' ? {} : { bot_id: options.identity.botId }) }
+  const share = { type: 'message', channel: options.channel ?? DEFAULT_CHANNEL, channel_type: 'channel',
+    ...(options.subtype === 'absent' ? {} : { subtype: 'file_share' }), ...by, team: DEFAULT_TEAM,
+    text: options.text ?? '', files, upload: false }
+  const subtype = shape === 'changed' ? { subtype: 'message_changed', message: { ...share, ts }, hidden: true }
+    : shape === 'deleted' ? { subtype: 'message_deleted', deleted_ts: ts, hidden: true } : {}
+  const thread = shape === 'reply' ? { thread_ts: (Number(ts) - 1).toFixed(6) } : {}
+  return makeEvent({ ...share, ...subtype, ...thread }, { ts, ...overrides })
 }
 
 /**

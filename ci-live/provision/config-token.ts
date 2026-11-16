@@ -10,11 +10,12 @@
  * anything uses the new token, and a pair that can't be saved stops the run
  * saying so. A successful rotation logs ROTATED_LINE, never a value.
  *
- * A token that is missing (no file, or an empty one) or refused (after the
- * one rotation, when there is a refresh token) is a
- * `ConfigTokenUnavailableError`: not runnable (exit 2), naming the file to
- * refresh, never the value. The apps stage catches it and goes on without
- * the token when apps.json records every app (provision/apps.ts).
+ * A token that is missing (no file, or an empty one), cannot manage the test
+ * apps (`no_permission`), or is refused (after the one rotation, when there
+ * is a refresh token) is a `ConfigTokenUnavailableError`: not runnable
+ * (exit 2), naming the cause or the file to refresh, never the value. The
+ * apps stage catches it and goes on without the token when apps.json
+ * records every app (provision/apps.ts).
  *
  * `rotateNow` forces one rotation (`bun ci-live/run.ts config-token
  * --rotate`), so the operator can prove rotation end to end.
@@ -26,6 +27,9 @@ import { safeErrorCode, SlackTransportError, TOKEN_REFUSED_CODES, type SlackApi,
 
 /** The one line a successful rotation logs. */
 export const ROTATED_LINE = 'config token: rotated with tooling.tokens.rotate; both token files rewritten (mode 600)'
+
+/** Configuration-token failures only: lack of app permission never rotates a token or classifies a bot token. */
+const CONFIG_TOKEN_UNAVAILABLE_CODES = new Set([...TOKEN_REFUSED_CODES, 'no_permission'])
 
 export interface ConfigTokenStore {
   read(): ConfigTokens
@@ -39,8 +43,9 @@ export interface ConfigTokenStore {
 
 /**
  * The configuration token can't be used: its file is missing or empty, or
- * Slack refused it (as expired, after a rotation that was impossible or
- * refused, or otherwise). Not runnable, unless the caller can do without it.
+ * Slack denied app permission or refused it (as expired, after a rotation
+ * that was impossible or refused, or otherwise). Not runnable, unless the
+ * caller can do without it.
  */
 export class ConfigTokenUnavailableError extends NotRunnableError {
   constructor(message: string) {
@@ -119,10 +124,13 @@ export class ConfigTokenSource {
   /** One manifest API call with the configuration token (rotated once if it expired). */
   async call(method: string, params: SlackParams): Promise<SlackResponse> {
     let answer = await this.api.call(method, this.current().token, params)
-    if (answer.ok || !TOKEN_REFUSED_CODES.has(safeErrorCode(answer))) return answer
+    if (answer.ok || !CONFIG_TOKEN_UNAVAILABLE_CODES.has(safeErrorCode(answer))) return answer
     if (safeErrorCode(answer) === 'token_expired' && (await this.rotate())) {
       answer = await this.api.call(method, this.current().token, params)
-      if (answer.ok || !TOKEN_REFUSED_CODES.has(safeErrorCode(answer))) return answer
+      if (answer.ok || !CONFIG_TOKEN_UNAVAILABLE_CODES.has(safeErrorCode(answer))) return answer
+    }
+    if (safeErrorCode(answer) === 'no_permission') {
+      throw new ConfigTokenUnavailableError('the Slack app configuration token cannot manage the test apps (no_permission)')
     }
     throw new ConfigTokenUnavailableError(
       `the Slack app configuration token was refused (${safeErrorCode(answer)}): write a fresh one to ${this.store.tokenPath} (mode 600)`,

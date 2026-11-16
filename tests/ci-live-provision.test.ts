@@ -22,8 +22,8 @@
  *   or created; a refused create clears it;
  *   a real run with no apps.json creates no app unless `--create-apps`;
  * - the configuration token is rotated once when expired, the new pair saved
- *   (refresh token first) before the retry; a missing or refused token is a
- *   `ConfigTokenUnavailableError`, which the apps stage survives with a
+ *   (refresh token first) before the retry; a missing, refused or
+ *   no_permission token is a `ConfigTokenUnavailableError`, which the apps stage survives with a
  *   warning only when apps.json records all four apps;
  * - `apps --delete-strays` runs only on an apps.json that is there, parses
  *   and records an app ID (read again before each delete), and deletes only
@@ -76,7 +76,17 @@ import { ambiguousPendingMessage, runAppsStage, AppsStageError, createUnanswered
 import { runAppTokenStage } from '../ci-live/provision/app-tokens.ts'
 import { BotApi, isTokenRefusal, type AppTokenCheck, type BotCheck } from '../ci-live/provision/bot-api.ts'
 import { ConfigTokenSource, ConfigTokenUnavailableError, ROTATED_LINE } from '../ci-live/provision/config-token.ts'
-import { allValid, missingAppsJsonMessage, runProvisioning, stagesToRun, validateCredentials, type ProvisionDeps } from '../ci-live/provision/index.ts'
+import {
+  allValid,
+  buildAppSetupSource,
+  missingAppsJsonMessage,
+  runProvisioning,
+  stagesToRun,
+  validateCredentials,
+  type AppSetupDeps,
+  type ProvisionDeps,
+  type ProvisionReport,
+} from '../ci-live/provision/index.ts'
 import { ProvisionError, runInstallStage, TransientProvisionError } from '../ci-live/provision/install.ts'
 import { memSecureFs } from './test-helpers/ci-live.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
@@ -299,6 +309,16 @@ describe('ConfigTokenSource', () => {
     const s = source(REFRESH, json({ ok: false, error: 'invalid_manifest' }))
     expect(await s.tokens.call('apps.manifest.create', { manifest: '{}' })).toEqual({ ok: false, error: 'invalid_manifest' })
     expect(s.written).toEqual([])
+  })
+
+  test('no_permission after an expiry rotation is unavailable without another rotation', async () => {
+    const s = source(REFRESH, json({ ok: false, error: 'token_expired' }), json({ ok: true, token: ROTATED, refresh_token: NEXT_REFRESH }), json({ ok: false, error: 'no_permission' }))
+    const err = await rejection(s.tokens.call('apps.manifest.export', { app_id: 'A0APP00001' }))
+    expect(err).toBeInstanceOf(ConfigTokenUnavailableError)
+    expect(err.message).toBe('the Slack app configuration token cannot manage the test apps (no_permission)')
+    expect(s.calls.map((c) => c.method)).toEqual(['apps.manifest.export', 'tooling.tokens.rotate', 'apps.manifest.export'])
+    expect(s.written.length).toBe(1)
+    assertNoLeak(err)
   })
 
   describe('over the secret store (both token files, mode 600)', () => {
@@ -593,6 +613,9 @@ describe('runAppsStage', () => {
     const second = await runAppsStage(rerun.deps)
     expect(second.map((o) => o.action)).toEqual(['reused', 'reused', 'reused', 'reused'])
     expect(rerun.calls.map((c) => c.method)).toEqual(Array(4).fill('apps.manifest.export'))
+    // Created and reused with a usable token: both checked, and logged with no "unchecked".
+    expect([...first, ...second].map((o) => o.unchecked)).toEqual(Array(8).fill(false))
+    expect(rerun.lines).toEqual(PERSONA_LETTERS.map((l, i) => `apps: CSCB Test ${l.toUpperCase()}: reused A0APPNEW0${i + 1}`))
   })
 
   test("a run stopped mid-create keeps the apps created so far and the unfinished create's intent; the rerun finds no such app on the apps list, so it clears the intent and creates only the rest", async () => {
@@ -619,7 +642,8 @@ describe('runAppsStage', () => {
     h.appsFile.save({ version: 1, personas: { b: { app_id: 'A0APPOLD02', bot_user_id: 'U0BOT00002' } }, channels: {} })
     h.deps.letters = ['b']
     const [outcome] = await runAppsStage(h.deps)
-    expect(outcome).toEqual({ letter: 'b', appId: 'A0APPOLD02', action: 'updated', drift: ['display_information.name'] })
+    expect(outcome).toEqual({ letter: 'b', appId: 'A0APPOLD02', action: 'updated', drift: ['display_information.name'], unchecked: false })
+    expect(h.lines).toEqual(['apps: CSCB Test B: updated A0APPOLD02 (drifted: display_information.name; marked for re-install)'])
     expect(h.calls.map((c) => c.method)).toEqual(['apps.manifest.export', 'apps.manifest.update'])
     expect(h.calls[1]!.params).toEqual({ app_id: 'A0APPOLD02', manifest: JSON.stringify(personaManifest(REPO_MANIFEST, 'b')) })
     expect(h.appsFile.load().personas.b).toEqual({ app_id: 'A0APPOLD02', bot_user_id: 'U0BOT00002', needs_reinstall: true })
@@ -714,7 +738,7 @@ describe('runAppsStage', () => {
 
     test('one unrecorded app of its exact name that the configuration token manages is adopted: recorded with the intent cleared, then checked like a recorded app; nothing is created', async () => {
       const h = pendingHarness([...decoys, row('A0MADE0001', 'CSCB Test C')])
-      expect(await runAppsStage(h.deps)).toEqual([{ letter: 'c', appId: 'A0MADE0001', action: 'adopted', drift: [] }])
+      expect(await runAppsStage(h.deps)).toEqual([{ letter: 'c', appId: 'A0MADE0001', action: 'adopted', drift: [], unchecked: false }])
       expect([recorded(h.appsFile.load()), creates(h)]).toEqual(['c:A0MADE0001', 0])
       expect(h.calls.filter((c) => c.params.app_id === 'A0MADE0001').map((c) => c.method)).toEqual(['apps.manifest.export', 'apps.manifest.export'])
     })
@@ -823,6 +847,7 @@ describe('the apps stage without a usable configuration token', () => {
   const REFUSED = 'the Slack app configuration token was refused (token_expired): write a fresh one to /cfg/slack_config_token (mode 600)'
   const CONDITIONS = [
     ['missing', {}, [], [], 'the Slack app configuration token is missing: write it to /cfg/slack_config_token (mode 600)'],
+    ['without permission (no_permission), even with a refresh token', { token: CONFIG_TOKEN, refresh: REFRESH }, [json({ ok: false, error: 'no_permission' })], ['apps.manifest.export'], 'the Slack app configuration token cannot manage the test apps (no_permission)'],
     ['expired, with no refresh token', { token: CONFIG_TOKEN }, [EXPIRED], ['apps.manifest.export'], REFUSED],
     ['expired, its rotation refused', { token: CONFIG_TOKEN, refresh: REFRESH }, [EXPIRED, json({ ok: false, error: 'invalid_refresh_token' })], ['apps.manifest.export', 'tooling.tokens.rotate'], REFUSED],
   ] as const
@@ -830,7 +855,7 @@ describe('the apps stage without a usable configuration token', () => {
   test.each(CONDITIONS)('a configuration token %s, with all four apps in apps.json: a WARNING (never a value), and the recorded apps reused unchecked', async (_what, seed, script, methods, why) => {
     const h = tokenHarness(seed, [...script], PERSONA_LETTERS)
     const outcomes = await runAppsStage(h.deps)
-    expect(outcomes).toEqual(PERSONA_LETTERS.map((letter) => ({ letter, appId: RECORDED[letter], action: 'reused', drift: [] })))
+    expect(outcomes).toEqual(PERSONA_LETTERS.map((letter) => ({ letter, appId: RECORDED[letter], action: 'reused', drift: [], unchecked: true })))
     expect(h.calls.map((c) => c.method)).toEqual([...methods])
     expect(h.lines.filter((l) => l.startsWith('WARNING:'))).toEqual([
       `WARNING: apps: the configuration token can't be used (${why}); apps.json records all four apps, so the run reuses them without their export, drift check or update`,
@@ -842,12 +867,42 @@ describe('the apps stage without a usable configuration token', () => {
     assertNoLeak({ lines: h.lines, outcomes })
   })
 
-  test.each(CONDITIONS)('a configuration token %s, with an app missing from apps.json: not runnable (exit 2), naming the token file, and nothing created', async (_what, seed, script, methods, why) => {
+  test.each(CONDITIONS)('a configuration token %s, with an app missing from apps.json: not runnable (exit 2), naming the cause, and nothing created', async (_what, seed, script, methods, why) => {
     const h = tokenHarness(seed, [...script], ['a', 'b', 'c'])
     const err = await rejection(runAppsStage(h.deps))
     expect([err instanceof ConfigTokenUnavailableError, err instanceof NotRunnableError, err.message]).toEqual([true, true, why])
     expect(h.calls.map((c) => c.method)).toEqual([...methods])
     expect(h.appsJson()).toBe(h.before)
+    assertNoLeak({ err, lines: h.lines })
+  })
+
+  test('an internal_error on export still stops with AppsStageError, even with all four apps recorded', async () => {
+    const h = tokenHarness({ token: CONFIG_TOKEN, refresh: REFRESH }, [json({ ok: false, error: 'internal_error' })], PERSONA_LETTERS)
+    const err = await rejection(runAppsStage(h.deps))
+    expect(err).toBeInstanceOf(AppsStageError)
+    expect(err.message).toBe('apps.manifest.export for CSCB Test A (A0APPOLD01) failed: internal_error')
+    expect(h.calls.map((c) => c.method)).toEqual(['apps.manifest.export'])
+    expect(h.lines).toEqual([])
+    expect(h.appsJson()).toBe(h.before)
+    assertNoLeak({ err, lines: h.lines })
+  })
+
+  test.each(['create', 'resolve an unfinished create'] as const)('no_permission cannot %s, rotates nothing and keeps no new app ID', async (operation) => {
+    const h = tokenHarness({ token: CONFIG_TOKEN, refresh: REFRESH }, [json({ ok: false, error: 'no_permission' })], [])
+    h.deps.letters = ['a']
+    if (operation === 'resolve an unfinished create') {
+      h.deps.appsFile.update((state) => {
+        state.personas.a = { pending_create: { started_at: '2026-01-01T00:00:00.000Z' } }
+      })
+      h.deps.listApps = async () => [{ id: 'A0PENDING1', name: 'CSCB Test A', rowText: 'CSCB Test A CSCB CI Test' }]
+    }
+    const before = h.appsJson()
+    const err = await rejection(runAppsStage(h.deps))
+    expect(err).toBeInstanceOf(ConfigTokenUnavailableError)
+    expect(err).toBeInstanceOf(NotRunnableError)
+    expect(h.calls.map((c) => c.method)).toEqual([operation === 'create' ? 'apps.manifest.create' : 'apps.manifest.export'])
+    expect(h.appsJson()).toBe(before)
+    expect(h.lines.filter((l) => l.startsWith('WARNING:'))).toEqual([])
     assertNoLeak({ err, lines: h.lines })
   })
 })
@@ -1321,6 +1376,118 @@ describe('runProvisioning against the stub workspace', () => {
     expect(allValid(undefined)).toBe(false)
     expect(h.lines.at(-2)).toBe('validate: CSCB Test C: bot_token failed (no_file), app_token failed (no_file)')
     assertNoLeak(h.lines)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The checks' app setup source (CheckContext.setup, buildAppSetupSource)
+// ---------------------------------------------------------------------------
+
+describe("buildAppSetupSource: the setup-readiness checks' view of this run's provisioning", () => {
+  const NOTHING = { appId: undefined, apps: undefined, drift: undefined, unchecked: undefined, install: undefined }
+  /** Every member, undefined ones included, so a filled-in member never matches an absent one. */
+  const members = (p: object) => Object.entries(p)
+
+  test("provisioned gives each persona's app ID, apps action, drift, unchecked and install action, as the stages reported them", async () => {
+    const h = provisionHarness()
+    const first = await runProvisioning(h.deps, null)
+    const appOf = (l: PersonaLetter) => h.appsFile.load().personas[l]!.app_id!
+    ;(h.stub.apps.get(appOf('a'))!.manifest.display_information as Record<string, unknown>).name = 'Renamed by hand'
+    const second = await runProvisioning(h.deps, null)
+
+    const of = (report: ProvisionReport) => PERSONA_LETTERS.map((l) => members(buildAppSetupSource(report, h.deps).provisioned(l)))
+    const row = (l: PersonaLetter, apps: string, drift: string[], install: string) => members({ appId: appOf(l), apps, drift, unchecked: false, install })
+    expect(of(first)).toEqual(PERSONA_LETTERS.map((l) => row(l, 'created', [], 'installed')))
+    expect(of(second)).toEqual([row('a', 'updated', ['display_information.name'], 'reinstalled'), row('b', 'reused', [], 'kept'), row('c', 'reused', [], 'kept'), row('d', 'reused', [], 'kept')])
+    // Each member is the stages' own outcome.
+    for (const o of second.apps!) {
+      expect(buildAppSetupSource(second, h.deps).provisioned(o.letter)).toEqual({ appId: o.appId, apps: o.action, drift: o.drift, unchecked: o.unchecked, install: second.install![o.letter] })
+    }
+  })
+
+  test("a tokenless reuse's unchecked outcome reaches the checks as unchecked: true, with the app it reported", () => {
+    const report: ProvisionReport = { apps: [{ letter: 'c', appId: 'A0APPOLD03', action: 'reused', drift: [], unchecked: true }], install: { c: 'kept' } }
+    expect(members(buildAppSetupSource(report, provisionHarness().deps).provisioned('c'))).toEqual(members({ appId: 'A0APPOLD03', apps: 'reused', drift: [], unchecked: true, install: 'kept' }))
+  })
+
+  test('a stage that did not run (--stage apps), a persona a stage did not report, and no report (provisioning threw, as a failed stage does) give undefined', async () => {
+    const h = provisionHarness()
+    const appsOnly = await runProvisioning(h.deps, 'apps')
+    const appC = h.appsFile.load().personas.c!.app_id!
+    expect(members(buildAppSetupSource(appsOnly, h.deps).provisioned('c'))).toEqual(members({ appId: appC, apps: 'created', drift: [], unchecked: false, install: undefined }))
+    const partial: ProvisionReport = { apps: appsOnly.apps!.filter((o) => o.letter !== 'd'), install: { a: 'kept' } }
+    expect(members(buildAppSetupSource(partial, h.deps).provisioned('d'))).toEqual(members(NOTHING))
+    // An install stage that fails rejects runProvisioning, so the runner has no report.
+    h.deps.browser = async () => stubBrowser(h.stub, { installApp: async () => Promise.reject(new FlowError('install page showed no button')) }).driver
+    await expect(runProvisioning(h.deps, null)).rejects.toThrow()
+    for (const l of PERSONA_LETTERS) expect(members(buildAppSetupSource(null, h.deps).provisioned(l))).toEqual(members(NOTHING))
+  })
+
+  test('needsReinstall reads apps.json at each call, not when the source was built', async () => {
+    const h = provisionHarness()
+    await runProvisioning(h.deps, 'apps')
+    const setup = buildAppSetupSource(null, h.deps)
+    expect(PERSONA_LETTERS.map((l) => setup.needsReinstall(l))).toEqual([false, false, false, false])
+    h.appsFile.update((state) => {
+      state.personas.c!.needs_reinstall = true
+    })
+    expect(PERSONA_LETTERS.map((l) => setup.needsReinstall(l))).toEqual([false, false, true, false])
+    h.appsFile.update((state) => {
+      delete state.personas.c!.needs_reinstall
+    })
+    expect(setup.needsReinstall('c')).toBe(false)
+  })
+
+  test("wantedManifest is manifestFor's manifest for that persona", () => {
+    const setup = buildAppSetupSource(null, provisionHarness().deps)
+    for (const l of PERSONA_LETTERS) expect(setup.wantedManifest(l)).toEqual(personaManifest(REPO_MANIFEST, l))
+    expect(setup.wantedManifest('a')).not.toEqual(setup.wantedManifest('c'))
+  })
+
+  test('exportManifest with a working configuration token gives the exported manifest', async () => {
+    const h = provisionHarness()
+    await runProvisioning(h.deps, 'apps')
+    const appC = h.appsFile.load().personas.c!.app_id!
+    expect(await buildAppSetupSource(null, h.deps).exportManifest(appC)).toEqual({ kind: 'exported', manifest: personaManifest(REPO_MANIFEST, 'c') })
+  })
+
+  // Every case plants the token and response-body sentinel where a careless reduction would copy it.
+  const ROTATE_OK = json({ ok: true, token: fakeToken(`${BOT_TOKEN_PREFIX.slice(0, 3)}e.`, 'rotated'), refresh_token: fakeToken(BOT_TOKEN_PREFIX.replace('b', 'e'), 'next') })
+  const EXPIRED = json({ ok: false, error: 'token_expired' })
+  // Each row: [what, token files, Slack's answers, why, fail the next rename].
+  const UNAVAILABLE: [string, { token?: string; refresh?: string }, Scripted[], string, boolean][] = [
+    ['no configuration token', {}, [json({ ok: true })], 'no usable configuration token', false],
+    ['no_permission to manage the app', { token: CONFIG_TOKEN, refresh: REFRESH }, [json({ ok: false, error: 'no_permission', detail: LEAK_SENTINEL })], 'no usable configuration token', false],
+    ['an expired token whose rotation is refused', { token: CONFIG_TOKEN, refresh: REFRESH }, [EXPIRED, json({ ok: false, error: 'invalid_refresh_token' })], 'no usable configuration token', false],
+    ['ok: false', { token: CONFIG_TOKEN }, [json({ ok: false, error: 'invalid_app_id', detail: LEAK_SENTINEL })], 'invalid_app_id', false],
+    ['ok: false with an unsafe error code', { token: CONFIG_TOKEN }, [json({ ok: false, error: `x ${CONFIG_TOKEN}` })], 'unknown_error', false],
+    ['ok: true with no manifest', { token: CONFIG_TOKEN }, [json({ ok: true, manifest: `${LEAK_SENTINEL}` })], 'no manifest in the answer', false],
+    ['no answer (a network failure)', { token: CONFIG_TOKEN }, [new TypeError(`down ${CONFIG_TOKEN}`)], 'no answer (network)', false],
+    ['no answer (HTTP 503)', { token: CONFIG_TOKEN }, [json({ ok: false, error: LEAK_SENTINEL }, { status: 503 })], 'no answer (http 503)', false],
+    // A rotated pair that could not be saved (NotRunnableError): a fixed reason, never the error's text.
+    ['a rotated pair that cannot be saved', { token: CONFIG_TOKEN, refresh: REFRESH }, [EXPIRED, ROTATE_OK], 'the configuration token call failed', true],
+  ]
+
+  test.each(UNAVAILABLE)('exportManifest with %s gives unavailable with a safe reason, never throws, and leaks nothing', async (_what, seed, script, why, failRename) => {
+    const s = stored(seed, ...script)
+    if (failRename) s.mem.failNext('rename')
+    const deps: AppSetupDeps = { callManifest: (method, params) => s.tokens.call(method, params), appsFile: new AppsStateFile(s.mem.fs, s.store.paths.appsJson), manifestFor: (l) => personaManifest(REPO_MANIFEST, l) }
+    const result = await buildAppSetupSource(null, deps).exportManifest('A0APPOLD03')
+    expect(result).toEqual({ kind: 'unavailable', why })
+    assertNoLeak({ result, lines: s.lines })
+  })
+
+  test("exportManifest reduces any other thrown error to a fixed reason, never the error's text", async () => {
+    const deps: AppSetupDeps = {
+      callManifest: async () => {
+        throw new Error(`boom ${CONFIG_TOKEN} ${LEAK_SENTINEL}`)
+      },
+      appsFile: { load: () => ({ version: 1, personas: {}, channels: {} }) },
+      manifestFor: (l) => personaManifest(REPO_MANIFEST, l),
+    }
+    const result = await buildAppSetupSource(null, deps).exportManifest('A0APPOLD03')
+    expect(result).toEqual({ kind: 'unavailable', why: 'the configuration token call failed' })
+    assertNoLeak(result)
   })
 })
 

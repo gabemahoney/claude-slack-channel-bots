@@ -5,9 +5,10 @@
  * stopped mid-check while the container still showed "running". The cause is
  * unknown, so the runner watches memory itself. Every WATCHDOG_INTERVAL_MS it
  * samples:
- * - the host (pod) cgroup: `memory.current`, `memory.max`, and `inactive_file`
- *   from `memory.stat`; the working set is `memory.current - inactive_file`
- *   (as the kubelet counts it: page cache the kernel can drop is not use);
+ * - the host (pod) cgroup: `memory.current`, `memory.max`, and non-reclaimable
+ *   memory from `memory.stat`, using /ci's shared calculation:
+ *   max(anon + shmem, active_anon + inactive_anon + unevictable), excluding
+ *   reclaimable page cache;
  * - the test container: `docker stats` (memory use / limit and PIDs);
  * - Chrome: its process tree's summed PSS (lib/proc-tree.ts; a process
  *   whose PSS can't be read counts its RSS, and the line says how many did)
@@ -17,7 +18,7 @@
  * reported at the end (run.log, results.json and results.md).
  *
  * It aborts the run (through `onAbort`, which the runner routes to the same
- * stop path as a signal) when the host working set crosses
+ * stop path as a signal) when the host non-reclaimable memory crosses
  * HOST_WORKING_SET_LIMIT_BYTES or Chrome's tree PSS crosses
  * CHROME_PSS_LIMIT_BYTES. The two readings with a limit come first (the host,
  * then Chrome) and each is checked as soon as it arrives, before the slow
@@ -39,6 +40,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
+import { nonReclaimableMemoryBytes, type NonReclaimableMemoryReading } from '../../scripts/non-reclaimable-memory.ts'
 import type { BrowserStats } from './browser-types.ts'
 import type { ContainerStats } from './docker.ts'
 import { describeError } from './errors.ts'
@@ -48,7 +50,7 @@ export const GIB = 1024 ** 3
 export const WATCHDOG_INTERVAL_MS = 30_000
 
 /**
- * Abort when the host cgroup's working set crosses this: well below the
+ * Abort when the host cgroup's non-reclaimable memory crosses this: well below the
  * 64 GiB pod limit, leaving room for the production bots and the other
  * sessions on the host, so the run stops itself long before the pod thrashes.
  */
@@ -89,12 +91,11 @@ export function formatBytes(bytes: number): string {
 // The host cgroup
 // ---------------------------------------------------------------------------
 
-export interface HostMemory {
+export interface HostMemory extends Required<NonReclaimableMemoryReading> {
   currentBytes: number
   /** `memory.max`, or `null` for `max` (no limit). */
   maxBytes: number | null
-  inactiveFileBytes: number
-  /** `currentBytes - inactiveFileBytes`, never below 0. */
+  /** Non-reclaimable memory; the field name is retained for results compatibility. */
   workingSetBytes: number
 }
 
@@ -108,10 +109,19 @@ function cgroupNumber(text: string, what: string): number {
 export function parseHostCgroup(current: string, max: string, stat: string): HostMemory {
   const currentBytes = cgroupNumber(current, 'memory.current')
   const maxBytes = max.trim() === 'max' ? null : cgroupNumber(max, 'memory.max')
-  const m = /^inactive_file ([0-9]{1,20})$/m.exec(stat)
-  if (!m) throw new Error('memory.stat has no inactive_file')
-  const inactiveFileBytes = Number(m[1])
-  return { currentBytes, maxBytes, inactiveFileBytes, workingSetBytes: Math.max(0, currentBytes - inactiveFileBytes) }
+  const counter = (key: string): number => {
+    const match = new RegExp(`^${key} ([0-9]{1,20})$`, 'm').exec(stat)
+    if (!match) throw new Error(`memory.stat has no ${key}`)
+    return Number(match[1])
+  }
+  const reading = {
+    anonBytes: counter('anon'),
+    shmemBytes: counter('shmem'),
+    activeAnonBytes: counter('active_anon'),
+    inactiveAnonBytes: counter('inactive_anon'),
+    unevictableBytes: counter('unevictable'),
+  }
+  return { currentBytes, maxBytes, ...reading, workingSetBytes: nonReclaimableMemoryBytes(reading) }
 }
 
 /** The cgroup v2 root this process sees (the pod's). */
@@ -237,7 +247,7 @@ export class MemoryWatchdog {
     if (this.cancel || this.stopped) return
     const t = this.thresholds
     this.o.log.info(
-      `watchdog: sampling memory every ${Math.round(this.intervalMs / 1000)} s into run.log; the run stops when the host working set passes ${formatBytes(t.hostWorkingSetBytes)} or Chrome's PSS passes ${formatBytes(t.chromePssBytes)}`,
+      `watchdog: sampling memory every ${Math.round(this.intervalMs / 1000)} s into run.log; the run stops when the host non-reclaimable memory passes ${formatBytes(t.hostWorkingSetBytes)} or Chrome's PSS passes ${formatBytes(t.chromePssBytes)}`,
     )
     this.cancel = this.clock.every(this.intervalMs, () => void this.tick())
     void this.tick()
@@ -320,7 +330,7 @@ export class MemoryWatchdog {
       this.hostMaxBytes = h.maxBytes
       this.peak('hostWorkingSet', h.workingSetBytes, at)
       this.peak('hostCurrent', h.currentBytes, at)
-      parts.push(`host ws=${formatBytes(h.workingSetBytes)} cur=${formatBytes(h.currentBytes)} max=${h.maxBytes === null ? 'max' : formatBytes(h.maxBytes)}`)
+      parts.push(`host non-reclaimable=${formatBytes(h.workingSetBytes)} cur=${formatBytes(h.currentBytes)} max=${h.maxBytes === null ? 'max' : formatBytes(h.maxBytes)}`)
     } else parts.push(`host error: ${host.error}`)
 
     if (container === null) parts.push('container not read (the watchdog stopped)')
@@ -356,14 +366,15 @@ export class MemoryWatchdog {
     this.o.log.detail(`watchdog: ${parts.join(' | ')}`)
   }
 
-  /** Why the host's working set is over its limit, or `null`. */
+  /** Why the host's non-reclaimable memory is over its limit, or `null`. */
   private hostCrossed(host: HostMemory): string | null {
     const t = this.thresholds
     if (host.workingSetBytes <= t.hostWorkingSetBytes) return null
     const max = host.maxBytes === null ? 'no memory.max' : `memory.max ${formatBytes(host.maxBytes)}`
     return (
-      `host working set ${formatBytes(host.workingSetBytes)} is over the ${formatBytes(t.hostWorkingSetBytes)} limit ` +
-      `(memory.current ${formatBytes(host.currentBytes)} minus inactive_file ${formatBytes(host.inactiveFileBytes)}; ${max})`
+      `host non-reclaimable memory ${formatBytes(host.workingSetBytes)} is over the ${formatBytes(t.hostWorkingSetBytes)} limit ` +
+      `(anon ${formatBytes(host.anonBytes)} + shmem ${formatBytes(host.shmemBytes)} vs anon/unevictable LRU ${formatBytes(host.activeAnonBytes + host.inactiveAnonBytes + host.unevictableBytes)}; ` +
+      `reclaimable page cache excluded; memory.current ${formatBytes(host.currentBytes)}; ${max})`
     )
   }
 
@@ -408,7 +419,7 @@ export class MemoryWatchdog {
     const t = this.thresholds
     const lines = [
       `${this.samples} samples every ${Math.round(this.intervalMs / 1000)} s, ${this.failedSamples} with a failed reading`,
-      `host working set peak ${size('hostWorkingSet')} (limit ${formatBytes(t.hostWorkingSetBytes)}; memory.max ${this.hostMaxBytes === null ? 'max or not read' : formatBytes(this.hostMaxBytes)})`,
+      `host non-reclaimable memory peak ${size('hostWorkingSet')} (limit ${formatBytes(t.hostWorkingSetBytes)}; memory.max ${this.hostMaxBytes === null ? 'max or not read' : formatBytes(this.hostMaxBytes)})`,
       `host memory.current peak ${size('hostCurrent')}`,
       `container memory peak ${size('containerMem')}, PIDs peak ${count('containerPids')}`,
       `Chrome tree PSS peak ${size('chromePss')} (limit ${formatBytes(t.chromePssBytes)}), processes peak ${count('chromeProcesses')}, rss fallback peak ${count('chromeRssFallbacks')}`,

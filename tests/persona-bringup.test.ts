@@ -66,6 +66,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { noticePost } from './test-helpers/server-post.ts'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -138,6 +139,7 @@ import {
   type StubSlack,
   type StubSlackOptions,
 } from './test-helpers/slack-stub.ts'
+
 
 // ---------------------------------------------------------------------------
 // Fixture: personas A and B, each with its own directory and credentials file
@@ -532,7 +534,7 @@ describe('held notices flush per persona when it is up', () => {
       (key, status) => h.controller.onConnectionStatus(key, status),
     )
     const postsOf = (key: string) => h.conn.slack.persona(key).calls.postMessage
-    const noticeTo = (persona: Persona, text: string) => ({ channel: persona.permission_prompts!, text: formatPersonaNotice(persona, text) })
+    const noticeTo = (persona: Persona, text: string) => noticePost(persona.permission_prompts!, formatPersonaNotice(persona, text))
 
     // Raised before any bring-up: every notice is held.
     await notifier.notify(a.key, 'first notice for A')
@@ -587,6 +589,7 @@ describe('end to end: A\'s connection trouble makes no agent-director call', () 
           await ack()
           received.push({ key: receiver as string, text: (event as { text?: unknown } | undefined)?.text })
         },
+        receiveReaction: async (_event, ack) => ack(),
       },
       clientFor,
       getPersona: (k) => cfg.personas.find((p) => p.key === k),
@@ -753,7 +756,7 @@ describe('an unresolvable claude_config_dir holds the persona retrying with its 
   /** A's socket activity since `since`, as [event, credential set]. */
   const socketActivity = (h: Harness, since: number) =>
     h.conn.slack.activityOf(a.key).slice(since).filter((e) => e.kind === 'socket').map((e) => [e.event, e.credentials])
-  const identityOf = (stub: StubSlack) => ({ botUserId: stub.identity.botUserId, botId: stub.identity.botId })
+  const identityOf = (stub: StubSlack) => ({ botUserId: stub.identity.botUserId, botId: stub.identity.botId, teamId: stub.identity.teamId })
   const changeFailedLines = (h: Harness) => h.lines.filter((l) => l.includes(`${PERSONA_CREDENTIALS_CHANGE_FAILED}:`))
   const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
@@ -869,6 +872,7 @@ describe('an unresolvable claude_config_dir holds the persona retrying with its 
           await ack()
           received.push({ key: receiver as string, text: (event as { text?: unknown } | undefined)?.text })
         },
+        receiveReaction: async (_event, ack) => ack(),
       },
       clientFor,
       getPersona: (k) => cfg.personas.find((p) => p.key === k),
@@ -903,7 +907,7 @@ describe('an unresolvable claude_config_dir holds the persona retrying with its 
     expect(h.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
     expect(h.retryLaunches).toEqual([a.key])
     expect(postsOf(a.key).slice(cp.aPosts)).toEqual([
-      { channel: a.permission_prompts!, text: formatPersonaNotice(a, 'a notice raised during the hold') },
+      noticePost(a.permission_prompts!, formatPersonaNotice(a, 'a notice raised during the hold')),
     ])
     expect(postsOf(b.key)).toHaveLength(cp.bPosts)
     // A later reconnect of A posts nothing again.

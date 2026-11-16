@@ -1,3 +1,8 @@
+import { _assignFixture, fixtureThreadHybridSince, makeSharedAuthority } from './test-helpers/shared-channels.ts'
+import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
+import { longLivedWebClientOptions } from '../src/persona-slack-clients.ts'
+import { durableWriteFileSync, DurableWriteUnsyncedError } from '../src/atomic-write.ts'
+import { CHANNEL_TARGET_STATE_UNRESOLVED } from '../src/registry.ts'
 /**
  * registry.test.ts — Persona-keyed MCP session registry, not-up session
  * admission and drop, and persona-scoped Slack tools (
@@ -20,12 +25,12 @@
  * and not the instructions a session receives name `clear-latch`.
  * Per channel mode: the harness's
  * mode seam (`h.mode`, read by `h.modeDeps.getChannelMode` at each call) and
- * a fungible-mode persona (`applyFungibleAlpha`) drive the posting scope per
+ * an open-mode persona (`applyOpenAlpha`) drive the posting scope per
  * mode, directly and through the MCP server, dry run included; the mode read
- * at each call; Slack's refusals as tool errors in fungible mode; the
- * declarative section never read in fungible mode, through the real loader
+ * at each call; Slack's refusals as tool errors in open mode; the
+ * strict channel-list scope bypassed in open mode, through the real loader
  * too; and one instructions text in both modes. `h.deps` binds no mode
- * reader, so every case that opens a session on it runs in declarative mode.
+ * reader, so every case that opens a session on it runs in strict mode.
  * The global `fetch` is stubbed for every test (it throws unless a test sets
  * `h.fetchHandler`), so no test reaches the network, and every tool result
  * and log line is leak-checked in `afterEach`.
@@ -33,6 +38,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { expectNoMetadata } from './test-helpers/server-post.ts'
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
@@ -90,35 +96,66 @@ import {
   matchPersonaByRootsPath,
   checkPersonaTarget,
   FUNGIBLE_TARGET_REFUSAL,
+  STRICT_TARGET_REFUSAL,
+  THREAD_HYBRID_GLOSS,
+  SET_CHANNEL_DELIVERY_DESCRIPTION,
+  SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION,
   isSlackHostedFileUrl,
   MCP_INSTRUCTIONS,
   MCP_INSTRUCTIONS_MAX_CHARS,
+  FETCH_MESSAGES_DESCRIPTION,
+  FETCH_MESSAGES_CURSOR_DESCRIPTION,
+  fetchMessagesCursorRefusal,
   SET_CHANNEL_DELIVERY_TOOL,
   slackRefusalToolErrorText,
+  replyPartialFailureText,
+  OWN_POST_UPLOAD_REFUSED,
   type PersonaTargetAction,
   type PersonaTargetCheck,
   _resetRegistry,
+  type ReactClaimContext,
   type SessionEntry,
   type SessionToolDeps,
 } from '../src/registry.ts'
-import { trackAck, consumeAck, _resetAckTracker, addDeliveryAck } from '../src/ack-tracker.ts'
+import { trackAck, consumeAck, claimReactAnswer, _resetAckTracker, addDeliveryAck } from '../src/ack-tracker.ts'
+import type { BotToolReactionInput, BotToolReactionIntakeResult } from '../src/persona-routing.ts'
+import { buildReactionHandoffFailedLine, type ReactionHandoffFailureReason } from '../src/react-handoff.ts'
+import { NAME_LOOKUP_TIMEOUT_MS } from '../src/tag-wrapper.ts'
+import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { makeReactHandoffFixture, drainReactHandoff, type ReactHandoffFixture } from './test-helpers/react-handoff.ts'
 import {
-  makeFungiblePersona,
+  makePersona,
   makeMultiPersonaConfig,
   makeStandInPersonaConfig,
   writeConfigFile,
   type PersonaSpec,
 } from './test-helpers/persona-config.ts'
+import { observeFileCompletions, withFileCompletions } from '../src/file-upload-observation.ts'
+import { holdOwnPostReady, makeRecordingOwnPostObserver, makeOwnPostHarness, type OwnPostHarness } from './test-helpers/own-post.ts'
+import type { DurableIoSettle } from './test-helpers/durable-io.ts'
+import { threadFsControls, threadPath } from './test-helpers/thread-memory.ts'
+import { watchWebClientAuth } from '../src/persona-web-api-watch.ts'
+import { createOwnPostObserver, type OwnPostObserver } from '../src/own-post.ts'
+import { metadataRetryDelay } from '../src/thread-memory.ts'
+import { THREAD_MEMORY_LOOKUP_DEADLINE_MS } from '../src/delivery-constants.ts'
 import {
   asWebClient,
+  slackAbortError,
+  makeDeferredWebApiCall,
+  makeOwnFileShare,
+  makePagedThread,
   makeStubSlack,
+  slackFileId,
+  slackPlatformError,
   openedDm,
   stubOpenedDmId,
+  type SettledWebApiOutcome,
   type StubSlack,
   type StubSlackOptions,
   type StubSlackScript,
   type StubWebCall,
   type StubWebMethod,
+  type PagedMessageSpec,
   type WebApiOutcome,
 } from './test-helpers/slack-stub.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
@@ -219,7 +256,7 @@ interface Harness {
   /** Per-persona stubs behind `deps.clientFor`; edit between calls. */
   clients: Map<string, StubSlack>
   alphaToken: string
-  /** The session tool deps; no channel-mode reader is bound, so declarative mode. */
+  /** The session tool deps; no channel-mode reader is bound, so strict mode. */
   deps: SessionToolDeps
   /** The channel mode `modeDeps.getChannelMode` returns at each call; set it between calls. */
   mode: ChannelMode
@@ -248,6 +285,8 @@ let h: Harness
 let openClients: Client[] = []
 let savedDryRun: string | undefined
 let consoleSpy: ReturnType<typeof spyOn> | undefined
+/** Only authority records created by the fetch_messages reader, never credential fixtures. */
+let fetchAuthorityFiles: string[] = []
 
 /**
  * The server-wide reply settings the harness's `getReplySettings` returns
@@ -315,7 +354,7 @@ function makeHarness(): Harness {
   }
   const harness: Harness = {
     dir, stateDir, inboxDir, credentialsFile, alpha, beta, personas, clients, alphaToken, deps,
-    mode: 'declarative',
+    mode: 'strict',
     modeDeps: { ...deps, getChannelMode: () => harness.mode },
     lines: [],
     results: [],
@@ -360,7 +399,7 @@ function totalSlackCalls(): number {
 
 /** Why `checkPersonaTarget` refuses a target. */
 const WHY = {
-  channel: "it is not one of the persona's configured channels.",
+  channel: STRICT_TARGET_REFUSAL,
   dmsOff: 'DMs are off for this persona (dm.enabled is false).',
   userId: 'this tool needs a conversation ID (a channel ID or a D… DM conversation ID), not a user ID.',
 } as const
@@ -390,19 +429,18 @@ function applyPersona(p: Persona, on: boolean, overrides: Partial<Persona> = {})
 }
 
 /**
- * Alpha Bot as the loader resolves it in fungible mode, with
- * its DMs switch set to `on`: no `channels` and no top-level
- * `permission_prompts` in force, and its destination from `invited`. `spec`
- * sets further fields; its `channels` or `permission_prompts` stand for a
- * declarative section beside the fungible one, which fungible mode never
- * reads. Applied as the persona `getPersona` returns at the
- * next call, under Alpha's key, so its tools land on Alpha's stub.
+ * Alpha Bot as the loader resolves it in open mode, with its DMs switch
+ * set to `on` and an explicit `permission_prompts` destination, shared by
+ * both modes. `spec` sets further fields; listed channels remain in the
+ * fixture while open-mode posting accepts eligible unlisted targets too.
+ * Applied as the persona `getPersona` returns at the next call, under
+ * Alpha's key, so its tools land on Alpha's stub.
  */
-function applyFungibleAlpha(on: boolean, spec: PersonaSpec = {}): Persona {
+function applyOpenAlpha(on: boolean, spec: PersonaSpec = {}): Persona {
   const config = makeMultiPersonaConfig(
-    [{ name: h.alpha.name, invited: { permission_prompts: A_ALL }, ...spec, dm: { enabled: on } }],
+    [{ name: h.alpha.name, permission_prompts: A_ALL, ...spec, dm: { enabled: on } }],
     h.dir,
-    { allow_invited_channels: true },
+    { channel_mode: 'open' },
   )
   const persona = config.personas[0]!
   expect(persona.key).toBe(h.alpha.key)
@@ -438,8 +476,14 @@ afterEach(async () => {
   if (savedDryRun === undefined) delete process.env['SLACK_DRY_RUN']
   else process.env['SLACK_DRY_RUN'] = savedDryRun
   globalThis.fetch = realFetch
-  rmSync(h.dir, { recursive: true, force: true })
-  assertNoLeak({ lines: h.lines, results: h.results }, 'registry.test afterEach')
+  try {
+    assertNoLeak({ lines: h.lines, results: h.results,
+      authorities: fetchAuthorityFiles.map(path => writtenFile(path)),
+    }, 'registry.test afterEach')
+  } finally {
+    fetchAuthorityFiles = []
+    rmSync(h.dir, { recursive: true, force: true })
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -1250,6 +1294,10 @@ describe('checkPersonaTarget', () => {
   /** An allowed target's kind, or the reason for its refusal. */
   type Expected = 'channel' | 'dm' | 'user' | { why: string }
 
+  test('pins the strict channel refusal', () => {
+    expect(STRICT_TARGET_REFUSAL).toBe("it is not one of the persona's channels with a non-off delivery choice in strict mode.")
+  })
+
   function expectedCheck(persona: Persona, target: string, expected: Expected): PersonaTargetCheck {
     return typeof expected === 'string'
       ? { allowed: true, kind: expected }
@@ -1300,6 +1348,7 @@ describe('tool posting scope (through the MCP server)', () => {
       expect(result.isError).toBeUndefined()
       const captured = stubOf(h.alpha).calls[TOOL_CAPTURE[tool]] as Array<{ channel?: string }>
       expect(captured.map((c) => c.channel)).toEqual([target])
+      expectNoMetadata(captured)
       expect(slackCallCount(stubOf(h.beta))).toBe(0)
     },
   )
@@ -1307,18 +1356,21 @@ describe('tool posting scope (through the MCP server)', () => {
   // DM targets (D…, U…, W…) are in `DM targets` below. The DMs switch does not widen the channel scope.
   test.each(
     TOOLS.flatMap((tool) =>
-      [B_CHANNEL, UNCONFIGURED, 'G0GROUP01'].flatMap((target) => (['off', 'on'] as const).map((dms) => [tool, target, dms] as const)),
+      [A_ALL, B_CHANNEL, UNCONFIGURED, 'G0GROUP01'].flatMap((target) => (['off', 'on'] as const).map((dms) => [tool, target, dms] as const)),
     ),
   )(
     '%s to %s with DMs %s is refused with a tool error naming persona and target, and no Slack call',
     async (tool, target, dms) => {
-      applyPersona(h.alpha, dms === 'on')
+      applyPersona(h.alpha, dms === 'on', target === A_ALL ? { channels: [{ id: A_ALL, delivery: 'off' }] } : {})
       const session = await openPersonaSession(h.alpha)
 
       const result = await session.call(tool, TOOL_ARGS[tool](target))
 
       expect(result.isError).toBe(true)
       expect(result.content[0]!.text).toBe(refusal(h.alpha, target))
+      if (tool === 'fetch_messages') {
+        expect(await session.call(tool, { ...TOOL_ARGS[tool](target), thread_ts: MSG_TS, cursor: 'unused-cursor' })).toEqual(result)
+      }
       expectNoSlackCall()
     },
   )
@@ -1334,6 +1386,7 @@ describe('tool posting scope (through the MCP server)', () => {
     expect(Object.keys(stubOf(h.alpha).calls.postMessage[0]!)).toEqual(
       expect.not.arrayContaining(['username', 'icon_emoji', 'icon_url']),
     )
+    expectNoMetadata(stubOf(h.alpha).calls.postMessage)
   })
 })
 
@@ -1414,6 +1467,9 @@ describe('DM targets (through the MCP server)', () => {
 
       expect(result.isError).toBe(true)
       expect(result.content[0]!.text).toBe(refusal(h.alpha, target, why))
+      if (tool === 'fetch_messages') {
+        expect(await session.call(tool, { ...TOOL_ARGS[tool](target), thread_ts: MSG_TS, cursor: 'unused-cursor' })).toEqual(result)
+      }
       expectNoSlackCall()
     },
   )
@@ -1487,6 +1543,9 @@ describe('DM targets (through the MCP server)', () => {
     expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([
       { channel_id: OPENED, file_uploads: [{ file, filename: 'out.txt' }], thread_ts: posted[0] },
     ] as any)
+    // Every chunk and the upload are Tool Posts.
+    expectNoMetadata(stubOf(h.alpha).calls.postMessage)
+    expectNoMetadata(stubOf(h.alpha).calls.filesUploadV2)
     expect(stubOf(h.beta).callLog).toEqual([])
   })
 
@@ -1676,13 +1735,15 @@ describe('dry run (SLACK_DRY_RUN=1)', () => {
     expectNoSlackCall()
   })
 
-  test.each(TOOLS)('%s to an unconfigured channel is still refused (scope runs before dry run)', async (tool) => {
+  test.each(TOOLS.flatMap(tool => [UNCONFIGURED, A_ALL].map(target => [tool, target] as const)))('%s to absent/off channel %s is still refused (scope runs before dry run)', async (tool, target) => {
+    if (target === A_ALL) applyPersona(h.alpha, false, { channels: [{ id: A_ALL, delivery: 'off' }] })
     const session = await openPersonaSession(h.alpha)
 
-    const result = await session.call(tool, TOOL_ARGS[tool](UNCONFIGURED))
+    const result = await session.call(tool, TOOL_ARGS[tool](target))
 
     expect(result.isError).toBe(true)
-    expect(result.content[0]!.text).toBe(refusal(h.alpha, UNCONFIGURED))
+    expect(result.content[0]!.text).toBe(refusal(h.alpha, target))
+    expectNoSlackCall()
   })
 })
 
@@ -1711,7 +1772,7 @@ interface ScopeRow {
   label: string
   target: string
   expected: (dms: boolean, action: PersonaTargetAction) => ScopeExpected
-  /** A DM target (`D…` or a user ID): its outcome is the declarative one in fungible mode too. */
+  /** A DM target (`D…` or a user ID): its outcome is the strict-mode one in open mode too. */
   dmTarget?: boolean
 }
 
@@ -1726,8 +1787,8 @@ const notListed = (): ScopeExpected => ({ why: WHY.channel })
 const neitherChannelNorDm = (): ScopeExpected => ({ why: FUNGIBLE_TARGET_REFUSAL })
 const anyChannel = (): ScopeExpected => 'channel'
 
-/** six targets, decided by Alpha Bot's listed channels in declarative mode. */
-const DECLARATIVE_SCOPE_ROWS: readonly ScopeRow[] = [
+/** six targets, decided by Alpha Bot's listed channels in strict mode. */
+const STRICT_SCOPE_ROWS: readonly ScopeRow[] = [
   { label: 'a listed channel', target: A_ALL, expected: anyChannel },
   { label: 'an unlisted C… channel', target: UNCONFIGURED, expected: notListed },
   { label: 'a G… ID', target: GROUP_DM, expected: notListed },
@@ -1736,8 +1797,8 @@ const DECLARATIVE_SCOPE_ROWS: readonly ScopeRow[] = [
   { label: 'a U… user ID', target: USER_U, expected: userIdOutcome, dmTarget: true },
 ]
 
-/** Targets fungible mode refuses as neither a channel ID nor an allowed DM target. */
-const FUNGIBLE_OTHER_TARGETS: ReadonlyArray<readonly [label: string, target: string]> = [
+/** Targets open mode refuses as neither a channel ID nor an allowed DM target. */
+const OPEN_OTHER_TARGETS: ReadonlyArray<readonly [label: string, target: string]> = [
   ['a malformed ID', MALFORMED_ID],
   ['an empty value', ''],
   ['a lower-case ID', 'c0nope001'],
@@ -1745,15 +1806,15 @@ const FUNGIBLE_OTHER_TARGETS: ReadonlyArray<readonly [label: string, target: str
   ['a D… ID with trailing text', `${DM_CONV},${UNCONFIGURED}`],
 ]
 
-/** six targets plus a `W…` user ID and the other refused shapes, in fungible mode. */
-const FUNGIBLE_SCOPE_ROWS: readonly ScopeRow[] = [
+/** six targets plus a `W…` user ID and the other refused shapes, in open mode. */
+const OPEN_SCOPE_ROWS: readonly ScopeRow[] = [
   { label: 'a listed channel', target: A_ALL, expected: anyChannel },
   { label: 'an unlisted C… channel', target: UNCONFIGURED, expected: anyChannel },
   { label: 'a G… ID', target: GROUP_DM, expected: anyChannel },
   { label: 'a D… conversation', target: DM_CONV, expected: dmConversationOutcome, dmTarget: true },
   { label: 'a U… user ID', target: USER_U, expected: userIdOutcome, dmTarget: true },
   { label: 'a W… user ID', target: USER_W, expected: userIdOutcome, dmTarget: true },
-  ...FUNGIBLE_OTHER_TARGETS.map(([label, target]): ScopeRow => ({ label, target, expected: neitherChannelNorDm })),
+  ...OPEN_OTHER_TARGETS.map(([label, target]): ScopeRow => ({ label, target, expected: neitherChannelNorDm })),
 ]
 
 /** Each row × DMs off and on × `post` and `act`, in `mode`. */
@@ -1773,11 +1834,11 @@ function scopeCheck(persona: Persona, target: string, expected: ScopeExpected): 
 }
 
 // the table over mode × target × dm.enabled ×
-// action. Alpha Bot lists A_ALL and A_MENTIONS in both modes, so a fungible
+// action. Alpha Bot lists A_ALL and A_MENTIONS in both modes, so an open-mode
 // row's outcome shows the persona's list is not what decides there. Every
 // refusal is checked by its full message.
 describe('checkPersonaTarget per channel mode', () => {
-  test.each([...scopeCases('declarative', DECLARATIVE_SCOPE_ROWS), ...scopeCases('fungible', FUNGIBLE_SCOPE_ROWS)])(
+  test.each([...scopeCases('strict', STRICT_SCOPE_ROWS), ...scopeCases('open', OPEN_SCOPE_ROWS)])(
     '$mode: $label, DMs $dmsLabel, $action',
     ({ mode, target, dms, action, expected, dmTarget }) => {
       const persona = applyPersona(h.alpha, dms)
@@ -1785,32 +1846,32 @@ describe('checkPersonaTarget per channel mode', () => {
       const check = checkPersonaTarget(persona, target, action, mode)
 
       expect(check).toEqual(scopeCheck(persona, target, expected(dms, action)))
-      if (dmTarget && mode === 'fungible') expect(check).toEqual(checkPersonaTarget(persona, target, action, 'declarative'))
+      if (dmTarget && mode === 'open') expect(check).toEqual(checkPersonaTarget(persona, target, action, 'strict'))
     },
   )
 
-  // gives the fungible refusal's content, not its text: it says
+  // gives the open-mode refusal's content, not its text: it says
   // the target is neither a channel ID nor an allowed DM target. `refusal`
   // pins the persona and the target around it.
-  test('the fungible refusal says the target is neither a channel ID nor an allowed DM target', () => {
+  test('the open-mode refusal says the target is neither a channel ID nor an allowed DM target', () => {
     expect(FUNGIBLE_TARGET_REFUSAL).toContain('neither a channel ID')
     expect(FUNGIBLE_TARGET_REFUSAL).toContain('nor an allowed DM target')
   })
 })
 
-// the five Slack tools of a fungible-mode
+// the five Slack tools of an open-mode
 // persona, through the MCP server.
-describe('tool posting scope in fungible mode (through the MCP server)', () => {
+describe('tool posting scope in open mode (through the MCP server)', () => {
   const ACT_TOOLS = TOOLS.filter((t) => t !== 'reply')
 
   beforeEach(() => {
-    h.mode = 'fungible'
+    h.mode = 'open'
   })
 
   test.each(TOOLS.flatMap((tool) => [UNCONFIGURED, GROUP_DM].map((target) => [tool, target] as const)))(
     "%s to the unlisted %s passes and lands on the persona's own client only",
     async (tool, target) => {
-      applyFungibleAlpha(false)
+      applyOpenAlpha(false)
       const session = await openModeSession(h.alpha)
 
       const result = await session.call(tool, TOOL_ARGS[tool](target))
@@ -1825,7 +1886,7 @@ describe('tool posting scope in fungible mode (through the MCP server)', () => {
 
   test.each([
     ...TOOLS.flatMap((tool) =>
-      FUNGIBLE_OTHER_TARGETS.map(([label, target]) => ({ tool, label, target, dms: true, why: FUNGIBLE_TARGET_REFUSAL as string })),
+      OPEN_OTHER_TARGETS.map(([label, target]) => ({ tool, label, target, dms: true, why: FUNGIBLE_TARGET_REFUSAL as string })),
     ),
     ...TOOLS.flatMap((tool) => [
       { tool, label: 'a D… conversation, DMs off', target: DM_CONV, dms: false, why: WHY.dmsOff as string },
@@ -1833,7 +1894,7 @@ describe('tool posting scope in fungible mode (through the MCP server)', () => {
     ]),
     ...ACT_TOOLS.map((tool) => ({ tool, label: 'a W… user ID, DMs on', target: USER_W, dms: true, why: WHY.userId as string })),
   ])('$tool to $label is refused with a tool error naming persona and target, and no Slack call on any stub', async ({ tool, target, dms, why }) => {
-    const persona = applyFungibleAlpha(dms)
+    const persona = applyOpenAlpha(dms)
     const session = await openModeSession(h.alpha)
 
     const result = await session.call(tool, TOOL_ARGS[tool](target))
@@ -1844,7 +1905,7 @@ describe('tool posting scope in fungible mode (through the MCP server)', () => {
   })
 
   test("a reply to a user ID with DMs on opens the DM on the persona's own client, then posts to the opened conversation", async () => {
-    applyFungibleAlpha(true)
+    applyOpenAlpha(true)
     stubOf(h.alpha).script.open.push(openedDm(OPENED_DM))
     const session = await openModeSession(h.alpha)
 
@@ -1860,12 +1921,12 @@ describe('tool posting scope in fungible mode (through the MCP server)', () => {
 })
 
 // the mode is read at each call, with
-// the persona, and an absent reader is declarative mode.
+// the persona, and an absent reader is strict mode.
 describe('the channel mode at each call', () => {
   test('flipping the mode between calls to the same unlisted channel flips the outcome', async () => {
     const session = await openModeSession(h.alpha)
     const outcomes: Array<[boolean | undefined, string]> = []
-    for (const mode of ['declarative', 'fungible', 'declarative'] as const) {
+    for (const mode of ['strict', 'open', 'strict'] as const) {
       h.mode = mode
       const result = await session.call('reply', TOOL_ARGS.reply(UNCONFIGURED))
       outcomes.push([result.isError, result.isError ? result.content[0]!.text : ''])
@@ -1879,9 +1940,9 @@ describe('the channel mode at each call', () => {
     expect(stubOf(h.alpha).calls.postMessage.map((c) => c.channel)).toEqual([UNCONFIGURED])
   })
 
-  test('a deps object with no mode reader decides as declarative mode, even for a persona in fungible shape', async () => {
-    const persona = applyFungibleAlpha(true)
-    h.mode = 'fungible'
+  test('a deps object with no mode reader decides as strict mode, even for a persona in the open-mode fixture shape', async () => {
+    const persona = applyOpenAlpha(true)
+    h.mode = 'open'
     expect(h.deps.getChannelMode).toBeUndefined()
     const session = await openPersonaSession(h.alpha)
 
@@ -1898,15 +1959,15 @@ describe('the channel mode at each call', () => {
 })
 
 // the scope check runs before the dry-run
-// branch in fungible mode too.
-describe('dry run in fungible mode (SLACK_DRY_RUN=1)', () => {
+// branch in open mode too.
+describe('dry run in open mode (SLACK_DRY_RUN=1)', () => {
   beforeEach(() => {
     process.env['SLACK_DRY_RUN'] = '1'
-    h.mode = 'fungible'
+    h.mode = 'open'
   })
 
   test.each(TOOLS)('%s to an unlisted channel returns the dry-run result with no Slack call', async (tool) => {
-    applyFungibleAlpha(false)
+    applyOpenAlpha(false)
     const session = await openModeSession(h.alpha)
 
     const result = await session.call(tool, TOOL_ARGS[tool](UNCONFIGURED))
@@ -1916,10 +1977,10 @@ describe('dry run in fungible mode (SLACK_DRY_RUN=1)', () => {
     expectNoSlackCall()
   })
 
-  test.each(TOOLS.flatMap((tool) => FUNGIBLE_OTHER_TARGETS.map(([label, target]) => [tool, label, target] as const)))(
-    '%s to %s gets the fungible refusal, not the dry-run result, and no Slack call',
+  test.each(TOOLS.flatMap((tool) => OPEN_OTHER_TARGETS.map(([label, target]) => [tool, label, target] as const)))(
+    '%s to %s gets the open-mode refusal, not the dry-run result, and no Slack call',
     async (tool, _label, target) => {
-      const persona = applyFungibleAlpha(true)
+      const persona = applyOpenAlpha(true)
       const session = await openModeSession(h.alpha)
 
       const result = await session.call(tool, TOOL_ARGS[tool](target))
@@ -1931,94 +1992,41 @@ describe('dry run in fungible mode (SLACK_DRY_RUN=1)', () => {
   )
 })
 
-// in fungible mode the outbound
-// outcome never depends on the declarative section (`channels`, the top-level
-// `permission_prompts`), even one holding a D… conversation or a malformed
-// value, which declarative mode would allow as listed channels.
-describe('fungible mode never reads the declarative section on the outbound path', () => {
-  /** A declarative section beside the fungible one: a listed channel, a D… conversation and a malformed value. */
-  const DECLARATIVE_SECTION: ChannelEntry[] = [
-    { id: A_ALL, delivery: 'all' },
-    { id: DM_CONV, delivery: 'all' },
-    { id: MALFORMED_ID, delivery: 'mentions' },
-  ]
-
-  /** Every fungible-row target × DMs off and on × `post` and `act`, as fungible mode decides it for `persona`. */
-  function fungibleOutcomes(persona: Persona): Record<string, PersonaTargetCheck> {
-    return Object.fromEntries(
-      scopeCases('fungible', FUNGIBLE_SCOPE_ROWS).map(({ label, target, dms, dmsLabel, action }) => [
-        `${label}, DMs ${dmsLabel}, ${action}`,
-        checkPersonaTarget({ ...persona, dm: { ...persona.dm, enabled: dms } }, target, action, 'fungible'),
-      ]),
-    )
-  }
-
-  /** `persona` applied as Alpha Bot; replies to an unlisted channel, the section's D… entry and its malformed entry. */
-  async function replyOutcomes(persona: Persona): Promise<Array<[boolean | undefined, string]>> {
-    h.personas.set(persona.key, persona)
-    const session = await openModeSession(h.alpha)
-    const results: Array<[boolean | undefined, string]> = []
-    for (const target of [UNCONFIGURED, DM_CONV, MALFORMED_ID]) {
-      const result = await session.call('reply', TOOL_ARGS.reply(target))
-      results.push([result.isError, result.isError ? result.content[0]!.text : ''])
+describe('shared configuration on the outbound path', () => {
+  test.each(['strict', 'open'] as const)('%s loads the same valid list and rejects malformed shared values', mode => {
+    const home = join(h.dir, 'home')
+    mkdirSync(home, { recursive: true })
+    const clean = makePersona({ name: h.alpha.name }, h.dir)
+    const load = (label: string, persona: unknown) => {
+      const dir = join(h.dir, mode + label)
+      mkdirSync(dir)
+      return loadPersonaConfig(writeConfigFile(dir, { channel_mode: mode, personas: [persona] }), home)
     }
-    return results
-  }
-
-  test('a resolved persona whose channels hold a listed channel, a D… conversation and a malformed value is decided as one with no channels', async () => {
-    const withSection = applyFungibleAlpha(false, { channels: DECLARATIVE_SECTION, permission_prompts: MALFORMED_ID })
-    const without = applyFungibleAlpha(false)
-    expect(withSection.channels).toEqual(DECLARATIVE_SECTION)
-    expect(without.channels).toEqual([])
-
-    expect(fungibleOutcomes(withSection)).toEqual(fungibleOutcomes(without))
-
-    h.mode = 'fungible'
-    const expected: Array<[boolean | undefined, string]> = [
-      [undefined, ''],
-      [true, refusal(without, DM_CONV, WHY.dmsOff)],
-      [true, refusal(without, MALFORMED_ID, FUNGIBLE_TARGET_REFUSAL)],
-    ]
-    expect(await replyOutcomes(withSection)).toEqual(expected)
-    expect(await replyOutcomes(without)).toEqual(expected)
-    // In declarative mode the same persona's section is read: its D… and
-    // malformed entries are listed channels there.
-    h.mode = 'declarative'
-    expect((await replyOutcomes(withSection)).map(([isError]) => isError)).toEqual([true, undefined, undefined])
+    const resolved = load('valid', clean).personas[0]!
+    expect(resolved.channels).toEqual(clean.channels!)
+    expect(resolved.permission_prompts).toBe(clean.permission_prompts!)
+    for (const [label, change] of [
+      ['channels', { channels: [{ id: A_ALL, delivery: 'sometimes' }] }],
+      ['destination', { permission_prompts: 42 }],
+      ['removed', { invited: { permission_prompts: 'dm' } }],
+    ] as const) expect(() => load(label, { ...clean, ...change })).toThrow()
   })
 
-  test('a configuration whose channels and top-level permission_prompts are malformed loads in fungible mode through the real loader, and its outbound outcomes are those of a persona with no declarative section', async () => {
-    const home = join(h.dir, 'home')
-    mkdirSync(home)
-    const load = (name: string, persona: unknown) => {
-      const dir = join(h.dir, name)
-      mkdirSync(dir)
-      return loadPersonaConfig(writeConfigFile(dir, { allow_invited_channels: true, personas: [persona] }), home)
+  test('open mode permits an unlisted valid channel without permitting malformed or disabled DM targets', async () => {
+    const persona = applyOpenAlpha(false)
+    h.mode = 'open'
+    const session = await openModeSession(persona)
+    const allowed = await session.call('reply', TOOL_ARGS.reply(UNCONFIGURED))
+    expect(allowed.isError).toBeUndefined()
+    for (const target of [DM_CONV, MALFORMED_ID]) {
+      const before = stubOf(persona).calls.postMessage.length
+      expect((await session.call('reply', TOOL_ARGS.reply(target))).isError).toBe(true)
+      expect(stubOf(persona).calls.postMessage).toHaveLength(before)
     }
-    const clean = makeFungiblePersona({ name: h.alpha.name }, h.dir)
-    const malformedChannels = [{ id: DM_CONV, delivery: 'sometimes' }, 'not-an-entry', { id: 42 }]
-    const malformed = load('malformed', { ...clean, channels: malformedChannels, permission_prompts: 42 })
-    const plain = load('plain', clean)
-    expect(channelModeOf(malformed)).toBe('fungible')
-    const withSection = malformed.personas[0]!
-    const without = plain.personas[0]!
-    expect(withSection.key).toBe(h.alpha.key)
-    // The malformed section reached the loader, as written, and resolved to none.
-    expect(withSection.sections.channels).toEqual(malformedChannels)
-    expect(withSection.sections.permission_prompts).toBe(42)
-    expect(withSection.channels).toEqual([])
-    expect(withSection.permission_prompts).toBeUndefined()
-
-    expect(fungibleOutcomes(withSection)).toEqual(fungibleOutcomes(without))
-
-    h.mode = 'fungible'
-    const expected: Array<[boolean | undefined, string]> = [
-      [undefined, ''],
-      [true, refusal(without, DM_CONV, WHY.dmsOff)],
-      [true, refusal(without, MALFORMED_ID, FUNGIBLE_TARGET_REFUSAL)],
-    ]
-    expect(await replyOutcomes(withSection)).toEqual(expected)
-    expect(await replyOutcomes(without)).toEqual(expected)
+    h.mode = 'strict'
+    const strict = await session.call('reply', TOOL_ARGS.reply(UNCONFIGURED))
+    expect(strict.isError).toBe(true)
+    expect(strict.content[0]!.text).toContain(UNCONFIGURED)
   })
 })
 
@@ -2027,6 +2035,55 @@ describe('fungible mode never reads the declarative section on the outbound path
 // ---------------------------------------------------------------------------
 
 describe('call-time resolution', () => {
+  test.each(TOOLS.flatMap(tool => (['strict', 'open'] as const).map(mode => [tool, mode] as const)))(
+    '%s in %s mode observes an affected-only unsynced choice through the same MCP session', async (tool, mode) => {
+      const input = { channel_mode: mode, personas: [h.alpha, h.beta].map(p => ({
+        name: p.name, credentials_file: p.credentials_file, working_directory: p.working_directory,
+        channels: p.channels, permission_prompts: p.permission_prompts, dm: p.dm,
+      })) }
+      const authority = makeSharedAuthority(h.stateDir, input, { write: (path, bytes) => {
+        durableWriteFileSync(path, bytes)
+        throw new DurableWriteUnsyncedError(path, { code: 'EIO' })
+      } })
+      const choices = createChannelDeliveryStore(authority)
+      h.mode = mode
+      const deps = { ...h.modeDeps, getChannelDelivery: () => choices }
+      const entry = registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer())
+      entry.personaIncarnation = authority.incarnation(h.alpha.key)
+      const session = await openSession(entry, deps)
+      expect((await session.call(tool, TOOL_ARGS[tool](A_ALL))).isError).toBeUndefined()
+      const callsBefore = totalSlackCalls(), fetchesBefore = h.fetches.length
+      expect(_assignFixture(authority, h.alpha.key, authority.incarnation(h.alpha.key)!, A_ALL, 'off', authority.revision, fixtureThreadHybridSince(authority.snapshot())).kind).toBe('unresolved')
+      expect(choices.readableFor(h.alpha.key, A_ALL)).toBe(false)
+      expect(choices.readableFor(h.alpha.key, A_MENTIONS)).toBe(true)
+      expect(choices.readableFor(h.beta.key, B_CHANNEL)).toBe(true)
+      for (const dryRun of [false, true]) {
+        if (dryRun) process.env['SLACK_DRY_RUN'] = '1'
+        const result = await session.call(tool, TOOL_ARGS[tool](A_ALL))
+        if (mode === 'strict') {
+          expect(result.isError).toBe(true)
+          expect(result.content[0]!.text).toBe(CHANNEL_TARGET_STATE_UNRESOLVED)
+          if (tool === 'fetch_messages') {
+            expect(await session.call(tool, { channel: A_ALL, thread_ts: MSG_TS, cursor: 'unused-cursor' })).toEqual(result)
+          }
+          expect(totalSlackCalls()).toBe(callsBefore); expect(h.fetches).toHaveLength(fetchesBefore)
+        } else {
+          expect(result.isError).toBeUndefined()
+          if (dryRun) expect(result.content[0]!.text).toStartWith('[dry-run]')
+        }
+      }
+      delete process.env['SLACK_DRY_RUN']
+      // Unchanged choice and sibling remain usable despite the same uncertain
+      // authority revision. This also guards against a global outage shortcut.
+      expect((await session.call(tool, TOOL_ARGS[tool](A_MENTIONS))).isError).toBeUndefined()
+      const siblingEntry = registerSession(h.beta.working_directory, h.beta.key, makeTransport(), makeServer())
+      siblingEntry.personaIncarnation = authority.incarnation(h.beta.key)
+      const sibling = await openSession(siblingEntry, deps)
+      expect((await sibling.call(tool, TOOL_ARGS[tool](B_CHANNEL))).isError).toBeUndefined()
+      expect(stubOf(h.beta).calls[TOOL_CAPTURE[tool]]).toHaveLength(1)
+    },
+  )
+
   test("swapping A's client between calls sends the second call through the new client", async () => {
     const session = await openPersonaSession(h.alpha)
     const first = stubOf(h.alpha)
@@ -2109,14 +2166,14 @@ describe('Slack call failures', () => {
   })
 })
 
-// in fungible mode Slack enforces membership, so
+// in open mode Slack enforces membership, so
 // its refusal of a call on a channel target reaches the persona as a tool
 // error naming the tool, the persona, the channel and Slack's code, built by
-// `slackRefusalToolErrorText`. DM targets in either mode, and declarative
-// mode, keep the declarative text (pinned by "Slack call failures" and "DM targets"
+// `slackRefusalToolErrorText`. DM targets in either mode, and strict
+// mode, keep the strict-mode text (pinned by "Slack call failures" and "DM targets"
 // above, whose sessions bind no mode reader). Every scripted failure carries
 // the leak marker (Alpha's stub is built with it).
-describe("Slack's refusals as tool errors in fungible mode", () => {
+describe("Slack's refusals as tool errors in open mode", () => {
   /** The stub's script queue each tool's one Slack call takes. */
   const TOOL_QUEUE: Record<ToolName, keyof StubSlackScript> = {
     reply: 'post',
@@ -2150,13 +2207,13 @@ describe("Slack's refusals as tool errors in fungible mode", () => {
   }
 
   beforeEach(() => {
-    h.mode = 'fungible'
+    h.mode = 'open'
   })
 
   test.each(TOOLS.flatMap((tool) => CODES.map((code) => [tool, code] as const)))(
     '%s on an unlisted channel Slack refuses with %s → the builder\'s tool error naming the persona, the channel and the code; token-safe',
     async (tool, code) => {
-      const persona = applyFungibleAlpha(false)
+      const persona = applyOpenAlpha(false)
       const outcome: WebApiOutcome = { kind: 'platform', error: code }
       stubOf(h.alpha).script[TOOL_QUEUE[tool]].push(outcome)
       const session = await openModeSession(h.alpha)
@@ -2181,7 +2238,7 @@ describe("Slack's refusals as tool errors in fungible mode", () => {
   test.each(TOOLS)(
     '%s on an unlisted channel whose call fails with no platform code (network) → the builder\'s no-code form, naming the persona and the channel and no code',
     async (tool) => {
-      const persona = applyFungibleAlpha(false)
+      const persona = applyOpenAlpha(false)
       const outcome: WebApiOutcome = { kind: 'network' }
       stubOf(h.alpha).script[TOOL_QUEUE[tool]].push(outcome)
       const session = await openModeSession(h.alpha)
@@ -2232,23 +2289,23 @@ describe("Slack's refusals as tool errors in fungible mode", () => {
     ['a user ID whose post fails after the open', USER_U, [openedDm(OPENED_DM)]],
     ['a D… conversation', DM_CONV, []],
   ])('a reply to %s fails with the DM failure text a session with no mode reader gets', async (_label, target, open) => {
-    const persona = applyFungibleAlpha(true)
+    const persona = applyOpenAlpha(true)
 
     const unbound = await failedReply(h.deps, target, open)
-    const fungible = await failedReply(h.modeDeps, target, open)
+    const openResult = await failedReply(h.modeDeps, target, open)
 
-    expect(fungible.result.isError).toBe(true)
-    expect(fungible.leads).toHaveLength(1)
-    expect(fungible).toEqual(unbound)
-    expect(fungible.result.content[0]!.text).not.toBe(slackRefusalToolErrorText('reply', persona, target, 'not_in_channel'))
-    expect(fungible.result.content[0]!.text).toContain(JSON.stringify(target))
-    assertNoLeak({ unbound, fungible })
+    expect(openResult.result.isError).toBe(true)
+    expect(openResult.leads).toHaveLength(1)
+    expect(openResult).toEqual(unbound)
+    expect(openResult.result.content[0]!.text).not.toBe(slackRefusalToolErrorText('reply', persona, target, 'not_in_channel'))
+    expect(openResult.result.content[0]!.text).toContain(JSON.stringify(target))
+    assertNoLeak({ unbound, openResult })
   })
 
   test.each(TOOLS)(
-    "declarative mode with the reader bound: %s on a listed channel Slack refuses keeps the text a session with no mode reader gets",
+    "strict mode with the reader bound: %s on a listed channel Slack refuses keeps the text a session with no mode reader gets",
     async (tool) => {
-      h.mode = 'declarative'
+      h.mode = 'strict'
       const run = async (deps: SessionToolDeps) => {
         stubOf(h.alpha).script[TOOL_QUEUE[tool]].push({ kind: 'platform', error: 'not_in_channel' })
         const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), deps)
@@ -2505,35 +2562,239 @@ describe('download_attachment', () => {
 // ---------------------------------------------------------------------------
 
 describe('fetch_messages', () => {
-  const M1 = { ts: '1700000000.000100', user: 'U1', text: 'first' }
-  const M2 = { ts: '1700000000.000200', user: 'U2', text: 'second' }
-
-  test.each<[string, Record<string, unknown>, 'history' | 'replies', typeof M1[], 'conversationsHistory' | 'conversationsReplies', Record<string, unknown>]>([
-    ['conversations.history (newest first, returned oldest first)', {}, 'history', [M2, M1], 'conversationsHistory', { channel: A_ALL, limit: 20 }],
-    ['conversations.replies for thread_ts', { thread_ts: MSG_TS }, 'replies', [M1, M2], 'conversationsReplies', { channel: A_ALL, ts: MSG_TS, limit: 20 }],
-  ])("%s: names resolved through A's persona key", async (_label, extra, queue, messages, capture, callArgs) => {
-    stubOf(h.alpha).script[queue].push({ kind: 'ok', result: { messages } })
+  /** Real shared authority; fixture choices use the durable transaction helper. */
+  async function reader(mode: ChannelMode = 'strict', options: StubSlackOptions = {}) {
+    const input = { channel_mode: mode, personas: [h.alpha, h.beta].map(p => ({
+      name: p.name, credentials_file: p.credentials_file, working_directory: p.working_directory,
+      channels: p.channels, permission_prompts: p.permission_prompts, dm: p.dm,
+    })) }
+    let failWrite = false
+    const authority = makeSharedAuthority(h.stateDir, input, { write: (path, bytes) => {
+      durableWriteFileSync(path, bytes)
+      if (failWrite) throw new DurableWriteUnsyncedError(path, { code: 'EIO' })
+    } })
+    fetchAuthorityFiles.push(authority.path)
+    const choices = createChannelDeliveryStore(authority)
+    let storeAvailable = true
+    const mint = fixtureThreadHybridSince(authority.snapshot())
+    const _fixtureChoice = (delivery: ChannelEntry['delivery']) => _assignFixture(authority,
+      h.alpha.key, authority.incarnation(h.alpha.key)!, A_ALL, delivery, authority.revision, mint,
+    )
+    expect(_fixtureChoice('thread_hybrid').kind).toBe('applied')
+    const stub = makeStubSlack({ token: h.alphaToken, leakMarker: LEAK_SENTINEL, ...options })
+    h.clients.set(h.alpha.key, stub)
+    const web = stub.createWebClient(h.alphaToken, longLivedWebClientOptions())
     const resolved: Array<[string, string]> = []
-    const deps: SessionToolDeps = {
-      ...h.deps,
-      resolveUserName: async (key, userId) => {
-        resolved.push([key, userId])
-        return `name-${userId}`
-      },
+    h.mode = mode
+    const deps: SessionToolDeps = { ...h.modeDeps, getChannelDelivery: () => storeAvailable ? choices : undefined,
+      clientFor: key => key === h.alpha.key ? asWebClient(web) : h.deps.clientFor(key),
+      resolveUserName: async (key, user) => { resolved.push([key, user]); return `name-${user}` },
     }
-    const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), deps)
+    const entry = registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer())
+    entry.personaIncarnation = authority.incarnation(h.alpha.key)
+    const session = await openSession(entry, deps)
+    return { session, stub, resolved, choices, _fixtureChoice, withoutStore: () => { storeAvailable = false }, makeUnreadable: () => {
+      failWrite = true
+      expect(_fixtureChoice('off').kind).toBe('unresolved')
+      expect(choices.readableFor(h.alpha.key, A_ALL)).toBe(false)
+    } }
+  }
 
-    const result = await session.call('fetch_messages', { channel: A_ALL, ...extra })
+  function formatted(thread: ReturnType<typeof makePagedThread>) {
+    return thread.messages.map(m => ({ ts: m.ts, user: `name-${m.user}`, user_id: m.user,
+      text: m.text, thread_ts: m.thread_ts,
+      files: m.files.map(({ name, mimetype, size }) => ({ name, mimetype, size })),
+    }))
+  }
 
-    expect(result.isError).toBeUndefined()
-    expect(JSON.parse(result.content[0]!.text)).toEqual([
-      { ts: M1.ts, user: 'name-U1', user_id: 'U1', text: 'first' },
-      { ts: M2.ts, user: 'name-U2', user_id: 'U2', text: 'second' },
+  test.each([false, true].flatMap(repeatRoot => [
+    { label: 'default', limit: undefined, effective: 20 },
+    { label: 'explicit', limit: 7, effective: 7 },
+    { label: 'minimum', limit: 1, effective: 1 },
+    { label: 'two', limit: 2, effective: 2 },
+    { label: 'maximum', limit: 100, effective: 100 },
+    { label: 'capped', limit: 150, effective: 100 },
+  ].map(row => ({ ...row, repeatRoot }))))(
+    'whole thread, repeated root=$repeatRoot, $label limit: every reply and cursor survives',
+    async ({ repeatRoot, limit, effective }) => {
+      const thread = makePagedThread(107, { repeatRoot })
+      const { session, stub, resolved } = await reader('strict', { repliesResponder: thread.respond })
+      const collected: unknown[] = []
+      let cursor: string | undefined
+      for (let page = 0; page < 2 * thread.messages.length; page++) {
+        const result = await session.call('fetch_messages', { channel: A_ALL, thread_ts: thread.rootTs,
+          ...(limit === undefined ? {} : { limit }), ...(cursor === undefined ? {} : { cursor }) })
+        expect(result.isError).toBeUndefined()
+        expect(result.content).toEqual([{ type: 'text', text: expect.any(String) }])
+        const body = JSON.parse(result.content[0]!.text)
+        expect(Object.keys(body).sort()).toEqual(body.next_cursor ? ['messages', 'next_cursor'] : ['messages'])
+        expect(body.messages.length).toBeLessThanOrEqual(effective)
+        if (page === 0) expect(body.messages[0].ts).toBe(thread.rootTs)
+        else expect(body.messages.some((m: { ts: string }) => m.ts === thread.rootTs)).toBe(false)
+        const slackPage = thread.responses[page]!
+        expect(body.next_cursor).toBe(slackPage.response_metadata?.next_cursor || undefined)
+        expect(stub.calls.conversationsReplies[page]).toEqual({ channel: A_ALL, ts: thread.rootTs, limit: effective,
+          ...(cursor === undefined ? {} : { cursor }) })
+        collected.push(...body.messages)
+        cursor = body.next_cursor
+        if (!cursor) break
+      }
+      expect(cursor).toBeUndefined()
+      expect(collected).toEqual(formatted(thread))
+      expect(resolved).toEqual(thread.messages.map(m => [h.alpha.key, m.user]))
+      expect(stub.callLog.map(c => c.method)).toEqual(thread.responses.map(() => 'conversations.replies'))
+      expect(stubOf(h.beta).callLog).toEqual([])
+    },
+  )
+
+  test.each([false, true])('short pages with repeated root=%s wait for a held later page and continue even after a root-only page', async repeatRoot => {
+    const thread = makePagedThread(8, { repeatRoot, pageSizes: [2, 1, 2] })
+    const held = makeDeferredWebApiCall(), reached = Promise.withResolvers<void>()
+    const { session } = await reader('open', { repliesResponder: args => {
+      if (args.cursor && thread.responses.length === 1) { reached.resolve(); return held.outcome }
+      return thread.respond(args)
+    } })
+    const collected: unknown[] = []
+    let cursor: string | undefined
+    const lengths: number[] = []
+    do {
+      expect(lengths.length).toBeLessThan(10)
+      let settled = false
+      const pending = session.call('fetch_messages', { channel: A_ALL, thread_ts: thread.rootTs,
+        ...(cursor ? { cursor } : {}) }).then(result => { settled = true; return result })
+      if (lengths.length === 1) {
+        try {
+          await Promise.race([reached.promise, pending])
+          expect(settled).toBe(false)
+        } finally {
+          held.settle(thread.respond({ channel: A_ALL, ts: thread.rootTs, cursor }))
+          await pending
+        }
+      }
+      const result = await pending
+      expect(result.isError).toBeUndefined()
+      const body = JSON.parse(result.content[0]!.text)
+      lengths.push(body.messages.length)
+      collected.push(...body.messages)
+      expect(body.next_cursor).toBe(thread.responses.at(-1)!.response_metadata?.next_cursor || undefined)
+      cursor = body.next_cursor
+      if (lengths.length <= 3) expect(typeof cursor).toBe('string')
+    } while (cursor)
+    expect(lengths.slice(0, 3)).toEqual(repeatRoot ? [2, 0, 1] : [2, 1, 2])
+    expect(collected).toEqual(formatted(thread))
+  })
+
+  test.each(['empty', 'absent'] as const)('one page, %s Slack final cursor; absent and empty input both use the original request', async finalCursor => {
+    const thread = makePagedThread(3, { finalCursor })
+    const { session, stub } = await reader('strict', { repliesResponder: thread.respond })
+    for (const extra of [{}, { cursor: '' }]) {
+      const result = await session.call('fetch_messages', { channel: A_ALL, thread_ts: thread.rootTs, ...extra })
+      expect(result.isError).toBeUndefined()
+      expect(JSON.parse(result.content[0]!.text)).toEqual({ messages: formatted(thread) })
+    }
+    expect(stub.calls.conversationsReplies).toEqual(Array(2).fill({ channel: A_ALL, ts: thread.rootTs, limit: 20 }))
+  })
+
+  // Extend the old history/replies table with every non-paged scope. Comparing
+  // both calls preserves strict-mode refusals as well as successful bare arrays.
+  test.each((['strict', 'open'] as const).flatMap(mode =>
+    (['off', 'mentions', 'all', 'DM', 'history', 'missing', 'no store', 'unreadable', 'changed'] as const)
+      .map(scope => ({ mode, scope }))))('$mode / $scope ignores cursor and preserves legacy calls/results', async ({ mode, scope }) => {
+    const thread = makePagedThread(3)
+    const { session, stub, resolved, _fixtureChoice, withoutStore, makeUnreadable } = await reader(mode, { repliesResponder: thread.respond })
+    let channel = A_ALL
+    let queue: 'history' | 'replies' = 'replies'
+    let cursor: unknown = { ignored: 'non-string-legacy-cursor' }
+    if (scope === 'changed') {
+      const first = await session.call('fetch_messages', { channel, thread_ts: thread.rootTs, limit: 1 })
+      cursor = JSON.parse(first.content[0]!.text).next_cursor
+      expect(typeof cursor).toBe('string')
+      expect(_fixtureChoice('mentions').kind).toBe('applied')
+    } else if (scope === 'off' || scope === 'mentions' || scope === 'all') expect(_fixtureChoice(scope).kind).toBe('applied')
+    else if (scope === 'DM') { applyPersona(h.alpha, true); channel = 'D0DIRECT1' }
+    else if (scope === 'history') queue = 'history'
+    else if (scope === 'missing') channel = UNCONFIGURED
+    else if (scope === 'unreadable') makeUnreadable()
+    else if (scope === 'no store') withoutStore()
+    const args = { channel, ...(queue === 'replies' ? { thread_ts: thread.rootTs } : {}) }
+    const callStart = stub.callLog.length
+    const resolutionStart = resolved.length
+    stub.script[queue].push(thread.legacyOutcome(queue), thread.legacyOutcome(queue))
+    const original = await session.call('fetch_messages', args)
+    const withCursor = await session.call('fetch_messages', { ...args, cursor })
+    expect(withCursor).toEqual(original)
+    if (mode === 'strict' && ['missing', 'unreadable'].includes(scope)) {
+      expect(original.isError).toBe(true)
+      expect(stub.callLog.length).toBe(callStart)
+    } else {
+      expect(original.isError).toBeUndefined()
+      expect(JSON.parse(original.content[0]!.text)).toEqual(formatted(thread))
+      expect(stub.callLog.slice(callStart)).toEqual(Array(2).fill({ method: `conversations.${queue}`,
+        args: { channel, limit: 20, ...(queue === 'replies' ? { ts: thread.rootTs } : {}) } }))
+      expect(resolved.slice(resolutionStart)).toEqual(Array(2).fill(thread.messages.map(m => [h.alpha.key, m.user])).flat())
+    }
+  })
+
+  test.each((['strict', 'open'] as const).flatMap(mode =>
+    (['off', 'mentions', 'all'] as const).map(delivery => ({ mode, delivery }))))(
+    '$mode / $delivery long legacy thread stops at the first page despite Slack continuation', async ({ mode, delivery }) => {
+      const thread = makePagedThread(107)
+      const { session, stub, _fixtureChoice, resolved } = await reader(mode, { repliesResponder: thread.respond })
+      expect(_fixtureChoice(delivery).kind).toBe('applied')
+      const args = { channel: A_ALL, thread_ts: thread.rootTs }
+      const original = await session.call('fetch_messages', args)
+      expect(original.isError).toBeUndefined()
+      expect(JSON.parse(original.content[0]!.text)).toEqual(formatted(thread).slice(0, 20))
+      expect(stub.calls.conversationsReplies).toEqual([{ channel: A_ALL, ts: thread.rootTs, limit: 20 }])
+      const cursor = thread.responses[0]!.response_metadata!.next_cursor
+      expect(typeof cursor).toBe('string')
+      expect(cursor!.length).toBeGreaterThan(0)
+
+      const withCursor = await session.call('fetch_messages', { ...args, cursor })
+      expect(withCursor).toEqual(original)
+      expect(stub.callLog).toEqual(Array(2).fill({ method: 'conversations.replies',
+        args: { channel: A_ALL, ts: thread.rootTs, limit: 20 } }))
+      expect(thread.responses).toHaveLength(2)
+      expect(thread.responses[1]!.response_metadata!.next_cursor).toBe(cursor)
+      expect(resolved).toEqual(Array(2).fill(thread.messages.slice(0, 20).map(m => [h.alpha.key, m.user])).flat())
+    },
+  )
+
+  test.each(['strict', 'open'] as const)('%s invalid_cursor preserves mode-specific errors and logs without disclosing the cursor or error payload', async mode => {
+    const cursor = 'private-cursor-never-echo-this'
+    const { session, stub } = await reader(mode, { replies: [{ kind: 'platform', error: 'invalid_cursor' }] })
+    const result = await session.call('fetch_messages', { channel: A_ALL, thread_ts: MSG_TS, cursor })
+    const failedFor = `Tool "fetch_messages" failed for persona ${renderPersonaRef(h.alpha.name, h.alpha.key)}`
+    expect(result).toEqual({ isError: true, content: [{ type: 'text', text: mode === 'open'
+      ? slackRefusalToolErrorText('fetch_messages', h.alpha, A_ALL, 'invalid_cursor')
+      : `${failedFor}: the tool call failed (invalid_cursor).` }] })
+    const logPrefix = `[slack] ${failedFor}${mode === 'open' ? ` on channel ${JSON.stringify(A_ALL)}` : ''}: `
+    // Stack frames vary by call site; pin the diagnostic before its stack.
+    expect(h.lines.filter(line => line.startsWith(`[slack] ${failedFor}`)).map(line => line.split(' at ')[0])).toEqual([
+      logPrefix + describeThrownValue(slackPlatformError('invalid_cursor', undefined, LEAK_SENTINEL)).split(' at ')[0],
     ])
-    expect(resolved).toEqual([[h.alpha.key, 'U1'], [h.alpha.key, 'U2']])
-    const calls = stubOf(h.alpha).calls
-    expect(calls[capture]).toEqual([callArgs] as any)
-    expect(calls.conversationsHistory.length + calls.conversationsReplies.length).toBe(1)
+    expect(JSON.stringify({ result, lines: h.lines })).not.toContain(cursor)
+    expect(stub.calls.conversationsReplies).toEqual([{ channel: A_ALL, ts: MSG_TS, limit: 20, cursor }])
+    expect(stub.options.web.at(-1)!.options!.attachOriginalToWebAPIRequestError).toBe(false)
+    assertNoLeak({ result, lines: h.lines })
+  })
+
+  test.each([123, null, { value: LEAK_SENTINEL }, [LEAK_SENTINEL]].map(cursor => ({ cursor })))('non-string cursor %# is refused without echo or Slack call', async ({ cursor }) => {
+    const { session } = await reader()
+    const result = await session.call('fetch_messages', { channel: A_ALL, thread_ts: MSG_TS, cursor })
+    expect(result).toEqual({ isError: true, content: [{ type: 'text', text: fetchMessagesCursorRefusal() }] })
+    expectNoSlackCall()
+    assertNoLeak({ result, lines: h.lines })
+  })
+
+  test.each(['strict', 'open'] as const)('%s dry-run in thread_hybrid ignores cursor before any Slack call', async mode => {
+    const { session } = await reader(mode)
+    process.env['SLACK_DRY_RUN'] = '1'
+    const original = await session.call('fetch_messages', { channel: A_ALL, thread_ts: MSG_TS })
+    const paged = await session.call('fetch_messages', { channel: A_ALL, thread_ts: MSG_TS, cursor: 'unused' })
+    expect(paged).toEqual(original)
+    expect(paged.content[0]!.text).toBe(`[dry-run] Would fetch messages from ${A_ALL}`)
+    expectNoSlackCall()
   })
 })
 
@@ -2747,6 +3008,838 @@ function recordPostedTs(p: Persona): (string | undefined)[] {
 }
 
 // ---------------------------------------------------------------------------
+// reply files: each nested upload completion observed on the persona's client
+// ---------------------------------------------------------------------------
+
+type OwnPostRecording = ReturnType<typeof makeRecordingOwnPostObserver>
+
+function expectOwnPostPairs(recording: OwnPostRecording, count: number) {
+  const starts = recording.calls.filter(c => c.kind === 'start')
+  const ends = recording.calls.filter(c => c.kind === 'end')
+  expect(starts).toHaveLength(count)
+  expect(ends).toHaveLength(count)
+  expect(new Set(starts.map(c => c.operation)).size).toBe(count)
+  for (const start of starts) {
+    expect(start.operation).toBeDefined()
+    expect(ends.filter(c => c.operation === start.operation)).toHaveLength(1)
+  }
+}
+
+function fileEndAnswers(recording: OwnPostRecording) {
+  const operations = recording.calls.filter(c => c.kind === 'start' && c.surface === 'file').map(c => c.operation)
+  return recording.calls.filter(c => c.kind === 'end' && operations.includes(c.operation)).map(c => c.kind === 'end' && c.answer)
+}
+
+/** A `files.completeUploadExternal` answer for `id`, shared as a new root at `share` when given. */
+const completion = (id: string, channel = A_ALL, share?: string): SettledWebApiOutcome =>
+  ({ kind: 'ok', result: { files: [{ id, ...(share ? { shares: { public: { [channel]: [{ ts: share }] } } } : {}) }] } })
+
+describe('reply files: nested upload completions observed on the real client', () => {
+  const TEXT_TS = '1700000000.000300'
+  const SHARE_TS = '1700000000.000301'
+
+  /** The session deps with `ownPosts`, each persona's client handed out as the connection manager does: observed on the raw client, then wrapped by the auth watch. */
+  function observedDeps(ownPosts: OwnPostObserver, observed = true): SessionToolDeps {
+    if (observed) for (const stub of h.clients.values()) observeFileCompletions(stub.web)
+    return {
+      ...h.deps, ownPosts,
+      clientFor: (key) => {
+        const stub = h.clients.get(key)
+        return stub ? asWebClient(watchWebClientAuth(stub.web, () => {})) : undefined
+      },
+    }
+  }
+  const openWith = (p: Persona, deps: SessionToolDeps) => openSession(registerSession(p.working_directory, p.key, makeTransport(), makeServer()), deps)
+  function inboxFile(name: string): string {
+    const file = join(h.inboxDir, name)
+    writeFileSync(file, name)
+    return file
+  }
+  async function settleMicrotasks(done: () => boolean): Promise<void> {
+    for (let i = 0; i < 50 && !done(); i++) await new Promise((resolve) => setImmediate(resolve))
+    expect(done()).toBe(true)
+  }
+
+  test('a group completed before its aggregate rejected keeps its one confirmation, counts as uploaded and clears the ack once; the other group\'s failure reports the partial post and nothing is posted or completed again', async () => {
+    const recording = makeRecordingOwnPostObserver()
+    const ownPosts = recording.observer
+    const stub = stubOf(h.alpha)
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    stub.script.post.push({ kind: 'ok', result: { ts: TEXT_TS } })
+    stub.uploadGroups.push(2)
+    stub.script.completeUpload.push(completion('F0DONE0001', A_ALL, SHARE_TS), { kind: 'platform', error: 'file_upload_failed' })
+    const session = await openWith(h.alpha, observedDeps(ownPosts))
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: 'here', files: [inboxFile('one.txt'), inboxFile('two.txt')], message_id: MSG_TS })
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 1, total: 1, lastTs: TEXT_TS, uploaded: 1, files: 2 }, 'file_upload_failed'))
+    expect(fileEndAnswers(recording)).toEqual([
+      { kind: 'confirmed', channel: A_ALL, file: 'F0DONE0001' },
+      { kind: 'failed', code: 'file_upload_failed' },
+    ])
+    expectOwnPostPairs(recording, 3)
+    expect([stub.calls.postMessage.length, stub.calls.filesUploadV2.length, stub.calls.completeUploadExternal.length]).toEqual([1, 1, 2])
+    expect(stub.calls.reactionsRemove).toEqual([REMOVE_EYES])
+    expect(slackCallCount(stubOf(h.beta))).toBe(0)
+    assertNoLeak({ result, lines: h.lines })
+  })
+
+  test('a completion arriving after its aggregate rejected cannot end the operation twice', async () => {
+    const recording = makeRecordingOwnPostObserver()
+    const ownPosts = recording.observer
+    const stub = stubOf(h.alpha), late = makeDeferredWebApiCall()
+    stub.script.post.push({ kind: 'ok', result: { ts: TEXT_TS } })
+    stub.uploadGroups.push(2)
+    stub.script.completeUpload.push(late.outcome, { kind: 'platform', error: 'internal_error' })
+    const session = await openWith(h.alpha, observedDeps(ownPosts))
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: 'here', files: [inboxFile('one.txt')] })
+
+    expect(result.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 1, total: 1, lastTs: TEXT_TS, uploaded: 0, files: 1 }, 'internal_error'))
+    expect(fileEndAnswers(recording)).toEqual([{ kind: 'failed', code: 'internal_error' }])
+    late.settle(completion('F0LATE0001'))
+    await settleMicrotasks(() => stub.calls.completeUploadExternal.length === 2)
+    await new Promise(resolve => setImmediate(resolve))
+    expect(fileEndAnswers(recording)).toEqual([{ kind: 'failed', code: 'internal_error' }])
+    expectOwnPostPairs(recording, 2)
+    expect(stub.calls.filesUploadV2).toHaveLength(1)
+    assertNoLeak({ result, lines: h.lines })
+  })
+
+  test.each([['observed on the client', true], ['a client built without the observation (the aggregate fallback)', false]] as const)(
+    'one completed upload is confirmed exactly once: %s', async (_name, observed) => {
+      const recording = makeRecordingOwnPostObserver()
+      const ownPosts = recording.observer
+      const stub = stubOf(h.alpha)
+      stub.script.post.push({ kind: 'ok', result: { ts: TEXT_TS } })
+      const session = await openWith(h.alpha, observedDeps(ownPosts, observed))
+
+      const result = await session.call('reply', { chat_id: A_ALL, text: 'here', files: [inboxFile('one.txt')] })
+
+      expect(result.content[0]!.text).toBe(`Sent 1 message(s) + 1 file(s) to ${A_ALL} [ts: ${TEXT_TS}]`)
+      expect(fileEndAnswers(recording)).toEqual([{ kind: 'confirmed', channel: A_ALL, file: 'F0STUB0001' }])
+      expectOwnPostPairs(recording, 2)
+      expect(stub.calls.completeUploadExternal).toEqual([{ files: [{ id: 'F0STUB0001' }], channel_id: A_ALL, thread_ts: TEXT_TS }] as any)
+    })
+
+  test('concurrent uploads of one persona and of two personas each end with only their own completion, settled in reverse order', async () => {
+    const recording = makeRecordingOwnPostObserver()
+    const ownPosts = recording.observer
+    const deps = observedDeps(ownPosts)
+    const alpha = stubOf(h.alpha), beta = stubOf(h.beta)
+    const alphaDone = [makeDeferredWebApiCall(), makeDeferredWebApiCall()], betaDone = makeDeferredWebApiCall()
+    alpha.script.completeUpload.push(alphaDone[0]!.outcome, alphaDone[1]!.outcome)
+    beta.script.completeUpload.push(betaDone.outcome)
+    const alphaSession = await openWith(h.alpha, deps), betaSession = await openWith(h.beta, deps)
+    const fileFor: Record<string, string> = { [A_ALL]: 'F0ALLFILE1', [A_MENTIONS]: 'F0MENFILE1', [B_CHANNEL]: 'F0BETFILE1' }
+
+    const replies = [
+      alphaSession.call('reply', { chat_id: A_ALL, text: 'one', files: [inboxFile('one.txt')] }),
+      alphaSession.call('reply', { chat_id: A_MENTIONS, text: 'two', files: [inboxFile('two.txt')] }),
+      betaSession.call('reply', { chat_id: B_CHANNEL, text: 'three', files: [inboxFile('three.txt')] }),
+    ]
+    await settleMicrotasks(() => alpha.calls.completeUploadExternal.length === 2 && beta.calls.completeUploadExternal.length === 1)
+    const channelOf = (stub: StubSlack, i: number) => (stub.calls.completeUploadExternal[i] as { channel_id: string }).channel_id
+    betaDone.settle(completion(fileFor[B_CHANNEL]!, B_CHANNEL))
+    alphaDone[1]!.settle(completion(fileFor[channelOf(alpha, 1)]!, channelOf(alpha, 1)))
+    alphaDone[0]!.settle(completion(fileFor[channelOf(alpha, 0)]!, channelOf(alpha, 0)))
+    for (const result of await Promise.all(replies)) expect(result.isError).toBeUndefined()
+
+    expect(recording.calls.filter(c => c.kind === 'start').filter(c => c.surface === 'file').map(start => {
+      const end = recording.calls.find(c => c.kind === 'end' && c.operation === start.operation)
+      return [start.key, start.target.channel, end?.kind === 'end' ? end.answer : undefined]
+    }).sort()).toEqual([
+      [h.alpha.key, A_ALL, { kind: 'confirmed' as const, channel: A_ALL, file: fileFor[A_ALL] }],
+      [h.alpha.key, A_MENTIONS, { kind: 'confirmed' as const, channel: A_MENTIONS, file: fileFor[A_MENTIONS] }],
+      [h.beta.key, B_CHANNEL, { kind: 'confirmed' as const, channel: B_CHANNEL, file: fileFor[B_CHANNEL] }],
+    ].sort())
+    expectOwnPostPairs(recording, 6)
+  })
+
+  test('a completion made outside any bound upload reaches no upload\'s listener, even while one is in flight', async () => {
+    const recording = makeRecordingOwnPostObserver()
+    const ownPosts = recording.observer
+    const stub = stubOf(h.alpha), inside = makeDeferredWebApiCall()
+    stub.script.completeUpload.push(inside.outcome)
+    const session = await openWith(h.alpha, observedDeps(ownPosts))
+
+    const reply = session.call('reply', { chat_id: A_ALL, text: 'here', files: [inboxFile('one.txt')] })
+    await settleMicrotasks(() => stub.calls.completeUploadExternal.length === 1)
+    expect(await stub.web.files.completeUploadExternal({ files: [{ id: 'F0OUTSIDE1' }], channel_id: A_ALL })).toMatchObject({ ok: true, files: [{ id: 'F0OUTSIDE1' }] })
+    inside.settle(completion('F0INSIDE01'))
+    expect((await reply).isError).toBeUndefined()
+
+    expect(fileEndAnswers(recording)).toEqual([{ kind: 'confirmed', channel: A_ALL, file: 'F0INSIDE01' }])
+    expectOwnPostPairs(recording, 2)
+  })
+
+  test('observing a client twice wraps its completion once; a bound upload hears each resolved completion once and a rejected one not at all, with the caller\'s results unchanged', async () => {
+    const stub = makeStubSlack({ leakMarker: LEAK_SENTINEL })
+    const client = stub.web
+    observeFileCompletions(client)
+    const wrapped = client.files.completeUploadExternal
+    observeFileCompletions(client)
+    expect(client.files.completeUploadExternal).toBe(wrapped)
+    const heard: unknown[] = []
+    const upload = () => client.filesUploadV2({ channel_id: A_ALL, file: Buffer.from('data'), filename: 'data.txt' })
+
+    const result = await withFileCompletions((response) => heard.push(response), upload)
+    expect(heard).toEqual([{ ok: true, files: [{ id: 'F0STUB0001' }] }])
+    expect(result).toEqual({ ok: true, files: heard } as any)
+
+    stub.script.completeUpload.push({ kind: 'platform', error: 'internal_error' })
+    const rejected = await withFileCompletions((response) => heard.push(response), upload).catch((err: unknown) => err)
+    expect(rejected).toMatchObject({ code: 'slack_webapi_platform_error', data: { error: 'internal_error' } })
+    expect(heard).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// reply without an own-post observer
+// ---------------------------------------------------------------------------
+
+describe('reply without an own-post observer', () => {
+  const PARTS = ['QZPART01', 'QZPART02', 'QZPART03']
+  const partTs = (n: number) => `1700000000.${String(n).padStart(6, '0')}`
+
+  test.each([2, 3])('a failure at text chunk %i of 3 reports the confirmed prefix, posts no part twice and logs one operator line without the reply\'s text', async (failing) => {
+    const logged: string[] = []
+    const stub = stubOf(h.alpha)
+    for (let i = 1; i < failing; i++) stub.script.post.push({ kind: 'ok' })
+    stub.script.post.push({ kind: 'platform', error: 'channel_not_found' })
+    const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), {
+      ...depsWithReplySettings({ reply_chunk_mode: 'length', reply_chunk_limit: 8 }), log: (line) => void logged.push(line),
+    })
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: PARTS.join('') })
+
+    const sent = failing - 1
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent, total: 3, lastTs: partTs(sent), uploaded: 0, files: 0 }, 'channel_not_found'))
+    expect(stub.calls.postMessage.map((c) => ('text' in c ? c.text : undefined))).toEqual(PARTS.slice(0, failing))
+    expect(logged).toHaveLength(1)
+    expect(logged[0]!.startsWith(`[slack] Tool "reply" stopped after a partial post for persona ${renderPersonaRef(h.alpha.name, h.alpha.key)}: sent=${sent}/3 uploaded=0/0: `)).toBe(true)
+    expect(logged[0]).toContain('channel_not_found')
+    for (const part of PARTS) expect(logged[0]).not.toContain(part)
+    expect(h.lines.filter((l) => l.includes('partial post'))).toEqual([])
+    assertNoLeak({ result, lines: logged })
+  })
+
+  test('a reply with text and a file posts each part once, reports success, clears its ack and logs nothing', async () => {
+    const stub = stubOf(h.alpha)
+    observeFileCompletions(stub.web)
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    const file = join(h.inboxDir, 'one.txt')
+    writeFileSync(file, 'one')
+    const consumedAt: Array<{ posts: number; uploads: number }> = []
+    const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), {
+      ...h.deps,
+      consumeAck: (key, channel, ts, remove) => {
+        consumedAt.push({ posts: stub.calls.postMessage.length, uploads: stub.calls.filesUploadV2.length })
+        return remove ? consumeAck(key, channel, ts, remove) : consumeAck(key, channel, ts)
+      },
+      clientFor: (key) => {
+        const s = h.clients.get(key)
+        return s ? asWebClient(watchWebClientAuth(s.web, () => {})) : undefined
+      },
+    })
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: 'here', files: [file], message_id: MSG_TS })
+
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0]!.text).toBe(`Sent 1 message(s) + 1 file(s) to ${A_ALL} [ts: ${partTs(1)}]`)
+    expect([stub.calls.postMessage.length, stub.calls.filesUploadV2.length, stub.calls.completeUploadExternal.length]).toEqual([1, 1, 1])
+    expect(stub.calls.reactionsRemove).toEqual([REMOVE_EYES])
+    // The text's own success clears the ack, before the upload starts.
+    expect(consumedAt).toEqual([{ posts: 1, uploads: 0 }])
+    expect(slackCallCount(stubOf(h.beta))).toBe(0)
+    expect(h.lines).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Per-call own-post observation through the real reply tool
+// ---------------------------------------------------------------------------
+
+function openReply(deps: SessionToolDeps = h.deps, persona = h.alpha) {
+  return openSession(registerSession(persona.working_directory, persona.key, makeTransport(), makeServer()), deps)
+}
+
+function replyFile(name = 'one.txt', content = name) {
+  const path = join(h.inboxDir, name)
+  writeFileSync(path, content)
+  return path
+}
+
+/** Keep the delivered reaction's original name even though reply settings now say eyes. */
+async function captureReplyAck(stub: StubSlack, key: string) {
+  const args = { channel: A_ALL, timestamp: MSG_TS, name: 'hourglass' }
+  await addDeliveryAck(key, A_ALL, MSG_TS,
+    () => stub.web.reactions.add(args), () => stub.web.reactions.remove(args))
+}
+
+/** Drain the in-memory MCP transport, without a wall-clock delay. Disk waits on `io` are awaited, not counted. */
+async function replyReached(done: () => boolean, io?: DurableIoSettle) {
+  for (let i = 0; i < 50 && !done();) {
+    if (io?.busy()) { await io.next(); continue }
+    await new Promise(resolve => setImmediate(resolve)); i++
+  }
+  expect(done()).toBe(true)
+}
+
+describe('reply own-post call boundaries', () => {
+  test.each(['channel', 'opened DM'] as const)('%s: three chunks and two files have independent operations, exact content and ready gates', async targetKind => {
+    const stub = stubOf(h.alpha), gates = Array.from({ length: 5 }, holdOwnPostReady)
+    const recording = makeRecordingOwnPostObserver(gates.map(gate => ({ ready: gate.ready })))
+    const files = [replyFile('one.bin', 'é'), replyFile('two.bin', 'three')]
+    const target = targetKind === 'channel' ? A_ALL : 'U0USER001'
+    const channel = targetKind === 'channel' ? A_ALL : stubOpenedDmId(target)
+    if (targetKind === 'opened DM') applyPersona(h.alpha, true)
+    trackAck(h.alpha.key, channel, MSG_TS)
+    const atAck: string[][] = []
+    const session = await openReply({
+      ...depsWithReplySettings({ reply_chunk_mode: 'length', reply_chunk_limit: 3 }), ownPosts: recording.observer,
+      consumeAck: (...args) => { atAck.push(recording.calls.map(c => c.kind)); return args[3] ? consumeAck(args[0], args[1], args[2], args[3]) : consumeAck(args[0], args[1], args[2]) },
+    })
+    const pending = session.call('reply', { chat_id: target, text: 'aaabbbccc', thread_ts: MSG_TS, message_id: MSG_TS, files })
+    try {
+      for (let i = 0; i < gates.length; i++) {
+        await replyReached(() => recording.calls.filter(c => c.kind === 'start').length === i + 1)
+        // Each chunk ends before the next starts; the files' operations all start before their one upload.
+        const ended = Math.min(i, 3)
+        expect(recording.calls.map(c => c.kind)).toEqual([...Array.from({ length: ended }, () => ['start', 'end'] as const).flat(), ...Array.from({ length: i + 1 - ended }, () => 'start' as const)])
+        expect(stub.calls.postMessage.length + stub.calls.filesUploadV2.length).toBe(ended)
+        gates[i]!.resolve()
+      }
+      const result = await pending
+      expect(result.isError).toBeUndefined()
+      expectOwnPostPairs(recording, 5)
+      expect(recording.calls.filter(c => c.kind === 'start').map(({ key, surface, target, content }) => ({ key, surface, target, content }))).toEqual([
+        ...['aaa', 'bbb', 'ccc'].map(text => ({ key: h.alpha.key, surface: 'text' as const, target: { channel, parent: MSG_TS }, content: { kind: 'text' as const, text } })),
+        ...([['one.bin', 2], ['two.bin', 5]] as const).map(([name, size]) => ({ key: h.alpha.key, surface: 'file' as const, target: { channel, parent: MSG_TS }, content: { kind: 'file' as const, name, size } })),
+      ])
+      expect(stub.calls.postMessage).toEqual(['aaa', 'bbb', 'ccc'].map(text => ({ channel, text, thread_ts: MSG_TS, unfurl_links: false, unfurl_media: false })))
+      expect(stub.calls.filesUploadV2).toEqual([{ channel_id: channel, file_uploads: fileUploads('one.bin', 'two.bin'), thread_ts: MSG_TS }] as any)
+      expect(recording.calls.filter(c => c.kind === 'end').map(c => c.answer)).toEqual([
+        ...[1, 2, 3].map(n => ({ kind: 'confirmed' as const, channel, ts: `1700000000.00000${n}` })),
+        ...[1, 2].map(n => ({ kind: 'confirmed' as const, channel, file: `F0STUB000${n}` })),
+      ])
+      expect(atAck).toEqual([['start', 'end']])
+      expect(stub.calls.reactionsRemove).toEqual([{ channel, timestamp: MSG_TS, name: 'eyes' }])
+    } finally { for (const gate of gates) gate.resolve(); await pending }
+  })
+
+  test('the upload guard rechecks after ready and ends a refused operation before returning the existing refusal', async () => {
+    const gate = holdOwnPostReady(), recording = makeRecordingOwnPostObserver([{}, { ready: gate.ready }])
+    const file = replyFile(), checked: number[] = [], stub = stubOf(h.alpha)
+    let refuse = false
+    const session = await openReply({ ...h.deps, ownPosts: recording.observer, assertSendable(path) {
+      checked.push(stub.calls.filesUploadV2.length)
+      h.deps.assertSendable(path)
+      if (refuse) throw new Error('file is no longer sendable')
+    } })
+    const pending = session.call('reply', { chat_id: A_ALL, text: 'here', files: [file] })
+    try {
+      await replyReached(() => recording.calls.length === 3)
+      expect(checked).toEqual([0])
+      expect(stub.calls.filesUploadV2).toHaveLength(0)
+      refuse = true; gate.resolve()
+      const result = await pending
+      expect(result.isError).toBe(true)
+      expect(result.content[0]!.text).toBe(`file is no longer sendable The reply text was already posted (1 message(s) to ${A_ALL} [ts: 1700000000.000001]); none of the 1 file(s) were uploaded.`)
+      expect(checked).toEqual([0, 0])
+      expect(fileEndAnswers(recording)).toEqual([{ kind: 'failed', code: OWN_POST_UPLOAD_REFUSED }])
+      expectOwnPostPairs(recording, 2)
+      expect(stub.calls.filesUploadV2).toHaveLength(0)
+    } finally { gate.resolve(); await pending }
+  })
+
+  test.each([
+    ['platform', { kind: 'platform', error: 'not_in_channel' }, { kind: 'failed', code: 'not_in_channel' }],
+    ['request', { kind: 'network' }, { kind: 'no-answer' }],
+    ['abort', { kind: 'reject', value: slackAbortError() }, { kind: 'no-answer' }],
+    ['missing timestamp', { kind: 'ok', result: { ts: undefined } }, { kind: 'no-answer' }],
+  ] as const)('a text %s answer ends once before returning', async (_label, outcome, answer) => {
+    const recording = makeRecordingOwnPostObserver(), stub = stubOf(h.alpha)
+    stub.script.post.push(outcome)
+    const session = await openReply({ ...h.deps, ownPosts: recording.observer })
+    const result = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL })
+    expect(recording.calls.filter(c => c.kind === 'end').map(c => c.answer)).toEqual([answer])
+    expectOwnPostPairs(recording, 1)
+    expect(stub.calls.postMessage).toHaveLength(1)
+    expect(result.isError).toBe(outcome.kind === 'ok' ? undefined : true)
+  })
+
+  test.each([
+    ['platform', { kind: 'platform', error: 'file_upload_failed' }, { kind: 'failed', code: 'file_upload_failed' }],
+    ['request', { kind: 'network' }, { kind: 'no-answer' }],
+    ['abort', { kind: 'reject', value: slackAbortError() }, { kind: 'no-answer' }],
+    ['missing file', { kind: 'ok', result: { files: [] } }, { kind: 'no-answer' }],
+  ] as const)('an upload %s answer ends its operation once', async (_label, outcome, answer) => {
+    const recording = makeRecordingOwnPostObserver(), stub = stubOf(h.alpha)
+    stub.script.upload.push(outcome)
+    const session = await openReply({ ...h.deps, ownPosts: recording.observer })
+    const result = await session.call('reply', { chat_id: A_ALL, text: '', files: [replyFile()] })
+    expect(fileEndAnswers(recording)).toEqual([answer])
+    expectOwnPostPairs(recording, 1)
+    expect(stub.calls.filesUploadV2).toHaveLength(1)
+    expect(result.isError).toBe(outcome.kind === 'ok' ? undefined : true)
+  })
+})
+
+describe('reply bookkeeping faults preserve posting and reaction cleanup', () => {
+  const faults = ['no observer', 'owner start throws', 'owner end throws', 'start throws', 'end throws', 'undefined operation', 'ready rejects'] as const
+  function observer(fault: typeof faults[number]): OwnPostObserver | undefined {
+    const error = new Error(sentinelInMessage('bookkeeping'))
+    if (fault === 'no observer') return undefined
+    if (fault === 'owner start throws' || fault === 'owner end throws') {
+      const recording = makeRecordingOwnPostObserver()
+      return createOwnPostObserver(() => ({
+        startOperation: (...args) => { if (fault === 'owner start throws') throw error; return recording.observer.start(...args) },
+        endOperation() { throw error },
+      }))
+    }
+    const step = fault === 'start throws' ? { throwStart: error }
+      : fault === 'end throws' ? { throwEnd: error }
+      : fault === 'undefined operation' ? { start: 'undefined' as const }
+      : { ready: Promise.reject(error).catch(() => { throw error }) }
+    // Rejections are handled at creation as well as by the surface's await.
+    if (step.ready) void step.ready.catch(() => {})
+    return makeRecordingOwnPostObserver(Array.from({ length: 5 }, () => step)).observer
+  }
+
+  test.each([...faults])('%s: three chunks and two files still post once and clear the ack on the first success', async fault => {
+    const stub = stubOf(h.alpha), atAck: Array<[number, number]> = []
+    await captureReplyAck(stub, h.alpha.key)
+    const session = await openReply({ ...depsWithReplySettings({ reply_chunk_mode: 'length', reply_chunk_limit: 4 }), ownPosts: observer(fault),
+      consumeAck: (...args) => { atAck.push([stub.calls.postMessage.length, stub.calls.filesUploadV2.length]); return args[3] ? consumeAck(args[0], args[1], args[2], args[3]) : consumeAck(args[0], args[1], args[2]) },
+    })
+    const result = await session.call('reply', { chat_id: A_ALL, text: 'aaaabbbbcccc', files: [replyFile(), replyFile('two.txt')], message_id: MSG_TS })
+    expect(result).toEqual({ content: [{ type: 'text', text: `Sent 3 message(s) + 2 file(s) to ${A_ALL} [ts: 1700000000.000003]` }] })
+    expect(stub.calls.postMessage.map(c => 'text' in c ? c.text : undefined)).toEqual(['aaaa', 'bbbb', 'cccc'])
+    expect(stub.calls.filesUploadV2).toHaveLength(1)
+    expect(atAck).toEqual([[1, 0]])
+    expect(stub.calls.reactionsRemove).toEqual([{ ...REMOVE_EYES, name: 'hourglass' }])
+    expect(h.lines).toEqual([])
+  })
+
+  test.each([...faults])('%s: a later upload failure keeps completed parts and the first text success clears the ack', async fault => {
+    const stub = stubOf(h.alpha)
+    observeFileCompletions(stub.web)
+    stub.uploadGroups.push(2)
+    stub.script.completeUpload.push({ kind: 'ok' }, { kind: 'platform', error: 'file_upload_failed' })
+    await captureReplyAck(stub, h.alpha.key)
+    const session = await openReply({ ...h.deps, ownPosts: observer(fault) })
+    const result = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL, files: [replyFile(), replyFile('two.txt')], message_id: MSG_TS })
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 1, total: 1, lastTs: '1700000000.000001', uploaded: 1, files: 2 }, 'file_upload_failed'))
+    expect(stub.calls.postMessage).toHaveLength(1)
+    expect(stub.calls.filesUploadV2).toHaveLength(1)
+    expect(stub.calls.reactionsRemove).toEqual([{ ...REMOVE_EYES, name: 'hourglass' }])
+    expect(h.lines).toHaveLength(1)
+    expect(h.lines[0]).toContain('sent=1/1 uploaded=1/2:')
+    expect(h.lines[0]).toContain('file_upload_failed')
+    assertNoLeak({ result, lines: h.lines })
+  })
+
+  test.each([...faults])('%s: a later text failure preserves the partial result, log and ack cleanup', async fault => {
+    const stub = stubOf(h.alpha)
+    stub.script.post.push({ kind: 'ok' }, { kind: 'platform', error: 'channel_not_found' })
+    await captureReplyAck(stub, h.alpha.key)
+    const session = await openReply({ ...depsWithReplySettings({ reply_chunk_mode: 'length', reply_chunk_limit: LEAK_SENTINEL.length }), ownPosts: observer(fault) })
+    const result = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL.repeat(3), files: [replyFile()], message_id: MSG_TS })
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 1, total: 3, lastTs: '1700000000.000001', uploaded: 0, files: 1 }, 'channel_not_found'))
+    expect(stub.calls.postMessage.map(c => 'text' in c ? c.text : undefined)).toEqual([LEAK_SENTINEL, LEAK_SENTINEL])
+    expect(stub.calls.filesUploadV2).toHaveLength(0)
+    expect(stub.calls.reactionsRemove).toEqual([{ ...REMOVE_EYES, name: 'hourglass' }])
+    expect(h.lines).toHaveLength(1)
+    expect(h.lines[0]).toContain('sent=1/3 uploaded=0/1:')
+    expect(h.lines[0]).toContain('channel_not_found')
+    assertNoLeak({ result, lines: h.lines })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Reply joins through the server's real owner composition
+// ---------------------------------------------------------------------------
+
+describe('reply joins through real Thread Memory', () => {
+  beforeEach(() => mkdirSync(join(h.dir, 'owner')))
+  const ROOT = '1700000100.000001', PARENT = '1700000100.000002', OTHER = '1700000100.000003'
+  const options = { membership: { channels: [{ id: A_ALL, delivery: 'thread_hybrid' as const }] } }
+
+  async function openOwner(owner: OwnPostHarness, key = 'alpha', overrides: Partial<SessionToolDeps> = {}) {
+    const persona = owner.sources.persona(key)!, stub = owner.members.h.stub(owner.members.h.p(key))
+    observeFileCompletions(stub.web)
+    const entry = registerSession(persona.working_directory, key, makeTransport(), makeServer(), owner.authority.incarnation(key))
+    const session = await openSession(entry, {
+      ...h.deps, getPersona: owner.sources.persona, getChannelMode: () => channelModeOf(owner.authority.config()),
+      getChannelDelivery: () => owner.choices, readChannelMembership: owner.members.membership.read,
+      clientFor: owner.members.h.clientFor, ownPosts: owner.observer, ...overrides,
+    })
+    return { session, stub }
+  }
+
+  const registrations = (owner: OwnPostHarness) => owner.events.filter(event => event.type === 'registered')
+  const outcomes = (owner: OwnPostHarness, key = 'alpha') => owner.records(key).filter(record => record.kind === 'post-outcome')
+  async function finish(owner: OwnPostHarness) {
+    try { assertNoLeak({ results: h.results, lines: h.lines, owner: owner.captured() }) } finally { await owner.close() }
+    expect(owner.clock.pendingCount()).toBe(0)
+  }
+
+  // Uploads as new channel messages: the server's lookup runner over the same owner.
+  const FILE = slackFileId(1), SHARE = '1700000100.000004', LATER = '1700000100.000005'
+  const lookupOptions = { ...options, lookups: true }
+  const historyCalls = (stub: StubSlack) => stub.callLog.filter(call => call.method === 'conversations.history')
+  /** Each confirmed decision's thread and join, in order: the text's, then the upload's. */
+  const confirmations = (owner: OwnPostHarness) => owner.events.filter(e => e.type === 'decided' && e.outcome?.kind === 'confirmed')
+    .map(e => [e.outcome!.thread, e.outcome!.joined])
+  /** P's own share of FILE at `ts` in `channel`, with the sentinel in its file name and text. */
+  const ownShare = (stub: StubSlack, ts: string, channel = A_ALL) =>
+    makeOwnFileShare({ identity: stub.identity, channel, ts, fileIds: [FILE], name: `${LEAK_SENTINEL}.txt`, text: LEAK_SENTINEL })
+  /** A_ALL's history: the reply's text at ROOT, then P's own share of FILE at each of `shares`. */
+  function history(stub: StubSlack, ...shares: string[]) {
+    stub.responders.history = makePagedThread(1 + shares.length, { rootTs: ROOT, channel: A_ALL, identity: stub.identity,
+      message: (i): PagedMessageSpec => i === 0 ? { ts: ROOT, author: 'own-user', placement: 'channel', text: LEAK_SENTINEL, file: false }
+        : { ts: shares[i - 1], author: 'own-user', placement: 'channel', fileIds: [FILE], file: { name: `${LEAK_SENTINEL}.txt`, size: LEAK_SENTINEL.length } },
+    }).respondHistory
+  }
+  /** The observer, delivering P's own share Event the moment an upload confirms, before the runner's next turn. */
+  const shareAtCompletion = (owner: OwnPostHarness, stub: StubSlack): OwnPostObserver => ({ start: owner.observer.start,
+    end(operation, answer) {
+      owner.observer.end(operation, answer)
+      if (answer.kind === 'confirmed' && answer.file) owner.lookups!.ownMessage('alpha', ownShare(stub, SHARE))
+    } })
+  const sent = (files: number, ts: string) => ({ content: [{ type: 'text', text: `Sent 1 message(s) + ${files} file(s) to ${A_ALL} [ts: ${ts}]` }] })
+
+  test('three top-level chunks join three roots in memory and on reopen; each has its own saved intent and outcome', async () => {
+    let owner = await makeOwnPostHarness(join(h.dir, 'owner'), options)
+    try {
+      const { session, stub } = await openOwner(owner, 'alpha', { getReplySettings: () => ({ ...REPLY_SETTINGS, reply_chunk_mode: 'length', reply_chunk_limit: LEAK_SENTINEL.length }) })
+      const roots = [ROOT, PARENT, OTHER]
+      stub.script.post.push(...roots.map(ts => ({ kind: 'ok' as const, result: { ts } })))
+      const result = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL.repeat(3) })
+      expect(result.isError).toBeUndefined()
+      expect(stub.calls.postMessage.map(c => 'text' in c ? c.text : undefined)).toEqual(Array(3).fill(LEAK_SENTINEL))
+      for (const root of roots) expect(owner.view('alpha', A_ALL, root)).toBe('joined')
+      await owner.flush()
+      const ids = registrations(owner).map(e => e.operationId)
+      expect(new Set(ids).size).toBe(3)
+      expect(owner.records().filter(r => r.kind === 'post-intent').map(r => r.operationId)).toEqual(ids)
+      expect(outcomes(owner).map(r => [r.operationId, r.outcome])).toEqual(ids.map(id => [id, 'joined']))
+      owner = await owner.reopen()
+      for (const root of roots) expect(owner.view('alpha', A_ALL, root)).toBe('joined')
+      expect(owner.records().filter(r => r.kind === 'join').map(r => r.root).sort()).toEqual([...roots].sort())
+    } finally { await finish(owner) }
+  })
+
+  test.each(['mapped parent', 'Slack thread takes precedence', 'parent upload'] as const)('%s joins the real root; a subsequent reply there writes no new intent', async kind => {
+    let owner = await makeOwnPostHarness(join(h.dir, 'owner'), options)
+    try {
+      await owner.storeSlack('alpha', { channel: A_ALL, ts: PARENT, key: { chat_id: A_ALL, ts: PARENT }, thread_ts: ROOT })
+      const { session, stub } = await openOwner(owner)
+      const first = makeDeferredWebApiCall()
+      stub.script.post.push(first.outcome)
+      const isFile = kind === 'parent upload'
+      const pending = session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL, thread_ts: PARENT, ...(isFile ? { files: [replyFile()] } : {}) })
+      await replyReached(() => stub.calls.postMessage.length === 1, owner.io.durable)
+      expect(owner.read.pendingOwnPosts('alpha', A_ALL)).toMatchObject([{ root: ROOT }])
+      // Let the text have no answer so the file, rather than the text, establishes the join.
+      first.settle({ kind: 'ok', result: isFile ? { ts: undefined } : { ts: OTHER, ...(kind === 'Slack thread takes precedence' ? { message: { thread_ts: OTHER } } : {}) } })
+      expect((await pending).isError).toBeUndefined()
+      const expected = kind === 'Slack thread takes precedence' ? OTHER : ROOT
+      expect(owner.view('alpha', A_ALL, expected)).toBe('joined')
+      expect(owner.view('alpha', A_ALL, PARENT)).toBe('not-joined')
+      await owner.flush()
+      const before = owner.records(), eventCount = registrations(owner).length
+      expect((await session.call('reply', { chat_id: A_ALL, text: 'again', thread_ts: expected })).isError).toBeUndefined()
+      await owner.flush()
+      expect(owner.records()).toEqual(before)
+      expect(registrations(owner)).toHaveLength(eventCount)
+      expect(outcomes(owner).map(r => r.outcome)).toEqual(['joined'])
+      owner = await owner.reopen()
+      expect(owner.view('alpha', A_ALL, expected)).toBe('joined')
+    } finally { await finish(owner) }
+  })
+
+  // A files-only reply is the one that uploads as a new channel message: with
+  // text, the files are threaded under the first chunk.
+  test('a new-message upload remains pending for its thread even when completion shares name a root', async () => {
+    const owner = await makeOwnPostHarness(join(h.dir, 'owner'), options)
+    try {
+      const { session, stub } = await openOwner(owner)
+      stub.script.completeUpload.push({ kind: 'ok', result: { files: [{ id: 'F0AWAIT001', shares: { public: { [A_ALL]: [{ ts: OTHER, thread_ts: PARENT }] } } }] } })
+      expect((await session.call('reply', { chat_id: A_ALL, text: '', files: [replyFile()] })).isError).toBeUndefined()
+      expect(stub.calls.postMessage).toHaveLength(0)
+      expect(owner.view('alpha', A_ALL, OTHER)).toBe('not-joined')
+      expect(owner.view('alpha', A_ALL, PARENT)).toBe('not-joined')
+      expect(owner.read.pendingOwnPosts('alpha', A_ALL)).toMatchObject([{ state: 'awaiting-thread' }])
+      expect(owner.owner.awaitingUploads('alpha', A_ALL)).toMatchObject([{ file: 'F0AWAIT001' }])
+      await owner.flush()
+      expect(registrations(owner)).toHaveLength(1)
+      expect(outcomes(owner)).toEqual([])
+      expect(owner.memory.unresolvedIntents('alpha')).toHaveLength(1)
+    } finally { await finish(owner) }
+  })
+
+  test.each(['Event', 'history'] as const)('a new-message upload joins its own share\'s ts once, learnt by %s, never a completion share\'s root', async source => {
+    let owner = await makeOwnPostHarness(join(h.dir, 'owner'), lookupOptions)
+    try {
+      const stub = owner.members.h.stub(owner.members.h.p('alpha'))
+      const { session } = await openOwner(owner, 'alpha', source === 'Event' ? { ownPosts: shareAtCompletion(owner, stub) } : {})
+      stub.script.completeUpload.push(completion(FILE, A_ALL, OTHER))
+      history(stub) // no share yet
+      const result = await session.call('reply', { chat_id: A_ALL, text: '', files: [replyFile('one.txt', LEAK_SENTINEL)] })
+      expect(result).toEqual({ content: [{ type: 'text', text: `Sent 0 message(s) + 1 file(s) to ${A_ALL}` }] })
+      if (source === 'history') {
+        // A complete read without the share learns nothing; the next read, once the share is listed, does.
+        await replyReached(() => historyCalls(stub).length === 1)
+        await owner.flush()
+        expect(owner.view('alpha', A_ALL, SHARE)).toBe('not-joined')
+        expect(owner.owner.awaitingUploads('alpha', A_ALL)).toMatchObject([{ file: FILE }])
+        history(stub, SHARE)
+        await owner.clock.advance(metadataRetryDelay(1))
+      }
+      await owner.flush()
+      expect(owner.owner.awaitingUploads('alpha')).toEqual([])
+      expect(confirmations(owner)).toEqual([[SHARE, true]])
+      expect(owner.view('alpha', A_ALL, SHARE)).toBe('joined')
+      for (const ts of [OTHER, LATER]) expect(owner.view('alpha', A_ALL, ts)).toBe('not-joined')
+      // A later share Event, and later time, change nothing.
+      owner.lookups!.ownMessage('alpha', ownShare(stub, LATER))
+      await owner.clock.advance(metadataRetryDelay(2))
+      await owner.flush()
+      expect(historyCalls(stub)).toHaveLength(source === 'Event' ? 0 : 2)
+      expect(confirmations(owner)).toEqual([[SHARE, true]])
+      expect(owner.view('alpha', A_ALL, LATER)).toBe('not-joined')
+      expect(stub.calls.postMessage).toHaveLength(0)
+      expect(stub.calls.filesUploadV2).toHaveLength(1)
+      expect(outcomes(owner).map(r => r.outcome)).toEqual(['joined'])
+      expect(owner.memory.unresolvedIntents('alpha')).toEqual([])
+      owner = await owner.reopen()
+      expect(owner.view('alpha', A_ALL, SHARE)).toBe('joined')
+      expect(owner.records().filter(r => r.kind === 'join').map(r => r.root)).toEqual([SHARE])
+    } finally { await finish(owner) }
+  })
+
+  test('a parent-bound upload joins its parent\'s Thread Root and reads no history, even when completion shares name another root', async () => {
+    let owner = await makeOwnPostHarness(join(h.dir, 'owner'), lookupOptions)
+    try {
+      await owner.storeSlack('alpha', { channel: A_ALL, ts: PARENT, key: { chat_id: A_ALL, ts: PARENT }, thread_ts: ROOT })
+      const { session, stub } = await openOwner(owner)
+      // The text has no answer, so the file, rather than the text, establishes the join.
+      stub.script.post.push({ kind: 'ok', result: { ts: undefined } })
+      stub.script.completeUpload.push(completion(FILE, A_ALL, OTHER))
+      history(stub, SHARE) // even a listed share of the file is never read
+      const result = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL, thread_ts: PARENT, files: [replyFile('one.txt', LEAK_SENTINEL)] })
+      expect(result.isError).toBeUndefined()
+      await owner.clock.advance(metadataRetryDelay(2))
+      await owner.flush()
+      expect(historyCalls(stub)).toEqual([])
+      expect(owner.owner.awaitingUploads('alpha')).toEqual([])
+      expect(confirmations(owner)).toEqual([[ROOT, true]])
+      expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined')
+      for (const ts of [PARENT, OTHER, SHARE]) expect(owner.view('alpha', A_ALL, ts)).toBe('not-joined')
+      owner = await owner.reopen()
+      expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined')
+      expect(owner.records().filter(r => r.kind === 'join').map(r => r.root)).toEqual([ROOT])
+    } finally { await finish(owner) }
+  })
+
+  test('a reply\'s files, threaded under its first chunk, register no intent and read no history: that root is already joined', async () => {
+    let owner = await makeOwnPostHarness(join(h.dir, 'owner'), lookupOptions)
+    try {
+      const { session, stub } = await openOwner(owner)
+      stub.script.post.push({ kind: 'ok', result: { ts: ROOT } })
+      stub.script.completeUpload.push(completion(FILE, A_ALL, OTHER))
+      history(stub, SHARE) // even a listed share of the file is never read
+      const result = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL, files: [replyFile('one.txt', LEAK_SENTINEL)] })
+      expect(result).toEqual(sent(1, ROOT))
+      expect(stub.calls.filesUploadV2).toEqual([{ channel_id: A_ALL, file_uploads: fileUploads('one.txt'), thread_ts: ROOT }] as any)
+      await owner.clock.advance(metadataRetryDelay(2))
+      await owner.flush()
+      expect(historyCalls(stub)).toEqual([])
+      expect(owner.owner.awaitingUploads('alpha')).toEqual([])
+      expect(registrations(owner)).toHaveLength(1)
+      expect(confirmations(owner)).toEqual([[ROOT, true]])
+      expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined')
+      for (const ts of [OTHER, SHARE]) expect(owner.view('alpha', A_ALL, ts)).toBe('not-joined')
+      owner = await owner.reopen()
+      expect(owner.records().filter(r => r.kind === 'join').map(r => r.root)).toEqual([ROOT])
+    } finally { await finish(owner) }
+  })
+
+  test('a refused later chunk records none and leaves earlier roots joined after reopening', async () => {
+    let owner = await makeOwnPostHarness(join(h.dir, 'owner'), options)
+    try {
+      const { session, stub } = await openOwner(owner, 'alpha', { getReplySettings: () => ({ ...REPLY_SETTINGS, reply_chunk_mode: 'length', reply_chunk_limit: LEAK_SENTINEL.length }) })
+      stub.script.post.push({ kind: 'ok', result: { ts: ROOT } }, { kind: 'platform', error: 'not_in_channel' })
+      await captureReplyAck(stub, 'alpha')
+      const result = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL.repeat(3), message_id: MSG_TS })
+      expect(result.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 1, total: 3, lastTs: ROOT, uploaded: 0, files: 0 }, 'not_in_channel'))
+      expect(stub.calls.postMessage).toHaveLength(2)
+      expect(stub.calls.reactionsRemove).toEqual([{ ...REMOVE_EYES, name: 'hourglass' }])
+      expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined')
+      expect(owner.view('alpha', A_ALL, OTHER)).toBe('not-joined')
+      await owner.flush()
+      expect(outcomes(owner).map(r => r.outcome)).toEqual(['joined', 'none'])
+      owner = await owner.reopen()
+      expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined')
+      expect(owner.records().filter(r => r.kind === 'join').map(r => r.root)).toEqual([ROOT])
+    } finally { await finish(owner) }
+  })
+
+  test.each(['off', 'DM', 'dry-run', 'edit_message', 'fetch_messages'] as const)('%s registers no own post, reads no upload thread and writes no Thread Memory records', async action => {
+    const owner = await makeOwnPostHarness(join(h.dir, 'owner'), {
+      membership: { mode: 'open', channels: [{ id: A_ALL, delivery: 'off' }] },
+      memory: { dryRun: action === 'dry-run' }, lookups: true,
+    })
+    try {
+      // Activating thread_hybrid may create its header; the tool must write nothing thereafter.
+      if (action !== 'off' && action !== 'DM') expect(owner.threads.choose('thread_hybrid', 'alpha', A_ALL).kind).toBe('applied')
+      const recording = makeRecordingOwnPostObserver()
+      const { session, stub } = await openOwner(owner, 'alpha', { ownPosts: {
+        start(...args) { recording.observer.start(...args); return owner.observer.start(...args) },
+        end: owner.observer.end,
+      } })
+      await owner.flush()
+      const before = owner.records()
+      owner.io.reset()
+      if (action === 'dry-run') process.env['SLACK_DRY_RUN'] = '1'
+      const target = action === 'DM' ? 'D0DIRECT1' : A_ALL
+      const tool = action === 'edit_message' || action === 'fetch_messages' ? action : 'reply'
+      const posts = action === 'off' || action === 'DM'
+      if (posts) stub.script.completeUpload.push(completion(FILE, target))
+      // A dry run builds no lookup runner, as the server does.
+      expect(owner.lookups === undefined).toBe(action === 'dry-run')
+      const args = tool === 'reply' ? { ...TOOL_ARGS.reply(target), files: [replyFile('one.txt', LEAK_SENTINEL)] } : TOOL_ARGS[tool](target)
+      const result = await session.call(tool, args)
+      expect(result.isError).toBeUndefined()
+      expect(recording.calls).toHaveLength(posts ? 2 : 0)
+      expect(stub.calls.postMessage).toHaveLength(posts ? 1 : 0)
+      expect(stub.calls.filesUploadV2).toHaveLength(posts ? 1 : 0)
+      // P's own share of the upload resolves nothing here either.
+      if (posts) owner.lookups!.ownMessage('alpha', ownShare(stub, SHARE, target))
+      await owner.clock.advance(metadataRetryDelay(1))
+      expect(historyCalls(stub)).toHaveLength(tool === 'fetch_messages' ? 1 : 0)
+      expect(registrations(owner)).toEqual([])
+      expect(owner.read.pendingOwnPosts('alpha', target)).toEqual([])
+      expect(owner.owner.awaitingUploads('alpha')).toEqual([])
+      await owner.flush()
+      expect(owner.records()).toEqual(before)
+      expect(owner.io.writes()).toEqual([])
+      if (before.length === 0) expect(existsSync(threadPath(owner.stateDir))).toBe(false)
+      for (const ts of [ROOT, SHARE]) expect(owner.view('alpha', target, ts)).not.toBe('joined')
+    } finally { await finish(owner) }
+  })
+
+  test('two personas sharing the same bot identity join only the roots their own replies create', async () => {
+    let owner = await makeOwnPostHarness(join(h.dir, 'owner'), { ...options, membership: { ...options.membership, names: ['alpha', 'beta'] }, start: false })
+    try {
+      const a = owner.members.h.stub(owner.members.h.p('alpha')), b = owner.members.h.stub(owner.members.h.p('beta'))
+      Object.assign(b.identity, a.identity)
+      b.script.botsInfo.push({ kind: 'ok', result: { bot: { id: a.identity.botId, user_id: a.identity.botUserId, app_id: a.identity.appId, deleted: false } } })
+      await owner.start()
+      expect(owner.members.h.identityFor('alpha')).toEqual(owner.members.h.identityFor('beta'))
+      const alpha = await openOwner(owner), beta = await openOwner(owner, 'beta')
+      a.script.post.push({ kind: 'ok', result: { ts: ROOT } }); b.script.post.push({ kind: 'ok', result: { ts: OTHER } })
+      for (const result of await Promise.all([alpha.session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL }), beta.session.call('reply', { chat_id: A_ALL, text: 'beta' })])) expect(result.isError).toBeUndefined()
+      const check = () => {
+        expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined'); expect(owner.view('alpha', A_ALL, OTHER)).toBe('not-joined')
+        expect(owner.view('beta', A_ALL, OTHER)).toBe('joined'); expect(owner.view('beta', A_ALL, ROOT)).toBe('not-joined')
+      }
+      check(); await owner.flush()
+      expect(outcomes(owner)).toHaveLength(1); expect(outcomes(owner, 'beta')).toHaveLength(1)
+      owner = await owner.reopen(); check()
+    } finally { await finish(owner) }
+  })
+
+  test.each(['intent', 'outcome', 'unreadable'] as const)('%s failure cannot stop or repeat chunks/uploads, change the result, or delay reaction cleanup', async failure => {
+    const dir = join(h.dir, 'owner')
+    let owner = await makeOwnPostHarness(dir, options)
+    try {
+      if (failure === 'unreadable') {
+        await owner.close()
+        const io = threadFsControls(dir); io.fail('readFileSync')
+        owner = await makeOwnPostHarness(dir, { membership: { ...options.membership, reopen: true }, memory: { reopen: true, fs: io } })
+        expect(owner.memory.store('alpha')?.readable).toBe(false)
+      } else if (failure === 'intent') owner.io.fail('writeSync')
+      const readyFlags: boolean[] = []
+      const { session, stub } = await openOwner(owner, 'alpha', {
+        getReplySettings: () => ({ ...REPLY_SETTINGS, reply_chunk_mode: 'length', reply_chunk_limit: LEAK_SENTINEL.length }),
+        ownPosts: { start(...args) { const start = owner.observer.start(...args); readyFlags.push(!!start?.ready); return start }, end: owner.observer.end },
+      })
+      const held = makeDeferredWebApiCall()
+      stub.script.post.push(held.outcome, { kind: 'ok', result: { ts: OTHER } })
+      await captureReplyAck(stub, 'alpha')
+      const pending = session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL.repeat(2), files: [replyFile(), replyFile('two.txt')], message_id: MSG_TS })
+      await replyReached(() => stub.calls.postMessage.length === 1, owner.io.durable)
+      if (failure === 'outcome') owner.io.fail('writeSync')
+      held.settle({ kind: 'ok', result: { ts: ROOT } })
+      const result = await pending
+      expect(result).toEqual({ content: [{ type: 'text', text: `Sent 2 message(s) + 2 file(s) to ${A_ALL} [ts: ${OTHER}]` }] })
+      expect(stub.calls.postMessage.map(c => 'text' in c ? c.text : undefined)).toEqual([LEAK_SENTINEL, LEAK_SENTINEL])
+      expect(stub.calls.filesUploadV2).toHaveLength(1)
+      expect(stub.calls.reactionsRemove).toEqual([{ ...REMOVE_EYES, name: 'hourglass' }])
+      expect(owner.view('alpha', A_ALL, ROOT)).toBe('joined')
+      expect(owner.view('alpha', A_ALL, OTHER)).toBe('joined')
+      // The files go under the first chunk's root, already joined, so only the chunks register.
+      expect(registrations(owner)).toHaveLength(2)
+      if (failure === 'unreadable') expect(readyFlags).toEqual([false, false, false, false])
+      await owner.flush()
+      expect(owner.threads.events.some(e => e.type === (failure === 'unreadable' ? 'read-failed' : 'append-failed'))).toBe(true)
+      expect(h.lines).toEqual([])
+      stub.script.post.push({ kind: 'ok', result: { ts: PARENT } }, { kind: 'platform', error: 'not_in_channel' })
+      const partial = await session.call('reply', { chat_id: A_ALL, text: LEAK_SENTINEL.repeat(3), files: [replyFile('later.txt')] })
+      expect(partial.isError).toBe(true)
+      expect(partial.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 1, total: 3, lastTs: PARENT, uploaded: 0, files: 1 }, 'not_in_channel'))
+      expect(stub.calls.postMessage).toHaveLength(4)
+      expect(stub.calls.filesUploadV2).toHaveLength(1)
+      expect(owner.view('alpha', A_ALL, PARENT)).toBe('joined')
+      expect(h.lines).toHaveLength(1)
+      expect(h.lines[0]).toContain('sent=1/3 uploaded=0/1:')
+      expect(h.lines[0]).toContain('not_in_channel')
+    } finally { await finish(owner) }
+  })
+
+  test.each(['hung', 'failing', 'appends failing'] as const)('upload read %s: every part posts once; the result, partial-failure text and ack cleanup are unchanged', async fault => {
+    const owner = await makeOwnPostHarness(join(h.dir, 'owner'), lookupOptions)
+    try {
+      const { session, stub } = await openOwner(owner)
+      stub.uploadGroups.push(2)
+      stub.script.completeUpload.push(completion(FILE), { kind: 'platform', error: 'file_upload_failed' })
+      if (fault === 'hung') stub.script.history.push({ kind: 'never' })
+      else if (fault === 'failing') stub.script.history.push({ kind: 'platform', error: 'channel_not_found' })
+      else { history(stub, SHARE); owner.io.fail('writeSync') }
+      await captureReplyAck(stub, 'alpha')
+      // Files only, so the upload is a new channel message whose thread is read.
+      const result = await session.call('reply', { chat_id: A_ALL, text: '', files: [replyFile('one.txt', LEAK_SENTINEL), replyFile('two.txt')], message_id: MSG_TS })
+      expect(result.isError).toBe(true)
+      expect(result.content[0]!.text).toBe(replyPartialFailureText({ where: A_ALL, sent: 0, total: 0, uploaded: 1, files: 2 }, 'file_upload_failed'))
+      // Past a hung attempt's deadline and its retry.
+      await owner.clock.advance(THREAD_MEMORY_LOOKUP_DEADLINE_MS + metadataRetryDelay(1))
+      await owner.flush()
+      expect(stub.calls.postMessage).toHaveLength(0)
+      expect(stub.calls.filesUploadV2).toHaveLength(1)
+      expect(stub.calls.reactionsRemove).toEqual([{ ...REMOVE_EYES, name: 'hourglass' }])
+      expect(h.lines).toHaveLength(1)
+      expect(h.lines[0]).toContain('sent=0/0 uploaded=1/2:')
+      expect(h.lines[0]).toContain('file_upload_failed')
+      expect(historyCalls(stub)).toHaveLength(fault === 'hung' ? 2 : 1)
+      expect(owner.owner.awaitingUploads('alpha')).toHaveLength(fault === 'hung' ? 1 : 0)
+      expect(owner.view('alpha', A_ALL, SHARE)).toBe(fault === 'appends failing' ? 'joined' : 'not-joined')
+      expect(owner.lookups!.events).toMatchObject(fault === 'failing' ? [{ kind: 'joins-lost', key: 'alpha', channel: A_ALL, threads: [] }] : [])
+      if (fault === 'appends failing') {
+        expect(owner.threads.events.some(e => e.type === 'append-failed')).toBe(true)
+        expect(confirmations(owner)).toEqual([[SHARE, true]])
+      }
+    } finally { await finish(owner) }
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Ack reaction removal
 // ---------------------------------------------------------------------------
 
@@ -2920,6 +4013,353 @@ describe('react — ack reaction removal', () => {
   })
 })
 
+// SR-6.1/SR-6.4: a successful react claims its answer through the ack
+// tracker. Only the first answer for the message and emoji, with the bot user
+// ID read with the client before the add, reaches onReactClaimed. With the
+// real react hand-off bound to it (`makeWorker`), the winning call's result
+// returns before the detached read (SR-6.2, SR-6.5), the read runs on the
+// captured client, and a losing, failed, refused or dry-run call reads nothing.
+describe('react — the first-answer claim and onReactClaimed', () => {
+  const BOT_USER = 'U0ALPHABOT'
+  const REACTED = { content: [{ type: 'text', text: `Reacted :thumbsup: to ${MSG_TS}` }] }
+  const ANSWER: Record<'ok' | 'already_reacted', SettledWebApiOutcome> = {
+    ok: { kind: 'ok' },
+    already_reacted: { kind: 'platform', error: 'already_reacted' },
+  }
+
+  /** Yield promise turns, never time, until `condition` holds; fails after a bound. */
+  async function turnsUntil(condition: () => boolean): Promise<void> {
+    const clock = createFakeClock()
+    for (let round = 0; round < 20 && !condition(); round++) await clock.flush()
+    expect(condition()).toBe(true)
+  }
+
+  /**
+   * Alpha's session with its confirmed bot user ID and a recording
+   * onReactClaimed (`told`) that passes each claim on to `worker`, then `over`.
+   */
+  async function claimSession(over: Partial<SessionToolDeps> = {}, worker?: HandoffWorker) {
+    const told: ReactClaimContext[] = []
+    const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), {
+      ...h.deps, getBotUserId: () => BOT_USER, onReactClaimed: (claim) => { told.push(claim); worker?.handoff.onReactClaimed(claim) }, ...over,
+    })
+    return { ...session, told }
+  }
+
+  const BETA_BOT = 'U0BETABOT'
+  /** Virtual time when the winning react's answer is observed, and the event ts Beta's intake must get for it. */
+  const OBSERVED_MS = 1700000000123
+  const OBSERVED_TS = '1700000000.123000'
+  /** Content the read passes over and a raw error carries; no line may hold one. */
+  const MARKERS = { body: 'reacted-body-marker', error: 'raw-error-marker' }
+  /** The reacted message as Alpha's read returns it: Beta's Tool Post, its text beside its author. */
+  const BETA_POST: SettledWebApiOutcome = { kind: 'ok', result: { messages: [{ type: 'message', ts: MSG_TS, user: BETA_BOT, text: `${MARKERS.body} ${LEAK_SENTINEL}` }] } }
+
+  type HandoffWorker = ReactHandoffFixture
+  const workers: HandoffWorker[] = []
+
+  /**
+   * The real react hand-off over the harness, as main builds it: the applied
+   * personas (`h.personas`) and confirmed bot users read at each use, a fake
+   * clock, a recording intake for A and its lines on console.error.
+   */
+  function makeWorker(): HandoffWorker {
+    const worker = makeReactHandoffFixture({
+      getAppliedPersonas: () => [...h.personas.values()],
+      identities: new Map([[h.alpha.key, BOT_USER], [h.beta.key, BETA_BOT]]),
+      clock: createFakeClock({ start: OBSERVED_MS }),
+      log: line => console.error(line),
+    })
+    workers.push(worker)
+    return worker
+  }
+
+  afterEach(async () => {
+    for (const w of workers.splice(0)) await drainReactHandoff(w)
+    for (const marker of Object.values(MARKERS)) expect(h.lines.join('\n')).not.toContain(marker)
+  })
+
+  /** What Beta's intake gets for Alpha's winning react, written out. */
+  const handedToBeta = (): { key: string; input: BotToolReactionInput } => ({
+    key: h.beta.key,
+    input: {
+      change: 'added', reactorUserId: BOT_USER, reactorPersonaName: 'Alpha Bot', emoji: 'thumbsup',
+      channel: A_ALL, messageTs: MSG_TS, eventTs: OBSERVED_TS, messageAuthorUserId: BETA_BOT,
+    },
+  })
+
+  /** Every message read on any persona's client. */
+  const reads = () => [...h.clients.values()].flatMap((stub) => stub.calls.conversationsReplies)
+
+  test.each(
+    ([['already_reacted', 'already_reacted'], ['ok', 'already_reacted'], ['already_reacted', 'ok']] as const)
+      .flatMap(([first, second]) => (['first', 'second'] as const).map((add) => [first, second, add] as const)),
+  )('overlapping reacts answered %s, then %s (the %s add answering first): only the first answer to arrive reaches onReactClaimed', async (first, second, add) => {
+    const stub = stubOf(h.alpha)
+    const adds = [makeDeferredWebApiCall(), makeDeferredWebApiCall()]
+    for (const held of adds) stub.script.reactionsAdd.push(held.outcome)
+    const { call, told } = await claimSession()
+    // What onReactClaimed had seen when each call returned, in completion order.
+    const done: { told: number; result: ToolResult }[] = []
+    const calls = [0, 1].map(() => call('react', TOOL_ARGS.react(A_ALL)).then((result) => { done.push({ told: told.length, result }) }))
+    try {
+      await turnsUntil(() => stub.calls.reactionsAdd.length === 2)
+      expect({ told: told.length, done: done.length }).toEqual({ told: 0, done: 0 })
+      const [answersFirst, answersSecond] = add === 'first' ? [adds[0]!, adds[1]!] : [adds[1]!, adds[0]!]
+      answersFirst.settle(ANSWER[first])
+      await turnsUntil(() => done.length === 1)
+      answersSecond.settle(ANSWER[second])
+      await Promise.all(calls)
+    } finally {
+      for (const held of adds) if (!held.settled) held.settle()
+      await Promise.allSettled(calls)
+    }
+    expect(done).toEqual([{ told: 1, result: REACTED }, { told: 1, result: REACTED }])
+    expect(told.map(({ persona, client, ...rest }) => rest)).toEqual([{ botUserId: BOT_USER, chatId: A_ALL, messageId: MSG_TS, emoji: 'thumbsup' }])
+    expect(told[0]!.persona).toBe(h.alpha)
+    expect(told[0]!.client).toBe(asWebClient(stub.web))
+    expect(stubOf(h.beta).callLog).toEqual([])
+  })
+
+  test("an injected claim is asked once per successful react with the persona's key, target and emoji; its false answer reaches onReactClaimed before any promise turn, its true answer never does, so the losing react's hand-off reads nothing", async () => {
+    const events: string[] = [], asked: Parameters<typeof claimReactAnswer>[] = [], told: ReactClaimContext[] = []
+    const w = makeWorker()
+    stubOf(h.alpha).script.replies.push(BETA_POST)
+    const { call } = await claimSession({
+      consumeAck: (key, channel, ts, remove, kept) => {
+        events.push('consumeAck')
+        return remove ? consumeAck(key, channel, ts, remove, kept) : consumeAck(key, channel, ts)
+      },
+      claimReactAnswer: (...args) => {
+        asked.push(args)
+        const held = claimReactAnswer(...args)
+        events.push(`claim:${held}`)
+        queueMicrotask(() => events.push('turn'))
+        return held
+      },
+      onReactClaimed: (claim) => { events.push('claimed'); told.push(claim); w.handoff.onReactClaimed(claim) },
+    })
+
+    expect(await call('react', TOOL_ARGS.react(A_ALL))).toEqual(REACTED)
+    expect(await call('react', TOOL_ARGS.react(A_ALL))).toEqual(REACTED)
+    await w.clock.advance(1)
+    await turnsUntil(() => w.intakes.length > 0)
+    await w.clock.advance(NAME_LOOKUP_TIMEOUT_MS)
+
+    expect(events).toEqual(['claim:false', 'claimed', 'turn', 'claim:true', 'turn'])
+    expect(asked.map((args) => args.slice(0, 4))).toEqual([0, 1].map(() => [h.alpha.key, A_ALL, MSG_TS, 'thumbsup']))
+    expect(asked.map((args) => typeof args[4])).toEqual(['function', 'function'])
+    expect(told).toHaveLength(1)
+    expect(stubOf(h.beta).callLog).toEqual([])
+    expect({ reads: reads().length, intakes: w.intakes }).toEqual({ reads: 1, intakes: [handedToBeta()] })
+  })
+
+  test("clientFor and getBotUserId are read together after onReplyCall, before the add; a client and bot user ID swapped while the add is held never reach the winning context or its hand-off's read and intake", async () => {
+    const events: string[] = [], told: ReactClaimContext[] = []
+    const key = h.alpha.key, original = stubOf(h.alpha), add = original.web.reactions.add
+    original.web.reactions.add = (args) => { events.push('reactions.add'); return add(args) }
+    const held = makeDeferredWebApiCall()
+    original.script.reactionsAdd.push(held.outcome)
+    original.script.replies.push(BETA_POST)
+    const w = makeWorker()
+    let botUser = BOT_USER
+    const { call } = await claimSession({
+      onReplyCall: async () => { events.push('onReplyCall') },
+      clientFor: (k) => { events.push(`clientFor:${k}`); queueMicrotask(() => events.push('turn')); return h.deps.clientFor(k) },
+      getBotUserId: (k) => { events.push(`getBotUserId:${k}`); return botUser },
+      onReactClaimed: (claim) => { told.push(claim); w.handoff.onReactClaimed(claim) },
+    })
+
+    const reacting = call('react', TOOL_ARGS.react(A_ALL))
+    try {
+      await turnsUntil(() => original.calls.reactionsAdd.length === 1)
+      expect(events.slice(0, 3)).toEqual(['onReplyCall', `clientFor:${key}`, `getBotUserId:${key}`])
+      expect(events.indexOf('reactions.add')).toBeGreaterThan(2)
+      const replacement = makeStubSlack({ token: fakeToken(BOT_TOKEN_PREFIX, 'alpha-2'), leakMarker: LEAK_SENTINEL })
+      h.clients.set(key, replacement)
+      botUser = 'U0SWAPPED'
+      w.identities.set(key, botUser)
+      held.settle()
+      expect(await reacting).toEqual(REACTED)
+      await w.clock.advance(1)
+      await turnsUntil(() => w.intakes.length > 0)
+      expect(replacement.callLog).toEqual([])
+    } finally {
+      if (!held.settled) held.settle()
+      await Promise.allSettled([reacting])
+      await w.handoff.stop()
+    }
+    expect(told).toHaveLength(1)
+    expect(told[0]!.client).toBe(asWebClient(original.web))
+    expect(told[0]!.botUserId).toBe(BOT_USER)
+    expect(events.filter((e) => /^(clientFor|getBotUserId):/.test(e))).toEqual([`clientFor:${key}`, `getBotUserId:${key}`])
+    // The hand-off read on the client and reacted as the bot user captured with the claim.
+    expect(original.callLog.map((c) => c.method)).toEqual(['reactions.add', 'conversations.replies'])
+    expect(original.calls.conversationsReplies.map(({ channel, ts }) => ({ channel, ts }))).toEqual([{ channel: A_ALL, ts: MSG_TS }])
+    expect(w.intakes).toEqual([handedToBeta()])
+  })
+
+  test.each<[string, Pick<SessionToolDeps, 'getBotUserId'>]>([
+    ['no getBotUserId', {}],
+    ['getBotUserId answering undefined', { getBotUserId: () => undefined }],
+    ['getBotUserId answering an empty ID', { getBotUserId: () => '' }],
+  ])('%s: a successful react still makes its one real claim, returns its result, records its reply call and removes its ack, and tells onReactClaimed nothing, so its hand-off reads nothing', async (_label, identity) => {
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    const asked: boolean[] = [], replyCalls: string[] = [], told: ReactClaimContext[] = []
+    const w = makeWorker()
+    const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), {
+      ...h.deps, ...identity,
+      onReplyCall: (key) => { replyCalls.push(key) },
+      claimReactAnswer: (...args) => { const held = claimReactAnswer(...args); asked.push(held); return held },
+      onReactClaimed: (claim) => { told.push(claim); w.handoff.onReactClaimed(claim) },
+    })
+
+    expect(await session.call('react', TOOL_ARGS.react(A_ALL))).toEqual(REACTED)
+    await turnsUntil(() => stubOf(h.alpha).calls.reactionsRemove.length > 0)
+    const fired = await w.clock.advance(NAME_LOOKUP_TIMEOUT_MS)
+
+    expect({ asked, replyCalls, told, removed: stubOf(h.alpha).calls.reactionsRemove, fired, reads: reads(), intakes: w.intakes })
+      .toEqual({ asked: [false], replyCalls: [h.alpha.key], told: [], removed: [REMOVE_EYES], fired: 0, reads: [], intakes: [] })
+    expect(claimReactAnswer(h.alpha.key, A_ALL, MSG_TS, 'thumbsup')).toBe(true)
+  })
+
+  test.each(['Slack failure', 'scope refusal', 'dry run'] as const)('a react ending in %s makes no claim, tells onReactClaimed nothing and its hand-off reads nothing', async (outcome) => {
+    const asked: Parameters<typeof claimReactAnswer>[] = []
+    if (outcome === 'Slack failure') stubOf(h.alpha).script.reactionsAdd.push({ kind: 'platform', error: 'invalid_name' })
+    if (outcome === 'dry run') process.env['SLACK_DRY_RUN'] = '1'
+    const target = outcome === 'scope refusal' ? B_CHANNEL : A_ALL
+    const w = makeWorker()
+    const { call, told } = await claimSession({ claimReactAnswer: (...args) => { asked.push(args); return claimReactAnswer(...args) } }, w)
+
+    const result = await call('react', TOOL_ARGS.react(target))
+    const fired = await w.clock.advance(NAME_LOOKUP_TIMEOUT_MS)
+
+    expect(result.isError === true).toBe(outcome !== 'dry run')
+    expect({ asked, told, fired, reads: reads(), intakes: w.intakes }).toEqual({ asked: [], told: [], fired: 0, reads: [], intakes: [] })
+    expect(claimReactAnswer(h.alpha.key, target, MSG_TS, 'thumbsup')).toBe(false)
+  })
+
+  test('a react with no onReactClaimed still records its answer: the same react afterwards with the callback is not first, another emoji is', async () => {
+    const plain = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), { ...h.deps, getBotUserId: () => BOT_USER })
+    expect(await plain.call('react', TOOL_ARGS.react(A_ALL))).toEqual(REACTED)
+    const { call, told } = await claimSession()
+
+    expect(await call('react', TOOL_ARGS.react(A_ALL))).toEqual(REACTED)
+    expect(told).toEqual([])
+    expect((await call('react', { ...TOOL_ARGS.react(A_ALL), emoji: 'tada' })).isError).toBeUndefined()
+    expect(told.map((claim) => claim.emoji)).toEqual(['tada'])
+  })
+
+  test.each<[string, Partial<SessionToolDeps>]>([
+    ['onReactClaimed throws', { onReactClaimed: () => { throw new Error('hand-off failed') } }],
+    ['the claim throws', { claimReactAnswer: () => { throw new Error('claim failed') } }],
+  ])('%s: the react returns its exact success result and no first answer is invented', async (_label, over) => {
+    const { call, told } = await claimSession(over)
+
+    expect(await call('react', TOOL_ARGS.react(A_ALL))).toEqual(REACTED)
+    expect(told).toEqual([])
+  })
+
+  test('a held legacy ack removal delays neither onReactClaimed nor the result, and its later failure changes neither', async () => {
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    const removal = makeDeferredWebApiCall()
+    stubOf(h.alpha).script.reactionsRemove.push(removal.outcome)
+    let removalWork: Promise<unknown> | undefined
+    const claims: boolean[] = []
+    const removals: string[] = []
+    const { call, told } = await claimSession({
+      claimReactAnswer: (key, channel, ts, emoji, remove) => {
+        const held = claimReactAnswer(key, channel, ts, emoji, async () => {
+          removalWork = remove!()
+          try { await removalWork } catch (error) {
+            removals.push('failed')
+            throw error
+          }
+        })
+        claims.push(held)
+        return held
+      },
+    })
+
+    try {
+      const result = await call('react', TOOL_ARGS.react(A_ALL))
+      expect(result).toEqual(REACTED)
+      expect(told).toHaveLength(1)
+      await turnsUntil(() => stubOf(h.alpha).calls.reactionsRemove.length > 0)
+      expect(removal.settled).toBe(false)
+      removal.settle({ kind: 'platform', error: 'internal_error' })
+      await turnsUntil(() => removals.length === 1)
+    } finally {
+      if (!removal.settled) removal.settle()
+      await Promise.allSettled([removalWork])
+    }
+    expect({ claims, removals, results: h.results }).toEqual({ claims: [false], removals: ['failed'], results: [REACTED] })
+    expect(told).toHaveLength(1)
+    expect(told[0]!.client).toBe(asWebClient(stubOf(h.alpha).web))
+    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([REMOVE_EYES])
+    expect(allCallLogs()).toEqual({ [h.alpha.key]: ['reactions.add', 'reactions.remove'], [h.beta.key]: [] })
+  })
+
+  test("with the real hand-off bound, the winning react's exact result returns before its read is due; the read then runs on Alpha's captured client, and Beta, not subscribed to the conversation, gets the whole bot-tool input while the result stays as returned", async () => {
+    const w = makeWorker()
+    const stub = stubOf(h.alpha)
+    const read = makeDeferredWebApiCall()
+    stub.script.replies.push(read.outcome)
+    w.releases.push(() => { if (!read.settled) read.settle() })
+    let answerIntake: (result: BotToolReactionIntakeResult) => void = () => {}
+    w.answer = () => new Promise((resolve) => { answerIntake = resolve })
+    w.releases.push(() => answerIntake({ status: 'stored', seq: 1 }))
+    const { call } = await claimSession({ onReactClaimed: w.handoff.onReactClaimed })
+
+    const result = await call('react', TOOL_ARGS.react(A_ALL))
+    expect(result).toEqual(REACTED)
+    expect(w.clock.pending().map((t) => t.delayMs)).toEqual([0])
+    expect({ calls: allCallLogs(), intakes: w.intakes }).toEqual({ calls: { [h.alpha.key]: ['reactions.add'], [h.beta.key]: [] }, intakes: [] })
+
+    await w.clock.advance(1)
+    expect(stub.calls.conversationsReplies.map(({ channel, ts }) => ({ channel, ts }))).toEqual([{ channel: A_ALL, ts: MSG_TS }])
+    expect(w.intakes).toEqual([])
+    read.settle(BETA_POST)
+    await turnsUntil(() => w.intakes.length > 0)
+    expect(w.intakes).toEqual([handedToBeta()])
+    expect(h.beta.channels.map((c) => c.id)).not.toContain(A_ALL)
+    expect(h.results).toEqual([REACTED])
+
+    answerIntake({ status: 'stored', seq: 1 })
+    await w.handoff.stop()
+    expect(result).toEqual(REACTED)
+    expect({ results: h.results, lines: h.lines, calls: allCallLogs() })
+      .toEqual({ results: [REACTED], lines: [], calls: { [h.alpha.key]: ['reactions.add', 'conversations.replies'], [h.beta.key]: [] } })
+  })
+
+  test.each<[string, ReactionHandoffFailureReason]>([
+    ["Alpha's read of the reacted message is rejected", 'read-failed'],
+    ["Beta's intake rejects the hand-off", 'handoff-rejected'],
+  ])("%s: the successful react's result is unchanged, one content-free line names the failure, no notice is posted and nothing retries", async (_label, reason) => {
+    const w = makeWorker()
+    const raw = new Error(`${MARKERS.error} ${LEAK_SENTINEL}`)
+    const readFails = reason === 'read-failed'
+    stubOf(h.alpha).script.replies.push(readFails ? { kind: 'reject', value: raw } : BETA_POST)
+    w.answer = () => Promise.reject(raw)
+    const { call } = await claimSession({ onReactClaimed: w.handoff.onReactClaimed })
+
+    const result = await call('react', TOOL_ARGS.react(A_ALL))
+    await w.clock.advance(1)
+    await turnsUntil(() => h.lines.length > 0)
+    await w.clock.advance(NAME_LOOKUP_TIMEOUT_MS * 2)
+
+    expect({ result, results: h.results }).toEqual({ result: REACTED, results: [REACTED] })
+    expect(h.lines).toEqual([buildReactionHandoffFailedLine({
+      reactor: { key: h.alpha.key, name: h.alpha.name },
+      ...(readFails ? {} : { receiver: { key: h.beta.key, name: h.beta.name } }),
+      chat_id: A_ALL, message_ts: MSG_TS, reason,
+    })])
+    expect(w.intakes).toEqual(readFails ? [] : [handedToBeta()])
+    expect(allCallLogs()).toEqual({ [h.alpha.key]: ['reactions.add', 'conversations.replies'], [h.beta.key]: [] })
+    expect(w.clock.pendingCount()).toBe(0)
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Reply chunking by the server-wide settings
 // ---------------------------------------------------------------------------
@@ -2984,10 +4424,14 @@ describe('tool list and instructions', () => {
       reply: { properties: ['chat_id', 'text', 'thread_ts', 'files', 'message_id'], required: ['chat_id', 'text'] },
       react: { properties: ['chat_id', 'message_id', 'emoji'], required: ['chat_id', 'message_id', 'emoji'] },
       edit_message: { properties: ['chat_id', 'message_id', 'text'], required: ['chat_id', 'message_id', 'text'] },
-      fetch_messages: { properties: ['channel', 'limit', 'thread_ts'], required: ['channel'] },
+      fetch_messages: { properties: ['channel', 'limit', 'thread_ts', 'cursor'], required: ['channel'] },
       download_attachment: { properties: ['chat_id', 'message_id'], required: ['chat_id', 'message_id'] },
-      [SET_CHANNEL_DELIVERY_TOOL]: { properties: ['channel', 'delivery'], required: ['channel', 'delivery'] },
+      [SET_CHANNEL_DELIVERY_TOOL]: { properties: ['channel', 'delivery', 'attempt_id', 'intent'], required: ['channel', 'delivery', 'attempt_id', 'intent'] },
     })
+    const fetch = tools.find(t => t.name === 'fetch_messages')!
+    expect(fetch.description).toBe(FETCH_MESSAGES_DESCRIPTION)
+    expect(fetch.inputSchema.properties!.cursor).toEqual({ type: 'string', description: FETCH_MESSAGES_CURSOR_DESCRIPTION })
+    for (const word of ['array', 'messages', 'next_cursor', 'cursor', 'thread_hybrid']) expect(fetch.description).toContain(word)
     // the whole tool definition (name, description, every schema
     // property name and description), so a reload tool or hint can't slip in.
     expect(Object.fromEntries(tools.map((t) => [t.name, reloadTermsIn(JSON.stringify(t))]))).toEqual(
@@ -3050,16 +4494,24 @@ describe('tool list and instructions', () => {
     expect(client.getInstructions()).toBe(MCP_INSTRUCTIONS)
   })
 
+  test('Thread Memory and Joins lost notices in the notice destination are for the operator, not the bot to act on', () => {
+    expect(MCP_INSTRUCTIONS.split('\n').filter(line => line.startsWith('Thread Memory'))).toEqual([
+      'Thread Memory notices (including Joins lost) in your notice destination are for the operator; do not act on them.',
+    ])
+  })
+
   // negotiated tools only; the system prompt owns full tag semantics.
-  test('the compact contract retains all nine points in order and every tool/via value under its cap', async () => {
+  test('the compact contract retains all contract points in order and every tool/via value under its cap', async () => {
     const { client } = await openPersonaSession(h.alpha)
     expect(client.getServerCapabilities()).toEqual({ tools: {} })
     expect(MCP_INSTRUCTIONS_MAX_CHARS).toBe(2048)
     expect(MCP_INSTRUCTIONS.length).toBeLessThanOrEqual(MCP_INSTRUCTIONS_MAX_CHARS)
     const points = [
       'The sender reads Slack', 'Messages arrive as the <channel> tag described in the system prompt',
-      'via:', '<@ID>', 'attachment_count', 'You may act', 'With DMs on', 'To remove the ack reaction', 'reply accepts files',
+      'via:', '<@ID>', 'attachment_count', 'In strict mode', SET_CHANNEL_DELIVERY_TOOL,
+      'Thread Memory notices', 'With DMs on', 'To remove the ack reaction', 'reply accepts files',
     ]
+    expect(MCP_INSTRUCTIONS.split('\n')).toHaveLength(points.length)
     let last = -1
     for (const point of points) {
       const at = MCP_INSTRUCTIONS.indexOf(point)
@@ -3068,14 +4520,38 @@ describe('tool list and instructions', () => {
     }
     for (const token of ['channel_name', 'part', 'chat_id', 'thread_ts', 'reply', 'download_attachment', SET_CHANNEL_DELIVERY_TOOL, 'react', 'edit_message', 'fetch_messages', 'files']) expect(MCP_INSTRUCTIONS).toContain(token)
     const via = MCP_INSTRUCTIONS.split('\n').find(line => line.startsWith('via:'))!
-    for (const value of ['dm', 'mention', 'broadcast', 'receive_all_shared', 'receive_all']) expect(via).toMatch(new RegExp(`\\b${value} =`))
+    for (const value of ['dm', 'mention', 'broadcast', 'receive_all_shared', 'receive_all', 'thread']) expect(via).toMatch(new RegExp(`\\b${value} =`))
+    expect(via).toContain('thread = a reply in a thread the bot is in')
+    expect(MCP_INSTRUCTIONS).not.toMatch(/participat|followed[ -]thread/i)
+    expect(via.split(';').find(reason => reason.trim().startsWith('thread ='))).not.toMatch(/whole.channel|exclusive|only (?:you|this persona)/i)
     expect(MCP_INSTRUCTIONS).toMatch(/<@ID> mentions a Slack user or persona/)
     expect(MCP_INSTRUCTIONS).toContain('end a turn with no terminal text unless a terminal reader needs it.')
     expect(MCP_INSTRUCTIONS).toMatch(/user ID \(U\.\.\. or W\.\.\.\) as chat_id/)
     expect(MCP_INSTRUCTIONS).toContain('With DMs off you have no DM target. Any other target is refused.')
     expect(MCP_INSTRUCTIONS).toContain('To remove the ack reaction, reply with message_id (the triggering message ts) or react to that message.')
+    const lastLine = MCP_INSTRUCTIONS.split('\n').at(-1)!
+    expect(lastLine).toMatch(/fetch_messages.*thread_hybrid.*next_cursor.*cursor.*whole thread/)
+    expect(MCP_INSTRUCTIONS).not.toContain('conversations.history')
     expect(MCP_INSTRUCTIONS).not.toContain('source=')
     assertNoLeak(MCP_INSTRUCTIONS)
+  })
+
+  test('the advertised delivery tool and parameter name every choice and explain thread_hybrid replies', async () => {
+    const { client } = await openPersonaSession(h.alpha)
+    const { tools } = await client.listTools()
+    const tool = tools.find(t => t.name === SET_CHANNEL_DELIVERY_TOOL)!
+    expect(tool).toBeDefined()
+    const delivery = tool.inputSchema.properties!.delivery as { description: string }
+    expect(tool.description).toBe(SET_CHANNEL_DELIVERY_DESCRIPTION)
+    expect(delivery.description).toBe(SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION)
+    for (const description of [tool.description, delivery.description]) {
+      expect(typeof description).toBe('string')
+      for (const value of ['off', 'mentions', 'all', 'thread_hybrid']) {
+        expect(description).toMatch(new RegExp(`\\b${value}\\b`))
+      }
+      expect(description).not.toMatch(/participat|followed[ -]thread/i)
+    }
+    expect(SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION).toContain(`"thread_hybrid" ${THREAD_HYBRID_GLOSS}`)
   })
 
   // CSCB knows only the personas on this server, so receive_all claims no more.
@@ -3096,34 +4572,37 @@ describe('tool list and instructions', () => {
 // SET_CHANNEL_DELIVERY_TOOL. The DM text is the DM cases' above; the tool
 // list, the clear-latch check and the content audits are elsewhere.
 describe('session instructions in both channel modes', () => {
+  test('pins the shared thread_hybrid gloss', () => {
+    expect(THREAD_HYBRID_GLOSS).toBe('(@mentions, broadcasts and replies in threads the bot is in)')
+  })
   /** `text` matched literally inside a pattern. */
   const literal = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
   /** The instructions a session for Alpha Bot receives when opened with the mode seam at `mode`. */
   async function instructionsIn(mode: ChannelMode): Promise<string | undefined> {
     h.mode = mode
-    if (mode === 'fungible') applyFungibleAlpha(false)
+    if (mode === 'open') applyOpenAlpha(false)
     else h.personas.set(h.alpha.key, h.alpha)
     const { client } = await openModeSession(h.alpha)
     return client.getInstructions()
   }
 
-  test('a session opened in fungible mode and one opened in declarative mode each receive exactly MCP_INSTRUCTIONS', async () => {
-    const fungible = await instructionsIn('fungible')
-    const declarative = await instructionsIn('declarative')
+  test('a session opened in open mode and one opened in strict mode each receive exactly MCP_INSTRUCTIONS', async () => {
+    const openInstructions = await instructionsIn('open')
+    const strictInstructions = await instructionsIn('strict')
 
-    expect(fungible).toBe(MCP_INSTRUCTIONS)
-    expect(declarative).toBe(MCP_INSTRUCTIONS)
-    expect(fungible).toBe(declarative!)
+    expect(openInstructions).toBe(MCP_INSTRUCTIONS)
+    expect(strictInstructions).toBe(MCP_INSTRUCTIONS)
+    expect(openInstructions).toBe(strictInstructions!)
   })
 
-  test('the text says where the persona may act, with invited channels off and on, and that the channel-delivery tool sets how closely the persona listens in a channel, called when someone there asks', () => {
-    expect(MCP_INSTRUCTIONS).toMatch(/You may act in every channel you receive/)
-    expect(MCP_INSTRUCTIONS).toMatch(/invited channels off[^\n]*these are your configured channels/)
-    expect(MCP_INSTRUCTIONS).toMatch(/with it on[^\n]*channels your Slack app belongs to[^\n]*Slack refuses others/)
-    expect(MCP_INSTRUCTIONS).toMatch(
-      new RegExp(`${literal(SET_CHANNEL_DELIVERY_TOOL)} sets listening to mentions[^\\n]*when someone in that channel asks`),
-    )
+  test('the text describes both channel modes and all listening choices when someone asks', () => {
+    expect(MCP_INSTRUCTIONS).toContain('In strict mode you may act in your configured non-off channels.')
+    expect(MCP_INSTRUCTIONS).toContain('In open mode Slack enforces channel access.')
+    expect(MCP_INSTRUCTIONS).toMatch(new RegExp(`${literal(SET_CHANNEL_DELIVERY_TOOL)} sets listening to off, mentions[^\n]*all[^\n]*thread_hybrid`))
+    expect(MCP_INSTRUCTIONS).toContain(`thread_hybrid ${THREAD_HYBRID_GLOSS}`)
+    expect(MCP_INSTRUCTIONS).toContain('Use when asked in that channel; new assignments need open mode.')
+    expect(MCP_INSTRUCTIONS).toContain('Retain attempt_id before submission; fresh assignments use fresh IDs. Retry keeps ID/channel/value and only reads history.')
   })
 })
 

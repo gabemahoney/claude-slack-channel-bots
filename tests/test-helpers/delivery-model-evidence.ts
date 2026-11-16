@@ -175,7 +175,7 @@ def response_for(state):
 def envelope_for(root, temporal=False):
     # Tiny original test inputs, not copied scheduler traces or certification.
     cfg = root / "ci/cfg/synthetic.cfg"
-    cfg.write_text('SPECIFICATION Spec\nCONSTANTS\n  Scenario = "traces"\n  Bug = "none"\n  Faults = {}\n' +
+    cfg.write_text('SPECIFICATION Spec\nCONSTANTS\n  Scenario = "traces"\n  Bug = "none"\n  Faults = {}\n  MaxMemoryHolds = 0\n  MaxPostHolds = 0\n' +
                    ('PROPERTY EventuallyDelivered\n' if temporal else 'INVARIANT NoDrop\n'))
     spec = root / "Synthetic.tla"
     spec.write_text('EngineActions == {"Deliver"}\nFaultNames == {"fault"}\n')

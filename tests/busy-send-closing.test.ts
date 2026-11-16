@@ -8,7 +8,7 @@ import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 
 const scenario = readFileSync(join(import.meta.dir, 'integration/lib/scenario.sh'), 'utf8')
-const entry = readFileSync(join(import.meta.dir, 'integration/test-50-fmk-busy-send.sh'), 'utf8')
+const entry = readFileSync(join(import.meta.dir, 'integration/test-68-fmk-busy-send.sh'), 'utf8')
 function declaration(source: string, name: string) {
   const match = source.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))
   expect(match).not.toBeNull()
@@ -45,7 +45,7 @@ function closing(options: { before?: string; after?: string; old?: boolean; omit
         'printf "call\\t%s\\t300\\t%s\\t/synthetic/agent-director.real kill\\tkill-session -t fixture\\n" "$EPOCHREALTIME" "$$" >> "${root}/tmux-shim.log"',
     ].join('\n') + '\n', { mode: 0o755 })
     const script = [
-      'set -euo pipefail', 'TEST_NAME=test-50-fmk-busy-send', names.map(name => declaration(scenario, name)).join('\n'),
+      'set -euo pipefail', 'TEST_NAME=test-68-fmk-busy-send', names.map(name => declaration(scenario, name)).join('\n'),
       declaration(entry, 'assert_busy_send_no_finished'), selection,
       'SCENARIO_FMK=1', '_SCENARIO_START_COUNT=0', '_SCENARIO_CLOSED=()', 'SCENARIO_SHELL_CMDLINE=synthetic-shell',
       'SCENARIO_AD_SHIM_LOG="$1/agent-director-shim.log"', 'SCENARIO_TMUX_SHIM_LOG="$1/tmux-shim.log"', 'SCENARIO_CSCB_RECORD="$1/record"',
@@ -69,17 +69,17 @@ function closing(options: { before?: string; after?: string; old?: boolean; omit
   } finally { rmSync(root, { recursive: true, force: true }) }
 }
 
-test('pre-repair test-50 closure fails its impossible server positive control', () => {
+test('pre-repair test-68 closure fails its impossible server positive control', () => {
   const result = closing({ old: true })
   expect(result.status).toBe(1)
   expect(result.stderr).toContain('assert_no_cscb_include_finished: positive control:')
   expect(result.stderr).toContain('no call CSCB made')
 })
-test('test-50 closes and passes the EXIT recheck using packed-driver evidence without a server', () => {
-  expect(closing()).toEqual({ status: 0, stdout: 'PASS: test-50-fmk-busy-send\n', stderr: '' })
+test('test-68 closes and passes the EXIT recheck using packed-driver evidence without a server', () => {
+  expect(closing()).toEqual({ status: 0, stdout: 'PASS: test-68-fmk-busy-send\n', stderr: '' })
 })
 test('covered runtime closes through the entry-script fixture-kill command without legacy tmux evidence', () => {
-  expect(closing({ covered: true })).toEqual({ status: 0, stdout: 'PASS: test-50-fmk-busy-send\n', stderr: '' })
+  expect(closing({ covered: true })).toEqual({ status: 0, stdout: 'PASS: test-68-fmk-busy-send\n', stderr: '' })
 })
 test('covered cleanup still fails the positive control when AD makes no tmux call', () => {
   const result = closing({ covered: true, noTmux: true })

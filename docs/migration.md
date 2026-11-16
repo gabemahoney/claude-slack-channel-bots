@@ -4,20 +4,17 @@ How to install this release over an earlier one, and how to go back. What change
 
 ## Migration
 
-This release requires agent-director 0.12.0 or later. Its 0.12.0 client and the host CLI are upgraded together, and rolled back together, by the two runbooks below. Beside them:
+For a 0.18.x host, follow [Upgrading from 0.18.x](#upgrading-from-018x). This release requires agent-director 0.12.0 or later; its client and the system-wide CLI move together through the switch-over and rollback runbooks below. The npm dependency is only the client.
 
-1. **Install the new CSCB together with agent-director 0.12.0**: installing the npm package is not the whole install. This release needs agent-director Phase 1 on the host, installed with it by the runbook in [Switching over to agent-director Phase 1](#switching-over-to-agent-director-phase-1), which also says when to install the package. The npm `agent-director` package CSCB pulls in is only the client; the binary is installed system-wide (see [Prerequisites](../README.md#prerequisites)).
-2. **(Optional) Run a periodic agent-director `find-missing` sweep**. CSCB itself runs `find-missing` once before a resume during dead-session recovery, so a bot that died on reboot comes back with its history intact. If agent-director doesn't answer that sweep (it times out or reports tmux not answering), CSCB stops the recovery there, with no resume and no fresh session, and retries it later. CSCB's own recovery needs no periodic sweep; one reconciles the rows of agent-director's other users on a cadence. A host that follows the switch-over runbook runs one: [switch-over step 11](#step-11-schedule-the-daily-expire) adds it where the host has none. Run it as a cron entry, a systemd timer or a loop script (the switch-over runbook calls this the host's sweep schedule). As a cron entry:
-   ```cron
-   * * * * * $HOME/.config/agent-director/bin/agent-director find-missing
-   ```
-   The job must run as the workers' user and resolve their tmux socket, the socket switch-over step 1 pins.
-3. **Install the startup-errors logrotate snippet** so `~/.config/claude-slack-channel-bots/startup-errors.log` doesn't grow unboundedly. Edit `USER` in the file to match the OS account running CSCB:
-   ```sh
-   sudo cp docs/logrotate-startup-errors.conf /etc/logrotate.d/claude-slack-channel-bots
-   ```
-   A snippet installed by an earlier release names `/home/USER/.claude/channels/slack/startup-errors.log` or `/home/USER/.config/cscb/startup-errors.log`: copy the file again, or change that path to `/home/USER/.config/claude-slack-channel-bots/startup-errors.log`.
-4. **Stop the old server before the first start after an upgrade from a release that kept its state in `~/.claude/channels/slack` or `~/.config/cscb`.** The state directory is now `~/.config/claude-slack-channel-bots` (`$XDG_CONFIG_HOME/claude-slack-channel-bots` when `XDG_CONFIG_HOME` is an absolute path). The first `start` moves `~/.config/cscb` there, then `~/.claude/channels/slack`, overwrites nothing in the new directory, and leaves each old name as a symbolic link to it. It refuses to start (exit 1, nothing moved, a `[slack] state-migrate: a server is still running on the old state directory …` line) while a server still runs on an old directory: run `claude-slack-channel-bots stop` (it finds the old directory), then `start`; `clean_restart --server` does both. A host that follows the switch-over runbook stops the old server in step 3 and moves the directory at the first start, in step 10; create nothing at `~/.config/claude-slack-channel-bots` before that start, or it merges the old directory into the new one instead of moving it whole. With `SLACK_STATE_DIR` set, nothing moves. What each starting point (0.13 and earlier, 0.14.0, 0.15.0) ends with is in the [CHANGELOG](../CHANGELOG.md) entry "The state directory is renamed to `~/.config/claude-slack-channel-bots`"; a conflict or a failed move is in the debug skill under [The state directory's location and its move at start](../skills/debug-slack-channel-bots/SKILL.md#the-state-directorys-location-and-its-move-at-start).
+- A periodic `agent-director find-missing` sweep is optional for CSCB recovery; [switch-over step 11](#step-11-schedule-the-daily-expire) schedules one where the host has none, as the workers' user on their tmux socket. The host's sweep schedule can be a cron entry, systemd timer or loop script; as a cron entry:
+  ```cron
+  * * * * * $HOME/.config/agent-director/bin/agent-director find-missing
+  ```
+- Install `docs/logrotate-startup-errors.conf` as `/etc/logrotate.d/claude-slack-channel-bots`, replacing `USER` with the server's OS account; update an existing snippet to `~/.config/claude-slack-channel-bots/startup-errors.log`.
+- Stop an old server before the first start that moves its state directory. Create nothing at the new location first. See [The state directory's location and its move at start](../skills/debug-slack-channel-bots/SKILL.md#the-state-directorys-location-and-its-move-at-start); with `SLACK_STATE_DIR` set, nothing moves.
+- **Enable Reaction Notices on each receiving persona's existing app.** Add any missing `reaction_added` and `reaction_removed` bot events under **Event Subscriptions → Subscribe to bot events**, and the `mpim:read` bot scope under **OAuth & Permissions → Bot Token Scopes**, or edit the app's own manifest, then reinstall the app. Follow the [do-not-paste warning](../skills/debug-slack-channel-bots/SKILL.md#the-message-archive-shows-channel-ids-re-install-each-app-to-gain-channelsread-and-groupsread) rather than replacing the app's manifest with [the shipped manifest](../slack-app-manifest.yml). Before the receiving persona's app has the reaction-event subscriptions in place, that persona gets no notices for reactions by people or other apps, though other personas served by this CSCB server deliberately using `react` still bring notices. `mpim:read` enables group-DM recognition, not group-DM message delivery. For new apps see [Quick Start](../README.md#quick-start); for behavior see [Reaction Notices](bots.md#reaction-notices).
+
+Server notices and already-closed permission prompts posted before the upgrade have no server-post marker, so reactions on them can bring notices as if they were the persona's own replies. Still-open old permission prompts remain excluded, and server notices and permission prompts posted after the upgrade are recognised.
 
 ### Switching over to agent-director Phase 1
 
@@ -184,6 +181,8 @@ The shared orchestrator prompt's "hold until after" wording goes out now (operat
 
 This runbook takes the host back to the previous CSCB on its previous compatible agent-director, whether agent-director Phase 1 was installed by [Switching over to agent-director Phase 1](#switching-over-to-agent-director-phase-1) or some other way. Both binaries are rolled back together.
 
+An earlier CSCB release without Reaction Notice support quarantines queued Reaction Notices; undelivered notices cannot be delivered by that release. This is separate from restoring agent-director's store below.
+
 - Stop all callers before restoring the previous agent-director using the released way-back procedure in step 6: restore the retained old directory and any external store's pre-upgrade copy. Schema 9 has no SQL downgrade. Data written since the upgrade is lost; restart only callers compatible with the restored CLI, including the previous CSCB.
 - The store is shared by every agent-director user on the host. Without stopping all callers first, a restore would drop the rows of other services' workers spawned since the switch-over, leaving them running with no row.
 - Every agent on the host, with every long-running agent-director process (`agent-director serve` included), is stopped before the previous binary is restored and started again after it.
@@ -273,18 +272,31 @@ Start the previous CSCB, then re-enable the host's autostart for CSCB (operator 
 claude-slack-channel-bots start
 ```
 
+### Upgrading from 0.18.x
+
+This is a hand-run preparation while CSCB is stopped. Use the [configuration reference](configuration.md#personas-configjson); no converter or compatibility reader chooses values for you.
+1. **Stop all old writes.** Disable autostart and run the old package's `claude-slack-channel-bots stop --stop-bots`; verify it succeeds before installing the new package without starting it. Keep services and bots stopped through preparation.
+2. **Preserve references outside the state directory.** Copy `config.json`, `config.json.last-applied`, `channel-delivery.json` and pending edits (`config.json.pending` or an edited, unconfirmed `config.json`), keeping their bytes and dates. These are manual references only: this release never reads `channel-delivery.json` and refuses removed configuration keys; see [Removed configuration keys](../skills/debug-slack-channel-bots/SKILL.md#removed-configuration-keys) for their replacements.
+3. **Prepare one baseline by hand.** Start from the preserved applied configuration (`config.json.last-applied`) when present, otherwise the preserved `config.json`, retaining its unrelated settings and defaults; set aside the edited `config.json`'s unconfirmed differences as pending intent before reconciling channel choices below. Write the same complete current-format configuration to `config.json` and `config.json.last-applied`, before the first start; the latter is adopted as the applied baseline. Keep the reference copies untouched.
+   - Choose `channel_mode: "strict"` or `"open"`, whatever the starting mode. For every channel in either old source (that configuration or the preserved reference `channel-delivery.json`), deliberately transfer its value into the persona's one shared `channels` list or retire it, including `off`; never infer writer order from file dates. A transferred non-off value is active in strict mode once membership is verified; explicit `off` stays silent. An unlisted, newly verified member gets `off` in strict or `mentions` in open. A value in another persona's destination channel applies as written there. See [saved and effective delivery](channel-modes.md#delivery-values-in-both-modes).
+   - Choose one `permission_prompts` destination per persona when old destinations differ: everyone in the chosen channel sees its prompts and notices; a DM goes to `dm.contact`. A formerly implicit DM now needs explicit `permission_prompts: "dm"`, `dm.enabled: true` and `dm.contact`; a channel destination must be listed. See [Permission prompts in both modes](channel-modes.md#permission-prompts-in-both-modes).
+   - Give every reference from an inactive, removed or renamed persona, or another app identity, an explicit disposition; nothing is inherited silently. You may choose `thread_hybrid` now, but the upgrade carries no Joined Threads.
+   - Keep pending channel, mode, credential-location and unrelated edits separately for later review; starting confirms none of them. Leave queues in place: accepted work retains its original text, queued emoji and reminder facts.
+4. **Finish or correct preparation before proceeding.** An interrupted pair, invalid value or destination, or removed key can refuse the start without changing the baseline or queues; the error identifies the invalid setting, and a removed-key error names its replacement. Correct both baseline files and retry. An unreadable old reference requires an explicit replacement choice. For damage after adoption, use [reviewed repair](../skills/debug-slack-channel-bots/SKILL.md#reload-shared-recovery), not another hand-written baseline; [destination failures](../skills/debug-slack-channel-bots/SKILL.md#persona-destination-failed) have their own checks.
+5. **Update every existing app and reinstall once.** Add whichever of the `member_joined_channel` and `channel_left` bot events and the `channels:read` and `groups:read` scopes the app lacks, as `slack-app-manifest.yml` names them, without pasting that manifest over the app's own (see the [do-not-paste warning](../skills/debug-slack-channel-bots/SKILL.md#the-message-archive-shows-channel-ids-re-install-each-app-to-gain-channelsread-and-groupsread)); [Update and reinstall an existing app](../skills/setup-slack-channel-bots/SKILL.md#update-and-reinstall-an-existing-app) has the steps. Inspect the current app; once its persona runs, record that evidence and read back setup and inventory separately. A new manifest install needs no extra reinstall.
+6. **Start the new release** with `claude-slack-channel-bots start`, then re-enable autostart. Startup membership catch-up finds changes while stopped and memberships neither old source held. A leave still absent at start is found; a leave and rejoin wholly during downtime, with no evidence of absence, is not reconstructed, so the channel keeps its value. Complete step 5's record and readback on the running persona.
+7. **Restore wanted pending edits as ordinary edits**, read the new preview and confirm it. See [Editing the configuration](reload.md#editing-the-configuration) for pending intent and [Confirming a change](reload.md#confirming-a-change) for confirmation and retries.
+
 ### Upgrading to personas
 
-After upgrading, every bot starts one fresh conversation; memory files are kept. Remove the Claude Code version pin after the upgrade.
-
-This major version accepts only the persona configuration format. These are the configuration steps of an upgrade from an earlier major version. Do them inside the switch-over runbook, not on their own: steps 1, 2, 3, 5 and 6 (the persona file, names, reply settings, Slack apps and who can reach each persona) at [step 1 of the switch-over](#step-1-check-the-host-and-stage-the-release), and steps 4, 7 and 8 (credentials files, crontable and `/interject` callers) at [step 7 of the switch-over](#step-7-install-the-new-cscb-without-starting-it). At switch-over step 1, these steps are written into the separate staged file, not `config.json`; step 7 puts that file in place as `config.json`. Until the new CSCB's first start, the new CLI keeps using the old state directory, `~/.claude/channels/slack`, so the persona `config.json`, the credentials files and the crontable go there; the first start moves that directory to `~/.config/claude-slack-channel-bots`.
+For a pre-persona host, do steps 1, 2, 3, 5 and 6 in the separate staged file at [switch-over step 1](#step-1-check-the-host-and-stage-the-release); do steps 4, 7 and 8 at [switch-over step 7](#step-7-install-the-new-cscb-without-starting-it). That runbook places the files, starts fresh conversations while keeping memory files, and removes the Claude Code version pin.
 
 1. **Rewrite `config.json` by hand.** A configuration from an earlier major version stops the server at start, with an error that names the offending setting and says the configuration must be converted to personas. Nothing is converted automatically and the file is not changed. Write a `personas` list as described in [Personas (config.json)](configuration.md#personas-configjson); the server-wide settings keep their names. The `debug-slack-channel-bots` skill covers this error under "Pre-persona configuration".
 2. **Pick persona names whose keys don't start with one another.** The configuration check rejects such a pair. If your bots were named `team`, `team_admin`, …, don't name a persona `team` beside `team_admin`: give the shorter name a suffix, such as `team_main` (see [Persona name and key](configuration.md#persona-name-and-key)).
 3. **Set the reply settings in `config.json`.** Choose top-level `queued_ack_reaction` and `ack_reaction`, or use their defaults after checking both emoji exist in the Slack workspace; custom emoji must exist before configuration. See [Acknowledgement reactions](server-settings.md#acknowledgement-reactions). If you had changed how replies are split, set `reply_chunk_limit` and `reply_chunk_mode` there too.
 4. **Move the tokens into credentials files.** Tokens come only from each persona's credentials file. Create one [credentials file](configuration.md#credentials-files) per persona, then remove any token environment variables you exported for the previous version.
-5. **Give each persona its own Slack app.** Your existing app can serve one persona; create another app for each additional persona. Add the `im:write`, `channels:read` and `groups:read` bot scopes to the existing app and re-install it; the `debug-slack-channel-bots` skill has the steps under "A persona can't open a DM" and "The message archive shows channel IDs".
-6. **Decide who can reach each persona.** In declarative mode, the mode an upgrade starts in, who can reach a persona is decided only by its `channels`, each channel's `delivery` and its `dm.enabled` switch (see [Channel delivery](configuration.md#channel-delivery) and [Direct messages](configuration.md#direct-messages-dmenabled)). Fungible mode changes that (see [Who can reach a persona in fungible mode](channel-modes.md#who-can-reach-a-persona-in-fungible-mode)).
+5. **Give each persona its own Slack app.** Your existing app can serve one persona; create another app for each additional persona. Add the `im:write`, `channels:read` and `groups:read` bot scopes to the existing app and re-install it; the `debug-slack-channel-bots` skill has the steps under "A persona can't open a DM" and "The message archive shows channel IDs". Also follow [Migration](#migration) for the reaction events, `mpim:read` and reinstall.
+6. **Decide who can reach each persona.** Choose strict or open mode, the shared `channels` list with explicit delivery values, one `permission_prompts` destination and `dm.enabled`. See [Delivery values](configuration.md#delivery-values), [Direct messages](configuration.md#direct-messages-dmenabled) and [Who can reach a persona in open mode](channel-modes.md#who-can-reach-a-persona-in-open-mode).
 7. **Rewrite crontable lines to name personas.** A crontable target that names a channel matches no persona, and the line is logged `unknown-persona` each time it fires. Rewrite each target as a persona's name or key (see [Scheduled Prompts](scheduled-prompts.md#scheduled-prompts-cscb_cron)).
 8. **Update `/interject` callers to send `persona`.** A request without `persona` is refused with 400, and a successful response holds only `ok` and `persona`. Change every script that calls `/interject`, including host crontab `curl` lines, to name a persona by name or key (see [Interject](bots.md#interject)).
 
@@ -292,44 +304,32 @@ This major version accepts only the persona configuration format. These are the 
 
 Once a release with the queue record kinds `submitted` and `submission-blocked` has run, going back to an older CSCB that cannot read that format is unsupported. Do not follow the phases below for such a target, even after draining the queues. There is no migration or replay workaround; see [Delivery and reconnect compatibility](agent-director.md#delivery-and-reconnect-compatibility).
 
-The four phases below apply only to a target that supports the current queue format. A supported downgrade must also start bots fresh with the target's required channels launch, or they can be unable to receive messages. Follow all four phases in order, including when the configuration already fits the target release.
+The four phases below apply only to a target that supports the current queue format. Follow all four phases in order, including when the configuration already fits the target release. An earlier release cannot use `channel_mode`, the shared list or `thread_hybrid`; restore its configuration and applied baseline from the [preserved upgrade references](#upgrading-from-018x). Those references contain no changes made since the upgrade; `channel-delivery.json` is a stale preserved reference that the current release never reads.
 
-1. **Stop sending and empty the queues.** Wait until `server.log` shows every received item delivered. Otherwise explicitly accept that undelivered messages are lost when using the earlier release.
+An earlier CSCB release without Reaction Notice support quarantines queued Reaction Notices, so undelivered notices cannot be delivered there.
+
+1. **Stop sending and empty the queues.** While the current release runs, change every `thread_hybrid` channel to another delivery value and confirm; wait until every *Thread Memory not saved* or *Thread Memory unreadable* report has been followed by *Thread Memory recovered*; then restart once with `claude-slack-channel-bots clean_restart --server` to tidy the queues at start. Wait until `server.log` shows every received item delivered. A reaction is finished when its `reaction-received` line is followed by `message-delivered` with `source=reaction`, or by `reaction-withdrawn` (which needs no delivered line). Otherwise explicitly accept that undelivered messages and Reaction Notices are lost when using the earlier release.
 2. **Disable resume on the current release.** Set `resume_enabled` to `false` in `config.json`, [confirm the pending change](reload.md#confirming-a-change), and verify `config.json.last-applied` holds `resume_enabled: false`. Keep the current server running until this is applied.
-   If the target release does not support these settings, first give every persona a valid declarative section (`permission_prompts`, and `channels` unless `dm.enabled` is `true`; see [Load-time rules](configuration.md#load-time-rules)), remove `allow_invited_channels` and every persona’s `invited`, confirm, and ensure the last-applied record holds neither.
    If the target release does not support `queued_ack_reaction`, remove it from `config.json`, confirm while the current server is running, and verify it is absent from `config.json.last-applied`.
    If the target release does not support the persona keys `model` and `effort`, remove them from every persona that sets them, confirm while the current server is running, and verify `config.json.last-applied` holds neither. These precautions do not replace any phase.
-3. **Stop with the bots, then install and pin the earlier build.** Run `claude-slack-channel-bots stop --stop-bots` and verify it succeeds, install the earlier build (for example `bun install -g claude-slack-channel-bots@<version>`), then restore its required Claude Code version pin before starting it.
-4. **Start the earlier release fresh with channels, then restore resume.** Run `claude-slack-channel-bots start`; verify every bot starts a new conversation with that release’s channels launch and no configuration load error. Only then set `resume_enabled` back to its previous value and confirm the change. The earlier build ignores `channel-delivery.json`; leave it in place.
+3. **Stop with the bots, then install and pin the earlier build.** Run `claude-slack-channel-bots stop --stop-bots` and verify it succeeds, then install the earlier build (for example `bun install -g claude-slack-channel-bots@<version>`). While stopped, save the current `config.json`, `config.json.last-applied`, `config.json.request`, `config.json.pending` and `config.json.apply` outside the state directory for upgrading again. Prepare copies of the old references with `resume_enabled: false` and phase 2's settings precautions, validate them with the earlier release, then restore them as `config.json` and `config.json.last-applied`; keep the current request, pending and apply files out of the state directory. Restore the earlier build's required Claude Code version pin before starting it.
+4. **Start the earlier release fresh with channels, then restore resume.** Run `claude-slack-channel-bots start`; verify every bot starts a new conversation with that release’s channels launch and no configuration load error. Only then set `resume_enabled` back to its previous value and confirm the change.
+
+The earlier release ignores Thread Memory and leaves its files alone. It delivers as ordinary messages replies still waiting for a thread decision, or decided since the queue was last tidied; it sets aside those decisions' records as unreadable and logs each in `server.log`, with no alert. Before upgrading again, stop with the bots and restore the saved current configuration, applied baseline and pending inputs. CSCB reports *Thread Memory changed while stopped* on upgrading again.
 
 ---
 
 ## Upgrading from pre-v0.6 (v0.5.x → v0.6.x)
 
-If you installed CSCB before v0.6.0 you may have legacy artifacts on disk that are no longer needed. Clean them up by hand; no install step removes them.
+Remove these old relay artifacts by hand; installation does not remove them. The permission relay runs through agent-director.
 
 ### 1. Remove old relay hook files
 
-The `.sh` relay hooks are no longer shipped by CSCB. Delete them if present:
-
-```sh
-rm -f ~/.claude/hooks/permission-relay.sh ~/.claude/hooks/ask-relay.sh
-```
+Delete `~/.claude/hooks/permission-relay.sh` and `~/.claude/hooks/ask-relay.sh` if present.
 
 ### 2. Remove orphan settings.json hook entries
 
-If you wired the hooks into `~/.claude/settings.json` by hand, remove the stale entries. Use this `jq` filter to check whether any are present:
-
-```sh
-jq '
-  (.hooks.PermissionRequest // [] | map(select(.hooks[]?.command | strings | test("\\.sh$")))),
-  (.hooks.PreToolUse // [] | map(select(.matcher == "AskUserQuestion" and (.hooks[]?.command | strings | test("\\.sh$")))))
-' ~/.claude/settings.json 2>/dev/null
-```
-
-Any non-empty arrays in the output are orphan entries. Remove:
+In `~/.claude/settings.json`, remove only the matching stale entries:
 
 - Any object inside `hooks.PermissionRequest` whose `hooks[].command` ends in `permission-relay.sh`.
 - Any object inside `hooks.PreToolUse` with `"matcher": "AskUserQuestion"` whose `hooks[].command` ends in `ask-relay.sh`.
-
-The modern permission relay runs automatically via agent-director — no `PermissionRequest` or `PreToolUse` hook entries for `.sh` files are needed.

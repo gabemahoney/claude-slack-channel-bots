@@ -1,6 +1,6 @@
 ---
 name: debug-slack-channel-bots
-description: Diagnose a claude-slack-channel-bots persona that is silent, down or refused — find its server-log lines, match the class, and follow the fix for every persona failure, every config.json rejection, every last-applied record failure at start, and every pending configuration change and its confirmation, in declarative and fungible channel mode, with the stored-choice file channel-delivery.json.
+description: Diagnose a claude-slack-channel-bots persona that is silent, down or refused — find its server-log lines, match the class, and follow the fix for every persona failure, every config.json rejection, every last-applied record failure at start, and every pending configuration change and its confirmation, in strict and open channel mode, with the shared authority config.json.last-applied.
 version: 1.0.0
 license: MIT
 user-invocable: true
@@ -17,9 +17,9 @@ one persona's lines, what each line means, and what the operator does about it.
 It also covers every reason `config.json` is rejected at start, every
 reason the last-applied record (`config.json.last-applied`) stops a start,
 how to read and confirm a pending configuration change
-(`config.json.pending`), both channel modes (declarative and fungible, set by
-`allow_invited_channels`), the stored-choice file
-(`channel-delivery.json`), where the state directory is and how a start moves
+(`config.json.pending`), both channel modes (`strict` and `open`, set by
+`channel_mode`), their sole shared authority (`config.json.last-applied`),
+where the state directory is and how a start moves
 it out of `~/.claude`.
 
 One broken persona never stops the server. Every healthy persona keeps serving,
@@ -48,9 +48,15 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
   without the operator's say-so.
 - NEVER edit `config.json` or a credentials file without the operator's
   say-so. Tell the operator what to change instead.
-- `config.json` names only paths and holds no tokens. If a value in it starts
-  with `xoxb-` or `xapp-`, don't display it; tell the operator a token has been
-  pasted into the configuration and must be moved to a credentials file.
+- `config.json` holds settings and paths; actual tokens belong only in
+  credentials files. If an actual token was pasted into the configuration,
+  don't display it; tell the operator to remove it and use the setup skill's
+  terminal-only [Credentials command](../setup-slack-channel-bots/SKILL.md#credentials-command).
+- Preserve configured persona names and full structured configured paths in
+  Slack and logs, safely quoted and escaped, even when token-shaped: an
+  `xoxb-` or `xapp-` prefix alone does not make these fields credentials.
+  Continue redacting actual credentials and untrusted failure text, including
+  configured names or paths quoted inside that text.
 - NEVER edit, or offer to edit, agent-director's config file
   (`~/.config/agent-director/config.toml`). An *agent-director refuses its config
   file* notice is for a human only (see
@@ -79,9 +85,13 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
   step of the "Operator actions" section of agent-director's README for it.
   Those notices are for a human only (see
   [A persona posts a Kill failed or Process outlived kill notice](#a-persona-posts-a-kill-failed-or-process-outlived-kill-notice)).
-- NEVER edit, write or delete the stored-choice file `channel-delivery.json`,
-  and move it aside only on the operator's say-so (see
-  [The stored-choice file: `channel-delivery.json`](#the-stored-choice-file-channel-deliveryjson)).
+- NEVER hand-edit or delete the shared authority `config.json.last-applied`
+  once a start has adopted it. The one exception is a baseline written by hand
+  for an upgrade that has not yet started: correct it together with
+  `config.json`, with the operator's say-so, as
+  [Removed configuration keys](#removed-configuration-keys) says.
+  Preserve authority and pending evidence during recovery (see
+  [The shared channel authority: `config.json.last-applied`](#the-shared-channel-authority-configjsonlast-applied)).
 - NEVER move, delete, relink or rewrite the state directory, its old
   location `~/.claude/channels/slack` or the symbolic link that may stand
   there, or anything in them a `state-migrate:` line names, without the
@@ -105,11 +115,13 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    and [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected).
    **Silent only in a channel its app was invited to?** See
    [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to).
+   Read [membership readiness](#membership-setup-record-and-readback) to
+   distinguish incomplete inventory from unknown or deficient app setup.
    **Answering every message in a channel, not only @mentions?** See
    [A persona receives every message in a channel](#a-persona-receives-every-message-in-a-channel).
    An `unclaimed-channel` line ending
-   `to serve this channel, use declarative mode with the channel listed` is
-   the fungible-mode form: see its reasons under
+   `to serve this channel, use strict mode with the channel listed` is
+   the open-mode form: see its reasons under
    [`unclaimed-channel`](#unclaimed-channel).
 2. **Pull every line for that key** from `server.log` (see
    [The server log](#the-server-log)).
@@ -227,7 +239,7 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change).
    Its channels, destination or DM settings were changed? See
    [A persona's routing settings were changed by a confirmed change](#a-personas-routing-settings-were-changed-by-a-confirmed-change).
-   `allow_invited_channels` was turned on or off? It applies in place, with
+   `channel_mode` was changed between strict and open? It applies in place, with
    every session kept: see the switch under
    [Confirming a pending change](#confirming-a-pending-change), then
    [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to)
@@ -260,9 +272,8 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
 11. **The cause of a hold is fixed but the persona is still held, or
     `clear-latch` printed a line and exited non-zero?** See
     [Clearing a hold by hand: `clear-latch`](#clearing-a-hold-by-hand-clear-latch).
-12. **A `channel-delivery-unreadable` line, or `[slack] channel-delivery:`
-    lines?** See
-    [The stored-choice file: `channel-delivery.json`](#the-stored-choice-file-channel-deliveryjson).
+12. **The shared authority is unreadable or invalid?** See
+    [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid).
     **An agent's `set_channel_delivery` call was refused or failed?** The
     refusals, in the order they are checked, and the failed write are under
     [`persona-channel-delivery-set`](#persona-channel-delivery-set).
@@ -407,7 +418,7 @@ A persona diagnostic line looks like this:
 | `personas[1]` | The persona's position in `config.json`'s `personas` array, counting from 0. |
 | `"Ops Bot"` | The persona's name, JSON-quoted as configured. |
 | `(key=ops_bot_5e2526f3)` | The persona's key, derived from its name. |
-| `path="…"` | The file or directory the line is about: the credentials file for credentials and Slack classes, the working directory for directory classes, the Claude config directory for `persona-config-dir-unresolvable`. Absent on `persona-start`, `unclaimed-channel` (in both channel modes), `persona-dm-dropped`, `persona-destination-failed`, `persona-invited-channel` and `persona-channel-delivery-set`. |
+| `path="…"` | The file or directory the line is about: the credentials file for credentials and Slack classes, the working directory for directory classes, the Claude config directory for `persona-config-dir-unresolvable`. Absent on `persona-start`, `unclaimed-channel` (in both channel modes), `persona-dm-dropped`, `persona-destination-failed`, `persona-open-channel` and `persona-channel-delivery-set`. |
 | After `path="…": ` (or `(key=<key>): ` when there is no path) | The cause. It may itself contain `: `. A bad token is named only by its key (`bot_token`, `app_token`) and the rule it breaks, never by value. |
 
 **The key.** A name of 1–40 characters using only `a-z`, `0-9` and `_` is its
@@ -427,7 +438,7 @@ hex digits. Don't derive it by hand: read it from the persona's
 | Outcome | Causes | Recovers on its own? |
 |---|---|---|
 | `up` | None | — |
-| `broken` | Credentials missing, unreadable, invalid or refused by Slack | No: fix the credentials file, wait for the pending change and confirm it (see [Recovering a persona broken by its credentials](#recovering-a-persona-broken-by-its-credentials)); no restart |
+| `broken` | Credentials missing, unreadable, invalid or refused by Slack | Membership-origin refusals can recover after Slack-side repair through [idle revalidation of already applied credentials](#membership-recovery-bounds); invalid/revoked credentials stay held while validation fails. Otherwise fix the credentials file, wait for the pending change and confirm it (see [Recovering a persona broken by its credentials](#recovering-a-persona-broken-by-its-credentials)); no restart |
 | `retrying` | Slack unreachable, working directory missing or unusable, or `claude_config_dir` unresolvable | Yes, once the cause clears; no restart |
 
 A persona that is not up posts nothing to Slack, and its instance, if one is
@@ -445,15 +456,25 @@ running are not affected. See
 
 Delivery diagnostics carry metadata only: the persona, source, conversation or sender,
 timestamp, sender ID and the diagnostic's counts, paths or reason. They never carry
-message text. RAW event, injected-message and first actual Slack dispatch lines
+message text. For Slack replies delivered because the bot is in the thread,
+`via=thread` follows `sender_id` in `message-received`, `message-delivered` and
+related dispatch/retry diagnostics, including recovered work. Other delivery
+reasons add no suffix. RAW event, injected-message and first actual Slack dispatch lines
 retain their existing text excerpts; receipt confirmation has its own line.
+
+The shared `message-delivered`, `message-retyped`, `message-not-taken-in`,
+`message-partial-receipt` and `delivery-stuck` classes use `source=slack`,
+`interject`, `cron` or `reaction`. For `reaction`, `chat_id` is the conversation,
+`ts` is the reaction event's timestamp (not the reacted message's), and
+`sender_id` is the reactor's user ID or bot ID. Reaction Notices get no
+acknowledgement stage.
 
 ### `message-not-saved`
 
 - **Line:** `[slack] message-not-saved: persona="<name>" (key=<key>) source=slack chat_id="<chat>" ts="<ts>" sender_id="<sender>" count=<n> path="<path>" code=<errno>`
-- **Meaning:** The incoming message could not be durably stored on this attempt; it was not accepted. Every failure is counted, including Slack retries.
+- **Meaning:** The incoming message could not be durably stored on this attempt; it was not accepted. Every failure is counted, including Slack retries. A reaction that could not be saved shows `source=reaction chat_id="<chat>" ts="<event ts>" sender_id="<reactor>"`: the conversation, the reaction event's timestamp (not the reacted message's) and the reactor's ID.
 - **Cause:** The queue directory or disk cannot be written.
-- **Fix:** Check free space, mount availability and permissions on the named path. For Slack, follow **Message not saved** below; retry a failed injected message once storage works.
+- **Fix:** Check free space, mount availability and permissions on the named path. For a Slack message, follow **Message not saved** below; retry a failed injected message once storage works. A reaction gets no *Message not saved* warning and no *Message saved after retry* correction, because both concern Slack messages. A reaction from Slack was not acknowledged, so Slack sends it again a few times; it is lost only if no copy is saved before Slack stops resending. A reaction another persona's bot made with its `react` tool is not sent again: it is lost, and that persona logs [`reaction-handoff-failed`](#reaction-handoff-failed) with `reason=store-failed`. A [`reaction-received`](#reaction-received) line confirms a copy was saved, but logging is best effort, so a missing line alone does not prove the reaction was lost.
 
 The same class also records attempts to correct a warning after the exact message
 was saved:
@@ -467,10 +488,11 @@ was saved:
 in the same place. `outcome=failed` concerns that Slack operation: the message
 has already been saved, so this line is not a reason to resend it.
 
-Each operation waits up to 10 seconds. `reason=timeout` means no result arrived
-within that bound; Slack may still complete it, so both an edit and a correction
-can appear. `reason=missing_message_ts` means the original warning's response
-lacked its message timestamp: no edit was possible, so CSCB tries the correction.
+Each operation waits up to 10 seconds for Slack's answer. `reason=timeout`
+means no result arrived within that bound; Slack may still complete it, so both
+an edit and a correction can appear. `reason=missing_message_ts` means the
+original warning's response lacked its message timestamp: no edit was possible,
+so CSCB tries the correction.
 
 Other failure reasons are redacted Slack error descriptions. Check the original
 destination and Slack connectivity/access if correction fails; CSCB does not retry
@@ -521,8 +543,8 @@ evidence may no longer qualify after restart.
 ### `delivery-stuck`
 
 - **Line:** `[slack] delivery-stuck: persona="<name>" (key=<key>) source=<source> chat_id="<chat>" ts="<ts>" sender_id="<sender>" reason=<reason> age_ms=<ms>`
-- **Meaning:** The oldest item has waited over five minutes in a reportable blocked state.
-- **Cause:** The reason identifies the current obstacle to typing or confirming the head item.
+- **Meaning:** The message CSCB is delivering has waited over five minutes in a reportable blocked state. That is usually the oldest waiting message; if an earlier held thread reply is released while a later message is already being delivered, it is that later message until it is confirmed (see [Delivery notices](#delivery-notices)).
+- **Cause:** The reason identifies the current obstacle to typing or confirming that message. `chat_id`, `ts`, `sender_id` and `age_ms` are all that message's.
 - **Fix:** Follow the matching reason under **Delivery stuck** below. Nothing behind it skips ahead.
 
 ### `queue-record-unreadable`
@@ -552,6 +574,47 @@ evidence may no longer qualify after restart.
 - **Meaning:** CSCB cannot write the shared bot system prompt, so this persona is not launched.
 - **Cause:** The state directory or its disk cannot be written.
 - **Fix:** Check the named file, state directory permissions, mount and free space. Launch retries follow the existing backoff; other personas continue.
+
+### `persona-thread-stamp-undecided`
+
+- **Line:** `[slack] persona-thread-stamp-undecided: personas[<i>] "<name>" (key=<key>): channel=<channel>: <cause>`
+- **Meaning:** Thread-dependent replies in this channel remain unacknowledged. Existing Joined Threads are retained but select nothing while the Channel Stamp is undecided; independent @mentions, Broadcasts, DMs and unaffected channels/personas can continue. The diagnostic goes to the server log only, once per persona/channel episode.
+- **Cause:** The channel's shared state has an undecided Channel Stamp, including during a staged restoration whose other settings remain readable.
+- **Fix:** Follow [reload-shared-recovery](#reload-shared-recovery) to review and apply the restoration. Finite Slack retries do not guarantee recovery of never-accepted events; check the app's event subscriptions and resend missing replies after recovery.
+
+### `reaction-received`
+
+- **Line:** `[slack] reaction-received: persona="<name>" (key=<key>) chat_id="<chat>" message_ts="<ts>" change=<added|removed> emoji="<emoji>" <user|bot_id>="<reactor>" seq=<n>`
+- **Meaning:** Someone added (`change=added`) or removed (`change=removed`) the reaction `<emoji>` on one of this persona's messages in `<chat>`, and CSCB saved it for the persona (for a reaction from Slack, before acknowledging Slack's event). `message_ts` is the reacted message's timestamp, `user` the reactor's user ID (`bot_id` for a reactor with no user ID) and `seq` the reaction's place in the persona's queue. It is logged once, when the reaction is first saved: a copy Slack sends again, before or after a restart, logs nothing. Saved is not delivered. CSCB next reads the reacted message; then either the reaction waits its turn like any message, and its [`message-delivered`](#message-delivered) line shows `source=reaction chat_id="<chat>" ts="<event ts>" sender_id="<reactor>"`, or a [`reaction-withdrawn`](#reaction-withdrawn) line says why it is never delivered.
+- **Cause:** A reaction to a message the persona's bot posted, by a person, by an app that is not a persona's, or by another persona's bot with its `react` tool, in a conversation the persona serves now. [`reaction-dropped`](#reaction-dropped) lists the reactions it doesn't take.
+- **Fix:** No action is needed. A reaction gets no acknowledgement reaction and never prompts a reply reminder. A reaction that could not be saved logs no `reaction-received` line: it logs [`message-not-saved`](#message-not-saved) with `source=reaction`, the conversation as `chat_id`, the event's `ts` and the reactor as `sender_id`, and no *Message not saved* warning is posted. A reaction from Slack is not acknowledged, so Slack sends it again; one from another persona's `react` tool is not sent again, and that persona logs [`reaction-handoff-failed`](#reaction-handoff-failed) with `reason=store-failed`. Fix the storage as that entry says.
+
+### `reaction-dropped`
+
+- **Line:** `[slack] reaction-dropped: persona="<name>" (key=<key>) chat_id="<chat>" message_ts="<ts>" reason=<reason>[ refusal=<refusal>]`
+- **Meaning:** A reaction to one of this persona's messages in `<chat>` was not saved and is never delivered to the persona's bot. `message_ts` is the reacted message's timestamp. Nothing sends it again: CSCB acknowledged Slack's event, and never resends a reaction from another persona's `react` tool. Nothing is posted to Slack. The persona's settings in effect when the reaction arrived decide it; a confirmed change applies from the next reaction.
+- **Cause:** `reason` names the first check that failed. `no-reactor`: the event names neither a user ID nor a bot ID. `notices-off`: the persona's applied `reaction_notices` is `false`, so it takes no reaction, in any conversation, whether from Slack or from another persona's `react` tool. `dm-disabled`: the reaction is in a DM and the persona's `dm.enabled` is off. `unserved-conversation`: the persona does not serve the channel: in strict mode it is not one of the persona's `channels`; in either mode its choice there is `off`, missing or not trustworthy, or its membership of the channel is not verified. A group DM is always unserved, even when listed: the app's channel inventory never holds one (see [A reaction in a group DM brings no Reaction Notice](#symptom-a-reaction-in-a-group-dm-brings-no-reaction-notice)). `open-refused`: an open-mode channel refusal; `refusal` names the failed check: `channel-id-malformed` (the conversation ID is not a channel ID), `flag-missing` (the event's envelope has no `is_ext_shared_channel` flag), `flag-not-boolean` (that flag is neither true nor false) or `externally-shared` (the channel is shared with another organization). Four kinds of reaction are dropped with no line: one to a message that is not this persona's, an event that is not a reaction to a message, the persona's own reaction, and Slack's event for a reaction by the bot of any persona this server has connected since it started, a removed persona's included (a reaction another persona's bot makes with its `react` tool reaches this persona through CSCB instead; see [`reaction-received`](#reaction-received)).
+- **Fix:** For `notices-off`, if the persona should get reaction notices, set its `reaction_notices` to `true` (or remove the key) and confirm the change; it applies in place (see [Confirming a pending change](#confirming-a-pending-change)). Only reactions arriving after the confirmation are affected, either way: reactions already saved before the setting went off are still delivered, and the ones dropped while it was off are not. For `dm-disabled`, if the persona should hear DMs, set `dm.enabled` to `true` and confirm the change (see [Confirming a pending change](#confirming-a-pending-change)). For `unserved-conversation`, if the persona should hear the channel, add it to the persona's `channels` and confirm the change (strict mode), or give it a choice other than `off` there; if its membership is not verified, see [`channel-membership-unresolved`](#channel-membership-unresolved). For `channel-id-malformed` and `externally-shared`, nothing: open mode never delivers those. For `no-reactor`, `flag-missing` and `flag-not-boolean`, nothing: Slack sent an incomplete event. Nothing resends a dropped reaction; a later reaction is decided afresh.
+### `reaction-withdrawn`
+
+- **Line:** `[slack] reaction-withdrawn: persona="<name>" (key=<key>) chat_id="<chat>" message_ts="<ts>" reason=<reason>[ failed_condition=<condition>]`
+- **Meaning:** A reaction to a message in `<chat>` was saved for this persona but is never typed to its bot. The queue passes it, so the messages behind it go on. `message_ts` is the reacted message's timestamp. When several reasons apply, the line names only the first applicable reason: `server-post`, `conversation-unknown`, `group-dm`, then `open-refused` (an open-mode channel refusal). The decision is final, after a restart too, and it is logged once.
+- **Cause:** `server-post`: the reacted message is a notice or permission prompt CSCB posted as the persona. `conversation-unknown`: the channel was in open mode and Slack's conversation lookup failed or timed out. `group-dm`: the conversation is a group DM, in either mode. A new reaction in a group DM is dropped before it is saved (see [`reaction-dropped`](#reaction-dropped)), so this withdrawal concerns only a reaction saved on stale or inconsistent conversation facts. `open-refused`: an open-mode channel refusal; `failed_condition` names the check that failed: `not-a-channel` (not a public or private channel), `externally-shared` (shared with another organization), or Slack's `not_in_channel` or `channel_not_found` when CSCB read the message. The mode is the one in effect when the reaction was saved, not the mode now.
+- **Fix:** For `server-post` and `group-dm`, nothing: those reactions are never delivered. For `failed_condition=not-a-channel` or `externally-shared`, no action is needed: open mode never delivers those conversations. For `not_in_channel` or `channel_not_found`, invite the persona's app to the channel. For `conversation-unknown`, check the persona's Slack connection and that its app has the manifest's `channels:read`, `groups:read` and `mpim:read` scopes; re-install the app if it lacks one. Nothing resends a withdrawn reaction; a later reaction is decided afresh.
+
+### `reaction-message-unknown`
+
+- **Line:** `[slack] reaction-message-unknown: persona="<name>" (key=<key>) chat_id="<chat>" message_ts="<ts>"`
+- **Meaning:** CSCB could not read the reacted message, so it took it for one of the bot's own replies and prepared the reaction notice without `thread_ts`: the bot is not told which thread the message is in. The notice then waits its turn like any message, so this line does not mean the bot has it; use [`message-delivered`](#message-delivered) to confirm that. Logged once, for this reaction only.
+- **Cause:** Slack's message read failed, timed out or returned no message with that timestamp, for example after the message was deleted. In strict mode, Slack's `not_in_channel` or `channel_not_found` answer has the same effect. When a reason in `reaction-withdrawn` applies, that line is logged instead and nothing is delivered.
+- **Fix:** No action is needed for an occasional line. If it repeats, check the persona's Slack connection and that its app has the manifest's `channels:history`, `groups:history` and `im:history` scopes, and is in the channel.
+
+### `reaction-handoff-failed`
+
+- **Line:** `[slack] reaction-handoff-failed: persona="<name>" (key=<key>)[ receiver="<name>" (key=<key>)] chat_id="<chat>" message_ts="<ts>" reason=<reason>`
+- **Meaning:** This persona's bot reacted with its `react` tool to the message `message_ts` in `<chat>`, and the reaction worked, but CSCB could not pass it on to the persona whose bot posted that message (`receiver`, named once CSCB knew it). That persona gets no notice of this reaction, and CSCB does not try again. The reaction itself stays on the message in Slack, and the reacting bot's tool result was not affected.
+- **Cause:** `reason` names the step that failed. `read-failed`: Slack refused or failed this persona's read of the message, or answered something CSCB could not use. `read-timeout`: the read took longer than 2 seconds. `message-missing`: Slack returned no message with that timestamp, for example after it was deleted. `store-failed`: the receiving persona could not save the reaction; the lines just before usually say why, for example [`message-not-saved`](#message-not-saved). `handoff-rejected` and `internal-failed`: an internal error.
+- **Fix:** No action is needed for an occasional `read-failed` or `read-timeout`. If they repeat, check this persona's Slack connection and that its app has the manifest's `channels:history`, `groups:history` and `im:history` scopes. For `store-failed`, fix the storage as that entry says. For `handoff-rejected` and `internal-failed`, report it as a bug, with the persona's lines around it.
 
 ### `persona-start`
 
@@ -646,20 +709,34 @@ evidence may no longer qualify after restart.
 
 ### `persona-credentials-refused`
 
-- **State:** `broken`. Doesn't recover on its own. Logged by the connection
-  manager, with the credentials file as `path`.
+- **State:** `broken`. Logged by the connection manager, with the credentials
+  file as `path`. A membership-origin refusal (Slack refusing the bot token on
+  the membership inventory, or on `bots.info` at bring-up) has bounded idle
+  revalidation of already applied credentials; other refusals keep the
+  confirmed-change recovery below. See [Membership recovery bounds](#membership-recovery-bounds).
 - **Meaning:** Slack answered and refused a token. Three checks can refuse:
-  - `bot_token refused by auth.test: Slack error <code>` (at bring-up)
+  - `bot_token refused by auth.test: Slack error <code>` (at bring-up; also
+    when the `bots.info` installation check that follows `auth.test` refuses
+    the bot token)
   - `app_token refused by the Socket Mode open: Slack error <code>` (at
     bring-up, or when a running persona's connection is reopened)
   - `bot_token refused by a Web API call (<method>): Slack error <code>` (a
-    running persona's call, such as `chat.postMessage`, was refused)
+    running persona's call, such as `chat.postMessage` or the membership
+    inventory's `users.conversations`, was refused)
 - **Codes:** for `auth.test` and the Socket Mode open, any Slack error except
   the five transient ones listed under `persona-slack-unreachable`. The
   expected ones are `not_authed`, `invalid_auth`, `account_inactive`,
-  `token_revoked`, `token_expired` and `not_allowed_token_type`. For a Web API
-  call, only `invalid_auth`, `token_revoked`, `account_inactive` and
-  `not_authed`.
+  `token_revoked`, `token_expired` and `not_allowed_token_type`. For `bots.info`
+  and a Web API call, only `invalid_auth`, `token_revoked`, `account_inactive`
+  and `not_authed`. Any other non-transient code there, such as
+  `missing_scope` or `access_denied`, is that call's own failure and refuses
+  no token: after `bots.info` at bring-up the persona comes up with its
+  installation unverified, and on the membership inventory it stays up with
+  reason `access` (see
+  [`channel-membership-inventory-incomplete`](#channel-membership-inventory-incomplete)).
+  A transient code is not a refusal either: on `bots.info` at bring-up the
+  persona is `persona-slack-unreachable` and retries, as for `auth.test`, and
+  on the membership inventory it is reason `transport`.
 - **Fix:** Get a working token from the persona's Slack app and have the
   operator write it into the credentials file, in their own terminal, with
   `claude-slack-channel-bots credentials <persona>` (it asks for both tokens
@@ -898,6 +975,289 @@ evidence may no longer qualify after restart.
   or `[slack] persona "<name>" (key=<key>): closing its Slack connection for its claude_config_dir failed: <error>`
   line is an internal error: report it as a bug.
 
+### `channel-membership-unresolved`
+
+- **Line:** `[slack] channel-membership-unresolved persona=<key> channel=<id>: <cause>. <action>`,
+  without ` channel=<id>` when no single channel applies. `<action>` is
+  `Authenticated reconciliation is required; elapsed time is not membership evidence.`,
+  or for `shared-state-unreadable`
+  `Restore readable, writable shared state; finite Slack retries cannot guarantee recovery of unsaved events.`,
+  or for `history-unresolved`
+  `Current inventory cannot establish this conflicting history; retain the hold for reviewed state recovery.`
+
+The named persona/channel lacks trustworthy current membership. The causes are
+`installation-unverified`, `current-membership-missing`, `eligibility-missing`,
+`event-order-conflict`, `shared-state-unreadable` and `history-unresolved`.
+`installation-unverified`
+requires a verified installation of the current authenticated app (see its
+[inventory reason](#channel-membership-inventory-incomplete)); `current-membership-missing` requires
+responsive inventory after startup, a gap or a live observation. A received
+join/leave is authenticated history, not current presence or absence by itself.
+`eligibility-missing` needs valid channel type and sharing metadata;
+`event-order-conflict` needs reconciliation beyond the conflicting observations.
+`shared-state-unreadable` requires readable shared state before recovery. Once
+a persona's scan has ended, the same missing evidence is also posted to its
+destination as a
+[*Channel membership evidence unresolved*](#membership-evidence-unresolved)
+report.
+
+`history-unresolved` means current inventory cannot establish historical order:
+contradictory event IDs, ambiguous old history, or a missed absence crossing a
+newer explicit choice. The hold preserves the original uncertainty and choice
+across retry/restart; later absent or present scans and live events cannot
+invent a leave, default or order. Retain it for reviewed state recovery; there
+is no operator clear action here and no instruction to edit durable state.
+
+Read [membership readiness](#membership-setup-record-and-readback) and the
+inventory cause. Unaffected current positives and already accepted queues can
+progress. Listing a channel, receiving a message, posting or waiting supplies
+no missing authority. Dry run starts no membership clients/probes/retries and
+grants no fresh channel-assignment authority.
+
+### `channel-membership-storage-failed`
+
+- **Line:** `[slack] channel-membership-storage-failed persona=<key> channel=<id>: event-not-durable. Restore readable, writable shared state; finite Slack retries cannot guarantee recovery of unsaved events.`
+
+`event-not-durable` means the named channel's event or retained history obligation
+could not be saved. Restore readable, writable shared state and free disk space;
+read readiness again after the idle retry. A live event is acknowledged only
+after its effect or all required recovery evidence is durable; if neither write
+succeeds it stays unacknowledged. An in-run hold cannot guarantee crash recovery
+of evidence that was never written. Accepted work remains queued.
+
+### `channel-membership-inventory-incomplete`
+
+- **Line:** `[slack] channel-membership-inventory-incomplete persona=<key>: pages=<n> positives=<n> reason=<reason> slack_error=<code> deadline_at=<ms> next_attempt_at=<ms> retry_after_seconds=<s>. Restore the named access or storage evidence; background retries continue. Accepted work remains queued.`
+  `slack_error`, `deadline_at`, `next_attempt_at` and `retry_after_seconds`
+  appear only when known.
+
+The persona's current inventory is unverified, scanning or incomplete, never
+an empty complete inventory. Read `pages`, `positives`, `reason`, optional
+`slack_error`, `deadline_at`, `next_attempt_at` and `retry_after_seconds`; the
+readback uses `problem`, `slackError`, `deadline`, `nextAttemptAt` and
+`retryAfterSeconds`. Times ending in `At` and `deadline` are epoch milliseconds;
+Retry-After is seconds.
+
+A scan needs a verified installation first. `auth.test` identifies the bot;
+when it gives no app ID, `bots.info` supplies it, which needs the `users:read`
+bot scope.
+
+The scan then reads `users.conversations` for public and private channels
+(`channels:read` and `groups:read`) on the persona's current connection. Add
+a missing scope with
+[Update and reinstall an existing app](../setup-slack-channel-bots/SKILL.md#update-and-reinstall-an-existing-app).
+A complete inventory still verifies no subscriptions or reinstall (see
+[membership readiness](#membership-setup-record-and-readback)).
+
+A reason classifies the last failure, not the call that failed: an inventory
+read, a retry's revalidation of the persona, or the refusal that broke it all
+use the same reasons. Read it with the persona's own class lines since its
+latest `persona-start` line (see [Triage](#triage)).
+
+| Reason | Missing evidence and action |
+|---|---|
+| `none` | No classified failure yet; read `inventory.state` for unverified/scanning progress. |
+| `deadline`, `transport`, `malformed-page` | No complete responsive pagination; `transport` includes Slack's transient errors and rate limits. Restore Slack/network service and let the bounded retry run. A short or empty page with a cursor is not completion. |
+| `access` | A non-transient Slack refusal outside the four authentication codes, for example `missing_scope` or `access_denied`. On a persona that is up with a verified installation, `users.conversations` refused: restore the app's `channels:read`/`groups:read` scopes or workspace access through the linked update and reinstall, and the bounded retry reads the pages again on the same connection without revalidating it. On a persona that is broken, or whose installation is unverified, Slack refused its credentials check (`auth.test` or the Socket Mode open) instead: read `slack_error` and follow [`persona-credentials-refused`](#persona-credentials-refused). Record setup separately. |
+| `installation-unverified` | The persona's current app installation is unverified. For a persona that is up with no credentials line, `auth.test` accepted the bot token but `bots.info` was refused with a non-transient, non-authentication code, usually for a missing `users:read`, or described another bot. It stays up on its `auth.test` identity: DMs and already accepted queued work continue, while a channel message or mention whose membership is unresolved, and join and leave events, stay held and unacknowledged, and bot channel choices are not applied. An unverified installation grants no membership. Add `users:read` through the linked update and reinstall; each retry checks the installation again with the held credentials. |
+| `authentication` | Slack refused a token (`invalid_auth`, `token_revoked`, `account_inactive` or `not_authed`): the bot token or the Socket Mode app token. The reason does not say which; use the key and check named on the credentials line when one is present. If the persona is broken, follow [`persona-credentials-refused`](#persona-credentials-refused): only a break on `users.conversations`, or on `bots.info` at bring-up, is also revalidated on its held credentials within [Membership recovery bounds](#membership-recovery-bounds); a refusal from posting or any other call recovers only through a confirmed change. If the persona is still up, a retry's revalidation was refused and the persona keeps its current connection; fix the token as that entry says. Invalid/revoked credentials stay held while validation fails. |
+| `storage` | Restore shared-state readability/writability; no incomplete negative batch may remove choices. |
+| `superseded`, `current-membership-missing` | The observation is obsolete or current evidence was invalidated; wait for the replacement reconciliation. |
+| `eligibility-missing`, `event-order-conflict`, `history-unresolved` | Follow [`channel-membership-unresolved`](#channel-membership-unresolved); current scans cannot solve unprovable history. |
+
+Independent valid positive channels can progress before completion. A failed,
+partial or expired scan cannot prove absence. Complete catch-up can establish
+a still-visible leave, but a leave/rejoin wholly during downtime without
+authoritative absence cannot be reconstructed, so that channel keeps its
+value. Both outcomes apply to the first start after an upgrade too (see
+[Upgrading from 0.18.x](../../docs/migration.md#upgrading-from-018x)).
+Repeated absence cannot erase
+a freshly reviewed future preference; a never-joined preference is not a leave.
+
+### `channel-membership-inventory-complete`
+
+- **Line:** `[slack] channel-membership-inventory-complete persona=<key>: pages=<n> positives=<n> reason=none. Inventory evidence is current; subscription/reinstall verification is separate.`
+
+All available pages and the final shared-state write completed for the current
+authenticated persona. No repair is needed for that inventory. Read setup
+separately: completion does not verify subscriptions or reinstall completion.
+A gap, identity change or new unresolved observation invalidates current
+completeness; saved historical evidence alone does not restore it.
+
+### `channel-membership-deadline`
+
+- **Line:** none of its own. It shows as `reason=deadline` on the
+  [`channel-membership-inventory-incomplete`](#channel-membership-inventory-incomplete)
+  line.
+
+A membership request, credential validation/open, or whole reconciliation
+attempt expired. Inventory reports `reason=deadline`; this typed timeout code
+is not a separate claim that a leave or repair occurred. Follow the next retry
+in readiness and [Membership recovery bounds](#membership-recovery-bounds).
+Expiry never authorizes discarding held history or accepted work.
+
+### Membership recovery bounds
+
+Membership requests have a **10000 ms end-to-end deadline**
+(`MEMBERSHIP_REQUEST_TIMEOUT_MS`), covering queued
+HTTP work; the membership client disables SDK retries, so SDK retry time cannot
+extend it. Composite credential validation/socket open is bounded at **20000 ms**
+(`MEMBERSHIP_VALIDATION_TIMEOUT_MS`),
+and a whole reconciliation attempt at **120000 ms** (`MEMBERSHIP_ATTEMPT_TIMEOUT_MS`).
+Inventory requests use
+**200 channels per page** (`MEMBERSHIP_PAGE_LIMIT`) and follow every cursor,
+including after empty pages.
+
+Idle retries start with **5000 ms** (`MEMBERSHIP_RETRY_MIN_MS`), doubling
+through 10000, 20000 and 40000
+to a local ceiling of **60000 ms** (`MEMBERSHIP_RETRY_MAX_MS`). A longer Slack
+`Retry-After` controls the
+actual next start. Long waits are rearmed in chunks no larger than
+**2147483647 ms** (`MEMBERSHIP_TIMER_MAX_MS`), never shortened into an early retry.
+
+With responsive Slack and persistence after repair, recovery takes at most the
+remaining in-flight deadline + next permitted retry wait (including Retry-After)
++ successful available-page scan/persistence work. For example, with 30000 ms
+remaining, a 90-second Retry-After, validation/open taking at most 20000 ms and
+two pages taking at most 10000 ms each, that is **160000 ms plus persistence**,
+provided the successful attempt completes within its 120000 ms bound. This is
+a conditional calculation, not a fixed total independent of pages/rate limits.
+
+Membership repair runs while idle without a new message, reconnect request or
+restart. Which repair applies depends on the persona's state and the call that
+failed, not on the inventory reason alone.
+
+When `users.conversations` refuses a persona that is up with a verified
+installation, for any reason but authentication, the persona stays up. The
+next permitted attempt reads the pages again on the same connection, without
+revalidating it.
+
+A persona that is up with an unverified installation, or broken by a
+membership-origin refusal (Slack refusing its bot token on
+`users.conversations`, or on `bots.info` at bring-up), is revalidated at each
+attempt. The existing credential/client owner checks the already applied
+credentials, the current authenticated installation and all persona admission
+checks; pending credential edits are not adopted, and a failed check leaves the
+persona as it was.
+
+A persona broken by any other refusal, such as a posting call's, is not
+revalidated: its scans report that refusal's reason, and it keeps the
+confirmed-change recovery. This is not automatic recovery for every broken
+persona.
+
+Shutdown, the persona's teardown and a new persona incarnation cancel the
+running attempt and its pending retry. A connection change cancels a running
+inventory and schedules nothing itself while the connection reconnects; once
+it is up or failed, a fresh attempt runs no sooner than
+`MEMBERSHIP_RETRY_MIN_MS` after the cancel. A newer observation during the inventory cancels it and
+schedules a fresh attempt no sooner than `MEMBERSHIP_RETRY_MIN_MS` later. A
+cancelled or superseded result changes nothing. Elapsed time grants no membership.
+
+### `channel-membership-setup-unknown`
+
+- **Line:** `[slack] channel-membership-setup-unknown persona=<key>: missing=<subscriptions|none> unknown=<subscriptions|none> reinstall=<complete|incomplete|unknown> reason=<reason>. Check both required subscriptions and reinstall completion for the authenticated app; record the result through the local /membership-readiness operator interface.`
+  ` reason=<reason>` appears only when a reason is known.
+  `channel-membership-subscriptions-missing` and
+  `channel-membership-reinstall-incomplete` use the same form and action;
+  `channel-membership-setup-verified` ends
+  `Manual evidence covers this installation; current inventory is reported separately.`
+
+The persona has no complete manual evidence for its current installation.
+`installation-unverified`, `shared-state-unreadable`, `manual-evidence-missing`
+and `manual-evidence-incomplete` identify what is unavailable. Unknown does not
+mean missing subscriptions. Read the current installation, restore any named
+state/authentication problem, then [inspect and record setup](#membership-setup-record-and-readback).
+Setup uncertainty does not invalidate independently trustworthy current positives.
+
+### `channel-membership-subscriptions-missing`
+
+- **Line:** `[slack] channel-membership-subscriptions-missing persona=<key>: missing=<subscriptions> unknown=<subscriptions|none> reinstall=<complete|incomplete|unknown>. Check both required subscriptions and reinstall completion for the authenticated app; record the result through the local /membership-readiness operator interface.`
+
+Manual evidence says one or both required subscriptions are missing from this
+persona's current app. Add the named `member_joined_channel` or `channel_left`
+subscription and finish the required reinstall, then record and read back the
+result. Check `reinstall` too: it can remain `incomplete` even when missing
+subscriptions is the primary setup state. Inventory completion cannot repair it.
+
+### `channel-membership-reinstall-incomplete`
+
+- **Line:** `[slack] channel-membership-reinstall-incomplete persona=<key>: missing=none unknown=<subscriptions|none> reinstall=incomplete. Check both required subscriptions and reinstall completion for the authenticated app; record the result through the local /membership-readiness operator interface.`
+
+The current app's manual record says reinstall is incomplete. Finish that app's
+installation in Slack, then record the observed result and read it back. Neither
+a successful scan nor a received event completes this setup evidence.
+
+### `channel-membership-setup-verified`
+
+- **Line:** `[slack] channel-membership-setup-verified persona=<key>: missing=none unknown=none reinstall=complete. Manual evidence covers this installation; current inventory is reported separately.`
+
+The current authenticated installation has both subscriptions manually verified
+and reinstall recorded complete. No redundant reinstall is needed on ordinary
+restart. This says nothing about inventory completeness; check its separate
+state. An old installation's record cannot verify a replacement app.
+
+### `channel-membership-setup-recorded`
+
+- **Line:** `[slack] channel-membership-setup-recorded persona=<key>: saved manual evidence for the authenticated current installation; inventory and saved choices are unchanged.`
+
+Manual setup evidence was saved for the current authenticated installation.
+Read back `setup.state`, both subscription values and `reinstall`: a saved
+record can describe a deficiency or unknown state. Inventory and saved choices
+are unchanged; this line alone does not mean setup is verified.
+
+### Membership setup record and readback
+
+Use local **POST `/membership-readiness`** on the running server. No CLI
+subcommand, bot tool or new runtime credential is needed. Run the commands on
+the server host, using its loopback listener; the actual peer address is
+checked, and forwarded headers cannot make a remote request local. If `bind`
+provides no loopback listener, resolve that listener configuration first.
+
+1. Check that `server.port` belongs to the running PID, then read the persona
+   (replace `ops_bot` with its applied key or name). Stop if any check fails:
+
+   ```sh
+   STATE_DIR="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}"
+   CSCB_PID=$(cat "$STATE_DIR/server.pid") && kill -0 "$CSCB_PID" &&
+   CSCB_PORT=$(jq -er --argjson pid "$CSCB_PID" 'select(.pid == $pid) | .port | select(type == "number" and floor == . and . >= 1 and . <= 65535)' "$STATE_DIR/server.port") &&
+   curl --fail-with-body --silent --show-error "http://127.0.0.1:$CSCB_PORT/membership-readiness" \
+     -H 'Content-Type: application/json' --data '{"action":"read","persona":"ops_bot"}' | jq .
+   ```
+
+2. Read `view.setup.installation`: `teamId`, `appId`, `botUserId`, `botId`.
+   If it is absent, resolve `setup.reason` before recording. Inspect that exact
+   app/workspace in Slack: both `member_joined_channel` and `channel_left` under
+   Event Subscriptions, `channels:read`/`groups:read` bot scopes, and reinstall
+   completion. New manifest installs include these; existing apps need missing
+   subscriptions/scopes added and their one-time reinstall completed. Ordinary
+   CSCB startup does not inspect or change Slack installation settings.
+3. Record only what was checked. Replace the four ID placeholders below with
+   the readback IDs. Each subscription accepts `verified`, `missing` or
+   `unknown`; `reinstall` accepts `complete`, `incomplete` or `unknown`. Change
+   the example values to record known deficiencies or uninspectable setup:
+
+   ```sh
+   curl --fail-with-body --silent --show-error "http://127.0.0.1:$CSCB_PORT/membership-readiness" \
+     -H 'Content-Type: application/json' --data '{"action":"record","persona":"ops_bot","installation":{"teamId":"<team ID>","appId":"<app ID>","botUserId":"<bot user ID>","botId":"<bot ID>"},"subscriptions":{"member_joined_channel":"verified","channel_left":"verified"},"reinstall":"complete"}' | jq .
+   ```
+
+4. A successful write returns `kind: "recorded"`, `revision` and `view`.
+   Repeat the read request: its response is `{ok:true,persona,view}`. Keep
+   `view.inventory.state` (`unverified`, `scanning`, `incomplete`, `complete`)
+   separate from `view.setup.state` (`verified`, `missing-subscriptions`,
+   `incomplete-reinstall`, `unknown`). Setup also exposes `missingSubscriptions`,
+   `unknownSubscriptions`, `reinstall` and, when present, `record` with the
+   submitted evidence, `recordedAt` and `order`.
+
+HTTP 400 means invalid input; 404 means no such applied persona; 409 means
+unverified/mismatched installation or a superseded write; 503 means storage
+failed. Read again after resolving the cause; never edit durable authority by
+hand. Records survive restart for the same installation but cannot be borrowed
+by another. Scans, silence, a single event and elapsed time verify neither
+subscriptions nor reinstall. Dry run supplies no production installation
+identity or record-write authority. Tokens stay in the existing terminal
+credentials workflow, never these requests or chat.
+
 ### `unclaimed-channel`
 
 - **State:** the persona is `up`; this is about a message, not the persona.
@@ -906,10 +1266,10 @@ evidence may no longer qualify after restart.
   received the message, one event logs at most one drop line, and the line
   has no `path` part.
 
-**Declarative mode** (`allow_invited_channels` absent or `false`):
+**Strict mode** (`channel_mode` absent or `"strict"`):
 
 - **Line:** `[slack] unclaimed-channel: personas[<i>] "<name>" (key=<key>): message in channel <id> not delivered: no applied persona lists this channel`
-- **Meaning:** In declarative mode, the persona's Slack app is a member of a
+- **Meaning:** In strict mode, the persona's Slack app is a member of a
   channel that no persona lists in `channels`, so the message reached no one.
   Logged by each persona whose app received it. A channel that another
   applied persona lists logs nothing: that persona receives the message. An
@@ -921,41 +1281,40 @@ evidence may no longer qualify after restart.
     confirmed (see [Confirming a pending change](#confirming-a-pending-change))
     it applies in place, with no restart, and the persona keeps its instance
     and conversation.
-  - For a public or private channel that is not externally shared: turn
-    fungible mode on, which serves every such channel each persona's app is
-    a member of (see
-    [Turning fungible mode on or off](../../docs/channel-modes.md#turning-fungible-mode-on-or-off)
-    and, before that, [Who can reach a persona in fungible mode](../../docs/channel-modes.md#who-can-reach-a-persona-in-fungible-mode)).
+  - In open mode too, explicitly assign a non-off shared channel choice in `config.json` and confirm it. Selecting open mode alone does not create a choice. Only public or private channels that are not externally shared can be served in open mode. A newly verified join without a choice creates `mentions`; an existing `off` choice stays off. Listening requires current eligible membership.
   - Remove the app from the channel.
 
-  Turning fungible mode on is a fix for a channel only,
-  and never for a group DM: a group DM is never served in either mode. If the ID is a group DM (someone @mentioned the persona in
+  These channel choices are never for a group DM: a group DM is never served in either mode. If the ID is a group DM (someone @mentioned the persona in
   a multi-person DM), the line is expected: do not add that ID to any
   persona's `channels`, because that would deliver group-DM mentions to it.
 
-**Fungible mode** (`allow_invited_channels` is `true`):
+**Open mode** (`channel_mode` is `"open"`):
 
-- **Line:** `[slack] unclaimed-channel: personas[<i>] "<name>" (key=<key>): message in channel <id> not delivered in fungible mode: <reason>; to serve this channel, use declarative mode with the channel listed`
-- **Meaning:** In fungible mode, a `message` event the persona's app received
-  was refused by the fungible path, so it reached no one. One line per
+- **Line:** `[slack] unclaimed-channel: personas[<i>] "<name>" (key=<key>): message in channel <id> not delivered in open mode: <reason>; to serve this channel, use strict mode with the channel listed`
+- **Meaning:** In open mode, a `message` event the persona's app received
+  was refused by the open path, so it reached no one. One line per
   refused `message` event, logged by the persona that received it, and no
-  `persona-invited-channel` line for it. An `app_mention` never logs this
-  line in fungible mode: the `message` event carrying the same mention
-  decides. For every reason but `the channel ID is malformed`, the line's
-  own advice is the one way to serve such a channel: declarative mode, with
-  the channel listed. Neither mode serves a malformed channel ID.
+  `persona-open-channel` line for it. An `app_mention` never logs this
+  line in open mode: the `message` event carrying the same mention
+  decides. For every reason but `the channel ID is malformed`, serving
+  such a channel requires strict mode, a non-off saved choice and current
+  verified membership; a group DM remains excluded. Open-discovered Slack
+  Connect membership may already have `mentions` saved and become eligible
+  on switching to strict without a new listing. Review the
+  [preview and off-first warning](../../docs/channel-modes.md#turning-open-mode-on-or-off).
+  Neither mode serves a malformed channel ID.
 - **Reasons and fixes:** the conditions are checked in this order, and the
   first that fails is the reason:
 
   | `<reason>` | Meaning | Fix |
   |---|---|---|
-  | `the conversation is not a public or private channel` | The event's `channel_type` is neither `channel` (public) nor `group` (private), or it is missing. A DM and a group DM never reach this check (see [`persona-dm-dropped`](#persona-dm-dropped)). | None in fungible mode. Serve it in declarative mode, with the channel listed, or remove the app from the conversation. |
+  | `the conversation is not a public or private channel` | The event's `channel_type` is neither `channel` (public) nor `group` (private), or it is missing. A DM and a group DM never reach this check (see [`persona-dm-dropped`](#persona-dm-dropped)). | None in open mode. Serve it in strict mode, with the channel listed, or remove the app from the conversation. |
   | `the channel ID is malformed` | The channel ID isn't a `C…` or `G…` ID of capital letters and digits. | None: `config.json` can't list such an ID either, so neither mode serves it. If the line repeats, report it as a bug, with the line. |
-  | `the event envelope carries no is_ext_shared_channel flag` | Slack's event envelope didn't say whether the channel is externally shared, so the server can't tell and doesn't serve it. | None in fungible mode. Serve it in declarative mode, with the channel listed. |
-  | `the event envelope's is_ext_shared_channel flag is not a boolean` | The envelope's flag is neither `true` nor `false`, so the server can't tell and doesn't serve it. | None in fungible mode. Serve it in declarative mode, with the channel listed. |
-  | `the channel is externally shared` | Slack marks the channel as externally shared (Slack Connect). Fungible mode never serves it. | Serve it in declarative mode, with the channel listed, or remove the app from the channel. |
+  | `the event envelope carries no is_ext_shared_channel flag` | Slack's event envelope didn't say whether the channel is externally shared, so the server can't tell and doesn't serve it. | None in open mode. Strict mode requires a non-off saved choice and current verified membership; review the [switch warning](../../docs/channel-modes.md#turning-open-mode-on-or-off). |
+  | `the event envelope's is_ext_shared_channel flag is not a boolean` | The envelope's flag is neither `true` nor `false`, so the server can't tell and doesn't serve it. | None in open mode. Strict mode requires a non-off saved choice and current verified membership; review the [switch warning](../../docs/channel-modes.md#turning-open-mode-on-or-off). |
+  | `the channel is externally shared` | Slack marks the channel as externally shared (Slack Connect). Open mode never serves it. | Serve it only in strict mode, at a non-off saved choice, with current verified membership, or remove the app. Open discovery may already have saved `mentions`; review the [preview and off-first warning](../../docs/channel-modes.md#turning-open-mode-on-or-off) before switching. |
 
-  Serving a channel in declarative mode means turning fungible mode off for
+  Serving a channel in strict mode means turning open mode off for
   every persona (see
   [Channel modes](../../docs/channel-modes.md#channel-modes)); there is no per-channel
   exception.
@@ -977,26 +1336,26 @@ evidence may no longer qualify after restart.
 - **Group DMs:** a group DM (a direct message with more than one person) is
   never delivered, in either channel mode, and never logs
   `persona-dm-dropped`, whatever `dm.enabled` says. This is by design, not a
-  fault; turning `dm.enabled` on, or turning fungible mode on, does not
+  fault; turning `dm.enabled` on, or turning open mode on, does not
   change it. What it logs:
   - a group-DM message that Slack marks with `channel_type` `mpim` logs the
     plain `[slack] persona "<name>" (key=<key>) dropped message from
     channel=<id> …: group-dm` line, in both modes;
   - an @mention of the persona in a group DM arrives as an `app_mention`
-    event without `channel_type`. In declarative mode it logs
-    [`unclaimed-channel`](#unclaimed-channel). In fungible mode it logs no
+    event without `channel_type`. In strict mode it logs
+    [`unclaimed-channel`](#unclaimed-channel). In open mode it logs no
     line of its own, only the server's
     `[slack] RAW app_mention event persona=<key>: …` intake line.
 
-### `persona-invited-channel`
+### `persona-open-channel`
 
 - **State:** the persona is `up`; this is an audit line, not a failure.
-- **Line:** `[slack] persona-invited-channel: personas[<i>] "<name>" (key=<key>): hears <public|private> channel <id> in fungible mode, at channel delivery <mentions|all>`
-- **Meaning:** The persona hears that channel in fungible mode. The line:
-  - is logged only in fungible mode (`allow_invited_channels` is `true`),
-    never in declarative mode;
+- **Line:** `[slack] persona-open-channel: personas[<i>] "<name>" (key=<key>): hears <public|private> channel <id> in open mode, at channel delivery <off|mentions|all|thread_hybrid>`
+- **Meaning:** The persona hears that channel in open mode. The line:
+  - is logged only in open mode (`channel_mode` is `"open"`),
+    never in strict mode;
   - is logged once per persona life and channel, on the first event from
-    that channel that takes the persona's fungible path (a `message` event
+    that channel that takes the persona's open path (a `message` event
     in a public or private channel that isn't externally shared), whether
     the message is delivered or not, and in addition to any drop line for
     that event. A message that doesn't mention the persona, or one queued
@@ -1004,11 +1363,13 @@ evidence may no longer qualify after restart.
   - is logged by each persona for each channel: two personas in one channel
     log a line each, and one persona logs a line per channel;
   - is logged again for a persona torn down and brought back, and afresh
-    after every server start. A confirmed change to `allow_invited_channels`
+    after every server start. A confirmed change to `channel_mode`
     doesn't reset it;
   - goes only to `server.log`, and carries no message text, user ID or
     token.
 
+  Hearing this event alone proves no current membership and grants no tool authority; check
+  [membership readiness](#membership-setup-record-and-readback) for holds.
   The delivery shown is the one in force at that first event; a later
   change to it logs no second line of this class (a change made with
   `set_channel_delivery` logs a
@@ -1016,135 +1377,182 @@ evidence may no longer qualify after restart.
 - **Log rotation:** because the line is logged once per persona life and
   channel, log rotation can discard a channel's only audit line on a
   long-running server (see [The server log](#the-server-log)). After a
-  restart, the first fungible-path event from each channel logs it again.
+  restart, the first open-path event from each channel logs it again.
 - **Cause:** The persona's Slack app is a member of that public or private
-  channel, the channel isn't externally shared, and `allow_invited_channels`
-  is `true`. The invite alone is enough: Slack sends the app events only from
-  channels it is in, so nothing about membership is stored and no Slack call
-  checks it.
+  channel, the channel isn’t externally shared, and `channel_mode` is `"open"`. The audit records hearing an event; listening still follows the shared applied choice.
 - **Fix:** None when the persona is expected to hear the channel. To stop the
   persona hearing it, remove its app from the channel in Slack. To change the
   delivery shown, ask the persona in that channel: its agent calls
   `set_channel_delivery`, which logs a
-  [`persona-channel-delivery-set`](#persona-channel-delivery-set) line. The
-  delivery shown is `mentions`, whatever the persona chose for the channel,
-  when the channel is another persona's fungible destination (its
-  `invited.permission_prompts` channel), so two personas can't answer each
-  other in a loop. It is `mentions` too when the persona has no stored
-  choice for the channel, or when the stored-choice file can't be read (see
-  [`channel-delivery-unreadable`](#channel-delivery-unreadable)). A persona
+  [`persona-channel-delivery-set`](#persona-channel-delivery-set) line. A newly verified join without a choice uses `mentions` in open mode; duplicate joins preserve explicit choices, including `off`. Without such a join or an assignment, delivery is `off`; an unreadable authority has no fallback choice (see [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid)). A persona
   that hears a channel but doesn't answer there is covered under
   [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to).
 - **Two personas at `all` in one channel:** don't. Each receives every
   message there, the other's posts included, so the two can keep answering
   each other with no human involved. Keep at most one at `all` (see
-  [Channel delivery in fungible mode](../../docs/channel-modes.md#channel-delivery-in-fungible-mode)).
+  [Delivery values in both modes](../../docs/channel-modes.md#delivery-values-in-both-modes)).
 
 ### `persona-channel-delivery-set`
 
 - **State:** the persona is `up`; this is an audit line, not a failure.
-- **Line:** `[slack] persona-channel-delivery-set: personas[<i>] "<name>" (key=<key>): stored choice for channel <id> set from <none|mentions|all> to <mentions|all>, at channel delivery <mentions|all> after the loop guard`
+- **Line:** `[slack] persona-channel-delivery-set: personas[<i>] "<name>" (key=<key>): delivery choice for channel <id> set from <none|off|mentions|all|thread_hybrid> to <off|mentions|all|thread_hybrid>, at channel delivery <off|mentions|all|thread_hybrid>`
 
-  `from` is the persona's stored choice for the channel before the call
-  (`none` when it had none), `to` is the choice the call stored, and
-  `at channel delivery` is the persona's channel delivery there after the
-  loop guard. The line has no `path` part.
-- **Meaning:** The persona's agent called `set_channel_delivery` and the
-  server stored its choice for that channel. The line:
-  - is logged once for each accepted call, including one that stores the
-    value already stored, and including in dry run, where the tool stores
-    its choice the same way and makes no Slack call;
-  - is logged only in fungible mode (`allow_invited_channels` is `true`):
-    in declarative mode every call is refused;
+  `from` is the stored choice before the application (`none` when absent),
+  `to` is the newly saved choice, and `at channel delivery` is the persona's
+  channel delivery there at that application, equal to the saved choice. The line has no `path` part.
+- **Meaning:** A new logical attempt durably applied one channel choice. The line:
+  - is logged once per new durable application, including a deliberate
+    same-value assignment with a fresh identifier. Retaining an attempt or
+    rejection, reading history, retrying and reopening do not log another
+    application. Recovery that establishes the original durable application
+    in the running server logs it once at its original position;
+  - follows application-time checks of open mode (`channel_mode: "open"`),
+    an active current persona/session and authenticated current eligible
+    public/private membership with explicit non-external-sharing evidence.
+    Strict mode and dry run cannot create assignments or attempt records;
   - goes only to `server.log`, in the `[slack]` stream: no
     `startup-errors.log` entry, and nothing is posted to Slack;
-  - carries no message text, user ID or token.
+  - carries no attempt identifier, message text, user ID or token.
 
-  The choice applies from the next event in that channel. It is kept in the
-  state directory across server restarts and persona relaunches, and across
-  `allow_invited_channels` turned off and on again by confirmed changes: it
-  doesn't apply while the switch is off, and applies again once it is back
-  on. A confirmed change that retires the persona's key drops its stored
-  choices: a removal, a rename that changes the key, or a destructive modify
-  under the same key (`working_directory` or `credentials_file` changed, or
-  `name` changed without changing the key; see **Destructively modified
-  persona** under
-  [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change)),
-  with a drop line naming the reason `retired by a confirmed change` (see
-  [The store's `[slack] channel-delivery:` lines](#the-stores-slack-channel-delivery-lines),
-  which also covers the drops a start makes). The persona brought up fresh is
-  at `mentions` in every channel until its agent stores a choice again.
-- **Cause:** The persona's agent called the tool, usually because someone in
-  that channel asked it to listen to every message there (`all`), or only to
-  @mentions and `@here` or `@channel` broadcasts (`mentions`).
-- **Fix:** None when the change was expected. To undo it, ask the persona in
-  that channel to set the other value; the other fixes for a persona that
-  receives every message in a channel are under
+  The choice applies from the next event and persists with its attempt outcome
+  in `config.json.last-applied`, without editing `config.json` or consuming
+  pending operator intent. Both modes use that shared choice; changing modes
+  preserves it. A replacement persona has a new incarnation and inherits
+  neither the old choices nor access to the old attempt history.
+
+- **Inputs:** Supply exactly `channel`, `delivery`, `attempt_id` and `intent`.
+  The channel must be a valid public/private ID (`C…` or `G…`); delivery is
+  `off`, `mentions`, `all` or `thread_hybrid`. Create and retain a nonempty,
+  non-whitespace identifier before first submission.
+
+  Each deliberate choice,
+  including the same value, uses a fresh identifier and `intent: assignment`.
+  After response loss, reconnect or restart, use `intent: retry` with the
+  original identifier/channel/value. Same-binding duplicates under either
+  intent refer to one attempt; retry never obtains a new assignment position.
+- **Cause:** Someone asked the persona to change its listening choice.
+  Current authenticated discovery can authorize a fresh assignment before any
+  message arrives or the inventory finishes.
+
+  Listing a channel, hearing a
+  message, holding historical membership or a saved choice, and dry-run
+  placeholders do not supply current membership. Unresolved membership still
+  holds affected new assignments; see [membership recovery](#channel-membership-inventory-incomplete).
+- **Fix:** None when the change was expected. To undo a known applied choice,
+  request a deliberate new assignment with a fresh identifier, subject to
+  current authorization. Other fixes are under
   [A persona receives every message in a channel](#a-persona-receives-every-message-in-a-channel).
-  Note:
-  - a line with `to all` and `at channel delivery mentions` means the loop
-    guard holds the channel at `mentions`, because it is another applied
-    persona's fungible destination (its `invited.permission_prompts`
-    channel), so two personas can't answer each other in a loop. The choice
-    stays stored, and applies once the channel is no longer that
-    destination.
-- **Refusals:** a refused call logs no line of this class, and no other
-  line: the agent gets a tool error, and nothing is stored or written. A
-  call is checked in this order, and the first rule it breaks gives the
-  error:
-  1. The session resolves to no applied persona, with the same refusals the
-     other tools give:
+
+- **Results and history:** Every result opens
+  `Channel delivery for persona "<name>" (key=<key>), channel <id>: `. An
+  applied result reads
+  `newly applied at position <n>; original saved <value>, effective <value>.`,
+  or `previously applied` in place of `newly applied` when it reports a
+  retained application. A historical result adds `This history read made no new assignment.`
+
+  An outcome reports both the saved choice and the effective delivery, which
+  can differ (see [saved and effective delivery](../../docs/channel-modes.md#delivery-values-in-both-modes)).
+  The current facts and mode follow separately, as
+  `Current saved <value>, effective <value> in <strict|open> mode.`;
+  a later operator choice is not overwritten. When current evidence is missing,
+  removed, ineligible or untrustworthy, the result identifies what is unavailable
+  rather than inventing an effective choice:
+  `Current saved/effective facts are unavailable: <reason>.` or
+  `Current saved <value>; effective delivery is unavailable: <reason>.`
+
+  An authorized current session of the same incarnation may read this history
+  in strict mode or dry run without writing. Inactive, stale, foreign or
+  replacement sessions cannot retrieve the original incarnation's outcomes.
+
+  The outcome clauses below omit the persona/channel prefix and separate
+  current-facts suffix.
+
+  | Attempt outcome | Outcome clause |
+  |---|---|
+  | Not-applied: membership | `this attempt did not apply and changed no choice: current eligible membership was not verified. Its retained outcome cannot be retried as a new assignment.` |
+  | Not-applied: inactive session/persona | `this attempt did not apply and changed no choice: the session or persona became inactive. Its retained outcome cannot be retried as a new assignment.` |
+  | Not-applied: strict mode | `this attempt did not apply and changed no choice: strict mode did not authorize an assignment. Its retained outcome cannot be retried as a new assignment.` |
+  | Not-applied: dry run | `this attempt did not apply and changed no choice: dry run did not authorize an assignment. Its retained outcome cannot be retried as a new assignment.` |
+  | Not-applied: write-failed | `this attempt did not apply and changed no choice: the application failed before durable activation. Its retained outcome cannot be retried as a new assignment.` |
+  | Pending | `the retained attempt is pending; no duplicate application was made. Its outcome requires recovery.` |
+  | Unresolved | `the durable outcome is unresolved; application or nonapplication cannot be established. Preserve the identifier and seek recovery; retry cannot create an assignment.` |
+
+  Restoring eligibility does not
+  turn that retained rejection into an assignment.
+
+  **What to do with each:**
+  - **No result** (the response was lost, or the session reconnected or
+    restarted): call again with the same `attempt_id`, channel and value and
+    `intent: retry`. It reports the retained outcome and makes no second
+    application. A retry whose identifier has no retained history reports
+    *unresolved* and creates nothing. A new identifier would make a new
+    assignment instead.
+  - **Pending:** the attempt is retained but its application is not yet
+    settled. **Unresolved:** the shared state cannot show whether it applied.
+    For both, preserve the identifier, then have the operator repair storage
+    ([`reload-record-write-failed`](#reload-record-write-failed)) or use
+    [reviewed repair](#reload-shared-recovery), and retry with the same
+    identifier afterwards.
+  - **Assert the same value again, cancel or revise a choice:** a deliberate
+    same-value assignment uses a fresh identifier and `intent: assignment`. An
+    operator's own channel choices, and cancelling or revising them before
+    confirmation, follow [Editing the configuration](../../docs/reload.md#editing-the-configuration)
+    and [Confirming a change](../../docs/reload.md#confirming-a-change).
+- **Refusals:** No new assignment diagnostic is produced for input/access
+  refusal, pending, not-applied or unresolved results. A rejected attempt may
+  retain metadata; absence of a success line does not establish the outcome.
+  Access and input validation precede history lookup; known attempts are
+  resolved before fresh-assignment mode and dry-run checks.
+  1. Session/access failures include:
      - `Tool "set_channel_delivery" refused: this session is not matched to a persona.`
-       The calling session is matched to no persona.
      - `Tool "set_channel_delivery" refused: persona key=<key> is not an applied persona.`
-       Besides a key absent from the applied configuration, it covers a key
-       that a confirmed change still in progress is retiring (a destructive
-       modify, from the change's apply until its teardown has settled), and
-       a session the server has dropped (the teardown of a removal or
-       destructive modify) or replaced with a later registration, even while
-       the persona is still in `config.json`. Once the persona's session is
-       up again, its agent can call the tool again.
-  2. Declarative mode:
-     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): invited channels are off, and in declarative mode channel delivery is set by the operator in config.json.`
-     Expected while `allow_invited_channels` is absent or `false`: the
-     operator sets each channel's `delivery` in `config.json`.
-  3. The stored-choice file is unreadable:
-     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): the stored-choice file "<path>" is not readable, so no channel delivery can be stored. To fix: the operator moves the file aside, then restarts the server.`
-     See [`channel-delivery-unreadable`](#channel-delivery-unreadable).
+     - `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): this request cannot access or change channel delivery.`
+       (an attempt lookup that found the session inactive or the request invalid).
+     An absent, retiring, down, disconnected, dropped or superseded session
+     is refused even when its key remains in `config.json`. A later authorized
+     session can read retained history only for its own current incarnation.
+  2. Fresh assignment in strict mode:
+     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): strict mode is active, so new assignments are unavailable. A retained same-incarnation attempt can still be read without writing.`
+     Fresh assignment in dry run:
+     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): dry run cannot create assignments or attempt records. Retained same-incarnation history can be read without writing.`
+  3. Unavailable authority may give:
+     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): the shared channel authority "<path>" is not trustworthy, so the outcome is unresolved and no channel delivery can be stored. The operator must preserve the evidence and restore trustworthy shared state before retrying.`
+     See [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid).
   4. A bad value:
-     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): delivery "<value>" is not "mentions" or "all".`
+     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): delivery "<value>" is not "off" or "mentions" or "all" or "thread_hybrid".`
      A value that is missing, not a string, or anything but 1 to 48
      letters and underscores reads
-     `… delivery is not "mentions" or "all" (the value given is not shown).`
-  5. An unknown channel:
-     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): channel "<channel>" is not known: it is not a channel this persona has heard a message from in fungible mode, or holds a choice for. Only a public or private channel that is not externally shared can be set.`
+     `… delivery is not "off" or "mentions" or "all" or "thread_hybrid" (the value given is not shown).`
+  5. An invalid channel:
+     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): channel "<channel>" needs a valid public or private channel ID and authenticated current eligible membership for a new assignment.`
      A value that isn't 1 to 24 capital letters and digits reads
-     `… the channel is not known (the value given is not shown): …`. The
-     persona has heard the channel only once a message from it took its
-     fungible path in its current life (see
-     [`persona-invited-channel`](#persona-invited-channel)); an externally
-     shared channel, a group DM and a DM never count. Fix: wait for a
-     message in that channel, then ask again.
-- **A failed write:** a failed write of the stored-choice file gives the
-  agent
-  `Tool "set_channel_delivery" failed for persona "<name>" (key=<key>): the stored-choice file "<path>" could not be written, so the choice was not stored and channel delivery is unchanged.`
-  and logs one `[slack] channel-delivery: cannot store the channel delivery of persona=<key> for channel <id> in "<path>"…`
-  line, with no `persona-channel-delivery-set` line. The choice is not
-  stored and the persona's channel delivery is unchanged. The line's forms,
-  including the one where the refused choice stays on disk, and the cause
-  and fix are under
-  [The store's `[slack] channel-delivery:` lines](#the-stores-slack-channel-delivery-lines).
-  Once the cause is fixed, ask the persona to set the value again.
-- **An input the store refuses:** a call that passed every refusal above can
-  still be turned away by the store's own check of what it would write. The
-  agent gets
-  `Tool "set_channel_delivery" failed for persona "<name>" (key=<key>): the choice was not stored (the store refused its <field>), so channel delivery is unchanged.`
-  This is not one of the refusals above, which the server checks before the
-  store. Nothing is stored or written, and no line is logged. `<field>` is
-  `key`, `channel`, `delivery`, `declaration` or `set_at`. The refusals above
-  screen the first four, so in practice it is `set_at`: the host's clock gave
-  no valid time to store with the choice. Fix: have the operator check the
-  host's system clock, then ask the persona to set the value again.
+     `… the channel (the value given is not shown) needs a valid public or private channel ID and authenticated current eligible membership for a new assignment.`
+     A syntactically valid channel still requires current eligible membership
+     at application; a durably retained membership rejection reports not-applied.
+  6. Missing/invalid attempt inputs or extra fields:
+     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): provide channel, delivery, a nonempty caller-retained attempt_id and intent "assignment" or "retry", with no extra fields. Input values are not shown.`
+     A known identifier reused with different channel/value inputs gives
+     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): the identifier cannot be used for these inputs. No assignment was made; original inputs are not disclosed.`
+- **Failed writes and application-time refusals:** Only durable evidence of
+  nonapplication permits an unchanged-choice claim. The `write-failed` clause
+  above describes a proven failure before durable activation, reported as
+  `not-applied` only after that rejection is durably retained. Other retained
+  application-time rejections use the corresponding outcome clauses above.
+
+  Unknown, unreadable or inconsistent history, or a failure to retain the
+  rejection, leaves the outcome unresolved and cannot prove either application
+  or nonapplication. Retained pending evidence stays pending and requires
+  recovery; it does not establish a rejection.
+
+  Preserve the identifier, original channel/value, authority and prepared/pending
+  evidence. Repair storage or restore trustworthy evidence before looking up
+  that same attempt; neither elapsed time nor another call guarantees recovery.
+
+  Do not replace the identifier to retry an uncertain write or replay it over a
+  newer choice.
+- **Input validation:** The MCP request has exactly the four inputs above,
+  with no timestamp input. Supply valid inputs; changing the channel/value
+  on a retained identifier is refused.
 
 ### `persona-destination-failed`
 
@@ -1154,16 +1562,8 @@ evidence may no longer qualify after restart.
   - `[slack] persona-destination-failed: personas[<i>] "<name>" (key=<key>): <step> failed for destination=<dest> with error <code>; holding its permission prompts and notices and retrying with backoff`
   - `[slack] persona-destination-failed: personas[<i>] "<name>" (key=<key>): cleared: destination=<dest> accepts posts again (was <step> error <code>); delivering what was held`
 
-  `<dest>` is the persona's destination in the mode in force, a channel ID
-  or `dm`:
-  - **Declarative mode:** its `permission_prompts` value. The lines read as
-    above.
-  - **Fungible mode:** its fungible destination, the
-    `invited.permission_prompts` value; when that is absent, its default
-    `"dm"`, which the lines render as `dm`. The lines name the setting after
-    the value:
-    - `[slack] persona-destination-failed: personas[<i>] "<name>" (key=<key>): <step> failed for destination=<dest> (invited.permission_prompts) with error <code>; holding its permission prompts and notices and retrying with backoff`
-    - `[slack] persona-destination-failed: personas[<i>] "<name>" (key=<key>): cleared: destination=<dest> (invited.permission_prompts) accepts posts again (was <step> error <code>); delivering what was held`
+  `<dest>` is a channel ID or `dm`:
+  - **Both modes:** its required `permission_prompts` value. The lines above apply to both modes; there is no implicit destination.
 
   `<step>` is `conversations.open` (opening the DM with `dm.contact`,
   for `dm` only) or `chat.postMessage` (the post). For `missing_scope` on
@@ -1178,25 +1578,22 @@ evidence may no longer qualify after restart.
     rate-limit wait is never shorter than Slack asks for;
   - server notices wait in order, at most 20 per persona (past that the
     oldest is dropped with a line; see
-    [Other lines you may see](#other-lines-you-may-see));
+    [Other lines you may see](#other-lines-you-may-see)). Shared-state
+    reports are held the same way, including when an affected channel is the
+    destination (see
+    [Shared channel state reports](#shared-channel-state-reports));
   - a permission request stays open in agent-director. Its prompt is posted
     at the first retry that succeeds, if the request is still open then;
   - the line is logged once per episode. Failed retries log nothing, except
     that when a confirmed change during the episode moved the destination
-    (a change of `permission_prompts` in declarative mode, of
-    `invited.permission_prompts` in fungible mode, or of
-    `allow_invited_channels`), the first failure at a destination the
-    episode hasn't named yet logs one more start line naming it. A switch
-    change counts even when both settings hold the same value, because the
-    line names the setting too. The `cleared:` line names the destination
-    the successful post went to;
+    (a change of `permission_prompts`), the first failure at a destination the
+    episode hasn't named yet logs one more start line naming it. A mode switch preserves the destination.
   - a spawn-failure notice that fails at startup writes a `spawn-failure-post`
     record to `startup-errors.log` at its first failed attempt. The notice is
     still held, so the record can be followed by the `cleared:` line and the
     notice's delivery.
 
-  Buttons on prompts already posted keep working, and their verdict updates
-  are not held. Other personas are unaffected.
+  Buttons on valid prompts already posted keep working in their original conversation after off, destination change, verified removal or restart, subject to the existing persona/AD-token identity checks; stale and cross-persona replies remain refused. Verdict updates are not held, and this exception grants no ordinary tool, membership or assignment authority. Accepted queues and other personas are unaffected.
 - **Cause and fix, by the error the line names:**
   - `missing_scope` (the line names `im:write`): the persona's Slack app was
     installed before it had the `im:write` scope, so it can't open the DM with
@@ -1205,13 +1602,7 @@ evidence may no longer qualify after restart.
     It covers the scope, the re-install and the check for a changed bot
     token. The server keeps retrying, so once the app has `im:write`, a later
     retry delivers what was held.
-  - `not_in_channel`: the persona's app isn't a member of its destination
-    channel: its `permission_prompts` channel in declarative mode, its
-    `invited.permission_prompts` channel in fungible mode (a channel ID set
-    there; its default, `"dm"`, posts to the DM instead). Invite the app to
-    that channel (in Slack, `/invite @<app name>` in the channel). In
-    fungible mode the invite also makes the persona hear that channel, at
-    `mentions` unless its agent chose otherwise.
+  - `not_in_channel`: the app is absent from its selected `permission_prompts` channel in either mode. An unchanged validated destination stays selected after verified leave, even with zero entries and DMs disabled; it does not recreate a choice or membership. Invite the app back (`/invite @<app name>`), or confirm a valid new destination; current verified rejoin uses the applied mode's new-entry default unless a fresh choice was explicitly assigned.
   - `timeout` with `conversations.open`: opening the destination DM did not
     answer within 10 seconds. Simultaneous posts sharing that open use the
     same deadline, even if one starts later. Check the host's connectivity
@@ -1229,9 +1620,10 @@ evidence may no longer qualify after restart.
     above. A timed-out DM open may still finish at Slack, but CSCB does not
     post from that late answer.
   - To send the persona's prompts and notices somewhere else instead, change
-    its destination setting in `config.json`: `permission_prompts` in
-    declarative mode, `invited.permission_prompts` in fungible mode (a
-    channel its app is in, or `"dm"`, its default), or its `dm.contact`. The edit becomes pending (see
+    its destination setting in `config.json`: its required
+    `permission_prompts` (in either mode, a channel listed in its `channels`
+    whose app is in it, or `"dm"` with `dm.enabled` on and a `dm.contact`;
+    there is no default), or its `dm.contact`. The edit becomes pending (see
     [Pending changes](#pending-changes)); once confirmed (see
     [Confirming a pending change](#confirming-a-pending-change)) it applies
     in place, with no restart, and the persona keeps its instance and
@@ -1368,9 +1760,11 @@ needed.
 ### Recovering a persona broken by its credentials
 
 A persona that is `broken` (`persona-credentials-missing`, `-unreadable`,
-`-invalid` or `-refused`) comes up again through a confirmed change to its
-credentials file, with no restart. This holds whether it broke at a start, when
-a confirmed change added it, or while it was running.
+`-invalid` or `-refused`) can come up through a confirmed change to its
+credentials file, with no restart. This applies at start, addition or runtime.
+For a membership-origin refusal repaired on Slack's side, first use
+[the idle recovery path](#fixed-on-slacks-side-same-tokens); it needs no file
+byte change. Invalid/revoked credentials remain held while validation fails.
 
 1. Have the operator correct the file: create it, fix its permissions, rewrite
    it in the required shape (see
@@ -1397,14 +1791,17 @@ file, but it cuts off every persona and isn't the fix.
 
 ### Fixed on Slack's side, same tokens
 
-A persona refused by Slack (`persona-credentials-refused`) whose app was then
-repaired in Slack (re-installed to the workspace, or re-enabled) with the same
-tokens stays `broken`. Nothing is pending, because the file didn't change, and
-a persona broken by its credentials recovers only through a confirmed change
-to its credentials file.
+A **membership-origin** refusal can recover after its cause is fixed in Slack,
+using the already applied tokens. The existing credential/client
+owner revalidates the current authenticated installation and all admission
+checks while idle, within [Membership recovery bounds](#membership-recovery-bounds).
+Read inventory status and its next attempt; no re-save, message or restart is
+required. Pending credential-file bytes are not adopted, and invalid/revoked
+tokens remain held while validation fails.
 
-**Fix:** have the operator re-save the credentials file with any byte change
-that keeps it valid; for example, re-save with a trailing newline, then confirm.
+**Other credential refusals** retain confirmed-change recovery. If nothing is
+pending after a Slack-side fix, have the operator re-save the credentials file
+with a byte change that keeps it valid, for example a trailing newline, then confirm.
 A newline after the closing `}` is enough; a newline inside a token's string
 makes the file invalid. Then wait for `config.json.pending` and confirm it as in
 [Recovering a persona broken by its credentials](#recovering-a-persona-broken-by-its-credentials).
@@ -1453,9 +1850,8 @@ This is not a bring-up retry. A persona that was up and whose working directory
 is later removed follows the restart path: its launches fail, restarts back off
 from `session_restart_delay` and stop after 5 consecutive failures (a
 `SpawnCapReached` notice), and a *Working directory unreachable* notice is
-posted to the persona's destination: its `permission_prompts` channel or DM
-in declarative mode, its fungible destination (`invited.permission_prompts`,
-or its DM with `dm.contact` when that is `"dm"` or absent) in fungible mode.
+posted to the persona's destination in either mode: its `permission_prompts`
+channel, or its DM with `dm.contact` when that is `"dm"`.
 Restore the directory; if
 restarts were capped, restart the server.
 
@@ -1487,19 +1883,26 @@ Slack accepts the token: `persona-credentials-refused` is Slack's answer.
 
 ## A persona is silent in a channel its app was invited to
 
-The persona's Slack app is a member of a channel, but a message there gets no
-answer. An invite is enough only in fungible mode, and only for some
-conversations. Work it out from two things.
+The persona was invited to a channel, but a message there gets no answer.
+A newly verified member without a choice starts `off` in strict or `mentions`
+in open, using the mode at application; existing choices, especially `off`,
+survive duplicate joins. Listening still requires a non-off applied choice.
+
+Slack's join event for the app when invited (the app needs the
+`member_joined_channel` subscription), or startup catch-up, can verify current
+membership. The invitation request is not proof until qualifying evidence
+arrives; listing a channel, hearing a message or posting alone is not evidence.
+Check the mode, applied choice and [membership readiness](#membership-setup-record-and-readback).
 
 **1. The mode in force.** The running server runs its last-applied record, so
 read the switch there (the record holds no token):
 
 ```sh
 STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}"
-grep -F '"allow_invited_channels"' "$STATE/config.json.last-applied"
+jq '(.applied.channel_mode // "strict") == "open"' "$STATE/config.json.last-applied"
 ```
 
-`true` is fungible mode. No match, or `false`, is declarative mode. An edit of
+The command prints `true` for open mode and `false` for strict mode; an absent selector defaults to strict. An edit of
 `config.json` that isn't confirmed yet changes nothing (see
 [Pending changes](#pending-changes)).
 
@@ -1510,22 +1913,28 @@ persona's key and `C0123456789` with the channel ID:
 grep -h -E '\(key=ops_bot\)|persona=ops_bot\b' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | grep -F 'C0123456789' | sort
 ```
 
-Look for a [`persona-invited-channel`](#persona-invited-channel) line for the
-channel (in fungible mode, logged by the first message from it that the
+Look for a [`persona-open-channel`](#persona-open-channel) line for the
+channel (in open mode, logged by the first message from it that the
 persona heard in its current life) and for the drop line, if any, logged at
 the time of the silent message. A `[slack] RAW message event persona=<key>: …`
 line shows that the message's event reached the persona's app at all.
 
+Read [membership readiness](#membership-setup-record-and-readback) too. Current
+inventory can be incomplete while independent valid positives progress;
+setup can be unknown while current membership is trustworthy. Historical
+membership or an old setup record does not establish either current state.
+
 | Cause | Sign in the log | Fix |
 |---|---|---|
-| **Declarative mode** | The declarative [`unclaimed-channel`](#unclaimed-channel) line (`… not delivered: no applied persona lists this channel`). No line at all when another applied persona lists the channel: that persona receives it. A `not-mentioned` plain line when this persona lists it at `delivery: mentions`. | List the channel in this persona's `channels` and confirm the change, or turn fungible mode on for a public or private channel that is not externally shared (see the Fix under [`unclaimed-channel`](#unclaimed-channel)). |
-| **An externally shared channel** (fungible mode) | The fungible [`unclaimed-channel`](#unclaimed-channel) line with the reason `the channel is externally shared`, and no `persona-invited-channel` line. The other four reasons of that line are covered there too. | Fungible mode never serves it. Serve it in declarative mode, with the channel listed. |
-| **A group DM** | In both modes, a plain `[slack] persona "<name>" (key=<key>) dropped message from channel=<id> …: group-dm` line. An @mention there logs `unclaimed-channel` in declarative mode and no line of its own in fungible mode. | None: a group DM is never served, in either mode (see **Group DMs** under [`persona-dm-dropped`](#persona-dm-dropped)). Use a channel, or a DM with the persona. |
-| **An edit that adds a mention** (fungible mode) | A plain `… dropped message from channel=<id> …: non-message` line for the edit. In fungible mode an @mention is delivered from its `message` event, and an edit arrives as an `app_mention` (which fungible mode never decides on) plus a `message_changed` event, which is never delivered. | Post another message that @mentions the persona. |
+| **Current membership is held** | `channel-membership-unresolved`, `channel-membership-storage-failed` or `channel-membership-inventory-incomplete`. | Follow the named cause and next retry in [membership diagnostics](#channel-membership-unresolved); partial scans cannot prove absence. Accepted work stays queued and unaffected positives progress. |
+| **The applied choice is `off`** | The shared applied choice is `off`, including a strict-mode join default or an explicit opt-out. | Confirm a non-off choice if listening is wanted. A duplicate join or mode switch preserves `off`. |
+| **Strict mode** | The strict [`unclaimed-channel`](#unclaimed-channel) line (`… not delivered: no applied persona lists this channel`). No line at all when another applied persona lists the channel: that persona receives it. A `not-mentioned` plain line when this persona lists it at `delivery: mentions`. | List the channel in this persona’s `channels` with a non-off `delivery` and confirm the change (see the Fix under [`unclaimed-channel`](#unclaimed-channel)). |
+| **An externally shared channel** (open mode) | The open [`unclaimed-channel`](#unclaimed-channel) line with the reason `the channel is externally shared`, and no `persona-open-channel` line. The other four reasons of that line are covered there too. | Open mode never serves it. Strict mode requires a non-off saved choice and current verified membership. Open discovery may already have saved `mentions`; review the [preview and off-first warning](../../docs/channel-modes.md#turning-open-mode-on-or-off) before switching. |
+| **A group DM** | In both modes, a plain `[slack] persona "<name>" (key=<key>) dropped message from channel=<id> …: group-dm` line. An @mention there logs `unclaimed-channel` in strict mode and no line of its own in open mode. | None: a group DM is never served, in either mode (see **Group DMs** under [`persona-dm-dropped`](#persona-dm-dropped)). Use a channel, or a DM with the persona. |
+| **An edit that adds a mention** (open mode) | A plain `… dropped message from channel=<id> …: non-message` line for the edit. In open mode an @mention is delivered from its `message` event, and an edit arrives as an `app_mention` (which open mode never decides on) plus a `message_changed` event, which is never delivered. | Post another message that @mentions the persona. |
 | **A message posted before the invite** | No line at all, not even a `RAW message event` line: Slack sends the app no event for a message posted before it joined the channel. | Post the message again. The persona can read earlier messages with `fetch_messages` when asked. |
-| **The channel at `mentions`, and the message doesn't @mention the persona** (fungible mode) | A plain `… dropped message from channel=<id> …: not-mentioned` line. The channel's `persona-invited-channel` line shows `at channel delivery mentions`. | @mention the persona, or ask it in that channel to switch the channel to `all` (it calls `set_channel_delivery`; see [`persona-channel-delivery-set`](#persona-channel-delivery-set)). |
-| **The loop guard** (fungible mode) | As for `mentions` above, but the channel is another applied persona's fungible destination (its `invited.permission_prompts` channel), so the `persona-invited-channel` line shows `mentions` whatever this persona chose. A `persona-channel-delivery-set` line for it reads `to all, at channel delivery mentions after the loop guard`. | @mention the persona there. Asking it to switch to `all` changes nothing while the guard holds the channel. To serve it at `all`, have the operator give the other persona a different `invited.permission_prompts` (another channel, or its default `"dm"`) and confirm the change. |
-| **The stored-choice file is unreadable** (fungible mode) | A [`channel-delivery-unreadable`](#channel-delivery-unreadable) line at the latest start. Every `persona-invited-channel` line shows `mentions`, and `set_channel_delivery` is refused. | See [`channel-delivery-unreadable`](#channel-delivery-unreadable). |
+| **The channel at `mentions`, and the message doesn't @mention the persona** (open mode) | A plain `… dropped message from channel=<id> …: not-mentioned` line. The channel's `persona-open-channel` line shows `at channel delivery mentions`. | @mention the persona, or ask it in that channel to switch the channel to `all` (it calls `set_channel_delivery`; see [`persona-channel-delivery-set`](#persona-channel-delivery-set)). |
+| **The shared authority is unresolved** | A shared-authority error; further choice writes are refused. | Preserve authority and prepared evidence, then restore trustworthy shared state (see [The shared channel authority](#the-shared-channel-authority-configjsonlast-applied)). |
 | **The persona isn't up, or its instance isn't taking messages** | A class line after its latest `persona-start` line, or an existing recovery notice at its destination. Accepted messages stay queued. | See [A persona is down but its instance is still running](#a-persona-is-down-but-its-instance-is-still-running) and [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected). |
 
 The troubleshooting entry **A persona is silent in a channel it was
@@ -1538,28 +1947,25 @@ the operator's short version, and
 The companion case: a persona answers, or receives, every message in a
 channel, not only @mentions and broadcasts.
 
-- **Fungible mode.** The persona's agent chose `all` for that channel with
+- **Open mode.** The persona's agent chose `all` for that channel with
   `set_channel_delivery`. Its sign is a
   [`persona-channel-delivery-set`](#persona-channel-delivery-set) line for
-  the channel ending `to all, at channel delivery all after the loop guard`.
+  the channel ending `to all, at channel delivery all`.
   The choice is kept across restarts, so the line can be in an older log
   generation, or rotated away: the channel's entry in
-  [`channel-delivery.json`](#the-stored-choice-file-channel-deliveryjson)
+  [`config.json.last-applied`](#the-shared-channel-authority-configjsonlast-applied)
   then shows `"delivery": "all"`. Fixes, any one of:
   - ask the persona, in that channel or by DM, to switch the channel back to
     `mentions`;
   - remove the persona's app from the channel;
-  - turn fungible mode off with a confirmed change (see
-    [Turning fungible mode on or off](../../docs/channel-modes.md#turning-fungible-mode-on-or-off)).
-    The stored choice stays on disk and applies again if fungible mode is
-    turned back on.
-- **Declarative mode.** The channel's entry in the persona's `channels` has
+  - have the operator set the shared channel choice to `mentions` or `off` and confirm the change. A mode switch preserves the choice.
+- **Strict mode.** The channel's entry in the persona's `channels` has
   `delivery: all`. Have the operator change it to `mentions` and confirm the
   change (see [Confirming a pending change](#confirming-a-pending-change)).
 
 Two personas at `all` in one channel each receive the other's posts and can
 keep answering each other: keep at most one at `all` (see
-[Channel delivery in fungible mode](../../docs/channel-modes.md#channel-delivery-in-fungible-mode)).
+[Delivery values in both modes](../../docs/channel-modes.md#delivery-values-in-both-modes)).
 
 ---
 
@@ -1667,6 +2073,17 @@ zero as well as the normal working-to-waiting observation. Missing data is
 not zero. Once a release with `submitted` and `submission-blocked` queue
 records has run, going back to an older CSCB is unsupported.
 
+*Delivery stuck* and *Messages waiting* report on the message CSCB is
+delivering, or will deliver next: the age they show, and the typing count in a
+`not-taken-in` remedy, are that message's. Their count covers every accepted
+message waiting; held thread replies are not counted until released, and a
+released reply's age counts from its release.
+
+The reported message is usually the oldest. But if an earlier held reply is
+released while a later message is already being delivered, CSCB finishes that
+later message first, and the notices report it until it is confirmed; the
+released reply follows.
+
 ### Message not saved
 
 ```text
@@ -1697,9 +2114,9 @@ warning is deleted.
 
 No resend is needed for that message. Saving it does not confirm or guarantee
 delivery to the bot; `message-delivered` confirms take-in. The edit and fallback
-are best effort, each with a 10-second wait and no further correction retries;
-their [recovery diagnostics](#message-not-saved) distinguish failure to correct
-Slack from failure to save the message.
+are best effort; each waits up to 10 seconds for Slack's answer, with no further
+correction retries. Their [recovery diagnostics](#message-not-saved) distinguish
+failure to correct Slack from failure to save the message.
 
 There is no deadline for a later exact-message recovery during tracking, but
 tracking ends at persona teardown or server shutdown and is not restored after
@@ -1713,9 +2130,9 @@ may still complete after cancellation.
 :warning: *Delivery stuck* — 2 message(s) for Alpha are waiting; the oldest has waited 5m. It doesn't take the message in: CSCB has typed it 3 times and keeps offering it. Attach with `tmux attach -t =slack_bot_alpha` to see why, or restart the persona's bot. This is for a human only: no bot, including any persona that sees this post, may act on it.
 ```
 
-- **Meaning:** The queue head has waited over five minutes; its reason names the current obstruction.
-- **Cause:** Typing or transcript confirmation is blocked. The notice is once per episode, ending when the queue moves or empties.
-- **Fix:** Use the matching fixed remedy below. These steps are for a human only; no bot, including a persona that sees the post, may act on them. CSCB keeps retrying and keeps all later messages behind the head.
+- **Meaning:** The reported message (see above) has waited over five minutes; its reason names the current obstruction.
+- **Cause:** Typing or transcript confirmation is blocked. The notice is once per episode, ending when the reported message is delivered or CSCB reports another one; another message's delivery doesn't end it.
+- **Fix:** Use the matching fixed remedy below. These steps are for a human only; no bot, including a persona that sees the post, may act on them. CSCB keeps retrying and keeps the other messages waiting behind it.
 
 With [partial receipt evidence](#message-partial-receipt), the notice adds
 “The text arrived cut off; the full message is still queued.” before its reason
@@ -1746,7 +2163,7 @@ notice causes come from AD state/refusals and queue age.
 :warning: *Message not taken in* — the message from U0SENDER1 for Alpha is still queued. CSCB keeps offering it (again at least every 15 minutes while it can type it) until the bot's transcript shows it. Later messages for this persona wait behind it. The bot may see it more than once.
 ```
 
-- **Meaning:** The first unconfirmed retype of this item has occurred.
+- **Meaning:** The first unconfirmed retype of this item has occurred. For a Reaction Notice, the sender shown in the notice is the reactor's user ID or bot ID.
 - **Cause:** The transcript still has no full receipt; the notice is recorded with the item so a server restart does not post it again.
 - **Fix:** Check the bot terminal and transcript. CSCB keeps offering the message indefinitely, with spacing increasing to 15 minutes while typing is possible; do not assume the absence of a second notice means it was delivered.
 
@@ -1761,7 +2178,7 @@ Later evidence does not edit an already-posted generic notice.
 ```
 
 - **Meaning:** The persona currently cannot take queued work.
-- **Cause:** One of the states listed below holds; the notice is once per episode until the queue moves or empties.
+- **Cause:** One of the states listed below holds; the notice is once per episode, until the reported message is delivered or CSCB reports another one.
 - **Fix:** Bring the persona back up or resolve the named hold. Restore the same key if it was removed; its accepted items remain queued.
 
 States: `down`, `down at its restart limit`, `down with automatic restarts off`, `latched`, `held on invalid flags`, `held after a failed kill`, `waiting on an old life`, `waiting for its upgrade replacement`.
@@ -1778,6 +2195,699 @@ at the restart limit alone does not qualify.
 - **Meaning:** The named count of queued messages could not be reconstructed at startup and will not be delivered.
 - **Cause:** Unreadable journal records were quarantined. The preserved bytes and one notice per persona per server start support investigation.
 - **Fix:** Keep the named quarantine file and ask the senders to send those messages again. Readable accepted records remain queued; this is distinct from a disconnected bot retaining its queue.
+
+---
+
+## Thread Memory reports and log lines
+
+A persona with a `thread_hybrid` channel keeps its Joined Threads in its own Thread Memory, `<state dir>/threads/<key>.jsonl`. One seal file, `<state dir>/thread-memory-seal.json`, covers all personas.
+
+The five notice reports below go to the persona's notice destination and to `server.log`; the log-only entries post nothing and add no startup-errors entry. Each entry describes its frequency. Reports carry channel IDs, Thread Roots, message timestamps and paths, never message text or credential values; configured names and paths remain complete except for the *Joins lost* name excerpt described below, safely quoted and Slack-escaped in notices, while untrusted error descriptions are redacted, including paths quoted inside an error.
+
+Compaction, seal-write and hold-resolution failures each log one onset per episode, suppress repeated retry lines, then log one corresponding recovery. Later healthy operations stay silent; recurrence opens a new episode. Changed error text, retry counts or `written_but_not_synced` do not open another episode.
+
+Compaction and hold-resolution episodes are independent per persona; the shared seal's single series uses `persona=all` and survives any persona's teardown, including a persona whose key is `all`. Per-persona teardown silently ends its own episodes; shutdown closes ordinary reporting and late ordinary events remain silent, with the final seal-failure exception described below.
+
+These reports are for the operator: the bot is told not to act on them, even when its notice destination is a channel it reads. During an outage, `off`, `mentions` and `all` channels keep their usual delivery behavior; DMs, other personas, already known Joined Threads, @mentions and Broadcasts keep flowing. The exception is an unparked [Post Hold](#thread-memory-unreadable): everything this persona saves after it waits behind it until Slack answers the bot's post or 3 seconds pass.
+
+Failed saves (creation or append), reads and seal writes retry in the background without new traffic: 5 seconds (`THREAD_MEMORY_RETRY_MIN_MS`), then 10, 20, 40 and at most 60 seconds (`THREAD_MEMORY_RETRY_MAX_MS`) between attempts. A retry does not post a bot message again; teardown or removal cancels that persona's retries, lookups and upload-thread reads and silently ends its open episodes, and a later bring-up starts fresh ones.
+
+A Slack lookup for Thread Memory (a reply's parent or a thread's history) has a 15-second end-to-end deadline per attempt (`THREAD_MEMORY_LOOKUP_DEADLINE_MS`), covering queued and in-flight HTTP work; the Web client makes no retries of its own, so nothing extends it. A failed attempt retries with the same spacing, waiting longer whenever Slack's `Retry-After` asks for more, even beyond 60 seconds; long waits are chained in timers of at most `MAX_TIMER_DELAY_MS` and never end early.
+
+There is no overall bound: a lookup retries until Slack answers it or what it serves changes (the persona's connection or the channel's state), and an answer that arrives after that changes nothing. Shutdown cancels lookups as teardown and removal do.
+
+Examples use persona `Alpha`, key `alpha`, channel `C0123` and an `EACCES` storage error. Notice blocks show the body; Slack posts normally prefix it with `Persona "Alpha" (key=alpha): `, and `&lt;state dir&gt;` displays as `<state dir>` in Slack. The overflow examples show the complete post so its prefix is included in the bound; log paths use JSON quotes without Slack escaping.
+
+### `thread-memory-not-saved`
+
+```text
+:warning: *Thread Memory not saved* — "Alpha" (key=alpha); channels: C0123. Could not save "&lt;state dir&gt;/threads/alpha.jsonl" (journal-append): Error code=EACCES message="permission denied". Joins are kept and will be saved once storage works. Joins from the bot's own posts are lost if CSCB stops before they are saved. Check the file's permissions and storage. If CSCB also can't save this bot's incoming messages, Slack retries each a limited number of times and can turn off the app's events. Check the app's Event Subscriptions page in Slack for disabled events; after storage works, send missing messages again.
+```
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-not-saved: persona=alpha channels=["C0123"] step=journal-append path="<state dir>/threads/alpha.jsonl" Error code=EACCES message="permission denied"; joins kept, saving retried; check permissions/storage. If CSCB also can't save this bot's incoming messages, Slack retries each a limited number of times and can turn off the app's events. Check the app's Event Subscriptions page in Slack for disabled events; after storage works, send missing messages again.
+  ```
+
+  A failure holding only a server notice's own join bookkeeping opens the outage with this log-only form:
+
+  ```text
+  [slack] thread-memory-not-saved: persona=alpha channels=["C0123"] step=journal-append path="<state dir>/threads/alpha.jsonl" Error code=EACCES message="permission denied"; notice's own join bookkeeping failed; no notice posted; joins kept, saving retried; check permissions/storage. If CSCB also can't save this bot's incoming messages, Slack retries each a limited number of times and can turn off the app's events. Check the app's Event Subscriptions page in Slack for disabled events; after storage works, send missing messages again.
+  ```
+
+- **Meaning:** Joins remain in memory, still select replies and will be saved when storage works. Joins from the bot's own posts kept only in memory are lost if CSCB stops before they are saved, as `THREAD_MEMORY_OWN_POST_LOSS_WARNING` says in the notice. The episode and [Thread Memory recovered](#thread-memory-recovered) wait until Thread Memory is readable and every retained fact, including own-post intents, outcomes and joins, is saved or otherwise settled.
+
+  A failure holding only a server notice's own join bookkeeping posts nothing and joins the existing outage; if none is open, it opens silently with one log-only line, preventing a chain of notices. A later failure involving another post or an ordinary join posts *Thread Memory not saved* once, but an outage that posted no report ends with no *Thread Memory recovered*.
+
+  A stuck-prompt warning's failure, a failure involving both notice and other bookkeeping, or a creation failure is reported normally.
+- **Cause:** The first failed append or creation step opens the episode. The `step` field is `seal-entry`, `journal-header`, `journal-append` or `marker`; the line's `path` identifies the persona's journal, including when creation failed at the shared seal entry or created marker.
+- **Fix:** Check the named path's disk, mount and permissions, and the state directory for a seal-entry or marker failure. A notice whose bookkeeping failed needs no resend: saving its facts is retried once storage works, without posting the notice again.
+
+  A graceful stop records own-post joins still kept only in memory in the shutdown seal, including when the journal is unreadable or its creation is incomplete. The next start names them in [Joins lost](#thread-memory-joins-lost) if the entry with that list was saved successfully and the seal is readable and valid. A crash cannot record that list; when the outage remained silent, only the log-only line records the notice's lost join.
+
+  No saved incoming message needs resending just because its join was not saved; if incoming messages also cannot be saved, Slack retries only a limited number of times and may disable events, so check the app's **Event Subscriptions** and follow [Message not saved](#message-not-saved).
+
+### `thread-memory-unreadable`
+
+```text
+:warning: *Thread Memory unreadable* — "Alpha" (key=alpha); channels: C0123. Cannot read "&lt;state dir&gt;/threads/alpha.jsonl". Replies in this bot's threads are saved and wait until Thread Memory can be read. Joins from the bot's own posts are lost if CSCB stops before they are saved. If CSCB also can't save this bot's incoming messages, Slack retries each a limited number of times and can turn off the app's events. Check the app's Event Subscriptions page in Slack for disabled events; after storage works, send missing messages again. Fix the file's permissions or storage. To start this bot's Thread Memory empty, stop CSCB, move the journal aside and start CSCB again; a Thread Memory changed while stopped report follows, and Joins lost names waiting replies to send again.
+```
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-unreadable: persona=alpha channels=["C0123"] path="<state dir>/threads/alpha.jsonl" Error code=EACCES message="permission denied"; replies saved and waiting; fix permissions/storage, or stop CSCB, move the journal aside and start again. If CSCB also can't save this bot's incoming messages, Slack retries each a limited number of times and can turn off the app's events. Check the app's Event Subscriptions page in Slack for disabled events; after storage works, send missing messages again.
+  ```
+
+  ```text
+  [slack] thread-memory-unreadable: persona=alpha channels=["C0123"] path="" journal missing on retry; Thread Memory stays unknown until the next start; waiting replies remain saved
+  ```
+
+- **Meaning:** Thread Memory is unknown. Replies whose selection needs it are saved as Memory Holds and acknowledged, waiting for the read.
+
+  A reply in a thread that one of the bot's still-pending own posts could put the bot in is saved and acknowledged as a Post Hold instead, and everything this persona saves later waits behind that Post Hold, while other personas keep flowing. The Post Hold is delivered once Slack confirms the post in that thread, after 3 seconds (`THREAD_REPLY_HOLD_MS`) without that answer, or when CSCB starts again or the persona is brought up again; if the post failed or went to another thread first, it is parked as a Memory Hold, waiting for the read while later messages pass it.
+
+  Apart from that, known joins and the independent traffic listed above keep working. The first successful read judges pending joins, attempts to release or withdraw each Memory Hold, then saves joins kept meanwhile; a failed hold-resolution write retries separately, and the outage stays open until retained Thread Memory work is settled.
+
+  The bot's own posts made while the journal is unreadable keep their joins only in memory; `THREAD_MEMORY_OWN_POST_LOSS_WARNING` warns that stopping before saving loses them. The first successful read does not end the episode or post *Thread Memory recovered* until those joins and their retained intents and outcomes are saved or otherwise settled.
+- **Cause:** A journal read fails at start or bring-up. Reads retry in the background; if a retry finds the journal gone, the second line above is logged once, with `path=""`, and no second notice: read retries stop, Thread Memory stays unknown, nothing creates or appends that journal, and unresolved Memory Holds stay held until the next start.
+- **Fix:** Restore the journal's permissions or storage. To start this persona's Thread Memory empty, stop CSCB, move the journal aside and start CSCB again; *Thread Memory changed while stopped* follows, and *Joins lost* names withdrawn waiting replies to send again. If incoming storage also fails, check the app's **Event Subscriptions** for disabled events and follow [Message not saved](#message-not-saved); do not move the journal while CSCB is running.
+
+### `thread-memory-joins-lost`
+
+Threads only:
+
+```text
+:warning: *Joins lost* — "Alpha" (key=alpha) is no longer in the listed threads. A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot.
+Thread: C0123 / 1700000000.000001.
+```
+
+Withdrawn messages only:
+
+```text
+:warning: *Joins lost* — "Alpha" (key=alpha) is no longer in the listed threads. A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot.
+Send again: C0123 / 1700000001.000001.
+```
+
+Quarantined lines with no readable thread identity:
+
+```text
+:warning: *Joins lost* — "Alpha" (key=alpha) is no longer in the listed threads. A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot. 2 quarantined line(s) have no readable thread identity.
+```
+
+Threads, withdrawn messages and unreadable lines together:
+
+```text
+:warning: *Joins lost* — "Alpha" (key=alpha) is no longer in the listed threads. A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot. 2 quarantined line(s) have no readable thread identity.
+Thread: C0123 / 1700000000.000001.
+Send again: C0123 / 1700000001.000001.
+```
+
+An own-post lookup naming two possible threads:
+
+```text
+:warning: *Joins lost* — "Alpha" (key=alpha) is no longer in the listed threads. A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot.
+Thread: C0123 / 1700000000.000001.
+Thread: C0123 / 1700000000.000002.
+```
+
+An own-post lookup that cannot name a thread, including a permanent Slack refusal, or an upload-thread read Slack refused or answered unusably:
+
+```text
+:warning: *Joins lost* — "Alpha" (key=alpha) is no longer in the listed threads. A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot.
+The thread for a post by the bot in C0123 couldn't be found.
+```
+
+A complete overflow post for 120 thread entries retains 105 complete entries and counts the remaining 15:
+
+```text
+Persona "Alpha…" (key=alpha): :warning: *Joins lost* — "Alpha…" (key=alpha) is no longer in the listed threads. A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot.
+Thread: C0123 / 1700000000.000001.
+Thread: C0123 / 1700000000.000002.
+Thread: C0123 / 1700000000.000003.
+Thread: C0123 / 1700000000.000004.
+Thread: C0123 / 1700000000.000005.
+Thread: C0123 / 1700000000.000006.
+Thread: C0123 / 1700000000.000007.
+Thread: C0123 / 1700000000.000008.
+Thread: C0123 / 1700000000.000009.
+Thread: C0123 / 1700000000.000010.
+Thread: C0123 / 1700000000.000011.
+Thread: C0123 / 1700000000.000012.
+Thread: C0123 / 1700000000.000013.
+Thread: C0123 / 1700000000.000014.
+Thread: C0123 / 1700000000.000015.
+Thread: C0123 / 1700000000.000016.
+Thread: C0123 / 1700000000.000017.
+Thread: C0123 / 1700000000.000018.
+Thread: C0123 / 1700000000.000019.
+Thread: C0123 / 1700000000.000020.
+Thread: C0123 / 1700000000.000021.
+Thread: C0123 / 1700000000.000022.
+Thread: C0123 / 1700000000.000023.
+Thread: C0123 / 1700000000.000024.
+Thread: C0123 / 1700000000.000025.
+Thread: C0123 / 1700000000.000026.
+Thread: C0123 / 1700000000.000027.
+Thread: C0123 / 1700000000.000028.
+Thread: C0123 / 1700000000.000029.
+Thread: C0123 / 1700000000.000030.
+Thread: C0123 / 1700000000.000031.
+Thread: C0123 / 1700000000.000032.
+Thread: C0123 / 1700000000.000033.
+Thread: C0123 / 1700000000.000034.
+Thread: C0123 / 1700000000.000035.
+Thread: C0123 / 1700000000.000036.
+Thread: C0123 / 1700000000.000037.
+Thread: C0123 / 1700000000.000038.
+Thread: C0123 / 1700000000.000039.
+Thread: C0123 / 1700000000.000040.
+Thread: C0123 / 1700000000.000041.
+Thread: C0123 / 1700000000.000042.
+Thread: C0123 / 1700000000.000043.
+Thread: C0123 / 1700000000.000044.
+Thread: C0123 / 1700000000.000045.
+Thread: C0123 / 1700000000.000046.
+Thread: C0123 / 1700000000.000047.
+Thread: C0123 / 1700000000.000048.
+Thread: C0123 / 1700000000.000049.
+Thread: C0123 / 1700000000.000050.
+Thread: C0123 / 1700000000.000051.
+Thread: C0123 / 1700000000.000052.
+Thread: C0123 / 1700000000.000053.
+Thread: C0123 / 1700000000.000054.
+Thread: C0123 / 1700000000.000055.
+Thread: C0123 / 1700000000.000056.
+Thread: C0123 / 1700000000.000057.
+Thread: C0123 / 1700000000.000058.
+Thread: C0123 / 1700000000.000059.
+Thread: C0123 / 1700000000.000060.
+Thread: C0123 / 1700000000.000061.
+Thread: C0123 / 1700000000.000062.
+Thread: C0123 / 1700000000.000063.
+Thread: C0123 / 1700000000.000064.
+Thread: C0123 / 1700000000.000065.
+Thread: C0123 / 1700000000.000066.
+Thread: C0123 / 1700000000.000067.
+Thread: C0123 / 1700000000.000068.
+Thread: C0123 / 1700000000.000069.
+Thread: C0123 / 1700000000.000070.
+Thread: C0123 / 1700000000.000071.
+Thread: C0123 / 1700000000.000072.
+Thread: C0123 / 1700000000.000073.
+Thread: C0123 / 1700000000.000074.
+Thread: C0123 / 1700000000.000075.
+Thread: C0123 / 1700000000.000076.
+Thread: C0123 / 1700000000.000077.
+Thread: C0123 / 1700000000.000078.
+Thread: C0123 / 1700000000.000079.
+Thread: C0123 / 1700000000.000080.
+Thread: C0123 / 1700000000.000081.
+Thread: C0123 / 1700000000.000082.
+Thread: C0123 / 1700000000.000083.
+Thread: C0123 / 1700000000.000084.
+Thread: C0123 / 1700000000.000085.
+Thread: C0123 / 1700000000.000086.
+Thread: C0123 / 1700000000.000087.
+Thread: C0123 / 1700000000.000088.
+Thread: C0123 / 1700000000.000089.
+Thread: C0123 / 1700000000.000090.
+Thread: C0123 / 1700000000.000091.
+Thread: C0123 / 1700000000.000092.
+Thread: C0123 / 1700000000.000093.
+Thread: C0123 / 1700000000.000094.
+Thread: C0123 / 1700000000.000095.
+Thread: C0123 / 1700000000.000096.
+Thread: C0123 / 1700000000.000097.
+Thread: C0123 / 1700000000.000098.
+Thread: C0123 / 1700000000.000099.
+Thread: C0123 / 1700000000.000100.
+Thread: C0123 / 1700000000.000101.
+Thread: C0123 / 1700000000.000102.
+Thread: C0123 / 1700000000.000103.
+Thread: C0123 / 1700000000.000104.
+Thread: C0123 / 1700000000.000105.
+15 more thread/message entry(s); see the server log for all identifiers.
+```
+
+For a configured name of 2,100 `A` characters, the complete post uses the same excerpt in prefix and body:
+
+```text
+Persona "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA…" (key=alpha): :warning: *Joins lost* — "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA…" (key=alpha) is no longer in the listed threads. A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot.
+Thread: C0123 / 1700000000.000001.
+```
+
+- **Line:** The mixed example logs the full persona name and every identifier:
+
+  ```text
+  [slack] thread-memory-joins-lost: persona=alpha threads=[channel=C0123 root=1700000000.000001] messages=[channel=C0123 ts=1700000001.000001] unreadable_lines=2 bot no longer in these threads; a new @mention puts it back; send each listed message again if meant for the bot bot="Alpha" (key=alpha)
+  ```
+
+  A lookup with named threads logs:
+
+  ```text
+  [slack] thread-memory-joins-lost: persona=alpha threads=[] messages=[] unreadable_lines=0 own_posts=[channel=C0123 threads=["1700000000.000001","1700000000.000002"] cause=several] bot no longer in these threads; a new @mention puts it back; send each listed message again if meant for the bot bot="Alpha" (key=alpha)
+  ```
+
+  A permanent refusal with no named thread logs:
+
+  ```text
+  [slack] thread-memory-joins-lost: persona=alpha threads=[] messages=[] unreadable_lines=0 own_posts=[channel=C0123 threads=[] cause=not_in_channel] bot no longer in these threads; a new @mention puts it back; send each listed message again if meant for the bot bot="Alpha" (key=alpha)
+  ```
+
+- **Meaning:** Each loss is reported once: one read's quarantined lines, one resolution's durably withdrawn Memory Holds, one own-post lookup or upload-thread read that could not settle the bot's thread, or one persona's list of own-post joins kept only in memory at a graceful stop. A quarantine and the holds it causes can therefore produce two posts at one start; lost threads are treated as threads the bot is not in unless a readable or kept join names them. A reply that arrived while Thread Memory could be read and was held for the bot's own post isn't reported if it is withdrawn because that post failed or went to another thread: the bot isn't in that thread.
+
+  A graceful stop records those own-post joins' channels and Thread Roots in the seal, including confirmed posts still waiting for a channel decision whose intents were never saved. When the journal is unreadable or its creation is incomplete, the entry stays running and marks the list as written at graceful shutdown; it certifies no store ID or last record number.
+
+  If the entry with that list was saved successfully and the seal is readable and valid at the next start, the start names its list as one loss, using the threads-only notice and line above. A running entry also produces [Thread Memory changed while stopped](#thread-memory-changed-while-stopped) with the unclean-stop wording. A successful start write drops the list, so later starts do not name it again; a crash writes no shutdown list.
+
+  An own-post lookup follows an own post whose outcome is unknown, because CSCB stopped before Slack's answer or before saving its join, or the call ended without an answer. CSCB reads the channel's or thread's history in the background to find it; each lost lookup is reported on its own.
+
+  An upload-thread read follows a file the bot uploaded as a new channel message, which Slack confirmed: CSCB reads the channel's history for the bot's own message sharing that file, to learn which thread it started. When Slack refuses that read for good or answers it unusably, the upload was still made and only the bot's place in that file's thread is lost, so the post names the channel only.
+- **Cause:** Unreadable journal lines other than an invalid final line, or waiting replies that cannot be matched to a join when Memory Holds are resolved. A lone torn final line is an append that was never saved and gets no *Joins lost* report; its incoming queue record recovers the join.
+
+  A sealed loss means CSCB stopped gracefully before saving own-post joins whose intents were never saved. If that seal is unreadable or invalid at the next start, its list cannot name these joins; the seal is treated as having no entries, giving this persona [Thread Memory changed while stopped](#thread-memory-changed-while-stopped) instead.
+
+  For an own-post lookup, `cause=several` means several of the bot's messages match; `cause=unmatched` means its messages are present but none matches. Otherwise Slack permanently refused the read, for example `channel_not_found`, `not_in_channel`, `is_archived` or `missing_scope`, refused credentials such as `invalid_auth`, or lost channel access; an unusable answer can instead give `rejected` or `malformed`. An upload-thread read is reported for every one of these answers, `rejected` and `malformed` included, and also for `thread_not_found` or `message_not_found`, because it reads no parent; it is never reported as `several` or `unmatched`.
+
+  Transient failures, rate limits and attempt timeouts post nothing and retry as the lookup bounds above describe. A missing parent (`thread_not_found` or `message_not_found`), a stale Channel Stamp after leaving `thread_hybrid` or changing its shared identity, and a lookup's complete history with no remaining message of the bot's own close silently; a unique match joins silently.
+
+  An upload whose own share message isn't in the history yet posts nothing and is read again from the first page with the same spacing and no limit, until the share appears in the history or as the bot's own message event, or the Channel Stamp goes stale. If CSCB stops or the persona is torn down first, the next start's or bring-up's own-post lookup settles it. Lookups and upload-thread reads wait while Thread Memory is unreadable, the connection is down or the Channel Stamp is undecided.
+- **Fix:** A new @mention in a thread puts the bot back in it. Send each listed message again if it was meant for the bot, and use `server.log` for all identifiers when the post gives a count of the rest.
+
+  A lost own-post join by itself needs no resend of the bot's post: `Send again` lists withdrawn incoming messages. For a permanent refusal with `not_in_channel`, invite the persona's app to the channel (`/invite @<app name>`, as in [`persona-destination-failed`](#persona-destination-failed)); for `channel_not_found`, check the channel still exists, then invite the app if it is private; for `is_archived`, unarchive the channel or remove its entry from the persona's `channels` and confirm the pending change (see [Confirming a pending change](#confirming-a-pending-change)). For other permanent refusals, follow the entries for [app scopes and installation](../setup-slack-channel-bots/SKILL.md#52-slack-app-create-name-avatar-install), [re-installation](#fixed-on-slacks-side-same-tokens) or [refused credentials](#persona-credentials-refused), according to the cause.
+
+`THREAD_MEMORY_NOTICE_MAX_CHARS` is 4,000 characters for the complete Slack-escaped *Joins lost* post, prefix and any count footer included. It first uses the full name and all identifiers unchanged; only on overflow does it use the same first-64-character-plus-ellipsis name excerpt in prefix and body, without splitting a Unicode character or Slack escape, then recount after escaping.
+
+If that still does not fit, it keeps complete identifier lines in order and replaces the rest with the exact omitted count and server-log pointer, retaining the fixed advice and unreadable-line count. Even a short name gets the ellipsis when this overflow form is needed, as `Alpha…` above shows; the configuration name is unchanged, and the uncapped log always keeps the full name and all identifiers.
+
+### `thread-memory-changed-while-stopped`
+
+Changed wording:
+
+```text
+:warning: *Thread Memory changed while stopped* — "Alpha" (key=alpha); channels: C0123. Some Joined Threads may be missing, or may be ones the bot should have forgotten. CSCB uses the Thread Memory it found. Check the threads the bot should be in; a new @mention puts it back in a thread.
+```
+
+Unclean wording:
+
+```text
+:warning: *Thread Memory changed while stopped* — "Alpha" (key=alpha); channels: C0123. CSCB didn't shut down cleanly, so it can't tell whether Thread Memory changed. CSCB uses the Thread Memory it found. Check the threads the bot should be in; a new @mention puts it back in a thread.
+```
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-changed-while-stopped: persona=alpha channels=["C0123"] case=journal-missing wording=changed Joined Threads may be missing or ones the bot should have forgotten; check threads, a new @mention puts the bot back
+  ```
+
+  ```text
+  [slack] thread-memory-changed-while-stopped: persona=alpha channels=["C0123"] case=unclean-stop wording=unclean CSCB didn't shut down cleanly; cannot tell whether Thread Memory changed; check threads, a new @mention puts the bot back
+  ```
+
+- **Meaning:** CSCB uses the Thread Memory it found, but cannot guarantee that its Joined Threads match what should remain. This report appears at most once per persona per server run, whether detected at start or on the first successful read; a later matching observation does not post again.
+- **Cause:** The first applicable case below supplies `case` and `wording`. The two line forms above differ only in those fields and the fixed explanation for changed versus unclean.
+- **Fix:** Check the threads the bot should be in; a new @mention puts it back in a thread. Never delete Thread Memory files to clear the report.
+
+| `case` | What was found | `wording` |
+| --- | --- | --- |
+| `unclean-stop` | The previous seal does not record a clean shutdown for this persona. | `unclean` |
+| `journal-missing` | The seal names Thread Memory whose journal is missing or has no created store. | `changed` |
+| `journal-changed` | The journal's store identity differs or its last record number is lower than the seal records. | `changed` |
+| `entry-missing` | A journal is present but the seal has no entry for it. | `changed` |
+| `hybrid-without-store` | A persona has a `thread_hybrid` channel, a seal existed, but neither its journal nor its seal entry is present. | `unclean` if a previous seal entry records an unclean stop; otherwise `changed` |
+| `marker-without-store` | The saved created marker says Thread Memory existed, but its journal and seal entry are absent. | `changed` |
+| `queue-changed` | After a recorded clean stop, the queue journal's identity or contents differ from what the seal saved. | `changed` |
+
+A first successful read can reveal `journal-missing` or `journal-changed` that an unreadable journal concealed. A first start with no earlier store or seal does not report a change.
+
+Restoring the entire state directory can go undetected when its Thread Memory journals, clean seal and queues remain mutually consistent and the restore preserves the file identities the seal checks. Copying a queue whose identity differs from the clean seal's record is detected even if its contents are unchanged.
+
+### `thread-memory-recovered`
+
+```text
+:white_check_mark: *Thread Memory recovered* — "Alpha" (key=alpha); channels: C0123. Thread Memory can be read and every kept join is saved.
+```
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-recovered: persona=alpha channels=["C0123"] Thread Memory readable; every kept join saved
+  ```
+
+- **Meaning:** Thread Memory is readable, its journal is not missing and every retained fact, including the bot's own-post intents, outcomes and joins, and every creation step is saved. If both not-saved and unreadable episodes are open, one recovered post and line close them together after the last outstanding work settles, provided at least one posted its report; healthy observations without an open outage and outages that posted no report produce no recovered post or line.
+- **Cause:** A successful read or save, or a later decision about pending joins, settles the outage. A join still awaiting a channel decision keeps it open; current joins must be saved durably, while stale joins no longer needed by a held reply can be discarded, allowing recovery without an append. Background saving continues without new traffic after a pending decision becomes available, and that decision does not advance an existing retry deadline.
+- **Fix:** No action is needed. This report confirms Thread Memory recovery, not that every held reply's separate queue resolution has been saved; a [holds-not-resolved](#thread-memory-holds-not-resolved) failure still needs its own storage fix.
+
+### `thread-memory-quarantined`
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-quarantined: persona=alpha lines=2 invalid_final_lines=1 path="<state dir>/threads/alpha.unreadable-2026-10-30T00-00-00.000Z" invalid lines quarantined; an invalid final line has no Joins lost report
+  ```
+
+- **Meaning:** No notice is posted for this label. `lines` counts quarantined lines and `invalid_final_lines` counts invalid final lines; their original bytes are kept in `<state dir>/threads/<key>.unreadable-<UTC start time>`, with colons in the timestamp replaced by hyphens.
+- **Cause:** A journal read found invalid records. Other damaged lines can separately cause *Joins lost*; a lone torn final line is an append that was never saved, so the incoming queue record recovers its join and no *Joins lost* is posted for that line.
+- **Fix:** Keep the quarantine file for investigation and check the journal's disk and storage. Readable joins remain usable; follow [Joins lost](#thread-memory-joins-lost) for any separately reported losses.
+
+### `thread-memory-compaction-failed`
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-compaction-failed: persona=alpha step=journal-rewrite path="<state dir>/threads/alpha.jsonl" Error code=EACCES message="permission denied"; compaction not confirmed; journal retained, retried at maintenance
+  ```
+
+- **Meaning:** Nothing is posted. `step=journal-rewrite` identifies a compaction that could not be confirmed; the journal is retained and compaction is retried at maintenance.
+- **Cause:** Rewriting or durably saving the compacted journal failed. The failure does not clear known joins or wait on another persona; maintenance runs hourly (`QUEUE_COMPACT_INTERVAL_MS`).
+- **Fix:** Check the named journal's disk, mount and permissions. Leave it in place for the next maintenance attempt; [`thread-memory-compaction-recovered`](#thread-memory-compaction-recovered) confirms recovery.
+
+### `thread-memory-compaction-recovered`
+
+- **Line:** One recovery line follows an open compaction-failure episode:
+
+  ```text
+  [slack] thread-memory-compaction-recovered: persona=alpha path="<state dir>/threads/alpha.jsonl" journal compaction confirmed
+  ```
+
+- **Meaning:** Journal compaction for this persona is confirmed. This metadata-only server-log line posts no Slack notice and adds no startup-errors entry.
+- **Cause:** After [`thread-memory-compaction-failed`](#thread-memory-compaction-failed), a durable rewrite or a maintenance completion proved to leave the journal unchanged succeeded. A guard return, unreadable memory, dry run, cancellation or a seal-write result does not confirm compaction.
+- **Fix:** No operator repair is needed for this recovery. Separate memory, seal or hold-resolution failures retain their own remedies; this is distinct from the [`Thread Memory recovered`](#thread-memory-recovered) notice.
+
+### `thread-memory-removal-failed`
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-removal-failed: persona=alpha step=journal-unlink path="<state dir>/threads/alpha.jsonl" Error code=EACCES message="permission denied"; removal retried at next start
+  ```
+
+- **Meaning:** Nothing is posted. `step` names the unfinished removal: `journal-unlink`, `seal-entry` or `marker`; `path` identifies the persona's journal for all three steps. Remaining removal work is retried at the next start.
+- **Cause:** Removal could not durably delete the journal, remove the shared seal entry or clear the saved created marker. The persona's retries are cancelled before removal.
+- **Fix:** Restore permissions and storage for the named journal and state directory, then let the next start finish removal. Keep any remaining files in place; successful removal logs no line.
+
+### `thread-memory-seal-unreadable`
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-seal-unreadable: persona=all path="<state dir>/thread-memory-seal.json" Error code=EACCES message="permission denied"; seal treated as having no entries
+  ```
+
+  ```text
+  [slack] thread-memory-seal-unreadable: persona=all path="<state dir>/thread-memory-seal.json" Error message="Invalid Thread Memory seal"; seal treated as having no entries
+  ```
+
+- **Meaning:** Nothing is posted for this label. `persona=all` identifies the shared seal, whose unreadable or invalid contents count as having no entries; CSCB rebuilds its running entries after load and rewrites the seal when there is Thread Memory to record.
+- **Cause:** The seal could not be read, parsed or validated. Separate *Thread Memory changed while stopped* reports may follow for personas whose earlier state cannot be verified.
+- **Fix:** Check the named seal's disk, mount and permissions and preserve damaged bytes for investigation. Follow any separate changed-while-stopped report; a failed replacement write follows the next entry's retries.
+
+### `thread-memory-seal-not-saved`
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-seal-not-saved: persona=all written_but_not_synced=false path="<state dir>/thread-memory-seal.json" Error code=EACCES message="permission denied"; seal write retried
+  ```
+
+  ```text
+  [slack] thread-memory-seal-not-saved: persona=all written_but_not_synced=true path="<state dir>/thread-memory-seal.json" Error code=EACCES message="permission denied"; seal write retried
+  ```
+
+- **Meaning:** Nothing is posted for this label. `persona=all` identifies the shared seal; `written_but_not_synced=true` means the write happened but durability was not confirmed, which still counts as a failure.
+- **Cause:** Writing or syncing the seal failed. One shared retry series uses the 5-to-60-second spacing above without stopping any persona's intake, delivery or independent Thread Memory retries; a new journal waiting for its seal entry keeps its joins in memory meanwhile.
+- **Fix:** Check the named seal's disk, mount and permissions; [`thread-memory-seal-saved`](#thread-memory-seal-saved) confirms recovery. One final failed or unsynced shutdown write logs this line after ordinary episodes close, even if an earlier onset already logged. That final line promises no retry after exit, and the next start may report an unclean stop.
+
+### `thread-memory-seal-saved`
+
+- **Line:** One recovery line follows the shared seal's open failure episode:
+
+  ```text
+  [slack] thread-memory-seal-saved: persona=all path="<state dir>/thread-memory-seal.json" seal write confirmed
+  ```
+
+- **Meaning:** The shared seal is durably saved. This metadata-only server-log line posts no Slack notice and adds no startup-errors entry; it covers the one seal shared by all personas.
+- **Cause:** An actual durable seal write succeeded after [`thread-memory-seal-not-saved`](#thread-memory-seal-not-saved). A skipped request, cancellation or a write whose sync failed does not recover the episode; another persona's teardown cannot clear it.
+- **Fix:** No operator repair is needed for this recovery. It does not certify journal compaction, hold resolution or the separate [`Thread Memory recovered`](#thread-memory-recovered) notice's readable-memory/every-kept-join-saved condition.
+
+### `thread-memory-holds-not-resolved`
+
+- **Line:** The log uses the following form (both forms where shown):
+
+  ```text
+  [slack] thread-memory-holds-not-resolved: persona=alpha step=resolution-append Error code=EACCES message="permission denied"; Memory Hold resolution not saved, retried
+  ```
+
+- **Meaning:** Nothing is posted. `step=resolution-append` means the decision to release or withdraw Memory Holds could not be saved in that persona's queue journal; those replies remain unresolved meanwhile.
+- **Cause:** The resolution write failed. CSCB retries that persona's resolution without new traffic, with waits of 10, 30, 60, 120, 300 and then 900 seconds (`RETYPE_BACKOFF_MS`); this is separate from Thread Memory's read/save retry spacing.
+- **Fix:** Check `<state dir>/queue/<key>.jsonl` and its disk, mount and permissions. [`thread-memory-holds-resolved`](#thread-memory-holds-resolved) confirms saved decisions; let them release eligible replies, and resend only messages a subsequent *Joins lost* report lists as withdrawn.
+
+### `thread-memory-holds-resolved`
+
+- **Line:** One recovery line follows this persona's open hold-resolution failure episode:
+
+  ```text
+  [slack] thread-memory-holds-resolved: persona=alpha step=resolution-append Memory Hold resolution saved
+  ```
+
+- **Meaning:** The requested Memory Hold decisions, including withdrawals, are durable. This metadata-only server-log line posts no Slack notice and adds no startup-errors entry; it does not certify preparation or delivery, or that every other hold is resolved.
+- **Cause:** A nonempty requested batch completed durably after [`thread-memory-holds-not-resolved`](#thread-memory-holds-not-resolved), before released replies' preparation finishes. An empty or unknown pass, pending durability, cancellation or another operation's success cannot recover that episode.
+- **Fix:** No operator repair is needed for this recovery. Follow any separate [release preparation failure](#memory-hold-release-preparation-failed); the [`Thread Memory recovered`](#thread-memory-recovered) notice has its own readable-memory/every-kept-join-saved meaning.
+
+### Memory Hold release preparation failed
+
+- **Line:** The same preparation-failure form used for live intake is logged once per failed callback, with safely described detail:
+
+  ```text
+  [slack] persona-routing: post-accept preparation failed<safe detail>
+  ```
+
+- **Meaning:** Preparation of a released reply threw or rejected after its hold decision was durable. This server-log-only error neither undoes resolution nor certifies delivery; other released replies and later resolutions continue independently.
+- **Cause:** A release's preparation callback failed. The safe detail uses the live preparation error's classification and redaction; this error opens no hold-resolution retry or recovery episode and posts no notice or startup-errors entry of its own.
+- **Fix:** Investigate the safely described preparation failure and check the reply's queue/delivery state before taking action. A separate [`thread-memory-holds-not-resolved`](#thread-memory-holds-not-resolved) needs its storage remedy; this line alone gives no automatic resend or preparation-retry instruction.
+
+---
+
+## Shared channel state reports
+
+These reports cover a persona's channels in the one shared channel list, `config.json.last-applied`, and its verified channel membership. Each report goes to the persona's notice destination and to `server.log` as one `[slack]` line, once per episode.
+
+A worse cause or evidence posts once more; channels found later join the open episode without another post or line. Staging a restoration inside either open episode logs its new case without another post.
+
+A notice names at most 20 channels (`SHARED_STATE_NOTICE_MAX_CHANNELS`), then counts the rest; its line lists every channel in that report. Reports carry persona keys, channel IDs, paths and safe error codes, never message text or credentials. Examples use persona `Alpha`, key `alpha`, channel `C0123` and an `EACCES` suffix when present; notice blocks show the body, normally prefixed with `Persona "Alpha" (key=alpha): `, and `&lt;state dir&gt;` displays as `<state dir>` in Slack.
+
+Affected undecidable intake stays held and unacknowledged. Unaffected channels and DMs, other personas and already accepted queues keep working; a staged repair lists membership readiness separately from Channel Stamp-dependent reply holds. Otherwise eligible @mentions, Broadcasts and other intake independent of those stamps continue. Reporting changes no hold, acknowledgement, write or recovery.
+
+Slack retries an unacknowledged event only a limited number of times: a message never accepted may be lost and should be sent again; follow [Message not saved](#message-not-saved) to check the app's **Event Subscriptions** for disabled events.
+
+When the notice destination channel is affected, including a whole-persona outage, the report still goes once through that destination's usual hold and its line is still written. Failed posts retry through the destination hold, which logs [`persona-destination-failed`](#persona-destination-failed); they create no second report or report about the notice. The report line is written even when the notice is muted.
+
+Teardown and removal end open episodes silently; later bring-up starts fresh ones. A persona withheld from bring-up by an unfinished reviewed retirement logs at detection and receives its queued notice once it can post.
+
+These failures post no additional report:
+
+- A start refused for an unreadable, invalid or unwritable last-applied record: no persona is connected, and the refusal and [`reload-shared-recovery`](#reload-shared-recovery) preview already reach the operator.
+- A definite failed or stale bot attempt or write, or a stale configuration apply, that leaves trustworthy state: its tool result or line already explains the outcome. A confirmed configuration apply that fails definitely instead posts *Configuration change not applied*; see [`reload-record-write-failed`](#reload-record-write-failed).
+- A pending or unresolved `set_channel_delivery` attempt, or a strict-mode tool refusal: its tool result explains it. Untrustworthy state behind an unresolved attempt still produces *Channel state unresolved*.
+- Membership evidence faults before the persona's scan run has ended, including conflicting history while the scan is running or only requested, and scan problems `transport` or `superseded`. Transport means Slack is unreachable, so the notice could not be posted either; a superseded scan supplies no current conclusion. Existing [`channel-membership-inventory-incomplete`](#channel-membership-inventory-incomplete) and related membership lines remain available.
+
+### `shared-state-unresolved`
+
+```text
+:warning: *Channel state unresolved* — "Alpha" (key=alpha); channels: C0123. Shared channel authority: "&lt;state dir&gt;/config.json.last-applied" (EACCES). A shared-state write was renamed but not synced. CSCB finishes it at its next configuration checks once the state directory can be synced. Check the disk and filesystem. If the file changes meanwhile, existing recovery can still finish when the exact pending bytes return and synchronization succeeds. If that recovery cannot finish, use reviewed restoration, or explicit replacement when restoration is impossible, as the debugging skill's reload-shared-recovery entry describes, then restart. Messages there stay held. Other channels and personas, and already accepted queues, keep working. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+For `evidence-changed`, `retirement-unresolved` and channel-specific `not-saved`, the opening, held-message text and retry warning stay the same; the problem and action sentences are:
+
+- `evidence-changed`: The file no longer holds what CSCB wrote, so CSCB won't guess. Preserve the evidence. Existing recovery can still finish without restarting when the exact pending bytes return and synchronization succeeds. If that recovery cannot finish, use reviewed restoration, or explicit replacement when restoration is impossible, as the debugging skill's reload-shared-recovery entry describes, then restart. Choices that cannot be restored are lost and must be set again.
+- `retirement-unresolved`: A confirmed change's persona retirement could not be finished or undone. CSCB retries at each configuration check. Check the state directory's disk; the retirement must be recovered before affected intake resumes.
+- `not-saved`: CSCB could not save membership evidence for these channels. It retries reconciliation in the background. Check the state directory's disk; retries cannot restore events Slack no longer sends.
+
+When a scan ends with a storage failure and no unresolved channels can be enumerated, the `not-saved` inventory form lists known channels rather than claiming they are all held. This can follow a failed observation of a newly discovered channel or a failed inventory commit; verified usable channels continue, while only intake depending on missing membership evidence stays held and unacknowledged.
+
+```text
+:warning: *Channel state unresolved* — "Alpha" (key=alpha); membership inventory incomplete; known channels: C0123. Shared channel authority: "&lt;state dir&gt;/config.json.last-applied" (EACCES). CSCB could not save a complete membership inventory. It retries reconciliation in the background. Check the state directory's disk; retries cannot restore events Slack no longer sends. Verified usable channels keep working. Only intake depending on missing membership evidence stays held and unacknowledged. Recovery requires a complete membership inventory. Other channels and personas, and already accepted queues, keep working. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+A staged restoration lists channels with decided membership separately from channels whose membership is unresolved. These lists describe membership readiness only: decided membership can still be ineligible, and thread-dependent replies in `thread_hybrid` channels remain held and unacknowledged while their Channel Stamps are undecided. Otherwise eligible @mentions, Broadcasts and other stamp-independent intake continue:
+
+```text
+:warning: *Channel state unresolved* — "Alpha" (key=alpha); all its channels; repair pending. Shared channel authority: "&lt;state dir&gt;/config.json.last-applied" (EACCES). A reviewed restoration is staged. Restart CSCB to review and confirm it; staging alone does not complete the repair. Repair is pending for this persona. Membership decided: C0123. Membership unresolved (intake held): C0456. These lists describe membership readiness only. Thread-dependent replies in thread_hybrid channels stay held and unacknowledged while Channel Stamps are undecided. Otherwise eligible @mentions, Broadcasts and other intake independent of Channel Stamps continue. Other channels and personas, and already accepted queues, keep working. Only messages whose intake is held remain unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+With identical membership projections, the unresolved-membership list can be empty while thread-dependent replies remain held. The status sentences are:
+
+```text
+Repair is pending for this persona. Membership decided: C0123, C0456. Membership unresolved (intake held): none. These lists describe membership readiness only. Thread-dependent replies in thread_hybrid channels stay held and unacknowledged while Channel Stamps are undecided. Otherwise eligible @mentions, Broadcasts and other intake independent of Channel Stamps continue.
+```
+
+If DMs are held too, the unresolved-membership sentence ends `; DMs are held too.`. The decided and unresolved membership lists share the same 20-channel budget, reserving space for unresolved entries first. The staged form without a membership breakdown uses these problem and status sentences:
+
+```text
+A reviewed restoration is staged. Restart CSCB to review and confirm it; staging alone does not complete the repair. Messages in the affected channels stay held.
+```
+
+Every staged notice and log uses this intake-specific retry warning (`SHARED_STATE_STAGED_SLACK_RETRY_WARNING`), so it does not imply that continuing mentions or Broadcasts go unacknowledged:
+
+```text
+Only messages whose intake is held remain unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+Other scope examples replace only the opening sentence; the overflow example has 22 channels:
+
+```text
+:warning: *Channel state unresolved* — "Alpha" (key=alpha); channels: C0123, C0124, C0125, C0126, C0127, C0128, C0129, C0130, C0131, C0132, C0133, C0134, C0135, C0136, C0137, C0138, C0139, C0140, C0141, C0142 and 2 more.
+```
+
+```text
+:warning: *Channel state unresolved* — "Alpha" (key=alpha); all its channels: C0123.
+```
+
+```text
+:warning: *Channel state unresolved* — "Alpha" (key=alpha); channels: C0123; DMs also affected.
+```
+
+- **Line:** Each cause has its own action text. These are the channel-scoped forms, the inventory form and the staged membership-readiness form:
+
+```text
+[slack] shared-state-unresolved: persona=alpha cause=unsynced channels=["C0123"] path="<state dir>/config.json.last-applied" EACCES; finish the write at configuration checks; check disk/filesystem; if evidence changes, existing recovery can still finish when exact pending bytes return and sync succeeds; if recovery cannot finish, use reviewed restoration or explicit replacement and restart. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+```text
+[slack] shared-state-unresolved: persona=alpha cause=evidence-changed channels=["C0123"] path="<state dir>/config.json.last-applied" EACCES; preserve evidence; existing recovery can still finish without restarting when exact pending bytes return and sync succeeds; if recovery cannot finish, use reviewed restoration or explicit replacement and restart; unrestorable choices must be set again. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+```text
+[slack] shared-state-unresolved: persona=alpha cause=retirement-unresolved channels=["C0123"] path="<state dir>/config.json.last-applied" EACCES; retirement recovery retries at configuration checks; check the state directory disk. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+```text
+[slack] shared-state-unresolved: persona=alpha cause=not-saved channels=["C0123"] path="<state dir>/config.json.last-applied" EACCES; membership reconciliation retries in the background; check the state directory disk. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+```text
+[slack] shared-state-unresolved: persona=alpha cause=not-saved scope=inventory known_channels=["C0123"] path="<state dir>/config.json.last-applied" EACCES; complete membership inventory not saved; verified usable channels keep working; only intake depending on missing membership evidence stays held and unacknowledged; recovery requires a complete membership inventory; membership reconciliation retries in the background; check the state directory disk. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+```text
+[slack] shared-state-unresolved: persona=alpha cause=restoration-staged scope=all channels=["C0123","C0456"] repair_pending=true membership_decided=["C0123"] membership_held=["C0456"] path="<state dir>/config.json.last-applied" EACCES; restart to review and confirm staged restoration; channel lists describe membership readiness only; thread-dependent replies in thread_hybrid channels stay held and unacknowledged while Channel Stamps are undecided; otherwise eligible @mentions, Broadcasts and other intake independent of Channel Stamps continue. Only messages whose intake is held remain unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+  Whole-persona scope adds `scope=all` before `channels`, except the `not-saved` inventory form, which uses `scope=inventory known_channels=[...]`; affected DMs add `dm=true` after the channel list. Staging adds `repair_pending=true` and the complete `membership_decided` and `membership_held` lists. `membership_held=[]` means no listed channel has unresolved membership; it does not clear the separate hold on thread-dependent replies while Channel Stamps are undecided.
+
+  The optional failure suffix follows the quoted path; without a failure, its following `; ` is omitted too.
+
+- **Meaning:** The first affected channel, DM or whole-persona scope opens an episode at a write, configuration check, membership save or start check; a staged restoration opens a repair-pending episode even when its membership projections remain decided; thread-dependent replies still wait for decided Channel Stamps. The episode ends only after its cause clears, every channel it accumulated reads as decided, and its DM and whole-persona unresolved claims clear.
+
+  The inventory form also waits for a complete scan, even if a retry makes every known channel usable. Its known-channel list does not establish that the inventory is complete or identify every held channel.
+- **Cause:** `unsynced` means the write was renamed but its directory sync did not finish; `evidence-changed` means the file changed under that uncertain write. `restoration-staged` means reviewed restoration is waiting for restart review; `retirement-unresolved` means an interrupted reviewed retirement is held; `not-saved` means membership evidence could not be saved while the shared list remains readable, either an `event-not-durable` hold or an ended `storage` scan.
+
+  Severity rises in this order: `not-saved`, `retirement-unresolved`, `unsynced`, `evidence-changed`, `restoration-staged`; staging inside an open episode is the log-only exception above. Equal or milder causes do not post again.
+- **Fix:** For `unsynced`, check the named path's disk and filesystem; later configuration checks finish the exact write when the directory can sync.
+
+  `evidence-changed` remains until existing recovery succeeds or restoration is staged; use [reviewed restoration or explicit replacement](#reload-shared-recovery) when exact recovery cannot finish, then restart, and set unrestorable choices again. Do not edit durable state by hand.
+
+  For `restoration-staged`, restart to review and confirm; staging alone is not completion. For `retirement-unresolved`, check the state directory's disk while configuration checks retry retirement. For `not-saved`, check storage while background reconciliation retries; see [`channel-membership-storage-failed`](#channel-membership-storage-failed) and [`reload-record-write-failed`](#reload-record-write-failed).
+
+  None of these repairs retrieves events Slack stopped retrying: send missing messages again and check **Event Subscriptions** as [Message not saved](#message-not-saved) describes.
+
+### `membership-evidence-unresolved`
+
+History gap (`absence-order`):
+
+```text
+:warning: *Channel membership evidence unresolved* — "Alpha" (key=alpha); channels: C0123. C0123: the bot was seen absent, but CSCB cannot tell whether that leave came before or after a choice confirmed meanwhile. Retries, reconciliation and time cannot settle this history; only reviewed recovery can, through an explicit absence replacement for the channel or reviewed restoration. Messages whose eligibility depends on this missing evidence stay held. Other channels and personas, and already accepted queues, keep working. Elapsed time does not establish missing evidence. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+For `event-history`, the per-channel evidence sentence is:
+
+```text
+C0123: a membership event conflicts with recorded history.
+```
+
+An ended scan with `deadline`:
+
+```text
+:warning: *Channel membership evidence unresolved* — "Alpha" (key=alpha); channels: C0123.  Slack's membership list could not be read in time. CSCB retries; if this continues, check Slack's status and the workspace size. Messages whose eligibility depends on this missing evidence stay held. Other channels and personas, and already accepted queues, keep working. Elapsed time does not establish missing evidence. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+Other ended-scan problems replace its problem and action sentences with the following text. The `access` example also shows the optional Slack reason and next-attempt time:
+
+- `access`: The bot lacks a scope or channel access needed to read membership. Add the scope named in the debugging skill and reinstall; retries alone cannot fix it. Slack reason: missing_scope. Next attempt at: 1700000000000.
+- `authentication`: Slack refused the bot's credentials. Fix the bot token through a confirmed configuration change; retries alone cannot fix it.
+- `installation-unverified`: CSCB could not verify the app installation. Check the installation and its credentials; retries alone cannot fix it.
+- `malformed-page`: Slack returned a membership page CSCB cannot read. CSCB retries; the incomplete page establishes no missing fact.
+- `current-membership-missing`: A complete scan still left current membership undecided for these channels. CSCB retries; check the debugging skill's current-membership-missing entry.
+- `eligibility-missing`: A complete scan still left channel eligibility undecided. CSCB retries; check the debugging skill's eligibility-missing entry.
+- `event-order-conflict`: A complete scan still left membership event order undecided. CSCB retries; check the debugging skill's event-order-conflict entry.
+
+- **Line:** History and ended-scan forms, including an optional safe Slack error and next-attempt time:
+
+```text
+[slack] membership-evidence-unresolved: persona=alpha cause=history channels=["C0123"] path="<state dir>/config.json.last-applied" missing_evidence=[C0123:absence-order] EACCES; history needs explicit absence replacement or reviewed restoration; retries and time cannot settle it. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+```text
+[slack] membership-evidence-unresolved: persona=alpha cause=history channels=["C0123"] path="<state dir>/config.json.last-applied" missing_evidence=[C0123:event-history] EACCES; history needs explicit absence replacement or reviewed restoration; retries and time cannot settle it. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+```text
+[slack] membership-evidence-unresolved: persona=alpha cause=scan-ended channels=["C0123"] path="<state dir>/config.json.last-applied" problem=deadline EACCES; background scans retry; restore the named access, authorization, installation or membership evidence; retries and time do not establish missing facts. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+```text
+[slack] membership-evidence-unresolved: persona=alpha cause=scan-ended channels=["C0123"] path="<state dir>/config.json.last-applied" problem=access slack_error=missing_scope next_attempt_at=1700000000000 EACCES; background scans retry; restore the named access, authorization, installation or membership evidence; retries and time do not establish missing facts. Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.
+```
+
+  Other scan problems replace the `problem` value above; their log action text is identical. A report can carry both `missing_evidence` and `problem`; it uses `cause=history` and the history action text.
+
+  `missing_evidence` lists every channel and its evidence kind, uncapped; history gaps beyond the notice's displayed channels are counted with `And N more channel evidence gaps; see the server log.`. Whole-persona scope adds `scope=all`; the optional failure suffix follows the quoted path.
+
+- **Meaning:** Once a scan has ended, missing history or an incomplete scan's missing or inaccessible evidence is reported. A request's initial `incomplete` status is not an ended scan. The episode stays open through retries and ends only when no `history-unresolved` channel remains, the latest scan is complete, and every accumulated channel has decided membership; a whole-persona claim also needs no unresolved channel remaining.
+- **Cause:** History is `absence-order` when an observed absence cannot be ordered against a confirmed choice, or `event-history` when an event conflicts with recorded history. Scan problems name a deadline, inaccessible membership, refused credentials, an unverified installation, a malformed page, or current membership, eligibility or event order still missing after reading the list.
+
+  Severity groups rise from `deadline`, `malformed-page`, `current-membership-missing`, `eligibility-missing` and `event-order-conflict`, to `access`, `authentication` and `installation-unverified`, then to either history kind. Same or lower severity stays in the open episode; a worse group posts once more only after the scan ends.
+- **Fix:** Only reviewed recovery settles history: an explicit absence replacement for the channel or reviewed restoration; retries, reconciliation and time cannot. For scan problems follow the action above; `access`, `authentication` and `installation-unverified` need their named repair, not retries alone.
+
+  See [`channel-membership-unresolved`](#channel-membership-unresolved), [`channel-membership-inventory-incomplete`](#channel-membership-inventory-incomplete) and [Membership recovery bounds](#membership-recovery-bounds) for scopes and repair limits. Elapsed time establishes no missing fact, and finite Slack retries can lose never-accepted messages; send missing messages again after repair and check **Event Subscriptions** via [Message not saved](#message-not-saved).
+
+### `shared-state-recovered`
+
+The `state` and `evidence` closing variants have the same notice body:
+
+```text
+:white_check_mark: *Channel state recovered* — "Alpha" (key=alpha); channels: C0123. The channel state and current membership for these channels are trustworthy again; held messages there are decided now. Slack retries are finite. Messages Slack stopped retrying meanwhile are not recovered; send missing messages again.
+```
+
+After an activated reviewed restoration or replacement (`repair`):
+
+```text
+:white_check_mark: *Channel state recovered* — "Alpha" (key=alpha); channels: C0123. The reviewed restoration or replacement is applied and this persona's current membership is verified. The channel state and current membership for these channels are trustworthy again; held messages there are decided now. Slack retries are finite. Messages Slack stopped retrying meanwhile are not recovered; send missing messages again.
+```
+
+- **Line:** The closing cause names the last episode, or reviewed repair:
+
+```text
+[slack] shared-state-recovered: persona=alpha cause=state closed=state channels=["C0123"] path="<state dir>/config.json.last-applied" EACCES; state and current membership trustworthy; held messages are decided now. Slack retries are finite; messages Slack stopped retrying are not recovered.
+```
+
+```text
+[slack] shared-state-recovered: persona=alpha cause=evidence closed=evidence channels=["C0123"] path="<state dir>/config.json.last-applied" EACCES; state and current membership trustworthy; held messages are decided now. Slack retries are finite; messages Slack stopped retrying are not recovered.
+```
+
+```text
+[slack] shared-state-recovered: persona=alpha cause=repair closed=repair channels=["C0123"] path="<state dir>/config.json.last-applied" EACCES; state and current membership trustworthy; held messages are decided now. Slack retries are finite; messages Slack stopped retrying are not recovered.
+```
+
+  Scope and optional failure fields follow the unresolved report's form; the closing channel list includes channels accumulated during the episode.
+
+- **Meaning:** One recovered report follows the last open state/evidence episode's closure, under its recovered mark; an earlier-closing episode is silent. Without an onset report there is no ordinary recovery report. `state` means shared-state unresolved closed last; `evidence` means membership evidence closed last, including when both close together.
+- **Cause:** Required state and membership became trustworthy. The `repair` variant is tracked only in the run whose start activated reviewed restoration or replacement; it needs a complete scan and decided channels, and may post without an onset. If that run restarts before membership is decided, the completion report is lost: the later start has only the existing `retained repair activation` log line, while any failure still open is reported as usual.
+- **Fix:** No further repair is needed. Messages Slack stopped retrying meanwhile are not recovered: send missing messages again, and follow [Message not saved](#message-not-saved) to check **Event Subscriptions** for disabled events.
+
+---
 
 ## A persona's instance runs but isn't connected
 
@@ -1923,7 +3033,7 @@ any other refused call: see
 | `[slack] reconnectSession: persona=<key> is <state> and reading its pane failed: <error> — tmux is not available; deferring to a later tick, no deferral noted and no notice (read-pane class=<CLASS>)` | The row reads `ask_user` or `check_permission`, and agent-director couldn't read the screen because tmux isn't available (`<CLASS>` `ENVIRONMENT`). Nothing is typed or posted, and the held-back time is not counted. A later tick retries. See **tmux isn't available** in [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own). |
 | `[slack] reconnectSession: persona=<key> is <state> and a launch for it is in flight — deferring to a later tick` | A launch for the persona is running and owns the instance. Nothing is typed or posted; a later tick retries. |
 | `[slack] reconnectSession: persona=<key> status check failed: <error> — not typing /mcp reconnect blind; deferring to a later tick` | agent-director couldn't report the row's state, so nothing is typed. A later tick retries. While agent-director can't report the persona, its instance is never killed or relaunched: see [agent-director can't report a persona's state](#agent-director-cant-report-a-personas-state). |
-| `[slack] reconnectMcp: send-keys answered GONE for <ref>: <error> — agent-director found no session of the row's launch; dead session (tmux-gone), with no tmux server start and no second try` | agent-director found no session of the instance's launch when the reconnect was typed (the instance was killed, or the machine restarted, for example). Nothing is posted and nothing is tried again. In the health check the `escalate-dead` line below follows, with `verdict=dead-session`, and the restart's re-probe decides; if the re-probe reads the row dead, the persona is relaunched. The old instance is killed first only when that re-probe was agent-director answering that its own install had disappeared, which reads nothing of the row (no session of its launch is the one kind of proof that can lead to a kill); a re-probe that read the row ended or missing, or found it gone, voids that proof, so nothing is killed. At a start or relaunch it is resumed or respawned (the `spawnForPersona: dead session for <ref>` line, with `cause=tmux-gone: dead evidence (GONE-based)`). |
+| `[slack] reconnectMcp: send-keys answered GONE for <ref>: <error> — agent-director found no session of the row's launch; dead session (tmux-gone), with no tmux server start and no second try` | agent-director found no session of the instance's launch when the reconnect was typed (the instance was killed, or the machine restarted, for example). Nothing is posted and nothing is tried again. In the health check the `escalate-dead` line below follows, with `verdict=dead-session`, and the restart's re-probe decides; if the re-probe reads the row dead, the persona is relaunched. If the re-probe cannot report liveness, including because agent-director's installation disappeared, no kill or relaunch follows; recovery waits for a fresh agent-director observation. A re-probe that reads the row ended or missing, or finds no row, voids the earlier GONE evidence: the persona is relaunched without a preceding kill. At a start or relaunch it is resumed or respawned (the `spawnForPersona: dead session for <ref>` line, with `cause=tmux-gone: dead evidence (GONE-based)`). |
 | `[slack] reconnectMcp: send-keys refused for <ref>: <error> — agent-director refused the keystrokes as not interactive (the row finished after it was read, or a pending row's session may be another launch's), which does not prove the worker gone; dead session (row-not-interactive), …` | agent-director would not take the reconnect: its row ended or was marked missing just before (often normal after an instance died), or the row is still starting under a launch that may not be this one. This alone doesn't mean the instance is gone. Nothing is posted. In the health check the `escalate-dead` line below follows, with `verdict=row-not-interactive`; if the restart's re-probe then reads the row dead, the persona is relaunched with nothing killed first (the `No kill before the relaunch` line below). A refused reconnect alone never leads to a kill. At a start it is resumed or respawned (`cause=row-not-interactive: not dead evidence` in its `dead session for` line). |
 | `[slack] reconnectMcp: send-keys found no row for <ref>: <error> — no row has the persona's instance id (a row read, not a GONE); dead session (row-absent)` | agent-director had no row for the persona when the reconnect was typed. Nothing is posted. In the health check the `escalate-dead` line below follows, with `verdict=row-absent-at-pane-read`, and a re-probe that reads the row dead relaunches the persona with nothing killed first; at a start it is spawned again. If a leftover session holds the persona's name, the relaunch holds the persona instead (see [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice)). |
 | `[slack] reconnectMcp: send-keys refused for <ref>: <error> — CONFLICT case=<case>…; nothing was typed and the send-keys is not retried; transient` | agent-director would not type into the persona's session because of a session conflict. The persona is held, with nothing typed, and the reconnect is never tried again by any automatic path; a `case=not-this-launch` line adds that a leftover of an earlier launch may hold the persona's session. See [A persona posts a Held: tmux session conflict notice](#a-persona-posts-a-held-tmux-session-conflict-notice). |
@@ -3140,7 +4250,7 @@ record only when its PID is the running server's. It sends one request to
 `config.json` or the last-applied record, connecting directly whatever
 proxy variable (`HTTP_PROXY` and the like) is set, and waits at most 30 s for the
 answer. So it reaches only a server whose `bind` is `127.0.0.1` (the
-default) or `0.0.0.0`, as scheduled prompts do. On any other `bind` a hold
+default) or `0.0.0.0`. On any other `bind` a hold
 ends only by the server's own check, by the persona's teardown (its removal
 or a destructive change), or by a server restart, which drops every hold.
 It reads no configuration file, needs no agent-director, and writes or
@@ -3594,20 +4704,13 @@ No notice raised during its teardown reaches the new half's destination (see
 is an internal error in that cancel; the teardown still runs. Report it as a
 bug.
 
-**Stored channel choices.** Once the change's last-applied record is
-written, the stored channel deliveries of every key it retires (a removed
-persona's, a renamed persona's old key, and a destructively modified
-persona's) are dropped from `channel-delivery.json`, in either mode, with a
-`[slack] channel-delivery: dropped the stored choices of persona=<key> in <n> channels: retired by a confirmed change`
-line (see
-[The store's `[slack] channel-delivery:` lines](#the-stores-slack-channel-delivery-lines)).
-They never apply again. A persona brought up under that key, a
-destructively modified persona's new half included, is at `mentions` in
-every channel in fungible mode until its agent sets a channel again with
-`set_channel_delivery`. From the change's apply until its teardowns have
-settled, a destructively modified persona's `set_channel_delivery` calls are
-refused as for a key that isn't applied (see
-[`persona-channel-delivery-set`](#persona-channel-delivery-set)).
+**Stored channel choices.** Successful activation records retirement and
+replacement choices in the sole shared authority. A replacement inherits no
+old choice or membership. Copied fields do not retain a choice;
+explicit reviewed retention assigns it to the replacement at a new order.
+Unassigned discovered entries use `off` in strict or `mentions` in open.
+While retirement is unsettled, old-life tool calls cannot assign for the
+replacement (see [`persona-channel-delivery-set`](#persona-channel-delivery-set)).
 
 **Either.** `[slack] reload: apply step <n> (<step>) failed for persona "<name>" (key=<key>): <error>`
 is an internal error in that persona's teardown or bring-up; the other
@@ -3724,16 +4827,14 @@ has begun, the server marks the key; once it then reads the new session
 running, it removes the key's entry, and the persona is resumed as usual from
 then on. Search `server.log` for `key is retired`.
 
-The stored channel choices of a retired key don't come back with it. The
-confirmed change that retired the key dropped them (see **Stored channel
-choices** under
-[A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change)),
-so a persona added again or renamed back starts at `mentions` in every
-channel in fungible mode. If that drop's write failed, the confirmed change
-that adds the persona back writes the stored-choice file first, and applies
-nothing if it can't (see
-[`reload-record-write-failed`](#reload-record-write-failed)); a start drops
-them too, while the key is absent or held as retired with no new life begun.
+Successful activation records the choice reset and replacement assignments
+atomically in the sole shared authority. Re-add or rename-back inherits no
+old choice or membership; deliberate reviewed retention is a
+new assignment to the replacement. Current membership still governs effective
+delivery. See **Stored channel choices** under
+[A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change)
+for replacement defaults, and
+[`reload-record-write-failed`](#reload-record-write-failed) for write failures.
 
 A server start records keys too: before its clean-up of old instances ends
 any of them, it records as retired, in one write, the key of every
@@ -3772,25 +4873,20 @@ grep -h -E 'retired-keys: (recorded|cannot record) .*cause=absent-at-start|recon
 
 ## A persona's routing settings were changed by a confirmed change
 
-A confirmed change to a kept persona's routing settings applies in place on
-the running server, with no restart. Which settings those are depends on the
-mode the change's own `allow_invited_channels` picks:
+A confirmed change to a kept persona's `channels`, `delivery`,
+`permission_prompts`, `dm.enabled` or `dm.contact` applies in place in both
+strict and open mode. Both modes use the same shared channel choices and
+destination. Omission retains current choices; use an explicit `off`
+assignment to stop intake. Mode-only edits and copied fields assign nothing
+(see [Pending changes](#pending-changes)).
 
-- **Declarative mode:** `channels` (each entry's `delivery` included) and
-  `permission_prompts`;
-- **Fungible mode:** `invited.permission_prompts`, the fungible destination
-  (an absent value and `"dm"` count as the same);
-- **both modes:** `dm.enabled` and `dm.contact`.
-
-A change to the other mode's section is recorded only and applies nothing
-(the preview's `recorded, with no effect until …` line; see
-[Pending changes](#pending-changes)). A change of `allow_invited_channels`
-itself also applies in place, keeping every session (see
-[Confirming a pending change](#confirming-a-pending-change)). The persona's instance, its
-conversation, its Slack connection and its MCP session are kept. The new
-values govern its next message, tool call, permission prompt and notice. This
-holds for a persona that is `retrying` or `broken` too: it uses the new values
-once it is up.
+A change of `channel_mode` also applies in place, keeping every session (see
+[Confirming a pending change](#confirming-a-pending-change)). The persona's
+instance, conversation, Slack connection and MCP session are kept. The new
+values govern its next message, tool call, permission prompt and notice.
+This holds for a persona that is `retrying` or `broken` too: it uses the new
+values once it is up. Own or inherited `stop_hook_bootstrap` changes also
+reach subsequent AD-state reminder checks immediately with the same session.
 
 - **Prompts already posted** stay where they were posted and can still be
   answered, including a prompt in the persona's DM after `dm.enabled` is
@@ -3803,8 +4899,8 @@ once it is up.
 
 | Line | Meaning |
 |---|---|
-| `[slack] persona "<name>" (key=<key>): updated in place (<settings>); its instance, Slack connection and MCP session are kept` | The change was applied. `<settings>` lists what changed, such as `channels, dm.contact` in declarative mode or `invited.permission_prompts, dm.enabled` in fungible mode. Normal. The same line is logged for a persona that is `retrying` or `broken`, though it has no instance, connection or session yet; it serves with the new values once it comes up. |
-| … the same line ending `; its cached DM conversation is forgotten` | The destination setting (`permission_prompts`, or `invited.permission_prompts` in fungible mode) or `dm.*` changed, so the next post to a DM destination opens the DM again. Normal. |
+| `[slack] persona "<name>" (key=<key>): updated in place (<settings>); its instance, Slack connection and MCP session are kept` | The change was applied. `<settings>` lists what changed, such as `channels, dm.contact` or `permission_prompts, dm.enabled`, in either mode. Normal. The same line is logged for a persona that is `retrying` or `broken`, though it has no instance, connection or session yet; it serves with the new values once it comes up. |
+| … the same line ending `; its cached DM conversation is forgotten` | The destination setting (`permission_prompts`) or `dm.*` changed, so the next post to a DM destination opens the DM again. Normal. |
 | … the same line ending `; forgetting its cached DM conversation failed: <error>` | An internal error. The new values still apply. Report it as a bug. |
 | `[slack] persona "<name>" (key=<key>): in-place update failed: <error>` | An internal error. The new values still apply, because the server reads them at each use. Report it as a bug. |
 
@@ -3899,9 +4995,7 @@ registers again with its history. If the new token is refused too, a new
   `server.log` has a matching `[slack] Tool "reply" failed for persona <ref>: could not open a DM with "<user>" …`
   line. Nothing is posted.
 - **Same cause, prompts and notices:** a persona with a `"dm"` destination
-  (its `permission_prompts` is `"dm"` in declarative mode; in fungible mode
-  its `invited.permission_prompts` is `"dm"` or absent, `"dm"` being the
-  default) opens its DM with `dm.contact` the same way, so its permission
+  (its `permission_prompts` is `"dm"`, in either mode) opens its DM with `dm.contact` the same way, so its permission
   prompts, stuck-prompt warnings and server notices can't be posted either.
   They are held, not lost: `server.log` has one
   [`persona-destination-failed`](#persona-destination-failed) line naming
@@ -3985,10 +5079,12 @@ registers again with its history. If the new token is refused too, a new
   channel not looked up yet gets its name at once. Rows already written keep
   the ID: nothing rewrites them.
 - **DM rows keep their ID, whatever the scopes:** a row from a DM keeps the
-  DM's `D…` ID in `channel_name`, because a DM has no name. A row from a group
-  DM keeps its ID too: looking up a group DM's name needs `mpim:read`, which
-  the shipped manifest does not ask for. Neither is a sign of this problem,
-  and a re-install does not change them.
+  DM's `D…` ID in `channel_name`, because a DM has no name.
+- **Group-DM names need `mpim:read`:** the shipped manifest grants this bot
+  scope. An older app keeps group-DM IDs until you add the scope under
+  OAuth & Permissions → Bot Token Scopes and reinstall the app. With that
+  scope, group DMs can have names; the cache timing above still applies,
+  and rows already written are not rewritten.
 
 ---
 
@@ -4916,13 +6012,18 @@ agent-director get --instance-id <id>
 | `[slack] Session disconnected[ (SSE abort)]: persona "<name>" (key=<key>) cwd="<path>"`, then `[slack] Skipping restart — server is shutting down (persona=<key>)` | The persona's instance's session closed while the server was stopping (stopping the server closes every session). Nothing is restarted and no retries are started. Nothing to do. |
 | `[slack] Queued message: persona=<key> has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one` | After a Slack message was stored and acknowledged, recovery found that its *tmux unavailable* or *tmux server changed* notice holds and nothing was retrying it (its earlier retries stopped: it wasn't up at a retry, its relaunch was declined, or the retry failed internally), below the restart limit (at the limit nothing is started and this line is not logged). The accepted message stays queued; no message-triggered restart was started, and the retries were started with the `environment` cause instead; `[slack] unavailable-retry: persona=<key> armed (environment) — first retry in 30 s` follows. The retries come even with `session_restart_delay` and `health_check_interval` both `0`. Nothing to do; for tmux itself, see **tmux isn't available** under [agent-director refuses a persona](#agent-director-refuses-a-persona-it-is-retried-on-its-own). |
 | `[slack] persona-routing: lost-message row read for persona "<name>" (key=<key>) failed — session-starting left out: …` | The one post-ack recovery read failed. The accepted item stays queued; the decision omits the pending-row state and still applies the existing restart guards. See the error detail in [The server log](#the-server-log). |
+| `[slack] persona-routing: reaction store failed for persona="<name>" (key=<key>) — not acked, so Slack sends it again[ (reason=<code>)]: <description>` | An internal error: saving a reaction to one of this persona's messages threw, where a storage failure logs [`message-not-saved`](#message-not-saved) instead. The receiving persona is named, or shown as `persona=<key>` when its name is unknown; the reaction was not saved or acknowledged, so Slack sends it again, and a [`reaction-received`](#reaction-received) line shows a copy that was saved. Report it as a bug, with the persona's lines around it. |
+| `[slack] persona-routing: error handling reaction event for persona="<name>" (key=<key>)[ (reason=<code>)]: <description>` | An internal error while taking a reaction from Slack, before it was saved. The line identifies the receiving persona, or `persona=<key>` when its name is unknown; CSCB acknowledged the event, so Slack does not send it again and the persona gets no notice of it. Report it as a bug, with the persona's lines around it. |
+| `[slack] persona-routing: failed to ack reaction event for persona="<name>" (key=<key>)[ (reason=<code>)]: <description>` | CSCB could not acknowledge a reaction event to Slack, for example because the persona's Slack connection dropped; the receiving persona is named, or shown as `persona=<key>` when its name is unknown. Slack sends the event again; a reaction already saved is not saved twice and still reaches the persona, at the latest after the next server start. Nothing to do unless it repeats; then check the persona's Slack connection. |
+| `[slack] persona-routing: post-accept reaction preparation failed for persona="<name>" (key=<key>)[ (reason=<code>)]: <description>` | Preparing a saved reaction for delivery failed on this try, from either Slack or another persona's bot using its `react` tool; the receiving persona is named, or shown as `persona=<key>` when its name is unknown. The reaction stays saved, and CSCB tries again on its own, after a restart too. Nothing to do unless it repeats; then check the state directory's free space and permissions, and if they are fine, report it as a bug, with the persona's lines around it. |
+| `[slack] persona-routing: bot-tool reaction store failed for persona "<name>" (key=<key>)[ (reason=<code>)]: …`, `[slack] persona-routing: error handling bot-tool reaction for persona "<name>" (key=<key>)[ (reason=<code>)]: …` | An internal error while saving, or before saving, a reaction another persona's bot made with its `react` tool on one of this persona's messages. The reaction was not saved and, unlike a reaction from Slack, is not sent again, so this persona gets no notice of it. Report it as a bug, with the persona's lines around it. |
 | `[slack] Session connected with CWD "<path>" — no matching persona` | A Claude session connected from a directory that is no persona's `working_directory` (compared by real path, after `~` expansion with symlinks resolved, so a symlinked path to a persona's directory matches). It is not registered: the server disconnects it. A second session that connects from a persona's directory replaces the first. Start it from the persona's directory, or fix `working_directory`. |
 | `[slack] Session refused: its working directory "<path>" is held for an old life that may still be running (instanceId="<id>"[, instanceId="<id>" …]) — registered as no persona's session until the hold ends` | A Claude session connected from a directory where an old instance (each `<id>`) may still be running, so it is registered as no persona's and disconnected, whichever persona names the directory and whether or not that persona is up. It is checked before any persona is matched. With `(the held-directory query failed: <error> — taken as held)` in place of the ids, the server could not tell and refused it to be safe: report that as a bug. Nothing to do for the session itself: once agent-director reads the old instance finished, a session from the directory is decided as usual. Check the old instance read-only with `agent-director get --instance-id <id>`, and see [A persona waiting on an old instance](#a-persona-waiting-on-an-old-instance). |
-| `[slack] persona-destination: <ref> has permission_prompts set to "dm" but dm.enabled is not true — no DM opened and nothing posted` (or `… dm.contact is not set …`; for a prompt the line starts `[slack] permission-poller: <ref>` and ends `— prompt for <instance> (request_token=…) not posted and no DM opened`). In fungible mode the line names the fungible destination's setting: `… <ref> has invited.permission_prompts set to "dm" but …`, also when `invited.permission_prompts` is absent and `"dm"` is its default | The persona's prompt or notice had a `"dm"` destination without DMs on or a contact, which the loader rejects in the mode in force, so it should not happen. Nothing is sent. Report it as a bug, with the persona's lines. |
+| `[slack] persona-destination: <ref> has permission_prompts set to "dm" but dm.enabled is not true — no DM opened and nothing posted` (or `… dm.contact is not set …`; prompts use `[slack] permission-poller: <ref>`) | A DM destination requires enabled DMs and a contact in both modes. The loader rejects this state; report an unexpected runtime occurrence with the persona’s lines. |
 | `[slack] permission-poller: chat.postMessage failed for <instance> token=<token> (the prompt's message was rejected; a short prompt naming the tool is posted instead) (reason=<code>): …` | Slack refused the prompt's message itself (`<code>` is `invalid_blocks`, `msg_too_long` or the like), not its destination, so nothing is held. That message is not posted again: at the next poll a short prompt goes to the destination in its place, naming the tool and reading `The tool input is not shown: Slack rejected the full prompt (<code>).`, with the usual Allow and Deny buttons, which work as on any prompt. Report it as a bug, with the line. |
 | `[slack] permission-poller: chat.postMessage failed for <instance> token=<token> (the short prompt's message was rejected too; nothing more is posted for this request) (reason=<code>): …` | Slack refused the short prompt too. Nothing more is posted for the request. Once agent-director's relay window for it elapses, Claude asks at the persona's tmux pane (`tmux attach -t =slack_bot_<key>`), where it can be answered. Report it as a bug, with both lines. |
 | `[slack] permission-poller: prompt for <instance> (request_token=<token>) failed — the tick goes on; a later tick tries it again unless it was posted: <description>`, `[slack] permission-poller: spawn <instance> failed — the tick goes on, its tracked prompts and stuck-prompt state kept as if not read this tick: <description>`, `[slack] permission-poller: closing prompt for <instance> token=<token> failed — kept for the next tick, the tick goes on: <description>`, `[slack] permission-poller: tick failed — the rest of it skipped: <description>` | An internal error in the permission poller, caught: on one request's prompt, on one instance's row, on one prompt's closing update, or (`tick failed`) elsewhere in one poll, whose rest was skipped. Everything else goes on (after `tick failed`, from the next poll), and later polls try again; each line is written once while the failure repeats, not at every poll. A request whose prompt never posts can still be answered at the persona's tmux pane once its relay window elapses. Report it as a bug, with the line. |
-| `[slack] Tool "<tool>" failed for persona "<name>" (key=<key>) on channel "<channel>": <error>` (fungible mode) | In fungible mode a persona's tools may target any channel ID and Slack decides, so a call on a channel can fail at Slack. The agent gets `Tool "<tool>" failed for persona "<name>" (key=<key>) on channel "<channel>": Slack refused the call (<code>).`, or `…: the tool call failed.` when the failure has no Slack error code (a network or local failure). `not_in_channel`, or `channel_not_found` for a private channel, means the persona's app isn't in that channel: invite the app to it, or have the persona use a channel its app is in. A target that is neither a channel ID nor an allowed DM target is refused before any Slack call, with the tool error `Persona "<name>" (key=<key>) may not target "<target>": it is neither a channel ID nor an allowed DM target.` In declarative mode a channel the persona doesn't list is refused before any Slack call instead, with `… may not target "<target>": it is not one of the persona's configured channels.` |
+| `[slack] Tool "<tool>" failed for persona "<name>" (key=<key>) on channel "<channel>": <error>` (open mode) | In open mode a persona's tools may target any channel ID and Slack decides, so a call on a channel can fail at Slack. The agent gets `Tool "<tool>" failed for persona "<name>" (key=<key>) on channel "<channel>": Slack refused the call (<code>).`, or `…: the tool call failed.` when the failure has no Slack error code (a network or local failure). `not_in_channel`, or `channel_not_found` for a private channel, means the persona's app isn't in that channel: invite the app to it, or have the persona use a channel its app is in. A target that is neither a channel ID nor an allowed DM target is refused before any Slack call, with the tool error `Persona "<name>" (key=<key>) may not target "<target>": it is neither a channel ID nor an allowed DM target.` In strict mode an absent channel or a listed channel whose delivery choice is `off` is refused before any Slack call, with `Persona "<name>" (key=<key>) may not target "<target>": it is not one of the persona's channels with a non-off delivery choice in strict mode.` |
 | `[slack] persona-destination-hold: more than 20 notices held for "<name>" (key=<key>) while its destination fails — oldest held notice dropped, not posted: <first line>` | The persona's destination has been failing for a while (see [`persona-destination-failed`](#persona-destination-failed)) and more than 20 notices are waiting. The oldest is dropped; the line shows its first line. Fix the destination. |
 | `[slack] persona-destination-hold: persona=<key> is no longer applied — <n> held notice(s) dropped, not posted` | The persona was removed from the configuration while notices waited for its failing destination. They are dropped. Nothing to do. |
 | `[slack] persona-destination-hold: shutting down — <n> held notice(s) for "<name>" (key=<key>) dropped, not posted` | The server stopped while the persona's destination was failing. Its held notices are lost; its still-open prompts are posted after the next start. Fix the destination (see [`persona-destination-failed`](#persona-destination-failed)). |
@@ -4931,7 +6032,7 @@ agent-director get --instance-id <id>
 | `[slack] Fatal: configuration error — …` | There was no last-applied record, and the server refused `config.json` and exited. See [Configuration rejections](#configuration-rejections). |
 | `[slack] Fatal: last-applied record error — …` | The server couldn't read or validate its last-applied record and exited. See [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid). |
 | `[<timestamp>] [retired-keys-unreadable] The retired-key record "<path>" …` | The server couldn't read, parse or validate its retired-key record and exited 1. See [The retired-key record can't be read or is invalid](#the-retired-key-record-cant-be-read-or-is-invalid). |
-| `[slack] Starting from the last-applied record "<path>"` or `[slack] No last-applied record: recorded the configuration file "<path>" as "<path>"` | Which configuration a start runs. See [The last-applied record](#the-last-applied-record). |
+| `[slack] Starting from the shared channel authority "<path>" at revision <n>` | The applied authority revision used at startup, including a fresh install's initial revision. See [The last-applied record](#the-last-applied-record). |
 | `[slack] agent-director version re-check: the runtime re-check could not run: <description>; the server keeps running and checks again at the next 120 s re-check` | The server's 120 s check of the agent-director binary couldn't run: the binary is missing, unreadable, unreachable, or didn't answer within 30 s. `<description>` says which (an error name such as `ErrSystemInstallUnreachable (reason <reason>, binary at <path>)`, or `no answer within the 30 s time limit`). Nothing changes: the server keeps running and checks again every 120 s. One line per run of failures: the first failure after start, or after a check that passed, logs it, and the failures after it log nothing until a check passes. Nothing goes to `startup-errors.log` or Slack. If the line keeps coming back, check that the agent-director binary is present and executable. If a later check finds a version the server refuses, the server stops as in [Found while the server was running](#found-while-the-server-was-running). |
 | `[slack] agent-director settings: the [tmux] values in effect from "<path>": pending_grace_seconds <n> s, stopping_window_seconds <n> s, starting_session_seconds <n> s, sweep_budget_seconds <n> s, query_timeout_ms <n> ms, action_timeout_ms <n> ms, create_timeout_ms <n> ms, pipe_close_wait_ms <n> ms, kill_exit_wait_ms <n> ms` | The nine agent-director timing settings the server uses: written at its first accepted read of the settings file and whenever one of the nine changes. Nothing to do; see [agent-director's timing settings](#agent-directors-timing-settings). |
 | `[slack] agent-director settings: the read of "<path>" was refused: <reason>; <kept> stay in effect until a read is accepted` | The server refused agent-director's timing settings file and keeps its last accepted values (`the defaults` at start). One line per run of refused reads. See [agent-director's timing settings](#agent-directors-timing-settings). |
@@ -5105,9 +6206,11 @@ bot teardown, and the other personas are still torn down when one fails.
   succeeds (through an agent-director older than Phase 1, which only `stop --stop-bots` reaches,
   that is a plain success), when agent-director finds no instance for it,
   or when the read before a further try finds the instance ended, missing
-  or gone (no further force-kill is made). A force-kill whose answer names a
-  process that outlived it still counts as stopped, with a *Process outlived
-  kill* text and no change to the exit status.
+  or gone (no further force-kill is made). If a force-kill answer names a
+  process that outlived it and the tries later end in success, the persona
+  counts as stopped, with a *Process outlived kill* text and no change to the
+  exit status. If the tries end in failure, the persona fails; the failure
+  text includes the earlier survivor description.
 - **A force-kill is tried again** (up to 3 tries, 2 s apart, a read of the
   instance before each further try) when agent-director doesn't answer in
   time, answers that it could not end the worker or that tmux did not
@@ -5633,27 +6736,32 @@ read that configuration.
 
 `config.json` (in the state directory) is checked at a start only when there
 is no last-applied record (`config.json.last-applied`, see
-[The last-applied record](#the-last-applied-record)): the first start, the
-first start after an upgrade, or a start after the record was deleted. Then the
+[The last-applied record](#the-last-applied-record)): a fresh install
+without an authority. An existing authority must be preserved during recovery. The
 first violation stops the start before any persona is brought up: nothing
 connects to Slack and nothing is launched. Credentials content and whether
 directories exist are never checked here; those are bring-up checks with the
 classes above.
 
-When a record exists, a start runs the record and doesn't read `config.json`,
-so a restart doesn't apply an edit of `config.json`. The running server still
+An ordinary start runs the recorded applied configuration, so restarting does not apply a `config.json` edit. A refused start may read that file as separately preserved input for [reviewed recovery](#reload-shared-recovery).
+
+The running server still
 checks an edit (a missing `config.json` included), within about 5 s once a start's bring-up is done (see
 [The last-applied record](#the-last-applied-record)). If the edit is wrong, it
 writes the error as one `INVALID:` line to `config.json.pending` and logs it
-once under [`reload-invalid`](#reload-invalid) in `server.log`; nothing is
-applied. The error is the same message as in the tables below. To apply an
+once per new pending review under [`reload-invalid`](#reload-invalid) in
+`server.log`; unchanged checks are quiet, and confirmation follows the
+sequences in that entry. Nothing is applied.
+
+The error is the same message
+as in the tables below. To apply an
 edit, confirm it (see [Confirming a pending change](#confirming-a-pending-change)).
 
 ```text
 [slack] reload-invalid: the pending configuration is invalid and nothing will be applied: <loader error> (preview in "<path>/config.json.pending")
 ```
 
-**Where it shows.** The server logs one line to `server.log` and exits 1, and
+**Where a refused start shows.** The server logs one line to `server.log` and exits 1, and
 `start` repeats the last lines of `server.log` on stderr under
 `[slack] Server failed to start (exit code 1). From <path>:`. Nothing goes to
 `startup-errors.log`.
@@ -5665,67 +6773,43 @@ edit, confirm it (see [Confirming a pending change](#confirming-a-pending-change
 Messages about one persona start `personas[<i>] "<name>" (key=<key>): `, or
 just `personas[<i>]: ` when the name itself is the problem. A malformed value
 (a bad channel ID, `dm.contact`, `permission_prompts` or
-`invited.permission_prompts`) is never echoed, and neither is a rejected
-`allow_invited_channels`, `model` or `effort`, and
+`channel_mode`) is never echoed, and neither is a rejected `model`, `effort` or
+`reaction_notices`, and
 no message shows a `bot_token` or `app_token` value. Messages do quote
 persona names (as written) and keys, channel IDs, the configuration file's path and, in the duplicate-path rules, the
 persona paths. An unknown key's name is quoted only when it is a plain setting
 name (letters and underscores, up to 48 characters); any other unknown key is
 counted instead, since it could be a pasted token. A name with a digit, such
-as `channels2`, is therefore not shown. After a fix, start the server again.
+as `channels2`, is therefore not shown. After a refused start, fix the file
+and start again. On a running server, fix the edit, read the fresh preview
+and confirm it.
 
-**Each mode has its own persona rules.** The switch `allow_invited_channels`
-is checked with the server-wide settings, before any persona entry, and the
-mode it picks sets which rules each entry is checked by: declarative mode
-(absent or `false`) checks `channels` and the top-level
-`permission_prompts`, fungible mode (`true`) checks `invited`. Each mode
-leaves the other section unchecked and unread, so a malformed `invited`
-loads in declarative mode, and malformed `channels` or `permission_prompts`
-load in fungible mode. `dm` and the rules [across personas](#across-personas)
-apply in both modes. A pending change is judged by the mode its own switch
-picks, not the mode in force: an edit that turns fungible mode on or off
-can give an `INVALID` preview for a persona section that loaded until then
-(see [`reload-invalid`](#reload-invalid)). `docs/configuration.md`'s
-[Load-time rules](../../docs/configuration.md#load-time-rules) list each mode's rules.
+**Both modes validate the shared fields.** The candidate's `channel_mode`
+is checked with the server-wide settings before any persona entry. Strict
+and open mode both validate `channels`, `permission_prompts` and `dm`;
+there is no unchecked section selected by a later switch. A pending edit is
+validated before it can be confirmed. See the
+[Load-time rules](../../docs/configuration.md#load-time-rules).
 
 ### The load-time rules
 
-The rules `config.json` must meet, by mode. The operator reference for each field is `docs/configuration.md`.
-
-Before it applies `config.json`, the server checks the whole file and reports the first rule it breaks. It checks the server-wide settings first, `allow_invited_channels` among them, before any persona, in either mode: a non-boolean `allow_invited_channels` is rejected naming the setting. The mode that switch picks then sets which rules each persona entry is checked by.
+Before applying `config.json`, the server validates server-wide settings and all shared persona fields in both modes. `channel_mode` accepts only `strict` (the default) and `open`; other values are rejected. Keys from an earlier release are rejected and need a manual edit; see [Removed configuration keys](#removed-configuration-keys).
 
 In both modes:
 
 - A persona's name or key equals another persona's name or key.
-- A persona's key starts with another persona's key, such as `dev` and `dev_2` (see [Persona name and key](../../docs/configuration.md#persona-name-and-key)).
-- Two personas share a `working_directory` or a `credentials_file`, compared by real path.
-- A `dm.contact` is malformed. User IDs start with `U` or `W`, followed by capital letters and digits only; underscores are not allowed.
-- A path isn't absolute, `~` or `~/…`.
+- A persona's key starts with another persona's key (see [Persona name and key](../../docs/configuration.md#persona-name-and-key)).
+- Two personas share a `working_directory` or a `credentials_file`, compared by real path, except for the [recorded-input recovery case below](#across-personas).
+- A path or ID is malformed; a required field is missing; a key is unknown; or a value has the wrong type or allowed value.
 - A `model` is empty, only whitespace or holds a control character, or an `effort` isn't one of `low`, `medium`, `high`, `xhigh` or `max` (case-sensitive). Both are set per persona only: at the top level they are unknown keys.
-- A required field is missing, or a key of the top level, a persona entry or `dm` is unknown.
-- A value has the wrong type, isn't an allowed value, or is out of range.
+- A `channels` entry lacks `id` or an explicit `delivery` of `off`, `mentions`, `all` or `thread_hybrid`, or duplicates a channel.
+- The required `permission_prompts` is invalid: it must name a listed channel (including `off`), an unchanged channel destination covered by the verified-removal exception below, or `dm` with `dm.enabled` set to `true` and `dm.contact`.
 
-In declarative mode (`allow_invited_channels` absent or `false`):
+In a fresh configuration, or when submitting a new or changed channel destination in `config.json`, the destination must be listed in `channels` in both modes, including open; `delivery: "off"` is allowed. A Slack invitation does not replace that listing.
 
-- `permission_prompts` names a channel that isn't in the persona's `channels`.
-- `permission_prompts` is `"dm"` without `dm.enabled: true` or without a `dm.contact`.
-- A persona has no channels and `dm.enabled` isn't `true`.
-- A persona lists the same channel twice.
-- A channel ID is malformed, or a channel entry has an unknown key. Channel IDs start with `C` or `G`, followed by capital letters and digits only; underscores are not allowed.
+An already validated, unchanged destination may remain absent when the shared authority holds verified-removal evidence for the same persona incarnation. This includes zero channels with DMs disabled and an unrelated confirmed edit: neither re-adding the removed channel nor changing the destination is required. A replacement identity or recreated entry cannot inherit the old incarnation's removal evidence.
 
-`invited` is neither checked nor read in declarative mode, so a malformed `invited` loads.
-
-In fungible mode (`allow_invited_channels` is `true`):
-
-- `invited` isn't an object, or holds a key other than `permission_prompts`.
-- `invited.permission_prompts` is neither `"dm"` nor a well-formed channel ID.
-- The persona's destination is `"dm"`, written or by default, without `dm.enabled: true` or without a `dm.contact`. The error names `invited.permission_prompts`, says whether `"dm"` is its default, and names each missing setting.
-
-`channels` and the top-level `permission_prompts` are neither checked nor read in fungible mode, whatever they hold, and `permission_prompts` isn't required. A channel destination needs no listing and no DMs, and a persona with DMs off and a channel destination is valid.
-
-A pending change is judged by the rules of the mode its own switch picks, not by the mode in effect. A change that turns fungible mode on is `INVALID` when a persona's `invited` section breaks the fungible-mode rules; a change that turns it off is `INVALID` when a persona's `channels` or `permission_prompts` breaks the declarative-mode rules.
-
-For a persona error, the error names the persona (`personas[<i>]`) and the field. A value that a format, type, range or allowed-value rule rejects is never shown; a type error names only the JSON type it got. Credentials content and whether directories exist are not checked here; they are checked when each persona comes up. At a start with no last-applied record, an error stops the start. On a running server, an error shows as an `INVALID` pending change (see [Reload](#the-last-applied-record)). The tables below give every rejection with its cause and fix.
+This is retained provenance, not an operator-supplied exception flag; only a confirmed destination change selects a different future audience.
 
 ### Before any persona is read
 
@@ -5733,72 +6817,75 @@ For a persona error, the error names the persona (`personas[<i>]`) and the field
 |---|---|---|
 | `missing prerequisite: config.json not found at <path>, and no config.json.last-applied at <path>` (from `start`), or `The configuration file "<path>" does not exist. The server requires the configuration file to start.` | No `config.json` and no last-applied record in the state directory. | Run `bun src/postinstall.ts` from the installed package directory to create the skeleton, or create `config.json` by hand; `{"personas": []}` is the smallest valid file. Check that `SLACK_STATE_DIR` names the directory you populated. |
 | `The configuration file "<path>" cannot be read (<errno>). …` | Permissions, or the path is a directory (`EISDIR`). `(not a regular file)` in place of the errno: the path is a FIFO, socket or device, which is never read. | Make it a readable regular file. |
-| `The configuration file "<path>" is larger than the 64 KiB limit. …` | The file is over 64 KiB. Start and the reload check never read past that; a real configuration is far smaller, so the file is damaged or the wrong file. | Replace it with the intended configuration. |
 | `loadPersonaConfig: malformed JSON in "<path>" at line <L>, column <C>.` | Not valid JSON. The line and column (from 1) point at the first character that breaks it; the file's content is never echoed. | Fix the syntax at that position. |
 | `the configuration must be a JSON object, got <type>.` | Top level isn't an object. | Wrap it in `{ … }`. |
 | A key belonging to the pre-persona shape | See [Pre-persona configuration](#pre-persona-configuration). | |
 | `unknown top-level field(s) in config.json: "chanels".`, or `…: 1 field whose name is not shown (it is not a plain setting name, so it could be a pasted secret).`, or `…: "chanels", plus 2 fields whose names are not shown (they are not plain setting names, so they could be pasted secrets).` | A top-level key the server doesn't know (often a typo). Only names made of letters and underscores (up to 48 characters) are shown; any other name (one with a digit such as `channels2`, a dash, a dot, or a pasted token) is only counted. | Remove or correct it. For an unshown field, compare the file's top-level keys with the settings in `docs/configuration.md`. |
-| `unknown top-level field(s) in config.json: "model".` or `… "effort".` | `model` or `effort` written at the top level, where neither exists: both are set per persona only. | Set it on each persona that should use it, and remove the top-level key. |
+| `unknown top-level field(s) in config.json: "model".`, `… "effort".` or `… "reaction_notices".` | `model`, `effort` or `reaction_notices` written at the top level: each is set per persona only. | Set it on each persona that should use it, and remove the top-level key. |
 | `claude_director_poll_interval_ms has been renamed to agent_director_poll_interval_ms …` | Old key name. | Rename it. |
 | `personas is required: an array of persona entries, which may be empty.` / `personas must be an array, got <type>.` | Missing or wrong type. | Add `"personas": [ … ]`. |
 | Server-wide type and range errors: `<key> must be a non-negative number.`, `<key> is invalid. Allowed values are: ….`, `<key> must be a boolean.`, `<key> must be a non-empty string when set.`, `<key> must be a string when set.`, `<key> must be a positive integer (>= 1) when set.`, `agent_director_poll_interval_ms must be a positive integer in [200, 3600000].`, `agent_director_call_timeout_ms must be a positive integer in [1000, 3600000].`, `cron_table_path must be a non-empty string.`, `cron_log_path must be a non-empty string.` | A server-wide setting has the wrong type or is out of range. | Correct the named key. |
-| `allow_invited_channels must be a boolean.` | The channel-mode switch is a string, a number, `null`, an object or an array. Its value is never shown. Checked in either mode, after the other server-wide settings and before any persona entry. | Use `true` (fungible mode) or `false`, or remove the key (declarative mode). See [Channel modes](../../docs/channel-modes.md#channel-modes). |
+| `channel_mode is invalid. Allowed values are: strict, open.` | Unsupported channel mode. | Use `"strict"` or `"open"`; absence defaults to strict. |
 
 ### Persona entries
 
-The **Mode** column says which mode checks the rule: *both*, *declarative*
-(`allow_invited_channels` absent or `false`) or *fungible* (`true`). A rule
-of one mode is never checked in the other.
+Every row below applies to submitted configuration in both modes; shared persona fields are always validated.
 
 | Message (after the persona prefix) | Mode | Cause | Fix |
 |---|---|---|---|
 | `personas[<i>] must be a JSON object, got <type>.` | both | An array element isn't an object. | Make it a persona object. |
-| `unknown field(s) in the persona entry: "<key>".`, `… in dm: …`, each possibly with `1 field whose name is not shown …` or `plus <n> fields whose names are not shown …` | both | A key the schema doesn't have, at that level. As at the top level, only plain setting names are shown; others (a digit, as in `channels2`, a dash, a pasted token) are counted. `channels`, `permission_prompts` and `invited` are known persona-entry keys in both modes. | Remove or correct it. For an unshown field, compare that entry's keys with the persona keys in `docs/configuration.md`. |
-| `unknown field(s) in channels[<j>]: …`, with the same forms | declarative | A key a channel entry doesn't have. | Remove or correct it. |
-| `invited must be a JSON object, got <type>.` | fungible | `invited` is a string, a number, an array or another non-object. | Make it an object, `{"permission_prompts": "<channel ID or dm>"}`, or remove it to use the default `"dm"`. |
-| `unknown field(s) in invited: "<key>".`, with the same forms as the persona entry's | fungible | `invited` holds a key other than `permission_prompts`. | Remove or correct it. |
+| `unknown field(s) in the persona entry: "<key>".`, `… in dm: …`, each possibly with `1 field whose name is not shown …` or `plus <n> fields whose names are not shown …` | both | A key the schema doesn't have, at that level. As at the top level, only plain setting names are shown; others (a digit, as in `channels2`, a dash, a pasted token) are counted. `channels` and `permission_prompts` are shared persona fields; for a key from an earlier release, see [Removed configuration keys](#removed-configuration-keys). | Remove or correct it. For an unshown field, compare that entry's keys with the persona keys in `docs/configuration.md`. |
+| `unknown field(s) in channels[<j>]: …`, with the same forms | both | A key a channel entry doesn't have. | Remove or correct it. |
 | `name is required.` / `name must be a non-empty string.` | both | Missing or blank name. Any other name is accepted: there is no format rule. | Give the persona a name. |
 | `credentials_file is required.` / `working_directory is required.` | both | Missing path. | Add it. |
 | `<setting> must be an absolute path, "~" or a path starting with "~/".` | both | `credentials_file`, `working_directory` or `claude_config_dir` is relative (or not a string). | Use an absolute path or `~/…`. |
 | `stop_hook_bootstrap must be a boolean.` / `dm.enabled must be a boolean.` | both | Wrong type. | Use `true` or `false`. |
-| `model must be a non-empty string with no control characters when set.` | both | `model` is empty or only whitespace, holds a control character, or isn't a string (`null`, a number, a boolean, an array or an object). The value is never shown. `model` then `effort` are checked after `stop_hook_bootstrap` and before the channel, `dm` and destination values, so this error comes ahead of an invalid channel ID or delivery, a non-boolean `dm.enabled` or a bad destination. Shape errors (an unknown key, `dm` or `invited` not a JSON object, `channels` not an array, a `channels` entry not a JSON object) are reported first. | Use a non-empty model name such as `opus`, `opus[1m]` or a full model ID, or remove the key. |
+| `model must be a non-empty string with no control characters when set.` | both | `model` is empty or only whitespace, holds a control character, or isn't a string (`null`, a number, a boolean, an array or an object). The value is never shown. `model`, then `effort`, then `reaction_notices` are checked after `stop_hook_bootstrap` and before the channel, `dm` and destination values, so this error comes ahead of an invalid channel ID or delivery, a non-boolean `dm.enabled` or a bad destination. Shape errors (a [removed configuration key](#removed-configuration-keys), an unknown key, `dm` not a JSON object, `channels` not an array, a `channels` entry not a JSON object) are reported first. | Use a non-empty model name such as `opus`, `opus[1m]` or a full model ID, or remove the key. |
 | `effort is invalid. Allowed values are: low, medium, high, xhigh, max.` | both | `effort` is another value, such as `ultracode` or `High` (case-sensitive), or isn't a string. The value is never shown. Checked right after `model`, in the same order as the `model` row says, with shape errors reported first. | Use one of `low`, `medium`, `high`, `xhigh`, `max`, lower-case, or remove the key. |
+| `reaction_notices must be a boolean.` | both | The supplied persona value is a string, number, `null`, array or object. The rejected value is never shown. Checked after `effort` and before channel, DM and destination values; shape errors come first. | Use JSON `true` or `false`, or remove the persona key to restore the default `true`. |
 | `dm must be a JSON object, got <type>.` | both | Wrong shape. | Fix the shape. |
-| `channels must be an array, got <type>.` / `channels[<j>] must be a JSON object, got <type>.` | declarative | Wrong shape. | Fix the shape. |
-| `channels[<j>].id is required.` / `channels[<j>].delivery is required.` | declarative | A channel entry lacks a key. | Every channel needs `id` and `delivery`. |
-| `channels[<j>].id must be a Slack channel ID matching ^[CG][A-Z0-9]+$.` | declarative | Malformed channel ID (a name, a lower-case ID, a URL). | Use the channel ID, e.g. `C0123ABCD`. |
-| `channels[<j>].delivery is invalid. Allowed values are: all, mentions.` | declarative | Bad delivery value. | `all` or `mentions`. |
-| `channel <id> is listed more than once (channels[<a>] and channels[<b>]).` | declarative | One persona lists a channel twice. | Keep one entry. (Several personas may list the same channel.) |
+| `channels must be an array, got <type>.` / `channels[<j>] must be a JSON object, got <type>.` | both | Wrong shape. | Fix the shape. |
+| `channels[<j>].id is required.` / `channels[<j>].delivery is required.` | both | A channel entry lacks a key. | Every channel needs `id` and `delivery`. |
+| `channels[<j>].id must be a Slack channel ID matching ^[CG][A-Z0-9]+$.` | both | Malformed channel ID (a name, a lower-case ID, a URL). | Use the channel ID, e.g. `C0123ABCD`. |
+| `channels[<j>].delivery is invalid. Allowed values are: off, mentions, all, thread_hybrid.` | both | Bad delivery value. | Explicitly choose `off`, `mentions`, `all` or `thread_hybrid`. |
+| `channel <id> is listed more than once (channels[<a>] and channels[<b>]).` | both | One persona lists a channel twice. | Keep one entry. (Several personas may list the same channel.) |
 | `dm.contact must be a Slack user ID matching ^[UW][A-Z0-9]+$.` | both | Malformed `dm.contact`. | Use a user ID, e.g. `U0123ABCD`. |
-| `permission_prompts is required: set it to "dm" or one of the persona's channel IDs.` | declarative | Missing. | Add it. |
-| `permission_prompts must be "dm" or a Slack channel ID matching ^[CG][A-Z0-9]+$.` | declarative | Malformed value. | Use `"dm"` or a channel ID. |
-| `invited.permission_prompts must be "dm" or a Slack channel ID matching ^[CG][A-Z0-9]+$.` | fungible | Malformed fungible destination (a channel name, a lower-case ID, a non-string). Checked after `dm.contact`. | Use `"dm"` or a channel ID. The channel needs no listing: invite the persona's app to it so posts there succeed. |
-| `the persona has no channels and dm.enabled is not true, so it can receive no messages. Add a channel or set dm.enabled to true.` | declarative | Zero channels with DMs off. Checked before the two destination rules below. | Add a channel or turn DMs on. |
-| `permission_prompts names channel <id>, which is not in the persona's channels.` | declarative | The destination channel isn't one the persona lists. | Add the channel to its `channels`, or pick one it lists. |
-| `permission_prompts is "dm" but dm.contact is not set` / `… but dm.enabled is not true` / both, joined by `and` | declarative | A `dm` destination needs both. | Set `dm.contact` and `"dm": {"enabled": true, …}`, or use a channel. |
-| `invited.permission_prompts is "dm" but dm.contact is not set.` / `… but dm.enabled is not true.` / `… but dm.contact is not set and dm.enabled is not true.` | fungible | An explicit `"dm"` fungible destination needs DMs on and a contact. | Set `dm.contact` and `"dm": {"enabled": true, …}`, or set `invited.permission_prompts` to a channel ID. |
-| `invited.permission_prompts is not set, so it is "dm" by default, but dm.contact is not set.` / `… but dm.enabled is not true.` / `… but dm.contact is not set and dm.enabled is not true.` | fungible | No `invited.permission_prompts`, so the destination is `"dm"` by default, which needs DMs on and a contact. A persona with DMs off and no contact needs a channel destination in fungible mode. | Set `invited.permission_prompts` to a channel ID, or set `dm.contact` and `"dm": {"enabled": true, …}`. |
+| `permission_prompts is required: set it to "dm" or one of the persona's channel IDs.` | both | Missing. | Set it to a listed channel or `"dm"` with DMs enabled and a contact. |
+| `permission_prompts must be "dm" or a Slack channel ID matching ^[CG][A-Z0-9]+$.` | both | Malformed value (a channel name, a lower-case ID, a non-string). Checked after `dm.contact`. | Use a listed channel ID or `"dm"` with DMs enabled and a contact. |
+| `the persona has no channels and dm.enabled is not true, so it can receive no messages. Add a channel or set dm.enabled to true.` | both | Zero channels with DMs off, without verified-removal evidence for an already validated, unchanged destination in the same incarnation. Checked before the two destination rules below. | Without that evidence, add a channel or turn DMs on. The [verified-removal exception above](#the-load-time-rules) requires neither for an unrelated edit. |
+| `permission_prompts names channel <id>, which is not in the persona's channels.` | both | The destination channel is unlisted and lacks the same-incarnation verified-removal evidence for an already validated, unchanged destination. | Unless the [verified-removal exception above](#the-load-time-rules) applies, add the channel to `channels` with an explicit delivery value (`off` is allowed), or pick one it lists. New or changed destinations and replacement identities cannot use old removal evidence. |
+| `permission_prompts is "dm" but dm.contact is not set.` / `… but dm.enabled is not true.` / `… but dm.contact is not set and dm.enabled is not true.` | both | A `dm` destination needs DMs enabled and a contact. | Set `dm.contact` and `"dm": {"enabled": true, …}`, or use a listed channel. |
 
-In fungible mode no rule asks a persona for a way to receive: a persona with
-DMs off, no `channels` and a channel fungible destination loads, and receives
-from the channels its app is invited to.
+### Removed configuration keys
+
+These keys belong to an earlier release's configuration. A start rejects them from `config.json` when there is no record, or from a hand-written `config.json.last-applied` that has not yet started, shown as `[slack] Fatal: last-applied record error — …` with the same message; a pending review rejects them too. Edit every file that holds them by hand: before the first start of an upgrade, both baseline files, as step 4 of [Upgrading from 0.18.x](../../docs/migration.md#upgrading-from-018x) says.
+
+| Message | Cause | Replace with |
+|---|---|---|
+| `allow_invited_channels has been removed; use channel_mode.` | The top level of `config.json`, or of a hand-written `config.json.last-applied`, contains `allow_invited_channels`. | `channel_mode`: `"open"` where it was `true`, `"strict"` where it was `false` or absent. Remove `allow_invited_channels`. |
+| `invited has been removed; use permission_prompts.` (after the persona prefix) | A persona entry in either file contains `invited`, whatever it holds. | The persona's one `permission_prompts`, which must meet [the destination rules](#the-load-time-rules): move `invited.permission_prompts` there. Where it was absent (the earlier `"dm"` default), set `"dm"` with `dm.enabled: true` and a `dm.contact`. A channel destination must be listed in `channels` with an explicit delivery (`off` is allowed). Then remove `invited`. |
+
+"Declarative mode" is now strict mode and "fungible mode" is now open mode. `channel-delivery.json` is a preserved reference the current release does not read; the [upgrade procedure](../../docs/migration.md#upgrading-from-018x) keeps it for manual use when transferring channel choices.
 
 ### Across personas
 
 Checked only after every entry is valid, in both channel modes, with the
-same messages. The two shared-path rules below are
-checked only for `config.json` at a start without a record. At a start from
-the last-applied record, a shared path is a bring-up failure of each persona
-involved instead ([`persona-directory-unusable`](#persona-directory-unusable)
-or [`persona-credentials-invalid`](#persona-credentials-invalid)), and the
-other personas come up.
+same messages. The two shared-path rules below reject collisions in
+`config.json` at a start without a record and in edited reload candidates.
+At a start from the last-applied record, a shared path is instead a bring-up
+failure of each persona involved
+([`persona-directory-unusable`](#persona-directory-unusable) or
+[`persona-credentials-invalid`](#persona-credentials-invalid)); other personas
+come up. Only reload input byte-for-byte identical to the recorded source
+retains this collision-recovery exception, for example during a
+credentials-only review. Edited input must pass both shared-path checks.
 
 | Message (after the later persona's prefix) | Cause | Fix |
 |---|---|---|
 | `name "<name>" is duplicated: personas[<j>] "<name>" (key=<key>) has the same name. Persona names and keys must be unique.` | Two personas share a name. | Rename one. |
 | `key <key> is duplicated: … has the same key. …` | Two different names map to the same key. | Rename one so the keys differ. |
 | `name "<name>" equals the key of personas[<j>] …. …` / `key <key> equals the name of personas[<j>] …. …` | One persona's name is another's key. | Rename one. |
-| `key dev_2 starts with the key of personas[0] "dev" (key=dev). tmux matches a session target by prefix unless it is written with =, so a human's tmux command without = for one persona (for example tmux attach -t slack_bot_dev) could reach slack_bot_dev_2. No persona's key may start with another persona's key: rename one of the two so that neither key starts with the other. For example, rename personas[0] "dev" (key=dev) to "dev_main" (key=dev_main).` (for `dev`, then `dev_2`) / `key <key> is the start of the key of personas[<j>] …. …` (the longer key first) | One persona's key starts with another's: `dev` and `dev_2`, `team` and `team_admin`, or `dev` and `"Dev Bot"` (key `dev_bot_…`). tmux matches a session target by prefix unless it is written with `=`, so a human's tmux command without `=` for one persona (for example `tmux attach -t slack_bot_dev`) could reach another persona's session. Checked in the last-applied record too. | Rename one so that neither key starts with the other. The `For example` sentence, when there is one, is a name for the persona with the shorter key that fits every other persona: its key plus `_main` (`_main_2`, … when that is taken). Keys that only share a start, such as `dev_a` and `dev_b`, are fine. For a record, fix `config.json` first, then delete the record. |
+| `key dev_2 starts with the key of personas[0] "dev" (key=dev). tmux matches a session target by prefix unless it is written with =, so a human's tmux command without = for one persona (for example tmux attach -t slack_bot_dev) could reach slack_bot_dev_2. No persona's key may start with another persona's key: rename one of the two so that neither key starts with the other. For example, rename personas[0] "dev" (key=dev) to "dev_main" (key=dev_main).` (for `dev`, then `dev_2`) / `key <key> is the start of the key of personas[<j>] …. …` (the longer key first) | One persona's key starts with another's: `dev` and `dev_2`, `team` and `team_admin`, or `dev` and `"Dev Bot"` (key `dev_bot_…`). tmux matches a session target by prefix unless it is written with `=`, so a human's tmux command without `=` for one persona (for example `tmux attach -t slack_bot_dev`) could reach another persona's session. Checked in the last-applied record too. | Rename one so that neither key starts with the other. The `For example` sentence, when there is one, is a name for the persona with the shorter key that fits every other persona: its key plus `_main` (`_main_2`, … when that is taken). Keys that only share a start, such as `dev_a` and `dev_b`, are fine. If the authority is invalid, preserve it and prepared input and restore trustworthy authority evidence; never delete it to promote the edit. |
 | `working_directory "<path>" is also the working_directory of personas[<j>] …. Each persona needs its own working_directory.` | Two personas share a working directory. Compared by real path, so a symlink to another persona's directory counts; the message then shows both paths and `both resolve to "<real path>"`. | Give each persona its own directory. |
 | `credentials_file "<path>" is also the credentials_file of personas[<j>] …. Each persona needs its own credentials_file.` | Two personas share a credentials file, compared by real path the same way. | One credentials file per persona (one Slack app per persona). |
 
@@ -5825,26 +6912,22 @@ other personas come up.
 
 ## The last-applied record
 
-The server keeps a byte copy of the configuration it last applied,
-`config.json.last-applied`, beside `config.json` in the state directory. Every
+The server keeps the shared authority envelope, `config.json.last-applied`, beside `config.json` in the state directory. Its `applied` configuration determines what runs; its reviewed source and exact `sourceBytesBase64` remain distinct from later shared choices. Every
 start runs the record when it exists and doesn't read `config.json` to decide
 what runs, so saving `config.json`, restarting or rebooting doesn't change the
 running configuration. Credentials files are the exception: every start reads
 them as they stand, so a changed credentials file takes effect at the next
 start.
 
-Without a record (the first start, the first start after an upgrade, or after
-the record was deleted), `config.json` is checked, copied to the record, then
-applied. The CLI takes its settings and persona set from the record too, or
+Without an authority on a fresh install, `config.json` is checked and becomes the first durable applied revision. The CLI takes its settings and persona set from the record too, or
 from `config.json` when there is none: `stop` (its `stop_timeout`),
-`stop --stop-bots` and `clean_restart`. Never edit the record's contents.
+`stop --stop-bots` and `clean_restart`. Never edit the record's contents once a start has adopted it; the one exception is a baseline written by hand for an upgrade that has not yet started, which you correct together with `config.json`, with the operator's say-so, as [Removed configuration keys](#removed-configuration-keys) says.
 
 Each start logs which configuration it runs:
 
 | Line | Meaning |
 |---|---|
-| `[slack] Starting from the last-applied record "<record path>"` | A record exists; the start runs it. |
-| `[slack] No last-applied record: recorded the configuration file "<config path>" as "<record path>"` | No record; `config.json` was valid and is now the record. |
+| `[slack] Starting from the shared channel authority "<path>" at revision <n>` | The start runs the authority's applied configuration at this revision. On a fresh install with no authority, validated `config.json` is first recorded as the initial source and applied state in the envelope. |
 
 Once a start's bring-up is done, the running server checks `config.json`
 every 5 s, and the credentials files it references too, unless the server
@@ -5886,8 +6969,17 @@ affected.
 `config.json.pending` sits beside `config.json` in the state directory. It
 appears within about 5 s of saving `config.json`, or a credentials file that
 `config.json` references, with content that differs from what is applied. It
-says what applying the change would do. It is deleted when nothing differs
-any more. Nothing in it is applied, and it never reaches Slack.
+says what applying the change would do. Explicit intent can keep it pending
+even with unchanged configuration bytes. It is removed only when neither
+input changes nor requested intent remain. Nothing in it is applied or sent to Slack.
+
+**Requests.** Follow [Editing the configuration](../../docs/reload.md#editing-the-configuration)
+for the exact `config.json.request` grammar. `request` declares assignments;
+`revise` replaces the whole set; `refresh` retains it; `cancel` clears it.
+Use a fresh ID and the current intent generation for each operation. Removing
+the request file does not cancel durable intent. Replayed IDs do not create
+new intent, even after cancellation, consumption or restart. None of these
+operations changes applied values or the original `config.json` bytes.
 
 - **Saving, restarting or rebooting applies nothing.** Every start runs the
   last-applied record, so a `config.json` edit stays pending across restarts
@@ -5900,28 +6992,34 @@ any more. Nothing in it is applied, and it never reaches Slack.
   then every 5 s.
 - **Applying it.** With the operator's say-so, rename `config.json.pending`
   to `config.json.apply`; the next check applies the change it describes,
-  if the files still match it (see
+  if its durable review and current membership still authorize it (see
   [Confirming a pending change](#confirming-a-pending-change)). The operator
   may direct an agent to do the rename. There is no reload command: no CLI
   subcommand, MCP tool or HTTP endpoint applies a change.
 
-Read it, and compare the edit with the applied configuration:
+Read it, and compare the edit with the exact reviewed source:
 
 ```sh
 STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}"
 cat "$STATE/config.json.pending"
-diff "$STATE/config.json.last-applied" "$STATE/config.json"
+diff <(jq -r .sourceBytesBase64 "$STATE/config.json.last-applied" | base64 -d) "$STATE/config.json"
 ```
 
-The file holds no token and no credentials content. It shows no setting value
-except the new path of a destructive path change (`working_directory changed
-to "<path>"`), plus persona names and credentials-file paths. The diff can
+The file holds no token or credentials content. It shows persona names,
+paths, intent generation and channel choices, saved order, current membership
+and effective delivery. `declared` and edited assignments differ from copied
+fields; an explicit same-value assignment has a new application order.
+Omitted current choices and automatic additions outside intent are retained;
+use an explicit `off` assignment to stop intake. A replacement resets copied
+preferences; deliberate retention assigns to the reviewed replacement and
+inherits no old membership. The diff can
 show anything in `config.json` (see [Constraints](#constraints)).
 
 The first two lines are written by the server:
 `claude-slack-channel-bots: pending configuration change (written by the server)`
 and `fingerprint: sha256:<64 hex digits>`. The fingerprint identifies the
-exact files the preview was made from; nobody needs to read or type it. After
+one durable review of the input, intent and current applied/membership facts;
+nobody computes or types it. A superseded or spent review cannot assign again. After
 a blank line comes the preview, one line per effect. Personas are named as
 `persona "<name>" (key=<key>)`.
 
@@ -5935,22 +7033,20 @@ A configuration change is pending; nothing has been applied. personas: <n> added
 a next-launch setting changed on the persona's own entry. A persona that only
 inherits a changed top-level default isn't counted there; the setting counts
 under `server-wide settings`. A persona with both an in-place change and
-changed credentials counts in both. A persona whose only change is recorded
-(a change to the section its mode doesn't read) counts nowhere.
-`allow_invited_channels` counts under `server-wide settings`.
+changed credentials counts in both.
+`channel_mode` counts under `server-wide settings`.
 
 **Line order and kinds.** After the header: removals, destructive modifies,
-additions, other changed personas (in `config.json` order), recorded
-changes (in `config.json` order), then server-wide settings, the switch's
+additions, other changed personas (in `config.json` order), then server-wide settings, the switch's
 line among them.
 
 | Line | Meaning |
 |---|---|
-| `DESTRUCTIVE: persona "<name>" (key=<key>) is removed: the persona will be retired: its session stopped and never resumed.` | The persona is gone from `config.json`. At the confirmation it is retired: its session is stopped and never resumed. Renaming a persona changes its key, so a rename shows as this line for the old name plus an `is added` line for the new one. |
+| `DESTRUCTIVE: persona "<name>" (key=<key>) is removed: the persona will be retired: its session stopped and never resumed; <n> open queued items kept, delivered only if a persona with the same key is added again.` | The persona is gone from `config.json`. At the confirmation it is retired: its session is stopped and never resumed. Accepted work stays under its original key; the count uses `item` when it is one. Renaming a persona changes its key, so a rename shows as this line for the old name plus an `is added` line for the new one. |
 | `DESTRUCTIVE: persona "<name>" (key=<key>) working_directory changed to "<path>": the persona will be retired and brought up fresh: its session stopped and never resumed.` | Its `credentials_file` or `working_directory` (compared by real path) changed, or its `name` changed without changing its key (`name changed`). Several are joined by ` and `, e.g. `credentials_file changed to "<path>" and working_directory changed to "<path>"`. At the confirmation the persona is retired (its session stopped and never resumed) and brought up fresh: the instance is replaced and loses its session history. |
 | `persona "<name>" (key=<key>) is added: it will be brought up and launched.` | A new persona. |
 | `persona "<name>" (key=<key>) is added but cannot come up: <cause>; <cause>.` | A new persona whose bring-up would fail now. The causes, in this order, are the credentials and working-directory cause texts under [Persona diagnostic classes](#persona-diagnostic-classes) (for example `credentials file does not exist`, `credentials file is invalid: …`, `working directory does not exist`), then `claude_config_dir cannot be resolved to a real path (<errno>)`, or `(<errno>: a symlink on its path points to nothing)` for a dangling symlink (see [`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable)). Every check runs, so one cause never hides another. A `claude_config_dir` not created yet under an existing parent is not listed. Fix them before the change is applied. |
-| `persona "<name>" (key=<key>): <settings> changed: applied in place immediately, instance kept.` | `<settings>` lists one or more of the in-place settings of the mode the edit's own `allow_invited_channels` picks. Declarative mode: `channels` (a channel added or removed), `delivery` (a kept channel's mode), `permission_prompts`. Fungible mode: `invited.permission_prompts` (an absent value and `"dm"` count as the same). Both modes: `dm.enabled`, `dm.contact`, `stop_hook_bootstrap`. Reordering channels isn't a change. When the same edit turns the switch on or off, the newly selected section counts as changed wherever its JSON differs from before. |
+| `persona "<name>" (key=<key>): <settings> changed: applied in place immediately, instance kept.` | `<settings>` lists one or more of the in-place settings of the mode the edit's own `channel_mode` picks. In both modes: `channels` (a channel added or removed), `delivery`, `permission_prompts`, `dm.enabled` `dm.contact` and `stop_hook_bootstrap`, `reaction_notices`. Reordering channels isn't a change. A mode-only switch preserves the shared choices and destination. |
 | `…: stop_hook_bootstrap changed: applied in place immediately, instance kept.` | The persona's own reminder setting changed. Subsequent checks use the confirmed value, keeping its running session. |
 | `…: claude_config_dir changed: takes effect at its next launch, which starts fresh (the conversation is not resumed), instance kept until then.` | The persona's own `claude_config_dir` changed (by real path). The running instance is kept; its next launch uses the new directory and starts a new conversation. A reminder-setting change alongside it has its own immediate in-place effect. |
 | `…: claude_config_dir changed: …, instance kept until then; but at that launch it cannot come up: claude_config_dir cannot be resolved to a real path (<errno>).` | A warning: the new directory can't be resolved now, with the same check and wording as an added persona's (`(<errno>: a symlink on its path points to nothing)` for a dangling symlink). It is not a refusal: confirming applies the change, and at the persona's next launch it is held as [`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable) (its Slack connection closed, its launch waiting) until the directory resolves. The same warning ends a changed top-level `claude_config_dir` line, naming the inheriting personas it stops (`; but at that launch "<name>" (key=<key>), … cannot come up: …`), and a `DESTRUCTIVE:` line whose persona's `claude_config_dir` changed too (`; but it cannot come up: …`; that persona is held when it is brought up at the confirmation). Fix the directory, or the setting, before confirming. If the check itself failed, the line ends `; whether it can come up at that launch could not be checked` (see the `cannot check` line below). |
@@ -5963,14 +7059,13 @@ line among them.
 | `…: credentials file "<path>" changed, but it cannot be used (<cause>): it stays broken by its credentials.` | The same bad content, for a persona broken by its credentials. It stays broken until the file is fixed. |
 | `persona "<name>" (key=<key>) is added; whether it can come up could not be checked.` | A new persona whose credentials and working directory the check couldn't examine (see the `cannot check` line below). It isn't counted differently in the header. |
 | `…: credentials file "<path>" changed; whether it is broken by its credentials now could not be checked.` | A credentials change whose persona's bring-up state couldn't be read (see the `cannot check` line below). With bad content it starts `credentials file "<path>" changed, but it cannot be used (<cause>);`. |
-| `persona "<name>" (key=<key>): <fields> changed in the <declarative or fungible> section: recorded, with no effect until allow_invited_channels selects <declarative or fungible> mode.` | A change to the section the edit's mode doesn't read: `channels` or `permission_prompts` (the declarative section) while the edit is in fungible mode, or `invited` (the fungible section) while it is in declarative mode. `<fields>` lists the changed keys, such as `channels, permission_prompts`. The change is written into the record at the confirmation and does nothing until the switch selects that section; it is never validated until then. The persona isn't counted as modified. |
-| `server-wide setting allow_invited_channels changed: turns <fungible or declarative> mode on, applied in place at once, from the next event, tool call, prompt and notice, for "<name>" (key=<key>), ….` | The channel-mode switch changed. Every persona present before and after the edit is named, in `config.json` order; with none, the line ends `; no persona is affected.` instead. It applies in place at the confirmation, with no restart and every session kept (see [Confirming a pending change](#confirming-a-pending-change)). Writing `false` where the switch was absent is no change. Before turning fungible mode on, review each app's channels and past `unclaimed-channel` lines (see [Turning fungible mode on or off](../../docs/channel-modes.md#turning-fungible-mode-on-or-off)). |
+| `server-wide setting channel_mode changed: turns <open or strict> mode on, applied in place at once, from the next event, tool call, prompt and notice, for "<name>" (key=<key>), ….` | The channel-mode switch changed. Every persona present before and after the edit is named, in `config.json` order; with none, the line ends `; no persona is affected.` instead. It applies in place at the confirmation, with no restart and every session kept (see [Confirming a pending change](#confirming-a-pending-change)). Writing `"strict"` where the selector was absent is no effective change. Before turning open mode on, review each app's channels and past `unclaimed-channel` lines (see [Turning open mode on or off](../../docs/channel-modes.md#turning-open-mode-on-or-off)). |
 | `server-wide setting <name> changed: once applied, it is recorded and takes effect at the next server start after that.` | A top-level setting such as `port` or `bind`. |
 | `server-wide setting <name> changed: once applied, it is recorded, and the CLI takes it from the record from then on (the running server does not use it).` | `stop_timeout` or `exit_timeout`, which only the CLI uses. |
 | `server-wide setting <name> changed: once applied, it is recorded, the CLI takes it from the record from then on, and the running server uses it from its next start.` | `agent_director_call_timeout_ms`, which both the CLI and the server use. |
-| `server-wide setting stop_hook_bootstrap changed: inherited by "<name>" (key=<key>), …; applied in place immediately, instance kept.` | The listed personas inherit the changed reminder default; subsequent checks use it. |
+| `server-wide setting stop_hook_bootstrap changed: inherited by "<name>" (key=<key>), …; once applied, reply reminders use it immediately.` | The listed personas inherit the changed reminder default; subsequent checks use it. |
 | `server-wide setting claude_config_dir changed: inherited by "<name>" (key=<key>), …; takes effect at each one's next launch, which starts fresh (the conversation is not resumed), instance kept until then.` | The top-level `claude_config_dir` changed; each listed persona's next launch starts a new conversation. |
-| `server-wide setting <name> changed: once applied, it is recorded; no persona inherits it, so no instance is affected.` | The top-level `claude_config_dir` or `stop_hook_bootstrap` changed, but every persona sets its own value. |
+| `server-wide setting claude_config_dir changed: once applied, it is recorded; no persona inherits it, so no instance is affected.` | Every persona sets its own directory. A `stop_hook_bootstrap` default with no inheritor instead ends `no persona inherits the change, so no reply reminder is affected.` |
 
 One persona's effects share one line, joined by `; `, for example
 `persona "bravo" (key=bravo): channels changed: applied in place immediately, instance kept; credentials file "<path>" changed: a new connection opens, then the old one closes, instance kept.`
@@ -5986,9 +7081,10 @@ INVALID: <error> Nothing will be applied.
 ```
 
 The error is a message from [Configuration rejections](#configuration-rejections),
-or `the configuration file "<path>" does not exist.`,
-`the configuration file "<path>" cannot be read (<errno>).` or
-`the configuration file "<path>" is larger than the 64 KiB limit.`
+or `the configuration file "<path>" does not exist.` or
+`the configuration file "<path>" cannot be read (<errno>).`
+Configuration, authority and preview reads have no size cap; credentials
+and agent-director settings keep their independent 64 KiB limits.
 
 **No effective change.** The bytes differ but nothing would change, for
 example a whitespace or key-order edit, or a setting written out with its
@@ -5998,9 +7094,7 @@ default value:
 A configuration change is pending; nothing has been applied. no effective change: applying it would change no persona and no server-wide setting.
 ```
 
-An edit made only of recorded changes (see the `recorded, with no effect
-until …` row above) is also no effective change: its preview is this line
-followed by its recorded lines. Confirming it rewrites the record and logs
+A source-only edit preserves assignment values and order. Confirming it advances the application revision, records the exact reviewed source bytes and logs
 [`reload-noop`](#reload-noop).
 
 **Logged once.** The same preview goes to `server.log` under
@@ -6008,7 +7102,9 @@ followed by its recorded lines. Confirming it rewrites the record and logs
 change differs from the one last logged, not at every check. The file can be
 rewritten without a new log line: if an added persona's directory, or a
 changed `claude_config_dir`, is created later, its line in the file changes,
-but the log keeps the old one. The file is the current preview.
+but the log keeps the old one. The file is the current preview. Confirmation
+can refresh an invalid review and log its pending error again; see
+[`reload-invalid`](#reload-invalid) for ordinary and restart sequences.
 
 If the check can't gather a fact the preview needs, it logs one line, and the
 preview says that fact `could not be checked` instead of guessing:
@@ -6019,17 +7115,14 @@ preview says that fact `could not be checked` instead of guessing:
 only after a check that gathered every fact. It is an internal error: report
 it as a bug.
 
-**Withdrawing a change.** Revert the edit so the file matches what is applied
-byte for byte (whitespace counts); for a credentials file, put back the
-content it had. With the operator's say-so, the applied `config.json` can be
-restored from the record, which discards every unapplied edit:
-
-```sh
-cp "$STATE/config.json.last-applied" "$STATE/config.json"
-```
-
-Within about 5 s the server deletes `config.json.pending` and logs
-[`reload-nothing-pending`](#reload-nothing-pending) once.
+**Withdrawing a change.** Revert only the intended edits; preserve unrelated
+pending input. Use `cancel` to clear declared assignments, or `revise` to keep
+a smaller complete set. Reverting configuration alone does not cancel intent.
+The authority is an envelope, not a configuration file: never copy it over
+`config.json`. When input matches the reviewed source and no requested intent
+remains, the next check removes the preview and logs
+[`reload-nothing-pending`](#reload-nothing-pending). Detected reversion still
+invalidates the earlier confirmation.
 
 ### Confirming a pending change
 
@@ -6040,13 +7133,16 @@ rename, or direct an agent (such as a Claude session running this skill) to
 do it. No CLI subcommand, MCP tool or HTTP endpoint applies a change, by
 design; saving, restarting and rebooting apply nothing.
 
-1. Read the preview and diff `config.json` against the record (see
+1. Read the preview and diff `config.json` against the record's exact reviewed source (see
    [Pending changes](#pending-changes)). The confirmation applies every edit
-   in `config.json`, not just the one you meant, and the preview lists them
-   all. If it reads `INVALID`, fix `config.json` first.
-2. Finish editing, and don't save `config.json` or a credentials file it
-   references again until the change is applied: any save after the preview
-   was written makes the confirmation stale.
+   in `config.json` plus the matching declared intent; inspect both lifecycle
+   and channel-review lines. Copied fields and mode-only edits are not channel
+   assignments. If it reads `INVALID`, fix the input or stale declaration first.
+2. Finish editing and requesting. Refresh when applied choices, identity,
+   destination, intent or current membership/leave evidence changes. Detected
+   configuration or credential changes also supersede the review, even when
+   reverted. After a stop, use the fresh preview after recovery and current
+   startup membership validation.
 3. With the operator's say-so, rename the preview:
 
    ```sh
@@ -6054,22 +7150,20 @@ design; saving, restarting and rebooting apply nothing.
    mv "$STATE/config.json.pending" "$STATE/config.json.apply"
    ```
 
-4. Within about 5 s the next check reads the confirmation and deletes it, so
-   it is used once. If its fingerprint still describes `config.json` and the
-   credentials files, the change is applied: the record is rewritten with
-   `config.json`'s bytes first. Then removed and destructively modified
-   personas are torn down, changed routing settings are updated in place and
-   personas whose credentials file changed are reconnected. The agent-director
-   template's memory-read rules are rewritten when the set of config
-   directories changed. Last, added and destructively modified personas, and
-   personas broken by their credentials whose credentials file changed, are
-   brought up.
-   Otherwise nothing is applied and
-   [`reload-stale-confirmation`](#reload-stale-confirmation) is logged.
+4. The next check revalidates the review, records its attempted outcome and
+   applies the reviewed mode, list, identity and matching intent consumption
+   durably together. Publication precedes teardown, in-place updates,
+   reconnects, template work and bring-ups. Cleanup follows successful
+   activation; deleting a file is not proof of consumption. Definite failure
+   preserves pending intent and needs fresh review. An uncertain write keeps
+   exact transaction evidence for recovery, never a second assignment.
+   Obsolete or spent reviews apply nothing; see
+   [`reload-stale-confirmation`](#reload-stale-confirmation) and
+   [`reload-review-outcome`](#reload-review-outcome).
 5. Watch `server.log` for the outcome:
 
    ```sh
-   grep -h -E 'reload-(applied|noop|invalid|stale-confirmation|record-write-failed)|reload: ' "$STATE"/server.log | tail
+   grep -h -E 'reload-(applied|noop|invalid|stale-confirmation|record-write-failed|request-[a-z-]+|review-[a-z-]+)|reload: ' "$STATE"/server.log | tail
    ```
 
    [`reload-applied`](#reload-applied) (or [`reload-noop`](#reload-noop))
@@ -6093,9 +7187,7 @@ What changes at once, with no restart:
   `agent-director kill of cscb_<key> failed` row there).
   See [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change).
 - **A kept persona's routing settings**, the preview's `… changed: applied in
-  place immediately, instance kept` lines: in declarative mode `channels`, a
-  channel's `delivery` and `permission_prompts`; in fungible mode
-  `invited.permission_prompts`; `dm.*` in both. See
+  place immediately, instance kept` lines: in both modes `channels`, each channel’s `delivery`, `permission_prompts` and `dm.*`. See
   [A persona's routing settings were changed by a confirmed change](#a-personas-routing-settings-were-changed-by-a-confirmed-change).
 - **A kept persona's credentials file content** (same path), the preview's
   `credentials file "<path>" changed …` lines. A persona that is up is
@@ -6111,41 +7203,34 @@ What changes at once, with no restart:
   line and its usual class line (`persona-credentials-invalid`,
   `-missing`, `-unreadable` or `-refused`), stays broken, and nothing is
   pending until the file changes again.
-- **The channel-mode switch `allow_invited_channels`**, the preview's
-  `server-wide setting allow_invited_channels changed: turns … mode on …`
-  line. It is the one server-wide setting applied in place, at once: no
-  persona is torn down, brought up, relaunched or reconnected, and every
-  persona keeps its instance, conversation, Slack connection and MCP session.
-  The mode it turns on applies from the next event, tool call, permission
-  prompt and notice. Turning fungible mode on serves, from its next message,
-  every public or private channel each persona's app is already in that is
-  not externally shared, at `mentions` unless a stored choice applies;
-  listed `delivery` values are not carried over. Turning it off returns
-  every persona to its `channels` from the next event; stored choices stay
-  in `channel-delivery.json` and stop applying. Prompts and notices go to
-  the destination of the mode turned on, held ones included, and prompts
-  already posted stay answerable. See
-  [Channel modes](../../docs/channel-modes.md#channel-modes).
-- **A recorded change** to the section the mode doesn't read, the preview's
-  `recorded, with no effect until …` lines: written into the record, with no
-  effect until the switch selects that section.
+- **The channel-mode switch `channel_mode`**, the preview's
+  `server-wide setting channel_mode changed: turns … mode on …` line.
+  It selects `strict` or `open` in place, from the next event, tool call,
+  permission prompt and notice. A mode-only change preserves shared channel
+  choices, their order and the destination in the sole authority; it assigns
+  no channel and keeps every instance, conversation, Slack connection and
+  MCP session. Current membership still gates delivery; an unassigned
+  discovered entry uses `off` in strict or `mentions` in open. Already posted
+  prompts stay answerable. See [Channel modes](../../docs/channel-modes.md#channel-modes).
+- **`stop_hook_bootstrap`, own or inherited.** Subsequent AD-state reminder
+  checks use the confirmed value immediately, including opt-out. The running
+  session is kept; no relaunch is needed.
 
 Next-launch and other server-wide settings are recorded and take effect later (see
 [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)).
-Never delete the record to apply an edit: the confirmation has already
-written the change into it. Deleting the record is only for a server that
-can't start (see [Starting without the record](#starting-without-the-record)).
+Never delete the authority to apply an edit or recover a failed start.
+Preserve it with prepared input and pending evidence, and restore trustworthy
+authority when recovery is needed (see [Starting without the record](#starting-without-the-record)).
 
 ### Next-launch and server-wide settings
 
-A confirmation records these changes in `config.json.last-applied`, and they
-take effect later. Until then, each persona keeps running as it was launched,
-with the same instance, conversation and Slack connection. The one exception
-among server-wide settings is `allow_invited_channels`, which applies in
-place at once, with every session kept, from the next event, tool call,
-prompt and notice (see
-[Confirming a pending change](#confirming-a-pending-change)); it never waits
-for a server start.
+A confirmation records the changes below in `config.json.last-applied`.
+The running instance, conversation and Slack connection are kept until the
+listed action. `channel_mode` and `stop_hook_bootstrap` (own or inherited)
+already apply in place at confirmation: the mode governs the next event,
+tool call, prompt and notice, and the reminder setting governs subsequent
+AD-state reminder checks with the same session. Neither waits for a server
+start (see [Confirming a pending change](#confirming-a-pending-change)).
 
 | Preview line | After the confirmation | To carry it out sooner |
 |---|---|---|
@@ -6191,13 +7276,15 @@ Look in `server.log` for the lines logged after the rename (the `grep` in
 
 | Line | Meaning |
 |---|---|
-| [`reload-applied`](#reload-applied) | The change was applied. Personas added, removed, destructively modified, changed in place or with a changed credentials file are handled (a credentials file that can't be used logs [`persona-credentials-change-failed`](#persona-credentials-change-failed) and stays pending); `allow_invited_channels` applies at once, in place; next-launch and other server-wide settings are recorded (see [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)). A persona that isn't up has its own class line. |
-| [`reload-noop`](#reload-noop) | The change had no effect (whitespace, key order, a default written out); the record now matches `config.json`. Nothing else happens. |
-| [`reload-invalid`](#reload-invalid), `the confirmed configuration is invalid, so nothing is applied` | `config.json` was invalid. Nothing is applied and the confirmation is used up. Fix the file, then confirm the new preview. |
-| [`reload-stale-confirmation`](#reload-stale-confirmation) | The confirmation didn't match the files as they stand, or couldn't be read. Nothing is applied. |
-| [`reload-record-write-failed`](#reload-record-write-failed), `the confirmed change is not applied and stays pending` | The record, the retired-key record written before it, or the stored-choice file (`channel-delivery.json`) written before both, couldn't be written. Nothing is applied; fix the state directory, then confirm again. |
-| `[slack] reload: cannot remove the confirmation "<apply path>" (<errno>); it was acted on once and is ignored until its content changes` | The confirmation was acted on once (one of the lines above), but the server couldn't delete it. It is ignored while its content stays the same. Fix the directory's permissions (or the read-only filesystem), then remove `config.json.apply` by hand. |
-| `[slack] reload: apply step <n> (<step>) failed …` or `[slack] reload: updating the server's applied configuration failed: <error>` | An internal error during the apply. Report it as a bug, with the lines around it. |
+| [`reload-applied`](#reload-applied) | The change was applied. Personas added, removed, destructively modified, changed in place or with a changed credentials file are handled (a credentials file that can't be used logs [`persona-credentials-change-failed`](#persona-credentials-change-failed) and stays pending); `channel_mode` and own/inherited `stop_hook_bootstrap` apply at once, in place; next-launch and other server-wide settings are recorded (see [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)). A persona that isn't up has its own class line. |
+| [`reload-noop`](#reload-noop) | A source-only edit changed no persona or server-wide setting. The authority records the exact reviewed source and new revision; channel choices and their order stay intact. |
+| [`reload-invalid`](#reload-invalid), `the confirmed configuration is invalid, so nothing is applied` | A current review confirmed invalid input. Nothing is applied; the confirmation is used up and a refreshed pending-invalid line follows. Fix the file, then confirm the new preview. |
+| [`reload-stale-confirmation`](#reload-stale-confirmation) | The confirmation is unreadable, malformed or does not match the current review, without a recorded outcome for its fingerprint. Nothing is applied; still-kept superseded reviews use `reload-review-outcome` below. |
+| [`reload-record-write-failed`](#reload-record-write-failed) | A definite failure needs fresh review; unresolved durability needs exact recovery. Preserve prepared input and authority/retirement evidence. |
+| [`reload-review-outcome`](#reload-review-outcome), [`reload-review-recovery`](#reload-review-recovery) | A spent review cannot assign again; interrupted noncommitted work keeps intent for fresh review after recovery. An old invalid confirmation found after restart logs `superseded`, followed by fresh pending-invalid, without the confirmed-invalid variant. |
+| [`reload-request-invalid`](#reload-request-invalid), [`reload-request-recorded`](#reload-request-recorded), [`reload-request-storage`](#reload-request-storage) | Request validation, intent recording or storage outcome; no application. |
+| `[slack] reload: cannot remove the confirmation "<apply path>" (<errno>); it was acted on once and is ignored until its content changes` | The confirmation was acted on once (one of the lines above), but the server couldn't delete it. Durable outcomes also prevent reuse after restart or content reversion. Fix the directory's permissions (or the read-only filesystem), then remove `config.json.apply` by hand. |
+| `[slack] reload: apply step <n> (<step>) failed …`, `[slack] reload: updating the server's applied configuration failed: <error>` or `[slack] reload: the server's post-apply work failed: <error>` | An internal error during the apply, or just after its steps. Report it as a bug, with the lines around it. |
 
 No line at all:
 
@@ -6216,179 +7303,174 @@ No line at all:
 
 ### Starting without the record
 
-Only for a server that can't start: the record can't be read or is invalid
-(see [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid)),
-or a first start failed after writing the record (see
-[A first start that fails after recording](#a-first-start-that-fails-after-recording)).
-A start without a record checks `config.json` as it stands, records it and
-applies it, with no preview and no confirmation.
-
-Read `config.json` first: the start applies every edit in it that was never
-applied. Compared with a confirmation:
-
-- A persona that was removed or renamed (a mistyped name counts: the name
-  sets the key) has its running instance killed by the start sweep, with the
-  result checked. Its agent-director row is kept until agent-director's
-  `expire` removes it, and is never resumed. A renamed persona comes up
-  fresh under its new key, without its session history. Before any of those
-  kills, the start records as retired the old key of each such persona whose
-  instance it lists, so adding that persona back later starts it fresh (see
-  [Added again or renamed back](#added-again-or-renamed-back)).
-- A persona whose `working_directory` changed has its running instance killed
-  by the start sweep too, with the result checked and its row kept, and comes
-  up fresh in the new directory.
-- A changed `credentials_file` only reconnects the persona to Slack with the
-  new app; its instance keeps running.
-- A setting that takes effect at a bot's launch (a changed `claude_config_dir`, `model` or `effort`) doesn't reach a bot that kept running. If the
-  server is still running, stop it with `stop --stop-bots` instead of `stop`.
-
-With the operator's say-so, stop the server if it is still running:
-
-```sh
-claude-slack-channel-bots stop --stop-bots
-```
-
-Go on only once the server is stopped. If the command exits 1 with
-`stop --stop-bots: nothing was stopped`, nothing was stopped: the server and
-every bot still run. Don't delete the record; follow
-[A precheck failed: nothing was stopped](#a-precheck-failed-nothing-was-stopped)
-first, then run it again. If it exits 1 with `could not stop persona`
-lines, the server was stopped and stays stopped (`stop --stop-bots` never
-starts it), and those personas may still run; see
-[`stop --stop-bots` or `clean_restart` could not stop a persona](#stop---stop-bots-or-clean_restart-could-not-stop-a-persona)
-before going on. Otherwise confirm the server is down: `stop` prints
-`server is not running`.
-
-```sh
-claude-slack-channel-bots stop
-```
-
-Then keep a copy of the record if it can be read, delete it and start. Keep
-the `.bak` copy until the new configuration runs as intended:
-
-```sh
-STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}"
-cp "$STATE/config.json.last-applied" "$STATE/config.json.last-applied.bak"
-diff "$STATE/config.json.last-applied.bak" "$STATE/config.json"
-rm "$STATE/config.json.last-applied" &&
-  claude-slack-channel-bots start
-```
-
-The configuration holds no tokens; if a value in the diff starts with
-`xoxb-` or `xapp-`, follow [Constraints](#constraints). If `config.json` is
-invalid, the start is refused (see
-[Configuration rejections](#configuration-rejections)), nothing runs and no
-record is written. Fix `config.json` and start again, or restore the copy as
-`config.json.last-applied` to run the previous configuration.
+A fresh install with no authority validates `config.json` and durably records the first applied revision. This is not a recovery path for an existing authority: preserve an unreadable, invalid or unresolved adopted authority together with prepared input and pending evidence, and use [reviewed restore or explicit replacement](#reload-shared-recovery). A baseline written by hand for an upgrade that has not yet started is corrected instead, as [Removed configuration keys](#removed-configuration-keys) says. See [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid).
 
 ### A first start that fails after recording
 
 A start without a record writes `config.json.last-applied` before the server
 binds its port. If that start then fails, the record stays, and every later
-start runs it. The usual case is the first start, or the first after the
-record was deleted, failing on the listening address:
+start runs it. The usual case is the first start failing on the listening address:
 
 - **Line:** `start` prints its `Server failed to start` block after the
-  `No last-applied record: recorded the configuration file …` line, and the
+  `Starting from the shared channel authority "<path>" at revision <n>` line, and the
   failure is a `[slack] Fatal:` line with the error from binding
   `bind`:`port` (for example, the port is already in use).
 - **Trap:** Fixing `bind` or `port` in `config.json` and starting again
   changes nothing: the next start runs the record, which holds the failing
   values, and fails the same way.
 - **Fix:** If the cause is outside the file (another process holds the port),
-  free it and start again. If the fix is an edit of `config.json`, apply it
-  with [Starting without the record](#starting-without-the-record): delete
-  the record and start, so the start checks, records and applies the fixed
-  file.
+  free it and start again. Preserve any edited `config.json` for ordinary review after startup. A valid authority with an unusable listening setting is not damaged-state replacement input; the recovery procedure below cannot force that edit into effect.
 
 ### `reload-record-write-failed`
 
-The server couldn't write `config.json.last-applied` durably, or, at a
-confirmed apply, a file it writes before that record (the stored-choice file
-or the retired-key record). It happens in two places: at a start without a
-record, and when a running server applies a confirmed change. The `(<errno>)` part appears only when the error has a
-code.
 
-**At a start without a record.**
+```text
+:warning: *Configuration change not applied* — "Alpha" (key=alpha); could not write the shared channel authority at "&lt;state dir&gt;/config.json.last-applied" (EACCES). Nothing in the confirmed change was applied. This persona and every other persona keep running as before, and the change stays pending. Fix the cause, for example disk space or permissions, then review the pending change again and confirm it afresh; a failed confirmation is not reused.
+```
 
-- **Line:** one of:
-  - `[slack] reload-record-write-failed: cannot write the last-applied record "<record path>" (<errno>); the server does not start and nothing is applied`:
-    the record wasn't written, and there is still no record.
-  - `[slack] reload-record-write-failed: the last-applied record "<record path>" was written but its directory could not be synced (<errno>), so it may not survive a crash, and the next start will run it; the server does not start`:
-    the record is in place, but the state directory couldn't be synced, so it
-    may be lost in a crash or power loss.
-- **When:** `config.json` was valid, but the server couldn't write the record
-  beside it durably.
-- **Effect:** The server exits 1. No persona is brought up and nothing is
-  applied. `start` shows the line in its `Server failed to start` block. After
-  the second line, the next start runs the record that was written (a copy of
-  `config.json` at that start), unless a crash lost it.
-- **Fix:** Fix the cause below, then start the server again.
+The retired-key record variant:
 
-**At a confirmed apply.** A running server acting on a confirmation
-(`config.json.apply`) writes, in this order, before it changes anything
-else:
+```text
+:warning: *Configuration change not applied* — "Alpha" (key=alpha); could not write the retired-key record (EACCES). Nothing in the confirmed change was applied. This persona and every other persona keep running as before, and the change stays pending. Fix the cause, for example disk space or permissions, then review the pending change again and confirm it afresh; a failed confirmation is not reused.
+```
 
-1. the stored-choice file, `channel-delivery.json` in the state directory
-   (see [The stored-choice file: `channel-delivery.json`](#the-stored-choice-file-channel-deliveryjson)),
-   only when the change brings up a persona (an added persona, or the new
-   half of a destructive modify) whose key has a drop of its stored choices
-   that no write has carried yet (an earlier
-   `[slack] channel-delivery: cannot write the drop of persona=<key> …`
-   line). The write carries only drops already in force. Otherwise nothing
-   is written here;
-2. the retired-key record, `retired-keys.json` in the state directory, with
-   the keys of the personas the change retires (removed personas, a renamed
-   persona's old key, and personas whose `name`, `credentials_file` or
-   `working_directory` changed);
-3. the record.
+Each applied persona the confirmed change names receives this once per confirmed change, or every applied persona receives it when the change names none; it has no closing notice, including after a later successful apply.
+Fix the cause, then review and confirm the pending change afresh; repeating the same failed confirmation posts nothing more.
 
-- **Line:** one of:
-  - `[slack] reload-record-write-failed: cannot write the stored-choice file "<path>" before bringing up a persona whose stored choices were dropped; the retired-key record is not written, the last-applied record "<record path>" is not rewritten, and the confirmed change is not applied and stays pending`:
-    the stored-choice file couldn't be written (a write whose directory
-    couldn't be synced counts as failed), so neither record was touched.
-    The store's own `[slack] channel-delivery: cannot write the drop of persona=<key> in "<path>"<detail>; …`
-    line before it carries the error code (see
-    [The store's `[slack] channel-delivery:` lines](#the-stores-slack-channel-delivery-lines)).
-    The dropped choices still don't apply, and the persona isn't brought up
-    until a confirmation succeeds; a restart before then drops them again at
-    start.
-  - `[slack] reload-record-write-failed: cannot write the last-applied record "<record path>" (<errno>); the confirmed change is not applied and stays pending`:
-    the old record is unchanged.
-  - `[slack] reload-record-write-failed: wrote the last-applied record "<record path>" but could not sync its directory (<errno>); the previous record was written back; the confirmed change is not applied and stays pending`:
-    the new record was put back to the old one. Instead of
-    `the previous record was written back`, the middle part can read
-    `the previous record was written back, though its directory could not be synced either`,
-    or
-    `writing the previous record back failed too (<errno>), so the next start may run the unapplied change`:
-    then the record may hold the unapplied change, and the next start would
-    run it.
-  - `[slack] reload-record-write-failed: cannot write the retired-key record "<path>"; the last-applied record "<record path>" is not rewritten, and the confirmed change is not applied and stays pending; the retired-key record holds what this server held as retired before this apply`:
-    the retired-key record couldn't be written, so the last-applied record wasn't touched.
-    A `[slack] retired-keys: cannot record …` line before it carries the
-    error, followed by the store's `[slack] retired-keys: restored …` or
-    `[slack] retired-keys: cannot restore …` line. The end can instead read
-    `putting the retired-key record back to what it held before this apply failed too, so a key this apply recorded that reached the file stays retired`.
+- **Line:** `[slack] reload-record-write-failed: …` names the shared authority path and, when available, a safe filesystem error code. At startup no persona comes up. Confirmation distinguishes `application failed` from `application unresolved`.
+- **Cause:** The authority or retired-key record could not be written durably; check permissions, free space and directory-sync support.
+- **Definite failure:** Prior applied state and pending intent remain. The gesture is not silently retried. Fix the cause, read the fresh preview and confirm again; replaying an attempted/rejected review cannot assign.
+- **Unresolved durability:** Preserve authority, prepared input, confirmation and retirement evidence. The serialized check can finish only the exact validated transaction already written, using its original order and publishing once. Changed or unreadable evidence stays unresolved; do not submit a replacement assignment or assume failure/success. Affected new work is held while independently trustworthy work and accepted queues can continue.
+- **Reviewed repair:** If exact retained-transaction recovery cannot resolve the evidence, use [owned restoration or explicit replacement](#reload-shared-recovery); never infer a lost outcome.
+- **Cleanup failure after commitment:** The consumed outcome remains authoritative even if `config.json.apply` cannot be removed. Fix the filesystem cause; do not repeat the assignment. Never delete the authority or promote unconfirmed input.
 
-  When the retired-key record was written first, the two last-applied record
-  lines end with
-  `; the retired-key record "<path>" is put back to what it held before this apply: the keys this apply recorded are removed again, and keys recorded before it stay`,
-  or, when putting it back failed,
-  `; putting the retired-key record "<path>" back to what it held before this apply failed, so the keys this apply recorded stay retired`.
-- **Effect:** Nothing is applied. The server keeps running what it ran, the
-  change stays pending, and within about 5 s `config.json.pending` is written
-  again. The confirmation was used up: it isn't acted on again.
-- **Fix:** Fix the cause below. Then read the new `config.json.pending`
-  (see [Pending changes](#pending-changes)) and confirm it again (see
-  [Confirming a pending change](#confirming-a-pending-change)). If the line
-  says writing the previous record back failed too, compare the record with
-  `config.json` before any restart: the next start runs the record.
+### `reload-shared-recovery`
 
-**Cause (both).** Usually the state directory: the server's user can't create
-or rename files in it (`EACCES`, `EPERM`), the disk or quota is full
-(`ENOSPC`, `EDQUOT`), or the filesystem is read-only (`EROFS`). A directory
-that can't be synced usually points at the filesystem (an I/O error, `EIO`,
-or a filesystem that doesn't support syncing a directory).
+This uses `config.json.request`, the existing preview and the confirming rename; there is no recovery subcommand. Preserve the authority, retirement evidence, request, confirmation, original `config.json` and accepted queues before repair. Never hand-edit the envelope or treat an older snapshot as trustworthy.
+
+- **Owned restore:** while the process still holds its latest validated state, choose `restore` below. It retains that owner's order, identities, leave boundaries, attempt history and unrelated pending intent; no snapshot field is accepted. Wait for `restoration staged`, then stop and start the server to obtain the recovery preview; staging freezes ordinary mutations while unchanged trustworthy projections and accepted queues may continue.
+- **Damaged start:** if no owner anchor remains, prepare `replacement-config.json` separately using the current configuration schema and deliberately chosen personas/channels. Keep `config.json` unchanged and choose `replace` below. Every replacement choice and lifetime is new: numeric continuity and recovery of lost preferences, leave or attempt history are not claimed, and lost attempt outcomes stay unresolved.
+
+A restored or new choice that ends at `thread_hybrid` starts with its Joined Threads empty: its preview line ends `Joined Threads forgotten, not restored.`, and the persona joins each thread again as it would a new one (see [Threads in `thread_hybrid` channels](../../docs/channel-modes.md#threads-in-thread_hybrid-channels)).
+
+For an initial repair, the following writes only a request, never the authority. Set `RECOVERY_ACTION` to `restore` for the still-running owner; `replace` reads the separately prepared replacement file.
+
+The example hashes the exact current damaged bytes, regardless of apparent recovery fields inside them. Use the separate revision example below only for a known retained cold stage.
+
+```sh
+STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}"
+RECOVERY_ACTION=replace
+python3 - "$STATE" "$RECOVERY_ACTION" <<'PYRECOVERY'
+import base64, hashlib, json, os, pathlib, sys, uuid
+state = pathlib.Path(sys.argv[1])
+action = sys.argv[2]
+assert action in ("restore", "replace")
+evidence = (state / "config.json.last-applied").read_bytes()
+evidence_hash = hashlib.sha256(evidence).hexdigest()
+request = {"format": "cscb-review-request-v1", "request_id": uuid.uuid4().hex,
+           "evidence_sha256": evidence_hash, "action": action}
+if action == "replace":
+    chosen = (state / "replacement-config.json").read_bytes()
+    request["replacement_source_base64"] = base64.b64encode(chosen).decode("ascii")
+path = state / "config.json.request.next"
+with open(path, "w", encoding="utf-8") as output:
+    os.chmod(path, 0o600)
+    json.dump(request, output)
+os.replace(path, state / "config.json.request")
+PYRECOVERY
+```
+
+For damaged start, run `claude-slack-channel-bots start` to stage the request; runtime startup remains refused. Read the complete `config.json.pending`: it shows the boundary, local revision, intent generation, each new or restored choice and the loss/preservation clauses. Rename that exact preview as [Confirming a change](../../docs/reload.md#confirming-a-change) describes, then run `claude-slack-channel-bots start` again; activation consumes the review once through the same durable authority.
+
+To deliberately revise an unactivated cold replacement, first obtain `review pending` from the procedure above and read its preview. Use this example only while that validated retained stage is unchanged; apparent fields in damaged JSON do not establish a stage.
+
+Prepare the revised `replacement-config.json` separately, keeping the original evidence and prepared input. This reads the known stage's original evidence hash and generates a fresh request ID:
+
+```sh
+python3 - "$STATE" <<'PYREVISION'
+import base64, hashlib, json, os, pathlib, sys, uuid
+state = pathlib.Path(sys.argv[1])
+retained = json.loads((state / "config.json.last-applied").read_bytes())["recovery"]
+assert retained["phase"] == "review" and retained["request"]["action"] == "replace"
+original = base64.b64decode(retained["evidenceBase64"], validate=True)
+evidence_hash = hashlib.sha256(original).hexdigest()
+assert evidence_hash == retained["request"]["evidence_sha256"]
+chosen = (state / "replacement-config.json").read_bytes()
+request = {"format": "cscb-review-request-v1", "request_id": uuid.uuid4().hex,
+           "evidence_sha256": evidence_hash, "action": "replace",
+           "replacement_source_base64": base64.b64encode(chosen).decode("ascii")}
+path = state / "config.json.request.next"
+with open(path, "w", encoding="utf-8") as output:
+    os.chmod(path, 0o600)
+    json.dump(request, output)
+os.replace(path, state / "config.json.request")
+PYREVISION
+```
+
+Run `start` again, read the fresh preview and confirm it by rename before the activating start. Invalid revisions do not activate the proposal, and a replacement cannot revise an owned restoration stage.
+
+While the stage is retained, a revision that reuses its current or any earlier request ID is refused as `request unresolved`, even with that request's earlier bytes put back. Activation forgets the earlier IDs, so give every revision and every later repair a fresh ID.
+
+To cancel an unactivated cold replacement, use the ordinary cancel grammar with the **current retained intent generation**, also shown in the preview (initially zero). This records cancellation without needing readable `config.json`; run `start` to process it:
+
+```sh
+jq -n --slurpfile s "$STATE/config.json.last-applied" --arg id "cancel-$(date +%s)-$RANDOM" '
+  {format:"cscb-review-request-v1", request_id:$id,
+   intent_generation:($s[0].pendingIntent.operator.generation // 0), action:"cancel"}
+' > "$STATE/config.json.request.next"
+mv "$STATE/config.json.request.next" "$STATE/config.json.request"
+claude-slack-channel-bots start
+```
+
+Accepted cancellation advances the generation and retains its tombstone, original damaged evidence and prepared bytes; it does not activate the proposal. Replaying the same cancellation request cannot cancel a later proposal.
+
+Rerunning this generator creates a new cancellation request for the current proposal. Old confirmations cannot revive a cancelled proposal; a later replacement requires a fresh ID and fresh review.
+
+| Status after `[slack] reload-shared-recovery:` | Meaning and action |
+|---|---|
+| `unresolved` / `request refused` | No usable owner anchor or request binding. Preserve evidence, correct access and request fields, and choose only the applicable restore/replace path above. |
+| `restoration staged` / `review pending` | The proposal is inert. Restart for the owned stage, read the current preview, confirm by rename and start again. |
+| `request unresolved` | Input/request no longer binds the stage; an observed change revokes the old confirmation. Use the bound request or a fresh replacement ID and review the new pending file. |
+| `proposal cancelled` | No configuration activated; the line gives the retained intent generation. A fresh replacement ID is required for another review. |
+| `cancellation not recorded` / `revision not recorded` | A definite storage failure left the prior proposal inert. Preserve request/evidence and retry the operation when storage is trustworthy. |
+| `stage unresolved` / `repair unresolved` | Preserve staged evidence and prepared input; correct the reported safe filesystem cause and restart to verify the retained stage. |
+| `durability unresolved` | The operation may already be installed. Preserve authority, retirement evidence, request, confirmation and prepared input; restart to recover the retained outcome **before any new review**. This is not definite nonactivation or permission to reconfirm. |
+| `confirmation not activated` | A definite failure or stale gesture; read the genuinely fresh pending preview after recovery before confirming again. |
+| `durable repair activated` / `retained repair activation` | The repair is consumed once; the latter reports its retained order on a later start, without applying it again. Current authenticated membership is still required. Only in the run whose start activated the repair, each affected persona posts a [*Channel state recovered*](#shared-state-recovered) report with `cause=repair` once membership is verified; a later start has only the retained line, so don't wait for that report (see that entry). |
+
+History is not current membership. Missing membership or eligibility evidence remains unresolved; independently provable work may progress, but a wholly unprovable authority cannot expose runtime configuration. Repair preserves accepted work under its original keys, content, context and FIFO; unrelated input remains for ordinary review.
+
+The authority keeps the damaged state's exact bytes and the separately prepared input privately only until activation. Activation keeps just the request's ID, action and evidence hash, so the copies preserved before repair are the lasting ones. A request matching them left in place applies nothing.
+
+Repair never retries an unknown or proven-not-applied assignment, and finite Slack retries cannot recover events never accepted. For a channel's unresolved absence order, the ordinary reviewed assignment may explicitly replace that conflict: its preview distinguishes retained history, the removal boundary and a new future preference, requiring fresh membership. It recovers no lost Joined Threads.
+
+### `reload-request-invalid`
+
+- **Line:** `[slack] reload-request-invalid: <invalid or stale>; intent generation=<n>. Applied configuration is unchanged. Preserve the request and input; use the current generation and target declaration for a fresh request.`
+- **Fix:** Check the exact [request fields](../../docs/reload.md#editing-the-configuration), current generation/incarnation and intended declaration. Unknown fields, duplicate key/channel entries, obsolete targets or reuse of an ID for a different payload cannot partially change intent. Preserve unrelated input and submit a fresh ID; use `revise` when intent already exists.
+
+### `reload-request-recorded`
+
+- **Line:** `[slack] reload-request-recorded: <recorded or duplicate>; intent generation=<n>. Applied configuration is unchanged. Review the pending file before confirming.`
+- **Meaning:** Intent only. The controller suppresses duplicate-request log repeats; a replay is never a fresh same-value assignment. Inspect the preview before the separate confirming rename.
+
+### `reload-request-storage`
+
+- **Line:** `[slack] reload-request-storage: <failed or unresolved>; intent generation=<n>. Applied configuration is unchanged. Preserve the request and input; use the current generation and target declaration for a fresh request.`
+- **Fix:** Preserve both files and authority evidence. Resolve the storage cause and any uncertainty before reading the current generation and preparing fresh intent; do not assume an unresolved request was recorded or discarded.
+
+### `reload-review-recovery`
+
+- **Line:** `[slack] reload-review-recovery: <recovered or unresolved>; the interrupted confirmation did not activate.` `recovered` adds `Pending intent remains; a fresh review and confirmation are required.` `unresolved` adds `Preserve authority and retirement evidence; affected new work remains held until retirement recovery succeeds.`
+- **Fix:** Preserve the named evidence and repair storage; do not remove retirement protection or resubmit old authorization. After recovery, use the fresh review with current membership. This line concerns interrupted noncommitted work, distinct from exact committed-transaction recovery above.
+- `[slack] reload: recovered persona bring-up failed: <safe cause>` or `[slack] reload: recovered activation lifecycle failed: <safe cause>` reports a recovery lifecycle failure. Preserve surrounding diagnostic lines and report it; neither licenses a second assignment.
+
+### `reload-review-outcome`
+
+- **Line:** `[slack] reload-review-outcome: <superseded, attempted, rejected or consumed>; this confirmation cannot assign again. Review the current pending file for a new confirmation.`
+- **Meaning:** Durable history spends the review independently of file cleanup. Replaying a consumed copy is not `reload-noop`; cancelled/redeclared intent or matching input bytes cannot revive it.
+- **Kept outcomes:** CSCB keeps the review outcome it recorded last, plus any outcome an interrupted change or an active repair still needs, and this line appears only while that review's outcome is kept. A confirmation whose outcome is no longer kept is refused as stale instead ([`reload-stale-confirmation`](#reload-stale-confirmation)) and applies nothing. Either way a spent review never assigns again, including a consumed copy left at the apply path because cleanup failed.
+- **Fix:** Read the current pending preview and confirm it afresh for any remaining work; never reuse the old confirmation.
 
 ### `reload-nothing-pending`
 
@@ -6398,21 +7480,20 @@ or a filesystem that doesn't support syncing a directory).
   - `[slack] reload-nothing-pending: the configuration file and the credentials files it references match what is applied; no change is pending`,
     when there was no `config.json.pending` to remove (for example it was
     deleted by hand, or never written).
-- **When:** once, when the state changes to nothing waiting, not at every
-  check. It is logged only after `config.json.pending` is gone. Two cases:
+- **When:** once, when neither differing input nor requested intent remains,
+  not at every check. It is logged only after `config.json.pending` is gone. Two cases:
   - an edit of `config.json` or of a credentials file was reverted, so the
     files match what is applied again;
   - the first check after a start removed a `config.json.pending` left over
-    from before, which the start made obsolete: the start applied the
-    waiting edit (the record was deleted, as under
-    [Starting without the record](#starting-without-the-record)), applied a
-    changed credentials file, or `config.json` was put back while the server
-    was stopped.
+    from before, which the start made obsolete: it read a changed credentials
+    file, or `config.json` was put back to its reviewed source while the server
+    was stopped. A restart never promotes an unconfirmed configuration edit.
 - It is never logged at a clean start, where nothing was waiting and no
   leftover file was found. After a start, it is logged only if the first
   check actually removed a leftover file.
-- **Meaning:** Nothing is waiting to be applied. The server runs what it
-  applied, and `config.json` and the credentials files match it.
+- **Meaning:** Nothing is waiting to be applied. Input matches the reviewed
+  source and credentials, and no explicit request remains. Applied automatic
+  choices can still differ from copied source fields; input is never rewritten.
 - **Fix:** None. It is informational. If the removal failed, a plain
   `[slack] reload: cannot remove the pending-change file …` line comes
   first, and this line follows once a later check removes the file. If the
@@ -6424,7 +7505,9 @@ or a filesystem that doesn't support syncing a directory).
 
 - **Line:** every line of the preview in `config.json.pending`, each as
   `[slack] reload-preview: <preview line>`. The first is the header, and it
-  ends with where the preview is written:
+  ends with where the preview is written. This excerpt abbreviates the removal
+  line: the log adds `; <n> open queued items kept, delivered only if a persona with the same key is added again`
+  before its final period (`item` when the count is one):
 
   ```text
   [slack] reload-preview: A configuration change is pending; nothing has been applied. personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed. (preview in "<pending path>")
@@ -6439,12 +7522,13 @@ or a filesystem that doesn't support syncing a directory).
   new content. Also once at the first check after each start while a change
   is still pending. Not at every check, and not when the file is only
   rewritten.
-- **Meaning:** Informational. `config.json`, or a credentials file it
-  references, differs from what is applied, and the edit is valid. Nothing
-  has been applied. Each line is explained under
+- **Meaning:** Informational. Configuration or credentials content differs,
+  or explicit assignment intent is pending even with unchanged bytes, and
+  the candidate is valid. Nothing has been applied. Each line is explained under
   [Pending changes](#pending-changes).
 - **Fix:** Review the preview (the file is the current one). To withdraw the
-  change, revert the edit (see [Pending changes](#pending-changes)). To apply
+  change, revert only the intended edit and cancel or revise any declared
+  assignments (see [Pending changes](#pending-changes)). To apply
   a `config.json` edit, see
   [Confirming a pending change](#confirming-a-pending-change).
 
@@ -6461,12 +7545,12 @@ or a filesystem that doesn't support syncing a directory).
   The ` (preview in "<pending path>")` part is missing when the pending file
   couldn't be written. `config.json.pending` holds the one line
   `INVALID: <error> Nothing will be applied.`
-- **When:** a running server's check, once each time the pending change
-  differs from the one last logged, and once at the first check after each
-  start while it is still pending. An invalid candidate logs only this line,
-  never `reload-preview`.
-- **Confirmed variant:** when a confirmation (`config.json.apply`) matched an
-  invalid candidate, the line is instead:
+- **When:** pending detection logs this line once for each new invalid
+  review, including the first check after a start while invalid input is
+  pending. Further unchanged checks are quiet. An invalid preview never
+  emits `reload-preview`; confirmation processing has the sequences below.
+- **Confirmed variant:** when a confirmation (`config.json.apply`) matches a
+  current, unused review of an invalid candidate, it first logs:
 
   ```text
   [slack] reload-invalid: the confirmed configuration is invalid, so nothing is applied: <error>
@@ -6474,29 +7558,33 @@ or a filesystem that doesn't support syncing a directory).
 
   For example
   `… so nothing is applied: loadPersonaConfig: malformed JSON in "<config path>" at line 3, column 5.`
-  Normally a candidate gets two lines: the pending-time line when its
-  `INVALID` preview is written, then this one when the confirmation is
-  processed. When the confirmation is already there on the pass that first
-  sees the candidate (for example the first check after a start), only this
-  line is logged.
+  On an ordinary confirmation check, this confirmed-invalid line is followed
+  by a new pending-invalid line as the server writes a refreshed `INVALID`
+  preview with a new review fingerprint. The earlier pending-time line was
+  already logged when the original preview was written. Further unchanged
+  checks emit neither line again.
+- **After restart:** a confirmation of the prior invalid review is
+  superseded. The first check logs [`reload-review-outcome`](#reload-review-outcome)
+  with `superseded`, then the pending-invalid line for the fresh review and
+  writes its `INVALID` preview. It does not log the confirmed-invalid variant;
+  later unchanged checks stay quiet.
 - **Cause:** the edited `config.json` fails to parse or validate (the
   `<error>` is a message from
   [Configuration rejections](#configuration-rejections); an unknown key whose
   name could be a pasted token is counted, not shown), or `config.json` is
-  missing, can't be read or is too large while a record exists:
+  missing or can't be read while a record exists:
   `the configuration file "<config path>" does not exist.`,
-  `the configuration file "<config path>" cannot be read (<errno>).` or
-  `the configuration file "<config path>" is larger than the 64 KiB limit.`
-  To the reload check, a file over 64 KiB counts as unreadable and is never
-  read in full. (Only the file-send guard reads `config.json` whole, so a
-  credentials path named in an oversized file stays protected.)
+  or `the configuration file "<config path>" cannot be read (<errno>).`
+  Configuration, authority and preview reads have no size cap. Credentials
+  and agent-director settings retain their independent 64 KiB limits.
 - **Effect:** Nothing is applied. The server keeps running the last-applied
   record. A confirmation of an invalid candidate is used up: it applies
   nothing, and it isn't acted on again.
 - **Fix:** Correct `config.json` at the position or rule the error names, or
   restore it (see withdrawing under [Pending changes](#pending-changes)).
   Within about 5 s the check writes the new preview, or removes the pending
-  file and logs `reload-nothing-pending` if the file matches what is applied.
+  file and logs `reload-nothing-pending` if input matches the reviewed source
+  and credentials and no explicit request remains.
   After the confirmed variant, the old confirmation can't be reused: read the
   new `config.json.pending` once the fix is in, then confirm it (see
   [Confirming a pending change](#confirming-a-pending-change)).
@@ -6510,19 +7598,20 @@ or a filesystem that doesn't support syncing a directory).
   ```
 
   The counts are the ones in the preview's header.
-- **When:** a running server's check found a confirmation
-  (`config.json.apply`) whose fingerprint matched the pending change, and the
-  change was valid and had an effect. The confirmation is deleted first, so
-  it is used once.
-- **Meaning:** `config.json.last-applied` now holds the confirmed
-  `config.json`, byte for byte, and the server runs its persona set. Every
-  later start runs it too. A changed server-wide setting is recorded and takes
-  effect at the next start, or for the CLI at once (`stop_timeout`,
-  `exit_timeout`), or both: the CLI at once and the server at its next start
-  (`agent_director_call_timeout_ms`), as its preview line says. The
-  exception is `allow_invited_channels`: it takes effect at once, in place,
-  from the next event, tool call, prompt and notice, with every session kept
-  and no lifecycle step for any persona.
+- **When:** a current, unused confirmation (`config.json.apply`) passed
+  revalidation and durably activated the reviewed change. Its matching intent
+  consumption and outcome were committed with the applied mode, choices and
+  identities before cleanup. The line follows the lifecycle work settling;
+  cleanup failure cannot authorize a second assignment.
+- **Meaning:** The `config.json.last-applied` envelope holds the exact reviewed
+  source bytes separately from its applied configuration and ordered choices.
+  The original `config.json` is untouched, and every later start runs the
+  authority's applied state. `channel_mode` applies in place from the next
+  event, tool call, prompt and notice; own or inherited `stop_hook_bootstrap`
+  applies to subsequent AD-state reminder checks, retaining the session.
+  Other settings keep the timing in
+  [Next-launch and server-wide settings](#next-launch-and-server-wide-settings),
+  including the CLI's immediate use of the recorded timeouts.
 - **What happens to personas now:** the apply switches the persona set the
   server runs at once. Message delivery, the up check, the notifier and the
   permission poller read that set at each use. Then:
@@ -6552,11 +7641,11 @@ or a filesystem that doesn't support syncing a directory).
     - it is never restarted or relaunched again;
   - a kept persona's routing settings take effect at once, for the next
     message, notice or prompt: `channels` (each entry's `delivery` included)
-    and `permission_prompts` in declarative mode,
-    `invited.permission_prompts` in fungible mode, and `dm.*` in both;
-  - a change to the section the mode doesn't read is only written into the
-    record, with no effect until the switch selects that section;
-  - a kept persona's `stop_hook_bootstrap` change applies immediately;
+    and `permission_prompts`, plus `dm.*`, in both modes;
+  - a kept persona's own or inherited `stop_hook_bootstrap` change applies
+    immediately to subsequent AD-state reminder checks, with the same session;
+  - a kept persona's `reaction_notices` change applies immediately in place,
+    in both modes, with the same session;
   - a kept persona's `claude_config_dir`, `model` or `effort` change takes effect at its next launch (a relaunch after the bot dies, a
     `clean_restart --server`, or `clean_restart <bot>…` naming it, `stop --stop-bots` then `start`, or a host reboot; a
     plain `stop` and `start` only attempts reconnect and cannot reconnect a covered instance), which launches the new
@@ -6582,8 +7671,9 @@ or a filesystem that doesn't support syncing a directory).
     brought up again anyway, logs its usual class line (for example
     `persona-credentials-invalid`) and stays broken; nothing is pending.
 
-  The next start runs the new record, which also carries out the server-wide
-  settings other than `allow_invited_channels`, already in force (see
+  The next start runs the authority's applied state and takes up settings
+  that require a server start. `channel_mode` and own/inherited
+  `stop_hook_bootstrap` are already in force (see
   [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)); the record already holds the change, so don't delete it.
 - **Fix:** None. If `config.json.pending` is written again after this line,
   something is still pending: see [Pending changes](#pending-changes). With
@@ -6592,122 +7682,27 @@ or a filesystem that doesn't support syncing a directory).
 
 ### `reload-noop`
 
-- **Line:**
-
-  ```text
-  [slack] reload-noop: the confirmed configuration has no effective change, so no persona and no server-wide setting changed; the last-applied record "<record path>" was rewritten with it
-  ```
-
-- **When:** a confirmation (`config.json.apply`) matched a pending change
-  whose preview said `no effective change`: `config.json`'s bytes differ from
-  the record's, but nothing they configure does. A whitespace or key-order
-  edit, a setting written out with its default value (`allow_invited_channels`
-  written as `false` included), or an edit made only of recorded changes to
-  the section the mode doesn't read (the preview's
-  `recorded, with no effect until …` lines) does this.
-- **Meaning:** The record was rewritten with `config.json`'s bytes, so the two
-  match again and nothing is pending. No persona, instance or setting changed.
-  The record holds any recorded change, which takes effect only once a
-  later confirmed change turns the switch to the mode that reads it.
-  A `claude_config_dir` moved to another path for the same real directory
-  (through a symlink) still logs one `template refresh:` line (see
-  [Memory-note reads](#next-launch-and-server-wide-settings)): the template's
-  rules are written from the path as spelled.
-- **Fix:** None.
+- **Line:** `[slack] reload-noop: the confirmed configuration has no effective change, so no persona and no server-wide setting changed; the last-applied record "<record path>" was rewritten with it`
+- **When:** A current, unused review confirms a source-only edit such as whitespace, key order or an explicit default (`channel_mode: "strict"` when already strict). A same-value explicit assignment is ordered and is not this case.
+- **Meaning:** Exact reviewed source and the application revision are recorded without changing channel assignment values/order or live sessions. Matching intent is consumed together with the review; automatic choices and unrelated pending input are retained. A `claude_config_dir` spelling change for the same real directory can still refresh template memory-read rules.
+- **Fix:** None. A consumed-copy replay applies nothing: it logs [`reload-review-outcome`](#reload-review-outcome) while that review's outcome is still kept, and [`reload-stale-confirmation`](#reload-stale-confirmation) once it is no longer kept.
 
 ### `reload-stale-confirmation`
 
-- **Line:**
-  `[slack] reload-stale-confirmation: the confirmation "<apply path>" <reason>; nothing is applied`,
-  where `<reason>` is one of:
-  - `does not match the configuration as it stands (the configuration file or a credentials file it references changed after that preview was written)`;
-  - `cannot be read (<errno>)` (for example `EISDIR`, a directory),
-    `cannot be read (not a regular file)` (a FIFO, socket or device, never
-    read), or `is larger than the 64 KiB limit`;
-  - `holds no well-formed fingerprint (it is not a pending-change file as the server writes it)`.
-- **When:** a running server's check found `config.json.apply` beside
-  `config.json`, including one left there while the server was stopped (the
-  first check after the start processes it). The line never shows the file's
-  content.
-- **Cause:** The confirmation's content no longer matches `config.json` and
-  the credentials files it references as they stand. A confirmation carries
-  the fingerprint line of the `config.json.pending` it was made from, and it
-  applies only while that still describes the files. The usual reasons:
-  - **An edit saved after the preview was written.** `config.json`, or a
-    credentials file it references, was saved again between the preview and
-    the rename, even with a change that was meant to go along with it.
-  - **A half-written save.** The check read `config.json` while an editor or
-    script was still writing it, wrote a preview of the partial file, and the
-    finished save no longer matches.
-  - **An older copy renamed.** The renamed file was an earlier
-    `config.json.pending` (a copy kept aside, or one from before a later
-    edit). A copy whose change was already applied still matches while the
-    files are unchanged: it logs `reload-noop`, not this line.
-  - **A hand-made or hand-edited confirmation.** A file written by hand, or a
-    preview edited or damaged, holds no well-formed fingerprint. One that is
-    a directory, a FIFO, socket or device, or over 64 KiB can't be read.
-- **Effect:** Nothing is applied. The confirmation is deleted, and the line is
-  logged once; the confirmation isn't acted on again. A change that is still
-  pending keeps its current preview in `config.json.pending`, which the check
-  writes again if it is missing.
-- **Fix:** Finish editing, wait about 5 s for `config.json.pending` to
-  refresh, read the new preview (see [Pending changes](#pending-changes)) and
-  rename it again (see
-  [Confirming a pending change](#confirming-a-pending-change)). Never write
-  or edit a confirmation: only the server's current `config.json.pending`
-  applies, renamed (a byte-for-byte copy also matches, but the rename is the
-  supported way). A confirmation is used once. After an edit
-  is reverted and redone, rename the new `config.json.pending`, even if it
-  reads the same as one renamed before.
-- **`is larger than the 64 KiB limit` on a fresh rename:** the server's own
-  `config.json.pending` can exceed the cap for a very large single change
-  (hundreds of personas renamed or credentials files changed at once), even
-  while `config.json` is under it. The check then rewrites the pending file
-  at every tick and can never apply it. Split the change into smaller
-  `config.json` edits and confirm each one in turn.
-- **A confirmation that can't be removed:** any confirmation, matched or not,
-  is deleted before it is acted on. If that fails, the plain line
-  `[slack] reload: cannot remove the confirmation "<apply path>" (<errno>); it was acted on once and is ignored until its content changes`
-  is logged just before the line that says how it was acted on. The server retries the delete silently at each check and ignores
-  the file while its content stays the same. Remove it by hand once its
-  directory is fixed (permissions, or a read-only filesystem). If it was
-  removed but its directory couldn't be synced, the line is
-  `[slack] reload: removed the confirmation "<apply path>" but could not sync its directory (<errno>); it may reappear after a crash`.
+- **Line:** `[slack] reload-stale-confirmation: the confirmation "<apply path>" <reason>; nothing is applied`. The reason describes a mismatch, unreadable/nonregular file or malformed fingerprint, never file contents.
+- **Cause:** The review no longer binds current mode, identity, assignment order/choices, destination, intent, membership/leave evidence or detected configuration/credential content. A detected change followed by reversion still invalidates it; so do cancellation/redeclaration and a new start. A stopped confirmation is assessed against recovered state and current startup membership evidence, not historical membership.
+- **Older copies:** A still-kept superseded, attempted, rejected or consumed review logs [`reload-review-outcome`](#reload-review-outcome). Matching bytes do not revive it. An incomplete save can produce a preview that the completed input supersedes; a hand-made fingerprint is not authorization.
+- **Effect:** Nothing applies. Obsolete/malformed confirmations are removed when possible, and remaining pending work gets a current preview. Prepared configuration and pending intent survive.
+- **Fix:** Finish the input/request, wait for the fresh preview (normally about 5 s), read it and rename it as [Confirming a pending change](#confirming-a-pending-change) describes. Use `refresh` when you need a new review of current facts; never compute or edit the fingerprint. Configuration and preview size have no cap; credentials keep their independent limit.
+- **Cleanup:** `[slack] reload: cannot remove the confirmation "<apply path>" (<errno>); it was acted on once and is ignored until its content changes` means cleanup failed, not that a durable outcome is forgotten. The server retries deletion silently; fix permissions or the read-only filesystem. A successful unlink whose directory sync failed logs `[slack] reload: removed the confirmation "<apply path>" but could not sync its directory (<errno>); it may reappear after a crash`. Durable consumed outcomes reject even a reappearing copy. A valid confirmation is kept through activation; it is not deleted ahead of success.
 
 ### The last-applied record can't be read or is invalid
 
-- **Line:** `[slack] Fatal: last-applied record error — <cause> Deleting the last-applied record "<record path>" makes the next start apply the configuration file "<config path>" as it stands.`
-  It carries no class label.
-- **Cause:** one of:
-  - `The last-applied record "<record path>" cannot be read (<errno>).`: the
-    record exists but the server's user can't read it (permissions, or the path
-    is a directory, `EISDIR`); `(not a regular file)` means the path is a FIFO,
-    socket or device, which is never read;
-  - `The last-applied record "<record path>" is larger than the 64 KiB limit.`:
-    the record is over 64 KiB, so it was damaged or replaced;
-  - `loadPersonaConfig: malformed JSON in "<record path>" at line <L>, column <C>.`:
-    the record isn't valid JSON (it was edited or damaged);
-  - `loadPersonaConfig: invalid persona config in "<record path>": <message>`:
-    the record breaks a rule. The messages are the ones under
-    [Configuration rejections](#configuration-rejections), except the two
-    shared-path rules, which a record start leaves to the bring-up.
-- **Effect:** The server exits 1 and doesn't fall back to `config.json`.
-  Until the record is fixed or deleted, `clean_restart` fails with
-  `[slack] clean_restart: failed to load config:` and stops nothing, and
-  `stop --stop-bots` logs `could not load config — skipping bot teardown`,
-  checks no persona and stops only the server. If it can't connect to
-  agent-director first, it stops nothing (see
-  [A precheck failed: nothing was stopped](#a-precheck-failed-nothing-was-stopped)),
-  unless the client refused the binary as too old: then it stops only the
-  server and exits 1 (see
-  [The two CLI commands on an old binary](#the-two-cli-commands-on-an-old-binary)). `stop` logs one line saying it could not load the applied
-  configuration, and uses a 30 s `stop_timeout`.
-- **Fix:** If it can't be read, make it a readable file and start again; the
-  record is kept. Otherwise, with the operator's say-so, delete the record and
-  start, as under [Starting without the record](#starting-without-the-record).
-- **Warning:** Deleting the record makes the next start run whatever is in
-  `config.json` now, including any edit that was never applied. Read
-  `config.json` before deleting the record.
+- **Line:** `[slack] Fatal: last-applied record error — <cause>` names `config.json.last-applied`; malformed JSON identifies only its position, never its contents.
+- **Cause:** The shared authority is unreadable, is not a regular file, is malformed or fails schema/evidence validation.
+- **Effect:** Startup refuses without falling back to `config.json`. Shared authority and configuration have no size cap; credentials and agent-director settings keep their independent 64 KiB limits. Neither writable storage, elapsed time, a queue acceptance nor a new mention proves missing state recovered, and no default listening choice supplies it.
+- **Fix:** Preserve the authority, prepared input and pending evidence. Correct read/permission failures before requesting [reviewed recovery](#reload-shared-recovery); unreadable or nonregular evidence cannot be staged. Only the running owner can supply a restoration anchor; without one, explicitly review replacement choices and lost history. Never delete the record or import an older copy as authority.
+- **A hand-written record that has never started:** when `<cause>` is a removed-key message from a record written by hand for an upgrade, correct both baseline files as [Removed configuration keys](#removed-configuration-keys) says. Reviewed repair is for an adopted authority. That start also logs `[slack] reload-shared-recovery: unresolved. No trustworthy authority anchor; …`, and the refusal ends "restore trustworthy authority evidence before starting again". For this record, correcting both baseline files is that restoration; it needs no request.
 
 ### The retired-key record can't be read or is invalid
 
@@ -6744,210 +7739,16 @@ writes it; it is absent until a key is first recorded. Never edit it.
 
 ---
 
-## The stored-choice file: `channel-delivery.json`
+## The shared channel authority: `config.json.last-applied`
 
-The server keeps the channel deliveries that personas' agents choose with
-`set_channel_delivery` in `channel-delivery.json`, in the state directory
-beside `retired-keys.json`. For each persona key it holds the persona's
-declaration (its `name`, and its `credentials_file` and `working_directory`
-as absolute paths with `~` expanded) and, for
-each channel, the stored choice (`mentions` or `all`) and when it was stored.
-That is persona keys, names, paths, channel IDs, choices and times only: no
-token, no credentials content and no message text.
+`config.json.last-applied` is the sole shared channel authority. Its envelope holds the revision, applied configuration, reviewed source and exact source bytes (`sourceBytesBase64`), persona identities and incarnations, and ordered channel choices. An uncertain or unresolved outcome requires preserving authority, prepared input and pending evidence.
 
-- **Only the server reads and writes it.** No CLI command reads, writes,
-  creates or removes it. Never edit it by hand (see
-  [Constraints](#constraints)).
-- **Read once per start.** The server reads it whole, with no size cap, once
-  at every start, in both channel modes and in dry run, before any persona is
-  brought up. It isn't read again while the server runs.
-- **Absent until the first stored choice.** A missing file is an empty
-  record. Only the first accepted `set_channel_delivery` call creates it.
-  Every call is refused in declarative mode, so declarative mode never
-  creates it.
-- **Stored choices apply only in fungible mode** (`allow_invited_channels`
-  is `true`). While the switch is off they stay on disk and apply again once
-  it is back on (see
-  [`persona-channel-delivery-set`](#persona-channel-delivery-set)).
-- **The server on its own only ever drops choices.** A confirmed change
-  that retires a persona's key drops its choices, and so do the start rules
-  at every start; each drop logs a line (see
-  [The store's `[slack] channel-delivery:` lines](#the-stores-slack-channel-delivery-lines)).
-
-To see whether the file exists and what it holds (no token is in it):
-
-```sh
-STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}"
-ls -l "$STATE/channel-delivery.json"
-cat "$STATE/channel-delivery.json"
-```
-
-### `channel-delivery-unreadable`
-
-- **Line:** one line at start, with no persona reference:
-
-  ```text
-  [slack] channel-delivery-unreadable: the stored-choice file "<path>" <what>. It is left in place, and this run neither writes it nor drops anything from it: in fungible mode every channel is served at mentions, and set_channel_delivery is refused. To fix: move the file aside, then restart the server
-  ```
-
-  `<what>` says which step failed. It never shows the file's content:
-  - `could not be read (<code>)`: the read failed. `<code>` is the error
-    code, such as `EACCES` or `EPERM` (permissions), `EISDIR` (the path is a
-    directory) or `not a regular file` (a FIFO, socket or device, which is
-    never read). The ` (<code>)` part is missing when the error has none.
-  - `could not be parsed: it is not valid UTF-8`, or
-    `could not be parsed: it is not valid JSON at line <L>, column <C>`
-    (`it is not valid JSON` when there is no position).
-  - `could not be validated: it is invalid: <problem>`: the JSON breaks a
-    rule of the format. `<problem>` names an entry by its position
-    (``entry <n> of `personas` ``, ``channel <n> of `channels` ``), never by
-    its key, channel ID or value; for example
-    `it has a top-level field the format does not name` or
-    ``entry 2 of `personas` has no `declaration` ``.
-- **Meaning:** The server couldn't use the stored-choice file, so for the
-  rest of this run the store is unreadable: no stored choice applies, and
-  nothing is stored.
-- **Cause:** The file could not be read, parsed or validated. Usually its
-  permissions (the server's user can't read it), a directory or other
-  non-regular file at its path, invalid JSON, or a damaged or hand-edited
-  file (a field the format doesn't name, a `version` other than 1, a key that
-  isn't a persona key, a `delivery` other than `mentions` or `all`, or a
-  `set_at` that isn't an RFC 3339 UTC time ending in `Z`).
-- **Effect:**
-  - In fungible mode every channel is served at `mentions`, whatever was
-    stored, and each `persona-invited-channel` line shows `mentions`. Every
-    `set_channel_delivery` call is refused, with this tool error, and nothing
-    is stored:
-    `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): the stored-choice file "<path>" is not readable, so no channel delivery can be stored. To fix: the operator moves the file aside, then restarts the server.`
-  - Nothing is written to the file and nothing is dropped from it, and the
-    start rules don't run, so this run logs no drop line.
-  - The server starts and runs every persona. Declarative mode delivers by
-    each persona's listed channels, as it always does.
-  - The state lasts for the rest of the run, even if a confirmed change turns
-    fungible mode on later in it: readability is decided once, at start.
-  - No `startup-errors.log` entry is written, and nothing is posted to Slack.
-    This line in `server.log` is the only sign.
-- **Fix:** With the operator's say-so, move the file aside. Never edit it in
-  place:
-
-  ```sh
-  STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}"
-  mv "$STATE/channel-delivery.json" "$STATE/channel-delivery.json.moved-aside"
-  ```
-
-  Then, also with the operator's say-so, restart the server
-  (`claude-slack-channel-bots stop && claude-slack-channel-bots start`; the
-  bots keep running). The start finds no file, so every stored choice is
-  gone: each channel is served at `mentions` until a persona's agent sets it
-  again with `set_channel_delivery`. Keep the moved file for the operator to
-  read.
-- **Restoring the file instead of moving it aside:** while the store is
-  unreadable nothing can be dropped from it. If the operator makes that same
-  file usable again in place (fixes its permissions, or puts the same bytes
-  back) and restarts, a persona that was removed and added back during that
-  run with the same `name`, `credentials_file` and `working_directory` gets
-  its earlier stored choices again. Moving the file aside avoids this.
-
-### The store's `[slack] channel-delivery:` lines
-
-The store logs plain lines with no class label, each starting
-`[slack] channel-delivery:`. None of them names a channel's choice, and none
-carries a token or message text. Declarative mode with no stored-choice file
-logs none of them. To list them:
-
-```sh
-grep -h -F '[slack] channel-delivery:' "$STATE"/server.log.* "$STATE"/server.log 2>/dev/null | sort
-```
-
-**Drop lines.** One line per persona key whose stored choices a drop removed:
-
-```text
-[slack] channel-delivery: dropped the stored choices of persona=<key> in <n> channels: <reason>
-```
-
-(`in 1 channel` for one.) The key's choices stop applying at once, so in
-fungible mode its persona is at `mentions` in those channels until its agent
-sets them again. `<reason>` is one of:
-
-| Reason | Meaning |
-|---|---|
-| `retired by a confirmed change` | A confirmed change retired the key: the persona was removed, renamed (its old key), or destructively modified (`name`, `credentials_file` or `working_directory` changed; see [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change)). Logged once the change's last-applied record is written. At a start it also covers a key that `retired-keys.json` holds as retired while the persona's next session has not begun. |
-| `not an applied persona at start` | At a start, the key belongs to no persona in the configuration the start runs: the persona was removed or renamed, for example by a start without the record. |
-| `its declaration changed` | At a start, the persona's `name`, `credentials_file` or `working_directory` differs from the one stored with its choices. Paths count as equal when they are equal as written (after `~` is expanded) or resolve to the same real path. Retargeting a symlink that the persona's path names is no change. A path that a confirmed change respelled to another path with the same real path counts as changed if that real path later changes before an accepted `set_channel_delivery` call writes the persona's entry again. |
-
-The start rules run right after the read at every start, in both modes, so
-drop lines can appear in declarative mode whenever the file exists. A key that
-matches several rules is dropped once, with the first reason in the order
-`not an applied persona at start`, `its declaration changed`,
-`retired by a confirmed change`. With no file there is nothing to drop, so
-nothing is written or logged. Each rule only ever drops choices, toward
-`mentions`. No fix is
-needed: if a persona should hear a channel at `all` again, ask it in that
-channel to set it.
-
-**Failed-write lines.** One line per failed write, naming the action, the file
-and the error:
-
-```text
-[slack] channel-delivery: cannot <action> in "<path>"<detail>; <what holds>
-```
-
-- **A stored choice's write** (a `set_channel_delivery` call):
-
-  ```text
-  [slack] channel-delivery: cannot store the channel delivery of persona=<key> for channel <id> in "<path>"<detail>; the stored choices in memory are unchanged
-  ```
-
-  The agent gets the tool error
-  `Tool "set_channel_delivery" failed for persona "<name>" (key=<key>): the stored-choice file "<path>" could not be written, so the choice was not stored and channel delivery is unchanged.`,
-  and no `persona-channel-delivery-set` line is logged. `<detail>` is one of:
-  - ` (<code>); the file is unchanged`;
-  - `: the record was written but its directory could not be synced (<code>); <write-back>`,
-    where `<write-back>` is `the previous record was written back`, or
-    `the file, absent before, was removed again` when the call would have
-    created it, either one possibly followed by
-    `, though its directory could not be synced either`;
-  - the write-back variant:
-    `: the record was written but its directory could not be synced (<code>); putting the previous state back failed too (<code>), so the file holds the refused choice until the next successful write`.
-    The refused choice is on disk but not in memory, so it doesn't apply in
-    this run. It stays there until the next successful write of the file
-    replaces it with the record held in memory. A restart before that write
-    reads it, and the refused choice then applies.
-- **A drop's write** (a confirmed change's drop, the start rules, or a later
-  write that carries an earlier failed drop):
-
-  ```text
-  [slack] channel-delivery: cannot write the drop of persona=<key> in "<path>"<detail>; the dropped choices do not apply, and the next successful write of the file carries the drop
-  ```
-
-  A drop of several keys names each, sorted and joined by `, `
-  (`persona=<key>, persona=<key>`). `<detail>` is ` (<code>); the file is unchanged`, or
-  `: the record was written but its directory could not be synced (<code>), so a crash can undo it`.
-  The dropped choices stop applying at once in memory, whatever the write
-  did. The drop stays unwritten until the next successful write of the file,
-  which carries it: an accepted `set_channel_delivery` call, another drop, or
-  a confirmed change that brings that key up again (which writes the file
-  first, and applies nothing if it can't; see
-  [`reload-record-write-failed`](#reload-record-write-failed)). A restart
-  before then reads the file with the dropped choices still in it, and the
-  start rules drop them again.
-
-The `(<code>)` parts appear only when the error has a code. **Cause and fix of
-a failed write:** as under
-[`reload-record-write-failed`](#reload-record-write-failed), usually the state
-directory: the server's user can't create or rename files in it (`EACCES`,
-`EPERM`), the disk or quota is full (`ENOSPC`, `EDQUOT`), or the filesystem is
-read-only (`EROFS`); a directory that can't be synced points at the
-filesystem. Have the operator fix it, then ask the persona to set the choice
-again. Any later successful write also carries an unwritten drop and replaces
-a refused choice left on disk.
-
----
+Once a start has adopted it, use [reviewed recovery](#reload-shared-recovery); do not replace it with an unconfirmed configuration or an unproven snapshot. The one exception is a baseline written by hand for an upgrade that has not yet started: correct it together with `config.json`, with the operator's say-so, as [Removed configuration keys](#removed-configuration-keys) says.
 
 ## The state directory's location and its move at start
 
 The state directory holds `config.json` and its reload files, `server.log`,
-`startup-errors.log`, `server.pid`, `channel-delivery.json`, the crontable
+`startup-errors.log`, `server.pid`, the shared authority, the crontable
 and the rest. The server uses, in order:
 
 - `$SLACK_STATE_DIR`, when it is set and non-empty. A server started with it
@@ -7181,6 +7982,18 @@ that agent-director could not resume; it does not establish history loss.
 
 The full entry for each symptom `docs/troubleshooting.md` lists, in the same order and under the same title. The sections above explain each log line in more detail.
 
+### Symptom: A channel request or confirmation is refused
+
+Check current intent and the fresh preview: [request diagnostics](#reload-request-invalid) explain invalid or stale requests, and [confirmation outcomes](#reload-review-outcome) explain why a spent review cannot assign again. Prepare a fresh request or confirmation against the current intent rather than replaying the old one.
+
+For uncertain writes, preserve input, authority, prepared confirmation and retirement evidence; see [write recovery](#reload-record-write-failed). [Reviewed recovery](#reload-shared-recovery) distinguishes inert proposals, cancellation, installed uncertainty and retained activation. Follow its preservation and review steps rather than inferring whether an assignment succeeded; see the separate [Channel state recovered](#symptom-a-persona-posts-a-channel-state-recovered-notice) entry for activation and Joined Threads behavior.
+
+### Symptom: A persona posts a *Configuration change not applied* notice
+
+A definite failed confirmed apply changes nothing: prior applied state and the pending change remain. Fix permissions, free space or directory-sync support, read the fresh preview and confirm afresh; the old confirmation is not reused. See [`reload-record-write-failed`](#reload-record-write-failed).
+
+An unresolved write may already be installed. Preserve authority, prepared input, confirmation and retirement evidence, then restart to recover the exact transaction; use [reviewed recovery](#reload-shared-recovery) only if that cannot resolve it. Do not treat uncertainty as a definite failure or submit a replacement assignment.
+
 ### Symptom: Installation fails or launches stay pending
 
 Install Bun before installing CSCB: its install and start scripts require
@@ -7214,11 +8027,15 @@ No `config.json` and no last-applied record. See the `missing prerequisite: conf
 
 ### Symptom: The server won't start: last-applied record error
 
-See [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid).
+For a removed-key message from a hand-written record that has never started, correct both baseline files as [Removed configuration keys](#removed-configuration-keys) says; reviewed repair is for an adopted authority. Otherwise see [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid), then [`reload-shared-recovery`](#reload-shared-recovery): a repaired choice ending at `thread_hybrid` starts with no Joined Threads, and once membership is verified in the run whose start activated the repair, the persona posts *Channel state recovered* (a later start doesn't).
 
 ### Symptom: The server won't start: `reload-record-write-failed`
 
-See **At a start without a record** under [`reload-record-write-failed`](#reload-record-write-failed).
+A definite failure applied nothing: fix the directory's permissions, free space or sync support and start again. An unresolved write may already be installed: preserve the authority and prepared input, restart to recover it, and use [reviewed repair](#reload-shared-recovery) only when that cannot resolve it. See [`reload-record-write-failed`](#reload-record-write-failed).
+
+### Symptom: A start or pending review rejects a removed configuration key
+
+The key belongs to an earlier release's configuration; edit `config.json` by hand to use its replacement, and before the first start after an upgrade also `config.json.last-applied`. See [Removed configuration keys](#removed-configuration-keys).
 
 ### Symptom: A fix to config.json is ignored after a failed first start
 
@@ -7263,6 +8080,24 @@ run. Early reply or reaction suppression lasts 24 hours and pending/completed tr
 in memory; restart loses reply suppression, so an already answered retained
 message can acquire a reaction again.
 
+### Symptom: A Reaction Notice has no thread timestamp
+
+- **Symptom:** A notice has no `thread_ts`. An ordinary unthreaded message also omits it, so omission alone proves no lookup failure.
+- **Cause:** If reading the reacted message fails, times out or finds no message, and the item is not withdrawn, CSCB treats it as the persona's reply-tool post and fixes the notice without `thread_ts`. See [`reaction-message-unknown`](#reaction-message-unknown).
+- **Action:** Match that safe `server.log` line to the persona, conversation and reacted message. Check app membership, the manifest's read scopes and Slack read availability; use [`message-delivered`](#message-delivered) to confirm delivery. A later successful read affects new or not-yet-fixed work; it does not repair an already fixed notice. Do not infer a thread or server-notice origin from the emoji.
+
+### Symptom: A reaction in a group DM brings no Reaction Notice
+
+- **Symptom:** A reaction on this persona's post in a group DM brings no notice, even when the group DM is listed in the persona's strict-mode `channels`.
+- **Cause:** Group DMs are never served. The app's channel inventory holds only public and private channels, so CSCB has no verified membership in a group DM, and the reaction logs [`reaction-dropped`](#reaction-dropped) with `reason=unserved-conversation` in both strict and open mode. Listing the conversation does not change this; ordinary group-DM messages never deliver either.
+- **Action:** None for the drop: use a channel the persona serves. A listed group DM serves nothing, so remove it from the persona's `channels` and [confirm the change](../../docs/reload.md#reload). Rarely, a reaction saved on stale or inconsistent conversation facts reaches preparation: a successful conversation lookup withdraws it ([`reaction-withdrawn`](#reaction-withdrawn) with `reason=group-dm`), but in strict mode it is kept and delivered while that lookup fails or times out, with no line marking it (`conversation-unknown` is logged only in open mode). For that case, check the app has `mpim:read`, reinstall it if needed and restore Slack lookup availability.
+
+### Symptom: No Reaction Notices for reactions by people or other apps
+
+- **Symptom:** Adding or removing a reaction on this persona's own reply-tool text or file post brings no notice.
+- **Cause:** Its app may lack the `reaction_added` and `reaction_removed` bot event subscriptions. The manifest also requires the `mpim:read` bot scope for recognising group DMs; its absence alone does not prove all reaction events are absent.
+- **Action:** Verify both bot events and the scopes against [the manifest](../../slack-app-manifest.yml), then reinstall the receiving persona's existing app as [Migration](../../docs/migration.md#migration) describes. Test an eligible reaction in a conversation it serves. Follow [`reaction-received`](#reaction-received), [`reaction-dropped`](#reaction-dropped) and [`reaction-withdrawn`](#reaction-withdrawn) to distinguish saved work from exclusions.
+
 ### Symptom: A persona's instance waits at a startup prompt
 
 AD pre-trust handles workspace trust before launch. CSCB never answers startup dialogs automatically. With the operator's say-so, inspect `agent-director get --instance-id cscb_<key>` and `agent-director read-pane --instance-id cscb_<key>`, then attach (`tmux attach -t =slack_bot_<key>`) to answer a prompt. Pending launches retain ordinary retries and their grace/bound; see [A persona posts a Launch stuck or Session not starting notice](#a-persona-posts-a-launch-stuck-or-session-not-starting-notice).
@@ -7277,15 +8112,23 @@ grep -E 'unavailable-retry: persona=<key> |Deferring persona=<key>: |pending-row
 
 ### Symptom: A persona doesn't receive messages in a channel or DM
 
-See [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to) (the mode in force, a pending edit, `delivery` or channel delivery, the loop guard) and, for DMs, [`persona-dm-dropped`](#persona-dm-dropped) and [A persona can't open a DM](#a-persona-cant-open-a-dm-re-install-its-app-to-gain-imwrite). A persona that is down: [Triage](#triage).
+See [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to) (the mode in force, a pending edit, `delivery` or channel delivery). A `thread_hybrid` channel delivers the persona's @mentions and `@here` / `@channel` Broadcasts anywhere in the channel, plus replies in threads the bot is in; other channel messages and replies don't reach it (see [Threads in `thread_hybrid` channels](../../docs/channel-modes.md#threads-in-thread_hybrid-channels)). For DMs, see [`persona-dm-dropped`](#persona-dm-dropped) and [A persona can't open a DM](#a-persona-cant-open-a-dm-re-install-its-app-to-gain-imwrite). A persona that is down: [Triage](#triage).
 
 ### Symptom: A persona is silent in a channel it was invited to
 
 See [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to).
 
+### Symptom: Membership inventory or app setup is unresolved
+
+Read [membership readiness](#membership-setup-record-and-readback) to separate inventory completeness from current-app subscription/reinstall evidence; for app setup, follow [Update and reinstall an existing app](../setup-slack-channel-bots/SKILL.md#update-and-reinstall-an-existing-app). Follow the named [inventory reason](#channel-membership-inventory-incomplete) and [recovery bounds](#membership-recovery-bounds); retain unprovable history as [`channel-membership-unresolved`](#channel-membership-unresolved) describes.
+
 ### Symptom: A persona receives every message in a channel
 
 See [A persona receives every message in a channel](#a-persona-receives-every-message-in-a-channel).
+
+### Symptom: A bot's channel delivery change has no result, or a pending or unresolved outcome
+
+Retry with the same `attempt_id`, channel and value and `intent: retry`, never a new identifier; for pending or unresolved, preserve the identifier and repair storage or use reviewed repair first. See **What to do with each** under [`persona-channel-delivery-set`](#persona-channel-delivery-set).
 
 ### Symptom: File attachment fails after a long wait
 
@@ -7297,7 +8140,7 @@ See [`unclaimed-channel`](#unclaimed-channel).
 
 ### Symptom: Permission relay not working
 
-Check that the persona's Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify the bot is in `check_permission` state (on agent-director 0.16 and 0.17.0 an unanswered prompt shows as `needs_intelligence` once its timeout passes) via `agent-director list --state check_permission,needs_intelligence --label service=cscb` (operator CLI). Inspect `server.log` for `permission-poller:` lines — skipped-tick WARNs at 5+ consecutive skips signal that the poll interval is too tight; increase `agent_director_poll_interval_ms` in `config.json` and apply the change (see [Reload](../../docs/reload.md#reload)); like every server-wide setting but the switch `allow_invited_channels`, which applies at once, it takes effect at the next server start.
+Check that the persona's Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify the bot is in `check_permission` state (on agent-director 0.16 and 0.17.0 an unanswered prompt shows as `needs_intelligence` once its timeout passes) via `agent-director list --state check_permission,needs_intelligence --label service=cscb` (operator CLI). Inspect `server.log` for `permission-poller:` lines — skipped-tick WARNs at 5+ consecutive skips signal that the poll interval is too tight; increase `agent_director_poll_interval_ms` in `config.json` and apply the change (see [Reload](../../docs/reload.md#reload)); this setting takes effect at the next server start.
 
 ### Symptom: A permission prompt or notice doesn't arrive
 
@@ -7309,9 +8152,9 @@ The bot is wedged in `check_permission` on a native Claude Code TUI prompt that 
 
 ### Symptom: Session not restarting after crash
 
-The persona's launches keep failing and it stays down. Auto-restart backs off exponentially on repeated launch failures — the delay doubles from `session_restart_delay` (default 60s) on each consecutive failure, up to a 15-minute ceiling. After 5 consecutive failures the persona hits a cap: a `SpawnCapReached` notice naming the persona is posted to the persona's destination (a channel or a DM with its contact, per its `permission_prompts` in declarative mode or its `invited.permission_prompts` in fungible mode) and automatic restarts stop. A launch that agent-director refuses is not counted: see [agent-director refuses a persona: it is retried on its own](#agent-director-refuses-a-persona-it-is-retried-on-its-own).
+The persona's launches keep failing and it stays down. Auto-restart backs off exponentially on repeated launch failures — the delay doubles from `session_restart_delay` (default 60s) on each consecutive failure, up to a 15-minute ceiling. After 5 consecutive failures the persona hits a cap: a `SpawnCapReached` notice naming the persona is posted to the persona's destination (a channel or a DM with its contact, per its required `permission_prompts` in both modes) and automatic restarts stop. A launch that agent-director refuses is not counted: see [agent-director refuses a persona: it is retried on its own](#agent-director-refuses-a-persona-it-is-retried-on-its-own).
 
-A clean exit (`/exit`, which `agent-director pause` sends) is relaunched about 3 s after the disconnect instead of after `session_restart_delay`, at most once per `session_restart_delay`; `grep ~/.config/claude-slack-channel-bots/server.log` shows the check and its loop guard (the `` lines under [Other lines you may see](#other-lines-you-may-see)). There is no such check while the persona's last launch failed, so failed launches still back off and cap; nothing is logged for that.
+A clean exit (`/exit`, which `agent-director pause` sends) is relaunched about 3 s after the disconnect instead of after `session_restart_delay`, at most once per `session_restart_delay`; `grep -i 'clean-exit check' ~/.config/claude-slack-channel-bots/server.log` shows the check and its loop guard (the `Clean-exit check` and `No clean-exit check` lines under [Other lines you may see](#other-lines-you-may-see)). There is no such check while the persona's last launch failed, so failed launches still back off and cap; nothing is logged for that.
 
 A resume counts only once its session starts, and after 2 resumes in a row that end first the persona comes up fresh: see [A persona's resumed launch ends before it reports in](#a-personas-resumed-launch-ends-before-it-reports-in). A restart relaunches without a preceding kill after agent-director reports a finished or absent row; the `No kill before …` lines are under [A persona whose instance died under a prompt](#a-persona-whose-instance-died-under-a-prompt). Accepted messages remain queued while the persona recovers.
 
@@ -7352,6 +8195,44 @@ persona's hold or down state resolved. Accepted items remain queued in order.
 Claude Code on macOS loses typed input sent as one large burst, so on a macOS host CSCB types a long message as several parts of at most about 880 bytes each, tag included; on other hosts a part can reach about 1,900 bytes. On a Mac, long attachment lists, sender names and channel names in the tag are shortened sooner, each ending in `…`; the channel ID and the attachment count are kept whole.
 
 CSCB sets a message's parts once, shortly after it is queued, and never changes them; restarting the bot or the server does not split it again. A message queued before an upgrade can therefore keep its larger parts, go on logging `message-retyped` and raise a *Message not taken in* or *Delivery stuck* notice while later messages wait behind it. CSCB keeps offering it until the bot takes it in. [Delivery notices](#delivery-notices) explains each notice and how to attach to the bot's terminal to see what it received.
+
+### Symptom: A persona posts a *Thread Memory not saved* notice
+
+Check the named path's disk, mount and permissions; saving retries in the background and nothing needs resending. See [`thread-memory-not-saved`](#thread-memory-not-saved).
+
+### Symptom: A persona posts a *Thread Memory unreadable* notice
+
+Restore the journal's permissions or storage; to start its Thread Memory empty, stop CSCB first. See [`thread-memory-unreadable`](#thread-memory-unreadable).
+
+### Symptom: A persona posts a *Joins lost* notice
+
+A new @mention in a thread puts the bot back in it; send each listed message again if it was meant for the bot. See [`thread-memory-joins-lost`](#thread-memory-joins-lost).
+
+### Symptom: A persona posts a *Thread Memory changed while stopped* notice
+
+Check the threads the bot should be in; a new @mention puts it back in a thread. Never delete Thread Memory files to clear it. See [`thread-memory-changed-while-stopped`](#thread-memory-changed-while-stopped).
+
+### Symptom: A persona posts a *Thread Memory recovered* notice
+
+No action is needed; a separate holds-not-resolved line still needs its own storage fix. See [`thread-memory-recovered`](#thread-memory-recovered).
+
+### Symptom: A Thread Memory line in server.log with no notice
+
+For `thread-memory-quarantined`, `-compaction-failed`, `-removal-failed`, `-seal-unreadable`, `-seal-not-saved` or `-holds-not-resolved`, follow the named entry's storage remedy and preserve its files. See the entries from [`thread-memory-quarantined`](#thread-memory-quarantined) on, under [Thread Memory reports and log lines](#thread-memory-reports-and-log-lines).
+
+The healthy [`thread-memory-compaction-recovered`](#thread-memory-compaction-recovered), [`thread-memory-seal-saved`](#thread-memory-seal-saved) and [`thread-memory-holds-resolved`](#thread-memory-holds-resolved) lines need no operator repair. A [Memory Hold release preparation failure](#memory-hold-release-preparation-failed) has its own preparation remedy; its hold decision is already durable.
+
+### Symptom: A persona posts a *Channel state unresolved* notice
+
+Follow the cause's action: check the state directory's disk, or restart to review a staged restoration; use [reviewed repair](#reload-shared-recovery) when exact recovery cannot finish. See [`shared-state-unresolved`](#shared-state-unresolved).
+
+### Symptom: A persona posts a *Channel membership evidence unresolved* notice
+
+Only reviewed recovery settles a history gap; for a scan problem, make the named repair (scope, credentials or installation) and let the retries run. See [`membership-evidence-unresolved`](#membership-evidence-unresolved).
+
+### Symptom: A persona posts a *Channel state recovered* notice
+
+No further repair is needed; send again any message Slack stopped retrying meanwhile. See [`shared-state-recovered`](#shared-state-recovered).
 
 ### Symptom: A persona posts a *Waiting on a prompt* or *Not connected* notice
 
@@ -7437,7 +8318,7 @@ A bot also starts a new conversation, by design, when its session no longer matc
 
 ### Symptom: Session crashes on resume with "sandbox required but unavailable"
 
-This is a known regression in certain Claude Code releases (e.g. v2.1.120) where `--resume` triggers a sandbox check that fails in headless environments. Set `resume_enabled: false` in `config.json`, apply the change and restart the server (`resume_enabled`, like every server-wide setting but `allow_invited_channels`, takes effect at the next start; see [Reload](../../docs/reload.md#reload)) to disable `--resume` entirely — the bot will always start a fresh Claude session instead of resuming a prior conversation, both on startup and on runtime auto-restart:
+This is a known regression in certain Claude Code releases (e.g. v2.1.120) where `--resume` triggers a sandbox check that fails in headless environments. Set `resume_enabled: false` in `config.json`, apply the change and restart the server (`resume_enabled` takes effect at the next start; see [Reload](../../docs/reload.md#reload)) to disable `--resume` entirely — the bot will always start a fresh Claude session instead of resuming a prior conversation, both on startup and on runtime auto-restart:
 
 ```json
 {

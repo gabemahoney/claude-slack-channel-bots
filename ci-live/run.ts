@@ -75,7 +75,7 @@
  * A run is memory-bounded: the container has hard --memory, --memory-swap and
  * --pids-limit caps, Chrome is one browser with one page per account, and a
  * memory watchdog samples every 30 s and stops the run (like a signal, with
- * the verdict `FAIL: memory watchdog: …`) when the host's working set passes
+ * the verdict `FAIL: memory watchdog: …`) when the host's non-reclaimable memory passes
  * 40 GiB or Chrome's PSS passes 4 GiB.
  *
  * The full usage is `USAGE` in lib/args.ts, which parses the command line.

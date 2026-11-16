@@ -11,12 +11,9 @@
  * (`describeUnknownKeys`), so a pasted token never reaches an error
  *
  *
- * The server-wide switch `allow_invited_channels` picks the channel mode of
- * every persona (`channelModeOf`): declarative mode (absent or
- * `false`) reads each persona's `channels` and top-level
- * `permission_prompts`; fungible mode (`true`) reads its `invited` section
- * instead. A configuration's entries are validated by the mode its own
- * switch picks, and the section not in force is never parsed.
+ * channel_mode selects strict (the default) or open for every persona.
+ * Both modes read the same channel list and required permission_prompts.
+ * Removed keys fail validation even alongside their replacements.
  *
  * The configuration file is `config.json` in the state directory, at the path
  * `resolveServerConfigPath` returns. Which configuration a
@@ -108,6 +105,20 @@ export const MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS = 3_600_000
  */
 export const TEST_TIMER_OVERRIDES_KEY = 'test_timer_overrides'
 export const TEST_MCP_DROP_ENDPOINT_KEY = 'test_mcp_drop_endpoint'
+/**
+ * The test-only measurement switch: a boolean, off unless `true`. Like
+ * `test_mcp_drop_endpoint` it is not one of `PERSONA_TOP_LEVEL_KEYS`, is
+ * captured at start and is never applied by a reload.
+ */
+export const TEST_MEASUREMENTS_KEY = 'test_measurements'
+/**
+ * The test-only diagnostic timing switch: a boolean, off unless `true`, and
+ * in effect only beside `test_measurements: true`. It adds the per-event
+ * `ack`, per-append `append` and per-save `thread-save` measurement lines,
+ * whose extra clock reads and work the other measured scenarios must not
+ * carry. Captured at start like `test_measurements`; never applied by a reload.
+ */
+export const TEST_MEASUREMENT_TIMINGS_KEY = 'test_measurement_timings'
 
 /** The keys of the test-only timer override block, each optional; milliseconds when the name ends `_ms`, seconds when it ends `_s`. */
 export const TEST_TIMER_OVERRIDE_KEYS = [
@@ -117,6 +128,7 @@ export const TEST_TIMER_OVERRIDE_KEYS = [
   'delivery_stuck_after_ms',
   'unavailable_retry_base_s',
   'unavailable_retry_ceiling_s',
+  'queue_compact_interval_ms',
 ] as const
 
 /** A key of the test-only timer override block. */
@@ -140,7 +152,7 @@ export const PRE_PERSONA_KEYS = ['routes', 'default_route', 'default_dm_session'
 
 /**
  * Server-wide top-level keys: the settings the
- * persona shape kept from the pre-persona shape, and `allow_invited_channels`,
+ * persona shape kept from the pre-persona shape, and `channel_mode`,
  * the switch that picks the channel mode for every persona.
  */
 const SHARED_TOP_LEVEL_KEYS = [
@@ -164,7 +176,7 @@ const SHARED_TOP_LEVEL_KEYS = [
   'cron_table_path',
   'cron_log_path',
   'cron_log_max_bytes',
-  'allow_invited_channels',
+  'channel_mode',
 ] as const
 
 /**
@@ -229,9 +241,8 @@ export const PERSONA_TOP_LEVEL_KEYS: readonly string[] = [
 ]
 
 /**
- * Keys allowed in a persona entry. `invited` is
- * a known key in both channel modes, as `channels` and `permission_prompts`
- * are; which of them is read depends on the mode (`channelModeOf`).
+ * Keys allowed in a persona entry. Both modes validate the same channels
+ * and required permission destination; removed keys are always rejected.
  */
 export const PERSONA_ENTRY_KEYS: readonly (keyof PersonaInput)[] = [
   'name',
@@ -240,30 +251,18 @@ export const PERSONA_ENTRY_KEYS: readonly (keyof PersonaInput)[] = [
   'channels',
   'dm',
   'permission_prompts',
-  'invited',
   'claude_config_dir',
   'stop_hook_bootstrap',
   'model',
   'effort',
+  'reaction_notices',
 ]
 
 /** Keys allowed in a persona's `dm` object. */
 export const PERSONA_DM_KEYS: readonly (keyof PersonaDmInput)[] = ['enabled', 'contact']
 
-/**
- * Keys allowed in a persona's `invited` object, the fungible section
- * Read only in fungible mode.
- */
-export const PERSONA_INVITED_KEYS: readonly (keyof PersonaInvitedInput)[] = ['permission_prompts']
-
-/**
- * The two channel modes, picked for every persona by the
- * `allow_invited_channels` switch: `declarative` when it is absent or
- * `false` (each persona serves its listed `channels`, with its top-level
- * `permission_prompts` as its destination), `fungible` when it is `true`
- * (each persona's `invited` section is in force).
- */
-export const CHANNEL_MODES = ['declarative', 'fungible'] as const
+/** The server-wide modes share one list and one permission destination. */
+export const CHANNEL_MODES = ['strict', 'open'] as const
 
 /** A channel mode. Read through `channelModeOf`. */
 export type ChannelMode = (typeof CHANNEL_MODES)[number]
@@ -272,7 +271,7 @@ export type ChannelMode = (typeof CHANNEL_MODES)[number]
 export const CHANNEL_ENTRY_KEYS: readonly (keyof ChannelEntryInput)[] = ['id', 'delivery']
 
 /** Allowed channel `delivery` values. */
-export const DELIVERY_MODES = ['all', 'mentions'] as const
+export const DELIVERY_MODES = ['off', 'mentions', 'all', 'thread_hybrid'] as const
 
 /** The `permission_prompts` value that sends prompts and notices by DM to `dm.contact`. */
 export const DM_DESTINATION = 'dm'
@@ -384,10 +383,9 @@ export interface ServerSettingsInput {
    */
   cron_log_max_bytes?: number
   /**
-   * The channel-mode switch: `true` turns fungible mode on for
-   * every persona; absent or `false` is declarative mode. Must be a boolean.
+   * Server-wide strict/open mode; defaults to strict. Both use the shared list.
    */
-  allow_invited_channels?: boolean
+  channel_mode?: ChannelMode
 }
 
 /**
@@ -441,10 +439,9 @@ export interface ServerSettings {
    */
   cron_log_max_bytes?: number
   /**
-   * The channel-mode switch. Defaults to false (declarative
-   * mode); absent and `false` resolve alike. Read through `channelModeOf`.
+   * Applied strict/open mode. Read through channelModeOf; defaults to strict.
    */
-  allow_invited_channels: boolean
+  channel_mode: ChannelMode
   /**
    * Test-only timer overrides: present only when the file has the
    * block. Read once at server start (`installTestTimerOverrides`); a
@@ -453,6 +450,10 @@ export interface ServerSettings {
   test_timer_overrides?: TestTimerOverrides
   /** test-only, captured at startup and never applied by reload. */
   test_mcp_drop_endpoint?: boolean
+  /** test-only, captured at startup and never applied by reload. */
+  test_measurements?: boolean
+  /** test-only, captured at startup and never applied by reload. */
+  test_measurement_timings?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -483,15 +484,6 @@ export interface PersonaDmInput {
   contact?: string
 }
 
-/** A persona's `invited` object as written in the file: the fungible section. */
-export interface PersonaInvitedInput {
-  /**
-   * The persona's destination in fungible mode: `dm` or a Slack channel ID
-   * (`CHANNEL_ID_RE`). Defaults to `dm`.
-   */
-  permission_prompts?: string
-}
-
 /** A persona entry as written in the file. */
 export interface PersonaInput {
   /** Persona identity: a non-empty string with no format rule. */
@@ -500,17 +492,11 @@ export interface PersonaInput {
   credentials_file: string
   /** The instance's working directory: absolute, `~` or `~/…`. */
   working_directory: string
-  /** Declarative mode: channels the persona is in. Defaults to none. Not read in fungible mode. */
+  /** Shared per-channel preferences in either mode. Defaults to an empty list. */
   channels?: ChannelEntryInput[]
   dm?: PersonaDmInput
-  /**
-   * Declarative mode: destination of prompts and notices, `dm` or one of the
-   * persona's channel IDs; required in declarative mode. Not read in fungible
-   * mode.
-   */
-  permission_prompts?: string
-  /** Fungible mode: the fungible section. Not read in declarative mode. */
-  invited?: PersonaInvitedInput
+  /** Required common destination: dm or one of the listed channel IDs. */
+  permission_prompts: string
   /** Per-persona Claude config dir: absolute, `~` or `~/…`. Defaults to the top-level value. */
   claude_config_dir?: string
   /** Per-persona reply reminder flag (legacy setting name). Defaults to the top-level value. */
@@ -519,6 +505,8 @@ export interface PersonaInput {
   model?: string
   /** The persona's effort level (`EFFORT_LEVELS`): per persona only, with no top-level value and no default. */
   effort?: EffortLevel
+  /** Whether the persona receives Reaction Notices, in both modes: per persona only, with no top-level value. Defaults to `true`. */
+  reaction_notices?: boolean
 }
 
 /** The persona configuration file as parsed from disk. */
@@ -547,18 +535,6 @@ export interface PersonaDm {
   contact?: string
 }
 
-/**
- * The JSON values of a persona entry's `channels`, `permission_prompts` and
- * `invited` as written, each undefined when absent. Never
- * validated or resolved: only the reload plan reads them, to tell whether a
- * section changed.
- */
-export interface PersonaSections {
-  channels: unknown
-  permission_prompts: unknown
-  invited: unknown
-}
-
 /** A resolved persona with defaults applied and settings inherited. */
 export interface Persona {
   /** Position of the entry in the file's `personas` array, for `personas[i]` in diagnostics. */
@@ -570,23 +546,11 @@ export interface Persona {
   credentials_file: string
   /** Absolute, tilde-expanded path. Not checked for existence at load time. */
   working_directory: string
-  /** Declarative mode: empty when the file lists none. Fungible mode: always empty, never parsed. */
+  /** The shared applied channel list, including explicit off entries. */
   channels: ChannelEntry[]
   dm: PersonaDm
-  /**
-   * Declarative mode: `dm` or one of `channels`' IDs. Fungible mode:
-   * undefined, never parsed. Read for a destination only through the one
-   * destination rule (`personaDestinationOf`).
-   */
-  permission_prompts: string | undefined
-  /**
-   * Fungible mode: the resolved `invited.permission_prompts`, `dm` when it is
-   * absent. Declarative mode: undefined. Read for a
-   * destination only through the one destination rule.
-   */
-  fungible_destination: string | undefined
-  /** The three section keys as written, in both modes; read only by the reload plan. */
-  sections: PersonaSections
+  /** Required prompt/notice destination, shared by both modes. */
+  permission_prompts: string
   /**
    * Effective Claude config dir: the per-persona value, else the top-level
    * value, else absent (Claude's own default applies). Absolute.
@@ -598,6 +562,8 @@ export interface Persona {
   model?: string
   /** The persona's own `effort`; absent when unset. Never inherited. */
   effort?: EffortLevel
+  /** The persona's own `reaction_notices`, `true` when unset. Never inherited. */
+  reaction_notices: boolean
 }
 
 /** Validated, fully-resolved persona configuration. */
@@ -639,16 +605,9 @@ export function agentDirectorCallTimeoutMsOf(config: ServerSettings | null | und
   return config?.agent_director_call_timeout_ms ?? DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS
 }
 
-/**
- * The channel mode of `config`: `fungible` when its
- * `allow_invited_channels` is `true`, else `declarative`. With no
- * configuration (before the server's start resolves): `declarative`. Every
- * consumer of the mode reads it through this, from the configuration in
- * effect when it acts (the reload plan also from the candidate), never from
- * a copy taken earlier. Pure; does not mutate the input.
- */
-export function channelModeOf(config: Pick<ServerSettings, 'allow_invited_channels'> | null | undefined): ChannelMode {
-  return config?.allow_invited_channels === true ? 'fungible' : 'declarative'
+/** Read the applied mode. Before configuration resolves, use strict. */
+export function channelModeOf(config: Pick<ServerSettings, 'channel_mode'> | null | undefined): ChannelMode {
+  return config?.channel_mode ?? 'strict'
 }
 
 // ---------------------------------------------------------------------------
@@ -693,14 +652,20 @@ function applyServerDefaults(input: ServerSettingsInput, configDir: string, cron
     cron_log_path: input.cron_log_path ?? resolve(configDir, CRON_LOG_FILE_NAME),
     cron_log_max_bytes: input.cron_log_max_bytes,
     // Only an absent switch takes the default: any other value, `null`
-    // included, is kept so the switch's boolean rule rejects it.
-    allow_invited_channels: input.allow_invited_channels === undefined ? false : input.allow_invited_channels,
+    // included, is kept so validation rejects it.
+    channel_mode: input.channel_mode === undefined ? 'strict' : input.channel_mode,
     // present only when the file has the block (any value, `null`
     // included, is kept so its rule rejects it). Not a documented key, so it
     // is not in `ServerSettingsInput`.
     ...(testTimerOverridesOf(input) === undefined ? {} : { test_timer_overrides: testTimerOverridesOf(input) }),
     ...((input as { test_mcp_drop_endpoint?: boolean }).test_mcp_drop_endpoint === undefined ? {} : {
       test_mcp_drop_endpoint: (input as { test_mcp_drop_endpoint?: boolean }).test_mcp_drop_endpoint,
+    }),
+    ...((input as { test_measurements?: boolean }).test_measurements === undefined ? {} : {
+      test_measurements: (input as { test_measurements?: boolean }).test_measurements,
+    }),
+    ...((input as { test_measurement_timings?: boolean }).test_measurement_timings === undefined ? {} : {
+      test_measurement_timings: (input as { test_measurement_timings?: boolean }).test_measurement_timings,
     }),
   }
 }
@@ -871,9 +836,8 @@ export function resolveRealPathStrict(path: string, fs?: Partial<StrictRealPathF
  * The current file is read tolerantly and not validated, so a file with an
  * invalid edit still protects the paths it names. It is read through
  * `readPersonaConfigBytes`, so a path that is not a regular file (a FIFO or a
- * device) is never read. It reads without the 64 KiB cap (`uncapped`, as the
- * retired-key record's start read and the stored-choice file's start read do,
- *): a configuration file larger than `MAX_RELOAD_FILE_BYTES`
+ * device) is never read. It reads without the 64 KiB cap (`uncapped`), so
+ * a configuration file larger than `MAX_RELOAD_FILE_BYTES`
  * still protects the paths it names, so the cap never shrinks what the guard
  * refuses. An unreadable or non-regular file, unparseable JSON, or a file
  * without a `personas` array contributes nothing; this never throws. The
@@ -1177,7 +1141,7 @@ export function describeUnknownKeys(keys: readonly string[]): string {
 // ---------------------------------------------------------------------------
 
 /** Lookup form of PERSONA_TOP_LEVEL_KEYS. */
-const PERSONA_TOP_LEVEL_KEY_SET: ReadonlySet<string> = new Set([...PERSONA_TOP_LEVEL_KEYS, TEST_TIMER_OVERRIDES_KEY, TEST_MCP_DROP_ENDPOINT_KEY])
+const PERSONA_TOP_LEVEL_KEY_SET: ReadonlySet<string> = new Set([...PERSONA_TOP_LEVEL_KEYS, TEST_TIMER_OVERRIDES_KEY, TEST_MCP_DROP_ENDPOINT_KEY, TEST_MEASUREMENTS_KEY, TEST_MEASUREMENT_TIMINGS_KEY])
 
 /**
  * Top-level path settings that today's resolution expands without a type
@@ -1248,9 +1212,11 @@ function validatePersonaServerSettings(settings: PersonaServerSettings): void {
   checkOptionalNonEmptyString(settings.ack_reaction, 'ack_reaction', style)
   checkOptionalPositiveInteger(settings.reply_chunk_limit, 'reply_chunk_limit', style)
   checkAllowedValue(settings.reply_chunk_mode, 'reply_chunk_mode', REPLY_CHUNK_MODES, style)
-  checkBoolean(settings.allow_invited_channels, 'allow_invited_channels', style)
+  checkAllowedValue(settings.channel_mode, 'channel_mode', CHANNEL_MODES, style)
   validateTestTimerOverrides(settings.test_timer_overrides, style)
   if (settings.test_mcp_drop_endpoint !== undefined) checkBoolean(settings.test_mcp_drop_endpoint, TEST_MCP_DROP_ENDPOINT_KEY, style)
+  if (settings.test_measurements !== undefined) checkBoolean(settings.test_measurements, TEST_MEASUREMENTS_KEY, style)
+  if (settings.test_measurement_timings !== undefined) checkBoolean(settings.test_measurement_timings, TEST_MEASUREMENT_TIMINGS_KEY, style)
 }
 
 // ---------------------------------------------------------------------------
@@ -1295,28 +1261,14 @@ function rejectUnknownEntryKeys(
   if (unknown.length > 0) throw ruleError(style, `unknown field(s) in ${where}: ${describeUnknownKeys(unknown)}.`)
 }
 
-/**
- * Stage 1 of an entry: unknown keys of the entry and the shape of the `dm`
- * object, then the section in force. Declarative
- * mode: the shape of the `channels` array and its entries, as
- * and give it; `invited` is not looked at. Fungible mode: the shape of
- * the `invited` object; `channels` is not looked at. Unknown keys are
- * rejected at every level checked (key names only, and only those safe to
- * echo: `describeUnknownKeys`).
- */
-function checkPersonaEntryShape(entry: Record<string, unknown>, mode: ChannelMode, style: RuleStyle): void {
+/** Validate every shared persona, DM and channel shape in either mode. */
+function checkPersonaEntryShape(entry: Record<string, unknown>, style: RuleStyle): void {
+  if (Object.hasOwn(entry, 'invited')) throw ruleError(style, 'invited has been removed; use permission_prompts.')
   rejectUnknownEntryKeys(entry, PERSONA_ENTRY_KEYS, 'the persona entry', style)
   const dm = entry['dm']
   if (dm !== undefined) {
     if (!isJsonObject(dm)) throw ruleError(style, `dm must be a JSON object, got ${jsonTypeName(dm)}.`)
     rejectUnknownEntryKeys(dm, PERSONA_DM_KEYS, 'dm', style)
-  }
-  if (mode === 'fungible') {
-    const invited = entry['invited']
-    if (invited === undefined) return
-    if (!isJsonObject(invited)) throw ruleError(style, `invited must be a JSON object, got ${jsonTypeName(invited)}.`)
-    rejectUnknownEntryKeys(invited, PERSONA_INVITED_KEYS, 'invited', style)
-    return
   }
   const channels = entry['channels']
   if (channels === undefined) return
@@ -1388,64 +1340,20 @@ function parsePermissionPrompts(value: unknown, style: RuleStyle): string {
   throw ruleError(style, `permission_prompts must be "${DM_DESTINATION}" or a Slack channel ID matching ${CHANNEL_ID_RE.source}.`)
 }
 
-/** The setting that names a persona's destination in fungible mode. */
-const INVITED_PERMISSION_PROMPTS = 'invited.permission_prompts'
-
-/**
- * The fungible destination: `invited.permission_prompts`,
- * `dm` or a Slack channel ID, or `dm` when `invited` or its key is absent.
- * The shape of `invited` is already checked in stage 1.
- */
-function parseFungibleDestination(invited: Record<string, unknown> | undefined, style: RuleStyle): string {
-  const value = invited?.['permission_prompts']
-  if (value === undefined) return DM_DESTINATION
-  if (value === DM_DESTINATION || (typeof value === 'string' && CHANNEL_ID_RE.test(value))) return value
-  throw ruleError(
-    style,
-    `${INVITED_PERMISSION_PROMPTS} must be "${DM_DESTINATION}" or a Slack channel ID matching ${CHANNEL_ID_RE.source}.`,
-  )
-}
-
-/**
- * Stage 3 of an entry in fungible mode: the fungible destination rule
- * A `dm` destination, written or by default, needs
- * `dm.contact` set and `dm.enabled` true; the error names
- * `invited.permission_prompts`, says whether `dm` is its default, and names
- * each missing setting (both when both are missing). A channel destination
- * needs no listing and no DMs, and no rule asks for a way to receive.
- */
-function checkFungibleDestination(destination: string, written: boolean, dm: PersonaDm, style: RuleStyle): void {
-  if (destination !== DM_DESTINATION) return
-  const problems: string[] = []
-  if (dm.contact === undefined) problems.push('dm.contact is not set')
-  if (!dm.enabled) problems.push('dm.enabled is not true')
-  if (problems.length === 0) return
-  const what = written
-    ? `${INVITED_PERMISSION_PROMPTS} is "${DM_DESTINATION}"`
-    : `${INVITED_PERMISSION_PROMPTS} is not set, so it is "${DM_DESTINATION}" by default,`
-  throw ruleError(style, `${what} but ${problems.join(' and ')}.`)
-}
-
-/**
- * Stage 3 of an entry in declarative mode: the cross-setting rules of the contract
- * Zero channels
- * with DMs off comes first: every destination would otherwise fail one of the
- * later rules, so could never be reported. Then a channel destination
- * not among `channels`, then a `dm` destination without `dm.contact` or with
- * `dm.enabled` not true (both named when both are wrong). Values named here
- * (channel IDs) have already passed their format rule.
- */
+/** Submitted input must have a receiving scope and a listed destination.
+ * Applied state may instead carry verified removal or choice-reset evidence. */
 function checkPersonaCrossSettings(
   { destination, channels, dm }: { destination: string; channels: readonly ChannelEntry[]; dm: PersonaDm },
   style: RuleStyle,
+  trustedMissingDestination = false,
 ): void {
-  if (channels.length === 0 && !dm.enabled) {
+  if (!trustedMissingDestination && channels.length === 0 && !dm.enabled) {
     throw ruleError(
       style,
       'the persona has no channels and dm.enabled is not true, so it can receive no messages. Add a channel or set dm.enabled to true.',
     )
   }
-  if (destination !== DM_DESTINATION && !channels.some((channel) => channel.id === destination)) {
+  if (!trustedMissingDestination && destination !== DM_DESTINATION && !channels.some((channel) => channel.id === destination)) {
     throw ruleError(style, `permission_prompts names channel ${destination}, which is not in the persona's channels.`)
   }
   if (destination === DM_DESTINATION) {
@@ -1458,67 +1366,20 @@ function checkPersonaCrossSettings(
   }
 }
 
-/**
- * The section in force of one persona entry, parsed and checked by the
- * channel mode: the resolved `channels`,
- * `permission_prompts` and `fungible_destination`. The section not in force
- * is never looked at.
- */
-type ResolvedSection = Pick<Persona, 'channels' | 'permission_prompts' | 'fungible_destination'>
-
-/**
- * Parse, default and validate one persona entry by the channel mode `mode`
- * (and the per-entry rules of the contract, as
- * and give them per mode), throwing on the first violation.
- *
- * Check order, so "first violation" is reproducible. Declarative mode
- *
- *   0. the entry is a JSON object;
- *   1. shape and unknown keys: persona entry, `dm`, `channels` and each
- *      channel entry (stage 1);
- *   2. types and formats, in this order: `name` (required, a non-empty
- *      string), `credentials_file`,
- *      `working_directory`, `claude_config_dir`, `stop_hook_bootstrap`,
- *      `model`, `effort`,
- *      `channels` (in array order: `id`, `delivery`, duplicate ID), `dm.enabled`,
- *      `dm.contact`, `permission_prompts` (required);
- *   3. cross-setting rules (see `checkPersonaCrossSettings`): zero channels
- *      with `dm.enabled` not true, then a destination channel not among
- *      `channels`, then a `dm` destination without `dm.contact` / with
- *      `dm.enabled` not true.
- * `invited` is neither checked nor read, whatever its type or content.
- *
- * Fungible mode:
- *   0. the entry is a JSON object;
- *   1. shape and unknown keys: persona entry, `dm` and `invited` (stage 1);
- *   2. types and formats, in this order: `name`, `credentials_file`,
- *      `working_directory`, `claude_config_dir`, `stop_hook_bootstrap`,
- *      `model`, `effort`, `dm.enabled`, `dm.contact`,
- *      `invited.permission_prompts`;
- *   3. the fungible destination rule (see `checkFungibleDestination`).
- * `channels` and the top-level `permission_prompts` are neither checked nor
- * read, whatever their type or content: the resolved `channels` is empty and
- * `permission_prompts` undefined.
- *
- * In both modes `sections` holds the three section keys as written.
- *
- * Errors name `personas[i]` and, when the name is a non-empty string, the
- * persona reference, plus the setting's key path; they never echo a rejected
- * value.
- * Pure: no file-system access, and the OS home is never read (`home` is given).
- */
+/** Parse the shared channels, DMs and required destination for one persona. Trusted removal provenance comes only from the recovered authority, never submitted JSON. Errors identify settings without echoing rejected values. */
 function parsePersonaEntry(
   raw: unknown,
   index: number,
   inherited: InheritedPersonaSettings,
-  mode: ChannelMode,
   home: string,
+  removedDestination?: (persona: Pick<Persona, 'name' | 'key' | 'credentials_file' | 'working_directory' | 'permission_prompts'>) => boolean,
+  resetDestination?: (persona: Pick<Persona, 'name' | 'key' | 'credentials_file' | 'working_directory' | 'permission_prompts'>) => boolean,
 ): Persona {
   if (!isJsonObject(raw)) {
     throw ruleError(PERSONA_RULE_STYLE, `personas[${index}] must be a JSON object, got ${jsonTypeName(raw)}.`)
   }
   const style = personaEntryStyle(raw['name'], index)
-  checkPersonaEntryShape(raw, mode, style)
+  checkPersonaEntryShape(raw, style)
 
   const name = raw['name']
   if (name === undefined) throw ruleError(style, 'name is required.')
@@ -1538,21 +1399,14 @@ function parsePersonaEntry(
   }
   const effort = raw['effort']
   if (effort !== undefined) checkAllowedValue(effort, 'effort', EFFORT_LEVELS, style)
-  let section: ResolvedSection
-  let dm: PersonaDm
-  if (mode === 'fungible') {
-    dm = parseDm(raw['dm'] as Record<string, unknown> | undefined, style)
-    const invited = raw['invited'] as Record<string, unknown> | undefined
-    const fungible_destination = parseFungibleDestination(invited, style)
-    checkFungibleDestination(fungible_destination, invited?.['permission_prompts'] !== undefined, dm, style)
-    section = { channels: [], permission_prompts: undefined, fungible_destination }
-  } else {
-    const channels = parseChannels((raw['channels'] as Record<string, unknown>[] | undefined) ?? [], style)
-    dm = parseDm(raw['dm'] as Record<string, unknown> | undefined, style)
-    const permission_prompts = parsePermissionPrompts(raw['permission_prompts'], style)
-    checkPersonaCrossSettings({ destination: permission_prompts, channels, dm }, style)
-    section = { channels, permission_prompts, fungible_destination: undefined }
-  }
+  const ownReactionNotices = raw['reaction_notices']
+  if (ownReactionNotices !== undefined) checkBoolean(ownReactionNotices, 'reaction_notices', style)
+  const channels = parseChannels((raw['channels'] as Record<string, unknown>[] | undefined) ?? [], style)
+  const dm = parseDm(raw['dm'] as Record<string, unknown> | undefined, style)
+  const permission_prompts = parsePermissionPrompts(raw['permission_prompts'], style)
+  const destinationDeclaration = { name, key: personaKey(name), credentials_file, working_directory, permission_prompts }
+  const trustedMissingDestination = removedDestination?.(destinationDeclaration) === true || resetDestination?.(destinationDeclaration) === true
+  checkPersonaCrossSettings({ destination: permission_prompts, channels, dm }, style, trustedMissingDestination)
 
   return {
     index,
@@ -1560,19 +1414,14 @@ function parsePersonaEntry(
     key: personaKey(name),
     credentials_file,
     working_directory,
-    channels: section.channels,
+    channels,
     dm,
-    permission_prompts: section.permission_prompts,
-    fungible_destination: section.fungible_destination,
-    sections: {
-      channels: raw['channels'],
-      permission_prompts: raw['permission_prompts'],
-      invited: raw['invited'],
-    },
+    permission_prompts,
     ...(claude_config_dir !== undefined ? { claude_config_dir } : {}),
     stop_hook_bootstrap: (ownStopHook as boolean | undefined) ?? inherited.stop_hook_bootstrap,
     ...(model !== undefined ? { model } : {}),
     ...(effort !== undefined ? { effort: effort as EffortLevel } : {}),
+    reaction_notices: (ownReactionNotices as boolean | undefined) ?? true,
   }
 }
 
@@ -1815,6 +1664,11 @@ function checkRealPathCollisions(personas: readonly Persona[]): void {
 
 /** How `resolvePersonaConfig` validates. */
 export interface ResolvePersonaConfigOptions {
+  /** Trusted applied-state provenance only; never read from submitted JSON. */
+  removedDestination?: (persona: Pick<Persona, 'name' | 'key' | 'credentials_file' | 'working_directory' | 'permission_prompts'>) => boolean
+  /** Only the shared authority's applied projection supplies reset evidence.
+   * Never pass this when validating submitted input or reviewed source. */
+  resetDestination?: (persona: Pick<Persona, 'name' | 'key' | 'credentials_file' | 'working_directory' | 'permission_prompts'>) => boolean
   /**
    * Record mode (record-start part): validate a start's
    * `config.json.last-applied`. Skips only the real-path collision step
@@ -1851,7 +1705,7 @@ export interface ResolvePersonaConfigOptions {
  *   3. unknown top-level keys (key names only, and only plain setting names:
  * `describeUnknownKeys`; the rename message);
  *   4. `personas` present and an array (it may be empty);
- * 5. server-wide settings defaulted and validated, the `allow_invited_channels` switch among them;
+ * 5. server-wide settings defaulted and validated, including `channel_mode`;
  *   6. each persona entry in array order, by the rules of the channel mode
  *      this configuration's own switch picks (see `parsePersonaEntry`;
  * to), inheriting the resolved top-level
@@ -1897,6 +1751,7 @@ export function resolvePersonaConfig(
   for (const key of PRE_PERSONA_KEYS) {
     if (Object.hasOwn(raw, key)) throw ruleError(style, prePersonaConversionMessage(key))
   }
+  if (Object.hasOwn(raw, 'allow_invited_channels')) throw ruleError(style, 'allow_invited_channels has been removed; use channel_mode.')
   rejectUnknownTopLevelKeys(raw, PERSONA_TOP_LEVEL_KEY_SET, style)
 
   const entries = raw['personas']
@@ -1912,8 +1767,7 @@ export function resolvePersonaConfig(
     claude_config_dir: settings.claude_config_dir,
     stop_hook_bootstrap: settings.stop_hook_bootstrap,
   }
-  const mode = channelModeOf(settings)
-  const personas = entries.map((entry: unknown, index) => parsePersonaEntry(entry, index, inherited, mode, home))
+  const personas = entries.map((entry: unknown, index) => parsePersonaEntry(entry, index, inherited, home, options.removedDestination, options.resetDestination))
 
   // Cross-persona rules, only once every entry has parsed so
   // per-entry violations are reported first.
@@ -1933,7 +1787,7 @@ export function resolvePersonaConfig(
  * otherwise `<XDG config dir>/claude-slack-channel-bots` (`resolveXdgConfigHome`), so
  * `~/.config/claude-slack-channel-bots` unless `XDG_CONFIG_HOME` names another directory.
  * `config.json`, its `.pending`, `.apply` and `.last-applied` files,
- * `channel-delivery.json`, the logs, the PID file and the crontable all live
+ * the logs, the PID file and the crontable all live
  * here. The default sits outside `~/.claude` because
  * Claude Code asks the user before every write under `.claude`, which stalled
  * every unattended configuration change by an agent. Releases up to 0.13
@@ -2031,25 +1885,7 @@ export function resolveServerConfigPath(home?: string, env: NodeJS.ProcessEnv = 
  */
 export const CONFIG_NOT_REGULAR_FILE_CODE = 'not a regular file'
 
-/**
- * The largest file the shared readers read, in bytes (64 KiB): the persona
- * configuration file, the last-applied record, `config.json.pending` and
- * `config.json.apply` (`readPersonaConfigBytes`), and a credentials file
- * (`readCredentialsFile` in `persona-credentials.ts`). A larger file is
- * refused as unreadable and never read past `MAX_RELOAD_FILE_BYTES + 1`
- * bytes. No legitimate capped file comes near it; the cap bounds the memory
- * and hashing work a file grown by mistake could cost. Applied in the readers
- * rather than by one caller, so the start, the bring-up and the reload tick
- * see the same outcome (and the same credentials digest marker) for one file.
- * Three reads are exempt (`readPersonaConfigBytes` with `uncapped`): the
- * file guard's read of the configuration file (`credentialsFilesToProtect`);
- * the start's read of the retired-key record (`loadRetiredKeyStore` in
- * `retired-keys.ts`), a file only the server writes that can legitimately
- * grow past the cap, read once at start and never hashed or compared; and
- * the start's read of the stored-choice file (`loadChannelDeliveryStore` in
- * `src/channel-delivery.ts`), likewise written only by the
- * server, read once at start, and parsed only, never hashed or compared.
- */
+/** The credential reader's independent 64 KiB safety limit. Configuration, authority, preview and confirmation reads have no product size cap. */
 export const MAX_RELOAD_FILE_BYTES = 64 * 1024
 
 /** `MAX_RELOAD_FILE_BYTES` as worded in messages: `64 KiB`. */
@@ -2119,11 +1955,12 @@ export interface PersonaConfigFs {
   openFile(path: string): number
   /**
    * Stat an open descriptor. `size` is the file's size in bytes; the reader
-   * refuses a file larger than `MAX_RELOAD_FILE_BYTES` before reading it. An
-   * override may omit `size`: the bounded read (`readFileFd`) enforces the
-   * limit either way. Throws an errno-style error (with `code`) on failure.
+   * compares descriptor metadata before and after reading. Only callers
+   * selecting the bounded policy refuse sizes above `MAX_RELOAD_FILE_BYTES`.
+   * An override may omit `size`; the bounded read still enforces its limit.
+   * Throws an errno-style error (with `code`) on failure.
    */
-  fstatFile(fd: number): { isFile(): boolean; isDirectory(): boolean; size?: number }
+  fstatFile(fd: number): { isFile(): boolean; isDirectory(): boolean; size?: number; mtimeMs?: number; ctimeMs?: number; ino?: number; dev?: number }
   /**
    * Read at most `maxBytes` bytes from the start of the file behind an open
    * descriptor (`readFdAtMost`). The reader asks for one byte more than the
@@ -2140,17 +1977,9 @@ export interface PersonaConfigFs {
   closeFile(fd: number): void
 }
 
-/** How `readPersonaConfigBytes` reads. */
+/** Read policy for regular files. Configuration reads are complete by default; an explicit uncapped:false selects the independent bounded policy. */
 export interface ReadPersonaConfigBytesOptions {
-  /**
-   * Read the whole file, with no `MAX_RELOAD_FILE_BYTES` cap. Queue journals also read in full. Only three configuration reads
-   * set it: the file guard's read (`credentialsFilesToProtect`), the
-   * start's read of the retired-key record (`loadRetiredKeyStore`), and the
-   * start's read of the stored-choice file (`loadChannelDeliveryStore` in
-   * `src/channel-delivery.ts`); every other caller is capped.
-   * Stat-first applies all the same: a directory or a non-regular file is
-   * refused and never read.
-   */
+  /** Full read by default; stat-first and changing-file protection apply in either policy. */
   uncapped?: boolean
 }
 
@@ -2214,62 +2043,24 @@ export function parsePersonaConfigBytes(
   configDir: string,
   options: ParsePersonaConfigBytesOptions = {},
 ): PersonaConfig {
-  const text = typeof bytes === 'string' ? bytes : Buffer.from(bytes).toString('utf-8')
-
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(text)
-  } catch {
-    throw new Error(malformedJsonMessage(text, source))
-  }
+  const parsed = parseConfigJsonBytes(bytes, source)
 
   try {
-    return resolvePersonaConfig(parsed, configDir, options.home, { record: options.record, env: options.env })
+    return resolvePersonaConfig(parsed, configDir, options.home, { record: options.record, env: options.env, removedDestination: options.removedDestination, resetDestination: options.resetDestination })
   } catch (err) {
     const cause = err instanceof Error ? err.message : String(err)
     throw new Error(`loadPersonaConfig: invalid persona config in "${source}": ${cause}`)
   }
 }
 
-/**
- * Read a persona configuration file's bytes once. A read failure is a
- * `PersonaConfigReadError` naming the path, with the errno code when the
- * error carried a safe one.
- *
- * Stat-first, as `checkPersonaCredentials` reads a credentials file: the file
- * is opened once, read-only and non-blocking, its descriptor is stat'ed, and
- * only a regular file is read, through the same descriptor (so the file
- * checked is the file read). A directory fails with `EISDIR`; any other
- * non-regular file (a FIFO, socket or device, after following symlinks) fails
- * with `CONFIG_NOT_REGULAR_FILE_CODE` and is never read: a FIFO would block
- * the read forever and a device such as `/dev/zero` would never end.
- *
- * Size cap: a regular file larger than `MAX_RELOAD_FILE_BYTES` (64 KiB) fails
- * with `FILE_TOO_LARGE_CODE`, worded "larger than the 64 KiB limit" and
- * carrying no file content. It is refused on the stat's size before any read,
- * and the read itself is bounded (at most `MAX_RELOAD_FILE_BYTES + 1` bytes),
- * so a file that grows after the stat, or a stat that under-reports, is still
- * refused and never read in full.
- *
- * The exception is `options.uncapped`, which reads the whole file with no size
- * limit (stat-first applies). Three reads set it: the file guard
- * (`credentialsFilesToProtect`), which must never protect fewer credentials
- * files because the configuration file grew past the cap; the start's read
- * of the retired-key record (`loadRetiredKeyStore` in `retired-keys.ts`), a
- * file only the server writes, which grows with every retired key until a
- * clear or a restore removes it, is read once at start and is never hashed or
- * compared, so a record past the cap is still one the server wrote and must
- * not stop the start; and the start's read of the stored-choice file
- * (`loadChannelDeliveryStore` in `src/channel-delivery.ts`),
- * which only the server writes, which is read once at start, and whose bytes
- * are parsed only, never hashed or compared. Every other caller (the start's
- * configuration file, the last-applied record, the pending and apply files,
- * the reload tick) is capped.
- *
- * @param configPath  Absolute path of the file.
- * @param fs          File-system overrides; unset operations use `DEFAULT_PERSONA_CONFIG_FS`.
- * @param options `uncapped` for the file guard's, the retired-key record's and the stored-choice file's reads only.
- */
+/** Parse JSON with a position-only diagnostic; parser errors may contain secrets. */
+export function parseConfigJsonBytes(bytes: Uint8Array | string, source: string): unknown {
+  const text = typeof bytes === 'string' ? bytes : Buffer.from(bytes).toString('utf-8')
+  try { return JSON.parse(text) }
+  catch { throw new Error(malformedJsonMessage(text, source)) }
+}
+
+/** Read a complete stable regular file through its checked descriptor. Non-blocking open and fstat reject directories/devices/FIFOs; a second fstat detects changes during reading. Configuration, baseline, preview and confirmation have no size cap. Credentials retain their separately enforced bounded reader. */
 export function readPersonaConfigBytes(
   configPath: string,
   fs?: Partial<PersonaConfigFs>,
@@ -2278,7 +2069,10 @@ export function readPersonaConfigBytes(
   const io: PersonaConfigFs = { ...DEFAULT_PERSONA_CONFIG_FS, ...fs }
   const failure = (cause: string, code: string | undefined) =>
     new PersonaConfigReadError(`loadPersonaConfig: cannot read persona config at "${configPath}": ${cause}`, code)
-  const errnoFailure = (err: unknown) => failure(err instanceof Error ? err.message : String(err), readErrnoCode(err))
+  const errnoFailure = (err: unknown) => {
+    const code = readErrnoCode(err)
+    return failure(code === undefined ? 'file operation failed' : `file operation failed (${code})`, code)
+  }
   const tooLarge = () => failure(`it is larger than the ${MAX_RELOAD_FILE_SIZE_TEXT} limit`, FILE_TOO_LARGE_CODE)
 
   let fd: number
@@ -2296,7 +2090,7 @@ export function readPersonaConfigBytes(
     }
     if (stats.isDirectory()) throw failure('it is a directory', 'EISDIR')
     if (!stats.isFile()) throw failure(`it is ${CONFIG_NOT_REGULAR_FILE_CODE}`, CONFIG_NOT_REGULAR_FILE_CODE)
-    const uncapped = options.uncapped === true
+    const uncapped = options.uncapped !== false
     if (!uncapped && typeof stats.size === 'number' && stats.size > MAX_RELOAD_FILE_BYTES) throw tooLarge()
     let bytes: Buffer
     try {
@@ -2305,6 +2099,16 @@ export function readPersonaConfigBytes(
       throw errnoFailure(err)
     }
     if (!uncapped && bytes.length > MAX_RELOAD_FILE_BYTES) throw tooLarge()
+    let after: ReturnType<PersonaConfigFs['fstatFile']>
+    try {
+      after = io.fstatFile(fd)
+    } catch (err) {
+      throw errnoFailure(err)
+    }
+    if (!after.isFile() || (typeof stats.size === 'number' && bytes.length !== stats.size) ||
+        (['size', 'mtimeMs', 'ctimeMs', 'ino', 'dev'] as const).some(key => stats[key] !== undefined && after[key] !== stats[key])) {
+      throw failure('it changed while being read; retry with a stable regular file', 'EAGAIN')
+    }
     return bytes
   } finally {
     try {

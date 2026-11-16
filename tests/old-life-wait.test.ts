@@ -812,7 +812,7 @@ describe('start 1 end to end: a later read of the old row as live with another c
   // the hold is kept and bravo2 is armed. A removal has no persona waiting, so no wait starts.
   test.each<[string, (alpha: PersonaInput, bravo: PersonaInput) => PersonaInput[], string | undefined]>([
     ['a removal of bravo', (alpha) => [alpha], undefined],
-    ['a rename of bravo to bravo2', (alpha, bravo) => [alpha, { ...bravo, name: 'bravo2' }], 'bravo2'],
+    ['a rename of bravo to bravo2', (alpha, bravo) => [alpha, { ...bravo, name: 'bravo2', channels: [{ id: 'C0REVIEWNEW', delivery: 'all' }], permission_prompts: 'C0REVIEWNEW' }], 'bravo2'],
   ])('%s, its teardown kill answering a CONFLICT (the row stays live): the hold on bravo\'s old directory moves to the row\'s cwd, its old key, cause and mark kept, with no line', async (_label, change, waiter) => {
     const r = (rh = makeReloadHarness())
     const alpha = r.persona('alpha')

@@ -1,3 +1,4 @@
+import { parseSharedChannelState } from '../src/shared-channels.ts'
 /**
  * persona-credentials-revoked.test.ts — A bot token revoked while a persona
  * runs, end to end, and its recovery (step 6).
@@ -44,10 +45,12 @@ import { createPersonaSerializer } from '../src/persona-serializer.ts'
 import { stubCallCount } from './test-helpers/agent-director-stub.ts'
 import { REDACTED_SENTINEL_TAIL, assertNoLeak } from './test-helpers/credentials.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
-import { resetRoutingState } from './test-helpers/persona-routing-harness.ts'
+import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
+import { observedMembership, resetRoutingState } from './test-helpers/persona-routing-harness.ts'
 import { makeManagedRouting } from './test-helpers/persona-routing-managed.ts'
 import { makeChannelMessage, type StubSlack } from './test-helpers/slack-stub.ts'
 import { makeReloadHarness, type ReloadHarness, type ReloadRun } from './test-helpers/reload-harness.ts'
+import { makeSharedAuthority, membershipPage } from './test-helpers/shared-channels.ts'
 
 let h: ReloadHarness
 /** The server lines the tool handlers write to `console.error` (a failed tool call's line), for `assertNoLeak`. */
@@ -98,6 +101,9 @@ async function running(): Promise<Running> {
   h.writeRecord({ personas: [alpha, bravo] })
   h.writeConfig({ personas: [alpha, bravo] })
   const run = await h.startDetecting({ realLifecycle: true })
+  for (const persona of [alpha, bravo]) run.stub(persona.name).script.inventory.push(membershipPage([channelOf(persona)]))
+  await run.membershipClock.runNext()
+  for (const persona of [alpha, bravo]) expect(run.membershipScanner.status(h.key(persona.name)).state).toBe('complete')
   await run.ticks.tick()
   expect(h.pendingExists()).toBe(false)
   expect([run.isUp('alpha'), run.isUp('bravo')]).toEqual([true, true])
@@ -169,8 +175,10 @@ async function revokeThroughReact(run: ReloadRun, alpha: PersonaInput): Promise<
  * applies it. Returns the new credential set's stub.
  */
 async function recover(run: ReloadRun, alpha: PersonaInput): Promise<StubSlack> {
-  const { label } = h.rotateCredentials(alpha)
+  const { label } = h.rotateCredentials(alpha, { slack: { appId: 'A0RECOVER', inventory: [membershipPage([channelOf(alpha)])] } })
   await (await run.confirmPending()).applying
+  await run.membershipClock.runNext()
+  expect(run.membershipScanner.status(h.key(alpha.name)).state).toBe('complete')
   return run.credentialsStub('alpha', label)
 }
 
@@ -276,7 +284,7 @@ describe('a Web API call refused with token_revoked marks the persona broken at 
 
     expect(h.pendingExists()).toBe(false)
     expect(run.since(cp).lifecycle).toEqual([])
-    expect(run.since(cp).writes).toEqual([])
+    expect(run.since(cp).writes).toEqual([h.lastAppliedWrite()]) // durable initial observation, no activation
     expect(run.stub('alpha').calls.authTest).toHaveLength(authTests)
     expect(run.isUp('alpha')).toBe(false)
     expect(isCredentialsBroken(run.bringUps.state(a.key))).toBe(true)
@@ -291,6 +299,7 @@ describe('a Web API call refused with token_revoked marks the persona broken at 
 describe('recovery through the confirmed credentials change', () => {
   test('a working file at A’s path is previewed, not applied; once confirmed, step 6’s recovery bring-up brings A up with the new tokens and records its launch, with no reconnect, kill or delete, and admits its MCP registration again; the notice held while broken posts through the new identity only; B is untouched', async () => {
     const { run, alpha, bravo } = await running()
+    const originalConfigBytes = h.readConfig()!
     const a = applied(run, 'alpha')
     const oldStub = run.stub('alpha')
     await revokeThroughReact(run, alpha)
@@ -300,7 +309,7 @@ describe('recovery through the confirmed credentials change', () => {
     const bravoSockets = run.stub('bravo').sockets.length
 
     // The operator places a working file: previewed on the next tick, nothing applied.
-    const { label } = h.rotateCredentials(alpha)
+    const { label } = h.rotateCredentials(alpha, { slack: { appId: 'A0RECOVER', inventory: [membershipPage([channelOf(alpha)])] } })
     const newStub = run.credentialsStub('alpha', label)
     const cp = run.checkpoint()
     await run.ticks.tick()
@@ -336,6 +345,8 @@ describe('recovery through the confirmed credentials change', () => {
     // session-manager.test.ts's collision ladder).
     expect(stubCallCount(run.composition!.agentDirector)).toBe(0)
     expect(run.admitSession('alpha')).toMatchObject({ kind: 'admitted' })
+    await run.membershipClock.runNext()
+    expect(run.membershipScanner.status(a.key).state).toBe('complete')
 
     // A serves again under its new identity only: an event reaches its session, its tool call posts on the new client.
     const text = 'to alpha after the recovery'
@@ -356,7 +367,8 @@ describe('recovery through the confirmed credentials change', () => {
     expect(run.stub('bravo').callLog).toHaveLength(bravoCalls)
     await expectBravoServes(run, bravo, 'after alpha’s recovery')
     expect(h.pendingExists()).toBe(false)
-    expect(h.readRecord()).toEqual(h.readConfig()!)
+    expect(Buffer.from(parseSharedChannelState(h.readRecord()!, h.paths.lastApplied, { home: h.home })!.sourceBytesBase64, 'base64').equals(originalConfigBytes)).toBe(true)
+    expect(h.readConfig()).toEqual(originalConfigBytes)
     expectNoLeak(run, { reply, newStub: newStub.callLog })
   })
 })
@@ -411,6 +423,7 @@ describe('a notice post refused with token_revoked', () => {
 describe('the manager wired with the per-persona serializer, as server.ts wires it', () => {
   let dir: string
   let c: ConnectionHarness | undefined
+  let managed: ReturnType<typeof makeManagedRouting> | undefined
 
   beforeEach(() => {
     dir = realpathSync(mkdtempSync(join(tmpdir(), 'persona-credentials-revoked-')))
@@ -420,6 +433,8 @@ describe('the manager wired with the per-persona serializer, as server.ts wires 
   afterEach(async () => {
     try {
       await c?.manager.stopAll()
+      await managed?.close()
+      managed = undefined
       c = undefined
       resetRoutingState()
     } finally {
@@ -432,7 +447,15 @@ describe('the manager wired with the per-persona serializer, as server.ts wires 
     c = makeConnectionHarness([{ name: 'alpha' }, { name: 'bravo' }], dir, { serialize: serializer.run })
     const [A, B] = [c.p('alpha'), c.p('bravo')]
     for (const p of [A, B]) expect(await c.bringUp(p)).toMatchObject({ state: 'up' })
-    const { routing, logs, queue: notifications } = makeManagedRouting(c, dir)
+    const config = c.config!
+    const store = createChannelDeliveryStore(makeSharedAuthority(dir, {
+      ...config, personas: config.personas.map(({ key, index, ...p }) => p),
+    }))
+    managed = makeManagedRouting(c, dir, {
+      getChannelDelivery: () => store,
+      membership: observedMembership({ [A.key]: [A.channels[0]!.id], [B.key]: [B.channels[0]!.id] }),
+    })
+    const { routing, logs, queue: notifications } = managed
     c.onEvent = createPersonaEventRouter({ routing, clientFor: c.clientFor, getPersona: c.getPersona, log: (line) => void logs.push(line) })
     const socketA = c.stub(A).socket
     const channelA = A.channels[0]!.id
@@ -456,8 +479,12 @@ describe('the manager wired with the per-persona serializer, as server.ts wires 
     await socketA.deliver(makeChannelMessage({ channel: channelA, text: 'to alpha after the revocation' }))
     expect(notifications.items(A.key)).toEqual([])
     expect(logs.filter((line) => line.includes(`persona=${A.key}`))).toEqual([])
-    await c.stub(B).socket.deliver(makeChannelMessage({ channel: channelB, text: 'to bravo' }))
-    expect(notifications.items(B.key)!.map((n) => n.accepted.text)).toEqual(['to bravo'])
+    const toBravo = makeChannelMessage({ channel: channelB, text: 'to bravo' })
+    await c.stub(B).socket.deliver(toBravo)
+    expect(notifications.items(B.key).map(n => ({ channel: n.accepted.channel, ts: n.accepted.ts, key: n.accepted.key, text: n.accepted.text, via: n.accepted.via }))).toEqual([
+      { channel: channelB, ts: toBravo.ts as string, key: { chat_id: channelB, ts: toBravo.ts as string }, text: toBravo.text as string, via: 'receive_all' },
+    ])
+    expect(c.stub(B).socket.acks).toHaveLength(1)
     expect(notifications.items(A.key)).toEqual([])
 
     turn.resolve()

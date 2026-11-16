@@ -8,3 +8,25 @@ export const DELIVERY_MAX_AD_CALLS_PER_S = 4
 export const DELIVERY_ROW_POLL_MS = 1000
 
 export const DELIVERY_STUCK_AFTER_MS = 300000
+
+/**
+ * A Thread Memory lookup: one end-to-end deadline per attempt, covering SDK
+ * queueing, retries and rate-limit waits as well as the HTTP request. No
+ * lookup gets a longer bound than another.
+ */
+export const THREAD_MEMORY_LOOKUP_DEADLINE_MS = 15_000
+/** Retry spacing after a failed or expired lookup attempt: bounded exponential from the minimum. */
+export const THREAD_MEMORY_RETRY_MIN_MS = 5_000
+export const THREAD_MEMORY_RETRY_MAX_MS = 60_000
+/**
+ * Allowance between the host clock and Slack's message timestamps when an
+ * own post's issue time is compared with them: a Post Hold's coverage of a
+ * new channel message, and the range an own-post lookup reads.
+ */
+export const OWN_ROOT_CLOCK_SKEW_MS = 120_000
+/** Longest reply wait for an own post, on the monotonic clock from receipt of the stored delivery. */
+export const THREAD_REPLY_HOLD_MS = 3_000
+/** Bound a Thread Memory loss report, including the notifier's persona prefix. */
+export const THREAD_MEMORY_NOTICE_MAX_CHARS = 4000
+/** Bound shared-state notices; their diagnostics retain the entire channel list. */
+export const SHARED_STATE_NOTICE_MAX_CHANNELS = 20

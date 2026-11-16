@@ -5,15 +5,11 @@
  * A confirmed, valid candidate is applied in six steps; each step completes
  * for every persona before the next starts:
  *
- *   1. record the retired keys of removed personas (a renamed persona's old
- *      key included) and of the old halves of destructive modifies, and the
- *      key of each persona brought up that is held as retired only in
- *      memory, durably, a failure of that write failing the apply with
- * nothing applied; then rewrite the
- *      last-applied record, a failed rewrite applying nothing and removing
- * again the keys this apply recorded; then swap the applied
- * set (the reload controller in `reload.ts` does this
- *      itself);
+ *   1. prepare the retired-key record, then durably apply the shared
+ *      authority. A definite failure restores retirement without stopping
+ *      delivery workers; an unresolved durability outcome preserves evidence.
+ *      Success stops retired workers and publishes the applied configuration
+ *      (`reload.ts` owns this synchronous boundary);
  *   2. teardowns of removed personas (and the old half of a destructive
  *      modify);
  *   3. in-place updates;
@@ -252,7 +248,8 @@ export function applyStepInputs(plan: ValidChangePlan, previous: PersonaConfig, 
 /**
  * Run `operation` for every persona at once (different personas are
  * independent) and settle once all of them settled, never
- * fail-fast: each rejection or throw is reported to `onFailure` with its
+ * fail-fast. `keepGoing` is checked before starting each operation. Each
+ * rejection or throw is reported to `onFailure` with its
  * persona, in `personas` order, and the others still complete. Never rejects
  * (unless `onFailure` throws).
  */
@@ -260,8 +257,11 @@ export async function fanOutPersonas(
   personas: readonly Persona[],
   operation: (persona: Persona) => Promise<unknown>,
   onFailure: (persona: Persona, err: unknown) => void,
+  keepGoing: () => boolean = () => true,
 ): Promise<void> {
-  const settled = await Promise.allSettled(personas.map(async (persona) => operation(persona)))
+  const settled = await Promise.allSettled(personas.map(async (persona) => {
+    if (keepGoing()) return operation(persona)
+  }))
   settled.forEach((result, i) => {
     if (result.status === 'rejected') onFailure(personas[i]!, result.reason)
   })
@@ -327,6 +327,7 @@ export function lifecycleApplySlots(
   members: ApplyLifecycleMembers,
   onFailure: ApplyPersonaFailure,
   credentialsBrokenNow: CredentialsBrokenNowQuery = () => undefined,
+  keepGoing: () => boolean = () => true,
 ): ApplyStepSlots {
   /** Per apply, the keys step 4 reconnected (or tried to): step 6 does not bring them up. */
   const reconnectedAt = new WeakMap<ApplyStepInputs, Set<string>>()
@@ -343,6 +344,7 @@ export function lifecycleApplySlots(
         [...inputs.removed, ...inputs.destructiveOld],
         (persona) => members.teardown(persona),
         (persona, err) => onFailure('teardowns', persona, err),
+        keepGoing,
       ),
     'in-place-updates': async (inputs) => {
       const changes = onePerPersona(inputs.inPlace)
@@ -351,6 +353,7 @@ export function lifecycleApplySlots(
         changes.map((change) => change.persona),
         (persona) => members.updateInPlace(byKey.get(persona.key)!),
         (persona, err) => onFailure('in-place-updates', persona, err),
+        keepGoing,
       )
     },
     'credentials-reconnects': async (inputs) => {
@@ -365,6 +368,7 @@ export function lifecycleApplySlots(
           if (isCredentialsBrokenAtReconnect(result)) reconnected.delete(persona.key)
         },
         (persona, err) => onFailure('credentials-reconnects', persona, err),
+        keepGoing,
       )
     },
     'template-refresh': (inputs) => members.refreshTemplate(inputs.applied),
@@ -385,8 +389,9 @@ export function lifecycleApplySlots(
           [...inputs.added, ...inputs.destructiveNew],
           (persona) => members.bringUp(persona, inputs.applied),
           onBringUpFailure,
+          keepGoing,
         ),
-        fanOutPersonas(recoveries, (persona) => members.bringUp(persona, inputs.applied, { recovery: true }), onBringUpFailure),
+        fanOutPersonas(recoveries, (persona) => members.bringUp(persona, inputs.applied, { recovery: true }), onBringUpFailure, keepGoing),
       ])
     },
   }
@@ -407,7 +412,8 @@ export function applyStepsFor(plan: ValidChangePlan): ApplyStepName[] {
 
 /**
  * Run the bound bodies of `steps` in `APPLY_STEPS` order, each awaited before
- * the next starts. A body that throws or rejects is reported to `onFailure`
+ * the next starts, unless `keepGoing` stops the run. A body that throws or
+ * rejects is reported to `onFailure`
  * and the next step still runs: a step isolates its personas' failures, and
  * a failure it lets through must not stop the later steps. Resolves once the
  * last step settled; never rejects.
@@ -417,14 +423,16 @@ export async function runApplySteps(
   inputs: ApplyStepInputs,
   steps: readonly ApplyStepName[],
   onFailure: (step: ApplyStepName, err: unknown) => void,
+  keepGoing: () => boolean = () => true,
 ): Promise<void> {
   for (const step of APPLY_STEPS) {
     const body = slots[step]
     if (body === undefined || !steps.includes(step)) continue
+    try { if (!keepGoing()) return } catch { return }
     try {
       await body(inputs)
     } catch (err) {
-      onFailure(step, err)
+      try { onFailure(step, err) } catch { /* reporting cannot interrupt durable activation */ }
     }
   }
 }

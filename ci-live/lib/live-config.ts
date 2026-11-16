@@ -1,40 +1,6 @@
-/**
- * live-config.ts — the persona config and system prompt the runner writes in
- * the container, exactly as the setup wizard's answers in testplans/live-acceptance.md
- * Part 1.5 would produce them (A: a-home `all` + coordination `mentions`, DMs
- * off, prompts to a-home; B: coordination `mentions`, DMs on with the human
- * as contact, prompts by DM; C: no channel, DMs on, prompts by DM;
- * `ack_reaction: "eyes"`; the Step 6 Role text), and D's entry for Check 25.
- *
- * The runner writes these instead of running the wizard (a deviation the
- * results' Notes record). The configuration also names the container's
- * crontable (`cron_table_path`, `CONTAINER_CRON_TABLE_PATH`), which the
- * wizard leaves out: the path is the default's (the state
- * directory, `~/.config/claude-slack-channel-bots`, now holds the crontable), written out so the
- * start's default-crontable preparation is not in play. Neither the configuration it writes nor D's entry
- * carries the invited-channel switch or an `invited` section: every check
- * before Check 30 runs with the switch absent.
- *
- * Check 30's switch-on edit (`switchOnFilter`) is a jq filter
- * applied to config.json through the plan's confirmed edit. It sets the
- * switch and gives every persona an `invited.permission_prompts` that keeps
- * the change valid and keeps the persona's destination where it is: A the
- * a-home channel, B and C `"dm"`, and D, only when D is still declared, the
- * d-home channel. A takes a-home, not `"dm"`: its DMs are off after setup and
- * Check 1, and on with no `dm.contact` after Part 7, so `"dm"` would be
- * invalid in either state. The filter handles D's presence itself, so one
- * filter serves both the state setup and Check 1 leave (a targeted run) and
- * the full run's state after Check 28. It changes nothing else: each
- * persona's `channels`, top-level `permission_prompts` and `dm` keep their
- * values. Checks 32 and 33 turn the switch off and on again with an edit of
- * the switch alone (`switchFilter`). The setting names are copies of
- * src/'s (the runner loads no other src/ module), pinned by
- * tests/ci-live-checks.test.ts.
- *
- * Pure: IDs in, JSON or a jq filter out.
- */
+/** Pure producers for the current shared channel configuration used by the live runner. */
 
-import { credentialsFileName, personaName, PERSONA_LETTERS, type PersonaLetter } from './personas.ts'
+import { credentialsFileName, personaName, type PersonaLetter } from './personas.ts'
 
 export interface WorkspaceIds {
   teamId: string
@@ -72,11 +38,9 @@ export interface PersonaEntry {
   name: string
   credentials_file: string
   working_directory: string
-  channels?: { id: string; delivery: 'all' | 'mentions' }[]
+  channels?: { id: string; delivery: 'off' | 'mentions' | 'all' | 'thread_hybrid' }[]
   dm?: { enabled: boolean; contact?: string }
   permission_prompts: string
-  /** The fungible section: only Check 30's edit writes it. */
-  invited?: { permission_prompts: string }
 }
 
 export interface LiveConfig {
@@ -85,54 +49,27 @@ export interface LiveConfig {
   append_system_prompt_file: string
   /** The container's crontable (`CONTAINER_CRON_TABLE_PATH`): not a wizard answer. */
   cron_table_path: string
-  /** The invited-channel switch (`SWITCH_KEY`): only Checks 30, 32 and 33's edits write it. */
-  [SWITCH_KEY]?: boolean
+  /** Mode defaults to strict when absent. */
+  [SWITCH_KEY]?: 'strict' | 'open'
 }
 
-/** The invited-channel switch's key (src/config.ts's `allow_invited_channels`). */
-export const SWITCH_KEY = 'allow_invited_channels'
-/** The fungible section's key. */
-export const INVITED_KEY = 'invited'
-/** The fungible section's destination key (src/config.ts's `PERSONA_INVITED_KEYS`). */
-export const INVITED_PERMISSION_PROMPTS_KEY = 'permission_prompts'
+/** The shared channel mode key, pinned against the production schema. */
+export const SWITCH_KEY = 'channel_mode'
 /** The destination value that sends a persona's prompts and notices to its DM with its contact. */
 export const DM_DESTINATION = 'dm'
 
-/** Each persona's `invited.permission_prompts` in Check 30's edit: A a-home, B and C `"dm"`, D d-home. */
-export function invitedDestinationFor(letter: PersonaLetter, ids: WorkspaceIds): string {
-  switch (letter) {
-    case 'a':
-      return ids.aHome
-    case 'b':
-    case 'c':
-      return DM_DESTINATION
-    case 'd':
-      return ids.dHome
-  }
+/** Check 30 changes only the mode; it never invents assignments or destinations. */
+export function switchOnFilter(): string {
+  return switchFilter(true)
 }
 
-/**
- * Check 30's switch-on edit as a jq filter over config.json:
- * the switch set to true, and each persona of A to D present in the file
- * given its `invited.permission_prompts` (`invitedDestinationFor`). A persona
- * absent from the file (D, after Check 27) gets nothing; every other key is
- * kept. Pure.
- */
-export function switchOnFilter(ids: WorkspaceIds): string {
-  const branches = PERSONA_LETTERS.map((l, i) => {
-    const section = JSON.stringify({ [INVITED_PERMISSION_PROMPTS_KEY]: invitedDestinationFor(l, ids) })
-    return `${i === 0 ? 'if' : 'elif'} .name == ${JSON.stringify(personaName(l))} then .${INVITED_KEY} = ${section}`
-  })
-  return `.${SWITCH_KEY} = true | .personas |= map(${branches.join(' ')} else . end)`
-}
-
-/** An edit of the switch alone, as a jq filter (Checks 32 and 33). Pure. */
+/** A mode-only edit (Checks 32 and 33). */
 export function switchFilter(on: boolean): string {
-  return `.${SWITCH_KEY} = ${on}`
+  return `.${SWITCH_KEY} = ${JSON.stringify(on ? 'open' : 'strict')}`
 }
 
-/** A jq expression for the switch's value in a configuration file: `true` or `false` (absent reads as false). */
-export const SWITCH_VALUE_JQ = `(.${SWITCH_KEY} // false)`
+/** Whether a configuration selects open mode, including the strict default. */
+export const SWITCH_VALUE_JQ = `((.${SWITCH_KEY} // "strict") == "open")`
 
 function base(letter: PersonaLetter): Pick<PersonaEntry, 'name' | 'credentials_file' | 'working_directory'> {
   return {

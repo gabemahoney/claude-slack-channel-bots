@@ -10,6 +10,13 @@
 # SessionStart re-fires every two seconds while AD says pending, until its grace
 # bound, to make lost-create-reply cases deterministic. Exact user messages go
 # to the transcript for receipt assertions. No native dialog bytes are fixtures.
+# displayed-states fires the registered UserPromptSubmit hook on each typed
+# message and holds it until a command in its per-session control file
+# (stub-claude-hooks.<session>): `receipt` writes the held message's
+# transcript record and fires the registered Stop hook at once; opt-in,
+# `receipt-only` writes the record and leaves the turn open (no Stop) until a
+# later `stop` fires Stop. While a turn is open no new message may be typed,
+# and `stop` without an open turn is refused (the stub exits 1).
 # This worker implements only the legacy terminal transport. Synthetic covered
 # custody lives in agent-director-busy-send.ts and never sends text here. It
 # cannot prove FileChanged/asyncRewake or Claude's native busy-send route.
@@ -250,6 +257,8 @@ DISPLAY_CONTROL="${STUB_DIR}/stub-claude-hooks.${SESSION_ID}"
 DISPLAY_RECORD="${DISPLAY_CONTROL}.jsonl"
 DISPLAY_NEXT=0
 DISPLAY_TEXT=""
+# 1 between `receipt-only` and `stop`: the receipt written, Stop not yet fired.
+DISPLAY_STOP_DUE=0
 declare -A DISPLAY_HOOK_PIDS=()
 display_record() {
     jq -nc --arg command "$1" --arg event "$2" --arg instance "${AGENT_DIRECTOR_INSTANCE_ID:-}" \
@@ -277,6 +286,20 @@ display_controls() {
                 fire_hooks "${STOP_HOOKS[@]}"
                 display_record "${command}" Stop
                 ;;
+            receipt-only)
+                [[ -n "${DISPLAY_TEXT}" ]] || exit 1
+                append_user_receipt "${DISPLAY_TEXT}"
+                DISPLAY_TEXT=""
+                DISPLAY_STOP_DUE=1
+                display_record "${command}" none
+                ;;
+            stop)
+                (( DISPLAY_STOP_DUE == 1 )) || exit 1
+                DISPLAY_STOP_DUE=0
+                display_payload Stop
+                fire_hooks "${STOP_HOOKS[@]}"
+                display_record "${command}" Stop
+                ;;
             permission-1|permission-2)
                 token="${command#permission-}"
                 [[ -z "${DISPLAY_HOOK_PIDS[${token}]:-}" ]] || exit 1
@@ -289,6 +312,19 @@ display_controls() {
                 pid=$!
                 DISPLAY_HOOK_PIDS["${token}"]="${pid}"
                 display_record "${command}" PermissionRequest "${pid}"
+                ;;
+            complete-1|complete-2)
+                token="${command#complete-}"
+                pid="${DISPLAY_HOOK_PIDS[${token}]:-}"
+                [[ -n "${pid}" ]] || exit 1
+                # The allowed fixture tool's turn ends only after this
+                # registered hook has returned its decision; AD, through the
+                # registered Stop, alone decides the row's next state.
+                wait "${pid}" || exit 1
+                unset 'DISPLAY_HOOK_PIDS['"${token}"']'
+                display_payload Stop
+                fire_hooks "${STOP_HOOKS[@]}"
+                display_record "${command}" Stop "${pid}"
                 ;;
             fallback-1|fallback-2)
                 token="${command#fallback-}"
@@ -659,7 +695,9 @@ handle_line() {
     # as `/exit` or `/mcp reconnect`) is no message.
     if (( REPORTED )) && [[ "${line}" =~ [^[:space:]] && ! "${line}" =~ ^[[:space:]]*/ ]]; then
         if [[ "${MODE}" == "${MODE_DISPLAYED_STATES}" ]]; then
-            [[ -z "${DISPLAY_TEXT}" ]] || exit 1
+            if [[ -n "${DISPLAY_TEXT}" ]] || (( DISPLAY_STOP_DUE )); then
+                exit 1
+            fi
             DISPLAY_TEXT="${line}"
             display_payload UserPromptSubmit
             fire_hooks "${PROMPT_HOOKS[@]}"

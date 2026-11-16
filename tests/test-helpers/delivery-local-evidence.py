@@ -38,6 +38,7 @@ worker = load(SOURCE / "jobs/lib/job.py", "local_delivery_worker")
 sys.modules["worker"] = worker
 cardinal = load(SOURCE / "ci/check_cardinal.py", "local_delivery_cardinal")
 permission = load(SOURCE / "ci/fairness-probe/job.py", "local_delivery_permission")
+reconnect = load(SOURCE / "ci/reconnect_coverage.py", "local_delivery_reconnect")
 
 
 def require(condition, reason):
@@ -212,11 +213,15 @@ def summary_add(summary, row, raw):
     summary["states"] += len(behavior)
     if row["cfg"] in runner.ALL_CONTROLS:
         summary["controls"].add(row["cfg"])
-    for before, after in zip(behavior, behavior[1:]):
+    for position, (before, after) in enumerate(zip(behavior, behavior[1:]), 2):
         if before["state"] == after["state"]:
             continue
         if after["control"]["class"] == "correct" and after["executedAction"] in summary["expectedActions"]:
             summary["actions"].add(after["executedAction"])
+            sources = summary["_actionSources"].setdefault(after["executedAction"], [])
+            if len(sources) < 3:
+                sources.append({"cfg": row["cfg"], "position": position,
+                                "rawSha256": digest(encoded(raw))})
         if after["transition"] in summary["expectedFlaps"]:
             summary["flaps"].add(after["transition"])
         for fault in summary["expectedFaults"]:
@@ -228,7 +233,7 @@ def summary_add(summary, row, raw):
 
 def new_summary():
     source = (SOURCE / "PersonaDelivery.tla").read_text()
-    return {"traces": 0, "states": 0, "controls": set(), "actions": set(), "faults": set(), "flaps": set(),
+    return {"traces": 0, "states": 0, "controls": set(), "actions": set(), "faults": set(), "flaps": set(), "_actionSources": {},
             "expectedActions": contract.inventory(source, "EngineActions"),
             "expectedFaults": contract.inventory(source, "FaultNames"),
             "expectedFlaps": {"AgentOwnTurnStart", "AgentTurnEnd", "PermissionOpen", "PermissionAnswer"}}
@@ -371,11 +376,39 @@ def validate_supplemental(envelope, source_inputs):
     return {"kind": payload["kind"], "scope": payload["scope"], **summary}
 
 
-def finish_summary(summary):
+def validate_reconnect(envelope, source_inputs):
+    require(envelope.get("schema") == 2 and envelope.get("cfg") == "supplemental_reconnect"
+            and envelope.get("spec") == "PersonaDelivery" and envelope.get("mode") == "check"
+            and envelope.get("certification") is False and envelope.get("snapshot") == runner.snapshot_id(source_inputs)
+            and envelope.get("behaviorMetadata") == {"replayField": "raw", "controlClass": "correct", "bugSteps": []},
+            "changed reconnect envelope")
+    evidence = envelope["supplementalEvidence"]
+    payload, stored = evidence["payload"], evidence["artifacts"]
+    require(set(stored) == reconnect.FILES and payload["raw"] == envelope["raw"]
+            and envelope["rawSha256"] == digest(encoded(envelope["raw"])), "changed reconnect trace/artifact inventory")
+    artifacts = {}
+    for name, artifact in stored.items():
+        require(set(artifact) == {"sha256", "base64"}, "changed reconnect artifact fields")
+        artifacts[name] = base64.b64decode(artifact["base64"], validate=True)
+        require(digest(artifacts[name]) == artifact["sha256"], "changed reconnect artifact bytes")
+    worker.validate_trace(envelope["raw"], counterexample=True, temporal=False)
+    return reconnect.verify(SOURCE, payload, artifacts, source_inputs)
+
+
+def finish_summary(summary, diagnostics=False):
+    groups = {actual: {"expected": sorted(summary[expected]), "executed": sorted(summary[actual]),
+                      "missing": sorted(summary[expected] - summary[actual]),
+                      "extra": sorted(summary[actual] - summary[expected])}
+              for actual, expected in (("actions", "expectedActions"), ("faults", "expectedFaults"), ("flaps", "expectedFlaps"))}
+    if diagnostics:
+        print(json.dumps({"event": "executed-coverage", **groups,
+                          "controls": sorted(summary["controls"]),
+                          "missingControls": sorted(set(runner.ALL_CONTROLS) - summary["controls"]),
+                          "actionSources": summary["_actionSources"]}), flush=True)
     for actual, expected in (("actions", "expectedActions"), ("faults", "expectedFaults"), ("flaps", "expectedFlaps")):
         require(summary[actual] == summary[expected], "missing executed coverage: " + actual + " " + str(sorted(summary[expected]-summary[actual])))
     require(summary["controls"] == set(runner.ALL_CONTROLS), "missing control traces")
-    return {key: sorted(value) if isinstance(value, set) else value for key, value in summary.items() if not key.startswith("expected")}
+    return {key: sorted(value) if isinstance(value, set) else value for key, value in summary.items() if not key.startswith(("expected", "_"))}
 
 
 def launch_budget(report):
@@ -521,11 +554,25 @@ def export(directory):
     supplemental_summary = validate_supplemental(supplemental_envelope, source_inputs)
     fixtures[SUPPLEMENTAL_NAME] = pack(supplemental_envelope)
     summary_add(summary, {"cfg": "supplemental_pullback"}, supplemental_envelope["raw"])
-    totals = finish_summary(summary)
+    reconnect_directory = directory / "supplemental/reconnect"
+    reconnect_payload = json.loads((reconnect_directory / "evidence.json").read_text())
+    require(reconnect_payload["inputs"] == source_inputs, "early reconnect witness differs from full-suite frozen inputs")
+    reconnect_envelope = {"schema": 2, "cfg": "supplemental_reconnect", "spec": "PersonaDelivery",
+        "mode": "check", "certification": False, "raw": reconnect_payload["raw"],
+        "rawSha256": digest(encoded(reconnect_payload["raw"])), "snapshot": runner.snapshot_id(source_inputs),
+        "behaviorMetadata": {"replayField": "raw", "controlClass": "correct", "bugSteps": []},
+        "supplementalEvidence": {"payload": reconnect_payload,
+            "artifacts": {name: {"sha256": digest((reconnect_directory / name).read_bytes()),
+                "base64": base64.b64encode((reconnect_directory / name).read_bytes()).decode()}
+                for name in reconnect_payload["artifacts"]}}}
+    reconnect_summary = validate_reconnect(reconnect_envelope, source_inputs)
+    fixtures[reconnect.NAME] = pack(reconnect_envelope)
+    summary_add(summary, {"cfg": "supplemental_reconnect"}, reconnect_envelope["raw"])
+    totals = finish_summary(summary, diagnostics=True)
     coverage = {"schema": 3, "evidenceKind": "local-tlc-replay", "certification": False,
                 "limitations": ["Local TLC execution; no scheduler certification or scheduler artifact provenance"],
                 "auxiliaryEvidence": auxiliary_evidence,
-                "supplementalEvidence": {SUPPLEMENTAL_NAME: supplemental_summary},
+                "supplementalEvidence": {SUPPLEMENTAL_NAME: supplemental_summary, reconnect.NAME: reconnect_summary},
                 "inputs": source_inputs, "report": report, "summary": totals,
                 "engineActions": totals["actions"], "boundedFaults": totals["faults"],
                 "flappingActions": totals["flaps"], "controls": totals["controls"],
@@ -548,8 +595,9 @@ def export(directory):
         changes.append({"file": "tests/fixtures/delivery-traces/" + name,
                         "change": "rewritten" if name in original else "added",
                         "reason": ("Add separately proven original-Next PullBack prefix to cover the genuine fault missed by the fixed-seed manifest traces."
-                        if name == SUPPLEMENTAL_NAME else reasons.get(name.rsplit("-", 1)[0], "Regenerated from complete waiting-only AD model run with retained independent local proofs."))
-                        if name != "coverage.json" else "Bind all 76 delivery rows, 8 auxiliary rows and proof bundles to unchanged current/frozen inputs."})
+                        if name == SUPPLEMENTAL_NAME else "Add original-Init/Next replayed deferReconnect prefix absent from sampled executed coverage."
+                        if name == reconnect.NAME else reasons.get(name.rsplit("-", 1)[0], "Regenerated from complete waiting-only AD model run with retained independent local proofs."))
+                        if name != "coverage.json" else f"Bind all {len(rows)} delivery rows, {len(report['auxiliaryRows'])} auxiliary rows and proof bundles to unchanged current/frozen inputs."})
         (DESTINATION / name).write_bytes(encoded(value) + b"\n")
     for name in original - set(fixtures) - {"coverage.json"}:
         changes.append({"file": "tests/fixtures/delivery-traces/" + name, "change": "deleted",
@@ -573,13 +621,19 @@ def validate():
     summary, selected = new_summary(), {row["cfg"]: [] for row in rows}
     trace_hashes = {row["cfg"]: [] for row in rows}
     by_cfg = {row["cfg"]: row for row in rows}
-    require(set(coverage.get("supplementalEvidence", {})) == {SUPPLEMENTAL_NAME}
-            and SUPPLEMENTAL_NAME in coverage["fixtures"], "missing supplemental fault coverage")
+    supplemental_names = {SUPPLEMENTAL_NAME, reconnect.NAME}
+    require(set(coverage.get("supplementalEvidence", {})) == supplemental_names
+            and supplemental_names <= set(coverage["fixtures"]), "missing supplemental executed coverage")
     for name, checksum in sorted(coverage["fixtures"].items()):
         require(re.fullmatch(r"[A-Za-z0-9_-]+-[0-9]{3}\.json", name), "unsafe fixture name")
         raw_bytes = (DESTINATION / name).read_bytes()
         require(digest(raw_bytes) == checksum, "changed frozen fixture")
         envelope = unpack(json.loads(raw_bytes))
+        if name == reconnect.NAME:
+            require(validate_reconnect(envelope, coverage["inputs"]) == coverage["supplementalEvidence"][name],
+                    "changed reconnect coverage summary")
+            summary_add(summary, {"cfg": "supplemental_reconnect"}, envelope["raw"])
+            continue
         if name == SUPPLEMENTAL_NAME:
             require(validate_supplemental(envelope, coverage["inputs"]) == coverage["supplementalEvidence"][name],
                     "changed supplemental coverage summary")

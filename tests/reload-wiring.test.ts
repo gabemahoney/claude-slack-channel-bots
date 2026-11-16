@@ -113,7 +113,10 @@ function endOfBringUpStatement(bringUpAt: number): number {
  * that config is still unset, then the swap
  * `<loaded> = configInEffect(<start-time>, <applied>)` (start-time first:
  * `configInEffect` keeps its first argument's server-wide values and takes
- * only the second's personas); fails the test otherwise.
+ * only the second's personas), then the shared-state reporter's
+ * successful-apply callback, and nothing else: preparation work started
+ * here would run under lives the apply's teardowns then end (it belongs in
+ * `onApplySettled`); fails the test otherwise.
  */
 function startTimeConfig(): string {
   const { loaded } = startResolution(SERVER_CODE)
@@ -122,7 +125,7 @@ function startTimeConfig(): string {
     new RegExp(
       `^\\(?\\s*(\\w+)\\s*\\)?\\s*=>\\s*\\{\\s*` +
         `if\\s*\\(\\s*(\\w+)\\s*===\\s*undefined\\s*\\)\\s*throw\\s+new\\s+Error\\s*\\(\\s*'[^']*'\\s*\\)\\s*;?\\s*` +
-        `${loaded}\\s*=\\s*configInEffect\\s*\\(\\s*\\2\\s*,\\s*\\1\\s*\\)\\s*;?\\s*void\\s+deliveryPreparation\\?\\.recover\\(\\1\\.personas\\.map\\(p\\s*=>\\s*p\\.key\\)\\)\\s*;?\\s*\\}$`,
+        `${loaded}\\s*=\\s*configInEffect\\s*\\(\\s*\\2\\s*,\\s*\\1\\s*\\)\\s*;?\\s*sharedStateReporting\\?\\.reloadApplied\\(\\)\\s*;?\\s*\\}$`,
     ),
   )
   expect(swap).not.toBeNull()
@@ -220,6 +223,44 @@ describe('server.ts wires the reload detection tick', () => {
     expect(indicesOf(/\b(?:let|const|var|function)\s+configInEffect\b/g, SERVER_CODE)).toEqual([])
   })
 
+  // Once a confirmed apply's steps have settled, the applied keys' claimed
+  // work is prepared again under their lives now: a destructive modify's
+  // teardown ended the life that held it (tests/reload-apply.test.ts drives
+  // that through the harness). `onApplySettled` is optional in the
+  // controller's deps and the harness binds its own, so only this audit makes
+  // sure production binds it, on the one preparation whose life the teardown's
+  // routing forget ends and whose ownership gates the engines' `prepare`, and
+  // that nothing prepares at step 1 instead (`onApplied` is pinned to the swap
+  // alone by startTimeConfig).
+  test('the controller\'s onApplySettled reclaims every applied key\'s claimed work through the one preparation the teardown forgets and the engines\' prepare is gated on, and only the start recovers every journal', () => {
+    const settled = (controllerProps().get('onApplySettled') ?? '').replace(/\s+/g, ' ')
+    const reclaim = settled.match(/^\(?(\w+)\)? => deliveryPreparation\?\.reclaim\(\1\.personas\.map\(\(?(\w+)\)? => \2\.key\)\)$/)
+    expect(reclaim).not.toBeNull()
+    expect(startTimeConfig()).toMatch(/^\w+$/)
+    // The one preparation: declared once at module scope and built once, in main().
+    expect([...SERVER_CODE.matchAll(/\b(?:let|const|var)\s+deliveryPreparation\b[^\n]*/g)].map((d) => d[0].trim())).toEqual([
+      'let deliveryPreparation: DeliveryPreparation | undefined',
+    ])
+    const builds = assignmentsOf('deliveryPreparation', 'createDeliveryPreparation')
+    expect(builds).toHaveLength(1)
+    expect(insideMain(SERVER_CODE, builds[0]!)).toBe(true)
+    expect(builds[0]!).toBeLessThan(onlyMethodCall('startDetection').at)
+    // Its life ends at a teardown's routing forget (the whole binding is pinned below), and the
+    // engines prepare only what it owns, so nothing else can fix an item a forget left unfixed.
+    // The branch composes the forget through forgetPersonaState, one step per owner.
+    expect(onlyCallProps('createPersonaLifecycle').get('routing')).toContain('k => deliveryPreparation?.forget(k)')
+    expect(onlyCallProps('createDeliveryEngines').get('prepare')).toBe(
+      '(key, item) => deliveryPreparation!.owns(key, item.accepted.seq) ? deliveryPreparation!.prepare(key, item) : Promise.resolve()',
+    )
+    // reclaim is called only there; the unrestricted recover only once, for every journal, after detection is armed.
+    expect(anyCallOf('reclaim')).toHaveLength(1)
+    const recover = [...SERVER_CODE.matchAll(/^\s*await deliveryPreparation\?\.recover\(\)\s*$/gm)]
+    expect(recover).toHaveLength(1)
+    expect(anyCallOf('recover')).toHaveLength(1)
+    expect(atMainTopLevel(SERVER_CODE, recover[0]!.index! + recover[0]![0].indexOf('await'))).toBe(true)
+    expect(recover[0]!.index!).toBeGreaterThan(onlyMethodCall('startDetection').at)
+  })
+
   // no file watcher. Only the controller's own options are audited, so
   // unrelated server code is free to use fs.watch; that the driver chains
   // timeouts rather than an interval is tested in tests/reload-timer.test.ts.
@@ -288,15 +329,25 @@ function forwardingHolder(lifecycle: Map<string, string>, member: string, arity:
  */
 function lifecycleHolder(): string {
   const lifecycle = objectProperties(controllerProps().get('lifecycle') ?? '')
-  const teardown = forwardingHolder(lifecycle, 'teardown', 1)
+  const holder = forwardingHolder(lifecycle, 'updateInPlace', 1)
+  // Teardown still forwards the same persona to this holder and waits for
+  // it, even on failure, before removing only an unapplied key's Thread Memory.
+  // Both hold resolvers, Post and Memory, are forgotten through the isolation
+  // helper, so neither forget throwing skips the other; resolver cleanup cannot
+  // prevent retry cancellation before removal or skip the remaining cleanup.
+  // Pin the whole wrapper: an arbitrary async body must not pass the audit.
+  const teardown = lifecycle.get('teardown') ?? ''
+  const parameter = teardown.match(/^async \((\w+)\) => /)
+  expect(parameter).not.toBeNull()
+  const persona = parameter![1]!
+  expect(teardown).toBe(`async (${persona}) => { try { await ${holder}.teardown(${persona}) } finally { if (!${loadedConfigName(SERVER_CODE)}?.personas.some(applied => applied.key === ${persona}.key)) { try { await forgetPersonaState(${persona}.key, [key => ownPostLookups?.forget(key), key => ownPostJoins?.forget(key)]) } finally { try { await forgetPersonaState(${persona}.key, [key => postHolds?.forget(key), key => memoryHolds?.forget(key)]) } finally { try { threadMemoryRetries?.forget(${persona}.key, 'removal') } finally { await threadMemory?.remove(${persona}.key) } } } } } }`)
   // All five on the same holder. bringUp forwards its third parameter, the
   // options carrying `recovery` (step 6): a binding that drops
   // it typechecks, but would bring a credentials-broken persona up as new.
-  expect(forwardingHolder(lifecycle, 'updateInPlace', 1)).toBe(teardown)
-  expect(forwardingHolder(lifecycle, 'reconnectCredentials', 2)).toBe(teardown)
-  expect(forwardingHolder(lifecycle, 'refreshTemplate', 1)).toBe(teardown)
-  expect(forwardingHolder(lifecycle, 'bringUp', 3)).toBe(teardown)
-  return teardown
+  expect(forwardingHolder(lifecycle, 'reconnectCredentials', 2)).toBe(holder)
+  expect(forwardingHolder(lifecycle, 'refreshTemplate', 1)).toBe(holder)
+  expect(forwardingHolder(lifecycle, 'bringUp', 3)).toBe(holder)
+  return holder
 }
 
 describe('server.ts binds the confirmed apply\'s teardown, in-place update, credentials change, template refresh and bring-up (steps 3 to 6)', () => {
@@ -400,7 +451,16 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       // change nothing the server serves.
       ['bringUps', constOf('createPersonaBringUpController')],
       ['connections', constOf('createPersonaConnectionManager')],
-      ['routing', `{ ...${constOf('createPersonaRouting')}, forget: key => { ${constOf('createPersonaRouting')}.forget(key); deliveryReporting?.forget(key); deliveryPreparation?.forget(key); void deliveryEngines?.forget(key); deliveryLifecycle?.forget(key) } }`],
+      // Cancel retries and both hold resolvers (Memory, then Post) through the
+      // isolation helper at teardown submission; the later routing cleanup
+      // still includes them all.
+      ['cancelThreadMemory', 'key => forgetPersonaState(key, [ k => threadMemoryRetries?.forget(k), k => ownPostLookups?.forget(k), k => memoryHolds?.forget(k), k => postHolds?.forget(k), ])'],
+      ['routing', `{ ...${constOf('createPersonaRouting')}, forget: key => forgetPersonaState(key, [ k => ${constOf('createPersonaRouting')}.forget(k), k => deliveryReporting?.forget(k), k => sharedStateReporting?.forget(k), k => deliveryPreparation?.forget(k), k => deliveryEngines?.forget(k), k => deliveryLifecycle?.forget(k), k => memoryHolds?.forget(k), k => postHolds?.forget(k), k => threadMemoryRetries?.forget(k), k => ownPostLookups?.forget(k), k => ownPostJoins?.forget(k), k => threadMemory?.forget(k), ]) }`],
+      // A later bring-up awaits this key's Thread Memory load, then recovers
+      // queued joins, releases its untracked Post Holds and, once that
+      // settles, starts detached Memory Hold resolution before connecting,
+      // only while running with both holders.
+      ['loadThreadMemory', "async key => { await threadMemory?.loadKey(key) if (!shuttingDown && deliveryQueue && threadMemory) { recoverQueuedJoins(key, deliveryQueue, threadMemory) void postHolds?.releaseUntracked(key).then(() => { if (threadMemoryWorkAllowed(key)) return memoryHolds?.resolve(key, 'recovered') }).catch(() => {}) ownPostLookups?.kick(key) } }"],
       ['destinations', constOf('createPersonaDestinations')],
       ['destinationHold', constOf('createPersonaDestinationHold')],
       ['notifier', notifier],
@@ -450,6 +510,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     // The imported production functions, each from its own module and not
     // shadowed by a local declaration of the same name.
     const imports: Record<string, string> = {
+      forgetPersonaState: './persona-lifecycle.ts',
       whenLaunchSettled: './session-manager.ts',
       cancelWorkingRowWait: './session-manager.ts',
       killPersonaInstanceForTeardown: './session-manager.ts',
@@ -499,12 +560,14 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
 
     expect(props.get('forgetReplyReminders')).toMatch(/^\(?key\)? => replyReminders\?\.forget\(key\) \?\? Promise\.resolve\(\)$/)
 
-    // Teardown stops delivery and forgets its lifecycle for this key.
+    // Teardown cancels the key's react hand-off work first, then stops
+    // membership discovery and forgets readiness before the existing
+    // delivery, lifecycle and reminder cleanup for this same key.
     const stopBody = props.get('stopDelivery') ?? ''
-    const stopDelivery = stopBody.match(/^async \(?(\w+)\)? => \{ const (\w+) = /)
+    const stopDelivery = stopBody.match(/^async \(?(\w+)\)? => \{ reactHandoff\?\.forget\(\1\); membershipScanner\?\.stop\(\1\); membershipReadiness\?\.forget\(\1\); const (\w+) = /)
     expect(stopDelivery).not.toBeNull()
     const [, stopKey, stoppingDelivery] = stopDelivery!
-    expect(stopBody).toBe(`async (${stopKey}) => { const ${stoppingDelivery} = deliveryEngines?.forget(${stopKey}); deliveryLifecycle?.forget(${stopKey}); const remindersStopping = replyReminders?.forget(${stopKey}); await Promise.all([${stoppingDelivery}, remindersStopping]) }`)
+    expect(stopBody).toBe(`async (${stopKey}) => { reactHandoff?.forget(${stopKey}); membershipScanner?.stop(${stopKey}); membershipReadiness?.forget(${stopKey}); const ${stoppingDelivery} = deliveryEngines?.forget(${stopKey}); deliveryLifecycle?.forget(${stopKey}); const remindersStopping = replyReminders?.forget(${stopKey}); await Promise.all([${stoppingDelivery}, remindersStopping]) }`)
 
     // optional in the deps, so only this pin makes
     // sure a production teardown stops the key's live-row sequence (right
@@ -879,7 +942,7 @@ describe('server-wide settings keep their start-time values after a confirmed ap
         ack_reaction: 'eyes',
         reply_chunk_limit: 1000,
         reply_chunk_mode: 'length',
-        [MODE_SWITCH_SETTING]: true,
+        [MODE_SWITCH_SETTING]: 'open',
       },
       '/applied-base',
     )

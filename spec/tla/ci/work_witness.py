@@ -48,7 +48,7 @@ CONSTANTS = {"MaxItems": 2, "MaxParts": 2, "MaxLaunches": 1,
              "MaxServerStarts": 2, "MaxRetypes": 1, "EnterRetries": 4,
              "MaxAgentQueue": 4, "Faults": [], "PromptFlapping": True,
              "Flapping": True, "Bug": "none", "Scenario": "probe",
-             "IdenticalTexts": False}
+             "IdenticalTexts": False, "MaxMemoryHolds": 0, "MaxPostHolds": 0}
 CORE_CONSTANTS = dict(CONSTANTS, MaxItems=1, MaxParts=1, MaxAgentQueue=2, Flapping=False)
 SCOPE = "existential-accepted-work-within-RestartStateConstraint"
 

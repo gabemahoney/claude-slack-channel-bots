@@ -3,7 +3,7 @@
 # Synthetic custody tests and actual legacy raw-input/receipt transport.
 # No real Claude. See busy-send-driver.ts for the precise client boundary.
 set -euo pipefail
-TEST_NAME=test-50-fmk-busy-send
+TEST_NAME=test-68-fmk-busy-send
 source "$(dirname "$0")/lib/scenario.sh"
 # Like D1's selected closing assertions, this packed-module scenario has no
 # bot server. Keep the tmux/delete checks; replace only the server-probe
@@ -12,7 +12,7 @@ SCENARIO_CLOSING_ASSERTIONS=(assert_no_server_tmux assert_busy_send_no_finished 
 assert_busy_send_no_finished() {
     local step=assert_busy_send_no_finished lines=() parent=() i get=0 send=0
     _scenario_query_prep "${step}"
-    (( _SCENARIO_START_COUNT == 0 )) || fail "${step}: test-50 must not start a bot server"
+    (( _SCENARIO_START_COUNT == 0 )) || fail "${step}: test-68 must not start a bot server"
     _scenario_read_log "${step}" "${SCENARIO_AD_SHIM_LOG}" lines
     for i in "${!lines[@]}"; do
         _scenario_split_line "${lines[i]}"
@@ -34,7 +34,7 @@ cp "${SCENARIO_FIXTURES}/busy-result.ts" "${SCENARIO_AD_ROOT}/bin/busy-result.ts
 ln -s /usr/local/bin/bun "${SCENARIO_AD_ROOT}/bin/agent-director-busy-bun"
 touch "${SCENARIO_BIN}/stub-claude-count-prompts"
 work=$(make_workdir dual-path)
-instance=cscb_t50_fixture
+instance=cscb_t68_fixture
 stub_mode "${work}" at-once
 ad_capture spawn --agent claude --cwd "${work}" --instance-id "${instance}" \
     --tmux-session-name "${instance}" --no-pre-trust --relay-mode on --label tag_prompt=1

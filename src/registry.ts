@@ -26,21 +26,17 @@
  * the persona with no username or icon override. While its `dm.enabled` is on,
  * it may target its DM conversations and (for `reply`) user IDs in both modes
  * (`checkPersonaTarget`). Its channel targets depend on the mode: in
- * declarative mode only the channels in the persona's current applied
- * configuration; in fungible mode any channel ID, with Slack enforcing
- * membership, and Slack's refusal returned as a tool error naming the
+ * strict mode only channels with a non-off choice in the persona's current
+ * applied configuration; in open mode any channel ID, with Slack enforcing
+ * access, and Slack's refusal returned as a tool error naming the
  * persona, the channel and Slack's error code (
  * `slackRefusalToolErrorText`).
  *
- * The sixth tool, `set_channel_delivery`, has no
- * Slack target and makes no Slack call, in or out of dry run. It stores the
- * persona's channel delivery (`mentions` or `all`) for one channel it heard
- * in fungible mode, or already holds a choice for, in the one stored-choice
- * store (`src/channel-delivery.ts`), and the choice applies from the next
- * event under the loop guard. It resolves the persona at call time as the
- * other tools do, also refusing a retiring key and a session that is not the
- * one the registry holds for its key, then checks rules in
- * order; in declarative mode every call is refused.
+ * The sixth tool, `set_channel_delivery`, makes no Slack call. It binds a
+ * caller-retained identifier to the current persona incarnation/channel/value.
+ * Fresh assignments require open mode and authenticated current membership;
+ * duplicate assignment and retry intents read retained outcomes only. Strict
+ * and dry-run sessions can read their own history but cannot create a write.
  *
  * Instructions: `MCP_INSTRUCTIONS` is exported as the exact string every
  * session server sends as its MCP `instructions`, in both modes, so the shipped-docs audit reads what instances receive.
@@ -57,20 +53,22 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import type { WebClient } from '@slack/web-api'
-import { writeFileSync } from 'fs'
+import { statSync, writeFileSync } from 'fs'
 import { basename, join, resolve } from 'path'
+import { claimReactAnswer } from './ack-tracker.ts'
 import {
   CHANNEL_DELIVERY_FILE_NAME,
-  CHANNEL_DELIVERY_SET_STORED,
-  CHANNEL_DELIVERY_SET_UNREADABLE,
-  CHANNEL_DELIVERY_SET_WRITE_FAILED,
-  channelDeliveryDeclarationOf,
+  currentChannelDeliveryFacts,
   SET_CHANNEL_DELIVERY_TOOL,
-  type ChannelDeliverySetInvalidField,
+  type ChannelDeliveryCurrentFacts,
+  type ChannelDeliveryUnavailableReason,
   type ChannelDeliveryStore,
 } from './channel-delivery.ts'
+import { CHANNEL_DELIVERY_INTENTS, validChannelDeliveryAttempt, validChannelDeliveryAttemptId, type BotAttemptResult, type ChannelDeliveryAttemptRequest } from './channel-delivery-attempt.ts'
+import type { MembershipReading } from './channel-membership.ts'
 import {
   CHANNEL_ID_RE,
+  DELIVERY_MODES,
   DM_CONTACT_RE,
   ECHOABLE_KEY_NAME_RE,
   MCP_SERVER_NAME,
@@ -80,15 +78,19 @@ import {
   type Persona,
   type ReplySettings,
 } from './config.ts'
-import { channelDeliveryFor, type ChannelDeliveryResult } from './delivery-decision.ts'
+import { channelDeliveryFor } from './delivery-decision.ts'
 import { chunkText, sanitizeFilename } from './lib.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { describeSlackCallFailure, describeThrownValue, renderLogMessageText, slackPlatformReason } from './persona-connection-errors.ts'
-import { DM_OPEN_SCOPE, MISSING_SCOPE_ERROR, fungibleDestinationsOf } from './persona-destination.ts'
+import { DM_OPEN_SCOPE, MISSING_SCOPE_ERROR } from './persona-destination.ts'
 import { channelDeliverySetCause, formatPersonaDiagnostic, PERSONA_CHANNEL_DELIVERY_SET } from './persona-diagnostics.ts'
 import { isDryRun } from './tokens.ts'
+import { completionFiles, ownPostAnswerOfError, ownPostAnswerOfPost, type OwnPostAnswer, type OwnPostObserver, type OwnPostStart } from './own-post.ts'
+import { withFileCompletions } from './file-upload-observation.ts'
 
 export { SET_CHANNEL_DELIVERY_TOOL }
+/** An upload refused by the final file guard before any upload call. */
+export const OWN_POST_UPLOAD_REFUSED = 'upload_refused'
 // Peer-PID + sessions.json registry have been deleted. The
 // agent-director library owns session state.
 
@@ -101,6 +103,9 @@ export interface SessionEntry {
   cwd: string
   /** Key of the persona this session is matched to; empty on a pending stub until promotion */
   personaKey: string
+  /** Shared authority life captured at registration; a key or cwd alone
+   * cannot give an old MCP session access to a replacement. */
+  personaIncarnation?: string
   /** MCP transport for this session */
   transport: WebStandardStreamableHTTPServerTransport
   /** MCP Server instance for this session */
@@ -378,6 +383,7 @@ export function registerSession(
   personaKey: string,
   transportOrPendingId: WebStandardStreamableHTTPServerTransport | string,
   server?: Server,
+  personaIncarnation?: string,
 ): SessionEntry {
   let transport: WebStandardStreamableHTTPServerTransport
   let resolvedServer: Server
@@ -415,6 +421,8 @@ export function registerSession(
     // (e.g. tool handlers in createSessionServer) see the updated values.
     stub.cwd = cwd
     stub.personaKey = personaKey
+    if (personaIncarnation !== undefined) stub.personaIncarnation = personaIncarnation
+    else delete stub.personaIncarnation
     stub.transport = transport
     stub.server = resolvedServer
     stub.connected = true
@@ -424,6 +432,7 @@ export function registerSession(
     entry = {
       cwd,
       personaKey,
+      ...(personaIncarnation !== undefined ? { personaIncarnation } : {}),
       transport,
       server: resolvedServer,
       connected: true,
@@ -663,54 +672,85 @@ export interface SessionToolDeps {
   /** Resolve a user's display name through the persona's client */
   resolveUserName: (personaKey: string, userId: string) => Promise<string>
   /**
-   * Record a successful correlated reply or react and clean up its captured ack stage.
+   * Record a successful correlated reply and clean up its captured ack stage.
    * The removal fallback is only for legacy entries without a captured reaction;
    * `kept` is a react's emoji, never removed.
    */
   consumeAck: (personaKey: string, channelId: string, messageTs: string, removeLegacy?: () => Promise<unknown>, kept?: string) => boolean | Promise<void>
+  /**
+   * Record a successful react as consumeAck does, with its emoji kept, and
+   * answer in the same step whether the persona already held that answer
+   * (true) or this one is the first (false). Absent: the ack tracker's own
+   * `claimReactAnswer`.
+   */
+  claimReactAnswer?: typeof claimReactAnswer
+  /**
+   * The persona's confirmed bot user ID from its serving connection, or
+   * undefined when unavailable; read with `clientFor` before a react's add.
+   * Absent: unavailable.
+   */
+  getBotUserId?: (key: string) => string | undefined
+  /**
+   * Told synchronously of each react whose claim was the first, when the
+   * persona's bot user ID was available before the add. Absent: nothing.
+   */
+  onReactClaimed?: (claim: ReactClaimContext) => void
   /** TCP port the MCP HTTP server is listening on (retained for diagnostics). */
   serverPort: number
   /**
    * The channel mode of the configuration in effect, read on every tool call together with the persona and never
    * copied at session creation (production: `channelModeOf` over the applied
-   * configuration). Absent: declarative mode.
+   * configuration). Absent: strict mode.
    */
   getChannelMode?: () => ChannelMode
   /**
-   * The one stored-choice store `main()` loads,
-   * read at each `set_channel_delivery` call (production: the server's
-   * module-scope holder). Undefined while no store is bound (before `main()`
-   * loads it): the call is refused and nothing is written. Absent: the same.
+   * The adapter over the recovered shared authority, read at each
+   * `set_channel_delivery` call (production: the server's module-scope
+   * holder). Undefined before `main()` binds it: the call is refused and
+   * nothing is written. Absent: the same.
    */
   getChannelDelivery?(): SessionChannelDeliveryStore | undefined
+  /** Current applied/up status, including shutdown. Required for attempt access. */
+  isPersonaUp?(key: string): boolean
+  /** Read current authenticated evidence; this never performs a network lookup. */
+  readChannelMembership?(key: string, channel: string, mode: ChannelMode): MembershipReading
   /**
-   * A read-only view of persona `key`'s heard set,
-   * read at each `set_channel_delivery` call (production: the one routing's
-   * `heardChannels`). Absent: the heard set is empty.
-   */
-  heardChannels?(key: string): ReadonlySet<string>
-  /**
-   * The applied personas of the configuration in effect, read at each `set_channel_delivery` call for the loop guard's
-   * input. Absent: only the calling persona.
-   */
-  getAppliedPersonas?(): readonly Persona[]
-  /**
-   * Receives the `persona-channel-delivery-set` line of each accepted
+   * Receives the `persona-channel-delivery-set` line of each newly applied
    * `set_channel_delivery` call: the `[slack]`
    * stream of `server.log`, as the routing's `log` receives
-   * `persona-invited-channel` (production: `console.error`). Absent:
+   * `persona-open-channel` (production: `console.error`). Absent:
    * `console.error`.
    */
   log?: (line: string) => void
+  /**
+   * Observes each reply chunk and upload's intent and answer. Absent:
+   * nothing is observed and posting is unchanged.
+   */
+  ownPosts?: OwnPostObserver
 }
 
 /**
- * What `set_channel_delivery` uses of the stored-choice store: its path, readability, lookups, the retiring keys and
- * the one write of a choice. `ChannelDeliveryStore` satisfies it as it is.
+ * A react whose claim was the first: the persona, the client that made the
+ * add and the bot user ID read with it before the add, never re-resolved
+ * after it, with the add's validated target and emoji.
+ */
+export interface ReactClaimContext {
+  persona: Persona
+  client: WebClient
+  botUserId: string
+  chatId: string
+  messageId: string
+  emoji: string
+}
+
+/**
+ * What `set_channel_delivery` uses of the shared-authority adapter:
+ * current readability, incarnation and the single
+ * authority's attempt API. `ChannelDeliveryStore` satisfies it as it is.
  */
 export type SessionChannelDeliveryStore = Pick<
   ChannelDeliveryStore,
-  'path' | 'readable' | 'storedChoice' | 'storedChannels' | 'set' | 'isRetiring'
+  'path' | 'readable' | 'readableFor' | 'storedChoice' | 'lookupAttempt' | 'attempt' | 'isRetiring' | 'incarnation'
 >
 
 // ---------------------------------------------------------------------------
@@ -722,26 +762,26 @@ const DM_CONVERSATION_ID_RE = /^D[A-Z0-9]+$/
 
 /**
  * What a tool target is, for one persona in one channel mode:
- * - `channel`: in declarative mode, the `id` of one of the persona's
- *   configured channels; in fungible mode, any value matching
+ * - `channel`: in strict mode, the `id` of a persona channel with a non-off
+ *   delivery choice; in open mode, any value matching
  *   `CHANNEL_ID_RE` (a `C…` or `G…` ID);
  * - `dm`: a DM conversation ID (`D…`);
  * - `user`: a Slack user ID (`U…`/`W…`, the `dm.contact` format);
- * - `other`: anything else (in declarative mode another channel or a group
- *   DM; in either mode a malformed ID, an empty value …).
+ * - `other`: anything else (in strict mode a channel outside that non-off
+ *   scope; in either mode a malformed ID, an empty value …).
  */
 type PersonaTargetKind = 'channel' | 'dm' | 'user' | 'other'
 
 /**
- * Classify `target` for `persona` in `mode`. In declarative mode a
- * configured channel wins over the ID shapes; in fungible mode the persona's
+ * Classify `target` for `persona` in `mode`. In strict mode a channel with
+ * a non-off choice wins over the ID shapes; in open mode the persona's
  * `channels` is never read and the channel-ID shape decides.
  * Pure: no Slack call, logging or state.
  */
 function classifyPersonaTarget(persona: Persona, target: string, mode: ChannelMode): PersonaTargetKind {
-  if (mode === 'fungible') {
+  if (mode === 'open') {
     if (CHANNEL_ID_RE.test(target)) return 'channel'
-  } else if (target !== '' && persona.channels.some((c) => c.id === target)) {
+  } else if (target !== '' && persona.channels.some((c) => c.id === target && c.delivery !== 'off')) {
     return 'channel'
   }
   if (DM_CONVERSATION_ID_RE.test(target)) return 'dm'
@@ -750,11 +790,15 @@ function classifyPersonaTarget(persona: Persona, target: string, mode: ChannelMo
 }
 
 /**
- * The reason a fungible-mode refusal of a target that is neither a channel ID
+ * The reason an open-mode refusal of a target that is neither a channel ID
  * nor a DM target gives, after `checkPersonaTarget`'s lead
  * naming the persona and the target.
  */
 export const FUNGIBLE_TARGET_REFUSAL = 'it is neither a channel ID nor an allowed DM target.'
+
+/** Why a target outside the persona's non-off strict channel scope is refused. */
+export const STRICT_TARGET_REFUSAL = "it is not one of the persona's channels with a non-off delivery choice in strict mode."
+export const CHANNEL_TARGET_STATE_UNRESOLVED = 'The current channel choice is unresolved; retry after reviewed state recovery.'
 
 /**
  * The kind of action a tool takes on its target: `post` posts a new message
@@ -775,10 +819,10 @@ export type PersonaTargetCheck =
 /**
  * The posting scope of a persona, decided from
  * the persona and the channel mode as applied now (callers pass both,
- * resolved at call time). `mode` absent is declarative mode.
- * - Declarative mode: a configured channel is allowed, whatever its delivery
- *   mode.
- * - Fungible mode: any target matching `CHANNEL_ID_RE` is allowed, whatever
+ * resolved at call time). `mode` absent is strict mode.
+ * - Strict mode: a configured channel is allowed only with a non-off
+ *   delivery choice.
+ * - Open mode: any target matching `CHANNEL_ID_RE` is allowed, whatever
  *   any persona lists (Slack enforces membership); the persona's `channels`
  *   is not read.
  * - In both modes, a `D…` conversation is allowed only while `dm.enabled` is
@@ -786,8 +830,8 @@ export type PersonaTargetCheck =
  *   only for `post` and only while `dm.enabled` is on, as `kind: 'user'`
  *   (open the DM first); for `act` a user ID is refused whatever the switch,
  *   so no read, edit or reaction ever opens a DM.
- * - Everything else is refused: in declarative mode as not a configured
- *   channel, in fungible mode with `FUNGIBLE_TARGET_REFUSAL`.
+ * - Everything else is refused: in strict mode with `STRICT_TARGET_REFUSAL`,
+ *   in open mode with `FUNGIBLE_TARGET_REFUSAL`.
  * A refusal message names the persona (`renderPersonaRef` with its stored
  * key) and the target. While `dm.enabled` is off, every `D…`/`U…`/`W…`
  * target on any tool gets the DMs-off reason, so the model is never steered
@@ -797,7 +841,7 @@ export function checkPersonaTarget(
   persona: Persona,
   target: string,
   action: PersonaTargetAction,
-  mode: ChannelMode = 'declarative',
+  mode: ChannelMode = 'strict',
 ): PersonaTargetCheck {
   const kind = classifyPersonaTarget(persona, target, mode)
   const refuse = (why: string): PersonaTargetCheck => ({
@@ -806,7 +850,7 @@ export function checkPersonaTarget(
   })
   if (kind === 'channel') return { allowed: true, kind }
   if (kind === 'other') {
-    return refuse(mode === 'fungible' ? FUNGIBLE_TARGET_REFUSAL : `it is not one of the persona's configured channels.`)
+    return refuse(mode === 'open' ? FUNGIBLE_TARGET_REFUSAL : STRICT_TARGET_REFUSAL)
   }
   if (!persona.dm.enabled) return refuse(`DMs are off for this persona (dm.enabled is false).`)
   if (kind === 'user' && action !== 'post') {
@@ -833,8 +877,30 @@ function toolError(text: string) {
   return { content: [{ type: 'text', text }], isError: true }
 }
 
+/** What a `reply` had already posted when a later part failed; that prefix is never posted again. */
+export interface ReplyPostedPrefix {
+  where: string
+  sent: number
+  total: number
+  lastTs?: string
+  uploaded: number
+  files: number
+}
+/** The `reply` tool error after a later Slack call failed following confirmed posts. */
+export function replyPartialFailureText(prefix: ReplyPostedPrefix, reason?: string): string {
+  return `Tool "reply" stopped after a partial post${reason ? ` (${reason})` : ''}: ` +
+    `${prefix.sent} of ${prefix.total} message(s) were posted to ${prefix.where}${prefix.lastTs ? ` [ts: ${prefix.lastTs}]` : ''}` +
+    `${prefix.files ? ` and ${prefix.uploaded} of ${prefix.files} file(s) were uploaded` : ''}. ` +
+    'The posted part stays in Slack and is not posted again; send only what is missing.'
+}
+/** The `[slack]` line for that failure; the thrown value goes through the safe describer. */
+export function replyPartialFailureLogLine(ref: string, prefix: ReplyPostedPrefix, err: unknown): string {
+  return `[slack] Tool "reply" stopped after a partial post for persona ${ref}: ` +
+    `sent=${prefix.sent}/${prefix.total} uploaded=${prefix.uploaded}/${prefix.files}: ${describeThrownValue(err)}`
+}
+
 /**
- * The tool error for a failed call on a channel target in fungible mode
+ * The tool error for a failed call on a channel target in open mode
  * where Slack enforces membership: it names
  * the tool, the persona (`renderPersonaRef`), the channel and Slack's error
  * code (`slackPlatformReason` of the thrown value, e.g. `not_in_channel` or
@@ -891,31 +957,34 @@ export function personaNotAppliedRefusal(tool: string, key: string): string {
 // set_channel_delivery
 // ---------------------------------------------------------------------------
 
-/**
- * The tool's description: it sets how closely the persona
- * listens in one channel its Slack app was invited to, between @mentions and
- * broadcasts only (`mentions`) and every message (`all`); it is called when
- * someone in that channel asks for it; it works only when the operator has
- * turned invited channels on.
- */
+/** The actual advertised request and direct-handler validation share this contract. */
 export const SET_CHANNEL_DELIVERY_DESCRIPTION =
-  "Set how closely your persona listens in one channel its Slack app was invited to: mentions (only @mentions of you and @here or @channel broadcasts) or all (every message). " +
-  'Call it when someone in that channel asks for it. ' +
-  'It works only when the operator has turned invited channels on; otherwise every call is refused. ' +
-  'The choice applies from the next message in that channel and is kept across server restarts.'
-
-/** The description of the tool's `channel` input. */
+  'Set listening in a currently verified public or private member channel to off, mentions, all, or thread_hybrid. ' +
+  'Call it when someone in that channel asks. New assignments require open mode and a current eligible membership. ' +
+  'Create and retain attempt_id before first submission. Each fresh deliberate assignment uses a fresh identifier, even for the same value. ' +
+  'A retry keeps the original identifier, channel and delivery and only reads its outcome. Known identifiers never assign again. ' +
+  'A current session of the same persona incarnation may read historical results in strict mode or dry run.'
 export const SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION =
-  'The channel ID (C... or G...) of a channel your persona has heard a message from, or already holds a choice for'
-
-/** The description of the tool's `delivery` input. */
+  'A public or private channel ID (C... or G...). New assignments require authenticated current membership and explicit non-external-sharing evidence.'
+export const THREAD_HYBRID_GLOSS = '(@mentions, broadcasts and replies in threads the bot is in)'
 export const SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION =
-  '"mentions" (only @mentions of you and @here or @channel broadcasts) or "all" (every message in the channel)'
-
-/** The values the tool's `delivery` input takes, in the order its schema lists them. */
-const SET_CHANNEL_DELIVERY_VALUES: readonly DeliveryMode[] = ['mentions', 'all']
-
-/** Whether `value` is a value the tool's `delivery` input takes: `"mentions"` or `"all"`. */
+  `"off", "mentions" (@mentions and broadcasts), "all" (every message), or "thread_hybrid" ${THREAD_HYBRID_GLOSS}. Keep the original value on retry.`
+export const SET_CHANNEL_DELIVERY_ATTEMPT_DESCRIPTION =
+  'A nonempty identifier you create and retain before first submission. Use a fresh identifier for each deliberate assignment; retain it across response loss, reconnect and restart. Never change it on retry.'
+export const SET_CHANNEL_DELIVERY_INTENT_DESCRIPTION =
+  '"assignment" for a fresh deliberate choice; "retry" to read the original outcome without applying. Retry keeps attempt_id, channel and delivery. An unknown retry remains unresolved.'
+export const SET_CHANNEL_DELIVERY_VALUES = DELIVERY_MODES
+export const SET_CHANNEL_DELIVERY_INPUT_SCHEMA = {
+  type: 'object' as const,
+  properties: {
+    channel: { type: 'string', pattern: CHANNEL_ID_RE.source, description: SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION },
+    delivery: { type: 'string', enum: [...SET_CHANNEL_DELIVERY_VALUES], description: SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION },
+    attempt_id: { type: 'string', minLength: 1, pattern: '\\S', description: SET_CHANNEL_DELIVERY_ATTEMPT_DESCRIPTION },
+    intent: { type: 'string', enum: [...CHANNEL_DELIVERY_INTENTS], description: SET_CHANNEL_DELIVERY_INTENT_DESCRIPTION },
+  },
+  required: ['channel', 'delivery', 'attempt_id', 'intent'],
+  additionalProperties: false,
+}
 function isChannelDeliveryValue(value: unknown): value is DeliveryMode {
   return typeof value === 'string' && (SET_CHANNEL_DELIVERY_VALUES as readonly string[]).includes(value)
 }
@@ -926,75 +995,78 @@ function isChannelDeliveryValue(value: unknown): value is DeliveryMode {
  */
 export const ECHOABLE_CHANNEL_RE = /^[A-Z0-9]{1,24}$/
 
-/**
- * The tool's refusals, in the order a call is checked; the
- * first rule a call breaks gives its tool error:
- * - `declarative-mode`: the configuration in effect is in declarative mode
- *   (`channelDeliveryDeclarativeRefusal`);
- * - `store-unreadable`: the stored-choice file was unreadable at start, or no
- *   store is bound (`channelDeliveryUnreadableRefusal`);
- * - `delivery-invalid`: `delivery` is not `"mentions"` or `"all"`, a missing
- *   value included (`channelDeliveryValueRefusal`);
- * - `channel-unknown`: the channel is neither in the persona's heard set nor
- *   among its stored choices (`channelDeliveryChannelRefusal`).
- * Every one is checked after the resolution refusals.
- */
-export const SET_CHANNEL_DELIVERY_REFUSALS = [
-  'declarative-mode',
-  'store-unreadable',
-  'delivery-invalid',
-  'channel-unknown',
-] as const
-
-/** One of `SET_CHANNEL_DELIVERY_REFUSALS`. */
-export type SetChannelDeliveryRefusal = (typeof SET_CHANNEL_DELIVERY_REFUSALS)[number]
-
 /** The lead every `set_channel_delivery` refusal shares: the tool and the persona (`renderPersonaRef`). */
 function channelDeliveryRefusalLead(name: string, key: string): string {
   return `Tool "${SET_CHANNEL_DELIVERY_TOOL}" refused for persona ${renderPersonaRef(name, key)}`
 }
+export function channelDeliveryAttemptInputRefusal(name: string, key: string): string {
+  return `${channelDeliveryRefusalLead(name, key)}: provide channel, delivery, a nonempty caller-retained attempt_id and intent "assignment" or "retry", with no extra fields. Input values are not shown.`
+}
+export function channelDeliveryDryRunRefusal(name: string, key: string): string {
+  return `${channelDeliveryRefusalLead(name, key)}: dry run cannot create assignments or attempt records. Retained same-incarnation history can be read without writing.`
+}
+export function channelDeliveryCurrentFactsText(current: ChannelDeliveryCurrentFacts): string {
+  if (current.kind === 'available') {
+    const { facts } = current
+    return `Current saved ${facts.saved}, effective ${facts.effective} in ${current.mode} mode.`
+  }
+  const reason: Record<ChannelDeliveryUnavailableReason, string> = {
+    'shared-state-unreadable': 'the shared state is not trustworthy',
+    'channel-removed': 'there is no currently saved channel entry',
+    'absent': 'current membership is absent',
+    'external-sharing': 'external sharing makes the channel ineligible in open mode',
+    'invalid-channel': 'the channel identity is invalid',
+    'installation-unverified': 'the current installation is unverified',
+    'current-membership-missing': 'current membership is unverified',
+    'event-order-conflict': 'membership event order is unresolved',
+    'history-unresolved': 'membership history is unresolved',
+    'event-not-durable': 'membership evidence is not durable',
+    'eligibility-missing': 'channel type or non-external-sharing evidence is missing',
+  }
+  return (current.saved === undefined ? 'Current saved/effective facts are unavailable' : `Current saved ${current.saved}; effective delivery is unavailable`) +
+    `: ${reason[current.reason]}.`
+}
+export function channelDeliveryAttemptResultText(
+  name: string, key: string, channel: string, result: BotAttemptResult, current?: ChannelDeliveryCurrentFacts,
+): string {
+  const lead = `Channel delivery for persona ${renderPersonaRef(name, key)}, channel ${channel}: `
+  const now = current ? ` ${channelDeliveryCurrentFactsText(current)}` : ''
+  if (result.kind === 'applied') {
+    const facts = result.outcome.facts
+    return lead + `${result.historical ? 'previously applied' : 'newly applied'} at position ${result.outcome.resolvedOrder}; original saved ${facts.saved}, effective ${facts.effective}.` +
+      (result.historical ? ' This history read made no new assignment.' : '') + now
+  }
+  if (result.kind === 'not-applied') {
+    const reason = {
+      membership: 'current eligible membership was not verified', inactive: 'the session or persona became inactive',
+      strict: 'strict mode did not authorize an assignment', 'dry-run': 'dry run did not authorize an assignment',
+      'write-failed': 'the application failed before durable activation',
+    }[result.reason]
+    return lead + `this attempt did not apply and changed no choice: ${reason}. Its retained outcome cannot be retried as a new assignment.` + now
+  }
+  if (result.kind === 'binding-conflict') return channelDeliveryRefusalLead(name, key) + ': the identifier cannot be used for these inputs. No assignment was made; original inputs are not disclosed.'
+  if (result.kind === 'pending') return lead + 'the retained attempt is pending; no duplicate application was made. Its outcome requires recovery.' + now
+  if (result.kind === 'inactive' || result.kind === 'invalid') return channelDeliveryRefusalLead(name, key) + ': this request cannot access or change channel delivery.'
+  return lead + 'the durable outcome is unresolved; application or nonapplication cannot be established. Preserve the identifier and seek recovery; retry cannot create an assignment.' + now
+}
 
-/**
- * Rule 1's tool error: declarative mode.
- *
- *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): invited channels are off, and in declarative mode channel delivery is set by the operator in config.json.
- *
- * Pure.
- */
+/** Strict refuses fresh assignments; existing history is resolved first. */
 export function channelDeliveryDeclarativeRefusal(name: string, key: string): string {
   return (
-    `${channelDeliveryRefusalLead(name, key)}: invited channels are off, and in declarative mode ` +
-    'channel delivery is set by the operator in config.json.'
+    `${channelDeliveryRefusalLead(name, key)}: strict mode is active, so ` +
+    'new assignments are unavailable. A retained same-incarnation attempt can still be read without writing.'
   )
 }
 
-/**
- * Rule 2's tool error: the stored-choice file is unreadable,
- * or no store is bound. `path` is the store's path, or
- * `CHANNEL_DELIVERY_FILE_NAME` when no store is bound.
- *
- *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): the stored-choice file "<path>" is not readable, so no channel delivery can be stored. To fix: the operator moves the file aside, then restarts the server.
- *
- * Pure.
- */
+/** Unavailable authority cannot prove application or nonapplication. */
 export function channelDeliveryUnreadableRefusal(name: string, key: string, path: string): string {
   return (
-    `${channelDeliveryRefusalLead(name, key)}: the stored-choice file ${JSON.stringify(path)} is not readable, ` +
-    'so no channel delivery can be stored. To fix: the operator moves the file aside, then restarts the server.'
+    `${channelDeliveryRefusalLead(name, key)}: the shared channel authority ${JSON.stringify(path)} is not trustworthy, ` +
+    'so the outcome is unresolved and no channel delivery can be stored. The operator must preserve the evidence and restore trustworthy shared state before retrying.'
   )
 }
 
-/**
- * Rule 3's tool error: `delivery` is not `"mentions"` or
- * `"all"`. The value is named, JSON-encoded, only when it is a string
- * matching `ECHOABLE_KEY_NAME_RE` (`src/config.ts`); otherwise the error
- * says it is not shown.
- *
- *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): delivery "<value>" is not "mentions" or "all".
- *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): delivery is not "mentions" or "all" (the value given is not shown).
- *
- * Pure.
- */
+/** Echo only a safe delivery label; never render arbitrary inputs. */
 export function channelDeliveryValueRefusal(name: string, key: string, value: unknown): string {
   const allowed = SET_CHANNEL_DELIVERY_VALUES.map((v) => JSON.stringify(v)).join(' or ')
   const lead = channelDeliveryRefusalLead(name, key)
@@ -1003,78 +1075,11 @@ export function channelDeliveryValueRefusal(name: string, key: string, value: un
     : `${lead}: delivery is not ${allowed} (the value given is not shown).`
 }
 
-/**
- * Rule 4's tool error: the channel is not known, neither in
- * the persona's heard set nor among its stored choices. The channel is
- * named, JSON-encoded, only when it matches `ECHOABLE_CHANNEL_RE`; otherwise
- * the error says it is not shown.
- *
- *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): channel "<channel>" is not known: it is not a channel this persona has heard a message from in fungible mode, or holds a choice for. Only a public or private channel that is not externally shared can be set.
- *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): the channel is not known (the value given is not shown): it is not a channel this persona has heard a message from in fungible mode, or holds a choice for. Only a public or private channel that is not externally shared can be set.
- *
- * Pure.
- */
+/** Listing or heard traffic never supplies current membership authority. */
 export function channelDeliveryChannelRefusal(name: string, key: string, channel: unknown): string {
   const what = typeof channel === 'string' && ECHOABLE_CHANNEL_RE.test(channel)
-    ? `channel ${JSON.stringify(channel)} is not known`
-    : 'the channel is not known (the value given is not shown)'
-  return (
-    `${channelDeliveryRefusalLead(name, key)}: ${what}: it is not a channel this persona has heard a message from ` +
-    'in fungible mode, or holds a choice for. Only a public or private channel that is not externally shared can be set.'
-  )
-}
-
-/**
- * The result of an accepted call: the channel, the stored
- * choice, and the persona's channel delivery there from the next event,
- * `result` (`channelDeliveryFor` with the choice just stored). When the loop
- * guard holds the channel at `mentions`, it says so and that the channel is
- * another persona's fungible destination.
- *
- *   Stored <stored> as your channel delivery for channel <channel>. From the next message in that channel, your channel delivery there is <delivery>.
- *   Stored <stored> as your channel delivery for channel <channel>. From the next message in that channel, your channel delivery there is mentions: the channel is another persona's fungible destination, where its permission prompts and notices go, so the loop guard holds it at mentions whatever is stored.
- *
- * Pure.
- */
-export function channelDeliverySetResultText(channel: string, stored: DeliveryMode, result: ChannelDeliveryResult): string {
-  const lead = `Stored ${stored} as your channel delivery for channel ${channel}. ` +
-    `From the next message in that channel, your channel delivery there is ${result.delivery}`
-  return result.heldByLoopGuard
-    ? `${lead}: the channel is another persona's fungible destination, where its permission prompts and notices go, ` +
-      `so the loop guard holds it at ${result.delivery} whatever is stored.`
-    : `${lead}.`
-}
-
-/**
- * The tool error of a failed write: names the
- * persona and the file. Memory is unchanged; the store logs its own
- * `[slack] channel-delivery:` line.
- *
- *   Tool "set_channel_delivery" failed for persona "<name>" (key=<key>): the stored-choice file "<path>" could not be written, so the choice was not stored and channel delivery is unchanged.
- *
- * Pure.
- */
-export function channelDeliveryWriteFailedText(name: string, key: string, path: string): string {
-  return (
-    `Tool "${SET_CHANNEL_DELIVERY_TOOL}" failed for persona ${renderPersonaRef(name, key)}: the stored-choice file ` +
-    `${JSON.stringify(path)} could not be written, so the choice was not stored and channel delivery is unchanged.`
-  )
-}
-
-/**
- * The tool error when the store refuses an input it would not write (its
- * `invalid` answer, such as a clock that gives no timestamp): nothing is
- * written and memory is unchanged.
- *
- *   Tool "set_channel_delivery" failed for persona "<name>" (key=<key>): the choice was not stored (the store refused its <field>), so channel delivery is unchanged.
- *
- * Pure.
- */
-export function channelDeliveryNotStoredText(name: string, key: string, field: ChannelDeliverySetInvalidField): string {
-  return (
-    `Tool "${SET_CHANNEL_DELIVERY_TOOL}" failed for persona ${renderPersonaRef(name, key)}: the choice was not stored ` +
-    `(the store refused its ${field}), so channel delivery is unchanged.`
-  )
+    ? `channel ${JSON.stringify(channel)}` : 'the channel (the value given is not shown)'
+  return `${channelDeliveryRefusalLead(name, key)}: ${what} needs a valid public or private channel ID and authenticated current eligible membership for a new assignment.`
 }
 
 // ---------------------------------------------------------------------------
@@ -1225,19 +1230,27 @@ function buildFilesRefusedText(reason: string, fileCount: number, posted?: strin
   )
 }
 
-/** every session receives the nine retained points in order. */
+export const FETCH_MESSAGES_DESCRIPTION = 'Fetch message history from a channel, DM conversation or thread. Returns a JSON array, oldest first. In a thread_hybrid channel with thread_ts, returns { messages, next_cursor } instead: one page of the thread, its channel message on the first page only; pass next_cursor back as cursor for the next page until none is returned.'
+export const FETCH_MESSAGES_CURSOR_DESCRIPTION = 'In a thread_hybrid channel with thread_ts: the next_cursor from the previous page, to read the next page (optional)'
+
+export function fetchMessagesCursorRefusal(): string {
+  return 'Tool "fetch_messages" refused: cursor must be a string.'
+}
+
+/** Every session receives these eleven points in order. */
 export const MCP_INSTRUCTIONS_MAX_CHARS = 2048
 export const MCP_INSTRUCTIONS = [
   'The sender reads Slack, not your terminal. Answer with reply, using chat_id and thread_ts for a thread; end a turn with no terminal text unless a terminal reader needs it.',
   'Messages arrive as the <channel> tag described in the system prompt, carrying channel_name and, for a long message, part.',
-  'via: dm = a direct message; mention = you were @mentioned; broadcast = @here or @channel; receive_all_shared = a channel where you and another persona receive every message; receive_all = a channel where you, and no other persona on this server, receive every message.',
+  'via: dm = a direct message; mention = you were @mentioned; broadcast = @here or @channel; thread = a reply in a thread the bot is in; receive_all_shared = a channel where you and another persona receive every message; receive_all = a channel where you, and no other persona on this server, receive every message.',
   '<@ID> mentions a Slack user or persona. Use <@ID> to address another persona.',
   'If attachment_count is present, use download_attachment(chat_id, message_id) to fetch attachments.',
-  'You may act in every channel you receive. With invited channels off, these are your configured channels; with it on, channels your Slack app belongs to (Slack refuses others).',
-  `${SET_CHANNEL_DELIVERY_TOOL} sets listening to mentions (@mentions and @here/@channel broadcasts) or all (every message). Use it when someone in that channel asks; it requires invited channels on.`,
-  'With DMs on, you may reply, react, edit_message, fetch_messages and download_attachment in a DM you belong to (D... chat_id). To start a DM, reply takes a user ID (U... or W...) as chat_id and returns the D... ID for later edits, reactions, reads and thread replies. Other tools take no user ID. With DMs off you have no DM target. Any other target is refused.',
+  'In strict mode you may act in your configured non-off channels. In open mode Slack enforces channel access.',
+  `${SET_CHANNEL_DELIVERY_TOOL} sets listening to off, mentions (@mentions and broadcasts), all (every message), or thread_hybrid ${THREAD_HYBRID_GLOSS}. Use when asked in that channel; new assignments need open mode. Retain attempt_id before submission; fresh assignments use fresh IDs. Retry keeps ID/channel/value and only reads history.`,
+  'Thread Memory notices (including Joins lost) in your notice destination are for the operator; do not act on them.',
+  'With DMs on, you may reply, react, edit_message, fetch_messages and download_attachment in a DM you belong to (D... chat_id). To start a DM, reply takes a user ID (U... or W...) as chat_id and returns the D... ID for later calls. Other tools take no user ID. With DMs off you have no DM target. Any other target is refused.',
   'To remove the ack reaction, reply with message_id (the triggering message ts) or react to that message.',
-  'reply accepts files: ["/abs/path.png"] for attachments. react adds emoji reactions; edit_message updates a sent message; fetch_messages reads real Slack history from conversations.history.',
+  'reply accepts files: ["/abs/path.png"] for attachments. react adds emoji reactions; edit_message updates a sent message; fetch_messages reads Slack history; in a thread_hybrid channel, pass its next_cursor back as cursor to read a whole thread.',
 ].join('\n')
 
 /**
@@ -1251,6 +1264,12 @@ export function createSessionServer(
   deps: SessionToolDeps,
 ): Server {
   const { assertSendable, getReplySettings, getPersona, clientFor, resolveUserName, inboxDir, consumeAck } = deps
+  const currentSessionLife = (): boolean => {
+    const store = deps.getChannelDelivery?.()
+    return !store || (!store.isRetiring(entry.personaKey) &&
+      entry.personaIncarnation !== undefined && entry.personaIncarnation === store.incarnation(entry.personaKey) &&
+      getSessionByPersona(entry.personaKey) === entry)
+  }
 
   const server = new Server(
     { name: MCP_SERVER_NAME, version: '0.1.0' },
@@ -1330,8 +1349,7 @@ export function createSessionServer(
       },
       {
         name: 'fetch_messages',
-        description:
-          'Fetch message history from a channel, DM conversation or thread. Returns oldest-first.',
+        description: FETCH_MESSAGES_DESCRIPTION,
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1344,6 +1362,7 @@ export function createSessionServer(
               type: 'string',
               description: 'If set, fetch replies in this thread',
             },
+            cursor: { type: 'string', description: FETCH_MESSAGES_CURSOR_DESCRIPTION },
           },
           required: ['channel'],
         },
@@ -1367,18 +1386,7 @@ export function createSessionServer(
       {
         name: SET_CHANNEL_DELIVERY_TOOL,
         description: SET_CHANNEL_DELIVERY_DESCRIPTION,
-        inputSchema: {
-          type: 'object' as const,
-          properties: {
-            channel: { type: 'string', description: SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION },
-            delivery: {
-              type: 'string',
-              enum: [...SET_CHANNEL_DELIVERY_VALUES],
-              description: SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION,
-            },
-          },
-          required: ['channel', 'delivery'],
-        },
+        inputSchema: SET_CHANNEL_DELIVERY_INPUT_SCHEMA,
       },
     ],
   }))
@@ -1388,12 +1396,12 @@ export function createSessionServer(
   //
   // Every call resolves the session's persona and the channel mode at call
   // time (the persona from the entry this server closes over, the mode
-  // through `deps.getChannelMode`, declarative when it is absent), checks the
+  // through `deps.getChannelMode`, strict when it is absent), checks the
   // tool's target against them (`checkPersonaTarget`, before the dry-run
   // branch), and outside dry run makes every Slack call on the persona's own
   // client, with no username or icon override. A refusal is a tool error
   // (`isError: true`), never a protocol error, and makes no Slack call. In
-  // fungible mode, a failed call on a channel target returns
+  // open mode, a failed call on a channel target returns
   // `slackRefusalToolErrorText`.
   //
   // A user-ID target (`reply` only) is opened with `conversations.open` on the
@@ -1401,6 +1409,17 @@ export function createSessionServer(
   // returned conversation; the user ID itself never reaches a Slack write,
   // which would open a DM implicitly.
   // -------------------------------------------------------------------------
+
+  function checkCurrentTarget(persona: Persona, target: string, action: PersonaTargetAction, mode: ChannelMode): PersonaTargetCheck {
+    const scope = checkPersonaTarget(persona, target, action, mode)
+    // Open ordinary tools use Slack access, independently of channel choices.
+    // Strict must not use an old non-off projection during an uncertain write.
+    if (scope.allowed && scope.kind === 'channel' && mode === 'strict' &&
+        deps.getChannelDelivery?.()?.readableFor(persona.key, target) === false) {
+      return { allowed: false, message: CHANNEL_TARGET_STATE_UNRESOLVED }
+    }
+    return scope
+  }
 
   /** Today's dry-run result for a tool whose target passed the scope check. */
   function dryRunResult(name: string, args: Record<string, any>, kind: PersonaTargetKind) {
@@ -1459,17 +1478,41 @@ export function createSessionServer(
     }
   }
 
+  /** A legacy tracked ack's removal through the caller's client; `kept` (a react's emoji) is never removed. */
+  function legacyAckRemoval(web: WebClient, chatId: string, messageId: string, ackReaction: string | undefined, kept?: string): () => Promise<unknown> {
+    return async () => {
+      if (ackReaction && ackReaction !== kept) await web.reactions.remove({ channel: chatId, timestamp: messageId, name: ackReaction })
+    }
+  }
+
   /**
-   * Record a successful correlated reply or react and detach removal of the
-   * persona's own ack reaction, so a held reaction call never delays the
-   * remaining content or the tool result. `kept` (a react's emoji) is never removed.
+   * Record a successful correlated reply and detach removal of the persona's
+   * own ack reaction, so a held reaction call never delays the remaining
+   * content or the tool result.
    */
-  function releaseAck(persona: Persona, web: WebClient, chatId: string, messageId: string, ackReaction: string | undefined, kept?: string): void {
+  function releaseAck(persona: Persona, web: WebClient, chatId: string, messageId: string, ackReaction: string | undefined): void {
     try {
-      void Promise.resolve(consumeAck(persona.key, chatId, messageId, async () => {
-        if (ackReaction && ackReaction !== kept) await web.reactions.remove({ channel: chatId, timestamp: messageId, name: ackReaction })
-      }, kept)).catch(() => {})
+      void Promise.resolve(consumeAck(persona.key, chatId, messageId, legacyAckRemoval(web, chatId, messageId, ackReaction))).catch(() => {})
     } catch { /* reaction cleanup cannot fail a successful tool call */ }
+  }
+
+  /**
+   * Claim a successful react's answer, which also releases the persona's ack
+   * as releaseAck does, keeping the emoji. Only a first answer with the bot
+   * user ID read before the add reaches `onReactClaimed`. Cleanup is
+   * detached, and neither a claim failure nor the callback can delay or
+   * change the tool result.
+   */
+  function claimReact(persona: Persona, web: WebClient, botUserId: string | undefined, chatId: string, messageId: string, emoji: string): void {
+    const removeLegacy = legacyAckRemoval(web, chatId, messageId, getReplySettings().ack_reaction, emoji)
+    let alreadyHeld = true
+    try {
+      alreadyHeld = (deps.claimReactAnswer ?? claimReactAnswer)(persona.key, chatId, messageId, emoji, removeLegacy)
+    } catch { /* a failed claim is never a first answer */ }
+    if (alreadyHeld !== false || !botUserId || !deps.onReactClaimed) return
+    try {
+      deps.onReactClaimed({ persona, client: web, botUserId, chatId, messageId, emoji })
+    } catch { /* the hand-off cannot fail a successful react */ }
   }
 
   /**
@@ -1486,6 +1529,7 @@ export function createSessionServer(
     web: WebClient,
     kind: PersonaTargetKind,
     dm: { opened?: string },
+    botUserId: string | undefined,
   ) {
     switch (name) {
       // ---------------------------------------------------------------------
@@ -1507,6 +1551,14 @@ export function createSessionServer(
         if (kind === 'user') {
           const opened = await openDmConversation(name, persona, web, chatId)
           if (!opened.ok) return toolError(opened.message)
+          const current = getPersona(persona.key)
+          if (!current || !currentSessionLife()) return toolError(personaNotAppliedRefusal(name, persona.key))
+          const mode = deps.getChannelMode?.() ?? 'strict'
+          for (const target of [chatId, opened.id]) {
+            const scope = checkCurrentTarget(current, target, 'post', mode)
+            if (!scope.allowed) return toolError(scope.message)
+          }
+          persona = current
           dm.opened = opened.id
           where = `${opened.id} (the DM with ${chatId})`
           chatId = opened.id
@@ -1523,41 +1575,122 @@ export function createSessionServer(
         let lastTs = ''
         let firstTs = ''
         let firstChunk = true
+        // The calling persona's own ack reaction, removed through its own
+        // client at most once (first success), only when its own entry for
+        // this message existed. `chatId` is the conversation posted to (for
+        // a user target, the DM just opened). Shared by text and file successes.
+        const succeeded = () => {
+          if (!firstChunk) return
+          firstChunk = false
+          clearAck()
+        }
+        const target = { channel: chatId, ...(threadTs ? { parent: threadTs } : {}) }
+        // Confirmed parts survive any later failure; none is posted again.
+        let sent = 0
+        let uploaded = 0
+        const prefix = (): ReplyPostedPrefix => ({ where, sent, total: chunks.length, ...(lastTs ? { lastTs } : {}), uploaded, files: files?.length ?? 0 })
+        const partialFailure = (err: unknown) => {
+          const log = deps.log ?? ((line: string) => console.error(line))
+          log(replyPartialFailureLogLine(renderPersonaRef(persona.name, persona.key), prefix(), err))
+          return toolError(replyPartialFailureText(prefix(), slackPlatformReason(err)))
+        }
         for (const chunk of chunks) {
-          const res = await web.chat.postMessage({
-            channel: chatId,
-            text: chunk,
-            thread_ts: threadTs,
-            unfurl_links: false,
-            unfurl_media: false,
-          })
-          lastTs = (res.ts as string) || lastTs
-          if (firstChunk) firstTs = (res.ts as string) || ''
-
-          // The calling persona's own ack reaction, removed through its own
-          // client at most once (first chunk), only when its own entry for
-          // this message existed. `chatId` is the conversation posted to (for
-          // a user target, the DM just opened).
-          if (firstChunk) {
-            firstChunk = false
-            clearAck()
+          // Each call captures its own intent and waits only for that append.
+          let op: OwnPostStart | undefined
+          try {
+            op = deps.ownPosts?.start(persona.key, 'text', target, { kind: 'text', text: chunk })
+            if (op?.ready) await op.ready
+          } catch { /* join bookkeeping cannot stop the remaining parts */ }
+          let res: Awaited<ReturnType<WebClient['chat']['postMessage']>>
+          try {
+            res = await web.chat.postMessage({
+              channel: chatId,
+              text: chunk,
+              thread_ts: threadTs,
+              unfurl_links: false,
+              unfurl_media: false,
+            })
+          } catch (err) {
+            try {
+              deps.ownPosts?.end(op?.operation, ownPostAnswerOfError(err))
+            } catch { /* join bookkeeping cannot stop the remaining parts */ }
+            if (sent === 0) throw err
+            return partialFailure(err)
           }
+          // Settle before reaction cleanup and before any other await.
+          try {
+            deps.ownPosts?.end(op?.operation, ownPostAnswerOfPost(chatId, res))
+          } catch { /* join bookkeeping cannot stop the remaining parts */ }
+          const ts = typeof res.ts === 'string' && res.ts !== '' ? res.ts : undefined
+          if (sent === 0) firstTs = ts ?? ''
+          sent++
+          lastTs = ts ?? lastTs
+          succeeded()
         }
 
         if (hasFiles) {
+          // One upload shares every file in one message; each file is still
+          // its own operation, under the parent the upload is threaded in and
+          // digested by the name the upload sends.
+          const uploadParent = threadTs || firstTs
+          const fileTarget = { channel: chatId, ...(uploadParent ? { parent: uploadParent } : {}) }
+          const ops: (OwnPostStart | undefined)[] = []
+          for (const filePath of files!) {
+            let op: OwnPostStart | undefined
+            try {
+              const size = statSync(resolve(filePath)).size
+              op = deps.ownPosts?.start(persona.key, 'file', fileTarget, { kind: 'file', name: basename(filePath), size })
+              if (op?.ready) await op.ready
+            } catch { /* missing metadata or join bookkeeping cannot stop the upload */ }
+            ops.push(op)
+          }
+          const ended = new Set<number>()
+          const endUpload = (at: number, answer: OwnPostAnswer) => {
+            if (ended.has(at)) return
+            ended.add(at)
+            try {
+              deps.ownPosts?.end(ops[at]?.operation, answer)
+            } catch { /* join bookkeeping cannot stop the remaining parts */ }
+          }
+          const endRemaining = (answer: OwnPostAnswer) => { for (let at = 0; at < ops.length; at++) endUpload(at, answer) }
           // Check every file again right before the upload: the text posts
           // above widen the window in which a symlink could be re-pointed at
           // a file the up-front pass would have refused.
           const reason = firstUnsendableReason(files!, assertSendable)
           if (reason !== undefined) {
+            endRemaining({ kind: 'failed', code: OWN_POST_UPLOAD_REFUSED })
             const posted = filesOnly
               ? undefined
-              : `${chunks.length} message(s) to ${where}${lastTs ? ` [ts: ${lastTs}]` : ''}`
+              : `${sent} message(s) to ${where}${lastTs ? ` [ts: ${lastTs}]` : ''}`
             return toolError(buildFilesRefusedText(reason, files!.length, posted))
           }
-
-          await web.filesUploadV2(replyUploadArgs(chatId, files!, threadTs, firstTs, text) as any)
-          if (firstChunk) clearAck()
+          // Each nested completion is confirmed in its own reaction, so files
+          // a group completed stay uploaded when the aggregate rejects.
+          // Confirmed files end the operations in file order.
+          let completed = 0
+          const onCompletion = (response: unknown) => {
+            for (const file of completionFiles(response)) {
+              if (completed < ops.length) endUpload(completed, { kind: 'confirmed', channel: chatId, file: file.id })
+              completed++
+            }
+            if (completed) succeeded()
+          }
+          try {
+            const result: unknown = await withFileCompletions(onCompletion, () => web.filesUploadV2(replyUploadArgs(chatId, files!, threadTs, firstTs, text) as any))
+            // A client built without the observation reports its completions only in the aggregate.
+            const responses = (result as { files?: unknown } | undefined)?.files
+            if (!completed && Array.isArray(responses)) for (const response of responses) onCompletion(response)
+            endRemaining({ kind: 'no-answer' })
+          } catch (err) {
+            endRemaining(ownPostAnswerOfError(err))
+            uploaded = Math.min(completed, files!.length)
+            if (uploaded < files!.length) {
+              if (sent === 0 && uploaded === 0) throw err
+              return partialFailure(err)
+            }
+          }
+          uploaded = files!.length
+          succeeded()
         }
 
         return {
@@ -1581,7 +1714,7 @@ export function createSessionServer(
           // The persona's own reaction is already there, as when it matches its ack.
           if (slackPlatformReason(err) !== 'already_reacted') throw err
         }
-        releaseAck(persona, web, chatId, messageId, getReplySettings().ack_reaction, emoji)
+        claimReact(persona, web, botUserId, chatId, messageId, emoji)
         return {
           content: [{ type: 'text', text: `Reacted :${emoji}: to ${messageId}` }],
         }
@@ -1609,35 +1742,49 @@ export function createSessionServer(
         const limit = Math.min(args.limit || 20, 100)
         const threadTs: string | undefined = args.thread_ts
 
+        const paged = kind === 'channel' && !!threadTs && channelDeliveryFor(persona.key, channel, {
+          storedChoices: deps.getChannelDelivery?.(),
+        }).delivery === 'thread_hybrid'
+        if (paged && Object.hasOwn(args, 'cursor') && typeof args.cursor !== 'string') {
+          return toolError(fetchMessagesCursorRefusal())
+        }
+        const cursor = paged && args.cursor ? args.cursor as string : undefined
+
         let messages: any[]
+        let nextCursor: string | undefined
         if (threadTs) {
-          const res = await web.conversations.replies({ channel, ts: threadTs, limit })
+          const res = await web.conversations.replies({ channel, ts: threadTs, limit, ...(cursor ? { cursor } : {}) })
           messages = res.messages || []
+          if (paged) {
+            if (cursor) messages = messages.filter(m => m.ts !== threadTs)
+            const next = res.response_metadata?.next_cursor
+            if (typeof next === 'string' && next !== '') nextCursor = next
+          }
         } else {
           const res = await web.conversations.history({ channel, limit })
           messages = (res.messages || []).reverse()
         }
 
-        const formatted = await Promise.all(
-          messages.map(async (m: any) => {
-            const userName = m.user ? await resolveUserName(persona.key, m.user) : 'unknown'
-            return {
-              ts: m.ts,
-              user: userName,
-              user_id: m.user,
-              text: m.text,
-              thread_ts: m.thread_ts,
-              files: m.files?.map((f: any) => ({
-                name: f.name,
-                mimetype: f.mimetype,
-                size: f.size,
-              })),
-            }
-          }),
-        )
+        const formatMessage = async (m: any) => {
+          const userName = m.user ? await resolveUserName(persona.key, m.user) : 'unknown'
+          return {
+            ts: m.ts,
+            user: userName,
+            user_id: m.user,
+            text: m.text,
+            thread_ts: m.thread_ts,
+            files: m.files?.map((f: any) => ({
+              name: f.name,
+              mimetype: f.mimetype,
+              size: f.size,
+            })),
+          }
+        }
+        const formatted = await Promise.all(messages.map(formatMessage))
+        const result = paged ? { messages: formatted, ...(nextCursor ? { next_cursor: nextCursor } : {}) } : formatted
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(formatted, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
         }
       }
 
@@ -1734,81 +1881,53 @@ export function createSessionServer(
   }
 
   // -------------------------------------------------------------------------
-  // set_channel_delivery (to; resolution as
-  // and , beside and
-  //)
-  //
-  // One synchronous stretch from reading the entry's persona key to the
-  // store's write, with no await, so no confirmed apply's step 1 comes
-  // between the persona resolved and the declaration stored.
-  // Resolution first: a session matched to no persona, a key that is not an
-  // applied persona's, a retiring key (the store's `isRetiring`), and a
-  // session entry that is not the one the registry holds for its key (dropped
-  // by `dropPersonaSession` or replaced by a newer registration) each get the
-  // other tools' refusal. Then rules, in order. A refused call
-  // stores, writes and logs nothing. An accepted call makes one store write
-  // and logs one `persona-channel-delivery-set` line after it. The tool never
-  // passes `checkPersonaTarget`, never reads a client and never makes a Slack
-  // call; dry run is not consulted, so it stores as outside dry run.
-  // -------------------------------------------------------------------------
-
+  // Logical attempt access and application stay synchronous. No admitted
+  // session/membership fact crosses an await, and the authority rechecks at
+  // its final turn after retaining the attempt binding.
   function setChannelDelivery(name: string, args: Record<string, unknown>) {
     const key = entry.personaKey
     if (!key) return toolError(sessionNotMatchedRefusal(name))
-    const persona = getPersona(key)
-    if (!persona) return toolError(personaNotAppliedRefusal(name, key))
+    const access = () => entry.connected && !!getPersona(key) && currentSessionLife() &&
+      getSessionByPersona(key) === entry && deps.isPersonaUp?.(key) === true
+    if (!access()) return toolError(personaNotAppliedRefusal(name, key))
+    const persona = getPersona(key)!
     const store = deps.getChannelDelivery?.()
-    if (store?.isRetiring(key) === true) return toolError(personaNotAppliedRefusal(name, key))
-    if (getSessionByPersona(key) !== entry) return toolError(personaNotAppliedRefusal(name, key))
-
-    // rules, in order; the first broken gives the error.
-    const mode: ChannelMode = deps.getChannelMode?.() ?? 'declarative'
-    if (mode !== 'fungible') return toolError(channelDeliveryDeclarativeRefusal(persona.name, key))
-    if (store === undefined || !store.readable) {
-      return toolError(channelDeliveryUnreadableRefusal(persona.name, key, store?.path ?? CHANNEL_DELIVERY_FILE_NAME))
+    if (!store || !entry.personaIncarnation) return toolError(channelDeliveryUnreadableRefusal(persona.name, key, store?.path ?? CHANNEL_DELIVERY_FILE_NAME))
+    if (!isChannelDeliveryValue(args.delivery)) return toolError(channelDeliveryValueRefusal(persona.name, key, args.delivery))
+    if (typeof args.channel !== 'string' || !CHANNEL_ID_RE.test(args.channel)) return toolError(channelDeliveryChannelRefusal(persona.name, key, args.channel))
+    if (!validChannelDeliveryAttemptId(args.attempt_id) || !validChannelDeliveryAttempt(args)) {
+      return toolError(channelDeliveryAttemptInputRefusal(persona.name, key))
     }
-    const delivery = args['delivery']
-    if (!isChannelDeliveryValue(delivery)) return toolError(channelDeliveryValueRefusal(persona.name, key, delivery))
-    const channel = args['channel']
-    const known = typeof channel === 'string' && channel !== '' &&
-      ((deps.heardChannels?.(key).has(channel) ?? false) || store.storedChannels(key).includes(channel))
-    if (!known) return toolError(channelDeliveryChannelRefusal(persona.name, key, channel))
-
-    // one write, with P's declaration from the configuration in effect.
-    const outcome = store.set(key, channel, delivery, channelDeliveryDeclarationOf(persona))
-    switch (outcome.kind) {
-      case CHANNEL_DELIVERY_SET_STORED:
-        break
-      case CHANNEL_DELIVERY_SET_WRITE_FAILED:
-        // the store logged its own failed-write line; memory is unchanged.
-        return toolError(channelDeliveryWriteFailedText(persona.name, key, outcome.path))
-      case CHANNEL_DELIVERY_SET_UNREADABLE:
-        return toolError(channelDeliveryUnreadableRefusal(persona.name, key, outcome.path))
-      default:
-        return toolError(channelDeliveryNotStoredText(persona.name, key, outcome.field))
+    const request: ChannelDeliveryAttemptRequest = args
+    const history = store.lookupAttempt(key, entry.personaIncarnation, request)
+    const answer = (outcome: BotAttemptResult) => {
+      if (!access()) return toolError(personaNotAppliedRefusal(name, key))
+      const mode = deps.getChannelMode?.() ?? 'strict'
+      const current = ['binding-conflict', 'inactive', 'invalid'].includes(outcome.kind) ? undefined : currentChannelDeliveryFacts(
+        key, request.channel, mode, store,
+        deps.readChannelMembership?.(key, request.channel, mode),
+      )
+      const text = channelDeliveryAttemptResultText(persona.name, key, request.channel, outcome, current)
+      return outcome.kind === 'applied' ? { content: [{ type: 'text', text }] } : toolError(text)
     }
-
-    // P's channel delivery there from the next event:
-    // the one loop guard over the applied personas' destinations, built as the
-    // routing builds them, with the choice just stored. Rule 1 passed, so the
-    // mode read above is fungible, and the destination rule is given that
-    // switch.
-    const applied = deps.getAppliedPersonas?.() ?? [persona]
-    const result = channelDeliveryFor(key, channel, {
-      fungibleDestinations: fungibleDestinationsOf({ allow_invited_channels: true }, applied),
-      storedChoices: store,
-    })
-    // one line per accepted call, after the
-    // write, to the `[slack]` stream only.
-    const log = deps.log ?? ((line: string) => console.error(line))
-    log(formatPersonaDiagnostic({
-      class: PERSONA_CHANNEL_DELIVERY_SET,
-      name: persona.name,
-      key,
-      index: persona.index,
-      cause: channelDeliverySetCause(channel, outcome.previous, delivery, result.delivery),
+    if (history) return answer(history)
+    if (request.intent === 'retry') return answer({ kind: 'unresolved' })
+    if ((deps.getChannelMode?.() ?? 'strict') !== 'open') return toolError(channelDeliveryDeclarativeRefusal(persona.name, key))
+    if (isDryRun()) return toolError(channelDeliveryDryRunRefusal(persona.name, key))
+    return answer(store.attempt(key, entry.personaIncarnation, request, () => {
+      if (!access()) return 'inactive'
+      if (isDryRun()) return 'dry-run'
+      if ((deps.getChannelMode?.() ?? 'strict') !== 'open') return 'strict'
+      const membership = deps.readChannelMembership?.(key, request.channel, 'open')
+      if (membership?.kind !== 'eligible' || membership.lifetime.incarnation !== entry.personaIncarnation) return 'membership'
+      return undefined
+    }, outcome => {
+      const log = deps.log ?? ((line: string) => console.error(line))
+      log(formatPersonaDiagnostic({ class: PERSONA_CHANNEL_DELIVERY_SET,
+        name: persona.name, key, index: persona.index,
+        cause: channelDeliverySetCause(request.channel, outcome.previous, outcome.facts.saved, outcome.facts.effective),
+      }))
     }))
-    return { content: [{ type: 'text', text: channelDeliverySetResultText(channel, delivery, result) }] }
   }
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -1825,32 +1944,36 @@ export function createSessionServer(
     // The calling instance's persona, resolved now (not at session creation).
     const key = entry.personaKey
     if (!key) return toolError(sessionNotMatchedRefusal(name))
-    const persona = getPersona(key)
-    if (!persona) return toolError(personaNotAppliedRefusal(name, key))
+    if (!getPersona(key) || !currentSessionLife()) return toolError(personaNotAppliedRefusal(name, key))
     if (name === 'reply' || name === 'react') await deps.onReplyCall?.(key)
+    const persona = getPersona(key)
+    if (!persona || !currentSessionLife()) return toolError(personaNotAppliedRefusal(name, key))
     // The channel mode, read now with the persona.
-    const mode: ChannelMode = deps.getChannelMode?.() ?? 'declarative'
+    const mode: ChannelMode = deps.getChannelMode?.() ?? 'strict'
 
     // Posting scope, before the dry-run branch.
     const rawTarget = args[toolTarget.arg]
     const target = typeof rawTarget === 'string' ? rawTarget : ''
-    const scope = checkPersonaTarget(persona, target, toolTarget.action, mode)
+    const scope = checkCurrentTarget(persona, target, toolTarget.action, mode)
     if (!scope.allowed) return toolError(scope.message)
 
     if (isDryRun()) return dryRunResult(name, args, scope.kind)
 
     const ref = renderPersonaRef(persona.name, persona.key)
     const web = clientFor(key)
+    // Read with the client, before the add: an identity swap while the add is
+    // pending cannot pair this client with another bot user ID.
+    const botUserId = name === 'react' ? deps.getBotUserId?.(key) : undefined
     if (!web) return toolError(`Tool "${name}" refused: the Slack client for persona ${ref} is not available.`)
 
     const dm: { opened?: string } = {}
     try {
-      return await runTool(name, args, persona, web, scope.kind, dm)
+      return await runTool(name, args, persona, web, scope.kind, dm, botUserId)
     } catch (err) {
-      // Fungible mode, channel target: Slack enforces
+      // Open mode, channel target: Slack enforces
       // membership, so its refusal names the persona, the channel and
       // Slack's error code. The log line stays token-safe.
-      if (mode === 'fungible' && scope.kind === 'channel') {
+      if (mode === 'open' && scope.kind === 'channel') {
         console.error(
           `[slack] Tool "${name}" failed for persona ${ref} on channel ${JSON.stringify(target)}: ${describeThrownValue(err)}`,
         )

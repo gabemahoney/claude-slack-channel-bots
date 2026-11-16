@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, sym
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { removeLegacyReplyHooks } from '../src/legacy-reply-hook-cleanup.ts'
+import { MAX_RELOAD_FILE_BYTES, readPersonaConfigBytes } from '../src/config.ts'
 import { assertNoLeak, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 
@@ -103,6 +104,38 @@ test('malformed and unreadable settings fail locally without exposing values or 
   ])
   assertNoLeak(lines)
 })
+
+test.each([MAX_RELOAD_FILE_BYTES, MAX_RELOAD_FILE_BYTES + 1, MAX_RELOAD_FILE_BYTES * 2])(
+  'settings cleanup independently bounds a valid %i-byte file and still cleans the next directory', size => {
+    const unrelated = { type: 'command', command: '/my/stop-hook.sh' }
+    const doc = { env: { private: LEAK_SENTINEL }, hooks: { Stop: [{ hooks: [retired(), unrelated] }] } }
+    const f = settings('bounded', doc)
+    const before = Buffer.from(f.bytes().padEnd(size, ' '))
+    expect(before.byteLength).toBe(size)
+    writeFileSync(f.path, before)
+    const inode = statSync(f.path).ino
+    // Configuration's uncapped default must not relax the independent settings limit.
+    expect(readPersonaConfigBytes(f.path).equals(before)).toBe(true)
+    const next = settings('next', { hooks: { Stop: [{ hooks: [retired()] }] } })
+    const lines: string[] = []
+
+    removeLegacyReplyHooks([f.config, next.config], line => lines.push(line))
+
+    assertNoLeak(lines)
+    if (size > MAX_RELOAD_FILE_BYTES) {
+      expect(readFileSync(f.path).equals(before)).toBe(true)
+      expect(statSync(f.path).ino).toBe(inode)
+      expect(lines).toEqual([
+        '[slack] reply-reminder: legacy hook cleanup failed; retrying on the next launch',
+        '[slack] reply-reminder: removed the legacy Stop hook',
+      ])
+    } else {
+      expect(JSON.parse(f.bytes())).toEqual({ ...doc, hooks: { Stop: [{ hooks: [unrelated] }] } })
+      expect(lines).toEqual(Array(2).fill('[slack] reply-reminder: removed the legacy Stop hook'))
+    }
+    expect(JSON.parse(next.bytes()).hooks.Stop).toEqual([])
+  },
+)
 
 test('the fake operator config and a symlink to it are refused without changing either file', () => {
   const home = join(dir, 'home'), operator = join(home, '.claude')

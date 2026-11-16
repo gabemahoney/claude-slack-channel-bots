@@ -5,21 +5,29 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { SendKeysParams } from 'agent-director'
 import { createDeliveryEngines, createDeliveryLifecycle, DELIVERY_ROW_POLL_MS, type DeliveryEngineDeps, type DeliveryEngines, type DeliveryEngineEvent } from '../../src/delivery-engine.ts'
-import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
+import { createDeliveryPreparation, type DeliveryPreparationDeps } from '../../src/delivery-intake.ts'
 import type { AcceptedInput, DeliveryQueue, DeliveryQueueOptions, QueueRecord } from '../../src/delivery-queue.ts'
 import { createFakeClock } from './fake-clock.ts'
 import { makeQueue, injectedInput, readQueue } from './delivery-queue.ts'
+import { durableIo } from './durable-io.ts'
 import { cannedGetResult, makeStubClient, type CannedGetResult } from './agent-director-stub.ts'
 import { appendTranscript, codexPromptEntry, endedTurn, promptEntry, replyEntry, writeTranscript } from './working-row-panes.ts'
 
-export async function makeEngineHarness(options: { onInfo?(key: string, message: string): void; keys?: string[]; constants?: DeliveryEngineDeps['constants']; stateDir?: string; queueFs?: DeliveryQueueOptions['fs']; configuredAgent?: 'claude' | 'codex'; clientFor?: DeliveryEngineDeps['clientFor']; onRow?: DeliveryEngineDeps['onRow']; inspectUpgrade?: DeliveryEngineDeps['inspectUpgrade']; refreshTranscript?: DeliveryEngineDeps['refreshTranscript']; onEvent?: DeliveryEngineDeps['onEvent']; onCoveredBlocked?: DeliveryEngineDeps['onCoveredBlocked'] } = {}) {
+export async function makeEngineHarness(options: { onInfo?(key: string, message: string): void; keys?: string[]; constants?: DeliveryEngineDeps['constants']; stateDir?: string; queue?: DeliveryQueue; queueFs?: DeliveryQueueOptions['fs']; configuredAgent?: 'claude' | 'codex'; clientFor?: DeliveryEngineDeps['clientFor']; isUp?: DeliveryEngineDeps['isUp']; onRow?: DeliveryEngineDeps['onRow']; inspectUpgrade?: DeliveryEngineDeps['inspectUpgrade']; refreshTranscript?: DeliveryEngineDeps['refreshTranscript']; onEvent?: DeliveryEngineDeps['onEvent']; onCoveredBlocked?: DeliveryEngineDeps['onCoveredBlocked']
+  /** Preparation's Slack client and name lookup, withdrawal time, log, persona and part limit; `clientFor` above is the engine's AD client. */
+  preparation?: Partial<Pick<DeliveryPreparationDeps, 'clientFor' | 'resolveUserName' | 'now' | 'log' | 'persona' | 'tagMaxBytes'>> } = {}) {
+  if (options.queue && !options.stateDir) throw new Error('an external queue needs its owned stateDir')
   const root = options.stateDir ?? mkdtempSync(join(tmpdir(), 'delivery-engine-'))
   const clock = createFakeClock(), events: DeliveryEngineEvent[] = [], errors: unknown[] = []
   const calls: { key: string; verb: string; at: number; params: unknown }[] = []
   const restarts: { key: string; cwd: string }[] = [], order: string[] = [], failures = new Map<string, number>()
   const received: { key: string; seq: number }[] = []
   let queue!: DeliveryQueue, engines!: DeliveryEngines, start = 0
-  let realQueue = await makeQueue(root, { now: clock.now, fs: options.queueFs })
+  // Virtual time waits for the owned queue's real fsync and rename, so a
+  // timer-driven loop's turns never run out while the disk is slow.
+  const queueIo = durableIo({ base: options.queueFs })
+  if (!options.queue) clock.settleOn(queueIo)
+  let realQueue = options.queue ?? await makeQueue(root, { now: clock.now, fs: queueIo.fs })
   queue = { ...realQueue, async append(key, record) {
     const count = failures.get(record.kind) ?? 0
     if (count > 0) { failures.set(record.kind, count - 1); throw Object.assign(new Error('injected append failure'), { code: 'ENOSPC' }) }
@@ -62,6 +70,7 @@ export async function makeEngineHarness(options: { onInfo?(key: string, message:
   let lifecycle = createDeliveryLifecycle({ clock })
   const preparation = createDeliveryPreparation({ queue, clock, clientFor: () => undefined,
     resolveUserName: async () => { order.push('lookup'); return 'sender' },
+    ...options.preparation,
     onPending: key => engines?.wake(key), wake: key => engines?.wake(key),
     onReceived: (key, item) => { received.push({ key, seq: item.accepted.seq }) },
   })
@@ -70,7 +79,8 @@ export async function makeEngineHarness(options: { onInfo?(key: string, message:
       clientFor: options.clientFor ?? (async key => personas.get(key)!.stub),
       instanceId: key => `cscb_${key}`,
       persona: key => personas.get(key)?.state.applied ? { cwd: root, agent: options.configuredAgent ?? (personas.get(key)!.state.row.agent === 'codex' ? 'codex' : 'claude') } : undefined,
-      isUp: key => personas.get(key)?.state.up ?? false, isLatched: key => personas.get(key)?.state.latched ?? false,
+      // Composed controller tests bind the actual persona-up predicate here.
+      isUp: options.isUp ?? (key => personas.get(key)?.state.up ?? false), isLatched: key => personas.get(key)?.state.latched ?? false,
       isHeld: key => personas.get(key)?.state.held ?? false, isConnected: key => personas.get(key)?.state.connected ?? false,
       prepare: (key, item) => preparation.owns(key, item.accepted.seq) ? preparation.prepare(key, item) : Promise.resolve(),
       isRestartPendingOrActive: key => personas.get(key)?.state.restartPending ?? false, scheduleRestart: (key, cwd) => restarts.push({ key, cwd }),
@@ -106,14 +116,15 @@ export async function makeEngineHarness(options: { onInfo?(key: string, message:
     keyCalls(key = 'alpha') { return calls.filter(c => c.key === key && c.verb === 'send-keys') as { key: string; verb: string; at: number; params: SendKeysParams }[] },
     textCalls(key = 'alpha') { return h.keyCalls(key).filter(c => c.params.no_enter) },
     async restartServer() {
+      if (options.queue) throw new Error('the caller owns external queue reopen')
       await engines.stop(); await realQueue.stop()
-      realQueue = await makeQueue(root, { now: clock.now, fs: options.queueFs })
+      realQueue = await makeQueue(root, { now: clock.now, fs: queueIo.fs })
       const append = queue.append
       Object.assign(queue, realQueue, { append })
       lifecycle = createDeliveryLifecycle({ clock }); build()
       for (const key of personas.keys()) engines.wake(key)
     },
-    async cleanup() { await engines.stop(); await preparation.stop(); await queue.stop(); if (!options.stateDir) rmSync(root, { recursive: true, force: true }) },
+    async cleanup() { await engines.stop(); await preparation.stop(); if (!options.queue) await queue.stop(); if (!options.stateDir) rmSync(root, { recursive: true, force: true }) },
   }
   return h
 }

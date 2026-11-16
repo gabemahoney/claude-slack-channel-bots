@@ -1,3 +1,4 @@
+import { SERVER_POST_METADATA } from './test-helpers/server-post.ts'
 import { REPLY_TOOL_PREALLOWED_LABEL } from '../src/reply-reminder.ts'
 import { makePendingRowModel, PENDING_ROW_MODEL_NO_ROW, judgeNotJudged } from './test-helpers/pending-row-model.ts'
 import { errDialogMaybeOpen } from './test-helpers/agent-director-stub.ts'
@@ -911,8 +912,9 @@ function expectOneNoticeToDestination(h: NotifierHarness): string {
   expect(posts).toHaveLength(1)
   const post = posts[0]!
   expect(post.channel).toBe(NOTICE_DEST)
-  // Top-level, the persona's own identity: exactly channel + text.
-  expect(Object.keys(post).sort()).toEqual(['channel', 'text'])
+  // Top-level, the persona's own identity: exactly channel + text, with the Server Post Marker.
+  expect(Object.keys(post).sort()).toEqual(['channel', 'metadata', 'text'])
+  expect(post.metadata).toEqual(SERVER_POST_METADATA)
   expect(post.text.startsWith(`Persona ${renderPersonaRef(NOTICE_NAME, NOTICE_KEY)}: `)).toBe(true)
   expect(post.text).not.toContain(NOTICE_DEST)
   expect(post.text).not.toContain(NOTICE_MENTIONS)
@@ -9403,9 +9405,9 @@ describe('persona notices', () => {
     expect(dmPosts.map((p) => p.channel)).toEqual([NOTICE_DM, NOTICE_DM])
     expect(dmPosts[0]!.text).toContain(`Error: \`${launchFailure.errName}\``)
     expect(dmPosts[1]!.text).toContain('Error: `SpawnCapReached`')
-    // Posted to the returned D… conversation, never to the contact's user ID; top-level, no identity override.
+    // Posted to the returned D… conversation, never to the contact's user ID; top-level, no identity override, the Server Post Marker.
     for (const post of dmPosts) {
-      expect(Object.keys(post).sort()).toEqual(['channel', 'text'])
+      expect(Object.keys(post).sort()).toEqual(['channel', 'metadata', 'text'])
       expect(post.text.startsWith(`Persona ${renderPersonaRef(NOTICE_NAME, NOTICE_KEY)}: `)).toBe(true)
       expect(post.text).not.toContain(NOTICE_CONTACT)
     }
@@ -9415,7 +9417,8 @@ describe('persona notices', () => {
     expect(h.stub(OTHER_KEY).callLog).toHaveLength(1)
     const [otherPost] = h.posts(OTHER_KEY)
     expect(otherPost!.channel).toBe(OTHER_DEST)
-    expect(Object.keys(otherPost!).sort()).toEqual(['channel', 'text'])
+    expect(Object.keys(otherPost!).sort()).toEqual(['channel', 'metadata', 'text'])
+    expect(otherPost!.metadata).toEqual(SERVER_POST_METADATA)
     expect(otherPost!.text.startsWith(`Persona ${renderPersonaRef(OTHER_NAME, OTHER_KEY)}: `)).toBe(true)
     expect(otherPost!.text).toContain('Error: `SpawnCapReached`')
     expect(otherPost!.text).not.toContain(NOTICE_NAME)
@@ -9518,7 +9521,7 @@ describe('persona notices', () => {
     expect(dmPosts[1]!.text).toContain('Error: `SpawnCapReached`')
     expect(dmPosts[2]!.text).toContain('Error: `ErrLateNotice`')
     for (const post of dmPosts) {
-      expect(Object.keys(post).sort()).toEqual(['channel', 'text'])
+      expect(Object.keys(post).sort()).toEqual(['channel', 'metadata', 'text'])
       expect(post.text.startsWith(`Persona ${renderPersonaRef(NOTICE_NAME, NOTICE_KEY)}: `)).toBe(true)
     }
     // One cleared line; nothing left held and no timer.

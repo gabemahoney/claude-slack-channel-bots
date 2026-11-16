@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "personas": {
+    "alpha": {
+      "declaration": {
+        "name": "alpha",
+        "credentials_file": "~/personas/alpha/credentials.json",
+        "working_director

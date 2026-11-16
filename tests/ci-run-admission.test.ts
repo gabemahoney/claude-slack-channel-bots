@@ -32,12 +32,14 @@ import {
   CI_LABEL_VALUE,
   containerLabelOwner,
   CPUS_PER_SHARD,
+  DRIVER_CPUS,
   formatOwner,
   formatRunTag,
   imageLabelOwner,
   isOwnerAlive,
   isReservationFileName,
   isRunnerCommandLine,
+  isBurstDriverScript,
   MAX_SHARDS,
   OPTION_RANGE_MIN,
   OWNER_LABEL,
@@ -68,6 +70,7 @@ import {
   holdFlock,
   otherProcess,
   probeFlock,
+  realScriptFileNames,
   type FakeProcessTable,
   type FlockHolder,
   type JsonFileChange,
@@ -1873,6 +1876,7 @@ import {
   ciLiveRealRunLockPath,
   ciLiveTempDir,
   cpuFits,
+  runCpus,
   CPU_REFUSAL_ADVICE,
   decideAdmission,
   DISK_CHECK_ALLOWANCE_BYTES,
@@ -3147,6 +3151,36 @@ describe('admission: admission readings, /ci-live, commitments, fits and refusal
     ])(`the CPU fit at %p shard(s), other runs' CPUs + ${CPUS_PER_SHARD}N = ${CI_CPUS} + %p: fits is %p`, (shards, overCpus, fits) => {
       const reservedCpus = CI_CPUS - CPUS_PER_SHARD * shards + overCpus
       expect(cpuFits(reservedCpus, shards)).toBe(fits)
+    })
+
+    test.each([
+      [1, 0, 2], [1, 3, 3], [3, 3, 9], [4, 3, 11], [5, 3, 13], [6, 3, 15], [6, 1, 13], [2, 0, 4],
+    ])('burst-driver scripts: %p shard(s) with %p of them take %p CPUs, one more for each shard that can hold one', (shards, driverScripts, cpus) => {
+      expect(runCpus(shards, driverScripts)).toBe(cpus)
+      expect(cpuFits(CI_CPUS - cpus, shards, driverScripts)).toBe(true)
+      expect(cpuFits(CI_CPUS - cpus + 1, shards, driverScripts)).toBe(false)
+      expect(buildReservation({ owner: LIVE_OWNER, shards, memoryCapBytes: SHARD_MEMORY_CAP_BYTES, driverScripts, kind: 'full' }).cpus).toBe(cpus)
+    })
+
+    test('burst-driver scripts: the full discovered population reserves a driver CPU for every possible driver shard', async () => {
+      const rig = makeAdmission(), figures = await rig.figures()
+      const driverScripts = realScriptFileNames().filter(isBurstDriverScript).length
+      expect(driverScripts).toBeGreaterThan(MAX_SHARDS)
+      const plain = admittedOf(decideAdmission(figures, defaultFullRun(), rig.listResultsDirs))
+      const driven = admittedOf(decideAdmission(figures, { ...defaultFullRun(), driverScripts }, rig.listResultsDirs))
+      expect([plain.shards, driven.shards]).toEqual([MAX_SHARDS, 4])
+      expect(driven.limitsAtNext).toEqual(['cpu'])
+      const pinned = decideAdmission(figures, { ...defaultFullRun(), canChooseShards: false, driverScripts }, rig.listResultsDirs)
+      expect(refusalOf(pinned).summary).toBe(`${MAX_SHARDS} shard(s) need ${runCpus(MAX_SHARDS, driverScripts)} CPUs; active /ci runs hold 0 of the ${CI_CPUS} CI CPUs`)
+      for (let shards = OPTION_RANGE_MIN; shards <= MAX_SHARDS; shards++) {
+        // There are more driver workloads than shards: each shard can need one extra CPU, never one per workload.
+        const cpus = shards * (CPUS_PER_SHARD + DRIVER_CPUS)
+        expect(runCpus(shards, driverScripts)).toBe(cpus)
+        expect(cpuFits(CI_CPUS - cpus, shards, driverScripts)).toBe(true)
+        expect(cpuFits(CI_CPUS - cpus + 1, shards, driverScripts)).toBe(false)
+        expect(buildReservation({ owner: LIVE_OWNER, shards, memoryCapBytes: SHARD_MEMORY_CAP_BYTES, driverScripts, kind: 'full' }).cpus).toBe(cpus)
+      }
+      expect(() => decideAdmission(figures, { ...defaultFullRun(), driverScripts: -1 }, rig.listResultsDirs)).toThrow('invalid driver scripts')
     })
 
     // --- Choosing N ---

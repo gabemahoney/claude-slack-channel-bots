@@ -1,3 +1,7 @@
+import { eligibleMembership } from './fungible-decision.ts'
+import { makeSharedAuthority } from './shared-channels.ts'
+import { createChannelDeliveryStore } from '../../src/channel-delivery.ts'
+import { slackInput } from './delivery-queue.ts'
 import { createDeliveryQueue } from '../../src/delivery-queue.ts'
 import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
 import { cannedReadPaneResult } from './ad-results.ts'
@@ -2039,10 +2043,24 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     const queue = createDeliveryQueue({ stateDir, now: clock.now })
     const ready = queue.start()
     const preparation = createDeliveryPreparation({ queue, clientFor: slackClientFor, resolveUserName: async (_key, userId) => userId })
+    const source = appliedConfig()
+    mkdirSync(join(stateDir, 'routing-authority'), { recursive: true })
+    const choices = createChannelDeliveryStore(makeSharedAuthority(join(stateDir, 'routing-authority'), {
+      ...source, personas: source.personas.map(({ key, index, ...p }) => p),
+    }))
     const core = createPersonaRouting({
+      getChannelDelivery: () => choices,
+      // This driver isolates AD recovery with explicitly positive observations.
+      // Real collection/leave integration is exercised by membership fixtures.
+      membership: { read: key => eligibleMembership(key), hasUnresolved: () => false, request: () => {} },
       getPersonaConfig: appliedConfig,
       getBotIdentity: key => slackStubs.get(key)?.identity,
-      queue: { lookupSlackKey: queue.lookupSlackKey, accept: async (key, input) => { await ready; return queue.accept(key, input) } },
+      queue: {
+        lookupSlackKey: queue.lookupSlackKey,
+        lookupReactionKey: queue.lookupReactionKey,
+        accept: async (key, input) => { await ready; return queue.accept(key, input) },
+        acceptDecided: async (key, slackKey, decide) => { await ready; return queue.acceptDecided(key, slackKey, decide) },
+      },
       prepare: preparation.prepare,
       archive: () => {},
       log,
@@ -2106,6 +2124,15 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     lostMessageCount += 1
     const event = makeChannelMessage({ channel, ts: `1700000000.${String(lostMessageCount).padStart(6, '0')}` })
     let acknowledged = false
+    if (down.has(key)) {
+      // A down app cannot admit new channel work. An already accepted item
+      // still reaches recovery, with its original Slack identity and content.
+      await queue.start()
+      const accepted = await queue.accept(key, slackInput({ channel, ts: event.ts as string,
+        key: { chat_id: channel, ts: event.ts as string }, user: event.user as string,
+        text: event.text as string, via: 'receive_all' }))
+      expect(accepted.status).toBe('accepted')
+    }
     await routing.receive(event, () => { acknowledged = true }, key)
     expect(lostMessageNotices.slice(noticesBefore)).toEqual([])
     return {

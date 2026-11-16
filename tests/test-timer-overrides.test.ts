@@ -32,6 +32,7 @@ import {
 import { TEST_TIMER_OVERRIDE_KEYS, type TestTimerOverrides } from '../src/config.ts'
 import { LATCH_RECHECK_INTERVAL_MS } from '../src/conflict-latch.ts'
 import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
+import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
 import {
   buildTestTimerOverridesLine,
   effectiveTestTimer,
@@ -53,6 +54,7 @@ const DEFAULTS = {
   delivery_stuck_after_ms: DELIVERY_STUCK_AFTER_MS,
   unavailable_retry_base_s: UNAVAILABLE_RETRY_BASE_S,
   unavailable_retry_ceiling_s: UNAVAILABLE_RETRY_CEILING_S,
+  queue_compact_interval_ms: QUEUE_COMPACT_INTERVAL_MS,
 } as const
 
 /** The override set test-26's refused legs run with. */
@@ -88,6 +90,10 @@ describe('effectiveTestTimer and effectiveTestTimers', () => {
     expect(DELIVERY_STUCK_AFTER_MS).toBe(300_000)
   })
 
+  test('pin: the production queue and Thread Memory compaction interval is an hour', () => {
+    expect(QUEUE_COMPACT_INTERVAL_MS).toBe(3_600_000)
+  })
+
   test.each([undefined, {}])('with %p every key is its production default', (overrides) => {
     for (const key of TEST_TIMER_OVERRIDE_KEYS) expect(effectiveTestTimer(key, overrides)).toBe(DEFAULTS[key])
     expect(effectiveTestTimers(overrides)).toEqual({
@@ -97,7 +103,20 @@ describe('effectiveTestTimer and effectiveTestTimers', () => {
       deliveryStuckAfterMs: DEFAULTS.delivery_stuck_after_ms,
       unavailableRetryBaseS: DEFAULTS.unavailable_retry_base_s,
       unavailableRetryCeilingS: DEFAULTS.unavailable_retry_ceiling_s,
+      queueCompactIntervalMs: DEFAULTS.queue_compact_interval_ms,
     })
+  })
+
+  // By name, so the case fails if the key leaves the block or stops feeding the answer.
+  test.each([undefined, {}, { latch_recheck_interval_ms: 45_000 }])('with %p the compaction interval is QUEUE_COMPACT_INTERVAL_MS', (overrides) => {
+    expect(effectiveTestTimer('queue_compact_interval_ms', overrides)).toBe(QUEUE_COMPACT_INTERVAL_MS)
+    expect(effectiveTestTimers(overrides).queueCompactIntervalMs).toBe(QUEUE_COMPACT_INTERVAL_MS)
+  })
+
+  test('a compaction interval override is the answer, in effectiveTestTimer and as queueCompactIntervalMs, and moves no other timer', () => {
+    const overrides: TestTimerOverrides = { queue_compact_interval_ms: 500 }
+    expect(effectiveTestTimer('queue_compact_interval_ms', overrides)).toBe(500)
+    expect(effectiveTestTimers(overrides)).toEqual({ ...effectiveTestTimers(undefined), queueCompactIntervalMs: 500 })
   })
 
   test('a key the block gives is its value, and every other key stays its default', () => {
@@ -116,6 +135,7 @@ describe('effectiveTestTimer and effectiveTestTimers', () => {
       deliveryStuckAfterMs: DELIVERY_STUCK_AFTER_MS,
       unavailableRetryBaseS: 5,
       unavailableRetryCeilingS: 60,
+      queueCompactIntervalMs: QUEUE_COMPACT_INTERVAL_MS,
     })
   })
 })
@@ -144,7 +164,14 @@ describe('buildTestTimerOverridesLine', () => {
     )
   })
 
-  test('all six keys are named, each once, and the line starts with the exported head', () => {
+  test('the compaction interval override: the head, the key with its value and default, the test-only note', () => {
+    expect(buildTestTimerOverridesLine({ queue_compact_interval_ms: 500 })).toBe(
+      `[slack] TEST TIMER OVERRIDES ACTIVE: queue_compact_interval_ms=500 (default ${QUEUE_COMPACT_INTERVAL_MS}); ` +
+        'test-only shortened timers from config.json test_timer_overrides, read once at this start; not for production use',
+    )
+  })
+
+  test('all seven keys are named, each once, and the line starts with the exported head', () => {
     const line = buildTestTimerOverridesLine({
       latch_recheck_interval_ms: 45_000,
       ad_version_recheck_interval_ms: 20_000,
@@ -152,6 +179,7 @@ describe('buildTestTimerOverridesLine', () => {
       delivery_stuck_after_ms: 7_000,
       unavailable_retry_base_s: 5,
       unavailable_retry_ceiling_s: 60,
+      queue_compact_interval_ms: 500,
     })!
     expect(line.startsWith(`${TEST_TIMER_OVERRIDES_LOG_PREFIX}: `)).toBe(true)
     for (const key of TEST_TIMER_OVERRIDE_KEYS) expect(line.split(`${key}=`)).toHaveLength(2)
@@ -159,6 +187,8 @@ describe('buildTestTimerOverridesLine', () => {
     expect(line.indexOf('dialog_ready_timeout_ms=')).toBeLessThan(line.indexOf('delivery_stuck_after_ms='))
     expect(line.indexOf('delivery_stuck_after_ms=')).toBeLessThan(line.indexOf('unavailable_retry_base_s='))
     expect(line.indexOf('unavailable_retry_base_s=')).toBeLessThan(line.indexOf('unavailable_retry_ceiling_s='))
+    expect(line.indexOf('unavailable_retry_ceiling_s=')).toBeLessThan(line.indexOf('queue_compact_interval_ms='))
+    expect(line).toContain(`queue_compact_interval_ms=500 (default ${QUEUE_COMPACT_INTERVAL_MS})`)
     expect(line.split('\n')).toHaveLength(1)
     assertNoLeak(line, 'the overrides line')
   })
@@ -173,6 +203,7 @@ describe('installTestTimerOverrides', () => {
 
     expect(lines).toEqual([])
     expect(timers).toEqual(effectiveTestTimers(undefined))
+    expect(timers.queueCompactIntervalMs).toBe(QUEUE_COMPACT_INTERVAL_MS)
     expect(adLaunchBoundMsInEffect()).toBe(DIALOG_READY_TIMEOUT_MS)
     // The re-check's pending timer is untouched: due at the production interval, not moved.
     expect(clock.pending().map((t) => t.delayMs)).toEqual([AD_VERSION_RECHECK_INTERVAL_MS])
@@ -224,6 +255,28 @@ describe('installTestTimerOverrides', () => {
     expect(effectiveTestTimers(undefined).deliveryStuckAfterMs).toBe(DELIVERY_STUCK_AFTER_MS)
     expect(lines).toHaveLength(1)
     assertNoLeak(lines, 'the delivery-stuck override startup line')
+  })
+
+  test('the compaction interval override is captured at start, logged once, and moves no other timer', () => {
+    const { clock, calls } = installedRecheck()
+    const lines: string[] = []
+    const overrides: TestTimerOverrides = { queue_compact_interval_ms: 500 }
+
+    const timers = installTestTimerOverrides(overrides, (line) => lines.push(line))
+
+    expect(timers).toEqual({ ...effectiveTestTimers(undefined), queueCompactIntervalMs: 500 })
+    expect(lines).toEqual([buildTestTimerOverridesLine(overrides)!])
+    expect(lines[0]).toContain(`${TEST_TIMER_OVERRIDES_LOG_PREFIX}: queue_compact_interval_ms=500 (default ${QUEUE_COMPACT_INTERVAL_MS})`)
+    expect(adLaunchBoundMsInEffect()).toBe(DIALOG_READY_TIMEOUT_MS)
+    expect(clock.pending().map((timer) => timer.delayMs)).toEqual([AD_VERSION_RECHECK_INTERVAL_MS])
+    expect(calls).toHaveLength(0)
+
+    // A later config object cannot change the value the running server captured.
+    overrides.queue_compact_interval_ms = 250
+    expect(timers.queueCompactIntervalMs).toBe(500)
+    expect(effectiveTestTimers(undefined).queueCompactIntervalMs).toBe(QUEUE_COMPACT_INTERVAL_MS)
+    expect(lines).toHaveLength(1)
+    assertNoLeak(lines, 'the compaction interval override startup line')
   })
 
   test('the latch, base and ceiling overrides reach the caller through the answer, for the latch re-check and the retry timers', () => {

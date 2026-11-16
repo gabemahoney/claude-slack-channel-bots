@@ -14,10 +14,19 @@ import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
  * How the routing uses the flag is covered in tests/persona-routing.test.ts
  * and tests/delivery-decision-fungible.test.ts.
  *
+ * SR-1.3: a `reaction_added` or `reaction_removed` event goes to the reaction
+ * intake (`receiveReaction`) once, with the event and its own ack unchanged,
+ * the receiving persona's key and the envelope flag in each of its forms; the
+ * router writes no RAW line for it and never acks it for the intake. Over the
+ * real routing, the reaction decision asks the manager's own Run Bot
+ * Identities. How the intake decides, stores and acks is covered in
+ * tests/persona-routing.test.ts.
+ *
  * Code under test (never `src/server.ts`, which is only read as text):
  * - `src/persona-event-router.ts` `createPersonaEventRouter`: the handler the
- *   connection manager forwards every `message`, `app_mention` and
- *   `interactive` event to, with the receiving persona's key;
+ *   connection manager forwards every `message`, `app_mention`,
+ *   `reaction_added`, `reaction_removed` and `interactive` event to, with the
+ *   receiving persona's key;
  * - `src/persona-start.ts` `createPersonaClientLookup` (`clientFor`, whose
  *   serving rule is driven through the real manager's statuses),
  *   `createPersonaIdentityLookup` and `createPersonaUpFlushListener`;
@@ -72,7 +81,7 @@ import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Database } from 'bun:sqlite'
@@ -83,6 +92,9 @@ import { SocketModeClient, type Logger } from '@slack/socket-mode'
 import type { WebClient, WebClientOptions } from '@slack/web-api'
 
 import type { Persona } from '../src/config.ts'
+import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
+import { makeSharedAuthority } from './test-helpers/shared-channels.ts'
+import { observedMembership } from './test-helpers/persona-routing-harness.ts'
 import { credentialsFilesToProtect, DEFAULT_REPLY_CHUNK_LIMIT, DEFAULT_REPLY_CHUNK_MODE } from '../src/config.ts'
 import { assertSendable } from '../src/lib.ts'
 import { createPersonaEventRouter, type PersonaEventRouterDeps } from '../src/persona-event-router.ts'
@@ -122,6 +134,7 @@ import {
   ENVELOPE_FLAG_FORMS,
   makeAppMention,
   makeChannelMessage,
+  makeReaction,
   type EnvelopeFlagForm,
   type SlackEvent,
 } from './test-helpers/slack-stub.ts'
@@ -200,6 +213,7 @@ let savedStateDir: string | undefined
 let savedDryRun: string | undefined
 let openDbs: Database[]
 let openClients: Client[]
+let managedRoutings: ReturnType<typeof makeManagedRouting>[]
 
 beforeAll(() => {
   savedStateDir = process.env['SLACK_STATE_DIR']
@@ -221,6 +235,7 @@ beforeEach(() => {
   harnesses = []
   openDbs = []
   openClients = []
+  managedRoutings = []
   resetRoutingState()
   initRestart(makeRestartDeps({ restartDelayS: NEVER_FIRE_RESTART_DELAY_S }))
   consoleLines = []
@@ -235,6 +250,7 @@ afterEach(async () => {
       await h.manager.stopAll()
       assertNoLeak({ lines: h.lines }, 'manager lines')
     }
+    for (const managed of managedRoutings.splice(0)) await managed.close()
     for (const client of openClients.splice(0)) await client.close()
     for (const db of openDbs.splice(0)) db.close()
     stopPermissionPoller()
@@ -257,52 +273,114 @@ function harness(opts: Parameters<typeof makeConnectionHarness>[2] = {}): Connec
   return Object.assign(h, { A: h.p(ALPHA), B: h.p(BETA) })
 }
 
+/** Real shared choices and independent current membership for the routing
+ * consumers. Configured channels alone never authorize intake. */
+function managedRouting(h: ConnectionHarness, opts: Parameters<typeof makeManagedRouting>[2] = {}) {
+  const config = h.config!
+  const store = createChannelDeliveryStore(makeSharedAuthority(dir, {
+    ...config, personas: config.personas.map(({ key, index, ...p }) => p),
+  }))
+  const managed = makeManagedRouting(h, dir, {
+    getChannelDelivery: () => store,
+    membership: observedMembership({ [h.p(ALPHA).key]: [CA, CS], [h.p(BETA).key]: [CB, CS] }),
+    ...opts,
+  })
+  managedRoutings.push(managed)
+  return managed
+}
+
 /** Bring A and B up; both must be up. */
 async function bringUpBoth(h: ConnectionHarness & { A: Persona; B: Persona }): Promise<void> {
   for (const p of [h.A, h.B]) expect(await h.bringUp(p)).toMatchObject({ state: 'up' })
 }
 
-/** One `receive` call the recording intake saw. */
+/** The router's routing intakes: `receive` for messages and mentions, `receiveReaction` for reactions. */
+type RouterIntakes = Pick<PersonaRouting, 'receive' | 'receiveReaction'>
+
+/** One intake call a recording intake saw. */
 interface IntakeCall {
   event: unknown
   key: unknown
 }
 
-/** An intake that records each call (event and the receiver argument as given) and acks. */
-function recordingIntake(): Pick<PersonaRouting, 'receive'> & { calls: IntakeCall[] } {
+/**
+ * An intake that records each call (event and the receiver argument as given)
+ * and acks: `calls` for `receive`, `reactions` for `receiveReaction`, kept
+ * apart so a delegation to the wrong one shows.
+ */
+function recordingIntake(): RouterIntakes & { calls: IntakeCall[]; reactions: IntakeCall[] } {
   const calls: IntakeCall[] = []
+  const reactions: IntakeCall[] = []
   return {
     calls,
+    reactions,
     receive: async (event, ack, key) => {
       calls.push({ event, key })
+      await ack()
+    },
+    receiveReaction: async (event, ack, key) => {
+      reactions.push({ event, key })
       await ack()
     },
   }
 }
 
-/** One `receive` call the flag-recording intake saw. */
+/** One intake call the flag-recording intake saw. */
 interface FlagIntakeCall {
   event: unknown
+  /** The second argument, as given. */
+  ack: unknown
   key: unknown
   /** The fourth argument, the envelope flag: undefined when absent. */
   flag: unknown
+  provenance: Parameters<PersonaRouting['receive']>[4]
   /** How many arguments the call had. */
   arity: number
   /** Every argument but the ack, for the no-envelope-field checks. */
   data: unknown[]
 }
 
-/** An intake that records each call with every argument as given (the envelope flag included) and acks. */
-function flagIntake(): Pick<PersonaRouting, 'receive'> & { calls: FlagIntakeCall[] } {
+/**
+ * An intake that records each call with every argument as given (the envelope
+ * flag included), `calls` for `receive` and `reactions` for
+ * `receiveReaction`, and acks; with `ackReactions: false` the reaction intake
+ * never acks, so any ack the envelope gets is the router's.
+ */
+function flagIntake({ ackReactions = true } = {}): RouterIntakes & { calls: FlagIntakeCall[]; reactions: FlagIntakeCall[] } {
   const calls: FlagIntakeCall[] = []
-  return {
-    calls,
-    receive: async (...args: Parameters<PersonaRouting['receive']>) => {
+  const reactions: FlagIntakeCall[] = []
+  const recorder = (into: FlagIntakeCall[], acks: boolean) =>
+    async (...args: Parameters<PersonaRouting['receive']> | Parameters<PersonaRouting['receiveReaction']>): Promise<void> => {
       const [event, ack, key, flag] = args
-      calls.push({ event, key, flag, arity: args.length, data: args.filter((arg) => arg !== ack) })
-      await ack()
-    },
-  }
+      // Only `receive` takes the issuing connection's provenance, as its fifth argument.
+      const provenance = (args as unknown[])[4] as FlagIntakeCall['provenance']
+      into.push({ event, ack, key, flag, provenance, arity: args.length, data: args.filter((arg) => arg !== ack) })
+      if (acks) await ack()
+    }
+  return { calls, reactions, receive: recorder(calls, true), receiveReaction: recorder(reactions, ackReactions) }
+}
+
+/** A Slack reaction event name the manager forwards. */
+type ReactionEventName = Extract<PersonaSocketEventName, 'reaction_added' | 'reaction_removed'>
+const REACTION_EVENTS: ReactionEventName[] = ['reaction_added', 'reaction_removed']
+
+/** A person who reacts (no persona's bot). */
+const REACTOR = 'U0WIREREACT'
+/** The reacted message's ts. */
+const REACTED_TS = '1700000000.888888'
+
+/**
+ * A reaction event on a message in `CS`: `overrides` replace its fields and
+ * `item` its item's.
+ */
+function reactionEvent(type: ReactionEventName, overrides: Record<string, unknown> = {}, item: Record<string, unknown> = {}): SlackEvent {
+  return makeReaction(type, {
+    user: REACTOR,
+    reaction: 'thumbsup',
+    item_user: 'U0WIREBOTA',
+    event_ts: '1700000001.000001',
+    ...overrides,
+  }, { channel: CS, ts: REACTED_TS, ...item })
 }
 
 /** One click-handler call a spy saw. */
@@ -330,7 +408,7 @@ function clickSpy(handled: (actionId: string) => boolean | Promise<boolean> = ()
 /** Build the event router over the harness's seams and plug it into the manager. */
 function plugRouter(
   h: ConnectionHarness,
-  routing: Pick<PersonaRouting, 'receive'>,
+  routing: RouterIntakes,
   extra: Partial<PersonaEventRouterDeps> = {},
 ): { logs: string[]; trail: TrailCapture; router: ReturnType<typeof createPersonaEventRouter> } {
   const logs: string[] = []
@@ -382,6 +460,7 @@ describe('each connection\'s inbound events reach the intake with its own person
     await h.stub(h.A).socket.deliver(onA)
 
     expect(intake.calls).toEqual([{ event: onA, key: h.A.key }])
+    expect(intake.reactions).toEqual([])
     expect(h.stub(h.A).socket.acks).toHaveLength(1)
     expect(h.stub(h.B).socket.acks).toHaveLength(0)
     const raw = logs.filter((l) => l.startsWith(`[slack] RAW ${eventName} event`))
@@ -401,13 +480,16 @@ describe('each connection\'s inbound events reach the intake with its own person
   test('the single-socket fan-out is gone: a message in a channel both personas hear (`all`), received on A\'s connection, reaches A\'s session only; the same on B\'s reaches B\'s only (real persona-routing)', async () => {
     const h = harness()
     await bringUpBoth(h)
-    const { routing, logs, queue: sessions } = makeManagedRouting(h, dir)
+    const { routing, logs, queue: sessions } = managedRouting(h)
     plugRouter(h, routing)
 
     const first = makeChannelMessage({ channel: CS, text: 'for whoever received it' })
     await h.stub(h.A).socket.deliver(first)
 
-    expect(sessions.items(h.A.key)!.map((n) => n.accepted.ts)).toEqual([first.ts as string])
+    expect(sessions.items(h.A.key).map(n => ({ channel: n.accepted.channel, ts: n.accepted.ts, key: n.accepted.key, text: n.accepted.text, via: n.accepted.via }))).toEqual([
+      { channel: CS, ts: first.ts as string, key: { chat_id: CS, ts: first.ts as string }, text: first.text as string, via: 'receive_all_shared' },
+    ])
+    const acceptedA = structuredClone(sessions.items(h.A.key))
     expect(sessions.items(h.B.key)).toEqual([])
     // The user-name lookup ran on the receiving persona's client only.
     expect(h.stub(h.A).calls.usersInfo).toHaveLength(1)
@@ -417,10 +499,13 @@ describe('each connection\'s inbound events reach the intake with its own person
     const second = makeChannelMessage({ channel: CS, text: 'again' })
     await h.stub(h.B).socket.deliver(second)
 
-    expect(sessions.items(h.B.key)!.map((n) => n.accepted.ts)).toEqual([second.ts as string])
-    expect(sessions.items(h.A.key)).toHaveLength(1)
+    expect(sessions.items(h.B.key).map(n => ({ channel: n.accepted.channel, ts: n.accepted.ts, key: n.accepted.key, text: n.accepted.text, via: n.accepted.via }))).toEqual([
+      { channel: CS, ts: second.ts as string, key: { chat_id: CS, ts: second.ts as string }, text: second.text as string, via: 'receive_all_shared' },
+    ])
+    expect(sessions.items(h.A.key)).toEqual(acceptedA)
     expect(h.stub(h.B).calls.usersInfo).toHaveLength(1)
     expect(h.stub(h.B).socket.acks).toHaveLength(1)
+    expect(h.stub(h.A).socket.acks).toHaveLength(1)
     assertNoLeak({ logs })
   })
 
@@ -428,7 +513,7 @@ describe('each connection\'s inbound events reach the intake with its own person
     const h = harness()
     await bringUpBoth(h)
     const archived: string[] = []
-    const { routing, queue: sessions } = makeManagedRouting(h, dir, { archive: (key) => void archived.push(key) })
+    const { routing, queue: sessions } = managedRouting(h, { archive: (key) => void archived.push(key) })
     const { router } = plugRouter(h, routing)
     const before = slackCalls(h.stub(h.A), h.stub(h.B))
     const ack = recordingAck()
@@ -441,24 +526,25 @@ describe('each connection\'s inbound events reach the intake with its own person
     expect(slackCalls(h.stub(h.A), h.stub(h.B))).toBe(before)
   })
 
-  test('an unknown event name is acked once and ignored: no intake, no click handler, no trail event', async () => {
+  test('an event name the router does not handle is acked once and ignored, even carrying a reaction event: neither intake, no click handler, no trail event', async () => {
     const h = harness()
     const intake = recordingIntake()
     const click = clickSpy()
     const { router, logs, trail } = plugRouter(h, intake, { handleClick: click.handleClick })
     const ack = recordingAck()
 
-    await router(h.A.key, 'reaction_added' as PersonaSocketEventName, {
+    await router(h.A.key, 'channel_created' as PersonaSocketEventName, {
       ack: ack.ack,
-      event: makeChannelMessage({ channel: CA }),
+      event: reactionEvent('reaction_added'),
       body: blockActions([encodePermissionActionId('allow', personaInstanceId(h.A.key), REQUEST_TOKEN)]),
     })
 
     expect(ack.count()).toBe(1)
     expect(intake.calls).toEqual([])
+    expect(intake.reactions).toEqual([])
     expect(click.calls).toEqual([])
     expect(trail.events).toEqual([])
-    expect(logs).toEqual([`[slack] persona=${h.A.key}: ignoring unexpected reaction_added event`])
+    expect(logs).toEqual([`[slack] persona=${h.A.key}: ignoring unexpected channel_created event`])
   })
 
   test('a throw while handling A\'s event is logged with A\'s key and its message redacted, token-safely, never reaches the manager, and B\'s events are still delivered', async () => {
@@ -466,11 +552,12 @@ describe('each connection\'s inbound events reach the intake with its own person
     await bringUpBoth(h)
     const intake = recordingIntake()
     // Throw for A only, with a code and a message carrying the marker in a token and a URL.
-    const throwing: Pick<PersonaRouting, 'receive'> = {
+    const throwing: RouterIntakes = {
       receive: async (event, ack, key) => {
         if (key === h.A.key) throw Object.assign(new Error(markedMessage('boom')), { code: 'EBOOM' })
         return intake.receive(event, ack, key)
       },
+      receiveReaction: intake.receiveReaction,
     }
     const { logs } = plugRouter(h, throwing)
 
@@ -511,7 +598,7 @@ describe('each connection\'s inbound events reach the intake with its own person
 
 describe('a throwing logger never skips an intake, an action or an ack (b.aos)', () => {
   /** Plug the router with a logger that records each line, then throws. */
-  function plugThrowing(h: ConnectionHarness, routing: Pick<PersonaRouting, 'receive'>, extra: Partial<PersonaEventRouterDeps> = {}) {
+  function plugThrowing(h: ConnectionHarness, routing: RouterIntakes, extra: Partial<PersonaEventRouterDeps> = {}) {
     const logs: string[] = []
     const plugged = plugRouter(h, routing, { log: (line) => { logs.push(line); throw new Error('log sink closed') }, ...extra })
     return { ...plugged, logs }
@@ -541,17 +628,18 @@ describe('a throwing logger never skips an intake, an action or an ack (b.aos)',
     const { router, logs } = plugThrowing(h, intake)
     const ack = recordingAck()
 
-    await expect(router(h.A.key, 'reaction_added' as PersonaSocketEventName, { ack: ack.ack })).resolves.toBeUndefined()
+    await expect(router(h.A.key, 'channel_created' as PersonaSocketEventName, { ack: ack.ack })).resolves.toBeUndefined()
 
     expect(ack.count()).toBe(1)
     expect(intake.calls).toEqual([])
-    expect(logs).toEqual([`[slack] persona=${h.A.key}: ignoring unexpected reaction_added event`])
+    expect(intake.reactions).toEqual([])
+    expect(logs).toEqual([`[slack] persona=${h.A.key}: ignoring unexpected channel_created event`])
   })
 
   test('an intake throw still resolves the handler, so the manager logs no handler failure', async () => {
     const h = harness()
     await bringUpBoth(h)
-    const { logs } = plugThrowing(h, { receive: async () => { throw new Error('intake failed') } })
+    const { logs } = plugThrowing(h, { receive: async () => { throw new Error('intake failed') }, receiveReaction: recordingIntake().receiveReaction })
 
     await h.stub(h.A).socket.deliver(makeChannelMessage({ channel: CS }))
 
@@ -629,7 +717,9 @@ describe('the envelope flag reaches the intake exactly as sent, and the RAW line
       expect(call!.event).toEqual(sent)
       expect(call!.key).toBe(h.A.key)
       expect(call!.flag).toBe(flag)
-      expect(call!.arity).toBeLessThanOrEqual(4)
+      expect(call!.arity).toBe(5)
+      expect(call!.provenance).toEqual({ ...h.manager.provenance(h.A.key)!, isCurrent: expect.any(Function) })
+      expect(call!.provenance?.isCurrent()).toBe(true)
       expectNoEnvelopeField(call!)
       expect(h.stub(h.A).socket.acks).toHaveLength(1)
       assertNoLeak({ logs })
@@ -685,6 +775,127 @@ describe('the envelope flag reaches the intake exactly as sent, and the RAW line
     expect(raw).toEqual(FORMS.map(() => expected))
     for (const envelopeText of ENVELOPE_ONLY_TEXTS) expect(raw.join('\n')).not.toContain(envelopeText)
     assertNoLeak({ logs })
+  })
+
+  test.each(REACTION_EVENTS.flatMap((eventName) => FORMS.map(([form, flag]) => [eventName, form, flag] as const)))(
+    'a `%s` event whose envelope flag is %s reaches the reaction intake once with the event unchanged, the receiving persona\'s key and the flag exactly as sent, and nothing else of the envelope; no message intake, click handler or line, RAW included',
+    async (eventName, form, flag) => {
+      const h = harness()
+      await bringUpBoth(h)
+      const intake = flagIntake()
+      const click = clickSpy()
+      const { logs } = plugRouter(h, intake, { handleClick: click.handleClick })
+      const event = reactionEvent(eventName)
+      const sent = structuredClone(event)
+
+      await h.stub(h.A).socket.deliver(event, { ...MARKED_ENVELOPE, ...ENVELOPE_FLAG_FORMS[form] })
+
+      expect(intake.reactions).toHaveLength(1)
+      const [call] = intake.reactions
+      expect(call!.event).toBe(event)
+      expect(call!.event).toEqual(sent)
+      expect(call!.key).toBe(h.A.key)
+      expect(call!.flag).toBe(flag)
+      expect(call!.arity).toBeLessThanOrEqual(4)
+      expectNoEnvelopeField(call!)
+      expect(intake.calls).toEqual([])
+      expect(click.calls).toEqual([])
+      // The intake's one ack is A's socket's own; B's socket is untouched.
+      expect(h.stub(h.A).socket.acks).toHaveLength(1)
+      expect(h.stub(h.B).socket.acks).toHaveLength(0)
+      expect(logs).toEqual([])
+    },
+  )
+
+  test.each(REACTION_EVENTS)('control: a `%s` event carrying `is_ext_shared_channel: false` on the event, with the envelope\'s flag removed, reaches the reaction intake with the flag absent (read from the envelope only)', async (eventName) => {
+    const h = harness()
+    await bringUpBoth(h)
+    const intake = flagIntake()
+    plugRouter(h, intake)
+    const event = reactionEvent(eventName, { is_ext_shared_channel: false })
+
+    await h.stub(h.A).socket.deliver(event, ENVELOPE_FLAG_FORMS.absent)
+
+    expect(intake.reactions).toHaveLength(1)
+    expect(intake.reactions[0]!.event).toBe(event)
+    expect(intake.reactions[0]!.flag).toBeUndefined()
+  })
+
+  test.each(REACTION_EVENTS)('a `%s` listener argument with no envelope (`body`) reaches the reaction intake with its own ack and the flag absent, and the router acks nothing for an intake that does not ack', async (eventName) => {
+    const h = harness()
+    const intake = flagIntake({ ackReactions: false })
+    const { router, logs } = plugRouter(h, intake)
+    const event = reactionEvent(eventName)
+    const ack = recordingAck()
+
+    await router(h.A.key, eventName, { event, ack: ack.ack })
+
+    expect(intake.reactions).toHaveLength(1)
+    expect(intake.reactions[0]!.event).toBe(event)
+    expect(intake.reactions[0]!.ack).toBe(ack.ack)
+    expect(intake.reactions[0]!.key).toBe(h.A.key)
+    expect(intake.reactions[0]!.flag).toBeUndefined()
+    expect(ack.count()).toBe(0)
+    expect(logs).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// reactions on each connection
+// ---------------------------------------------------------------------------
+
+describe('each connection\'s reaction events reach the reaction intake with its own persona key', () => {
+  test('real routing over the manager: a person\'s reaction to A\'s message received on A\'s connection is stored for A alone; B\'s bot reacting to it (a Run Bot Identity the manager confirmed) and B\'s connection receiving the same reaction store nothing; each envelope is acked once on its own socket', async () => {
+    const h = harness()
+    await bringUpBoth(h)
+    // A serves CS: a stored choice and verified membership (a reaction needs both).
+    const { routing, logs, queue } = managedRouting(h)
+    plugRouter(h, routing)
+    const aBot = h.identityFor(h.A.key)!.botUserId
+    const bBot = h.identityFor(h.B.key)!.botUserId
+    const bCallsBefore = slackCalls(h.stub(h.B))
+
+    const personTs = '1700000001.000001'
+    await h.stub(h.A).socket.deliver(reactionEvent('reaction_added', { item_user: aBot, event_ts: personTs }))
+    await h.stub(h.A).socket.deliver(reactionEvent('reaction_added', { item_user: aBot, user: bBot, event_ts: '1700000001.000002' }))
+    await h.stub(h.B).socket.deliver(reactionEvent('reaction_removed', { item_user: aBot, event_ts: '1700000001.000003' }))
+
+    expect(queue.items(h.A.key)!.map((i) => [i.accepted.source, i.accepted.ts])).toEqual([['reaction', personTs]])
+    expect(queue.items(h.B.key)).toEqual([])
+    expect(h.stub(h.A).socket.acks).toHaveLength(2)
+    expect(h.stub(h.B).socket.acks).toHaveLength(1)
+    expect(slackCalls(h.stub(h.B))).toBe(bCallsBefore)
+    expect(logs.filter((l) => l.includes('RAW'))).toEqual([])
+    assertNoLeak({ logs })
+  })
+
+  test('a throw from the reaction intake on A\'s connection is logged with A\'s key and its message redacted, token-safely, is not acked by the router, never reaches the manager, and B\'s reactions still reach the intake', async () => {
+    const h = harness()
+    await bringUpBoth(h)
+    const intake = recordingIntake()
+    const throwing: RouterIntakes = {
+      receive: intake.receive,
+      receiveReaction: async (event, ack, key) => {
+        if (key === h.A.key) throw Object.assign(new Error(markedMessage('boom')), { code: 'EBOOM' })
+        return intake.receiveReaction(event, ack, key)
+      },
+    }
+    const { logs } = plugRouter(h, throwing)
+
+    await h.stub(h.A).socket.deliver(reactionEvent('reaction_added'))
+    const onB = reactionEvent('reaction_removed')
+    await h.stub(h.B).socket.deliver(onB)
+
+    const failed = logs.filter((l) => l.includes('event handling failed'))
+    expect(failed).toHaveLength(1)
+    expect(failed[0]).toStartWith(`[slack] persona=${h.A.key}: reaction_added event handling failed: Error code=EBOOM`)
+    expect(failed[0]).toContain(redactedMessageField('boom'))
+    expect(h.stub(h.A).socket.acks).toHaveLength(0)
+    expect(intake.reactions).toEqual([{ event: onB, key: h.B.key }])
+    expect(intake.calls).toEqual([])
+    expect(h.stub(h.B).socket.acks).toHaveLength(1)
+    expect(h.lines.filter((l) => l.includes('event handler failed'))).toEqual([])
+    assertNoLeak({ logs, lines: h.lines })
   })
 })
 
@@ -903,7 +1114,7 @@ describe('carry: clientFor serves A\'s long-lived client only while A is serving
     h.stub(h.A).socket.drop()
     expect(h.manager.status(h.A.key)).toEqual({ state: 'lost' })
     expect(h.clientFor(h.A.key)).toBe(a)
-    expect(h.identityFor(h.A.key)).toEqual({ botUserId: h.stub(h.A).identity.botUserId, botId: h.stub(h.A).identity.botId })
+    expect(h.identityFor(h.A.key)).toEqual({ botUserId: h.stub(h.A).identity.botUserId, botId: h.stub(h.A).identity.botId, teamId: h.stub(h.A).identity.teamId })
 
     // The hung reopen is abandoned 10 s in; the retry at +5 s fails (network).
     await h.clock.advance(10_000)
@@ -994,8 +1205,8 @@ describe('carry: clientFor serves A\'s long-lived client only while A is serving
 
     const a = h.identityFor(h.A.key)
     const b = h.identityFor(h.B.key)
-    expect(a).toEqual({ botUserId: h.stub(h.A).identity.botUserId, botId: h.stub(h.A).identity.botId })
-    expect(b).toEqual({ botUserId: h.stub(h.B).identity.botUserId, botId: h.stub(h.B).identity.botId })
+    expect(a).toEqual({ botUserId: h.stub(h.A).identity.botUserId, botId: h.stub(h.A).identity.botId, teamId: h.stub(h.A).identity.teamId })
+    expect(b).toEqual({ botUserId: h.stub(h.B).identity.botUserId, botId: h.stub(h.B).identity.botId, teamId: h.stub(h.B).identity.teamId })
     expect(a!.botUserId).not.toBe(b!.botUserId)
     expect(a!.botId).not.toBe(b!.botId)
   })
@@ -1423,7 +1634,7 @@ describe('archive rows are written with the receiving persona\'s name resolver',
     openDbs.push(db)
     const errors: unknown[] = []
     const write = createPersonaArchiveWriter(db, createPersonaNameResolverSource(h.clientFor), (err) => void errors.push(err))
-    const { routing } = makeManagedRouting(h, dir, { archive: write })
+    const { routing } = managedRouting(h, { archive: write })
     const { router } = plugRouter(h, routing)
     const rows = () => db.query('SELECT channel_id, channel_name, sender_id, sender_name FROM messages ORDER BY timestamp').all() as ArchiveRowView[]
     return { h, db, errors, router, rows }

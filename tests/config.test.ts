@@ -24,10 +24,8 @@ import {
   EFFORT_LEVELS,
   MODEL_INVALID_REASON,
   PERSONA_ENTRY_KEYS,
-  PERSONA_INVITED_KEYS,
   type ChannelMode,
   type PersonaDmInput,
-  type PersonaInvitedInput,
   DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   DEFAULT_ACK_REACTION,
   DEFAULT_QUEUED_ACK_REACTION,
@@ -35,7 +33,14 @@ import {
   MAX_TEST_TIMER_OVERRIDE_MS,
   MAX_TEST_TIMER_OVERRIDE_S,
   MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  PERSONA_DM_KEYS,
   PERSONA_TOP_LEVEL_KEYS,
+  CHANNEL_ENTRY_KEYS,
+  PRE_PERSONA_KEYS,
+  SERVER_PATH_SETTINGS,
+  TEST_MCP_DROP_ENDPOINT_KEY,
+  TEST_MEASUREMENTS_KEY,
+  TEST_MEASUREMENT_TIMINGS_KEY,
   TEST_TIMER_OVERRIDE_KEYS,
   TEST_TIMER_OVERRIDES_KEY,
   expandTilde,
@@ -67,11 +72,12 @@ import {
 } from '../src/config.ts'
 import { personaKey, personaTmuxSessionName } from '../src/persona-identity.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
-import { buildChangePlan, MODE_SWITCH_SETTING, RECORDED_SECTION_KEYS } from '../src/reload-plan.ts'
+import { buildChangePlan, DESTRUCTIVE_SETTINGS, IN_PLACE_SETTINGS, MODE_SWITCH_SETTING, NEXT_LAUNCH_SETTINGS } from '../src/reload-plan.ts'
 import { configInEffect } from '../src/reload.ts'
+import { buildTestTimerOverridesLine, effectiveTestTimer } from '../src/test-timer-overrides.ts'
+import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
 import { assertSendable } from '../src/lib.ts'
 import {
-  makeFungiblePersona,
   makeMultiPersonaConfig,
   makePersona,
   makePersonaConfig,
@@ -82,13 +88,18 @@ import {
   APP_TOKEN_PREFIX,
   BOT_TOKEN_PREFIX,
   LEAK_SENTINEL,
-  assertNoLeak,
+  assertNoLeak, writtenFile,
   fakeToken,
+  sentinelInMessage,
   withoutName,
   writeCredentialsFile,
 } from './test-helpers/credentials.ts'
 import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { SHARED_CHANNEL_IDS, channelPopulation } from './test-helpers/shared-channels.ts'
+import { SR8_SHARED_LIST_CHANNELS, SR8_DELIVERY_CYCLE } from './test-helpers/thread-memory.ts'
+
+const MALFORMED_CHANNEL_ID = 'D0TEST001'
 
 // ---------------------------------------------------------------------------
 // expandTilde()
@@ -259,7 +270,7 @@ describe('loadPersonaConfig', () => {
       const config = load(withPersonas(
         makePersona({
           name: 'Ops Bot',
-          channels: [{ id: 'C0TEST001', delivery: 'all' }, { id: 'G0TEST002', delivery: 'all' }],
+          channels: [{ id: SHARED_CHANNEL_IDS.primary, delivery: 'all' }, { id: SHARED_CHANNEL_IDS.private, delivery: 'all' }],
           dm: undefined,
         }),
         makePersona({ name: 'review_bot' }),
@@ -269,10 +280,10 @@ describe('loadPersonaConfig', () => {
         [1, 'review_bot', personaKey('review_bot')],
       ])
       expect(config.personas[0].channels).toEqual([
-        { id: 'C0TEST001', delivery: 'all' },
-        { id: 'G0TEST002', delivery: 'all' },
+        { id: SHARED_CHANNEL_IDS.primary, delivery: 'all' },
+        { id: SHARED_CHANNEL_IDS.private, delivery: 'all' },
       ])
-      expect(config.personas[1].channels).toEqual([{ id: 'C0TEST001', delivery: 'all' }])
+      expect(config.personas[1].channels).toEqual([{ id: SHARED_CHANNEL_IDS.primary, delivery: 'all' }])
       // the persona in two channels is one persona, not one per channel.
       expect(config.personas.filter((p) => p.name === 'Ops Bot')).toHaveLength(1)
       for (const persona of config.personas) {
@@ -292,8 +303,8 @@ describe('loadPersonaConfig', () => {
     })
 
     test('a mentions channel loads', () => {
-      const config = load(withPersonas(makePersona({ channels: [{ id: 'C0TEST001', delivery: 'mentions' }] })))
-      expect(config.personas[0].channels).toEqual([{ id: 'C0TEST001', delivery: 'mentions' }])
+      const config = load(withPersonas(makePersona({ channels: [{ id: SHARED_CHANNEL_IDS.primary, delivery: 'mentions' }] })))
+      expect(config.personas[0].channels).toEqual([{ id: SHARED_CHANNEL_IDS.primary, delivery: 'mentions' }])
     })
 
     test('a ~ config path is expanded under the injected home', () => {
@@ -396,7 +407,7 @@ describe('loadPersonaConfig', () => {
     }
     const inDm = (extra: Record<string, unknown>) => persona({ dm: { enabled: false, ...extra } })
     const inChannel = (extra: Record<string, unknown>) =>
-      persona({ channels: [{ id: 'C0TEST001', delivery: 'all', ...extra }] })
+      persona({ channels: [{ id: SHARED_CHANNEL_IDS.primary, delivery: 'all', ...extra }] })
 
     // The credentials keys hold sentinel-bearing fake tokens at every level:
     // loadError's assertNoLeak proves the error names the level and the key
@@ -408,6 +419,7 @@ describe('loadPersonaConfig', () => {
       // Per persona only: no top-level value.
       ['top-level model', { ...makePersonaConfigInput(), model: `${LEAK_SENTINEL}-model` }, 'model', WHERE.top, false],
       ['top-level effort', { ...makePersonaConfigInput(), effort: LEAK_SENTINEL }, 'effort', WHERE.top, false],
+      ['top-level reaction_notices', { ...makePersonaConfigInput(), reaction_notices: false }, 'reaction_notices', WHERE.top, false],
       ['persona entry', persona({ nickname: 'ops' }), 'nickname', WHERE.entry, true],
       ['persona entry bot_token', persona({ bot_token: fakeToken(BOT_TOKEN_PREFIX, 'entry') }), 'bot_token', WHERE.entry, true],
       ['persona entry app_token', persona({ app_token: fakeToken(APP_TOKEN_PREFIX, 'entry') }), 'app_token', WHERE.entry, true],
@@ -467,15 +479,15 @@ describe('loadPersonaConfig', () => {
       ['a non-object dm', { dm: true }, 'dm'],
       ['a non-array channels', { channels: PLACEHOLDER }, 'channels'],
       ['a non-object channel entry', { channels: [null] }, 'channels[0]'],
-      ['a channel ID not matching ^[CG][A-Z0-9]+$', { channels: [{ id: 'D0TEST001', delivery: 'all' }] }, 'channels[0].id'],
+      ['a channel ID not matching ^[CG][A-Z0-9]+$', { channels: [{ id: MALFORMED_CHANNEL_ID, delivery: 'all' }] }, 'channels[0].id'],
       ['a missing channel id', { channels: [{ delivery: 'all' }] }, 'channels[0].id'],
-      ['a missing delivery', { channels: [{ id: 'C0TEST001' }] }, 'channels[0].delivery'],
-      ['an unsupported delivery', { channels: [{ id: 'C0TEST001', delivery: PLACEHOLDER }] }, 'channels[0].delivery'],
+      ['a missing delivery', { channels: [{ id: SHARED_CHANNEL_IDS.primary }] }, 'channels[0].delivery'],
+      ['an unsupported delivery', { channels: [{ id: SHARED_CHANNEL_IDS.primary, delivery: PLACEHOLDER }] }, 'channels[0].delivery'],
       ['a dm.contact not matching ^[UW][A-Z0-9]+$', { dm: { enabled: true, contact: 'B0TEST001' } }, 'dm.contact'],
       [
         'the same channel listed twice',
-        { channels: [{ id: 'C0TEST001', delivery: 'all' }, { id: 'C0TEST001', delivery: 'mentions' }] },
-        'C0TEST001',
+        { channels: [{ id: SHARED_CHANNEL_IDS.primary, delivery: 'all' }, { id: SHARED_CHANNEL_IDS.primary, delivery: 'mentions' }] },
+        SHARED_CHANNEL_IDS.primary,
       ],
     ])('%s is rejected, naming the persona and the key or channel', (_label, overrides, named) => {
       const message = loadError(withPersonas(makePersona({ name: 'Ops Bot', ...overrides } as Partial<PersonaInput>, dir)))
@@ -578,8 +590,8 @@ describe('loadPersonaConfig', () => {
         ac: '32',
         label: 'destination channel not in the persona channels',
         offenders: [[0, 'Ops Bot']],
-        settings: ['permission_prompts', 'C0TEST999'],
-        build: () => ({ personas: [makePersona({ name: 'Ops Bot', permission_prompts: 'C0TEST999' }, dir)] }),
+        settings: ['permission_prompts', SHARED_CHANNEL_IDS.foreign],
+        build: () => ({ personas: [makePersona({ name: 'Ops Bot', permission_prompts: SHARED_CHANNEL_IDS.foreign }, dir)] }),
       },
       {
         ac: '42',
@@ -1244,7 +1256,7 @@ describe('loadPersonaConfig', () => {
       ['a non-object dm', { dm: true }, 'dm must be a JSON object'],
       ['a bot_token value in dm', { dm: { enabled: false, bot_token: fakeToken(BOT_TOKEN_PREFIX, 'dm') } }, 'unknown field(s) in dm: "bot_token".'],
       ['a non-object channel entry', { channels: [null] }, 'channels[0] must be a JSON object'],
-      ['a bad channel ID', { channels: [{ id: 'D0TEST001', delivery: 'all' }] }, 'channels[0].id must be a Slack channel ID'],
+      ['a bad channel ID', { channels: [{ id: MALFORMED_CHANNEL_ID, delivery: 'all' }] }, 'channels[0].id must be a Slack channel ID'],
       ['a missing permission_prompts', { permission_prompts: undefined }, 'permission_prompts'],
     ])('with %s, the error names personas[i] with the token-shaped name and key as written', (_label, overrides, reported) => {
       const name = tokenName(BOT_TOKEN_PREFIX)
@@ -1353,7 +1365,7 @@ describe('loadPersonaConfig', () => {
         reply_chunk_limit: 12000,
         reply_chunk_mode: 'length',
         // makePersonaConfigInput gives a switch set to true its fungible-mode persona.
-        allow_invited_channels: true,
+        channel_mode: 'open',
       } satisfies Omit<Required<PersonaConfigInput>, 'personas'>
       const underHome = (path: string) => join(home, path.slice(2))
       expect(load(makePersonaConfigInput(values))).toMatchObject({
@@ -1489,7 +1501,7 @@ describe('loadPersonaConfig', () => {
     const MS_KEYS = TEST_TIMER_OVERRIDE_KEYS.filter((key) => key.endsWith('_ms'))
     const S_KEYS = TEST_TIMER_OVERRIDE_KEYS.filter((key) => key.endsWith('_s'))
 
-    test('the key is named, the six keys include the delivery-stuck timer, and it is not a documented top-level key', () => {
+    test('the key is named, the seven keys include the delivery-stuck timer and end with the compaction interval, and it is not a documented top-level key', () => {
       expect(TEST_TIMER_OVERRIDES_KEY).toBe('test_timer_overrides')
       expect([...TEST_TIMER_OVERRIDE_KEYS]).toEqual([
         'latch_recheck_interval_ms',
@@ -1498,6 +1510,7 @@ describe('loadPersonaConfig', () => {
         'delivery_stuck_after_ms',
         'unavailable_retry_base_s',
         'unavailable_retry_ceiling_s',
+        'queue_compact_interval_ms',
       ])
       expect(PERSONA_TOP_LEVEL_KEYS as readonly string[]).not.toContain(TEST_TIMER_OVERRIDES_KEY)
     })
@@ -1516,7 +1529,7 @@ describe('loadPersonaConfig', () => {
       }
     })
 
-    test('all six keys together load as given', () => {
+    test('all seven keys together load as given', () => {
       const block = {
         latch_recheck_interval_ms: 45_000,
         ad_version_recheck_interval_ms: 20_000,
@@ -1524,6 +1537,7 @@ describe('loadPersonaConfig', () => {
         delivery_stuck_after_ms: 7_000,
         unavailable_retry_base_s: 5,
         unavailable_retry_ceiling_s: 60,
+        queue_compact_interval_ms: 500,
       }
       expect(load(withBlock(block)).test_timer_overrides).toEqual(block)
     })
@@ -1602,6 +1616,171 @@ describe('loadPersonaConfig', () => {
       })
       expect(loadError(withBlock({ latch_recheck_interval_ms: 45_000, unavailable_retry_base_s: 0, unavailable_retry_ceiling_s: 60 }))).toContain('unavailable_retry_base_s')
     })
+
+    // queue_compact_interval_ms by name, so these cases fail if the key leaves the block.
+    test('queue_compact_interval_ms loads alone at 1 and at the maximum, kept as given', () => {
+      expect(load(withBlock({ queue_compact_interval_ms: 1 })).test_timer_overrides).toEqual({ queue_compact_interval_ms: 1 })
+      expect(load(withBlock({ queue_compact_interval_ms: MAX_TEST_TIMER_OVERRIDE_MS })).test_timer_overrides).toEqual({
+        queue_compact_interval_ms: MAX_TEST_TIMER_OVERRIDE_MS,
+      })
+    })
+
+    // The third column is a sentinel the value carries: the message names the key and its rule, never the value
+    // (loadError also checks PLACEHOLDER and the leak sentinel).
+    test.each<[string, unknown, string | undefined]>([
+      ['zero', 0, undefined],
+      ['negative', -24_681, '24681'],
+      ['a non-integer number', 1_357.9, '1357'],
+      ['one above the maximum', MAX_TEST_TIMER_OVERRIDE_MS + 1, String(MAX_TEST_TIMER_OVERRIDE_MS + 1)],
+      ['far above the maximum', MAX_TEST_TIMER_OVERRIDE_MS + 24_681, String(MAX_TEST_TIMER_OVERRIDE_MS + 24_681)],
+      ['a numeric string', '24681', '24681'],
+      ['the placeholder string', PLACEHOLDER, undefined],
+      ['the leak sentinel', LEAK_SENTINEL, undefined],
+      ['null', null, undefined],
+      ['a boolean', true, undefined],
+    ])('queue_compact_interval_ms %s is refused with the full message, naming the key and its rule and never the value', (_label, value, sentinel) => {
+      const message = loadError(withBlock({ queue_compact_interval_ms: value }))
+      expect(message).toBe(
+        `loadPersonaConfig: invalid persona config in "${join(dir, 'config.json')}": Persona config validation error: ` +
+          `${TEST_TIMER_OVERRIDES_KEY}.queue_compact_interval_ms must be a positive integer in [1, ${MAX_TEST_TIMER_OVERRIDE_MS}].`,
+      )
+      if (sentinel !== undefined) expect(message).not.toContain(sentinel)
+    })
+  })
+
+  // The two test-only switches the performance scenarios use (Task
+  // t2.yiv.sf.tu): test_measurements and test_timer_overrides'
+  // queue_compact_interval_ms. Like test_mcp_drop_endpoint they are off unless
+  // set, validated, outside every public key list and reload class, and
+  // captured at start.
+  describe('the test-only switches test_measurements and queue_compact_interval_ms', () => {
+    const withSwitch = (value: unknown) => ({ ...makePersonaConfigInput({}, dir), [TEST_MEASUREMENTS_KEY]: value })
+    const withBoth = (measurements: boolean, interval: number) => ({
+      ...makePersonaConfigInput({}, dir),
+      [TEST_MEASUREMENTS_KEY]: measurements,
+      [TEST_TIMER_OVERRIDES_KEY]: { queue_compact_interval_ms: interval },
+    })
+    const without = (config: object, ...keys: string[]) => Object.fromEntries(Object.entries(config).filter(([key]) => !keys.includes(key)))
+
+    /** Every exported key list and every exported reload class. */
+    const PUBLIC_LISTS: [string, readonly string[]][] = [
+      ['PERSONA_TOP_LEVEL_KEYS', PERSONA_TOP_LEVEL_KEYS],
+      ['PERSONA_ENTRY_KEYS', PERSONA_ENTRY_KEYS],
+      ['PERSONA_DM_KEYS', PERSONA_DM_KEYS],
+      ['CHANNEL_ENTRY_KEYS', CHANNEL_ENTRY_KEYS],
+      ['PRE_PERSONA_KEYS', PRE_PERSONA_KEYS],
+      ['SERVER_PATH_SETTINGS', SERVER_PATH_SETTINGS],
+      ['DESTRUCTIVE_SETTINGS', DESTRUCTIVE_SETTINGS],
+      ['IN_PLACE_SETTINGS', IN_PLACE_SETTINGS],
+      ['NEXT_LAUNCH_SETTINGS', NEXT_LAUNCH_SETTINGS],
+    ]
+
+    test('the switch is named, and neither key is in any public key list or reload class', () => {
+      expect(TEST_MEASUREMENTS_KEY).toBe('test_measurements')
+      expect(TEST_TIMER_OVERRIDE_KEYS).toContain('queue_compact_interval_ms')
+      for (const key of [TEST_MEASUREMENTS_KEY, 'queue_compact_interval_ms']) {
+        expect(PUBLIC_LISTS.filter(([, list]) => list.includes(key)).map(([name]) => name)).toEqual([])
+      }
+    })
+
+    test('the unset path: neither key resolves to a value, the compaction keeps its production interval, and no override line is due', () => {
+      const unset = load(makePersonaConfigInput({}, dir))
+      expect(Object.hasOwn(unset, TEST_MEASUREMENTS_KEY)).toBe(false)
+      expect(Object.hasOwn(unset, TEST_TIMER_OVERRIDES_KEY)).toBe(false)
+      // Setting the keys adds only them: the rest of the resolved configuration is the unset one.
+      for (const measurements of [true, false]) {
+        expect(without(load(withBoth(measurements, 500)), TEST_MEASUREMENTS_KEY, TEST_TIMER_OVERRIDES_KEY)).toStrictEqual(without(unset))
+      }
+      expect(effectiveTestTimer('queue_compact_interval_ms', unset.test_timer_overrides)).toBe(QUEUE_COMPACT_INTERVAL_MS)
+      expect(buildTestTimerOverridesLine(unset.test_timer_overrides)).toBeUndefined()
+    })
+
+    test.each([true, false])('test_measurements %p loads and is kept as given', (value) => {
+      expect(load(withSwitch(value)).test_measurements).toBe(value)
+    })
+
+    // Refused as test_mcp_drop_endpoint is: the same rule, the same full message with only the key's name changed.
+    test.each<[string, unknown]>([
+      ['null', null],
+      ['zero', 0],
+      ['one', 1],
+      ['a string', 'true'],
+      ['an object', {}],
+      ['an array', []],
+      ['the leak sentinel as a string', LEAK_SENTINEL],
+      ['a fake token as a string', fakeToken(BOT_TOKEN_PREFIX, 'measurements')],
+      ['an object holding the leak sentinel', { value: LEAK_SENTINEL }],
+    ])('test_measurements %s is refused as test_mcp_drop_endpoint is, naming the key and never the value', (_label, value) => {
+      const message = loadError(withSwitch(value))
+      expect(message).toBe(
+        `loadPersonaConfig: invalid persona config in "${join(dir, 'config.json')}": Persona config validation error: ` +
+          `${TEST_MEASUREMENTS_KEY} must be a boolean.`,
+      )
+      const drop = loadError({ ...makePersonaConfigInput({}, dir), [TEST_MCP_DROP_ENDPOINT_KEY]: value })
+      expect(message).toBe(drop.replace(TEST_MCP_DROP_ENDPOINT_KEY, TEST_MEASUREMENTS_KEY))
+    })
+
+    /** A switch state: test_measurements and queue_compact_interval_ms, each absent when undefined. */
+    type Switches = [measurements: boolean | undefined, interval: number | undefined]
+    test.each<[string, Switches, Switches]>([
+      ['both added', [undefined, undefined], [true, 500]],
+      ['both removed', [true, 500], [undefined, undefined]],
+      ['both changed', [false, 250], [true, 500]],
+    ])('%s: a reload changes no setting and keeps both start-time values in effect', (_label, [startMeasurements, startInterval], [nextMeasurements, nextInterval]) => {
+      const input = (measurements: boolean | undefined, interval: number | undefined) => ({
+        ...makePersonaConfigInput({}, dir),
+        ...(measurements === undefined ? {} : { [TEST_MEASUREMENTS_KEY]: measurements }),
+        ...(interval === undefined ? {} : { [TEST_TIMER_OVERRIDES_KEY]: { queue_compact_interval_ms: interval } }),
+      })
+      const start = load(input(startMeasurements, startInterval))
+      const next = load(input(nextMeasurements, nextInterval))
+      const plan = buildChangePlan(start, { kind: 'valid', config: next }, { realPath: path => path, home, dryRun: true })
+      if (!plan.valid) throw new Error('expected a valid plan')
+      expect(plan.settings).toEqual([])
+      expect(plan.noEffectiveChange).toBe(true)
+      const inEffect = configInEffect(start, next)
+      expect(inEffect.test_measurements).toBe(start.test_measurements)
+      expect(inEffect.test_timer_overrides).toEqual(start.test_timer_overrides)
+      expect(effectiveTestTimer('queue_compact_interval_ms', inEffect.test_timer_overrides)).toBe(startInterval ?? QUEUE_COMPACT_INTERVAL_MS)
+    })
+
+    describe('test_measurement_timings', () => {
+      const withTimings = (value: unknown) => ({ ...makePersonaConfigInput({}, dir), [TEST_MEASUREMENT_TIMINGS_KEY]: value })
+
+      test('is named, outside every public key list and reload class, and absent unless set', () => {
+        expect(TEST_MEASUREMENT_TIMINGS_KEY).toBe('test_measurement_timings')
+        expect(PUBLIC_LISTS.filter(([, list]) => list.includes(TEST_MEASUREMENT_TIMINGS_KEY)).map(([name]) => name)).toEqual([])
+        const unset = load(makePersonaConfigInput({}, dir))
+        expect(Object.hasOwn(unset, TEST_MEASUREMENT_TIMINGS_KEY)).toBe(false)
+        for (const value of [true, false]) {
+          const loaded = load(withTimings(value))
+          expect(loaded.test_measurement_timings).toBe(value)
+          expect(without(loaded, TEST_MEASUREMENT_TIMINGS_KEY)).toStrictEqual(without(unset))
+        }
+      })
+
+      test.each<[string, unknown]>([
+        ['null', null],
+        ['one', 1],
+        ['a string', 'true'],
+        ['the leak sentinel as a string', LEAK_SENTINEL],
+        ['an object holding the leak sentinel', { value: LEAK_SENTINEL }],
+      ])('%s is refused as test_measurements is, naming the key and never the value', (_label, value) => {
+        const message = loadError(withTimings(value))
+        expect(message).toBe(loadError(withSwitch(value)).replace(TEST_MEASUREMENTS_KEY, TEST_MEASUREMENT_TIMINGS_KEY))
+        expect(message).toContain(`${TEST_MEASUREMENT_TIMINGS_KEY} must be a boolean.`)
+      })
+
+      test.each([[undefined, true], [true, undefined], [false, true]] as const)('%p to %p: a reload changes no setting and keeps the start-time value', (from, to) => {
+        const input = (value: boolean | undefined) => value === undefined ? makePersonaConfigInput({}, dir) : withTimings(value)
+        const start = load(input(from)), next = load(input(to))
+        const plan = buildChangePlan(start, { kind: 'valid', config: next }, { realPath: path => path, home, dryRun: true })
+        if (!plan.valid) throw new Error('expected a valid plan')
+        expect(plan.settings).toEqual([])
+        expect(plan.noEffectiveChange).toBe(true)
+        expect(configInEffect(start, next).test_measurement_timings).toBe(start.test_measurement_timings)
+      })
+    })
   })
 
   // access.json's ackReaction,
@@ -1669,7 +1848,7 @@ describe('loadPersonaConfig', () => {
     }
 
     test.each([
-      ['routes as a populated object', 'routes', { C0TEST001: { cwd: '/tmp/ops' } }],
+      ['routes as a populated object', 'routes', { [SHARED_CHANNEL_IDS.primary]: { cwd: '/tmp/ops' } }],
       ['routes as an empty object', 'routes', {}],
       ['routes as an array', 'routes', []],
       ['routes as a non-object', 'routes', 'none'],
@@ -1715,558 +1894,68 @@ describe('loadPersonaConfig', () => {
     })
   })
 
-  // -------------------------------------------------------------------------
-  // Channel modes. The switch picks the mode for
-  // every persona at once: declarative mode (absent or false) reads each
-  // persona's `channels` and top-level `permission_prompts`; fungible mode
-  // (true) reads its `invited` section. Setting names, key lists and the "dm"
-  // default come from src/ (the `satisfies` names below are checked against
-  // the input types). Each rejection goes through `loadError`, so every one is
-  // leak-checked with `assertNoLeak`.
-  // -------------------------------------------------------------------------
-
-  const INVITED = 'invited' satisfies keyof PersonaInput
-  const INVITED_PROMPTS = `${INVITED}.${'permission_prompts' satisfies keyof PersonaInvitedInput}`
-  const DM_ENABLED = `dm.${'enabled' satisfies keyof PersonaDmInput}`
-  const DM_CONTACT = `dm.${'contact' satisfies keyof PersonaDmInput}`
-  const CREDENTIALS_FILE = 'credentials_file' satisfies keyof PersonaInput
-
-  /** The persona every channel-mode case names, and its error prefix (`personas[0]` plus the persona reference). */
-  const MODE_NAME = 'Ops Bot'
-  const MODE_REF = `personas[0] ${renderPersonaRef(MODE_NAME)}`
-  const CHANNEL = 'C0TEST001'
-  const OTHER_CHANNEL = 'G0TEST002'
-  const DM_ON = { enabled: true, contact: 'U0TEST001' }
-
-  /** The switch value that picks `mode`. */
-  const switchFor = (mode: ChannelMode) => mode === 'fungible'
-
-  /**
-   * A configuration in file form holding `personas` with the switch written
-   * as `value` (any JSON value), or with no switch when `value` is undefined.
-   */
-  const underSwitch = (value: unknown, ...personas: unknown[]) =>
-    value === undefined ? { personas } : { [MODE_SWITCH_SETTING]: value, personas }
-
-  /**
-   * A persona entry named `MODE_NAME` under the temp dir, from `makePersona`
-   * (declarative-mode defaults) or `factory`; `overrides` may hold values of
-   * any shape, and one set to undefined drops its key.
-   */
-  const modeEntry = (overrides: Record<string, unknown> = {}, factory = makePersona) =>
-    factory({ name: MODE_NAME, ...overrides } as Partial<PersonaInput>, dir)
-
-  /** A persona valid in both modes: one listed channel as its destination in each section, DMs off. */
-  const bothModesEntry = (overrides: Record<string, unknown> = {}) =>
-    modeEntry({ [INVITED]: { permission_prompts: CHANNEL }, ...overrides })
-
-  describe('the channel-mode switch allow_invited_channels', () => {
-    test.each([
-      ['true', true, 'fungible'],
-      ['false', false, 'declarative'],
-      ['absent', undefined, 'declarative'],
-    ] as const)('%s loads, resolving to %p and to %s mode (channelModeOf)', (_label, value, mode) => {
-      const config = load(underSwitch(value, bothModesEntry()))
-      expect(config.allow_invited_channels).toBe(value ?? false)
-      expect(channelModeOf(config)).toBe(mode)
+  describe('shared strict/open channel configuration', () => {
+    test.each([undefined, 'strict', 'open'] as const)('mode %p reads the same four explicit preferences and destination', mode => {
+      const channels = [SHARED_CHANNEL_IDS.primary, SHARED_CHANNEL_IDS.secondary, SHARED_CHANNEL_IDS.private, SHARED_CHANNEL_IDS.third]
+        .map((id, i) => ({ id, delivery: SR8_DELIVERY_CYCLE[i]! }))
+      const config = load({ channel_mode: mode, personas: [makePersona({ channels, permission_prompts: channels[0]!.id } as Partial<PersonaInput>, dir)] })
+      expect(config.channel_mode).toBe(mode ?? 'strict')
+      expect(channelModeOf(config)).toBe(mode ?? 'strict')
+      expect(config.personas[0]!.channels).toEqual(channels)
+      expect(config.personas[0]!.channels.map(channel => channel.delivery)).toEqual(['off', 'mentions', 'all', 'thread_hybrid'])
+      expect(config.personas[0]!.permission_prompts).toBe(channels[0]!.id)
+      assertNoLeak(config)
     })
 
-    test('absent and false resolve to the same configuration', () => {
-      expect(load(underSwitch(undefined, bothModesEntry()))).toStrictEqual(load(underSwitch(false, bothModesEntry())))
+    test.each([null, true, false, 1, '', 'declarative', 'fungible', LEAK_SENTINEL, {}])('invalid mode %p gives a setting error without echoing input', mode => {
+      const error = loadError({ channel_mode: mode, personas: [makePersona({}, dir)] })
+      expect(error).toContain('channel_mode')
+      expect(error).toContain('strict')
+      expect(error).toContain('open')
     })
 
-    // The personas are valid in both modes, so only the switch can be rejected.
-    // LEAK_SENTINEL rows: loadError's assertNoLeak proves the value is never echoed.
-    const REJECTED: [string, unknown][] = [
-      ['a string', 'true'],
-      ['a number', 1],
-      ['null', null],
-      ['an object', { enabled: true }],
-      ['an array', [true]],
-      ['the leak sentinel as a string', LEAK_SENTINEL],
-      ['a fake token as a string', fakeToken(BOT_TOKEN_PREFIX, 'switch')],
-      ['an object holding the leak sentinel', { value: LEAK_SENTINEL }],
-      ['an array holding the leak sentinel', [LEAK_SENTINEL]],
-    ]
-
-    test.each(REJECTED)('%s is rejected, naming the setting and no persona', (_label, value) => {
-      const message = loadError(underSwitch(value, bothModesEntry()))
-      expect(message).toContain(MODE_SWITCH_SETTING)
-      expect(message).not.toContain('personas[')
-    })
-
-    test('every rejected value gives the same error, so none of them is echoed', () => {
-      const messages = new Set(REJECTED.map(([, value]) => loadError(underSwitch(value, bothModesEntry()))))
-      expect(messages.size).toBe(1)
-    })
-
-    test.each([
-      ['a string', 'true'],
-      ['null', null],
-    ])('%s beside a persona entry invalid in both modes: the switch is reported, as it is validated first', (_label, value) => {
-      const message = loadError(underSwitch(value, bothModesEntry({ [CREDENTIALS_FILE]: undefined })))
-      expect(message).toBe(loadError(underSwitch(value, bothModesEntry())))
-      expect(message).not.toContain(CREDENTIALS_FILE)
-      // Control: the same entry under a boolean switch is rejected for its own setting.
-      for (const mode of CHANNEL_MODES) {
-        expect(loadError(underSwitch(switchFor(mode), bothModesEntry({ [CREDENTIALS_FILE]: undefined })))).toContain(
-          `${MODE_REF}: ${CREDENTIALS_FILE}`,
-        )
+    test.each([undefined, 'strict', 'open'] as const)('mode %p rejects every removed-key location', mode => {
+      for (const value of [null, false, true, {}, { permission_prompts: SHARED_CHANNEL_IDS.primary }, LEAK_SENTINEL]) {
+        expect(loadError({ channel_mode: mode, allow_invited_channels: value, personas: [makePersona({}, dir)] })).toContain('allow_invited_channels has been removed; use channel_mode')
+        expect(loadError({ channel_mode: mode, personas: [{ ...makePersona({}, dir), invited: value }] })).toContain('invited has been removed; use permission_prompts')
+        expect(loadError({ channel_mode: mode, personas: [{ ...makePersona({}, dir), fungible_destination: value }] })).toContain('fungible_destination')
       }
     })
-  })
 
-  describe('the invited section and the resolved form', () => {
-    test('invited is a known persona-entry key (PERSONA_ENTRY_KEYS)', () => {
-      expect(PERSONA_ENTRY_KEYS).toContain(INVITED)
-    })
-
-    test.each([...CHANNEL_MODES])('in %s mode an entry carrying invited loads, with no unknown-key rejection', (mode) => {
-      const [persona] = load(underSwitch(switchFor(mode), bothModesEntry())).personas
-      expect(persona.sections.invited).toEqual({ permission_prompts: CHANNEL })
-    })
-
-    test('in fungible mode every key PERSONA_INVITED_KEYS lists is accepted in invited', () => {
-      const invited = Object.fromEntries(PERSONA_INVITED_KEYS.map((key) => [key, CHANNEL]))
-      const [persona] = load(underSwitch(true, modeEntry({ [INVITED]: invited }, makeFungiblePersona))).personas
-      expect(persona.sections.invited).toEqual(invited)
-    })
-
-    // The declarative section is written too, so the resolved channels and
-    // permission_prompts show it is not read.
-    test.each([
-      ['"dm", with DMs on', { permission_prompts: DM_DESTINATION }, DM_ON, DM_DESTINATION],
-      ['a C channel ID, with DMs off', { permission_prompts: CHANNEL }, { enabled: false }, CHANNEL],
-      ['a G channel ID, with DMs off', { permission_prompts: OTHER_CHANNEL }, { enabled: false }, OTHER_CHANNEL],
-      ['absent from invited: "dm" by default, with DMs on', {}, DM_ON, DM_DESTINATION],
-      ['invited absent: "dm" by default, with DMs on', undefined, DM_ON, DM_DESTINATION],
-    ])('fungible mode: invited.permission_prompts %s resolves to fungible_destination %p, channels [] and permission_prompts undefined', (_label, invited, dm, expected) => {
-      const [persona] = load(underSwitch(true, modeEntry({ [INVITED]: invited, dm }))).personas
-      expect(persona.fungible_destination).toBe(expected)
-      expect(persona.channels).toEqual([])
-      expect(persona.permission_prompts).toBeUndefined()
-      expect(persona.dm).toEqual(dm)
-    })
-
-    test.each([
-      ['absent', undefined],
-      ['false', false],
-    ])('declarative mode (switch %s): fungible_destination is undefined and the declarative section is parsed', (_label, value) => {
-      const [persona] = load(underSwitch(value, bothModesEntry({ [INVITED]: { permission_prompts: OTHER_CHANNEL } }))).personas
-      expect(persona.fungible_destination).toBeUndefined()
-      expect(persona.channels).toEqual([{ id: CHANNEL, delivery: 'all' }])
-      expect(persona.permission_prompts).toBe(CHANNEL)
-    })
-
-    const WRITTEN = {
-      channels: [{ id: CHANNEL, delivery: 'mentions' }],
-      permission_prompts: CHANNEL,
-      invited: { permission_prompts: OTHER_CHANNEL },
-    }
-    test.each([
-      ['declarative', 'all three written', WRITTEN, {}],
-      ['declarative', 'only permission_prompts written', { channels: undefined, permission_prompts: DM_DESTINATION, invited: undefined }, { dm: DM_ON }],
-      ['fungible', 'all three written', WRITTEN, {}],
-      ['fungible', 'none written', { channels: undefined, permission_prompts: undefined, invited: undefined }, { dm: DM_ON }],
-    ] as const)('%s mode, %s: sections holds the three keys as written, each undefined when absent', (mode, _label, written, extra) => {
-      const [persona] = load(underSwitch(switchFor(mode), modeEntry({ ...written, ...extra }))).personas
-      expect(Object.keys(persona.sections).sort()).toEqual([...RECORDED_SECTION_KEYS].sort())
-      expect(persona.sections).toStrictEqual({
-        channels: written.channels,
-        permission_prompts: written.permission_prompts,
-        invited: written.invited,
-      })
-    })
-  })
-
-  describe('fungible parity: the real loader against makeMultiPersonaConfig', () => {
-    test('makeFungiblePersona entries under the switch load to the sections and destinations makeMultiPersonaConfig builds from the same values', () => {
-      const specs = [
-        { name: 'alpha' },
-        { name: 'bravo', invited: { permission_prompts: OTHER_CHANNEL } },
-        { name: 'charlie', invited: { permission_prompts: DM_DESTINATION }, dm: DM_ON },
-        { name: 'delta', invited: {}, dm: DM_ON },
-        { name: 'echo', invited: undefined, dm: DM_ON },
+    test.each(['strict', 'open'] as const)('%s validates all shared fields; no dormant section bypasses validation', channel_mode => {
+      const invalid = [
+        { permission_prompts: undefined }, { permission_prompts: SHARED_CHANNEL_IDS.foreign },
+        { permission_prompts: DM_DESTINATION }, { channels: [{ id: SHARED_CHANNEL_IDS.primary }] },
+        { channels: [{ id: SHARED_CHANNEL_IDS.primary, delivery: 'automatic' }] },
+        { channels: [{ id: MALFORMED_CHANNEL_ID, delivery: 'all' }] },
+        { channels: null }, { dm: { enabled: 'yes' } },
       ]
-      const loaded = load(underSwitch(true, ...specs.map((spec) => makeFungiblePersona(spec, dir)))).personas
-      // makeFungiblePersona's default invited, made explicit for the resolved builder.
-      const defaultInvited = makeFungiblePersona({}, dir).invited
-      const built = makeMultiPersonaConfig(
-        specs.map((spec) => ({ invited: defaultInvited, ...spec })),
-        dir,
-        { allow_invited_channels: true },
-      ).personas
-      const resolvedForm = ({ fungible_destination, sections, channels, permission_prompts }: (typeof loaded)[number]) => ({
-        fungible_destination,
-        sections,
-        channels,
-        permission_prompts,
-      })
-      expect(loaded.map(resolvedForm)).toStrictEqual(built.map(resolvedForm))
-      expect(loaded.map((p) => p.fungible_destination)).toEqual([
-        defaultInvited?.permission_prompts,
-        OTHER_CHANNEL,
-        DM_DESTINATION,
-        DM_DESTINATION,
-        DM_DESTINATION,
-      ])
-    })
-  })
-
-  /** A persona with no channels and DMs off, prompting to "dm": invalid in declarative mode, `invited` aside. */
-  const NO_WAY_TO_RECEIVE = { channels: undefined, dm: { enabled: false }, permission_prompts: DM_DESTINATION }
-
-  /** The two switch values of declarative mode. */
-  const DECLARATIVE_SWITCHES = [
-    ['absent', undefined],
-    ['false', false],
-  ] as const
-
-  describe('validation in declarative mode: invited is neither checked nor read', () => {
-    const MALFORMED_INVITED: [string, unknown][] = [
-      ['an invited with a malformed permission_prompts', { permission_prompts: PLACEHOLDER }],
-      ['an invited with a non-string permission_prompts', { permission_prompts: 42 }],
-      ['an invited with an unknown key', { extra_key: 1 }],
-      ['an invited with a token-named key', { [fakeToken(BOT_TOKEN_PREFIX, 'invited')]: 1 }],
-      ['a string invited', PLACEHOLDER],
-      ['an array invited', [CHANNEL]],
-      ['a null invited', null],
-      ['a number invited', 7],
-    ]
-    const EVERY_INVITED: [string, unknown][] = [['a valid invited', { permission_prompts: CHANNEL }], ...MALFORMED_INVITED]
-
-    const bySwitch = (rows: [string, unknown][]) =>
-      DECLARATIVE_SWITCHES.flatMap(([switchLabel, value]) =>
-        rows.map(([label, invited]): [string, string, unknown, unknown] => [switchLabel, label, value, invited]))
-
-    test.each(bySwitch(EVERY_INVITED))(
-      'switch %s, %s: a persona with no channels and DMs off is rejected naming dm.enabled, with the error it gets without invited',
-      (_switchLabel, _label, value, invited) => {
-        const message = loadError(underSwitch(value, modeEntry({ ...NO_WAY_TO_RECEIVE, [INVITED]: invited })))
-        expect(message).toBe(loadError(underSwitch(value, modeEntry(NO_WAY_TO_RECEIVE))))
-        expect(message).toContain(`${MODE_REF}: `)
-        expect(message).toContain(DM_ENABLED)
-        // Reported before any destination rule, and invited is not looked at.
-        expect(message).not.toContain(DM_CONTACT)
-        expect(message).not.toContain(INVITED)
-      },
-    )
-
-    test.each(bySwitch(MALFORMED_INVITED))('switch %s, %s: loads, resolved as without it', (_switchLabel, _label, value, invited) => {
-      const [persona] = load(underSwitch(value, modeEntry({ [INVITED]: invited }))).personas
-      const [without] = load(underSwitch(value, modeEntry())).personas
-      expect(persona.fungible_destination).toBeUndefined()
-      expect(persona.sections.invited).toStrictEqual(invited)
-      const { sections: _sections, ...resolved } = persona
-      const { sections: _withoutSections, ...resolvedWithout } = without
-      expect(resolved).toStrictEqual(resolvedWithout)
-    })
-  })
-
-  describe('validation in fungible mode', () => {
-    /** `personas[i]` plus the persona reference (`renderPersonaRef`). */
-    const indexedRef = (index: number, name: string) => `personas[${index}] ${renderPersonaRef(name)}`
-
-    const rejectFungible = (overrides: Record<string, unknown>) =>
-      loadError(underSwitch(true, modeEntry(overrides, makeFungiblePersona)))
-
-    interface FungibleRejection {
-      label: string
-      overrides: Record<string, unknown>
-      /** Fragments the error must hold: the persona reference with the setting, then what else it names. */
-      named: string[]
-      /** Fragments the error must not hold. */
-      absent: string[]
-    }
-
-    const TOKEN_KEY = fakeToken(BOT_TOKEN_PREFIX, 'invited-key')
-
-    // LEAK_SENTINEL and fake-token rows: loadError's assertNoLeak proves the
-    // value in invited or in invited.permission_prompts is never echoed.
-    const SHAPE_AND_FORMAT_ROWS: FungibleRejection[] = [
-      ...([
-        ['a string', PLACEHOLDER],
-        ['the leak sentinel', LEAK_SENTINEL],
-        ['an array', [CHANNEL]],
-        ['an array holding the leak sentinel', [LEAK_SENTINEL]],
-        ['null', null],
-      ] as const).map(([what, invited]): FungibleRejection => ({
-        label: `invited as ${what}`,
-        overrides: { [INVITED]: invited },
-        named: [`${MODE_REF}: ${INVITED} `],
-        absent: [INVITED_PROMPTS],
-      })),
-      ...([
-        ['an unknown key', { extra_key: 1 }, 'extra_key'],
-        ['an unknown key holding the leak sentinel', { extra_key: LEAK_SENTINEL }, 'extra_key'],
-        ['an unknown key beside a valid permission_prompts', { permission_prompts: CHANNEL, extra_key: 1 }, 'extra_key'],
-        ['a token-named key', { [TOKEN_KEY]: 1 }, TOKEN_KEY],
-      ] as const).map(([what, invited, key]): FungibleRejection => ({
-        label: `invited with ${what}`,
-        overrides: { [INVITED]: invited },
-        named: [`${MODE_REF}: `, INVITED, describeUnknownKeys([key])],
-        absent: [INVITED_PROMPTS],
-      })),
-      ...([
-        ['a malformed string', PLACEHOLDER],
-        ['the leak sentinel', LEAK_SENTINEL],
-        ['a fake token', fakeToken(BOT_TOKEN_PREFIX, 'prompts')],
-        ['a number', 42],
-        ['null', null],
-        ['an empty string', ''],
-        ['a user ID', 'U0TEST001'],
-        ['a direct-message channel ID', 'D0TEST001'],
-        ['a lower-case channel ID', CHANNEL.toLowerCase()],
-      ] as const).map(([what, prompts]): FungibleRejection => ({
-        label: `invited.permission_prompts as ${what}`,
-        overrides: { [INVITED]: { permission_prompts: prompts }, dm: DM_ON },
-        named: [`${MODE_REF}: ${INVITED_PROMPTS} `],
-        absent: [DM_CONTACT, DM_ENABLED],
-      })),
-    ]
-
-    /** The "dm" fungible destination, written or by default, against each missing DM setting. */
-    const DESTINATION_ROWS: (FungibleRejection & { byDefault: boolean })[] = ([
-      ['written as "dm"', { permission_prompts: DM_DESTINATION }, false],
-      ['by default (permission_prompts absent from invited)', {}, true],
-      ['by default (invited absent)', undefined, true],
-    ] as const).flatMap(([how, invited, byDefault]) =>
-      ([
-        ['DMs off', { enabled: false, contact: DM_ON.contact }, [DM_ENABLED], [DM_CONTACT]],
-        ['no contact', { enabled: true }, [DM_CONTACT], [DM_ENABLED]],
-        ['DMs off and no contact', { enabled: false }, [DM_ENABLED, DM_CONTACT], []],
-        ['dm absent', undefined, [DM_ENABLED, DM_CONTACT], []],
-      ] as const).map(([missing, dm, named, absent]) => ({
-        label: `a "dm" destination ${how}, with ${missing}`,
-        overrides: { [INVITED]: invited, dm },
-        named: [`${MODE_REF}: ${INVITED_PROMPTS} `, JSON.stringify(DM_DESTINATION), ...named],
-        absent: [...absent],
-        byDefault,
-      })),
-    )
-
-    test.each([...SHAPE_AND_FORMAT_ROWS, ...DESTINATION_ROWS])('$label is rejected, naming the persona and the setting', ({ overrides, named, absent }) => {
-      const message = rejectFungible(overrides)
-      for (const fragment of named) expect(message).toContain(fragment)
-      for (const fragment of absent) expect(message).not.toContain(fragment)
+      for (const change of invalid) expect(loadError({ channel_mode, personas: [{ ...makePersona({}, dir), ...change }] })).toContain('personas[0]')
     })
 
-    test.each(DESTINATION_ROWS)('$label: the error says whether "dm" is the default', ({ overrides, byDefault }) => {
-      const message = rejectFungible(overrides)
-      if (byDefault) expect(message).toContain('default')
-      else expect(message).not.toContain('default')
+    test.each(['strict', 'open'] as const)('%s builders match the production loader and emit only current fields', channel_mode => {
+      const specs = [
+        { name: 'alpha', channels: [{ id: SHARED_CHANNEL_IDS.primary, delivery: 'off' as const }], permission_prompts: SHARED_CHANNEL_IDS.primary },
+        { name: 'beta', channels: [], permission_prompts: DM_DESTINATION, dm: { enabled: true, contact: 'U0TEST001' } },
+      ]
+      const input = makePersonaConfigInput({ channel_mode, personas: specs.map(spec => makePersona(spec, dir)) }, dir)
+      const actual = load(input)
+      const expected = makeMultiPersonaConfig(specs, dir, { channel_mode })
+      expect(actual.personas).toEqual(expected.personas)
+      expect(actual.channel_mode).toBe(expected.channel_mode)
+      expect(JSON.stringify(input)).not.toMatch(/allow_invited_channels|fungible_destination|"invited"/)
+      assertNoLeak({ input, actual, expected })
     })
 
-    // Steps: (1) shape and unknown keys of the entry, dm and invited; (2) types
-    // and formats, invited.permission_prompts after dm.contact; (3) the
-    // destination rule. A row breaking several steps reports the earliest.
-    test.each([
-      {
-        label: 'a non-object invited (1) before a missing credentials_file (2)',
-        overrides: { [INVITED]: PLACEHOLDER, [CREDENTIALS_FILE]: undefined },
-        reported: [`${MODE_REF}: ${INVITED} `],
-        absent: [CREDENTIALS_FILE],
-      },
-      {
-        label: 'an unknown key in the entry (1) before a malformed invited.permission_prompts (2)',
-        overrides: { nickname: 'ops', [INVITED]: { permission_prompts: PLACEHOLDER } },
-        reported: [`${MODE_REF}: `, describeUnknownKeys(['nickname'])],
-        absent: [INVITED],
-      },
-      {
-        label: 'a non-object dm (1) before a non-object invited (1, checked after dm)',
-        overrides: { dm: PLACEHOLDER, [INVITED]: PLACEHOLDER },
-        reported: [`${MODE_REF}: dm `],
-        absent: [INVITED],
-      },
-      {
-        label: 'an unknown key in invited (1) before a malformed dm.contact (2)',
-        overrides: { [INVITED]: { extra_key: 1 }, dm: { enabled: true, contact: 'B0TEST001' } },
-        reported: [`${MODE_REF}: `, INVITED, describeUnknownKeys(['extra_key'])],
-        absent: [DM_CONTACT],
-      },
-      {
-        label: 'a missing credentials_file (2) before a malformed invited.permission_prompts (2, last)',
-        overrides: { [CREDENTIALS_FILE]: undefined, [INVITED]: { permission_prompts: PLACEHOLDER } },
-        reported: [`${MODE_REF}: ${CREDENTIALS_FILE} `],
-        absent: [INVITED],
-      },
-      {
-        label: 'a non-boolean dm.enabled (2) before a malformed invited.permission_prompts (2, after dm)',
-        overrides: { dm: { enabled: PLACEHOLDER }, [INVITED]: { permission_prompts: PLACEHOLDER } },
-        reported: [`${MODE_REF}: ${DM_ENABLED} `],
-        absent: [INVITED],
-      },
-      {
-        label: 'a malformed dm.contact (2) before a malformed invited.permission_prompts (2, after dm.contact)',
-        overrides: { dm: { enabled: true, contact: 'B0TEST001' }, [INVITED]: { permission_prompts: PLACEHOLDER } },
-        reported: [`${MODE_REF}: ${DM_CONTACT} `],
-        absent: [INVITED],
-      },
-      {
-        label: 'a malformed dm.contact (2) before the destination rule (3) of a "dm" destination with DMs off',
-        overrides: { dm: { enabled: false, contact: 'B0TEST001' }, [INVITED]: { permission_prompts: DM_DESTINATION } },
-        reported: [`${MODE_REF}: ${DM_CONTACT} `],
-        absent: [INVITED, DM_ENABLED],
-      },
-      {
-        label: 'a missing credentials_file (2) before the destination rule (3) of the default "dm" destination',
-        overrides: { [CREDENTIALS_FILE]: undefined, [INVITED]: undefined },
-        reported: [`${MODE_REF}: ${CREDENTIALS_FILE} `],
-        absent: [INVITED, DM_ENABLED, DM_CONTACT],
-      },
-      {
-        label: 'a malformed invited.permission_prompts beside a malformed declarative section, which is never read',
-        overrides: { channels: [null], permission_prompts: 42, [INVITED]: { permission_prompts: PLACEHOLDER } },
-        reported: [`${MODE_REF}: ${INVITED_PROMPTS} `],
-        absent: ['channels'],
-      },
-    ])('check order: $label', ({ overrides, reported, absent }) => {
-      const message = rejectFungible(overrides)
-      for (const fragment of reported) expect(message).toContain(fragment)
-      for (const fragment of absent) expect(message).not.toContain(fragment)
-      expect(message.split('Persona config validation error: ')).toHaveLength(2)
-    })
-
-    test('a persona with no channels, no top-level permission_prompts, DMs off and a channel fungible destination loads', () => {
-      const entry = modeEntry({ [INVITED]: { permission_prompts: OTHER_CHANNEL } }, makeFungiblePersona)
-      expect(Object.keys(entry)).not.toContain('channels')
-      expect(Object.keys(entry)).not.toContain('permission_prompts')
-      const [persona] = load(underSwitch(true, entry)).personas
-      expect(persona.dm).toEqual({ enabled: false })
-      expect(persona.fungible_destination).toBe(OTHER_CHANNEL)
-    })
-
-    test.each([
-      ['channels as a string', { channels: PLACEHOLDER }],
-      ['channels as an object', { channels: {} }],
-      ['channels as null', { channels: null }],
-      ['a non-object channel entry', { channels: [null] }],
-      ['a malformed channel ID', { channels: [{ id: 'D0TEST001', delivery: 'all' }] }],
-      ['a channel entry with an unknown key', { channels: [{ id: CHANNEL, delivery: 'all', label: 'ops' }] }],
-      ['a channel entry with no delivery', { channels: [{ id: CHANNEL }] }],
-      ['the same channel listed twice', { channels: [{ id: CHANNEL, delivery: 'all' }, { id: CHANNEL, delivery: 'mentions' }] }],
-      ['a top-level permission_prompts naming an unlisted channel', { permission_prompts: 'C0TEST999' }],
-      [
-        'a top-level permission_prompts naming a channel not among channels',
-        { channels: [{ id: CHANNEL, delivery: 'all' }], permission_prompts: OTHER_CHANNEL },
-      ],
-      ['a top-level permission_prompts of the wrong type (a number)', { permission_prompts: 42 }],
-      ['a top-level permission_prompts of the wrong type (an object)', { permission_prompts: { id: CHANNEL } }],
-      ['a malformed top-level permission_prompts', { permission_prompts: PLACEHOLDER }],
-      ['a top-level permission_prompts "dm" with DMs off', { permission_prompts: DM_DESTINATION }],
-    ])('%s loads: the declarative section is never read', (_label, overrides: Record<string, unknown>) => {
-      const [persona] = load(underSwitch(true, modeEntry(overrides, makeFungiblePersona))).personas
-      expect(persona.channels).toEqual([])
-      expect(persona.permission_prompts).toBeUndefined()
-      expect(persona.sections.channels).toStrictEqual(overrides['channels'])
-      expect(persona.sections.permission_prompts).toStrictEqual(overrides['permission_prompts'])
-    })
-
-    /** Paths of the persona at position `i` under the temp dir, so personas collide only where a row says so. */
-    const pathsAt = (i: number) => ({
-      working_directory: join(dir, `p${i}`, 'work'),
-      credentials_file: join(dir, `p${i}`, 'credentials.json'),
-    })
-
-    /** A real directory and a symlink to it, both inside the temp root; safe to call once per mode. */
-    const symlinkedDir = () => {
-      const target = join(dir, 'real-work')
-      const link = join(dir, 'link-work')
-      mkdirSync(target, { recursive: true })
-      if (!existsSync(link)) symlinkSync(target, link)
-      return { target, link }
-    }
-
-    interface CrossPersonaRow {
-      label: string
-      /** The two personas the error names, by array position. */
-      offenders: [number, string][]
-      /** Builds the personas with the persona builder of one mode. */
-      build: (factory: typeof makePersona) => PersonaInput[]
-      /** Record mode: only the real-path collision step is skipped. */
-      record: 'loads' | 'rejects'
-    }
-
-    const CROSS_PERSONA_ROWS: CrossPersonaRow[] = [
-      {
-        label: 'the same name twice',
-        offenders: [[0, MODE_NAME], [1, MODE_NAME]],
-        build: (factory) => [0, 1].map((i) => factory({ name: MODE_NAME, ...pathsAt(i) }, dir)),
-        record: 'rejects',
-      },
-      {
-        label: "a name equal to another persona's key",
-        offenders: [[0, MODE_NAME], [1, personaKey(MODE_NAME)]],
-        build: (factory) => [MODE_NAME, personaKey(MODE_NAME)].map((name, i) => factory({ name, ...pathsAt(i) }, dir)),
-        record: 'rejects',
-      },
-      {
-        label: 'prefix-related keys',
-        offenders: [[0, 'dev'], [1, 'dev_2']],
-        build: (factory) => ['dev', 'dev_2'].map((name, i) => factory({ name, ...pathsAt(i) }, dir)),
-        record: 'rejects',
-      },
-      {
-        label: 'a shared working_directory',
-        offenders: [[0, 'alpha'], [1, 'bravo']],
-        build: (factory) =>
-          ['alpha', 'bravo'].map((name, i) => factory({ name, ...pathsAt(i), working_directory: join(dir, 'shared-work') }, dir)),
-        record: 'loads',
-      },
-      {
-        label: 'a shared credentials_file',
-        offenders: [[0, 'alpha'], [1, 'bravo']],
-        build: (factory) =>
-          ['alpha', 'bravo'].map((name, i) => factory({ name, ...pathsAt(i), credentials_file: join(dir, 'shared.json') }, dir)),
-        record: 'loads',
-      },
-      {
-        label: 'a symlinked duplicate working_directory inside the temp root',
-        offenders: [[0, 'alpha'], [1, 'bravo']],
-        build: (factory) => {
-          const { target, link } = symlinkedDir()
-          return [
-            factory({ name: 'alpha', ...pathsAt(0), working_directory: target }, dir),
-            factory({ name: 'bravo', ...pathsAt(1), working_directory: link }, dir),
-          ]
-        },
-        record: 'loads',
-      },
-    ]
-
-    test.each(CROSS_PERSONA_ROWS)('$label is rejected with the declarative-mode error', ({ offenders, build }) => {
-      const fungible = loadError(underSwitch(true, ...build(makeFungiblePersona)))
-      expect(fungible).toBe(loadError(underSwitch(undefined, ...build(makePersona))))
-      for (const [index, name] of offenders) expect(fungible).toContain(indexedRef(index, name))
-    })
-
-    test.each(CROSS_PERSONA_ROWS)('record mode, $label: $record, as in declarative mode', ({ build, record }) => {
-      const personas = build(makeFungiblePersona)
-      const input = underSwitch(true, ...personas)
-      const recordPath = join(dir, 'config.json.last-applied')
-      const parse = (asRecord: boolean) =>
-        parsePersonaConfigBytes(Buffer.from(JSON.stringify(input)), recordPath, dir, { home, record: asRecord })
-      const messageOf = (run: () => unknown) => {
-        try {
-          run()
-        } catch (err) {
-          assertNoLeak(err, 'rejection')
-          return (err as Error).message
-        }
-        return undefined
-      }
-      const standard = messageOf(() => parse(false))
-      expect(standard).toBeDefined()
-      if (record === 'loads') {
-        const destinations = personas.map((p) => p.invited?.permission_prompts)
-        expect(parse(true).personas.map((p) => p.fungible_destination)).toEqual(destinations)
-        expect(resolvePersonaConfig(input, dir, home, { record: true }).personas.map((p) => p.fungible_destination)).toEqual(
-          destinations,
-        )
-      } else {
-        expect(messageOf(() => parse(true))).toBe(standard)
-      }
+    test('a valid configuration above 64 KiB retains all 1000 channel preferences', () => {
+      const channels = channelPopulation(SR8_SHARED_LIST_CHANNELS)
+      const input = makePersonaConfigInput({ personas: [makePersona({ channels, permission_prompts: channels.at(-1)!.id }, dir)] }, dir)
+      const path = writeConfigFile(dir, input)
+      expect(statSync(path).size).toBeGreaterThan(MAX_RELOAD_FILE_BYTES)
+      const actual = loadPersonaConfig(path, home)
+      expect(actual.personas[0]!.channels).toEqual(channels)
+      expect(actual.personas[0]!.permission_prompts).toBe(channels.at(-1)!.id)
+      assertNoLeak({ actual, file: writtenFile(path) })
     })
   })
 
@@ -2277,8 +1966,13 @@ describe('loadPersonaConfig', () => {
   // recordError below).
   describe('model and effort', () => {
     const EFFORT_REASON = `effort is invalid. Allowed values are: ${EFFORT_LEVELS.join(', ')}.`
-    const MODES = ['declarative', 'fungible', 'record'] as const
+    const MODES = [...CHANNEL_MODES, 'record'] as const
     type LoadMode = (typeof MODES)[number]
+    const MODE_NAME = 'Ops Bot'
+    const MODE_REF = `personas[0] ${renderPersonaRef(MODE_NAME)}`
+    const CHANNEL = SHARED_CHANNEL_IDS.primary
+    const DM_ENABLED = 'dm.enabled'
+    const DM_CONTACT = 'dm.contact'
 
     const recordPath = () => join(dir, 'config.json.last-applied')
     const parseBytes = (input: unknown, record: boolean) =>
@@ -2298,14 +1992,12 @@ describe('loadPersonaConfig', () => {
     /** What follows the source path in a rejection: the validation error itself. */
     const causeOf = (message: string) => message.slice(message.indexOf('Persona config validation error: '))
 
-    /** Record mode reads a declarative-mode file; fungible mode writes the switch as true. */
-    const factoryFor = (mode: LoadMode) => (mode === 'fungible' ? makeFungiblePersona : makePersona)
+    /** The persona entry named `MODE_NAME`; `overrides` may hold values of any shape. */
+    const modeEntry = (overrides: Record<string, unknown>) => makePersona({ name: MODE_NAME, ...overrides } as Partial<PersonaInput>, dir)
+    /** `personas` in file form; record mode reads a strict-mode file, and open mode writes `channel_mode`. */
+    const underMode = (mode: LoadMode, ...personas: unknown[]) => (mode === 'open' ? { channel_mode: mode, personas } : { personas })
     const configIn = (mode: LoadMode, overrides: Record<string, unknown>) =>
-      underSwitch(
-        mode === 'fungible' ? true : undefined,
-        modeEntry(overrides, factoryFor(mode)),
-        factoryFor(mode)({ name: 'review_bot' }, dir),
-      )
+      underMode(mode, modeEntry(overrides), makePersona({ name: 'review_bot' }, dir))
 
     const loadIn = (mode: LoadMode, input: unknown) => (mode === 'record' ? parseBytes(input, true) : load(input))
 
@@ -2434,66 +2126,105 @@ describe('loadPersonaConfig', () => {
           reported: EFFORT_REASON,
           absent: [DM_ENABLED],
         },
+        {
+          mode,
+          label: 'a removed invited key (stage 1) before an invalid effort',
+          overrides: { invited: PLACEHOLDER, effort: BAD_EFFORT },
+          reported: 'invited has been removed',
+          absent: ['effort'],
+        },
+        {
+          mode,
+          label: 'non-array channels (stage 1) before an invalid effort',
+          overrides: { channels: PLACEHOLDER, effort: BAD_EFFORT },
+          reported: 'channels ',
+          absent: ['effort'],
+        },
+        {
+          mode,
+          label: 'an invalid effort before a bad channel id',
+          overrides: { effort: BAD_EFFORT, channels: [{ id: MALFORMED_CHANNEL_ID, delivery: 'all' }] },
+          reported: EFFORT_REASON,
+          absent: ['channels'],
+        },
+        {
+          mode,
+          label: 'an invalid effort before an unsupported delivery',
+          overrides: { effort: BAD_EFFORT, channels: [{ id: CHANNEL, delivery: PLACEHOLDER }] },
+          reported: EFFORT_REASON,
+          absent: ['channels'],
+        },
+        {
+          mode,
+          label: 'an invalid effort before a permission_prompts that is neither dm nor a channel ID',
+          overrides: { effort: BAD_EFFORT, permission_prompts: PLACEHOLDER },
+          reported: EFFORT_REASON,
+          absent: ['permission_prompts'],
+        },
+        {
+          mode,
+          label: 'an invalid effort before the destination rule of a "dm" destination with DMs off',
+          overrides: { effort: BAD_EFFORT, permission_prompts: DM_DESTINATION, dm: { enabled: false } },
+          reported: EFFORT_REASON,
+          absent: [DM_ENABLED, DM_CONTACT],
+        },
       ]),
-      {
-        mode: 'declarative',
-        label: 'non-array channels (stage 1) before an invalid effort',
-        overrides: { channels: PLACEHOLDER, effort: BAD_EFFORT },
-        reported: 'channels ',
-        absent: ['effort'],
-      },
-      {
-        mode: 'declarative',
-        label: 'an invalid effort before a bad channel id',
-        overrides: { effort: BAD_EFFORT, channels: [{ id: 'D0TEST001', delivery: 'all' }] },
-        reported: EFFORT_REASON,
-        absent: ['channels'],
-      },
-      {
-        mode: 'declarative',
-        label: 'an invalid effort before an unsupported delivery',
-        overrides: { effort: BAD_EFFORT, channels: [{ id: CHANNEL, delivery: PLACEHOLDER }] },
-        reported: EFFORT_REASON,
-        absent: ['channels'],
-      },
-      {
-        mode: 'declarative',
-        label: 'an invalid effort before a permission_prompts that is neither dm nor a channel ID',
-        overrides: { effort: BAD_EFFORT, permission_prompts: PLACEHOLDER },
-        reported: EFFORT_REASON,
-        absent: ['permission_prompts'],
-      },
-      {
-        mode: 'fungible',
-        label: 'a non-object invited (stage 1) before an invalid effort',
-        overrides: { [INVITED]: PLACEHOLDER, effort: BAD_EFFORT },
-        reported: `${INVITED} `,
-        absent: ['effort'],
-      },
-      {
-        mode: 'fungible',
-        label: 'an invalid effort before a malformed invited.permission_prompts',
-        overrides: { effort: BAD_EFFORT, [INVITED]: { permission_prompts: PLACEHOLDER } },
-        reported: EFFORT_REASON,
-        absent: [INVITED],
-      },
-      {
-        mode: 'fungible',
-        label: 'an invalid effort before the destination rule of a "dm" destination with DMs off',
-        overrides: { effort: BAD_EFFORT, [INVITED]: { permission_prompts: DM_DESTINATION }, dm: { enabled: false } },
-        reported: EFFORT_REASON,
-        absent: [INVITED, DM_ENABLED, DM_CONTACT],
-      },
     ]
 
     test.each(ORDER_ROWS)('$mode mode, check order: $label, and record mode reports the same', ({ mode, overrides, reported, absent }) => {
-      const input = underSwitch(switchFor(mode) || undefined, modeEntry(overrides, factoryFor(mode)))
+      const input = underMode(mode, modeEntry(overrides))
       const message = loadError(input)
       expect(message).toContain(`Persona config validation error: ${MODE_REF}: ${reported}`)
       for (const fragment of absent) expect(message).not.toContain(fragment)
       expect(message.split('Persona config validation error: ')).toHaveLength(2)
       expect(recordError(input)).toBe(`loadPersonaConfig: invalid persona config in "${recordPath()}": ${causeOf(message)}`)
     })
+  })
+
+  // Per-persona reaction_notices, in both channel modes: true when absent,
+  // never inherited from a sibling, and a supplied non-boolean (null included)
+  // rejected rather than defaulted, without echoing the value. Top-level
+  // placement is in the unknown-keys table above.
+  describe('reaction_notices', () => {
+    const REACTION_NOTICES = 'reaction_notices' satisfies keyof PersonaInput
+    const MODE_NAME = 'Ops Bot'
+    const MODE_REF = `personas[0] ${renderPersonaRef(MODE_NAME)}`
+    /** `overrides` on the persona `MODE_NAME`, beside a sibling that never sets the key; open mode writes `channel_mode`. */
+    const configIn = (mode: ChannelMode, overrides: Record<string, unknown>) => {
+      const personas = [makePersona({ name: MODE_NAME, ...overrides } as Partial<PersonaInput>, dir), makePersona({ name: 'review_bot' }, dir)]
+      return mode === 'open' ? { channel_mode: mode, personas } : { personas }
+    }
+
+    test.each(
+      CHANNEL_MODES.flatMap((mode) =>
+        ([['omitted', {}, true], ['true', { [REACTION_NOTICES]: true }, true], ['false', { [REACTION_NOTICES]: false }, false]] as const)
+          .map(([label, written, expected]) => ({ mode, label, written, expected }))),
+    )('$mode mode, $label: resolves to $expected, and the sibling resolves to true', ({ mode, written, expected }) => {
+      const [persona, sibling] = load(configIn(mode, written)).personas
+      expect(persona!.reaction_notices).toBe(expected)
+      expect(sibling!.reaction_notices).toBe(true)
+    })
+
+    const REJECTED: [string, unknown][] = [
+      ['null', null],
+      ['the string "false"', 'false'],
+      ['the number 0', 0],
+      ['the number 1', 1],
+      ['an empty array', []],
+      ['an object', { enabled: true }],
+      ['a fake token as a string', fakeToken(BOT_TOKEN_PREFIX, 'reaction')],
+      ['an object holding a fake token', { value: fakeToken(APP_TOKEN_PREFIX, 'reaction') }],
+    ]
+
+    test.each(CHANNEL_MODES.flatMap((mode) => REJECTED.map(([label, value]) => ({ mode, label, value }))))(
+      '$mode mode: $label is rejected naming the persona and the setting, never the value',
+      ({ mode, value }) => {
+        expect(loadError(configIn(mode, { [REACTION_NOTICES]: value }))).toBe(
+          `loadPersonaConfig: invalid persona config in "${join(dir, 'config.json')}": Persona config validation error: ` +
+            `${MODE_REF}: ${REACTION_NOTICES} must be a boolean.`,
+        )
+      },
+    )
   })
 })
 
@@ -2548,7 +2279,7 @@ function recordingConfigFs(overrides: Partial<PersonaConfigFs> = {}) {
 /** An operation that throws an errno-style error with `code`. */
 function configFsFailsWith(code: string): () => never {
   return () => {
-    throw Object.assign(new Error(`simulated ${code}`), { code })
+    throw Object.assign(new Error(sentinelInMessage('config-io')), { code })
   }
 }
 
@@ -2788,7 +2519,7 @@ describe('credentialsFilesToProtect', () => {
       writeFileSync(path, `{ "personas": [ { "credentials_file": "${fakeToken(BOT_TOKEN_PREFIX)}" `, 'utf-8')
       return path
     }],
-    ['a route-shaped file', () => writeConfigFile(dir, { routes: { C0TEST001: { cwd: join(dir, 'work') } } })],
+    ['a route-shaped file', () => writeConfigFile(dir, { routes: { [SHARED_CHANNEL_IDS.primary]: { cwd: join(dir, 'work') } } })],
     ['a non-array personas', () => writeConfigFile(dir, { personas: { credentials_file: join(dir, 'x.json') } })],
     ['a non-string credentials_file', () => writeConfigFile(dir, { personas: [{ name: 'x', credentials_file: 42 }] })],
     ['a JSON null', () => writeConfigFile(dir, null)],
@@ -2803,7 +2534,7 @@ describe('credentialsFilesToProtect', () => {
   // Rows: label, arrange, whether the current file's path is listed, ops made after the open.
   test.each<[string, () => { path: string; overrides: Partial<PersonaConfigFs> }, boolean, ConfigFdCall['op'][]]>([
     ['a regular file, read through the injected seam', () => ({ path: writeCurrent(join(dir, 'current', 'credentials.json')), overrides: {} }),
-      true, ['fstat', 'read', 'close']],
+      true, ['fstat', 'read', 'fstat', 'close']],
     ['a non-regular file, as the injected fstatFile reports it', () => ({
       path: writeCurrent(join(dir, 'current', 'credentials.json')),
       overrides: { fstatFile: NOT_REGULAR_STATS },
@@ -2833,35 +2564,37 @@ describe('credentialsFilesToProtect', () => {
     expect(lines).toEqual([])
   })
 
-  // The 64 KiB cap exempts this one read: a config.json grown past the cap
-  // still protects every credentials file it names, even one named only after
-  // the first 65,537 bytes. The padding is sentinel-bearing fake token text,
-  // so a leak of the file's content fails assertNoLeak.
+  // Complete config reads still protect credentials paths after the old cap.
+  // Invalid pending input carries sentinel-bearing padding; valid input uses
+  // leading whitespace so the padding itself introduces no schema error.
   /** A config.json over 3 × 64 KiB whose one persona names `credentialsFile` after the padding. */
-  function writeOversizedCurrent(credentialsFile: string): string {
+  function writeOversizedCurrent(credentialsFile: string, invalid = true): string {
     const unit = `${fakeToken(BOT_TOKEN_PREFIX, 'padding')} `
     const padding = unit.repeat(Math.ceil((3 * MAX_RELOAD_FILE_BYTES) / unit.length) + 1)
     const path = writeConfigFile(dir, {
-      notes: padding,
+      ...(invalid ? { notes: padding } : {}),
       ...makePersonaConfigInput({ personas: [makePersona({ name: 'current_bot', credentials_file: credentialsFile }, dir)] }, dir),
     })
+    if (!invalid) writeFileSync(path, ' '.repeat(padding.length) + readFileSync(path, 'utf8'))
     expect(statSync(path).size).toBeGreaterThan(3 * MAX_RELOAD_FILE_BYTES)
     expect(readFileSync(path, 'utf-8').indexOf(credentialsFile)).toBeGreaterThan(MAX_RELOAD_FILE_BYTES + 1)
     return path
   }
 
-  test('a config.json over the 64 KiB cap is read whole and uncapped: the path it names is listed and refused by assertSendable, while the capped reader refuses the same file with EFBIG', () => {
+  test.each([false, true])('large pending config (invalid=%s) protects every named credential path while a bounded control read still refuses EFBIG', invalid => {
     const applied = appliedPersonas()
     // Outside the state directory, so only the list can refuse it.
     const named = writeCredentialsFile(dir, 'outside/credentials.json')
-    const path = writeOversizedCurrent(named)
+    const path = writeOversizedCurrent(named, invalid)
+    if (invalid) expect(() => loadPersonaConfig(path, home)).toThrow()
+    else expect(loadPersonaConfig(path, home).personas[0]!.credentials_file).toBe(named)
     const { fs, calls, opened } = recordingConfigFs()
 
     const list = credentialsFilesToProtect(applied, path, home, fs)
 
     assertNoLeak({ list, lines }, 'protect')
     expect(list).toEqual([applied[0].credentials_file, named])
-    expect(calls.map((c) => c.op)).toEqual(['open', 'fstat', 'read', 'close'])
+    expect(calls.map((c) => c.op)).toEqual(['open', 'fstat', 'read', 'fstat', 'close'])
     expect(calls.find((c) => c.op === 'read')).toMatchObject({ maxBytes: Infinity, returned: statSync(path).size })
     expect(() => fstatSync(opened()!)).toThrow()
     expect(lines).toEqual([])
@@ -2871,10 +2604,10 @@ describe('credentialsFilesToProtect', () => {
     expect(() => assertSendable(named, stateDir, inboxDir, list)).toThrow(`Blocked: cannot send ${named} — it is a persona credentials file.`)
     expect(() => assertSendable(named, stateDir, inboxDir, [applied[0].credentials_file])).not.toThrow()
 
-    // Every other read of the same file is capped.
+    // Callers with an independent bound still enforce it.
     let refused: unknown
     try {
-      readPersonaConfigBytes(path)
+      readPersonaConfigBytes(path, undefined, { uncapped: false })
     } catch (err) {
       refused = err
     }
@@ -3171,12 +2904,12 @@ describe('start-path primitives', () => {
       afterOpen: ConfigFdCall['op'][]
     }
     test.each<Row>([
-      { label: 'a regular file', arrange: (p) => (writeFileSync(p, CONTENT), {}), code: 'ok', afterOpen: ['fstat', 'read', 'close'] },
+      { label: 'a regular file', arrange: (p) => (writeFileSync(p, CONTENT), {}), code: 'ok', afterOpen: ['fstat', 'read', 'fstat', 'close'] },
       {
         label: 'a symlink to a regular file (followed, read)',
         arrange: (p) => (writeFileSync(join(dir, 'target.json'), CONTENT), symlinkSync(join(dir, 'target.json'), p), {}),
         code: 'ok',
-        afterOpen: ['fstat', 'read', 'close'],
+        afterOpen: ['fstat', 'read', 'fstat', 'close'],
       },
       {
         label: 'a directory (real)',
@@ -3203,21 +2936,32 @@ describe('start-path primitives', () => {
         label: 'fstat fails with EIO (injected)',
         arrange: (p) => (writeFileSync(p, CONTENT), { fstatFile: configFsFailsWith('EIO') }),
         code: 'EIO',
-        cause: 'simulated EIO',
+        cause: 'file operation failed (EIO)',
         afterOpen: ['fstat', 'close'],
       },
       {
         label: 'the read fails with EIO (injected)',
         arrange: (p) => (writeFileSync(p, CONTENT), { readFileFd: configFsFailsWith('EIO') }),
         code: 'EIO',
-        cause: 'simulated EIO',
+        cause: 'file operation failed (EIO)',
         afterOpen: ['fstat', 'read', 'close'],
+      },
+      {
+        label: 'post-read fstat fails with EIO: classified without file or error content',
+        arrange: (p) => {
+          writeFileSync(p, CONTENT)
+          let stats = 0
+          return { fstatFile: fd => ++stats === 1 ? fstatSync(fd) : configFsFailsWith('EIO')() }
+        },
+        code: 'EIO',
+        cause: 'file operation failed (EIO)',
+        afterOpen: ['fstat', 'read', 'fstat', 'close'],
       },
       {
         label: 'closing throws (injected): ignored, the bytes stand',
         arrange: (p) => (writeFileSync(p, CONTENT), { closeFile: configFsFailsWith('EIO') }),
         code: 'ok',
-        afterOpen: ['fstat', 'read', 'close'],
+        afterOpen: ['fstat', 'read', 'fstat', 'close'],
       },
       {
         label: 'closing throws after a refused non-regular file (injected): ignored, the refusal stands',
@@ -3294,79 +3038,62 @@ describe('start-path primitives', () => {
       expect(out).toEqual({ reader: refused, loader: refused, ops: ['open', 'fstat', 'close'] })
     }, 15_000)
 
-    // The 64 KiB cap (65,536 bytes): a larger file is refused with EFBIG, named
-    // by path and limit, carrying none of its content, and never read past
-    // 65,537 bytes. The files hold sentinel-bearing fake token text, so a leak
-    // of their content fails assertNoLeak.
-    const tooLargeMessage = (path: string) => exactMessage(path, 'it is larger than the 64 KiB limit')
-    const tooLargeStartMessage = (path: string) =>
-      `The configuration file "${path}" is larger than the 64 KiB limit. The server requires the configuration file to start.`
-
-    /** Write `size` bytes of fake token text (ASCII: one byte per character) at `path`; the bytes. */
-    function writeTokenText(path: string, size: number): Buffer {
-      const line = `${fakeToken(BOT_TOKEN_PREFIX, 'oversized')}\n`
-      const bytes = Buffer.from(line.repeat(Math.ceil(size / line.length)).slice(0, size))
+    test.each([65_536, 65_537, 3 * 65_536])('regular configuration of %i bytes is read in full and closed', size => {
+      const path = join(dir, 'config.json')
+      const bytes = Buffer.from(' '.repeat(size - 2) + '{}')
       writeFileSync(path, bytes)
-      return bytes
-    }
-
-    /** Call `fn`, expecting a too-large refusal of `path`; checks the error and its start message. */
-    function expectTooLarge(path: string, fn: () => unknown): void {
-      const err = thrown(fn)
-      const startMessage = configFileReadFailureMessage(path, (err as PersonaConfigReadError).code)
-      assertNoLeak({ err, startMessage }, 'too large')
-      expect(err).toBeInstanceOf(PersonaConfigReadError)
-      expect((err as PersonaConfigReadError).code).toBe('EFBIG')
-      expect(err.message).toBe(tooLargeMessage(path))
-      expect(isMissingConfigCode('EFBIG')).toBe(false)
-      expect(startMessage).toBe(tooLargeStartMessage(path))
-    }
-
-    test.each([
-      { label: '65,536 bytes (the limit) is read in full, asking for at most 65,537', size: 65_536, afterOpen: ['fstat', 'read', 'close'] },
-      { label: '65,537 bytes is refused on its stat, unread, and the path loader fails the same way', size: 65_537, afterOpen: ['fstat', 'close'] },
-    ])('a file of $label', ({ size, afterOpen }) => {
-      const path = join(dir, 'config.json')
-      const content = writeTokenText(path, size)
       const { fs, calls, opened } = recordingConfigFs()
-
-      if (size <= 65_536) {
-        const bytes = readPersonaConfigBytes(path, fs)
-        expect(bytes.length).toBe(size)
-        expect(bytes.equals(content)).toBe(true)
-        expect(calls.find((c) => c.op === 'read')).toMatchObject({ maxBytes: 65_537, returned: size })
-      } else {
-        expectTooLarge(path, () => readPersonaConfigBytes(path, fs))
-        expectTooLarge(path, () => loadPersonaConfig(path, home))
-      }
-      expect(calls.map((c) => c.op)).toEqual(['open', ...afterOpen])
+      const actual = readPersonaConfigBytes(path, fs)
+      expect(actual.equals(bytes)).toBe(true)
+      expect(calls.map(c => c.op)).toEqual(['open', 'fstat', 'read', 'fstat', 'close'])
       expect(() => fstatSync(opened()!)).toThrow()
+      assertNoLeak(actual)
     })
 
-    // A stat that under-reports (as for a file that grows after it) or omits
-    // the size: the bounded read still refuses the file, asking for no more
-    // than 65,537 bytes; a read double that returns more than it was asked
-    // for is refused too.
-    const regularStats = (size?: number) => () => ({ isFile: () => true, isDirectory: () => false, ...(size === undefined ? {} : { size }) })
-    test.each<{ label: string; overrides: Partial<PersonaConfigFs>; returned: number }>([
-      { label: 'fstat reports 10 bytes; the real bounded read', overrides: { fstatFile: regularStats(10) }, returned: 65_537 },
-      { label: 'fstat reports no size; the real bounded read', overrides: { fstatFile: regularStats() }, returned: 65_537 },
-      {
-        label: 'fstat reports 10 bytes; a read double returning the whole file whatever it is asked for',
-        overrides: { fstatFile: regularStats(10), readFileFd: (fd) => readFileSync(fd) },
-        returned: 3 * 65_536,
-      },
-    ])('a 192 KiB file where $label: refused as too large, the read asked for at most 65,537 bytes', ({ overrides, returned }) => {
+    test.each([0, 10, undefined])('stat size %p either returns complete bytes or refuses a byte-count mismatch', size => {
       const path = join(dir, 'config.json')
-      writeTokenText(path, 3 * 65_536)
-      const { fs, calls, opened } = recordingConfigFs(overrides)
-
-      expectTooLarge(path, () => readPersonaConfigBytes(path, fs))
-
-      expect(calls.map((c) => c.op)).toEqual(['open', 'fstat', 'read', 'close'])
-      expect(calls.find((c) => c.op === 'read')).toMatchObject({ maxBytes: 65_537, returned })
+      const bytes = Buffer.from(' '.repeat(3 * MAX_RELOAD_FILE_BYTES) + '{}')
+      writeFileSync(path, bytes)
+      const { fs, opened } = recordingConfigFs({ fstatFile: () => ({ isFile: () => true, isDirectory: () => false, size }) })
+      if (size === undefined) expect(readPersonaConfigBytes(path, fs).equals(bytes)).toBe(true)
+      else expect((thrown(() => readPersonaConfigBytes(path, fs)) as PersonaConfigReadError).code).toBe('EAGAIN')
       expect(() => fstatSync(opened()!)).toThrow()
+      assertNoLeak(bytes)
     })
+
+    test.each(['stable', 'size', 'mtimeMs', 'ctimeMs', 'ino', 'dev'] as const)(
+      'sequenced metadata: %s after a complete read, with closure and safe diagnostics', field => {
+        const path = join(dir, 'config.json')
+        const bytes = Buffer.from(JSON.stringify({ notes: LEAK_SENTINEL }))
+        writeFileSync(path, bytes)
+        let statCalls = 0
+        const { fs, calls, opened } = recordingConfigFs({
+          fstatFile(fd) {
+            const stats = fstatSync(fd)
+            // Initial size matches the real bytes; only the post-read stat changes.
+            if (++statCalls === 2 && field !== 'stable') stats[field] += 1
+            return stats
+          },
+        })
+        if (field === 'stable') {
+          expect(readPersonaConfigBytes(path, fs)).toEqual(bytes)
+        } else {
+          const err = thrown(() => readPersonaConfigBytes(path, fs)) as PersonaConfigReadError
+          const startMessage = configFileReadFailureMessage(path, err.code)
+          expect(err).toBeInstanceOf(PersonaConfigReadError)
+          expect(err.code).toBe('EAGAIN')
+          expect(err.message).toBe(exactMessage(path, 'it changed while being read; retry with a stable regular file'))
+          expect(isMissingConfigCode(err.code)).toBe(false)
+          expect(startMessage).toBe(`The configuration file "${path}" cannot be read (EAGAIN). The server requires the configuration file to start.`)
+          assertNoLeak({ err, startMessage }, 'changed-file diagnostics')
+        }
+        expect(statCalls).toBe(2)
+        expect(calls.map(c => c.op)).toEqual(['open', 'fstat', 'read', 'fstat', 'close'])
+        expect(calls.find(c => c.op === 'read')?.returned).toBe(bytes.length)
+        expect(calls.slice(1).every(c => c.fd === opened())).toBe(true)
+        expect(() => fstatSync(opened()!)).toThrow()
+      },
+    )
   })
 
   describe('parsePersonaConfigBytes', () => {

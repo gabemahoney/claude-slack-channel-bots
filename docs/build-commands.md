@@ -14,6 +14,10 @@ none: the repo has no linter or formatter configured; `bun run check:mocks` runs
 
 `bun test`, with a fresh scratch HOME and `SLACK_STATE_DIR` as required by [the test instructions](../tests/README.md#running-the-unit-suite).
 
+## Fast checks
+
+Targeted tests: `bun test <paths>` for the test files covering what changed, with the same scratch HOME and `SLACK_STATE_DIR` as the unit suite. Repo-wide guards: `bun run typecheck` (about 15 s) and `bun run check:mocks` (under 1 s).
+
 ## Integration tests
 
 The repo's [/ci skill](../.claude/skills/ci/SKILL.md) (`$ci` on Codex): Docker-sharded run of `tests/integration`. Never pass `ANTHROPIC_*` env to it; use `CI_ANTHROPIC_*`. The live Slack acceptance run is `/ci-live`, only when a task asks for it.

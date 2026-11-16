@@ -1,4 +1,6 @@
-import { cannedDecideResult } from './test-helpers/agent-director-stub.ts'
+import { expectNoMetadata } from './test-helpers/server-post.ts'
+import { cannedDecideResult, stubCallCount } from './test-helpers/agent-director-stub.ts'
+import { makeReloadHarness, type ReloadRun } from './test-helpers/reload-harness.ts'
 /**
  * permission-click-handler.test.ts — click → decide path under
  * the request_token / plural-projection wire (component 2 rewrite), resolved by
@@ -185,6 +187,7 @@ const TOKEN_B = '22222222-2222-4222-8222-222222222222'
 const TOKEN_C = '33333333-3333-4333-8333-333333333333'
 /** A key naming no applied persona. */
 const UNKNOWN_KEY = 'no_such_persona'
+
 
 const ALLOWED_TEXT = '*Permission* — Allowed'
 const DENIED_TEXT = '*Permission* — Denied by operator'
@@ -553,6 +556,7 @@ describe('handlePermissionClick — happy path', () => {
     expect(updates[0]!.channel).toBe(CHANNEL_A)
     expect(updates[0]!.ts).toBe(messageTs)
     expect(updates[0]!.text).toBe(ALLOWED_TEXT)
+    expectNoMetadata(updates[0]!)
     // Nothing went through persona B's client.
     expect(slackCalls(h.stubB)).toBe(0)
     // The update was resolved through A's key.
@@ -581,6 +585,7 @@ describe('handlePermissionClick — happy path', () => {
     expect(updates[0]!.channel).toBe(CHANNEL_A)
     expect(updates[0]!.ts).toBe(messageTs)
     expect(updates[0]!.text).toBe(DENIED_TEXT)
+    expectNoMetadata(updates[0]!)
     expect(slackCalls(h.stubB)).toBe(0)
     expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(true)
   })
@@ -840,6 +845,100 @@ describe('handlePermissionClick — decide-wire invariant', () => {
 // ---------------------------------------------------------------------------
 
 describe('handlePermissionClick — stale click', () => {
+  test.each(['channel', 'dm'] as const)('a valid %s prompt survives confirmed off/destination changes and restart while ordinary tools remain refused', async destination => {
+    const config = makeReloadHarness()
+    let run: ReloadRun | undefined
+    try {
+      const alpha = config.persona('alpha', destination === 'dm'
+        ? { dm: { enabled: true, contact: CONTACT_D }, permission_prompts: 'dm' } : {})
+      const beta = config.persona('beta'); config.materialize(alpha, beta)
+      config.writeConfig({ personas: [alpha, beta] })
+      const opts = { dryRun: false, realLifecycle: true, slack: {
+        alpha: { appId: 'A0PROMPTA', botUserId: 'U0PROMPTA', botId: 'B0PROMPTA', teamId: 'T0PROMPT' },
+        beta: { appId: 'A0PROMPTB', botUserId: 'U0PROMPTB', botId: 'B0PROMPTB', teamId: 'T0PROMPT' },
+      } }
+      run = await config.startDetecting(opts); expect(run.outcome?.kind).toBe('applied')
+      const checkSecrecy = () => assertNoLeak({ ...run!.captured(), server: config.serverSideFiles(
+        config.paths.config, alpha.credentials_file, beta.credentials_file,
+      ) })
+      checkSecrecy()
+      const original = run.serverConfig()!.personas[0]!, instance = personaInstanceId(original.key)
+      const getPersona = (key: string) => run!.serverConfig()!.personas.find(p => p.key === key)
+      const clientFor = (key: string) => run!.connections.clientFor(key)
+      const decide = makeDecideStub()
+      const ad = { ...decide.client,
+        list: async () => ({ spawns: [cannedListRow({ state: 'check_permission' }, original, config.root)] }),
+        get: async () => cannedGetResultPlural({ state: 'check_permission', permission_requests: [TOKEN_A, TOKEN_B].map(request_token => cannedPermissionRequest({ request_token })) }, original, config.root),
+      }
+      initOutageState({ getClient: () => ad as unknown as Client, notify: () => {} })
+      const poller = startManualPoller({ getClient: () => ad as unknown as Client, clientFor, getPersona, getPersonaConfig: () => run!.serverConfig() })
+      await poller.tick()
+      const posted = getLivePermission(instance, TOKEN_A)!, unclicked = getLivePermission(instance, TOKEN_B)!
+      expect(posted).toBeDefined(); expect(unclicked).toBeDefined()
+      expect(run.stub('alpha').calls.postMessage).toHaveLength(2)
+      run.registerSession('alpha'); const session = run.session('alpha'), socket = run.stub('alpha').socket
+      const cp = run.checkpoint(), timeline = run.lifecycle.timeline.length, calls = run.composition!.calls.length
+      const adCalls = stubCallCount(run.composition!.agentDirector)
+      const clients = { alpha: clientFor(config.key('alpha')), beta: clientFor(config.key('beta')) }
+      const sockets = ['alpha', 'beta'].map(name => run!.stub(name).sockets.map(s => ({ starts: s.startCalls, disconnects: s.disconnectCalls })))
+      const betaSocket = run.stub('beta').socket
+      config.writeConfig({ personas: [{ ...alpha,
+        channels: [...alpha.channels!.map(c => ({ ...c, delivery: 'off' as const })), { id: CHANNEL_B_MOVED, delivery: 'all' }],
+        permission_prompts: CHANNEL_B_MOVED, dm: { enabled: false },
+      }, beta] })
+      await run.ticks.tick()
+      expect(config.pendingExists()).toBe(true)
+      expect(run.since(cp).lifecycle).toEqual([])
+      expect(run.since(cp).slackBuilds).toBe(0); expect(run.since(cp).slackCalls).toEqual([])
+      expect(run.composition!.calls.slice(calls)).toEqual([])
+      checkSecrecy() // The preview must still exist when its bytes are checked.
+      config.confirm(); await run.ticks.tick()
+      expect(run.since(cp).lifecycle).toEqual([{ op: 'update-in-place', key: original.key, via: 'apply', settings:
+        destination === 'dm' ? ['channels', 'delivery', 'permission_prompts', 'dm.enabled', 'dm.contact'] : ['channels', 'delivery', 'permission_prompts'],
+      }])
+      expect(run.lifecycle.timeline.slice(timeline)).toEqual([
+        { op: 'update-in-place', key: original.key, phase: 'start' },
+        { op: 'update-in-place', key: original.key, phase: 'settled' },
+      ])
+      expect(run.composition!.calls.slice(calls)).toEqual([['destinations.forget', original.key]])
+      expect(stubCallCount(run.composition!.agentDirector)).toBe(adCalls)
+      expect(run.since(cp).slackBuilds).toBe(0); expect(run.since(cp).slackCalls).toEqual([])
+      expect(clientFor(config.key('alpha'))).toBe(clients.alpha); expect(clientFor(config.key('beta'))).toBe(clients.beta)
+      expect(run.stub('beta').socket).toBe(betaSocket)
+      expect(['alpha', 'beta'].map(name => run!.stub(name).sockets.map(s => ({ starts: s.startCalls, disconnects: s.disconnectCalls })))).toEqual(sockets)
+      checkSecrecy()
+      expect(run.session('alpha')).toBe(session); expect(run.stub('alpha').socket).toBe(socket)
+      expect(run.controller.sharedChannels()!.choice(original.key, alpha.channels![0]!.id)).toBe('off')
+      expect((await run.callTool('alpha', 'reply', { chat_id: posted.channelId, text: 'ordinary reply' })).isError).toBe(true)
+      const deps = { receivingPersonaKey: original.key, getPersona, clientFor, log: () => {}, emitTrail: () => {} }
+      expect(await handlePermissionClick(encodePermissionActionId('allow', instance, TOKEN_A), { ...deps, receivingPersonaKey: config.key('beta') })).toBe(true)
+      expect(decide.calls).toEqual([])
+      expect(await handlePermissionClick(encodePermissionActionId('allow', instance, TOKEN_A), deps)).toBe(true)
+      expect(run.stub('alpha').calls.update).toHaveLength(1)
+      expect(run.stub('alpha').calls.update[0]).toMatchObject({ channel: posted.channelId, ts: posted.messageTs })
+      expect(run.stub('alpha').calls.postMessage).toHaveLength(2)
+      checkSecrecy()
+      stopPermissionPoller(); _resetPollerState(); await run.stop()
+      run = await config.startDetecting(opts); expect(run.outcome?.kind).toBe('applied')
+      checkSecrecy()
+      expect(getLivePermission(instance, TOKEN_B)).toBeUndefined()
+      initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+      expect(await handlePermissionClick(encodePermissionActionId('deny', instance, TOKEN_B), deps, { channel: unclicked.channelId })).toBe(true)
+      expect(decide.calls).toEqual([
+        { instance_id: instance, request_token: TOKEN_A, decision: 'allow' },
+        { instance_id: instance, request_token: TOKEN_B, decision: 'deny' },
+      ])
+      expect(run.stub('alpha').calls.update).toEqual([])
+      expect(run.stub('alpha').calls.postMessage).toEqual([])
+      expect(run.stub('beta').calls.update).toEqual([])
+      run.registerSession('alpha')
+      expect((await run.callTool('alpha', 'reply', { chat_id: unclicked.channelId, text: 'ordinary reply after restart' })).isError).toBe(true)
+      checkSecrecy()
+    } finally {
+      stopPermissionPoller(); _resetPollerState(); await run?.stop(); await config.cleanup()
+    }
+  })
+
   test('no live entry for (instance, token) → decide STILL fires with decoded token; NO chat.update', async () => {
     // Do NOT seed an entry. The poller-state is empty; the click is stale.
     // The receiving persona resolves, so decide still fires.

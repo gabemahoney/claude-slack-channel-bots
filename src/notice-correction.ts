@@ -2,6 +2,9 @@
 import type { PostedPersonaNotice } from './persona-notifier.ts'
 import type { PersonaConnectionClock } from './persona-connections.ts'
 import { describeSlackCallFailure } from './persona-connection-errors.ts'
+import { OWN_POST_CANCELLED } from './persona-destination.ts'
+import { ownPostAnswerOfError, ownPostAnswerOfPost, type OwnPostAnswer, type OwnPostStart } from './own-post.ts'
+import { SERVER_POST_EVENT_TYPE } from './server-post.ts'
 
 export const NOTICE_CORRECTION_TIMEOUT_MS = 10_000
 export type NoticeCorrectionOutcome =
@@ -36,6 +39,34 @@ function attempt(call: () => Promise<unknown>, deps: NoticeCorrectionDeps): Prom
   })
 }
 
+/**
+ * The fallback is a new message as the persona, so it runs as an own-post
+ * operation of the original post's kind (SR-3.2.1): the intent is kept before
+ * the call, and the operation ends with Slack's own answer whatever this
+ * correction's bound or cancellation decides. Bookkeeping never changes the
+ * correction (SR-3.2.5).
+ */
+async function postCorrection(post: PostedPersonaNotice, text: string, deps: NoticeCorrectionDeps): Promise<NoticeCorrectionOutcome> {
+  const own = post.ownPost
+  let op: OwnPostStart | undefined
+  try {
+    op = own?.observer.start(own.key, own.surface, { channel: post.channelId }, { kind: 'text', text })
+    if (op?.ready) await op.ready
+  } catch { /* join bookkeeping cannot change the correction */ }
+  const end = (answer: OwnPostAnswer) => {
+    try { own?.observer.end(op?.operation, answer) } catch { /* join bookkeeping cannot change the correction */ }
+  }
+  if (deps.signal.aborted || !deps.isActive()) { end({ kind: 'failed', code: OWN_POST_CANCELLED }); return { outcome: 'cancelled' } }
+  return attempt(() => {
+    let call: Promise<unknown>
+    try {
+      call = post.client.chat.postMessage({ channel: post.channelId, text, metadata: { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} } })
+    } catch (error) { end(ownPostAnswerOfError(error)); throw error }
+    void call.then(response => end(ownPostAnswerOfPost(post.channelId, response)), error => end(ownPostAnswerOfError(error)))
+    return call
+  }, deps)
+}
+
 /** One edit, then at most one short same-place correction; neither enters destination retries. */
 export async function correctPostedNotice(post: PostedPersonaNotice, text: string, deps: NoticeCorrectionDeps): Promise<void> {
   const active = () => !deps.signal.aborted && deps.isActive()
@@ -47,6 +78,6 @@ export async function correctPostedNotice(post: PostedPersonaNotice, text: strin
   if (!active() || edited.outcome === 'cancelled') return
   deps.logOutcome('edit', edited)
   if (edited.outcome === 'success') return
-  const correction = await attempt(() => post.client.chat.postMessage({ channel: post.channelId, text: formatted }), deps)
+  const correction = await postCorrection(post, formatted, deps)
   if (active() && correction.outcome !== 'cancelled') deps.logOutcome('correction', correction)
 }

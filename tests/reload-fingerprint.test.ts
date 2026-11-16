@@ -16,6 +16,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { reviewFingerprint } from '../src/reload-review.ts'
 import { describe, test, expect } from 'bun:test'
 import {
   composePendingFile,
@@ -25,6 +26,7 @@ import {
   PENDING_FILE_HEADER,
   PENDING_FINGERPRINT_PREFIX,
   reloadFingerprint,
+  reloadReviewBinding,
   type FingerprintContent,
   type FingerprintCredentialsEntry,
 } from '../src/reload-fingerprint.ts'
@@ -213,4 +215,26 @@ describe('composePendingFile and parsePendingFingerprint', () => {
   ])('parse returns undefined for %s, without throwing', (_label, text) => {
     expect(parsePendingFingerprint(text)).toBeUndefined()
   })
+})
+
+test('review binding includes every authority/current dependency and generation, but never exposes credentials', () => {
+  const content = reloadFingerprint(CONFIG, baseEntries())
+  const seed: Parameters<typeof reloadReviewBinding> = [content, 'authority-a', 'process-a', 3, { membership: 'ready', currentMode: 'strict', activeLife: 'alpha-1' }]
+  const bound = reloadReviewBinding(...seed)
+  expect(bound).toMatch(FINGERPRINT)
+  expect(reloadReviewBinding(...structuredClone(seed))).toBe(bound)
+  const mutations: typeof seed[] = [
+    [reloadFingerprint(CONFIG, baseEntries().slice(1)), ...seed.slice(1)] as typeof seed,
+    [seed[0], 'authority-b', seed[2], seed[3], seed[4]],
+    [seed[0], seed[1], 'process-b', seed[3], seed[4]],
+    [seed[0], seed[1], seed[2], 4, seed[4]],
+    [seed[0], seed[1], seed[2], seed[3], { ...seed[4] as object, membership: 'unresolved' }],
+    [seed[0], seed[1], seed[2], seed[3], { ...seed[4] as object, currentMode: 'open' }],
+    [seed[0], seed[1], seed[2], seed[3], { ...seed[4] as object, activeLife: 'alpha-2' }],
+  ]
+  const changed = mutations.map(input => reloadReviewBinding(...input))
+  expect(new Set([bound, ...changed]).size).toBe(8)
+  expect(reviewFingerprint(bound, 4)).not.toBe(reviewFingerprint(bound, 5))
+  expect(reviewFingerprint(bound, 4)).toBe(reviewFingerprint(reloadReviewBinding(...seed), 4))
+  assertNoLeak([bound, ...changed, reviewFingerprint(bound, 4)])
 })

@@ -1,29 +1,29 @@
 /**
- * upgrade-0-11-1.test.ts — An upgrade from 0.11.1 stays declarative.
+ * upgrade-0-11-1.test.ts — An upgrade from 0.11.1 stays in strict mode.
  *
  * What this suite proves: a 0.11.1 `config.json`, with neither the
  * `allow_invited_channels` switch nor any `invited` section, loads unchanged
- * and behaves as 0.11.1 did. Each fixture below, written into a temp state
- * directory:
+ * and keeps strict-mode behavior under current membership eligibility. Each
+ * fixture below, written into a temp state directory:
  *
  * - keeps its bytes, through `loadPersonaConfig` and through a reload-harness
  *   start, a start over its last-applied record and a confirmed 0.11.1-style
  *   edit; the record is a byte copy of the file at each step;
- * - runs in declarative mode, with no fungible destination and no `invited`
- *   section on any persona;
- * - never gets a stored-choice file (`CHANNEL_DELIVERY_FILE_NAME`);
+ * - runs in strict mode, with an explicit `permission_prompts` destination
+ *   and no `invited` section on any persona;
+ * - never gets a stored-choice file (`'channel-delivery.json'`);
  * - logs, previews and posts nothing that names the switch, fungible mode or
  *   a class this work adds (the term list below), so no line suggests
- * fungible mode and, with the switch absent, no recorded line
- * can appear;
+ *   open mode and, with the switch absent, no recorded line can appear;
  * - previews a 0.11.1-style edit as the counted header and the persona's
  *   in-place line, and once it is confirmed updates only that persona in
  *   place, with the edit in effect for the next event;
  * - posts each notice to the persona's `permission_prompts` destination;
- * - decides sample events from listed and unlisted channels as says;
- * - lists `set_channel_delivery` and refuses it with the declarative
+ * - decides sample events from listed and unlisted channels using current
+ *   membership;
+ * - lists `set_channel_delivery` and refuses it with the strict-mode
  *   refusal, and sends `MCP_INSTRUCTIONS` as the session instructions: the
- * two agent-visible additions allows.
+ *   two agent-visible additions covered by this suite.
  *
  * Fixtures, owned by this suite and pinned by SHA-256 so an edit
  * to either fails:
@@ -35,10 +35,10 @@
  *   Its `"port": 3100` is as the README has it; no case binds or reaches a
  *   port.
  * - `tests/fixtures/upgrade-0.11.1/two-personas.json`: the shape of
- * phase A, the configuration test-29's declarative phase
+ *   phase A, the configuration test-29's strict phase
  *   writes, with fixed IDs and `~/` paths: `alpha` in A1 (`all`) and A2
  *   (`mentions`), DMs off, prompts to A1; `bravo` in B1 (`mentions`), DMs on
- * with a contact, prompts by `"dm"`server-wide keys.
+ *   with a contact, prompts by `"dm"`, and server-wide keys.
  *
  * Every `~/` path expands under a temp home inside the test's own
  * `mkdtempSync` root, never the operator's home. Tokens are the
@@ -46,6 +46,8 @@
  *
  * SPDX-License-Identifier: MIT
  */
+
+import { parseSharedChannelState } from '../src/shared-channels.ts'
 
 import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
@@ -56,9 +58,6 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 
 import {
-  CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES,
-  CHANNEL_DELIVERY_FILE_NAME,
-  CHANNEL_DELIVERY_LOG_PREFIX,
   SET_CHANNEL_DELIVERY_TOOL,
 } from '../src/channel-delivery.ts'
 import {
@@ -70,17 +69,14 @@ import {
   type ChannelEntryInput,
   type PersonaDmInput,
 } from '../src/config.ts'
-import type { Via } from '../src/delivery-decision.ts'
-import { FUNGIBLE_DESTINATION_SETTING } from '../src/persona-destination.ts'
+import type { DropDecision, Via } from '../src/delivery-decision.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import {
   FUNGIBLE_REFUSAL_TEXTS,
-  formatPersonaDiagnostic,
   PERSONA_CHANNEL_DELIVERY_SET,
-  PERSONA_INVITED_CHANNEL,
+  PERSONA_OPEN_CHANNEL,
   PERSONA_START,
   UNCLAIMED_CHANNEL,
-  unclaimedChannelCause,
 } from '../src/persona-diagnostics.ts'
 import {
   channelDeliveryDeclarativeRefusal,
@@ -94,13 +90,10 @@ import {
   MODE_SWITCH_SETTING,
   modeSwitchLine,
   PENDING_PREVIEW_TITLE,
-  RECORDED_SECTION_KEYS,
   RELOAD_PREVIEW,
-  recordedLine,
   renderChangePlanCounts,
   type ChangePlanCounts,
   type InPlaceSetting,
-  type RecordedSectionKey,
 } from '../src/reload-plan.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import {
@@ -111,6 +104,7 @@ import {
   type StartedReloadRun,
 } from './test-helpers/reload-harness.ts'
 import { makeAppMention, makeChannelMessage, mentionText, stubOpenedDmId, type SlackEvent } from './test-helpers/slack-stub.ts'
+import { deliveryAttempt, membershipPage } from './test-helpers/shared-channels.ts'
 
 // ---------------------------------------------------------------------------
 // The fixtures: paths and bytes, read once
@@ -196,17 +190,13 @@ function modeSwitchLineHead(mode: (typeof CHANNEL_MODES)[number]): string {
 /**
  * What no log line, preview or pending-file text, or Slack-posted text of a
  * 0.11.1 configuration may carry. Every entry is imported from `src/`. It
- * does not apply to `set_channel_delivery`'s listing, its declarative
- * refusal or the session instructions: allows those additions, and
+ * does not apply to `set_channel_delivery`'s listing, its strict-mode
+ * refusal or the session instructions: this suite allows those additions, and
  * they are checked by equality with their exported texts.
  */
 const TERM_LIST: readonly Term[] = [
-  { label: 'PERSONA_INVITED_CHANNEL', text: PERSONA_INVITED_CHANNEL },
+  { label: 'PERSONA_OPEN_CHANNEL', text: PERSONA_OPEN_CHANNEL },
   { label: 'PERSONA_CHANNEL_DELIVERY_SET', text: PERSONA_CHANNEL_DELIVERY_SET },
-  ...CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES.map((text) => ({ label: `CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES ${text}`, text })),
-  { label: 'CHANNEL_DELIVERY_LOG_PREFIX', text: CHANNEL_DELIVERY_LOG_PREFIX },
-  { label: 'CHANNEL_DELIVERY_FILE_NAME', text: CHANNEL_DELIVERY_FILE_NAME },
-  { label: 'FUNGIBLE_DESTINATION_SETTING', text: FUNGIBLE_DESTINATION_SETTING },
   // The switch's key. Its membership in the top-level keys is pinned below,
   // so a rename fails the suite instead of leaving this entry checking nothing.
   { label: 'MODE_SWITCH_SETTING', text: MODE_SWITCH_SETTING },
@@ -217,7 +207,7 @@ const TERM_LIST: readonly Term[] = [
 
 /**
  * Beside the list: the words "fungible" and "invited", in any case.
- * says no line may suggest fungible mode, and the 0.11.1 source holds
+ * No line may suggest the removed modes, and the 0.11.1 source holds
  * neither word.
  */
 const SUGGESTIVE_WORDS = /fungible|invited/i
@@ -339,7 +329,7 @@ describe('upgrade fixtures and the term list', () => {
   })
 
   test.each([
-    ['fungible', 'a FunGible mode', 'FunGible'],
+    ['open', 'a FunGible mode', 'FunGible'],
     ['invited', 'an InViTed channel', 'InViTed'],
   ])('the checker reports the word "%s" in mixed case', (_word, text, hit) => {
     expect(termsIn(text)).toEqual([`word "${hit}"`])
@@ -357,9 +347,21 @@ describe('upgrade fixtures and the term list', () => {
   )
 })
 
-describe('a 0.11.1 configuration loaded directly stays declarative', () => {
+describe('a 0.11.1 configuration loaded directly stays in strict mode', () => {
+  test.each(['invited', 'fungible_destination'] as const)('the loader rejects a removed %s input instead of silently dropping it', field => {
+    const { home, stateDir } = makeRig()
+    const fixture = FIXTURES[0]!
+    const configPath = join(stateDir, 'config.json')
+    const input = {
+      ...fixture.input,
+      personas: fixture.input.personas.map((entry, index) => index === 0 ? { ...entry, [field]: {} } : entry),
+    }
+    writeFileSync(configPath, JSON.stringify(input))
+    expect(() => loadPersonaConfig(configPath, home)).toThrow(field)
+  })
+
   test.each(FIXTURES.map((f) => [f.file, f] as const))(
-    '%s loads through loadPersonaConfig in declarative mode with its bytes unchanged, no load-time message and no stored-choice file',
+    '%s loads through loadPersonaConfig in strict mode with its bytes unchanged, no load-time message and no stored-choice file',
     (_file, fixture) => {
       const { home, stateDir } = makeRig()
       const configPath = join(stateDir, 'config.json')
@@ -376,10 +378,8 @@ describe('a 0.11.1 configuration loaded directly stays declarative', () => {
       }
 
       expect(readFileSync(configPath).equals(fixture.bytes)).toBe(true)
-      expect(channelModeOf(config)).toBe('declarative')
-      expect(config.personas.map((p) => ({ fungible: p.fungible_destination, invited: p.sections.invited }))).toEqual(
-        fixture.input.personas.map(() => ({ fungible: undefined, invited: undefined })),
-      )
+      expect(channelModeOf(config)).toBe('strict')
+      expect(config.personas.every(p => !('fungible_destination' in p) && !('invited' in p))).toBe(true)
       expect(
         config.personas.map((p) => ({ name: p.name, channels: p.channels, dm: p.dm, permission_prompts: p.permission_prompts })),
       ).toEqual(
@@ -390,7 +390,7 @@ describe('a 0.11.1 configuration loaded directly stays declarative', () => {
           permission_prompts: entry.permission_prompts,
         })),
       )
-      expect(filesNamed(rig!.root, CHANNEL_DELIVERY_FILE_NAME)).toEqual([])
+      expect(filesNamed(rig!.root, 'channel-delivery.json')).toEqual([])
       // The loader prints nothing for a valid configuration, so the check is
       // that nothing was printed at all, which also rules out every term.
       expect(messages).toEqual([])
@@ -442,23 +442,23 @@ async function startFixture(h: ReloadHarness, fixture: UpgradeFixture): Promise<
 /**
  * The facts every step leaves: `config.json` holds `bytes`,
  * the last-applied record is a byte copy of them, the configuration the
- * server runs is in declarative mode with no fungible destination, and no
- * stored-choice file exists, at `h.channelDeliveryFile` or by its name
+ * server runs is in strict mode with an explicit `permission_prompts`
+ * destination, and no stored-choice file exists, at `h.channelDeliveryFile` or by its name
  * anywhere under the harness root.
  */
-function expectDeclarativeAndUnchanged(h: ReloadHarness, run: ReloadRun, bytes: Buffer): void {
+function expectStrictAndUnchanged(h: ReloadHarness, run: ReloadRun, bytes: Buffer): void {
   expect({
     config: h.readConfig()?.equals(bytes),
-    record: h.readRecord()?.equals(bytes),
+    record: Buffer.from(parseSharedChannelState(h.readRecord()!, h.paths.lastApplied, { home: h.home })!.sourceBytesBase64, 'base64').equals(bytes),
     mode: channelModeOf(run.serverConfig()),
-    fungibleDestinations: run.serverConfig()?.personas.filter((p) => p.fungible_destination !== undefined).map((p) => p.name),
-    storedChoiceFile: existsSync(h.channelDeliveryFile),
-    namedAnywhere: filesNamed(h.root, CHANNEL_DELIVERY_FILE_NAME),
+    removedFields: run.serverConfig()?.personas.filter(p => 'fungible_destination' in p || 'invited' in p).map(p => p.name),
+    storedChoiceFile: existsSync(join(h.stateDir, 'channel-delivery.json')),
+    namedAnywhere: filesNamed(h.root, 'channel-delivery.json'),
   }).toEqual({
     config: true,
     record: true,
-    mode: 'declarative',
-    fungibleDestinations: [],
+    mode: 'strict',
+    removedFields: [],
     storedChoiceFile: false,
     namedAnywhere: [],
   })
@@ -468,7 +468,7 @@ function expectDeclarativeAndUnchanged(h: ReloadHarness, run: ReloadRun, bytes: 
 const PROBE_NOTICE = 'a probe notice'
 
 /**
- * Where a persona's notice goes in declarative mode: its `permission_prompts`
+ * Where a persona's notice goes in both modes: its `permission_prompts`
  * channel, or, for `"dm"`, the DM the stub opens with its contact.
  */
 function noticeTargetOf(entry: FixturePersona): string {
@@ -510,15 +510,15 @@ function expectNoLeak(h: ReloadHarness, run: ReloadRun, placed: PlacedFixture, e
   assertNoLeak(h.serverSideFiles(...placed.credentialsFiles))
 }
 
-describe('a 0.11.1 configuration through a reload-harness start stays declarative', () => {
+describe('a 0.11.1 configuration through a reload-harness start stays in strict mode', () => {
   test.each(FIXTURES.map((f) => [f.file, f] as const))(
-    '%s, first start with no record: config.json keeps its bytes, the record is a byte copy, declarative mode, no stored-choice file, and each notice posts to its permission_prompts destination',
+    '%s, first start with no record: config.json keeps its bytes, the record is a byte copy, strict mode, no stored-choice file, and each notice posts to its permission_prompts destination',
     async (_file, fixture) => {
       const h = makeHarness()
       const { run, placed } = await startFixture(h, fixture)
 
       expect(run.outcome.kind).toBe('applied')
-      expectDeclarativeAndUnchanged(h, run, fixture.bytes)
+      expectStrictAndUnchanged(h, run, fixture.bytes)
       expect(run.logsOf(PERSONA_START)).toHaveLength(fixture.input.personas.length)
 
       const personas = fixture.input.personas
@@ -542,14 +542,14 @@ describe('a 0.11.1 configuration through a reload-harness start stays declarativ
       const run = await h.start()
       expect(run.outcome.kind).toBe('applied')
       expect(run.writes).toEqual([])
-      expectDeclarativeAndUnchanged(h, run, fixture.bytes)
+      expectStrictAndUnchanged(h, run, fixture.bytes)
 
       expect(run.startDetection()).toBe(true)
       const cp = run.checkpoint()
       await run.ticks.ticks(3)
-      expect(run.since(cp)).toEqual(NO_RUN_ACTIVITY)
+      expect(run.since(cp)).toEqual({ ...NO_RUN_ACTIVITY, writes: [h.lastAppliedWrite()] })
       expect(h.pendingExists()).toBe(false)
-      expectDeclarativeAndUnchanged(h, run, fixture.bytes)
+      expectStrictAndUnchanged(h, run, fixture.bytes)
       expect(run.slackPosts()).toEqual([])
       expectNoTerms(run, PERSONA_START)
       expectNoLeak(h, run, first.placed)
@@ -614,25 +614,9 @@ const EDITS: readonly Edit[] = [
 /** A preview header's counts with nothing counted. */
 const NO_COUNTS: ChangePlanCounts = { added: 0, removed: 0, destructive: 0, inPlace: 0, credentials: 0, settings: 0 }
 
-/** Every non-empty choice of the recorded section keys, in their reported order. */
-function recordedFieldSets(): RecordedSectionKey[][] {
-  const sets: RecordedSectionKey[][] = []
-  for (let mask = 1; mask < 1 << RECORDED_SECTION_KEYS.length; mask++) {
-    sets.push(RECORDED_SECTION_KEYS.filter((_k, i) => (mask & (1 << i)) !== 0))
-  }
-  return sets
-}
-
-/** Every line `recordedLine` can build for a persona of `fixture`. */
-function recordedLinesOf(h: ReloadHarness, fixture: UpgradeFixture): string[] {
-  return fixture.input.personas.flatMap((p) =>
-    recordedFieldSets().map((fields) => recordedLine({ name: p.name, key: h.key(p.name), fields })),
-  )
-}
-
 describe("a 0.11.1-style edit is previewed and confirmed as in 0.11.1 (switch-absent half)", () => {
   test.each(FIXTURES.flatMap((f) => EDITS.map((e) => [f.file, e.edit, f, e] as const)))(
-    '%s, %s: the preview is the header and the in-place line, with no recorded line, no switch line and no term; the confirmation updates that persona in place, records the edited bytes and stays declarative',
+    '%s, %s: the preview is the header and the in-place line, with no recorded line, no switch line and no term; the confirmation updates that persona in place, records the edited bytes and stays in strict mode',
     async (_file, _edit, fixture, edit) => {
       const h = makeHarness()
       const { run, placed } = await startWithSessions(h, fixture)
@@ -648,12 +632,12 @@ describe("a 0.11.1-style edit is previewed and confirmed as in 0.11.1 (switch-ab
       expect(preview).toEqual([
         `${PENDING_PREVIEW_TITLE} ${renderChangePlanCounts({ ...NO_COUNTS, inPlace: 1 })}.`,
         startingWith(`persona ${renderPersonaRef(name, h.key(name))}: ${edit.settings.join(', ')} changed: `),
+        ...h.reviewLines(),
       ])
       expect(run.lastPreviewText()).toEqual(preview)
       expect(run.previewEmissionCount()).toBe(1)
       expect(run.since(beforeConfirm).lifecycle).toEqual([])
-      const recorded = new Set(recordedLinesOf(h, fixture))
-      expect(preview!.filter((line) => recorded.has(line))).toEqual([])
+      expect(run.slackPosts()).toEqual([])
       expect(preview!.filter((line) => CHANNEL_MODES.some((mode) => line.startsWith(modeSwitchLineHead(mode))))).toEqual([])
       expect(termHits([h.readPendingText()!])).toEqual({})
       expectNoTerms(run, RELOAD_PREVIEW)
@@ -664,10 +648,15 @@ describe("a 0.11.1-style edit is previewed and confirmed as in 0.11.1 (switch-ab
       await run.ticks.tick()
       expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
       expect(run.since(atConfirm).lifecycle).toEqual([{ op: 'update-in-place', key: h.key(name), via: 'apply', settings: edit.settings }])
-      expectDeclarativeAndUnchanged(h, run, editedBytes)
+      expectStrictAndUnchanged(h, run, editedBytes)
       expect(h.pendingExists()).toBe(false)
 
       // The edit's effect: the probe reaches only the changed persona, as its edited entry says.
+      // Slack independently confirms the edited persona's channel membership.
+      run.stub(name).script.inventory.push(membershipPage(edited.personas.find(p => p.name === name)!.channels!.map(c => c.id)))
+      run.membershipScanner.request(h.key(name))
+      await run.membershipClock.runNext()
+      expect(run.membershipScanner.status(h.key(name)).state).toBe('complete')
       const outcome = await deliverSample(run, fixture, { event: edit.edit, to: name, kind: edit.probe.kind, channel })
       expect(outcome).toEqual({ event: edit.edit, deliveries: deliveredTo(fixture, name, channel, edit.probe.via(edited, name, channel)), dropLines: [] })
       expect(run.slackPosts()).toEqual([])
@@ -723,7 +712,16 @@ async function deliverSample(run: ReloadRun, fixture: UpgradeFixture, sample: Sa
   const events: SlackEvent[] = sample.bothEvents === true
     ? [makeAppMention({ channel: sample.channel, text, ts: message['ts'] }), message]
     : [message]
+  const acks = run.stub(sample.to).socket.acks.length
+  const queues = Object.fromEntries(names.map(name => [name, structuredClone(run.queued(name))]))
   for (const event of events) await run.deliver(sample.to, event)
+  expect(run.stub(sample.to).socket.acks.length - acks).toBe(events.length)
+  for (const name of names) {
+    if (name !== sample.to || run.deliveries(name).length === before[name]) expect(run.queued(name)).toEqual(queues[name])
+    else expect(run.queued(name).slice(queues[name]!.length).map(item => ({ channel: item.accepted.channel, key: item.accepted.key, text: item.accepted.text }))).toEqual([
+      { channel: sample.channel, key: { chat_id: sample.channel, ts: message.ts as string }, text },
+    ])
+  }
   return {
     event: sample.event,
     deliveries: Object.fromEntries(
@@ -757,25 +755,11 @@ function listed(fixture: UpgradeFixture, name: string, n: number): string {
   return channel
 }
 
-/** The declarative `unclaimed-channel` line for the persona and channel, from its builders. */
-function unclaimedLine(h: ReloadHarness, fixture: UpgradeFixture, name: string, channel: string): string {
-  return formatPersonaDiagnostic({
-    class: UNCLAIMED_CHANNEL,
-    name,
-    key: h.key(name),
-    index: entryOf(fixture, name).index,
-    cause: unclaimedChannelCause(channel),
-  })
-}
-
-/**
- * A `not-mentioned` drop line of the persona in `channel` (the reason is the
- * line's last word). It pins the 0.11.1 line shape of
- * `src/persona-routing.ts`, which exports no builder or prefix for it.
- */
-function notMentioned(h: ReloadHarness, name: string, channel: string) {
+/** A selection refusal is checked with its persona/channel and exact reason.
+ * Completed membership evidence precedes legacy listed-channel diagnostics. */
+function dropped(h: ReloadHarness, name: string, channel: string, reason: DropDecision['reason']) {
   return expect.stringMatching(
-    new RegExp(`^${escapeRegExp(`[slack] persona ${renderPersonaRef(name, h.key(name))} dropped message from channel=${channel} `)}.*: not-mentioned$`),
+    new RegExp(`^${escapeRegExp(`[slack] persona ${renderPersonaRef(name, h.key(name))} dropped message from channel=${channel} `)}.*: ${reason}$`),
   )
 }
 
@@ -791,7 +775,12 @@ function startingWith(prefix: string) {
 /** Start `fixture` through the fixture-start helper and register every channel persona's session. */
 async function startWithSessions(h: ReloadHarness, fixture: UpgradeFixture) {
   const started = await startFixture(h, fixture)
-  for (const p of channelPersonas(fixture)) started.run.registerSession(p.name)
+  for (const p of channelPersonas(fixture)) {
+    started.run.registerSession(p.name)
+    started.run.stub(p.name).script.inventory.push(membershipPage(p.channels!.map(c => c.id)))
+  }
+  await started.run.membershipClock.runNext()
+  for (const p of channelPersonas(fixture)) expect(started.run.membershipScanner.status(h.key(p.name)).state).toBe('complete')
   return started
 }
 
@@ -802,14 +791,14 @@ const SAMPLES: Readonly<Record<string, (h: ReloadHarness, fixture: UpgradeFixtur
     const [a1, a2, b1] = [listed(f, 'alpha', 0), listed(f, 'alpha', 1), listed(f, 'bravo', 0)]
     return [
       [{ event: 'alpha, A1, plain', to: 'alpha', kind: 'plain', channel: a1 }, { deliveries: deliveredTo(f, 'alpha', a1, 'receive_all'), dropLines: [] }],
-      [{ event: 'alpha, A2, plain', to: 'alpha', kind: 'plain', channel: a2 }, { deliveries: noDelivery(f), dropLines: [notMentioned(h, 'alpha', a2)] }],
+      [{ event: 'alpha, A2, plain', to: 'alpha', kind: 'plain', channel: a2 }, { deliveries: noDelivery(f), dropLines: [dropped(h, 'alpha', a2, 'not-mentioned')] }],
       [{ event: 'alpha, A2, mention', to: 'alpha', kind: 'mention', channel: a2 }, { deliveries: deliveredTo(f, 'alpha', a2, 'mention'), dropLines: [] }],
       [{ event: 'bravo, B1, mention', to: 'bravo', kind: 'mention', channel: b1 }, { deliveries: deliveredTo(f, 'bravo', b1, 'mention'), dropLines: [] }],
       [
         { event: 'alpha, an unlisted channel, a mention as both its events', to: 'alpha', kind: 'mention', channel: UNLISTED_CHANNEL, bothEvents: true },
         // only accepted Slack keys are durable dedupe facts;
         // both rejected envelopes are diagnosed without creating a queue row.
-        { deliveries: noDelivery(f), dropLines: Array.from({ length: 2 }, () => unclaimedLine(h, f, 'alpha', UNLISTED_CHANNEL)) },
+        { deliveries: noDelivery(f), dropLines: Array.from({ length: 2 }, () => dropped(h, 'alpha', UNLISTED_CHANNEL, 'channel-ineligible')) },
       ],
     ]
   },
@@ -819,11 +808,11 @@ const SAMPLES: Readonly<Record<string, (h: ReloadHarness, fixture: UpgradeFixtur
     return [
       [{ event: 'planner, its home channel, plain', to: 'planner', kind: 'plain', channel: home }, { deliveries: deliveredTo(f, 'planner', home, 'receive_all'), dropLines: [] }],
       [{ event: 'planner, the shared channel, plain', to: 'planner', kind: 'plain', channel: shared }, { deliveries: deliveredTo(f, 'planner', shared, 'receive_all'), dropLines: [] }],
-      [{ event: 'reviewer, the shared channel, plain', to: 'reviewer', kind: 'plain', channel: shared }, { deliveries: noDelivery(f), dropLines: [notMentioned(h, 'reviewer', shared)] }],
+      [{ event: 'reviewer, the shared channel, plain', to: 'reviewer', kind: 'plain', channel: shared }, { deliveries: noDelivery(f), dropLines: [dropped(h, 'reviewer', shared, 'not-mentioned')] }],
       [{ event: 'reviewer, the shared channel, mention', to: 'reviewer', kind: 'mention', channel: shared }, { deliveries: deliveredTo(f, 'reviewer', shared, 'mention'), dropLines: [] }],
-      // A channel another applied persona lists logs nothing.
-      [{ event: "reviewer, planner's home channel, mention", to: 'reviewer', kind: 'mention', channel: home }, { deliveries: noDelivery(f), dropLines: [] }],
-      [{ event: 'planner, an unlisted channel, plain', to: 'planner', kind: 'plain', channel: UNLISTED_CHANNEL }, { deliveries: noDelivery(f), dropLines: [unclaimedLine(h, f, 'planner', UNLISTED_CHANNEL)] }],
+      // Another persona's declaration supplies no current membership to the receiver.
+      [{ event: "reviewer, planner's home channel, mention", to: 'reviewer', kind: 'mention', channel: home }, { deliveries: noDelivery(f), dropLines: [dropped(h, 'reviewer', home, 'channel-ineligible')] }],
+      [{ event: 'planner, an unlisted channel, plain', to: 'planner', kind: 'plain', channel: UNLISTED_CHANNEL }, { deliveries: noDelivery(f), dropLines: [dropped(h, 'planner', UNLISTED_CHANNEL, 'channel-ineligible')] }],
     ]
   },
 }
@@ -860,9 +849,9 @@ async function openListingClient(run: ReloadRun, name: string): Promise<Client> 
   return client
 }
 
-describe('a 0.11.1 configuration decides sample events as says', () => {
+describe('a 0.11.1 configuration retains its choices under current membership eligibility', () => {
   test.each(FIXTURES.map((f) => [f.file, f] as const))(
-    '%s: listed channels deliver by their entries, each dropped unlisted event logs one unclaimed-channel line, a channel another persona lists logs nothing',
+    '%s: current members deliver by their entries; proven absence drops each event, while unresolved membership holds intake',
     async (_file, fixture) => {
       const h = makeHarness()
       const { run, placed } = await startWithSessions(h, fixture)
@@ -872,9 +861,19 @@ describe('a 0.11.1 configuration decides sample events as says', () => {
       for (const [sample] of samples) outcomes.push(await deliverSample(run, fixture, sample))
 
       expect(outcomes).toEqual(samples.map(([sample, expected]) => ({ event: sample.event, ...expected })))
-      expectDeclarativeAndUnchanged(h, run, fixture.bytes)
-      // The not-mentioned and unclaimed-channel lines above are this check's positive controls.
-      expectNoTerms(run, UNCLAIMED_CHANNEL)
+      expectStrictAndUnchanged(h, run, fixture.bytes)
+      // Proved absence is a drop; lost current evidence is a hold, not a
+      // legacy unclaimed-channel diagnostic or an acknowledgement of loss.
+      const name = channelPersonas(fixture)[0]!.name, key = h.key(name), channel = listed(fixture, name, 0)
+      const queues = Object.fromEntries(channelPersonas(fixture).map(p => [p.name, structuredClone(run.queued(p.name))]))
+      run.membership.invalidate(key)
+      expect(run.membership.read(key, channel, 'strict').kind).toBe('unresolved')
+      const acks = run.stub(name).socket.acks.length, logs = run.logs.length
+      await run.deliver(name, makeChannelMessage({ channel, text: `${mentionText(run.stub(name).identity.botUserId)} held probe` }))
+      expect(run.stub(name).socket.acks).toHaveLength(acks)
+      expect(run.logs.slice(logs).filter(isDropLine)).toEqual([])
+      expect(Object.fromEntries(channelPersonas(fixture).map(p => [p.name, run.queued(p.name)]))).toEqual(queues)
+      expectNoTerms(run, PERSONA_START)
       expect(termHits(outcomes.flatMap((o) => o.dropLines))).toEqual({})
       expectNoLeak(h, run, placed, { outcomes })
     },
@@ -883,7 +882,7 @@ describe('a 0.11.1 configuration decides sample events as says', () => {
 
 describe('set_channel_delivery is listed and refused, and the instructions are MCP_INSTRUCTIONS', () => {
   test.each(FIXTURES.map((f) => [f.file, f] as const))(
-    '%s: every channel persona lists the tool, gets the declarative refusal for one of its channels at all, and receives MCP_INSTRUCTIONS',
+    '%s: every channel persona lists the tool, gets the strict-mode refusal for one of its channels at all, and receives MCP_INSTRUCTIONS',
     async (_file, fixture) => {
       const h = makeHarness()
       const { run, placed } = await startWithSessions(h, fixture)
@@ -894,7 +893,8 @@ describe('set_channel_delivery is listed and refused, and the instructions are M
       for (const name of names) {
         const client = await openListingClient(run, name)
         const { tools } = await client.listTools()
-        const result = await run.callTool(name, SET_CHANNEL_DELIVERY_TOOL, { channel: listed(fixture, name, 0), delivery: 'all' })
+        const request = deliveryAttempt(`upgrade-${fixture.file}-${name}`, listed(fixture, name, 0), 'all')
+        const result = await run.callTool(name, SET_CHANNEL_DELIVERY_TOOL, request)
         seen[name] = {
           listed: tools.some((t) => t.name === SET_CHANNEL_DELIVERY_TOOL),
           result,
@@ -908,7 +908,7 @@ describe('set_channel_delivery is listed and refused, and the instructions are M
       }
 
       expect(seen).toEqual(expected)
-      expectDeclarativeAndUnchanged(h, run, fixture.bytes)
+      expectStrictAndUnchanged(h, run, fixture.bytes)
       expectNoTerms(run, PERSONA_START)
       expectNoLeak(h, run, placed, { seen })
     },

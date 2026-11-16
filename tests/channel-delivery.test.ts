@@ -1,1654 +1,1013 @@
-/**
- * channel-delivery.test.ts — The stored-choice store, src/channel-delivery.ts
- * (beside beside;
- * and beside; the store part
- * of the contract and beside,
- *).
- *
- * - Fixed values: the file name, format version 1, the closed class list
- *   (`channel-delivery-unreadable`), the `[slack] channel-delivery:` prefix
- * and three drop reasons, typed only in their one pin case.
- * - Location: the path under a given state directory; the default
- *   follows `SLACK_STATE_DIR` at call time; no `src/` module but the store's
- *   spells the file name or names its serialiser or parser.
- * - Format: a round trip; the same record always gives the same
- *   bytes; a key with no channels is left out; every refused form, made by
- *   altering the serialiser's output (its bytes, for the UTF-8 rule), reads
- *   as unreadable through the store's load.
- * - The stored-choice helper's contract (tests/test-helpers/channel-delivery.ts).
- * - The read at start: a missing file; a file that cannot
- *   be read, parsed or validated, and the unreadable state it gives for the
- *   run; a directory and a real FIFO (in a child process); no size cap; the
- *   bytes parsed only; the `channel-delivery-unreadable` line.
- * - Writes: whole-record, durable writes; each
- *   failure through the `DurableWriteFs` seam (before the rename, an unsynced
- *   rename, a write-back that fails too); the failed-write line; the
- *   credentials file's path, never its content, in the file.
- * - Drops: at once in memory; one write per batch; a key
- *   named twice dropped once; an unknown reason refused before any change;
- *   unwritten drops and the next successful write that carries them; the
- *   drop line.
- * - Start rules: each rule's drop and its kept control, the
- *   precedence, both channel modes, a failed start-rule write.
- * - Retiring keys (store part): memory only, never written or
- *   logged, none at a fresh start.
- *
- * Isolation: every file sits under a per-case `mkdtempSync` root removed in
- * `afterEach`; `SLACK_STATE_DIR` points at the case's state directory and is
- * restored after every case; the store's clock is a `createFakeClock`; the
- * record is seeded and read only through tests/test-helpers/channel-delivery.ts
- * or the module's own serialiser (a refused form alters the serialiser's
- * output, never a JSON literal); every injected error's message carries
- * `sentinelInMessage(…)`; every case runs `assertNoLeak` over its lines and
- * the files in its state directory. Texts, class labels and drop reasons come
- * from src/, but for the pin cases. No `mock.module`.
- *
- * SPDX-License-Identifier: MIT
- */
-
+/** The file-free adapter and the durable shared-authority mutation contract. */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { spawnSync } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, closeSync, fsyncSync, openSync, readdirSync, renameSync, unlinkSync, writeSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { DurableWriteUnsyncedError, durableWriteFileSync, type DurableWriteFs } from '../src/atomic-write.ts'
+import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
 import {
-  closeSync,
-  existsSync,
-  fsyncSync,
-  lstatSync,
-  mkdirSync,
-  mkdtempSync,
-  openSync,
-  readdirSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  symlinkSync,
-  unlinkSync,
-  writeFileSync,
-  writeSync,
-} from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
-import { basename, dirname, join } from 'node:path'
-
-import { durableUnlinkSync, durableWriteFileSync, type DurableWriteFs } from '../src/atomic-write.ts'
+  createSharedChannelAuthority, parseSharedChannelState, serializeSharedChannelState, type SharedChannelState, applySharedMembership,
+  applySharedMemberships, sharedAppliedConfig, type SharedChannelAuthority, type SharedChannelDeps, type VerifiedSharedMembership,
+} from '../src/shared-channels.ts'
+import { assertNoLeak, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
+import { makePersona, makePersonaConfigInput } from './test-helpers/persona-config.ts'
 import {
-  CHANNEL_DELIVERY_DECLARATION_FIELDS,
-  CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES,
-  CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED,
-  CHANNEL_DELIVERY_DROP_NOT_APPLIED,
-  CHANNEL_DELIVERY_DROP_REASONS,
-  CHANNEL_DELIVERY_DROP_RETIRED,
-  CHANNEL_DELIVERY_FILE_NAME,
-  CHANNEL_DELIVERY_FORMAT_VERSION,
-  CHANNEL_DELIVERY_LOG_PREFIX,
-  CHANNEL_DELIVERY_NOTHING_TO_WRITE,
-  CHANNEL_DELIVERY_PROBLEM_PARSE,
-  CHANNEL_DELIVERY_PROBLEM_VALIDATE,
-  CHANNEL_DELIVERY_SET_INVALID,
-  CHANNEL_DELIVERY_SET_STORED,
-  CHANNEL_DELIVERY_SET_UNREADABLE,
-  CHANNEL_DELIVERY_SET_WRITE_FAILED,
-  CHANNEL_DELIVERY_UNREADABLE,
-  CHANNEL_DELIVERY_UNREADABLE_READ,
-  CHANNEL_DELIVERY_WRITE_FAILED,
-  CHANNEL_DELIVERY_WRITTEN,
-  channelDeliveryDeclarationOf,
-  channelDeliveryDropAction,
-  channelDeliveryDropLine,
-  channelDeliveryPath,
-  channelDeliverySetAction,
-  channelDeliveryUnreadableLine,
-  channelDeliveryWriteFailedLine,
-  loadChannelDeliveryAtStart,
-  loadChannelDeliveryStore,
-  parseChannelDelivery,
-  serializeChannelDelivery,
-  SET_CHANNEL_DELIVERY_TOOL,
-  type ChannelDeliveryAppliedPersona,
-  type ChannelDeliveryDeclaration,
-  type ChannelDeliveryDropReason,
-  type ChannelDeliveryPersonaEntry,
-  type ChannelDeliveryRecord,
-  type ChannelDeliveryStart,
-  type ChannelDeliveryStore,
-  type ChannelDeliveryStoreDeps,
-  type ChannelDeliveryUnreadableCause,
-} from '../src/channel-delivery.ts'
-import {
-  CONFIG_NOT_REGULAR_FILE_CODE,
-  DELIVERY_MODES,
-  MAX_RELOAD_FILE_BYTES,
-  type DeliveryMode,
-  type Persona,
-  type PersonaConfigFs,
-} from '../src/config.ts'
-import { errnoSuffix } from '../src/persona-credentials.ts'
-import { loadRetiredKeyStore, RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, RETIRED_KEY_CAUSE_REMOVED, type RetiredKeyStore } from '../src/retired-keys.ts'
-import {
-  channelDeliveryRecordOf,
-  declarationOf,
-  readChannelDeliveryRecord,
-  SAMPLE_SET_AT,
-  writeChannelDeliveryRecord,
-  type ChannelDeliveryChannelSeed,
-  type ChannelDeliveryPersonaSeed,
-} from './test-helpers/channel-delivery.ts'
-import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, makeCredentials, sentinelInMessage, writeCredentialsFile, writtenFile } from './test-helpers/credentials.ts'
-import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
-import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
-import { hostSafeChildEnv, osTempDir } from './test-helpers/host-safe-env.ts'
-import { lineParts } from './test-helpers/line-parts.ts'
-import { makeMultiPersonaConfig, type PersonaSpec } from './test-helpers/persona-config.ts'
-import { writeRetiredKeysRecord, type RetiredKeySeed } from './test-helpers/retired-keys.ts'
-import { importedSpecifiers, maskLiterals, srcModules, stripComments } from './test-helpers/source-audit.ts'
+  SHARED_CHANNEL_IDS as C, retainedScanHistory, RETAINED_SCAN_EVENTS, membershipJoin, membershipObservation, applyMembershipPage,
+  membershipTimestamp, _assignFixture, fixtureThreadHybridSince, configBytes, FIXTURE_THREAD_HYBRID_SINCE_PREFIX, initialSharedState,
+  makeSharedAuthority, malformedThreadMemoryMarkers, readSharedState, sharedChannelPath, withThreadMemoryCreated, writeSharedState,
+  contradictoryBotHistory, deliveryAttempt, malformedBotHistories, makeMembershipHarness, membershipPage, channelPopulation,
+} from './test-helpers/shared-channels.ts'
+import { osTempDir } from './test-helpers/host-safe-env.ts'
+import { botAttemptBinding, botAttemptKey, validChannelDeliveryAttemptId } from '../src/channel-delivery-attempt.ts'
+import { SR8_SHARED_LIST_CHANNELS } from './test-helpers/thread-memory.ts'
 
-// ---------------------------------------------------------------------------
-// The rig
-// ---------------------------------------------------------------------------
+let root: string, mint: () => string
+beforeEach(() => { mint = fixtureThreadHybridSince(); root = mkdtempSync(join(tmpdir(), 'shared-authority-')) })
+afterEach(() => { rmSync(root, { recursive: true, force: true }) })
+function input() {
+  return makePersonaConfigInput({ personas: [makePersona({ name: 'alpha' }, root), makePersona({ name: 'beta' }, root)] }, root)
+}
+function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedChannelPath(root)) ? writtenFile(sharedChannelPath(root)) : undefined }) }
 
-/** The fake clock's start: a whole second, distinct from the helper's `SAMPLE_SET_AT`. */
-const START_MS = Date.UTC(2026, 9, 7, 8, 0, 0)
+describe('one durable authority', () => {
+  test('adapter reads only applied choices and each of the four values survives reopen', () => {
+    const source = input(); source.channel_mode = 'open'
+    const authority = makeSharedAuthority(root, source)
+    const persona = authority.config().personas[0]!
+    expect(authority.observeMembership(persona.key, authority.incarnation(persona.key)!, membershipJoin(C.primary, 'adapter-join', { identity: 'authenticated-app' }), authority.revision).kind).toBe('applied')
+    const store = createChannelDeliveryStore(authority, (key, channel) => authority.personaSnapshot(key)?.membership[channel]?.member === true)
+    for (const delivery of ['off', 'mentions', 'all', 'thread_hybrid'] as const) {
+      const previous = authority.choice(persona.key, C.primary)
+      expect(store.attempt(persona.key, authority.incarnation(persona.key)!,
+        deliveryAttempt(`adapter-${delivery}`, C.primary, delivery), () => undefined))
+        .toMatchObject({ kind: 'applied', historical: false, outcome: { previous, delivery } })
+      const reopened = createSharedChannelAuthority(authority.path, readSharedState(root)!)
+      expect(reopened.choice(persona.key, C.primary)).toBe(delivery)
+      expect(reopened.config().personas[0]!.channels).toEqual([{ id: C.primary, delivery }])
+    }
+    expect(store.path).toBe(sharedChannelPath(root))
+    expect(existsSync(join(root, 'channel-delivery.json'))).toBe(false)
+    check(authority.snapshot())
+  })
 
-/** Channel IDs the fixtures store choices for. */
-const C1 = 'C0TEST001'
-const C2 = 'C0TEST002'
-const G3 = 'G0TEST003'
+  test('same-value assignments advance the common order while preserving unrelated evidence and submitted source', () => {
+    const authority = makeSharedAuthority(root, input())
+    expect(authority.transact(authority.revision, next => { next.pendingIntent = { review: 'prepared' }; next.outcomes = { attempt: 'settled' } }).kind).toBe('applied')
+    const before = authority.snapshot()
+    const alpha = authority.config().personas[0]!
+    for (let i = 0; i < 2; i++) expect(_assignFixture(authority, alpha.key, authority.incarnation(alpha.key)!, C.primary, 'all', authority.revision, mint).kind).toBe('applied')
+    const after = readSharedState(root)!
+    expect(after.revision).toBe(before.revision + 2)
+    expect(after.personas[alpha.key]!.assignments[C.primary]!.order).toBe(after.revision)
+    expect(after.personas['beta']).toEqual(before.personas['beta'])
+    expect(after.source).toEqual(before.source)
+    expect(after.pendingIntent).toEqual(before.pendingIntent)
+    expect(after.outcomes).toEqual(before.outcomes)
+    check(after)
+  })
 
-/** A `set_at` a seed gives, other than the helper's sample. */
-const EARLIER_SET_AT = new Date(START_MS - 60_000).toISOString()
+  test('stale revision, nested mutation and invalid callback write nothing', () => {
+    const writes: Uint8Array[] = []
+    const authority = makeSharedAuthority(root, input(), { write: (_path, bytes) => { writes.push(bytes) } })
+    const before = authority.snapshot()
+    expect(authority.transact(0, () => { throw new Error('must not run') })).toEqual({ kind: 'stale', revision: 1 })
+    for (const revision of [-1, 1, 3]) {
+      expect(authority.transact(1, next => { next.revision = revision })).toEqual({ kind: 'failed', revision: 1 })
+    }
+    expect(writes).toEqual([])
+    expect(authority.snapshot()).toEqual(before)
+    expect(authority.transact(1, next => {
+      expect(authority.transact(1, () => {})).toEqual({ kind: 'stale', revision: 1 })
+      next.outcomes = { result: 'outer' }
+    })).toEqual({ kind: 'applied', revision: 2 })
+    expect(writes).toHaveLength(1)
+    check(authority.snapshot())
+  })
 
-let root: string
-/** The state directory under test; `SLACK_STATE_DIR` points at it for the case. */
-let stateDir: string
-let savedStateDir: string | undefined
+  test('subscribers see a whole durable mode, list and destination after the writer completes', () => {
+    let durable = false
+    const authority = makeSharedAuthority(root, input(), { write(path, bytes) { durableWriteFileSync(path, bytes); durable = true } })
+    const received: unknown[] = []
+    const unsubscribe = authority.subscribe(config => { expect(durable).toBe(true); received.push(config) })
+    const edited = input(); edited.channel_mode = 'open'; edited.personas[0]!.channels = [{ id: C.secondary, delivery: 'thread_hybrid' }]; edited.personas[0]!.permission_prompts = C.secondary
+    expect(authority.transact(authority.revision, next => { next.pendingIntent = { prepared: 'review' }; next.outcomes = { prior: 'retained' } }).kind).toBe('applied')
+    received.length = 0
+    durable = false
+    expect(authority.applyReviewed(configBytes(edited), authority.revision).kind).toBe('applied')
+    expect(received).toEqual([authority.config()])
+    expect(readSharedState(root)!.applied).toEqual(authority.snapshot().applied)
+    expect(readSharedState(root)!.pendingIntent).toEqual({ prepared: 'review' })
+    expect(readSharedState(root)!.outcomes).toEqual({ prior: 'retained' })
+    unsubscribe()
+    _assignFixture(authority, 'alpha', authority.incarnation('alpha')!, C.secondary, 'off', authority.revision, mint)
+    expect(received).toHaveLength(1)
+    check(received)
+  })
 
-beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), 'cscb-channel-delivery-'))
-  stateDir = join(root, 'state')
-  mkdirSync(stateDir)
-  savedStateDir = process.env['SLACK_STATE_DIR']
-  process.env['SLACK_STATE_DIR'] = stateDir
+  test.each(['before-rename', 'after-rename'] as const)('%s failure preserves memory, source, pending intent and evidence', fault => {
+    const initial = initialSharedState(root, input())
+    initial.pendingIntent = { prepared: 'retained' }; initial.outcomes = { prior: 'retained' }
+    writeSharedState(root, initial)
+    const before = readFileSync(sharedChannelPath(root))
+    let writes = 0
+    const authority = createSharedChannelAuthority(sharedChannelPath(root), initial, { write(path, bytes) {
+      writes++
+      if (fault === 'after-rename') { durableWriteFileSync(path, bytes); throw new DurableWriteUnsyncedError(path, Object.assign(new Error(sentinelInMessage('unsynced')), { code: 'EIO' })) }
+      throw Object.assign(new Error(sentinelInMessage('capacity')), { code: 'ENOSPC' })
+    } })
+    const edited = input(); edited.channel_mode = 'open'
+    expect(authority.applyReviewed(configBytes(edited), 1)).toEqual({ kind: fault === 'after-rename' ? 'unresolved' : 'failed', revision: 1 })
+    expect(authority.snapshot()).toEqual(initial)
+    expect(authority.readable).toBe(fault === 'before-rename')
+    const disk = readSharedState(root)!
+    expect(disk.revision).toBe(fault === 'before-rename' ? 1 : 2)
+    if (fault === 'before-rename') expect(readFileSync(authority.path)).toEqual(before)
+    else {
+      expect(_assignFixture(authority, 'alpha', initial.personas['alpha']!.incarnation, C.primary, 'off', 1, mint).kind).toBe('unresolved')
+      expect(authority.observeMembership('alpha', initial.personas['alpha']!.incarnation, membershipJoin(C.primary, 'join'), 1).kind).toBe('unresolved')
+      expect(() => authority.previewReviewed(configBytes(edited))).toThrow('unresolved')
+      expect(writes).toBe(1)
+      expect(createSharedChannelAuthority(authority.path, disk).config().channel_mode).toBe('open')
+    }
+    check({ memory: authority.snapshot(), disk })
+  })
+
+  test('snapshots cannot mutate the authority, and observer failure cannot undo its durable result', () => {
+    const authority = makeSharedAuthority(root, input())
+    const detached = authority.snapshot(); detached.pendingIntent['outside'] = true; detached.personas['alpha']!.assignments = {}
+    authority.subscribe(() => { throw new Error('observer failed') })
+    expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, C.primary, 'mentions', 1, mint)).toEqual({ kind: 'applied', revision: 2 })
+    expect(authority.snapshot().pendingIntent).toEqual({})
+    expect(readSharedState(root)!.revision).toBe(2)
+    check(authority.snapshot())
+  })
+
+  // Large-list costs are measured by integration tests 44, 45 and 48.
+  test('a persona snapshot is detached and cannot mutate the authority', () => {
+    const authority = makeSharedAuthority(root, input())
+    const join = membershipJoin(C.primary, 'join')
+    expect(authority.observeMembership('alpha', authority.incarnation('alpha')!, join, authority.revision).kind).toBe('applied')
+    const before = authority.snapshot()
+    const alpha = authority.personaSnapshot('alpha')
+    expect(alpha).toEqual(before.personas['alpha'])
+    alpha!.assignments = {}; alpha!.membershipEvents['join']!.channel = C.forged; alpha!.incarnation = 'forged-life'
+    expect(authority.snapshot()).toEqual(before)
+    expect(authority.personaSnapshot('alpha')).toEqual(before.personas['alpha'])
+    expect(['gone', '__proto__', 'constructor', 'hasOwnProperty'].map(key => authority.personaSnapshot(key))).toEqual([undefined, undefined, undefined, undefined])
+    check(authority.snapshot())
+  })
+
+  test('observer reentrancy cannot publish a second revision and memory matches serialized state', () => {
+    const authority = makeSharedAuthority(root, input())
+    const results: unknown[] = []
+    authority.subscribe(() => {
+      results.push(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, C.primary, 'off', authority.revision, mint))
+    })
+    expect(authority.transact(1, next => { next.pendingIntent['omitted'] = undefined })).toEqual({ kind: 'applied', revision: 2 })
+    expect(results).toEqual([]) // metadata alone publishes no runtime change
+    expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, C.primary, 'mentions', 2, mint)).toEqual({ kind: 'applied', revision: 3 })
+    expect(results).toEqual([{ kind: 'stale', revision: 3 }])
+    expect(authority.choice('alpha', C.primary)).toBe('mentions')
+    expect(Object.hasOwn(authority.snapshot().pendingIntent, 'omitted')).toBe(false)
+    expect(authority.snapshot()).toEqual(readSharedState(root)!)
+    check(results)
+  })
+
+  test('retiring is adapter-local, rejects the held key and leaves its healthy neighbor writable', () => {
+    const source = input(); source.channel_mode = 'open'
+    const authority = makeSharedAuthority(root, source)
+    for (const key of ['alpha', 'beta']) expect(authority.observeMembership(key, authority.incarnation(key)!, membershipJoin(C.primary, `adapter-${key}-join`, { identity: 'authenticated-app' }), authority.revision).kind).toBe('applied')
+    const membership = (key: string, channel: string) => authority.personaSnapshot(key)?.membership[channel]?.member === true
+    const store = createChannelDeliveryStore(authority, membership)
+    store.beginRetiring(['alpha'])
+    const request = deliveryAttempt('retiring-alpha', C.primary, 'off')
+    const before = authority.snapshot()
+    expect(store.attempt('alpha', authority.incarnation('alpha')!, request, () => undefined)).toEqual({ kind: 'inactive' })
+    expect(authority.snapshot()).toEqual(before)
+    expect(store.attempt('beta', authority.incarnation('beta')!, deliveryAttempt('healthy-beta', request.channel, 'mentions'), () => undefined).kind).toBe('applied')
+    const fresh = createChannelDeliveryStore(authority, membership)
+    expect(fresh.isRetiring('alpha')).toBe(false)
+    expect(fresh.attempt('alpha', authority.incarnation('alpha')!, deliveryAttempt('fresh-alpha', request.channel, request.delivery), () => undefined).kind).toBe('applied')
+    store.endRetiring(['alpha'])
+    expect(store.attempt('alpha', authority.incarnation('alpha')!, request, () => undefined).kind).toBe('applied')
+    check(authority.snapshot())
+  })
 })
 
-afterEach(() => {
-  if (savedStateDir === undefined) delete process.env['SLACK_STATE_DIR']
-  else process.env['SLACK_STATE_DIR'] = savedStateDir
-  rmSync(root, { recursive: true, force: true })
+test('replaying a verified leave preserves a later future preference, while a never-joined preference has no leave evidence', () => {
+  const authority = makeSharedAuthority(root, input())
+  const life = authority.incarnation('alpha')!
+  const leave = membershipJoin(C.primary, 'verified-leave', { member: false })
+  expect(authority.observeMembership('alpha', life, leave, authority.revision).kind).toBe('applied')
+  const leaveRevision = authority.revision
+  expect(_assignFixture(authority, 'alpha', life, C.primary, 'thread_hybrid', authority.revision, mint).kind).toBe('applied')
+  expect(_assignFixture(authority, 'alpha', life, C.future, 'mentions', authority.revision, mint).kind).toBe('applied')
+  const reopened = createSharedChannelAuthority(authority.path, readSharedState(root)!)
+  const before = readFileSync(authority.path)
+  expect(reopened.observeMembership('alpha', life, leave, reopened.revision)).toEqual({ kind: 'applied', revision: leaveRevision })
+  expect(readFileSync(authority.path)).toEqual(before)
+  expect(reopened.choice('alpha', C.primary)).toBe('thread_hybrid')
+  expect(reopened.choice('alpha', C.future)).toBe('mentions')
+  const state = reopened.snapshot().personas['alpha']!
+  expect(state.membership[C.primary]!.member).toBe(false)
+  expect(state.assignments[C.primary]!.order).toBeGreaterThan(state.leaves[C.primary]!.boundary)
+  expect(state.membership[C.future]).toBeUndefined()
+  expect(state.leaves[C.future]).toBeUndefined()
+  let writes = 0
+  const unresolved = createSharedChannelAuthority(authority.path, reopened.snapshot(), { write(path, bytes) {
+    writes++
+    durableWriteFileSync(path, bytes)
+    throw new DurableWriteUnsyncedError(path, Object.assign(new Error(sentinelInMessage('sync')), { code: 'EIO' }))
+  } })
+  expect(_assignFixture(unresolved, 'alpha', life, C.future, 'off', unresolved.revision, mint).kind).toBe('unresolved')
+  expect(unresolved.observeMembership('alpha', life, leave, unresolved.revision).kind).toBe('unresolved')
+  expect(writes).toBe(1)
+  check(reopened.snapshot())
 })
 
-/** An errno-style error, as `node:fs` throws, whose message carries the sentinel the way a quoted message would. */
-function injected(code: string, label: string): NodeJS.ErrnoException {
-  return Object.assign(new Error(`${code}: injected failure (${sentinelInMessage(label)})`), { code })
-}
+// Every malformed envelope is a mutation of durable production output, never a
+// separately maintained authority fixture. These relationships changed in gf.
+const appliedPersona = (s: SharedChannelState) => (s.applied['personas'] as Record<string, unknown>[])[0]!
+test.each<{ label: string; alter: (state: SharedChannelState) => void }>([
+  { label: 'reviewed bytes disagree with source', alter: s => { s.source['channel_mode'] = 'open' } },
+  { label: 'applied non-channel field differs from reviewed input', alter: s => { appliedPersona(s)['stop_hook_bootstrap'] = false } },
+  { label: 'declaration belongs to another key', alter: s => { s.personas['alpha']!.declaration.name = 'foreign' } },
+  { label: 'two current personas share an incarnation', alter: s => { s.personas['beta']!.incarnation = s.personas['alpha']!.incarnation } },
+  { label: 'current incarnation is retired', alter: s => { s.personas['beta']!.incarnation = Object.keys(s.retiredIdentities)[0]! } },
+  { label: 'retired channels repeat', alter: s => { const r = Object.values(s.retiredIdentities)[0]!; r.channels.push({ ...r.channels[0]! }) } },
+  { label: 'applied choice disagrees with assignment', alter: s => { appliedPersona(s)['channels'] = [{ id: C.primary, delivery: 'off' }] } },
+  { label: 'membership metadata has invalid type', alter: s => { Object.assign(s.personas['alpha']!.membership[C.primary]!, { isExtSharedChannel: 'false' }) } },
+  { label: 'current membership contradicts latest event', alter: s => { s.personas['alpha']!.membership[C.primary]!.member = true } },
+  { label: 'membership history is incomplete', alter: s => { delete s.personas['alpha']!.membershipEvents['left'] } },
+  { label: 'membership boundary disagrees with event order', alter: s => { s.personas['alpha']!.membershipEvents['joined']!.boundary++ } },
+  { label: 'leave points to a join', alter: s => { s.personas['alpha']!.leaves[C.primary]!.event = 'joined' } },
+  { label: 'assignment predates leave', alter: s => { s.personas['alpha']!.assignments[C.primary]!.order = s.personas['alpha']!.leaves[C.primary]!.boundary } },
+  { label: 'destination proof belongs to a foreign life', alter: s => { s.personas['alpha']!.removedDestinations[C.primary]!.incarnation = s.personas['beta']!.incarnation } },
+  { label: 'destination proof no longer names the configured destination', alter: s => {
+    const applied = appliedPersona(s)
+    const source = (s.source['personas'] as Record<string, unknown>[])[0]!
+    applied['permission_prompts'] = source['permission_prompts'] = C.foreign
+    for (const persona of [applied, source]) (persona['channels'] as unknown[]).push({ id: C.foreign, delivery: 'all' })
+    s.personas['alpha']!.assignments[C.foreign] = { delivery: 'all', order: s.revision }
+    s.sourceBytesBase64 = configBytes(s.source).toString('base64')
+  } },
+])('$label is refused by parser and constructor without publishing', ({ alter }) => {
+  const source = input()
+  const authority = makeSharedAuthority(root, source)
+  source.personas[1]!.working_directory = join(root, 'replacement')
+  expect(authority.applyReviewed(configBytes(source), authority.revision, [{ key: 'beta', channel: C.primary, delivery: 'all' }]).kind).toBe('applied')
+  const life = authority.incarnation('alpha')!
+  expect(authority.observeMembership('alpha', life, membershipJoin(C.primary, 'joined'), authority.revision).kind).toBe('applied')
+  expect(authority.observeMembership('alpha', life, membershipJoin(C.primary, 'left', { member: false, boundary: authority.revision }), authority.revision).kind).toBe('applied')
+  expect(_assignFixture(authority, 'alpha', life, C.primary, 'mentions', authority.revision, mint).kind).toBe('applied')
+  const seed = readSharedState(root)!
+  // Object property order is not a source mismatch; exact reviewed bytes stay separate.
+  seed.source = Object.fromEntries(Object.entries(seed.source).reverse())
+  expect(parseSharedChannelState(serializeSharedChannelState(seed), authority.path)!.sourceBytesBase64).toBe(seed.sourceBytesBase64)
+  const before = readFileSync(authority.path)
+  alter(seed)
+  expect(() => parseSharedChannelState(serializeSharedChannelState(seed), authority.path)).toThrow()
+  expect(() => createSharedChannelAuthority(authority.path, seed)).toThrow()
+  expect(readFileSync(authority.path)).toEqual(before)
+  check(authority.snapshot())
+})
 
-/**
- * One failing call of the durable writer's file system: the `call`-th call
- * (1 by default) of `step`, counted from the last `fail`, throws an
- * `injected` error with `code` (`EIO` by default). The temporary file's
- * fsync is `fsyncSync` call 1 and the directory's is call 2, so
- * {@link UNSYNCED} is a rename whose directory sync failed.
- */
-interface FsFailure {
-  readonly step: keyof DurableWriteFs
-  readonly call?: number
-  readonly code?: string
-}
+// t2.yiv.sf.in (SR-8.9): the same checks over a history whose superseded scan
+// repeats were dropped. They cannot tell a dropped newest repeat (SR-3.5).
+test.each<{ label: string; event: string }>([
+  { label: 'the record that began a channel\'s current membership', event: RETAINED_SCAN_EVENTS.beginning },
+  { label: 'the named leave that began a channel\'s current membership', event: RETAINED_SCAN_EVENTS.leave },
+])('a retained scan history missing $label is refused by parser and constructor without publishing', ({ event }) => {
+  const authority = makeSharedAuthority(root, input())
+  const seed = retainedScanHistory(authority)
+  expect(Object.keys(seed.personas['alpha']!.membershipEvents).sort()).toEqual([
+    RETAINED_SCAN_EVENTS.beginning, RETAINED_SCAN_EVENTS.secondaryBeginning, RETAINED_SCAN_EVENTS.leave,
+    RETAINED_SCAN_EVENTS.latest, RETAINED_SCAN_EVENTS.latestAbsence])
+  expect(seed.personas['alpha']!.leaves[C.secondary]!.event).toBe(RETAINED_SCAN_EVENTS.leave)
+  expect(parseSharedChannelState(serializeSharedChannelState(seed), authority.path)).toEqual(seed)
+  const before = readFileSync(authority.path)
+  delete seed.personas['alpha']!.membershipEvents[event]
+  expect(() => parseSharedChannelState(serializeSharedChannelState(seed), authority.path)).toThrow()
+  expect(() => createSharedChannelAuthority(authority.path, seed)).toThrow()
+  expect(readFileSync(authority.path)).toEqual(before)
+  check(authority.snapshot())
+})
 
-/** A rename whose directory sync failed: the new bytes are in place, and the writer throws `DurableWriteUnsyncedError`. */
-const UNSYNCED: FsFailure = { step: 'fsyncSync', call: 2 }
-
-/** Each failing step before the rename: the path is left as it was. */
-const BEFORE_RENAME: readonly FsFailure[] = [
-  { step: 'openSync' },
-  { step: 'writeSync' },
-  { step: 'fsyncSync' },
-  { step: 'closeSync' },
-  { step: 'renameSync' },
-]
-
-/** A store over the case's state directory and what it did. */
-interface Rig {
-  store: ChannelDeliveryStore
-  /** Every line the store logged. */
-  logs: string[]
-  /** The bytes of every writer call, failed ones and write-backs included. */
-  writes: Uint8Array[]
-  clock: FakeClock
-  /** Every error the seam threw, in order. */
-  thrown: NodeJS.ErrnoException[]
-  /** Replace the seam's failures (none: every call passes) and restart its call counts. */
-  fail(...failures: FsFailure[]): void
-}
-
-interface RigOptions {
-  /** The read's seam. */
-  readFs?: Partial<PersonaConfigFs>
-  /** Load through `loadChannelDeliveryAtStart` with these applied personas and retired keys. */
-  start?: ChannelDeliveryStart
-  /** The seam's failures from the load on. */
-  failures?: readonly FsFailure[]
-  clock?: FakeClock
-}
-
-/**
- * Load the store over `stateDir`, logging into `logs`, with a fake clock, and
- * a writer and remover built on the real `durableWriteFileSync` and
- * `durableUnlinkSync` over a `DurableWriteFs` seam that passes every call to
- * `node:fs` unless a failure is set.
- */
-function openRig(opts: RigOptions = {}): Rig {
-  const counts = new Map<keyof DurableWriteFs, number>()
-  let failures: readonly FsFailure[] = opts.failures ?? []
-  const rig: Rig = {
-    store: undefined as unknown as ChannelDeliveryStore,
-    logs: [],
-    writes: [],
-    clock: opts.clock ?? createFakeClock({ start: START_MS }),
-    thrown: [],
-    fail: (...next) => {
-      failures = next
-      counts.clear()
-    },
+describe('thread fields in the production format', () => {
+  const ORDERED = 'The shared channel authority has an invalid ordered assignment.'
+  const MARKER = 'The shared channel authority has an invalid Thread Memory marker.'
+  function refused(state: SharedChannelState, path: string, message: string) {
+    expect(() => parseSharedChannelState(serializeSharedChannelState(state), path)).toThrow(message)
+    expect(() => createSharedChannelAuthority(path, state)).toThrow(message)
   }
-  const at = (step: keyof DurableWriteFs): void => {
-    const call = (counts.get(step) ?? 0) + 1
-    counts.set(step, call)
-    const failure = failures.find((f) => f.step === step && (f.call ?? 1) === call)
-    if (failure === undefined) return
-    const err = injected(failure.code ?? 'EIO', `${step}-${call}`)
-    rig.thrown.push(err)
-    throw err
+  /** Fixture alpha starts hybrid; beta stays all. */
+  function hybridSeed() {
+    const authority = makeSharedAuthority(root, input())
+    expect(_assignFixture(authority, 'alpha', authority.incarnation('alpha')!, C.primary, 'thread_hybrid', authority.revision, mint).kind).toBe('applied')
+    return { authority, seed: readSharedState(root)! }
   }
-  const fs: DurableWriteFs = {
-    openSync: (path, flags) => {
-      at('openSync')
-      return openSync(path, flags)
-    },
-    writeSync: (fd, buffer, offset, length) => {
-      at('writeSync')
-      return writeSync(fd, buffer, offset, length)
-    },
-    fsyncSync: (fd) => {
-      at('fsyncSync')
-      fsyncSync(fd)
-    },
-    closeSync: (fd) => {
-      closeSync(fd)
-      at('closeSync')
-    },
-    renameSync: (from, to) => {
-      at('renameSync')
-      renameSync(from, to)
-    },
-    unlinkSync: (path) => {
-      at('unlinkSync')
-      unlinkSync(path)
-    },
+
+  test.each<{ label: string; alter: (state: SharedChannelState) => void }>([
+    { label: 'thread_hybrid entry without Thread Hybrid Since', alter: s => { delete s.personas['alpha']!.assignments[C.primary]!.threadHybridSince } },
+    { label: 'thread_hybrid entry with an empty one', alter: s => { s.personas['alpha']!.assignments[C.primary]!.threadHybridSince = '' } },
+    { label: 'thread_hybrid entry with a non-string one', alter: s => { Object.assign(s.personas['alpha']!.assignments[C.primary]!, { threadHybridSince: 7 }) } },
+    { label: 'all entry with one', alter: s => { s.personas['beta']!.assignments[C.primary]!.threadHybridSince = s.personas['alpha']!.assignments[C.primary]!.threadHybridSince } },
+  ])('$label is refused as an invalid ordered assignment', ({ alter }) => {
+    const { authority, seed } = hybridSeed()
+    expect(seed.personas['alpha']!.assignments[C.primary]!.threadHybridSince).toStartWith(FIXTURE_THREAD_HYBRID_SINCE_PREFIX)
+    const before = readFileSync(authority.path)
+    alter(seed)
+    refused(seed, authority.path, ORDERED)
+    expect(readFileSync(authority.path)).toEqual(before)
+    check(seed)
+  })
+
+  test('markers for current and removed keys parse and round-trip through the fixture writer and reader', () => {
+    const { authority, seed } = hybridSeed()
+    expect(seed.personas['gone_key']).toBeUndefined()
+    const seeded = withThreadMemoryCreated(seed, ['alpha', 'gone_key'])
+    writeSharedState(root, seeded)
+    expect(readSharedState(root)).toEqual(seeded)
+    expect(createSharedChannelAuthority(authority.path, readSharedState(root)!).threadMemoryCreatedKeys()).toEqual(['alpha', 'gone_key'])
+    const cleared = withThreadMemoryCreated(seeded, [])
+    expect(Object.hasOwn(cleared, 'threadMemoryCreated')).toBe(false)
+    writeSharedState(root, cleared)
+    expect(readSharedState(root)).toEqual(cleared)
+    check(readSharedState(root))
+  })
+
+  test('each malformed marker shape is refused', () => {
+    const { authority } = hybridSeed()
+    expect(authority.setThreadMemoryCreated('alpha')).toEqual({ kind: 'saved' })
+    const before = readFileSync(authority.path)
+    const variants = malformedThreadMemoryMarkers(readSharedState(root)!)
+    for (const { state } of variants) {
+      refused(state, authority.path, MARKER)
+      expect(() => writeSharedState(root, state)).toThrow(MARKER)
+    }
+    expect(readFileSync(authority.path)).toEqual(before)
+    check(variants)
+  })
+})
+
+describe('identity and provenance foundations', () => {
+  test('a real-path spelling preserves the life while a changed path retires it and rejects old work', () => {
+    const edited = input(); const persona = edited.personas[0]!
+    mkdirSync(persona.working_directory, { recursive: true })
+    const alias = join(root, 'work-alias'); symlinkSync(persona.working_directory, alias)
+    const authority = makeSharedAuthority(root, edited)
+    const life = authority.incarnation('alpha')!
+    _assignFixture(authority, 'alpha', life, C.primary, 'off', authority.revision, mint)
+    persona.working_directory = alias
+    expect(authority.applyReviewed(configBytes(edited), authority.revision).kind).toBe('applied')
+    expect(authority.incarnation('alpha')).toBe(life)
+    expect(authority.choice('alpha', C.primary)).toBe('off')
+    persona.working_directory = join(root, 'replacement')
+    expect(authority.applyReviewed(configBytes(edited), authority.revision, [{ key: 'alpha', channel: C.primary, delivery: 'mentions' }]).kind).toBe('applied')
+    expect(authority.incarnation('alpha')).not.toBe(life)
+    expect(authority.snapshot().retiredIdentities[life]!.key).toBe('alpha')
+    const beforeStale = readFileSync(authority.path)
+    expect(_assignFixture(authority, 'alpha', life, C.primary, 'all', authority.revision, mint).kind).toBe('stale')
+    expect(readFileSync(authority.path)).toEqual(beforeStale)
+    check(authority.snapshot())
+  })
+
+  test('a verified leave retains only this life’s destination provenance through production serialization', () => {
+    const authority = makeSharedAuthority(root, input())
+    const persona = authority.config().personas[0]!
+    const incarnation = authority.incarnation(persona.key)!
+    expect(authority.observeMembership(persona.key, incarnation, membershipJoin(C.primary, 'leave-event', { member: false, identity: 'authenticated-app' }), 1).kind).toBe('applied')
+    const state = readSharedState(root)!
+    const reopened = createSharedChannelAuthority(authority.path, state)
+    expect(reopened.config().personas[0]!.channels).toEqual([])
+    expect(reopened.validatesRemovedDestination(persona)).toBe(true)
+    expect(reopened.validatesRemovedDestination({ ...persona, working_directory: join(root, 'other') })).toBe(false)
+    const altered = structuredClone(state); altered.personas['alpha']!.incarnation = 'replacement-life'
+    expect(() => parseSharedChannelState(serializeSharedChannelState(altered), authority.path)).toThrow('provenance')
+    check(state)
+  })
+
+  test.each([
+    (state: SharedChannelState) => { state.revision = 0 },
+    (state: SharedChannelState) => { state.personas['alpha']!.assignments[C.primary]!.order = 100 },
+    (state: SharedChannelState) => { state.personas['alpha']!.removedDestinations[C.primary] = { event: 'forged', boundary: 1, incarnation: state.personas['alpha']!.incarnation } },
+  ])('malformed authority is refused without changing its durable bytes', alter => {
+    const authority = makeSharedAuthority(root, input())
+    const before = readFileSync(authority.path)
+    const state = authority.snapshot(); alter(state)
+    expect(() => parseSharedChannelState(serializeSharedChannelState(state), authority.path)).toThrow()
+    expect(readFileSync(authority.path)).toEqual(before)
+    check(authority.snapshot())
+  })
+
+  test.each([osTempDir(), '/'])('fixture writer refuses an unowned directory %s', dir => {
+    expect(() => writeSharedState(dir, initialSharedState(root, input()))).toThrow('owned directory')
+    assertNoLeak({ dir })
+  })
+})
+
+// The retirement revision, never JSON property order, identifies the latest reviewed source.
+test.each((['strict', 'open'] as const).flatMap(mode =>
+  (['off', 'mentions', 'all', 'thread_hybrid'] as const).flatMap(original =>
+    [false, true].map(reorder => ({ mode, original, reorder }))),
+))('repeated remove/readd uses latest source after disk reopen: $mode / $original / reordered=$reorder', ({ mode, original, reorder }) => {
+  const source = input(); source.channel_mode = mode
+  const alpha = source.personas[0]!
+  alpha.dm = { enabled: true, contact: 'U0TEST001' }
+  alpha.permission_prompts = 'dm'
+  alpha.channels = [{ id: C.primary, delivery: original }]
+  let authority = makeSharedAuthority(root, source)
+  const sibling = authority.snapshot().personas['beta']
+  const originalLife = authority.incarnation('alpha')!
+  const changed = original === 'mentions' ? 'all' : 'mentions'
+  const reopen = () => {
+    const state = readSharedState(root)!
+    if (reorder) state.retiredIdentities = Object.fromEntries(Object.entries(state.retiredIdentities).reverse())
+    // Reorder the actual persisted representation, then parse it as a new process would.
+    writeSharedState(root, state)
+    authority = createSharedChannelAuthority(authority.path, readSharedState(root)!)
   }
-  const deps: ChannelDeliveryStoreDeps = {
-    log: (line) => rig.logs.push(line),
-    readFs: opts.readFs,
-    now: () => rig.clock.now(),
-    write: (path, bytes) => {
-      rig.writes.push(bytes)
-      durableWriteFileSync(path, bytes, fs)
-    },
-    remove: (path) => durableUnlinkSync(path, fs),
+  const apply = (present: boolean) => {
+    const reviewed = configBytes({ ...source, personas: present ? source.personas : source.personas.slice(1) })
+    expect(authority.applyReviewed(reviewed, authority.revision).kind).toBe('applied')
+    reopen()
+    expect(authority.sourceBytes()).toEqual(reviewed)
+    expect(authority.snapshot().personas['beta']).toEqual(sibling)
   }
-  rig.store = opts.start === undefined ? loadChannelDeliveryStore(stateDir, deps) : loadChannelDeliveryAtStart(stateDir, opts.start, deps)
-  return rig
-}
-
-/** The stored-choice file's path in the case's state directory. */
-const filePath = (): string => channelDeliveryPath(stateDir)
-
-/** The file's bytes, or null when there is none. */
-function fileBytes(): Uint8Array | null {
-  return existsSync(filePath()) ? new Uint8Array(readFileSync(filePath())) : null
-}
-
-/** The state directory's entries, sorted. */
-const stateEntries = (): string[] => readdirSync(stateDir).sort()
-
-/** Every regular file in the state directory, marked for `assertNoLeak`. */
-function filesWritten(): ReturnType<typeof writtenFile>[] {
-  return readdirSync(stateDir)
-    .filter((name) => lstatSync(join(stateDir, name)).isFile())
-    .map((name) => writtenFile(join(stateDir, name)))
-}
-
-/**
- * `assertNoLeak` over the rig's lines, `extra` and, unless `files` is false
- * (a case that seeded a token into the file itself), every file in the state
- * directory.
- */
-function expectNoLeak(rig: Rig | undefined, extra: Record<string, unknown> = {}, files = true): void {
-  assertNoLeak({ logs: rig?.logs ?? [], ...extra, files: files ? filesWritten() : [] })
-}
-
-/** Resolved personas of the case, their paths under its root (declarative mode unless `fungible`). */
-function personasOf(specs: PersonaSpec[], fungible = false): Persona[] {
-  return makeMultiPersonaConfig(specs, root, fungible ? { allow_invited_channels: true } : {}).personas
-}
-
-/** The persona named `name`, in declarative mode. */
-const personaNamed = (name: string): Persona => personasOf([{ name }])[0]!
-
-/** Create a persona's working directory and credentials file (fake tokens), so its paths resolve. */
-function onDisk(persona: Persona): Persona {
-  mkdirSync(persona.working_directory, { recursive: true })
-  writeCredentialsFile(dirname(persona.credentials_file), basename(persona.credentials_file))
-  return persona
-}
-
-/** A seed for `persona` with `channels`. */
-function seedFor(persona: Persona, channels: Record<string, ChannelDeliveryChannelSeed>): ChannelDeliveryPersonaSeed {
-  return { declaration: declarationOf(persona), channels }
-}
-
-/** Two keys: `alpha` in two channels (`all`, `mentions`), `beta` in one (`all`). */
-function baseSeeds(): Record<string, ChannelDeliveryPersonaSeed> {
-  return {
-    alpha: seedFor(personaNamed('alpha'), { [C1]: { delivery: 'all' }, [C2]: { delivery: 'mentions', set_at: EARLIER_SET_AT } }),
-    beta: seedFor(personaNamed('beta'), { [G3]: { delivery: 'all' } }),
+  apply(false)
+  alpha.channels[0]!.delivery = changed
+  apply(true)
+  expect(authority.choice('alpha', C.primary)).toBe(changed)
+  expect(authority.incarnation('alpha')).not.toBe(originalLife)
+  for (let reset = 0; reset < 3; reset++) {
+    const previousLife = authority.incarnation('alpha')!
+    apply(false)
+    const preview = authority.previewReviewed(configBytes(source))
+    expect(preview.personas[0]!.channels).toEqual([])
+    apply(true)
+    expect(authority.incarnation('alpha')).not.toBe(previousLife)
+    expect(authority.choice('alpha', C.primary)).toBeUndefined()
+    expect(authority.snapshot().source).toEqual(JSON.parse(configBytes(source).toString()))
   }
-}
+  const retirements = Object.values(authority.snapshot().retiredIdentities)
+  const latest = retirements.reduce((a, b) => a.order > b.order ? a : b)
+  expect(new Set(retirements.map(record => record.order)).size).toBe(retirements.length)
+  expect(latest.channels).toEqual(alpha.channels)
+  // A fresh explicit assignment still works, but copying it through another reset does not.
+  expect(authority.applyReviewed(configBytes(source), authority.revision, [
+    { key: 'alpha', channel: C.primary, delivery: changed, incarnation: authority.incarnation('alpha') },
+  ]).kind).toBe('applied')
+  reopen()
+  expect(authority.choice('alpha', C.primary)).toBe(changed)
+  apply(false); apply(true)
+  expect(authority.choice('alpha', C.primary)).toBeUndefined()
+  check(authority.snapshot())
+})
 
-/** The base seeds' bytes, as the serialiser writes them. */
-const seededBytes = (): Uint8Array => serializeChannelDelivery(channelDeliveryRecordOf(baseSeeds()))
-
-/** The base seeds' serialised record, parsed, altered by `alter` (which may return a replacement) and written back as JSON. */
-function altered(alter: (doc: Record<string, any>) => unknown): Uint8Array {
-  const doc = JSON.parse(new TextDecoder().decode(seededBytes()))
-  const out = alter(doc)
-  return new TextEncoder().encode(JSON.stringify(out === undefined ? doc : out, null, 2))
-}
-
-/** The unreadable cause the parser gives for `bytes`; fails when they parse. */
-function refusalOf(bytes: Uint8Array): ChannelDeliveryUnreadableCause {
-  const parsed = parseChannelDelivery(bytes)
-  if (parsed.ok) throw new Error('the bytes parsed; the case needs a refused form')
-  return { stage: parsed.stage, problem: parsed.problem }
-}
-
-/** The retired-key record holding `seeds`, loaded through src/retired-keys.ts from its own directory under the root. */
-function retiredKeysOf(seeds: Readonly<Record<string, RetiredKeySeed>> = {}): RetiredKeyStore {
-  const dir = join(root, 'retired')
-  mkdirSync(dir, { recursive: true })
-  if (Object.keys(seeds).length > 0) writeRetiredKeysRecord(dir, seeds)
-  const loaded = loadRetiredKeyStore(dir, { log: () => {} })
-  if (loaded.kind !== 'loaded') throw new Error('the retired-key record did not load')
-  return loaded.store
-}
-
-/** The applied personas as the start rules see them. */
-const appliedOf = (personas: readonly Persona[]): ChannelDeliveryAppliedPersona[] =>
-  personas.map((persona) => ({ key: persona.key, declaration: declarationOf(persona) }))
-
-/** What the start rules run over: `personas` applied, `retired` in the retired-key record. */
-function startOf(personas: readonly Persona[], retired: Readonly<Record<string, RetiredKeySeed>> = {}): ChannelDeliveryStart {
-  return { applied: appliedOf(personas), retiredKeys: retiredKeysOf(retired) }
-}
-
-/**
- * `line` is the failed-write line `build` makes around its detail: the
- * builder's own text before and after it, with each injected error's errno
- * code (`errnoSuffix`) inside the detail, in order.
- */
-function expectWriteFailedLine(line: string, build: (detail: string) => string, errors: readonly NodeJS.ErrnoException[]): void {
-  const [head, tail] = lineParts(build) as [string, string]
-  expect(line.startsWith(head)).toBe(true)
-  expect(line.endsWith(tail)).toBe(true)
-  let detail = line.slice(head.length, line.length - tail.length)
-  for (const err of errors) {
-    const code = errnoSuffix(err)
-    expect(code).not.toBe('')
-    expect(detail).toContain(code)
-    detail = detail.slice(detail.indexOf(code) + code.length)
+test.each(['name', 'credentials_file', 'working_directory'] as const)('replacement and return of %s cannot resurrect copied choices after reopen', field => {
+  const source = input()
+  const alpha = source.personas[0]!
+  alpha.dm = { enabled: true, contact: 'U0TEST001' }
+  alpha.permission_prompts = 'dm'
+  alpha.channels = [{ id: C.primary, delivery: 'all' }]
+  let authority = makeSharedAuthority(root, source)
+  const sibling = authority.snapshot().personas['beta']
+  const apply = () => {
+    expect(authority.applyReviewed(configBytes(source), authority.revision).kind).toBe('applied')
+    authority = createSharedChannelAuthority(authority.path, readSharedState(root)!)
+    expect(authority.snapshot().personas['beta']).toEqual(sibling)
   }
-}
+  const original = alpha[field]
+  alpha[field] = field === 'name' ? 'gamma' : join(root, `replacement-${field}`)
+  apply()
+  alpha.channels[0]!.delivery = 'mentions'
+  apply()
+  expect(authority.choice(field === 'name' ? 'gamma' : 'alpha', C.primary)).toBe('mentions')
+  alpha[field] = original
+  apply()
+  expect(authority.choice('alpha', C.primary)).toBeUndefined()
+  alpha[field] = field === 'name' ? 'gamma' : join(root, `replacement-${field}`)
+  apply()
+  expect(authority.choice(field === 'name' ? 'gamma' : 'alpha', C.primary)).toBeUndefined()
+  check(authority.snapshot())
+})
 
-/** What `act` throws; fails when it returns. */
-function thrownBy(act: () => unknown): NodeJS.ErrnoException {
+test.each(['missing', 'zero', 'fractional', 'future'] as const)('retirement order %s is refused with the specific evidence diagnostic', invalid => {
+  const source = input()
+  const authority = makeSharedAuthority(root, source)
+  expect(authority.applyReviewed(configBytes({ ...source, personas: source.personas.slice(1) }), authority.revision).kind).toBe('applied')
+  const state = authority.snapshot()
+  const record = Object.values(state.retiredIdentities)[0]! as unknown as Record<string, unknown>
+  if (invalid === 'missing') delete record.order
+  else record.order = invalid === 'zero' ? 0 : invalid === 'fractional' ? 1.5 : state.revision + 1
+  const bytes = serializeSharedChannelState(state)
+  expect(() => parseSharedChannelState(bytes, authority.path)).toThrow('The shared channel authority has invalid retired identity evidence.')
+  check(state)
+})
+
+test.each(['rejection-at-assignment', 'colliding-attempts'] as const)('F1: production reader rejects %s rather than trusting contradictory history', shape => {
+  const config = input(); config.channel_mode = 'open'
+  const authority = makeSharedAuthority(root, config)
+  const store = createChannelDeliveryStore(authority, () => true)
+  expect(store.attempt('alpha', authority.incarnation('alpha')!, deliveryAttempt('parser-regression', C.primary, 'all'), () => undefined).kind).toBe('applied')
+  const bytes = serializeSharedChannelState(contradictoryBotHistory(authority.snapshot(), shape))
+  expect(() => parseSharedChannelState(bytes, authority.path)).toThrow()
+  durableWriteFileSync(authority.path, bytes)
+  expect(() => readSharedState(root)).toThrow()
+  check(bytes)
+})
+
+test.each(['pending-at-terminal', 'pending-at-inventory'] as const)('attempt positions exclude %s while an inventory may reference the applied revision', async shape => {
+  const h = makeMembershipHarness(root)
   try {
-    act()
-  } catch (err) {
-    return err as NodeJS.ErrnoException
+    await h.start()
+    const persona = h.h.p('alpha'), channel = C.primary
+    h.h.stub(persona).script.inventory.push(membershipPage([channel])); await h.scan()
+    const store = createChannelDeliveryStore(h.authority, () => true)
+    const request = deliveryAttempt('before-authenticated-inventory', channel, 'all')
+    expect(store.attempt('alpha', h.authority.incarnation('alpha')!, request, () => undefined).kind).toBe('applied')
+    const appliedRevision = h.authority.revision
+    h.h.stub(persona).script.inventory.push(membershipPage([channel])); h.scanner.request('alpha'); await h.scan()
+    const valid = h.authority.snapshot()
+    expect(valid.personas.alpha!.membershipInventory!.observedRevision).toBe(appliedRevision)
+    expect(readSharedState(root)).toEqual(valid)
+    expect(createSharedChannelAuthority(h.authority.path, readSharedState(root)!).lookupBotAttempt('alpha', h.authority.incarnation('alpha')!, request)?.kind).toBe('applied')
+    const bytes = serializeSharedChannelState(contradictoryBotHistory(valid, shape))
+    expect(() => parseSharedChannelState(bytes, h.authority.path)).toThrow(shape === 'pending-at-terminal' ? 'Invalid durable bot attempt order.' : 'Inconsistent durable bot attempt effect.')
+    durableWriteFileSync(h.authority.path, bytes)
+    expect(() => readSharedState(root)).toThrow()
+    expect(readFileSync(h.authority.path)).toEqual(Buffer.from(bytes))
+    check(bytes)
+  } finally { await h.close() }
+})
+
+test('the production reader refuses malformed typed evidence without dumping identifiers or injected data', () => {
+  const config = input(); config.channel_mode = 'open'
+  const authority = makeSharedAuthority(root, config), store = createChannelDeliveryStore(authority, () => true)
+  const request = deliveryAttempt('valid-source-record', C.primary, 'all')
+  const applied = store.attempt('alpha', authority.incarnation('alpha')!, request, () => undefined)
+  expect(applied.kind).toBe('applied')
+  if (applied.kind !== 'applied') throw new Error('expected a durable application')
+  expect(applied.outcome.facts).toEqual({ saved: 'all', effective: 'all' })
+  const valid = authority.snapshot()
+  expect(parseSharedChannelState(serializeSharedChannelState(valid), authority.path)).toEqual(valid)
+  expect(readSharedState(root)).toEqual(valid)
+  expect(createSharedChannelAuthority(authority.path, readSharedState(root)!).lookupBotAttempt('alpha', authority.incarnation('alpha')!, request)).toEqual({ ...applied, historical: true })
+  for (const { label, state } of malformedBotHistories(valid)) {
+    const bytes = serializeSharedChannelState(state)
+    let failure: unknown
+    try { parseSharedChannelState(bytes, authority.path) } catch (error) { failure = error }
+    expect(failure, label).toBeInstanceOf(Error)
+    assertNoLeak(String(failure))
+    expect(String(failure)).not.toContain('must-not-be-persisted')
   }
-  throw new Error('expected a throw; none came')
-}
+  check(authority.snapshot())
+})
 
-/** Every entry the store holds is one `seeds` held, as it was: the rules only remove. */
-function expectOnlyRemoved(store: ChannelDeliveryStore, seeds: Readonly<Record<string, ChannelDeliveryPersonaSeed>>): void {
-  const seeded = channelDeliveryRecordOf(seeds)
-  for (const [key, entry] of store.record()) expect(entry).toEqual(seeded.get(key)!)
-}
-
-/** Whether `line`, with `path` taken out, names a delivery value as a word. */
-function namesAChoice(line: string, path: string): boolean {
-  const words = line.replaceAll(path, '')
-  return DELIVERY_MODES.some((mode) => new RegExp(`\\b${mode}\\b`).test(words))
-}
-
-/**
- * What breaks "the bytes are parsed only" in comment-stripped
- * `code`: each imported specifier naming a crypto module, and each hashing,
- * digest or byte-comparison name in its code outside literals. Empty when the
- * module only parses.
- */
-function parsedOnlyFindings(code: string): string[] {
-  const imports = importedSpecifiers(code).filter((spec) => /crypto/.test(spec)).map((spec) => `imports ${spec}`)
-  const names = [...maskLiterals(code).matchAll(/\b(?:createHash|createHmac|digest|timingSafeEqual|sha256Hex)\b|\bBuffer\.compare\b|\.equals\s*\(/g)]
-    .map((m) => `names ${m[0]}`)
-  return [...imports, ...names]
-}
-
-// ---------------------------------------------------------------------------
-// S1: fixed values, location, format, refused forms, the helper's contract
-// ---------------------------------------------------------------------------
-
-describe('the store\'s fixed values', () => {
-  test('pin: the file name, format version 1, the class list holding only channel-delivery-unreadable, the line prefix and three drop reasons', () => {
-    const values = {
-      file: CHANNEL_DELIVERY_FILE_NAME,
-      version: CHANNEL_DELIVERY_FORMAT_VERSION,
-      classes: [...CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES],
-      unreadable: CHANNEL_DELIVERY_UNREADABLE,
-      prefix: CHANNEL_DELIVERY_LOG_PREFIX,
-      reasons: [CHANNEL_DELIVERY_DROP_RETIRED, CHANNEL_DELIVERY_DROP_NOT_APPLIED, CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED],
-    }
-    expect(values).toEqual({
-      file: 'channel-delivery.json',
-      version: 1,
-      classes: ['channel-delivery-unreadable'],
-      unreadable: 'channel-delivery-unreadable',
-      prefix: '[slack] channel-delivery:',
-      reasons: ['retired by a confirmed change', 'not an applied persona at start', 'its declaration changed'],
+describe('membership transactions preserve durable state and publications', () => {
+  const observe = (authority: SharedChannelAuthority, key: string, channel: string, member: boolean, event: string) =>
+    authority.observeMembership(key, authority.incarnation(key)!, membershipObservation(authority, key, channel, member, event), authority.revision)
+  /** An open-mode authority in `dir` whose observers record each publication
+   * with the revision on disk; `whole` routes membership through `transact`. */
+  function historyRun(dir: string, whole: boolean, write: NonNullable<SharedChannelDeps['write']> = durableWriteFileSync) {
+    mkdirSync(dir)
+    const config = input(); config.channel_mode = 'open'
+    const state = initialSharedState(root, config)
+    writeSharedState(dir, state)
+    const writes: Buffer[] = [], seen: unknown[] = []
+    let since = 0
+    const authority = createSharedChannelAuthority(sharedChannelPath(dir), state, {
+      write(path, bytes) { writes.push(Buffer.from(bytes)); write(path, bytes) }, threadHybridSince: () => `since-${++since}`,
     })
-    expect<string[]>([...CHANNEL_DELIVERY_DROP_REASONS]).toEqual(values.reasons)
-    assertNoLeak(values)
-  })
-})
-
-describe('where the file lives (beside)', () => {
-  test('a store over a state directory has <dir>/<file name> as its path, and its first accepted write creates exactly that file, with no temporary file', () => {
-    const rig = openRig()
-    expect(rig.store.path).toBe(join(stateDir, CHANNEL_DELIVERY_FILE_NAME))
-    expect(channelDeliveryPath(stateDir)).toBe(rig.store.path)
-
-    expect(rig.store.set('alpha', C1, 'all', declarationOf(personaNamed('alpha'))).kind).toBe(CHANNEL_DELIVERY_SET_STORED)
-
-    expect(stateEntries()).toEqual([CHANNEL_DELIVERY_FILE_NAME])
-    expectNoLeak(rig)
-  })
-
-  test('with no directory given, the path follows SLACK_STATE_DIR as it is at call time; a given directory wins', () => {
-    const first = join(root, 'first')
-    const second = join(root, 'second')
-    process.env['SLACK_STATE_DIR'] = first
-    expect(channelDeliveryPath()).toBe(join(first, CHANNEL_DELIVERY_FILE_NAME))
-    process.env['SLACK_STATE_DIR'] = second
-    expect(channelDeliveryPath()).toBe(join(second, CHANNEL_DELIVERY_FILE_NAME))
-    expect(channelDeliveryPath(stateDir)).toBe(join(stateDir, CHANNEL_DELIVERY_FILE_NAME))
-    expectNoLeak(undefined)
-  })
-
-  test('no src/ module but src/channel-delivery.ts spells the file name or names the serialiser or the parser (comment-stripped code)', () => {
-    const helpers = /\b(?:serializeChannelDelivery|parseChannelDelivery)\b/
-    const modules = srcModules()
-    const own = modules.get('channel-delivery.ts')!
-    // The module itself holds all three, so the check can match.
-    expect(own).toContain(CHANNEL_DELIVERY_FILE_NAME)
-    expect(maskLiterals(own)).toMatch(helpers)
-
-    const offenders = [...modules]
-      .filter(([name]) => name !== 'channel-delivery.ts')
-      .filter(([, code]) => code.includes(CHANNEL_DELIVERY_FILE_NAME) || helpers.test(maskLiterals(code)))
-      .map(([name]) => name)
-    expect(offenders).toEqual([])
-    expectNoLeak(undefined)
-  })
-})
-
-describe('the file\'s format', () => {
-  test('a full record round-trips through the serialiser and the parser, and loads whole through the store', () => {
-    const seeds = {
-      ...baseSeeds(),
-      ['__proto__']: seedFor(personaNamed('__proto__'), { [C2]: { delivery: 'mentions' } }),
-      gamma: seedFor(personaNamed('gamma'), { [G3]: { delivery: 'mentions', set_at: EARLIER_SET_AT }, [C1]: { delivery: 'all' } }),
-    }
-    const record = channelDeliveryRecordOf(seeds)
-    expect(record.size).toBe(4)
-
-    expect(parseChannelDelivery(serializeChannelDelivery(record))).toEqual({ ok: true, record })
-
-    writeChannelDeliveryRecord(stateDir, seeds)
-    const rig = openRig()
-    expect(rig.store.readable).toBe(true)
-    expect(rig.store.record()).toEqual(record)
-    expect(rig.logs).toEqual([])
-    expectNoLeak(rig)
-  })
-
-  test('the same record always gives the same bytes, whatever order its keys and channels were added in', () => {
-    const seeds = baseSeeds()
-    const reversed: Record<string, ChannelDeliveryPersonaSeed> = {}
-    for (const key of Object.keys(seeds).reverse()) {
-      const seed = seeds[key]!
-      reversed[key] = { declaration: seed.declaration, channels: Object.fromEntries(Object.entries(seed.channels).reverse()) }
-    }
-    const bytes = serializeChannelDelivery(channelDeliveryRecordOf(seeds))
-
-    expect(serializeChannelDelivery(channelDeliveryRecordOf(seeds))).toEqual(bytes)
-    expect(serializeChannelDelivery(channelDeliveryRecordOf(reversed))).toEqual(bytes)
-    expectNoLeak(undefined, { bytes })
-  })
-
-  test('the serialiser leaves out a key with no channels', () => {
-    const record = new Map(channelDeliveryRecordOf(baseSeeds()))
-    const withEmpty = new Map<string, ChannelDeliveryPersonaEntry>(record)
-    withEmpty.set('gamma', { declaration: declarationOf(personaNamed('gamma')), channels: new Map() })
-
-    expect(serializeChannelDelivery(withEmpty)).toEqual(serializeChannelDelivery(record))
-    expectNoLeak(undefined)
-  })
-
-  /** An alteration that respells `alpha`'s C1 `set_at` (the serialiser's `SAMPLE_SET_AT`, 2026-06-01T09:30:00.000Z). */
-  const respellSetAt = (respell: (setAt: string) => string) => (doc: Record<string, any>): void => {
-    doc.personas.alpha.channels[C1].set_at = respell(doc.personas.alpha.channels[C1].set_at)
+    if (whole) authority.transactMembership = (key, revision, change, span) => authority.transact(revision, change, span)
+    const disk = () => parseSharedChannelState(readFileSync(authority.path), authority.path)!.revision
+    // Settings resolved beside the authority file name its directory.
+    authority.subscribe(config => seen.push(['config', authority.revision, disk(), JSON.parse(JSON.stringify(config).replaceAll(dir, '<dir>'))]))
+    authority.subscribeThreadView(view => seen.push(['view', view.revision, disk(), view.personaKeys().map(key => [key, view.threadHybridChannels(key), view.stamp(key, C.secondary)])]))
+    authority.watch(() => seen.push(['watch', authority.revision, disk(), authority.readable]))
+    return { authority, writes, seen }
   }
-
-  // Every form refuses, each the base seeds' serialised record altered.
-  const REFUSED: Array<[string, (doc: Record<string, any>) => unknown]> = [
-    ['a record with no `version`', (doc) => { delete doc.version }],
-    ['a record with no `personas`', (doc) => { delete doc.personas }],
-    ['an entry with no `declaration`', (doc) => { delete doc.personas.alpha.declaration }],
-    ['an entry with no `channels`', (doc) => { delete doc.personas.alpha.channels }],
-    ...CHANNEL_DELIVERY_DECLARATION_FIELDS.map((field): [string, (doc: Record<string, any>) => unknown] => [
-      `a declaration with no \`${field}\``,
-      (doc) => { delete doc.personas.beta.declaration[field] },
-    ]),
-    ['a channel entry with no `delivery`', (doc) => { delete doc.personas.alpha.channels[C2].delivery }],
-    ['a channel entry with no `set_at`', (doc) => { delete doc.personas.beta.channels[G3].set_at }],
-    ['an unknown top-level field', (doc) => { doc.note = 1 }],
-    ['an unknown field in an entry', (doc) => { doc.personas.alpha.note = 1 }],
-    ['an unknown field in a declaration', (doc) => { doc.personas.alpha.declaration.note = 'x' }],
-    ['an unknown field in a channel entry', (doc) => { doc.personas.beta.channels[G3].note = 'x' }],
-    ['version 2', (doc) => { doc.version = CHANNEL_DELIVERY_FORMAT_VERSION + 1 }],
-    ['a version given as a string', (doc) => { doc.version = String(doc.version) }],
-    ['`personas` given as an array', (doc) => { doc.personas = Object.values(doc.personas) }],
-    ['a key that is not a persona key', (doc) => { doc.personas['Not A Key'] = doc.personas.beta; delete doc.personas.beta }],
-    ['a malformed channel ID', (doc) => { doc.personas.beta.channels['c0lower'] = doc.personas.beta.channels[G3] }],
-    ['a `delivery` of "none"', (doc) => { doc.personas.alpha.channels[C1].delivery = 'none' }],
-    ['a `set_at` without the trailing Z', respellSetAt((setAt) => setAt.replace(/Z$/, ''))],
-    ['a `set_at` with an offset in place of Z', respellSetAt((setAt) => setAt.replace(/Z$/, '+00:00'))],
-    ['a `set_at` in month 13', respellSetAt((setAt) => setAt.replace(/^(\d{4})-\d{2}/, '$1-13'))],
-    ['a `set_at` on 30 February', respellSetAt((setAt) => setAt.replace(/^(\d{4})-\d{2}-\d{2}/, '$1-02-30'))],
-    ['a `set_at` at hour 24', respellSetAt((setAt) => setAt.replace(/T\d{2}/, 'T24'))],
-    ['a `set_at` at minute 60', respellSetAt((setAt) => setAt.replace(/T(\d{2}):\d{2}/, 'T$1:60'))],
-    ['a `set_at` at second 61', respellSetAt((setAt) => setAt.replace(/T(\d{2}):(\d{2}):\d{2}/, 'T$1:$2:61'))],
-    ['a declaration field that is not a string', (doc) => { doc.personas.alpha.declaration.name = 7 }],
-    ['an entry with no channel in `channels`', (doc) => { doc.personas.beta.channels = {} }],
-  ]
-
-  // UTF-8 rule, as raw bytes: each would read as the base seeds if
-  // the decoder dropped a byte order mark or replaced a bad byte. The bad
-  // byte sits inside a declaration path, where a replacement character would
-  // still validate.
-  const NOT_UTF8: Array<[string, () => Uint8Array]> = [
-    ['a UTF-8 byte order mark before the record', () => new Uint8Array([0xef, 0xbb, 0xbf, ...seededBytes()])],
-    ['a byte that is not UTF-8 (0xFF) inside a declaration path', () => {
-      const bytes = seededBytes()
-      // The record is ASCII, so the path's text offset is its byte offset.
-      const at = new TextDecoder().decode(bytes).indexOf(root)
-      if (at < 0) throw new Error('the case root is not in the record')
-      bytes[at + 1] = 0xff
-      return bytes
-    }],
-  ]
-
-  test.each([...REFUSED.map(([label, alter]): [string, () => Uint8Array] => [label, () => altered(alter)]), ...NOT_UTF8])('%s reads as unreadable through the store\'s load: one line, the file left byte-identical', (_label, build) => {
-    const bytes = build()
-    writeFileSync(filePath(), bytes)
-
-    const rig = openRig()
-
-    expect(rig.store.readable).toBe(false)
-    expect(rig.logs).toEqual([channelDeliveryUnreadableLine(filePath(), refusalOf(bytes))])
-    expect(fileBytes()).toEqual(bytes)
-    expectNoLeak(rig)
-  })
-
-  // `set_at` is an RFC 3339 UTC timestamp ending in `Z`; the
-  // fraction of a second is optional and of any width.
-  test.each<[string, (setAt: string) => string, string]>([
-    ['one fraction digit', (setAt) => setAt.replace(/\.\d+Z$/, '.5Z'), '2026-06-01T09:30:00.5Z'],
-    ['no fraction of a second', (setAt) => setAt.replace(/\.\d+Z$/, 'Z'), '2026-06-01T09:30:00Z'],
-    ['six fraction digits', (setAt) => setAt.replace(/\.\d+Z$/, '.123456Z'), '2026-06-01T09:30:00.123456Z'],
-  ])('a `set_at` with %s is accepted: the store loads readable, with the choice and the timestamp as written, and no line', (_label, respell, expected) => {
-    const bytes = altered(respellSetAt(respell))
-    writeFileSync(filePath(), bytes)
-
-    const rig = openRig()
-
-    expect(rig.store.readable).toBe(true)
-    expect(rig.store.storedChoice('alpha', C1)).toBe('all')
-    expect(rig.store.record().get('alpha')!.channels.get(C1)).toEqual({ delivery: 'all', set_at: expected })
-    expect(rig.logs).toEqual([])
-    expect(fileBytes()).toEqual(bytes)
-    expectNoLeak(rig)
-  })
-})
-
-describe('the stored-choice helper\'s contract (tests/test-helpers/channel-delivery.ts)', () => {
-  test('writeChannelDeliveryRecord writes exactly the serialiser\'s bytes at the module\'s path, a given set_at kept and an unset one SAMPLE_SET_AT', () => {
-    const alpha = personaNamed('alpha')
-    const expected: ChannelDeliveryRecord = new Map([
-      [
-        'alpha',
-        {
-          declaration: declarationOf(alpha),
-          channels: new Map([
-            [C1, { delivery: 'all' as DeliveryMode, set_at: SAMPLE_SET_AT }],
-            [C2, { delivery: 'mentions' as DeliveryMode, set_at: EARLIER_SET_AT }],
-          ]),
-        },
-      ],
-    ])
-
-    const path = writeChannelDeliveryRecord(stateDir, { alpha: seedFor(alpha, { [C1]: { delivery: 'all' }, [C2]: { delivery: 'mentions', set_at: EARLIER_SET_AT } }) })
-
-    expect(path).toBe(filePath())
-    expect(fileBytes()).toEqual(serializeChannelDelivery(expected))
-    expect(stateEntries()).toEqual([CHANNEL_DELIVERY_FILE_NAME])
-    expectNoLeak(undefined)
-  })
-
-  test('writeChannelDeliveryRecord refuses the real home (the launch-time home), the OS temp directory itself and a directory outside it, writing nothing', () => {
-    // When the launch-time home is a scratch HOME under the OS temp directory
-    // (`HOME=$(mktemp -d)`), only the real-home rule refuses it.
-    const errors: Error[] = []
-    for (const refused of [homedir(), osTempDir(), '/']) {
-      const path = channelDeliveryPath(refused)
-      const existed = existsSync(path)
-      errors.push(thrownBy(() => writeChannelDeliveryRecord(refused, baseSeeds())))
-      expect(existsSync(path)).toBe(existed)
-    }
-    for (const err of errors) expect(err.message).toContain(writeChannelDeliveryRecord.name)
-    expectNoLeak(undefined, { errors })
-  })
-
-  test('readChannelDeliveryRecord answers null for no file and the parsed record for a file', () => {
-    expect(readChannelDeliveryRecord(stateDir)).toBeNull()
-
-    writeChannelDeliveryRecord(stateDir, baseSeeds())
-
-    expect(readChannelDeliveryRecord(stateDir)).toEqual(channelDeliveryRecordOf(baseSeeds()))
-    expectNoLeak(undefined)
-  })
-
-  test('readChannelDeliveryRecord throws on a refused file, naming the path and the parser\'s problem and no file content; another read failure is rethrown', () => {
-    const token = fakeToken(BOT_TOKEN_PREFIX, 'helper')
-    const bytes = altered((doc) => { doc.personas.alpha.channels[C1].delivery = token })
-    writeFileSync(filePath(), bytes)
-    const { problem } = refusalOf(bytes) as { problem: string }
-
-    const refused = thrownBy(() => readChannelDeliveryRecord(stateDir))
-
-    expect(refused.message).toContain(readChannelDeliveryRecord.name)
-    expect(refused.message).toContain(filePath())
-    expect(refused.message).toContain(problem)
-    expectNoLeak(undefined, { refused }, false)
-
-    rmSync(filePath())
-    mkdirSync(filePath())
-    const rethrown = thrownBy(() => readChannelDeliveryRecord(stateDir))
-    expect(rethrown.code).toBe('EISDIR')
-    expectNoLeak(undefined, { rethrown })
-  })
-
-  test('declarationOf(persona) equals the declaration the store records for that persona, as the server builds it', () => {
-    const [alpha] = personasOf([{ name: 'alpha' }])
-    const rig = openRig()
-
-    rig.store.set(alpha!.key, C1, 'all', channelDeliveryDeclarationOf(alpha!))
-
-    expect(readChannelDeliveryRecord(stateDir)!.get(alpha!.key)!.declaration).toEqual(declarationOf(alpha!))
-    expect(declarationOf(alpha!)).toEqual({ name: alpha!.name, credentials_file: alpha!.credentials_file, working_directory: alpha!.working_directory })
-    expectNoLeak(rig)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// S2: the read at start and the unreadable state
-// ---------------------------------------------------------------------------
-
-describe('the read at start (beside)', () => {
-  test('a missing file reads as an empty, readable record: nothing written or created, no line', () => {
-    const alpha = personaNamed('alpha')
-    const rig = openRig({ start: startOf([alpha]) })
-
-    expect(rig.store.readable).toBe(true)
-    expect(rig.store.record().size).toBe(0)
-    expect(rig.store.storedChoice(alpha.key, C1)).toBeUndefined()
-    expect(rig.writes).toEqual([])
-    expect(stateEntries()).toEqual([])
-    expect(rig.logs).toEqual([])
-    expectNoLeak(rig)
-  })
-
-  // Each cause of an unreadable file. The file always holds keys no applied
-  // persona has, so a start rule that ran would drop them.
-  const UNREADABLE: Array<[string, () => { readFs?: Partial<PersonaConfigFs>; cause: ChannelDeliveryUnreadableCause }]> = [
-    ['a read error (EACCES at the open, through the read seam)', () => {
-      writeChannelDeliveryRecord(stateDir, baseSeeds())
-      const err = injected('EACCES', 'open')
-      return { readFs: { openFile: () => { throw err } }, cause: { stage: CHANNEL_DELIVERY_UNREADABLE_READ, code: err.code } }
-    }],
-    ['a read error (EIO at the read, through the read seam)', () => {
-      writeChannelDeliveryRecord(stateDir, baseSeeds())
-      const err = injected('EIO', 'read')
-      return { readFs: { readFileFd: () => { throw err } }, cause: { stage: CHANNEL_DELIVERY_UNREADABLE_READ, code: err.code } }
-    }],
-    ['invalid JSON (the record cut short)', () => {
-      const bytes = seededBytes().slice(0, 80)
-      writeFileSync(filePath(), bytes)
-      return { cause: refusalOf(bytes) }
-    }],
-    ['a record the parser refuses (version 2)', () => {
-      const bytes = altered((doc) => { doc.version = CHANNEL_DELIVERY_FORMAT_VERSION + 1 })
-      writeFileSync(filePath(), bytes)
-      return { cause: refusalOf(bytes) }
-    }],
-  ]
-
-  test.each(UNREADABLE)('%s: the file left in place, one line, and an unreadable store for the run that stores, drops and writes nothing, and runs no start rule', (_label, setUp) => {
-    const { readFs, cause } = setUp()
-    const before = fileBytes()
-    const alpha = personaNamed('alpha')
-
-    const rig = openRig({ readFs, start: startOf([]) })
-
-    expect(rig.store.readable).toBe(false)
-    expect(rig.logs).toEqual([channelDeliveryUnreadableLine(filePath(), cause)])
-    const results = {
-      choice: rig.store.storedChoice('alpha', C1),
-      channels: rig.store.storedChannels('alpha'),
-      size: rig.store.record().size,
-      set: rig.store.set('alpha', C1, 'mentions', declarationOf(alpha)),
-      drop: rig.store.drop([{ key: 'alpha', reason: CHANNEL_DELIVERY_DROP_NOT_APPLIED }]),
-      unwritten: rig.store.hasUnwrittenDrop('alpha'),
-      writeUnwritten: rig.store.writeUnwrittenDrops(),
-      rules: rig.store.applyStartRules(startOf([])),
-    }
-    expect(results).toEqual({
-      choice: undefined,
-      channels: [],
-      size: 0,
-      set: { kind: CHANNEL_DELIVERY_SET_UNREADABLE, path: filePath() },
-      drop: CHANNEL_DELIVERY_NOTHING_TO_WRITE,
-      unwritten: false,
-      writeUnwritten: CHANNEL_DELIVERY_NOTHING_TO_WRITE,
-      rules: CHANNEL_DELIVERY_NOTHING_TO_WRITE,
-    })
-    expect(rig.writes).toEqual([])
-    expect(rig.logs).toHaveLength(1)
-    expect(fileBytes()).toEqual(before)
-    // No startup-errors file under SLACK_STATE_DIR, which is the state directory.
-    expect(stateEntries()).toEqual([CHANNEL_DELIVERY_FILE_NAME])
-    expectNoLeak(rig, { results })
-  })
-
-  test('a directory at the path reads as unreadable (EISDIR) and is left in place', () => {
-    mkdirSync(filePath())
-
-    const rig = openRig({ start: startOf([]) })
-
-    expect(rig.store.readable).toBe(false)
-    expect(rig.logs).toEqual([channelDeliveryUnreadableLine(filePath(), { stage: CHANNEL_DELIVERY_UNREADABLE_READ, code: 'EISDIR' })])
-    expect(lstatSync(filePath()).isDirectory()).toBe(true)
-    expectNoLeak(rig)
-  })
-
-  test.skipIf(!mkfifoAvailable())('a real FIFO at the path with no writer reads as unreadable at once (child process, 10 s bound; skipped where mkfifo is unavailable)', () => {
-    makeFifo(filePath())
-    const home = join(root, 'home')
-    mkdirSync(home)
-    const modulePath = join(import.meta.dir, '..', 'src', 'channel-delivery.ts')
-    const script = `
-      const mod = await import(${JSON.stringify(modulePath)})
-      const logs = []
-      const store = mod.loadChannelDeliveryStore(${JSON.stringify(stateDir)}, { log: (line) => logs.push(line) })
-      console.log(JSON.stringify({ readable: store.readable, logs }))
-    `
-    const child = spawnSync(process.execPath, ['-e', script], {
-      timeout: 10_000,
-      encoding: 'utf-8',
-      env: hostSafeChildEnv(home, { tools: [], extras: { SLACK_STATE_DIR: join(home, 'state') } }),
-    })
-
-    expect(child.signal).toBeNull()
-    expect(child.error).toBeUndefined()
-    expect(child.status).toBe(0)
-    const out = JSON.parse(child.stdout.trim())
-    expect(out).toEqual({
-      readable: false,
-      logs: [channelDeliveryUnreadableLine(filePath(), { stage: CHANNEL_DELIVERY_UNREADABLE_READ, code: CONFIG_NOT_REGULAR_FILE_CODE })],
-    })
-    assertNoLeak({ out, stderr: child.stderr })
-  }, 15_000)
-
-  test('a valid record over 64 KiB is read whole, with every entry present and no line', () => {
-    const alpha = personaNamed('alpha')
-    const seeds: Record<string, ChannelDeliveryPersonaSeed> = {}
-    for (let i = 0; serializeChannelDelivery(channelDeliveryRecordOf(seeds)).length <= MAX_RELOAD_FILE_BYTES; i++) {
-      seeds[`persona_${String(i).padStart(5, '0')}`] = seedFor(alpha, { [C1]: { delivery: DELIVERY_MODES[i % DELIVERY_MODES.length]! } })
-    }
-    writeChannelDeliveryRecord(stateDir, seeds)
-    expect(fileBytes()!.length).toBeGreaterThan(MAX_RELOAD_FILE_BYTES)
-
-    const rig = openRig()
-
-    expect(rig.store.readable).toBe(true)
-    expect(rig.store.record()).toEqual(channelDeliveryRecordOf(seeds))
-    expect(rig.logs).toEqual([])
-    expectNoLeak(rig)
-  })
-
-  test('the file\'s bytes are parsed only: comment-stripped src/channel-delivery.ts imports no hashing module and digests or compares no bytes, and the check fails on altered source', () => {
-    const code = stripComments(readFileSync(join(import.meta.dir, '..', 'src', 'channel-delivery.ts'), 'utf-8'))
-    expect(parsedOnlyFindings(code)).toEqual([])
-
-    for (const added of ['import { createHash } from \'node:crypto\'', 'Buffer.compare(a, b)', 'x.equals(y)']) {
-      expect(parsedOnlyFindings(`${code}\n${added}\n`)).not.toEqual([])
-    }
-    expectNoLeak(undefined)
-  })
-
-  // gives no exact text: this case pins the logged line to its
-  // builder for each kind and checks each part requires.
-  test('pin: the channel-delivery-unreadable line for each kind (read, parse, validate) is its builder\'s, and names the file, the kind with its errno code or position, the fungible-mode effect and the fix', () => {
-    const kinds: Array<[string, () => { readFs?: Partial<PersonaConfigFs>; cause: ChannelDeliveryUnreadableCause }]> = [UNREADABLE[0]!, UNREADABLE[2]!, UNREADABLE[3]!]
-    const lines: string[] = []
-    const stages: string[] = []
-    for (const [, setUp] of kinds) {
-      rmSync(filePath(), { force: true })
-      const { readFs, cause } = setUp()
-      const rig = openRig({ readFs })
-      expect(rig.logs).toEqual([channelDeliveryUnreadableLine(filePath(), cause)])
-      lines.push(rig.logs[0]!)
-      stages.push(cause.stage)
-    }
-    expect(stages).toEqual([CHANNEL_DELIVERY_UNREADABLE_READ, CHANNEL_DELIVERY_PROBLEM_PARSE, CHANNEL_DELIVERY_PROBLEM_VALIDATE])
-    const [read, parse, validate] = lines as [string, string, string]
-
-    for (const line of lines) {
-      expect(line.startsWith(`[slack] ${CHANNEL_DELIVERY_UNREADABLE}:`)).toBe(true)
-      expect(line).toContain(JSON.stringify(filePath()))
-      expect(line).toContain('in fungible mode every channel is served at mentions')
-      expect(line).toContain(`${SET_CHANNEL_DELIVERY_TOOL} is refused`)
-      expect(line).toContain('To fix: move the file aside, then restart')
-    }
-    expect(read).toContain('could not be read (EACCES)')
-    expect(parse).toContain('could not be parsed')
-    expect(parse).toMatch(/at line \d+, column \d+/)
-    expect(validate).toContain('could not be validated')
-    expect(validate).toContain(`\`version\` is not ${CHANNEL_DELIVERY_FORMAT_VERSION}`)
-    assertNoLeak(lines)
-  })
-
-  test.each<[string, () => Uint8Array]>([
-    ['a parse failure over bytes cut short right after a fake token', () => {
-      const token = fakeToken(BOT_TOKEN_PREFIX, 'cut')
-      const text = new TextDecoder().decode(altered((doc) => { doc.personas.alpha.declaration.name = token }))
-      return new TextEncoder().encode(text.slice(0, text.indexOf(token) + token.length))
-    }],
-    ['a validation failure whose refused key is a fake token', () => altered((doc) => { doc.personas[fakeToken(BOT_TOKEN_PREFIX, 'key')] = doc.personas.alpha })],
-    ['a validation failure whose refused value is a fake token', () => altered((doc) => { doc.personas.alpha.channels[C1].delivery = fakeToken(BOT_TOKEN_PREFIX, 'value') })],
-  ])('%s: the one line carries no file content', (_label, build) => {
-    const bytes = build()
-    writeFileSync(filePath(), bytes)
-
-    const rig = openRig()
-
-    expect(rig.store.readable).toBe(false)
-    expect(rig.logs).toEqual([channelDeliveryUnreadableLine(filePath(), refusalOf(bytes))])
-    // The seeded file itself holds the token, so only the line is checked.
-    expectNoLeak(rig, {}, false)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// S3: whole-record durable writes and their failures
-// ---------------------------------------------------------------------------
-
-describe('an accepted set writes the whole record, durably', () => {
-  test('with the production writer: the given declaration and the clock\'s set_at stored, the file parsing back to the record in memory, the earlier choice answered', () => {
-    writeChannelDeliveryRecord(stateDir, baseSeeds())
-    const clock = createFakeClock({ start: START_MS })
-    const logs: string[] = []
-    const store = loadChannelDeliveryStore(stateDir, { log: (line) => logs.push(line), now: () => clock.now() })
-    const moved = { ...personaNamed('beta'), working_directory: join(root, 'elsewhere') }
-
-    const first = store.set('beta', C1, 'mentions', declarationOf(moved))
-    const second = store.set('beta', C1, 'all', declarationOf(moved))
-
-    expect([first, second]).toEqual([
-      { kind: CHANNEL_DELIVERY_SET_STORED, previous: undefined },
-      { kind: CHANNEL_DELIVERY_SET_STORED, previous: 'mentions' },
-    ])
-    expect(store.storedChoice('beta', C1)).toBe('all')
-    // The channel added last comes first: storedChannels answers the IDs sorted.
-    expect(store.storedChannels('beta')).toEqual([C1, G3])
-    expect(store.record().get('beta')).toEqual({
-      declaration: declarationOf(moved),
-      channels: new Map([
-        [C1, { delivery: 'all', set_at: new Date(START_MS).toISOString() }],
-        [G3, { delivery: 'all', set_at: SAMPLE_SET_AT }],
-      ]),
-    })
-    expect(store.record().get('alpha')).toEqual(channelDeliveryRecordOf(baseSeeds()).get('alpha')!)
-    expect(readChannelDeliveryRecord(stateDir)).toEqual(store.record())
-    expect(stateEntries()).toEqual([CHANNEL_DELIVERY_FILE_NAME])
-    expect(logs).toEqual([])
-    assertNoLeak({ logs, files: filesWritten() })
-  })
-
-  test('one set is one write of the whole record held in memory, with the change', async () => {
-    writeChannelDeliveryRecord(stateDir, baseSeeds())
-    const rig = openRig()
-    await rig.clock.advance(5_000)
-
-    rig.store.set('alpha', C1, 'mentions', declarationOf(personaNamed('alpha')))
-
-    expect(rig.writes).toHaveLength(1)
-    expect(rig.writes[0]).toEqual(serializeChannelDelivery(rig.store.record()))
-    expect(rig.store.record().get('alpha')!.channels.get(C1)).toEqual({ delivery: 'mentions', set_at: new Date(START_MS + 5_000).toISOString() })
-    expect(rig.store.record().get('beta')).toEqual(channelDeliveryRecordOf(baseSeeds()).get('beta')!)
-    expectNoLeak(rig)
-  })
-
-  test.each<[string, (rig: Rig, decl: ChannelDeliveryDeclaration) => unknown, string]>([
-    ['a key that is not a persona key', (rig, decl) => rig.store.set('Not A Key', C1, 'all', decl), 'key'],
-    ['a malformed channel ID', (rig, decl) => rig.store.set('alpha', 'c0lower', 'all', decl), 'channel'],
-    ['a delivery that is not a delivery value', (rig, decl) => rig.store.set('alpha', C1, 'none' as DeliveryMode, decl), 'delivery'],
-    ['a declaration missing a field', (rig, decl) => rig.store.set('alpha', C1, 'all', { name: decl.name } as ChannelDeliveryDeclaration), 'declaration'],
-    ['a clock that gives no timestamp', (rig, decl) => {
-      rig.clock = { ...rig.clock, now: () => Number.NaN }
-      return rig.store.set('alpha', C1, 'all', decl)
-    }, 'set_at'],
-  ])('only an accepted set creates a missing file: %s is refused with no write and no file', (_label, act, field) => {
-    const decl = declarationOf(personaNamed('alpha'))
-    const rig = openRig()
-
-    const refused = act(rig, decl)
-
-    expect(refused).toEqual({ kind: CHANNEL_DELIVERY_SET_INVALID, field })
-    expect(rig.writes).toEqual([])
-    expect(stateEntries()).toEqual([])
-
-    rig.clock = createFakeClock({ start: START_MS })
-    expect(rig.store.set('alpha', C1, 'all', decl).kind).toBe(CHANNEL_DELIVERY_SET_STORED)
-    expect(stateEntries()).toEqual([CHANNEL_DELIVERY_FILE_NAME])
-    expectNoLeak(rig, { refused })
-  })
-
-  test('no store operation returns a promise', () => {
-    writeChannelDeliveryRecord(stateDir, baseSeeds())
-    const alpha = personaNamed('alpha')
-    const rig = openRig()
-    const store = rig.store
-    const results: unknown[] = [
-      store.storedChoice('alpha', C1),
-      store.storedChannels('alpha'),
-      store.record(),
-      store.set('alpha', C1, 'mentions', declarationOf(alpha)),
-      store.drop([{ key: 'beta', reason: CHANNEL_DELIVERY_DROP_NOT_APPLIED }]),
-      store.hasUnwrittenDrop('beta'),
-      store.writeUnwrittenDrops(),
-      store.applyStartRules(startOf([alpha])),
-      store.beginRetiring(['alpha']),
-      store.isRetiring('alpha'),
-      store.endRetiring(['alpha']),
+  function membershipHistory(authority: SharedChannelAuthority): unknown[] {
+    const store = createChannelDeliveryStore(authority, () => true)
+    return [
+      observe(authority, 'alpha', C.primary, true, 'EvJOIN1'),
+      applyMembershipPage(authority, 'alpha', [C.secondary, C.third], 'first'),
+      store.attempt('alpha', authority.incarnation('alpha')!, deliveryAttempt('equivalent-attempt', C.secondary, 'thread_hybrid'), () => undefined),
+      observe(authority, 'beta', C.primary, true, 'EvJOIN2'),
+      observe(authority, 'alpha', C.secondary, false, 'EvLEAVE1'),
+      observe(authority, 'alpha', C.primary, false, 'EvLEAVE2'),
+      observe(authority, 'alpha', C.secondary, true, 'EvREJOIN1'),
+      observe(authority, 'alpha', C.secondary, true, 'EvREJOIN1'),
+      applyMembershipPage(authority, 'alpha', [C.third, C.fourth], 'second'),
+      authority.transactMembership('alpha', authority.revision, () => { throw new Error('refused') }),
+      authority.transactMembership('alpha', authority.revision - 1, () => { throw new Error('must not run') }),
     ]
+  }
 
-    for (const result of results) expect(typeof (result as { then?: unknown } | undefined)?.then).toBe('undefined')
-    expectNoLeak(rig, { results })
-  })
-})
-
-describe('a failed set leaves memory and the file as they were', () => {
-  /** The failed-write line of a set of `alpha` in C1. */
-  const setLine = (detail: string): string => channelDeliveryWriteFailedLine(filePath(), channelDeliverySetAction('alpha', C1), detail, false)
-
-  test.each(BEFORE_RENAME.map((failure) => [failure.step, failure] as const))('a failure at %s, before the rename: write-failed, memory and the file\'s bytes unchanged, no temporary file, one line', (_step, failure) => {
-    writeChannelDeliveryRecord(stateDir, baseSeeds())
-    const before = fileBytes()
-    const rig = openRig({ failures: [failure] })
-
-    const result = rig.store.set('alpha', C1, 'mentions', declarationOf(personaNamed('alpha')))
-
-    expect(result).toEqual({ kind: CHANNEL_DELIVERY_SET_WRITE_FAILED, path: filePath() })
-    expect(rig.store.record()).toEqual(channelDeliveryRecordOf(baseSeeds()))
-    expect(rig.store.storedChoice('alpha', C1)).toBe('all')
-    expect(fileBytes()).toEqual(before)
-    expect(stateEntries()).toEqual([CHANNEL_DELIVERY_FILE_NAME])
-    expect(rig.logs).toHaveLength(1)
-    expectWriteFailedLine(rig.logs[0]!, setLine, [rig.thrown[0]!])
-    expectNoLeak(rig, { result })
+  test('a membership history commits the bytes, outcomes, publications and observer order of whole-state transactions', () => {
+    const runs = [false, true].map(whole => {
+      const run = historyRun(join(root, whole ? 'whole' : 'narrow'), whole)
+      return { ...run, results: membershipHistory(run.authority) }
+    })
+    const [narrow, whole] = runs as [typeof runs[0], typeof runs[0]]
+    expect(narrow.results).toEqual(whole.results)
+    expect(narrow.results.map(result => (result as { kind: string }).kind)).toEqual(['applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'failed', 'stale'])
+    expect(narrow.writes).toEqual(whole.writes)
+    expect(narrow.seen).toEqual(whole.seen)
+    // Every publication follows its durable write.
+    for (const entry of narrow.seen.filter(entry => (entry as unknown[])[0] !== 'watch')) expect((entry as number[])[1]).toBe((entry as number[])[2])
+    expect(narrow.authority.snapshot()).toEqual(whole.authority.snapshot())
+    expect(readFileSync(narrow.authority.path)).toEqual(readFileSync(whole.authority.path))
+    expect(parseSharedChannelState(readFileSync(narrow.authority.path), narrow.authority.path)).toEqual(narrow.authority.snapshot())
+    check([narrow.seen, narrow.authority.snapshot()])
   })
 
-  test.each<[string, readonly FsFailure[]]>([
-    ['the directory\'s fsync fails', [UNSYNCED]],
-    ['the directory\'s open fails', [{ step: 'openSync', call: 2 }]],
-  ])('an unsynced rename (%s): the replaced bytes are written back, memory unchanged, one line', (_label, failures) => {
-    writeChannelDeliveryRecord(stateDir, baseSeeds())
-    const before = fileBytes()
-    const rig = openRig({ failures })
-
-    const result = rig.store.set('alpha', C1, 'mentions', declarationOf(personaNamed('alpha')))
-
-    expect(result).toEqual({ kind: CHANNEL_DELIVERY_SET_WRITE_FAILED, path: filePath() })
-    expect(rig.writes).toHaveLength(2)
-    expect(rig.writes[1]).toEqual(before!)
-    expect(fileBytes()).toEqual(before)
-    expect(stateEntries()).toEqual([CHANNEL_DELIVERY_FILE_NAME])
-    expect(rig.store.record()).toEqual(channelDeliveryRecordOf(baseSeeds()))
-    expect(rig.logs).toHaveLength(1)
-    expect(rig.thrown).toHaveLength(1)
-    expectWriteFailedLine(rig.logs[0]!, setLine, rig.thrown)
-    expectNoLeak(rig, { result })
-  })
-
-  test('an unsynced rename whose write-back\'s directory fsync fails too: the bytes written back, memory unchanged, one line reporting the write-back done without its code; the next unsynced set writes back the same bytes', () => {
-    writeChannelDeliveryRecord(stateDir, baseSeeds())
-    const before = fileBytes()
-    const alpha = declarationOf(personaNamed('alpha'))
-    const [head, tail] = lineParts(setLine) as [string, string]
-    const detailOf = (line: string): string => line.slice(head.length, line.length - tail.length)
-    // The store's own line for a write-back that synced, from a store of its own over the same file.
-    const synced = openRig({ failures: [UNSYNCED] })
-    synced.store.set('alpha', C1, 'mentions', alpha)
-    expect(fileBytes()).toEqual(before)
-    const writtenBack = synced.logs[0]!
-    const rig = openRig({ failures: [UNSYNCED, { step: 'fsyncSync', call: 4, code: 'ENOSPC' }] })
-
-    const result = rig.store.set('alpha', C1, 'mentions', alpha)
-
-    expect(result).toEqual({ kind: CHANNEL_DELIVERY_SET_WRITE_FAILED, path: filePath() })
-    expect(rig.writes).toHaveLength(2)
-    expect(rig.writes[1]).toEqual(before!)
-    expect(fileBytes()).toEqual(before)
-    expect(stateEntries()).toEqual([CHANNEL_DELIVERY_FILE_NAME])
-    expect(rig.store.record()).toEqual(channelDeliveryRecordOf(baseSeeds()))
-    expect(rig.thrown.map((err) => err.code)).toEqual(['EIO', 'ENOSPC'])
-    expect(rig.logs).toHaveLength(1)
-    // The line names the first failure's code, then the written-back branch,
-    // extended; the write-back's own code is not in it (its bytes were
-    // restored), so it is not the branch whose putting back failed.
-    expectWriteFailedLine(rig.logs[0]!, setLine, [rig.thrown[0]!])
-    const detail = detailOf(rig.logs[0]!)
-    expect(detail.startsWith(detailOf(writtenBack))).toBe(true)
-    expect(detail.length).toBeGreaterThan(detailOf(writtenBack).length)
-    expect(detail).not.toContain(errnoSuffix(rig.thrown[1]!))
-
-    // The bytes the store believes the file holds are still the original ones.
-    rig.fail(UNSYNCED)
-    expect(rig.store.set('alpha', C1, 'mentions', alpha).kind).toBe(CHANNEL_DELIVERY_SET_WRITE_FAILED)
-    expect(rig.writes).toHaveLength(4)
-    expect(rig.writes[3]).toEqual(before!)
-    expect(fileBytes()).toEqual(before)
-    expect(rig.logs[1]).toBe(writtenBack)
-    expectNoLeak(rig, { result, synced: synced.logs })
-  })
-
-  test('an unsynced rename over a file that did not exist: the file removed again, nothing in memory, one line', () => {
-    const rig = openRig({ failures: [UNSYNCED] })
-
-    const result = rig.store.set('alpha', C1, 'mentions', declarationOf(personaNamed('alpha')))
-
-    expect(result).toEqual({ kind: CHANNEL_DELIVERY_SET_WRITE_FAILED, path: filePath() })
-    expect(stateEntries()).toEqual([])
-    expect(rig.store.record().size).toBe(0)
-    expect(rig.logs).toHaveLength(1)
-    expectWriteFailedLine(rig.logs[0]!, setLine, [rig.thrown[0]!])
-    expectNoLeak(rig, { result })
-  })
-
-  test.each<[string, boolean, FsFailure]>([
-    ['the previous record\'s write-back fails', true, { step: 'renameSync', call: 2, code: 'ENOSPC' }],
-    ['removing the file, absent before, fails', false, { step: 'unlinkSync', call: 1, code: 'EBUSY' }],
-  ])('an unsynced rename whose putting back fails (%s): both codes in the one line, the refused choice on disk and not in memory, read by a fresh load, replaced by the next successful write', (_label, seeded, backFailure) => {
-    if (seeded) writeChannelDeliveryRecord(stateDir, baseSeeds())
-    const before = seeded ? channelDeliveryRecordOf(baseSeeds()) : new Map()
-    const rig = openRig({ failures: [UNSYNCED, backFailure] })
-
-    const result = rig.store.set('alpha', C1, 'mentions', declarationOf(personaNamed('alpha')))
-
-    expect(result).toEqual({ kind: CHANNEL_DELIVERY_SET_WRITE_FAILED, path: filePath() })
-    expect(rig.logs).toHaveLength(1)
-    expect(rig.thrown).toHaveLength(2)
-    expectWriteFailedLine(rig.logs[0]!, setLine, rig.thrown)
-    expect(rig.store.record()).toEqual(before)
-    expect(readChannelDeliveryRecord(stateDir)!.get('alpha')!.channels.get(C1)!.delivery).toBe('mentions')
-    // A restart before the next successful write reads the refused choice.
-    const fresh = openRig()
-    expect(fresh.store.storedChoice('alpha', C1)).toBe('mentions')
-
-    rig.fail()
-    expect(rig.store.set('beta', C2, 'mentions', declarationOf(personaNamed('beta'))).kind).toBe(CHANNEL_DELIVERY_SET_STORED)
-    expect(fileBytes()).toEqual(serializeChannelDelivery(rig.store.record()))
-    expect(readChannelDeliveryRecord(stateDir)!.get('alpha')?.channels.get(C1)?.delivery).toBe(seeded ? 'all' : undefined)
-    expectNoLeak(rig, { result, fresh: fresh.logs })
-  })
-
-  // gives no exact text: the one pin of the failed-write line, each
-  // variant's detail typed here, every other case building it with the builder.
-  test('pin: the failed-write line of a set, of a set whose write-back failed too, and of a drop; each names the file, the action and the codes, and none names a choice', () => {
-    writeChannelDeliveryRecord(stateDir, baseSeeds())
-    const rig = openRig({ failures: [{ step: 'renameSync' }] })
-    const alpha = declarationOf(personaNamed('alpha'))
-    const path = filePath()
-
-    rig.store.set('alpha', C1, 'mentions', alpha)
-    rig.fail(UNSYNCED, { step: 'renameSync', call: 2, code: 'ENOSPC' })
-    rig.store.set('alpha', C1, 'mentions', alpha)
-    rig.fail({ step: 'renameSync' })
-    rig.store.drop([{ key: 'beta', reason: CHANNEL_DELIVERY_DROP_NOT_APPLIED }])
-
-    const expected = [
-      channelDeliveryWriteFailedLine(path, channelDeliverySetAction('alpha', C1), ' (EIO); the file is unchanged', false),
-      channelDeliveryWriteFailedLine(
-        path,
-        channelDeliverySetAction('alpha', C1),
-        ': the record was written but its directory could not be synced (EIO); putting the previous state back failed too (ENOSPC), so the file holds the refused choice until the next successful write',
-        false,
-      ),
-      channelDeliveryDropLine('beta', 1, CHANNEL_DELIVERY_DROP_NOT_APPLIED),
-      channelDeliveryWriteFailedLine(path, channelDeliveryDropAction(['beta']), ' (EIO); the file is unchanged', true),
+  test('a batch of mixed observations commits the bytes, outcomes and publications of one application per observation', () => {
+    const batches: Array<[string, (authority: SharedChannelAuthority) => VerifiedSharedMembership[]]> = [
+      ['alpha', a => [membershipObservation(a, 'alpha', C.secondary, true, 'EvB1J2'), membershipObservation(a, 'alpha', C.primary, false, 'EvB1L1'),
+        membershipObservation(a, 'alpha', C.third, true, 'EvB1J3', membershipTimestamp()), membershipObservation(a, 'alpha', C.fourth, true, 'EvB1J4')]],
+      ['alpha', a => [membershipObservation(a, 'alpha', C.primary, true, 'EvB2J1'), membershipObservation(a, 'alpha', C.secondary, true, 'EvB2J2', membershipTimestamp(1000)), membershipObservation(a, 'alpha', C.third, false, 'EvB2L3')]],
+      // An obsolete boundary after an applicable observation refuses the whole batch.
+      ['alpha', a => [membershipObservation(a, 'alpha', C.fifth, true, 'EvB3J5'), { ...membershipObservation(a, 'alpha', C.fourth, false, 'EvB3L4'), boundary: 999 }]],
+      ['beta', a => [membershipObservation(a, 'beta', C.primary, false, 'EvB4L1'), membershipObservation(a, 'beta', C.sixth, true, 'EvB4J6'), membershipObservation(a, 'beta', C.seventh, true, 'EvB4J7')]],
+      ['alpha', a => [membershipObservation(a, 'alpha', C.fourth, false, 'EvB5L4'), membershipObservation(a, 'alpha', C.fifth, true, 'EvB5J5')]],
     ]
-    expect(rig.logs).toEqual(expected)
-    const [set, setBack, , drop] = rig.logs as [string, string, string, string]
-    for (const line of [set, setBack, drop]) {
-      expect(line.startsWith(`${CHANNEL_DELIVERY_LOG_PREFIX} cannot `)).toBe(true)
-      expect(line).toContain(JSON.stringify(path))
-      expect(line).toContain('(EIO)')
-      expect(namesAChoice(line, path)).toBe(false)
+    const runs = [false, true].map(batched => {
+      const run = historyRun(join(root, batched ? 'batched' : 'single'), false)
+      const { authority } = run
+      let minted = 0
+      const mint = () => `minted-${++minted}`
+      const results = batches.map(([key, of]) => {
+        const staged = of(authority), incarnation = authority.incarnation(key)!
+        return authority.transactMembership(key, authority.revision, (next, order) => {
+          const first = order - staged.length + 1
+          if (batched) applySharedMemberships(next, first, key, incarnation, staged, mint)
+          else staged.forEach((observation, index) => applySharedMembership(next, first + index, key, incarnation, observation, mint))
+        }, staged.length)
+      })
+      return { ...run, results, minted }
+    })
+    const [single, batched] = runs as [typeof runs[0], typeof runs[0]]
+    expect(single.results.map(result => result.kind)).toEqual(['applied', 'applied', 'failed', 'applied', 'applied'])
+    expect(batched.results).toEqual(single.results)
+    expect([batched.minted, batched.writes, batched.seen]).toEqual([single.minted, single.writes, single.seen])
+    expect(batched.authority.snapshot()).toEqual(single.authority.snapshot())
+    expect(readFileSync(batched.authority.path)).toEqual(readFileSync(single.authority.path))
+    check([batched.seen, batched.authority.snapshot()])
+  })
+
+  test.each([true, false])('a saved empty source keeps its removal proof after rejoin: reject deletion without writing or publishing (whole=%p)', whole => {
+    const config = input()
+    const alpha = config.personas[0]!
+    alpha.dm = { enabled: false }
+    const channel = alpha.permission_prompts!
+    const writes: Uint8Array[] = []
+    const authority = makeSharedAuthority(root, config, { write(path, bytes) { writes.push(bytes); durableWriteFileSync(path, bytes) } })
+    if (whole) authority.transactMembership = (_key, revision, change, span) => authority.transact(revision, change, span)
+    expect(observe(authority, 'alpha', channel, false, 'EvSOURCELEAVE').kind).toBe('applied')
+    alpha.channels = []; alpha.stop_hook_bootstrap = false
+    const source = configBytes(config)
+    expect(authority.applyReviewed(source, authority.revision).kind).toBe('applied')
+    expect(authority.sourceBytes()).toEqual(source)
+    expect(observe(authority, 'alpha', channel, true, 'EvSOURCEREJOIN').kind).toBe('applied')
+    expect(authority.config().personas[0]!.channels.map(entry => entry.id)).toEqual([channel])
+    expect(authority.snapshot().personas.alpha!.removedDestinations[channel]).toBeDefined()
+    const before = { memory: authority.snapshot(), disk: readFileSync(authority.path), writes: writes.length }
+    const published: unknown[] = []
+    authority.subscribe(config => published.push(config))
+    authority.subscribeThreadView(view => published.push(view.revision))
+
+    expect(authority.transactMembership('alpha', authority.revision, next => {
+      delete next.personas.alpha!.removedDestinations[channel]
+    })).toEqual({ kind: 'failed', revision: before.memory.revision })
+    expect([authority.snapshot(), readFileSync(authority.path), writes.length, published, authority.readable])
+      .toEqual([before.memory, before.disk, before.writes, [], true])
+    const reopened = createSharedChannelAuthority(authority.path, readSharedState(root)!)
+    expect(reopened.snapshot()).toEqual(before.memory)
+    expect(reopened.config()).toEqual(authority.config())
+    check(reopened.snapshot())
+  })
+
+  const eio = () => Object.assign(new Error(sentinelInMessage('disk')), { code: 'EIO' })
+  /** Real durable writes, failing at `fault.at`: the temporary file's open,
+   * write or fsync, the rename, or the directory's open after the rename. */
+  function faultyWrite(fault: { at?: string }) {
+    const fs: DurableWriteFs = {
+      openSync: (path, flags) => { if (fault.at === (flags === 'r' ? 'directory' : 'open')) throw eio(); return openSync(path, flags) },
+      writeSync: (fd, buffer, offset, length) => { if (fault.at === 'write') throw eio(); return writeSync(fd, buffer, offset, length) },
+      fsyncSync: fd => { if (fault.at === 'fsync') throw eio(); fsyncSync(fd) },
+      closeSync: fd => closeSync(fd),
+      renameSync: (from, to) => { if (fault.at === 'rename') throw eio(); renameSync(from, to) },
+      unlinkSync: path => unlinkSync(path),
     }
-    expect(set).toContain(`persona=alpha for channel ${C1}`)
-    expect(setBack).toContain('(ENOSPC)')
-    expect(drop).toContain('write the drop of persona=beta')
-    expect(drop).toContain('the next successful write of the file carries the drop')
-    expectNoLeak(rig)
-  })
-})
-
-describe('the stored-choice file holds the credentials file\'s path, never its content', () => {
-  test('a persona whose credentials file holds fake tokens has a choice stored: the file holds the path and none of the content', () => {
-    const credentials = writeCredentialsFile(join(root, 'secrets'), 'persona.json')
-    const [persona] = personasOf([{ name: 'alpha', credentials_file: credentials }])
-    const rig = openRig()
-
-    expect(rig.store.set(persona!.key, C1, 'all', declarationOf(persona!)).kind).toBe(CHANNEL_DELIVERY_SET_STORED)
-
-    expect(readChannelDeliveryRecord(stateDir)!.get(persona!.key)!.declaration.credentials_file).toBe(credentials)
-    const text = new TextDecoder().decode(fileBytes()!)
-    for (const value of Object.values(makeCredentials())) expect(text).not.toContain(String(value))
-    expectNoLeak(rig, { file: writtenFile(filePath()) })
-  })
-})
-
-// ---------------------------------------------------------------------------
-// S4: drops and unwritten drops
-// ---------------------------------------------------------------------------
-
-describe('drops and unwritten drops', () => {
-  /** The failed-write line of a drop of `keys`. */
-  const dropLine = (keys: readonly string[]) => (detail: string): string =>
-    channelDeliveryWriteFailedLine(filePath(), channelDeliveryDropAction(keys), detail, true)
-
-  test.each<[string, readonly FsFailure[]]>([
-    ['its write succeeds', []],
-    ['its write fails before the rename', [{ step: 'renameSync' }]],
-    ['its rename is unsynced', [UNSYNCED]],
-  ])('a drop removes the key\'s choices from memory at once when %s', (_label, failures) => {
-    writeChannelDeliveryRecord(stateDir, baseSeeds())
-    const rig = openRig({ failures })
-
-    rig.store.drop([{ key: 'alpha', reason: CHANNEL_DELIVERY_DROP_RETIRED }])
-
-    expect(rig.store.storedChoice('alpha', C1)).toBeUndefined()
-    expect(rig.store.storedChannels('alpha')).toEqual([])
-    expect(rig.store.record().has('alpha')).toBe(false)
-    expect(rig.store.storedChoice('beta', G3)).toBe('all')
-    expectNoLeak(rig)
-  })
-
-  test('a batch of keys with different reasons is one write, with one drop line per key', () => {
-    const seeds = { ...baseSeeds(), gamma: seedFor(personaNamed('gamma'), { [C1]: { delivery: 'all' } }) }
-    writeChannelDeliveryRecord(stateDir, seeds)
-    const rig = openRig()
-
-    const outcome = rig.store.drop([
-      { key: 'alpha', reason: CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED },
-      { key: 'beta', reason: CHANNEL_DELIVERY_DROP_RETIRED },
-    ])
-
-    expect(outcome).toBe(CHANNEL_DELIVERY_WRITTEN)
-    expect(rig.writes).toHaveLength(1)
-    expect(rig.logs).toEqual([
-      channelDeliveryDropLine('alpha', 2, CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED),
-      channelDeliveryDropLine('beta', 1, CHANNEL_DELIVERY_DROP_RETIRED),
-    ])
-    expect(readChannelDeliveryRecord(stateDir)).toEqual(new Map([['gamma', channelDeliveryRecordOf(seeds).get('gamma')!]]))
-    expectNoLeak(rig)
-  })
-
-  test('a key named twice in a batch is dropped once, with its first reason', () => {
-    writeChannelDeliveryRecord(stateDir, baseSeeds())
-    const rig = openRig()
-
-    rig.store.drop([
-      { key: 'alpha', reason: CHANNEL_DELIVERY_DROP_RETIRED },
-      { key: 'alpha', reason: CHANNEL_DELIVERY_DROP_NOT_APPLIED },
-    ])
-
-    expect(rig.logs).toEqual([channelDeliveryDropLine('alpha', 2, CHANNEL_DELIVERY_DROP_RETIRED)])
-    expect(rig.writes).toHaveLength(1)
-    expectNoLeak(rig)
-  })
-
-  test('a batch holding an unknown reason throws a RangeError before any change: memory, the file and the log as they were', () => {
-    writeChannelDeliveryRecord(stateDir, baseSeeds())
-    const before = fileBytes()
-    const rig = openRig()
-
-    const thrown = thrownBy(() =>
-      rig.store.drop([
-        { key: 'alpha', reason: CHANNEL_DELIVERY_DROP_RETIRED },
-        { key: 'beta', reason: 'unknown' as ChannelDeliveryDropReason },
-      ]),
-    )
-
-    expect(thrown).toBeInstanceOf(RangeError)
-    expect(rig.store.record()).toEqual(channelDeliveryRecordOf(baseSeeds()))
-    expect(rig.store.hasUnwrittenDrop('alpha')).toBe(false)
-    expect(rig.writes).toEqual([])
-    expect(rig.logs).toEqual([])
-    expect(fileBytes()).toEqual(before)
-    expectNoLeak(rig, { thrown })
-  })
-
-  test.each<[string, boolean]>([
-    ['over a file', true],
-    ['with no file, which it never creates', false],
-  ])('a drop of a key with no entries writes and logs nothing, %s', (_label, seeded) => {
-    if (seeded) writeChannelDeliveryRecord(stateDir, baseSeeds())
-    const before = fileBytes()
-    const rig = openRig()
-
-    expect(rig.store.drop([{ key: 'gamma', reason: CHANNEL_DELIVERY_DROP_NOT_APPLIED }])).toBe(CHANNEL_DELIVERY_NOTHING_TO_WRITE)
-
-    expect(rig.writes).toEqual([])
-    expect(rig.logs).toEqual([])
-    expect(fileBytes()).toEqual(before)
-    expect(rig.store.hasUnwrittenDrop('gamma')).toBe(false)
-    expectNoLeak(rig)
-  })
-
-  test.each<[string, FsFailure]>([
-    ['a write that fails before the rename', { step: 'renameSync' }],
-    ['an unsynced rename', UNSYNCED],
-  ])('%s: the drop lines, then one failed-write line naming the file and the keys; each key left with an unwritten drop', (_label, failure) => {
-    const seeds = { ...baseSeeds(), gamma: seedFor(personaNamed('gamma'), { [C1]: { delivery: 'all' } }) }
-    writeChannelDeliveryRecord(stateDir, seeds)
-    const rig = openRig({ failures: [failure] })
-
-    const outcome = rig.store.drop([
-      { key: 'beta', reason: CHANNEL_DELIVERY_DROP_NOT_APPLIED },
-      { key: 'alpha', reason: CHANNEL_DELIVERY_DROP_RETIRED },
-    ])
-
-    expect(outcome).toBe(CHANNEL_DELIVERY_WRITE_FAILED)
-    expect(rig.logs).toHaveLength(3)
-    expect(rig.logs.slice(0, 2)).toEqual([
-      channelDeliveryDropLine('beta', 1, CHANNEL_DELIVERY_DROP_NOT_APPLIED),
-      channelDeliveryDropLine('alpha', 2, CHANNEL_DELIVERY_DROP_RETIRED),
-    ])
-    expectWriteFailedLine(rig.logs[2]!, dropLine(['alpha', 'beta']), [rig.thrown[0]!])
-    expect(['alpha', 'beta', 'gamma'].map((key) => rig.store.hasUnwrittenDrop(key))).toEqual([true, true, false])
-    // A drop's failed write writes nothing back.
-    expect(rig.writes).toHaveLength(1)
-    expectNoLeak(rig, { outcome })
-  })
-
-  test.each<[string, (rig: Rig) => unknown]>([
-    ['an accepted set of another key', (rig) => rig.store.set('beta', C1, 'mentions', declarationOf(personaNamed('beta')))],
-    ['writeUnwrittenDrops', (rig) => rig.store.writeUnwrittenDrops()],
-  ])('after a failed drop write, the next successful write (%s) leaves no entry of the key on disk and clears its unwritten drop', (_label, act) => {
-    writeChannelDeliveryRecord(stateDir, baseSeeds())
-    const rig = openRig({ failures: [{ step: 'renameSync' }] })
-    rig.store.drop([{ key: 'alpha', reason: CHANNEL_DELIVERY_DROP_RETIRED }])
-    expect(readChannelDeliveryRecord(stateDir)!.has('alpha')).toBe(true)
-    rig.fail()
-
-    const result = act(rig)
-
-    expect(rig.writes).toHaveLength(2)
-    expect(readChannelDeliveryRecord(stateDir)!.has('alpha')).toBe(false)
-    expect(rig.store.hasUnwrittenDrop('alpha')).toBe(false)
-    expect(fileBytes()).toEqual(serializeChannelDelivery(rig.store.record()))
-    expectNoLeak(rig, { result })
-  })
-
-  test('writeUnwrittenDrops with nothing pending writes and logs nothing', () => {
-    writeChannelDeliveryRecord(stateDir, baseSeeds())
-    const rig = openRig()
-
-    expect(rig.store.writeUnwrittenDrops()).toBe(CHANNEL_DELIVERY_NOTHING_TO_WRITE)
-
-    expect(rig.writes).toEqual([])
-    expect(rig.logs).toEqual([])
-    expectNoLeak(rig)
-  })
-
-  test.each<[string, FsFailure]>([
-    ['fails before the rename', { step: 'writeSync' }],
-    ['has an unsynced rename', UNSYNCED],
-  ])('writeUnwrittenDrops that %s keeps the unwritten drops and logs one failed-write line', (_label, failure) => {
-    writeChannelDeliveryRecord(stateDir, baseSeeds())
-    const rig = openRig({ failures: [{ step: 'renameSync' }] })
-    rig.store.drop([{ key: 'alpha', reason: CHANNEL_DELIVERY_DROP_RETIRED }])
-    const linesBefore = rig.logs.length
-    rig.fail(failure)
-
-    expect(rig.store.writeUnwrittenDrops()).toBe(CHANNEL_DELIVERY_WRITE_FAILED)
-
-    expect(rig.store.hasUnwrittenDrop('alpha')).toBe(true)
-    expect(rig.logs).toHaveLength(linesBefore + 1)
-    expectWriteFailedLine(rig.logs.at(-1)!, dropLine(['alpha']), [rig.thrown.at(-1)!])
-    expectNoLeak(rig)
-  })
-
-  test.each(CHANNEL_DELIVERY_DROP_REASONS.map((reason) => [reason] as const))('a drop for "%s" logs one line per key that lost entries, built with the drop-line builder', (reason) => {
-    writeChannelDeliveryRecord(stateDir, baseSeeds())
-    const rig = openRig()
-
-    rig.store.drop([{ key: 'alpha', reason }, { key: 'gamma', reason }])
-
-    expect(rig.logs).toEqual([channelDeliveryDropLine('alpha', 2, reason)])
-    expectNoLeak(rig)
-  })
-
-  // gives no exact text: the one pin of the drop line.
-  test('pin: the drop line is its builder\'s, and names the key, the number of channels and the reason, and never a choice', () => {
-    writeChannelDeliveryRecord(stateDir, baseSeeds())
-    const rig = openRig()
-
-    rig.store.drop([{ key: 'alpha', reason: CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED }, { key: 'beta', reason: CHANNEL_DELIVERY_DROP_NOT_APPLIED }])
-
-    expect(rig.logs).toEqual([
-      channelDeliveryDropLine('alpha', 2, CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED),
-      channelDeliveryDropLine('beta', 1, CHANNEL_DELIVERY_DROP_NOT_APPLIED),
-    ])
-    const [alpha, beta] = rig.logs as [string, string]
-    expect(alpha.startsWith(CHANNEL_DELIVERY_LOG_PREFIX)).toBe(true)
-    expect(alpha).toContain('persona=alpha')
-    expect(alpha).toContain('in 2 channels')
-    expect(alpha).toContain(CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED)
-    expect(beta).toContain('persona=beta')
-    expect(beta).toContain('in 1 channel:')
-    expect(beta).toContain(CHANNEL_DELIVERY_DROP_NOT_APPLIED)
-    for (const line of rig.logs) expect(namesAChoice(line, filePath())).toBe(false)
-    expectNoLeak(rig)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// S5: the start rules
-// ---------------------------------------------------------------------------
-
-describe('the start rules (beside)', () => {
-  /** A start's personas: `keep` (always applied, unchanged) and the subject `alpha`, both on disk. */
-  function startPersonas(): { keep: Persona; alpha: Persona } {
-    const [keep, alpha] = personasOf([{ name: 'keep' }, { name: 'alpha' }])
-    return { keep: onDisk(keep!), alpha: onDisk(alpha!) }
+    return (path: string, bytes: Uint8Array) => durableWriteFileSync(path, bytes, fs)
   }
+  test.each(['open', 'write', 'fsync', 'rename', 'directory'] as const)('a membership write failing at %s leaves durable and memory state consistent and retryable, as a whole-state one does', at => {
+    const [narrow, whole] = [false, true].map(routed => {
+      const fault: { at?: string } = {}
+      const dir = join(root, routed ? 'whole' : 'narrow')
+      const { authority, seen } = historyRun(dir, routed, faultyWrite(fault))
+      expect(observe(authority, 'alpha', C.primary, true, 'EvSETUP').kind).toBe('applied')
+      const before = { disk: readFileSync(authority.path), memory: authority.snapshot(), seen: seen.length }
+      fault.at = at
+      const failed = observe(authority, 'alpha', C.secondary, true, 'EvFAULT')
+      const after = { failed, readable: authority.readable, cause: authority.unreadableCause, failure: authority.failure,
+        disk: readFileSync(authority.path), memory: authority.snapshot(), temporary: readdirSync(dir).filter(name => name.endsWith('.tmp')), seen: seen.slice(before.seen) }
+      // Memory never runs ahead of a failed or uncertain write.
+      expect(after.memory).toEqual(before.memory)
+      if (at === 'directory') {
+        expect([failed.kind, after.readable, after.disk.equals(before.disk)]).toEqual(['unresolved', false, false])
+      } else {
+        expect([failed, after.readable, after.disk]).toEqual([{ kind: 'failed', revision: before.memory.revision }, true, before.disk])
+      }
+      expect(after.temporary).toEqual([])
+      fault.at = undefined
+      const retried = at === 'directory' ? authority.recoverDurability() : observe(authority, 'alpha', C.secondary, true, 'EvFAULT')
+      expect(retried).toEqual({ kind: 'applied', revision: before.memory.revision + 1 })
+      expect(parseSharedChannelState(readFileSync(authority.path), authority.path)).toEqual(authority.snapshot())
+      return { after, retried, final: readFileSync(authority.path), memory: authority.snapshot(), seen: seen.slice(before.seen) }
+    })
+    expect(narrow).toEqual(whole!)
+    check(narrow)
+  })
 
-  /** The seeds of a start: `keep` and `alpha` as recorded, each in two channels. */
-  function startSeeds(keep: Persona, alpha: Persona): Record<string, ChannelDeliveryPersonaSeed> {
-    return {
-      keep: seedFor(keep, { [C1]: { delivery: 'all' }, [G3]: { delivery: 'mentions', set_at: EARLIER_SET_AT } }),
-      alpha: seedFor(alpha, { [C1]: { delivery: 'all' }, [C2]: { delivery: 'all' } }),
+  test.each<[string, (next: SharedChannelState, order: number) => void]>([
+    ['throws after writing its own persona', (next, order) => { applySharedMembership(next, order, 'alpha', next.personas['alpha']!.incarnation, membershipJoin(C.additional)); throw new Error('refused') }],
+    ['changes a committed record in place', next => { next.personas['alpha']!.membership[C.primary]!.member = false }],
+    ['writes another persona', (next, order) => { next.personas['beta']!.assignments[C.additional] = { delivery: 'off', order } }],
+    ['replaces a shared field', next => { next.pendingIntent = { forged: true } }],
+    ['changes its incarnation', next => { next.personas['alpha']!.incarnation = 'forged-life' }],
+    ['changes its applied entry beyond channels', next => { (next.applied['personas'] as Record<string, unknown>[])[0]!['permission_prompts'] = C.additional }],
+    ['writes an invalid record', (next, order) => { next.personas['alpha']!.membership[C.additional] = { member: true, boundary: order, identity: '' } }],
+  ])('a membership transaction that %s fails, writes and publishes nothing, and stays retryable', (_case, change) => {
+    const writes: Uint8Array[] = []
+    const authority = makeSharedAuthority(root, input(), { write(path, bytes) { writes.push(bytes); durableWriteFileSync(path, bytes) } })
+    expect(observe(authority, 'alpha', C.primary, true, 'EvSETUP').kind).toBe('applied')
+    const before = { memory: authority.snapshot(), disk: readFileSync(authority.path), writes: writes.length }
+    const published: unknown[] = []
+    authority.subscribe(config => published.push(config)); authority.subscribeThreadView(view => published.push(view.revision))
+    expect(authority.transactMembership('alpha', authority.revision, change)).toEqual({ kind: 'failed', revision: before.memory.revision })
+    expect([authority.snapshot(), readFileSync(authority.path), writes.length, published, authority.readable]).toEqual([before.memory, before.disk, before.writes, [], true])
+    expect(observe(authority, 'alpha', C.secondary, true, 'EvRETRY')).toEqual({ kind: 'applied', revision: before.memory.revision + 1 })
+    expect(readSharedState(root)).toEqual(authority.snapshot())
+    check(authority.snapshot())
+  })
+
+  test('committed state is frozen: a retained draft cannot change what was published', () => {
+    const authority = makeSharedAuthority(root, input())
+    let kept: SharedChannelState | undefined
+    expect(authority.transactMembership('alpha', authority.revision, (next, order) => {
+      kept = next
+      applySharedMembership(next, order, 'alpha', authority.incarnation('alpha')!, membershipJoin(C.secondary))
+    }).kind).toBe('applied')
+    const committed = authority.snapshot()
+    expect(() => { kept!.personas['alpha']!.membership[C.secondary]!.member = false }).toThrow(TypeError)
+    expect(() => { kept!.personas['beta']!.assignments = {} }).toThrow(TypeError)
+    expect(() => { kept!.pendingIntent['forged'] = true }).toThrow(TypeError)
+    // Readers still get detached copies they may change.
+    const copy = authority.snapshot(); copy.personas['alpha']!.membership = {}
+    expect([authority.snapshot(), readSharedState(root)]).toEqual([committed, committed])
+    check(committed)
+  })
+
+  test('live membership outcomes preserve untouched records beside SR8_SHARED_LIST_CHANNELS channels per persona', () => {
+    const authority = makeSharedAuthority(root, input())
+    const ids = channelPopulation(SR8_SHARED_LIST_CHANNELS).map(channel => channel.id)
+    for (const key of ['alpha', 'beta']) {
+      expect(authority.transact(authority.revision, (next, order) => {
+        let position = order - ids.length
+        for (const channel of ids) applySharedMembership(next, ++position, key, authority.incarnation(key)!, { ...membershipJoin(channel, `scan:setup:${channel}`), channelType: 'channel', isExtSharedChannel: false })
+      }, ids.length).kind).toBe('applied')
     }
-  }
+    const before = authority.snapshot()
+    const outcomes = [...ids.slice(1, 6).map(channel => observe(authority, 'alpha', channel, false, `EvLEAVE${channel}`)),
+      ...ids.slice(1, 6).map(channel => observe(authority, 'alpha', channel, true, `EvREJOIN${channel}`))]
+    expect(authority.personaSnapshot('beta')).toEqual(before.personas.beta)
+    outcomes.push(observe(authority, 'beta', C.additional, true, 'EvBETA'))
+    expect(outcomes.map(outcome => outcome.kind)).toEqual(Array(11).fill('applied'))
+    for (const key of ['alpha', 'beta']) {
+      const setup = `scan:setup:${ids[0]}`
+      expect(authority.personaSnapshot(key)!.membershipEvents[setup]).toEqual(before.personas[key]!.membershipEvents[setup])
+    }
+    expect(readSharedState(root)).toEqual(authority.snapshot())
+    check(authority.snapshot())
+  })
 
-  /** A start scenario: the applied personas (by the recorded `alpha` and `keep`) and the retired-key record. */
-  interface Scenario {
-    applied: (keep: Persona, alpha: Persona) => Persona[]
-    retired?: Readonly<Record<string, RetiredKeySeed>>
-  }
+  // Integration test 44 covers large-list writes and growth under load.
+  test('membership commits beside SR8_SHARED_LIST_CHANNELS channels per persona write the native pretty JSON of each state', () => {
+    function populated(dir: string, whole: boolean) {
+      mkdirSync(dir)
+      const config = input(); config.channel_mode = 'open'
+      const state = initialSharedState(root, config)
+      writeSharedState(dir, state)
+      const writes: Buffer[] = []
+      let since = 0
+      const authority = createSharedChannelAuthority(sharedChannelPath(dir), state, {
+        write(path, bytes) { writes.push(Buffer.from(bytes)); durableWriteFileSync(path, bytes) }, threadHybridSince: () => `since-${++since}`,
+      })
+      const ids = channelPopulation(SR8_SHARED_LIST_CHANNELS).map(channel => channel.id)
+      for (const key of ['alpha', 'beta']) {
+        expect(authority.transact(authority.revision, (next, order) => {
+          let position = order - ids.length
+          for (const channel of ids) applySharedMembership(next, ++position, key, authority.incarnation(key)!, { ...membershipJoin(channel, `scan:setup:${channel}`), channelType: 'channel', isExtSharedChannel: false })
+        }, ids.length).kind).toBe('applied')
+      }
+      if (whole) authority.transactMembership = (key, revision, change, span) => authority.transact(revision, change, span)
+      return { authority, writes, ids }
+    }
+    const steps = (authority: SharedChannelAuthority, ids: string[]): Array<[string, () => unknown]> => {
+      const store = createChannelDeliveryStore(authority, () => true)
+      return [
+        // A membership update after installing the initial population.
+        ['first', () => observe(authority, 'alpha', ids[0]!, false, 'EvFIRST')],
+        ...ids.slice(1, 6).map((channel): [string, () => unknown] => ['membership', () => observe(authority, 'alpha', channel, false, `EvLEAVE${channel}`)]),
+        ['membership', () => applyMembershipPage(authority, 'beta', [C.primary, C.secondary, ids[7]!], 'beta')],
+        ...ids.slice(1, 4).map((channel): [string, () => unknown] => ['membership', () => observe(authority, 'alpha', channel, true, `EvREJOIN${channel}`)]),
+        ['duplicate', () => observe(authority, 'alpha', ids[1]!, true, `EvREJOIN${ids[1]}`)],
+        ['refused', () => authority.transactMembership('alpha', authority.revision, () => { throw new Error('refused') })],
+        ['membership', () => applyMembershipPage(authority, 'alpha', [C.secondary], 'alpha')],
+        ['attempt', () => store.attempt('alpha', authority.incarnation('alpha')!, deliveryAttempt('encoded-attempt', C.secondary, 'thread_hybrid'), () => undefined)],
+        ['first', () => observe(authority, 'beta', ids[8]!, false, 'EvAFTERATTEMPT')],
+        ['membership', () => observe(authority, 'alpha', C.additional, true, 'EvNEW')],
+        ['membership', () => observe(authority, 'beta', ids[8]!, true, 'EvREJOINBETA')],
+      ]
+    }
+    const runs = [false, true].map(whole => {
+      const { authority, writes, ids } = populated(join(root, whole ? 'whole' : 'narrow'), whole)
+      const start = writes.length
+      const measured: Array<{ kind: string; writes: number }> = []
+      const results: unknown[] = []
+      for (const [kind, step] of steps(authority, ids)) {
+        const before = writes.length
+        results.push(step())
+        measured.push({ kind, writes: writes.length - before })
+        if (writes.length > before) expect(writes.at(-1)!.toString()).toBe(JSON.stringify(authority.snapshot(), null, 2) + '\n')
+      }
+      return { authority, results, writes: writes.slice(start), measured }
+    })
+    const [narrow, whole] = runs as [typeof runs[0], typeof runs[0]]
+    expect(narrow.results.map(result => (result as { kind: string }).kind)).toEqual([
+      'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'applied', 'failed', 'applied', 'applied', 'applied', 'applied', 'applied'])
+    expect(narrow.results).toEqual(whole.results)
+    expect(narrow.writes).toEqual(whole.writes)
+    expect(readFileSync(narrow.authority.path)).toEqual(readFileSync(whole.authority.path))
+    const steady = (run: typeof narrow) => run.measured.filter(step => step.kind === 'membership')
+    for (const run of [narrow, whole]) {
+      expect(steady(run).every(step => step.writes === 1)).toBe(true)
+      expect(run.measured.filter(step => step.kind === 'duplicate' || step.kind === 'refused').map(step => step.writes)).toEqual([0, 0])
+    }
+    check(narrow.authority.snapshot())
+  })
 
-  const DROPPED: Array<[string, Scenario, ChannelDeliveryDropReason]> = [
-    ['an orphan key', { applied: (keep) => [keep] }, CHANNEL_DELIVERY_DROP_NOT_APPLIED],
-    ['an applied key whose name changed only in case', { applied: (keep, alpha) => [keep, { ...alpha, name: 'Alpha' }] }, CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED],
-    ['an applied key whose credentials_file changed', {
-      applied: (keep, alpha) => [keep, { ...alpha, credentials_file: writeCredentialsFile(join(root, 'other'), 'credentials.json') }],
-    }, CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED],
-    ['an applied key whose working_directory changed', {
-      applied: (keep, alpha) => {
-        const other = join(root, 'other-work')
-        mkdirSync(other)
-        return [keep, { ...alpha, working_directory: other }]
-      },
-    }, CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED],
-    ['an applied key held in the retired-key record with new_life_begun_at null', {
-      applied: (keep, alpha) => [keep, alpha],
-      retired: { alpha: { cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY } },
-    }, CHANNEL_DELIVERY_DROP_RETIRED],
+  test('commits give each configuration reader its own copy of the configuration they validated, and call configuration-free listeners in subscription order with none', () => {
+    const dir = join(root, 'listeners'); mkdirSync(dir)
+    const config = input(); config.channel_mode = 'open'
+    const state = initialSharedState(root, config)
+    writeSharedState(dir, state)
+    const authority = createSharedChannelAuthority(sharedChannelPath(dir), state, { threadHybridSince: () => 'since' })
+    type Config = ReturnType<typeof authority.config>
+    const calls: Array<[string, number]> = [], received: Array<{ config: Config; state: SharedChannelState }> = []
+    const reader = (name: string) => (config: Config) => { calls.push([name, 1]); received.push({ config, state: authority.snapshot() }) }
+    authority.subscribe(reader('first'))
+    authority.subscribeChange((...args: unknown[]) => { calls.push(['plain', args.length]) })
+    authority.subscribe(reader('second'))
+    const late = authority.subscribeChange((...args: unknown[]) => { calls.push(['late', args.length]) })
+    const publish = reader('publish')
+    const beta = (next: SharedChannelState, order: number) => applySharedMembership(next, order, 'beta', authority.incarnation('beta')!, membershipJoin(C.third, 'EvBETA'))
+    const results = [
+      observe(authority, 'alpha', C.primary, true, 'EvJOIN'),
+      authority.transact(authority.revision, beta, 1, publish),
+      // A metadata commit publishes the configuration but notifies no listener.
+      authority.transact(authority.revision, next => { next.threadMemoryCreated = { alpha: true } }, 1, publish),
+      (() => { late(); return observe(authority, 'alpha', C.primary, false, 'EvLEAVE') })(),
+    ]
+    expect(results.map(result => result.kind)).toEqual(['applied', 'applied', 'applied', 'applied'])
+    const first: [string, number] = ['first', 1], plain: [string, number] = ['plain', 0], second: [string, number] = ['second', 1], publisher: [string, number] = ['publish', 1]
+    expect(calls).toEqual([first, plain, second, ['late', 0], publisher, first, plain, second, ['late', 0], publisher, first, plain, second])
+    // Every recipient owns its configuration: what parsing the installed state gives.
+    const configs = received.map(({ config }) => config)
+    expect(new Set(configs).size).toBe(configs.length)
+    expect(new Set(configs.map(config => config.personas[0])).size).toBe(configs.length)
+    expect(new Set(received.map(({ state }) => state.revision)).size).toBe(4)
+    for (const { config, state } of received) expect(config).toEqual(sharedAppliedConfig(state, authority.path))
+    configs[0]!.personas.length = 0
+    expect(configs[1]!.personas).toHaveLength(2)
+    check(authority.snapshot())
+  })
+
+  function openAuthority(name: string) {
+    const dir = join(root, name); mkdirSync(dir)
+    const config = input(); config.channel_mode = 'open'
+    const state = initialSharedState(root, config)
+    writeSharedState(dir, state)
+    return createSharedChannelAuthority(sharedChannelPath(dir), state, { threadHybridSince: () => 'since' })
+  }
+  const joinBeta = (authority: SharedChannelAuthority) => (next: SharedChannelState, order: number) =>
+    applySharedMembership(next, order, 'beta', authority.incarnation('beta')!, membershipJoin(C.third, 'EvBETA'))
+
+  // review-r1 R2: commits took their listeners before the publisher and the
+  // thread-view callbacks ran, as the old path did after them, so a listener
+  // those callbacks removed still ran and one they added did not.
+  test('a commit notifies the listeners subscribed once its publisher and thread-view callbacks have run, each reader with its own configuration', () => {
+    const authority = openAuthority('boundary')
+    type Config = ReturnType<typeof authority.config>
+    const calls: string[] = [], received: Array<{ name: string; config: Config; state: SharedChannelState }> = []
+    const reader = (name: string) => (config: Config) => { calls.push(name); received.push({ name, config, state: authority.snapshot() }) }
+    const plain = (name: string) => () => { calls.push(name) }
+    let phase = ''
+    const removedByPublisher = authority.subscribe(reader('removed by publisher'))
+    const removedByView = authority.subscribeChange(plain('removed by view'))
+    const kept = authority.subscribe(reader('kept'))
+    authority.subscribeThreadView(() => {
+      calls.push(`view: ${phase}`)
+      if (phase === 'publisher commit') { removedByView(); authority.subscribe(reader('added by view')) }
+      else { kept(); authority.subscribeChange(plain('added by view again')) }
+    })
+    const publish = (config: Config) => {
+      calls.push('publisher')
+      received.push({ name: 'publisher', config, state: authority.snapshot() })
+      removedByPublisher(); authority.subscribeChange(plain('added by publisher')); authority.subscribe(reader('reader added by publisher'))
+      config.personas.length = 0
+    }
+    phase = 'publisher commit'
+    expect(authority.transact(authority.revision, joinBeta(authority), 1, publish).kind).toBe('applied')
+    const first = calls.splice(0)
+    phase = 'membership commit'
+    expect(observe(authority, 'alpha', C.primary, true, 'EvJOIN').kind).toBe('applied')
+    // The old path's recipients: the listeners as subscribed after both callbacks.
+    expect([first, calls]).toEqual([
+      ['publisher', 'view: publisher commit', 'kept', 'added by publisher', 'reader added by publisher', 'added by view'],
+      ['view: membership commit', 'added by publisher', 'reader added by publisher', 'added by view', 'added by view again'],
+    ])
+    // Each recipient owns what parsing its installed state gives; the publisher changed only its own copy.
+    const configs = received.map(({ config }) => config)
+    expect(new Set(configs).size).toBe(configs.length)
+    expect(received.map(({ name, state }) => [name, state.revision])).toEqual([['publisher', 2], ['kept', 2], ['reader added by publisher', 2], ['added by view', 2], ['reader added by publisher', 3], ['added by view', 3]])
+    expect(configs[0]!.personas).toHaveLength(0)
+    for (const { config, state } of received.slice(1)) expect(config).toEqual(sharedAppliedConfig(state, authority.path))
+    check(authority.snapshot())
+  })
+
+  test('a publisher\'s configuration is its own when it subscribes the commit\'s only reader', () => {
+    const authority = openAuthority('lone-publisher')
+    type Config = ReturnType<typeof authority.config>
+    const published: Config[] = [], read: Config[] = []
+    expect(authority.transact(authority.revision, joinBeta(authority), 1, config => {
+      published.push(config)
+      authority.subscribe(config => read.push(config))
+      config.personas.length = 0
+    }).kind).toBe('applied')
+    expect(read).toHaveLength(1)
+    expect(read[0]).not.toBe(published[0])
+    expect(read[0]).toEqual(sharedAppliedConfig(authority.snapshot(), authority.path))
+    expect(read[0]!.personas).toHaveLength(2)
+  })
+
+  // review-r1 R1 sweep: a membership commit reused a committed object's
+  // encoding without reading it again, so a hook a draft installed ran only
+  // when first encoded, or never, where the old path's whole encoding ran it
+  // at every commit. review-r2 R2: an own `toJSON`, enumerable or not, on a
+  // copied object or array. Counts and bytes are the old path's (HEAD).
+  const hooks: Array<[string, (next: SharedChannelState, call: () => void) => void, number[]]> = [
+    ['an enumerable accessor on a copied map', (next, call) => {
+      const membership = next.personas['alpha']!.membership, record = membership[C.primary]
+      Object.defineProperty(membership, C.primary, { get() { call(); return record }, enumerable: true, configurable: true })
+    }, [4, 1, 1]],
+    ['a non-enumerable toJSON getter on a copied map', (next, call) => {
+      Object.defineProperty(next.personas['alpha']!.membership, 'toJSON', { get() { call(); return undefined }, enumerable: false, configurable: true })
+    }, [1, 1, 1]],
+    ['a non-enumerable toJSON method on a copied map', (next, call) => {
+      Object.defineProperty(next.personas['alpha']!.membership, 'toJSON', { value() { call(); return {} }, enumerable: false, configurable: true })
+    }, [1, 1, 1]],
+    ['a non-enumerable toJSON method on a copied array', (next, call) => {
+      Object.defineProperty(next.applied['personas'], 'toJSON', { value(this: unknown[]) { call(); return Array.from(this) }, enumerable: false, configurable: true })
+    }, [2, 0, 0]],
   ]
-
-  test.each(DROPPED)('%s is dropped at start, in one write, with one line naming its reason; the kept key\'s entries are unchanged', (_label, scenario, reason) => {
-    const { keep, alpha } = startPersonas()
-    const seeds = startSeeds(keep, alpha)
-    writeChannelDeliveryRecord(stateDir, seeds)
-
-    const rig = openRig({ start: startOf(scenario.applied(keep, alpha), scenario.retired) })
-
-    expect(rig.writes).toHaveLength(1)
-    expect(rig.logs).toEqual([channelDeliveryDropLine('alpha', 2, reason)])
-    expect(rig.store.record().has('alpha')).toBe(false)
-    expect(readChannelDeliveryRecord(stateDir)).toEqual(new Map([['keep', channelDeliveryRecordOf(seeds).get('keep')!]]))
-    expectOnlyRemoved(rig.store, seeds)
-    expectNoLeak(rig)
-  })
-
-  const KEPT: Array<[string, Scenario]> = [
-    ['a key held in the retired-key record with its mark set', {
-      applied: (keep, alpha) => [keep, alpha],
-      retired: { alpha: { cause: RETIRED_KEY_CAUSE_REMOVED, mark: true } },
-    }],
-    ['a working_directory given through a symlink to the same directory', {
-      applied: (keep, alpha) => {
-        const link = join(root, 'links', 'work')
-        mkdirSync(dirname(link), { recursive: true })
-        symlinkSync(alpha.working_directory, link)
-        return [keep, { ...alpha, working_directory: link }]
-      },
-    }],
-    ['a credentials_file given through a symlink to the same file', {
-      applied: (keep, alpha) => {
-        const link = join(root, 'links', 'credentials.json')
-        mkdirSync(dirname(link), { recursive: true })
-        symlinkSync(alpha.credentials_file, link)
-        return [keep, { ...alpha, credentials_file: link }]
-      },
-    }],
-    ['both paths respelled with the same real paths', {
-      applied: (keep, alpha) => [keep, {
-        ...alpha,
-        working_directory: `${alpha.working_directory}/../${basename(alpha.working_directory)}/`,
-        credentials_file: `${dirname(alpha.credentials_file)}/./${basename(alpha.credentials_file)}`,
-      }],
-    }],
-  ]
-
-  test.each(KEPT)('%s keeps the entries byte-identical: no write, no line', (_label, scenario) => {
-    const { keep, alpha } = startPersonas()
-    const seeds = startSeeds(keep, alpha)
-    writeChannelDeliveryRecord(stateDir, seeds)
-    const before = fileBytes()
-
-    const rig = openRig({ start: startOf(scenario.applied(keep, alpha), scenario.retired) })
-
-    expect(rig.writes).toEqual([])
-    expect(rig.logs).toEqual([])
-    expect(fileBytes()).toEqual(before)
-    expect(rig.store.record()).toEqual(channelDeliveryRecordOf(seeds))
-    expectNoLeak(rig)
-  })
-
-  test('a path respelled through a symlink whose target later changes reads as changed at the next start and is dropped', () => {
-    const { keep, alpha } = startPersonas()
-    const seeds = startSeeds(keep, alpha)
-    writeChannelDeliveryRecord(stateDir, seeds)
-    const link = join(root, 'links', 'work')
-    mkdirSync(dirname(link), { recursive: true })
-    symlinkSync(alpha.working_directory, link)
-    const respelled = { ...alpha, working_directory: link }
-
-    const first = openRig({ start: startOf([keep, respelled]) })
-    expect(first.logs).toEqual([])
-
-    const retargeted = join(root, 'retargeted')
-    mkdirSync(retargeted)
-    rmSync(link)
-    symlinkSync(retargeted, link)
-    const second = openRig({ start: startOf([keep, respelled]) })
-
-    expect(second.logs).toEqual([channelDeliveryDropLine('alpha', 2, CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED)])
-    expect(readChannelDeliveryRecord(stateDir)!.has('alpha')).toBe(false)
-    expectOnlyRemoved(second.store, seeds)
-    expectNoLeak(second, { first: first.logs })
-  })
-
-  test.each<[string, Scenario, ChannelDeliveryDropReason]>([
-    ['an orphan key also held unmarked in the retired-key record is dropped as not applied', {
-      applied: (keep) => [keep],
-      retired: { alpha: { cause: RETIRED_KEY_CAUSE_REMOVED } },
-    }, CHANNEL_DELIVERY_DROP_NOT_APPLIED],
-    ['a changed declaration also held unmarked in the retired-key record is dropped as declaration changed', {
-      applied: (keep, alpha) => [keep, { ...alpha, name: 'Alpha' }],
-      retired: { alpha: { cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY } },
-    }, CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED],
-  ])('precedence: %s, with exactly one line', (_label, scenario, reason) => {
-    const { keep, alpha } = startPersonas()
-    writeChannelDeliveryRecord(stateDir, startSeeds(keep, alpha))
-
-    const rig = openRig({ start: startOf(scenario.applied(keep, alpha), scenario.retired) })
-
-    expect(rig.logs).toEqual([channelDeliveryDropLine('alpha', 2, reason)])
-    expect(rig.writes).toHaveLength(1)
-    expectNoLeak(rig)
-  })
-
-  test.each<[string, boolean]>([
-    ['a declarative', false],
-    ['a fungible', true],
-  ])('applied personas from %s configuration give the same result', (_label, fungible) => {
-    const [keep, alpha, beta] = personasOf([{ name: 'keep' }, { name: 'alpha' }, { name: 'beta' }], fungible).map(onDisk)
-    const seeds = {
-      ...startSeeds(keep!, alpha!),
-      beta: seedFor(beta!, { [C2]: { delivery: 'mentions' } }),
-      gone: seedFor(personaNamed('gone'), { [G3]: { delivery: 'all' } }),
-    }
-    writeChannelDeliveryRecord(stateDir, seeds)
-
-    const rig = openRig({ start: startOf([keep!, { ...alpha!, name: 'Alpha' }, beta!], { beta: { cause: RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY } }) })
-
-    expect(rig.logs).toEqual([
-      channelDeliveryDropLine('alpha', 2, CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED),
-      channelDeliveryDropLine('beta', 1, CHANNEL_DELIVERY_DROP_RETIRED),
-      channelDeliveryDropLine('gone', 1, CHANNEL_DELIVERY_DROP_NOT_APPLIED),
-    ])
-    expect(rig.writes).toHaveLength(1)
-    expect(readChannelDeliveryRecord(stateDir)).toEqual(new Map([['keep', channelDeliveryRecordOf(seeds).get('keep')!]]))
-    expectNoLeak(rig)
-  })
-
-  test.each<[string, boolean]>([
-    ['a file whose every key matches its applied persona', true],
-    ['a missing file', false],
-  ])('when nothing matches (%s): no write, no line, the bytes unchanged', (_label, seeded) => {
-    const { keep, alpha } = startPersonas()
-    if (seeded) writeChannelDeliveryRecord(stateDir, startSeeds(keep, alpha))
-    const before = fileBytes()
-
-    const rig = openRig({ start: startOf([keep, alpha], { other: { cause: RETIRED_KEY_CAUSE_REMOVED } }) })
-
-    expect(rig.writes).toEqual([])
-    expect(rig.logs).toEqual([])
-    expect(fileBytes()).toEqual(before)
-    expect(stateEntries()).toEqual(seeded ? [CHANNEL_DELIVERY_FILE_NAME] : [])
-    expectNoLeak(rig)
-  })
-
-  test('a failed start-rule write logs the drop lines and one failed-write line, and leaves each dropped key with an unwritten drop', () => {
-    const { keep, alpha } = startPersonas()
-    const seeds = { ...startSeeds(keep, alpha), gone: seedFor(personaNamed('gone'), { [G3]: { delivery: 'all' } }) }
-    writeChannelDeliveryRecord(stateDir, seeds)
-    const before = fileBytes()
-
-    const rig = openRig({ start: startOf([keep, { ...alpha, name: 'Alpha' }]), failures: [{ step: 'renameSync' }] })
-
-    expect(rig.logs).toHaveLength(3)
-    expect(rig.logs.slice(0, 2)).toEqual([
-      channelDeliveryDropLine('alpha', 2, CHANNEL_DELIVERY_DROP_DECLARATION_CHANGED),
-      channelDeliveryDropLine('gone', 1, CHANNEL_DELIVERY_DROP_NOT_APPLIED),
-    ])
-    expectWriteFailedLine(
-      rig.logs[2]!,
-      (detail) => channelDeliveryWriteFailedLine(filePath(), channelDeliveryDropAction(['alpha', 'gone']), detail, true),
-      [rig.thrown[0]!],
-    )
-    expect(['alpha', 'gone', 'keep'].map((key) => rig.store.hasUnwrittenDrop(key))).toEqual([true, true, false])
-    expect(rig.store.record()).toEqual(new Map([['keep', channelDeliveryRecordOf(seeds).get('keep')!]]))
-    expect(fileBytes()).toEqual(before)
-    expectNoLeak(rig)
+  test.each(hooks)('%s runs at each later commit\'s encoding as the native encoder of the whole state ran it, with its bytes', (_, install, expected) => {
+    const authority = makeSharedAuthority(root, input())
+    expect(observe(authority, 'alpha', C.primary, true, 'EvJOIN1').kind).toBe('applied')
+    let calls = 0
+    const call = () => { calls++ }
+    const counted = (step: () => { kind: string }) => { const before = calls; expect(step().kind).toBe('applied'); return calls - before }
+    const perCommit = [counted(() => authority.transactMembership('alpha', authority.revision, (next, order) => {
+      applySharedMembership(next, order, 'alpha', authority.incarnation('alpha')!, membershipJoin(C.secondary))
+      install(next, call)
+    }))]
+    for (const [channel, event] of [[C.third, 'EvBETA3'], [C.fourth, 'EvBETA4']] as const) perCommit.push(counted(() => observe(authority, 'beta', channel, true, event)))
+    expect(perCommit).toEqual(expected)
+    // The bytes the native encoder gives the installed state: alpha's committed life as it encodes, hooks run.
+    const state = authority.snapshot()
+    state.personas['alpha'] = JSON.parse(JSON.stringify(authority.inspectMembershipHistory('alpha', life => life as never)))
+    expect(readFileSync(authority.path).toString()).toBe(JSON.stringify(state, null, 2) + '\n')
   })
 })
-
-// ---------------------------------------------------------------------------
-// S6: the in-memory retiring-key set (store part)
-// ---------------------------------------------------------------------------
-
-describe('the store\'s retiring keys are held in memory only', () => {
-  test.each<[string, boolean]>([
-    ['a readable store', true],
-    ['an unreadable store', false],
-  ])('%s: a key is retiring from beginRetiring until endRetiring, other keys are not, nothing is written or logged, and a fresh store has none', (_label, readable) => {
-    writeChannelDeliveryRecord(stateDir, baseSeeds())
-    const readFs: Partial<PersonaConfigFs> | undefined = readable ? undefined : { readFileFd: () => { throw injected('EIO', 'read') } }
-    const rig = openRig({ readFs })
-    expect(rig.store.readable).toBe(readable)
-    const linesAtLoad = [...rig.logs]
-    const before = fileBytes()
-
-    rig.store.beginRetiring(['alpha', 'beta'])
-    const begun = ['alpha', 'beta', 'gamma'].map((key) => rig.store.isRetiring(key))
-    rig.store.endRetiring(['alpha'])
-    const ended = ['alpha', 'beta', 'gamma'].map((key) => rig.store.isRetiring(key))
-
-    expect(begun).toEqual([true, true, false])
-    expect(ended).toEqual([false, true, false])
-    expect(rig.writes).toEqual([])
-    expect(rig.logs).toEqual(linesAtLoad)
-    expect(fileBytes()).toEqual(before)
-
-    // The readable store writes the file while `beta` is retiring.
-    if (readable) expect(rig.store.set('gamma', C1, 'all', declarationOf(personaNamed('gamma'))).kind).toBe(CHANNEL_DELIVERY_SET_STORED)
-    const fresh = openRig()
-
-    expect(fresh.store.readable).toBe(true)
-    expect(['alpha', 'beta', 'gamma'].map((key) => fresh.store.isRetiring(key))).toEqual([false, false, false])
-    expectNoLeak(rig, { fresh: fresh.logs })
+test('attempt identifiers preserve exact code units and cannot collide after Unicode replacement or trimming', () => {
+  const values = ['retained', ' retained ', '\ud800', '\ufffd', '😀', '😀 ']
+  const keys = values.map(id => {
+    expect(validChannelDeliveryAttemptId(id)).toBe(true)
+    return botAttemptKey(botAttemptBinding('alpha', 'same-life', deliveryAttempt(id, C.primary, 'all')))
   })
+  expect(new Set(keys).size).toBe(values.length)
+  expect(validChannelDeliveryAttemptId(' \r\n\t')).toBe(false)
+  assertNoLeak(keys)
 })

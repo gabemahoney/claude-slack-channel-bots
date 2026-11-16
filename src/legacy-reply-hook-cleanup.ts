@@ -36,7 +36,7 @@ export function removeLegacyReplyHooks(dirs: readonly (string | undefined)[], lo
     }
     const path = join(real, 'settings.json')
     try {
-      const doc: unknown = JSON.parse(readPersonaConfigBytes(path).toString('utf8'))
+      const doc: unknown = JSON.parse(readPersonaConfigBytes(path, undefined, { uncapped: false }).toString('utf8'))
       if (!object(doc) || !object(doc.hooks) || !Array.isArray(doc.hooks.Stop)) continue
       let changed = false
       const groups: unknown[] = []

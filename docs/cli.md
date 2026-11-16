@@ -14,35 +14,23 @@ missing prerequisite: config.json not found at <path>, and no config.json.last-a
 
 `start` reads no Slack token. The server checks the configuration, and each persona's credentials file, once it runs.
 
-The server first runs the agent-director startup gate: it imports `agent-director`, constructs the singleton Client (which probes the system binary's version and refuses a binary below the client's own minimum), reads the binary's version from the built client and refuses a binary below CSCB's Phase 1 floor, and verifies `~/.config/agent-director/state.db` is owned by the current user. Failures land in `startup-errors.log` (see [Startup errors](troubleshooting.md#startup-errors)). agent-director enforces tmux availability at spawn time. The server then loads the configuration and starts listening. With a last-applied record it runs the record; without one it checks `config.json`, records it and applies it (see [Reload](reload.md#reload)). Only then does it write its PID to `STATE_DIR/server.pid`. Conversation context is preserved across server restarts when possible.
+The server first runs the agent-director startup gate: it refuses a binary below the agent-director client's own minimum or below CSCB's Phase 1 floor, and checks that `~/.config/agent-director/state.db` is owned by the current user. Failures land in `startup-errors.log` (see [Startup errors](troubleshooting.md#startup-errors)); agent-director enforces tmux availability at spawn time.
+
+The server then loads the configuration and starts listening. With a last-applied record it runs the record; without one it checks `config.json`, records it and applies it (see [Reload](reload.md#reload)). Only then does it write its PID to `STATE_DIR/server.pid`; conversation context is preserved across server restarts when possible.
 
 `start` waits up to 30 seconds for that PID file. The outcomes are:
 
-- **The server is up:** `start` prints this line and exits 0.
+- **The server is up:** `start` prints `[slack] Server starting in background (PID 12345)` and exits 0.
+- **The server exits during startup:** `start` exits 1. It prints `[slack] Server failed to start (exit code 1). From <path>/server.log:`, followed by the last lines (at most 20) the server wrote there, which carry the server's own reason.
+- **The server is still starting after 30 seconds:** `start` exits 0 and leaves it running, printing `[slack] Server is still starting in the background (PID 12345) after 30s — its log is <path>/server.log`.
 
-  ```
-  [slack] Server starting in background (PID 12345)
-  ```
+At a start with no last-applied record, an invalid configuration stops the start. The server writes `[slack] Fatal: configuration error —` and the loader's message to `server.log` and exits, so `start` shows the same line and exits 1.
 
-- **The server exits during startup:** `start` exits 1. It prints why the server stopped, followed by the last lines (at most 20) the server wrote to `server.log`, which carry the server's own reason:
+A persona's error names the persona and the field. A configuration from before personas is named by its first pre-persona key, to be rewritten by hand as a `"personas"` array, and a removed key's message names what replaces it. Every message is in [Configuration rejections](../skills/debug-slack-channel-bots/SKILL.md#configuration-rejections).
 
-  ```
-  [slack] Server failed to start (exit code 1). From /home/you/.config/claude-slack-channel-bots/server.log:
-  ```
+A last-applied record that can't be read or is invalid stops the start with `[slack] Fatal: last-applied record error —` and its cause. The line asks you to preserve the record and `config.json` and restore trustworthy evidence; never delete the record (see [The last-applied record can't be read or is invalid](../skills/debug-slack-channel-bots/SKILL.md#the-last-applied-record-cant-be-read-or-is-invalid)).
 
-- **The server is still starting after 30 seconds:** `start` exits 0 and leaves it running.
-
-  ```
-  [slack] Server is still starting in the background (PID 12345) after 30s — its log is /home/you/.config/claude-slack-channel-bots/server.log
-  ```
-
-At a start with no last-applied record, a configuration from before personas stops the start. The server writes the conversion error to `server.log` and exits, so `start` shows the same line on the terminal and exits 1. In `server.log`, where each line is prefixed with a timestamp, it reads:
-
-```
-[slack] Fatal: configuration error — loadPersonaConfig: invalid persona config in "<path>": Persona config validation error: "<key>" belongs to the pre-persona configuration shape, which is no longer accepted. The configuration must be converted to personas: rewrite it by hand as a "personas" array. Nothing is converted automatically and the file has not been changed.
-```
-
-`<key>` is the first pre-persona key found in the file. Any other invalid configuration fails the same way, with a message naming the persona and the field. A last-applied record that can't be read or is invalid stops the start with `[slack] Fatal: last-applied record error —` and the deletion hint, and a record that can't be written stops it with `reload-record-write-failed` (see [Troubleshooting](troubleshooting.md#troubleshooting)). A server that is already running makes the new one exit with `[slack] Server is already running (PID <pid>). Exiting.`, so `start` exits 1.
+A record that can't be written stops the start with `reload-record-write-failed` (see [Troubleshooting](troubleshooting.md#troubleshooting)). A server that is already running makes the new one exit with `[slack] Server is already running (PID <pid>). Exiting.`, so `start` exits 1.
 
 ## `claude-slack-channel-bots stop`
 
@@ -85,7 +73,9 @@ For each persona in the last-applied record (or in `config.json` when there is n
 
 `clean_restart` logs its progress to `STATE_DIR/clean_restart.log`. The lines that end it with an error (config load failure, agent-director initialization failure, a failed precheck, a persona it could not stop, the alert that the server was not started, start failure) are also printed to the terminal, and so is any *Process outlived kill* text from the teardown, even on a run that goes on to start the server.
 
-`clean_restart` loads the last-applied record first, or `config.json` when there is no record, and takes `exit_timeout` from it. If it cannot (a record that can't be read or is invalid, or a missing or pre-persona file), it exits 1 with `[slack] clean_restart: failed to load config:` and the loader's error, and nothing is stopped. For a bad record, the error says that deleting it makes the next start apply `config.json` (see [Reload](reload.md#reload)). `clean_restart` doesn't apply a pending `config.json` edit: the server comes back on the record.
+`clean_restart` loads the last-applied record first, or `config.json` when there is no record, and takes `exit_timeout` from it. If it cannot (a record that can't be read or is invalid, or a missing or pre-persona file), it exits 1 with `[slack] clean_restart: failed to load config:` and the loader's error, and nothing is stopped.
+
+For a bad record, the error is the one `start` prints: preserve the record and `config.json` and restore trustworthy evidence. `clean_restart` doesn't apply a pending `config.json` edit: the server comes back on the record.
 
 A persona whose force-kill succeeds, or whose instance is found already ended, missing or gone, counts as stopped; so does one whose force-kill ends with a *Process outlived kill* text. When every persona is stopped, the server is started and the command exits with the start's status. When a persona can't be stopped, the command prints its line once every persona's teardown has finished, then starts the server only if agent-director answers, and exits 1 either way (see [When `clean_restart` can't stop a bot](#when-clean_restart-cant-stop-a-bot)).
 
@@ -198,7 +188,7 @@ It prints one line on stderr and never repeats its argument:
 | `clear-latch: cleared the latch of persona "<name>" (key=<key>)` | `0` | The persona was held; the hold and its restart limit are cleared. |
 | `clear-latch: persona "<name>" (key=<key>) was not latched; nothing changed` | `0` | The persona was not held, or only by a *Cannot launch* hold, which this command does not end. Its restart limit is unchanged. |
 
-It reaches the server at `127.0.0.1`, at the port the running server recorded in `server.port`, not at the `port` of `config.json`. It connects directly and ignores proxy environment variables such as `HTTP_PROXY`, so its argument never leaves the host. So the server's `bind` must be `127.0.0.1` (the default) or `0.0.0.0`, as scheduled prompts need. On any other `bind` it cannot reach the server, and a hold ends only by the server's own check every 2 minutes, by the persona's teardown (removing it, or a destructive change to it), or by a server restart, which drops every hold.
+It reaches the server at `127.0.0.1`, at the port the running server recorded in `server.port`, not at the `port` of `config.json`. It connects directly and ignores proxy environment variables such as `HTTP_PROXY`, so its argument never leaves the host. So the server's `bind` must be `127.0.0.1` (the default) or `0.0.0.0`. On any other `bind` it cannot reach the server, and a hold ends only by the server's own check every 2 minutes, by the persona's teardown (removing it, or a destructive change to it), or by a server restart, which drops every hold.
 
 It needs no agent-director, reads no configuration file and writes or removes no file.
 

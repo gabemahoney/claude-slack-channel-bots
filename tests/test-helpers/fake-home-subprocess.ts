@@ -8,9 +8,13 @@
  * launched with HOME set to the test's own `mkdtempSync` directory: if the
  * code regresses, only that fake home can be written to.
  *
+ * - Module mode takes `modulePath`, `call` and JSON `input`. Script mode takes
+ *   `scriptPath` and optional `args`, executes it as the real Bun entry, and
+ *   observes the same child's home through a scratch preload under `home`.
+ *   The preload directory is removed on success, refusal or abnormal exit.
  * - The child env is a direct `hostSafeChildEnv` call (host-safe-env.ts):
  *   HOME is the fake home, PATH holds only the directories of
- *   `FAKE_HOME_CHILD_TOOLS` (checked to hold no agent-director entry),
+ *   `tools` (default `FAKE_HOME_CHILD_TOOLS`, checked to hold no agent-director entry),
  *   TMUX_TMPDIR is the helper's per-process temp dir, and SLACK_STATE_DIR
  *   (when given), `env` and the JSON input are its extras. Nothing else from the parent env is
  *   passed on, so the Slack token variables and any other ambient credential
@@ -19,7 +23,8 @@
  *   the launch-time home) throws before any child starts.
  * - The child prints one control line, `HOMEDIR::<path>`, before running the
  *   entry point. The caller asserts `observedHomedir` equals the fake home
- *   before trusting anything else the child did.
+ *   before trusting anything else the child did. `stdout` keeps the control
+ *   line for existing callers; `payloadStdout` removes just that line.
  * - `spawnSync` gets a timeout (30 s by default). A child that hangs, or is
  *   killed by any signal, throws an error naming the signal instead of
  *   blocking the run or passing unnoticed.
@@ -28,18 +33,20 @@
  */
 
 import { spawnSync } from 'node:child_process'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { hostSafeChildEnv, isRealHome } from './host-safe-env.ts'
 
 /** Default bound on one child run. */
 export const FAKE_HOME_SUBPROCESS_TIMEOUT_MS = 30_000
 
 /**
- * Tools the child resolves by name: `bun` runs the eval script, and `sh` is
- * what code under test shells out through (e.g. stop-hook-bootstrap's jq check).
+ * Default tools available to code under test (e.g. stop-hook-bootstrap's
+ * jq check shells out through `sh`). Bun itself starts by absolute path.
  */
 export const FAKE_HOME_CHILD_TOOLS: readonly string[] = Object.freeze(['bun', 'sh'])
 
-export interface FakeHomeRunOptions {
+interface FakeHomeModuleOptions {
   /** Absolute path of the source module to import in the child. */
   modulePath: string
   /**
@@ -49,6 +56,21 @@ export interface FakeHomeRunOptions {
   call: string
   /** JSON-serialisable value handed to `call` as `input`. */
   input: unknown
+  scriptPath?: never
+  args?: never
+}
+
+interface FakeHomeScriptOptions {
+  /** Absolute script entry path; Bun preserves import.meta.main and process.argv. */
+  scriptPath: string
+  /** Arguments after the script path, unchanged. */
+  args?: readonly string[]
+  modulePath?: never
+  call?: never
+  input?: never
+}
+
+export type FakeHomeRunOptions = (FakeHomeModuleOptions | FakeHomeScriptOptions) & {
   /** Launch-time HOME for the child: the test's own temp dir. */
   home: string
   /**
@@ -60,6 +82,8 @@ export interface FakeHomeRunOptions {
   stateDir?: string
   /** More variables for the child (`XDG_CONFIG_HOME`, say); never SLACK_STATE_DIR or the helper's input. */
   env?: Record<string, string>
+  /** Tools resolved by name; defaults to FAKE_HOME_CHILD_TOOLS. Use [] when none are needed. */
+  tools?: readonly string[]
   /** Bound on the child run in ms; defaults to FAKE_HOME_SUBPROCESS_TIMEOUT_MS. */
   timeoutMs?: number
 }
@@ -67,6 +91,8 @@ export interface FakeHomeRunOptions {
 export interface FakeHomeRunResult {
   status: number | null
   stdout: string
+  /** stdout with the helper's one homedir control line removed. */
+  payloadStdout: string
   stderr: string
   /** The child's `homedir()`, from its `HOMEDIR::` control line ('' if absent). */
   observedHomedir: string
@@ -77,33 +103,53 @@ export function runInFakeHome(opts: FakeHomeRunOptions): FakeHomeRunResult {
     throw new Error('runInFakeHome: home must be a temp dir, not the real home dir')
   }
   const timeoutMs = opts.timeoutMs ?? FAKE_HOME_SUBPROCESS_TIMEOUT_MS
-  const script = `
+  const observeHome = `
     const { homedir } = require('node:os');
     process.stdout.write('HOMEDIR::' + homedir() + '\\n');
+  `
+  // A preload observes the entry's own process before it runs, without importing
+  // the entry (which would lose import.meta.main and the original argv).
+  let preloadDir: string | undefined
+  try {
+    let args: string[]
+    if (opts.scriptPath !== undefined) {
+      preloadDir = mkdtempSync(join(opts.home, '.fake-home-preload-'))
+      const preload = join(preloadDir, 'observe-home.cjs')
+      writeFileSync(preload, observeHome)
+      args = ['--preload', preload, opts.scriptPath, ...(opts.args ?? [])]
+    } else {
+      args = ['-e', `${observeHome}
     const input = JSON.parse(process.env.FAKE_HOME_INPUT_JSON);
     const mod = await import(${JSON.stringify(opts.modulePath)});
     ${opts.call}
-  `
-  const res = spawnSync('bun', ['-e', script], {
-    env: hostSafeChildEnv(opts.home, {
-      tools: FAKE_HOME_CHILD_TOOLS,
-      extras: {
-        ...opts.env,
-        ...(opts.stateDir === undefined ? {} : { SLACK_STATE_DIR: opts.stateDir }),
-        FAKE_HOME_INPUT_JSON: JSON.stringify(opts.input),
-      },
-    }),
-    encoding: 'utf-8',
-    timeout: timeoutMs,
-  })
-  const stdout = res.stdout ?? ''
-  const stderr = res.stderr ?? ''
-  if (res.signal !== null || res.error !== undefined) {
-    throw new Error(
-      `runInFakeHome: child did not exit normally (signal=${res.signal ?? 'none'}, ` +
-        `error=${res.error?.message ?? 'none'}, timeout=${timeoutMs} ms)\nstderr:\n${stderr}`,
-    )
+  `]
+    }
+    const res = spawnSync(process.execPath, args, {
+      env: hostSafeChildEnv(opts.home, {
+        tools: opts.tools ?? FAKE_HOME_CHILD_TOOLS,
+        extras: {
+          ...opts.env,
+          ...(opts.stateDir === undefined ? {} : { SLACK_STATE_DIR: opts.stateDir }),
+          ...(opts.scriptPath === undefined ? { FAKE_HOME_INPUT_JSON: JSON.stringify(opts.input) } : {}),
+        },
+      }),
+      encoding: 'utf-8',
+      timeout: timeoutMs,
+    })
+    const stdout = res.stdout ?? ''
+    const stderr = res.stderr ?? ''
+    if (res.signal !== null || res.error !== undefined) {
+      throw new Error(
+        `runInFakeHome: child did not exit normally (signal=${res.signal ?? 'none'}, ` +
+          `error=${res.error?.message ?? 'none'}, timeout=${timeoutMs} ms)\nstderr:\n${stderr}`,
+      )
+    }
+    const m = stdout.match(/^HOMEDIR::(.*)$/m)
+    return {
+      status: res.status, stdout, stderr, observedHomedir: m ? m[1]! : '',
+      payloadStdout: stdout.replace(/^HOMEDIR::.*\r?\n/m, ''),
+    }
+  } finally {
+    if (preloadDir !== undefined) rmSync(preloadDir, { recursive: true, force: true })
   }
-  const m = stdout.match(/^HOMEDIR::(.*)$/m)
-  return { status: res.status, stdout, stderr, observedHomedir: m ? m[1]! : '' }
 }

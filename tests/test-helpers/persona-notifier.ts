@@ -109,6 +109,7 @@ import {
   type UnclassifiedErrorEpisodes,
 } from '../../src/persona-episodes.ts'
 import { recordStartupError } from '../../src/startup-errors.ts'
+import type { OwnPostObserver } from '../../src/own-post.ts'
 import { createFakeClock, type FakeClock } from './fake-clock.ts'
 import { makeStubSlack, type StubSlack, type WebApiOutcome } from './slack-stub.ts'
 
@@ -116,6 +117,7 @@ import { makeStubSlack, type StubSlack, type WebApiOutcome } from './slack-stub.
 export interface NoticePost {
   channel: string
   text: string
+  metadata?: { event_type: string; event_payload: Record<string, never> }
 }
 
 /** The lookups, clock and log `makeNotifierStack` builds the notifier over. */
@@ -137,6 +139,8 @@ export interface NotifierStackDeps {
    * attempt, as `src/server.ts` passes it.
    */
   getPersonaConfig: () => DestinationConfig
+  /** The per-call observer: start before each surfaced Slack post, await its optional ready, then end with Slack's answer, as `src/server.ts` wires it. Default: none. */
+  ownPosts?: OwnPostObserver
 }
 
 /** The notifier and the pieces it was built with. */
@@ -158,7 +162,7 @@ export interface NotifierStack {
 export function makeNotifierStack(deps: NotifierStackDeps): NotifierStack {
   const { getPersona, clientFor, log } = deps
   const clock = deps.clock ?? createFakeClock()
-  const destinations = createPersonaDestinations({ log, clock, getPersonaConfig: deps.getPersonaConfig })
+  const destinations = createPersonaDestinations({ log, clock, getPersonaConfig: deps.getPersonaConfig, ...(deps.ownPosts ? { ownPosts: deps.ownPosts } : {}) })
   const hold = createPersonaDestinationHold({ destinations, getPersona, clientFor, clock, log })
   const notifier = createPersonaNotifier({
     getPersona,
@@ -268,6 +272,8 @@ export interface NotifierHarnessOptions {
    * `config`'s switch (declarative when it has none).
    */
   getPersonaConfig?: () => DestinationConfig
+  /** The per-call own-post observer passed through to the destination resolver. Default: none. */
+  ownPosts?: OwnPostObserver
 }
 
 export interface NotifierHarness {
@@ -321,7 +327,7 @@ const STARTUP_ENTRY_RE = /^\[[^\]]*\] \[([^\]]*)\] (.*)$/
 
 /** Build the real persona notifier over one stub Slack per persona of `config`. */
 export function makeNotifierHarness(
-  config: Pick<PersonaConfig, 'personas'> & Partial<Pick<PersonaConfig, 'allow_invited_channels'>>,
+  config: Pick<PersonaConfig, 'personas'> & Partial<Pick<PersonaConfig, 'channel_mode'>>,
   opts: NotifierHarnessOptions = {},
 ): NotifierHarness {
   const personas = [...config.personas]
@@ -366,7 +372,8 @@ export function makeNotifierHarness(
     isDryRun: () => dryRun,
     log,
     ...(recorder !== undefined ? { recordStartupError: recorder } : {}),
-    getPersonaConfig: opts.getPersonaConfig ?? (() => ({ allow_invited_channels: config.allow_invited_channels === true })),
+    getPersonaConfig: opts.getPersonaConfig ?? (() => ({ channel_mode: config.channel_mode ?? 'strict' })),
+    ownPosts: opts.ownPosts,
   })
 
   function stub(key: string): StubSlack {

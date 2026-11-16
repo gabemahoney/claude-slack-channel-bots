@@ -54,7 +54,7 @@ Argument rules:
 
 ### Testing a candidate agent-director dist
 
-Use `/ci --ad-candidate-dist '/absolute/path/to/dist' test-50` for the
+Use `/ci --ad-candidate-dist '/absolute/path/to/dist' test-68` for the
 synthetic dual-path scenario, or omit SCRIPT to exercise all scripts against
 the overlay. The ordinary `/ci` image and package dependency pins are unchanged.
 Candidate runs use the existing SELECTIVE verdict/exit-code rules (PASS exits
@@ -82,7 +82,7 @@ check is inapplicable to this explicit overlay. CSCB's own runtime floor still
 runs. No npm prerelease publication, host install or package/lockfile edit is
 needed. Ordinary image prerequisites still apply if the base is missing.
 
-Test 50 proves actual legacy transport when the runtime omits `busy_send`,
+Test 68 proves actual legacy transport when the runtime omits `busy_send`,
 and shim-driven `not_covered` / safe `agent_not_covered` fallback on an
 uncovered launch. With a truly covered candidate launch those legacy legs
 are omitted explicitly: changing `get` cannot turn its real native transport
@@ -111,6 +111,52 @@ Run kinds:
   gate result.
 - A candidate-dist run is always reported as selective and is never a gate
   result, including with no SCRIPT arguments.
+
+### Authorized integration evidence across two lanes
+
+When the caller explicitly authorizes complete integration evidence across
+two lanes, follow the [two-lane integration procedure](../../../tests/README.md#two-lane-integration-procedure).
+Recheck the current script listing and runner driver classification, then
+resolve transitive prerequisites before launching:
+
+- **Scheduler:** take scheduler network access into account: select every
+  no-model, non-burst workload in one invocation except Test 13 and Test 47
+  while scheduler jobs run with the network off. Include all recovery groups;
+  do not use `/ad-gate`'s different
+  offline published-release selection.
+- **Local:** while scheduler jobs run with the network off, run Test 13 and
+  Test 47 locally because they install packages from the npm registry. Select
+  one local workload per disposable-container `/ci` invocation and finish it
+  before starting the next. Every other workload keeps its current lane:
+  native model and burst workloads stay local. Native filenames contain
+  `-fmk-real-`; burst workloads are test-44 and every strict/open membership
+  group. Keep native Claude and Codex local, with all existing admission,
+  memory/resource, performance and credential/login guards. An independent
+  selection can use `--shards 1`, including Codex-only.
+
+Every workload must appear in exactly one lane; test-1 is mandatory bootstrap
+repeated in every shard/invocation. If prerequisite closure crosses lanes,
+resolve the execution plan before running. Retain each run's script list,
+commit, diagnostic state, verdict and evidence for the caller to judge
+complete combined coverage under its recorded authorization.
+
+Use existing SCRIPT arguments and the launch/wait/report procedure below.
+Every such invocation stays `SELECTIVE`, including a whole lane or an explicit
+whole-list selection: PASS has reader exit **3**, no default-full success line
+and no valid cap-source claim. No individual selection suffices for the
+integration gate. With no SCRIPT arguments, `/ci` still runs every integration
+script.
+
+### Optional diagnostics
+
+This skill never sets or defaults `CSCB_TEST_DIAGNOSTICS`; leave it unset for
+gate measurements. Only literal value `1` enables optional diagnostics.
+When deliberately supplied in the caller's environment, the runner forwards
+the defined value unchanged, including empty, through bare
+`--env CSCB_TEST_DIAGNOSTICS`; absence adds no option or default. Required
+measurement records and numerical verdicts stay enabled. See
+[optional test diagnostics](../../../tests/README.md#optional-test-diagnostics)
+for disabled behavior and the limited profiling scope.
 
 ## Outcomes and exit codes
 
@@ -547,10 +593,10 @@ the host and fits the run. Every figure below is a runner constant.
 
 | Figure | Value |
 |---|---|
-| CPUs | 2 per shard; all live `/ci` runs together hold at most 12 CI CPUs |
+| CPUs | 2 per shard for the server (`CPUS_PER_SHARD`); test-44 and every strict/open membership-load group use the burst load driver (see the [suite inventory](../../../tests/README.md#layout)). A shard holding any of them adds `DRIVER_CPUS=1` once, with the driver in its separate 0.9-CPU group; it needs `--init`, `--security-opt writable-cgroups=true` and `--cgroupns private`. Before scheduling, admission reserves `2*N + min(N, selected burst-script count)` CPUs. The complete split population needs 12 CPUs for 4 shards; selective limits depend on their selected population. All live `/ci` runs together hold at most 12 CI CPUs |
 | Memory per shard | Ordinary cap: 2 GiB. Each dedicated Codex shard adds 2 GiB (currently 4 GiB), for both memory and memory-swap |
 | Admission margin | 1 GiB |
-| Ceiling C | 85% of the pod memory limit (54.4 GiB on the 64 GiB pod); while a `/ci-live` run is active, the lower of that and 40 GiB, `/ci-live`'s working-set stop line |
+| Ceiling C | 85% of the pod memory limit (54.4 GiB on the 64 GiB pod); while a `/ci-live` run is active, the lower of that and 40 GiB, `/ci-live`'s non-reclaimable memory stop line |
 | Memory fit | pod non-reclaimable memory U + other runs' commitments + N × the ordinary cap + 2 GiB per Codex shard + 1 GiB margin ≤ C |
 | Stop line | C less 0.5 GiB (53.9 GiB, or 39.5 GiB while `/ci-live` runs). The memory watchdog checks U every 30 s and stops the run there |
 | Disk line | 85%: (used + 1 GiB) ÷ (used + available) must stay under it on the volume holding the run directory |
@@ -574,8 +620,9 @@ reservation; reducing ordinary shards does not remove that extra cost.
 The full reservation stays held while Track B waits and after either track
 finishes; early login release does not release or overbook reserved capacity.
 
-Detail: [`docker/README.md`'s Admission: memory, disk and CPU](../../../docker/README.md#admission-memory-disk-and-cpu)
-and [The admission lock, reservations and the sweep](../../../docker/README.md#the-admission-lock-reservations-and-the-sweep).
+Detail: [`docker/README.md`'s Admission: memory, disk and CPU](../../../docker/README.md#admission-memory-disk-and-cpu),
+[The admission lock, reservations and the sweep](../../../docker/README.md#the-admission-lock-reservations-and-the-sweep)
+and [Burst-driver shards](../../../docker/README.md#burst-driver-shards).
 
 ## Refusals and what to do
 
@@ -765,7 +812,7 @@ input is set; this project's host invocation uses the CI family.
 
 ### The base image
 
-The test image is built `FROM` the base image `cscb-ci-base:v9`, the one
+The test image is built `FROM` the base image `cscb-ci-base:v10`, the one
 `docker/Dockerfile.test`'s `FROM` line names. It is built once per host. When
 it is missing, the runner checks its build prerequisites before the
 admission lock, without changing anything, and refuses when one fails:
@@ -803,9 +850,21 @@ Other outcomes print no timing summary; the same items are in the run's
 
 To refresh `tests/ci-durations.tsv`, paste the block's lines (not the
 introducing line) over the whole file and commit it as an ordinary change.
-The runner never writes the table. A `slow:` line does not fail the run; it
-means the table is stale. Detail:
-[`tests/README.md`'s Refreshing the table](../../../tests/README.md#refreshing-the-table).
+The runner never writes the table. Only scripts that actually passed in that
+run supply fresh measurements; carried-forward rows remain estimates.
+
+For authorized evidence across both lanes, follow the
+[measured-row and provenance procedure](../../../tests/README.md#refreshing-the-table).
+After all contributing runs pass on the final source with diagnostics unset,
+merge only their actual printed passed-script rows into one canonical TSV.
+Retain each script/row's lane, run identity, commit and diagnostic state; use
+the highest contributing measured test-1 row, with test-1 passed in every
+contributing shard. Do not guess seconds, divide totals or paste successive
+lane blocks as proof of complete measurement: a later block can carry older
+estimates. Timing rows alone establish no runtime acceptance or default-full
+PASS.
+
+A `slow:` line does not fail the run; it means the table is stale.
 
 ## The cap line
 

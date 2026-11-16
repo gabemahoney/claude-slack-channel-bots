@@ -21,11 +21,11 @@
  * The labels cover credentials refused, Slack unreachable, connection lost
  * and restored, the unclaimed channel and the DM drop, the per-persona start
  * line, the destination failure, the failed credentials change, the
- * unresolvable claude_config_dir, the channel a persona hears in fungible
+ * unresolvable claude_config_dir, the channel a persona hears in open
  * mode, and the channel delivery its agent stores. The channel causes are built here once:
- * `invitedChannelCause`, `channelDeliverySetCause`, `unclaimedChannelCause`
- * for declarative mode, and `fungibleUnclaimedChannelCause` with its exported
- * reason texts for fungible mode. None carries message text, a user ID or a
+ * `openChannelCause`, `channelDeliverySetCause`, `unclaimedChannelCause`
+ * for strict mode, and `fungibleUnclaimedChannelCause` with its exported
+ * reason texts for open mode. None carries message text, a user ID or a
  * token.
  *
  * SPDX-License-Identifier: MIT
@@ -81,11 +81,11 @@ export const PERSONA_DIRECTORY_UNUSABLE = 'persona-directory-unusable'
 
 /**
  * A channel message was not delivered because no persona serves its channel
- * Declarative mode: a message in a
+ * Strict mode: a message in a
  * channel that no applied persona lists, logged by each receiving persona,
  * and not logged when another applied persona lists the channel
- * (`unclaimedChannelCause`). Fungible mode: a `message` event refused on the
- * fungible path, with the reason (`fungibleUnclaimedChannelCause`). The cause
+ * (`unclaimedChannelCause`). Open mode: a `message` event refused on the
+ * open path, with the reason (`fungibleUnclaimedChannelCause`). The cause
  * names the channel.
  */
 export const UNCLAIMED_CHANNEL = 'unclaimed-channel'
@@ -137,25 +137,30 @@ export const PERSONA_CREDENTIALS_CHANGE_FAILED = 'persona-credentials-change-fai
 export const PERSONA_CONFIG_DIR_UNRESOLVABLE = 'persona-config-dir-unresolvable'
 
 /**
- * A persona heard a channel in fungible mode: the
- * first event in the persona's life that took its fungible path for that
+ * A persona heard a channel in open mode: the
+ * first event in the persona's life that took its open path for that
  * channel, delivered or not. Logged once per persona life and channel, to
- * `server.log` only. The cause (`invitedChannelCause`) names the channel ID,
- * `public` or `private`, and the persona's channel delivery there after the
- * loop guard; the line has no path.
+ * `server.log` only. The cause (`openChannelCause`) names the channel ID,
+ * `public` or `private`, and the persona's saved channel delivery
+ * (`off`, `mentions`, `all` or `thread_hybrid`); the line has no path.
  */
-export const PERSONA_INVITED_CHANNEL = 'persona-invited-channel'
+export const PERSONA_OPEN_CHANNEL = 'persona-open-channel'
 
 /**
  * A persona's agent stored a channel delivery with `set_channel_delivery`
- * one line per accepted call, logged after
+ * : one line per new durable application, after
  * the store's write succeeded, to `server.log` only; nothing is posted to
  * Slack. The cause (`channelDeliverySetCause`) names the channel ID, the
  * stored choice before the call (`none` when there was none) and after it,
- * and the persona's channel delivery there after the loop guard; the line
- * has no path.
+ * and the persona's saved channel delivery (`off`, `mentions`, `all` or
+ * `thread_hybrid`); the line has no path.
  */
 export const PERSONA_CHANNEL_DELIVERY_SET = 'persona-channel-delivery-set'
+
+export const PERSONA_THREAD_STAMP_UNDECIDED = 'persona-thread-stamp-undecided'
+export function threadStampUndecidedCause(channel: string): string {
+  return `channel=${safe(channel)}: thread-dependent replies remain unacknowledged until the shared-state restoration is reviewed and applied; finite Slack retries do not guarantee recovery of never-accepted events. Check the app's event subscriptions and resend missing replies after recovery.`
+}
 
 export const MESSAGE_NOT_SAVED = 'message-not-saved'
 export const MESSAGE_RECEIVED = 'message-received'
@@ -171,13 +176,113 @@ export const QUEUE_KEPT = 'queue-kept'
 export const SYSTEM_PROMPT_UNWRITABLE = 'system-prompt-unwritable'
 export const DELIVERY_DIAGNOSTIC_CLASSES = [MESSAGE_NOT_SAVED, MESSAGE_RECEIVED, MESSAGE_DELIVERED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, MESSAGE_PARTIAL_RECEIPT, DELIVERY_STUCK, QUEUE_RECORD_UNREADABLE, QUEUE_UNWRITABLE, QUEUE_KEPT, SYSTEM_PROMPT_UNWRITABLE] as const
 export type DeliveryDiagnosticClass = typeof DELIVERY_DIAGNOSTIC_CLASSES[number]
+export const THREAD_MEMORY_NOT_SAVED = 'thread-memory-not-saved'
+export const THREAD_MEMORY_UNREADABLE = 'thread-memory-unreadable'
+export const THREAD_MEMORY_JOINS_LOST = 'thread-memory-joins-lost'
+export const THREAD_MEMORY_CHANGED_WHILE_STOPPED = 'thread-memory-changed-while-stopped'
+export const THREAD_MEMORY_RECOVERED = 'thread-memory-recovered'
+export const THREAD_MEMORY_QUARANTINED = 'thread-memory-quarantined'
+export const THREAD_MEMORY_COMPACTION_FAILED = 'thread-memory-compaction-failed'
+export const THREAD_MEMORY_COMPACTION_RECOVERED = 'thread-memory-compaction-recovered'
+export const THREAD_MEMORY_REMOVAL_FAILED = 'thread-memory-removal-failed'
+export const THREAD_MEMORY_SEAL_UNREADABLE = 'thread-memory-seal-unreadable'
+export const THREAD_MEMORY_SEAL_NOT_SAVED = 'thread-memory-seal-not-saved'
+export const THREAD_MEMORY_SEAL_SAVED = 'thread-memory-seal-saved'
+export const THREAD_MEMORY_HOLDS_NOT_RESOLVED = 'thread-memory-holds-not-resolved'
+export const THREAD_MEMORY_HOLDS_RESOLVED = 'thread-memory-holds-resolved'
+export const THREAD_MEMORY_DIAGNOSTIC_CLASSES = [
+  THREAD_MEMORY_NOT_SAVED, THREAD_MEMORY_UNREADABLE, THREAD_MEMORY_JOINS_LOST,
+  THREAD_MEMORY_CHANGED_WHILE_STOPPED, THREAD_MEMORY_RECOVERED, THREAD_MEMORY_QUARANTINED,
+  THREAD_MEMORY_COMPACTION_FAILED, THREAD_MEMORY_REMOVAL_FAILED, THREAD_MEMORY_SEAL_UNREADABLE,
+  THREAD_MEMORY_SEAL_NOT_SAVED, THREAD_MEMORY_HOLDS_NOT_RESOLVED,
+  THREAD_MEMORY_COMPACTION_RECOVERED, THREAD_MEMORY_SEAL_SAVED, THREAD_MEMORY_HOLDS_RESOLVED,
+] as const
+export type ThreadMemoryDiagnosticClass = typeof THREAD_MEMORY_DIAGNOSTIC_CLASSES[number]
+export const SHARED_STATE_UNRESOLVED = 'shared-state-unresolved'
+export const MEMBERSHIP_EVIDENCE_UNRESOLVED = 'membership-evidence-unresolved'
+export const SHARED_STATE_RECOVERED = 'shared-state-recovered'
+export const SHARED_STATE_DIAGNOSTIC_CLASSES = [SHARED_STATE_UNRESOLVED, MEMBERSHIP_EVIDENCE_UNRESOLVED, SHARED_STATE_RECOVERED] as const
+export type SharedStateDiagnosticClass = typeof SHARED_STATE_DIAGNOSTIC_CLASSES[number]
+export type SharedStateCause = 'unsynced' | 'evidence-changed' | 'restoration-staged' | 'retirement-unresolved' | 'not-saved'
+export type SharedStateClosing = 'state' | 'evidence' | 'repair'
+export type MembershipHistoryEvidence = 'absence-order' | 'event-history'
+export type MembershipReportProblem = 'deadline' | 'access' | 'authentication' | 'installation-unverified' | 'malformed-page' |
+  'current-membership-missing' | 'eligibility-missing' | 'event-order-conflict'
+export interface SharedStateReportScope {
+  channels: readonly string[]
+  all?: boolean
+  dm?: boolean
+  /** Membership-only reporting: usable means decided (including ineligible),
+   * not unrestricted intake. Staged Channel Stamps still hold dependent replies. */
+  repairPending?: { usable: readonly string[]; held: readonly string[] }
+}
+export interface MembershipReportEvidence {
+  history?: readonly { channel: string; evidence: MembershipHistoryEvidence }[]
+  problem?: MembershipReportProblem
+  slackError?: string
+  nextAttemptAt?: number
+}
+export const SHARED_STATE_SLACK_RETRY_WARNING = 'Messages Slack sent to held channels while this lasted stay unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.'
+export const SHARED_STATE_STAGED_SLACK_RETRY_WARNING = 'Only messages whose intake is held remain unacknowledged. Slack retries each only a limited number of times, so messages never accepted may be lost and should be sent again.'
+/** Keep the configured path separate from identifiers and untrusted failures,
+ * so token-shaped directories remain complete and safely quoted. */
+export function buildSharedStateDiagnostic(kind: SharedStateDiagnosticClass, persona: string, identity: string, detail = '', configuredPath?: string): string {
+  const path = configuredPath === undefined ? '' : ` path=${JSON.stringify(configuredPath).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')}`
+  return `[slack] ${kind}: persona=${safe(persona)} ${safe(identity)}${path}${detail ? ` ${safe(detail)}` : ''}`.replace(/[\u2028\u2029]/g, ' ').trimEnd()
+}
+const sharedScopeIdentity = (scope: SharedStateReportScope, inventory = false): string =>
+  `${inventory ? 'scope=inventory known_channels=' : `${scope.all ? 'scope=all ' : ''}channels=`}${JSON.stringify(scope.channels)}${scope.dm ? ' dm=true' : ''}` +
+  (scope.repairPending ? ` repair_pending=true membership_decided=${JSON.stringify(scope.repairPending.usable)} membership_held=${JSON.stringify(scope.repairPending.held)}` : '')
+export function buildSharedStateUnresolvedLine(key: string, scope: SharedStateReportScope, cause: SharedStateCause, path: string, failure = ''): string {
+  const inventory = cause === 'not-saved' && scope.all === true
+  const next: Record<SharedStateCause, string> = {
+    unsynced: 'finish the write at configuration checks; check disk/filesystem; if evidence changes, existing recovery can still finish when exact pending bytes return and sync succeeds; if recovery cannot finish, use reviewed restoration or explicit replacement and restart',
+    'evidence-changed': 'preserve evidence; existing recovery can still finish without restarting when exact pending bytes return and sync succeeds; if recovery cannot finish, use reviewed restoration or explicit replacement and restart; unrestorable choices must be set again',
+    'restoration-staged': 'restart to review and confirm staged restoration; channel lists describe membership readiness only; thread-dependent replies in thread_hybrid channels stay held and unacknowledged while Channel Stamps are undecided; otherwise eligible @mentions, Broadcasts and other intake independent of Channel Stamps continue',
+    'retirement-unresolved': 'retirement recovery retries at configuration checks; check the state directory disk',
+    'not-saved': (inventory ? 'complete membership inventory not saved; verified usable channels keep working; only intake depending on missing membership evidence stays held and unacknowledged; recovery requires a complete membership inventory; ' : '') +
+      'membership reconciliation retries in the background; check the state directory disk',
+  }
+  return buildSharedStateDiagnostic(SHARED_STATE_UNRESOLVED, key, `cause=${cause} ${sharedScopeIdentity(scope, inventory)}`,
+    `${failure ? `${failure}; ` : ''}${next[cause]}. ${cause === 'restoration-staged' ? SHARED_STATE_STAGED_SLACK_RETRY_WARNING : SHARED_STATE_SLACK_RETRY_WARNING}`, path)
+}
+export function buildMembershipEvidenceUnresolvedLine(key: string, scope: SharedStateReportScope, evidence: MembershipReportEvidence, path: string, failure = ''): string {
+  const history = evidence.history?.map(item => `${item.channel}:${item.evidence}`).join(',') ?? ''
+  return buildSharedStateDiagnostic(MEMBERSHIP_EVIDENCE_UNRESOLVED, key,
+    `cause=${history ? 'history' : 'scan-ended'} ${sharedScopeIdentity(scope)}`,
+    (history ? `missing_evidence=[${history}] ` : '') + (evidence.problem ? `problem=${evidence.problem} ` : '') +
+      (evidence.slackError ? `slack_error=${evidence.slackError} ` : '') +
+      (evidence.nextAttemptAt === undefined ? '' : `next_attempt_at=${evidence.nextAttemptAt} `) +
+    `${failure ? `${failure}; ` : ''}` + (history ? 'history needs explicit absence replacement or reviewed restoration; retries and time cannot settle it. ' :
+      'background scans retry; restore the named access, authorization, installation or membership evidence; retries and time do not establish missing facts. ') + SHARED_STATE_SLACK_RETRY_WARNING, path)
+}
+export function buildSharedStateRecoveredLine(key: string, scope: SharedStateReportScope, closing: SharedStateClosing, path: string, failure = ''): string {
+  return buildSharedStateDiagnostic(SHARED_STATE_RECOVERED, key, `cause=${closing} closed=${closing} ${sharedScopeIdentity(scope)}`,
+    `${failure ? `${failure}; ` : ''}state and current membership trustworthy; held messages are decided now. Slack retries are finite; messages Slack stopped retrying are not recovered.`, path)
+}
 const safe = (text: string): string => redactSlackLogText(text).replace(/[\r\n]/g, ' ')
-/** Explicit metadata allowlist: redaction alone is not message-body exclusion. */
-export function deliveryIdentity(a: Pick<AcceptedRecord, 'source' | 'channel' | 'sender' | 'ts' | 'user' | 'bot_id'>): string {
-  return `source=${a.source} ${a.source === 'slack' ? `chat_id=${JSON.stringify(safe(a.channel ?? ''))}` : `sender=${JSON.stringify(safe(a.sender ?? ''))}`} ts=${JSON.stringify(safe(a.ts))} sender_id=${JSON.stringify(safe(a.user ?? a.bot_id ?? a.sender ?? 'unknown'))}`
+/**
+ * Explicit metadata allowlist: redaction alone is not message-body exclusion.
+ * A Reaction Item names its conversation, its event ts and its reactor, like a
+ * Slack message; it has no injected sender.
+ */
+export function deliveryIdentity(a: Pick<AcceptedRecord, 'source' | 'channel' | 'sender' | 'ts' | 'user' | 'bot_id' | 'via'>): string {
+  return `source=${a.source} ${a.source === 'slack' || a.source === 'reaction' ? `chat_id=${JSON.stringify(safe(a.channel ?? ''))}` : `sender=${JSON.stringify(safe(a.sender ?? ''))}`} ts=${JSON.stringify(safe(a.ts))} sender_id=${JSON.stringify(safe(a.user ?? a.bot_id ?? a.sender ?? 'unknown'))}` +
+    (a.source === 'slack' && a.via === 'thread' ? ' via=thread' : '')
 }
 export function buildDeliveryDiagnostic(kind: DeliveryDiagnosticClass, persona: string, identity: string, detail = ''): string {
   return `[slack] ${kind}: persona=${safe(persona)} ${safe(identity)}${detail ? ` ${safe(detail)}` : ''}`.trimEnd()
+}
+/** Configured paths have their own field: quote them without treating a
+ * token-shaped directory as a credential. All untrusted text stays redacted. */
+export function buildThreadMemoryDiagnostic(kind: ThreadMemoryDiagnosticClass, persona: string, identity: string, detail = '', configuredPath?: string): string {
+  const path = configuredPath === undefined ? '' : ` path=${JSON.stringify(configuredPath).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')}`
+  return `[slack] ${kind}: persona=${safe(persona)}${identity ? ` ${safe(identity)}` : ''}${path}${detail ? ` ${safe(detail)}` : ''}`.trimEnd()
+}
+/** Shared by live intake and released Memory Holds. The caller supplies
+ * describeSlackCallFailure's safe tail, never the thrown value itself. */
+export function buildPostAcceptPreparationFailedLine(failure: string): string {
+  return `[slack] persona-routing: post-accept preparation failed${safe(failure).replace(/[\u2028\u2029]/g, ' ')}`
 }
 export function buildQueuedMessageRetryLine(key: string): string {
   return `[slack] Queued message: persona=${safe(key)} has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one`
@@ -188,7 +293,10 @@ export function queueErrorCode(error: unknown): string {
 
 /** Every persona diagnostic class label, in a fixed order. */
 export const PERSONA_DIAGNOSTIC_CLASSES = [
+  PERSONA_THREAD_STAMP_UNDECIDED,
   ...DELIVERY_DIAGNOSTIC_CLASSES,
+  ...THREAD_MEMORY_DIAGNOSTIC_CLASSES,
+  ...SHARED_STATE_DIAGNOSTIC_CLASSES,
   PERSONA_START,
   PERSONA_CREDENTIALS_MISSING,
   PERSONA_CREDENTIALS_UNREADABLE,
@@ -204,7 +312,7 @@ export const PERSONA_DIAGNOSTIC_CLASSES = [
   PERSONA_DESTINATION_FAILED,
   PERSONA_CREDENTIALS_CHANGE_FAILED,
   PERSONA_CONFIG_DIR_UNRESOLVABLE,
-  PERSONA_INVITED_CHANNEL,
+  PERSONA_OPEN_CHANNEL,
   PERSONA_CHANNEL_DELIVERY_SET,
 ] as const
 
@@ -317,19 +425,19 @@ export function formatCredentialsChangeFailed(failure: CredentialsChangeFailure)
 // ---------------------------------------------------------------------------
 
 /**
- * The `persona-invited-channel` cause, formatted through
+ * The `persona-open-channel` cause, formatted through
  * `formatPersonaDiagnostic` with no path:
  *
- *   `hears <public|private> channel <channel> in fungible mode, at channel delivery <mentions|all>`
+ *   `hears <public|private> channel <channel> in open mode, at channel delivery <off|mentions|all|thread_hybrid>`
  *
- * `delivery` is the persona's channel delivery after the loop guard. Pure.
+ * `delivery` is the persona's channel delivery. Pure.
  */
-export function invitedChannelCause(
+export function openChannelCause(
   channel: string,
   channelType: FungibleChannelType,
   delivery: DeliveryMode,
 ): string {
-  return `hears ${channelType} channel ${channel} in fungible mode, at channel delivery ${delivery}`
+  return `hears ${channelType} channel ${channel} in open mode, at channel delivery ${delivery}`
 }
 
 /** How a `persona-channel-delivery-set` line names the absence of a stored choice before the call. */
@@ -339,11 +447,11 @@ export const NO_STORED_CHOICE = 'none'
  * The `persona-channel-delivery-set` cause, formatted through
  * `formatPersonaDiagnostic` with no path:
  *
- *   `stored choice for channel <channel> set from <none|mentions|all> to <mentions|all>, at channel delivery <mentions|all> after the loop guard`
+ *   `delivery choice for channel <channel> set from <none|off|mentions|all|thread_hybrid> to <off|mentions|all|thread_hybrid>, at channel delivery <off|mentions|all|thread_hybrid>`
  *
  * `before` is the stored choice before the call, undefined when there was
  * none (written `none`); `after` is the choice the call stored; `delivery`
- * is the persona's channel delivery there after the loop guard. Pure.
+ * is the persona's channel delivery there. Pure.
  */
 export function channelDeliverySetCause(
   channel: string,
@@ -352,13 +460,13 @@ export function channelDeliverySetCause(
   delivery: DeliveryMode,
 ): string {
   return (
-    `stored choice for channel ${channel} set from ${before ?? NO_STORED_CHOICE} to ${after}, ` +
-    `at channel delivery ${delivery} after the loop guard`
+    `delivery choice for channel ${channel} set from ${before ?? NO_STORED_CHOICE} to ${after}, ` +
+    `at channel delivery ${delivery}`
   )
 }
 
 /**
- * The declarative-mode `unclaimed-channel` cause, formatted through `formatPersonaDiagnostic` with no path:
+ * The strict-mode `unclaimed-channel` cause, formatted through `formatPersonaDiagnostic` with no path:
  *
  *   `message in channel <channel> not delivered: no applied persona lists this channel`
  *
@@ -368,22 +476,22 @@ export function unclaimedChannelCause(channel: string): string {
   return `message in channel ${channel} not delivered: no applied persona lists this channel`
 }
 
-/** Fungible-mode `unclaimed-channel` reason: the envelope flag is `true`. */
+/** Open-mode `unclaimed-channel` reason: the envelope flag is `true`. */
 export const UNCLAIMED_REASON_EXTERNALLY_SHARED = 'the channel is externally shared'
 
-/** Fungible-mode `unclaimed-channel` reason: the envelope carries no `is_ext_shared_channel`. */
+/** Open-mode `unclaimed-channel` reason: the envelope carries no `is_ext_shared_channel`. */
 export const UNCLAIMED_REASON_FLAG_MISSING = 'the event envelope carries no is_ext_shared_channel flag'
 
-/** Fungible-mode `unclaimed-channel` reason: the envelope's `is_ext_shared_channel` is not a boolean. */
+/** Open-mode `unclaimed-channel` reason: the envelope's `is_ext_shared_channel` is not a boolean. */
 export const UNCLAIMED_REASON_FLAG_NOT_BOOLEAN = "the event envelope's is_ext_shared_channel flag is not a boolean"
 
-/** Fungible-mode `unclaimed-channel` reason: the channel ID does not match `CHANNEL_ID_RE`. */
+/** Open-mode `unclaimed-channel` reason: the channel ID does not match `CHANNEL_ID_RE`. */
 export const UNCLAIMED_REASON_CHANNEL_ID_MALFORMED = 'the channel ID is malformed'
 
-/** Fungible-mode `unclaimed-channel` reason: `channel_type` is not `channel` or `group`. */
+/** Open-mode `unclaimed-channel` reason: `channel_type` is not `channel` or `group`. */
 export const UNCLAIMED_REASON_NOT_A_CHANNEL = 'the conversation is not a public or private channel'
 
-/** Each fungible-path refusal's reason text: a closed mapping, one text per refusal. */
+/** Each open-path refusal's reason text: a closed mapping, one text per refusal. */
 export const FUNGIBLE_REFUSAL_TEXTS: Readonly<Record<FungibleRefusal, string>> = {
   'not-a-channel': UNCLAIMED_REASON_NOT_A_CHANNEL,
   'channel-id-malformed': UNCLAIMED_REASON_CHANNEL_ID_MALFORMED,
@@ -393,17 +501,17 @@ export const FUNGIBLE_REFUSAL_TEXTS: Readonly<Record<FungibleRefusal, string>> =
 }
 
 /**
- * The fungible-mode `unclaimed-channel` cause, formatted
+ * The open-mode `unclaimed-channel` cause, formatted
  * through `formatPersonaDiagnostic` with no path:
  *
- *   `message in channel <channel> not delivered in fungible mode: <reason>; to serve this channel, use declarative mode with the channel listed`
+ *   `message in channel <channel> not delivered in open mode: <reason>; to serve this channel, use strict mode with the channel listed`
  *
  * `<reason>` is the refusal's text from `FUNGIBLE_REFUSAL_TEXTS`. Pure.
  */
 export function fungibleUnclaimedChannelCause(channel: string, refusal: FungibleRefusal): string {
   return (
-    `message in channel ${channel} not delivered in fungible mode: ${FUNGIBLE_REFUSAL_TEXTS[refusal]}; ` +
-    'to serve this channel, use declarative mode with the channel listed'
+    `message in channel ${channel} not delivered in open mode: ${FUNGIBLE_REFUSAL_TEXTS[refusal]}; ` +
+    'to serve this channel, use strict mode with the channel listed'
   )
 }
 

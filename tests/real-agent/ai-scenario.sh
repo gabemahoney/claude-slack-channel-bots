@@ -35,6 +35,9 @@ real_persona "aiac${AI_CRITERION}" "${PROMPT}"
 if [[ "${AI_CRITERION}" == 11 || "${AI_CRITERION}" == 12 || "${AI_CRITERION}" == 20 ]]; then
     jq -c '.channels=[{id:"C0TESTCHAN1",delivery:"all"}]' "${REAL_PERSONAS}" > "${REAL_PERSONAS}.new"
     mv "${REAL_PERSONAS}.new" "${REAL_PERSONAS}"
+    # Declare the same actual Slack membership for both corpus personas.
+    jq -c '.memberships=["C0TESTCHAN1"]' "${REAL_TOKENS}" > "${REAL_TOKENS}.new"
+    mv "${REAL_TOKENS}.new" "${REAL_TOKENS}"
 fi
 # AC11 keeps its first three turns together; every hazard gets a new native
 # conversation. AC12 and AC20 also isolate their hazard inputs.

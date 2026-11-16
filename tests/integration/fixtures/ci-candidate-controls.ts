@@ -13,7 +13,7 @@ const ordinary = parseCiArguments([])
 assert(ordinary.ok)
 assert.equal(ordinary.invocation.adCandidateDist, undefined)
 assert(isGateEligible(ordinary.invocation))
-const candidate = parseCiArguments(['test-50', '--ad-candidate-dist', '/tmp/candidate AD'])
+const candidate = parseCiArguments(['test-68', '--ad-candidate-dist', '/tmp/candidate AD'])
 assert(candidate.ok)
 assert.equal(candidate.invocation.adCandidateDist, '/tmp/candidate AD')
 assert(isSelectiveRun(candidate.invocation))
@@ -23,8 +23,8 @@ const fullCandidate = parseCiArguments(['--ad-candidate-dist', '/tmp/candidate']
 assert(fullCandidate.ok)
 assert(isSelectiveRun(fullCandidate.invocation), 'candidate cannot claim ordinary full PASS')
 assert(!isGateEligible(fullCandidate.invocation))
-assert.equal(buildVerdictLine({ invocation: fullCandidate.invocation, passed: true, ranked: [], scripts: ['test-1', 'test-50'] }),
-  'SELECTIVE (test-1 test-50): PASS')
+assert.equal(buildVerdictLine({ invocation: fullCandidate.invocation, passed: true, ranked: [], scripts: ['test-1', 'test-68'] }),
+  'SELECTIVE (test-1 test-68): PASS')
 for (const args of [
   ['--ad-candidate-dist'], ['--ad-candidate-dist', 'relative'], ['--ad-candidate-dist=/tmp/ad'],
   ['--ad-candidate-dist', '/tmp/ad', '--ad-candidate-dist', '/tmp/ad'], ['--ad-candidate-dist', '/tmp/\nAD'],

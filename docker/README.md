@@ -6,7 +6,7 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
 
 ## Images
 
-- **`cscb-ci-base:v9`** (built from `docker/Dockerfile.test.base`) — slow base
+- **`cscb-ci-base:v10`** (built from `docker/Dockerfile.test.base`) — slow base
   layers (apt deps incl. tmux, bun, nodejs, cozempic, agent-director and native
   Claude/Codex versions). Built lazily once per host. No checkout source
   inside; published CSCB tarballs are fixtures. From the repo build context
@@ -14,7 +14,7 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   `docker/install-real-codex.sh`, and no `package.json`. What it holds is in
   [What the base holds](#what-the-base-holds).
 - **The run's test image** (built from `docker/Dockerfile.test`,
-  `FROM cscb-ci-base:v9`) — adds `docker/entrypoint.sh`, `tests/`,
+  `FROM cscb-ci-base:v10`) — adds `docker/entrypoint.sh`, `tests/`,
   `testplans/`, the `testuser` account, and the `ENTRYPOINT`. It also copies
   the current tree's `docker/ad-client-check.sh` with mode `0755` over
   `/opt/agent-director/check/ad-client-check.sh`, refreshing the checker even
@@ -23,7 +23,7 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   tags it only `cscb-ci-run:<RUN_ID>-<PID>-test`, and removes it at the run's
   end (see [The run's images and tags](#the-runs-images-and-tags)). The build
   should complete in under 10 s on a warm base.
-- **`cscb-ci-live:v2`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v9`)
+- **`cscb-ci-live:v2`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v10`)
   — the `/ci-live` image (see [/ci-live](#ci-live-the-live-slack-acceptance-run)
   below). It adds Claude Code at a pinned version with auto-update off, the
   agent-director binary the runner stages, checked against the base's
@@ -35,7 +35,7 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   Built on every `/ci-live` run.
 
 - **The heavy run's image** (`docker/Dockerfile.real-agent`,
-  `FROM cscb-ci-base:v9`) — a self-contained packed `package.tgz`, tests and
+  `FROM cscb-ci-base:v10`) — a self-contained packed `package.tgz`, tests and
   `docker/real-agent-job.sh` and `docker/real-agent-codex-job.sh`, tagged `cscb-real-agent:<run-id>` and removed
   by `scripts/real-agent-matrix.ts`. Jobs select native Claude through
   agent-director, install runtime latest inside the container when needed,
@@ -79,7 +79,7 @@ the live image build, where it is checked (see
 The base build fetches bun, agent-director 0.10.0's binary and both binaries
 for each of the current and legacy displayed-state releases from GitHub,
 native Claude releases from their distribution service, and the pinned
-client, two 0.10.0 fixtures, the 0.16.1 downgrade fixture and native Codex
+client, two 0.10.0 fixtures, the 0.18.0 downgrade fixture and native Codex
 platform package from the npm registry. `/ci` runs it with
 `docker build --network=host`. On some hosts the default docker bridge network
 intermittently fails those fetches with SSL/timeout errors even when the host
@@ -109,7 +109,7 @@ Every path is readable by every user, `testuser` included, except the global cli
 | `/opt/claude-code/2.1.280/claude`, `/opt/claude-code/2.1.296/claude` | Native Linux x64 Claude programs, off PATH; manifests supply SHA-256 checks, and each `--version` must match. `DISABLE_AUTOUPDATER=1` is set in the base |
 | `/opt/codex/0.159.2/codex` | Native ELF from the Codex platform npm package, off PATH; build requires `codex-cli 0.159.2`. Selected explicitly by the isolated D1 gate and local heavy harness |
 | `/opt/cscb-ci/install-real-agents.sh`, `/opt/cscb-ci/install-real-codex.sh` | Marked-image-only native installers; the Claude installer also supports the heavy job's resolved latest |
-| `/opt/claude-slack-channel-bots-0.16.1/claude-slack-channel-bots-0.16.1.tgz` and `release.json` | Published-before-work downgrade fixture, separate from the retained 0.10.0 fixture. Publication: `2026-10-14T17:20:30.700Z`; SHA-256: `95bd53d19f4950caf8a13a4d9a4b7a8c85d22433ba87dd69cabbba20570e8164`. Build checks the hash/version; record includes registry provenance |
+| `/opt/claude-slack-channel-bots-0.18.0/claude-slack-channel-bots-0.18.0.tgz` and `release.json` | Published downgrade fixture, separate from the retained 0.10.0 fixture. Publication: `2026-10-21T08:49:18.397Z`; SHA-256: `16d102793cc62395b771c431078b4124267b3d11cb8b56e84c48e8910d096b62`. Build checks the hash/version; record includes registry provenance |
 | `/etc/cscb-ci-image` | The image marker (see [Image marker](#image-marker)) |
 
 It also installs `sqlite3` (the harness's store reads and edits) and `file`
@@ -249,7 +249,7 @@ git -C "$CSCB_AD_SRC_DIR" show "v$AD_VERSION:skills/install-agent-director/insta
 GH_TOKEN="$(gh auth token)" docker build --network=host \
   --secret id=gh_token,env=GH_TOKEN --progress=quiet \
   --build-context agent-director-install="$AD_INSTALL_CTX" \
-  -f docker/Dockerfile.test.base -t cscb-ci-base:v9 .
+  -f docker/Dockerfile.test.base -t cscb-ci-base:v10 .
 rm -rf "$AD_INSTALL_CTX"
 ```
 
@@ -269,7 +269,7 @@ rm -rf "$AD_INSTALL_CTX"
   that message, and every other check's `ERROR:` line: rerun with
   `--progress=plain` to see which step failed and why.
 - **Check an image by counts only**, never by printing its history:
-  `docker history --no-trunc cscb-ci-base:v9 | grep -c GH_TOKEN=` prints `0`.
+  `docker history --no-trunc cscb-ci-base:v10 | grep -c GH_TOKEN=` prints `0`.
 - **Earlier tags are retired.** Nothing names `v4` or an earlier tag. Tags
   before `v4` took the token as a build-arg, so their image history held its
   value, as did every image built on them; they are removed from the hosts
@@ -319,7 +319,7 @@ against Anthropic's direct endpoint.
 
 ## When to bump the base image version
 
-Bump `cscb-ci-base`'s version tag (next, `v9` → `v10`) whenever you change
+Bump `cscb-ci-base`'s version tag (next, `v10` → `v11`) whenever you change
 `docker/Dockerfile.test.base`, its pins included: the release's
 `AD_VERSION`, `AD_COMMIT`, `AD_SHA256`, `AD_ADMIN_SHA256`,
 `AD_INSTALL_SH_SHA256`, independent `AD_CLIENT_VERSION` and
@@ -401,7 +401,7 @@ the pin revision. A live-only pin change leaves `cscb-ci-base`'s tag alone.
 To simulate a fresh host, remove the base tag by its name, and nothing else:
 
 ```sh
-docker rmi cscb-ci-base:v9
+docker rmi cscb-ci-base:v10
 /ci   # with CSCB_AD_SRC_DIR set; or run the hand build above
 ```
 
@@ -416,7 +416,7 @@ build comes near it, raise an issue.
 After a `/ci` run, confirm the base layers are intact:
 
 ```sh
-docker history cscb-ci-base:v9
+docker history cscb-ci-base:v10
 ```
 
 Then edit a comment in (e.g.) `tests/integration/test-1-install-startup.sh`
@@ -429,7 +429,7 @@ docker build -f docker/Dockerfile.test -t "$WARM_TAG" .
 ```
 
 This should complete in seconds, and needs neither build context nor the
-token. `docker history cscb-ci-base:v9` should show the same layer IDs as
+token. `docker history cscb-ci-base:v10` should show the same layer IDs as
 before — proof the source edit didn't invalidate the base. Then remove the
 tag by its name:
 
@@ -573,7 +573,7 @@ it does not decide admission or a watchdog stop.
 monitor uses the working set, so its reading can differ from U.
 
 While a `/ci-live` run is active, C is the lower of that and 40 GiB,
-`/ci-live`'s working-set stop line (see [Memory bounds](#memory-bounds)).
+`/ci-live`'s non-reclaimable memory stop line (see [Memory bounds](#memory-bounds)).
 Shard containers run under the root, so their anonymous, shared and locked
 memory is in U. Reclaimable page cache left by removed containers can remain
 charged to the pod and visible in W without consuming the gate's headroom.
@@ -621,13 +621,21 @@ names it. A `cscb-ci=1` container is picked by its label, whatever its name.
 The CPU fit counts the CPUs of every other live `/ci` reservation;
 `/ci-live` adds none.
 
+A shard holding test-44 or any strict/open membership-load group takes one
+more CPU than the 2 its server keeps, once per shard even with several such
+scripts, for the burst load driver (see
+[Burst-driver shards](#burst-driver-shards)). Admission comes before
+scheduling places those scripts, so for N shards it counts one more CPU for
+each of the run's burst-driver scripts, at most N; the reservation records
+the same CPUs.
+
 **The three fits.** N is the number of shards being judged:
 
 | Fit | Passes when |
 |---|---|
 | Memory | U + the commitments + N × the ordinary cap + 2 GiB per Codex shard + the 1 GiB admission margin ≤ C, and no container blocks every run |
 | Disk | (used + 1 GiB) ÷ (used + available) < 85% on the volume holding the run directory. The 1 GiB is an allowance for the run's own files; the 85% is `/ci`'s own disk line |
-| CPU | The other live reservations' CPUs + 2 × N ≤ the 12 CI CPUs |
+| CPU | The other live reservations' CPUs + 2 × N + the smaller of N and the run's burst-driver scripts ≤ the 12 CI CPUs |
 
 The disk fit uses actual allocated filesystem blocks and available space;
 it does not discount temporary usage. The tarball is packed under the run
@@ -705,8 +713,15 @@ with a 64 GiB pod limit:
   41.4 GiB, and 5 up to 43.4 GiB.
 - While a `/ci-live` run is active, C is 40 GiB and that run counts 13 GiB,
   so no `/ci` run fits once U is above 24 GiB.
-- A second default full run beside a 6-shard run is refused for CPU: the
-  6-shard run holds all 12 CI CPUs.
+- The complete split burst workload population exceeds the maximum shard
+  count. A default full run can therefore fit at most 4 shards in an otherwise
+  unoccupied CPU budget: 8 + 4 = 12 CPUs; 5 shards would need 15. A second
+  default full run beside it is refused for CPU. At its isolation minimum of
+  two shards, the dedicated Codex shard and one ordinary shard, it needs
+  4 + 2 = 6 CPUs, with none free beside the 4-shard run.
+- Selective runs depend on their selected burst population; four is not a
+  universal cap. A run without burst scripts takes 2 CPUs a shard, so a
+  6-shard run holds all 12 CI CPUs and leaves none for another run.
 
 **The memory watchdog** checks U every 30 s against C less 0.5 GiB
 (53.9 GiB for a 64 GiB pod, or 39.5 GiB while `/ci-live` lowers C). At or
@@ -788,7 +803,7 @@ rename), with these keys:
 | `runId`, `pid` | the run's RUN_ID and PID |
 | `shards` | N |
 | `memoryBytes` | N × the ordinary per-shard memory cap + 2 GiB per dedicated Codex shard |
-| `cpus` | 2 × N |
+| `cpus` | 2 × N + the smaller of N and the run's burst-driver scripts |
 | `kind` | `full` or `selective` |
 
 - **Its lifetime.** A reservation lives until its run ends: the run removes
@@ -827,7 +842,7 @@ The sweep never touches:
 
 - anything whose owner is alive;
 - any `cscb-live=1` container, or any container without `cscb-ci=1`;
-- any other tag shape, such as `cscb-ci:latest`, `cscb-ci-base:v9`,
+- any other tag shape, such as `cscb-ci:latest`, `cscb-ci-base:v10`,
   `cscb-ci-live:v2` or a lane tag like `cscb-ci-l5:m5`;
 - an image that still has a tag, or an image with no owner label;
 - any file beside the lock but a dead owner's reservation;
@@ -1008,12 +1023,75 @@ image's build succeeded, and from the pinned ID when it did not (see
 | `--memory` | The per-shard memory cap, in bytes | Each shard is held to the cap admission counted it at (see [The per-shard memory cap and out-of-memory kills](#the-per-shard-memory-cap-and-out-of-memory-kills) for its value and rules) |
 | `--memory-swap` | The same as `--memory` | No swap above the cap: past it the kernel kills a process inside the container instead of swapping |
 | `--pids-limit` | `2048` | Stops a fork or spawn loop inside one shard long before it reaches the host |
-| `--cpus` | `2` | The CPUs admission reserves per shard (see [Admission: memory, disk and CPU](#admission-memory-disk-and-cpu) for the CPU budget) |
+| `--cpus` | `2`, or `3` for a burst-driver shard | The CPUs admission reserves per shard (see [Admission: memory, disk and CPU](#admission-memory-disk-and-cpu) for the CPU budget) |
 
 **Isolation.** A shard is on the default network only. No list sets
 `--network`, `--privileged`, or a PID, IPC or network namespace shared with
 the host or another container. No list sets `--rm` either: a shard never
 removes itself, and only the runner removes it, after its final reading.
+
+#### Burst-driver shards
+
+A shard holding test-44 or any strict/open membership-load group keeps the
+burst load driver, the test's own load generator, off the CPU quota of the
+server it measures. `BURST_DRIVER_SCRIPTS` in `scripts/ci-run.ts` recognizes
+the thread-burst and membership-load filename families, including suffixed
+membership groups; see the canonical [suite inventory](../tests/README.md#layout).
+Recovery groups, ACK-only test-31 and model scripts do not use this driver. Its `docker run` adds
+four things to an ordinary shard's:
+
+| Flag | Why |
+|---|---|
+| `--cpus 3` | The server keeps the 2 CPUs of quota every shard has; the third is the driver's |
+| `--cgroupns private` | The cgroup the shard sees, and may write, is its own, whatever the daemon's default namespace mode |
+| `--security-opt writable-cgroups=true` | The entrypoint can make CPU groups inside the container's own cgroup, with no added capability |
+| `--init` | Docker's init is PID 1, so the container's main process stays in the container's cgroup, where the runner reads its memory and PIDs |
+
+The Docker daemon must support `writable-cgroups` (Docker 29 does); one that
+does not refuses the `docker run`, and the shard fails to start. Ordinary
+shards keep the read-only cgroup.
+
+`docker/entrypoint.sh` refuses, and the shard fails, unless its cgroup view is
+the container's own: the entrypoint at its namespace's root (`0::/`), listed in
+the mount root's `cgroup.procs`. It then splits the container's cgroup with
+the threaded `cpu` controller:
+
+- Everything it starts, the in-container runner, scripts, Slack stub and
+  server alike, runs in `shard/server` at `cpu.max` 200000/100000, the same
+  2 CPUs as before.
+- The driver's launcher, `tests/integration/fixtures/burst-driver.sh --serve`,
+  is born in `shard/driver`, at 0.9 of the third CPU, and runs as testuser. A
+  test's `burst-driver.sh` passes it each driver run, which starts there, so
+  nothing migrates. A request names a record path, one of the
+  `sr8-evidence.ts` driver commands (`burst`, `fault-burst`,
+  `fault-recover`) with its arguments, and at most the fields `SCENARIO_ROOT`,
+  `SR8_PHASE_CPU_FILE`, `SR8_PHASE_CPU_PIDS` and `SR8_PROFILE_DIR`. The
+  launcher refuses anything else with status 64 and starts nothing.
+  It runs the image's root-owned `/usr/local/bin/bun` on the fixtures'
+  `sr8-evidence.ts` itself, with the arguments unevaluated, from `/`, with
+  its own `PATH`, `HOME=/` and no Bun options. No program, search path,
+  preload, `bunfig.toml`, `.env` file or other loader setting comes from the
+  caller. It serves only while that Bun, the fixtures directory and
+  `sr8-evidence.ts` are root-owned and writable by no one else.
+  Like the server, the driver imports the installed package under test,
+  which test-1 installs as testuser. The launcher limits what a request can
+  start, not what testuser's own files hold.
+- testuser, the server's UID, owns no cgroup file, so it cannot move any
+  process into another group or change any limit. Only the entrypoint runs as
+  root, and it creates the groups and places the launcher before it drops to
+  testuser.
+- The 0.1 CPU left is headroom. It makes it rare for the container's 3-CPU
+  quota to throttle the server's group, but does not prevent it: the control
+  probes recorded 5 ms and 1.1 s of container-level throttling under
+  saturated loops. When a slow ACK is diagnosed, container-level throttling
+  remains a possible cause.
+
+Memory, PID and OOM figures stay the container's, as in any shard. While the
+measured server runs, the script's `driver-cpu` verdict checks the placement,
+the configured quotas and the server's UID's permissions (a write-only open of
+each guarded cgroup file must be refused; any other probe error is missing),
+not throttling (see
+[Thread Memory performance runs](../docs/testing-guide.md#thread-memory-performance-runs)).
 
 **Mounts.** Each mount is a `--mount type=bind,...`, never `-v`, so Docker
 never creates a missing source: every source is a file or directory the
@@ -1086,7 +1164,9 @@ same order, each step after the one before:
 4. Its removal, never forced.
 
 There is no graceful stop: the in-container runner is the container's PID 1
-and ignores SIGTERM, so SIGTERM is never sent. A failed SIGKILL or log save is
+and ignores SIGTERM, so SIGTERM is never sent. (In a burst-driver shard
+Docker's init is PID 1 and would pass SIGTERM on to the runner; it is never
+sent there either.) A failed SIGKILL or log save is
 written to the runner log, and the removal still follows. A shard retired at
 its limit whose `result.txt` already holds its end marker is retired at its
 end marker instead, never as over its limit.
@@ -1365,7 +1445,7 @@ The template's `Dockerfile` mirrors the `/ci` image at the tag
   manifest's expected version and, when the manifest records a commit, a
   commit starting with it; the admin tool reports the same version; and the
   installed files match the manifest's digests.
-- There is no native Claude Code or Codex and no 0.16.1 downgrade fixture.
+- There is no native Claude Code or Codex and no 0.18.0 downgrade fixture.
   The 0.10.0 fixtures and the 0.17.0 legacy fixture come from `inputs/`, the
   latter checked against the pins of v0.18.2's base Dockerfile.
 - `/test-repo` is pre-installed from the same package tarball, so test-1's
@@ -1598,9 +1678,11 @@ runner lives in `ci-live/` and is not part of the npm package.
      the reason says to rerun.
    - **The configuration token is optional once the apps exist.** When
      `apps.json` records all four app IDs and the token is missing, empty or
-     refused (expired with no refresh token, or a refused rotation), the
-     stage logs a `WARNING` (never the value) and reuses the recorded apps
-     without their export, drift check or update. Each is logged as
+     refused (expired with no refresh token, or a refused rotation), or
+     cannot manage the test apps (`no_permission`), the stage logs one
+     `WARNING` (never the value) and reuses the recorded apps without further
+     export, drift check or update. `no_permission` never triggers rotation.
+     Each is logged as
      `reused … (unchecked: no usable configuration token)`. Creating an app
      or resolving an unfinished create still needs the token (exit 2
      without it).
@@ -1788,12 +1870,12 @@ and writes one `watchdog:` line to `run.log` per sample:
 
 | Part of the line | What it reads |
 |---|---|
-| `host` | The host (pod) cgroup: the working set (`ws`), which is `memory.current` minus `inactive_file` from `memory.stat` (page cache the kernel can drop is not use, as the kubelet counts it), then `memory.current` and `memory.max` |
+| `host` | The host (pod) cgroup: non-reclaimable memory (`non-reclaimable`), using `/ci`'s shared `max(anon + shmem, active_anon + inactive_anon + unevictable)` calculation from `memory.stat`, excluding reclaimable page cache; then `memory.current` and `memory.max` |
 | `container` | The test container's `docker stats`: memory use and limit, and its PIDs. `container not running` before it starts and after it is removed; `container not read (the watchdog stopped)` in a sample that ends after the watchdog stopped, which skips `docker stats` |
 | `chrome` | Chrome's process tree (the runner's descendants that are Chrome): its summed PSS (`pss=`, which counts pages shared between Chrome's processes once), its process count, and the browser's open pages (how many idle on `about:blank`) and contexts. A process whose `smaps_rollup` can't be read counts its RSS instead, and the line says how many did (`rss fallback for <n>`) |
 | `runner` | The runner's own RSS |
 
-It stops the run when the host working set passes 40 GiB (well below the
+It stops the run when the host non-reclaimable memory passes 40 GiB (well below the
 pod's 64 GiB, leaving room for the production bots) or Chrome's tree PSS
 passes 4 GiB (a healthy run stays well under it). Each limit is checked as
 soon as its reading arrives, the host's first, then Chrome's, before the
@@ -1818,7 +1900,7 @@ It stops the run the way a signal does (see
 The results so far are written with a `memory watchdog` FAIL row, and the
 run exits 1. The verdict names what crossed its limit, its value and the
 limit, such as
-`FAIL: memory watchdog: host working set 41.2 GiB is over the 40.0 GiB limit (…)`.
+`FAIL: memory watchdog: host non-reclaimable memory 41.2 GiB is over the 40.0 GiB limit (…)`.
 The run's note says what the cleanup actually did (see
 [One run at a time](#one-run-at-a-time)).
 
@@ -1877,7 +1959,7 @@ against the runtime record and proves the client accepts it.
   - Anything else (a missing or malformed release record, steps 1
     (tarball) to 4 (exports), a missing check script, the check's refusal or
     usage error):
-    `ERROR: the base image's global agent-director client or its ad-client check failed (the line above names what failed): the base image cscb-ci-base:v9 predates this tree's docker/Dockerfile.test.base or docker/ad-client-check.sh; bump the base image version as the When to bump the base image version section of docker/README.md describes`.
+    `ERROR: the base image's global agent-director client or its ad-client check failed (the line above names what failed): the base image cscb-ci-base:v10 predates this tree's docker/Dockerfile.test.base or docker/ad-client-check.sh; bump the base image version as the When to bump the base image version section of docker/README.md describes`.
 
   Whichever line it is, the run reports a `container` FAIL row for the failed
   build, `docker build of the live image failed (exit N)`, followed by what
@@ -2225,16 +2307,9 @@ writes. A clean start's summary ends `0 failed, 0 not brought up, 0 not
 reconnected, 0 latched, 0 retrying, 0 waiting on a live-row sequence, 0 held
 on invalid flags, 0 fresh as retired keys`.
 
-Checks 30 to 34 take the other texts they expect from copies: those held
-once in `ci-live/checks/invited-checks.ts` (the switch's preview lines, the
-in-place and recorded lines, the no-effective-change preview and
-`reload-noop` line, the `persona-invited-channel`,
-`persona-channel-delivery-set` and `unclaimed-channel` lines, and Check 33's
-tool-error form), the preview header and `reload-applied` line in
-`ci-live/checks/helpers.ts`, and the setting names in
-`ci-live/lib/live-config.ts`. The runner loads no other `src/` module, so
-each copy names the `src/` builder or constant it copies and is pinned
-against it in `tests/ci-live-checks.test.ts`.
+Checks 30 to 34 use copies in `ci-live/checks/invited-checks.ts`: `modeSwitchPreviewLine` from `src/reload-plan.ts`’s `modeSwitchLine`; `invitedInPlaceLine` / `invitedRecordedLine` for the common destination’s in-place preview; `NO_EFFECTIVE_CHANGE_PREVIEW` from `PENDING_PREVIEW_TITLE` / `NO_EFFECTIVE_CHANGE`; `noopLine` from `src/reload-apply.ts`’s `renderNoopLogLine`; and persona references/lines and `openChannelCause`, `channelDeliverySetCause`, `unclaimedChannelCause` from `src/persona-diagnostics.ts`. Tool names come from `src/registry.ts` / `src/channel-delivery.ts`, and `slackRefusalText` copies `slackRefusalToolErrorText`; its safe code pattern follows `src/persona-connection-errors.ts`’s `SAFE_IDENTIFIER_RE`. `ci-live/checks/helpers.ts` copies preview counts/header and the applied line; `ci-live/lib/live-config.ts` copies `channel_mode` and its strict/open interpretation.
+
+`ci-live/checks/membership-setup.ts` copies `MEMBERSHIP_READINESS_ROUTE`, `MEMBERSHIP_REQUIRED_SUBSCRIPTIONS`, the five `MEMBERSHIP_SETUP_*` / subscription/reinstall diagnostic labels, `membershipSetupRecordedDiagnostic` and readiness diagnostic formatting from `src/channel-membership-readiness.ts`. Each copy names its source and is pinned in `tests/ci-live-checks.test.ts`; the runner imports no other runtime source beyond the two import-free text modules above.
 
 | Check | In `/ci-live` |
 |---|---|
@@ -2254,8 +2329,10 @@ against it in `tests/ci-live-checks.test.ts`.
 | 26 | `SKIPPED (optional)` |
 | 27 | Automated, with step 2's optional prompt. The teardown kills D's row and keeps it: once the teardown's complete line is logged, the runner runs a guarded `agent-director find-missing` in the container (a kill never changes a row's state; find-missing marks the row once its agent process is gone), then expects A's, B's and C's rows unchanged and D's row kept and not live (`ended` or `missing`), with one teardown line for a kill that kept the row. It records whether D's row was there before the removal, which tells Check 28 whether to expect D's kept row |
 | 28 | Automated; the reboot is a container restart (see below). Steps 1, 3 and 5 expect one live row per configured persona, plus D's kept row, not live, when Check 27 found D's row before removing D (whether or not D connected in Check 25), and no row for D otherwise. A persona Slack was unreachable for at the start, up after its bring-up retry and connected within the wait, is a note, not a failure |
-| 30 to 34 | Automated, after Check 28 and before 29a, against persona C (in no channel, DMs on, the test human its contact). Check 30 starts only from the applied, nothing-pending, running state, copies `config.json` to `~/cscb-live/config-before-invited.json` in the container, and turns the switch on with a confirmed config edit that gives every persona an `invited.permission_prompts` keeping its destination where it is (A `a-home`, B and C `"dm"`, D `d-home` when still declared); it expects A's, B's and C's (and D's) in-place lines. The test human then creates the run channel, public and named `cscb-live-invited-<RUN_ID>`, mentions C there, invites C's app and mentions it again. Check 31 asks C in the channel to call `set_channel_delivery` with `all`; Check 32 turns the switch off and waits the full 3-minute reply window; Check 33 turns it on again, kicks C's app and asks C by DM for the calls. Checks 31 and 33 read C's calls from its transcript and follow Check 16's ask rule (at most two asks; no call after two is `SKIPPED (not run: …)`). Check 33 judges each of its `reply` and `fetch_messages` calls C made, even when the other is missing: it finds the tool-error form anywhere in the tool error (the client may wrap it), and writes each refusal, `reply: refused by Slack (<code>)` and `fetch_messages without thread_ts: refused by Slack (<code>)`, to both the evidence and Notes; a call that is not Slack's refusal fails it, and it is `SKIPPED (not run: …)`, naming the missing call or calls, only when one is still missing and nothing failed. Check 33's outcomes for `react`, `edit_message` on C's earlier post and `fetch_messages` with `thread_ts` are recorded as notes, never judged, one per call: `Check 33 residual: <call> after the kick: <outcome>`. Check 34 runs whatever 30 to 33 found: it restores the copied bytes through a confirmed edit, kicks C's app if it is still in the channel, archives the channel, and passes only when C is in no channel, archived ones included. When an earlier edit's `config.json.pending` is already there and the restore changes `config.json`, it notes that file's fingerprint and waits for the restore's own file (a different fingerprint) before reading the preview and renaming; it never confirms the earlier file, and with none rewritten for the restore it fails and renames nothing. Under `--only`, Check 34 runs whenever any of Checks 30 to 33 is selected. Against a silent workspace it passes only as "nothing to restore", when Check 30 copied nothing and created no channel. `--only 30,31,32,33,34` runs them from the state setup and Check 1 leave (A, B and C applied, A's DMs off, no D): the switch-on edit handles either state |
-| 29a | Automated. Always runs, also in a dry run and after a blocking failure; adds a host-side scan of the results. It scans the plan's file list, the stored-choice file `channel-delivery.json` included, and requires a transcript only for each persona this run brought up (A to C in Check 1, D in Check 25) and sent a message to |
+| setup-ready (`membershipSetupCheck`) | Runner-only, after channel checks with C up and before Check 24. Uses this run’s provisioning/reinstall results, apps.json needs_reinstall and a configuration-token apps.manifest.export. Records/readbacks the authenticated installation, rejects another app’s installation and verifies unchanged saved choices. Verified setup passes; missing subscriptions/incomplete reinstall or inconsistent evidence fails; uninspectable setup is SKIPPED (not run). Inventory is reported separately. No Results column. |
+| setup-restart (`membershipSetupRestartCheck`) | Runner-only, after Check 28 and before Part 11. Requires the same installation, record order/time/state and no further reinstall under a different server PID owning server.port. A missing prior check, unchanged PID or unknown setup is SKIPPED (not run), never PASS; a changed/lost record, installation or invalid setup fails. No Results column. |
+| 30 to 34 | After Check 28 and setup-restart, C starts with no channel and DMs on. Check 30 saves config.json, confirms channel_mode=open without changing common channels/destination settings, creates the public run channel, invites C and requires its shared mentions choice and verified membership. Check 31 proves one new logical all assignment and an unmentioned answer. Check 32 confirms strict mode and requires the same all choice, member=true, a reply and no unclaimed-channel line. Check 33 returns to open, kicks C, judges reply/unthreaded fetch refusals and records residual calls, then requires the choice absent, member=false and a recorded leave. Check 34 restores the saved config, kicks/archives and requires C in no channel, archived channels included; it runs whenever any of 30–33 is selected. Calls follow the at-most-two-asks rule; missing calls are SKIPPED as not run, never passed. |
+| 29a | Automated. Always runs, also in a dry run and after a blocking failure; adds a host-side scan of the results. It scans the plan's file list, including the shared authority `config.json.last-applied`, and requires a transcript only for each persona this run brought up (A to C in Check 1, D in Check 25) and sent a message to |
 | 29b | `SKIPPED (optional: needs host sudo/iptables)` |
 | Teardown | The personas' tmux panes, the container's own logs and the personas' transcript tails are copied into `container-logs/` (see [Outputs](#outputs)), then the container is removed. The apps and the three provisioned channels stay for the next run; each run's invited channel is archived by Check 34 |
 | HOST | The host is unchanged (see [Isolation](#isolation-from-the-production-bots)) |

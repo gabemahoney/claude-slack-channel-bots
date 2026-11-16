@@ -1,6 +1,8 @@
 # Claude Slack Channel Bots
 
-A single HTTP MCP server that runs several independent Claude Code bots, called personas. Each persona has its own Slack app and identity (name and avatar) and one Claude Code instance with its own working directory. It is reachable by direct message when its `dm.enabled` is `true`, and in the Slack channels the server's channel mode gives it: in declarative mode, the default, the channels it is configured into; in fungible mode, every public or private channel its Slack app is invited to that is not externally shared (see [Channel modes](docs/channel-modes.md#channel-modes)). The server holds one Slack Socket Mode connection per persona and delivers each message to the persona whose app received it. Each persona's tool calls act as that persona: in declarative mode only in the channels it is configured into, in fungible mode in any channel ID it names, where the call goes to Slack, which decides; and in its direct messages when its `dm.enabled` is `true`.
+A single HTTP MCP server connects Slack apps to Claude personas. Each persona has its own Slack app and identity, Claude Code instance and working directory. With `dm.enabled: true`, it can also receive direct messages.
+
+Each persona has a saved delivery choice for each channel; in both modes, its non-off applied channel choices determine listening. Each persona's tool calls act as that persona: in strict mode only in its configured non-off channels, in open mode in any channel ID it names, where the call goes to Slack, which decides. See [Channel modes](docs/channel-modes.md) and [Configuration](docs/configuration.md).
 
 ---
 
@@ -32,9 +34,13 @@ Install [Bun](https://bun.sh) before installing CSCB. For installation problems,
 
    The wizard walks you through one persona at a time: creating and installing the persona's Slack app from `slack-app-manifest.yml`, setting its name and avatar, and inviting it to its channels, which you do in Slack; declaring the persona in `config.json`, which the wizard writes; and writing its credentials file, which you do in your terminal. Tokens go only into the wizard's [credentials command](skills/setup-slack-channel-bots/SKILL.md#credentials-command), `claude-slack-channel-bots credentials <persona>`, which you run in your own terminal, never into the chat. On a running server, the wizard explains how to confirm the pending change (see [Changing the configuration](#changing-the-configuration)).
 
+   An existing app needs one manifest update and reinstall; follow [Update and reinstall an existing app](skills/setup-slack-channel-bots/SKILL.md#update-and-reinstall-an-existing-app) for its current-app verification and readback.
+
 4. **Or create your personas by hand:**
 
    Skip this step if the wizard created them. Create one Slack app per persona from `slack-app-manifest.yml`. Write each app's tokens to its own credentials file, then list the personas in `config.json`. See [A first configuration](#a-first-configuration), and [Personas (config.json)](docs/configuration.md#personas-configjson) and [Credentials files](docs/configuration.md#credentials-files) for the full reference.
+
+   For an existing app, add any missing `reaction_added` and `reaction_removed` bot events and the `mpim:read` bot scope, then reinstall it; before the receiving persona's app has the reaction-event subscriptions in place, that persona gets no notices for reactions by people or other apps, though other personas served by this CSCB server deliberately using `react` still bring notices. See [Migration](docs/migration.md#migration) for existing-app instructions and [Reaction Notices](docs/bots.md#reaction-notices) for behavior.
 
 5. **Start the server:**
 
@@ -48,7 +54,7 @@ Install [Bun](https://bun.sh) before installing CSCB. For installation problems,
 
 - [Bun](https://bun.sh) `>= 1.0.21` (agent-director minimum)
 - [Claude Code](https://claude.ai/code) 2.1.280 or later for the workers, installed and authenticated: CSCB's supported minimum and the version the fleet runs. The `claude` on the workers' `PATH` must be Claude Code's native binary or a wrapper that `exec`s it. See [Troubleshooting](docs/troubleshooting.md#troubleshooting) for launches that stay `pending`.
-- [`agent-director`](https://github.com/gabemahoney/agent-director) 0.12.0 or later, **installed system-wide**. Check it with `bun run install-check`; see [Checking your agent-director install](docs/agent-director.md#checking-your-agent-director-install). For an existing installation, follow [Migration](docs/migration.md#migration), including its switch-over and rollback runbooks.
+- [`agent-director`](https://github.com/gabemahoney/agent-director) 0.12.0 or later, **installed system-wide**. Check it with `bun run install-check`; see [Checking your agent-director install](docs/agent-director.md#checking-your-agent-director-install). For an existing installation, follow [Migration](docs/migration.md#migration), including [Upgrading from 0.18.x](docs/migration.md#upgrading-from-018x) and the switch-over and rollback runbooks.
 - [tmux](https://github.com/tmux/tmux) 3.2 or later, with `remain-on-exit` off. agent-director runs it; CSCB starts no tmux process. agent-director does not depend on tmux's `base-index` or `pane-base-index`, so their values don't matter.
 - Slack workspace admin access (to create and configure one Slack app per persona)
 
@@ -88,10 +94,10 @@ Consult [agent-director's documentation](https://github.com/gabemahoney/agent-di
 
 - `credentials_file` holds the persona's two Slack tokens. Write it with `claude-slack-channel-bots credentials planner` in your own terminal; it asks for the tokens and checks them with Slack.
 - `working_directory` must exist; the persona's Claude instance runs there.
-- `channels` lists the channels the persona is in, each with `delivery` `"all"` (every message) or `"mentions"` (only @mentions and `@here` / `@channel`). Invite the persona's Slack app to each one.
+- `channels` is the shared list in both modes, each entry choosing `off`, `mentions`, `all` or `thread_hybrid`; see [Delivery values in both modes](docs/channel-modes.md#delivery-values-in-both-modes) for their meaning. Invite the persona's Slack app to each channel it should serve.
 - `permission_prompts` is where the persona's permission prompts and notices go: one of its channels, or `"dm"` with a `dm` section.
 
-Replace the channel ID and paths with your own. [Configuration](docs/configuration.md) has every persona field and a complete example; [Channel modes](docs/channel-modes.md) covers fungible mode.
+Replace the channel ID and paths with your own. [Configuration](docs/configuration.md) has every persona field and a complete example; [Channel modes](docs/channel-modes.md) covers open mode.
 
 ---
 
@@ -131,14 +137,14 @@ The server applies it without a restart. Lines that start `DESTRUCTIVE:` name pe
 |---|---|
 | [Configuration](docs/configuration.md) | Write `config.json`: every persona field, credentials files and the load-time rules |
 | [Server settings](docs/server-settings.md) | Set the server-wide settings, environment variables and `slack-mcp.json` |
-| [Channel modes](docs/channel-modes.md) | Choose declarative or fungible mode, and see who can reach a persona in fungible mode |
+| [Channel modes](docs/channel-modes.md) | Choose strict or open mode, use one shared channel list, and see who can reach a persona in open mode |
 | [Reload](docs/reload.md) | Change the configuration of a running server and read its preview |
 | [CLI Reference](docs/cli.md) | Look up a command's behaviour, output and exit codes |
 | [What a bot can do](docs/bots.md) | Learn the bots' tools, how messages reach them, `/interject`, the permission relay and Slack reply reminders |
 | [Scheduled Prompts](docs/scheduled-prompts.md) | Send prompts to bots on a schedule |
 | [agent-director](docs/agent-director.md) | Check the agent-director install and size CSCB's agent-director timeout |
 | [Troubleshooting](docs/troubleshooting.md) | Fix a persona that is silent or down, a notice, or a startup error |
-| [Migration](docs/migration.md) | Install this release over an earlier one, or roll it back |
+| [Migration](docs/migration.md) | Install this release over an earlier one, including the [manual upgrade from 0.18.x](docs/migration.md#upgrading-from-018x), or roll it back |
 | [CHANGELOG.md](CHANGELOG.md) | See what changed in each release |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Work on CSCB itself |
 

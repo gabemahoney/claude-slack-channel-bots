@@ -404,6 +404,78 @@ export function percentile(values: number[], quantile: number): number {
   if (!values.length) throw new Error('No latency samples')
   return [...values].sort((a, b) => a - b)[Math.ceil(values.length * quantile) - 1]!
 }
+export const THREAD_N2_MIN_SAMPLES = 20
+export const THREAD_N2_TYPING_MS = 2_000
+export const THREAD_N2_DELIVERY_MS = 10_000
+export interface ThreadLatencyOptions {
+  key: string; channel: string; samples: string[]; delayed: string; hung: string
+  scenario: string; mode: 'strict' | 'open'
+}
+/** Project actual shared_queue_snapshot observations onto the explicitly named
+ * N2 workload. Completion is the latest durable part receipt, never a poll's
+ * return time. concurrent-overlap separately binds these rows to the N2 verdict.
+ */
+export function threadSampleIntervals(key: string, channel: string, samples: readonly string[], journal: readonly any[]): string {
+  if (!/^[a-z0-9_]+$/.test(key) || !samples.length || new Set(samples).size !== samples.length) throw new Error('Invalid thread interval selection')
+  return samples.map(ts => {
+    const accepted = workloadItems(journal).filter(r => r.source === 'slack' && r.channel === channel && r.ts === ts
+      && r.key?.chat_id === channel && r.key?.ts === ts && r.key?.edited_ts === undefined)
+    const item = accepted[0], fixed = journal.filter(r => r.kind === 'fixed' && r.seq === item?.seq)
+    if (accepted.length !== 1 || item.via !== 'thread' || !Number.isSafeInteger(item.seq) || item.seq < 1
+      || !Number.isFinite(item.received_at) || item.received_at < 0 || fixed.length !== 1 || !fixed[0].parts?.length)
+      throw new Error('Missing thread interval acceptance/fixation')
+    const completed = fixed[0].parts.map((_: unknown, i: number) => {
+      const rows = journal.filter(r => r.kind === 'delivered' && r.seq === item.seq && r.part === i + 1)
+      if (rows.length !== 1 || !Number.isFinite(rows[0].at) || rows[0].at < item.received_at)
+        throw new Error('Missing thread interval part completion')
+      return rows[0].at as number
+    })
+    return [key, item.seq, item.received_at, Math.max(...completed)].join('\t')
+  }).join('\n') + '\n'
+}
+/** Select exact Slack keys, never the last N timings. The caller must first
+ * pass auditReceipts over the WHOLE journal, including reminders and roots.
+ * Name evidence is the first own AD send of the first fixed part; a later
+ * retry or a name cached after the timeout cannot repair that observation.
+ * N4's interval belongs to sr8-evidence's same-process measurement records.
+ */
+export function threadLatency(options: ThreadLatencyOptions, timings: { seq: number; typing_ms: number; delivery_ms: number }[],
+  journal: readonly any[], sends: readonly ShimSend[], print: (line: string) => void = console.log): number {
+  const { key, channel, samples, delayed, hung, scenario, mode } = options
+  if (!/^[a-z0-9_]+$/.test(key) || !/^[CG][A-Z0-9]+$/.test(channel) || !/^[\w-]+$/.test(scenario)
+    || !['strict', 'open'].includes(mode) || [...samples, delayed, hung].some(ts => !/^\d+\.\d+$/.test(ts))) throw new Error('Invalid thread latency arguments')
+  let missing = samples.length < THREAD_N2_MIN_SAMPLES
+  let invalid = new Set(samples).size !== samples.length || delayed === hung || !samples.includes(delayed) || !samples.includes(hung)
+  const selected: typeof timings = []
+  for (const ts of samples) {
+    const items = workloadItems(journal).filter(r => r.source === 'slack' && r.channel === channel && r.ts === ts
+      && r.key?.chat_id === channel && r.key?.ts === ts && r.key?.edited_ts === undefined)
+    const item = items[0], matches = timings.filter(t => t.seq === item?.seq)
+    const fixed = journal.filter(r => r.kind === 'fixed' && r.seq === item?.seq)
+    const first = sends.filter(s => s.instanceId === `cscb_${key}` && s.text === fixed[0]?.parts?.[0]).sort((a, b) => a.at - b.at)[0]
+    const header = first?.text.match(/^<channel\b[^>]*>/)?.[0]
+    const name = header?.match(/\buser="([^"]*)"/)?.[1]
+    const lookup = ts === hung ? 'hung' : ts === delayed ? 'delayed' : 'none'
+    const named = name ? name === item?.user ? 'fallback' : 'resolved' : 'missing'
+    const timing = matches[0]
+    const complete = items.length === 1 && matches.length === 1 && fixed.length === 1 && first !== undefined
+      && Number.isFinite(first.at) && name !== undefined && name !== ''
+      && timing && [timing.typing_ms, timing.delivery_ms].every(n => Number.isFinite(n) && n >= 0)
+    if (!complete) missing = true
+    else selected.push(timing)
+    const valid = item?.via === 'thread' && !!item.thread_ts
+      && header?.includes(`chat_id="${channel}"`) && header.includes('via="thread"')
+      && header.includes(`user_id="${item.user}"`) && header.includes(`message_id="${ts}"`)
+      && (lookup !== 'hung' || named === 'fallback') && (lookup !== 'delayed' || named === 'resolved')
+    if (complete && !valid) invalid = true
+    print(`recorded: sr8 n2-sample key=${key} seq=${item?.seq ?? 'missing'} typing_ms=${timing?.typing_ms ?? 'missing'} delivery_ms=${timing?.delivery_ms ?? 'missing'} via=${item?.via === 'thread' ? 'thread' : 'other'} lookup=${lookup} name=${named} verdict=${!complete ? 'missing' : valid ? 'pass' : 'fail'}`)
+  }
+  const typing = selected.length ? percentile(selected.map(t => t.typing_ms), .95) : NaN
+  const delivery = selected.length ? percentile(selected.map(t => t.delivery_ms), .95) : NaN
+  const verdict = missing ? 'missing' : invalid || typing > THREAD_N2_TYPING_MS || delivery > THREAD_N2_DELIVERY_MS ? 'fail' : 'pass'
+  print(`recorded: sr8 n2 scenario=${scenario} mode=${mode} population=100000 key=${key} samples=${selected.length} typing_p95_ms=${Number.isFinite(typing) ? typing : 'missing'} delivery_p95_ms=${Number.isFinite(delivery) ? delivery : 'missing'} typing_limit_ms=${THREAD_N2_TYPING_MS} delivery_limit_ms=${THREAD_N2_DELIVERY_MS} verdict=${verdict}`)
+  return verdict === 'pass' ? 0 : 1
+}
 /** Failure-only projection: no message bodies, paths, IDs, raw errors or AD
  * objects escape. All counters are bounded independently of queue size. */
 export function deliveryFailureEvidence(options: AuditOptions, entries: readonly TranscriptEntry[], adapters: ReceiptAdapters,
@@ -472,6 +544,13 @@ export function reportUsage(stateDir: string, entries: readonly TranscriptEntry[
 }
 if (import.meta.main) {
   try {
+    // thread-intervals <key> <channel> <shared-queue-snapshot> <sample-ts>...
+    if (process.argv[2] === 'thread-intervals') {
+      if (!existsSync('/etc/cscb-ci-image')) throw new Error('thread intervals require the CI image')
+      const [key, channel, snapshot, ...samples] = process.argv.slice(3)
+      process.stdout.write(threadSampleIntervals(key, channel, samples, jsonLines(snapshot)))
+      process.exit(0)
+    }
     if (process.argv[2] === 'capture') {
       if (!existsSync('/etc/cscb-ci-image')) throw new Error('receipt capture requires the CI image')
       const stateDir = process.argv[3]
@@ -479,15 +558,27 @@ if (import.meta.main) {
       captureReceiptJournals(stateDir)
       process.exit(0)
     }
-    if (process.argv[2] === 'report') {
+    if (['report', 'report-states'].includes(process.argv[2] ?? '')) {
       const [stateDir, shimLog, root, ...keys] = process.argv.slice(3)
       if (!stateDir || !shimLog || !root) throw new Error('report requires state-dir shim-log transcript-root [keys...]')
       const adapters = await packedReceiptAdapters(), transcripts = transcriptFiles(root), entries = readTranscripts(transcripts, adapters, true)
       // Emit usage even when duplicate evidence is damaged or incomplete.
       console.log(`tokens: ${JSON.stringify(transcriptTokens(entries))}`)
-      const result = reportUsage(stateDir, entries, adapters, keys)
-      console.log(`duplicates: ${result.duplicates}`)
+      const states = process.argv[2] === 'report-states' ? [stateDir, ...keys] : [stateDir]
+      const duplicates = states.reduce((sum, state) => sum + reportUsage(state, entries, adapters,
+        process.argv[2] === 'report-states' ? [] : keys).duplicates, 0)
+      console.log(`duplicates: ${duplicates}`)
       process.exit(0)
+    }
+    // thread-latency <state> <key> <shim> <transcripts> <scenario> <mode>
+    //   <population-channel> <delayed-ts> <hung-ts> <sample-ts>...
+    if (process.argv[2] === 'thread-latency') {
+      const [stateDir, key, shimLog, root, scenario, mode, channel, delayed, hung, ...samples] = process.argv.slice(3)
+      const adapters = await packedReceiptAdapters(), transcripts = transcriptFiles(root)
+      const audited = auditReceipts({ stateDir, key, shimLog, transcripts }, readTranscripts(transcripts, adapters), adapters)
+      console.log(receiptsRecord(audited, transcripts.length))
+      process.exit(threadLatency({ key, channel, samples, delayed, hung, scenario, mode: mode as ThreadLatencyOptions['mode'] },
+        audited.timings, receiptJournal(stateDir, key), shimSends(readFileSync(shimLog, 'utf8'))))
     }
     const [command, stateDir, key, shimLog, root, count, mode, statusFile] = process.argv.slice(2)
     if (!stateDir || !key || !shimLog || !root || !['audit', 'ready', 'progress', 'latency', 'diagnostic'].includes(command ?? '')) throw new Error('Usage: transcript-receipts <audit|ready|progress|latency|diagnostic> <state-dir> <key> <shim-log> <transcript-root> [count] [no-retype]')

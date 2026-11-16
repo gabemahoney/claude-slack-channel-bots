@@ -2,20 +2,11 @@
  * persona-destination.ts — Where a persona's permission prompts and server
  * notices go, and the post there.
  *
- * A persona's destination comes from one rule, `personaDestinationOf`
- * over the configuration in effect: its
- * `permission_prompts` setting in declarative mode, its fungible destination
- * (`invited.permission_prompts`, `dm` by default) in fungible mode; either way
- * a channel ID, or `dm`. The resolver reads the configuration in effect
- * through its injected `getPersonaConfig` at each attempt,
- * which every resolver is given. The destination hold and the permission poller ask the resolver
- * (`destinationOf`, `refusalOf`, `settingOf`), so all of them read the one
- * switch. In fungible mode prompts and notices go to the fungible
- * destination on the persona's own client, and after a
- * confirmed switch change the next attempt goes to the destination of the
- * mode turned on. A channel destination is that channel. A
- * `dm` destination is the persona's DM conversation with its `dm.contact`,
- * explicit or by default in fungible mode, obtained with
+ * A persona's required `permission_prompts` selects one common destination
+ * in strict and open modes, read through `personaDestinationOf` at each
+ * attempt. A channel destination stays that channel even after verified
+ * removal from the shared list. A `dm` destination uses the persona's own
+ * client and configured `dm.contact`, obtained with
  * `conversations.open` on the persona's own client (Slack returns the existing
  * conversation, or creates one when none exists, so a DM-only persona's first
  * post needs no prior DM and no history or conversation-list lookup). Posts
@@ -45,13 +36,11 @@
  * has `dm.enabled` on and `dm.contact` set. Should
  * either be missing anyway, nothing is opened or posted: the refusal is logged
  * and returned. Its line names the destination setting in force
- * (`destinationSettingOf`): `permission_prompts` in
- * declarative mode, `invited.permission_prompts` in fungible mode. It does
+ * (`destinationSettingOf`): the common `permission_prompts`. It does
  * not go through the MCP tool-scope check (`checkPersonaTarget`).
  *
- * Every line elsewhere that names a destination setting (the destination
- * hold's `persona-destination-failed` lines, the permission poller's
- * refusal) takes it from the resolver (`settingOf`, read through
+ * Every line elsewhere that names a destination setting (such as the
+ * permission poller's refusal) takes it from the resolver (`settingOf`, read through
  * `destinationSettingFrom`) in the same step as the destination it names, so
  * it names the setting that destination came from.
  *
@@ -72,11 +61,12 @@
  */
 
 import type { WebClient } from '@slack/web-api'
-import { DM_DESTINATION, channelModeOf, type Persona, type ServerSettings } from './config.ts'
-import type { PersonaFungibleDestination } from './delivery-decision.ts'
+import { DM_DESTINATION, type Persona, type ServerSettings } from './config.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { describeSlackCallFailure, describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
+import { ownPostAnswerOfError, ownPostAnswerOfPost, type OwnPostObserver, type OwnPostStart, type OwnPostSurface } from './own-post.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
+import { SERVER_POST_EVENT_TYPE } from './server-post.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -97,11 +87,11 @@ export const NO_CONVERSATION_ID_CODE = 'no_conversation_id'
 /** Maximum wait for a shared DM open; expiry is a retryable destination failure. */
 export const DM_OPEN_TIMEOUT_MS = 10_000
 
-/** The setting that names a persona's destination in declarative mode. */
-export const DECLARATIVE_DESTINATION_SETTING = 'permission_prompts'
+/** The own-post answer of a post its caller cancelled after its intent, before any Slack call. */
+export const OWN_POST_CANCELLED = 'post_cancelled'
 
-/** The setting that names a persona's destination in fungible mode. */
-export const FUNGIBLE_DESTINATION_SETTING = 'invited.permission_prompts'
+/** The common setting that names a persona's destination in both modes. */
+export const DECLARATIVE_DESTINATION_SETTING = 'permission_prompts'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -122,10 +112,10 @@ type PersonaDestination =
 export type DmDestinationRefusal = 'dm_disabled' | 'no_dm_contact'
 
 /**
- * The setting that names a persona's destination in the mode in force
+ * The common setting that names a persona's destination
  * (`destinationSettingOf`).
  */
-export type DestinationSetting = typeof DECLARATIVE_DESTINATION_SETTING | typeof FUNGIBLE_DESTINATION_SETTING
+export type DestinationSetting = typeof DECLARATIVE_DESTINATION_SETTING
 
 /** The Slack call that failed. */
 export type DestinationStep = 'conversations.open' | 'chat.postMessage'
@@ -159,18 +149,45 @@ export interface DestinationRefused {
 /** The outcome of a `conversations.open`: the DM conversation, or the failure. */
 type DmOpenResult = { outcome: 'opened'; channelId: string } | DestinationFailure
 
+/** A post Slack confirmed: the conversation posted to and the returned timestamp. */
+export interface DestinationPosted {
+  outcome: 'posted'
+  channelId: string
+  ts: string | undefined
+}
+
 /** The outcome of one post to a persona's destination. */
 export type DestinationPostResult =
-  | { outcome: 'posted'; channelId: string; ts: string | undefined }
+  | DestinationPosted
   | { outcome: 'cancelled' }
   | DestinationRefused
   | DestinationFailure
+
+/**
+ * What one post is, for its confirmed success. A post with no `surface` is
+ * never observed as an own post.
+ */
+export interface DestinationPostOptions {
+  surface?: OwnPostSurface
+  /**
+   * Called synchronously at the success response, after settling the own-post
+   * operation and before any await. Join bookkeeping faults cannot prevent
+   * the caller from registering the success. Its throw is ignored.
+   */
+  onPosted?(posted: DestinationPosted): void
+}
 
 /** The actual post identity and client, retained independently of later routing changes. */
 export interface DestinationPostedMessage {
   client: DestinationSlackClient
   channelId: string
   ts: string | undefined
+  /**
+   * The observer that saw this post, bound to its persona and surface, so a
+   * follow-up post in the same place is an own-post operation too (SR-3.2.1).
+   * Absent for a post no observer saw.
+   */
+  ownPost?: { key: string; surface: OwnPostSurface; observer: OwnPostObserver }
 }
 
 export interface DestinationMessageTracking {
@@ -188,12 +205,11 @@ export interface DestinationMessage {
 }
 
 /**
- * The part of a configuration the one destination rule reads: its
- * `allow_invited_channels` switch (`channelModeOf`). Null or undefined when
- * there is no configuration (before the server's start resolves): declarative
- * mode.
+ * Configuration shape retained by the resolver's injection interface.
+ * The common destination rule reads only the persona's `permission_prompts`;
+ * it does not depend on this mode or on configuration availability.
  */
-export type DestinationConfig = Pick<ServerSettings, 'allow_invited_channels'> | null | undefined
+export type DestinationConfig = Pick<ServerSettings, 'channel_mode'> | null | undefined
 
 /** Dependencies injected into `createPersonaDestinations`. */
 export interface PersonaDestinationsDeps {
@@ -207,6 +223,8 @@ export interface PersonaDestinationsDeps {
    * Production passes the server's applied configuration.
    */
   getPersonaConfig(): DestinationConfig
+  /** Observes each surfaced post's intent and answer; absent, nothing is observed. */
+  ownPosts?: OwnPostObserver
 }
 
 /**
@@ -226,13 +244,15 @@ export interface PersonaDestinations {
    * configured channel, or the DM with `dm.contact` (opened on `client` unless
    * cached). The destination is resolved, by the one destination rule over
    * the configuration in effect, synchronously at the call. For a channel
-   * destination the post is issued synchronously (before the first `await`).
-   * Never rejects.
+   * destination the post is issued synchronously unless its own-post intent
+   * needs to settle first. The operation ends and `onPosted` runs before a
+   * success is returned; neither join bookkeeping nor the callback can turn
+   * it into a failure. A tracked message cancelled before its Slack call
+   * returns `cancelled`, ending its operation unposted. Never rejects.
    */
-  post(persona: Persona, client: DestinationSlackClient, message: DestinationMessage): Promise<DestinationPostResult>
+  post(persona: Persona, client: DestinationSlackClient, message: DestinationMessage, options?: DestinationPostOptions): Promise<DestinationPostResult>
   /**
-   * The persona's destination now (`personaDestinationOf` over the
-   * configuration in effect at this call): what a `post` called at the same
+   * The persona's destination now (`personaDestinationOf`): what a `post` called at the same
    * moment posts to.
    */
   destinationOf(persona: PersonaDestinationFields): string
@@ -244,8 +264,7 @@ export interface PersonaDestinations {
   refusalOf(persona: PersonaDestinationFields & Pick<Persona, 'dm'>): DmDestinationRefusal | undefined
   /**
    * The setting that names the persona's destination now
-   * (`destinationSettingOf` over the configuration in effect at this call,
-   *): the one a line naming the destination `destinationOf`
+   * (`destinationSettingOf`): the one a line naming the destination `destinationOf`
    * gives at the same moment names. Read through `destinationSettingFrom`.
    */
   settingOf(persona: PersonaDestinationFields): DestinationSetting
@@ -267,44 +286,16 @@ interface DmCacheEntry {
 // ---------------------------------------------------------------------------
 
 /** The resolved fields the one destination rule reads. */
-export type PersonaDestinationFields = Pick<Persona, 'permission_prompts' | 'fungible_destination'>
+export type PersonaDestinationFields = Pick<Persona, 'permission_prompts'>
 
-/**
- * The one destination rule: a persona's
- * destination, `dm` or a channel ID, by the channel mode of `config`, the
- * configuration in effect when the caller acts (
- * `channelModeOf`). Fungible mode: its fungible destination
- * (`invited.permission_prompts`, `dm` when that is absent). Declarative mode:
- * its `permission_prompts` (`dm` when that is absent, which no loaded
- * declarative configuration resolves).
- *
- * Every caller passes the configuration in effect and the persona it read
- * from it at that attempt, never a copy taken at start or held in a closure
- * or a queued item, so a confirmed change of the switch or of either
- * destination setting applies from the next attempt. A `dm` destination is
- * refused by `dmDestinationRefusal` unless DMs are on with a contact.
- *
- * The one place a destination consumer reads `permission_prompts` or
- * `fungible_destination`: the resolver below, its DM
- * refusal, the destination hold, the permission poller and the notifier all
- * go through it. Pure.
- */
-export function personaDestinationOf(config: DestinationConfig, persona: PersonaDestinationFields): string {
-  if (channelModeOf(config) === 'fungible') return persona.fungible_destination ?? DM_DESTINATION
-  return persona.permission_prompts ?? DM_DESTINATION
+/** The required common permission destination in strict and open modes. */
+export function personaDestinationOf(persona: PersonaDestinationFields): string {
+  return persona.permission_prompts
 }
 
-/**
- * The setting that names a persona's destination under `config`, the
- * configuration in effect when the caller acts:
- * `permission_prompts` in declarative mode, `invited.permission_prompts` in
- * fungible mode. It reads the same switch the one destination rule reads
- * (`channelModeOf`), so a line naming it names the setting that
- * `personaDestinationOf` over the same `config` took the destination from.
- * Pure.
- */
-export function destinationSettingOf(config: DestinationConfig): DestinationSetting {
-  return channelModeOf(config) === 'fungible' ? FUNGIBLE_DESTINATION_SETTING : DECLARATIVE_DESTINATION_SETTING
+/** The single permission-destination setting in both modes. */
+export function destinationSettingOf(): DestinationSetting {
+  return DECLARATIVE_DESTINATION_SETTING
 }
 
 /**
@@ -320,28 +311,12 @@ export function destinationSettingFrom(
 }
 
 /**
- * The loop guard's input: each of `personas` (the
- * applied personas of the configuration in effect) with its destination by
- * the one destination rule over `config`, in their order. The one builder of
- * that input: the routing passes it to the delivery decision at each
- * fungible-mode event, and `set_channel_delivery` passes it to
- * `channelDeliveryFor` for its result and line, so both read the same
- * destinations. Pure.
- */
-export function fungibleDestinationsOf(
-  config: DestinationConfig,
-  personas: readonly (PersonaDestinationFields & Pick<Persona, 'key'>)[],
-): PersonaFungibleDestination[] {
-  return personas.map((p) => ({ key: p.key, destination: personaDestinationOf(config, p) }))
-}
-
-/**
  * Resolve a persona's destination through the one destination rule
- * (`personaDestinationOf`) over `config`: `dm` for the DM destination, else
+ * (`personaDestinationOf`): `dm` for the DM destination, else
  * the channel it names. Pure.
  */
-function resolvePersonaDestination(config: DestinationConfig, persona: PersonaDestinationFields): PersonaDestination {
-  const destination = personaDestinationOf(config, persona)
+function resolvePersonaDestination(persona: PersonaDestinationFields): PersonaDestination {
+  const destination = personaDestinationOf(persona)
   if (destination === DM_DESTINATION) return { kind: 'dm' }
   return { kind: 'channel', channelId: destination }
 }
@@ -349,14 +324,14 @@ function resolvePersonaDestination(config: DestinationConfig, persona: PersonaDe
 /**
  * Why the persona's `dm` destination must not be opened (DMs off, or no
  * contact), or undefined when it may be, or when the destination is a
- * channel. The destination comes from the one destination rule over `config`,
- * the configuration in effect (`personaDestinationOf`). Pure.
+ * channel. The destination comes from the one destination rule
+ * (`personaDestinationOf`). Pure.
  */
 export function dmDestinationRefusal(
   config: DestinationConfig,
   persona: PersonaDestinationFields & Pick<Persona, 'dm'>,
 ): DmDestinationRefusal | undefined {
-  if (personaDestinationOf(config, persona) !== DM_DESTINATION) return undefined
+  if (personaDestinationOf(persona) !== DM_DESTINATION) return undefined
   if (!persona.dm.enabled) return 'dm_disabled'
   if (!persona.dm.contact) return 'no_dm_contact'
   return undefined
@@ -427,7 +402,7 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
   const dmCache = new Map<string, DmCacheEntry>()
 
   function destinationOf(persona: PersonaDestinationFields): string {
-    return personaDestinationOf(deps.getPersonaConfig(), persona)
+    return personaDestinationOf(persona)
   }
 
   function refusalOf(persona: PersonaDestinationFields & Pick<Persona, 'dm'>): DmDestinationRefusal | undefined {
@@ -435,7 +410,7 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
   }
 
   function settingOf(persona: PersonaDestinationFields): DestinationSetting {
-    return destinationSettingOf(deps.getPersonaConfig())
+    return destinationSettingOf()
   }
 
   /**
@@ -452,7 +427,7 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
     if (refusal) {
       deps.log(
         `[slack] persona-destination: ${renderPersonaRef(persona.name, persona.key)} has ` +
-          `${destinationSettingOf(config)} set to "${DM_DESTINATION}" but ${describeDmDestinationRefusal(refusal)} — ` +
+          `${destinationSettingOf()} set to "${DM_DESTINATION}" but ${describeDmDestinationRefusal(refusal)} — ` +
           'no DM opened and nothing posted',
       )
       return { outcome: 'refused', reason: refusal }
@@ -500,18 +475,19 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
     })
   }
 
-  // The channel path makes no `await` before `chat.postMessage`, so callers
-  // that issue several posts in a row keep their order.
+  // The channel path posts synchronously unless an intent append must settle;
+  // a post with no intent wait can overtake one that is waiting.
   async function post(
     persona: Persona,
     client: DestinationSlackClient,
     message: DestinationMessage,
+    options?: DestinationPostOptions,
   ): Promise<DestinationPostResult> {
     const cancelled = () => message.tracking?.signal.aborted || message.tracking?.canPost() === false
     if (message.tracking?.signal.aborted) return { outcome: 'cancelled' }
     // One read of the configuration in effect for the whole attempt.
     const config = deps.getPersonaConfig()
-    const destination = resolvePersonaDestination(config, persona)
+    const destination = resolvePersonaDestination(persona)
     let channelId: string
     // The cache entry the post used, so a stale-conversation failure drops
     // that entry only, never a newer one.
@@ -527,21 +503,55 @@ export function createPersonaDestinations(deps: PersonaDestinationsDeps): Person
       if (opened.outcome !== 'opened') return opened
       channelId = opened.channelId
     }
-    const args: { channel: string; text: string; blocks?: never } = { channel: channelId, text: message.text }
+    const args: {
+      channel: string
+      text: string
+      blocks?: never
+      metadata: { event_type: typeof SERVER_POST_EVENT_TYPE; event_payload: Record<string, never> }
+    } = { channel: channelId, text: message.text, metadata: { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} } }
     if (message.blocks !== undefined) args.blocks = message.blocks as never
-    // No await between this exact-message/lifecycle check and the Slack call.
-    if (cancelled()) return { outcome: 'cancelled' }
+    let op: OwnPostStart | undefined
+    if (options?.surface !== undefined) {
+      try {
+        op = deps.ownPosts?.start(persona.key, options.surface, { channel: channelId }, { kind: 'text', text: message.text })
+        if (op?.ready) await op.ready
+      } catch { /* join bookkeeping cannot turn a post into a failure */ }
+    }
+    // No await between this exact-message/lifecycle check and the Slack call:
+    // a save while the post waited for its intent drops it unposted.
+    if (cancelled()) {
+      if (options?.surface !== undefined) {
+        try {
+          deps.ownPosts?.end(op?.operation, { kind: 'failed', code: OWN_POST_CANCELLED })
+        } catch { /* join bookkeeping cannot turn a post into a failure */ }
+      }
+      return { outcome: 'cancelled' }
+    }
+    let response: unknown
     try {
-      const response = await client.chat.postMessage(args)
-      const ts = (response as { ts?: string }).ts
-      try { message.tracking?.onPosted({ client, channelId, ts }) } catch { /* reporting cannot change a successful post */ }
-      return { outcome: 'posted', channelId, ts }
+      response = await client.chat.postMessage(args)
     } catch (err) {
+      if (options?.surface !== undefined) {
+        try {
+          deps.ownPosts?.end(op?.operation, ownPostAnswerOfError(err))
+        } catch { /* join bookkeeping cannot turn a post into a failure */ }
+      }
       const code = classifySlackError(err)
       if (used && code === CHANNEL_NOT_FOUND_ERROR && dmCache.get(persona.key) === used) dmCache.delete(persona.key)
       try { message.tracking?.onPostFailed?.() } catch { /* reporting cannot change the Slack outcome */ }
       return { outcome: 'failed', step: 'chat.postMessage', code, channelId, error: err }
     }
+    if (options?.surface !== undefined) {
+      try {
+        deps.ownPosts?.end(op?.operation, ownPostAnswerOfPost(channelId, response))
+      } catch { /* join bookkeeping cannot turn a post into a failure */ }
+    }
+    const ts = (response as { ts?: unknown } | undefined)?.ts
+    const posted: DestinationPosted = { outcome: 'posted', channelId, ts: typeof ts === 'string' && ts !== '' ? ts : undefined }
+    const ownPost = options?.surface !== undefined && deps.ownPosts ? { key: persona.key, surface: options.surface, observer: deps.ownPosts } : undefined
+    try { message.tracking?.onPosted({ client, channelId, ts: posted.ts, ...(ownPost ? { ownPost } : {}) }) } catch { /* reporting cannot change a successful post */ }
+    try { options?.onPosted?.({ ...posted }) } catch { /* nor can the caller's success bookkeeping */ }
+    return posted
   }
 
   function forget(personaKey: string): void {

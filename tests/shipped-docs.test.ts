@@ -1,3 +1,6 @@
+import { deliveryResultSamples, deliveryCurrentSamples } from './test-helpers/shared-channels.ts'
+import * as recoveryClauses from '../src/reload-preview-clauses.ts'
+import { CHANNEL_TARGET_STATE_UNRESOLVED } from '../src/registry.ts'
 import { REPLY_REMINDER_TEXT } from '../src/reply-reminder.ts'
 /**
  * shipped-docs.test.ts — the shipped-description audit: what
@@ -36,12 +39,16 @@ import { REPLY_REMINDER_TEXT } from '../src/reply-reminder.ts'
  *   read): no
  * first-@mention claim, and no term of `FORBIDDEN_TERMS` (the
  *   pre-persona shape, the token environment variables and command-line
- *   tokens, the access-control file, the retired name-rule wording). The
- *   exemptions (`AUDIT_EXCEPTIONS`) are exactly three: the debugging skill's
- * entry, and one entry per README runbook section, each exempting
+ *   tokens, the access-control file, the retired name-rule wording, the
+ *   destination loop guard, the removed channel-mode configuration). The
+ *   exemptions (`AUDIT_EXCEPTIONS`) are exactly four: the debugging skill's
+ *   pre-persona entry; one entry per README runbook section, each exempting
  *   `access.json` only, and only inside "Switching over to agent-director
  *   Phase 1" (which saves the previous CSCB's file) or "Rolling back the
- * switch-over" (which restores it).
+ *   switch-over" (which restores it); and the debugging skill's
+ *   `### Removed configuration keys` entry, which may name the removed
+ *   switch, the per-persona `invited` key and the old mode names to quote
+ *   each removed-key error with what replaces it.
  *   Every other term stays banned inside those sections, the token
  *   variables' names included; a missing heading fails the audit;
  * - the README's receiving section: its table's row for each
@@ -237,7 +244,7 @@ import { REPLY_REMINDER_TEXT } from '../src/reply-reminder.ts'
  *     and rows, "Confirming a change" and the switch's take-effect exception
  * ; the troubleshooting entries and the downgrade steps.
  * Setting names come from `src/` or typed names, preview
- *     lines from `modeSwitchLine` and `recordedLine` (built when the row
+ *     lines from `modeSwitchLine` (built when the row
  *     runs), labels from their exports; the switch's line is read in its
  *     second carrier too, the setup wizard's step on how a change takes
  *     effect (`WIZARD_SWITCH_LINE_ROW`);
@@ -292,7 +299,8 @@ import {
 } from '../src/ad-settings.ts'
 import { AD_VERSION_RECHECK_INTERVAL_MS, DEBUG_SKILL_PATH, DEBUG_SKILL_RUNTIME_STOP_SECTION_TITLE, PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_DOC, PHASE1_RUNBOOK_SECTION_TITLE, PUBLISHING_HOST_BLOCK_HEADING } from '../src/ad-version-gate.ts'
 import { DEFAULT_STORE_PATH } from '../src/agent-director-client.ts'
-import { CHANNEL_DELIVERY_FILE_NAME, CHANNEL_DELIVERY_UNREADABLE, SET_CHANNEL_DELIVERY_TOOL } from '../src/channel-delivery.ts'
+import { CHANNEL_DELIVERY_FILE_NAME, SET_CHANNEL_DELIVERY_TOOL } from '../src/channel-delivery.ts'
+import { MEMBERSHIP_READINESS_ROUTE, MEMBERSHIP_REQUIRED_SUBSCRIPTIONS } from '../src/channel-membership-readiness.ts'
 import {
   CLEAR_LATCH_COMMAND,
   CLEAR_LATCH_DIAL_HOST,
@@ -315,7 +323,6 @@ import {
   MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   PERSONA_DM_KEYS,
   PERSONA_ENTRY_KEYS,
-  PERSONA_INVITED_KEYS,
   PERSONA_TOP_LEVEL_KEYS,
   prefixRelatedKeysReason,
   resolvePersonaConfig,
@@ -330,7 +337,10 @@ import {
   UNUSABLE_NAME_NOTICE_HEAD
 } from '../src/conflict-latch.ts'
 import { CRONTABLE_TEMPLATE_HEADER } from '../src/cron-bootstrap.ts'
-import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
+import { DELIVERY_STUCK_AFTER_MS, THREAD_REPLY_HOLD_MS } from '../src/delivery-constants.ts'
+import { QUEUE_COMPACT_INTERVAL_MS, parseQueueRecord, type WithdrawnRecord } from '../src/delivery-queue.ts'
+import { REACTION_LOGGED_DROP_REASONS, buildReactionDroppedLine } from '../src/reaction-intake-diagnostics.ts'
+import { buildReactionWithdrawnLine } from '../src/reaction-preparation-diagnostics.ts'
 import type { Via } from '../src/delivery-decision.ts'
 import {
   buildMessageNotSavedNotice,
@@ -370,12 +380,18 @@ import {
   type KillFailureClosing,
 } from '../src/kill-failure-alert.ts'
 import { ONSET_TEMPLATES, tmuxServerChangedOnset } from '../src/outage-state.ts'
+import { THREAD_MEMORY_LOOKUP_METHODS, type ThreadMemoryLookupMethod } from '../src/thread-memory.ts'
 import { STUCK_LAUNCH_HELD_HEAD, STUCK_LAUNCH_RELAUNCHING_HEAD } from '../src/pending-row.ts'
 import { renderLogMessageText } from '../src/persona-connection-errors.ts'
 import {
+  channelDeliverySetCause,
   FUNGIBLE_REFUSAL_TEXTS,
+  NO_STORED_CHOICE,
   PERSONA_CHANNEL_DELIVERY_SET,
-  PERSONA_INVITED_CHANNEL,
+  PERSONA_OPEN_CHANNEL,
+  PERSONA_DIAGNOSTIC_CLASSES,
+  formatPersonaDiagnostic,
+  openChannelCause,
   UNCLAIMED_CHANNEL,
   UNCLAIMED_REASON_CHANNEL_ID_MALFORMED,
   UNCLAIMED_REASON_EXTERNALLY_SHARED,
@@ -401,19 +417,37 @@ import * as registryExports from '../src/registry.ts'
 import {
   channelDeliveryChannelRefusal,
   channelDeliveryDeclarativeRefusal,
-  channelDeliveryNotStoredText,
-  channelDeliverySetResultText,
   channelDeliveryUnreadableRefusal,
   channelDeliveryValueRefusal,
-  channelDeliveryWriteFailedText,
   FUNGIBLE_TARGET_REFUSAL,
   MCP_INSTRUCTIONS,
+  MCP_INSTRUCTIONS_MAX_CHARS,
+  STRICT_TARGET_REFUSAL,
+  THREAD_HYBRID_GLOSS,
   personaNotAppliedRefusal,
   sessionNotMatchedRefusal,
   SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION,
   SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION,
   SET_CHANNEL_DELIVERY_DESCRIPTION,
+  SET_CHANNEL_DELIVERY_ATTEMPT_DESCRIPTION,
+  SET_CHANNEL_DELIVERY_INTENT_DESCRIPTION,
+  channelDeliveryAttemptInputRefusal,
+  channelDeliveryDryRunRefusal,
+  channelDeliveryAttemptResultText,
+  channelDeliveryCurrentFactsText,
 } from '../src/registry.ts'
+import { TAG_DESCRIPTION } from '../src/tag-description.ts'
+import {
+  buildThreadMemoryNotSavedNotice, buildThreadMemoryUnreadableNotice,
+  buildThreadMemoryJoinsLostNotice, buildThreadMemoryChangedWhileStoppedNotice,
+  buildThreadMemoryRecoveredNotice,
+} from '../src/thread-memory-reports.ts'
+import {
+  buildSharedStateUnresolvedNotice, buildMembershipEvidenceUnresolvedNotice,
+  buildSharedStateRecoveredNotice,
+} from '../src/shared-state-reports.ts'
+import { APPLY_FILE_SUFFIX, PENDING_FILE_SUFFIX } from '../src/reload.ts'
+import { REVIEW_REQUEST_SUFFIX } from '../src/reload-request.ts'
 import { RELOAD_NOOP } from '../src/reload-apply.ts'
 import {
   buildChangePlan,
@@ -426,11 +460,8 @@ import {
   NEXT_LAUNCH_SETTINGS,
   NO_EFFECTIVE_CHANGE,
   PENDING_PREVIEW_TITLE,
-  RECORDED_SECTION_KEYS,
-  recordedLine,
   renderPreviewLines,
   type NextLaunchSetting,
-  type RecordedSectionKey,
   type ValidChangePlan,
 } from '../src/reload-plan.ts'
 import { LAST_APPLIED_FILE_SUFFIX, RELOAD_RECORD_WRITE_FAILED } from '../src/reload.ts'
@@ -609,7 +640,7 @@ describe('slack-app-manifest.yml', () => {
     expect(readme).toMatch(/earlier manifest must have both scopes added and be re-installed/)
   })
 
-  // b.n24: scope presence is covered by the pinned list and provisioning tests.
+  // Scope presence is covered by the pinned list and provisioning tests.
   // Keep each migration promise with its own permission, so the Lists note
   // cannot accidentally satisfy the new scopes' operator guidance.
   const housekeepingGuidance = [
@@ -662,6 +693,34 @@ describe('slack-app-manifest.yml', () => {
     }
   })
 
+  // b.n3k: the reaction paragraph carries its own migration, so an earlier
+  // paragraph's re-install note cannot stand in for it.
+  const reactionGuidance = [
+    '`reaction_added`', '`reaction_removed`', '`mpim:read`',
+    /`mpim:read`[^.]*(?:recogni[sz]e|identify|look)[^.]*group DM/i,
+    migrationGuidance[0],
+    /(?=[^.]*`reaction_added`)(?=[^.]*`reaction_removed`)(?=[^.]*`mpim:read`)[^.]*\badded\b[^.]*re-?install/i,
+  ] as const
+
+  test('manifest header explains the reaction events, mpim:read and existing-app re-install', () => {
+    expect(lacking(scopeParagraph(header, 'mpim:read'), reactionGuidance)).toEqual([])
+  })
+
+  test('sensitivity: reaction guidance rejects each omitted obligation, despite other paragraphs\' re-install notes', () => {
+    const paragraphs = header.split(/\n\s*\n/)
+    const index = paragraphs.findIndex(paragraph => paragraph.includes('`mpim:read`'))
+    const paragraph = flat(paragraphs[index] ?? '')
+    expect(lacking(paragraph, reactionGuidance)).toEqual([])
+    for (const item of reactionGuidance) {
+      const pattern = typeof item === 'string' ? new RegExp(escapeRegExp(item), 'g') : new RegExp(item.source, `${item.flags}g`)
+      const edited = paragraph.replace(pattern, '')
+      expect(edited).not.toBe(paragraph)
+      const editedHeader = paragraphs.map((p, i) => (i === index ? edited : p)).join('\n\n')
+      expect(editedHeader.replace(edited, '')).toMatch(/added[^.]*re-?install/i)
+      expect(lacking(scopeParagraph(editedHeader, 'mpim:read'), reactionGuidance).length).toBeGreaterThan(0)
+    }
+  })
+
   test('message.im stays subscribed and message.mpim is not (group DMs unsubscribed)', () => {
     const events = manifest.settings.event_subscriptions.bot_events
     expect(events).toContain('message.im')
@@ -685,6 +744,7 @@ describe('slack-app-manifest.yml', () => {
         'im:write',
         'lists:read',
         'lists:write',
+        'mpim:read',
         'reactions:read',
         'reactions:write',
         'users:read',
@@ -692,9 +752,20 @@ describe('slack-app-manifest.yml', () => {
     )
   })
 
+  // Thread Memory's lookups use scopes the manifest already grants.
+  test('every scope a Thread Memory lookup method needs is already a bot scope', () => {
+    const bot = manifest.oauth_config.scopes.bot
+    const METHOD_SCOPES: Record<ThreadMemoryLookupMethod, readonly string[]> = {
+      'conversations.replies': ['channels:history', 'groups:history'],
+      'conversations.history': ['channels:history', 'groups:history'],
+    }
+    expect(Object.keys(METHOD_SCOPES).sort()).toEqual([...THREAD_MEMORY_LOOKUP_METHODS].sort())
+    expect(Object.values(METHOD_SCOPES).flat().filter((scope) => !bot.includes(scope))).toEqual([])
+  })
+
   test('the bot events are exactly the pinned list (none dropped, none added)', () => {
     expect([...manifest.settings.event_subscriptions.bot_events].sort()).toEqual(
-      ['app_mention', 'message.channels', 'message.groups', 'message.im'].sort(),
+      ['app_mention', 'message.channels', 'message.groups', 'message.im', 'member_joined_channel', 'channel_left', 'reaction_added', 'reaction_removed'].sort(),
     )
   })
 
@@ -763,17 +834,17 @@ function codeSpans(cell: string): string[] {
 /** The persona configuration reference heading (in `CONFIGURATION_DOC`) and its complete-example heading, DOC-1's interface. */
 const PERSONAS_HEADING = '## Personas (config.json)'
 const EXAMPLE_HEADING = '### Example'
-/** The heading of the second complete example, in fungible mode, a section of `CHANNEL_MODES_DOC`. */
-const FUNGIBLE_EXAMPLE_HEADING = '## Example in fungible mode'
+/** The heading of the second complete example, in open mode, a section of `CHANNEL_MODES_DOC`. */
+const OPEN_MODE_EXAMPLE_HEADING = '## Example in open mode'
 
 /**
  * The persona-entry key holding the fungible section: read
  * only in fungible mode, so the declarative example need not carry it.
  */
-const FUNGIBLE_SECTION_KEY = 'invited' satisfies (typeof PERSONA_ENTRY_KEYS)[number]
+const REMOVED_SECTION_KEY = 'invited'
 
 /** The fungible section's key naming the persona's destination, `invited.permission_prompts`. */
-const INVITED_DESTINATION_KEY = 'permission_prompts' satisfies (typeof PERSONA_INVITED_KEYS)[number]
+const INVITED_DESTINATION_KEY = 'permission_prompts' satisfies (typeof PERSONA_ENTRY_KEYS)[number]
 
 /** Where a section nested in the persona reference comes from, for `requiredSection` failures. */
 const IN_PERSONAS = `${CONFIGURATION_DOC}, under "${PERSONAS_HEADING}",`
@@ -786,13 +857,13 @@ function personasSection(text: string): string {
 /**
  * A complete example's text: the one fenced block, tagged `json`, directly
  * under `heading`: `### Example` inside `## Personas (config.json)` of
- * `configuration` (`CONFIGURATION_DOC`), or `## Example in fungible mode` in
+ * `configuration` (`CONFIGURATION_DOC`), or `## Example in open mode` in
  * `CHANNEL_MODES_DOC`. Throws naming what is missing, and on any other count
  * or tag, so the load case never passes vacuously or on some other JSON block.
  */
 function completeExample(configuration: string, heading: string = EXAMPLE_HEADING): string {
   const example =
-    heading === FUNGIBLE_EXAMPLE_HEADING
+    heading === OPEN_MODE_EXAMPLE_HEADING
       ? requiredSection(readRepoFile(CHANNEL_MODES_DOC), heading, CHANNEL_MODES_DOC)
       : requiredSection(personasSection(configuration), heading, IN_PERSONAS)
   const { blocks } = splitFences(example)
@@ -819,7 +890,6 @@ const MOVED_SERVER_SETTINGS = ['ack_reaction', 'reply_chunk_limit', 'reply_chunk
 const KEY_TABLES: [heading: string, keys: readonly string[]][] = [
   ['Persona fields', PERSONA_ENTRY_KEYS.flatMap((key) => {
     if (key === 'dm') return PERSONA_DM_KEYS.map((sub) => `dm.${sub}`)
-    if (key === FUNGIBLE_SECTION_KEY) return PERSONA_INVITED_KEYS.map((sub) => `${FUNGIBLE_SECTION_KEY}.${sub}`)
     return [key]
   })],
   ['Channel entries', CHANNEL_ENTRY_KEYS],
@@ -911,31 +981,24 @@ describe('README.md', () => {
     /** The switch's row, found by the switch named in its Change cell. */
     const SWITCH_ROW: Expected = { label: `the switch ${MODE_SWITCH_SETTING}`, find: naming(MODE_SWITCH_SETTING), session: 'Kept', destructive: false }
 
-    /** The recorded row, found by the section keys its Change cell names. */
-    const RECORDED_ROW: Expected = {
-      label: `a recorded change to the section not in force (${RECORDED_SECTION_KEYS.join(', ')})`,
-      find: naming(...RECORDED_SECTION_KEYS),
-      session: 'Kept',
-      destructive: false,
-    }
+    /** Shared review also covers same-value assignments, with no ordinary in-place diff. */
+    const SHARED_REVIEW_ROW: Expected = { label: 'reviewed channel assignments', find: naming('channels'), session: 'Kept', destructive: false }
 
     /**
-     * One entry per change kind the plan classifies (`ValidChangePlan`'s lists),
+     * One entry per change kind and shared review the plan classifies,
      * the settings expanded from the plan's exported classes. A new kind in the
      * plan fails the typecheck here until it has a README row; a new setting in
-     * a class needs its name in that class's row, so the in-place row names
-     * `invited.permission_prompts` too. The plan reports the
+     * a class needs its name in that class's row. The plan reports the
      * switch (`MODE_SWITCH_SETTING`) among the server-wide settings, so the
      * switch's row is a second `settings` entry, found by the switch named in
      * its Change cell; the server-wide row names the switch only in its Once
-     * confirmed cell, as its exception, so each finder matches one row. The
-     * recorded row (a change to the section not in force) is found by the
-     * section keys its Change cell names (`RECORDED_SECTION_KEYS`).
+     * confirmed cell, as its exception, so each finder matches one row.
      */
     const EXPECTED: Record<
       Exclude<keyof ValidChangePlan, 'valid' | 'noEffectiveChange' | 'configDirsChanged' | 'unchanged'>,
       Expected[]
     > = {
+      sharedReview: [SHARED_REVIEW_ROW],
       inPlace: [
         { label: IN_PLACE_SETTINGS.filter(s => s !== 'stop_hook_bootstrap').join(', '), find: naming(...IN_PLACE_SETTINGS.filter(s => s !== 'stop_hook_bootstrap')), session: 'Kept', destructive: false },
         { label: 'stop_hook_bootstrap', find: naming('stop_hook_bootstrap'), session: 'Kept', destructive: false },
@@ -969,7 +1032,6 @@ describe('README.md', () => {
         destructive: true,
       })),
       settings: [SERVER_WIDE_ROW, SWITCH_ROW],
-      recorded: [RECORDED_ROW],
       added: [
         {
           label: 'a persona is added',
@@ -1017,28 +1079,14 @@ describe('README.md', () => {
       expect(serverWideExceptionProblems(rows)).toEqual([])
     })
 
-    /** The recorded row's problems in `all`: its Once confirmed cell names no `reload-noop`. */
-    function recordedNoopProblems(all: readonly Row[]): string[] {
-      const row = all.find(RECORDED_ROW.find)
-      if (row === undefined) return ['no recorded row']
-      return codeSpans(row.confirmed).includes(RELOAD_NOOP) ? [] : [`Once confirmed names no \`${RELOAD_NOOP}\``]
-    }
-
-    test(`the recorded row's Once confirmed cell names \`${RELOAD_NOOP}\` for a confirmation of recorded changes only`, () => {
-      expect(recordedNoopProblems(rows)).toEqual([])
-    })
-
     /**
-     * Self-checks on edited copies of the README: each of the
-     * two rows this work adds, the switch's and the recorded one, fails its
-     * case when it is removed or duplicated, when its Live session changes,
-     * and when its Once confirmed cell gains `DESTRUCTIVE:`; each leg of the
-     * server-wide exception case (the next server start, the switch, the word
-     * "exception") fails alone when cut from that row; and the recorded row's
-     * `reload-noop` case fails when the label is cut from that row.
+     * Self-checks on edited copies of the reload guide: the switch and shared
+     * review rows each fail when removed, duplicated, given a different live
+     * session effect or marked `DESTRUCTIVE:`. Each server-wide exception
+     * obligation also fails independently when cut from its row.
      */
     describe('self-checks, on edited copies', () => {
-      const NEW_ROWS: readonly Expected[] = [SWITCH_ROW, RECORDED_ROW]
+      const NEW_ROWS: readonly Expected[] = [SWITCH_ROW, SHARED_REVIEW_ROW]
 
       /** `text` with `edit` applied to the raw line of the one table row `expected` finds; an edit to '' removes the line. */
       function withRowEdited(text: string, expected: Expected, edit: (line: string) => string): string {
@@ -1082,11 +1130,7 @@ describe('README.md', () => {
         expect(serverWideExceptionProblems(rowsOf(edited))).toEqual([problem])
       })
 
-      test(`the recorded row with \`${RELOAD_NOOP}\` cut fails the ${RELOAD_NOOP} case`, () => {
-        const edited = withRowEdited(reloadDoc, RECORDED_ROW, (line) => line.replaceAll(`\`${RELOAD_NOOP}\``, 'a no-op line'))
-        expect(edited).not.toBe(reloadDoc)
-        expect(recordedNoopProblems(rowsOf(edited))).toEqual([`Once confirmed names no \`${RELOAD_NOOP}\``])
-      })
+
     })
   })
 
@@ -1167,7 +1211,7 @@ describe('README.md', () => {
         return { raw, home, config }
       }
 
-      const EXAMPLE_HEADINGS = [EXAMPLE_HEADING, FUNGIBLE_EXAMPLE_HEADING]
+      const EXAMPLE_HEADINGS = [EXAMPLE_HEADING, OPEN_MODE_EXAMPLE_HEADING]
 
       test.each(EXAMPLE_HEADINGS)('the example under "%s" loads with no error, one resolved persona per entry, in order', (heading) => {
         const { raw, config } = loadExample(heading)
@@ -1191,10 +1235,10 @@ describe('README.md', () => {
        */
       const COMPLETENESS: [label: string, check: (example: Example) => void][] = [
         ['the switch absent or false (declarative mode)', ({ raw }) => {
-          expect([undefined, false] as unknown[]).toContainEqual(raw[MODE_SWITCH_SETTING])
+          expect([undefined, 'strict'] as unknown[]).toContainEqual(raw[MODE_SWITCH_SETTING])
         }],
         ['every persona-entry key declarative mode reads', ({ raw }) => {
-          const read = PERSONA_ENTRY_KEYS.filter((key) => key !== FUNGIBLE_SECTION_KEY)
+          const read = PERSONA_ENTRY_KEYS
           expect(read.filter((key) => !raw.personas.some((p) => key in p))).toEqual([])
         }],
         ['every dm key', ({ raw }) => {
@@ -1239,31 +1283,26 @@ describe('README.md', () => {
        */
       const FUNGIBLE_COMPLETENESS: [label: string, check: (example: Example) => void][] = [
         ['the switch true (fungible mode)', ({ raw }) => {
-          expect(raw[MODE_SWITCH_SETTING]).toBe(true)
+          expect(raw[MODE_SWITCH_SETTING]).toBe('open')
         }],
         ['a persona with DMs off and a channel fungible destination', ({ config }) => {
           const shapes = config.personas.map((p) => ({
             dm: p.dm.enabled,
-            channelDestination: p.fungible_destination !== undefined && p.fungible_destination !== DM_DESTINATION,
+            channelDestination: p.permission_prompts !== undefined && p.permission_prompts !== DM_DESTINATION,
           }))
           expect(shapes).toContainEqual({ dm: false, channelDestination: true })
         }],
-        [`a persona whose destination is "${DM_DESTINATION}" by default, none written`, ({ raw, config }) => {
-          const byDefault = config.personas.filter((p, i) => {
-            const invited = raw.personas[i].invited
-            const written = invited !== undefined && INVITED_DESTINATION_KEY in invited
-            return p.fungible_destination === DM_DESTINATION && !written
-          })
-          expect(byDefault.map((p) => p.name)).not.toEqual([])
+        ['a persona with an explicitly written DM destination', ({ raw, config }) => {
+          expect(config.personas.some((p, i) => p.permission_prompts === DM_DESTINATION && raw.personas[i]!.permission_prompts === DM_DESTINATION)).toBe(true)
         }],
-        ['every key of the fungible section', ({ raw }) => {
-          const written = (key: string) => raw.personas.some((p) => p.invited !== undefined && key in p.invited)
-          expect(PERSONA_INVITED_KEYS.filter((key) => !written(key))).toEqual([])
+        ['shared fields are present and removed keys never occur', ({ raw }) => {
+          expect(raw.personas.every(p => 'permission_prompts' in p && !(REMOVED_SECTION_KEY in p))).toBe(true)
+          expect(raw).not.toHaveProperty('allow_invited_channels')
         }],
       ]
 
       test.each(FUNGIBLE_COMPLETENESS)('the fungible-mode example is complete: %s', (_label, check) => {
-        check(loadExample(FUNGIBLE_EXAMPLE_HEADING))
+        check(loadExample(OPEN_MODE_EXAMPLE_HEADING))
       })
     })
   })
@@ -1378,7 +1417,7 @@ const toolTextSample = lazy(() => {
  * [export name, form ('' for a text with one form), text]. The listing texts
  * as exported; each builder rendered with `toolTextSample()`, the value and
  * channel refusals in their echoed and their not-shown forms, the result in
- * its plain and its loop-guard-held forms; and the two resolution refusals
+ * its plain form; and the two resolution refusals
  * every tool shares, named for this tool. Each
  * text is rendered when its case runs.
  */
@@ -1386,6 +1425,12 @@ const SET_CHANNEL_DELIVERY_TEXTS: readonly [exportName: string, form: string, te
   const s = toolTextSample
   return [
     ['SET_CHANNEL_DELIVERY_DESCRIPTION', '', () => SET_CHANNEL_DELIVERY_DESCRIPTION],
+    ['SET_CHANNEL_DELIVERY_ATTEMPT_DESCRIPTION', '', () => SET_CHANNEL_DELIVERY_ATTEMPT_DESCRIPTION],
+    ['SET_CHANNEL_DELIVERY_INTENT_DESCRIPTION', '', () => SET_CHANNEL_DELIVERY_INTENT_DESCRIPTION],
+    [channelDeliveryAttemptInputRefusal.name, '', () => channelDeliveryAttemptInputRefusal(s().name, s().key)],
+    [channelDeliveryDryRunRefusal.name, '', () => channelDeliveryDryRunRefusal(s().name, s().key)],
+    ...deliveryResultSamples().map(({ form, result, current }): [string, string, () => string] => [channelDeliveryAttemptResultText.name, form, () => channelDeliveryAttemptResultText(s().name, s().key, s().channel, result, current)]),
+    ...deliveryCurrentSamples().map(({ form, current }): [string, string, () => string] => [channelDeliveryCurrentFactsText.name, form, () => channelDeliveryCurrentFactsText(current)]),
     ['SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION', '', () => SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION],
     ['SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION', '', () => SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION],
     [channelDeliveryDeclarativeRefusal.name, '', () => channelDeliveryDeclarativeRefusal(s().name, s().key)],
@@ -1394,10 +1439,6 @@ const SET_CHANNEL_DELIVERY_TEXTS: readonly [exportName: string, form: string, te
     [channelDeliveryValueRefusal.name, 'not shown', () => channelDeliveryValueRefusal(s().name, s().key, s().hiddenValue)],
     [channelDeliveryChannelRefusal.name, 'echoed', () => channelDeliveryChannelRefusal(s().name, s().key, s().channel)],
     [channelDeliveryChannelRefusal.name, 'not shown', () => channelDeliveryChannelRefusal(s().name, s().key, s().hiddenChannel)],
-    [channelDeliverySetResultText.name, 'plain', () => channelDeliverySetResultText(s().channel, 'all', { delivery: 'all', heldByLoopGuard: false })],
-    [channelDeliverySetResultText.name, 'held by the loop guard', () => channelDeliverySetResultText(s().channel, 'all', { delivery: 'mentions', heldByLoopGuard: true })],
-    [channelDeliveryWriteFailedText.name, '', () => channelDeliveryWriteFailedText(s().name, s().key, s().path)],
-    [channelDeliveryNotStoredText.name, '', () => channelDeliveryNotStoredText(s().name, s().key, 'set_at')],
     [sessionNotMatchedRefusal.name, '', () => sessionNotMatchedRefusal(SET_CHANNEL_DELIVERY_TOOL)],
     [personaNotAppliedRefusal.name, '', () => personaNotAppliedRefusal(SET_CHANNEL_DELIVERY_TOOL, s().key)],
   ]
@@ -1434,6 +1475,9 @@ const SHIPPED_TEXTS: [name: string, read: () => string][] = [
   [`${REPLY_REMINDER_FILE} (reminder text)`, replyReminderText],
   ['CRONTABLE_TEMPLATE_HEADER (src/cron-bootstrap.ts)', crontableHeaderText],
   ...SET_CHANNEL_DELIVERY_TEXTS.map(toolTextEntry),
+  ...Object.entries(recoveryClauses).filter(([name]) => /^(RECOVERY_|REVIEW_ABSENCE_REPLACEMENT$)/.test(name))
+    .map(([name, value]): [string, () => string] => [`${name} (src/reload-preview-clauses.ts)`, () => String(value)]),
+  ['CHANNEL_TARGET_STATE_UNRESOLVED (src/registry.ts)', () => CHANNEL_TARGET_STATE_UNRESOLVED],
 ]
 
 const DEBUG_SKILL_FILE = 'skills/debug-slack-channel-bots/SKILL.md'
@@ -1553,7 +1597,7 @@ describe(`shipped text audit (README, skills, manifest, MCP instructions, ${SET_
 /** One forbidden term: its label in case titles and failures, and its pattern (flag `g`, so every occurrence is found). */
 type Term = readonly [label: string, pattern: RegExp]
 
-/** A group of forbidden terms: what they stand for, the SRs (or decisions) that retire them, and the terms. */
+/** A group of forbidden terms: what they stand for, the behaviour the group enforces (in a comment), and the terms. */
 interface TermGroup {
   name: string
   terms: readonly Term[]
@@ -1595,6 +1639,14 @@ interface TermGroup {
  *   variables you exported for the previous version"), so banning it would
  *   need a second exemption; a name or an export is what would tell an
  *   operator to set one.
+ * - The removed per-persona key `invited` matches only as a key (a code span
+ *   holding exactly `invited`, `"invited":`, an `invited:` line, and the
+ *   removed-key error's `invited has been removed`); "an app invited to a
+ *   channel" never matches. Retired diagnostic labels have their own group,
+ *   with no scoped exemption. "declarative" matches
+ *   only in the old mode and section phrases ("declarative mode",
+ *   "declarative-mode", "declarative and fungible mode", "declarative
+ *   section"); `fungible` matches in any use, including former log values.
  */
 const FORBIDDEN_TERMS: readonly TermGroup[] = [
   {
@@ -1665,9 +1717,52 @@ const FORBIDDEN_TERMS: readonly TermGroup[] = [
     name: 'the retired persona-name rule',
     terms: [['a name that "looks like a Slack token"', /\bnames?\b[^.]{0,40}\blooks?\s+like\s+an?\s+(?:Slack\s+)?token\b/gi]],
   },
+  {
+    // A persona's `delivery` applies as written in another persona's
+    // destination channel: nothing holds it there. The clean-exit loop guard
+    // (session_restart_delay) is another mechanism and stays unflagged.
+    name: 'the destination loop guard',
+    terms: [
+      ['an open-mode or destination loop guard', /\b(?:open(?:-|\s+)mode|open|fungible|destination)\s+loop(?:-|\s+)guards?\b/gi],
+      ['loop-guarded', /\bloop(?:-|\s+)guarded\b/gi],
+      ['loop-guard checks', /\bloop(?:-|\s+)guard\s+checks?\b/gi],
+      ['after the loop guard', /\bafter\s+the\s+loop(?:-|\s+)guard\b/gi],
+      ['the loop guard holding a value', /\bloop(?:-|\s+)guard\s+holds?\b/gi],
+      ['a value held at `mentions`', /\bheld\s+at\s+`mentions`/gi],
+    ],
+  },
+  {
+    // Strict and open mode take `channel_mode` and one shared list; the
+    // removed switch, the removed per-persona `invited` key and the old mode
+    // names appear only where an upgrading operator reads the removed-key
+    // errors. Plain-prose "invited" and bare
+    // "declarative" stay legal.
+    name: 'the removed channel-mode configuration',
+    terms: [
+      ['allow_invited_channels', /\ballow_invited_channels\b/g],
+      ['invited.permission_prompts', /\binvited\.permission_prompts\b/g],
+      ['invited as a configuration key', /`invited`|"invited"\s*:|^[ \t-]*invited:|\binvited\s+has\s+been\s+removed\b/gm],
+      ['fungible', /\bfungible\b/gi],
+      ['declarative mode or section', /\bdeclarative(?:-|\s+)(?:(?:and|or)\s+fungible(?:-|\s+))?(?:modes?|sections?)\b/gi],
+    ],
+  },
+  {
+    // Current log and queue values use open-mode vocabulary, even inside
+    // guidance that may quote removed configuration keys and mode names.
+    name: 'retired diagnostic labels',
+    terms: [
+      ['fungible-refused', /\bfungible-refused\b/gi],
+      ['persona-invited-channel', /\bpersona-invited-channel\b/gi],
+    ],
+  },
 ]
 
-/** One exemption: `terms` may appear in `file` only inside the section under `heading` (bounded at the next heading of its level or higher). */
+/**
+ * One exemption: `terms` may appear in `file` only inside the section under
+ * `heading` (bounded at the next heading of its level or higher). There are
+ * four, in `AUDIT_EXCEPTIONS`: the pre-persona entry, the two runbook entries
+ * and the removed configuration keys entry.
+ */
 interface AuditException {
   file: string
   heading: string
@@ -1724,7 +1819,32 @@ const ROLLBACK_EXCEPTION: AuditException = {
 /** The two runbook entries: one per runbook section in `RUNBOOK_DOC`, each exempting only `access.json`. */
 const RUNBOOK_EXCEPTIONS: readonly AuditException[] = [SWITCH_OVER_EXCEPTION, ROLLBACK_EXCEPTION]
 
-const AUDIT_EXCEPTIONS: readonly AuditException[] = [DELIVERY_WORDING_EXCEPTION, ...RUNBOOK_EXCEPTIONS]
+/** The removed channel-mode configuration group, by its name in `FORBIDDEN_TERMS`. */
+const REMOVED_CHANNEL_MODE_GROUP = 'the removed channel-mode configuration'
+
+/** The removed channel-mode configuration's terms. Throws if the group is gone. */
+function removedChannelModeTerms(): readonly Term[] {
+  const group = FORBIDDEN_TERMS.find((g) => g.name === REMOVED_CHANNEL_MODE_GROUP)
+  if (group === undefined) throw new Error(`FORBIDDEN_TERMS has no group "${REMOVED_CHANNEL_MODE_GROUP}"`)
+  return group.terms
+}
+
+/**
+ * The fourth exemption: the debugging skill's `### Removed configuration keys`
+ * entry, under `## Configuration rejections`, may name the removed
+ * channel-mode configuration (the switch, the per-persona `invited` key and
+ * the old mode names) to quote each removed-key error with what replaces the
+ * key. Every other term stays banned inside it, and those names stay banned
+ * everywhere else. A missing heading throws, as for the other entries.
+ */
+const REMOVED_KEYS_EXCEPTION: AuditException = {
+  file: DEBUG_SKILL_FILE,
+  heading: '### Removed configuration keys',
+  terms: removedChannelModeTerms().map(([label]) => label),
+  reason: "an upgrading operator's removed-key errors, each quoted with what replaces the key",
+}
+
+const AUDIT_EXCEPTIONS: readonly AuditException[] = [DELIVERY_WORDING_EXCEPTION, ...RUNBOOK_EXCEPTIONS, REMOVED_KEYS_EXCEPTION]
 
 /** A forbidden term found in a text: its file, 1-based line, term label, matched text and whole line. */
 interface TermHit {
@@ -1787,6 +1907,54 @@ function auditText(
 /** Every forbidden term, across the groups. */
 const ALL_FORBIDDEN_TERMS: readonly Term[] = FORBIDDEN_TERMS.flatMap((group) => group.terms)
 
+describe('runtime diagnostic vocabulary uses the shipped-text audit', () => {
+  const subject = { name: 'Alpha', key: 'alpha', chat_id: 'C123', message_ts: '1.000001' }
+  const withdrawn = {
+    v: 1, kind: 'withdrawn', seq: 1, at: 1000,
+    reason: 'open-refused', failed_condition: 'externally-shared',
+  } satisfies WithdrawnRecord
+  const samples: readonly [string, () => string, string, string][] = [
+    ['logged drop reason inventory', () => JSON.stringify(REACTION_LOGGED_DROP_REASONS), withdrawn.reason, 'fungible-refused'],
+    ['reaction drop line', () => buildReactionDroppedLine(subject, {
+      reason: withdrawn.reason, chat_id: subject.chat_id,
+      message_ts: subject.message_ts, refusal: 'externally-shared',
+    }), withdrawn.reason, 'fungible-refused'],
+    ['reaction withdrawal line', () => buildReactionWithdrawnLine(subject, withdrawn.reason, withdrawn.failed_condition), withdrawn.reason, 'fungible-refused'],
+    ['serialized withdrawal record', () => JSON.stringify(withdrawn), withdrawn.reason, 'fungible-refused'],
+    ['persona class inventory', () => JSON.stringify(PERSONA_DIAGNOSTIC_CLASSES), PERSONA_OPEN_CHANNEL, 'persona-invited-channel'],
+    ['first-heard persona line', () => formatPersonaDiagnostic({
+      class: PERSONA_OPEN_CHANNEL, name: subject.name, key: subject.key, index: 0,
+      cause: openChannelCause(subject.chat_id, 'public', 'mentions'),
+    }), PERSONA_OPEN_CHANNEL, 'persona-invited-channel'],
+  ]
+
+  test('the withdrawal sample is a current production-format queue record', () => {
+    expect(parseQueueRecord(JSON.stringify(withdrawn))).toEqual(withdrawn)
+    expect(parseQueueRecord(JSON.stringify({ ...withdrawn, reason: 'fungible-refused' }))).toBeUndefined()
+    expect(REACTION_LOGGED_DROP_REASONS).toContain(withdrawn.reason)
+    expect(PERSONA_DIAGNOSTIC_CLASSES).toContain(PERSONA_OPEN_CHANNEL)
+  })
+
+  test.each(samples)('%s passes now and fails if its retired value returns', (name, read, current, retired) => {
+    const text = read()
+    assertNoLeak(text, name)
+    expect(text).toContain(current)
+    expect(auditText(name, text, ALL_FORBIDDEN_TERMS).hits.map(formatHit)).toEqual([])
+    const reverted = text.replaceAll(current, retired)
+    expect(reverted).not.toBe(text)
+    expect(auditText(name, reverted, ALL_FORBIDDEN_TERMS).hits.map(hit => hit.term)).toContain(retired)
+  })
+
+  test.each(['fungible-refused', 'persona-invited-channel'])('%s stays forbidden inside every sanctioned exemption', retired => {
+    for (const exception of AUDIT_EXCEPTIONS) {
+      const text = operatorText(exception.file)
+      const edited = text.replace(exception.heading, `${exception.heading}\n\n${code(retired)}`)
+      expect(edited).not.toBe(text)
+      expect(auditText(exception.file, edited, ALL_FORBIDDEN_TERMS).hits.map(hit => hit.term)).toContain(retired)
+    }
+  })
+})
+
 /** A group's term labels, for case titles. */
 function termLabels(group: TermGroup): string {
   return group.terms.map(([label]) => label).join(', ')
@@ -1811,7 +1979,8 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
     const TWO_FORMS: Record<string, readonly string[]> = {
       [channelDeliveryValueRefusal.name]: ['echoed', 'not shown'],
       [channelDeliveryChannelRefusal.name]: ['echoed', 'not shown'],
-      [channelDeliverySetResultText.name]: ['plain', 'held by the loop guard'],
+      [channelDeliveryAttemptResultText.name]: deliveryResultSamples().map(sample => sample.form),
+      [channelDeliveryCurrentFactsText.name]: deliveryCurrentSamples().map(sample => sample.form),
     }
     const exported = Object.keys(registryExports).filter((name) => /^(?:SET_CHANNEL_DELIVERY_\w*DESCRIPTION|channelDelivery\w+(?:Refusal|Text))$/.test(name))
     expect(exported.length).toBeGreaterThanOrEqual(10)
@@ -1821,6 +1990,24 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
     expect(expected.filter((name) => !read.includes(name))).toEqual([])
   })
 
+  test('attempt outcome inventory keeps every status and rejection and current restrictions', () => {
+    expect(deliveryResultSamples().map(sample => sample.form)).toEqual([
+      'new', 'historical', 'not-applied-membership', 'not-applied-inactive', 'not-applied-strict',
+      'not-applied-dry-run', 'not-applied-write-failed', 'pending', 'unresolved', 'binding-conflict', 'invalid', 'inactive',
+    ])
+    const current = deliveryCurrentSamples()
+    expect(new Set(current.map(sample => sample.form)).size).toBe(30)
+  })
+
+  test('the shipped-text audit includes each actual recovery clause and strict unreadable-state refusal', () => {
+    const names = Object.keys(recoveryClauses).filter(name => /^(RECOVERY_|REVIEW_ABSENCE_REPLACEMENT$)/.test(name))
+    expect(names.sort()).toEqual(['RECOVERY_CURRENT_MEMBERSHIP', 'RECOVERY_LOSS', 'RECOVERY_PRESERVATION', 'RECOVERY_RESTORE', 'RECOVERY_THREADS_FORGOTTEN', 'REVIEW_ABSENCE_REPLACEMENT'])
+    for (const name of [...names.map(name => `${name} (src/reload-preview-clauses.ts)`), 'CHANNEL_TARGET_STATE_UNRESOLVED (src/registry.ts)']) {
+      const entry = SHIPPED_TEXTS.find(([label]) => label === name)
+      expect(entry).toBeDefined(); expect(entry![1]().trim().length).toBeGreaterThan(30)
+    }
+  })
+
   test(`each two-form ${SET_CHANNEL_DELIVERY_TOOL} builder is read in both forms: the echoed form names the sample, the not-shown one does not`, () => {
     const text = (exportName: string, form: string) => SET_CHANNEL_DELIVERY_TEXTS.find(([n, f]) => n === exportName && f === form)![2]()
     const sample = toolTextSample()
@@ -1828,7 +2015,6 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
     expect(text(channelDeliveryValueRefusal.name, 'not shown')).not.toContain(String(sample.hiddenValue))
     expect(text(channelDeliveryChannelRefusal.name, 'echoed')).toContain(JSON.stringify(sample.channel))
     expect(text(channelDeliveryChannelRefusal.name, 'not shown')).not.toContain(sample.hiddenChannel)
-    expect(text(channelDeliverySetResultText.name, 'held by the loop guard')).not.toBe(text(channelDeliverySetResultText.name, 'plain'))
   })
 
   test(`the audit reads ${CREDENTIALS_SCRIPT}, whose prompts and messages the operator sees`, () => {
@@ -1854,12 +2040,72 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
     expect([...new Set(hits.map((hit) => hit.term))].sort()).toEqual([...DELIVERY_WORDING_EXCEPTION.terms].sort())
   })
 
-  test(`the exemptions are exactly the entry and the two runbook entries, each runbook entry exempting only access.json in ${RUNBOOK_DOC}`, () => {
+  test(`the exemptions are exactly four: the pre-persona entry, the two runbook entries, each exempting only access.json in ${RUNBOOK_DOC}, and the removed configuration keys entry`, () => {
     expect(AUDIT_EXCEPTIONS.map((e) => [e.file, e.heading, [...e.terms]])).toEqual([
       [DELIVERY_WORDING_EXCEPTION.file, DELIVERY_WORDING_EXCEPTION.heading, [...DELIVERY_WORDING_EXCEPTION.terms]],
       [RUNBOOK_DOC, `### ${PHASE1_RUNBOOK_SECTION_TITLE}`, ['access.json']],
       [RUNBOOK_DOC, `### ${ROLLBACK_RUNBOOK_SECTION_TITLE}`, ['access.json']],
+      [
+        DEBUG_SKILL_FILE,
+        '### Removed configuration keys',
+        ['allow_invited_channels', 'invited.permission_prompts', 'invited as a configuration key', 'fungible', 'declarative mode or section'],
+      ],
     ])
+  })
+
+  /** The removed keys' labels in the removed channel-mode configuration group; the old mode names are the group's other labels. */
+  const REMOVED_KEY_LABELS = ['allow_invited_channels', 'invited.permission_prompts', 'invited as a configuration key']
+
+  test(`the only allowed hit: the removed channel-mode configuration in ${REMOVED_KEYS_EXCEPTION.file} under "${REMOVED_KEYS_EXCEPTION.heading}"; with the exemptions off, it appears nowhere else in shipped text, and every removed key is named there`, () => {
+    const terms = removedChannelModeTerms()
+    expect(terms.map(([label]) => label)).toEqual([...REMOVED_KEYS_EXCEPTION.terms])
+    const range = sectionRange(operatorText(REMOVED_KEYS_EXCEPTION.file), REMOVED_KEYS_EXCEPTION.heading)
+    if (range === undefined) throw new Error(`${REMOVED_KEYS_EXCEPTION.file} has no heading "${REMOVED_KEYS_EXCEPTION.heading}"`)
+    const inside = (hit: TermHit) => hit.file === REMOVED_KEYS_EXCEPTION.file && hit.line > range.start && hit.line <= range.end
+    const hits = SHIPPED_TEXTS.flatMap(([name, read]) => auditText(name, read(), terms, []).hits)
+    expect(hits.filter((hit) => !inside(hit)).map(formatHit)).toEqual([])
+    const named = new Set(hits.filter(inside).map((hit) => hit.term))
+    expect(REMOVED_KEY_LABELS.filter((label) => !named.has(label))).toEqual([])
+    expect([...named].filter((label) => !REMOVED_KEYS_EXCEPTION.terms.includes(label))).toEqual([])
+  })
+
+  /**
+   * Each removed-key error as the loader renders it (`resolvePersonaConfig`,
+   * pure, no file read), after the persona prefix for a persona entry's key:
+   * a valid configuration with the removed key added, rejected. Throws
+   * unless the loader rejects it.
+   */
+  const removedKeyErrors = lazy((): [key: string, message: string][] => {
+    const base = join(tmpdir(), 'cscb-shipped-docs-removed-keys')
+    const persona = makePersona({}, base)
+    const key = personaKey(String(persona.name))
+    const rejection = (raw: unknown, lead: string): string => {
+      let message: string | undefined
+      try {
+        resolvePersonaConfig(raw, base, base)
+      } catch (err) {
+        assertNoLeak(err, 'removed-key rejection')
+        message = err instanceof Error ? err.message : undefined
+      }
+      const at = message?.indexOf(lead) ?? -1
+      if (message === undefined || at < 0) throw new Error(`the loader did not reject the removed key with a message after "${lead}": ${message}`)
+      return message.slice(at + lead.length)
+    }
+    resolvePersonaConfig({ personas: [persona] }, base, base)
+    return [
+      ['allow_invited_channels', rejection({ allow_invited_channels: true, personas: [persona] }, ': ')],
+      ['invited', rejection({ personas: [{ ...persona, invited: { permission_prompts: DM_DESTINATION } }] }, `(key=${key}): `)],
+    ]
+  })
+
+  test(`the removed configuration keys entry quotes each removed-key error as the loader renders it, names channel_mode and permission_prompts as the replacements, and holds no ### heading`, () => {
+    const text = operatorText(REMOVED_KEYS_EXCEPTION.file)
+    const section = requiredSection(text, REMOVED_KEYS_EXCEPTION.heading, REMOVED_KEYS_EXCEPTION.file)
+    const entry = flat(section)
+    for (const [, message] of removedKeyErrors()) expect(entry).toContain(code(message))
+    expect(entry).toContain(code(MODE_SWITCH_SETTING))
+    expect(entry).toContain(code(PROMPTS_KEY))
+    expect(headings(section).map((h) => h.title)).toEqual([])
   })
 
   test(`the only allowed hits: access.json in ${RUNBOOK_DOC} under "${SWITCH_OVER_EXCEPTION.heading}" and under "${ROLLBACK_EXCEPTION.heading}"; with the exemptions off, it appears nowhere else in shipped text, and both exemptions are used`, () => {
@@ -1899,10 +2145,16 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
     [DELIVERY_WORDING_EXCEPTION.file, '#a-personas-routing-settings-were-changed-by-a-confirmed-change', "That heading's anchor"],
     [DELIVERY_WORDING_EXCEPTION.file, '`[slack] persona-routing: ', "The server's real log prefix"],
     [DELIVERY_WORDING_EXCEPTION.file, 'routinely', 'whole words: "routine" is not "routes"'],
+    [DELIVERY_WORDING_EXCEPTION.file, /^\| `\[slack\] No clean-exit check for persona=.*\(the clean-exit loop guard: .*$/m, "the clean-exit loop guard's log line row: not the destination loop guard"],
+    [DELIVERY_WORDING_EXCEPTION.file, /^A clean exit \(`\/exit`.*shows the check and its loop guard.*$/m, "the clean-exit paragraph: its loop guard is the clean-exit check's"],
     [RUNBOOK_DOC, 'remove any token environment variables you exported for the previous version', "Upgrade wording: variables are banned by name and export form"],
     [SERVER_SETTINGS_DOC, 'slack-channel-router', 'the MCP server name; no route term matches it'],
     [CREDENTIALS_SCRIPT, 'header = "Authorization: Bearer %s"', "the credentials script's curl config line, read from curl's stdin, not a command-line argument"],
     [WIZARD_FILE, /^allowed-tools:.*$/m, 'skill frontmatter: a tool list, not an allowlist'],
+    [DEBUG_SKILL_FILE, `### ${code(PERSONA_OPEN_CHANNEL)}`, 'the current open-path class label'],
+    [DEBUG_SKILL_FILE, '`open-refused`', 'the current open-path refusal reason'],
+    [DEBUG_SKILL_FILE, '## A persona is silent in a channel its app was invited to', 'plain-prose "invited": a Slack invitation, not the removed key'],
+    [RUNBOOK_DOC, /^.*this release never reads `channel-delivery\.json`.*$/m, 'the upgrade keeps channel-delivery.json as a preserved reference; the file name is not banned'],
   ]
 
   test.each(NOT_HITS_BY_DESIGN)('%s: %p is not a hit (%s)', (file, snippet, _reason) => {
@@ -1914,9 +2166,11 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
 })
 
 /**
- * Self-checks for the scanner and the exemption, on in-memory text only: each
- * term is flagged, the exemption covers only its three keys and only
- * inside its section, and persona wording is left alone.
+ * Self-checks for the scanner and the four exemptions, on in-memory text
+ * only: each term is flagged; the pre-persona entry covers only its three
+ * keys, each runbook entry only `access.json`, and the removed configuration
+ * keys entry only the removed channel-mode configuration, each only inside
+ * its section; and persona wording is left alone.
  */
 describe('forbidden-term scanner self-checks', () => {
   /** One sample per term, so a term added to the list needs a sample here. */
@@ -1952,6 +2206,19 @@ describe('forbidden-term scanner self-checks', () => {
     'allowlist wording': 'Add the user to the allow-list.',
     'pairing wording': 'Pairing codes expire after an hour.',
     'a name that "looks like a Slack token"': 'A name that looks like a Slack\ntoken is rejected.',
+    'an open-mode or destination loop guard': 'The open-mode loop guard keeps a persona out of the other\'s destination.',
+    'loop-guarded': 'Departed or loop-guarded saved-all siblings do not count.',
+    'loop-guard checks': 'after current membership, eligibility and loop-guard checks',
+    'after the loop guard': 'at channel delivery mentions after the loop guard',
+    'the loop guard holding a value': 'The loop guard holds a saved `thread_hybrid` there.',
+    'a value held at `mentions`': 'In another persona\'s destination, a channel is held at `mentions`.',
+    allow_invited_channels: 'Set allow_invited_channels to true.',
+    'invited.permission_prompts': 'Set `invited.permission_prompts` to "dm".',
+    'invited as a configuration key': 'Move the `invited` section into the persona entry.',
+    fungible: 'In fungible mode a persona serves every channel.',
+    'declarative mode or section': 'In declarative mode a persona serves its listed channels.',
+    'fungible-refused': 'reason=fungible-refused',
+    'persona-invited-channel': '### `persona-invited-channel`',
   }
 
   /**
@@ -1969,7 +2236,35 @@ describe('forbidden-term scanner self-checks', () => {
     ['a bearer token in a curl header flag', '--header "…"', 'curl --header "Authorization: Bearer <bot token>" https://slack.com/api/auth.test'],
     ['a bearer token in a curl header flag', 'unquoted -H', 'curl -H Authorization:Bearer\\ <bot token> https://slack.com/api/auth.test'],
     ['a bearer token in a curl header flag', '--header=…', "curl --header='Authorization: Bearer <bot token>' https://slack.com/api/auth.test"],
+    ['an open-mode or destination loop guard', '"the open loop guard"', 'Off suppresses mentions before the open loop guard.'],
+    ['an open-mode or destination loop guard', '"the destination loop guard"', 'The destination loop guard applies to every other persona.'],
+    ['the loop guard holding a value', 'a wrapped "holds"', 'The loop\nguard holds the channel at mentions.'],
     ['a name that "looks like a Slack token"', 'plural names', 'Persona names that look like a token are rejected.'],
+    ['invited as a configuration key', 'a quoted "invited" key', '{ "invited": { "permission_prompts": "dm" } }'],
+    ['invited as a configuration key', 'an invited: key', 'personas:\n  - invited:\n      permission_prompts: dm'],
+    ['invited as a configuration key', 'the removed-key error', 'The start fails with invited has been removed; use permission_prompts.'],
+    ['fungible', 'bare "fungible"', 'fungible'],
+    ['fungible', '"Fungible"', 'Fungible'],
+    ['fungible', '"fungible mode"', 'Use fungible mode.'],
+    ['fungible', '"fungible-mode"', 'Use fungible-mode.'],
+    ['fungible', '"a fungible destination"', 'Use a fungible destination.'],
+    ['fungible', '"fungible destination"', "The persona's fungible destination is its DM."],
+    ['fungible', 'the exact former log value', 'reason=fungible-refused'],
+    ['fungible-refused', 'a code span', '`fungible-refused`'],
+    ['persona-invited-channel', 'a diagnostic line', '[slack] persona-invited-channel: personas[0] "Alpha" (key=alpha): hears a channel'],
+    ['persona-invited-channel', 'a case-changed class label', 'PERSONA-INVITED-CHANNEL'],
+    ['fungible', 'a longer token starting with the log value', 'reason=fungible-refused-mode'],
+    ['fungible', 'a longer word starting with the log value', 'reason=fungible-refusedly'],
+    ['fungible', 'a token with a prefix before the log value', 'reason=legacy-fungible-refused'],
+    ['fungible', 'a case-changed log value', 'reason=Fungible-Refused'],
+    ['fungible', 'a log value with a case-changed suffix', 'reason=fungible-Refused'],
+    ['fungible', 'a stale "fungible-mode" anchor', 'See [who can reach it](channel-modes.md#who-can-reach-a-persona-in-fungible-mode).'],
+    ['declarative mode or section', 'a wrapped "declarative mode"', 'Switch back to declarative\nmode first.'],
+    ['declarative mode or section', '"declarative-mode"', 'The declarative-mode example lists every channel.'],
+    ['declarative mode or section', 'the plural', 'Both declarative modes are gone.'],
+    ['declarative mode or section', '"declarative section"', 'Edit the declarative section of the persona.'],
+    ['declarative mode or section', '"declarative and fungible mode"', 'It works in declarative and fungible mode.'],
+    ['declarative mode or section', '"declarative or fungible mode"', 'In declarative or fungible mode alike.'],
   ] as const)('%s is flagged in %s', (label, _form, text) => {
     expect(findTerms('sample', text, ALL_FORBIDDEN_TERMS).map((hit) => hit.term)).toContain(label)
   })
@@ -2007,12 +2302,23 @@ describe('forbidden-term scanner self-checks', () => {
     ['MCP wait without loss', 'Messages sent while MCP is down are kept; they are not lost.'],
     ['unreadable-record non-delivery', buildQueueRecordUnreadableNotice('Alpha', 2, '/state/queue/quarantined.jsonl')],
     ['conversation history loss', 'The transcript is missing; conversation history was lost.'],
+    ['the clean-exit loop guard', 'the full 120s restart delay stands (the clean-exit loop guard: at most one clean-exit relaunch per session_restart_delay)'],
+    ['the clean-exit check and its loop guard', 'A clean exit is relaunched about 3 s later; server.log shows the check and its loop guard.'],
+    ['a persona held at a startup prompt', 'The persona is held at a startup prompt until the operator answers it.'],
+    ['a choice that applies as written', "Each persona's `delivery` applies as written in a channel where another persona posts its permission prompts and notices."],
+    ['plain-prose "invited"', 'A persona is silent in a channel its app was invited to: an app invited to a channel needs it listed.'],
+    ['the current open-path label', `### ${code(PERSONA_OPEN_CHANNEL)}\n[slack] ${PERSONA_OPEN_CHANNEL}: …`],
+    ['channel-delivery.json as a preserved reference', '`channel-delivery.json` is a preserved reference the current release does not read.'],
+    ['channel_mode with its values', 'Set `channel_mode` to `"strict"` or `"open"`; absence defaults to strict.'],
+    ['strict and open mode', 'In strict mode a persona serves its listed channels; in open mode, every eligible channel.'],
+    ['bare "declarative"', 'The configuration is declarative: each persona lists its channels in the shared list.'],
+    ['the current server log value', 'reason=open-refused and `open-refused`'],
   ])('%s is not flagged', (_label, text) => {
     expect(findTerms('sample', text, ALL_FORBIDDEN_TERMS).map(formatHit)).toEqual([])
   })
 
   const FILE = DELIVERY_WORDING_EXCEPTION.file
-  /** A synthetic debugging skill: the section (with a subsection) between two other sections. */
+  /** A synthetic debugging skill: the section (with a subsection) between two other sections, then the removed configuration keys heading, which the skill's file must hold. */
   const skill = (earlier: string, entry: string, later: string) =>
     [
       '# Debugging', //                                  l.1
@@ -2024,6 +2330,7 @@ describe('forbidden-term scanner self-checks', () => {
       'Still inside: `default_route` is rejected.', //   l.7
       '## Later', //                                     l.8
       later, //                                          l.9
+      REMOVED_KEYS_EXCEPTION.heading, //                 l.10
     ].join('\n')
   const ENTRY = '`routes`, `default_route` and `default_dm_session` are rejected.'
 
@@ -2164,6 +2471,74 @@ describe('forbidden-term scanner self-checks', () => {
       expect(() => auditText(README, edited, ALL_FORBIDDEN_TERMS)).toThrow(`${README} has no heading "${heading}"`)
     })
   })
+
+  /** The removed configuration keys exemption, on a synthetic debugging skill. */
+  describe('the removed configuration keys exemption', () => {
+    const HEADING = REMOVED_KEYS_EXCEPTION.heading
+    const NAMES = 'Remove `allow_invited_channels`; "fungible mode" is now open mode.'
+    /**
+     * A synthetic debugging skill: the entry between two `###` siblings under
+     * one `##` section, with a `####` subsection, then another `##` section.
+     * Line numbers hold while each part is one line.
+     */
+    const skill = (before: string, entry: string, after: string) =>
+      [
+        '# Debugging', //                               l.1
+        '## Configuration rejections', //               l.2
+        '### Persona entries', //                       l.3
+        before, //                                      l.4
+        HEADING, //                                     l.5
+        entry, //                                       l.6
+        '#### Detail', //                               l.7
+        'Move `invited.permission_prompts` too.', //    l.8
+        '### Across personas', //                       l.9
+        after, //                                       l.10
+        '## Pre-persona configuration', //              l.11
+      ].join('\n')
+
+    test('inside the section, including its subsections, the removed names are allowed, not hits', () => {
+      const { hits, allowed } = auditText(DEBUG_SKILL_FILE, skill('-', NAMES, '-'), ALL_FORBIDDEN_TERMS)
+      expect(hits).toEqual([])
+      expect(allowed.map((hit) => `${hit.line}: ${hit.term}`)).toEqual(['6: allow_invited_channels', '8: invited.permission_prompts', '6: fungible'])
+    })
+
+    test.each([
+      ['just before the section', skill(NAMES, NAMES, '-'), 4],
+      ['just after its next ### sibling', skill('-', NAMES, NAMES), 10],
+    ])('a removed name %s is a hit, with file and line', (_where, text, line) => {
+      expect(auditText(DEBUG_SKILL_FILE, text, ALL_FORBIDDEN_TERMS).hits.map(formatHit).map((hit) => hit.slice(0, hit.indexOf(' ('))).sort()).toEqual(
+        [`${DEBUG_SKILL_FILE}:${line}: allow_invited_channels`, `${DEBUG_SKILL_FILE}:${line}: fungible`],
+      )
+    })
+
+    test('the same section in another skill exempts nothing', () => {
+      const other = 'skills/other-skill/SKILL.md'
+      const { hits, allowed } = auditText(other, skill('-', NAMES, '-'), ALL_FORBIDDEN_TERMS)
+      expect(allowed).toEqual([])
+      expect(hits.map((hit) => `${hit.file}:${hit.line}: ${hit.term}`)).toEqual(
+        [`${other}:6: allow_invited_channels`, `${other}:8: invited.permission_prompts`, `${other}:6: fungible`],
+      )
+    })
+
+    test.each([
+      ['a token variable', 'Unset SLACK_BOT_TOKEN too.', 'SLACK_BOT_TOKEN'],
+      ['the access-control file', 'Delete access.json too.', 'access.json'],
+      ['a pre-persona key', 'Remove `default_route` too.', 'default_route'],
+    ])('%s inside the section is a hit', (_label, line, term) => {
+      const { hits } = auditText(DEBUG_SKILL_FILE, skill('-', `${NAMES}\n${line}`, '-'), ALL_FORBIDDEN_TERMS)
+      expect(hits.map((hit) => `${hit.line}: ${hit.term}`)).toEqual([`7: ${term}`])
+    })
+
+    test.each([
+      ['removed', (text: string) => text.replace(`${HEADING}\n`, '')],
+      ['renamed', (text: string) => text.replace(HEADING, '### Old configuration keys')],
+      ['moved to another level', (text: string) => text.replace(HEADING, `#${HEADING}`)],
+    ])('with the heading %s, the audit fails naming it and exempts nothing', (_how, edit) => {
+      const edited = edit(skill('-', NAMES, '-'))
+      expect(edited).not.toBe(skill('-', NAMES, '-'))
+      expect(() => auditText(DEBUG_SKILL_FILE, edited, ALL_FORBIDDEN_TERMS)).toThrow(`${DEBUG_SKILL_FILE} has no heading "${HEADING}"`)
+    })
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -2180,6 +2555,7 @@ const VIA_ROWS: Record<Via, string> = {
   dm: 'Direct message',
   mention: 'Direct @mention',
   broadcast: '`@here` / `@channel` broadcast',
+  thread: 'Reply in a thread the bot is in',
   receive_all_shared: 'Every message, shared channel',
   receive_all: 'Every message, this persona alone',
 }
@@ -2244,6 +2620,20 @@ describe(`${BOTS_DOC} "${RECEIVING_HEADING}"`, () => {
     expect(codeSpans(viaCell(label))).toEqual([])
   })
 
+  test('the table contains each delivery reason and injected kind exactly once', () => {
+    const { viaColumn, rows } = kindsTable()
+    // The Reaction Notice row's `reaction` is a tag value outside the message `Via` union.
+    expect(rows.map(row => row[0]).sort()).toEqual([...Object.values(VIA_ROWS), ...INJECTED_ROWS, 'Reaction Notice'].sort())
+    expect(rows.flatMap(row => codeSpans(row[viaColumn] ?? '')).sort()).toEqual([...VIA_VALUES, 'reaction'].sort())
+  })
+
+  test('the receiving explanation includes thread precedence and no obsolete denial of thread following', () => {
+    const text = flat(section())
+    const precedence = text.match(/The first applicable `via` wins[^.]+/)?.[0] ?? ''
+    expect(codeSpans(precedence)).toEqual(['via', ...VIA_VALUES])
+    expect(text).not.toMatch(/(?:do(?:es)? not|never|no) (?:add |support )?thread following/i)
+  })
+
   test.each([
     ['the scheduled prompt', /\bscheduled\s+prompt\b/i],
     ['the `/interject` message', /`\/interject`\s+message\b/i],
@@ -2254,6 +2644,80 @@ describe(`${BOTS_DOC} "${RECEIVING_HEADING}"`, () => {
 
   test('no "Messages a bot receives" heading remains in any user doc', () => {
     expect(USER_DOC_FILES.flatMap((doc) => headings(readRepoFile(doc)).filter((h) => /messages a bot receives/i.test(h.title)).map((h) => `${doc}: ${h.text}`))).toEqual([])
+  })
+})
+
+/** A thread reason describes a thread this bot is in, without an audience promise. */
+function threadAudienceProblems(text: string): string[] {
+  const checks: Array<[string, RegExp]> = [
+    ['whole-channel audience', /(?:every|all) messages? (?:in|from) (?:the|this) channel|(?:whole|entire) channel/i],
+    ['exclusive audience', /(?:only|just) (?:you|this persona) (?:receiv|participat|follow)|(?:exclusive|sole) (?:recipient|audience|participant)/i],
+  ]
+  return checks.filter(([, pattern]) => pattern.test(text)).map(([label]) => label)
+}
+
+describe('exported thread reason wording', () => {
+  const surfaces = [['MCP instructions', MCP_INSTRUCTIONS], ['tag description', TAG_DESCRIPTION]] as const
+  const meaning = /a reply in a thread the bot is in/i
+
+  test.each(surfaces)('%s explains a reply in a thread the bot is in without promising a channel or exclusive audience', (_name, text) => {
+    const clause = text.match(/(?:thread =|via="thread" means)\s*([^\n]*?)(?=;\s*\w+ =|\n|$)/)?.[1] ?? ''
+    expect(clause).toMatch(meaning)
+    expect(threadAudienceProblems(clause)).toEqual([])
+  })
+
+  test('the MCP instruction budget still holds', () => {
+    expect(MCP_INSTRUCTIONS.length).toBeLessThanOrEqual(MCP_INSTRUCTIONS_MAX_CHARS)
+  })
+
+  test('the MCP instructions explain the thread delivery choice with the exported gloss', () => {
+    expect(MCP_INSTRUCTIONS).toContain(`thread_hybrid ${THREAD_HYBRID_GLOSS}`)
+    expect(SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION).toContain(`"thread_hybrid" ${THREAD_HYBRID_GLOSS}`)
+  })
+
+  test.each([
+    ['all messages in the channel', 'whole-channel audience'],
+    ['the entire channel', 'whole-channel audience'],
+    ['only this persona receives it', 'exclusive audience'],
+    ['just you participate', 'exclusive audience'],
+    ['an exclusive recipient', 'exclusive audience'],
+  ])('the audience audit rejects %s even beside the thread explanation', (claim, problem) => {
+    expect(threadAudienceProblems(`A reply in a thread the bot is in; ${claim}.`)).toEqual([problem])
+  })
+
+  test('the thread meaning is required, not just a thread label or the former participation wording', () => {
+    expect('thread = an unmentioned reply').not.toMatch(meaning)
+    expect('thread = a reply delivered because another persona participates in that thread').not.toMatch(meaning)
+  })
+
+  test.each(surfaces)('%s rejects reverting to the former participation wording', (_name, text) => {
+    expect(text).toMatch(meaning)
+    const reverted = text.replace(meaning, 'a reply delivered because this persona participates in that thread')
+    expect(reverted).not.toBe(text)
+    expect(reverted).not.toMatch(meaning)
+  })
+
+  test('the receiving row retains Slack attributes and reminder eligibility without an audience promise', () => {
+    const row = kindRowOf('thread')(referenceText())
+    expect(tableCells(row).slice(2)).toEqual(['Slack attributes', '`thread`', 'Yes'])
+    expect(threadAudienceProblems(row)).toEqual([])
+  })
+
+  /** Wording of following a thread by participation, paused and resumed by a delivery change. */
+  const PARTICIPATION_WORDING = /\b(?:participat|paus|resum)\w*/gi
+
+  test('the receiving row names no participation, pause or resume', () => {
+    expect(kindRowOf('thread')(referenceText()).match(PARTICIPATION_WORDING)).toBeNull()
+  })
+
+  test.each([
+    'It participates once it accepts a direct @mention.',
+    '`mentions` or `all` pauses following.',
+    '`thread_hybrid` resumes it.',
+  ])('self-check: the receiving row with "%s" added fails the participation check', (sentence) => {
+    const text = referenceText()
+    const edited = withLineEdited(text, (line) => line.startsWith(`| ${VIA_ROWS.thread} |`), (line) => line.replace(' A thread\'s channel message', ` ${sentence} A thread's channel message`))
+    expect(kindRowOf('thread')(edited).match(PARTICIPATION_WORDING)).not.toBeNull()
   })
 })
 
@@ -2646,7 +3110,7 @@ const AD_VOCABULARY: Record<string, { text: string; source: string }> = {
   configMalformed: { text: code('ErrConfigMalformed'), source: "HO §1; ADSRD agent-director's answer to a malformed settings file" },
   ownerLabel: { text: code('@ad_owner'), source: "HO rev 15; the session label by which agent-director proves a session is a row's" },
   paneLabel: { text: code('@ad_pane'), source: 'HO rev 17; the per-pane label' },
-  unknownErrorName: { text: code('ErrUnknownErrorName'), source: "agent-director's client: the error a name outside its catalog arrives as; the E4 hatch note (`ad-shim-catalog-incomplete`)" },
+  unknownErrorName: { text: code('ErrUnknownErrorName'), source: "agent-director's client: the error a name outside its catalog arrives as (`ad-shim-catalog-incomplete`)" },
   expireAll: { text: code('--older-than 0d'), source: 'HO C6step 11: never used' },
   'ceiling kill': { text: 'the larger of 2Q + 2A + E + 4W and 3Q + 2A + 5W', source: 'ADSRD' },
   'ceiling read-pane': { text: '3Q + A + 4W', source: 'ADSRD' },
@@ -2782,7 +3246,7 @@ const UPGRADING_TITLE = 'Upgrading to personas'
 /**
  * A link to the `RUNBOOK_DOC` heading titled `title` as the carrier writes
  * it: a same-file anchor in `RUNBOOK_DOC`, `docs/migration.md#…` in the
- * CHANGELOG copy (the PM note).
+ * CHANGELOG copy.
  */
 const readmeLink = (title: string) => (carrier: RunbookCarrier) => `(${carrier.name.startsWith(`${CHANGELOG_FILE} `) ? RUNBOOK_DOC : ''}#${headingSlug(title)})`
 
@@ -2969,7 +3433,7 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci(`the shared orchestrator prompt is the system prompt your orchestrator bots load, for example the file ${code('append_system_prompt_file' satisfies (typeof SERVER_PATH_SETTINGS)[number])} names`),
   ]],
   ['step 1 › The orchestrator prompt', 'operator action: the §6 "ship now" wording', [OPERATOR_ACTION]],
-  ['step 1', `the conversion steps kept in "${UPGRADING_TITLE}" are linked (the E35 T1 PM note)`, [upgradingLink]],
+  ['step 1', `the conversion steps kept in "${UPGRADING_TITLE}" are linked`, [upgradingLink]],
 
   // Steps 2 to 11.
   ['step 2', "the host's autostart for CSCB disabled until step 10", [ci("disable the host's autostart for CSCB until step 10")]],
@@ -3048,7 +3512,7 @@ const SWITCH_OVER_ELEMENTS: [where: string, element: string, required: readonly 
     ci(`passes on the still-installed ${HISTORICAL_RUNBOOK_AD}, with its note`),
   ]],
   ['step 7', 'from this step the new CSCB is deployed but not started', [ci('from this step the new CSCB is deployed but not started')]],
-  ['step 7', `the conversion steps kept in "${UPGRADING_TITLE}" are linked (the E35 T1 PM note)`, [upgradingLink]],
+  ['step 7', `the conversion steps kept in "${UPGRADING_TITLE}" are linked`, [upgradingLink]],
   ['step 8 › The go-ahead', "the go-ahead for this host confirmed as still standing, and recorded in the switch-over log (A-19)", [
     ci('confirm that the go-ahead for this host still stands, and record it in the switch-over log'),
   ]],
@@ -3594,9 +4058,12 @@ describe(`the switch-over runbook, "${PHASE1_RUNBOOK_SECTION_TITLE}"`, () => {
       expect(upgrading()).toMatch(pattern)
     })
 
-    test(`"${UPGRADING_HEADING}" says step 1 writes these steps into the separate staged file, not config.json, and step 7 puts it in place as config.json`, () => {
-      expect(upgrading()).toMatch(ci('at switch-over step 1, these steps are written into the separate staged file, not `config.json`'))
-      expect(upgrading()).toMatch(ci('step 7 puts that file in place as `config.json`'))
+    test(`"${UPGRADING_HEADING}" assigns preparation to the staged file and placement to the switch-over runbook`, () => {
+      expect(linkTexts(upgrading())).toContain('do steps 1, 2, 3, 5 and 6 in the separate staged file at switch-over step 1')
+      expect(linkTexts(upgrading())).toContain('do steps 4, 7 and 8 at switch-over step 7')
+      // Placement still belongs to the linked runbook, whose steps are audited above.
+      expect(upgrading()).toContain('That runbook places the files')
+      expect(flat(readmeCarrier().steps[6])).toContain('config.json')
     })
 
     test.each([1, 7])(`"${UPGRADING_HEADING}" links switch-over step %d`, (n) => {
@@ -3683,7 +4150,7 @@ const ROLLBACK_ELEMENTS: [where: string, element: string, required: readonly Ite
   ['step 2', 'operator action: removing the daily expire', [ci(`loop script that runs it ${OPERATOR_ACTION}`)]],
 
   // Step 3.
-  ['step 3', `the new CSCB stopped with ${CLI_COMMAND_STOP_BOTS}, whose failure lines the CLI Reference describes (E32, E33)`, [
+  ['step 3', `the new CSCB stopped with ${CLI_COMMAND_STOP_BOTS}, whose failure lines the CLI Reference describes`, [
     `claude-slack-channel-bots ${CLI_COMMAND_STOP_BOTS}`,
     ci("the command's failure lines are described in"),
     'Precheck before stopping bots',
@@ -4338,7 +4805,7 @@ const RELEASE_ENTRY_CHECKS: [element: string, problems: (changelog: string) => s
     textUnits(changelog).filter((unit) => /\baccess\.json\b/.test(unit) && DELETE_WORDS.test(unit)).map((unit) => `a delete instruction: ${unit}`)],
   ['the prompt-open relaunch note says the server checks the session through agent-director', (changelog) =>
     noteUnitProblems(changelog, ci('prompt or question open'), (unit) => lacking(unit, [ci('checks the session through agent-director')]))],
-  [`the note "The server's own tmux commands act only on a bot's own session" is gone (E17, E18)`, (changelog) =>
+  [`the note "The server's own tmux commands act only on a bot's own session" is gone`, (changelog) =>
     [...flat(changelog).matchAll(/the server's own tmux commands/gi)].map((m) => `the dropped note is back: ${m[0]}`)],
   [`the prefix-key note's reason is sentence and does not name agent-director ${HISTORICAL_RUNBOOK_AD}`, (changelog) =>
     noteUnitProblems(changelog, ci("may start with another persona's key"), (unit) => [
@@ -4376,14 +4843,14 @@ function releaseCheck(element: string): (changelog: string) => string[] {
  * pinned), with the component and source of each.
  */
 const HATCH_NOTE_NAMES: [name: string, source: string][] = [
-  [CLEAR_LATCH_COMMAND, 'E31: src/clear-latch.ts CLEAR_LATCH_COMMAND'],
-  [SERVER_PORT_FILE_NAME, 'E31: src/clear-latch.ts SERVER_PORT_FILE_NAME'],
-  [CLI_TEARDOWN_FAILED_LABEL, 'E33: src/cli-teardown.ts CLI_TEARDOWN_FAILED_LABEL'],
-  [PERSONA_KILL_FAILED_LABEL, 'E33: src/kill-failure-alert.ts PERSONA_KILL_FAILED_LABEL'],
-  [PERSONA_KILL_SURVIVOR_LABEL, 'E33: src/kill-failure-alert.ts PERSONA_KILL_SURVIVOR_LABEL'],
-  [CLEAN_RESTART_NOT_RESTARTED_LABEL, 'E33: src/cli-teardown.ts CLEAN_RESTART_NOT_RESTARTED_LABEL'],
-  ...startSummaryCountLabels().map((label): [string, string] => [label, 'E26: src/session-manager.ts startupSummaryEnding']),
-  [UNAVAILABLE_RETRY_CAUSE_COLLISION, "E36 T1: src/unavailable-retry.ts UNAVAILABLE_RETRY_CAUSE_COLLISION (the retry cause's rename, reconcile ruling)"],
+  [CLEAR_LATCH_COMMAND, 'src/clear-latch.ts CLEAR_LATCH_COMMAND'],
+  [SERVER_PORT_FILE_NAME, 'src/clear-latch.ts SERVER_PORT_FILE_NAME'],
+  [CLI_TEARDOWN_FAILED_LABEL, 'src/cli-teardown.ts CLI_TEARDOWN_FAILED_LABEL'],
+  [PERSONA_KILL_FAILED_LABEL, 'src/kill-failure-alert.ts PERSONA_KILL_FAILED_LABEL'],
+  [PERSONA_KILL_SURVIVOR_LABEL, 'src/kill-failure-alert.ts PERSONA_KILL_SURVIVOR_LABEL'],
+  [CLEAN_RESTART_NOT_RESTARTED_LABEL, 'src/cli-teardown.ts CLEAN_RESTART_NOT_RESTARTED_LABEL'],
+  ...startSummaryCountLabels().map((label): [string, string] => [label, 'src/session-manager.ts startupSummaryEnding']),
+  [UNAVAILABLE_RETRY_CAUSE_COLLISION, "src/unavailable-retry.ts UNAVAILABLE_RETRY_CAUSE_COLLISION (the retry cause's rename)"],
 ]
 
 /**
@@ -6091,8 +6558,9 @@ function noticeTitle(text: string): string {
 /**
  * The Slack notices README "Troubleshooting" gives an entry each (
  * the retry timer's, `tmux-unresponsive`'s, the kill-failure alert's two
- * versions and the other new notices), each title rendered by the `src/`
- * builder or head that posts it.
+ * versions, the other new notices, the five Thread Memory reports and the
+ * three shared-state reports), each title rendered by the `src/` builder or
+ * head that posts it.
  */
 const TROUBLESHOOTING_NOTICES: readonly [source: string, title: () => string][] = [
   ['tmuxUnresponsiveOnsetText', () => noticeTitle(tmuxUnresponsiveOnsetText(ALERT_KEY))],
@@ -6112,6 +6580,14 @@ const TROUBLESHOOTING_NOTICES: readonly [source: string, title: () => string][] 
     .map(({ content }): [string, () => string] => [`killFailureAlertText (${content.version})`, () => noticeTitle(killFailureAlertText(content, KILL_FAILURE_CLOSING_DESTINATION, true))]),
   ["ONSET_TEMPLATES['ad-config-malformed']", () => noticeTitle(ONSET_TEMPLATES['ad-config-malformed']())],
   ['unclassifiedErrorAlertText', () => noticeTitle(unclassifiedErrorAlertText({ reportedName: undefined, message: '' }))],
+  ['buildThreadMemoryNotSavedNotice', () => memoryNotSavedTitle()],
+  ['buildThreadMemoryUnreadableNotice', () => memoryUnreadableTitle()],
+  ['buildThreadMemoryJoinsLostNotice', () => joinsLostTitle()],
+  ['buildThreadMemoryChangedWhileStoppedNotice', () => memoryChangedTitle()],
+  ['buildThreadMemoryRecoveredNotice', () => memoryRecoveredTitle()],
+  ['buildSharedStateUnresolvedNotice', () => sharedStateUnresolvedTitle()],
+  ['buildMembershipEvidenceUnresolvedNotice', () => membershipEvidenceUnresolvedTitle()],
+  ['buildSharedStateRecoveredNotice', () => sharedStateRecoveredTitle()],
 ]
 
 /**
@@ -6358,14 +6834,14 @@ const README_NOTICE_ROWS: readonly DocRow[] = [
   ]],
 
   // Migration, beside the runbooks.
-  ["Migration: the find-missing job runs as the workers' user and resolves their tmux socket (C7, C19)", sectionOf(USER_DOCS_NAME, MIGRATION_HEADING), [
-    ci("the job must run as the workers' user and resolve their tmux socket"),
-    ci('the socket switch-over step 1 pins'),
+  ["Migration: the find-missing job runs as the workers' user on the pinned tmux socket", sectionOf(RUNBOOK_DOC, /^#### .*Schedule the daily expire$/), [
+    ci("as the workers' user in the tmux environment step 1 pinned"),
+    ci('running both `agent-director find-missing` on a schedule'),
   ]],
   ["Migration: a host that follows the switch-over runbook runs a periodic sweep, which switch-over step 11 (linked) adds where the host has none; it runs as a cron entry, a systemd timer or a loop script, the runbook's sweep schedule", sectionOf(USER_DOCS_NAME, MIGRATION_HEADING), [
-    ci('a host that follows the switch-over runbook runs one'),
-    '[switch-over step 11](#step-11-schedule-the-daily-expire) adds it where the host has none',
-    ci("run it as a cron entry, a systemd timer or a loop script (the switch-over runbook calls this the host's sweep schedule)"),
+    ci('sweep is optional for CSCB recovery'),
+    '[switch-over step 11](#step-11-schedule-the-daily-expire) schedules one where the host has none',
+    ci("The host's sweep schedule can be a cron entry, systemd timer or loop script"),
   ]],
 
   // Destructive changes: the retired persona, no delete, checked kills.
@@ -6818,7 +7294,7 @@ describe('over every operator text (through it)', () => {
     expect(killAdviceProblems(_name === CHANGELOG_FILE ? historicalRunbookText(read()) : read(), CHECKS_THE_RESULT)).toEqual([])
   })
 
-  test.each(OPERATOR_TEXTS)('%s: no `agent-director kill` with a positional id and no kill-and-respawn advice (the E8 note)', (name, read) => {
+  test.each(OPERATOR_TEXTS)('%s: no `agent-director kill` with a positional id and no kill-and-respawn advice', (name, read) => {
     expect(findTerms(name, name === CHANGELOG_FILE ? historicalRunbookText(read()) : migrationKillAuditText(name, read()), RAW_COMMAND_FORMS).map(formatHit)).toEqual([])
   })
 
@@ -6982,7 +7458,7 @@ describe('over every operator text (through it)', () => {
       ['run `agent-director\n  kill <id>`', '`agent-director kill` without --instance-id'],
       ['(`agent-director kill` / tmux-kill + respawn)', 'kill-and-respawn advice'],
       ['then kill and\nrespawn the session', 'kill-and-respawn advice'],
-    ] as const)('the E8 note: %p is reported as %s', (text, label) => {
+    ] as const)('the kill advice: %p is reported as %s', (text, label) => {
       expect(findTerms('sample.md', text, RAW_COMMAND_FORMS).map((hit) => hit.term)).toEqual([label])
     })
 
@@ -7101,7 +7577,8 @@ function migrationCronProblems(readme: string): string[] {
  * side can gain or lose an entry alone. Returns each problem. Pure.
  */
 function troubleshootingIndexProblems(index: string, skill: string): string[] {
-  const titles = requiredSection(index, TROUBLESHOOTING_HEADING, TROUBLESHOOTING_DOC).split('\n').filter((line) => /^\*\*.+\*\*\s*$/.test(line)).map((line) => line.trim().slice(2, -2))
+  const titles = [...requiredSection(index, TROUBLESHOOTING_HEADING, TROUBLESHOOTING_DOC)
+    .matchAll(/^\*\*(.+?)\*\*(?=\s|$)/gm)].map((match) => match[1])
   const entries = troubleshootingEntries(skill).map((entry) => entry.title.slice(2, -2))
   const skillLink = relative(dirname(TROUBLESHOOTING_DOC), DEBUG_SKILL_FILE)
   const links = markdownLinks(index).filter((link) => link.path === skillLink).map((link) => link.anchor)
@@ -7121,9 +7598,11 @@ describe(`${TROUBLESHOOTING_DOC} indexes the debugging skill's "${SYMPTOM_REFERE
   test('self-check: an entry added to the skill alone, or a title dropped from the page, is reported', () => {
     const index = operatorText(TROUBLESHOOTING_DOC)
     const skill = operatorText(DEBUG_SKILL_FILE)
+    const standaloneTitles = index.replace(/^(\*\*.+?\*\*)[ \t]+/gm, '$1\n')
+    expect(troubleshootingIndexProblems(standaloneTitles, skill)).toEqual([])
     const added = skill.replace(SYMPTOM_REFERENCE_HEADING, `${SYMPTOM_REFERENCE_HEADING}\n\n${SYMPTOM_PREFIX}A new symptom\n\nText.\n`)
     expect(troubleshootingIndexProblems(index, added)).toEqual(['the symptom entry "A new symptom" is not on the index', 'the index does not link the symptom entry "A new symptom"'])
-    const dropped = index.replace(/^\*\*config\.json not found\*\*\n/m, '')
+    const dropped = index.replace(/^\*\*config\.json not found\*\*(?=\s|$)/m, '')
     expect(dropped).not.toBe(index)
     expect(troubleshootingIndexProblems(dropped, skill)).toEqual(['the symptom entry "config.json not found" is not on the index'])
   })
@@ -7157,7 +7636,7 @@ describe('the user docs describe the build', () => {
     expect(migrationCronProblems(readme())).toEqual([])
   })
 
-  test.each(REFUSAL_LABELS)(`"${SKILL_STARTUP_ERRORS_HEADING}": the \`%s\` item points to the "${REFUSAL_BLOCK_HEADING}" block and step 10, never "start the server again" (E2 gate)`, (label) => {
+  test.each(REFUSAL_LABELS)(`"${SKILL_STARTUP_ERRORS_HEADING}": the \`%s\` item points to the "${REFUSAL_BLOCK_HEADING}" block and step 10, never "start the server again"`, (label) => {
     expect(readmeRefusalItemProblems(label, readme())).toEqual([])
   })
 
@@ -7290,7 +7769,7 @@ describe('the debugging skill describes the build', () => {
     expect(debugClassSectionNames(`## Other\n\`${RETIRED_KEYS_UNREADABLE_LABEL}\`\n`, RETIRED_KEYS_UNREADABLE_LABEL)).toBe(false)
   })
 
-  test.each(REFUSAL_LABELS)(`the \`%s\` entry's fix follows the "${REFUSAL_BLOCK_HEADING}" block and the runbook's step 10, never "start the server again" (E2 gate)`, (label) => {
+  test.each(REFUSAL_LABELS)(`the \`%s\` entry's fix follows the "${REFUSAL_BLOCK_HEADING}" block and the runbook's step 10, never "start the server again"`, (label) => {
     expect(debugRefusalEntryProblems(label, skill())).toEqual([])
   })
 
@@ -7576,13 +8055,20 @@ describe(`${TESTS_README_FILE} names every integration script and keeps the star
 const CHANNEL_MODES_HEADING = '# Channel modes'
 const SERVER_SETTINGS_HEADING = '# Server settings'
 const WHAT_EACH_MODE_SERVES_HEADING = '## What each mode serves'
-/** The security subsection, read before turning fungible mode on, so right after what each mode serves. */
-const WHO_CAN_REACH_HEADING = '## Who can reach a persona in fungible mode'
-const TURNING_FUNGIBLE_HEADING = '## Turning fungible mode on or off'
-const FUNGIBLE_DELIVERY_HEADING = '## Channel delivery in fungible mode'
-const FUNGIBLE_PROMPTS_HEADING = '## Permission prompts in fungible mode'
-/** The page's sections, in order: the four of the contract, the security section and the fungible-mode example. */
-const CHANNEL_MODES_SUBSECTIONS = [WHAT_EACH_MODE_SERVES_HEADING, WHO_CAN_REACH_HEADING, TURNING_FUNGIBLE_HEADING, FUNGIBLE_DELIVERY_HEADING, FUNGIBLE_PROMPTS_HEADING, FUNGIBLE_EXAMPLE_HEADING] as const
+/** The security subsection, read before turning open mode on, so right after what each mode serves. */
+const WHO_CAN_REACH_HEADING = '## Who can reach a persona in open mode'
+const TURNING_OPEN_MODE_HEADING = '## Turning open mode on or off'
+const DELIVERY_VALUES_HEADING = '## Delivery values in both modes'
+const THREADS_HEADING = '## Threads in `thread_hybrid` channels'
+const PROMPTS_IN_BOTH_MODES_HEADING = '## Permission prompts in both modes'
+/** The page's sections, in order: what each mode serves, the security section, the switch, the delivery values, threads, prompts and the open-mode example. */
+const CHANNEL_MODES_SUBSECTIONS = [WHAT_EACH_MODE_SERVES_HEADING, WHO_CAN_REACH_HEADING, TURNING_OPEN_MODE_HEADING, DELIVERY_VALUES_HEADING, THREADS_HEADING, PROMPTS_IN_BOTH_MODES_HEADING, OPEN_MODE_EXAMPLE_HEADING] as const
+/** The threads section's own sections, in order. */
+const THREADS_SUBSECTIONS = ['### Joining a thread', '### Staying in a thread', '### Starting over'] as const
+/** The upgrade guidance's broader link to configuration rejections. */
+const CONFIGURATION_REJECTIONS_LINK = `[Configuration rejections](${relative('docs', DEBUG_SKILL_FILE)}#configuration-rejections)`
+/** The removed-key explanation links directly to the skill's replacement guidance. */
+const REMOVED_CONFIGURATION_KEYS_LINK = `[Removed configuration keys](${relative('docs', DEBUG_SKILL_FILE)}#${headingSlug(REMOVED_KEYS_EXCEPTION.heading.replace(/^#+ /, ''))})`
 
 /** The downgrade section, under `## Migration` right after "Upgrading to personas". */
 const DOWNGRADE_HEADING = '### Downgrading to an earlier release'
@@ -7608,9 +8094,30 @@ const DM_KEY = 'dm' satisfies (typeof PERSONA_ENTRY_KEYS)[number]
 const DELIVERY_KEY = 'delivery' satisfies (typeof CHANNEL_ENTRY_KEYS)[number]
 const DM_CONTACT = `${DM_KEY}.${'contact' satisfies (typeof PERSONA_DM_KEYS)[number]}`
 const DM_ENABLED = `${DM_KEY}.${'enabled' satisfies (typeof PERSONA_DM_KEYS)[number]}`
-const INVITED_DESTINATION = `${FUNGIBLE_SECTION_KEY}.${INVITED_DESTINATION_KEY}`
+const INVITED_DESTINATION = `${REMOVED_SECTION_KEY}.${INVITED_DESTINATION_KEY}`
 const MENTIONS = 'mentions' satisfies (typeof DELIVERY_MODES)[number]
 const ALL = 'all' satisfies (typeof DELIVERY_MODES)[number]
+const OFF = 'off' satisfies (typeof DELIVERY_MODES)[number]
+const THREAD_HYBRID = 'thread_hybrid' satisfies (typeof DELIVERY_MODES)[number]
+const THREAD_VIA = 'thread' satisfies Via
+const RESUME_KEY = 'resume_enabled' satisfies (typeof PERSONA_TOP_LEVEL_KEYS)[number]
+const QUEUED_ACK_KEY = 'queued_ack_reaction' satisfies (typeof PERSONA_TOP_LEVEL_KEYS)[number]
+// Retired names have no public source constant; the current authority is CHANNEL_DELIVERY_FILE_NAME.
+const LEGACY_DELIVERY_FILE = 'channel-delivery.json'
+const REMOVED_MODE_KEY = 'allow_invited_channels'
+const UPGRADE_HEADING = '### Upgrading from 0.18.x'
+const UPGRADE_ANCHOR = headingSlug(UPGRADE_HEADING.replace(/^#+ /, ''))
+const REINSTALL_ANCHOR = headingSlug('Update and reinstall an existing app')
+const CONFIG_REVIEW_FILES = [CONFIG_FILE_NAME, CHANNEL_DELIVERY_FILE_NAME,
+  ...[REVIEW_REQUEST_SUFFIX, PENDING_FILE_SUFFIX, APPLY_FILE_SUFFIX].map(suffix => CONFIG_FILE_NAME + suffix)]
+const memoryNotSavedTitle = () => noticeTitle(buildThreadMemoryNotSavedNotice('persona', [], '/memory', 'write', 'unavailable'))
+const memoryUnreadableTitle = () => noticeTitle(buildThreadMemoryUnreadableNotice('persona', [], '/memory'))
+const memoryRecoveredTitle = () => noticeTitle(buildThreadMemoryRecoveredNotice('persona', []))
+const memoryChangedTitle = () => noticeTitle(buildThreadMemoryChangedWhileStoppedNotice('persona', [], 'unclean'))
+const joinsLostTitle = () => noticeTitle(buildThreadMemoryJoinsLostNotice({ name: 'persona', key: 'persona' }, { threads: [], messages: [] }).text)
+const sharedStateUnresolvedTitle = () => noticeTitle(buildSharedStateUnresolvedNotice('persona', { channels: [] }, 'unsynced', '/authority'))
+const membershipEvidenceUnresolvedTitle = () => noticeTitle(buildMembershipEvidenceUnresolvedNotice('persona', { channels: [] }, { problem: 'deadline' }))
+const sharedStateRecoveredTitle = () => noticeTitle(buildSharedStateRecoveredNotice('persona', { channels: [] }, 'repair'))
 const RECEIVE_ALL_SHARED = 'receive_all_shared' satisfies Via
 /** `"dm"`, as the README writes the destination value in a code span. */
 const DM_VALUE = code(JSON.stringify(DM_DESTINATION))
@@ -7623,6 +8130,26 @@ const TARGETING_TOOLS = ['reply', 'react', 'edit_message', 'fetch_messages', 'do
 
 /** A README section's flattened text (a row's passage). */
 const readmeSection = (heading: HeadingMatch) => sectionOf(USER_DOCS_NAME, heading)
+
+/** The body between the README title and its first section, also used for in-memory edits. */
+function readmeIntroductionBody(text: string): string {
+  const body = requiredSection(text, README_TITLE_HEADING, USER_DOCS_NAME)
+  const firstSection = headings(body)[0]
+  return body.split('\n').slice(0, firstSection?.line).join('\n')
+}
+
+/** Only introductory prose, regardless of paragraph breaks; later sections cannot supply missing facts. */
+const readmeIntroduction = (text: string) => flat(splitFences(readmeIntroductionBody(text)).prose)
+
+/** `text` with its README introduction split into a paragraph per sentence and wrapped at every space outside code spans: formatting only. */
+const wrappedIntroduction = (text: string) => {
+  const body = readmeIntroductionBody(text)
+  const wrapped = body.replace(/\. /g, '.\n\n').split('`').map((part, i) => (i % 2 === 1 ? part : part.replace(/ /g, '\n'))).join('`')
+  return text.replace(body, () => wrapped)
+}
+
+/** `literal` found in raw Markdown however it is wrapped (`rawGapSource`), for in-memory edits of a flattened passage. */
+const rawLiteral = (literal: string) => new RegExp(rawGapSource(escapeRegExp(literal)))
 
 /** The one line of the README section under `heading` that opens a table row with `| <prefix>`; throws unless exactly one does (a row's passage). */
 const tableRowOf = (heading: HeadingMatch, prefix: string) => (text: string) => {
@@ -7649,9 +8176,90 @@ const downgradeStep = (n: number) => (readme: string) => {
   return step
 }
 
-/** R55's four phases replace the old fungible-only downgrade recipe. */
+/** A numbered procedure step, including nested bullets and continuation lines. */
+const upgradeStep = (n: number) => (text: string): string => {
+  const steps = requiredSection(text, UPGRADE_HEADING, RUNBOOK_DOC).split(/\n(?=\d+\. )/).slice(1)
+  const step = steps[n - 1]
+  if (step === undefined || !step.startsWith(`${n}. `)) throw new Error(`upgrade has no step ${n} in place`)
+  return flat(step)
+}
+
+const UPGRADE_ROWS: readonly DocRow[] = [
+  ['Upgrade: stop old writes before installing or preparing', upgradeStep(1), [
+    ci('Disable autostart'), code(`claude-slack-channel-bots ${CLI_COMMAND_STOP_BOTS}`), ci("old package's"),
+    ci('verify it succeeds before installing'), ci('without starting it'), ci('Keep services and bots stopped'),
+  ]],
+  ['Upgrade: preserve old files and pending intent as manual references', upgradeStep(2), [
+    ci('outside the state directory'), ...[CONFIG_FILE_NAME, CHANNEL_DELIVERY_FILE_NAME, LEGACY_DELIVERY_FILE, CONFIG_FILE_NAME + PENDING_FILE_SUFFIX].map(code),
+    ci('edited, unconfirmed'), ci('keeping their bytes and dates'), ci('manual references only'),
+    ci(`this release never reads ${code(LEGACY_DELIVERY_FILE)}`), ci('refuses removed configuration keys'),
+    REMOVED_CONFIGURATION_KEYS_LINK,
+  ]],
+  ['Upgrade: prepare both baseline files before the first start', upgradeStep(3), [
+    ci('Start from the preserved applied configuration'),
+    ci(`(${code(CHANNEL_DELIVERY_FILE_NAME)}) when present, otherwise the preserved ${code(CONFIG_FILE_NAME)}`),
+    ci('retaining its unrelated settings and defaults'),
+    ci('same complete current-format configuration'), code(CONFIG_FILE_NAME), code(CHANNEL_DELIVERY_FILE_NAME),
+    ci('before the first start'), ci('adopted as the applied baseline'), ci('Keep the reference copies untouched'),
+  ]],
+  ['Upgrade: choose the mode and transfer or retire every old choice deliberately', upgradeStep(3), [
+    code(`${MODE_SWITCH_SETTING}: "strict"`), code('"open"'), ci('whatever the starting mode'),
+    ci('For every channel in either old source'), ci('deliberately transfer its value'),
+    ci(`that configuration or the preserved reference ${code(LEGACY_DELIVERY_FILE)}`),
+    ci(`one shared ${code(CHANNELS_KEY)} list or retire it, including ${code(OFF)}`),
+    ci('never infer writer order from file dates'), ci('active in strict mode once membership is verified'),
+    ci(`explicit ${code(OFF)} stays silent`),
+  ]],
+  ['Upgrade: join defaults and another persona destination keep their meaning', upgradeStep(3), [
+    ci('unlisted, newly verified member'), ci(`${code(OFF)} in strict or ${code(MENTIONS)} in open`),
+    ci("another persona's destination channel applies as written"),
+  ]],
+  ['Upgrade: choose one explicit permission destination', upgradeStep(3), [
+    ci(`one ${code(PROMPTS_KEY)} destination per persona when old destinations differ`),
+    ci('everyone in the chosen channel sees its prompts and notices'), code(DM_CONTACT),
+    ci('formerly implicit DM now needs explicit'), code(`${PROMPTS_KEY}: "${DM_DESTINATION}"`),
+    code(`${DM_ENABLED}: true`), ci('a channel destination must be listed'),
+  ]],
+  ['Upgrade: resolve inactive identities and start with no joined threads', upgradeStep(3), [
+    ci('every reference from an inactive, removed or renamed persona, or another app identity'),
+    ci('an explicit disposition'), ci('nothing is inherited silently'), code(THREAD_HYBRID), ci('upgrade carries no Joined Threads'),
+  ]],
+  ['Upgrade: pending edits stay separate and queues retain accepted facts', upgradeStep(3), [
+    ci(`set aside the edited ${code(CONFIG_FILE_NAME)}'s unconfirmed differences as pending intent before reconciling channel choices`),
+    ci('pending channel, mode, credential-location and unrelated edits separately for later review'),
+    ci('starting confirms none of them'), ci('Leave queues in place'), ci('original text, queued emoji and reminder facts'),
+  ]],
+  ['Upgrade: refuse and correct invalid or interrupted preparation without changing state', upgradeStep(4), [
+    ci('interrupted pair'), ci('invalid value or destination'), ci('removed key can refuse the start'),
+    ci('without changing the baseline or queues'), ci('error identifies the invalid setting'),
+    ci('removed-key error names its replacement'), ci('Correct both baseline files and retry'),
+    ci('unreadable old reference requires an explicit replacement choice'),
+  ]],
+  ['Upgrade: update and reinstall each existing app once with recorded verification', upgradeStep(5), [
+    ci('every existing app and reinstall once'), code('slack-app-manifest.yml'), ...MEMBERSHIP_REQUIRED_SUBSCRIPTIONS.map(code),
+    `(${relative('docs', WIZARD_FILE)}#${REINSTALL_ANCHOR})`, ci('Inspect the current app'),
+    ci('once its persona runs, record that evidence'), ci('read back setup and inventory separately'),
+    ci('new manifest install needs no extra reinstall'),
+  ]],
+  ['Upgrade: startup catches up membership with both downtime outcomes', upgradeStep(6), [
+    code('claude-slack-channel-bots start'), ci('then re-enable autostart'),
+    ci('Startup membership catch-up'), ci('changes while stopped and memberships neither old source held'),
+    ci('A leave still absent at start is found'), ci('a leave and rejoin wholly during downtime'),
+    ci('with no evidence of absence, is not reconstructed'), ci('channel keeps its value'),
+    ci('record and readback on the running persona'),
+  ]],
+  ['Upgrade: restore pending edits through ordinary preview and confirmation', upgradeStep(7), [
+    ci('Restore wanted pending edits as ordinary edits'), ci('read the new preview and confirm it'),
+    '(reload.md#editing-the-configuration)', '(reload.md#confirming-a-change)',
+  ]],
+]
+
+/** Four ordered phases retain the current files and restore the earlier baseline. */
 const R55_DOWNGRADE_ROWS: readonly DocRow[] = [
   ['Downgrading: step 1 stops intake and drains received items, or explicitly accepts loss', downgradeStep(1), [
+    ci(`change every ${code(THREAD_HYBRID)} channel to another delivery value and confirm`),
+    () => ci(`wait until every *${memoryNotSavedTitle()}* or *${memoryUnreadableTitle()}* report has been followed by *${memoryRecoveredTitle()}*`),
+    ci(`then restart once with ${code(`claude-slack-channel-bots ${CLI_COMMAND_CLEAN_RESTART} --server`)} to tidy the queues at start`),
     /stop sending/i, /server\.log/, /every received (?:item|message)[^.]*delivered/i,
     /(?:accept|accepting)[^.]*undelivered messages[^.]*lost/i,
   ]],
@@ -7668,7 +8276,37 @@ const R55_DOWNGRADE_ROWS: readonly DocRow[] = [
   ]],
 ]
 
-/** The troubleshooting entries names, by their titles (T17's closing note). */
+const DOWNGRADE_STATE_ROWS: readonly DocRow[] = [
+  ['Downgrading: restore the earlier format from preserved upgrade references', readmeSection(DOWNGRADE_HEADING), [
+    ci(`cannot use ${code(MODE_SWITCH_SETTING)}, the shared list or ${code(THREAD_HYBRID)}`),
+    ci('restore its configuration and applied baseline'), `(#${UPGRADE_ANCHOR})`,
+    ci('references contain no changes made since the upgrade'),
+    ci(`${code(LEGACY_DELIVERY_FILE)} is a stale preserved reference that the current release never reads`),
+  ]],
+  ['Downgrading: keep current files and restore validated old copies while stopped', downgradeStep(3), [
+    ci('While stopped, save the current'), ...CONFIG_REVIEW_FILES.map(code),
+    ci('outside the state directory for upgrading again'), ci('Prepare copies of the old references'),
+    code(`${RESUME_KEY}: false`), ci("phase 2's settings precautions"),
+    ci('validate them with the earlier release'), ci(`restore them as ${code(CONFIG_FILE_NAME)} and ${code(CHANNEL_DELIVERY_FILE_NAME)}`),
+    ci('keep the current request, pending and apply files out of the state directory'),
+  ]],
+  ['Downgrading: keep the queued reaction precaution for targets without it', readmeSection(DOWNGRADE_HEADING), [
+    ci(`If the target release does not support ${code(QUEUED_ACK_KEY)}, remove it from ${code(CONFIG_FILE_NAME)}`),
+    ci(`confirm while the current server is running, and verify it is absent from ${code(CHANNEL_DELIVERY_FILE_NAME)}`),
+  ]],
+  ['Downgrading: earlier releases leave memory files and deliver waiting replies as ordinary messages', readmeSection(DOWNGRADE_HEADING), [
+    ci('earlier release ignores Thread Memory and leaves its files alone'),
+    ci('delivers as ordinary messages replies still waiting for a thread decision'),
+    ci('or decided since the queue was last tidied'),
+    ci("sets aside those decisions' records as unreadable"), ci('logs each in `server.log`, with no alert'),
+  ]],
+  ['Downgrading: upgrading again restores current inputs and reports changed memory', readmeSection(DOWNGRADE_HEADING), [
+    ci('Before upgrading again, stop with the bots and restore the saved current configuration, applied baseline and pending inputs'),
+    () => ci(`reports *${memoryChangedTitle()}* on upgrading again`),
+  ]],
+]
+
+/** The troubleshooting entries names, by their titles. */
 const SILENT_INVITED_TITLE = 'A persona is silent in a channel it was invited to'
 const RECEIVES_EVERYTHING_TITLE = 'A persona receives every message in a channel'
 const UNCLAIMED_ENTRY_TITLE = 'Messages in a channel no persona is configured into are not delivered'
@@ -7694,24 +8332,21 @@ function switchLineQuote(mode: ChannelMode): string {
   return `${line.slice(0, at).replace(` turns ${mode} mode on`, ' turns <mode> mode on')}, for …`
 }
 
-/** The ending of the switch's line when no persona is in both configurations (`modeSwitchLine` with none), from its last `;`. */
-function switchLineNoPersonaEnding(): string {
-  const line = modeSwitchLine('fungible', [])
-  return line.slice(line.lastIndexOf(';'))
+/**
+ * The `persona-channel-delivery-set` cause as the channel-modes page quotes
+ * it: `channelDeliverySetCause` with the channel as `<channel>`, the earlier
+ * choice as every value it can name and the new one as `<value>`.
+ */
+function deliverySetCauseQuote(): string {
+  type Value = (typeof DELIVERY_MODES)[number]
+  const before = `<${[NO_STORED_CHOICE, ...DELIVERY_MODES].join('|')}>` as Value
+  return channelDeliverySetCause('<channel>', before, '<value>' as Value, '<value>' as Value)
 }
 
-/**
- * A recorded line as README "Reading the preview" quotes it:
- * `recordedLine` for a change to the section of `mode`'s, from ` changed in
- * the`, after `…`. The declarative section's for `channels`, the fungible
- * section's for `invited`.
- */
-function recordedLineQuote(section: ChannelMode): string {
-  const fields: RecordedSectionKey[] = section === 'fungible' ? [FUNGIBLE_SECTION_KEY] : [CHANNELS_KEY]
-  const line = recordedLine({ ...previewSample(), fields })
-  const at = line.indexOf(' changed in the ')
-  if (at < 0) throw new Error(`recordedLine renders no " changed in the ": ${line}`)
-  return `…${line.slice(at)}`
+/** The ending of the switch's line when no persona is in both configurations (`modeSwitchLine` with none), from its last `;`. */
+function switchLineNoPersonaEnding(): string {
+  const line = modeSwitchLine('open', [])
+  return line.slice(line.lastIndexOf(';'))
 }
 
 /**
@@ -7723,329 +8358,308 @@ function recordedLineQuote(section: ChannelMode): string {
  * thunks built when the row runs; labels from their exports.
  */
 const README_DEO_ROWS: readonly DocRow[] = [
-  // the two modes: "## Channel modes" ( S2).
-  ['Channel modes: what each mode serves, the switch, who sets delivery and the destination, per mode', readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [
-    ci(`| The switch | ${SWITCH} absent or ${code('false')}, the default | ${code(`${MODE_SWITCH_SETTING}: true`)} |`),
-    ci(`The channels listed in its ${code(CHANNELS_KEY)} | Every public or private channel its Slack app is a member of that Slack marks as not externally shared`),
-    ci(`The operator, with each channel entry's ${code(DELIVERY_KEY)} | The persona's agent, with ${TOOL}; ${code(MENTIONS)} otherwise`),
-    ci(`| Destination of prompts and notices | ${code(PROMPTS_KEY)} | ${code(INVITED_DESTINATION)}, ${DM_VALUE} when it is absent`),
+["Channel modes: strict and open share configured choices", readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [ci("`channel_mode`"), ci("`strict`"), ci("`open`"), ci("default")]],
+["Channel modes: one shared list and destination", readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [ci("shared"), ci("`channels`"), ci("`permission_prompts`"), ci("both modes")]],
+// Foundation : channelAvailability requires current eligible membership;
+// shared-channels applies join defaults only to a verified member with no choice.
+['Channel modes: current verified membership and join defaults', readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [
+    ci('Listening requires current verified membership'),
+    ci("learned from Slack's join event for the app when invited (the app needs the `member_joined_channel` subscription), or from startup catch-up"),
+    ci('An invitation request is not proof until qualifying evidence arrives'),
+    ci('listing a channel, hearing a message or posting alone is not evidence'),
+    ci('A newly verified member without a choice starts at `off` in strict or `mentions` in open, using the mode when the join is applied'),
+    ci('Duplicate joins and mode switches preserve choices, including `off`'),
   ]],
-  ['Channel modes: two separate sections, neither reading nor overriding the other', readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [
-    ci('**Each mode reads only its own section.** Neither reads nor overrides the other'),
-    ci(`in declarative mode ${code(FUNGIBLE_SECTION_KEY)} is not read, and in fungible mode ${code(CHANNELS_KEY)} and the top-level ${code(PROMPTS_KEY)} are not read, whatever they hold`),
-    ci('A persona may carry both sections, so switching back and forth needs no rewrite'),
+['Channel modes: changing mode preserves applied channel choices', readmeSection(TURNING_OPEN_MODE_HEADING), [
+    ci('Mode changes preserve every applied `delivery` choice and the shared destination'),
+    ci('Strict mode uses the same shared channel choices and destination'),
+    ci('The mode switch preserves them, including choices made while open mode was active'),
+    ci('Slack Connect memberships discovered in open mode already have `mentions` saved when no prior choice existed'),
+    ci('with current verified membership, switching to strict can activate that choice without another manual listing step'),
+    ci('Existing `off` choices stay off'),
+    `[Reading the preview](${relative('docs', RELOAD_DOC)}#reading-the-preview)`,
+    ci('If that external audience is unwanted, review and confirm an explicit `off` assignment **before switching to strict**'),
   ]],
-  ['Channel modes: turning fungible mode on serves, from the next message, every public or private channel each app is already in that is not externally shared, at mentions unless a stored choice applies, listed delivery not carried over', readmeSection(TURNING_FUNGIBLE_HEADING), [
-    ci("**Turning it on.** From each channel's next message, fungible mode serves every public or private channel each persona's app is already in that is not externally shared"),
-    ci(`Each channel is served at ${code(MENTIONS)} unless a stored choice applies`),
-    ci(`Listed ${code(DELIVERY_KEY)} values are not carried over`),
-  ]],
-  [`Channel modes: before turning it on, the operator reviews each app's channels and past ${UNCLAIMED_CHANNEL} lines`, readmeSection(TURNING_FUNGIBLE_HEADING), [
+[`Channel modes: before turning it on, the operator reviews each app's channels and past ${UNCLAIMED_CHANNEL} lines`, readmeSection(TURNING_OPEN_MODE_HEADING), [
     ci("Before you turn it on, review each persona's app's channel memberships in Slack, private channels included"),
     ci(`Past ${code(UNCLAIMED_CHANNEL)} lines in ${code('server.log')} show channels`),
     `grep ${UNCLAIMED_CHANNEL} ~/.config/claude-slack-channel-bots/server.log*`,
   ]],
-  ['Channel modes: upgrades stay declarative, with no migration', readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [
-    ci(`**Upgrades stay declarative.** A configuration without ${SWITCH} runs in declarative mode`),
-    ci(`Upgrading needs no migration, and nothing rewrites ${code(CONFIG_FILE_NAME)}`),
+["Channel modes: a removed key rejects configuration with replacement guidance", readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [
+    ci('A configuration still holding a removed key is rejected with an error naming its replacement'),
+    REMOVED_CONFIGURATION_KEYS_LINK,
   ]],
-  ['Channel modes: switching and switching back go through pending and confirm, with no restart', readmeSection(TURNING_FUNGIBLE_HEADING), [
-    ci('The switch changes through a confirmed edit, like every other setting'),
-    ci('Read the pending preview. The switch has its own line'),
-    ci('It applies in place, at once, from the next event, tool call, prompt and notice, with no restart, and every session is kept'),
-    ci(`To turn it off, remove the setting or set it to ${code('false')}`),
-    ci('**Turning it off.** The change is checked by the declarative rules'),
+["Channel modes: switching through pending confirmation", readmeSection(TURNING_OPEN_MODE_HEADING), [ci("confirmed"), ci("preview"), ci("no restart"), ci("`strict`"), ci("`open`")]],
+['Channel modes: four persistent listening choices with missing choices unresolved', readmeSection(DELIVERY_VALUES_HEADING), [
+    ci('In both modes, the shared choices are `off`, `mentions`, `all` and `thread_hybrid`'),
+    ci('A missing or unreadable assignment holds affected intake; it is not a saved `off` choice'),
+    ci("A newly verified member gets the mode's join default described above, preserving any existing choice"),
+    ci('Applied choices live in `config.json.last-applied` across server restarts and persona relaunches'),
+    ci('A mode switch preserves them'),
+    ci('A removed, renamed or replaced persona never inherits its previous incarnation’s choices'),
+    ci(`**Saved and effective choice.** A persona's saved choice is the ${code(DELIVERY_KEY)} value of its entry in the shared list`),
+    ci("Its effective choice is what applies to the next message: the saved value while its app is a verified, eligible member and the shared state is readable"),
+    ci('the saved value stays as it is'),
   ]],
-  [`Channel modes: channel delivery, ${MENTIONS} by default, ${SET_CHANNEL_DELIVERY_TOOL}, and the loop guard`, readmeSection(FUNGIBLE_DELIVERY_HEADING), [
-    ci(`**${code(MENTIONS)} is the default.** A channel is at ${code(ALL)} only when the persona's agent stored ${code(ALL)} for it with ${TOOL}`),
-    ci(`**The loop guard.** A channel that is another persona's fungible destination (its ${code(INVITED_DESTINATION)} channel) is held at ${code(MENTIONS)} for every other persona, whatever they stored`),
-    ci(`a ${DM_VALUE} destination holds nothing`),
-    ci(`**Stored choices persist.** Each choice is kept in ${code(CHANNEL_DELIVERY_FILE_NAME)}`),
+// decideDelivery checks current channelAvailability and the all choice for each sibling.
+[`Channel modes: ${RECEIVE_ALL_SHARED} requires current eligible effective-all siblings`, readmeSection(DELIVERY_VALUES_HEADING), [
+    ci(`**${code(RECEIVE_ALL_SHARED)} requires effective eligibility.**`),
+    ci('In either mode, a non-mention/non-broadcast message uses this reason only when this persona and another currently eligible member have effective `all` in the channel'),
+    ci('A saved-all choice alone does not count: departed or unverified personas cannot supply it'),
+    ci('a persona on `thread_hybrid` never counts'),
+    ci('otherwise the reason is `receive_all`'),
   ]],
-  [`Channel modes: the ${RECEIVE_ALL_SHARED} approximation, a stored choice saying nothing of whether the other app remains in the channel`, readmeSection(FUNGIBLE_DELIVERY_HEADING), [
-    ci(`**${code(RECEIVE_ALL_SHARED)} is an approximation.**`),
-    ci("A stored choice says nothing about whether the other persona's app remains in the channel"),
+[`Channel modes: a persona's ${code(DELIVERY_KEY)} applies as written in another persona's destination`, readmeSection(DELIVERY_VALUES_HEADING), [
+    ci(`**Notice Destinations.** Each persona's ${code(DELIVERY_KEY)} applies as written in a channel where another persona posts its permission prompts and notices`),
   ]],
-  [`Channel modes: the warning against two personas at ${ALL} in one channel`, readmeSection(FUNGIBLE_DELIVERY_HEADING), [
+['Channel modes: the on-purpose example, a second persona hearing the first persona\'s destination to review its prompts', readmeSection(DELIVERY_VALUES_HEADING), [
+    ci(`Use this on purpose: with ${code('planner')}'s ${code(PROMPTS_KEY)} set to a channel where ${code('reviewer')}'s entry is ${code(ALL)}, ${code('reviewer')} sees each of ${code('planner')}'s prompts and notices there and can review them`),
+  ]],
+['Channel modes: the loop warning for two personas hearing each other in a destination, thread_hybrid channels included', readmeSection(DELIVERY_VALUES_HEADING), [
+    ci('**Two personas hearing each other there can answer each other in a loop.**'),
+    ci("This includes `thread_hybrid` channels, because a persona's own prompts and notices put it in their threads"),
+    ci(`To avoid it, keep one of them at ${code(MENTIONS)}, or give the other persona a different destination`),
+  ]],
+[`Channel modes: the warning against two personas at ${ALL} in one channel or in one thread`, readmeSection(DELIVERY_VALUES_HEADING), [
     ci(`**Don't keep two personas at ${code(ALL)} in one channel.**`),
     ci('the two can keep answering each other with no human involved'),
+    ci('Two personas in one thread they are both in can keep answering each other the same way'),
     ci(`If one should listen to everything, keep the other at ${code(MENTIONS)}`),
   ]],
-  [`Channel modes: the fungible destination ${INVITED_DESTINATION}, "${DM_DESTINATION}" by default`, readmeSection(FUNGIBLE_PROMPTS_HEADING), [
-    ci(`In fungible mode, a persona's destination is its ${code(INVITED_DESTINATION)}, ${DM_VALUE} when it is absent`),
-    ci('**A channel ID:** any channel; it needs no listing and no DMs'),
-    ci(`**${DM_VALUE}, written or by default:** a DM from the persona's app to its ${code(DM_CONTACT)}`),
-  ]],
-
+["Channel modes: required shared destination", readmeSection(PROMPTS_IN_BOTH_MODES_HEADING), [ci("`permission_prompts`"), ci("required"), ci("both modes"), ci("`dm`"), ci("listed")]],
   // the configuration sections cases do not read ( S3).
   [`Server-wide settings: the opening paragraph names ${MODE_SWITCH_SETTING} and the reminder default as applying immediately`, unitOf(USER_DOCS_NAME, '## Server-wide settings', 'These top-level fields apply'), [
     ci('Confirmed changes take effect at the next server start, with exceptions'),
     ci(`${SWITCH} applies in place at once`),
     ci('`stop_hook_bootstrap` applies immediately to each inheriting persona'),
   ]],
-  [`Persona fields: ${CHANNELS_KEY} is a declarative-mode field`, tableRowOf('### Persona fields', `${code(CHANNELS_KEY)} |`), [
-    ci('in declarative mode, yes unless'),
-    ci('Declarative mode only:'),
-    ci('Not read in fungible mode'),
-  ]],
-  [`Persona fields: ${PROMPTS_KEY} is a declarative-mode field`, tableRowOf('### Persona fields', `${code(PROMPTS_KEY)} |`), [
-    ci('in declarative mode, yes'),
-    ci('Declarative mode only:'),
-    ci('Not read in fungible mode'),
-  ]],
-  [`Persona fields: the note on ${DM_KEY} names ${FUNGIBLE_SECTION_KEY}`, unitOf(USER_DOCS_NAME, '### Persona fields', `${code(DM_KEY)} is an object`), [
-    ci(`${code(FUNGIBLE_SECTION_KEY)} is an object holding ${code(INVITED_DESTINATION_KEY)}`),
-  ]],
-  // Each section's pointer into "## Channel modes" is read by `pointerProblems` (DECLARATIVE_POINTERS), not here.
-  ['Channel entries: applies in declarative mode', readmeSection('### Channel entries'), [
-    ci('Channel entries apply in declarative mode'),
-  ]],
-  ['Channel delivery: applies in declarative mode', readmeSection('### Channel delivery'), [
-    ci('This section applies in declarative mode'),
-  ]],
-  ['Permission prompts: applies in declarative mode', readmeSection('### Permission prompts'), [
-    ci(`This section applies in declarative mode, where ${code(PROMPTS_KEY)} is required`),
-  ]],
-  ['Load-time rules: the switch is checked before any persona, and a non-boolean value is rejected naming it', sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
-    ci(`It checks the server-wide settings first, ${SWITCH} among them, before any persona, in either mode`),
-    ci(`a non-boolean ${SWITCH} is rejected naming the setting`),
-  ]],
-  [`Load-time rules: in declarative mode ${FUNGIBLE_SECTION_KEY} is neither checked nor read`, sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
-    ci(`${code(FUNGIBLE_SECTION_KEY)} is neither checked nor read in declarative mode`),
-  ]],
-  [`Load-time rules: in fungible mode ${CHANNELS_KEY} and the top-level ${PROMPTS_KEY} are neither checked nor read`, sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
-    ci(`${code(CHANNELS_KEY)} and the top-level ${code(PROMPTS_KEY)} are neither checked nor read in fungible mode`),
-  ]],
-  [`Load-time rules: in fungible mode ${FUNGIBLE_SECTION_KEY} is an object holding only ${INVITED_DESTINATION_KEY}, "${DM_DESTINATION}" or a channel ID`, sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
-    ci(`${code(FUNGIBLE_SECTION_KEY)} isn't an object, or holds a key other than ${code(INVITED_DESTINATION_KEY)}`),
-    ci(`${code(INVITED_DESTINATION)} is neither ${DM_VALUE} nor a well-formed channel ID`),
-  ]],
-  [`Load-time rules: in fungible mode a "${DM_DESTINATION}" destination, written or by default, needs ${DM_ENABLED} true and a ${DM_CONTACT}`, sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
-    ci(`The persona's destination is ${DM_VALUE}, written or by default, without ${code(`${DM_ENABLED}: true`)} or without a ${code(DM_CONTACT)}`),
-  ]],
-  ['Load-time rules: in fungible mode a channel destination needs no listing and no DMs', sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
-    ci('A channel destination needs no listing and no DMs'),
-  ]],
-  ['Load-time rules: the cross-persona rules apply in both modes', sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
+["Persona fields: shared channel choices", tableRowOf('### Persona fields', `${code(CHANNELS_KEY)} |`), [ci("both modes")]],
+["Persona fields: required shared destination", tableRowOf('### Persona fields', `${code(PROMPTS_KEY)} |`), [ci("both modes"), ci("required")]],
+["Channel entries: shared in both modes", readmeSection('### Channel entries'), [ci("both modes")]],
+["Delivery values: four shared values", readmeSection('### Delivery values'), [ci("both modes"), ci("`off`"), ci("`mentions`"), ci("`all`"), ci("`thread_hybrid`")]],
+["Permission prompts: required in both modes", readmeSection('### Permission prompts'), [ci("both modes"), ci("required")]],
+["Load-time rules: channel_mode accepts only strict and open", sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [ci("`channel_mode`"), ci("`strict`"), ci("`open`"), ci("rejected")]],
+["Load-time rules: explicit DM destination requires enabled and contact", sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [ci("`permission_prompts`"), ci("`dm`"), ci("`dm.enabled`"), ci("`dm.contact`")]],
+["Load-time rules: a listed channel destination is allowed including off", sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [ci("listed"), ci("including `off`"), ci("both modes")]],
+['Load-time rules: the cross-persona rules apply in both modes', sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
     ci("In both modes: - A persona's name or key equals another persona's name or key. - A persona's key starts with another persona's key"),
     ci(`Two personas share a ${code('working_directory' satisfies (typeof PERSONA_ENTRY_KEYS)[number])} or a ${code('credentials_file' satisfies (typeof PERSONA_ENTRY_KEYS)[number])}, compared by real path`),
   ]],
-  ['Load-time rules: a change is judged by the mode it turns on, INVALID in each direction', sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
-    ci('A pending change is judged by the rules of the mode its own switch picks, not by the mode in effect'),
-    ci(`A change that turns fungible mode on is ${INVALID} when a persona's ${code(FUNGIBLE_SECTION_KEY)} section breaks the fungible-mode rules`),
-    ci(`a change that turns it off is ${INVALID} when a persona's ${code(CHANNELS_KEY)} or ${code(PROMPTS_KEY)} breaks the declarative-mode rules`),
-  ]],
-
-  // receiving, security ( S4).
-  ...(['mention', 'broadcast'] as const).map((via): DocRow => [`receiving: the ${via} row, scoped per mode`, kindRowOf(via), [
-    ci(`In declarative mode: in a channel listed in ${via === 'mention' ? 'its' : "the persona's"} ${code(CHANNELS_KEY)}`),
-    ci('In fungible mode: in a public or private channel its app is in that is not externally shared, at either channel delivery'),
+["Load-time rules: shared fields are validated regardless of mode", sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [ci("both modes"), ci("`channels`"), ci("`permission_prompts`"), ci("invalid")]],
+...(['mention', 'broadcast'] as const).map((via): DocRow => [`receiving: the ${via} row, scoped per mode`, kindRowOf(via), [
+    ci(`In strict mode: in a channel listed in ${via === 'mention' ? 'its' : "the persona's"} ${code(CHANNELS_KEY)}`),
+    ci('In open mode: in a public or private channel its app is in that is not externally shared, with a non-off applied channel choice'),
   ]]),
-  [`receiving: the ${RECEIVE_ALL_SHARED} row, scoped per mode`, kindRowOf(RECEIVE_ALL_SHARED), [
-    ci(`In declarative mode: in a channel listed in its ${code(CHANNELS_KEY)} with ${code(`${DELIVERY_KEY}: ${ALL}`)}, when at least one other persona`),
-    ci(`In fungible mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is ${code(ALL)}`),
-    ci(`has a channel delivery of ${code(ALL)} for that channel by the same rule, whether or not that persona's app remains in the channel`),
+['receiving: current verified eligibility in both modes', unitOf(USER_DOCS_NAME, RECEIVING_HEADING, 'For every channel message and thread reply,'), [
+    ci('both modes require current verified eligible membership and a trustworthy non-off choice'),
+    ci('open also requires a public/private channel with explicit non-external-sharing evidence'),
+    ci('Off suppresses mentions and broadcasts'),
+    ci('unresolved facts withhold affected acknowledgement while independent recipients and accepted work can progress'),
   ]],
-  ['receiving: the receive_all row, scoped per mode', kindRowOf('receive_all'), [
-    ci(`In declarative mode: in a channel listed in its ${code(CHANNELS_KEY)} with ${code(`${DELIVERY_KEY}: ${ALL}`)}, when no other persona`),
-    ci(`In fungible mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is ${code(ALL)}, when no other persona in the applied configuration has a channel delivery of ${code(ALL)} for that channel`),
+[`receiving: the ${RECEIVE_ALL_SHARED} row requires current eligible effective-all siblings`, kindRowOf(RECEIVE_ALL_SHARED), [
+    ci('Neither a direct mention nor a broadcast, with effective `all` for this persona and another currently eligible persona in the same channel'),
+    ci(`Only another persona whose saved choice is ${code(ALL)} counts; departed, unverified or off ones do not`),
+    ci('and a persona on `thread_hybrid` never does'),
   ]],
-  ['receiving: in fungible mode an @mention is delivered from its message event', unitOf(USER_DOCS_NAME, RECEIVING_HEADING, '- **In fungible mode, an @mention is delivered from its'), [
-    ci(`**In fungible mode, an @mention is delivered from its ${code('message')} event.**`),
+['receiving: the receive_all row, scoped per mode', kindRowOf('receive_all'), [
+    ci(`In strict mode: in a channel listed in its ${code(CHANNELS_KEY)} with ${code(`${DELIVERY_KEY}: ${ALL}`)}, when no other persona is currently eligible and effectively all there`),
+    ci(`In open mode: in a public or private channel its app is in that is not externally shared, where its applied choice is ${code(ALL)}, when no other persona in the applied configuration has a choice of ${code(ALL)} for that channel after current membership and eligibility checks`),
+  ]],
+['receiving: a reply in a thread this persona is in, under effective thread_hybrid', text => tableCells(kindRowOf('thread')(text))[1] ?? '', [
+    /Neither a direct mention nor a broadcast: a reply in a thread this persona is in/i,
+    /effective `thread_hybrid`/i,
+    /current verified eligible membership/i,
+    /In open mode the channel must also be a public or private channel its app is in that is not externally shared/i,
+    /A thread's channel message never arrives this way/i,
+    `[Threads in \`thread_hybrid\` channels](${relative('docs', CHANNEL_MODES_DOC)}${anchorLink(THREADS_HEADING).slice(1, -1)})`,
+  ]],
+['receiving: in open mode an @mention is delivered from its message event', unitOf(USER_DOCS_NAME, RECEIVING_HEADING, '- **In open mode, an @mention is delivered from its'), [
+    ci(`**In open mode, an @mention is delivered from its ${code('message')} event.**`),
     ci(`the ${code('app_mention')} event decides nothing and the ${code('message')} event carrying the same mention decides`),
   ]],
-  ['receiving: "Anyone in the workspace can reach a persona", in both modes', unitOf(USER_DOCS_NAME, RECEIVING_HEADING, '- **Anyone in the workspace can reach a persona,**'), [
+['receiving: "Anyone in the workspace can reach a persona", in both modes', unitOf(USER_DOCS_NAME, RECEIVING_HEADING, '- **Anyone in the workspace can reach a persona,**'), [
     ci('**Anyone in the workspace can reach a persona,** in both modes'),
-    ci(`in declarative mode in its listed channels, by each channel's ${code(DELIVERY_KEY)}`),
-    ci('in fungible mode in every channel its app is invited to that it serves, by its channel delivery there'),
+    ci(`in strict mode in its listed channels, by each channel's ${code(DELIVERY_KEY)}`),
+    ci('in open mode in every channel its app is invited to that it serves, by its choice there'),
     ci(`in both modes by DM when its ${code(DM_ENABLED)} is ${code('true')}`),
   ]],
-  ["security: an invite changes a persona's audience", readmeSection(WHO_CAN_REACH_HEADING), [
+["security: an invite changes a persona's audience", readmeSection(WHO_CAN_REACH_HEADING), [
     ci("Each persona's Claude worker runs with tool access on the host"),
-    ci("**An invite changes a persona's audience.**"),
+    ci("**Assignments change a persona's audience.**"),
   ]],
-  ['security: any member can point a worker at any channel they are in, private channels included, which the operator may not see', readmeSection(WHO_CAN_REACH_HEADING), [
-    ci("Any workspace member can point a persona's worker at any channel they are in by inviting the persona's app there"),
+['security: any member can point a worker at any channel they are in, private channels included, which the operator may not see', readmeSection(WHO_CAN_REACH_HEADING), [
+    ci("A channel invitation and an applied listening choice can expose a persona's worker to new people"),
     ci('This includes private channels, which the operator may not be able to see'),
   ]],
-  [`security: anyone who can reach the persona can switch any channel it serves to ${ALL}, one they are not in included`, readmeSection(WHO_CAN_REACH_HEADING), [
-    ci(`**Anyone who can reach the persona can switch a channel to ${code(ALL)}.** In any channel it serves, or by DM, anyone can ask the persona to switch any channel it serves to ${code(ALL)}, including a channel they are not in`),
-    ci('From then on, every message in that channel reaches the worker'),
+['security: anyone who can reach the persona can set any eligible channel it is in to any value, one they are not in included, and open-mode choices persist into strict mode', readmeSection(WHO_CAN_REACH_HEADING), [
+    ci('**Anyone who can reach the persona can change what it hears in a channel.** In any channel it serves, or by DM, anyone can ask the persona to set any eligible channel it is a member of to any value, including a channel they are not in'),
+    ci(`At ${code(ALL)}, every message in that channel then reaches the worker`),
+    ci('**Open-mode choices persist into strict mode.** A choice a persona sets in open mode stays in force when strict mode is turned on'),
+    ci('so a non-off choice can start delivery in a channel that was `off`'),
   ]],
-  ['security: fetch_messages reads every channel the app is in, so content can be carried between channels', readmeSection(WHO_CAN_REACH_HEADING), [
+['security: fetch_messages reads every channel the app is in, so content can be carried between channels', readmeSection(WHO_CAN_REACH_HEADING), [
     ci(`**${code('fetch_messages' satisfies (typeof TARGETING_TOOLS)[number])} reads every channel the app is in.**`),
     ci('so content can be carried from one channel to another'),
   ]],
-  ['security: Slack Connect channels are never served in fungible mode', readmeSection(WHO_CAN_REACH_HEADING), [
-    ci('**Slack Connect channels are never served.** An externally shared channel is never served in fungible mode'),
+['security: Slack Connect channels are never served in open mode', readmeSection(WHO_CAN_REACH_HEADING), [
+    ci('**Slack Connect channels are never served in open mode.**'),
+    ci('They can be served only in strict mode, at a non-off choice, with current verified membership'),
+    ci('Open discovery saves `mentions` when no choice exists; switching to strict can activate it without another listing step'),
+    `[preview and off-first warning]${anchorLink(TURNING_OPEN_MODE_HEADING)}`,
   ]],
-  ["security: an Enterprise Grid channel is served when Slack marks it not externally shared, so every sharing workspace's members can reach the persona", readmeSection(WHO_CAN_REACH_HEADING), [
+["security: an Enterprise Grid channel is served when Slack marks it not externally shared, so every sharing workspace's members can reach the persona", readmeSection(WHO_CAN_REACH_HEADING), [
     ci("**Enterprise Grid: Slack's flag decides.**"),
-    ci('is served when Slack marks it as not externally shared, and then members of every workspace sharing it can reach the persona'),
+    ci('can be served when Slack marks it as not externally shared, and then members of every workspace sharing it can reach the persona'),
   ]],
-  [`security: the audit lines ${PERSONA_INVITED_CHANNEL} and ${PERSONA_CHANNEL_DELIVERY_SET}`, readmeSection(WHO_CAN_REACH_HEADING), [
-    ci(`The audit lines in ${code('server.log')} are ${code(PERSONA_INVITED_CHANNEL)}, logged the first time a persona hears a channel in fungible mode`),
-    ci(`and ${code(PERSONA_CHANNEL_DELIVERY_SET)}, logged for each stored ${TOOL} choice`),
+[`security: the audit lines ${PERSONA_OPEN_CHANNEL} and ${PERSONA_CHANNEL_DELIVERY_SET}`, readmeSection(WHO_CAN_REACH_HEADING), [
+    ci(`The audit lines in ${code('server.log')} are ${code(PERSONA_OPEN_CHANNEL)}, logged the first time a persona hears a channel in open mode`),
+    () => ci(`and ${code(PERSONA_CHANNEL_DELIVERY_SET)}, logged for each choice a ${TOOL} call newly applies, as ${code(deliverySetCauseQuote())}`),
   ]],
-  ["security: log rotation can discard a channel's only audit line, and a restart logs every heard channel again", readmeSection(WHO_CAN_REACH_HEADING), [
+["security: log rotation can discard a channel's only audit line, and a restart logs every heard channel again", readmeSection(WHO_CAN_REACH_HEADING), [
     ci("log rotation can discard a channel's only audit line"),
-    ci('After a restart, the first event from each channel a persona hears in fungible mode logs its line again'),
+    ci('After a restart, the first event from each channel a persona hears in open mode logs its line again'),
   ]],
-
-  // the introduction, "Personas (config.json)" and "Tools" ( S5).
-  ['introduction: the channels a persona serves, per mode', unitOf(USER_DOCS_NAME, README_TITLE_HEADING, 'A single HTTP MCP server'), [
-    ci('in declarative mode, the default, the channels it is configured into; in fungible mode, every public or private channel its Slack app is invited to that is not externally shared'),
+['introduction: a persona has its own identity and worker', readmeIntroduction, [
+    ci('Each persona has its own Slack app and identity'), ci('Claude Code instance'), ci('working directory'),
   ]],
-  ["introduction: what a persona's tool calls may target, per mode", unitOf(USER_DOCS_NAME, README_TITLE_HEADING, 'A single HTTP MCP server'), [
-    ci("Each persona's tool calls act as that persona: in declarative mode only in the channels it is configured into, in fungible mode in any channel ID it names, where the call goes to Slack, which decides"),
+['introduction: direct messages require enabled DMs', readmeIntroduction, [
+    ci(`With ${code(`${DM_ENABLED}: true`)}, it can also receive direct messages`),
   ]],
-  ['Personas (config.json): the channels a persona serves and its tools may target, per mode', unitOf(USER_DOCS_NAME, PERSONAS_HEADING, 'Each bot is a **persona**'), [
-    ci('In declarative mode, the default, those are the channels it is configured into, and its tools may target only them'),
-    ci('in fungible mode, they are the public and private channels its app is invited to that are not externally shared, and its tools may target any channel ID: the call goes to Slack, which decides'),
+['introduction: persona definition and conditional DMs precede channel choices', readmeIntroduction, [
+    /own Slack app and identity.*?Claude Code instance.*?working directory.*?With `dm\.enabled: true`, it can also receive direct messages.*?saved delivery choice/is,
   ]],
-  ['Tools: in declarative mode a refused target sends nothing to Slack', unitOf(USER_DOCS_NAME, TOOLS_HEADING, '- **In declarative mode,**'), [
+['introduction: useful Configuration and Channel modes navigation', readmeIntroduction, [
+    `[Configuration](${CONFIGURATION_DOC})`, `[Channel modes](${CHANNEL_MODES_DOC})`,
+  ]],
+['introduction: the channels a persona serves, per mode', readmeIntroduction, [
+    ci('in both modes, its non-off applied channel choices determine listening'),
+  ]],
+["introduction: what a persona's tool calls may target, per mode", readmeIntroduction, [
+    ci("Each persona's tool calls act as that persona"),
+    ci('in strict mode only in its configured non-off channels'),
+    ci('in open mode in any channel ID it names, where the call goes to Slack, which decides'),
+  ]],
+['Personas (config.json): the channels a persona serves, in both modes, with Tools for what its tools may target', unitOf(USER_DOCS_NAME, PERSONAS_HEADING, 'Each bot is a **persona**'), [
+    ci('In both modes, listening follows the shared applied channel choices'),
+    ci('and Tools for what its tools may target'),
+  ]],
+['Tools: in strict mode a refused target sends nothing to Slack', unitOf(USER_DOCS_NAME, TOOLS_HEADING, '- **In strict mode,**'), [
     ci("a tool call with any other target, a channel the persona isn't configured into included, is refused with a tool error naming the persona and the target, and nothing is sent to Slack"),
   ]],
-  ["Tools: in fungible mode a target that is no channel ID or allowed DM target is refused before any Slack call (FUNGIBLE_TARGET_REFUSAL), and Slack's refusal of any other reaches the persona", unitOf(USER_DOCS_NAME, TOOLS_HEADING, '- **In fungible mode,**'), [
+["Tools: in open mode a target that is no channel ID or allowed DM target is refused before any Slack call (FUNGIBLE_TARGET_REFUSAL), and Slack's refusal of any other reaches the persona", unitOf(USER_DOCS_NAME, TOOLS_HEADING, '- **In open mode,**'), [
     ci(`a target that ${FUNGIBLE_TARGET_REFUSAL.replace(/^it /, '').replace(/\.$/, '')} is refused before any Slack call, with a tool error naming the persona and the target`),
     ci('Any other channel target goes to Slack, which decides'),
     ci(`for example ${code('not_in_channel')} for a channel the persona's app is not in, reaches the persona as a tool error naming the persona, the channel and Slack's error code`),
   ]],
-  ...TARGETING_TOOLS.map((tool): DocRow => [`Tools: the ${tool} row states its targets in each mode`, toolRowOf(tool), [
-    ci(tool === 'reply' ? "in declarative mode one of the persona's configured channels; in fungible mode any channel ID" : 'a configured channel in declarative mode; any channel ID in fungible mode'),
+...TARGETING_TOOLS.map((tool): DocRow => [`Tools: the ${tool} row states its targets in each mode`, toolRowOf(tool), [
+    ci(tool === 'reply' ? "in strict mode one of the persona's configured non-off channels; in open mode any channel ID" : 'a configured non-off channel in strict mode; any channel ID in open mode'),
   ]]),
-  [`Tools: the ${SET_CHANNEL_DELIVERY_TOOL} row, exactly one`, toolRowOf(SET_CHANNEL_DELIVERY_TOOL), [
-    docLink(BOTS_DOC, CHANNEL_MODES_DOC, anchorLink(FUNGIBLE_DELIVERY_HEADING).slice(2, -1)),
-    ci(`Two inputs: ${code('channel')}, a channel ID, and ${code(DELIVERY_KEY)}, ${code(MENTIONS)} or ${code(ALL)}`),
-    ci('It works only in fungible mode: every call is refused in declarative mode'),
-    ci(`and while ${code(CHANNEL_DELIVERY_FILE_NAME)} is unreadable`),
-    ci('It accepts only a channel the persona has heard a message from in fungible mode since it came up, or one it holds a stored choice for'),
-    ci('It makes no Slack call'),
-    ci(`The choice persists in ${code(CHANNEL_DELIVERY_FILE_NAME)} and applies from the next message in that channel`),
-    ci(`says so when the loop guard holds the channel at ${code(MENTIONS)}`),
-    ci(`Each accepted call logs one ${code(PERSONA_CHANNEL_DELIVERY_SET)} line`),
-    ci('It changes no configuration and applies no reload'),
+["Tools: set_channel_delivery updates one shared authority", toolRowOf(SET_CHANNEL_DELIVERY_TOOL), [ci("`off`"), ci("`mentions`"), ci("`all`"), ci("`thread_hybrid`"), ci("open mode"), ci("strict mode"), ci("config.json.last-applied"), ci("no Slack call"), ci("`attempt_id`"), ci("`intent`"), ci("retry"), ci("history"), ci("membership")]],
+["Tools: set_channel_delivery links a persona's saved and effective choice and who may ask for one", toolRowOf(SET_CHANNEL_DELIVERY_TOOL), [
+    `[saved and effective choice](${relative('docs', CHANNEL_MODES_DOC)}${anchorLink(DELIVERY_VALUES_HEADING).slice(1, -1)})`,
+    `[${WHO_CAN_REACH_HEADING.replace(/^## /, '')}](${relative('docs', CHANNEL_MODES_DOC)}${anchorLink(WHO_CAN_REACH_HEADING).slice(1, -1)})`,
   ]],
-  ['Tools: the known residual in an externally shared channel the app is in', readmeSection(TOOLS_HEADING), [
+["Tools: fetch_messages reads a whole thread in a thread_hybrid channel a page at a time, with cursor and next_cursor, and otherwise returns an oldest-first array, ignoring cursor", toolRowOf('fetch_messages' satisfies (typeof TARGETING_TOOLS)[number]), [
+    ci("With `thread_ts` in a channel where the persona's saved choice is `thread_hybrid`, it returns `{ messages, next_cursor }`"),
+    ci('one page of the thread, the first starting with its channel message, and `next_cursor` while more remain'),
+    ci('pass it back as `cursor` for the next page'),
+    ci('Otherwise it returns an oldest-first JSON array and ignores `cursor`'),
+    ci('`limit` defaults to 20, at most 100'),
+  ]],
+['Tools: the known residual in an externally shared channel the app is in ', readmeSection(TOOLS_HEADING), [
     ci("CSCB makes no Slack call to learn whether a channel holds the persona's app, is externally shared or is a group DM"),
-    ci('So in fungible mode it refuses no post, read, reaction or edit in an externally shared channel that the app belongs to'),
+    ci('So in open mode it refuses no post, read, reaction or edit in an externally shared channel that the app belongs to'),
   ]],
-  ['Tools: the known residual in a group DM the app is in, where Slack refuses reads', readmeSection(TOOLS_HEADING), [
+['Tools: the known residual in a group DM the app is in, where Slack refuses reads ', readmeSection(TOOLS_HEADING), [
     ci('The same holds in a group DM the app belongs to, except that Slack refuses reads there'),
     ci(`the app has no ${code('mpim:history')} scope`),
   ]],
-  [`Tools: the permission-prompt note for ${SET_CHANNEL_DELIVERY_TOOL}`, readmeSection(TOOLS_HEADING), [
+[`Tools: the permission-prompt note for ${SET_CHANNEL_DELIVERY_TOOL}`, readmeSection(TOOLS_HEADING), [
     ci("On a host whose Claude Code permission settings don't allow the server's tools as a group"),
     ci(`the first ${TOOL} call raises a permission prompt, in either mode`),
   ]],
-
-
-  // Reload outside "What a confirmation applies" ( S6).
-  [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, what it holds, only the server writes it, never edit it by hand`, tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
-    ci("The stored-choice file: each persona's stored channel-delivery choices"),
-    ci('It holds no token and no message text'),
-    ci('Only the server reads and writes it, never the CLI'),
-    ci(`It is absent until the first accepted ${TOOL} call, so it is never created in declarative mode`),
-    ci('Never edit it by hand'),
-    ci('The server reads it once at each start'),
-  ]],
-  [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, the unreadable state, linked to the debugging skill`, tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
-    `[${code(CHANNEL_DELIVERY_UNREADABLE)}]${docLink(RELOAD_DOC, DEBUG_SKILL_FILE, anchorLink(code(CHANNEL_DELIVERY_UNREADABLE)).slice(2, -1))}`,
-    ci('starts and runs every persona, but for that run no stored choice applies'),
-    ci(`in fungible mode every channel is at ${code(MENTIONS)}, ${TOOL} is refused, and nothing is written to the file or dropped from it`),
-  ]],
-  [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, its fix is moving it aside`, tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
-    ci('To fix it, move the file aside, then restart the server; this discards every stored choice'),
-  ]],
-  [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, the residual of restoring an unreadable file`, tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
-    ci('If you restore that same file in place instead of moving it aside, a persona removed and added back with the same'),
-    ci('while it was unreadable gets its earlier choices again'),
-  ]],
-  [`Size limit: ${CHANNEL_DELIVERY_FILE_NAME} has no size cap`, readmeSection('## Size limit'), [
-    ci(`and the stored-choice file (${code(CHANNEL_DELIVERY_FILE_NAME)}) have no size cap`),
-  ]],
-  [`Reading the preview: the header counts the switch among the server-wide settings, and a persona with only recorded changes is not counted`, readmeSection('## Reading the preview'), [
-    ci(`and the server-wide settings changed, the switch ${SWITCH} among them`),
-    ci('A persona whose only changes are recorded ones (changes to the section not in force, see the table below) is not counted as modified'),
-  ]],
-  ["Reading the preview: the switch's line, as modeSwitchLine renders it in each direction, and its row", readmeSection('## Reading the preview'), [
-    () => `| ${code(switchLineQuote('fungible'))} |`,
-    () => `| ${code(switchLineQuote('declarative'))} |`,
+["Files beside the config file: sole shared authority envelope", tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [ci("shared authority"), ci("revision"), ci("applied configuration"), ci("source"), ci("Never edit it by hand")]],
+["Shared authority: preserve uncertain outcome evidence", tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [ci("preserve"), ci("trustworthy"), ci("unresolved")]],
+["Shared authority: replacement never inherits choices", tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [ci("identity"), ci("incarnation"), ci("never inherits")]],
+["Size limit: configuration and shared state remain uncapped", readmeSection('## Size limit'), [ci("config.json.last-applied"), ci("no size cap"), ci("credentials"), ci("64 KiB")]],
+["Reading the preview: mode and effective channel changes", readmeSection('## Reading the preview'), [ci("`channel_mode`"), ci("server-wide settings"), ci("no effective change")]],
+["Reading the preview: the switch's line, as modeSwitchLine renders it in each direction, and its row", readmeSection('## Reading the preview'), [
+    () => `| ${code(switchLineQuote('open'))} |`,
+    () => `| ${code(switchLineQuote('strict'))} |`,
     () => ci(`ends ${code(switchLineNoPersonaEnding())} when there is none`),
     ci('It applies at once, with no restart, and every session is kept'),
     ci('The inherited `stop_hook_bootstrap` default also applies immediately to reminder checks'),
   ]],
-  ['Reading the preview: the recorded lines, as recordedLine renders them for each section, and their row', readmeSection('## Reading the preview'), [
-    () => code(recordedLineQuote('declarative')),
-    () => code(recordedLineQuote('fungible')),
-    ci(`(${code(CHANNELS_KEY)} or ${code(PROMPTS_KEY)} in fungible mode, ${code(FUNGIBLE_SECTION_KEY)} in declarative mode)`),
-    ci('These lines come after every persona line and before the server-wide setting lines'),
-    ci(`A change made only of recorded changes previews as ${code(NO_EFFECTIVE_CHANGE)}, followed by its recorded lines`),
-  ]],
   [`Confirming a change: the switch is the exception to "recorded and take effect later"`, readmeSection('## Confirming a change'), [
     ci(`Next-launch and most server-wide settings are recorded and take effect later; the switch ${SWITCH} and reminder setting ` + code('stop_hook_bootstrap') + ` (own or inherited) apply in place at once`),
   ]],
-  [`Confirming a change: ${RELOAD_NOOP} covers a confirmation of recorded changes only`, tableRowOf('## Confirming a change', `\`[slack] ${RELOAD_NOOP}:`), [
-    ci('as for a confirmation whose only changes are recorded ones (changes to the section not in force)'),
-  ]],
-  [`Confirming a change: ${RELOAD_RECORD_WRITE_FAILED} names the stored-choice file`, tableRowOf('## Confirming a change', `\`[slack] ${RELOAD_RECORD_WRITE_FAILED}:`), [
-    ci(`The line can also name the stored-choice file (${code(CHANNEL_DELIVERY_FILE_NAME)})`),
-    ci('a confirmation that brings up a persona whose stored choices were dropped earlier, by a write that failed, first writes that file'),
-    ci("when it can't, nothing is applied, the retired-key record is not written, and the change stays pending"),
-  ]],
+["Confirming a change: shared-authority failures retain evidence", tableRowOf('## Confirming a change', `\`[slack] ${RELOAD_RECORD_WRITE_FAILED}:`), [ci("shared"), ci("preserve"), ci("pending")]],
   ['When next-launch and server-wide changes take effect: the switch takes effect once confirmed, with no restart', readmeSection('## When next-launch and server-wide changes take effect'), [
     ci(`Server-wide settings take effect at the next server start, except ${SWITCH} and the inherited ` + code('stop_hook_bootstrap') + ` reminder setting: both take effect when the change is confirmed, and need no ${code(CLI_COMMAND_CLEAN_RESTART)}`),
   ]],
-
-  // troubleshooting and downgrade ( S8).
-  [`"${SILENT_INVITED_TITLE}": declarative mode, listing the channel or turning fungible mode on`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
-    ci(`No match, or ${code('false')}, is declarative mode`),
+[`"${SILENT_INVITED_TITLE}": strict mode, explicit shared choice`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
+    ci(`The command prints ${code('true')} for open mode and ${code('false')} for strict mode`),
     ci('not delivered: no applied persona lists this channel'),
-    ci(`List the channel in this persona's ${code(CHANNELS_KEY)} and confirm the change, or turn fungible mode on`),
+    ci(`List the channel in this persona’s ${code(CHANNELS_KEY)} with a non-off ${code('delivery')} and confirm the change`),
   ]],
-  [`"${SILENT_INVITED_TITLE}": an externally shared channel`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
-    ci('**An externally shared channel** (fungible mode)'),
+[`"${SILENT_INVITED_TITLE}": an externally shared channel`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
+    ci('**An externally shared channel** (open mode)'),
     ci(`with the reason ${code(UNCLAIMED_REASON_EXTERNALLY_SHARED)}`),
-    ci('Fungible mode never serves it. Serve it in declarative mode, with the channel listed'),
+    ci('Open mode never serves it. Strict mode requires a non-off saved choice and current verified membership'),
+    ci('Open discovery may already have saved `mentions`'),
+    `[preview and off-first warning](${relative(dirname(DEBUG_SKILL_FILE), CHANNEL_MODES_DOC)}${anchorLink(TURNING_OPEN_MODE_HEADING).slice(1, -1)})`,
+    ci('before switching'),
   ]],
-  [`"${SILENT_INVITED_TITLE}": a group DM`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
+[`"${SILENT_INVITED_TITLE}": a group DM`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
     ci('a group DM is never served, in either mode'),
   ]],
-  [`"${SILENT_INVITED_TITLE}": an edit that adds a mention`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
-    ci(`In fungible mode an @mention is delivered from its ${code('message')} event`),
+[`"${SILENT_INVITED_TITLE}": an edit that adds a mention`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
+    ci(`In open mode an @mention is delivered from its ${code('message')} event`),
     ci('Post another message that @mentions the persona'),
   ]],
-  [`"${SILENT_INVITED_TITLE}": a message posted before the invite`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
+[`"${SILENT_INVITED_TITLE}": a message posted before the invite`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
     ci('Slack sends the app no event for a message posted before it joined the channel'),
   ]],
-  [`"${RECEIVES_EVERYTHING_TITLE}": an agent chose ${ALL}`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
+[`"${RECEIVES_EVERYTHING_TITLE}": an agent chose ${ALL}`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
     ci(`The persona's agent chose ${code(ALL)} for that channel with ${TOOL}`),
     ci(`Its sign is a [${code(PERSONA_CHANNEL_DELIVERY_SET)}](#${PERSONA_CHANNEL_DELIVERY_SET}) line`),
   ]],
-  [`"${RECEIVES_EVERYTHING_TITLE}": ask the persona to switch back`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
+[`"${RECEIVES_EVERYTHING_TITLE}": ask the persona to switch back`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
     ci(`ask the persona, in that channel or by DM, to switch the channel back to ${code(MENTIONS)}`),
   ]],
-  [`"${RECEIVES_EVERYTHING_TITLE}": remove the app from the channel`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
+[`"${RECEIVES_EVERYTHING_TITLE}": remove the app from the channel`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
     ci("remove the persona's app from the channel"),
   ]],
-  [`"${RECEIVES_EVERYTHING_TITLE}": turn the switch off`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
-    ci('turn fungible mode off with a confirmed change'),
+[`"${RECEIVES_EVERYTHING_TITLE}": confirm an explicit shared choice`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
+    ci('have the operator set the shared channel choice to `mentions` or `off` and confirm the change'),
+    ci('A mode switch preserves the choice'),
   ]],
-  [`"${UNCLAIMED_ENTRY_TITLE}": the ${UNCLAIMED_CHANNEL} fix in declarative mode, fungible mode the other fix, never for a group DM`, viaSymptom(`**${UNCLAIMED_ENTRY_TITLE}**`, UNCLAIMED_SKILL_HEADING), [
-    ci(`In declarative mode, the persona's Slack app is a member of a channel that no persona lists in ${code(CHANNELS_KEY)}`),
+[`"${UNCLAIMED_ENTRY_TITLE}": the ${UNCLAIMED_CHANNEL} fix in strict mode, explicit shared choice in open mode too, never for a group DM`, viaSymptom(`**${UNCLAIMED_ENTRY_TITLE}**`, UNCLAIMED_SKILL_HEADING), [
+    ci(`In strict mode, the persona's Slack app is a member of a channel that no persona lists in ${code(CHANNELS_KEY)}`),
     ci(`Add the channel to the right persona's ${code(CHANNELS_KEY)} in ${code(CONFIG_FILE_NAME)}`),
-    ci('For a public or private channel that is not externally shared: turn fungible mode on'),
+    ci('In open mode too, explicitly assign a non-off shared channel choice in `config.json` and confirm it'),
+    ci('Selecting open mode alone does not create a choice'),
+    ci('Only public or private channels that are not externally shared can be served in open mode'),
     ci('a group DM is never served in either mode'),
   ]],
-  [`"${UNCLAIMED_ENTRY_TITLE}": the ${UNCLAIMED_CHANNEL} fix in fungible mode, each reason (FUNGIBLE_REFUSAL_TEXTS); for every reason but a malformed channel ID, served only in declarative mode with the channel listed; a malformed channel ID served in neither mode`, viaSymptom(`**${UNCLAIMED_ENTRY_TITLE}**`, UNCLAIMED_SKILL_HEADING), [
-    ci("In fungible mode, a `message` event the persona's app received was refused by the fungible path"),
+[`"${UNCLAIMED_ENTRY_TITLE}": the ${UNCLAIMED_CHANNEL} fix in open mode, each reason (FUNGIBLE_REFUSAL_TEXTS); strict mode needs a non-off saved choice and current verified membership; malformed IDs and group DMs remain excluded`, viaSymptom(`**${UNCLAIMED_ENTRY_TITLE}**`, UNCLAIMED_SKILL_HEADING), [
+    ci("In open mode, a `message` event the persona's app received was refused by the open path"),
     // Each reason as a row of the reasons table, its first cell.
     ...Object.values(FUNGIBLE_REFUSAL_TEXTS).map((reason) => ci(`| ${code(reason)} |`)),
-    ci(`For every reason but ${code(UNCLAIMED_REASON_CHANNEL_ID_MALFORMED)}, the line's own advice is the one way to serve such a channel: declarative mode, with the channel listed`),
+    ci(`For every reason but ${code(UNCLAIMED_REASON_CHANNEL_ID_MALFORMED)}, serving such a channel requires strict mode, a non-off saved choice and current verified membership; a group DM remains excluded`),
+    ci('Open-discovered Slack Connect membership may already have `mentions` saved and become eligible on switching to strict without a new listing'),
+    // Keep each corrected remedy in its own table cell: another reason's fix cannot satisfy it.
+    ...(['flag-missing', 'flag-not-boolean', 'externally-shared'] as const).map(reason => new RegExp(
+      String.raw`\| ${escapeRegExp(code(FUNGIBLE_REFUSAL_TEXTS[reason]))} \|[^|]*\| [^|]*strict mode[^|]*non-off saved choice[^|]*current verified membership[^|]*\[[^\]]*warning\]\(${escapeRegExp(relative(dirname(DEBUG_SKILL_FILE), CHANNEL_MODES_DOC) + anchorLink(TURNING_OPEN_MODE_HEADING).slice(1, -1))}\)`,
+      'i',
+    )),
+    `[preview and off-first warning](${relative(dirname(DEBUG_SKILL_FILE), CHANNEL_MODES_DOC)}${anchorLink(TURNING_OPEN_MODE_HEADING).slice(1, -1)})`,
     ci('Neither mode serves a malformed channel ID'),
     ci(`${code(CONFIG_FILE_NAME)} can't list such an ID either, so neither mode serves it`),
   ]],
-  ...R55_DOWNGRADE_ROWS,
+...UPGRADE_ROWS,
+...R55_DOWNGRADE_ROWS,
+...DOWNGRADE_STATE_ROWS,
 ]
 
 /** The setup wizard's step on how a change takes effect, found by its title, whatever its number. */
@@ -8061,8 +8675,44 @@ const WIZARD_TAKES_EFFECT_HEADING = /^### Step \d+ — How the change takes effe
 const WIZARD_SWITCH_LINE_ROW: DocRow = [
   `${WIZARD_FILE}: the switch's line, as modeSwitchLine renders it in each direction`,
   sectionOf(WIZARD_FILE, WIZARD_TAKES_EFFECT_HEADING),
-  [() => code(switchLineQuote('fungible')), () => code(switchLineQuote('declarative'))],
+  [() => code(switchLineQuote('open')), () => code(switchLineQuote('strict'))],
 ]
+
+describe('shipped tool guidance quotes the current exported wording', () => {
+  const rows: readonly [file: string, row: DocRow][] = [
+    [WIZARD_FILE, ['the setup channel choice has its thread gloss',
+      sectionOf(WIZARD_FILE, /^#### (?:\d+(?:\.\d+)*\s+)?Channels$/),
+      [() => `${code('thread_hybrid')} ${THREAD_HYBRID_GLOSS}`],
+    ]],
+    [DEBUG_SKILL_FILE, ['the ordinary-tool refusal explains absent and off choices in strict mode',
+      text => {
+        const section = requiredSection(text, '## Other lines you may see', DEBUG_SKILL_FILE)
+        const rows = section.split('\n').filter(line => line.startsWith('| `[slack] Tool "<tool>" failed'))
+        if (rows.length !== 1) throw new Error(`expected one ordinary-tool failure row, found ${rows.length}`)
+        return flat(rows[0])
+      },
+      [() => code(`Persona "<name>" (key=<key>) may not target "<target>": ${STRICT_TARGET_REFUSAL}`),
+        ci('an absent channel or a listed channel whose delivery choice is `off` is refused before any Slack call')],
+    ]],
+  ]
+
+  test.each(rows)('%s: %s', (file, [element, passage, required]) => {
+    expect({ element, problems: docRowProblems(passage, required, operatorText(file)) }).toEqual({ element, problems: [] })
+  })
+
+  test.each(rows)('self-check: %s loses each exact wording obligation when cut or reworded', (file, [, passage, required]) => {
+    const text = operatorText(file)
+    for (const item of required.map(resolveItem)) {
+      const cut = withItemCut(text, passage, item)
+      expect(docRowProblems(passage, [item], cut).length).toBeGreaterThan(0)
+    }
+    const current = file === WIZARD_FILE ? THREAD_HYBRID_GLOSS : STRICT_TARGET_REFUSAL
+    const former = file === WIZARD_FILE ? '(every message)' : "it is not one of the persona's configured channels."
+    const reverted = text.replaceAll(current, former)
+    expect(reverted).not.toBe(text)
+    expect(docRowProblems(passage, required, reverted).length).toBeGreaterThan(0)
+  })
+})
 
 /** Where a README heading must stand: exactly once, inside `parent`, right after `previous` (the nearest heading at its level or above), and after a line matching `after`. */
 interface Placement {
@@ -8101,7 +8751,8 @@ function placementProblems(readme: string, p: Placement): string[] {
  * place them: `# Channel modes`, its own page (`CHANNEL_MODES_DOC`), between
  * the server settings and Reload in the docs' order, with its sections in
  * order inside it (the security section right after "What each mode serves",
- * the fungible-mode example last), and the downgrade section a `###` of its
+ * the three thread sections in order under the threads section, the
+ * open-mode example last), and the downgrade section a `###` of its
  * own (the "Upgrading to personas" cases read that section alone) right after
  * "Upgrading to personas".
  */
@@ -8112,14 +8763,21 @@ const README_DEO_PLACEMENTS: readonly Placement[] = [
     parent: CHANNEL_MODES_HEADING,
     previous: i === 0 ? CHANNEL_MODES_HEADING : CHANNEL_MODES_SUBSECTIONS[i - 1],
   })),
+  ...THREADS_SUBSECTIONS.map((heading, i): Placement => ({
+    heading,
+    parent: THREADS_HEADING,
+    previous: i === 0 ? THREADS_HEADING : THREADS_SUBSECTIONS[i - 1],
+  })),
+  { heading: UPGRADE_HEADING, parent: MIGRATION_HEADING, previous: ROLLBACK_HEADING, next: `### ${UPGRADING_TITLE}` },
   { heading: DOWNGRADE_HEADING, parent: MIGRATION_HEADING, previous: `### ${UPGRADING_TITLE}` },
 ]
 
-/** Each declarative-scoped configuration section and the channel-modes page's section its pointer must link. */
-const DECLARATIVE_POINTERS: readonly [section: string, target: string][] = [
+/** Each configuration section on the shared list and destination, and the channel-modes page's section each of its pointers must link. */
+const CONFIGURATION_POINTERS: readonly [section: string, target: string][] = [
   ['### Channel entries', WHAT_EACH_MODE_SERVES_HEADING],
-  ['### Channel delivery', FUNGIBLE_DELIVERY_HEADING],
-  ['### Permission prompts', FUNGIBLE_PROMPTS_HEADING],
+  ['### Delivery values', DELIVERY_VALUES_HEADING],
+  ['### Delivery values', THREADS_HEADING],
+  ['### Permission prompts', PROMPTS_IN_BOTH_MODES_HEADING],
 ]
 
 /** The pointer path from the persona reference to the channel-modes page, as `CONFIGURATION_DOC` writes it (`channel-modes.md`). */
@@ -8161,7 +8819,7 @@ describe('the README describes both channel modes', () => {
   const readme = () => referenceText()
 
   describe('headings', () => {
-    test.each(README_DEO_PLACEMENTS.map((p) => [p.heading, p] as const))('"%s" appears once, where T17 placed it', (_heading, placement) => {
+    test.each(README_DEO_PLACEMENTS.map((p) => [p.heading, p] as const))('"%s" appears once, in its placed section', (_heading, placement) => {
       expect(placementProblems(readme(), placement)).toEqual([])
     })
 
@@ -8182,11 +8840,211 @@ describe('the README describes both channel modes', () => {
     })
 
     test.each(README_DEO_ROWS)('self-check: %s: each of its items, cut from its passage in the README, is reported by the row', (element, passage, required) => {
+      expect({ element, problems: docRowProblems(passage, required, readme()) }).toEqual({ element, problems: [] })
       for (const item of required.map(resolveItem)) {
         const edited = withItemCut(readme(), passage, item)
+        expect(passage(edited)).not.toBe(passage(readme()))
         expect({ element, item: String(item), reported: docRowProblems(passage, required, edited).includes(`lacks ${String(item)}`) }).toEqual({ element, item: String(item), reported: true })
       }
     })
+
+    test.each([
+      ['a persona has its own identity and worker', 'own Slack app and identity', 'shared Slack app and identity'],
+      ['a persona has its own identity and worker', 'Claude Code instance', 'shared terminal'],
+      ['a persona has its own identity and worker', 'working directory', 'workspace label'],
+      ['direct messages require enabled DMs', 'With `dm.enabled: true`,', 'With `dm.enabled: false`,'],
+      ['direct messages require enabled DMs', 'With `dm.enabled: true`, it can also', 'It can always'],
+      ['the channels a persona serves, per mode', 'non-off applied channel choices', 'off applied channel choices'],
+      ["what a persona's tool calls may target, per mode", 'in strict mode only in its configured non-off channels', 'in strict mode in any channel'],
+      ["what a persona's tool calls may target, per mode", 'where the call goes to Slack, which decides', 'where CSCB decides without calling Slack'],
+    ])('self-check: introduction: %s rejects reversed "%s"', (label, original, reversal) => {
+      const row = README_DEO_ROWS.find(([name]) => name === `introduction: ${label}`)
+      if (row === undefined) throw new Error(`no introduction row for ${label}`)
+      const [, passage, required] = row
+      for (const text of [readme(), wrappedIntroduction(readme())]) {
+        expect(docRowProblems(passage, required, text)).toEqual([])
+        const edited = text.replace(rawLiteral(original), () => reversal)
+        expect(passage(edited)).not.toBe(passage(text))
+        expect(docRowProblems(passage, required, edited).length).toBeGreaterThan(0)
+      }
+    })
+
+    test.each([
+      'Each persona has its own Slack app and identity, Claude Code instance and working directory.',
+      'With `dm.enabled: true`, it can also receive direct messages.',
+    ])('self-check: introduction rejects "%s" moved after channel choices', (sentence) => {
+      const row = README_DEO_ROWS.find(([name]) => name === 'introduction: persona definition and conditional DMs precede channel choices')
+      if (row === undefined) throw new Error('no introduction ordering row')
+      const [, passage, required] = row
+      for (const text of [readme(), wrappedIntroduction(readme())]) {
+        expect(docRowProblems(passage, required, text)).toEqual([])
+        const intro = passage(text)
+        const body = readmeIntroductionBody(text)
+        const found = body.match(rawLiteral(sentence))
+        if (found === null) throw new Error(`introduction lacks ${sentence}`)
+        const edited = text.replace(body, () => `${body.replace(found[0], () => '')}\n${found[0]}\n`)
+        expect(passage(edited)).not.toBe(intro)
+        expect(docRowProblems(passage, required, edited).length).toBeGreaterThan(0)
+        // Identity and DM facts remain present: only their teaching order was reversed.
+        for (const [, otherPassage, otherRequired] of README_DEO_ROWS.filter(([name]) => name.startsWith('introduction:') && name !== row[0])) {
+          expect(docRowProblems(otherPassage, otherRequired, edited)).toEqual([])
+        }
+      }
+    })
+
+    test('introduction permits paragraph splitting and wrapping, but facts below its first section cannot satisfy it', () => {
+      const text = readme()
+      const intro = readmeIntroduction(text)
+      const body = readmeIntroductionBody(text)
+      const wrapped = wrappedIntroduction(text)
+      const relocated = text.replace(body, '\n').replace('## Quick Start', `## Quick Start\n\n${body}`)
+      expect(readmeIntroduction(wrapped)).toBe(intro)
+      expect(readmeIntroduction(relocated)).not.toBe(intro)
+      for (const [, passage, required] of README_DEO_ROWS.filter(([name]) => name.startsWith('introduction:'))) {
+        expect(docRowProblems(passage, required, text)).toEqual([])
+        expect(docRowProblems(passage, required, wrapped)).toEqual([])
+        expect(docRowProblems(passage, required, relocated).length).toBeGreaterThan(0)
+      }
+    })
+
+    test.each([
+      ['changing mode preserves applied channel choices', 'Mode changes preserve', 'Mode changes discard'],
+      ['changing mode preserves applied channel choices', 'including choices made while open mode was active', 'except choices made while open mode was active'],
+      ['four persistent listening choices with missing choices unresolved', 'A missing or unreadable assignment holds affected intake; it is not a saved `off` choice', 'A missing or unreadable assignment defaults to `off`'],
+      ['four persistent listening choices with missing choices unresolved', 'A mode switch preserves them', 'A mode switch resets them'],
+      ['four persistent listening choices with missing choices unresolved', 'never inherits its previous incarnation’s choices', 'inherits its previous incarnation’s choices'],
+    ])('self-check: Channel modes: %s rejects omission or reversal of "%s"', (label, original, reversal) => {
+      const element = `Channel modes: ${label}`
+      const row = README_DEO_ROWS.find(([name]) => name === element)
+      if (row === undefined) throw new Error(`no README row for ${element}`)
+      const [, passage, required] = row
+      const text = readme()
+      expect(docRowProblems(passage, required, text)).toEqual([])
+      for (const replacement of ['', reversal]) {
+        const edited = text.replace(original, replacement)
+        expect(edited).not.toBe(text)
+        expect(passage(edited)).not.toBe(passage(text))
+        expect(docRowProblems(passage, required, edited).length).toBeGreaterThan(0)
+      }
+    })
+
+    test.each(([
+      ['Channel modes: current verified membership and join defaults', [
+        ['requires current verified membership', 'requires historical membership'],
+        ["learned from Slack's join event for the app when invited", "learned only from a complete inventory, never from an invitation"],
+        ['the app needs the `member_joined_channel` subscription', 'the app needs no join-event subscription'],
+        ['or from startup catch-up', 'never from startup catch-up'],
+        ['An invitation request is not proof until qualifying evidence arrives', 'An invitation request alone is proof'],
+        ['listing a channel, hearing a message or posting alone is not evidence', 'listing a channel, hearing a message or posting alone is evidence'],
+        ['starts at `off` in strict or `mentions` in open', 'starts at `mentions` in strict or `off` in open'],
+        ['using the mode when the join is applied', 'using the mode when the invitation is requested'],
+        ['Duplicate joins and mode switches preserve choices, including `off`', 'Duplicate joins and mode switches reset choices, including `off`'],
+      ]],
+      ['Channel modes: four persistent listening choices with missing choices unresolved', [
+        ['holds affected intake', 'drops affected intake'],
+        ['it is not a saved `off` choice', 'it is a saved `off` choice'],
+        ["A newly verified member gets the mode's join default described above, preserving any existing choice", "Any missing assignment gets the mode's join default, resetting any existing choice"],
+      ]],
+      ['Channel modes: changing mode preserves applied channel choices', [
+        ['when no prior choice existed', 'even when an off choice existed'],
+        ['with current verified membership, switching to strict can activate that choice without another manual listing step', 'switching to strict requires another manual listing step'],
+        ['Existing `off` choices stay off', 'Existing `off` choices become mentions'],
+        ['review and confirm an explicit `off` assignment **before switching to strict**', 'assign off after switching to strict'],
+      ]],
+      [`Channel modes: ${RECEIVE_ALL_SHARED} requires current eligible effective-all siblings`, [
+        ['this persona and another currently eligible member have effective `all`', 'this persona alone has saved `all`'],
+        ['currently eligible member', 'historically listed member'],
+        ['have effective `all`', 'have saved `all`'],
+        ['A saved-all choice alone does not count', 'A saved-all choice alone counts'],
+        ['departed or unverified personas cannot supply it', 'departed or unverified personas can supply it'],
+        ['a persona on `thread_hybrid` never counts', 'a persona on `thread_hybrid` counts too'],
+        ['otherwise the reason is `receive_all`', 'otherwise the reason is `receive_all_shared`'],
+      ]],
+      ['Channel modes: four persistent listening choices with missing choices unresolved', [
+        ["A persona's saved choice is the `delivery` value", "A persona's saved choice is its effective choice"],
+        ['the saved value stays as it is', 'the saved value is reset to `off`'],
+      ]],
+      ['Channel modes: a removed key rejects configuration with replacement guidance', [
+        ['A configuration still holding a removed key is rejected with an error naming its replacement', 'A configuration from an earlier release is rejected at load until it is prepared by hand; a manual edit is required'],
+        ['is rejected with an error naming its replacement', 'is accepted without naming its replacement'],
+        [REMOVED_CONFIGURATION_KEYS_LINK, CONFIGURATION_REJECTIONS_LINK],
+      ]],
+      ['security: Slack Connect channels are never served in open mode', [
+        ['**Slack Connect channels are never served in open mode.**', '**Slack Connect channels are never served.**'],
+        ['only in strict mode, at a non-off choice, with current verified membership', 'in either mode, even at off or without current verified membership'],
+        ['Open discovery saves `mentions` when no choice exists', 'Open discovery resets every choice to `mentions`'],
+        ['switching to strict can activate it without another listing step', 'switching to strict requires another listing step'],
+        [`[preview and off-first warning]${anchorLink(TURNING_OPEN_MODE_HEADING)}`, 'preview and off-first warning'],
+      ]],
+      [`"${SILENT_INVITED_TITLE}": an externally shared channel`, [
+        ['Open mode never serves it', 'Open mode serves it'],
+        ['Strict mode requires a non-off saved choice and current verified membership', 'Serve it in strict mode, with the channel listed'],
+        ['Open discovery may already have saved `mentions`', 'Open discovery requires a new listing'],
+        [`[preview and off-first warning](${relative(dirname(DEBUG_SKILL_FILE), CHANNEL_MODES_DOC)}${anchorLink(TURNING_OPEN_MODE_HEADING).slice(1, -1)})`, 'preview and off-first warning'],
+      ]],
+      [`"${UNCLAIMED_ENTRY_TITLE}": the ${UNCLAIMED_CHANNEL} fix in open mode, each reason (FUNGIBLE_REFUSAL_TEXTS); strict mode needs a non-off saved choice and current verified membership; malformed IDs and group DMs remain excluded`, [
+        ['requires strict mode, a non-off saved choice', 'requires strict mode, with the channel listed'],
+        ['current verified membership', 'historical membership'],
+        ['a group DM remains excluded', 'a group DM is eligible'],
+        ['on switching to strict without a new listing', 'only after a new listing'],
+        [`[preview and off-first warning](${relative(dirname(DEBUG_SKILL_FILE), CHANNEL_MODES_DOC)}${anchorLink(TURNING_OPEN_MODE_HEADING).slice(1, -1)})`, 'preview and off-first warning'],
+      ]],
+      [`Channel modes: a persona's ${code(DELIVERY_KEY)} applies as written in another persona's destination`, [
+        ['applies as written in a channel where another persona posts', 'is held at `mentions` in a channel where another persona posts'],
+      ]],
+      ['Channel modes: the on-purpose example, a second persona hearing the first persona\'s destination to review its prompts', [
+        ["`reviewer`'s entry is `all`", "`reviewer`'s entry is `off`"],
+        ["`reviewer` sees each of `planner`'s prompts and notices there", "`reviewer` never sees `planner`'s prompts and notices there"],
+      ]],
+      ['Channel modes: the loop warning for two personas hearing each other in a destination, thread_hybrid channels included', [
+        ['can answer each other in a loop', 'never answer each other'],
+        ['This includes `thread_hybrid` channels', 'This excludes `thread_hybrid` channels'],
+        ['keep one of them at `mentions`', 'keep both of them at `all`'],
+      ]],
+      [`Channel modes: the warning against two personas at ${ALL} in one channel or in one thread`, [
+        ['Two personas in one thread they are both in can keep answering each other the same way', 'Two personas in one thread never answer each other'],
+      ]],
+      ['security: anyone who can reach the persona can set any eligible channel it is in to any value, one they are not in included, and open-mode choices persist into strict mode', [
+        ['to any value, including a channel they are not in', 'to `all`, only in a channel they are in'],
+        ['stays in force when strict mode is turned on', 'is discarded when strict mode is turned on'],
+      ]],
+      ['receiving: current verified eligibility in both modes', [
+        ['current verified eligible membership', 'listed or historical membership'],
+        ['a trustworthy non-off choice', 'a missing choice defaulting to off'],
+        ['explicit non-external-sharing evidence', 'unknown external-sharing evidence'],
+        ['Off suppresses mentions and broadcasts', 'Off enables mentions and broadcasts'],
+        ['unresolved facts withhold affected acknowledgement while independent recipients and accepted work can progress', 'unresolved facts acknowledge a drop and block independent recipients and accepted work'],
+      ]],
+      [`receiving: the ${RECEIVE_ALL_SHARED} row requires current eligible effective-all siblings`, [
+        ['Neither a direct mention nor a broadcast, with effective `all`', 'A direct mention or broadcast, with saved `all`'],
+        ['this persona and another currently eligible persona in the same channel', 'this persona alone or another historical persona in a different channel'],
+        ['another currently eligible persona', 'another historically listed persona'],
+        ['departed, unverified or off ones do not', 'departed, unverified or off ones count too'],
+        ['a persona on `thread_hybrid` never does', 'a persona on `thread_hybrid` counts too'],
+      ]],
+      ['receiving: the receive_all row, scoped per mode', [
+        ['no other persona is currently eligible and effectively all there', 'no other persona has a saved-all entry there'],
+        ['after current membership and eligibility checks', 'whether or not that app remains in the channel'],
+      ]],
+      ['receiving: a reply in a thread this persona is in, under effective thread_hybrid', [
+        ['a reply in a thread this persona is in', 'any reply in the channel'],
+        ["A thread's channel message never arrives this way", "A thread's channel message also arrives this way"],
+      ]],
+    ] as const).flatMap(([element, mutations]) => mutations.map(([original, reversal]) => [element, original, reversal] as const)))(
+      'self-check: %s rejects omission or reversal of "%s"', (element, original, reversal) => {
+        const row = README_DEO_ROWS.find(([name]) => name === element)
+        if (row === undefined) throw new Error(`no README row for ${element}`)
+        const [, passage, required] = row
+        const text = readme()
+        expect(docRowProblems(passage, required, text)).toEqual([])
+        for (const replacement of ['', reversal]) {
+          const edited = text.replaceAll(original, replacement)
+          expect(edited).not.toBe(text)
+          expect(passage(edited)).not.toBe(passage(text))
+          expect(docRowProblems(passage, required, edited).length).toBeGreaterThan(0)
+        }
+      },
+    )
 
     test('self-check: an item whose builder throws fails its own row with the error, and the row still reads its other items', () => {
       const passage = readmeSection('## Reading the preview')
@@ -8200,12 +9058,12 @@ describe('the README describes both channel modes', () => {
     })
   })
 
-  describe('pointers from the declarative-scoped sections', () => {
-    test.each(DECLARATIVE_POINTERS)('"%s" links "%s", and the link resolves', (section, target) => {
+  describe('pointers from the configuration sections', () => {
+    test.each(CONFIGURATION_POINTERS)('"%s" links "%s", and the link resolves', (section, target) => {
       expect(pointerProblems(readme(), section, target)).toEqual([])
     })
 
-    test.each(DECLARATIVE_POINTERS)('self-check: "%s" with its link to "%s" dropped, or that heading renamed, fails', (section, target) => {
+    test.each(CONFIGURATION_POINTERS)('self-check: "%s" with its link to "%s" dropped, or that heading renamed, fails', (section, target) => {
       const anchor = anchorLink(target).slice(2, -1)
       const unlinked = readme().replaceAll(`](${CHANNEL_MODES_FROM_CONFIGURATION}#${anchor})`, ']')
       expect(unlinked).not.toBe(readme())
@@ -8312,14 +9170,13 @@ describe('the README describes both channel modes', () => {
         const example = JSON.parse(completeExample(readme())) as { personas: Record<string, unknown>[] } & Record<string, unknown>
         const applied = load('applied.json', example)
         const candidate = structuredClone(example)
-        candidate[MODE_SWITCH_SETTING] = true
+        candidate[MODE_SWITCH_SETTING] = 'open'
         const byName = (name: string) => {
           const persona = candidate.personas.find((p) => p.name === name)
           if (persona === undefined) throw new Error(`the declarative Example has no persona "${name}"`)
           return persona
         }
         const planner = byName('planner')
-        planner[FUNGIBLE_SECTION_KEY] = { [INVITED_DESTINATION_KEY]: planner[PROMPTS_KEY] }
         const reviewer = byName('reviewer')
         reviewer[CHANNELS_KEY] = [...(reviewer[CHANNELS_KEY] as unknown[]), { id: planner[PROMPTS_KEY], [DELIVERY_KEY]: MENTIONS }]
         const plan = buildChangePlan(applied, { kind: 'valid', config: load('candidate.json', candidate) }, { realPath: (path) => path, home })
@@ -8384,7 +9241,7 @@ describe('the README describes both channel modes', () => {
     })
   })
 
-  describe('same-file and cross-page links of the user docs (T17 hatch note 10)', () => {
+  describe('same-file and cross-page links of the user docs', () => {
     test.each([...USER_DOC_FILES, CONTRIBUTING_FILE])('every same-file link in %s resolves to one of its own headings', (doc) => {
       expect(brokenReadmeAnchors(operatorText(doc))).toEqual([])
     })
@@ -8650,6 +9507,18 @@ test('0.17.0 records fresh conversations, retained memory and the typed launch c
 
 const OBSOLETE_SLACK_REDELIVERY = /(?:deduplicat\w*|redeliver\w*|key)[^.]*(?:10|ten)[ -]minutes?|(?:deduplicat\w*|redeliver\w*|key)[^.]*(?:clear\w*|reset\w*|forgotten|forget\w*)[^.]*restart/i
 
+/** How often maintenance compacts a queue, as the privacy paragraph words `QUEUE_COMPACT_INTERVAL_MS`. */
+const COMPACTION_CADENCE = QUEUE_COMPACT_INTERVAL_MS === 60 * 60 * 1000 ? 'about hourly' : `about every ${QUEUE_COMPACT_INTERVAL_MS / 60_000} minutes`
+
+/** The longest a reply racing the persona's own post waits for that post's answer, in seconds. */
+const POST_HOLD_SECONDS = THREAD_REPLY_HOLD_MS / 1000
+
+/** The R44 receiving-order row's element, which its reversal cases look up. */
+const POST_HOLD_ROW = `arrival order and one in flight hold across sources; a reply racing the persona's own post waits up to ${POST_HOLD_SECONDS} seconds with everything behind it, then is released or withdrawn, and a reply waiting on Thread Memory lets later items pass; each decision is saved before the affected reply moves on; a restart releases an unresolved Post Hold but not a Memory Hold; a blocked head never expires`
+
+/** The R44 privacy row's element, which its reversal cases look up. */
+const PRIVACY_ROW = `privacy: undelivered and removed-persona text persists, delivered text is removed when the queue is compacted, at each start and ${COMPACTION_CADENCE}, and a message that joined a thread is kept until Thread Memory has saved that join or no longer needs it`
+
 /** Uncovered R44 facts only; marker and fixed notice rows stay above. */
 const QUEUED_DOC_ROWS: readonly (readonly [file: string, heading: HeadingMatch | undefined, element: string, required: readonly (string | RegExp)[], example: string])[] = [
   [BOTS_DOC, RECEIVING_HEADING, 'CSCB types the tag; channel names and split parts are explained', [
@@ -8669,11 +9538,26 @@ const QUEUED_DOC_ROWS: readonly (readonly [file: string, heading: HeadingMatch |
     /key[^.]*at least 24 hours after intake/i,
     /paired channel @mention adds no second item/i,
   ], 'Slack redeliveries add no second queue item across server restarts. Each accepted message keeps its key for at least 24 hours after intake; the paired channel @mention adds no second item.'],
-  [BOTS_DOC, RECEIVING_HEADING, 'FIFO and one in flight hold across sources; a blocked head never expires', [
-    /(?:strict[^.]*order|first.in.first.out|FIFO)/i, /one (?:message|item) in flight/i,
+  [BOTS_DOC, RECEIVING_HEADING, POST_HOLD_ROW, [
+    /(?:arrival order|first.in.first.out|FIFO)/i, /one (?:message|item) in flight/i,
     /(?:next|later)[^.]*(?:confirm|delivered)/i, /(?:no age cutoff|never expires|no expiry)/i,
     /(?:Slack[^.]*interject[^.]*scheduled|every source)/i,
-  ], 'Strict order covers every source. There is one message in flight; the next waits until the previous is confirmed delivered. There is no age cutoff.'],
+    /A reply racing the persona['’]s own post/i,
+    /waits while one of its posts is pending, either in that thread or as a new channel message that may have started it/i,
+    new RegExp(String.raw`waits up to ${POST_HOLD_SECONDS} seconds for the post['’]s answer, and everything behind it waits too`, 'i'),
+    new RegExp(`released when a post lands in that thread or the ${POST_HOLD_SECONDS} seconds pass`, 'i'),
+    /withdrawn, never delivered, when every post landed elsewhere or failed/i,
+    /A reply in a thread whose Thread Memory can['’]t be read/i,
+    /waits while later items pass it, and is delivered only if the persona turns out to be in that thread/i,
+    /A racing reply waits this way instead of being withdrawn when its thread can['’]t be read/i,
+    /Each decision is saved before the affected reply moves on, and a failed save is retried/i,
+    /An unresolved Post Hold blocks every later item, and a restart releases it, including one whose decision wasn['’]t saved yet/i,
+    /A Memory Hold lets later items pass and survives a restart until Thread Memory can be read/i,
+    'SKILL.md#thread-memory-unreadable',
+  ], `Slack, /interject and scheduled prompts go in arrival order. There is one message in flight; the next waits until the previous is confirmed delivered. There is no age cutoff.
+- A reply racing the persona's own post waits while one of its posts is pending, either in that thread or as a new channel message that may have started it. It waits up to ${POST_HOLD_SECONDS} seconds for the post's answer, and everything behind it waits too. It is released when a post lands in that thread or the ${POST_HOLD_SECONDS} seconds pass, and withdrawn, never delivered, when every post landed elsewhere or failed.
+- A reply in a thread whose Thread Memory can't be read waits while later items pass it, and is delivered only if the persona turns out to be in that thread. A racing reply waits this way instead of being withdrawn when its thread can't be read.
+Each decision is saved before the affected reply moves on, and a failed save is retried. An unresolved Post Hold blocks every later item, and a restart releases it, including one whose decision wasn't saved yet. A Memory Hold lets later items pass and survives a restart until Thread Memory can be read (see [Thread Memory unreadable](../skills/debug-slack-channel-bots/SKILL.md#thread-memory-unreadable)).`],
   [BOTS_DOC, RECEIVING_HEADING, 'MCP disconnection holds messages for delivery once connected', [
     /messages[^.]*wait[^.]*MCP|MCP[^.]*messages[^.]*wait/i, /deliver\w*[^.]*once[^.]*connected/i,
   ], 'Messages wait while disconnected over MCP and are delivered once connected.'],
@@ -8701,13 +9585,17 @@ const QUEUED_DOC_ROWS: readonly (readonly [file: string, heading: HeadingMatch |
     /tag description[^.]*always/i, /`system_prompt_mode`/, /`none`/,
     /(?:one|same|single|shared) file[^.]*every persona/i, /(?:whom|whose)[^.]*(?:obey|follow)/i,
   ], 'The tag description is always carried, with `system_prompt_mode` `none` included. One file serves every persona and defines whom to obey.'],
-  [SERVER_SETTINGS_DOC, '## Server-wide settings', 'acknowledgement waits for the whole transcript receipt and an early reply or reaction suppresses it', [
+  [SERVER_SETTINGS_DOC, '## Server-wide settings', 'acknowledgement waits for the whole transcript receipt, an early reply or reaction suppresses it, and a held thread reply gets its queued reaction only once released', [
     /`ack_reaction`[^\n]*transcript[^\n]*whole message/i, /reply or reaction before delivery[^.]*suppress/i,
-  ], '| `ack_reaction` | Its transcript confirms the whole message first; a reply or reaction before delivery suppresses the later reaction. |'],
-  [SERVER_SETTINGS_DOC, "# Server settings", 'privacy: undelivered and removed-persona text persists, delivered text is removed within 24 hours', [
+    /held thread reply gets its queued reaction only once released/i,
+  ], '| `ack_reaction` | Its transcript confirms the whole message first; a reply or reaction before delivery suppresses the later reaction. |\nA held thread reply gets its queued reaction only once released.'],
+  [SERVER_SETTINGS_DOC, "# Server settings", PRIVACY_ROW, [
     /undelivered[^.]*(?:kept|retain)[^.]*(?:until delivered|until delivery)/i,
-    /removed persona[^.]*queue/i, /delivered[^.]*(?:removed|deleted)[^.]*(?:within|no later than) 24 hours/i,
-  ], "Undelivered text is kept until delivered. A removed persona's queue is retained too. Delivered text is removed within 24 hours."],
+    /removed persona[^.]*queue/i, /delivered text is (?:removed|deleted) when the queue is compacted/i,
+    new RegExp(`compacted, at each start and ${COMPACTION_CADENCE}`, 'i'),
+    /delivered message that joined the persona to a thread is kept until Thread Memory has saved that join or no longer needs it/i,
+    /then removed at the next compaction/i,
+  ], `Undelivered text is kept until delivered. A removed persona's queue is retained too. Delivered text is removed when the queue is compacted, at each start and ${COMPACTION_CADENCE}. A delivered message that joined the persona to a thread is kept until Thread Memory has saved that join or no longer needs it, then removed at the next compaction.`],
   [SERVER_SETTINGS_DOC, "# Server settings", 'privacy: native transcript/history and message-bearing server log remain', [
     /transcript/i, /prompt history/i, /Claude Code[^.]*config directory/i,
     /server\.log[^.]*message text/i, /received.event/, /dispatch/, '/interject',
@@ -8715,9 +9603,12 @@ const QUEUED_DOC_ROWS: readonly (readonly [file: string, heading: HeadingMatch |
   [CONFIGURATION_DOC, '### Permission prompts', 'destinations use Message not saved and mutual storage-failure notices end after one each per episode', [
     /Message not saved/, /one[^.]*(?:each|per persona)[^.]*episode/i,
   ], 'Message not saved notices stop after one each per episode.'],
-  [CHANNEL_MODES_DOC, FUNGIBLE_PROMPTS_HEADING, 'fungible destinations receive the current storage-failure notice', [
+  [CHANNEL_MODES_DOC, PROMPTS_IN_BOTH_MODES_HEADING, "a persona's destination receives the current storage-failure notice, and a validated destination stays selected after the persona's verified leave, creating no membership or choice", [
     'Message not saved',
-  ], 'The destination receives Message not saved notices.'],
+    /validated unchanged channel destination stays selected after a verified leave of that channel by the same persona incarnation/i,
+    /even with zero entries and DMs off/i,
+    /does not recreate membership or a choice/i,
+  ], 'The destination receives Message not saved notices. A validated unchanged channel destination stays selected after a verified leave of that channel by the same persona incarnation, even with zero entries and DMs off; it does not recreate membership or a choice.'],
   [RELOAD_DOC, '## Reading the preview', 'a removed persona line includes the exact retained-queue clause', [
     /DESTRUCTIVE:[^.]*removed[^.]*\d+ open queued items? kept/, /delivered only if a persona with the same key is added again/,
   ], 'DESTRUCTIVE: persona "scribe" is removed: 2 open queued items kept, delivered only if a persona with the same key is added again.'],
@@ -8788,10 +9679,50 @@ describe('R44: queued-delivery documentation', () => {
     }
   })
 
+  test.each([
+    [BOTS_DOC, POST_HOLD_ROW, [
+      [`up to ${POST_HOLD_SECONDS} seconds for the post`, `up to ${POST_HOLD_SECONDS * 10} seconds for the post`],
+      ['and everything behind it waits too', 'and later items pass it'],
+      ['released when a post lands in that thread', 'withdrawn when a post lands in that thread'],
+      ['withdrawn, never delivered, when every post landed elsewhere or failed', 'delivered anyway when every post landed elsewhere or failed'],
+      ['waits while later items pass it', 'blocks every later item'],
+      ['waits this way instead of being withdrawn', 'is withdrawn instead of waiting'],
+      ['saved before the affected reply moves on', 'saved after the affected reply moves on'],
+      ['a failed save is retried', 'a failed save is dropped'],
+      ['An unresolved Post Hold blocks every later item', 'An unresolved Post Hold lets later items pass'],
+      ['and a restart releases it, including one', 'and survives a restart, including one'],
+      ['including one whose decision', 'except one whose decision'],
+      ['A Memory Hold lets later items pass', 'A Memory Hold blocks every later item'],
+      ['and survives a restart until Thread Memory can be read', ', and a restart releases it'],
+      ['survives a restart until Thread Memory can be read', 'is released by a restart'],
+    ]],
+    [SERVER_SETTINGS_DOC, PRIVACY_ROW, [
+      ['has saved that join or no longer needs it', 'has saved that join'],
+      ['then removed at the next compaction', 'then kept for good'],
+    ]],
+  ] as const)('self-check: %s — %s rejects omission or reversal of each held fact', (file, element, mutations) => {
+    const row = QUEUED_DOC_ROWS.find((r) => r[2] === element)
+    if (row === undefined) throw new Error(`no R44 row for ${element}`)
+    const [, heading, , required] = row
+    const passage = sectionOf(file, heading!)
+    const text = operatorText(file)
+    expect(docRowProblems(passage, required, text)).toEqual([])
+    for (const [original, reversal] of mutations) {
+      for (const replacement of ['', reversal]) {
+        const edited = text.replaceAll(original, replacement)
+        expect({ original, replacement, changed: edited !== text }).toEqual({ original, replacement, changed: true })
+        expect({ original, replacement, failing: docRowProblems(passage, required, edited).length > 0 }).toEqual({ original, replacement, failing: true })
+      }
+    }
+  })
+
   test('the interject error table has exactly the supported responses and no session-unavailable answer', () => {
     const section = requiredSection(operatorText(BOTS_DOC), '### Error conditions', BOTS_DOC)
     expect(firstTable(section).rows.map(row => Number(row[0])).sort((a, b) => a - b)).toEqual([400, 403, 404, 405, 413, 500])
-    const edited = `${section.trimEnd()}\n| 503 | No session |`
+    const lines = section.split('\n')
+    const lastRow = lines.map((line) => line.startsWith('|')).lastIndexOf(true)
+    expect(lastRow).toBeGreaterThan(0)
+    const edited = [...lines.slice(0, lastRow + 1), '| 503 | No session |', ...lines.slice(lastRow + 1)].join('\n')
     expect(firstTable(edited).rows.map(row => Number(row[0]))).toContain(503)
   })
 
@@ -8851,24 +9782,44 @@ describe('MCP-loss wording sensitivity', () => {
 const DOWNGRADE_OPERATIONS: readonly (readonly [label: string, pattern: RegExp])[] = [
   [`native ${MIN_CLAUDE_CODE_VERSION} selected before either start`, new RegExp(`^real_prepare ${escapeRegExp(MIN_CLAUDE_CODE_VERSION)}$`, 'm')],
   ['current release starts', /^start_server --live$/m],
-  ['queue emptiness is required', /^\[\[ ! -e .*\/queue\/.*\|\| ! -s .*\]\] \|\| fail 'downgrade requires empty queues'$/m],
+  // The downgrade's first phase: retire thread_hybrid and let Thread Memory recover, before the queues are emptied.
+  ['every thread_hybrid channel is changed to another value', /^jq -c '\.channels \|= map\(if \.delivery == "thread_hybrid" then \.delivery = "all" else \. end\)' "\$\{REAL_PERSONAS\}" > "\$\{SCENARIO_ROOT\}\/real-personas\.next"\nmv "\$\{SCENARIO_ROOT\}\/real-personas\.next" "\$\{REAL_PERSONAS\}"\nreal_write_config$/m],
+  ['the thread_hybrid change is confirmed', /^mv .*config\.json\.pending" .*config\.json\.apply"$/m],
+  ['no thread_hybrid channel is applied before continuing', /^wait_until \d+ '[^']*' no_thread_hybrid_applied$/m],
+  ['every Thread Memory outage report is followed by recovered', /^wait_until \d+ '[^']*' thread_memory_recovered$/m],
+  ['the current release stops for the tidying restart', /^stop_server$/m],
+  ['the current release starts again and tidies its queue', /^start_server --live$/m],
+  ['the tidied queue is read after the restart', /^wait_until \d+ '[^']*' queue_tidied$/m],
+  ['every received item is delivered', /^queue_all_delivered \|\| fail 'downgrade requires every received item delivered'$/m],
   ['resume is disabled on the current release', /^real_write_config '\{"resume_enabled":false\}'$/m],
   ['disable-resume change is confirmed', /^mv .*config\.json\.pending" .*config\.json\.apply"$/m],
-  ['last-applied false is observed before stopping', /^wait_until .*jq -e '\.resume_enabled == false' .*config\.json\.last-applied"$/m],
+  ['last-applied false is observed before stopping', /^wait_until .*configuration_applied_is "\$\{SLACK_STATE_DIR\}\/config\.json" "\$\{SLACK_STATE_DIR\}\/config\.json\.last-applied" resume_enabled false$/m],
+  ['reviewed bytes and applied configuration are verified before stopping', /^configuration_record_matches "\$\{SLACK_STATE_DIR\}\/config\.json" "\$\{SLACK_STATE_DIR\}\/config\.json\.last-applied" applied \\\n    \|\| fail 'disable-resume confirmation did not preserve reviewed bytes and applied configuration'$/m],
   ['server and bots stop', /^stop_server --stop-bots$/m],
-  ['previous tarball is selected', /^PREVIOUS="\/opt\/claude-slack-channel-bots-0\.16\.1\/claude-slack-channel-bots-0\.16\.1\.tgz"$/m],
+  ['previous tarball is selected', /^PREVIOUS="\/opt\/claude-slack-channel-bots-0\.18\.0\/claude-slack-channel-bots-0\.18\.0\.tgz"$/m],
   ['previous tarball is bound to the installed package manifest', /^printf '\{"private":true,"dependencies":\{"claude-slack-channel-bots":"file:%s"\}\}\\n' "\$\{PREVIOUS\}" > "\$\{INSTALL\}\/package\.json"$/m],
   ['previous package is installed', /^\(cd "\$\{INSTALL\}" && bun install --ignore-scripts .*\)$/m],
-  ['CLI changes to the installed previous build', /^SCENARIO_CLI="\$\{INSTALL\}\/node_modules\/\.bin\/claude-slack-channel-bots"$/m],
+  ['CLI changes to the installed previous build, keeping the current CLI', /^CURRENT_CLI="\$\{SCENARIO_CLI\}"\nSCENARIO_CLI="\$\{INSTALL\}\/node_modules\/\.bin\/claude-slack-channel-bots"$/m],
   ['previous release starts', /^start_server --live$/m],
   ['previous bot finishes launching', /^real_wait_launch "\$\{REAL_KEY\}"$/m],
   ['fresh start is asserted rather than resume', /^\[\[ .*cscb_ad_count_between .* resume\).* == 0 \]\] \|\| fail /m],
-  ['actual previous launch templates are read', /^python3 - "\$\{SCENARIO_AD_SHIM_LOG\}" "\$\{OLD_MARK\}" <<'CHECK'$/m],
-  ['previous launch has the channels flag and router', /^assert any\('--dangerously-load-development-channels' in words and 'server:slack-channel-router' in words for words in templates\)/m],
+  // 0.18.0 has no development-channels flag; its route is its own template.
+  ['shim words are decoded by the shared %q decoder', /^const \{ shimWords \} = await import\(receipts\)$/m],
+  ["the previous release's own router name is loaded", /^const \{ loadPersonaConfig, MCP_SERVER_NAME \} = await import\(configTs\)$/m],
+  ['the previous release builds its own template parameters', /^const params = buildTemplateParams\(loadPersonaConfig\(config, home\)\)$/m],
+  ["the previous template's MCP config names the router", /^const routed = params\.agent_args\[0\] === "--mcp-config" && typeof MCP_SERVER_NAME === "string" && MCP_SERVER_NAME !== ""\n  && Object\.hasOwn\(JSON\.parse\(fs\.readFileSync\(params\.agent_args\[1\], "utf8"\)\)\.mcpServers \?\? \{\}, MCP_SERVER_NAME\)$/m],
+  ['actual previous launch templates are read', /^const calls = fs\.readFileSync\(log, "utf8"\)\.split\("\\n"\)\.slice\(Number\(mark\)\)\.filter\(l => l\.startsWith\("call\\t"\)\)\n  \.map\(l => shimWords\(l\.split\("\\t"\)\.slice\(5\)\.join\("\\t"\)\)\)\.filter\(w => w\.includes\("make-template"\)\)$/m],
+  ['a template flag is read only when it occurs exactly once', /^const only = \(w, flag\) => w\.indexOf\(flag\) >= 0 && w\.indexOf\(flag\) === w\.lastIndexOf\(flag\) \? w\[w\.indexOf\(flag\) \+ 1\] : undefined$/m],
+  ['every --agent-args value is read in order', /^const agentArgs = w => w\.flatMap\(\(word, i\) => word === "--agent-args" \? \[w\[i \+ 1\]\] : \[\]\)$/m],
+  ['previous launch is its own template contract without the channels flag or router', /^const ok = routed && params\.name === "slack-channel-bot" && params\.relay_mode === "on" && calls\.length > 0 && calls\.every\(w =>\n  only\(w, "--name"\) === params\.name && only\(w, "--relay-mode"\) === params\.relay_mode\n  && JSON\.stringify\(agentArgs\(w\)\) === JSON\.stringify\(params\.agent_args\)\n  && !w\.includes\("--dangerously-load-development-channels"\) && !w\.includes\("server:slack-channel-router"\)\)\nprocess\.exit\(ok \? 0 : 1\)' \\$/m],
+  ['the contract reads the shim log since OLD_MARK and the previous package, and fails', /^    "\$\{SCENARIO_AD_SHIM_LOG\}" "\$\{OLD_MARK\}" "\$\{SCENARIO_FIXTURES\}\/transcript-receipts\.ts" \\\n    "\$\{EARLIER_PKG\}\/src\/config\.ts" "\$\{EARLIER_PKG\}\/src\/agent-director-template\.ts" "\$\{SLACK_STATE_DIR\}\/config\.json" "\$\{HOME\}" \\\n    \|\| fail '[^']+'$/m],
   ['previous release load errors fail', /^! grep -Ei 'failed to load config\|invalid persona config\|load error' /m],
   ['resume is restored after fresh startup', /^jq '\.resume_enabled = true' .*\| write_config$/m],
   ['restore-resume change is confirmed', /^mv .*config\.json\.pending" .*config\.json\.apply"$/m],
   ['last-applied true is observed', /^wait_until .*jq -e '\.resume_enabled == true' .*config\.json\.last-applied"$/m],
+  ['the stopped current-format authority is restored', /^restore_stopped_downgrade$/m],
+  ['CLI changes back to the current build before upgrading again', /^SCENARIO_CLI="\$\{CURRENT_CLI\}"$/m],
+  ['current release starts again after the downgrade', /^start_server --live$/m],
 ]
 
 function downgradeExecutableText(text: string): string {
@@ -8896,7 +9847,7 @@ describe('R55: documented downgrade matches the executed safety barriers', () =>
   })
 
   const documentedPhases = `${DOWNGRADE_HEADING}\n
-1. Stop sending; wait until server.log shows every received item delivered, or accept that undelivered messages are lost.
+1. Stop sending; change every ${code(THREAD_HYBRID)} channel to another delivery value and confirm; wait until every *${memoryNotSavedTitle()}* or *${memoryUnreadableTitle()}* report has been followed by *${memoryRecoveredTitle()}*; then restart once with ${code(`claude-slack-channel-bots ${CLI_COMMAND_CLEAN_RESTART} --server`)} to tidy the queues at start. Wait until server.log shows every received item delivered, or accept that undelivered messages are lost.
 2. On the current release set \`resume_enabled\` to \`false\`, confirm the change and check last-applied.
 3. Run \`claude-slack-channel-bots stop --stop-bots\`, install the earlier build, and restore the Claude Code pin.
 4. Start the earlier release in a fresh conversation with channels; set \`resume_enabled\` back and confirm the change.
@@ -8968,18 +9919,16 @@ describe('R55: documented downgrade matches the executed safety barriers', () =>
     expect(lacking(edited, [pattern])).toHaveLength(1)
   })
 
-  test('schema precautions are conditional on the older target, without an install-and-resume shortcut', () => {
+  test('schema restoration uses preserved references without an install-and-resume shortcut', () => {
+    for (const [element, passage, required] of DOWNGRADE_STATE_ROWS) {
+      expect({ element, problems: docRowProblems(passage, required, operatorText(RUNBOOK_DOC)) }).toEqual({ element, problems: [] })
+    }
     const text = flat(requiredSection(operatorText(RUNBOOK_DOC), DOWNGRADE_HEADING, RUNBOOK_DOC))
-    expect(text).toMatch(/(?:if|when)[^.]*(?:target|release|build)[^.]*(?:reject|support|understand)/i)
-    expect(text).toContain('`allow_invited_channels`')
-    expect(text).toContain('`invited`')
-    expect(text).toMatch(/valid declarative (?:section|configuration)/i)
-    expect(text).toMatch(/remov\w*[^.]*`allow_invited_channels`[^.]*`invited`/i)
-    expect(text).toMatch(/last-applied[^.]*(?:neither|without)|(?:neither|without)[^.]*last-applied/i)
     expect(text).not.toMatch(/An earlier release's loader rejects/)
     expect(text).not.toMatch(/never held either key[^.]*install the older build and restart/i)
     const step4 = downgradeStep(4)(operatorText(RUNBOOK_DOC))
     expect(step4).toMatch(/start[^.]*(?:fresh|new conversation)[\s\S]*resume_enabled[\s\S]*confirm/i)
+    expect(step4).not.toContain(LEGACY_DELIVERY_FILE)
   })
 
   test('the maintained downgrade copy matches word for word, with only its intro and relative links normalised', () => {
@@ -8993,5 +9942,229 @@ describe('R55: documented downgrade matches the executed safety barriers', () =>
     expect(asReadmeText(copy).trim()).toBe(current.trim())
     expect(asReadmeText(copy.replace('1. ', '1. Changed instruction. ')).trim()).not.toBe(current.trim())
     expect(asReadmeText(copy.replace('2. ', '2.\n3. ')).trim()).not.toBe(current.trim())
+  })
+})
+
+// The membership setup record's narrow operator contract: the terms its documentation names.
+const MEMBERSHIP_RECORD_TERMS = [MEMBERSHIP_READINESS_ROUTE, ...MEMBERSHIP_REQUIRED_SUBSCRIPTIONS,
+  'installation', 'teamId', 'appId', 'botUserId', 'botId', 'subscriptions', 'reinstall', 'record', 'read']
+function membershipRecordMissing(text: string): string[] {
+  return MEMBERSHIP_RECORD_TERMS.filter(term => !new RegExp(`(?<![A-Za-z0-9_-])${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9_-])`).test(text))
+}
+test('membership readiness: shipped guidance exposes the app-bound manual record and readback fields', () => {
+  const text = `${userDocsText()}\n${operatorText(DEBUG_SKILL_FILE)}`
+  expect(membershipRecordMissing(text)).toEqual([])
+})
+test.each(MEMBERSHIP_RECORD_TERMS)('membership readiness manual record check detects omitted %s', term => {
+  const example = MEMBERSHIP_RECORD_TERMS.join('\n')
+  expect(membershipRecordMissing(example)).toEqual([])
+  expect(membershipRecordMissing(MEMBERSHIP_RECORD_TERMS.filter(value => value !== term).join('\n'))).toContain(term)
+})
+
+/** Find the shared-channel release by its content, so publishing can rename its heading. */
+function sharedReleaseEntry(changelog: string): string {
+  const entries = headings(changelog).filter(h => h.level === 2)
+    .map(h => requiredSection(changelog, h.text, CHANGELOG_FILE))
+    .filter(entry => headings(entry).some(h => h.text === '### Shared channels and threads'))
+  if (entries.length !== 1) throw new Error(`expected one shared-channel release entry, found ${entries.length}`)
+  return entries[0]
+}
+
+const SHARED_RELEASE_ROWS: readonly DocRow[] = [
+  ['removed keys fail at load and name their replacements', sharedReleaseEntry, [
+    code(REMOVED_MODE_KEY), code(REMOVED_SECTION_KEY), ci('cause load errors naming'),
+    code(MODE_SWITCH_SETTING), code(PROMPTS_KEY), ci('as their replacements'),
+    code(CONFIG_FILE_NAME), code(CHANNEL_DELIVERY_FILE_NAME), ci('no automatic conversion'),
+    `(${RUNBOOK_DOC}#${UPGRADE_ANCHOR})`,
+  ]],
+  ['the old delivery file is ignored and retained for rollback', sharedReleaseEntry, [
+    ci(`${code(LEGACY_DELIVERY_FILE)} is ignored`),
+    ci('Keep it until rollback is no longer wanted, because the previous CSCB reads it'),
+    ci('preserved copy only as a manual reference'),
+  ]],
+  ['existing apps need one manifest update and reinstall with current verification', sharedReleaseEntry, [
+    ci('Every existing Slack app needs one manifest update and reinstall'),
+    ...MEMBERSHIP_REQUIRED_SUBSCRIPTIONS.map(code),
+    ci('Record and read back verification for the current installation'),
+    `(${WIZARD_FILE}#${REINSTALL_ANCHOR})`,
+    ci('New manifest installs need no extra reinstall; ordinary restarts need none'),
+  ]],
+  ['the removed destination guard leaves choices effective as written', sharedReleaseEntry, [
+    ci('destination loop guard is removed'), ci("delivery value applies as written in another persona's destination channel"),
+  ]],
+  // Tool and parameter names are inline in registry.ts; it exports descriptions, not a name list.
+  ['thread delivery and whole-thread reading name their public controls', sharedReleaseEntry, [
+    code(THREAD_HYBRID), code(`via="${THREAD_VIA}"`), code('fetch_messages'), code('thread_ts'), code('cursor'), ci('read the whole thread'),
+  ]],
+  ['thread memory and shared-state reports name the source titles', sharedReleaseEntry, [
+    ...[memoryNotSavedTitle, memoryUnreadableTitle, memoryChangedTitle, memoryRecoveredTitle, joinsLostTitle,
+      sharedStateUnresolvedTitle, membershipEvidenceUnresolvedTitle, sharedStateRecoveredTitle,
+    ].map(title => () => code(title())),
+  ]],
+  ['tag descriptions quote the changed source lines', sharedReleaseEntry, [
+    () => {
+      const line = TAG_DESCRIPTION.split('\n').find(line => line.startsWith(`- via="${THREAD_VIA}"`))
+      if (!line) throw new Error('tag description has no thread line')
+      return code(line.slice(2))
+    },
+    () => {
+      const line = TAG_DESCRIPTION.match(/BODY carries [^:]+/)
+      if (!line) throw new Error('tag description has no BODY clause')
+      return code(line[0])
+    },
+  ]],
+  ['downgrade actions precede draining and keep both configurations', sharedReleaseEntry, [
+    ci(`change every ${code(THREAD_HYBRID)} channel to another value and confirm`),
+    ci('wait for Thread Memory recovery'), ci('then restart once to tidy queues before draining them'),
+    ci('Restore the earlier configuration from preserved references while stopped'),
+    ci('retaining the current files for upgrading again'), `(${RUNBOOK_DOC}#${headingSlug(DOWNGRADE_HEADING.slice(4))})`,
+  ]],
+]
+
+/** These passages read README.md itself; other pages cannot satisfy a pointer. */
+const README_UPGRADE_ROWS: readonly DocRow[] = [
+  ['prerequisites link the manual upgrade for existing installations', sectionOf('README.md', PREREQUISITES_HEADING), [
+    ci('For an existing installation'), `(${RUNBOOK_DOC}#${UPGRADE_ANCHOR})`,
+  ]],
+  ['the wizard pointer requires one existing-app update and reinstall', sectionOf('README.md', '## Quick Start'), [
+    ci('An existing app needs one manifest update and reinstall'), `(${WIZARD_FILE}#${REINSTALL_ANCHOR})`,
+    ci('current-app verification and readback'),
+  ]],
+  ['the Migration table row names the manual upgrade and rollback', tableRowOf('## Documentation', '[Migration]'), [
+    ci('Install this release over an earlier one'), ci('manual upgrade'), `(${RUNBOOK_DOC}#${UPGRADE_ANCHOR})`, ci('roll it back'),
+  ]],
+  ['the Channel modes table row names both modes and the shared list', tableRowOf('## Documentation', '[Channel modes]'), [
+    '(docs/channel-modes.md)', ci('strict or open mode'), ci('one shared channel list'), ci('who can reach a persona in open mode'),
+  ]],
+  ['the first configuration names every delivery value', unitOf('README.md', '## A first configuration', `- ${code(CHANNELS_KEY)}`), [
+    ci('shared list in both modes'), ...DELIVERY_MODES.map(code),
+  ]],
+]
+
+function orderedTextProblems(text: string, items: readonly RegExp[]): string[] {
+  let after = 0
+  return items.flatMap(item => {
+    const match = item.exec(text.slice(after))
+    if (!match) return [`missing or out of order: ${String(item)}`]
+    after += match.index + match[0].length
+    return []
+  })
+}
+
+const DOWNGRADE_PRE_DRAIN = [
+  ci(`change every ${code(THREAD_HYBRID)} channel to another delivery value and confirm`),
+  ci(`wait until every *${memoryNotSavedTitle()}* or *${memoryUnreadableTitle()}* report has been followed by *${memoryRecoveredTitle()}*`),
+  ci(`then restart once with ${code(`claude-slack-channel-bots ${CLI_COMMAND_CLEAN_RESTART} --server`)}`),
+  ci('every received item delivered'),
+]
+
+function legacyDeliveryReferenceProblems(text: string): string[] {
+  return textUnits(text).filter(unit => unit.includes(LEGACY_DELIVERY_FILE)
+    && !/(?:preserved|stale) reference|(?:this|current) release (?:never reads|does(?:n't| not) read)/i.test(unit))
+}
+
+describe('the manual upgrade and release guidance', () => {
+  test.each([
+    ['prepare both baseline files', 'Start from the preserved applied configuration', 'Start from the edited configuration'],
+    ['prepare both baseline files', `when present, otherwise the preserved ${code(CONFIG_FILE_NAME)}`, 'even when absent'],
+    ['prepare both baseline files', 'retaining its unrelated settings and defaults', 'resetting its unrelated settings and defaults'],
+    ['choose the mode and transfer', `that configuration or the preserved reference ${code(LEGACY_DELIVERY_FILE)}`, `the edited configuration or the preserved reference ${code(LEGACY_DELIVERY_FILE)}`],
+    ['pending edits stay separate', `set aside the edited ${code(CONFIG_FILE_NAME)}'s unconfirmed differences as pending intent before reconciling channel choices`, `apply the edited ${code(CONFIG_FILE_NAME)}'s unconfirmed differences while reconciling channel choices`],
+  ])('self-check: upgrade %s rejects reversed baseline or pending intent', (prefix, from, to) => {
+    const row = UPGRADE_ROWS.find(([element]) => element.startsWith(`Upgrade: ${prefix}`))!
+    const text = operatorText(RUNBOOK_DOC)
+    const edited = text.replace(from, to)
+    expect(edited).not.toBe(text)
+    expect(row[1](edited)).toContain(to)
+    expect(docRowProblems(row[1], row[2], edited).length).toBeGreaterThan(0)
+  })
+
+  test('the upgrade has exactly seven ordered preparation, verification and start steps', () => {
+    const text = operatorText(RUNBOOK_DOC)
+    const numbers = requiredSection(text, UPGRADE_HEADING, RUNBOOK_DOC).match(/^\d+(?=\. )/gm)
+    expect(numbers).toEqual(['1', '2', '3', '4', '5', '6', '7'])
+    for (const [, passage, required] of UPGRADE_ROWS) expect(docRowProblems(passage, required, text)).toEqual([])
+  })
+
+  test.each([1, 2, 3, 4, 5, 6])('self-check: swapping upgrade steps %s and its successor fails their rows', n => {
+    const text = operatorText(RUNBOOK_DOC)
+    const body = requiredSection(text, UPGRADE_HEADING, RUNBOOK_DOC)
+    const parts = body.split(/\n(?=\d+\. )/)
+    const next = parts[n + 1]
+    parts[n + 1] = parts[n].replace(/^\d+\./, `${n + 1}.`)
+    parts[n] = next.replace(/^\d+\./, `${n}.`)
+    const edited = text.replace(body, parts.join('\n'))
+    expect(edited).not.toBe(text)
+    expect(UPGRADE_ROWS.flatMap(([, passage, required]) => docRowProblems(passage, required, edited)).length).toBeGreaterThan(0)
+  })
+
+  test('downgrade changes delivery, waits for recovery and restarts before draining', () => {
+    expect(orderedTextProblems(downgradeStep(1)(operatorText(RUNBOOK_DOC)), DOWNGRADE_PRE_DRAIN)).toEqual([])
+  })
+  test.each([0, 1, 2])('self-check: moving pre-drain action %s after its successor fails', i => {
+    const text = downgradeStep(1)(operatorText(RUNBOOK_DOC))
+    const action = text.match(DOWNGRADE_PRE_DRAIN[i])![0]
+    const edited = text.replace(action, '') + ` ${action}`
+    expect(orderedTextProblems(edited, DOWNGRADE_PRE_DRAIN).length).toBeGreaterThan(0)
+  })
+
+  for (const [file, rows] of [['README.md', README_UPGRADE_ROWS], [CHANGELOG_FILE, SHARED_RELEASE_ROWS]] as const) {
+    describe(file, () => {
+      test.each(rows)('%s', (element, passage, required) => {
+        expect({ element, problems: docRowProblems(passage, required, operatorText(file)) }).toEqual({ element, problems: [] })
+      })
+      test.each(rows)('self-check: %s fails for every omitted item', (element, passage, required) => {
+        const text = operatorText(file)
+        for (const item of required.map(resolveItem)) {
+          const edited = withItemCut(text, passage, item)
+          expect({ element, item: String(item), problems: docRowProblems(passage, [item], edited) })
+            .toEqual({ element, item: String(item), problems: [`lacks ${String(item)}`] })
+        }
+      })
+    })
+  }
+
+  const SHARED_RELEASE_REVERTS = [
+    ['removed keys fail', 'cause load errors naming', 'are accepted alongside'],
+    ['the old delivery file', 'is ignored', 'is the active store'],
+    ['existing apps need', 'needs one manifest update and reinstall', 'needs no manifest update or reinstall'],
+    ['the removed destination guard', 'destination loop guard is removed', 'destination loop guard still suppresses delivery'],
+    ['thread delivery', code('fetch_messages'), code('reply')],
+    ['thread memory and shared-state reports', code(memoryRecoveredTitle()), code('Storage works')],
+    ['tag descriptions', 'BODY carries the Slack text with terminal normalization', 'BODY carries the text exactly as Slack sent it'],
+    ['downgrade actions', 'then restart once to tidy queues before draining them', 'drain queues without restarting'],
+  ] as const
+  test.each(SHARED_RELEASE_REVERTS)('self-check: %s rejects reverted release wording', (prefix, from, to) => {
+    const row = SHARED_RELEASE_ROWS.find(([element]) => element.startsWith(prefix))!
+    const text = operatorText(CHANGELOG_FILE)
+    const entry = sharedReleaseEntry(text)
+    const edited = text.replace(entry, entry.replace(from, to))
+    expect(edited).not.toBe(text)
+    expect(docRowProblems(row[1], row[2], edited).length).toBeGreaterThan(0)
+  })
+
+  test('publishing the shared-channel entry and inserting an empty Unreleased keeps every release check', () => {
+    const text = operatorText(CHANGELOG_FILE)
+    const published = text.replace(/^## Unreleased$/m, '## Unreleased\n\n## 1.0.0 (2026-11-08)')
+    expect(published).not.toBe(text)
+    for (const [element, passage, required] of SHARED_RELEASE_ROWS) {
+      expect({ element, problems: docRowProblems(passage, required, published) }).toEqual({ element, problems: [] })
+    }
+  })
+
+  const deleteInstructions = (text: string) => textUnits(text).filter(unit => unit.includes(LEGACY_DELIVERY_FILE) && DELETE_WORDS.test(unit))
+  test('nothing in the changelog tells the reader to delete the old delivery file', () => {
+    expect(deleteInstructions(operatorText(CHANGELOG_FILE))).toEqual([])
+  })
+  test.each(['Delete', 'Remove', 'Erase', 'Discard', 'rm'])('self-check: %s of the old delivery file is caught outside the release entry', action => {
+    expect(deleteInstructions(`${operatorText(CHANGELOG_FILE)}\n\n${action} ${code(LEGACY_DELIVERY_FILE)}.`)).toHaveLength(1)
+  })
+
+  test.each([RUNBOOK_DOC, 'README.md'])('%s treats the old delivery file only as a reference', file => {
+    expect(legacyDeliveryReferenceProblems(operatorText(file))).toEqual([])
+  })
+  test.each([RUNBOOK_DOC, 'README.md'])('self-check: %s cannot describe the old delivery file as a current store', file => {
+    const text = `${operatorText(file)}\n\n${code(LEGACY_DELIVERY_FILE)} is the current delivery store.`
+    expect(legacyDeliveryReferenceProblems(text)).toHaveLength(1)
   })
 })
