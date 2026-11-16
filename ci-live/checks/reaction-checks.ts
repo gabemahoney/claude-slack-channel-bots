@@ -153,7 +153,7 @@ async function aPost(ctx: CheckContext, f: Findings, channel: string, text: stri
  * comparing the preview (recorded as evidence); waits for `reload-applied` or
  * `reload-noop`.
  */
-async function confirmLoose(ctx: CheckContext, f: Findings, what: string, script: string): Promise<boolean> {
+export async function confirmLoose(ctx: CheckContext, f: Findings, what: string, script: string): Promise<boolean> {
   const m = await mark(ctx)
   const edit = await guarded(ctx, script)
   if (!f.expect(edit.ok && edit.code === 0, `${what}: the guarded config edit did not run`)) return false

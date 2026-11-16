@@ -17,6 +17,7 @@ import { CLOSING_CHECKS, LIFECYCLE_CHECKS } from './lifecycle-checks.ts'
 import { membershipSetupCheck, membershipSetupRestartCheck } from './membership-setup.ts'
 import { REACTION_CHECKS } from './reaction-checks.ts'
 import { installCheck, preflightCheck, s1Check, s2Check, s3Check, setupCheck } from './setup-checks.ts'
+import { THREAD_CHECKS } from './thread-checks.ts'
 
 export const teardownCheck: CheckDef<CheckContext> = {
   id: 'teardown',
@@ -76,6 +77,7 @@ export const PLAN_CHECKS: CheckDef<CheckContext>[] = [
   membershipSetupRestartCheck,
   ...INVITED_CHECKS,
   ...REACTION_CHECKS,
+  ...THREAD_CHECKS,
   ...CLOSING_CHECKS,
 ]
 

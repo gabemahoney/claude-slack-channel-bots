@@ -163,6 +163,12 @@ export interface SharedState {
    * restarts (which must find another PID).
    */
   membershipSetup?: { installation: string; order: number; recordedAt: number; state: string; pid: number }
+  /** TH1: where it copied config.json before its first edit; set as soon as the copy exists (TH-restore restores it). */
+  threadConfigCopy?: string
+  /** TH1: the coordination thread A joined by its own reply (TH4 and TH5 reply in it again). */
+  threadOwnRoot?: string
+  /** TH2: the coordination thread A joined by an @mention in its channel message (TH5 replies in it again). */
+  threadMentionRoot?: string
 }
 
 export interface CheckContext {

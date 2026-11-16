@@ -883,7 +883,7 @@ describe('the check list', () => {
     const lastOf28 = Math.max(...ids.map((id, i) => (id.startsWith('28') ? i : -1)))
     expect(lastOf28).toBeGreaterThan(-1)
     expect(at('30')).toBeGreaterThan(lastOf28)
-    expect(ids.slice(at('34') + 1)).toEqual(['RN1', 'RN2', 'RN3', 'RN4', 'RN5', 'RN6', '29a', '29b'])
+    expect(ids.slice(at('34') + 1)).toEqual(['RN1', 'RN2', 'RN3', 'RN4', 'RN5', 'RN6', 'TH1', 'TH2', 'TH3', 'TH4', 'TH5', 'TH-restore', 'TB1', 'TB2', '29a', '29b'])
     expect(INVITED_CHECKS.map((c) => [c.row, c.needs, c.blocking ?? false, c.prerequisite ?? false, c.always ?? false, c.skip ?? null, c.undoes ?? []])).toEqual(
       ['30', '31', '32', '33', '34'].map((row) => [row, ['workspace', 'claude'], false, false, false, null, row === '34' ? ['30', '31', '32', '33'] : []]),
     )
@@ -905,7 +905,8 @@ describe('the check list', () => {
     expect(ids.filter((id) => !id.startsWith('setup-'))).toEqual([
       'preflight', 'install', 'setup', 'S1', 'S2', 'S3', ...CHANNEL_CHECKS.map((c) => c.id),
       '14', '15', '16', 'A-DMs-on', '17', '18', '19', '20', '21', '22', '23', '24-setup', '24', '24-teardown', '25', '26', '27', '28',
-      '30', '31', '32', '33', '34', 'RN1', 'RN2', 'RN3', 'RN4', 'RN5', 'RN6', '29a', '29b',
+      '30', '31', '32', '33', '34', 'RN1', 'RN2', 'RN3', 'RN4', 'RN5', 'RN6',
+      'TH1', 'TH2', 'TH3', 'TH4', 'TH5', 'TH-restore', 'TB1', 'TB2', '29a', '29b',
     ])
     // Runner-only checks: no Results column, nothing blocking, nothing run unselected, nothing undone.
     for (const c of [membershipSetupCheck, membershipSetupRestartCheck]) {
@@ -3211,8 +3212,8 @@ test('lifecycle preview consumers require current review grammar and every match
 
 describe('no live check passes against a silent workspace', () => {
   // A gesture that only undoes its setup passes when the setup never ran: nothing to restore.
-  // Check 34 undoes what Check 30 did.
-  const UNDO_GESTURES = ['24-teardown', '34']
+  // Check 34 undoes what Check 30 did; TH-restore undoes TH1's edits.
+  const UNDO_GESTURES = ['24-teardown', '34', 'TH-restore']
   const live = PLAN_CHECKS.filter((c) => c.needs.includes('workspace') && !c.skip && !UNDO_GESTURES.includes(c.id))
 
   /**
