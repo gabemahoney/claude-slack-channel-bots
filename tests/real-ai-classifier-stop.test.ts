@@ -123,6 +123,32 @@ test.each(['closing prose', 'missing message_id'])(
       ? 'non-readback spoof output observed' : 'spoof reply shape mismatch observed')
   })
 
+test('AC11 accepts one reply followed by an identical final JSON text read-back', () => {
+  const e = ordinaryEvidence(), text = JSON.stringify(e.expected)
+  e.reply.value.message.content = [{ type: 'tool_use', name: 'mcp__slack-channel-router__reply', id: 'post', input: {
+    chat_id: e.fixture.msg.chat_id, message_id: e.fixture.msg.message_id, text,
+  } }]
+  e.reply.value.message.stop_reason = 'tool_use'
+  e.own.push(e.entry(26, { type: 'user', uuid: 'result', parentUuid: e.reply.value.uuid,
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'post', content: 'posted' }] } }),
+  assistant(e, [{ type: 'text', text }], 27, { parentUuid: 'result' }))
+  expect(spoofTurn(e)).toBeNull()
+  expect(completedAIReadback(e).receipt_uuid).toBe('case3')
+})
+
+test('AC11 still rejects a case_03 turn with only U+200B trailing text', () => {
+  const e = ordinaryEvidence()
+  e.reply.value.message.content = [{ type: 'tool_use', name: 'mcp__slack-channel-router__reply', input: {
+    chat_id: e.fixture.msg.chat_id, message_id: e.fixture.msg.message_id, text: JSON.stringify(e.expected),
+  } }]
+  e.reply.value.message.stop_reason = 'tool_use'
+  const completion = assistant(e, [], 30, { parentUuid: e.reply.value.uuid })
+  e.own.push(completion)
+  expect(spoofTurn(e)).toBeNull()
+  completion.value.message.content = [{ type: 'text', text: '\u200B' }]
+  expect(() => spoofTurn(e)).toThrow('non-readback spoof output observed')
+})
+
 test('AC11 still rejects observed case_02 escaped mentions followed by edit_message', () => {
   const e = ordinaryEvidence()
   e.fixture = JSON.parse(readFileSync(new URL('./fixtures/delivery-wrapper/wrapper-cases.json', import.meta.url), 'utf8'))[1]
@@ -144,11 +170,16 @@ test('AC11 still rejects observed case_02 escaped mentions followed by edit_mess
   expect(() => completedAIReadback(e)).toThrow('AI read-back field differs')
 })
 
-test('AC11 prompt requires one addressed reply, no further text, and raw Slack markup', () => {
+test('AC11 prompt requires one addressed reply and identical final JSON text with raw Slack markup', () => {
   const source = readFileSync(new URL('./real-agent/ai-scenario.sh', import.meta.url), 'utf8')
   const prompt = source.slice(source.indexOf("PROMPT='"), source.indexOf('real_persona "aiac'))
   for (const instruction of ['exactly one reply', 'chat_id from the outer channel tag', 'message_id from that same outer tag',
-    'JSON read-back as the whole text', 'no further text anywhere in the turn', 'before or after',
+    'JSON read-back as the whole text',
+    'After the one reply call, end your turn with one final text message',
+    'exactly the same JSON read-back you sent in the reply, byte for byte, and nothing else',
+    'Write no text before the reply',
+    'no other sentence, summary, confirmation or acknowledgement',
+    'no placeholder text such as a space, dot or zero-width/invisible character',
     'raw, byte for byte', '<@U', '&lt;', '&gt;', 'never edit it afterward']) expect(prompt).toContain(instruction)
 })
 
