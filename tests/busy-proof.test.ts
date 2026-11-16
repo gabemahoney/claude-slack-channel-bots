@@ -20,6 +20,115 @@ function snapshot(complete: boolean, body = 'private body'): BusyProofSnapshot {
     journal: [{ kind: 'accepted', seq: 2, source: 'slack', received_at: 200 }, { kind: 'fixed', seq: 2, parts: [body] }], own }
 }
 const prove = (value: BusyProofSnapshot) => assertBusyProof(value, 2, () => ({ duplicates: 0 }), (actual, expected) => actual === expected)
+
+function nextTurnSnapshot(): BusyProofSnapshot {
+  const value = snapshot(true)
+  value.own[2]!.offset = 70
+  value.own[2]!.at = 700
+  value.own.push(record(60, 600, { type: 'assistant', message: { id: 'retry', stop_reason: 'end_turn', content: [{ type: 'text', text: 'visible answer' }] } }))
+  return value
+}
+
+test.each([undefined, true])('thinking-only terminal and native meta nudge are one turn (turnCompanion=%s)', companion => {
+  const value = nextTurnSnapshot()
+  value.own[3]!.value.message.content = [{ type: 'thinking' }]
+  // The retained failure projection omits turnCompanion and withholds user text.
+  value.own.push(record(50, 550, { type: 'user', isMeta: true, ...(companion === undefined ? {} : { turnCompanion: companion }), message: { content: '<text withheld>' } }))
+  expect(prove(value)).toMatchObject({ turn: 'next', taken_in_at: 700 })
+})
+
+test('two real native turns before the take-in still fail', () => {
+  expect(() => prove(nextTurnSnapshot())).toThrow('later than the next turn')
+})
+
+test('a late take-in after a retried turn and another real turn still fails', () => {
+  const value = nextTurnSnapshot()
+  value.own[3]!.value.message.content = [{ type: 'thinking' }]
+  value.own.push(record(50, 550, { type: 'user', isMeta: true, message: { content: '<text withheld>' } }),
+    record(65, 650, { type: 'assistant', message: { id: 'another-turn', stop_reason: 'end_turn', content: [{ type: 'text', text: 'another answer' }] } }))
+  expect(() => prove(value)).toThrow('later than the next turn')
+})
+
+test.each([
+  { name: 'exhausted retry followed by unmarked enforcement', companions: [true, undefined] },
+  { name: 'chained explicit companions', companions: [true, true, true] },
+  { name: 'chained old-projection companions', companions: [undefined, undefined, undefined] },
+])('does not merge $name into one native turn', ({ companions }) => {
+  const value = snapshot(false)
+  value.own[2]!.offset = 1000
+  value.own[2]!.at = 1000
+  for (let i = 0; i <= companions.length; i++) {
+    value.own.push(record(40 + i * 20, 500 + i * 100, { type: 'assistant', message: {
+      id: `terminal-${i}`, stop_reason: 'end_turn',
+      content: [i === companions.length ? { type: 'text', text: 'visible answer' } : { type: 'thinking' }],
+    } }))
+    if (i < companions.length) value.own.push(record(50 + i * 20, 550 + i * 100, {
+      type: 'user', isMeta: true, ...(companions[i] === undefined ? {} : { turnCompanion: companions[i] }),
+      message: { content: '<text withheld>' },
+    }))
+  }
+  // The first retry may be grouped once. Its exhausted response cannot start another merge,
+  // including when a later stop_hook_blocking enforcement emits no stop_hook_summary.
+  expect(() => prove(value)).toThrow('later than the next turn')
+})
+
+test('requires a companion marker when the transcript retains companion metadata', () => {
+  const value = nextTurnSnapshot()
+  value.own[3]!.value.message.content = [{ type: 'thinking' }]
+  value.own.push(record(25, 425, { type: 'user', isMeta: true, turnCompanion: true }),
+    record(50, 550, { type: 'user', isMeta: true, message: { content: '<text withheld>' } }))
+  expect(() => prove(value)).toThrow('later than the next turn')
+})
+
+test('an exhausted thinking-only retry alone still counts as one native turn', () => {
+  const value = nextTurnSnapshot()
+  for (const entry of value.own.filter(e => e.value?.type === 'assistant' && e.offset > 20)) {
+    entry.value.message.content = [{ type: 'thinking' }]
+  }
+  value.own.push(record(50, 550, { type: 'user', isMeta: true, turnCompanion: true, message: { content: '<text withheld>' } }))
+  expect(prove(value)).toMatchObject({ turn: 'next' })
+})
+
+test.each(['no nudge', 'ordinary user', 'human origin', 'not a companion', 'tool result', 'api error',
+  'visible streaming copy', 'stop hook boundary', 'turn duration boundary', 'foreign nudge'])('does not merge two turns with %s', mutation => {
+  const value = nextTurnSnapshot(), first = value.own[3]!
+  first.value.message.content = [{ type: 'thinking' }]
+  const nudge = record(50, 550, { type: 'user', isMeta: true, message: { content: '<text withheld>' } })
+  value.own.push(nudge)
+  if (mutation === 'no nudge') value.own.pop()
+  if (mutation === 'ordinary user') nudge.value.isMeta = false
+  if (mutation === 'human origin') nudge.value.origin = { kind: 'human' }
+  if (mutation === 'not a companion') nudge.value.turnCompanion = false
+  if (mutation === 'tool result') nudge.value.message.content = [{ type: 'tool_result', tool_use_id: 'other-tool' }]
+  if (mutation === 'api error') first.value.isApiErrorMessage = true
+  if (mutation === 'visible streaming copy') value.own.push(record(45, 510, { type: 'assistant',
+    message: { id: 'answer', stop_reason: 'end_turn', content: [{ type: 'text', text: 'visible completion' }] } }))
+  if (mutation === 'stop hook boundary' || mutation === 'turn duration boundary') value.own.push(record(45, 510,
+    { type: 'system', subtype: mutation === 'stop hook boundary' ? 'stop_hook_summary' : 'turn_duration' }))
+  if (mutation === 'foreign nudge') nudge.path = '/foreign/session.jsonl'
+  expect(() => prove(value)).toThrow('later than the next turn')
+})
+
+test('a malformed-tool-use retry adds no terminal boundary', () => {
+  const value = nextTurnSnapshot()
+  value.own[3]!.value.message.stop_reason = 'tool_use'
+  value.own.push(record(50, 550, { type: 'user', isMeta: true, turnCompanion: true, message: { content: '<text withheld>' } }))
+  expect(prove(value)).toMatchObject({ turn: 'next' })
+})
+
+test('retry grouping preserves the first terminal offset and all terminal timestamps', () => {
+  const value = nextTurnSnapshot()
+  value.own[3]!.value.message.content = [{ type: 'thinking' }]
+  value.own.push(record(50, 550, { type: 'user', isMeta: true, message: { content: '<text withheld>' } }))
+  // A take-in between the nudge and retry still follows the first terminal.
+  value.own[2]!.offset = 55
+  value.own[2]!.at = 575
+  expect(prove(value)).toMatchObject({ turn: 'next' })
+  value.own[2]!.offset = 70
+  // Even when grouped, a retry recorded before the take-in cannot be timestamped after it.
+  expect(() => prove(value)).toThrow('later than the next turn')
+})
+
 function fakeClock() {
   let elapsed = 0
   return { now: () => elapsed, wallNow: () => 1_000_000 + elapsed,

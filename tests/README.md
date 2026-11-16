@@ -869,7 +869,17 @@ different session needs its own matching observation. The check reports
 the first text's delay from its matching waiting observation.
 The busy case proves the target message arrived during the matching tool's
 active interval and was taken in in that turn or the immediately following
-turn, rather than inferring overlap from a `working` row alone.
+native turn, rather than inferring overlap from a `working` row alone. Streaming
+copies share one terminal boundary. A thinking-only `end_turn` or `stop_sequence`,
+its adjacent originless `isMeta` user nudge, and the retried terminal response
+also share one boundary, at the first terminal offset. The oracle uses native
+record markers, never nudge text; it accepts `turnCompanion: true` when present
+and permits the retained projection's omitted field only when no user record
+in the selected transcript retains companion metadata. The native budget is
+one thinking-only retry per turn: a retried response cannot start another merge,
+even if it is thinking-only and followed by another meta continuation without
+a turn-end marker. An intervening native turn-end marker also prevents merging;
+two real terminal turns before take-in still fail.
 
 Print structured AD/receipt evidence, fidelity observations and measurements only as `recorded:`
 lines in the script log. The shared EXIT hook prints one `duplicates:` count
@@ -1261,7 +1271,7 @@ Test 101 pre-allows `Bash(sleep *)` and the Slack reply tool, and sets exact
 both deliberate permission prompts observable even when native Claude
 automatically allows benign commands.
 
-After the busy message, Test 101 polls its unchanged native evidence predicate
+After the busy message, Test 101 polls its native evidence predicate
 for at most 180 seconds. AD waiting can precede the durable terminal
 record; a late record may satisfy the predicate within that bound. On timeout,
 it retains the exact final assertion snapshot (checkpoint identity, journal

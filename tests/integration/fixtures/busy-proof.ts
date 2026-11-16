@@ -12,6 +12,27 @@ export interface BusyProofSnapshot {
 class BusyProofAssertionError extends Error {}
 function check(value: unknown, reason: string): asserts value { if (!value) throw new BusyProofAssertionError(reason) }
 function blocks(e: TranscriptEntry): any[] { return e.value?.type === 'assistant' && Array.isArray(e.value.message?.content) ? e.value.message.content : [] }
+function messageKey(e: TranscriptEntry): string | number { return e.value.message?.id ?? e.value.uuid ?? e.offset }
+/** Only the adjacent native thinking-only retry joins two completed API messages. */
+function isThinkingOnlyRetry(prior: TranscriptEntry, retry: TranscriptEntry, records: TranscriptEntry[], allowMissingCompanion: boolean) {
+  if (!['end_turn', 'stop_sequence'].includes(prior.value.message?.stop_reason)) return false
+  const copies = records.filter(e => e.value?.type === 'assistant' && messageKey(e) === messageKey(prior))
+  if (!copies.every(e => !e.value.isApiErrorMessage && blocks(e).length > 0
+    && blocks(e).every(b => b.type === 'thinking' || b.type === 'redacted_thinking'))) return false
+  const between = records.filter(e => e.offset > prior.offset && e.offset < retry.offset)
+  const nudge = between.at(-1)
+  if (!nudge) return false
+  const value = nudge.value
+  // Require the native companion marker when available. The old failure projection
+  // omits it throughout; only that metadata-poor evidence can use the missing-field path.
+  // No text match: user text and thinking bodies are withheld in that projection.
+  return value?.type === 'user' && value.isMeta === true && value.origin === undefined
+    && (value.turnCompanion === true || (allowMissingCompanion && value.turnCompanion === undefined))
+    && value.toolUseResult === undefined && value.sourceToolAssistantUUID === undefined && value.sourceToolUseID === undefined
+    && !(Array.isArray(value.message?.content) && value.message.content.some((b: any) => b.type === 'tool_result'))
+    && Number.isFinite(nudge.at) && prior.at <= nudge.at && nudge.at <= retry.at
+    && between.slice(0, -1).every(e => e.value?.type === 'assistant' && messageKey(e) === messageKey(prior))
+}
 export function assertBusyProof(snapshot: BusyProofSnapshot, seq: number,
   auditReceipts: () => { duplicates: number }, receiptTextMatches: (actual: string, expected: string) => boolean) {
   const { selected, journal: j, own } = snapshot, item=j.find(r=>r.kind==='accepted'&&!r.compact&&r.seq===seq)
@@ -40,13 +61,25 @@ export function assertBusyProof(snapshot: BusyProofSnapshot, seq: number,
   // keep its first offset so later copies cannot hide a prior turn end.
   const byMessage=new Map<string|number,typeof ends[number]>()
   for(const e of ends) {
-    const id=e.value.message?.id??e.value.uuid??e.offset, prior=byMessage.get(id)
+    const id=messageKey(e), prior=byMessage.get(id)
     if(!prior||e.offset<prior.offset)byMessage.set(id,e)
   }
-  const boundaries=[...byMessage.values()]
-  check(boundaries.length>0&&boundaries.every(e=>Number.isFinite(e.at)&&e.at>=result.at),'completed tool turn evidence missing/invalid')
+  const messages=[...byMessage.values()].sort((a,b)=>a.offset-b.offset)
+  check(messages.length>0&&messages.every(e=>Number.isFinite(e.at)&&e.at>=result.at),'completed tool turn evidence missing/invalid')
+  const records=own.filter(e=>e.path===use.path&&e.offset>use.offset).sort((a,b)=>a.offset-b.offset)
+  const allowMissingCompanion=!own.some(e=>e.path===use.path&&e.value?.type==='user'&&e.value.turnCompanion!==undefined)
+  // Keep the first terminal offset even for a retry, so a later copy or nudge
+  // cannot move an already-observed boundary past the take-in.
+  // Native thinkingOnlyNudged permits one retry: consume a pair once, never
+  // use its retried response as the prior of a second (transitive) merge.
+  const boundaries: TranscriptEntry[]=[]
+  for(let i=0;i<messages.length;i++) {
+    const first=messages[i]!, retry=messages[i+1]
+    boundaries.push(first)
+    if(retry&&isThinkingOnlyRetry(first,retry,records,allowMissingCompanion))i++
+  }
   const before=boundaries.filter(e=>e.offset<take.offset)
-  check(before.length<=1&&before.every(e=>e.at<=take.at),'busy message was taken in later than the next turn')
+  check(before.length<=1&&messages.filter(e=>e.offset<take.offset).every(e=>e.at<=take.at),'busy message was taken in later than the next turn')
   return {tool_use_id:selected.id,tool_started_at:use.at,accepted_at:item.received_at,
     tool_result_at:result.at,taken_in_at:take.at,turn:before.length===0?'same':'next',duplicates:audit.duplicates}
 }
