@@ -48,6 +48,8 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 - **Channel names recover after a lookup failure.** A failed or timed-out channel-name lookup left later messages from that channel tagged with the channel ID in `channel_name` until the server restarted. Later messages now retry the lookup and use the name once it resolves. Successful names stay cached, messages already tagged with the ID keep it, and the two-second fallback is unchanged.
 - **Deliveries no longer stall when the agent-director call budget fills.** Repeated readiness reads used up the per-persona agent-director calls needed to type a message and press Enter, so delivery could stall. CSCB now waits until the budget has room for the whole read-and-key step, and keeps the persona typing lease from the text to its Enter. The call limit is unchanged.
+- **A failing logger no longer blocks a message's acknowledgement.** When writing a log line threw, an incoming Slack message could go unacknowledged and, on some paths, unstored. Logging failures are now ignored on the message path, so the message is still acknowledged and stored.
+- **No false "check the server's disk" condition, and stricter queue records.** A queue record the delivery queue refused as invalid marked the persona's queue unwritable, as if storage had failed. Only a real storage failure does so now. Queue records whose kind fields hold a list instead of a single value are now rejected rather than replayed as live work.
 
 ---
 
