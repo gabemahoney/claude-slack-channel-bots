@@ -117,10 +117,11 @@ LABEL
         CASE_DIAGNOSTIC="$(jq -r ".[$((n-1))] | .case+\" fixture=\"+.fixture" "${EXPECTED}/case-labels.json")"
         printf 'recorded: AI AC%s trial=%s field=%s case=%s\n' "${AI_CRITERION}" "${REAL_AGENT_TRIAL}" "${n}" "${CASE_DIAGNOSTIC}"
         if [[ "$(jq -r ".[$((n-1))].msg.via" "${EXPECTED}/corpus.json")" == receive_all ]]; then
-            jq '(.personas[] | select(.name=="corpuspeer") | .channels)=[]' "${SLACK_STATE_DIR}/config.json" | write_config
+            # Omission retains the choice; explicitly disable only this recipient.
+            jq '(.personas[] | select(.name=="corpuspeer") | .channels[] | select(.id=="C0TESTCHAN1") | .delivery)="off"' "${SLACK_STATE_DIR}/config.json" | write_config
             wait_for_file "${SLACK_STATE_DIR}/config.json.pending" 30 'corpus channel change preview absent'
             mv "${SLACK_STATE_DIR}/config.json.pending" "${SLACK_STATE_DIR}/config.json.apply"
-            wait_until 30 'corpus shared recipient not removed' jq -e '.personas[] | select(.name=="corpuspeer") | .channels==[]' "${SLACK_STATE_DIR}/config.json.last-applied"
+            wait_until 30 'corpus shared recipient not removed' jq -e 'any(.applied.personas[]; .name=="corpuspeer" and any(.channels[]; .id=="C0TESTCHAN1" and .delivery=="off"))' "${SLACK_STATE_DIR}/config.json.last-applied"
         fi
         # Intake keeps this recipient's routing mention as sent; the expected
         # body and corpus wrapper include it ahead of the original body,

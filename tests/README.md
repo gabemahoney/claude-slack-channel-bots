@@ -732,6 +732,15 @@ closing prose, U+200B-only trailing text and an escaped first reply followed by
 `edit_message` all remain failures. Labels and retained evidence do not change
 any verdict.
 
+For a corpus row with `via=receive_all`, the shared scenario confirms an explicit
+`C0TESTCHAN1` `delivery=off` assignment for `corpuspeer` and waits for it in the
+shared authority record's applied personas. The tested persona keeps `delivery=all`.
+This occurs at AC11 case_13 and AC20 case_02; AC12 selects no `receive_all` row.
+The offline `real-ai-corpus-reload.test.ts` control executes the scenario edit,
+atomic config writer, confirmation move and wait predicate around the real
+reload controller, then proves only the tested persona receives the next event.
+It also rejects the wait before application; no native agent or model runs.
+
 
 Tests 32–40 are the nine real Claude gates included in every full `/ci` run.
 They drive the packed CSCB against the loopback Slack stub, select native
