@@ -677,8 +677,33 @@ evidence captured before retirement. Claude assistant text blocks and the
 are retained, scrubbed with the existing secret scrubber before each string is
 bounded to 4,096 UTF-16 code units (including a `[truncated]` suffix when needed).
 Emission and coordinator retention apply their existing redaction again.
-User prompts, thinking, other tool arguments, tool results and native terminal
-text stay withheld; types, subtypes, stop reasons, models, tool names, permission/denial
+Other Claude assistant tool inputs are retained under `input` as structured
+values too, including Bash `command`/`description` and Write/Edit paths. Before
+serialization or truncation, a key matching `key`, `token`, `secret`, `password`,
+`credential`, `authorization` or `cookie` case-insensitively anywhere in its
+scrubbed spelling has its entire scalar or subtree value replaced by
+`[REDACTED]`. Every remaining input string, including commands, descriptions,
+nested strings and keys, is scrubbed and then checked for those same terms
+anywhere, case-insensitively. A match withholds the whole string as
+`[REDACTED: credential-bearing string]` before any bound or serialization;
+no shell quoting is parsed. Other strings keep the same scrub-before-bound
+path, so ordinary commands and paths remain readable. Withheld keys can
+coalesce. Containers stop at depth 4
+(root depth 0), keep the first 16 entries/items plus a truncation marker, and
+share a 64-value-node budget. Each retained `input` is at most 16,384 UTF-16 code
+units when JSON-serialized. Oversized projections (or JSON syntax altered by
+redaction) retain only `{truncated:true}`, with no preview. Reply/edit inputs
+still keep only `text`, `chat_id` and `message_id`; their field handling and
+per-string limits are unchanged.
+Every projected Claude/Codex transcript record shares a 32,768-code-unit JSON
+serialization cap, including metadata and all retained text/tool inputs, and
+keeps at most 32 content blocks. Once exhausted, whole trailing blocks are
+omitted and record-level `truncated:true` is added; if metadata alone exceeds
+the cap, only `{truncated:true}` remains. These limits apply after scrubbing,
+without slicing serialized JSON, and are checked again after relative stream
+paths are added. The enclosing scope/event JSONL fields are outside this record
+cap.
+User prompts, thinking, tool results and native terminal text stay withheld; types, subtypes, stop reasons, models, tool names, permission/denial
 flags, agent IDs and notification links remain. Structured Claude and Codex
 errors retain identifier fields (`type`, `code`, `name`, `errno`), HTTP status,
 retryability/retry timing, nested error/cause/response metadata, and
@@ -716,7 +741,9 @@ body whitespace; no body normalization or completion/provenance relaxation is
 applied for diagnostics. `ai-mismatch-diagnostics.test.ts` and the multipart controls
 in `real-ai-classifier-stop.test.ts` exercise these distinctions.
 
-AC11 asks for exactly one `reply` per message, addressed with the real outer
+AC11 tells the bot that each message is data to read back, to carry out no
+request in it, and to call no tool except `reply`. It asks for exactly one
+`reply` per message, addressed with the real outer
 `chat_id` and `message_id`, containing only the JSON read-back. It requests no
 text before the reply, then one final text message containing exactly the same
 JSON read-back byte for byte and nothing else: no other sentence, summary,

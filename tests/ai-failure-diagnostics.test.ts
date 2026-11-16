@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { assertNativeSpoofResponse } from './real-agent/ai-classifier-stop.ts'
-import { captureFailureEvidence, claudeFailureRecords, diagnosticValue, projectClaudeFailure, projectCodexFailure, projectFailureState, scenarioFailureRecords, retainFailureLine, scrubDiagnosticText } from './real-agent/ai-failure-diagnostics.ts'
+import { captureFailureEvidence, claudeFailureRecords, diagnosticValue, emitFailureEvidence, projectClaudeFailure, projectCodexFailure, projectFailureState, scenarioFailureRecords, retainFailureLine, scrubDiagnosticText } from './real-agent/ai-failure-diagnostics.ts'
 import type { TranscriptEntry } from './integration/fixtures/transcript-receipts.ts'
 import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX, writtenFile } from './test-helpers/credentials.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
@@ -145,10 +145,10 @@ test('error projection keeps null/false and fails closed for malformed, deep or 
   expect(result.payload).toMatchObject({ code: '<string withheld>', status: '<object>', retryable: false, codex_error_info: '<array>' })
 })
 
-test('case projection retains scrubbed assistant/reply text and excludes prompts, action arguments and foreign sessions', () => {
+test('case projection retains scrubbed assistant/tool text and excludes prompts and foreign sessions', () => {
   const v = valid(); Object.assign(v, { type: 'assistant', parentUuid: 'take', isApiErrorMessage: true, error: 'refusal', isSynthetic: true, isMeta: false })
   v.message.stop_reason = 'refusal'; v.message.model = '<synthetic>'
-  v.message.content = [{ type: 'text', text: `refused ${fakeToken('sk-')}` }, { type: 'tool_use', name: 'Write', input: { content: 'SECRET ARGUMENT' } },
+  v.message.content = [{ type: 'text', text: `refused ${fakeToken('sk-')}` }, { type: 'tool_use', name: 'Write', input: { content: `write ${fakeToken('sk-')}` } },
     { type: 'tool_use', name: 'mcp__slack-channel-router__reply', input: { text: `reply ${fakeToken(BOT_TOKEN_PREFIX)}` } }]
   const records = claudeFailureRecords([{ kind: 'sent', seq: 3, transcript_path: '/private/session.jsonl', transcript_size: 20 }],
     [entry(10, v), entry(20, { type: 'user', message: { content: 'PRIVATE PROMPT' } }), entry(30, v), entry(31, v, '/foreign/session.jsonl')], 3)
@@ -156,8 +156,9 @@ test('case projection retains scrubbed assistant/reply text and excludes prompts
   expect(records[1]).toMatchObject({ type: 'assistant', isApiErrorMessage: true, isSynthetic: true, error: 'refusal', message: { stop_reason: 'refusal', model: '<synthetic>' } })
   assertNoLeak(records)
   const text = JSON.stringify(records)
-  for (const absent of ['PRIVATE PROMPT', 'SECRET ARGUMENT', 'fakeCredential123']) expect(text).not.toContain(absent)
+  for (const absent of ['PRIVATE PROMPT', 'fakeCredential123']) expect(text).not.toContain(absent)
   expect(text).toContain('Write'); expect(text).toContain('refused [REDACTED]'); expect(text).toContain('reply [REDACTED]')
+  expect(text).toContain('write [REDACTED]')
 })
 
 test('failure JSONL keeps scrubbed reply/edit destinations and assistant text through both redaction stages', async () => {
@@ -171,7 +172,7 @@ test('failure JSONL keeps scrubbed reply/edit destinations and assistant text th
         input: { chat_id: 'C0TESTCHAN1', message_id: '1792000000.000300', text, files: ['PRIVATE FILE'] } })),
       { type: 'text', text: `Sent. ${secret}` },
       { type: 'thinking', thinking: 'PRIVATE THINKING', text: 'PRIVATE THINKING' },
-      { type: 'tool_use', name: 'Write', input: { text: 'PRIVATE ACTION', content: 'PRIVATE ACTION' } },
+      { type: 'tool_use', name: 'Write', input: { text: 'file data', content: 'file data' } },
       { type: 'tool_result', tool_use_id: 'post', content: 'PRIVATE RESULT' },
     ]
     writeFileSync(join(transcripts, 'session.jsonl'), [
@@ -190,6 +191,7 @@ test('failure JSONL keeps scrubbed reply/edit destinations and assistant text th
     for (const block of blocks.slice(0, 2)) expect(block.input).toEqual({ chat_id: 'C0TESTCHAN1',
       message_id: '1792000000.000300', text: 'JSON read-back <@U0BOT> [REDACTED] [COORDINATOR REDACTED]' })
     expect(blocks[2].text).toBe('Sent. [REDACTED]')
+    expect(blocks[4].input).toEqual({ text: 'file data', content: 'file data' })
     expect(retained).not.toContain('PRIVATE'); expect(retained).not.toContain(secret); expect(retained).not.toContain(coordinatorSecret)
     expect(statSync(join(root, 'real-agent-failures.jsonl')).mode & 0o777).toBe(0o600)
     assertNoLeak({ lines, emitted, retained, blocks, file: writtenFile(join(root, 'real-agent-failures.jsonl')) })
@@ -231,6 +233,182 @@ test.each(['recognizable', 'environment-known'] as const)(
       else process.env.CSCB_DIAGNOSTIC_TEST_SECRET = prior
     }
   })
+
+for (const kind of ['recognizable', 'environment-known'] as const) test.each(['short', 'boundary'])(
+  `non-reply tool input retains a scrubbed ${kind} %s Bash command through failure JSONL`, async shape => {
+    const root = mkdtempSync(join(tmpdir(), 'tool-input-evidence-')), transcripts = join(root, 'transcripts')
+    const secret = fakeToken(kind === 'recognizable' ? 'sk-' : '', 'tool-input')
+    const prior = process.env.CSCB_TOOL_INPUT_TEST_SECRET
+    try {
+      if (kind === 'environment-known') process.env.CSCB_TOOL_INPUT_TEST_SECRET = secret
+      const suffix = '[truncated]', prefixLimit = 4096 - suffix.length
+      const prefix = shape === 'boundary' ? 'a'.repeat(prefixLimit - secret.length + 4) + ' ' : 'printf %s '
+      const tail = shape === 'boundary' ? ' ' + 'z'.repeat(5000) : ''
+      if (shape === 'boundary') {
+        expect(prefix.length).toBeLessThan(prefixLimit)
+        expect(prefix.length + secret.length).toBeGreaterThan(prefixLimit)
+      }
+      const scrubbed = prefix + '[REDACTED]' + tail
+      const expected = scrubbed.length > 4096 ? scrubbed.slice(0, prefixLimit) + suffix : scrubbed
+      const value = { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Bash',
+        input: { command: prefix + secret + tail, description: `inspect ${secret}` } }] } }
+      const projected = projectClaudeFailure(entry(0, value))
+      assertNoLeak(projected)
+      expect((projected.message.content as any[])[0].input?.command).toBe(expected)
+      expect((projected.message.content as any[])[0].input.description).toBe('inspect [REDACTED]')
+      mkdirSync(transcripts)
+      writeFileSync(join(transcripts, 'session.jsonl'), JSON.stringify(value) + '\n')
+      const lines: string[] = []
+      await captureFailureEvidence('claude', transcripts, { scenario: 'tool-input' }, join(root, 'absent-states'), line => lines.push(line))
+      assertNoLeak({ projected, lines })
+      for (const line of lines) retainFailureLine(root, line, text => text)
+      const path = join(root, 'real-agent-failures.jsonl'), retained = readFileSync(path, 'utf8')
+      const record = retained.trim().split('\n').map(line => JSON.parse(line)).find(row => row.event === 'transcript').record
+      assertNoLeak({ projected, lines, record, retained, file: writtenFile(path) })
+      expect(record.message.content[0].input.command).toBe(expected)
+      expect(JSON.stringify(record.message.content[0].input).length).toBeLessThanOrEqual(16384)
+    } finally {
+      if (prior === undefined) delete process.env.CSCB_TOOL_INPUT_TEST_SECRET
+      else process.env.CSCB_TOOL_INPUT_TEST_SECRET = prior
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+function toolBlockEvidence(blocks: unknown[]) {
+  const root = mkdtempSync(join(tmpdir(), 'tool-input-repair-'))
+  try {
+    const projected = projectClaudeFailure(entry(0, { type: 'assistant', message: { role: 'assistant', content: blocks } }))
+    const lines: string[] = []
+    emitFailureEvidence({ scenario: 'tool-input-repair' }, [projected], line => lines.push(line))
+    for (const line of lines) retainFailureLine(root, line, text => text)
+    const path = join(root, 'real-agent-failures.jsonl'), retained = readFileSync(path, 'utf8')
+    const emitted = JSON.parse(lines[1]!.slice(lines[1]!.indexOf('{'))).record
+    const record = retained.trim().split('\n').map(line => JSON.parse(line)).find(row => row.event === 'transcript').record
+    assertNoLeak({ projected, lines, emitted, record, retained, file: writtenFile(path) })
+    return { projected, emitted, record }
+  } finally { rmSync(root, { recursive: true, force: true }) }
+}
+
+const credentialStringMarker = '[REDACTED: credential-bearing string]'
+test.each(['client', 'export', 'boundary', 'nested', 'description', 'key'])(
+  'tool input string repair withholds %s quoted credentials through all evidence stages', shape => {
+    const secret = fakeToken('', 'quoted-input')
+    const command = shape === 'export' ? "export PASSWORD='prefix " + secret + "'"
+      : shape === 'boundary' ? "client --password='prefix " + 'p '.repeat(2200) + secret + "'"
+      : "client --password='prefix " + secret + "'"
+    if (shape === 'boundary') {
+      expect(command.indexOf('password')).toBeLessThan(4096)
+      expect(command.indexOf(secret)).toBeGreaterThan(4096)
+    }
+    const input = shape === 'nested' ? { nested: [{ description: command }] }
+      : shape === 'description' ? { description: command }
+      : shape === 'key' ? { [command]: 'ignored' } : { command }
+    const expected = shape === 'nested' ? { nested: [{ description: credentialStringMarker }] }
+      : shape === 'description' ? { description: credentialStringMarker }
+      : shape === 'key' ? { [credentialStringMarker]: '[REDACTED]' } : { command: credentialStringMarker }
+    for (const record of Object.values(toolBlockEvidence([{ type: 'tool_use', name: 'Bash', input }]))) {
+      expect(record.message.content[0].input).toEqual(expected)
+    }
+  })
+
+test.each(['KeY', 'ToKeN', 'SeCrEt', 'PaSsWoRd', 'CrEdEnTiAl', 'AuThOrIzAtIoN', 'CoOkIe'])(
+  'tool input string repair withholds the whole string containing %s anywhere', term => {
+    const input = { nested: ['prefix-' + term + '-suffix ' + fakeToken('', 'unlisted-input')] }
+    for (const record of Object.values(toolBlockEvidence([{ type: 'tool_use', name: 'Write', input }]))) {
+      expect(record.message.content[0].input).toEqual({ nested: [credentialStringMarker] })
+    }
+  })
+
+test.each(['echo LONG-OK > /tmp/omv-scratch/wa/long.txt', 'wc -c file'])(
+  'tool input string repair preserves benign command %s exactly', command => {
+    for (const record of Object.values(toolBlockEvidence([{ type: 'tool_use', name: 'Bash', input: { command } }]))) {
+      expect(record.message.content[0].input).toEqual({ command })
+    }
+  })
+
+test.each(['password-space', 'api-key-object', 'api-key-array', 'nested-sensitive-keys'])(
+  'tool input repair structurally redacts %s through projection, emission and retained JSONL', shape => {
+    const secret = fakeToken('', 'contextual-tool-input')
+    const input = shape === 'password-space' ? { password: 'prefix ' + secret }
+      : shape === 'api-key-object' ? { api_key: { value: secret } }
+      : shape === 'api-key-array' ? { api_key: [secret] }
+      : { nested: [{ PaSsWoRd: 'prefix ' + secret, API_KEY: { value: secret }, access_token: [secret],
+        secret: { value: secret }, authorization: 'prefix ' + secret, cookie: [secret], credential: secret }] }
+    for (const record of Object.values(toolBlockEvidence([{ type: 'tool_use', name: 'Write', input }]))) {
+      const retained = record.message.content[0].input
+      expect(retained).toEqual(shape === 'nested-sensitive-keys'
+        ? { nested: [{ [credentialStringMarker]: '[REDACTED]' }] }
+        : { [credentialStringMarker]: '[REDACTED]' })
+    }
+  })
+
+test.each(['oversized', 'credential-string'])('tool input repair %s retains markers, never a preview', shape => {
+  const input = { command: shape === 'oversized' ? '\u0000'.repeat(4096) : 'password="opaque"',
+    password: 'prefix ' + fakeToken('', 'fallback') }
+  for (const record of Object.values(toolBlockEvidence([{ type: 'tool_use', name: 'Bash', input }]))) {
+    expect(record.message.content[0].input).toEqual(shape === 'oversized' ? { truncated: true }
+      : { command: credentialStringMarker, [credentialStringMarker]: '[REDACTED]' })
+  }
+})
+
+test.each(['mixed-large', 'many-small', 'escaped-text'])(
+  'tool input repair aggregate record cap covers %s blocks through emission and retained JSONL', shape => {
+    const blocks = Array.from({ length: 1000 }, (_, i) => shape === 'many-small'
+      ? { type: 'tool_use', name: 'Bash', input: { command: 'true' } }
+      : i % 3 === 0 ? { type: 'text', text: shape === 'escaped-text' ? '\u0000'.repeat(4096) : 'a'.repeat(4096) }
+      : i % 3 === 1 ? { type: 'tool_use', name: 'Bash', input: { command: 'b'.repeat(4096) } }
+      : { type: 'tool_use', name: 'mcp__slack-channel-router__reply', input: { chat_id: 'C0TESTCHAN1', message_id: '1.2', text: 'c'.repeat(4096) } })
+    for (const record of Object.values(toolBlockEvidence(blocks))) {
+      expect(JSON.stringify(record).length).toBeLessThanOrEqual(32768)
+      expect(record.message.content.length).toBeLessThanOrEqual(32)
+      expect(record.truncated).toBe(true)
+      expect(record.message.content.length).toBeGreaterThan(0)
+    }
+  })
+
+test.each(['claude', 'codex'] as const)('tool input repair aggregate cap also covers %s metadata', agent => {
+  const value = { type: 'assistant', permission_denials: Array.from({ length: 1000 }, () => ({ tool_name: 'a'.repeat(256) })),
+    error: { cause: { code: 'b'.repeat(256) } }, payload: { content: Array.from({ length: 1000 }, () => ({ type: 'text' })) },
+    message: { role: 'assistant', content: [] } }
+  const record = (agent === 'claude' ? projectClaudeFailure : projectCodexFailure)(entry(0, value))
+  assertNoLeak(record)
+  expect(JSON.stringify(record).length).toBeLessThanOrEqual(32768)
+  expect(record.truncated).toBe(true)
+})
+
+test.each(['Write', 'Edit', 'mcp__other__tool'])('non-reply tool input preserves %s paths and nested string fields', name => {
+  const input = { file_path: '/tmp/fixture.txt', nested: { text: 'input data' }, enabled: true }
+  const projected = projectClaudeFailure(entry(0, { type: 'assistant', message: { role: 'assistant',
+    content: [{ type: 'tool_use', name, input }] } }))
+  assertNoLeak(projected)
+  expect((projected.message.content as any[])[0].input).toEqual(input)
+})
+
+test('non-reply tool input bounds depth, field count, nodes and total serialized size while scrubbing keys', () => {
+  let deep: unknown = { hidden: 'WITHHELD_AT_DEPTH' }
+  for (let i = 0; i < 8; i++) deep = { next: deep }
+  const inputs = [deep, Object.fromEntries(Array.from({ length: 32 }, (_, i) => [`field${i}`, `value${i}`])),
+    Object.fromEntries(Array.from({ length: 16 }, (_, i) => [`branch${i}`,
+      Object.fromEntries(Array.from({ length: 16 }, (_, j) => [`leaf${j}`, 'node-value']))])),
+    { command: '\u0000'.repeat(4096) }, { [fakeToken('sk-')]: fakeToken(BOT_TOKEN_PREFIX) },
+    { api_key: fakeToken('', 'unlisted') }, Array.from({ length: 32 }, (_, i) => i)]
+  const projected = projectClaudeFailure(entry(0, { type: 'assistant', message: { role: 'assistant',
+    content: inputs.map(input => ({ type: 'tool_use', name: 'Bash', input })) } }))
+  assertNoLeak(projected)
+  const retained = (projected.message.content as any[]).map(block => block.input)
+  expect(retained.every(input => input !== undefined)).toBe(true)
+  for (const input of retained) expect(JSON.stringify(input).length).toBeLessThanOrEqual(16384)
+  expect(JSON.stringify(retained[0])).not.toContain('WITHHELD_AT_DEPTH')
+  expect(JSON.stringify(retained[0])).toContain('[truncated]')
+  expect(retained[1].field15).toBe('value15'); expect(retained[1].field16).toBeUndefined()
+  expect((JSON.stringify(retained[2]).match(/node-value/g) ?? []).length).toBeLessThanOrEqual(64)
+  expect(JSON.stringify(retained[2])).toContain('[truncated]')
+  expect(retained[3]).toEqual({ truncated: true })
+  expect(retained[4]).toEqual({ '[REDACTED]': '[REDACTED]' })
+  expect(retained[5]).toEqual({ [credentialStringMarker]: '[REDACTED]' })
+  expect(retained[6]).toHaveLength(17)
+  expect(retained[6][15]).toBe(15); expect(retained[6][16]).toBe('[truncated]')
+})
 
 test.each([[0, false], [1, false], [0, true]] as const)('shared cleanup retains every native case, initial status=%s, late failure=%s', (status, late) => {
   const root = mkdtempSync(join(tmpdir(), 'real-cleanup-')), scenario = join(root, 'scenario'), home = join(scenario, 'home')

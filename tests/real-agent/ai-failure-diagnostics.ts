@@ -5,8 +5,9 @@ import type { TranscriptEntry } from '../integration/fixtures/transcript-receipt
 import { taskNotificationFields } from './native-task-notification.ts'
 
 export const AI_FAILURE_PREFIX = 'real-agent-failure-evidence: '
+const sensitiveCredentialKey = /key|token|secret|password|credential/i
 export function scrubDiagnosticText(text: string, env: NodeJS.ProcessEnv = process.env): string {
-  const secrets = Object.entries(env).filter(([key, value]) => value && /key|token|secret|password|credential/i.test(key)).map(([, value]) => value!)
+  const secrets = Object.entries(env).filter(([key, value]) => value && sensitiveCredentialKey.test(key)).map(([, value]) => value!)
   for (const secret of secrets.sort((a, b) => b.length - a.length)) {
     for (const spelling of [secret, JSON.stringify(secret).slice(1, -1), encodeURIComponent(secret)]) text = text.split(spelling).join('[REDACTED]')
   }
@@ -66,13 +67,75 @@ function retainedText(value: unknown): unknown {
   const text = scrubDiagnosticText(value), suffix = '[truncated]'
   return text.length <= MAX_RETAINED_TEXT_CHARS ? text : text.slice(0, MAX_RETAINED_TEXT_CHARS - suffix.length) + suffix
 }
+const MAX_TOOL_INPUT_DEPTH = 4
+const MAX_TOOL_INPUT_ENTRIES = 16
+const MAX_TOOL_INPUT_NODES = 64
+const MAX_TOOL_INPUT_JSON_CHARS = 16384
+const MAX_RECORD_JSON_CHARS = 32768
+const MAX_RECORD_BLOCKS = 32
+function isSensitiveToolText(text: string): boolean {
+  return sensitiveCredentialKey.test(text) || /authorization|cookie/i.test(text)
+}
+function retainedToolString(value: string): unknown {
+  const scrubbed = scrubDiagnosticText(value)
+  // Do not interpret shell quoting or partial assignments. Withhold the entire
+  // credential-bearing string/key before a cut could hide its context.
+  return isSensitiveToolText(scrubbed) ? '[REDACTED: credential-bearing string]' : retainedText(scrubbed)
+}
+function retainedToolInput(input: unknown): unknown {
+  let remaining = MAX_TOOL_INPUT_NODES
+  function project(value: unknown, depth: number, sensitive = false): unknown {
+    if (remaining-- <= 0) return '[truncated]'
+    // Hide a sensitive field's entire scalar/subtree before any serialization
+    // or cut, including opaque credentials unknown to the environment scrubber.
+    if (sensitive) return '[REDACTED]'
+    if (typeof value === 'string') return retainedToolString(value)
+    if (value === null || typeof value !== 'object') return diagnosticValue(value)
+    if (depth >= MAX_TOOL_INPUT_DEPTH) return '[truncated]'
+    const entries = Object.entries(value), kept: [string, unknown][] = []
+    for (const [key, item] of entries.slice(0, MAX_TOOL_INPUT_ENTRIES)) {
+      if (remaining <= 0) break
+      const scrubbedKey = scrubDiagnosticText(key)
+      kept.push([String(retainedToolString(scrubbedKey)), project(item, depth + 1, isSensitiveToolText(scrubbedKey))])
+    }
+    const limited = kept.length < entries.length
+    return Array.isArray(value) ? [...kept.map(([, item]) => item), ...(limited ? ['[truncated]'] : [])]
+      : Object.fromEntries([...kept, ...(limited ? [['[truncated]', true]] : [])])
+  }
+  // Preserve the existing textual scrub too, but fail closed if it damages JSON.
+  const serialized = scrubDiagnosticText(JSON.stringify(project(input, 0)))
+  if (serialized.length <= MAX_TOOL_INPUT_JSON_CHARS) {
+    try { return JSON.parse(serialized) }
+    catch { /* No preview: malformed redacted JSON has no safe retained text. */ }
+  }
+  return { truncated: true }
+}
+/** One aggregate cap covers metadata and every text/tool block together.
+ * Keep whole scrubbed blocks in order; never slice serialized JSON. */
+function boundedRecord(record: any, rawContent?: unknown): any {
+  if (Array.isArray(rawContent) && rawContent.length > MAX_RECORD_BLOCKS) record.truncated = true
+  const blocks = record.message?.content ?? record.payload?.content
+  const size = () => {
+    const serialized = JSON.stringify(record)
+    return Math.max(serialized.length, scrubDiagnosticText(serialized).length)
+  }
+  if (size() > MAX_RECORD_JSON_CHARS) {
+    record.truncated = true
+    if (Array.isArray(blocks)) while (blocks.length && size() > MAX_RECORD_JSON_CHARS) blocks.pop()
+    // Oversized metadata alone cannot bypass the shared bound.
+    if (size() > MAX_RECORD_JSON_CHARS) return { truncated: true }
+  }
+  return record
+}
 function contentMetadata(content: unknown, assistant = false): unknown {
   if (!Array.isArray(content)) return typeof content === 'string' ? '<text withheld>' : diagnosticValue(content)
-  return content.map(b => ({ ...fields(b, ['type', 'id', 'name', 'tool_use_id', 'is_error']),
+  return content.slice(0, MAX_RECORD_BLOCKS).map(b => ({ ...fields(b, ['type', 'id', 'name', 'tool_use_id', 'is_error']),
     ...(assistant && b?.type === 'text' ? { text: retainedText(b.text) } : {}),
     ...(assistant && b?.type === 'tool_use' && ['mcp__slack-channel-router__reply', 'mcp__slack-channel-router__edit_message'].includes(b.name)
       ? { input: Object.fromEntries(['chat_id', 'message_id', 'text'].filter(key => b.input?.[key] !== undefined)
-        .map(key => [key, retainedText(b.input[key])])) } : {}) }))
+        .map(key => [key, retainedText(b.input[key])])) } : {}),
+    ...(assistant && b?.type === 'tool_use' && !['mcp__slack-channel-router__reply', 'mcp__slack-channel-router__edit_message'].includes(b.name)
+      ? { input: retainedToolInput(b.input) } : {}) }))
 }
 /** Native notification linkage is metadata; summary/result/body text is never retained. */
 export function notificationMetadata(content: unknown) {
@@ -81,7 +144,7 @@ export function notificationMetadata(content: unknown) {
 }
 export function projectClaudeFailure(entry: TranscriptEntry) {
   const v = entry.value, m = v?.message
-  return { stream: basename(entry.path), sidechain: entry.path.includes('/subagents/'), offset: entry.offset,
+  return boundedRecord({ stream: basename(entry.path), sidechain: entry.path.includes('/subagents/'), offset: entry.offset,
     at: Number.isFinite(entry.at) ? entry.at : null, ...fields(v, identityFields), ...errorFields(v),
     origin: fields(v?.origin, ['kind', 'subkind', 'producer', 'runId']),
     toolUseResult: fields(v?.toolUseResult, ['agentId', 'status', 'isAsync', 'resolvedModel', 'canContinueAgent']),
@@ -93,13 +156,13 @@ export function projectClaudeFailure(entry: TranscriptEntry) {
     permission_denials: Array.isArray(v?.permission_denials) ? v.permission_denials.map((d: unknown) => fields(d, ['tool_name', 'tool_use_id'])) : undefined,
     notification: notificationMetadata(v?.type === 'attachment' && v.attachment?.type === 'queued_command' ? v.attachment.prompt : m?.content),
     message: { ...fields(m, ['id', 'role', 'model', 'stop_reason']), ...errorFields(m),
-      content: contentMetadata(m?.content, v?.type === 'assistant' && m?.role === 'assistant') } }
+      content: contentMetadata(m?.content, v?.type === 'assistant' && m?.role === 'assistant') } }, m?.content)
 }
 export function projectCodexFailure(entry: TranscriptEntry) {
   const v = entry.value, p = v?.payload
-  return { stream: basename(entry.path), offset: entry.offset, at: Number.isFinite(entry.at) ? entry.at : null,
+  return boundedRecord({ stream: basename(entry.path), offset: entry.offset, at: Number.isFinite(entry.at) ? entry.at : null,
     ...fields(v, identityFields), ...errorFields(v), payload: { ...fields(p, [...identityFields, 'id', 'role', 'model', 'turn_id', 'call_id', 'name',
-      'status', 'decision', 'approval', 'request_id', 'thread_id', 'parent_thread_id']), ...errorFields(p), content: contentMetadata(p?.content) } }
+      'status', 'decision', 'approval', 'request_id', 'thread_id', 'parent_thread_id']), ...errorFields(p), content: contentMetadata(p?.content) } }, p?.content)
 }
 /** Only AD contract fields leave the container. Native pane text is never read. */
 export function projectFailureState(row: unknown) {
@@ -123,7 +186,7 @@ export async function scenarioFailureRecords(root: string, agent: 'claude' | 'co
         try {
           const value = JSON.parse(line), at = typeof value.timestamp === 'number' ? value.timestamp : Date.parse(value.timestamp ?? '')
           const entry = { path, offset, at, value, kind: 'other' }
-          records.push({ ...((agent === 'claude' ? projectClaudeFailure : projectCodexFailure)(entry)), stream: relative(root, path).split('/').map(part => diagnosticValue(part)).join('/') })
+          records.push(boundedRecord({ ...((agent === 'claude' ? projectClaudeFailure : projectCodexFailure)(entry)), stream: relative(root, path).split('/').map(part => diagnosticValue(part)).join('/') }))
         } catch { records.push({ stream: diagnosticValue(basename(path)), offset, malformed: true }) }
       }
       offset += Buffer.byteLength(line) + 1
@@ -133,9 +196,9 @@ export async function scenarioFailureRecords(root: string, agent: 'claude' | 'co
 }
 
 /** All attempts/copies for the selected item, including late linked responses.
- * Only bounded, scrubbed assistant text and reply/edit destination/text fields
- * accompany metadata. Prompts, other tool arguments, config, login files and
- * tool results stay withheld. An absent send is never called a pass. */
+ * Bounded, scrubbed assistant text and tool inputs accompany metadata. Reply
+ * and edit inputs retain only destination/text fields. Prompts, config, login
+ * files and tool results stay withheld. An absent send is never a pass. */
 export function claudeFailureRecords(journal: any[], entries: TranscriptEntry[], seq: number) {
   const windows = journal.filter(r => r.kind === 'sent' && r.seq === seq && typeof r.transcript_path === 'string' && Number.isFinite(r.transcript_size))
   return entries.filter(e => windows.some(w => e.path === w.transcript_path && e.offset >= w.transcript_size)).map(projectClaudeFailure)
