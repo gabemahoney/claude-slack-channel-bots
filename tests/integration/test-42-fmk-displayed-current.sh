@@ -2,7 +2,7 @@
 # ci-requires: test-1
 # b.iy3 current AD contract: real hook-driven idle screen and aged permission
 # requests, production delivery receipt extension and permission Slack posts.
-# Legacy additionally requires unnormalized real-client negative controls.
+# Also covers a subagent request surviving the main Stop within one tick.
 set -euo pipefail
 TEST_NAME="test-42-fmk-displayed-current"
 # shellcheck source=lib/scenario.sh

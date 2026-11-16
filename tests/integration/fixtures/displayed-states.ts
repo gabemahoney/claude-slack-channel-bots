@@ -99,13 +99,14 @@ const control = join(process.env.DISPLAY_BIN!, 'stub-claude-hooks.' + session)
 const adTrail = () => readFileSync(join(process.env.HOME!, '.config/agent-director/ad-trail.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
 const hookRecords = () => existsSync(control + '.jsonl') ? readFileSync(control + '.jsonl', 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : []
 async function command(value: string) {
+  const prior = hookRecords().filter(row => row.command === value).length
   appendFileSync(control, value + '\n')
-  await until(`registered hook control ${value}`, async () => hookRecords().some(row => row.command === value))
+  await until(`registered hook control ${value}`, async () => hookRecords().filter(row => row.command === value).length === prior + 1)
   const observed = hookRecords().filter(row => row.command === value)
-  assert.equal(observed.length, 1)
-  assert.equal(observed[0].session_id, session)
-  assert.equal(observed[0].instance_id, instance)
-  evidence('registered-hook', observed[0])
+  assert.equal(observed.length, prior + 1)
+  assert.equal(observed[prior].session_id, session)
+  assert.equal(observed[prior].instance_id, instance)
+  evidence('registered-hook', observed[prior])
 }
 async function appliedHook(event: string) {
   let rows: any[] = []
@@ -216,7 +217,7 @@ try {
   await until('Stop reports waiting', async () => (await read()).state === 'waiting')
 
   // Real HTTP Slack stub; the only injected boundary is Slack, plus the
-  // documented client seam for the legacy unnormalized negative control.
+  // documented client seam for raw and normalized runtime comparisons.
   const api = process.env.CSCB_SLACK_API_URL!
   assert(/^http:\/\/127\.0\.0\.1:[0-9]+\/api\/$/.test(api), 'non-loopback Slack endpoint')
   const web = new WebClient(process.env.DISPLAY_BOT_TOKEN!, { slackApiUrl: api, retryConfig: { retries: 0 } })
@@ -227,12 +228,14 @@ try {
     assertPermissionPosts(slackRows().slice(mark.http), trail.slice(mark.trail), tokens, instance, channel)
   let fire: () => void
   let listDone = 0
-  function start(client: any, expectedState: string | null = 'check_permission') {
+  function start(client: any, expectedState: string | null = 'check_permission', allowEmpty = false) {
     poller._resetPollerState()
     poller.startPermissionPoller({ getClient: () => ({
       async list(params: any) {
         const result = capture(await client.list(params))
-        assertListStates(result.spawns, expectedState === null ? null : { state: expectedState })
+        if (!allowEmpty || result.spawns.length > 0) {
+          assertListStates(result.spawns, expectedState === null ? null : { state: expectedState })
+        }
         for (const row of result.spawns) {
           assert.equal(row.instance_id, instance)
           assert.equal(row.labels.persona, key)
@@ -264,10 +267,9 @@ try {
       event.instance_id === instance && event.request_token === token &&
       ((event.event === 'cscb.poller.row_decision' && event.action === 'already_tracked') ||
        (event.event === 'cscb.chat_post.attempted' && event.ok === true)))))
-    // Each token reached the post/duplicate branch. Empty raw-negative ticks
-    // have no rows or tracked entries; their completion is synchronous after list.
+    // Each token reached the post/duplicate branch.
     await Bun.sleep(0)
-    assert.deepEqual(log, [], 'poller read/post/setup failure cannot count as a negative control')
+    assert.deepEqual(log, [], 'poller read/post/setup failure')
   }
   async function requests(count: number) {
     let row: any
@@ -290,6 +292,45 @@ try {
       evidence('ad-relay-active', { session_id: session, request_token: token, request_id: request.request_id, requested_at: request.requested_at })
     }
     return tokens as string[]
+  }
+  // b.92q: a background request followed by the main Stop within one
+  // production tick. No poller runs until AD reports waiting; discovery
+  // must use the real unproven projection, never an earlier permission post.
+  let subagentPosts: any[] = []
+  if (!legacy) {
+    await command('subagent')
+    const began = Date.now()
+    await command('permission-1')
+    const [token] = await requests(1)
+    await command('stop')
+    const stopped = await read()
+    const gap = Date.now() - began
+    assert(gap < 1000, `permission/Stop sequence exceeded one 1000 ms tick: ${gap} ms`)
+    assert.equal(stopped.state, 'waiting')
+    assert.deepEqual(stopped.permission_requests, [])
+    assert.equal(stopped.unproven_requests.length, 1)
+    assert.equal(stopped.unproven_requests[0].request_token, token)
+    assert.equal(stopped.unproven_requests[0].decision, null)
+    assert.equal(stopped.unproven_requests[0].unproven_since, null)
+    evidence('subagent-stop-before-poll', { session_id: session, request_token: token, state: stopped.state, gap_ms: gap })
+    const mark = checkpoint()
+    start(normalized, 'waiting', true)
+    await tick([token!]); await tick([token!])
+    subagentPosts = checkPosts(mark, [token!]).posts
+    assert.equal(slackRows().slice(mark.http).filter(row => row.method === 'chat.update').length, 0)
+    capture(await raw.decide({ instance_id: instance, request_token: token!, decision: 'deny' }))
+    await until('subagent relay verdict delivered', async () =>
+      capture(await raw.getPermission({ request_token: token! })).delivery === 'delivered')
+    fire!()
+    await until('subagent denial closes tracked prompt', async () => !poller.getLivePermission(instance, token!))
+    const closed = slackRows().slice(mark.http).filter(row => row.event === 'api' && row.method === 'chat.update')
+    assert.equal(closed.length, 1)
+    assert.equal(closed[0].channel, channel)
+    evidence('subagent-stop-relayed-and-closed', { session_id: session, request_token: token, gap_ms: gap,
+      posts: subagentPosts, closure_count: closed.length })
+    poller.stopPermissionPoller(); poller._resetPollerState()
+    await command('complete-1')
+    await command('main-agent')
   }
   await command('permission-1')
   const [first] = await requests(1)
@@ -322,15 +363,16 @@ try {
   if (legacy) assert.equal((row as any).request_token, first)
   else assert.notEqual((row as any).displayed_state, 'needs_intelligence')
   await observeList(raw, 'check_permission', legacy ? null : { state: 'check_permission' })
+  let legacyPosts: any[] = []
   if (legacy) {
     await observeList(raw, 'needs_intelligence', { state: 'needs_intelligence' })
-    const negative = checkpoint()
-    start(raw, null)
-    await tick([]); await tick([])
-    const negativePosts = checkPosts(negative, [])
-    assert.equal(poller.getLivePermission(instance, first), undefined)
+    const unnormalized = checkpoint()
+    start(raw, 'needs_intelligence')
+    await tick([first!]); await tick([first!])
+    legacyPosts = checkPosts(unnormalized, [first!]).posts
+    assert.equal(poller.getLivePermission(instance, first).channelId, channel)
     await observeState('needs_intelligence')
-    evidence('expected-negative', { session_id: session, request_token: first, reason: 'unnormalized-permission-filter-missing-post', completed_ticks: 2, ...negativePosts })
+    evidence('legacy-live-discovery', { session_id: session, request_token: first, completed_ticks: 2, posts: legacyPosts })
     poller.stopPermissionPoller(); poller._resetPollerState()
   }
   await observeList(normalized, 'check_permission', { state: 'check_permission' })
@@ -359,7 +401,7 @@ try {
   poller.stopPermissionPoller(); poller._resetPollerState()
   const allPosts = slackRows().slice(permissionStart).filter(row => row.event === 'api' && row.method === 'chat.postMessage')
   assert.deepEqual(allPosts.map(row => ({ slack_ts: row.response_ts, channel: row.channel })),
-    [...unagedPosts.posts, ...positivePosts.posts].map(({ slack_ts, channel }) => ({ slack_ts, channel })),
+    [...subagentPosts, ...unagedPosts.posts, ...legacyPosts, ...positivePosts.posts].map(({ slack_ts, channel }) => ({ slack_ts, channel })),
     'HTTP posts outside the checked legs')
   evidence('all-permission-posts', { session_id: session, post_count: allPosts.length })
   assert.deepEqual(errors, [])

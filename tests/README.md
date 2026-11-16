@@ -461,9 +461,10 @@ tests/
     test-41-fmk-real-codex.sh      # guarded Codex 0.159.2 D1 receipt-only gate: native observations, FIFO/faults,
                                    # actual harness SIGKILL/recovery and trailing @/$ fidelity; final native gate passed
     test-42-fmk-displayed-current.sh # current AD: raw working/displayed idle_screen; known aged permissions stay check_permission;
+                                   # subagent permission then main Stop within one tick; one prompt and denial closure while waiting;
                                    # real registered hooks, production receipt extension and measured Slack permission posts
     test-43-fmk-displayed-legacy.sh  # verified legacy AD in a separate HOME/store/socket: actual idle_screen and needs_intelligence;
-                                   # unnormalized real-client negative controls and production normalized positive behavior
+                                   # raw-client and production-normalized discovery without a state filter
     test-44-fmk-thread-burst.sh     # fmk mode: burst acks, store p99, Post Holds and compactions at 0/10,000/100,000 Joined Threads, and the 1,000-channel shared list
     test-45-fmk-membership-load.sh  # strict mode: first/later hung membership pages, retries and idle repair at 100,000 joins per persona
     test-46-shared-channel-recovery.sh # shared mode, phases 1–5: queue/directory faults, kills, review replay and lost bot-attempt answers
@@ -2264,9 +2265,16 @@ An unaged request first posts through the raw client. After confirmed hook
 fallback and more than the legacy default 30-second interval, the current
 request must remain `check_permission`; legacy must become
 `needs_intelligence`. Each leg checkpoints the complete HTTP record and
-production trail: repeated ticks must yield one unaged post, zero posts in the
-legacy unnormalized leg, and then exactly the first and second requests in order
-in the normalized leg, with no duplicate of the first.
+production trail: repeated ticks must yield one unaged post, one post in the
+legacy unnormalized leg (discovery has no state filter), and then exactly the
+first and second requests in order in the normalized leg, with no duplicate of
+the first.
+
+The current-runtime case also starts a background `permission-1` hook with a
+subagent `agent_id`, then the main `Stop` within 1000 ms. Before the first poller
+tick, real AD must report `waiting`, empty `permission_requests` and one undecided,
+open `unproven_requests` entry. Two ticks must post it exactly once without an
+early closure; a real `decide(deny)` must then close the tracked prompt once.
 
 `displayed-state-assertions.ts` counts every subsequent `chat.postMessage`,
 including failed calls and other destinations. It joins each expected request's
@@ -2274,7 +2282,7 @@ production trail event to exactly one actual HTTP response timestamp, and every
 HTTP post back to exactly one event, checking success, instance, channel, text,
 blocks and `args_token_like == false`. Evidence reports the measured per-leg
 `post_count` and joined tokens/timestamps; the whole permission phase must match
-the checked legs (three posts total), rejecting posts between them.
+the checked legs (four posts total per runtime), rejecting posts between them.
 
 The driver adds an extra post to another channel only in an in-memory copy of
 its observations and requires the same oracle to reject it. Host-only

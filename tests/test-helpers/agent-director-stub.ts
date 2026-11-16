@@ -1457,7 +1457,9 @@ export type CannedGetResult = GetResult & Pick<PersonaGetResultOverrides, 'trans
 
 /**
  * Build a canned `GetResult`. Pass `permission_requests` for check_permission
- * rows under the new plural-projection wire. For the negative-test cases
+ * rows under the new plural-projection wire. Unless explicitly overridden,
+ * unproven_requests includes those requests whose dialog is not proven gone.
+ * For the negative-test cases
  * (poller skips when the plural field is absent), pass `null` or omit.
  *
  * The `cwd`, tmux name and label defaults match `cannedListRow`. Without
@@ -1487,6 +1489,9 @@ export function cannedGetResult(
   persona?: CannedRowPersona,
   home?: string,
 ): CannedGetResult {
+  const unprovenRequests = Array.isArray(overrides.permission_requests)
+    ? overrides.permission_requests.filter((request) => request.proven_gone_at === null)
+    : overrides.permission_requests ?? []
   if (persona) {
     if (home === undefined) throw new Error('cannedGetResult: the persona form needs a home')
     return omitUndefined(withDefaultLaunchStart({
@@ -1494,7 +1499,7 @@ export function cannedGetResult(
       state: 'waiting',
       agent: 'claude',
       permission_requests: [],
-      unproven_requests: [],
+      unproven_requests: unprovenRequests,
       agent_args: [],
       relay_mode: 'on',
       jsonl_path: '',
@@ -1511,7 +1516,7 @@ export function cannedGetResult(
     state: 'waiting',
     agent: 'claude',
     permission_requests: [],
-    unproven_requests: [],
+    unproven_requests: unprovenRequests,
     agent_args: [],
     relay_mode: 'on',
     jsonl_path: '',

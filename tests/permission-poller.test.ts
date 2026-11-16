@@ -2381,6 +2381,7 @@ describe('poller tick — two concurrent open rows on a single tick', () => {
       { ...projection.permission_requests![0], request_token: TOKEN_A },
       { ...projection.permission_requests![1], request_token: TOKEN_B },
     ]
+    projection.unproven_requests = projection.permission_requests
 
     const ivl = startPoller(() => ({
       list: async () => ({ spawns: [checkPermRow()] }),

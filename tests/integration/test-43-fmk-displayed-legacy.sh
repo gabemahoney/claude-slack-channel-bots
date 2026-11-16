@@ -2,7 +2,7 @@
 # ci-requires: test-1
 # b.iy3 legacy AD contract: real hook-driven idle screen and aged permission
 # requests, production delivery receipt extension and permission Slack posts.
-# Legacy additionally requires unnormalized real-client negative controls.
+# Raw and normalized clients both discover aged requests without a state filter.
 set -euo pipefail
 TEST_NAME="test-43-fmk-displayed-legacy"
 SCENARIO_AD_START=0.17.0

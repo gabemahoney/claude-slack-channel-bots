@@ -1,9 +1,10 @@
 /**
  * permission-poller.ts — permission-state poller.
  *
- * Every tick, lists spawns in check_permission with the cscb service label
+ * Every tick, lists live spawns with the cscb service label
  * and reconciles CSCB's live Slack-prompt state against agent-director's
- * plural `permission_requests` projection. The pending map is keyed on a
+ * `permission_requests` plus undecided, still-open `unproven_requests`.
+ * The pending map is keyed on a
  * composite of (instance_id, request_token) so concurrent open
  * requests on the same spawn each get their own Slack prompt without
  * colliding.
@@ -29,15 +30,16 @@
  * the persona key.
  *
  * Behavior per tick:
- *   1. list({state:['check_permission'], label:['service=cscb']}).
+ *   1. list({label:['service=cscb']}) (finished rows excluded by AD).
  *   2. For each row, resolve the persona from its `persona` label; a row with
  *      no label, or one naming no applied persona, is logged and skipped.
- *      Then get({instance_id}). When the plural projection is absent
- *      (undefined/null), log non-conformance and skip — do not mutate state
- *      for that row, and exclude that spawn's live entries from the
- *      newly-closed sweep this tick.
- *   3. For each PermissionRequestRow in the plural projection, compute the
- *      composite key. If already tracked → skip (duplicate-tick no-op).
+ *      Then get({instance_id}). An absent permission_requests projection
+ *      (undefined/null) skips the row. An absent unproven_requests projection
+ *      still permits permission_requests discovery. Either logs non-conformance
+ *      and protects existing prompts and wedge state from reconciliation.
+ *   3. Visit every permission_requests entry, then eligible unproven requests,
+ *      deduplicated by composite key before posting. Every distinct candidate
+ *      counts as seen; an already tracked candidate is not posted again.
  *      Else post a fresh Block Kit prompt to the persona's destination and
  *      register the live entry. The prompt shows the tool input cut to fit
  *      Slack's section-text limit (`SLACK_SECTION_TEXT_MAX`, the tool-name
@@ -1080,7 +1082,11 @@ async function runTick(deps: PollerDeps): Promise<void> {
     const client = deps.getClient()
     let rows: ListRow[]
     try {
-      const r = await client.list({ state: ['check_permission'], label: ['service=cscb'] })
+      // One list, at most one get per listed live row, and at most one
+      // get-permission per tracked prompt in the closing sweep: 1 + L + P
+      // AD calls per tick. Both discovery projections share that get and
+      // deduplicate in memory, with no per-request AD read or retry.
+      const r = await client.list({ label: ['service=cscb'] })
       rows = r.spawns
     } catch (err) {
       logViaDeps(deps, `[slack] permission-poller: list failed: ${describeThrownValue(err)}`)
@@ -1171,15 +1177,18 @@ async function runTick(deps: PollerDeps): Promise<void> {
           continue
         }
 
-        if (got.permission_requests === null || got.permission_requests === undefined) {
+        if (got.permission_requests === null || got.permission_requests === undefined ||
+            got.unproven_requests === null || got.unproven_requests === undefined) {
           logViaDeps(deps, `[slack] permission-poller: non-conforming open-rows response for ${row.instance_id} — skipping`)
           nonConformingInstanceIds.add(row.instance_id)
           // F4 follow-up: a non-conforming response is a read we could not
           // trust, not a positive non-wedged observation — exempt from re-arming.
           wedgeSkippedThisTick.add(row.instance_id)
-          // request_token omitted (no row was readable) .
+          // A missing additive projection must not suppress the original
+          // permission_requests source. Its unknown contents still protect
+          // tracked prompts and wedge state from false reconciliation.
           emitRowDecision(deps, 'non_conforming_skipped', row.instance_id, undefined)
-          continue
+          if (got.permission_requests === null || got.permission_requests === undefined) continue
         }
 
         // F4: an EMPTY (but conforming) array is a spawn sitting in
@@ -1187,14 +1196,25 @@ async function runTick(deps: PollerDeps): Promise<void> {
         // Feed it to the detector; a non-empty array means the spawn is NOT
         // wedged, so it is intentionally excluded from wedgeObservedEmpty and
         // will be re-armed by reconcileWedgeStates below.
-        if (got.permission_requests.length === 0) {
+        if (got.unproven_requests != null && got.state === 'check_permission' && got.permission_requests.length === 0) {
           if (!reResolve()) continue
           wedgeObservedEmpty.add(row.instance_id)
           await observeWedgeCandidate(deps, row.instance_id, persona)
         }
 
-        for (const perm of got.permission_requests) {
+        // A main Stop may leave a background subagent's request awaiting an
+        // answer on waiting/working/ask_user. AD exposes it here in every
+        // live state. Keep every original permission_requests entry (including
+        // decided requests awaiting delivery), then add only unanswered,
+        // still-open unproven requests. The original projection takes priority.
+        const permissions = [
+          ...got.permission_requests,
+          ...(got.unproven_requests ?? []).filter((perm) =>
+            perm.decision === null && perm.unproven_since === null && perm.proven_gone_at === null),
+        ]
+        for (const perm of permissions) {
           const key = makeCompositeKey(row.instance_id, perm.request_token)
+          if (seenComposite.has(key)) continue
           seenComposite.add(key)
           // a throw while handling this request is its own; the row's
           // other requests go on. The key is already observed, so the request

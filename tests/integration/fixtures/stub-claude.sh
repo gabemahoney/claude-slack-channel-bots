@@ -259,6 +259,7 @@ DISPLAY_NEXT=0
 DISPLAY_TEXT=""
 # 1 between `receipt-only` and `stop`: the receipt written, Stop not yet fired.
 DISPLAY_STOP_DUE=0
+DISPLAY_AGENT_ID=""
 declare -A DISPLAY_HOOK_PIDS=()
 display_record() {
     jq -nc --arg command "$1" --arg event "$2" --arg instance "${AGENT_DIRECTOR_INSTANCE_ID:-}" \
@@ -266,8 +267,9 @@ display_record() {
         '{command:$command,event:$event,instance_id:$instance,session_id:$session,pid:$pid,at:$at}' >> "${DISPLAY_RECORD}"
 }
 display_payload() {
-    jq -nc --arg event "$1" --arg session "${SESSION_ID}" --arg cwd "${REALCWD}" --arg path "${TRANSCRIPT}" --arg marker "${2:-}" \
-        '{hook_event_name:$event,session_id:$session,cwd:$cwd,transcript_path:$path,tool_name:"Bash",tool_input:{command:("printf fixture-"+$marker)}}' > "${HOOK_FILE}"
+    jq -nc --arg event "$1" --arg session "${SESSION_ID}" --arg cwd "${REALCWD}" --arg path "${TRANSCRIPT}" --arg marker "${2:-}" --arg agent "${DISPLAY_AGENT_ID:-}" \
+        '{hook_event_name:$event,session_id:$session,cwd:$cwd,transcript_path:$path,tool_name:"Bash",tool_input:{command:("printf fixture-"+$marker)}} +
+         (if $event == "PermissionRequest" and $agent != "" then {agent_id:$agent} else {} end)' > "${HOOK_FILE}"
 }
 display_controls() {
     [[ -f "${DISPLAY_CONTROL}" ]] || return 0
@@ -278,6 +280,14 @@ display_controls() {
         DISPLAY_NEXT=$(( DISPLAY_NEXT + 1 ))
         command="${commands[index]}"
         case "${command}" in
+            subagent)
+                DISPLAY_AGENT_ID="fixture-background-subagent"
+                display_record "${command}" none
+                ;;
+            main-agent)
+                DISPLAY_AGENT_ID=""
+                display_record "${command}" none
+                ;;
             receipt)
                 [[ -n "${DISPLAY_TEXT}" ]] || exit 1
                 append_user_receipt "${DISPLAY_TEXT}"
@@ -294,7 +304,7 @@ display_controls() {
                 display_record "${command}" none
                 ;;
             stop)
-                (( DISPLAY_STOP_DUE == 1 )) || exit 1
+                if (( DISPLAY_STOP_DUE != 1 )) && [[ -z "${DISPLAY_AGENT_ID:-}" || -z "${DISPLAY_HOOK_PIDS[1]:-}" ]]; then exit 1; fi
                 DISPLAY_STOP_DUE=0
                 display_payload Stop
                 fire_hooks "${STOP_HOOKS[@]}"
