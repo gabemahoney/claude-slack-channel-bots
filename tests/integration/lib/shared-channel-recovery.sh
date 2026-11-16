@@ -534,4 +534,3 @@ recovery_finish() {
     [[ "${leaks_n}" == 0 ]] || fail 'token-like data in recovery evidence'
     echo "PASS: ${TEST_NAME}"
 }
-
