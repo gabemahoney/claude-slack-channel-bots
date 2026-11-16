@@ -297,9 +297,16 @@ the persona should serve, in that channel:
 ```
 
 Listening requires current verified membership and a non-off applied choice.
-An invitation, a listed choice or a received message alone supplies no current
-membership evidence. Valid current positives can progress before the inventory
-is complete; open mode also excludes externally shared channels.
+Slack's join event for the app when invited (the app needs the
+`member_joined_channel` subscription), or startup catch-up, can verify
+membership; the invitation request itself is not proof until qualifying
+evidence arrives. Listing a channel, hearing a message or posting alone is
+not evidence.
+
+Valid current positives can progress before the inventory is
+complete; open mode also excludes externally shared channels. See
+[membership readiness](../debug-slack-channel-bots/SKILL.md#membership-setup-record-and-readback).
+
 Invite the app to its destination channel from 5.7 too, when that is a
 channel. If the persona stays silent in a channel its app was invited to,
 point to the debugging skill's entry "A persona is silent in a channel its app

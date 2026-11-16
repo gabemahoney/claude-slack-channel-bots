@@ -1296,9 +1296,13 @@ credentials workflow, never these requests or chat.
   refused `message` event, logged by the persona that received it, and no
   `persona-open-channel` line for it. An `app_mention` never logs this
   line in open mode: the `message` event carrying the same mention
-  decides. For every reason but `the channel ID is malformed`, the line's
-  own advice is the one way to serve such a channel: strict mode, with
-  the channel listed. Neither mode serves a malformed channel ID.
+  decides. For every reason but `the channel ID is malformed`, serving
+  such a channel requires strict mode, a non-off saved choice and current
+  verified membership; a group DM remains excluded. Open-discovered Slack
+  Connect membership may already have `mentions` saved and become eligible
+  on switching to strict without a new listing. Review the
+  [preview and off-first warning](../../docs/channel-modes.md#turning-open-mode-on-or-off).
+  Neither mode serves a malformed channel ID.
 - **Reasons and fixes:** the conditions are checked in this order, and the
   first that fails is the reason:
 
@@ -1306,9 +1310,9 @@ credentials workflow, never these requests or chat.
   |---|---|---|
   | `the conversation is not a public or private channel` | The event's `channel_type` is neither `channel` (public) nor `group` (private), or it is missing. A DM and a group DM never reach this check (see [`persona-dm-dropped`](#persona-dm-dropped)). | None in open mode. Serve it in strict mode, with the channel listed, or remove the app from the conversation. |
   | `the channel ID is malformed` | The channel ID isn't a `C…` or `G…` ID of capital letters and digits. | None: `config.json` can't list such an ID either, so neither mode serves it. If the line repeats, report it as a bug, with the line. |
-  | `the event envelope carries no is_ext_shared_channel flag` | Slack's event envelope didn't say whether the channel is externally shared, so the server can't tell and doesn't serve it. | None in open mode. Serve it in strict mode, with the channel listed. |
-  | `the event envelope's is_ext_shared_channel flag is not a boolean` | The envelope's flag is neither `true` nor `false`, so the server can't tell and doesn't serve it. | None in open mode. Serve it in strict mode, with the channel listed. |
-  | `the channel is externally shared` | Slack marks the channel as externally shared (Slack Connect). Open mode never serves it. | Serve it in strict mode, with the channel listed, or remove the app from the channel. |
+  | `the event envelope carries no is_ext_shared_channel flag` | Slack's event envelope didn't say whether the channel is externally shared, so the server can't tell and doesn't serve it. | None in open mode. Strict mode requires a non-off saved choice and current verified membership; review the [switch warning](../../docs/channel-modes.md#turning-open-mode-on-or-off). |
+  | `the event envelope's is_ext_shared_channel flag is not a boolean` | The envelope's flag is neither `true` nor `false`, so the server can't tell and doesn't serve it. | None in open mode. Strict mode requires a non-off saved choice and current verified membership; review the [switch warning](../../docs/channel-modes.md#turning-open-mode-on-or-off). |
+  | `the channel is externally shared` | Slack marks the channel as externally shared (Slack Connect). Open mode never serves it. | Serve it only in strict mode, at a non-off saved choice, with current verified membership, or remove the app. Open discovery may already have saved `mentions`; review the [preview and off-first warning](../../docs/channel-modes.md#turning-open-mode-on-or-off) before switching. |
 
   Serving a channel in strict mode means turning open mode off for
   every persona (see
@@ -1881,9 +1885,14 @@ Slack accepts the token: `persona-credentials-refused` is Slack's answer.
 
 The persona was invited to a channel, but a message there gets no answer.
 A newly verified member without a choice starts `off` in strict or `mentions`
-in open, using the mode at application. Existing choices, especially `off`,
-survive duplicate joins; an invitation or a received message alone supplies no
-current evidence. Check the mode, applied choice and membership readiness.
+in open, using the mode at application; existing choices, especially `off`,
+survive duplicate joins. Listening still requires a non-off applied choice.
+
+Slack's join event for the app when invited (the app needs the
+`member_joined_channel` subscription), or startup catch-up, can verify current
+membership. The invitation request is not proof until qualifying evidence
+arrives; listing a channel, hearing a message or posting alone is not evidence.
+Check the mode, applied choice and [membership readiness](#membership-setup-record-and-readback).
 
 **1. The mode in force.** The running server runs its last-applied record, so
 read the switch there (the record holds no token):
@@ -1920,7 +1929,7 @@ membership or an old setup record does not establish either current state.
 | **Current membership is held** | `channel-membership-unresolved`, `channel-membership-storage-failed` or `channel-membership-inventory-incomplete`. | Follow the named cause and next retry in [membership diagnostics](#channel-membership-unresolved); partial scans cannot prove absence. Accepted work stays queued and unaffected positives progress. |
 | **The applied choice is `off`** | The shared applied choice is `off`, including a strict-mode join default or an explicit opt-out. | Confirm a non-off choice if listening is wanted. A duplicate join or mode switch preserves `off`. |
 | **Strict mode** | The strict [`unclaimed-channel`](#unclaimed-channel) line (`… not delivered: no applied persona lists this channel`). No line at all when another applied persona lists the channel: that persona receives it. A `not-mentioned` plain line when this persona lists it at `delivery: mentions`. | List the channel in this persona’s `channels` with a non-off `delivery` and confirm the change (see the Fix under [`unclaimed-channel`](#unclaimed-channel)). |
-| **An externally shared channel** (open mode) | The open [`unclaimed-channel`](#unclaimed-channel) line with the reason `the channel is externally shared`, and no `persona-open-channel` line. The other four reasons of that line are covered there too. | Open mode never serves it. Serve it in strict mode, with the channel listed. |
+| **An externally shared channel** (open mode) | The open [`unclaimed-channel`](#unclaimed-channel) line with the reason `the channel is externally shared`, and no `persona-open-channel` line. The other four reasons of that line are covered there too. | Open mode never serves it. Strict mode requires a non-off saved choice and current verified membership. Open discovery may already have saved `mentions`; review the [preview and off-first warning](../../docs/channel-modes.md#turning-open-mode-on-or-off) before switching. |
 | **A group DM** | In both modes, a plain `[slack] persona "<name>" (key=<key>) dropped message from channel=<id> …: group-dm` line. An @mention there logs `unclaimed-channel` in strict mode and no line of its own in open mode. | None: a group DM is never served, in either mode (see **Group DMs** under [`persona-dm-dropped`](#persona-dm-dropped)). Use a channel, or a DM with the persona. |
 | **An edit that adds a mention** (open mode) | A plain `… dropped message from channel=<id> …: non-message` line for the edit. In open mode an @mention is delivered from its `message` event, and an edit arrives as an `app_mention` (which open mode never decides on) plus a `message_changed` event, which is never delivered. | Post another message that @mentions the persona. |
 | **A message posted before the invite** | No line at all, not even a `RAW message event` line: Slack sends the app no event for a message posted before it joined the channel. | Post the message again. The persona can read earlier messages with `fetch_messages` when asked. |

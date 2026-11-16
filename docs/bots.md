@@ -15,7 +15,7 @@ Create and retain `attempt_id` before first submission, keeping it across respon
 
 A fresh write needs an active current persona session and verified public or private membership with explicit non-external-sharing evidence, rechecked at application. Current discovery before traffic can suffice; listed or heard channels, historical membership and dry-run placeholders cannot authorize it. Stale, foreign or replacement sessions cannot read another incarnation's history.
 
-A new application gets one assignment position and one `persona-channel-delivery-set` log line, without editing `config.json` or consuming pending operator intent. Its result keeps the original saved and effective choice and restrictions apart from current facts, which may reflect a later operator choice or be unavailable; history never overwrites that later choice.
+A successful durable application shares the [order of confirmed operator assignments](channel-modes.md#delivery-values-in-both-modes): the later success wins. It gets one assignment position and one `persona-channel-delivery-set` log line, without editing `config.json` or consuming pending operator intent. Its retained result separates the original saved/effective choice and restrictions from current facts, which may reflect a later choice or be unavailable; history never overwrites that later choice.
 
 Pending, proven not-applied and unresolved outcomes differ, and an unknown retry cannot write or prove the state unchanged. See [tool outcomes and recovery](../skills/debug-slack-channel-bots/SKILL.md#persona-channel-delivery-set).
 

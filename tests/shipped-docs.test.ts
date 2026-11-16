@@ -8065,8 +8065,10 @@ const PROMPTS_IN_BOTH_MODES_HEADING = '## Permission prompts in both modes'
 const CHANNEL_MODES_SUBSECTIONS = [WHAT_EACH_MODE_SERVES_HEADING, WHO_CAN_REACH_HEADING, TURNING_OPEN_MODE_HEADING, DELIVERY_VALUES_HEADING, THREADS_HEADING, PROMPTS_IN_BOTH_MODES_HEADING, OPEN_MODE_EXAMPLE_HEADING] as const
 /** The threads section's own sections, in order. */
 const THREADS_SUBSECTIONS = ['### Joining a thread', '### Staying in a thread', '### Starting over'] as const
-/** The link from a page under `docs/` to the debugging skill's configuration-rejections section, as the channel-modes page writes it. */
+/** The upgrade guidance's broader link to configuration rejections. */
 const CONFIGURATION_REJECTIONS_LINK = `[Configuration rejections](${relative('docs', DEBUG_SKILL_FILE)}#configuration-rejections)`
+/** The removed-key explanation links directly to the skill's replacement guidance. */
+const REMOVED_CONFIGURATION_KEYS_LINK = `[Removed configuration keys](${relative('docs', DEBUG_SKILL_FILE)}#${headingSlug(REMOVED_KEYS_EXCEPTION.heading.replace(/^#+ /, ''))})`
 
 /** The downgrade section, under `## Migration` right after "Upgrading to personas". */
 const DOWNGRADE_HEADING = '### Downgrading to an earlier release'
@@ -8342,7 +8344,9 @@ const README_DEO_ROWS: readonly DocRow[] = [
 // shared-channels applies join defaults only to a verified member with no choice.
 ['Channel modes: current verified membership and join defaults', readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [
     ci('Listening requires current verified membership'),
-    ci('Listing, hearing a message, posting or inviting alone supplies no such evidence'),
+    ci("learned from Slack's join event for the app when invited (the app needs the `member_joined_channel` subscription), or from startup catch-up"),
+    ci('An invitation request is not proof until qualifying evidence arrives'),
+    ci('listing a channel, hearing a message or posting alone is not evidence'),
     ci('A newly verified member without a choice starts at `off` in strict or `mentions` in open, using the mode when the join is applied'),
     ci('Duplicate joins and mode switches preserve choices, including `off`'),
   ]],
@@ -8350,15 +8354,20 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci('Mode changes preserve every applied `delivery` choice and the shared destination'),
     ci('Strict mode uses the same shared channel choices and destination'),
     ci('The mode switch preserves them, including choices made while open mode was active'),
+    ci('Slack Connect memberships discovered in open mode already have `mentions` saved when no prior choice existed'),
+    ci('with current verified membership, switching to strict can activate that choice without another manual listing step'),
+    ci('Existing `off` choices stay off'),
+    `[Reading the preview](${relative('docs', RELOAD_DOC)}#reading-the-preview)`,
+    ci('If that external audience is unwanted, review and confirm an explicit `off` assignment **before switching to strict**'),
   ]],
 [`Channel modes: before turning it on, the operator reviews each app's channels and past ${UNCLAIMED_CHANNEL} lines`, readmeSection(TURNING_OPEN_MODE_HEADING), [
     ci("Before you turn it on, review each persona's app's channel memberships in Slack, private channels included"),
     ci(`Past ${code(UNCLAIMED_CHANNEL)} lines in ${code('server.log')} show channels`),
     `grep ${UNCLAIMED_CHANNEL} ~/.config/claude-slack-channel-bots/server.log*`,
   ]],
-["Channel modes: a configuration from an earlier release requires a manual edit", readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [
-    ci('A configuration from an earlier release is rejected at load until it is prepared by hand; a manual edit is required'),
-    CONFIGURATION_REJECTIONS_LINK,
+["Channel modes: a removed key rejects configuration with replacement guidance", readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [
+    ci('A configuration still holding a removed key is rejected with an error naming its replacement'),
+    REMOVED_CONFIGURATION_KEYS_LINK,
   ]],
 ["Channel modes: switching through pending confirmation", readmeSection(TURNING_OPEN_MODE_HEADING), [ci("confirmed"), ci("preview"), ci("no restart"), ci("`strict`"), ci("`open`")]],
 ['Channel modes: four persistent listening choices with missing choices unresolved', readmeSection(DELIVERY_VALUES_HEADING), [
@@ -8473,7 +8482,10 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci('so content can be carried from one channel to another'),
   ]],
 ['security: Slack Connect channels are never served in open mode', readmeSection(WHO_CAN_REACH_HEADING), [
-    ci('**Slack Connect channels are never served.** An externally shared channel is never served in open mode'),
+    ci('**Slack Connect channels are never served in open mode.**'),
+    ci('They can be served only in strict mode, at a non-off choice, with current verified membership'),
+    ci('Open discovery saves `mentions` when no choice exists; switching to strict can activate it without another listing step'),
+    `[preview and off-first warning]${anchorLink(TURNING_OPEN_MODE_HEADING)}`,
   ]],
 ["security: an Enterprise Grid channel is served when Slack marks it not externally shared, so every sharing workspace's members can reach the persona", readmeSection(WHO_CAN_REACH_HEADING), [
     ci("**Enterprise Grid: Slack's flag decides.**"),
@@ -8559,7 +8571,10 @@ const README_DEO_ROWS: readonly DocRow[] = [
 [`"${SILENT_INVITED_TITLE}": an externally shared channel`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
     ci('**An externally shared channel** (open mode)'),
     ci(`with the reason ${code(UNCLAIMED_REASON_EXTERNALLY_SHARED)}`),
-    ci('Open mode never serves it. Serve it in strict mode, with the channel listed'),
+    ci('Open mode never serves it. Strict mode requires a non-off saved choice and current verified membership'),
+    ci('Open discovery may already have saved `mentions`'),
+    `[preview and off-first warning](${relative(dirname(DEBUG_SKILL_FILE), CHANNEL_MODES_DOC)}${anchorLink(TURNING_OPEN_MODE_HEADING).slice(1, -1)})`,
+    ci('before switching'),
   ]],
 [`"${SILENT_INVITED_TITLE}": a group DM`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
     ci('a group DM is never served, in either mode'),
@@ -8593,11 +8608,18 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci('Only public or private channels that are not externally shared can be served in open mode'),
     ci('a group DM is never served in either mode'),
   ]],
-[`"${UNCLAIMED_ENTRY_TITLE}": the ${UNCLAIMED_CHANNEL} fix in open mode, each reason (FUNGIBLE_REFUSAL_TEXTS); for every reason but a malformed channel ID, served only in strict mode with the channel listed; a malformed channel ID served in neither mode`, viaSymptom(`**${UNCLAIMED_ENTRY_TITLE}**`, UNCLAIMED_SKILL_HEADING), [
+[`"${UNCLAIMED_ENTRY_TITLE}": the ${UNCLAIMED_CHANNEL} fix in open mode, each reason (FUNGIBLE_REFUSAL_TEXTS); strict mode needs a non-off saved choice and current verified membership; malformed IDs and group DMs remain excluded`, viaSymptom(`**${UNCLAIMED_ENTRY_TITLE}**`, UNCLAIMED_SKILL_HEADING), [
     ci("In open mode, a `message` event the persona's app received was refused by the open path"),
     // Each reason as a row of the reasons table, its first cell.
     ...Object.values(FUNGIBLE_REFUSAL_TEXTS).map((reason) => ci(`| ${code(reason)} |`)),
-    ci(`For every reason but ${code(UNCLAIMED_REASON_CHANNEL_ID_MALFORMED)}, the line's own advice is the one way to serve such a channel: strict mode, with the channel listed`),
+    ci(`For every reason but ${code(UNCLAIMED_REASON_CHANNEL_ID_MALFORMED)}, serving such a channel requires strict mode, a non-off saved choice and current verified membership; a group DM remains excluded`),
+    ci('Open-discovered Slack Connect membership may already have `mentions` saved and become eligible on switching to strict without a new listing'),
+    // Keep each corrected remedy in its own table cell: another reason's fix cannot satisfy it.
+    ...(['flag-missing', 'flag-not-boolean', 'externally-shared'] as const).map(reason => new RegExp(
+      String.raw`\| ${escapeRegExp(code(FUNGIBLE_REFUSAL_TEXTS[reason]))} \|[^|]*\| [^|]*strict mode[^|]*non-off saved choice[^|]*current verified membership[^|]*\[[^\]]*warning\]\(${escapeRegExp(relative(dirname(DEBUG_SKILL_FILE), CHANNEL_MODES_DOC) + anchorLink(TURNING_OPEN_MODE_HEADING).slice(1, -1))}\)`,
+      'i',
+    )),
+    `[preview and off-first warning](${relative(dirname(DEBUG_SKILL_FILE), CHANNEL_MODES_DOC)}${anchorLink(TURNING_OPEN_MODE_HEADING).slice(1, -1)})`,
     ci('Neither mode serves a malformed channel ID'),
     ci(`${code(CONFIG_FILE_NAME)} can't list such an ID either, so neither mode serves it`),
   ]],
@@ -8784,8 +8806,10 @@ describe('the README describes both channel modes', () => {
     })
 
     test.each(README_DEO_ROWS)('self-check: %s: each of its items, cut from its passage in the README, is reported by the row', (element, passage, required) => {
+      expect({ element, problems: docRowProblems(passage, required, readme()) }).toEqual({ element, problems: [] })
       for (const item of required.map(resolveItem)) {
         const edited = withItemCut(readme(), passage, item)
+        expect(passage(edited)).not.toBe(passage(readme()))
         expect({ element, item: String(item), reported: docRowProblems(passage, required, edited).includes(`lacks ${String(item)}`) }).toEqual({ element, item: String(item), reported: true })
       }
     })
@@ -8814,14 +8838,25 @@ describe('the README describes both channel modes', () => {
     test.each(([
       ['Channel modes: current verified membership and join defaults', [
         ['requires current verified membership', 'requires historical membership'],
-        ['supplies no such evidence', 'supplies sufficient evidence'],
+        ["learned from Slack's join event for the app when invited", "learned only from a complete inventory, never from an invitation"],
+        ['the app needs the `member_joined_channel` subscription', 'the app needs no join-event subscription'],
+        ['or from startup catch-up', 'never from startup catch-up'],
+        ['An invitation request is not proof until qualifying evidence arrives', 'An invitation request alone is proof'],
+        ['listing a channel, hearing a message or posting alone is not evidence', 'listing a channel, hearing a message or posting alone is evidence'],
         ['starts at `off` in strict or `mentions` in open', 'starts at `mentions` in strict or `off` in open'],
+        ['using the mode when the join is applied', 'using the mode when the invitation is requested'],
         ['Duplicate joins and mode switches preserve choices, including `off`', 'Duplicate joins and mode switches reset choices, including `off`'],
       ]],
       ['Channel modes: four persistent listening choices with missing choices unresolved', [
         ['holds affected intake', 'drops affected intake'],
         ['it is not a saved `off` choice', 'it is a saved `off` choice'],
         ["A newly verified member gets the mode's join default described above, preserving any existing choice", "Any missing assignment gets the mode's join default, resetting any existing choice"],
+      ]],
+      ['Channel modes: changing mode preserves applied channel choices', [
+        ['when no prior choice existed', 'even when an off choice existed'],
+        ['with current verified membership, switching to strict can activate that choice without another manual listing step', 'switching to strict requires another manual listing step'],
+        ['Existing `off` choices stay off', 'Existing `off` choices become mentions'],
+        ['review and confirm an explicit `off` assignment **before switching to strict**', 'assign off after switching to strict'],
       ]],
       [`Channel modes: ${RECEIVE_ALL_SHARED} requires current eligible effective-all siblings`, [
         ['this persona and another currently eligible member have effective `all`', 'this persona alone has saved `all`'],
@@ -8836,9 +8871,30 @@ describe('the README describes both channel modes', () => {
         ["A persona's saved choice is the `delivery` value", "A persona's saved choice is its effective choice"],
         ['the saved value stays as it is', 'the saved value is reset to `off`'],
       ]],
-      ['Channel modes: a configuration from an earlier release requires a manual edit', [
-        ['is rejected at load until it is prepared by hand', 'is accepted at load and prepared automatically'],
-        [CONFIGURATION_REJECTIONS_LINK, 'Configuration rejections'],
+      ['Channel modes: a removed key rejects configuration with replacement guidance', [
+        ['A configuration still holding a removed key is rejected with an error naming its replacement', 'A configuration from an earlier release is rejected at load until it is prepared by hand; a manual edit is required'],
+        ['is rejected with an error naming its replacement', 'is accepted without naming its replacement'],
+        [REMOVED_CONFIGURATION_KEYS_LINK, CONFIGURATION_REJECTIONS_LINK],
+      ]],
+      ['security: Slack Connect channels are never served in open mode', [
+        ['**Slack Connect channels are never served in open mode.**', '**Slack Connect channels are never served.**'],
+        ['only in strict mode, at a non-off choice, with current verified membership', 'in either mode, even at off or without current verified membership'],
+        ['Open discovery saves `mentions` when no choice exists', 'Open discovery resets every choice to `mentions`'],
+        ['switching to strict can activate it without another listing step', 'switching to strict requires another listing step'],
+        [`[preview and off-first warning]${anchorLink(TURNING_OPEN_MODE_HEADING)}`, 'preview and off-first warning'],
+      ]],
+      [`"${SILENT_INVITED_TITLE}": an externally shared channel`, [
+        ['Open mode never serves it', 'Open mode serves it'],
+        ['Strict mode requires a non-off saved choice and current verified membership', 'Serve it in strict mode, with the channel listed'],
+        ['Open discovery may already have saved `mentions`', 'Open discovery requires a new listing'],
+        [`[preview and off-first warning](${relative(dirname(DEBUG_SKILL_FILE), CHANNEL_MODES_DOC)}${anchorLink(TURNING_OPEN_MODE_HEADING).slice(1, -1)})`, 'preview and off-first warning'],
+      ]],
+      [`"${UNCLAIMED_ENTRY_TITLE}": the ${UNCLAIMED_CHANNEL} fix in open mode, each reason (FUNGIBLE_REFUSAL_TEXTS); strict mode needs a non-off saved choice and current verified membership; malformed IDs and group DMs remain excluded`, [
+        ['requires strict mode, a non-off saved choice', 'requires strict mode, with the channel listed'],
+        ['current verified membership', 'historical membership'],
+        ['a group DM remains excluded', 'a group DM is eligible'],
+        ['on switching to strict without a new listing', 'only after a new listing'],
+        [`[preview and off-first warning](${relative(dirname(DEBUG_SKILL_FILE), CHANNEL_MODES_DOC)}${anchorLink(TURNING_OPEN_MODE_HEADING).slice(1, -1)})`, 'preview and off-first warning'],
       ]],
       [`Channel modes: a persona's ${code(DELIVERY_KEY)} applies as written in another persona's destination`, [
         ['applies as written in a channel where another persona posts', 'is held at `mentions` in a channel where another persona posts'],
