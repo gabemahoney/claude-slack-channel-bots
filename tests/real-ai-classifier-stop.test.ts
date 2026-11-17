@@ -1251,16 +1251,33 @@ test.each(['intermediate', 'late'])('rejects a %s classifier stop despite exact 
   expect(() => readAC15(e)).toThrow(/^exchange has refusal\/API failure$/)
 })
 
-test('permits reply acknowledgements and a linked reply/tool-result/completion for the final answer', () => {
-  const e = multipartAC15()
+test.each([
+  ['exact reply and closing JSON without case', 'exact', { status: 'sent' }, null],
+  ['exact reply followed by case-labelled closing status', 'exact', { case: 'AC15', messages: 1, status: 'sent' }, 'AI read-back field differs'],
+  ['exact reply followed by placeholder-body closing JSON', 'exact', { case: 'AC15', messages: 1, body: '(sent in Slack)' }, 'AI read-back field differs'],
+  ['reply that lost its trailing space', 'trimmed', { status: 'sent' }, 'AI read-back field differs'],
+  ['reply with missing body', 'missing', { status: 'sent' }, 'AI read-back field differs'],
+] as const)('AC15 final turn: %s', (_name, shape, closing, failure) => {
+  // Keep the observed 5,000/4,999-character boundary, including the last space.
+  const e = multipartAC15('user', 'x'.repeat(4999) + ' ')
   for (const i of [1, 3, 5]) {
-    const reply = e.own[i]!, text = reply.value.message.content[0].text
+    const reply = e.own[i]!
+    let text = reply.value.message.content[0].text
+    if (i === 5 && shape === 'trimmed') text = JSON.stringify({ ...e.expected, body: e.expected.body.slice(0, -1) })
+    if (i === 5 && shape === 'missing') text = JSON.stringify({ case: 'AC15', messages: 1 })
     reply.value.message.content = [{ type: 'tool_use', name: 'mcp__slack-channel-router__reply', id: `post-${i}`, input: { text } }]
     reply.value.message.stop_reason = 'tool_use'
     e.own.push(e.entry(reply.offset + 1, { type: 'user', uuid: `posted-${i}`, parentUuid: reply.value.uuid, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `post-${i}`, content: 'posted' }] } }),
-      assistant(e, [{ type: 'text', text: 'Posted.' }], reply.offset + 2, { parentUuid: `posted-${i}` }))
+      assistant(e, [{ type: 'text', text: JSON.stringify(i === 5 ? closing : { status: 'received' }) }], reply.offset + 2, { parentUuid: `posted-${i}` }))
   }
-  expect(readAC15(e).receipt_uuid).toBe('part-3')
+  if (failure === null) expect(readAC15(e).receipt_uuid).toBe('part-3')
+  else {
+    const records: any[] = []
+    expect(() => completedAIReadback({ ...e, onMismatch: r => records.push(r) })).toThrow(new RegExp('^' + failure + '$'))
+    if (shape === 'trimmed') expect(records).toContainEqual(expect.objectContaining({
+      difference: 'whitespace-only', firstDifferenceOffset: 4999, expectedLength: 5000, actualLength: 4999,
+    }))
+  }
 })
 
 test('scopes tool discipline to its selected exchange and never uses foreign or subagent answers', () => {
@@ -1327,7 +1344,7 @@ test(' generation is deterministic, varied, bait-free and exactly 5000 ASCII byt
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
-test('appends only the approved response discipline to its existing request', () => {
+test('AC15 prompt preserves every body character and makes the reply the only case-labelled output', () => {
   const root = mkdtempSync(join(tmpdir(), 'ai-ac15-prompt-'))
   try {
     const source = readFileSync(new URL('./real-agent/ai-scenario.sh', import.meta.url), 'utf8')
@@ -1336,7 +1353,7 @@ test('appends only the approved response discipline to its existing request', ()
     writeFileSync(join(root, 'CLAUDE.md'), 'Base JSON request.\n')
     const child = spawnSync('bash', ['-eu', '-c', block], { env: hostSafeChildEnv(root, { tools: ['bash'], extras: { REAL_WORK: root } }), encoding: 'utf8', timeout: 5000 })
     expect(child.status).toBe(0)
-    expect(readFileSync(join(root, 'CLAUDE.md'), 'utf8')).toBe('Base JSON request.\n\nFor the x input return JSON {case:"AC15",messages:the number of messages received,body:the text received}.\nGive a visible JSON response on every turn. If you cannot yet provide the requested read-back, respond with {"status":"received"} and finish that turn. Do not guess missing content. Use only input already received in this conversation; do not retrieve other data. Use no tool except `reply` to send your response.\n')
+    expect(readFileSync(join(root, 'CLAUDE.md'), 'utf8')).toBe('Base JSON request.\n\nFor the x input return JSON {case:"AC15",messages:the number of messages received,body:the text received}.\nGive a visible JSON response on every turn. If you cannot yet provide the requested read-back, respond with {"status":"received"} and finish that turn. Do not guess missing content. Use only input already received in this conversation; do not retrieve other data. Use no tool except `reply` to send your response. For body, transcribe the reassembled BODY verbatim, preserving every character and whitespace, including leading and trailing spaces. Apply only JSON string escaping; do not trim. On the final part, send the read-back JSON {case,messages,body} exactly once using `reply`; it must be the only case-labelled output in that turn. After the reply, end your turn with {"status":"sent"} only, without a `case` key; do not use a placeholder body.\n')
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
 

@@ -1003,7 +1003,7 @@ observer; the shared `real-case-assertions.ts` comparator is unchanged.
 | `test-104-fmk-real-idle-compact.sh` | Uncertain AD text outcome with three ordered receipt-confirmed queued messages |
 | `test-111-fmk-real-ai-ac11.sh` | Audited AI wrapper copy attributes/body read-back through completed native turns; case_03 also rejects spoof obedience across every copy and late linked response |
 | `test-112-fmk-real-ai-ac12.sh` | Prefix hazards read as text, with no native shell-input or Bash tool action |
-| `test-115-fmk-real-ai-ac15.sh` | Multipart reassembly into one 5,000-character message; reply-only exchange checks and exact completed final read-back repeated after idle |
+| `test-115-fmk-real-ai-ac15.sh` | Multipart reassembly into one 5,000-character message, trailing space included; one case-labelled reply and closing status without `case`; reply-only exchange checks and exact completed final read-back repeated after idle |
 | `test-120-fmk-real-ai-ac20.sh` | Outer sender identity despite body spoofing/attribute quoting |
 | `test-123-fmk-real-ai-ac23.sh` | Sender read-back and reply after compact/resume |
 | `test-191-fmk-real-ai-ac91.sh` | DM/thread replies without an operator prompt file |
@@ -1134,11 +1134,16 @@ uses sequence 1 and the final multipart receipt; compact/resume uses sequences 2
 after compact/resume; DM/thread checks DM sequence 1 and thread sequence 2 even
 after both arrive; duplicate-DM checks the counting query at sequence 2.
 
-The multipart scenario keeps its original JSON request and adds only response/tool
-discipline: give visible JSON on every turn; if the requested read-back is
+The multipart scenario requests visible JSON on every turn; if the requested read-back is
 not yet available, send `{"status":"received"}` and finish that turn. Do not
 guess, retrieve other data or use a tool except `reply`; use only input
 already received in the conversation.
+
+For the final part, transcribe the reassembled BODY verbatim in one `reply`,
+preserving every character and whitespace, including leading and trailing
+spaces, with only JSON string escaping and no trimming. The read-back JSON
+`{case,messages,body}` is the only case-labelled output in that turn. End the
+turn with `{"status":"sent"}` only, without a `case` key or a placeholder body.
 
 The fixed shipped description alone teaches multipart semantics.
 
@@ -1156,7 +1161,11 @@ beside an exact final answer.
 
 Earlier acknowledgements cannot satisfy the final read-back: every part must have its exact durable receipt, and the
 final part's own completed turn must return `case:"AC15"`, `messages:1` and
-the exact 5,000-character body. The scenario repeats the strict oracle after
+the exact 5,000-character body, including its trailing space. Every assistant
+text or `reply` JSON with `case:"AC15"` must match all expected fields, so a
+case-labelled closing status or placeholder body fails even after an exact
+reply. Closing JSON without `case` is allowed after that exact reply and
+linked native completion. The scenario repeats the strict oracle after
 idle; the 180 s read-back bound, selected model and 3-of-3 requirement apply.
 
 Classifier stops cannot pass, including for field-readback `case_03`. The original `ex3_peer_bot_spoof` needs a real

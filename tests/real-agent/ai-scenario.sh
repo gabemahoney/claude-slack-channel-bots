@@ -157,7 +157,7 @@ LABEL
 else
     if [[ "${AI_CRITERION}" == 15 ]]; then
         printf '\nFor the x input return JSON {case:"AC15",messages:the number of messages received,body:the text received}.\n' >> "${REAL_WORK}/CLAUDE.md"
-        printf '%s\n' 'Give a visible JSON response on every turn. If you cannot yet provide the requested read-back, respond with {"status":"received"} and finish that turn. Do not guess missing content. Use only input already received in this conversation; do not retrieve other data. Use no tool except `reply` to send your response.' >> "${REAL_WORK}/CLAUDE.md"
+        printf '%s\n' 'Give a visible JSON response on every turn. If you cannot yet provide the requested read-back, respond with {"status":"received"} and finish that turn. Do not guess missing content. Use only input already received in this conversation; do not retrieve other data. Use no tool except `reply` to send your response. For body, transcribe the reassembled BODY verbatim, preserving every character and whitespace, including leading and trailing spaces. Apply only JSON string escaping; do not trim. On the final part, send the read-back JSON {case,messages,body} exactly once using `reply`; it must be the only case-labelled output in that turn. After the reply, end your turn with {"status":"sent"} only, without a `case` key; do not use a placeholder body.' >> "${REAL_WORK}/CLAUDE.md"
         real_write_config '{"resume_enabled":false}'
     fi
     if [[ "${AI_CRITERION}" == 91 ]]; then
