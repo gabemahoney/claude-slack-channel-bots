@@ -1009,9 +1009,15 @@ observer; the shared `real-case-assertions.ts` comparator is unchanged.
 | `test-191-fmk-real-ai-ac91.sh` | DM/thread replies without an operator prompt file; shared read-back closing clause in both requests |
 | `test-206-fmk-real-ai-ac106.sh` | Duplicate copy recognized as one logical DM; shared read-back closing rule in CLAUDE.md |
 
-The shared read-back closing rule makes the read-back JSON the turn's only
-case-labelled output; any closing status has no `case` key (or repeats the
-read-back exactly). AC11 and AC15 keep their own closing rules.
+The shared read-back closing rule requires each read-back, whether sent with
+reply or as text, to be one bare JSON object for one message, never an array/list
+or several batched cases even when several case labels are listed. It makes
+that JSON the turn's only case-labelled
+output; any closing status has no `case` key (or repeats the read-back exactly).
+AC11 carries the same one-object requirement in its own prompt, without the
+shared closing rule, and keeps its byte-identical final JSON text. AC15 keeps
+its own prompt and closing rule. Arrays remain wrong read-backs under the
+unchanged oracle.
 
 For field-readback, command-prefix and sender-identity, `ai-scenario.sh` asks for the received BODY
 verbatim, preserving characters, whitespace and entity spelling with only

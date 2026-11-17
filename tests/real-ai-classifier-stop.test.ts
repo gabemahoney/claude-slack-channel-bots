@@ -1535,7 +1535,8 @@ test('AC15 prompt preserves every body character and makes the reply the only ca
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
-const readbackClosingRule = 'The read-back JSON must be the only case-labelled output in the turn; any closing status after it must have no `case` key (or repeat the read-back exactly).'
+const oneObjectReadbackRule = 'Each read-back, whether sent with reply or as text, must be ONE bare JSON object for one message, never an array or list. Do not batch several cases into one read-back, even when several case labels are listed.'
+const readbackClosingRule = oneObjectReadbackRule + ' The read-back JSON must be the only case-labelled output in the turn; any closing status after it must have no `case` key (or repeat the read-back exactly).'
 const baseReadbackPrompt = 'Answer the test requests in JSON without Markdown.'
 const corpusReadbackPrompt = ' For each message return {case:the corresponding case label in sequence,attributes:a map of all tag attributes and values,body:the message body}. For body, transcribe the received BODY verbatim, preserving every character, whitespace and entity spelling. Apply only JSON string escaping; do not reconstruct the original Slack text before delivery. Case labels are supplied below.'
 
@@ -1548,7 +1549,25 @@ function readbackPromptSetup(source: string): string {
   return 'real_persona() { if [[ "$1" == "aiac${AI_CRITERION}" ]]; then printf "%s\\n" "$2" > "$REAL_WORK/CLAUDE.md"; fi; }\n' + source.slice(start, end)
 }
 
-for (const criterion of [12, 20, 23, 106]) test(`AC${criterion} generated CLAUDE.md pins the shared read-back closing rule`, () => {
+test('AC11 generated CLAUDE.md pins its own one-object read-back and byte-identical final text without the shared closing rule', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ai-ac11-prompt-'))
+  try {
+    const source = readFileSync(new URL('./real-agent/ai-scenario.sh', import.meta.url), 'utf8')
+    const child = spawnSync('bash', ['-eu', '-c', readbackPromptSetup(source)], {
+      env: hostSafeChildEnv(root, { tools: ['bash'], extras: { AI_CRITERION: '11', REAL_WORK: root } }), encoding: 'utf8', timeout: 5000,
+    })
+    expect(child.error).toBeUndefined(); expect(child.signal).toBeNull(); expect(child.status).toBe(0)
+    expect(child.stderr).toBe('')
+    const prompt = readFileSync(join(root, 'CLAUDE.md'), 'utf8')
+    expect(prompt).toStartWith(baseReadbackPrompt + corpusReadbackPrompt)
+    expect(prompt).toContain(oneObjectReadbackRule)
+    expect(prompt).toContain('with the JSON read-back as the whole text.')
+    expect(prompt).toContain('After the one reply call, end your turn with one final text message that is exactly the same JSON read-back you sent in the reply, byte for byte, and nothing else:')
+    expect(prompt).not.toContain('The read-back JSON must be the only case-labelled output in the turn;')
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+for (const criterion of [12, 20, 23, 106]) test(`AC${criterion} generated CLAUDE.md pins the shared one-object read-back closing rule`, () => {
   const root = mkdtempSync(join(tmpdir(), 'ai-readback-prompt-'))
   try {
     const source = readFileSync(new URL('./real-agent/ai-scenario.sh', import.meta.url), 'utf8')
@@ -1561,7 +1580,7 @@ for (const criterion of [12, 20, 23, 106]) test(`AC${criterion} generated CLAUDE
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
-test('AC91 DM/thread requests pin the shared read-back closing clause with no CLAUDE.md', () => {
+test('AC91 DM/thread requests pin the shared one-object read-back closing clause with no CLAUDE.md', () => {
   const root = mkdtempSync(join(tmpdir(), 'ai-ac91-prompt-'))
   try {
     const source = readFileSync(new URL('./real-agent/ai-scenario.sh', import.meta.url), 'utf8')
