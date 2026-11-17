@@ -1535,6 +1535,71 @@ test('AC15 prompt preserves every body character and makes the reply the only ca
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
+const readbackClosingRule = 'The read-back JSON must be the only case-labelled output in the turn; any closing status after it must have no `case` key (or repeat the read-back exactly).'
+const baseReadbackPrompt = 'Answer the test requests in JSON without Markdown.'
+const corpusReadbackPrompt = ' For each message return {case:the corresponding case label in sequence,attributes:a map of all tag attributes and values,body:the message body}. For body, transcribe the received BODY verbatim, preserving every character, whitespace and entity spelling. Apply only JSON string escaping; do not reconstruct the original Slack text before delivery. Case labels are supplied below.'
+
+function readbackPromptSetup(source: string): string {
+  const start = source.indexOf('PROMPT=')
+  const end = source.indexOf('\n', source.indexOf('real_persona "aiac${AI_CRITERION}"'))
+  expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start)
+  // Execute only prompt construction with an inert persona writer, never
+  // scenario setup, a server start or a native/model call.
+  return 'real_persona() { if [[ "$1" == "aiac${AI_CRITERION}" ]]; then printf "%s\\n" "$2" > "$REAL_WORK/CLAUDE.md"; fi; }\n' + source.slice(start, end)
+}
+
+for (const criterion of [12, 20, 23, 106]) test(`AC${criterion} generated CLAUDE.md pins the shared read-back closing rule`, () => {
+  const root = mkdtempSync(join(tmpdir(), 'ai-readback-prompt-'))
+  try {
+    const source = readFileSync(new URL('./real-agent/ai-scenario.sh', import.meta.url), 'utf8')
+    const child = spawnSync('bash', ['-eu', '-c', readbackPromptSetup(source)], {
+      env: hostSafeChildEnv(root, { tools: ['bash'], extras: { AI_CRITERION: String(criterion), REAL_WORK: root } }), encoding: 'utf8', timeout: 5000,
+    })
+    expect(child.error).toBeUndefined(); expect(child.signal).toBeNull(); expect(child.status).toBe(0)
+    expect(child.stderr).toBe('')
+    expect(readFileSync(join(root, 'CLAUDE.md'), 'utf8')).toBe(baseReadbackPrompt + ([12, 20].includes(criterion) ? corpusReadbackPrompt : '') + ' ' + readbackClosingRule + '\n')
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+test('AC91 DM/thread requests pin the shared read-back closing clause with no CLAUDE.md', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ai-ac91-prompt-'))
+  try {
+    const source = readFileSync(new URL('./real-agent/ai-scenario.sh', import.meta.url), 'utf8')
+    const remove = source.indexOf('    if [[ "${AI_CRITERION}" == 91 ]]; then')
+    const request = source.indexOf('    elif [[ "${AI_CRITERION}" == 91 ]]; then')
+    expect(remove).toBeGreaterThan(0); expect(request).toBeGreaterThan(remove)
+    const script = readbackPromptSetup(source) + '\nreal_write_config() { :; }\n'
+      + source.slice(remove, source.indexOf('\n    fi', remove) + '\n    fi'.length)
+      + '\nreal_dm() { printf "%s\\n" "$2"; }\nslack_stub_push() { printf "%s\\n" "$2"; }\nreal_wait_delivery() { :; }\nreal_wait_idle() { :; }\n'
+      + source.slice(source.indexOf('\n', request) + 1, source.indexOf('        for kind in dm thread;', request))
+    const child = spawnSync('bash', ['-eu', '-c', script], {
+      env: hostSafeChildEnv(root, { tools: ['bash', 'rm', 'date', 'jq'], extras: { AI_CRITERION: '91', REAL_WORK: root, EXPECTED: root, REAL_LABEL: 'aiac91', REAL_KEY: 'aiac91', REAL_CHANNEL: 'C0AIAC91', REAL_USER: 'U0AIAC91' } }), encoding: 'utf8', timeout: 5000,
+    })
+    expect(child.error).toBeUndefined(); expect(child.signal).toBeNull(); expect(child.status).toBe(0)
+    expect(child.stderr).toBe('')
+    expect(() => readFileSync(join(root, 'CLAUDE.md'))).toThrow('ENOENT')
+    const [dm, thread] = child.stdout.trimEnd().split('\n')
+    expect(dm).toBe('Please reply here with exactly {"case":"AC91-DM","destination":"dm"} using the reply tool. ' + readbackClosingRule)
+    expect(JSON.parse(thread!).text).toBe('Please reply in this thread with exactly {"case":"AC91-thread","destination":"thread"} using the reply tool. ' + readbackClosingRule)
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+test.each([
+  ['exact reply + {"status":"sent"}', { status: 'sent' }, null],
+  ['exact reply + {"status":"sent","case":"AC23-resume"}', { status: 'sent', case: 'AC23-resume' }, 'AI read-back field differs'],
+] as const)('AC23 resume turn: %s', (_name, closing, failure) => {
+  const e = ordinaryEvidence()
+  const expected = { case: 'AC23-resume', user: 'stub-u0aiac23', user_id: 'U0AIAC23', chat_id: 'D0AIAC23', via: 'dm' }
+  e.reply.value.message.content = [{ type: 'tool_use', name: 'mcp__slack-channel-router__reply', id: 'post', input: { text: JSON.stringify(expected) } }]
+  e.reply.value.message.stop_reason = 'tool_use'
+  e.own.push(e.entry(26, { type: 'user', uuid: 'posted', parentUuid: e.reply.value.uuid,
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'post', content: 'posted' }] } }),
+    assistant(e, [{ type: 'text', text: JSON.stringify(closing) }], 27, { parentUuid: 'posted' }))
+  const read = () => completedAIReadback({ ...e, expected })
+  if (failure === null) expect(read().receipt_uuid).toBe('case3')
+  else expect(read).toThrow(/^AI read-back field differs$/)
+})
+
 test.each([false, true])('actual scenario checks again after idle, late retrieval=%s', late => {
   const root = mkdtempSync(join(tmpdir(), 'ai-ac15-shell-'))
   try {

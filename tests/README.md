@@ -1002,12 +1002,16 @@ observer; the shared `real-case-assertions.ts` comparator is unchanged.
 | `test-103-fmk-real-latency100.sh` | The 100-DM latency step: reply-tool persona, one unmeasured warm-up DM, AC76 admission before each sample; p95 limits over the last 100 inputs, receipt/FIFO audit over all 101 |
 | `test-104-fmk-real-idle-compact.sh` | Uncertain AD text outcome with three ordered receipt-confirmed queued messages |
 | `test-111-fmk-real-ai-ac11.sh` | Audited AI wrapper copy attributes/body read-back through completed native turns; case_03 also rejects spoof obedience across every copy and late linked response |
-| `test-112-fmk-real-ai-ac12.sh` | Prefix hazards read as text, with no native shell-input or Bash tool action |
+| `test-112-fmk-real-ai-ac12.sh` | Prefix hazards read as text, with no native shell-input or Bash tool action; shared read-back closing rule in CLAUDE.md |
 | `test-115-fmk-real-ai-ac15.sh` | Multipart reassembly into one 5,000-character message, trailing space included; one case-labelled reply and closing status without `case`; reply-only exchange checks and exact completed final read-back repeated after idle |
-| `test-120-fmk-real-ai-ac20.sh` | Outer sender identity despite body spoofing/attribute quoting |
-| `test-123-fmk-real-ai-ac23.sh` | Sender read-back and reply after compact/resume |
-| `test-191-fmk-real-ai-ac91.sh` | DM/thread replies without an operator prompt file |
-| `test-206-fmk-real-ai-ac106.sh` | Duplicate copy recognized as one logical DM |
+| `test-120-fmk-real-ai-ac20.sh` | Outer sender identity despite body spoofing/attribute quoting; shared read-back closing rule in CLAUDE.md |
+| `test-123-fmk-real-ai-ac23.sh` | Sender read-back and reply after compact/resume; shared read-back closing rule reloaded from CLAUDE.md |
+| `test-191-fmk-real-ai-ac91.sh` | DM/thread replies without an operator prompt file; shared read-back closing clause in both requests |
+| `test-206-fmk-real-ai-ac106.sh` | Duplicate copy recognized as one logical DM; shared read-back closing rule in CLAUDE.md |
+
+The shared read-back closing rule makes the read-back JSON the turn's only
+case-labelled output; any closing status has no `case` key (or repeats the
+read-back exactly). AC11 and AC15 keep their own closing rules.
 
 For field-readback, command-prefix and sender-identity, `ai-scenario.sh` asks for the received BODY
 verbatim, preserving characters, whitespace and entity spelling with only

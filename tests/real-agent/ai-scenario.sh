@@ -27,6 +27,7 @@ ai_spoof_readback() {
 }
 real_prepare "${REAL_AGENT_CLAUDE_VERSION:-2.1.296}" mcp__slack-channel-router__reply
 PROMPT='Answer the test requests in JSON without Markdown.'
+READBACK_CLOSING_RULE='The read-back JSON must be the only case-labelled output in the turn; any closing status after it must have no `case` key (or repeat the read-back exactly).'
 if [[ "${AI_CRITERION}" == 11 || "${AI_CRITERION}" == 12 || "${AI_CRITERION}" == 20 ]]; then
     PROMPT+=' For each message return {case:the corresponding case label in sequence,attributes:a map of all tag attributes and values,body:the message body}. For body, transcribe the received BODY verbatim, preserving every character, whitespace and entity spelling. Apply only JSON string escaping; do not reconstruct the original Slack text before delivery. Case labels are supplied below.'
     if [[ "${AI_CRITERION}" == 11 ]]; then
@@ -35,6 +36,9 @@ if [[ "${AI_CRITERION}" == 11 || "${AI_CRITERION}" == 12 || "${AI_CRITERION}" ==
     # A second configured recipient is needed for the reference corpus's
     # receive_all_shared case. The stub pushes only to the tested persona.
     real_persona corpuspeer
+fi
+if [[ "${AI_CRITERION}" == 12 || "${AI_CRITERION}" == 20 || "${AI_CRITERION}" == 23 || "${AI_CRITERION}" == 106 ]]; then
+    PROMPT+=" ${READBACK_CLOSING_RULE}"
 fi
 real_persona "aiac${AI_CRITERION}" "${PROMPT}"
 if [[ "${AI_CRITERION}" == 11 || "${AI_CRITERION}" == 12 || "${AI_CRITERION}" == 20 ]]; then
@@ -241,11 +245,11 @@ AC15_BODY
         done
     elif [[ "${AI_CRITERION}" == 91 ]]; then
         # No operator prompt file or working-directory CLAUDE.md exists.
-        real_dm "${REAL_LABEL}" 'Please reply here with exactly {"case":"AC91-DM","destination":"dm"} using the reply tool.'
+        real_dm "${REAL_LABEL}" 'Please reply here with exactly {"case":"AC91-DM","destination":"dm"} using the reply tool. '"${READBACK_CLOSING_RULE}"
         real_wait_delivery "${REAL_KEY}" 1
         real_wait_idle "${REAL_KEY}"
         THREAD="$(date +%s.%6N)"
-        slack_stub_push "${REAL_LABEL}" "$(jq -cn --arg ch "${REAL_CHANNEL}" --arg u "${REAL_USER}" --arg ts "$(date +%s.%6N)" --arg th "${THREAD}" '{type:"message",channel:$ch,channel_type:"channel",user:$u,ts:$ts,thread_ts:$th,text:"Please reply in this thread with exactly {\"case\":\"AC91-thread\",\"destination\":\"thread\"} using the reply tool."}')"
+        slack_stub_push "${REAL_LABEL}" "$(jq -cn --arg ch "${REAL_CHANNEL}" --arg u "${REAL_USER}" --arg ts "$(date +%s.%6N)" --arg th "${THREAD}" --arg closing "${READBACK_CLOSING_RULE}" '{type:"message",channel:$ch,channel_type:"channel",user:$u,ts:$ts,thread_ts:$th,text:("Please reply in this thread with exactly {\"case\":\"AC91-thread\",\"destination\":\"thread\"} using the reply tool. "+$closing)}')"
         real_wait_delivery "${REAL_KEY}" 2
         printf '{"case":"AC91-DM","destination":"dm"}\n' > "${EXPECTED}/dm.json"
         printf '{"case":"AC91-thread","destination":"thread"}\n' > "${EXPECTED}/thread.json"
