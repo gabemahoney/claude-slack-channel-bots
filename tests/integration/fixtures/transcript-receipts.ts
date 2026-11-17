@@ -189,6 +189,13 @@ export function shimWords(input: string): string[] {
   return result
 }
 export interface ShimSend { at: number; text: string; words: string[]; instanceId?: string }
+/** The unterminated tail of a captured append may still be being written. */
+export function completeShimLog(log: string): string {
+  return log.slice(0, log.lastIndexOf('\n') + 1)
+}
+export function readShimLog(path: string): string {
+  return completeShimLog(readFileSync(path, 'utf8'))
+}
 function argument(words: readonly string[], flag: string): string | undefined {
   const index = words.indexOf(flag)
   return index >= 0 ? words[index + 1] : words.find(w => w.startsWith(flag + '='))?.slice(flag.length + 1)
@@ -354,7 +361,7 @@ export function auditReceipts(options: AuditOptions, entries: readonly Transcrip
   const log = readFileSync(join(options.stateDir, 'server.log'), 'utf8').split('\n')
   const ownEntries = personaTranscripts(options.key, journal, log, entries)
   const takes = receiptTakes(ownEntries)
-  const sends = shimSends(readFileSync(options.shimLog, 'utf8')).filter(s => s.instanceId === `cscb_${options.key}`)
+  const sends = shimSends(readShimLog(options.shimLog)).filter(s => s.instanceId === `cscb_${options.key}`)
   let previousAppearance = -1, previousDelivered = -Infinity, duplicates = 0
   const timings: { seq: number; typing_ms: number; delivery_ms: number }[] = []
   for (const item of accepted) {
@@ -578,7 +585,7 @@ if (import.meta.main) {
       const audited = auditReceipts({ stateDir, key, shimLog, transcripts }, readTranscripts(transcripts, adapters), adapters)
       console.log(receiptsRecord(audited, transcripts.length))
       process.exit(threadLatency({ key, channel, samples, delayed, hung, scenario, mode: mode as ThreadLatencyOptions['mode'] },
-        audited.timings, receiptJournal(stateDir, key), shimSends(readFileSync(shimLog, 'utf8'))))
+        audited.timings, receiptJournal(stateDir, key), shimSends(readShimLog(shimLog))))
     }
     const [command, stateDir, key, shimLog, root, count, mode, statusFile] = process.argv.slice(2)
     if (!stateDir || !key || !shimLog || !root || !['audit', 'ready', 'progress', 'latency', 'diagnostic'].includes(command ?? '')) throw new Error('Usage: transcript-receipts <audit|ready|progress|latency|diagnostic> <state-dir> <key> <shim-log> <transcript-root> [count] [no-retype]')

@@ -1,11 +1,11 @@
 /** Import-safe independent audit of the actual queue, shim and native rollout.
  * Delivery assertions never require assistant prose or turn completion. */
-import { shimWords } from '../integration/fixtures/transcript-receipts.ts'
+import { completeShimLog, shimWords } from '../integration/fixtures/transcript-receipts.ts'
 import type { CodexRollout } from './codex-evidence.ts'
 import { requireEvidence } from './codex-ai.ts'
 
 export function codexShimCalls(log: string) {
-  return log.split('\n').filter(line => line.startsWith('call\t')).map(line => {
+  return completeShimLog(log).split('\n').filter(line => line.startsWith('call\t')).map(line => {
     const fields = line.split('\t')
     requireEvidence(fields.length === 6 && Number.isFinite(Number(fields[1])), 'invalid shim call')
     const words = shimWords(fields[5]!)

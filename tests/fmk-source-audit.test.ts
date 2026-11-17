@@ -1934,7 +1934,7 @@ printf 'RESULT=%s' "$?"`, ['cat', 'jq', 'awk'])
     if (mode === 'wrong-outcome') records[1]!.outcome = 'ErrDialogMaybeOpen'
     if (mode === 'missing-result') records.splice(1, 1)
     if (mode === 'unrelated-child-noise') records.splice(1, 0, { ...records[2]!, caller_pid: 109, ts: '1970-01-01T00:00:02.600Z' })
-    writeFileSync(join(home, 'shim.log'), log.map(row => row.join('\t')).join('\n'))
+    writeFileSync(join(home, 'shim.log'), log.map(row => row.join('\t')).join('\n') + '\n')
     writeFileSync(join(home, 'ad-trail.jsonl'), records.map(record => JSON.stringify(record)).join('\n'))
     writeFileSync(join(home, 'processes'), 'proc\tserver\t42\t1\t0.000000\tbun server.ts\n')
     const correlate = helper('_scenario_reconnect_outcomes')

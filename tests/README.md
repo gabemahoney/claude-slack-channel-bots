@@ -2858,6 +2858,8 @@ on, then prints the next such line (`cscb_ad_calls`' line `<count-before>` +
 Readers for the latch scenarios (fmk mode; harness additions
 ). Test 15 and the latch scenarios read the logs through these;
 `scenario.sh`'s header gives each one's arguments and output.
+Readers ignore an unterminated last shim-log line, which may still be being
+written; complete malformed lines still fail.
 
 - Marks. `ad_shim_mark` and `tmux_shim_mark` print a shim log's position
   now (how many lines it holds, 0 with no log). A reader taking
