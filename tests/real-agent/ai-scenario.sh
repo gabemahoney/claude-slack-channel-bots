@@ -8,8 +8,10 @@ CASE_ASSERT="${SCENARIO_FIXTURES}/real-case-assertions.ts"
 case_assert() { bun "${CASE_ASSERT}" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${@:2}"; }
 # Decision 18: fail before any model launch if the reviewed AI inputs drift.
 bun "${BASH_SOURCE[0]%/*}/ai-fixture-audit.ts"
-# Bind ordinary answers to an explicit durable item, its final part and native
-# turn. The shared transport comparator does not establish response provenance.
+# Pass original-input ordinals; TS oracles resolve durable items with reminders
+# excluded. Counted real_wait_delivery calls count originals and audit every
+# receipt, including reminders, before checking the selected field's answer.
+# The shared transport comparator does not establish response provenance.
 ai_readback() {
     bun "${BASH_SOURCE[0]%/*}/ai-readback.ts" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "$1" "$2"
 }
@@ -231,6 +233,7 @@ AC15_BODY
             real_wait_delivery "${REAL_KEY}"
             jq -n --arg c "AC23-${stage}" --arg u "stub-${REAL_USER,,}" --arg id "${REAL_USER}" --arg ch "D0${REAL_LABEL^^}" '{case:$c,user:$u,user_id:$id,chat_id:$ch,via:"dm"}' > "${EXPECTED}/${stage}.json"
             if [[ "${stage}" == compact ]]; then READBACK_SEQ=2; else READBACK_SEQ=3; fi
+            real_wait_delivery "${REAL_KEY}" "${READBACK_SEQ}"
             wait_until 180 'AC23 sender readback differs' ai_readback "${EXPECTED}/${stage}.json" "${READBACK_SEQ}"
             jq -n --arg dm "D0${REAL_LABEL^^}" --slurpfile expected "${EXPECTED}/${stage}.json" '[{channel:$dm,json:$expected[0]}]' > "${EXPECTED}/reply-${stage}.json"
             wait_until 180 'AC23 readback was not posted using reply' case_assert posts "${SCENARIO_SLACK_RECORD}" "${EXPECTED}/reply-${stage}.json"
@@ -247,8 +250,8 @@ AC15_BODY
         printf '{"case":"AC91-DM","destination":"dm"}\n' > "${EXPECTED}/dm.json"
         printf '{"case":"AC91-thread","destination":"thread"}\n' > "${EXPECTED}/thread.json"
         for kind in dm thread; do
-            if [[ "${kind}" == dm ]]; then READBACK_SEQ=1; else READBACK_SEQ=2; fi
-            wait_until 180 "AC91 ${kind} JSON differs" ai_readback "${EXPECTED}/${kind}.json" "${READBACK_SEQ}"
+            if [[ "${kind}" == dm ]]; then READBACK_ORDINAL=1; else READBACK_ORDINAL=2; fi
+            wait_until 180 "AC91 ${kind} JSON differs" ai_readback "${EXPECTED}/${kind}.json" "${READBACK_ORDINAL}"
         done
         jq -n --arg dm "D0${REAL_LABEL^^}" --arg ch "${REAL_CHANNEL}" --arg th "${THREAD}" '[{channel:$dm,text:"{\"case\":\"AC91-DM\",\"destination\":\"dm\"}"},{channel:$ch,thread_ts:$th,text:"{\"case\":\"AC91-thread\",\"destination\":\"thread\"}"}]' > "${EXPECTED}/posts.json"
         wait_until 180 'AC91 reply destination/thread mismatch' case_assert posts "${SCENARIO_SLACK_RECORD}" "${EXPECTED}/posts.json"

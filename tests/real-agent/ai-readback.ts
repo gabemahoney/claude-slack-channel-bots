@@ -2,7 +2,7 @@
  * supply JSON; the shared transport comparator is deliberately unchanged. */
 import { existsSync, readFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
-import { auditReceipts, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, transcriptFiles, type ReceiptAdapters, type TranscriptEntry } from '../integration/fixtures/transcript-receipts.ts'
+import { auditReceipts, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, transcriptFiles, workloadItem, type ReceiptAdapters, type TranscriptEntry } from '../integration/fixtures/transcript-receipts.ts'
 import { parseReadbackJSON, readbackMismatch } from './ai-mismatch-diagnostics.ts'
 import { AI_FAILURE_PREFIX, diagnosticValue, reportFailureOnce, scrubDiagnosticText } from './ai-failure-diagnostics.ts'
 
@@ -237,12 +237,14 @@ function assertAC15Exchange(parts: string[], acceptedAt: number, seq: number, jo
   }
 }
 
-export function completedAIReadback({ seq, expected, journal, own, adapters, model, key, log = [], onMismatch }: {
+/** The input `seq` is a scenario ordinal; returned seq is the durable item. */
+export function completedAIReadback({ seq: ordinal, expected, journal, own, adapters, model, key, log = [], onMismatch }: {
   seq: number; expected: any; journal: any[]; own: TranscriptEntry[]; adapters: ReceiptAdapters; model: string
   key?: string; log?: readonly string[]
   onMismatch?: (record: ReturnType<typeof readbackMismatch> & { responseUuid?: unknown; stopReason?: unknown }) => void
 }) {
-  check(Number.isSafeInteger(seq) && seq > 0 && typeof expected?.case === 'string' && safeSelectedModel(model), 'AI readback identity missing')
+  check(Number.isSafeInteger(ordinal) && ordinal > 0 && typeof expected?.case === 'string' && safeSelectedModel(model), 'AI readback identity missing')
+  const { seq } = workloadItem(journal, ordinal)
   const one = (kind: string, part?: number) => {
     const rows = journal.filter(r => r.kind === kind && r.seq === seq && !r.compact && (part === undefined || r.part === part))
     check(rows.length === 1, 'AI readback has missing/ambiguous ' + kind)
@@ -268,7 +270,7 @@ export function completedAIReadback({ seq, expected, journal, own, adapters, mod
     'AI readback receipt has no native send window')
   }
   if (expected.case === "AC15") assertAC15Exchange(fixed.parts, accepted.received_at, seq, journal, own, adapters, bound)
-  // Reassembly answers belong to the final delivered part. Explicit seqs also
+  // Reassembly answers belong to the final delivered part. Explicit ordinals also
   // preserve earlier DM checks after a later thread and across resume sessions.
   const receipt = take!
   const session = own.filter(e => e.path === receipt.path && e.value?.sessionId === receipt.value.sessionId
@@ -330,17 +332,18 @@ export function completedAIReadback({ seq, expected, journal, own, adapters, mod
 if (import.meta.main) {
   try {
     check(existsSync('/etc/cscb-ci-image'), 'AI readback requires the CI image')
-    const [state, key, shim, root, expectedPath, seq] = process.argv.slice(2)
+    const [state, key, shim, root, expectedPath, ordinal] = process.argv.slice(2)
     const adapters = await packedReceiptAdapters(), paths = transcriptFiles(root!)
     const all = readTranscripts(paths, adapters), journal = receiptJournal(state!, key!)
     auditReceipts({ stateDir: state!, key: key!, shimLog: shim!, transcripts: paths }, all, adapters)
     const log = readFileSync(join(state!, 'server.log'), 'utf8').split('\n')
     const own = personaTranscripts(key!, journal, log, all)
     const expected = JSON.parse(readFileSync(expectedPath!, 'utf8'))
-    const result = completedAIReadback({ seq: Number(seq), expected,
+    const result = completedAIReadback({ seq: Number(ordinal), expected,
       journal, own, adapters, key, log, model: process.env.REAL_AGENT_MODEL_PIN ?? '', onMismatch: record => {
         const line = AI_FAILURE_PREFIX + scrubDiagnosticText(JSON.stringify({ event: 'readback-mismatch',
-          agent: 'claude', scenario: 'ai-readback', case: expected.case, seq: Number(seq), trial: process.env.REAL_AGENT_TRIAL, record }))
+          agent: 'claude', scenario: 'ai-readback', case: expected.case, ordinal: Number(ordinal),
+          seq: workloadItem(journal, Number(ordinal)).seq, trial: process.env.REAL_AGENT_TRIAL, record }))
         reportFailureOnce(join(state!, 'ai-readback-mismatches.json'), line, console.log)
       } })
     console.log('recorded: AI current-turn field comparison ' + JSON.stringify({ criterion: process.env.AI_CRITERION,

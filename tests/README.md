@@ -1042,7 +1042,7 @@ byte-identical, and original `ex3_peer_bot_spoof` stays exact.
 | `tests/real-agent/fixtures/input-audit.json` | Records each of the 15 cases, all seven criteria's generated/inline inputs and prompts (including multipart response/tool discipline), differences and reasons, canonical/AI SHA-256 values and reviewed input-source hashes. |
 | `tests/real-agent/ai-fixture-audit.ts` | Validates the AI copy against the canonical corpus, approved difference, case order/mapping and reviewed source hashes before generation or classifier observation; never rewrites inputs. Input-source changes require a fresh complete audit. |
 | `tests/real-agent/ai-no-shell.ts` | field-readback/command-prefix observer rejecting native bash records or any assistant Bash tool request, including an action beside otherwise exact JSON. |
-| `tests/real-agent/ai-readback.ts` | Ordinary read-back observer requiring an explicit queue sequence, every part's exact durable native receipt and send window, and exact JSON from the selected model's parent-linked completed response in the final part's own session/path. Records criterion, trial, case and `actual_model` from native completion; leaves the shared comparator unchanged. |
+| `tests/real-agent/ai-readback.ts` | Ordinary read-back observer requiring an explicit original-input ordinal mapped through `workloadItem` to the durable queue sequence (excluding reminders), every part's exact durable native receipt and send window, and exact JSON from the selected model's parent-linked completed response in the final part's own session/path. Records criterion, trial, case and `actual_model` from native completion; leaves the shared comparator unchanged. |
 | `tests/real-agent/ai-fresh-session.ts` | Proves each `hz_*` case and AC11's case_03 spoof has an exact durable receipt in a unique own native session/path, with no other fixture wrapper or message identity. Uses the packed matcher, including native `pasted_content`, and records the session proof in `isolation-sessions.jsonl`. |
 
 The one-pass audit covers every AI fixture and all seven criteria's
@@ -1135,10 +1135,15 @@ streaming records may share the same native message identity.
 
 
 The field-readback, command-prefix and sender-identity scenarios
-use each case's sequence, including field-readback case_03 at sequence 3. The multipart scenario
-uses sequence 1 and the final multipart receipt; compact/resume uses sequences 2/3
-after compact/resume; DM/thread checks DM sequence 1 and thread sequence 2 even
-after both arrive; duplicate-DM checks the counting query at sequence 2.
+pass each case's original-input ordinal, including field-readback case_03 at ordinal 3.
+The multipart scenario uses ordinal 1 and the final multipart receipt; compact/resume
+uses ordinals 2/3; DM/thread checks DM ordinal 1 and thread ordinal 2 even after
+both arrive; duplicate-DM checks the counting query at ordinal 2. The TS oracles
+map these ordinals through the cumulative journal with `workloadItem`; reminders
+never occupy an ordinal. Counted delivery waits count original inputs; all delivery
+waits audit every receipt, including reminders. After its early count-free wait,
+AC23 waits with the stage's original ordinal before starting its bounded read-back
+poll. Missing or ambiguous field evidence fails without a raw-seq fallback.
 
 The multipart scenario requests visible JSON on every turn; if the requested read-back is
 not yet available, send `{"status":"received"}` and finish that turn. Do not
@@ -1194,7 +1199,7 @@ read-back may be text or a correctly addressed Slack reply.
 Classifier stops, refusal diagnostics, synthetic responses, generic API
 errors and model fallback (including HTTP 403) fail even beside exact JSON
 or when linked to the spoof after a later take-in. The guard also invokes
-the ordinary `ai-readback.ts` oracle at sequence 3; `ai-scenario.sh`
+the ordinary `ai-readback.ts` oracle at original-input ordinal 3; `ai-scenario.sh`
 requires that oracle explicitly as well, and repeats the checks after idle.
 Polling and final checks emit no accepted `recorded: classifier-stop`
 line; the former `stop` mode is invalid. Every case retains its exact JSON
@@ -1208,7 +1213,7 @@ completion, linked reply/tool-result completion, multipart final-part
 responses, resumed sessions and earlier DM answers after a later thread.
 It rejects classifier stops before, beside or after exact JSON, including
 late linked stops, fallback/API errors, synthetic answers and incomplete
-duplicates. Shell controls require sequence 3 and check silent successful
+duplicates. Shell controls require ordinal 3 and check silent successful
 final observation; a separate control rejects the withdrawn `stop` mode. For
 `via=mention` cases, the generator's expected body and corpus wrapper keep the
 recipient mention (`<@recipient> `). The spoof CLI accepts the delivered
@@ -1250,7 +1255,7 @@ or unlinked completion, refusal/API errors and missing or wrong durable
 receipts. Positive controls cover own completed and streaming answers,
 linked reply/tool-result completion, multipart final-part responses,
 resume-session identity and an earlier DM checked after a later thread.
-Additional case_03 CLI controls require ordinary sequence-3 read-back and
+Additional case_03 CLI controls require ordinary ordinal-3 read-back and
 independently completed duplicate copies. They reject classifier stops
 with or without exact JSON, late linked stops, synthetic/API-error answers,
 fallback, unfinished duplicates and spoof actions, and reject `stop` mode.

@@ -1,15 +1,19 @@
 /**  hazard isolation, checked against packed-production receipts. */
 import { appendFileSync, existsSync, readFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
-import { auditReceipts, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, transcriptFiles, type ReceiptAdapters, type TranscriptEntry } from '../integration/fixtures/transcript-receipts.ts'
+import { auditReceipts, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, transcriptFiles, workloadItem, type ReceiptAdapters, type TranscriptEntry } from '../integration/fixtures/transcript-receipts.ts'
 
 function check(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason) }
-export function freshHazardSession({ seq, corpus, journal, own, adapters, previous }: {
+/** The input `seq` indexes the corpus; proof/history seqs are durable items. */
+export function freshHazardSession({ seq: ordinal, corpus, journal, own, adapters, previous }: {
   seq: number; corpus: any[]; journal: any[]; own: TranscriptEntry[]; adapters: ReceiptAdapters;
   previous: { seq: number; session: string }[]
 }) {
-  const fixture = corpus[seq - 1]
-  check(Number.isSafeInteger(seq) && (fixture?.name.startsWith('hz_') || fixture?.name === 'ex3_peer_bot_spoof'), 'isolation proof requires hazard case')
+  const fixture = corpus[ordinal - 1]
+  check(Number.isSafeInteger(ordinal) && (fixture?.name.startsWith('hz_') || fixture?.name === 'ex3_peer_bot_spoof'), 'isolation proof requires hazard case')
+  const { seq } = workloadItem(journal, ordinal)
+  check(journal.filter(r => r.kind === 'accepted' && !r.compact && r.seq === seq).length === 1,
+    'hazard acceptance missing or ambiguous')
   const delivered = journal.filter(r => r.kind === 'delivered' && r.seq === seq && !r.compact)
   check(delivered.length === 1, 'hazard must have one exact durable receipt')
   const matches = own.filter(e => e.path === delivered[0].receipt?.path && e.uuid === delivered[0].receipt?.uuid)
@@ -24,7 +28,7 @@ export function freshHazardSession({ seq, corpus, journal, own, adapters, previo
   check(journal.filter(r => r.kind === 'sent' && r.seq !== seq).every(r => r.session_id !== session), 'hazard reused earlier delivery session')
   check(previous.every(p => p.seq !== seq && p.session !== session), 'hazard session repeated')
   const native = own.filter(e => e.path === path)
-  for (const [index, row] of corpus.entries()) if (index !== seq - 1) {
+  for (const [index, row] of corpus.entries()) if (index !== ordinal - 1) {
     check(!native.some(e => typeof e.text === 'string' && adapters.receiptTextMatches(e.text, row.typed)), 'hazard transcript contains another fixture wrapper')
     check(!native.some(e => JSON.stringify(e.value).includes(row.msg.message_id ?? row.msg.ts)), 'hazard transcript contains another fixture message identity')
   }
@@ -39,12 +43,12 @@ if (import.meta.main) {
   try {
     check(existsSync('/etc/cscb-ci-image'), 'isolation proof requires CI image')
     const [state, key, shim, root, corpusPath, number, history] = process.argv.slice(2)
-    const seq = Number(number), adapters = await packedReceiptAdapters(), paths = transcriptFiles(root!)
+    const ordinal = Number(number), adapters = await packedReceiptAdapters(), paths = transcriptFiles(root!)
     const all = readTranscripts(paths, adapters), journal = receiptJournal(state!, key!)
-    auditReceipts({ stateDir: state!, key: key!, shimLog: shim!, transcripts: paths, expectedCount: seq }, all, adapters)
+    auditReceipts({ stateDir: state!, key: key!, shimLog: shim!, transcripts: paths, expectedCount: ordinal }, all, adapters)
     const own = personaTranscripts(key!, journal, readFileSync(join(state!, 'server.log'), 'utf8').split('\n'), all)
     const previous = existsSync(history!) ? readFileSync(history!, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line)) : []
-    const proof = freshHazardSession({ seq, corpus: JSON.parse(readFileSync(corpusPath!, 'utf8')), journal, own, adapters, previous })
+    const proof = freshHazardSession({ seq: ordinal, corpus: JSON.parse(readFileSync(corpusPath!, 'utf8')), journal, own, adapters, previous })
     appendFileSync(history!, JSON.stringify(proof) + '\n', { mode: 0o600 })
     console.log('recorded: AI fresh session isolation ' + JSON.stringify(proof))
   } catch (error) { console.error(error instanceof Error ? error.message : 'AI isolation proof failed'); process.exitCode = 1 }

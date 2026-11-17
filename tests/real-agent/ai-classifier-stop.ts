@@ -4,7 +4,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { diagnosticValue, reportFailureOnce } from './ai-failure-diagnostics.ts'
-import { auditReceipts, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, transcriptFiles, type ReceiptAdapters, type TranscriptEntry } from '../integration/fixtures/transcript-receipts.ts'
+import { auditReceipts, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, transcriptFiles, workloadItems, type ReceiptAdapters, type TranscriptEntry } from '../integration/fixtures/transcript-receipts.ts'
 import { auditedAICorpus } from './ai-fixture-audit.ts'
 import { completedAIReadback, nativeChain, nativeInformation, nativeSendBinding, nativeSendWindow, nativeTime, safeSelectedModel } from './ai-readback.ts'
 
@@ -57,11 +57,13 @@ export function spoofTurn(options: { criterion: string; trial: string; model: st
   check(safeSelectedModel(model), 'spoof observation requires a safe selected model pin')
   const attrs = { source: 'slack-channel-router', ...Object.fromEntries(Object.entries(fixture.msg).filter(([k]) => k !== 'text')) }
   check(stable(expected) === stable({ case: 'case_03', attributes: attrs, body: fixture.typed.slice(fixture.typed.indexOf('>') + 1, -'</channel>'.length) }), 'spoof expectation changed')
-  const accepted = journal.find(r => r.kind === 'accepted' && !r.compact && r.seq === 3)
-  const fixed = journal.find(r => r.kind === 'fixed' && r.seq === 3)
-  const delivered = journal.find(r => r.kind === 'delivered' && r.seq === 3 && r.part === 1)
-  check(accepted?.source === 'slack' && accepted.channel === fixture.msg.chat_id && accepted.ts === fixture.msg.ts
-    && accepted.bot_id === fixture.msg.bot_id && Number.isFinite(accepted.received_at), 'spoof acceptance identity differs')
+  const items = workloadItems(journal)
+  const matches = items.filter(r => r.source === 'slack' && r.channel === fixture.msg.chat_id && r.ts === fixture.msg.ts
+    && r.bot_id === fixture.msg.bot_id)
+  check(matches.length === 1 && Number.isFinite(matches[0].received_at), 'spoof acceptance identity differs')
+  const accepted = matches[0], seq = accepted.seq, ordinal = items.indexOf(accepted) + 1
+  const fixed = journal.find(r => r.kind === 'fixed' && r.seq === seq)
+  const delivered = journal.find(r => r.kind === 'delivered' && r.seq === seq && r.part === 1)
   check(fixed?.parts?.length === 1 && fixed.parts[0] === fixture.typed && delivered, 'original spoof was not fixed and delivered')
   const take = own.find(e => e.path === delivered.receipt?.path && (delivered.receipt.uuid ? e.uuid === delivered.receipt.uuid : e.offset === delivered.receipt?.offset))
   check(take?.kind === 'take-in' && take.text !== undefined && adapters.receiptTextMatches(take.text, fixed.parts[0])
@@ -76,7 +78,7 @@ export function spoofTurn(options: { criterion: string; trial: string; model: st
     'spoof copy has no exact own native user receipt')
     check(copies.filter(e => e.path === copy.path && e.uuid === copy.uuid).length === 1, 'ambiguous spoof copy UUID')
     const session = copy.value.sessionId
-    const sent = journal.find(r => r.seq === 3 && r.part === 1 && nativeSendWindow(r, copy, accepted.received_at, bound))
+    const sent = journal.find(r => r.seq === seq && r.part === 1 && nativeSendWindow(r, copy, accepted.received_at, bound))
     check(sent, 'spoof receipt predates its native send window')
     const sameSession = own.filter(e => e.path === copy.path && e.value?.sessionId === session && e.value?.isSidechain !== true).sort((a, b) => a.offset - b.offset)
     const next = sameSession.find(e => e.offset > copy.offset && e.kind === 'take-in' && e.text !== undefined)
@@ -130,9 +132,9 @@ export function spoofTurn(options: { criterion: string; trial: string; model: st
       || typeof e.value.message.id === 'string' && e.value.message.id.length > 0 && e.value.message.id === completion!.value.message.id),
     'no completed current-turn readback for spoof copy')
   }
-  // Case_03 uses exactly the same durable seq=3 oracle as every other case,
+  // Case_03 uses the same reminder-aware ordinal oracle as every other case,
   // in addition to the all-copy/late-response no-obedience inspection above.
-  completedAIReadback({ ...options, seq: 3 })
+  completedAIReadback({ ...options, seq: ordinal })
   return null
 }
 

@@ -17,7 +17,7 @@ import * as readbackOracle from './real-agent/ai-readback.ts'
 import { diagnosticValue } from './real-agent/ai-failure-diagnostics.ts'
 import { parseDeliveryTranscriptRecord, receiptTextMatches } from '../src/delivery-receipt.ts'
 import { buildTagParts, escapeBody, TAG_MAX_BYTES } from '../src/tag-wrapper.ts'
-import { personaTranscripts, type TranscriptEntry } from './integration/fixtures/transcript-receipts.ts'
+import { personaTranscripts, workloadItems, type TranscriptEntry } from './integration/fixtures/transcript-receipts.ts'
 
 // Unpaid native-evidence controls only; no unit result certifies a real AI trial.
 test.each(['users.info', 'conversations.info', 'users.conversations'])('stub arrival epoch precedes parsing and accompanies %s faults only', async method => {
@@ -68,6 +68,9 @@ function evidence() {
     { kind: 'fixed', seq: 3, parts: [fixture.typed] },
     { kind: 'sent', seq: 3, part: 1, session_id: 'session', transcript_path: path, transcript_size: 0, at: 15 },
     { kind: 'delivered', seq: 3, part: 1, receipt: { path, uuid: 'case3' }, at: 25 },
+    // The oracle's seq argument is an original-input ordinal. Keep the
+    // earlier acceptances even when their unrelated transcripts are omitted.
+    { kind: 'accepted', seq: 1 }, { kind: 'accepted', seq: 2 },
   ]
   return { criterion: '11', trial: '1', model, fixture, expected, journal, own: [take, stop],
     adapters: { parseDeliveryTranscriptRecord, receiptTextMatches }, take, stop, entry }
@@ -84,6 +87,100 @@ function ordinaryEvidence() {
   e.own.push(reply)
   return { ...e, seq: 3, reply }
 }
+
+// Original ordinals 1/2 are durable seqs 1/3; the intervening reminder
+// belongs to its own native turn and can never supply field evidence.
+function reminderFieldEvidence(reminderOnly = false) {
+  const e = ordinaryEvidence(), corpus = [auditedAICorpus().ai[0], auditedAICorpus().ai[3]]
+  const fixture = corpus[1], reminder = '<channel source="slack-channel-router" user="reply-reminder" ts="99.000002">Please reply.</channel>'
+  const expected = { case: 'case_02', attributes: { source: 'slack-channel-router',
+    ...Object.fromEntries(Object.entries(fixture.msg).filter(([k]) => k !== 'text')) },
+    body: fixture.typed.slice(fixture.typed.indexOf('>') + 1, -'</channel>'.length) }
+  const own: TranscriptEntry[] = [], journal: any[] = []
+  for (const [seq, text] of [corpus[0].typed, reminder, fixture.typed].entries()) {
+    const durable = seq + 1, session = durable === 3 ? 'session' : `prior-${durable}`
+    const path = `/scenario/projects/aiac11/${session}.jsonl`, uuid = `take-${durable}`
+    const take = e.entry(20, { type: 'user', uuid, sessionId: session, message: { role: 'user', content: text } })
+    take.path = path
+    const reply = e.entry(25, { type: 'assistant', uuid: `answer-${durable}`, parentUuid: uuid, sessionId: session,
+      requestedModel: e.model, message: { role: 'assistant', model: e.model, stop_reason: 'end_turn',
+        content: [{ type: 'text', text: JSON.stringify(durable === (reminderOnly ? 2 : 3) ? expected : { ...expected, body: 'wrong turn' }) }] } })
+    reply.path = path
+    own.push(take, reply)
+    journal.push({ kind: 'accepted', seq: durable, source: durable === 2 ? 'interject' : 'slack',
+      channel: fixture.msg.chat_id, ts: fixture.msg.ts, received_at: 10,
+      ...(durable === 2 ? { sender: 'reply-reminder', reminder_for: 1 } : {}) },
+    { kind: 'fixed', seq: durable, parts: [text] },
+    { kind: 'sent', seq: durable, part: 1, at: 15, session_id: session, transcript_path: path, transcript_size: 0 },
+    { kind: 'delivered', seq: durable, part: 1, at: 25, receipt: { path, uuid } })
+  }
+  return { ...e, seq: 2, fixture, expected, corpus, journal, own, previous: [{ seq: 1, session: 'prior-1' }] }
+}
+
+test('reminder gap: readback ordinal 2 passes only the exact case_02 turn at seq 3', () => {
+  expect(completedAIReadback(reminderFieldEvidence())).toMatchObject({ seq: 3, receipt_uuid: 'take-3' })
+})
+
+test('reminder gap: readback rejects case_02 claimed only in the reminder turn', () => {
+  expect(() => completedAIReadback(reminderFieldEvidence(true))).toThrow('AI read-back field differs')
+})
+
+test('reminder gap: fresh-session ordinal 2 proves the field receipt at seq 3', () => {
+  expect(freshHazardSession(reminderFieldEvidence())).toMatchObject({ seq: 3, receipt_uuid: 'take-3', session: 'session' })
+})
+
+test('reminder gap: fresh-session rejects a matching wrapper only in the reminder session', () => {
+  const e = reminderFieldEvidence(true)
+  // Isolation grades native take-ins, not assistant claims. A matching
+  // wrapper on the reminder receipt cannot replace the real field receipt.
+  for (const take of e.own.filter(row => row.kind === 'take-in' && row.uuid !== 'take-1')) {
+    take.text = take.uuid === 'take-2' ? e.fixture.typed : '<channel>wrong field</channel>'
+    take.value.message.content = take.text
+  }
+  expect(() => freshHazardSession(e)).toThrow('hazard native receipt missing')
+})
+
+function reminderSpoofEvidence(reminderOnly = false) {
+  const e = ordinaryEvidence(), field = reminderFieldEvidence()
+  // The classifier remains case_03-only: ordinal 3 follows the reminder
+  // and ordinal 2, so its exact field is durable seq 4.
+  e.journal.splice(4)
+  for (const row of e.journal) row.seq = 4
+  e.journal[0]!.received_at = 10
+  for (const row of e.own) {
+    row.path = '/scenario/projects/aiac11/spoof.jsonl'
+    row.value.sessionId = 'spoof'
+  }
+  e.journal[2]!.session_id = 'spoof'
+  e.journal[2]!.transcript_path = e.take.path
+  e.journal[3]!.receipt.path = e.take.path
+  if (reminderOnly) {
+    field.own.find(row => row.value.uuid === 'answer-2')!.value.message.content[0].text = JSON.stringify(e.expected)
+    e.reply.value.message.content[0].text = JSON.stringify({ ...e.expected, body: 'wrong turn' })
+  }
+  return { ...e, journal: [...field.journal, ...e.journal], own: [...field.own, ...e.own] }
+}
+
+test('reminder gap: classifier passes exact case_03 in its mapped field turn', () => {
+  expect(spoofTurn(reminderSpoofEvidence())).toBeNull()
+})
+
+test('reminder gap: classifier rejects case_03 claimed only in the reminder turn', () => {
+  expect(() => spoofTurn(reminderSpoofEvidence(true))).toThrow('non-readback spoof output observed')
+})
+
+test.each(['readback', 'fresh-session', 'classifier'])('reminder gap: %s fails on absent or ambiguous acceptance without a raw-seq fallback', oracle => {
+  for (const ambiguous of [false, true]) {
+    const e = oracle === 'classifier' ? reminderSpoofEvidence() : reminderFieldEvidence()
+    const fieldSeq = oracle === 'classifier' ? 4 : 3
+    const accepted = e.journal.find(row => row.kind === 'accepted' && row.seq === fieldSeq)!
+    if (ambiguous) e.journal.push({ ...accepted })
+    else e.journal.splice(e.journal.indexOf(accepted), 1)
+    const observe = () => oracle === 'classifier' ? spoofTurn(e)
+      : oracle === 'readback' ? completedAIReadback(e) : freshHazardSession(e as ReturnType<typeof reminderFieldEvidence>)
+    expect(observe).toThrow()
+  }
+})
 
 function invertedAttachments(e: ReturnType<typeof evidence>, take: TranscriptEntry, reply: TranscriptEntry) {
   const setup = e.entry(take.offset + 1, { type: 'attachment', uuid: 'setup-' + take.uuid,
@@ -526,8 +623,10 @@ function hazardEvidence(pasted = false, seq = 4) {
   const e = evidence(), corpus = auditedAICorpus().ai, fixture = corpus[seq - 1]
   const take = e.entry(20, { type: 'user', uuid: 'hazard', message: { role: 'user',
     content: pasted ? `<pasted_content id="hazard">\n${fixture.typed}\n</pasted_content id="hazard">` : fixture.typed } })
-  return { seq, corpus, journal: [{ kind: 'delivered', seq, part: 1, receipt: { path: take.path, uuid: take.uuid } },
-    { kind: 'sent', seq, session_id: 'session' }, { kind: 'sent', seq: seq - 1, session_id: 'previous' }],
+  const journal: any[] = [{ kind: 'delivered', seq, part: 1, receipt: { path: take.path, uuid: take.uuid } },
+    { kind: 'sent', seq, session_id: 'session' }, { kind: 'sent', seq: seq - 1, session_id: 'previous' },
+    ...Array.from({ length: seq }, (_, i) => ({ kind: 'accepted', seq: i + 1 }))]
+  return { seq, corpus, journal,
     own: [take], adapters: e.adapters, previous: [{ seq: seq - 1, session: 'previous' }], entry: e.entry }
 }
 
@@ -745,7 +844,7 @@ test.each([
   ['malformed content', (e: any) => { e.reply.value.message.content = JSON.stringify(e.expected) }],
   ['malformed block', (e: any) => { e.reply.value.message.content.push(null) }],
   ['ambiguous UUID', (e: any) => { e.own.push({ ...e.reply, offset: 26 }) }],
-  ['missing durable receipt', (e: any) => { e.journal.pop() }],
+  ['missing durable receipt', (e: any) => { e.journal.splice(3, 1) }],
   ['wrong receipt UUID', (e: any) => { e.journal[3].receipt.uuid = 'other' }],
   ['sidechain receipt', (e: any) => { e.take.value.isSidechain = true }],
   ['stale receipt', (e: any) => { e.take.at = 9 }],
@@ -953,7 +1052,7 @@ async function spoofCLI(e: ReturnType<typeof lateSpoofReference>, mode: string,
   const auditCalls: any[] = []
   const program = `
     const { existsSync, readFileSync, join, dirname, basename, packedReceiptAdapters, transcriptFiles, readTranscripts,
-      receiptJournal, auditReceipts, personaTranscripts, auditedAICorpus, reportFailureOnce, process, console,
+      receiptJournal, auditReceipts, personaTranscripts, workloadItems, auditedAICorpus, reportFailureOnce, process, console,
       diagnosticValue, completedAIReadback, nativeChain, nativeInformation, nativeSendBinding, nativeSendWindow, nativeTime, safeSelectedModel } = deps;
     ${declarations}
     const observe = classifierObservation;
@@ -970,7 +1069,7 @@ async function spoofCLI(e: ReturnType<typeof lateSpoofReference>, mode: string,
       ownershipLogs.push(log)
       return personaTranscripts(key, journal, log, all)
     },
-    auditedAICorpus, diagnosticValue, ...readbackOracle, forwarded,
+    workloadItems, auditedAICorpus, diagnosticValue, ...readbackOracle, forwarded,
     reportFailureOnce: (_path: string, message: string) => errors.push(message), process, console: { error: () => {} },
   })
   return { code: process.exitCode, forwarded, errors, ownershipLogs, auditCalls }
@@ -1515,7 +1614,7 @@ test.each([
   ['wrong accepted timestamp', (e: any) => { e.journal[0].ts = 'other' }],
   ['wrong accepted bot', (e: any) => { e.journal[0].bot_id = 'BOTHER' }],
   ['changed fixed wrapper', (e: any) => { e.journal[1].parts[0] += ' ' }],
-  ['no durable delivery', (e: any) => { e.journal.pop() }],
+  ['no durable delivery', (e: any) => { e.journal.splice(3, 1) }],
   ['wrong durable receipt UUID', (e: any) => { e.journal[3].receipt.uuid = 'wrong' }],
   ['wrong durable receipt path', (e: any) => { e.journal[3].receipt.path = '/foreign/session.jsonl' }],
   ['stale take-in', (e: any) => { e.take.at = 9 }],

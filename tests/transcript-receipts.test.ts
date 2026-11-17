@@ -1118,6 +1118,57 @@ test('workload ordinals retain original input identities across interleaved remi
   assertSelection()
 })
 
+test.each([2, 3])('AC23 stage ordinal %i ready audit waits beyond complete prior originals and reminder', async ordinal => {
+  const h = await fixture(), rows = jsonLines(h.journal)
+  const target = workloadItem(rows, ordinal)
+  const audit = (expectedCount?: number) => auditReceipts({ ...h.options, expectedCount }, h.entries(), h.adapters)
+  const save = (records: any[]) => writeFileSync(h.journal, records.map(row => JSON.stringify(row)).join('\n') + '\n')
+  // Both the prior originals and the reminder have complete receipts. The
+  // stage's input has not been accepted yet, so only a count-free audit passes.
+  save(rows.filter(row => row.seq < target.seq))
+  expect(audit()).toMatchObject({ items: ordinal - 1, reminders: 1 })
+  expect(() => audit(ordinal)).toThrow('Accepted item count differs')
+  save(rows.filter(row => row.seq <= target.seq))
+  expect(audit(ordinal)).toMatchObject({ items: ordinal, reminders: 1 })
+  expect(workloadItem(receiptJournal(h.options.stateDir, 'alpha'), ordinal).seq).toBe(target.seq)
+})
+
+test('AC23 stages pass their original ordinal to delivery before readback', () => {
+  const source = readFileSync(join(import.meta.dir, 'real-agent/ai-scenario.sh'), 'utf8')
+  const begin = source.indexOf('        for stage in compact resume; do')
+  const end = source.indexOf('\n    elif [[ "${AI_CRITERION}" == 91 ]]; then', begin)
+  expect(begin).toBeGreaterThan(0); expect(end).toBeGreaterThan(begin)
+  const home = mkdtempSync(join(tmpdir(), 'ac23-stage-wait-'))
+  cleanups.push(async () => rmSync(home, { recursive: true, force: true }))
+  const script = `set -eu
+REAL_KEY=alpha
+REAL_LABEL=alpha
+REAL_USER=U0USER
+EXPECTED=${JSON.stringify(home)}
+SCENARIO_SLACK_RECORD=unused
+real_dm() { :; }
+real_wait_delivery() { printf 'delivery:%s\\n' "\${2:-none}"; }
+real_wait_idle() { :; }
+real_ad() { :; }
+real_instance() { printf instance; }
+stop_server() { :; }
+start_server() { :; }
+real_wait_launch() { :; }
+jq() { :; }
+case_assert() { :; }
+wait_until() { shift 2; "$@"; }
+ai_readback() { printf 'readback:%s\\n' "$2"; }
+${source.slice(begin, end)}
+`
+  const result = Bun.spawnSync(['bash', '-c', script], {
+    env: hostSafeChildEnv(home, { tools: ['bash'] }), stdout: 'pipe', stderr: 'pipe', timeout: 3000,
+  })
+  const stdout = result.stdout.toString(), stderr = result.stderr.toString()
+  assertNoLeak([stdout, stderr])
+  expect(result.exitCode).toBe(0); expect(stderr).toBe('')
+  expect(stdout).toBe('delivery:none\ndelivery:2\nreadback:2\ndelivery:none\ndelivery:3\nreadback:3\n')
+})
+
 test.each([0, -1, 1.5, NaN, Infinity])('workload selection rejects invalid ordinal %s', ordinal => {
   expect(() => workloadItem([], ordinal)).toThrow('Invalid workload ordinal')
 })
