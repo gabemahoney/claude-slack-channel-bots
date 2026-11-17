@@ -400,9 +400,10 @@ test('removing diagnostic additions preserves the approved AD-state-only scenari
   // Includes the reviewed three-line corpus membership declaration (7p.8d)
   // and b.99w's routing-mention expected values, plus b.p37's AC11
   // response-format sentence and explicit-off corpuspeer reload, plus b.jam's
-  // AC15 verbatim-body/only-case-labelled-reply prompt. Only the two diagnostic
-  // gates are removed, so every other byte stays pinned.
-  expect(createHash('sha256').update(scenario.replace(caseGate, '').replace(waitGate, '')).digest('hex')).toBe('df955e92d46fea5071f6220828955050d20f03ac4221238183c1353784814dde')
+  // AC15 verbatim-body/only-case-labelled-reply prompt and b.6xb's AC11-only
+  // case_03 restart/isolation proof. Only the two diagnostic gates are removed,
+  // so every other byte stays pinned; AC20's grouping is unchanged.
+  expect(createHash('sha256').update(scenario.replace(caseGate, '').replace(waitGate, '')).digest('hex')).toBe('602e2057d44e8d68e61b5a53db1b3efe05ae7bffb15a3af5d5b11394da5b9379')
 })
 
 function procStat(pid: number, state = 'S', started = '111', comm = 'native ) spaced') {

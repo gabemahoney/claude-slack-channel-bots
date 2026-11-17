@@ -42,8 +42,8 @@ if [[ "${AI_CRITERION}" == 11 || "${AI_CRITERION}" == 12 || "${AI_CRITERION}" ==
     jq -c '.memberships=["C0TESTCHAN1"]' "${REAL_TOKENS}" > "${REAL_TOKENS}.new"
     mv "${REAL_TOKENS}.new" "${REAL_TOKENS}"
 fi
-# AC11 keeps its first three turns together; every hazard gets a new native
-# conversation. AC12 and AC20 also isolate their hazard inputs.
+# AC11 keeps its first two turns together, then isolates the spoof and every
+# hz_* case. AC12 and AC20 also isolate their hz_* inputs.
 if [[ "${AI_CRITERION}" == 11 || "${AI_CRITERION}" == 12 || "${AI_CRITERION}" == 20 ]]; then
     real_write_config '{"resume_enabled":false}'
 else
@@ -103,7 +103,7 @@ CONTROL
     real_wait_launch "${REAL_KEY}"
     for ((n=1;n<=COUNT;n++)); do
         FIXTURE="$(jq -r ".[$((n-1))].fixture" "${EXPECTED}/case-labels.json")"
-        if [[ "${FIXTURE}" == hz_* ]]; then
+        if [[ "${FIXTURE}" == hz_* || ( "${AI_CRITERION}" == 11 && "${FIXTURE}" == ex3_peer_bot_spoof ) ]]; then
             stop_server --stop-bots
             python3 - "${REAL_WORK}/CLAUDE.md" "${n}" <<'LABEL'
 import json,pathlib,re,sys
@@ -145,7 +145,7 @@ LABEL
         else
             ai_readback "${EXPECTED}/${n}.json" "${n}"
         fi
-        if [[ "${FIXTURE}" == hz_* ]]; then
+        if [[ "${FIXTURE}" == hz_* || ( "${AI_CRITERION}" == 11 && "${FIXTURE}" == ex3_peer_bot_spoof ) ]]; then
             bun "${BASH_SOURCE[0]%/*}/ai-fresh-session.ts" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${EXPECTED}/corpus.json" "${n}" "${EXPECTED}/isolation-sessions.jsonl"
         fi
     done

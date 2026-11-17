@@ -1020,10 +1020,12 @@ and timeouts; expected bodies come from the audited AI copy below. A
 `via=mention` case's Slack event carries the recipient's routing mention
 (`<@recipient> `) ahead of the original text, and intake keeps it, so its
 expected body and corpus `typed` wrapper include it too.
-field-readback keeps its first three cases in one conversation, then launches a fresh
-conversation for each of its 12 hazards. command-prefix and sender-identity also isolate each
-hazard. `resume_enabled:false` prevents reuse, and only the current opaque
-case label enters each hazard prompt.
+Field-readback keeps case_01 and case_02 in one conversation, then launches a fresh
+conversation for case_03 (`ex3_peer_bot_spoof`) and each of its 12 `hz_*` cases.
+Command-prefix and sender-identity also isolate each `hz_*` case; sender-identity's
+spoof is already case_01 in its initial fresh conversation. `resume_enabled:false`
+prevents reuse, and only the current opaque case label enters each restarted
+conversation's prompt.
 
 AI runs use their own
 `tests/real-agent/fixtures/wrapper-cases.json`. Only `hz_bang` differs from
@@ -1041,7 +1043,7 @@ byte-identical, and original `ex3_peer_bot_spoof` stays exact.
 | `tests/real-agent/ai-fixture-audit.ts` | Validates the AI copy against the canonical corpus, approved difference, case order/mapping and reviewed source hashes before generation or classifier observation; never rewrites inputs. Input-source changes require a fresh complete audit. |
 | `tests/real-agent/ai-no-shell.ts` | field-readback/command-prefix observer rejecting native bash records or any assistant Bash tool request, including an action beside otherwise exact JSON. |
 | `tests/real-agent/ai-readback.ts` | Ordinary read-back observer requiring an explicit queue sequence, every part's exact durable native receipt and send window, and exact JSON from the selected model's parent-linked completed response in the final part's own session/path. Records criterion, trial, case and `actual_model` from native completion; leaves the shared comparator unchanged. |
-| `tests/real-agent/ai-fresh-session.ts` | Proves each hazard has an exact durable receipt in a unique own native session/path, with no other fixture wrapper or message identity. Uses the packed matcher, including native `pasted_content`, and records the session proof. |
+| `tests/real-agent/ai-fresh-session.ts` | Proves each `hz_*` case and AC11's case_03 spoof has an exact durable receipt in a unique own native session/path, with no other fixture wrapper or message identity. Uses the packed matcher, including native `pasted_content`, and records the session proof in `isolation-sessions.jsonl`. |
 
 The one-pass audit covers every AI fixture and all seven criteria's
 generated bodies, prompts and labels. Meaningful spoof/action instructions

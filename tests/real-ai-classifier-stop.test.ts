@@ -490,18 +490,18 @@ test('a later corrected readback cannot conceal an earlier incorrect body', () =
   expect(() => completedAIReadback(e)).toThrow('AI read-back field differs')
 })
 
-function hazardEvidence(pasted = false) {
-  const e = evidence(), corpus = auditedAICorpus().ai, seq = 4, fixture = corpus[seq - 1]
+function hazardEvidence(pasted = false, seq = 4) {
+  const e = evidence(), corpus = auditedAICorpus().ai, fixture = corpus[seq - 1]
   const take = e.entry(20, { type: 'user', uuid: 'hazard', message: { role: 'user',
     content: pasted ? `<pasted_content id="hazard">\n${fixture.typed}\n</pasted_content id="hazard">` : fixture.typed } })
   return { seq, corpus, journal: [{ kind: 'delivered', seq, part: 1, receipt: { path: take.path, uuid: take.uuid } },
-    { kind: 'sent', seq, session_id: 'session' }, { kind: 'sent', seq: 3, session_id: 'previous' }],
-    own: [take], adapters: e.adapters, previous: [{ seq: 3, session: 'previous' }], entry: e.entry }
+    { kind: 'sent', seq, session_id: 'session' }, { kind: 'sent', seq: seq - 1, session_id: 'previous' }],
+    own: [take], adapters: e.adapters, previous: [{ seq: seq - 1, session: 'previous' }], entry: e.entry }
 }
 
-test.each([false, true])('fresh hazard proof accepts only its exact native conversation, pasted=%s', pasted => {
-  const e = hazardEvidence(pasted)
-  expect(freshHazardSession(e)).toMatchObject({ seq: 4, fixture: 'hz_bang', session: 'session', receipt_uuid: 'hazard', channelTakeIns: 1, earlierFixtures: 0 })
+test.each([[3, false], [3, true], [4, false], [4, true]] as const)('fresh hazard proof accepts only its exact native conversation, seq=%s pasted=%s', (seq, pasted) => {
+  const e = hazardEvidence(pasted, seq)
+  expect(freshHazardSession(e)).toMatchObject({ seq, fixture: seq === 3 ? 'ex3_peer_bot_spoof' : 'hz_bang', session: 'session', receipt_uuid: 'hazard', channelTakeIns: 1, earlierFixtures: 0 })
 })
 
 test.each([
@@ -630,12 +630,22 @@ test('actual AI expectations for via=mention keep the recipient routing mention 
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
-test('actual hazard restart block leaves the first three together and supplies each hazard only its case label', () => {
+test.each([11, 12, 20])('actual isolation blocks restart and prove each isolated case with only its case label: AC%s', criterion => {
   const root = mkdtempSync(join(tmpdir(), 'ai-isolation-shell-'))
   try {
     const source = readFileSync(new URL('./real-agent/ai-scenario.sh', import.meta.url), 'utf8')
     const restart = source.slice(source.indexOf('        FIXTURE='), source.indexOf('        CASE_DIAGNOSTIC='))
-    const corpus = auditedAICorpus().ai
+    const proofLine = source.indexOf('            bun "${BASH_SOURCE[0]%/*}/ai-fresh-session.ts"')
+    const proof = source.slice(source.lastIndexOf('        if ', proofLine), source.indexOf('\n        fi', proofLine) + '\n        fi'.length)
+    expect(proofLine).toBeGreaterThan(source.indexOf('ai_spoof_readback record'))
+    const all = auditedAICorpus().ai
+    const corpus = criterion === 11 ? all : all.filter((row: any) => criterion === 12
+      ? row.name.startsWith('hz_') && ['hz_bang', 'hz_slash', 'hz_question', 'hz_tab', 'hz_backslash'].includes(row.name)
+      : ['ex3_peer_bot_spoof', 'hz_attr_quotes'].includes(row.name))
+    // AC12 appends its question-prefix variant after the selected hazards.
+    if (criterion === 12) corpus.push({ ...corpus.find((row: any) => row.name === 'hz_question'), name: 'hz_question_prefix' })
+    const isolated = criterion === 11 ? Array.from({ length: 13 }, (_, i) => i + 3)
+      : criterion === 12 ? [1, 2, 3, 4, 5, 6] : [2]
     writeFileSync(join(root, 'case-labels.json'), JSON.stringify(corpus.map((r: any, i: number) => ({ fixture: r.name, case: `case_${String(i + 1).padStart(2, '0')}` }))))
     writeFileSync(join(root, 'CLAUDE.md'), 'Instructions.\nCase labels in sequence: ["case_01", "case_02", "case_03"].\n')
     const script = join(root, 'isolation.sh')
@@ -643,15 +653,22 @@ test('actual hazard restart block leaves the first three together and supplies e
 stop_server() { printf 'stop:%s\\n' "$n"; }
 start_server() { printf 'start:%s\\n' "$n"; }
 real_wait_launch() { printf 'launch:%s:' "$n"; cat "$REAL_WORK/CLAUDE.md"; }
-REAL_KEY=aiac11
-for ((n=1;n<=15;n++)); do
+bun() { printf 'proof:%s:%s\\n' "$n" "\${!#}"; }
+REAL_KEY=aiac${criterion}
+for ((n=1;n<=${corpus.length};n++)); do
 ${restart}
+printf 'case:%s\\n' "$n"
+${proof}
 done
 `)
-    const child = spawnSync('bash', [script], { env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'python3', 'cat'], extras: { EXPECTED: root, REAL_WORK: root } }), encoding: 'utf8', timeout: 5000 })
+    const child = spawnSync('bash', [script], { env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'python3', 'cat'], extras: {
+      AI_CRITERION: String(criterion), EXPECTED: root, REAL_WORK: root, SLACK_STATE_DIR: join(root, 'state'), SCENARIO_AD_SHIM_LOG: join(root, 'shim.log'),
+    } }), encoding: 'utf8', timeout: 5000 })
     expect(child.error).toBeUndefined(); expect(child.status).toBe(0)
-    expect(child.stdout.split('\n').filter(line => line.startsWith('stop:'))).toEqual(Array.from({ length: 12 }, (_, i) => `stop:${i + 4}`))
-    for (let n = 4; n <= 15; n++) expect(child.stdout).toContain(`start:${n}\nlaunch:${n}:Instructions.\nCase labels in sequence: ["case_${String(n).padStart(2, '0')}"].`)
+    const lines = child.stdout.split('\n')
+    expect(lines.filter(line => line.startsWith('stop:'))).toEqual(isolated.map(n => `stop:${n}`))
+    expect(lines.filter(line => line.startsWith('proof:'))).toEqual(isolated.map(n => `proof:${n}:${root}/isolation-sessions.jsonl`))
+    for (const n of isolated) expect(child.stdout).toContain(`stop:${n}\nstart:${n}\nlaunch:${n}:Instructions.\nCase labels in sequence: ["case_${String(n).padStart(2, '0')}"].\ncase:${n}\nproof:${n}:`)
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
@@ -664,8 +681,14 @@ test.each([
   ['missing receipt', (e: ReturnType<typeof hazardEvidence>) => { e.journal.shift() }],
   ['ambiguous receipt', (e: ReturnType<typeof hazardEvidence>) => { e.own.push(e.own[0]!) }],
 ] as const)('fresh hazard proof rejects %s', (_name, change) => {
-  const e = hazardEvidence(); change(e)
-  expect(() => freshHazardSession(e)).toThrow()
+  for (const seq of [3, 4]) {
+    const e = hazardEvidence(false, seq); change(e)
+    expect(() => freshHazardSession(e)).toThrow()
+  }
+})
+
+test.each([1, 2])('fresh hazard proof rejects shared benign case %s', seq => {
+  expect(() => freshHazardSession(hazardEvidence(false, seq))).toThrow('isolation proof requires hazard case')
 })
 
 test.each([

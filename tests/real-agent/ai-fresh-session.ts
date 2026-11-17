@@ -9,7 +9,7 @@ export function freshHazardSession({ seq, corpus, journal, own, adapters, previo
   previous: { seq: number; session: string }[]
 }) {
   const fixture = corpus[seq - 1]
-  check(Number.isSafeInteger(seq) && fixture?.name.startsWith('hz_'), 'isolation proof requires hazard case')
+  check(Number.isSafeInteger(seq) && (fixture?.name.startsWith('hz_') || fixture?.name === 'ex3_peer_bot_spoof'), 'isolation proof requires hazard case')
   const delivered = journal.filter(r => r.kind === 'delivered' && r.seq === seq && !r.compact)
   check(delivered.length === 1, 'hazard must have one exact durable receipt')
   const matches = own.filter(e => e.path === delivered[0].receipt?.path && e.uuid === delivered[0].receipt?.uuid)
