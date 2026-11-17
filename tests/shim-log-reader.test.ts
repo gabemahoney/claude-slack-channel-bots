@@ -86,3 +86,29 @@ describe('scenario shim-log reader', () => {
     expect(result.stderr).toContain(`line ${line} is not in the shims' line format`)
   })
 })
+
+describe('scenario complete-line output', () => {
+  const cases = [
+    ...boundaries,
+    { name: 'same malformed tail with newline', log: call + malformed + '\n', complete: call + malformed + '\n' },
+    { name: 'empty complete line before partial tail', log: '\n' + malformed, complete: '\n' },
+  ]
+  test.each(cases.flatMap(boundary => ['count', 'output'].map(projection => ({ ...boundary, projection }))))('$name: $projection includes only complete lines', ({ log, complete, projection }) => {
+    const { root, path } = fixture(log)
+    const declaration = scenario.match(/^_scenario_complete_log\(\) \{[\s\S]*?^\}/m)?.[0]
+    if (!declaration) throw new Error('Missing shell function _scenario_complete_log')
+    const child = spawnSync('bash', ['-c', [
+      'set -euo pipefail', declaration,
+      'mapfile -t lines < <(_scenario_complete_log "$1")',
+      'printf "%s\\n" "${#lines[@]}"',
+      'if (( ${#lines[@]} )); then printf "%s\\n" "${lines[@]}"; fi',
+    ].join('\n'), 'complete-line-control', path], {
+      env: hostSafeChildEnv(root, { tools: ['bash', 'awk'] }), encoding: 'utf8', timeout: 5000,
+    })
+    expect(child.error).toBeUndefined(); expect(child.signal).toBeNull()
+    expect(child.status).toBe(0); expect(child.stderr).toBe('')
+    const newline = child.stdout.indexOf('\n')
+    if (projection === 'count') expect(Number(child.stdout.slice(0, newline))).toBe(complete.split('\n').length - 1)
+    else expect(child.stdout.slice(newline + 1)).toBe(complete)
+  })
+})

@@ -352,9 +352,10 @@ t21_note_calls() {
 # t21_harness_find_missing: how many `find-missing` calls in the
 # agent-director shim's whole log came from no CSCB process (the harness's).
 t21_harness_find_missing() {
-    local all cscb
-    all="$(awk -F'\t' '$1 == "call" && $6 ~ /(^| )find-missing( |$)/' "${SCENARIO_AD_SHIM_LOG}" | wc -l | tr -d ' ')"
-    cscb="$(cscb_ad_count find-missing)" || exit 1
+    local all cscb file
+    file="$(_scenario_ad_window t21_harness_find_missing 0 -)" || exit 1
+    all="$(awk -F'\t' '$1 == "call" && $6 ~ /(^| )find-missing( |$)/' "${file}" | wc -l | tr -d ' ')"
+    cscb="$(SCENARIO_AD_SHIM_LOG="${file}" cscb_ad_count find-missing)" || exit 1
     echo $(( all - cscb ))
 }
 

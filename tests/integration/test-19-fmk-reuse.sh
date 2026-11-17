@@ -933,7 +933,7 @@ t19_note_pre_trust() {
 # `find-missing` the shim logged at or after <time>, whoever made them.
 t19_all_find_missing_since() {
     [[ -f "${SCENARIO_AD_SHIM_LOG}" ]] || { echo 0; return 0; }
-    awk -F'\t' -v t="$1" '$1 == "call" && $2 + 0 >= t + 0 && (" " $6 " ") ~ / find-missing / { n++ } END { print n + 0 }' "${SCENARIO_AD_SHIM_LOG}"
+    _scenario_complete_log "${SCENARIO_AD_SHIM_LOG}" | awk -F'\t' -v t="$1" '$1 == "call" && $2 + 0 >= t + 0 && (" " $6 " ") ~ / find-missing / { n++ } END { print n + 0 }'
 }
 
 t19_row_pending_launched() {

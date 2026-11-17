@@ -934,7 +934,7 @@ t14_check_sweep_budget() {
 t14_note_kills_at() {
     local step="$1" n
     shift
-    n="$(awk -F'\t' -v t="${MARK_TIME}" -v targets="$*" '
+    n="$(_scenario_complete_log "${SCENARIO_TMUX_SHIM_LOG}" | awk -F'\t' -v t="${MARK_TIME}" -v targets="$*" '
         BEGIN { split(targets, tl, " "); for (i in tl) want[tl[i]] = 1 }
         $1 == "call" && $2 + 0 >= t + 0 {
             k = split($6, w, " ")
@@ -946,7 +946,7 @@ t14_note_kills_at() {
             }
             if (kill && hit) n++
         }
-        END { print n + 0 }' "${SCENARIO_TMUX_SHIM_LOG}" 2> /dev/null)" || n="?"
+        END { print n + 0 }' 2> /dev/null)" || n="?"
     [[ "${n}" =~ ^[0-9]+$ ]] && (( n > 0 )) \
         || fail "${step}: no targeted kill reached the tmux shim; the fail-kill fault was not exercised"
     echo "${TEST_NAME}: NOTE: ${step}: ${n} tmux call(s) holding a kill aimed at $* reached the tmux shim after the mark (each refused under fail-kill --targets)"

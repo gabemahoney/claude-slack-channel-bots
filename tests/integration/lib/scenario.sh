@@ -4892,6 +4892,14 @@ _scenario_shim_diagnostic() {
     fi
 }
 
+# _scenario_complete_log <log>: print complete lines from one read of <log>.
+_scenario_complete_log() {
+    local line
+    while IFS= read -r line; do
+        printf '%s\n' "${line}"
+    done < "$1"
+}
+
 # _scenario_read_log <step> <log> <array-name>: read <log>'s lines into the
 # array (none when the log is missing), ignoring an unterminated last line
 # still being written; fail, naming <step> and the line, on malformed lines.

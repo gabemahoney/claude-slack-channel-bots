@@ -2594,11 +2594,12 @@ fail() { printf 'REFUSED: %s' "$*"; exit 1; }
 printf '\\nRESULT=%s' "$?"`, ['mkdir', 'ln'])
     expect(output).toBe(`REFUSED: setup: could not create ${home}/home-0.13/.config\nRESULT=1`)
   })
-  test.each(['target', 'other', 'empty'])('rebuilt A must exercise its targeted kill fault: %s log', (mode) => {
+  test.each(['target', 'target-partial', 'other', 'empty'])('rebuilt A must exercise its targeted kill fault: %s log', (mode) => {
     const source = readFileSync(join(import.meta.dir, 'integration/test-14-fmk-kill-fails.sh'), 'utf8')
-    const call = mode === 'empty' ? '' : `call\t100\t1\t2\t3\tkill-session -t =${mode === 'target' ? 'ua' : 'unrelated'}\n`
+    const call = mode === 'empty' ? '' : `call\t100\t1\t2\t3\tkill-session -t =${mode.startsWith('target') ? 'ua' : 'unrelated'}${mode === 'target-partial' ? '' : '\n'}`
     writeFileSync(join(home, 'tmux.log'), call)
-    const output = shell(`${helper('t14_note_kills_at', source)}
+    const output = shell(`${helper('_scenario_complete_log')}
+${helper('t14_note_kills_at', source)}
 SCENARIO_TMUX_SHIM_LOG="$HOME/tmux.log"
 MARK_TIME=90
 TEST_NAME=inert
