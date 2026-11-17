@@ -403,10 +403,11 @@ test('removing diagnostic additions preserves the approved AD-state-only scenari
   // AC15 verbatim-body/only-case-labelled-reply prompt and b.6xb's AC11-only
   // case_03 restart/isolation proof and b.xgn's original-input ordinal arguments,
   // plus b.j77's shared closing rule and AC91 DM/thread closing clauses,
-  // and b.yej's one-object rule for reply or text there and in AC11's own prompt.
+  // and b.yej's one-object rule for reply or text there and in AC11's own prompt,
+  // plus b.vc7's body-only byte-for-byte rule for AC11/AC12/AC20.
   // Only the two diagnostic gates are removed,
   // so every other byte stays pinned; AC20's grouping is unchanged.
-  expect(createHash('sha256').update(scenario.replace(caseGate, '').replace(waitGate, '')).digest('hex')).toBe('9df8f096c24be2008a39bd508080b3d4019b1aa0ca83ae7abdce159044433064')
+  expect(createHash('sha256').update(scenario.replace(caseGate, '').replace(waitGate, '')).digest('hex')).toBe('96ab1e2bd7f158cf8a98d5e14e5c244b3147d77b4d43c78d2b7c32b97834b6cc')
 })
 
 function procStat(pid: number, state = 'S', started = '111', comm = 'native ) spaced') {

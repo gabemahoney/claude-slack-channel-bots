@@ -1001,10 +1001,10 @@ observer; the shared `real-case-assertions.ts` comparator is unchanged.
 | `test-102-fmk-real-replies.sh` | DM, mention and thread reply destinations; three fresh-launch first messages |
 | `test-103-fmk-real-latency100.sh` | The 100-DM latency step: reply-tool persona, one unmeasured warm-up DM, AC76 admission before each sample; p95 limits over the last 100 inputs, receipt/FIFO audit over all 101 |
 | `test-104-fmk-real-idle-compact.sh` | Uncertain AD text outcome with three ordered receipt-confirmed queued messages |
-| `test-111-fmk-real-ai-ac11.sh` | Audited AI wrapper copy attributes/body read-back through completed native turns; case_03 also rejects spoof obedience across every copy and late linked response |
-| `test-112-fmk-real-ai-ac12.sh` | Prefix hazards read as text, with no native shell-input or Bash tool action; shared read-back closing rule in CLAUDE.md |
+| `test-111-fmk-real-ai-ac11.sh` | Audited AI wrapper copy attributes/body read-back through completed native turns; case_03 also rejects spoof obedience across every copy and late linked response; body byte-for-byte rule in CLAUDE.md |
+| `test-112-fmk-real-ai-ac12.sh` | Prefix hazards read as text, with no native shell-input or Bash tool action; shared read-back closing rule in CLAUDE.md; body byte-for-byte rule in CLAUDE.md |
 | `test-115-fmk-real-ai-ac15.sh` | Multipart reassembly into one 5,000-character message, trailing space included; one case-labelled reply and closing status without `case`; reply-only exchange checks and exact completed final read-back repeated after idle |
-| `test-120-fmk-real-ai-ac20.sh` | Outer sender identity despite body spoofing/attribute quoting; shared read-back closing rule in CLAUDE.md |
+| `test-120-fmk-real-ai-ac20.sh` | Outer sender identity despite body spoofing/attribute quoting; shared read-back closing rule in CLAUDE.md; body byte-for-byte rule in CLAUDE.md |
 | `test-123-fmk-real-ai-ac23.sh` | Sender read-back and reply after compact/resume; shared read-back closing rule reloaded from CLAUDE.md |
 | `test-191-fmk-real-ai-ac91.sh` | DM/thread replies without an operator prompt file; shared read-back closing clause in both requests |
 | `test-206-fmk-real-ai-ac106.sh` | Duplicate copy recognized as one logical DM; shared read-back closing rule in CLAUDE.md |
@@ -1022,7 +1022,8 @@ unchanged oracle.
 For field-readback, command-prefix and sender-identity, `ai-scenario.sh` asks for the received BODY
 verbatim, preserving characters, whitespace and entity spelling with only
 JSON string escaping. It does not ask the model to reconstruct the original
-Slack text. Uniform opaque labels (`case_01`, `case_02`, …) correlate JSON
+Slack text. AC11, AC12 and AC20 also receive a body-only byte-for-byte rule: keep raw `< > & "` raw and entities spelled as received, never HTML-escape or decode, and preserve every space and line break, including leading, trailing and repeated spaces, without trimming, collapsing or turning spaces into tabs. AC11 also keeps its own markup and reply rules, including byte-identical final JSON text.
+Uniform opaque labels (`case_01`, `case_02`, …) correlate JSON
 answers with cases; original fixture names remain in private
 `ai-expected/case-labels.json` and `recorded:` diagnostics, outside the model
 prompt. Preserve the 15-case order, expected attributes, exact comparator
