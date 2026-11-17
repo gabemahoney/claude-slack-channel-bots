@@ -4892,16 +4892,29 @@ _scenario_shim_diagnostic() {
     fi
 }
 
+# _scenario_complete_log <log>: print complete lines from one read of <log>.
+_scenario_complete_log() {
+    local line
+    while IFS= read -r line; do
+        printf '%s\n' "${line}"
+    done < "$1"
+}
+
 # _scenario_read_log <step> <log> <array-name>: read <log>'s lines into the
-# array (none when the log is missing); fail, naming <step> and the line,
-# when a line is not in the shims' format.
+# array (none when the log is missing), ignoring an unterminated last line
+# still being written; fail, naming <step> and the line, on malformed lines.
 _scenario_read_log() {
-    local step="$1" log="$2" i
+    local step="$1" log="$2" i last
     local -n _scenario_read_log_lines="$3"
     _scenario_read_log_lines=()
     [[ -f "${log}" ]] || return 0
-    mapfile -t _scenario_read_log_lines < "${log}"
+    mapfile _scenario_read_log_lines < "${log}"
+    if (( ${#_scenario_read_log_lines[@]} )); then
+        last=$(( ${#_scenario_read_log_lines[@]} - 1 ))
+        [[ "${_scenario_read_log_lines[last]}" == *$'\n' ]] || unset '_scenario_read_log_lines[last]'
+    fi
     for i in "${!_scenario_read_log_lines[@]}"; do
+        _scenario_read_log_lines[i]="${_scenario_read_log_lines[i]%$'\n'}"
         if ! _scenario_split_line "${_scenario_read_log_lines[i]}" \
             || { [[ "${_L_KIND}" == call ]] && ! _scenario_decode_words; }; then
             _scenario_shim_diagnostic "  | ${log##*/}:$(( i + 1 )): ${_scenario_read_log_lines[i]}"

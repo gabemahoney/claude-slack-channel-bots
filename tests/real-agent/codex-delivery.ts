@@ -315,7 +315,7 @@ function fault(match: 'key=Enter' | 'no_enter') {
   writeFileSync(shimLog.replace(/\.log$/, '.faults'), `send-keys ${match} swallow 1\n`, { mode: 0o600 })
 }
 function consumedFault(match: string) {
-  return readFileSync(shimLog, 'utf8').split('\n').some(line => line.startsWith('fault\t') && receipts.shimWords(line.split('\t')[5]!)[1] === match)
+  return receipts.readShimLog(shimLog).split('\n').some(line => line.startsWith('fault\t') && receipts.shimWords(line.split('\t')[5]!)[1] === match)
 }
 function dm(text: string, n: number) {
   const ts = `1792000100.${String(n).padStart(6, '0')}`
@@ -373,8 +373,8 @@ async function gate() {
   for (const seq of burst) await delivered(seq)
   if (!consumedFault('no_enter')) throw new Error('whole-text fault never occurred')
   const { auditCodexDelivery, assertCodexRecovery, codexShimCalls } = await import('./codex-gate.ts')
-  assertCodexRecovery(journal(), burst[0]!, 'enter', readFileSync(shimLog, 'utf8'), instance)
-  assertCodexRecovery(journal(), burst[1]!, 'retype', readFileSync(shimLog, 'utf8'), instance)
+  assertCodexRecovery(journal(), burst[0]!, 'enter', receipts.readShimLog(shimLog), instance)
+  assertCodexRecovery(journal(), burst[1]!, 'retype', receipts.readShimLog(shimLog), instance)
   const completedPrefix = journal().filter(r => r.seq >= basicSeqs[0]!)
 
   stage = 'gate-crash-between-text-and-enter'
@@ -386,7 +386,7 @@ async function gate() {
       journal,
       counts: () => {
         try {
-          const calls = codexShimCalls(readFileSync(shimLog, 'utf8')).filter(c => c.parent === child.pid && c.instance === instance)
+          const calls = codexShimCalls(receipts.readShimLog(shimLog)).filter(c => c.parent === child.pid && c.instance === instance)
           return { queue: journal().filter(r => r.kind === 'accepted').length, text: calls.filter(c => c.noEnter).length, enter: calls.filter(c => c.key === 'Enter').length }
         } catch { return { queue: -1, text: -1, enter: -1 } }
       },
@@ -396,7 +396,7 @@ async function gate() {
     const beforeKill = journal(), crashItem = beforeKill.find(r => r.kind === 'accepted' && r.seq === pair.firstSeq)
     if (!crashItem || !beforeKill.some(r => r.kind === 'accepted' && r.seq === pair.successorSeq)) throw new Error('crash input pair was not durable')
     const typed = beforeKill.find(r => r.kind === 'fixed' && r.seq === crashItem.seq)?.parts[0]
-    const calls = codexShimCalls(readFileSync(shimLog, 'utf8')).filter(c => c.parent === child.pid && c.instance === instance)
+    const calls = codexShimCalls(receipts.readShimLog(shimLog)).filter(c => c.parent === child.pid && c.instance === instance)
     if (!calls.some(c => c.text === typed && c.noEnter) || calls.some(c => c.key === 'Enter')) throw new Error('child crash boundary did not precede Enter')
     child.kill('SIGKILL')
     await child.exited
@@ -404,20 +404,20 @@ async function gate() {
     record('harness-crash', { pid: child.pid, signal: child.signalCode, seq: crashItem.seq, afterText: true, beforeEnter: true })
     await buildEngine()
     for (const item of queue.items(key)) if (!item.delivered) await delivered(item.accepted.seq)
-    assertCodexRecovery(journal(), crashItem.seq, 'enter', readFileSync(shimLog, 'utf8'), instance)
+    assertCodexRecovery(journal(), crashItem.seq, 'enter', receipts.readShimLog(shimLog), instance)
   } finally { if (child.exitCode === null) { child.kill('SIGKILL'); await child.exited } }
 
   stage = 'gate-trailing-popup-fidelity'
   for (const [index, suffix] of ['@', '$'].entries()) {
     const seq = await accept(dm(`This body ends in ${suffix}`, 30 + index))
     await delivered(seq)
-    assertCodexRecovery(journal(), seq, 'no-retype', readFileSync(shimLog, 'utf8'), instance)
+    assertCodexRecovery(journal(), seq, 'no-retype', receipts.readShimLog(shimLog), instance)
   }
   if (queue.openCount(key) !== 0) throw new Error('gate retained open items')
   stage = 'gate-final-audit'
   const current = await rollout()
   const audit = auditCodexDelivery({ journal: journal().filter(r => r.seq >= basicSeqs[0]!), completedPrefix, rollout: current.data, path: current.path,
-    instance, shim: readFileSync(shimLog, 'utf8'), events: eventJournal(), key, log: readFileSync(join(stateDir, 'server.log'), 'utf8') })
+    instance, shim: receipts.readShimLog(shimLog), events: eventJournal(), key, log: readFileSync(join(stateDir, 'server.log'), 'utf8') })
   if (audit.items !== 17) throw new Error('gate scenario inventory incomplete')
   record('gate', { assertionsPassed: true, items: audit.items, firstReceipts: audit.firstReceipts, queueEmpty: true })
   await summary(audit.duplicates, false)
@@ -449,7 +449,7 @@ async function ai(ac: number) {
   const audit = async (after: number) => {
     const current = await rollout()
     const actual = gateOracle.auditCodexDelivery({ journal: journal().filter(r => r.seq > after), rollout: current.data, path: current.path,
-      instance, shim: readFileSync(shimLog, 'utf8'), events: eventJournal(), key, log: readFileSync(join(stateDir, 'server.log'), 'utf8') })
+      instance, shim: receipts.readShimLog(shimLog), events: eventJournal(), key, log: readFileSync(join(stateDir, 'server.log'), 'utf8') })
     duplicates += actual.duplicates
     oracle.assertCodexNoShell(current.data)
   }
@@ -507,7 +507,7 @@ async function ai(ac: number) {
       const current = await rollout()
       try { return oracle.assertCodexDuplicateTakeins(current.data, first, second) } catch { return }
     }, 180000)
-    const actual = [...receipts.shimSends(readFileSync(shimLog, 'utf8'))].reverse().find(s => s.instanceId === instance && s.text === first.text && s.at >= second.sentAt && !s.words.includes('--no-enter'))
+    const actual = [...receipts.shimSends(receipts.readShimLog(shimLog))].reverse().find(s => s.instanceId === instance && s.text === first.text && s.at >= second.sentAt && !s.words.includes('--no-enter'))
     if (!actual) throw new Error('second DM has no actual submitted shim call')
     await waiting()
     oracle.assertCodexDuplicateTakeins((await rollout()).data, first, second)

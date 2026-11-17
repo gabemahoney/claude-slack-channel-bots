@@ -216,7 +216,7 @@ expect_in_order() {
 # holding <verb> and the persona's instance id (a cheap scan; the windows
 # below read whose call it is).
 shim_line_after() {
-    tail -n "+$(( $1 + 1 ))" "${SCENARIO_AD_SHIM_LOG}" 2> /dev/null | grep -F -- "$2" | grep -qF -- "${INSTANCE_ID}"
+    _scenario_complete_log "${SCENARIO_AD_SHIM_LOG}" 2> /dev/null | tail -n "+$(( $1 + 1 ))" | grep -F -- "$2" | grep -F -- "${INSTANCE_ID}" > /dev/null
 }
 
 # window_calls <step> <from-mark> <to-mark|->: set WIN_VERBS, WIN_ARGS (the
@@ -279,7 +279,7 @@ harness_find_missing() {
         || fail "${step}: find-missing listed ${INSTANCE_ID} in its ids: $(tr '\n' ' ' < "${AD_OUT}")"
     answer="$(jq -c '.' "${AD_OUT}")" || fail "${step}: jq could not read find-missing's answer"
     echo "${TEST_NAME}: ${step}: find-missing answered ${answer}"
-    mapfile -t lines < <(tail -n "+$(( mark + 1 ))" "${SCENARIO_AD_SHIM_LOG}")
+    mapfile -t lines < <(_scenario_complete_log "${SCENARIO_AD_SHIM_LOG}" | tail -n "+$(( mark + 1 ))")
     for i in "${!lines[@]}"; do
         _scenario_split_line "${lines[i]}" && [[ "${_L_KIND}" == call ]] || continue
         _scenario_decode_words || continue
@@ -552,7 +552,7 @@ n="$(cscb_ad_count_between "${MARK_HELD}" - find-missing)"
 # ---------------------------------------------------------------------------
 
 STEP="leg 7 (close)"
-mapfile -t lines < "${SCENARIO_AD_SHIM_LOG}"
+_scenario_read_log "${STEP}" "${SCENARIO_AD_SHIM_LOG}" lines
 kills=0
 for line in "${lines[@]}"; do
     _scenario_split_line "${line}" && [[ "${_L_KIND}" == call ]] || continue

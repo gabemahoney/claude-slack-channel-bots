@@ -2,7 +2,7 @@
 import { existsSync, readFileSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import type { GetResult } from 'agent-director'
-import { auditReceipts, captureReceiptJournal, jsonLines, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, receiptsRecord, shimWords, transcriptFiles, workloadItem, workloadItems } from './transcript-receipts.ts'
+import { auditReceipts, captureReceiptJournal, jsonLines, packedReceiptAdapters, personaTranscripts, readTranscripts, readShimLog, receiptJournal, receiptsRecord, shimWords, transcriptFiles, workloadItem, workloadItems } from './transcript-receipts.ts'
 import { assertBusyProof, emitBusyProofFailure, pollBusyProof, type BusyProofSnapshot } from './busy-proof.ts'
 function check(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason) }
 /** Exit status for a case whose complete receipt audit does not pass yet; its
@@ -173,9 +173,9 @@ async function main() {
 const [command, state, key, shim, root, arg = '', arg2 = '', arg3 = ''] = process.argv.slice(2)
 function journal() { return jsonLines(join(state!, 'queue', `${key}.jsonl`)) }
 function cumulativeJournal() { return receiptJournal(state!, key!) }
-function calls() { return readFileSync(shim!, 'utf8').split('\n').filter(l => l.startsWith('call\t')).map(l => { const f=l.split('\t'); return { at:Number(f[1])*1000, pid:f[2], words:shimWords(f[5]!) } }) }
+function calls() { return readShimLog(shim!).split('\n').filter(l => l.startsWith('call\t')).map(l => { const f=l.split('\t'); return { at:Number(f[1])*1000, pid:f[2], words:shimWords(f[5]!) } }) }
 function faultsSince(mark: string): KeyCall[] {
-  const lines=readFileSync(shim!,'utf8').split('\n').filter(Boolean), start=Number(mark)
+  const lines=readShimLog(shim!).split('\n').filter(Boolean), start=Number(mark)
   check(Number.isSafeInteger(start)&&start>=0&&start<=lines.length,'invalid covered fault mark')
   return lines.slice(start).filter(l=>l.startsWith('fault\t')).map(l=>{const f=l.split('\t');return {at:Number(f[1])*1000,pid:f[2],words:shimWords(f[5]!)}})
 }
@@ -243,7 +243,7 @@ try {
     for(const [source,count] of [['slack',10],['interject',2],['cron',1]] as const) check(accepted.filter(r=>r.source===source).length===count,'DOWN interval source count differs: '+source)
     check(j.filter(r=>r.kind==='sent').length===baseline.sent,'send recorded during DOWN interval')
     check(j.filter(r=>r.kind==='delivered').length===baseline.delivered,'delivery recorded during DOWN interval')
-    const lines=readFileSync(shim!,'utf8').split('\n').filter(Boolean), mark=Number(arg2)
+    const lines=readShimLog(shim!).split('\n').filter(Boolean), mark=Number(arg2)
     check(Number.isSafeInteger(mark)&&mark>=0&&mark<=lines.length,'invalid DOWN interval shim mark')
     const interval=lines.slice(mark).map(line=>{const f=line.split('\t');return {kind:f[0],pid:f[2],ppid:f[3],parent:f[4],words:shimWords(f[5]!)}})
     const verb=(words:string[])=>{let i=0;while(words[i]?.startsWith('--')) i+=words[i]!.includes('=')?1:2;return words[i]}
@@ -266,9 +266,9 @@ try {
     const j=cumulativeJournal(),seq=workloadItem(j,Number(arg)).seq,f=j.find(r=>r.seq===seq&&r.kind==='fixed')
     check(f?.parts?.some((_:unknown,n:number)=>!j.some(r=>r.seq===seq&&r.kind==='delivered'&&r.part===n+1)),'expected head is already complete')
   } else if(command==='no-enter-fault') {
-    check(readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')&&shimWords(l.split('\t')[5]!)[1]==='no_enter').length>=Number(arg),'text fault not yet applied')
+    check(readShimLog(shim!).split('\n').filter(l=>l.startsWith('fault\t')&&shimWords(l.split('\t')[5]!)[1]==='no_enter').length>=Number(arg),'text fault not yet applied')
   } else if(command==='enter-fault') {
-    check(readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')&&shimWords(l.split('\t')[5]!)[1]==='key=Enter').length>=Number(arg),'Enter fault not yet applied')
+    check(readShimLog(shim!).split('\n').filter(l=>l.startsWith('fault\t')&&shimWords(l.split('\t')[5]!)[1]==='key=Enter').length>=Number(arg),'Enter fault not yet applied')
   } else if(command==='covered-send-fault') {
     assertCoveredSendFault(cumulativeJournal(),calls(),faultsSince(arg),'cscb_'+key)
   } else if(command==='covered-lost-reply-proof') {
@@ -278,7 +278,7 @@ try {
     check(result.duplicates===0,'covered lost reply produced duplicate take-ins')
     console.log('recorded: covered lost reply recovered by lookup, no resend or duplicates, exact receipt FIFO complete')
   } else if(command==='fault') {
-    check(readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')&&shimWords(l.split('\t')[5]!)[2]===arg).length>=Number(arg2||1), 'fault not yet consumed')
+    check(readShimLog(shim!).split('\n').filter(l=>l.startsWith('fault\t')&&shimWords(l.split('\t')[5]!)[2]===arg).length>=Number(arg2||1), 'fault not yet consumed')
   } else if(command==='fidelity-shapes') {
     const j=cumulativeJournal();for(const [ordinal,bytes] of [[9,850],[10,1400],[11,1900]] as const) {
       const seq=workloadItem(j,ordinal).seq
@@ -286,13 +286,13 @@ try {
     }
   } else if(command==='unknown-proof') {
     await confirmReceipts()
-    const faults=readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')).map(l=>{const f=l.split('\t');return {at:Number(f[1])*1000,words:shimWords(f[5]!)}})
+    const faults=readShimLog(shim!).split('\n').filter(l=>l.startsWith('fault\t')).map(l=>{const f=l.split('\t');return {at:Number(f[1])*1000,words:shimWords(f[5]!)}})
     const f=faults.find(f=>f.words[2]===arg);check(f,'unknown fault was not applied')
     assertUnknownKeyRecovery(calls(),f,'cscb_'+key)
     console.log('recorded: unknown outcome confirmed by exact receipt after guarded recovery '+arg)
   } else if(command==='reset-spacing') {
     await confirmReceipts()
-    const faults=readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')).map(l=>{const f=l.split('\t');return {at:Number(f[1])*1000,pid:f[2],words:shimWords(f[5]!)}})
+    const faults=readShimLog(shim!).split('\n').filter(l=>l.startsWith('fault\t')).map(l=>{const f=l.split('\t');return {at:Number(f[1])*1000,pid:f[2],words:shimWords(f[5]!)}})
     const waiting=readFileSync(join(state!,'server.log'),'utf8').split('\n').flatMap(line=>{
       const marker='delivery-launch-first-waiting: ', index=line.indexOf(marker)
       return index < 0 ? [] : [JSON.parse(line.slice(index+marker.length))]
@@ -306,7 +306,7 @@ try {
     const j=cumulativeJournal(), seq=workloadItem(j,Number(arg)).seq, s=j.filter(r=>r.kind==='sent'&&r.seq===seq)
     const text=s.filter(r=>r.send_kind!=='enter')
     if(arg2==='enter') {
-      const faults=readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')).map(l=>{const f=l.split('\t');return {at:Number(f[1])*1000,pid:f[2],words:shimWords(f[5]!)}})
+      const faults=readShimLog(shim!).split('\n').filter(l=>l.startsWith('fault\t')).map(l=>{const f=l.split('\t');return {at:Number(f[1])*1000,pid:f[2],words:shimWords(f[5]!)}})
       assertSwallowedEnterRecovery(j,calls(),faults,seq,'cscb_'+key)
     }
     if(arg2==='retype') check(text.length>=2, 'missed text was not retyped')
@@ -322,7 +322,7 @@ try {
     check(a.every((r,i)=>r.ts&&(!i||Number(r.ts)>Number(a[i-1].ts))), 'cron fire timestamps missing or unordered')
     console.log('recorded: cron fires '+JSON.stringify(a.map(r=>({seq:r.seq,ts:r.ts,received_at:r.received_at}))))
   } else if(command==='fault-at') {
-    const f=readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')&&shimWords(l.split('\t')[5]!)[2]===arg).at(-1);check(f,'fault not found');console.log(Number(f.split('\t')[1])*1000)
+    const f=readShimLog(shim!).split('\n').filter(l=>l.startsWith('fault\t')&&shimWords(l.split('\t')[5]!)[2]===arg).at(-1);check(f,'fault not found');console.log(Number(f.split('\t')[1])*1000)
   } else if(command==='reconnect-proof') {
     const j=cumulativeJournal(),target=workloadItem(j,Number(arg))
     const fixed=j.find(r=>r.kind==='fixed'&&r.seq===target?.seq);check(fixed,'reconnect target not fixed')

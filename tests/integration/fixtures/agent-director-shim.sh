@@ -79,6 +79,7 @@
 # Every writer appends its line while it holds an exclusive lock on the log
 # (`/usr/bin/flock -x` on the open log file), so lines that concurrent
 # processes write never interleave.
+# Readers ignore an unterminated last line, which may still be being written.
 
 self="$0"
 [[ "${self}" == /* ]] || self="$(pwd -P)/${self}"

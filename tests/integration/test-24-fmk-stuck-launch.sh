@@ -345,9 +345,9 @@ server_calls_of() {
 # server_killed <id> <srv>: true once the shim's log holds a `call` line whose
 # parent is the bot server <srv> and whose words hold `kill` and row <id>.
 server_killed() {
-    awk -F'\t' -v p="$2" -v id="$1" '
+    _scenario_complete_log "${SCENARIO_AD_SHIM_LOG}" | awk -F'\t' -v p="$2" -v id="$1" '
         $1 == "call" && $4 == p && $6 ~ /(^| )kill( |$)/ && index($6, id) { found = 1 }
-        END { exit !found }' "${SCENARIO_AD_SHIM_LOG}"
+        END { exit !found }'
 }
 
 # server_call_after <id> <srv> <verb> <time>: print the time of the first
@@ -909,7 +909,7 @@ leg_other_process() {
     echo "${TEST_NAME}: ${step}: the bot server's calls of ${Q_ID} from L (recorded): $(calls "${table}" "${srv}" "${Q_ID}" - - - | awk -F'\t' -v l="${l_s}" '{ a = $5; sub(/ --label .*/, " …", a); printf "%+.1fs %s [%s]; ", $1 - l, $3, a }')"
     echo "${TEST_NAME}: ${step}: the bot server's find-missing runs, from L (recorded): $(calls "${table}" "${srv}" - find-missing - - | awk -F'\t' -v l="${l_s}" '{ printf "%+.1fs ", $1 - l }')"
     # The only resume of Q's row: the harness's, its parent the scenario's own shell.
-    mapfile -t resume_lines < <(awk -F'\t' -v id="${Q_ID}" '$1 == "call" && $6 ~ /(^| )resume( |$)/ && index($6, id)' "${SCENARIO_AD_SHIM_LOG}")
+    mapfile -t resume_lines < <(_scenario_complete_log "${SCENARIO_AD_SHIM_LOG}" | awk -F'\t' -v id="${Q_ID}" '$1 == "call" && $6 ~ /(^| )resume( |$)/ && index($6, id)')
     (( ${#resume_lines[@]} == 1 )) || {
         printf '  | %s\n' "${resume_lines[@]}" >&2
         fail "${step}: ${#resume_lines[@]} resume call(s) of ${Q_ID} from any process, not the harness's one"

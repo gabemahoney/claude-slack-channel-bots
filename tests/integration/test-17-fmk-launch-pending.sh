@@ -351,10 +351,10 @@ any_calls_naming() {
 
 # any_calls_naming_of <id> <verb> <from> <to>: `any_calls_naming` for row <id>.
 any_calls_naming_of() {
-    awk -F'\t' -v v="$2" -v id="$1" -v a="$3" -v b="$4" '
+    _scenario_complete_log "${SCENARIO_AD_SHIM_LOG}" | awk -F'\t' -v v="$2" -v id="$1" -v a="$3" -v b="$4" '
         $1 == "call" && index(" " $6 " ", " " v " ") && index(" " $6 " ", " " id " ") \
             && (a == "-" || $2 + 0 > a + 0) && (b == "-" || $2 + 0 <= b + 0)
-    ' "${SCENARIO_AD_SHIM_LOG}"
+    '
 }
 
 # call_table <file>: write <file>, one TAB-separated line per agent-director
@@ -1117,8 +1117,8 @@ leg_launch_timeouts() {
         [[ -n "${launch_at[${role}]}" ]] || fail "${step}: ${role}: the bot server made no launch of its kind for ${id}"
         verb=spawn
         [[ "${role}" != resume ]] || verb=resume
-        n="$(awk -F'\t' -v p="${srv}" -v w="${verb} instance=${id} launch-reply-timeout 1" \
-            '$1 == "fault" && $4 == p && $6 == w { n++ } END { print n + 0 }' "${SCENARIO_AD_SHIM_LOG}")"
+        n="$(_scenario_complete_log "${SCENARIO_AD_SHIM_LOG}" | awk -F'\t' -v p="${srv}" -v w="${verb} instance=${id} launch-reply-timeout 1" \
+            '$1 == "fault" && $4 == p && $6 == w { n++ } END { print n + 0 }')"
         (( n == 1 )) || fail "${step}: ${role}: ${n} successful launch responses lost, not one"
         if [[ "${role}" != spawn ]]; then
             echo "${TEST_NAME}: ${step}: ${role}: its plain spawn's collision (recorded): $(log_hits "${log0}" "[slack] spawnForPersona: collision resolved, state=" "for ${ref}" | cut -f3 | tr '\n' '|')"
@@ -1372,8 +1372,8 @@ leg_fail_create() {
     tmux_shim_mode log
     reset_at="$(now_s)"
     echo "${TEST_NAME}: ${step}: the spawn failed by $(seconds_between "${leg_start}" "${reset_at}")s after the start; the tmux shim is back in log mode. Its line (recorded): $(log_hits "${log0}" '[slack] spawnForPersona: ' "failed for ${F_REF}: " "${SESSION_CREATE_ERR}" | head -n 1 | cut -f3 | cut -c1-400)"
-    creates="$(awk -F'\t' -v a="${leg_start}" -v b="${reset_at}" \
-        '$1 == "call" && $2 + 0 > a + 0 && $2 + 0 <= b + 0 && $6 ~ /(^| )new-session( |$)/ { n++ } END { print n + 0 }' "${SCENARIO_TMUX_SHIM_LOG}")"
+    creates="$(_scenario_complete_log "${SCENARIO_TMUX_SHIM_LOG}" | awk -F'\t' -v a="${leg_start}" -v b="${reset_at}" \
+        '$1 == "call" && $2 + 0 > a + 0 && $2 + 0 <= b + 0 && $6 ~ /(^| )new-session( |$)/ { n++ } END { print n + 0 }')"
     (( creates >= 1 )) || fail "${step}: no new-session call reached the tmux shim while it was in fail-create"
     echo "${TEST_NAME}: ${step}: ${creates} new-session call(s) failed in fail-create (recorded)"
     wait_for_log "$(completion_match 1)" "${START_WAIT_S}" "${step}: the start pass never completed"
@@ -1474,8 +1474,8 @@ leg_fail_create() {
     n="$(count_calls "${table}" - "${F_ID}" kill - -)"
     (( n == 0 )) || fail "${step}: ${n} kill call(s) of ${F_ID} by a CSCB process"
     # Only the bot server ran find-missing in the leg: none from the scenario's shell.
-    mapfile -t lines < <(awk -F'\t' -v a="${leg_start}" -v p="${srv}" \
-        '$1 == "call" && $2 + 0 > a + 0 && $4 != p && $6 ~ /(^| )find-missing( |$)/' "${SCENARIO_AD_SHIM_LOG}")
+    mapfile -t lines < <(_scenario_complete_log "${SCENARIO_AD_SHIM_LOG}" | awk -F'\t' -v a="${leg_start}" -v p="${srv}" \
+        '$1 == "call" && $2 + 0 > a + 0 && $4 != p && $6 ~ /(^| )find-missing( |$)/')
     (( ${#lines[@]} == 0 )) || {
         printf '  | %s\n' "${lines[@]}" >&2
         fail "${step}: ${#lines[@]} find-missing call(s) in the leg not made by the bot server"
@@ -1523,9 +1523,9 @@ leg_fail_create() {
 # (SERVER_PID's) first `status` of row <id> after <time>, read straight from
 # the agent-director shim's log (empty when none).
 server_status_after() {
-    awk -F'\t' -v p="${SERVER_PID}" -v id="$1" -v t="$2" '
+    _scenario_complete_log "${SCENARIO_AD_SHIM_LOG}" | awk -F'\t' -v p="${SERVER_PID}" -v id="$1" -v t="$2" '
         $1 == "call" && $4 == p && $2 + 0 > t + 0 && index(" " $6 " ", " status ") \
-            && index(" " $6 " ", " --instance-id " id " ") { print $2; exit }' "${SCENARIO_AD_SHIM_LOG}"
+            && index(" " $6 " ", " --instance-id " id " ") && !found { print $2; found = 1 }'
 }
 
 # server_status_seen <id> <time>: true once `server_status_after` prints a time.

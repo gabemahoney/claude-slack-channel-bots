@@ -9804,11 +9804,11 @@ const DOWNGRADE_OPERATIONS: readonly (readonly [label: string, pattern: RegExp])
   ['previous bot finishes launching', /^real_wait_launch "\$\{REAL_KEY\}"$/m],
   ['fresh start is asserted rather than resume', /^\[\[ .*cscb_ad_count_between .* resume\).* == 0 \]\] \|\| fail /m],
   // 0.18.0 has no development-channels flag; its route is its own template.
-  ['shim words are decoded by the shared %q decoder', /^const \{ shimWords \} = await import\(receipts\)$/m],
+  ['the shared complete-line reader and %q decoder are loaded', /^const \{ readShimLog, shimWords \} = await import\(receipts\)$/m],
   ["the previous release's own router name is loaded", /^const \{ loadPersonaConfig, MCP_SERVER_NAME \} = await import\(configTs\)$/m],
   ['the previous release builds its own template parameters', /^const params = buildTemplateParams\(loadPersonaConfig\(config, home\)\)$/m],
   ["the previous template's MCP config names the router", /^const routed = params\.agent_args\[0\] === "--mcp-config" && typeof MCP_SERVER_NAME === "string" && MCP_SERVER_NAME !== ""\n  && Object\.hasOwn\(JSON\.parse\(fs\.readFileSync\(params\.agent_args\[1\], "utf8"\)\)\.mcpServers \?\? \{\}, MCP_SERVER_NAME\)$/m],
-  ['actual previous launch templates are read', /^const calls = fs\.readFileSync\(log, "utf8"\)\.split\("\\n"\)\.slice\(Number\(mark\)\)\.filter\(l => l\.startsWith\("call\\t"\)\)\n  \.map\(l => shimWords\(l\.split\("\\t"\)\.slice\(5\)\.join\("\\t"\)\)\)\.filter\(w => w\.includes\("make-template"\)\)$/m],
+  ['actual previous launch templates are read from complete shim lines', /^const calls = readShimLog\(log\)\.split\("\\n"\)\.slice\(Number\(mark\)\)\.filter\(l => l\.startsWith\("call\\t"\)\)\n  \.map\(l => shimWords\(l\.split\("\\t"\)\.slice\(5\)\.join\("\\t"\)\)\)\.filter\(w => w\.includes\("make-template"\)\)$/m],
   ['a template flag is read only when it occurs exactly once', /^const only = \(w, flag\) => w\.indexOf\(flag\) >= 0 && w\.indexOf\(flag\) === w\.lastIndexOf\(flag\) \? w\[w\.indexOf\(flag\) \+ 1\] : undefined$/m],
   ['every --agent-args value is read in order', /^const agentArgs = w => w\.flatMap\(\(word, i\) => word === "--agent-args" \? \[w\[i \+ 1\]\] : \[\]\)$/m],
   ['previous launch is its own template contract without the channels flag or router', /^const ok = routed && params\.name === "slack-channel-bot" && params\.relay_mode === "on" && calls\.length > 0 && calls\.every\(w =>\n  only\(w, "--name"\) === params\.name && only\(w, "--relay-mode"\) === params\.relay_mode\n  && JSON\.stringify\(agentArgs\(w\)\) === JSON\.stringify\(params\.agent_args\)\n  && !w\.includes\("--dangerously-load-development-channels"\) && !w\.includes\("server:slack-channel-router"\)\)\nprocess\.exit\(ok \? 0 : 1\)' \\$/m],

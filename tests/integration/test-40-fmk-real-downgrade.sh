@@ -423,13 +423,13 @@ real_wait_launch "${REAL_KEY}"
 SLACK_STATE_DIR="${SLACK_STATE_DIR}" bun -e '
 const fs = await import("node:fs")
 const [, log, mark, receipts, configTs, templateTs, config, home] = process.argv
-const { shimWords } = await import(receipts)
+const { readShimLog, shimWords } = await import(receipts)
 const { loadPersonaConfig, MCP_SERVER_NAME } = await import(configTs)
 const { buildTemplateParams } = await import(templateTs)
 const params = buildTemplateParams(loadPersonaConfig(config, home))
 const routed = params.agent_args[0] === "--mcp-config" && typeof MCP_SERVER_NAME === "string" && MCP_SERVER_NAME !== ""
   && Object.hasOwn(JSON.parse(fs.readFileSync(params.agent_args[1], "utf8")).mcpServers ?? {}, MCP_SERVER_NAME)
-const calls = fs.readFileSync(log, "utf8").split("\n").slice(Number(mark)).filter(l => l.startsWith("call\t"))
+const calls = readShimLog(log).split("\n").slice(Number(mark)).filter(l => l.startsWith("call\t"))
   .map(l => shimWords(l.split("\t").slice(5).join("\t"))).filter(w => w.includes("make-template"))
 const only = (w, flag) => w.indexOf(flag) >= 0 && w.indexOf(flag) === w.lastIndexOf(flag) ? w[w.indexOf(flag) + 1] : undefined
 const agentArgs = w => w.flatMap((word, i) => word === "--agent-args" ? [w[i + 1]] : [])

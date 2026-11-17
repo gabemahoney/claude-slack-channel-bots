@@ -196,13 +196,13 @@ call_count() {
         echo 0
         return 0
     fi
-    awk -F'\t' '$1 == "call" { n++ } END { print n + 0 }' "${log}"
+    _scenario_complete_log "${log}" | awk -F'\t' '$1 == "call" { n++ } END { print n + 0 }'
 }
 
 # last_call_line [<log>]: print <log>'s last `call` line (the agent-director
 # shim's log by default).
 last_call_line() {
-    awk -F'\t' '$1 == "call" { l = $0 } END { print l }' "${1:-${SCENARIO_AD_SHIM_LOG}}"
+    _scenario_complete_log "${1:-${SCENARIO_AD_SHIM_LOG}}" | awk -F'\t' '$1 == "call" { l = $0 } END { print l }'
 }
 
 # line_count <file>: print how many lines <file> holds (0 when there is none).
@@ -415,7 +415,7 @@ tmux_lines_from_ad() {
     while IFS= read -r line; do
         read_call "tmux lines from agent-director" "${line}"
         [[ "${CALL_PARENT[0]:-}" == */agent-director ]] && n=$(( n + 1 ))
-    done < <(awk -F'\t' '$1 == "call"' "${SCENARIO_TMUX_SHIM_LOG}")
+    done < <(_scenario_complete_log "${SCENARIO_TMUX_SHIM_LOG}" | awk -F'\t' '$1 == "call"')
     echo "${n}"
 }
 
@@ -849,7 +849,7 @@ stop_lines_for() {
         _scenario_split_line "${line}" || continue
         _scenario_eval_words words "${_L_RAW_WORDS}" || continue
         [[ "${words[0]:-}" == stub-claude && "${words[6]:-}" == "${id}:" ]] && printf '%s\n' "${line}"
-    done < <(awk -F'\t' '$1 == "stop"' "${SCENARIO_AD_SHIM_LOG}")
+    done < <(_scenario_complete_log "${SCENARIO_AD_SHIM_LOG}" | awk -F'\t' '$1 == "stop"')
     return 0
 }
 
@@ -1649,7 +1649,7 @@ EOF
     done
 
     # No tmux line has the bot server as its parent.
-    n="$(awk -F'\t' -v p="${SERVER_PID}" '$1 == "call" && $4 == p { n++ } END { print n + 0 }' "${SCENARIO_TMUX_SHIM_LOG}")"
+    n="$(_scenario_complete_log "${SCENARIO_TMUX_SHIM_LOG}" | awk -F'\t' -v p="${SERVER_PID}" '$1 == "call" && $4 == p { n++ } END { print n + 0 }')"
     [[ "${n}" == 0 ]] || fail "${step}: ${n} tmux line(s) have the bot server ${SERVER_PID} as their parent"
 
     # The closing assertions pass over this start's own lines, and both

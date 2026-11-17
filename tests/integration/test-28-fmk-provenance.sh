@@ -452,7 +452,7 @@ run_driver() {
 ad_parented_tmux_count() {
     local lines=() line parent=() n=0 w rest
     [[ -f "${SCENARIO_TMUX_SHIM_LOG}" ]] || { echo 0; return 0; }
-    mapfile -t lines < "${SCENARIO_TMUX_SHIM_LOG}"
+    _scenario_read_log ad_parented_tmux_count "${SCENARIO_TMUX_SHIM_LOG}" lines
     for line in ${lines[@]+"${lines[@]}"}; do
         _scenario_split_line "${line}" && [[ "${_L_KIND}" == call && "${_L_PARENT}" != '?' ]] || continue
         _scenario_decode_words || continue
@@ -483,7 +483,7 @@ tmux_shim_mark() {
 tmux_kill_lines() {
     local lines=() line n=0
     [[ -f "${SCENARIO_TMUX_SHIM_LOG}" ]] || fail "tmux_kill_lines: no tmux shim log at ${SCENARIO_TMUX_SHIM_LOG}"
-    mapfile -t lines < <(tail -n "+$(( $1 + 1 ))" "${SCENARIO_TMUX_SHIM_LOG}")
+    mapfile -t lines < <(_scenario_complete_log "${SCENARIO_TMUX_SHIM_LOG}" | tail -n "+$(( $1 + 1 ))")
     for line in ${lines[@]+"${lines[@]}"}; do
         [[ "${line}" =~ ${TMUX_KILL_RE} ]] && n=$(( n + 1 ))
     done
@@ -663,7 +663,7 @@ echo_log_lines() {
 # holding <verb> and instance id <id> (a cheap scan; the windows read whose
 # call it is).
 shim_line_after() {
-    tail -n "+$(( $1 + 1 ))" "${SCENARIO_AD_SHIM_LOG}" 2> /dev/null | grep -F -- "$2" | grep -qF -- "$3"
+    _scenario_complete_log "${SCENARIO_AD_SHIM_LOG}" 2> /dev/null | tail -n "+$(( $1 + 1 ))" | grep -F -- "$2" | grep -F -- "$3" > /dev/null
 }
 
 # expect_one_relaunch <step> <id>: the last window holds exactly one resume of
