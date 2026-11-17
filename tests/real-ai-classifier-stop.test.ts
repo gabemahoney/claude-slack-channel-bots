@@ -85,6 +85,38 @@ function ordinaryEvidence() {
   return { ...e, seq: 3, reply }
 }
 
+function invertedAttachments(e: ReturnType<typeof evidence>, take: TranscriptEntry, reply: TranscriptEntry) {
+  const setup = e.entry(take.offset + 1, { type: 'attachment', uuid: 'setup-' + take.uuid,
+    parentUuid: take.uuid, attachment: { type: 'environment' } })
+  setup.at = take.at - 1
+  // Native pending attachments land before the first receipt, even when the
+  // turn under test is a later part or a repeated copy.
+  const head = e.entry(take.offset / 10, { type: 'attachment', uuid: 'head-' + take.uuid,
+    parentUuid: setup.value.uuid, attachment: { type: 'instructions' } })
+  head.at = take.at
+  reply.value.parentUuid = head.value.uuid
+  e.own.push(head, setup)
+  return { head, setup }
+}
+
+test('spoof observer links inverted attachments on the durable receipt and every duplicate', () => {
+  const e = ordinaryEvidence(), copy = duplicate(e)
+  invertedAttachments(e, e.take, e.reply)
+  invertedAttachments(e, copy.take, copy.reply)
+  expect(spoofTurn(e)).toBeNull()
+})
+
+test.each(['early', 'assistant', 'same-offset', 'cycle'])('spoof duplicate cannot use an inverted %s link', kind => {
+  const e = ordinaryEvidence(), copy = duplicate(e)
+  const { head, setup } = invertedAttachments(e, copy.take, copy.reply)
+  if (kind === 'early') head.at = copy.take.at - 1
+  if (kind === 'assistant') head.value.type = 'assistant'
+  if (kind === 'same-offset') head.offset = setup.offset
+  if (kind === 'cycle') setup.value.parentUuid = head.value.uuid
+  expect(() => spoofTurn(e)).toThrow(kind === 'cycle'
+    ? 'spoof response has stale/invalid time' : 'no completed current-turn readback for spoof copy')
+})
+
 test.each([
   ['missing message_id', { message_id: undefined }],
   ['wrong message_id', { message_id: 'wrong' }],
@@ -813,6 +845,28 @@ const readAC15 = (e: ReturnType<typeof multipartAC15>) => completedAIReadback(e)
 const forbiddenAC15Action = (e: ReturnType<typeof multipartAC15>, offset: number, parentUuid: string, name = 'mcp__slack-channel-router__fetch_messages') =>
   assistant(e, [{ type: 'tool_use', name, id: 'fetch', input: { chat_id: 'D0AIAC15', limit: 1 } }], offset, { parentUuid })
 
+test('AC15 exchange and final completion accept inverted attachments at receipt time', () => {
+  const e = multipartAC15()
+  invertedAttachments(e, e.own[0]!, e.own[1]!)
+  invertedAttachments(e, e.own[4]!, e.own[5]!)
+  expect(readAC15(e).receipt_uuid).toBe('part-3')
+})
+
+test.each(['tool', 'refusal'])('AC15 exchange catches late %s through inverted attachments after the next take-in', outcome => {
+  const e = multipartAC15(), { head } = invertedAttachments(e, e.own[0]!, e.own[1]!)
+  const late = outcome === 'tool' ? forbiddenAC15Action(e, 90, head.value.uuid)
+    : e.entry(90, { type: 'system', uuid: 'late-refusal', parentUuid: head.value.uuid, subtype: 'model_refusal_no_fallback' })
+  e.own.push(e.entry(80, { type: 'user', uuid: 'unrelated', parentUuid: 'reply65',
+    message: { role: 'user', content: 'other input' } }), late)
+  expect(() => readAC15(e)).toThrow(outcome === 'tool' ? /^non-reply tool action observed$/ : /^exchange has refusal\/API failure$/)
+})
+
+test('AC15 completion rejects an inverted attachment stamped before its receipt', () => {
+  const e = multipartAC15(), take = e.own[4]!, { head } = invertedAttachments(e, take, e.own[5]!)
+  head.at = take.at - 1
+  expect(() => readAC15(e)).toThrow('invalid native assistant response')
+})
+
 // b.436: exercise the independent engine reference without fabricating a
 // send-time path. The CLI controls below the image boundary cover its wiring.
 function lateReferenceEvidence(multipart: boolean, allPathless = false) {
@@ -900,7 +954,7 @@ async function spoofCLI(e: ReturnType<typeof lateSpoofReference>, mode: string,
   const program = `
     const { existsSync, readFileSync, join, dirname, basename, packedReceiptAdapters, transcriptFiles, readTranscripts,
       receiptJournal, auditReceipts, personaTranscripts, auditedAICorpus, reportFailureOnce, process, console,
-      diagnosticValue, completedAIReadback, nativeInformation, nativeSendBinding, nativeSendWindow, nativeTime, safeSelectedModel } = deps;
+      diagnosticValue, completedAIReadback, nativeChain, nativeInformation, nativeSendBinding, nativeSendWindow, nativeTime, safeSelectedModel } = deps;
     ${declarations}
     const observe = classifierObservation;
     classifierObservation = (options, mode) => { deps.forwarded.push(options); return observe(options, mode); };
@@ -982,7 +1036,8 @@ test.each(['user', 'queued-final'])('accepts ten untimed native informational re
 function ac15ClockChain(skew = 1, type = 'total_tokens_reminder') {
   const e = multipartAC15(), first = e.own[0]!, final = e.own[4]!, reply = e.own[5]!
   // Captured R6 trial 2: user .773 -> environment .772, and later user
-  // .441 -> total_tokens_reminder .440. File offsets and UUIDs order both.
+  // .441 -> total_tokens_reminder .440. UUIDs select ancestry; the preparation
+  // timestamps do not authorize forward parents before the receipt.
   const base = Date.parse('2026-10-17T10:45:33.753Z')
   for (const row of e.own) row.at += base
   e.journal[0].received_at += base
@@ -1038,7 +1093,8 @@ test.each([
   ['missing parent', (x: ReturnType<typeof ac15ClockChain>) => { delete x.reminder.value.parentUuid }],
   ['malformed parent', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.value.parentUuid = {} }],
   ['unknown parent', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.value.parentUuid = 'missing' }],
-  ['future parent', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.value.parentUuid = x.completion.value.uuid }],
+  ['future parent before receipt time', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.value.parentUuid = x.completion.value.uuid }],
+  ['future parent of non-attachment', (x: ReturnType<typeof ac15ClockChain>) => { x.e.own[5]!.value.parentUuid = x.completion.value.uuid }],
   ['same-offset parent', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.offset = 60 }],
   ['cycle', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.value.parentUuid = x.e.own[5]!.value.uuid }],
   ['duplicate UUID', (x: ReturnType<typeof ac15ClockChain>) => { x.e.own.push({ ...x.reminder, offset: 62 }) }],

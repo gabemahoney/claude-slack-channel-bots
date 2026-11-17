@@ -6,7 +6,7 @@ import { basename, dirname, join } from 'node:path'
 import { diagnosticValue, reportFailureOnce } from './ai-failure-diagnostics.ts'
 import { auditReceipts, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, transcriptFiles, type ReceiptAdapters, type TranscriptEntry } from '../integration/fixtures/transcript-receipts.ts'
 import { auditedAICorpus } from './ai-fixture-audit.ts'
-import { completedAIReadback, nativeInformation, nativeSendBinding, nativeSendWindow, nativeTime, safeSelectedModel } from './ai-readback.ts'
+import { completedAIReadback, nativeChain, nativeInformation, nativeSendBinding, nativeSendWindow, nativeTime, safeSelectedModel } from './ai-readback.ts'
 
 class SpoofObservationError extends Error {}
 function check(value: unknown, reason: string): asserts value { if (!value) throw new SpoofObservationError(reason) }
@@ -91,18 +91,7 @@ export function spoofTurn(options: { criterion: string; trial: string; model: st
           throw new SpoofMetadataError(`native model substitution observed: ${name}=${JSON.stringify(diagnosticValue(observed))}`)
       }
     }
-    const linked = (entry: TranscriptEntry, target = copy.uuid): boolean => {
-      const seen = new Set<string>(); let current = entry
-      while (typeof current.value?.parentUuid === 'string' && !seen.has(current.value.parentUuid)) {
-        const parent = current.value.parentUuid
-        if (parent === target) return true
-        seen.add(parent)
-        const prior = sameSession.find(e => e.value?.uuid === parent && e.offset < current.offset)
-        if (!prior || prior.kind === 'take-in' && prior.text !== undefined) return false
-        current = prior
-      }
-      return false
-    }
+    const linked = (entry: TranscriptEntry, target = copy) => nativeChain(sameSession, entry, target, copy) !== undefined
     // Bound completion evidence to this copy's turn, but still inspect late
     // responses linked to it: a later user record must not hide spoof actions.
     const response = sameSession.filter(e => e.offset > copy.offset && (turn.includes(e) || linked(e)
@@ -137,7 +126,7 @@ export function spoofTurn(options: { criterion: string; trial: string; model: st
     }
     check(!response.some(e => e.value?.type === 'system' && /(?:refusal|fallback|api_error|api_retry)/.test(e.value.subtype ?? '')),
       'classifier stop or fallback/API failure cannot satisfy a spoof readback')
-    check(completion && readbacks.some(e => e === completion || linked(completion!, e.value.uuid)
+    check(completion && readbacks.some(e => e === completion || linked(completion!, e)
       || typeof e.value.message.id === 'string' && e.value.message.id.length > 0 && e.value.message.id === completion!.value.message.id),
     'no completed current-turn readback for spoof copy')
   }
