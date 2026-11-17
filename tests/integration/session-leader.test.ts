@@ -39,7 +39,9 @@ import { readFileSync } from 'node:fs'
 const stat = readFileSync('/proc/self/stat', 'utf8')
 const fields = stat.slice(stat.lastIndexOf(') ') + 2).split(' ')
 const session = parseInt(fields[3] ?? '', 10)
-process.stdout.write(JSON.stringify({ pid: process.pid, session }) + '\\n')
+const nspid = readFileSync('/proc/self/status', 'utf8').split('\\n').find(l => l.startsWith('NSpid:')) ?? ''
+const pid = parseInt(nspid.slice('NSpid:'.length).trim().split(/\\s+/)[0] ?? '', 10)
+process.stdout.write(JSON.stringify({ pid, session }) + '\\n')
 `
 
 describe('isSessionLeader stat parsing on a real detached child', () => {

@@ -354,7 +354,13 @@ await child.exited
     const grandchild = `
       import { connect } from 'node:net'
       const socket = connect(${JSON.stringify(socketPath)}, () => {
-        socket.write(JSON.stringify([process.ppid, process.pid]) + '\\n')
+        // Host PIDs for the /proc checks; without /proc, the namespace pair as before.
+        let host = [process.ppid, process.pid]
+        try {
+          const status = require('node:fs').readFileSync('/proc/self/status', 'utf8')
+          host = [Number(status.match(/^PPid:\\s+(\\d+)/m)[1]), Number(status.match(/^NSpid:\\s+(\\d+)/m)[1])]
+        } catch {}
+        socket.write(JSON.stringify([process.ppid, process.pid, ...host]) + '\\n')
       })
       setInterval(() => {}, 1000)
     `
@@ -392,13 +398,13 @@ await child.exited
       expect({ code, stdout, stderr, signal: child.signalCode ?? null })
         .toEqual({ code: 130, stdout: '', stderr: '', signal: null })
       await bounded(disconnected, 'descendant disconnect')
-      await expectDescendantsStopped(pids)
+      await expectDescendantsStopped(pids.slice(2))
     } finally {
       // Cleanup must work even if the wrapper's group kill or readiness fails.
       try { child?.kill('SIGKILL') } catch {}
       const recorded: number[] = existsSync(pidFile) ? JSON.parse(readFileSync(pidFile, 'utf8')) : []
       if (recorded[0]) { try { process.kill(-recorded[0], 'SIGKILL') } catch {} }
-      for (const pid of new Set([...recorded, ...pids])) { try { process.kill(pid, 'SIGKILL') } catch {} }
+      for (const pid of new Set([...recorded, ...pids.slice(0, 2)])) { try { process.kill(pid, 'SIGKILL') } catch {} }
       for (const socket of sockets) socket.destroy()
       const cleanupDeadline = performance.now() + 1_000
       const cleanup = [

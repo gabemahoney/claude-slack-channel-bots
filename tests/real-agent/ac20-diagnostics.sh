@@ -19,8 +19,9 @@ real_ac20_diagnostics_start() {
 #!/usr/bin/env bash
 # The final execve in native() preserves this pane PID for AD's SessionStart
 # association. Raw stderr only crosses an anonymous pipe to the sidecar.
+while read -r key value _; do [[ "${key}" == NSpid: ]] && { HOST_PID="${value}"; break; }; done < /proc/self/status
 exec bun "${AC20_DIAGNOSTIC_HELPER}" native "${AC20_DIAGNOSTIC_DIR}" /opt/claude-code/2.1.296/claude "$@" \
-    2> >(exec bun "${AC20_DIAGNOSTIC_HELPER}" collect "${AC20_DIAGNOSTIC_DIR}" "$$")
+    2> >(exec bun "${AC20_DIAGNOSTIC_HELPER}" collect "${AC20_DIAGNOSTIC_DIR}" "${HOST_PID}")
 WRAPPER
     chmod 700 "${wrapper}"
     python3 - "${SCENARIO_AD_ROOT}/config.toml" "${wrapper}" <<'CONFIG'

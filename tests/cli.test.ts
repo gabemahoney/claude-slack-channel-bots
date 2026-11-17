@@ -2280,7 +2280,9 @@ describe('start — daemonize session-leader guard', () => {
     // PRECONDITION: the leaked-marker tests assume the runner is NOT a session
     // leader. Fail loudly with a self-diagnosing message if it is (e.g. PID 1).
     const sid = readOwnSessionId()
-    if (sid !== null && sid === process.pid) {
+    // A non-null sid means /proc is readable. Compare it with the host PID
+    // (NSpid's first field), which equals process.pid outside a PID namespace.
+    if (sid !== null && sid === parseInt(readFileSync('/proc/self/status', 'utf8').match(/^NSpid:\s+(\d+)/m)?.[1] ?? '', 10)) {
       throw new Error(
         `precondition violated: the test runner IS a session leader ` +
         `(session id ${sid} === pid ${process.pid}). The leaked-marker guard ` +

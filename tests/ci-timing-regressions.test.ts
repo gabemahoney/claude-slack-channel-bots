@@ -2884,7 +2884,9 @@ describe('the burst driver runs off the server\'s CPU quota (stub shell)', () =>
   ]
   // A stand-in for sr8-evidence.ts: prints what it ran with, and for fault-burst waits to be stopped.
   const stubDriver = `import { readFileSync, writeFileSync } from 'node:fs'
-const [command, ...rest] = process.argv.slice(2), grand = readFileSync('/proc/' + process.ppid + '/stat', 'utf8').split(') ')[1].split(' ')[1], e = process.env
+const ppidOf = (pid) => { const s = readFileSync('/proc/' + pid + '/stat', 'utf8'); return s.slice(s.lastIndexOf(') ') + 2).split(' ')[1] }
+const nsPid = (hostPid) => readFileSync('/proc/' + hostPid + '/status', 'utf8').split('\\n').find(l => l.startsWith('NSpid:')).split('\\t').pop()
+const [command, ...rest] = process.argv.slice(2), grand = nsPid(ppidOf(ppidOf('self'))), e = process.env
 console.log('driver ' + command + ' ' + rest.join(' ') + ' cwd=' + process.cwd() + ' root=' + e.SCENARIO_ROOT + ' cpu=' + e.SR8_PHASE_CPU_FILE + ' pids=' + e.SR8_PHASE_CPU_PIDS
   + ' profile=' + e.SR8_PROFILE_DIR + ' path=' + e.PATH + ' home=' + e.HOME + ' options=' + e.BUN_OPTIONS + ' extra=' + e.EXTRA + ' pid=' + process.pid + ' grandparent=' + grand)
 console.error('driver stderr')

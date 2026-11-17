@@ -289,10 +289,10 @@ function launchSeam(options: { ready?: unknown; appearsAt?: number; alive?: bool
   let now = 0, execs = 0; const killed: number[] = [], replaced = {}
   const environment = { ANTHROPIC_BASE_URL: 'https://example.invalid/base?keep=1', AC20_TEST_SECRET: secret, KEEP: 'same' }
   let arguments_: unknown, forwarded: Record<string, string> | undefined
-  const native = new Function('readFileSync', 'join', 'integer', 'process', 'Bun', 'existsSync', 'Date', 'nativeProcessIdentity', new Bun.Transpiler({ loader: 'ts' }).transformSync(nativeFunction + '\nreturn native'))(
+  const native = new Function('readFileSync', 'join', 'integer', 'process', 'Bun', 'existsSync', 'Date', 'nativeProcessIdentity', 'hostPid', new Bun.Transpiler({ loader: 'ts' }).transformSync(nativeFunction + '\nreturn native'))(
     (path: string) => path.endsWith('gateway-ready.json') ? JSON.stringify({ port: options.port ?? 12345 }) : now < (options.appearsAt ?? 0) ? (() => { throw new Error('collector not ready') })() : JSON.stringify(options.ready ?? { pid: 100, nativePid: 99, started: '111' }),
     join, integer, { pid: 99, env: environment, kill: (pid: number) => { killed.push(pid); if (options.alive === false) throw new Error('collector not live') }, execve: (binary: string, args: string[], env: Record<string, string>) => { execs++; arguments_ = { binary, args }; forwarded = env; if (!options.returns) throw replaced } },
-    { sleep: async (ms: number) => { now += ms } }, () => now >= (options.appearsAt ?? 0), { now: () => now }, () => ({ state: 'S', started: '111' }))
+    { sleep: async (ms: number) => { now += ms } }, () => now >= (options.appearsAt ?? 0), { now: () => now }, () => ({ state: 'S', started: '111' }), () => 99)
   return { run: async () => { let execReplaced = false, failed = false; try { await native('/owned', '/owned/stand-in', ['--original', 'space arg']) } catch (error) { execReplaced = error === replaced; failed = !execReplaced }; return { execReplaced, failed } },
     state: () => ({ now, execs, killed, arguments_, environmentPreserved: forwarded !== undefined && Object.keys(environment).every(key => key === 'ANTHROPIC_BASE_URL' || forwarded![key] === environment[key as keyof typeof environment]), gatewayChangedOnly: forwarded?.ANTHROPIC_BASE_URL === 'http://127.0.0.1:12345/base?keep=1' }) }
 }
@@ -301,9 +301,9 @@ function collectorSeam(options: { chunks?: Buffer[]; readFailure?: boolean; pend
   const renames: Array<[string, string]> = []; let identityReads = 0
   const rows: Row[] = [], writes: Array<{ path: string; value: unknown; options: unknown }> = []
   const reader = { read: async () => { if (options.readFailure) throw new Error(secret); if (index < (options.chunks?.length ?? 0)) return { done: false, value: options.chunks![index++] }; if (options.pending) return new Promise<{ done: boolean }>(resolve => { pendingResolve = resolve }); return { done: true } }, cancel: async () => { cancelled++; pendingResolve?.({ done: true }) } }
-  const collect = new Function('integer', 'process', 'sink', 'nativeDebugProjection', 'scope', 'Bun', 'writeFileSync', 'join', 'Date', 'renameSync', 'nativeProcessIdentity', new Bun.Transpiler({ loader: 'ts' }).transformSync((options.implementation ? options.implementation.slice(options.implementation.indexOf('async function collectNative('), options.implementation.indexOf('\nif (import.meta.main)')) : collectorFunction) + '\nreturn collectNative'))(
+  const collect = new Function('integer', 'process', 'sink', 'nativeDebugProjection', 'scope', 'Bun', 'writeFileSync', 'join', 'Date', 'renameSync', 'nativeProcessIdentity', 'hostPid', new Bun.Transpiler({ loader: 'ts' }).transformSync((options.implementation ? options.implementation.slice(options.implementation.indexOf('async function collectNative('), options.implementation.indexOf('\nif (import.meta.main)')) : collectorFunction) + '\nreturn collectNative'))(
     integer, { pid: 100, kill: () => { if (options.vanish) throw new Error('gone') } }, () => (row: Row) => rows.push(row), nativeDebugProjection, () => 2,
-    { stdin: { stream: () => ({ getReader: () => reader }) }, sleep: async (ms: number) => { now += ms; if (options.releaseAfter !== undefined && now >= options.releaseAfter) pendingResolve?.({ done: true }) } }, (path: string, data: string, settings: unknown) => writes.push({ path, value: JSON.parse(data), options: settings }), join, { now: () => now }, (from: string, to: string) => renames.push([from, to]), () => { identityReads++; if (identityReads === 1 && options.initialState) { if (options.initialState === 'missing') return undefined; if (options.initialState === 'EACCES') throw new Error(secret); return { state: options.initialState, started: '111' } }; if (identityReads > 1) { if (options.vanish || options.state === 'gone') return undefined; if (options.state === 'EACCES') { if (identityReads > 2) throw new Error(secret); return { state: 'S', started: '111' } }; if (options.state) return { state: options.state === 'reused' ? 'S' : options.state, started: options.state === 'reused' ? '222' : '111' } }; return { state: 'S', started: '111' } })
+    { stdin: { stream: () => ({ getReader: () => reader }) }, sleep: async (ms: number) => { now += ms; if (options.releaseAfter !== undefined && now >= options.releaseAfter) pendingResolve?.({ done: true }) } }, (path: string, data: string, settings: unknown) => writes.push({ path, value: JSON.parse(data), options: settings }), join, { now: () => now }, (from: string, to: string) => renames.push([from, to]), () => { identityReads++; if (identityReads === 1 && options.initialState) { if (options.initialState === 'missing') return undefined; if (options.initialState === 'EACCES') throw new Error(secret); return { state: options.initialState, started: '111' } }; if (identityReads > 1) { if (options.vanish || options.state === 'gone') return undefined; if (options.state === 'EACCES') { if (identityReads > 2) throw new Error(secret); return { state: 'S', started: '111' } }; if (options.state) return { state: options.state === 'reused' ? 'S' : options.state, started: options.state === 'reused' ? '222' : '111' } }; return { state: 'S', started: '111' } }, () => 100)
   return { run: () => collect('/owned', options.nativePid ?? 99), rows, writes, renames, state: () => ({ now, cancelled }) }
 }
 describe('PID-preserving native launcher and strict collector handshake', () => {
@@ -358,11 +358,13 @@ async function processIdentityProbe(mode: 'exec' | 'spawn') {
     writeFileSync(join(home, 'gateway-ready.json'), '{"port":12345}'); writeFileSync(join(home, 'scope.json'), '{"case":1}')
     const actualWrapper = shell.slice(shell.indexOf('#!/usr/bin/env bash\n'), shell.indexOf('\nWRAPPER'))
     const command = mode === 'exec' ? actualWrapper.slice(actualWrapper.indexOf('\n') + 1) : 'exec bun "$AC20_DIAGNOSTIC_HELPER" native "$AC20_DIAGNOSTIC_DIR" /opt/claude-code/2.1.296/claude "$@"'
-    writeFileSync(wrapper, `printf '{"panePid":%s}\\n' "$$"\n${command}\n`)
+    // Exec mode also prints the pane's host PID (NSpid's first field), which names its log. The frozen spawn control keeps its namespace-only prefix.
+    const paneLine = mode === 'exec' ? `while read -r k v _; do [[ $k == NSpid: ]] && { H=$v; break; }; done < /proc/self/status\nprintf '{"panePid":%s,"paneHost":%s}\\n' "$$" "$H"` : `printf '{"panePid":%s}\\n' "$$"`
+    writeFileSync(wrapper, `${paneLine}\n${command}\n`)
     const child = spawnSync('bash', [wrapper, '--original', 'space arg'], { env: hostSafeChildEnv(home, { tools: ['bash', 'bun'], extras: { AC20_DIAGNOSTIC_HELPER: helper, AC20_DIAGNOSTIC_DIR: home, OWNED_STAND_IN: standIn, ANTHROPIC_BASE_URL: 'https://example.invalid/base?keep=1', AC20_TEST_SECRET: secret } }), encoding: 'utf8', timeout: 7000 })
     safe([child.stdout, child.stderr]); expect(child.error).toBeUndefined(); expect(child.status).toBe(17); expect(child.stderr).toBe('')
     const [pane, native] = child.stdout.trim().split('\n').map(line => JSON.parse(line))
-    const log = join(home, `native-${pane.panePid}.jsonl`)
+    const log = join(home, `native-${mode === 'exec' ? pane.paneHost : pane.panePid}.jsonl`)
     for (let i = 0; i < 100; i++) { if (existsSync(log) && readFileSync(log, 'utf8').includes('unterminated_line')) break; await Bun.sleep(10) }
     const rows = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line)); safe(rows)
     return { pane, native, rows }
@@ -424,7 +426,7 @@ async function publishWhileLaunching(implementation: string) {
   const first = implementation.indexOf('async function native('), native = implementation.slice(first, implementation.indexOf('\n/**', first))
   const collector = implementation.slice(implementation.indexOf('async function collectNative('), implementation.indexOf('\nif (import.meta.main)'))
   const files = new Map<string, string>([['/owned/gateway-ready.json', '{"port":12345}']]); let launched: Promise<unknown> | undefined, replaced = false
-  const replacement = {}, fields = ['readFileSync', 'writeFileSync', 'renameSync', 'existsSync', 'join', 'integer', 'process', 'Bun', 'Date', 'sink', 'nativeDebugProjection', 'scope', 'nativeProcessIdentity']
+  const replacement = {}, fields = ['readFileSync', 'writeFileSync', 'renameSync', 'existsSync', 'join', 'integer', 'process', 'Bun', 'Date', 'sink', 'nativeDebugProjection', 'scope', 'nativeProcessIdentity', 'hostPid']
   const common: Record<string, unknown> = { readFileSync: (path: string) => { if (!files.has(path)) throw new Error('not yet published'); return files.get(path) }, existsSync: (path: string) => files.has(path), join, integer,
     Bun: { sleep: async () => {}, stdin: { stream: () => ({ getReader: () => ({ read: async () => ({ done: true }), cancel: async () => {} }) }) } }, Date: { now: () => 0 }, sink: () => () => {}, nativeDebugProjection, scope: () => 1, nativeProcessIdentity: () => ({ state: 'S', started: '111' }) }
   let launch!: () => Promise<unknown>
@@ -433,7 +435,7 @@ async function publishWhileLaunching(implementation: string) {
     files.set(path, ''); launched ??= launch(); files.set(path, data)
   }
   common.renameSync = (from: string, to: string) => { files.set(to, files.get(from)!); files.delete(from) }
-  const build = (body: string, process_: unknown, name: string) => new Function(...fields, new Bun.Transpiler({ loader: 'ts' }).transformSync(body + `\nreturn ${name}`))(...fields.map(field => field === 'process' ? process_ : common[field]))
+  const build = (body: string, process_: unknown, name: string) => new Function(...fields, new Bun.Transpiler({ loader: 'ts' }).transformSync(body + `\nreturn ${name}`))(...fields.map(field => field === 'process' ? process_ : field === 'hostPid' ? () => (process_ as { pid: number }).pid : common[field]))
   const launcher = build(native, { pid: 99, env: { ANTHROPIC_BASE_URL: 'https://example.invalid' }, kill: () => {}, execve: () => { throw replacement } }, 'native')
   launch = async () => { try { await launcher('/owned', '/owned/stand-in', []) } catch (error) { replaced = error === replacement } }
   await build(collector, { pid: 100, kill: () => {} }, 'collectNative')('/owned', 99)

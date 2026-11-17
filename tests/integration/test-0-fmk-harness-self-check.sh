@@ -2519,7 +2519,7 @@ leg_stub_lines_not_cscb() {
     # missing; only the status-failure leg writes one. Harness calls stay
     # in the same shim log format.
     if ad_release_at_least 0.18.0; then expected_stops=1; fi
-    mapfile -d '' -t mine < "/proc/$$/cmdline"
+    mapfile -d '' -t mine < "/proc/self/cmdline"
     while IFS= read -r line; do
         _scenario_split_line "${line}" || fail "${step}: a shim log line is not in its format: ${line}"
         case "${_L_KIND}" in

@@ -181,10 +181,11 @@ async function native(directory: string, binary: string, args: string[]) {
   if (!integer(ready.port, 65535) || ready.port === 0) throw new Error('gateway not ready')
   const url = new URL(process.env.ANTHROPIC_BASE_URL!)
   url.protocol = 'http:'; url.hostname = '127.0.0.1'; url.port = String(ready.port)
-  const collectorReady = join(directory, `native-${process.pid}.ready`), deadline = Date.now() + 5000
+  const self = hostPid()
+  const collectorReady = join(directory, `native-${self}.ready`), deadline = Date.now() + 5000
   while (!existsSync(collectorReady) && Date.now() < deadline) await Bun.sleep(20)
   const collector = JSON.parse(readFileSync(collectorReady, 'utf8'))
-  if (!integer(collector.pid) || collector.pid === 0 || collector.nativePid !== process.pid || collector.started !== nativeProcessIdentity(process.pid)?.started) throw new Error('native collector unavailable')
+  if (!integer(collector.pid) || collector.pid === 0 || collector.nativePid !== self || collector.started !== nativeProcessIdentity(self)?.started) throw new Error('native collector unavailable')
   process.kill(collector.pid, 0)
   // AD associates SessionStart with the pane PID. Spawning a child here leaves
   // Bun as that pane process and makes AD reject every native hook. execve
@@ -207,12 +208,16 @@ function nativeProcessIdentity(pid: number) {
   try { return parseNativeProcessStat(readFileSync(`/proc/${pid}/stat`, 'utf8'), pid) }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
 }
+/** This process's PID as /proc names it: NSpid's first field, never process.pid. */
+function hostPid() {
+  return Number(/^NSpid:\s+(\d+)/m.exec(readFileSync('/proc/self/status', 'utf8'))?.[1])
+}
 
 /** The shell starts this sidecar before execing native in the pane. No raw
  * debug file is created. EOF is not evidence of an exit code, and inherited
  * descendant writers cannot keep collection alive after the pane PID exits. */
 async function collectNative(directory: string, nativePid: number) {
-  if (!integer(nativePid) || nativePid === 0 || nativePid === process.pid) throw new Error('native identity unavailable')
+  if (!integer(nativePid) || nativePid === 0 || nativePid === hostPid()) throw new Error('native identity unavailable')
   const identity = nativeProcessIdentity(nativePid)
   if (!identity || /^[ZXx]$/.test(identity.state)) throw new Error('native identity unavailable')
   const emit = sink(directory, `native-${nativePid}.jsonl`)
