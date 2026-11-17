@@ -1088,10 +1088,14 @@ remain unchanged, and diagnostic records establish no paid acceptance result.
 Ordinary receipts may be eligible native user records or production-recognized
 human queued-command attachments; each take-in starts its own exchange window.
 A queued command may be timestamped before the previous turn's acknowledgement;
-it still needs its own exact receipt and send window. Resolve ancestry by unique
-UUID parents in the same session/path at strictly preceding file offsets,
-independently of timestamps, and stop at another take-in; earlier turns or
-sessions cannot supply the response.
+it still needs its own exact receipt and send window. Resolve `parentUuid` by
+unique UUID in the same session/path at any offset. A later-offset parent is
+allowed only for a timed native attachment child that is not a take-in and is
+stamped at or after the receipt; assistant, user, tool-result and system children
+still require an earlier-offset parent. Reject same-offset parents and cycles,
+and stop at any other take-in before reaching the exact receipt UUID; earlier
+turns or sessions cannot supply the response. The ordinary, multipart and spoof
+observers share this ancestry rule.
 
 Only timed `environment`, `model`, `agent_listing_delta`,
 `mcp_instructions_delta`, `skill_listing`, `total_tokens_reminder`,

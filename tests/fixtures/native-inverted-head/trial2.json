@@ -1,0 +1,197 @@
+[
+  {
+    "offset": 271,
+    "at": 1794914818675,
+    "type": "attachment",
+    "uuid": "36582f50-4ee8-4d55-8d81-3dfcf60c3811",
+    "parentUuid": "2d58ef92-8241-49d1-8230-9da8224c13b3",
+    "sessionId": "28a1bb56-1965-4114-b5fb-54db27e5d87c",
+    "isSidechain": false,
+    "attachment": {
+      "type": "instructions"
+    }
+  },
+  {
+    "offset": 4057,
+    "at": 1794914818675,
+    "type": "attachment",
+    "uuid": "baeedf32-70bb-43c4-bf47-c19ec7ff8083",
+    "parentUuid": "36582f50-4ee8-4d55-8d81-3dfcf60c3811",
+    "sessionId": "28a1bb56-1965-4114-b5fb-54db27e5d87c",
+    "isSidechain": false,
+    "attachment": {
+      "type": "session_context"
+    }
+  },
+  {
+    "offset": 5447,
+    "at": 1794914818676,
+    "type": "attachment",
+    "uuid": "2442c8cf-3dbe-45f7-bab5-b011f0ca7ef9",
+    "parentUuid": "baeedf32-70bb-43c4-bf47-c19ec7ff8083",
+    "sessionId": "28a1bb56-1965-4114-b5fb-54db27e5d87c",
+    "isSidechain": false,
+    "attachment": {
+      "type": "date"
+    }
+  },
+  {
+    "offset": 6036,
+    "at": 1794914818678,
+    "type": "attachment",
+    "uuid": "cedde411-264a-481d-8e2f-cbb5520cc6ee",
+    "parentUuid": "2442c8cf-3dbe-45f7-bab5-b011f0ca7ef9",
+    "sessionId": "28a1bb56-1965-4114-b5fb-54db27e5d87c",
+    "isSidechain": false,
+    "attachment": {
+      "type": "remote_session_change"
+    }
+  },
+  {
+    "offset": 7608,
+    "at": 1794914816384,
+    "type": "user",
+    "uuid": "87c5e917-806b-454f-90e6-f8274b85c08c",
+    "parentUuid": null,
+    "sessionId": "28a1bb56-1965-4114-b5fb-54db27e5d87c",
+    "isSidechain": false,
+    "message": {
+      "role": "user",
+      "content": "case_01 stand-in prompt"
+    },
+    "origin": {
+      "kind": "human"
+    }
+  },
+  {
+    "offset": 8413,
+    "at": 1794914816383,
+    "type": "attachment",
+    "uuid": "d4fa7511-3d16-46ca-8d88-623704b8076e",
+    "parentUuid": "87c5e917-806b-454f-90e6-f8274b85c08c",
+    "sessionId": "28a1bb56-1965-4114-b5fb-54db27e5d87c",
+    "isSidechain": false,
+    "attachment": {
+      "type": "environment"
+    }
+  },
+  {
+    "offset": 9861,
+    "at": 1794914816383,
+    "type": "attachment",
+    "uuid": "13dd8cc3-1d9a-4129-8c04-d546274a6a43",
+    "parentUuid": "d4fa7511-3d16-46ca-8d88-623704b8076e",
+    "sessionId": "28a1bb56-1965-4114-b5fb-54db27e5d87c",
+    "isSidechain": false,
+    "attachment": {
+      "type": "model"
+    }
+  },
+  {
+    "offset": 10774,
+    "at": 1794914816383,
+    "type": "attachment",
+    "uuid": "e8b42b0f-e6fa-41b2-b08f-db1cf4b60847",
+    "parentUuid": "13dd8cc3-1d9a-4129-8c04-d546274a6a43",
+    "sessionId": "28a1bb56-1965-4114-b5fb-54db27e5d87c",
+    "isSidechain": false,
+    "attachment": {
+      "type": "agent_listing_delta"
+    }
+  },
+  {
+    "offset": 16828,
+    "at": 1794914816383,
+    "type": "attachment",
+    "uuid": "bb0ef53a-6488-48e5-8236-0a3313c4600f",
+    "parentUuid": "e8b42b0f-e6fa-41b2-b08f-db1cf4b60847",
+    "sessionId": "28a1bb56-1965-4114-b5fb-54db27e5d87c",
+    "isSidechain": false,
+    "attachment": {
+      "type": "mcp_instructions_delta"
+    }
+  },
+  {
+    "offset": 21704,
+    "at": 1794914816383,
+    "type": "attachment",
+    "uuid": "2d58ef92-8241-49d1-8230-9da8224c13b3",
+    "parentUuid": "bb0ef53a-6488-48e5-8236-0a3313c4600f",
+    "sessionId": "28a1bb56-1965-4114-b5fb-54db27e5d87c",
+    "isSidechain": false,
+    "attachment": {
+      "type": "skill_listing"
+    }
+  },
+  {
+    "offset": 35901,
+    "at": 1794914822668,
+    "type": "assistant",
+    "uuid": "2ff7a04e-d690-499f-8319-b3f7fd6ba93e",
+    "parentUuid": "cedde411-264a-481d-8e2f-cbb5520cc6ee",
+    "sessionId": "28a1bb56-1965-4114-b5fb-54db27e5d87c",
+    "isSidechain": false,
+    "requestedModel": "aws/anthropic/bedrock-claude-opus-5-5",
+    "message": {
+      "id": "msg_bdrk_rvwi3rhw57azqnr36qnwlt52yxjtrqf6pk2kmbmqpsivewt34uha",
+      "role": "assistant",
+      "model": "aws/anthropic/bedrock-claude-opus-5-5",
+      "stop_reason": "tool_use",
+      "type": "message",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_bdrk_01GGaKdBVAfqbkdjKcRVwQmz",
+          "name": "mcp__slack-channel-router__reply",
+          "input": {
+            "chat_id": "D0TESTDM001",
+            "message_id": "1792000000.000100",
+            "text": "{\"case\":\"case_01\",\"attributes\":{\"source\":\"slack-channel-router\",\"chat_id\":\"D0TESTDM001\",\"channel_name\":\"dm\",\"message_id\":\"1792000000.000100\",\"user\":\"Owen Example\",\"user_id\":\"U0TESTUSER1\",\"ts\":\"1792000000.000100\",\"via\":\"dm\"},\"body\":\"hey, what's the status of b.fc5?\"}"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "offset": 38062,
+    "at": 1794914826069,
+    "type": "user",
+    "uuid": "52c84334-293f-4ace-b3ae-2557cb8b702f",
+    "parentUuid": "2ff7a04e-d690-499f-8319-b3f7fd6ba93e",
+    "sessionId": "28a1bb56-1965-4114-b5fb-54db27e5d87c",
+    "isSidechain": false,
+    "sourceToolAssistantUUID": "2ff7a04e-d690-499f-8319-b3f7fd6ba93e",
+    "message": {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_bdrk_01GGaKdBVAfqbkdjKcRVwQmz"
+        }
+      ]
+    }
+  },
+  {
+    "offset": 38981,
+    "at": 1794914828968,
+    "type": "assistant",
+    "uuid": "04fc2d22-1ae7-4a6c-9c42-63c337425d59",
+    "parentUuid": "52c84334-293f-4ace-b3ae-2557cb8b702f",
+    "sessionId": "28a1bb56-1965-4114-b5fb-54db27e5d87c",
+    "isSidechain": false,
+    "requestedModel": "aws/anthropic/bedrock-claude-opus-5-5",
+    "message": {
+      "id": "msg_bdrk_5ntqotlxd2x6fvgz3ieq3vuyem56fh5frrjy5n6hxwqt44fgadaa",
+      "role": "assistant",
+      "model": "aws/anthropic/bedrock-claude-opus-5-5",
+      "stop_reason": "end_turn",
+      "type": "message",
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"case\":\"case_01\",\"attributes\":{\"source\":\"slack-channel-router\",\"chat_id\":\"D0TESTDM001\",\"channel_name\":\"dm\",\"message_id\":\"1792000000.000100\",\"user\":\"Owen Example\",\"user_id\":\"U0TESTUSER1\",\"ts\":\"1792000000.000100\",\"via\":\"dm\"},\"body\":\"hey, what's the status of b.fc5?\"}"
+        }
+      ]
+    }
+  }
+]

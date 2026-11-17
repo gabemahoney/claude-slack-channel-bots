@@ -35,21 +35,25 @@ export function nativeInformation(entry: TranscriptEntry, adapters: ReceiptAdapt
     && entry.kind === 'other' && entry.uuid === undefined && entry.text === undefined
 }
 
-function nativeParent(session: TranscriptEntry[], entry: TranscriptEntry): TranscriptEntry | undefined {
+function nativeParent(session: TranscriptEntry[], entry: TranscriptEntry, receipt: TranscriptEntry): TranscriptEntry | undefined {
   const id = entry.value?.parentUuid
-  return typeof id === 'string' && id.length > 0
-    ? session.find(prior => prior.value?.uuid === id && prior.offset < entry.offset) : undefined
+  const parent = typeof id === 'string' && id.length > 0
+    ? session.find(candidate => candidate.value?.uuid === id) : undefined
+  return parent && (parent.offset < entry.offset || parent.offset > entry.offset
+    && entry.value?.type === 'attachment' && entry.kind !== 'take-in'
+    && Number.isFinite(entry.at) && entry.at >= receipt.at) ? parent : undefined
 }
 
-// UUID identity and strictly preceding file offsets establish ancestry. Resolve
-// the parent before matching the target; timestamps never select the chain.
-function nativeChain(session: TranscriptEntry[], entry: TranscriptEntry, target: TranscriptEntry): TranscriptEntry[] | undefined {
+// Unique UUIDs in this session/path select parents before matching the target.
+// Only a timed non-take-in attachment at/after the receipt may have a later-offset
+// parent; all other edges require earlier offsets. Same-offset edges and cycles fail.
+export function nativeChain(session: TranscriptEntry[], entry: TranscriptEntry, target: TranscriptEntry, receipt = target): TranscriptEntry[] | undefined {
   const chain: TranscriptEntry[] = [], seen = new Set<TranscriptEntry>()
   let current = entry
   while (!seen.has(current)) {
     seen.add(current)
     if (current.kind === 'take-in' && current.text !== undefined) return undefined
-    const parent = nativeParent(session, current)
+    const parent = nativeParent(session, current, receipt)
     if (!parent) return undefined
     chain.push(current)
     if (parent === target) return chain
@@ -83,11 +87,11 @@ export function nativeTime(session: TranscriptEntry[], entry: TranscriptEntry, r
   }
   // Setup can also be serialized after its response was timestamped. Validate
   // its membership, then compare clocks against the nearest non-setup parent.
-  // Strictly decreasing offsets bound this walk; no elapsed-time tolerance.
-  let parent = nativeParent(session, entry)
+  // Each setup membership check rejects cycles; no elapsed-time tolerance.
+  let parent = nativeParent(session, entry, receipt)
   while (parent && nativeSetup(parent)) {
     if (!nativeTime(session, parent, receipt, adapters)) return false
-    parent = nativeParent(session, parent)
+    parent = nativeParent(session, parent, receipt)
   }
   return entry.at >= receipt.at && (!parent || Number.isFinite(parent.at) && entry.at >= parent.at)
 }
@@ -276,7 +280,7 @@ export function completedAIReadback({ seq, expected, journal, own, adapters, mod
   }
   const next = session.find(e => e.offset > receipt.offset && e.kind === 'take-in' && e.text !== undefined)
   const turn = session.filter(e => e.offset > receipt.offset && (!next || e.offset < next.offset))
-  const linked = (entry: TranscriptEntry, target = receipt) => nativeChain(session, entry, target) !== undefined
+  const linked = (entry: TranscriptEntry, target = receipt) => nativeChain(session, entry, target, receipt) !== undefined
   const readbacks: TranscriptEntry[] = []
   const candidates: { text: string; entry: TranscriptEntry }[] = []
   const mismatch = (reason: string): never => {
