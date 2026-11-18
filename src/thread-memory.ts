@@ -1395,10 +1395,11 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     if (batch && selections) {
       // Preserve each caller's saved/kept answer as if its own selection were
       // saved in sequence. Unrelated and deferred writes remain outstanding.
-      const remaining = new Set(j.writes.order.keys()), saved = new Set(writes)
+      let remaining = j.writes.order.size
+      const saved = new Set(writes)
       for (const selection of selections) {
-        for (const write of selection) if (saved.has(write)) remaining.delete(write)
-        batch.outcomes.push(remaining.size ? 'kept' : 'saved')
+        for (const write of selection) if (saved.delete(write)) remaining--
+        batch.outcomes.push(remaining ? 'kept' : 'saved')
       }
     }
     try {

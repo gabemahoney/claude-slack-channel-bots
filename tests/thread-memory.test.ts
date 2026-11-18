@@ -3609,6 +3609,42 @@ describe('Thread Memory backlog preserves unsaved joins across changes', () => {
     expect(h.io.calls.filter(c => c.op === 'writeSync' && c.path === threadPath(h.stateDir))).toHaveLength(1)
     expect(h.clock.pending()).toEqual([])
   })
+  test('b.fdw batch outcomes skip a large unrelated backlog and count repeated selections once', async () => {
+    const h = fixture(); await h.start()
+    const backlog = Array.from({ length: 4096 }, (_, n) => h.fact({ root: `1700000012.${String(n).padStart(6, '0')}` }))
+    h.io.fail('writeSync')
+    expect((await h.memory.saveJoins('alpha', backlog)).kind).toBe('failed')
+    h.io.heal()
+    const unrelated = new Set(backlog.map(f => f.root)), originalKeys = Map.prototype.keys
+    let unrelatedVisits = 0
+    // Count actual kept-write iterator visits, not wall time. Scope the spy
+    // to this batch and restore it before the intentional full backlog flush.
+    const keys = spyOn(Map.prototype, 'keys').mockImplementation(function* (this: Map<unknown, unknown>) {
+      for (const key of originalKeys.call(this)) {
+        if (typeof key === 'object' && key !== null && 'records' in key && Array.isArray(key.records) &&
+          unrelated.has(key.records[0]?.root)) unrelatedVisits++
+        yield key
+      }
+      return undefined
+    })
+    async function repeatedSelections(first: ThreadJoin, other: ThreadJoin) {
+      const pending = [first, first, other, first].map(f => h.memory.saveJoins('alpha', [f], { coalesce: true }))
+      await h.clock.advance(JOIN_SAVE_WINDOW_MS)
+      return (await Promise.all(pending)).map(r => r.kind)
+    }
+    let outcomes: string[]
+    try { outcomes = await repeatedSelections(h.fact(), h.fact({ root: R.secondary })) }
+    finally { keys.mockRestore() }
+    expect(outcomes).toEqual(['kept', 'kept', 'kept', 'kept'])
+    expect(h.memory.keptFacts('alpha')).toHaveLength(backlog.length)
+    expect(savedJoins(h).map(f => f.root)).toEqual([R.primary, R.secondary])
+    // With no unrelated writes left, repeated selections must not decrement
+    // the count twice and make the second caller claim saved prematurely.
+    expect(await h.memory.flush('alpha')).toEqual({ kind: 'saved' })
+    expect(await repeatedSelections(h.fact({ root: R.third }), h.fact({ root: '1700000013.000001' })))
+      .toEqual(['kept', 'kept', 'saved', 'saved'])
+    expect(unrelatedVisits).toBe(0)
+  })
   test('b.fdw saves arriving during a shared append keep every earlier caller marked kept', async () => {
     const h = fixture(); await h.start(); h.io.reset()
     const facts = [h.fact(), h.fact({ root: R.secondary }), h.fact({ root: R.third })], held = holdJournalSync(h)
