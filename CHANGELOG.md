@@ -6,6 +6,10 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+---
+
+## 0.19.0 (2026-11-18)
+
 ### Breaking changes
 
 - Follow the one manual procedure in [Upgrading from 0.18.x](docs/migration.md#upgrading-from-018x) before starting this release. `allow_invited_channels` and each persona's `invited` now cause load errors naming `channel_mode` and `permission_prompts` as their replacements, in both `config.json` and `config.json.last-applied`. There is no automatic conversion.
