@@ -407,7 +407,7 @@ The setting is read only at intake: accepted Reaction Items are prepared and del
 
 The connection manager (`persona-connections.ts`) serves each scan. `revalidateMembership` returns the current connection while its installation is verified and nothing marked it for revalidation. Otherwise it repairs an up persona whose installation is unverified, or one broken by a membership-origin refusal, with one attempt on the held applied credentials (never pending credential edits), gated by the persona's incarnation and admission checks.
 
-The repair swaps only to the same installation and bot identity, and a failed attempt changes no persona status. A persona broken by any other refusal is not revalidated: `revalidateMembership` returns its status outcome, and it keeps the confirmed-change recovery.
+The repair swaps only to the same installation and bot identity, and a failed attempt changes no persona status. A cancelled revalidation, including one cancelled by the persona's own socket reopen, is the scanner's `superseded` problem: it stays log-only, posts no warning or recovery notice, and uses the normal retry. A persona broken by any other refusal is not revalidated: `revalidateMembership` returns its status outcome, and it keeps the confirmed-change recovery.
 
 `membershipPage` reads each page through a watched client: only a `WEB_API_AUTH_FAILURE_ERRORS` code marks the persona refused while running and arms that repair. Any other non-transient refusal, such as `missing_scope` or `access_denied`, is the scanner's `access` failure, and a transient or unreachable failure is `transport`. Either way the persona stays up, and the next permitted attempt reads the pages again on the same connection, with no `auth.test`, `bots.info` or new socket.
 

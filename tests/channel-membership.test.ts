@@ -682,6 +682,18 @@ test('metadata validation hang stays inside the manager deadline; late completio
   expect(stub(f).sockets).toHaveLength(0); expect(reading(f).kind).toBe('unresolved')
 })
 
+test('a revalidation cancelled by an in-flight socket reopen is superseded', async () => {
+  const f = fixture(); await f.start()
+  const reopen = makeDeferredConnect()
+  stub(f).script.connect.push(reopen.outcome)
+  stub(f).socket.drop(); await f.h.clock.flush()
+  expect(f.h.manager.status('alpha')?.state).toBe('lost')
+  await f.scan()
+  expect(f.scanner.status('alpha')).toMatchObject({ state: 'incomplete', problem: 'superseded' })
+  expect(stub(f).calls.inventory).toEqual([])
+  reopen.settle({ kind: 'ok' }); await f.h.clock.flush()
+})
+
 test('a non-auth bots.info refusal brings the persona up on its auth.test identity with membership held; its DM and accepted work deliver beside a verified sibling', async () => {
   const f = fixture({ realBringUp: true, names: ['alpha', 'beta'], channels: [{ id: C.primary, delivery: 'mentions' }] })
   const alpha = stub(f), beta = stub(f, 'beta')

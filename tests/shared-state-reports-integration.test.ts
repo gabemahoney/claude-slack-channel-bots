@@ -2,7 +2,7 @@ import { _assignFixture, fixtureThreadHybridSince } from './test-helpers/shared-
 import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { dirname } from 'node:path'
 import type { ChannelMode } from '../src/config.ts'
-import { MEMBERSHIP_REQUEST_TIMEOUT_MS } from '../src/channel-membership-retry.ts'
+import { MEMBERSHIP_REQUEST_TIMEOUT_MS, MEMBERSHIP_RETRY_MIN_MS } from '../src/channel-membership-retry.ts'
 import { membershipScanDiagnostic } from '../src/channel-membership-scan.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
@@ -24,7 +24,7 @@ import {
   initialSharedState, writeSharedState, channelPopulation,
 } from './test-helpers/shared-channels.ts'
 import { SR8_SHARED_LIST_CHANNELS } from './test-helpers/thread-memory.ts'
-import { makeDeferredWebApiCall, makeMembershipEvent, makeChannelMessage, mentionText, broadcastText, type WebApiOutcome } from './test-helpers/slack-stub.ts'
+import { makeDeferredWebApiCall, makeDeferredConnect, makeMembershipEvent, makeChannelMessage, mentionText, broadcastText, type WebApiOutcome } from './test-helpers/slack-stub.ts'
 
 let h: ReloadHarness
 beforeEach(() => { h = makeReloadHarness() })
@@ -456,6 +456,42 @@ test.each(MODES)('%s: persona teardown forgets old evidence scope before a fresh
   h.clearWriteFailure(); await run.ticks.tick(); await flush(run)
   recovered(run, { channels: [C.primary], all: false, dm: false }, 'state')
   expect(posts(run)).toHaveLength(before + 2)
+})
+
+test.each(MODES)('%s: revalidation cancelled by an in-flight socket reopen stays log-only through recovery', async mode => {
+  seed(mode); const run = await start(); await scan(run)
+  const reopen = makeDeferredConnect()
+  run.stub('alpha').script.connect.push(reopen.outcome)
+  run.stub('alpha').socket.drop(); await run.clock.flush()
+  expect(run.connections.manager.status('alpha')?.state).toBe('lost')
+  await run.membershipClock.advance(MEMBERSHIP_RETRY_MIN_MS); await flush(run)
+  const status = run.membershipScanner.status('alpha')
+  expect(status).toMatchObject({ state: 'incomplete', problem: 'superseded' })
+  expect(run.logs).toContain(membershipScanDiagnostic('alpha', status))
+  expect(posts(run)).toEqual([])
+  expect(reportLines(run, MEMBERSHIP_EVIDENCE_UNRESOLVED)).toEqual([])
+  reopen.settle({ kind: 'ok' }); await run.clock.flush(); await flush(run)
+  expect(run.connections.manager.status('alpha')?.state).toBe('up')
+  await retry(run, membershipPage([C.primary, C.secondary]))
+  expect(run.membershipScanner.status('alpha').state).toBe('complete')
+  expect(posts(run)).toEqual([])
+  expect(reportLines(run)).toEqual([])
+  quietQ(run)
+})
+
+test.each(MODES)('%s: a real bots.info refusal reports installation-unverified exactly once', async mode => {
+  seed(mode)
+  const run = await start({ slack: { alpha: { botsInfo: Array<WebApiOutcome>(3).fill({ kind: 'platform', error: 'missing_scope' }) } } })
+  run.stub('beta').script.inventory.push(membershipPage([C.private]))
+  await run.membershipClock.runNext(); await flush(run)
+  expect(run.membershipScanner.status('alpha')).toMatchObject({ state: 'incomplete', problem: 'installation-unverified' })
+  evidenceReport(run, { channels: [C.primary, C.secondary], all: true }, {
+    history: [], problem: 'installation-unverified', nextAttemptAt: run.membershipScanner.status('alpha').nextAttemptAt,
+  })
+  await run.membershipClock.advance(MEMBERSHIP_RETRY_MIN_MS); await flush(run)
+  expect(run.membershipScanner.status('alpha')).toMatchObject({ state: 'incomplete', problem: 'installation-unverified' })
+  expect(posts(run)).toHaveLength(1)
+  expect(reportLines(run, MEMBERSHIP_EVIDENCE_UNRESOLVED)).toHaveLength(1)
 })
 
 test.each(MODES.flatMap(mode => (['deadline', 'access', 'transport'] as const).map(problem => ({ mode, problem }))))(

@@ -347,6 +347,7 @@ export function createMembershipScanner(deps: MembershipScanDeps): MembershipSca
     try {
       const validated = await boundedMembershipCall(clock, controller.signal, deadline, signal => deps.connections.revalidateMembership(entry.key, signal), MEMBERSHIP_VALIDATION_TIMEOUT_MS)
       if (!valid(entry, controller)) return
+      if (validated.kind === 'cancelled') throw new ScanFailure('superseded')
       if (validated.kind !== 'ready') throw new ScanFailure('installation-unverified', validated.kind === 'failed' ? validated.outcome : undefined)
       const generation = deps.membership.activate(entry.key, validated.provenance)
       if (!generation) throw new ScanFailure('installation-unverified')
