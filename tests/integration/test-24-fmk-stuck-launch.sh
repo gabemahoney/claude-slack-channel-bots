@@ -261,7 +261,7 @@ hold_pending_worker() {
 # end it with the stub's sentinel, sent into its pane with the real tmux, and
 # wait until the row reads ended or missing AND its old session/process exit.
 end_worker() {
-    local session pid
+    local session session_id pid identity
     local -a socket_args=()
     poll_row_of "$1" "$2"
     [[ -n "${ROW_SESSION}" ]] || fail "$2: row $1 names no tmux session"
@@ -269,40 +269,83 @@ end_worker() {
     [[ -z "${ROW_SOCKET}" ]] || socket_args=(-S "${ROW_SOCKET}")
     worker_tmux_query has-session "${session}" "${socket_args[@]}" \
         || fail "$2: old life session is not live before exit"
-    pid="$(worker_tmux_query display-message "${session}" "${socket_args[@]}")" \
-        || fail "$2: old life pane pid unavailable"
+    identity="$(worker_tmux_query display-message "${session}" "${socket_args[@]}")" \
+        || fail "$2: old life pane identity unavailable"
+    read -r session_id pid <<< "${identity}"
+    [[ "${session_id}" =~ ^\$[0-9]+$ && "${pid}" =~ ^[1-9][0-9]*$ ]] \
+        || fail "$2: old life pane identity invalid"
     pid_alive "${pid}" || fail "$2: old life process is not live before exit"
     timeout 3s "${SCENARIO_REAL_TMUX}" "${socket_args[@]}" send-keys -t "=${session}:" "${SENTINEL}" Enter \
         || fail "$2: could not send the sentinel into ${session}"
     wait_until "${ENDED_WAIT_S}" "$2: row $1 never read ended or missing after the sentinel" \
         row_of_reads "$1" "$2" ended missing
     wait_until "${GONE_WAIT_S}" "$2: old life never exited" \
-        ended_worker_gone "${session}" "${pid}" "${socket_args[@]}"
+        ended_worker_gone "${session_id}" "${pid}" "${socket_args[@]}"
 }
 ended_worker_gone() {
-    local session="$1" pid="$2"; shift 2
-    if worker_tmux_query has-session "${session}" "$@"; then return 1; fi
+    local session_id="$1" pid="$2" id; shift 2
+    if worker_tmux_query list-sessions "${session_id}" "$@"; then
+        while IFS= read -r id; do
+            [[ -z "${id}" || "${id}" =~ ^\$[0-9]+$ ]] || fail 'old life tmux session identities unavailable'
+            [[ "${id}" != "${session_id}" ]] || return 1
+        done <<< "${WORKER_TMUX_SESSION_IDS}"
+    fi
     ! pid_alive "${pid}"
 }
 
-# worker_tmux_query <has-session|display-message> <session> [socket args...].
-# Only has-session's exit 1 proves absence. Never treat timeout/query failure
-# as gone, including when this helper runs as wait_until's predicate.
+# worker_tmux_query <has-session|display-message|list-sessions> <session> [socket args...].
+# list-sessions saves its identities in WORKER_TMUX_SESSION_IDS. Invoke that
+# query directly, so a fatal failure cannot be mistaken for absence after a
+# command substitution. A reused name with a new $N is a different life.
 worker_tmux_query() {
-    local query="$1" session="$2" rc=0; shift 2
+    local query="$1" session="$2" rc=0 output diagnostic error_file socket=""; shift 2
+    [[ "${1:-}" != -S ]] || socket="$2"
     local -a query_args=()
     case "${query}" in
         has-session) query_args=(has-session -t "=${session}") ;;
-        display-message) query_args=(display-message -p -t "=${session}:" '#{pane_pid}') ;;
+        display-message) query_args=(display-message -p -t "=${session}:" '#{session_id} #{pane_pid}') ;;
+        list-sessions) query_args=(list-sessions -F '#{session_id}') ;;
         *) fail 'old life tmux query unsupported' ;;
     esac
-    timeout 3s "${SCENARIO_REAL_TMUX}" "$@" "${query_args[@]}" 2>/dev/null || rc=$?
+    error_file="$(mktemp "${SCENARIO_ROOT}/old-life-query.XXXXXX")" || fail 'old life tmux diagnostic capture failed'
+    output="$(timeout 3s "${SCENARIO_REAL_TMUX}" "$@" "${query_args[@]}" 2>"${error_file}")" || rc=$?
+    # A sentinel preserves trailing newlines so the classifier can reject an
+    # extra line rather than command substitution silently stripping it.
+    diagnostic="$(head -c 4097 -- "${error_file}" 2>/dev/null && printf '.')" || {
+        rm -f -- "${error_file}"
+        fail 'old life tmux diagnostic read failed'
+    }
+    diagnostic="${diagnostic%.}"
+    rm -f -- "${error_file}" || fail 'old life tmux diagnostic cleanup failed'
     case "${rc}" in
-        0) return 0 ;;
-        1) [[ "${query}" != has-session ]] || return 1 ;;
+        0)
+            if [[ "${query}" == list-sessions ]]; then WORKER_TMUX_SESSION_IDS="${output}"
+            else printf '%s' "${output}"; fi
+            return 0 ;;
+        1)
+            if [[ "${query}" == has-session || "${query}" == list-sessions ]] &&
+                worker_tmux_no_server "${diagnostic}" "${socket}"; then return 1; fi ;;
         124|137) fail 'old life tmux query timed out' ;;
     esac
     fail "old life tmux query failed (status ${rc})"
+}
+
+# tmux 3.2a client.c connection diagnostics. Never print the raw diagnostic.
+worker_tmux_no_server() {
+    local diagnostic="$1" socket="$2" path
+    (( ${#diagnostic} <= 4096 )) || return 1
+    diagnostic="${diagnostic%$'\n'}"
+    [[ "${diagnostic}" != *$'\n'* && "${diagnostic}" != *$'\r'* ]] || return 1
+    case "${diagnostic}" in
+        'no server running on '*) path="${diagnostic#no server running on }" ;;
+        'error connecting to '*' (No such file or directory)')
+            path="${diagnostic#error connecting to }"
+            path="${path% (No such file or directory)}" ;;
+        *) return 1 ;;
+    esac
+    [[ -n "${path}" ]] || return 1
+    if [[ -n "${socket}" ]]; then [[ "${path}" == "${socket}" ]]
+    else [[ "${path}" == /* ]]; fi
 }
 
 # call_table <file>: write <file>, one TAB-separated line per agent-director

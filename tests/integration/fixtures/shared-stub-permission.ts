@@ -129,8 +129,10 @@ async function noticeControl(client: NoticeClient, command: string, id: string, 
       event.key === key && event.work === work))
     oldLife = events[0].old_life
     noticeFact('journal-life', oldLife && oldLife.tmux_session_name === first.tmux_session_name &&
+      typeof oldLife.tmux_session_id === 'string' && /^\$[0-9]+$/.test(oldLife.tmux_session_id) &&
       oldLife.tmux_socket === (first.tmux_socket ?? null) && Number.isSafeInteger(oldLife.pid) && oldLife.pid > 0 &&
       events.every(event => event.old_life?.tmux_session_name === oldLife.tmux_session_name &&
+        event.old_life?.tmux_session_id === oldLife.tmux_session_id &&
         event.old_life?.tmux_socket === oldLife.tmux_socket && event.old_life?.pid === oldLife.pid))
     const stillEnded = first.state === 'ended' && events[1].last_seen_at === first.last_seen_at
     if (command === 'notice-ended') {

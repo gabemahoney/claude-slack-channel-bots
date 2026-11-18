@@ -4194,10 +4194,15 @@ absent, and the seeders refuse. Rebuild live fixtures only after the upgrade.
 ### The stub worker
 
 Before a harness resumes an ended AD row, wait with a bounded deadline until
-the old tmux session is gone and its process is dead (a zombie counts as dead).
-Use the row's recorded session name and socket, and capture a live pane pid
-before ending it as a positive control. AD can refuse an earlier resume as
-"still stopping" even though the row already reads `ended`.
+the old tmux session ID is gone and its pane pid is dead (a zombie counts as dead).
+Use the row's recorded session name and socket to capture the live pane pid
+and tmux's unique `#{session_id}` (`$N`) together before ending it as a positive
+control.
+
+Poll `list-sessions -F '#{session_id}'` on that socket for the exact ID,
+so a replacement using the same name does not hold the old life's barrier.
+AD can refuse an earlier resume as "still stopping" even though the row already
+reads `ended`.
 
 Test 4 uses `slow-exit` to keep each old worker alive for 3 s after SessionEnd.
 It requires an observation of the old session at `ended` in both resume phases,

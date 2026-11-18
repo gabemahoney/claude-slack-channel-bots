@@ -4393,11 +4393,12 @@ test('shared registered-hook controls bind the actual row and fail closed withou
   const captured: unknown[][] = []
   const clock = createFakeClock()
   let oldLifeExited = false, oldLifeExitError = false
+  let duringLifeExit: (() => void) | undefined
   // The copied declaration receives its own context; production imports and
   // the preload retain the process HOME, argv, console and clock untouched.
   const context = { env: { HOME: join(scratch, 'home') } as Record<string, string>, argv: [] as string[],
     log: (...args: unknown[]) => captured.push(args), now: clock.now, sleep: clock.advance,
-    waitLifeExit: async () => { if (oldLifeExitError) throw Error('old life never exited'); oldLifeExited = true } }
+    waitLifeExit: async () => { if (oldLifeExitError) throw Error('old life never exited'); oldLifeExited = true; duringLifeExit?.() } }
   mkdirSync(context.env.HOME!)
   const source = readFileSync(join(INTEGRATION_DIR, 'fixtures/shared-stub-permission.ts'), 'utf8')
   writeFileSync(join(scratch, 'permission-source.ts'), source)
@@ -4408,7 +4409,7 @@ test('shared registered-hook controls bind the actual row and fail closed withou
   // The imported barrier has separate probe-driven coverage in ended-life.test.ts.
   // Never let this declaration audit query the host's tmux or process table.
   declarations = declarations.replace("const { captureLiveLife, waitForLifeExit } = await import('./ended-life.ts')",
-    `const captureLiveLife = row => ({ tmux_session_name: row.tmux_session_name, tmux_socket: row.tmux_socket ?? null, pid: 123 });
+    `const captureLiveLife = row => ({ tmux_session_name: row.tmux_session_name, tmux_session_id: '$7', tmux_socket: row.tmux_socket ?? null, pid: 123 });
      const waitForLifeExit = async life => { if (life.pid !== 123) throw Error('wrong life'); await auditContext.waitLifeExit() };`)
   const native = "await import(import.meta.resolve('agent-director', join(pkg, 'src/agent-director-client.ts')))"
   expect(declarations.split(native)).toHaveLength(2)
@@ -4458,6 +4459,7 @@ test('shared registered-hook controls bind the actual row and fail closed withou
         jsonl_path:transcript,permission_requests:[],unproven_requests:[],last_seen_at:'recorded-hook'}
       calls=[];gets=0;change=undefined;resumeError=false;sendError=false;stays=false;configFor(0)
       oldLifeExited=false;oldLifeExitError=false
+      duringLifeExit=undefined
       writeFileSync(join(bin,'stub-claude-modes'),'displayed-states\t'+work+'\n')
       setAuditClient(Object.assign(makeStubClient(), {
         async get() { calls.push('get'); gets++; change?.(); return structuredClone(row) },
@@ -4489,6 +4491,25 @@ test('shared registered-hook controls bind the actual row and fail closed withou
       assert(!calls.includes('resume'))
       assert.deepEqual(readFileSync(evidence,'utf8').trim().split('\n').map(l=>JSON.parse(l).phase),['end-requested','ended'])
       assert.equal(auditFailure().step,'old life never exited')
+    })
+    await check('notice journal rejects a changed or missing tmux session identity',async()=>{
+      for(const changed of [undefined,'not-an-id','$8']) {
+        reset();const evidence=await invoke('notice-end')
+        const events=readFileSync(evidence,'utf8').trim().split('\n').map(line=>JSON.parse(line))
+        events[1].old_life.tmux_session_id=changed
+        writeFileSync(evidence,events.map(event=>JSON.stringify(event)).join('\n')+'\n')
+        await assert.rejects(invoke('notice-resume',evidence))
+        assert(!calls.includes('resume'))
+        assert(auditMetadata()?.includes('check=journal-life'))
+      }
+    })
+    await check('a server relaunch during the exit barrier still fails the fresh-ended check',async()=>{
+      reset();const evidence=await invoke('notice-end')
+      duringLifeExit=()=>{row.state='waiting';row.last_seen_at='later-session-start'}
+      await assert.rejects(invoke('notice-resume',evidence))
+      assert(!calls.includes('resume'))
+      assert(auditMetadata()?.includes('check=resume-fresh-ended'))
+      assert.equal(readFileSync(evidence,'utf8').trim().split('\n').length,2)
     })
     for (const state of ['working','pending','ask_user','check_permission','missing','ended']) await check('end refuses AD '+state,async()=>{
       reset();row.state=state;await assert.rejects(invoke('notice-end'));assert(!calls.includes('send'))
