@@ -181,10 +181,12 @@ import { join } from 'path'
 import { DM_DESTINATION, type Persona, type PersonaConfig } from '../src/config.ts'
 import {
   _resetPollerState,
+  LIST_RECOVERED_LINE,
   PROMPT_JSON_SUMMARY_MAX,
   PROMPT_TOOL_NAME_MAX,
   SLACK_SECTION_TEXT_MAX,
   buildClosingFailedLine,
+  buildListFailedLine,
   buildFallbackPermissionBlocks,
   buildFallbackPromptRejectedLine,
   buildPermissionBlocks,
@@ -3255,6 +3257,83 @@ describe('poller tick — skipped-tick observability', () => {
 // Lifecycle
 // ---------------------------------------------------------------------------
 
+describe('list failure episodes', () => {
+  test('logs one failure over many ticks, one recovery, and a later failure episode again', async () => {
+    const logCalls: unknown[][] = []
+    const failure = new Error('list unavailable')
+    let failing = false
+    let listCalls = 0
+    const ivl = startPoller(() => ({
+      list: async () => {
+        listCalls++
+        if (failing) throw failure
+        return { spawns: [] }
+      },
+      get: async () => cannedGetResult({ instance_id: INSTANCE_A }),
+    }), { log: (...args) => { logCalls.push(args) } })
+
+    await ivl.tick()
+    expect(logCalls).toHaveLength(0)
+    failing = true
+    for (let i = 0; i < 20; i++) await ivl.tick()
+    expect(listCalls).toBe(21)
+    expect(logLines(logCalls, 'list failed')).toEqual([
+      [buildListFailedLine(describeThrownValue(failure))],
+    ])
+    expect(logCalls).toHaveLength(1)
+
+    failing = false
+    for (let i = 0; i < 3; i++) await ivl.tick()
+    expect(logCalls).toHaveLength(2)
+    expect(logCalls[1]).toEqual([LIST_RECOVERED_LINE])
+
+    failing = true
+    for (let i = 0; i < 3; i++) await ivl.tick()
+    expect(logLines(logCalls, 'list failed')).toHaveLength(2)
+    expect(logCalls).toHaveLength(3)
+    failing = false
+    await ivl.tick()
+    await ivl.tick()
+    expect(logCalls[3]).toEqual([LIST_RECOVERED_LINE])
+    expect(logCalls).toHaveLength(4)
+    expect(listCalls).toBe(29)
+    assertNoLeak({ logCalls })
+  })
+
+  test.each(['stop', 'test reset'] as const)('%s re-arms list failure logging without a stale recovery', async (reset) => {
+    const logCalls: unknown[][] = []
+    let failing = true
+    const getClient = () => ({
+      list: async () => {
+        if (failing) throw new Error('list unavailable')
+        return { spawns: [] }
+      },
+      get: async () => cannedGetResult({ instance_id: INSTANCE_A }),
+    })
+    const opts = { log: (...args: unknown[]) => { logCalls.push(args) } }
+    const resetPoller = reset === 'stop' ? stopPermissionPoller : _resetPollerState
+    const first = startPoller(getClient, opts)
+    await first.tick()
+    resetPoller()
+
+    failing = false
+    const second = startPoller(getClient, opts)
+    await second.tick()
+    expect(logCalls).toHaveLength(1)
+    failing = true
+    await second.tick()
+    expect(logLines(logCalls, 'list failed')).toHaveLength(2)
+    resetPoller()
+
+    const third = startPoller(getClient, opts)
+    await third.tick()
+    await third.tick()
+    expect(logLines(logCalls, 'list failed')).toHaveLength(3)
+    expect(logLines(logCalls, 'list recovered')).toHaveLength(0)
+    assertNoLeak({ logCalls })
+  })
+})
+
 describe('poller lifecycle', () => {
   test('startPermissionPoller is idempotent', () => {
     const ivl = makeManualInterval()
@@ -4973,6 +5052,16 @@ describe('forgetPersonaPrompts — a teardown drops one persona\'s poller state'
 
 describe('pin: the failure and payload-rejection lines, as the debugging skill quotes them', () => {
   test.each<[string, string, string]>([
+    [
+      'a list failed',
+      buildListFailedLine('<description>'),
+      '[slack] permission-poller: list failed: <description>',
+    ],
+    [
+      'a list recovered',
+      LIST_RECOVERED_LINE,
+      '[slack] permission-poller: list recovered',
+    ],
     [
       'a request\'s prompt failed',
       buildPromptFailedLine('<instance>', '<token>', '<description>'),

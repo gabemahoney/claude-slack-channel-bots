@@ -473,6 +473,8 @@ const failedClosings = new Set<string>()
 const failedRows = new Set<string>()
 /** A tick threw past its catches: logged once until a tick runs to its end. */
 let tickFailing = false
+/** A list call failed: mirrors tickFailing, re-armed by the first successful list. */
+let listFailing = false
 
 /** A record keyed by composite key, as the forgetting passes see it. */
 interface PerRequestRecord {
@@ -597,6 +599,7 @@ export function _resetPollerState(): void {
   postedWithoutTs.clear()
   failedRows.clear()
   tickFailing = false
+  listFailing = false
   wedgeStates.clear()
   notUpSkipping.clear()
   noLabelLogged.clear()
@@ -807,6 +810,14 @@ export function buildPromptPostedWithoutTsLine(instanceId: string, requestToken:
   return `[slack] permission-poller: chat.postMessage returned no ts for ${instanceId} ` +
     `(request_token=${requestToken}) — posted but not answerable from Slack; not posted again`
 }
+
+/** The first failed list call in an episode. Pure. */
+export function buildListFailedLine(description: string): string {
+  return `[slack] permission-poller: list failed: ${description}`
+}
+
+/** The first successful list after a failure episode. */
+export const LIST_RECOVERED_LINE = '[slack] permission-poller: list recovered'
 
 /** A throw past the tick's catches, caught by the interval's last-resort catch. Pure. */
 export function buildTickFailedLine(description: string): string {
@@ -1121,8 +1132,15 @@ async function runTick(deps: PollerDeps): Promise<void> {
       const r = await client.list({ label: ['service=cscb'] })
       rows = r.spawns
     } catch (err) {
-      logViaDeps(deps, `[slack] permission-poller: list failed: ${describeThrownValue(err)}`)
+      if (!listFailing) {
+        listFailing = true
+        logFailureSafely(deps, buildListFailedLine(describeThrownValue(err)))
+      }
       return
+    }
+    if (listFailing) {
+      listFailing = false
+      logFailureSafely(deps, LIST_RECOVERED_LINE)
     }
     forgetUnlistedNoLabelRows(rows)
     const listedIds = new Set(rows.map(row => row.instance_id))
@@ -1935,6 +1953,7 @@ function noteTickFailure(deps: PollerDeps, err: unknown): void {
  */
 export function startPermissionPoller(deps: PollerDeps): void {
   if (pollerHandle !== null) return
+  listFailing = false
   depsRef = deps
   const setIntervalFn = deps.setInterval ?? setInterval
   pollerHandle = setIntervalFn(() => {
@@ -1953,6 +1972,7 @@ export function startPermissionPoller(deps: PollerDeps): void {
 
 /** Stop the poller. Safe to call multiple times. */
 export function stopPermissionPoller(): void {
+  listFailing = false
   if (pollerHandle === null) return
   const clearIntervalFn = depsRef?.clearInterval ?? clearInterval
   clearIntervalFn(pollerHandle)
