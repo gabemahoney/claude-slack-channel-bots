@@ -10,7 +10,7 @@
 #   patched to match (patch-client-check.py);
 # - the build fails unless the binary reports the manifest's expected version
 #   and, when the manifest records one, a commit starting with its commit;
-# - no native Claude Code or Codex, no 0.16.1 downgrade fixture, no global
+# - no native Claude Code or Codex, no 0.18.0 downgrade fixture, no global
 #   root client: the real-agent scripts are not run;
 # - every fixture comes from ./inputs (prepare.sh); the build uses the network
 #   only for apt, bun, node and cozempic, and the container runs with none;

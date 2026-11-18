@@ -964,9 +964,75 @@ describe('submitCommands (dry run)', () => {
   })
 })
 
+const REPO_ROOT = join(import.meta.dir, '..')
+
+// --- patch-client-check.py's supported release forms ---
+
+describe('patch-client-check.py', () => {
+  const current = readFileSync(join(REPO_ROOT, 'docker', 'ad-client-check.sh'), 'utf8')
+  // Byte-for-byte copies of docker/ad-client-check.sh from these CSCB tags.
+  const legacy = readFileSync(join(import.meta.dir, 'fixtures', 'ad-gate', 'ad-client-check-v0.18.1.sh'), 'utf8')
+  const native = readFileSync(join(import.meta.dir, 'fixtures', 'ad-gate', 'ad-client-check-v0.18.7.sh'), 'utf8')
+  const overlayLine = "CANDIDATE=$(jq -r '.candidate_overlay // false' \"${RELEASE_RECORD}\")\n"
+
+  function patch(original: string): { code: number; stderr: string; text: string } {
+    const dir = mkdtempSync(join(tmpdir(), 'ad-gate-patch-'))
+    const path = join(dir, 'ad-client-check.sh')
+    try {
+      writeFileSync(path, original)
+      const result = Bun.spawnSync([join(resolveToolDir('python3') ?? '', 'python3'), '-I', join(REPO_ROOT, 'scripts', 'ad-gate', 'template', 'patch-client-check.py'), path], {
+        env: hostSafeChildEnv(dir, { tools: ['python3'] }),
+        stdout: 'pipe',
+        stderr: 'pipe',
+        timeout: 2_000,
+      })
+      return { code: result.exitCode, stderr: result.stderr.toString(), text: readFileSync(path, 'utf8') }
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  test('the working tree check changes only the candidate overlay assignment', () => {
+    expect(current.split(overlayLine)).toHaveLength(2)
+    const result = patch(current)
+    expect(result.stderr).toBe('')
+    expect(result.code).toBe(0)
+    expect(result.text).toBe(current.replace(overlayLine, 'CANDIDATE=false\n'))
+  })
+
+  test('the v0.18.1 check receives exactly the three original client-version edits', () => {
+    const edits = [
+      ['AD_TGZ_SHA256=$(record_field client_tarball_sha256)\n', 'AD_TGZ_SHA256=$(record_field client_tarball_sha256)\nAD_CLIENT_VERSION=$(record_field client_version)\n'],
+      ['[[ "${AD_VERSION}" =~ ${PLAIN_RELEASE_RE} ]]', '[[ "${AD_CLIENT_VERSION}" =~ ${PLAIN_RELEASE_RE} ]]'],
+      ['[ "${CLIENT_VERSION}" = "${AD_VERSION}" ]', '[ "${CLIENT_VERSION}" = "${AD_CLIENT_VERSION}" ]'],
+    ] as const
+    let expected = legacy
+    for (const [old, replacement] of edits) {
+      expect(expected.split(old)).toHaveLength(2)
+      expected = expected.replace(old, replacement)
+    }
+    expect(patch(legacy)).toEqual({ code: 0, stderr: '', text: expected })
+  })
+
+  test('the v0.18.7 check stays byte-identical', () => {
+    expect(patch(native)).toEqual({ code: 0, stderr: '', text: native })
+  })
+
+  test.each([
+    ['changed overlay assignment', current.replace(overlayLine, overlayLine.replace('// false', '// true'))],
+    ['duplicate overlay mention', `${current}\n# candidate_overlay\n`],
+    ['native check with an overlay mention', `${native}\n# candidate_overlay\n`],
+  ])('refuses an unknown candidate_overlay form: %s', (_name, original) => {
+    const result = patch(original)
+    expect(result.code).toBe(1)
+    expect(result.stderr).toContain('ERROR: patch-client-check:')
+    expect(result.stderr).toContain('candidate_overlay')
+    expect(result.text).toBe(original)
+  })
+})
+
 // --- entry.sh's gate lines ---
 
-const REPO_ROOT = join(import.meta.dir, '..')
 const ENTRY_SH = readFileSync(join(REPO_ROOT, 'scripts', 'ad-gate', 'template', 'entry.sh'), 'utf8')
 
 /** printf as entry.sh uses it: each `%s` or `%d` takes the next argument, `\n` ends the line. */
