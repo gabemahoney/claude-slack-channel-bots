@@ -11,6 +11,7 @@ import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { basename, join, relative } from 'node:path'
 import { THREAD_MEMORY_LOOKUP_METHODS, MetadataCancelledError, classifyMetadataFailure, createMetadataAttempts, metadataRetryDelay,
+  THREAD_MEMORY_JOIN_SAVE_WINDOW_MS as JOIN_SAVE_WINDOW_MS, THREAD_MEMORY_JOIN_SAVE_MAX_REQUESTS as JOIN_SAVE_MAX_REQUESTS,
   type MetadataFailure } from '../src/thread-memory.ts'
 import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS, THREAD_MEMORY_NOTICE_MAX_CHARS } from '../src/delivery-constants.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
@@ -3531,6 +3532,149 @@ describe('Thread Memory backlog preserves unsaved joins across changes', () => {
     }
   }
   const holdJournalSync = (h: ThreadMemoryHarness) => h.io.hold('fsync', 'alpha', { match: path => path === threadPath(h.stateDir) })
+  test('b.fdw post-ACK batching bounds are pinned', () => {
+    expect(JOIN_SAVE_WINDOW_MS).toBe(10)
+    expect(JOIN_SAVE_MAX_REQUESTS).toBe(32)
+  })
+  test.each(['saved', 'failed'] as const)('b.fdw coalesces pending join saves into one durable append: %s', async ending => {
+    const h = fixture(); await h.start()
+    h.io.reset()
+    const first = holdJournalSync(h), writes = h.io.calls
+    const head = h.memory.saveJoins('alpha', [h.fact()])
+    await first.reached
+    const facts = Array.from({ length: 6 }, (_, n) => h.fact({ root: `1700000009.${String(n).padStart(6, '0')}` }))
+    const completed: number[] = []
+    const backlog = facts.map((fact, n) => h.memory.saveJoins('alpha', [fact], { coalesce: true }).then(result => { completed.push(n); return result }))
+    const shared = h.io.hold('fsync', 'alpha', { match: path => path === threadPath(h.stateDir) })
+    await h.clock.advance(JOIN_SAVE_WINDOW_MS)
+    first.release(); await head; await shared.reached
+    expect(completed).toEqual([])
+    if (ending === 'failed') h.io.fail('writeSync')
+    // Fail the held shared fsync, rather than a later unrelated append.
+    if (ending === 'failed') shared.fail(Object.assign(new Error('EIO shared append'), { code: 'EIO' })); else shared.release()
+    const results = await Promise.all(backlog)
+    h.io.heal()
+    expect(completed).toEqual([0, 1, 2, 3, 4, 5])
+    expect(results.every(r => r.kind === ending || (ending === 'saved' && r.kind === 'kept'))).toBe(true)
+    if (ending === 'saved') expect(savedJoins(h).slice(1).map(f => f.root)).toEqual(facts.map(f => f.root))
+    else expect(facts.every(f => !h.memory.isJoinSaved('alpha', f))).toBe(true)
+    expect(writes.filter(c => c.op === 'writeSync' && c.path === threadPath(h.stateDir)).length).toBeLessThanOrEqual(2)
+  })
+  test('b.fdw join-save window is bounded at 10 ms and preserves immediate in-memory joins', async () => {
+    const h = fixture(); await h.start(); h.io.reset()
+    const first = h.fact(), second = h.fact({ root: R.secondary })
+    const a = h.memory.saveJoins('alpha', [first], { coalesce: true })
+    await h.clock.flush()
+    expect(view(h)).toBe('joined'); expect(h.memory.isJoinSaved('alpha', first)).toBe(false)
+    expect(h.io.writes()).toEqual([])
+    await h.clock.advance(JOIN_SAVE_WINDOW_MS - 1)
+    const b = h.memory.saveJoins('alpha', [second], { coalesce: true })
+    expect(h.io.writes()).toEqual([])
+    await h.clock.advance(1)
+    expect((await Promise.all([a, b])).map(r => r.kind)).toEqual(['kept', 'saved'])
+    expect(savedJoins(h).map(r => r.root)).toEqual([first.root, second.root])
+    expect(h.io.calls.filter(c => c.op === 'writeSync' && c.path === threadPath(h.stateDir))).toHaveLength(1)
+  })
+  test('b.fdw 70 saves behind a busy writer use three capped appends', async () => {
+    const h = fixture(); await h.start(); h.io.reset()
+    const held = holdJournalSync(h), head = h.memory.saveJoins('alpha', [h.fact()])
+    await held.reached
+    const facts = Array.from({ length: JOIN_SAVE_MAX_REQUESTS * 2 + 6 }, (_, n) => h.fact({ root: `1700000011.${String(n).padStart(6, '0')}` }))
+    const pending = facts.map(f => h.memory.saveJoins('alpha', [f], { coalesce: true }))
+    await h.clock.advance(JOIN_SAVE_WINDOW_MS)
+    held.release(); await head; await Promise.all(pending)
+    expect(savedJoins(h).slice(1).map(f => f.root)).toEqual(facts.map(f => f.root))
+    expect(h.io.calls.filter(c => c.op === 'writeSync' && c.path === threadPath(h.stateDir))).toHaveLength(4)
+    expect(h.clock.pending()).toEqual([])
+  })
+  test('b.fdw join batches preserve per-caller selections across an earlier timestamp for the same root', async () => {
+    const h = fixture(); await h.start(); h.io.reset()
+    const first = h.fact(), other = h.fact({ root: R.secondary }), earlier = { ...first, at: first.at - 1 }
+    const pending = [first, other, earlier].map(f => h.memory.saveJoins('alpha', [f], { coalesce: true }))
+    await h.clock.advance(JOIN_SAVE_WINDOW_MS)
+    expect((await Promise.all(pending)).map(r => r.kind)).toEqual(['kept', 'saved', 'saved'])
+    // As with separate saves, the first caller also selects its root's earlier
+    // kept version. It must precede the other caller's root on disk.
+    expect(savedJoins(h).map(({ root, at }) => ({ root, at }))).toEqual([first, earlier, other].map(({ root, at }) => ({ root, at })))
+    expect(h.io.calls.filter(c => c.op === 'writeSync' && c.path === threadPath(h.stateDir))).toHaveLength(1)
+  })
+  test('b.fdw join-save cap closes a 32-request batch without waiting for its window', async () => {
+    const h = fixture(); await h.start(); h.io.reset()
+    const facts = Array.from({ length: JOIN_SAVE_MAX_REQUESTS }, (_, n) => h.fact({ root: `1700000010.${String(n).padStart(6, '0')}` }))
+    const pending = facts.map(f => h.memory.saveJoins('alpha', [f], { coalesce: true }))
+    await h.clock.flush()
+    const results = await Promise.all(pending)
+    expect(results.at(-1)).toEqual({ kind: 'saved' })
+    expect(savedJoins(h).map(f => f.root)).toEqual(facts.map(f => f.root))
+    expect(h.io.calls.filter(c => c.op === 'writeSync' && c.path === threadPath(h.stateDir))).toHaveLength(1)
+    expect(h.clock.pending()).toEqual([])
+  })
+  test('b.fdw saves arriving during a shared append keep every earlier caller marked kept', async () => {
+    const h = fixture(); await h.start(); h.io.reset()
+    const facts = [h.fact(), h.fact({ root: R.secondary }), h.fact({ root: R.third })], held = holdJournalSync(h)
+    const first = facts.slice(0, 2).map(f => h.memory.saveJoins('alpha', [f], { coalesce: true }))
+    await h.clock.advance(JOIN_SAVE_WINDOW_MS); await held.reached
+    const later = h.memory.saveJoins('alpha', [facts[2]!], { coalesce: true })
+    held.release()
+    expect((await Promise.all(first)).map(r => r.kind)).toEqual(['kept', 'kept'])
+    await h.clock.advance(JOIN_SAVE_WINDOW_MS)
+    expect(await later).toEqual({ kind: 'saved' })
+    expect(savedJoins(h).map(f => f.root)).toEqual(facts.map(f => f.root))
+  })
+  test('b.fdw another writer operation seals the join batch immediately without draining its post intent', async () => {
+    const h = fixture(); await h.start(); h.io.reset()
+    const fact = h.fact(), second = h.fact({ root: R.secondary }), held = holdJournalSync(h)
+    const pending = [fact, second].map(f => h.memory.saveJoins('alpha', [f], { coalesce: true }))
+    const intent = h.memory.keepIntent('alpha', { operationId: 'post-after-batch', channel: fact.channel, root: fact.root,
+      at: fact.at, stamp: fact.stamp, digest: 'ab'.repeat(32) })
+    try {
+      await h.clock.flush(); await held.reached
+      expect(readThreads(h.stateDir).filter(r => r.kind !== 'header').map(r => r.kind)).toEqual(['join', 'join'])
+    } finally { held.release() }
+    expect((await Promise.all(pending)).map(r => r.kind)).toEqual(['kept', 'kept'])
+    expect(intent.kept && await intent.ready).toBe('saved')
+    expect(readThreads(h.stateDir).filter(r => r.kind !== 'header').map(r => r.kind)).toEqual(['join', 'join', 'post-intent'])
+    expect(h.clock.pending()).toEqual([])
+  })
+  test.each(['forget', 'remove', 'stop'] as const)('b.fdw %s cancels a pending join-save window without a late append', async ending => {
+    const h = fixture(); await h.start(); h.io.reset()
+    const pending = h.memory.saveJoins('alpha', [h.fact()], { coalesce: true })
+    if (ending === 'forget') h.memory.forget('alpha')
+    else if (ending === 'remove') await h.memory.remove('alpha')
+    else await h.memory.stop()
+    expect(await pending).toEqual({ kind: 'cancelled' })
+    const writes = h.io.calls.filter(c => c.op === 'writeSync').length
+    await h.clock.advance(JOIN_SAVE_WINDOW_MS * 10)
+    expect(h.io.calls.filter(c => c.op === 'writeSync')).toHaveLength(writes)
+    expect(h.clock.pending()).toEqual([])
+  })
+  test('b.fdw a held join batch does not block another persona and shutdown waits for its active append', async () => {
+    const h = fixture(); h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta'])); await h.start(); h.io.reset()
+    const held = holdJournalSync(h), alpha = h.fact(), beta = h.fact({}, 'beta')
+    const a = h.memory.saveJoins('alpha', [alpha], { coalesce: true })
+    await h.clock.advance(JOIN_SAVE_WINDOW_MS); await held.reached
+    const b = h.memory.saveJoins('beta', [beta], { coalesce: true })
+    await h.clock.advance(JOIN_SAVE_WINDOW_MS)
+    expect(await b).toEqual({ kind: 'saved' }); expect(h.memory.isJoinSaved('beta', beta)).toBe(true)
+    let stopped = false
+    const stop = h.memory.stop().then(() => { stopped = true })
+    await h.clock.flush(); expect(stopped).toBe(false)
+    held.release()
+    expect(await a).toEqual({ kind: 'saved' }); await stop
+    expect(stopped).toBe(true); expect(savedJoins(h).map(f => f.root)).toEqual([alpha.root])
+    expect(h.clock.pending()).toEqual([])
+  })
+  test.each(['quiesce', 'stop', 'lifecycle gate'] as const)('b.fdw %s refuses a late join-save window', async ending => {
+    let allowed = true
+    const h = fixture({ canRun: () => allowed }); await h.start(); h.io.reset()
+    if (ending === 'lifecycle gate') allowed = false
+    else await h.memory[ending]()
+    const pending = h.memory.saveJoins('alpha', [h.fact()], { coalesce: true })
+    await h.clock.flush()
+    expect(h.clock.pending()).toEqual([])
+    expect(await pending).toEqual({ kind: 'cancelled' })
+    expect(h.io.writes()).toEqual([])
+  })
   // Recorded from the linear scans at 339a4ee1: kept order, counts, kept
   // answers, save results, journal records, joins and events, step by step.
   const backlogTrace = [

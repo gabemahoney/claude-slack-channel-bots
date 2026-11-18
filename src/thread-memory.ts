@@ -277,11 +277,15 @@ export type ThreadMemoryEvent =
 export type ThreadMemoryWriteResult = { kind: 'saved' | 'kept' | 'cancelled' } | { kind: 'failed'; error?: unknown }
 export type ThreadMemoryReadResult = 'read' | 'unreadable' | 'missing'
 export interface ThreadMemoryOutage { unknown: boolean; unsaved: number; missing: boolean }
+export const THREAD_MEMORY_JOIN_SAVE_WINDOW_MS = 10
+export const THREAD_MEMORY_JOIN_SAVE_MAX_REQUESTS = 32
 export interface ThreadMemoryOptions {
   stateDir: string; fs?: typeof nodeFs; now?: () => number; dryRun?: boolean
   /** Test-only compaction clock; read only while a compaction observer
    * is set. */
   monotonicNow?: () => number
+  /** Clock for the bounded post-ACK join-save window. */
+  joinSaveClock?: Pick<PersonaConnectionClock, 'setTimeout' | 'clearTimeout'>
   seal?: ThreadMemorySealPort
   setInterval?: typeof globalThis.setInterval; clearInterval?: typeof globalThis.clearInterval
   appliedKeys(): readonly string[]
@@ -322,7 +326,7 @@ export interface ThreadMemory {
   published(): void
   view(key: string, channel: string, root: string): ThreadMemoryView
   addJoin(key: string, fact: ThreadJoin): boolean
-  saveJoins(key: string, facts: readonly ThreadJoin[]): Promise<ThreadMemoryWriteResult>
+  saveJoins(key: string, facts: readonly ThreadJoin[], options?: { coalesce?: boolean }): Promise<ThreadMemoryWriteResult>
   isJoinSaved(key: string, fact: ThreadJoin): boolean
   hasSavedJoin(key: string, channel: string, root: string, stamp: ChannelStamp): boolean
   threadJoinSaved(key: string, channel: string, root: string, stamp: ChannelStamp, at: number): boolean
@@ -712,6 +716,16 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   const monotonicNow = options.monotonicNow ?? (() => performance.now())
   const io = createDurableJournal({ dir, parentDir: options.stateDir, directoryMode: THREAD_MEMORY_DIRECTORY_MODE, fileMode: THREAD_MEMORY_FILE_MODE, fs })
   const journals = new Map<string, MemoryJournal>(), writers = new Map<string, Promise<unknown>>()
+  interface JoinSaveRequest { facts: ThreadJoin[]; resolve(result: ThreadMemoryWriteResult): void }
+  interface JoinSaveGroup {
+    journal: MemoryJournal; requests: JoinSaveRequest[]; release(): void
+    timer?: ReturnType<PersonaConnectionClock['setTimeout']>
+  }
+  const formingJoinSaves = new Map<string, JoinSaveGroup>()
+  const joinSaveClock = options.joinSaveClock ?? {
+    setTimeout: (fn: () => void, ms: number) => globalThis.setTimeout(fn, ms),
+    clearTimeout: (handle: unknown) => globalThis.clearTimeout(handle as ReturnType<typeof globalThis.setTimeout>),
+  }
   const forgotten = new Set<string>(), clocks = new Map<string, number>()
   const pendingJoins = new Map<string, ThreadJoin[]>()
   const maintenanceQueued = new WeakSet<MemoryJournal>()
@@ -742,9 +756,48 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     try { void Promise.resolve(options.onEvent?.(e)).catch(() => {}) } catch { /* observers cannot change durable outcomes */ }
   }
   function serial<T>(key: string, work: () => T | Promise<T>): Promise<T> {
+    // Other writer work seals the window immediately: a batch neither delays
+    // that work for its timer nor collects saves from beyond that boundary.
+    sealJoinSaves(key)
     const next = (writers.get(key) ?? Promise.resolve()).catch(() => {}).then(work)
     writers.set(key, next)
     return next
+  }
+  function sealJoinSaves(key: string): void {
+    const group = formingJoinSaves.get(key)
+    if (!group) return
+    formingJoinSaves.delete(key)
+    if (group.timer !== undefined) joinSaveClock.clearTimeout(group.timer)
+    group.release()
+  }
+  function enqueueJoinSave(key: string, j: MemoryJournal, facts: ThreadJoin[]): Promise<ThreadMemoryWriteResult> {
+    if (!current(key, j)) return Promise.resolve({ kind: 'cancelled' })
+    return new Promise(resolve => {
+      const request = { facts, resolve }, forming = formingJoinSaves.get(key)
+      if (forming?.journal === j) {
+        forming.requests.push(request)
+        if (forming.requests.length >= THREAD_MEMORY_JOIN_SAVE_MAX_REQUESTS) sealJoinSaves(key)
+        return
+      }
+      let release!: () => void
+      const ready = new Promise<void>(r => { release = r })
+      const group: JoinSaveGroup = { journal: j, requests: [request], release }
+      void serial(key, async () => {
+        await ready
+        const batch = { requests: group.requests.map(r => r.facts), outcomes: [] as Array<'saved' | 'kept'> }
+        let result: ThreadMemoryWriteResult
+        try { result = await saveKept(key, j, [], undefined, batch) }
+        catch (error) { result = { kind: 'failed', error } }
+        // A save arriving during fsync leaves new kept work: no earlier
+        // caller may claim the journal has settled in that case.
+        for (const [n, r] of group.requests.entries()) r.resolve(result.kind === 'saved' && batch.outcomes[n]
+          ? { kind: batch.outcomes[n] } : result)
+      })
+      formingJoinSaves.set(key, group)
+      // Acceptance already owns each join durably. A short, bounded window
+      // amortizes this separate post-ACK append without changing its writer.
+      group.timer = joinSaveClock.setTimeout(() => sealJoinSaves(key), THREAD_MEMORY_JOIN_SAVE_WINDOW_MS)
+    })
   }
   function workAllowed(key: string): boolean {
     return !stopped && !quiesced && (options.canRun?.(key) ?? true)
@@ -1304,7 +1357,8 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       return [record]
     })
   }
-  async function saveKept(key: string, j: MemoryJournal, requested?: readonly ThreadJoin[], through?: KeptWrite): Promise<ThreadMemoryWriteResult> {
+  async function saveKept(key: string, j: MemoryJournal, requested?: readonly ThreadJoin[], through?: KeptWrite,
+    batch?: { requests: ThreadJoin[][]; outcomes: Array<'saved' | 'kept'> }): Promise<ThreadMemoryWriteResult> {
     if (!current(key, j)) return { kind: 'cancelled' }
     if (options.dryRun || !j.readable || (requested !== undefined && !j.created)) return { kind: 'kept' }
     const creation = await createStore(key, j)
@@ -1313,7 +1367,10 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     const hadKept = j.writes.order.size > 0
     const named = heldStampLookup(key)
     judge(key, j, named)
-    const candidates = requested ? writesForJoins(j.writes, requested) : writesThrough(j.writes, through)
+    const selections = batch?.requests.map(facts => writesForJoins(j.writes, facts))
+    // Keep caller order, including repeated roots and earlier join times; a
+    // flattened requested set sorted globally could reorder journal records.
+    const candidates = selections ? [...new Set(selections.flat())] : requested ? writesForJoins(j.writes, requested) : writesThrough(j.writes, through)
     const writes: KeptWrite[] = [], records: ThreadMemoryRecord[] = []
     let noticeOnly = true
     digestKept(j)
@@ -1334,6 +1391,15 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
         else records.push({ kind: 'post-outcome', operationId: fact.operationId, outcome: fact.outcome, v: 1, seq: j.highWater + records.length + 1 })
       }
       writes.push(write)
+    }
+    if (batch && selections) {
+      // Preserve each caller's saved/kept answer as if its own selection were
+      // saved in sequence. Unrelated and deferred writes remain outstanding.
+      const remaining = new Set(j.writes.order.keys()), saved = new Set(writes)
+      for (const selection of selections) {
+        for (const write of selection) if (saved.has(write)) remaining.delete(write)
+        batch.outcomes.push(remaining.size ? 'kept' : 'saved')
+      }
     }
     try {
       if (records.length) {
@@ -1539,11 +1605,12 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       return j.readable ? 'not-joined' : 'unknown'
     },
     addJoin,
-    saveJoins(key, facts) {
+    saveJoins(key, facts, saveOptions) {
       const copy = facts.map(copyThreadJoin)
       for (const fact of copy) addJoin(key, fact)
       const j = journals.get(key)
-      return j ? serial(key, () => saveKept(key, j, copy)) : Promise.resolve({ kind: 'cancelled' })
+      return j ? saveOptions?.coalesce ? enqueueJoinSave(key, j, copy) : serial(key, () => saveKept(key, j, copy))
+        : Promise.resolve({ kind: 'cancelled' })
     },
     isJoinSaved(key, fact) { const j = journals.get(key); return !!j?.live && memoryStampMatches(fact.stamp, options.stamp(key, fact.channel)) && savedJoin(j, fact) },
     // Intake requires a current stamp; retention below can use saved evidence
@@ -1618,7 +1685,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     advancePast,
     flush(key) { const j = journals.get(key); return j ? serial(key, () => saveKept(key, j)) : Promise.resolve({ kind: 'cancelled' }) },
     compact,
-    forget(key) { forgotten.add(key); journals.delete(key); pendingJoins.delete(key) },
+    forget(key) { forgotten.add(key); journals.delete(key); pendingJoins.delete(key); sealJoinSaves(key) },
     remove, removeUnappliedAtStart,
     startMaintenance(intervalMs) {
       if (stopped || quiesced || timer !== undefined) return
@@ -1629,6 +1696,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     setCompactionObserver(observer) { compactionObserver = observer },
     async quiesce() {
       quiesced = true
+      for (const key of formingJoinSaves.keys()) sealJoinSaves(key)
       await Promise.allSettled([...writers.values()])
     },
     async stop() {

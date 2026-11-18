@@ -306,7 +306,7 @@ export function makeThreadMemoryHarness(stateDir: string, options: ThreadHarness
   clock.settleOn(queueIo)
   const queue = seal ? createDeliveryQueue({ stateDir, now: clock.now, ...intervalTimers(clock), ...options.queueOptions, fs: queueIo.fs }) : undefined
   const memory = createThreadMemory({
-    stateDir, fs: io.fs, now: options.now ?? clock.now, ...intervalTimers(clock), dryRun: options.dryRun, seal,
+    stateDir, fs: io.fs, now: options.now ?? clock.now, ...intervalTimers(clock), joinSaveClock: clock, dryRun: options.dryRun, seal,
     compactIntervalMs: options.compactIntervalMs,
     monotonicNow: options.monotonicNow,
     appliedKeys: options.appliedKeys ?? (() => authority.config().personas.map(p => p.key)),

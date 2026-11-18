@@ -780,6 +780,13 @@ Full filenames and helper inventory are in [Layout](../tests/README.md#layout).
 
 ### Thread Memory performance runs
 
+The production routing adapter coalesces separate join saves for up to 10 ms
+or 32 requests per persona. `thread-memory.test.ts` uses the injected
+`joinSaveClock` and held durable-I/O fsyncs to check shared success/failure,
+record order, both bounds, intervening writer operations and lifecycle
+cancellation. The server wiring test executes the actual adapter and checks
+that it opts in. These savings do not change any performance limit.
+
 Optional diagnostics require exactly `CSCB_TEST_DIAGNOSTICS=1`; absent,
 empty, `0` and all other values leave them off. The host runner forwards a
 defined switch unchanged through the child environment and bare
@@ -2027,6 +2034,7 @@ Import each numerical bound from `src/`; only its pin case types the number besi
 | Post Hold deadline from receipt | | `THREAD_REPLY_HOLD_MS` | tests/post-holds.test.ts |
 | Thread Memory retry spacing, honouring a longer Retry-After | | `THREAD_MEMORY_RETRY_MIN_MS` to `THREAD_MEMORY_RETRY_MAX_MS` | tests/thread-memory.test.ts |
 | Thread Memory metadata attempt deadline | | `THREAD_MEMORY_LOOKUP_DEADLINE_MS` | tests/thread-memory.test.ts |
+| Post-ACK Thread Memory join-save window and requests per batch | | `THREAD_MEMORY_JOIN_SAVE_WINDOW_MS`, `THREAD_MEMORY_JOIN_SAVE_MAX_REQUESTS` (`src/thread-memory.ts`) | tests/thread-memory.test.ts |
 | Queue stores per group: one journal write and one file fsync, plus a directory fsync only while the journal entry may not be durable after creation, rename replacement or this run’s first opening, until a newer-started directory fsync succeeds | | `QUEUE_GROUP_COMMIT_MAX` | tests/delivery-queue.test.ts |
 
 The timers `LATCH_RECHECK_INTERVAL_MS`, `AD_VERSION_RECHECK_INTERVAL_MS`, `DIALOG_READY_TIMEOUT_MS`, `UNAVAILABLE_RETRY_BASE_S`, `UNAVAILABLE_RETRY_CEILING_S`, `DELIVERY_STUCK_AFTER_MS` and `QUEUE_COMPACT_INTERVAL_MS` can be shortened in an integration run by the test-only override block (see the integration scripts rules); the unit tests assert the exported defaults and the controllers' own interval, base and ceiling inputs, never a real shortened timer.

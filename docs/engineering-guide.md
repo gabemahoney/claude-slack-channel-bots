@@ -74,6 +74,8 @@ Preserve the [intake](architecture.md#durable-intake-queue), [engine](architectu
 
   The accepted record's `thread_join` is the intake join's only saved copy before the ack; append its Thread Memory `join` after the ack attempt (or before retained-target feedback if the ack is withheld), never waiting for that append before the ack. Store the original queued emoji with acceptance.
 
+  Coalesce the routing adapter's separate join saves per persona for at most 10 ms or 32 requests. Another Thread Memory writer operation closes the window immediately; preserve its order and do not drain its unrelated writes in the join batch. Resolve callers in order after the shared append, fail every member on shared failure, and retain accepted records until their joins are confirmed saved. Cancel pending windows on teardown/shutdown. Recovery and other direct join-save callers retain the immediate writer path.
+
   Decide and store a Memory Hold in the same `acceptDecided` serial section and acknowledge it like an accepted item; received and queued reporting, preparation and `handleLostMessage` wait for release (`releaseHeld`, skipping `handleLostMessage` for recovered work). Keep a persona's Memory Hold resolutions serialized, but start each saved release's `releaseHeld` in `seq` order without awaiting it in the resolver's writer chain: a resolve result means saved resolutions, and a slow release must not hold up the next resolve or the startup compaction.
 
   Do no network work before the ack; when a partial-fanout store failure suppresses it, report queued feedback only for retained targets, leaving recovery/preparation for a successful retry. Retained accepted-only targets are not accepted twice.

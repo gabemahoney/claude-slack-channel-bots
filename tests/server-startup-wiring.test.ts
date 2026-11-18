@@ -6653,7 +6653,7 @@ describe('Thread Memory server lifecycle wiring', () => {
       hasSavedJoin: '(key, channel, root, stamp) => threadMemory?.hasSavedJoin(key, channel, root, stamp) ?? false',
       clock: 'key => threadMemory!.clock(key)',
       addJoin: '(key, fact) => threadMemory?.addJoin(key, fact) ?? false',
-      saveJoins: "(key, facts) => threadMemory?.saveJoins(key, facts) ?? Promise.resolve({ kind: 'cancelled' })",
+      saveJoins: "(key, facts) => threadMemory?.saveJoins(key, facts, { coalesce: true }) ?? Promise.resolve({ kind: 'cancelled' })",
     })
     for (const [member, call] of [[retentionMember, queue], [joinsMember, onlyCallOf('createPersonaRouting')]] as const) {
       const bindings = indicesOf(new RegExp(`\\b${member}\\s*:`, 'g'), SERVER_CODE)
@@ -6677,7 +6677,7 @@ describe('Thread Memory server lifecycle wiring', () => {
     const adapters = new Function(js)() as {
       retained: NonNullable<DeliveryQueueOptions['threadJoinSaved']>
       joins: NonNullable<PersonaRoutingDeps['joins']>
-      set(value: Pick<ThreadMemoryModule.ThreadMemory, 'advancePast' | 'threadJoinSavedForPass' | 'hasSavedJoin'>): void
+      set(value: Pick<ThreadMemoryModule.ThreadMemory, 'advancePast' | 'threadJoinSavedForPass' | 'hasSavedJoin' | 'saveJoins'>): void
     }
     const fact = threadJoin(), key = THREAD_PERSONAS.primary
     const queued: QueueThreadJoin = { thread_ts: fact.root, stamp: fact.stamp, at: fact.at }
@@ -6692,12 +6692,15 @@ describe('Thread Memory server lifecycle wiring', () => {
         advancePast: (...args) => { calls.push(['advance', ...args]) },
         threadJoinSavedForPass: k => (...args) => { calls.push(['retention', k, ...args]); return saved },
         hasSavedJoin: (...args) => { calls.push(['saved', ...args]); return saved },
+        saveJoins: async (...args) => { calls.push(['save', ...args]); return { kind: saved ? 'saved' : 'kept' } },
       })
       expect(adapters.retained(key)(fact.channel, queued)).toBe(saved)
       expect(adapters.joins.hasSavedJoin(key, fact.channel, fact.root, fact.stamp)).toBe(saved)
+      expect(await adapters.joins.saveJoins(key, [fact])).toEqual({ kind: saved ? 'saved' : 'kept' })
       expect(calls).toEqual([
         ['advance', key, fact.at], ['retention', key, fact.channel, fact.root, fact.stamp, fact.at],
         ['saved', key, fact.channel, fact.root, fact.stamp],
+        ['save', key, [fact], { coalesce: true }],
       ])
     }
   })

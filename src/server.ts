@@ -1350,7 +1350,7 @@ const personaRouting = createPersonaRouting({
     hasSavedJoin: (key, channel, root, stamp) => threadMemory?.hasSavedJoin(key, channel, root, stamp) ?? false,
     clock: key => threadMemory!.clock(key),
     addJoin: (key, fact) => threadMemory?.addJoin(key, fact) ?? false,
-    saveJoins: (key, facts) => threadMemory?.saveJoins(key, facts) ?? Promise.resolve({ kind: 'cancelled' }),
+    saveJoins: (key, facts) => threadMemory?.saveJoins(key, facts, { coalesce: true }) ?? Promise.resolve({ kind: 'cancelled' }),
   },
   threadStampUndecided: (key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel)?.kind === 'undecided',
   threadStampEpisodes: {

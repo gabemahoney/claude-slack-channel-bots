@@ -287,6 +287,10 @@ Inbound delivery lives in `src/persona-routing.ts`. Each persona has its own Soc
 
    **Completion.** `saveJoins` schedules the Thread Memory `join` append after the ack attempt, or before retained-target feedback when the ack is withheld; a failed append leaves the join kept in memory and changes neither the ack nor reporting. After the ack attempt, detached received reporting requests queued feedback.
 
+   The routing adapter coalesces join saves per persona for up to 10 ms or 32 requests, whichever closes first, with one file fsync. Any other Thread Memory writer operation closes the window immediately and stays behind that batch. The accepted record retains each unsaved join throughout.
+
+   Requests complete in order after the shared append, with their own saved/kept outcomes; a shared failure fails every request. Teardown and shutdown cancel pending windows.
+
    Partial fanout reports only successfully retained targets even when aggregate ack is suppressed; their recovery/preparation waits for a successful retry, without accepting those targets twice.
 
    A stored hold doesn't wait for the retry. Each key with a stored, unresolved hold gets one detached `onHoldStored` after the ack attempt, even a thrown one, or at once when a sibling's failed store suppresses the ack, so its resolution starts without the retry; the retry finds it a duplicate and stores or releases nothing more. That notification awaits nothing, and its throw changes neither the ack nor the other targets' effects.
