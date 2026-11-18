@@ -26,7 +26,7 @@ import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVer
   type SharedListEvidence, type PendingProbe, type AccountedEvent, type LookupProbe,
   burstAckVerdicts, pendingBurstVerdict, type BurstItem, type PendingWindow,
   SR8_DIAGNOSTIC_KINDS, SR8_USER_HZ, cgroupCpuCounters, procCpuTicks, phasePids, phaseCpuSample, phaseCpuResults, ackClockSamples, ackClockResults,
-  ackBinResults, ackEventResults, serverWaves, serverPhase, appendResults, saveResults, observeResults, membershipAckDiagnostics, type PhaseCpuSample, type ClockSample,
+  ackBinResults, ackEventResults, serverWaves, serverPhase, appendResults, saveResults, observeResults, membershipAckDiagnostics, membershipAppendDiagnostics, type PhaseCpuSample, type ClockSample,
   SR8_SERVER_CPUS, SR8_GUARDED_CGROUP_FILES, cgroupPathOf, cgroupChain, cpuMaxCpus, driverCpuVerdict, guardedCgroups, cgroupWriteAccess, cgroupOpenFailure,
   type CgroupWriteAccess, type CgroupOpenOutcome,
 } from './integration/fixtures/sr8-evidence.ts'
@@ -3158,6 +3158,64 @@ describe('test-44 latency observation collectors (synthetic rows, no runtime cla
     expect(unsafe[1].stats).toMatchObject({ persona: 'missing', envelope: 'missing', phase: 'missing' })
     expect(membershipAckDiagnostics([], [], [], percentile)).toEqual([])
   })
+  test('membership append diagnostics separate journals, acceptance groups, fsync waits and window boundaries on the server clock', () => {
+    const ev = [items[0], items[1], items[2], { ...items[5], envelope_id: 'reply' }, items[3]]
+    const ackAt = (key: string, n: number, received: number, returned: number) => JSON.parse(ack([key], n, returned - received - 1, received, 1))
+    const stored = (key: string, seq: number, store: string, at: number) => ({ kind: 'store', key, seq, store, at_mono_ms: at })
+    const server = [
+      ackAt('alpha', 1, 1000, 1010), ackAt('alpha', 2, 1100, 1210), ackAt('alpha', 3, 1110, 1310),
+      ackAt('alpha', 5, 1400, 1510), ackAt('beta', 2, 1150, 1260),
+      JSON.parse(append('alpha', 'queue', 980, 1, 5, 3, 1)), // before the burst
+      JSON.parse(append('alpha', 'queue', 1105, 1, 10, 6, 2)), // straddles roots start
+      JSON.parse(append('alpha', 'queue', 1140, 2, 20, 12, 3)),
+      JSON.parse(append('alpha', 'threads', 1140.5, 1, 10, 6, 2)), // cannot steal the pending queue append
+      stored('alpha', 1, 'accepted', 1141), stored('alpha', 2, 'post-hold', 1141),
+      JSON.parse(append('beta', 'queue', 1160, 1, 10, 6, 2)), stored('beta', 1, 'accepted', 1161),
+      JSON.parse(append('alpha', 'queue', 1200, 1, 30, 18, 2)), stored('alpha', 1, 'fixed', 1201),
+      JSON.parse(append('alpha', 'queue', 1300, 1, 40, 25, 5)), stored('alpha', 3, 'memory-hold', 1301),
+      JSON.parse(append('alpha', 'threads', 1320, 2, 30, 18, 2)), // straddles roots end
+      JSON.parse(append('alpha', 'queue', 1380, 2, 20, 12, 3)), stored('alpha', 4, 'accepted', 1381), // partial group evidence
+      JSON.parse(append('alpha', 'queue', 1500, 2, 20, 12, 3)), // other queue records need no store row
+      JSON.parse(append('alpha', 'queue', 1525, 1, 10, 6, 2)), // after the burst
+    ].sort((a, b) => a.at_mono_ms - b.at_mono_ms)
+    const all = membershipAppendDiagnostics(ev, server, percentile)
+    const row = (key: string, window: string, journal: string) => all.find(r => r.stats.persona === key && r.stats.window === window && r.stats.journal === journal)!
+    expect(all).toHaveLength(12)
+    expect(row('alpha', 'roots', 'queue-acceptance').stats).toMatchObject({
+      window_complete: 'yes', window_events: 2, window_acked: 2, window_start_mono_ms: 1100, window_end_mono_ms: 1310, wall_ms: 210,
+      appends: 2, records_total: 3, records_min: 1, records_p50: 1, records_max: 2,
+      append_sum_ms: 60, append_p50_ms: 20, append_p99_ms: 40, append_max_ms: 40,
+      fsync_sum_ms: 45, fsync_p50_ms: 15, fsync_p99_ms: 30, fsync_max_ms: 30,
+      non_fsync_sum_ms: 15, non_fsync_p50_ms: 5, non_fsync_p99_ms: 10, non_fsync_max_ms: 10,
+      file_fsync_sum_ms: 37, dir_fsync_sum_ms: 8, fsync_calls: 4, append_wall_ratio: .286, unclassified_queue_appends: 0,
+    })
+    expect(row('alpha', 'roots', 'queue-other').stats).toMatchObject({ appends: 1, append_sum_ms: 30, boundary_appends: 1 })
+    expect(row('alpha', 'roots', 'thread-memory').stats).toMatchObject({ appends: 1, append_sum_ms: 10, boundary_appends: 1 })
+    expect(row('alpha', 'burst', 'queue-acceptance').stats).toMatchObject({ wall_ms: 510, appends: 2, append_sum_ms: 60, unclassified_queue_appends: 1 })
+    expect(row('alpha', 'burst', 'queue-other').stats).toMatchObject({ appends: 3, append_sum_ms: 60, boundary_appends: 0 })
+    expect(row('alpha', 'burst', 'thread-memory').stats).toMatchObject({ appends: 2, append_sum_ms: 40 })
+    expect(row('beta', 'roots', 'queue-acceptance').stats).toMatchObject({ wall_ms: 110, appends: 1, records_total: 1, append_sum_ms: 10 })
+    expect(all.map(r => resultLine({ scenario: 'test-56', mode: 'strict', population: 100000, recipients: 2 }, r))
+      .every(l => l.startsWith('recorded: sr8 diag ') && l.includes('diagnostic=append-cost') && l.endsWith('limit=none verdict=recorded'))).toBe(true)
+  })
+  test('membership append diagnostics require complete ACK windows, distinguish zero samples, and reject impossible fsync costs', () => {
+    const server = JSON.parse(ack(['alpha'], 2, 10, 100, 1))
+    const app = JSON.parse(append('alpha', 'queue', 108, 1, 5, 3, 1))
+    for (const missing of [[], [server, server], [{ ...server, outcome: 'suppressed' }]]) {
+      const all = membershipAppendDiagnostics([items[1]], [app, ...missing], percentile)
+      expect(all).toHaveLength(6)
+      expect(all.every(r => r.stats.window_complete === 'no' && r.stats.wall_ms === 'none'
+        && r.stats.append_sum_ms === 'none' && r.stats.fsync_sum_ms === 'none' && r.stats.append_wall_ratio === 'none')).toBe(true)
+    }
+    const noAppends = membershipAppendDiagnostics([items[1]], [server], percentile)
+    expect(noAppends[0].stats).toMatchObject({ window_complete: 'yes', appends: 0, append_sum_ms: 0, append_p50_ms: 'none', records_min: 'none', append_wall_ratio: 'none' })
+    const noRoots = membershipAppendDiagnostics([{ ...items[1], phase: 'replies' }], [server], percentile)
+    expect(noRoots.find(r => r.stats.window === 'roots')!.stats).toMatchObject({ window_complete: 'no', window_events: 0, wall_ms: 'none' })
+    const zero = membershipAppendDiagnostics([items[1]], [{ ...server, receive_to_ack_ms: 0, ack_call_ms: 0 }], percentile)
+    expect(zero[0].stats).toMatchObject({ window_complete: 'yes', wall_ms: 0, append_wall_ratio: 'none' })
+    expect(() => membershipAppendDiagnostics([items[1]], [server, { ...app, file_fsync_ms: 6 }], percentile)).toThrow('invalid append timings')
+    expect(membershipAppendDiagnostics([], [], percentile)).toEqual([])
+  })
   const none3 = (prefix: string) => `${prefix}_p50_ms=none ${prefix}_p99_ms=none ${prefix}_max_ms=none`
   test('both ACK clocks match per event by key and Slack ts, with the server receipt rebuilt from its own row; every ledger item is kept', () => {
     const samples = ackClockSamples(items, times, rows())
@@ -4315,6 +4373,15 @@ globalThis.fetch = async (_url, init) => {
     const ordinary = cli('diag-ack', [dir, file, String(Buffer.byteLength(ack))])
     expect(ordinary.status).toBe(0); expect(ordinary.stdout).toBe(fault.stdout)
     expect(String(ordinary.stdout).trim().split('\n').every(l => l.startsWith('recorded: sr8 diag ') && l.endsWith('limit=none verdict=recorded'))).toBe(true)
+    const costs = String(ordinary.stdout).trim().split('\n').filter(l => l.includes('diagnostic=append-cost'))
+    expect(costs).toHaveLength(6)
+    expect(costs.find(l => l.includes('window=roots journal=queue-acceptance'))).toContain('wall_ms=6 appends=0')
+    writeFileSync(file, ack + ack + JSON.stringify({ kind: 'append', key: keys[1], journal: 'queue', records: 1,
+      append_ms: 1, file_fsync_ms: 2, dir_fsync_ms: 0, fsyncs: 1, at_mono_ms: 10004 }) + '\n')
+    const invalid = cli('diag-ack', [dir, file, String(Buffer.byteLength(ack))])
+    expect(invalid.status).toBe(0); expect(invalid.stderr).toBe('')
+    expect(String(invalid.stdout)).toContain('diagnostic=ack-summary')
+    expect(String(invalid.stdout)).toContain('diagnostic=append-unavailable limit=none verdict=recorded')
     const absent = cli('diag-ack', [join(root, 'absent'), file, '0'])
     expect(absent.status).toBe(0); expect(absent.stderr).toBe('')
     expect(String(absent.stdout)).toContain('diagnostic=ack-unavailable limit=none verdict=recorded')

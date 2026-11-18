@@ -1025,6 +1025,23 @@ Compare durations across processes, never their monotonic timestamps. `gap_ms`
 also includes delivery/dispatch before routing and ACK transport/observation;
 it does not by itself prove stub scheduling delay. Replayed timestamps may give
 `server=ambiguous`; absent observations print `none` or `ack-unavailable`.
+`diagnostic=append-cost` adds six lines per persona: `window=burst` and
+`window=roots`, each split into `journal=queue-acceptance`, `queue-other` and
+`thread-memory`. Each complete window runs from its first server receipt to
+its last ACK return; every original event in that window needs a unique successful
+server ACK. Lines give append counts, records per append (min/p50/max), append,
+fsync-wait and non-fsync sums/p50/p99/max, file/directory fsync totals, wall time,
+and `append_wall_ratio` (summed append duration divided by that wall time).
+Queue acceptance appends match the same persona's following acceptance-store
+rows in recorder order; partial group matches print `unclassified_queue_appends`.
+Only whole append intervals inside the window enter sums; straddling intervals
+print as `boundary_appends`, without prorating their fsync cost. Incomplete ACK
+windows print `window_complete=no` and no cost sums; invalid append timings
+print `append-unavailable` while preserving ACK diagnostics. Zero samples have
+no percentile or ratio. Fsync wait includes callback dispatch, and the residual
+includes other waits and scheduling as well as synchronous append work; it is
+not a CPU measurement. Compaction rewrites have no append timing row and are
+excluded. Post-ACK appends completing after the window are excluded as well.
 These lines supply no verdict or allowance. Timing observers add clock reads,
 record construction, buffering and periodic file writes to the measured process,
 so diagnostic runs include that instrumentation cost.

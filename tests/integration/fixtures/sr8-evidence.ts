@@ -190,6 +190,10 @@
  *     and the drained measurement file. Prints per-persona both-clock maxima and
  *     five slowest stub samples with envelope IDs, local monotonic timestamps,
  *     ACK-call time and receive-to-store/store-to-ACK splits where uniquely matched.
+ *     Also prints append-cost by persona, queue-acceptance/queue-other/thread-memory,
+ *     for complete burst and roots windows: counts, group sizes, append/fsync/rest
+ *     costs, window wall time and append/wall ratio. Boundary appends are counted
+ *     separately and excluded from sums. Existing append rows time fsync waits.
  *     Replayed Slack timestamps make server matching ambiguous, never zero latency.
  *     Every line starts `recorded: sr8 diag `; no summary or numeric verdict.
  *   observe C <burst-dir> <measurement-file> <byte-mark> <phase-cpu-file>
@@ -2653,6 +2657,76 @@ export function membershipAckDiagnostics(items: BurstItem[], times: Times[], row
   })
 }
 
+type AppendCategory = 'queue-acceptance' | 'queue-other' | 'thread-memory' | 'queue-unclassified'
+interface DiagnosticAppend extends AppendRow { category: AppendCategory; accepted: number }
+/** Record order binds a queue append to its following acceptance-store rows.
+ * Each persona's queue writer publishes those stores before its next append;
+ * other personas and the Thread Memory writer may interleave freely. */
+function membershipAppends(rows: any[]): DiagnosticAppend[] {
+  const appends: DiagnosticAppend[] = [], pending = new Map<string, DiagnosticAppend>()
+  for (const row of rows) {
+    if (row?.kind === 'append' && ['queue', 'thread-memory'].includes(row.journal)) {
+      if (!appendRow(row) || typeof row.key !== 'string' || !integer(row.records) || row.records < 1
+        || row.at_mono_ms < row.append_ms || row.file_fsync_ms + row.dir_fsync_ms > row.append_ms) throw new Error('invalid append timings')
+      const append: DiagnosticAppend = { ...row, category: row.journal === 'queue' ? 'queue-other' : 'thread-memory', accepted: 0 }
+      appends.push(append)
+      if (row.journal === 'queue') pending.set(row.key, append)
+    } else if (row?.kind === 'store' && ACCEPTANCE_STORES.includes(row.store)) {
+      const append = pending.get(row.key)
+      if (append && nonnegative(row.at_mono_ms) && row.at_mono_ms >= append.at_mono_ms) append.accepted++
+    }
+  }
+  for (const a of appends) if (a.accepted) a.category = a.accepted === a.records ? 'queue-acceptance' : 'queue-unclassified'
+  return appends
+}
+interface AppendWindow { events: number; acked: number; start?: number; end?: number }
+/** Require a unique successful server ACK for every original item in the
+ * window. A partial/replayed/suppressed set cannot supply a complete wall time. */
+function membershipAppendWindow(samples: ClockSample[]): AppendWindow {
+  const known = samples.filter(s => s.server_status === 'acked' && nonnegative(s.received) && nonnegative(s.acked))
+  return { events: samples.length, acked: known.length, ...(samples.length && known.length === samples.length
+    ? { start: Math.min(...known.map(s => s.received!)), end: maximum(known.map(s => s.acked!)) } : {}) }
+}
+/** Only whole append intervals inside a window enter cost sums. The observer
+ * records fsync durations, not their endpoints, so a boundary cannot be prorated. */
+function membershipAppendCost(own: DiagnosticAppend[], window: AppendWindow, percentile: Percentile): Result['stats'] {
+  const complete = window.start !== undefined && window.end !== undefined
+  const inside = (a: DiagnosticAppend) => complete && a.at_mono_ms - a.append_ms >= window.start! && a.at_mono_ms <= window.end!
+  const selected = own.filter(inside), overlap = own.filter(a => complete && !inside(a)
+    && a.at_mono_ms > window.start! && a.at_mono_ms - a.append_ms < window.end!)
+  const sum = (ns: number[]) => complete ? round3(ns.reduce((n, v) => n + v, 0)) : 'none'
+  const costs = (prefix: string, ns: number[]) => ({ [`${prefix}_sum_ms`]: sum(ns), ...spread(prefix, ns, percentile) })
+  const wall = complete ? window.end! - window.start! : undefined, records = selected.map(a => a.records)
+  const append = selected.map(a => a.append_ms), fsync = selected.map(a => a.file_fsync_ms + a.dir_fsync_ms)
+  return { window_complete: complete ? 'yes' : 'no', window_events: window.events, window_acked: window.acked,
+    window_start_mono_ms: complete ? round3(window.start!) : 'none', window_end_mono_ms: complete ? round3(window.end!) : 'none',
+    wall_ms: wall === undefined ? 'none' : round3(wall), appends: selected.length, boundary_appends: overlap.length,
+    records_total: records.reduce((n, v) => n + v, 0), records_min: records.length ? Math.min(...records) : 'none',
+    records_p50: records.length ? percentile(records, .5) : 'none', records_max: records.length ? maximum(records) : 'none',
+    ...costs('append', append), ...costs('fsync', fsync), ...costs('non_fsync', selected.map((a, n) => a.append_ms - fsync[n])),
+    file_fsync_sum_ms: sum(selected.map(a => a.file_fsync_ms)), dir_fsync_sum_ms: sum(selected.map(a => a.dir_fsync_ms)),
+    fsync_calls: selected.reduce((n, a) => n + a.fsyncs, 0),
+    append_wall_ratio: wall !== undefined && wall > 0 && append.length ? round3(append.reduce((n, v) => n + v, 0) / wall) : 'none' }
+}
+/** Six bounded lines/persona: three append classes in each of two server-clock
+ * windows. Append time includes fsync callback dispatch; residual is not CPU time.
+ * Rewrites/compactions have no append row and are not charged here. */
+export function membershipAppendDiagnostics(items: BurstItem[], rows: any[], percentile: Percentile): Result[] {
+  const samples = ackClockSamples(items, [], rows), appends = membershipAppends(rows)
+  const categories = ['queue-acceptance', 'queue-other', 'thread-memory'] as const
+  return [...new Set(items.map(i => i.key))].flatMap(key => ['burst', 'roots'].flatMap(phase => {
+    const window = membershipAppendWindow(samples.filter(s => s.key === key && (phase === 'burst' || s.phase === 'roots')))
+    const mine = appends.filter(a => a.key === key)
+    return categories.map(category => {
+      const stats = membershipAppendCost(mine.filter(a => a.category === category), window, percentile)
+      const unknown = membershipAppendCost(mine.filter(a => a.category === 'queue-unclassified'), window, percentile)
+      return result('diag', Number(stats.appends), { diagnostic: 'append-cost', persona: /^[a-z][a-z0-9-]*$/.test(key) ? key : 'invalid',
+        window: phase, journal: category, ...stats, ...(category === 'queue-acceptance'
+          ? { unclassified_queue_appends: unknown.appends, unclassified_boundary_appends: unknown.boundary_appends } : {}) }, 'none', 'recorded')
+    })
+  }))
+}
+
 async function membershipAckObservation(c: Context, args: string[]): Promise<Result[]> {
   countArgs(args, 3)
   const [dir, file, mark] = args, { percentile } = await import('./transcript-receipts.ts')
@@ -2667,7 +2741,9 @@ async function membershipAckObservation(c: Context, args: string[]): Promise<Res
   } else items = jsonl(join(dir, 'burst.jsonl'))
   const rows = integer(numeric(mark)) ? jsonl(file, Number(mark), true) : undefined, times = timingRows(join(dir, 'times.jsonl'))
   if (!items || !rows || !times) throw new Error('missing diagnostic inputs')
-  return membershipAckDiagnostics(items, times, rows, percentile)
+  const ack = membershipAckDiagnostics(items, times, rows, percentile)
+  try { return [...ack, ...membershipAppendDiagnostics(items, rows, percentile)] }
+  catch { return [...ack, result('diag', 0, { diagnostic: 'append-unavailable' }, 'none', 'recorded')] }
 }
 /** The cgroup v2 namespace root's mount. */
 const CGROUP_ROOT = '/sys/fs/cgroup'
