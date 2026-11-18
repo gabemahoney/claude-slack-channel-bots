@@ -236,12 +236,16 @@
  * of every listed row labelled with a persona absent from the applied
  * configuration, with the cause `absent-at-start`;
  * a failed write leaves the file as it was while the store holds those keys
- * in memory, and the sweep goes on. Still before the first kill it begins an
- * old-life hold on the `cwd` of every row listed live
- * (`pending` included) whose key is recorded as retired without the "new
- * life has begun" mark, whether it then kills, keeps or spares the row for a
- * latch: holds live in server memory, so this restores after a restart the
- * holds apply step 1 began. Then it kills, with the result checked,
+ * in memory, and the sweep goes on. That batch record precedes every kill.
+ * Eligible applied-own-row listing holds begin before the first kill;
+ * a stray's listing hold begins beside its lazy Full Row read, just before
+ * that stray's own kill. A hold needs a live row (`pending` included), a key
+ * recorded as retired without the "new life has begun" mark, and a known
+ * `cwd`. Applied own rows are read with get, live or finished, before their
+ * verdicts. A stray spared for a latch gets no get; if its eligible hold's
+ * directory is unknown, the sweep reports that the hold could not start.
+ * Holds live in server memory, so this restores after a restart the known
+ * holds apply step 1 began. It kills, with the result checked,
  * each remaining live row with a persona absent from the applied
  * configuration, an instance ID other than `cscb_<key>`, or a `cwd` other
  * than its persona's working directory, and each live pre-persona row (no
@@ -15105,42 +15109,51 @@ function reportStartSweepHoldUnavailable(pass: SweepPass, instanceId: string): v
   recordStartupError(ORPHAN_CLEANUP_LABEL, redactSlackLogText(line))
 }
 
-/** Read live rows and every cscb_<key> row once: even finished own-row reads consume liveness notes. */
-async function readStartSweepRows(pass: SweepPass, listed: readonly SweepLightRow[]): Promise<SweepRow[]> {
+/** Read only applied personas' own rows up front, including finished rows for their note/cwd verdicts. */
+async function readStartSweepRows(pass: SweepPass, listed: readonly SweepLightRow[], personasByKey: ReadonlyMap<string, Persona>): Promise<SweepRow[]> {
   const rows: SweepRow[] = []
   for (const light of listed) {
     // Explicit projection also discards full fields older binaries still put in list.
     const row: SweepRow = { instance_id: light.instance_id, state: light.state, parent_id: light.parent_id, labels: light.labels, agent: light.agent }
     rows.push(row)
-    if (sweepStopped(pass) || (!AGENT_DIRECTOR_LIVE_STATES.has(row.state) && ownRowKeyOfRowId(row.instance_id) === undefined)) continue
-    let reason: string
-    try {
-      const full = await pass.client.get({ instance_id: row.instance_id })
-      if (sweepStopped(pass)) continue
-      rows[rows.length - 1] = {
-        ...row, state: full.state, cwd: full.cwd, tmux_session_name: full.tmux_session_name,
-        launch_started_at: full.launch_started_at, liveness_note: full.liveness_note, fullRowRead: 'ready',
-      }
-      if (typeof full.cwd === 'string' && full.cwd !== '') continue
-      reason = 'get returned an empty cwd'
-    } catch (err) {
-      if (sweepStopped(pass)) continue
-      const gone = isAdErrorInstance(err, ErrSpawnNotFound)
-      rows[rows.length - 1] = { ...row, fullRowRead: gone ? 'gone' : 'failed' }
-      reason = gone ? 'get found no row (it vanished since list)' : `get failed: ${describeAdFailureForLog(err)}`
-    }
-    const entry = startSweepReadFailedLine(row.instance_id, reason)
-    console.error(`${SWEEP_LOG_PREFIX}: ${redactSlackLogText(entry)}`)
-    recordStartupError(ORPHAN_CLEANUP_READ_FAILED_LABEL, redactSlackLogText(entry))
+    const ownKey = ownRowKeyOfRowId(row.instance_id)
+    if (ownKey !== undefined && personasByKey.has(ownKey)) rows[rows.length - 1] = await readStartSweepRow(pass, row)
   }
   return rows
 }
 
+/** One required Full Row read; absence is uncertainty, never authorization to kill a persona row. */
+async function readStartSweepRow(pass: SweepPass, row: SweepRow): Promise<SweepRow> {
+  if (sweepStopped(pass)) return row
+  let result: SweepRow
+  let reason: string
+  try {
+    const full = await pass.client.get({ instance_id: row.instance_id })
+    if (sweepStopped(pass)) return row
+    result = {
+      ...row, state: full.state, cwd: full.cwd, tmux_session_name: full.tmux_session_name,
+      launch_started_at: full.launch_started_at, liveness_note: full.liveness_note, fullRowRead: 'ready',
+    }
+    if (typeof full.cwd === 'string' && full.cwd !== '') return result
+    reason = 'get returned an empty cwd'
+  } catch (err) {
+    if (sweepStopped(pass)) return row
+    const gone = isAdErrorInstance(err, ErrSpawnNotFound)
+    result = { ...row, fullRowRead: gone ? 'gone' : 'failed' }
+    reason = gone ? 'get found no row (it vanished since list)' : `get failed: ${describeAdFailureForLog(err)}`
+  }
+  const entry = startSweepReadFailedLine(row.instance_id, reason)
+  console.error(`${SWEEP_LOG_PREFIX}: ${redactSlackLogText(entry)}`)
+  recordStartupError(ORPHAN_CLEANUP_READ_FAILED_LABEL, redactSlackLogText(entry))
+  return result
+}
+
 /**
- * The start sweep's latch pass, made over the enriched rows before any kill. Each
- * successfully read row whose id is a key's own (`cscb_<key>`, `ownRowKeyOfRowId`), whatever
+ * The start sweep's latch pass, made before any kill. Each
+ * row whose id is a key's own (`cscb_<key>`, `ownRowKeyOfRowId`), whatever
  * its `persona` label, goes through the shared own-row read's act step
- * (`actOnOwnRowRead`) at `START_SWEEP_LIST_SITE`, as a `get` row would:
+ * (`actOnOwnRowRead`) at `START_SWEEP_LIST_SITE`. Applied personas use their
+ * successful Full Rows; other keys need only light facts for the entry clear:
  *
  *   - a configured persona's own row (the installed `ConfiguredPersonaQuery`)
  *     that reads `pending` with no launch start latches it with "launch
@@ -15172,8 +15185,9 @@ function latchFromListedRows(
 ): ReadonlySet<string> {
   const latched = new Set<string>()
   for (const row of rows) {
-    // Missing Full Row fields are uncertainty, never evidence for a latch.
-    if (row.fullRowRead !== 'ready') continue
+    // Failed persona reads carry no latch evidence. Unconfigured keys need
+    // only light identity/state facts for the independent entry-clear rule.
+    if (row.fullRowRead === 'failed' || row.fullRowRead === 'gone') continue
     const key = ownRowKeyOfRowId(row.instance_id)
     if (key === undefined) continue
     const persona = personasByKey.get(key)
@@ -15305,13 +15319,15 @@ function recordAbsentPersonaKeys(keys: readonly string[]): number {
  * (`recordAbsentPersonaKeys`); the keys are
  *      counted in `recordedAsRetired`. A failed write leaves the file as it
  *      was, the store holds the keys in memory, and the sweep goes on.
- *      Then, still before the first kill, the listing's old-life holds
- * (`beginStartSweepListingHolds`): every row
+ *      Then the listing's old-life holds (`beginStartSweepListingHolds`):
+ *      applied own rows before the first kill, strays just before their
+ *      own kill once their directory is read. Every eligible row
  *      listed live (`pending` included) whose key is recorded as retired
  *      without the "new life has begun" mark, a key just recorded included,
- *      holds its `cwd`, whether the sweep then kills it, keeps it or leaves
- *      it for a latch, so a restart restores the hold apply step 1 began (a
- *      destructive modify's same-key old life the sweep keeps included).
+ *      holds its known `cwd`; applied own rows may be kept or left for a
+ *      latch. A latched stray gets no get, and an eligible hold with unknown
+ *      cwd reports that it could not start. A restart thus restores known
+ *      holds apply step 1 began, including a kept same-key old life.
  *   4. Row by row in list order, of the rows step 2 left: a row with no
  * `persona` label (a pre-persona row) is a stray; a labelled row
  *      is a stray when `sweepDecision` sweeps it (an absent persona, an
@@ -15381,8 +15397,11 @@ function recordAbsentPersonaKeys(keys: readonly string[]): number {
  * live in server memory, so this sweep is where a restart rebuilds the ones
  * still needed.
  *
- * Each listed live row and every cscb_<key> row is first enriched with one get: cwd/session and
- * latch metadata come only from that Full Row, whose newer state is used.
+ * Each applied persona's cscb_<key> row, live or finished, is first enriched
+ * with one get. Other live strays get one only just before their kill when
+ * a hold set needs their cwd. Kept pre-persona rows and strays swept without
+ * holds get no get. Directory/session and latch metadata come only from Full
+ * Rows, whose newer state is used; unconfigured keys' note-only logs are not read.
  * Failed or incomplete reads never authorize a cwd kill; vanished rows are
  * gone. Finished own rows retain their liveness-note handling and cwd comparisons.
  *
@@ -15425,7 +15444,8 @@ export async function reconcileOrphans(
   }
   const records: SweepRowRecord[] = []
 
-  const rows = await readStartSweepRows(pass, listed)
+  const personasByKey = new Map(personaConfig.personas.map((p) => [p.key, p]))
+  const rows = await readStartSweepRows(pass, listed, personasByKey)
 
   // a shutdown begun by the time the list returns means no
   // latch, no record write and no kill; every row counts as kept.
@@ -15436,14 +15456,13 @@ export async function reconcileOrphans(
 
   // every latch and record decision is made over the
   // whole list before the first kill.
-  const personasByKey = new Map(personaConfig.personas.map((p) => [p.key, p]))
   const absentKeys = absentPersonaKeysOf(rows, personasByKey)
   const latched = latchFromListedRows(rows, personasByKey, new Set(absentKeys))
   const recordedAsRetired = recordAbsentPersonaKeys(absentKeys)
-  // after the recording and before the first kill,
-  // the listing's holds: every live row of a key recorded without its mark,
-  // whatever the sweep then does with it.
-  beginStartSweepListingHolds(pass, rows)
+  // Begin known persona holds after recording. Strays' listing holds begin
+  // beside their lazy Full Row read just before their own kill. Kept latched
+  // strays with an eligible hold report the unknown directory without a get.
+  beginStartSweepListingHolds(pass, rows.filter((row) => row.fullRowRead !== undefined || startSweepLatchOf(row, latched) !== undefined))
   // then each listed row is a read of it, through the
   // one read entry: a finished one ends an old-life hold on it, and a live
   // one's state seeds the hold's first wait (so a row listed `pending` gets
@@ -15475,17 +15494,20 @@ export async function reconcileOrphans(
 }
 
 /**
- * The start sweep's listing holds (third start,
- *), begun after its batch record and before its first kill: each
+ * The start sweep's listing holds (third start), begun after its batch
+ * record: applied personas before the first kill, strays just before their
+ * own kill once their Full Row has been read. Each
  * listed row in a live state (`AGENT_DIRECTOR_LIVE_STATES`, `pending`
  * included) whose `persona` label key the installed retired-key store answers
  * as recorded without the "new life has begun" mark (`retiredKeyReadingOf`,
  * a key this sweep has just recorded and one held only in memory included)
- * gets one hold on its `cwd`, with the cause `start-sweep-listing` and the old
+ * gets one hold on its known `cwd`, with the cause `start-sweep-listing` and the old
  * key `oldLifeKeyOf` gives (the label, or the instance id when the id is not
  * the label's `cscb_<key>`), whatever the sweep then does with the row: kill
- * it, keep it (a destructive modify's same-key old life whose `cwd` matches
- * its persona included) or leave it for a latch. It restores after a restart
+ * it, keep an applied own row (a destructive modify's same-key old life whose
+ * `cwd` matches its persona included) or leave an applied own row for a latch.
+ * A latched stray gets no get; an eligible hold with unknown cwd reports that
+ * it could not start. It restores after a restart
  * the hold apply step 1 began. A row whose kill then succeeds keeps the hold
  * until a read shows it finished (the post-kill findMissing run usually
  * does). A finished row, a row with no `persona` label, and a row whose key is
@@ -15611,6 +15633,19 @@ async function sweepListedRow(pass: SweepPass, row: SweepRow, context: StartSwee
   if (startSweepLatchOf(row, context.latched) !== undefined) return { row, disposition: SWEEP_ROW_LEFT_FOR_LATCH }
   // after a stop the sweep makes no further call.
   if (pass.stop.stopping || sweepStopsAtShutdown(pass)) return { row, disposition: SWEEP_ROW_KEPT }
+  // After the latch pass, any unread live row is a stray on light facts.
+  // Its Full Row is needed only if the imminent kill can need a directory hold.
+  if (row.fullRowRead === undefined && AGENT_DIRECTOR_LIVE_STATES.has(row.state) && oldLifeHolds !== undefined) {
+    row = await readStartSweepRow(pass, row)
+    if (sweepStopped(pass)) return { row, disposition: SWEEP_ROW_KEPT }
+    beginStartSweepListingHolds(pass, [row])
+    noteOldLifeRowRead(
+      row.instance_id,
+      row.fullRowRead === 'gone' ? { kind: OLD_LIFE_ROW_READ_NO_ROW } : { kind: OLD_LIFE_ROW_READ_STATE, state: row.state, cwd: row.cwd },
+      oldLifeReadName(START_SWEEP_LIST_SITE),
+    )
+    if (row.fullRowRead === 'gone') return { row, disposition: SWEEP_ROW_KEPT }
+  }
   const live = AGENT_DIRECTOR_LIVE_STATES.has(row.state)
   const personaLabel = row.labels?.[PERSONA_LABEL_KEY]
   let target: StartSweepKillTarget = {}

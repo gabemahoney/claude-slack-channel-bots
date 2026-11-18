@@ -873,8 +873,8 @@ describe('starts 2 and 3, the start sweep holds the cwd of each live row it fail
 
     expect([...new Set(h.stub.calls.killCalls.map((k) => k.instance_id))]).toEqual([pre, absent, bOld, bElsewhere].map((row) => row.instance_id))
     expect(holdsOf(h)).toEqual([
-      hold(absent.instance_id, LAUNCH_START_ABSENT_PERSONA_KEY, absent.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING, true),
       hold(pre.instance_id, pre.instance_id, pre.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL, true),
+      hold(absent.instance_id, LAUNCH_START_ABSENT_PERSONA_KEY, absent.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_LISTING, true),
       hold(bOld.instance_id, bOld.instance_id, bOld.cwd, OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL, true),
       hold(personaInstanceId(b), b, h.home, OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL, true),
     ])

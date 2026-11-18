@@ -12,7 +12,7 @@ Automatic reconnect is unavailable for covered instances in this build. Follow t
 
 Once a release with the new queue record kinds (`submitted` and `submission-blocked`) has run, going back to an older CSCB is unsupported. There is no queue migration or replay command.
 
-At startup, CSCB lists its instances and reads each live instance and every `cscb_<key>` instance with `get` before checking its working directory or using its session details. This supports agent-director's light `list` results with the pinned client and preserves checks and diagnostics for finished persona instances. Other finished instances need no additional read. See [Startup errors](troubleshooting.md#startup-errors) if an instance cannot be read.
+At startup, CSCB lists its instances and reads each applied persona's own `cscb_<key>` instance with `get`, live or finished. A stray gets a read only just before its kill when a working-directory hold needs it. Kept pre-persona instances and strays swept without holds get no additional read. This supports light `list` results with the pinned client; see [Startup errors](troubleshooting.md#startup-errors) if a required read fails.
 
 ---
 

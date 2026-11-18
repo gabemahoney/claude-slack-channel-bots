@@ -7205,10 +7205,10 @@ describe('bring-up outcomes ()', () => {
       // A notice raised for A before the pass is held; it must never be posted.
       await f.notifier.notify(a.key, 'held notice for A')
 
-      // The sweep reads Full Rows, kills its control row and keeps A's row.
+      // The sweep reads A's Full Row and kills the control on light facts (no hold set).
       // A's cwd check is deferred only when its working directory has no real path.
       await reconcileOrphans(f.h.config!)
-      expect(adCallsFor(ORPHAN_ID)).toEqual({ get: 1, kill: 1 })
+      expect(adCallsFor(ORPHAN_ID)).toEqual({ kill: 1 })
       expect([...rows.keys()]).toEqual([idOf(a), ORPHAN_ID])
       expect(deferredLines()).toEqual(existsSync(a.working_directory) ? [] : [expect.stringContaining(renderPersonaRef(a.name, a.key))])
 
@@ -7422,7 +7422,7 @@ describe('bring-up outcomes ()', () => {
 
       expect(result.perPersona.find(p => p.key === a.key)).toMatchObject({ action: 'not-brought-up', outcome: 'retrying' })
       expect(adCallsFor(idOf(a))).toEqual({ get: 1 })
-      expect(adCallsFor(ORPHAN_ID)).toEqual({ get: 1, kill: 1 })
+      expect(adCallsFor(ORPHAN_ID)).toEqual({ kill: 1 })
       expect(deferredLines()).toEqual([expect.stringContaining(renderPersonaRef(a.name, a.key))])
       // While A retries, a registration from its configured directory is refused.
       const whileRetrying = await connectSession(f, a.working_directory)

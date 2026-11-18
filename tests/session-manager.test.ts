@@ -302,6 +302,8 @@ import {
   type OldLifeHoldEndReason,
 } from '../src/retired-keys.ts'
 import { RETIRED_ENTRY_CLEARING_STATES } from '../src/row-read-rules.ts'
+import { createOldLifeHoldSet } from '../src/retired-keys.ts'
+import { setOldLifeHolds } from '../src/session-manager.ts'
 import {
   _forceResumeForPersona, _forceReuseSpawnForPersona, _resetInvalidFlagsHold, _resetOldLifeHolds, _resetOldLifeWaitBindings, _resetRetiredKeyStore, abortKillOwnStuckLaunch, buildOldLifeWaitDeps, buildPendingRowRuleDeps, COLLISION_GET_SITE, createOldLifeHoldEndRetry, createOldLifeWaitRecord,
   ensureOldLifeWait, forgetLaunchCalls, isCscbOwnLaunch, isOldLifeWaitRunningFor, isOwnRowOldLifeHeld, isSequenceOrOldLifeWaitRunning, JSONL_NO_CANDIDATES_TEXT, jsonlCandidatesInconclusiveNoticeText, jsonlCandidatesText, ladderRuleRetryingLine, LATCH_RECHECK_AT_CAP,
@@ -3570,6 +3572,48 @@ function sweepKillFailedEntry(
 describe('reconcileOrphans: Light Rows get their sweep details from Full Rows', () => {
   afterEach(recoveryAfterEach)
 
+  test.each(['ended', 'missing'])('a kept %s pre-persona row is never named by get', async (state) => {
+    const { h, p } = buildRecoveryCase()
+    const row = harnessRow(h, harnessPersona(h, p), { instance_id: 'cscb_legacy', state, labels: { service: 'cscb' } })
+    h.script({ listResult: { spawns: [cannedListRow(row, 'light')] }, getFn: () => row })
+    expect(await h.startSweep()).toEqual(sweepResult({ listed: 1, kept: 1 }))
+    expect(h.stub.calls.getCalls).toEqual([])
+    expect(h.stub.calls.killCalls).toEqual([])
+  })
+
+  test('a live pre-persona row kept after an earlier kill stops the sweep gets no get', async () => {
+    const { h, p } = buildRecoveryCase()
+    const persona = harnessRow(h, harnessPersona(h, p), { cwd: h.home })
+    const legacy = { ...persona, instance_id: 'cscb_legacy', labels: { service: 'cscb' } }
+    h.script({ listResult: { spawns: [cannedListRow(persona, 'light'), cannedListRow(legacy, 'light')] }, getFn: ({ instance_id }) => instance_id === persona.instance_id ? persona : legacy })
+    const kill = h.stub.client.kill.bind(h.stub.client)
+    let stopped = false
+    h.stub.client.kill = async (params) => { const result = await kill(params); stopped = true; return result }
+    await h.startSweep(() => stopped)
+    expect(h.stub.calls.getCalls).toEqual([{ instance_id: persona.instance_id }])
+    expect(h.stub.calls.killCalls).toEqual([{ instance_id: persona.instance_id }])
+  })
+
+  test('a stray killed on light facts with no hold set gets no get', async () => {
+    const { h, p } = buildRecoveryCase()
+    _resetOldLifeHolds()
+    const row = harnessRow(h, harnessPersona(h, p), { instance_id: 'other_callers_id' })
+    h.script({ listResult: { spawns: [cannedListRow(row, 'light')] }, getFn: () => row })
+    expect(await h.startSweep()).toEqual(sweepResult({ listed: 1, killed: 1 }))
+    expect(h.stub.calls.getCalls).toEqual([])
+    expect(h.stub.calls.killCalls).toEqual([{ instance_id: row.instance_id }])
+  })
+
+  test('each stray needing a hold gets exactly one Full Row just before its own kill', async () => {
+    const { h, p } = buildRecoveryCase()
+    const rows = ['stray_one', 'stray_two'].map((instance_id) => harnessRow(h, harnessPersona(h, p), { instance_id }))
+    h.script({ listResult: { spawns: rows.map((row) => cannedListRow(row, 'light')) }, getFn: ({ instance_id }) => rows.find((row) => row.instance_id === instance_id)! })
+    const order = recordCallOrder(h)
+    expect(await h.startSweep()).toEqual(sweepResult({ listed: 2, killed: 2 }))
+    expect(order).toEqual(['list', 'get', 'kill', 'get', 'kill', 'findMissing'])
+    expect(h.stub.calls.getCalls).toEqual(rows.map((row) => ({ instance_id: row.instance_id })))
+  })
+
   test.each([...AGENT_DIRECTOR_LIVE_STATES])('keeps a correct %s persona row; reads finished own rows but skips finished strays outside the own-row ID form', async (state) => {
     const { h, p, b } = buildRecoveryCase()
     const full = harnessRow(h, harnessPersona(h, p), { state })
@@ -3607,7 +3651,7 @@ describe('reconcileOrphans: Light Rows get their sweep details from Full Rows', 
     expect(entry).toContain(full.tmux_session_name)
   })
 
-  test.each(['waiting', 'ended', 'missing'].flatMap((state) => ['get failed', 'not_found', 'empty cwd'].map((fault) => [state, fault] as const)))('%s: %s keeps the persona, logs and records the uncertainty', async (state, fault) => {
+  test.each([...AGENT_DIRECTOR_LIVE_STATES, 'ended', 'missing'].flatMap((state) => ['get failed', 'not_found', 'empty cwd'].map((fault) => [state, fault] as const)))('%s: %s keeps the persona, logs and records the uncertainty', async (state, fault) => {
     const { h, p } = buildRecoveryCase()
     const full = harnessRow(h, harnessPersona(h, p), { state })
     h.script({
@@ -3688,15 +3732,14 @@ describe('reconcileOrphans: Light Rows get their sweep details from Full Rows', 
     expect(h.startupErrors().filter((value) => value.includes(`[${ORPHAN_CLEANUP_LABEL}] ${line}`))).toHaveLength(1)
   })
 
-  test.each(['ended', 'missing'])('a finished %s unconfigured cscb_<key> stray is read to preserve its liveness-note log without latching', async (state) => {
+  test.each(['ended', 'missing'])('a finished %s unconfigured cscb_<key> stray needs no Full Row verdict or hold and gets no get', async (state) => {
     const { h, p } = buildRecoveryCase()
     const full = harnessRow(h, harnessPersona(h, p), { instance_id: 'cscb_departed', state, labels: { service: 'cscb', persona: 'departed' }, liveness_note: provenanceNote })
     h.script({ listResult: { spawns: [cannedListRow(full, 'light')] }, getFn: () => full })
     expect(await h.startSweep()).toEqual(sweepResult({ listed: 1, kept: 1, recordedAsRetired: 1 }))
-    expect(h.stub.calls.getCalls).toEqual([{ instance_id: full.instance_id }])
+    expect(h.stub.calls.getCalls).toEqual([])
     expect(h.stub.calls.killCalls).toEqual([])
-    expect(h.errors.join('\n')).toContain('persona=departed: its row carries the liveness note')
-    expect(h.errors.join('\n')).toContain('the note is not applied')
+    expect(h.errors.filter((line) => line.includes('its row carries the liveness note'))).toEqual([])
     expect(h.episodeNotices).toEqual([])
   })
 
@@ -3990,6 +4033,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
     afterEach(() => {
       setKillFailureAlerts(undefined)
+      _resetOldLifeHolds()
       expect(alertPosts).toEqual([])
     })
 
@@ -4023,6 +4067,9 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       setConflictLatch(latch)
       setConfiguredPersonaQuery((key) => cfg.personas.some((p) => p.key === key))
       const listed = rows(cfg, home)
+      // Production installs holds before the sweep; these cases require Full
+      // Row session details for their checked-kill entries and alerts.
+      setOldLifeHolds(createOldLifeHoldSet({ log: () => {} }))
       const killCalls: import('agent-director').KillParams[] = []
       const statusCalls: import('agent-director').StatusParams[] = []
       const deleteCalls: StubDeleteParams[] = []
@@ -4304,7 +4351,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         // The re-check's stop is its one line; no shutdown stop line.
         expect(errLog).not.toContain(START_SWEEP_SHUTDOWN_STOP_LINE)
         expect(startupEntriesIn(readLog(), ORPHAN_CLEANUP_LABEL)).toEqual([
-          sweepKillFailedEntry(spawns[1]!, renderPersonaRef('alpha', 'alpha'), standing, undefined, true),
+          sweepKillFailedEntry({ ...spawns[1]!, tmux_session_name: '' }, renderPersonaRef('alpha', 'alpha'), standing, undefined, true),
         ])
         expectSummaryLast(errLog, result)
         expect(errLog).not.toContain('instanceId=cscb_departed state=')
@@ -4347,7 +4394,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         expect(result).toEqual(sweepResult({ listed: 2, kept: 2, killFailed: 1 }))
         expect(errLog.split('\n').filter((l) => l.includes('the version re-check decided that the server stops'))).toHaveLength(1)
         expect(startupEntriesIn(readLog(), ORPHAN_CLEANUP_LABEL)).toEqual([
-          sweepKillFailedEntry(legacy, undefined, { ...killOutcomeOf({ thrown: err }), recheck: RECHECK_OUTCOME_STOP } as KillOutcome, undefined, true),
+          sweepKillFailedEntry({ ...legacy, tmux_session_name: '' }, undefined, { ...killOutcomeOf({ thrown: err }), recheck: RECHECK_OUTCOME_STOP } as KillOutcome, undefined, true),
         ])
       })
 
@@ -5185,7 +5232,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         listed(h, p, { instance_id: `${personaInstanceId(p)}_old`, cwd: h.home }),
       ])
 
-      expect(run.order).toEqual(['list', 'get', 'get', 'get', 'get', 'kill', 'findMissing'])
+      expect(run.order).toEqual(['list', 'get', 'get', 'kill', 'findMissing'])
       expect(killedIds(h)).toEqual([legacy.instance_id])
       expectRecordedAbsent(h, [LAUNCH_START_ABSENT_PERSONA_KEY])
       expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))
@@ -5295,7 +5342,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
         const run = await sweepOver(h, stopRows(h, p, b), h.config, () => h.retiredKeyWrites.length > 0)
 
-        expect(run.order).toEqual(['list', 'get', 'get', 'get', 'get'])
+        expect(run.order).toEqual(['list', 'get'])
         expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))
         expectRecordedAbsent(h, [LAUNCH_START_ABSENT_PERSONA_KEY])
         const expected = sweepResult({ listed: 4, kept: 3, recordedAsRetired: 1, leftForLatch: 1 })
@@ -5320,7 +5367,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
         const run = await sweepOver(h, rows, h.config, () => h.stub.calls.killCalls.length > 0)
 
-        expect(run.order).toEqual(['list', 'get', 'get', 'get', 'get', 'kill'])
+        expect(run.order).toEqual(['list', 'get', 'get', 'kill'])
         expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))
         expectRecordedAbsent(h, [LAUNCH_START_ABSENT_PERSONA_KEY])
         const expected = sweepResult({ listed: 4, kept: 3, killFailed: 1, recordedAsRetired: 1, leftForLatch: 1 })
@@ -10894,7 +10941,8 @@ describe('agent-director failure text in startup records and the spawn-failure n
       instanceId: row.instance_id,
       persona: renderPersonaRef('alpha', 'alpha'),
       state: row.state,
-      session: row.tmux_session_name,
+      // No hold set: this stray is killed on light facts without a get.
+      session: '',
       outcome: describeKillOutcome(killOutcomeOf({ thrown: err })),
       stoppedAtShutdown: false,
     }))).toBe(true)

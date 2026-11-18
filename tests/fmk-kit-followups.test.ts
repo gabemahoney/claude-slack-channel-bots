@@ -136,7 +136,7 @@ test.each(['labelnote', 'nostart'] as const)('test 23 %s sweep latch requires on
   expect(result.stdout).toContain('anchor=2000000')
 })
 
-test.each([
+const SWEEP_GET_FAULTS: ReadonlyArray<readonly [SweepGetFault, string]> = [
   ['missing', 'no bot-server Full Row get'],
   ['duplicate', 'more than one CSCB get'],
   ['before-list', 'not strictly after its sweep list'],
@@ -147,8 +147,10 @@ test.each([
   ['at-latch', 'not strictly after its sweep list'],
   ['only-after-latch', 'no bot-server Full Row get'],
   ['other-call-before-latch', "not the bot server's one Full Row get"],
-] as const)('test 23 sweep latch rejects %s', (fault, reason) => {
-  const result = sweepLatchOrdering('labelnote', fault)
+]
+
+test.each((['labelnote', 'nostart'] as const).flatMap(key => SWEEP_GET_FAULTS.map(([fault, reason]) => [key, fault, reason] as const)))('test 23 %s sweep latch rejects %s', (key, fault, reason) => {
+  const result = sweepLatchOrdering(key, fault)
   expect(result.status).toBe(1)
   expect(result.stderr).toContain(reason)
 })

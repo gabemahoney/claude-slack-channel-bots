@@ -1511,7 +1511,7 @@ Host-safety audits pin the eight-module import graph, including `codex-crash-bar
 
 ### fmk scenarios
 
-The startup sweep's service-filtered `list` is followed by one Full Row `get` per live listed instance, including `pending`, and per finished `cscb_<key>` instance before its latch, hold and kill decisions. Finished own rows keep cwd comparisons and liveness-note handling, including note logs for absent keys; other finished strays need no `get`. Sweep call counts include these startup reads; test-32's delivery measurement windows start after the sweep.
+The startup sweep makes one service-filtered `list`, then one Full Row `get` per applied persona's own `cscb_<key>` instance, live or finished, before its latch/cwd verdict. A stray gets one `get` just before its own kill when a hold needs its directory; kept pre-persona rows and strays swept with no hold set get none. Unconfigured own-ID rows use light identity/state facts for retired-entry clears; their note-only diagnostics need no read. Sweep call counts include the selected startup reads; test-32's delivery measurement windows start after the sweep.
 
 Each fmk scenario of agent-director's handoff to CSCB, §7 (lifecycle scenario),
 is one script, named here; scenario 14 has no script, and scenario 17 is a
