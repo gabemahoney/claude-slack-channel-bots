@@ -30,6 +30,7 @@ Each source module has a corresponding test file under `tests/`. Every `tests/*.
 
 | Source | Test File | What It Tests |
 |--------|-----------|---------------|
+| test-stall-attribution.ts, post-holds.ts, fixtures/sr8-attribution.ts | stall-attribution.test.ts | Base-switch gate, injected probe/CPU/heap and unavailable cgroup counters, early hold callback/re-arm and decision times, informational deadline-window matching across personas, bounded printing and failure file retention. Synthetic evidence only. |
 | tests/integration/fixtures/transcript-receipts.ts, lib/scenario.sh, tests/real-agent/codex-gate.ts | shim-log-reader.test.ts | Synthetic append boundaries retain only complete lines in the shared readers and scenario-local selector output. Empty/newline-free logs and incomplete malformed or valid tails are ignored; complete malformed calls and bad quoting still fail, as do malformed fault/stop lines in the shell reader. Executes only extracted shell reader declarations, with no native agent. |
 | tests/integration/test-32-fmk-real-order.sh, fixtures/real-case-assertions.ts | real-down-pause.test.ts | Executes the DOWN assertion with synthetic structured AD evidence and the actual pre-pause/pause boundaries with inert functions. Requires one receipted DM and `transcript_status: present` before pause; pins cumulative 14/34/54 counts and 20 latency indices, permits completed baseline work, and rejects any send/delivery during DOWN. Accepts `missing` after the scenario's successful pause only with the same native session and available launch fields; rejects absent/foreign success proof, session loss, changed launches and live/foreign end rows. Preserves `ended` and absent optional launch fields. No native agent or credentials. |
 | child-env.ts, bundled agent-director client | child-env.test.ts | Case-insensitive Slack credential-name removal, inherited `AGENT_DIRECTOR_INSTANCE_ID` removal in both filters with marker options omitted, false and true, ordinary host-variable pass-through, pure child copies and in-place entry scrub, and daemon-only marker handoff. A scratch child drives the real npm client's discovery and one verb against an inert fake executable, recording environment names only; an unscrubbed control proves the verb boundary is exercised. See the fake-executable exception under Host safety. |
@@ -1021,7 +1022,50 @@ server's `at_mono_ms`, and stores carry their duration. The scenario enables
 it with `test_measurements: true` in `config.json`; clean shutdown awaits its
 drain before the final read.
 
-Membership-load cases also enable `test_measurement_timings: true` and print
+Every Test 44 case and membership-load case enables `test_measurements: true`
+through the shared SR-8 config generator. That base switch alone enables hold
+attribution, synchronous-work markers and a 10 ms unref'd server probe recording
+dispatch gaps over 20 ms. Each `event-loop-stall` row carries last-tick/start, expected and actual
+fire times, elapsed/gap ms, process user/system CPU deltas (µs), the server's own
+cgroup-v2 `cpu.stat` counters and deltas since the preceding tick, and heap-used/
+heap-total bytes at both ends. A missing/malformed reading is `null`, never a
+zero-throttle claim. High process CPU hints at busy work; low CPU plus raised
+throttle counters supports quota starvation. Heap changes only hint at GC;
+unmarked busy work, mixed causes and host scheduling may need further profiling.
+
+`recorded: sr8 attribution ... verdict=info` lines preserve this evidence even
+when a lane keeps only `recorded:` output. `type=post-hold` prints persona key/seq,
+server process ID, receipt, due, every callback with its armed delay, evaluation time and signed
+lateness, plus stalls and synchronous work overlapping `[due, evaluate]` on the
+server clock (including work by other personas). Process IDs keep restarted
+server lifetimes separate when a retained file includes several starts. `type=stall` prints each gap's
+CPU/throttle/heap data and overlapping work; the largest 200 gaps are printed,
+with `type=stall-summary` giving the full count, maximum and sum. Per-window
+arrays cap at 50 and retain their uncapped counts. Work markers cover runs over
+20 ms in Thread Memory judge, digest, image concatenation and save selection,
+queue compaction selection/stringify/rebuild, and measurement serialization.
+All attribution observers, reads and probe timers are absent when the base
+`test_measurements` switch is off.
+
+On a verdict or script failure, the shared SR-8 failure hook runs after server
+stop and recorder drain, before scratch cleanup. It copies up to 64 regular
+measurement files (including scenario snapshots) to
+`/test-results/<script>.sh.sr8-measurements-N.jsonl`, the shard-results mount;
+on the host these are beside the script logs in
+`/run/openclaw/horde/cscb-ci-<run>/shard-N/` (or that run's configured temp root).
+`type=kept-file` prints the container path and original source;
+`type=failure-row` prints at most 400 rows per file within ±2 s of each failing
+Post Hold deadline-to-evaluation window, prioritizing timing/stall/work rows.
+`type=failure-summary` gives window, available-row and printed counts. Full
+files retain every byte. Retention is informational and preserves the script's
+failure; result ownership allows only these numbered regular files for assigned
+burst scripts. Test 44's optional CPU profile and detailed `observe` output still
+require `CSCB_TEST_DIAGNOSTICS=1`. Its per-event ack/append/save rows remain
+opt-in under `test_measurement_timings: true`, enabled only for diagnostic burst
+cases. Default and non-burst test-44 cases do not gain per-event ack/append/save
+rows. Membership-load cases already enable that separate per-event switch.
+
+Membership-load cases print
 `recorded: sr8 diag` lines before the post-restart verdicts. `diagnostic=ack-summary`
 gives each persona's stub push-to-ACK and server receive-to-ACK maxima;
 `diagnostic=ack-slow` correlates its five slowest stub samples by envelope ID,

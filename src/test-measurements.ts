@@ -15,7 +15,8 @@
  * The `ack`, `append` and `thread-save` kinds also need
  * `test_measurement_timings: true` (`TEST_MEASUREMENT_TIMINGS_KEY`), because
  * their observers add work to every receipt, append and save.
- * The `thread-compaction` kind needs only `test_measurements: true`.
+ * `thread-compaction`, `post-hold-timing`, `event-loop-stall` and `sync-work`
+ * need only `test_measurements: true`.
  *
  * Each line is `{ v: 1, kind, at_mono_ms, … }` and holds numbers, persona
  * keys, sequence numbers, Slack event timestamps (`ack`'s `ts`) and fixed
@@ -24,11 +25,13 @@
  * clock, the queue's default): for the store kinds and `append`, when the
  * append became durable; for `ack`, when the ack call returned or was
  * suppressed; for `thread-compaction`, when the compaction completed;
+ * for attribution, the observation time (or the end of a span);
  * for the others, when the recorder was handed the fact.
  *
  * Importing this module performs no I/O and starts no timer.
  */
 
+import { testSyncWorkStart, testSyncWorkEnd, type AttributionMeasurement } from './test-stall-attribution.ts'
 import * as nodeFs from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import type { HoldOutcome, QueueEvent, QueueStoreKind } from './delivery-queue.ts'
@@ -83,7 +86,7 @@ export interface ThreadCompactionMeasurement {
 }
 /** What `record` takes. */
 export type TestMeasurement = StoreMeasurement | ResolutionStoreMeasurement | PostHoldResolvedMeasurement
-  | AckMeasurement | AppendMeasurement | ThreadSaveMeasurement | ThreadCompactionMeasurement
+  | AckMeasurement | AppendMeasurement | ThreadSaveMeasurement | ThreadCompactionMeasurement | AttributionMeasurement
 /** One line of the file. */
 export type TestMeasurementRecord = TestMeasurement & { v: 1; at_mono_ms: number }
 
@@ -91,6 +94,19 @@ export type TestMeasurementRecord = TestMeasurement & { v: 1; at_mono_ms: number
 export function serializeTestMeasurement(record: TestMeasurementRecord): string {
   const head = { v: 1, kind: record.kind, at_mono_ms: record.at_mono_ms }
   switch (record.kind) {
+    case 'post-hold-timing':
+      return JSON.stringify({ ...head, process_id: record.process_id, key: record.key, seq: record.seq, phase: record.phase,
+        received_mono_ms: record.received_mono_ms, due_mono_ms: record.due_mono_ms,
+        ...(record.armed_delay_ms === undefined ? {} : { armed_delay_ms: record.armed_delay_ms }) })
+    case 'sync-work':
+      return JSON.stringify({ ...head, process_id: record.process_id, work: record.work, ...(record.key === undefined ? {} : { key: record.key }),
+        start_mono_ms: record.start_mono_ms, end_mono_ms: record.end_mono_ms })
+    case 'event-loop-stall':
+      return JSON.stringify({ ...head, process_id: record.process_id, start_mono_ms: record.start_mono_ms, end_mono_ms: record.end_mono_ms,
+        expected_mono_ms: record.expected_mono_ms, gap_ms: record.gap_ms, elapsed_ms: record.elapsed_ms,
+        cpu_user_usec: record.cpu_user_usec, cpu_system_usec: record.cpu_system_usec,
+        cpu_stat: record.cpu_stat, cpu_stat_delta: record.cpu_stat_delta, cpu_stat_before_mono_ms: record.cpu_stat_before_mono_ms,
+        heap_before: record.heap_before, heap_after: record.heap_after })
     case 'store':
       return JSON.stringify({ ...head, key: record.key, seq: record.seq, store: record.store, store_ms: record.store_ms })
     case 'resolution-store':
@@ -230,7 +246,11 @@ export function createTestMeasurements(deps: TestMeasurementsDeps): TestMeasurem
   let failing = false
   let stopped = false
 
-  const lines = (records: TestMeasurementRecord[]) => records.map(r => serializeTestMeasurement(r) + '\n').join('')
+  const lines = (records: TestMeasurementRecord[]) => {
+    const start = testSyncWorkStart()
+    try { return records.map(r => serializeTestMeasurement(r) + '\n').join('') }
+    finally { testSyncWorkEnd(start, 'measurement-serialize') }
+  }
   function failed(error: unknown): void {
     if (failing) return
     failing = true
@@ -323,9 +343,12 @@ export function createTestMeasurements(deps: TestMeasurementsDeps): TestMeasurem
     record(entry) {
       try {
         if (stopped) return
-        const atMonoMs = entry.kind === 'store' || entry.kind === 'resolution-store' || entry.kind === 'ack' || entry.kind === 'append' || entry.kind === 'thread-compaction'
+        const atMonoMs = entry.kind === 'store' || entry.kind === 'resolution-store' || entry.kind === 'ack' || entry.kind === 'append' || entry.kind === 'thread-compaction' || entry.kind === 'post-hold-timing' || entry.kind === 'sync-work' || entry.kind === 'event-loop-stall'
           ? entry.at_mono_ms : monotonicNow()
-        buffer.push({ ...entry, v: 1, at_mono_ms: atMonoMs })
+        const attribution = entry.kind === 'post-hold-timing' || entry.kind === 'sync-work' || entry.kind === 'event-loop-stall'
+        const record: TestMeasurementRecord = { ...entry, v: 1, at_mono_ms: atMonoMs }
+        if (attribution) (record as AttributionMeasurement).process_id = process.pid
+        buffer.push(record)
         arm()
       } catch { /* the record never throws */ }
     },

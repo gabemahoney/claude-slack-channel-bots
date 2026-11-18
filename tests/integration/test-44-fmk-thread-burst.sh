@@ -10,6 +10,7 @@ source "$(dirname "$0")/lib/scenario.sh"
 
 PRINTER="${SCENARIO_FIXTURES}/fmk-texts.ts"
 SR8="${SCENARIO_FIXTURES}/sr8-evidence.ts"
+source "$(dirname "$0")/lib/sr8-attribution.sh"
 BURST_DRIVER="${SCENARIO_FIXTURES}/burst-driver.sh"
 EVIDENCE="${SCENARIO_ROOT}/evidence"
 mkdir -p "${EVIDENCE}"

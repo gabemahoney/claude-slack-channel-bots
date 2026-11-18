@@ -1,4 +1,5 @@
 /** Durable per-persona FIFO journals. No import-time I/O. */
+import { testSyncWorkStart, testSyncWorkEnd } from './test-stall-attribution.ts'
 import type { GetResult } from 'agent-director'
 import * as nodeFs from 'node:fs'
 import { join } from 'node:path'
@@ -743,6 +744,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     await reconcileRollback(pathFor(key), j)
     // The caller's lifetime can end while the repair awaits the disk.
     if (!current()) return
+    const selectionStart = testSyncWorkStart()
     const threadJoinSaved = options.threadJoinSaved?.(key)
     const at = now(), retained: QueueRecord[] = []
     const retainedJoinItems = new Set<number>()
@@ -792,9 +794,15 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     }
     // Preserve both sequence allocation and the injected microsecond watermark forever.
     retained.push({ v: 1, kind: 'accepted', seq: j.nextSeq - 1, compact: 'allocation', ...(j.lastInjected === undefined ? {} : { injected_ts: formatMicros(j.lastInjected) }) })
-    await rewrite(pathFor(key), Buffer.from(retained.map(r => JSON.stringify(r) + '\n').join('')))
+    testSyncWorkEnd(selectionStart, 'queue-compact-selection', key)
+    const stringifyStart = testSyncWorkStart()
+    let bytes: Buffer
+    try { bytes = Buffer.from(retained.map(r => JSON.stringify(r) + '\n').join('')) }
+    finally { testSyncWorkEnd(stringifyStart, 'queue-compact-stringify', key) }
+    await rewrite(pathFor(key), bytes)
     j.records = retained
-    rebuild(j)
+    const rebuildStart = testSyncWorkStart()
+    try { rebuild(j) } finally { testSyncWorkEnd(rebuildStart, 'queue-compact-rebuild', key) }
   }
   function lookupSlackKey(key: string, slack: SlackKey): QueueAcceptResult | undefined {
     const j = journal(key)

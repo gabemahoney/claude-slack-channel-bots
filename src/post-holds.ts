@@ -1,6 +1,7 @@
 /** Durable Post Hold resolution from own-post answers or the receipt deadline.
  * Decisions survive append retries in this life; restart releases unresolved
  * holds. No import-time effects, I/O or logging. */
+import type { HoldTimingMeasurement } from './test-stall-attribution.ts'
 import { isOpenItem, type DeliveryQueue, type HoldOutcome, type HoldResolution, type QueueItem } from './delivery-queue.ts'
 import { RETYPE_BACKOFF_MS, THREAD_REPLY_HOLD_MS } from './delivery-constants.ts'
 import type { OwnPostJoins, OwnPostOperationView } from './own-post.ts'
@@ -41,6 +42,8 @@ export interface PostHoldResolverDeps {
   retryDelaysMs?: readonly number[]
   holdMs?: number
   onEvent?(event: PostHoldEvent): void
+  /** Test-only observer, absent unless test_measurements is on. */
+  onTiming?(timing: HoldTimingMeasurement): void
   /** Reject old-life events throughout the lifecycle's teardown window. */
   canRun?(key: string): boolean
 }
@@ -101,11 +104,18 @@ export function createPostHoldResolver(deps: PostHoldResolverDeps): PostHoldReso
       life.waiters.delete(waiter); waiter.settle()
     }
   }
+  function timing(key: string, hold: Tracked, phase: HoldTimingMeasurement['phase'], at: number, delay?: number): void {
+    if (!deps.onTiming || !hold.input) return
+    try { deps.onTiming({ kind: 'post-hold-timing', key, seq: hold.seq, phase, at_mono_ms: at,
+      received_mono_ms: hold.input.receivedAt, due_mono_ms: hold.input.receivedAt + holdMs,
+      ...(delay === undefined ? {} : { armed_delay_ms: delay }) }) } catch { /* isolated measurement observer */ }
+  }
   function arm(key: string, life: Life, hold: Tracked): void {
     const remaining = holdMs - (deps.clock.now() - hold.input!.receivedAt)
     if (remaining <= 0) { hold.expired = true; return }
     hold.timer = deps.clock.setTimeout(() => {
       hold.timer = undefined
+      if (deps.onTiming) timing(key, hold, 'callback', deps.clock.now(), remaining)
       if (!current(key, life) || hold.decision || life.holds.get(hold.seq) !== hold) return
       // A timer may wake early; only its monotonic deadline expires the hold.
       arm(key, life, hold)
@@ -125,6 +135,7 @@ export function createPostHoldResolver(deps: PostHoldResolverDeps): PostHoldReso
       hold.cause = outcome !== 'released' ? 'outcomes'
         : verdicts.some(verdict => verdict.kind === 'thread' && verdict.thread === input.threadRoot) ? 'thread' : 'timer'
       hold.heldMs = Math.max(0, now - input.receivedAt)
+      if (deps.onTiming) timing(key, hold, 'evaluate', now)
       clearTimer(hold)
     }
     void save(key, life)
@@ -198,6 +209,7 @@ export function createPostHoldResolver(deps: PostHoldResolverDeps): PostHoldReso
         if (life && !life.holds.has(input.seq)) {
           hold = { seq: input.seq, input: { ...input, operations: [...input.operations] }, retention, expired: false, mode: 'live' }
           life.holds.set(input.seq, hold)
+          if (deps.onTiming) timing(key, hold, 'registered', deps.clock.now())
           arm(key, life, hold)
           api.check(key)
           return

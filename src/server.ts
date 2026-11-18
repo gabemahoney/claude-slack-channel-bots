@@ -367,6 +367,7 @@ import {
 import { buildPersonaClientOrExit, runAgentDirectorStartupGate, createDeliveryClientFactory } from './agent-director-startup.ts'
 import { disposeAdVersionRecheck, installAdVersionRecheck, onAdVersionChanged } from './ad-version-gate.ts'
 import { installTestTimerOverrides } from './test-timer-overrides.ts'
+import { startStallAttribution } from './test-stall-attribution.ts'
 import { createTestMeasurements, buildTestMeasurementsStartLine, TEST_MEASUREMENTS_FILE_NAME, queueEventMeasurement, postHoldEventMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, threadCompactionMeasurement, type TestMeasurements } from './test-measurements.ts'
 import { setDurableAppendTimer } from './durable-journal.ts'
 import {
@@ -3295,6 +3296,9 @@ export async function main(): Promise<void> {
       try { const entry = postHoldEventMeasurement(event); if (entry) recorder.record(entry) } catch { /* isolated measurement observer */ }
     }
     threadMemory.setCompactionObserver(compaction => { recorder.record(threadCompactionMeasurement(compaction)) })
+    // Deadline/stall attribution uses the base measurement gate in every SR-8 case.
+    postHoldDeps.onTiming = timing => recorder.record(timing)
+    const stopAttribution = startStallAttribution(true, { record: entry => recorder.record(entry), now: HOLD_CLOCK.now })
     // The per-event timings add work to every receipt, append and save, so
     // only the scenario that reads them turns them on.
     if (personaConfig.test_measurement_timings === true) {
@@ -3306,6 +3310,7 @@ export async function main(): Promise<void> {
       threadMemory.setSaveObserver(save => { recorder.record(threadSaveMeasurement(save)) })
     }
     unsubscribeTestMeasurements = () => {
+      stopAttribution(); delete postHoldDeps.onTiming
       deliveryQueueEvents.emit = emit; delete postHoldDeps.onEvent; ackTimingObserver = undefined
       setDurableAppendTimer(undefined); threadMemory?.setSaveObserver(undefined)
       threadMemory?.setCompactionObserver(undefined)

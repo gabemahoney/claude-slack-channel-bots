@@ -2436,6 +2436,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       mkdirSync(dir, { recursive: true }); mkdirSync(join(root, 'tests/test-helpers'), { recursive: true })
       writeFileSync(marker, '')
       writeFileSync(join(dir, 'sr8-evidence.ts'), source('fixtures/sr8-evidence.ts').replace("existsSync('/etc/cscb-ci-image')", `existsSync(${JSON.stringify(marker)})`))
+      writeFileSync(join(dir, 'sr8-attribution.ts'), source('fixtures/sr8-attribution.ts'))
       writeFileSync(join(dir, 'transcript-receipts.ts'), source('fixtures/transcript-receipts.ts'))
       writeFileSync(join(root, 'tests/test-helpers/thread-populations.ts'), readFileSync(join(import.meta.dir, 'test-helpers/thread-populations.ts')))
       // Only the package-value printer is substituted. The actual command
@@ -2473,7 +2474,10 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     // A non-passing membership-fault case first prints its correlation rows.
     const rows = all.filter(l => l.startsWith('recorded: sr8 membership-fault-row '))
     expect(rows).toEqual(command === 'membership-fault' ? ['recorded: sr8 membership-fault-row case=hang source=stub rows=unavailable'] : [])
-    const lines = all.slice(rows.length)
+    const attribution = all.filter(l => l.startsWith('recorded: sr8 attribution '))
+    expect(attribution).toHaveLength(command === 'pending-post' ? 1 : 0)
+    expect(attribution.every(l => l.includes('type=stall-summary ') && l.endsWith('verdict=info'))).toBe(true)
+    const lines = all.slice(rows.length).filter(l => !l.startsWith('recorded: sr8 attribution '))
     expect(child.status).toBe(1); expect(lines).toHaveLength(count + 1)
     expect(lines.slice(0, -1).every(l => l.endsWith('verdict=missing'))).toBe(true)
     expect(lines.at(-1)).toContain(`measures=${count} pass=0 fail=0 missing=${count}`)
@@ -2485,7 +2489,10 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     const files = { before: jsonl(p.before), after: jsonl(p.after), probes: p.probes.map(p => [p.parent, p.channel, p.ts, p.envelope_id].join('\t')).join('\n') + '\n',
       'e/alpha.queue.jsonl': jsonl(p.queue), 'e/times.jsonl': jsonl([...p.times, ...b.ledger.filter(i => i.phase !== 'probes').map(i => timing(i.envelope_id!, 1))]),
       measurements: jsonl(p.rows), 'e/burst.jsonl': jsonl(b.ledger), 'e/final-stub.jsonl': jsonl(b.stub), 'e/before.journal': '64768:12\n', 'e/after.journal': '64768:12\n' }
-    const pass = cli('pending-post', args, files, 1), lines = pass.stdout.trim().split('\n')
+    const pass = cli('pending-post', args, files, 1), all = pass.stdout.trim().split('\n')
+    expect(all.filter(l => l.startsWith('recorded: sr8 attribution '))).toHaveLength(1)
+    expect(all[0]).toContain('type=stall-summary mode=strict population=100000 recipients=1 count=0 printed=0 max_gap_ms=0 total_gap_ms=0 marker_count=0 verdict=info')
+    const lines = all.filter(l => !l.startsWith('recorded: sr8 attribution '))
     expect(pass.status).toBe(0)
     expect(lines.map(l => l.split(' ')[2])).toEqual(['pending-post', 'pending-post-ack', 'post-hold', 'ack-accepted', 'ack-dropped', 'pending-post-burst', 'summary'])
     expect(lines[5]).toContain(`samples=${SR8_BURST_JOINS + SR8_BURST_REPLIES + SR8_BURST_DROPPED} compact_interval_ms=${QUEUE_COMPACT_INTERVAL_MS} window_ms=${QUEUE_COMPACT_INTERVAL_MS - 1} probes_inside=3 burst_in_pending=yes same_journal=yes limit=window_ms<compact_interval_ms verdict=pass`)
@@ -2583,7 +2590,12 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     // One row of each kind as the server's own serializer writes it.
     const diagnostic = [serverRows.ack, serverRows.append, serverRows.save].map(l => JSON.parse(l))
     expect(diagnostic.map(r => r.kind)).toEqual([...SR8_DIAGNOSTIC_KINDS])
-    const all = run([...diagnostic, JSON.parse(serverRows.compaction)])
+    const attribution = [
+      { v: 1, kind: 'post-hold-timing', key, seq: 1, phase: 'registered', received_mono_ms: 0, due_mono_ms: 3000, at_mono_ms: 1 },
+      { v: 1, kind: 'event-loop-stall', at_mono_ms: 100, start_mono_ms: 1, end_mono_ms: 100, gap_ms: 89 },
+      { v: 1, kind: 'sync-work', key, work: 'thread-judge', start_mono_ms: 1, end_mono_ms: 99, at_mono_ms: 99 },
+    ]
+    const all = run([...diagnostic, ...attribution, JSON.parse(serverRows.compaction)])
     expect({ status: all.status, stdout: all.stdout }).toEqual({ status: plain.status, stdout: plain.stdout })
     const unknown = run([{ v: 1, kind: 'unreviewed', key, at_mono_ms: 1 }])
     expect(unknown.status).toBe(1); expect(unknown.stdout.split('\n').filter(l => l.includes(' store ')).every(l => l.endsWith('verdict=missing'))).toBe(true)
@@ -3771,6 +3783,7 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
       const dir = join(root, 'tests/integration/fixtures'), marker = join(root, 'image')
       mkdirSync(dir, { recursive: true }); mkdirSync(join(root, 'tests/test-helpers'), { recursive: true }); writeFileSync(marker, '')
       writeFileSync(join(dir, 'sr8-evidence.ts'), prefix + source('fixtures/sr8-evidence.ts').replace("existsSync('/etc/cscb-ci-image')", `existsSync(${JSON.stringify(marker)})`))
+      writeFileSync(join(dir, 'sr8-attribution.ts'), source('fixtures/sr8-attribution.ts'))
       writeFileSync(join(dir, 'transcript-receipts.ts'), source('fixtures/transcript-receipts.ts'))
       writeFileSync(join(root, 'tests/test-helpers/thread-populations.ts'), readFileSync(join(import.meta.dir, 'test-helpers/thread-populations.ts')))
       writeFileSync(join(dir, 'fmk-texts.ts'), `import {readFileSync} from 'node:fs'; if(process.argv[2]==='sharedQueueSnapshot') console.log(readFileSync(process.argv[3],'utf8')); else console.log(${JSON.stringify({ THREAD_REPLY_HOLD_MS, DELIVERY_MAX_AD_CALLS_PER_S, NAME_LOOKUP_TIMEOUT_MS })}[process.argv[2]]);`)
@@ -4397,12 +4410,24 @@ globalThis.fetch = async (_url, init) => {
     const off = JSON.parse(plain.stdout), on = JSON.parse(timed.stdout)
     expect(off[TEST_MEASUREMENTS_KEY]).toBe(true); expect(Object.hasOwn(off, TEST_MEASUREMENT_TIMINGS_KEY)).toBe(false)
     expect(on).toEqual({ ...off, [TEST_MEASUREMENT_TIMINGS_KEY]: true })
+    // Every population/mode/recipient combination used by test-44 has base
+    // attribution without enabling the extra per-event observers. Membership
+    // cases use this same generator at population 100000 / two recipients.
+    for (const c of sr8Combinations()) {
+      const child = spawnSync(process.execPath, [join(dir, 'sr8-evidence.ts'), 'config', c.mode, String(c.population), String(c.recipients), join(root, 'people'), '4100', '250'],
+        { env: hostSafeChildEnv(root, { extras: { SCENARIO_ROOT: root } }), encoding: 'utf8', timeout: 3000 })
+      expect(child.status).toBe(0)
+      const config = JSON.parse(child.stdout)
+      expect(config[TEST_MEASUREMENTS_KEY]).toBe(true)
+      expect(Object.hasOwn(config, TEST_MEASUREMENT_TIMINGS_KEY)).toBe(false)
+    }
     expect(config('other').status).not.toBe(0); expect(config('timings', 'timings').status).not.toBe(0)
-    // Membership-load always records both clocks; test-44 remains opt-in. Executable switch
+    // Membership-load enables per-event timings; test-44 enables them only for diagnostics. Executable switch
     // controls live with the profile lifecycle controls in cpu-profile.test.ts.
     const shells = (readdirSync(integration, { recursive: true }) as string[]).filter(f => f.endsWith('.sh'))
     expect(shells.filter(f => /\(timings\)|\bconfig\b.*\btimings\b/.test(source(f))).sort()).toEqual(['lib/membership-load.sh', 'test-44-fmk-thread-burst.sh'])
-    expect(source('test-44-fmk-thread-burst.sh')).toContain('if [[ "${CSCB_TEST_DIAGNOSTICS:-}" == 1 && "${CASE}" == burst ]]; then\n    # The server\'s diagnostic ack/append/save rows, read only by observe below.\n    config_args+=(timings)\nfi\nbun "${SR8}" config "${config_args[@]}" | write_config\n')
+    const test44 = source('test-44-fmk-thread-burst.sh')
+    expect(test44).toContain('if [[ "${CSCB_TEST_DIAGNOSTICS:-}" == 1 && "${CASE}" == burst ]]; then\n    # The server\'s diagnostic ack/append/save rows, read only by observe below.\n    config_args+=(timings)\nfi\nbun "${SR8}" config "${config_args[@]}" | write_config\n')
   }))
 })
 
@@ -4558,6 +4583,7 @@ describe('SR-8 evidence verdicts (synthetic evidence, no runtime performance cla
         const guard = "existsSync('/etc/cscb-ci-image')"
         expect(original).toContain(guard)
         writeFileSync(marker, '')
+        writeFileSync(join(root, 'sr8-attribution.ts'), source('fixtures/sr8-attribution.ts'))
         writeFileSync(script, original.replace(guard, `existsSync(${JSON.stringify(marker)})`))
         const child = spawnSync(process.execPath, [script, 'startup-load', 'test-startup', mode, String(population), String(recipients), ...args], {
           env: hostSafeChildEnv(root), encoding: 'utf8', timeout: 3000,

@@ -33,6 +33,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { testSyncWorkStart, testSyncWorkEnd } from './test-stall-attribution.ts'
 import * as nodeFs from 'node:fs'
 import { join } from 'node:path'
 import { createHmac, randomBytes, randomUUID } from 'node:crypto'
@@ -680,7 +681,8 @@ async function serializeInSlices(header: ThreadMemoryHeader, records: Iterable<T
     }
   }
   chunks.push(Buffer.from(lines.join('')))
-  return Buffer.concat(chunks)
+  const syncStart = testSyncWorkStart()
+  try { return Buffer.concat(chunks) } finally { testSyncWorkEnd(syncStart, 'thread-image-concat') }
 }
 
 /** Unique, increasing saved records have stable chunk boundaries. A rewrite
@@ -707,7 +709,8 @@ async function serializeSavedImage(j: MemoryJournal, header: ThreadMemoryHeader,
     chunks.push(chunk.bytes)
     if (slices.due(work) && !await slices.pause()) return undefined
   }
-  return Buffer.concat(chunks)
+  const syncStart = testSyncWorkStart()
+  try { return Buffer.concat(chunks) } finally { testSyncWorkEnd(syncStart, 'thread-image-concat') }
 }
 
 /** All state belongs to this instance; reading, activation and timers are explicit. */
@@ -897,57 +900,60 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     }
   }
   function judge(key: string, j: MemoryJournal, named = heldStampLookup(key)): void {
-    pruneHeldJoins(key, named)
-    const stamps = new Map<string, ThreadMemoryStampState | undefined>()
-    const readStamp = (channel: string) => {
-      if (!stamps.has(channel)) stamps.set(channel, options.stamp(key, channel))
-      return stamps.get(channel)
-    }
-    const facts = options.stampFacts?.()
-    // Unchanged facts give each judged channel the stamp it was judged under,
-    // or one still undecided: either way the loop below would skip it.
-    const unchanged = facts !== undefined && facts === j.judgedFacts
-    for (const [channel, roots] of j.joinedByChannel) {
-      if (unchanged && j.judged.has(channel)) continue
-      const stamp = readStamp(channel)
-      if (stamp?.kind === 'undecided') continue
-      // Every remaining join already matched this stamp: nothing to forget.
-      const current = stamp?.kind === 'decided' && stamp.threadHybridSince !== undefined
-        ? stampKey({ incarnation: stamp.incarnation, threadHybridSince: stamp.threadHybridSince }) : undefined
-      if (current !== undefined && j.judged.get(channel) === current) continue
-      for (const [root, entries] of roots) {
-        for (const [id, value] of entries) if (!memoryStampMatches(value.join.stamp, stamp)) {
-          const held = named(channel, value.join.stamp) ? retain(j, value.join, value.saved, j.heldJoins) : undefined
-          if (!held || held.saved !== value.saved) replaceSaved(j, value.saved)
-          entries.delete(id)
-          // A held entry's evidence can now be this slot's.
-          savedEvidenceChanged(j, channel, root, id)
+    const syncStart = testSyncWorkStart()
+    try {
+      pruneHeldJoins(key, named)
+      const stamps = new Map<string, ThreadMemoryStampState | undefined>()
+      const readStamp = (channel: string) => {
+        if (!stamps.has(channel)) stamps.set(channel, options.stamp(key, channel))
+        return stamps.get(channel)
+      }
+      const facts = options.stampFacts?.()
+      // Unchanged facts give each judged channel the stamp it was judged under,
+      // or one still undecided: either way the loop below would skip it.
+      const unchanged = facts !== undefined && facts === j.judgedFacts
+      for (const [channel, roots] of j.joinedByChannel) {
+        if (unchanged && j.judged.has(channel)) continue
+        const stamp = readStamp(channel)
+        if (stamp?.kind === 'undecided') continue
+        // Every remaining join already matched this stamp: nothing to forget.
+        const current = stamp?.kind === 'decided' && stamp.threadHybridSince !== undefined
+          ? stampKey({ incarnation: stamp.incarnation, threadHybridSince: stamp.threadHybridSince }) : undefined
+        if (current !== undefined && j.judged.get(channel) === current) continue
+        for (const [root, entries] of roots) {
+          for (const [id, value] of entries) if (!memoryStampMatches(value.join.stamp, stamp)) {
+            const held = named(channel, value.join.stamp) ? retain(j, value.join, value.saved, j.heldJoins) : undefined
+            if (!held || held.saved !== value.saved) replaceSaved(j, value.saved)
+            entries.delete(id)
+            // A held entry's evidence can now be this slot's.
+            savedEvidenceChanged(j, channel, root, id)
+          }
+          if (!entries.size) roots.delete(root)
         }
-        if (!entries.size) roots.delete(root)
+        if (!roots.size) j.joinedByChannel.delete(channel)
+        if (roots.size && current !== undefined) j.judged.set(channel, current)
+        else j.judged.delete(channel)
       }
-      if (!roots.size) j.joinedByChannel.delete(channel)
-      if (roots.size && current !== undefined) j.judged.set(channel, current)
-      else j.judged.delete(channel)
-    }
-    j.judgedFacts = facts
-    const kept = j.kept
-    // Unchanged facts keep every other kept join matching its stamp, or undecided.
-    const channels = unchanged ? [...kept.unjudged] : [...kept.byChannel.keys()]
-    kept.unjudged.clear()
-    for (const channel of channels) {
-      const groups = kept.byChannel.get(channel)
-      if (!groups) continue
-      const stamp = readStamp(channel)
-      if (stamp?.kind === 'undecided') continue
-      let held = false
-      const keeps = (joined: ThreadMemoryStamp) => memoryStampMatches(joined, stamp) || (named(channel, joined) && (held = true))
-      for (const group of [...groups.values()]) {
-        if (!group.mixed) { if (!keeps(group.stamp)) for (const fact of groupFacts(group)) dropFact(kept, fact) }
-        else for (const fact of groupFacts(group)) if (!keeps(fact.stamp)) dropFact(kept, fact)
+      j.judgedFacts = facts
+      const kept = j.kept
+      // Unchanged facts keep every other kept join matching its stamp, or undecided.
+      const channels = unchanged ? [...kept.unjudged] : [...kept.byChannel.keys()]
+      kept.unjudged.clear()
+      for (const channel of channels) {
+        const groups = kept.byChannel.get(channel)
+        if (!groups) continue
+        const stamp = readStamp(channel)
+        if (stamp?.kind === 'undecided') continue
+        let held = false
+        const keeps = (joined: ThreadMemoryStamp) => memoryStampMatches(joined, stamp) || (named(channel, joined) && (held = true))
+        for (const group of [...groups.values()]) {
+          if (!group.mixed) { if (!keeps(group.stamp)) for (const fact of groupFacts(group)) dropFact(kept, fact) }
+          else for (const fact of groupFacts(group)) if (!keeps(fact.stamp)) dropFact(kept, fact)
+        }
+        // A hold can be withdrawn with no new facts.
+        if (held && kept.byChannel.has(channel)) kept.unjudged.add(channel)
       }
-      // A hold can be withdrawn with no new facts.
-      if (held && kept.byChannel.has(channel)) kept.unjudged.add(channel)
-    }
+    } finally { testSyncWorkEnd(syncStart, 'thread-judge', key) }
   }
   function replay(key: string, j: MemoryJournal): void {
     const named = heldStampLookup(key)
@@ -964,14 +970,17 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     settleKept(j, true)
   }
   function digestKept(j: MemoryJournal): void {
-    const digestKey = (j.header ?? j.creationHeader)?.digestKey
-    if (!digestKey) return
-    for (const record of j.writes.undigested) {
-      if (!record.content) continue
-      record.digest = ownPostDigest(digestKey, record.content)
-      delete record.content
-    }
-    j.writes.undigested.clear()
+    const syncStart = testSyncWorkStart()
+    try {
+      const digestKey = (j.header ?? j.creationHeader)?.digestKey
+      if (!digestKey) return
+      for (const record of j.writes.undigested) {
+        if (!record.content) continue
+        record.digest = ownPostDigest(digestKey, record.content)
+        delete record.content
+      }
+      j.writes.undigested.clear()
+    } finally { testSyncWorkEnd(syncStart, 'thread-digest-kept') }
   }
   function replayIntents(j: MemoryJournal): void {
     if (j.records) {
@@ -1364,6 +1373,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     const creation = await createStore(key, j)
     if (creation.kind !== 'saved') return creation
     if (!current(key, j)) return { kind: 'cancelled' }
+    const selectionStart = testSyncWorkStart()
     const hadKept = j.writes.order.size > 0
     const named = heldStampLookup(key)
     judge(key, j, named)
@@ -1402,6 +1412,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
         batch.outcomes.push(remaining ? 'kept' : 'saved')
       }
     }
+    testSyncWorkEnd(selectionStart, 'thread-save-kept-selection', key)
     try {
       if (records.length) {
         j.appendAttempts++

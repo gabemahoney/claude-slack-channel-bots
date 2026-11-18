@@ -14346,6 +14346,9 @@ function ownedShardFileNames(inputs: IntegrityInputs, shard: number): Set<string
     DEPENDENCY_FINGERPRINT_FILE_NAME,
     DOCKER_LOG_FILE_NAME,
     ...integrityAssigned(inputs, shard).map((fileName) => `${fileName}${SCRIPT_LOG_SUFFIX}`),
+    // Failure-only SR-8 recorder copies, bounded by the retention fixture.
+    ...integrityAssigned(inputs, shard).filter(isBurstDriverScript).flatMap(fileName =>
+      Array.from({ length: 64 }, (_, index) => `${fileName}.sr8-measurements-${index + 1}.jsonl`)),
   ])
 }
 
@@ -14372,7 +14375,8 @@ function runDirOwnershipFailures(inputs: IntegrityInputs, runDir: EvidenceListin
  * Check 6, `results-ownership`: a shard subdirectory
  * holds only its `canary.txt`, `result.txt`, `package.sha256`,
  * `dependency-fingerprint.txt`, `docker.log` and the logs of its assigned
- * scripts, each a regular file; every other entry, a directory or a link
+ * scripts, plus at most 64 named SR-8 measurement files per assigned burst
+ * script, each a regular file; every other entry, a directory or a link
  * included, fails naming the shard. The run directory holds only
  * `status.json`, `runner.log`, the directory `package/` (whose contents are
  * not judged) and the run's shard subdirectories; every other entry fails
