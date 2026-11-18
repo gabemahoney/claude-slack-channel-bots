@@ -2084,7 +2084,7 @@ every run, and its failure still fails that run.
 
 | Script | Symptom |
 |---|---|
-| test-4 (`test-4-resume-dialog.sh`) | Seen once in five serial runs. The driver's `resume` meets agent-director's "still stopping" refusal within its stopping window, while the first life's worker is still exiting, and the script fails with `phase2 spawnForPersona returned failed`. A re-run passed |
+| None | No script is currently listed |
 
 ### Contained runner controls
 
@@ -4193,6 +4193,18 @@ absent, and the seeders refuse. Rebuild live fixtures only after the upgrade.
 
 ### The stub worker
 
+Before a harness resumes an ended AD row, wait with a bounded deadline until
+the old tmux session is gone and its process is dead (a zombie counts as dead).
+Use the row's recorded session name and socket, and capture a live pane pid
+before ending it as a positive control. AD can refuse an earlier resume as
+"still stopping" even though the row already reads `ended`.
+
+Test 4 uses `slow-exit` to keep each old worker alive for 3 s after SessionEnd.
+It requires an observation of the old session at `ended` in both resume phases,
+then one strict resume preserving the original session ID and `--resume` args.
+`fixtures/ended-life.ts` shares that barrier with the shared notice fixture;
+the notice evidence journal retains the pre-sentinel live identity for resume.
+
 `tests/integration/fixtures/stub-claude.sh` runs only in the scenario's isolated environment. Its mode controls test input and hook timing, never CSCB readiness. AD row state and typed outcomes control CSCB progression. Test operators may answer explicit fixture dialogs; CSCB sends no startup answer.
 
 | Mode | Fixture behavior |
@@ -4205,6 +4217,7 @@ absent, and the seeders refuse. Rebuild live fixtures only after the upgrade.
 | `folder-trust` | Uses the isolated trust fixture; any remaining dialog requires an operator. |
 | `transcript-on-first-message` | Defers transcript creation until the first ordinary input, for resume/transcript cases. |
 | `linger-on-exit` | Reports SessionEnd then stays alive until the harness releases it, for checked recovery cases. |
+| `slow-exit` | Reports SessionStart immediately; on the exit sentinel, reports SessionEnd then waits 3 s before exiting, so test 4 exercises its exit barrier. |
 | `exit-on-pause` | Reports in immediately; on `pause`'s `/exit` reports SessionEnd, closes its MCP session and exits 0, as Claude Code does, for clean-exit cases. |
 
 `stub_mode`, `stub_dialog_delay`, `stub_press_enter`, `stub_type_line` and `stub_release` are harness-only controls under `SCENARIO_ROOT`. They must not become production screen observers. Lost-create-reply scenarios retain AD pending/launch-window, normal retry and checked recovery assertions. No fixture depends on a production approver or pending pane lap.

@@ -2,6 +2,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
+import { captureLiveLife, sessionPresent, waitForLifeExit, type EndedLife } from './ended-life.ts'
 if (!existsSync('/etc/cscb-ci-image')) throw new Error('CI image required')
 const PKG = process.env.CSCB_PKG_DIR ?? '/test-repo/node_modules/claude-slack-channel-bots'
 const { runAgentDirectorStartupGate } = await import(`${PKG}/src/agent-director-startup.ts`)
@@ -28,6 +29,11 @@ async function waitState(instance: string, allowed: string[]) {
     await Bun.sleep(250)
   }
   driverFail('AD row never reached the expected state')
+}
+async function exitBarrier(phase: string, life: EndedLife) {
+  if (sessionPresent(life)) console.log(`DRIVER: ${phase}_OLD_SESSION_PRESENT_AT_ENDED`)
+  try { await waitForLifeExit(life) }
+  catch { driverFail('old life never exited') }
 }
 async function main() {
   const personaCfg = resolvePersonaConfig(
@@ -74,17 +80,23 @@ async function main() {
   expectAction('phase1', fresh.action, 'spawned')
   const first = await waitState(instanceId, ['waiting'])
   if (!first.session_id) driverFail('fresh launch has no AD session identity')
+  console.log(`DRIVER: SESSION_ID ${first.session_id}`)
   console.log('DRIVER: PHASE1_OK')
+  const firstLife = captureLiveLife(first)
   await getClient().sendKeys({ instance_id: instanceId, text: '__CSCB_TEST_EXIT__' })
   const ended = await waitState(instanceId, ['ended', 'missing'])
   if (!ended.session_id) driverFail('terminal row has no AD session identity')
   console.log('DRIVER: PRECONDITION_OK')
+  await exitBarrier('PHASE2', firstLife)
   const resumed = await spawnForPersona(persona, personaCfg, true)
   expectAction('phase2', resumed.action, 'resumed')
-  await waitState(instanceId, ['waiting'])
+  const second = await waitState(instanceId, ['waiting'])
+  if (second.session_id !== first.session_id) driverFail('phase2 changed AD session identity')
   console.log('DRIVER: PHASE2_OK')
+  const secondLife = captureLiveLife(second)
   await getClient().sendKeys({ instance_id: instanceId, text: '__CSCB_TEST_EXIT__' })
   await waitState(instanceId, ['ended', 'missing'])
+  await exitBarrier('PHASE3', secondLife)
   const modeFile = process.env.DRIVER_STUB_MODES_FILE
   if (!modeFile) driverFail('missing private stub mode file')
   writeFileSync(modeFile, `manual-start\t${WORKING_DIRECTORY}\n`)
@@ -92,7 +104,8 @@ async function main() {
   const before = readFileSync(trailPath, 'utf8').split('\n').length
   const held = await spawnForPersona(persona, personaCfg, false)
   expectAction('phase3', held.action, 'resumed')
-  await waitState(instanceId, ['pending'])
+  const pending = await waitState(instanceId, ['pending'])
+  if (pending.session_id !== first.session_id) driverFail('phase3 changed AD session identity')
   // No startup handler should type or read UI, including after its former first poll.
   await Bun.sleep(2000)
   const row = await getClient().get({ instance_id: instanceId })

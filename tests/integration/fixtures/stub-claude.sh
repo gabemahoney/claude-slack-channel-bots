@@ -5,6 +5,7 @@
 # silent fires no hooks; transcript-on-first-message delays its transcript until
 # message receipt; linger-on-exit fires SessionEnd but waits for harness SIGUSR1;
 # exit-on-pause fires SessionEnd, closes its MCP session and exits 0, as Claude Code does.
+# slow-exit reports immediately, then waits 3 s after the sentinel's SessionEnd.
 # Optional stub-claude-report-delays postpones at-once SessionStart in seconds.
 # Hooks execute as direct children, preserving AD's process identity checks.
 # SessionStart re-fires every two seconds while AD says pending, until its grace
@@ -95,6 +96,7 @@ MODE_TRANSCRIPT_ON_FIRST_MESSAGE=transcript-on-first-message
 MODE_LINGER_ON_EXIT=linger-on-exit
 MODE_EXIT_ON_PAUSE=exit-on-pause
 MODE_DISPLAYED_STATES=displayed-states
+MODE_SLOW_EXIT=slow-exit
 
 STUB_DIR="${BASH_SOURCE[0]%/*}"
 [[ "${STUB_DIR}" == "${BASH_SOURCE[0]}" ]] && STUB_DIR=.
@@ -140,7 +142,7 @@ fi
 case "${MODE}" in
     "${MODE_AT_ONCE}" | "${MODE_SILENT}" | "${MODE_MANUAL_START}") ;;
     "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}") ;;
-    "${MODE_LINGER_ON_EXIT}" | "${MODE_EXIT_ON_PAUSE}" | "${MODE_DISPLAYED_STATES}") ;;
+    "${MODE_LINGER_ON_EXIT}" | "${MODE_EXIT_ON_PAUSE}" | "${MODE_DISPLAYED_STATES}" | "${MODE_SLOW_EXIT}") ;;
     *)
         printf 'stub-claude: unknown mode %q selected for %s; running %s\n' \
             "${MODE}" "${REALCWD}" "${MODE_AT_ONCE}" >&2
@@ -636,7 +638,7 @@ case "${MODE}" in
         print_manual_start
         AWAITING_ENTER=1
         ;;
-    "${MODE_AT_ONCE}" | "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}" | "${MODE_LINGER_ON_EXIT}" | "${MODE_EXIT_ON_PAUSE}" | "${MODE_DISPLAYED_STATES}")
+    "${MODE_AT_ONCE}" | "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}" | "${MODE_LINGER_ON_EXIT}" | "${MODE_EXIT_ON_PAUSE}" | "${MODE_DISPLAYED_STATES}" | "${MODE_SLOW_EXIT}")
         if (( REPORT_DELAY_S > 0 )); then
             printf 'Starting worker\n'
             now_ms
@@ -692,6 +694,7 @@ handle_line() {
     local line="$1"
     if [[ "${line}" == *"${SENTINEL}"* ]]; then
         [[ "${MODE}" == "${MODE_SILENT}" ]] || fire_session_end
+        if [[ "${MODE}" == "${MODE_SLOW_EXIT}" ]]; then sleep 3; fi
         exit 0
     fi
     if [[ "${MODE}" == "${MODE_LINGER_ON_EXIT}" && "${line}" == "${PAUSE_EXIT_LINE}" ]] && (( REPORTED )); then

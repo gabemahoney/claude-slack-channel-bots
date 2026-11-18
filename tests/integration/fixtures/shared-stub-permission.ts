@@ -30,6 +30,7 @@ if (!existsSync('/etc/cscb-ci-image')) {
   console.error('FAIL: shared-stub-permission: refused outside the CI image')
   process.exit(2)
 }
+const { captureLiveLife, waitForLifeExit } = await import('./ended-life.ts')
 
 // The redacted failure line's fixed step label and last bound AD row state.
 let failureStep = 'prerequisites'
@@ -100,8 +101,9 @@ async function noticeControl(client: NoticeClient, command: string, id: string, 
   const first = await read()
   const clean = (row: typeof first) => noticeFact('clean-requests', row.permission_requests.length === 0 && row.unproven_requests.length === 0)
   const identity = { instance_id: id, session_id: first.session_id, key, work }
+  let oldLife: ReturnType<typeof captureLiveLife>
   const save = (phase: string, row: typeof first, exclusive = false) =>
-    writeNoticeEvidence(evidence, { ...identity, phase, state: row.state, last_seen_at: row.last_seen_at }, exclusive)
+    writeNoticeEvidence(evidence, { ...identity, phase, state: row.state, last_seen_at: row.last_seen_at, old_life: oldLife }, exclusive)
   let startupResumed = false
   if (command === 'notice-end') {
     noticeFact('end-waiting', first.state === 'waiting'); clean(first)
@@ -111,6 +113,8 @@ async function noticeControl(client: NoticeClient, command: string, id: string, 
     noticeFact('sentinel', sentinel)
     const fresh = await read()
     noticeFact('end-fresh-waiting', fresh.state === 'waiting'); clean(fresh)
+    failureFacts.check = 'end-live-life'
+    oldLife = captureLiveLife(fresh)
     save('end-requested', fresh, true)
     failureFacts.check = 'send-keys'
     await client.sendKeys({ instance_id: id, text: sentinel })
@@ -123,6 +127,11 @@ async function noticeControl(client: NoticeClient, command: string, id: string, 
     noticeFact('journal-states', events[0].state === 'waiting' && events[1].state === 'ended')
     noticeFact('journal-identity', events.every(event => event.instance_id === id && event.session_id === first.session_id &&
       event.key === key && event.work === work))
+    oldLife = events[0].old_life
+    noticeFact('journal-life', oldLife && oldLife.tmux_session_name === first.tmux_session_name &&
+      oldLife.tmux_socket === (first.tmux_socket ?? null) && Number.isSafeInteger(oldLife.pid) && oldLife.pid > 0 &&
+      events.every(event => event.old_life?.tmux_session_name === oldLife.tmux_session_name &&
+        event.old_life?.tmux_socket === oldLife.tmux_socket && event.old_life?.pid === oldLife.pid))
     const stillEnded = first.state === 'ended' && events[1].last_seen_at === first.last_seen_at
     if (command === 'notice-ended') {
       noticeFact('ended-state', stillEnded); clean(first)
@@ -134,6 +143,12 @@ async function noticeControl(client: NoticeClient, command: string, id: string, 
       // Displayed-state commands start reading at zero on resume. Keep their
       // evidence intact, but select ordinary receipts so no permission replays.
       appendControl(modes, 'at-once\t' + work + '\n')
+      failureFacts.check = 'old-life-exit'
+      try { await waitForLifeExit(oldLife) }
+      catch {
+        failureStep = 'old life never exited'
+        throw new Error('old life never exited')
+      }
       const fresh = await read()
       noticeFact('resume-fresh-ended', fresh.state === 'ended' && fresh.last_seen_at === first.last_seen_at); clean(fresh)
       save('resume-requested', fresh)

@@ -4392,10 +4392,12 @@ test('shared registered-hook controls bind the actual row and fail closed withou
   const scratch = mkdtempSync('/tmp/c9/shared-permission-audit-'), pkg = REPO_ROOT
   const captured: unknown[][] = []
   const clock = createFakeClock()
+  let oldLifeExited = false, oldLifeExitError = false
   // The copied declaration receives its own context; production imports and
   // the preload retain the process HOME, argv, console and clock untouched.
   const context = { env: { HOME: join(scratch, 'home') } as Record<string, string>, argv: [] as string[],
-    log: (...args: unknown[]) => captured.push(args), now: clock.now, sleep: clock.advance }
+    log: (...args: unknown[]) => captured.push(args), now: clock.now, sleep: clock.advance,
+    waitLifeExit: async () => { if (oldLifeExitError) throw Error('old life never exited'); oldLifeExited = true } }
   mkdirSync(context.env.HOME!)
   const source = readFileSync(join(INTEGRATION_DIR, 'fixtures/shared-stub-permission.ts'), 'utf8')
   writeFileSync(join(scratch, 'permission-source.ts'), source)
@@ -4403,6 +4405,11 @@ test('shared registered-hook controls bind the actual row and fail closed withou
   let declarations = ast.statements.filter(n => ts.isImportDeclaration(n) || ts.isFunctionDeclaration(n) ||
     ts.isVariableStatement(n) || ts.isTypeAliasDeclaration(n))
     .filter(n => !n.getText(ast).startsWith('const watchdog =')).map(n => n.getText(ast)).join('\n')
+  // The imported barrier has separate probe-driven coverage in ended-life.test.ts.
+  // Never let this declaration audit query the host's tmux or process table.
+  declarations = declarations.replace("const { captureLiveLife, waitForLifeExit } = await import('./ended-life.ts')",
+    `const captureLiveLife = row => ({ tmux_session_name: row.tmux_session_name, tmux_socket: row.tmux_socket ?? null, pid: 123 });
+     const waitForLifeExit = async life => { if (life.pid !== 123) throw Error('wrong life'); await auditContext.waitLifeExit() };`)
   const native = "await import(import.meta.resolve('agent-director', join(pkg, 'src/agent-director-client.ts')))"
   expect(declarations.split(native)).toHaveLength(2)
   declarations = declarations.replace(native, `({ Client: { create: async (options) => {
@@ -4447,13 +4454,15 @@ test('shared registered-hook controls bind the actual row and fail closed withou
     let row: any, calls: string[], change: undefined | (()=>void), gets: number, resumeError=false, sendError=false, stays=false
     function reset() {
       row={instance_id:id,session_id:session,agent:'claude',cwd:work,state:'waiting',labels:{persona:key,service:'cscb'},
+        tmux_session_name:'notice-fixture',tmux_socket:'/scratch/notice-socket',
         jsonl_path:transcript,permission_requests:[],unproven_requests:[],last_seen_at:'recorded-hook'}
       calls=[];gets=0;change=undefined;resumeError=false;sendError=false;stays=false;configFor(0)
+      oldLifeExited=false;oldLifeExitError=false
       writeFileSync(join(bin,'stub-claude-modes'),'displayed-states\t'+work+'\n')
       setAuditClient(Object.assign(makeStubClient(), {
         async get() { calls.push('get'); gets++; change?.(); return structuredClone(row) },
         async sendKeys(args: any) { calls.push('send');assert.deepEqual(args,{instance_id:id,text:sentinel});if(sendError)throw Error('unknown');if(!stays)row.state='ended' },
-        async resume(args: any) { calls.push('resume');assert.deepEqual(args,{instance_id:id});if(resumeError)throw Error('uncertain');if(!stays)row.state='waiting' },
+        async resume(args: any) { assert(oldLifeExited,'resume must follow old-life exit');calls.push('resume');assert.deepEqual(args,{instance_id:id});if(resumeError)throw Error('uncertain');if(!stays)row.state='waiting' },
         async close() { calls.push('close') },
       }))
     }
@@ -4473,6 +4482,13 @@ test('shared registered-hook controls bind the actual row and fail closed withou
       assert(readFileSync(join(bin,'stub-claude-modes'),'utf8').endsWith('at-once\t'+work+'\n'))
       assert.deepEqual(readFileSync(record),stateBefore)
       await assert.rejects(invoke('notice-resume',evidence));assert.equal(calls.filter(c=>c==='resume').length,1)
+    })
+    await check('old-life timeout fails explicitly before any resume request',async()=>{
+      reset();const evidence=await invoke('notice-end');oldLifeExitError=true
+      await assert.rejects(invoke('notice-resume',evidence),/old life never exited/)
+      assert(!calls.includes('resume'))
+      assert.deepEqual(readFileSync(evidence,'utf8').trim().split('\n').map(l=>JSON.parse(l).phase),['end-requested','ended'])
+      assert.equal(auditFailure().step,'old life never exited')
     })
     for (const state of ['working','pending','ask_user','check_permission','missing','ended']) await check('end refuses AD '+state,async()=>{
       reset();row.state=state;await assert.rejects(invoke('notice-end'));assert(!calls.includes('send'))

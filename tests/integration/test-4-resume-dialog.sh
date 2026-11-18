@@ -56,7 +56,7 @@ command -v claude >/dev/null 2>&1 \
 
 # --- Persona working directory ---------------------------------------------
 mkdir -p "${DRIVER_WORKING_DIRECTORY}"
-printf 'at-once\t%s\n' "$(realpath -e -- "${DRIVER_WORKING_DIRECTORY}")" > "${STUB_BIN_DIR}/stub-claude-modes"
+printf 'slow-exit\t%s\n' "$(realpath -e -- "${DRIVER_WORKING_DIRECTORY}")" > "${STUB_BIN_DIR}/stub-claude-modes"
 git -C "${DRIVER_WORKING_DIRECTORY}" init -q 2>/dev/null || true
 
 # --- Run the driver (NON-dry-run: SLACK_DRY_RUN deliberately unset) --------
@@ -89,9 +89,11 @@ fi
 
 # --- Assertions -----------------------------------------------------------
 
-for phase in PHASE1_OK PRECONDITION_OK PHASE2_OK; do
+for phase in PHASE1_OK PRECONDITION_OK PHASE2_OK PHASE2_OLD_SESSION_PRESENT_AT_ENDED PHASE3_OLD_SESSION_PRESENT_AT_ENDED; do
     grep -q "^DRIVER: ${phase}" /tmp/test-4-driver.out || fail "missing AD lifecycle phase ${phase}"
 done
+SESSION_ID="$(sed -n 's/^DRIVER: SESSION_ID //p' /tmp/test-4-driver.out)"
+[[ "${SESSION_ID}" =~ ^[a-f0-9-]{36}$ ]] || fail "missing fresh session identity"
 
 # 4. Both launches carried `--system-prompt-snapshot off` (the template
 #    installed from a config without `fresh_system_prompt`): the stub recorded
@@ -106,6 +108,10 @@ launch_no=0
 for launch_label in fresh resumed held-startup; do
     launch_no=$((launch_no + 1))
     launch_line="$(sed -n "${launch_no}p" "${LAUNCH_ARGS_FILE}")"
+    if (( launch_no > 1 )); then
+        [[ " ${launch_line} " == *" --resume ${SESSION_ID} "* ]] \
+            || fail "${launch_label}: launch lacks --resume with the fresh session identity"
+    fi
     [[ "${launch_line}" != *--dangerously-load-development-channels* && "${launch_line}" != *server:slack-channel-router* ]] \
         || fail "${launch_label}: launch carried channel arguments"
     [[ "$(grep -o -- '--append-system-prompt-file' <<< "${launch_line}" | wc -l)" == 1 ]] \

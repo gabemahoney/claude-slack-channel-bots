@@ -181,32 +181,32 @@ write_credentials() {
 # `get` of row <id>. Sets ROW_READ_AT (the
 # time just before the call), ROW_STATE (`absent` for ErrSpawnNotFound),
 # ROW_SID (session_id), ROW_LAUNCH (launch_started_at as printed) and
-# ROW_SESSION (tmux_session_name), each empty when absent.
+# ROW_SESSION (tmux_session_name) and ROW_SOCKET (tmux_socket), each empty when absent.
 poll_row_of() {
     local id="$1" fields row
     ROW_READ_AT="$(now_s)"
     if ad_release_at_least 0.18.0; then
         row="$(ad_store_peek "${id}")" || exit 1
         if [[ -z "${row}" ]]; then
-            ROW_STATE=absent ROW_SID="" ROW_LAUNCH="" ROW_SESSION=""
+            ROW_STATE=absent ROW_SID="" ROW_LAUNCH="" ROW_SESSION="" ROW_SOCKET=""
             return 0
         fi
-        fields="$(jq -r '[.state // "", .session_id // "", (.launch_started_at // "" | tostring), .tmux_session_name // ""] | join("\u001f")' <<< "${row}")" \
+        fields="$(jq -r '[.state // "", .session_id // "", (.launch_started_at // "" | tostring), .tmux_session_name // "", .tmux_socket // ""] | join("\u001f")' <<< "${row}")" \
             || fail "$2: the store row of ${id} does not read: ${row}"
-        IFS=$'\x1f' read -r ROW_STATE ROW_SID ROW_LAUNCH ROW_SESSION <<< "${fields}"
+        IFS=$'\x1f' read -r ROW_STATE ROW_SID ROW_LAUNCH ROW_SESSION ROW_SOCKET <<< "${fields}"
         return 0
     fi
     ad_capture get --instance-id "${id}"
     if (( AD_RC != 0 )); then
         if grep -qF ErrSpawnNotFound "${AD_OUT}" "${AD_ERR}"; then
-            ROW_STATE=absent ROW_SID="" ROW_LAUNCH="" ROW_SESSION=""
+            ROW_STATE=absent ROW_SID="" ROW_LAUNCH="" ROW_SESSION="" ROW_SOCKET=""
             return 0
         fi
         fail "$2: the harness get of ${id} exited ${AD_RC}: $(head -c 300 "${AD_ERR}")"
     fi
-    fields="$(jq -r '[.state // "", .session_id // "", (.launch_started_at // "" | tostring), .tmux_session_name // ""] | join("\u001f")' "${AD_OUT}")" \
+    fields="$(jq -r '[.state // "", .session_id // "", (.launch_started_at // "" | tostring), .tmux_session_name // "", .tmux_socket // ""] | join("\u001f")' "${AD_OUT}")" \
         || fail "$2: the harness get of ${id} printed no row object: $(head -c 300 "${AD_OUT}")"
-    IFS=$'\x1f' read -r ROW_STATE ROW_SID ROW_LAUNCH ROW_SESSION <<< "${fields}"
+    IFS=$'\x1f' read -r ROW_STATE ROW_SID ROW_LAUNCH ROW_SESSION ROW_SOCKET <<< "${fields}"
 }
 
 # row_of_reads <id> <step> <state>...: read row <id>; true when its state is
@@ -259,14 +259,50 @@ hold_pending_worker() {
 
 # end_worker <id> <step>: a plain stop has left row <id>'s worker running;
 # end it with the stub's sentinel, sent into its pane with the real tmux, and
-# wait until the row reads ended or missing.
+# wait until the row reads ended or missing AND its old session/process exit.
 end_worker() {
+    local session pid
+    local -a socket_args=()
     poll_row_of "$1" "$2"
     [[ -n "${ROW_SESSION}" ]] || fail "$2: row $1 names no tmux session"
-    "${SCENARIO_REAL_TMUX}" send-keys -t "=${ROW_SESSION}:" "${SENTINEL}" Enter \
-        || fail "$2: could not send the sentinel into ${ROW_SESSION}"
+    session="${ROW_SESSION}"
+    [[ -z "${ROW_SOCKET}" ]] || socket_args=(-S "${ROW_SOCKET}")
+    worker_tmux_query has-session "${session}" "${socket_args[@]}" \
+        || fail "$2: old life session is not live before exit"
+    pid="$(worker_tmux_query display-message "${session}" "${socket_args[@]}")" \
+        || fail "$2: old life pane pid unavailable"
+    pid_alive "${pid}" || fail "$2: old life process is not live before exit"
+    timeout 3s "${SCENARIO_REAL_TMUX}" "${socket_args[@]}" send-keys -t "=${session}:" "${SENTINEL}" Enter \
+        || fail "$2: could not send the sentinel into ${session}"
     wait_until "${ENDED_WAIT_S}" "$2: row $1 never read ended or missing after the sentinel" \
         row_of_reads "$1" "$2" ended missing
+    wait_until "${GONE_WAIT_S}" "$2: old life never exited" \
+        ended_worker_gone "${session}" "${pid}" "${socket_args[@]}"
+}
+ended_worker_gone() {
+    local session="$1" pid="$2"; shift 2
+    if worker_tmux_query has-session "${session}" "$@"; then return 1; fi
+    ! pid_alive "${pid}"
+}
+
+# worker_tmux_query <has-session|display-message> <session> [socket args...].
+# Only has-session's exit 1 proves absence. Never treat timeout/query failure
+# as gone, including when this helper runs as wait_until's predicate.
+worker_tmux_query() {
+    local query="$1" session="$2" rc=0; shift 2
+    local -a query_args=()
+    case "${query}" in
+        has-session) query_args=(has-session -t "=${session}") ;;
+        display-message) query_args=(display-message -p -t "=${session}:" '#{pane_pid}') ;;
+        *) fail 'old life tmux query unsupported' ;;
+    esac
+    timeout 3s "${SCENARIO_REAL_TMUX}" "$@" "${query_args[@]}" 2>/dev/null || rc=$?
+    case "${rc}" in
+        0) return 0 ;;
+        1) [[ "${query}" != has-session ]] || return 1 ;;
+        124|137) fail 'old life tmux query timed out' ;;
+    esac
+    fail "old life tmux query failed (status ${rc})"
 }
 
 # call_table <file>: write <file>, one TAB-separated line per agent-director
