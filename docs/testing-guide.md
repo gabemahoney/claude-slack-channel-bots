@@ -626,7 +626,23 @@ The child crash barrier publishes private mode-0600 checkpoints and an atomic ma
 
 Within the original shared 180 s deadline, require both actual durable acceptances, successful text-call return and visible input. Record bounded child status/checkpoint/call-count diagnostics before SIGKILL or failure cleanup. The actual kill boundary stays after successful text and before Enter, with the native agent alive; verify SIGKILL and Enter-only durable recovery rather than simulating the crash.
 
-Synthetic controls in `codex-delivery-controls.test.ts` cover delayed startup/successor acceptance, failed transport, early exit/signal, malformed/foreign/oversize/symlink checkpoints, atomic publication, marker-first snapshots, deadlines and diagnostics-before-kill. `codex-ai-controls.test.ts` holds successor parts until real completion and refuses failed acknowledgement; `codex-gate-controls.test.ts` checks the preserved prefix/suffix and rejects missing receipts, sends and FIFO violations. Host-safety audits pin the added helper and executable surfaces; controls supply no native acceptance.
+The Codex corpus prompt in `codex-delivery.ts` asks for XML-decoded attribute values exactly once (`&quot;` → `"`, `&lt;` → `<`, `&gt;` → `>`, `&amp;` → `&`) and byte-exact BODY with its original entity spelling. Claude's prompts live separately in `ai-scenario.sh`.
+
+Keep completion evidence separate from answer acceptance. Both `native completion and answer oracle` and AC106's `second actual exact DM take-in and completion` retry pending evidence: an incomplete trailing JSONL record, no exact post-send take-in or no terminal event for its own started turn. In a complete snapshot, bind terminal `task_complete`, `error` and `turn_aborted` events to that receipt's turn, stopping at the next input/start; a terminal marker establishes failure finality, never acceptance.
+
+Once the own turn is terminal, any validation rejection fails immediately: `native-turn-failed` with `["turn"]`, `model-mismatch` with `["model"]`, or `native-turn-invalid` with `["completion"]`. Preserve every assertion in `completedCodexTurn` and the answer/take-in oracles; failed native evidence cannot pass.
+
+Emit `recorded: codex-oracle {"case":"case_13","reason":"read-back-differs","fields":["attributes.user"]}` through the existing redaction, with fixed schema names only, never values, answer text or invented JSON keys. The [Codex reason catalogue](../tests/README.md#codex-gate-and-heavy-ai) also covers JSON/read-back, exchange/tool/shell, usage and independent-take-in failures, plus the fixed `oracle-rejected` fallback.
+
+Latch the first fatal multipart callback failure with its original part/check stage, surface it from the enclosing driver poll outside the engine's send-error handling, and block later harness sends. Record an oracle rejection only once, while retaining the original completion bound for pending acknowledgements.
+
+Scope fatal-latch checks to scenario waits: cleanup retirement must still perform its original bounded sweep and row-state verification after a latched failure. Preserve the first scenario failure and stage, and report a retirement cleanup failure only when that verification fails.
+
+Pending evidence retains the 180 s bound (item completion measured from the durable send); `codex-bound.step` names the actual poll and `codex-failure.stage` includes the AI case and current step. AC106's second poll checks independent take-ins after valid completion, and its later count query still requires exact JSON.
+
+Synthetic controls in `codex-delivery-controls.test.ts` cover delayed startup/successor acceptance, failed transport, early exit/signal, malformed/foreign/oversize/symlink checkpoints, atomic publication, marker-first snapshots, deadlines and diagnostics-before-kill. `codex-ai-controls.test.ts` executes the actual completion polls and multipart callback through the production engine with synthetic rollouts and a simulated clock, asserting immediate safe terminal/answer rejections, unchanged pending bounds, accurate stages and blocked later sends.
+
+`codex-gate-controls.test.ts` checks the preserved prefix/suffix and rejects missing receipts, sends and FIFO violations. Host-safety audits pin the added helper and executable surfaces; controls supply no native acceptance.
 
 On a failed native delivery wait, capture structured AD row and exact-receipt/journal evidence before cleanup. `transcript-receipts.ts` projects counts and send/receipt state with fixed reason classes; no composer observation, pane text, arbitrary parser errors, message bodies or credentials enter diagnostics. Preserve the original wait, FAIL and cleanup order; late readiness cannot pass.
 

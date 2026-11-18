@@ -27,6 +27,8 @@ const stateDir = join(paths.root, 'codex-delivery-state'), key = 'codex_delivery
 // One label per criterion for both the model's instructions and its oracle.
 const AC15_CASE = 'AC15', AC106_CASE = 'AC106'
 let instance = `cscb_${key}`, stage = 'prepare', lastKey: string | null = null
+let aiCase: string | undefined
+let fatalOracle: { error: unknown; stage: string } | undefined
 const liveInstances = new Set<string>()
 const nativeRollouts = new Map<string, import('./codex-evidence.ts').CodexRollout>()
 const userNames = new Map<string, string>(), channelNames = new Map<string, string>()
@@ -172,6 +174,7 @@ async function buildEngine() {
   engines = engineModule.createDeliveryEngines({ queue, lifecycle, clientFor: async () => ({
     get: (params: any) => client.get(params),
     sendKeys: async (params: any) => {
+      throwFatalOracle()
       if (crashBarrier && params.no_enter && typeof params.text === 'string') crashCheckpoint('text-call-start', { textStarted: true })
       const result = await (multipartSend ? multipartSend(params) : client.sendKeys(params))
       if (crashBarrier && params.no_enter && typeof params.text === 'string') {
@@ -201,9 +204,29 @@ async function buildEngine() {
   crashCheckpoint('queue-ready', { queueReady: true })
 }
 async function stopEngine() { await engines?.stop(); await preparation?.stop(); await lifecycle?.stop(); await queue?.stop() }
-async function poll<T>(step: string, check: () => Promise<T | undefined>, ms = 120000): Promise<T> {
+function throwFatalOracle() {
+  if (fatalOracle) { stage = fatalOracle.stage; throw fatalOracle.error }
+}
+function latchFatalOracle(error: unknown): never {
+  fatalOracle ??= { error, stage }
+  stage = fatalOracle.stage
+  throw fatalOracle.error
+}
+async function poll<T>(step: string, check: () => Promise<T | undefined>, ms = 120000, scope: 'scenario' | 'cleanup' = 'scenario'): Promise<T> {
+  if (scope === 'scenario') throwFatalOracle()
+  const pollStage = scope === 'cleanup' && fatalOracle ? fatalOracle.stage : `${aiCase ? `${aiCase}-` : ''}${step}`
+  stage = pollStage
   const end = Date.now() + ms
-  while (Date.now() < end) { const result = await check(); if (result !== undefined && Date.now() <= end) return result; await Bun.sleep(250) }
+  while (Date.now() < end) {
+    if (scope === 'scenario') throwFatalOracle()
+    stage = pollStage
+    const result = await check()
+    if (scope === 'scenario') throwFatalOracle()
+    if (result !== undefined && Date.now() <= end) return result
+    await Bun.sleep(250)
+  }
+  if (scope === 'scenario') throwFatalOracle()
+  stage = pollStage
   record('bound', { step, milliseconds: ms })
   throw new Error(`${step}: observation incomplete within bound`)
 }
@@ -233,6 +256,7 @@ async function waiting() {
 }
 async function sendWaiting(params: Record<string, unknown>) {
   await waiting()
+  throwFatalOracle()
   return client.sendKeys({ instance_id: instance, ...params })
 }
 async function retire(label: string) {
@@ -249,7 +273,7 @@ async function retired(id: string) {
   return poll('row retirement', async () => {
     return await codexRetirementCheckpoint({ findMissing: () => client.findMissing({}),
       state: async () => (await client.get({ instance_id: id })).state }) ? true : undefined
-  }, 30000)
+  }, 30000, 'cleanup')
 }
 async function start(label = 'delivery', instructions = 'For observation probes, answer with OK unless the input asks for another response.') {
   stage = `${label}-spawn`; lastKey = null
@@ -287,13 +311,18 @@ async function completedItem(seq: number, part?: number, expected?: unknown, noT
   const sent = sends[0]
   if (!sent) throw new Error('delivery has no durable send')
   const end = sent.at + 180000
-  const complete = await poll('native completion', async () => {
+  const complete = await poll(expected === undefined ? 'native completion' : 'native completion and answer oracle', async () => {
     const current = await rollout()
     const window = { session: sent.session_id, offset: sent.transcript_size, sentAt: sent.at, text: item.fixed.parts[target - 1], model: paths.model }
+    const oracle = await import('./codex-ai.ts')
     try {
-      if (expected !== undefined) return (await import('./codex-ai.ts')).assertCodexAnswer(current.data, window, expected, { noTools })
-      return evidence.completedCodexTurn(current.data, window)
-    } catch { return }
+      const completed = evidence.observeCodexTurn(current.data, window)
+      if (!completed || expected === undefined) return completed
+      return oracle.assertCodexAnswer(current.data, window, expected, { noTools })
+    } catch (error) {
+      if (!fatalOracle) record('oracle', oracle.codexOracleFailure((expected as any)?.case ?? aiCase?.match(/^AI-(AC15|AC106)(?:-|$)/)?.[1], error))
+      latchFatalOracle(error)
+    }
   }, Math.max(0, end - Date.now()))
   record('rollout-model', complete.model)
   record('completed-turn', { session: sent.session_id, send: complete.send, receipt: complete.receipt, completion: complete.completion })
@@ -447,6 +476,7 @@ async function ai(ac: number) {
     return queue.items(key).at(-1)?.accepted.seq ?? 0
   }
   const audit = async (after: number) => {
+    stage = `${aiCase}-delivery audit`
     const current = await rollout()
     const actual = gateOracle.auditCodexDelivery({ journal: journal().filter(r => r.seq > after), rollout: current.data, path: current.path,
       instance, shim: receipts.readShimLog(shimLog), events: eventJournal(), key, log: readFileSync(join(stateDir, 'server.log'), 'utf8') })
@@ -457,10 +487,12 @@ async function ai(ac: number) {
     const cases = oracle.codexAICases(ac)
     if (ac === 11 && cases.length !== 15) throw new Error('corpus incomplete')
     for (const [i, test] of cases.entries()) {
-      stage = `AI-AC${ac}-${test.label}`
+      aiCase = `AI-AC${ac}-${test.label}`
+      stage = `${aiCase}-begin`
       if (test.msg.user_id) userNames.set(test.msg.user_id, test.msg.user)
       channelNames.set(test.msg.chat_id, test.msg.channel_name)
-      const after = await begin(`ai_${ac}_${i}`, `For each received tagged message return one JSON object {"case":"${test.label}","attributes":a map of all outer tag attributes and values,"body":the received BODY}. Transcribe BODY verbatim, preserving every character, whitespace and entity spelling; use only JSON string escaping. Return JSON without Markdown.`)
+      const after = await begin(`ai_${ac}_${i}`, `For each received tagged message return one JSON object {"case":"${test.label}","attributes":a map of all outer tag attributes and values,"body":the received BODY}. Return attribute values XML-decoded exactly once: &quot; becomes ", &lt; becomes <, &gt; becomes >, and &amp; becomes &. Transcribe BODY byte-exact, preserving every character, whitespace and entity spelling; use only JSON string escaping. Return JSON without Markdown.`)
+      stage = `${aiCase}-accept and wrapper check`
       const seq = await accept(oracle.codexSlackInput(test.msg))
       if (JSON.stringify(queue.item(key, seq).fixed.parts) !== JSON.stringify([test.typed])) throw new Error('production wrapper differs from independent audited reference')
       await delivered(seq)
@@ -472,23 +504,30 @@ async function ai(ac: number) {
       await retire(`ai_${ac}_${i}`)
     }
   } else if (ac === 15) {
+    aiCase = 'AI-AC15'
+    stage = `${aiCase}-begin`
     const after = await begin('ai_15', `Give a visible JSON response on every turn. For received multipart input, acknowledge a nonfinal part with {"status":"received"} and finish the turn. Once complete return {"case":"${AC15_CASE}","messages":the number of messages received,"body":the joined BODY}. Use only input received in this conversation. Do not retrieve other data. Use no tools. Return JSON without Markdown.`)
+    stage = `${aiCase}-input fixture`
     const message = oracle.codexAC15Message(), body = message.text
     userNames.set(message.user_id, message.user)
     const answers: any[] = []
     multipartSend = oracle.codexMultipartSender((params: any) => client.sendKeys(params), async text => {
-      const item = queue.items(key).find((item: any) => item.accepted.seq > after && item.fixed?.parts.includes(text))
-      if (!item) throw new Error('submission has no exact durable part')
-      const part = item.fixed.parts.indexOf(text) + 1
-      if (part !== answers.length + 1) throw new Error('submission order differs')
-      stage = `AI--part-${part}-completion`
-      answers.push(await completedItem(item.accepted.seq, part,
-        part < 3 ? { status: 'received' } : { case: AC15_CASE, messages: 1, body }, true))
+      try {
+        const item = queue.items(key).find((item: any) => item.accepted.seq > after && item.fixed?.parts.includes(text))
+        if (!item) throw new Error('submission has no exact durable part')
+        const part = item.fixed.parts.indexOf(text) + 1
+        if (part !== answers.length + 1) throw new Error('submission order differs')
+        aiCase = `AI-AC15-part-${part}`
+        answers.push(await completedItem(item.accepted.seq, part,
+          part < 3 ? { status: 'received' } : { case: AC15_CASE, messages: 1, body }, true))
+      } catch (error) { latchFatalOracle(error) }
     })
     try {
+      stage = `${aiCase}-accept`
       const seq = await accept(oracle.codexSlackInput(message))
       await delivered(seq)
       const parts = queue.item(key, seq).fixed.parts
+      stage = `${aiCase}-multipart oracle`
       if (parts.length !== 3) throw new Error('production wrapper did not make three parts')
       oracle.assertCodexMultipart(parts, body, answers)
       await waiting()
@@ -496,27 +535,42 @@ async function ai(ac: number) {
       await audit(after)
     } finally { multipartSend = undefined }
   } else {
+    aiCase = 'AI-AC106'
+    stage = `${aiCase}-begin`
     const after = await begin('ai_106', `Answer ordinary test requests with JSON without Markdown. Acknowledge a message with {"status":"received"}. When asked for a count, return {"case":"${AC106_CASE}","messages":the number of distinct prior DMs received before the query}. Use no tools.`)
+    stage = `${aiCase}-accept first DM`
     const seq = await accept(dm('Please acknowledge this DM.', 110))
     await delivered(seq); await completedItem(seq, 1, { status: 'received' }, true); await waiting()
     const item = queue.item(key, seq), sent = item.records.find((r: any) => r.kind === 'sent' && r.part === 1)
     const first = { session: sent.session_id, offset: sent.transcript_size, sentAt: sent.at, text: item.fixed.parts[0], model: paths.model }
     const before = await rollout(), second = { session: before.data.session, offset: before.data.size, sentAt: Date.now(), text: first.text, model: paths.model }
+    stage = `${aiCase}-submit second DM`
     await sendWaiting({ text: first.text })
     await poll('second actual exact DM take-in and completion', async () => {
       const current = await rollout()
-      try { return oracle.assertCodexDuplicateTakeins(current.data, first, second) } catch { return }
+      try {
+        if (!evidence.observeCodexTurn(current.data, second)) return
+        return oracle.assertCodexDuplicateTakeins(current.data, first, second)
+      } catch (error) {
+        if (!fatalOracle) record('oracle', oracle.codexOracleFailure(AC106_CASE, error))
+        latchFatalOracle(error)
+      }
     }, 180000)
+    stage = `${aiCase}-second DM submission audit`
     const actual = [...receipts.shimSends(receipts.readShimLog(shimLog))].reverse().find(s => s.instanceId === instance && s.text === first.text && s.at >= second.sentAt && !s.words.includes('--no-enter'))
     if (!actual) throw new Error('second DM has no actual submitted shim call')
     await waiting()
+    stage = `${aiCase}-duplicate take-in recheck`
     oracle.assertCodexDuplicateTakeins((await rollout()).data, first, second)
+    stage = `${aiCase}-accept count query`
     const query = await accept(dm(`How many distinct DMs have you received before this query? Return a JSON object with case "${AC106_CASE}" and messages set to the count you observed.`, 111))
     await delivered(query); await completedItem(query, 1, { case: AC106_CASE, messages: 1 }, true); await waiting()
     await completedItem(query, 1, { case: AC106_CASE, messages: 1 }, true)
     await audit(after)
   }
+  stage = `${aiCase}-final queue check`
   if (queue.openCount(key) !== 0) throw new Error('AI scenario retained open items')
+  stage = `${aiCase}-summary`
   await summary(duplicates, true)
 }
 

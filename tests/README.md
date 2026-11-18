@@ -1457,6 +1457,31 @@ This uses the existing guarded local Codex lifecycle and skips Claude jobs, runt
 
 `codex-ai.ts` keeps inputs and expected JSON private, outside model working files. `codex-evidence.ts` binds the answer and `task_complete` to the exact own session, take-in/send window and selected model, with positive input/output usage. `codex-gate.ts` independently audits delivery without the heavy answer requirement. Stops, refusal/API errors, fallback/model changes, unfinished turns, prohibited tool actions and native shell input cannot count as successful exact AI read-back; there is no classifier-stop acceptance. Require 3 of 3 fresh successes for every criterion and 15 unique scenario/trial result rows. Nonnegative safe-integer duplicate-message counts are reported and aggregated, never alone a failure; duplicated result identities and missing/invalid reports fail.
 
+The Codex corpus prompt requires attribute values XML-decoded exactly once (`&quot;` → `"`, `&lt;` → `<`, `&gt;` → `>`, `&amp;` → `&`); BODY stays byte-exact, including entity spelling. This prompt lives in `codex-delivery.ts`; Claude's separate `ai-scenario.sh` prompt is unchanged.
+
+The `native completion and answer oracle` poll retries pending evidence: a partial trailing JSONL record, no exact post-send take-in yet, or no terminal marker for its own started turn yet. Only a complete snapshot can make a rejection final through an own `task_complete`, `error` or `turn_aborted`; a refusal, classifier/fallback record, wrong model or invalid completion then fails immediately without weakening any completion or answer assertion.
+
+Failures emit `recorded: codex-oracle {"case":"case_13","reason":"read-back-differs","fields":["attributes.user"]}` through the existing redaction. Fields are fixed schema names only; values, answer text and invented JSON keys are never recorded.
+
+| Fixed reason | Meaning / fixed fields |
+|---|---|
+| `native-turn-failed` | Terminal native failure, including refusal/classifier/fallback; `["turn"]` |
+| `model-mismatch` | Terminal turn's model differs; `["model"]` |
+| `native-turn-invalid` | Other terminal completion validation failure; `["completion"]` |
+| `answer-not-json`, `read-back-differs` | Invalid JSON or unequal read-back; `answer` or differing fixed schema fields |
+| `exchange-failed-or-model-changed`, `native-shell` | Forbidden exchange evidence; `["exchange"]` |
+| `unexpected-tool`, `positive-usage-missing` | Tool action or invalid usage; `["tools"]` or `["usage"]` |
+| `duplicate-takeins-differ` | Independent AC106 take-ins not established; `["takeins"]` |
+| `oracle-rejected` | Unexpected rejection; empty fields |
+
+AC106's `second actual exact DM take-in and completion` poll applies the same pending/terminal distinction to its second send window before checking the independent take-ins. Its later count query retains exact JSON checking.
+
+The multipart callback latches its first fatal failure and original part/check stage, so the enclosing driver poll surfaces it even when the production engine handles a send exception. Further harness sends are blocked after that failure, and only one oracle rejection is recorded.
+
+Cleanup retirement runs its original bounded sweep and row-state verification independently of the scenario latch, preserving the first scenario failure and stage. Only a failure of that verification reports a retirement cleanup failure; later harness sends remain blocked.
+
+Pending observations retain the 180 s bound, measured from the durable send for item completion. `codex-bound.step` names the actual poll and `codex-failure.stage` names its AI case and current step, including multipart completion timeouts.
+
 Each trial emits exactly one `duplicates:` line, `tokens:` with input/output/cache-read/cache-creation counts, `recorded: codex-model <name>`, `recorded: codex-completed true` and `recorded: codex-auth-symlink true`. The coordinator validates native version, actual model, completion, usage and trial identity, records `job-codex.json`, and includes observed duplicate/token totals on failure too. Bounded polls use 120 s ordinarily, 180 s for delivery/completion and 300 s for launch; no unchanged automatic paid retry is permitted.
 
 Real-agent actions wait on AD `waiting` and typed refusals. Explicit `/compact` trials verify later exact receipts and durable queue progress; no pane or native compaction marker establishes lifecycle state. Diagnostics omit pane text.
@@ -1471,7 +1496,9 @@ The host login is only the existing single read-write mounted file; the private 
 
 Use [the runner's full admission and retirement contract](../docker/README.md#codex-admission-login-and-scratch-lifecycle): selected top-level host model, bounded plain `CODEX_HOST_CONFIG_KEYS`, UID/owner-0600 checks, dedicated test-1/Codex shard, shared 30-minute login lease, survivor refusal, core dumps disabled, additional 2 GiB memory and before/after token scans. Codex always runs in local disposable containers, never a scheduler job. Supply the same `CI_ANTHROPIC_*` environment directly to the `/ci` runner and every verdict-reader call; `/ci-live` stays in its own container and test workspace. Never export scratch homes or access actual credentials from host tests.
 
-The four synthetic Codex suites are `codex-config-keys.test.ts`, `codex-delivery-controls.test.ts`, `codex-ai-controls.test.ts` and `codex-gate-controls.test.ts`. They cover strict bounded child checkpoints, atomic markers, both durable pair IDs, marker-first consistent reads, diagnostics before kill, completed multipart acknowledgements and compaction-preserved FIFO evidence. `codex-delivery-controls.test.ts` also requires each AI prompt's `case` label for criteria 15 and 106 to equal its oracle's. Actual SIGKILL stays between successful text return and Enter.
+The four synthetic Codex suites are `codex-config-keys.test.ts`, `codex-delivery-controls.test.ts`, `codex-ai-controls.test.ts` and `codex-gate-controls.test.ts`. They cover strict bounded child checkpoints, atomic markers, both durable pair IDs, marker-first consistent reads, diagnostics before kill, completed multipart acknowledgements and compaction-preserved FIFO evidence.
+
+`codex-ai-controls.test.ts` executes the driver's completion polls and actual multipart callback through the production engine with synthetic rollouts and a simulated clock, checking immediate safe rejections, terminal native failures, unchanged pending-turn bounds, accurate stages and blocked later sends. `codex-delivery-controls.test.ts` also requires each AI prompt's `case` label for criteria 15 and 106 to equal its oracle's; actual SIGKILL stays between successful text return and Enter.
 
 Host-safety audits pin the eight-module import graph, including `codex-crash-barrier.ts`, guarded driver/crash-worker and exactly five heavy entrypoints plus shared helper; secrecy audits retain leak checks for config/model readers, fake login helpers and control suites. `delivery-receipt.test.ts` checks failure-only Claude delivery projections, fixed reasons, secret sentinels and unchanged FAIL/cleanup ordering. `fmk-launch-pending-dialog-wait.test.ts` checks test 26's exact existing recovery-result poll within `LOG_WAIT_S=30` before `get_line`, preserving counts, outcomes and timing bounds. See [the testing guide](../docs/testing-guide.md#real-agent-evidence-and-heavy-runner) before adding an execution surface or import. Controls are unpaid and cannot supply native acceptance.
 

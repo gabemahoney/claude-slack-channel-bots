@@ -32,6 +32,44 @@ const stable = (v: any): string => JSON.stringify(v && typeof v === 'object' && 
   ? Object.fromEntries(Object.keys(v).sort().map(k => [k, JSON.parse(stable(v[k]))]))
   : Array.isArray(v) ? v.map(x => JSON.parse(stable(x))) : v)
 
+const ORACLE_REASONS = ['answer-not-json', 'read-back-differs', 'exchange-failed-or-model-changed',
+  'unexpected-tool', 'native-shell', 'positive-usage-missing', 'duplicate-takeins-differ',
+  'native-turn-failed', 'model-mismatch', 'native-turn-invalid'] as const
+type OracleReason = typeof ORACLE_REASONS[number]
+const READBACK_KEYS = ['case', 'body', 'messages', 'status']
+const READBACK_ATTRIBUTES = ['source', 'chat_id', 'channel_name', 'message_id', 'user', 'user_id', 'bot_id', 'ts', 'thread_ts', 'via', 'attachment_count', 'attachments', 'part']
+function oracleError(message: string, reason: OracleReason, fields: string[]) {
+  return Object.assign(new Error(message), { reason, fields })
+}
+function requireOracle(value: unknown, message: string, reason: OracleReason, fields: string[]): asserts value {
+  if (!value) throw oracleError(message, reason, fields)
+}
+
+/** Only fixed schema names may leave the container, including when an answer
+ * invents object keys. Never include answer values or arbitrary JSON keys. */
+function readbackFields(answer: any, expected: any): string[] {
+  const fields: string[] = []
+  for (const key of READBACK_KEYS) {
+    if (stable(answer?.[key] ?? null) !== stable(expected?.[key] ?? null)) fields.push(key)
+  }
+  if (stable(answer?.attributes ?? null) !== stable(expected?.attributes ?? null)) {
+    for (const key of READBACK_ATTRIBUTES) {
+      if (stable(answer?.attributes?.[key] ?? null) !== stable(expected?.attributes?.[key] ?? null)) fields.push(`attributes.${key}`)
+    }
+    if (!fields.some(field => field.startsWith('attributes.'))) fields.push('attributes')
+  }
+  return fields.length ? fields : ['answer']
+}
+
+export function codexOracleFailure(label: unknown, error: unknown) {
+  const caseLabel = typeof label === 'string' && /^(?:case_\d{2}|AC15|AC106)$/.test(label) ? label : 'unknown'
+  const detail = error instanceof Error ? error as Error & { reason?: OracleReason; fields?: unknown } : undefined
+  const known = detail?.reason !== undefined && ORACLE_REASONS.includes(detail.reason)
+  const allowed = new Set(['answer', 'attributes', 'exchange', 'tools', 'usage', 'takeins', 'turn', 'model', 'completion', ...READBACK_KEYS, ...READBACK_ATTRIBUTES.map(key => `attributes.${key}`)])
+  return { case: caseLabel, reason: known ? detail.reason : 'oracle-rejected',
+    fields: known && Array.isArray(detail.fields) ? detail.fields.filter(field => typeof field === 'string' && allowed.has(field)) : [] }
+}
+
 export function tagReadback(typed: string, label: string) {
   const match = /^<channel ((?:[a-z_]+="[^"]*" ?)+)>([\s\S]*)<\/channel>$/.exec(typed)
   requireEvidence(match, 'invalid independent reference tag')
@@ -113,13 +151,14 @@ export function assertCodexAnswer(rollout: CodexRollout, window: CodexWindow, ex
   // Check the entire observed exchange, including late stops/tool actions and
   // duplicate copies, rather than accepting an earlier matching JSON alone.
   const exchange = rollout.records.filter(r => r.offset >= window.offset)
-  requireEvidence(!exchange.some(r => r.failed || r.model !== undefined && r.model !== window.model), 'AI exchange stopped or changed model')
-  if (options.noTools) requireEvidence(!exchange.some(r => r.tool), 'AI exchange performed a tool action')
-  assertCodexNoShell(rollout)
+  requireOracle(!exchange.some(r => r.failed || r.model !== undefined && r.model !== window.model), 'AI exchange stopped or changed model', 'exchange-failed-or-model-changed', ['exchange'])
+  if (options.noTools) requireOracle(!exchange.some(r => r.tool), 'AI exchange performed a tool action', 'unexpected-tool', ['tools'])
+  try { assertCodexNoShell(rollout) }
+  catch { throw oracleError('native user shell mode observed', 'native-shell', ['exchange']) }
   let answer: unknown
-  try { answer = JSON.parse(complete.answer) } catch { throw new Error('native answer is not one complete JSON value') }
-  requireEvidence(stable(answer) === stable(expected), 'native JSON read-back differs')
-  requireEvidence(complete.tokens && complete.tokens.input > 0 && complete.tokens.output > 0, 'native positive usage missing')
+  try { answer = JSON.parse(complete.answer) } catch { throw oracleError('native answer is not one complete JSON value', 'answer-not-json', ['answer']) }
+  if (stable(answer) !== stable(expected)) throw oracleError('native JSON read-back differs', 'read-back-differs', readbackFields(answer, expected))
+  requireOracle(complete.tokens && complete.tokens.input > 0 && complete.tokens.output > 0, 'native positive usage missing', 'positive-usage-missing', ['usage'])
   return complete
 }
 
@@ -142,9 +181,11 @@ export function assertCodexMultipart(parts: string[], body: string, completions:
 }
 
 export function assertCodexDuplicateTakeins(rollout: CodexRollout, first: CodexWindow, second: CodexWindow) {
-  requireEvidence(first.session === second.session && first.text === second.text && second.offset > first.offset && second.sentAt > first.sentAt, 'duplicate lacks two independent send windows')
-  const a = completedCodexTurn(rollout, first), b = completedCodexTurn(rollout, second)
-  requireEvidence(a.receipt.offset < second.offset && a.completion.offset < b.receipt.offset && a.receipt.offset !== b.receipt.offset,
-    'two actual identical DM take-ins not established')
-  return [a, b]
+  try {
+    requireEvidence(first.session === second.session && first.text === second.text && second.offset > first.offset && second.sentAt > first.sentAt, 'duplicate lacks two independent send windows')
+    const a = completedCodexTurn(rollout, first), b = completedCodexTurn(rollout, second)
+    requireEvidence(a.receipt.offset < second.offset && a.completion.offset < b.receipt.offset && a.receipt.offset !== b.receipt.offset,
+      'two actual identical DM take-ins not established')
+    return [a, b]
+  } catch { throw oracleError('two actual identical DM take-ins not established', 'duplicate-takeins-differ', ['takeins']) }
 }

@@ -6,6 +6,9 @@ import { codexAC15Body, codexAC15Message, codexAICases, codexSlackInput, tagRead
 import { projectCodexRollout, type CodexWindow } from './real-agent/codex-evidence.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { buildTagParts } from '../src/tag-wrapper.ts'
+import * as oracle from './real-agent/codex-ai.ts'
+import * as evidence from './real-agent/codex-evidence.ts'
+import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
 
 const model = 'synthetic-model', session = 'synthetic-session'
 const expected = { case: 'case_01', attributes: { user_id: 'U0REAL' }, body: 'ordinary text' }
@@ -53,6 +56,224 @@ function project(rows: any[] = turn()) {
   const records = [{ type: 'session_meta', payload: { id: session }, timestamp: new Date(0).toISOString() }, ...rows]
   return projectCodexRollout(Buffer.from(records.map(r => JSON.stringify(r) + '\n').join('')), session)
 }
+
+describe('Codex driver completion diagnostics (synthetic; no native process)', () => {
+  // Execute the actual driver functions/poll body, without its guarded entrypoint.
+  function driver(kind: 'answer' | 'duplicate', data: ReturnType<typeof project> | ReturnType<typeof project>[], first = window, expectation: unknown = expected, activeCase?: string, secondWindow?: CodexWindow) {
+    const source = readFileSync(new URL('./real-agent/codex-delivery.ts', import.meta.url), 'utf8')
+    const extract = (name: string) => {
+      const declaration = source.match(new RegExp(`^(?:async )?function ${name}[\\s\\S]*?^\\}`, 'm'))?.[0]
+      if (!declaration) throw new Error(`missing driver declaration: ${name}`)
+      return declaration.replaceAll("(await import('./codex-ai.ts'))", 'oracle').replaceAll("await import('./codex-ai.ts')", 'deps.oracle')
+    }
+    const duplicate = source.slice(source.indexOf("    await poll('second actual exact DM take-in and completion'"), source.indexOf('    const actual = [...receipts.shimSends'))
+    expect(duplicate).toContain('assertCodexDuplicateTakeins')
+    let at = secondWindow?.sentAt ?? 1000, reads = 0
+    const started = at
+    const records: { label: string; value: any }[] = []
+    const program = `
+      const { oracle, evidence, data, first, record, Date, Bun, rollout } = deps;
+      const paths = { model: '${model}' }, AC106_CASE = 'AC106';
+      let aiCase = '${activeCase ?? (kind === 'answer' ? 'AI-AC11-case_01' : 'AI-AC106')}', stage = 'ai_11_0-idle';
+      let fatalOracle;
+      const item = { fixed: { parts: [first.text] }, records: [{ kind: 'sent', part: 1,
+        session_id: first.session, transcript_size: first.offset, at: first.sentAt }] };
+      const queue = { item: () => item }, key = 'synthetic';
+      const second = deps.second;
+      ${['throwFatalOracle', 'latchFatalOracle'].filter(name => source.includes(`function ${name}(`)).map(extract).join('\n')}
+      ${extract('poll')}
+      ${extract('completedItem')}
+      return { run: async () => { ${kind === 'answer' ? 'return await completedItem(1, 1, deps.expected, true)' : duplicate} }, stage: () => stage };
+    `
+    const actual = new Function('deps', new Bun.Transpiler({ loader: 'ts' }).transformSync(program))({
+      oracle, evidence, data, first, expected: expectation,
+      second: secondWindow ?? { session, model, offset: 0, sentAt: 1000, text: first.text },
+      record: (label: string, value: any) => { assertNoLeak(value); records.push({ label, value }) },
+      Date: { now: () => at }, Bun: { sleep: async (ms: number) => { at += ms } },
+      rollout: async () => ({ data: Array.isArray(data) ? data[Math.min(reads++, data.length - 1)] : (reads++, data) }),
+    }) as { run(): Promise<unknown>; stage(): string }
+    return { ...actual, records, elapsed: () => at - started, reads: () => reads }
+  }
+
+  test.each(['wrong-field', 'non-json', 'refusal-text'] as const)('completed %s fails at once with safe reason and field names', async kind => {
+    const rows = turn()
+    rows[3]!.payload.content[0].text = kind === 'wrong-field'
+      ? JSON.stringify({ ...expected, attributes: { user_id: 'PRIVATE WRONG VALUE' } })
+      : kind === 'non-json' ? '{PRIVATE MALFORMED ANSWER' : 'I cannot return PRIVATE REFUSAL TEXT'
+    const d = driver('answer', project(rows))
+    await expect(d.run()).rejects.toThrow()
+    expect(d.records).toEqual([{ label: 'oracle', value: { case: 'case_01',
+      reason: kind === 'wrong-field' ? 'read-back-differs' : 'answer-not-json', fields: kind === 'wrong-field' ? ['attributes.user_id'] : ['answer'] } }])
+    expect(d.elapsed()).toBe(0); expect(d.reads()).toBe(1)
+    expect(d.stage()).toBe('AI-AC11-case_01-native completion and answer oracle')
+    expect(JSON.stringify(d.records)).not.toContain('PRIVATE')
+  })
+  test.each(['answer', 'duplicate'] as const)('incomplete %s reaches the unchanged bound with the actual failing step', async kind => {
+    const rows = turn(); rows.pop()
+    const d = driver(kind, project(rows))
+    const step = kind === 'answer' ? 'native completion and answer oracle' : 'second actual exact DM take-in and completion'
+    await expect(d.run()).rejects.toThrow(`${step}: observation incomplete within bound`)
+    expect(d.elapsed()).toBe(180000)
+    expect(d.records).toEqual([{ label: 'bound', value: { step, milliseconds: 180000 } }])
+    expect(d.stage()).toBe(`${kind === 'answer' ? 'AI-AC11-case_01' : 'AI-AC106'}-${step}`)
+  })
+  test('AC106 completed take-in oracle rejection fails at once with safe names', async () => {
+    // The second window completes, but the first window cannot establish an
+    // independent take-in. AC106 checks receipts here, and checks JSON on its query.
+    const d = driver('duplicate', project(), { ...window, sentAt: 1001 })
+    await expect(d.run()).rejects.toThrow()
+    expect(d.records).toEqual([{ label: 'oracle', value: { case: 'AC106', reason: 'duplicate-takeins-differ', fields: ['takeins'] } }])
+    expect(d.elapsed()).toBe(0); expect(d.reads()).toBe(1)
+    expect(d.stage()).toBe('AI-AC106-second actual exact DM take-in and completion')
+  })
+  test('exact completed JSON still passes and records completion without a rejection', async () => {
+    const d = driver('answer', project())
+    await expect(d.run()).resolves.toHaveProperty('answer', JSON.stringify(expected))
+    expect(d.records.map(r => r.label)).toEqual(['rollout-model', 'completed-turn'])
+    expect(d.elapsed()).toBe(0)
+  })
+  test.each(['AC15', 'AC106'])('%s acknowledgement rejection retains its case without a case field in expected JSON', async label => {
+    const d = driver('answer', project(turn(window.text, { status: 'PRIVATE WRONG ACK' })), window, { status: 'received' }, `AI-${label}`)
+    await expect(d.run()).rejects.toThrow()
+    expect(d.records).toEqual([{ label: 'oracle', value: { case: label, reason: 'read-back-differs', fields: ['status'] } }])
+    expect(d.elapsed()).toBe(0)
+  })
+  test('AC106 completed wrong count answer fails immediately', async () => {
+    const d = driver('answer', project(turn(window.text, { case: 'AC106', messages: 2 })), window, { case: 'AC106', messages: 1 }, 'AI-AC106')
+    await expect(d.run()).rejects.toThrow()
+    expect(d.records).toEqual([{ label: 'oracle', value: { case: 'AC106', reason: 'read-back-differs', fields: ['messages'] } }])
+    expect(d.elapsed()).toBe(0); expect(d.reads()).toBe(1)
+    expect(d.stage()).toBe('AI-AC106-native completion and answer oracle')
+  })
+  test('invented answer keys and values never become diagnostic field names', async () => {
+    const answer = { ...expected, attributes: { ...expected.attributes, 'PRIVATE ATTRIBUTE KEY': 'PRIVATE ATTRIBUTE VALUE' }, 'PRIVATE ROOT KEY': 'PRIVATE ROOT VALUE' }
+    const d = driver('answer', project(turn(window.text, answer)))
+    await expect(d.run()).rejects.toThrow()
+    expect(d.records).toEqual([{ label: 'oracle', value: { case: 'case_01', reason: 'read-back-differs', fields: ['attributes'] } }])
+    expect(JSON.stringify(d.records)).not.toContain('PRIVATE')
+  })
+  test('Codex corpus prompt separates decoded attributes from byte-exact BODY', () => {
+    const source = readFileSync(new URL('./real-agent/codex-delivery.ts', import.meta.url), 'utf8')
+    const prompt = source.split('\n').find(line => line.includes('For each received tagged message return one JSON object'))!
+    expect(prompt).toContain('Return attribute values XML-decoded exactly once: &quot; becomes ", &lt; becomes <, &gt; becomes >, and &amp; becomes &.')
+    expect(prompt).toContain('Transcribe BODY byte-exact, preserving every character, whitespace and entity spelling')
+  })
+  for (const poll of ['answer', 'duplicate'] as const) {
+    test.each(['finishes', 'persists'] as const)(`round 3 ${poll}: partial trailing record %s`, async kind => {
+      const firstRows = turn(), firstData = project(firstRows)
+      const second = { ...window, offset: firstData.size, sentAt: 2000 }
+      const rows = poll === 'answer' ? firstRows : [...firstRows, ...turn(window.text, expected, 2001, 'second-turn')]
+      const records = [{ type: 'session_meta', payload: { id: session }, timestamp: new Date(0).toISOString() }, ...rows]
+      const tail = JSON.stringify({ type: 'event_msg', payload: { type: 'bookkeeping' }, timestamp: new Date(2009).toISOString() })
+      const bytes = Buffer.from(records.map(row => JSON.stringify(row) + '\n').join('') + tail)
+      const partial = projectCodexRollout(bytes, session)
+      const finished = projectCodexRollout(Buffer.concat([bytes, Buffer.from('\n')]), session)
+      expect(partial.incomplete).toBe(true); expect(finished.incomplete).toBe(false)
+      expect(() => evidence.completedCodexTurn(partial, poll === 'answer' ? window : second)).toThrow('invalid completion evidence window')
+      const d = driver(poll, kind === 'finishes' ? [partial, finished] : partial, window, expected, undefined, poll === 'duplicate' ? second : undefined)
+      if (kind === 'finishes') {
+        const result = await d.run()
+        if (poll === 'answer') expect((result as any).answer).toBe(JSON.stringify(expected))
+        expect(d.elapsed()).toBe(250); expect(d.reads()).toBe(2)
+        expect(d.records.map(r => r.label)).toEqual(poll === 'answer' ? ['rollout-model', 'completed-turn'] : [])
+      } else {
+        await expect(d.run()).rejects.toThrow('observation incomplete within bound')
+        expect(d.elapsed()).toBe(180000); expect(d.reads()).toBe(720)
+        expect(d.records).toEqual([{ label: 'bound', value: { step: poll === 'answer' ? 'native completion and answer oracle' : 'second actual exact DM take-in and completion', milliseconds: 180000 } }])
+      }
+    })
+    test.each(['refusal', 'refusal-block', 'classifier_stop', 'model_fallback', 'error', 'turn_aborted', 'wrong-model', 'missing-output', 'missing-completion-id'])(`round 2 ${poll}: terminal %s fails at once`, async kind => {
+      const rows = turn()
+      if (kind === 'wrong-model') rows[1]!.payload.model = 'PRIVATE-WRONG-MODEL'
+      else if (kind === 'missing-output') rows.splice(3, 1)
+      else if (kind === 'missing-completion-id') delete rows.at(-1)!.payload.turn_id
+      else if (kind === 'refusal-block') rows[3]!.payload.content = [{ type: 'refusal', refusal: 'PRIVATE NATIVE REFUSAL' }]
+      else {
+        if (kind === 'error' || kind === 'turn_aborted') rows.pop()
+        rows.splice(3, 0, { type: 'event_msg', timestamp: new Date(1002).toISOString(), payload: { type: kind, turn_id: 'synthetic-turn', message: 'PRIVATE NATIVE FAILURE' } })
+      }
+      const d = driver(poll, project(rows))
+      await expect(d.run()).rejects.toThrow()
+      const invalid = kind === 'missing-output' || kind === 'missing-completion-id'
+      const reason = kind === 'wrong-model' ? 'model-mismatch' : invalid ? 'native-turn-invalid' : 'native-turn-failed'
+      expect(d.records).toEqual([{ label: 'oracle', value: { case: poll === 'answer' ? 'case_01' : 'AC106', reason,
+        fields: [kind === 'wrong-model' ? 'model' : invalid ? 'completion' : 'turn'] } }])
+      expect(d.elapsed()).toBe(0); expect(d.reads()).toBe(1)
+      expect(d.stage()).toBe(poll === 'answer' ? 'AI-AC11-case_01-native completion and answer oracle' : 'AI-AC106-second actual exact DM take-in and completion')
+      expect(JSON.stringify(d.records)).not.toContain('PRIVATE')
+    })
+    test.each(['no-takein', 'no-terminal', 'foreign-terminal', 'fallback-without-terminal'])(`round 2 ${poll}: pending %s keeps its bound`, async kind => {
+      const rows = turn()
+      if (kind === 'no-takein') rows[2]!.payload.content[0].text = 'different input'
+      else if (kind === 'foreign-terminal') rows.at(-1)!.payload.turn_id = 'foreign-turn'
+      else rows.pop()
+      if (kind === 'fallback-without-terminal') rows.push({ type: 'event_msg', timestamp: new Date(1002).toISOString(), payload: { type: 'model_fallback', turn_id: 'synthetic-turn' } })
+      const d = driver(poll, project(rows))
+      await expect(d.run()).rejects.toThrow('observation incomplete within bound')
+      expect(d.elapsed()).toBe(180000)
+      expect(d.records.map(r => r.label)).toEqual(['bound'])
+    })
+  }
+})
+
+describe('round 2 Codex multipart through the real engine (synthetic; no native process)', () => {
+  test.each(['wrong-ack', 'incomplete'] as const)('%s escapes engine handling with the original part/check stage', async kind => {
+    const source = readFileSync(new URL('./real-agent/codex-delivery.ts', import.meta.url), 'utf8')
+    const extract = (name: string) => source.match(new RegExp(`^(?:async )?function ${name}[\\s\\S]*?^\\}`, 'm'))![0].replaceAll("await import('./codex-ai.ts')", 'deps.oracle')
+    const callback = source.slice(source.indexOf('    multipartSend = oracle.codexMultipartSender'), source.indexOf('\n    try {\n      stage = `${aiCase}-accept`'))
+    expect(callback).toContain('answers.push(await completedItem')
+    const send = source.slice(source.indexOf('    sendKeys: async (params: any) => {') + '    sendKeys: '.length, source.indexOf('\n    },\n  }),') + '\n    }'.length)
+    expect(send).toContain('multipartSend(params)')
+    let h!: EngineHarness, d!: { delivered(seq: number): Promise<unknown>; engineSend(params: any): Promise<unknown>; stage(): string }
+    const records: { label: string; value: any }[] = []
+    h = await makeEngineHarness({ configuredAgent: 'codex', clientFor: async key => ({
+      get: (params: any) => h.client(key).get(params), sendKeys: (params: any) => d.engineSend(params),
+    }) as any })
+    try {
+      h.p().row.agent = 'codex'; h.p().row.session_id = session
+      const item = await h.accept('multipart input', 'alpha', [window.text, 'second part', 'third part'])
+      const program = `
+        const { evidence, queue, engines, rollout, Date, Bun, record, client } = deps;
+        const oracle = deps.oracle, paths = { model: '${model}' }, key = 'alpha', AC15_CASE = 'AC15';
+        const answers = [], after = 0, body = 'multipart input';
+        let fatalOracle, aiCase = 'AI-AC15', stage = 'initial', multipartSend, crashBarrier = false;
+        ${['throwFatalOracle', 'latchFatalOracle'].filter(name => source.includes(`function ${name}(`)).map(extract).join('\n')}
+        ${['poll', 'completedItem', 'delivered'].map(extract).join('\n')}
+        ${callback}
+        return { delivered, engineSend: ${send}, stage: () => stage };
+      `
+      d = new Function('deps', new Bun.Transpiler({ loader: 'ts' }).transformSync(program))({
+        evidence, oracle, queue: h.queue, engines: h.engine, client: h.client(),
+        Date: { now: h.clock.now }, Bun: { sleep: (ms: number) => h.clock.advance(ms) },
+        record: (label: string, value: any) => { assertNoLeak(value); records.push({ label, value }) },
+        rollout: async () => {
+          const sent = h.queue.item('alpha', item.accepted.seq)!.records.find((r: any) => r.kind === 'sent') as any
+          const rows = turn(window.text, { status: 'PRIVATE WRONG ACK' }, sent.at + 1)
+          if (kind === 'incomplete') rows.pop()
+          // Preserve the production engine's captured transcript-size window.
+          const bytes = [{ type: 'session_meta', payload: { id: session, padding: ' '.repeat(sent.transcript_size) } }, ...rows]
+          return { data: projectCodexRollout(Buffer.from(bytes.map(row => JSON.stringify(row) + '\n').join('')), session) }
+        },
+      })
+      const started = h.clock.now()
+      await expect(d.delivered(item.accepted.seq)).rejects.toThrow(kind === 'wrong-ack' ? 'native JSON read-back differs' : 'native completion and answer oracle: observation incomplete within bound')
+      const elapsed = h.clock.now() - started
+      expect(kind === 'wrong-ack' ? elapsed < 1000 : elapsed >= 180000 && elapsed < 181000).toBe(true)
+      expect(d.stage()).toBe('AI-AC15-part-1-native completion and answer oracle')
+      expect(records.filter(r => r.label === 'oracle')).toEqual(kind === 'wrong-ack'
+        ? [{ label: 'oracle', value: { case: 'AC15', reason: 'read-back-differs', fields: ['status'] } }] : [])
+      expect(records.filter(r => r.label === 'bound').map(r => r.value.step)).toEqual(kind === 'incomplete' ? ['native completion and answer oracle'] : [])
+      const calls = h.keyCalls().length
+      await expect(d.engineSend({ text: 'later harness send', no_enter: true })).rejects.toThrow()
+      expect(h.keyCalls()).toHaveLength(calls)
+      await h.advance(20000)
+      expect(h.keyCalls()).toHaveLength(calls)
+      expect(h.textCalls()).toHaveLength(1)
+      expect(records.filter(r => r.label === 'oracle')).toHaveLength(kind === 'wrong-ack' ? 1 : 0)
+      assertNoLeak(records)
+    } finally { await h.cleanup() }
+  })
+})
 
 describe('Codex private AI inputs', () => {
   test('retains all fifteen audited cases, including the original spoof', () => {

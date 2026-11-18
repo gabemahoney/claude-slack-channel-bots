@@ -86,6 +86,44 @@ export function completedCodexTurn(rollout: CodexRollout, window: CodexWindow) {
     tokens: turn.filter(r => r.usage && r.offset > receipt.offset && r.offset <= completion.offset).at(-1)?.usage }
 }
 
+/** A terminal marker establishes failure finality, never acceptance. Bind it to
+ * the exact post-send receipt and its own started turn, stopping at the next
+ * input/start. Unlabelled markers belong only to that bounded interval and
+ * cannot supply the identity required for successful completion. */
+function terminalCodexTurn(rollout: CodexRollout, window: CodexWindow) {
+  if (rollout.session !== window.session || !Number.isSafeInteger(window.offset) || window.offset < 0 || window.offset > rollout.size || !Number.isFinite(window.sentAt)) return
+  const after = rollout.records.filter(r => r.offset >= window.offset)
+  const receiptIndex = after.findIndex(r => r.type === 'response_item' && r.role === 'user' && r.text === window.text && r.at !== undefined && r.at >= window.sentAt)
+  if (receiptIndex < 0) return
+  const startIndex = after.slice(0, receiptIndex).map(r => r.type === 'event_msg' && r.kind === 'task_started').lastIndexOf(true)
+  const start = after[startIndex]
+  if (!start?.turn || start.at === undefined || start.at < window.sentAt) return
+  const next = after.findIndex((r, i) => i > receiptIndex && (r.type === 'response_item' && r.role === 'user' || r.type === 'event_msg' && r.kind === 'task_started'))
+  const turn = after.slice(startIndex, next < 0 ? undefined : next)
+  const terminal = turn.some(r => r.offset > after[receiptIndex]!.offset && r.type === 'event_msg'
+    && ['task_complete', 'error', 'turn_aborted'].includes(r.kind) && (r.turn === undefined || r.turn === start.turn))
+  return terminal ? turn : undefined
+}
+
+/** Undefined means pending. Every established terminal rejection is fatal;
+ * successful evidence still passes every assertion in completedCodexTurn. */
+export function observeCodexTurn(rollout: CodexRollout, window: CodexWindow) {
+  // The next read may finish the trailing JSONL append. Even an earlier own
+  // terminal marker cannot make this partial snapshot final evidence.
+  if (rollout.incomplete) return
+  try { return completedCodexTurn(rollout, window) }
+  catch {
+    const turn = terminalCodexTurn(rollout, window)
+    if (!turn) return
+    const modelMismatch = turn.some(r => r.type === 'turn_context' && r.model !== undefined && r.model !== window.model)
+    const failed = turn.some(r => r.failed)
+    throw Object.assign(new Error('native terminal turn rejected'), {
+      reason: modelMismatch ? 'model-mismatch' : failed ? 'native-turn-failed' : 'native-turn-invalid',
+      fields: [modelMismatch ? 'model' : failed ? 'turn' : 'completion'],
+    })
+  }
+}
+
 export function safeCodexEvents(rollout: CodexRollout) {
   return rollout.records.map(({ offset, end, at, type, kind, session, turn, model, role, usage }) => ({ offset, end, at, type, kind, session, turn, model, role, usage }))
 }

@@ -16,6 +16,52 @@ const session = 'synthetic-session', model = 'synthetic/model', text = 'syntheti
 const hostProjection = encodeCodexHostConfigKeys([['model']])
 const nativeConfig = '[tui]\nscreen_reader_detection_done = true\n'
 
+describe('round 3 Codex cleanup after a fatal scenario (synthetic; no native process)', () => {
+  test.each(['ended', 'missing', 'sweep-failure', 'still-live'])('%s retirement verifies independently and retains the first scenario error', async outcome => {
+    const source = readFileSync(join(import.meta.dir, 'real-agent/codex-delivery.ts'), 'utf8')
+    const extract = (name: string) => source.match(new RegExp(`^(?:async )?function ${name}[\\s\\S]*?^\\}`, 'm'))![0]
+    const failureStage = 'AI-AC15-part-1-native completion and answer oracle'
+    let at = 0
+    const calls: string[] = [], records: { label: string; value: any }[] = []
+    const firstError = new Error('synthetic scenario rejection'), cleanupError = new Error('synthetic cleanup sweep failure')
+    const client = makeStubClient({ killFn: () => { calls.push('kill'); return undefined },
+      findMissingFn: () => { calls.push('sweep'); if (outcome === 'sweep-failure') throw cleanupError; return undefined },
+      getFn: () => { calls.push('get'); return cannedGetResult({ instance_id: 'synthetic', state: outcome === 'still-live' ? 'waiting' : outcome as 'ended' | 'missing' }) },
+    })
+    const program = `
+      const { client, codexRetirementCheckpoint, Date, Bun, record } = deps;
+      let stage = '${failureStage}', aiCase = 'AI-AC15-part-1', fatalOracle;
+      ${['throwFatalOracle', 'latchFatalOracle', 'poll', 'retired'].map(extract).join('\n')}
+      return { latch: latchFatalOracle, stage: () => stage,
+        cleanup: async () => { await client.kill({ instance_id: 'synthetic' }); return retired('synthetic') },
+        scenario: () => poll('later scenario step', async () => true) };
+    `
+    const d = new Function('deps', new Bun.Transpiler({ loader: 'ts' }).transformSync(program))({
+      client, codexRetirementCheckpoint, Date: { now: () => at }, Bun: { sleep: async (ms: number) => { at += ms } },
+      record: (label: string, value: any) => { assertNoLeak(value); records.push({ label, value }) },
+    }) as { latch(error: Error): never; stage(): string; cleanup(): Promise<boolean>; scenario(): Promise<boolean> }
+    expect(() => d.latch(firstError)).toThrow(firstError.message)
+    if (outcome === 'sweep-failure') {
+      await expect(d.cleanup()).rejects.toBe(cleanupError)
+      expect(calls).toEqual(['kill', 'sweep']); expect(at).toBe(0); expect(records).toEqual([])
+    } else if (outcome === 'still-live') {
+      await expect(d.cleanup()).rejects.toThrow('row retirement: observation incomplete within bound')
+      expect(at).toBe(30000)
+      expect(calls.filter(call => call === 'sweep')).toHaveLength(120)
+      expect(calls.filter(call => call === 'get')).toHaveLength(120)
+      expect(records).toEqual([{ label: 'bound', value: { step: 'row retirement', milliseconds: 30000 } }])
+    } else {
+      await expect(d.cleanup()).resolves.toBe(true)
+      expect(calls).toEqual(['kill', 'sweep', 'get']); expect(at).toBe(0); expect(records).toEqual([])
+    }
+    expect(d.stage()).toBe(failureStage)
+    const priorCalls = [...calls]
+    await expect(d.scenario()).rejects.toBe(firstError)
+    expect(d.stage()).toBe(failureStage); expect(calls).toEqual(priorCalls)
+    assertNoLeak({ calls, records })
+  })
+})
+
 describe('Codex driver late AD readiness (synthetic; no native process)', () => {
   function driver(observations: Record<string, unknown>[]) {
     // Execute the actual poll, identity guard, launch and AI begin closure.
@@ -37,7 +83,8 @@ describe('Codex driver late AD readiness (synthetic; no native process)', () => 
     } })
     const program = `
       const { client, join, codexArguments, CODEX_NATIVE, Date, Bun, record, authContract, buildEngine } = deps;
-      let instance, stage, lastKey, engines;
+      let instance, stage, lastKey, engines, aiCase, fatalOracle;
+      ${['throwFatalOracle', 'latchFatalOracle'].map(name => source.match(new RegExp(`^function ${name}[\\s\\S]*?^\\}`, 'm'))![0]).join('\n')}
       const work = '/synthetic/work', codexHome = '/synthetic/home', key = 'synthetic';
       const sessions = new Set(), liveInstances = new Set(), paths = { model: 'synthetic/model' };
       const tagDescription = 'synthetic instructions', queue = { items: () => [{ accepted: { seq: 7 } }] };
@@ -255,7 +302,7 @@ describe('D1 crash-worker checkpoints and durable-pair boundary (synthetic; no n
       const result = new Promise((yes, no) => { resolve = yes; reject = no })
       const program = [
         `let crashProgress = ${JSON.stringify(progress())};`,
-        "let stage = 'prepare', crashBarrier = true, multipartSend, engines, preparation, queue, lifecycle;",
+        "let stage = 'prepare', crashBarrier = true, multipartSend, engines, preparation, queue, lifecycle, fatalOracle;",
         "const process = { argv: ['bun', 'driver', 'crash-worker'] };",
         'const key = "synthetic", userNames = new Map(), channelNames = new Map();',
         'const instance = "cscb_codex_gate", work = stateDir;',
@@ -263,7 +310,7 @@ describe('D1 crash-worker checkpoints and durable-pair boundary (synthetic; no n
         'const engineModule = { createDeliveryLifecycle: () => ({}), createDeliveryEngines: options => { captured.options = options; return {}; } };',
         'const intakeModule = { createDeliveryPreparation: () => ({ recover: async () => {} }) };',
         'const receivedItem = () => {}, engineEvent = () => {}, log = text => captured.log.push(text);',
-        extract('crashCheckpoint'), extract('crashError'), extract('buildEngine'),
+        extract('throwFatalOracle'), extract('crashCheckpoint'), extract('crashError'), extract('buildEngine'),
         'return { buildEngine, stage: () => stage };',
       ].join('\n')
       const driver = new Function('stateDir', 'crashProtocol', 'join', 'client', 'transport', 'randomBytes', 'captured',
