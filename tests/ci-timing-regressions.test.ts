@@ -26,7 +26,7 @@ import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVer
   type SharedListEvidence, type PendingProbe, type AccountedEvent, type LookupProbe,
   burstAckVerdicts, pendingBurstVerdict, type BurstItem, type PendingWindow,
   SR8_DIAGNOSTIC_KINDS, SR8_USER_HZ, cgroupCpuCounters, procCpuTicks, phasePids, phaseCpuSample, phaseCpuResults, ackClockSamples, ackClockResults,
-  ackBinResults, ackEventResults, serverWaves, serverPhase, appendResults, saveResults, observeResults, type PhaseCpuSample, type ClockSample,
+  ackBinResults, ackEventResults, serverWaves, serverPhase, appendResults, saveResults, observeResults, membershipAckDiagnostics, type PhaseCpuSample, type ClockSample,
   SR8_SERVER_CPUS, SR8_GUARDED_CGROUP_FILES, cgroupPathOf, cgroupChain, cpuMaxCpus, driverCpuVerdict, guardedCgroups, cgroupWriteAccess, cgroupOpenFailure,
   type CgroupWriteAccess, type CgroupOpenOutcome,
 } from './integration/fixtures/sr8-evidence.ts'
@@ -1651,7 +1651,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       .toEqual({ status: 0, stdout: 'recorded: sr8 seal verdict=pass\nafter\n', stderr: '' })
     // Every verdict command goes through it; setup and observation commands do not.
     const direct = [...load.matchAll(/bun "\$\{E\}" ([a-z-]+)/g)].map(m => m[1]).sort()
-    expect([...new Set(direct)]).toEqual(['bodies', 'burst', 'conditions', 'config', 'cpu-mark', 'envelope-times', 'fault-burst', 'fault-ids', 'fault-plan', 'fault-recover', 'plan', 'seed'])
+    expect([...new Set(direct)]).toEqual(['bodies', 'burst', 'conditions', 'config', 'cpu-mark', 'diag-ack', 'envelope-times', 'fault-burst', 'fault-ids', 'fault-plan', 'fault-recover', 'plan', 'seed'])
   })
   test('test-45/48 reopen observer prints AD rows, lifecycle, stub hook and MCP session fields only on a reopen failure', () => {
     const load = source('lib/membership-load.sh'), safe = load.match(/^REOPEN_SAFE='[\s\S]*?;'$/m)![0]
@@ -3124,6 +3124,40 @@ describe('test-44 latency observation collectors (synthetic rows, no runtime cla
     ]
   }
   const rows = () => observedServerRows().map(l => JSON.parse(l))
+  test('membership ACK diagnostics correlate independent clocks and durable targets without changing N1', () => {
+    const server = rows()
+    server.find(r => r.kind === 'ack' && r.ts === ts(2) && r.keys[0] === 'alpha').targets = [{ key: 'alpha', seq: 2 }]
+    const diagnostics = membershipAckDiagnostics(items, times, server, percentile)
+    const own = diagnostics.filter(r => r.stats.persona === 'alpha')
+    expect(own[0].stats).toMatchObject({ diagnostic: 'ack-summary', stub_max_ms: 2000, server_max_ms: 1500,
+      receive_to_store_max_ms: 10, store_to_ack_max_ms: 80, ack_call_max_ms: 2 })
+    expect(own[1].stats).toMatchObject({ diagnostic: 'ack-slow', rank: 1, envelope: 'r2-a', stub_ms: 2000, server_ms: 1500,
+      gap_ms: 500, stub_sent_mono_ms: 1001, stub_ack_mono_ms: 3001, server_received_mono_ms: 11000,
+      server_ack_return_mono_ms: 12500, receive_to_store_ms: 'none', store_to_ack_ms: 'none' })
+    expect(own[2].stats).toMatchObject({ envelope: 'r1-a', receive_to_store_ms: 10, store_to_ack_ms: 80, ack_call_ms: 2 })
+    const beta = diagnostics.filter(r => r.stats.persona === 'beta')
+    expect(beta[0].stats).toMatchObject({ server_events: 0, server_ambiguous: 1, server_max_ms: 'none' })
+    expect(beta[1].stats).toMatchObject({ server: 'ambiguous', server_ms: 'none', stub_ms: 500 })
+    expect(diagnostics.every(r => r.verdict === 'recorded' && r.limit === 'none')).toBe(true)
+    expect(diagnostics.map(r => resultLine({ scenario: 'test-56', mode: 'strict', population: 100000, recipients: 2 }, r))
+      .every(l => l.startsWith('recorded: sr8 diag '))).toBe(true)
+    expect(ackVerdict('n1', ['too-slow'], [stub('too-slow', 1, 3002)]).verdict).toBe('fail')
+    expect(SR8_ACK_LIMIT_MS).toBe(3000)
+  })
+  test('membership ACK diagnostics bound output per persona, retain missing samples, and omit unsafe identities', () => {
+    const ev = Array.from({ length: 9 }, (_, i) => ({ ...items[1], envelope_id: `e-${i}`, ts: ts(i) }))
+    const diagnostics = membershipAckDiagnostics(ev, ev.map((i, n) => stub(i.envelope_id, n, 100 + 2 * n)), [], percentile)
+    expect(diagnostics).toHaveLength(6)
+    expect(diagnostics[0].stats).toMatchObject({ stub_events: 9, server_missing: 9, server_max_ms: 'none' })
+    expect(diagnostics.slice(1).map(r => r.stats.envelope)).toEqual(['e-8', 'e-7', 'e-6', 'e-5', 'e-4'])
+    const unacked = membershipAckDiagnostics([items[1]], [{ ...times[1], acks: [] }], [], percentile)
+    expect(unacked).toHaveLength(1)
+    expect(unacked[0].stats).toMatchObject({ stub_events: 0, server_events: 0, stub_max_ms: 'none' })
+    const unsafe = membershipAckDiagnostics([{ ...items[1], key: 'bad\nkey', envelope_id: 'bad\nid', phase: 'bad\nphase' }],
+      [stub('bad\nid', 0, 1)], [], percentile)
+    expect(unsafe[1].stats).toMatchObject({ persona: 'missing', envelope: 'missing', phase: 'missing' })
+    expect(membershipAckDiagnostics([], [], [], percentile)).toEqual([])
+  })
   const none3 = (prefix: string) => `${prefix}_p50_ms=none ${prefix}_p99_ms=none ${prefix}_max_ms=none`
   test('both ACK clocks match per event by key and Slack ts, with the server receipt rebuilt from its own row; every ledger item is kept', () => {
     const samples = ackClockSamples(items, times, rows())
@@ -4257,7 +4291,35 @@ globalThis.fetch = async (_url, init) => {
   return Response.json({ok:true,envelope_id:id});
 };
 `))
-  test('config adds the diagnostic timing switch only for its timings opt-in, which only test-44\'s diagnostic burst case passes', () => withCLI(root => {
+  test('membership diagnostics CLI reads original fault identities or undurable burst identities, after the measurement mark', () => withCLI((root, cli) => {
+    const keys = sr8Personas(2), dir = join(root, 'observations'), file = join(root, 'measurements')
+    mkdirSync(dir)
+    const item = { key: keys[1], phase: 'roots', channel: 'CONE', ts: '1700000000.000001', sender: 'UHUMAN', ordinal: 0, dependent: false, root: '-' }
+    const timed = { envelope_id: 'original', push: { sent_mono_ms: 10, connection_id: 'c' }, acks: [{ ack_mono_ms: 3011, connection_id: 'c' }] }
+    writeFileSync(join(dir, 'times.jsonl'), JSON.stringify(timed) + '\n')
+    const ack = JSON.stringify({ kind: 'ack', keys: [keys[1]], ts: item.ts, targets: [], outcome: 'acked', receive_to_ack_ms: 5, ack_call_ms: 1, at_mono_ms: 10006 }) + '\n'
+    writeFileSync(file, ack + ack)
+    const plan = join(dir, 'fault-plan.json')
+    writeFileSync(plan, JSON.stringify({ context: { scenario: 'test-fault', mode: 'strict', population: 0, recipients: 2 },
+      plan: { kind: 'lookup', key: keys[0], keys, all: false, channels: [], items: [item] } }))
+    writeFileSync(join(dir, 'fault-ledger.jsonl'), [
+      { ordinal: 0, stage: 'original', envelope_id: 'original' }, { ordinal: 0, stage: 'replay', envelope_id: 'replay' },
+    ].map(r => JSON.stringify(r) + '\n').join(''))
+    const fault = cli('diag-ack', [dir, file, String(Buffer.byteLength(ack))])
+    expect(fault.status).toBe(0); expect(fault.stderr).toBe('')
+    expect(String(fault.stdout)).toContain('envelope=original phase=roots stub=acked stub_ms=3001 server=acked server_ms=5 gap_ms=2996')
+    expect(String(fault.stdout)).not.toContain('envelope=replay')
+    // Same diagnostic command serves the undurable case's ordinary burst ledger.
+    rmSync(plan)
+    writeFileSync(join(dir, 'burst.jsonl'), JSON.stringify({ ...item, envelope_id: 'original' }) + '\n')
+    const ordinary = cli('diag-ack', [dir, file, String(Buffer.byteLength(ack))])
+    expect(ordinary.status).toBe(0); expect(ordinary.stdout).toBe(fault.stdout)
+    expect(String(ordinary.stdout).trim().split('\n').every(l => l.startsWith('recorded: sr8 diag ') && l.endsWith('limit=none verdict=recorded'))).toBe(true)
+    const absent = cli('diag-ack', [join(root, 'absent'), file, '0'])
+    expect(absent.status).toBe(0); expect(absent.stderr).toBe('')
+    expect(String(absent.stdout)).toContain('diagnostic=ack-unavailable limit=none verdict=recorded')
+  }))
+  test('config adds the diagnostic timing switch only for its timings opt-in, used by test-44 diagnostics and membership-load', () => withCLI(root => {
     const dir = join(root, 'tests/integration/fixtures')
     writeFileSync(join(dir, 'fmk-texts.ts'), `console.log(${JSON.stringify({ TEST_MEASUREMENTS_KEY, TEST_MEASUREMENT_TIMINGS_KEY,
       testTimerOverridesBlock: '{"queue_compact_interval_ms":250}' })}[process.argv[2]]);`)
@@ -4269,11 +4331,10 @@ globalThis.fetch = async (_url, init) => {
     expect(off[TEST_MEASUREMENTS_KEY]).toBe(true); expect(Object.hasOwn(off, TEST_MEASUREMENT_TIMINGS_KEY)).toBe(false)
     expect(on).toEqual({ ...off, [TEST_MEASUREMENT_TIMINGS_KEY]: true })
     expect(config('other').status).not.toBe(0); expect(config('timings', 'timings').status).not.toBe(0)
-    // The other scripts reach config through shared libs with six arguments;
-    // only test-44's diagnostic burst case adds the opt-in. Executable switch
+    // Membership-load always records both clocks; test-44 remains opt-in. Executable switch
     // controls live with the profile lifecycle controls in cpu-profile.test.ts.
     const shells = (readdirSync(integration, { recursive: true }) as string[]).filter(f => f.endsWith('.sh'))
-    expect(shells.filter(f => /\(timings\)|\bconfig\b.*\btimings\b/.test(source(f)))).toEqual(['test-44-fmk-thread-burst.sh'])
+    expect(shells.filter(f => /\(timings\)|\bconfig\b.*\btimings\b/.test(source(f))).sort()).toEqual(['lib/membership-load.sh', 'test-44-fmk-thread-burst.sh'])
     expect(source('test-44-fmk-thread-burst.sh')).toContain('if [[ "${CSCB_TEST_DIAGNOSTICS:-}" == 1 && "${CASE}" == burst ]]; then\n    # The server\'s diagnostic ack/append/save rows, read only by observe below.\n    config_args+=(timings)\nfi\nbun "${SR8}" config "${config_args[@]}" | write_config\n')
   }))
 })

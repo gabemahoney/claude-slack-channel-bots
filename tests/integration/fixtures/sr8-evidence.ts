@@ -21,7 +21,7 @@
  *     Whole config; credentials root/<key>.env, work root/<key>. Pipe to write_config.
  *     Compact-ms is a test override, printed/validated by fmk-texts, never a limit.
  *     `timings` adds the server's diagnostic timing switch beside test_measurements;
- *     only test-44's burst case passes it, because its rows add server work.
+ *     test-44's diagnostic burst and membership-load pass it. Its rows add server work.
  *   seed <config-path> <state-dir> <population>
  *     STOPPED server only, BEFORE its first start. If absent, creates the matching
  *     config.json.last-applied using initialSharedChannelState/serializeSharedChannelState.
@@ -184,6 +184,14 @@
  *     their paths a write-only open reached, and how many it could not probe;
  *     missing unless driverCpuVerdict passes every run and every present file
  *     was refused.
+ *   diag-ack C <burst-dir> <measurement-file> <byte-mark>
+ *     Membership-load observation only, always exit 0 on readable inputs. Reads
+ *     original fault-plan/ledger identities (or undurable's burst.jsonl), times.jsonl
+ *     and the drained measurement file. Prints per-persona both-clock maxima and
+ *     five slowest stub samples with envelope IDs, local monotonic timestamps,
+ *     ACK-call time and receive-to-store/store-to-ACK splits where uniquely matched.
+ *     Replayed Slack timestamps make server matching ambiguous, never zero latency.
+ *     Every line starts `recorded: sr8 diag `; no summary or numeric verdict.
  *   observe C <burst-dir> <measurement-file> <byte-mark> <phase-cpu-file>
  *     Test-44's latency observation, never a verdict: exits 0 and prints no summary.
  *     The phase-cpu file is what burst appends when SR8_PHASE_CPU_FILE names it
@@ -2589,6 +2597,78 @@ async function observe(args: string[]): Promise<Result[]> {
   return observeResults({ rows: integer(numeric(mark)) ? jsonl(file, Number(mark), true) : undefined, items: records(items) ? items : undefined,
     times: timingRows(join(dir, 'times.jsonl')), cpu: cpu?.every(phaseCpuRow) ? cpu : undefined }, percentile)
 }
+
+/** Bounded membership-load diagnostics. Only durations cross process clocks;
+ * receive_to_ack ends at the ACK call, while server_ack_return includes it.
+ * Server matches require a unique persona/Slack-ts row, including on replay. */
+function membershipAckSamples(items: BurstItem[], times: Times[], rows: any[]) {
+  const samples = ackClockSamples(items, times, rows)
+  const stores = new Map<string, any[]>(), acks = new Map<string, any[]>()
+  for (const r of rows) {
+    if (r?.kind === 'store' && ACCEPTANCE_STORES.includes(r.store) && nonnegative(r.at_mono_ms)) {
+      const id = identity(r); stores.set(id, [...stores.get(id) ?? [], r])
+    }
+    if (ackRow(r)) for (const key of r.keys) {
+      const id = `${key}\t${r.ts}`; acks.set(id, [...acks.get(id) ?? [], r])
+    }
+  }
+  return samples.map((s, n) => {
+    const item = items[n], matches = acks.get(`${s.key}\t${item.ts}`) ?? [], ack = matches.length === 1 ? matches[0] : undefined
+    const targets = Array.isArray(ack?.targets) ? ack.targets : []
+    const own = targets.filter((t: any) => t.key === s.key).map((t: any) => stores.get(identity(t)))
+    const stored = own.length && own.every((r: any[] | undefined) => r?.length === 1) ? maximum(own.map((r: any[]) => r[0].at_mono_ms)) : undefined
+    const before = stored !== undefined && s.received !== undefined ? stored - s.received : undefined
+    const after = before !== undefined && s.server !== undefined ? s.server - before : undefined
+    return { ...s, envelope: item.envelope_id, ackCall: ack?.ack_call_ms,
+      before: nonnegative(before) && nonnegative(after) ? before : undefined,
+      after: nonnegative(before) && nonnegative(after) ? after : undefined }
+  })
+}
+/** Persona summaries and five slowest stub samples, never a verdict. */
+export function membershipAckDiagnostics(items: BurstItem[], times: Times[], rows: any[], percentile: Percentile): Result[] {
+  const enriched = membershipAckSamples(items, times, rows)
+  const ms = (n: number | undefined) => n === undefined ? 'none' : round3(n)
+  const word = (s: string | undefined) => s !== undefined && /^[a-zA-Z0-9_-]{1,200}$/.test(s) ? s : 'missing'
+  return [...new Set(items.map(i => i.key))].flatMap(key => {
+    const own = enriched.filter(s => s.key === key), matched = own.filter(s => s.stub !== undefined && s.server !== undefined)
+    const count = (status: ServerAckStatus) => own.filter(s => s.server_status === status).length
+    return [result('diag', own.length, { diagnostic: 'ack-summary', persona: word(key),
+      stub_events: own.filter(s => s.stub !== undefined).length, server_events: own.filter(s => s.server !== undefined).length,
+      stub_missing: own.filter(s => s.stub_status === 'missing').length, stub_unacked: own.filter(s => s.stub_status === 'unacked').length,
+      stub_ambiguous: own.filter(s => s.stub_status === 'ambiguous').length,
+      matched: matched.length, server_missing: count('missing'), server_ambiguous: count('ambiguous'),
+      suppressed: count('suppressed'), ack_failed: count('ack-failed'),
+      ...spread('stub', own.flatMap(s => s.stub ?? []), percentile), ...spread('server', own.flatMap(s => s.server ?? []), percentile),
+      ...spread('gap', matched.map(s => s.stub! - s.server!), percentile),
+      ...spread('receive_to_store', own.flatMap(s => s.before ?? []), percentile),
+      ...spread('store_to_ack', own.flatMap(s => s.after ?? []), percentile),
+      ...spread('ack_call', own.flatMap(s => s.ackCall ?? []), percentile) }, 'none', 'recorded'),
+    ...own.filter(s => s.stub !== undefined).sort((a, b) => b.stub! - a.stub!).slice(0, 5).map((s, n) => result('diag', 1,
+      { diagnostic: 'ack-slow', persona: word(key), rank: n + 1, envelope: word(s.envelope), phase: word(s.phase),
+        stub: s.stub_status, stub_ms: ms(s.stub), server: s.server_status, server_ms: ms(s.server),
+        gap_ms: s.stub !== undefined && s.server !== undefined ? ms(s.stub - s.server) : 'none',
+        stub_sent_mono_ms: ms(s.sent), stub_ack_mono_ms: s.sent !== undefined && s.stub !== undefined ? ms(s.sent + s.stub) : 'none',
+        server_received_mono_ms: ms(s.received), server_ack_return_mono_ms: ms(s.acked), ack_call_ms: ms(s.ackCall),
+        receive_to_store_ms: ms(s.before), store_to_ack_ms: ms(s.after) }, 'none', 'recorded'))]
+  })
+}
+
+async function membershipAckObservation(c: Context, args: string[]): Promise<Result[]> {
+  countArgs(args, 3)
+  const [dir, file, mark] = args, { percentile } = await import('./transcript-receipts.ts')
+  let items: BurstItem[] | undefined
+  if (existsSync(join(dir, 'fault-plan.json'))) {
+    const plan = await readFaultPlan(dir, c), ledger = evidenceRows(join(dir, 'fault-ledger.jsonl')) as FaultPush[] | undefined
+    if (!ledger) throw new Error('missing ledger')
+    items = plan.items.map(i => {
+      const original = ledger.filter(l => l.ordinal === i.ordinal && l.stage === 'original')
+      return { ...i, envelope_id: original.length === 1 ? original[0].envelope_id : undefined }
+    })
+  } else items = jsonl(join(dir, 'burst.jsonl'))
+  const rows = integer(numeric(mark)) ? jsonl(file, Number(mark), true) : undefined, times = timingRows(join(dir, 'times.jsonl'))
+  if (!items || !rows || !times) throw new Error('missing diagnostic inputs')
+  return membershipAckDiagnostics(items, times, rows, percentile)
+}
 /** The cgroup v2 namespace root's mount. */
 const CGROUP_ROOT = '/sys/fs/cgroup'
 /** A cgroup v2 file of the cgroup at `path` below the namespace root. */
@@ -2673,6 +2753,11 @@ async function main(args: string[]): Promise<number> {
   if (command === 'windows') return printResults(c, await windows(c, args))
   if (command === 'concurrent-overlap') return printResults(c, concurrentOverlap(c, args))
   if (command === 'observe') { for (const r of await observe(args)) console.log(resultLine(c, r)); return 0 }
+  if (command === 'diag-ack') {
+    try { for (const r of await membershipAckObservation(c, args)) console.log(resultLine(c, r)) }
+    catch { console.log(resultLine(c, result('diag', 0, { diagnostic: 'ack-unavailable' }, 'none', 'recorded'))) }
+    return 0
+  }
   const extra = await additional(command!, c, args)
   if (extra) return printResults(c, extra)
   throw new Error('usage')

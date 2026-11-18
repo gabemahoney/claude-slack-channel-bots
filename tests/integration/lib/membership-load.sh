@@ -484,7 +484,8 @@ run_membership_load() {
         bun "${E}" cpu-mark "${ROOT}/cpu.before" || :
         new_state_dir "${MODE}-${CASE_KIND}"
         CONFIG="${SLACK_STATE_DIR}/config.json"
-        bun "${E}" config "${MODE}" 100000 2 "${ROOT}" "${SCENARIO_PORT}" "${COMPACT_MS}" | write_config
+        # Diagnostic observers add buffered ACK/append/save rows, never verdicts.
+        bun "${E}" config "${MODE}" 100000 2 "${ROOT}" "${SCENARIO_PORT}" "${COMPACT_MS}" timings | write_config
         mapfile -t KEYS < <(jq -er '.personas[].name' "${CONFIG}")
         [[ "${#KEYS[@]}" == 2 ]] || fail 'population config lacks two personas'
         P="${KEYS[0]}"
@@ -721,6 +722,10 @@ PY
         # Real traffic has stored and been drained by now: absence is a failure.
         regular_measurements || fail 'test-only measurement file missing after measured traffic'
         cp "${MEASUREMENTS}" "${OUT}/measurements.jsonl"
+        # The recorder is drained and both clocks are frozen. Print before any
+        # later verdict can stop the case; diagnostic failure only adds output.
+        bun "${E}" diag-ack "${C[@]}" "${OUT}" "${OUT}/measurements.jsonl" "${MEASURE_MARK}" \
+            || printf 'recorded: sr8 diag diagnostic=ack-unavailable\n'
         REOPEN_LOG="$(byte_mark "${SLACK_STATE_DIR}/server.log")"
         start_ready
         verdict seal measured "${C[@]}" "${SLACK_STATE_DIR}/server.log" "${REOPEN_LOG}" "${CONFIG}"

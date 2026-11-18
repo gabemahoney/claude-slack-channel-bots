@@ -1014,6 +1014,21 @@ server's `at_mono_ms`, and stores carry their duration. The scenario enables
 it with `test_measurements: true` in `config.json`; clean shutdown awaits its
 drain before the final read.
 
+Membership-load cases also enable `test_measurement_timings: true` and print
+`recorded: sr8 diag` lines before the post-restart verdicts. `diagnostic=ack-summary`
+gives each persona's stub push-to-ACK and server receive-to-ACK maxima;
+`diagnostic=ack-slow` correlates its five slowest stub samples by envelope ID,
+with both intervals, process-local timestamps, ACK-call duration, and
+receive-to-store/store-to-ACK splits where the durable target is uniquely matched.
+The server interval ends at the ACK call; its return timestamp includes the call.
+Compare durations across processes, never their monotonic timestamps. `gap_ms`
+also includes delivery/dispatch before routing and ACK transport/observation;
+it does not by itself prove stub scheduling delay. Replayed timestamps may give
+`server=ambiguous`; absent observations print `none` or `ack-unavailable`.
+These lines supply no verdict or allowance. Timing observers add clock reads,
+record construction, buffering and periodic file writes to the measured process,
+so diagnostic runs include that instrumentation cost.
+
 A restart resolution without `held_ms` supplies
 no timing sample.
 
