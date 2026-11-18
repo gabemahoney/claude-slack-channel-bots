@@ -52,7 +52,7 @@ A reply or reaction before delivery suppresses later stages: early answers are r
 
 Runtime options are read from environment variables. None of them is required. Slack tokens come only from each persona's credentials file (see [Credentials files](configuration.md#credentials-files)). Set runtime options in your shell profile; Bun can also load `.env` files from the working directory.
 
-CSCB removes its own Slack credential variables (names matching `SLACK_*TOKEN` or `SLACK_*SECRET`, case-insensitively) from child environments, including agent-director calls and any tmux server they start. The same rule covers variables Bun loads from `.env` files. Its internal daemon marker goes only to the daemon child and is removed after its startup check. All other host environment variables pass through; the operator controls which host secrets their shells and bots receive.
+CSCB removes its own Slack credential variables (names matching `SLACK_*TOKEN` or `SLACK_*SECRET`, case-insensitively) from child environments, including agent-director calls and any tmux server they start. The same rule covers variables Bun loads from `.env` files. CSCB also always removes inherited `AGENT_DIRECTOR_INSTANCE_ID` from its own process and child environments, so launches and resumes do not parent personas to the session that started CSCB. Its internal daemon marker goes only to the daemon child and is removed after its startup check. Apart from these exclusions and the marker rule, ordinary host environment variables pass through; the operator controls which host secrets their shells and bots receive.
 
 | Variable | Description |
 |---|---|

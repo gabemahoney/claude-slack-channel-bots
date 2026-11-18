@@ -2145,12 +2145,13 @@ describe('b.c13 CLI child environments', () => {
   let redirectedLogs: string[]
   let redirectedErrorArgs: unknown[][]
   beforeEach(() => {
-    saved = Object.fromEntries([...names, 'GH_TOKEN'].map(name => [name, process.env[name]]))
+    saved = Object.fromEntries([...names, 'GH_TOKEN', 'AGENT_DIRECTOR_INSTANCE_ID'].map(name => [name, process.env[name]]))
     credentialValue = fakeToken(BOT_TOKEN_PREFIX)
     redirectedLogs = []
     redirectedErrorArgs = []
     for (const name of names) process.env[name] = credentialValue
     process.env.GH_TOKEN = 'fake-not-a-token'
+    process.env.AGENT_DIRECTOR_INSTANCE_ID = 'cscb_starter'
   })
 
   // A finally block runs before the file's afterEach restores spies/removes
@@ -2176,11 +2177,12 @@ describe('b.c13 CLI child environments', () => {
     expect(env).toBeDefined()
     expect(env).not.toBe(process.env)
     expect(Object.keys(env!).filter(name => names.includes(name))).toEqual([])
+    expect(env).not.toHaveProperty('AGENT_DIRECTOR_INSTANCE_ID')
     expect(env!._CLI_DAEMON_CHILD).toBe(daemon ? '1' : undefined)
     expect(env!.GH_TOKEN).toBe('fake-not-a-token')
   }
 
-  test('daemon spawn removes Slack credentials, sets its own marker and keeps host GH_TOKEN', leakChecked(async () => {
+  test('daemon spawn removes Slack credentials and inherited caller ID, sets its own marker and keeps host GH_TOKEN', leakChecked(async () => {
     const b = makeDeps()
     await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
     expect(b.exitCodes).toEqual([0])
@@ -2188,6 +2190,7 @@ describe('b.c13 CLI child environments', () => {
     expectClean(b.daemonSpawns[0]!.opts.env, true)
     // Building a child env must not mutate the parent's inputs.
     expect(process.env.SLACK_BOT_TOKEN).toBe(credentialValue)
+    expect(process.env.AGENT_DIRECTOR_INSTANCE_ID).toBe('cscb_starter')
   }))
 
   test('clean_restart passes explicit clean environments to both stop and start', leakChecked(async () => {

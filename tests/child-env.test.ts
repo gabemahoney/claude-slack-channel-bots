@@ -1,4 +1,4 @@
-/** b.c13: CSCB owns Slack credentials and its marker; other host env passes. */
+/** CSCB removes Slack credentials, inherited AD caller identity and its marker. */
 import { afterEach, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -25,6 +25,24 @@ const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
 
 describe('b.c13 child environment policy', () => {
+  test.each([undefined, false, true])('b.z5q childEnv drops the inherited caller ID (daemonChild=%s)', async daemonChild => {
+    const { childEnv } = await loadModule()
+    const source = { ...PUBLIC_ENV, AGENT_DIRECTOR_INSTANCE_ID: 'cscb_starter' }
+    const before = { ...source }
+    const result = childEnv(source, { daemonChild })
+    expect(result).not.toHaveProperty('AGENT_DIRECTOR_INSTANCE_ID')
+    expect(result).toEqual({ ...PUBLIC_ENV, ...(daemonChild ? { _CLI_DAEMON_CHILD: '1' } : {}) })
+    expect(source).toEqual(before)
+  })
+
+  test.each([undefined, false, true])('b.z5q scrubProcessEnv drops the inherited caller ID (keepDaemonMarker=%s)', async keepDaemonMarker => {
+    const { scrubProcessEnv } = await loadModule()
+    const env: NodeJS.ProcessEnv = { ...PUBLIC_ENV, AGENT_DIRECTOR_INSTANCE_ID: 'cscb_starter', _CLI_DAEMON_CHILD: '1' }
+    scrubProcessEnv(env, { keepDaemonMarker })
+    expect(env).not.toHaveProperty('AGENT_DIRECTOR_INSTANCE_ID')
+    expect(env).toEqual({ ...PUBLIC_ENV, ...(keepDaemonMarker ? { _CLI_DAEMON_CHILD: '1' } : {}) })
+  })
+
   test.each(SECRET_NAMES)('%s is recognized case-insensitively and removed from a child', async name => {
     const { childEnv, isCscbSecretName } = await loadModule()
     expect(isCscbSecretName(name)).toBe(true)

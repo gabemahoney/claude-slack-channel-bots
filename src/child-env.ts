@@ -4,6 +4,7 @@ export function isCscbSecretName(name: string): boolean {
 }
 
 const DAEMON_MARKER = '_CLI_DAEMON_CHILD'
+const CALLER_ID = 'AGENT_DIRECTOR_INSTANCE_ID'
 
 /** Copy the host environment, keeping the marker only for a new daemon. */
 export function childEnv(
@@ -11,7 +12,7 @@ export function childEnv(
   { daemonChild = false }: { daemonChild?: boolean } = {},
 ): NodeJS.ProcessEnv {
   const env = Object.fromEntries(
-    Object.entries(source).filter(([name]) => !isCscbSecretName(name) && name !== DAEMON_MARKER),
+    Object.entries(source).filter(([name]) => !isCscbSecretName(name) && name !== CALLER_ID && name !== DAEMON_MARKER),
   )
   if (daemonChild) env[DAEMON_MARKER] = '1'
   return env
@@ -23,6 +24,6 @@ export function scrubProcessEnv(
   { keepDaemonMarker = false }: { keepDaemonMarker?: boolean } = {},
 ): void {
   for (const name of Object.keys(env)) {
-    if (isCscbSecretName(name) || (name === DAEMON_MARKER && !keepDaemonMarker)) delete env[name]
+    if (isCscbSecretName(name) || name === CALLER_ID || (name === DAEMON_MARKER && !keepDaemonMarker)) delete env[name]
   }
 }

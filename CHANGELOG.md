@@ -9,6 +9,7 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 ### Fixed
 
 - The startup sweep reads working directories and session details through agent-director `get`, so light `list` results keep correctly placed live personas. Failed or incomplete reads keep those instances and record `orphan-cleanup-read-failed`; vanished instances are not killed. The client remains pinned to `agent-director@0.12.0`.
+- CSCB removes inherited `AGENT_DIRECTOR_INSTANCE_ID` from its process and child environments, so launching or resuming personas does not parent them to the session that started CSCB. Ordinary host variables still pass through. Existing live rows are unchanged; their parent clears on the next resume or reuse (b.z5q).
 - The [switch-over post-install check](docs/migration.md#step-10-start-the-new-cscb) discovers pending IDs with agent-director `list` and reads each instance's launch start through `get`.
 
 ---

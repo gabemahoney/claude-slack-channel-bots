@@ -32,6 +32,13 @@ Those are the canonical queue/shared-authority input contracts; the inventory
 also describes exact byte/shutdown assertions and isolated jq projections.
 See [Bounded costs](../docs/testing-guide.md#bounded-costs) for the own-root skew pin.
 
+`tests/child-env.test.ts` checks that both runtime environment filters remove
+Slack credential names and inherited `AGENT_DIRECTOR_INSTANCE_ID`, preserve
+ordinary host variables, and limit the daemon marker to its startup handoff.
+The caller-ID cases cover each marker option omitted, false and true.
+`tests/cli.test.ts` also checks the captured daemon spawn, restart and credentials
+environments for caller-ID removal.
+
 Unit checks assert values, bytes, mutation isolation and order; the existing
 [Thread Memory performance runs](../docs/testing-guide.md#thread-memory-performance-runs)
 measure end-to-end costs and shard memory at scale. The full 0/10,000/100,000-join
