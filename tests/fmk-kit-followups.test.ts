@@ -23,7 +23,7 @@ function run(script: string) {
       'fail() { echo "$*" >&2; exit 1; }',
       script,
     ].join('\n'), 'fmk-kit-followups', root], {
-      env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'mkdir', 'cp', 'awk', 'sed', 'date', 'cut', 'tail'] }), encoding: 'utf8', timeout: 10000,
+      env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'mkdir', 'cp', 'awk', 'sed', 'date', 'cut', 'tail', 'grep', 'head'] }), encoding: 'utf8', timeout: 10000,
     })
     expect(result.error).toBeUndefined()
     expect(result.signal).toBeNull()
@@ -94,6 +94,63 @@ test.each(['latched', 'relatched', 'leftover', 'other-persona'] as const)('test 
     expect(result.status).toBe(0)
     expect(result.stderr).toBe('')
   }
+})
+
+type SweepGetFault = 'none' | 'missing' | 'duplicate' | 'before-list' | 'position-before-list' | 'wrong-parent' | 'wrong-id' | 'at-list' | 'at-latch' | 'only-after-latch' | 'other-call-before-latch'
+
+/** Execute only the real ordering assertion over synthetic shim rows; no scenario/AD/tmux execution. */
+function sweepLatchOrdering(key: 'labelnote' | 'nostart', fault: SweepGetFault) {
+  const source = readFileSync(join(integration, 'test-23-fmk-latch-recheck.sh'), 'utf8')
+  const id = `cscb_${key}`
+  const row = (pos: number, time: string, parent = 42, verb = 'get', args = `--instance-id ${id}`) => [pos, time, parent, verb, id, args].join('\t')
+  const early = row(fault === 'before-list' || fault === 'position-before-list' ? 9 : 11,
+    fault === 'before-list' ? '1.900000' : fault === 'at-list' ? '2.000000' : fault === 'at-latch' ? '3.000000' : '2.500000',
+    fault === 'wrong-parent' ? 99 : 42, 'get', `--instance-id ${fault === 'wrong-id' ? `${id}_other` : id}`)
+  const rows = [
+    ...(['missing', 'only-after-latch'].includes(fault) ? [] : [early]),
+    ...(fault === 'duplicate' ? [row(12, '2.600000')] : []),
+    ...(fault === 'other-call-before-latch' ? [row(12, '2.700000', 42, 'send-keys')] : []),
+    ...(fault === 'missing' ? [] : [row(13, '3.500000')]),
+  ].join('\n')
+  return run([
+    'TEST_NAME=fixture SLACK_STATE_DIR="$SCENARIO_ROOT" LATCH_PID=42 LATCH_LIFE_MARK=0',
+    `CASE_LAUNCH_START=${quote(LATCH_CASE_LAUNCH_START_NOT_RECORDED)}`,
+    `declare -A PERSONA_ID=([${key}]=${id}) CASE_OF=([${key}]=${key === 'nostart' ? quote(LATCH_CASE_LAUNCH_START_NOT_RECORDED) : 'conflicting-labels'})`,
+    `declare -A SESSION_OF=([${key}]=session) OP_OF=([${key}]=none) LATCH_ROW_OF=([${key}]=pending) LATCH_MARK=([${key}]=20) LATCH_US=() PERSONA_NAME=([${key}]=${key})`,
+    'printf "%s\\n" SET-LATCH > "$SLACK_STATE_DIR/server.log"',
+    'fmk_text() { printf "%s\\n" SET-LATCH; }',
+    'log_line_us() { echo 3000000; }',
+    `ad_cscb_verb_between() { printf '%s\\n' ${quote('10\t2.000000\t42\tlist\t-\t--label service=cscb')}; }`,
+    '_scenario_store_read() { printf ""; }',
+    ...['us_of', 'secs_of', 'check_sweep_latch'].map(name => declaration(source, name)),
+    `check_sweep_latch fixture ${key} ${quote(rows)}`,
+    `echo "anchor=\${LATCH_US[${key}]}"`,
+  ].join('\n'))
+}
+
+test.each(['labelnote', 'nostart'] as const)('test 23 %s sweep latch requires one Full Row get and retains the list timer', key => {
+  const result = sweepLatchOrdering(key, 'none')
+  expect(result.status).toBe(0)
+  expect(result.stdout).toContain('accepted Full Row get')
+  expect(result.stdout).toContain('shim line 11 (2.500), parent 42')
+  expect(result.stdout).toContain('anchor=2000000')
+})
+
+test.each([
+  ['missing', 'no bot-server Full Row get'],
+  ['duplicate', 'more than one CSCB get'],
+  ['before-list', 'not strictly after its sweep list'],
+  ['position-before-list', 'not strictly after its sweep list'],
+  ['wrong-parent', "not the bot server's one Full Row get"],
+  ['wrong-id', "not the bot server's one Full Row get"],
+  ['at-list', 'not strictly after its sweep list'],
+  ['at-latch', 'not strictly after its sweep list'],
+  ['only-after-latch', 'no bot-server Full Row get'],
+  ['other-call-before-latch', "not the bot server's one Full Row get"],
+] as const)('test 23 sweep latch rejects %s', (fault, reason) => {
+  const result = sweepLatchOrdering('labelnote', fault)
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain(reason)
 })
 
 test.each(['0.18.0', '0.17.4'])('test 19 leg G reads its pending launch without contaminating attribution on %s', release => {

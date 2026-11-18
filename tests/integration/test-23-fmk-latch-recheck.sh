@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # AD outcome and lifecycle regression checks; no startup TUI interpretation.
+# A sweep latch requires list, exactly one server-owned Full Row get, then
+# the latch; every other call of that instance follows the latch. Its round
+# timer still starts at the sweep's list.
 
 set -euo pipefail
 
@@ -621,8 +624,8 @@ declare -A OP_OF=([${NL_KEY}]="${OP_RESUME}" [${DI_KEY}]="${OP_RESUME}" [${AS_KE
 declare -A LATCH_ROW_OF=([${SL_KEY}]="${ROW_NO_ROW}" [${DS_KEY}]=ended [${OI_KEY}]=missing [${PN_KEY}]=waiting
     [${R1_KEY}]=waiting [${R2_KEY}]=waiting [${NS_KEY}]=pending)
 # `send-keys`: the bring-up's reconnect, agent-director's send-keys verb;
-# `none`: no call of the id at all before the latch (the start sweep's `list`
-# latches it).
+# `none`: no refused bring-up call: the sweep's list and exactly one Full
+# Row get of the id precede the latch (check_sweep_latch).
 declare -A REFUSED_OF=([${NL_KEY}]="${CALL_RESUME}" [${DI_KEY}]="${CALL_RESUME}" [${AS_KEY}]="${CALL_RESUME}" [${LO_KEY}]="${CALL_RESUME}"
     [${SL_KEY}]="${CALL_PLAIN_SPAWN}" [${DS_KEY}]="${CALL_PLAIN_SPAWN}" [${OI_KEY}]="${CALL_RESUME}" [${PN_KEY}]=pane [${UN_KEY}]=-
     [${R1_KEY}]=send-keys [${R2_KEY}]=send-keys [${NS_KEY}]=none)
@@ -910,8 +913,8 @@ p1_check_note_notice() {
     echo "${TEST_NAME}: ${step}: one CONFLICT notice, as printed for ${CASE_OF[${key}]} and \"${SESSION_OF[${key}]}\", with no description line"
 }
 
-# p1_check_note_latch: the note persona latched by the start sweep's `list`
-#, before any call of its id, with one post.
+# p1_check_note_latch: the sweep's list and one Full Row get precede the
+# note persona's latch; every other call follows it, with one post.
 p1_check_note_latch() {
     local key="${CN_KEY}" step="part 1: latch life: ${CN_KEY} latches" id="${PERSONA_ID[${CN_KEY}]}" set_line rows n
     set_line="$(fmk_text conflictLatchSetLine "${key}" "${CASE_OF[${key}]}" "${SESSION_OF[${key}]}" "${OP_OF[${key}]}" "${LATCH_ROW_OF[${key}]}")" \
@@ -1591,14 +1594,15 @@ log_line_us() {
     echo "$(( 10#${us} ))"
 }
 
-# check_sweep_latch <step> <key> <rows>: the start sweep's `list` latched
-# the persona before any bring-up call for it: its latch-set line's time
-# (server.log) comes after a `list` of the bot server's in the latch life and
-# before every CSCB call of its id up to its latch mark (<rows>, each logged);
-# that `list`'s time is the round timer's starting point (LATCH_US); for
+# check_sweep_latch <step> <key> <rows>: between the bot server's sweep list
+# and its latch-set line, exactly one server-owned get names --instance-id
+# <id>. Every other CSCB call of that id must follow the latch. Both shim
+# position and timestamp must place the get strictly between list and latch.
+# That list's time stays the round timer's starting point (LATCH_US); for
 # "launch start not recorded", its row records no launch start in the store.
 check_sweep_latch() {
     local step="$1" key="$2" rows="$3" id="${PERSONA_ID[$2]}" set_line line latch_us lists sweep="" pos p time ppid started us
+    local verb args gets=0 get_pos="" get_us="" after_verbs=""
     set_line="$(fmk_text conflictLatchSetLine "${key}" "${CASE_OF[${key}]}" "${SESSION_OF[${key}]}" "${OP_OF[${key}]}" "${LATCH_ROW_OF[${key}]}")" \
         || fail "${step}: fmk-texts.ts could not print conflictLatchSetLine"
     line="$(grep -F -m 1 -e "${set_line}" "${SLACK_STATE_DIR}/server.log")" || fail "${step}: no latch-set line in server.log"
@@ -1613,17 +1617,30 @@ check_sweep_latch() {
     [[ -n "${sweep}" ]] || fail "${step}: no CSCB list of the bot server's (${LATCH_PID}) in the latch life before ${id}'s latch ($(secs_of "${latch_us}"))"
     read -r pos time <<< "${sweep}"
     LATCH_US[${key}]="$(us_of "${time}")" || exit 1
-    while IFS=$'\t' read -r p time _; do
+    while IFS=$'\t' read -r p time ppid verb _ args; do
         [[ -n "${p}" ]] || continue
         us="$(us_of "${time}")" || exit 1
-        (( us > latch_us )) || fail "${step}: the CSCB call of ${id} at shim line ${p} ($(secs_of "${us}")) comes before its latch ($(secs_of "${latch_us}"))"
+        if (( us > latch_us )); then
+            after_verbs+="${verb} "
+            continue
+        fi
+        [[ "${verb}" == get && "${ppid}" == "${LATCH_PID}" && " ${args} " == *" --instance-id ${id} "* ]] \
+            || fail "${step}: the CSCB call of ${id} at shim line ${p} before its latch is not the bot server's one Full Row get with --instance-id ${id}"
+        (( p > pos && us > LATCH_US[${key}] && us < latch_us )) \
+            || fail "${step}: the Full Row get of ${id} at shim line ${p} ($(secs_of "${us}")) is not strictly after its sweep list and before its latch"
+        gets=$(( gets + 1 ))
+        (( gets == 1 )) || fail "${step}: more than one CSCB get of ${id} before its latch"
+        get_pos="${p}"
+        get_us="${us}"
     done <<< "${rows}"
-    if [[ -n "${rows}" ]]; then
-        echo "${TEST_NAME}: ${step}: [recorded] CSCB call(s) of ${id} after its latch and before its latch mark: $(field_of 4 "${rows}" | tr '\n' ' ')"
+    (( gets == 1 )) || fail "${step}: no bot-server Full Row get of ${id} between the sweep list and its latch"
+    echo "${TEST_NAME}: ${step}: accepted Full Row get of ${id} at shim line ${get_pos} ($(secs_of "${get_us}")), parent ${LATCH_PID}"
+    if [[ -n "${after_verbs}" ]]; then
+        echo "${TEST_NAME}: ${step}: [recorded] CSCB call(s) of ${id} after its latch and before its latch mark: ${after_verbs}"
         grep -F -e "${PERSONA_NAME[${key}]}\" (key=${key})" -e "persona=${key} " "${SLACK_STATE_DIR}/server.log" \
             | sed "s/^/${TEST_NAME}: ${step}: [recorded] server.log: /" | head -n 20 || true
     fi
-    echo "${TEST_NAME}: ${step}: the start sweep's list at shim line ${pos} ($(secs_of "${LATCH_US[${key}]}")), then the latch ($(secs_of "${latch_us}")), before every call of ${id}"
+    echo "${TEST_NAME}: ${step}: the start sweep's list at shim line ${pos} ($(secs_of "${LATCH_US[${key}]}")), then its Full Row get, then the latch ($(secs_of "${latch_us}")), before every other call of ${id}"
     [[ "${CASE_OF[${key}]}" == "${CASE_LAUNCH_START}" ]] || return 0
     started="$(_scenario_store_read "${step}" "SELECT COALESCE(launch_started_at, '') FROM spawns WHERE instance_id = '${id}'")" \
         || exit 1
@@ -1644,8 +1661,8 @@ p2_check_latch() {
     esac
     [[ "${SESSION_OF[${key}]}" == "${want}" ]] || fail "${step}: the latch quotes session '${SESSION_OF[${key}]}', not ${want}"
 
-    # The bring-up's refused call, the bot server's; the persona's last call
-    # before the latch is the round timer's starting point; no kill.
+    # A sweep latch starts its round timer at list; a bring-up refusal
+    # starts it at the persona's last pre-latch call. Neither permits a kill.
     rows="$(ad_cscb_calls "${id}" "${LATCH_LIFE_MARK}" "${LATCH_MARK[${key}]}")" || exit 1
     echo "${TEST_NAME}: ${step}: CSCB calls of ${id} up to the latch (recorded): $(field_of 4 "${rows}" | tr '\n' ' ')"
     if [[ "${REFUSED_OF[${key}]}" == none ]]; then

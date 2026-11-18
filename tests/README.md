@@ -1556,6 +1556,11 @@ contracts to satisfy a zero-match audit.
 | 25 | `test-27-fmk-unusable-name.sh` | An unusable recorded name latches with no tmux call and clears once the row is gone |
 | 26 | `test-28-fmk-provenance.sh` | CSCB never touches `@ad_owner`/`@ad_pane`, whatever the tmux server's state; see fmk scenario list |
 
+In `test-23-fmk-latch-recheck.sh`, sweep-latched `labelnote` and `nostart`
+require exactly one bot-server Full Row `get --instance-id <id>` strictly
+between the sweep list and latch, by shim position and time; every other
+instance call follows the latch. The round timer still starts at that list.
+
 Scenario 14 has no script by decision, not as a gap: the `/ci` suite covers
 every §7 scenario except scenario 14.
 
