@@ -859,6 +859,7 @@ import {
 } from './persona-connection-errors.ts'
 import { describeDestinationFailureCause } from './persona-destination.ts'
 import { escapeSlackControlCharacters } from './slack-text-escape.ts'
+import { redactSlackLogText } from './slack-log-redaction.ts'
 import {
   RESTART_FAILURE_CAP,
   RESTART_OUTCOME_ALREADY_CONNECTED,
@@ -14364,16 +14365,24 @@ type SweepRowDisposition =
   | typeof SWEEP_ROW_KILLED
   | typeof SWEEP_ROW_KILL_FAILED
 
+/** The only list fields the start sweep consumes; newer binaries omit Full Row details. */
+type SweepLightRow = Pick<ListRow, 'instance_id' | 'state' | 'parent_id' | 'labels' | 'agent'>
+
+/** List facts plus details read only with get, never from the client's legacy ListRow type. */
+type SweepRow = SweepLightRow & Partial<Pick<GetResult, 'cwd' | 'tmux_session_name' | 'launch_started_at' | 'liveness_note'>> & {
+  readonly fullRowRead?: 'ready' | 'failed' | 'gone'
+}
+
 /**
- * One listed row as the start sweep handled it: the row as listed (its
- * state, `cwd`, labels and session), what the sweep did with it, and, for a
+ * One listed row as the start sweep handled it: its Light Row facts and
+ * Full Row details, what the sweep did with it, and, for a
  * row given a kill, the bounded retry's result (the outcome that stands, how
  * the tries ended and the alert decision). The sweep keeps one per listed
  * row, in list order; its counts and its post-kill findMissing run are taken
  * from them.
  */
 interface SweepRowRecord {
-  readonly row: ListRow
+  readonly row: SweepRow
   readonly disposition: SweepRowDisposition
   readonly kill?: KillRetryResult
 }
@@ -14412,12 +14421,14 @@ function sweepResultOf(records: readonly SweepRowRecord[], recordedAsRetired: nu
  * when live and kept the same way.
  */
 function sweepDecision(
-  row: ListRow,
+  row: SweepRow,
   persona: Persona | undefined,
   home: string,
 ): { action: 'sweep'; reason: string } | { action: 'keep' } | { action: 'deferred'; persona: Persona } {
   if (!persona) return { action: 'sweep', reason: 'absent persona' }
   if (row.instance_id !== personaInstanceId(persona.key)) return { action: 'sweep', reason: 'wrong instance ID' }
+  // Unknown directory data never authorizes a wrong-cwd decision, in any state.
+  if (!row.cwd) return { action: 'keep' }
   const comparison = compareRowToPersona(row, persona, home)
   if (comparison.cwdCheckDeferred) return { action: 'deferred', persona }
   if (!comparison.cwdMatches) return { action: 'sweep', reason: 'wrong cwd' }
@@ -14496,7 +14507,7 @@ export interface StartSweepKillFailedEntryInput {
   readonly persona?: string
   /** The state the sweep listed the row in. */
   readonly state: string
-  /** The row's tmux session name as listed. */
+  /** The row's tmux session name read with get. */
   readonly session: string
   /** The outcome that stands, rendered (`describeKillOutcome`: its class, name and redacted description). */
   readonly outcome: string
@@ -14598,11 +14609,11 @@ export function startSweepStoppedKillLine(
  * its `orphan-cleanup` entry with no alert text, and nothing more. Nothing is posted, no retry timer is armed and
  * nothing latches.
  */
-async function killStartSweepRow(pass: SweepPass, row: ListRow, target: StartSweepKillTarget): Promise<KillRetryResult> {
+async function killStartSweepRow(pass: SweepPass, row: SweepRow, target: StartSweepKillTarget): Promise<KillRetryResult> {
   const id = row.instance_id
   const name = startSweepRowName(id, target.persona)
   console.error(
-    `${SWEEP_LOG_PREFIX}: killing ${name} state=${row.state} tmux_session=${row.tmux_session_name}; the row is kept whatever the outcome`,
+    `${SWEEP_LOG_PREFIX}: killing ${name} state=${row.state} tmux_session=${row.tmux_session_name ?? 'unknown'}; the row is kept whatever the outcome`,
   )
   const retried = await sweepKill(pass, id, row.state, target.configuredKey)
   const { outcome, alert } = retried
@@ -14642,7 +14653,7 @@ async function killStartSweepRow(pass: SweepPass, row: ListRow, target: StartSwe
  * when `alert` is not of `version`. Never throws.
  */
 function sweepKillAlertEntry(
-  row: ListRow,
+  row: SweepRow,
   alert: KillRetryAlert,
   version: typeof KILL_FAILURE_VERSION_ORDINARY | typeof KILL_FAILURE_VERSION_SURVIVOR,
 ): { readonly classLabel: string; readonly entry: string } | undefined {
@@ -14667,7 +14678,7 @@ function sweepKillAlertEntry(
  * `ErrTmuxKillFailed` that stands, or any failure after a survivor-naming
  * one), else the empty string, so the entry stays as it was. Never throws.
  */
-function sweepOrdinaryAlertTail(row: ListRow, alert: KillRetryAlert): string {
+function sweepOrdinaryAlertTail(row: SweepRow, alert: KillRetryAlert): string {
   const built = sweepKillAlertEntry(row, alert, KILL_FAILURE_VERSION_ORDINARY)
   return built === undefined ? '' : `; kill-failure alert: ${built.entry}`
 }
@@ -14680,7 +14691,7 @@ function sweepOrdinaryAlertTail(row: ListRow, alert: KillRetryAlert): string {
  * sentence, its writer also writing the server-log line. Nothing else is
  * done: the row counts as killed. Never throws.
  */
-function recordSweepSurvivorAlert(row: ListRow, alert: KillRetryAlert): void {
+function recordSweepSurvivorAlert(row: SweepRow, alert: KillRetryAlert): void {
   const built = sweepKillAlertEntry(row, alert, KILL_FAILURE_VERSION_SURVIVOR)
   if (built !== undefined) recordStartupError(built.classLabel, built.entry)
 }
@@ -14710,6 +14721,7 @@ interface SweepPass {
   readonly budget: KillRetryPassBudget
   readonly clock: KillRetryWait
   readonly isShuttingDown: () => boolean
+  readonly holdUnavailableReported: Set<string>
 }
 
 /** The start sweep's line prefix, its kill retry's lines included. */
@@ -15073,9 +15085,60 @@ export const START_SWEEP_LIST_SITE: OwnRowReadSite = Object.freeze({ site: 'reco
  */
 export const ORPHAN_CLEANUP_LIST_FAILED_LABEL = 'orphan-cleanup-list-failed'
 
+/** A startup sweep could not read the Full Row details it needs. */
+export const ORPHAN_CLEANUP_READ_FAILED_LABEL = 'orphan-cleanup-read-failed'
+
+export function startSweepReadFailedLine(instanceId: string, reason: string): string {
+  return `instanceId=${instanceId}: ${reason}; no cwd decision is made; a vanished row is not killed`
+}
+
+export function startSweepHoldUnavailableLine(instanceId: string): string {
+  return `instanceId=${instanceId}: old-life hold could not start because its cwd is unknown`
+}
+
+/** One missing-directory hold diagnostic per row per pass, shared by listing and failed-kill holds. */
+function reportStartSweepHoldUnavailable(pass: SweepPass, instanceId: string): void {
+  if (sweepStopped(pass) || pass.holdUnavailableReported.has(instanceId)) return
+  pass.holdUnavailableReported.add(instanceId)
+  const line = startSweepHoldUnavailableLine(instanceId)
+  console.error(`${SWEEP_LOG_PREFIX}: ${redactSlackLogText(line)}`)
+  recordStartupError(ORPHAN_CLEANUP_LABEL, redactSlackLogText(line))
+}
+
+/** Read live rows and every cscb_<key> row once: even finished own-row reads consume liveness notes. */
+async function readStartSweepRows(pass: SweepPass, listed: readonly SweepLightRow[]): Promise<SweepRow[]> {
+  const rows: SweepRow[] = []
+  for (const light of listed) {
+    // Explicit projection also discards full fields older binaries still put in list.
+    const row: SweepRow = { instance_id: light.instance_id, state: light.state, parent_id: light.parent_id, labels: light.labels, agent: light.agent }
+    rows.push(row)
+    if (sweepStopped(pass) || (!AGENT_DIRECTOR_LIVE_STATES.has(row.state) && ownRowKeyOfRowId(row.instance_id) === undefined)) continue
+    let reason: string
+    try {
+      const full = await pass.client.get({ instance_id: row.instance_id })
+      if (sweepStopped(pass)) continue
+      rows[rows.length - 1] = {
+        ...row, state: full.state, cwd: full.cwd, tmux_session_name: full.tmux_session_name,
+        launch_started_at: full.launch_started_at, liveness_note: full.liveness_note, fullRowRead: 'ready',
+      }
+      if (typeof full.cwd === 'string' && full.cwd !== '') continue
+      reason = 'get returned an empty cwd'
+    } catch (err) {
+      if (sweepStopped(pass)) continue
+      const gone = isAdErrorInstance(err, ErrSpawnNotFound)
+      rows[rows.length - 1] = { ...row, fullRowRead: gone ? 'gone' : 'failed' }
+      reason = gone ? 'get found no row (it vanished since list)' : `get failed: ${describeAdFailureForLog(err)}`
+    }
+    const entry = startSweepReadFailedLine(row.instance_id, reason)
+    console.error(`${SWEEP_LOG_PREFIX}: ${redactSlackLogText(entry)}`)
+    recordStartupError(ORPHAN_CLEANUP_READ_FAILED_LABEL, redactSlackLogText(entry))
+  }
+  return rows
+}
+
 /**
- * The start sweep's latch pass, made over the whole list before any kill. Each listed
- * row whose id is a key's own (`cscb_<key>`, `ownRowKeyOfRowId`), whatever
+ * The start sweep's latch pass, made over the enriched rows before any kill. Each
+ * successfully read row whose id is a key's own (`cscb_<key>`, `ownRowKeyOfRowId`), whatever
  * its `persona` label, goes through the shared own-row read's act step
  * (`actOnOwnRowRead`) at `START_SWEEP_LIST_SITE`, as a `get` row would:
  *
@@ -15103,12 +15166,14 @@ export const ORPHAN_CLEANUP_LIST_FAILED_LABEL = 'orphan-cleanup-list-failed'
  * Never throws.
  */
 function latchFromListedRows(
-  rows: readonly ListRow[],
+  rows: readonly SweepRow[],
   personasByKey: ReadonlyMap<string, Persona>,
   recordedKeys: ReadonlySet<string>,
 ): ReadonlySet<string> {
   const latched = new Set<string>()
   for (const row of rows) {
+    // Missing Full Row fields are uncertainty, never evidence for a latch.
+    if (row.fullRowRead !== 'ready') continue
     const key = ownRowKeyOfRowId(row.instance_id)
     if (key === undefined) continue
     const persona = personasByKey.get(key)
@@ -15162,7 +15227,7 @@ export function startSweepLatchedLine(ref: string, latchCase: string): string {
  * persona latched, else its `persona` label when that persona latched;
  * undefined when neither did. Pure; never throws.
  */
-function startSweepLatchOf(row: ListRow, latched: ReadonlySet<string>): string | undefined {
+function startSweepLatchOf(row: SweepLightRow, latched: ReadonlySet<string>): string | undefined {
   const own = ownRowKeyOfRowId(row.instance_id)
   if (own !== undefined && latched.has(own)) return own
   const label = row.labels?.[PERSONA_LABEL_KEY]
@@ -15176,7 +15241,7 @@ function startSweepLatchOf(row: ListRow, latched: ReadonlySet<string>): string |
  * order. A pre-persona row (no `persona` label) gives no key. Pure; never
  * throws.
  */
-function absentPersonaKeysOf(rows: readonly ListRow[], personasByKey: ReadonlyMap<string, Persona>): string[] {
+function absentPersonaKeysOf(rows: readonly SweepLightRow[], personasByKey: ReadonlyMap<string, Persona>): string[] {
   const keys = new Set<string>()
   for (const row of rows) {
     const label = row.labels?.[PERSONA_LABEL_KEY]
@@ -15316,8 +15381,13 @@ function recordAbsentPersonaKeys(keys: readonly string[]): number {
  * live in server memory, so this sweep is where a restart rebuilds the ones
  * still needed.
  *
- * The sweep keeps one record per listed row (`SweepRowRecord`: the row as
- * listed, what it did with it, and its kill's result), from which its
+ * Each listed live row and every cscb_<key> row is first enriched with one get: cwd/session and
+ * latch metadata come only from that Full Row, whose newer state is used.
+ * Failed or incomplete reads never authorize a cwd kill; vanished rows are
+ * gone. Finished own rows retain their liveness-note handling and cwd comparisons.
+ *
+ * The sweep keeps one record per listed row (`SweepRowRecord`: the enriched
+ * row, what it did with it, and its kill's result), from which its
  * counts and its findMissing run are taken.
  */
 export async function reconcileOrphans(
@@ -15331,11 +15401,11 @@ export async function reconcileOrphans(
   }
 
   const client = getClient()
-  let rows: ListRow[]
+  let listed: SweepLightRow[]
   try {
     // the service label only, so every row in every state is listed.
     const r = await client.list({ label: [SERVICE_LABEL] })
-    rows = r.spawns
+    listed = r.spawns
   } catch (err) {
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('list', 'UnknownError', String(err))
     recordStartupError(
@@ -15351,8 +15421,11 @@ export async function reconcileOrphans(
     budget: createKillRetryPassBudget(),
     clock,
     isShuttingDown,
+    holdUnavailableReported: new Set<string>(),
   }
   const records: SweepRowRecord[] = []
+
+  const rows = await readStartSweepRows(pass, listed)
 
   // a shutdown begun by the time the list returns means no
   // latch, no record write and no kill; every row counts as kept.
@@ -15379,7 +15452,7 @@ export async function reconcileOrphans(
   for (const row of rows) {
     noteOldLifeRowRead(
       row.instance_id,
-      { kind: OLD_LIFE_ROW_READ_STATE, state: row.state, cwd: row.cwd },
+      row.fullRowRead === 'gone' ? { kind: OLD_LIFE_ROW_READ_NO_ROW } : { kind: OLD_LIFE_ROW_READ_STATE, state: row.state, cwd: row.cwd },
       oldLifeReadName(START_SWEEP_LIST_SITE),
     )
   }
@@ -15420,17 +15493,21 @@ export async function reconcileOrphans(
  * the sweep has stopped (`sweepStopped`), or with no hold set installed.
  * Each hold's begin line is the hold set's. Never throws.
  */
-function beginStartSweepListingHolds(pass: SweepPass, rows: readonly ListRow[]): void {
+function beginStartSweepListingHolds(pass: SweepPass, rows: readonly SweepRow[]): void {
   const holds = oldLifeHolds
   if (holds === undefined || sweepStopped(pass)) return
   for (const row of rows) {
     try {
       if (!AGENT_DIRECTOR_LIVE_STATES.has(row.state)) continue
+      if (row.fullRowRead === 'gone') continue
       const label = row.labels?.[PERSONA_LABEL_KEY]
       if (typeof label !== 'string' || label === '') continue
       const reading = retiredKeyReadingOf(label)
       if (!reading.recorded || reading.marked) continue
-      if (typeof row.cwd !== 'string' || row.cwd === '') continue
+      if (typeof row.cwd !== 'string' || row.cwd === '') {
+        reportStartSweepHoldUnavailable(pass, row.instance_id)
+        continue
+      }
       holds.begin({
         instanceId: row.instance_id,
         oldKey: oldLifeKeyOf(row.instance_id, label),
@@ -15470,7 +15547,10 @@ function beginStartSweepKillHold(pass: SweepPass, record: SweepRowRecord): void 
   const id = row.instance_id
   try {
     if (holds.holdOf(id) === undefined) {
-      if (typeof row.cwd !== 'string' || row.cwd === '') return
+      if (typeof row.cwd !== 'string' || row.cwd === '') {
+        reportStartSweepHoldUnavailable(pass, id)
+        return
+      }
       holds.begin({
         instanceId: id,
         oldKey: oldLifeKeyOf(id, row.labels?.[PERSONA_LABEL_KEY]),
@@ -15525,7 +15605,8 @@ interface StartSweepRowContext {
  * (`killStartSweepRow`) and kept, counted killed when the kill's success
  * stands. Never throws.
  */
-async function sweepListedRow(pass: SweepPass, row: ListRow, context: StartSweepRowContext): Promise<SweepRowRecord> {
+async function sweepListedRow(pass: SweepPass, row: SweepRow, context: StartSweepRowContext): Promise<SweepRowRecord> {
+  if (row.fullRowRead === 'gone') return { row, disposition: SWEEP_ROW_KEPT }
   // a latched persona's rows are left as they are.
   if (startSweepLatchOf(row, context.latched) !== undefined) return { row, disposition: SWEEP_ROW_LEFT_FOR_LATCH }
   // after a stop the sweep makes no further call.

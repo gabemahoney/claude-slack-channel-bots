@@ -85,6 +85,7 @@ import {
   resetAdVersionRecheckForTests,
 } from '../src/ad-version-gate.ts'
 import { getClient, resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
+import { ORPHAN_CLEANUP_READ_FAILED_LABEL, startSweepHoldUnavailableLine, startSweepReadFailedLine } from '../src/session-manager.ts'
 import { buildStartAgentArgs, buildTemplateParams, EFFORT_ARG_PREFIX, MODEL_ARG_PREFIX } from '../src/agent-director-template.ts'
 import {
   AgentDirectorError,
@@ -495,6 +496,7 @@ import {
   holdOldAt,
   listed,
   PRE_PERSONA_ID,
+  scriptSweepFullRows,
   sweepOver,
   type SweepRun
 } from './test-helpers/old-life.ts'
@@ -3565,6 +3567,161 @@ function sweepKillFailedEntry(
   return `${entry}; kill-failure alert: ${sweepAlertEntry(row, { version: KILL_FAILURE_VERSION_ORDINARY, session: row.tmux_session_name, instanceId: row.instance_id, quotes: ordinary })}`
 }
 
+describe('reconcileOrphans: Light Rows get their sweep details from Full Rows', () => {
+  afterEach(recoveryAfterEach)
+
+  test.each([...AGENT_DIRECTOR_LIVE_STATES])('keeps a correct %s persona row; reads finished own rows but skips finished strays outside the own-row ID form', async (state) => {
+    const { h, p, b } = buildRecoveryCase()
+    const full = harnessRow(h, harnessPersona(h, p), { state })
+    const finished = harnessRow(h, harnessPersona(h, b), { state: 'ended' })
+    const stray = harnessRow(h, harnessPersona(h, b), { instance_id: 'legacy_finished', state: 'ended' })
+    h.script({
+      listResult: { spawns: [cannedListRow(full, 'light'), cannedListRow(finished, 'light'), cannedListRow(stray, 'light')] },
+      getFn: ({ instance_id }) => instance_id === full.instance_id ? full : finished,
+    })
+    expect(await h.startSweep()).toEqual(sweepResult({ listed: 3, kept: 3 }))
+    expect(h.stub.calls.getCalls).toEqual([{ instance_id: full.instance_id }, { instance_id: finished.instance_id }])
+    expect(h.stub.calls.killCalls).toEqual([])
+    expect(h.latch.isLatched(p)).toBe(false)
+    expect(h.startupErrors()).toEqual([])
+  })
+
+  test('wrong cwd, failed-kill hold, kill log, entry and alert use the Full Row directory and session', async () => {
+    const { h, p } = buildRecoveryCase()
+    const full = harnessRow(h, harnessPersona(h, p), { cwd: h.home, tmux_session_name: 'full-row-session' })
+    h.script({
+      listResult: { spawns: [cannedListRow(full, 'light')] },
+      getFn: () => full,
+      killError: errTmuxKillFailed(),
+    })
+    expect(await h.startSweep()).toEqual(sweepResult({ listed: 1, kept: 1, killFailed: 1 }))
+    expect(h.stub.calls.getCalls).toEqual([{ instance_id: full.instance_id }])
+    expect(h.stub.calls.killCalls.map((call) => call.instance_id)).toEqual(Array(KILL_RETRY_TRIES).fill(full.instance_id))
+    expect(h.oldLifeHolds.holdOf(full.instance_id)?.directory).toBe(full.cwd)
+    expect(h.errors.join('\n')).toContain(`cwd=${full.cwd}`)
+    expect(h.errors.join('\n')).toContain(`tmux_session=${full.tmux_session_name}`)
+    const entry = h.startupErrors().join('\n')
+    expect(entry).toContain('[orphan-cleanup]')
+    expect(entry).toContain(`tmux_session=${full.tmux_session_name}`)
+    expect(entry).toContain('kill-failure alert:')
+    expect(entry).toContain(full.tmux_session_name)
+  })
+
+  test.each(['waiting', 'ended', 'missing'].flatMap((state) => ['get failed', 'not_found', 'empty cwd'].map((fault) => [state, fault] as const)))('%s: %s keeps the persona, logs and records the uncertainty', async (state, fault) => {
+    const { h, p } = buildRecoveryCase()
+    const full = harnessRow(h, harnessPersona(h, p), { state })
+    h.script({
+      listResult: { spawns: [cannedListRow(full, 'light')] },
+      getFn: () => fault === 'get failed' ? errTmuxUnresponsive('get') : fault === 'not_found' ? errSpawnNotFound() : { ...full, cwd: '' },
+    })
+    expect(await h.startSweep()).toEqual(sweepResult({ listed: 1, kept: 1 }))
+    expect(h.stub.calls.getCalls).toEqual([{ instance_id: full.instance_id }])
+    expect(h.stub.calls.killCalls).toEqual([])
+    expect(h.errors.join('\n')).toContain(full.instance_id)
+    expect(h.startupErrors()).toHaveLength(1)
+    expect(h.startupErrors().join('\n')).toContain(`[${ORPHAN_CLEANUP_READ_FAILED_LABEL}]`)
+    expect(h.startupErrors().join('\n')).toContain(full.instance_id)
+    if (fault === 'not_found') expect(h.errors).toContain(`[slack] reconcileOrphans: ${startSweepReadFailedLine(full.instance_id, 'get found no row (it vanished since list)')}`)
+  })
+
+  test.each(['absent persona', 'wrong instance ID', 'pre-persona'] as const)('%s is swept on Light Row facts when get fails; an unknown directory cannot start a kill hold', async (stray) => {
+    const { h, p } = buildRecoveryCase()
+    const labels: Record<string, string> = stray === 'pre-persona' ? { service: 'cscb' } : { service: 'cscb', persona: stray === 'absent persona' ? 'departed' : p }
+    const full = harnessRow(h, harnessPersona(h, p), { instance_id: 'cscb_stray', labels })
+    h.script({ listResult: { spawns: [cannedListRow(full, 'light')] }, getFn: () => errTmuxUnresponsive('get'), killError: errTmuxKillFailed() })
+    expect((await h.startSweep()).killFailed).toBe(1)
+    expect(h.stub.calls.getCalls).toEqual([{ instance_id: full.instance_id }])
+    expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
+    expect(h.oldLifeHolds.holdOf(full.instance_id)).toBeUndefined()
+    expect(h.errors).toContain(`[slack] reconcileOrphans: ${startSweepHoldUnavailableLine(full.instance_id)}`)
+    expect(h.startupErrors().join('\n')).toContain(startSweepHoldUnavailableLine(full.instance_id))
+  })
+
+  test('a vanished stray is gone rather than a kill target, and ends its existing hold', async () => {
+    const { h, p } = buildRecoveryCase()
+    const full = harnessRow(h, harnessPersona(h, p), { instance_id: 'cscb_stray', labels: { service: 'cscb' } })
+    h.beginOldLifeHold({ instanceId: full.instance_id, oldKey: full.instance_id, directory: full.cwd, cause: OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL })
+    h.script({ listResult: { spawns: [cannedListRow(full, 'light')] }, getFn: () => errSpawnNotFound() })
+    expect((await h.startSweep()).kept).toBe(1)
+    expect(h.stub.calls.killCalls).toEqual([])
+    expect(h.oldLifeHolds.holdOf(full.instance_id)).toBeUndefined()
+    expect(h.startupErrors()).toHaveLength(1)
+  })
+
+  test('the listing hold uses the Full Row cwd and survives a successful kill until a finished read', async () => {
+    const { h, p } = buildRecoveryCase()
+    const full = harnessRow(h, harnessPersona(h, p), { instance_id: 'cscb_departed', cwd: h.home, labels: { service: 'cscb', persona: 'departed' } })
+    h.script({ listResult: { spawns: [cannedListRow(full, 'light')] }, getFn: () => full })
+    expect((await h.startSweep()).killed).toBe(1)
+    expect(h.oldLifeHolds.holdOf(full.instance_id)?.directory).toBe(full.cwd)
+    expect(h.stub.calls.getCalls).toEqual([{ instance_id: full.instance_id }])
+  })
+
+  test.each(['get failed', 'empty cwd'].flatMap((fault) => [false, true].map((killFails) => [fault, killFails] as const)))('an absent persona with %s reports its unavailable listing hold once (kill fails=%s)', async (fault, killFails) => {
+    const { h, p } = buildRecoveryCase()
+    const full = harnessRow(h, harnessPersona(h, p), { instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } })
+    h.script({
+      listResult: { spawns: [cannedListRow(full, 'light')] },
+      getFn: () => fault === 'get failed' ? errTmuxUnresponsive('get') : { ...full, cwd: '' },
+      ...(killFails ? { killError: errTmuxKillFailed() } : {}),
+    })
+    const result = await h.startSweep()
+    expect(result).toEqual(sweepResult({ listed: 1, recordedAsRetired: 1, ...(killFails ? { kept: 1, killFailed: 1 } : { killed: 1 }) }))
+    expect(h.oldLifeHolds.holdOf(full.instance_id)).toBeUndefined()
+    const line = startSweepHoldUnavailableLine(full.instance_id)
+    expect(h.errors.filter((value) => value === `[slack] reconcileOrphans: ${line}`)).toHaveLength(1)
+    expect(h.startupErrors().filter((value) => value.includes(`[${ORPHAN_CLEANUP_LABEL}] ${line}`))).toHaveLength(1)
+  })
+
+  test.each(['get failed', 'empty cwd'])('a retired persona left for its latch with %s reports its unavailable listing hold without a kill', async (fault) => {
+    const { h, p } = retiredBuild(false)
+    const full = harnessRow(h, harnessPersona(h, p), {})
+    h.script({ getResult: { ...full, liveness_note: provenanceNote } })
+    await readPersonaOwnRow(p, { site: 'session-manager.test', what: 'latch before sweep' })
+    h.stub.calls.getCalls.length = 0
+    h.script({ listResult: { spawns: [cannedListRow(full, 'light')] }, getFn: () => fault === 'get failed' ? errTmuxUnresponsive('get') : { ...full, cwd: '' } })
+    expect(await h.startSweep()).toEqual(sweepResult({ listed: 1, leftForLatch: 1 }))
+    expect(h.stub.calls.killCalls).toEqual([])
+    expect(h.oldLifeHolds.holdOf(full.instance_id)).toBeUndefined()
+    const line = startSweepHoldUnavailableLine(full.instance_id)
+    expect(h.errors.filter((value) => value === `[slack] reconcileOrphans: ${line}`)).toHaveLength(1)
+    expect(h.startupErrors().filter((value) => value.includes(`[${ORPHAN_CLEANUP_LABEL}] ${line}`))).toHaveLength(1)
+  })
+
+  test.each(['ended', 'missing'])('a finished %s unconfigured cscb_<key> stray is read to preserve its liveness-note log without latching', async (state) => {
+    const { h, p } = buildRecoveryCase()
+    const full = harnessRow(h, harnessPersona(h, p), { instance_id: 'cscb_departed', state, labels: { service: 'cscb', persona: 'departed' }, liveness_note: provenanceNote })
+    h.script({ listResult: { spawns: [cannedListRow(full, 'light')] }, getFn: () => full })
+    expect(await h.startSweep()).toEqual(sweepResult({ listed: 1, kept: 1, recordedAsRetired: 1 }))
+    expect(h.stub.calls.getCalls).toEqual([{ instance_id: full.instance_id }])
+    expect(h.stub.calls.killCalls).toEqual([])
+    expect(h.errors.join('\n')).toContain('persona=departed: its row carries the liveness note')
+    expect(h.errors.join('\n')).toContain('the note is not applied')
+    expect(h.episodeNotices).toEqual([])
+  })
+
+  test.each([false, true])('shutdown while get settles (failure=%s) ignores the late answer and makes no later read or effect', async (failed) => {
+    const { h, p, b } = buildRecoveryCase()
+    const full = harnessRow(h, harnessPersona(h, p), { cwd: h.home, liveness_note: provenanceNote })
+    h.script({ listResult: { spawns: [cannedListRow(full, 'light'), cannedListRow({}, harnessPersona(h, b), h.home, 'light')] } })
+    const get = h.stub.client.get.bind(h.stub.client)
+    let stopped = false
+    h.stub.client.get = async (params) => {
+      await get(params)
+      stopped = true
+      if (failed) throw errTmuxUnresponsive('get')
+      return full
+    }
+    expect(await h.startSweep(() => stopped)).toEqual(sweepResult({ listed: 2, kept: 2 }))
+    expect(h.stub.calls.getCalls).toEqual([{ instance_id: full.instance_id }])
+    expect(h.stub.calls.killCalls).toEqual([])
+    expect(h.stub.calls.findMissingCalls).toEqual([])
+    expect(h.startupErrors()).toEqual([])
+    expect(h.retiredKeyWrites).toEqual([])
+    expect(h.latch.isLatched(p)).toBe(false)
+  })
+})
+
 describe('reconcileOrphans: the start sweep by persona kills its live strays with the result checked and deletes no row', () => {
   /**
    * Three applied personas in real temp working directories, except that
@@ -4532,6 +4689,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       const findMissingCalls: import('agent-director').FindMissingParams[] = []
       const stub = installStub()
       stub.list = async () => ({ spawns: [...rows.values()] })
+      stub.get = async (params) => cannedGetResult(rows.get(params.instance_id)!)
       stub.kill = async (params) => {
         killCalls.push(params.instance_id)
         // The survivor's kill reports success while its session lives on.
@@ -4724,9 +4882,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       expect(h.retiredKeys.isMarked(p)).toBe(pMarked)
     })
 
-    // P's own row carrying the note latches P, and the sweep leaves it
-    // as it is, whatever it would otherwise decide (another cwd is swept when
-    // P is not latched).
+    // P's own row carrying the note latches P in every state, whatever its cwd.
     test.each<[string, string, (h: RecoveryHarness) => Partial<ListRow>]>([
       ['in P\'s working directory', 'waiting', () => ({})],
       ['in P\'s working directory', LIVENESS_DEAD_ROW_ENDED, () => ({})],
@@ -5029,7 +5185,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         listed(h, p, { instance_id: `${personaInstanceId(p)}_old`, cwd: h.home }),
       ])
 
-      expect(run.order).toEqual(['list', 'kill', 'findMissing'])
+      expect(run.order).toEqual(['list', 'get', 'get', 'get', 'get', 'kill', 'findMissing'])
       expect(killedIds(h)).toEqual([legacy.instance_id])
       expectRecordedAbsent(h, [LAUNCH_START_ABSENT_PERSONA_KEY])
       expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))
@@ -5072,7 +5228,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
       const run = await sweepOver(h, [listed(h, p, { cwd: h.home })])
 
-      expect(run.order).toEqual(['list', 'kill', 'findMissing', 'get'])
+      expect(run.order).toEqual(['list', 'get', 'kill', 'findMissing', 'get'])
       expectNoteLatchedOnce(h, p, ENDED_READ)
       expect(run.result).toEqual(sweepResult({ listed: 1, killed: 1 }))
       expect(linesEqual(h, startSweepPostKillLine(1, [], [personaInstanceId(p)], []))).toHaveLength(1)
@@ -5134,12 +5290,12 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         expectSummaryLast(h.errors, expected)
       })
 
-      test('shutting down once the absent key is recorded, before the first kill: P\'s latch and the record stand; no kill, status, find-missing or get; the unkilled rows count as kept; one stop line, then the summary', async () => {
+      test('shutting down once the absent key is recorded, before the first kill: P\'s latch and the record stand; only the initial Full Row reads; the unkilled rows count as kept; one stop line, then the summary', async () => {
         const { h, p, b } = buildRecoveryCase()
 
         const run = await sweepOver(h, stopRows(h, p, b), h.config, () => h.retiredKeyWrites.length > 0)
 
-        expect(run.order).toEqual(['list'])
+        expect(run.order).toEqual(['list', 'get', 'get', 'get', 'get'])
         expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))
         expectRecordedAbsent(h, [LAUNCH_START_ABSENT_PERSONA_KEY])
         const expected = sweepResult({ listed: 4, kept: 3, recordedAsRetired: 1, leftForLatch: 1 })
@@ -5164,7 +5320,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
         const run = await sweepOver(h, rows, h.config, () => h.stub.calls.killCalls.length > 0)
 
-        expect(run.order).toEqual(['list', 'kill'])
+        expect(run.order).toEqual(['list', 'get', 'get', 'get', 'get', 'kill'])
         expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))
         expectRecordedAbsent(h, [LAUNCH_START_ABSENT_PERSONA_KEY])
         const expected = sweepResult({ listed: 4, kept: 3, killFailed: 1, recordedAsRetired: 1, leftForLatch: 1 })
@@ -5186,7 +5342,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
         const run = await sweepOver(h, [listed(h, p, { cwd: h.home })], h.config, () => h.stub.calls.findMissingCalls.length > 0)
 
-        expect(run.order).toEqual(['list', 'kill', 'findMissing'])
+        expect(run.order).toEqual(['list', 'get', 'kill', 'findMissing'])
         expectNoNoteLatch(h)
         const expected = sweepResult({ listed: 1, killed: 1 })
         expect(run.result).toEqual(expected)
@@ -5208,7 +5364,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
         const run = await sweepOver(h, [legacy], h.config, () => h.stub.calls.findMissingCalls.length > 0)
 
-        expect(run.order).toEqual(['list', 'kill', 'findMissing'])
+        expect(run.order).toEqual(['list', 'get', 'kill', 'findMissing'])
         const expected = sweepResult({ listed: 1, killed: 1 })
         expect(run.result).toEqual(expected)
         expect(linesEqual(h, START_SWEEP_SHUTDOWN_STOP_LINE)).toHaveLength(1)
@@ -5268,9 +5424,9 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }]]))
         h.script({ findMissingResult: unverifiedRowsOf(p) })
 
-        const run = await sweepOver(h, [listed(h, p, { cwd: h.home })], h.config, () => h.stub.calls.getCalls.length > 0)
+        const run = await sweepOver(h, [listed(h, p, { cwd: h.home })], h.config, () => h.stub.calls.getCalls.length > 1)
 
-        expect(run.order).toEqual(['list', 'kill', 'findMissing', 'get'])
+        expect(run.order).toEqual(['list', 'get', 'kill', 'findMissing', 'get'])
         expectNoNoteLatch(h)
         expect([h.notices, h.episodeNotices]).toEqual([[], []])
         expect(h.errors.filter((line) => line.includes('the get settled after its caller stopped — not acted on'))).toHaveLength(1)
@@ -14411,14 +14567,15 @@ describe('after a run the server makes, one get of each configured persona\'s ow
       listResult: { spawns: [prePersonaRow('waiting')] },
       findMissingResult: cannedFindMissing({ rows: { [SWEPT_OLD_ID]: 'ids', [personaInstanceId(p)]: 'unverified_ids' } }),
     })
+    scriptSweepFullRows(h, [prePersonaRow('waiting')])
     const order = recordCallOrder(h)
 
     await reconcileOrphans(h.config)
 
-    expect(order).toEqual(['list', 'kill', 'findMissing', 'get'])
+    expect(order).toEqual(['list', 'get', 'kill', 'findMissing', 'get'])
     expect(h.stub.calls.killCalls.map((k) => k.instance_id)).toEqual([SWEPT_OLD_ID])
     expect(h.stub.calls.deleteCalls).toEqual([])
-    expect(getIds(h)).toEqual([personaInstanceId(p)])
+    expect(getIds(h)).toEqual([SWEPT_OLD_ID, personaInstanceId(p)])
     expectNoteLatchedOnce(h, p, ENDED_READ)
     expect(sweptRowBuckets(h.errors)).toEqual(['missing'])
   })
@@ -14434,12 +14591,13 @@ describe('after a run the server makes, one get of each configured persona\'s ow
       findMissingResult: cannedFindMissing({ rows: { [SWEPT_OLD_ID]: 'ids', [personaInstanceId(p)]: 'unverified_ids' } }),
       getError: err,
     })
+    scriptSweepFullRows(h, [prePersonaRow('waiting')])
     const order = recordCallOrder(h)
 
     await reconcileOrphans(h.config)
 
-    expect(order).toEqual(['list', 'kill', 'findMissing', 'get'])
-    expect(getIds(h)).toEqual([personaInstanceId(p)])
+    expect(order).toEqual(['list', 'get', 'kill', 'findMissing', 'get'])
+    expect(getIds(h)).toEqual([SWEPT_OLD_ID, personaInstanceId(p)])
     const failure = describeAdFailureForLog(err)
     expect(h.errors.filter((line) => line.includes(' — UNUSABLE NAME met in '))).toEqual([
       `[slack] reconcileOrphans: post-sweep get for persona=${p}: ${failure} — UNUSABLE NAME met in the start sweep: routed to the server log; nothing latches`,
@@ -14461,10 +14619,11 @@ describe('after a run the server makes, one get of each configured persona\'s ow
       findMissingResult: cannedFindMissing({ rows: { [SWEPT_OLD_ID]: 'ids', [personaInstanceId(p)]: 'unverified_ids' } }),
       getResult: row.build(harnessPersona(h, p), h.home),
     })
+    scriptSweepFullRows(h, [prePersonaRow('waiting')])
 
     await reconcileOrphans(h.config)
 
-    expect(getIds(h)).toEqual([personaInstanceId(p)])
+    expect(getIds(h)).toEqual([SWEPT_OLD_ID, personaInstanceId(p)])
     expect(postRunReadsOf(h)).toBe(`persona=${p} latched`)
     expectLatchedOnce(h, p, launchStartLatch(p, row))
     expect(sweptRowBuckets(h.errors)).toEqual(['missing'])

@@ -3893,6 +3893,21 @@ describe(`the switch-over runbook, "${PHASE1_RUNBOOK_SECTION_TITLE}"`, () => {
     })
   })
 
+  test('the maintained post-install check discovers pending IDs with list and reads launch_started_at with get', () => {
+    const carrier = readRunbookCarrier(RUNBOOK_DOC, operatorText(RUNBOOK_DOC), SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
+    const text = textAt(carrier, 'step 10 › The post-install check')
+    const required = [
+      code('agent-director list --state pending'),
+      ci('to discover pending instance IDs'),
+      ci('for each returned instance ID'),
+      code('agent-director get --instance-id <instance_id>'),
+      ci('check `launch_started_at` in that Full Row if it still reads `pending`'),
+    ]
+    expect(missingItems(carrier, text, required)).toEqual([])
+    const old = text.replace(code('agent-director get --instance-id <instance_id>'), code('agent-director list --state pending'))
+    expect(missingItems(carrier, old, required)).toEqual([code('agent-director get --instance-id <instance_id>')])
+  })
+
   describe('negative and order checks', () => {
     test.each(overCarriers([[vocab('baseIndex')], [vocab('paneBaseIndex')]] as const))('%s: step 1 does not name %s', (_name, term, read) => {
       expect(read().steps[0]).not.toContain(term)
@@ -9422,7 +9437,7 @@ describe('released agent-director 0.12 migration instructions', () => {
     // runbook uses the launcher; step 1 still pins its user, PATH and HOME.
     const currentRequired = required.map((item) => typeof item === 'string'
       ? item.replaceAll(HISTORICAL_RUNBOOK_CLAUDE, MIN_CLAUDE_CODE_VERSION).replace('the minimum agent-director states for its exec-form hooks', "CSCB's supported minimum")
-      : item instanceof RegExp ? new RegExp(item.source.replaceAll(HISTORICAL_RUNBOOK_CLAUDE.replaceAll('.', '\\.'), MIN_CLAUDE_CODE_VERSION.replaceAll('.', '\\.')).replace('the minimum agent-director states for its exec-form hooks', "CSCB's supported minimum").replace('by its owner', 'through its launcher'), item.flags) : item)
+      : item instanceof RegExp ? new RegExp(item.source.replaceAll(HISTORICAL_RUNBOOK_CLAUDE.replaceAll('.', '\\.'), MIN_CLAUDE_CODE_VERSION.replaceAll('.', '\\.')).replace('the minimum agent-director states for its exec-form hooks', "CSCB's supported minimum").replace('by its owner', 'through its launcher').replace('shows a `launch_started_at` on every row', 'check `launch_started_at` in that Full Row if it still reads `pending`'), item.flags) : item)
     expect({ element, missing: missingItems(upgrade(), textAt(upgrade(), where), currentRequired) }).toEqual({ element, missing: [] })
   })
 

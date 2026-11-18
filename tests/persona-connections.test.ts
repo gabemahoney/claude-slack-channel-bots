@@ -7098,10 +7098,10 @@ describe('bring-up outcomes ()', () => {
   /** Give `persona` a surviving row, as its spawn wrote it unless `cwd` says otherwise, and add the orphan. */
   function addSurvivingRow(persona: Persona, state: 'waiting' | 'ended', cwd = persona.working_directory): void {
     rows.set(idOf(persona), {
-      list: cannedListRow({ state, cwd }, persona, spawnHome()),
+      list: cannedListRow({ state, cwd }, persona, spawnHome(), 'light'),
       get: cannedGetResult({ state, cwd }, persona, spawnHome()),
     })
-    rows.set(ORPHAN_ID, { list: cannedListRow({ instance_id: ORPHAN_ID }), get: cannedGetResult({ instance_id: ORPHAN_ID }) })
+    rows.set(ORPHAN_ID, { list: cannedListRow({ instance_id: ORPHAN_ID }, 'light'), get: cannedGetResult({ instance_id: ORPHAN_ID }) })
   }
 
   /** The agent-director calls addressing instance `id`, counted by verb; verbs with none are left out. */
@@ -7205,10 +7205,10 @@ describe('bring-up outcomes ()', () => {
       // A notice raised for A before the pass is held; it must never be posted.
       await f.notifier.notify(a.key, 'held notice for A')
 
-      // The start sweep kills its control row and keeps it (no delete), and touches nothing of
-      // A's; A's cwd check is deferred only when its working directory has no real path.
+      // The sweep reads Full Rows, kills its control row and keeps A's row.
+      // A's cwd check is deferred only when its working directory has no real path.
       await reconcileOrphans(f.h.config!)
-      expect(adCallsFor(ORPHAN_ID)).toEqual({ kill: 1 })
+      expect(adCallsFor(ORPHAN_ID)).toEqual({ get: 1, kill: 1 })
       expect([...rows.keys()]).toEqual([idOf(a), ORPHAN_ID])
       expect(deferredLines()).toEqual(existsSync(a.working_directory) ? [] : [expect.stringContaining(renderPersonaRef(a.name, a.key))])
 
@@ -7269,7 +7269,7 @@ describe('bring-up outcomes ()', () => {
       expect(later.admission.kind).toBe('not-up')
       expect(getSessionByPersona(a.key)).toBeUndefined()
       expect(getSessionByPersona(b.key)).toBe(fromB.entry!)
-      expect(adCallsFor(idOf(a))).toEqual({})
+      expect(adCallsFor(idOf(a))).toEqual({ get: 1 })
       expect([...rows.keys()]).toEqual([idOf(a), ORPHAN_ID])
       await expectServes(f, b)
       expect(slackCallsBesidesAuthTest(f)).toEqual([])
@@ -7401,9 +7401,9 @@ describe('bring-up outcomes ()', () => {
     // Rows: the row's state, how the row spells A's directory, what the ladder does with it and
     // the calls it makes for A's instance (the spawn is the one that collides with the row).
     test.each<[string, 'waiting' | 'ended', 'configured' | 'old symlink target', 'reconnected' | 'resumed', Record<string, number>]>([
-      ['a waiting row is reconnected', 'waiting', 'configured', 'reconnected', { spawn: 1, get: 4, sendKeys: 2 }],
-      ['an ended row is resumed', 'ended', 'configured', 'resumed', { spawn: 1, get: 1, resume: 1 }],
-      ['a waiting row recorded under the target of a working_directory symlink that now dangles is reconnected', 'waiting', 'old symlink target', 'reconnected', { spawn: 1, get: 4, sendKeys: 2 }],
+      ['a waiting row is reconnected', 'waiting', 'configured', 'reconnected', { spawn: 1, get: 5, sendKeys: 2 }],
+      ['an ended row is resumed', 'ended', 'configured', 'resumed', { spawn: 1, get: 2, resume: 1 }],
+      ['a waiting row recorded under the target of a working_directory symlink that now dangles is reconnected', 'waiting', 'old symlink target', 'reconnected', { spawn: 1, get: 5, sendKeys: 2 }],
     ])('a directory-broken persona’s surviving row is kept, and once its directory exists it comes up with no confirmation and its launch reuses the row — %s, with no kill, delete or fresh spawn; its instance, refused while it retried, is then admitted', async (_label, state, spelling, action, reuseCalls) => {
       let launched: Awaited<ReturnType<typeof spawnForPersona>> | undefined
       const f: BringUpFixture = makeBringUpFixture({
@@ -7421,8 +7421,8 @@ describe('bring-up outcomes ()', () => {
       const result = await sweepAndStart(f)
 
       expect(result.perPersona.find(p => p.key === a.key)).toMatchObject({ action: 'not-brought-up', outcome: 'retrying' })
-      expect(adCallsFor(idOf(a))).toEqual({})
-      expect(adCallsFor(ORPHAN_ID)).toEqual({ kill: 1 })
+      expect(adCallsFor(idOf(a))).toEqual({ get: 1 })
+      expect(adCallsFor(ORPHAN_ID)).toEqual({ get: 1, kill: 1 })
       expect(deferredLines()).toEqual([expect.stringContaining(renderPersonaRef(a.name, a.key))])
       // While A retries, a registration from its configured directory is refused.
       const whileRetrying = await connectSession(f, a.working_directory)

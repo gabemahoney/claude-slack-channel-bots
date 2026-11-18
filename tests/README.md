@@ -1504,6 +1504,8 @@ Host-safety audits pin the eight-module import graph, including `codex-crash-bar
 
 ### fmk scenarios
 
+The startup sweep's service-filtered `list` is followed by one Full Row `get` per live listed instance, including `pending`, and per finished `cscb_<key>` instance before its latch, hold and kill decisions. Finished own rows keep cwd comparisons and liveness-note handling, including note logs for absent keys; other finished strays need no `get`. Sweep call counts include these startup reads; test-32's delivery measurement windows start after the sweep.
+
 Each fmk scenario of agent-director's handoff to CSCB, §7 (lifecycle scenario),
 is one script, named here; scenario 14 has no script, and scenario 17 is a
 closing assertion of server-backed fmk scripts. Test 0 is the harness's

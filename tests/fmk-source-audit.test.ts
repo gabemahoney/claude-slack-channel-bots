@@ -111,6 +111,111 @@ import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSyn
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import ts from 'typescript'
+
+// Light list rows must be narrowed before the start sweep can consume them.
+// The released client's ListRow still declares fields newer binaries omit.
+const LIGHT_LIST_FIELDS = new Set([
+  'instance_id', 'state', 'displayed_state', 'parent_id', 'labels', 'agent',
+  'family_state', 'state_changed_at', 'prompt_marker', 'integration_mode',
+])
+function sweepListTypeFindings(source: string): string[] {
+  const file = ts.createSourceFile('sweep.ts', source, ts.ScriptTarget.Latest, true)
+  const findings: string[] = []
+  function visit(node: ts.Node): void {
+    if (ts.isTypeReferenceNode(node) && node.typeName.getText(file) === 'ListRow') {
+      const pick = node.parent
+      if (!ts.isTypeReferenceNode(pick) || pick.typeName.getText(file) !== 'Pick' || pick.typeArguments?.[0] !== node) findings.push(node.getText(file))
+      else {
+        const keys = pick.typeArguments?.[1]
+        for (const key of keys && ts.isUnionTypeNode(keys) ? keys.types : keys ? [keys] : []) {
+          if (!ts.isLiteralTypeNode(key) || !ts.isStringLiteral(key.literal) || !LIGHT_LIST_FIELDS.has(key.literal.text)) findings.push(key.getText(file))
+        }
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(file)
+  return findings
+}
+
+/** Resolve inferred row types against the pinned client, without compiling unrelated application code. */
+function sweepListReadFindings(source: string): string[] {
+  const filename = join(import.meta.dir, 'sweep-light-list-audit.ts')
+  const text = "import type { Client, ListRow, GetResult } from 'agent-director'; declare function getClient(): Client;\n" + source
+  const options: ts.CompilerOptions = { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler, types: [], skipLibCheck: true }
+  const host = ts.createCompilerHost(options)
+  const originalGetSourceFile = host.getSourceFile.bind(host)
+  host.getSourceFile = (path, languageVersion, onError, shouldCreateNewSourceFile) => path === filename
+    ? ts.createSourceFile(path, text, languageVersion, true)
+    : originalGetSourceFile(path, languageVersion, onError, shouldCreateNewSourceFile)
+  const program = ts.createProgram([filename], options, host)
+  const file = program.getSourceFile(filename)!
+  const checker = program.getTypeChecker()
+  const findings: string[] = []
+  function isListRow(type: ts.Type): boolean {
+    const present = checker.getNonNullableType(type)
+    return present.getSymbol()?.getName() === 'ListRow' || (present.isUnionOrIntersection() && present.types.some(isListRow))
+  }
+  function visit(node: ts.Node): void {
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const key = ts.isPropertyAccessExpression(node) ? node.name.text
+        : ts.isStringLiteral(node.argumentExpression) ? node.argumentExpression.text : undefined
+      if ((key === undefined || !LIGHT_LIST_FIELDS.has(key)) && isListRow(checker.getTypeAtLocation(node.expression))) findings.push(node.getText(file))
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(file)
+  return findings
+}
+
+function startSweepSource(): string {
+  const source = readFileSync(join(import.meta.dir, '../src/session-manager.ts'), 'utf8')
+  const start = source.indexOf('function emptySweepResult(')
+  const end = source.indexOf('// startupSessionManager', start)
+  expect(start).toBeGreaterThan(0)
+  expect(end).toBeGreaterThan(start)
+  return source.slice(start, end)
+}
+
+describe('start sweep consumes narrowed Light Rows, never dropped fields from ListRow', () => {
+  test('the sweep has no raw ListRow or dropped Pick key', () => {
+    expect(sweepListTypeFindings(startSweepSource())).toEqual([])
+  })
+
+  test('the real sweep has no inferred dropped-field read from list', () => {
+    expect(sweepListReadFindings(startSweepSource())).toEqual([])
+  })
+
+  test.each([
+    'const inferred = r.spawns[0]!; void inferred.cwd',
+    'for (const inferred of r.spawns) void inferred.tmux_session_name',
+    'const inferredRows = r.spawns; void inferredRows[0]!["liveness_note"]',
+  ])('flags an inferred list-row read planted in the real sweep: %s', (violation) => {
+    const source = startSweepSource()
+    const planted = source.replace('listed = r.spawns', `listed = r.spawns; ${violation}`)
+    expect(planted).not.toBe(source)
+    expect(sweepListReadFindings(planted)).toHaveLength(1)
+  })
+
+  test('the same cwd field read from an inferred get result passes', () => {
+    const source = startSweepSource().replace('listed = r.spawns', 'listed = r.spawns; const full = await client.get({ instance_id: r.spawns[0]!.instance_id }); void full.cwd')
+    expect(sweepListReadFindings(source)).toEqual([])
+  })
+
+  test.each([
+    'cwd', 'tmux_session_name', 'relay_mode', 'process_liveness', 'confirmations',
+    'idle_screen_availability', 'started_at', 'last_seen_at', 'ended_at',
+    'launch_started_at', 'liveness_note', 'liveness_checked_at', 'liveness_source',
+    'permission_requests', 'agent_defaults',
+  ])('rejects dropped field %s, both directly and in a projection', (field) => {
+    expect(sweepListTypeFindings(`function sweep(row: ListRow) { return row.${field} }`)).toHaveLength(1)
+    expect(sweepListTypeFindings(`type Light = Pick<ListRow, 'instance_id' | '${field}'>`)).toHaveLength(1)
+  })
+
+  test('permits Light Row keys and independently typed Full Row details', () => {
+    expect(sweepListTypeFindings("type Light = Pick<ListRow, 'instance_id' | 'state' | 'labels'>; type SweepRow = Light & Pick<GetResult, 'cwd' | 'tmux_session_name'>")).toEqual([])
+  })
+})
 import type { PersonaConfigInput } from '../src/config.ts'
 import { createSharedChannelAuthority } from '../src/shared-channels.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, writtenFile } from './test-helpers/credentials.ts'

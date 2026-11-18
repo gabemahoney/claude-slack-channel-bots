@@ -1365,9 +1365,16 @@ function defaultRowFields(instanceId: string): {
  * `undefined` (`SAMPLE_LAUNCH_START_NONE` for the launch start) is left out
  * of the row; a `null` launch start is shown as `null`.
  */
-export function cannedListRow(overrides: Partial<ListRow> & { instance_id: string }): ListRow
-export function cannedListRow(overrides: Partial<ListRow>, persona: CannedRowPersona, home: string): ListRow
-export function cannedListRow(overrides: Partial<ListRow>, persona?: CannedRowPersona, home?: string): ListRow {
+export function cannedListRow(overrides: Partial<ListRow> & { instance_id: string }, projection?: 'light'): ListRow
+export function cannedListRow(overrides: Partial<ListRow>, persona: CannedRowPersona, home: string, projection?: 'light'): ListRow
+export function cannedListRow(overrides: Partial<ListRow>, persona?: CannedRowPersona | 'light', home?: string, projection?: 'light'): ListRow {
+  if (persona === 'light' || projection === 'light') {
+    const full = typeof persona === 'object' ? cannedListRow(overrides, persona, home!) : cannedListRow(overrides as Partial<ListRow> & { instance_id: string })
+    return Object.fromEntries(Object.entries(full).filter(([key]) => [
+      'instance_id', 'state', 'displayed_state', 'parent_id', 'labels', 'agent',
+      'family_state', 'state_changed_at', 'prompt_marker', 'integration_mode',
+    ].includes(key))) as unknown as ListRow
+  }
   if (persona) {
     if (home === undefined) throw new Error('cannedListRow: the persona form needs a home')
     return omitUndefined(withDefaultLaunchStart({
@@ -1712,7 +1719,8 @@ export interface StubClientOptions {
   statusFn?: (params: StatusParams) => StatusResult | Error | undefined
 
   // get() — a row may carry the Phase 1 `launch_started_at` and
-  // `liveness_note` (`cannedGetResult`).
+  // `liveness_note` (`cannedGetResult`). With no scripted get answer, reuse
+  // a matching full list fixture; Light Row fixtures must script get themselves.
   getResult?: GetResult
   getError?: Error
   getQueue?: CannedResponse<GetResult>[]
@@ -1977,8 +1985,11 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
         if (r instanceof Error) throw r
         if (r !== undefined) return r
       }
+      const listed = opts.listResult?.spawns.find((row) => row.instance_id === params.instance_id && typeof row.cwd === 'string')
       return nextResponse('get', opts.getQueue, opts.getResult, opts.getError, cannedGetResult({
         instance_id: params.instance_id,
+        ...listed,
+        ...(listed === undefined ? {} : { launch_started_at: listed.launch_started_at }),
       }))
     },
     async sendKeys(params: SendKeysParams): Promise<SendKeysResult> {

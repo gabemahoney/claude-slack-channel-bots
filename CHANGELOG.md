@@ -6,6 +6,11 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+### Fixed
+
+- The startup sweep reads working directories and session details through agent-director `get`, so light `list` results keep correctly placed live personas. Failed or incomplete reads keep those instances and record `orphan-cleanup-read-failed`; vanished instances are not killed. The client remains pinned to `agent-director@0.12.0`.
+- The [switch-over post-install check](docs/migration.md#step-10-start-the-new-cscb) discovers pending IDs with agent-director `list` and reads each instance's launch start through `get`.
+
 ---
 
 ## 0.19.0 (2026-11-18)

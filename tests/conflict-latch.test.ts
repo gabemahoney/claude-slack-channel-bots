@@ -3694,7 +3694,7 @@ describe('a pending row with no launch start holds P for a human on every automa
     harnesses.push(h)
     const [p, q] = h.keys as [string, string]
     const row = cannedListRow({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE, ...overrides(h) }, personaOf(h, p), h.home)
-    h.script({ listResult: { spawns: [row] } })
+    h.script({ listResult: { spawns: [cannedListRow(row, 'light')] }, getResult: cannedGetResult({ ...row, launch_started_at: row.launch_started_at }) })
 
     const result = await h.drive(reconcileOrphans(h.config, h.killRetryClock))
 
@@ -3706,8 +3706,8 @@ describe('a pending row with no launch start holds P for a human on every automa
     expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
     await expectLostMessageReports(h, p, 'held-for-human')
 
-    // Neither the sweep nor the start pass nor the lost message made any call of P's instance, a kill, send-keys or delete included.
-    expect(personaCallCounts(h, p)).toEqual({})
+    // Only the sweep's Full Row get addresses P; the latched start/lost-message paths make no call.
+    expect(personaCallCounts(h, p)).toEqual({ getCalls: 1 })
     expect(tmuxTouchingCallsIn(h.stub.calls)).toEqual([])
     expect(h.stub.calls.deleteCalls).toEqual([])
     expect(h.episodeNotices).toEqual([{ key: p, text: launchStartNotRecordedNoticeText(p) }])

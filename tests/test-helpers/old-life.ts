@@ -46,10 +46,11 @@ import {
   type OldLifeWaitEndDecision,
   type OldLifeWaitEndKind,
 } from '../../src/old-life-wait.ts'
-import { personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../../src/persona-identity.ts'
+import { PERSONA_INSTANCE_ID_PREFIX, personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../../src/persona-identity.ts'
 import { OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1, OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL, type OldLifeHold } from '../../src/retired-keys.ts'
 import {
   OLD_LIFE_HOLD_END_NOT_RETRIED_LATCHED,
+  AGENT_DIRECTOR_LIVE_STATES,
   SEQUENCE_WAITING_CAUSE_OLD_LIFE_HOLD,
   oldLifeHoldEndSettledRetryLine,
   oldLifeHoldLaunchLine,
@@ -58,7 +59,7 @@ import {
   type OldLifeHoldWaitStart,
   type SpawnPersonaResult,
 } from '../../src/session-manager.ts'
-import { cannedListRow } from './agent-director-stub.ts'
+import { cannedGetResult, cannedListRow, type StubClientOptions } from './agent-director-stub.ts'
 import { personaOf, recordCallOrder, type RecoveryHarness } from './recovery-harness.ts'
 
 // ---------------------------------------------------------------------------
@@ -102,6 +103,21 @@ export interface SweepRun {
   readonly atFirstKill: { readonly writes: number; readonly latched: string[] } | undefined
 }
 
+/** Serve live and cscb_<key> fixtures through get once, then preserve later/post-kill read scripts. */
+export function scriptSweepFullRows(h: RecoveryHarness, rows: readonly ListRow[]): void {
+  const beforeGet = (h.stub.calls as StubClientOptions).getFn
+  const full = new Map(rows.filter((row) => AGENT_DIRECTOR_LIVE_STATES.has(row.state) || (row.instance_id.startsWith(PERSONA_INSTANCE_ID_PREFIX) && row.instance_id.length > PERSONA_INSTANCE_ID_PREFIX.length)).map((row) => [row.instance_id, row]))
+  h.script({
+    listResult: { spawns: rows.map((row) => cannedListRow(row, 'light')) },
+    getFn: (params) => {
+      const row = full.get(params.instance_id)
+      if (row === undefined) return beforeGet?.(params)
+      full.delete(params.instance_id)
+      return cannedGetResult({ ...row, launch_started_at: row.launch_started_at })
+    },
+  })
+}
+
 /**
  * Run the start sweep over `rows` with `config` (the harness's own by
  * default), as `main()` runs it, its kill retries on the harness clock, with
@@ -113,7 +129,7 @@ export async function sweepOver(
   config: PersonaConfig = h.config,
   isShuttingDown?: () => boolean,
 ): Promise<SweepRun> {
-  h.script({ listResult: { spawns: [...rows] } })
+  scriptSweepFullRows(h, rows)
   let atFirstKill: SweepRun['atFirstKill']
   const kill = h.stub.client.kill.bind(h.stub.client)
   h.stub.client.kill = (params) => {
