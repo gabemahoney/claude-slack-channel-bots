@@ -91,9 +91,14 @@ for who in p q; do
 done
 slack_stub_history 2
 
+# Slack reply reminders are off for both personas (top-level
+# stop_hook_bootstrap), for test-29's reason: a reminder nudge is a delivery,
+# and in manual receipt mode it would take a receipt release meant for a real
+# item.
 write_config <<EOF
 {
   "channel_mode":"open",
+  "stop_hook_bootstrap":false,
   "personas":[
     {"name":"${NAME[p]}","credentials_file":"${CREDS[p]}","working_directory":"${WORK[p]}",
      "channels":[{"id":"${A}","delivery":"all"},{"id":"${B}","delivery":"thread_hybrid"},{"id":"${NOTICE}","delivery":"mentions"}],

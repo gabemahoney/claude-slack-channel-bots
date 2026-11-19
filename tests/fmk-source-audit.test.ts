@@ -3493,6 +3493,29 @@ ${command}`], {
     expect(JSON.parse(result.stdout)).toEqual({ id: request.id, isError: false, text: 'fixture result' })
   })
 
+  // The shared recovery lib's real write_config, read by the production
+  // parser. Both personas start in manual receipt mode, and a reply reminder
+  // would hold a turn no receipt releases (b.vv3).
+  test('the shared recovery config turns reply reminders off for both personas', async () => {
+    const helper = readFileSync(join(import.meta.dir, 'integration/lib/shared-channel-recovery.sh'), 'utf8')
+    const start = helper.indexOf('write_config <<EOF'), end = helper.indexOf('\n\n# These helpers', start)
+    expect(start).toBeGreaterThanOrEqual(0); expect(end).toBeGreaterThan(start)
+    const { parsePersonaConfigBytes } = await import('../src/config.ts')
+    const home = mkdtempSync(join(tmpdir(), 'recovery-reminder-config-'))
+    try {
+      mkdirSync(join(home, 'p')); mkdirSync(join(home, 'q'))
+      const config = spawnSync('bash', ['-euc', [
+        'declare -A NAME=([p]=alpha [q]=bravo) CREDS=([p]="$HOME/p.json" [q]="$HOME/q.json") WORK=([p]="$HOME/p" [q]="$HOME/q")',
+        'A=C0ALL001 B=C0HYBRID1 NOTICE=C0NOTICE1 CONTACT=U0CONTACT SCENARIO_PORT=4100 MCP_CONFIG="$HOME/mcp.json"',
+        'write_config() { cat; }', helper.slice(start, end),
+      ].join('\n')], { encoding: 'utf8', timeout: 5000, env: hostSafeChildEnv(home, { tools: ['bash', 'cat'] }) })
+      assertNoLeak({ stdout: config.stdout, stderr: config.stderr })
+      expect(config.error).toBeUndefined(); expect({ status: config.status, stderr: config.stderr }).toEqual({ status: 0, stderr: '' })
+      const settings = parsePersonaConfigBytes(config.stdout, join(home, 'config.json'), home, { home })
+      expect(settings.personas.map(p => [p.name, p.stop_hook_bootstrap])).toEqual([['alpha', false], ['bravo', false]])
+    } finally { rmSync(home, { recursive: true, force: true }) }
+  })
+
   test.each([
     ['not a JSON object', '"$CALL_ARGS"', ': the arguments are not a JSON object'],
     ['over the arguments-file bound', '"$(jq -cn --arg t "$CALL_ARGS" \'{text: ($t + ("x" * 70000))}\')"', ': the arguments take 70'],

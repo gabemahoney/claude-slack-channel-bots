@@ -608,7 +608,11 @@ expect_count "${recovered_line}" 1 'restoration closing report repeated on ordin
 for who in p q; do drain "${who}"; done
 cp "${CONFIG}" "${EVIDENCE}/replacement-source.json"
 replacement_scope="${restore_scope}"
-edit_input '.personas[0].stop_hook_bootstrap=false'
+# The shared config turns reminders off at the top level, so the prepared
+# input turns them back on for p: a real effective change. It is never
+# confirmed (withdrawn and cancelled below), so the confirmed setting stays
+# off for the rest of the script.
+edit_input '.personas[0].stop_hook_bootstrap=true'
 cp "${CONFIG}" "${EVIDENCE}/replacement-prepared.json"
 replacement_incarnation="$(shared_persona_facts "${KEY[p]}" | jq -r .incarnation)"
 replacement_stamp="$(stamp p "${B}")"
