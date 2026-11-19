@@ -6,6 +6,10 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+---
+
+## 0.19.1 (2026-11-19)
+
 ### Fixed
 
 - The startup sweep supports light agent-director `list` results by reading each applied persona's own `cscb_<key>` row with `get`, live or finished, and reading a stray only just before its kill when a directory hold needs it. Kept pre-persona rows are never named by a CSCB call; strays swept without holds get no `get`. Failed or incomplete reads keep live persona rows and record `orphan-cleanup-read-failed`; vanished rows are never killed. The client remains pinned to `agent-director@0.12.0` (b.e9v).
