@@ -71,7 +71,8 @@ export function tmuxDiagnostic(stderr: string, socket: string | null): string {
   const errno = connect[3]?.toLowerCase().replace(/[^a-z0-9]+/g, '-')
   const label = connect[1] !== undefined ? 'no-server'
     : errno === 'no-such-file-or-directory' ? 'missing-socket' : `connect-error:${errno?.slice(0, 24)}`
-  const ours = socket !== null ? path === socket : path.startsWith('/') && path.length > 1
+  // An empty socket runs tmux's default one, as runTmux does.
+  const ours = socket ? path === socket : path.startsWith('/') && path.length > 1
   return ours ? label : `${label}-foreign-socket`
 }
 /**
@@ -80,8 +81,9 @@ export function tmuxDiagnostic(stderr: string, socket: string | null): string {
  * server leaves when it exits (ECONNREFUSED); and a connection the server
  * closed unanswered while exiting (server.c server_accept with server_exit set,
  * or exit with the connection queued: "server exited unexpectedly"). A
- * shutdown notice instead exits 0 with no session list. Anything else is not
- * proof of absence.
+ * shutdown notice instead exits 0 with no session list and no stderr. Anything
+ * else is not proof of absence, including an exit 0 with stderr (3.2a's
+ * "server version is too old for client" exits 0).
  */
 export function tmuxNoServer(stderr: string, socket: string | null): boolean {
   return ['no-server', 'missing-socket', 'server-exited-unexpectedly'].includes(tmuxDiagnostic(stderr, socket))
@@ -105,10 +107,14 @@ export function processState(stat: string): string {
   if (!state) throw new ExitBarrierError({ barrier: 'process-state-unavailable' }, 'old life process state unavailable')
   return state
 }
+/** A status-0 answer counts only with no stderr (an injected probe may omit the label). */
+function quiet(result: TmuxResult): boolean {
+  return result.diagnostic === undefined || result.diagnostic === 'no-stderr'
+}
 export function sessionPresent(life: EndedLife, probes: Probes = nativeProbes): boolean {
   const result = probes.tmux(life.tmux_socket, ['list-sessions', '-F', '#{session_id}'])
   if (result.status === 1 && result.noServer === true) return false
-  if (result.status !== 0) {
+  if (result.status !== 0 || !quiet(result)) {
     const diagnostic = result.diagnostic ?? 'unknown'
     throw new ExitBarrierError({ barrier: 'tmux-query', query: 'list-sessions', status: result.status, tmux: diagnostic },
       `old life tmux query failed: list-sessions exit ${result.status} (${diagnostic})`)
@@ -123,7 +129,7 @@ export function captureLiveLife(row: { tmux_session_name: string; tmux_socket?: 
   if (!row.tmux_session_name) throw new ExitBarrierError({ barrier: 'capture-no-session' }, 'old life has no recorded tmux session')
   const pane = probes.tmux(row.tmux_socket ?? null,
     ['display-message', '-p', '-t', `=${row.tmux_session_name}:`, '#{session_id} #{pane_pid}'])
-  const identity = pane.status === 0 ? /^(\$[0-9]+) ([1-9][0-9]*)$/.exec(pane.stdout) : null
+  const identity = pane.status === 0 && quiet(pane) ? /^(\$[0-9]+) ([1-9][0-9]*)$/.exec(pane.stdout) : null
   if (!identity) {
     const diagnostic = pane.diagnostic ?? 'unknown'
     throw new ExitBarrierError({ barrier: 'capture-pane', status: pane.status, tmux: diagnostic },

@@ -4208,9 +4208,11 @@ An exit-1 query reads as "gone" only for the three tmux 3.2a client outcomes of
 a gone server: `no server running on <socket>` (the exited server leaves its
 socket file, so this is the usual one), `error connecting to <socket> (No such
 file or directory)`, and `server exited unexpectedly` (a query that reached the
-server while it exited). Anything else fails closed, and every barrier failure
-names its cause (query, status and a fixed stderr label, timeout, or what still
-held at the deadline), never just "old life never exited".
+server while it exited). Anything else fails closed, a status 0 with stderr
+included. Every failure of `fixtures/ended-life.ts`'s barrier names its cause
+(query, status and a fixed stderr label, timeout, or what still held at the
+deadline), never just "old life never exited"; test 24's shell barrier labels
+its query failures, but its deadline message stays generic.
 
 Test 4 uses `slow-exit` to keep each old worker alive for 3 s after SessionEnd.
 It requires an observation of the old session at `ended` in both resume phases,

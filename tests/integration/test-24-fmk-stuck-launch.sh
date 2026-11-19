@@ -319,6 +319,9 @@ worker_tmux_query() {
     rm -f -- "${error_file}" || fail 'old life tmux diagnostic cleanup failed'
     case "${rc}" in
         0)
+            # An answer counts only with no stderr: 3.2a's "server version is
+            # too old for client" exits 0 with nothing on stdout.
+            [[ -z "${diagnostic}" ]] || fail "old life tmux query failed (status 0, $(worker_tmux_diagnostic "${diagnostic}" "${socket}"))"
             if [[ "${query}" == list-sessions ]]; then WORKER_TMUX_SESSION_IDS="${output}"
             else printf '%s' "${output}"; fi
             return 0 ;;

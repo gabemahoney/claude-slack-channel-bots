@@ -149,6 +149,7 @@ const EXIT_ONE_DIAGNOSTICS = [
   ['refused-text', 'error connecting to /scratch/recorded-socket (Connection refused)\n', false, 'connect-error:connection-refused'],
   ['long-errno', 'error connecting to /scratch/recorded-socket (Resource temporarily unavailable)\n', false, 'connect-error:resource-temporarily-una'],
   ['protocol', 'protocol version mismatch (client 8, server 7)\n', false, 'protocol-version-mismatch'],
+  // tmux 3.2a prints this with exit 0; see the status-0 case below. Here only its label at exit 1.
   ['server-too-old', 'server version is too old for client\n', false, 'server-too-old'],
   ['send-failure', 'failed to send command\n', false, 'send-failed'],
   ['command-too-long', 'command too long\n', false, 'command-too-long'],
@@ -185,6 +186,17 @@ test('default-socket no-server classification is bounded and accepts only the su
 test('a status-0 empty session list reads as absent', () => {
   const f = fixture(), life = captureLiveLife(f.row, f.probes)
   expect(sessionPresent(life, { ...f.probes, tmux: () => ({ status: 0, stdout: '' }) })).toBe(false)
+  expect(sessionPresent(life, { ...f.probes, tmux: () => ({ status: 0, stdout: '', diagnostic: 'no-stderr' }) })).toBe(false)
+})
+test('a status-0 answer with stderr (3.2a server-too-old) fails closed, at capture and in the barrier', () => {
+  const f = fixture(), life = captureLiveLife(f.row, f.probes)
+  const tooOld = { ...f.probes, tmux: () => ({ status: 0, stdout: '', diagnostic: tmuxDiagnostic('server version is too old for client\n', null) }) }
+  expect(() => sessionPresent(life, tooOld)).toThrow('old life tmux query failed: list-sessions exit 0 (server-too-old)')
+  expect(() => captureLiveLife(f.row, tooOld)).toThrow('old life pane identity unavailable: display-message exit 0 (server-too-old)')
+})
+test('an empty recorded socket is the default socket, as runTmux runs it', () => {
+  expect(tmuxDiagnostic('no server running on /tmp/tmux-1000/default\n', '')).toBe('no-server')
+  expect(tmuxDiagnostic('no server running on /\n', '')).toBe('no-server-foreign-socket')
 })
 test('the deadline failure names what still held', async () => {
   const f = fixture(), life = captureLiveLife(f.row, f.probes)
@@ -242,6 +254,7 @@ if [[ -e "$root/poll" && "$query" == list-sessions ]]; then
     case "$MODE" in
         unexpected-*) exit "\${MODE#unexpected-}" ;;
         exit-one-*) exit_one "\${MODE#exit-one-}" ;;
+        zero-too-old) printf 'server version is too old for client\\n' >&2; exit 0 ;;
         hang) while (( SECONDS < 5 )); do :; done ;;
         present) printf '$7\\n$8\\n'; exit 0 ;;
         replacement) printf '$8\\n$70\\n'; exit 0 ;;
@@ -289,6 +302,11 @@ test.each(EXIT_ONE_DIAGNOSTICS)('shell exit-one %s is absence only with a gone-s
     expect(result.status).toBe(absent ? 0 : 70)
     expect(result.stderr).toBe(absent ? '' : `FAIL: old life tmux query failed (status 1, ${label})\n`)
   })
+test('shell status-0 answer with stderr (3.2a server-too-old) fails closed', () => {
+  const result = shellControl('zero-too-old')
+  expect(result.status).toBe(70)
+  expect(result.stderr).toBe('FAIL: old life tmux query failed (status 0, server-too-old)\n')
+})
 test.each(['no-server', 'missing-socket', 'server-exited', 'permission', 'protocol'])('shell has-session exit-one %s keeps the positive control fail-closed', name => {
   const result = shellControl(`before-exit-one-${name}`, 'end')
   expect(result.status).toBe(70)
@@ -365,7 +383,8 @@ test.skipIf(!tmux32a)('native tmux 3.2a: the exited server leaves a stale socket
     now: () => Date.now(), sleep: (ms: number) => Bun.sleep(ms) }
   let serverPid = 0, panePid = 0
   try {
-    expect(runTmux(socket, ['new-session', '-d', '-s', 'old-life', 'sleep 60'], env).status).toBe(0)
+    // -f /dev/null: no host tmux.conf (e.g. exit-empty off) changes the server.
+    expect(runTmux(socket, ['-f', '/dev/null', 'new-session', '-d', '-s', 'old-life', 'sleep 60'], env).status).toBe(0)
     serverPid = Number(runTmux(socket, ['display-message', '-p', '-t', '=old-life:', '#{pid}'], env).stdout)
     const life = captureLiveLife({ tmux_session_name: 'old-life', tmux_socket: socket }, probes)
     panePid = life.pid
@@ -387,6 +406,8 @@ test.skipIf(!tmux32a)('native tmux 3.2a: the exited server leaves a stale socket
     expect(sessionPresent(life, probes)).toBe(false)
   } finally {
     for (const pid of [panePid, serverPid]) if (pid > 0 && nativeAlive(pid)) process.kill(pid, 'SIGKILL')
+    // A server whose pid was never read still goes; its result does not matter here.
+    if (existsSync(socket)) try { runTmux(socket, ['kill-server'], env) } catch {}
     rmSync(root, { recursive: true, force: true })
   }
 }, NATIVE_TMUX_EXIT_TEST_TIMEOUT_MS)
