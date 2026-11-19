@@ -4204,6 +4204,14 @@ so a replacement using the same name does not hold the old life's barrier.
 AD can refuse an earlier resume as "still stopping" even though the row already
 reads `ended`.
 
+An exit-1 query reads as "gone" only for the three tmux 3.2a client outcomes of
+a gone server: `no server running on <socket>` (the exited server leaves its
+socket file, so this is the usual one), `error connecting to <socket> (No such
+file or directory)`, and `server exited unexpectedly` (a query that reached the
+server while it exited). Anything else fails closed, and every barrier failure
+names its cause (query, status and a fixed stderr label, timeout, or what still
+held at the deadline), never just "old life never exited".
+
 Test 4 uses `slow-exit` to keep each old worker alive for 3 s after SessionEnd.
 It requires an observation of the old session at `ended` in both resume phases,
 then one strict resume preserving the original session ID and `--resume` args.

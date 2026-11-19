@@ -4398,7 +4398,12 @@ test('shared registered-hook controls bind the actual row and fail closed withou
   // the preload retain the process HOME, argv, console and clock untouched.
   const context = { env: { HOME: join(scratch, 'home') } as Record<string, string>, argv: [] as string[],
     log: (...args: unknown[]) => captured.push(args), now: clock.now, sleep: clock.advance,
-    waitLifeExit: async () => { if (oldLifeExitError) throw Error('old life never exited'); oldLifeExited = true; duringLifeExit?.() } }
+    waitLifeExit: async () => {
+      // Shaped like ended-life.ts's ExitBarrierError, plus a field the fixture must drop.
+      if (oldLifeExitError) throw Object.assign(Error('old life tmux query failed: list-sessions exit 1 (connect-error:permission-denied)'),
+        { facts: { barrier: 'tmux-query', query: 'list-sessions', status: 1, tmux: 'connect-error:permission-denied', check: 'forged', stderr: 'raw' } })
+      oldLifeExited = true; duringLifeExit?.()
+    } }
   mkdirSync(context.env.HOME!)
   const source = readFileSync(join(INTEGRATION_DIR, 'fixtures/shared-stub-permission.ts'), 'utf8')
   writeFileSync(join(scratch, 'permission-source.ts'), source)
@@ -4485,12 +4490,16 @@ test('shared registered-hook controls bind the actual row and fail closed withou
       assert.deepEqual(readFileSync(record),stateBefore)
       await assert.rejects(invoke('notice-resume',evidence));assert.equal(calls.filter(c=>c==='resume').length,1)
     })
-    await check('old-life timeout fails explicitly before any resume request',async()=>{
+    await check('an old-life barrier failure fails explicitly, with its cause, before any resume request',async()=>{
       reset();const evidence=await invoke('notice-end');oldLifeExitError=true
-      await assert.rejects(invoke('notice-resume',evidence),/old life never exited/)
+      await assert.rejects(invoke('notice-resume',evidence),/old life exit barrier failed/)
       assert(!calls.includes('resume'))
       assert.deepEqual(readFileSync(evidence,'utf8').trim().split('\n').map(l=>JSON.parse(l).phase),['end-requested','ended'])
-      assert.equal(auditFailure().step,'old life never exited')
+      assert.equal(auditFailure().step,'old life exit barrier')
+      const metadata=auditMetadata()!
+      for(const fact of ['check=old-life-exit','barrier=tmux-query','query=list-sessions','status=1','tmux=connect-error:permission-denied'])
+        assert(metadata.includes(fact),fact)
+      assert(!metadata.includes('forged')&&!metadata.includes('stderr='))
     })
     await check('notice journal rejects a changed or missing tmux session identity',async()=>{
       for(const changed of [undefined,'not-an-id','$8']) {

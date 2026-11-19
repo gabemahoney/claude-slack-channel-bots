@@ -46,6 +46,17 @@ function noticeFact(check: string, value: unknown): asserts value {
   failureFacts.check = check
   requireFact(value)
 }
+// The exit barrier's own labels (ExitBarrierError.facts: its cause, tmux exit
+// status and diagnostic label) name the underlying failure; failureMetadata
+// still redacts any value outside its label set.
+function barrierFacts(error: unknown): Record<string, string | number> {
+  const facts = (error as { facts?: unknown } | null)?.facts
+  if (!facts || typeof facts !== 'object') return { barrier: 'unlabelled' }
+  // Only ended-life.ts's fact names; failureMetadata still redacts each value.
+  const names = ['barrier', 'query', 'status', 'tmux', 'errno', 'session', 'process']
+  return Object.fromEntries(Object.entries(facts).filter(([name, value]) =>
+    names.includes(name) && (typeof value === 'string' || typeof value === 'number')))
+}
 function failureMetadata(): string | undefined {
   if (!Object.keys(failureFacts).length) return undefined
   const fields = Object.entries({ ...failureFacts, ad_state: failureState ?? 'unknown' })
@@ -114,7 +125,8 @@ async function noticeControl(client: NoticeClient, command: string, id: string, 
     const fresh = await read()
     noticeFact('end-fresh-waiting', fresh.state === 'waiting'); clean(fresh)
     failureFacts.check = 'end-live-life'
-    oldLife = captureLiveLife(fresh)
+    try { oldLife = captureLiveLife(fresh) }
+    catch (error) { Object.assign(failureFacts, barrierFacts(error)); throw error }
     save('end-requested', fresh, true)
     failureFacts.check = 'send-keys'
     await client.sendKeys({ instance_id: id, text: sentinel })
@@ -147,9 +159,10 @@ async function noticeControl(client: NoticeClient, command: string, id: string, 
       appendControl(modes, 'at-once\t' + work + '\n')
       failureFacts.check = 'old-life-exit'
       try { await waitForLifeExit(oldLife) }
-      catch {
-        failureStep = 'old life never exited'
-        throw new Error('old life never exited')
+      catch (error) {
+        failureStep = 'old life exit barrier'
+        Object.assign(failureFacts, barrierFacts(error))
+        throw new Error('old life exit barrier failed')
       }
       const fresh = await read()
       noticeFact('resume-fresh-ended', fresh.state === 'ended' && fresh.last_seen_at === first.last_seen_at); clean(fresh)

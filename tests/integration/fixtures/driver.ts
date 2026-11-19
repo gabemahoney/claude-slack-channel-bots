@@ -30,10 +30,20 @@ async function waitState(instance: string, allowed: string[]) {
   }
   driverFail('AD row never reached the expected state')
 }
+// Barrier failures name their cause (tmux exit and diagnostic label, process
+// probe, or the exit deadline), never one generic message.
+function barrierError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+function captureLife(phase: string, row: Parameters<typeof captureLiveLife>[0]): EndedLife {
+  try { return captureLiveLife(row) }
+  catch (error) { driverFail(`${phase.toLowerCase()} ${barrierError(error)}`) }
+}
 async function exitBarrier(phase: string, life: EndedLife) {
-  if (sessionPresent(life)) console.log(`DRIVER: ${phase}_OLD_SESSION_PRESENT_AT_ENDED`)
-  try { await waitForLifeExit(life) }
-  catch { driverFail('old life never exited') }
+  try {
+    if (sessionPresent(life)) console.log(`DRIVER: ${phase}_OLD_SESSION_PRESENT_AT_ENDED`)
+    await waitForLifeExit(life)
+  } catch (error) { driverFail(`${phase.toLowerCase()} ${barrierError(error)}`) }
 }
 async function main() {
   const personaCfg = resolvePersonaConfig(
@@ -82,7 +92,7 @@ async function main() {
   if (!first.session_id) driverFail('fresh launch has no AD session identity')
   console.log(`DRIVER: SESSION_ID ${first.session_id}`)
   console.log('DRIVER: PHASE1_OK')
-  const firstLife = captureLiveLife(first)
+  const firstLife = captureLife('PHASE1', first)
   await getClient().sendKeys({ instance_id: instanceId, text: '__CSCB_TEST_EXIT__' })
   const ended = await waitState(instanceId, ['ended', 'missing'])
   if (!ended.session_id) driverFail('terminal row has no AD session identity')
@@ -93,7 +103,7 @@ async function main() {
   const second = await waitState(instanceId, ['waiting'])
   if (second.session_id !== first.session_id) driverFail('phase2 changed AD session identity')
   console.log('DRIVER: PHASE2_OK')
-  const secondLife = captureLiveLife(second)
+  const secondLife = captureLife('PHASE2', second)
   await getClient().sendKeys({ instance_id: instanceId, text: '__CSCB_TEST_EXIT__' })
   await waitState(instanceId, ['ended', 'missing'])
   await exitBarrier('PHASE3', secondLife)

@@ -327,25 +327,54 @@ worker_tmux_query() {
                 worker_tmux_no_server "${diagnostic}" "${socket}"; then return 1; fi ;;
         124|137) fail 'old life tmux query timed out' ;;
     esac
-    fail "old life tmux query failed (status ${rc})"
+    fail "old life tmux query failed (status ${rc}, $(worker_tmux_diagnostic "${diagnostic}" "${socket}"))"
 }
 
-# tmux 3.2a client.c connection diagnostics. Never print the raw diagnostic.
-worker_tmux_no_server() {
-    local diagnostic="$1" socket="$2" path
-    (( ${#diagnostic} <= 4096 )) || return 1
+# worker_tmux_diagnostic <stderr> <socket>: a fixed label for a tmux 3.2a
+# client's stderr (client.c client_main and client_exit_message), the same
+# labels as fixtures/ended-life.ts tmuxDiagnostic. Never print the raw
+# diagnostic. A path other than the queried socket gets -foreign-socket.
+worker_tmux_diagnostic() {
+    local LC_ALL=C diagnostic="$1" socket="$2" path label errno slug c i run=0
+    local mismatch='^protocol version mismatch \(client [0-9]+, server [0-9]+\)$'
+    local connect='^error connecting to (.+) \(([^()]+)\)$'
+    [[ -n "${diagnostic}" ]] || { printf 'no-stderr'; return 0; }
+    (( ${#diagnostic} <= 4096 )) || { printf 'oversized-stderr'; return 0; }
     diagnostic="${diagnostic%$'\n'}"
-    [[ "${diagnostic}" != *$'\n'* && "${diagnostic}" != *$'\r'* ]] || return 1
+    [[ "${diagnostic}" != *$'\n'* && "${diagnostic}" != *$'\r'* ]] || { printf 'multi-line-stderr'; return 0; }
     case "${diagnostic}" in
-        'no server running on '*) path="${diagnostic#no server running on }" ;;
-        'error connecting to '*' (No such file or directory)')
-            path="${diagnostic#error connecting to }"
-            path="${path% (No such file or directory)}" ;;
+        'server exited unexpectedly') printf 'server-exited-unexpectedly'; return 0 ;;
+        'failed to send command') printf 'send-failed'; return 0 ;;
+        'command too long') printf 'command-too-long'; return 0 ;;
+        'server version is too old for client') printf 'server-too-old'; return 0 ;;
+    esac
+    if [[ "${diagnostic}" =~ ${mismatch} ]]; then printf 'protocol-version-mismatch'; return 0; fi
+    if [[ "${diagnostic}" == 'no server running on '?* ]]; then
+        path="${diagnostic#no server running on }" label=no-server
+    elif [[ "${diagnostic}" =~ ${connect} ]]; then
+        path="${BASH_REMATCH[1]}" errno="${BASH_REMATCH[2],,}" slug=""
+        for (( i = 0; i < ${#errno}; i++ )); do
+            c="${errno:i:1}"
+            if [[ "${c}" == [a-z0-9] ]]; then slug+="${c}" run=0
+            elif (( run == 0 )); then slug+=- run=1; fi
+        done
+        if [[ "${slug}" == no-such-file-or-directory ]]; then label=missing-socket
+        else label="connect-error:${slug:0:24}"; fi
+    else
+        printf 'unrecognised-stderr'; return 0
+    fi
+    if [[ -n "${socket}" && "${path}" == "${socket}" || -z "${socket}" && "${path}" == /?* ]]; then printf '%s' "${label}"
+    else printf '%s-foreign-socket' "${label}"; fi
+}
+
+# The tmux 3.2a client outcomes that prove the queried server is gone: no
+# socket file, a stale socket file the exited server left (ECONNREFUSED), and
+# a connection the exiting server closed unanswered. Anything else fails closed.
+worker_tmux_no_server() {
+    case "$(worker_tmux_diagnostic "$1" "$2")" in
+        no-server|missing-socket|server-exited-unexpectedly) return 0 ;;
         *) return 1 ;;
     esac
-    [[ -n "${path}" ]] || return 1
-    if [[ -n "${socket}" ]]; then [[ "${path}" == "${socket}" ]]
-    else [[ "${path}" == /* ]]; fi
 }
 
 # call_table <file>: write <file>, one TAB-separated line per agent-director
