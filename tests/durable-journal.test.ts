@@ -96,6 +96,24 @@ const syncs = (ops: Op[]) => ops.filter(op => op.step === 'sync').map(op => op.p
 /** Lets every unheld durable step finish, so each operation has settled or waits on a hold. */
 async function quiesce(r: ReturnType<typeof recordingFs>) { do { await r.io.idle(); await yieldToEventLoop() } while (r.io.busy()) }
 
+test('compaction sync scope crosses no-op reconciliation and pauses only after rewrite prelude reaches native I/O', async () => {
+  const r = recordingFs(), j = journal(r.fs), events: string[] = []
+  const scope = { phase() {}, stop() {}, pause() { events.push('pause') }, resume() { events.push('resume') } }
+  await j.ensureDir(); r.ops.length = 0
+  await j.reconcileRollback(path, {}, scope)
+  expect(events).toEqual([]) // an already-resolved promise is not a macrotask boundary
+  const gate = Promise.withResolvers<void>()
+  r.control.hold = op => op.step === 'sync' && op.path.endsWith('.tmp') ? gate.promise : undefined
+  r.control.before = op => { if (op.step === 'write') expect(events).toEqual([]) }
+  const pending = j.rewrite(path, Buffer.from('new-image\n'), scope)
+  expect(events).toEqual(['pause'])
+  expect(fs.existsSync(path)).toBe(false)
+  gate.resolve(); await pending
+  expect(events).toEqual(['pause', 'resume', 'pause', 'resume', 'pause', 'resume'])
+  expect(read().toString()).toBe('new-image\n')
+  expect(durableSteps(r.ops).map(op => op.step)).toEqual(['sync', 'rename', 'sync'])
+})
+
 describe('directory durability and modes', () => {
   test.each(['async', 'sync'] as const)('%s appends set mode once per journal file, reopen and replacement', async form => {
     const r = recordingFs()

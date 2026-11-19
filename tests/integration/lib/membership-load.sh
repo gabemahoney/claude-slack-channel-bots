@@ -440,6 +440,7 @@ run_membership_load() {
     MEMBERSHIP_PROFILE_CASE=''
     if [[ "${CSCB_TEST_DIAGNOSTICS:-}" == 1 ]]; then MEMBERSHIP_PROFILE_CASE="${4:-}"; fi
     E="${SCENARIO_FIXTURES}/sr8-evidence.ts"
+    source "${SCENARIO_FIXTURES}/../lib/sr8-attribution.sh"
     PRINTER="${SCENARIO_FIXTURES}/fmk-texts.ts"
     # Every burst driver runs off the server's CPU quota; driver-cpu judges that.
     BURST_DRIVER="${SCENARIO_FIXTURES}/burst-driver.sh"

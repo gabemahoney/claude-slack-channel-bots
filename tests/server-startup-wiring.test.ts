@@ -1,3 +1,4 @@
+import { startStallAttribution, testSyncWorkStart } from '../src/test-stall-attribution.ts'
 import { createChannelMembership } from '../src/channel-membership.ts'
 import { createMembershipScanner, membershipConnectionListener } from '../src/channel-membership-scan.ts'
 import { createMembershipReadiness } from '../src/channel-membership-readiness.ts'
@@ -5801,11 +5802,11 @@ describe('test-only measurement wiring (Decision 25)', () => {
     const flags: boolean[] = [], intervals: Array<[string, number]> = [], recorded: TestMeasurement[] = []
     const forwarded: QueueEvent[] = [], original = (event: QueueEvent) => { forwarded.push(event) }
     const deliveryQueueEvents = { emit: original }
-    const postHoldDeps: Pick<PostHoldsModule.PostHoldResolverDeps, 'onEvent'> = {}
+    const postHoldDeps: Pick<PostHoldsModule.PostHoldResolverDeps, 'onEvent' | 'onTiming'> = {}
     let appendTimer: DurableAppendTimer | undefined, saveObserver: ((save: ThreadMemorySave) => void) | undefined
     let compactionObserver: ((compaction: ThreadMemoryModule.ThreadMemoryCompaction) => void) | undefined
     const compactionObservers: Array<typeof compactionObserver> = []
-    let created = 0, unrefs = 0
+    let created = 0, unrefs = 0, attributionStarts = 0, attributionStops = 0
     const result = expression<() => {
       stop(): Promise<void>; apply(config: PersonaConfig): void; recorder(): TestMeasurements | undefined
       ackObserver(): ((timing: AckTiming) => void) | undefined
@@ -5817,6 +5818,14 @@ describe('test-only measurement wiring (Decision 25)', () => {
         ackObserver: () => ackTimingObserver };
     }`, {
       config, installTestTimerOverrides, configInEffect,
+      HOLD_CLOCK: { now: clock.now },
+      startStallAttribution: (enabled: boolean, deps: Parameters<typeof startStallAttribution>[1]) => {
+        attributionStarts++
+        const stop = startStallAttribution(enabled, { ...deps, now: clock.now, cpu: () => ({ user: 0, system: 0 }),
+          heap: () => ({ heap_used: 1, heap_total: 2 }), read: () => { throw new Error('unavailable fixture cgroup') },
+          timers: { setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout } })
+        return () => { attributionStops++; stop() }
+      },
       deliveryPreparation: undefined, sharedStateReporting: undefined,
       deliveryQueue: { setMeasureTimings: (value: boolean) => { flags.push(value) }, startMaintenance: (ms: number) => { intervals.push(['queue', ms]) } },
       threadMemory: {
@@ -5843,8 +5852,27 @@ describe('test-only measurement wiring (Decision 25)', () => {
     const run = result(); stops.push(run.stop)
     return { ...run, root, config, clock, logs, flags, intervals, recorded, forwarded, deliveryQueueEvents, original, postHoldDeps,
       appendTimer: () => appendTimer, saveObserver: () => saveObserver, compactionObserver: () => compactionObserver, compactionObservers,
+      attributionStarts: () => attributionStarts, attributionStops: () => attributionStops,
       created: () => created, unrefs: () => unrefs, path: join(root, TEST_MEASUREMENTS_FILE_NAME) }
   }
+
+  test.each([undefined, false, true].flatMap(measurements => [undefined, false, true].map(timings =>
+    [measurements, timings, measurements === true ? 1 : 0] as const)))(
+    'attribution follows only the base switch: measurements=%s timings=%s', async (measurements, timings, count) => {
+      const h = wired(measurements, undefined, undefined, timings)
+      expect(h.attributionStarts()).toBe(count)
+      expect(h.clock.pendingCount()).toBe(count)
+      expect(testSyncWorkStart()).toBe(count ? h.clock.now() : undefined)
+      expect(typeof h.postHoldDeps.onTiming).toBe(count ? 'function' : 'undefined')
+      if (count) h.postHoldDeps.onTiming!({ kind: 'post-hold-timing', key: 'alpha', seq: 1, phase: 'evaluate',
+        received_mono_ms: 1, due_mono_ms: 3001, at_mono_ms: 3005 })
+      expect(h.recorded.filter(r => r.kind === 'post-hold-timing')).toHaveLength(count)
+      await h.stop()
+      expect(h.attributionStops()).toBe(count)
+      expect(h.clock.pendingCount()).toBe(0)
+      expect(h.postHoldDeps.onTiming).toBeUndefined()
+      expect(testSyncWorkStart()).toBeUndefined()
+    })
 
   test('one strict switch read follows the one start resolution beside test_mcp_drop_endpoint; all measurement effects are in its true branch', () => {
     expect(enabledAt).toBeGreaterThan(installAt)
@@ -5861,6 +5889,9 @@ describe('test-only measurement wiring (Decision 25)', () => {
       within(onlyCallOf(name), branch)
       expect(timingsBranch.getText(tree)).not.toContain(`${name}(`)
     }
+    within(onlyCallOf('startStallAttribution'), branch)
+    expect(timingsBranch.getText(tree)).not.toContain('startStallAttribution(')
+    expect(timingsBranch.getText(tree)).not.toContain('postHoldDeps.onTiming')
     // Compactions need only test_measurements, including the startup compactions.
     const compactionCalls = callsOf('threadMemory\\??\\.setCompactionObserver')
     expect(compactionCalls).toHaveLength(2)
@@ -5963,6 +5994,8 @@ describe('test-only measurement wiring (Decision 25)', () => {
       expect(h.saveObserver()).toBeUndefined()
       expect(h.compactionObserver()).toBeUndefined()
       expect(h.compactionObservers).toEqual([])
+      expect(h.attributionStarts()).toBe(0)
+      expect(h.postHoldDeps.onTiming).toBeUndefined()
     }
     noNewObservers()
     h.apply({ ...h.config, test_measurements: true, test_measurement_timings: true })
@@ -5987,6 +6020,8 @@ describe('test-only measurement wiring (Decision 25)', () => {
     expect(h.created()).toBe(1)
     expect(h.flags).toEqual([true])
     expect(h.postHoldDeps.onEvent).toBeFunction()
+    expect(h.postHoldDeps.onTiming).toBeFunction()
+    expect(h.attributionStarts()).toBe(1)
     const noTimingObservers = () => {
       expect(h.ackObserver()).toBeUndefined()
       expect(h.appendTimer()).toBeUndefined()
@@ -6104,6 +6139,7 @@ describe('test-only measurement wiring (Decision 25)', () => {
     }
     visit(tree)
     expect(cleanup).toEqual([`() => {
+      stopAttribution(); delete postHoldDeps.onTiming
       deliveryQueueEvents.emit = emit; delete postHoldDeps.onEvent; ackTimingObserver = undefined
       setDurableAppendTimer(undefined); threadMemory?.setSaveObserver(undefined)
       threadMemory?.setCompactionObserver(undefined)
@@ -7677,9 +7713,9 @@ describe('Memory Hold server wiring', () => {
     const declared = indicesOf(new RegExp(`^const\\s+${name}\\s*:\\s*PostHoldClock\\s*=`, 'gm'), SERVER_CODE)
     expect(declared).toHaveLength(1)
     expect(insideMain(declared[0]!)).toBe(false)
-    // Named only by its declaration, routing's receipt reading and the resolver's clock.
+    // Shared by declaration, routing receipt, resolver and the test-only stall probe.
     const named = indicesOf(new RegExp(`\\b${name}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(3)
+    expect(named).toHaveLength(4)
     expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
     expect(objectProperties(spreadConstObject('postHoldDeps')).get('clock')).toBe(name)
     expect(onlyCallProps('createPersonaRouting').get('monotonicNow')).toBe(`${name}.now`)

@@ -1,3 +1,4 @@
+import { testSyncWorkStart, testSyncWorkEnd } from './test-stall-attribution.ts'
 import { closeSync, existsSync, fstatSync, openSync, renameSync, rmSync, statSync, writeSync } from 'node:fs'
 
 // --- Logging ---
@@ -165,29 +166,32 @@ export function appendLogLine(path: string, text: string, at?: number): AppendLo
 
 function makeLogFn(original: (...args: unknown[]) => void): (...args: unknown[]) => void {
   return (...args: unknown[]): void => {
-    const line = logLine(formatArgs(args), Date.now())
-    // Recover a dropped fd: if a prior rotation reopen failed but the target
-    // path is still known, retry the open here. Best-effort — a failure leaves
-    // fd null and we fall back to console for this write, retrying next time.
-    if (fd === null && currentPath !== null) {
-      try {
-        fd = openSync(currentPath, 'a')
-      } catch {
-        fd = null
-      }
-    }
-    if (fd !== null) {
-      try {
-        maybeRotate()
-        if (fd !== null) {
-          writeSync(fd, line + '\n')
-          return
+    const syncStart = testSyncWorkStart()
+    try {
+      const line = logLine(formatArgs(args), Date.now())
+      // Recover a dropped fd: if a prior rotation reopen failed but the target
+      // path is still known, retry the open here. Best-effort — a failure leaves
+      // fd null and we fall back to console for this write, retrying next time.
+      if (fd === null && currentPath !== null) {
+        try {
+          fd = openSync(currentPath, 'a')
+        } catch {
+          fd = null
         }
-      } catch {
-        // fall through to original
       }
-    }
-    original(...args)
+      if (fd !== null) {
+        try {
+          maybeRotate()
+          if (fd !== null) {
+            writeSync(fd, line + '\n')
+            return
+          }
+        } catch {
+          // fall through to original
+        }
+      }
+      original(...args)
+    } finally { testSyncWorkEnd(syncStart, 'server-log-write') }
   }
 }
 

@@ -4,6 +4,7 @@ import { appendFileSync, mkdtempSync, readFileSync, rmSync, statSync } from 'nod
 import { appendFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { AttributionMeasurement } from '../src/test-stall-attribution.ts'
 import type { QueueEvent } from '../src/delivery-queue.ts'
 import type { DurableAppendTiming } from '../src/durable-journal.ts'
 import type { AckTiming } from '../src/persona-routing.ts'
@@ -81,9 +82,9 @@ function harness(overrides: Partial<TestMeasurementsDeps> = {}) {
 }
 
 describe('test-only measurement records (Decision 25)', () => {
-  test('the schema has exactly seven kinds; the filename, flush delay and loud line are exported', () => {
-    const kinds: Record<TestMeasurement['kind'], true> = { store: true, 'resolution-store': true, 'post-hold-resolved': true, ack: true, append: true, 'thread-save': true, 'thread-compaction': true }
-    expect(Object.keys(kinds)).toEqual(['store', 'resolution-store', 'post-hold-resolved', 'ack', 'append', 'thread-save', 'thread-compaction'])
+  test('the schema has exactly ten kinds; the filename, flush delay and loud line are exported', () => {
+    const kinds: Record<TestMeasurement['kind'], true> = { store: true, 'resolution-store': true, 'post-hold-resolved': true, ack: true, append: true, 'thread-save': true, 'thread-compaction': true, 'post-hold-timing': true, 'event-loop-stall': true, 'sync-work': true }
+    expect(Object.keys(kinds)).toEqual(['store', 'resolution-store', 'post-hold-resolved', 'ack', 'append', 'thread-save', 'thread-compaction', 'post-hold-timing', 'event-loop-stall', 'sync-work'])
     expect(TEST_MEASUREMENTS_FILE_NAME).toBe('test-measurements.jsonl')
     expect(TEST_MEASUREMENTS_FLUSH_MS).toBe(250)
     expect(TEST_MEASUREMENTS_STOP_WAIT_MS).toBe(1_000)
@@ -94,6 +95,27 @@ describe('test-only measurement records (Decision 25)', () => {
       `[slack] test-only measurement record: shutdown incomplete for ${JSON.stringify(path)} (write failed); 2 records not confirmed written, kept in memory only; unwritten records will be lost on process exit`,
     )
     assertNoLeak(line)
+  })
+
+  test('attribution rows preserve their observed monotonic times and omit unrelated fields', async () => {
+    const h = harness()
+    const entries: AttributionMeasurement[] = [
+      { kind: 'post-hold-timing', key: 'reader', seq: 7, phase: 'callback', received_mono_ms: 1, due_mono_ms: 3001, armed_delay_ms: 3000, at_mono_ms: 3010 },
+      { kind: 'sync-work', key: 'reader', work: 'thread-judge', start_mono_ms: 2990, end_mono_ms: 3010, at_mono_ms: 3010 },
+      { kind: 'event-loop-stall', start_mono_ms: 2990, end_mono_ms: 3010, at_mono_ms: 3010, expected_mono_ms: 3000,
+        gap_ms: 10, elapsed_ms: 20, cpu_user_usec: 1, cpu_system_usec: 2, cpu_stat: null, cpu_stat_delta: null,
+        cpu_stat_before_mono_ms: 2990, heap_before: null, heap_after: null,
+        resource_delta: { minorPageFault: 1, majorPageFault: 0, voluntaryContextSwitches: 2, involuntaryContextSwitches: 3, fsRead: 4, fsWrite: 5 },
+        resource_before_mono_ms: 2990, system_sampling: 'stall-end', system_before_mono_ms: 2500, system_after_mono_ms: 3010,
+        pressure: { cpu: { some: 100, full: 0 }, memory: null, io: null }, pressure_delta: { cpu: { some: 10, full: 0 }, memory: null, io: null },
+        memory_current: 100, memory_max: 'max', memory_stat: { anon: 70, workingset_refault_file: 4 }, memory_stat_delta: { anon: -2, workingset_refault_file: 1 },
+        host_steal_ticks: 90, host_steal_delta_ticks: 1 },
+    ]
+    for (const entry of entries) { const contaminated = { ...entry, body: LEAK_SENTINEL }; h.recorder.record(contaminated) }
+    await h.recorder.stop()
+    expect(h.records()).toEqual(entries.map(entry => ({ v: 1, ...entry, process_id: process.pid })))
+    assertNoLeak(h.bytes().toString())
+    expect(h.bytes().toString()).not.toContain(LEAK_SENTINEL)
   })
 
   const rows: Array<{ name: string; event: QueueEvent | PostHoldEvent; entry: TestMeasurement }> = [

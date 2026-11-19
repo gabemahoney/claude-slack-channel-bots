@@ -1,4 +1,5 @@
 /** Shared byte-level journal operations. Construction performs no I/O. */
+import { testSyncWorkStart, testSyncWorkEnd, type TestSyncWorkScope } from './test-stall-attribution.ts'
 import * as nodeFs from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { types } from 'node:util'
@@ -173,11 +174,14 @@ export function createDurableJournal(options: DurableJournalOptions) {
     entry.file = file
   }
   function runSync(steps: DurableSteps): void {
-    for (let next = steps.next(); !next.done;) {
-      const step = next.value
-      try { if (step.op === 'fsync') fs.fsyncSync(step.fd); else fs.renameSync(step.from, step.to) } catch (error) { next = steps.throw(error); continue }
-      next = steps.next()
-    }
+    const start = testSyncWorkStart()
+    try {
+      for (let next = steps.next(); !next.done;) {
+        const step = next.value
+        try { if (step.op === 'fsync') fs.fsyncSync(step.fd); else fs.renameSync(step.from, step.to) } catch (error) { next = steps.throw(error); continue }
+        next = steps.next()
+      }
+    } finally { testSyncWorkEnd(start, 'journal-sync-recovery') }
   }
   function perform(step: DurableStep): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -186,22 +190,32 @@ export function createDurableJournal(options: DurableJournalOptions) {
       else fs.rename(step.from, step.to, done)
     })
   }
-  async function run(steps: DurableSteps, times?: StepTimes): Promise<void> {
-    for (let next = steps.next(); !next.done;) {
+  function nextStep(steps: DurableSteps): IteratorResult<DurableStep, void> {
+    const start = testSyncWorkStart()
+    try { return steps.next() } finally { testSyncWorkEnd(start, 'journal-sync-step') }
+  }
+  function failedStep(steps: DurableSteps, error: unknown): IteratorResult<DurableStep, void> {
+    const start = testSyncWorkStart()
+    try { return steps.throw(error) } finally { testSyncWorkEnd(start, 'journal-rollback-step') }
+  }
+  async function run(steps: DurableSteps, times?: StepTimes, scope?: TestSyncWorkScope): Promise<void> {
+    for (let next = nextStep(steps); !next.done;) {
       const started = times?.now()
-      try { await perform(next.value) } catch (error) { next = steps.throw(error); continue }
+      scope?.pause()
+      try { await perform(next.value) } catch (error) { scope?.resume(); next = failedStep(steps, error); continue }
+      scope?.resume()
       if (times && started !== undefined && next.value.op === 'fsync') {
         const ms = times.now() - started
         times.fsyncs++
         if (next.value.target === 'dir') times.dirFsyncMs += ms; else times.fileFsyncMs += ms
       }
-      next = steps.next()
+      next = nextStep(steps)
     }
   }
-  async function timedAppend(timer: DurableAppendTimer, path: string, bytes: Uint8Array, rollback?: AppendRollback): Promise<void> {
+  async function timedAppend(timer: DurableAppendTimer, path: string, bytes: Uint8Array, rollback?: AppendRollback, scope?: TestSyncWorkScope): Promise<void> {
     const times: StepTimes = { now: () => timer.now(), fileFsyncMs: 0, dirFsyncMs: 0, fsyncs: 0 }
     const started = timer.now()
-    await run(appendSteps(path, bytes, rollback), times)
+    await run(appendSteps(path, bytes, rollback), times, scope)
     try {
       const atMonoMs = timer.now()
       let records = 0
@@ -241,8 +255,11 @@ export function createDurableJournal(options: DurableJournalOptions) {
     if (generation === directoryGeneration) durableDirectory = { dev: stat.dev, ino: stat.ino }
   }
   function writeAll(fd: number, bytes: Uint8Array): void {
-    let offset = 0
-    while (offset < bytes.length) { const n = fs.writeSync(fd, bytes, offset, bytes.length - offset); if (n <= 0) throw new Error('Short queue write'); offset += n }
+    const start = testSyncWorkStart()
+    try {
+      let offset = 0
+      while (offset < bytes.length) { const n = fs.writeSync(fd, bytes, offset, bytes.length - offset); if (n <= 0) throw new Error('Short queue write'); offset += n }
+    } finally { testSyncWorkEnd(start, 'journal-write') }
   }
   function ensureFileMode(path: string, fd: number, stat: nodeFs.Stats): void {
     const previous = fileModes.get(path)
@@ -312,15 +329,15 @@ export function createDurableJournal(options: DurableJournalOptions) {
     ensureDir: (): Promise<void> => run(ensureDirSteps()),
     /** Resolves once the bytes and the directory entry are durable. The caller's
      * serialized writer must own `path` and `rollback` until it settles. */
-    durableAppend: (path: string, bytes: Uint8Array, rollback?: AppendRollback): Promise<void> => {
+    durableAppend: (path: string, bytes: Uint8Array, rollback?: AppendRollback, scope?: TestSyncWorkScope): Promise<void> => {
       const timer = appendTimer
-      return timer ? timedAppend(timer, path, bytes, rollback) : run(appendSteps(path, bytes, rollback))
+      return timer ? timedAppend(timer, path, bytes, rollback, scope) : run(appendSteps(path, bytes, rollback), undefined, scope)
     },
     /** Blocking form, only for Thread Memory's read-time quarantine inside its
      * synchronous journal read (start, bring-up, read retry). */
     durableAppendSync: (path: string, bytes: Uint8Array, rollback?: AppendRollback): void => runSync(appendSteps(path, bytes, rollback)),
-    reconcileRollback: (path: string, j: AppendRollback): Promise<void> => run(reconcileSteps(path, j)),
-    rewrite: (path: string, bytes: Uint8Array): Promise<void> => run(rewriteSteps(path, bytes)),
+    reconcileRollback: (path: string, j: AppendRollback, scope?: TestSyncWorkScope): Promise<void> => run(reconcileSteps(path, j), undefined, scope),
+    rewrite: (path: string, bytes: Uint8Array, scope?: TestSyncWorkScope): Promise<void> => run(rewriteSteps(path, bytes), undefined, scope),
     /** The caller's read of the file at `path`. A successful open is an opening
      * even if the read then fails, so a failure counts only when it names a
      * step after the open. Any other failure, ENOENT or one naming no syscall

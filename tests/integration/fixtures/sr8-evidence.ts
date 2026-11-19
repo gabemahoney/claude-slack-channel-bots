@@ -558,6 +558,7 @@ export const SR8_ACK_LIMIT_MS = 3_000
 export const SR8_STORE_LIMIT_MS = 50
 /** The server's test-only diagnostic measurement kinds; only `observe` reads them. */
 export const SR8_DIAGNOSTIC_KINDS: readonly string[] = ['ack', 'append', 'thread-save']
+export const SR8_ATTRIBUTION_KINDS: readonly string[] = ['post-hold-timing', 'event-loop-stall', 'sync-work']
 /** Linux USER_HZ: the tick rate of /proc/<pid>/stat CPU times. */
 export const SR8_USER_HZ = 100
 export type Verdict = 'pass' | 'fail' | 'missing' | 'recorded'
@@ -1601,11 +1602,19 @@ const numeric = (raw: string | undefined) => raw?.trim() ? Number(raw) : NaN
 function diagnostics(path: string, key: string) {
   return scanDiagnostics(textFile(path), key, printer('MEMBERSHIP_INVENTORY_INCOMPLETE'), printer('MEMBERSHIP_INVENTORY_COMPLETE'))
 }
+/** Loaded only after main's image check, like the other evidence helpers. */
+async function printAttribution(c: Context, file: string, offset: number): Promise<void> {
+  try {
+    const { attributionLines, readAttributionRows } = await import('./sr8-attribution.ts')
+    for (const line of attributionLines(c, readAttributionRows(file, offset))) console.log(line)
+  } catch { console.log(`recorded: sr8 attribution scenario=${c.scenario} type=unavailable verdict=info`) }
+}
 async function additional(command: string, c: Context, args: string[]): Promise<Result[] | undefined> {
   if (command === 'pending-post') {
     countArgs(args, 18)
     const [key, operation, start, end, before, after, probes, queue, times, measurement, mark, channel,
       burstDir, startSeq, endSeq, compact, measuredStart, windowEnd] = args
+    await printAttribution(c, measurement, numeric(mark))
     const ps = tsv(probes, ['parent', 'channel', 'ts', 'envelope_id']) as PendingProbe[] | undefined
     // A named channel fixes this case independently of the journal contents.
     const b = evidenceRows(before), a = evidenceRows(after)
@@ -1715,7 +1724,7 @@ async function additional(command: string, c: Context, args: string[]): Promise<
  * `observe` (SR8_DIAGNOSTIC_KINDS); `thread-compaction` feeds only the compaction
  * proof, which checks its own fields; any other unknown kind is still invalid. */
 function measurements(path: string, offset: number): Measurement[] | undefined {
-  const rows = jsonl(path, offset, true)?.filter(r => !SR8_DIAGNOSTIC_KINDS.includes(r?.kind))
+  const rows = jsonl(path, offset, true)?.filter(r => !SR8_DIAGNOSTIC_KINDS.includes(r?.kind) && !SR8_ATTRIBUTION_KINDS.includes(r?.kind))
   return rows?.every(r => r.v === 1 && ['store', 'resolution-store', 'post-hold-resolved', 'thread-compaction'].includes(r.kind)
     && typeof r.key === 'string' && nonnegative(r.at_mono_ms)) ? rows : undefined
 }
@@ -2071,6 +2080,7 @@ async function faultCommands(command: string, c: Context, args: string[]): Promi
   const [, stub, clearMark, clearAt, measurement, mark, start, ready] = args, p = await population(), { percentile } = await import('./transcript-receipts.ts')
   const queues = Object.fromEntries(plan.keys.map(key => [key, evidenceRows(join(dir, `${key}.queue.jsonl`))]))
   const duringQueues = Object.fromEntries(plan.keys.map(key => [key, evidenceRows(join(dir, 'during', `${key}.queue.jsonl`))]))
+  await printAttribution(c, measurement, numeric(mark))
   const e: FaultLoadEvidence = { plan, ledger, stub: evidenceRows(stub), during: timingRows(join(dir, 'during-times.jsonl')), times: timingRows(join(dir, 'times.jsonl')),
     queues, duringQueues, rows: measurements(measurement, numeric(mark)), clearMark: numeric(clearMark), clearAt: numeric(clearAt) }
   const rows = faultLoadVerdicts(e, { roots: p.SR8_BURST_JOINS, replies: p.SR8_BURST_REPLIES, dropped: p.SR8_BURST_DROPPED }, Number(printer('THREAD_REPLY_HOLD_MS')), percentile)
@@ -2197,6 +2207,7 @@ async function check(c: Context, args: string[]): Promise<Result[]> {
   const [dir, measurementFile, mark, start, ready, required = '0', n2File] = args
   if (args.length === 6 || !Number.isSafeInteger(Number(required)) || Number(required) < 0) throw new Error('usage')
   const p = await population(), { percentile } = await import('./transcript-receipts.ts'), keys = p.sr8Personas(c.recipients)
+  await printAttribution(c, measurementFile, Number(mark))
   const rows = measurements(measurementFile, Number(mark)), items: BurstItem[] | undefined = jsonl(join(dir, 'burst.jsonl')), times = jsonl(join(dir, 'times.jsonl'))
   const acceptedItems = items?.filter(i => ['roots', 'replies', 'held'].includes(i.phase)) ?? []
   const accepted: Accepted[] = [], holds: Accepted[] = [], joins: Result[] = [], ordinary: (Accepted & { envelope_id?: string })[] = []
@@ -2290,6 +2301,11 @@ export function cpuConditionFields(cpuMax: string | undefined, before: string | 
 
 /** The measured server's CPU quota, in CPUs: a shard's `CPUS_PER_SHARD` (scripts/ci-run.ts), which the driver's own CPU leaves unchanged. */
 export const SR8_SERVER_CPUS = 2
+/**
+ * The CPUs a burst-driver shard's container must leave above the server's and the driver's quotas. With
+ * 0.1 CPU the container's quota throttled the server's group, unseen in its own cpu.stat (b.9p6).
+ */
+export const SR8_CONTAINER_HEADROOM_CPUS = 1
 /** A cgroup v2 path from `/proc/<pid>/cgroup`'s `0::` line, below the namespace root; undefined when absent or not a plain path. Pure. */
 export function cgroupPathOf(text: string | undefined): string | undefined {
   const path = text?.match(/^0::(.*)$/m)?.[1]
@@ -2338,7 +2354,8 @@ export function cgroupWriteAccess(paths: string[], probe: (path: string, file: s
  * the smallest cpu.max on its path. The server's must be `SR8_SERVER_CPUS`;
  * each recorded driver run's must be finite; and every cgroup holding both
  * (their common ancestors, the server's own when they share it) must allow
- * the server's CPUs plus the driver's. The server's UID, checking from the
+ * the server's CPUs plus the driver's plus `SR8_CONTAINER_HEADROOM_CPUS`.
+ * The server's UID, checking from the
  * server's group, must be able to open none of the guarded files on either
  * path for writing, so it can neither move a process nor change a limit.
  * Any other placement, an unreadable path or cpu.max, a writable guarded
@@ -2356,7 +2373,7 @@ export function driverCpuVerdict(server: string | undefined, drivers: (string | 
   const fits = (driver: string | undefined) => {
     const serverCpus = cpusOf(server), driverCpus = cpusOf(driver), common = shared(driver)
     return serverCpus === SR8_SERVER_CPUS && driverCpus !== undefined && Number.isFinite(driverCpus)
-      && !!common?.every(c => c !== undefined && c >= serverCpus + driverCpus)
+      && !!common?.every(c => c !== undefined && c >= serverCpus + driverCpus + SR8_CONTAINER_HEADROOM_CPUS)
   }
   const shown = (path: string | undefined) => path ?? 'unknown'
   const cpus = (n: number | undefined) => n === undefined ? 'unknown' : Number.isFinite(n) ? round3(n) : 'max'

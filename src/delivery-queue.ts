@@ -1,4 +1,5 @@
 /** Durable per-persona FIFO journals. No import-time I/O. */
+import { testSyncWorkStart, testSyncWorkEnd, createTestSyncWorkScope, type TestSyncWorkScope } from './test-stall-attribution.ts'
 import type { GetResult } from 'agent-director'
 import * as nodeFs from 'node:fs'
 import { join } from 'node:path'
@@ -603,10 +604,10 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     }
     return cached
   }
-  async function load(key: string): Promise<void> {
+  async function load(key: string, scope?: TestSyncWorkScope): Promise<void> {
     const stored = journal(key)
     if (stored.loaded) return
-    if (stored.pendingRecovery) { await finishRecovery(key, stored); return }
+    if (stored.pendingRecovery) { await finishRecovery(key, stored, scope); return }
     // Publish only a complete replay after quarantine is durable. Its existing
     // items must remain visible to startup preparation and delivery recovery.
     const j = emptyJournal()
@@ -646,7 +647,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     rebuild(j)
     if (damaged.length) {
       // Exact original bytes, including torn tails, preserved before rewriting the source.
-      await durableAppend(quarantinePath, Buffer.concat(damaged.map(l => l.bytes)), stored.quarantineRollback ??= {})
+      await durableAppend(quarantinePath, Buffer.concat(damaged.map(l => l.bytes)), stored.quarantineRollback ??= {}, scope)
       for (const l of damaged) {
         const raw = l.raw
         const seq = raw?.seq
@@ -663,15 +664,15 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       // the damage; truncating a torn send alone would lose that evidence.
       j.pendingRecovery = true
       journals.set(key, j)
-      await finishRecovery(key, j)
+      await finishRecovery(key, j, scope)
       return
     }
     j.loaded = true
     journals.set(key, j)
     loadedAfterStart(key)
   }
-  async function finishRecovery(key: string, stored: Journal): Promise<void> {
-    try { await rewrite(pathFor(key), Buffer.from(stored.records.map(r => JSON.stringify(r) + '\n').join(''))) } catch (error) { event({ type: 'recovery-failed', key, error }); throw error }
+  async function finishRecovery(key: string, stored: Journal, scope?: TestSyncWorkScope): Promise<void> {
+    try { await rewrite(pathFor(key), Buffer.from(stored.records.map(r => JSON.stringify(r) + '\n').join('')), scope) } catch (error) { event({ type: 'recovery-failed', key, error }); throw error }
     // A rename followed by failed directory fsync is still pending: no writer
     // can append until retry makes this same recovered journal durable.
     stored.pendingRecovery = false
@@ -738,63 +739,78 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     return [...targets.values()]
   }
   async function compactOne(key: string, current: () => boolean = () => true): Promise<void> {
-    await load(key)
-    const j = journal(key)
-    await reconcileRollback(pathFor(key), j)
-    // The caller's lifetime can end while the repair awaits the disk.
-    if (!current()) return
-    const threadJoinSaved = options.threadJoinSaved?.(key)
-    const at = now(), retained: QueueRecord[] = []
-    const retainedJoinItems = new Set<number>()
-    const queuedReminders = new Set(materialize(j).flatMap(item => item.accepted.reminder_for === undefined ? [] : [item.accepted.reminder_for]))
-    for (const r of j.records) if (r.kind === 'accepted' && 'compact' in r && (r.compact === 'key' || r.compact === 'reaction-key') && at - r.received_at < QUEUE_KEY_KEEP_MS) retained.push(r)
-    for (const item of materialize(j)) {
-      if (item.hold?.state === 'withdrawn') {
-        if (item.accepted.key && at - item.accepted.received_at < QUEUE_KEY_KEEP_MS) retained.push({ v: 1, kind: 'accepted', seq: item.accepted.seq, compact: 'key', key: item.accepted.key, received_at: item.accepted.received_at, delivered_at: item.hold.at! })
-      } else if (isQueueItemClosed(item)) {
-        // Closed content goes; only a fresh key fact stays, unless Thread Memory
-        // still needs the join copy. Open items keep their full record, key included.
-        const a = item.accepted
-        if (a.thread_join !== undefined && threadJoinSaved?.(a.channel!, a.thread_join) !== true) {
-          retained.push(...item.records)
-          retainedJoinItems.add(a.seq)
-        } else if (at - a.received_at < QUEUE_KEY_KEEP_MS) {
-          const closedAt = item.withdrawn?.at ?? Math.max(...item.records.flatMap(r => r.kind === 'delivered' ? [r.at] : []))
-          if (a.key) retained.push({ v: 1, kind: 'accepted', seq: a.seq, compact: 'key', key: a.key, received_at: a.received_at, delivered_at: closedAt })
-          else if (a.reaction_key) retained.push({ v: 1, kind: 'accepted', seq: a.seq, compact: 'reaction-key', reaction_key: a.reaction_key, received_at: a.received_at, closed_at: closedAt })
+    const scope = createTestSyncWorkScope('queue-compact-sync', key)
+    try {
+      scope?.phase('queue-phase-load')
+      await load(key, scope)
+      const j = journal(key)
+      await reconcileRollback(pathFor(key), j, scope)
+      // The caller's lifetime can end while the repair awaits the disk.
+      if (!current()) return
+      scope?.phase('queue-phase-selection')
+      const selectionStart = testSyncWorkStart()
+      const threadJoinSaved = options.threadJoinSaved?.(key)
+      const at = now(), retained: QueueRecord[] = []
+      const retainedJoinItems = new Set<number>()
+      const queuedReminders = new Set(materialize(j).flatMap(item => item.accepted.reminder_for === undefined ? [] : [item.accepted.reminder_for]))
+      for (const r of j.records) if (r.kind === 'accepted' && 'compact' in r && (r.compact === 'key' || r.compact === 'reaction-key') && at - r.received_at < QUEUE_KEY_KEEP_MS) retained.push(r)
+      for (const item of materialize(j)) {
+        if (item.hold?.state === 'withdrawn') {
+          if (item.accepted.key && at - item.accepted.received_at < QUEUE_KEY_KEEP_MS) retained.push({ v: 1, kind: 'accepted', seq: item.accepted.seq, compact: 'key', key: item.accepted.key, received_at: item.accepted.received_at, delivered_at: item.hold.at! })
+        } else if (isQueueItemClosed(item)) {
+          // Closed content goes; only a fresh key fact stays, unless Thread Memory
+          // still needs the join copy. Open items keep their full record, key included.
+          const a = item.accepted
+          if (a.thread_join !== undefined && threadJoinSaved?.(a.channel!, a.thread_join) !== true) {
+            retained.push(...item.records)
+            retainedJoinItems.add(a.seq)
+          } else if (at - a.received_at < QUEUE_KEY_KEEP_MS) {
+            const closedAt = item.withdrawn?.at ?? Math.max(...item.records.flatMap(r => r.kind === 'delivered' ? [r.at] : []))
+            if (a.key) retained.push({ v: 1, kind: 'accepted', seq: a.seq, compact: 'key', key: a.key, received_at: a.received_at, delivered_at: closedAt })
+            else if (a.reaction_key) retained.push({ v: 1, kind: 'accepted', seq: a.seq, compact: 'reaction-key', reaction_key: a.reaction_key, received_at: a.received_at, closed_at: closedAt })
+          }
+        } else {
+          const refused = new Set(item.records.flatMap(r => r.kind === 'refused' ? [r.attempt] : []))
+          const removable = new Set(item.records.flatMap(r => r.kind === 'sent' && !('unknown_outcome' in r) && refused.has(r.attempt) ? [r.attempt] : []))
+          const accepted = { ...item.accepted, attempt_high_watermark: item.nextAttempt - 1 }
+          if (item.hold?.state === 'released') { delete accepted.hold; accepted.via = 'thread'; accepted.released_at = item.hold.at }
+          // A parked Post Hold keeps only the Memory Hold form; its parked record goes below.
+          else if (item.hold?.kind === 'memory' && item.hold.field.on === 'post') accepted.hold = memoryForm(item.hold.field)
+          retained.push(accepted)
+          retained.push(...item.records.filter(r => r.kind !== 'accepted' && !isHoldResolution(r) && !((r.kind === 'sent' || r.kind === 'refused') && removable.has(r.attempt))))
         }
-      } else {
-        const refused = new Set(item.records.flatMap(r => r.kind === 'refused' ? [r.attempt] : []))
-        const removable = new Set(item.records.flatMap(r => r.kind === 'sent' && !('unknown_outcome' in r) && refused.has(r.attempt) ? [r.attempt] : []))
-        const accepted = { ...item.accepted, attempt_high_watermark: item.nextAttempt - 1 }
-        if (item.hold?.state === 'released') { delete accepted.hold; accepted.via = 'thread'; accepted.released_at = item.hold.at }
-        // A parked Post Hold keeps only the Memory Hold form; its parked record goes below.
-        else if (item.hold?.kind === 'memory' && item.hold.field.on === 'post') accepted.hold = memoryForm(item.hold.field)
-        retained.push(accepted)
-        retained.push(...item.records.filter(r => r.kind !== 'accepted' && !isHoldResolution(r) && !((r.kind === 'sent' || r.kind === 'refused') && removable.has(r.attempt))))
       }
-    }
-    // Pending reminder facts contain no delivered body, fixed text, or receipt
-    // path. Suppression must outlive every full item retained for its join:
-    // replay could otherwise derive a new candidate from its delivery facts.
-    // Unfinished items keep suppression until delivery; other completed and
-    // expired facts disappear without discarding accepted delivery work.
-    for (const record of j.reminders.values()) {
-      if (retainedJoinItems.has(record.seq)) {
-        // A torn append can keep the reminder's acceptance but lose its
-        // terminal fact. Preserve that evidence even if this compaction
-        // removes the delivered reminder itself.
-        retained.push(queuedReminders.has(record.seq) && record.state === 'observed' ? { ...record, state: 'nudged' } : record)
-        continue
+      // Pending reminder facts contain no delivered body, fixed text, or receipt
+      // path. Suppression must outlive every full item retained for its join:
+      // replay could otherwise derive a new candidate from its delivery facts.
+      // Unfinished items keep suppression until delivery; other completed and
+      // expired facts disappear without discarding accepted delivery work.
+      for (const record of j.reminders.values()) {
+        if (retainedJoinItems.has(record.seq)) {
+          // A torn append can keep the reminder's acceptance but lose its
+          // terminal fact. Preserve that evidence even if this compaction
+          // removes the delivered reminder itself.
+          retained.push(queuedReminders.has(record.seq) && record.state === 'observed' ? { ...record, state: 'nudged' } : record)
+          continue
+        }
+        if (queuedReminders.has(record.seq)) continue
+        if ((record.state === 'observed' && !reminderExpired(record, at)) || (j.items.has(record.seq) && isOpenItem(j.items.get(record.seq)!))) retained.push(record)
       }
-      if (queuedReminders.has(record.seq)) continue
-      if ((record.state === 'observed' && !reminderExpired(record, at)) || (j.items.has(record.seq) && isOpenItem(j.items.get(record.seq)!))) retained.push(record)
-    }
-    // Preserve both sequence allocation and the injected microsecond watermark forever.
-    retained.push({ v: 1, kind: 'accepted', seq: j.nextSeq - 1, compact: 'allocation', ...(j.lastInjected === undefined ? {} : { injected_ts: formatMicros(j.lastInjected) }) })
-    await rewrite(pathFor(key), Buffer.from(retained.map(r => JSON.stringify(r) + '\n').join('')))
-    j.records = retained
-    rebuild(j)
+      // Preserve both sequence allocation and the injected microsecond watermark forever.
+      retained.push({ v: 1, kind: 'accepted', seq: j.nextSeq - 1, compact: 'allocation', ...(j.lastInjected === undefined ? {} : { injected_ts: formatMicros(j.lastInjected) }) })
+      testSyncWorkEnd(selectionStart, 'queue-compact-selection', key)
+      scope?.phase('queue-phase-stringify')
+      const stringifyStart = testSyncWorkStart()
+      let bytes: Buffer
+      try { bytes = Buffer.from(retained.map(r => JSON.stringify(r) + '\n').join('')) }
+      finally { testSyncWorkEnd(stringifyStart, 'queue-compact-stringify', key) }
+      scope?.phase('queue-phase-write')
+      await rewrite(pathFor(key), bytes, scope)
+      scope?.phase('queue-phase-rebuild')
+      j.records = retained
+      const rebuildStart = testSyncWorkStart()
+      try { rebuild(j) } finally { testSyncWorkEnd(rebuildStart, 'queue-compact-rebuild', key) }
+    } finally { scope?.stop() }
   }
   function lookupSlackKey(key: string, slack: SlackKey): QueueAcceptResult | undefined {
     const j = journal(key)

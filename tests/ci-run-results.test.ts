@@ -37,6 +37,7 @@ import { decideReport, judgeVerdict, REPORT_EXIT_SELECTIVE_PASS, secretMask } fr
 
 import {
   atomicTempFileName,
+  checkResultsOwnership, readIntegrityEvidence,
   CANARY_FILE_NAME,
   CANARY_LENGTH,
   CI_LABEL,
@@ -3398,6 +3399,20 @@ describe('integrity checks: integrity checks and secret-scan', () => {
 
   describe('results-ownership (check 6)', () => {
     const outside = (name: string): string => join(root, name)
+
+    test.each(['own', 'foreign', 'ordinary', 'over-cap', 'link', 'directory'] as const)('SR-8 retained measurement ownership: %s', kind => {
+      const run = integrityRun(), script = 'test-44-fmk-thread-burst.sh'
+      const inputs = { ...run.inputs, assignment: run.inputs.assignment!.map(a => a.shard === 1 ? { ...a, assigned: [...a.assigned, script] } : a) }
+      const name = `${kind === 'foreign' ? 'test-52-fmk-membership-load-rate.sh' : kind === 'ordinary' ? run.scripts.testOne : script}.sr8-measurements-${kind === 'over-cap' ? 65 : 1}.jsonl`
+      const path = join(run.shardDir(1), name)
+      if (kind === 'link') symlinkSync(join(root, 'absent'), path)
+      else if (kind === 'directory') mkdirSync(path)
+      else writeFileSync(path, '{"v":1,"kind":"post-hold-timing","at_mono_ms":1}\n')
+      const failures = checkResultsOwnership(inputs, readIntegrityEvidence(run.runDir, [1, 2]))
+      expect(failures).toHaveLength(kind === 'own' ? 0 : 1)
+      if (kind !== 'own') expect(failures[0]!.line).toContain(name)
+    })
+
 
     test.each([
       ['a log of a script not assigned to the shard', { files: { 2: (clean, { others }) => ({ ...clean, scriptLogs: { ...clean.scriptLogs, [others[0] as string]: 'not its script\n' } }) } }, ({ others }) => [

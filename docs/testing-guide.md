@@ -31,6 +31,7 @@ Each source module has a corresponding test file under `tests/`. Every `tests/*.
 | Source | Test File | What It Tests |
 |--------|-----------|---------------|
 | tests/integration/fixtures/ended-life.ts, tests/integration/test-24-fmk-stuck-launch.sh | ended-life.test.ts | Injected probes bind the recorded socket and unique tmux session ID/pane pid, reject vacuous positive controls, require both exit orders and cover name reuse, exit deadlines and query errors. Literal proc-stat cases include trailing newlines and embedded comm delimiters; an isolated native child control distinguishes a live process from its unreaped zombie, skipping with a named reason only when the load-time `/proc/self` link differs from `process.pid`. Extracted shell declarations use inert tmux/pid stand-ins for socket/exact targets, session IDs, unexpected statuses and the real 3 s timeout; no native tmux or AD. |
+| test-stall-attribution.ts, post-holds.ts, fixtures/sr8-attribution.ts | stall-attribution.test.ts | Base-switch gate, injected probe/CPU/heap and unavailable cgroup counters, early hold callback/re-arm and decision times, informational deadline-window matching across personas, bounded printing and failure file retention. Synthetic evidence only. |
 | tests/integration/fixtures/transcript-receipts.ts, lib/scenario.sh, tests/real-agent/codex-gate.ts | shim-log-reader.test.ts | Synthetic append boundaries retain only complete lines in the shared readers and scenario-local selector output. Empty/newline-free logs and incomplete malformed or valid tails are ignored; complete malformed calls and bad quoting still fail, as do malformed fault/stop lines in the shell reader. Executes only extracted shell reader declarations, with no native agent. |
 | tests/integration/test-32-fmk-real-order.sh, fixtures/real-case-assertions.ts | real-down-pause.test.ts | Executes the DOWN assertion with synthetic structured AD evidence and the actual pre-pause/pause boundaries with inert functions. Requires one receipted DM and `transcript_status: present` before pause; pins cumulative 14/34/54 counts and 20 latency indices, permits completed baseline work, and rejects any send/delivery during DOWN. Accepts `missing` after the scenario's successful pause only with the same native session and available launch fields; rejects absent/foreign success proof, session loss, changed launches and live/foreign end rows. Preserves `ended` and absent optional launch fields. No native agent or credentials. |
 | child-env.ts, bundled agent-director client | child-env.test.ts | Case-insensitive Slack credential-name removal, inherited `AGENT_DIRECTOR_INSTANCE_ID` removal in both filters with marker options omitted, false and true, ordinary host-variable pass-through, pure child copies and in-place entry scrub, and daemon-only marker handoff. A scratch child drives the real npm client's discovery and one verb against an inert fake executable, recording environment names only; an unscrubbed control proves the verb boundary is exercised. See the fake-executable exception under Host safety. |
@@ -838,10 +839,11 @@ CPU quota. Test 44 and every strict/open membership group run in
 keeps 2 CPUs of `cpu.max` quota, as in every shard, shared as before with the
 Slack stub, the scripts and the runner. `tests/integration/fixtures/burst-driver.sh`
 hands each driver run to a launcher born in its own group beside the server's,
-at 0.9 of the shard's third CPU, and the cgroup each run ran in is recorded.
+at 0.9 CPU, and the cgroup each run ran in is recorded. The container has
+4 CPUs (`CPUS_PER_SHARD` + `DRIVER_CPUS`), so 1.1 CPU is headroom above both groups.
 The runner's naming-family classifier includes every suffixed membership
-entrypoint. Admission reserves the extra driver CPU per driver-bearing shard;
-multiple driver scripts in a shard add it only once. These shards retain
+entrypoint. Admission reserves the two extra CPUs per driver-bearing shard;
+multiple driver scripts in a shard add them only once. These shards retain
 `--init`, private cgroup namespaces and writable cgroups. Recovery groups
 remain ordinary no-model, non-burst workloads.
 
@@ -864,9 +866,15 @@ only when:
 A driver in the server's group or quota, a guarded file that opened (even a
 write-only one), a probe error other than a refusal, or an unreadable
 placement is missing. It checks placement, configured quotas and permissions,
-not throttling. The 0.1 CPU left is headroom, so the container's quota rarely
-throttles the server's group, but it can, and a passing control does not rule
-that out.
+not throttling. A throttled ancestor (the container's quota) never shows in
+the server group's own `cpu.stat`: its tasks wait runnable, which only its
+`cpu.pressure` shows. With 0.1 CPU of headroom (a 3-CPU container), b.9p6's
+SR-8 runs saw such gaps of up to 313 ms, and a Post Hold released 110 ms late
+fits that class. The 1.1 CPU of headroom keeps the container's quota clear of
+the 2.9 CPUs the groups can use. The entrypoint refuses, and `driver-cpu`
+reports `missing` for, a container with less than 1 CPU of headroom
+(`SR8_CONTAINER_HEADROOM_CPUS`). A passing control still does not rule out
+contention outside the container (the host's own quota or other load).
 
 Take populations and burst counts from `tests/test-helpers/thread-populations.ts`:
 0, 10,000 and 100,000 Joined Threads per persona across 100 eligible
@@ -1027,7 +1035,81 @@ server's `at_mono_ms`, and stores carry their duration. The scenario enables
 it with `test_measurements: true` in `config.json`; clean shutdown awaits its
 drain before the final read.
 
-Membership-load cases also enable `test_measurement_timings: true` and print
+Every Test 44 case and membership-load case enables `test_measurements: true`
+through the shared SR-8 config generator. That base switch alone enables hold
+attribution, synchronous-work markers and a 10 ms unref'd server probe recording
+dispatch gaps over 20 ms. Each `event-loop-stall` row carries last-tick/start, expected and actual
+fire times, elapsed/gap ms, process user/system CPU deltas (µs), the server's own
+cgroup-v2 `cpu.stat` counters and deltas since the preceding tick, and heap-used/
+heap-total bytes at both ends. A missing/malformed reading is `null`, never a
+zero-throttle claim. High process CPU hints at busy work; low CPU plus raised
+throttle counters supports quota starvation. Heap changes only hint at GC;
+unmarked busy work, mixed causes and host scheduling may need further profiling.
+
+Each stall also carries `resource_delta` (Bun `process.resourceUsage()` counters:
+minor/major page faults, voluntary/involuntary context switches, filesystem block
+input/output operations), sampled at every probe tick. `resource_before_mono_ms`
+identifies its pre-gap reading. Unavailable readings/counters and counter resets
+are `null`, never zero. Process resource counters include the runtime's threads;
+filesystem operation counts are not bytes.
+
+The costly bundle adds cgroup `cpu.pressure`, `memory.pressure`, `io.pressure`
+`some`/`full` totals and deltas (µs), endpoint `memory_current`/`memory_max` (bytes,
+or `max`), selected `memory_stat` and deltas (`anon`, `file`, `shmem`,
+`pgmajfault`, `workingset_refault*`), and host aggregate `host_steal_ticks` plus
+`host_steal_delta_ticks` from `/proc/stat` (kernel clock ticks, not milliseconds).
+Memory byte gauges may have negative deltas; fault/refault counters may not.
+`system_sampling=stall-end` means the bundle is read once at startup and then
+only at stall endpoints: local every-tick sampling cost about 144 µs, versus
+15.7 µs for a normal tick with endpoint-only system reads. `system_before_mono_ms`
+and `system_after_mono_ms` expose that wider interval. A positive PSI/refault/
+steal delta therefore does not prove it occurred in this one gap; resource and
+`cpu.stat` deltas still use the preceding probe tick. These are observer-cost
+measurements with injected timer re-arm, not contained SR-8 performance evidence.
+
+`recorded: sr8 attribution ... verdict=info` lines preserve this evidence even
+when a lane keeps only `recorded:` output. `type=post-hold` prints persona key/seq,
+server process ID, receipt, due, every callback with its armed delay, evaluation time and signed
+lateness, plus stalls and synchronous work overlapping `[due, evaluate]` on the
+server clock (including work by other personas). Process IDs keep restarted
+server lifetimes separate when a retained file includes several starts. `type=stall` prints each gap's
+CPU/throttle/heap data and overlapping work; the largest 200 gaps are printed,
+with `type=stall-summary` giving the full count, maximum and sum. Per-window
+arrays cap at 50 and retain their uncapped counts. Work markers cover runs over
+20 ms in Thread Memory judge, digest, image concatenation and save selection,
+queue compaction selection/stringify/rebuild, and measurement serialization.
+Fine markers cover Thread Memory activation replay (intents, joins, judge,
+settlement), read/parse/index recovery, compaction collection/sort/merge/cache,
+image indexing/encoding/concatenation, write/publish/digest, save encoding and
+publication, journal synchronous generator steps/writes, shared-seal/authority durable
+writes, atomic durable replacements/unlinks and console-log writes. Whole
+`thread-compact-sync`/`queue-compact-sync` stretches stay open across resolved
+promises and close only at existing macrotask yields or native asynchronous
+journal I/O; they resume at continuation. Nested phase/whole-operation spans
+and spans of different personas can overlap and must not be summed as exclusive
+CPU time. No new scheduling boundary is introduced by these markers.
+All attribution observers, reads and probe timers are absent when the base
+`test_measurements` switch is off.
+
+On a verdict or script failure, the shared SR-8 failure hook runs after server
+stop and recorder drain, before scratch cleanup. It copies up to 64 regular
+measurement files (including scenario snapshots) to
+`/test-results/<script>.sh.sr8-measurements-N.jsonl`, the shard-results mount;
+on the host these are beside the script logs in
+`/run/openclaw/horde/cscb-ci-<run>/shard-N/` (or that run's configured temp root).
+`type=kept-file` prints the container path and original source;
+`type=failure-row` prints at most 400 rows per file within ±2 s of each failing
+Post Hold deadline-to-evaluation window, prioritizing timing/stall/work rows.
+`type=failure-summary` gives window, available-row and printed counts. Full
+files retain every byte. Retention is informational and preserves the script's
+failure; result ownership allows only these numbered regular files for assigned
+burst scripts. Test 44's optional CPU profile and detailed `observe` output still
+require `CSCB_TEST_DIAGNOSTICS=1`. Its per-event ack/append/save rows remain
+opt-in under `test_measurement_timings: true`, enabled only for diagnostic burst
+cases. Default and non-burst test-44 cases do not gain per-event ack/append/save
+rows. Membership-load cases already enable that separate per-event switch.
+
+Membership-load cases print
 `recorded: sr8 diag` lines before the post-restart verdicts. `diagnostic=ack-summary`
 gives each persona's stub push-to-ACK and server receive-to-ACK maxima;
 `diagnostic=ack-slow` correlates its five slowest stub samples by envelope ID,

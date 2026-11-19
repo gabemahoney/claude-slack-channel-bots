@@ -705,11 +705,15 @@ describe('test-45/48 profile opt-in (run_membership_load in a stub shell)', () =
   // state directory, where the stub reports the case's profile and stops.
   const run = (diagnostics: string | null, ...args: string[]) => {
     writeFileSync(join(root, 'membership-load.sh'), LOAD)
+    mkdirSync(join(root, 'lib'), { recursive: true })
+    mkdirSync(join(root, 'fixtures'), { recursive: true })
+    writeFileSync(join(root, 'lib/sr8-attribution.sh'), readFileSync(join(import.meta.dir, 'integration/lib/sr8-attribution.sh')))
     const program = `set -euo pipefail
 log() { printf '%s\\n' "$*" >> "$HOME/calls"; }
 require_ci_image() { :; }
 require_scenario_home() { :; }
 on_exit() { :; }
+on_failure() { :; }
 on_before_cleanup() { log "hook $1"; }
 fail() { echo "FAIL: $1" >&2; exit 1; }
 overrides_stem() { printf 'stem\\n'; }
