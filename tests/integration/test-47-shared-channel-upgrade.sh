@@ -149,9 +149,10 @@ assert_stopped() {
         wait_until 30 "$1: a bot session is still running before preparation" no_session "${key}"
     done
 }
-# prepare_case <case> <letter> <dir>: materialize into a fresh state dir and
-# home, write each credentials file with a fake token, check every 0.18.0
-# reference with 0.18.0's own code and record the references' bytes and dates.
+# prepare_case <case> <letter> <dir> [<materialize arg>...]: materialize into
+# a fresh state dir and home, write each credentials file with a fake token,
+# check every 0.18.0 reference with 0.18.0's own code and record the
+# references' bytes and dates.
 prepare_case() {
     local kind first rest out key want
     CASE="$1"; LETTER="$2"
@@ -169,7 +170,7 @@ prepare_case() {
         --state-dir "${SLACK_STATE_DIR}" --home "${CASE_HOME}" --persona-prefix "${SCENARIO_TAG}_${LETTER}_" \
         --setting bind=127.0.0.1 --setting "port=${SCENARIO_PORT}" --setting health_check_interval=0 \
         --setting session_restart_delay=0 --setting exit_timeout=5 --setting "mcp_config_path=${MCP_CONFIG}" \
-        > "${out}" || fail "${CASE}: materialize refused"
+        "${@:4}" > "${out}" || fail "${CASE}: materialize refused"
     P=(); REFERENCE_DIR=''
     while read -r kind first rest; do
         case "${kind}" in
@@ -319,9 +320,10 @@ snapshot() {
     if [[ -f "${SNAP[$1]}" ]]; then shared_queue_snapshot "${SNAP[$1]}" "$1" "${SNAP[$1]}"
     else shared_queue_snapshot "${SNAP[$1]}" "$1"; fi
 }
+# The drain's receipt evidence goes to stderr, so a failed run's log keeps it.
 drain() {
     snapshot "$1"
-    shared_wait_queue_drained "$1" "${SNAP[$1]}" "${SNAP[$1]}" > /dev/null
+    shared_wait_queue_drained "$1" "${SNAP[$1]}" "${SNAP[$1]}" >&2
     snapshot "$1"
 }
 receipt() {
@@ -626,8 +628,14 @@ refuse_all() {
 # Case D: 0.18.0 declarative to strict (AC-U01, U02, U03, U06, U07, U08,
 # U09, U11). alpha holds 0.18.0's queue; bravo has the conflicts, the new
 # thread_hybrid, an explicit off and the prompt/notice destination.
+# Slack reply reminders are off for both personas (top-level
+# stop_hook_bootstrap), for test-29's reason: a reminder nudge is a delivery,
+# and in manual receipt mode it would take a receipt release meant for a real
+# item. Any manual turn can end in one on any agent-director version; 0.18's
+# permission-turn repair, which reads an allowed turn working before its Stop,
+# makes it more frequent.
 # ===========================================================================
-prepare_case declarative-choices-and-queues d case-d
+prepare_case declarative-choices-and-queues d case-d --setting stop_hook_bootstrap=false
 DA="${P[alpha]}"; DB="${P[bravo]}"
 CATCHUP="$(scenario_id C caught-up)"
 STOPPED_JOIN="$(scenario_id C joined-while-stopped)"
