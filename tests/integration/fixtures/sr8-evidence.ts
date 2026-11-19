@@ -2301,6 +2301,11 @@ export function cpuConditionFields(cpuMax: string | undefined, before: string | 
 
 /** The measured server's CPU quota, in CPUs: a shard's `CPUS_PER_SHARD` (scripts/ci-run.ts), which the driver's own CPU leaves unchanged. */
 export const SR8_SERVER_CPUS = 2
+/**
+ * The CPUs a burst-driver shard's container must leave above the server's and the driver's quotas. With
+ * 0.1 CPU the container's quota throttled the server's group, unseen in its own cpu.stat (b.9p6).
+ */
+export const SR8_CONTAINER_HEADROOM_CPUS = 1
 /** A cgroup v2 path from `/proc/<pid>/cgroup`'s `0::` line, below the namespace root; undefined when absent or not a plain path. Pure. */
 export function cgroupPathOf(text: string | undefined): string | undefined {
   const path = text?.match(/^0::(.*)$/m)?.[1]
@@ -2349,7 +2354,8 @@ export function cgroupWriteAccess(paths: string[], probe: (path: string, file: s
  * the smallest cpu.max on its path. The server's must be `SR8_SERVER_CPUS`;
  * each recorded driver run's must be finite; and every cgroup holding both
  * (their common ancestors, the server's own when they share it) must allow
- * the server's CPUs plus the driver's. The server's UID, checking from the
+ * the server's CPUs plus the driver's plus `SR8_CONTAINER_HEADROOM_CPUS`.
+ * The server's UID, checking from the
  * server's group, must be able to open none of the guarded files on either
  * path for writing, so it can neither move a process nor change a limit.
  * Any other placement, an unreadable path or cpu.max, a writable guarded
@@ -2367,7 +2373,7 @@ export function driverCpuVerdict(server: string | undefined, drivers: (string | 
   const fits = (driver: string | undefined) => {
     const serverCpus = cpusOf(server), driverCpus = cpusOf(driver), common = shared(driver)
     return serverCpus === SR8_SERVER_CPUS && driverCpus !== undefined && Number.isFinite(driverCpus)
-      && !!common?.every(c => c !== undefined && c >= serverCpus + driverCpus)
+      && !!common?.every(c => c !== undefined && c >= serverCpus + driverCpus + SR8_CONTAINER_HEADROOM_CPUS)
   }
   const shown = (path: string | undefined) => path ?? 'unknown'
   const cpus = (n: number | undefined) => n === undefined ? 'unknown' : Number.isFinite(n) ? round3(n) : 'max'

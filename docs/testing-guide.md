@@ -865,7 +865,9 @@ the server group's own `cpu.stat`: its tasks wait runnable, which only its
 `cpu.pressure` shows. With 0.1 CPU of headroom (a 3-CPU container), b.9p6's
 SR-8 runs saw such gaps of up to 313 ms, and a Post Hold released 110 ms late
 fits that class. The 1.1 CPU of headroom keeps the container's quota clear of
-the 2.9 CPUs the groups can use. A passing control still does not rule out
+the 2.9 CPUs the groups can use. The entrypoint refuses, and `driver-cpu`
+reports `missing` for, a container with less than 1 CPU of headroom
+(`SR8_CONTAINER_HEADROOM_CPUS`). A passing control still does not rule out
 contention outside the container (the host's own quota or other load).
 
 Take populations and burst counts from `tests/test-helpers/thread-populations.ts`:

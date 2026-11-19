@@ -1088,7 +1088,9 @@ the threaded `cpu` controller:
   with no throttle in its own `cpu.stat`, the signature of a throttled
   ancestor; a Post Hold released 110 ms late fits that class. Throttling at an
   ancestor never shows in `shard/server/cpu.stat`. The entrypoint refuses a
-  container quota that leaves no headroom above 2.9 CPUs, and always sets
+  container quota below 3.9 CPUs (less than 1 CPU of headroom above the
+  server's 2 and the driver's 0.9, `SR8_CONTAINER_HEADROOM_CPUS`), and
+  `driver-cpu` is `missing` for one. It always sets
   the server's group to exactly 2 CPUs, whatever the container's quota.
 
 Memory, PID and OOM figures stay the container's, as in any shard. While the

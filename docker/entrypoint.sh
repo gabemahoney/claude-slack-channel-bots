@@ -79,8 +79,10 @@ chown -R testuser:testuser "${TESTUSER_HOME}/.claude" "${TESTUSER_HOME}/.claude.
 # headroom. With only 0.1 CPU left, the container's quota could throttle the
 # server's group while the server's own quota was not exhausted, unseen in
 # the server's cpu.stat (b.9p6: late Post Hold releases with the server
-# runnable but not running). The container must leave some headroom. testuser owns no cgroup
-# file, so the server's UID can neither move a process nor change a limit.
+# runnable but not running), so a container with less than 1 CPU of headroom
+# (tests/integration/fixtures/sr8-evidence.ts SR8_CONTAINER_HEADROOM_CPUS) is
+# refused. testuser owns no cgroup file, so the server's UID can neither move
+# a process nor change a limit.
 # The cpu controller is threaded, so PID 1 keeps the container's cgroup, which
 # the host runner reads.
 split_driver_cpu() {
@@ -91,8 +93,8 @@ split_driver_cpu() {
         return 1
     fi
     read -r quota period < "${root}/cpu.max"
-    if ! [[ ${quota} =~ ^[0-9]+$ && ${period} =~ ^[0-9]+$ ]] || (( quota <= period * 2 + period * 9 / 10 )); then
-        echo "entrypoint.sh: the container's cpu.max leaves no headroom beside the server's 2 CPUs and the burst driver's 0.9" >&2
+    if ! [[ ${quota} =~ ^[0-9]+$ && ${period} =~ ^[0-9]+$ ]] || (( quota < period * 3 + period * 9 / 10 )); then
+        echo "entrypoint.sh: the container's cpu.max leaves less than 1 CPU of headroom beside the server's 2 CPUs and the burst driver's 0.9" >&2
         return 1
     fi
     mkdir "${root}/shard"
