@@ -88,7 +88,9 @@ export type RowDecisionAction = CanonicalRowDecisionAction | (string & {})
  *
  * `click_handler_relay_fallen_back` is not a verdict — it records that AD
  * refused the click because the request's relay window had already elapsed
- * the real answer is given at the tmux pane.
+ * the real answer is given at the tmux pane. `click_handler_no_open_request`
+ * is not a verdict either: AD refused the click with
+ * `ErrNoOpenPermissionRequest`, and the update says the click was not applied.
  */
 export const CLOSURE_VERDICT_TAGS = [
   'operator_allow',
@@ -100,6 +102,7 @@ export const CLOSURE_VERDICT_TAGS = [
   'click_handler_allow',
   'click_handler_deny',
   'click_handler_relay_fallen_back',
+  'click_handler_no_open_request',
 ] as const
 
 export type CanonicalClosureVerdictTag = (typeof CLOSURE_VERDICT_TAGS)[number]
@@ -143,6 +146,7 @@ export const AD_DECIDE_RESPONSE_CLASSES = [
   'ErrInvalidFlags',
   'ErrAmbiguousRequest',
   'ErrRelayFallenBack',
+  'ErrNoOpenPermissionRequest',
   'other',
 ] as const
 

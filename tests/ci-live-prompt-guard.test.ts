@@ -48,7 +48,7 @@ import {
   containerPromptGuardDeps,
   DECIDED_RESULT_CLASSES,
   denyScript,
-  NOT_A_VERDICT_TAG,
+  NOT_A_VERDICT_TAGS,
   noteFor,
   parsePromptTrail,
   personaOfInstance,
@@ -679,12 +679,14 @@ describe('promptTrailScript over a fixture trail (bash and jq)', () => {
 
   test('a decide closes a request only when it succeeded (ok, or already decided); a refused one, and the update that renders the refusal, leave it open', () => {
     expect([...DECIDED_RESULT_CLASSES]).toEqual(['ok', 'ErrAlreadyDecided'])
-    expect(NOT_A_VERDICT_TAG).toBe('click_handler_relay_fallen_back')
+    expect([...NOT_A_VERDICT_TAGS]).toEqual(['click_handler_relay_fallen_back', 'click_handler_no_open_request'])
     const trail = [
       decideLine('t-ok', 'ok'),
       decideLine('t-already', 'ErrAlreadyDecided'),
       decideLine('t-fallen-back', 'ErrRelayFallenBack'),
       clickUpdateLine('t-fallen-back', 'click_handler_relay_fallen_back'),
+      decideLine('t-no-open', 'ErrNoOpenPermissionRequest'),
+      clickUpdateLine('t-no-open', 'click_handler_no_open_request'),
       decideLine('t-invalid', 'ErrInvalidFlags'),
       decideLine('t-ambiguous', 'ErrAmbiguousRequest'),
       decideLine('t-other', 'other', { raw_error_message: 'decide failed' }),

@@ -71,6 +71,11 @@ const manifest = {
     installer_sha256: put(join('ad', 'install.sh'), `fixture ${role} installer (never run)\n`),
     client_tgz_sha256: '',
   },
+  cscb_downgrade: {
+    version: '0.0.1',
+    tarball_sha256: put(join('fixtures', 'downgrade', 'claude-slack-channel-bots-0.0.1.tgz'), 'fixture CSCB downgrade package\n'),
+    published: '2026-01-01T00:00:00.000Z',
+  },
   ad_role: role,
 }
 if (badInputs) put(join('ad', 'agent-director'), `fixture ${role} binary (never run)\n`)

@@ -1852,8 +1852,12 @@ p2_clearing_schedule() {
     n="$(count_log "${ROUND_HEAD[${PN_KEY}]}")"
     (( n == MIN_LATCHED_ROUNDS + 2 )) || fail "${step}: ${PN_KEY} has ${n} round lines at its clearing event, not $(( MIN_LATCHED_ROUNDS + 2 ))"
     stub_mode "${PERSONA_WORK[${PN_KEY}]}" "${STUB_MODE_AT_ONCE}"
-    if ad_release_at_least 0.18.0; then PN_CLEAR_MS="$(date +%s%3N)"; fi
+    if ad_release_at_least 0.18.0; then
+        PN_CLEAR_MS="$(date +%s%3N)"
+        PN_END_MARK="$(ad_shim_mark)"
+    fi
     end_session "${SEED_SID[${PN_KEY}]}"
+    if ad_release_at_least 0.18.0; then PN_ENDED_MARK="$(ad_shim_mark)"; fi
     free_snapshot "${PN_KEY}" "${n}"
     echo "${TEST_NAME}: ${step}: the harness selected ${STUB_MODE_AT_ONCE} for ${PN_KEY}'s stub and ended ${PERSONA_NAMED[${PN_KEY}]} (${SEED_SID[${PN_KEY}]})"
 
@@ -2073,6 +2077,111 @@ check_retry_clear() {
     check_launched "${step}" "${key}"
 }
 
+# first_cscb_read_of <id> <prior> <from-mark>: print the first CSCB call
+# after <from-mark> that could select <id>'s row, as ad_mark_caller counts
+# them for an ad_recovery tick (a `status`, `get` or `pause` of the id, or a
+# `list` that could select a row in state <prior>), as its shim line, time
+# and verb, tab-separated; nothing when there is none.
+first_cscb_read_of() {
+    local id="$1" prior="$2" from="$3" step="first_cscb_read_of $1" lines=() i
+    _scenario_query_prep "${step}"
+    _scenario_read_log "${step}" "${SCENARIO_AD_SHIM_LOG}" lines
+    for i in "${!lines[@]}"; do
+        _scenario_in_window "$(( i + 1 ))" "${from}" - || continue
+        _scenario_split_line "${lines[i]}" || continue
+        [[ "${_L_KIND}" == call ]] || continue
+        _scenario_role_at "${_L_PPID}" "${_L_US}" || continue
+        _scenario_decode_words || continue
+        _scenario_ad_verb
+        _scenario_ad_id
+        case "${_L_VERB}" in
+            list) _scenario_mark_list_selects "${id}" "${prior}" || continue ;;
+            status | get | pause) [[ "${_L_ID}" == "${id}" ]] || continue ;;
+            *) continue ;;
+        esac
+        printf '%s\t%s\t%s\n' "$(( i + 1 ))" "$(_scenario_us_text "${_L_US}")" "${_L_VERB}"
+        return 0
+    done
+}
+
+# state_writes_of <id> <tick> <from-ms> <to-us>: print agent-director's trail
+# records of a write of <id>'s state, other than <tick>, whose millisecond
+# time could fall in [<from-ms>, <to-us>): a hook's state transition, a
+# state-bearing tick, a resume's move or restore, and a reuse's reset or
+# restore. Fails if any of <id>'s records of those events has a ts that does
+# not read as a time, since a write it hides could fall in the window.
+state_writes_of() {
+    local id="$1" tick="$2" from="$3" to="$4" event all="" out
+    for event in ad.spawn.state_transition ad.find_missing.tick ad.resume.moved_to_pending ad.resume.restored \
+        ad.spawn.reused ad.spawn.reuse_restored; do
+        out="$(ad_trail_events "${event}" "${id}")" || exit 1
+        all+="${out:+${out}$'\n'}"
+    done
+    [[ -n "${all}" ]] || return 0
+    out="$(jq -c -s '.[] | select(if (.ts | type) == "string" then (.ts | test("^[^.]+?(\\.[0-9]+)?Z$") | not) else true end)' <<< "${all}")" \
+        || fail "state_writes_of ${id}: jq could not read the trail records"
+    [[ -z "${out}" ]] \
+        || { sed 's/^/  | /' <<< "${out}" >&2; fail "state_writes_of ${id}: a record's ts does not read as a time, so a state write could hide in the window"; }
+    jq -c -s --argjson tick "${tick}" --argjson from "${from}" --argjson to "${to}" '
+        .[] | select(. != $tick and (.event != "ad.find_missing.tick" or .new_state != null))
+        | select((.ts | capture("^(?<s>[^.]+?)(\\.(?<f>[0-9]+))?Z$")) as $t
+            | (($t.s + "Z") | fromdateiso8601) * 1000 + ((($t.f // "0") + "000")[0:3] | tonumber)
+            | . >= $from and . * 1000 < $to)' <<< "${all}" \
+        || fail "state_writes_of ${id}: jq could not read the trail records, or a record's ts is no valid time"
+}
+
+# check_pn_marked <step> <id> <status-line> <status-time> <probe-time>: from
+# 0.18.0 a read checks the rows it selects, so once PN's session ends the
+# first CSCB active read that selects its row (the permission poller's
+# `list`, say, or the round's own `status`) marks it missing, and the
+# clearing round's `status` reads it `missing`:
+#   - the first missing tick after the session's end is an active read's
+#     (`ad_recovery`); the last call before it that could have made it is
+#     one unambiguous CSCB `list`, `status` or `get` (`ad_mark_caller`)
+#     after the shim mark taken right before the end;
+#   - when that call began after end_session returned, agent-director's
+#     contract makes the mark the first CSCB `list`, `status` or `get` that
+#     could select the row since then, and the tick follows that read; a
+#     later call before the tick is a second candidate, named in any failure;
+#   - the mark is the round's status, or it was written before the status
+#     began; and no other write of the row's state could fall from the mark
+#     to the probe, which the round makes after its status answered.
+check_pn_marked() {
+    local step="$1" id="$2" s_pos="$3" s_us p_us tick source prior tick_ms caller pos time verb role first writes
+    local last_pos two=""
+    s_us="$(us_of "$4")"
+    p_us="$(us_of "$5")"
+    tick="$(ad_missing_tick "${id}" "${PN_CLEAR_MS}")" || fail "${step}: no tick marked ${id} missing after its session ended"
+    source="$(jq -r '.source // ""' <<< "${tick}")"
+    prior="$(jq -r '.prior_state // ""' <<< "${tick}")"
+    [[ "${source}" == ad_recovery ]] || fail "${step}: ${id}'s missing tick is not an active read's (source '${source}'): ${tick}"
+    tick_ms="$(date -u -d "$(jq -r '.ts' <<< "${tick}")" +%s%3N 2> /dev/null)" && [[ "${tick_ms}" =~ ^[0-9]+$ ]] \
+        || fail "${step}: ${id}'s missing tick has no time: ${tick}"
+    caller="$(ad_mark_caller "${tick}" "${PN_END_MARK}")" || fail "${step}: no agent-director call after ${id}'s session end could have made the mark: ${tick}"
+    IFS=$'\t' read -r pos time _ verb role <<< "${caller}"
+    [[ "${role}" == cscb && ( "${verb}" == list || "${verb}" == status || "${verb}" == get ) ]] \
+        || fail "${step}: ${id}'s mark (shim line ${pos}, ${verb} at ${time}) is not a CSCB active read (role ${role})"
+    if (( pos > PN_ENDED_MARK )); then
+        last_pos="${pos}"
+        first="$(first_cscb_read_of "${id}" "${prior}" "${PN_ENDED_MARK}")" || exit 1
+        [[ -n "${first}" ]] || fail "${step}: no CSCB read that could select ${id}'s row after its session ended, though shim line ${pos} is one"
+        IFS=$'\t' read -r pos time verb <<< "${first}"
+        (( pos == last_pos )) || two=" (two candidate reads before the tick: shim lines ${pos} and ${last_pos}; the first is the mark by agent-director's contract)"
+        [[ "${verb}" == list || "${verb}" == status || "${verb}" == get ]] \
+            || fail "${step}: ${id}'s mark (shim line ${pos}, ${verb} at ${time}) is not a CSCB list, status or get${two}"
+        (( $(us_of "${time}") < (tick_ms + 1) * 1000 )) \
+            || fail "${step}: ${id}'s missing tick (${tick_ms} ms) comes before the first CSCB read that could select its row after its session ended (shim line ${pos} at ${time})"
+    fi
+    if (( pos != s_pos )); then
+        (( pos < s_pos && (tick_ms + 1) * 1000 <= s_us )) \
+            || fail "${step}: ${id}'s mark (shim line ${pos}, tick ${tick_ms} ms) is neither its clearing round's status (shim line ${s_pos}) nor before it${two}"
+    fi
+    writes="$(state_writes_of "${id}" "${tick}" "${tick_ms}" "${p_us}")" || exit 1
+    [[ -z "${writes}" ]] \
+        || { sed 's/^/  | /' <<< "${writes}" >&2; fail "${step}: ${id}'s state was written between its mark and the round's probe, so its status may not have read missing${two}"; }
+    echo "${TEST_NAME}: ${step}: CSCB's ${verb} at shim line ${pos} marked ${id} missing (${prior} to missing); the round's status at shim line ${s_pos} read it missing${two}"
+}
+
 # check_probe_clear <key>: the probe's own clearing round (see the header,
 # life 6).
 check_probe_clear() {
@@ -2082,22 +2191,14 @@ check_probe_clear() {
     echo "${TEST_NAME}: ${step}: CSCB calls of ${id} in the round's window (recorded): $(field_of 4 "${rows}" | tr '\n' ' ')"
     IFS=$'\t' read -r s_pos s_time _ s_verb _ <<< "$(sed -n 1p <<< "${rows}")"
     IFS=$'\t' read -r p_pos p_time _ p_verb _ p_args <<< "$(sed -n 2p <<< "${rows}")"
-    if ad_release_at_least 0.18.0 && [[ "${key}" == "${PN_KEY}" ]]; then
-        # The worker is now gone: step 1's active status marks it missing,
-        # rather than reading the old waiting state until find-missing.
-        # PN's next-check operation still selects the probe in either state.
-        local tick caller mark_pos mark_verb mark_role
-        tick="$(ad_missing_tick "${id}" "${PN_CLEAR_MS}")" || fail "${step}: no missing tick after PN's session ended"
-        caller="$(ad_mark_caller "${tick}" "${FREE_MARK[${key}]}")" || fail "${step}: no unambiguous PN mark caller"
-        IFS=$'\t' read -r mark_pos _ _ mark_verb mark_role <<< "${caller}"
-        [[ "${mark_pos}" == "${s_pos}" && "${mark_verb}" == status && "${mark_role}" == cscb ]] \
-            || fail "${step}: PN's missing mark is not its clearing round's status: ${caller}"
-    fi
     if [[ "${s_verb}" != status ]] || ! round_call_is "${CALL_PROBE}" "${p_verb}" "${p_args}"; then
         sed 's/^/  | /' <<< "${rows}" >&2
         fail "${step}: the round's first calls of ${id} are '${s_verb}' and '${p_verb}', not status then a one-line read-pane"
     fi
     check_cadence "${step}" "${PREV_US[${key}]}" "$(us_of "${s_time}")" "$(us_of "${p_time}")" "${CALL_PROBE}"
+    if ad_release_at_least 0.18.0 && [[ "${key}" == "${PN_KEY}" ]]; then
+        check_pn_marked "${step}" "${id}" "${s_pos}" "${s_time}" "${p_time}"
+    fi
     # Exactly one CSCB find-missing in the round's window, after the probe.
     fm="$(ad_cscb_verb_between find-missing "${s_pos}" "${ROUND_END_MARK[${key}]}")" || exit 1
     n="$(rows_count "${fm}")"

@@ -21,6 +21,9 @@ import { makeReloadHarness, type ReloadRun } from './test-helpers/reload-harness
  * mutation.
  *   - ErrRelayFallenBack → log + buttonless "answer at the tmux pane"
  * repaint + no markHandled + no retry.
+ *   - ErrNoOpenPermissionRequest → one named log line + buttonless "click
+ *     not applied" repaint + no markHandled + no retry (never the generic
+ *     `decide failed` drop).
  *   - ErrInvalidFlags / ErrAmbiguousRequest → log + no retry + no
  * chat.update.
  *   - ErrInvalidFlags additionally makes exactly one immediate agent-director
@@ -76,7 +79,7 @@ import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { ErrSystemInstallDisappeared, ErrTmuxNotAvailable, type Client, type DecideParams, type DecideResult } from 'agent-director'
-import { handlePermissionClick, type ClickDeps } from '../src/permission-click-handler.ts'
+import { NO_OPEN_REQUEST_TEXT, handlePermissionClick, type ClickDeps } from '../src/permission-click-handler.ts'
 import type { AdVersionRecheckTrigger } from '../src/ad-error-class.ts'
 import {
   AD_VERSION_RECHECK_TIME_LIMIT_MS,
@@ -104,6 +107,7 @@ import {
   errAmbiguousRequest,
   errGeneric,
   errInvalidFlags,
+  errNoOpenPermissionRequest,
   errRelayFallenBack,
   makeStubResolveSystemBinary,
   type StubResolveSystemBinaryOutcome,
@@ -1258,6 +1262,107 @@ describe('handlePermissionClick — ErrRelayFallenBack', () => {
 })
 
 // ---------------------------------------------------------------------------
+// ErrNoOpenPermissionRequest surfaced, never silently dropped (b.ya4)
+// ---------------------------------------------------------------------------
+
+describe('handlePermissionClick — ErrNoOpenPermissionRequest', () => {
+  test('repaints the prompt buttonless through A\'s client, emits the no-open-request trail pair, logs one line and leaves the entry unhandled', async () => {
+    await seedLiveEntry({ requestToken: TOKEN_A })
+    const messageTs = getLivePermission(h.instanceA, TOKEN_A)!.messageTs
+    const trail = makeTrailCapture()
+    const decide = makeDecideStub({ throwOn: errNoOpenPermissionRequest() })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+    const logs: unknown[][] = []
+
+    const result = await handlePermissionClick(
+      encodePermissionActionId('deny', h.instanceA, TOKEN_A),
+      clickDeps({
+        emitTrail: trail.emit,
+        log: (...args: unknown[]) => logs.push(args),
+      }),
+      { channel: CHANNEL_A },
+    )
+
+    expect(result).toBe(true)
+    // One decide, no retry: agent-director refused every verdict on this request.
+    expect(decide.calls).toHaveLength(1)
+
+    // The operator sees the click did not land: one chat.update over the
+    // original prompt message, with the refusal text and no actions block.
+    const updates = updatesOn(h.stubA)
+    expect(updates).toHaveLength(1)
+    expect(updates[0]!.channel).toBe(CHANNEL_A)
+    expect(updates[0]!.ts).toBe(messageTs)
+    // True whether AD still lists the request (AD issue #51) or has none.
+    expect(NO_OPEN_REQUEST_TEXT).toBe(
+      '*Permission* — click not applied: agent-director refused it (no open request it will answer); watch this prompt for its verdict or a pane notice',
+    )
+    expect(updates[0]!.text).toBe(NO_OPEN_REQUEST_TEXT)
+    const blocks = updates[0]!.blocks as Array<{ type: string; text?: { text: string } }>
+    expect(blocks.find((b) => b.type === 'actions')).toBeUndefined()
+    expect(blocks.map((b) => b.text?.text)).toEqual([NO_OPEN_REQUEST_TEXT])
+    expectNoMetadata(updates[0]!)
+    expect(slackCalls(h.stubB)).toBe(0)
+
+    // The decide attempt is classified by name, not bucketed into 'other'.
+    const decided = trail.events.find((e) => e.event === 'cscb.ad_decide.attempted')
+    expect(decided!['result_class']).toBe('ErrNoOpenPermissionRequest')
+    expect(decided!['decision']).toBe('deny')
+    expect('raw_error_message' in decided!).toBe(false)
+
+    // The repaint is recorded under its own non-verdict tag.
+    const closure = trail.events.find((e) => e.event === 'cscb.chat_update.attempted')
+    expect(closure).toBeDefined()
+    expect(closure!['verdict_tag']).toBe('click_handler_no_open_request')
+    expect(closure!['triggered_by']).toBe('click_handler')
+    expect(closure!['ok']).toBe(true)
+    expect(closure!.message_ts).toBe(messageTs)
+    expect(closure!.request_token).toBe(TOKEN_A)
+    expect(closure!.channel).toBe(CHANNEL_A)
+
+    // Not a verdict: the entry stays tracked and unhandled, so the poller's
+    // later closure or fallback rendering may still land on the message.
+    expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(false)
+
+    // Loud, not silent: exactly one named line, not the generic `decide failed`.
+    expect(logs).toHaveLength(1)
+    const line = String(logs[0]!.join(' '))
+    expect(line).toStartWith(
+      `[slack] permission-click: ErrNoOpenPermissionRequest from decide for ${h.instanceA} (request_token=${TOKEN_A})` +
+        ' — agent-director refused it (no open request it will answer); the click was not applied: ',
+    )
+    expect(line).not.toContain('decide failed')
+    assertNoLeak({ logs, trail: trail.events, slack: h.stubA.web.callLog })
+  })
+
+  test('stale click (no live entry) → decide fires once, no chat.update, one named line, returns true', async () => {
+    const trail = makeTrailCapture()
+    const decide = makeDecideStub({ throwOn: errNoOpenPermissionRequest() })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+    const logs: unknown[][] = []
+
+    const result = await handlePermissionClick(
+      encodePermissionActionId('allow', h.instanceA, TOKEN_C),
+      clickDeps({
+        emitTrail: trail.emit,
+        log: (...args: unknown[]) => logs.push(args),
+      }),
+      { channel: CHANNEL_A },
+    )
+
+    expect(result).toBe(true)
+    expect(decide.calls).toHaveLength(1)
+    expect(h.stubA.calls.update).toHaveLength(0)
+    expect(h.stubB.calls.update).toHaveLength(0)
+    expect(trail.events.find((e) => e.event === 'cscb.chat_update.attempted')).toBeUndefined()
+    const decided = trail.events.find((e) => e.event === 'cscb.ad_decide.attempted')
+    expect(decided!['result_class']).toBe('ErrNoOpenPermissionRequest')
+    expect(logs).toHaveLength(1)
+    expect(String(logs[0]!.join(' '))).toContain('ErrNoOpenPermissionRequest from decide')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // sibling independence on click
 // ---------------------------------------------------------------------------
 
@@ -1746,6 +1851,7 @@ describe('handlePermissionClick — decide ErrInvalidFlags version re-check', ()
     ['ErrAmbiguousRequest', () => errAmbiguousRequest()],
     ['ErrAlreadyDecided', () => errAlreadyDecided()],
     ['ErrRelayFallenBack', () => errRelayFallenBack()],
+    ['ErrNoOpenPermissionRequest', () => errNoOpenPermissionRequest()],
     ['a generic AgentDirectorError', () => errGeneric('decide', 'ErrSomethingElse')],
     ['a non-AgentDirectorError', () => new Error('network timeout')],
   ] as Array<[string, () => Error]>)('%s → no re-check', async (_label, build) => {

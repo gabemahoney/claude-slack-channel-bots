@@ -11,7 +11,7 @@
  * latest copy wins, since a restart posts an open prompt again. A token is
  * resolved once it has a `cscb.ad_decide.attempted` that succeeded (its
  * `result_class` one of DECIDED_RESULT_CLASSES), a `cscb.chat_update.attempted`
- * that renders a verdict (any but NOT_A_VERDICT_TAG) or a `reconciled_closed`
+ * that renders a verdict (any but NOT_A_VERDICT_TAGS) or a `reconciled_closed`
  * row decision. A refused decide (`ErrRelayFallenBack` and the like) leaves it
  * open, so the guard still denies it.
  *
@@ -150,22 +150,24 @@ export interface PromptGuardDeps {
  * The `result_class` of a `cscb.ad_decide.attempted` that leaves the request
  * decided: `ok`, or `ErrAlreadyDecided` (it was decided before; CSCB takes
  * that as success). Any other class is a refusal (`ErrRelayFallenBack`,
- * `ErrInvalidFlags`, `ErrAmbiguousRequest`, `other`, an outage) and leaves
+ * `ErrNoOpenPermissionRequest`, `ErrInvalidFlags`, `ErrAmbiguousRequest`,
+ * `other`, an outage) and leaves
  * the request open.
  */
 export const DECIDED_RESULT_CLASSES = ['ok', 'ErrAlreadyDecided'] as const
 
 /**
- * The `verdict_tag` of the one `cscb.chat_update.attempted` that is no
- * verdict: the click handler's rendering of an `ErrRelayFallenBack` refusal
- * (the prompt now waits at the session's tmux pane, still open).
+ * The `verdict_tag`s of the `cscb.chat_update.attempted` events that are no
+ * verdict: the click handler's renderings of an `ErrRelayFallenBack` refusal
+ * (the prompt now waits at the session's tmux pane, still open) and of an
+ * `ErrNoOpenPermissionRequest` refusal (the click was not applied).
  */
-export const NOT_A_VERDICT_TAG = 'click_handler_relay_fallen_back'
+export const NOT_A_VERDICT_TAGS = ['click_handler_relay_fallen_back', 'click_handler_no_open_request'] as const
 
 /** The events that close a request: a decide that succeeded, a closing message update, a reconciled closure. */
 const CLOSING_JQ =
   `((.event == "cscb.ad_decide.attempted" and (${DECIDED_RESULT_CLASSES.map((c) => `.result_class == ${JSON.stringify(c)}`).join(' or ')}))` +
-  ` or (.event == "cscb.chat_update.attempted" and .verdict_tag != ${JSON.stringify(NOT_A_VERDICT_TAG)})` +
+  ` or (.event == "cscb.chat_update.attempted" and (${NOT_A_VERDICT_TAGS.map((t) => `.verdict_tag != ${JSON.stringify(t)}`).join(' and ')}))` +
   ' or (.event == "cscb.poller.row_decision" and .action == "reconciled_closed"))'
 
 /** One trail line as the guard reads it: `{post: …}` (`promptPosts`'s projection), `{closed: <token>}`, or nothing. A line that doesn't parse is skipped. */

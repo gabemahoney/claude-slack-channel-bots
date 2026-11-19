@@ -1280,6 +1280,8 @@ interface Manifest {
     readonly installer_sha256: string
     readonly client_tgz_sha256: string
   }
+  /** The earlier CSCB release the tag's docker/Dockerfile.test.base pins for the downgrade scripts. */
+  readonly cscb_downgrade: { readonly version: string; readonly tarball_sha256: string; readonly published: string }
   readonly ad_role?: string
 }
 
@@ -1372,7 +1374,7 @@ function roleLabel(cscbVersion: string, role: GateRole): string {
 function readManifest(context: string): Manifest {
   const path = join(context, 'inputs', 'manifest.json')
   const manifest = parseJsonObject(readText(path, 'the manifest'), `the manifest ${path}`)
-  for (const block of ['cscb', 'candidate']) {
+  for (const block of ['cscb', 'candidate', 'cscb_downgrade']) {
     const value = manifest[block]
     if (typeof value !== 'object' || value === null) throw new GateError(`the manifest ${path} has no ${block} block`)
   }
@@ -1395,6 +1397,7 @@ function inputProblems(context: string, manifest: Manifest, cscbVersion: string,
     ['ad/agent-director', manifest.candidate.binary_sha256],
     ['ad/agent-director-admin', manifest.candidate.admin_sha256],
     ['ad/install.sh', manifest.candidate.installer_sha256],
+    [`fixtures/downgrade/claude-slack-channel-bots-${manifest.cscb_downgrade.version}.tgz`, manifest.cscb_downgrade.tarball_sha256],
   ]
   for (const [file, want] of files) {
     const path = join(context, 'inputs', file)
@@ -1725,6 +1728,9 @@ function startReference(run: RunContext, gate: ReleaseGate): void {
   gate.refManifest = refManifest
   gate.manifestProblems.push(...inputProblems(version.reference.context, refManifest, cscbVersion, gate.tagCommit, refSource))
   if (canonicalJson(refManifest.cscb) !== canonicalJson(gate.candManifest.cscb)) gate.manifestProblems.push('the reference context tests another CSCB package or tag than the candidate')
+  if (canonicalJson(refManifest.cscb_downgrade) !== canonicalJson(gate.candManifest.cscb_downgrade)) {
+    gate.manifestProblems.push('the reference context holds another CSCB downgrade fixture than the candidate')
+  }
   const refCommands = planRole(run, cscbVersion, refSource, version.reference, candidateVerdict.referenceScripts, run.options.shards ?? MAX_GATE_SHARDS)
   if (gate.manifestProblems.length > 0) {
     gate.outcome = finish(run, cscbVersion, version, gate.manifestProblems, gate.candidate!, { plan: version.reference.plan!, shards: [], manifest: refManifest }, candidateVerdict)
@@ -1993,6 +1999,7 @@ function renderReport(run: RunContext, outcome: GateOutcome): string {
     ...(nonRelease.length === 0 ? [] : ['**Not a release verdict.** This run cannot gate a release: ' + nonRelease.join('; ') + '.', '']),
     `- Candidate: ${options.candidateDist} (expected ${options.candidateVersion}${manifest.candidate.commit === undefined ? '' : `, commit ${manifest.candidate.commit}`}); binary sha256 ${manifest.candidate.binary_sha256}`,
     `- CSCB ${manifest.cscb.version}: tests ${manifest.cscb.tests_commit}, tarball sha256 ${manifest.cscb.tarball_sha256}, AD client pin ${manifest.cscb.ad_client_pin}`,
+    `- CSCB downgrade fixture ${manifest.cscb_downgrade.version}: tarball sha256 ${manifest.cscb_downgrade.tarball_sha256}`,
     `- Kit: ${run.kit.revision}${run.kit.dirty ? ' with uncommitted changes' : ''} (file hashes in verdict.json)`,
     ...(run.state.shardChoice === null ? [] : [`- Shards: ${describeShardChoice(run.state.shardChoice)}`]),
     `- Reference: ${outcome.referenceTag}, ${outcome.reference === null ? 'not run (no candidate failure needed it)' : `run for ${outcome.candidateVerdict.referenceScripts.join(' ')}`}`,

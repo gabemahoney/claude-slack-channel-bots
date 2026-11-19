@@ -99,7 +99,9 @@
  * copy of the kit, with prepare.sh replaced by tests/fixtures/ad-gate/
  * fake-prepare.ts (no fetch) and `--jobsched` pointing at the recording
  * tests/fixtures/ad-gate/fake-jobsched.ts: no scheduler, Docker or network,
- * and no agent-director binary.
+ * and no agent-director binary. The downgrade-fixture cases run the real
+ * prepare.sh over stub `npm` and `curl` that copy served fixture files, and
+ * scratch CSCB and AD checkouts: no network either.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -1028,6 +1030,324 @@ describe('patch-client-check.py', () => {
     expect(result.stderr).toContain('ERROR: patch-client-check:')
     expect(result.stderr).toContain('candidate_overlay')
     expect(result.text).toBe(original)
+  })
+})
+
+// --- prepare.sh's earlier-CSCB downgrade fixture ---
+
+/**
+ * The real prepare.sh over stub `npm` and `curl` (they copy served fixture
+ * files, so nothing is fetched), a scratch CSCB checkout whose tags carry
+ * variants of this repository's docker/Dockerfile.test.base, and a scratch
+ * AD checkout holding the legacy installer. Each CSCB version below is one
+ * tag, so one prepare run.
+ */
+describe("prepare.sh's downgrade fixture", () => {
+  const BASE = readFileSync(join(REPO_ROOT, 'docker', 'Dockerfile.test.base'), 'utf8')
+  const SHA_ARG = /^ARG CSCB_DOWNGRADE_SHA256=[0-9a-f]{64}$/m
+  const PUBLISHED = BASE.match(/"published":"([^"]+)"/)?.[1] ?? ''
+  const AD_PIN = '1.2.3'
+  let work = ''
+  let serve = ''
+  let stubBin = ''
+  let cscbRepo = ''
+  let adRepo = ''
+  let adDist = ''
+  let downgradeSha = ''
+
+  const sha256 = (path: string): string => createHash('sha256').update(readFileSync(path)).digest('hex')
+
+  function run(argv: readonly string[], cwd: string): { code: number; stdout: string; stderr: string } {
+    const result = Bun.spawnSync([join(resolveToolDir(argv[0] ?? '') ?? '', argv[0] ?? ''), ...argv.slice(1)], {
+      cwd,
+      env: hostSafeChildEnv(join(work, 'home'), {
+        pathDirs: [stubBin],
+        tools: ['bash', 'git', 'jq', 'tar', 'gzip', 'sha256sum', 'sed', 'awk', 'python3', 'du'],
+        extras: { GIT_CONFIG_NOSYSTEM: '1' },
+      }),
+      stdout: 'pipe',
+      stderr: 'pipe',
+      timeout: 30_000,
+    })
+    return { code: result.exitCode, stdout: result.stdout.toString(), stderr: result.stderr.toString() }
+  }
+
+  function must(argv: readonly string[], cwd: string = work): void {
+    const result = run(argv, cwd)
+    if (result.code !== 0) throw new Error(`${argv.join(' ')} failed: ${result.stderr}`)
+  }
+
+  /** Serves an npm tarball `<name>-<file version>.tgz` whose package.json names `version`. */
+  function servePackage(name: string, fileVersion: string, version: string, dependencies: Record<string, string> = {}): string {
+    const dir = join(work, 'pack', `${name}-${fileVersion}`)
+    mkdirSync(join(dir, 'package'), { recursive: true })
+    writeFileSync(join(dir, 'package', 'package.json'), `${JSON.stringify({ name, version, dependencies })}\n`)
+    const tgz = join(serve, 'npm', `${name}-${fileVersion}.tgz`)
+    must(['tar', '-czf', tgz, '-C', dir, 'package'])
+    return tgz
+  }
+
+  /** Serves a release asset at `<tag>/<asset>`, an ELF64 x86-64 header and `text`. */
+  function serveAsset(tag: string, asset: string, text: string): string {
+    const path = join(serve, 'gh', tag, asset)
+    mkdirSync(join(serve, 'gh', tag), { recursive: true })
+    writeFileSync(path, Buffer.concat([elfHeader(), Buffer.from(text)]))
+    return path
+  }
+
+  function elfHeader(): Buffer {
+    const header = Buffer.alloc(20)
+    Buffer.from([0x7f, 0x45, 0x4c, 0x46, 2, 1]).copy(header)
+    header.writeUInt16LE(62, 18)
+    return header
+  }
+
+  /** Commits `base` as the CSCB checkout's docker/Dockerfile.test.base, tags it v<version> and serves that CSCB. */
+  function cscbTag(version: string, base: string): void {
+    writeFileSync(join(cscbRepo, 'docker', 'Dockerfile.test.base'), base)
+    must(['git', '-C', cscbRepo, 'add', '-A'])
+    must(['git', '-C', cscbRepo, '-c', 'user.name=ad-gate test', '-c', 'user.email=ad-gate-test@example.invalid', 'commit', '-q', '--allow-empty', '-m', version])
+    must(['git', '-C', cscbRepo, 'tag', `v${version}`])
+    servePackage('claude-slack-channel-bots', version, version, { 'agent-director': AD_PIN })
+  }
+
+  /** prepare.sh for the CSCB tag v<version>; its inputs directory. */
+  function prepare(version: string): { code: number; stdout: string; stderr: string; inputs: string } {
+    const inputs = join(work, `run-${version}`, 'inputs')
+    const result = run([
+      'bash', join(REPO_ROOT, 'scripts', 'ad-gate', 'prepare.sh'), '--inputs', inputs, '--cscb-version', version,
+      '--ad-dist', adDist, '--ad-install-sh', join(adDist, 'install.sh'), '--ad-expected-version', '9.9.1',
+      '--ad-role', 'cand', '--cscb-repo', cscbRepo, '--ad-repo', adRepo,
+    ], work)
+    return { ...result, inputs }
+  }
+
+  beforeAll(() => {
+    work = mkdtempSync(join(tmpdir(), 'ad-gate-prepare-'))
+    serve = join(work, 'serve')
+    stubBin = join(work, 'bin')
+    cscbRepo = join(work, 'cscb')
+    adRepo = join(work, 'ad')
+    adDist = join(work, 'dist')
+    for (const dir of [join(work, 'home'), join(serve, 'npm'), stubBin, adDist,
+      join(cscbRepo, 'tests', 'integration'), join(cscbRepo, 'testplans'), join(cscbRepo, 'docker'),
+      join(adRepo, 'skills', 'install-agent-director')]) mkdirSync(dir, { recursive: true })
+    writeFileSync(join(stubBin, 'npm'), [
+      '#!/usr/bin/env bash',
+      '# fixture npm: `npm pack ... --pack-destination DIR NAME@VERSION` copies the served tarball.',
+      '[[ "$1" == pack ]] || exit 1',
+      "dest='' spec=''",
+      'while (( $# )); do case "$1" in --pack-destination) dest="$2"; shift 2 ;; pack | -*) shift ;; *) spec="$1"; shift ;; esac; done',
+      `cp ${quoted(join(serve, 'npm'))}"/\${spec%@*}-\${spec##*@}.tgz" "\${dest}/"`,
+      '',
+    ].join('\n'))
+    writeFileSync(join(stubBin, 'curl'), [
+      '#!/usr/bin/env bash',
+      '# fixture curl: `curl ... -o DEST <base>/releases/download/<tag>/<asset>` copies the served asset.',
+      "out='' url=''",
+      'while (( $# )); do case "$1" in -o) out="$2"; shift 2 ;; --retry) shift 2 ;; -*) shift ;; *) url="$1"; shift ;; esac; done',
+      `src=${quoted(join(serve, 'gh'))}"/\${url#*/releases/download/}"`,
+      '[[ -f "${src}" ]] || exit 22',
+      'cp "${src}" "${out}"',
+      '',
+    ].join('\n'))
+    chmodSync(join(stubBin, 'npm'), 0o755)
+    chmodSync(join(stubBin, 'curl'), 0o755)
+
+    for (const name of ['agent-director', 'agent-director-admin']) writeFileSync(join(adDist, name), Buffer.concat([elfHeader(), Buffer.from(`fixture ${name}\n`)]))
+    writeFileSync(join(adDist, 'install.sh'), 'fixture installer (never run)\n')
+    servePackage('agent-director', AD_PIN, AD_PIN)
+    servePackage('agent-director', '0.10.0', '0.10.0')
+    servePackage('claude-slack-channel-bots', '0.10.0', '0.10.0')
+    serveAsset('v0.10.0', 'agent-director-linux-amd64', 'fixture 0.10.0\n')
+    const legacy = ['agent-director-linux-amd64', 'agent-director-admin-linux-amd64'].map((asset) => `${sha256(serveAsset('v0.17.0', asset, `fixture legacy ${asset}\n`))}  ${asset}`)
+    writeFileSync(join(serve, 'gh', 'v0.17.0', 'SHA256SUMS'), `${legacy.join('\n')}\n`)
+    writeFileSync(join(adRepo, 'skills', 'install-agent-director', 'install.sh'), 'fixture legacy installer (never run)\n')
+    must(['git', 'init', '-q', adRepo])
+    must(['git', '-C', adRepo, 'add', '-A'])
+    must(['git', '-C', adRepo, '-c', 'user.name=ad-gate test', '-c', 'user.email=ad-gate-test@example.invalid', 'commit', '-q', '-m', 'ad'])
+    must(['git', '-C', adRepo, 'tag', 'v0.17.0'])
+
+    downgradeSha = sha256(servePackage('claude-slack-channel-bots', '0.18.0', '0.18.0'))
+    // Its file name says 0.18.1, its package.json 0.18.0.
+    const mislabelledSha = sha256(servePackage('claude-slack-channel-bots', '0.18.1', '0.18.0'))
+    writeFileSync(join(cscbRepo, 'tests', 'integration', 'test-1-fixture.sh'), 'exit 0\n')
+    writeFileSync(join(cscbRepo, 'testplans', 'README.md'), 'fixture\n')
+    writeFileSync(join(cscbRepo, 'docker', 'entrypoint.sh'), 'exit 0\n')
+    writeFileSync(join(cscbRepo, 'docker', 'ad-client-check.sh'), 'exit 0\n')
+    must(['git', 'init', '-q', cscbRepo])
+    const pinned = BASE.replace(SHA_ARG, `ARG CSCB_DOWNGRADE_SHA256=${downgradeSha}`)
+    cscbTag('1.0.0', pinned)
+    cscbTag('1.0.1', BASE)
+    cscbTag('1.0.2', pinned.replace(/^ARG CSCB_DOWNGRADE_(VERSION|SHA256)=.*\n/gm, ''))
+    cscbTag('1.0.3', pinned.replace(SHA_ARG, (line) => `${line}\n${line}`))
+    cscbTag('1.0.4', pinned.replace(/"published":"[^"]+",/, ''))
+    cscbTag('1.0.5', pinned.replace(/^ARG CSCB_DOWNGRADE_VERSION=.*$/m, 'ARG CSCB_DOWNGRADE_VERSION=0.18.1').replace(SHA_ARG, `ARG CSCB_DOWNGRADE_SHA256=${mislabelledSha}`))
+  }, 30_000)
+
+  afterAll(() => {
+    if (work !== '') rmSync(work, { recursive: true, force: true })
+  })
+
+  test('this repository pins one downgrade release, its SHA-256 and its publication time', () => {
+    expect(BASE.match(/^ARG CSCB_DOWNGRADE_VERSION=[0-9]+\.[0-9]+\.[0-9]+$/gm)).toHaveLength(1)
+    expect(BASE.match(new RegExp(SHA_ARG.source, 'gm'))).toHaveLength(1)
+    expect(PUBLISHED).toMatch(/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z$/)
+  })
+
+  test('it fetches the pinned release, checks it and records it as the manifest\'s cscb_downgrade', () => {
+    const result = prepare('1.0.0')
+    expect(result.stderr).toBe('')
+    expect(result.code).toBe(0)
+    const tgz = join(result.inputs, 'fixtures', 'downgrade', 'claude-slack-channel-bots-0.18.0.tgz')
+    expect(sha256(tgz)).toBe(downgradeSha)
+    const manifest = JSON.parse(readFileSync(join(result.inputs, 'manifest.json'), 'utf8')) as Record<string, unknown>
+    expect(manifest['cscb_downgrade']).toEqual({ version: '0.18.0', tarball_sha256: downgradeSha, published: PUBLISHED })
+  }, 30_000)
+
+  test.each([
+    ['the tarball differs from the pinned SHA-256', '1.0.1', /claude-slack-channel-bots 0\.18\.0 has SHA-256 [0-9a-f]{64}, v1\.0\.1:docker\/Dockerfile\.test\.base pins [0-9a-f]{64}/],
+    ['the tag pins no downgrade release', '1.0.2', /v1\.0\.2:docker\/Dockerfile\.test\.base pins no single CSCB_DOWNGRADE_VERSION/],
+    ['the tag pins two SHA-256 values', '1.0.3', /v1\.0\.3:docker\/Dockerfile\.test\.base pins no single CSCB_DOWNGRADE_SHA256/],
+    ['the tag records no publication time', '1.0.4', /v1\.0\.4:docker\/Dockerfile\.test\.base records no single published time/],
+    ['the pinned tarball holds another version', '1.0.5', /the packed downgrade fixture is not claude-slack-channel-bots 0\.18\.1/],
+  ])('prepare fails loudly, writing no manifest, when %s', (_name, version, message) => {
+    const result = prepare(version)
+    expect(result.code).toBe(2)
+    expect(result.stderr).toMatch(new RegExp(`^prepare\\.sh: ${message.source}`, 'm'))
+    expect(existsSync(join(result.inputs, 'manifest.json'))).toBe(false)
+  }, 30_000)
+})
+
+describe("the template's downgrade fixture", () => {
+  const TEMPLATE = readFileSync(join(REPO_ROOT, 'scripts', 'ad-gate', 'template', 'Dockerfile'), 'utf8')
+  const BASE = readFileSync(join(REPO_ROOT, 'docker', 'Dockerfile.test.base'), 'utf8')
+
+  test("it writes the base image's release.json, the publication time taken from the manifest", () => {
+    const record = BASE.match(/printf '(\{"version":"%s","published":")[^"]+(","sha256":"%s","registry":"[^"]+"\}\\n)'/)
+    expect(record).not.toBeNull()
+    expect(TEMPLATE).toContain(`printf '${record?.[1]}%s${record?.[2]}' "\${V}" "\${PUBLISHED}" "\${SHA}" > "$d/release.json"`)
+  })
+
+  test('it installs the manifest\'s release at the base image\'s path, checked against the manifest', () => {
+    expect(BASE).toContain('d="/opt/claude-slack-channel-bots-${CSCB_DOWNGRADE_VERSION}"')
+    for (const line of [
+      'V=$(jq -er \'.cscb_downgrade.version\' "${IN}/manifest.json")',
+      'SHA=$(jq -er \'.cscb_downgrade.tarball_sha256\' "${IN}/manifest.json")',
+      'PUBLISHED=$(jq -er \'.cscb_downgrade.published\' "${IN}/manifest.json")',
+      'd="/opt/claude-slack-channel-bots-${V}"',
+      'f="$d/claude-slack-channel-bots-${V}.tgz"',
+      'cp "${IN}/fixtures/downgrade/claude-slack-channel-bots-${V}.tgz" "$f"',
+      'printf \'%s  %s\\n\' "${SHA}" "$f" | sha256sum --check --status',
+      'test "$(tar -xOf "$f" package/package.json | jq -r .version)" = "${V}"',
+      'chmod -R a+rX "$d"',
+    ]) expect(TEMPLATE).toContain(line)
+    expect(TEMPLATE).not.toContain('no 0.18.0 downgrade fixture')
+  })
+})
+
+describe("the template's offline warm of test-47's downgrade install", () => {
+  const TEMPLATE = readFileSync(join(REPO_ROOT, 'scripts', 'ad-gate', 'template', 'Dockerfile'), 'utf8')
+  const BASE = readFileSync(join(REPO_ROOT, 'docker', 'Dockerfile.test.base'), 'utf8')
+  const TEST_47 = readFileSync(join(REPO_ROOT, 'tests', 'integration', 'test-47-shared-channel-upgrade.sh'), 'utf8')
+  const ENTRYPOINT = readFileSync(join(REPO_ROOT, 'docker', 'entrypoint.sh'), 'utf8')
+  const WARM_START = TEMPLATE.indexOf("# test-47 installs the downgrade fixture with no lockfile")
+  const WARM = TEMPLATE.slice(WARM_START, TEMPLATE.indexOf('WORKDIR /test-repo'))
+  /** test-47's own install command, as its script runs it. */
+  const INSTALL = TEST_47.match(/\(cd "\$\{EARLIER_INSTALL\}" && (bun install[^>]*?) >/)?.[1]
+
+  test('test-47 installs the tarball the template warms, as testuser with HOME /home/testuser', () => {
+    expect(WARM_START).toBeGreaterThan(0)
+    expect(WARM).toContain('RUN set -eu; \\')
+    const pinned = BASE.match(/^ARG CSCB_DOWNGRADE_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$/m)?.[1]
+    expect(pinned).toBeDefined()
+    expect(TEST_47).toContain(`EARLIER_TGZ="/opt/claude-slack-channel-bots-${pinned}/claude-slack-channel-bots-${pinned}.tgz"`)
+    expect(WARM).toContain('TGZ="/opt/claude-slack-channel-bots-${V}/claude-slack-channel-bots-${V}.tgz"')
+    expect(WARM).toContain('V=$(jq -er \'.cscb_downgrade.version\' /opt/ad-gate/inputs/manifest.json)')
+    // The runner runs as testuser through gosu, and test-47 is no fmk script,
+    // so scenario.sh keeps the container's HOME, whose bun cache the warm fills.
+    expect(ENTRYPOINT).toContain('exec gosu testuser bash /tests/runner.sh "$@"')
+    expect(TEST_47).toMatch(/^TEST_NAME="test-47-[a-z-]+"$/m)
+    expect(TEST_47.match(/^TEST_NAME="([^"]+)"$/m)?.[1]).not.toContain('-fmk-')
+    expect(WARM).toContain('[ "$(gosu testuser sh -c \'echo "${HOME}"\')" = /home/testuser ]')
+  })
+
+  test("it runs test-47's exact package.json and install, online first, after testuser and the fixture exist", () => {
+    const filter = TEST_47.match(/jq -n --arg tgz "file:\$\{EARLIER_TGZ\}" '([^']+)'/)?.[1]
+    expect(filter).toBeDefined()
+    expect(INSTALL).toBe('bun install --ignore-scripts')
+    const userAt = TEMPLATE.indexOf('useradd -m -s /bin/bash testuser')
+    const fixtureAt = TEMPLATE.indexOf('cp "${IN}/fixtures/downgrade/claude-slack-channel-bots-${V}.tgz" "$f"')
+    expect(userAt).toBeGreaterThan(0)
+    expect(fixtureAt).toBeGreaterThan(0)
+    expect(WARM_START).toBeGreaterThan(userAt)
+    expect(WARM_START).toBeGreaterThan(fixtureAt)
+    expect(WARM).toContain(`jq -n --arg tgz "file:\${TGZ}" '${filter}' > "\${W}/\${d}/package.json"`)
+    expect(WARM).toContain(`(cd "\${W}/online" && gosu testuser ${INSTALL});`)
+  })
+
+  test("testuser's bun then prefers cached metadata of any age, set after the online install and before every offline proof", () => {
+    const bunfig = 'printf \'[install]\\nprefer = "offline"\\n\' > /home/testuser/.bunfig.toml;'
+    expect(WARM).toContain(bunfig)
+    expect(WARM).toContain('chown testuser:testuser /home/testuser/.bunfig.toml;')
+    expect(WARM.indexOf('"${W}/online" && gosu')).toBeGreaterThan(0)
+    expect(WARM.indexOf(bunfig)).toBeGreaterThan(WARM.indexOf('"${W}/online" && gosu'))
+    expect(WARM.indexOf(bunfig)).toBeLessThan(WARM.indexOf('"${W}/offline" && gosu'))
+  })
+
+  test("the build fails unless an invalid prefer in testuser's bunfig first fails testuser's install with bun's own error", () => {
+    const invalid = 'printf \'[install]\\nprefer = "not-a-prefer-setting"\\n\' > /home/testuser/.bunfig.toml;'
+    const probe = `if (cd "\${W}/bunfig" && gosu testuser ${INSTALL} > "\${W}/bunfig.log" 2>&1); then \\\n`
+    const real = 'printf \'[install]\\nprefer = "offline"\\n\' > /home/testuser/.bunfig.toml;'
+    expect(WARM).toContain('for d in online bunfig offline control blocked; do')
+    expect(WARM).toContain(invalid)
+    expect(WARM).toContain(
+      probe + '        echo "ERROR: bun, run as testuser, installed despite an invalid prefer in /home/testuser/.bunfig.toml: it does not read that file" >&2; exit 1; \\\n' + '    fi;',
+    )
+    // bun 1.4.2 prints `error: Invalid prefer setting, must be one of online or offline`.
+    expect(WARM).toContain('grep -q \'Invalid prefer setting\' "${W}/bunfig.log" \\\n        || {')
+    expect(WARM).toContain('echo "bun, run as testuser, reads /home/testuser/.bunfig.toml')
+    expect(WARM.indexOf(invalid)).toBeGreaterThan(WARM.indexOf('"${W}/online" && gosu'))
+    expect(WARM.indexOf(probe)).toBeGreaterThan(WARM.indexOf(invalid))
+    expect(WARM.indexOf(real)).toBeGreaterThan(WARM.indexOf(probe))
+    expect(WARM.indexOf('chown testuser:testuser /home/testuser/.bunfig.toml;')).toBeGreaterThan(WARM.indexOf(invalid))
+    expect(WARM.indexOf('chown testuser:testuser /home/testuser/.bunfig.toml;')).toBeLessThan(WARM.indexOf(probe))
+  })
+
+  test('the build fails unless bun --offline installs it from the cache alone', () => {
+    expect(WARM).toContain(
+      `(cd "\${W}/offline" && gosu testuser ${INSTALL} --offline) \\\n` +
+        '        || { echo "ERROR: bun --offline cannot install the CSCB ${V} downgrade fixture from testuser\'s cache" >&2; exit 1; };',
+    )
+  })
+
+  test('the build fails unless every proxy at a closed port stops an empty-cache install by a refused connection', () => {
+    expect(WARM).toContain(
+      'BLOCK="HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 NO_PROXY= no_proxy=";',
+    )
+    expect(WARM).toContain(
+      `if (cd "\${W}/control" && gosu testuser env \${BLOCK} BUN_INSTALL_CACHE_DIR="\${W}/empty-cache" ${INSTALL} > "\${W}/control.log" 2>&1); then \\\n` +
+        '        echo "ERROR: bun installed the CSCB ${V} downgrade fixture from an empty cache with every proxy at a closed port: the network block does not hold" >&2; exit 1; \\\n' +
+        '    fi;',
+    )
+    expect(WARM).toContain('grep -q ConnectionRefused "${W}/control.log" \\\n        || {')
+  })
+
+  test("the build fails unless test-47's exact install, so blocked, installs the fixture's version with the online lockfile", () => {
+    expect(WARM).toContain(
+      `(cd "\${W}/blocked" && gosu testuser env \${BLOCK} ${INSTALL}) \\\n` +
+        '        || { echo "ERROR: test-47\'s install of the CSCB ${V} downgrade fixture needs the network" >&2; exit 1; };',
+    )
+    expect(WARM).toContain(
+      'for d in online offline blocked; do \\\n' +
+        '        test "$(jq -r .version "${W}/${d}/node_modules/claude-slack-channel-bots/package.json")" = "${V}"; \\\n' +
+        '    done;',
+    )
+    expect(WARM).toContain('cmp "${W}/online/bun.lock" "${W}/blocked/bun.lock" \\\n        || {')
+    expect(WARM).toContain('RUN set -eu; \\')
+    expect(WARM).toContain(
+      'echo "CSCB ${V} downgrade fixture: test-47\'s install warmed in testuser\'s bun cache and proved offline (--offline, and with the network blocked)"',
+    )
   })
 })
 

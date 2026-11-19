@@ -57,7 +57,13 @@ reads a token. The AD checkout must hold the reference tag (and, for a
 candidate with no `install.sh`, its commit). `agent-director` must be on
 `PATH` only when `--reference-tag` is not given. No secret is needed: the
 driver passes no `ANTHROPIC_*` or `CI_ANTHROPIC_*` variable to any child, and
-every job runs with its network off.
+every job runs with its network off. The job image's build uses the network
+for apt, bun, node, cozempic and the bun installs that fill `testuser`'s bun
+cache, and fails unless test-47's install of the downgrade fixture then
+resolves with no network; its last line for that is `CSCB <version>
+downgrade fixture: test-47's install warmed in testuser's bun cache and
+proved offline (--offline, and with the network blocked)` (see
+[The job image](../../../docker/README.md#the-job-image)).
 
 ## What a release gate runs
 
@@ -295,9 +301,9 @@ runs. Rerun with `--resume`, or in a new `--out` when an option must change.
 
 | Message | What to do |
 |---|---|
-| `prepare.sh failed for the <role> (exit <n>): <line>; see <path>/prepare.log` | Read `prepare.log` (a download, checksum or tag failed) and fix it. Rerun with `--resume`, or in a new `--out` when an option must change |
+| `prepare.sh failed for the <role> (exit <n>): <line>; see <path>/prepare.log` | Read `prepare.log` (a download, checksum or tag failed) and fix it. Rerun with `--resume`, or in a new `--out` when an option must change. A line naming `docker/Dockerfile.test.base` is about the downgrade fixture the tag pins (see [The job image](../../../docker/README.md#the-job-image)): a SHA-256 mismatch means npm serves another tarball than the pin, so report it; a tag with no single pin (any before v0.17.0) cannot be gated |
 | `planning the <role> for claude-slack-channel-bots <version>: <reason>` | For `"<name>" names no integration script of the tag` or `<file> cannot run in the gate: …`, correct `--only` in a new `--out`. For `the tag's prerequisite headers are refused: …` or `the tag has no test-1`, that release cannot be gated: report it |
-| `<context> holds no inputs/cscb-src/tests/integration: prepare.sh extracted no tests from the tag`, `the manifest <path> cannot be read: <reason>`, `the manifest <path> is not JSON: <reason>`, `the manifest <path> has no <cscb\|candidate> block`, `the tag script <path> cannot be read: <reason>` or `the tag duration table <path> cannot be read: <reason>` | The context is incomplete: read `prepare.log`, then start a new `--out` |
+| `<context> holds no inputs/cscb-src/tests/integration: prepare.sh extracted no tests from the tag`, `the manifest <path> cannot be read: <reason>`, `the manifest <path> is not JSON: <reason>`, `the manifest <path> has no <cscb\|candidate\|cscb_downgrade> block`, `the tag script <path> cannot be read: <reason>` or `the tag duration table <path> cannot be read: <reason>` | The context is incomplete: read `prepare.log`, then start a new `--out`. A context an earlier kit prepared has no `cscb_downgrade` block |
 | `shard(s) <k> would need a timeout above jobsched's 12 h: use more shards or --durations` | Use more shards, or `--durations` with measured times |
 
 ### The scheduler

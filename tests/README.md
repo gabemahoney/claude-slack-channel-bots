@@ -399,7 +399,8 @@ tests/
                                    # HO §7 scenario 10, fmk: a find-missing from another tmux environment marks nothing; the own-id conflict latches
                                    # and clears (see fmk scenario list). It writes the scenario HOME's `[tmux]` table and runs about ten minutes
     test-23-fmk-latch-recheck.sh  # AD row/refusal and lifecycle recovery scenario; startup dialogs receive no CSCB answer
-                                   # From AD 0.18.0 PN uses the shared absent-pane fixture with its worker kept; its clearing status marks it missing.
+                                   # From AD 0.18.0 PN uses the shared absent-pane fixture with its worker kept; once its session ends, the first CSCB active read
+                                   # selecting its row (one unambiguous caller) marks it missing, and its clearing round's status reads it missing.
                                    # Observation reads are passive; R1/R2 marks are attributed to CSCB or the loop; NS has no launch-start latch,
                                    # while another latch after its relaunch is recorded under S8. The note's cause stays until its clearing event.
     test-24-fmk-stuck-launch.sh    # AD row/refusal and lifecycle recovery scenario; startup dialogs receive no CSCB answer

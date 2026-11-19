@@ -1452,13 +1452,53 @@ The template's `Dockerfile` mirrors the `/ci` image at the tag
   manifest's expected version and, when the manifest records a commit, a
   commit starting with it; the admin tool reports the same version; and the
   installed files match the manifest's digests.
-- There is no native Claude Code or Codex and no 0.18.0 downgrade fixture.
-  The 0.10.0 fixtures and the 0.17.0 legacy fixture come from `inputs/`, the
-  latter checked against the pins of v0.18.2's base Dockerfile.
+- There is no native Claude Code or Codex. The 0.10.0 fixtures and the
+  0.17.0 legacy fixture come from `inputs/`, the latter checked against the
+  pins of v0.18.2's base Dockerfile.
+- The earlier-CSCB downgrade fixture (test-47's; the base's real-agent
+  test-40 is never gated) is the release the
+  tag's `docker/Dockerfile.test.base` pins: `prepare.sh` reads its
+  `CSCB_DOWNGRADE_VERSION`, `CSCB_DOWNGRADE_SHA256` and `release.json`
+  publication time from the tag (`git cat-file`, as it reads the tag's
+  tests), packs that release into `inputs/fixtures/downgrade/`, and fails
+  unless the tarball matches the pinned SHA-256 and names that version. A
+  tag with no single pin (any tag before v0.17.0) fails `prepare.sh`.
+  `inputs/manifest.json` records it as `cscb_downgrade` (`version`,
+  `tarball_sha256`, `published`); the image installs it at
+  `/opt/claude-slack-channel-bots-<version>/` with the base image's
+  `release.json`, checked again against the manifest. For v0.19.x that is
+  0.18.0; v0.17.0 to v0.18.7 pin 0.16.1.
 - `/test-repo` is pre-installed from the same package tarball, so test-1's
   install resolves offline.
-- The build uses the network only for apt, bun, node and cozempic; the job
-  runs with `--network off`. Nothing reads or receives a credential.
+- test-47's install of the downgrade fixture is warmed and proved offline.
+  test-47 installs it with no lockfile (a `file:` dependency in a fresh
+  directory, `bun install --ignore-scripts`, as `testuser` with HOME
+  `/home/testuser`), so bun needs the registry's metadata for the fixture's
+  dependencies. The build runs that install online as the same user and
+  HOME, filling `testuser`'s bun cache, then sets `testuser`'s global
+  `~/.bunfig.toml` to `[install] prefer = "offline"`: bun otherwise
+  fetches cached metadata older than the registry's max-age (minutes) again
+  and, with no network, fails. The build's offline proofs run on fresh
+  metadata and pass without that setting, so it first writes an invalid
+  `prefer` there and fails unless `testuser`'s `bun install` then fails
+  with bun's `Invalid prefer setting` error, which shows bun reads that
+  file; the log line is `bun, run as testuser, reads
+  /home/testuser/.bunfig.toml (an invalid prefer there failed its install
+  with: error: Invalid prefer setting, must be one of online or offline)`.
+  The build then fails unless, from that cache, `bun install --offline`
+  installs it; with `HTTP_PROXY`, `HTTPS_PROXY` and their lower-case forms
+  at a closed port (127.0.0.1:9) and `NO_PROXY` empty, an install with an
+  empty cache fails on `ConnectionRefused` (the
+  block holds); and test-47's exact install under that block installs the
+  fixture's version with the online install's `bun.lock` byte for byte. Its
+  last build log line is `CSCB <version> downgrade fixture: test-47's
+  install warmed in testuser's bun cache and proved offline (--offline, and
+  with the network blocked)`. The setting only lets an install that would
+  otherwise need the network use the cache, which a job without network
+  could never reach.
+- The build uses the network only for apt, bun, node, cozempic and the two
+  warming installs (test-1's and test-47's); the job runs with
+  `--network off`. Nothing reads or receives a credential.
 - It writes the [image marker](#image-marker), so the tag's runner and
   scripts run there.
 
@@ -1588,15 +1628,18 @@ incomplete reference run never becomes a pass.
   must match its `SHA256SUMS` when it has one. A reference release's assets
   come from its public GitHub download and must match the release's
   `SHA256SUMS`, with `install.sh` from the AD checkout at the tag. The
-  binary must be a linux-amd64 ELF. The manifest holds names, versions and
-  SHA-256s only.
+  binary must be a linux-amd64 ELF. The earlier-CSCB downgrade fixture must
+  match the version and SHA-256 the tag's `docker/Dockerfile.test.base` pins
+  (see [The job image](#the-job-image)). The manifest holds names, versions,
+  SHA-256s and that fixture's publication time only.
 - **Before submitting,** the driver checks that the manifest names this CSCB
   version, tests from the tag's commit, the role's expected AD version and
   its `ad_role`, and that each input file matches its recorded SHA-256 (the
   client tarball present exactly when one is recorded). The reference's
-  CSCB entry must equal the candidate's.
+  CSCB and `cscb_downgrade` entries must equal the candidate's.
 - **The image build** checks the binary's version and commit, the admin
-  tool's version and the installed files' digests (see
+  tool's version and the installed files' digests, and proves test-47's
+  install of the downgrade fixture resolves with no network (see
   [The job image](#the-job-image)).
 - **After the run,** each job's `ad-gate: manifest:` line must equal its
   context's manifest. Each job's name (`adg-<v>-<cand|ref>-s<k>`) and
@@ -2416,11 +2459,14 @@ denies the prompts no check expects, so one detour can't cascade:
   an open prompt again: the latest copy is the one clicked). A decide that
   succeeded (its `result_class` `ok`, or `ErrAlreadyDecided`), a closing
   message update or a reconciled closure resolves a prompt. A refused decide
-  (`ErrRelayFallenBack`, `ErrInvalidFlags`, an agent-director outage …) and
-  the message update that shows an `ErrRelayFallenBack` refusal leave it
-  open, so the guard still tries to deny it. A prompt whose relay window has
-  elapsed can only be answered at the persona's tmux pane, so neither of the
-  guard's ways can deny it; its note then says it could not be denied, and
+  (`ErrRelayFallenBack`, `ErrNoOpenPermissionRequest`, `ErrInvalidFlags`, an
+  agent-director outage …) and the message updates that show an
+  `ErrRelayFallenBack` or `ErrNoOpenPermissionRequest` refusal leave it open,
+  so the guard still tries to deny it. A prompt whose relay window has
+  elapsed can only be answered at the persona's tmux pane, and one
+  agent-director refuses as having no open request it will answer takes no
+  verdict, so neither of the
+  guard's ways can deny them; the note then says it could not be denied, and
   why.
 - **An unexpected prompt is denied.** An open prompt that the running check
   did not declare and that is older than 15 s is denied: Deny clicked on its

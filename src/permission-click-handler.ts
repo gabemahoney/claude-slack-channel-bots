@@ -19,6 +19,14 @@
  * retries nor touches the session — it repaints the prompt message to say the
  * answer must now be given at the pane.
  *
+ * `ErrNoOpenPermissionRequest` means agent-director has no open request it
+ * will take a verdict for (absent, closed, proven gone or obsolete; on
+ * agent-director 0.18.0 to 0.18.7 also a still-listed subagent request after
+ * the main agent's turn ended). The click did not land, so the handler logs a
+ * named line and repaints the prompt buttonless to say so, without retrying
+ * or touching the session, and advises no pane answer, as agent-director's
+ * contract says.
+ *
  * `ErrInvalidFlags` from `decide` is logged once and not retried, and it
  * starts one immediate agent-director version re-check through the
  * `ErrInvalidFlags` step in `src/ad-error-class.ts`.
@@ -57,6 +65,7 @@ import { decideWithToken } from './agent-director-client.ts'
 import {
   AgentDirectorError,
   ErrAlreadyDecided,
+  ErrNoOpenPermissionRequest,
   ErrRelayFallenBack,
   ErrSystemInstallDisappeared,
 } from './agent-director-errors.ts'
@@ -119,6 +128,7 @@ function logDeps(deps: ClickDeps, ...args: unknown[]): void {
 function classifyAdDecideError(err: unknown): AdDecideResponseClass {
   if (err instanceof ErrAlreadyDecided) return 'ErrAlreadyDecided'
   if (err instanceof ErrRelayFallenBack) return 'ErrRelayFallenBack'
+  if (err instanceof ErrNoOpenPermissionRequest) return 'ErrNoOpenPermissionRequest'
   if (isInvalidFlagsError(err)) return 'ErrInvalidFlags'
   if (err instanceof AgentDirectorError && err.errName === 'ErrAmbiguousRequest') return 'ErrAmbiguousRequest'
   return 'other'
@@ -155,6 +165,27 @@ function buildRelayFallenBackBlocks(): unknown[] {
     {
       type: 'section',
       text: { type: 'mrkdwn', text: RELAY_FALLEN_BACK_TEXT },
+    },
+  ]
+}
+
+/**
+ * message body for a click AD refused with `ErrNoOpenPermissionRequest`. AD
+ * took no verdict, so the rendering says the click was not applied and strips
+ * the buttons, which would only be refused again. It claims only what AD said,
+ * that it has no open request it will answer, since on agent-director 0.18.0
+ * to 0.18.7 AD may still list the request (issue #51). It advises no pane
+ * answer: AD's contract gives none for this refusal; the poller's later
+ * verdict or pane fallback notice renders over this message.
+ */
+export const NO_OPEN_REQUEST_TEXT =
+  '*Permission* — click not applied: agent-director refused it (no open request it will answer); watch this prompt for its verdict or a pane notice'
+
+function buildNoOpenRequestBlocks(): unknown[] {
+  return [
+    {
+      type: 'section',
+      text: { type: 'mrkdwn', text: NO_OPEN_REQUEST_TEXT },
     },
   ]
 }
@@ -390,6 +421,34 @@ export async function handlePermissionClick(
           RELAY_FALLEN_BACK_TEXT,
           buildRelayFallenBackBlocks(),
           'click_handler_relay_fallen_back',
+        )
+      }
+      return true
+    }
+    // AD took no verdict: it has no open request it will answer by this
+    // token. Re-deciding would be refused the same way and the session is not
+    // at fault, so, as for ErrRelayFallenBack, the only useful action is to
+    // tell the operator loudly that the click did NOT land. Unlike that
+    // refusal, AD advises no pane answer here, so the repaint names none.
+    if (err instanceof ErrNoOpenPermissionRequest) {
+      logDeps(
+        deps,
+        `[slack] permission-click: ErrNoOpenPermissionRequest from decide for ${instanceId} ` +
+          `(request_token=${requestToken}) — agent-director refused it (no open request it will answer); ` +
+          `the click was not applied: ${describeAgentDirectorFailure(err)}`,
+      )
+      const refusedEntry = getLivePermission(instanceId, requestToken)
+      if (refusedEntry) {
+        // Deliberately no markHandled(): this is not a verdict. A later poller
+        // closure or fallback rendering must still be free to render over it.
+        await renderPromptUpdate(
+          deps,
+          emit,
+          persona,
+          refusedEntry,
+          NO_OPEN_REQUEST_TEXT,
+          buildNoOpenRequestBlocks(),
+          'click_handler_no_open_request',
         )
       }
       return true

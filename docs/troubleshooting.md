@@ -69,6 +69,9 @@ Turn on the persona's app's interactivity, check the bot is in `check_permission
 **A permission prompt or notice doesn't arrive**
 Slack refused a post to the persona's one `permission_prompts` destination, in either mode; a `persona-destination-failed` line names its error, and the prompts and notices are held and retried. For `missing_scope` add `im:write` and re-install the app; for `not_in_channel` invite the app to its destination channel. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-permission-prompt-or-notice-doesnt-arrive).
 
+**A permission click shows *click not applied***
+agent-director refused the click with `ErrNoOpenPermissionRequest` and took no verdict; don't answer that request at the pane on its account, and wait for the prompt's verdict or pane fallback notice. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-permission-click-shows-click-not-applied).
+
 **Bot appears dead / posts a "blocked on a native Claude Code permission prompt" warning**
 The bot is stuck on a Claude Code prompt that never reached Slack. A human reads it with `agent-director read-pane --instance-id <id>`, ends the session with `agent-director kill --instance-id <id>` and checks the result; on an error, don't delete or respawn, and never use `send-keys`. The server then brings the persona up again. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-bot-appears-dead--posts-a-blocked-on-a-native-claude-code-permission-prompt-warning).
 

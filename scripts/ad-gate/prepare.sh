@@ -182,6 +182,36 @@ chmod 0755 "${INPUTS}/fixtures/agent-director-${AD_010_VERSION}"
 npm pack --ignore-scripts --silent --pack-destination "${INPUTS}/fixtures" "agent-director@${AD_010_VERSION}" >/dev/null
 npm pack --ignore-scripts --silent --pack-destination "${INPUTS}/fixtures" "claude-slack-channel-bots@${CSCB_010_VERSION}" >/dev/null
 
+# The earlier CSCB release the base image installs for the downgrade and
+# upgrade scripts (test-47 from v0.19.0), with the pin of the tag's
+# docker/Dockerfile.test.base: its CSCB_DOWNGRADE_VERSION and
+# CSCB_DOWNGRADE_SHA256 ARGs and its release.json's publication time, each
+# exactly once. The tarball must match the pin.
+BASE_DOCKERFILE="$(git -C "${CSCB_REPO}" cat-file -p "v${CSCB_VERSION}:docker/Dockerfile.test.base")" \
+    || die "the CSCB checkout ${CSCB_REPO} has no v${CSCB_VERSION}:docker/Dockerfile.test.base"
+# base_pin <pattern>: the one match of the sed pattern in the tag's base Dockerfile.
+base_pin() {
+    local found
+    found="$(sed -n "$1" <<< "${BASE_DOCKERFILE}")"
+    [[ -n "${found}" && "${found}" != *$'\n'* ]] || return 1
+    printf '%s\n' "${found}"
+}
+DOWNGRADE_VERSION="$(base_pin 's/^ARG CSCB_DOWNGRADE_VERSION=\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p')" \
+    || die "v${CSCB_VERSION}:docker/Dockerfile.test.base pins no single CSCB_DOWNGRADE_VERSION"
+DOWNGRADE_SHA256="$(base_pin 's/^ARG CSCB_DOWNGRADE_SHA256=\([0-9a-f]\{64\}\)$/\1/p')" \
+    || die "v${CSCB_VERSION}:docker/Dockerfile.test.base pins no single CSCB_DOWNGRADE_SHA256"
+DOWNGRADE_PUBLISHED="$(base_pin 's/^.*"published":"\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}T[0-9:.]*Z\)".*$/\1/p')" \
+    || die "v${CSCB_VERSION}:docker/Dockerfile.test.base records no single published time for CSCB ${DOWNGRADE_VERSION}"
+mkdir -p "${INPUTS}/fixtures/downgrade"
+npm pack --ignore-scripts --silent --pack-destination "${INPUTS}/fixtures/downgrade" "claude-slack-channel-bots@${DOWNGRADE_VERSION}" >/dev/null
+DOWNGRADE_TGZ="${INPUTS}/fixtures/downgrade/claude-slack-channel-bots-${DOWNGRADE_VERSION}.tgz"
+[[ -s "${DOWNGRADE_TGZ}" ]] || die "npm pack wrote no ${DOWNGRADE_TGZ}"
+got="$(sha256sum "${DOWNGRADE_TGZ}" | cut -d' ' -f1)"
+[[ "${got}" == "${DOWNGRADE_SHA256}" ]] \
+    || die "claude-slack-channel-bots ${DOWNGRADE_VERSION} has SHA-256 ${got}, v${CSCB_VERSION}:docker/Dockerfile.test.base pins ${DOWNGRADE_SHA256}"
+[[ "$(tar -xOzf "${DOWNGRADE_TGZ}" package/package.json | jq -r .version)" == "${DOWNGRADE_VERSION}" ]] \
+    || die "the packed downgrade fixture is not claude-slack-channel-bots ${DOWNGRADE_VERSION}"
+
 # ad-gate-0172: CSCB v0.18.2's image adds the legacy displayed-state fixture
 # (test-43): release v0.17.0's binary and admin tool, checked against that
 # release's SHA256SUMS here and against CSCB's own pins in the image build,
@@ -211,11 +241,14 @@ jq -n \
     --arg ad_install_sha "$(sha "${INPUTS}/ad/install.sh")" \
     --arg ad_client_sha "$( [[ -f "${INPUTS}/ad/client.tgz" ]] && sha "${INPUTS}/ad/client.tgz" || true)" \
     --arg ad_commit "${AD_COMMIT}" --arg ad_role "${AD_ROLE}" \
+    --arg downgrade_version "${DOWNGRADE_VERSION}" --arg downgrade_sha "$(sha "${DOWNGRADE_TGZ}")" \
+    --arg downgrade_published "${DOWNGRADE_PUBLISHED}" \
     '{cscb: {version: $cscb_version, tests_commit: $cscb_commit, tarball_sha256: $cscb_sha, ad_client_pin: $ad_pin},
       candidate: ({source: $ad_source, expected_version: $ad_version}
                   + (if $ad_commit == "" then {} else {commit: $ad_commit} end)
                   + {binary_sha256: $ad_sha, admin_sha256: $ad_admin_sha, installer_sha256: $ad_install_sha,
-                     client_tgz_sha256: $ad_client_sha})}
+                     client_tgz_sha256: $ad_client_sha}),
+      cscb_downgrade: {version: $downgrade_version, tarball_sha256: $downgrade_sha, published: $downgrade_published}}
      + (if $ad_role == "" then {} else {ad_role: $ad_role} end)' > "${INPUTS}/manifest.json"
 cp "${CSCB_TGZ}" "${INPUTS}/cscb/package.tgz"
 rm -f "${CSCB_TGZ}"
