@@ -1,4 +1,5 @@
 /** Thread Memory's shared durable seal. No I/O until an explicit lifecycle call. */
+import { testSyncWorkStart, testSyncWorkEnd } from './test-stall-attribution.ts'
 import * as nodeFs from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
@@ -206,6 +207,7 @@ export function createThreadMemorySeal(options: ThreadMemorySealOptions): Thread
     if (!entries.size && !emptyWriteNeeded) return Promise.resolve({ kind: 'skipped' })
     const next = chain.catch(() => {}).then((): ThreadMemorySealWriteResult => {
       queued = undefined
+      const writeStart = testSyncWorkStart()
       try {
         const bytes = serializeThreadMemorySeal({ v: 1, entries: Object.fromEntries(entries) })
         durableWriteFileSync(path, bytes, fs)
@@ -213,27 +215,31 @@ export function createThreadMemorySeal(options: ThreadMemorySealOptions): Thread
         event({ type: 'seal-written', path })
         return { kind: 'written' }
       } catch (error) { return failed(error) }
+      finally { testSyncWorkEnd(writeStart, 'thread-seal-write') }
     })
     queued = next; chain = next
     return next
   }
   function queueIdentity(key: string): ThreadMemoryQueueIdentity {
-    checkKey(key)
-    let fd: number
-    try { fd = fs.openSync(options.queueJournalPath(key), 'r') } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { size: '0', sha256: EMPTY_SHA256 }
-      throw error
-    }
-    try { options.onQueueJournalOpened?.(key) } catch { /* an observer cannot change the identity */ }
+    const syncStart = testSyncWorkStart()
     try {
-      const stat = fs.fstatSync(fd, { bigint: true }), hash = createHash('sha256'), buffer = Buffer.alloc(QUEUE_HASH_CHUNK_BYTES)
-      for (;;) {
-        const length = fs.readSync(fd, buffer, 0, buffer.length, null)
-        if (length === 0) break
-        hash.update(buffer.subarray(0, length))
+      checkKey(key)
+      let fd: number
+      try { fd = fs.openSync(options.queueJournalPath(key), 'r') } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { size: '0', sha256: EMPTY_SHA256 }
+        throw error
       }
-      return { inode: stat.ino.toString(), size: stat.size.toString(), mtimeNs: stat.mtimeNs.toString(), sha256: hash.digest('hex') }
-    } finally { fs.closeSync(fd) }
+      try { options.onQueueJournalOpened?.(key) } catch { /* an observer cannot change the identity */ }
+      try {
+        const stat = fs.fstatSync(fd, { bigint: true }), hash = createHash('sha256'), buffer = Buffer.alloc(QUEUE_HASH_CHUNK_BYTES)
+        for (;;) {
+          const length = fs.readSync(fd, buffer, 0, buffer.length, null)
+          if (length === 0) break
+          hash.update(buffer.subarray(0, length))
+        }
+        return { inode: stat.ino.toString(), size: stat.size.toString(), mtimeNs: stat.mtimeNs.toString(), sha256: hash.digest('hex') }
+      } finally { fs.closeSync(fd) }
+    } finally { testSyncWorkEnd(syncStart, 'thread-seal-queue-identity', key) }
   }
   function readPrevious(): void {
     let bytes: string

@@ -104,7 +104,12 @@ describe('test-only measurement records (Decision 25)', () => {
       { kind: 'sync-work', key: 'reader', work: 'thread-judge', start_mono_ms: 2990, end_mono_ms: 3010, at_mono_ms: 3010 },
       { kind: 'event-loop-stall', start_mono_ms: 2990, end_mono_ms: 3010, at_mono_ms: 3010, expected_mono_ms: 3000,
         gap_ms: 10, elapsed_ms: 20, cpu_user_usec: 1, cpu_system_usec: 2, cpu_stat: null, cpu_stat_delta: null,
-        cpu_stat_before_mono_ms: 2990, heap_before: null, heap_after: null },
+        cpu_stat_before_mono_ms: 2990, heap_before: null, heap_after: null,
+        resource_delta: { minorPageFault: 1, majorPageFault: 0, voluntaryContextSwitches: 2, involuntaryContextSwitches: 3, fsRead: 4, fsWrite: 5 },
+        resource_before_mono_ms: 2990, system_sampling: 'stall-end', system_before_mono_ms: 2500, system_after_mono_ms: 3010,
+        pressure: { cpu: { some: 100, full: 0 }, memory: null, io: null }, pressure_delta: { cpu: { some: 10, full: 0 }, memory: null, io: null },
+        memory_current: 100, memory_max: 'max', memory_stat: { anon: 70, workingset_refault_file: 4 }, memory_stat_delta: { anon: -2, workingset_refault_file: 1 },
+        host_steal_ticks: 90, host_steal_delta_ticks: 1 },
     ]
     for (const entry of entries) { const contaminated = { ...entry, body: LEAK_SENTINEL }; h.recorder.record(contaminated) }
     await h.recorder.stop()

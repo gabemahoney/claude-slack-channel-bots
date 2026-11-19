@@ -14,13 +14,14 @@ const overlaps = (r: Row, start: number, end: number) => span(r) && r.start_mono
 // file is retained separately; no error, path, content or arbitrary string field.
 const FIELDS = ['v', 'kind', 'process_id', 'key', 'seq', 'seqs', 'store', 'store_ms', 'held_ms', 'outcome', 'cause', 'phase', 'work', 'at_mono_ms',
   'received_mono_ms', 'due_mono_ms', 'armed_delay_ms', 'start_mono_ms', 'end_mono_ms', 'expected_mono_ms', 'elapsed_ms', 'gap_ms',
-  'cpu_user_usec', 'cpu_system_usec', 'cpu_stat_before_mono_ms', 'cpu_stat', 'cpu_stat_delta', 'heap_before', 'heap_after',
+  'cpu_user_usec', 'cpu_system_usec', 'cpu_stat_before_mono_ms', 'cpu_stat', 'cpu_stat_delta', 'heap_before', 'heap_after', 'resource_delta', 'resource_before_mono_ms', 'system_sampling', 'system_before_mono_ms', 'system_after_mono_ms',
+  'pressure', 'pressure_delta', 'memory_current', 'memory_max', 'memory_stat', 'memory_stat_delta', 'host_steal_ticks', 'host_steal_delta_ticks',
   'keys', 'ts', 'targets', 'receive_to_ack_ms', 'ack_call_ms', 'journal', 'records', 'bytes', 'append_ms', 'file_fsync_ms', 'dir_fsync_ms', 'fsyncs', 'joins', 'intents', 'outcomes']
 function safeValue(value: unknown): unknown {
   if (value === null || finite(value)) return value
   if (word(value) || (typeof value === 'string' && /^\d{1,12}\.\d{1,6}$/.test(value))) return value
   if (Array.isArray(value)) return value.slice(0, 100).map(safeValue)
-  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).filter(([k]) => [...FIELDS, 'nr_periods', 'nr_throttled', 'throttled_usec', 'usage_usec', 'heap_used', 'heap_total'].includes(k)).map(([k, v]) => [k, safeValue(v)]))
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).filter(([k]) => [...FIELDS, 'nr_periods', 'nr_throttled', 'throttled_usec', 'usage_usec', 'heap_used', 'heap_total', 'some', 'full', 'cpu', 'memory', 'io', 'minorPageFault', 'majorPageFault', 'voluntaryContextSwitches', 'involuntaryContextSwitches', 'fsRead', 'fsWrite', 'anon', 'file', 'shmem', 'pgmajfault'].includes(k) || /^workingset_refault(?:_[a-z]+)?$/.test(k)).map(([k, v]) => [k, safeValue(v)]))
   return undefined
 }
 const safeRow = (r: Row) => Object.fromEntries(FIELDS.filter(k => r[k] !== undefined).map(k => [k, safeValue(r[k])]))

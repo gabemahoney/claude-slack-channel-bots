@@ -19,6 +19,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { testSyncWorkStart, testSyncWorkEnd } from './test-stall-attribution.ts'
 import { randomBytes } from 'node:crypto'
 import {
   closeSync,
@@ -193,31 +194,34 @@ function errnoCodeOf(err: unknown): string | undefined {
  * @param fs     The file-system calls; the real ones by default.
  */
 export function durableWriteFileSync(path: string, bytes: Uint8Array, fs: DurableWriteFs = NODE_DURABLE_WRITE_FS): void {
-  const tmp = durableTempPath(path)
+  const syncStart = testSyncWorkStart()
   try {
-    const fd = fs.openSync(tmp, 'wx')
+    const tmp = durableTempPath(path)
     try {
-      writeAll(fs, fd, bytes)
-      fs.fsyncSync(fd)
+      const fd = fs.openSync(tmp, 'wx')
+      try {
+        writeAll(fs, fd, bytes)
+        fs.fsyncSync(fd)
+      } catch (err) {
+        closeQuietly(fs, fd)
+        throw err
+      }
+      fs.closeSync(fd)
+      fs.renameSync(tmp, path)
     } catch (err) {
-      closeQuietly(fs, fd)
+      try {
+        fs.unlinkSync(tmp)
+      } catch {
+        /* ignore: best effort, it may never have been created */
+      }
       throw err
     }
-    fs.closeSync(fd)
-    fs.renameSync(tmp, path)
-  } catch (err) {
     try {
-      fs.unlinkSync(tmp)
-    } catch {
-      /* ignore: best effort, it may never have been created */
+      fsyncDirectory(fs, dirname(path))
+    } catch (err) {
+      throw new DurableWriteUnsyncedError(path, err)
     }
-    throw err
-  }
-  try {
-    fsyncDirectory(fs, dirname(path))
-  } catch (err) {
-    throw new DurableWriteUnsyncedError(path, err)
-  }
+  } finally { testSyncWorkEnd(syncStart, 'atomic-durable-write') }
 }
 
 // ---------------------------------------------------------------------------
@@ -272,17 +276,20 @@ export class DurableUnlinkUnsyncedError extends Error {
  * @param fs    The file-system calls; the real ones by default.
  */
 export function durableUnlinkSync(path: string, fs: DurableWriteFs = NODE_DURABLE_WRITE_FS): boolean {
+  const syncStart = testSyncWorkStart()
   try {
-    fs.unlinkSync(path)
-  } catch (err) {
-    const code = errnoCodeOf(err)
-    if (code !== undefined && ABSENT_TARGET_CODES.has(code)) return false
-    throw err
-  }
-  try {
-    fsyncDirectory(fs, dirname(path))
-  } catch (err) {
-    throw new DurableUnlinkUnsyncedError(path, err)
-  }
-  return true
+    try {
+      fs.unlinkSync(path)
+    } catch (err) {
+      const code = errnoCodeOf(err)
+      if (code !== undefined && ABSENT_TARGET_CODES.has(code)) return false
+      throw err
+    }
+    try {
+      fsyncDirectory(fs, dirname(path))
+    } catch (err) {
+      throw new DurableUnlinkUnsyncedError(path, err)
+    }
+    return true
+  } finally { testSyncWorkEnd(syncStart, 'atomic-durable-unlink') }
 }

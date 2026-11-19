@@ -1033,6 +1033,27 @@ zero-throttle claim. High process CPU hints at busy work; low CPU plus raised
 throttle counters supports quota starvation. Heap changes only hint at GC;
 unmarked busy work, mixed causes and host scheduling may need further profiling.
 
+Each stall also carries `resource_delta` (Bun `process.resourceUsage()` counters:
+minor/major page faults, voluntary/involuntary context switches, filesystem block
+input/output operations), sampled at every probe tick. `resource_before_mono_ms`
+identifies its pre-gap reading. Unavailable readings/counters and counter resets
+are `null`, never zero. Process resource counters include the runtime's threads;
+filesystem operation counts are not bytes.
+
+The costly bundle adds cgroup `cpu.pressure`, `memory.pressure`, `io.pressure`
+`some`/`full` totals and deltas (µs), endpoint `memory_current`/`memory_max` (bytes,
+or `max`), selected `memory_stat` and deltas (`anon`, `file`, `shmem`,
+`pgmajfault`, `workingset_refault*`), and host aggregate `host_steal_ticks` plus
+`host_steal_delta_ticks` from `/proc/stat` (kernel clock ticks, not milliseconds).
+Memory byte gauges may have negative deltas; fault/refault counters may not.
+`system_sampling=stall-end` means the bundle is read once at startup and then
+only at stall endpoints: local every-tick sampling cost about 144 µs, versus
+15.7 µs for a normal tick with endpoint-only system reads. `system_before_mono_ms`
+and `system_after_mono_ms` expose that wider interval. A positive PSI/refault/
+steal delta therefore does not prove it occurred in this one gap; resource and
+`cpu.stat` deltas still use the preceding probe tick. These are observer-cost
+measurements with injected timer re-arm, not contained SR-8 performance evidence.
+
 `recorded: sr8 attribution ... verdict=info` lines preserve this evidence even
 when a lane keeps only `recorded:` output. `type=post-hold` prints persona key/seq,
 server process ID, receipt, due, every callback with its armed delay, evaluation time and signed
@@ -1044,6 +1065,16 @@ with `type=stall-summary` giving the full count, maximum and sum. Per-window
 arrays cap at 50 and retain their uncapped counts. Work markers cover runs over
 20 ms in Thread Memory judge, digest, image concatenation and save selection,
 queue compaction selection/stringify/rebuild, and measurement serialization.
+Fine markers cover Thread Memory activation replay (intents, joins, judge,
+settlement), read/parse/index recovery, compaction collection/sort/merge/cache,
+image indexing/encoding/concatenation, write/publish/digest, save encoding and
+publication, journal synchronous generator steps/writes, shared-seal/authority durable
+writes, atomic durable replacements/unlinks and console-log writes. Whole
+`thread-compact-sync`/`queue-compact-sync` stretches stay open across resolved
+promises and close only at existing macrotask yields or native asynchronous
+journal I/O; they resume at continuation. Nested phase/whole-operation spans
+and spans of different personas can overlap and must not be summed as exclusive
+CPU time. No new scheduling boundary is introduced by these markers.
 All attribution observers, reads and probe timers are absent when the base
 `test_measurements` switch is off.
 

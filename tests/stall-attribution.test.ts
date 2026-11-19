@@ -3,7 +3,7 @@ import { afterEach, expect, test } from 'bun:test'
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { parseCpuStat, readServerCpuStat, startStallAttribution, testSyncWorkStart, testSyncWorkEnd } from '../src/test-stall-attribution.ts'
+import { parseCpuStat, parsePressure, parseMemoryStat, parseHostSteal, readServerCpuStat, startStallAttribution, createTestSyncWorkScope, testSyncWorkStart, testSyncWorkEnd } from '../src/test-stall-attribution.ts'
 import { createPostHoldResolver } from '../src/post-holds.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { SR8_DISPATCH_ALLOWANCE_MS } from './integration/fixtures/sr8-evidence.ts'
@@ -16,8 +16,9 @@ const stat = (n: number) => `usage_usec ${n * 1000}\nnr_periods ${n}\nnr_throttl
 
 test('disabled attribution creates no probe, reads, clocks or rows', () => {
   const forbidden = () => { throw new Error('disabled path called dependency') }
-  stop = startStallAttribution(false, { record: forbidden, now: forbidden, cpu: forbidden, heap: forbidden, read: forbidden, timers: { setTimeout: forbidden, clearTimeout: forbidden } })
+  stop = startStallAttribution(false, { record: forbidden, now: forbidden, cpu: forbidden, resource: forbidden, heap: forbidden, read: forbidden, timers: { setTimeout: forbidden, clearTimeout: forbidden } })
   expect(testSyncWorkStart()).toBeUndefined()
+  expect(createTestSyncWorkScope('disabled')).toBeUndefined()
   testSyncWorkEnd(undefined, 'thread-judge', 'alpha')
 })
 
@@ -53,10 +54,69 @@ test('an unavailable cgroup/heap remains explicit in a stalled probe and does no
   let now = 0, tick = () => {}
   const recorded: any[] = []
   stop = startStallAttribution(true, { record: r => recorded.push(r), now: () => now,
-    cpu: () => ({ user: 0, system: 0 }), heap: () => { throw new Error('unavailable') }, read: () => { throw new Error('ENOENT') },
+    cpu: () => ({ user: 0, system: 0 }), resource: () => { throw new Error('unavailable') }, heap: () => { throw new Error('unavailable') }, read: () => { throw new Error('ENOENT') },
     timers: { setTimeout: fn => { tick = fn; return 1 }, clearTimeout: () => {} } })
   now = 50; tick()
-  expect(recorded[0]).toMatchObject({ gap_ms: 40, cpu_user_usec: 0, cpu_system_usec: 0, cpu_stat: null, cpu_stat_delta: null, heap_before: null, heap_after: null })
+  expect(recorded[0]).toMatchObject({ gap_ms: 40, cpu_user_usec: 0, cpu_system_usec: 0, cpu_stat: null, cpu_stat_delta: null, heap_before: null, heap_after: null, resource_delta: null,
+    pressure: { cpu: null, memory: null, io: null }, memory_current: null, memory_max: null, memory_stat: null, host_steal_ticks: null, host_steal_delta_ticks: null })
+})
+
+test('pressure, selected memory and host steal parsers reject malformed counters without inventing zero', () => {
+  expect(parsePressure('some avg10=1.0 avg60=0.0 avg300=0.0 total=123\nfull avg10=0.0 avg60=0.0 avg300=0.0 total=4\n')).toEqual({ some: 123, full: 4 })
+  expect(parsePressure('some total=bad')).toBeNull()
+  expect(parsePressure('some total=10')).toEqual({ some: 10, full: null })
+  expect(parseMemoryStat('anon 100\nfile 20\nshmem 3\npgmajfault 4\nworkingset_refault_anon 5\nworkingset_refault_file 6\nother 100\n')).toEqual({ anon: 100, file: 20, shmem: 3, pgmajfault: 4, workingset_refault_anon: 5, workingset_refault_file: 6 })
+  expect(parseMemoryStat('anon nope')).toBeNull()
+  expect(parseHostSteal('cpu 1 2 3 4 5 6 7 88 9 10\ncpu0 1 2 3 4 5 6 7 999\n')).toBe(88)
+  expect(parseHostSteal('cpu 1 2')).toBeNull()
+})
+
+test('resource deltas cover the probe gap; costly pressure/memory/steal readings expose their wider stall-end baseline', () => {
+  let now = 0, n = 1, tick = () => {}
+  const reads: string[] = [], recorded: any[] = []
+  const counters = () => ({ minorPageFault: n * 10, majorPageFault: n, voluntaryContextSwitches: n * 2,
+    involuntaryContextSwitches: n * 3, fsRead: n * 4, fsWrite: n * 5 })
+  stop = startStallAttribution(true, { record: r => recorded.push(r), now: () => now, resource: counters,
+    cpu: () => ({ user: 0, system: 0 }), heap: () => ({ heap_used: 1, heap_total: 2 }),
+    read: path => {
+      reads.push(path)
+      if (path === '/proc/self/cgroup') return '0::/server\n'
+      if (path.endsWith('/cpu.stat')) return stat(n)
+      if (path.endsWith('.pressure')) return `some total=${n * 100}\nfull total=${n * 20}\n`
+      if (path.endsWith('/memory.current')) return String(1000 - n)
+      if (path.endsWith('/memory.max')) return 'max'
+      if (path.endsWith('/memory.stat')) return `anon ${100 - n}\nfile 20\nshmem 3\npgmajfault ${n}\nworkingset_refault_file ${n * 4}\n`
+      if (path === '/proc/stat') return `cpu 1 2 3 4 5 6 7 ${n * 8} 9 10\n`
+      throw new Error('unexpected path')
+    }, timers: { setTimeout: fn => { tick = fn; return 1 }, clearTimeout: () => {} } })
+  const baselineReads = reads.length
+  now = 10; n = 2; tick()
+  expect(reads.length - baselineReads).toBe(1) // cpu.stat only on a normal tick
+  now = 60; n = 4; tick()
+  expect(recorded[0]).toMatchObject({ resource_before_mono_ms: 10,
+    resource_delta: { minorPageFault: 20, majorPageFault: 2, voluntaryContextSwitches: 4, involuntaryContextSwitches: 6, fsRead: 8, fsWrite: 10 },
+    system_sampling: 'stall-end', system_before_mono_ms: 0, system_after_mono_ms: 60,
+    pressure_delta: { cpu: { some: 300, full: 60 }, memory: { some: 300, full: 60 }, io: { some: 300, full: 60 } },
+    memory_current: 996, memory_max: 'max', memory_stat_delta: { anon: -3, pgmajfault: 3, workingset_refault_file: 12 },
+    host_steal_delta_ticks: 24 })
+  now = 110; n = 1; tick()
+  expect(recorded[1]).toMatchObject({ resource_delta: { minorPageFault: null, majorPageFault: null },
+    pressure_delta: { cpu: { some: null, full: null } }, memory_stat_delta: { anon: 3, pgmajfault: null }, host_steal_delta_ticks: null })
+})
+
+test('sync scopes span microtasks but exclude real I/O/yield waits, with phases inside each stretch', async () => {
+  let now = 0
+  const rows: any[] = []
+  stop = startStallAttribution(true, { record: r => rows.push(r), now: () => now, cpu: () => ({ user: 0, system: 0 }),
+    resource: () => ({}), heap: () => ({ heap_used: 1, heap_total: 2 }), read: () => { throw new Error('unavailable') },
+    timers: { setTimeout: () => 1, clearTimeout: () => {} } })
+  const scope = createTestSyncWorkScope('whole-compaction', 'alpha')!
+  scope.phase('first-phase'); now = 15; await Promise.resolve(); now = 25
+  scope.phase('second-phase'); now = 40; scope.pause()
+  now = 100; scope.resume(); now = 125; scope.stop()
+  expect(rows.filter(r => r.work === 'whole-compaction').map(r => [r.start_mono_ms, r.end_mono_ms])).toEqual([[0, 40], [100, 125]])
+  expect(rows.filter(r => r.work === 'first-phase').map(r => [r.start_mono_ms, r.end_mono_ms])).toEqual([[0, 25]])
+  expect(rows.filter(r => r.work === 'second-phase').map(r => [r.start_mono_ms, r.end_mono_ms])).toEqual([[100, 125]])
 })
 
 test('Post Hold records receipt, early re-arm callbacks and the held_ms decision without changing timer/microtask scheduling', async () => {
@@ -105,6 +165,19 @@ test('informational lines correlate callback, deadline windows, cross-persona ma
   expect(separated).not.toContain('foreign-process')
   expect(lines.find(l => l.includes('type=stall-summary '))).toContain('count=1 printed=1 max_gap_ms=105 total_gap_ms=105')
   expect(attributionLines(context, [...rows, ...rows.filter(r => r.kind === 'event-loop-stall')], 1).filter(l => l.includes('type=stall '))).toHaveLength(1)
+})
+
+test('informational JSON adds resource, pressure, memory and steal fields without changing legacy fields', () => {
+  const data = { ...rows.find(r => r.kind === 'event-loop-stall')!,
+    resource_delta: { majorPageFault: 1, minorPageFault: 2, voluntaryContextSwitches: 3, involuntaryContextSwitches: 4, fsRead: 5, fsWrite: 6 },
+    resource_before_mono_ms: 3095, system_sampling: 'stall-end', system_before_mono_ms: 1000, system_after_mono_ms: 3210,
+    pressure: { cpu: { some: 100, full: 1 }, memory: null, io: null }, pressure_delta: { cpu: { some: 10, full: 0 }, memory: null, io: null },
+    memory_current: 500, memory_max: 'max', memory_stat: { anon: 100, workingset_refault_file: 20 }, memory_stat_delta: { anon: -1, workingset_refault_file: 2 },
+    host_steal_ticks: 100, host_steal_delta_ticks: 4 }
+  const line = attributionLines(context, [data]).find(l => l.includes('type=stall '))!
+  const json = JSON.parse(line.split(' data=')[1]!.split(' marker_count=')[0]!)
+  expect(json).toEqual(data)
+  expect(line).toContain('verdict=info')
 })
 
 test('failure retention copies regular measurement files and prints bounded rows around failing hold windows', () => {

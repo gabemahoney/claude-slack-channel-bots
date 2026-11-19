@@ -106,7 +106,12 @@ export function serializeTestMeasurement(record: TestMeasurementRecord): string 
         expected_mono_ms: record.expected_mono_ms, gap_ms: record.gap_ms, elapsed_ms: record.elapsed_ms,
         cpu_user_usec: record.cpu_user_usec, cpu_system_usec: record.cpu_system_usec,
         cpu_stat: record.cpu_stat, cpu_stat_delta: record.cpu_stat_delta, cpu_stat_before_mono_ms: record.cpu_stat_before_mono_ms,
-        heap_before: record.heap_before, heap_after: record.heap_after })
+        heap_before: record.heap_before, heap_after: record.heap_after,
+        resource_delta: record.resource_delta, resource_before_mono_ms: record.resource_before_mono_ms,
+        system_sampling: record.system_sampling, system_before_mono_ms: record.system_before_mono_ms, system_after_mono_ms: record.system_after_mono_ms,
+        pressure: record.pressure, pressure_delta: record.pressure_delta, memory_current: record.memory_current, memory_max: record.memory_max,
+        memory_stat: record.memory_stat, memory_stat_delta: record.memory_stat_delta,
+        host_steal_ticks: record.host_steal_ticks, host_steal_delta_ticks: record.host_steal_delta_ticks })
     case 'store':
       return JSON.stringify({ ...head, key: record.key, seq: record.seq, store: record.store, store_ms: record.store_ms })
     case 'resolution-store':

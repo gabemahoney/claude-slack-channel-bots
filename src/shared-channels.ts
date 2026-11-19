@@ -2,6 +2,7 @@
  * Importing this module performs no I/O. All mutations are synchronous,
  * revision checked, and become visible only after the injected durable write.
  */
+import { testSyncWorkStart, testSyncWorkEnd } from './test-stall-attribution.ts'
 import { createHash, randomUUID } from 'node:crypto'
 import {
   botAttemptBinding, botAttemptKey, botAttemptResult, sameBotAttempt, validChannelDeliveryAttempt, validateBotAttempts,
@@ -1320,42 +1321,45 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
    * state and its bytes, write them durably, install, then publish. */
   function commit(expectedRevision: number, orderSpan: number, publish: ((config: PersonaConfig) => void) | undefined,
     stage: (revision: number) => { bytes: Uint8Array; state: SharedChannelState; config: PersonaConfig }, key?: string): SharedMutationResult {
-    if (!readable) return { kind: 'unresolved', revision: current.revision }
-    if (mutating || expectedRevision !== current.revision) return { kind: 'stale', revision: current.revision }
-    if (!Number.isSafeInteger(orderSpan) || orderSpan < 1 || !Number.isSafeInteger(current.revision + orderSpan)) return { kind: 'failed', revision: current.revision }
-    const before = current
-    const appliedRevision = current.revision + orderSpan
-    let prepared: SharedChannelState | undefined, installed: PersonaConfig | undefined
-    mutating = true
-    failure = ''
+    const syncStart = testSyncWorkStart()
     try {
-      const staged = stage(appliedRevision)
-      prepared = staged.state
-      write(path, staged.bytes)
-      current = staged.state
-      installed = staged.config
-    } catch (err) {
-      mutating = false
-      failure = errnoSuffix(err)
-      // Never overwrite ambiguous evidence with a rollback or allow another
-      // writer to decide that the old memory won after an unsynced rename.
-      if (err instanceof DurableWriteUnsyncedError) {
-        readable = false
-        unreadableCause = 'unsynced'
-        uncertain = prepared
-        uncertainPublish = publish
-        deliverThreadView(false)
-        return { kind: 'unresolved', revision: current.revision }
+      if (!readable) return { kind: 'unresolved', revision: current.revision }
+      if (mutating || expectedRevision !== current.revision) return { kind: 'stale', revision: current.revision }
+      if (!Number.isSafeInteger(orderSpan) || orderSpan < 1 || !Number.isSafeInteger(current.revision + orderSpan)) return { kind: 'failed', revision: current.revision }
+      const before = current
+      const appliedRevision = current.revision + orderSpan
+      let prepared: SharedChannelState | undefined, installed: PersonaConfig | undefined
+      mutating = true
+      failure = ''
+      try {
+        const staged = stage(appliedRevision)
+        prepared = staged.state
+        write(path, staged.bytes)
+        current = staged.state
+        installed = staged.config
+      } catch (err) {
+        mutating = false
+        failure = errnoSuffix(err)
+        // Never overwrite ambiguous evidence with a rollback or allow another
+        // writer to decide that the old memory won after an unsynced rename.
+        if (err instanceof DurableWriteUnsyncedError) {
+          readable = false
+          unreadableCause = 'unsynced'
+          uncertain = prepared
+          uncertainPublish = publish
+          deliverThreadView(false)
+          return { kind: 'unresolved', revision: current.revision }
+        }
+        return { kind: 'failed', revision: current.revision }
       }
-      return { kind: 'failed', revision: current.revision }
-    }
-    try {
-      // Metadata has durable order, but no applied publication or assignment.
-      publishChange(before, publish, key, installed)
-    } finally {
-      mutating = false
-    }
-    return { kind: 'applied', revision: appliedRevision }
+      try {
+        // Metadata has durable order, but no applied publication or assignment.
+        publishChange(before, publish, key, installed)
+      } finally {
+        mutating = false
+      }
+      return { kind: 'applied', revision: appliedRevision }
+    } finally { testSyncWorkEnd(syncStart, 'shared-authority-commit', key) }
   }
   function candidateInput(bytes: Uint8Array): PersonaConfig {
     // Exact recorded input keeps record-start collision recovery available
