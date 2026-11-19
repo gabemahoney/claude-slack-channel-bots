@@ -833,10 +833,11 @@ CPU quota. Test 44 and every strict/open membership group run in
 keeps 2 CPUs of `cpu.max` quota, as in every shard, shared as before with the
 Slack stub, the scripts and the runner. `tests/integration/fixtures/burst-driver.sh`
 hands each driver run to a launcher born in its own group beside the server's,
-at 0.9 of the shard's third CPU, and the cgroup each run ran in is recorded.
+at 0.9 CPU, and the cgroup each run ran in is recorded. The container has
+4 CPUs (`CPUS_PER_SHARD` + `DRIVER_CPUS`), so 1.1 CPU is headroom above both groups.
 The runner's naming-family classifier includes every suffixed membership
-entrypoint. Admission reserves the extra driver CPU per driver-bearing shard;
-multiple driver scripts in a shard add it only once. These shards retain
+entrypoint. Admission reserves the two extra CPUs per driver-bearing shard;
+multiple driver scripts in a shard add them only once. These shards retain
 `--init`, private cgroup namespaces and writable cgroups. Recovery groups
 remain ordinary no-model, non-burst workloads.
 
@@ -859,9 +860,13 @@ only when:
 A driver in the server's group or quota, a guarded file that opened (even a
 write-only one), a probe error other than a refusal, or an unreadable
 placement is missing. It checks placement, configured quotas and permissions,
-not throttling. The 0.1 CPU left is headroom, so the container's quota rarely
-throttles the server's group, but it can, and a passing control does not rule
-that out.
+not throttling. A throttled ancestor (the container's quota) never shows in
+the server group's own `cpu.stat`: its tasks wait runnable, which only its
+`cpu.pressure` shows. With 0.1 CPU of headroom (a 3-CPU container), b.9p6's
+SR-8 runs saw such gaps of up to 313 ms, and a Post Hold released 110 ms late
+fits that class. The 1.1 CPU of headroom keeps the container's quota clear of
+the 2.9 CPUs the groups can use. A passing control still does not rule out
+contention outside the container (the host's own quota or other load).
 
 Take populations and burst counts from `tests/test-helpers/thread-populations.ts`:
 0, 10,000 and 100,000 Joined Threads per persona across 100 eligible

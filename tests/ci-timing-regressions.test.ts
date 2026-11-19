@@ -30,7 +30,7 @@ import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVer
   SR8_SERVER_CPUS, SR8_GUARDED_CGROUP_FILES, cgroupPathOf, cgroupChain, cpuMaxCpus, driverCpuVerdict, guardedCgroups, cgroupWriteAccess, cgroupOpenFailure,
   type CgroupWriteAccess, type CgroupOpenOutcome,
 } from './integration/fixtures/sr8-evidence.ts'
-import { CPUS_PER_SHARD } from '../scripts/ci-run.ts'
+import { CPUS_PER_SHARD, DRIVER_CPUS } from '../scripts/ci-run.ts'
 import { serializeTestMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, threadCompactionMeasurement,
   type TestMeasurement, type TestMeasurementRecord } from '../src/test-measurements.ts'
 import { QUEUE_COMPACT_INTERVAL_MS, type AcceptedRecord } from '../src/delivery-queue.ts'
@@ -1036,8 +1036,8 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
     const stat = (usec: number) => `usage_usec ${usec}\nuser_usec 1\nsystem_usec 1\nnr_periods 1\nnr_throttled 0\nthrottled_usec 0\n`
     // Before: one 2-CPU container quota holds the server, the stub and the driver.
     const shared = { '/cpu.max': '200000 100000\n', '/cpu.stat': stat(7_806_000) }
-    // Now: a 3-CPU container; the server's group keeps 2 CPUs and the driver's 0.9 sits beside it.
-    const split = { '/cpu.max': '300000 100000\n', '/cpu.stat': stat(9_000_000), '/shard/cpu.max': 'max 100000\n',
+    // Now: a 4-CPU container; the server's group keeps 2 CPUs, the driver's 0.9 sits beside it and 1.1 is headroom.
+    const split = { '/cpu.max': '400000 100000\n', '/cpu.stat': stat(9_000_000), '/shard/cpu.max': 'max 100000\n',
       '/shard/server/cpu.max': '200000 100000\n', '/shard/server/cpu.stat': stat(5_000_000),
       '/shard/driver/cpu.max': '90000 100000\n', '/shard/driver/cpu.stat': stat(1_860_000) }
     // The server's UID could open none of the guarded files it checked for writing.
@@ -1048,7 +1048,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
         guarded_files: 10, writable_files: 0, unprobed_files: 0 }, limit: 2, verdict: 'missing' })
       expect(driverCpuVerdict('/shard/server', ['/shard/driver', '/shard/driver'], files(split), contained)).toEqual({ measure: 'driver-cpu', samples: 2, stats: {
         server_cgroup: '/shard/server', server_cpu_max: '200000/100000', server_cpus: 2, server_usage_ms: 5000, driver_cgroup: '/shard/driver',
-        driver_cpu_max: '90000/100000', driver_cpus: 0.9, driver_usage_ms: 1860, shared_cpus: 3, guarded_files: 34, writable_files: 0, unprobed_files: 0 }, limit: 2, verdict: 'pass' })
+        driver_cpu_max: '90000/100000', driver_cpus: 0.9, driver_usage_ms: 1860, shared_cpus: 4, guarded_files: 34, writable_files: 0, unprobed_files: 0 }, limit: 2, verdict: 'pass' })
       expect(SR8_SERVER_CPUS).toBe(CPUS_PER_SHARD)
     })
     // Injected probe outcomes: the tally the real write-only probe feeds, whoever runs the suite.
@@ -2995,7 +2995,7 @@ else process.exitCode = command === 'burst' ? 3 : 0
     expect({ status: r.status, stdout: r.stdout }).toEqual({ status: 0, stdout: 'launcher 70\n' })
     expect(r.stderr).toMatch(/^burst-driver: \S+ is not root-owned and closed to others; the launcher does not serve\n$/)
   })
-  test('a burst-driver shard\'s entrypoint keeps the server at all but one CPU, starts the driver\'s launcher in the driver\'s group, and gives testuser no cgroup file', () => {
+  test('a burst-driver shard\'s entrypoint keeps the server at exactly 2 CPUs with headroom beside the driver, starts the driver\'s launcher in the driver\'s group, and gives testuser no cgroup file', () => {
     expect(entrypoint).toContain('if [[ -w /sys/fs/cgroup/cgroup.subtree_control ]] && (( $$ != 1 )); then\n'
       + '    split_driver_cpu /sys/fs/cgroup /proc/self/cgroup /run/cscb-burst-driver\nfi\n\nexec gosu testuser bash /tests/runner.sh "$@"\n')
     expect(fixture).toContain(spool)
@@ -3011,18 +3011,24 @@ else process.exitCode = command === 'burst' ? 3 : 0
       '[[ -p "$HOME/spool/requests" ]] && printf "spool %o requests %o\\n" "$(( 0$(stat -c %a "$HOME/spool") & 0777 ))" "$(( 0$(stat -c %a "$HOME/spool/requests") & 0777 ))"',
       'while read -r line; do echo "${line//"$HOME"/<home>}"; done < "$HOME/log"',
     ].join('\n'))
-    const r = split('300000 100000')
-    expect({ status: r.status, stdout: r.stdout, stderr: r.stderr }).toEqual({ status: 0, stderr: '', stdout: [
-      'cgroup.subtree_control=+cpu', 'shard/cgroup.type=threaded', 'shard/cgroup.subtree_control=+cpu', 'shard/server/cgroup.type=threaded',
-      'shard/driver/cgroup.type=threaded', 'shard/server/cpu.max=200000 100000', 'shard/driver/cpu.max=90000 100000',
-      'forked from the driver group, then moved to the server group', 'spool 700 requests 600',
-      'chown testuser:testuser <home>/spool <home>/spool/requests', 'gosu testuser bash /tests/integration/fixtures/burst-driver.sh --serve <home>/spool', ''].join('\n') })
+    // The runner's burst-driver shard (CPUS_PER_SHARD + DRIVER_CPUS = 4 CPUs) and the smallest quota with any headroom
+    // both keep the server at exactly 2 CPUs: the container's quota above the two groups is headroom, never the server's (b.9p6).
+    for (const cpuMax of [`${(CPUS_PER_SHARD + DRIVER_CPUS) * 100000} 100000`, '290001 100000']) {
+      const r = split(cpuMax)
+      expect({ status: r.status, stdout: r.stdout, stderr: r.stderr }).toEqual({ status: 0, stderr: '', stdout: [
+        'cgroup.subtree_control=+cpu', 'shard/cgroup.type=threaded', 'shard/cgroup.subtree_control=+cpu', 'shard/server/cgroup.type=threaded',
+        'shard/driver/cgroup.type=threaded', 'shard/server/cpu.max=200000 100000', 'shard/driver/cpu.max=90000 100000',
+        'forked from the driver group, then moved to the server group', 'spool 700 requests 600',
+        'chown testuser:testuser <home>/spool <home>/spool/requests', 'gosu testuser bash /tests/integration/fixtures/burst-driver.sh --serve <home>/spool', ''].join('\n') })
+    }
+    const noHeadroom = 'the container\'s cpu.max leaves no headroom beside the server\'s 2 CPUs and the burst driver\'s 0.9'
     for (const [cpuMax, member, listed, message] of [
-      ['300000 100000', '0::/docker/0123abcd', true, 'the cgroup mount is not this container\'s own; a burst-driver shard needs --cgroupns private'],
-      ['300000 100000', '0::/', false, 'the cgroup mount is not this container\'s own; a burst-driver shard needs --cgroupns private'],
-      ['max 100000', '0::/', true, 'the container\'s cpu.max leaves no CPU for the burst driver'],
-      ['100000 100000', '0::/', true, 'the container\'s cpu.max leaves no CPU for the burst driver'],
-      ['', '0::/', true, 'the container\'s cpu.max leaves no CPU for the burst driver'],
+      ['400000 100000', '0::/docker/0123abcd', true, 'the cgroup mount is not this container\'s own; a burst-driver shard needs --cgroupns private'],
+      ['400000 100000', '0::/', false, 'the cgroup mount is not this container\'s own; a burst-driver shard needs --cgroupns private'],
+      ['max 100000', '0::/', true, noHeadroom],
+      ['100000 100000', '0::/', true, noHeadroom],
+      ['290000 100000', '0::/', true, noHeadroom],
+      ['', '0::/', true, noHeadroom],
     ] as const) {
       const refused = split(cpuMax, member, listed)
       expect({ status: refused.status, stdout: refused.stdout, stderr: refused.stderr }).toEqual({ status: 1, stdout: '', stderr: `entrypoint.sh: ${message}\n` })
@@ -4252,14 +4258,14 @@ globalThis.fetch = async (_url, init) => {
       + 'server_cgroup=/ server_cpu_max=200000/100000 server_cpus=2 server_usage_ms=7 driver_cgroup=/ driver_cpu_max=200000/100000 driver_cpus=2 driver_usage_ms=7 shared_cpus=2 '
       + 'guarded_files=2 writable_files=0 unprobed_files=0 limit=2 verdict=missing\n'
       + 'recorded: sr8 summary scenario=test-fault measures=1 pass=0 fail=0 missing=1\n' })
-    put('proc/102/cgroup', '0::/shard/server\n'); put('cgroup/cpu.max', '300000 100000\n'); put('cgroup/shard/cpu.max', 'max 100000\n')
+    put('proc/102/cgroup', '0::/shard/server\n'); put('cgroup/cpu.max', '400000 100000\n'); put('cgroup/shard/cpu.max', 'max 100000\n')
     put('cgroup/shard/cgroup.procs', ''); put('cgroup/shard/driver/cgroup.procs', ''); put('cgroup/shard/server/cgroup.procs', '7\n')
     put('cgroup/shard/server/cpu.max', '200000 100000\n'); put('cgroup/shard/server/cpu.stat', stat(5_000))
     put('cgroup/shard/driver/cpu.max', '90000 100000\n'); put('cgroup/shard/driver/cpu.stat', stat(2_000))
     writeFileSync(join(root, 'split'), '/shard/driver\n/shard/driver\n')
     const split = cli('driver-cpu', ['102', join(root, 'split')])
     expect({ status: split.status, stdout: split.stdout }).toEqual({ status: 0, stdout: 'recorded: sr8 driver-cpu scenario=test-fault mode=strict population=0 recipients=2 samples=2 '
-      + 'server_cgroup=/shard/server server_cpu_max=200000/100000 server_cpus=2 server_usage_ms=5 driver_cgroup=/shard/driver driver_cpu_max=90000/100000 driver_cpus=0.9 driver_usage_ms=2 shared_cpus=3 '
+      + 'server_cgroup=/shard/server server_cpu_max=200000/100000 server_cpus=2 server_usage_ms=5 driver_cgroup=/shard/driver driver_cpu_max=90000/100000 driver_cpus=0.9 driver_usage_ms=2 shared_cpus=4 '
       + 'guarded_files=8 writable_files=0 unprobed_files=0 limit=2 verdict=pass\n'
       + 'recorded: sr8 summary scenario=test-fault measures=1 pass=1 fail=0 missing=0\n' })
     // R1's escape: the server's UID able to write the parent's cgroup.procs, so it could leave its group,

@@ -621,11 +621,11 @@ names it. A `cscb-ci=1` container is picked by its label, whatever its name.
 The CPU fit counts the CPUs of every other live `/ci` reservation;
 `/ci-live` adds none.
 
-A shard holding test-44 or any strict/open membership-load group takes one
-more CPU than the 2 its server keeps, once per shard even with several such
-scripts, for the burst load driver (see
-[Burst-driver shards](#burst-driver-shards)). Admission comes before
-scheduling places those scripts, so for N shards it counts one more CPU for
+A shard holding test-44 or any strict/open membership-load group takes two
+more CPUs than the 2 its server keeps (`DRIVER_CPUS`), once per shard even
+with several such scripts: 0.9 for the burst load driver and 1.1 of headroom
+(see [Burst-driver shards](#burst-driver-shards)). Admission comes before
+scheduling places those scripts, so for N shards it counts two more CPUs for
 each of the run's burst-driver scripts, at most N; the reservation records
 the same CPUs.
 
@@ -635,7 +635,7 @@ the same CPUs.
 |---|---|
 | Memory | U + the commitments + N × the ordinary cap + 2 GiB per Codex shard + the 1 GiB admission margin ≤ C, and no container blocks every run |
 | Disk | (used + 1 GiB) ÷ (used + available) < 85% on the volume holding the run directory. The 1 GiB is an allowance for the run's own files; the 85% is `/ci`'s own disk line |
-| CPU | The other live reservations' CPUs + 2 × N + the smaller of N and the run's burst-driver scripts ≤ the 12 CI CPUs |
+| CPU | The other live reservations' CPUs + 2 × N + 2 × the smaller of N and the run's burst-driver scripts ≤ the 12 CI CPUs |
 
 The disk fit uses actual allocated filesystem blocks and available space;
 it does not discount temporary usage. The tarball is packed under the run
@@ -714,12 +714,12 @@ with a 64 GiB pod limit:
 - While a `/ci-live` run is active, C is 40 GiB and that run counts 13 GiB,
   so no `/ci` run fits once U is above 24 GiB.
 - The complete split burst workload population exceeds the maximum shard
-  count. A default full run can therefore fit at most 4 shards in an otherwise
-  unoccupied CPU budget: 8 + 4 = 12 CPUs; 5 shards would need 15. A second
+  count. A default full run can therefore fit at most 3 shards in an otherwise
+  unoccupied CPU budget: 6 + 6 = 12 CPUs; 4 shards would need 16. A second
   default full run beside it is refused for CPU. At its isolation minimum of
   two shards, the dedicated Codex shard and one ordinary shard, it needs
-  4 + 2 = 6 CPUs, with none free beside the 4-shard run.
-- Selective runs depend on their selected burst population; four is not a
+  4 + 4 = 8 CPUs, with none free beside the 3-shard run.
+- Selective runs depend on their selected burst population; three is not a
   universal cap. A run without burst scripts takes 2 CPUs a shard, so a
   6-shard run holds all 12 CI CPUs and leaves none for another run.
 
@@ -803,7 +803,7 @@ rename), with these keys:
 | `runId`, `pid` | the run's RUN_ID and PID |
 | `shards` | N |
 | `memoryBytes` | N × the ordinary per-shard memory cap + 2 GiB per dedicated Codex shard |
-| `cpus` | 2 × N + the smaller of N and the run's burst-driver scripts |
+| `cpus` | 2 × N + 2 × the smaller of N and the run's burst-driver scripts |
 | `kind` | `full` or `selective` |
 
 - **Its lifetime.** A reservation lives until its run ends: the run removes
@@ -1042,7 +1042,7 @@ four things to an ordinary shard's:
 
 | Flag | Why |
 |---|---|
-| `--cpus 3` | The server keeps the 2 CPUs of quota every shard has; the third is the driver's |
+| `--cpus 4` | The server keeps the 2 CPUs of quota every shard has; the driver takes 0.9 and 1.1 is headroom |
 | `--cgroupns private` | The cgroup the shard sees, and may write, is its own, whatever the daemon's default namespace mode |
 | `--security-opt writable-cgroups=true` | The entrypoint can make CPU groups inside the container's own cgroup, with no added capability |
 | `--init` | Docker's init is PID 1, so the container's main process stays in the container's cgroup, where the runner reads its memory and PIDs |
@@ -1060,7 +1060,7 @@ the threaded `cpu` controller:
   server alike, runs in `shard/server` at `cpu.max` 200000/100000, the same
   2 CPUs as before.
 - The driver's launcher, `tests/integration/fixtures/burst-driver.sh --serve`,
-  is born in `shard/driver`, at 0.9 of the third CPU, and runs as testuser. A
+  is born in `shard/driver`, at 0.9 CPU, and runs as testuser. A
   test's `burst-driver.sh` passes it each driver run, which starts there, so
   nothing migrates. A request names a record path, one of the
   `sr8-evidence.ts` driver commands (`burst`, `fault-burst`,
@@ -1080,11 +1080,16 @@ the threaded `cpu` controller:
   process into another group or change any limit. Only the entrypoint runs as
   root, and it creates the groups and places the launcher before it drops to
   testuser.
-- The 0.1 CPU left is headroom. It makes it rare for the container's 3-CPU
-  quota to throttle the server's group, but does not prevent it: the control
-  probes recorded 5 ms and 1.1 s of container-level throttling under
-  saturated loops. When a slow ACK is diagnosed, container-level throttling
-  remains a possible cause.
+- The 1.1 CPU left is headroom, so the container's 4-CPU quota stays clear
+  of the 2.9 CPUs the two groups can use. With 0.1 CPU of headroom (a 3-CPU
+  container), the control probes recorded 5 ms and 1.1 s of container-level
+  throttling under saturated loops. In b.9p6's SR-8 runs, the server's group
+  sat runnable but not running for gaps of up to 313 ms: high `cpu.pressure`
+  with no throttle in its own `cpu.stat`, the signature of a throttled
+  ancestor; a Post Hold released 110 ms late fits that class. Throttling at an
+  ancestor never shows in `shard/server/cpu.stat`. The entrypoint refuses a
+  container quota that leaves no headroom above 2.9 CPUs, and always sets
+  the server's group to exactly 2 CPUs, whatever the container's quota.
 
 Memory, PID and OOM figures stay the container's, as in any shard. While the
 measured server runs, the script's `driver-cpu` verdict checks the placement,
