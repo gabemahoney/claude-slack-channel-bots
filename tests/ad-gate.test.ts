@@ -1594,6 +1594,14 @@ describe("entry.sh's gate lines", () => {
     expect(ENTRY_SH).toMatch(/^say\(\) \{ printf 'ad-gate: %s\\n' "\$\*"; \}$/m)
     expect(ENTRY_SH).toMatch(/^say "manifest: \$\(jq -c \. "\$\{MANIFEST\}"\)"$/m)
   })
+
+  test("it runs the tag's entrypoint.sh as a background child with shard number 1, then the canary, flags and scripts as separate arguments", () => {
+    const launches = ENTRY_SH.split('\n').filter((line) => line.includes('/usr/local/bin/entrypoint.sh'))
+
+    expect(launches).toEqual([
+      '/usr/local/bin/entrypoint.sh 1 "${canary}" "${runner_flags[@]}" "${inject_flags[@]}" "${scripts[@]}" &',
+    ])
+  })
 })
 
 // --- The command line, over a fake scheduler ---

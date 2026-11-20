@@ -231,7 +231,7 @@ fi
 # shard's cgroup (shard/server, shard/driver) only when its $$ != 1, so an exec
 # would skip the split silently and fail every burst-driver script's
 # driver-cpu verdict as missing.
-/usr/local/bin/entrypoint.sh 1"${canary}" "${runner_flags[@]}" "${inject_flags[@]}" "${scripts[@]}" &
+/usr/local/bin/entrypoint.sh 1 "${canary}" "${runner_flags[@]}" "${inject_flags[@]}" "${scripts[@]}" &
 runner=$!
 say "runner pid ${runner}; deadline ${DEADLINE_S} s"
 
