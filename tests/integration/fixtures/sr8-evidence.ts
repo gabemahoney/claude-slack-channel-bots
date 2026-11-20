@@ -3016,13 +3016,14 @@ export async function memberCpuWindow(io: MemberCpuWindowIo, kind: string): Prom
     return memberCpuSummary(samples, io.cpuMs() - startCpu, kind)
   } finally { cancel() }
 }
+export const MEMBER_CPU_MAX_MS = 7_200_000
 async function memberCpuCommand(args: string[]): Promise<number> {
   if (!memberCpuEnabled(process.env.CSCB_TEST_DIAGNOSTICS, process.env.SR8_MEMBER_CPU, args[0] ?? '')) return 0
   let fd: number | undefined, deadline: ReturnType<typeof setTimeout> | undefined, stop: (() => void) | undefined
   try {
     countArgs(args, 8)
     const [kind, out, server, stub, root, rawMax, ...keys] = args, maxMs = Number(rawMax)
-    if (!/^[a-z-]+$/.test(kind) || ![server, stub].every(s => /^[1-9][0-9]*$/.test(s)) || !positive(maxMs) || maxMs > 600_000
+    if (!/^[a-z-]+$/.test(kind) || ![server, stub].every(s => /^[1-9][0-9]*$/.test(s)) || !positive(maxMs) || maxMs > MEMBER_CPU_MAX_MS
       || !keys.every(k => /^[a-z0-9_]+$/.test(k)) || !process.env.SCENARIO_ROOT
       || !resolve(out).startsWith(resolve(process.env.SCENARIO_ROOT) + '/')) throw new Error('arguments')
     fd = openSync(join(out, 'member-cpu.jsonl'), 'wx', 0o600)

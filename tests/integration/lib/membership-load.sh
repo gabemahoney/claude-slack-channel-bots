@@ -440,14 +440,15 @@ membership_member_cpu_clock() {
 }
 membership_member_cpu_start() {
     membership_member_cpu_enabled || return 0
-    local deadline
+    # Runaway guard, checked against the composed burst/write watchdogs in cpu-profile.test.ts.
+    local deadline max_ms=7200000
     if [[ "${MEMBERSHIP_MEMBER_CPU_HOOK}" == 0 ]]; then
         on_before_cleanup membership_member_cpu_stop
         MEMBERSHIP_MEMBER_CPU_HOOK=1
     fi
     ( umask 077
       exec bash "${BURST_DRIVER}" "${OUT}/member-cpu-cgroup" bun "${E}" member-cpu \
-          "${CASE_KIND}" "${OUT}" "${SERVER_PID}" "${STUB_PID}" "${ROOT}" "$((WAIT_MS * 4))" "${KEYS[@]}" \
+          "${CASE_KIND}" "${OUT}" "${SERVER_PID}" "${STUB_PID}" "${ROOT}" "${max_ms}" "${KEYS[@]}" \
           > "${OUT}/member-cpu.log" 2> /dev/null ) &
     MEMBERSHIP_MEMBER_CPU_PID=$!
     track_pid "${MEMBERSHIP_MEMBER_CPU_PID}"

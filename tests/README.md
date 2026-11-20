@@ -725,6 +725,8 @@ reporting the sampler's own CPU and actual sample gaps. The first observation
 precedes readiness, and SIGTERM requests a final observation; the sampler runs
 through `burst-driver.sh`'s `member-cpu` command in `shard/driver`, with its
 actual placement reported when the launcher is absent and it runs in place.
+The two-hour runaway guard matches `MEMBER_CPU_MAX_MS` and is checked against
+the composed burst and ordered-write watchdogs; SIGTERM normally ends observation.
 
 Readiness and shutdown each use a 5 s elapsed deadline from Bash's `SECONDS`,
 subject to the final poll and scheduling delay. Cleanup sends TERM, then

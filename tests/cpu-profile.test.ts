@@ -13,10 +13,11 @@ import {
   CPU_PROFILE_DIR_ENV, CPU_PROFILE_INTERVAL_US, CPU_PROFILE_LONGEST_CAP_S, CPU_PROFILE_MAX_INTERVAL_US, cpuProfileOptIn, profileCapS, samplingIntervalUs,
   startCpuProfile, summaryLines, summaryReport, type CpuProfile, type ProfilePart, type ProfilerIo,
 } from './integration/fixtures/cpu-profile.ts'
-import { windowsVerdict, memberCpuEnabled, memberCpuLabel, memberCpuSample, memberCpuSummary, memberCpuWindow,
+import { windowsVerdict, faultWaves, MEMBER_CPU_MAX_MS, memberCpuEnabled, memberCpuLabel, memberCpuSample, memberCpuSummary, memberCpuWindow,
   type MemberCpuSample, type MemberCpuPaths } from './integration/fixtures/sr8-evidence.ts'
 import { DELIVERY_MAX_AD_CALLS_PER_S } from '../src/delivery-constants.ts'
 import { DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS } from '../src/config.ts'
+import { MEMBERSHIP_ATTEMPT_TIMEOUT_MS, MEMBERSHIP_RETRY_MAX_MS, MEMBERSHIP_REQUEST_TIMEOUT_MS } from '../src/channel-membership-retry.ts'
 
 const REPO = join(import.meta.dir, '..')
 const FIXTURES = join(import.meta.dir, 'integration/fixtures')
@@ -361,6 +362,108 @@ describe('membership member CPU diagnostic (synthetic samples and proc tree)', (
     expect({ status: failed.status, stdout: failed.stdout, stderr: failed.stderr })
       .toEqual({ status: 0, stdout: 'recorded: sr8 member-cpu unavailable reason=sampler\n', stderr: '' })
   })
+  function memberHarness() {
+    // Only the driver transport is replaced: the fixture's argument check,
+    // first/final observations, readiness and SIGTERM handler all run for real.
+    writeFileSync(join(root, 'launcher.sh'), '#!/bin/bash\nshift 2\nexec "$BUN" "$@"\n')
+    const waitAssignment = LOAD.match(/^    WAIT_MS="\$\(\(ATTEMPT_MS \+ RETRY_MAX_MS \+ REQUEST_MS\)\)"$/m)?.[0]
+    expect(waitAssignment).toBeDefined()
+    const program = ['set -euo pipefail', "MEMBERSHIP_MEMBER_CPU_PID=''; MEMBERSHIP_MEMBER_CPU_HOOK=0; CASE_KIND=later-rate",
+      `ATTEMPT_MS=${MEMBERSHIP_ATTEMPT_TIMEOUT_MS}; RETRY_MAX_MS=${MEMBERSHIP_RETRY_MAX_MS}; REQUEST_MS=${MEMBERSHIP_REQUEST_TIMEOUT_MS}`,
+      waitAssignment!, 'OUT="$HOME/out"; ROOT="$HOME"; SERVER_PID=1; STUB_PID=2; KEYS=(alpha beta)',
+      'BURST_DRIVER="$HOME/launcher.sh"; E="$HOME/member-evidence.ts"',
+      'on_before_cleanup() { :; }; track_pid() { :; }',
+      ...['membership_member_cpu_enabled', 'membership_member_cpu_clock', 'membership_member_cpu_start', 'membership_member_cpu_stop'].map(n => shellFunction(LOAD, n)),
+      'membership_member_cpu_start; membership_member_cpu_stop; echo continued',
+    ].join('\n')
+    return spawnSync('bash', ['-c', program], { env: hostSafeChildEnv(root, { tools: ['bash', 'sleep'], extras: {
+      BUN: process.execPath, SCENARIO_ROOT: root, CSCB_TEST_DIAGNOSTICS: '1', SR8_MEMBER_CPU: 'all',
+    } }), encoding: 'utf8', timeout: 15000 })
+  }
+  test('member CPU real membership watchdog is accepted by the real sampler CLI', () => {
+    memberCli(fakeTree())
+    const out = join(root, 'out'); mkdirSync(out)
+    const child = memberHarness()
+    expect(child.error).toBeUndefined()
+    expect({ status: child.status, stderr: child.stderr }).toEqual({ status: 0, stderr: '' })
+    expect(child.stdout).not.toContain('unavailable reason=')
+    expect(child.stdout).toContain('recorded: sr8 member-cpu case=later-rate ')
+    expect(child.stdout).toEndWith('continued\n')
+    expect(existsSync(join(out, 'member-cpu.ready'))).toBe(true)
+    const rows = readFileSync(join(out, 'member-cpu.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    expect(rows.length).toBeGreaterThanOrEqual(2)
+    expect(rows.every(row => row.target_cgroup === '/shard/server' && row.threads.length === 2)).toBe(true)
+    expect(readFileSync(join(out, 'member-cpu.summary'), 'utf8')).toBe(child.stdout.slice(0, -'continued\n'.length))
+  })
+  test('member CPU window stays active beyond 600 seconds and takes its final observation at stop', () => {
+    const file = memberCli(fakeTree()), out = join(root, 'out'); mkdirSync(out)
+    const source = readFileSync(file, 'utf8'), ready = "console.log('member-ready')"
+    expect(source.split(ready)).toHaveLength(2)
+    // Lexical timers and a virtual monotonic clock affect only this scratch
+    // fixture copy. The real CLI receives the real shell's lifetime argument.
+    const clock = `
+let clockMs = 0, timerId = 0, tick = () => {};
+const timers = new Map();
+const setTimeout = (callback, ms) => { timers.set(++timerId, { callback, at: clockMs + ms }); return timerId; };
+const clearTimeout = id => { timers.delete(id); };
+const setInterval = callback => { tick = callback; return 1; };
+const clearInterval = () => { tick = () => {}; };
+Object.defineProperty(performance, 'now', { value: () => clockMs });
+function advance(ms) {
+  clockMs = ms;
+  for (const [id, timer] of timers) if (timer.at <= clockMs) { timers.delete(id); timer.callback(); }
+  tick();
+}
+`
+    writeFileSync(file, clock + source.replace(ready, `${ready}; queueMicrotask(async () => {
+      advance(610000);
+      for (let turn = 0; turn < 5; turn++) await Promise.resolve();
+      advance(625000);
+      process.emit('SIGTERM');
+    })`))
+    const child = memberHarness()
+    expect(child.error).toBeUndefined()
+    expect({ status: child.status, stderr: child.stderr }).toEqual({ status: 0, stderr: '' })
+    expect(child.stdout).not.toContain('unavailable reason=')
+    const rows = readFileSync(join(out, 'member-cpu.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    expect(rows[0].at_ms).toBe(0)
+    expect(rows.some(row => row.at_ms === 610000)).toBe(true)
+    expect(rows.at(-1).at_ms).toBe(625000)
+    expect(child.stdout).toContain('start_ms=0 end_ms=625000 duration_ms=625000')
+    expect(readFileSync(join(out, 'member-cpu.summary'), 'utf8')).toBe(child.stdout.slice(0, -'continued\n'.length))
+  })
+  test('member CPU shell ceiling matches the validator and covers composed watchdogs in both modes', async () => {
+    const fixture = integrationFile('fixtures/sr8-evidence.ts')
+    const ceiling = Number(fixture.match(/^export const MEMBER_CPU_MAX_MS = ([\d_]+)$/m)?.[1].replaceAll('_', ''))
+    expect(ceiling).toBe(MEMBER_CPU_MAX_MS)
+    expect(Number(shellFunction(LOAD, 'membership_member_cpu_start').match(/\bmax_ms=(\d+)\b/)?.[1])).toBe(ceiling)
+    expect(fixture).toContain('maxMs > MEMBER_CPU_MAX_MS')
+    const waitMs = MEMBERSHIP_ATTEMPT_TIMEOUT_MS + MEMBERSHIP_RETRY_MAX_MS + MEMBERSHIP_REQUEST_TIMEOUT_MS
+    const waitS = Math.ceil(waitMs / 1000), scenario = integrationFile('lib/scenario.sh')
+    const rescanS = Number(shellFunction(scenario, 'wait_membership_rescan').match(/wait_until (\d+) /)?.[1])
+    const callS = Number(scenario.match(/^SCENARIO_STUB_CALL_S=(\d+)$/m)?.[1])
+    expect(rescanS).toBeGreaterThan(0); expect(callS).toBeGreaterThan(0)
+    const strict = shellFunction(LOAD, 'membership_writes'), open = shellFunction(LOAD, 'ordered_writes')
+    expect(strict).toContain('for kind in leave join; do')
+    expect(strict.match(/wait_until "\$\{WAIT_S\}"/g)).toHaveLength(1)
+    expect(strict.match(/slack_wait_one_ack "\$\{envelope\}" "\$\{WAIT_S\}"/g)).toHaveLength(1)
+    expect(strict.match(/wait_membership_rescan /g)).toHaveLength(1)
+    expect(open).toContain('for delivery in all mentions; do')
+    expect(open.match(/wait_until "\$\{WAIT_S\}"/g)).toHaveLength(1)
+    expect(open.match(/stub_session_result /g)).toHaveLength(1)
+    expect(shellFunction(scenario, 'stub_session_result')).toContain('${3:-${SCENARIO_STUB_CALL_S}}')
+    const items = ['held', 'roots', 'replies', 'replies'].map((phase, ordinal) => ({ phase, ordinal, key: 'alpha', channel: 'C1',
+      ts: String(ordinal + 1), sender: 'U1', root: '-', dependent: false }))
+    let burstMs = 0
+    const spend = async () => { burstMs += waitMs; return true }
+    expect(await faultWaves(items, async () => { await spend() }, spend, spend, { items: [items[3]], released: spend })).toBe(true)
+    // Four sequential send batches, three ACK waits, held admission and release.
+    expect(burstMs).toBe(9 * waitMs)
+    const strictMs = (3 * waitS + 2 * rescanS) * 1000, openMs = (waitS + 2 * callS) * 1000
+    // Serial addition overbounds the actual overlap; include sampler readiness.
+    expect(ceiling).toBeGreaterThan(burstMs + Math.max(strictMs, openMs) + 5000)
+    expect(ceiling).toBe(7_200_000)
+  })
   test.each([[undefined, 'all'], ['', 'all'], ['0', 'all'], ['true', 'all'], ['1', undefined], ['1', ''], ['1', 'first-rate'], ['1', 'later-rate-extra']])
   ('off gate starts no process, writes no file and prints no line (diagnostics=%p selection=%p)', (diagnostics, selection) => {
     expect(memberCpuEnabled(diagnostics, selection, 'later-rate')).toBe(false)
@@ -406,7 +509,7 @@ setInterval(() => {}, 1000);
     expect(readFileSync(join(root, 'hook'), 'utf8')).toBe('membership_member_cpu_stop\n')
     expect(readFileSync(join(root, 'tracked'), 'utf8')).toBe('tracked\n')
     expect(JSON.parse(readFileSync(join(root, 'request'), 'utf8'))).toEqual({ record: join(out, 'member-cpu-cgroup'), command: 'member-cpu', kind: 'later-rate',
-      rest: ['1', '2', root, '4000', 'alpha', 'beta'] })
+      rest: ['1', '2', root, String(MEMBER_CPU_MAX_MS), 'alpha', 'beta'] })
     expect(existsSync(join(out, 'driver-cgroup'))).toBe(false)
     expect(statSync(join(out, 'member-cpu.log')).mode & 0o777).toBe(0o600)
   })
