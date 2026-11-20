@@ -1652,7 +1652,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       .toEqual({ status: 0, stdout: 'recorded: sr8 seal verdict=pass\nafter\n', stderr: '' })
     // Every verdict command goes through it; setup and observation commands do not.
     const direct = [...load.matchAll(/bun "\$\{E\}" ([a-z-]+)/g)].map(m => m[1]).sort()
-    expect([...new Set(direct)]).toEqual(['bodies', 'burst', 'conditions', 'config', 'cpu-mark', 'diag-ack', 'envelope-times', 'fault-burst', 'fault-ids', 'fault-plan', 'fault-recover', 'plan', 'seed'])
+    expect([...new Set(direct)]).toEqual(['bodies', 'burst', 'conditions', 'config', 'cpu-mark', 'diag-ack', 'envelope-times', 'fault-burst', 'fault-ids', 'fault-plan', 'fault-recover', 'member-cpu', 'plan', 'seed'])
   })
   test('test-45/48 reopen observer prints AD rows, lifecycle, stub hook and MCP session fields only on a reopen failure', () => {
     const load = source('lib/membership-load.sh'), safe = load.match(/^REOPEN_SAFE='[\s\S]*?;'$/m)![0]
@@ -2904,6 +2904,7 @@ console.log('driver ' + command + ' ' + rest.join(' ') + ' cwd=' + process.cwd()
   + ' profile=' + e.SR8_PROFILE_DIR + ' path=' + e.PATH + ' home=' + e.HOME + ' options=' + e.BUN_OPTIONS + ' extra=' + e.EXTRA + ' pid=' + process.pid + ' grandparent=' + grand)
 console.error('driver stderr')
 writeFileSync(e.SCENARIO_ROOT + '/driver.pid', String(process.pid))
+if (command === 'member-cpu') console.log('member diagnostics=' + e.CSCB_TEST_DIAGNOSTICS + ' selection=' + e.SR8_MEMBER_CPU)
 if (command === 'fault-burst') setTimeout(() => {}, 20000)
 else process.exitCode = command === 'burst' ? 3 : 0
 `
@@ -2923,14 +2924,14 @@ else process.exitCode = command === 'burst' ? 3 : 0
     expect(r.status).toBe(0)
     expect(r.stdout).toContain(` pid=${pid} grandparent=`)
     expect(r.stdout.replace(/^driver .*\n/m, '')).toBe(`status 3, caller pid ${pid}\nother command 64\nrelative record 64\n/shard/server\n`)
-    const usage = 'usage: burst-driver.sh <record> bun <fixtures>/sr8-evidence.ts burst|fault-burst|fault-recover <arguments>... | --serve <spool>\n'
+    const usage = 'usage: burst-driver.sh <record> bun <fixtures>/sr8-evidence.ts burst|fault-burst|fault-recover|member-cpu <arguments>... | --serve <spool>\n'
     expect(r.stderr).toBe(`driver stderr\n${usage}${usage}`)
   })
-  test('the launcher runs all three driver commands under itself, with its own Bun, directory, PATH and HOME and only the driver fields, relaying output and status', () => {
+  test('the launcher runs all four driver commands under itself, with its own Bun, directory, PATH and HOME and only the driver fields, relaying output and status', () => {
     const r = shell([
       ...setup, 'bash "$HOME/driver.sh" --serve "$HOME/spool" & launcher=$!', 'cd "$HOME/work"', 'echo "launcher $launcher"',
-      'export SCENARIO_ROOT="$HOME" SR8_PHASE_CPU_FILE="$HOME/cpu.jsonl" SR8_PHASE_CPU_PIDS=server=7,stub=8 SR8_PROFILE_DIR="$HOME/profile" EXTRA=dropped',
-      'for command in burst fault-recover; do',
+      'export SCENARIO_ROOT="$HOME" SR8_PHASE_CPU_FILE="$HOME/cpu.jsonl" SR8_PHASE_CPU_PIDS=server=7,stub=8 SR8_PROFILE_DIR="$HOME/profile" CSCB_TEST_DIAGNOSTICS=1 SR8_MEMBER_CPU=first-rate,later-rate EXTRA=dropped',
+      'for command in burst fault-recover member-cpu; do',
       '  status=0; bash "$HOME/driver.sh" "$HOME/record" bun "$HOME/sr8-evidence.ts" "$command" "a b" \'$HOME\' & caller=$!; wait "$caller" || status=$?',
       '  echo "$command status $status caller $caller"',
       'done',
@@ -2946,14 +2947,15 @@ else process.exitCode = command === 'burst' ? 3 : 0
     const literal = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     const fields = literal(`cwd=/ root=${home} cpu=${home}/cpu.jsonl pids=server=7,stub=8 profile=${home}/profile path=/usr/local/bin:/usr/bin:/bin home=/ options=undefined extra=undefined`)
     // Arguments arrive as given, unevaluated; each driver's grandparent is the launcher, not its caller.
-    for (const [command, status] of [['burst', 3], ['fault-recover', 0]] as const) {
+    for (const [command, status] of [['burst', 3], ['fault-recover', 0], ['member-cpu', 0]] as const) {
       const caller = r.stdout.match(new RegExp(`^${command} status ${status} caller (\\d+)$`, 'm'))![1]
       const line = r.stdout.match(new RegExp(`^driver ${command} a b \\$HOME ${fields} pid=(\\d+) grandparent=(\\d+)$`, 'm'))!
       expect([line[1] === caller, line[2]]).toEqual([false, launcher])
     }
     expect(r.stdout).toMatch(new RegExp(`^driver fault-burst  ${fields} pid=\\d+ grandparent=${launcher}$`, 'm'))
-    expect(r.stdout).toContain('fault-burst stopped 143\n/shard/driver\n/shard/driver\n/shard/driver\nrequests\n')
-    expect(r.stderr).toBe('driver stderr\ndriver stderr\ndriver stderr\n')
+    expect(r.stdout).toContain('member diagnostics=1 selection=first-rate,later-rate\n')
+    expect(r.stdout).toContain('fault-burst stopped 143\n/shard/driver\n/shard/driver\n/shard/driver\n/shard/driver\nrequests\n')
+    expect(r.stderr).toBe('driver stderr\ndriver stderr\ndriver stderr\ndriver stderr\n')
   })
   test('the launcher ignores a caller\'s PATH, Bun options, preload, bunfig and .env files, and refuses crafted environment entries, arguments and records', () => {
     const r = shell([
@@ -2971,22 +2973,27 @@ else process.exitCode = command === 'burst' ? 3 : 0
       '  bash "$HOME/driver.sh" "$HOME/record" bun "$HOME/sr8-evidence.ts" fault-recover || status=$?',
       'echo "overridden caller $status"; for f in fake-bun preloaded; do [[ -e "$HOME/$f" ]] && echo "$f ran"; done',
       craft, 'rm -f "$HOME/driver.pid"',
-      'for entry in -u --unset=SCENARIO_ROOT -i -- PATH=/tmp BUN_OPTIONS=--preload=x HOME=/tmp NODE_OPTIONS=x SR8_PROFILE_DIR SCENARIO_ROOTX=1 " SR8_PROFILE_DIR=x"; do',
+      'for entry in -u --unset=SCENARIO_ROOT -i -- PATH=/tmp BUN_OPTIONS=--preload=x HOME=/tmp NODE_OPTIONS=x SR8_PROFILE_DIR SCENARIO_ROOTX=1 " SR8_PROFILE_DIR=x" CSCB_TEST_DIAGNOSTICSX=1 SR8_MEMBER_CPUX=all SR8_MEMBER_CPU; do',
       '  echo "entry [$entry]: $(craft "$HOME/record" 3 bun "$HOME/sr8-evidence.ts" burst "$entry")"',
       'done',
       'echo "argv: $(craft "$HOME/record" 3 bash -c "touch $HOME/ran")"',
       'echo "other entry file: $(craft "$HOME/record" 3 bun "$HOME/work/../sr8-evidence.ts" burst)"',
       'echo "relative record: $(craft record 3 bun "$HOME/sr8-evidence.ts" burst)"',
       'echo "short argv: $(craft "$HOME/record" 5 bun "$HOME/sr8-evidence.ts" burst)"',
+      'echo "unknown command: $(craft "$HOME/record" 3 bun "$HOME/sr8-evidence.ts" member-cpu-evil)"',
       '[[ -e "$HOME/driver.pid" || -e "$HOME/ran" ]] && echo "a crafted request ran" || echo "no crafted request ran"',
       'kill "$launcher"', 'cat "$HOME/record"',
     ].join('\n'), { 'driver.sh': planted(), 'sr8-evidence.ts': stubDriver })
     expect(r.status).toBe(0)
     expect(r.stdout).toMatch(/^driver fault-recover  cwd=\/ root=\S+ cpu=undefined pids=undefined profile=undefined path=\/usr\/local\/bin:\/usr\/bin:\/bin home=\/ options=undefined extra=undefined pid=\d+ grandparent=\d+$/m)
-    const entries = ['-u', '--unset=SCENARIO_ROOT', '-i', '--', 'PATH=/tmp', 'BUN_OPTIONS=--preload=x', 'HOME=/tmp', 'NODE_OPTIONS=x', 'SR8_PROFILE_DIR', 'SCENARIO_ROOTX=1', ' SR8_PROFILE_DIR=x']
+    const entries = ['-u', '--unset=SCENARIO_ROOT', '-i', '--', 'PATH=/tmp', 'BUN_OPTIONS=--preload=x', 'HOME=/tmp', 'NODE_OPTIONS=x', 'SR8_PROFILE_DIR', 'SCENARIO_ROOTX=1', ' SR8_PROFILE_DIR=x', 'CSCB_TEST_DIAGNOSTICSX=1', 'SR8_MEMBER_CPUX=all', 'SR8_MEMBER_CPU']
     expect(r.stdout.replace(/^driver .*\n/m, '')).toBe(['preload live', 'overridden caller 0', ...entries.map(entry => `entry [${entry}]: exit 64`),
-      'argv: exit 64', 'other entry file: exit 64', 'relative record: exit 64', 'short argv: exit 64', 'no crafted request ran', '/shard/driver', ''].join('\n'))
+      'argv: exit 64', 'other entry file: exit 64', 'relative record: exit 64', 'short argv: exit 64', 'unknown command: exit 64', 'no crafted request ran', '/shard/driver', ''].join('\n'))
     expect(r.stderr).toBe('driver stderr\n')
+  })
+  test('driver environment allowlist adds only the two member sampler gates', () => {
+    const names = fixture.match(/^DRIVER_ENV=\(([^)]*)\)$/m)?.[1].split(' ')
+    expect(names).toEqual(['SCENARIO_ROOT', 'SR8_PHASE_CPU_FILE', 'SR8_PHASE_CPU_PIDS', 'SR8_PROFILE_DIR', 'CSCB_TEST_DIAGNOSTICS', 'SR8_MEMBER_CPU'])
   })
   test.each([['other-writable', 'chmod 0757 "$HOME/bin/bun"'], ['a link', 'ln -s "$HOME/bin/bun" "$HOME/bin/link"'],
     ['a group-writable entry file of another group', 'chmod 0664 "$HOME/sr8-evidence.ts"']])('the launcher does not serve when what it runs is %s', (_name, change) => {

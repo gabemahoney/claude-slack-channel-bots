@@ -1116,19 +1116,29 @@ the threaded `cpu` controller:
   is born in `shard/driver`, at 0.9 CPU, and runs as testuser. A
   test's `burst-driver.sh` passes it each driver run, which starts there, so
   nothing migrates. A request names a record path, one of the
-  `sr8-evidence.ts` driver commands (`burst`, `fault-burst`,
-  `fault-recover`) with its arguments, and at most the fields `SCENARIO_ROOT`,
-  `SR8_PHASE_CPU_FILE`, `SR8_PHASE_CPU_PIDS` and `SR8_PROFILE_DIR`. The
-  launcher refuses anything else with status 64 and starts nothing.
+  `sr8-evidence.ts` commands (`burst`, `fault-burst`, `fault-recover`,
+  `member-cpu`) with its arguments, and at most six environment fields:
+  `SCENARIO_ROOT`, `SR8_PHASE_CPU_FILE`, `SR8_PHASE_CPU_PIDS`,
+  `SR8_PROFILE_DIR`, `CSCB_TEST_DIAGNOSTICS` and `SR8_MEMBER_CPU`.
+
+  The launcher refuses anything else with status 64 and starts nothing.
   It runs the image's root-owned `/usr/local/bin/bun` on the fixtures'
   `sr8-evidence.ts` itself, with the arguments unevaluated, from `/`, with
-  its own `PATH`, `HOME=/` and no Bun options. No program, search path,
+  its own `PATH`, `HOME=/` and no Bun options.
+
+  No program, search path,
   preload, `bunfig.toml`, `.env` file or other loader setting comes from the
   caller. It serves only while that Bun, the fixtures directory and
   `sr8-evidence.ts` are root-owned and writable by no one else.
+
   Like the server, the driver imports the installed package under test,
   which test-1 installs as testuser. The launcher limits what a request can
   start, not what testuser's own files hold.
+
+  The optional `member-cpu` sampler uses a separate
+  `<OUT>/member-cpu-cgroup` record, leaving the burst's `driver-cpu` verdict
+  input unchanged. With no launcher it runs in place; its summary reports
+  both sampler and target cgroups (see [Optional test diagnostics](../tests/README.md#optional-test-diagnostics)).
 - testuser, the server's UID, owns no cgroup file, so it cannot move any
   process into another group or change any limit. Only the entrypoint runs as
   root, and it creates the groups and places the launcher before it drops to

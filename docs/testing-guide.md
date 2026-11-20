@@ -265,6 +265,7 @@ New features that add significant logic should get their own test file (e.g., `s
 | ad-settings.ts | ad-settings.test.ts | Defaults and accepted minima, pending/create-timeout coupling, ignored unknown keys, malformed/unreadable settings, safe refusal/value logs and runtime reload behavior. |
 | tests/real-agent/ai-mismatch-diagnostics.ts | ai-mismatch-diagnostics.test.ts | Acknowledgement-only, malformed and absent responses; exact decoded-body and metadata mismatches; JSON/fence/escaping normalization and fixture-token-only excerpts with secret scrubbing before slicing and retention. |
 | tests/integration/fixtures/cpu-profile.ts, cpu-profile-preload.ts | cpu-profile.test.ts | Synthetic CPU profile ranks, sample windows and CLI outcomes; profiler start/stop faults, timeout, capped sampling and inert behavior without opt-in. Executable extracted shell controls cover unset/empty/0/other/1 for tests 32/44/45: no profile directories, hooks, preload or optional waits off; only strict first-hang profiles in membership, with later/open/new groups inert. Test-44 optional timing config/observers share the switch. Enabled controls retain bounded cleanup, status preservation and test-32 sampling/memory caps. |
+| tests/integration/fixtures/sr8-evidence.ts (`member-cpu`), lib/membership-load.sh, fixtures/burst-driver.sh | cpu-profile.test.ts, ci-timing-regressions.test.ts | Synthetic member-CPU samples and injectable proc/cgroup trees cover bracketed counters, endpoint totals through gaps, matching thread identities, coverage, signed over-accounting, qualified/unavailable shares, ambiguous throttling and nearest-rank scan p99; top-ten-plus-rest output stays within the cap. CLI/shell controls cover exact two-part opt-in, no off-state process/file/output/wait, safe labels, placement, mode-0600 output, initial/readiness/final SIGTERM ordering, timer cancellation, nonfatal failure and elapsed start/stop deadlines with kill/reap. Ten in-memory deletion controls pin wiring presence/order; the real launcher declaration admits the fourth command and exact six environment names while retaining fixed paths, trust and crafted-request refusals; synthetic results establish no native sampling cost or performance verdict. |
 | delivery-engine.ts (createDeliveryCallBudget) | delivery-engine-budget.test.ts | Call-budget waits preserve whole-step age order and typed-text leases; back-to-back receipts deliver each item with only the required Enter revalidation read. |
 | tests/integration/test-19-fmk-reuse.sh, test-23-fmk-latch-recheck.sh | fmk-kit-followups.test.ts | The real mark-window shell block preserves epoch milliseconds under mawk. Extracted sweep-latch checks require one correctly parented Full Row get between list and latch, reject missing/duplicate/early/wrong-ID calls, permit later gets, and retain the list timer for both sweep-latched cases. |
 | tests/integration/lib/scenario.sh | fmk-mark-caller.test.ts | Row attribution requires matching state and every label; permission-list traffic cannot claim a waiting-row mark, and competing eligible callers remain ambiguous. |
@@ -911,6 +912,53 @@ boundaries. Test 32 samples at 100 ms for at most 300 s to cap profile memory,
 with one continuous wave around its 20 samples. See the
 [diagnostic scope table](../tests/README.md#optional-test-diagnostics).
 
+Membership-load also has a separate diagnostic sampler, enabled only by
+`CSCB_TEST_DIAGNOSTICS=1` plus `SR8_MEMBER_CPU=all` or an exact comma-list case
+selection. Both fields inherit through the scheduler/AD-kit container,
+entrypoint and runner, then join the launcher's allowed environment; this
+adds no host `/ci` forwarding for the selector. Its [operating contract](../tests/README.md#member-cpu-sampler)
+covers the 10 ms requested interval, separate output/record, elapsed deadlines
+and nonfatal cleanup; it changes no verdict.
+
+Each observation brackets the target's thread scan with `cpu.stat` reads and
+monotonic start/end times. Whole-window cgroup usage comes from the first and
+last valid monotone counter endpoints in the same cgroup, even across missing
+observations; thread CPU uses each matching `(tid, tgid, start_ticks)` identity's
+first/last observations with nondecreasing runtime. Missing files/TIDs,
+unmatched threads and partial histories are counted, and labels identify the
+server, Slack stub, persona stubs or sanitized comm/executable/argv[1] basenames,
+without emitting full argv, environment, cwd or executable paths.
+
+For adjacent scans, outer usage spans previous-before to current-after;
+inner usage spans previous-after to current-before. An inner `nr_throttled`
+rise proves a throttled interval, no outer rise proves an unthrottled interval,
+and other valid intervals are `ambiguous`, outside both scopes. `coverage_pct`
+is the union of valid adjacent outer time intervals over the sampling window;
+missing intervals are never classified, and this coverage does not prove that
+every short-lived thread was observed.
+
+Window output includes actual gaps, sampler CPU, counter endpoints and
+largest/nearest-rank p99 scan durations; `inner_usage_ms`, `outer_usage_ms` and
+`between_pct` expose collection skew. `unaccounted_ms` and
+`inner_unaccounted_ms` are signed cgroup-usage-minus-observed-CPU balances, so
+negative values remain visible. Label and scope `cpu_ms` remain observed CPU
+only; unknown CPU is never assigned to a label.
+
+`observed_pct` is 100 times observed label CPU over outer usage, rounded to the
+nearest three decimals: an observed-only ratio, never a share bound. A positive
+remainder always makes `share_pct=qualified`, even with complete observed
+endpoint histories. Shares use cgroup usage, never the label sum;
+`share_min_pct` is 100 times observed label CPU over outer usage.
+
+`share_max_pct` is 100 times the sum of observed label CPU and the entire positive
+remainder, `max(0, outer_usage − observed_all)`, divided by inner usage. Bounds
+round outward to 0.001 percentage points: the lower rounds down and the upper
+rounds up. Upper bounds can exceed 100% and are not normalized across labels;
+missing brackets or nonpositive denominators leave shares or bounds unavailable.
+
+A negative outer balance leaves both dominance bounds unavailable; a negative
+inner balance alone keeps the qualified bracket bounds.
+
 Run `tests/integration/test-44-fmk-thread-burst.sh` (bursts, Post Holds and the
 large shared list), all strict/open membership groups (45/48/51–64; full
 filenames in [Layout](../tests/README.md#layout)), and the
@@ -948,14 +996,11 @@ multiple driver scripts in a shard add them only once. These shards retain
 `--init`, private cgroup namespaces and writable cgroups. Recovery groups
 remain ordinary no-model, non-burst workloads.
 
-The launcher takes only one of the three driver commands, its arguments, a
-record path, and the `SCENARIO_ROOT` and three `SR8_*` profiling fields. It
-runs the image's root-owned Bun itself, from `/`, with its own `PATH` and
-`HOME`, so a caller's `PATH`, Bun options, preload, `bunfig.toml` or `.env`
-file never reaches the driver. The server's UID owns no cgroup file, so
-nothing it runs can change group or limit.
+See [Burst-driver shards](../docker/README.md#burst-driver-shards) for the
+launcher allowlist, trust and resource contract. The [Member CPU sampler](../tests/README.md#member-cpu-sampler)
+reference covers its separate `member-cpu-cgroup` record, output and lifecycle.
 
-While the measured server still runs, `driver-cpu` reads that record and the
+While the measured server still runs, `driver-cpu` reads `<OUT>/driver-cgroup` and the
 server's cgroup. As the server's UID, from the server's group, it opens every
 guarded cgroup file on both paths write-only, and writes nothing. It passes
 only when:

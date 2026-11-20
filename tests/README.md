@@ -696,6 +696,7 @@ environment unchanged, never in arguments; absence adds no option or default.
 | Test 32 | Each strict/open thread phase's measured server, one continuous wave around all 20 samples; 100 ms sampling, capped at 300 s. |
 | Test 44 | Its measured burst cases; optional server timing rows, wave CPU/latency observations and CPU profile. |
 | Test 45 | Strict first-hang measured start/burst/ordered writes only. |
+| Membership-load member CPU sampler | Any case selected by `SR8_MEMBER_CPU`, additionally gated by `CSCB_TEST_DIAGNOSTICS=1`; separate from CPU profiling. |
 
 Off runs create no profile, load no profile preload and perform no optional
 profile waits; Test 44's optional timing rows and observers are also off.
@@ -704,6 +705,42 @@ and content-free summaries without changing the test's status or observation
 boundaries. Seed/seal and reopen starts, later-hang, open membership, new
 membership groups and recovery groups gain no profiling. Required measurement records,
 startup/performance evidence and numerical verdicts remain active in both states.
+
+#### Member CPU sampler
+
+The membership-load sampler requires both `CSCB_TEST_DIAGNOSTICS=1` and
+`SR8_MEMBER_CPU=all` or a comma list containing the exact case kind, such as
+`SR8_MEMBER_CPU=first-rate,later-rate`. With either gate off it starts no
+process, writes no file, prints no line and performs no optional wait.
+
+For a scheduler/AD-kit diagnostic, pass both names through `jobsched submit`'s
+`--env` options. They inherit through the container's `/opt/ad-gate/entry.sh`,
+the image entrypoint and `tests/runner.sh` to membership-load, and the launcher
+forwards them into its clean environment. This adds no host `/ci` forwarding
+option for `SR8_MEMBER_CPU`.
+
+Sampling starts just before the case's original burst and ends after both
+the burst and ordered writes finish, requesting observations every 10 ms and
+reporting the sampler's own CPU and actual sample gaps. The first observation
+precedes readiness, and SIGTERM requests a final observation; the sampler runs
+through `burst-driver.sh`'s `member-cpu` command in `shard/driver`, with its
+actual placement reported when the launcher is absent and it runs in place.
+
+Readiness and shutdown each use a 5 s elapsed deadline from Bash's `SECONDS`,
+subject to the final poll and scheduling delay. Cleanup sends TERM, then
+best-effort KILL and reaps a stuck observer; failure remains nonfatal and prints
+`recorded: sr8 member-cpu unavailable reason=<word>`.
+
+The case's OUT directory holds mode-0600 `member-cpu.jsonl`,
+`member-cpu.summary` and `member-cpu.ready`; `member-cpu.log` is created under
+umask 077, and `member-cpu-cgroup` is separate from the burst's verdict record.
+Normal summaries have at most 38 `recorded: sr8 member-cpu …` lines (39 with
+the timeout diagnostic), and the shell relays at most 40 lines from that log.
+
+These files share scenario scratch's lifetime; the printed summary remains
+in the script log, with no additional artifact retention. The sampler changes
+no verdict; see [Thread Memory performance runs](../docs/testing-guide.md#thread-memory-performance-runs)
+for bracketed counters, coverage and qualified CPU-share interpretation.
 
 ### Real Claude gate and heavy legs
 

@@ -546,8 +546,8 @@
  * Post Hold and N4 STRICT limits and the membership hang request duration D-A;
  * each prints signed excess and allowance always.
  */
-import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, statSync, statfsSync, openSync, readSync, closeSync, constants as fsConstants } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { existsSync, readFileSync, readlinkSync, writeFileSync, appendFileSync, mkdirSync, statSync, statfsSync, openSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs'
+import { basename, join, resolve } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { cpus } from 'node:os'
 import { isDeepStrictEqual } from 'node:util'
@@ -2809,9 +2809,250 @@ function conditions(args: string[]) {
   const cpu = mark === undefined ? '' : ` ${cpuConditionFields(cgroupCpuMax(server), textFile(mark), cgroupCpuStat(server))}`
   console.log(`recorded: sr8 conditions bun=${Bun.version} cpus=${cpus().length} memory_limit=${memory} fs_type=${statfsSync(state).type} state_dir_mount=${mount} peak_rss_kib=${peak}${cpu}`)
 }
+/** `member-cpu <case-kind> <out> <server-pid> <slack-pid> <case-root> <max-ms> <P> <Q>`:
+ * 10 ms threaded-cgroup observations until SIGTERM (final sample) or the cap.
+ * Requires CSCB_TEST_DIAGNOSTICS=1 and SR8_MEMBER_CPU=all or an exact case list.
+ * Diagnostic only: no member-CPU observation participates in an SR-8 verdict. */
+export interface MemberCpuThread {
+  tid: number; tgid: number; start_ticks: number; comm: string; label: string; cpu_ns: number
+}
+export interface MemberCpuSample {
+  /** Scan start/end, bracketing both cpu.stat reads and the thread scan. */
+  at_ms: number; end_ms: number; sampler_cgroup: string; target_cgroup: string
+  counters: { usage_usec: number; nr_periods: number; nr_throttled: number; throttled_usec: number } | null
+  after_counters: MemberCpuSample['counters']
+  threads: MemberCpuThread[]; skipped_tids: number; skipped_files: number
+}
+export interface MemberCpuPaths {
+  proc: string; cgroup: string; server: number; slackStub: number; personas: Record<string, string>
+  clock?: () => number; readCpuStat?: (path: string) => string
+}
+export function memberCpuEnabled(diagnostics: string | undefined, selected: string | undefined, kind: string): boolean {
+  return diagnostics === '1' && (selected === 'all' || !!selected?.split(',').includes(kind))
+}
+function memberCpuWord(value: string): string { return basename(value).replace(/[^A-Za-z0-9_.:-]/g, '_').slice(0, 96) || 'unknown' }
+/** No argv, environment, cwd or executable path is returned: only bounded basenames. */
+export function memberCpuLabel(tgid: number, comm: string, exe: string, arg1: string, cwd: string, paths: Pick<MemberCpuPaths, 'server' | 'slackStub' | 'personas'>): string {
+  if (tgid === paths.server) return 'server'
+  if (tgid === paths.slackStub) return 'slack-stub'
+  const name = Object.entries(paths.personas).find(([, dir]) => dir === cwd)?.[0]
+  if (name && ['claude', 'stub-claude.sh', 'stub-mcp-session.ts'].includes(basename(arg1)))
+    return `persona:${memberCpuWord(name)}:${basename(arg1) === 'stub-mcp-session.ts' ? 'mcp' : 'session'}:${tgid}`
+  return `other:${memberCpuWord(comm)}:${memberCpuWord(exe)}:${memberCpuWord(arg1)}`
+}
+/** Paths are injectable for fake proc/cgroup trees. Missing or racing files are counted, never fatal. */
+export function memberCpuSample(paths: MemberCpuPaths, atMs: number): MemberCpuSample {
+  let skippedFiles = 0, skippedTids = 0
+  const read = (path: string) => { try { return readFileSync(path, 'utf8') } catch { skippedFiles++; return undefined } }
+  const link = (path: string) => { try { return readlinkSync(path) } catch { skippedFiles++; return '' } }
+  const target = cgroupPathOf(read(join(paths.proc, String(paths.server), 'cgroup')))
+  const own = cgroupPathOf(read(join(paths.proc, 'self/cgroup'))) ?? 'unknown'
+  const names = ['usage_usec', 'nr_periods', 'nr_throttled', 'throttled_usec'] as const
+  const readCounters = (): MemberCpuSample['counters'] => {
+    let text: string | undefined
+    if (target !== undefined) {
+      const file = join(paths.cgroup, target, 'cpu.stat')
+      if (paths.readCpuStat) { try { text = paths.readCpuStat(file) } catch { skippedFiles++ } }
+      else text = read(file)
+    }
+    const raw = cgroupCpuCounters(text)
+    return raw && names.every(n => nonnegative(raw[n]))
+      ? Object.fromEntries(names.map(n => [n, raw[n]])) as NonNullable<MemberCpuSample['counters']> : null
+  }
+  const counters = readCounters()
+  const tids = target === undefined ? undefined : read(join(paths.cgroup, target, 'cgroup.threads'))
+  const threads: MemberCpuThread[] = [], metadata = new Map<number, { exe: string; arg1: string; cwd: string }>()
+  for (const token of new Set(tids?.trim().split(/\s+/).filter(Boolean) ?? [])) {
+    if (!/^[1-9][0-9]*$/.test(token)) { skippedTids++; continue }
+    const dir = join(paths.proc, token), status = read(join(dir, 'status')), comm = read(join(dir, 'comm'))
+    const sched = read(join(dir, 'schedstat')), stat = read(join(dir, 'stat'))
+    const tgid = Number(status?.match(/^Tgid:\s+(\d+)$/m)?.[1]), ns = Number(sched?.trim().split(/\s+/)[0])
+    const start = stat?.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)[19]
+    if (!positive(tgid) || !comm || !sched || !stat || !start || !nonnegative(ns) || !nonnegative(Number(start))) { skippedTids++; continue }
+    let meta = metadata.get(tgid)
+    if (!meta) {
+      const processDir = join(paths.proc, String(tgid))
+      meta = { exe: link(join(processDir, 'exe')), cwd: link(join(processDir, 'cwd')),
+        arg1: read(join(processDir, 'cmdline'))?.split('\0', 2)[1] ?? '' }
+      metadata.set(tgid, meta)
+    }
+    threads.push({ tid: Number(token), tgid, start_ticks: Number(start), comm: memberCpuWord(comm.trim()), cpu_ns: ns,
+      label: memberCpuLabel(tgid, comm.trim(), meta.exe, meta.arg1, meta.cwd, paths) })
+  }
+  const after_counters = readCounters(), endMs = (paths.clock ?? (() => performance.now()))()
+  return { at_ms: atMs, end_ms: endMs, sampler_cgroup: own, target_cgroup: target ?? 'unknown', counters, after_counters, threads,
+    skipped_tids: skippedTids, skipped_files: skippedFiles }
+}
+/** Whole-window accounting bridges missing observations; classification never does.
+ * Thread reads lie between each scan's two counters, so scoped usage is bounded,
+ * not silently treated as atomic. Shares always use cgroup usage, never label sums. */
+export function memberCpuSummary(samples: MemberCpuSample[], ownCpuMs: number, kind: string): string[] {
+  const prefix = `recorded: sr8 member-cpu case=${memberCpuWord(kind)}`
+  if (!samples.length) return [`${prefix} unavailable reason=no-samples`]
+  type Counter = NonNullable<MemberCpuSample['counters']>
+  const valid = (c: MemberCpuSample['counters']): c is Counter => !!c && Object.values(c).every(nonnegative)
+  const monotone = (a: Counter, b: Counter) => (Object.keys(a) as (keyof Counter)[]).every(k => b[k] >= a[k])
+  const difference = (a: MemberCpuSample['counters'], b: MemberCpuSample['counters'], key: keyof Counter = 'usage_usec') =>
+    valid(a) && valid(b) && monotone(a, b) ? (b[key] - a[key]) / 1000 : null
+  const first = samples[0], last = samples.at(-1)!, group = (scope: string) => ({
+    scope, usage: null as number | null, inner: null as number | null, throttled: null as number | null,
+    intervals: 0, labels: new Map<string, number>(), bounds: true, qualified: false,
+  })
+  const all = group('all'), throttled = group('throttled'), unthrottled = group('unthrottled'), ambiguous = group('ambiguous')
+  const groups = [all, throttled, unthrottled, ambiguous]
+  const points = samples.flatMap((s, index) => [
+    { at: s.at_ms, c: s.counters, index, path: s.target_cgroup },
+    { at: s.end_ms, c: s.after_counters, index, path: s.target_cgroup },
+  ]).filter(p => valid(p.c) && finite(p.at) && p.path !== 'unknown')
+  const target = points[0]?.path ?? first.target_cgroup, same = points.filter(p => p.path === target)
+  const begin = same[0], end = same.at(-1)
+  const window = !!begin && !!end && end.at > begin.at && same.every((p, n) => n === 0
+    || p.at >= same[n - 1].at && monotone(same[n - 1].c!, p.c!))
+  if (window) {
+    all.usage = difference(begin!.c, end!.c); all.throttled = difference(begin!.c, end!.c, 'throttled_usec')
+    const a = samples[begin!.index], b = samples[end!.index]
+    all.inner = a.end_ms <= b.at_ms ? difference(a.after_counters, b.counters) : null
+    all.bounds = valid(a.counters) && valid(b.after_counters) && all.inner !== null
+      && begin!.index === 0 && end!.index === samples.length - 1 && samples.every(s => s.target_cgroup === target)
+  } else all.bounds = false
+  const identity = (t: MemberCpuThread) => `${t.tid}:${t.tgid}:${t.start_ticks}`
+  const histories = new Map<string, { first: MemberCpuThread; last: MemberCpuThread; from: number; to: number; count: number; bad: boolean }>()
+  for (const [n, s] of samples.entries()) {
+    if (s.target_cgroup !== target) continue
+    for (const t of s.threads) {
+      const h = histories.get(identity(t))
+      if (!h) histories.set(identity(t), { first: t, last: t, from: n, to: n, count: 1, bad: false })
+      else { h.bad ||= t.cpu_ns < h.last.cpu_ns; h.last = t; h.to = n; h.count++ }
+    }
+  }
+  const add = (labels: Map<string, number>, label: string, ms: number) => labels.set(label, (labels.get(label) ?? 0) + ms)
+  let partial = 0
+  for (const h of histories.values()) {
+    if (h.bad || h.count < 2 || h.from !== (begin?.index ?? 0) || h.to !== (end?.index ?? samples.length - 1)) partial++
+    if (!h.bad && h.count >= 2) add(all.labels, h.last.label, (h.last.cpu_ns - h.first.cpu_ns) / 1e6)
+  }
+  const coverage: [number, number][] = []
+  let maxGap = 0, skippedIntervals = 0, unmatched = 0
+  for (let n = 1; n < samples.length; n++) {
+    const a = samples[n - 1], b = samples[n]
+    maxGap = Math.max(maxGap, b.at_ms - a.at_ms)
+    const sequence = [a.counters, a.after_counters, b.counters, b.after_counters]
+    if (a.target_cgroup !== target || b.target_cgroup !== target || a.end_ms < a.at_ms || b.end_ms < b.at_ms || b.at_ms < a.end_ms
+      || !sequence.every(valid) || !sequence.every((c, k) => k === 0 || monotone(sequence[k - 1]!, c!))) {
+      skippedIntervals++; continue
+    }
+    coverage.push([a.at_ms, b.end_ms]); all.intervals++
+    // Inner rise proves throttling; no outer rise proves no throttling.
+    // A rise confined to either scan cannot classify the thread-read interval.
+    const g = b.counters!.nr_throttled > a.after_counters!.nr_throttled ? throttled
+      : b.after_counters!.nr_throttled === a.counters!.nr_throttled ? unthrottled : ambiguous
+    g.intervals++; g.usage = (g.usage ?? 0) + difference(a.counters, b.after_counters)!
+    g.inner = (g.inner ?? 0) + difference(a.after_counters, b.counters)!
+    g.throttled = (g.throttled ?? 0) + difference(a.counters, b.after_counters, 'throttled_usec')!
+    const previous = new Map(a.threads.map(t => [identity(t), t]))
+    for (const t of b.threads) {
+      const old = previous.get(identity(t))
+      if (!old || t.cpu_ns < old.cpu_ns) { unmatched++; g.qualified = true; continue }
+      add(g.labels, t.label, (t.cpu_ns - old.cpu_ns) / 1e6)
+    }
+    g.qualified ||= a.threads.length !== b.threads.length
+  }
+  let covered = 0, through = first.at_ms
+  for (const [a, b] of coverage) { const from = Math.max(first.at_ms, a, through), to = Math.min(last.end_ms, b); covered += Math.max(0, to - from); through = Math.max(through, to) }
+  const duration = last.end_ms - first.at_ms, coveragePct = duration > 0 ? 100 * covered / duration : 0
+  all.qualified = coveragePct < 100 || partial > 0 || samples.some(s => s.target_cgroup !== target) || !all.bounds
+  const scans = samples.map(s => s.end_ms - s.at_ms).filter(nonnegative).sort((a, b) => a - b)
+  const fmt = (n: number | null | undefined) => n === null || n === undefined ? 'unavailable' : round3(n)
+  const lines = [`${prefix} window start_ms=${round3(first.at_ms)} end_ms=${round3(last.end_ms)} duration_ms=${round3(duration)}`
+    + ` samples=${samples.length} max_gap_ms=${round3(maxGap)} sampler_cpu_ms=${round3(ownCpuMs)}`
+    + ` sampler_cgroup=${first.sampler_cgroup} target_cgroup=${first.target_cgroup}`
+    + ` skipped_tids=${samples.reduce((n, s) => n + s.skipped_tids, 0)} skipped_files=${samples.reduce((n, s) => n + s.skipped_files, 0)}`
+    + ` skipped_intervals=${skippedIntervals} unmatched_threads=${unmatched} partial_threads=${partial}`
+    + ` coverage_pct=${fmt(coveragePct)} counter_start_ms=${window ? fmt(begin!.at) : 'unavailable'} counter_end_ms=${window ? fmt(end!.at) : 'unavailable'}`
+    + ` max_scan_ms=${fmt(scans.at(-1) ?? 0)} p99_scan_ms=${fmt(scans[Math.max(0, Math.ceil(scans.length * .99) - 1)] ?? 0)}`]
+  for (const g of groups) {
+    if ((g === ambiguous || g === unthrottled) && !g.intervals) continue
+    const sorted = [...g.labels].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])), accounted = sorted.reduce((n, [, ms]) => n + ms, 0)
+    const balance = g.usage === null ? null : g.usage - accounted, innerBalance = g.inner === null ? null : g.inner - accounted
+    const dominanceBounds = g.bounds && balance !== null && balance >= 0
+    // Unattributed CPU could belong to any label, including a new thread of
+    // an already observed member. It is uncertainty, not measured label CPU.
+    const unknownCpu = balance === null ? null : Math.max(0, balance)
+    const qualified = g.qualified || !g.bounds || g.inner !== g.usage || balance !== null && balance !== 0
+    lines.push(`${prefix} scope=${g.scope} intervals=${g.intervals} usage_ms=${fmt(g.usage)} throttled_ms=${fmt(g.throttled)}`
+      + ` unaccounted_ms=${fmt(balance)} inner_usage_ms=${fmt(g.inner)} outer_usage_ms=${fmt(g.usage)} inner_unaccounted_ms=${fmt(innerBalance)}`
+      + ` between_pct=${g.usage !== null && g.usage > 0 && g.inner !== null ? fmt(100 * (g.usage - g.inner) / g.usage) : 'unavailable'} cpu_ms=${fmt(accounted)}`)
+    // Keep the requested all/throttled top ten plus rest; add ambiguous labels.
+    // Unthrottled CPU totals need only one line, keeping the maximum at 38.
+    if (g === unthrottled) continue
+    const top = sorted.slice(0, 10), rest = sorted.slice(10).reduce((n, [, ms]) => n + ms, 0)
+    for (const [rank, [label, ms]] of [...top, ['rest', rest] as [string, number]].entries()) {
+      const share = g.usage === null || g.usage <= 0 ? 'unavailable' : qualified ? 'qualified' : fmt(100 * ms / g.usage)
+      lines.push(`${prefix} scope=${g.scope} rank=${rank + 1} label=${label} cpu_ms=${round3(ms)} share_pct=${share}`
+        // Bound formatting is outward: ordinary rounding could tighten a limit.
+        + (share === 'qualified' ? ` share_min_pct=${dominanceBounds && g.usage! > 0 ? Math.floor(100_000 * ms / g.usage!) / 1000 : 'unavailable'}`
+          + ` share_max_pct=${dominanceBounds && g.inner !== null && g.inner > 0 && unknownCpu !== null ? Math.ceil(100_000 * (ms + unknownCpu) / g.inner) / 1000 : 'unavailable'}` : '')
+        + ` observed_pct=${g.usage !== null && g.usage > 0 ? fmt(100 * ms / g.usage) : 'unavailable'}`)
+    }
+  }
+  return lines
+}
+export interface MemberCpuWindowIo {
+  read(): MemberCpuSample; append(sample: MemberCpuSample): void; ready(): void; cpuMs(): number
+  stopped: Promise<void>; every(callback: () => void, ms: number): () => void
+}
+/** Install stop notification before calling. The final observation is taken after stop, before summary. */
+export async function memberCpuWindow(io: MemberCpuWindowIo, kind: string): Promise<string[]> {
+  const startCpu = io.cpuMs(), samples: MemberCpuSample[] = []
+  const take = () => { const sample = io.read(); io.append(sample); samples.push(sample) }
+  let failed!: (reason: unknown) => void
+  const failure = new Promise<void>((_resolve, reject) => { failed = reject })
+  take()
+  const cancel = io.every(() => { try { take() } catch (error) { failed(error) } }, 10)
+  try {
+    io.ready()
+    await Promise.race([io.stopped, failure])
+    take()
+    return memberCpuSummary(samples, io.cpuMs() - startCpu, kind)
+  } finally { cancel() }
+}
+async function memberCpuCommand(args: string[]): Promise<number> {
+  if (!memberCpuEnabled(process.env.CSCB_TEST_DIAGNOSTICS, process.env.SR8_MEMBER_CPU, args[0] ?? '')) return 0
+  let fd: number | undefined, deadline: ReturnType<typeof setTimeout> | undefined, stop: (() => void) | undefined
+  try {
+    countArgs(args, 8)
+    const [kind, out, server, stub, root, rawMax, ...keys] = args, maxMs = Number(rawMax)
+    if (!/^[a-z-]+$/.test(kind) || ![server, stub].every(s => /^[1-9][0-9]*$/.test(s)) || !positive(maxMs) || maxMs > 600_000
+      || !keys.every(k => /^[a-z0-9_]+$/.test(k)) || !process.env.SCENARIO_ROOT
+      || !resolve(out).startsWith(resolve(process.env.SCENARIO_ROOT) + '/')) throw new Error('arguments')
+    fd = openSync(join(out, 'member-cpu.jsonl'), 'wx', 0o600)
+    const paths: MemberCpuPaths = { proc: '/proc', cgroup: '/sys/fs/cgroup', server: Number(server), slackStub: Number(stub),
+      personas: Object.fromEntries(keys.map(k => [k, join(root, k)])) }
+    let timedOut = false
+    const stopped = new Promise<void>(done => {
+      stop = done; process.once('SIGTERM', done)
+      deadline = setTimeout(() => { timedOut = true; done() }, maxMs)
+    })
+    const lines = await memberCpuWindow({ read: () => memberCpuSample(paths, performance.now()), append: sample => { writeSync(fd!, JSON.stringify(sample) + '\n') },
+      ready: () => { writeFileSync(join(out, 'member-cpu.ready'), String(process.pid), { mode: 0o600, flag: 'wx' }) },
+      cpuMs: () => { const cpu = process.cpuUsage(); return (cpu.user + cpu.system) / 1000 }, stopped,
+      every: (callback, ms) => { const timer = setInterval(callback, ms); return () => clearInterval(timer) },
+    }, kind)
+    if (timedOut) lines.push('recorded: sr8 member-cpu unavailable reason=timeout')
+    writeFileSync(join(out, 'member-cpu.summary'), lines.join('\n') + '\n', { mode: 0o600, flag: 'wx' })
+    for (const line of lines) console.log(line)
+  } catch { console.log('recorded: sr8 member-cpu unavailable reason=sampler') }
+  finally {
+    if (deadline) clearTimeout(deadline)
+    if (stop) process.removeListener('SIGTERM', stop)
+    if (fd !== undefined) closeSync(fd)
+  }
+  return 0
+}
 async function main(args: string[]): Promise<number> {
   if (!existsSync('/etc/cscb-ci-image')) { console.error('FAIL: sr8-evidence requires the CI image'); return 2 }
   const command = args.shift()
+  if (command === 'member-cpu') return memberCpuCommand(args)
   if (command === 'config') { await config(args); return 0 }
   if (command === 'seed') { await seed(args); return 0 }
   if (command === 'plan') { await plan(args); return 0 }

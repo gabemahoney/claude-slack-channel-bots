@@ -1,5 +1,5 @@
 #!/bin/bash
-# burst-driver.sh <record> bun <fixtures>/sr8-evidence.ts burst|fault-burst|fault-recover <arguments>...
+# burst-driver.sh <record> bun <fixtures>/sr8-evidence.ts burst|fault-burst|fault-recover|member-cpu <arguments>...
 #   Runs an SR-8 burst driver off the measured server's CPU quota and exits
 #   with its status. <record> is an absolute path. In a burst-driver shard,
 #   docker/entrypoint.sh starts this script's launcher (--serve) in
@@ -15,7 +15,7 @@
 #   serves only while BUN, this directory and its sr8-evidence.ts are owned
 #   by root and writable by no one else. A request names no program, loader,
 #   directory or search path: the launcher runs BUN itself on this
-#   directory's sr8-evidence.ts with one of the three commands and the
+#   directory's sr8-evidence.ts with one of the four commands and the
 #   request's arguments, unevaluated, from /, with DRIVER_FIXED_ENV and only
 #   the request's DRIVER_ENV fields. Any other request starts nothing and
 #   answers 64.
@@ -34,19 +34,19 @@ TRUSTED_UID=0
 TRUSTED_GID=0
 FIXTURES="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The caller's environment a driver gets: the scenario root (the value
-# printer's scratch fence) and the profiling fields, nothing else.
-DRIVER_ENV=(SCENARIO_ROOT SR8_PHASE_CPU_FILE SR8_PHASE_CPU_PIDS SR8_PROFILE_DIR)
+# printer's scratch fence), profiling fields and the two member sampler gates.
+DRIVER_ENV=(SCENARIO_ROOT SR8_PHASE_CPU_FILE SR8_PHASE_CPU_PIDS SR8_PROFILE_DIR CSCB_TEST_DIAGNOSTICS SR8_MEMBER_CPU)
 # The rest of a driver's environment, the launcher's own: no Bun options,
 # preload, config or .env file can come from the caller.
 DRIVER_FIXED_ENV=(PATH=/usr/local/bin:/usr/bin:/bin HOME=/ BUN_RUNTIME_TRANSPILER_CACHE_PATH=0)
 
 usage() {
-    echo 'usage: burst-driver.sh <record> bun <fixtures>/sr8-evidence.ts burst|fault-burst|fault-recover <arguments>... | --serve <spool>' >&2
+    echo 'usage: burst-driver.sh <record> bun <fixtures>/sr8-evidence.ts burst|fault-burst|fault-recover|member-cpu <arguments>... | --serve <spool>' >&2
     exit 64
 }
 # Only the SR-8 driver commands may run in the driver's group.
 driver_command() {
-    (( $# >= 3 )) && [[ $1 == bun && $2 == "${FIXTURES}/sr8-evidence.ts" && $3 =~ ^(burst|fault-burst|fault-recover)$ ]]
+    (( $# >= 3 )) && [[ $1 == bun && $2 == "${FIXTURES}/sr8-evidence.ts" && $3 =~ ^(burst|fault-burst|fault-recover|member-cpu)$ ]]
 }
 # One forwarded assignment: a DRIVER_ENV name, then =.
 driver_assignment() {

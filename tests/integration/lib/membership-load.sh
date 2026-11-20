@@ -428,6 +428,70 @@ membership_profile_collect() {
 }
 membership_profile_cleanup() { membership_profile_collect "${MEMBERSHIP_PROFILE_CLEANUP_STOP_S}"; }
 
+# Diagnostic only. Off means builtins only: no launcher, file, output or wait.
+MEMBERSHIP_MEMBER_CPU_PID=''
+MEMBERSHIP_MEMBER_CPU_HOOK=0
+membership_member_cpu_enabled() {
+    [[ "${CSCB_TEST_DIAGNOSTICS:-}" == 1 && ( "${SR8_MEMBER_CPU:-}" == all || ",${SR8_MEMBER_CPU:-}," == *",${CASE_KIND},"* ) ]]
+}
+# Builtin elapsed clock; tests can replace this setter without a subprocess.
+membership_member_cpu_clock() {
+    MEMBERSHIP_MEMBER_CPU_NOW="${SECONDS}"
+}
+membership_member_cpu_start() {
+    membership_member_cpu_enabled || return 0
+    local deadline
+    if [[ "${MEMBERSHIP_MEMBER_CPU_HOOK}" == 0 ]]; then
+        on_before_cleanup membership_member_cpu_stop
+        MEMBERSHIP_MEMBER_CPU_HOOK=1
+    fi
+    ( umask 077
+      exec bash "${BURST_DRIVER}" "${OUT}/member-cpu-cgroup" bun "${E}" member-cpu \
+          "${CASE_KIND}" "${OUT}" "${SERVER_PID}" "${STUB_PID}" "${ROOT}" "$((WAIT_MS * 4))" "${KEYS[@]}" \
+          > "${OUT}/member-cpu.log" 2> /dev/null ) &
+    MEMBERSHIP_MEMBER_CPU_PID=$!
+    track_pid "${MEMBERSHIP_MEMBER_CPU_PID}"
+    # Readiness follows the first sample. A broken observer cannot fail a case.
+    membership_member_cpu_clock
+    deadline=$((MEMBERSHIP_MEMBER_CPU_NOW + 5))
+    while (( MEMBERSHIP_MEMBER_CPU_NOW < deadline )); do
+        [[ ! -s "${OUT}/member-cpu.ready" ]] || return 0
+        kill -0 "${MEMBERSHIP_MEMBER_CPU_PID}" 2> /dev/null || break
+        sleep 0.01
+        membership_member_cpu_clock
+    done
+    printf 'recorded: sr8 member-cpu unavailable reason=start\n'
+    membership_member_cpu_stop
+}
+membership_member_cpu_stop() {
+    [[ -n "${MEMBERSHIP_MEMBER_CPU_PID}" ]] || return 0
+    local deadline line printed=0
+    kill -TERM "${MEMBERSHIP_MEMBER_CPU_PID}" 2> /dev/null || :
+    membership_member_cpu_clock
+    deadline=$((MEMBERSHIP_MEMBER_CPU_NOW + 5))
+    while (( MEMBERSHIP_MEMBER_CPU_NOW < deadline )); do
+        kill -0 "${MEMBERSHIP_MEMBER_CPU_PID}" 2> /dev/null || break
+        sleep 0.01
+        membership_member_cpu_clock
+    done
+    if kill -0 "${MEMBERSHIP_MEMBER_CPU_PID}" 2> /dev/null; then
+        kill -KILL "${MEMBERSHIP_MEMBER_CPU_PID}" 2> /dev/null || :
+        printf 'recorded: sr8 member-cpu unavailable reason=stop\n'
+    fi
+    wait "${MEMBERSHIP_MEMBER_CPU_PID}" 2> /dev/null || :
+    MEMBERSHIP_MEMBER_CPU_PID=''
+    if [[ -r "${OUT}/member-cpu.log" ]]; then
+        while IFS= read -r line; do
+            if [[ "${line}" == 'recorded: sr8 member-cpu '* && "${printed}" -lt 40 ]]; then
+                printf '%s\n' "${line}"
+                printed=$((printed + 1))
+            fi
+        done < "${OUT}/member-cpu.log"
+    fi
+    if [[ "${printed}" == 0 ]]; then printf 'recorded: sr8 member-cpu unavailable reason=output\n'; fi
+    return 0
+}
+
 run_membership_load() {
     local group="${2:-}" case_kinds=()
     require_ci_image "membership load"
@@ -630,6 +694,7 @@ PY
                 ;;
         esac
 
+        membership_member_cpu_start
         if [[ "${KIND}" == undurable ]]; then
             bash "${BURST_DRIVER}" "${OUT}/driver-cgroup" bun "${E}" burst "${C[@]}" "${BATCH}" "${SCENARIO_SLACK_STUB_URL}" "${SCENARIO_SLACK_RECORD}" \
                 "${SLACK_STATE_DIR}" "${OUT}" "${WAIT_MS}" "${MEASUREMENTS}" "${MEASURE_MARK}" &
@@ -645,6 +710,7 @@ PY
         # Every network-fault case overlaps these ordered Q writes instead.
         if [[ "${KIND}" != undurable ]]; then ordered_writes; fi
         wait "${BURST_PID}" || fail 'full original burst did not complete'
+        membership_member_cpu_stop
         # The profile ends with the burst and the ordered writes, and its
         # summary prints at once, so a later failing verdict keeps it.
         membership_profile_collect 30

@@ -5,7 +5,7 @@
  * wiring in a stub shell. No scenario or server runs. */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { spawn, spawnSync } from 'node:child_process'
-import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { tmpdir } from 'node:os'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
@@ -13,7 +13,8 @@ import {
   CPU_PROFILE_DIR_ENV, CPU_PROFILE_INTERVAL_US, CPU_PROFILE_LONGEST_CAP_S, CPU_PROFILE_MAX_INTERVAL_US, cpuProfileOptIn, profileCapS, samplingIntervalUs,
   startCpuProfile, summaryLines, summaryReport, type CpuProfile, type ProfilePart, type ProfilerIo,
 } from './integration/fixtures/cpu-profile.ts'
-import { windowsVerdict } from './integration/fixtures/sr8-evidence.ts'
+import { windowsVerdict, memberCpuEnabled, memberCpuLabel, memberCpuSample, memberCpuSummary, memberCpuWindow,
+  type MemberCpuSample, type MemberCpuPaths } from './integration/fixtures/sr8-evidence.ts'
 import { DELIVERY_MAX_AD_CALLS_PER_S } from '../src/delivery-constants.ts'
 import { DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS } from '../src/config.ts'
 
@@ -72,6 +73,393 @@ function imageFixtures(): string {
   return fixtures
 }
 const iso = (ms: number) => new Date(ms).toISOString()
+
+describe('membership member CPU diagnostic (synthetic samples and proc tree)', () => {
+  const sample = (at: number, usage: number, throttled: number, cpu: number[]): MemberCpuSample => ({
+    at_ms: at, end_ms: at, sampler_cgroup: '/shard/driver', target_cgroup: '/shard/server',
+    counters: { usage_usec: usage * 1000, nr_periods: at, nr_throttled: throttled, throttled_usec: throttled * 5000 },
+    after_counters: { usage_usec: usage * 1000, nr_periods: at, nr_throttled: throttled, throttled_usec: throttled * 5000 },
+    threads: cpu.map((ms, n) => ({ tid: n + 1, tgid: n + 1, start_ticks: 1, comm: 'bun',
+      label: n === 0 ? 'server' : n === 1 ? 'slack-stub' : `worker-${n}`, cpu_ns: ms * 1e6 })),
+    skipped_tids: 0, skipped_files: 0,
+  } as MemberCpuSample)
+  const summaryFields = (lines: string[], scope: string, label?: string): Record<string, string> => {
+    const line = lines.find(l => l.includes(` scope=${scope} `) && (label ? l.includes(` label=${label} `) : !l.includes(' rank=')))
+    expect(line).toBeDefined()
+    return Object.fromEntries(line!.split(' ').filter(t => t.includes('=')).map(t => t.split('=')))
+  }
+  const bracket = (at: number, end: number, before: number, after: number, cpu: number[], beforeThr = 0, afterThr = beforeThr) =>
+    Object.assign(sample(at, before, beforeThr, cpu), { end_ms: end,
+      after_counters: { usage_usec: after * 1000, nr_periods: at, nr_throttled: afterThr, throttled_usec: afterThr * 5000 } })
+  test.each(['new-same-label', 'new-other-label', 'disappeared', 'reused'] as const)
+  ('member CPU actual share bounds include unknown CPU (%s)', condition => {
+    const first = sample(0, 0, 0, [0]), last = sample(100, 100, 1, [20])
+    const extra = { ...last.threads[0], tid: 2, cpu_ns: 80e6 }
+    if (condition.startsWith('new')) last.threads.push(condition === 'new-other-label' ? { ...extra, label: 'slack-stub', tgid: 2 } : extra)
+    else {
+      first.threads.push({ ...extra, cpu_ns: condition === 'reused' ? 500e6 : 0 })
+      if (condition === 'reused') last.threads.push({ ...extra, start_ticks: extra.start_ticks + 1 })
+    }
+    const lines = memberCpuSummary([first, last], 1, 'later-rate')
+    for (const scope of ['all', 'throttled']) {
+      expect(summaryFields(lines, scope)).toMatchObject({ usage_ms: '100', cpu_ms: '20', unaccounted_ms: '80' })
+      const server = summaryFields(lines, scope, 'server')
+      // Actual dominance may be 100%, while the measured contribution is 20%.
+      expect(server.share_max_pct).toBe('100')
+      expect(server).toMatchObject({ cpu_ms: '20', observed_pct: '20', share_pct: 'qualified', share_min_pct: '20' })
+      expect(summaryFields(lines, scope, 'rest')).toMatchObject({ cpu_ms: '0', observed_pct: '0', share_min_pct: '0', share_max_pct: '80' })
+    }
+    expect(lines.length).toBeLessThanOrEqual(40)
+  })
+  test('member CPU actual share bounds include unknown CPU even with complete endpoint histories', () => {
+    const lines = memberCpuSummary([sample(0, 0, 0, [0, 0]), sample(100, 100, 1, [20, 30])], 1, 'later-rate')
+    expect(lines[0]).toContain('partial_threads=0')
+    for (const scope of ['all', 'throttled']) {
+      expect(summaryFields(lines, scope)).toMatchObject({ usage_ms: '100', cpu_ms: '50', unaccounted_ms: '50' })
+      expect(summaryFields(lines, scope, 'server')).toMatchObject({ cpu_ms: '20', observed_pct: '20', share_pct: 'qualified', share_min_pct: '20', share_max_pct: '70' })
+      expect(summaryFields(lines, scope, 'slack-stub')).toMatchObject({ cpu_ms: '30', observed_pct: '30', share_min_pct: '30', share_max_pct: '80' })
+      expect(summaryFields(lines, scope, 'rest')).toMatchObject({ observed_pct: '0', share_max_pct: '50' })
+    }
+  })
+  test('member CPU actual share bounds keep observed ratios distinct when all CPU is accounted for', () => {
+    const lines = memberCpuSummary([sample(0, 0, 0, [0, 0]), sample(100, 100, 1, [20, 80])], 1, 'later-rate')
+    for (const scope of ['all', 'throttled']) {
+      expect(summaryFields(lines, scope)).toMatchObject({ usage_ms: '100', cpu_ms: '100', unaccounted_ms: '0' })
+      expect(summaryFields(lines, scope, 'server')).toMatchObject({ cpu_ms: '20', observed_pct: '20', share_pct: '20' })
+      expect(summaryFields(lines, scope, 'server').share_max_pct).toBeUndefined()
+    }
+  })
+  test('member CPU actual share bounds round outward while the observed ratio rounds to nearest', () => {
+    const lines = memberCpuSummary([sample(0, 0, 0, [0, 0]), sample(100, 6, 1, [1, 4])], 1, 'later-rate')
+    for (const scope of ['all', 'throttled']) {
+      expect(summaryFields(lines, scope)).toMatchObject({ usage_ms: '6', cpu_ms: '5', unaccounted_ms: '1' })
+      const server = summaryFields(lines, scope, 'server')
+      expect(server).toMatchObject({ cpu_ms: '1', observed_pct: '16.667', share_pct: 'qualified', share_min_pct: '16.666', share_max_pct: '33.334' })
+      expect(Number(server.share_min_pct)).toBeLessThanOrEqual(100 / 6)
+      expect(Number(server.share_max_pct)).toBeGreaterThanOrEqual(200 / 6)
+    }
+  })
+  test('member CPU accounting repairs: valid/missing/valid retains the full denominator and thread delta, with zero classification coverage', () => {
+    const missing = Object.assign(sample(50, 0, 0, []), { counters: null, after_counters: null })
+    const lines = memberCpuSummary([sample(0, 0, 0, [0]), missing, sample(100, 100, 1, [80])], 1, 'later-rate')
+    expect(summaryFields(lines, 'all')).toMatchObject({ usage_ms: '100', outer_usage_ms: '100', inner_usage_ms: '100', cpu_ms: '80', unaccounted_ms: '20' })
+    expect(lines[0]).toContain('coverage_pct=0')
+    expect(summaryFields(lines, 'all', 'server')).toMatchObject({ cpu_ms: '80', observed_pct: '80', share_pct: 'qualified', share_min_pct: '80', share_max_pct: '100' })
+    expect(summaryFields(lines, 'throttled')).toMatchObject({ intervals: '0', usage_ms: 'unavailable', cpu_ms: '0' })
+    expect(summaryFields(lines, 'throttled', 'rest').share_pct).toBe('unavailable')
+  })
+  test('member CPU accounting repairs: mixed valid/gap intervals keep whole totals separate from known throttling', () => {
+    const missing = Object.assign(sample(50, 0, 0, []), { counters: null, after_counters: null })
+    const lines = memberCpuSummary([sample(0, 0, 0, [0]), sample(25, 20, 0, [15]), missing,
+      sample(75, 80, 1, [60]), sample(100, 100, 2, [80])], 1, 'later-rate')
+    expect(summaryFields(lines, 'all')).toMatchObject({ usage_ms: '100', cpu_ms: '80', unaccounted_ms: '20' })
+    expect(lines[0]).toContain('coverage_pct=50')
+    expect(summaryFields(lines, 'all', 'server')).toMatchObject({ observed_pct: '80', share_pct: 'qualified', share_min_pct: '80', share_max_pct: '100' })
+    expect(summaryFields(lines, 'throttled')).toMatchObject({ intervals: '1', usage_ms: '20', cpu_ms: '20', unaccounted_ms: '0' })
+    expect(summaryFields(lines, 'unthrottled')).toMatchObject({ intervals: '1', usage_ms: '20', cpu_ms: '15', unaccounted_ms: '5' })
+  })
+  test.each([true, false])('member CPU accounting repairs: no valid window has unavailable shares (missing counters=%p)', missing => {
+    const rows = missing ? [0, 10].map(at => Object.assign(sample(at, 0, 0, [0]), { counters: null, after_counters: null })) : [sample(0, 0, 0, [0])]
+    const lines = memberCpuSummary(rows, 0, 'later-rate')
+    expect(summaryFields(lines, 'all')).toMatchObject({ usage_ms: 'unavailable', unaccounted_ms: 'unavailable' })
+    expect(summaryFields(lines, 'all', 'rest').share_pct).toBe('unavailable')
+    expect(lines[0]).toContain('coverage_pct=0')
+  })
+  test('member CPU accounting repairs: 9/29 ms collection skew exposes both brackets, inner over-accounting and qualified shares', () => {
+    const lines = memberCpuSummary([bracket(0, 9, 0, 9, [9]), bracket(10, 29, 10, 29, [29])], 1, 'later-rate')
+    expect(summaryFields(lines, 'all')).toMatchObject({ usage_ms: '29', inner_usage_ms: '1', outer_usage_ms: '29',
+      cpu_ms: '20', unaccounted_ms: '9', inner_unaccounted_ms: '-19', between_pct: '96.552' })
+    expect(lines[0]).toContain('max_scan_ms=19 p99_scan_ms=19')
+    expect(summaryFields(lines, 'all', 'server')).toMatchObject({ observed_pct: '68.966', share_pct: 'qualified', share_min_pct: '68.965', share_max_pct: '2900' })
+  })
+  test.each([false, true])('member CPU outer over-accounting retains diagnostics but withholds dominance bounds (throttled=%p)', isThrottled => {
+    const lines = memberCpuSummary([sample(0, 0, 0, [9]), sample(10, 10, isThrottled ? 1 : 0, [29])], 1, 'later-rate')
+    for (const scope of ['all', ...(isThrottled ? ['throttled'] : [])]) {
+      expect(summaryFields(lines, scope)).toMatchObject({ usage_ms: '10', cpu_ms: '20', unaccounted_ms: '-10', inner_unaccounted_ms: '-10' })
+      expect(summaryFields(lines, scope, 'server')).toMatchObject({ cpu_ms: '20', observed_pct: '200', share_pct: 'qualified',
+        share_min_pct: 'unavailable', share_max_pct: 'unavailable' })
+      // The contradictory scope cannot establish bounds for its other labels either.
+      expect(summaryFields(lines, scope, 'rest')).toMatchObject({ cpu_ms: '0', observed_pct: '0', share_pct: 'qualified',
+        share_min_pct: 'unavailable', share_max_pct: 'unavailable' })
+    }
+  })
+  test('member CPU accounting repairs: a throttling transition inside the scan bracket is ambiguous', () => {
+    const lines = memberCpuSummary([bracket(0, 2, 0, 2, [1], 0, 1), bracket(10, 12, 10, 12, [11], 1, 1)], 1, 'later-rate')
+    expect(summaryFields(lines, 'ambiguous')).toMatchObject({ intervals: '1', usage_ms: '12', inner_usage_ms: '8', cpu_ms: '10', unaccounted_ms: '2' })
+    expect(summaryFields(lines, 'throttled')).toMatchObject({ intervals: '0', usage_ms: 'unavailable', cpu_ms: '0' })
+    expect(lines.some(l => l.includes('scope=unthrottled'))).toBe(false)
+    expect(summaryFields(lines, 'ambiguous', 'server').share_pct).toBe('qualified')
+  })
+  test('member CPU accounting repairs: scan p99 is nearest rank, and all three detailed scopes fit the output cap', () => {
+    const durations = [...Array(98).fill(1), 9, 99]
+    const many = durations.map((ms, n) => bracket(n * 1000, n * 1000 + ms, n * 1000, n * 1000 + ms, [n]))
+    expect(memberCpuSummary(many, 1, 'later-rate')[0]).toContain('max_scan_ms=99 p99_scan_ms=9')
+    const rows = [bracket(0, 2, 0, 2, Array(13).fill(0)), bracket(10, 12, 10, 12, Array(13).fill(1), 1),
+      bracket(20, 22, 20, 22, Array(13).fill(2), 1, 2), bracket(30, 32, 30, 32, Array(13).fill(3), 2),
+      bracket(40, 42, 40, 42, Array(13).fill(4), 2)]
+    const lines = memberCpuSummary(rows, 1, 'later-rate')
+    expect(lines).toHaveLength(38)
+    for (const scope of ['all', 'throttled', 'ambiguous']) expect(lines.filter(l => l.includes(`scope=${scope} `) && l.includes(' rank='))).toHaveLength(11)
+  })
+  function fakeTree(): MemberCpuPaths {
+    const proc = join(root, 'proc'), cgroup = join(root, 'cgroup')
+    mkdirSync(join(proc, 'self'), { recursive: true }); mkdirSync(join(proc, '1'), { recursive: true })
+    mkdirSync(join(cgroup, 'shard/server'), { recursive: true })
+    writeFileSync(join(proc, 'self/cgroup'), '0::/shard/driver\n')
+    writeFileSync(join(proc, '1/cgroup'), '0::/shard/server\n')
+    writeFileSync(join(cgroup, 'shard/server/cpu.stat'), 'usage_usec 3000\nnr_periods 7\nnr_throttled 2\nthrottled_usec 1000\n')
+    writeFileSync(join(cgroup, 'shard/server/cgroup.threads'), '1\n7\n404\n')
+    for (const tid of [1, 7]) {
+      const dir = join(proc, String(tid)); mkdirSync(dir, { recursive: true })
+      writeFileSync(join(dir, 'status'), 'Tgid:\t1\n')
+      writeFileSync(join(dir, 'comm'), 'bun worker\n')
+      writeFileSync(join(dir, 'stat'), `${tid} (bun worker) S ${Array(18).fill('0').join(' ')} 99\n`)
+      writeFileSync(join(dir, 'schedstat'), `${tid * 1000000} 0 0\n`)
+    }
+    symlinkSync('/private/bin/bun', join(proc, '1/exe'))
+    symlinkSync('/private/work', join(proc, '1/cwd'))
+    writeFileSync(join(proc, '1/cmdline'), '/private/bin/bun\0/private/server.ts\0never-record-this-argument\0')
+    return { proc, cgroup, server: 1, slackStub: 2, personas: { alpha: '/private/alpha' } }
+  }
+  test('samples every cgroup TID, using schedstat ns, Tgid, comm and safe labels; vanished TIDs are counted', () => {
+    const row = memberCpuSample(Object.assign(fakeTree(), { clock: () => 14 }), 12)
+    expect(row).toEqual({ at_ms: 12, end_ms: 14, sampler_cgroup: '/shard/driver', target_cgroup: '/shard/server',
+      counters: { usage_usec: 3000, nr_periods: 7, nr_throttled: 2, throttled_usec: 1000 },
+      after_counters: { usage_usec: 3000, nr_periods: 7, nr_throttled: 2, throttled_usec: 1000 },
+      threads: [1, 7].map(tid => ({ tid, tgid: 1, start_ticks: 99, comm: 'bun_worker', label: 'server', cpu_ns: tid * 1000000 })),
+      skipped_tids: 1, skipped_files: 4 })
+    expect(JSON.stringify(row)).not.toContain('private')
+    expect(JSON.stringify(row)).not.toContain('never-record')
+    expect(JSON.stringify(row)).not.toContain(root)
+  })
+  test('member CPU bracket reader takes two distinct counter reads around the scan and records its end clock', () => {
+    const reads: string[] = [], paths = Object.assign(fakeTree(), { clock: () => 19, readCpuStat: (file: string) => {
+      reads.push(file)
+      return readFileSync(file, 'utf8').replace('usage_usec 3000', `usage_usec ${reads.length * 1000}`)
+    } })
+    const row = memberCpuSample(paths, 12)
+    expect(reads).toEqual([join(paths.cgroup, 'shard/server/cpu.stat'), join(paths.cgroup, 'shard/server/cpu.stat')])
+    expect(row).toMatchObject({ at_ms: 12, end_ms: 19, counters: { usage_usec: 1000 }, after_counters: { usage_usec: 2000 } })
+  })
+  test('unreadable cgroup observations stay diagnostic, with skipped files and intervals reported', () => {
+    const paths = Object.assign(fakeTree(), { clock: () => 1 }); rmSync(join(paths.cgroup, 'shard/server/cpu.stat'))
+    const row = memberCpuSample(paths, 1)
+    expect(row.counters).toBeNull(); expect(row.skipped_files).toBe(6)
+    expect(memberCpuSummary([row, Object.assign({}, row, { at_ms: 11, end_ms: 11 })], 2, 'later-rate')[0])
+      .toContain('skipped_tids=2 skipped_files=12 skipped_intervals=1')
+  })
+  test('labels server, Slack stub and each persona session; other labels contain only comm and two basenames', () => {
+    const paths = { server: 1, slackStub: 2, personas: { alpha: '/private/alpha', beta: '/private/beta' } }
+    expect(memberCpuLabel(1, 'bun', '/bin/bun', '/private/server.ts', '/', paths)).toBe('server')
+    expect(memberCpuLabel(2, 'bun', '/bin/bun', '/private/stub.ts', '/', paths)).toBe('slack-stub')
+    expect(memberCpuLabel(3, 'bash', '/bin/bash', '/private/bin/claude', '/private/alpha', paths)).toBe('persona:alpha:session:3')
+    expect(memberCpuLabel(4, 'bash', '/bin/bash', '/private/stub-claude.sh', '/private/beta', paths)).toBe('persona:beta:session:4')
+    expect(memberCpuLabel(5, 'bun', '/bin/bun', '/private/stub-mcp-session.ts', '/private/alpha', paths)).toBe('persona:alpha:mcp:5')
+    expect(memberCpuLabel(6, 'python 3', '/private/bin/python3', '/private/poll.py', '/private/alpha', paths))
+      .toBe('other:python_3:python3:poll.py')
+  })
+  test('whole-window and throttled-only shares use their own cgroup deltas, with window and own CPU reported', () => {
+    const lines = memberCpuSummary([sample(0, 0, 0, [0, 0]), sample(10, 20, 0, [5, 5]), sample(30, 60, 1, [20, 15])], 2.5, 'later-rate')
+    expect(lines[0]).toContain('start_ms=0 end_ms=30 duration_ms=30 samples=3 max_gap_ms=20 sampler_cpu_ms=2.5')
+    expect(lines).toContain('recorded: sr8 member-cpu case=later-rate scope=all intervals=2 usage_ms=60 throttled_ms=5 unaccounted_ms=25 inner_usage_ms=60 outer_usage_ms=60 inner_unaccounted_ms=25 between_pct=0 cpu_ms=35')
+    expect(lines).toContain('recorded: sr8 member-cpu case=later-rate scope=all rank=1 label=server cpu_ms=20 share_pct=qualified share_min_pct=33.333 share_max_pct=75 observed_pct=33.333')
+    expect(lines).toContain('recorded: sr8 member-cpu case=later-rate scope=throttled intervals=1 usage_ms=40 throttled_ms=5 unaccounted_ms=15 inner_usage_ms=40 outer_usage_ms=40 inner_unaccounted_ms=15 between_pct=0 cpu_ms=25')
+    expect(lines).toContain('recorded: sr8 member-cpu case=later-rate scope=throttled rank=1 label=server cpu_ms=15 share_pct=qualified share_min_pct=37.5 share_max_pct=75 observed_pct=37.5')
+    expect(lines).toContain('recorded: sr8 member-cpu case=later-rate scope=throttled rank=2 label=slack-stub cpu_ms=10 share_pct=qualified share_min_pct=25 share_max_pct=62.5 observed_pct=25')
+  })
+  test('top ten plus rest is bounded in both scopes and new/reused TIDs never import earlier CPU', () => {
+    const zero = Array(13).fill(0), end = Array.from({ length: 13 }, (_, n) => n + 1)
+    const lines = memberCpuSummary([sample(0, 0, 0, zero), sample(10, 100, 1, end)], 1, 'first-rate')
+    expect(lines).toHaveLength(25)
+    expect(lines).toContain('recorded: sr8 member-cpu case=first-rate scope=all rank=11 label=rest cpu_ms=6 share_pct=qualified share_min_pct=6 share_max_pct=15 observed_pct=6')
+    expect(lines.filter(l => l.includes('rank='))).toHaveLength(22)
+    const reused = sample(10, 100, 1, [99]); reused.threads[0].start_ticks++
+    const missing = sample(20, 200, 2, []); missing.skipped_tids = 1
+    const report = memberCpuSummary([sample(0, 0, 0, [0]), reused, missing], 1, 'later-rate')
+    expect(report[0]).toContain('skipped_tids=1'); expect(report[0]).toContain('unmatched_threads=1')
+    expect(report.some(l => l.includes('label=server'))).toBe(false)
+  })
+  test('10 ms loop samples before readiness, at ticks and once after stop, cancelling the timer and reporting its CPU', async () => {
+    let at = 0, cpu = 0, tick!: () => void, stop!: () => void, cancelled = 0
+    const rows: MemberCpuSample[] = [], calls: string[] = []
+    const stopped = new Promise<void>(r => { stop = r })
+    const lines = await memberCpuWindow({ read: () => { calls.push('read'); return sample(at++, at, 0, [at]) },
+      append: row => { rows.push(row) }, cpuMs: () => cpu++ * 2, stopped,
+      every: (fn, ms) => { expect(ms).toBe(10); tick = fn; return () => { cancelled++ } },
+      ready: () => { calls.push('ready'); tick(); stop() },
+    }, 'later-rate')
+    expect(calls).toEqual(['read', 'ready', 'read', 'read'])
+    expect(rows).toHaveLength(3); expect(cancelled).toBe(1)
+    expect(lines[0]).toContain('samples=3 max_gap_ms=1 sampler_cpu_ms=2')
+  })
+  test('a failed periodic output cancels sampling and rejects to the CLI diagnostic handler', async () => {
+    let tick!: () => void, cancelled = false, count = 0
+    await expect(memberCpuWindow({ read: () => sample(0, 0, 0, []), append: () => { if (++count > 1) throw new Error('disk') },
+      cpuMs: () => 0, stopped: new Promise(() => {}), every: fn => { tick = fn; return () => { cancelled = true } },
+      ready: () => tick(),
+    }, 'later-rate')).rejects.toThrow('disk')
+    expect(cancelled).toBe(true)
+  })
+  function memberCli(paths: MemberCpuPaths): string {
+    const marker = join(root, 'image'), file = join(root, 'member-evidence.ts')
+    writeFileSync(marker, '')
+    const original = integrationFile('fixtures/sr8-evidence.ts')
+    const procPaths = "proc: '/proc', cgroup: '/sys/fs/cgroup'"
+    const ready = "writeFileSync(join(out, 'member-cpu.ready'), String(process.pid), { mode: 0o600, flag: 'wx' })"
+    for (const text of ["'/etc/cscb-ci-image'", procPaths, ready]) expect(original.split(text)).toHaveLength(2)
+    writeFileSync(file, original.replace("'/etc/cscb-ci-image'", JSON.stringify(marker))
+      .replace(procPaths, `proc: ${JSON.stringify(paths.proc)}, cgroup: ${JSON.stringify(paths.cgroup)}`)
+      .replace(ready, `${ready}; console.log('member-ready')`))
+    return file
+  }
+  test.each(['/shard/driver', '/shard/server'])('CLI takes a final SIGTERM sample and writes mode-600 raw and bounded summary, reporting placement %s', async ownGroup => {
+    const paths = fakeTree(), file = memberCli(paths), out = join(root, 'evidence')
+    mkdirSync(out); writeFileSync(join(paths.proc, 'self/cgroup'), `0::${ownGroup}\n`)
+    const child = spawn(process.execPath, [file, 'member-cpu', 'later-rate', out, '1', '2', root, '5000', 'alpha', 'beta'], {
+      env: hostSafeChildEnv(root, { tools: [], extras: { CSCB_TEST_DIAGNOSTICS: '1', SR8_MEMBER_CPU: 'later-rate', SCENARIO_ROOT: root } }),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = '', stderr = '', ready!: () => void, reject!: (error: Error) => void
+    const started = new Promise<void>((yes, no) => { ready = yes; reject = no })
+    child.stdout!.on('data', b => { stdout += b.toString(); if (stdout.includes('member-ready\n')) ready() })
+    child.stderr!.on('data', b => { stderr += b.toString() })
+    child.on('error', reject)
+    const ended = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(done => {
+      child.on('close', (code, signal) => { if (!stdout.includes('member-ready\n')) reject(new Error('sampler ended before readiness')); done({ code, signal }) })
+    })
+    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('sampler readiness timeout')) }, 5000)
+    try {
+      await started
+      expect(existsSync(join(out, 'member-cpu.ready'))).toBe(true)
+      child.kill('SIGTERM')
+      expect(await ended).toEqual({ code: 0, signal: null }); expect(stderr).toBe('')
+      const rows = readFileSync(join(out, 'member-cpu.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
+      expect(rows.length).toBeGreaterThanOrEqual(2)
+      expect(rows.at(-1).at_ms).toBeGreaterThanOrEqual(rows[0].at_ms)
+      expect(rows.every(r => r.sampler_cgroup === ownGroup && r.threads.length === 2)).toBe(true)
+      expect(statSync(join(out, 'member-cpu.jsonl')).mode & 0o777).toBe(0o600)
+      expect(statSync(join(out, 'member-cpu.summary')).mode & 0o777).toBe(0o600)
+      const summary = readFileSync(join(out, 'member-cpu.summary'), 'utf8')
+      expect(summary.trim().split('\n').length).toBeLessThanOrEqual(40)
+      expect(stdout).toBe('member-ready\n' + summary)
+      expect(summary).toContain(`sampler_cgroup=${ownGroup}`)
+      expect(summary).toMatch(/sampler_cpu_ms=\d+(?:\.\d+)? /)
+      expect(JSON.stringify(rows)).not.toContain('never-record-this-argument')
+    } finally { clearTimeout(timer); if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); await ended }
+  })
+  test('CLI failure is a fixed diagnostic line and exit zero; its disabled gate makes no files', () => {
+    const file = memberCli(fakeTree()), out = join(root, 'does-not-exist')
+    const args = [file, 'member-cpu', 'later-rate', out, '1', '2', root, '5000', 'alpha', 'beta']
+    const off = spawnSync(process.execPath, args, { env: hostSafeChildEnv(root, { tools: [], extras: {
+      SCENARIO_ROOT: root, CSCB_TEST_DIAGNOSTICS: '0', SR8_MEMBER_CPU: 'all',
+    } }), encoding: 'utf8', timeout: 5000 })
+    expect({ status: off.status, stdout: off.stdout, stderr: off.stderr }).toEqual({ status: 0, stdout: '', stderr: '' })
+    expect(existsSync(out)).toBe(false)
+    const failed = spawnSync(process.execPath, args, { env: hostSafeChildEnv(root, { tools: [], extras: {
+      SCENARIO_ROOT: root, CSCB_TEST_DIAGNOSTICS: '1', SR8_MEMBER_CPU: 'all',
+    } }), encoding: 'utf8', timeout: 5000 })
+    expect({ status: failed.status, stdout: failed.stdout, stderr: failed.stderr })
+      .toEqual({ status: 0, stdout: 'recorded: sr8 member-cpu unavailable reason=sampler\n', stderr: '' })
+  })
+  test.each([[undefined, 'all'], ['', 'all'], ['0', 'all'], ['true', 'all'], ['1', undefined], ['1', ''], ['1', 'first-rate'], ['1', 'later-rate-extra']])
+  ('off gate starts no process, writes no file and prints no line (diagnostics=%p selection=%p)', (diagnostics, selection) => {
+    expect(memberCpuEnabled(diagnostics, selection, 'later-rate')).toBe(false)
+    const program = ['set -euo pipefail', "MEMBERSHIP_MEMBER_CPU_PID=''; MEMBERSHIP_MEMBER_CPU_HOOK=0; CASE_KIND=later-rate",
+      'OUT="$HOME/must-not-exist"', 'bash() { echo launcher-request; return 99; }',
+      ...['membership_member_cpu_enabled', 'membership_member_cpu_clock', 'membership_member_cpu_start', 'membership_member_cpu_stop'].map(n => shellFunction(LOAD, n)),
+      'membership_member_cpu_start; membership_member_cpu_stop'].join('\n')
+    const child = spawnSync('bash', ['-c', program], { env: hostSafeChildEnv(root, { tools: ['bash'], extras: {
+      ...(diagnostics === undefined ? {} : { CSCB_TEST_DIAGNOSTICS: diagnostics }), ...(selection === undefined ? {} : { SR8_MEMBER_CPU: selection }),
+    } }), encoding: 'utf8', timeout: 5000 })
+    expect({ status: child.status, stdout: child.stdout, stderr: child.stderr }).toEqual({ status: 0, stdout: '', stderr: '' })
+    expect(readdirSync(root)).toEqual([])
+  })
+  test.each(['all', 'later-rate', 'first-rate,later-rate'])('selects only literal diagnostic opt-in and an exact case: %s', selected => {
+    expect(memberCpuEnabled('1', selected, 'later-rate')).toBe(true)
+  })
+  test.each([false, true])('enabled shell registers cleanup, waits for readiness, stops once and preserves continuation (sampler fails=%p)', fails => {
+    const out = join(root, 'out'); mkdirSync(out)
+    writeFileSync(join(root, 'launcher.sh'), `#!/bin/bash\nexec "$BUN" "$HOME/fake.ts" "$@"\n`)
+    writeFileSync(join(root, 'fake.ts'), `import { writeFileSync } from 'node:fs'
+const [record, , , command, kind, out, ...rest] = process.argv.slice(2);
+writeFileSync(process.env.HOME + '/request', JSON.stringify({ record, command, kind, rest }));
+writeFileSync(record, '/shard/driver\\n');
+if (${fails}) { console.log('recorded: sr8 member-cpu unavailable reason=fake'); process.exit(7) }
+process.on('SIGTERM', () => { console.log('recorded: sr8 member-cpu final'); process.exit(0) });
+writeFileSync(out + '/member-cpu.ready', 'ready');
+setInterval(() => {}, 1000);
+`)
+    const program = ['set -euo pipefail', "MEMBERSHIP_MEMBER_CPU_PID=''; MEMBERSHIP_MEMBER_CPU_HOOK=0; CASE_KIND=later-rate",
+      'OUT="$HOME/out"; ROOT="$HOME"; SERVER_PID=1; STUB_PID=2; WAIT_MS=1000; KEYS=(alpha beta)',
+      'BURST_DRIVER="$HOME/launcher.sh"; E="$HOME/evidence.ts"',
+      'on_before_cleanup() { printf "%s\\n" "$1" > "$HOME/hook"; }',
+      'track_pid() { printf "%s\\n" tracked > "$HOME/tracked"; }',
+      ...['membership_member_cpu_enabled', 'membership_member_cpu_clock', 'membership_member_cpu_start', 'membership_member_cpu_stop'].map(n => shellFunction(LOAD, n)),
+      'membership_member_cpu_start; membership_member_cpu_stop; membership_member_cpu_stop; echo continued'].join('\n')
+    const child = spawnSync('bash', ['-c', program], { env: hostSafeChildEnv(root, { tools: ['bash', 'sleep'], extras: {
+      BUN: process.execPath, CSCB_TEST_DIAGNOSTICS: '1', SR8_MEMBER_CPU: 'later-rate',
+    } }), encoding: 'utf8', timeout: 15000 })
+    expect(child.error).toBeUndefined()
+    expect({ status: child.status, stderr: child.stderr }).toEqual({ status: 0, stderr: '' })
+    expect(child.stdout).toBe(fails ? 'recorded: sr8 member-cpu unavailable reason=start\nrecorded: sr8 member-cpu unavailable reason=fake\ncontinued\n'
+      : 'recorded: sr8 member-cpu final\ncontinued\n')
+    expect(readFileSync(join(root, 'hook'), 'utf8')).toBe('membership_member_cpu_stop\n')
+    expect(readFileSync(join(root, 'tracked'), 'utf8')).toBe('tracked\n')
+    expect(JSON.parse(readFileSync(join(root, 'request'), 'utf8'))).toEqual({ record: join(out, 'member-cpu-cgroup'), command: 'member-cpu', kind: 'later-rate',
+      rest: ['1', '2', root, '4000', 'alpha', 'beta'] })
+    expect(existsSync(join(out, 'driver-cgroup'))).toBe(false)
+    expect(statSync(join(out, 'member-cpu.log')).mode & 0o777).toBe(0o600)
+  })
+  test.each(['start', 'stop'])('member CPU elapsed deadline bounds a stuck %s, kills and reaps without failing the scenario', phase => {
+    mkdirSync(join(root, 'out'))
+    writeFileSync(join(root, 'launcher.sh'), 'exec "$BUN" "$HOME/stuck.ts"\n')
+    writeFileSync(join(root, 'stuck.ts'), 'setInterval(() => {}, 1000)\n')
+    const program = ['set -euo pipefail', "MEMBERSHIP_MEMBER_CPU_PID=''; MEMBERSHIP_MEMBER_CPU_HOOK=0; CASE_KIND=later-rate",
+      'OUT="$HOME/out"; ROOT="$HOME"; SERVER_PID=1; STUB_PID=2; WAIT_MS=1000; KEYS=(alpha beta)',
+      'BURST_DRIVER="$HOME/launcher.sh"; E="$HOME/evidence.ts"; FAKE_SECONDS=0; POLLS=0',
+      'on_before_cleanup() { :; }; track_pid() { :; }',
+      ...['membership_member_cpu_enabled', 'membership_member_cpu_clock', 'membership_member_cpu_start', 'membership_member_cpu_stop'].map(n => shellFunction(LOAD, n)),
+      'membership_member_cpu_clock() { MEMBERSHIP_MEMBER_CPU_NOW="$FAKE_SECONDS"; }',
+      // Every poll costs three elapsed seconds, regardless of the requested sleep.
+      'sleep() { FAKE_SECONDS=$((FAKE_SECONDS + 3)); POLLS=$((POLLS + 1)); }',
+      // Ignore TERM and keep reporting the observer alive; KILL still reaches
+      // the owned inert child. No fake process or blocked child can leak.
+      'kill() { if [[ "$1" == -0 ]]; then return 0; fi; printf "%s at=%s\\n" "$1" "$FAKE_SECONDS" >> "$HOME/signals"; if [[ "$1" == -KILL ]]; then builtin kill "$@" 2>/dev/null || :; fi; }',
+      phase === 'start' ? 'membership_member_cpu_start' : '"$BUN" "$HOME/stuck.ts" > /dev/null 2>&1 & MEMBERSHIP_MEMBER_CPU_PID=$!; membership_member_cpu_stop',
+      'printf "continued clock=%s polls=%s\\n" "$FAKE_SECONDS" "$POLLS"',
+    ].join('\n')
+    const child = spawnSync('bash', ['-c', program], { env: hostSafeChildEnv(root, { tools: ['bash'], extras: {
+      BUN: process.execPath, CSCB_TEST_DIAGNOSTICS: '1', SR8_MEMBER_CPU: 'all',
+    } }), encoding: 'utf8', timeout: 5000 })
+    expect(child.error).toBeUndefined(); expect(child.status).toBe(0)
+    expect(child.stdout).toContain(phase === 'start' ? 'continued clock=12 polls=4\n' : 'continued clock=6 polls=2\n')
+    expect(child.stdout).toContain('recorded: sr8 member-cpu unavailable reason=stop\n')
+    if (phase === 'start') expect(child.stdout).toContain('recorded: sr8 member-cpu unavailable reason=start\n')
+    expect(readFileSync(join(root, 'signals'), 'utf8')).toBe(phase === 'start' ? '-TERM at=6\n-KILL at=12\n' : '-TERM at=0\n-KILL at=6\n')
+  })
+  test('wiring pins require presence and order; each in-memory deletion is refused', () => {
+    const markers = ['        membership_member_cpu_start\n', 'bun "${E}" fault-burst',
+      'then ordered_writes; fi', 'wait "${BURST_PID}" || fail', '        membership_member_cpu_stop\n']
+    const pin = (text: string) => {
+      let previous = -1
+      for (const marker of markers) {
+        const at = text.indexOf(marker, previous + 1)
+        expect(at).toBeGreaterThanOrEqual(0); expect(at).toBeGreaterThan(previous); previous = at
+      }
+      expect(text).toContain('on_before_cleanup membership_member_cpu_stop')
+      expect(text).toContain('track_pid "${MEMBERSHIP_MEMBER_CPU_PID}"')
+      expect(text).toContain('"${OUT}/member-cpu-cgroup" bun "${E}" member-cpu')
+      expect(text).toContain('wait "${MEMBERSHIP_MEMBER_CPU_PID}" 2> /dev/null || :')
+      expect(text).toContain('kill -TERM "${MEMBERSHIP_MEMBER_CPU_PID}"')
+    }
+    pin(LOAD)
+    for (const marker of [...markers, 'on_before_cleanup membership_member_cpu_stop', 'track_pid "${MEMBERSHIP_MEMBER_CPU_PID}"',
+      '"${OUT}/member-cpu-cgroup" bun "${E}" member-cpu', 'wait "${MEMBERSHIP_MEMBER_CPU_PID}" 2> /dev/null || :', 'kill -TERM "${MEMBERSHIP_MEMBER_CPU_PID}"']) {
+      expect(LOAD).toContain(marker)
+      expect(() => pin(LOAD.replace(marker, ''))).toThrow()
+    }
+  })
+})
 
 describe('cpu-profile summary (synthetic profiles)', () => {
   const server = '(module)@claude-slack-channel-bots/src/server.ts:1', handler = 'handleEvent@claude-slack-channel-bots/src/socket.ts:10'
@@ -1166,7 +1554,7 @@ describe('cpu-profile opt-in', () => {
     expect(shells.filter(f => opted.test(readFileSync(join(integration, f), 'utf8'))).sort())
       .toEqual(['fixtures/burst-driver.sh', 'lib/membership-load.sh', 'test-32-fmk-real-order.sh', 'test-44-fmk-thread-burst.sh', 'test-45-fmk-membership-load.sh'])
     const forwarder = readFileSync(join(integration, 'fixtures/burst-driver.sh'), 'utf8')
-    expect(forwarder.split('\n').filter(line => opted.test(line))).toEqual(['DRIVER_ENV=(SCENARIO_ROOT SR8_PHASE_CPU_FILE SR8_PHASE_CPU_PIDS SR8_PROFILE_DIR)'])
+    expect(forwarder.split('\n').filter(line => opted.test(line))).toEqual(['DRIVER_ENV=(SCENARIO_ROOT SR8_PHASE_CPU_FILE SR8_PHASE_CPU_PIDS SR8_PROFILE_DIR CSCB_TEST_DIAGNOSTICS SR8_MEMBER_CPU)'])
     expect(shells.filter(f => readFileSync(join(integration, f), 'utf8').includes('--cpu-profile')).sort())
       .toEqual(['lib/membership-load.sh', 'test-45-fmk-membership-load.sh'])
     expect(T45.match(/^run_membership_load .*$/gm)).toEqual(['run_membership_load strict hang --cpu-profile first-hang'])
