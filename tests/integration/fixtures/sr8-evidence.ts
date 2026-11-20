@@ -429,10 +429,10 @@
  *     Submit held probes first, admit the independent probes as above; then concurrent
  *     P/Q roots, wait ONLY expected independent ACKs, then concurrent P/Q replies and
  *     drops (including replies to withheld roots). Never await a dependent ACK.
- *     Open mode only (strict refuses it as usage): with tail-release, Q's last
+ *     In both modes, with tail-release, Q's last
  *     SR8_FAULT_TAIL_ITEMS independent replies wait (within wait-ms) until that
  *     file exists; the script creates it after the ordered writes' result mark,
- *     so Q's burst ACKs overlap both marks. Strict submits its second wave at once.
+ *     so Q's burst ACKs overlap both marks. Without it, the second wave is concurrent.
  *     With SR8_PROFILE_DIR set (test-45's profiled case only), `held` (when there
  *     are held probes), `roots` and `replies-drops` are appended to <dir>/waves as
  *     each wave's sends start; the script marks `end` after its ordered writes.
@@ -1338,9 +1338,9 @@ export const SR8_FAULT_TAIL_ITEMS = 8
 export function faultTail(plan: FaultPlan): FaultItem[] {
   return plan.items.filter(i => i.phase === 'replies' && i.key !== plan.key && !i.dependent).slice(-SR8_FAULT_TAIL_ITEMS)
 }
-/** Open mode only: strict keeps its whole second wave concurrent. */
-export function faultTailOption(mode: Context['mode'], plan: FaultPlan, released: () => Promise<boolean>) {
-  return mode === 'open' ? { items: faultTail(plan), released } : undefined
+/** Both modes hold the same independent Q replies for the ordered result mark. */
+export function faultTailOption(_mode: Context['mode'], plan: FaultPlan, released: () => Promise<boolean>) {
+  return { items: faultTail(plan), released }
 }
 export async function faultWaves(items: FaultItem[], send: (item: FaultItem) => Promise<void>, wait: (items: FaultItem[]) => Promise<boolean>,
   admitHeld: (items: FaultItem[]) => Promise<boolean>, tail?: { items: FaultItem[]; released: () => Promise<boolean> },
@@ -1848,7 +1848,7 @@ async function faultPlan(c: Context, args: string[]): Promise<number> {
   return 0
 }
 async function faultBurst(c: Context, args: string[]): Promise<number> {
-  countArgs(args, 7, c.mode === 'open' ? 8 : 7)
+  countArgs(args, 7, 8)
   const [dir, url, stubFile, stateDir, measurement, mark, rawWait, release] = args, waitMs = numeric(rawWait), plan = await readFaultPlan(dir, c)
   if (!/^http:\/\/(127\.0\.0\.1|\[::1\]):\d+$/.test(url) || !positive(waitMs) || !integer(numeric(mark))) throw new Error('usage')
   const payloads = jsonl(join(dir, 'payloads.jsonl'))

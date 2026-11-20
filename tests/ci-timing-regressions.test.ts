@@ -22,7 +22,7 @@ import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVer
   SR8_PENDING_POST_MS, SR8_LARGE_BYTES, SR8_SHARED_CHANNELS, pendingPostVerdicts, sharedListVerdicts,
   scanDiagnostics, membershipFaultVerdicts, membershipFaultRows, cpuThrottle, cpuConditionFields, membershipRepairVerdict, membershipLateVerdict, zeroAckVerdict,
   accountingVerdicts, personaStoreVerdicts, lookupFaultVerdicts, orderedWriteVerdicts, membershipWriteVerdicts,
-  faultLoadVerdicts, faultWaves, faultTail, faultTailOption, postHoldOverlapVerdicts, concurrentOverlapVerdicts, envelopeTimings, type FaultPlan, type FaultPush, type FaultLoadEvidence,
+  faultLoadVerdicts, faultWaves, faultTail, faultTailOption, SR8_FAULT_TAIL_ITEMS, postHoldOverlapVerdicts, concurrentOverlapVerdicts, envelopeTimings, type FaultPlan, type FaultPush, type FaultLoadEvidence,
   type SharedListEvidence, type PendingProbe, type AccountedEvent, type LookupProbe,
   burstAckVerdicts, pendingBurstVerdict, type BurstItem, type PendingWindow,
   SR8_DIAGNOSTIC_KINDS, SR8_USER_HZ, cgroupCpuCounters, procCpuTicks, phasePids, phaseCpuSample, phaseCpuResults, ackClockSamples, ackClockResults,
@@ -3653,6 +3653,53 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
     expect(stopped).toEqual(withHeld ? ['held'] : ['roots'])
     expect(await faultWaves(items, async () => {}, async () => true, async () => true)).toBe(true)
   })
+  test.each([['strict', false], ['strict', true], ['open', false], ['open', true]] as const)
+  ('ordered writes release the tail after the result mark, or abort without an early release (%s, failed=%p)', (mode, failed) => {
+    const result = shell([
+      `MODE=${mode}; BAD=${failed ? 1 : 0}`,
+      'OUT="$HOME"; WRITES="$HOME/writes"; mkdir "$WRITES"; Q=beta; ROOT="$HOME"; CONFIG="$HOME/config"',
+      'WRITE_CHANNEL=C0WRITE; WRITE_TOOL=fixture; WAIT_S=1; CASE_MARK=0; CASE=fixture',
+      'trap \'if [[ -f "$OUT/tail-release" ]]; then echo release=yes; else echo release=no; fi\' EXIT',
+      'membership_writes() { [[ ! -e "$OUT/tail-release" ]] || fail early-release; [[ "$BAD" == 0 ]] || fail "write failed"; WRITE_RESULT=2; }',
+      'read_jsonl() { if [[ "$1" == */after.jsonl ]]; then [[ -f "$OUT/tail-release" && "$WRITE_RESULT" == 2 ]] || fail result-order; fi; }',
+      'wait_until() { :; }',
+      'slack_post_mark() { [[ ! -e "$OUT/tail-release" ]] || fail early-release; printf 2; }',
+      'scenario_attempt_id() { printf id; }', 'attempt_args() { printf "{}"; }',
+      'stub_session_submit() { printf id; }',
+      'stub_session_result() { [[ "$BAD" == 0 ]] || fail "write failed"; printf \'{"isError":false,"text":"expected"}\'; }',
+      'printed() { printf expected; }',
+      declaration(source('lib/membership-load.sh'), 'ordered_writes'),
+      'ordered_writes; printf "result=%s\\n" "$WRITE_RESULT"',
+    ].join('\n'))
+    expect(result.status).toBe(failed ? 1 : 0)
+    expect(result.stdout).toBe(failed ? 'release=no\n' : 'result=2\nrelease=yes\n')
+    expect(result.stderr).toBe(failed ? 'write failed\n' : '')
+  })
+  test.each([null, 'bun "${E}" fault-burst', 'BURST_PID=$!', 'track_pid "${BURST_PID}"', 'then ordered_writes; fi'])
+  ('fault-burst receives the release file in both modes and is tracked before ordered writes can fail (removed marker=%p)', removed => {
+    const original = source('lib/membership-load.sh')
+    const pin = (load: string) => {
+      expect(load).not.toContain('TAIL_RELEASE=')
+      const burst = load.indexOf('bun "${E}" fault-burst')
+      expect(burst).toBeGreaterThanOrEqual(0)
+      const pid = load.indexOf('BURST_PID=$!', burst)
+      expect(pid).toBeGreaterThanOrEqual(0)
+      expect(burst).toBeLessThan(pid)
+      expect(load.slice(burst, pid)).toContain('"${MEASURE_MARK}" "${WAIT_MS}" "${OUT}/tail-release"')
+      const tracked = load.indexOf('track_pid "${BURST_PID}"'), writes = load.indexOf('then ordered_writes; fi')
+      expect(tracked).toBeGreaterThanOrEqual(0)
+      expect(writes).toBeGreaterThanOrEqual(0)
+      expect(tracked).toBeLessThan(writes)
+    }
+    if (removed === null) pin(original)
+    else {
+      expect(original).toContain(removed)
+      const mutated = original.replace(removed, '')
+      expect(mutated).not.toContain(removed)
+      expect(() => pin(mutated)).toThrow()
+    }
+  })
+
   test.each([true, false])('fault waves hold Q\'s tail until released (released=%p), keeping the whole burst', async released => {
     const plan = composed().plan, tail = faultTail(plan), calls: string[] = [], sent = new Set<number>()
     expect(tail.length).toBeGreaterThan(0)
@@ -3666,7 +3713,7 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
     expect(calls.indexOf('tail')).toBeGreaterThan(calls.indexOf('release'))
     expect(calls.filter(s => s === 'tail')).toHaveLength(tail.length)
   })
-  test.each(['strict', 'open'] as const)('%s fault waves with a non-tail send held: only open withholds Q\'s tail', async mode => {
+  test.each(['strict', 'open'] as const)('%s fault waves with a non-tail send held: both modes withhold Q\'s tail', async mode => {
     const plan = composed().plan, tail = new Set(faultTail(plan).map(i => i.ordinal))
     const second = plan.items.filter(i => !['roots', 'held'].includes(i.phase)), stuck = second.find(i => !tail.has(i.ordinal))!
     const submitted = new Set<number>()
@@ -3680,11 +3727,11 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
     }, async () => true, async () => true, option)
     await started; await new Promise(r => setTimeout(r, 0))
     const before = second.filter(i => submitted.has(i.ordinal)).length
-    if (mode === 'strict') expect(before).toBe(second.length)
-    else expect(before).toBe(second.length - tail.size)
+    expect(before).toBe(second.length - tail.size)
     resolve()
     expect(await done).toBe(true); expect(submitted.size).toBe(plan.items.length)
-    expect(option === undefined).toBe(mode === 'strict')
+    expect(option?.items).toEqual(faultTail(plan))
+    expect(option?.items).toHaveLength(SR8_FAULT_TAIL_ITEMS)
   })
   test.each(['during', 'before', 'after', 'slow-ack', 'missing-admission', 'missing-resolution'] as const)('Post Hold overlap %s', where => {
     const hold = { key: 'alpha', seq: 1 }, ordinary = [{ key: 'alpha', seq: 2, envelope_id: 'ordinary' }]
@@ -4143,7 +4190,7 @@ globalThis.fetch = async (_url, init) => {
         + ` limit=>=${roots} verdict=${kept ? 'pass' : 'fail'}`
     }))
   }))
-  test('fault CLI declares plan-derived dependencies and sends both waves without withheld ACKs', () => withCLI((root, cli) => {
+  test.each([false, true])('fault CLI declares plan-derived dependencies and sends both waves without withheld ACKs (tail release=%p)', withTail => withCLI((root, cli) => {
     const e = composed(), batch = join(root, 'batches'), out = join(root, 'e'), state = join(root, 'state')
     mkdirSync(batch); mkdirSync(join(state, 'queue'), { recursive: true })
     const payloads = e.plan.items.map(i => ({ label: i.key, event: { channel: i.channel, ts: i.ts, user: i.sender, ...(i.root === '-' ? {} : { thread_ts: i.root }) } }))
@@ -4153,8 +4200,16 @@ globalThis.fetch = async (_url, init) => {
     expect(cli('fault-plan', [batch, join(root, 'plan.tsv'), 'hang', '1', '1', out]).status).toBe(0)
     const declared = JSON.parse(readFileSync(join(out, 'fault-plan.json'), 'utf8')).plan
     expect(declared.items.map((i: any) => i.dependent)).toEqual(e.plan.items.map(i => i.dependent))
-    expect(cli('fault-burst', [out, 'http://127.0.0.1:1', join(root, 'stub'), state, join(root, 'measurements'), '0', '100', join(root, 'tail-release')]).status).toBe(64)
-    expect(cli('fault-burst', [out, 'http://127.0.0.1:1', join(root, 'stub'), state, join(root, 'measurements'), '0', '100']).status).toBe(0)
+    expect(existsSync(join(root, 'tail-release'))).toBe(false)
+    expect(cli('fault-burst', [out, 'http://127.0.0.1:1', join(root, 'stub'), state, join(root, 'measurements'), '0', '100',
+      ...(withTail ? [join(root, 'tail-release')] : [])]).status).toBe(0)
+    if (withTail) {
+      const tail = e.plan.items.filter(i => i.phase === 'replies' && i.key !== e.plan.key && !i.dependent).slice(-SR8_FAULT_TAIL_ITEMS)
+      const trace = readFileSync(join(root, 'tail-trace'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
+      expect(tail).toHaveLength(SR8_FAULT_TAIL_ITEMS)
+      expect(trace[0]).toEqual({ event: 'release', pushed: e.plan.items.length - tail.length })
+      expect(trace.slice(1)).toEqual(tail.map(i => ({ event: 'tail', ordinal: i.ordinal, released: true })))
+    }
     const ledger = readFileSync(join(out, 'fault-ledger.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
     expect(ledger).toHaveLength(e.plan.items.length)
     expect(ledger[0].ordinal).toBe(e.plan.items.find(i => i.phase === 'held')!.ordinal)
@@ -4195,12 +4250,29 @@ globalThis.fetch = async (_url, init) => {
 // The profile opt-in is set only when the test asks.
 { const base = resolve(import.meta.dir, '../../..'); mkdirSync(join(base, 'profile'), { recursive: true });
   if (existsSync(join(base, 'profile-on'))) process.env.SR8_PROFILE_DIR = join(base, 'profile') }
-let transportPlan;
+let transportPlan, releaseScheduled = false;
+const submitted = new Set();
 globalThis.fetch = async (_url, init) => {
   const base = resolve(import.meta.dir, '../../..'), dir = join(base, 'e');
   const plan = transportPlan ??= JSON.parse(readFileSync(join(dir, 'fault-plan.json'), 'utf8')).plan;
   const b = JSON.parse(init.body), i = plan.items.find(i => i.key === b.label && i.channel === b.event.channel && i.ts === b.event.ts);
   const id = 'original-' + i.ordinal;
+  const releaseFile = join(base, 'tail-release'), trace = join(base, 'tail-trace');
+  const withTail = process.argv[2] === 'fault-burst' && process.argv.at(-1) === releaseFile;
+  const tail = plan.items.filter(i => i.phase === 'replies' && i.key !== plan.key && !i.dependent).slice(-SR8_FAULT_TAIL_ITEMS);
+  if (withTail && tail.some(t => t.ordinal === i.ordinal)) {
+    const released = existsSync(releaseFile);
+    appendFileSync(trace, JSON.stringify({ event: 'tail', ordinal: i.ordinal, released })+'\\n');
+    if (!released) return Response.json({ok:false}, {status:409});
+  }
+  submitted.add(i.ordinal);
+  if (withTail && !releaseScheduled && submitted.size === plan.items.length - tail.length) {
+    releaseScheduled = true;
+    setImmediate(() => {
+      appendFileSync(trace, JSON.stringify({ event: 'release', pushed: submitted.size })+'\\n');
+      writeFileSync(releaseFile, '');
+    });
+  }
   appendFileSync(join(base,'stub'), JSON.stringify({event:'push',label:i.key,channel:i.channel,event_ts:i.ts,envelope_id:id})+'\\n');
   if (!i.dependent) appendFileSync(join(base,'stub'),JSON.stringify({event:'ws-message',envelope_id:id})+'\\n');
   if (i.phase === 'held') {

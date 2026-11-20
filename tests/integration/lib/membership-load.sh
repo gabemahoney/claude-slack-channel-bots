@@ -222,7 +222,8 @@ applied_events() {
 # acknowledged only once durable, and requests a fresh scan. Q's inventory is
 # staged to agree before each event, without a control replacement that would
 # reset P's fault counters inside the burst, and that scan settles before the
-# state is read or the inventory changes again.
+# state is read or the inventory changes again. WRITE_RESULT is marked after
+# the join ACK; ordered_writes then releases Q's withheld reply tail.
 membership_writes() {
     local kind type ids envelope event mark channel
     local -a absent=()
@@ -265,29 +266,32 @@ with open(source) as rows, open(out,'w') as target:
 PY
 }
 
-# Open mode's fault-burst holds Q's last replies until the release file exists;
-# created after WRITE_RESULT, Q's burst ACKs continue past both write marks.
+# Both modes' fault-burst holds Q's last independent replies until this file
+# is created after WRITE_RESULT, so Q's burst ACKs pass both write marks.
 ordered_writes() {
     local delivery attempt args id result expected
-    if [[ "${MODE}" == strict ]]; then membership_writes; return; fi
-    read_jsonl "${WRITES}/before.jsonl" shared_attempt_order "${Q}"
-    wait_until "${WAIT_S}" 'burst has no observed push' has_record_since "${CASE_MARK}" push "label=${Q}"
-    WRITE_SUBMIT="$(slack_post_mark)"
-    for delivery in all mentions; do
-        attempt="$(scenario_attempt_id "${CASE}-ordered-${delivery}")"
-        args="$(attempt_args "${attempt}" "${WRITE_CHANNEL}" "${delivery}")"
-        id="$(stub_session_submit "${ROOT}/${Q}" "${WRITE_TOOL}" "${args}")"
-        result="$(stub_session_result "${ROOT}/${Q}" "${id}")"
-        printf '%s\n' "${result}" >> "${WRITES}/results.jsonl"
-        expected="$(printed channelDeliveryAttemptResultText "${CONFIG}" "${CONFIG}.last-applied" \
-            "${Q}" "${WRITE_CHANNEL}" "${delivery}" "${attempt}" new "${delivery}")"
-        jq -e --arg expected "${expected}" '.isError==false and (has("error")|not) and .text==$expected' \
-            <<< "${result}" > /dev/null || fail 'ordered write result differs from production text'
-        printf '%s\t%s\n' "${WRITE_CHANNEL}" "${delivery}" >> "${WRITES}/expected.tsv"
-    done
-    WRITE_RESULT="$(slack_post_mark)"
+    if [[ "${MODE}" == strict ]]; then
+        membership_writes
+    else
+        read_jsonl "${WRITES}/before.jsonl" shared_attempt_order "${Q}"
+        wait_until "${WAIT_S}" 'burst has no observed push' has_record_since "${CASE_MARK}" push "label=${Q}"
+        WRITE_SUBMIT="$(slack_post_mark)"
+        for delivery in all mentions; do
+            attempt="$(scenario_attempt_id "${CASE}-ordered-${delivery}")"
+            args="$(attempt_args "${attempt}" "${WRITE_CHANNEL}" "${delivery}")"
+            id="$(stub_session_submit "${ROOT}/${Q}" "${WRITE_TOOL}" "${args}")"
+            result="$(stub_session_result "${ROOT}/${Q}" "${id}")"
+            printf '%s\n' "${result}" >> "${WRITES}/results.jsonl"
+            expected="$(printed channelDeliveryAttemptResultText "${CONFIG}" "${CONFIG}.last-applied" \
+                "${Q}" "${WRITE_CHANNEL}" "${delivery}" "${attempt}" new "${delivery}")"
+            jq -e --arg expected "${expected}" '.isError==false and (has("error")|not) and .text==$expected' \
+                <<< "${result}" > /dev/null || fail 'ordered write result differs from production text'
+            printf '%s\t%s\n' "${WRITE_CHANNEL}" "${delivery}" >> "${WRITES}/expected.tsv"
+        done
+        WRITE_RESULT="$(slack_post_mark)"
+    fi
     : > "${OUT}/tail-release"
-    read_jsonl "${WRITES}/after.jsonl" shared_attempt_order "${Q}"
+    if [[ "${MODE}" == open ]]; then read_jsonl "${WRITES}/after.jsonl" shared_attempt_order "${Q}"; fi
 }
 
 membership_settled_twice() {
@@ -630,12 +634,10 @@ PY
             bash "${BURST_DRIVER}" "${OUT}/driver-cgroup" bun "${E}" burst "${C[@]}" "${BATCH}" "${SCENARIO_SLACK_STUB_URL}" "${SCENARIO_SLACK_RECORD}" \
                 "${SLACK_STATE_DIR}" "${OUT}" "${WAIT_MS}" "${MEASUREMENTS}" "${MEASURE_MARK}" &
         else
-            # Strict keeps its whole second wave concurrent: no tail release.
-            TAIL_RELEASE=()
-            if [[ "${MODE}" == open ]]; then TAIL_RELEASE=("${OUT}/tail-release"); fi
+            # Both modes release Q's last independent replies after the ordered result mark.
             SR8_PROFILE_DIR="${MEMBERSHIP_PROFILE_DIR}" bash "${BURST_DRIVER}" "${OUT}/driver-cgroup" \
                 bun "${E}" fault-burst "${C[@]}" "${OUT}" "${SCENARIO_SLACK_STUB_URL}" "${SCENARIO_SLACK_RECORD}" \
-                "${SLACK_STATE_DIR}" "${MEASUREMENTS}" "${MEASURE_MARK}" "${WAIT_MS}" ${TAIL_RELEASE[@]+"${TAIL_RELEASE[@]}"} &
+                "${SLACK_STATE_DIR}" "${MEASUREMENTS}" "${MEASURE_MARK}" "${WAIT_MS}" "${OUT}/tail-release" &
         fi
         BURST_PID=$!
         track_pid "${BURST_PID}"
