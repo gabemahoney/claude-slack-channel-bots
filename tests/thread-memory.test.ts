@@ -2596,6 +2596,10 @@ describe('Thread Memory queued join recovery', () => {
 })
 
 describe('SR-9.11 Thread Memory maintenance beside acceptance', () => {
+  test('THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS is 500 ms (SR-2.4.5)', () => {
+    expect(THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS).toBe(500)
+  })
+
   // Keep the SR-8 burst cadence; virtual time, never a wall-clock sleep.
   const CADENCE = 250
   const runs: Awaited<ReturnType<typeof makeBacklogMemory>>[] = []
@@ -2870,6 +2874,10 @@ describe('SR-9.11 Thread Memory maintenance beside acceptance', () => {
 })
 
 describe('Thread Memory compaction in slices', () => {
+  test('THREAD_MEMORY_REWRITE_CHUNK_BYTES is 256 KiB (SR-2.4.5)', () => {
+    expect(THREAD_MEMORY_REWRITE_CHUNK_BYTES).toBe(262_144)
+  })
+
   const SLICE = THREAD_MEMORY_COMPACTION_SLICE, COUNT = 2 * SLICE + 1
   // Capture actual writes without changing the shared harness used by other owners.
   const rewriteWrites = new WeakMap<ThreadMemoryHarness['io']['calls'][number], {
