@@ -13,7 +13,10 @@ import { basename, join, relative } from 'node:path'
 import { THREAD_MEMORY_LOOKUP_METHODS, MetadataCancelledError, classifyMetadataFailure, createMetadataAttempts, metadataRetryDelay,
   THREAD_MEMORY_JOIN_SAVE_WINDOW_MS as JOIN_SAVE_WINDOW_MS, THREAD_MEMORY_JOIN_SAVE_MAX_REQUESTS as JOIN_SAVE_MAX_REQUESTS,
   type MetadataFailure } from '../src/thread-memory.ts'
-import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS, THREAD_MEMORY_NOTICE_MAX_CHARS, THREAD_MEMORY_REWRITE_CHUNK_BYTES } from '../src/delivery-constants.ts'
+import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS, THREAD_MEMORY_NOTICE_MAX_CHARS, THREAD_MEMORY_REWRITE_CHUNK_BYTES, THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS } from '../src/delivery-constants.ts'
+import { makeBacklogMemory } from './test-helpers/thread-memory-backlog.ts'
+import { makeRoutingHarness, observedMembership, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness } from './test-helpers/persona-routing-harness.ts'
+import { makeChannelMessage, mentionText } from './test-helpers/slack-stub.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { INITIAL_CREDENTIALS, slackHttpError, slackPlatformError, slackRateLimited } from './test-helpers/slack-stub.ts'
 import { assertNoLeak, LEAK_SENTINEL, writeCredentialsFile, fakeToken, BOT_TOKEN_PREFIX, APP_TOKEN_PREFIX, writtenFile } from './test-helpers/credentials.ts'
@@ -2589,6 +2592,190 @@ describe('Thread Memory queued join recovery', () => {
       expect(view(h)).toBe('not-joined'); expect(h.memory.joins('alpha')).toEqual([])
       expect(journalBytes(h)).toEqual(before); expect(h.events).toEqual(events); expect(h.io.calls).toEqual([])
     } finally { await queue.stop() }
+  })
+})
+
+describe('SR-9.11 Thread Memory maintenance beside acceptance', () => {
+  // Keep the SR-8 burst cadence; virtual time, never a wall-clock sleep.
+  const CADENCE = 250
+  const runs: Awaited<ReturnType<typeof makeBacklogMemory>>[] = []
+  const routingRuns: Array<{ h: RoutingHarness; dir: string; release(): void; work?: Promise<void>; receive?: Promise<void>; retired?: boolean }> = []
+  async function setup(keys?: string[]) { const h = await makeBacklogMemory(keys); runs.push(h); return h }
+  afterEach(async () => {
+    for (const run of routingRuns.splice(0)) {
+      run.retired = true; run.release(); await run.work; await run.receive
+      run.h.hold.cancelAll(); run.h.releaseLaunches(); await run.h.ready(); await run.h.settleJoinSaves()
+      await run.h.threads?.close(); await run.h.preparation.stop(); await run.h.queue.stop()
+      assertNoLeak(run.h.captured()); resetRoutingState(); rmSync(run.dir, { recursive: true, force: true })
+    }
+    for (const h of runs.splice(0)) { await h.close(); expect(h.clock.pendingCount()).toBe(0) }
+  })
+  const writes = (h: Awaited<ReturnType<typeof setup>>, key = 'alpha') => h.io.calls.filter(c => c.op === 'writeSync' && c.path.startsWith(`${threadPath(h.stateDir, key)}.`))
+
+  test('a backlog-clear notification starts maintenance, with unchanged image, durability, seal, skip and measurement boundaries', async () => {
+    const h = await setup(); await h.start(); await h.measurements.flush(); await h.dirty(); h.reset()
+    const baselineMeasurements = readFileSync(h.measurementsPath, 'utf8').trim().split('\n').length
+    const expected = h.image(), backlog = await h.backlog()
+    const temp = h.io.hold('fsync', 'alpha', { match: p => p.endsWith('.tmp') })
+    const complete = h.completion()
+    h.memory.startMaintenance(CADENCE)
+    await h.clock.advance(CADENCE)
+    const trigger = h.clock.now()
+    expect(writes(h)).toEqual([]); expect(h.completed).toEqual([]); expect(h.sealCalls).toEqual([])
+    await h.clock.advance(CADENCE / 2)
+    expect(writes(h)).toEqual([])
+    const started = h.clock.now()
+    backlog.release(); expect((await backlog.pending).status).toBe('accepted')
+    await temp.reached
+    expect(writes(h).length).toBeGreaterThan(0)
+    expect(h.completed).toEqual([]); expect(h.sealCalls).toEqual([])
+    await h.measurements.flush()
+    expect(readFileSync(h.measurementsPath, 'utf8').trim().split('\n')).toHaveLength(baselineMeasurements)
+    await h.clock.advance(1)
+    temp.release(); await complete; await h.seal.flush()
+    expect(h.bytes().equals(expected)).toBe(true)
+    const operations = h.io.calls.filter(c => ['writeSync', 'fsync', 'rename'].includes(c.op))
+    const tempPath = writes(h)[0]!.path
+    const steps = [...writes(h).map(c => `writeSync:${c.path}`), `fsync:${tempPath}`, `rename:${tempPath}`, `fsync:${join(h.stateDir, 'threads')}`]
+    expect(operations.map(c => `${c.op}:${c.path}`)).toEqual(steps)
+    expect(h.sealCalls).toEqual([{ key: 'alpha', steps }])
+    expect(h.completed).toEqual([{ key: 'alpha', startMonoMs: started, endMonoMs: started + 1, outcome: 'rewritten' }])
+    expect(started).toBeGreaterThan(trigger)
+    await h.measurements.flush()
+    expect(JSON.parse(readFileSync(h.measurementsPath, 'utf8').trim().split('\n').at(-1)!)).toEqual({
+      v: 1, kind: 'thread-compaction', key: 'alpha', start_mono_ms: started, end_mono_ms: started + 1,
+      outcome: 'rewritten', at_mono_ms: started + 1,
+    })
+    const before = h.bytes(), identity = statSync(threadPath(h.stateDir), { bigint: true })
+    h.reset(); const skipped = h.completion()
+    await h.clock.advanceTo(2 * CADENCE); await skipped
+    expect(h.completed.map(c => c.outcome)).toEqual(['skipped'])
+    expect(h.io.calls).toEqual([]); expect(h.sealCalls).toEqual([]); expect(h.sealIo.calls).toEqual([])
+    expect(h.bytes()).toEqual(before)
+    const after = statSync(threadPath(h.stateDir), { bigint: true })
+    expect([after.ino, after.mtimeNs, after.size]).toEqual([identity.ino, identity.mtimeNs, identity.size])
+  })
+
+  test('earliest-trigger deadline is exact despite later triggers, and a trigger during the rewrite gets a subsequent complete pass', async () => {
+    const h = await setup(); await h.start(); await h.dirty(); h.reset()
+    const backlog = await h.backlog(), temp = h.io.hold('fsync', 'alpha', { match: p => p.endsWith('.tmp') })
+    const complete = h.completion()
+    h.memory.startMaintenance(CADENCE)
+    await h.clock.advance(CADENCE)
+    const trigger = h.clock.now(), deadline = trigger + THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS
+    await h.clock.advance(THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS - 1)
+    expect(h.clock.now()).toBe(deadline - 1)
+    expect(writes(h)).toEqual([]); expect(h.completed).toEqual([])
+    await h.clock.advance(1); await temp.reached
+    expect(h.queue.hasAcceptanceBacklog!('alpha')).toBe(true)
+    expect(writes(h).length).toBeGreaterThan(0)
+    // A further trigger while the actual rewrite is held cannot be dropped.
+    await h.clock.advance(CADENCE)
+    const lastTrigger = h.clock.now(), subsequent = h.completion('alpha', 2)
+    expect(h.completed).toEqual([])
+    temp.release(); await complete
+    expect(h.completed[0]).toMatchObject({ key: 'alpha', startMonoMs: deadline, endMonoMs: lastTrigger, outcome: 'rewritten' })
+    backlog.release(); await backlog.pending; await subsequent
+    expect(h.completed.map(c => c.outcome)).toEqual(['rewritten', 'skipped'])
+    for (let at = trigger; at <= lastTrigger; at += CADENCE) expect(h.completed.some(c => c.endMonoMs >= at)).toBe(true)
+    expect(h.completed[1]!.endMonoMs).toBeGreaterThanOrEqual(lastTrigger)
+  })
+
+  test.each(['startup', 'bring-up', 'explicit'] as const)('%s compaction bypasses an existing acceptance backlog', async phase => {
+    const h = await setup()
+    if (phase !== 'startup') await h.start()
+    if (phase === 'bring-up') await h.memory.forget('alpha')
+    h.reset()
+    const expected = h.image(), backlog = await h.backlog(), now = h.clock.now()
+    const temp = h.io.hold('fsync', 'alpha', { match: p => p.endsWith('.tmp') })
+    const operation = phase === 'startup' ? h.start() : phase === 'bring-up' ? h.memory.loadKey('alpha') : h.memory.compact('alpha')
+    try {
+      await temp.reached
+      expect(h.queue.hasAcceptanceBacklog!('alpha')).toBe(true)
+      expect(h.clock.now()).toBe(now)
+      temp.release(); await operation
+      expect(h.completed.map(c => [c.key, c.outcome])).toEqual([['alpha', 'rewritten']])
+      expect(h.bytes().equals(expected)).toBe(true)
+      expect(h.queue.hasAcceptanceBacklog!('alpha')).toBe(true)
+    } finally { temp.release(); backlog.release(); await backlog.pending; await operation }
+  })
+
+  test('alpha backlog leaves beta maintenance independent', async () => {
+    const h = await setup(['alpha', 'beta']); await h.start(); await h.dirty('alpha'); await h.dirty('beta'); h.reset()
+    const backlog = await h.backlog('alpha'), beta = h.completion('beta'), alpha = h.completion('alpha')
+    h.memory.startMaintenance(CADENCE)
+    await h.clock.advance(CADENCE); await beta
+    expect(writes(h, 'alpha')).toEqual([])
+    expect(h.completed.map(c => [c.key, c.outcome, c.startMonoMs])).toEqual([['beta', 'rewritten', CADENCE]])
+    expect(h.queue.hasAcceptanceBacklog!('alpha')).toBe(true)
+    backlog.release(); await backlog.pending; await alpha
+    expect(h.completed.map(c => c.key)).toEqual(['beta', 'alpha'])
+  })
+
+  test.each(['strict', 'open'] as const)('%s intake reaches a partial rewrite, decides, stores and acks before it completes; its memory append waits', async mode => {
+    resetRoutingState()
+    const dir = mkdtempSync(join(tmpdir(), 'thread-memory-intake-rewrite-')), io = threadFsControls(dir), base = io.fs
+    const slices: Buffer[] = [], order: string[] = [], first = Promise.withResolvers<void>()
+    let atFirstWrite: (() => void) | undefined, partialBytes = 0, decisionBytes = 0, tempPath = '', receive: Promise<void> | undefined
+    const seam = { ...base, writeSync(fd: number, bytes: Uint8Array, offset: number, length: number, position?: number | null) {
+      const written = base.writeSync(fd, bytes, offset, length, position), call = io.calls.at(-1)!
+      if (call.path.endsWith('.tmp') && atFirstWrite) {
+        slices.push(Buffer.from(bytes.subarray(offset, offset + written)))
+        tempPath = call.path; partialBytes = statSync(call.path).size
+        const submit = atFirstWrite; atFirstWrite = undefined
+        order.push('first-slice'); submit(); first.resolve()
+      } else if (call.path.endsWith('.tmp')) slices.push(Buffer.from(bytes.subarray(offset, offset + written)))
+      else if (call.path === threadPath(dir)) order.push('memory-append')
+      return written
+    } } as typeof base
+    const h = makeRoutingHarness([{ name: 'alpha', channels: [{ id: C.primary, delivery: 'thread_hybrid' }], dm: { enabled: true } }], dir,
+      { mode, threadMemory: { fs: { ...io, fs: seam } }, membership: observedMembership({ alpha: [C.primary] }), restartDelayS: NEVER_FIRE_RESTART_DELAY_S })
+    const temp = io.hold('fsync', 'alpha', { match: p => p.endsWith('.tmp') })
+    const run: typeof routingRuns[number] = { h, dir, release: temp.release }; routingRuns.push(run)
+    await h.ready()
+    const t = h.threads!, count = 2 * THREAD_MEMORY_COMPACTION_SLICE + 1
+    const facts = Array.from({ length: count }, (_, i) => t.fact({ root: i === 0 ? R.primary : `1700000000.${String(300000 + i).padStart(6, '0')}` }))
+    expect((await t.memory.saveJoins('alpha', facts)).kind).toBe('saved')
+    const [header, ...records] = readThreads(dir)
+    if (header?.kind !== 'header') throw new Error('fixture journal without its header')
+    const image = serializeThreadMemoryRecords([{ ...header, highWater: t.memory.store('alpha')!.lastRecordNumber }, ...records])
+    expect(image.length).toBeGreaterThan(THREAD_MEMORY_REWRITE_CHUNK_BYTES)
+    const reply = makeChannelMessage({ channel: C.primary, thread_ts: R.primary, text: 'reply during rewrite' })
+    const mention = makeChannelMessage({ channel: C.primary, ts: R.secondary, text: mentionText(h.p('alpha').stub.identity.botUserId) })
+    const view = t.memory.view.bind(t.memory)
+    t.memory.view = (...args) => { decisionBytes = statSync(tempPath).size; order.push('decided'); return view(...args) }
+    const completed: ThreadMemoryCompaction[] = []
+    t.memory.setCompactionObserver(c => { completed.push(c); order.push('rewrite-complete') })
+    io.reset(); slices.length = 0; order.length = 0
+    atFirstWrite = () => {
+      receive = Promise.all([reply, mention].map((event, i) => h.receive(event, ['alpha'], () => { order.push(`ack:${i}`) }))).then(() => {})
+      run.receive = receive
+    }
+    const rewrite = t.memory.compact('alpha'); run.work = rewrite
+    await first.promise; await temp.reached; await receive
+    if (run.retired) return // The test runner timed out; cleanup has released the rewrite.
+    expect(partialBytes).toBeGreaterThan(0); expect(partialBytes).toBeLessThan(image.length)
+    expect(decisionBytes).toBeGreaterThan(0); expect(decisionBytes).toBeLessThan(image.length)
+    expect(h.order).toContain('save-join:alpha')
+    expect(h.threadMemoryReads).toEqual([['alpha', C.primary, R.primary]])
+    expect(order.indexOf('decided')).toBeGreaterThan(order.indexOf('first-slice'))
+    expect(order).toContain('ack:0'); expect(order).toContain('ack:1')
+    expect(completed).toEqual([]); expect(order).not.toContain('memory-append')
+    expect(io.calls.filter(c => c.op === 'writeSync' && c.path === threadPath(dir))).toEqual([])
+    expect(h.queued('alpha').map(i => [i.accepted.seq, i.accepted.via])).toEqual([[1, 'thread'], [2, 'mention']])
+    expect(h.queue.lookupSlackKey('alpha', { chat_id: C.primary, ts: reply.ts as string })?.status).toBe('duplicate')
+    expect(t.memory.hasSavedJoin('alpha', C.primary, R.secondary, t.fact().stamp)).toBe(false)
+    expect(Buffer.concat(slices).equals(image)).toBe(true)
+    for (const slice of slices) expect(slice.length).toBeLessThanOrEqual(THREAD_MEMORY_REWRITE_CHUNK_BYTES)
+    temp.release(); await rewrite; await h.settleJoinSaves(); await t.memory.flush('alpha')
+    expect(completed.map(c => c.outcome)).toEqual(['rewritten'])
+    expect(order.indexOf('rewrite-complete')).toBeGreaterThan(order.indexOf('ack:1'))
+    expect(order.indexOf('memory-append')).toBeGreaterThan(order.indexOf('rewrite-complete'))
+    const calls = io.calls, append = calls.findIndex(c => c.op === 'writeSync' && c.path === threadPath(dir))
+    const directory = calls.findIndex(c => c.op === 'fsync' && c.path === join(dir, 'threads'))
+    expect(append).toBeGreaterThan(directory); expect(directory).toBeGreaterThan(-1)
+    expect(readFileSync(threadPath(dir)).subarray(0, image.length).equals(image)).toBe(true)
+    expect(readThreads(dir).filter(r => r.kind === 'join').map(r => r.root)).toEqual([...facts.map(f => f.root), R.secondary])
   })
 })
 

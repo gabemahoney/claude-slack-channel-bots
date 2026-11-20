@@ -43,7 +43,7 @@ test('Memory Hold recovery and failed fixation retries prepare only released wor
   const h = await makeEngineHarness(); harnesses.push(h)
   for (const ts of [THREAD_ROOTS.secondary, THREAD_ROOTS.third]) {
     const input = heldSlackInput(memoryHold(h.clock.now()), { ts, key: { chat_id: 'C0TEST001', ts } })
-    expect((await h.queue.acceptDecided('alpha', input.key, () => ({ store: input }))).status).toBe('accepted')
+    expect((await h.queue.acceptDecided('alpha', input.key, () => ({ store: input }), { channel: input.channel!, root: input.hold!.thread_ts })).status).toBe('accepted')
   }
   await h.restartServer()
   await h.queue.resolveHolds('alpha', [{ seq: 2, outcome: 'withdrawn', at: h.clock.now() }])

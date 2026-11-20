@@ -27,7 +27,7 @@ import type { MembershipScanner } from '../src/channel-membership-scan.ts'
 import { _resetAckTracker, createQueuedAckCallback, forgetPersonaAcks } from '../src/ack-tracker.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import type { DeliveryQueueOptions, QueueEvent, QueueThreadJoin, DeliveryQueue, ReplyReminderQueue } from '../src/delivery-queue.ts'
-import { QUEUE_COMPACT_INTERVAL_MS, REPLY_REMINDER_KEEP_MS } from '../src/delivery-queue.ts'
+import { QUEUE_COMPACT_INTERVAL_MS, QUEUE_GROUP_COMMIT_MAX, REPLY_REMINDER_KEEP_MS } from '../src/delivery-queue.ts'
 import { installTestTimerOverrides } from '../src/test-timer-overrides.ts'
 import { TEST_MEASUREMENTS_FILE_NAME, buildTestMeasurementsStartLine, createTestMeasurements, queueEventMeasurement, postHoldEventMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, threadCompactionMeasurement, type TestMeasurements, type TestMeasurementsDeps, type TestMeasurement } from '../src/test-measurements.ts'
 import type { DurableAppendTimer } from '../src/durable-journal.ts'
@@ -91,7 +91,7 @@ import type { PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
 import type { PollerDeps } from '../src/permission-poller.ts'
 import type * as PersonaNotifierModule from '../src/persona-notifier.ts'
 import type { PersonaNotifier } from '../src/persona-notifier.ts'
-import type { PersonaRouting, PersonaRoutingDeps } from '../src/persona-routing.ts'
+import { createPersonaRouting, type PersonaRouting, type PersonaRoutingDeps } from '../src/persona-routing.ts'
 import type * as ReactHandoffModule from '../src/react-handoff.ts'
 import type { ReactHandoff, ReactHandoffClock, ReactHandoffDeps } from '../src/react-handoff.ts'
 import type { SessionAdmissionOptions, SessionToolDeps } from '../src/registry.ts'
@@ -119,13 +119,16 @@ import { buildAdInputHoldNotice } from '../src/ad-input-notices.ts'
 import { clearDeliveredInputHold } from '../src/ad-input-custody.ts'
 import { createDeliveryLifecycle } from '../src/delivery-engine.ts'
 import { makeDeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
-import { deliveredRecord, heldSlackInput, injectedInput, memoryHold, makeQueue, queuePath, reactionInput, refusedRecord, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
+import { deliveredRecord, heldSlackInput, injectedInput, memoryHold, makeQueue, queuePath, reactionInput, readQueue, refusedRecord, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
 import { threadJoin, threadHeader, seedThreads, threadFsControls, threadSealFsControls, threadConfig, threadPath, THREAD_PERSONAS, THREAD_ROOTS, THREAD_CHANNELS, THREAD_STAMP } from './test-helpers/thread-memory.ts'
 import { makeConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import { makeOwnPostHarness } from './test-helpers/own-post.ts'
-import { makeOwnFileShare } from './test-helpers/slack-stub.ts'
+import { makeOwnFileShare, makeChannelMessage, mentionText, makeStubSlack } from './test-helpers/slack-stub.ts'
 import { ownPostStampState, pendingOwnPostViews } from '../src/own-post.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
+import { makeBacklogMemory } from './test-helpers/thread-memory-backlog.ts'
+import { observedMembership } from './test-helpers/persona-routing-harness.ts'
+import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { durableIo } from './test-helpers/durable-io.ts'
 import {
@@ -6729,6 +6732,124 @@ describe('own-post lookup server wiring', () => {
   })
 })
 
+describe('SR-9.11 production server routing queue adapter', () => {
+  /** Evaluate the actual queue property, including its live holder and not-started
+   * branch. Passing the queue directly to routing would omit this boundary. */
+  function serverQueuePort() {
+    return expression<() => { queue: PersonaRoutingDeps['queue']; set(queue?: DeliveryQueue): void }>(`() => {
+      let deliveryQueue;
+      const queue = (${onlyCallProps('createPersonaRouting').get('queue')!});
+      return { queue, set: value => { deliveryQueue = value } };
+    }`, {})()
+  }
+  type Run = { h: Awaited<ReturnType<typeof makeBacklogMemory>>; releases: Array<() => void>; work: Promise<void>[]; retired: boolean }
+  const runs: Run[] = []
+  afterEach(async () => {
+    for (const run of runs.splice(0)) {
+      run.retired = true
+      for (const release of run.releases) release()
+      await Promise.all(run.work); await run.h.close()
+      expect(run.h.clock.pendingCount()).toBe(0)
+    }
+  })
+  async function setup() {
+    const h = await makeBacklogMemory(), run: Run = { h, releases: [], work: [], retired: false }
+    runs.push(run); await h.start()
+    const port = serverQueuePort(); port.set(h.queue)
+    const identity = makeStubSlack().identity, channel = THREAD_CHANNELS.primary
+    const decisions: string[] = [], reads: string[] = []
+    const joins = expression<NonNullable<PersonaRoutingDeps['joins']>>(onlyCallProps('createPersonaRouting').get('joins')!, {
+      threadMemory: h.memory, reloadController: { sharedChannels: () => h.authority },
+    })
+    const channelDelivery = createChannelDeliveryStore(h.authority)
+    const config = { ...h.authority.config(), session_restart_delay: 0 } // This fixture serves no agent session.
+    const routing = createPersonaRouting({ queue: port.queue,
+      getPersonaConfig: () => config, getBotIdentity: () => identity,
+      getChannelDelivery: () => channelDelivery, membership: observedMembership({ alpha: [channel] }),
+      archive() {}, log() {}, prepare: async () => {},
+      threadMemory: (key, channel, root) => { reads.push(root); return h.memory.view(key, channel, root) },
+      joins: { ...joins, hasSavedJoin(...args) {
+        decisions.push(args[2])
+        return joins.hasSavedJoin(...args)
+      } },
+    })
+    const rootMention = (root: string) => makeChannelMessage({ channel, ts: root, text: mentionText(identity.botUserId) })
+    const hold = (directory = false) => {
+      const gate = h.queueIo.hold('fsync', 'alpha', { match: p => p === (directory ? join(h.stateDir, 'queue') : queuePath(h.stateDir)) })
+      run.releases.push(gate.release); return gate
+    }
+    return { h, run, routing, port, channel, decisions, reads, rootMention, hold }
+  }
+
+  test('sixteen independent root mentions share two capped commits through the real server queue property', async () => {
+    const { h, run, routing, channel, rootMention, hold, decisions } = await setup()
+    const count = 2 * QUEUE_GROUP_COMMIT_MAX
+    const events = Array.from({ length: count }, (_, i) => rootMention(`1700000400.${String(i + 1).padStart(6, '0')}`))
+    const first = hold(), directory = hold(true), second = hold()
+    const firstAcks = Promise.withResolvers<void>()
+    const acks: Array<{ index: number; seq?: number; joined: string }> = []
+    const work = Promise.all(events.map((event, index) => routing.receive(event, () => {
+      const stored = h.queue.lookupSlackKey('alpha', { chat_id: channel, ts: event.ts as string })
+      acks.push({ index, seq: stored && stored.status !== 'failed' ? stored.seq : undefined,
+        joined: h.memory.view('alpha', channel, event.ts as string) })
+      if (acks.length === QUEUE_GROUP_COMMIT_MAX) firstAcks.resolve()
+    }, ['alpha']))).then(() => {})
+    run.work.push(work)
+    await first.reached
+    if (run.retired) return
+    expect(decisions.length).toBeGreaterThanOrEqual(QUEUE_GROUP_COMMIT_MAX)
+    expect(readQueue(h.stateDir).map(r => r.seq)).toEqual(Array.from({ length: QUEUE_GROUP_COMMIT_MAX }, (_, i) => i + 1))
+    expect(h.queue.items('alpha')).toEqual([]); expect(acks).toEqual([])
+    for (const event of events) expect(h.memory.view('alpha', channel, event.ts as string)).toBe('not-joined')
+    first.release(); await directory.reached
+    expect(h.queue.items('alpha')).toEqual([]); expect(acks).toEqual([])
+    directory.release(); await second.reached; await firstAcks.promise
+    expect(h.queue.items('alpha')).toHaveLength(QUEUE_GROUP_COMMIT_MAX)
+    expect(acks).toEqual(events.slice(0, QUEUE_GROUP_COMMIT_MAX).map((_, index) => ({ index, seq: index + 1, joined: 'joined' })))
+    expect(readQueue(h.stateDir).map(r => r.seq)).toEqual(Array.from({ length: count }, (_, i) => i + 1))
+    second.release(); await work
+    expect(decisions).toEqual(events.map(e => e.ts as string))
+    expect(h.queue.items('alpha').map(i => [i.accepted.seq, i.accepted.via, i.accepted.thread_join?.thread_ts]))
+      .toEqual(events.map((event, i) => [i + 1, 'mention', event.ts as string]))
+    expect(acks).toEqual(events.map((_, index) => ({ index, seq: index + 1, joined: 'joined' })))
+    expect(h.queueIo.calls.filter(c => c.op === 'fsync' && c.path === queuePath(h.stateDir))).toHaveLength(2)
+    expect(h.queueIo.calls.filter(c => c.op === 'fsync' && c.path === join(h.stateDir, 'queue'))).toHaveLength(1)
+  })
+
+  test('same-thread reply waits for the mention join through the real server queue property', async () => {
+    const { h, run, routing, channel, rootMention, hold, reads } = await setup()
+    const root = '1700000500.000001', mention = rootMention(root)
+    const reply = makeChannelMessage({ channel, thread_ts: root, text: 'reply waiting for its mention' })
+    const fsync = hold(), acks: number[] = []
+    const work = Promise.all([mention, reply].map((event, i) => routing.receive(event, () => { acks.push(i) }, ['alpha']))).then(() => {})
+    run.work.push(work)
+    await fsync.reached
+    expect(reads).toEqual([]); expect(acks).toEqual([]); expect(h.queue.items('alpha')).toEqual([])
+    expect(h.memory.view('alpha', channel, root)).toBe('not-joined')
+    fsync.release(); await work
+    expect(reads).toEqual([root]); expect(acks).toEqual([0, 1])
+    expect(h.queue.items('alpha').map(i => [i.accepted.seq, i.accepted.via])).toEqual([[1, 'mention'], [2, 'thread']])
+    expect(h.memory.view('alpha', channel, root)).toBe('joined')
+  })
+
+  test('queue-not-started branch still decides with unchecked key, preserves skips and refuses stores', async () => {
+    const { queue } = serverQueuePort(), input = slackInput(), seen: boolean[] = []
+    const thread = { channel: input.channel!, root: input.ts! }
+    expect(queue.lookupSlackKey('alpha', input.key!)).toBeUndefined()
+    const skipped = await queue.acceptDecided('alpha', input.key, facts => { seen.push(facts.keyChecked); return { skip: 'not-mentioned' } }, thread)
+    expect(skipped).toEqual({ status: 'skipped', outcome: 'not-mentioned' })
+    const store = await queue.acceptDecided('alpha', input.key, facts => { seen.push(facts.keyChecked); return { store: input } }, thread)
+    expect(store.status).toBe('failed')
+    if (store.status !== 'failed') throw new Error('not-started store must fail')
+    expect(store.error).toBeInstanceOf(Error); expect((store.error as Error).message).toBe('Queue not started')
+    const accepted = await queue.accept('alpha', input)
+    expect(accepted.status).toBe('failed')
+    if (accepted.status !== 'failed') throw new Error('not-started acceptance must fail')
+    expect((accepted.error as Error).message).toBe('Queue not started')
+    expect(seen).toEqual([false, false])
+  })
+})
+
 describe('Thread Memory server lifecycle wiring', () => {
   const factory: keyof typeof ThreadMemoryModule = 'createThreadMemory'
   const sealFactory: keyof typeof ThreadMemorySealModule = 'createThreadMemorySeal'
@@ -6966,7 +7087,7 @@ describe('Thread Memory server lifecycle wiring', () => {
       expect(adapter.backlog.has(key)).toBe(queue.hasAcceptanceBacklog!(key))
       expect(adapter.backlog.has(key)).toBe(false)
       const input = heldSlackInput(memoryHold(fact.at, { stamp: fact.stamp }), { channel: fact.channel })
-      pending = queue.acceptDecided(key, input.key, () => ({ store: input }))
+      pending = queue.acceptDecided(key, input.key, () => ({ store: input }), undefined)
       await reached.promise
       expect(adapter.backlog.has(key)).toBe(queue.hasAcceptanceBacklog!(key))
       expect(adapter.backlog.has(key)).toBe(true)
@@ -7820,7 +7941,7 @@ describe('Thread Memory failure wiring', () => {
     try {
       wiring.start(reporting, { startupFindings: () => [] })
       const input = heldSlackInput(memoryHold(clock.now()), { channel: THREAD_CHANNELS.primary })
-      expect((await queue.acceptDecided(persona.key, input.key, () => ({ store: input }))).status).toBe('accepted')
+      expect((await queue.acceptDecided(persona.key, input.key, () => ({ store: input }), undefined)).status).toBe('accepted')
       expect(await resolver.resolve(persona.key, 'live')).toBe('resolved')
       await clock.flush()
       expect(input.channel).toBeDefined(); expect(input.ts).toBeDefined(); expect(input.thread_ts).toBeDefined()
@@ -8040,7 +8161,7 @@ describe('Memory Hold server wiring', () => {
     try {
       adapter.set(queue)
       const input = heldSlackInput(memoryHold(fact.at, { stamp: fact.stamp }), { channel: fact.channel })
-      const stored = await queue.acceptDecided(key, input.key, () => ({ store: input }))
+      const stored = await queue.acceptDecided(key, input.key, () => ({ store: input }), undefined)
       const stamps = [{ channel: fact.channel, stamp: fact.stamp }]
       // A failed fsync also attempts rollback. Every store-time observation,
       // including that rollback, must still protect the decided hold.

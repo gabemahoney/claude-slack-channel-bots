@@ -269,7 +269,7 @@ describe('b.6cg operator abandonment', () => {
 
 async function hold(h: EngineHarness, ts: string = THREAD_ROOTS.secondary, key = 'alpha', field: (at: number) => HoldField = memoryHold) {
   const input = heldSlackInput(field(h.clock.now()), { ts, key: { chat_id: 'C0TEST001', ts } })
-  const result = await h.queue.acceptDecided(key, input.key, () => ({ store: input }))
+  const result = await h.queue.acceptDecided(key, input.key, () => ({ store: input }), { channel: input.channel!, root: input.hold!.thread_ts })
   if (result.status !== 'accepted') throw new Error('hold fixture acceptance failed')
   return result.item!
 }

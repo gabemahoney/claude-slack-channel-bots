@@ -1305,13 +1305,13 @@ const personaRouting = createPersonaRouting({
       if (!deliveryQueue) return Promise.resolve({ status: 'failed' as const, error: new Error('Queue not started') })
       return deliveryQueue.accept(key, input)
     },
-    acceptDecided: (key, slackKey, decide) => {
+    acceptDecided: (key, slackKey, decide, thread) => {
       if (!deliveryQueue) {
         const decision = decide({ keyChecked: false })
         return Promise.resolve('skip' in decision ? { status: 'skipped' as const, outcome: decision.skip }
           : { status: 'failed' as const, error: new Error('Queue not started') })
       }
-      return deliveryQueue.acceptDecided(key, slackKey, decide)
+      return deliveryQueue.acceptDecided(key, slackKey, decide, thread)
     },
     lookupSlackKey: (key, slackKey) => deliveryQueue?.lookupSlackKey(key, slackKey),
     lookupReactionKey: (key, reactionKey) => deliveryQueue?.lookupReactionKey(key, reactionKey),

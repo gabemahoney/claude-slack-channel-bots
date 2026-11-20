@@ -270,7 +270,7 @@ describe('b.6cg abandonment reporting', () => {
 
 async function noticeHold(r: DeliveryNoticeHarness, ts: string = THREAD_ROOTS.secondary, field: (at: number) => HoldField = memoryHold) {
   const input = heldSlackInput(field(r.h.clock.now()), { ts, key: { chat_id: 'C0TEST001', ts }, text: 'private held reply' })
-  const result = await r.queue.acceptDecided(r.alpha, input.key, () => ({ store: input }))
+  const result = await r.queue.acceptDecided(r.alpha, input.key, () => ({ store: input }), { channel: input.channel!, root: input.hold!.thread_ts })
   if (result.status !== 'accepted') throw new Error('hold fixture acceptance failed')
   return result.item!
 }

@@ -222,7 +222,9 @@ export interface PersonaRoutingDeps {
    * run), or undefined when it is not known.
    */
   getBotIdentity(key: string): SlackBotIdentity | undefined
-  /** Shared queue; acceptance does no network I/O. */
+  /** Shared queue; acceptance does no network I/O. The required fourth
+   * acceptDecided argument must pass through every adapter, including the
+   * server's not-started branch. Only malformed events can lack a thread. */
   queue: Pick<DeliveryQueue, 'accept' | 'acceptDecided' | 'lookupSlackKey' | 'lookupReactionKey'>
   /**
    * Whether `id` is one of the Run Bot Identities (production: the

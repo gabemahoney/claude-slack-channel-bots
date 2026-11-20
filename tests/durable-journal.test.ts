@@ -651,6 +651,64 @@ describe('Thread Memory torn-tail removal', () => {
 })
 
 describe('whole-file rewrite', () => {
+  test.each([Infinity, 2])('SR-9.11: chunked image writes yield between bounded contiguous slices, including odd remainder and short writes (%s)', async maxWrite => {
+    const r = recordingFs(), chunk = 7, image = Buffer.from('é🙂-odd-image-end!\n')
+    r.control.maxChunk = maxWrite
+    const writes: Array<{ start: number; requested: number; bytes: Buffer }> = [], turns: number[] = []
+    let turn = 0
+    const seam = { ...r.fs, writeSync(fd: number, bytes: Uint8Array, offset: number, length: number) {
+      const start = fs.fstatSync(fd).size, n = r.fs.writeSync(fd, bytes, offset, length)
+      writes.push({ start, requested: length, bytes: Buffer.from(bytes.subarray(offset, offset + n)) }); turns.push(turn)
+      setImmediate(() => { turn++ })
+      return n
+    } } as typeof fs
+    const j = createDurableJournal({ dir, parentDir: root, directoryMode: 0o700, fileMode: 0o600, fs: seam, rewriteChunkBytes: chunk })
+    seed('previous image\n'); await j.ensureDir(); r.ops.length = 0
+    const pending = j.rewrite(path, image)
+    await pending
+    expect(image.length % chunk).not.toBe(0)
+    let covered = 0
+    for (const write of writes) {
+      expect(write.start).toBe(covered)
+      expect(write.requested).toBeLessThanOrEqual(chunk)
+      expect(write.bytes.length).toBeGreaterThan(0)
+      expect(write.bytes.equals(image.subarray(covered, covered + write.bytes.length))).toBe(true)
+      covered += write.bytes.length
+    }
+    expect(covered).toBe(image.length)
+    expect(Buffer.concat(writes.map(w => w.bytes)).equals(image)).toBe(true)
+    const expectedLengths: number[] = []
+    for (let offset = 0; offset < image.length; offset += chunk) {
+      for (let left = Math.min(chunk, image.length - offset); left > 0; left -= Math.min(left, maxWrite)) expectedLengths.push(left)
+    }
+    expect(writes.map(w => w.requested)).toEqual(expectedLengths)
+    for (let i = 1; i < writes.length; i++) {
+      if (writes[i]!.start % chunk === 0) expect(turns[i]!).toBeGreaterThan(turns[i - 1]!)
+      else expect(turns[i]).toBe(turns[i - 1])
+    }
+    expect(read()).toEqual(image)
+    const temp = r.ops.find(op => op.step === 'open' && op.flags === 'wx')!.path
+    expect(r.ops.filter(op => ['write', 'sync', 'rename'].includes(op.step)).map(op => [op.step, op.path]))
+      .toEqual([...writes.map(() => ['write', temp]), ['sync', temp], ['rename', temp], ['sync', dir]])
+    expect(r.paths.size).toBe(0); expect(fs.readdirSync(dir)).toEqual(['alpha.jsonl'])
+    writes.length = 0
+    await j.durableAppend(path, image)
+    // The option affects rewrites only; appends still request the entire buffer.
+    expect(writes[0]!.requested).toBe(image.length)
+    expect(read()).toEqual(Buffer.concat([image, image]))
+  })
+
+  test('SR-9.11: a journal without rewriteChunkBytes retains the queue whole-image write', async () => {
+    const r = recordingFs(), j = journal(r.fs), image = Buffer.from('a whole queue image\né🙂\n')
+    await j.ensureDir(); r.ops.length = 0
+    await j.rewrite(path, image)
+    expect(r.ops.filter(op => op.step === 'write').map(op => op.length)).toEqual([image.length])
+    const temp = r.ops.find(op => op.step === 'open' && op.flags === 'wx')!.path
+    expect(r.ops.filter(op => ['write', 'sync', 'rename'].includes(op.step)).map(op => [op.step, op.path]))
+      .toEqual([['write', temp], ['sync', temp], ['rename', temp], ['sync', dir]])
+    expect(read()).toEqual(image); expect(r.paths.size).toBe(0)
+  })
+
   test('uses unique exclusive mode-0600 temps, short writes and fsync before rename, then directory fsync, after which appends sync the file only', async () => {
     const r = recordingFs(), j = journal(r.fs), old = Buffer.from('old longer record\n'), next = Buffer.from('é🙂\n')
     seed(old); await j.ensureDir(); r.ops.length = 0; r.control.maxChunk = 2

@@ -74,7 +74,7 @@ test.each([['Memory', memoryHold], ['Post', postHold]] as const)('%s Holds never
   const clock = createFakeClock(), q = await open({ now: clock.now }), h = harness(q)
   for (const ts of [THREAD_ROOTS.secondary, THREAD_ROOTS.third]) {
     const input = heldSlackInput(field(clock.now()), { ts, key: { chat_id: 'C0TEST001', ts } })
-    expect((await q.acceptDecided('alpha', input.key, () => ({ store: input }))).status).toBe('accepted')
+    expect((await q.acceptDecided('alpha', input.key, () => ({ store: input }), { channel: input.channel!, root: input.hold!.thread_ts })).status).toBe('accepted')
   }
   await q.resolveHolds('alpha', [{ seq: 2, outcome: 'withdrawn', at: clock.now() }])
   await clock.advance(REPLY_REMINDER_KEEP_MS)

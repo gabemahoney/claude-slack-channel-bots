@@ -2059,7 +2059,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
         lookupSlackKey: queue.lookupSlackKey,
         lookupReactionKey: queue.lookupReactionKey,
         accept: async (key, input) => { await ready; return queue.accept(key, input) },
-        acceptDecided: async (key, slackKey, decide) => { await ready; return queue.acceptDecided(key, slackKey, decide) },
+        acceptDecided: async (key, slackKey, decide, thread) => { await ready; return queue.acceptDecided(key, slackKey, decide, thread) },
       },
       prepare: preparation.prepare,
       archive: () => {},

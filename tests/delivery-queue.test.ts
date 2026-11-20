@@ -1086,7 +1086,7 @@ describe('b.2is repair composed with the durable journal and thread facts', () =
     } }).fs })
     // The fixture message, edited.
     const key = { ...slackInput().key!, edited_ts: THREAD_ROOTS.secondary }
-    expect((await q.acceptDecided('alpha', key, () => ({ store: slackInput({ key, ts: key.ts, edited_ts: key.edited_ts }) }))).status).toBe('failed')
+    expect((await q.acceptDecided('alpha', key, () => ({ store: slackInput({ key, ts: key.ts, edited_ts: key.edited_ts }) }), undefined)).status).toBe('failed')
     failing = false
     expect(events.filter(e => e.type === 'store-failed')).toEqual([expect.objectContaining({ key: 'alpha', ts: key.ts, slackKey: key, edited_ts: key.edited_ts })])
   })
@@ -1226,8 +1226,8 @@ test('a queue history returns, stores, reports and replays what structuredClone 
       await record(() => q.accept('alpha', input))
       await record(() => q.accept('alpha', input))
       await record(() => q.accept('alpha', injectedInput({ text: 'second 🙂\nline' })))
-      await record(() => q.acceptDecided('alpha', held.key, () => ({ store: held })))
-      await record(() => q.acceptDecided('alpha', { chat_id: THREAD_CHANNELS.primary, ts: THREAD_ROOTS.third }, () => ({ skip: 'not stored' })))
+      await record(() => q.acceptDecided('alpha', held.key, () => ({ store: held }), undefined))
+      await record(() => q.acceptDecided('alpha', { chat_id: THREAD_CHANNELS.primary, ts: THREAD_ROOTS.third }, () => ({ skip: 'not stored' }), undefined))
       await record(() => q.append('alpha', fixedRecord(1, ['fixed 🙂', 'bytes'])))
       await record(() => q.append('alpha', sentRecord()))
       await record(() => q.append('alpha', deliveredRecord()))
@@ -1264,7 +1264,7 @@ test('accept and acceptDecided store and return what one structuredClone of an i
       const q = createDeliveryQueue({ stateDir, now: () => THREAD_TIME }); queues.push(q)
       await q.start()
       const results = [await q.accept('alpha', input('1700000000.000001')),
-        await q.acceptDecided('alpha', new SlackKey('1700000000.000002'), () => ({ store: input('1700000000.000002') }))]
+        await q.acceptDecided('alpha', new SlackKey('1700000000.000002'), () => ({ store: input('1700000000.000002') }), undefined)]
       return { results: JSON.stringify(results), items: JSON.stringify(q.items('alpha')), reads, bytes: fs.readFileSync(queuePath(stateDir)) }
     } finally { copier?.mockRestore() }
   }
@@ -1282,7 +1282,7 @@ test('queue entry points retain caller values despite mutation after submission'
   expect(q.item('alpha', 1)!.accepted).toMatchObject({ text: slackInput().text, files: [{ name: 'original.txt' }] })
 
   const ts = '1700000000.000002', key = { chat_id: THREAD_CHANNELS.primary, ts }
-  const deciding = q.acceptDecided('alpha', key, () => ({ store: heldSlackInput(unknownRootPostHold(1000), { ts, key: { chat_id: THREAD_CHANNELS.primary, ts } }) }))
+  const deciding = q.acceptDecided('alpha', key, () => ({ store: heldSlackInput(unknownRootPostHold(1000), { ts, key: { chat_id: THREAD_CHANNELS.primary, ts } }) }), undefined)
   key.ts = THREAD_ROOTS.third
   expect((await deciding).status).toBe('accepted')
   expect(q.lookupSlackKey('alpha', { chat_id: THREAD_CHANNELS.primary, ts })?.status).toBe('duplicate')
@@ -1338,10 +1338,10 @@ test('accept and acceptDecided give a disguised WeakRef or Blob, nested or froze
       for (const [i, [name, input]] of inputs.entries()) {
         const ts = (n: number) => `1700000000.${String(10 * i + n).padStart(6, '0')}`
         results.push([name, 'accept', await q.accept('alpha', input(ts(1)))])
-        results.push([name, 'acceptDecided', await q.acceptDecided('alpha', { chat_id: 'C0TEST001', ts: ts(2) }, () => ({ store: input(ts(2)) }))])
+        results.push([name, 'acceptDecided', await q.acceptDecided('alpha', { chat_id: 'C0TEST001', ts: ts(2) }, () => ({ store: input(ts(2)) }), undefined)])
       }
       // A disguised WeakRef as the decided Slack key itself.
-      results.push(['WeakRef key', 'acceptDecided key', await q.acceptDecided('alpha', weakKey('1700000000.000099') as never, () => ({ store: slackInput() }))])
+      results.push(['WeakRef key', 'acceptDecided key', await q.acceptDecided('alpha', weakKey('1700000000.000099') as never, () => ({ store: slackInput() }), undefined)])
       results.push(['items', q.items('alpha')])
       return { results: await described(results), bytes: fs.readFileSync(queuePath(stateDir)) }
     } finally { copier?.mockRestore() }
@@ -1809,7 +1809,7 @@ describe('thread_join acceptance and main-reader compatibility', () => {
     const seam = io.fs
     const clock = createFakeClock({ start: THREAD_TIME })
     const q = await open({ fs: seam, now: clock.now }), input = joiningInput(via)
-    const result = await q.acceptDecided('alpha', input.key, () => ({ store: input }))
+    const result = await q.acceptDecided('alpha', input.key, () => ({ store: input }), undefined)
     expect(result).toMatchObject({ status: 'accepted', seq: 1 })
     expect(readQueue(dir)).toEqual([{ ...input, v: 1, kind: 'accepted', item_id: expect.any(String), seq: 1, received_at: THREAD_TIME, ts: input.ts! }])
     expect(writes).toEqual([fs.readFileSync(queuePath(dir))])
@@ -1981,7 +1981,7 @@ describe('decided acceptance owns the persona writer turn', () => {
       expect(keyChecked).toBe(true); expect(joined).toBe(true); order.push('reply')
       return { store: { ...second, via: joined ? 'thread' : 'mention' } }
     })
-    const duplicate = q.acceptDecided('alpha', first.key, () => { throw new Error('duplicate must not decide') })
+    const duplicate = q.acceptDecided('alpha', first.key, () => { throw new Error('duplicate must not decide') }, { channel: first.channel!, root: first.thread_ts ?? first.ts! })
     await reached()
     // The first store waits on its file sync: nothing published or joined, the next decision
     // waits, while timers and another persona's store run.
@@ -2006,7 +2006,7 @@ describe('decided acceptance owns the persona writer turn', () => {
       if (outcome === 'skip') return { skip: skipped }
       if (outcome === 'decide throws') throw error
       return { store: slackInput(), afterStore: () => { order.push('afterStore'); if (outcome === 'afterStore throws') throw new Error('observer failed') } }
-    })
+    }, undefined)
     if (outcome === 'skip') {
       expect(result).toEqual({ status: 'skipped', outcome: skipped })
       if (result.status === 'skipped') expect(result.outcome).toBe(skipped)
@@ -2018,7 +2018,7 @@ describe('decided acceptance owns the persona writer turn', () => {
       expect(q.items('alpha')).toEqual([]); expect(q.lookupSlackKey('alpha', slackInput().key!)).toBeUndefined()
       if (outcome === 'decide throws') expect(result).toEqual({ status: 'failed', error })
       fail = false
-      expect(await q.acceptDecided('alpha', slackInput().key, () => ({ store: slackInput() }))).toMatchObject({ status: 'accepted', seq: 1 })
+      expect(await q.acceptDecided('alpha', slackInput().key, () => ({ store: slackInput() }), undefined)).toMatchObject({ status: 'accepted', seq: 1 })
       expect(readQueue(dir)).toHaveLength(1)
     } else {
       expect(result).toMatchObject({ status: 'accepted', seq: 1 })
@@ -2038,7 +2038,7 @@ describe('decided acceptance owns the persona writer turn', () => {
     for (const input of inputs) {
       const result = await q.acceptDecided('alpha', input.key, () => ({ store: input, afterStore: stored => {
         seen.push({ ...stored, key: q.item('alpha', stored.seq)?.accepted.key })
-      } }))
+      } }), undefined)
       expect(result).toMatchObject({ status: 'accepted', seq: seen.at(-1)!.seq })
     }
     expect(seen).toEqual(inputs.map((input, i) => ({ seq: i + 2, key: input.key })))
@@ -2060,12 +2060,12 @@ describe('decided acceptance owns the persona writer turn', () => {
     if (state !== 'not started') await q.start()
     if (state === 'stopped') await q.stop()
     const skipped = { reason: 'drop' }
-    expect(await q.acceptDecided('alpha', slackInput().key, facts => { expect(facts).toEqual({ keyChecked: false }); return { skip: skipped } })).toEqual({ status: 'skipped', outcome: skipped })
+    expect(await q.acceptDecided('alpha', slackInput().key, facts => { expect(facts).toEqual({ keyChecked: false }); return { skip: skipped } }, undefined)).toEqual({ status: 'skipped', outcome: skipped })
     expect(events.filter(e => e.type === 'store-failed' || e.type === 'stored')).toEqual([])
     let after = false
     expect((await q.acceptDecided('alpha', slackInput().key, facts => {
       expect(facts).toEqual({ keyChecked: false }); return { store: slackInput(), afterStore: () => { after = true } }
-    })).status).toBe('failed')
+    }, undefined)).status).toBe('failed')
     expect(after).toBe(false)
     expect(events.filter(e => e.type === 'store-failed' || e.type === 'stored').map(e => e.type)).toEqual(['store-failed'])
     expect(fs.existsSync(queuePath(dir)) ? fs.readFileSync(queuePath(dir)) : undefined).toEqual(bytes)
@@ -2079,8 +2079,8 @@ describe('decided acceptance owns the persona writer turn', () => {
     try {
       await reached()
       // No effect or durable key of the held store can change these drops.
-      const backlog = Array.from({ length: 20 }, (_, i) => q.acceptDecided('alpha', undefined, () => { order.push(`alpha:${i}`); return { skip: i } }))
-      const decided = q.acceptDecided('beta', slackInput().key, () => { order.push('beta'); return { store: slackInput() } })
+      const backlog = Array.from({ length: 20 }, (_, i) => q.acceptDecided('alpha', undefined, () => { order.push(`alpha:${i}`); return { skip: i } }, undefined))
+      const decided = q.acceptDecided('beta', slackInput().key, () => { order.push('beta'); return { store: slackInput() } }, undefined)
       const plain = q.accept('gamma', injectedInput()).then(r => { order.push('gamma'); return r })
       pending.push(...backlog, decided, plain)
       expect((await Promise.all([decided, plain])).map(r => r.status)).toEqual(['accepted', 'accepted'])
@@ -2235,7 +2235,7 @@ describe('acceptances queued together share one durable append per batch', () =>
     const syncs = journalSyncs(), q = await open({ fs: syncs.fs, now: () => THREAD_TIME })
     const n = 2 * QUEUE_GROUP_COMMIT_MAX + 3
     const call = (key: string, i: number) => i % 3 === 0 ? q.accept(key, injectedInput({ text: `m${i}` }))
-      : i % 3 === 1 ? q.accept(key, slackAt(i)) : q.acceptDecided(key, slackAt(i).key, () => ({ store: slackAt(i) }))
+      : i % 3 === 1 ? q.accept(key, slackAt(i)) : q.acceptDecided(key, slackAt(i).key, () => ({ store: slackAt(i) }), undefined)
     const results = await Promise.all(Array.from({ length: n }, (_, i) => [call('alpha', i), call('beta', i)]).flat())
     expect(seqs(results)).toEqual(Array.from({ length: n }, (_, i) => [i + 1, i + 1]).flat())
     expect(syncs.lines).toEqual([QUEUE_GROUP_COMMIT_MAX, 2 * QUEUE_GROUP_COMMIT_MAX, n])
@@ -2255,7 +2255,7 @@ describe('acceptances queued together share one durable append per batch', () =>
     const q = await open({ fs: h.io.fs })
     h.state.armed = true
     const hold = heldSlackInput(memoryHold(THREAD_TIME)), settled: number[] = []
-    const calls = [q.accept('alpha', slackInput()), q.acceptDecided('alpha', hold.key, () => ({ store: hold })), q.accept('alpha', injectedInput())]
+    const calls = [q.accept('alpha', slackInput()), q.acceptDecided('alpha', hold.key, () => ({ store: hold }), undefined), q.accept('alpha', injectedInput())]
       .map((pending, i) => pending.then(result => { settled.push(i); return result }))
     await h.reached()
     expect(readQueue(dir).map(r => r.seq)).toEqual([1, 2, 3])
@@ -2278,7 +2278,7 @@ describe('acceptances queued together share one durable append per batch', () =>
     const boundary = fs.readFileSync(queuePath(dir))
     events.length = 0; syncs.lines.length = 0; syncs.fail = 1
     const hold = heldSlackInput(memoryHold(THREAD_TIME)), n = QUEUE_GROUP_COMMIT_MAX + 2
-    const results = await Promise.all(Array.from({ length: n }, (_, i) => i === 1 ? q.acceptDecided('alpha', hold.key, () => ({ store: hold })) : q.accept('alpha', slackAt(i + 1))))
+    const results = await Promise.all(Array.from({ length: n }, (_, i) => i === 1 ? q.acceptDecided('alpha', hold.key, () => ({ store: hold }), undefined) : q.accept('alpha', slackAt(i + 1))))
     expect(seqs(results)).toEqual([...Array<string>(QUEUE_GROUP_COMMIT_MAX).fill('failed'), 2, 3])
     // The failed append holds the whole batch; its rollback; then only the next batch: no member is written twice.
     expect(syncs.lines).toEqual([1 + QUEUE_GROUP_COMMIT_MAX, 1, 3])
@@ -2351,7 +2351,7 @@ describe('acceptances queued together share one durable append per batch', () =>
     const syncs = journalSyncs(), q = await open({ fs: syncs.fs })
     const results = await Promise.all([
       q.accept('alpha', slackAt(0)), q.accept('alpha', injectedInput()),
-      q.acceptDecided('alpha', slackAt(0).key, () => { throw new Error('duplicate must not decide') }),
+      q.acceptDecided('alpha', slackAt(0).key, () => { throw new Error('duplicate must not decide') }, undefined),
       q.accept('alpha', slackAt(0)), q.accept('alpha', slackAt(1)),
     ])
     expect(results.map(r => [r.status, 'seq' in r ? r.seq : undefined])).toEqual([['accepted', 1], ['accepted', 2], ['duplicate', 1], ['duplicate', 1], ['accepted', 3]])
@@ -2414,7 +2414,7 @@ describe('a journal loaded after start', () => {
     expect(calls).toEqual([])
     heal()
     const order: string[] = []
-    const result = await q.acceptDecided('alpha', later(THREAD_ROOTS.secondary).key, () => { order.push(`decide after ${calls.length}`); return { store: later(THREAD_ROOTS.secondary) } })
+    const result = await q.acceptDecided('alpha', later(THREAD_ROOTS.secondary).key, () => { order.push(`decide after ${calls.length}`); return { store: later(THREAD_ROOTS.secondary) } }, undefined)
     expect(calls).toEqual([['alpha', 1]])
     expect(order).toEqual(['decide after 1'])
     // A thrown hook leaves the load and the turn's own store in place.
@@ -2443,7 +2443,7 @@ describe('a journal loaded after start', () => {
     heal(); h.state.armed = true
     const from = h.io.steps.length, input = later(THREAD_ROOTS.secondary)
     let observed = false, settled = false
-    const pending = q.acceptDecided('alpha', input.key, () => ({ store: input, afterStore: () => { observed = true } })).then(result => { settled = true; return result })
+    const pending = q.acceptDecided('alpha', input.key, () => ({ store: input, afterStore: () => { observed = true } }), undefined).then(result => { settled = true; return result })
     await Promise.race([h.reached(), pending])
     expect(h.state.armed).toBe(false)
     expect(fs.readFileSync(queuePath(dir), 'utf8')).toContain(input.ts!)
@@ -2489,7 +2489,7 @@ describe('Memory Hold queue records', () => {
   const heldRecord = (hold: HoldField = memoryHold(THREAD_TIME)): AcceptedRecord => ({ ...accepted(), ...heldSlackInput(hold), received_at: THREAD_TIME })
   async function storeHold(q: DeliveryQueue, at: number, overrides: Partial<AcceptedInput> = {}, key = 'alpha', hold: (at: number) => HoldField = memoryHold) {
     const input = heldSlackInput(hold(at), overrides)
-    const result = await q.acceptDecided(key, input.key, () => ({ store: input }))
+    const result = await q.acceptDecided(key, input.key, () => ({ store: input }), undefined)
     expect(result.status).toBe('accepted')
     if (result.status !== 'accepted' || !result.item) throw new Error('hold was not stored')
     return result.item
@@ -2523,7 +2523,7 @@ describe('Memory Hold queue records', () => {
     const q = await open({ now: clock.now, fs: seam, onEvent: e => events.push(e) })
     const hold = kind === 'post' ? postHold(clock.now(), { operations: ['post-one', 'post-two'] }) : memoryHold(clock.now())
     const input = heldSlackInput(hold, { text: 'held exact\nbytes🙂', queued_ack_reaction: 'original_queue' })
-    const result = await q.acceptDecided('alpha', input.key, () => ({ store: input }))
+    const result = await q.acceptDecided('alpha', input.key, () => ({ store: input }), undefined)
     const item_id: unknown = JSON.parse(writes[0]!.toString('utf8')).item_id
     expect(typeof item_id).toBe('string')
     const record: AcceptedRecord = { ...input, v: 1, kind: 'accepted', item_id: item_id as string, seq: 1, received_at: clock.now(), ts: input.ts! }
@@ -2934,7 +2934,7 @@ describe('Memory Hold queue records', () => {
       await reached()
       storeSync.state.armed = true
       // Independent decisions can run now; their stores still follow the held append.
-      const backlog = Array.from({ length: 20 }, (_, i) => q.acceptDecided('alpha', undefined, () => { order.push(`alpha:${i}`); return { store: injectedInput({ text: `alpha:${i}` }) } }))
+      const backlog = Array.from({ length: 20 }, (_, i) => q.acceptDecided('alpha', undefined, () => { order.push(`alpha:${i}`); return { store: injectedInput({ text: `alpha:${i}` }) } }, undefined))
       const alpha = q.resolveHolds('alpha', [{ seq: 1, outcome: 'released', at: clock.now() }]).then(saved => { order.push('alpha:resolved'); return saved })
       pending.push(...backlog, alpha)
       expect(await q.resolveHolds('beta', [{ seq: 1, outcome: 'withdrawn', at: clock.now() }])).toHaveLength(1)
@@ -2964,7 +2964,7 @@ describe('Memory Hold queue records', () => {
     if (state !== 'unresolved') await q.resolveHolds('alpha', [{ seq: 1, outcome: state, at: clock.now() }])
     const duplicate = async () => {
       const bytes = fs.readFileSync(queuePath(dir))
-      expect(await q.acceptDecided('alpha', input.key, () => { throw new Error('duplicate must not decide') })).toMatchObject({ status: 'duplicate', seq: 1 })
+      expect(await q.acceptDecided('alpha', input.key, () => { throw new Error('duplicate must not decide') }, undefined)).toMatchObject({ status: 'duplicate', seq: 1 })
       expect(fs.readFileSync(queuePath(dir))).toEqual(bytes)
     }
     await duplicate()
@@ -2975,7 +2975,7 @@ describe('Memory Hold queue records', () => {
     await clock.advance(1); await q.compact('alpha')
     if (state === 'withdrawn') {
       expect(q.lookupSlackKey('alpha', input.key!)).toBeUndefined()
-      expect(await q.acceptDecided('alpha', input.key, () => ({ store: input }))).toMatchObject({ status: 'accepted', seq: 2 })
+      expect(await q.acceptDecided('alpha', input.key, () => ({ store: input }), undefined)).toMatchObject({ status: 'accepted', seq: 2 })
     } else await duplicate() // Open accepted work and unresolved holds never expire.
   })
 
@@ -3001,7 +3001,7 @@ describe('Memory Hold queue records', () => {
       heldSlackInput(hold(), { channel: THREAD_CHANNELS.secondary, key: { chat_id: THREAD_CHANNELS.secondary, ts: THREAD_ROOTS.secondary } }),
       heldSlackInput(hold(), { channel: THREAD_CHANNELS.private, key: { chat_id: THREAD_CHANNELS.private, ts: THREAD_ROOTS.secondary } }),
     ]
-    for (const input of inputs) expect((await q.acceptDecided('alpha', input.key, () => ({ store: input }))).status).toBe('accepted')
+    for (const input of inputs) expect((await q.acceptDecided('alpha', input.key, () => ({ store: input }), undefined)).status).toBe('accepted')
     await clock.advance(50)
     await q.resolveHolds('alpha', [
       { seq: 1, outcome: 'released', at: clock.now() }, { seq: 2, outcome: 'withdrawn', at: clock.now() },
@@ -3107,9 +3107,9 @@ describe('test-only store timings', () => {
   async function drive(q: DeliveryQueue, rig: TimedRig): Promise<unknown[]> {
     const outcomes: unknown[] = [await q.accept('alpha', slackInput({ text: SECRET }))]
     for (const input of [heldAt(memoryHold(THREAD_TIME), THREAD_ROOTS.secondary, SECRET), heldAt(postHold(THREAD_TIME), THREAD_ROOTS.third, SECRET)]) {
-      outcomes.push(await q.acceptDecided('alpha', input.key, () => ({ store: input })))
+      outcomes.push(await q.acceptDecided('alpha', input.key, () => ({ store: input }), undefined))
     }
-    outcomes.push(await q.accept('alpha', slackInput({ text: SECRET })), await q.acceptDecided('alpha', undefined, () => ({ skip: 'drop' })))
+    outcomes.push(await q.accept('alpha', slackInput({ text: SECRET })), await q.acceptDecided('alpha', undefined, () => ({ skip: 'drop' }), undefined))
     rig.fail = true
     const failed = await q.accept('alpha', later(SECRET))
     outcomes.push(failed.status === 'failed' ? { status: failed.status, error: (failed.error as Error).message } : failed)
@@ -3164,9 +3164,9 @@ describe('test-only store timings', () => {
 
   const MEASURED_ACCEPTS = [
     ['accept', 'accepted', (q: DeliveryQueue) => q.accept('alpha', slackInput())],
-    ['acceptDecided', 'accepted', (q: DeliveryQueue) => q.acceptDecided('alpha', slackInput().key, () => ({ store: slackInput() }))],
-    ['a Post Hold', 'post-hold', (q: DeliveryQueue) => { const input = heldAt(postHold(THREAD_TIME), THREAD_ROOTS.secondary); return q.acceptDecided('alpha', input.key, () => ({ store: input })) }],
-    ['a Memory Hold', 'memory-hold', (q: DeliveryQueue) => { const input = heldAt(memoryHold(THREAD_TIME), THREAD_ROOTS.secondary); return q.acceptDecided('alpha', input.key, () => ({ store: input })) }],
+    ['acceptDecided', 'accepted', (q: DeliveryQueue) => q.acceptDecided('alpha', slackInput().key, () => ({ store: slackInput() }), undefined)],
+    ['a Post Hold', 'post-hold', (q: DeliveryQueue) => { const input = heldAt(postHold(THREAD_TIME), THREAD_ROOTS.secondary); return q.acceptDecided('alpha', input.key, () => ({ store: input }), undefined) }],
+    ['a Memory Hold', 'memory-hold', (q: DeliveryQueue) => { const input = heldAt(memoryHold(THREAD_TIME), THREAD_ROOTS.secondary); return q.acceptDecided('alpha', input.key, () => ({ store: input }), undefined) }],
   ] as const
   test.each(MEASURED_ACCEPTS)('%s: storeMs runs from its turn start, after the wait behind an earlier turn, through its append; atMonoMs is that append return', async (_, store, accept) => {
     const rig = timedRig(), events: QueueEvent[] = [], q = await timedQueue(rig, events), start = rig.mono
@@ -3190,7 +3190,7 @@ describe('test-only store timings', () => {
     let appends = 0
     rig.during = () => { appends++; rig.mono += APPEND }
     // The earlier member's decision takes STAGE, so a batch-wide start would give the measured member STAGE+APPEND too.
-    const earlier = q.acceptDecided('alpha', later().key, () => { rig.mono += STAGE; return { store: later() } })
+    const earlier = q.acceptDecided('alpha', later().key, () => { rig.mono += STAGE; return { store: later() } }, undefined)
     const [first, measured] = await Promise.all([earlier, accept(q)])
     expect([first, measured]).toMatchObject([{ status: 'accepted', seq: 1 }, { status: 'accepted', seq: 2 }])
     expect(appends).toBe(1)
@@ -3207,11 +3207,11 @@ describe('test-only store timings', () => {
     expect(events).toEqual([{ type: 'stored', key: 'alpha', seq: 1, store: 'accepted', storeMs: 0, atMonoMs: rig.mono }])
     events.length = 0
     expect((await q.accept('alpha', slackInput())).status).toBe('duplicate')
-    expect((await q.acceptDecided('alpha', slackInput().key, () => { throw new Error('duplicate must not decide') })).status).toBe('duplicate')
-    expect((await q.acceptDecided('alpha', later().key, () => ({ skip: 'drop' }))).status).toBe('skipped')
+    expect((await q.acceptDecided('alpha', slackInput().key, () => { throw new Error('duplicate must not decide') }, undefined)).status).toBe('duplicate')
+    expect((await q.acceptDecided('alpha', later().key, () => ({ skip: 'drop' }), undefined)).status).toBe('skipped')
     rig.fail = true
     expect((await q.accept('alpha', later())).status).toBe('failed')
-    expect((await q.acceptDecided('alpha', later().key, () => ({ store: later() }))).status).toBe('failed')
+    expect((await q.acceptDecided('alpha', later().key, () => ({ store: later() }), undefined)).status).toBe('failed')
     expect(events.map(e => e.type)).toEqual(['store-failed', 'store-failed'])
     expect(timingFields(events)).toEqual([])
   })
@@ -3219,7 +3219,7 @@ describe('test-only store timings', () => {
   test('one resolveHolds call emits one saved-resolutions event timed over its one append, after its wait, with the saved seqs; a failed one carries no timing', async () => {
     const rig = timedRig(), events: QueueEvent[] = [], q = await timedQueue(rig, events)
     for (const input of [heldAt(memoryHold(THREAD_TIME), THREAD_ROOTS.secondary), heldAt(postHold(THREAD_TIME), THREAD_ROOTS.third), heldAt(memoryHold(THREAD_TIME), THREAD_ROOTS.primary)]) {
-      expect((await q.acceptDecided('alpha', input.key, () => ({ store: input }))).status).toBe('accepted')
+      expect((await q.acceptDecided('alpha', input.key, () => ({ store: input }), undefined)).status).toBe('accepted')
     }
     const resolutions: HoldResolution[] = [{ seq: 1, outcome: 'released', at: THREAD_TIME }, { seq: 2, outcome: 'withdrawn', at: THREAD_TIME }]
     let appends = 0

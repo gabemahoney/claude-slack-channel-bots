@@ -138,7 +138,7 @@ async function resolverFixture(options: { names?: string[]; canRun?: (key: strin
           store: heldSlackInput(field, { channel: C, ts, key: { chat_id: C, ts }, text: MESSAGE_BODY }),
           ...(register ? { afterStore: ({ seq }: { seq: number }) => { const handed = retention!; retention = undefined; register(seq, handed) } } : {}),
         }
-      })
+      }, { channel: C, root })
       if (result.status !== 'accepted') throw new Error('fixture hold not stored')
       return result.seq
     } finally { retention?.() }
