@@ -79,7 +79,7 @@ test.each(['latched', 'relatched', 'leftover', 'other-persona'] as const)('test 
     `HEAD_RELATCHED=${quote(relatched.slice(0, relatched.indexOf('case=') + 5))}`,
     `printf '%s\\n' ${quote(line)} > "$SLACK_STATE_DIR/server.log"`,
     `ad_missing_tick() { printf '%s\\n' '{"source":"ad_recovery"}'; }`,
-    `ad_mark_caller() { printf '1\\t1.000000\\t42\\tget\\tcscb\\n'; }`,
+    `ad_mark_caller() { printf '1\\t1.000000\\t42\\tget\\tcscb\\n2\\t1.000500\\t43\\tstatus\\tcscb\\n'; }`,
     'fmk_text() { [[ "$1" == conflictLatchSetLineHead ]] || exit 1; if [[ "$3" == latched ]]; then echo "$HEAD_LATCHED"; else echo "$HEAD_RELATCHED"; fi; }',
     'latch_lines_of() { :; }',
     'posts_holding() { HOLDING=(); }',
@@ -195,6 +195,8 @@ test.each([
   { kind: 'harness-mark', error: "not the bot server's" },
   { kind: 'late-mark', error: "not from G" },
   { kind: 'early-mark', error: "not from G" },
+  { kind: 'server-candidates', error: '' },
+  { kind: 'other-server-candidate', error: "not the bot server's" },
 ])('test 17 scenario 11 accepts authoritative read recovery: $kind', ({ kind, error }) => {
   const source = readFileSync(join(integration, 'test-17-fmk-launch-pending.sh'), 'utf8')
   const leg = declaration(source, 'leg_fail_create')
@@ -210,7 +212,10 @@ test.each([
     `l_ms=${launch * 1000} l_s=${launch} g_at=${launch + 60} next_at=${next} spawn0=${launch}`,
     'srv=42 mark0=0 first_missing="" table=fixture log0=0',
     `ad_missing_tick() { printf '%s\\n' ${quote(tick)}; }`,
-    `ad_mark_caller() { printf '290\\t${mark.toFixed(6)}\\t${kind === 'harness-mark' ? 99 : 42}\\tstatus\\t${kind === 'harness-mark' ? 'other' : 'cscb'}\\n'; }`,
+    // Every candidate is printed; a second one started after the first but inside the tick's millisecond.
+    `ad_mark_caller() { printf '290\\t${mark.toFixed(6)}\\t${kind === 'harness-mark' ? 99 : 42}\\tstatus\\t${kind === 'harness-mark' ? 'other' : 'cscb'}\\n'; ${
+      kind === 'server-candidates' || kind === 'other-server-candidate'
+        ? `printf '291\\t${(mark + 0.0005).toFixed(6)}\\t${kind === 'other-server-candidate' ? 43 : 42}\\tget\\tcscb\\n';` : ''} }`,
     'calls() { :; }', // The observed direct-read path has no find-missing.
     `first_call_at() { ${kind === 'missing-get' ? ':' : `echo ${mark + 0.001}`}; }`,
     `log_hits() { ${hasRule ? `printf '1\\t${ruleAt}\\tget: missing\\n'` : ':'}; }`,
@@ -251,7 +256,10 @@ test.each([
   { verb: 'get', parent: 99, role: 'other', status: 1 },
   { verb: 'get', parent: 43, role: 'cscb', status: 1 },
   { verb: 'ambiguous', parent: 42, role: 'cscb', status: 1 },
-])('pending-persona mark requires this server: $verb parent=$parent role=$role', ({ verb, parent, role, status }) => {
+  { verb: 'status', parent: 42, role: 'cscb', status: 0, second: 42 },
+  { verb: 'status', parent: 42, role: 'cscb', status: 1, second: 43 },
+  { verb: 'status', parent: 42, role: 'cscb', status: 1, second: 99 },
+].map(c => ({ second: 'none' as number | 'none', ...c })))('pending-persona mark requires this server: $verb parent=$parent role=$role, second candidate $second', ({ verb, parent, role, status, second }) => {
   const source = readFileSync(join(integration, 'test-21-fmk-teardown.sh'), 'utf8')
   const result = run([
     'D_ID=row SERVER_PID=42 TEST_NAME=fixture',
@@ -262,9 +270,114 @@ test.each([
     `ad_mark_caller() {
       [[ "$2" == 7 ]] || fail 'wrong shim window'
       ${verb === 'ambiguous' ? 'return 1' : `printf '8\\t1.100000\\t${parent}\\t${verb}\\t${role}\\n'`}
+      ${second === 'none' ? '' : `printf '9\\t1.100500\\t${second}\\tget\\t${second === 99 ? 'other' : 'cscb'}\\n'`}
     }`,
     declaration(source, 't21_check_missing_mark'),
     't21_check_missing_mark fixture 1794351500.0001 7',
   ].join('\n'))
   expect(result.status).toBe(status)
+})
+
+// b.mve: the tick is stamped in millisecond .010 (it ends at .011000); the
+// marking call M is the bot server's status at .010200.
+const markTick = JSON.stringify({ instance_id: 'row', prior_state: 'waiting', source: 'ad_recovery', ts: '2023-11-14T22:13:20.010Z' })
+const candidate = (pos: number, us: number, parent: number, verb: string, role = 'cscb') =>
+  [pos, `1700000000.${us.toString().padStart(6, '0')}`, parent, verb, role].join('\t')
+
+test.each([
+  { parent: 42, role: 'cscb', status: 0 },
+  { parent: 43, role: 'cscb', status: 1 },
+  { parent: 99, role: 'other', status: 1 },
+])('test 28 missing mark requires every candidate to be this server: second parent=$parent role=$role', ({ parent, role, status }) => {
+  const source = readFileSync(join(integration, 'test-28-fmk-provenance.sh'), 'utf8')
+  const start = source.lastIndexOf('if ad_release_at_least 0.18.0; then', source.indexOf('tick="$(ad_missing_tick "${ID_B}"'))
+  const block = `${source.slice(start, source.indexOf('\n    sleep "${SETTLE_S}"', start))}\nfi`
+  const rows = [candidate(5, 10200, 42, 'status'), candidate(6, 10600, parent, 'get', role)]
+  const result = run([
+    'ad_release_at_least() { return 0; }',
+    'ID_B=row EDIT_MS_P=1700000000000 MARK_P=3 SERVER_PID=42 STEP=fixture TEST_NAME=fixture',
+    `ad_missing_tick() {
+      [[ "$1" == "$ID_B" && "$2" == "$EDIT_MS_P" ]] || fail 'wrong tick window or id'
+      printf '%s\\n' ${quote(markTick)}
+    }`,
+    `ad_mark_caller() {
+      [[ "$1" == ${quote(markTick)} && "$2" == "$MARK_P" ]] || fail 'wrong tick or shim window'
+      printf '%s\\n' ${rows.map(quote).join(' ')}
+    }`,
+    block,
+  ].join('\n'))
+  expect(result.status).toBe(status)
+  if (status === 1) {
+    expect(result.stderr).toContain(`shim line 6, get at 1700000000.010600, parent ${parent}`)
+    expect(result.stderr).toContain("not the bot server 42's")
+  } else {
+    expect(result.stderr).toBe('')
+    expect(result.stdout).toContain('marked row missing')
+  }
+})
+
+test.each([
+  { name: 'the marking call alone', rows: [candidate(5, 10200, 42, 'status')], error: '', named: 'status at 1700000000.010200' },
+  { name: 'two CSCB candidates', rows: [candidate(5, 10200, 42, 'status'), candidate(6, 10600, 43, 'get')], error: '', named: 'status or get at 1700000000.010200 or 1700000000.010600' },
+  { name: 'a harness candidate', rows: [candidate(5, 10200, 99, 'status', 'other')], error: "is not CSCB's" },
+  { name: 'a candidate after te', rows: [candidate(5, 10200, 42, 'status'), candidate(6, 10800, 42, 'get')], error: 'before a call that could have marked it (get at 1700000000.010800)' },
+])('test 19 leg G bounds every candidate by the first missing read\'s return: $name', ({ rows, error, named }) => {
+  const source = readFileSync(join(integration, 'test-19-fmk-reuse.sh'), 'utf8')
+  const leg = declaration(source, 't19_leg_missing_row')
+  const start = leg.lastIndexOf('    if ad_release_at_least 0.18.0; then', leg.indexOf('tick="$(ad_missing_tick "${id}"'))
+  const block = `${leg.slice(start, leg.indexOf('\n    else', start))}\n    fi`
+  const result = run([
+    'ad_release_at_least() { return 0; }',
+    'id=row step=fixture MARK_TIME=1700000000.000100 MARK_AD=3 missing_t=1700000000.010300 missing_te=1700000000.010700',
+    `ad_missing_tick() { printf '%s\\n' ${quote(markTick)}; }`,
+    `ad_mark_caller() {
+      [[ "$2" == 3 && "\${3:-}" == "$missing_te" ]] || fail "ad_mark_caller: not bounded by te: $*"
+      printf '%s\\n' ${rows.map(quote).join(' ')}
+    }`,
+    declaration(source, 't19_at_or_before'),
+    block,
+    'echo "named: $verb at $fm_t"',
+  ].join('\n'))
+  if (error) {
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain(error)
+  } else {
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain(`named: ${named}`)
+  }
+})
+
+test.each([
+  // The tick's millisecond ends by the status's start (.011000): every candidate must precede the status.
+  { name: 'a read before the status', status: 11000, rows: [candidate(5, 10200, 42, 'list')], error: '' },
+  { name: 'two reads before the status', status: 11000, rows: [candidate(5, 10200, 42, 'list'), candidate(6, 10600, 42, 'get')], error: '' },
+  { name: 'a candidate logged after the status', status: 11000, rows: [candidate(5, 10200, 42, 'list'), candidate(10, 10600, 42, 'get')], error: 'is not before its clearing round\'s status (shim line 9)' },
+  // The status began inside the tick's millisecond (.010900): it must be the only candidate.
+  { name: 'the status alone', status: 10900, rows: [candidate(9, 10900, 42, 'status')], error: '' },
+  { name: 'a read beside the status', status: 10900, rows: [candidate(5, 10200, 42, 'list'), candidate(9, 10900, 42, 'status')], error: 'shim line 5 (list at 1700000000.010200) could have made it beside the status' },
+  { name: 'a read after the status', status: 10900, rows: [candidate(9, 10900, 42, 'status'), candidate(10, 10950, 42, 'get')], error: 'shim line 10 (get at 1700000000.010950) could have made it beside the status' },
+  { name: 'one read that is not the status', status: 10900, rows: [candidate(5, 10200, 42, 'list')], error: 'not proven written before' },
+  { name: 'a pause', status: 11000, rows: [candidate(5, 10200, 42, 'pause')], error: 'is not a CSCB active read' },
+  { name: 'a harness read', status: 11000, rows: [candidate(5, 10200, 99, 'get', 'other')], error: 'is not a CSCB active read' },
+])('test 23 pane-not-found mark holds for every candidate: $name', ({ status, rows, error }) => {
+  const source = readFileSync(join(integration, 'test-23-fmk-latch-recheck.sh'), 'utf8')
+  const result = run([
+    'TEST_NAME=fixture PN_CLEAR_MS=1700000000000 PN_END_MARK=4',
+    `ad_missing_tick() { [[ "$1" == row && "$2" == "$PN_CLEAR_MS" ]] || fail 'wrong tick window or id'; printf '%s\\n' ${quote(markTick)}; }`,
+    `ad_mark_caller() {
+      [[ "$2" == "$PN_END_MARK" && -z "\${3:-}" ]] || fail "ad_mark_caller: wrong window: $*"
+      printf '%s\\n' ${rows.map(quote).join(' ')}
+    }`,
+    'state_writes_of() { :; }',
+    declaration(source, 'us_of'),
+    declaration(source, 'check_pn_marked'),
+    `check_pn_marked fixture row 9 1700000000.${status.toString().padStart(6, '0')} 1700000000.012000`,
+  ].join('\n'))
+  if (error) {
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain(error)
+  } else {
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain('read it missing')
+  }
 })

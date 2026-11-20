@@ -1122,8 +1122,9 @@ leg_upgrade_sweep() {
         tick="$(ad_missing_tick "${P_ID}" "$(awk -v t="${MARK_TIME}" 'BEGIN { printf "%.0f", int(t * 1000) }')")" \
             || fail "${step}: no ad.find_missing.tick record marked ${P_ID} missing after the mark"
         caller="$(ad_mark_caller "${tick}" "${MARK_AD}")" || fail "${step}: no agent-director call after the mark could have made it: ${tick}"
-        IFS=$'\t' read -r pos time _ verb role <<< "${caller}"
-        [[ "${role}" == cscb ]] || fail "${step}: the mark's call (shim line ${pos}, ${verb} at ${time}) is not CSCB's"
+        while IFS=$'\t' read -r pos time _ verb role; do
+            [[ "${role}" == cscb ]] || fail "${step}: a call that could have made the mark (shim line ${pos}, ${verb} at ${time}) is not CSCB's"
+        done <<< "${caller}"
         n="$(t14_count_posts "${MARK_RECORD}" "" "${prefix}${body}")"
         [[ "${n}" == 0 ]] || fail "${step}: ${n} launch-start-not-recorded post(s) for ${P_NAME}, not none"
         t14_value latch_case LATCH_CASE_LEFTOVER

@@ -972,6 +972,7 @@ t19_pane_dead() {
 t19_leg_missing_row() {
     local step="missing row, no session id" id="${G_ID}" name="${G_NAME}" session="${G_SESSION}" work="${G_WORK}"
     local ref launch_start launch_s watch leftover_sid elapsed t_begin missing_t missing_te fm_t first_reuse_t diag diag_t n all_fm sid mark_record
+    local pos time v
     local tick caller verb role
 
     ref="$(persona_ref "${name}")" || exit 1
@@ -1037,18 +1038,21 @@ t19_leg_missing_row() {
     missing_te="$(t19_watch_first_return "${watch}" missing)"
     [[ -n "${missing_te}" ]] || { jq -c . "${watch}" | sed 's/^/  | /' >&2; fail "${step}: the first background read of ${id} missing (started ${missing_t}) records no return time"; }
     if ad_release_at_least 0.18.0; then
-        # From 0.18.0 a read checks the rows it selects too: the mark's call
-        # (`ad_mark_caller`, by the tick's source) is CSCB's. That call is the
-        # latest eligible one started before the tick's millisecond ends, and
-        # AD writes the tick after the mark, so the bound below assumes no
-        # other eligible CSCB call starts between the two.
+        # From 0.18.0 a read checks the rows it selects too. The tick names no
+        # caller, so every call that could have made the mark
+        # (`ad_mark_caller`, by the tick's source) is CSCB's, and te bounds
+        # them (`by`): a call started after it cannot have made the mark.
         tick="$(ad_missing_tick "${id}" "$(awk -v t="${MARK_TIME}" 'BEGIN { printf "%.0f", int(t * 1000) }')")" \
             || fail "${step}: no ad.find_missing.tick record marked ${id} missing after the mark"
-        caller="$(ad_mark_caller "${tick}" "${MARK_AD}")" || fail "${step}: no agent-director call after the mark could have made it: ${tick}"
-        IFS=$'\t' read -r _ fm_t _ verb role <<< "${caller}"
-        [[ "${role}" == cscb ]] || fail "${step}: the mark's call (${verb} at ${fm_t}) is not CSCB's: ${tick}"
-        t19_at_or_before "${fm_t}" "${missing_te}" \
-            || fail "${step}: ${id} read missing by a read started at ${missing_t} and returned at ${missing_te}, before the call that marked it (${verb} at ${fm_t})"
+        caller="$(ad_mark_caller "${tick}" "${MARK_AD}" "${missing_te}")" \
+            || fail "${step}: ${id} read missing by a read started at ${missing_t} and returned at ${missing_te}, but no agent-director call after the mark and started by then could have made it: ${tick}"
+        verb="" fm_t=""
+        while IFS=$'\t' read -r pos time _ v role; do
+            [[ "${role}" == cscb ]] || fail "${step}: a call that could have made the mark (shim line ${pos}, ${v} at ${time}) is not CSCB's: ${tick}"
+            t19_at_or_before "${time}" "${missing_te}" \
+                || fail "${step}: ${id} read missing by a read started at ${missing_t} and returned at ${missing_te}, before a call that could have marked it (${v} at ${time})"
+            verb+="${verb:+ or }${v}" fm_t+="${fm_t:+ or }${time}"
+        done <<< "${caller}"
     else
         fm_t="$(t19_cscb_calls_since "${MARK_TIME}" find-missing | awk -F'\t' 'NR == 1 { print $2 }')" || exit 1
         [[ -n "${fm_t}" ]] || fail "${step}: no CSCB find-missing after the mark"

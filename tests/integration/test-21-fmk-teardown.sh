@@ -917,16 +917,19 @@ t21_ms_since() {
 }
 
 # 0.18.0: a retry's get/status may mark D before a find-missing runs. The
-# harness observes the store, and the tick must belong to this bot server.
+# harness observes the store, and every call that could have made the tick
+# must be this bot server's.
 t21_check_missing_mark() {
-    local step="$1" since="$2" from="$3" tick caller pos time ppid verb role after_ms
+    local step="$1" since="$2" from="$3" tick caller pos time ppid verb role after_ms named=""
     after_ms="$(awk -v t="${since}" 'BEGIN { printf "%.0f", int(t * 1000) }')"
     tick="$(ad_missing_tick "${D_ID}" "${after_ms}")" || fail "${step}: no missing tick for ${D_ID} after the restart"
     caller="$(ad_mark_caller "${tick}" "${from}")" || fail "${step}: no unambiguous call made ${D_ID}'s missing mark"
-    IFS=$'\t' read -r pos time ppid verb role <<< "${caller}"
-    [[ "${role}" == cscb && "${ppid}" == "${SERVER_PID}" ]] \
-        || fail "${step}: ${D_ID}'s mark came from ${verb} at shim line ${pos}, parent ${ppid}, not the bot server ${SERVER_PID}"
-    echo "${TEST_NAME}: ${step}: ${D_ID} marked missing by the bot server's ${verb} at ${time} (shim line ${pos})"
+    while IFS=$'\t' read -r pos time ppid verb role; do
+        [[ "${role}" == cscb && "${ppid}" == "${SERVER_PID}" ]] \
+            || fail "${step}: ${D_ID}'s mark could have come from ${verb} at shim line ${pos}, parent ${ppid}, not the bot server ${SERVER_PID}"
+        named+="${named:+ or }${verb} at ${time} (shim line ${pos})"
+    done <<< "${caller}"
+    echo "${TEST_NAME}: ${step}: ${D_ID} marked missing by the bot server's ${named}"
 }
 
 t21_pending_leg() {

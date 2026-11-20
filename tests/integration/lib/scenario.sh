@@ -1191,21 +1191,29 @@
 #                                      print the rows of the CSCB-parented calls of <verb> between the
 #                                      two marks, for a verb that carries no instance id (find-missing,
 #                                      list, version)
-#   ad_mark_caller <tick> [<from-mark>]
-#                                      from 0.18.0, the call that made an `ad.find_missing.tick`
-#                                      record <tick> (one JSON object; the record names no caller):
-#                                      the latest shim `call` line after <from-mark> and by the
-#                                      tick's ts whose verb could make a tick of its `source`
-#                                      (ad_find_missing: find-missing or sweep; ad_recovery: list,
-#                                      or status, get or pause naming the row). Prints
+#   ad_mark_caller <tick> [<from-mark> [<by>]]
+#                                      from 0.18.0, every call that could have made an
+#                                      `ad.find_missing.tick` record <tick> (one JSON object; the
+#                                      record names no caller): each shim `call` line after
+#                                      <from-mark>, started before the tick's millisecond ends and,
+#                                      given <by> (a time with six decimals), at or before <by>, whose
+#                                      verb could make a tick of its `source` (ad_find_missing:
+#                                      find-missing or sweep; ad_recovery: list, or status, get or
+#                                      pause naming the row). Prints one candidate per line, in log
+#                                      order:
 #                                        <position> TAB <time> TAB <ppid> TAB <verb> TAB <cscb|other>
-#                                      and returns 1 when no line could have made it. List filters
-#                                      must admit the tick's prior state and the row's current labels.
-#                                      This is approximate: no call-end times or historical labels are
-#                                      logged. Treat every eligible call in the window as possibly
-#                                      overlapping; fail ambiguous when different parents include a
-#                                      non-CSCB caller. Same-CSCB calls still use the latest start,
-#                                      and list limits/display filters cannot be reconstructed.
+#                                      and returns 1 when no line could have made it. AD commits the
+#                                      mark before it stamps the tick, so a call that started after
+#                                      the marking call can still be a candidate: no one candidate is
+#                                      known to be the marking call, so a caller asserts its claim
+#                                      over every line.
+#                                      Pass as <by> the time an observation of the mark had ended (a
+#                                      read that returned missing): a call started after it cannot
+#                                      have made the mark. List filters must admit the tick's prior
+#                                      state and the row's current labels. No call-end times or
+#                                      historical labels are logged, so candidates may overlap: fail
+#                                      ambiguous when they have different parents and any is not
+#                                      CSCB's. List limits/display filters cannot be reconstructed.
 #   tmux_shim_targets <session-name|session-id|window-id|pane-id> [<from-mark> [<to-mark>]]
 #                                      print, for each tmux shim `call` line between the marks (every
 #                                      line of that log is a CSCB process's or agent-director's for
@@ -5599,11 +5607,16 @@ _scenario_mark_list_selects() {
 }
 
 ad_mark_caller() {
-    local tick="${1:-}" from="${2:--}" step="ad_mark_caller" id source ts prior tick_ms lines=() i found="" role
-    local parents=() roles=() chosen_parent="" chosen_role=""
+    local tick="${1:-}" from="${2:--}" by="${3:--}" step="ad_mark_caller" id source ts prior tick_ms by_us="" lines=() i role
+    local found=() other=""
+    local -A parents=()
     require_ci_image "${step}"
     require_scenario_home "${step}"
     _scenario_check_mark "${step}" "<from-mark>" "${from}"
+    if [[ "${by}" != - ]]; then
+        _scenario_to_us "${by}" || fail "${step}: <by> '${by}' is not a time with six decimals, or -"
+        by_us="${_SCENARIO_US}"
+    fi
     id="$(jq -er '.instance_id // ""' <<< "${tick}" 2> /dev/null)" \
         && source="$(jq -er '.source // ""' <<< "${tick}")" && ts="$(jq -er '.ts // ""' <<< "${tick}")" \
         || fail "${step}: the tick is not one trail record: ${tick}"
@@ -5620,6 +5633,7 @@ ad_mark_caller() {
         _scenario_split_line "${lines[i]}"
         [[ "${_L_KIND}" == call ]] || continue
         (( _L_US < (tick_ms + 1) * 1000 )) || continue
+        [[ -z "${by_us}" ]] || (( _L_US <= by_us )) || continue
         _scenario_decode_words
         _scenario_ad_verb
         _scenario_ad_id
@@ -5631,18 +5645,15 @@ ad_mark_caller() {
         esac
         role=other
         _scenario_role_at "${_L_PPID}" "${_L_US}" && role=cscb
-        parents+=("${_L_PPID}")
-        roles+=("${role}")
-        chosen_parent="${_L_PPID}" chosen_role="${role}"
-        printf -v found '%s\t%s\t%s\t%s\t%s' "$(( i + 1 ))" "$(_scenario_us_text "${_L_US}")" "${_L_PPID}" "${_L_VERB}" "${role}"
+        [[ "${role}" == cscb ]] || other="${_L_PPID}"
+        parents["${_L_PPID}"]=1
+        found+=("$(( i + 1 ))"$'\t'"$(_scenario_us_text "${_L_US}")"$'\t'"${_L_PPID}"$'\t'"${_L_VERB}"$'\t'"${role}")
     done
-    [[ -n "${found}" ]] || return 1
-    for i in "${!parents[@]}"; do
-        if [[ "${parents[i]}" != "${chosen_parent}" && ( "${roles[i]}" == other || "${chosen_role}" == other ) ]]; then
-            fail "${step}: ambiguous mark of ${id}: eligible calls from parents ${parents[i]} and ${chosen_parent} may overlap (no call-end timestamps)"
-        fi
-    done
-    printf '%s\n' "${found}"
+    (( ${#found[@]} > 0 )) || return 1
+    if [[ -n "${other}" ]] && (( ${#parents[@]} > 1 )); then
+        fail "${step}: ambiguous mark of ${id}: eligible calls from parents ${!parents[*]}, ${other} not CSCB's, may overlap (no call-end timestamps)"
+    fi
+    printf '%s\n' "${found[@]}"
 }
 
 # Match each key to the exact shim invocation, through the first success.

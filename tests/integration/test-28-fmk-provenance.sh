@@ -1327,10 +1327,13 @@ if ad_release_at_least 0.18.0; then
     tick="$(ad_missing_tick "${ID_B}" "${EDIT_MS_P}")" \
         || fail "${STEP}: no ad.find_missing.tick record marked row ${ID_B} missing after the edit"
     caller="$(ad_mark_caller "${tick}" "${MARK_P}")" || fail "${STEP}: no agent-director call after the edit could have marked ${ID_B}: ${tick}"
-    IFS=$'\t' read -r pos time ppid verb role <<< "${caller}"
-    [[ "${role}" == cscb && "${ppid}" == "${SERVER_PID}" ]] \
-        || fail "${STEP}: the mark's call (shim line ${pos}, ${verb} at ${time}, parent ${ppid}) is not the bot server ${SERVER_PID}'s"
-    echo "${TEST_NAME}: ${STEP}: the bot server's ${verb} at shim line ${pos} marked ${ID_B} missing"
+    named=""
+    while IFS=$'\t' read -r pos time ppid verb role; do
+        [[ "${role}" == cscb && "${ppid}" == "${SERVER_PID}" ]] \
+            || fail "${STEP}: a call that could have made the mark (shim line ${pos}, ${verb} at ${time}, parent ${ppid}) is not the bot server ${SERVER_PID}'s"
+        named+="${named:+ or }${verb} at shim line ${pos}"
+    done <<< "${caller}"
+    echo "${TEST_NAME}: ${STEP}: the bot server's ${named} marked ${ID_B} missing"
     sleep "${SETTLE_S}"
     n="$(count_in "$(log_slice "${LOG_P}")" "${LATCH_HOLD_B}")"
     [[ "${n}" == 0 ]] || fail "${STEP}: server.log holds ${n} launch-start latch line(s) for ${PERSONA_B} since the leg began, not none"

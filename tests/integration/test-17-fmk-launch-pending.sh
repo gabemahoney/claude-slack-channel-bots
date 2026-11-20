@@ -1315,20 +1315,23 @@ fc_only_pending() {
 # fc_marked_by_server <step> <l-ms> <l-s> <g-at> <next-at> <from-mark> <server-pid> <first-missing>:
 # from 0.18.0, where a read checks the rows it selects: F's row was marked
 # missing (an ad.find_missing.tick record) no earlier than G and no later
-# than F's next launch, by a call of the bot server (`ad_mark_caller`, from
-# <from-mark>); the harness, which reads the store, saw missing only after.
+# than F's next launch, by a call of the bot server (every call
+# `ad_mark_caller` prints from <from-mark> is the bot server's); the harness,
+# which reads the store, saw missing only after.
 fc_marked_by_server() {
     local step="$1" l_ms="$2" l_s="$3" g_at="$4" next_at="$5" from="$6" srv="$7" first_missing="$8"
-    local tick tick_s caller pos time ppid verb role
+    local tick tick_s caller pos time ppid verb role named=""
     tick="$(ad_missing_tick "${F_ID}" "${l_ms}")" || fail "${step}: no ad.find_missing.tick record marked ${F_ID} missing after its launch start"
     tick_s="$(date -u -d "$(jq -r '.ts' <<< "${tick}")" +%s.%3N)" || fail "${step}: the mark's ts does not read as a time: ${tick}"
     awk -v t="${tick_s}" -v g="${g_at}" -v n="${next_at}" 'BEGIN { exit !(t + 0 >= g + 0 && t + 0 <= n + 0.001) }' \
         || fail "${step}: F's row was marked missing $(seconds_between "${l_s}" "${tick_s}")s after L, not from G ${G_S}s to its next launch (+$(seconds_between "${l_s}" "${next_at}")s)"
     caller="$(ad_mark_caller "${tick}" "${from}")" || fail "${step}: no agent-director call at or before the mark could have made it: ${tick}"
-    IFS=$'\t' read -r pos time ppid verb role <<< "${caller}"
-    [[ "${role}" == cscb && "${ppid}" == "${srv}" ]] \
-        || fail "${step}: the mark's call (shim line ${pos}, ${verb} at ${time}, parent ${ppid}) is not the bot server's (${srv})"
-    echo "${TEST_NAME}: ${step}: from L: marked missing +$(seconds_between "${l_s}" "${tick_s}")s by the bot server's ${verb} (shim line ${pos}, source $(jq -r '.source' <<< "${tick}")), next launch +$(seconds_between "${l_s}" "${next_at}")s"
+    while IFS=$'\t' read -r pos time ppid verb role; do
+        [[ "${role}" == cscb && "${ppid}" == "${srv}" ]] \
+            || fail "${step}: a call that could have made the mark (shim line ${pos}, ${verb} at ${time}, parent ${ppid}) is not the bot server's (${srv})"
+        named+="${named:+ or }${verb} (shim line ${pos})"
+    done <<< "${caller}"
+    echo "${TEST_NAME}: ${step}: from L: marked missing +$(seconds_between "${l_s}" "${tick_s}")s by the bot server's ${named} (source $(jq -r '.source' <<< "${tick}")), next launch +$(seconds_between "${l_s}" "${next_at}")s"
     if [[ -n "${first_missing}" ]]; then
         # ROW_READ_AT is just before the store read, which can see a mark made while it ran.
         awk -v m="${first_missing}" -v t="${tick_s}" -v p="${FC_POLL_S}" 'BEGIN { exit !(m + p >= t + 0) }' \

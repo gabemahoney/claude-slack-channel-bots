@@ -881,8 +881,9 @@ s19_scan_trail() {
 # ad.launch.name_held record from `ad_find_missing` (row_result
 # `marked_missing`) naming the leftover's session name and tmux id, a CSCB
 # call that made that mark (to 0.17: a `find-missing` at or before it; from
-# 0.18.0: `ad_mark_caller`), no `find-missing` from any other process (the
-# harness runs none), and no CSCB `kill` of the id.
+# 0.18.0: every call `ad_mark_caller` prints is CSCB's), no `find-missing`
+# from any other process (the harness runs none), and no CSCB `kill` of the
+# id.
 s19_pending_marked() {
     local step="phase 4: ${PEND_KEY}'s row marked missing" id="${PERSONA_ID[${PEND_KEY}]}" session="${PERSONA_NAMED[${PEND_KEY}]}"
     local deadline_ms timeout_s marks ts tick_ms recs named fm pos time us found="" other calls n verb role
@@ -915,13 +916,14 @@ s19_pending_marked() {
     # The mark is a CSCB call's, and no other process ran a find-missing. Up
     # to 0.17 only find-missing marks rows: a CSCB find-missing call started
     # at or before the mark. From 0.18.0 a read checks the rows it selects
-    # too: the latest call at or before the mark that could have made it
-    # (by the tick's source) is CSCB's.
+    # too: every call at or before the mark that could have made it (by the
+    # tick's source) is CSCB's.
     if ad_release_at_least 0.18.0; then
         fm="$(ad_mark_caller "${marks}" "${LIFE2_MARK}")" || fail "${step}: no agent-director call at or before the mark could have made it: ${marks}"
-        IFS=$'\t' read -r pos time _ verb role <<< "${fm}"
-        [[ "${role}" == cscb ]] || fail "${step}: the mark's call (shim line ${pos}, ${verb} at ${time}) is not CSCB's"
-        found="${pos} (${verb})"
+        while IFS=$'\t' read -r pos time _ verb role; do
+            [[ "${role}" == cscb ]] || fail "${step}: a call that could have made the mark (shim line ${pos}, ${verb} at ${time}) is not CSCB's"
+            found+="${found:+ or }${pos} (${verb})"
+        done <<< "${fm}"
     else
         fm="$(ad_cscb_verb_between find-missing "${LIFE2_MARK}" -)"
         while IFS=$'\t' read -r pos time _; do

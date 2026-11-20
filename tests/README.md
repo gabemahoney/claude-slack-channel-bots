@@ -2966,17 +2966,23 @@ written; complete malformed lines still fail.
 - `ad_missing_tick <instance-id> [<after-ms>]` prints the first
   `ad.find_missing.tick` record that marked the row missing at or after
   `<after-ms>`, and returns 1 when there is none. The tick names no caller,
-  so `ad_mark_caller <tick> [<from-mark>]` attributes it: it prints the
-  latest shim `call` line after the mark, and by the tick's `ts`, whose
-  verb could make a tick of its `source` (`ad_find_missing`: `find-missing`
-  or `sweep`; `ad_recovery`: `list`, or `status`, `get` or `pause` naming
-  the row), as `<position> TAB <time> TAB <ppid> TAB <verb> TAB
-  <cscb|other>`, and returns 1 when no line could have made it.
+  so `ad_mark_caller <tick> [<from-mark> [<by>]]` prints every call that
+  could have made it: each shim `call` line after the mark, started before
+  the tick's millisecond ends (and at or before `<by>`, a time with six
+  decimals, when given), whose verb could make a tick of its `source`
+  (`ad_find_missing`: `find-missing` or `sweep`; `ad_recovery`: `list`, or
+  `status`, `get` or `pause` naming the row), one per line in log order as
+  `<position> TAB <time> TAB <ppid> TAB <verb> TAB <cscb|other>`, and
+  returns 1 when no line could have made it. agent-director commits the mark
+  before it stamps the tick, so a call that started after the marking call
+  can still be listed: a caller asserts its claim over every line, never one
+  picked line. Pass as `<by>` the time a read that returned the row missing
+  had ended; a call started after it cannot have made the mark.
   A list must admit the tick's prior state and match every label filter against
   the passive store row. Call ends and historical labels are unavailable: all
-  eligible calls in the window may overlap, so different parents including a
-  non-CSCB caller fail as ambiguous; same-CSCB calls use the latest start.
-  List limits and display filters remain an approximation.
+  candidates may overlap, so candidates from different parents fail as
+  ambiguous when any is not CSCB's. List limits and display filters remain an
+  approximation.
 
 Call windows (fmk mode; scenario 10; each a harness addition). The marks are `ad_shim_mark`'s (above).
 `cscb_ad_calls_between <from-mark> <to-mark|-> <verb> [<fragment>...]` and
