@@ -1507,8 +1507,38 @@ The template's `Dockerfile` mirrors the `/ci` image at the tag
 Each shard is one job:
 
 ```text
-jobsched submit --context <ctx> --name adg-<cscb version>-<cand|ref>-s<k> --channel <id> --network off --cpus 2 --memory 4g --disk 20g --timeout <m>m --env GATE_FILTER=<0|1> --env GATE_DEADLINE_S=<s> [--env GATE_INJECT_FAIL=<files>] -- <the shard's scripts>
+jobsched submit --context <ctx> --name adg-<cscb version>-<cand|ref>-s<k> --channel <id> --network off [--cgroups writable] --cpus <2|burst CPUs> --memory 4g --disk 20g --timeout <m>m --env GATE_FILTER=<0|1> --env GATE_DEADLINE_S=<s> [--env GATE_INJECT_FAIL=<files>] -- <the shard's scripts>
 ```
+
+- **Burst-driver shards.** A shard holding a burst-driver script
+  (`isBurstDriverScript` in `scripts/ci-run.ts`: test-44, 45, 48 and 51–64
+  at v0.19.1) of a tag whose `docker/entrypoint.sh` splits the driver's CPU
+  (`split_driver_cpu`, v0.19.0 on) gets `--cgroups writable` and that tag's
+  own CI burst-shard CPUs, `CPUS_PER_SHARD + DRIVER_CPUS` from the tag's
+  `scripts/ci-run.ts`: 4 for v0.19.1, 3 for v0.19.0. The scheduler then runs
+  it in a private cgroup namespace with its own cgroup writable, which the
+  entrypoint needs to keep the server's quota apart from the driver's (see
+  [Burst-driver shards](#burst-driver-shards)); its `driver-cpu` verdict is
+  otherwise `missing`. `prepare.sh` records the CPUs and the tag's
+  `BURST_DRIVER_SCRIPTS` source as the manifest's `burst_driver`; it fails
+  unless each of `DRIVER_CPUS`, `CPUS_PER_SHARD` and `BURST_DRIVER_SCRIPTS`
+  is declared exactly once and the entrypoint splits, or, for a tag with no
+  `DRIVER_CPUS`, unless the entrypoint does not split (`burst_driver`
+  null: that tag's CI ran these scripts in ordinary shards, and so does the
+  gate). The driver refuses a tag whose pattern is not the kit's own. A
+  shard with no burst-driver script keeps `--cpus 2` and the scheduler's
+  read-only cgroup, and no such shard ever gets `--cgroups writable`. At
+  v0.19.x, though, the burst scripts take about a third of the tag's
+  measured time, so in practice every planned shard holds one: a full
+  gate's candidate shards all run as burst-driver shards (six shards,
+  24 CPUs at v0.19.1), as does each reference shard holding a burst script;
+  only an `--only` subset or a reference rerun without one gets 2-CPU
+  shards. Each shard's CPUs and cgroup setting, as `jobsched status`
+  reports them, are in `report.md`'s shard table and `verdict.json`'s
+  `jobs`. The job has no `--init` (the scheduler offers none), so
+  `entry.sh` must stay PID 1 and start the tag's `entrypoint.sh` as a
+  child, never `exec` it: that entrypoint splits the cgroup only when its
+  own PID is not 1, and would otherwise skip the split silently.
 
 - m is ⌈(2 × the shard's expected seconds + 1800) ÷ 60⌉, and s is
   m × 60 − 600, so the verdict line prints before the scheduler's timeout.
@@ -1517,9 +1547,12 @@ jobsched submit --context <ctx> --name adg-<cscb version>-<cand|ref>-s<k> --chan
   releases; ties go to the earlier release, then the lowest shard number.
   It waits on all pending jobs together with `jobsched wait --timeout 20m`
   in a loop, and records each shard's queue, build and run times.
-- **2 CPUs and 4 GiB per shard.** Six shards reserve 12 CPUs and 24 GiB,
-  where the hand-built gate reserved 28 GiB for each of its four serial
-  jobs. Measured on AD 0.17.5 against CSCB 0.18.6: shard peaks of 194.2 to
+- **4 GiB per shard, and 2 CPUs for a shard with no burst-driver script**
+  (a burst-driver shard gets the tag's burst CPUs, above). The scheduler
+  admits jobs by slot and memory, not CPUs: `--cpus` caps a container's CPU
+  time and reserves nothing, so shards can contend for the host's CPUs. Six
+  shards reserve 24 GiB, where the hand-built gate reserved 28 GiB for each
+  of its four serial jobs. Measured on AD 0.17.5 against CSCB 0.18.6: shard peaks of 194.2 to
   408.6 MiB, the filter shard highest; the serial run peaked at 440 MiB.
   Per-script times on 2 CPUs matched the 4-CPU serial run within about 1 s
   (test-24: 1498 s), so 2 CPUs does not slow the timing-sensitive scripts.
@@ -1630,13 +1663,17 @@ incomplete reference run never becomes a pass.
   `SHA256SUMS`, with `install.sh` from the AD checkout at the tag. The
   binary must be a linux-amd64 ELF. The earlier-CSCB downgrade fixture must
   match the version and SHA-256 the tag's `docker/Dockerfile.test.base` pins
-  (see [The job image](#the-job-image)). The manifest holds names, versions,
-  SHA-256s and that fixture's publication time only.
+  (see [The job image](#the-job-image)). The burst-driver shard resources
+  come from the tag's `scripts/ci-run.ts` (see
+  [Resources and wall time](#resources-and-wall-time)). The manifest holds
+  names, versions, SHA-256s, that fixture's publication time and those
+  resources only.
 - **Before submitting,** the driver checks that the manifest names this CSCB
   version, tests from the tag's commit, the role's expected AD version and
   its `ad_role`, and that each input file matches its recorded SHA-256 (the
   client tarball present exactly when one is recorded). The reference's
-  CSCB and `cscb_downgrade` entries must equal the candidate's.
+  CSCB, `cscb_downgrade` and `burst_driver` entries must equal the
+  candidate's.
 - **The image build** checks the binary's version and commit, the admin
   tool's version and the installed files' digests, and proves test-47's
   install of the downgrade fixture resolves with no network (see

@@ -16,7 +16,8 @@
 #   --inputs DIR     the context's inputs directory, which must be named
 #                    `inputs`; it is emptied first.
 #   --cscb-version   the published CSCB version to test; default: npm's latest.
-#                    Its tests come from the CSCB checkout's tag v<VERSION>.
+#                    Its tests come from the CSCB checkout's tag v<VERSION>,
+#                    and the manifest's burst_driver from its scripts/ci-run.ts.
 #   --ad-tag         a published AD release: agent-director-linux-amd64,
 #                    agent-director-admin-linux-amd64 and the client tgz from
 #                    the release's public download URLs, checked against its
@@ -107,6 +108,42 @@ PKG_VERSION="$(tar -xOzf "${CSCB_TGZ}" package/package.json | jq -r .version)"
 [[ "${PKG_VERSION}" == "${CSCB_VERSION}" ]] || die "the packed CSCB is ${PKG_VERSION}, not ${CSCB_VERSION}"
 AD_PIN="$(tar -xOzf "${CSCB_TGZ}" package/package.json | jq -r '.dependencies["agent-director"]')"
 [[ "${AD_PIN}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "CSCB ${CSCB_VERSION} pins agent-director '${AD_PIN}', not an exact version"
+
+# The tag's burst-driver shards (b.ya4). A tag whose docker/entrypoint.sh
+# splits a burst-driver shard's CPU (split_driver_cpu, v0.19.0 on) declares
+# DRIVER_CPUS in its scripts/ci-run.ts: its CI gave such a shard
+# CPUS_PER_SHARD + DRIVER_CPUS CPUs, and BURST_DRIVER_SCRIPTS names its
+# scripts. The manifest's burst_driver records both, each declared exactly
+# once; it is null for an earlier tag, whose CI ran them in ordinary shards.
+CI_RUN="$(git -C "${CSCB_REPO}" cat-file -p "v${CSCB_VERSION}:scripts/ci-run.ts")" \
+    || die "the CSCB checkout ${CSCB_REPO} has no v${CSCB_VERSION}:scripts/ci-run.ts"
+# ci_count <name>: how many lines of the tag's ci-run.ts declare the constant.
+ci_count() { grep -c -E "^export const $1([^A-Za-z0-9_\$]|\$)" <<< "${CI_RUN}" || true; }
+# ci_const <name> <sed value pattern>: the value of the constant's one declaration, when it has that form.
+ci_const() {
+    local found
+    [[ "$(ci_count "$1")" == 1 ]] || return 1
+    found="$(sed -n "s/^export const $1 = $2\$/\\1/p" <<< "${CI_RUN}")"
+    [[ -n "${found}" && "${found}" != *$'\n'* ]] || return 1
+    printf '%s\n' "${found}"
+}
+ENTRYPOINT_SPLITS=0
+if grep -q -E '^split_driver_cpu\(\)' "${INPUTS}/cscb-src/docker/entrypoint.sh"; then ENTRYPOINT_SPLITS=1; fi
+if [[ "$(ci_count DRIVER_CPUS)" == 0 ]]; then
+    (( ENTRYPOINT_SPLITS == 0 )) \
+        || die "v${CSCB_VERSION}:docker/entrypoint.sh defines split_driver_cpu, but v${CSCB_VERSION}:scripts/ci-run.ts declares no DRIVER_CPUS"
+    BURST_DRIVER=null
+else
+    (( ENTRYPOINT_SPLITS == 1 )) \
+        || die "v${CSCB_VERSION}:scripts/ci-run.ts declares DRIVER_CPUS, but v${CSCB_VERSION}:docker/entrypoint.sh defines no split_driver_cpu"
+    DRIVER_CPUS="$(ci_const DRIVER_CPUS '\([1-9][0-9]*\)')" \
+        || die "v${CSCB_VERSION}:scripts/ci-run.ts declares no single DRIVER_CPUS count"
+    CPUS_PER_SHARD="$(ci_const CPUS_PER_SHARD '\([1-9][0-9]*\)')" \
+        || die "v${CSCB_VERSION}:scripts/ci-run.ts declares no single CPUS_PER_SHARD count"
+    BURST_PATTERN="$(ci_const BURST_DRIVER_SCRIPTS '\/\(.*\)\/')" \
+        || die "v${CSCB_VERSION}:scripts/ci-run.ts declares no single BURST_DRIVER_SCRIPTS regular expression without flags"
+    BURST_DRIVER="$(jq -nc --argjson cpus "$(( CPUS_PER_SHARD + DRIVER_CPUS ))" --arg pattern "${BURST_PATTERN}" '{cpus: $cpus, pattern: $pattern}')"
+fi
 
 # The client CSCB resolves (its exact pin), as the client check's tarball.
 npm pack --ignore-scripts --silent --pack-destination "${INPUTS}/fixtures" "agent-director@${AD_PIN}" >/dev/null
@@ -242,13 +279,14 @@ jq -n \
     --arg ad_client_sha "$( [[ -f "${INPUTS}/ad/client.tgz" ]] && sha "${INPUTS}/ad/client.tgz" || true)" \
     --arg ad_commit "${AD_COMMIT}" --arg ad_role "${AD_ROLE}" \
     --arg downgrade_version "${DOWNGRADE_VERSION}" --arg downgrade_sha "$(sha "${DOWNGRADE_TGZ}")" \
-    --arg downgrade_published "${DOWNGRADE_PUBLISHED}" \
+    --arg downgrade_published "${DOWNGRADE_PUBLISHED}" --argjson burst_driver "${BURST_DRIVER}" \
     '{cscb: {version: $cscb_version, tests_commit: $cscb_commit, tarball_sha256: $cscb_sha, ad_client_pin: $ad_pin},
       candidate: ({source: $ad_source, expected_version: $ad_version}
                   + (if $ad_commit == "" then {} else {commit: $ad_commit} end)
                   + {binary_sha256: $ad_sha, admin_sha256: $ad_admin_sha, installer_sha256: $ad_install_sha,
                      client_tgz_sha256: $ad_client_sha}),
-      cscb_downgrade: {version: $downgrade_version, tarball_sha256: $downgrade_sha, published: $downgrade_published}}
+      cscb_downgrade: {version: $downgrade_version, tarball_sha256: $downgrade_sha, published: $downgrade_published},
+      burst_driver: $burst_driver}
      + (if $ad_role == "" then {} else {ad_role: $ad_role} end)' > "${INPUTS}/manifest.json"
 cp "${CSCB_TGZ}" "${INPUTS}/cscb/package.tgz"
 rm -f "${CSCB_TGZ}"

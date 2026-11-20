@@ -65,6 +65,34 @@ downgrade fixture: test-47's install warmed in testuser's bun cache and
 proved offline (--offline, and with the network blocked)` (see
 [The job image](../../../docker/README.md#the-job-image)).
 
+A shard gets 4 GiB and either 2 CPUs and the scheduler's read-only cgroup,
+or, as a burst-driver shard, `--cgroups writable` and the tag's own CI
+burst-shard CPUs (`CPUS_PER_SHARD + DRIVER_CPUS` from its
+`scripts/ci-run.ts`: 4 for v0.19.1, 3 for v0.19.0), recorded as the
+manifest's `burst_driver`. A burst-driver shard is one holding a
+burst-driver script (test-44, 45, 48 and 51–64 at v0.19.1) of a tag whose
+entrypoint splits the driver's CPU (v0.19.0 on); no other shard gets
+`--cgroups writable`. At v0.19.x the burst scripts take about a third of the
+tag's measured time, so every planned shard holds one in practice: a full
+gate's candidate shards all run as burst-driver shards (six shards, 24 CPUs
+at v0.19.1), and so does each reference shard holding a burst script; only an
+`--only` subset or a reference rerun without them gets 2-CPU shards. The
+scheduler admits jobs by slot and memory, not CPUs: `--cpus` caps each
+container's CPU time and reserves nothing, so shards can contend for the
+host's CPUs. The dry run's plan marks a burst-driver shard `, burst driver
+(<n> CPUs, cgroups writable)`, and `report.md`'s shard table and
+`verdict.json`'s `jobs` show each shard's `cpus` and `cgroups`.
+
+`--cgroups writable` needs Docker Engine 28+ on the scheduler's host. On an
+older host the scheduler rejects the job after its build
+(`cgroups-unsupported`), so the gate FAILs that shard with a
+`scheduler-state` reason, `job <id> ended rejected`, and `verdict.json`'s
+`jobs[].reason` holds the scheduler's `writable cgroups require Docker
+server 28.0+; version <v>`. A burst-driver shard run with a read-only cgroup
+fails its scripts' `driver-cpu` verdict as `missing`. Either way, fix the
+host; never drop the scripts. See
+[Resources and wall time](../../../docker/README.md#resources-and-wall-time).
+
 ## What a release gate runs
 
 - **The latest CSCB release only by default.** Repeat `--cscb-version` to
@@ -98,7 +126,7 @@ downloads every input, so give the Bash call a 10-minute `timeout`.
 
 - Check the `ad-gate: shards:` line (see [Shard choice](#shard-choice)),
   then `ad-gate: CSCB <v> candidate: <n> scripts in <k> shard(s)` and one
-  `s<k>: ~<seconds> s[, filter regression]: <scripts>` per shard. With
+  `s<k>: ~<seconds> s[, filter regression][, burst driver (<n> CPUs, cgroups writable)]: <scripts>` per shard. With
   measured durations and six free slots, CSCB 0.18.6 plans 33 scripts in six
   shards of about 28 min.
 - The commands follow `ad-gate: dry run: <n> candidate submit command(s)
@@ -206,7 +234,7 @@ Each release's `<out>/cscb-<v>/verdict.json` holds the evidence:
 | `candidate.manifest`, `reference.manifest` | Every input's version and SHA-256 |
 | `manifestProblems` | Inputs, run.log manifests or job provenance that did not match |
 | `scripts` | Each planned script's outcome line per shard, on the candidate and the reference |
-| `jobs` | Per shard: job ID and name, state, exit, queue, build and run seconds, peak memory, OOM facts, context SHA-256 |
+| `jobs` | Per shard: job ID and name, state, exit, CPUs and cgroup setting, queue, build and run seconds, peak memory, OOM facts, context SHA-256 |
 | `firstSubmitAt`, `verdictAt`, `wallSeconds` | The wall time, first submit to verdict |
 
 A reason's `kind` names its rule: `manifest-mismatch`, `plan-coverage`,
@@ -301,9 +329,10 @@ runs. Rerun with `--resume`, or in a new `--out` when an option must change.
 
 | Message | What to do |
 |---|---|
-| `prepare.sh failed for the <role> (exit <n>): <line>; see <path>/prepare.log` | Read `prepare.log` (a download, checksum or tag failed) and fix it. Rerun with `--resume`, or in a new `--out` when an option must change. A line naming `docker/Dockerfile.test.base` is about the downgrade fixture the tag pins (see [The job image](../../../docker/README.md#the-job-image)): a SHA-256 mismatch means npm serves another tarball than the pin, so report it; a tag with no single pin (any before v0.17.0) cannot be gated |
+| `prepare.sh failed for the <role> (exit <n>): <line>; see <path>/prepare.log` | Read `prepare.log` (a download, checksum or tag failed) and fix it. Rerun with `--resume`, or in a new `--out` when an option must change. A line naming `docker/Dockerfile.test.base` is about the downgrade fixture the tag pins (see [The job image](../../../docker/README.md#the-job-image)): a SHA-256 mismatch means npm serves another tarball than the pin, so report it; a tag with no single pin (any before v0.17.0) cannot be gated. A line naming `scripts/ci-run.ts` or `docker/entrypoint.sh` means the tag's burst-driver figures (`DRIVER_CPUS`, `CPUS_PER_SHARD`, `BURST_DRIVER_SCRIPTS`, `split_driver_cpu`) are missing, repeated or disagree: that tag cannot be gated; report it |
 | `planning the <role> for claude-slack-channel-bots <version>: <reason>` | For `"<name>" names no integration script of the tag` or `<file> cannot run in the gate: …`, correct `--only` in a new `--out`. For `the tag's prerequisite headers are refused: …` or `the tag has no test-1`, that release cannot be gated: report it |
-| `<context> holds no inputs/cscb-src/tests/integration: prepare.sh extracted no tests from the tag`, `the manifest <path> cannot be read: <reason>`, `the manifest <path> is not JSON: <reason>`, `the manifest <path> has no <cscb\|candidate\|cscb_downgrade> block`, `the tag script <path> cannot be read: <reason>` or `the tag duration table <path> cannot be read: <reason>` | The context is incomplete: read `prepare.log`, then start a new `--out`. A context an earlier kit prepared has no `cscb_downgrade` block |
+| `<context> holds no inputs/cscb-src/tests/integration: prepare.sh extracted no tests from the tag`, `the manifest <path> cannot be read: <reason>`, `the manifest <path> is not JSON: <reason>`, `the manifest <path> has no <cscb\|candidate\|cscb_downgrade> block`, `the manifest <path> has no valid burst_driver (null or {cpus, pattern}); …`, `the tag script <path> cannot be read: <reason>` or `the tag duration table <path> cannot be read: <reason>` | The context is incomplete: read `prepare.log`, then start a new `--out`. A context an earlier kit prepared has no `cscb_downgrade` block or no `burst_driver` |
+| `the tag classifies burst-driver scripts by /<pattern>/, not the kit's /<pattern>/: …` | The tag's `BURST_DRIVER_SCRIPTS` differs from the kit's, so the kit cannot tell its burst-driver shards: report it; gate that tag with a kit whose pattern is the tag's |
 | `shard(s) <k> would need a timeout above jobsched's 12 h: use more shards or --durations` | Use more shards, or `--durations` with measured times |
 
 ### The scheduler

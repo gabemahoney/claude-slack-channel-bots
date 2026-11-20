@@ -17,7 +17,9 @@
  * `GATE_INJECT_FAIL` names it; every other script passes. The scenario's
  * evidence switches, each naming a role, make that role's jobs report an OOM
  * kill, keep no result.json, or show `status` a wrong name, a wrong context
- * directory or a context hash of their own. Runs no child.
+ * directory or a context hash of their own. `status` reports each job's
+ * submitted `--cpus` and `--cgroups` (`readonly` when not given), as the
+ * scheduler reports the limits it applied. Runs no child.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -52,6 +54,8 @@ interface Job {
   readonly state: 'succeeded' | 'failed'
   readonly exitCode: number
   readonly ended: boolean
+  readonly cpus: number
+  readonly cgroups: string
 }
 
 const scenarioPath = process.env['AD_GATE_FAKE_SCENARIO'] ?? ''
@@ -113,7 +117,11 @@ function submit(): void {
   mkdirSync(jobsDir, { recursive: true })
   const count = readdirSync(jobsDir).filter((entry) => entry.endsWith('.json') && !entry.endsWith('.result.json')).length
   const id = `j20261106000000-${(count + 1).toString(16).padStart(6, '0')}`
-  const job: Job = { id, name, context, role, state: passed ? 'succeeded' : 'failed', exitCode: passed ? 0 : 1, ended: scenario.waitBatches === undefined }
+  const job: Job = {
+    id, name, context, role, state: passed ? 'succeeded' : 'failed', exitCode: passed ? 0 : 1, ended: scenario.waitBatches === undefined,
+    cpus: Number(optionValues(options, '--cpus')[0] ?? '4'),
+    cgroups: optionValues(options, '--cgroups')[0] ?? 'readonly',
+  }
   const oomKilled = scenario.oomKilled === role
   writeFileSync(jobPath(id, '.run.log'), runLog)
   if (scenario.noResult !== role) {
@@ -140,6 +148,8 @@ function status(id: string): void {
       build_s: 2,
       run_s: 3,
       peak_memory: 1048576,
+      cpus: job.cpus,
+      cgroups: job.cgroups,
       remote_host: 'fixture-host',
       reason: null,
       submitted_at: '2026-11-06T00:00:00Z',

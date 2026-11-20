@@ -13,7 +13,10 @@
  * `badInputs` naming the role (and `onlyRelease`, if set, naming the CSCB
  * release), the manifest's binary sha256 is wrong; with
  * `refCscbDiffers`, the reference gets another CSCB package than the
- * candidate, its own manifest matching it. The scripts are written as
+ * candidate, its own manifest matching it. The manifest's `burst_driver` is
+ * the scenario's `burstDriver`, any JSON value (null when absent), and is
+ * left out with `burstDriver: 'absent'`; the reference's is `refBurstDriver`
+ * when that is set. The scripts are written as
  * tests/ad-gate.test.ts commits them into its scratch tag. Runs no child.
  *
  * SPDX-License-Identifier: MIT
@@ -31,6 +34,8 @@ interface Scenario {
   readonly badInputs?: 'cand' | 'ref'
   readonly onlyRelease?: string
   readonly refCscbDiffers?: boolean
+  readonly burstDriver?: unknown
+  readonly refBurstDriver?: unknown
 }
 
 const scenarioPath = process.env['AD_GATE_FAKE_SCENARIO'] ?? ''
@@ -55,6 +60,7 @@ for (const [fileName, requires] of Object.entries(scenario.scripts)) {
   put(join(integration, fileName), ['#!/usr/bin/env bash', '# fixture integration script', ...(requires === null ? [] : [`# ci-requires: ${requires}`]), 'exit 0', ''].join('\n'))
 }
 put(join('cscb-src', 'tests', 'ci-durations.tsv'), scenario.durations)
+const burstDriver = role === 'ref' && scenario.refBurstDriver !== undefined ? scenario.refBurstDriver : scenario.burstDriver
 
 const manifest = {
   cscb: {
@@ -76,6 +82,7 @@ const manifest = {
     tarball_sha256: put(join('fixtures', 'downgrade', 'claude-slack-channel-bots-0.0.1.tgz'), 'fixture CSCB downgrade package\n'),
     published: '2026-01-01T00:00:00.000Z',
   },
+  ...(burstDriver === 'absent' ? {} : { burst_driver: burstDriver ?? null }),
   ad_role: role,
 }
 if (badInputs) put(join('ad', 'agent-director'), `fixture ${role} binary (never run)\n`)

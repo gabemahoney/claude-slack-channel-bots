@@ -120,6 +120,7 @@ import {
   planShards,
   planShardsWithNotes,
   submitCommands,
+  type BurstDriver,
   type FilterOutcome,
   type GateReason,
   type GateVerdict,
@@ -135,7 +136,7 @@ import {
   type ShardResult,
   type SubmitSettings,
 } from '../scripts/ad-gate/ad-gate.ts'
-import { DURATION_TABLE_HEADER, DURATION_TABLE_PATH, durationLineIgnoredNote, durationTableMissingNote, sortCanonical } from '../scripts/ci-run.ts'
+import { BURST_DRIVER_SCRIPTS, CPUS_PER_SHARD, DRIVER_CPUS, DURATION_TABLE_HEADER, DURATION_TABLE_PATH, durationLineIgnoredNote, durationTableMissingNote, sortCanonical } from '../scripts/ci-run.ts'
 import { hostSafeChildEnv, resolveToolDir } from './test-helpers/host-safe-env.ts'
 
 // --- Fixtures ---
@@ -866,6 +867,7 @@ const SETTINGS: SubmitSettings = {
   cscbVersion: '9.8.7',
   role: 'candidate',
   channel: 'C0FAKE00001',
+  burstDriver: null,
 }
 
 /** Each option's values before `--`, by flag. */
@@ -966,6 +968,102 @@ describe('submitCommands (dry run)', () => {
   })
 })
 
+// --- Burst-driver shards (b.ya4) ---
+
+/** Two of v0.19.1's burst-driver scripts (BURST_DRIVER_SCRIPTS). */
+const THREAD_BURST = 'test-44-fmk-thread-burst.sh'
+const MEMBERSHIP_LOAD = 'test-51-fmk-membership-load-transient.sh'
+
+/** v0.19.1's manifest block: its CPUS_PER_SHARD 2 plus DRIVER_CPUS 2, by the kit's own pattern. */
+const BURST_V0191: BurstDriver = { cpus: 4, pattern: BURST_DRIVER_SCRIPTS.source }
+/** v0.19.0's: DRIVER_CPUS 1, so 3, as its CI gave its burst shards. */
+const BURST_V0190: BurstDriver = { cpus: 3, pattern: BURST_DRIVER_SCRIPTS.source }
+
+/** An ordinary shard (s1, the filter's) and a burst-driver shard (s2), the burst one longer. */
+const BURST_PLAN: ShardPlan = {
+  scripts: [f(1), f(5), THREAD_BURST, MEMBERSHIP_LOAD],
+  shards: [
+    { shard: 1, scripts: [f(1), f(5)], expectedSeconds: 100, filterRegression: true },
+    { shard: 2, scripts: [f(1), THREAD_BURST, MEMBERSHIP_LOAD], expectedSeconds: 600, filterRegression: false },
+  ],
+}
+
+/** BURST_PLAN's s1 as submitted before b.ya4, and still for any shard holding no burst-driver script. */
+const ORDINARY_S1_ARGV = [
+  SETTINGS.jobsched, 'submit',
+  '--context', SETTINGS.context,
+  '--name', 'adg-9.8.7-cand-s1',
+  '--channel', SETTINGS.channel,
+  '--network', 'off',
+  '--cpus', '2',
+  '--memory', '4g',
+  '--disk', '20g',
+  '--timeout', '34m',
+  '--env', 'GATE_FILTER=1',
+  '--env', `GATE_DEADLINE_S=${34 * 60 - 600}`,
+  '--', f(1), f(5),
+]
+
+/** BURST_PLAN's s2 with `cpus` and, when `writable`, the scheduler's writable cgroup. */
+function burstS2Argv(cpus: string, writable: boolean): string[] {
+  return [
+    SETTINGS.jobsched, 'submit',
+    '--context', SETTINGS.context,
+    '--name', 'adg-9.8.7-cand-s2',
+    '--channel', SETTINGS.channel,
+    '--network', 'off',
+    ...(writable ? ['--cgroups', 'writable'] : []),
+    '--cpus', cpus,
+    '--memory', '4g',
+    '--disk', '20g',
+    '--timeout', '50m',
+    '--env', 'GATE_FILTER=0',
+    '--env', `GATE_DEADLINE_S=${50 * 60 - 600}`,
+    '--', f(1), THREAD_BURST, MEMBERSHIP_LOAD,
+  ]
+}
+
+describe('submitCommands: burst-driver shards (b.ya4)', () => {
+  test("the fixtures are burst-driver scripts by the kit's rule, and v0.19.1's figures are this checkout's", () => {
+    expect([THREAD_BURST, MEMBERSHIP_LOAD].every((file) => BURST_DRIVER_SCRIPTS.test(file))).toBe(true)
+    expect([f(1), f(5)].some((file) => BURST_DRIVER_SCRIPTS.test(file))).toBe(false)
+    expect(CPUS_PER_SHARD + DRIVER_CPUS).toBe(BURST_V0191.cpus)
+  })
+
+  test("a burst-driver shard gets --cgroups writable and the tag's burst CPUs; the ordinary shard keeps today's exact argv", () => {
+    expect(submitCommands({ ...SETTINGS, burstDriver: BURST_V0191 }, BURST_PLAN)).toEqual([burstS2Argv('4', true), ORDINARY_S1_ARGV])
+  })
+
+  test('a tag without the split (burst_driver null) gets no burst option on any shard, burst scripts or not', () => {
+    const commands = submitCommands({ ...SETTINGS, burstDriver: null }, BURST_PLAN)
+
+    expect(commands).toEqual([burstS2Argv('2', false), ORDINARY_S1_ARGV])
+    expect(commands.flat()).not.toContain('--cgroups')
+  })
+
+  test("v0.19.0's burst-driver shard gets its own CI's 3 CPUs, never more", () => {
+    expect(submitCommands({ ...SETTINGS, burstDriver: BURST_V0190 }, BURST_PLAN)).toEqual([burstS2Argv('3', true), ORDINARY_S1_ARGV])
+  })
+
+  test('a reference burst-driver shard gets the same options', () => {
+    const [argv] = submitCommands({ ...SETTINGS, role: 'reference', burstDriver: BURST_V0191 }, refPlan(THREAD_BURST))
+
+    expect([optionsOf(argv).get('--cgroups'), optionsOf(argv).get('--cpus')]).toEqual([['writable'], ['4']])
+  })
+
+  test('a plan with no burst-driver script is submitted exactly as with burst_driver null', () => {
+    expect(submitCommands({ ...SETTINGS, burstDriver: BURST_V0191 }, CAND)).toEqual(submitCommands(SETTINGS, CAND))
+  })
+
+  test("a context whose burst-driver pattern is not the kit's is refused", () => {
+    const other: BurstDriver = { cpus: 4, pattern: '-fmk-thread-burst\\.sh$' }
+
+    expect(() => submitCommands({ ...SETTINGS, burstDriver: other }, BURST_PLAN)).toThrow(
+      `the tag classifies burst-driver scripts by /${other.pattern}/, not the kit's /${BURST_DRIVER_SCRIPTS.source}/`,
+    )
+  })
+})
+
 const REPO_ROOT = join(import.meta.dir, '..')
 
 // --- patch-client-check.py's supported release forms ---
@@ -1046,6 +1144,14 @@ describe("prepare.sh's downgrade fixture", () => {
   const BASE = readFileSync(join(REPO_ROOT, 'docker', 'Dockerfile.test.base'), 'utf8')
   const SHA_ARG = /^ARG CSCB_DOWNGRADE_SHA256=[0-9a-f]{64}$/m
   const PUBLISHED = BASE.match(/"published":"([^"]+)"/)?.[1] ?? ''
+  // This repository's burst-driver split (b.ya4): its ci-run.ts constants and its entrypoint.
+  const CI_RUN = readFileSync(join(REPO_ROOT, 'scripts', 'ci-run.ts'), 'utf8')
+  const ENTRYPOINT = readFileSync(join(REPO_ROOT, 'docker', 'entrypoint.sh'), 'utf8')
+  const DRIVER_LINE = /^export const DRIVER_CPUS = [0-9]+$/m
+  const PER_SHARD_LINE = /^export const CPUS_PER_SHARD = [0-9]+$/m
+  const PATTERN_LINE = /^export const BURST_DRIVER_SCRIPTS = \/.*\/$/m
+  /** A tag's ci-run.ts before the split (v0.18.x): it declares no DRIVER_CPUS. */
+  const PRE_SPLIT_CI_RUN = CI_RUN.replace(DRIVER_LINE, '')
   const AD_PIN = '1.2.3'
   let work = ''
   let serve = ''
@@ -1062,7 +1168,7 @@ describe("prepare.sh's downgrade fixture", () => {
       cwd,
       env: hostSafeChildEnv(join(work, 'home'), {
         pathDirs: [stubBin],
-        tools: ['bash', 'git', 'jq', 'tar', 'gzip', 'sha256sum', 'sed', 'awk', 'python3', 'du'],
+        tools: ['bash', 'git', 'jq', 'tar', 'gzip', 'sha256sum', 'sed', 'awk', 'grep', 'python3', 'du'],
         extras: { GIT_CONFIG_NOSYSTEM: '1' },
       }),
       stdout: 'pipe',
@@ -1102,9 +1208,15 @@ describe("prepare.sh's downgrade fixture", () => {
     return header
   }
 
-  /** Commits `base` as the CSCB checkout's docker/Dockerfile.test.base, tags it v<version> and serves that CSCB. */
-  function cscbTag(version: string, base: string): void {
+  /**
+   * Commits `base` as the CSCB checkout's docker/Dockerfile.test.base, with
+   * `burst`'s scripts/ci-run.ts and docker/entrypoint.sh (a tag before the
+   * burst-driver split by default), tags it v<version> and serves that CSCB.
+   */
+  function cscbTag(version: string, base: string, burst: { readonly ciRun?: string; readonly entrypoint?: string } = {}): void {
     writeFileSync(join(cscbRepo, 'docker', 'Dockerfile.test.base'), base)
+    writeFileSync(join(cscbRepo, 'scripts', 'ci-run.ts'), burst.ciRun ?? PRE_SPLIT_CI_RUN)
+    writeFileSync(join(cscbRepo, 'docker', 'entrypoint.sh'), burst.entrypoint ?? 'exit 0\n')
     must(['git', '-C', cscbRepo, 'add', '-A'])
     must(['git', '-C', cscbRepo, '-c', 'user.name=ad-gate test', '-c', 'user.email=ad-gate-test@example.invalid', 'commit', '-q', '--allow-empty', '-m', version])
     must(['git', '-C', cscbRepo, 'tag', `v${version}`])
@@ -1130,7 +1242,7 @@ describe("prepare.sh's downgrade fixture", () => {
     adRepo = join(work, 'ad')
     adDist = join(work, 'dist')
     for (const dir of [join(work, 'home'), join(serve, 'npm'), stubBin, adDist,
-      join(cscbRepo, 'tests', 'integration'), join(cscbRepo, 'testplans'), join(cscbRepo, 'docker'),
+      join(cscbRepo, 'tests', 'integration'), join(cscbRepo, 'testplans'), join(cscbRepo, 'docker'), join(cscbRepo, 'scripts'),
       join(adRepo, 'skills', 'install-agent-director')]) mkdirSync(dir, { recursive: true })
     writeFileSync(join(stubBin, 'npm'), [
       '#!/usr/bin/env bash',
@@ -1173,7 +1285,6 @@ describe("prepare.sh's downgrade fixture", () => {
     const mislabelledSha = sha256(servePackage('claude-slack-channel-bots', '0.18.1', '0.18.0'))
     writeFileSync(join(cscbRepo, 'tests', 'integration', 'test-1-fixture.sh'), 'exit 0\n')
     writeFileSync(join(cscbRepo, 'testplans', 'README.md'), 'fixture\n')
-    writeFileSync(join(cscbRepo, 'docker', 'entrypoint.sh'), 'exit 0\n')
     writeFileSync(join(cscbRepo, 'docker', 'ad-client-check.sh'), 'exit 0\n')
     must(['git', 'init', '-q', cscbRepo])
     const pinned = BASE.replace(SHA_ARG, `ARG CSCB_DOWNGRADE_SHA256=${downgradeSha}`)
@@ -1183,6 +1294,17 @@ describe("prepare.sh's downgrade fixture", () => {
     cscbTag('1.0.3', pinned.replace(SHA_ARG, (line) => `${line}\n${line}`))
     cscbTag('1.0.4', pinned.replace(/"published":"[^"]+",/, ''))
     cscbTag('1.0.5', pinned.replace(/^ARG CSCB_DOWNGRADE_VERSION=.*$/m, 'ARG CSCB_DOWNGRADE_VERSION=0.18.1').replace(SHA_ARG, `ARG CSCB_DOWNGRADE_SHA256=${mislabelledSha}`))
+    // The burst-driver split (b.ya4): v0.19.1's form, v0.19.0's DRIVER_CPUS, then broken forms.
+    const split = { ciRun: CI_RUN, entrypoint: ENTRYPOINT }
+    cscbTag('1.1.0', pinned, split)
+    cscbTag('1.1.1', pinned, { ...split, ciRun: CI_RUN.replace(DRIVER_LINE, 'export const DRIVER_CPUS = 1') })
+    cscbTag('1.1.2', pinned, { ciRun: CI_RUN })
+    cscbTag('1.1.3', pinned, { entrypoint: ENTRYPOINT })
+    cscbTag('1.1.4', pinned, { ...split, ciRun: CI_RUN.replace(DRIVER_LINE, (line) => `${line}\n${line}`) })
+    cscbTag('1.1.5', pinned, { ...split, ciRun: CI_RUN.replace(DRIVER_LINE, 'export const DRIVER_CPUS = two') })
+    cscbTag('1.1.6', pinned, { ...split, ciRun: CI_RUN.replace(PER_SHARD_LINE, '') })
+    cscbTag('1.1.7', pinned, { ...split, ciRun: CI_RUN.replace(PATTERN_LINE, '') })
+    cscbTag('1.1.8', pinned, { ...split, ciRun: CI_RUN.replace(PATTERN_LINE, (line) => `${line}i`) })
   }, 30_000)
 
   afterAll(() => {
@@ -1212,6 +1334,48 @@ describe("prepare.sh's downgrade fixture", () => {
     ['the tag records no publication time', '1.0.4', /v1\.0\.4:docker\/Dockerfile\.test\.base records no single published time/],
     ['the pinned tarball holds another version', '1.0.5', /the packed downgrade fixture is not claude-slack-channel-bots 0\.18\.1/],
   ])('prepare fails loudly, writing no manifest, when %s', (_name, version, message) => {
+    const result = prepare(version)
+    expect(result.code).toBe(2)
+    expect(result.stderr).toMatch(new RegExp(`^prepare\\.sh: ${message.source}`, 'm'))
+    expect(existsSync(join(result.inputs, 'manifest.json'))).toBe(false)
+  }, 30_000)
+
+  /** A successful prepare's manifest burst_driver. */
+  function burstDriverOf(version: string): unknown {
+    const result = prepare(version)
+    expect(result.stderr).toBe('')
+    expect(result.code).toBe(0)
+    const manifest = JSON.parse(readFileSync(join(result.inputs, 'manifest.json'), 'utf8')) as Record<string, unknown>
+    expect(Object.keys(manifest)).toContain('burst_driver')
+    return manifest['burst_driver']
+  }
+
+  test("this repository declares each burst-driver constant once, and its entrypoint splits", () => {
+    for (const line of [DRIVER_LINE, PER_SHARD_LINE, PATTERN_LINE]) expect(CI_RUN.match(new RegExp(line.source, 'gm'))).toHaveLength(1)
+    expect(ENTRYPOINT).toMatch(/^split_driver_cpu\(\) \{$/m)
+  })
+
+  test("a tag with the split records its CI's burst-shard CPUs and pattern as the manifest's burst_driver", () => {
+    expect(burstDriverOf('1.1.0')).toEqual({ cpus: CPUS_PER_SHARD + DRIVER_CPUS, pattern: BURST_DRIVER_SCRIPTS.source })
+  }, 30_000)
+
+  test("v0.19.0's DRIVER_CPUS 1 gives 3 CPUs, as its CI did", () => {
+    expect(burstDriverOf('1.1.1')).toEqual({ cpus: CPUS_PER_SHARD + 1, pattern: BURST_DRIVER_SCRIPTS.source })
+  }, 30_000)
+
+  test('a tag before the split (no DRIVER_CPUS, no split_driver_cpu) records burst_driver null', () => {
+    expect(burstDriverOf('1.0.0')).toBeNull()
+  }, 30_000)
+
+  test.each([
+    ['DRIVER_CPUS is declared but the entrypoint has no split', '1.1.2', /v1\.1\.2:scripts\/ci-run\.ts declares DRIVER_CPUS, but v1\.1\.2:docker\/entrypoint\.sh defines no split_driver_cpu/],
+    ['the entrypoint splits but no DRIVER_CPUS is declared', '1.1.3', /v1\.1\.3:docker\/entrypoint\.sh defines split_driver_cpu, but v1\.1\.3:scripts\/ci-run\.ts declares no DRIVER_CPUS/],
+    ['DRIVER_CPUS is declared twice', '1.1.4', /v1\.1\.4:scripts\/ci-run\.ts declares no single DRIVER_CPUS/],
+    ['DRIVER_CPUS is no count', '1.1.5', /v1\.1\.5:scripts\/ci-run\.ts declares no single DRIVER_CPUS/],
+    ['CPUS_PER_SHARD is missing', '1.1.6', /v1\.1\.6:scripts\/ci-run\.ts declares no single CPUS_PER_SHARD/],
+    ['BURST_DRIVER_SCRIPTS is missing', '1.1.7', /v1\.1\.7:scripts\/ci-run\.ts declares no single BURST_DRIVER_SCRIPTS/],
+    ['BURST_DRIVER_SCRIPTS has flags', '1.1.8', /v1\.1\.8:scripts\/ci-run\.ts declares no single BURST_DRIVER_SCRIPTS/],
+  ])('prepare fails loudly, writing no manifest, when %s (b.ya4)', (_name, version, message) => {
     const result = prepare(version)
     expect(result.code).toBe(2)
     expect(result.stderr).toMatch(new RegExp(`^prepare\\.sh: ${message.source}`, 'm'))
@@ -1470,6 +1634,10 @@ interface FakeScenario {
   readonly contextHashDiffers?: 'cand' | 'ref'
   /** The reference is prepared with another CSCB package than the candidate. */
   readonly refCscbDiffers?: boolean
+  /** The manifests' burst_driver, any JSON value (malformed ones too): null when absent; `'absent'` leaves the key out. */
+  readonly burstDriver?: unknown
+  /** The reference manifest's burst_driver, when it differs from `burstDriver`. */
+  readonly refBurstDriver?: unknown
 }
 
 const FIXTURE_DIR = join(import.meta.dir, 'fixtures', 'ad-gate')
@@ -1502,6 +1670,27 @@ const CLI_DURATIONS = durationsText([[1, 10], [2, 5], [3, 5], [5, 100], [6, 50]]
 const SLOT_SCRIPTS: Readonly<Record<string, string | null>> = { ...CLI_SCRIPTS, 'test-7-gamma.sh': null, 'test-8-delta.sh': null, 'test-9-epsilon.sh': null }
 const SLOT_DURATIONS = durationsText([[1, 10], [2, 5], [3, 5], [5, 100], [6, 50], [7, 40], [8, 30], [9, 20]])
 const SLOT_WORK_SECONDS = 260
+
+/** The fake tag with a burst-driver script of its own unit (b.ya4). */
+const BURST_CLI_SCRIPTS: Readonly<Record<string, string | null>> = { ...CLI_SCRIPTS, [THREAD_BURST]: null }
+const BURST_CLI_DURATIONS = durationsText([[1, 10], [2, 5], [3, 5], [5, 100], [6, 50], [44, 30]])
+
+/** Manifest burst_driver values readManifest refuses, by scenario name (b.ya4); `'absent'` leaves the key out. */
+const MALFORMED_BURST_DRIVERS: readonly (readonly [string, unknown])[] = [
+  ['burst-driver-absent', 'absent'],
+  ['burst-driver-cpus-zero', { cpus: 0, pattern: BURST_DRIVER_SCRIPTS.source }],
+  ['burst-driver-cpus-negative', { cpus: -4, pattern: BURST_DRIVER_SCRIPTS.source }],
+  ['burst-driver-cpus-fraction', { cpus: 2.5, pattern: BURST_DRIVER_SCRIPTS.source }],
+  ['burst-driver-cpus-string', { cpus: '4', pattern: BURST_DRIVER_SCRIPTS.source }],
+  ['burst-driver-cpus-missing', { pattern: BURST_DRIVER_SCRIPTS.source }],
+  ['burst-driver-pattern-missing', { cpus: 4 }],
+  ['burst-driver-pattern-number', { cpus: 4, pattern: 4 }],
+  ['burst-driver-pattern-null', { cpus: 4, pattern: null }],
+  ['burst-driver-array', [4, BURST_DRIVER_SCRIPTS.source]],
+  ['burst-driver-number', 4],
+  ['burst-driver-string', '4'],
+  ['burst-driver-empty-object', {}],
+]
 
 /** A fake tag script's text, as fake-prepare.ts writes it into a context: the tag and the context agree. */
 function tagScriptText(requires: string | null): string {
@@ -1842,6 +2031,16 @@ describe('the command line over a fake scheduler', () => {
       once('bad-manifest-line', { badManifestLine: 'cand' }),
       once('only', {}, ['--only', 'test-6']),
       once('inject-fail', { fail: { cand: [], ref: ['test-5'] } }, ['--inject-fail', 'test-5']),
+      // Burst-driver shards (b.ya4).
+      once('burst', { scripts: BURST_CLI_SCRIPTS, durations: BURST_CLI_DURATIONS, burstDriver: BURST_V0191, fail: { cand: ['test-44'], ref: ['test-44'] } }),
+      once('burst-pattern-mismatch', { scripts: BURST_CLI_SCRIPTS, durations: BURST_CLI_DURATIONS, burstDriver: { cpus: 4, pattern: '-fmk-thread-burst\\.sh$' } }),
+      once('burst-reference-differs', {
+        scripts: BURST_CLI_SCRIPTS, durations: BURST_CLI_DURATIONS, burstDriver: BURST_V0191, refBurstDriver: BURST_V0190, fail: { cand: ['test-44'], ref: ['test-44'] },
+      }),
+      once('burst-reference-pattern-differs', {
+        scripts: BURST_CLI_SCRIPTS, durations: BURST_CLI_DURATIONS, burstDriver: BURST_V0191, refBurstDriver: { cpus: 4, pattern: '-fmk-thread-burst\\.sh$' }, fail: { cand: ['test-44'], ref: ['test-44'] },
+      }),
+      ...MALFORMED_BURST_DRIVERS.map(([name, burstDriver]) => once(name, { burstDriver })),
     ])
   }, CLI_SETUP_TIMEOUT_MS)
 
@@ -1979,6 +2178,78 @@ describe('the command line over a fake scheduler', () => {
     expect(run.code).toBe(3)
     expect(injectedEnv).toEqual([[expect.stringMatching(/-cand-s/), ['GATE_INJECT_FAIL=test-5-alpha.sh']]])
     expect([v.outcome, v.release, v.reference.ran, v.verdict.excused]).toEqual(['non-release-pass', false, true, ['test-5-alpha.sh']])
+  })
+
+  test("a burst-driver shard is submitted with --cgroups writable and the tag's burst CPUs on both roles; every other shard as before (b.ya4)", () => {
+    const run = runs['burst']
+    const submits = run.calls.filter((call) => call[0] === 'submit')
+    const isBurst = (call: readonly string[]): boolean => call.slice(call.indexOf('--') + 1).includes(THREAD_BURST)
+    const limits = (call: readonly string[]): unknown[] => {
+      const options = optionsOf([jobsched, ...call])
+      return [options.get('--cgroups'), options.get('--cpus')]
+    }
+
+    expect([run.code, run.prepared]).toEqual([0, ['cand', 'ref']])
+    expect(submits.filter(isBurst).map((call) => call[call.indexOf('--name') + 1].replace(/-s[0-9]+$/, ''))).toEqual(['adg-9.8.7-cand', 'adg-9.8.7-ref'])
+    for (const call of submits.filter(isBurst)) expect(limits(call)).toEqual([['writable'], ['4']])
+    expect(submits.filter((call) => !isBurst(call))).toHaveLength(3)
+    for (const call of submits.filter((call) => !isBurst(call))) expect(limits(call)).toEqual([undefined, ['2']])
+  })
+
+  test("report.md and verdict.json show each shard job's cpus and cgroups, so a run shows its burst-driver shards (b.ya4)", () => {
+    const run = runs['burst']
+    const doc = JSON.parse(readFileSync(join(run.out, `cscb-${CSCB_VERSION}`, 'verdict.json'), 'utf8')) as {
+      readonly jobs: Readonly<Record<'candidate' | 'reference', readonly { readonly jobId: string; readonly scripts: readonly string[]; readonly cpus: number | null; readonly cgroups: string | null }[]>>
+    }
+    const jobs = [...doc.jobs.candidate, ...doc.jobs.reference]
+    const report = readFileSync(join(run.out, `cscb-${CSCB_VERSION}`, 'report.md'), 'utf8')
+    const row = (jobId: string): string[] => (report.split('\n').find((line) => line.startsWith('| s') && line.includes(` ${jobId} `)) ?? '').split('|').map((cell) => cell.trim())
+
+    expect(jobs).toHaveLength(5)
+    expect(report).toContain('| shard | job | state | exit | cpus | cgroups |')
+    for (const job of jobs) {
+      const want = job.scripts.includes(THREAD_BURST) ? [4, 'writable'] : [2, 'readonly']
+      expect([job.cpus, job.cgroups]).toEqual(want)
+      expect(row(job.jobId).slice(5, 7)).toEqual(want.map(String))
+    }
+  })
+
+  test("a context whose burst-driver pattern is not the kit's is refused before anything is submitted (b.ya4)", () => {
+    const run = runs['burst-pattern-mismatch']
+
+    expect([run.code, run.prepared, submittedNames(run)]).toEqual([2, ['cand'], []])
+    expect(run.stderr).toContain(`ad-gate: the tag classifies burst-driver scripts by /-fmk-thread-burst\\.sh$/, not the kit's /${BURST_DRIVER_SCRIPTS.source}/`)
+    expect(run.stderr).not.toContain('(unexpected error)')
+  })
+
+  test.each(MALFORMED_BURST_DRIVERS.map(([name, value]) => [name, JSON.stringify(value)] as const))(
+    'a manifest whose burst_driver is not null or {cpus, pattern} (%s: %s) is refused before anything is submitted (b.ya4)',
+    (name) => {
+      const run = runs[name]
+
+      expect([run.code, run.prepared, submittedNames(run)]).toEqual([2, ['cand'], []])
+      expect(run.stderr).toMatch(
+        /^ad-gate: the manifest \S+\/inputs\/manifest\.json has no valid burst_driver \(null or \{cpus, pattern\}\); an earlier kit's context has none: start a new --out$/m,
+      )
+      expect(run.stderr).not.toContain('(unexpected error)')
+    },
+  )
+
+  test("a reference whose burst_driver differs from the candidate's fails the gate as a manifest problem before the reference is submitted (b.ya4)", () => {
+    const run = runs['burst-reference-differs']
+
+    expect([run.code, run.prepared]).toEqual([1, ['cand', 'ref']])
+    expect(submittedNames(run).filter((name) => name.includes('-ref-'))).toEqual([])
+    expectDetail(releaseVerdict(run).verdict, 'manifest-mismatch', /^the reference context gives burst-driver shards other resources than the candidate$/)
+  })
+
+  test("a reference whose burst-driver pattern is not the kit's is that same manifest problem, not an error mid-gate (b.ya4)", () => {
+    const run = runs['burst-reference-pattern-differs']
+
+    expect([run.code, run.prepared]).toEqual([1, ['cand', 'ref']])
+    expect(submittedNames(run).filter((name) => name.includes('-ref-'))).toEqual([])
+    expectDetail(releaseVerdict(run).verdict, 'manifest-mismatch', /^the reference context gives burst-driver shards other resources than the candidate$/)
+    expect(run.stderr).not.toContain('classifies burst-driver scripts')
   })
 
   test('a FAIL of an --only run is labelled as no release verdict', () => {

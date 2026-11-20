@@ -22,7 +22,10 @@
  *      times winning;
  *   4. submits every release's candidate shards together, one scheduler job
  *      per shard, longest first across releases, and waits on them all with
- *      `jobsched wait --timeout 20m` at a time;
+ *      `jobsched wait --timeout 20m` at a time; a shard holding a burst-driver
+ *      script of a tag that splits its driver's CPU (the manifest's
+ *      `burst_driver`) gets that tag's burst CPUs and `--cgroups writable`,
+ *      every other shard 2 CPUs and the default read-only cgroup;
  *   5. as soon as a release's candidate jobs have ended, reads each job's
  *      status, run.log (the only output the scheduler returns) and
  *      result.json (its OOM facts), checks each job is this gate's, and
@@ -45,7 +48,7 @@
  * arguments.
  *
  * The pure parts (`planShards`, `parseRunLog`, `gateVerdict`,
- * `submitCommands`) are exported for tests/ad-gate.test.ts; importing this
+ * `submitCommands`, `isBurstDriverShard`) are exported for tests/ad-gate.test.ts; importing this
  * module runs nothing. No child gets an `ANTHROPIC_*` or `CI_ANTHROPIC_*`
  * variable, and no job gets a secret.
  *
@@ -61,11 +64,13 @@ import { join, resolve } from 'node:path'
 
 import {
   assignShards,
+  BURST_DRIVER_SCRIPTS,
   checkPrerequisiteHeaders,
   DURATION_TABLE_HEADER,
   DURATION_TABLE_PATH,
   fileNameNumber,
   fileNameNumberForm,
+  isBurstDriverScript,
   matchScript,
   parseDurationTable,
   parsePrerequisiteLines,
@@ -681,6 +686,18 @@ export function gateVerdict(input: { readonly manifestProblems: readonly string[
 
 // --- Submission ---
 
+/**
+ * The manifest's `burst_driver` (prepare.sh, from the tag's scripts/ci-run.ts):
+ * the CPUs the tag's own CI gave a burst-driver shard (its `CPUS_PER_SHARD`
+ * plus `DRIVER_CPUS`) and the source of its `BURST_DRIVER_SCRIPTS`. Null for
+ * a tag whose entrypoint has no burst-driver split (before v0.19.0): its CI
+ * ran those scripts in ordinary shards.
+ */
+export interface BurstDriver {
+  readonly cpus: number
+  readonly pattern: string
+}
+
 /** What a role's `jobsched submit` commands share. */
 export interface SubmitSettings {
   readonly jobsched: string
@@ -688,12 +705,20 @@ export interface SubmitSettings {
   readonly cscbVersion: string
   readonly role: GateRole
   readonly channel: string
+  /** The role's manifest `burst_driver`. */
+  readonly burstDriver: BurstDriver | null
   /** Scripts the runner records failed without running them (verification only). */
   readonly injectFail?: readonly string[]
 }
 
 /** Each shard job's resources: the serial run peaked at 440 MiB. */
 const SHARD_CPUS = '2'
+/**
+ * A burst-driver shard's scheduler cgroup setting: the container's own cgroup
+ * in a private namespace, writable, so the tag's docker/entrypoint.sh can keep
+ * the server's CPU quota apart from the SR-8 burst driver's (b.ya4).
+ */
+const BURST_SHARD_CGROUPS = 'writable'
 const SHARD_MEMORY_GIB = 4
 const SHARD_MEMORY = `${SHARD_MEMORY_GIB}g`
 const SHARD_DISK = '20g'
@@ -716,19 +741,41 @@ export function shardTimeoutMinutes(expectedSeconds: number): number {
   return Math.ceil((2 * expectedSeconds + TIMEOUT_ADDEND_SECONDS) / 60)
 }
 
-/** One `jobsched submit` argv per shard, the longest expected total first, the lowest k on a tie. */
+/**
+ * Whether a shard is a burst-driver shard: its tag splits the driver's CPU
+ * (`burstDriver` set) and it holds a burst-driver script.
+ */
+export function isBurstDriverShard(burstDriver: BurstDriver | null, scripts: readonly string[]): boolean {
+  return burstDriver !== null && scripts.some(isBurstDriverScript)
+}
+
+/**
+ * One `jobsched submit` argv per shard, the longest expected total first, the
+ * lowest k on a tie. A burst-driver shard gets `--cgroups writable` and the
+ * tag's burst CPUs; every other shard `--cpus 2` and the scheduler's default
+ * read-only cgroup. Throws a GateError for a `burstDriver` whose pattern is
+ * not the kit's own, so no script is classified by a rule other than the tag's.
+ */
 export function submitCommands(settings: SubmitSettings, plan: ShardPlan): string[][] {
+  const burstDriver = settings.burstDriver
+  if (burstDriver !== null && burstDriver.pattern !== BURST_DRIVER_SCRIPTS.source) {
+    throw new GateError(
+      `the tag classifies burst-driver scripts by /${burstDriver.pattern}/, not the kit's /${BURST_DRIVER_SCRIPTS.source}/: gate it with a kit whose scripts/ci-run.ts BURST_DRIVER_SCRIPTS is the tag's`,
+    )
+  }
   const ordered = [...plan.shards].sort((a, b) => b.expectedSeconds - a.expectedSeconds || a.shard - b.shard)
   return ordered.map((shard) => {
     const timeoutMinutes = shardTimeoutMinutes(shard.expectedSeconds)
     const injected = shard.scripts.filter((file) => settings.injectFail?.includes(file) ?? false)
+    const burst = isBurstDriverShard(burstDriver, shard.scripts)
     return [
       settings.jobsched, 'submit',
       '--context', settings.context,
       '--name', shardJobName(settings.cscbVersion, settings.role, shard.shard),
       '--channel', settings.channel,
       '--network', 'off',
-      '--cpus', SHARD_CPUS,
+      ...(burst ? ['--cgroups', BURST_SHARD_CGROUPS] : []),
+      '--cpus', burst ? String(burstDriver!.cpus) : SHARD_CPUS,
       '--memory', SHARD_MEMORY,
       '--disk', SHARD_DISK,
       '--timeout', `${timeoutMinutes}m`,
@@ -1019,6 +1066,9 @@ interface JobStatus {
   readonly name: string | null
   readonly contextDir: string | null
   readonly contextSha256: string | null
+  /** The CPUs and cgroup setting (`readonly`, `writable`) the scheduler gave the job. */
+  readonly cpus: number | null
+  readonly cgroups: string | null
 }
 
 function numberOrNull(value: unknown): number | null {
@@ -1050,6 +1100,8 @@ function jobStatus(jobsched: string, id: string): JobStatus {
     name: stringOrNull(doc.name),
     contextDir: stringOrNull(doc.context_dir),
     contextSha256: stringOrNull(doc.context_sha256),
+    cpus: numberOrNull(doc.cpus),
+    cgroups: stringOrNull(doc.cgroups),
   }
 }
 
@@ -1282,6 +1334,8 @@ interface Manifest {
   }
   /** The earlier CSCB release the tag's docker/Dockerfile.test.base pins for the downgrade scripts. */
   readonly cscb_downgrade: { readonly version: string; readonly tarball_sha256: string; readonly published: string }
+  /** The tag's burst-driver shard resources, or null for a tag with no burst-driver split. */
+  readonly burst_driver: BurstDriver | null
   readonly ad_role?: string
 }
 
@@ -1377,6 +1431,12 @@ function readManifest(context: string): Manifest {
   for (const block of ['cscb', 'candidate', 'cscb_downgrade']) {
     const value = manifest[block]
     if (typeof value !== 'object' || value === null) throw new GateError(`the manifest ${path} has no ${block} block`)
+  }
+  const burst = manifest['burst_driver']
+  const fields = typeof burst === 'object' && burst !== null ? (burst as Record<string, unknown>) : {}
+  const cpus = fields['cpus']
+  if (burst !== null && !(typeof cpus === 'number' && Number.isInteger(cpus) && cpus > 0 && typeof fields['pattern'] === 'string')) {
+    throw new GateError(`the manifest ${path} has no valid burst_driver (null or {cpus, pattern}); an earlier kit's context has none: start a new --out`)
   }
   return manifest as unknown as Manifest
 }
@@ -1621,9 +1681,11 @@ function prepareRole(run: RunContext, cscbVersion: string, source: RoleSource, r
  * coverage. A recorded plan (`--resume`) must equal the one the context gives
  * now once any of its jobs is submitted; before that, it is replaced. Writes
  * plan.json and the submit commands beside the context and returns the
- * commands.
+ * commands; `burstDriver` is the context manifest's.
  */
-function planRole(run: RunContext, cscbVersion: string, source: RoleSource, role: RoleState, only: readonly string[] | null, shards: number): string[][] {
+function planRole(
+  run: RunContext, cscbVersion: string, source: RoleSource, role: RoleState, only: readonly string[] | null, shards: number, burstDriver: BurstDriver | null,
+): string[][] {
   const label = roleLabel(cscbVersion, source.role)
   const input = { ...planInputOf(role.context, shards, run.measured), only: only ?? undefined, filterRegression: source.role === 'candidate' }
   const fresh = plannedOrGateError(() => planShardsWithNotes(input), `planning the ${source.role} for claude-slack-channel-bots ${cscbVersion}`)
@@ -1640,7 +1702,7 @@ function planRole(run: RunContext, cscbVersion: string, source: RoleSource, role
   checkTimeouts(role.plan)
   const injectFail = source.role === 'candidate' ? plannedFileNames(run.options.injectFail, role.plan, '--inject-fail') : []
   const commands = submitCommands(
-    { jobsched: run.options.jobsched, context: role.context, cscbVersion, role: source.role, channel: run.options.channel, injectFail },
+    { jobsched: run.options.jobsched, context: role.context, cscbVersion, role: source.role, channel: run.options.channel, burstDriver, injectFail },
     role.plan,
   )
   const roleDir = join(role.context, '..')
@@ -1648,7 +1710,8 @@ function planRole(run: RunContext, cscbVersion: string, source: RoleSource, role
   writeWhole(join(roleDir, 'submit-commands.txt'), commands.map((argv) => argv.map(shellWord).join(' ')).join('\n') + '\n')
   say(`${label}: ${role.plan.scripts.length} scripts in ${role.plan.shards.length} shard(s)`)
   for (const shard of role.plan.shards) {
-    say(`  s${shard.shard}: ~${shard.expectedSeconds} s${shard.filterRegression ? ', filter regression' : ''}: ${shard.scripts.join(' ')}`)
+    const burst = isBurstDriverShard(burstDriver, shard.scripts) ? `, burst driver (${burstDriver!.cpus} CPUs, cgroups ${BURST_SHARD_CGROUPS})` : ''
+    say(`  s${shard.shard}: ~${shard.expectedSeconds} s${shard.filterRegression ? ', filter regression' : ''}${burst}: ${shard.scripts.join(' ')}`)
   }
   return commands
 }
@@ -1731,7 +1794,15 @@ function startReference(run: RunContext, gate: ReleaseGate): void {
   if (canonicalJson(refManifest.cscb_downgrade) !== canonicalJson(gate.candManifest.cscb_downgrade)) {
     gate.manifestProblems.push('the reference context holds another CSCB downgrade fixture than the candidate')
   }
-  const refCommands = planRole(run, cscbVersion, refSource, version.reference, candidateVerdict.referenceScripts, run.options.shards ?? MAX_GATE_SHARDS)
+  if (canonicalJson(refManifest.burst_driver) !== canonicalJson(gate.candManifest.burst_driver)) {
+    gate.manifestProblems.push('the reference context gives burst-driver shards other resources than the candidate')
+  }
+  // Planned with the candidate's burst_driver, which equals the reference's
+  // unless the problem above is recorded; the kit has already accepted its
+  // pattern, so a reference that differs fails as that problem, not mid-gate.
+  const refCommands = planRole(
+    run, cscbVersion, refSource, version.reference, candidateVerdict.referenceScripts, run.options.shards ?? MAX_GATE_SHARDS, gate.candManifest.burst_driver,
+  )
   if (gate.manifestProblems.length > 0) {
     gate.outcome = finish(run, cscbVersion, version, gate.manifestProblems, gate.candidate!, { plan: version.reference.plan!, shards: [], manifest: refManifest }, candidateVerdict)
     return
@@ -1892,6 +1963,8 @@ function shardFigures(shards: readonly CollectedShard[]): unknown[] {
     expectedSeconds: planned.expectedSeconds,
     filterRegression: planned.filterRegression,
     scripts: planned.scripts,
+    cpus: status?.cpus ?? null,
+    cgroups: status?.cgroups ?? null,
     queuedSeconds: status?.queuedS ?? null,
     buildSeconds: status?.buildS ?? null,
     runSeconds: status?.runS ?? null,
@@ -1963,14 +2036,16 @@ function oomCell(oomKilled: boolean | null | undefined): string {
 
 function shardTable(shards: readonly CollectedShard[]): string[] {
   return [
-    '| shard | job | state | exit | queued | build | run | peak memory | OOM | expected | scripts | context sha256 |',
-    '|---|---|---|---|---|---|---|---|---|---|---|---|',
+    '| shard | job | state | exit | cpus | cgroups | queued | build | run | peak memory | OOM | expected | scripts | context sha256 |',
+    '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|',
     ...shards.map(({ planned, result, status }) => {
       const cells = [
         `s${planned.shard}${planned.filterRegression ? ' (filter)' : ''}`,
         result.jobId,
         result.state,
         result.exitCode ?? '-',
+        status?.cpus ?? '-',
+        status?.cgroups ?? '-',
         duration(status?.queuedS ?? null),
         duration(status?.buildS ?? null),
         duration(status?.runS ?? null),
@@ -2215,7 +2290,7 @@ function runGate(invocation: Invocation): number {
     save()
   }
   for (const gate of gates) {
-    gate.candCommands = planRole(run, gate.cscbVersion, gate.candSource, gate.version.candidate, options.only, choice.perRelease)
+    gate.candCommands = planRole(run, gate.cscbVersion, gate.candSource, gate.version.candidate, options.only, choice.perRelease, gate.candManifest.burst_driver)
     for (const problem of gate.manifestProblems) say(`CSCB ${gate.cscbVersion} manifest problem: ${problem}`)
   }
   if (invocation.dryRun) {

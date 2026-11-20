@@ -226,7 +226,12 @@ else
     say "runner interface: no --keep-going; the runner stops at its first failure"
 fi
 
-/usr/local/bin/entrypoint.sh 1 "${canary}" "${runner_flags[@]}" "${inject_flags[@]}" "${scripts[@]}" &
+# Keep this script PID 1 and run entrypoint.sh as a child, never exec it: the
+# scheduler adds no --init, and the tag's entrypoint.sh splits a burst-driver
+# shard's cgroup (shard/server, shard/driver) only when its $$ != 1, so an exec
+# would skip the split silently and fail every burst-driver script's
+# driver-cpu verdict as missing.
+/usr/local/bin/entrypoint.sh 1"${canary}" "${runner_flags[@]}" "${inject_flags[@]}" "${scripts[@]}" &
 runner=$!
 say "runner pid ${runner}; deadline ${DEADLINE_S} s"
 
