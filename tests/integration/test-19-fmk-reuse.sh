@@ -709,9 +709,10 @@ t19_poll() {
 
 # t19_watch_start <id> <file>: from now on, a subshell of the scenario's own
 # shell (`track_pid`) reads the row with the harness `get` every
-# WATCH_PERIOD_S and appends one JSON line per read to <file>: {t, rc, state,
-# session_id} for an answered read, {t, rc, err} (its output and
-# error, on one line) for a failed one. It ends at the top of its loop once
+# WATCH_PERIOD_S and appends one JSON line per read to <file>: {t, te, rc,
+# state, session_id} for an answered read, {t, te, rc, err} (its output and
+# error, on one line) for a failed one. <t> is taken just before the read,
+# <te> just after it returns. It ends at the top of its loop once
 # <file>.stop exists (`t19_bg_stop`). From 0.18.0 a `get` checks the row it
 # reads and can mark it missing itself, so the loop reads the store
 # (`ad_store_peek`) instead; no store row is a failed read naming
@@ -728,26 +729,30 @@ t19_watch_start() {
             [[ -e "${file}.stop" ]] && exit 0
             t="${EPOCHREALTIME/,/.}"
             if (( peek )); then
-                if ! (ad_store_peek "${id}") > "${tmp}" 2> "${tmp}.err"; then
-                    jq -cn --arg t "${t}" --rawfile e "${tmp}.err" \
-                        '{t: $t, rc: 2, err: ($e | gsub("\n"; " ") | .[0:400])}' >> "${file}" 2> /dev/null
+                (ad_store_peek "${id}") > "${tmp}" 2> "${tmp}.err"
+                rc=$?
+                te="${EPOCHREALTIME/,/.}"
+                if (( rc != 0 )); then
+                    jq -cn --arg t "${t}" --arg te "${te}" --rawfile e "${tmp}.err" \
+                        '{t: $t, te: $te, rc: 2, err: ($e | gsub("\n"; " ") | .[0:400])}' >> "${file}" 2> /dev/null
                 elif [[ -s "${tmp}" ]]; then
-                    jq -c --arg t "${t}" '{t: $t, rc: 0, state: .state, session_id: (.session_id // "")}' \
+                    jq -c --arg t "${t}" --arg te "${te}" '{t: $t, te: $te, rc: 0, state: .state, session_id: (.session_id // "")}' \
                         "${tmp}" >> "${file}" 2> /dev/null
                 else
-                    jq -cn --arg t "${t}" --arg nf "${NOT_FOUND}" '{t: $t, rc: 1, err: ("no store row: " + $nf)}' >> "${file}" 2> /dev/null
+                    jq -cn --arg t "${t}" --arg te "${te}" --arg nf "${NOT_FOUND}" '{t: $t, te: $te, rc: 1, err: ("no store row: " + $nf)}' >> "${file}" 2> /dev/null
                 fi
                 sleep "${WATCH_PERIOD_S}"
                 continue
             fi
             ad get --instance-id "${id}" > "${tmp}" 2> "${tmp}.err"
             rc=$?
+            te="${EPOCHREALTIME/,/.}"
             if (( rc == 0 )); then
-                jq -c --arg t "${t}" '{t: $t, rc: 0, state: .state, session_id: (.session_id // "")}' \
+                jq -c --arg t "${t}" --arg te "${te}" '{t: $t, te: $te, rc: 0, state: .state, session_id: (.session_id // "")}' \
                     "${tmp}" >> "${file}" 2> /dev/null
             else
-                jq -cn --arg t "${t}" --argjson rc "${rc}" --rawfile o "${tmp}" --rawfile e "${tmp}.err" \
-                    '{t: $t, rc: $rc, err: (($o + " " + $e) | gsub("\n"; " ") | .[0:400])}' >> "${file}" 2> /dev/null
+                jq -cn --arg t "${t}" --arg te "${te}" --argjson rc "${rc}" --rawfile o "${tmp}" --rawfile e "${tmp}.err" \
+                    '{t: $t, te: $te, rc: $rc, err: (($o + " " + $e) | gsub("\n"; " ") | .[0:400])}' >> "${file}" 2> /dev/null
             fi
             sleep "${WATCH_PERIOD_S}"
         done
@@ -760,6 +765,13 @@ t19_watch_start() {
 # <state> in <file>, or nothing.
 t19_watch_first() {
     jq -r -s --arg s "$2" '[.[] | select(.rc == 0 and .state == $s)] | if length == 0 then "" else .[0].t end' "$1"
+}
+
+# t19_watch_first_return <file> <state>: the time the read `t19_watch_first`
+# names returned (its te), or nothing when there is no such read or it
+# carries no te. Whatever that read saw was in the store by then.
+t19_watch_first_return() {
+    jq -r -s --arg s "$2" '[.[] | select(.rc == 0 and .state == $s)] | if length == 0 then "" else (.[0].te // "") end' "$1"
 }
 
 # t19_watch_check <file> <id> <step>: the row was present at every read:
@@ -959,7 +971,7 @@ t19_pane_dead() {
 
 t19_leg_missing_row() {
     local step="missing row, no session id" id="${G_ID}" name="${G_NAME}" session="${G_SESSION}" work="${G_WORK}"
-    local ref launch_start launch_s watch leftover_sid elapsed t_begin missing_t fm_t first_reuse_t diag diag_t n all_fm sid mark_record
+    local ref launch_start launch_s watch leftover_sid elapsed t_begin missing_t missing_te fm_t first_reuse_t diag diag_t n all_fm sid mark_record
     local tick caller verb role
 
     ref="$(persona_ref "${name}")" || exit 1
@@ -1013,33 +1025,41 @@ t19_leg_missing_row() {
     t19_bg_stop "${T19_WATCH_PID}" "${watch}.stop" "${step}: stop the background get"
 
     # 5. The checks.
-    # The row read missing, marked by CSCB's own run: a CSCB find-missing
-    # after the mark no later than the first read of missing, and none
-    # from any other process.
+    # The row read missing, marked by CSCB's own run, and no find-missing
+    # after the mark from any other process. A read can answer missing only
+    # after the mark is stored, and the call that stored it started before
+    # that, so the call's start is at or before the first missing read's
+    # return (te). The read's start (t) is no bound: the watch takes it, and
+    # the shim takes the call's time, each before its store access, so a read
+    # started just before the call can still see the call's mark.
     missing_t="$(t19_watch_first "${watch}" missing)"
     [[ -n "${missing_t}" ]] || { jq -c . "${watch}" | sed 's/^/  | /' >&2; fail "${step}: the background get never read ${id} missing"; }
+    missing_te="$(t19_watch_first_return "${watch}" missing)"
+    [[ -n "${missing_te}" ]] || { jq -c . "${watch}" | sed 's/^/  | /' >&2; fail "${step}: the first background read of ${id} missing (started ${missing_t}) records no return time"; }
     if ad_release_at_least 0.18.0; then
         # From 0.18.0 a read checks the rows it selects too: the mark's call
-        # (`ad_mark_caller`, by the tick's source) is CSCB's.
+        # (`ad_mark_caller`, by the tick's source) is CSCB's. That call is the
+        # latest eligible one started before the tick's millisecond ends, and
+        # AD writes the tick after the mark, so the bound below assumes no
+        # other eligible CSCB call starts between the two.
         tick="$(ad_missing_tick "${id}" "$(awk -v t="${MARK_TIME}" 'BEGIN { printf "%.0f", int(t * 1000) }')")" \
             || fail "${step}: no ad.find_missing.tick record marked ${id} missing after the mark"
         caller="$(ad_mark_caller "${tick}" "${MARK_AD}")" || fail "${step}: no agent-director call after the mark could have made it: ${tick}"
         IFS=$'\t' read -r _ fm_t _ verb role <<< "${caller}"
         [[ "${role}" == cscb ]] || fail "${step}: the mark's call (${verb} at ${fm_t}) is not CSCB's: ${tick}"
-        # The watch's time is just before its store read, which can see a mark made while it ran.
-        t19_at_or_before "${fm_t}" "$(awk -v m="${missing_t}" -v p="${WATCH_PERIOD_S}" 'BEGIN { printf "%.6f", m + p }')" \
-            || fail "${step}: ${id} read missing at ${missing_t}, before the call that marked it (${verb} at ${fm_t})"
+        t19_at_or_before "${fm_t}" "${missing_te}" \
+            || fail "${step}: ${id} read missing by a read started at ${missing_t} and returned at ${missing_te}, before the call that marked it (${verb} at ${fm_t})"
     else
         fm_t="$(t19_cscb_calls_since "${MARK_TIME}" find-missing | awk -F'\t' 'NR == 1 { print $2 }')" || exit 1
         [[ -n "${fm_t}" ]] || fail "${step}: no CSCB find-missing after the mark"
-        t19_at_or_before "${fm_t}" "${missing_t}" \
-            || fail "${step}: ${id} read missing at ${missing_t}, before CSCB's first find-missing after the mark (${fm_t})"
+        t19_at_or_before "${fm_t}" "${missing_te}" \
+            || fail "${step}: ${id} read missing by a read started at ${missing_t} and returned at ${missing_te}, before CSCB's first find-missing after the mark (${fm_t})"
         verb=find-missing
     fi
     all_fm="$(t19_all_find_missing_since "${MARK_TIME}")"
     n="$(t19_cscb_count_since "${MARK_TIME}" find-missing)"
     [[ "${all_fm}" == "${n}" ]] || fail "${step}: ${all_fm} find-missing call(s) after the mark, of which ${n} CSCB's: another process ran find-missing"
-    echo "${TEST_NAME}: ${step}: CSCB's own ${verb} at ${fm_t} (${n} CSCB find-missing after the mark, no other) marked ${id} missing (first read ${missing_t})"
+    echo "${TEST_NAME}: ${step}: CSCB's own ${verb} at ${fm_t} (${n} CSCB find-missing after the mark, no other) marked ${id} missing (first read started ${missing_t}, returned ${missing_te})"
 
     # The resume answered ErrNoSessionId, before the first reuse spawn.
     n="$(t19_cscb_count_since "${MARK_TIME}" resume "${id}")"
