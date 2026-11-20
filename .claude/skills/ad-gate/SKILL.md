@@ -41,14 +41,14 @@ bun scripts/ad-gate/ad-gate.ts --candidate-dist DIR --candidate-version X.Y.Z --
 | `--reference-tag vX.Y.Z` | The reference AD release. Default: the host's `agent-director version`. It must be tagged in the AD checkout and differ from the candidate's version |
 | `--cscb-version X.Y.Z` | A CSCB release to gate; repeatable. Default: npm's `latest`. Naming any replaces the default, so also name the latest release's version to keep it |
 | `--channel ID` | The Slack channel for the scheduler's job notices. Required |
-| `--shards N` | Each release's candidate shard count, 1 to 6. Default: whichever of 4–6 has the shortest estimated finish time on the scheduler's free slots at submission, shared by all releases; ties use fewer jobs. Overrides the slot reading. Reference subsets use N when given, otherwise up to 6 |
+| `--shards N` | Each release's candidate shard count, 1 to 6. Default: whichever of 4–6 has the shortest estimated finish time on the scheduler's free slots at submission, shared by all releases; ties use fewer jobs. The estimate omits burst serialization (see [Shard choice](#shard-choice)). Overrides the slot reading. Reference subsets use N when given, otherwise up to 6 |
 | `--out DIR` | Where the contexts, evidence and verdict go. Required. New or empty, unless `--resume`. Outside the CSCB checkout: what it holds is evidence, never tracked |
 | `--durations FILE` | Measured times (`script<TAB>seconds`, the duration table's header first), overriding the tag's `tests/ci-durations.tsv`: an earlier gate's `measured-durations.tsv` |
 | `--only SCRIPT` | Verification only: run this script (`test-<n>` or its file name), its prerequisites and test-1; repeatable. Never a release verdict |
 | `--inject-fail SCRIPT` | Verification only: the candidate's runner records SCRIPT failed without running it; repeatable. Never a release verdict |
 | `--ad-repo DIR` | The AD checkout, read only: reference tags, `install.sh` sources. Default in `--help` |
 | `--jobsched PATH` | The scheduler CLI. Default in `--help` |
-| `--dry-run` | Prepare and plan, print the `jobsched submit` commands, submit nothing |
+| `--dry-run` | Prepare and plan, print the `jobsched submit` commands and serial-burst notice, submit nothing |
 | `--resume` | Continue the run recorded in `--out/state.json` |
 
 The host needs `bun`, `git`, `npm`, `curl`, `jq` and `python3`, and public
@@ -72,12 +72,15 @@ burst-shard CPUs (`CPUS_PER_SHARD + DRIVER_CPUS` from its
 manifest's `burst_driver`. A burst-driver shard is one holding a
 burst-driver script (test-44, 45, 48 and 51–64 at v0.19.1) of a tag whose
 entrypoint splits the driver's CPU (v0.19.0 on); no other shard gets
-`--cgroups writable`. At v0.19.x the burst scripts take about a third of the
-tag's measured time, so every planned shard holds one in practice: a full
-gate's candidate shards all run as burst-driver shards (six shards, 24 CPUs
-at v0.19.1), and so does each reference shard holding a burst script; only an
-`--only` subset or a reference rerun without them gets 2-CPU shards. The
-scheduler admits jobs by slot and memory, not CPUs: `--cpus` caps each
+`--cgroups writable`.
+
+At v0.19.x the burst scripts take about a third of the tag's measured time, so every planned shard holds one in practice: a full
+gate's candidate shards all run as burst-driver shards (six planned shards
+at v0.19.1, each with 4 CPUs, submitted serially), and so does each reference
+shard holding a burst script; only an `--only` subset or a reference rerun
+without them gets 2-CPU shards.
+
+The scheduler admits jobs by slot and memory, not CPUs: `--cpus` caps each
 container's CPU time and reserves nothing, so shards can contend for the
 host's CPUs. The dry run's plan marks a burst-driver shard `, burst driver
 (<n> CPUs, cgroups writable)`, and `report.md`'s shard table and
@@ -107,14 +110,20 @@ be gated on this scheduler. See
 ## What a release gate runs
 
 - **The latest CSCB release only by default.** Repeat `--cscb-version` to
-  gate several releases: all candidate shards are submitted together,
-  longest first across releases, so their runs overlap as slots allow.
+  gate several releases: ordinary candidate shards run concurrently as slots
+  allow; available shards are submitted longest first across releases.
+- **One burst slot across releases and roles.** Burst shards are submitted
+  serially across candidate and reference roles; a queued or running burst
+  job holds the slot until it ends. `--resume` keeps recorded job IDs and
+  their slot ownership. This driver's submission follows the testing guide's
+  [burst-storage isolation rule](../../../docs/testing-guide.md#thread-memory-performance-runs);
+  it provides no host pinning or exclusion of unrelated workloads.
 - **The reference only on a candidate failure.** A passing candidate never
   prepares or runs the reference. When candidate scripts fail, the driver
-  prepares and submits that release's reference as soon as its candidate
-  is judged, while other releases' jobs can keep running. It runs just the
-  failed scripts and their prerequisites; each failure must fail there too
-  for the gate to pass.
+  prepares that release's reference as soon as its candidate is judged,
+  while other releases' jobs can keep running. It submits the reference
+  under the same burst-slot rule and runs just the failed scripts and their
+  prerequisites; each failure must fail there too for the gate to pass.
 - **`--only` and `--inject-fail` runs are never release verdicts.** Their
   pass is `NON-RELEASE PASS`, exit 3; every verdict line, `report.md` and
   `verdict.json` (`release: false`, `nonRelease`) say so, a FAIL included.
@@ -142,6 +151,10 @@ downloads every input, so give the Bash call a 10-minute `timeout`.
   shards of about 28 min.
 - The commands follow `ad-gate: dry run: <n> candidate submit command(s)
   across <R> release(s), longest first; nothing is submitted:` (one line).
+- Check the `ad-gate: burst shards run one at a time across releases and
+  candidate/reference roles (queued jobs included):` notice and its shard
+  names (or `none in this candidate plan`). The printed submit commands
+  include later burst shards whose submission waits for the slot.
 - Exit 0: clean. Exit 1: `ad-gate: CSCB <v> manifest problem:` lines name
   inputs that differ from the manifest or the tag; fix them before any real
   run. Exit 2 or 64: see [Exit codes](#exit-codes).
@@ -156,13 +169,15 @@ again at submission and may plan a different count. Every other option must
 be exactly the dry run's. To skip the dry run, give the command without
 either flag and a new, empty `--out`.
 
-The driver blocks for the whole gate. With measured durations and six free
-slots, expect about 28 min of script work for one release, or at least about
-57 min for two; four free slots give about 85 min for two. Build, setup,
-queueing and any reference work add time: the latest measured single-release
-run took 59.5 min with queueing, with shard runs of 28.5–29.8 min (about
-30 min without queueing, inferred). See
-[Resources and wall time](../../../docker/README.md#resources-and-wall-time).
+The driver blocks for the whole gate. Its slot-based shard-choice estimate
+omits burst serialization; a burst-bearing gate's elapsed script time
+includes the sum of its serial burst-shard durations. Build, setup, queueing
+and any reference work add time.
+
+Historically, AD 0.17.5 against CSCB 0.18.6 took 59.5 min with queueing,
+with shard runs of 28.5–29.8 min; about 30 min without queueing was inferred.
+See [Resources and wall time](../../../docker/README.md#resources-and-wall-time)
+for that run's conditions.
 
 Launch it as a background task (Claude Code: the Bash tool's
 `run_in_background: true`), with its output in a log beside `--out`, never
@@ -192,8 +207,11 @@ bun scripts/ad-gate/ad-gate.ts <the dry run's options, without --dry-run> --resu
 Without `--shards`, free slots are `max(0, limit − active − queued)`; queued
 jobs count because the scheduler is FIFO. The driver chooses 4–6 candidate
 shards per release to minimise the estimated time for all releases sharing
-those slots, with fewer jobs on a tie. A release with fewer scheduling units
-uses fewer shards; `--durations` balances the work and sizes the estimate.
+those slots, with fewer jobs on a tie.
+
+`fastestShardCount` estimates slot rounds without accounting for burst
+serialization. A release with fewer scheduling units uses fewer shards;
+`--durations` balances the work and sizes the estimate.
 
 The slot-based log line is one line:
 

@@ -324,6 +324,7 @@ tests/
     shared-channel-upgrade/       # generated reference-0.18.0, new-baseline, pending-edits and manifest
   test-helpers/
     thread-populations.ts         # deterministic Thread Memory populations and expected bursts
+    thread-memory-backlog.ts      # real queue backlog holds, memory/seal and injected maintenance clock
     shared-channel-upgrade.ts     # fixture generator, materializer and command assertions
     shared-channels.ts            # shared-authority seeds, fixture transactions and membership harness
     channel-delivery.ts           # declaration/choice projections and shared-envelope seeds
@@ -2498,6 +2499,18 @@ passes alone do not establish runtime behavior.
 ### Scenario helper
 
 #### Shared-channel and Thread Memory helpers
+
+`tests/test-helpers/thread-memory-backlog.ts` exports `makeBacklogMemory` for
+SR-9.11 regressions. It composes the production queue, Thread Memory, shared
+authority, seal and measurement writer on one injected clock, with separate
+filesystem controls.
+
+`backlog()` holds a real queue acceptance at fsync;
+`completion()` waits for the compaction observer, and `backlogWaitCount()`
+tracks live clear subscriptions.
+
+`image()` supplies expected serialized bytes;
+`close()` releases holds and drains writers, timers and measurements.
 
 `lib/scenario.sh` fences production-state readers and request publication to scenario scratch with `require_scenario_state [step]`. These helpers read committed evidence or submit the normal operator request; none repairs a running authority. The following argument lists are positional; `key` is a persona key, `label` a stub token label, and optional arguments use brackets. Tests 29 and 31 compose delivery/own-post cases; Test 40, Test 44, all membership groups and recovery tests 46/65/66/67 share the queue, recovery and population evidence adapters. Direct users are visible beside each call in `tests/integration/`; wrappers retain the same evidence contracts. Unit own-post suites, including `tests/own-post.test.ts`, use `makeOwnPostHarness` for real composition, captured reads, controlled publication and startup/replay with caller-owned membership/queue boundaries; its options and snapshot surfaces are documented once in [Factory Functions](../docs/testing-guide.md#factory-functions).
 

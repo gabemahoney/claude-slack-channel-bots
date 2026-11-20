@@ -1430,10 +1430,11 @@ kit is development-only; none of it is in the npm package.
   only for candidate failures. Each role has its own context; one template
   serves both.
 - **The releases.** npm's `latest` CSCB by default; `--cscb-version` names
-  others. All releases' candidate shards are submitted together, so their
-  runs overlap as scheduler slots allow. Each release is judged when its
-  own candidate jobs end; if it needs a reference, that reference is
-  prepared and submitted then, while the other releases can keep running.
+  others. Ordinary candidate shards across releases run together as scheduler
+  slots allow; burst shards share one slot across every release and both
+  candidate/reference roles. Each release is judged when its own candidate
+  jobs end; if it needs a reference, that reference is prepared then and
+  submitted under the same burst rule while other releases keep running.
 
 ### One scheduler job per shard
 
@@ -1451,8 +1452,8 @@ one job:
   container would collide on both.
 - **No way around them.** The tests come from the release tag and cannot
   change, and the scheduler offers no PID or mount namespace option.
-- **The 8-CPU job cap.** One job gets at most 8 CPUs, not the 12 six shards
-  use. Run serially in one container, the scripts took 2 h 50 min.
+- **The 8-CPU job cap.** One job gets at most 8 CPUs; six concurrent
+  ordinary 2-CPU shards use 12 across their jobs.
 
 So each shard is its own job from the role's one context, as each `/ci`
 shard is its own container, and the driver merges the jobs' evidence into
@@ -1477,8 +1478,9 @@ one verdict.
 - `fastestShardCount` chooses N from 4 to 6 for each release to minimise
   `ceil(releases × N / max(free, 1)) × workSeconds / N`, with fewer jobs on
   a tie. This compares how many rounds all releases need on the shared
-  slots, rather than dividing the slots evenly: two releases on six free
-  slots finish sooner with six shards each (~57 min) than four (~85 min).
+  slots, rather than dividing the slots evenly. The estimate omits burst
+  serialization.
+
   `workSeconds` is the longest release's planned script time, with test-1
   counted once. It sizes the estimate; the chosen N depends only on free
   slots and release count. Each release uses at most its number of units.
@@ -1584,8 +1586,9 @@ jobsched submit --context <ctx> --name adg-<cscb version>-<cand|ref>-s<k> --chan
   read-only cgroup, and no such shard ever gets `--cgroups writable`. At
   v0.19.x, though, the burst scripts take about a third of the tag's
   measured time, so in practice every planned shard holds one: a full
-  gate's candidate shards all run as burst-driver shards (six shards,
-  24 CPUs at v0.19.1), as does each reference shard holding a burst script;
+  gate's candidate shards all run as burst-driver shards (six planned
+  shards at v0.19.1, each with 4 CPUs, submitted serially), as does each
+  reference shard holding a burst script;
   only an `--only` subset or a reference rerun without one gets 2-CPU
   shards. Each shard's CPUs and cgroup setting, as `jobsched status`
   reports them, are in `report.md`'s shard table and `verdict.json`'s
@@ -1607,34 +1610,46 @@ jobsched submit --context <ctx> --name adg-<cscb version>-<cand|ref>-s<k> --chan
 - m is ⌈(2 × the shard's expected seconds + 1800) ÷ 60⌉, and s is
   m × 60 − 600, so the verdict line prints before the scheduler's timeout.
   A plan that needs a timeout over jobsched's 12 h is refused.
-- The driver submits all releases' candidate shards longest first across
-  releases; ties go to the earlier release, then the lowest shard number.
-  It waits on all pending jobs together with `jobsched wait --timeout 20m`
-  in a loop, and records each shard's queue, build and run times.
+- The driver submits available shards longest first across releases; ties
+  go to the earlier release, then the lowest shard number. Ordinary shards
+  remain concurrent.
+
+  Burst shards are submitted serially: a queued or
+  running burst holds the single slot until its job ends, across every
+  release and candidate/reference role. `--resume` reuses saved job IDs
+  and preserves that slot; dry-run output identifies the serial burst
+  shards. The driver waits on all submitted pending jobs together with
+  `jobsched wait --timeout 20m` in a loop, and records each shard's queue,
+  build and run times.
 - **4 GiB per shard, and 2 CPUs for a shard with no burst-driver script**
   (a burst-driver shard gets the tag's burst CPUs, above). The scheduler
   admits jobs by slot and memory, not CPUs: `--cpus` caps a container's CPU
   time and reserves nothing, so shards can contend for the host's CPUs. Six
-  shards reserve 24 GiB, where the hand-built gate reserved 28 GiB for each
-  of its four serial jobs. Measured on AD 0.17.5 against CSCB 0.18.6: shard peaks of 194.2 to
+  concurrent ordinary shards reserve 24 GiB; the serial burst lane needs
+  one shard's 4 GiB at a time.
+
+  The hand-built gate reserved 28 GiB for each of its four serial jobs.
+  Measured on AD 0.17.5 against CSCB 0.18.6: shard peaks were 194.2 to
   408.6 MiB, the filter shard highest; the serial run peaked at 440 MiB.
-  Per-script times on 2 CPUs matched the 4-CPU serial run within about 1 s
-  (test-24: 1498 s), so 2 CPUs does not slow the timing-sensitive scripts.
-- **Expected wall time.** With measured durations, one release plans about
-  170 min of scripts: about 28 min on six free slots. Two releases need at
-  least about 57 min even with all six slots free (12 shards in two rounds),
-  or about 85 min on four free slots (eight shards in two rounds). These
-  estimates exclude build, setup, queueing and any reference work; the
-  two-release gate cannot meet 45 min on six slots even with no other jobs.
+  In that run, per-script times on 2 CPUs matched the 4-CPU serial run
+  within about 1 s (test-24: 1498 s).
+- **Wall-time estimate.** `fastestShardCount`'s slot estimate omits burst
+  serialization. A burst-bearing gate's elapsed script time includes the
+  sum of its serial burst-shard durations; build, setup, queueing and any
+  reference work add time.
+
   A slot reading is a snapshot, not a reservation, and zero free slots is
   estimated as one slot without predicting when it will become free.
 - **Measured wall time.** AD 0.17.5 against CSCB 0.18.6 took 62.6 min with
   shard runs of 24.0–32.3 min and queue waits up to 33.6 min. A repeat using
   its `measured-durations.tsv` balanced the shard runs to 28.5–29.8 min and
-  took 59.5 min, with two shards queued 8.6 and 29.1 min. About 30 min with
+  took 59.5 min, with two shards queued 8.6 and 29.1 min.
+
+  About 30 min with
   six free slots is inferred from that repeat's timings, not a measured
   idle-scheduler result. A reference adds its own queue, build and run, and
-  can overlap other releases' remaining candidate jobs.
+  can overlap other releases' remaining candidate jobs under the same
+  single-burst-slot rule.
 
 ### entry.sh's variables and lines
 
