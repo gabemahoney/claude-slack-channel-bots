@@ -1437,8 +1437,11 @@ function readManifest(context: string): Manifest {
   const burst = manifest['burst_driver']
   const fields = typeof burst === 'object' && burst !== null ? (burst as Record<string, unknown>) : {}
   const cpus = fields['cpus']
-  if (burst !== null && !(typeof cpus === 'number' && Number.isInteger(cpus) && cpus > 0 && cpus <= BURST_SHARD_CPUS_MAX && typeof fields['pattern'] === 'string')) {
-    throw new GateError(`the manifest ${path} has no valid burst_driver (null or {cpus 1-${BURST_SHARD_CPUS_MAX}, pattern}); an earlier kit's context has none: start a new --out`)
+  if (burst !== null && !(typeof cpus === 'number' && Number.isInteger(cpus) && cpus > 0 && typeof fields['pattern'] === 'string')) {
+    throw new GateError(`the manifest ${path} has no valid burst_driver (null or {cpus, pattern}); an earlier kit's context has none: start a new --out`)
+  }
+  if (typeof cpus === 'number' && cpus > BURST_SHARD_CPUS_MAX) {
+    throw new GateError(`the manifest ${path} asks ${cpus} CPUs for a burst-driver shard, above the scheduler's maximum of ${BURST_SHARD_CPUS_MAX}: the tag cannot be gated on this scheduler; report it`)
   }
   return manifest as unknown as Manifest
 }

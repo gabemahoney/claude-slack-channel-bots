@@ -92,14 +92,16 @@ server 28.0+; version <v>`. A burst-driver shard run with a read-only cgroup
 fails its scripts' `driver-cpu` verdict as `missing`. Either way, fix the
 host; never drop the scripts. A writable cgroup would let a job rewrite its
 own limits, so the scheduler's supervisor stops any job that changes its
-cgroup's `memory.max`, `memory.swap.max`, `cpu.max` or `pids.max`: the job
-ends `failed` with outcome `cgroup-limit-changed`, the gate FAILs that
-shard, and `verdict.json`'s `jobs[].reason` holds the scheduler's reason.
-The tag's entrypoint only makes child groups (`shard/server`,
-`shard/driver`) and moves processes into them, so that outcome means a
-changed entrypoint or test wrote a limit file: fix that, never the check.
-The manifest's burst CPUs may be at most 8, the scheduler's `--cpus`
-maximum. See
+container cgroup's own `memory.max`, `memory.swap.max`, `cpu.max` or
+`pids.max`: the job ends `failed` with outcome `cgroup-limit-changed`, its
+run is cut short, so the gate FAILs that shard, and `verdict.json`'s
+`jobs[].reason` names the change. The tag's entrypoint sets CPU quotas
+only on its child groups `shard/server` and `shard/driver`, never on the
+container's own cgroup, the only one the supervisor watches; so that
+outcome means a changed entrypoint or test wrote one of the container's
+own limit files: fix that, never the check. The manifest's burst CPUs may
+be at most 8, the scheduler's `--cpus` maximum; a tag asking more cannot
+be gated on this scheduler. See
 [Resources and wall time](../../../docker/README.md#resources-and-wall-time).
 
 ## What a release gate runs
@@ -340,7 +342,8 @@ runs. Rerun with `--resume`, or in a new `--out` when an option must change.
 |---|---|
 | `prepare.sh failed for the <role> (exit <n>): <line>; see <path>/prepare.log` | Read `prepare.log` (a download, checksum or tag failed) and fix it. Rerun with `--resume`, or in a new `--out` when an option must change. A line naming `docker/Dockerfile.test.base` is about the downgrade fixture the tag pins (see [The job image](../../../docker/README.md#the-job-image)): a SHA-256 mismatch means npm serves another tarball than the pin, so report it; a tag with no single pin (any before v0.17.0) cannot be gated. A line naming `scripts/ci-run.ts` or `docker/entrypoint.sh` means the tag's burst-driver figures (`DRIVER_CPUS`, `CPUS_PER_SHARD`, `BURST_DRIVER_SCRIPTS`, `split_driver_cpu`) are missing, repeated or disagree: that tag cannot be gated; report it |
 | `planning the <role> for claude-slack-channel-bots <version>: <reason>` | For `"<name>" names no integration script of the tag` or `<file> cannot run in the gate: …`, correct `--only` in a new `--out`. For `the tag's prerequisite headers are refused: …` or `the tag has no test-1`, that release cannot be gated: report it |
-| `<context> holds no inputs/cscb-src/tests/integration: prepare.sh extracted no tests from the tag`, `the manifest <path> cannot be read: <reason>`, `the manifest <path> is not JSON: <reason>`, `the manifest <path> has no <cscb\|candidate\|cscb_downgrade> block`, `the manifest <path> has no valid burst_driver (null or {cpus 1-8, pattern}); …`, `the tag script <path> cannot be read: <reason>` or `the tag duration table <path> cannot be read: <reason>` | The context is incomplete: read `prepare.log`, then start a new `--out`. A context an earlier kit prepared has no `cscb_downgrade` block or no `burst_driver` |
+| `<context> holds no inputs/cscb-src/tests/integration: prepare.sh extracted no tests from the tag`, `the manifest <path> cannot be read: <reason>`, `the manifest <path> is not JSON: <reason>`, `the manifest <path> has no <cscb\|candidate\|cscb_downgrade> block`, `the manifest <path> has no valid burst_driver (null or {cpus, pattern}); …`, `the tag script <path> cannot be read: <reason>` or `the tag duration table <path> cannot be read: <reason>` | The context is incomplete: read `prepare.log`, then start a new `--out`. A context an earlier kit prepared has no `cscb_downgrade` block or no `burst_driver` |
+| `the manifest <path> asks <n> CPUs for a burst-driver shard, above the scheduler's maximum of 8: …` | The tag's `CPUS_PER_SHARD + DRIVER_CPUS` exceeds the scheduler's `--cpus` maximum, so a new `--out` would be refused the same way: that tag cannot be gated on this scheduler; report it |
 | `the tag classifies burst-driver scripts by /<pattern>/, not the kit's /<pattern>/: …` | The tag's `BURST_DRIVER_SCRIPTS` differs from the kit's, so the kit cannot tell its burst-driver shards: report it; gate that tag with a kit whose pattern is the tag's |
 | `shard(s) <k> would need a timeout above jobsched's 12 h: use more shards or --durations` | Use more shards, or `--durations` with measured times |
 

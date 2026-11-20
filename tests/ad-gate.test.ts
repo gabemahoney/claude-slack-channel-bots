@@ -1689,7 +1689,6 @@ const MALFORMED_BURST_DRIVERS: readonly (readonly [string, unknown])[] = [
   ['burst-driver-absent', 'absent'],
   ['burst-driver-cpus-zero', { cpus: 0, pattern: BURST_DRIVER_SCRIPTS.source }],
   ['burst-driver-cpus-negative', { cpus: -4, pattern: BURST_DRIVER_SCRIPTS.source }],
-  ['burst-driver-cpus-above-scheduler-max', { cpus: 9, pattern: BURST_DRIVER_SCRIPTS.source }],
   ['burst-driver-cpus-fraction', { cpus: 2.5, pattern: BURST_DRIVER_SCRIPTS.source }],
   ['burst-driver-cpus-string', { cpus: '4', pattern: BURST_DRIVER_SCRIPTS.source }],
   ['burst-driver-cpus-missing', { pattern: BURST_DRIVER_SCRIPTS.source }],
@@ -2053,6 +2052,7 @@ describe('the command line over a fake scheduler', () => {
       once('burst-dry-run-cpus-max', {
         scripts: BURST_CLI_SCRIPTS, durations: BURST_CLI_DURATIONS, burstDriver: { cpus: BURST_SHARD_CPUS_MAX, pattern: BURST_DRIVER_SCRIPTS.source },
       }, ['--dry-run']),
+      once('burst-driver-cpus-above-scheduler-max', { burstDriver: { cpus: BURST_SHARD_CPUS_MAX + 1, pattern: BURST_DRIVER_SCRIPTS.source } }),
       ...MALFORMED_BURST_DRIVERS.map(([name, burstDriver]) => once(name, { burstDriver })),
     ])
   }, CLI_SETUP_TIMEOUT_MS)
@@ -2247,17 +2247,27 @@ describe('the command line over a fake scheduler', () => {
   })
 
   test.each(MALFORMED_BURST_DRIVERS.map(([name, value]) => [name, JSON.stringify(value)] as const))(
-    'a manifest whose burst_driver is not null or {cpus 1-8, pattern} (%s: %s) is refused before anything is submitted (b.ya4)',
+    'a manifest whose burst_driver is not null or {cpus, pattern} (%s: %s) is refused before anything is submitted (b.ya4)',
     (name) => {
       const run = runs[name]
 
       expect([run.code, run.prepared, submittedNames(run)]).toEqual([2, ['cand'], []])
       expect(run.stderr).toMatch(
-        /^ad-gate: the manifest \S+\/inputs\/manifest\.json has no valid burst_driver \(null or \{cpus 1-8, pattern\}\); an earlier kit's context has none: start a new --out$/m,
+        /^ad-gate: the manifest \S+\/inputs\/manifest\.json has no valid burst_driver \(null or \{cpus, pattern\}\); an earlier kit's context has none: start a new --out$/m,
       )
       expect(run.stderr).not.toContain('(unexpected error)')
     },
   )
+
+  test("a manifest asking more burst CPUs than the scheduler's maximum of 8 is refused as a tag that cannot be gated, before anything is submitted (b.ya4)", () => {
+    const run = runs['burst-driver-cpus-above-scheduler-max']
+
+    expect([run.code, run.prepared, submittedNames(run)]).toEqual([2, ['cand'], []])
+    expect(run.stderr).toMatch(
+      /^ad-gate: the manifest \S+\/inputs\/manifest\.json asks 9 CPUs for a burst-driver shard, above the scheduler's maximum of 8: the tag cannot be gated on this scheduler; report it$/m,
+    )
+    expect(run.stderr).not.toContain('(unexpected error)')
+  })
 
   test("a reference whose burst_driver differs from the candidate's fails the gate as a manifest problem before the reference is submitted (b.ya4)", () => {
     const run = runs['burst-reference-differs']

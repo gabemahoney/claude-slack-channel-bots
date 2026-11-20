@@ -1541,13 +1541,15 @@ jobsched submit --context <ctx> --name adg-<cscb version>-<cand|ref>-s<k> --chan
   child, never `exec` it: that entrypoint splits the cgroup only when its
   own PID is not 1, and would otherwise skip the split silently. A
   writable cgroup would let the job rewrite its own limits, so the
-  scheduler's supervisor watches the container's `memory.max`,
+  scheduler's supervisor watches the container cgroup's own `memory.max`,
   `memory.swap.max`, `cpu.max` and `pids.max` and stops a job that changes
-  one: it ends `failed` with outcome `cgroup-limit-changed`, which the gate
-  FAILs, with the scheduler's reason in `verdict.json`'s `jobs[].reason`.
-  The tag's entrypoint only makes the child groups `shard/server` and
-  `shard/driver` and moves processes into them, never writing those four
-  files, so that outcome means a changed entrypoint or test wrote one.
+  one: it ends `failed` with outcome `cgroup-limit-changed` and its run is
+  cut short, so the gate FAILs that shard, and `verdict.json`'s
+  `jobs[].reason` names the change. The tag's entrypoint sets CPU quotas
+  only on its child groups `shard/server` and `shard/driver`, never on the
+  container's own cgroup, the only one the supervisor watches; so that
+  outcome means a changed entrypoint or test wrote one of the container's
+  own limit files.
 
 - m is ⌈(2 × the shard's expected seconds + 1800) ÷ 60⌉, and s is
   m × 60 − 600, so the verdict line prints before the scheduler's timeout.
