@@ -27,7 +27,7 @@ import type { MembershipScanner } from '../src/channel-membership-scan.ts'
 import { _resetAckTracker, createQueuedAckCallback, forgetPersonaAcks } from '../src/ack-tracker.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import type { DeliveryQueueOptions, QueueEvent, QueueThreadJoin, DeliveryQueue, ReplyReminderQueue } from '../src/delivery-queue.ts'
-import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
+import { QUEUE_COMPACT_INTERVAL_MS, REPLY_REMINDER_KEEP_MS } from '../src/delivery-queue.ts'
 import { installTestTimerOverrides } from '../src/test-timer-overrides.ts'
 import { TEST_MEASUREMENTS_FILE_NAME, buildTestMeasurementsStartLine, createTestMeasurements, queueEventMeasurement, postHoldEventMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, threadCompactionMeasurement, type TestMeasurements, type TestMeasurementsDeps, type TestMeasurement } from '../src/test-measurements.ts'
 import type { DurableAppendTimer } from '../src/durable-journal.ts'
@@ -113,8 +113,12 @@ import type { QueueAcceptResult, ReactionKey } from '../src/delivery-queue.ts'
 import { makeStubCallLog } from './test-helpers/agent-director-stub.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
+import { inputBinding, makeInputHoldFixture } from './test-helpers/ad-input-holds.ts'
+import { buildAdInputHoldNotice } from '../src/ad-input-notices.ts'
+import { clearDeliveredInputHold } from '../src/ad-input-custody.ts'
+import { createDeliveryLifecycle } from '../src/delivery-engine.ts'
 import { makeDeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
-import { deliveredRecord, heldSlackInput, memoryHold, makeQueue, queuePath, slackInput } from './test-helpers/delivery-queue.ts'
+import { deliveredRecord, heldSlackInput, injectedInput, memoryHold, makeQueue, queuePath, reactionInput, refusedRecord, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
 import { threadJoin, threadHeader, seedThreads, threadFsControls, threadSealFsControls, threadConfig, threadPath, THREAD_PERSONAS, THREAD_ROOTS, THREAD_CHANNELS, THREAD_STAMP } from './test-helpers/thread-memory.ts'
 import { makeConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import { makeOwnPostHarness } from './test-helpers/own-post.ts'
@@ -6180,6 +6184,120 @@ describe('test-only measurement wiring (Decision 25)', () => {
 })
 
 describe('delivery ownership wiring', () => {
+  function inputHoldLoader(bindings: Record<string, unknown>): (key: string) => void {
+    const tree = ts.createSourceFile('server.ts', SERVER_CODE, ts.ScriptTarget.Latest, true)
+    const main = tree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'main') as ts.FunctionDeclaration
+    const declarations = main.body!.statements.filter(ts.isVariableStatement).flatMap(node => [...node.declarationList.declarations])
+      .filter(node => node.name.getText(tree) === 'loadInputHold')
+    expect(declarations).toHaveLength(1)
+    return expression<(key: string) => void>(declarations[0]!.initializer!.getText(), bindings)
+  }
+
+  test.each(['text-intent', 'text-ready', 'enter-intent', 'uncertain', 'blocked', 'delivered', 'delivered-part'] as const)('startup input %s holds only uncertainty or invalid storage', async step => {
+    const root = mkdtempSync(join(tmpdir(), 'startup-input-hold-'))
+    const life = createDeliveryLifecycle({}), calls: unknown[] = [], loadedInputKeys = new Set<string>()
+    let deliveryQueue: DeliveryQueue | undefined
+    try {
+      deliveryQueue = await makeQueue(root)
+      const disk = await makeInputHoldFixture(root)
+      disk.store.load('alpha')
+      const delivered = step === 'delivered' || step === 'delivered-part'
+      const initial = delivered
+        ? disk.store.markUncertain('alpha', inputBinding(), 'submission_unconfirmed', { seq: 1, part: 1, attempt: 1 })
+        : disk.store.begin('alpha', inputBinding())
+      expect(initial.ok).toBe(true)
+      if (!initial.ok) throw new Error(initial.code)
+      if (step === 'blocked') disk.faults.read = true
+      else if (delivered) {
+        expect((await deliveryQueue.accept('alpha', slackInput())).status).toBe('accepted')
+        await deliveryQueue.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: step === 'delivered' ? ['already receipted'] : ['already receipted', 'next part'] })
+        await deliveryQueue.append('alpha', sentRecord())
+        await deliveryQueue.append('alpha', step === 'delivered' ? deliveredRecord(1, Date.now()) : deliveredRecord())
+        expect(deliveryQueue.item('alpha', 1)?.records.some(r => r.kind === 'delivered' && r.part === 1)).toBe(true)
+        await deliveryQueue.stop()
+        deliveryQueue = await makeQueue(root)
+        // Startup compaction removes a fully delivered item, while a delivered
+        // part remains in the journal when another part is still open.
+        if (step === 'delivered') expect(deliveryQueue.item('alpha', 1)).toBeUndefined()
+        else expect(deliveryQueue.item('alpha', 1)?.records.some(r => r.kind === 'delivered' && r.part === 1)).toBe(true)
+        expect(disk.fresh().load('alpha')).toMatchObject({ kind: 'record', record: { step: 'uncertain', delivery: { seq: 1, part: 1, attempt: 1 } } })
+      } else if (step !== 'text-intent') expect(disk.store.advance('alpha', initial.value.revision, step, step === 'uncertain' ? 'submission_unconfirmed' : undefined).ok).toBe(true)
+      const inputHolds = disk.fresh()
+      const load = inputHoldLoader({
+        loadedInputKeys, inputHolds, deliveryLifecycle: life, clearDeliveredInputHold, deliveryQueue,
+        noticeEpisodes: { begin: (...args: unknown[]) => calls.push(args), post: (...args: unknown[]) => calls.push(args) },
+        getAppliedPersona: (key: string) => ({ key }), buildAdInputHoldNotice,
+      })
+      load('alpha'); load('alpha')
+      const held = step === 'uncertain' || step === 'blocked'
+      expect(life.inputHeld('alpha')).toBe(held)
+      expect(loadedInputKeys).toEqual(new Set(['alpha']))
+      expect(calls).toEqual(held ? [['alpha', 'ad-input-unconfirmed'], ['alpha', 'ad-input-unconfirmed', buildAdInputHoldNotice({ key: 'alpha' }, inputHolds.path('alpha'))]] : [])
+      expect(life.reconnectInput('alpha')).toEqual(step === 'text-ready' ? { session: inputBinding().sessionId, launchStartedAt: inputBinding().launchStartedAt } : undefined)
+      if (delivered || step === 'text-intent' || step === 'enter-intent') {
+        expect(existsSync(inputHolds.path('alpha'))).toBe(false)
+        expect(disk.fresh().load('alpha')).toEqual({ kind: 'clear' })
+      }
+      assertNoLeak([calls, writtenFile(root)])
+    } finally { await life.stop(); await deliveryQueue?.stop(); rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test.each(['expired', 'different-attempt', 'withdrawn', 'refused', 'durability-pending', 'writer-blocked'] as const)('startup keeps the uncertain hold with %s completion evidence', async fault => {
+    const root = mkdtempSync(join(tmpdir(), 'startup-completion-evidence-'))
+    const clock = createFakeClock({ start: Date.parse('2026-11-20T02:00:00Z') })
+    const life = createDeliveryLifecycle({ clock }), calls: unknown[] = []
+    const io = threadFsControls(root)
+    let queue: Awaited<ReturnType<typeof makeQueue>> | undefined
+    try {
+      queue = await makeQueue(root, { now: clock.now, fs: io.fs })
+      const disk = await makeInputHoldFixture(root, clock.now)
+      disk.store.load('alpha')
+      expect(disk.store.markUncertain('alpha', inputBinding(), 'submission_unconfirmed', { seq: 1, part: 1, attempt: 1 }).ok).toBe(true)
+      expect((await queue.accept('alpha', fault === 'withdrawn' ? reactionInput() : slackInput())).status).toBe('accepted')
+      if (fault !== 'withdrawn') await queue.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['completed item'] })
+      if (fault !== 'different-attempt' && fault !== 'withdrawn') await queue.append('alpha', sentRecord())
+      if (fault === 'refused') await queue.append('alpha', refusedRecord(1, 1, clock.now()))
+      if (fault === 'different-attempt' || fault === 'refused') await queue.append('alpha', sentRecord(1, 2))
+      if (fault === 'withdrawn') await queue.append('alpha', { v: 1, kind: 'withdrawn', seq: 1, at: clock.now(), reason: 'conversation-unknown' })
+      else await queue.append('alpha', deliveredRecord(1, fault === 'expired' ? clock.now() - REPLY_REMINDER_KEEP_MS - 1 : clock.now()))
+      await queue.stop()
+      if (fault === 'durability-pending') {
+        fs.appendFileSync(queuePath(root), '{"v":1,"kind":"accepted","seq":3,')
+        io.fail('openSync', 'alpha', { match: path => path.endsWith('.tmp') })
+      }
+      queue = await makeQueue(root, { now: clock.now, fs: io.fs })
+      if (fault !== 'durability-pending') expect(queue.item('alpha', 1)).toBeUndefined()
+      if (fault === 'writer-blocked') {
+        const accepted = await queue.accept('alpha', injectedInput({ text: 'later item' }))
+        expect(accepted.status).toBe('accepted')
+        if (accepted.status === 'failed') throw new Error('fixture acceptance failed')
+        io.fail('fsync', 'alpha', { match: path => path === queuePath(root) })
+        await expect(queue.append('alpha', sentRecord(accepted.seq))).rejects.toThrow('fixture fsync refused')
+      }
+      const unsafe = fault === 'durability-pending' || fault === 'writer-blocked'
+      expect(queue.isWritable!('alpha')).toBe(!unsafe)
+      expect(queue.durabilityPending!('alpha')).toBe(fault === 'durability-pending')
+      const reminders = queue.replyReminderItems('alpha')
+      if (fault === 'expired' || fault === 'withdrawn') expect(reminders).toEqual([])
+      else expect(reminders).toMatchObject([{ seq: 1, delivery_attempts: fault === 'different-attempt' || fault === 'refused' ? [2] : [1] }])
+      const holds = disk.fresh()
+      const load = inputHoldLoader({
+        loadedInputKeys: new Set<string>(), inputHolds: holds, deliveryQueue: queue, deliveryLifecycle: life, clearDeliveredInputHold,
+        noticeEpisodes: { begin: (...args: unknown[]) => calls.push(args), post: (...args: unknown[]) => calls.push(args) },
+        getAppliedPersona: (key: string) => ({ key }), buildAdInputHoldNotice,
+      })
+      load('alpha'); load('alpha')
+      expect(life.inputHeld('alpha')).toBe(true)
+      expect(calls).toEqual([['alpha', 'ad-input-unconfirmed'], ['alpha', 'ad-input-unconfirmed', buildAdInputHoldNotice({ key: 'alpha' }, holds.path('alpha'))]])
+      expect(holds.get('alpha')).toMatchObject({ kind: 'record', record: { step: 'uncertain', delivery: { seq: 1, part: 1, attempt: 1 } } })
+      expect(disk.fresh().load('alpha')).toEqual(holds.get('alpha'))
+      expect(existsSync(holds.path('alpha'))).toBe(true)
+      expect(life.reconnectInput('alpha')).toBeUndefined()
+      expect(clock.pending()).toEqual([])
+      assertNoLeak([calls, reminders, writtenFile(root)])
+    } finally { await life.stop(); await queue?.stop(); rmSync(root, { recursive: true, force: true }) }
+  })
+
   test('main installs the same lifecycle in the session manager and engines before the start bring-up', () => {
     const built = onlyCallOf('createDeliveryLifecycle')
     const engines = onlyCallOf('createDeliveryEngines')

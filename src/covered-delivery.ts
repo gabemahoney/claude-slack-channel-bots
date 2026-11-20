@@ -9,6 +9,7 @@ import type { DeliveryQueue, QueueItem, SubmittedRecord } from './delivery-queue
 import { cantSendDetailsOf, isInvalidFlagsError, notPausableCauseOf } from './ad-error-class.ts'
 import { NOT_NOW_RETRY_MS } from './delivery-constants.ts'
 import { renderPersonaRef } from './persona-identity.ts'
+import { isLegacyInputCustodyReason, unresolvedInputBlocks } from './ad-input-custody.ts'
 
 /** AD E6 is not released. Flip only after its only_if_waiting capability lands.
  * Never infer this capability from the AD version or busy_send coverage.
@@ -29,7 +30,7 @@ export function buildCoveredDeliveryBlockedNotice(persona: { key: string; name?:
 export function hasUnresolvedCoveredCustody(item: QueueItem): boolean {
   const refused = new Set(item.records.flatMap(r => r.kind === 'refused' ? [r.attempt] : []))
   const delivered = new Set(item.records.flatMap(r => r.kind === 'delivered' ? [r.part] : []))
-  return item.records.some(r => (r.kind === 'submission-blocked' && r.reason !== 'ad-input-unconfirmed') || (r.kind === 'submitted' && !refused.has(r.attempt) && !delivered.has(r.part)))
+  return item.records.some(r => (r.kind === 'submission-blocked' && !isLegacyInputCustodyReason(r.reason)) || (r.kind === 'submitted' && !refused.has(r.attempt) && !delivered.has(r.part)))
 }
 
 export function isCoveredRow(row: GetResult): boolean { return row.busy_send === 'covered' }
@@ -126,7 +127,7 @@ export function createCoveredDelivery(deps: {
       const { key, item, part, row } = input
       const headId = queueItemId(item)
       if (heads.get(key) !== headId) { clearLogs(key); heads.set(key, headId); retrySteps.delete(key) }
-      if (item.records.some(r => r.kind === 'submission-blocked')) return 'blocked'
+      if (unresolvedInputBlocks(item).length || item.records.some(r => r.kind === 'submission-blocked' && !isLegacyInputCustodyReason(r.reason))) return 'blocked'
       const refusedAttempts = new Set(item.records.flatMap(r => r.kind === 'refused' ? [r.attempt] : []))
       const submitted = item.records.filter((r): r is SubmittedRecord => r.kind === 'submitted' && r.part === part && !refusedAttempts.has(r.attempt) && !item.records.some(done => done.kind === 'delivered' && done.part === r.part)).at(-1)
       if (!submitted && !isCoveredRow(row)) return hasUnresolvedCoveredCustody(item) ? 'blocked' : 'legacy'

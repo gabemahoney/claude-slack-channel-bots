@@ -83,11 +83,24 @@ describe('durable control-input safety records', () => {
     expect(f.store.get('alpha').kind).not.toBe('clear')
   })
 
-  test.each(['waiting', 'working', 'ended', 'missing'] as const)('%s and session rotation never prove a new launch', async state => {
+  test.each(['waiting', 'working', 'ended', 'missing'] as const)('%s with a rotated session releases only a live new launch', async state => {
     const f = await fixture(), binding = inputBinding()
     f.store.load('alpha'); value(f.store.begin('alpha', binding))
-    expect(f.store.observeLaunch('alpha', { ...binding, state, sessionId: 'rotated-session' })).toEqual({ ok: true, value: 'kept' })
-    expect(f.fresh().load('alpha').kind).toBe('record')
+    const live = state === 'waiting' || state === 'working'
+    expect(f.store.observeLaunch('alpha', { ...binding, state, sessionId: 'rotated-session' })).toEqual({ ok: true, value: live ? 'cleared' : 'kept' })
+    expect(f.fresh().load('alpha').kind).toBe(live ? 'clear' : 'record')
+  })
+
+  test.each(['ended', 'missing'] as const)('%s observation survives CSCB restart and releases a same-session resumed launch', async state => {
+    const f = await fixture(), binding = inputBinding()
+    f.store.load('alpha')
+    const first = value(f.store.begin('alpha', binding))
+    value(f.store.advance('alpha', first.revision, 'uncertain', 'submission_unconfirmed'))
+    expect(f.store.observeLaunch('alpha', { ...binding, state })).toEqual({ ok: true, value: 'kept' })
+    const restarted = f.fresh()
+    expect(restarted.load('alpha')).toMatchObject({ kind: 'record', record: { step: 'uncertain' } })
+    expect(restarted.observeLaunch('alpha', { ...binding, state: 'waiting' })).toEqual({ ok: true, value: 'cleared' })
+    expect(f.fresh().load('alpha')).toEqual({ kind: 'clear' })
   })
 
   test.each(['row-replaced', 'pending-launch'] as const)('%s clears only the bound persona durably', async evidence => {

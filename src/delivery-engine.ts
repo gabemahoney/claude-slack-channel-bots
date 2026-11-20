@@ -11,6 +11,8 @@ import { ErrInvalidFlags, ErrSpawnNotFound, ErrSpawnNotInteractive, ErrSendKeysW
 import { ENTER_DELAY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS, DELIVERY_MAX_AD_CALLS_PER_S, DELIVERY_ROW_POLL_MS } from './delivery-constants.ts'
 import type { DeliveryAgent } from './delivery-receipt.ts'
 import { createCoveredDelivery, isCoveredRow, hasUnresolvedCoveredCustody, type CoveredClient } from './covered-delivery.ts'
+import type { AdInputHoldStore } from './ad-input-holds.ts'
+import { AD_INPUT_UNCONFIRMED, captureQueuedInputLaunch, clearDeliveredInputHold, observeQueuedInputLaunch, unresolvedInputBlocks } from './ad-input-custody.ts'
 
 export * from './delivery-policy.ts'
 export { createDeliveryLifecycle, NOT_NOW_RETRY_MS } from './delivery-lifecycle.ts'
@@ -43,6 +45,7 @@ export type DeliveryEngineEvent =
 export type DeliveryClient = Pick<Client, 'get' | 'sendKeys'> & CoveredClient
 export interface DeliveryEngineDeps {
   queue: DeliveryQueue; lifecycle: DeliveryLifecycle
+  inputHolds?: AdInputHoldStore
   clientFor(key: string): Promise<DeliveryClient>
   /** Production wraps every call in withOutageDetection using this client. */
   call?<T>(key: string, verb: AdCall, client: DeliveryClient, run: (client: DeliveryClient) => Promise<T>): Promise<T>
@@ -132,7 +135,7 @@ function setItemMember(values: number[], seq: number, present: boolean): void {
 }
 function createQueueSummary(queue: DeliveryQueue, key: string) {
   const read = createQueueItemReader(queue, key)
-  const items = new Map<number, QueueItem>(), open: number[] = []
+  const items = new Map<number, QueueItem>(), open: number[] = [], custody = new Set<number>()
   const p = { accepted: [] as number[], fixed: [] as number[], sent: [] as DeliveryPolicyKnowledge['p']['sent'][number][], refused: [] as number[], delivered: [] as DeliveryPair[], withdrawn: [] as number[] }
   const parts: Record<number, number> = {}, holds: { item: number; kind: 'memory' | 'post' }[] = []
   // Immutable between membership changes, so a new executor can inherit the
@@ -141,6 +144,7 @@ function createQueueSummary(queue: DeliveryQueue, key: string) {
   function update(item: QueueItem): boolean {
     const seq = item.accepted.seq, included = item.hold?.state !== 'withdrawn'
     items.set(seq, item)
+    if (unresolvedInputBlocks(item).length) custody.add(seq); else custody.delete(seq)
     setItemMember(open, seq, isOpenItem(item))
     setItemMember(p.accepted, seq, included)
     setItemMember(p.fixed, seq, included && !!item.fixed)
@@ -176,7 +180,7 @@ function createQueueSummary(queue: DeliveryQueue, key: string) {
   function refresh(): number[] {
     const changed = read()
     if (changed.reset) {
-      items.clear(); open.length = 0
+      items.clear(); open.length = 0; custody.clear()
       for (const values of Object.values(p)) values.length = 0
       for (const seq of Object.keys(parts)) delete parts[Number(seq)]
       holds.length = 0; notices = []
@@ -197,13 +201,13 @@ function createQueueSummary(queue: DeliveryQueue, key: string) {
     }
     previousReceiptItem = target?.[0]
   }
-  return { p, parts, holds, items, open, refresh, receiptOffsets, get notices() { return notices } }
+  return { p, parts, holds, items, open, custody, refresh, receiptOffsets, get notices() { return notices } }
 }
 export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines {
   const clock = deps.clock ?? systemDeliveryClock, life = deps.lifecycle, constants = deps.constants
   const ms = (name: 'ENTER_DELAY_MS' | 'RECEIPT_WAIT_MS', fallback: number): number => constants?.[name] ?? fallback
   interface State {
-    custody: Set<string>; notifiedCustody: Set<string>;
+    notifiedCustody: Set<string>; queueHeld?: boolean
     queue: ReturnType<typeof createQueueSummary>; noticesInitialized: boolean
     e: DeliveryPolicyEngine; reading: DeliveryReading; row?: GetResult; receipt?: ReceiptObservation
     reader: DeliveryReceiptReader; receiptTarget?: DeliveryPair; receiptAttempt?: number; deadlines: Partial<Record<DeliveryTimer, number>>; budget: DeliveryCallBudget
@@ -231,18 +235,11 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     let queue = summaries.get(key)
     if (!queue) { queue = createQueueSummary(deps.queue, key); summaries.set(key, queue) }
     queue.receiptOffsets(undefined, 0, 0)
-    const s: State = { custody: new Set(), notifiedCustody: new Set(), queue, noticesInitialized: false, e: createDeliveryPolicyState(), reading: createDeliveryReading(), reader: deps.receiptReader?.() ?? createQueueDeliveryReceiptReader(deps.queue, key), partialAfterAttempts: new Map(), deadlines: {}, budget: budget(key), rowAt: -Infinity, notNowStep: 0, retryStep: 0, appendRetryStep: 0, stopped: false, relaunch: true, receiptWorking: false, pollAfter: 0, dialogHold: false, dialogMaybeOpen: false }
-    // A recovered sent intent has no proof whether the process reached keys.
-    // Keep it receipt-only even if the error-to-block append was interrupted.
-    for (const item of deps.queue.items(key)) {
-      for (const send of item.records) if (send.kind === 'sent' && !item.records.some(r => r.kind === 'refused' && r.attempt === send.attempt)) {
-        s.custody.add(`${send.seq}:${'part' in send ? send.part : 1}`)
-      }
-    }
+    const s: State = { notifiedCustody: new Set(), queue, noticesInitialized: false, e: createDeliveryPolicyState(), reading: createDeliveryReading(), reader: deps.receiptReader?.() ?? createQueueDeliveryReceiptReader(deps.queue, key), partialAfterAttempts: new Map(), deadlines: {}, budget: budget(key), rowAt: -Infinity, notNowStep: 0, retryStep: 0, appendRetryStep: 0, stopped: false, relaunch: true, receiptWorking: false, pollAfter: 0, dialogHold: false, dialogMaybeOpen: false }
     states.set(key, s); life.engineRunning(key, true); return s
   }
   function receiptOnly(s: State, head: QueueItem, pair: DeliveryPair): boolean {
-    return s.custody.has(`${pair[0]}:${pair[1]}`) || head.records.some(r => r.kind === 'submission-blocked' && r.reason === 'ad-input-unconfirmed' && head.records.some(send => send.kind === 'sent' && send.attempt === r.attempt && (!('part' in send) || send.part === pair[1])))
+    return unresolvedInputBlocks(s.queue.items.get(pair[0]) ?? head, pair[1]).length > 0
   }
   function notifyCustody(key: string, s: State, facts: SubmissionUnconfirmedFacts): void {
     const id = `${s.e.target[0]}:${s.e.target[1]}`
@@ -314,12 +311,32 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     if (clock.now() - s.rowAt < DELIVERY_ROW_POLL_MS && s.row && !force) return true
     s.rowAt = clock.now()
     try {
+      const holds = deps.inputHolds
+      const prior = holds?.get(key)
+      refreshQueue(s)
+      const queuedBeforeRead = captureQueuedInputLaunch([...s.queue.custody].map(seq => s.queue.items.get(seq)!))
       const row = await ad(key, s, 'get', client => client.get({ instance_id: deps.instanceId(key) }))
       if (stopped || s.stopped) return false
       const partialLaunch = JSON.stringify([row.session_id, row.launch_started_at])
       if (s.partialLaunch !== undefined && s.partialLaunch !== partialLaunch) resetPartialLaunch(key, s)
       s.partialLaunch = partialLaunch
       s.row = row
+      if (row.instance_id === deps.instanceId(key)) {
+        // Save queued release evidence before the control hold can be unlinked.
+        refreshQueue(s)
+        if (holds && clearDeliveredInputHold(deps.queue, holds, key)) life.releaseInput(key)
+        const released = await observeQueuedInputLaunch(deps.queue, key, row, queuedBeforeRead, {
+          binding: prior?.kind === 'record' ? prior.record.binding : undefined, releasedDelivery: holds?.releasedDelivery(key),
+        }, () => !stopped && !s.stopped)
+        if (stopped || s.stopped) return false
+        if (holds && prior) {
+          const observed = holds.observeLaunch(key, { instanceId: row.instance_id, state: row.state, rowStartedAt: row.started_at, sessionId: row.session_id, launchStartedAt: row.launch_started_at }, prior)
+          if (observed.ok && observed.value === 'cleared') life.releaseInput(key)
+          const held = holds.get(key)
+          if (held.kind === 'blocked' || (held.kind === 'record' && held.record.step === 'uncertain')) life.holdInput(key)
+        }
+        if (released && s.queueHeld) releaseQueueHold(key, s)
+      }
       if (row.state !== 'waiting' || !row.unproven_requests?.length || row.unproven_requests.some(r => r.decision === null)) s.dialogHold = false
       life.observeRow(key, row)
       if (row.state === 'ended' || row.state === 'missing') restart(key, s)
@@ -332,6 +349,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         const client = await deps.clientFor(key)
         if (stopped || s.stopped) return false
         await deps.inspectUpgrade(key, row, client, s.budget)
+        if (stopped || s.stopped) return false
         if (markerMissing) {
           wait(key, s, 'marker')
           // Replacement may have started. Never continue with the old reading.
@@ -344,8 +362,10 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       }
       return true
     } catch (error) {
+      if (stopped || s.stopped) return false
       if (error instanceof DeliveryBudgetWait) throw error
       await deps.onReadError?.(key, error, 'get')
+      if (stopped || s.stopped) return false
       deps.onError?.(key, error)
       if (isAdErrorInstance(error, ErrSpawnNotFound)) {
         const gone = s.gone
@@ -477,6 +497,13 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     return false
   }
   function queueWrite(s: State, record: QueueRecord, complete: () => void): void { s.pending = { record, complete } }
+  function releaseQueueHold(key: string, s: State): void {
+    refreshQueue(s)
+    if (s.queue.custody.size) return
+    s.queueHeld = false
+    const held = deps.inputHolds?.get(key)
+    if (!held || held.kind === 'clear' || (held.kind === 'record' && held.record.step !== 'uncertain')) life.releaseInput(key)
+  }
   function queueRefusal(key: string, s: State): void {
     const [seq] = s.e.target, attempt = s.e.attempt
     queueWrite(s, { v: 1, kind: 'refused', seq, attempt, at: clock.now() }, () => {
@@ -498,11 +525,22 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     const row = s.row!
     const facts = submissionUnconfirmedFactsOf(error, textCall ? 'text' : 'enter')
     if (facts) {
+      let savedUncertainty = false
       if (facts.kind !== 'not_started') {
         const [seq, part] = s.e.target
-        s.custody.add(`${seq}:${part}`)
-        queueWrite(s, { v: 1, kind: 'submission-blocked', seq, attempt: s.e.attempt, at: clock.now(), reason: 'ad-input-unconfirmed' }, () => {})
+        // First effect after classification: synchronously persist uncertainty.
+        // This closes the queue-append window without treating ordinary intents
+        // as uncertainty. An absent store is supported only by isolated callers.
+        const holds = deps.inputHolds
+        if (holds) {
+          savedUncertainty = holds.markUncertain(key, { instanceId: row.instance_id, rowStartedAt: row.started_at, sessionId: row.session_id, launchStartedAt: row.launch_started_at ?? null }, facts.kind, { seq, part, attempt: s.e.attempt }).ok
+          life.holdInput(key)
+        }
+        const record: QueueRecord = { v: 1, kind: 'submission-blocked', seq, attempt: s.e.attempt, at: clock.now(), reason: AD_INPUT_UNCONFIRMED }
+        try { await deps.queue.append(key, record); savedUncertainty = true }
+        catch (appendError) { queueWrite(s, record, () => {}); deps.onError?.(key, appendError) }
         s.e.phase = 'receipt'; release(s)
+        if (!savedUncertainty) return // Retry persistence before reads or notices.
       }
       await readRow(key, s, true)
       if (facts.kind !== 'not_started') {
@@ -609,6 +647,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         // Legacy uncertainty retains observation and exact receipt settlement,
         // but cannot acquire a typing lease or become recovery Enter/retype.
         const retained = head && receiptOnly(s, head, pair)
+        if (retained) { s.queueHeld = true; life.holdInput(key) }
         if (retained && !s.pending && !s.receipt?.receipt) notifyCustody(key, s, { kind: 'unknown', step: 'text', keysSent: 'unknown', issue: 'missing-details', next: 'hold-and-read' })
         if (!s.pending && (retained || life.inputHeld(key)) && !s.receipt?.receipt) { release(s); s.e.phase = 'receipt'; wait(key, s, 'held'); break }
         const action = !s.pending && retained && s.receipt?.receipt ? 'readReceipt' : decideEngine(k)
@@ -639,6 +678,11 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           const receipt = s.receipt?.receipt
           if (!receipt) break
           queueWrite(s, { v: 1, kind: 'delivered', seq: pair[0], part, at: clock.now(), receipt: { path: receipt.path, uuid: receipt.uuid, offset: receipt.offset } }, () => {
+            const held = deps.inputHolds?.get(key)
+            if (held?.kind === 'record' && held.record.delivery?.seq === pair[0] && held.record.delivery.part === part) {
+              if (deps.inputHolds!.clear(key, held.record.revision).ok) life.releaseInput(key)
+            }
+            if (s.queueHeld) releaseQueueHold(key, s)
             // The working extension belongs to this confirmed part. Carrying
             // it into the next head makes its first waiting row start a new
             // receipt timeout before that head has sent any keys.

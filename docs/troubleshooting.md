@@ -73,7 +73,7 @@ Accepted messages remain queued. For an uncovered instance the health check norm
 Keep the queue and read `server.log`; covered delivery holds unknown outcomes without resending, and the pinned client needs a matching busy-send client for covered instances. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-delivery-is-blocked-or-its-hand-over-is-unconfirmed).
 
 **Automatic input is paused or delivery is unconfirmed**
-A human resolves the input through agent-director, then releases only the reviewed persona hold; retained deliveries need a separate review before resend. A restart keeps uncertainty held. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-automatic-input-is-paused-or-delivery-is-unconfirmed).
+A human resolves the input through agent-director, then releases only the reviewed persona hold; retained deliveries need a separate review before resend. A CSCB-only restart on the same live launch keeps the hold. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-automatic-input-is-paused-or-delivery-is-unconfirmed).
 
 **Reading the start summary**
 Each start logs one `[slack] startupSessionManager: complete — …` line counting its personas by outcome. `latched`, `retrying`, `waiting on a live-row sequence`, `held on invalid flags` and `fresh as retired keys` are not failures. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-reading-the-start-summary).

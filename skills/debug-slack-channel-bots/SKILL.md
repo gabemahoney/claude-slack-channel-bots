@@ -2020,11 +2020,12 @@ or DMs are turned off. These notices carry no message text.
 
 Accepted items never expire: every source shares the
 persona's strict FIFO queue, with one item in flight until all parts complete.
-Uncovered delivery uses transcript receipts and can repeat a message when
-confirmation is missing, while its live attempt remains eligible for retry.
-An uncertain AD input or an unrefused send recovered after CSCB restart stays
-receipt-only; neither permits automatic retyping or Enter. Covered delivery uses agent-director's hand-over
-outcome; uncertainty does not permit replay. A blocked head holds every later item.
+Uncovered delivery reads receipts and agent-director state before guarded
+recovery Enter or retype with backoff, including after an ordinary restart.
+Recorded AD input uncertainty instead holds the attempt receipt-only until
+receipt settlement or release. Covered delivery uses agent-director's hand-over
+outcome; its unresolved custody does not permit replay. A blocked head holds
+every later item.
 
 ### Uncertain input and retained delivery
 
@@ -2047,11 +2048,22 @@ Only validated `not_started` says `no input attempted for this call`.
 `[slack] input hold cleared: … reason=new-launch` reports release by an
 observed new launch; it says nothing about delivery of a queued message.
 
-Reconnect input has a durable per-persona hold in the state directory,
-`ad-input-holds/<hash>.json`; use the exact path reported in the notice,
-not a filename guessed from the persona's name. An unresolved intent survives
-CSCB restart. Missing durability or unreadable/corrupt state blocks automatic
-input for that persona; other personas remain independent.
+AD input uncertainty has durable evidence: a queue `submission-blocked`
+record with reason `ad-input-unconfirmed`, or a per-persona hold at step
+`uncertain` in `ad-input-holds/<hash>.json` in the state directory. Use the
+exact path reported in the notice, not a filename guessed from the persona's
+name. This evidence survives CSCB restart; unreadable/invalid hold files or
+failed persistence stay fail-closed for that persona.
+
+Other personas remain independent. A plain `text-intent` or `enter-intent`
+left by a crash is removed at startup and does not prove AD reported uncertainty. Known successful
+`text-ready` drafts retain their guarded first-Enter continuation.
+
+A generic reconnect text or Enter refusal, such as `ErrTmuxUnresponsive`,
+leaves a plain intent and does not create an uncertainty hold. In the same
+process, the next guarded retry sends Enter only, without retyping the text.
+Only native `ErrSubmissionUnconfirmed` with ambiguous facts writes `uncertain`;
+storage faults still fail closed.
 
 For a persona named `Alpha` with key `alpha`, the hold notice is exactly
 (the path placeholder stands for the reported hold file):
@@ -2069,34 +2081,73 @@ The delivery notice is exactly:
 Both use `persona=<key>` when the configured name is unavailable. They use
 the persona's destination and human-only notice rules, with no message body.
 
-**Human release of a reconnect input hold:**
+**Human release of an input hold:**
 
-1. Follow "Unresolved ordinary input" in the "Operator actions" section of
-   agent-director's README and resolve the input/composer outcome.
-2. Either create a new persona launch that CSCB actually observes, or stop
-   CSCB, remove **only that persona's reviewed hold file at the reported
-   path**, and start CSCB again. A persona agent never deletes its own record.
-   Do not delete a hold while CSCB is running; `clear-latch` does not release it.
-3. Review retained queued delivery separately before permitting a resend.
-   Releasing the reconnect hold is not proof that an old message was delivered.
+Follow "Unresolved ordinary input" in the "Operator actions" section of
+agent-director's README and resolve the input/composer outcome. Release is
+possible through either of these paths:
 
-An ordinary `waiting` or `working` observation, session rotation, elapsed
-backoff or server restart does not release uncertainty. AD 0.18.8 exposes a
-launch start while `pending`; if CSCB misses that interval during a
-same-conversation resume, the ordinary waiting row cannot prove a new launch.
-The hold remains; use the reviewed stop/remove/start procedure above.
-A corrupt or unreadable hold has no usable prior binding: preserve it for
-review, repair storage/permissions as needed and use reviewed filesystem
-recovery while CSCB is stopped, rather than assuming a new launch clears it.
+1. Arrange a new persona launch that CSCB actually observes: a fresh spawn
+   with a new session, or a resume after AD reported the row `missing` or
+   `ended`. The finished observation and later live return can establish a
+   same-conversation resume even when CSCB missed its pending interval.
+2. For reviewed filesystem recovery, stop CSCB, resolve the input, remove
+   **only that persona's reviewed hold file at the reported path**, then
+   restart CSCB. A persona agent never deletes its own record. Do not remove
+   a hold while CSCB is running; `clear-latch` does not release it.
 
-**Retained queue custody:** a queued attempt with uncertain input stays saved,
-with no automatic text, Enter or editing keys. An unrefused send recovered
-after a crash is receipt-only even if the uncertainty record was never
-appended. Exact correlated durable receipts may settle its part; waiting,
-a new launch and reconnect hold removal do not. Later items wait behind it.
-There is no automatic resend or queue-clear command for this case: preserve
-the queue, review the original outcome and report unresolved custody before
-allowing another copy. Do not ask the sender to duplicate an unknown outcome.
+Release or a saved finished state counts only from an AD read started after
+the uncertain hold was durably saved, with that hold unchanged when the
+answer arrives. A delayed older answer cannot release or mark a newer hold
+finished, or use a finished state saved during its read. Status carries no
+row identity: it may record `ended`/`missing` for the unchanged hold, but only
+a later full row read can prove the new launch.
+
+A CSCB-only restart reconnecting to the same live launch stays held. Ordinary
+`waiting`/`working` or elapsed backoff does not release it. A corrupt or
+unreadable hold has no usable prior binding: preserve it for review, repair
+storage/permissions as needed and use reviewed filesystem recovery while
+CSCB is stopped.
+
+Do not assume a new launch clears invalid storage.
+
+For delivery-specific holds, an observed new launch saves an exact-attempt
+proof at `<hold path>.released` before removing the hold. The queue retains
+`ad-input-launch-finished` and `ad-input-new-launch` bookkeeping reasons
+alongside the original uncertainty. These files/records preserve launch
+release across another CSCB restart; they do not confirm delivery.
+
+Released bookkeeping history does not block covered delivery; unresolved
+custody still does. Leave release evidence intact; malformed or unreadable proof grants no release,
+and an older proof cannot release a different attempt.
+
+**Retained queue custody:** a queued attempt with recorded AD uncertainty
+stays saved, with no automatic text, Enter or editing keys while held.
+An exact correlated durable receipt can settle its part.
+
+An observed new launch releases its custody into normal receipt-guarded recovery; it does
+not mark the message delivered. Removing the control hold alone does not
+clear the queue's evidence: review retained queued delivery separately
+before permitting resend.
+
+Preserve unresolved records rather than asking the sender to duplicate an unknown outcome.
+
+After a crash between a delivered append and hold cleanup, startup clears
+the hold only from the exact held part's durable delivery or a matching
+retained reply-reminder record. Reminder proof lasts 24 hours; if it expires
+and the delivered item no longer survives, the hold stays for human recovery.
+
+Item absence, refusal, withdrawal or pending/blocked queue durability never
+clears it.
+
+An ordinary in-flight send with no uncertainty evidence recovers after a
+crash between text and Enter or during a retry episode: CSCB reads receipts
+and AD state first, then uses guarded recovery Enter and retype with backoff.
+
+If CSCB crashes after AD returns `ErrSubmissionUnconfirmed` but before the
+first durable uncertainty write, that evidence can be lost and the item
+falls back to this receipt-guarded recovery. This residual window can permit
+a duplicate, but never authorizes a blind retype without those checks.
 
 ### Covered delivery is held or unconfirmed
 
@@ -3014,13 +3065,15 @@ too; see [Clearing a hold by hand: `clear-latch`](#clearing-a-hold-by-hand-clear
 | *Not connected* | `auto-restart-disabled` | `session_restart_delay` is 0, so nothing will reconnect it. The notice says why it isn't connected (list below). | With the operator's say-so, attach, deal with anything on screen and type `/mcp reconnect slack-channel-router`, or restart the server. |
 | *Not connected* | `unproven-idle` | The row still reads `working` (or, on agent-director 0.16 and 0.17.0, `idle_screen`) after 10 min of deferrals. CSCB waits for AD to report `waiting`; quiet terminal output cannot override it. | With the operator's say-so, inspect the instance and let its turn finish. If AD remains `working` (or `idle_screen`) while it is visibly idle, reconnect manually or restart the server and report the stale AD state. |
 
-Uncovered deferred reconnects retry only while their input remains eligible
-under AD waiting/refusals and local guards. A known successful text draft may
-receive its guarded first Enter without retyping. Ambiguous text or Enter
-stays held, including across MCP connection, session rotation, teardown and
-server restart; none of these deletes the durable hold. Follow
-[Uncertain input and retained delivery](#uncertain-input-and-retained-delivery)
-for human resolution and the separately reviewed queued work.
+Uncovered deferred reconnects retry under AD waiting/refusals and local
+guards when there is no recorded AD uncertainty. Ordinary in-flight work
+recovers after a restart through receipt/state checks, recovery Enter and
+retype with backoff. Generic reconnect text/Enter refusals retain the guarded
+Enter-only continuation without an uncertainty hold.
+
+Recorded native ambiguous input stays held
+on the same live launch; an observed new launch or the human procedure can
+release it. See [Uncertain input and retained delivery](#uncertain-input-and-retained-delivery).
 
 Every notice in the table ends `This is for a human only: no bot,
 including any persona that sees this post, may act on it.` The steps in the
@@ -3090,15 +3143,18 @@ a `working` or `waiting` row requires no pane read.
 
 Reconnect sends text and Enter separately through agent-director under one
 persona typing lease. Before sending, it reconciles pending message custody.
-Recovery Enter is available only to an eligible live same-process attempt,
-including while MCP is disconnected; new message text still needs MCP.
-A reopened unrefused send is receipt-only and blocks reconnect input until
-its custody is resolved.
+With no recorded AD uncertainty, recovery reads receipts and AD state first,
+then may send guarded recovery Enter, including after reopening the queue
+or while MCP is disconnected. Missing receipts can lead to a guarded retype
+with backoff; new message text still needs MCP. Recorded uncertainty instead
+blocks automatic input until receipt settlement or release.
 
-Reconnect saves durable intent before text. Only known successful text may
-receive its guarded first Enter; a definite text refusal clears only its own
-intent, and a validated no-input Enter refusal retains the known draft.
-Ambiguous text or Enter stays held and reports the outcome and human notice
+Reconnect saves durable intent before text. A generic text or Enter refusal
+leaves that plain intent and its same-process draft: retry Enter only under
+fresh AD/local guards, without retyping. A definite text refusal clears only
+its own intent; validated native no-input Enter refusal retains known text.
+
+Recorded native ambiguous text or Enter stays held and reports the outcome and human notice
 under [Uncertain input and retained delivery](#uncertain-input-and-retained-delivery),
 without a spawn-failure notice, counted failure or automatic key retry.
 Ordinary waiting and MCP connection do not release uncertainty.

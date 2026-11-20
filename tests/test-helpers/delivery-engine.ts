@@ -15,6 +15,8 @@ import { appendTranscript, codexPromptEntry, endedTurn, promptEntry, replyEntry,
 
 export async function makeEngineHarness(options: { onInfo?(key: string, message: string): void; keys?: string[]; constants?: DeliveryEngineDeps['constants']; stateDir?: string; queue?: DeliveryQueue; queueFs?: DeliveryQueueOptions['fs']; configuredAgent?: 'claude' | 'codex'; clientFor?: DeliveryEngineDeps['clientFor']; isUp?: DeliveryEngineDeps['isUp']; onRow?: DeliveryEngineDeps['onRow']; inspectUpgrade?: DeliveryEngineDeps['inspectUpgrade']; refreshTranscript?: DeliveryEngineDeps['refreshTranscript']; onEvent?: DeliveryEngineDeps['onEvent']; onCoveredBlocked?: DeliveryEngineDeps['onCoveredBlocked']
   onSubmissionUnconfirmed?: DeliveryEngineDeps['onSubmissionUnconfirmed']
+  receiptReader?: DeliveryEngineDeps['receiptReader']
+  inputHolds?: DeliveryEngineDeps['inputHolds']
   /** Preparation's Slack client and name lookup, withdrawal time, log, persona and part limit; `clientFor` above is the engine's AD client. */
   preparation?: Partial<Pick<DeliveryPreparationDeps, 'clientFor' | 'resolveUserName' | 'now' | 'log' | 'persona' | 'tagMaxBytes'>> } = {}) {
   if (options.queue && !options.stateDir) throw new Error('an external queue needs its owned stateDir')
@@ -76,7 +78,7 @@ export async function makeEngineHarness(options: { onInfo?(key: string, message:
     onReceived: (key, item) => { received.push({ key, seq: item.accepted.seq }) },
   })
   function build() {
-    engines = createDeliveryEngines({ queue, lifecycle, clock, constants: options.constants,
+    engines = createDeliveryEngines({ queue, lifecycle, clock, constants: options.constants, receiptReader: options.receiptReader, inputHolds: options.inputHolds,
       clientFor: options.clientFor ?? (async key => personas.get(key)!.stub),
       instanceId: key => `cscb_${key}`,
       persona: key => personas.get(key)?.state.applied ? { cwd: root, agent: options.configuredAgent ?? (personas.get(key)!.state.row.agent === 'codex' ? 'codex' : 'claude') } : undefined,

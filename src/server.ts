@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { createAdInputHoldStore, createAdInputHoldIo } from './ad-input-holds.ts'
+import { clearDeliveredInputHold } from './ad-input-custody.ts'
 import { setSubmissionInputServices, prepareSubmissionInput } from './session-manager.ts'
 import { buildAdInputHoldNotice, buildAdDeliveryUnconfirmedNotice, buildAdInputOutcomeLine } from './ad-input-notices.ts'
 /**
@@ -3927,11 +3928,16 @@ export async function main(): Promise<void> {
   const loadedInputKeys = new Set<string>()
   const loadInputHold = (key: string): void => {
     if (loadedInputKeys.has(key)) return
-    const reading = inputHolds.load(key)
+    const loaded = inputHolds.load(key)
+    // A crash intent alone restores the pre-hold startup path. Remove it
+    // before either writer starts; a failed durable removal remains blocked.
+    if (loaded.kind === 'record' && ['text-intent', 'enter-intent'].includes(loaded.record.step)) inputHolds.clear(key, loaded.record.revision)
+    clearDeliveredInputHold(deliveryQueue!, inputHolds, key)
+    const reading = inputHolds.get(key)
     loadedInputKeys.add(key)
     if (reading.kind === 'record' && reading.record.step === 'text-ready') {
       deliveryLifecycle!.rememberReconnectInput(key, { session: reading.record.binding.sessionId, launchStartedAt: reading.record.binding.launchStartedAt })
-    } else if (reading.kind !== 'clear') {
+    } else if (reading.kind === 'blocked' || (reading.kind === 'record' && reading.record.step === 'uncertain')) {
       deliveryLifecycle!.holdInput(key)
       noticeEpisodes.begin(key, 'ad-input-unconfirmed')
       noticeEpisodes.post(key, 'ad-input-unconfirmed', buildAdInputHoldNotice(getAppliedPersona(key) ?? { key }, inputHolds.path(key)))
@@ -3946,7 +3952,7 @@ export async function main(): Promise<void> {
   deliveryClients = createDeliveryClientFactory(agentDirectorCallTimeoutMsOf(personaConfig))
   const deferredReconnect = _buildReconnectSessionAdapter(getAppliedPersona, key => conflictLatch.isLatched(key), getAppliedPersona, { noNotice: true })
   deliveryEngines = createDeliveryEngines({
-    queue: deliveryQueue!, lifecycle: deliveryLifecycle,
+    queue: deliveryQueue!, lifecycle: deliveryLifecycle, inputHolds,
     clientFor: key => { loadInputHold(key); return deliveryClients!.clientFor(key) },
     call: (key, verb, client, run) => withOutageDetection(key, undefined, verb, c => run(c), { client: client as Client, armsNothing: { personaConfigured: () => !!getAppliedPersona(key) } }),
     instanceId: personaInstanceId,

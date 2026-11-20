@@ -64,6 +64,7 @@ The server-wide `channel_mode` selects `strict` (default) or `open` for every pe
     ├── delivery-receipt.ts incremental transcript reader, exact receipts and partial evidence, per-send windows and credit-once identities.
     ├── delivery-lifecycle.ts typing leases, independent input holds, AD row/session relaunch observations, deferred reconnect timer/engine ownership and cancellation.
     ├── ad-input-holds.ts Per-persona durable reconnect input intent/uncertainty, revision-checked transitions and validated AD new-launch release; bounded no-follow IO using atomic-write.ts, no message text.
+    ├── ad-input-custody.ts Exact-attempt uncertainty/finished/new-launch bookkeeping over the existing queue API, release-proof consumption and cleanup after a durable delivered part.
     ├── ad-input-notices.ts Pure builders for reconnect hold/delivery uncertainty notices and metadata-only outcome/release lines.
     ├── delivery-constants.ts shared production timing and load bounds.
     ├── delivery-ad-scope.ts    Async-local isolated client and budget hook across shared reconnect/outage guards.
@@ -647,7 +648,15 @@ Partial evidence is reconstructed from durable sends and readable transcripts af
 
 The `receiptWorking` extension belongs to the unconfirmed part. A successful durable `delivered` append clears it and its receipt deadline before advancing to the next part or FIFO head; a failed append preserves the extension until its retry succeeds. Observing a new launch also clears the old extension. The next eligible part therefore uses fresh AD `waiting` without inheriting the previous part's receipt delay.
 
-**Retries and recovery.** Only a known live same-process attempt eligible for retry first gets a persisted `send_kind: enter` recovery attempt after AD reports `waiting` and normal backoff expires. Recovery Enter uses the local safety guards even with MCP disconnected; new text and full retypes still require MCP. The engine sends Enter without identifying a draft, then waits `RECEIPT_WAIT_MS` (10 s) for an exact receipt. Only if confirmation remains absent does a later eligible attempt retype the complete part. Recovery attempt identity is delivery bookkeeping, forgotten on process restart. An unrefused `sent` intent recovered after restart instead keeps receipt-only custody, even if a crash interrupted the uncertainty-to-block append: no recovery Enter or retype is permitted. There is no leftover-text cleanup, byte-count Enter allowance or screen-change reset.
+**Retries and recovery.** Without recorded AD uncertainty, ordinary in-flight `sent` work recovers after process restart as well as within one process: read exact receipts and fresh AD state first, then persist a `send_kind: enter` recovery attempt after AD reports `waiting` and normal backoff expires. Recovery Enter uses local safety guards even with MCP disconnected; new text and full retypes still require MCP. The engine sends Enter, waits `RECEIPT_WAIT_MS` (10 s) for an exact receipt, and only a later eligible attempt retypes the complete part if confirmation is still absent.
+
+A crash between text and Enter or during a retry episode does not create uncertainty custody by itself. Recovery attempt identity is delivery bookkeeping, forgotten on process restart; no leftover-text cleanup, byte-count Enter allowance or screen-change reset is used.
+
+Receipt-only custody instead requires AD uncertainty evidence: an unresolved `submission-blocked` record with reason `ad-input-unconfirmed`, or the per-persona store at `step: uncertain`. Invalid/unreadable holds fail closed.
+
+The engine writes the uncertainty hold synchronously as its first durable effect after classification, with exact `{seq, part, attempt}`, then awaits the queue block append before AD reads or notices. Reconnect synchronously advances its own record to `uncertain` before those effects. A failed append retries persistence without more keys; failed hold persistence cannot grant input.
+
+**Residual risk:** a crash between AD returning uncertainty and the first successful durable write can lose that evidence, returning the item to ordinary receipt-guarded recovery. Receipts and AD state still precede recovery keys; this accepted window is not a blind retype.
 
 Per-item spacing spans parts: 10, 30, 60, 120, 300, then 900 s indefinitely; server start or a new launch resets spacing. Append failure releases the lease, retains the continuation and blocks more keys until durability returns. Resumed keys revalidate AD/lifecycle guards. Open work never expires; at-least-once delivery permits duplicates.
 
@@ -655,15 +664,37 @@ Per-item spacing spans parts: 10, 30, 60, 120, 300, then 900 s indefinitely; ser
 
 Once writable, it reconciles durable delivery attempts and the receipt window after successful recovery Enter, retaining the writability check at reconciliation. A released lease alone cannot finish reconciliation: an unconfirmed current attempt needs engine phase `ready`, no `receiptWorking` extension, and matching launch/session/recovery-attempt identity. An AD read failure preserves the receipt wait; AD `working` extends it until a fresh full receipt wait after `waiting`, while an exact receipt permits early progress only after its `delivered` append is durable.
 
-Reconnect shares the persona lease with delivery and revalidates AD `waiting`, marker, relay, launch/session identity and local holds before each key. `ad-input-holds.ts` durably writes `text-intent` before reconnect text, `text-ready` after known successful text, and `enter-intent` before Enter. Ambiguity advances to `uncertain`; recovered text/Enter intents stay held. Only a known `text-ready` draft can continue with its first guarded Enter without retyping. A definite text refusal clears only its own revision; a refused Enter retains that known draft. Revision checks prevent a delayed successful answer from clearing newer uncertainty.
+Reconnect shares the persona lease with delivery and revalidates AD `waiting`, marker, relay, launch/session identity and local holds before each key. `ad-input-holds.ts` durably writes `text-intent` before reconnect text, `text-ready` after known successful text, and `enter-intent` before Enter. Only native `ErrSubmissionUnconfirmed` with ambiguous facts advances to `uncertain`.
 
-`server.ts` loads configured persona holds before clients, engines or startup input, shares the store through `setSubmissionInputServices`, and loads newly configured keys before reconnect/connected shortcuts or delivery client access. Record/IO faults hold input closed. The lifecycle input hold is independent of leases/drafts: lease release, MCP connection, timers, teardown and shutdown never delete durable uncertainty. Shutdown resets services after stopping writers. Existing row reads consume new-launch evidence without an extra idle polling loop.
+A generic text/Enter refusal such as `ErrTmuxUnresponsive` leaves a plain intent and the process-local draft, without an uncertainty hold; its next guarded retry is Enter-only, with no retype. Plain `text-intent`/`enter-intent` records recovered without an in-memory draft are durably removed at startup, restoring the ordinary fresh-row path. A known `text-ready` draft retains its first guarded Enter.
 
-`submissionUnconfirmedFactsOf` classifies native `ErrSubmissionUnconfirmed` as STATE and validates facts by text/Enter step. Valid `not_started` reads AD before guarded retry; partial/submission/legacy/malformed facts hold input and read once through the existing persona/outage/budget path. `gateway_refused` retains explicit-resubmit custody. Reconnect returns `input-unconfirmed`, propagated as held/uncounted, never a successful reconnect, restart-cap failure or death escalation.
+A definite text refusal clears only its own revision; validated native no-input Enter refusal retains the known draft. Revision checks prevent a delayed successful answer from clearing newer uncertainty.
 
-The delivery engine retains `sent` and appends the existing `submission-blocked` record with reason `ad-input-unconfirmed`. Append failure retries persistence only. An exact correlated receipt can settle the referenced part, so its old block does not obstruct the next multipart part. Covered custody still requires its AD lookup proof and never becomes legacy replay after a capability change. A new launch or release of control custody does not prove queued delivery.
+`server.ts` loads configured persona holds before clients, engines or startup input, clears plain crash intents and only proven delivered-item holds (below), and remembers `text-ready` drafts. It shares the same store through `setSubmissionInputServices` and delivery-engine dependencies, loading newly configured keys before reconnect/connected shortcuts or delivery client access. Uncertain records and record/IO faults hold input closed; failed durable removal also stays blocked.
 
-Only validated AD evidence of a replacement row or an observed distinct pending launch releases a matching readable reconnect hold. Ordinary waiting/working, elapsed time, session rotation and ended/missing alone do not. AD 0.18.8 exposes `launch_started_at` only while pending; a same-conversation resume whose pending interval was missed stays held. Invalid calendar timestamps fail closed through `parseLaunchStart`. Human resolution and reviewed stop/remove/start recovery are documented in [Uncertain input and retained delivery](../skills/debug-slack-channel-bots/SKILL.md#uncertain-input-and-retained-delivery); there is no remote-clear API for input holds.
+The lifecycle input hold is independent of leases/drafts: lease release, MCP connection, timers, teardown and shutdown never delete durable uncertainty. Shutdown resets services after stopping writers. Existing row reads consume new-launch evidence without an extra idle polling loop.
+
+`submissionUnconfirmedFactsOf` classifies native `ErrSubmissionUnconfirmed` as STATE and validates facts by text/Enter step. Valid `not_started` reads AD before guarded retry; partial/submission/legacy/malformed facts hold input and read once through the existing persona/outage/budget path. `gateway_refused` retains explicit-resubmit custody.
+
+Reconnect returns `input-unconfirmed`, propagated as held/uncounted, never a successful reconnect, restart-cap failure or death escalation.
+
+`ad-input-custody.ts` associates the existing `submission-blocked` uncertainty with its exact sent attempt/part and excludes refused or durably delivered parts. Later `ad-input-launch-finished` and `ad-input-new-launch` reasons record AD's finished observation and release without rewriting queue history or changing its schema. Released legacy bookkeeping history does not block covered lookup or a later ready part; unresolved legacy custody and genuine covered blocks still do.
+
+These three legacy-input reasons never become covered custody; genuine covered submissions retain their independent AD lookup proof. An exact correlated durable receipt settles the held part and clears its delivery-specific hold. The old block then cannot obstruct the next multipart part.
+
+After a crash between a delivered append and hold cleanup, `clearDeliveredInputHold` requires a surviving durable `delivered` part or a retained reply-reminder for the same item containing the held attempt. Reminder proof expires after `REPLY_REMINDER_KEEP_MS` (24 hours); with no surviving delivery proof, the hold stays for the documented operator procedure. Item absence, refusal or withdrawal is not proof.
+
+Pending queue durability or a blocked writer always prevents startup clear, even when completion evidence exists. This retention limit is separate from the pre-uncertainty-write crash risk above.
+
+An observed new launch releases matching uncertainty: a fresh spawn with a new nonempty session, a replacement row/distinct pending launch, or a live return after AD reported `ended`/`missing`. The finished observation is durable, so a same-session resume can release even when its pending interval was missed. A finished row alone does not release, and a CSCB-only restart reconnecting to the same live launch stays held.
+
+Release and `finished` facts require an AD read started after uncertainty was durably written, with the same hold revision and queued-attempt facts still current at completion. Readers capture those facts before awaiting AD; a delayed older answer cannot affect newer uncertainty or consume a finished fact saved during its read. Status carries state only: it can save `ended`/`missing` for the unchanged hold, but a later full row read must prove the new launch.
+
+Timestamps still use strict `parseLaunchStart` validation. After awaited queue bookkeeping, readers recheck engine/persona stopped state before further appends, hold changes or lifecycle callbacks.
+
+Before unlinking a delivery-specific hold, the store durably writes its original binding/attempt and validated new-launch observation to `<hold path>.released`. The engine consumes that exact-attempt proof if a shared observer cleared the hold before it could save `ad-input-new-launch`, including after another CSCB restart. Missing, malformed, unreadable or unrelated proof grants no release.
+
+These facts release custody into normal receipt/AD-guarded recovery; they do not append `delivered` or bypass receipt/retry gates. Manual control-hold removal alone does not settle queued uncertainty. Human resolution and reviewed stop/remove/start recovery are in [Uncertain input and retained delivery](../skills/debug-slack-channel-bots/SKILL.md#uncertain-input-and-retained-delivery); no remote-clear API is added.
 
 `ad-input-notices.ts` reports outcome/step/next and validated state without raw details or message/draft text. The shared persona episodes own `ad-input-unconfirmed` and `ad-delivery-unconfirmed`, preserving destination/teardown/log-only rules. New-launch release ends the control episode; durable item delivery ends the retained-delivery episode. No spawn-failure notice is posted for uncertainty.
 
@@ -3472,8 +3503,11 @@ A UTF-8 JSON object, written by `serializeRetiredKeys` (two-space indented, a fi
 
 `ad-input-holds.ts` stores one v1 JSON file named by the SHA-256 of the persona
 key, containing that key, a monotonic revision, instance/row/session/launch
-binding, step, recorded boundary and validated outcome. No message, draft or
-credential is stored. It uses durable atomic replacement/unlink; reads reject
+binding, step, recorded boundary and validated outcome, with optional
+`finished: true` and exact delivery `{seq, part, attempt}` facts. A delivery
+hold's `.released` sidecar preserves its validated new-launch release proof;
+one proof per persona can release only its matching attempt. No message,
+draft or credential is stored. It uses durable atomic replacement/unlink; reads reject
 nonregular files, symlinks, oversized bytes, malformed UTF-8/JSON and invalid
 bindings. Sticky IO/schema faults block input until reviewed recovery.
 

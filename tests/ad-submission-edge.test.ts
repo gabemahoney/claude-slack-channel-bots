@@ -95,7 +95,7 @@ test('a persisted text-ready draft resumes with only Enter when waiting omits th
   expect(f.life.reconnectInput(f.key)).toBeUndefined()
 })
 
-test('pending status releases only the queried persona with a genuinely new stored launch', () => {
+test('state-only status stays held; a shared full row releases only the queried persona', async () => {
   const f = reconnectFixture()
   f.seed('uncertain'); const sibling = f.seed('uncertain', f.sibling)
   f.life.holdInput(f.key); f.life.holdInput(f.sibling)
@@ -104,12 +104,17 @@ test('pending status releases only the queried persona with a genuinely new stor
   session.applyOwnRowStatusStep(f.sibling, { result: cannedStatusResult({ state: 'pending', launch_started_at: oldStamp }) }, { site: 'test', what: 'status' })
   expect(f.holds.get(f.sibling)).toEqual({ kind: 'record', record: sibling })
   session.applyOwnRowStatusStep(f.key, { result: cannedStatusResult({ state: 'pending', launch_started_at: newStamp }) }, { site: 'test', what: 'status' })
+  expect(f.holds.get(f.key).kind).toBe('record')
+  expect(existsSync(`${f.holds.path(f.key)}.released`)).toBe(false)
+  f.row.state = 'pending'; f.row.launch_started_at = newStamp
+  await session.readPersonaOwnRow(f.key, { site: 'test', what: 'get' })
   expect(f.holds.get(f.key)).toEqual({ kind: 'clear' })
   expect(f.fresh().load(f.key)).toEqual({ kind: 'clear' })
   expect(f.holds.get(f.sibling)).toEqual({ kind: 'record', record: sibling })
   expect(f.life.inputHeld(f.key)).toBe(false)
   expect(f.life.inputHeld(f.sibling)).toBe(true)
-  expect(f.h.stub.callCount()).toBe(0)
+  expect(f.h.stub.callCount()).toBe(1)
+  expect(f.h.stub.calls.getCalls).toEqual([{ instance_id: f.row.instance_id }])
 })
 
 test('prepare loads a new persona hold before any AD read, hold inspection or input', async () => {
@@ -123,7 +128,7 @@ test('prepare loads a new persona hold before any AD read, hold inspection or in
     sendKeysFn: () => { order.push('Enter'); return {} },
   })
   expect((await f.run()).outcome).toBe('ok')
-  expect(order.slice(0, 3)).toEqual(['prepare', 'loaded', 'AD get'])
+  expect(order.slice(0, 4)).toEqual(['prepare', 'loaded', 'inspect', 'AD get'])
   expect(order.filter(event => event === 'prepare')).toHaveLength(1)
   expect(order.indexOf('inspect')).toBeGreaterThan(order.indexOf('loaded'))
   expect(order.at(-1)).toBe('Enter')
@@ -131,7 +136,7 @@ test('prepare loads a new persona hold before any AD read, hold inspection or in
   expect(f.fresh().load(f.key)).toEqual({ kind: 'clear' })
 })
 
-test.each(['saved clear', 'failed clear'] as const)('released ends the notice episode only after durable and lifecycle release (%s)', outcome => {
+test.each(['saved clear', 'failed clear'] as const)('released ends the notice episode only after durable and lifecycle release (%s)', async outcome => {
   const f = reconnectFixture(), order: string[] = []
   f.seed('uncertain'); f.life.holdInput(f.key)
   f.life.rememberReconnectInput(f.key, { session: f.row.session_id })
@@ -148,12 +153,14 @@ test.each(['saved clear', 'failed clear'] as const)('released ends the notice ep
     expect(f.h.episodes.isOpen(k, 'ad-input-unconfirmed')).toBe(true)
     f.h.episodes.end(k, 'ad-input-unconfirmed')
   }, log() { order.push('log') } })
-  session.applyOwnRowStatusStep(f.key, { result: cannedStatusResult({ state: 'pending', launch_started_at: newStamp }) }, { site: 'test', what: 'status' })
+  f.row.state = 'pending'; f.row.launch_started_at = newStamp
+  await session.readPersonaOwnRow(f.key, { site: 'test', what: 'get' })
   expect(order).toEqual(outcome === 'saved clear' ? ['released', 'log'] : [])
   expect(f.h.episodes.isOpen(f.key, 'ad-input-unconfirmed')).toBe(outcome === 'failed clear')
   expect(f.life.inputHeld(f.key)).toBe(outcome === 'failed clear')
   if (outcome === 'failed clear') expect(f.holds.get(f.key)).toEqual({ kind: 'blocked', code: 'INPUT_HOLD_CLEAR_FAILED' })
-  expect(f.h.stub.callCount()).toBe(0)
+  expect(f.h.stub.callCount()).toBe(1)
+  expect(f.h.stub.calls.getCalls).toEqual([{ instance_id: f.row.instance_id }])
 })
 
 test.each(['same engine', 'restarted engine'] as const)('new covered capability cannot replay a legacy uncertain submission (%s)', async mode => {

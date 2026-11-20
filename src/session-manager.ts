@@ -1,5 +1,5 @@
 import { submissionUnconfirmedFactsOf, type SubmissionUnconfirmedFacts } from './ad-error-class.ts'
-import type { AdInputHoldStore } from './ad-input-holds.ts'
+import type { AdInputHoldReading, AdInputHoldStore } from './ad-input-holds.ts'
 import { buildAdInputHoldNotice, buildAdInputOutcomeLine, buildAdInputHoldClearedLine } from './ad-input-notices.ts'
 /**
  * session-manager.ts — Library-backed startup orchestration for CSCB.
@@ -2863,10 +2863,10 @@ const submissionHolds = new Map<string, SubmissionUnconfirmedFacts>()
 export function setSubmissionInputServices(value: SubmissionInputServices | undefined): void { submissionInputServices = value; submissionHolds.clear() }
 export function prepareSubmissionInput(key: string): void { submissionInputServices?.prepare?.(key) }
 const unknownInputFacts = (): SubmissionUnconfirmedFacts => ({ kind: 'unknown', step: 'text', keysSent: 'unknown', issue: 'missing-details', next: 'hold-and-read' })
-function observeSubmissionLaunch(key: string, row: Pick<GetResult, 'instance_id' | 'started_at' | 'session_id' | 'state' | 'launch_started_at'>): void {
+function observeSubmissionLaunch(key: string, row: Pick<GetResult, 'instance_id' | 'started_at' | 'session_id' | 'state' | 'launch_started_at'>, beforeRead: AdInputHoldReading | undefined): void {
   const services = submissionInputServices
-  if (!services) return
-  const launchHoldObservation = services.holds.observeLaunch(key, { instanceId: row.instance_id, state: row.state, rowStartedAt: row.started_at, sessionId: row.session_id, launchStartedAt: row.launch_started_at })
+  if (!services || !beforeRead) return
+  const launchHoldObservation = services.holds.observeLaunch(key, { instanceId: row.instance_id, state: row.state, rowStartedAt: row.started_at, sessionId: row.session_id, launchStartedAt: row.launch_started_at }, beforeRead)
   if (launchHoldObservation.ok && launchHoldObservation.value === 'cleared') {
     submissionHolds.delete(key); deliveryLifecycle?.releaseInput(key); deliveryLifecycle?.clearReconnectInput(key)
     services.released?.(key)
@@ -2875,7 +2875,7 @@ function observeSubmissionLaunch(key: string, row: Pick<GetResult, 'instance_id'
 }
 function heldInputAnswer(key: string): ReconnectResult | undefined {
   const reading = submissionInputServices?.holds.get(key)
-  if (reading && reading.kind !== 'clear' && !(reading.kind === 'record' && reading.record.step === 'text-ready')) {
+  if (reading && (reading.kind === 'blocked' || (reading.kind === 'record' && reading.record.step === 'uncertain'))) {
     deliveryLifecycle?.holdInput(key)
     return { outcome: 'input-unconfirmed', facts: submissionHolds.get(key) ?? unknownInputFacts() }
   }
@@ -2902,7 +2902,8 @@ export async function handleDeliveryReadError(key: string, error: unknown, verb:
 
 /** Apply own-row rules and record upgrade provenance from a fresh delivery-client reading. */
 export function applyDeliveryOwnRowRead(key: string, row: GetResult): boolean {
-  observeSubmissionLaunch(key, row)
+  // The engine already applied custody with its pre-request snapshot. This
+  // callback has no request provenance and must not reapply the observation.
   busySendNoticeCoverage.set(key, isCoveredRow(row))
   const at = { site: 'delivery engine', what: 'get' }
   endKillFailureEpisodeOnRead(key, { state: row.state })
@@ -2942,6 +2943,7 @@ export function recoverDeliveryGone(key: string, row: GetResult): boolean {
 
 export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promise<OwnRowRead> {
   const launchWindow = launchCallWindowOf(key)
+  const inputHoldBeforeRead = submissionInputServices?.holds.get(key)
   let row: GetResult
   try {
     row = await withOutageDetection(key, undefined, 'get', (client) =>
@@ -2974,7 +2976,7 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
   }
   // a row that settles after the caller stopped is not acted on.
   if (!ownRowActGoes(key, at)) return { kind: OWN_ROW_READ_ROW, row, latched: false }
-  observeSubmissionLaunch(key, row)
+  observeSubmissionLaunch(key, row, inputHoldBeforeRead)
   busySendNoticeCoverage.set(key, isCoveredRow(row))
   // a row read `ended` or `missing` ends the kill-failure episode.
   endKillFailureEpisodeOnRead(key, { state: row.state })
@@ -3205,17 +3207,12 @@ export type OwnRowStatusAnswer =
   | { readonly thrown: unknown }
 
 
-export function applyOwnRowStatusStep(key: string, answer: OwnRowStatusAnswer, at: OwnRowReadSite): boolean {
+export function applyOwnRowStatusStep(key: string, answer: OwnRowStatusAnswer, at: OwnRowReadSite, inputHoldBeforeRead?: AdInputHoldReading): boolean {
   try {
     if (!('thrown' in answer)) {
-      // Status has no row/session identity, but its pending launch stamp is
-      // authoritative for this queried instance. Retain the stored binding.
-      const held = submissionInputServices?.holds.get(key)
-      if (held?.kind === 'record') observeSubmissionLaunch(key, {
-        instance_id: personaInstanceId(key), started_at: held.record.binding.rowStartedAt,
-        session_id: held.record.binding.sessionId, state: answer.result.state,
-        launch_started_at: answer.result.launch_started_at,
-      })
+      // Status has no row/session identity. With request provenance it can
+      // save a finished fact, but only a later full row can prove new life.
+      if (inputHoldBeforeRead && ownRowActGoes(key, at)) submissionInputServices?.holds.observeLaunch(key, { state: answer.result.state }, inputHoldBeforeRead)
       deliveryLifecycle?.observeRow(key, answer.result)
     }
     // a row read `ended` or `missing`, or gone, ends
@@ -3287,6 +3284,7 @@ export type OwnRowStatusRead =
 
 export async function readPersonaOwnRowStatus(key: string, at: OwnRowReadSite): Promise<OwnRowStatusRead> {
   // The result whole, so the step reads its launch start.
+  const inputHoldBeforeRead = submissionInputServices?.holds.get(key)
   let result: StatusResult
   try {
     result = await withOutageDetection(key, undefined, 'status', (client) =>
@@ -3298,7 +3296,7 @@ export async function readPersonaOwnRowStatus(key: string, at: OwnRowReadSite): 
       ? { kind: OWN_ROW_STATUS_ABSENT }
       : { kind: OWN_ROW_STATUS_REFUSED, error: err }
   }
-  if (applyOwnRowStatusStep(key, { result }, at)) {
+  if (applyOwnRowStatusStep(key, { result }, at, inputHoldBeforeRead)) {
     return { kind: OWN_ROW_STATUS_LATCHED, rowState: latchRowStateRead(result.state) }
   }
   const launchStartedAt = pendingLaunchStartOf(result)
@@ -3790,7 +3788,12 @@ export async function reconnectMcpWithCause(
   const getInput = () => life ? life.reconnectInput(key) : standaloneReconnectInputs.get(key)
   const clearInput = () => { if (life) life.clearReconnectInput(key); else standaloneReconnectInputs.delete(key) }
   if (life?.deferred(key)) life.defer(key)
-  const defer = (): ReconnectResult => { if (!isLiveRowSequenceRunning(key)) life?.defer(key); return { outcome: 'transient' } }
+  const defer = (): ReconnectResult => {
+    const held = heldInputAnswer(key)
+    if (held) return held
+    if (!isLiveRowSequenceRunning(key)) life?.defer(key)
+    return { outcome: 'transient' }
+  }
   if (personaLatchedNow(key)) {
     console.error(reconnectLatchedLine(ref))
     life?.defer(key)
@@ -3814,7 +3817,13 @@ export async function reconnectMcpWithCause(
   busySendNoticeCoverage.set(key, isCoveredRow(row))
   const heldInput = heldInputAnswer(key)
   if (heldInput) return heldInput
-  const stored = submissionInputServices?.holds.get(key)
+  let stored = submissionInputServices?.holds.get(key)
+  // Before durable holds existed, a CSCB restart lost the in-memory reconnect
+  // draft and ran the normal fresh-row path. Intents alone preserve that policy.
+  if (stored?.kind === 'record' && ['text-intent', 'enter-intent'].includes(stored.record.step) && !getInput()) {
+    if (!submissionInputServices!.holds.clear(key, stored.record.revision).ok) return holdSubmissionInput(key, unknownInputFacts())
+    stored = submissionInputServices!.holds.get(key)
+  }
   if (stored?.kind === 'record' && stored.record.step === 'text-ready') {
     const b = stored.record.binding
     if (b.instanceId !== row.instance_id || b.rowStartedAt !== row.started_at || b.sessionId !== row.session_id) return holdSubmissionInput(key, unknownInputFacts())
@@ -3927,7 +3936,13 @@ export async function reconnectMcpWithCause(
   } catch (err) {
     const facts = submissionUnconfirmedFactsOf(err, textCall ? 'text' : 'enter')
     if (facts) {
-      if (facts.kind !== 'not_started') { saveStep('uncertain', facts.kind); holdSubmissionInput(key, facts) }
+      if (facts.kind !== 'not_started') {
+        if (!saveStep('uncertain', facts.kind)) {
+          submissionHolds.set(key, facts); life?.holdInput(key)
+          return { outcome: 'input-unconfirmed', facts }
+        }
+        holdSubmissionInput(key, facts)
+      }
       const fresh = await readPersonaOwnRow(key, { site: 'reconnect', what: 'submission outcome' })
       const submissionOutcomeLine = redactSlackLogText(buildAdInputOutcomeLine({ personaRef: ref, site: 'reconnect', facts, state: fresh.kind === OWN_ROW_READ_ROW ? fresh.row.state : undefined }))
       if (submissionInputServices) submissionInputServices.log(submissionOutcomeLine); else console.error(submissionOutcomeLine)
@@ -11320,15 +11335,18 @@ function transientReconnectResult(
   state: string,
   transient: { latched?: true; stopping?: true },
 ): SpawnPersonaResult {
+  // Recovery can discover uncertain queued input before the reconnect itself
+  // runs. Its old transient line's "nothing was typed" claim is then false.
+  const held = heldInputAnswer(key)
   if (transient.stopping) {
-    console.error(transientReconnectLine(ref, state, 'stopping'))
+    if (!held) console.error(transientReconnectLine(ref, state, 'stopping'))
     return { key, action: 'failed', stopping: true }
   }
   if (transient.latched || personaLatchedNow(key)) {
-    console.error(transientReconnectLine(ref, state, 'latched'))
+    if (!held) console.error(transientReconnectLine(ref, state, 'latched'))
     return { key, action: 'latched' }
   }
-  console.error(transientReconnectLine(ref, state, SPAWN_ACTION_RETRYING))
+  if (!held) console.error(transientReconnectLine(ref, state, SPAWN_ACTION_RETRYING))
   return { key, action: SPAWN_ACTION_RETRYING }
 }
 
@@ -13790,6 +13808,7 @@ async function readOldLifeRow(target: OldLifeWaitTarget, record: OldLifeWaitReco
 async function readOldLifeKillRow(target: OldLifeWaitTarget, record: OldLifeWaitRecord, ref: string): Promise<KillRetryRead> {
   const { instanceId, oldKey } = target
   const own = isConfiguredOwnRow(target)
+  const inputHoldBeforeRead = own ? submissionInputServices?.holds.get(oldKey) : undefined
   const at: OwnRowReadSite = { site: OLD_LIFE_WAIT_SITE, what: OLD_LIFE_WAIT_STATUS_WHAT, ref }
   let result: StatusResult
   try {
@@ -13811,7 +13830,7 @@ async function readOldLifeKillRow(target: OldLifeWaitTarget, record: OldLifeWait
     return { kind: KILL_RETRY_READ_FAILED, error: err }
   }
   if (own) {
-    if (applyOwnRowStatusStep(oldKey, { result }, at)) return { kind: KILL_RETRY_READ_LATCHED }
+    if (applyOwnRowStatusStep(oldKey, { result }, at, inputHoldBeforeRead)) return { kind: KILL_RETRY_READ_LATCHED }
     return { kind: KILL_RETRY_READ_STATE, state: result.state }
   }
   noteOldLifeRowRead(instanceId, { kind: OLD_LIFE_ROW_READ_STATE, state: result.state }, oldLifeReadName(at))

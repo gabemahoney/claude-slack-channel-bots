@@ -28,17 +28,31 @@ base. The next coordinated base bump is v11 to v12.
 |---|---|
 | `ad-latest.test.ts`, `ad-latest-check.test.ts` | Injected bounded GitHub/npm provenance and base-record validation; prepare SR-2.8/exit 16, no network. |
 | `ci-run-lifecycle.test.ts`, `ci-live-docker.test.ts`, `ci-ad-runtime.test.ts`, `publish-prepare-changelog.test.ts` | Composed latest/base admission and publish-before-mutation checks, including release-digest, present-base and client-only-latest FAIL artifacts before any packing/build/shard; all discovered base consumers including candidate, independent client/floor and legacy installer checks. |
-| `ad-input-holds.test.ts`, `ad-input-holds-io.test.ts` | Durable reconnect intents, revision safety, IO/schema faults, no-follow production file access, strictly validated launch release and service callbacks; FIFO IO/load runs in a bounded isolated child process. |
+| `ad-input-holds.test.ts`, `ad-input-holds-io.test.ts` | Durable uncertainty versus plain crash intents, revision safety, IO/schema faults, no-follow production file access, fresh-session/observed-finished resume release and service callbacks; FIFO IO/load runs in a bounded isolated child process. |
+| `server-startup-wiring.test.ts` | Exact-part or matching unexpired reminder proof clears a delivered-item hold. Six real-queue cases retain it for expired/wrong-attempt proof, withdrawal, refusal, pending durability or a blocked writer. |
 | `ad-input-notices.test.ts`, `ad-submission-classification.test.ts` | Ruled human-only notice pins/escaping, safe diagnostics and native outcome validation. |
-| `ad-submission-reconnect.test.ts`, `ad-submission-delivery.test.ts`, `ad-submission-edge.test.ts` | No blind text/Enter after uncertainty, including failed fresh AD reads through retry deadlines and durable reload; restart and interrupted-save custody, exact late receipts, multipart progress, CAS races, state-based launch release and isolation. |
+| `ad-submission-reconnect.test.ts`, `ad-submission-delivery.test.ts`, `ad-submission-edge.test.ts` | Ordinary restart recovery without uncertainty evidence; no keys after recorded uncertainty, including failed fresh AD reads and reload after the first durable uncertainty write. Exact late receipts, multipart progress, CAS races, first-write ordering, fresh-session/observed-finished resume release and isolation. Test-18-shaped generic text/Enter refusals retain Enter-only retries without `uncertain`; startup clears old plain intents, and native ambiguous controls stay held. |
 
-Recovered unrefused `sent` work is receipt-only: reopening a queue cannot send
-recovery Enter or retype, including a crash before `submission-blocked` was
-saved. A correlated durable receipt can settle its part; a new persona launch
-or cleared reconnect hold is not delivery proof. Existing delivery/recovery
-suites drive live same-process sends for retry behavior and keep crash recovery
-separate. No pane-text classification or new idle polling supplies proof.
-See [human recovery](../skills/debug-slack-channel-bots/SKILL.md#uncertain-input-and-retained-delivery).
+Receipt-only custody requires recorded AD uncertainty: a queue
+`submission-blocked/ad-input-unconfirmed` or per-persona `uncertain` hold;
+invalid/unreadable holds fail closed. Ordinary in-flight `sent` work without
+that evidence recovers after reopen through receipt/AD reads, then guarded
+recovery Enter and retype/backoff. This includes text-to-Enter crashes and
+restarted retry episodes.
+
+Plain text/Enter intents are cleared at startup.
+
+Uncertainty is saved before the queue block and follow-up reads/notices.
+A crash before the first successful durable uncertainty write can lose the
+evidence and fall back to normal receipt-guarded recovery. A new session or
+live resume after observed ended/missing releases held custody into those
+guards; same-live-launch CSCB restarts remain held.
+
+The `.released` proof and
+`ad-input-launch-finished`/`ad-input-new-launch` reasons preserve that release
+across restart without confirming delivery. Keep exact-receipt and reviewed
+manual queue recovery separate; see [human recovery](../skills/debug-slack-channel-bots/SKILL.md#uncertain-input-and-retained-delivery).
+No pane-text classification or new idle polling supplies proof.
 
 ## Running the unit suite
 
