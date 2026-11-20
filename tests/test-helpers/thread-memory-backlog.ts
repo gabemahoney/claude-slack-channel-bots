@@ -27,6 +27,8 @@ export async function makeBacklogMemory(keys: string[] = ['alpha']) {
     return threadJoin({ stamp: { incarnation: stamp.incarnation, threadHybridSince: stamp.threadHybridSince },
       root: rootNumber++ === 0 ? THREAD_ROOTS.primary : `1700000000.${String(200000 + rootNumber).padStart(6, '0')}` })
   }
+  let closing = false
+  const backlogListeners = new Set<() => void>()
   for (const key of keys) seedThreads(stateDir, [threadHeader(), joinRecord(fact(key))], key)
   const seal = createThreadMemorySeal({ stateDir, fs: sealIo.fs, queueJournalPath: key => queuePath(stateDir, key),
     appliedKeys: () => keys, threadHybrid: () => true, created: key => authority.threadMemoryCreated(key) })
@@ -43,7 +45,12 @@ export async function makeBacklogMemory(keys: string[] = ['alpha']) {
   type Interval = { timer: unknown; stopped: boolean; unref(): void }
   const memory = createThreadMemory({ stateDir, fs: io.fs, seal, now: clock.now, monotonicNow: clock.now,
     maintenanceClock: clock, joinSaveClock: clock,
-    acceptanceBacklog: { has: key => queue.hasAcceptanceBacklog!(key), onCleared: (key, callback) => queue.onAcceptanceBacklogCleared!(key, callback) },
+    acceptanceBacklog: { has: key => queue.hasAcceptanceBacklog!(key), onCleared(key, callback) {
+      const notify = () => { backlogListeners.delete(notify); callback() }
+      backlogListeners.add(notify)
+      const unsubscribe = queue.onAcceptanceBacklogCleared!(key, notify)
+      return () => { backlogListeners.delete(notify); unsubscribe() }
+    } },
     setInterval: ((callback: () => void, ms: number) => {
       const handle: Interval = { timer: undefined, stopped: false, unref() {} }
       const tick = () => { if (!handle.stopped) { callback(); handle.timer = clock.setTimeout(tick, ms) } }
@@ -63,6 +70,8 @@ export async function makeBacklogMemory(keys: string[] = ['alpha']) {
   })
   const holds: Array<{ release(): void; pending: Promise<unknown> }> = []
   return { stateDir, clock, io, queueIo, queue, authority, memory, seal, sealIo, sealCalls, completed, measurements, measurementsPath, fact,
+    get closing() { return closing },
+    backlogWaitCount: () => backlogListeners.size,
     async start() { memory.readAtStart(); await seal.loadAtStart(memory.journalFacts()); await memory.activate() },
     async dirty(key = 'alpha') { return memory.saveJoins(key, [fact(key)]) },
     reset() { io.reset(); sealIo.reset(); sealCalls.length = 0; completed.length = 0 },
@@ -83,6 +92,7 @@ export async function makeBacklogMemory(keys: string[] = ['alpha']) {
     },
     bytes: (key = 'alpha') => readFileSync(threadPath(stateDir, key)),
     async close() {
+      closing = true
       for (const hold of memoryHolds) hold.release()
       for (const hold of holds) hold.release()
       await Promise.all(holds.map(h => h.pending)); await memory.stop(); await queue.stop(); await seal.stop(); await measurements.stop()

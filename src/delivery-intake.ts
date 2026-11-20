@@ -75,6 +75,10 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
   const claimed = new Map<string, Set<number>>()
   // Every life's outstanding work, an ended life's included, so stop drains writes already issued.
   const running = new Set<Promise<void>>()
+  // Lookups remain independent, but submit only one ready preparation write
+  // per persona at a time. A burst's post-ACK fixations must not reserve a
+  // thousand queue turns ahead of the next acceptance or hold resolution.
+  const appendWriters = new Map<string, Promise<boolean>>()
   let stopped = false
   const timeout = deps.lookupTimeoutMs ?? NAME_LOOKUP_TIMEOUT_MS
   const tagMaxBytes = deps.tagMaxBytes ?? TAG_MAX_BYTES
@@ -142,6 +146,16 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
       void Promise.resolve(deps.log(line)).catch(() => {})
     } catch { /* a diagnostic never undoes, retries or delays a durable outcome */ }
   }
+  function appendPrepared(key: string, record: FixedRecord | WithdrawnRecord, life: PreparationLife): Promise<boolean> {
+    const work = (appendWriters.get(key) ?? Promise.resolve()).catch(() => {}).then(async () => {
+      if (life.ended) return false
+      await deps.queue.append(key, record)
+      return true
+    })
+    appendWriters.set(key, work)
+    void work.finally(() => { if (appendWriters.get(key) === work) appendWriters.delete(key) }).catch(() => {})
+    return work
+  }
   /**
    * Decides and durably appends a reaction's outcome: true when the caller
    * should wake, false when an outcome stands without a wake, undefined when
@@ -166,7 +180,7 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
       life.reactionOutcomes.set(a.seq, outcome)
     }
     try {
-      await deps.queue.append(key, outcome.record)
+      if (!await appendPrepared(key, outcome.record, life)) return undefined
     } catch (error) {
       if (!(error instanceof QueueOutcomeFinal)) throw error
       // Another durable outcome stands: never replace or report it.
@@ -219,7 +233,7 @@ export function createDeliveryPreparation(deps: DeliveryPreparationDeps): Delive
         parts = buildTagParts(message, tagMaxBytes)
         life.fixedParts.set(a.seq, parts)
       }
-      await deps.queue.append(key, { v: 1, kind: 'fixed', seq: a.seq, parts })
+      if (!await appendPrepared(key, { v: 1, kind: 'fixed', seq: a.seq, parts }, life)) return false
       life.fixedParts.delete(a.seq)
     }
     if (current(life)) await deps.wake?.(key)

@@ -2612,6 +2612,96 @@ describe('SR-9.11 Thread Memory maintenance beside acceptance', () => {
   })
   const writes = (h: Awaited<ReturnType<typeof setup>>, key = 'alpha') => h.io.calls.filter(c => c.op === 'writeSync' && c.path.startsWith(`${threadPath(h.stateDir, key)}.`))
 
+  test('a maintenance backlog wait leaves the memory writer free for a durable join save', async () => {
+    const h = await setup(); await h.start(); await h.dirty(); h.reset()
+    const backlog = await h.backlog()
+    h.memory.startMaintenance(CADENCE)
+    await h.clock.advance(CADENCE)
+    const triggeredAt = h.clock.now(), fact = h.fact()
+    expect(h.backlogWaitCount()).toBe(1)
+    expect(writes(h)).toEqual([]); expect(h.completed).toEqual([])
+    const saving = h.memory.saveJoins('alpha', [fact])
+    const result = await saving
+    if (h.closing) return // A failing baseline run has timed out and cleanup is draining it.
+    expect(result).toEqual({ kind: 'saved' })
+    expect(h.clock.now()).toBe(triggeredAt)
+    expect(h.clock.now()).toBeLessThan(triggeredAt + THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS)
+    expect(h.queue.hasAcceptanceBacklog!('alpha')).toBe(true)
+    expect(h.memory.isJoinSaved('alpha', fact)).toBe(true)
+    expect(readThreads(h.stateDir).at(-1)).toEqual(joinRecord(fact, h.memory.store('alpha')!.lastRecordNumber))
+    expect(h.io.calls.filter(c => c.op === 'fsync' && c.path === threadPath(h.stateDir))).toHaveLength(1)
+    expect(writes(h)).toEqual([]); expect(h.completed).toEqual([]); expect(h.sealCalls).toEqual([])
+    const expected = h.image(), complete = h.completion()
+    backlog.release(); expect((await backlog.pending).status).toBe('accepted')
+    await complete; await h.seal.flush()
+    expect(h.completed.map(c => c.outcome)).toEqual(['rewritten'])
+    expect(h.completed[0]!.startMonoMs).toBe(triggeredAt)
+    expect(h.backlogWaitCount()).toBe(0)
+    expect(h.bytes().equals(expected)).toBe(true)
+    expect(h.memory.isJoinSaved('alpha', fact)).toBe(true)
+  })
+
+  test('quiesce cancels the outside-writer wait and drains an admitted save while acceptance stays backlogged', async () => {
+    const h = await setup(); await h.start(); await h.dirty(); h.reset()
+    const backlog = await h.backlog()
+    h.memory.startMaintenance(CADENCE); await h.clock.advance(CADENCE)
+    const deadline = h.clock.now() + THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS
+    expect(h.backlogWaitCount()).toBe(1)
+    const append = h.io.hold('fsync', 'alpha', { match: p => p === threadPath(h.stateDir) })
+    const saving = h.memory.saveJoins('alpha', [h.fact()])
+    await append.reached
+    let drained = false
+    const quiescing = h.memory.quiesce().then(() => { drained = true })
+    expect(h.backlogWaitCount()).toBe(0)
+    expect(h.clock.pending().filter(t => t.delayMs === THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS && t.dueAt === deadline)).toEqual([])
+    // An independent real queue commit supplies an observed completion while
+    // alpha's already-admitted memory append remains held, without a sleep.
+    expect((await h.queue.accept('beta', slackInput())).status).toBe('accepted')
+    expect(drained).toBe(false)
+    expect(h.queue.hasAcceptanceBacklog!('alpha')).toBe(true)
+    append.release(); expect((await saving).kind).toBe('saved'); await quiescing
+    expect(drained).toBe(true)
+    expect(h.queue.hasAcceptanceBacklog!('alpha')).toBe(true)
+    expect(writes(h)).toEqual([]); expect(h.completed).toEqual([]); expect(h.sealCalls).toEqual([])
+    const calls = [...h.io.calls], bytes = h.bytes()
+    backlog.release(); await backlog.pending
+    await h.clock.advanceTo(deadline + CADENCE)
+    await h.memory.quiesce(); await h.seal.flush()
+    expect(h.io.calls).toEqual(calls); expect(h.bytes()).toEqual(bytes)
+    expect(h.completed).toEqual([]); expect(h.sealCalls).toEqual([]); expect(h.backlogWaitCount()).toBe(0)
+  })
+
+  test('forget cancels the old outside-writer wait and a reloaded life can schedule maintenance without stranding work', async () => {
+    const h = await setup(); await h.start(); await h.dirty(); h.reset()
+    const backlog = await h.backlog()
+    h.memory.startMaintenance(CADENCE); await h.clock.advance(CADENCE)
+    const oldDeadline = h.clock.now() + THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS
+    expect(h.backlogWaitCount()).toBe(1)
+    h.memory.forget('alpha')
+    expect(h.backlogWaitCount()).toBe(0)
+    expect(h.clock.pending().filter(t => t.delayMs === THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS && t.dueAt === oldDeadline)).toEqual([])
+    expect(h.memory.store('alpha')).toBeUndefined()
+    expect(writes(h)).toEqual([]); expect(h.completed).toEqual([])
+    await h.memory.loadKey('alpha')
+    expect(h.queue.hasAcceptanceBacklog!('alpha')).toBe(true)
+    expect(h.completed.map(c => c.outcome)).toEqual(['rewritten'])
+    await h.dirty(); h.reset()
+    await h.clock.advanceTo(2 * CADENCE)
+    expect(h.backlogWaitCount()).toBe(1)
+    expect(writes(h)).toEqual([]); expect(h.completed).toEqual([])
+    const expected = h.image(), complete = h.completion()
+    backlog.release(); await backlog.pending; await complete
+    expect(h.completed.map(c => c.outcome)).toEqual(['rewritten'])
+    expect(h.bytes().equals(expected)).toBe(true)
+    expect(h.backlogWaitCount()).toBe(0)
+    await h.memory.quiesce(); await h.seal.flush()
+    const calls = [...h.io.calls]
+    await h.clock.advanceTo(oldDeadline + THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS)
+    await h.memory.quiesce()
+    expect(h.io.calls).toEqual(calls)
+    expect(h.completed.map(c => c.outcome)).toEqual(['rewritten'])
+  })
+
   test('a backlog-clear notification starts maintenance, with unchanged image, durability, seal, skip and measurement boundaries', async () => {
     const h = await setup(); await h.start(); await h.measurements.flush(); await h.dirty(); h.reset()
     const baselineMeasurements = readFileSync(h.measurementsPath, 'utf8').trim().split('\n').length

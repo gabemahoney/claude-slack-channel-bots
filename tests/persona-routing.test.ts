@@ -2796,6 +2796,58 @@ describe.each(['strict', 'open'] as const)('%s Post Hold routing through real ow
     const resolutions = () => existsSync(queuePath(dir)) ? readQueue(dir).filter(r => r.kind === 'released' || r.kind === 'hold-withdrawn') : []
     const outcomes = () => readThreads(dir).filter(r => r.kind === 'post-outcome')
 
+    test('b.gkw preparation admission: a root burst leaves room for a reply and the 3000 ms Post Hold resolution before its tail fixation', async () => {
+      const { h, t, queueIo } = await resolving(), holds = h.resolvers!
+      const post = await heldPost(h, { thread_ts: R })
+      await h.receive(humanReply(), ['alpha'])
+      expect(h.heldPostHolds.map(call => [call.key, call.hold.seq, call.hold.receivedAt])).toEqual([['alpha', 1, 0]])
+      expect(h.queue.item('alpha', 1)!.hold?.state).toBe('unresolved')
+      const submitted: Array<{ key: string; kind: string; seq: number }> = [], append = h.queue.append
+      h.queue.append = (key, record) => { submitted.push({ key, kind: record.kind, seq: record.seq }); return append(key, record) }
+      const fixedAt = (seq: number) => (path: string) => {
+        const last = path === queuePath(dir) ? readQueue(dir).at(-1) : undefined
+        return last?.kind === 'fixed' && last.seq === seq
+      }
+      const count = 16, first = queueIo.hold('fsync', 'alpha', { match: fixedAt(2) })
+      const tail = queueIo.hold('fsync', 'alpha', { match: fixedAt(count + 1) })
+      const roots = Array.from({ length: count }, (_, i) => makeChannelMessage({ channel: A,
+        ts: `1700000200.${String(i + 1).padStart(6, '0')}`, text: mentionText(h.p('alpha').stub.identity.botUserId) }))
+      const rootAcks: number[] = [], replyAcks: string[] = [], siblingAcks: string[] = []
+      const rootWork = Promise.all(roots.map((event, i) => h.receive(event, ['alpha'], () => { rootAcks.push(i) })))
+      let replyWork = Promise.resolve()
+      try {
+        await first.reached; await holds.clock.flush()
+        expect(rootAcks).toEqual(Array.from({ length: count }, (_, i) => i))
+        const submittedWhileFirstHeld = submitted.filter(call => call.key === 'alpha').map(({ kind, seq }) => `${kind}:${seq}`)
+        expect(h.queue.item('alpha', 2)!.fixed).toBeUndefined()
+        await h.receive(makeChannelMessage({ channel: A, ts: '1700000201.000001', text: mentionText(h.p('beta').stub.identity.botUserId) }), ['beta'], () => { siblingAcks.push('beta') })
+        expect(siblingAcks).toEqual(['beta'])
+        expect(h.queued('beta').map(item => [item.accepted.seq, item.accepted.via, item.fixed !== undefined])).toEqual([[1, 'mention', true]])
+        expect(h.queue.item('alpha', 2)!.fixed).toBeUndefined()
+        const reply = makeChannelMessage({ channel: A, thread_ts: roots[0]!.ts, text: 'reply while root fixations wait' })
+        replyWork = h.receive(reply, ['alpha'], () => { replyAcks.push('reply') })
+        await holds.clock.advance(THREAD_REPLY_HOLD_MS - 1)
+        expect(holds.postEvents).toEqual([])
+        await holds.clock.advance(1)
+        expect(holds.clock.now()).toBe(3_000)
+        expect(holds.postEvents).toEqual([]); expect(replyAcks).toEqual([])
+        first.release(); await tail.reached; await holds.clock.flush()
+        expect({ submittedWhileFirstHeld, replyAcks, holdState: h.queue.item('alpha', 1)!.hold?.state,
+          resolutions: holds.postEvents }).toEqual({ submittedWhileFirstHeld: ['fixed:2'], replyAcks: ['reply'], holdState: 'released',
+          resolutions: [{ kind: 'post-hold-resolved', key: 'alpha', seq: 1, outcome: 'released', cause: 'timer', heldMs: THREAD_REPLY_HOLD_MS }] })
+        expect(h.queue.item('alpha', count + 1)!.fixed).toBeUndefined()
+        expect(h.queue.item('alpha', count + 2)!.accepted).toMatchObject({ ts: reply.ts, thread_ts: roots[0]!.ts, via: 'thread' })
+        expect(readQueue(dir).map(record => `${record.kind}:${record.seq}`)).toEqual([
+          ...Array.from({ length: count + 1 }, (_, i) => `accepted:${i + 1}`), 'fixed:2', `accepted:${count + 2}`, 'released:1',
+          ...Array.from({ length: count - 1 }, (_, i) => `fixed:${i + 3}`),
+        ])
+        expect(submitted.filter(call => call.key === 'beta')).toEqual([{ key: 'beta', kind: 'fixed', seq: 1 }])
+      } finally {
+        first.release(); tail.release(); await Promise.all([rootWork, replyWork])
+        await holds.clock.flush(); await post.settle(); await t.clock.flush()
+      }
+    })
+
     test.each([['fails', 'failed'], ["is confirmed in the reply's thread", 'confirmed']] as const)(
       "a post that %s while its reply's Post Hold store waits on disk resolves that hold durably as the store finishes, before THREAD_REPLY_HOLD_MS", async (_label, outcome) => {
         const { h, t, queueIo, received, settleFeedback } = await resolving()

@@ -747,6 +747,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   const pendingJoins = new Map<string, ThreadJoin[]>()
   const maintenanceQueued = new WeakSet<MemoryJournal>()
   const maintenanceWaits = new Map<MemoryJournal, () => void>()
+  const maintenanceWork = new Set<Promise<void>>()
   const maintenanceClock = options.maintenanceClock ?? {
     now: () => performance.now(),
     setTimeout: (fn: () => void, ms: number) => globalThis.setTimeout(fn, ms),
@@ -1555,15 +1556,21 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     await Promise.allSettled([...journals].filter(([, j]) => !maintenanceQueued.has(j)).map(([k, j]) => {
       const triggeredAt = maintenanceClock.now()
       maintenanceQueued.add(j)
-      return serial(k, async () => {
-        try { await waitForAcceptanceBacklog(k, j, triggeredAt) }
-        finally { maintenanceQueued.delete(j) }
-        await compactOne(k, j, undefined, true)
-      })
+      const work = admitMaintenance(k, j, triggeredAt).finally(() => { maintenanceWork.delete(work) })
+      maintenanceWork.add(work)
+      return work
     }))
   }
+  async function admitMaintenance(key: string, j: MemoryJournal, triggeredAt: number): Promise<void> {
+    try { await waitForAcceptanceBacklog(key, j, triggeredAt) }
+    catch (error) { maintenanceQueued.delete(j); throw error }
+    await serial(key, () => {
+      maintenanceQueued.delete(j)
+      return compactOne(key, j, undefined, true)
+    })
+  }
   /** Coalesced triggers retain the first trigger's deadline. Waiting owns no
-   * queue turn and never delays a queue store, even for this same persona. */
+   * queue or Thread Memory writer turn: saves can proceed during the wait. */
   async function waitForAcceptanceBacklog(key: string, j: MemoryJournal, triggeredAt: number): Promise<void> {
     const backlog = options.acceptanceBacklog
     if (!current(key, j) || !backlog?.has(key)) return
@@ -1798,6 +1805,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
       quiesced = true
       for (const finish of maintenanceWaits.values()) finish()
       for (const key of formingJoinSaves.keys()) sealJoinSaves(key)
+      await Promise.allSettled([...maintenanceWork])
       await Promise.allSettled([...writers.values()])
     },
     async stop() {

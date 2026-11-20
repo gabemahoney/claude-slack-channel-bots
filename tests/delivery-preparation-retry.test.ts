@@ -21,6 +21,7 @@ import { assertNoLeak, LEAK_SENTINEL, sentinelInMessage, writtenFile } from './t
 import { makeSharedAuthority } from './test-helpers/shared-channels.ts'
 import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
 import { observedMembership } from './test-helpers/persona-routing-harness.ts'
+import { heldStep } from './test-helpers/durable-io.ts'
 
 const harnesses: EngineHarness[] = []
 const preparations: DeliveryPreparation[] = []
@@ -231,6 +232,122 @@ function preparer(h: EngineHarness, opts: { resolve?: (user: string) => Promise<
 const lookups = (p: Preparer, key = PERSONA.key): number => p.stubs[key]!.callLog.length + p.resolvedBy[key]!.length
 /** The Slack methods called on one stub, sorted. */
 const methods = (stub: StubSlack): string[] => stub.callLog.map(c => c.method).sort()
+
+/** Record entry to preparation's real queue port, holding its first submitted
+ * append. All successful writes still go through the harness's durable queue. */
+function admission(h: EngineHarness, later?: (record: QueueRecord) => Promise<void> | undefined) {
+  const first = heldStep(), submitted: QueueRecord[] = []
+  releases.push(first.release)
+  const p = preparer(h, { holdAppend: record => {
+    submitted.push(structuredClone(record))
+    return submitted.length === 1 ? first.promise : later?.(record) ?? Promise.resolve()
+  } })
+  return { ...p, first, submitted }
+}
+async function unfixed(h: EngineHarness, text: string) {
+  const result = await h.queue.accept('alpha', injectedInput({ text }))
+  if (result.status !== 'accepted' || !result.item) throw new Error('fixture unfixed acceptance failed')
+  return result.item
+}
+
+describe('b.gkw preparation admission lifecycle', () => {
+  test('a rejected first append leaves the next ready preparation able to submit and wake only after its durable store', async () => {
+    const h = await harness(), p = admission(h)
+    const a = await unfixed(h, 'first'), b = await unfixed(h, 'second')
+    const first = p.preparation.prepare('alpha', a), failed = Promise.allSettled([first])
+    const second = p.preparation.prepare('alpha', b)
+    await h.clock.flush()
+    expect(p.submitted.map(record => [record.kind, record.seq])).toEqual([['fixed', 1]])
+    expect(outcomes(h, 1)).toEqual([]); expect(outcomes(h, 2)).toEqual([])
+    expect(p.wakes).toEqual([]); expect(p.logs).toEqual([])
+    const error = new Error('first preparation append rejected')
+    p.first.fail(error)
+    try {
+      expect(await failed).toEqual([{ status: 'rejected', reason: error }])
+      await second
+      expect(p.submitted.map(record => [record.kind, record.seq])).toEqual([['fixed', 1], ['fixed', 2]])
+      expect(outcomes(h, 1)).toEqual([])
+      expect(outcomes(h, 2)).toEqual([{ v: 1, kind: 'fixed', seq: 2, parts: buildTagParts({ user: b.accepted.sender, ts: b.accepted.ts, text: b.accepted.text }) }])
+      expect(effects(h)).toEqual(['append:fixed:2', 'wake:alpha'])
+      expect(p.wakes).toEqual(['alpha']); expect(p.logs).toEqual([])
+      expect(p.preparation.owns('alpha', 1)).toBe(true)
+      expect(p.preparation.owns('alpha', 2)).toBe(false)
+    } finally { p.first.release(); await Promise.allSettled([first, second]) }
+  })
+
+  test('forget and re-add cancels an old queued reaction outcome without appending or waking it, while the new life fixes that item independently', async () => {
+    const h = await harness(), freshAppend = heldStep()
+    releases.push(freshAppend.release)
+    const p = admission(h, record => record.seq === 2 ? freshAppend.promise : undefined)
+    const a = await unfixed(h, 'old submitted work'), item = await acceptReaction(h, reaction())
+    p.stub.script.replies.push(exact(SERVER_POST), exact({ thread_ts: ROOT_TS }))
+    p.stub.script.info.push(conversation(PUBLIC), conversation(PUBLIC))
+    const oldFirst = p.preparation.prepare('alpha', a), oldQueued = p.preparation.prepare('alpha', item)
+    await h.clock.flush()
+    expect(p.submitted.map(record => [record.kind, record.seq])).toEqual([['fixed', 1]])
+    expect(lookups(p)).toBe(3)
+    p.preparation.forget('alpha')
+    const fresh = p.preparation.prepare('alpha', item)
+    await h.clock.flush()
+    expect(fresh).not.toBe(oldQueued)
+    expect(p.preparation.prepare('alpha', item)).toBe(fresh)
+    expect(lookups(p)).toBe(6)
+    expect(p.submitted.map(record => [record.kind, record.seq])).toEqual([['fixed', 1]])
+    p.first.release()
+    try {
+      await Promise.all([oldFirst, oldQueued]); await h.clock.flush()
+      expect(p.submitted.map(record => [record.kind, record.seq])).toEqual([['fixed', 1], ['fixed', 2]])
+      expect(p.preparation.owns('alpha', 2)).toBe(true)
+      expect(p.preparation.prepare('alpha', item)).toBe(fresh)
+      expect(p.wakes).toEqual([]); expect(p.logs).toEqual([])
+      expect(outcomes(h, 2)).toEqual([])
+      freshAppend.release(); await fresh
+      expect(outcomes(h, 2)).toEqual([{ v: 1, kind: 'fixed', seq: 2, parts: buildTagParts(notice({ thread_ts: ROOT_TS })) }])
+      expect(p.submitted.some(record => record.kind === 'withdrawn')).toBe(false)
+      expect(effects(h)).toEqual(['append:fixed:1', 'append:fixed:2', 'wake:alpha'])
+      expect(p.wakes).toEqual(['alpha']); expect(p.logs).toEqual([])
+      expect(p.preparation.owns('alpha', 2)).toBe(false)
+    } finally { p.first.release(); freshAppend.release(); await Promise.allSettled([oldFirst, oldQueued, fresh]) }
+  })
+
+  test('stop drains several ready ordinary, reaction fixed and reaction withdrawn outcomes through the same admission without later wake or report', async () => {
+    const h = await harness(), p = admission(h)
+    const a = await unfixed(h, 'first'), fixed = await acceptReaction(h, reaction())
+    const withdrawn = await acceptReaction(h, reaction({ ts: LATER_EVENT_TS })), b = await unfixed(h, 'last')
+    p.stub.script.replies.push(exact(), exact(SERVER_POST))
+    p.stub.script.info.push(conversation(PUBLIC), conversation(PUBLIC))
+    const work = [a, fixed, withdrawn].map(item => p.preparation.prepare('alpha', item))
+    // Let both reaction outcomes become ready before the last ordinary item;
+    // lookups are concurrent and readiness, rather than seq, orders admission.
+    await h.clock.flush()
+    work.push(p.preparation.prepare('alpha', b))
+    await h.clock.flush()
+    expect(lookups(p)).toBe(6)
+    expect(p.submitted.map(record => [record.kind, record.seq])).toEqual([['fixed', 1]])
+    expect(p.wakes).toEqual([]); expect(p.logs).toEqual([])
+    let stopped = false
+    const stopping = p.preparation.stop().then(() => { stopped = true })
+    try {
+      await h.clock.flush()
+      expect(stopped).toBe(false)
+      expect(p.submitted.map(record => record.seq)).toEqual([1])
+      p.first.release(); await Promise.all([...work, stopping])
+      expect(stopped).toBe(true)
+      expect(p.submitted.map(record => [record.kind, record.seq])).toEqual([['fixed', 1], ['fixed', 2], ['withdrawn', 3], ['fixed', 4]])
+      expect(p.submitted).toEqual(h.records().filter(record => record.kind !== 'accepted'))
+      expect(outcomes(h, 2)).toEqual([{ v: 1, kind: 'fixed', seq: 2, parts: buildTagParts(notice()) }])
+      expect(outcomes(h, 3)).toEqual([withdrawal(3, 'server-post', START)])
+      expect(effects(h)).toEqual(['append:fixed:1', 'append:fixed:2', 'append:withdrawn:3', 'append:fixed:4'])
+      expect(p.wakes).toEqual([]); expect(p.logs).toEqual([])
+      const before = h.records()
+      await h.clock.advance(RETYPE_BACKOFF_MS.at(-1)! * 2)
+      expect(h.records()).toEqual(before); expect(p.submitted).toHaveLength(4)
+      expect(p.wakes).toEqual([]); expect(p.logs).toEqual([])
+      for (const item of [a, fixed, withdrawn, b]) expect(p.preparation.owns('alpha', item.accepted.seq)).toBe(false)
+      expect(h.clock.pendingCount()).toBe(0)
+    } finally { p.first.release(); await Promise.allSettled([...work, stopping]) }
+  })
+})
 
 describe('reaction preparation fixes or withdraws through the real queue', () => {
   const ASSEMBLY: Array<[string, Partial<ReactionAcceptedInput>, SettledWebApiOutcome, SettledWebApiOutcome, TagMessage, string[]]> = [
